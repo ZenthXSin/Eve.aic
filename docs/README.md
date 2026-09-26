@@ -11,13 +11,13 @@
 - [决策记录](./决策记录.md)：已经确认的技术和架构决策。
 - [待确认问题](./待确认问题.md)：尚未决定、需要逐步讨论的问题。
 
-## 架构图
+## 第一阶段总览图
 
-- [总体架构图](./diagrams/system-architecture.svg)
-- [Runtime 流程图](./diagrams/runtime-flow.svg)
-- [功能分层图](./diagrams/feature-map.svg)
+[打开 EVE.AIC 总览 SVG](./diagrams/eve-aic-overview.svg)
 
-![Eve.aic 总体架构图](./diagrams/system-architecture.svg)
+这张图把第一阶段需要讨论和验收的内容放在同一张图中：定义层、实现层和组合层的架构；核心功能关系；插件启动、失败回滚和逆序停止流程；从架构决策到 PR 的实现流程；Provider 与 Consumer 插件的协作效果；以及与《开发计划》一致的 Phase 0–5 路线。
+
+![EVE.AIC 第一阶段总览图](./diagrams/eve-aic-overview.svg)
 
 ## 当前状态
 
