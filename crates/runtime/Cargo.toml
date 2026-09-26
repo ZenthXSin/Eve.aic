@@ -1,0 +1,10 @@
+[package]
+name = "eve-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-kernel = { path = "../kernel" }
+eve-plugin-api = { path = "../plugin-api" }
+tokio.workspace = true
