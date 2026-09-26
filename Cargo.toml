@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/plugin-api",
+    "crates/kernel",
+    "crates/runtime",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
