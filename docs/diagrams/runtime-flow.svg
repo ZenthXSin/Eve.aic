@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1050" viewBox="0 0 1600 1050" role="img" aria-labelledby="title desc">
+  <title id="title">Eve.aic Runtime 流程图</title>
+  <desc id="desc">从 Runtime 启动、插件依赖解析、事件处理到关闭和恢复的完整流程。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#34d399"/></marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#fb7185"/></marker>
+    <style>
+      .bg{fill:#0b1020}.box{fill:#111a2e;stroke:#475569;stroke-width:2}.start{fill:#123329;stroke:#34d399;stroke-width:2}.step{fill:#172554;stroke:#60a5fa;stroke-width:2}.decision{fill:#2f2614;stroke:#f59e0b;stroke-width:2}.error{fill:#351824;stroke:#fb7185;stroke-width:2}.persist{fill:#172b3d;stroke:#38bdf8;stroke-width:2}.title{font:700 30px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#f8fafc}.subtitle{font:400 16px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#94a3b8}.label{font:700 17px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#f8fafc}.small{font:400 14px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#cbd5e1}.tiny{font:400 12px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#94a3b8}.arrow{stroke:#94a3b8;stroke-width:2.5;fill:none;marker-end:url(#arrow)}.green{stroke:#34d399;stroke-width:2.5;fill:none;marker-end:url(#arrow-green)}.red{stroke:#fb7185;stroke-width:2.5;fill:none;marker-end:url(#arrow-red)}.dash{stroke-dasharray:8 7}
+    </style>
+  </defs>
+  <rect class="bg" width="1600" height="1050"/>
+  <text class="title" x="70" y="62">Eve.aic · Runtime Lifecycle &amp; Cognitive Flow</text>
+  <text class="subtitle" x="70" y="90">内核先保证可控的生命周期，再让插件通过 Context、事件、服务和状态形成持续运行闭环</text>
+
+  <rect class="start" x="70" y="145" width="200" height="70" rx="14"/><text class="label" x="170" y="177" text-anchor="middle">启动 Runtime</text><text class="tiny" x="170" y="198" text-anchor="middle">加载配置 / 日志</text>
+  <path class="green" d="M270 180 L345 180"/>
+  <rect class="step" x="345" y="145" width="220" height="70" rx="14"/><text class="label" x="455" y="177" text-anchor="middle">发现 Plugin Manifest</text><text class="tiny" x="455" y="198" text-anchor="middle">ID / Version / 权限</text>
+  <path class="green" d="M565 180 L640 180"/>
+  <rect class="step" x="640" y="145" width="220" height="70" rx="14"/><text class="label" x="750" y="177" text-anchor="middle">解析依赖图</text><text class="tiny" x="750" y="198" text-anchor="middle">缺失 / 循环 / 版本</text>
+  <path class="green" d="M860 180 L935 180"/>
+  <rect class="decision" x="935" y="145" width="220" height="70" rx="14"/><text class="label" x="1045" y="177" text-anchor="middle">依赖满足？</text><text class="tiny" x="1045" y="198" text-anchor="middle">按拓扑层并行启动</text>
+  <path class="green" d="M1155 180 L1230 180"/>
+  <rect class="start" x="1230" y="145" width="270" height="70" rx="14"/><text class="label" x="1365" y="177" text-anchor="middle">创建 Plugin Scope</text><text class="tiny" x="1365" y="198" text-anchor="middle">Context / 资源所有权</text>
+
+  <path class="red" d="M1045 215 C1045 275 930 275 930 315"/><text class="tiny" x="1000" y="270">否</text>
+  <rect class="error" x="820" y="315" width="220" height="65" rx="14"/><text class="label" x="930" y="345" text-anchor="middle">启动失败</text><text class="tiny" x="930" y="366" text-anchor="middle">报告错误 / 保持可诊断</text>
+  <path class="red" d="M820 348 L690 348"/>
+  <rect class="error" x="440" y="315" width="250" height="65" rx="14"/><text class="label" x="565" y="345" text-anchor="middle">反向清理已启动插件</text><text class="tiny" x="565" y="366" text-anchor="middle">回滚半启动状态</text>
+  <path class="red" d="M440 348 L280 348"/>
+  <rect class="box" x="70" y="315" width="210" height="65" rx="14"/><text class="label" x="175" y="345" text-anchor="middle">等待修复或禁用</text><text class="tiny" x="175" y="366" text-anchor="middle">Runtime 可继续运行</text>
+
+  <path class="green" d="M1365 215 L1365 430"/>
+  <rect class="step" x="1130" y="430" width="470" height="90" rx="14"/><text class="label" x="1365" y="464" text-anchor="middle">Plugin Active</text><text class="small" x="1365" y="488" text-anchor="middle">注册服务 · 订阅事件 · 创建任务 · 读取状态</text>
+  <path class="arrow" d="M1130 475 L950 475"/>
+  <rect class="step" x="650" y="430" width="300" height="90" rx="14"/><text class="label" x="800" y="464" text-anchor="middle">Context Boundary</text><text class="small" x="800" y="488" text-anchor="middle">RuntimeHandle / Event / Service</text>
+  <path class="arrow" d="M650 475 L470 475"/>
+  <rect class="persist" x="150" y="430" width="320" height="90" rx="14"/><text class="label" x="310" y="464" text-anchor="middle">Scope-owned Resources</text><text class="small" x="310" y="488" text-anchor="middle">Listener / Task / Connection / State</text>
+
+  <path class="arrow" d="M1365 520 L1365 590"/>
+  <rect class="box" x="1110" y="590" width="510" height="100" rx="14"/><text class="label" x="1365" y="626" text-anchor="middle">运行循环</text><text class="small" x="1365" y="650" text-anchor="middle">外部事件 + 内部任务 + 定时调度 + 空闲检查</text><text class="tiny" x="1365" y="672" text-anchor="middle">Fast Runtime Loop / Slow Background Work</text>
+  <path class="arrow" d="M1110 640 L920 640"/>
+  <rect class="box" x="650" y="590" width="270" height="100" rx="14"/><text class="label" x="785" y="626" text-anchor="middle">Event Bus</text><text class="small" x="785" y="650" text-anchor="middle">emit / async / ordered</text><text class="tiny" x="785" y="672" text-anchor="middle">监听器错误隔离</text>
+  <path class="arrow" d="M650 640 L470 640"/>
+  <rect class="persist" x="120" y="590" width="350" height="100" rx="14"/><text class="label" x="295" y="626" text-anchor="middle">State &amp; Experience</text><text class="small" x="295" y="650" text-anchor="middle">命名空间状态 / 快照 / 诊断</text><text class="tiny" x="295" y="672" text-anchor="middle">写入可恢复的持久层</text>
+
+  <path class="arrow" d="M1365 690 L1365 770"/>
+  <rect class="decision" x="1130" y="770" width="470" height="85" rx="14"/><text class="label" x="1365" y="806" text-anchor="middle">继续运行？</text><text class="small" x="1365" y="830" text-anchor="middle">处理下一个事件或进入停止流程</text>
+  <path class="green" d="M1130 812 C1020 812 1020 640 1110 640"/>
+  <text class="tiny" x="1040" y="735">是</text>
+  <path class="red" d="M1600 812 L1600 920 L1365 920 L1365 855"/>
+  <text class="tiny" x="1535" y="900">否</text>
+
+  <rect class="step" x="820" y="875" width="330" height="85" rx="14"/><text class="label" x="985" y="910" text-anchor="middle">停止消费者插件</text><text class="small" x="985" y="934" text-anchor="middle">取消任务 / 删除监听 / 提交状态</text>
+  <path class="arrow" d="M820 918 L630 918"/>
+  <rect class="step" x="280" y="875" width="350" height="85" rx="14"/><text class="label" x="455" y="910" text-anchor="middle">停止依赖提供者</text><text class="small" x="455" y="934" text-anchor="middle">反向拓扑顺序 / 尽可能全部清理</text>
+  <path class="arrow" d="M280 918 L100 918"/>
+  <rect class="start" x="70" y="875" width="30" height="85" rx="12"/>
+  <path class="arrow" d="M100 960 C100 1000 1500 1000 1500 960"/>
+  <text class="tiny" x="800" y="1015" text-anchor="middle">保存快照 → Runtime Stopped → 下次启动恢复 State</text>
+</svg>

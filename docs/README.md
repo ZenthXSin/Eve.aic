@@ -11,6 +11,14 @@
 - [决策记录](./决策记录.md)：已经确认的技术和架构决策。
 - [待确认问题](./待确认问题.md)：尚未决定、需要逐步讨论的问题。
 
+## 架构图
+
+- [总体架构图](./diagrams/system-architecture.svg)
+- [Runtime 流程图](./diagrams/runtime-flow.svg)
+- [功能分层图](./diagrams/feature-map.svg)
+
+![Eve.aic 总体架构图](./diagrams/system-architecture.svg)
+
 ## 当前状态
 
 项目处于第一阶段设计期，暂不实现 AGI 认知层。
@@ -30,4 +38,3 @@ Event / Service / State / Task
     ↓
 Cleanup / Shutdown / Recovery
 ```
-

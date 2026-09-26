@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1050" viewBox="0 0 1600 1050" role="img" aria-labelledby="title desc">
+  <title id="title">Eve.aic 功能分层图</title>
+  <desc id="desc">从内核能力到插件服务、认知闭环和自我演化的功能分层与开发阶段。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/></marker>
+    <style>
+      .bg{fill:#0b1020}.layer0{fill:#172554;stroke:#60a5fa;stroke-width:2}.layer1{fill:#123329;stroke:#34d399;stroke-width:2}.layer2{fill:#241a45;stroke:#a78bfa;stroke-width:2}.layer3{fill:#321b33;stroke:#f472b6;stroke-width:2}.future{fill:#2f2614;stroke:#f59e0b;stroke-width:2}.title{font:700 30px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#f8fafc}.subtitle{font:400 16px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#94a3b8}.layer-title{font:700 19px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#f8fafc}.label{font:700 15px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#f8fafc}.small{font:400 12px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#cbd5e1}.tiny{font:400 11px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#94a3b8}.arrow{stroke:#94a3b8;stroke-width:2.5;fill:none;marker-end:url(#arrow)}.dash{stroke-dasharray:8 7}
+    </style>
+  </defs>
+  <rect class="bg" width="1600" height="1050"/>
+  <text class="title" x="70" y="62">Eve.aic · Capability &amp; Evolution Map</text>
+  <text class="subtitle" x="70" y="90">第一阶段先完成可控底座，后续能力通过插件逐层接入，不提前把 AGI 逻辑硬编码进 Kernel</text>
+
+  <rect class="layer0" x="50" y="125" width="1500" height="185" rx="18"/>
+  <text class="layer-title" x="80" y="160">Layer 0 · Kernel Foundation（Phase 0–2）</text>
+  <text class="tiny" x="80" y="181">Runtime 的不可替代边界：插件可以演化，内核负责让演化可控</text>
+  <rect class="layer0" x="80" y="210" width="155" height="68" rx="10"/><text class="label" x="157" y="239" text-anchor="middle">Runtime</text><text class="small" x="157" y="260" text-anchor="middle">启动 / 停止</text>
+  <rect class="layer0" x="255" y="210" width="155" height="68" rx="10"/><text class="label" x="332" y="239" text-anchor="middle">Registry</text><text class="small" x="332" y="260" text-anchor="middle">插件 / 服务</text>
+  <rect class="layer0" x="430" y="210" width="155" height="68" rx="10"/><text class="label" x="507" y="239" text-anchor="middle">Lifecycle</text><text class="small" x="507" y="260" text-anchor="middle">依赖 / 清理</text>
+  <rect class="layer0" x="605" y="210" width="155" height="68" rx="10"/><text class="label" x="682" y="239" text-anchor="middle">Context</text><text class="small" x="682" y="260" text-anchor="middle">能力边界</text>
+  <rect class="layer0" x="780" y="210" width="155" height="68" rx="10"/><text class="label" x="857" y="239" text-anchor="middle">Event Bus</text><text class="small" x="857" y="260" text-anchor="middle">解耦协作</text>
+  <rect class="layer0" x="955" y="210" width="155" height="68" rx="10"/><text class="label" x="1032" y="239" text-anchor="middle">State</text><text class="small" x="1032" y="260" text-anchor="middle">持久化 / 恢复</text>
+  <rect class="layer0" x="1130" y="210" width="155" height="68" rx="10"/><text class="label" x="1207" y="239" text-anchor="middle">Tasks</text><text class="small" x="1207" y="260" text-anchor="middle">调度 / 取消</text>
+  <rect class="layer0" x="1305" y="210" width="205" height="68" rx="10"/><text class="label" x="1407" y="239" text-anchor="middle">Permission / Diagnostics</text><text class="small" x="1407" y="260" text-anchor="middle">边界 / 可观察性</text>
+
+  <path class="arrow" d="M800 310 L800 345"/>
+  <rect class="layer1" x="50" y="345" width="1500" height="185" rx="18"/>
+  <text class="layer-title" x="80" y="380">Layer 1 · Plugin Services（Phase 3–4）</text>
+  <text class="tiny" x="80" y="401">所有上层能力通过 Plugin API 接入，Service 是能力，Plugin 是生命周期单元</text>
+  <rect class="layer1" x="80" y="430" width="155" height="68" rx="10"/><text class="label" x="157" y="459" text-anchor="middle">Communication</text><text class="small" x="157" y="480" text-anchor="middle">Chat / API</text>
+  <rect class="layer1" x="255" y="430" width="155" height="68" rx="10"/><text class="label" x="332" y="459" text-anchor="middle">Filesystem</text><text class="small" x="332" y="480" text-anchor="middle">受限访问</text>
+  <rect class="layer1" x="430" y="430" width="155" height="68" rx="10"/><text class="label" x="507" y="459" text-anchor="middle">LLM</text><text class="small" x="507" y="480" text-anchor="middle">Provider / Router</text>
+  <rect class="layer1" x="605" y="430" width="155" height="68" rx="10"/><text class="label" x="682" y="459" text-anchor="middle">Memory</text><text class="small" x="682" y="480" text-anchor="middle">Episode / Semantic</text>
+  <rect class="layer1" x="780" y="430" width="155" height="68" rx="10"/><text class="label" x="857" y="459" text-anchor="middle">World Model</text><text class="small" x="857" y="480" text-anchor="middle">Object / Relation</text>
+  <rect class="layer1" x="955" y="430" width="155" height="68" rx="10"/><text class="label" x="1032" y="459" text-anchor="middle">Reasoning</text><text class="small" x="1032" y="480" text-anchor="middle">Rules / LLM</text>
+  <rect class="layer1" x="1130" y="430" width="155" height="68" rx="10"/><text class="label" x="1207" y="459" text-anchor="middle">Browser / Git</text><text class="small" x="1207" y="480" text-anchor="middle">外部工具</text>
+  <rect class="layer1" x="1305" y="430" width="205" height="68" rx="10"/><text class="label" x="1407" y="459" text-anchor="middle">Capability Executor</text><text class="small" x="1407" y="480" text-anchor="middle">可复用能力</text>
+
+  <path class="arrow" d="M800 530 L800 565"/>
+  <rect class="layer2" x="50" y="565" width="1500" height="190" rx="18"/>
+  <text class="layer-title" x="80" y="600">Layer 2 · Cognitive Loop（Phase 5–8）</text>
+  <text class="tiny" x="80" y="621">经验经过记忆、概念和能力形成，反过来影响兴趣、人格、目标和行动</text>
+  <rect class="layer2" x="80" y="655" width="170" height="68" rx="10"/><text class="label" x="165" y="684" text-anchor="middle">Experience</text><text class="small" x="165" y="705" text-anchor="middle">观察 / 结果</text>
+  <rect class="layer2" x="285" y="655" width="170" height="68" rx="10"/><text class="label" x="370" y="684" text-anchor="middle">Memory</text><text class="small" x="370" y="705" text-anchor="middle">保留经历</text>
+  <rect class="layer2" x="490" y="655" width="170" height="68" rx="10"/><text class="label" x="575" y="684" text-anchor="middle">Concept</text><text class="small" x="575" y="705" text-anchor="middle">抽象 / 关系</text>
+  <rect class="layer2" x="695" y="655" width="170" height="68" rx="10"/><text class="label" x="780" y="684" text-anchor="middle">Capability</text><text class="small" x="780" y="705" text-anchor="middle">Skill / Procedure</text>
+  <rect class="layer2" x="900" y="655" width="170" height="68" rx="10"/><text class="label" x="985" y="684" text-anchor="middle">Interest / Personality</text><text class="small" x="985" y="705" text-anchor="middle">偏好 / 表达</text>
+  <rect class="layer2" x="1105" y="655" width="170" height="68" rx="10"/><text class="label" x="1190" y="684" text-anchor="middle">Drive / Goal</text><text class="small" x="1190" y="705" text-anchor="middle">内生目标</text>
+  <rect class="layer2" x="1310" y="655" width="200" height="68" rx="10"/><text class="label" x="1410" y="684" text-anchor="middle">Action / New Experience</text><text class="small" x="1410" y="705" text-anchor="middle">行动闭环</text>
+  <path class="arrow" d="M250 689 L285 689"/><path class="arrow" d="M455 689 L490 689"/><path class="arrow" d="M660 689 L695 689"/><path class="arrow" d="M865 689 L900 689"/><path class="arrow" d="M1070 689 L1105 689"/><path class="arrow" d="M1275 689 L1310 689"/><path class="arrow" d="M1410 723 C1410 745 165 745 165 723"/>
+
+  <path class="arrow" d="M800 755 L800 790"/>
+  <rect class="layer3" x="50" y="790" width="1500" height="170" rx="18"/>
+  <text class="layer-title" x="80" y="825">Layer 3 · Self Improvement（Phase 9–10）</text>
+  <text class="tiny" x="80" y="846">自我改进必须经过隔离、评估、版本和回滚，不能直接修改 Kernel</text>
+  <rect class="layer3" x="130" y="875" width="210" height="58" rx="10"/><text class="label" x="235" y="910" text-anchor="middle">Self Model / Weakness</text>
+  <rect class="layer3" x="390" y="875" width="210" height="58" rx="10"/><text class="label" x="495" y="910" text-anchor="middle">Improvement Proposal</text>
+  <rect class="layer3" x="650" y="875" width="210" height="58" rx="10"/><text class="label" x="755" y="910" text-anchor="middle">Sandbox</text>
+  <rect class="layer3" x="910" y="875" width="210" height="58" rx="10"/><text class="label" x="1015" y="910" text-anchor="middle">Benchmark</text>
+  <rect class="future" x="1170" y="875" width="210" height="58" rx="10"/><text class="label" x="1275" y="910" text-anchor="middle">Adopt / Rollback</text>
+  <rect class="future" x="1430" y="875" width="80" height="58" rx="10"/><text class="label" x="1470" y="910" text-anchor="middle">v2</text>
+  <path class="arrow" d="M340 904 L390 904"/><path class="arrow" d="M600 904 L650 904"/><path class="arrow" d="M860 904 L910 904"/><path class="arrow" d="M1120 904 L1170 904"/><path class="arrow" d="M1380 904 L1430 904"/>
+  <text class="tiny" x="80" y="1005">开发策略：先实现 Layer 0，再以插件方式逐层接入 Layer 1–3。</text>
+</svg>
