@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="2020" viewBox="0 0 1900 2020" role="img" aria-labelledby="title desc">
+  <title id="title">EVE.AIC 第一阶段总览：架构、流程、功能与验收效果</title>
+  <desc id="desc">一切皆插件的 Rust Runtime 总览图，包含分层架构、核心功能关系、插件生命周期、实现流程、第一阶段验收效果和阶段路线。</desc>
+  <defs>
+    <linearGradient id="header" x1="0" x2="1" y1="0" y2="0"><stop offset="0" stop-color="#172554"/><stop offset="1" stop-color="#0f766e"/></linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#94a3b8"/></marker>
+    <marker id="blue-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#60a5fa"/></marker>
+    <marker id="green-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#34d399"/></marker>
+    <marker id="red-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 10 5 0 10Z" fill="#fb7185"/></marker>
+    <style>
+      .bg{fill:#080d18}.panel{fill:#101827;stroke:#334155;stroke-width:2}.definition{fill:#172554;stroke:#60a5fa;stroke-width:2}.implementation{fill:#123329;stroke:#34d399;stroke-width:2}.composition{fill:#241a45;stroke:#a78bfa;stroke-width:2}.process{fill:#1e293b;stroke:#38bdf8;stroke-width:2}.success{fill:#123329;stroke:#34d399;stroke-width:2}.failure{fill:#351824;stroke:#fb7185;stroke-width:2}.future{fill:#2f2614;stroke:#f59e0b;stroke-width:2}.title{font:700 34px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#f8fafc}.subtitle{font:400 17px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#cbd5e1}.section{font:700 22px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#f8fafc}.section-note{font:400 13px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#94a3b8}.label{font:700 16px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#f8fafc}.body{font:400 13px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#cbd5e1}.small{font:400 12px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#94a3b8}.tiny{font:400 11px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#94a3b8}.number{font:700 18px system-ui,-apple-system,"Segoe UI",sans-serif;fill:#0b1020}.arrow{stroke:#94a3b8;stroke-width:2.4;fill:none;marker-end:url(#arrow)}.blue{stroke:#60a5fa;stroke-width:2.5;fill:none;marker-end:url(#blue-arrow)}.green{stroke:#34d399;stroke-width:2.5;fill:none;marker-end:url(#green-arrow)}.red{stroke:#fb7185;stroke-width:2.5;fill:none;marker-end:url(#red-arrow)}.dashed{stroke-dasharray:8 7}.divider{stroke:#334155;stroke-width:1}
+    </style>
+  </defs>
+
+  <rect class="bg" width="1900" height="2020"/>
+  <rect x="35" y="30" width="1830" height="85" rx="18" fill="url(#header)"/>
+  <text class="title" x="70" y="72">EVE.AIC · 第一阶段总览</text>
+  <text class="subtitle" x="70" y="98">Rust Runtime · 一切皆插件 · 定义层 / 实现层 / 组合层 · 可控生命周期与可恢复状态</text>
+  <text class="small" x="1825" y="73" text-anchor="end">PR #1 · 中文统一版</text>
+  <text class="small" x="1825" y="96" text-anchor="end">当前目标：稳定的插件运行底座</text>
+
+  <!-- 1. 分层架构 -->
+  <rect class="panel" x="35" y="140" width="1830" height="355" rx="18"/>
+  <text class="section" x="70" y="180">一、总体架构：能力通过插件进入 Runtime</text>
+  <text class="section-note" x="70" y="203">内核只提供边界、生命周期和资源所有权；具体能力由插件实现并可替换</text>
+  <rect class="definition" x="70" y="225" width="1760" height="75" rx="12"/>
+  <text class="label" x="95" y="252">定义层（Phase 0–1）</text>
+  <text class="body" x="95" y="276">Plugin · PluginManifest · PluginContext · Dependency · Permission · Handle · Error · Service / Event / State 协议</text>
+  <path class="blue" d="M950 300 950 325"/>
+  <rect class="implementation" x="70" y="325" width="1760" height="75" rx="12"/>
+  <text class="label" x="95" y="352">实现层（Phase 2–4）</text>
+  <text class="body" x="95" y="376">Kernel Runtime · Registry · Dependency Resolver · Lifecycle · Scope / Cleanup · Event Bus · Service Registry · State Store · Task · Permission · Diagnostics</text>
+  <path class="green" d="M950 400 950 425"/>
+  <rect class="composition" x="70" y="425" width="1760" height="48" rx="12"/>
+  <text class="label" x="95" y="455">组合层（Host）</text>
+  <text class="body" x="300" y="455">装配配置、注册静态可信插件、选择接口实现、启动 Runtime；插件只能经由 PluginContext 访问能力</text>
+
+  <!-- 2. 功能关系 -->
+  <rect class="panel" x="35" y="520" width="1830" height="305" rx="18"/>
+  <text class="section" x="70" y="560">二、核心功能关系：PluginContext 是唯一运行时边界</text>
+  <text class="section-note" x="70" y="583">每项基础能力都是抽象接口，可在组合层替换实现；插件不直接依赖 Kernel 内部对象</text>
+  <rect class="composition" x="685" y="625" width="530" height="135" rx="16"/>
+  <text class="label" x="950" y="662" text-anchor="middle">PluginContext</text>
+  <text class="body" x="950" y="689" text-anchor="middle">插件的唯一 Runtime 入口</text>
+  <text class="small" x="950" y="715" text-anchor="middle">生命周期 · 资源范围 · 事件 · 服务 · 状态 · 任务 · 权限 · 日志</text>
+  <text class="small" x="950" y="738" text-anchor="middle">所有句柄随 Scope 结束而失效或清理</text>
+  <rect class="definition" x="70" y="625" width="270" height="66" rx="12"/><text class="label" x="205" y="653" text-anchor="middle">Plugin API</text><text class="small" x="205" y="675" text-anchor="middle">契约 / 清单 / 依赖 / 错误</text>
+  <rect class="implementation" x="70" y="710" width="270" height="66" rx="12"/><text class="label" x="205" y="738" text-anchor="middle">Registry + Resolver</text><text class="small" x="205" y="760" text-anchor="middle">登记插件 / 服务 / 依赖图</text>
+  <rect class="implementation" x="1560" y="625" width="270" height="66" rx="12"/><text class="label" x="1695" y="653" text-anchor="middle">Lifecycle Manager</text><text class="small" x="1695" y="675" text-anchor="middle">状态机 / 拓扑启动 / 逆序停止</text>
+  <rect class="implementation" x="1560" y="710" width="270" height="66" rx="12"/><text class="label" x="1695" y="738" text-anchor="middle">Resource Scope</text><text class="small" x="1695" y="760" text-anchor="middle">监听器 / 任务 / 连接自动清理</text>
+  <path class="blue" d="M340 658 685 658"/><path class="green" d="M340 743 685 743"/>
+  <path class="green" d="M1215 658 1560 658"/><path class="green" d="M1215 743 1560 743"/>
+
+  <!-- 3. 功能模块 -->
+  <rect class="panel" x="35" y="850" width="1830" height="255" rx="18"/>
+  <text class="section" x="70" y="890">三、第一版实现功能：基础服务协作面</text>
+  <text class="section-note" x="70" y="913">Phase 3 提供协作能力，Phase 4 提供持久化、恢复与诊断；认知能力留在插件扩展边界</text>
+  <g>
+    <rect class="implementation" x="70" y="950" width="205" height="100" rx="12"/><text class="label" x="172" y="982" text-anchor="middle">Event Bus</text><text class="small" x="172" y="1007" text-anchor="middle">发布 / 订阅 / 广播</text><text class="tiny" x="172" y="1029" text-anchor="middle">监听器错误隔离</text>
+    <rect class="implementation" x="295" y="950" width="205" height="100" rx="12"/><text class="label" x="397" y="982" text-anchor="middle">Service Registry</text><text class="small" x="397" y="1007" text-anchor="middle">字符串 ID + 类型约束</text><text class="tiny" x="397" y="1029" text-anchor="middle">Provider / Consumer</text>
+    <rect class="implementation" x="520" y="950" width="205" height="100" rx="12"/><text class="label" x="622" y="982" text-anchor="middle">State Store</text><text class="small" x="622" y="1007" text-anchor="middle">抽象接口 / 多实现</text><text class="tiny" x="622" y="1029" text-anchor="middle">命名空间 / 快照</text>
+    <rect class="implementation" x="745" y="950" width="205" height="100" rx="12"/><text class="label" x="847" y="982" text-anchor="middle">Task Manager</text><text class="small" x="847" y="1007" text-anchor="middle">Tokio 任务 / 取消</text><text class="tiny" x="847" y="1029" text-anchor="middle">停止时等待收敛</text>
+    <rect class="implementation" x="970" y="950" width="205" height="100" rx="12"/><text class="label" x="1072" y="982" text-anchor="middle">Permission</text><text class="small" x="1072" y="1007" text-anchor="middle">声明 / 检查 / 限制</text><text class="tiny" x="1072" y="1029" text-anchor="middle">抽象接口</text>
+    <rect class="implementation" x="1195" y="950" width="205" height="100" rx="12"/><text class="label" x="1297" y="982" text-anchor="middle">Logger</text><text class="small" x="1297" y="1007" text-anchor="middle">结构化日志</text><text class="tiny" x="1297" y="1029" text-anchor="middle">可观察性</text>
+    <rect class="process" x="1420" y="950" width="205" height="100" rx="12"/><text class="label" x="1522" y="982" text-anchor="middle">Diagnostics</text><text class="small" x="1522" y="1007" text-anchor="middle">状态 / 错误 / 清理汇总</text><text class="tiny" x="1522" y="1029" text-anchor="middle">恢复依据</text>
+    <rect class="future" x="1645" y="950" width="185" height="100" rx="12"/><text class="label" x="1737" y="982" text-anchor="middle">扩展插件</text><text class="small" x="1737" y="1007" text-anchor="middle">LLM / Memory / 工具</text><text class="tiny" x="1737" y="1029" text-anchor="middle">后续阶段接入</text>
+  </g>
+
+  <!-- 4. 生命周期流程 -->
+  <rect class="panel" x="35" y="1130" width="1830" height="340" rx="18"/>
+  <text class="section" x="70" y="1170">四、插件生命周期流程：启动可回滚，停止可逆序清理</text>
+  <text class="section-note" x="70" y="1193">成功路径、启动失败路径和停止路径均可诊断；消费者依赖提供者，因此停止顺序相反</text>
+  <rect class="success" x="70" y="1230" width="190" height="62" rx="12"/><text class="label" x="165" y="1257" text-anchor="middle">Registered</text><text class="tiny" x="165" y="1278" text-anchor="middle">注册</text>
+  <path class="green" d="M260 1261 300 1261"/>
+  <rect class="process" x="300" y="1230" width="220" height="62" rx="12"/><text class="label" x="410" y="1257" text-anchor="middle">Waiting Dependencies</text><text class="tiny" x="410" y="1278" text-anchor="middle">等待依赖</text>
+  <path class="green" d="M520 1261 560 1261"/>
+  <rect class="process" x="560" y="1230" width="170" height="62" rx="12"/><text class="label" x="645" y="1257" text-anchor="middle">Starting</text><text class="tiny" x="645" y="1278" text-anchor="middle">创建 Scope</text>
+  <path class="green" d="M730 1261 770 1261"/>
+  <rect class="success" x="770" y="1230" width="170" height="62" rx="12"/><text class="label" x="855" y="1257" text-anchor="middle">Active</text><text class="tiny" x="855" y="1278" text-anchor="middle">提供服务 / 事件</text>
+  <path class="green" d="M940 1261 980 1261"/>
+  <rect class="process" x="980" y="1230" width="180" height="62" rx="12"/><text class="label" x="1070" y="1257" text-anchor="middle">Stopping</text><text class="tiny" x="1070" y="1278" text-anchor="middle">停止 Runtime</text>
+  <path class="green" d="M1160 1261 1200 1261"/>
+  <rect class="process" x="1200" y="1230" width="260" height="62" rx="12"/><text class="label" x="1330" y="1257" text-anchor="middle">Reverse Async Cleanup</text><text class="tiny" x="1330" y="1278" text-anchor="middle">逆序异步 Cleanup</text>
+  <path class="green" d="M1460 1261 1500 1261"/>
+  <rect class="success" x="1500" y="1230" width="160" height="62" rx="12"/><text class="label" x="1580" y="1257" text-anchor="middle">Stopped</text><text class="tiny" x="1580" y="1278" text-anchor="middle">已停止</text>
+  <path class="red" d="M645 1292 645 1360 510 1360"/>
+  <text class="tiny" x="658" y="1348">启动失败</text>
+  <rect class="failure" x="270" y="1330" width="240" height="62" rx="12"/><text class="label" x="390" y="1357" text-anchor="middle">当前插件清理</text><text class="tiny" x="390" y="1378" text-anchor="middle">释放已取得资源</text>
+  <path class="red" d="M270 1361 180 1361"/>
+  <rect class="failure" x="70" y="1330" width="110" height="62" rx="12"/><text class="label" x="125" y="1357" text-anchor="middle">Failed</text><text class="tiny" x="125" y="1378" text-anchor="middle">可诊断</text>
+  <path class="arrow" d="M1580 1292 1580 1360 1490 1360"/>
+  <text class="tiny" x="1595" y="1348">停止分支</text>
+  <rect class="process" x="1180" y="1330" width="310" height="62" rx="12"/><text class="label" x="1335" y="1357" text-anchor="middle">消费者先退出</text><text class="tiny" x="1335" y="1378" text-anchor="middle">取消任务 / 删除监听 / 写入状态</text>
+  <path class="arrow" d="M1180 1361 940 1361"/>
+  <rect class="process" x="700" y="1330" width="240" height="62" rx="12"/><text class="label" x="820" y="1357" text-anchor="middle">提供者后退出</text><text class="tiny" x="820" y="1378" text-anchor="middle">撤销 Service / 释放资源</text>
+  <path class="arrow" d="M700 1361 530 1361"/>
+  <rect class="process" x="270" y="1410" width="260" height="40" rx="10"/><text class="small" x="400" y="1435" text-anchor="middle">保存快照 → 下次启动恢复 State</text>
+  <path class="arrow" d="M400 1392 400 1410"/>
+
+  <!-- 5. 实现流程 -->
+  <rect class="panel" x="35" y="1500" width="1830" height="205" rx="18"/>
+  <text class="section" x="70" y="1540">五、实现流程：从架构决策到可审查 PR</text>
+  <text class="section-note" x="70" y="1563">每一步产出可验证的契约或行为，后续能力不得绕过抽象层直接进入 Kernel</text>
+  <g>
+    <circle cx="115" cy="1625" r="20" fill="#60a5fa"/><text class="number" x="115" y="1631" text-anchor="middle">0</text><text class="label" x="115" y="1668" text-anchor="middle">架构决策</text><text class="tiny" x="115" y="1687" text-anchor="middle">Rust / 插件原则</text>
+    <path class="blue" d="M140 1625 315 1625"/>
+    <circle cx="340" cy="1625" r="20" fill="#60a5fa"/><text class="number" x="340" y="1631" text-anchor="middle">1</text><text class="label" x="340" y="1668" text-anchor="middle">定义层契约</text><text class="tiny" x="340" y="1687" text-anchor="middle">Trait / 类型 / 错误</text>
+    <path class="blue" d="M365 1625 540 1625"/>
+    <circle cx="565" cy="1625" r="20" fill="#34d399"/><text class="number" x="565" y="1631" text-anchor="middle">2</text><text class="label" x="565" y="1668" text-anchor="middle">Kernel 实现</text><text class="tiny" x="565" y="1687" text-anchor="middle">Tokio / 生命周期</text>
+    <path class="green" d="M590 1625 765 1625"/>
+    <circle cx="790" cy="1625" r="20" fill="#34d399"/><text class="number" x="790" y="1631" text-anchor="middle">3</text><text class="label" x="790" y="1668" text-anchor="middle">Runtime 组合</text><text class="tiny" x="790" y="1687" text-anchor="middle">选择实现 / 装配插件</text>
+    <path class="green" d="M815 1625 990 1625"/>
+    <circle cx="1015" cy="1625" r="20" fill="#a78bfa"/><text class="number" x="1015" y="1631" text-anchor="middle">4</text><text class="label" x="1015" y="1668" text-anchor="middle">插件协作验收</text><text class="tiny" x="1015" y="1687" text-anchor="middle">Provider / Consumer</text>
+    <path class="arrow" d="M1040 1625 1215 1625"/>
+    <circle cx="1240" cy="1625" r="20" fill="#a78bfa"/><text class="number" x="1240" y="1631" text-anchor="middle">5</text><text class="label" x="1240" y="1668" text-anchor="middle">测试与 PR</text><text class="tiny" x="1240" y="1687" text-anchor="middle">XML / 行为 / 审查</text>
+    <path class="arrow" d="M1265 1625 1440 1625"/>
+    <rect class="success" x="1460" y="1595" width="330" height="60" rx="12"/><text class="label" x="1625" y="1621" text-anchor="middle">合并后进入下一阶段</text><text class="tiny" x="1625" y="1642" text-anchor="middle">所有仓库更新走 PR</text>
+  </g>
+
+  <!-- 6. 验收效果 -->
+  <rect class="panel" x="35" y="1740" width="1830" height="165" rx="18"/>
+  <text class="section" x="70" y="1780">六、第一阶段验收效果：两个插件完成一次可控协作</text>
+  <rect class="success" x="70" y="1810" width="300" height="68" rx="12"/><text class="label" x="220" y="1838" text-anchor="middle">Provider Plugin</text><text class="small" x="220" y="1861" text-anchor="middle">注册 Service · 发布 Event</text>
+  <path class="green" d="M370 1844 475 1844"/>
+  <rect class="process" x="475" y="1810" width="390" height="68" rx="12"/><text class="label" x="670" y="1838" text-anchor="middle">PluginContext 协作通道</text><text class="small" x="670" y="1861" text-anchor="middle">依赖解析 · Service 获取 · Event 订阅</text>
+  <path class="green" d="M865 1844 970 1844"/>
+  <rect class="success" x="970" y="1810" width="300" height="68" rx="12"/><text class="label" x="1120" y="1838" text-anchor="middle">Consumer Plugin</text><text class="small" x="1120" y="1861" text-anchor="middle">声明依赖 · 写入 State</text>
+  <path class="green" d="M1270 1844 1375 1844"/>
+  <rect class="success" x="1375" y="1810" width="455" height="68" rx="12"/><text class="label" x="1602" y="1838" text-anchor="middle">停止结果</text><text class="small" x="1602" y="1861" text-anchor="middle">消费者先退出 → 提供者后退出 → 监听器 / 任务 / Service 自动清理</text>
+
+  <!-- 7. 路线 -->
+  <rect class="panel" x="35" y="1940" width="1830" height="55" rx="16"/>
+  <text class="section" x="70" y="1975">七、阶段路线</text>
+  <text class="small" x="260" y="1975">Phase 0 文档与边界</text><text class="small" x="510" y="1975">→ Phase 1 Plugin API</text><text class="small" x="755" y="1975">→ Phase 2 Kernel Runtime</text><text class="small" x="1040" y="1975">→ Phase 3 基础服务</text><text class="small" x="1280" y="1975">→ Phase 4 恢复与诊断</text><text class="small" x="1530" y="1975">→ Phase 5 插件扩展边界</text>
+  <text class="tiny" x="1825" y="2015" text-anchor="end">Phase 5 才评估 WASM、独立进程、版本化协议、安装更新、沙箱与资源配额</text>
+</svg>
