@@ -11,3 +11,5 @@ edition = "2024"
 version = "0.1.0"
 license = "MIT"
 
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

@@ -5,13 +5,34 @@
 
 use std::any::Any;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 /// The result type used by the plugin boundary.
 pub type PluginResult<T> = Result<T, PluginError>;
 
-/// A cleanup action owned by a plugin scope.
-pub type Cleanup = Box<dyn FnOnce() -> PluginResult<()> + Send + 'static>;
+/// An executor-independent, Send future for the object-safe plugin boundary.
+pub type PluginFuture<'a, T> = Pin<Box<dyn Future<Output = PluginResult<T>> + Send + 'a>>;
+
+/// A one-shot asynchronous cleanup action owned by a plugin scope.
+/// The kernel awaits actions sequentially in reverse registration order.
+pub type Cleanup = Box<dyn FnOnce() -> PluginFuture<'static, ()> + Send + 'static>;
+
+/// Box an asynchronous cleanup action without exposing its future type.
+///
+/// ```
+/// use eve_plugin_api::cleanup;
+/// let action = cleanup(|| async { Ok(()) });
+/// # drop(action);
+/// ```
+pub fn cleanup<F, Fut>(action: F) -> Cleanup
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = PluginResult<()>> + Send + 'static,
+{
+    Box::new(move || Box::pin(action()))
+}
 
 /// A stable identifier for a plugin.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -285,7 +306,9 @@ pub trait Plugin: Send {
     /// Start the plugin. Resources created through the context are owned by
     /// the plugin scope and are cleaned up automatically when it stops.
     /// The optional return value is an additional explicit cleanup action.
-    fn start(&mut self, ctx: PluginContext) -> PluginResult<Option<Cleanup>>;
+    /// Return `Box::pin(async move { ... })`; the future may borrow `self`.
+    /// A plugin becomes active only after this future completes successfully.
+    fn start(&mut self, ctx: PluginContext) -> PluginFuture<'_, Option<Cleanup>>;
 }
 
 /// Errors crossing the plugin boundary.
@@ -311,6 +334,7 @@ pub enum PluginError {
     State(String),
     Event(String),
     Cleanup(String),
+    Lifecycle(String),
 }
 
 impl fmt::Display for PluginError {
@@ -333,6 +357,7 @@ impl fmt::Display for PluginError {
             Self::State(message) => write!(f, "state error: {message}"),
             Self::Event(message) => write!(f, "event error: {message}"),
             Self::Cleanup(message) => write!(f, "cleanup error: {message}"),
+            Self::Lifecycle(message) => write!(f, "lifecycle error: {message}"),
         }
     }
 }
