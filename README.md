@@ -28,7 +28,7 @@ cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 ~~~
 
-项目是 Cargo Workspace：plugin-api 定义契约，kernel 实现内核，runtime 提供宿主示例。详见 [docs](./docs/README.md)。
+项目是 Cargo Workspace：plugin-api 定义契约，kernel 提供默认实现，runtime 负责组合宿主。所有功能遵循“定义层、实现层、组合层”分离原则。详见 [docs](./docs/README.md)。
 
 ## 第一版边界
 
