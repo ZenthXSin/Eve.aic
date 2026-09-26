@@ -195,3 +195,124 @@ async fn failed_start_rolls_back_dependencies_started_for_the_request() {
     assert_eq!(kernel.state(&failing), Some(PluginState::Failed));
     assert_eq!(kernel.state(&producer), Some(PluginState::Stopped));
 }
+
+#[tokio::test]
+async fn failed_start_removes_services_registered_before_the_error() {
+    struct FailingServicePlugin {
+        manifest: PluginManifest,
+    }
+
+    impl Plugin for FailingServicePlugin {
+        fn manifest(&self) -> &PluginManifest {
+            &self.manifest
+        }
+
+        fn start(&mut self, ctx: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
+            let plugin = ctx.plugin().id.clone();
+            Box::pin(async move {
+                ctx.provide_service(ServiceId::new("transient")?, 7_u32)?;
+                Err(PluginError::PluginFailed {
+                    plugin,
+                    message: "expected failure after registration".to_string(),
+                })
+            })
+        }
+    }
+
+    struct HealthyServicePlugin {
+        manifest: PluginManifest,
+    }
+
+    impl Plugin for HealthyServicePlugin {
+        fn manifest(&self) -> &PluginManifest {
+            &self.manifest
+        }
+
+        fn start(&mut self, ctx: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
+            Box::pin(async move {
+                ctx.provide_service(ServiceId::new("transient")?, 8_u32)?;
+                Ok(None)
+            })
+        }
+    }
+
+    let kernel = Kernel::new();
+    kernel
+        .register(Box::new(FailingServicePlugin {
+            manifest: PluginManifest::new("failing-service", "0.1.0").unwrap(),
+        }))
+        .unwrap();
+    kernel
+        .register(Box::new(HealthyServicePlugin {
+            manifest: PluginManifest::new("healthy-service", "0.1.0").unwrap(),
+        }))
+        .unwrap();
+
+    let failing = PluginId::new("failing-service").unwrap();
+    let healthy = PluginId::new("healthy-service").unwrap();
+    assert!(kernel.start(&failing).await.is_err());
+    kernel.start(&healthy).await.unwrap();
+
+    let service = kernel
+        .inner
+        .services
+        .lock()
+        .unwrap()
+        .get(&ServiceId::new("transient").unwrap())
+        .unwrap()
+        .value
+        .clone()
+        .downcast::<u32>()
+        .unwrap();
+    assert_eq!(*service, 8);
+}
+
+#[tokio::test]
+async fn stopped_plugin_context_cannot_register_new_services() {
+    struct ContextHolderPlugin {
+        manifest: PluginManifest,
+        context: Arc<Mutex<Option<PluginContext>>>,
+    }
+
+    impl Plugin for ContextHolderPlugin {
+        fn manifest(&self) -> &PluginManifest {
+            &self.manifest
+        }
+
+        fn start(&mut self, ctx: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
+            let context = self.context.clone();
+            Box::pin(async move {
+                *context.lock().unwrap() = Some(ctx);
+                Ok(None)
+            })
+        }
+    }
+
+    let kernel = Kernel::new();
+    let context = Arc::new(Mutex::new(None));
+    kernel
+        .register(Box::new(ContextHolderPlugin {
+            manifest: PluginManifest::new("context-holder", "0.1.0").unwrap(),
+            context: context.clone(),
+        }))
+        .unwrap();
+
+    let id = PluginId::new("context-holder").unwrap();
+    kernel.start(&id).await.unwrap();
+    kernel.stop(&id).await.unwrap();
+
+    let context = context.lock().unwrap().take().unwrap();
+    assert!(
+        context
+            .provide_service(ServiceId::new("late-service").unwrap(), 1_u32)
+            .is_err()
+    );
+    assert!(
+        !kernel
+            .inner
+            .services
+            .lock()
+            .unwrap()
+            .contains_key(&ServiceId::new("late-service").unwrap())
+    );
+}

@@ -7,7 +7,7 @@
 - [企划案](./企划案.md)：项目愿景、目标和范围。
 - [开发计划](./开发计划.md)：阶段目标、优先级和完成条件。
 - [执行书](./执行书.md)：当前阶段的具体执行顺序和工作规则。
-- [架构设计](./架构设计.md)：Rust Runtime、Plugin 和内核边界。
+- [架构设计](./架构设计.md)：Rust Runtime、插件和内核边界。
 - [决策记录](./决策记录.md)：已经确认的技术和架构决策。
 - [待确认问题](./待确认问题.md)：尚未决定、需要逐步讨论的问题。
 
@@ -18,16 +18,16 @@
 当前优先目标是建立稳定的 Rust 插件 Runtime：
 
 ```text
-Plugin Registry
+插件注册
     ↓
-Dependency Resolution
+依赖解析
     ↓
-Plugin Lifecycle
+插件生命周期
     ↓
-Context
+Context 边界
     ↓
-Event / Service / State / Task
+事件 / 服务 / 状态 / 任务
     ↓
-Cleanup / Shutdown / Recovery
+清理 / 停止 / 恢复
 ```
 
