@@ -3,6 +3,7 @@
 pub mod backends;
 mod context;
 mod lifecycle;
+mod panic_boundary;
 mod scope;
 
 use context::KernelHooks;
