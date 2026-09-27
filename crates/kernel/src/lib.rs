@@ -1,17 +1,18 @@
-//! An embeddable Tokio host for trusted, statically linked plugins.
+//! 可信静态插件的 Tokio 宿主，能力后端由组合层注入。
 
+pub mod backends;
+mod context;
 mod lifecycle;
 mod scope;
 
+use context::KernelHooks;
 use eve_plugin_api::{
-    Event, EventHandler, EventId, Plugin, PluginContext, PluginError, PluginId, PluginInfo,
-    PluginManifest, PluginResult, RuntimeHooks, ServiceId, cleanup,
+    EventBus, PermissionChecker, Plugin, PluginContext, PluginError, PluginId, PluginInfo,
+    PluginManifest, PluginResult, ServiceRegistry, StateStore,
 };
 use scope::PluginScope;
-use std::any::Any;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,25 +33,31 @@ struct PluginSlot {
     scope: Mutex<Option<Arc<PluginScope>>>,
 }
 
-struct Listener {
-    id: u64,
-    scope: Weak<PluginScope>,
-    handler: EventHandler,
+/// 组合层按能力选择后端；每个 Kernel 默认拥有独立的内存后端。
+/// Event Bus / Service Registry 应属于同一个 Runtime，避免插件 ID 跨 Runtime 冲突。
+pub struct KernelServices {
+    pub events: Arc<dyn EventBus>,
+    pub registry: Arc<dyn ServiceRegistry>,
+    pub state: Arc<dyn StateStore>,
+    pub permissions: Arc<dyn PermissionChecker>,
 }
 
-struct ServiceEntry {
-    owner: PluginId,
-    value: Arc<dyn Any + Send + Sync>,
+impl Default for KernelServices {
+    fn default() -> Self {
+        Self {
+            events: Arc::new(backends::SyncEventBus::default()),
+            registry: Arc::new(backends::MemoryServiceRegistry::default()),
+            state: Arc::new(backends::MemoryStateStore::default()),
+            permissions: Arc::new(backends::DeclaredPermissionChecker),
+        }
+    }
 }
 
 #[derive(Default)]
 struct KernelInner {
     lifecycle: AsyncMutex<()>,
     plugins: Mutex<HashMap<PluginId, Arc<PluginSlot>>>,
-    listeners: Mutex<HashMap<EventId, Vec<Listener>>>,
-    services: Mutex<HashMap<ServiceId, ServiceEntry>>,
-    state: Mutex<HashMap<(PluginId, String), Vec<u8>>>,
-    next_listener: AtomicU64,
+    services: KernelServices,
 }
 
 #[derive(Clone, Default)]
@@ -61,6 +68,15 @@ pub struct Kernel {
 impl Kernel {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_services(services: KernelServices) -> Self {
+        Self {
+            inner: Arc::new(KernelInner {
+                services,
+                ..KernelInner::default()
+            }),
+        }
     }
 
     pub fn register(&self, plugin: Box<dyn Plugin>) -> PluginResult<()> {
@@ -126,181 +142,9 @@ impl Kernel {
         let hooks = Arc::new(KernelHooks {
             kernel: Arc::downgrade(&self.inner),
             scope,
+            manifest: slot.manifest.clone(),
         });
         PluginContext::new(PluginInfo::from(&slot.manifest), hooks)
-    }
-}
-
-struct KernelHooks {
-    kernel: Weak<KernelInner>,
-    scope: Arc<PluginScope>,
-}
-
-impl KernelHooks {
-    fn kernel(&self) -> PluginResult<Kernel> {
-        self.kernel
-            .upgrade()
-            .map(|inner| Kernel { inner })
-            .ok_or_else(|| PluginError::Lifecycle("runtime has been dropped".into()))
-    }
-}
-
-impl RuntimeHooks for KernelHooks {
-    fn emit(&self, _owner: &PluginId, event: Event) -> PluginResult<()> {
-        let kernel = self.kernel()?;
-        let handlers: Vec<_> = self.scope.access(|| {
-            kernel
-                .inner
-                .listeners
-                .lock()
-                .expect("listener lock poisoned")
-                .get(&event.id)
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .map(|entry| (entry.scope.clone(), entry.handler.clone()))
-                        .collect()
-                })
-                .unwrap_or_default()
-        })?;
-        let mut first_error = None;
-        for (scope, handler) in handlers {
-            if scope.upgrade().is_some_and(|scope| scope.is_open())
-                && let Err(error) = handler(&event)
-            {
-                first_error.get_or_insert(error);
-            }
-        }
-        first_error.map_or(Ok(()), Err)
-    }
-
-    fn subscribe(
-        &self,
-        _owner: &PluginId,
-        event: EventId,
-        handler: EventHandler,
-    ) -> PluginResult<()> {
-        let kernel = self.kernel()?;
-        self.scope.resource(|| {
-            let listener_id = kernel.inner.next_listener.fetch_add(1, Ordering::Relaxed);
-            kernel
-                .inner
-                .listeners
-                .lock()
-                .expect("listener lock poisoned")
-                .entry(event.clone())
-                .or_default()
-                .push(Listener {
-                    id: listener_id,
-                    scope: Arc::downgrade(&self.scope),
-                    handler,
-                });
-            let weak = self.kernel.clone();
-            Ok(cleanup(move || async move {
-                if let Some(inner) = weak.upgrade() {
-                    let mut listeners = inner.listeners.lock().expect("listener lock poisoned");
-                    if let Some(entries) = listeners.get_mut(&event) {
-                        entries.retain(|entry| entry.id != listener_id);
-                        if entries.is_empty() {
-                            listeners.remove(&event);
-                        }
-                    }
-                }
-                Ok(())
-            }))
-        })
-    }
-
-    fn provide_service(
-        &self,
-        owner: &PluginId,
-        id: ServiceId,
-        service: Arc<dyn Any + Send + Sync>,
-    ) -> PluginResult<()> {
-        let kernel = self.kernel()?;
-        self.scope.resource(|| {
-            let mut services = kernel.inner.services.lock().expect("service lock poisoned");
-            if services.contains_key(&id) {
-                return Err(PluginError::ServiceConflict(id));
-            }
-            services.insert(
-                id.clone(),
-                ServiceEntry {
-                    owner: owner.clone(),
-                    value: service,
-                },
-            );
-            let weak = self.kernel.clone();
-            Ok(cleanup(move || async move {
-                if let Some(inner) = weak.upgrade() {
-                    inner
-                        .services
-                        .lock()
-                        .expect("service lock poisoned")
-                        .remove(&id);
-                }
-                Ok(())
-            }))
-        })
-    }
-
-    fn get_service(&self, id: &ServiceId) -> Option<Arc<dyn Any + Send + Sync>> {
-        let kernel = self.kernel().ok()?;
-        self.scope
-            .access(|| {
-                let entry = kernel
-                    .inner
-                    .services
-                    .lock()
-                    .expect("service lock poisoned")
-                    .get(id)
-                    .map(|entry| (entry.owner.clone(), entry.value.clone()));
-                entry.and_then(|(owner, value)| {
-                    matches!(
-                        kernel.state(&owner),
-                        Some(PluginState::Active | PluginState::Stopping)
-                    )
-                    .then_some(value)
-                })
-            })
-            .ok()
-            .flatten()
-    }
-
-    fn state_get(&self, owner: &PluginId, key: &str) -> Option<Vec<u8>> {
-        let kernel = self.kernel().ok()?;
-        self.scope
-            .access(|| {
-                kernel
-                    .inner
-                    .state
-                    .lock()
-                    .expect("state lock poisoned")
-                    .get(&(owner.clone(), key.to_string()))
-                    .cloned()
-            })
-            .ok()
-            .flatten()
-    }
-
-    fn state_set(&self, owner: &PluginId, key: String, value: Vec<u8>) -> PluginResult<()> {
-        let kernel = self.kernel()?;
-        self.scope.access(|| {
-            kernel
-                .inner
-                .state
-                .lock()
-                .expect("state lock poisoned")
-                .insert((owner.clone(), key), value);
-        })
-    }
-
-    fn register_cleanup(
-        &self,
-        _owner: &PluginId,
-        cleanup: eve_plugin_api::Cleanup,
-    ) -> PluginResult<()> {
-        self.scope.resource(|| Ok(cleanup))
     }
 }
 

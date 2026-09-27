@@ -3,6 +3,7 @@ members = [
     "crates/plugin-api",
     "crates/kernel",
     "crates/runtime",
+    "crates/example-plugins",
 ]
 resolver = "2"
 
