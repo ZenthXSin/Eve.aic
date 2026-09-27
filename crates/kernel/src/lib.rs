@@ -3,29 +3,24 @@
 pub mod backends;
 mod context;
 mod lifecycle;
+mod operations;
+mod panic_boundary;
 mod scope;
 
 use context::KernelHooks;
 use eve_plugin_api::{
-    EventBus, PermissionChecker, Plugin, PluginContext, PluginError, PluginId, PluginInfo,
-    PluginManifest, PluginResult, ServiceRegistry, StateStore, TaskManager,
+    EventBus, Logger, PermissionChecker, Plugin, PluginContext, PluginError, PluginId, PluginInfo,
+    PluginManifest, PluginResult, PluginStatus, RuntimeInspector, ServiceRegistry, StateStore,
+    TaskManager,
 };
 use scope::PluginScope;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PluginState {
-    Registered,
-    WaitingDependencies,
-    Starting,
-    Active,
-    Stopping,
-    Stopped,
-    Failed,
-}
+// 保留原导出路径，生命周期定义归入契约层。
+pub use eve_plugin_api::PluginState;
 
 struct PluginSlot {
     manifest: PluginManifest,
@@ -42,6 +37,7 @@ pub struct KernelServices {
     pub state: Arc<dyn StateStore>,
     pub permissions: Arc<dyn PermissionChecker>,
     pub tasks: Arc<dyn TaskManager>,
+    pub logger: Arc<dyn Logger>,
 }
 
 impl Default for KernelServices {
@@ -52,6 +48,7 @@ impl Default for KernelServices {
             state: Arc::new(backends::MemoryStateStore::default()),
             permissions: Arc::new(backends::DeclaredPermissionChecker),
             tasks: Arc::new(backends::TokioTaskManager::default()),
+            logger: Arc::new(backends::StderrLogger::default()),
         }
     }
 }
@@ -60,6 +57,8 @@ impl Default for KernelServices {
 pub struct KernelConfig {
     pub task_shutdown_timeout: Duration,
     pub task_abort_timeout: Duration,
+    /// 未确认的生命周期记录上限；满时拒绝新操作，不淘汰旧错误。
+    pub lifecycle_report_capacity: usize,
 }
 
 impl Default for KernelConfig {
@@ -67,13 +66,15 @@ impl Default for KernelConfig {
         Self {
             task_shutdown_timeout: Duration::from_secs(5),
             task_abort_timeout: Duration::from_millis(100),
+            lifecycle_report_capacity: 128,
         }
     }
 }
 
 #[derive(Default)]
 struct KernelInner {
-    lifecycle: AsyncMutex<()>,
+    lifecycle: Arc<AsyncMutex<()>>,
+    operations: Mutex<operations::OperationRegistry>,
     plugins: Mutex<HashMap<PluginId, Arc<PluginSlot>>>,
     services: KernelServices,
     config: KernelConfig,
@@ -104,6 +105,7 @@ impl Kernel {
     }
 
     pub fn register(&self, plugin: Box<dyn Plugin>) -> PluginResult<()> {
+        let _registration = self.registration_guard()?;
         let manifest = plugin.manifest().clone();
         let id = manifest.id.clone();
         let mut plugins = self.inner.plugins.lock().expect("plugin lock poisoned");
@@ -122,16 +124,54 @@ impl Kernel {
         Ok(())
     }
 
+    /// 注册表变更与生命周期快照串行化，避免运行中的 start/stop 漏掉新插件。
+    fn registration_guard(&self) -> PluginResult<AsyncMutexGuard<'_, ()>> {
+        self.ensure_lifecycle_healthy()?;
+        self.inner
+            .lifecycle
+            .try_lock()
+            .map_err(|_| PluginError::Lifecycle("生命周期操作正在执行，不能注册插件".into()))
+    }
+
     pub fn state(&self, id: &PluginId) -> Option<PluginState> {
         self.slot(id)
             .ok()
             .map(|slot| *slot.state.lock().expect("state lock poisoned"))
     }
 
+    /// 获取已注册插件的状态快照；不等待生命周期锁。
+    pub fn plugins(&self) -> PluginResult<Vec<PluginStatus>> {
+        let slots = self
+            .inner
+            .plugins
+            .lock()
+            .map_err(|_| PluginError::Lifecycle("插件注册表锁中毒".into()))?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut statuses = Vec::with_capacity(slots.len());
+        for slot in slots {
+            statuses.push(PluginStatus {
+                info: PluginInfo::from(&slot.manifest),
+                state: *slot
+                    .state
+                    .lock()
+                    .map_err(|_| PluginError::Lifecycle("插件状态锁中毒".into()))?,
+            });
+        }
+        statuses.sort_by(|a, b| a.info.id.cmp(&b.info.id));
+        Ok(statuses)
+    }
+
     /// 宿主查询任务，包括停止后尚未确认退出的任务。
     pub fn tasks(&self, id: &PluginId) -> PluginResult<Vec<eve_plugin_api::TaskInfo>> {
         self.slot(id)?;
         self.inner.services.tasks.list(id)
+    }
+
+    /// 宿主停止日志生产后显式刷新；即使插件停止失败，也可尝试排出已有日志。
+    pub fn flush_logs(&self) -> PluginResult<()> {
+        self.inner.services.logger.flush()
     }
 
     fn has(&self, id: &PluginId) -> bool {
@@ -175,6 +215,16 @@ impl Kernel {
             manifest: slot.manifest.clone(),
         });
         PluginContext::new(PluginInfo::from(&slot.manifest), hooks)
+    }
+}
+
+impl RuntimeInspector for Kernel {
+    fn plugins(&self) -> PluginResult<Vec<PluginStatus>> {
+        Kernel::plugins(self)
+    }
+
+    fn plugin_tasks(&self, id: &PluginId) -> PluginResult<Vec<eve_plugin_api::TaskInfo>> {
+        self.tasks(id)
     }
 }
 

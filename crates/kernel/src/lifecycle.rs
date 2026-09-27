@@ -1,13 +1,35 @@
 use super::{Kernel, PluginState};
+use crate::panic_boundary::contain_panic;
 use crate::scope::PluginScope;
-use eve_plugin_api::{PluginError, PluginId, PluginResult};
+use eve_plugin_api::{
+    LifecycleRequest, PluginError, PluginId, PluginResult, PluginStopError, StopStage,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 
 impl Kernel {
-    /// Start every registered plugin in deterministic id order.
+    /// 按 ID 顺序启动全部插件；准入后取消等待不取消操作，结果保留供查询。
     pub async fn start_all(&self) -> PluginResult<()> {
-        let _lifecycle = self.inner.lifecycle.lock().await;
+        self.run_lifecycle(LifecycleRequest::StartAll).await
+    }
+
+    /// 启动插件及依赖；正常返回时自动确认报告，取消等待时保留报告。
+    pub async fn start(&self, id: &PluginId) -> PluginResult<()> {
+        self.run_lifecycle(LifecycleRequest::Start(id.clone()))
+            .await
+    }
+
+    pub(crate) async fn execute_lifecycle(&self, request: LifecycleRequest) -> PluginResult<()> {
+        // 只从持有 owned 准入锁的 worker 调用，递归依赖不能再次提交操作。
+        match request {
+            LifecycleRequest::Start(id) => self.start_inner(&id).await,
+            LifecycleRequest::StartAll => self.start_all_inner().await,
+            LifecycleRequest::Stop(id) => self.stop_inner(&id, &mut HashSet::new()).await,
+            LifecycleRequest::StopAll => self.stop_all_inner().await,
+        }
+    }
+
+    async fn start_all_inner(&self) -> PluginResult<()> {
         let mut started = Vec::new();
         for id in self.plugin_ids() {
             let mut path = HashSet::new();
@@ -18,9 +40,7 @@ impl Kernel {
         Ok(())
     }
 
-    /// Start one plugin and all of its dependencies.
-    pub async fn start(&self, id: &PluginId) -> PluginResult<()> {
-        let _lifecycle = self.inner.lifecycle.lock().await;
+    async fn start_inner(&self, id: &PluginId) -> PluginResult<()> {
         let mut started = Vec::new();
         let mut path = HashSet::new();
         match self.start_with_path(id, &mut path, &mut started).await {
@@ -47,7 +67,7 @@ impl Kernel {
             }
         };
 
-        {
+        let previous_state = {
             let mut state = slot.state.lock().expect("state lock poisoned");
             match *state {
                 PluginState::Active => {
@@ -71,15 +91,17 @@ impl Kernel {
                 PluginState::Registered
                 | PluginState::WaitingDependencies
                 | PluginState::Stopped => {
+                    let previous = *state;
                     *state = PluginState::WaitingDependencies;
+                    previous
                 }
             }
-        }
+        };
 
         let dependencies = slot.manifest.dependencies.clone();
         for dependency in dependencies {
             if !self.has(&dependency.id) {
-                self.restore_registered(&slot);
+                self.restore_waiting_state(&slot, previous_state);
                 path.remove(id);
                 return Err(PluginError::MissingDependency {
                     plugin: id.clone(),
@@ -88,7 +110,7 @@ impl Kernel {
             }
             if let Err(error) = Box::pin(self.start_with_path(&dependency.id, path, started)).await
             {
-                self.restore_registered(&slot);
+                self.restore_waiting_state(&slot, previous_state);
                 path.remove(id);
                 return Err(error);
             }
@@ -101,7 +123,10 @@ impl Kernel {
 
         let result = {
             let mut plugin = slot.plugin.lock().await;
-            plugin.start(self.context(&slot, scope.clone())).await
+            contain_panic("插件启动", async {
+                plugin.start(self.context(&slot, scope.clone())).await
+            })
+            .await
         };
 
         match result {
@@ -161,10 +186,10 @@ impl Kernel {
         }
     }
 
-    fn restore_registered(&self, slot: &super::PluginSlot) {
+    fn restore_waiting_state(&self, slot: &super::PluginSlot, previous: PluginState) {
         let mut state = slot.state.lock().expect("state lock poisoned");
         if *state == PluginState::WaitingDependencies {
-            *state = PluginState::Registered;
+            *state = previous;
         }
     }
 
@@ -172,23 +197,25 @@ impl Kernel {
         slot.scope.lock().expect("scope lock poisoned").take();
     }
 
-    /// Stop every active plugin. Consumers are stopped before their providers.
+    /// 消费者先于提供者停止；准入后即使调用方取消等待，也继续执行收尾。
     pub async fn stop_all(&self) -> PluginResult<()> {
-        let _lifecycle = self.inner.lifecycle.lock().await;
-        let mut stopping = HashSet::new();
-        let mut first_error = None;
-        for id in self.plugin_ids() {
-            if let Err(error) = self.stop_inner(&id, &mut stopping).await {
-                first_error.get_or_insert(error);
-            }
-        }
-        first_error.map_or(Ok(()), Err)
+        self.run_lifecycle(LifecycleRequest::StopAll).await
     }
 
-    /// Stop one plugin and all active consumers that depend on it.
+    async fn stop_all_inner(&self) -> PluginResult<()> {
+        let mut stopping = HashSet::new();
+        let mut errors = Vec::new();
+        for id in self.plugin_ids() {
+            if let Err(error) = self.stop_inner(&id, &mut stopping).await {
+                append_stop_error(&mut errors, &id, error);
+            }
+        }
+        stopped_result(errors)
+    }
+
+    /// 停止一个插件及其消费者；正常返回自动确认报告，取消等待不丢收尾结果。
     pub async fn stop(&self, id: &PluginId) -> PluginResult<()> {
-        let _lifecycle = self.inner.lifecycle.lock().await;
-        self.stop_inner(id, &mut HashSet::new()).await
+        self.run_lifecycle(LifecycleRequest::Stop(id.clone())).await
     }
 
     async fn stop_inner(
@@ -222,10 +249,10 @@ impl Kernel {
             .collect::<Vec<_>>();
         consumers.sort();
 
-        let mut first_error = None;
+        let mut errors = Vec::new();
         for consumer in consumers {
             if let Err(error) = Box::pin(self.stop_inner(&consumer, stopping)).await {
-                first_error.get_or_insert(error);
+                append_stop_error(&mut errors, &consumer, error);
             }
         }
 
@@ -239,10 +266,11 @@ impl Kernel {
             }
         };
         if !active {
-            return first_error.map_or(Ok(()), Err);
+            return stopped_result(errors);
         }
 
-        let scope = slot.scope.lock().expect("scope lock poisoned").take();
+        // 保留 Scope 到收尾结束，执行器意外中断时仍能同步撤销 Context。
+        let scope = slot.scope.lock().expect("scope lock poisoned").clone();
         if let Some(scope) = &scope {
             scope.begin_stop();
         }
@@ -251,24 +279,70 @@ impl Kernel {
             Some(scope) => scope.cleanup().await,
             None => Ok(()),
         };
+        self.clear_scope(&slot);
+        for (stage, result) in [
+            (StopStage::Tasks, task_result),
+            (StopStage::Cleanup, cleanup_result),
+        ] {
+            if let Err(error) = result {
+                errors.push(PluginStopError {
+                    plugin: id.clone(),
+                    stage,
+                    error: Box::new(error),
+                });
+            }
+        }
         // 未确认退出的任务可能仍在操作外部资源，不能把插件标为可安全重启。
-        let exited = self
-            .inner
-            .services
-            .tasks
-            .list(id)
-            .map(|tasks| tasks.iter().all(|task| task.exited))
-            .unwrap_or(false);
+        let exited = match self.inner.services.tasks.list(id) {
+            Ok(tasks) if tasks.iter().all(|task| task.exited) => true,
+            result => {
+                let error = match result {
+                    Err(error) => error,
+                    Ok(tasks) => PluginError::Task(format!(
+                        "退出确认仍有未结束任务：{}",
+                        tasks
+                            .iter()
+                            .filter(|task| !task.exited)
+                            .map(|task| task.id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                };
+                errors.push(PluginStopError {
+                    plugin: id.clone(),
+                    stage: StopStage::Inspection,
+                    error: Box::new(error),
+                });
+                false
+            }
+        };
         *slot.state.lock().expect("state lock poisoned") = if exited {
             PluginState::Stopped
         } else {
             PluginState::Failed
         };
 
-        if let Err(error) = merge_cleanup_results(task_result, cleanup_result) {
-            first_error.get_or_insert(error);
-        }
-        first_error.map_or(Ok(()), Err)
+        stopped_result(errors)
+    }
+}
+
+fn append_stop_error(errors: &mut Vec<PluginStopError>, plugin: &PluginId, error: PluginError) {
+    match error {
+        // 子插件错误保留原始归属，不重复包装成提供者的错误。
+        PluginError::Shutdown(nested) => errors.extend(nested),
+        error => errors.push(PluginStopError {
+            plugin: plugin.clone(),
+            stage: StopStage::Lifecycle,
+            error: Box::new(error),
+        }),
+    }
+}
+
+fn stopped_result(errors: Vec<PluginStopError>) -> PluginResult<()> {
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(PluginError::Shutdown(errors))
     }
 }
 

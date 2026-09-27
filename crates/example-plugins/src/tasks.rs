@@ -1,7 +1,8 @@
 //! 任务演示只依赖插件定义层，定时和执行由宿主后端负责。
 use eve_plugin_api::{
-    Cleanup, Plugin, PluginContext, PluginError, PluginFuture, PluginManifest, PluginResult, Task,
-    TaskMode, TaskSchedule, TaskScheduler, TaskSignal, TaskSpec, TaskState, TaskTypeId,
+    Cleanup, LogEntry, LogLevel, Plugin, PluginContext, PluginError, PluginFuture, PluginManifest,
+    PluginResult, Task, TaskMode, TaskSchedule, TaskScheduler, TaskSignal, TaskSpec, TaskState,
+    TaskTypeId,
 };
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -72,6 +73,11 @@ impl Plugin for TaskDemoPlugin {
                 return Err(PluginError::Task(format!("自定义任务演示失败：{report:?}")));
             }
             ctx.state_set("custom_task_runs", report.runs.to_string().into_bytes())?;
+            ctx.log(
+                LogEntry::new(LogLevel::Info, "demo.tasks", "前台任务验收完成")?
+                    .with_field("builtin_runs", completed.to_string())
+                    .with_field("custom_runs", report.runs.to_string()),
+            )?;
             ctx.spawn_task(TaskSpec::from_task(
                 "后台周期任务",
                 TaskMode::Background,

@@ -1,0 +1,91 @@
+name: Rust 持续集成
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stable:
+    name: Stable / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 安装 Rust Stable 与检查组件
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+      - name: 检查代码格式
+        run: cargo fmt --all -- --check
+      - name: 检查所有构建目标
+        run: cargo check --workspace --all-targets --locked
+      - name: 检查 Clippy 警告
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: 运行测试与文档测试
+        run: cargo test --workspace --locked
+      - name: 运行插件协作验收
+        run: cargo run -p eve-runtime --locked
+      - name: 验证取消生命周期等待后的收尾
+        run: cargo run -p eve-runtime --example lifecycle_operations --locked
+      - name: 验证两次独立进程恢复状态
+        run: |
+          function Assert-SavedCounter([string] $Directory, [string] $ExpectedStarts) {
+            $snapshotPath = Join-Path $Directory "state.json"
+            $snapshot = Get-Content -LiteralPath $snapshotPath -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
+            $starts = $snapshot.entries["demo.state-recovery"].starts
+            if ($snapshot.version -ne 1 -or $starts -isnot [array] -or
+                (ConvertTo-Json -InputObject $starts -Compress) -cne $ExpectedStarts) {
+              throw "磁盘快照必须保存版本 1 和 starts 字节数组 $ExpectedStarts"
+            }
+          }
+
+          $stateDirectory = Join-Path $env:RUNNER_TEMP "eve-state-recovery-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $firstOutput = @(& cargo run -p eve-runtime --example state_recovery --locked -- $stateDirectory)
+          if ($LASTEXITCODE -ne 0) { throw "首次状态恢复示例执行失败" }
+          $firstOutput | ForEach-Object { Write-Host $_ }
+          if ($firstOutput.Count -eq 0 -or $firstOutput[0] -cne "恢复前值：无；写入后值：1。") {
+            throw "首次启动必须从空状态写入计数 1"
+          }
+          Assert-SavedCounter $stateDirectory "[49]"
+
+          $secondOutput = @(& cargo run -p eve-runtime --example state_recovery --locked -- $stateDirectory)
+          if ($LASTEXITCODE -ne 0) { throw "第二次状态恢复示例执行失败" }
+          $secondOutput | ForEach-Object { Write-Host $_ }
+          if ($secondOutput.Count -eq 0 -or $secondOutput[0] -cne "恢复前值：1；写入后值：2。") {
+            throw "第二次启动必须恢复计数 1 并写入计数 2"
+          }
+          Assert-SavedCounter $stateDirectory "[50]"
+
+  msrv:
+    name: 最低 Rust 版本 / 1.89.0
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 安装最低支持版本
+        run: rustup toolchain install 1.89.0 --profile minimal
+      - name: 检查最低版本的所有构建目标
+        run: cargo +1.89.0 check --workspace --all-targets --locked

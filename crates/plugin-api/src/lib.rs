@@ -10,10 +10,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 mod capabilities;
+mod diagnostics;
+mod lifecycle;
+mod logging;
 mod tasks;
 pub use capabilities::{
     EventBus, PermissionChecker, ServiceEntry, ServiceRegistry, ServiceValue, StateStore,
 };
+pub use diagnostics::{PluginState, PluginStatus, PluginStopError, RuntimeInspector, StopStage};
+pub use lifecycle::{
+    LifecycleOperation, LifecycleOperationId, LifecycleOperationState, LifecycleRequest,
+    RuntimeLifecycle,
+};
+pub use logging::{LogEntry, LogLevel, LogRecord, Logger};
 pub use tasks::{
     Task, TaskAction, TaskFuture, TaskInfo, TaskManager, TaskMode, TaskRunReport, TaskSchedule,
     TaskScheduleFactory, TaskScheduleInfo, TaskScheduler, TaskShutdownReport, TaskSignal, TaskSpec,
@@ -272,6 +281,7 @@ pub trait RuntimeHooks: Send + Sync {
     fn state_get(&self, owner: &PluginId, key: &str) -> PluginResult<Option<Vec<u8>>>;
     fn state_set(&self, owner: &PluginId, key: String, value: Vec<u8>) -> PluginResult<()>;
     fn check_permission(&self, permission: &Permission) -> PluginResult<()>;
+    fn log(&self, entry: LogEntry) -> PluginResult<()>;
     fn spawn_task(&self, owner: &PluginId, spec: TaskSpec) -> PluginResult<TaskId>;
     fn run_foreground(
         &self,
@@ -359,6 +369,11 @@ impl PluginContext {
     pub fn tasks(&self) -> PluginResult<Vec<TaskInfo>> {
         self.hooks.list_tasks(&self.info.id)
     }
+
+    /// 记录结构化日志，插件身份和时间由宿主补充；停止后的 Context 不能投递。
+    pub fn log(&self, entry: LogEntry) -> PluginResult<()> {
+        self.hooks.log(entry)
+    }
 }
 
 /// A plugin implementation.
@@ -396,6 +411,8 @@ pub enum PluginError {
         cause: Box<PluginError>,
         errors: Vec<PluginError>,
     },
+    /// 停止尝试中的所有失败，按实际处理顺序保留原插件和阶段。
+    Shutdown(Vec<PluginStopError>),
     ServiceConflict(ServiceId),
     ServiceNotFound(ServiceId),
     ServiceTypeMismatch(ServiceId),
@@ -406,6 +423,7 @@ pub enum PluginError {
     Task(String),
     State(String),
     Event(String),
+    Log(String),
     Cleanup(String),
     Lifecycle(String),
 }
@@ -432,6 +450,17 @@ impl fmt::Display for PluginError {
                 }
                 Ok(())
             }
+            Self::Shutdown(errors) => {
+                write!(f, "插件停止失败")?;
+                for failure in errors {
+                    write!(
+                        f,
+                        "；{} [{}]：{}",
+                        failure.plugin, failure.stage, failure.error
+                    )?;
+                }
+                Ok(())
+            }
             Self::ServiceConflict(id) => write!(f, "service already provided: {id}"),
             Self::ServiceNotFound(id) => write!(f, "service not found: {id}"),
             Self::ServiceTypeMismatch(id) => write!(f, "服务类型不匹配：{id}"),
@@ -441,6 +470,7 @@ impl fmt::Display for PluginError {
             Self::Task(message) => write!(f, "task error: {message}"),
             Self::State(message) => write!(f, "state error: {message}"),
             Self::Event(message) => write!(f, "event error: {message}"),
+            Self::Log(message) => write!(f, "日志错误：{message}"),
             Self::Cleanup(message) => write!(f, "cleanup error: {message}"),
             Self::Lifecycle(message) => write!(f, "lifecycle error: {message}"),
         }

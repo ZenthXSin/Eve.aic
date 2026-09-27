@@ -1,3 +1,4 @@
+use crate::panic_boundary::contain_panic;
 use eve_plugin_api::{Cleanup, PluginError, PluginResult};
 use std::sync::Mutex;
 
@@ -74,6 +75,13 @@ impl PluginScope {
         self.state.lock().expect("scope lock poisoned").accepting = false;
     }
 
+    /// 执行器意外中断时同步撤销 Context，不声称异步清理已执行。
+    pub(crate) fn revoke(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.open = false;
+        state.accepting = false;
+    }
+
     pub(crate) fn register(&self, cleanup: Cleanup) -> PluginResult<()> {
         self.resource(|| Ok(cleanup))
     }
@@ -88,7 +96,8 @@ impl PluginScope {
         let cleanups = self.take_cleanups();
         let mut errors = Vec::new();
         for cleanup in cleanups.into_iter().rev() {
-            if let Err(error) = cleanup().await {
+            if let Err(error) = contain_panic("资源清理", async move { cleanup().await }).await
+            {
                 errors.push(error.to_string());
             }
         }
