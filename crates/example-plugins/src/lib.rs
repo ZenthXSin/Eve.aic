@@ -1,8 +1,8 @@
 //! 仅依赖定义层的静态插件示例；不访问 Kernel 或具体后端。
 
 use eve_plugin_api::{
-    Cleanup, Event, EventId, Permission, Plugin, PluginContext, PluginDependency, PluginError,
-    PluginFuture, PluginId, PluginManifest, PluginResult, ServiceId,
+    Cleanup, Event, EventId, LogEntry, LogLevel, Permission, Plugin, PluginContext,
+    PluginDependency, PluginError, PluginFuture, PluginId, PluginManifest, PluginResult, ServiceId,
 };
 use std::sync::Arc;
 
@@ -96,7 +96,12 @@ impl Plugin for EventConsumerPlugin {
             ctx.on(
                 EventId::new(MESSAGE)?,
                 Arc::new(move |event| {
-                    state.state_set("last_message", formatter.format(&event.payload))
+                    state.state_set("last_message", formatter.format(&event.payload))?;
+                    state.log(
+                        LogEntry::new(LogLevel::Info, "demo.message", "已处理消息")?
+                            .with_field("event", event.id.as_str())
+                            .with_field("bytes", event.payload.len().to_string()),
+                    )
                 }),
             )?;
             ctx.emit(Event::new(READY, Vec::new())?)?;
@@ -131,6 +136,11 @@ impl Plugin for FailingPlugin {
                 EventId::new(TRANSIENT_EVENT)?,
                 Arc::new(move |_| state.state_set("unexpected", b"leaked".to_vec())),
             )?;
+            ctx.log(LogEntry::new(
+                LogLevel::Warn,
+                "demo.rollback",
+                "准备触发预期启动失败，验证资源回滚",
+            )?)?;
             Err(PluginError::PluginFailed {
                 plugin: ctx.plugin().id.clone(),
                 message: "验收用预期启动失败".into(),

@@ -1,10 +1,11 @@
 use crate::{Kernel, KernelInner, PluginState, scope::PluginScope};
 use eve_plugin_api::{
-    Cleanup, Event, EventHandler, EventId, Permission, PluginError, PluginFuture, PluginId,
-    PluginManifest, PluginResult, RuntimeHooks, ServiceId, ServiceValue, TaskId, TaskInfo,
-    TaskRunReport, TaskSpec,
+    Cleanup, Event, EventHandler, EventId, LogEntry, LogRecord, Permission, PluginError,
+    PluginFuture, PluginId, PluginManifest, PluginResult, RuntimeHooks, ServiceId, ServiceValue,
+    TaskId, TaskInfo, TaskRunReport, TaskSpec,
 };
 use std::sync::{Arc, Weak};
+use std::time::SystemTime;
 
 pub(crate) struct KernelHooks {
     pub(crate) kernel: Weak<KernelInner>,
@@ -108,6 +109,19 @@ impl RuntimeHooks for KernelHooks {
                 .permissions
                 .check(&self.manifest, permission)
         })?
+    }
+
+    fn log(&self, entry: LogEntry) -> PluginResult<()> {
+        let kernel = self.kernel()?;
+        self.scope.access(|| ())?;
+        entry.validate()?;
+        // 与事件投递一样，调用自定义后端前释放 Scope 锁，允许后端访问 Context。
+        // 已准入的同步写入可能与停止重叠，停止完成后发起的新调用会被拒绝。
+        kernel.inner.services.logger.log(LogRecord {
+            timestamp: SystemTime::now(),
+            plugin: self.manifest.id.clone(),
+            entry,
+        })
     }
 
     fn spawn_task(&self, _owner: &PluginId, spec: TaskSpec) -> PluginResult<TaskId> {

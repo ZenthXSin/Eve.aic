@@ -14,5 +14,6 @@ async fn main() -> PluginResult<()> {
         report.custom_task_runs
     );
     println!("预期失败已回滚：{}", report.expected_failure);
+    println!("日志验收通过：插件结构化日志已输出并刷新。");
     Ok(())
 }

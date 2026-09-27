@@ -7,7 +7,7 @@ mod scope;
 
 use context::KernelHooks;
 use eve_plugin_api::{
-    EventBus, PermissionChecker, Plugin, PluginContext, PluginError, PluginId, PluginInfo,
+    EventBus, Logger, PermissionChecker, Plugin, PluginContext, PluginError, PluginId, PluginInfo,
     PluginManifest, PluginResult, ServiceRegistry, StateStore, TaskManager,
 };
 use scope::PluginScope;
@@ -42,6 +42,7 @@ pub struct KernelServices {
     pub state: Arc<dyn StateStore>,
     pub permissions: Arc<dyn PermissionChecker>,
     pub tasks: Arc<dyn TaskManager>,
+    pub logger: Arc<dyn Logger>,
 }
 
 impl Default for KernelServices {
@@ -52,6 +53,7 @@ impl Default for KernelServices {
             state: Arc::new(backends::MemoryStateStore::default()),
             permissions: Arc::new(backends::DeclaredPermissionChecker),
             tasks: Arc::new(backends::TokioTaskManager::default()),
+            logger: Arc::new(backends::StderrLogger::default()),
         }
     }
 }
@@ -132,6 +134,11 @@ impl Kernel {
     pub fn tasks(&self, id: &PluginId) -> PluginResult<Vec<eve_plugin_api::TaskInfo>> {
         self.slot(id)?;
         self.inner.services.tasks.list(id)
+    }
+
+    /// 宿主停止日志生产后显式刷新；即使插件停止失败，也可尝试排出已有日志。
+    pub fn flush_logs(&self) -> PluginResult<()> {
+        self.inner.services.logger.flush()
     }
 
     fn has(&self, id: &PluginId) -> bool {
