@@ -15,5 +15,9 @@ async fn main() -> PluginResult<()> {
     );
     println!("预期失败已回滚：{}", report.expected_failure);
     println!("日志验收通过：插件结构化日志已输出并刷新。");
+    println!(
+        "诊断验收通过：已通过抽象接口检查 {} 个插件的最终状态，停止与回滚后均无残留任务。",
+        report.diagnosed_plugins
+    );
     Ok(())
 }

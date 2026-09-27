@@ -10,11 +10,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 mod capabilities;
+mod diagnostics;
 mod logging;
 mod tasks;
 pub use capabilities::{
     EventBus, PermissionChecker, ServiceEntry, ServiceRegistry, ServiceValue, StateStore,
 };
+pub use diagnostics::{PluginState, PluginStatus, PluginStopError, RuntimeInspector, StopStage};
 pub use logging::{LogEntry, LogLevel, LogRecord, Logger};
 pub use tasks::{
     Task, TaskAction, TaskFuture, TaskInfo, TaskManager, TaskMode, TaskRunReport, TaskSchedule,
@@ -404,6 +406,8 @@ pub enum PluginError {
         cause: Box<PluginError>,
         errors: Vec<PluginError>,
     },
+    /// 停止尝试中的所有失败，按实际处理顺序保留原插件和阶段。
+    Shutdown(Vec<PluginStopError>),
     ServiceConflict(ServiceId),
     ServiceNotFound(ServiceId),
     ServiceTypeMismatch(ServiceId),
@@ -438,6 +442,17 @@ impl fmt::Display for PluginError {
                 write!(f, "{cause}；回滚错误")?;
                 for error in errors {
                     write!(f, "；{error}")?;
+                }
+                Ok(())
+            }
+            Self::Shutdown(errors) => {
+                write!(f, "插件停止失败")?;
+                for failure in errors {
+                    write!(
+                        f,
+                        "；{} [{}]：{}",
+                        failure.plugin, failure.stage, failure.error
+                    )?;
                 }
                 Ok(())
             }
