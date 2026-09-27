@@ -9,6 +9,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+mod capabilities;
+pub use capabilities::{
+    EventBus, PermissionChecker, ServiceEntry, ServiceRegistry, ServiceValue, StateStore,
+};
+
 /// The result type used by the plugin boundary.
 pub type PluginResult<T> = Result<T, PluginError>;
 
@@ -237,9 +242,10 @@ pub trait RuntimeHooks: Send + Sync {
         id: ServiceId,
         service: Arc<dyn Any + Send + Sync>,
     ) -> PluginResult<()>;
-    fn get_service(&self, id: &ServiceId) -> Option<Arc<dyn Any + Send + Sync>>;
-    fn state_get(&self, owner: &PluginId, key: &str) -> Option<Vec<u8>>;
+    fn get_service(&self, id: &ServiceId) -> PluginResult<Option<ServiceValue>>;
+    fn state_get(&self, owner: &PluginId, key: &str) -> PluginResult<Option<Vec<u8>>>;
     fn state_set(&self, owner: &PluginId, key: String, value: Vec<u8>) -> PluginResult<()>;
+    fn check_permission(&self, permission: &Permission) -> PluginResult<()>;
     fn register_cleanup(&self, owner: &PluginId, cleanup: Cleanup) -> PluginResult<()>;
 }
 
@@ -276,16 +282,21 @@ impl PluginContext {
             .provide_service(&self.info.id, id, Arc::new(service))
     }
 
-    pub fn service<T>(&self, id: &ServiceId) -> Option<Arc<T>>
+    pub fn service<T>(&self, id: &ServiceId) -> PluginResult<Option<Arc<T>>>
     where
         T: Any + Send + Sync,
     {
         self.hooks
-            .get_service(id)
-            .and_then(|service| service.downcast::<T>().ok())
+            .get_service(id)?
+            .map(|service| {
+                service
+                    .downcast::<T>()
+                    .map_err(|_| PluginError::ServiceTypeMismatch(id.clone()))
+            })
+            .transpose()
     }
 
-    pub fn state_get(&self, key: &str) -> Option<Vec<u8>> {
+    pub fn state_get(&self, key: &str) -> PluginResult<Option<Vec<u8>>> {
         self.hooks.state_get(&self.info.id, key)
     }
 
@@ -296,6 +307,11 @@ impl PluginContext {
 
     pub fn cleanup(&self, cleanup: Cleanup) -> PluginResult<()> {
         self.hooks.register_cleanup(&self.info.id, cleanup)
+    }
+
+    /// 检查当前插件声明的权限；宿主可以注入更严格的检查器。
+    pub fn check_permission(&self, permission: &Permission) -> PluginResult<()> {
+        self.hooks.check_permission(permission)
     }
 }
 
@@ -329,8 +345,18 @@ pub enum PluginError {
         plugin: PluginId,
         message: String,
     },
+    /// 保留启动原始错误及回滚期间的全部停止错误。
+    Rollback {
+        cause: Box<PluginError>,
+        errors: Vec<PluginError>,
+    },
     ServiceConflict(ServiceId),
     ServiceNotFound(ServiceId),
+    ServiceTypeMismatch(ServiceId),
+    PermissionDenied {
+        plugin: PluginId,
+        permission: Permission,
+    },
     State(String),
     Event(String),
     Cleanup(String),
@@ -352,8 +378,19 @@ impl fmt::Display for PluginError {
             Self::PluginFailed { plugin, message } => {
                 write!(f, "plugin {plugin} failed: {message}")
             }
+            Self::Rollback { cause, errors } => {
+                write!(f, "{cause}；回滚错误")?;
+                for error in errors {
+                    write!(f, "；{error}")?;
+                }
+                Ok(())
+            }
             Self::ServiceConflict(id) => write!(f, "service already provided: {id}"),
             Self::ServiceNotFound(id) => write!(f, "service not found: {id}"),
+            Self::ServiceTypeMismatch(id) => write!(f, "服务类型不匹配：{id}"),
+            Self::PermissionDenied { plugin, permission } => {
+                write!(f, "插件 {plugin} 未获权限：{}", permission.as_str())
+            }
             Self::State(message) => write!(f, "state error: {message}"),
             Self::Event(message) => write!(f, "event error: {message}"),
             Self::Cleanup(message) => write!(f, "cleanup error: {message}"),

@@ -12,8 +12,7 @@ impl Kernel {
         for id in self.plugin_ids() {
             let mut path = HashSet::new();
             if let Err(error) = self.start_with_path(&id, &mut path, &mut started).await {
-                self.rollback_started(started).await;
-                return Err(error);
+                return Err(self.rollback_started(started, error).await);
             }
         }
         Ok(())
@@ -26,10 +25,7 @@ impl Kernel {
         let mut path = HashSet::new();
         match self.start_with_path(id, &mut path, &mut started).await {
             Ok(()) => Ok(()),
-            Err(error) => {
-                self.rollback_started(started).await;
-                Err(error)
-            }
+            Err(error) => Err(self.rollback_started(started, error).await),
         }
     }
 
@@ -137,10 +133,21 @@ impl Kernel {
         }
     }
 
-    async fn rollback_started(&self, started: Vec<PluginId>) {
+    async fn rollback_started(&self, started: Vec<PluginId>, cause: PluginError) -> PluginError {
         let mut stopping = HashSet::new();
+        let mut errors = Vec::new();
         for id in started.into_iter().rev() {
-            let _ = self.stop_inner(&id, &mut stopping).await;
+            if let Err(error) = self.stop_inner(&id, &mut stopping).await {
+                errors.push(error);
+            }
+        }
+        if errors.is_empty() {
+            cause
+        } else {
+            PluginError::Rollback {
+                cause: Box::new(cause),
+                errors,
+            }
         }
     }
 

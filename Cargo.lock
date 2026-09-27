@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "eve-example-plugins"
+version = "0.1.0"
+dependencies = [
+ "eve-plugin-api",
+]
+
+[[package]]
 name = "eve-kernel"
 version = "0.1.0"
 dependencies = [
@@ -18,6 +25,7 @@ version = "0.1.0"
 name = "eve-runtime"
 version = "0.1.0"
 dependencies = [
+ "eve-example-plugins",
  "eve-kernel",
  "eve-plugin-api",
  "tokio",

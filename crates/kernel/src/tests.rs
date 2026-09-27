@@ -1,5 +1,7 @@
 use super::*;
-use eve_plugin_api::{Cleanup, Event, PluginDependency, PluginFuture, cleanup};
+use eve_plugin_api::{
+    Cleanup, Event, EventHandler, EventId, PluginDependency, PluginFuture, ServiceId, cleanup,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Producer {
@@ -52,7 +54,7 @@ impl Plugin for Consumer {
     fn start(&mut self, ctx: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         Box::pin(async move {
             let number = ctx
-                .service::<u32>(&ServiceId::new("number")?)
+                .service::<u32>(&ServiceId::new("number")?)?
                 .ok_or_else(|| PluginError::ServiceNotFound(ServiceId::new("number").unwrap()))?;
             assert_eq!(*number, 42);
             let seen = self.seen.clone();
@@ -82,31 +84,23 @@ async fn starts_dependencies_and_exposes_state_service_and_events() {
     assert_eq!(kernel.state(&producer), Some(PluginState::Active));
     assert_eq!(kernel.state(&consumer), Some(PluginState::Active));
 
-    let scope = kernel
+    kernel
         .inner
-        .plugins
-        .lock()
-        .unwrap()
-        .get(&consumer)
-        .unwrap()
-        .scope
-        .lock()
-        .unwrap()
-        .clone()
-        .unwrap();
-    let hooks = KernelHooks {
-        kernel: Arc::downgrade(&kernel.inner),
-        scope,
-    };
-    hooks
-        .emit(
-            &consumer,
-            Event::new("consumer-ready", b"consumer".to_vec()).unwrap(),
-        )
+        .services
+        .events
+        .emit(Event::new("consumer-ready", b"consumer".to_vec()).unwrap())
         .unwrap();
     assert_eq!(seen.load(Ordering::SeqCst), 1);
 
-    assert_eq!(hooks.state_get(&producer, "started"), Some(b"yes".to_vec()));
+    assert_eq!(
+        kernel
+            .inner
+            .services
+            .state
+            .get(&producer, "started")
+            .unwrap(),
+        Some(b"yes".to_vec())
+    );
     kernel.stop_all().await.unwrap();
     assert_eq!(kernel.state(&consumer), Some(PluginState::Stopped));
     assert_eq!(kernel.state(&producer), Some(PluginState::Stopped));
@@ -256,9 +250,9 @@ async fn failed_start_removes_services_registered_before_the_error() {
     let service = kernel
         .inner
         .services
-        .lock()
-        .unwrap()
+        .registry
         .get(&ServiceId::new("transient").unwrap())
+        .unwrap()
         .unwrap()
         .value
         .clone()
@@ -308,11 +302,12 @@ async fn stopped_plugin_context_cannot_register_new_services() {
             .is_err()
     );
     assert!(
-        !kernel
+        kernel
             .inner
             .services
-            .lock()
+            .registry
+            .get(&ServiceId::new("late-service").unwrap())
             .unwrap()
-            .contains_key(&ServiceId::new("late-service").unwrap())
+            .is_none()
     );
 }
