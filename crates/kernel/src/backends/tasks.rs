@@ -46,6 +46,7 @@ struct Entry {
     execution: Arc<Execution>,
     abort: AbortHandle,
     outcome: watch::Receiver<Option<TaskRunReport>>,
+    fallback: Mutex<Option<TaskRunReport>>,
     retain: AtomicBool,
 }
 
@@ -136,6 +137,7 @@ impl TokioTaskManager {
         let (sender, outcome) = watch::channel(None);
         // 锁覆盖任务登记，shutdown 不会看见未安装取消句柄的半成品。
         let mut tasks = self.inner.tasks.lock().expect("任务锁中毒");
+        prune_unretained_finished(&mut tasks);
         let worker_execution = execution.clone();
         let name = spec.name.clone();
         let task_type = spec.task_type.clone();
@@ -151,6 +153,7 @@ impl TokioTaskManager {
             execution,
             abort: worker.abort_handle(),
             outcome,
+            fallback: Mutex::new(None),
             retain: AtomicBool::new(true),
         });
         tasks.insert(id, entry.clone());
@@ -274,11 +277,83 @@ async fn wait(entry: &Entry) -> PluginResult<TaskRunReport> {
         if let Some(report) = receiver.borrow_and_update().clone() {
             return Ok(report);
         }
-        receiver
-            .changed()
-            .await
-            .map_err(|_| PluginError::Task("任务执行器已关闭".into()))?;
+        if let Some(report) = read_report(entry) {
+            return Ok(report);
+        }
+        if receiver.changed().await.is_err() {
+            // watch 发送端由监视器持有；通道关闭且没有报告，说明监视器未能发布结果。
+            entry.execution.signal.cancel();
+            entry.abort.abort();
+            loop {
+                if let Some(report) = read_report(entry) {
+                    return Ok(report);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
     }
+}
+
+/// 监视器丢失即判失败，因为原始结果不可用。只有 worker 确认退出后才能报告退出；
+/// abort 无法强制终止同步阻塞代码。
+fn recover_monitor_report(entry: &Entry) -> TaskRunReport {
+    let mut fallback = entry.fallback.lock().expect("任务报告锁中毒");
+    if let Some(report) = fallback.as_ref() {
+        return report.clone();
+    }
+    let mut progress = entry.execution.progress.lock().expect("任务状态锁中毒");
+    if progress.state != TaskState::TimedOut {
+        progress.state = TaskState::Failed;
+    }
+    let report = TaskRunReport {
+        id: entry.id.clone(),
+        task_type: entry.task_type.clone(),
+        runs: progress.runs,
+        state: progress.state,
+        errors: vec!["任务监视器已中断，原始执行结果不可用".into()],
+    };
+    *fallback = Some(report.clone());
+    report
+}
+
+/// 正常监视器报告优先；确认监视器关闭且 worker 退出后才缓存回退报告。
+fn read_report(entry: &Entry) -> Option<TaskRunReport> {
+    if let Some(report) = entry.outcome.borrow().clone() {
+        return Some(report);
+    }
+    let closed_without_report = entry.outcome.has_changed().is_err();
+    // has_changed 可能因 sender 已关闭而返回 Err，即使关闭前刚发送了结果；重读以保留正常报告。
+    if closed_without_report && let Some(report) = entry.outcome.borrow().clone() {
+        return Some(report);
+    }
+
+    if let Some(report) = entry.fallback.lock().expect("任务报告锁中毒").clone() {
+        return Some(report);
+    }
+    if closed_without_report && entry.abort.is_finished() {
+        return Some(recover_monitor_report(entry));
+    }
+    None
+}
+
+fn monitor_lost(entry: &Entry) -> bool {
+    if entry.outcome.has_changed().is_ok() {
+        return false;
+    }
+    entry.outcome.borrow().is_none()
+}
+
+fn prune_unretained_finished(tasks: &mut HashMap<TaskId, Arc<Entry>>) {
+    tasks.retain(|_, entry| {
+        if entry.retain.load(Ordering::SeqCst) {
+            return true;
+        }
+        let report = read_report(entry);
+        if report.is_some() {
+            return false;
+        }
+        !entry.abort.is_finished() || !monitor_lost(entry)
+    });
 }
 
 fn remove(manager: &Weak<Inner>, id: &TaskId) {
@@ -295,7 +370,7 @@ struct ForegroundWait {
 impl Drop for ForegroundWait {
     fn drop(&mut self) {
         self.entry.retain.store(false, Ordering::SeqCst);
-        if self.entry.outcome.borrow().is_none() {
+        if read_report(&self.entry).is_none() {
             self.entry.execution.signal.cancel();
             self.entry.abort.abort();
         } else {
@@ -324,9 +399,12 @@ impl TaskManager for TokioTaskManager {
     }
 
     fn list(&self, owner: &PluginId) -> PluginResult<Vec<TaskInfo>> {
-        let tasks = self.inner.tasks.lock().expect("任务锁中毒");
+        let mut tasks = self.inner.tasks.lock().expect("任务锁中毒");
+        prune_unretained_finished(&mut tasks);
         let mut result = Vec::new();
         for entry in tasks.values().filter(|entry| entry.owner == *owner) {
+            let outcome = read_report(entry);
+            let lost_monitor = outcome.is_none() && monitor_lost(entry);
             let progress = entry.execution.progress.lock().expect("任务状态锁中毒");
             result.push(TaskInfo {
                 id: entry.id.clone(),
@@ -335,9 +413,18 @@ impl TaskManager for TokioTaskManager {
                 task_type: entry.task_type.clone(),
                 mode: entry.mode,
                 schedule: entry.schedule.clone(),
-                state: progress.state,
-                runs: progress.runs,
-                exited: entry.outcome.borrow().is_some(),
+                state: outcome.as_ref().map_or_else(
+                    || {
+                        if lost_monitor && progress.state != TaskState::TimedOut {
+                            TaskState::Failed
+                        } else {
+                            progress.state
+                        }
+                    },
+                    |report| report.state,
+                ),
+                runs: outcome.as_ref().map_or(progress.runs, |report| report.runs),
+                exited: outcome.is_some() || entry.abort.is_finished(),
             });
         }
         result.sort_by(|a, b| a.id.cmp(&b.id));
@@ -353,18 +440,18 @@ impl TaskManager for TokioTaskManager {
         let owner = owner.clone();
         Box::pin(async move {
             let end = deadline(timeout)?;
-            let mut entries: Vec<_> = self
-                .inner
-                .tasks
-                .lock()
-                .expect("任务锁中毒")
-                .values()
-                .filter(|entry| entry.owner == owner)
-                .cloned()
-                .collect();
+            let mut entries: Vec<_> = {
+                let mut tasks = self.inner.tasks.lock().expect("任务锁中毒");
+                prune_unretained_finished(&mut tasks);
+                tasks
+                    .values()
+                    .filter(|entry| entry.owner == owner)
+                    .cloned()
+                    .collect()
+            };
             entries.sort_by(|a, b| a.id.cmp(&b.id));
             for entry in &entries {
-                if entry.outcome.borrow().is_none() {
+                if read_report(entry).is_none() {
                     entry.execution.set_state(TaskState::Stopping);
                 }
                 entry.execution.signal.cancel();
