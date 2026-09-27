@@ -95,32 +95,45 @@ impl FileStateStore {
             .map_err(|error| failure("状态目录被占用或无法加锁", error))?;
 
         let snapshot_path = directory.join("state.json");
-        // read 会跟随链接；悬空链接的 NotFound 不能被解释为新建空库。
-        let snapshot = match fs::symlink_metadata(&snapshot_path) {
-            Ok(metadata) => {
-                if !metadata.file_type().is_file() {
-                    return Err(PluginError::State(
-                        "状态快照必须是普通文件，不能是链接或目录".into(),
-                    ));
+        // 先独立解析快照；失败时在返回错误前显式释放目录锁，保证调用方
+        // 可以在同一进程中修复文件后立即重试打开。
+        let snapshot = (|| -> PluginResult<Snapshot> {
+            // read 会跟随链接；悬空链接的 NotFound 不能被解释为新建空库。
+            match fs::symlink_metadata(&snapshot_path) {
+                Ok(metadata) => {
+                    if !metadata.file_type().is_file() {
+                        return Err(PluginError::State(
+                            "状态快照必须是普通文件，不能是链接或目录".into(),
+                        ));
+                    }
+                    let bytes =
+                        fs::read(&snapshot_path).map_err(|error| failure("打开状态快照", error))?;
+                    let snapshot: Snapshot = serde_json::from_slice(&bytes)
+                        .map_err(|error| failure("读取状态快照", error))?;
+                    if snapshot.version != VERSION {
+                        return Err(PluginError::State(format!(
+                            "不支持状态版本 {}，需要版本 {VERSION}",
+                            snapshot.version
+                        )));
+                    }
+                    for namespace in snapshot.entries.keys() {
+                        PluginId::new(namespace.clone())
+                            .map_err(|_| PluginError::State("状态包含空插件标识".into()))?;
+                    }
+                    Ok(snapshot)
                 }
-                let bytes =
-                    fs::read(&snapshot_path).map_err(|error| failure("打开状态快照", error))?;
-                let snapshot: Snapshot = serde_json::from_slice(&bytes)
-                    .map_err(|error| failure("读取状态快照", error))?;
-                if snapshot.version != VERSION {
-                    return Err(PluginError::State(format!(
-                        "不支持状态版本 {}，需要版本 {VERSION}",
-                        snapshot.version
-                    )));
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(Snapshot::default())
                 }
-                for namespace in snapshot.entries.keys() {
-                    PluginId::new(namespace.clone())
-                        .map_err(|_| PluginError::State("状态包含空插件标识".into()))?;
-                }
-                snapshot
+                Err(error) => Err(failure("打开状态快照", error)),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Snapshot::default(),
-            Err(error) => return Err(failure("打开状态快照", error)),
+        })();
+        let snapshot = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                drop(lock);
+                return Err(error);
+            }
         };
         Ok(Self {
             directory,
