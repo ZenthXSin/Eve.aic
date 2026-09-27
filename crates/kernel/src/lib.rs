@@ -17,7 +17,7 @@ use scope::PluginScope;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
 // 保留原导出路径，生命周期定义归入契约层。
 pub use eve_plugin_api::PluginState;
@@ -105,7 +105,7 @@ impl Kernel {
     }
 
     pub fn register(&self, plugin: Box<dyn Plugin>) -> PluginResult<()> {
-        self.ensure_lifecycle_healthy()?;
+        let _registration = self.registration_guard()?;
         let manifest = plugin.manifest().clone();
         let id = manifest.id.clone();
         let mut plugins = self.inner.plugins.lock().expect("plugin lock poisoned");
@@ -122,6 +122,15 @@ impl Kernel {
             }),
         );
         Ok(())
+    }
+
+    /// 注册表变更与生命周期快照串行化，避免运行中的 start/stop 漏掉新插件。
+    fn registration_guard(&self) -> PluginResult<AsyncMutexGuard<'_, ()>> {
+        self.ensure_lifecycle_healthy()?;
+        self.inner
+            .lifecycle
+            .try_lock()
+            .map_err(|_| PluginError::Lifecycle("生命周期操作正在执行，不能注册插件".into()))
     }
 
     pub fn state(&self, id: &PluginId) -> Option<PluginState> {
