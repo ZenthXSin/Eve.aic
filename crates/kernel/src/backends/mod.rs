@@ -4,8 +4,10 @@ mod events;
 mod permissions;
 mod services;
 mod state;
+mod tasks;
 
 pub use events::SyncEventBus;
 pub use permissions::DeclaredPermissionChecker;
 pub use services::MemoryServiceRegistry;
 pub use state::MemoryStateStore;
+pub use tasks::TokioTaskManager;

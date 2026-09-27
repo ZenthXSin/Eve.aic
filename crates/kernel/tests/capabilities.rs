@@ -118,6 +118,14 @@ async fn context_rejects_all_operations_after_stop_and_after_restart() {
             .is_err()
     );
     assert!(old.cleanup(cleanup(|| async { Ok(()) })).is_err());
+    let late_foreground = TaskSpec::new(
+        "late",
+        TaskMode::Foreground,
+        TaskSchedule::Immediate,
+        Arc::new(|_| Box::pin(async { Ok(()) })),
+    )
+    .unwrap();
+    assert!(old.run_foreground(late_foreground).await.is_err());
     assert_eq!(current.state_get("saved").unwrap(), Some(b"value".to_vec()));
     current.provide_service(sid("late"), 2_u32).unwrap();
     kernel.stop_all().await.unwrap();
@@ -403,6 +411,7 @@ async fn host_can_replace_each_backend_without_changing_plugins() {
         registry: registry.clone(),
         state: state.clone(),
         permissions: permissions.clone(),
+        ..KernelServices::default()
     });
     register(&kernel, "provider", &[], |ctx| {
         ctx.provide_service(sid("service"), 42_u32)?;
