@@ -94,8 +94,17 @@ impl FileStateStore {
         lock.try_lock()
             .map_err(|error| failure("状态目录被占用或无法加锁", error))?;
 
-        let snapshot = match fs::read(directory.join("state.json")) {
-            Ok(bytes) => {
+        let snapshot_path = directory.join("state.json");
+        // read 会跟随链接；悬空链接的 NotFound 不能被解释为新建空库。
+        let snapshot = match fs::symlink_metadata(&snapshot_path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    return Err(PluginError::State(
+                        "状态快照必须是普通文件，不能是链接或目录".into(),
+                    ));
+                }
+                let bytes =
+                    fs::read(&snapshot_path).map_err(|error| failure("打开状态快照", error))?;
                 let snapshot: Snapshot = serde_json::from_slice(&bytes)
                     .map_err(|error| failure("读取状态快照", error))?;
                 if snapshot.version != VERSION {

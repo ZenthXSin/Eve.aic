@@ -139,6 +139,53 @@ fn filesystem_errors_are_reported_instead_of_becoming_empty_state() {
     }
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn valid_and_dangling_state_symlinks_are_rejected_without_modifying_links_or_targets() {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink as create_symlink;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_file as create_symlink;
+
+    const ORIGINAL: &[u8] = br#"{"version":1,"entries":{"owner":{"key":[42]}}}"#;
+    for target_exists in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state");
+        fs::create_dir(&state_directory).unwrap();
+        let target = directory.path().join("target.json");
+        if target_exists {
+            fs::write(&target, ORIGINAL).unwrap();
+        }
+        let link = state_directory.join("state.json");
+        create_symlink(&target, &link)
+            .expect("必须实际创建符号链接；权限不足时应明确失败，不能跳过此验收");
+        let destination = fs::read_link(&link).unwrap();
+
+        assert!(
+            matches!(
+                FileStateStore::open(&state_directory),
+                Err(PluginError::State(_))
+            ),
+            "state.json 符号链接必须拒绝打开，目标存在：{target_exists}"
+        );
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), destination);
+        if target_exists {
+            assert_eq!(fs::read(&target).unwrap(), ORIGINAL);
+        } else {
+            assert_eq!(
+                fs::symlink_metadata(&target).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+        }
+    }
+}
+
 #[test]
 fn concurrent_writes_preserve_every_key_in_memory_and_on_disk() {
     const WRITERS: usize = 8;
