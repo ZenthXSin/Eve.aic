@@ -75,6 +75,13 @@ impl PluginScope {
         self.state.lock().expect("scope lock poisoned").accepting = false;
     }
 
+    /// 执行器意外中断时同步撤销 Context，不声称异步清理已执行。
+    pub(crate) fn revoke(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.open = false;
+        state.accepting = false;
+    }
+
     pub(crate) fn register(&self, cleanup: Cleanup) -> PluginResult<()> {
         self.resource(|| Ok(cleanup))
     }

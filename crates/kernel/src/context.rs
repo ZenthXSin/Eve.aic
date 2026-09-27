@@ -19,6 +19,10 @@ impl KernelHooks {
             .upgrade()
             .map(|inner| Kernel { inner })
             .ok_or_else(|| PluginError::Lifecycle("Runtime 已释放".into()))
+            .and_then(|kernel| {
+                kernel.ensure_lifecycle_healthy()?;
+                Ok(kernel)
+            })
     }
 }
 

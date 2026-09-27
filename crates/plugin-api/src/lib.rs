@@ -11,12 +11,17 @@ use std::sync::Arc;
 
 mod capabilities;
 mod diagnostics;
+mod lifecycle;
 mod logging;
 mod tasks;
 pub use capabilities::{
     EventBus, PermissionChecker, ServiceEntry, ServiceRegistry, ServiceValue, StateStore,
 };
 pub use diagnostics::{PluginState, PluginStatus, PluginStopError, RuntimeInspector, StopStage};
+pub use lifecycle::{
+    LifecycleOperation, LifecycleOperationId, LifecycleOperationState, LifecycleRequest,
+    RuntimeLifecycle,
+};
 pub use logging::{LogEntry, LogLevel, LogRecord, Logger};
 pub use tasks::{
     Task, TaskAction, TaskFuture, TaskInfo, TaskManager, TaskMode, TaskRunReport, TaskSchedule,
