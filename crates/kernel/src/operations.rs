@@ -32,15 +32,19 @@ pub(crate) struct OperationRegistry {
 
 /// 与 worker 一起拥有串行锁；即使 worker 未首次轮询就被执行器丢弃，也会记录中断。
 struct OperationGuard {
-    kernel: Kernel,
+    kernel: Option<Kernel>,
     entry: Arc<OperationEntry>,
     started: bool,
     completed: bool,
-    _admission: OwnedMutexGuard<()>,
+    admission: Option<OwnedMutexGuard<()>>,
 }
 
 impl OperationGuard {
     fn complete(&mut self, result: PluginResult<()>) {
+        // 先释放 Kernel 和准入锁，再通知等待者；否则 wait 返回后后台 worker
+        // 仍可能暂时持有状态后端，导致立即重建 Runtime 时出现锁竞争。
+        self.kernel.take();
+        self.admission.take();
         self.completed = true;
         self.entry
             .state
@@ -55,6 +59,8 @@ impl Drop for OperationGuard {
         }
 
         if !self.started {
+            self.kernel.take();
+            self.admission.take();
             self.entry
                 .state
                 .send_replace(LifecycleOperationState::Interrupted(
@@ -71,14 +77,16 @@ impl Drop for OperationGuard {
             self.entry.id, self.entry.request
         ));
         // 不在持有报告锁时操作 Scope，避免与 Context 的能力访问形成锁顺序环。
-        self.kernel
+        let Some(kernel) = self.kernel.as_ref() else {
+            return;
+        };
+        kernel
             .inner
             .operations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .interrupted = Some(error.clone());
-        let slots = self
-            .kernel
+        let slots = kernel
             .inner
             .plugins
             .lock()
@@ -109,6 +117,8 @@ impl Drop for OperationGuard {
                 *state = PluginState::Failed;
             }
         }
+        self.kernel.take();
+        self.admission.take();
         self.entry
             .state
             .send_replace(LifecycleOperationState::Interrupted(error));
@@ -159,17 +169,19 @@ impl Kernel {
             entry
         };
         let mut guard = OperationGuard {
-            kernel: self.clone(),
+            kernel: Some(self.clone()),
             entry: entry.clone(),
             started: false,
             completed: false,
-            _admission: admission,
+            admission: Some(admission),
         };
         // 丢弃 JoinHandle 仅分离等待；worker 持有 Kernel 和准入锁直到操作结束。
         drop(executor.spawn(async move {
             guard.started = true;
             let result = guard
                 .kernel
+                .as_ref()
+                .expect("生命周期 worker 缺少 Kernel")
                 .execute_lifecycle(guard.entry.request.clone())
                 .await;
             guard.complete(result);
