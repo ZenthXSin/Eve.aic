@@ -1,14 +1,24 @@
-use super::{Kernel, PluginState};
+use super::{Kernel, PluginSlot, PluginState};
 use crate::panic_boundary::contain_panic;
 use crate::scope::PluginScope;
 use eve_plugin_api::{
-    LifecycleRequest, PluginError, PluginId, PluginResult, PluginStopError, StopStage,
+    LifecycleRequest, PluginDependency, PluginError, PluginId, PluginResult, PluginStopError,
+    StopStage,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
 
+enum StartCheck {
+    Enter(PluginId),
+    Dependency {
+        owner: PluginId,
+        dependency: PluginDependency,
+    },
+    Leave(PluginId),
+}
+
 impl Kernel {
-    /// 按 ID 顺序启动全部插件；准入后取消等待不取消操作，结果保留供查询。
+    /// 预检全部根后按 ID 顺序启动；准入后取消等待不取消操作，结果保留供查询。
     pub async fn start_all(&self) -> PluginResult<()> {
         self.run_lifecycle(LifecycleRequest::StartAll).await
     }
@@ -30,8 +40,10 @@ impl Kernel {
     }
 
     async fn start_all_inner(&self) -> PluginResult<()> {
+        let ids = self.plugin_ids();
+        self.preflight_start(&ids)?;
         let mut started = Vec::new();
-        for id in self.plugin_ids() {
+        for id in ids {
             let mut path = HashSet::new();
             if let Err(error) = self.start_with_path(&id, &mut path, &mut started).await {
                 return Err(self.rollback_started(started, error).await);
@@ -41,12 +53,103 @@ impl Kernel {
     }
 
     async fn start_inner(&self, id: &PluginId) -> PluginResult<()> {
+        self.preflight_start(std::slice::from_ref(id))?;
         let mut started = Vec::new();
         let mut path = HashSet::new();
         match self.start_with_path(id, &mut path, &mut started).await {
             Ok(()) => Ok(()),
             Err(error) => Err(self.rollback_started(started, error).await),
         }
+    }
+
+    /// 与实际启动共用准入锁；整个请求通过之前不改状态、不调用插件代码。
+    fn preflight_start(&self, roots: &[PluginId]) -> PluginResult<()> {
+        let mut checked = HashSet::new();
+        let mut path = HashSet::new();
+        // 显式栈保留根节点及清单依赖顺序，避免深层图消耗同步调用栈。
+        let mut pending = roots
+            .iter()
+            .rev()
+            .cloned()
+            .map(StartCheck::Enter)
+            .collect::<Vec<_>>();
+        while let Some(check) = pending.pop() {
+            match check {
+                StartCheck::Enter(id) => {
+                    if checked.contains(&id) {
+                        continue;
+                    }
+                    if !path.insert(id.clone()) {
+                        return Err(PluginError::DependencyCycle(id));
+                    }
+                    let slot = self.slot(&id)?;
+                    let state = *slot.state.lock().expect("state lock poisoned");
+                    match state {
+                        PluginState::Active => {
+                            path.remove(&id);
+                            checked.insert(id);
+                            continue;
+                        }
+                        PluginState::Starting | PluginState::Stopping => {
+                            return Err(PluginError::InvalidLifecycle {
+                                plugin: id,
+                                state: format!("{state:?}"),
+                            });
+                        }
+                        PluginState::Failed => {
+                            return Err(PluginError::InvalidLifecycle {
+                                plugin: id,
+                                state: "Failed; restart is not automatic".into(),
+                            });
+                        }
+                        PluginState::Registered
+                        | PluginState::WaitingDependencies
+                        | PluginState::Stopped => {}
+                    }
+                    pending.push(StartCheck::Leave(id.clone()));
+                    for dependency in slot.manifest.dependencies.iter().rev() {
+                        pending.push(StartCheck::Dependency {
+                            owner: id.clone(),
+                            dependency: dependency.clone(),
+                        });
+                    }
+                }
+                StartCheck::Dependency { owner, dependency } => {
+                    // 每条边的要求都要检查，不能因共享节点已访问或 Active 而跳过。
+                    self.checked_dependency(&owner, &dependency)?;
+                    pending.push(StartCheck::Enter(dependency.id));
+                }
+                StartCheck::Leave(id) => {
+                    path.remove(&id);
+                    checked.insert(id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn checked_dependency(
+        &self,
+        owner: &PluginId,
+        dependency: &PluginDependency,
+    ) -> PluginResult<Arc<PluginSlot>> {
+        let slot = self
+            .slot(&dependency.id)
+            .map_err(|_| PluginError::MissingDependency {
+                plugin: owner.clone(),
+                dependency: dependency.id.clone(),
+            })?;
+        if let Some(requirement) = &dependency.requirement
+            && !slot.manifest.version.matches_requirement(requirement)?
+        {
+            return Err(PluginError::DependencyVersionMismatch {
+                plugin: owner.clone(),
+                dependency: dependency.id.clone(),
+                requirement: requirement.clone(),
+                found: slot.manifest.version.clone(),
+            });
+        }
+        Ok(slot)
     }
 
     async fn start_with_path(
@@ -100,32 +203,14 @@ impl Kernel {
 
         let dependencies = slot.manifest.dependencies.clone();
         for dependency in dependencies {
-            let dependency_slot = match self.slot(&dependency.id) {
+            let dependency_slot = match self.checked_dependency(id, &dependency) {
                 Ok(slot) => slot,
-                Err(_) => {
+                Err(error) => {
                     self.restore_waiting_state(&slot, previous_state);
                     path.remove(id);
-                    return Err(PluginError::MissingDependency {
-                        plugin: id.clone(),
-                        dependency: dependency.id,
-                    });
+                    return Err(error);
                 }
             };
-            if let Some(requirement) = &dependency.requirement
-                && !dependency_slot
-                    .manifest
-                    .version
-                    .matches_requirement(requirement)?
-            {
-                self.restore_waiting_state(&slot, previous_state);
-                path.remove(id);
-                return Err(PluginError::DependencyVersionMismatch {
-                    plugin: id.clone(),
-                    dependency: dependency.id,
-                    requirement: requirement.clone(),
-                    found: dependency_slot.manifest.version.clone(),
-                });
-            }
             if let Err(error) =
                 Box::pin(self.start_with_path(&dependency_slot.manifest.id, path, started)).await
             {
