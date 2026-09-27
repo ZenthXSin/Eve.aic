@@ -67,7 +67,7 @@ impl Kernel {
             }
         };
 
-        {
+        let previous_state = {
             let mut state = slot.state.lock().expect("state lock poisoned");
             match *state {
                 PluginState::Active => {
@@ -91,15 +91,17 @@ impl Kernel {
                 PluginState::Registered
                 | PluginState::WaitingDependencies
                 | PluginState::Stopped => {
+                    let previous = *state;
                     *state = PluginState::WaitingDependencies;
+                    previous
                 }
             }
-        }
+        };
 
         let dependencies = slot.manifest.dependencies.clone();
         for dependency in dependencies {
             if !self.has(&dependency.id) {
-                self.restore_registered(&slot);
+                self.restore_waiting_state(&slot, previous_state);
                 path.remove(id);
                 return Err(PluginError::MissingDependency {
                     plugin: id.clone(),
@@ -108,7 +110,7 @@ impl Kernel {
             }
             if let Err(error) = Box::pin(self.start_with_path(&dependency.id, path, started)).await
             {
-                self.restore_registered(&slot);
+                self.restore_waiting_state(&slot, previous_state);
                 path.remove(id);
                 return Err(error);
             }
@@ -184,10 +186,10 @@ impl Kernel {
         }
     }
 
-    fn restore_registered(&self, slot: &super::PluginSlot) {
+    fn restore_waiting_state(&self, slot: &super::PluginSlot, previous: PluginState) {
         let mut state = slot.state.lock().expect("state lock poisoned");
         if *state == PluginState::WaitingDependencies {
-            *state = PluginState::Registered;
+            *state = previous;
         }
     }
 
