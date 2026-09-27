@@ -1,3 +1,4 @@
+use crate::panic_boundary::contain_panic;
 use eve_plugin_api::{Cleanup, PluginError, PluginResult};
 use std::sync::Mutex;
 
@@ -88,7 +89,8 @@ impl PluginScope {
         let cleanups = self.take_cleanups();
         let mut errors = Vec::new();
         for cleanup in cleanups.into_iter().rev() {
-            if let Err(error) = cleanup().await {
+            if let Err(error) = contain_panic("资源清理", async move { cleanup().await }).await
+            {
                 errors.push(error.to_string());
             }
         }

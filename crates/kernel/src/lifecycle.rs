@@ -1,4 +1,5 @@
 use super::{Kernel, PluginState};
+use crate::panic_boundary::contain_panic;
 use crate::scope::PluginScope;
 use eve_plugin_api::{PluginError, PluginId, PluginResult, PluginStopError, StopStage};
 use std::collections::HashSet;
@@ -101,7 +102,10 @@ impl Kernel {
 
         let result = {
             let mut plugin = slot.plugin.lock().await;
-            plugin.start(self.context(&slot, scope.clone())).await
+            contain_panic("插件启动", async {
+                plugin.start(self.context(&slot, scope.clone())).await
+            })
+            .await
         };
 
         match result {
