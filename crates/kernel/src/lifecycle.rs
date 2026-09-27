@@ -110,6 +110,7 @@ impl Kernel {
                     && let Err(error) = scope.register(cleanup)
                 {
                     *slot.state.lock().expect("state lock poisoned") = PluginState::Failed;
+                    scope.begin_stop();
                     let task_result = shutdown_tasks(self, id).await;
                     let cleanup_result = scope.cleanup().await;
                     self.clear_scope(&slot);
@@ -127,6 +128,7 @@ impl Kernel {
             }
             Err(error) => {
                 *slot.state.lock().expect("state lock poisoned") = PluginState::Failed;
+                scope.begin_stop();
                 let task_result = shutdown_tasks(self, id).await;
                 let cleanup_result = scope.cleanup().await;
                 self.clear_scope(&slot);
@@ -241,12 +243,27 @@ impl Kernel {
         }
 
         let scope = slot.scope.lock().expect("scope lock poisoned").take();
+        if let Some(scope) = &scope {
+            scope.begin_stop();
+        }
         let task_result = shutdown_tasks(self, id).await;
         let cleanup_result = match scope {
             Some(scope) => scope.cleanup().await,
             None => Ok(()),
         };
-        *slot.state.lock().expect("state lock poisoned") = PluginState::Stopped;
+        // 未确认退出的任务可能仍在操作外部资源，不能把插件标为可安全重启。
+        let exited = self
+            .inner
+            .services
+            .tasks
+            .list(id)
+            .map(|tasks| tasks.iter().all(|task| task.exited))
+            .unwrap_or(false);
+        *slot.state.lock().expect("state lock poisoned") = if exited {
+            PluginState::Stopped
+        } else {
+            PluginState::Failed
+        };
 
         if let Err(error) = merge_cleanup_results(task_result, cleanup_result) {
             first_error.get_or_insert(error);
@@ -261,7 +278,11 @@ async fn shutdown_tasks(kernel: &Kernel, id: &PluginId) -> PluginResult<()> {
         .services
         .tasks
         .clone()
-        .shutdown(id, kernel.inner.config.task_shutdown_timeout)
+        .shutdown(
+            id,
+            kernel.inner.config.task_shutdown_timeout,
+            kernel.inner.config.task_abort_timeout,
+        )
         .await?;
     if report.is_clean() {
         Ok(())
@@ -272,6 +293,17 @@ async fn shutdown_tasks(kernel: &Kernel, id: &PluginId) -> PluginResult<()> {
                 "超时任务：{}",
                 report
                     .timed_out
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !report.unfinished.is_empty() {
+            details.push(format!(
+                "尚未确认退出：{}",
+                report
+                    .unfinished
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()

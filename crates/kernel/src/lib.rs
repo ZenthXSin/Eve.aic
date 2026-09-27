@@ -59,12 +59,14 @@ impl Default for KernelServices {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KernelConfig {
     pub task_shutdown_timeout: Duration,
+    pub task_abort_timeout: Duration,
 }
 
 impl Default for KernelConfig {
     fn default() -> Self {
         Self {
             task_shutdown_timeout: Duration::from_secs(5),
+            task_abort_timeout: Duration::from_millis(100),
         }
     }
 }
@@ -124,6 +126,12 @@ impl Kernel {
         self.slot(id)
             .ok()
             .map(|slot| *slot.state.lock().expect("state lock poisoned"))
+    }
+
+    /// 宿主查询任务，包括停止后尚未确认退出的任务。
+    pub fn tasks(&self, id: &PluginId) -> PluginResult<Vec<eve_plugin_api::TaskInfo>> {
+        self.slot(id)?;
+        self.inner.services.tasks.list(id)
     }
 
     fn has(&self, id: &PluginId) -> bool {

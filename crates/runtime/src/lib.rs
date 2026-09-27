@@ -2,7 +2,7 @@
 
 use eve_example_plugins::{
     CONSUMER, EventConsumerPlugin, FAILING, FORMATTER, FailingPlugin, MESSAGE, PROVIDER,
-    ServiceProviderPlugin, TRANSIENT, TRANSIENT_EVENT,
+    ServiceProviderPlugin, TASK_DEMO, TRANSIENT, TRANSIENT_EVENT, TaskDemoPlugin,
 };
 use eve_kernel::{Kernel, KernelServices, PluginState};
 use eve_plugin_api::{Event, PluginError, PluginId, PluginResult, ServiceId};
@@ -10,6 +10,7 @@ use eve_plugin_api::{Event, PluginError, PluginId, PluginResult, ServiceId};
 pub struct DemoReport {
     pub message: String,
     pub expected_failure: String,
+    pub task_runs: u32,
 }
 
 pub async fn run_demo() -> PluginResult<DemoReport> {
@@ -21,9 +22,11 @@ pub async fn run_demo() -> PluginResult<DemoReport> {
     kernel.register(Box::new(ServiceProviderPlugin::new()?))?;
     kernel.register(Box::new(EventConsumerPlugin::new()?))?;
     kernel.register(Box::new(FailingPlugin::new()?))?;
+    kernel.register(Box::new(TaskDemoPlugin::new()?))?;
     let consumer = PluginId::new(CONSUMER)?;
     let provider = PluginId::new(PROVIDER)?;
     let failing = PluginId::new(FAILING)?;
+    let task_demo = PluginId::new(TASK_DEMO)?;
 
     let result = async {
         kernel.start(&consumer).await?;
@@ -38,7 +41,30 @@ pub async fn run_demo() -> PluginResult<DemoReport> {
             message == "已接收：你好，Eve.aic".as_bytes(),
             "事件或服务处理结果不符",
         )?;
+        kernel.start(&task_demo).await?;
+        verify(
+            state.get(&task_demo, "foreground_runs")? == Some(b"6".to_vec()),
+            "前台执行次数不符",
+        )?;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if kernel.tasks(&task_demo)?.iter().any(|task| task.runs > 0) {
+                    break Ok::<_, PluginError>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| PluginError::Task("后台任务未开始".into()))??;
+        verify(
+            state.get(&task_demo, "background_started")? == Some(b"yes".to_vec()),
+            "后台任务未写入状态",
+        )?;
         kernel.stop_all().await?;
+        verify(
+            kernel.tasks(&task_demo)?.is_empty(),
+            "任务停止后仍有残留记录",
+        )?;
         verify(
             kernel.state(&consumer) == Some(PluginState::Stopped),
             "消费者未停止",
@@ -85,6 +111,7 @@ pub async fn run_demo() -> PluginResult<DemoReport> {
             message: String::from_utf8(message)
                 .map_err(|error| PluginError::State(error.to_string()))?,
             expected_failure: expected_failure.to_string(),
+            task_runs: 6,
         })
     }
     .await;
@@ -110,5 +137,6 @@ mod tests {
         let report = super::run_demo().await.unwrap();
         assert_eq!(report.message, "已接收：你好，Eve.aic");
         assert!(report.expected_failure.contains("验收用预期启动失败"));
+        assert_eq!(report.task_runs, 6);
     }
 }

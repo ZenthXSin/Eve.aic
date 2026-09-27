@@ -1,269 +1,392 @@
+//! Tokio 任务执行器。登记与执行分开，前台与后台使用同一条停止路径。
+
 use eve_plugin_api::{
-    PluginError, PluginFuture, PluginId, PluginResult, TaskAction, TaskId, TaskInfo, TaskManager,
-    TaskMode, TaskRunReport, TaskSchedule, TaskShutdownReport, TaskSignal, TaskSpec, TaskState,
+    PluginError, PluginFuture, PluginId, PluginResult, TaskId, TaskInfo, TaskManager, TaskMode,
+    TaskRunReport, TaskSchedule, TaskShutdownReport, TaskSignal, TaskSpec, TaskState,
 };
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, SystemTime};
+use tokio::runtime::Handle;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::AbortHandle;
+use tokio::time::{Instant, sleep_until, timeout_at};
 
 #[derive(Default)]
 pub struct TokioTaskManager {
-    inner: Arc<TaskManagerInner>,
+    inner: Arc<Inner>,
 }
 
 #[derive(Default)]
-struct TaskManagerInner {
+struct Inner {
     next_id: AtomicU64,
-    tasks: Mutex<HashMap<TaskId, Arc<TaskEntry>>>,
+    tasks: Mutex<HashMap<TaskId, Arc<Entry>>>,
 }
 
-struct TaskEntry {
+impl Drop for Inner {
+    fn drop(&mut self) {
+        for entry in self.tasks.get_mut().expect("任务锁中毒").values() {
+            entry.execution.signal.cancel();
+            entry.abort.abort();
+        }
+    }
+}
+
+struct Entry {
+    id: TaskId,
     owner: PluginId,
     name: String,
     mode: TaskMode,
     schedule: TaskSchedule,
-    state: Mutex<TaskState>,
-    signal: Arc<TokioTaskSignal>,
-    handle: Mutex<Option<JoinHandle<PluginResult<()>>>>,
+    execution: Arc<Execution>,
+    abort: AbortHandle,
+    outcome: watch::Receiver<Option<TaskRunReport>>,
+    retain: AtomicBool,
 }
 
-struct TokioTaskSignal {
-    state: Arc<TaskSignalState>,
+struct Execution {
+    progress: Mutex<Progress>,
+    signal: Arc<StopSignal>,
 }
 
-struct TaskSignalState {
-    cancelled: AtomicBool,
+struct Progress {
+    state: TaskState,
+    runs: u32,
+}
+
+struct StopSignal {
     sender: watch::Sender<bool>,
-    receiver: Mutex<watch::Receiver<bool>>,
 }
 
-impl TokioTaskSignal {
-    fn cancel(&self) {
-        if !self.state.cancelled.swap(true, Ordering::SeqCst) {
-            let _ = self.state.sender.send(true);
+impl StopSignal {
+    fn new() -> Self {
+        Self {
+            sender: watch::channel(false).0,
         }
     }
+    fn cancel(&self) {
+        self.sender.send_replace(true);
+    }
 }
 
-impl TaskSignal for TokioTaskSignal {
+impl TaskSignal for StopSignal {
     fn is_cancelled(&self) -> bool {
-        self.state.cancelled.load(Ordering::SeqCst)
+        *self.sender.borrow()
     }
-
     fn cancelled(&self) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-        let state = self.state.clone();
-        let mut receiver = state.receiver.lock().expect("任务信号锁中毒").clone();
+        let mut receiver = self.sender.subscribe();
         Box::pin(async move {
-            if state.cancelled.load(Ordering::SeqCst) {
-                return;
+            // subscribe 先于检查：取消发生在任意一个位置均不会丢失。
+            loop {
+                if *receiver.borrow_and_update() {
+                    return;
+                }
+                if receiver.changed().await.is_err() {
+                    return;
+                }
             }
-            let _ = receiver.changed().await;
         })
+    }
+}
+
+impl Execution {
+    fn set_state(&self, state: TaskState) {
+        let mut progress = self.progress.lock().expect("任务状态锁中毒");
+        if !matches!(progress.state, TaskState::Stopping | TaskState::TimedOut) {
+            progress.state = state;
+        }
     }
 }
 
 impl TokioTaskManager {
-    fn allocate(&self, owner: PluginId, spec: &TaskSpec) -> (TaskId, Arc<TaskEntry>) {
+    fn register(
+        &self,
+        owner: PluginId,
+        spec: TaskSpec,
+        mode: TaskMode,
+    ) -> PluginResult<Arc<Entry>> {
+        spec.validate()?;
+        if spec.mode != mode {
+            return Err(PluginError::Task("任务模式与调用入口不一致".into()));
+        }
+        let runtime = Handle::try_current()
+            .map_err(|_| PluginError::Task("创建任务需要 Tokio Runtime".into()))?;
+        let delay = match spec.schedule {
+            TaskSchedule::After(delay) => delay,
+            TaskSchedule::At(time) => time.duration_since(SystemTime::now()).unwrap_or_default(),
+            _ => Duration::ZERO,
+        };
+        let first_due = deadline(delay)?;
+        if let TaskSchedule::Every { interval, .. } = spec.schedule {
+            deadline(interval)?;
+        }
         let id = TaskId::new(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
-        let entry = Arc::new(TaskEntry {
-            owner,
-            name: spec.name.clone(),
-            mode: spec.mode,
-            schedule: spec.schedule.clone(),
-            state: Mutex::new(TaskState::Scheduled),
-            signal: Arc::new(TokioTaskSignal {
-                state: Arc::new({
-                    let (sender, receiver) = watch::channel(false);
-                    TaskSignalState {
-                        cancelled: AtomicBool::new(false),
-                        sender,
-                        receiver: Mutex::new(receiver),
-                    }
-                }),
+        let execution = Arc::new(Execution {
+            progress: Mutex::new(Progress {
+                state: TaskState::Scheduled,
+                runs: 0,
             }),
-            handle: Mutex::new(None),
+            signal: Arc::new(StopSignal::new()),
         });
-        self.inner
-            .tasks
-            .lock()
-            .expect("任务锁中毒")
-            .insert(id.clone(), entry.clone());
-        (id, entry)
-    }
-
-    fn run_action(
-        action: TaskAction,
-        signal: Arc<TokioTaskSignal>,
-        schedule: TaskSchedule,
-    ) -> TaskFutureBox {
-        Box::pin(async move {
-            match schedule {
-                TaskSchedule::Immediate => (action)(signal).await,
-                TaskSchedule::After(delay) => {
-                    tokio::select! {
-                        _ = tokio::time::sleep(delay) => (action)(signal).await,
-                        _ = signal.cancelled() => Ok(()),
-                    }
-                }
-                TaskSchedule::Every { interval, runs } => {
-                    let mut completed = 0_u32;
-                    loop {
-                        if signal.is_cancelled() {
-                            return Ok(());
-                        }
-                        (action)(signal.clone()).await?;
-                        completed += 1;
-                        if runs.is_some_and(|limit| completed >= limit) {
-                            return Ok(());
-                        }
-                        tokio::select! {
-                            _ = tokio::time::sleep(interval) => {},
-                            _ = signal.cancelled() => return Ok(()),
-                        }
-                    }
-                }
-            }
-        })
-    }
-
-    fn spawn_entry(&self, entry: Arc<TaskEntry>, spec: TaskSpec) -> PluginResult<()> {
-        let action = spec.action.clone();
-        let signal = entry.signal.clone();
-        let schedule = spec.schedule;
-        let entry_for_run = entry.clone();
-        let handle = tokio::spawn(async move {
-            *entry_for_run.state.lock().expect("任务状态锁中毒") = TaskState::Running;
-            let result = Self::run_action(action, signal, schedule).await;
-            *entry_for_run.state.lock().expect("任务状态锁中毒") = match &result {
-                Ok(()) => TaskState::Finished,
-                Err(_) => TaskState::Failed,
+        let (sender, outcome) = watch::channel(None);
+        // 锁覆盖任务登记，shutdown 不会看见未安装取消句柄的半成品。
+        let mut tasks = self.inner.tasks.lock().expect("任务锁中毒");
+        let worker_execution = execution.clone();
+        let name = spec.name.clone();
+        let schedule = spec.schedule.clone();
+        let worker = runtime.spawn(async move { execute(spec, worker_execution, first_due).await });
+        let entry = Arc::new(Entry {
+            id: id.clone(),
+            owner,
+            name,
+            mode,
+            schedule,
+            execution,
+            abort: worker.abort_handle(),
+            outcome,
+            retain: AtomicBool::new(true),
+        });
+        tasks.insert(id, entry.clone());
+        drop(tasks);
+        let monitored = entry.clone();
+        let manager = Arc::downgrade(&self.inner);
+        // JoinHandle 只由监视器等待，前台等待和 shutdown 共享结果而不争夺句柄。
+        runtime.spawn(async move {
+            let joined = worker.await;
+            let (state, errors) = match joined {
+                Ok(Ok(cancelled)) => (
+                    if cancelled {
+                        TaskState::Cancelled
+                    } else {
+                        TaskState::Finished
+                    },
+                    Vec::new(),
+                ),
+                Ok(Err(error)) => (TaskState::Failed, vec![error.to_string()]),
+                Err(error) if error.is_cancelled() => (TaskState::Cancelled, Vec::new()),
+                Err(error) => (TaskState::Failed, vec![error.to_string()]),
             };
-            result
+            let report = {
+                let mut progress = monitored.execution.progress.lock().expect("任务状态锁中毒");
+                if progress.state != TaskState::TimedOut {
+                    progress.state = state;
+                }
+                TaskRunReport {
+                    id: monitored.id.clone(),
+                    runs: progress.runs,
+                    state: progress.state,
+                    errors,
+                }
+            };
+            // Join 完成意味着动作及其捕获资源已经释放。
+            sender.send_replace(Some(report));
+            if !monitored.retain.load(Ordering::SeqCst) {
+                remove(&manager, &monitored.id);
+            }
         });
-        *entry.handle.lock().expect("任务句柄锁中毒") = Some(handle);
-        Ok(())
+        Ok(entry)
     }
 }
 
-type TaskFutureBox = Pin<Box<dyn Future<Output = PluginResult<()>> + Send + 'static>>;
+async fn execute(
+    spec: TaskSpec,
+    execution: Arc<Execution>,
+    first_due: Instant,
+) -> PluginResult<bool> {
+    let mut due = first_due;
+    loop {
+        execution.set_state(TaskState::Scheduled);
+        tokio::select! {
+            biased;
+            _ = execution.signal.cancelled() => return Ok(true),
+            _ = sleep_until(due) => {}
+        }
+        if execution.signal.is_cancelled() {
+            return Ok(true);
+        }
+        execution.set_state(TaskState::Running);
+        (spec.action)(execution.signal.clone()).await?;
+        let runs = {
+            let mut progress = execution.progress.lock().expect("任务状态锁中毒");
+            progress.runs = progress.runs.saturating_add(1);
+            progress.runs
+        };
+        match spec.schedule {
+            TaskSchedule::Every {
+                interval,
+                runs: limit,
+            } if !limit.is_some_and(|limit| runs >= limit) => {
+                if execution.signal.is_cancelled() {
+                    return Ok(true);
+                }
+                // 固定延迟：不追赶错过的 tick，也不会让同一个动作重叠执行。
+                due = deadline(interval)?;
+            }
+            _ => return Ok(execution.signal.is_cancelled()),
+        }
+    }
+}
+
+fn deadline(duration: Duration) -> PluginResult<Instant> {
+    Instant::now()
+        .checked_add(duration)
+        .ok_or_else(|| PluginError::Task("任务时间超出支持范围".into()))
+}
+
+async fn wait(entry: &Entry) -> PluginResult<TaskRunReport> {
+    let mut receiver = entry.outcome.clone();
+    loop {
+        if let Some(report) = receiver.borrow_and_update().clone() {
+            return Ok(report);
+        }
+        receiver
+            .changed()
+            .await
+            .map_err(|_| PluginError::Task("任务执行器已关闭".into()))?;
+    }
+}
+
+fn remove(manager: &Weak<Inner>, id: &TaskId) {
+    if let Some(manager) = manager.upgrade() {
+        manager.tasks.lock().expect("任务锁中毒").remove(id);
+    }
+}
+
+struct ForegroundWait {
+    entry: Arc<Entry>,
+    manager: Weak<Inner>,
+}
+
+impl Drop for ForegroundWait {
+    fn drop(&mut self) {
+        self.entry.retain.store(false, Ordering::SeqCst);
+        if self.entry.outcome.borrow().is_none() {
+            self.entry.execution.signal.cancel();
+            self.entry.abort.abort();
+        } else {
+            remove(&self.manager, &self.entry.id);
+        }
+    }
+}
 
 impl TaskManager for TokioTaskManager {
     fn spawn(&self, owner: PluginId, spec: TaskSpec) -> PluginResult<TaskId> {
-        if spec.mode != TaskMode::Background {
-            return Err(PluginError::Task(
-                "只有 Background 任务可以通过 spawn_task 创建".into(),
-            ));
-        }
-        let (id, entry) = self.allocate(owner, &spec);
-        if let Err(error) = self.spawn_entry(entry, spec) {
-            self.inner.tasks.lock().expect("任务锁中毒").remove(&id);
-            return Err(error);
-        }
-        Ok(id)
+        Ok(self.register(owner, spec, TaskMode::Background)?.id.clone())
     }
 
-    fn run_foreground(self: Arc<Self>, owner: PluginId, spec: TaskSpec) -> PluginFutureBoxReport {
-        Box::pin(async move {
-            if spec.mode != TaskMode::Foreground {
-                return Err(PluginError::Task(
-                    "只有 Foreground 任务可以通过 run_foreground 执行".into(),
-                ));
-            }
-            let (id, entry) = self.allocate(owner, &spec);
-            *entry.state.lock().expect("任务状态锁中毒") = TaskState::Running;
-            let mut report = TaskRunReport {
-                id: id.clone(),
-                runs: 0,
-                errors: Vec::new(),
-            };
-            let action = spec.action.clone();
-            let schedule = spec.schedule.clone();
-            let result = Self::run_action(action, entry.signal.clone(), schedule.clone()).await;
-            match result {
-                Ok(()) => {
-                    report.runs = match schedule {
-                        TaskSchedule::Every { runs: Some(r), .. } => r,
-                        _ => 1,
-                    };
-                    *entry.state.lock().expect("任务状态锁中毒") = TaskState::Finished;
-                }
-                Err(error) => {
-                    report.errors.push(error.to_string());
-                    *entry.state.lock().expect("任务状态锁中毒") = TaskState::Failed;
-                }
-            }
-            self.inner.tasks.lock().expect("任务锁中毒").remove(&id);
-            Ok(report)
-        })
+    fn run_foreground(
+        self: Arc<Self>,
+        owner: PluginId,
+        spec: TaskSpec,
+    ) -> PluginResult<PluginFuture<'static, TaskRunReport>> {
+        let entry = self.register(owner, spec, TaskMode::Foreground)?;
+        let guard = ForegroundWait {
+            entry,
+            manager: Arc::downgrade(&self.inner),
+        };
+        // 在 Future 构造前创建 guard；即使从不 poll 就丢弃也会请求取消。
+        Ok(Box::pin(async move { wait(&guard.entry).await }))
     }
 
     fn list(&self, owner: &PluginId) -> PluginResult<Vec<TaskInfo>> {
-        let entries = self.inner.tasks.lock().expect("任务锁中毒");
-        Ok(entries
-            .iter()
-            .filter(|(_, entry)| entry.owner == *owner)
-            .map(|(id, entry)| TaskInfo {
-                id: id.clone(),
+        let tasks = self.inner.tasks.lock().expect("任务锁中毒");
+        let mut result = Vec::new();
+        for entry in tasks.values().filter(|entry| entry.owner == *owner) {
+            let progress = entry.execution.progress.lock().expect("任务状态锁中毒");
+            result.push(TaskInfo {
+                id: entry.id.clone(),
                 owner: entry.owner.clone(),
                 name: entry.name.clone(),
                 mode: entry.mode,
                 schedule: entry.schedule.clone(),
-                state: *entry.state.lock().expect("任务状态锁中毒"),
-            })
-            .collect())
+                state: progress.state,
+                runs: progress.runs,
+                exited: entry.outcome.borrow().is_some(),
+            });
+        }
+        result.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(result)
     }
 
     fn shutdown(
         self: Arc<Self>,
         owner: &PluginId,
         timeout: Duration,
+        abort_timeout: Duration,
     ) -> PluginFuture<'static, TaskShutdownReport> {
         let owner = owner.clone();
         Box::pin(async move {
-            let entries: Vec<_> = self
+            let end = deadline(timeout)?;
+            let mut entries: Vec<_> = self
                 .inner
                 .tasks
                 .lock()
                 .expect("任务锁中毒")
-                .iter()
-                .filter(|(_, entry)| entry.owner == owner)
-                .map(|(id, entry)| (id.clone(), entry.clone()))
+                .values()
+                .filter(|entry| entry.owner == owner)
+                .cloned()
                 .collect();
-            for (_, entry) in &entries {
-                *entry.state.lock().expect("任务状态锁中毒") = TaskState::Stopping;
-                entry.signal.cancel();
-            }
-            let deadline = tokio::time::Instant::now() + timeout;
-            let mut report = TaskShutdownReport::default();
-            for (id, entry) in entries {
-                let Some(mut handle) = entry.handle.lock().expect("任务句柄锁中毒").take()
-                else {
-                    report.stopped.push(id);
-                    continue;
-                };
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                match tokio::time::timeout(remaining, &mut handle).await {
-                    Ok(Ok(Ok(()))) => report.stopped.push(id.clone()),
-                    Ok(Ok(Err(error))) => report.errors.push(format!("{id}: {error}")),
-                    Ok(Err(error)) => report.errors.push(format!("{id}: {error}")),
-                    Err(_) => {
-                        handle.abort();
-                        let _ = handle.await;
-                        *entry.state.lock().expect("任务状态锁中毒") = TaskState::TimedOut;
-                        report.timed_out.push(id.clone());
-                    }
+            entries.sort_by(|a, b| a.id.cmp(&b.id));
+            for entry in &entries {
+                if entry.outcome.borrow().is_none() {
+                    entry.execution.set_state(TaskState::Stopping);
                 }
-                self.inner.tasks.lock().expect("任务锁中毒").remove(&id);
+                entry.execution.signal.cancel();
+            }
+            let mut report = TaskShutdownReport::default();
+            let mut pending = Vec::new();
+            for entry in entries {
+                match timeout_at(end, wait(&entry)).await {
+                    Ok(result) => record_exit(&self.inner, &entry, result, &mut report),
+                    Err(_) => pending.push(entry),
+                }
+            }
+            // 同时发取消，再用第二个共享截止时间确认退出。
+            for entry in &pending {
+                entry
+                    .execution
+                    .progress
+                    .lock()
+                    .expect("任务状态锁中毒")
+                    .state = TaskState::TimedOut;
+                report.timed_out.push(entry.id.clone());
+                entry.abort.abort();
+            }
+            let abort_end = deadline(abort_timeout)?;
+            for entry in pending {
+                match timeout_at(abort_end, wait(&entry)).await {
+                    Ok(result) => record_exit(&self.inner, &entry, result, &mut report),
+                    Err(_) => report.unfinished.push(entry.id.clone()),
+                }
             }
             Ok(report)
         })
     }
 }
 
-type PluginFutureBoxReport =
-    Pin<Box<dyn Future<Output = PluginResult<TaskRunReport>> + Send + 'static>>;
+fn record_exit(
+    inner: &Inner,
+    entry: &Entry,
+    result: PluginResult<TaskRunReport>,
+    report: &mut TaskShutdownReport,
+) {
+    match result {
+        Ok(result) => {
+            report.stopped.push(entry.id.clone());
+            report.errors.extend(
+                result
+                    .errors
+                    .into_iter()
+                    .map(|error| format!("{}: {error}", entry.id)),
+            );
+            inner.tasks.lock().expect("任务锁中毒").remove(&entry.id);
+        }
+        Err(error) => {
+            report.errors.push(format!("{}: {error}", entry.id));
+            report.unfinished.push(entry.id.clone());
+        }
+    }
+}

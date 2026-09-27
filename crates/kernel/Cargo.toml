@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 eve-plugin-api = { path = "../plugin-api" }
 tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

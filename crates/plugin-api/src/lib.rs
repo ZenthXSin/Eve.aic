@@ -10,8 +10,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 mod capabilities;
+mod tasks;
 pub use capabilities::{
     EventBus, PermissionChecker, ServiceEntry, ServiceRegistry, ServiceValue, StateStore,
+};
+pub use tasks::{
     TaskAction, TaskFuture, TaskInfo, TaskManager, TaskMode, TaskRunReport, TaskSchedule,
     TaskShutdownReport, TaskSignal, TaskSpec, TaskState,
 };
@@ -146,7 +149,7 @@ impl fmt::Display for EventId {
     }
 }
 
-/// 由 Runtime 分配的后台任务标识。
+/// 由 Runtime 分配的任务标识。
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TaskId(u64);
 
