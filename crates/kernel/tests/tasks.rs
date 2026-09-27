@@ -636,6 +636,7 @@ async fn blocking_task_is_reported_unfinished_and_kernel_cannot_restart_it() {
         KernelConfig {
             task_shutdown_timeout: Duration::from_millis(20),
             task_abort_timeout: Duration::from_millis(20),
+            ..KernelConfig::default()
         },
     );
     let ctx = context(&kernel).await;

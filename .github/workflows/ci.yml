@@ -45,6 +45,8 @@ jobs:
         run: cargo test --workspace --locked
       - name: 运行插件协作验收
         run: cargo run -p eve-runtime --locked
+      - name: 验证取消生命周期等待后的收尾
+        run: cargo run -p eve-runtime --example lifecycle_operations --locked
       - name: 验证两次独立进程恢复状态
         run: |
           function Assert-SavedCounter([string] $Directory, [string] $ExpectedStarts) {

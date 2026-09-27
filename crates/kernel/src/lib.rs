@@ -3,6 +3,7 @@
 pub mod backends;
 mod context;
 mod lifecycle;
+mod operations;
 mod panic_boundary;
 mod scope;
 
@@ -56,6 +57,8 @@ impl Default for KernelServices {
 pub struct KernelConfig {
     pub task_shutdown_timeout: Duration,
     pub task_abort_timeout: Duration,
+    /// 未确认的生命周期记录上限；满时拒绝新操作，不淘汰旧错误。
+    pub lifecycle_report_capacity: usize,
 }
 
 impl Default for KernelConfig {
@@ -63,13 +66,15 @@ impl Default for KernelConfig {
         Self {
             task_shutdown_timeout: Duration::from_secs(5),
             task_abort_timeout: Duration::from_millis(100),
+            lifecycle_report_capacity: 128,
         }
     }
 }
 
 #[derive(Default)]
 struct KernelInner {
-    lifecycle: AsyncMutex<()>,
+    lifecycle: Arc<AsyncMutex<()>>,
+    operations: Mutex<operations::OperationRegistry>,
     plugins: Mutex<HashMap<PluginId, Arc<PluginSlot>>>,
     services: KernelServices,
     config: KernelConfig,
@@ -100,6 +105,7 @@ impl Kernel {
     }
 
     pub fn register(&self, plugin: Box<dyn Plugin>) -> PluginResult<()> {
+        self.ensure_lifecycle_healthy()?;
         let manifest = plugin.manifest().clone();
         let id = manifest.id.clone();
         let mut plugins = self.inner.plugins.lock().expect("plugin lock poisoned");
