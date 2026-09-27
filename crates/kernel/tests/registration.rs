@@ -1,5 +1,8 @@
-use eve_kernel::Kernel;
-use eve_plugin_api::{Cleanup, Plugin, PluginContext, PluginFuture, PluginId, PluginManifest};
+use eve_kernel::{Kernel, KernelServices, backends::MemoryStateStore};
+use eve_plugin_api::{
+    Cleanup, Plugin, PluginContext, PluginFuture, PluginId, PluginManifest, PluginRegistry,
+    StateStore,
+};
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -20,6 +23,23 @@ impl Plugin for SimplePlugin {
 
     fn start(&mut self, _: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         Box::pin(async { Ok(None) })
+    }
+}
+
+struct StatefulPlugin {
+    manifest: PluginManifest,
+}
+
+impl Plugin for StatefulPlugin {
+    fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+
+    fn start(&mut self, ctx: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
+        Box::pin(async move {
+            ctx.state_set("保留", "状态".as_bytes().to_vec())?;
+            Ok(None)
+        })
     }
 }
 
@@ -84,4 +104,54 @@ async fn registration_is_rejected_while_a_lifecycle_operation_holds_the_admissio
         Some(eve_plugin_api::PluginState::Registered)
     );
     kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn unregister_preserves_state_and_allows_reusing_the_plugin_id() {
+    let state = Arc::new(MemoryStateStore::default());
+    let kernel = Kernel::with_services(KernelServices {
+        state: state.clone(),
+        ..Default::default()
+    });
+    let id = PluginId::new("reusable").unwrap();
+    kernel
+        .register(Box::new(StatefulPlugin {
+            manifest: PluginManifest::new("reusable", "0.1.0").unwrap(),
+        }))
+        .unwrap();
+    kernel.start(&id).await.unwrap();
+    kernel.stop(&id).await.unwrap();
+
+    let registry: &dyn PluginRegistry = &kernel;
+    registry.unregister(&id).unwrap();
+    assert_eq!(kernel.state(&id), None);
+    assert_eq!(
+        state.get(&id, "保留").unwrap(),
+        Some("状态".as_bytes().to_vec())
+    );
+
+    registry.register(plugin("reusable")).unwrap();
+    assert_eq!(
+        kernel.state(&id),
+        Some(eve_plugin_api::PluginState::Registered)
+    );
+}
+
+#[tokio::test]
+async fn unregister_rejects_an_active_plugin_until_it_is_stopped() {
+    let kernel = Kernel::new();
+    let id = PluginId::new("active").unwrap();
+    kernel.register(plugin("active")).unwrap();
+    kernel.start(&id).await.unwrap();
+
+    let error = kernel.unregister(&id).unwrap_err();
+    assert!(matches!(
+        error,
+        eve_plugin_api::PluginError::InvalidLifecycle { .. }
+    ));
+    assert_eq!(kernel.state(&id), Some(eve_plugin_api::PluginState::Active));
+
+    kernel.stop(&id).await.unwrap();
+    kernel.unregister(&id).unwrap();
+    assert_eq!(kernel.state(&id), None);
 }

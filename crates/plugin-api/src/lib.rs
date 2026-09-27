@@ -437,6 +437,14 @@ pub trait Plugin: Send {
     fn start(&mut self, ctx: PluginContext) -> PluginFuture<'_, Option<Cleanup>>;
 }
 
+/// 宿主侧插件注册表契约。插件本身不能通过 `PluginContext` 操作注册表。
+pub trait PluginRegistry: Send + Sync {
+    fn register(&self, plugin: Box<dyn Plugin>) -> PluginResult<()>;
+
+    /// 仅移除未运行且任务已确认退出的插件；插件状态字节不会被删除。
+    fn unregister(&self, id: &PluginId) -> PluginResult<()>;
+}
+
 /// Errors crossing the plugin boundary.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum PluginError {

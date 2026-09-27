@@ -10,8 +10,8 @@ mod scope;
 use context::KernelHooks;
 use eve_plugin_api::{
     EventBus, Logger, PermissionChecker, Plugin, PluginContext, PluginError, PluginId, PluginInfo,
-    PluginManifest, PluginResult, PluginStatus, RuntimeInspector, ServiceRegistry, StateStore,
-    TaskManager,
+    PluginManifest, PluginRegistry, PluginResult, PluginStatus, RuntimeInspector, ServiceRegistry,
+    StateStore, TaskManager,
 };
 use scope::PluginScope;
 use std::collections::HashMap;
@@ -125,6 +125,41 @@ impl Kernel {
         Ok(())
     }
 
+    /// 移除已注册但没有运行中资源的插件；不会删除该插件的 StateStore 数据。
+    pub fn unregister(&self, id: &PluginId) -> PluginResult<()> {
+        let _registration = self.registration_guard()?;
+        let slot = self.slot(id)?;
+        let state = *slot.state.lock().expect("state lock poisoned");
+        if !matches!(
+            state,
+            PluginState::Registered | PluginState::Stopped | PluginState::Failed
+        ) {
+            return Err(PluginError::InvalidLifecycle {
+                plugin: id.clone(),
+                state: format!("cannot unregister plugin in {state:?} state"),
+            });
+        }
+        if slot.scope.lock().expect("scope lock poisoned").is_some() {
+            return Err(PluginError::InvalidLifecycle {
+                plugin: id.clone(),
+                state: "plugin scope is still present".into(),
+            });
+        }
+        let tasks = self.inner.services.tasks.list(id)?;
+        if let Some(task) = tasks.iter().find(|task| !task.exited) {
+            return Err(PluginError::Task(format!(
+                "cannot unregister plugin with an unconfirmed task: {}",
+                task.id
+            )));
+        }
+        self.inner
+            .plugins
+            .lock()
+            .expect("plugin lock poisoned")
+            .remove(id);
+        Ok(())
+    }
+
     /// 注册表变更与生命周期快照串行化，避免运行中的 start/stop 漏掉新插件。
     fn registration_guard(&self) -> PluginResult<AsyncMutexGuard<'_, ()>> {
         self.ensure_lifecycle_healthy()?;
@@ -208,6 +243,16 @@ impl Kernel {
             manifest: slot.manifest.clone(),
         });
         PluginContext::new(PluginInfo::from(&slot.manifest), hooks)
+    }
+}
+
+impl PluginRegistry for Kernel {
+    fn register(&self, plugin: Box<dyn Plugin>) -> PluginResult<()> {
+        Kernel::register(self, plugin)
+    }
+
+    fn unregister(&self, id: &PluginId) -> PluginResult<()> {
+        Kernel::unregister(self, id)
     }
 }
 
