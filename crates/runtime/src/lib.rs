@@ -4,8 +4,10 @@ use eve_example_plugins::{
     CONSUMER, EventConsumerPlugin, FAILING, FORMATTER, FailingPlugin, MESSAGE, PROVIDER,
     ServiceProviderPlugin, TASK_DEMO, TRANSIENT, TRANSIENT_EVENT, TaskDemoPlugin,
 };
-use eve_kernel::{Kernel, KernelServices, PluginState, backends::StderrLogger};
-use eve_plugin_api::{Event, Logger, PluginError, PluginId, PluginResult, ServiceId};
+use eve_kernel::{Kernel, KernelServices, backends::StderrLogger};
+use eve_plugin_api::{
+    Event, Logger, PluginError, PluginId, PluginResult, PluginState, RuntimeInspector, ServiceId,
+};
 use std::sync::Arc;
 
 pub struct DemoReport {
@@ -13,6 +15,7 @@ pub struct DemoReport {
     pub expected_failure: String,
     pub task_runs: u32,
     pub custom_task_runs: u32,
+    pub diagnosed_plugins: usize,
 }
 
 pub async fn run_demo() -> PluginResult<DemoReport> {
@@ -130,12 +133,34 @@ pub async fn run_demo_with_logger(logger: Arc<dyn Logger>) -> PluginResult<DemoR
             state.get(&failing, "unexpected")?.is_none(),
             "失败后残留监听器",
         )?;
+        // 验收宿主只依赖只读诊断契约，避免依赖 Kernel 内部注册表。
+        let inspector: &dyn RuntimeInspector = &kernel;
+        let statuses = inspector.plugins()?;
+        verify(statuses.len() == 4, "诊断插件数量不符")?;
+        for (id, expected) in [
+            (&consumer, PluginState::Stopped),
+            (&provider, PluginState::Stopped),
+            (&task_demo, PluginState::Stopped),
+            (&failing, PluginState::Failed),
+        ] {
+            verify(
+                statuses
+                    .iter()
+                    .any(|status| &status.info.id == id && status.state == expected),
+                &format!("插件 {id} 的最终诊断状态不符"),
+            )?;
+            verify(
+                inspector.plugin_tasks(id)?.is_empty(),
+                &format!("插件 {id} 停止或回滚后仍有残留任务"),
+            )?;
+        }
         Ok(DemoReport {
             message: String::from_utf8(message)
                 .map_err(|error| PluginError::State(error.to_string()))?,
             expected_failure: expected_failure.to_string(),
             task_runs: 6,
             custom_task_runs: 3,
+            diagnosed_plugins: statuses.len(),
         })
     }
     .await;
@@ -167,6 +192,7 @@ mod tests {
         assert!(report.expected_failure.contains("验收用预期启动失败"));
         assert_eq!(report.task_runs, 6);
         assert_eq!(report.custom_task_runs, 3);
+        assert_eq!(report.diagnosed_plugins, 4);
         let snapshot = logger.snapshot().unwrap();
         assert_eq!(snapshot.dropped, 0);
         assert_eq!(snapshot.records.len(), 3);

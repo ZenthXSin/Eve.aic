@@ -1,6 +1,6 @@
 use super::{Kernel, PluginState};
 use crate::scope::PluginScope;
-use eve_plugin_api::{PluginError, PluginId, PluginResult};
+use eve_plugin_api::{PluginError, PluginId, PluginResult, PluginStopError, StopStage};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -176,13 +176,13 @@ impl Kernel {
     pub async fn stop_all(&self) -> PluginResult<()> {
         let _lifecycle = self.inner.lifecycle.lock().await;
         let mut stopping = HashSet::new();
-        let mut first_error = None;
+        let mut errors = Vec::new();
         for id in self.plugin_ids() {
             if let Err(error) = self.stop_inner(&id, &mut stopping).await {
-                first_error.get_or_insert(error);
+                append_stop_error(&mut errors, &id, error);
             }
         }
-        first_error.map_or(Ok(()), Err)
+        stopped_result(errors)
     }
 
     /// Stop one plugin and all active consumers that depend on it.
@@ -222,10 +222,10 @@ impl Kernel {
             .collect::<Vec<_>>();
         consumers.sort();
 
-        let mut first_error = None;
+        let mut errors = Vec::new();
         for consumer in consumers {
             if let Err(error) = Box::pin(self.stop_inner(&consumer, stopping)).await {
-                first_error.get_or_insert(error);
+                append_stop_error(&mut errors, &consumer, error);
             }
         }
 
@@ -239,7 +239,7 @@ impl Kernel {
             }
         };
         if !active {
-            return first_error.map_or(Ok(()), Err);
+            return stopped_result(errors);
         }
 
         let scope = slot.scope.lock().expect("scope lock poisoned").take();
@@ -251,24 +251,69 @@ impl Kernel {
             Some(scope) => scope.cleanup().await,
             None => Ok(()),
         };
+        for (stage, result) in [
+            (StopStage::Tasks, task_result),
+            (StopStage::Cleanup, cleanup_result),
+        ] {
+            if let Err(error) = result {
+                errors.push(PluginStopError {
+                    plugin: id.clone(),
+                    stage,
+                    error: Box::new(error),
+                });
+            }
+        }
         // 未确认退出的任务可能仍在操作外部资源，不能把插件标为可安全重启。
-        let exited = self
-            .inner
-            .services
-            .tasks
-            .list(id)
-            .map(|tasks| tasks.iter().all(|task| task.exited))
-            .unwrap_or(false);
+        let exited = match self.inner.services.tasks.list(id) {
+            Ok(tasks) if tasks.iter().all(|task| task.exited) => true,
+            result => {
+                let error = match result {
+                    Err(error) => error,
+                    Ok(tasks) => PluginError::Task(format!(
+                        "退出确认仍有未结束任务：{}",
+                        tasks
+                            .iter()
+                            .filter(|task| !task.exited)
+                            .map(|task| task.id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                };
+                errors.push(PluginStopError {
+                    plugin: id.clone(),
+                    stage: StopStage::Inspection,
+                    error: Box::new(error),
+                });
+                false
+            }
+        };
         *slot.state.lock().expect("state lock poisoned") = if exited {
             PluginState::Stopped
         } else {
             PluginState::Failed
         };
 
-        if let Err(error) = merge_cleanup_results(task_result, cleanup_result) {
-            first_error.get_or_insert(error);
-        }
-        first_error.map_or(Ok(()), Err)
+        stopped_result(errors)
+    }
+}
+
+fn append_stop_error(errors: &mut Vec<PluginStopError>, plugin: &PluginId, error: PluginError) {
+    match error {
+        // 子插件错误保留原始归属，不重复包装成提供者的错误。
+        PluginError::Shutdown(nested) => errors.extend(nested),
+        error => errors.push(PluginStopError {
+            plugin: plugin.clone(),
+            stage: StopStage::Lifecycle,
+            error: Box::new(error),
+        }),
+    }
+}
+
+fn stopped_result(errors: Vec<PluginStopError>) -> PluginResult<()> {
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(PluginError::Shutdown(errors))
     }
 }
 
