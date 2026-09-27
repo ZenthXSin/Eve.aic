@@ -107,6 +107,7 @@ impl Kernel {
     pub fn register(&self, plugin: Box<dyn Plugin>) -> PluginResult<()> {
         let _registration = self.registration_guard()?;
         let manifest = plugin.manifest().clone();
+        manifest.validate()?;
         let id = manifest.id.clone();
         let mut plugins = self.inner.plugins.lock().expect("plugin lock poisoned");
         if plugins.contains_key(&id) {
@@ -172,14 +173,6 @@ impl Kernel {
     /// 宿主停止日志生产后显式刷新；即使插件停止失败，也可尝试排出已有日志。
     pub fn flush_logs(&self) -> PluginResult<()> {
         self.inner.services.logger.flush()
-    }
-
-    fn has(&self, id: &PluginId) -> bool {
-        self.inner
-            .plugins
-            .lock()
-            .expect("plugin lock poisoned")
-            .contains_key(id)
     }
 
     fn plugin_ids(&self) -> Vec<PluginId> {

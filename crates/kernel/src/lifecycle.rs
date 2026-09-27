@@ -100,15 +100,34 @@ impl Kernel {
 
         let dependencies = slot.manifest.dependencies.clone();
         for dependency in dependencies {
-            if !self.has(&dependency.id) {
+            let dependency_slot = match self.slot(&dependency.id) {
+                Ok(slot) => slot,
+                Err(_) => {
+                    self.restore_waiting_state(&slot, previous_state);
+                    path.remove(id);
+                    return Err(PluginError::MissingDependency {
+                        plugin: id.clone(),
+                        dependency: dependency.id,
+                    });
+                }
+            };
+            if let Some(requirement) = &dependency.requirement
+                && !dependency_slot
+                    .manifest
+                    .version
+                    .matches_requirement(requirement)?
+            {
                 self.restore_waiting_state(&slot, previous_state);
                 path.remove(id);
-                return Err(PluginError::MissingDependency {
+                return Err(PluginError::DependencyVersionMismatch {
                     plugin: id.clone(),
                     dependency: dependency.id,
+                    requirement: requirement.clone(),
+                    found: dependency_slot.manifest.version.clone(),
                 });
             }
-            if let Err(error) = Box::pin(self.start_with_path(&dependency.id, path, started)).await
+            if let Err(error) =
+                Box::pin(self.start_with_path(&dependency_slot.manifest.id, path, started)).await
             {
                 self.restore_waiting_state(&slot, previous_state);
                 path.remove(id);

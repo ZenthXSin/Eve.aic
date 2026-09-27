@@ -80,8 +80,7 @@ impl fmt::Display for PluginId {
     }
 }
 
-/// A version string. Full semver validation is intentionally deferred to the
-/// dependency protocol; the first kernel only preserves and reports it.
+/// A validated semantic version used by plugin manifests and dependencies.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Version(String);
 
@@ -93,11 +92,27 @@ impl Version {
                 "plugin version cannot be empty".to_string(),
             ));
         }
+        semver::Version::parse(&value).map_err(|error| {
+            PluginError::InvalidManifest(format!("plugin version must be valid SemVer: {error}"))
+        })?;
         Ok(Self(value))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// 检查该版本是否满足一个 SemVer 版本范围。
+    pub fn matches_requirement(&self, requirement: &str) -> PluginResult<bool> {
+        let requirement = semver::VersionReq::parse(requirement).map_err(|error| {
+            PluginError::InvalidManifest(format!(
+                "dependency version requirement must be valid SemVer: {error}"
+            ))
+        })?;
+        let version = semver::Version::parse(&self.0).map_err(|error| {
+            PluginError::InvalidManifest(format!("plugin version must be valid SemVer: {error}"))
+        })?;
+        Ok(requirement.matches(&version))
     }
 }
 
@@ -179,8 +194,8 @@ impl fmt::Display for TaskId {
     }
 }
 
-/// A dependency declaration. `requirement` is preserved for the future
-/// semver resolver; the first resolver checks the dependency id.
+/// A dependency declaration. `None` accepts any valid dependency version;
+/// `Some` uses a standard SemVer version requirement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PluginDependency {
     pub id: PluginId,
@@ -224,6 +239,40 @@ impl PluginManifest {
             dependencies: Vec::new(),
             permissions: Vec::new(),
         })
+    }
+
+    /// 校验供注册、发现和未来外部插件协议共用的清单约束。
+    pub fn validate(&self) -> PluginResult<()> {
+        let mut dependencies = std::collections::HashSet::new();
+        for dependency in &self.dependencies {
+            if dependency.id == self.id {
+                return Err(PluginError::InvalidManifest(format!(
+                    "plugin {} cannot depend on itself",
+                    self.id
+                )));
+            }
+            if !dependencies.insert(dependency.id.clone()) {
+                return Err(PluginError::InvalidManifest(format!(
+                    "plugin {} declares dependency {} more than once",
+                    self.id, dependency.id
+                )));
+            }
+            if let Some(requirement) = &dependency.requirement {
+                if requirement.trim().is_empty() {
+                    return Err(PluginError::InvalidManifest(format!(
+                        "dependency {} of plugin {} has an empty version requirement",
+                        dependency.id, self.id
+                    )));
+                }
+                semver::VersionReq::parse(requirement).map_err(|error| {
+                    PluginError::InvalidManifest(format!(
+                        "dependency {} of plugin {} has invalid version requirement {requirement:?}: {error}",
+                        dependency.id, self.id
+                    ))
+                })?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -397,6 +446,12 @@ pub enum PluginError {
         plugin: PluginId,
         dependency: PluginId,
     },
+    DependencyVersionMismatch {
+        plugin: PluginId,
+        dependency: PluginId,
+        requirement: String,
+        found: Version,
+    },
     DependencyCycle(PluginId),
     InvalidLifecycle {
         plugin: PluginId,
@@ -436,6 +491,15 @@ impl fmt::Display for PluginError {
             Self::MissingDependency { plugin, dependency } => {
                 write!(f, "plugin {plugin} is missing dependency {dependency}")
             }
+            Self::DependencyVersionMismatch {
+                plugin,
+                dependency,
+                requirement,
+                found,
+            } => write!(
+                f,
+                "plugin {plugin} requires dependency {dependency} at {requirement}, found {found}"
+            ),
             Self::DependencyCycle(id) => write!(f, "dependency cycle detected at {id}"),
             Self::InvalidLifecycle { plugin, state } => {
                 write!(f, "invalid lifecycle transition for {plugin}: {state}")
