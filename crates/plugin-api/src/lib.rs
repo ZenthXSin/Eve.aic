@@ -15,8 +15,9 @@ pub use capabilities::{
     EventBus, PermissionChecker, ServiceEntry, ServiceRegistry, ServiceValue, StateStore,
 };
 pub use tasks::{
-    TaskAction, TaskFuture, TaskInfo, TaskManager, TaskMode, TaskRunReport, TaskSchedule,
-    TaskShutdownReport, TaskSignal, TaskSpec, TaskState,
+    Task, TaskAction, TaskFuture, TaskInfo, TaskManager, TaskMode, TaskRunReport, TaskSchedule,
+    TaskScheduleFactory, TaskScheduleInfo, TaskScheduler, TaskShutdownReport, TaskSignal, TaskSpec,
+    TaskState, TaskTypeId,
 };
 
 /// The result type used by the plugin boundary.

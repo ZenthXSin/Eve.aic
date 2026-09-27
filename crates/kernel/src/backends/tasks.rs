@@ -2,7 +2,8 @@
 
 use eve_plugin_api::{
     PluginError, PluginFuture, PluginId, PluginResult, TaskId, TaskInfo, TaskManager, TaskMode,
-    TaskRunReport, TaskSchedule, TaskShutdownReport, TaskSignal, TaskSpec, TaskState,
+    TaskRunReport, TaskSchedule, TaskScheduleInfo, TaskShutdownReport, TaskSignal, TaskSpec,
+    TaskState, TaskTypeId,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -39,8 +40,9 @@ struct Entry {
     id: TaskId,
     owner: PluginId,
     name: String,
+    task_type: TaskTypeId,
     mode: TaskMode,
-    schedule: TaskSchedule,
+    schedule: TaskScheduleInfo,
     execution: Arc<Execution>,
     abort: AbortHandle,
     outcome: watch::Receiver<Option<TaskRunReport>>,
@@ -136,12 +138,14 @@ impl TokioTaskManager {
         let mut tasks = self.inner.tasks.lock().expect("任务锁中毒");
         let worker_execution = execution.clone();
         let name = spec.name.clone();
-        let schedule = spec.schedule.clone();
+        let task_type = spec.task_type.clone();
+        let schedule = spec.schedule.info();
         let worker = runtime.spawn(async move { execute(spec, worker_execution, first_due).await });
         let entry = Arc::new(Entry {
             id: id.clone(),
             owner,
             name,
+            task_type,
             mode,
             schedule,
             execution,
@@ -176,6 +180,7 @@ impl TokioTaskManager {
                 }
                 TaskRunReport {
                     id: monitored.id.clone(),
+                    task_type: monitored.task_type.clone(),
                     runs: progress.runs,
                     state: progress.state,
                     errors,
@@ -196,9 +201,29 @@ async fn execute(
     execution: Arc<Execution>,
     first_due: Instant,
 ) -> PluginResult<bool> {
+    if execution.signal.is_cancelled() {
+        return Ok(true);
+    }
+    // 用户工厂在 worker 内执行，不占用登记锁；每个实例拥有独立的调度状态。
+    let mut scheduler = match &spec.schedule {
+        TaskSchedule::Custom { factory, .. } => Some(factory()),
+        _ => None,
+    };
     let mut due = first_due;
     loop {
         execution.set_state(TaskState::Scheduled);
+        if let Some(scheduler) = &mut scheduler {
+            let completed = execution.progress.lock().expect("任务状态锁中毒").runs;
+            let next = tokio::select! {
+                biased;
+                _ = execution.signal.cancelled() => return Ok(true),
+                result = scheduler.next(completed) => result?
+            };
+            match next {
+                Some(delay) => due = deadline(delay)?,
+                None => return Ok(execution.signal.is_cancelled()),
+            }
+        }
         tokio::select! {
             biased;
             _ = execution.signal.cancelled() => return Ok(true),
@@ -215,6 +240,13 @@ async fn execute(
             progress.runs
         };
         match spec.schedule {
+            TaskSchedule::Custom { max_runs, .. }
+                if !max_runs.is_some_and(|limit| runs >= limit) =>
+            {
+                if execution.signal.is_cancelled() {
+                    return Ok(true);
+                }
+            }
             TaskSchedule::Every {
                 interval,
                 runs: limit,
@@ -300,6 +332,7 @@ impl TaskManager for TokioTaskManager {
                 id: entry.id.clone(),
                 owner: entry.owner.clone(),
                 name: entry.name.clone(),
+                task_type: entry.task_type.clone(),
                 mode: entry.mode,
                 schedule: entry.schedule.clone(),
                 state: progress.state,

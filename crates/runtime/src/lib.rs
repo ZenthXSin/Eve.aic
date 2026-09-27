@@ -11,6 +11,7 @@ pub struct DemoReport {
     pub message: String,
     pub expected_failure: String,
     pub task_runs: u32,
+    pub custom_task_runs: u32,
 }
 
 pub async fn run_demo() -> PluginResult<DemoReport> {
@@ -46,6 +47,12 @@ pub async fn run_demo() -> PluginResult<DemoReport> {
             state.get(&task_demo, "foreground_runs")? == Some(b"6".to_vec()),
             "前台执行次数不符",
         )?;
+        verify(
+            state.get(&task_demo, "custom_task_runs")? == Some(b"3".to_vec())
+                && state.get(&task_demo, "custom_task_value")?
+                    == Some(b"custom task executed".to_vec()),
+            "自定义类型或自定义调度未实际执行",
+        )?;
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 if kernel.tasks(&task_demo)?.iter().any(|task| task.runs > 0) {
@@ -59,6 +66,13 @@ pub async fn run_demo() -> PluginResult<DemoReport> {
         verify(
             state.get(&task_demo, "background_started")? == Some(b"yes".to_vec()),
             "后台任务未写入状态",
+        )?;
+        verify(
+            kernel
+                .tasks(&task_demo)?
+                .iter()
+                .any(|task| task.task_type.as_str() == "demo.write-state" && task.runs > 0),
+            "后台任务未保留自定义类型标识",
         )?;
         kernel.stop_all().await?;
         verify(
@@ -112,6 +126,7 @@ pub async fn run_demo() -> PluginResult<DemoReport> {
                 .map_err(|error| PluginError::State(error.to_string()))?,
             expected_failure: expected_failure.to_string(),
             task_runs: 6,
+            custom_task_runs: 3,
         })
     }
     .await;
@@ -138,5 +153,6 @@ mod tests {
         assert_eq!(report.message, "已接收：你好，Eve.aic");
         assert!(report.expected_failure.contains("验收用预期启动失败"));
         assert_eq!(report.task_runs, 6);
+        assert_eq!(report.custom_task_runs, 3);
     }
 }

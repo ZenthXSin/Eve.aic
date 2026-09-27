@@ -1,6 +1,7 @@
 //! 任务模式、调度与执行契约；定义层不依赖 Tokio。
 
 use crate::{PluginError, PluginFuture, PluginId, PluginResult, TaskId};
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -16,6 +17,50 @@ pub type TaskFuture = PluginFuture<'static, ()>;
 /// 重复任务每次构造一个新的 Future；同一任务内的动作串行执行。
 pub type TaskAction = Arc<dyn Fn(Arc<dyn TaskSignal>) -> TaskFuture + Send + Sync + 'static>;
 
+/// 开放的任务类型标识，建议使用插件命名空间，例如 `demo.write-state`。
+/// 仅用于诊断与分类；执行行为由 Task 对象提供，不按字符串查找代码。
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct TaskTypeId(String);
+
+impl TaskTypeId {
+    pub fn new(value: impl Into<String>) -> PluginResult<Self> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(PluginError::Task("任务类型标识不能为空".into()));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TaskTypeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// 插件自定义的任务行为。字段可保存类型化参数和 Context，无需修改内核。
+/// 同一任务串行调用 execute；多个任务共享此对象时，实现须自行保护共享状态。
+pub trait Task: Send + Sync + 'static {
+    /// 在构造 TaskSpec 时快照；此方法应快速返回稳定标识。
+    fn task_type(&self) -> TaskTypeId;
+    fn execute(&self, signal: Arc<dyn TaskSignal>) -> PluginFuture<'_, ()>;
+}
+
+/// 每个已登记任务独占的调度状态；不依赖特定执行器。
+pub trait TaskScheduler: Send + 'static {
+    /// 每次动作前调用；成功次数从零开始。可以异步等待事件或外部条件。
+    /// Some 表示从本次返回起再等多久，None 表示自然结束。
+    /// 停止时等待 Future 会被丢弃，因此实现必须允许取消；不得同步阻塞线程。
+    fn next(&mut self, completed: u32) -> PluginFuture<'_, Option<Duration>>;
+}
+
+/// 执行器内部调用，为每个任务创建独立调度状态；工厂 panic 记入任务报告。
+pub type TaskScheduleFactory = Arc<dyn Fn() -> Box<dyn TaskScheduler> + Send + Sync + 'static>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskMode {
     /// 调用方等待完成；不是 UI 线程或更高的调度优先级。
@@ -23,7 +68,7 @@ pub enum TaskMode {
     Background,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub enum TaskSchedule {
     Immediate,
     After(Duration),
@@ -34,11 +79,59 @@ pub enum TaskSchedule {
         interval: Duration,
         runs: Option<u32>,
     },
+    /// 调度工厂由插件提供；max_runs 是由后端强制执行的次数上限。
+    /// 前台必须有正数上限；后台可为 None。上限不保证 next 会及时返回。
+    Custom {
+        name: String,
+        max_runs: Option<u32>,
+        factory: TaskScheduleFactory,
+    },
+}
+
+/// 可查询的调度描述，不持有插件对象或工厂闭包。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TaskScheduleInfo {
+    Immediate,
+    After(Duration),
+    At(SystemTime),
+    Every {
+        interval: Duration,
+        runs: Option<u32>,
+    },
+    Custom {
+        name: String,
+        max_runs: Option<u32>,
+    },
+}
+
+impl TaskSchedule {
+    pub fn info(&self) -> TaskScheduleInfo {
+        match self {
+            Self::Immediate => TaskScheduleInfo::Immediate,
+            Self::After(delay) => TaskScheduleInfo::After(*delay),
+            Self::At(time) => TaskScheduleInfo::At(*time),
+            Self::Every { interval, runs } => TaskScheduleInfo::Every {
+                interval: *interval,
+                runs: *runs,
+            },
+            Self::Custom { name, max_runs, .. } => TaskScheduleInfo::Custom {
+                name: name.clone(),
+                max_runs: *max_runs,
+            },
+        }
+    }
+}
+
+impl fmt::Debug for TaskSchedule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.info().fmt(f)
+    }
 }
 
 #[derive(Clone)]
 pub struct TaskSpec {
     pub name: String,
+    pub task_type: TaskTypeId,
     pub mode: TaskMode,
     pub schedule: TaskSchedule,
     pub action: TaskAction,
@@ -53,11 +146,29 @@ impl TaskSpec {
     ) -> PluginResult<Self> {
         let spec = Self {
             name: name.into(),
+            task_type: TaskTypeId("eve.action".into()),
             mode,
             schedule,
             action,
         };
         spec.validate()?;
+        Ok(spec)
+    }
+
+    /// 将自定义任务对象适配到统一执行路径，前台、后台与各种调度均可组合。
+    pub fn from_task(
+        name: impl Into<String>,
+        mode: TaskMode,
+        schedule: TaskSchedule,
+        task: Arc<dyn Task>,
+    ) -> PluginResult<Self> {
+        let task_type = task.task_type();
+        let action: TaskAction = Arc::new(move |signal| {
+            let task = task.clone();
+            Box::pin(async move { task.execute(signal).await })
+        });
+        let mut spec = Self::new(name, mode, schedule, action)?;
+        spec.task_type = task_type;
         Ok(spec)
     }
 
@@ -77,6 +188,19 @@ impl TaskSpec {
                 return Err(PluginError::Task("无限重复任务不能以前台模式运行".into()));
             }
         }
+        if let TaskSchedule::Custom { name, max_runs, .. } = &self.schedule {
+            if name.trim().is_empty() {
+                return Err(PluginError::Task("自定义调度名称不能为空".into()));
+            }
+            if *max_runs == Some(0) {
+                return Err(PluginError::Task("执行次数上限必须大于零".into()));
+            }
+            if self.mode == TaskMode::Foreground && max_runs.is_none() {
+                return Err(PluginError::Task(
+                    "前台自定义调度必须设置执行次数上限".into(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -86,8 +210,9 @@ pub struct TaskInfo {
     pub id: TaskId,
     pub owner: PluginId,
     pub name: String,
+    pub task_type: TaskTypeId,
     pub mode: TaskMode,
-    pub schedule: TaskSchedule,
+    pub schedule: TaskScheduleInfo,
     pub state: TaskState,
     /// 已成功完成的次数，长期运行到上限后饱和计数。
     pub runs: u32,
@@ -109,6 +234,7 @@ pub enum TaskState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskRunReport {
     pub id: TaskId,
+    pub task_type: TaskTypeId,
     pub runs: u32,
     pub state: TaskState,
     pub errors: Vec<String>,
