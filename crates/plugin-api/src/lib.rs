@@ -12,6 +12,8 @@ use std::sync::Arc;
 mod capabilities;
 pub use capabilities::{
     EventBus, PermissionChecker, ServiceEntry, ServiceRegistry, ServiceValue, StateStore,
+    TaskAction, TaskFuture, TaskInfo, TaskManager, TaskMode, TaskRunReport, TaskSchedule,
+    TaskShutdownReport, TaskSignal, TaskSpec, TaskState,
 };
 
 /// The result type used by the plugin boundary.
@@ -144,6 +146,26 @@ impl fmt::Display for EventId {
     }
 }
 
+/// 由 Runtime 分配的后台任务标识。
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TaskId(u64);
+
+impl TaskId {
+    #[doc(hidden)]
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+    pub fn get(&self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for TaskId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "task-{}", self.0)
+    }
+}
+
 /// A dependency declaration. `requirement` is preserved for the future
 /// semver resolver; the first resolver checks the dependency id.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -246,6 +268,13 @@ pub trait RuntimeHooks: Send + Sync {
     fn state_get(&self, owner: &PluginId, key: &str) -> PluginResult<Option<Vec<u8>>>;
     fn state_set(&self, owner: &PluginId, key: String, value: Vec<u8>) -> PluginResult<()>;
     fn check_permission(&self, permission: &Permission) -> PluginResult<()>;
+    fn spawn_task(&self, owner: &PluginId, spec: TaskSpec) -> PluginResult<TaskId>;
+    fn run_foreground(
+        &self,
+        owner: &PluginId,
+        spec: TaskSpec,
+    ) -> PluginFuture<'static, TaskRunReport>;
+    fn list_tasks(&self, owner: &PluginId) -> PluginResult<Vec<TaskInfo>>;
     fn register_cleanup(&self, owner: &PluginId, cleanup: Cleanup) -> PluginResult<()>;
 }
 
@@ -313,6 +342,19 @@ impl PluginContext {
     pub fn check_permission(&self, permission: &Permission) -> PluginResult<()> {
         self.hooks.check_permission(permission)
     }
+
+    /// 创建由当前插件 Scope 归属的后台任务。
+    pub fn spawn_task(&self, spec: TaskSpec) -> PluginResult<TaskId> {
+        self.hooks.spawn_task(&self.info.id, spec)
+    }
+
+    pub fn run_foreground(&self, spec: TaskSpec) -> PluginFuture<'static, TaskRunReport> {
+        self.hooks.run_foreground(&self.info.id, spec)
+    }
+
+    pub fn tasks(&self) -> PluginResult<Vec<TaskInfo>> {
+        self.hooks.list_tasks(&self.info.id)
+    }
 }
 
 /// A plugin implementation.
@@ -357,6 +399,7 @@ pub enum PluginError {
         plugin: PluginId,
         permission: Permission,
     },
+    Task(String),
     State(String),
     Event(String),
     Cleanup(String),
@@ -391,6 +434,7 @@ impl fmt::Display for PluginError {
             Self::PermissionDenied { plugin, permission } => {
                 write!(f, "插件 {plugin} 未获权限：{}", permission.as_str())
             }
+            Self::Task(message) => write!(f, "task error: {message}"),
             Self::State(message) => write!(f, "state error: {message}"),
             Self::Event(message) => write!(f, "event error: {message}"),
             Self::Cleanup(message) => write!(f, "cleanup error: {message}"),

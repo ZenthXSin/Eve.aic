@@ -1,7 +1,8 @@
 use crate::{Kernel, KernelInner, PluginState, scope::PluginScope};
 use eve_plugin_api::{
-    Cleanup, Event, EventHandler, EventId, Permission, PluginError, PluginId, PluginManifest,
-    PluginResult, RuntimeHooks, ServiceId, ServiceValue,
+    Cleanup, Event, EventHandler, EventId, Permission, PluginError, PluginFuture, PluginId,
+    PluginManifest, PluginResult, RuntimeHooks, ServiceId, ServiceValue, TaskId, TaskInfo,
+    TaskRunReport, TaskSpec,
 };
 use std::sync::{Arc, Weak};
 
@@ -107,6 +108,42 @@ impl RuntimeHooks for KernelHooks {
                 .permissions
                 .check(&self.manifest, permission)
         })?
+    }
+
+    fn spawn_task(&self, _owner: &PluginId, spec: TaskSpec) -> PluginResult<TaskId> {
+        let kernel = self.kernel()?;
+        self.scope.access(|| {
+            kernel
+                .inner
+                .services
+                .tasks
+                .spawn(self.manifest.id.clone(), spec)
+        })?
+    }
+
+    fn run_foreground(
+        &self,
+        _owner: &PluginId,
+        spec: TaskSpec,
+    ) -> PluginFuture<'static, TaskRunReport> {
+        if let Err(error) = self.scope.access(|| ()) {
+            return Box::pin(async move { Err(error) });
+        }
+        match self.kernel() {
+            Ok(kernel) => kernel
+                .inner
+                .services
+                .tasks
+                .clone()
+                .run_foreground(self.manifest.id.clone(), spec),
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
+    }
+
+    fn list_tasks(&self, _owner: &PluginId) -> PluginResult<Vec<TaskInfo>> {
+        let kernel = self.kernel()?;
+        self.scope
+            .access(|| kernel.inner.services.tasks.list(&self.manifest.id))?
     }
 
     fn register_cleanup(&self, _owner: &PluginId, cleanup: Cleanup) -> PluginResult<()> {

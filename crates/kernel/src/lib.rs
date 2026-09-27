@@ -8,11 +8,12 @@ mod scope;
 use context::KernelHooks;
 use eve_plugin_api::{
     EventBus, PermissionChecker, Plugin, PluginContext, PluginError, PluginId, PluginInfo,
-    PluginManifest, PluginResult, ServiceRegistry, StateStore,
+    PluginManifest, PluginResult, ServiceRegistry, StateStore, TaskManager,
 };
 use scope::PluginScope;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +41,7 @@ pub struct KernelServices {
     pub registry: Arc<dyn ServiceRegistry>,
     pub state: Arc<dyn StateStore>,
     pub permissions: Arc<dyn PermissionChecker>,
+    pub tasks: Arc<dyn TaskManager>,
 }
 
 impl Default for KernelServices {
@@ -49,6 +51,20 @@ impl Default for KernelServices {
             registry: Arc::new(backends::MemoryServiceRegistry::default()),
             state: Arc::new(backends::MemoryStateStore::default()),
             permissions: Arc::new(backends::DeclaredPermissionChecker),
+            tasks: Arc::new(backends::TokioTaskManager::default()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelConfig {
+    pub task_shutdown_timeout: Duration,
+}
+
+impl Default for KernelConfig {
+    fn default() -> Self {
+        Self {
+            task_shutdown_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -58,6 +74,7 @@ struct KernelInner {
     lifecycle: AsyncMutex<()>,
     plugins: Mutex<HashMap<PluginId, Arc<PluginSlot>>>,
     services: KernelServices,
+    config: KernelConfig,
 }
 
 #[derive(Clone, Default)]
@@ -71,9 +88,14 @@ impl Kernel {
     }
 
     pub fn with_services(services: KernelServices) -> Self {
+        Self::with_services_and_config(services, KernelConfig::default())
+    }
+
+    pub fn with_services_and_config(services: KernelServices, config: KernelConfig) -> Self {
         Self {
             inner: Arc::new(KernelInner {
                 services,
+                config,
                 ..KernelInner::default()
             }),
         }
