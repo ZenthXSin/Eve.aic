@@ -1,5 +1,8 @@
-//! LLM 瀹夸富鐨勬渶灏忕粍鍚堝疄鐜般€?//!
-//! 鏈ā鍧楀彧璐熻矗鎶婂凡缁忔敞鍐岀殑 Provider銆丆ontext 鍜?Tool 鏈嶅姟瑁呴厤鎴愪竴杞?//! 璇锋眰銆傛湇鍔′粛閫氳繃 `plugin-api` 鐨勫叕寮€娉ㄥ唽琛ㄨ闂紝涓氬姟鎻掍欢涓嶄緷璧栨湰妯″潡銆?
+//! LLM 宿主的最小组合实现。
+//!
+//! 本模块负责将已经注册的 Provider、Context 和 Tool 服务组合为一次请求。
+//! 服务仍通过 `plugin-api` 的公开注册表访问，业务插件不依赖本模块。
+use eve_kernel::Kernel;
 use eve_llm_api::{
     ChatMessage, ChatRole, ContextAssembler, ContextService, ContextSnapshot, LlmError,
     LlmProvider, ModelRequest, ModelResponse, Tool, ToolBinding, ToolCall, ToolCancellation,
@@ -55,13 +58,13 @@ impl Default for LlmHostConfig {
 impl LlmHostConfig {
     pub fn validate(&self) -> Result<(), LlmError> {
         if self.version.trim().is_empty() {
-            return Err(LlmError::Configuration("閰嶇疆鐗堟湰涓嶈兘涓虹┖".into()));
+            return Err(LlmError::Configuration("配置版本不能为空".into()));
         }
         if self.system_prompt.trim().is_empty() {
-            return Err(LlmError::Configuration("绯荤粺鎸囦护涓嶈兘涓虹┖".into()));
+            return Err(LlmError::Configuration("系统指令不能为空".into()));
         }
         if self.output_format.trim().is_empty() {
-            return Err(LlmError::Configuration("杈撳嚭鏍煎紡涓嶈兘涓虹┖".into()));
+            return Err(LlmError::Configuration("输出格式不能为空".into()));
         }
         if self.provider_timeout.is_zero()
             || self.tool_timeout.is_zero()
@@ -236,7 +239,7 @@ where
     poll_fn(
         |context| match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(context))) {
             Ok(result) => result,
-            Err(_) => Poll::Ready(Err(LlmError::Backend("寮傛鍥炶皟鍙戠敓寮傚父".into()))),
+            Err(_) => Poll::Ready(Err(LlmError::Backend("异步回调发生异常".into()))),
         },
     )
     .await
@@ -268,19 +271,18 @@ enum PermissionFailure {
 pub struct LlmHost {
     provider: Arc<dyn LlmProvider>,
     registry: Arc<dyn ServiceRegistry>,
-    inspector: Arc<dyn RuntimeInspector>,
+    kernel: Kernel,
     permissions: Arc<dyn PermissionChecker>,
     context: ContextBinding,
     bindings: Vec<ToolBinding>,
     config: LlmHostConfig,
-    gate: Arc<Mutex<()>>,
 }
 
 impl LlmHost {
     pub fn new(
         provider: Arc<dyn LlmProvider>,
         registry: Arc<dyn ServiceRegistry>,
-        inspector: Arc<dyn RuntimeInspector>,
+        kernel: Kernel,
         permissions: Arc<dyn PermissionChecker>,
         context: ContextBinding,
         bindings: Vec<ToolBinding>,
@@ -294,13 +296,11 @@ impl LlmHost {
                 || binding.service_id.as_str().trim().is_empty()
                 || binding.expected_owner.as_str().trim().is_empty()
             {
-                return Err(LlmError::Configuration(
-                    "宸ュ叿缁戝畾鏍囪瘑涓嶈兘涓虹┖".into(),
-                ));
+                return Err(LlmError::Configuration("工具绑定标识不能为空".into()));
             }
             if !names.insert(binding.name.clone()) {
                 return Err(LlmError::Configuration(format!(
-                    "宸ュ叿缁戝畾鍚嶇О閲嶅: {}",
+                    "工具绑定名称重复: {}",
                     binding.name
                 )));
             }
@@ -308,17 +308,16 @@ impl LlmHost {
         Ok(Self {
             provider,
             registry,
-            inspector,
+            kernel,
             permissions,
             context,
             bindings,
             config,
-            gate: Arc::new(Mutex::new(())),
         })
     }
 
     pub async fn run_turn(&self, input: TurnInput) -> Result<TurnOutput, TurnFailure> {
-        let _gate = self.gate.lock().await;
+        let _admission = self.kernel.acquire_runtime_admission().await;
         let mut diagnostics = TurnDiagnostics::default();
         let prepared = match self.prepare(&input, &mut diagnostics).await {
             Ok(value) => value,
@@ -404,7 +403,7 @@ impl LlmHost {
         diagnostics: &mut TurnDiagnostics,
     ) -> Result<PreparedTurn, LlmError> {
         if input.text.trim().is_empty() {
-            return Err(LlmError::Context("鏈疆杈撳叆涓嶈兘涓虹┖".into()));
+            return Err(LlmError::Context("本轮输入不能为空".into()));
         }
         let assembler = self.context_service()?;
         let context = contain_panic(async { assembler.assemble(input.clone()).await }).await?;
@@ -413,18 +412,18 @@ impl LlmHost {
         for binding in &self.bindings {
             let service = self.tool_service(binding)?;
             let definition = catch_unwind(AssertUnwindSafe(|| service.definition()))
-                .map_err(|_| LlmError::Configuration("宸ュ叿瀹氫箟瑁呴厤鍙戠敓寮傚父".into()))?;
+                .map_err(|_| LlmError::Configuration("工具定义装配发生异常".into()))?;
             definition.validate()?;
             if definition.name != binding.name {
                 return Err(LlmError::Configuration(format!(
-                    "宸ュ叿瀹氫箟鍚嶇О婕傜Щ: {}",
+                    "工具定义名称不匹配: {}",
                     binding.name
                 )));
             }
             check_permissions(
                 &self.permissions,
                 &self
-                    .inspector
+                    .kernel
                     .plugin_manifest(&binding.expected_owner)
                     .map_err(backend)?,
                 &definition.required_permissions,
@@ -454,7 +453,7 @@ impl LlmHost {
         diagnostics.provider_requests += 1;
         let provider = self.provider.clone();
         let future = catch_unwind(AssertUnwindSafe(|| provider.complete(request)))
-            .map_err(|_| LlmError::Provider("Provider 璇锋眰鍙戠敓寮傚父".into()))?;
+            .map_err(|_| LlmError::Provider("Provider 请求发生异常".into()))?;
         let response = tokio::select! {
             biased;
             _ = tokio::time::sleep(self.config.provider_timeout) => {
@@ -473,11 +472,11 @@ impl LlmHost {
             .registry
             .get(&self.context.service_id)
             .map_err(backend)?
-            .ok_or_else(|| LlmError::Configuration("涓婁笅鏂囨湇鍔′笉瀛樺湪".into()))?;
-        ensure_owner_and_active(&*self.inspector, &entry.owner, &self.context.expected_owner)?;
+            .ok_or_else(|| LlmError::Configuration("上下文服务不存在".into()))?;
+        ensure_owner_and_active(&self.kernel, &entry.owner, &self.context.expected_owner)?;
         Arc::downcast::<ContextService>(entry.value)
             .map(|service| service.0.clone())
-            .map_err(|_| LlmError::Configuration("涓婁笅鏂囨湇鍔＄被鍨嬩笉鍖归厤".into()))
+            .map_err(|_| LlmError::Configuration("上下文服务类型不匹配".into()))
     }
 
     fn tool_service(&self, binding: &ToolBinding) -> Result<Arc<dyn Tool>, LlmError> {
@@ -485,15 +484,11 @@ impl LlmHost {
             .registry
             .get(&binding.service_id)
             .map_err(backend)?
-            .ok_or_else(|| {
-                LlmError::Configuration(format!("宸ュ叿鏈嶅姟涓嶅瓨鍦? {}", binding.name))
-            })?;
-        ensure_owner_and_active(&*self.inspector, &entry.owner, &binding.expected_owner)?;
+            .ok_or_else(|| LlmError::Configuration(format!("工具服务不存在: {}", binding.name)))?;
+        ensure_owner_and_active(&self.kernel, &entry.owner, &binding.expected_owner)?;
         Arc::downcast::<ToolService>(entry.value)
             .map(|service| service.0.clone())
-            .map_err(|_| {
-                LlmError::Configuration(format!("宸ュ叿鏈嶅姟绫诲瀷涓嶅尮閰? {}", binding.name))
-            })
+            .map_err(|_| LlmError::Configuration(format!("工具服务类型不匹配: {}", binding.name)))
     }
 
     async fn execute_calls_ordered(
@@ -519,7 +514,7 @@ impl LlmHost {
                 results[index] = Some(tool_failure(
                     &call,
                     ToolFailureCode::UnknownTool,
-                    "鏈煡宸ュ叿",
+                    "未知工具",
                 ));
                 continue;
             };
@@ -565,7 +560,7 @@ impl LlmHost {
                     results[index] = Some(tool_failure(
                         &call,
                         ToolFailureCode::ExecutionFailed,
-                        "宸ュ叿鍙傛暟鏍￠獙澶辫触",
+                        "工具参数校验失败",
                     ));
                     continue;
                 }
@@ -578,7 +573,7 @@ impl LlmHost {
                 ));
                 continue;
             }
-            let manifest = match self.inspector.plugin_manifest(&binding.expected_owner) {
+            let manifest = match self.kernel.plugin_manifest(&binding.expected_owner) {
                 Ok(manifest) => manifest,
                 Err(PluginError::PluginNotFound(_)) => {
                     results[index] = Some(tool_failure(
@@ -666,7 +661,7 @@ impl LlmHost {
                             task.call_id.clone(),
                             ToolFailureCode::ExecutionFailed,
                             if error.is_panic() {
-                                "宸ュ叿鎵ц寮傚父"
+                                "工具执行异常"
                             } else {
                                 "tool execution cancelled"
                             },
@@ -695,7 +690,7 @@ impl LlmHost {
         if entry.owner != binding.expected_owner {
             return Err(CallLookupError::OwnerMismatch);
         }
-        match self.inspector.plugins() {
+        match self.kernel.plugins() {
             Ok(statuses) => {
                 let Some(status) = statuses
                     .iter()
@@ -856,17 +851,15 @@ fn ensure_owner_and_active(
     expected: &PluginId,
 ) -> Result<(), LlmError> {
     if actual != expected {
-        return Err(LlmError::Backend(format!(
-            "鏈嶅姟鎵€鏈夎€呬笉鍖归厤: {actual}"
-        )));
+        return Err(LlmError::Backend(format!("服务所有者不匹配: {actual}")));
     }
     let statuses = inspector.plugins().map_err(backend)?;
     let status = statuses
         .iter()
         .find(|status| status.info.id == *expected)
-        .ok_or_else(|| LlmError::Backend(format!("鎻掍欢涓嶅瓨鍦? {expected}")))?;
+        .ok_or_else(|| LlmError::Backend(format!("插件不存在: {expected}")))?;
     if status.state != PluginState::Active {
-        return Err(LlmError::Backend(format!("鎻掍欢鏈縺娲? {expected}")));
+        return Err(LlmError::Backend(format!("插件未激活: {expected}")));
     }
     Ok(())
 }
@@ -916,8 +909,8 @@ mod tests {
             Box::pin(async move {
                 Ok(ContextSnapshot {
                     revision: "r1".into(),
-                    profile: "娴嬭瘯鐢ㄦ埛".into(),
-                    memories: vec!["鍥哄畾璁板繂".into()],
+                    profile: "测试用户".into(),
+                    memories: vec!["固定记忆".into()],
                     history: vec![],
                 })
             })
@@ -932,7 +925,7 @@ mod tests {
         fn definition(&self) -> ToolDefinition {
             ToolDefinition {
                 name: "echo".into(),
-                description: "鍥炴樉".into(),
+                description: "回显".into(),
                 argument_schema: json!({"type":"object"}),
                 required_permissions: vec![],
                 concurrency: Some(ToolConcurrency::ParallelSafe),
@@ -977,7 +970,7 @@ mod tests {
                     .lock()
                     .await
                     .pop()
-                    .ok_or_else(|| LlmError::Provider("鑴氭湰鑰楀敖".into()))
+                    .ok_or_else(|| LlmError::Provider("脚本已耗尽".into()))
             })
         }
     }
@@ -1021,7 +1014,7 @@ mod tests {
         LlmHost::new(
             provider,
             registry,
-            Arc::new(kernel),
+            kernel,
             permissions,
             ContextBinding {
                 service_id: ServiceId::new(CONTEXT).unwrap(),
@@ -1042,7 +1035,7 @@ mod tests {
         let provider = Arc::new(ScriptedProvider {
             calls: Mutex::new(vec![
                 ModelResponse::Final {
-                    text: "瀹屾垚".into(),
+                    text: "完成".into(),
                 },
                 ModelResponse::ToolCalls {
                     calls: vec![ToolCall {
@@ -1067,7 +1060,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(output.text, "瀹屾垚");
+        assert_eq!(output.text, "完成");
         assert_eq!(output.diagnostics.provider_requests, 2);
         assert_eq!(output.diagnostics.tool_results[0].call_id, "c1");
     }

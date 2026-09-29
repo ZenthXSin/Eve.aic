@@ -56,7 +56,10 @@ enum ToolMode {
     PanicSync,
     PanicFuture,
     WaitForCancellation(Arc<AtomicBool>),
-    WaitForRelease(Arc<Notify>),
+    WaitForRelease {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    },
     WaitForDrop(Arc<AtomicBool>),
 }
 
@@ -146,7 +149,9 @@ impl Tool for TestTool {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             }),
-            ToolMode::WaitForRelease(release) => Box::pin(async move {
+            ToolMode::WaitForRelease { started, release } => Box::pin(async move {
+                starts.lock().expect("starts lock").push(call.id.clone());
+                started.notify_one();
                 release.notified().await;
                 Ok(json!({"id": call.id}))
             }),
@@ -174,6 +179,7 @@ struct RecordingProvider {
     requests: Arc<Mutex<Vec<ModelRequest>>>,
     responses: Mutex<VecDeque<Result<ModelResponse, LlmError>>>,
     delay: Option<Duration>,
+    block: Option<(Arc<Notify>, Arc<Notify>)>,
 }
 
 impl RecordingProvider {
@@ -182,6 +188,7 @@ impl RecordingProvider {
             requests: Arc::new(Mutex::new(Vec::new())),
             responses: Mutex::new(responses.into()),
             delay: None,
+            block: None,
         })
     }
 
@@ -190,7 +197,20 @@ impl RecordingProvider {
             requests: Arc::new(Mutex::new(Vec::new())),
             responses: Mutex::new(VecDeque::new()),
             delay: Some(delay),
+            block: None,
         })
+    }
+
+    fn blocked() -> (Arc<Self>, Arc<Notify>, Arc<Notify>) {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let provider = Arc::new(Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            responses: Mutex::new(VecDeque::from([final_response("Provider 已释放")])),
+            delay: None,
+            block: Some((started.clone(), release.clone())),
+        });
+        (provider, started, release)
     }
 }
 
@@ -198,8 +218,13 @@ impl LlmProvider for RecordingProvider {
     fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
         self.requests.lock().expect("request lock").push(request);
         let delay = self.delay;
+        let block = self.block.clone();
         let response = self.responses.lock().expect("response lock").pop_front();
         Box::pin(async move {
+            if let Some((started, release)) = block {
+                started.notify_one();
+                release.notified().await;
+            }
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
@@ -260,12 +285,27 @@ impl Plugin for ServicePlugin {
     }
 }
 
+struct EmptyPlugin {
+    manifest: PluginManifest,
+}
+
+impl Plugin for EmptyPlugin {
+    fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+
+    fn start(&mut self, _context: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
+        Box::pin(async { Ok(None) })
+    }
+}
+
 async fn make_host(
     provider: Arc<RecordingProvider>,
     tools: Vec<Arc<TestTool>>,
     config: LlmHostConfig,
 ) -> (LlmHost, Arc<CountingContext>, Vec<Arc<TestTool>>) {
-    make_host_with_registry(provider, tools, config, None).await
+    let (host, context, tools, _) = make_host_with_registry(provider, tools, config, None).await;
+    (host, context, tools)
 }
 
 async fn make_host_with_registry(
@@ -273,7 +313,7 @@ async fn make_host_with_registry(
     tools: Vec<Arc<TestTool>>,
     mut config: LlmHostConfig,
     registry_override: Option<Arc<dyn ServiceRegistry>>,
-) -> (LlmHost, Arc<CountingContext>, Vec<Arc<TestTool>>) {
+) -> (LlmHost, Arc<CountingContext>, Vec<Arc<TestTool>>, Kernel) {
     let context = Arc::new(CountingContext::default());
     let service_tools = tools
         .iter()
@@ -283,7 +323,7 @@ async fn make_host_with_registry(
     let base_registry = services.registry.clone();
     let registry = registry_override.unwrap_or_else(|| base_registry.clone());
     let permissions = services.permissions.clone();
-    let kernel = Arc::new(Kernel::with_services(services));
+    let kernel = Kernel::with_services(services);
     let manifest = PluginManifest::new(OWNER, "0.1.0").expect("valid manifest");
     kernel
         .register(Box::new(ServicePlugin {
@@ -310,7 +350,7 @@ async fn make_host_with_registry(
     let host = LlmHost::new(
         provider,
         registry,
-        kernel,
+        kernel.clone(),
         permissions,
         ContextBinding {
             service_id: ServiceId::new(CONTEXT).expect("valid context binding"),
@@ -320,7 +360,7 @@ async fn make_host_with_registry(
         config,
     )
     .expect("construct LLM host");
-    (host, context, tools)
+    (host, context, tools, kernel)
 }
 
 fn turn() -> TurnInput {
@@ -580,7 +620,8 @@ async fn tool_timeout_requests_cancellation_and_preserves_call_id() {
 }
 
 #[tokio::test]
-async fn stop_plugin_waits_for_the_current_turn_and_unregisters_after_cleanup() {
+async fn lifecycle_mutations_wait_for_turn_and_shared_kernel_clones_cannot_bypass_gate() {
+    let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let provider = RecordingProvider::scripted(vec![
         tool_response(vec![call("held", "held", json!({}))]),
@@ -589,18 +630,124 @@ async fn stop_plugin_waits_for_the_current_turn_and_unregisters_after_cleanup() 
     let tool = Arc::new(TestTool::new(
         "held",
         Some(ToolConcurrency::ParallelSafe),
-        ToolMode::WaitForRelease(release.clone()),
+        ToolMode::WaitForRelease {
+            started: started.clone(),
+            release: release.clone(),
+        },
     ));
-    let (host, _, _) = make_host(provider, vec![tool], LlmHostConfig::default()).await;
+    let (host, _, _, kernel) =
+        make_host_with_registry(provider, vec![tool], LlmHostConfig::default(), None).await;
     let turn_task = tokio::spawn(async move { host.run_turn(turn()).await });
-    tokio::time::sleep(Duration::from_millis(5)).await;
-    // 取回宿主的任务必须持有借用，先用另一个独立 host 无法验证 gate，因此用通知释放后检查整轮完成。
-    release.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(1), started.notified())
+        .await
+        .expect("tool execution started");
+
+    let register_error = kernel
+        .clone()
+        .register(Box::new(EmptyPlugin {
+            manifest: PluginManifest::new("llm-test-extra", "0.1.0").expect("valid manifest"),
+        }))
+        .expect_err("registration must be rejected during an active turn");
+    assert!(register_error.to_string().contains("不能注册插件"));
+    let unregister_error = kernel
+        .clone()
+        .unregister(&owner_id())
+        .expect_err("unregistration must be rejected during an active turn");
+    assert!(unregister_error.to_string().contains("不能卸载插件"));
+
+    let start_waiting = Arc::new(Notify::new());
+    let starting_kernel = kernel.clone();
+    let start_started = start_waiting.clone();
+    let start_task = tokio::spawn(async move {
+        start_started.notify_one();
+        starting_kernel.start(&owner_id()).await
+    });
+    tokio::time::timeout(Duration::from_secs(1), start_waiting.notified())
+        .await
+        .expect("start request should be submitted");
+    assert!(
+        !start_task.is_finished(),
+        "start must wait for the in-flight tool call"
+    );
+
+    let stop_waiting = Arc::new(Notify::new());
+    let stopping_kernel = kernel.clone();
+    let stop_started = stop_waiting.clone();
+    let stop_task = tokio::spawn(async move {
+        stop_started.notify_one();
+        stopping_kernel.stop(&owner_id()).await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), stop_waiting.notified())
+            .await
+            .is_ok(),
+        "stop request should be submitted"
+    );
+    assert!(
+        !stop_task.is_finished(),
+        "stop must wait for the in-flight tool call"
+    );
+
+    release.notify_one();
     let result = turn_task
         .await
         .expect("turn task join")
         .expect("turn succeeds");
     assert_eq!(result.text, "已释放");
+    start_task
+        .await
+        .expect("start task join")
+        .expect("start completes after the turn releases admission");
+    stop_task
+        .await
+        .expect("stop task join")
+        .expect("stop succeeds after the turn releases admission");
+    kernel
+        .unregister(&owner_id())
+        .expect("unregister after stop and turn cleanup");
+}
+
+#[tokio::test]
+async fn stop_waits_while_provider_request_is_in_flight() {
+    let (provider, started, release) = RecordingProvider::blocked();
+    let (host, _, _, kernel) =
+        make_host_with_registry(provider, vec![], LlmHostConfig::default(), None).await;
+    let turn_task = tokio::spawn(async move { host.run_turn(turn()).await });
+    tokio::time::timeout(Duration::from_secs(1), started.notified())
+        .await
+        .expect("provider request started");
+
+    let stop_waiting = Arc::new(Notify::new());
+    let stopping_kernel = kernel.clone();
+    let stop_started = stop_waiting.clone();
+    let stop_task = tokio::spawn(async move {
+        stop_started.notify_one();
+        stopping_kernel.stop(&owner_id()).await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), stop_waiting.notified())
+            .await
+            .is_ok(),
+        "stop request should be submitted"
+    );
+    assert!(
+        !stop_task.is_finished(),
+        "stop must wait for the in-flight provider request"
+    );
+
+    release.notify_one();
+    let output = turn_task
+        .await
+        .expect("turn task join")
+        .expect("turn succeeds");
+    assert_eq!(output.text, "Provider 已释放");
+    stop_task
+        .await
+        .expect("stop task join")
+        .expect("stop succeeds after the provider request");
+    kernel
+        .unregister(&owner_id())
+        .expect("unregister after stop and turn cleanup");
 }
 
 #[tokio::test]
@@ -625,7 +772,7 @@ async fn later_preflight_backend_failure_starts_no_prior_tools_or_second_request
         registry: base_registry.clone(),
         ..KernelServices::default()
     };
-    let kernel = Arc::new(Kernel::with_services(services));
+    let kernel = Kernel::with_services(services);
     let manifest = PluginManifest::new(OWNER, "0.1.0").expect("valid manifest");
     kernel
         .register(Box::new(ServicePlugin {
@@ -678,7 +825,8 @@ async fn dropping_run_turn_drops_in_flight_tool_future() {
         Some(ToolConcurrency::ParallelSafe),
         ToolMode::WaitForDrop(dropped.clone()),
     ));
-    let (host, _, tools) = make_host(provider, vec![tool], LlmHostConfig::default()).await;
+    let (host, _, tools, kernel) =
+        make_host_with_registry(provider, vec![tool], LlmHostConfig::default(), None).await;
     let task = tokio::spawn(async move { host.run_turn(turn()).await });
     for _ in 0..100 {
         if !tools[0].starts.lock().expect("starts lock").is_empty() {
@@ -696,4 +844,11 @@ async fn dropping_run_turn_drops_in_flight_tool_future() {
     })
     .await
     .expect("tool future should be dropped after turn cancellation");
+    tokio::time::timeout(Duration::from_secs(1), kernel.stop(&owner_id()))
+        .await
+        .expect("stop should acquire admission after turn cancellation")
+        .expect("stop succeeds after turn cancellation");
+    kernel
+        .unregister(&owner_id())
+        .expect("unregister after canceled turn cleanup");
 }

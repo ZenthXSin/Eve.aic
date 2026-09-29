@@ -132,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             requests: Mutex::new(0),
         }),
         registry,
-        Arc::new(kernel.clone()),
+        kernel.clone(),
         permissions,
         ContextBinding {
             service_id: ServiceId::new(CONTEXT)?,
