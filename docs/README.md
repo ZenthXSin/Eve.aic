@@ -48,4 +48,4 @@ Context 边界
 清理 / 停止 / 恢复
 ```
 
-插件扩展边界已具备静态工厂与目录。下一阶段已确定最小 LLM 工具闭环的协议：Runtime 负责模型请求与单工具循环，Provider 可替换，Context、Memory、Tool 和 Channel 继续作为插件能力；该契约尚未实现，后续先以无网络 Mock 闭环验收，再接入真实 Provider。详见[LLM 工具调用](./LLM工具调用.md)和[开发计划](./开发计划.md#phase-6最小-llm-工具闭环)。
+插件扩展边界已具备静态工厂与目录。下一阶段已确定最小 LLM 工具闭环的协议：Runtime 负责模型请求和工具调用批次循环，Provider 可替换，Context、Memory、Tool 和 Channel 继续作为插件能力。并行安全工具可在宿主上限内并发执行，串行作用域保持模型顺序，单项失败、超时或取消按调用 ID 隔离；该契约尚未实现，后续先以无网络 Mock 闭环验收，再接入真实 Provider。详见[LLM 工具调用](./LLM工具调用.md)和[开发计划](./开发计划.md#phase-6最小-llm-工具闭环)。
