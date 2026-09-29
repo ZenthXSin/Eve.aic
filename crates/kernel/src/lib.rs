@@ -1,6 +1,7 @@
 //! 可信静态插件的 Tokio 宿主，能力后端由组合层注入。
 
 pub mod backends;
+mod catalog;
 mod context;
 mod lifecycle;
 mod operations;
@@ -20,6 +21,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
 // 保留原导出路径，生命周期定义归入契约层。
+pub use catalog::InMemoryPluginCatalog;
 pub use eve_plugin_api::PluginState;
 
 struct PluginSlot {
