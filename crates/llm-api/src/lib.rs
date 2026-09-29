@@ -60,12 +60,67 @@ impl ChatMessage {
                 "tool result batch cannot be empty".into(),
             ));
         }
+        validate_result_ids(&results)?;
         Ok(Self {
             role: ChatRole::Tool,
             text: None,
             tool_calls: Vec::new(),
             tool_results: results,
         })
+    }
+
+    fn validate(&self) -> Result<(), LlmError> {
+        match &self.role {
+            ChatRole::System | ChatRole::User => {
+                if !has_non_empty_text(self.text.as_deref()) {
+                    return Err(LlmError::Protocol(format!(
+                        "{} message text cannot be empty",
+                        role_name(&self.role)
+                    )));
+                }
+                if !self.tool_calls.is_empty() || !self.tool_results.is_empty() {
+                    return Err(LlmError::Protocol(format!(
+                        "{} message cannot contain tool calls or results",
+                        role_name(&self.role)
+                    )));
+                }
+            }
+            ChatRole::Assistant => {
+                if !self.tool_results.is_empty() {
+                    return Err(LlmError::Protocol(
+                        "assistant message cannot contain tool results".into(),
+                    ));
+                }
+                if self.tool_calls.is_empty() {
+                    if !has_non_empty_text(self.text.as_deref()) {
+                        return Err(LlmError::Protocol(
+                            "assistant message text cannot be empty".into(),
+                        ));
+                    }
+                } else {
+                    if self.text.is_some() {
+                        return Err(LlmError::Protocol(
+                            "assistant tool call message cannot contain text".into(),
+                        ));
+                    }
+                    validate_calls(&self.tool_calls)?;
+                }
+            }
+            ChatRole::Tool => {
+                if self.text.is_some() || !self.tool_calls.is_empty() {
+                    return Err(LlmError::Protocol(
+                        "tool message cannot contain text or tool calls".into(),
+                    ));
+                }
+                if self.tool_results.is_empty() {
+                    return Err(LlmError::Protocol(
+                        "tool result batch cannot be empty".into(),
+                    ));
+                }
+                validate_result_ids(&self.tool_results)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -85,6 +140,42 @@ impl ModelRequest {
                     "duplicate tool name: {}",
                     tool.name
                 )));
+            }
+        }
+
+        for (index, message) in self.messages.iter().enumerate() {
+            message.validate()?;
+
+            match &message.role {
+                ChatRole::Assistant if !message.tool_calls.is_empty() => {
+                    let Some(next) = self.messages.get(index + 1) else {
+                        return Err(LlmError::Protocol(
+                            "assistant tool call message must be followed by tool results".into(),
+                        ));
+                    };
+                    if next.role != ChatRole::Tool {
+                        return Err(LlmError::Protocol(
+                            "assistant tool call message must be followed by tool results".into(),
+                        ));
+                    }
+                }
+                ChatRole::Tool => {
+                    let Some(previous) = index
+                        .checked_sub(1)
+                        .and_then(|previous_index| self.messages.get(previous_index))
+                    else {
+                        return Err(LlmError::Protocol(
+                            "tool results must follow assistant tool calls".into(),
+                        ));
+                    };
+                    if previous.role != ChatRole::Assistant || previous.tool_calls.is_empty() {
+                        return Err(LlmError::Protocol(
+                            "tool results must follow assistant tool calls".into(),
+                        ));
+                    }
+                    validate_result_batch(&previous.tool_calls, &message.tool_results)?;
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -258,6 +349,49 @@ fn validate_calls(calls: &[ToolCall]) -> Result<(), LlmError> {
         }
     }
     Ok(())
+}
+
+fn validate_result_ids(results: &[ToolResult]) -> Result<(), LlmError> {
+    for result in results {
+        if result.call_id.trim().is_empty() {
+            return Err(LlmError::Protocol(
+                "tool result call id cannot be empty".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_result_batch(calls: &[ToolCall], results: &[ToolResult]) -> Result<(), LlmError> {
+    if calls.len() != results.len() {
+        return Err(LlmError::Protocol(format!(
+            "tool result count {} does not match tool call count {}",
+            results.len(),
+            calls.len()
+        )));
+    }
+    for (call, result) in calls.iter().zip(results) {
+        if call.id != result.call_id {
+            return Err(LlmError::Protocol(format!(
+                "tool result call id {} does not match tool call {}",
+                result.call_id, call.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn has_non_empty_text(text: Option<&str>) -> bool {
+    text.is_some_and(|text| !text.trim().is_empty())
+}
+
+fn role_name(role: &ChatRole) -> &'static str {
+    match role {
+        ChatRole::System => "system",
+        ChatRole::User => "user",
+        ChatRole::Assistant => "assistant",
+        ChatRole::Tool => "tool",
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -435,5 +569,110 @@ mod tests {
         assert!(!context.is_cancel_requested());
         handle.cancel();
         assert!(context.is_cancel_requested());
+    }
+
+    fn request(messages: Vec<ChatMessage>) -> ModelRequest {
+        ModelRequest {
+            messages,
+            tools: vec![],
+        }
+    }
+
+    #[test]
+    fn accepts_matching_assistant_calls_and_tool_results() {
+        let calls = vec![call("first"), call("second")];
+        let results = vec![
+            ToolResult::success("first", json!(1)).unwrap(),
+            ToolResult::failure("second", ToolFailureCode::ExecutionFailed, "failed").unwrap(),
+        ];
+        let assistant = ChatMessage::assistant_tool_calls(calls).unwrap();
+        let tool = ChatMessage::tool_results(results).unwrap();
+
+        assert!(
+            request(vec![
+                ChatMessage::text(ChatRole::User, "run"),
+                assistant,
+                tool
+            ])
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_tool_result_ids() {
+        let assistant = ChatMessage::assistant_tool_calls(vec![call("expected")]).unwrap();
+        let tool =
+            ChatMessage::tool_results(vec![ToolResult::success("actual", json!(null)).unwrap()])
+                .unwrap();
+
+        assert!(request(vec![assistant, tool]).validate().is_err());
+    }
+
+    #[test]
+    fn rejects_tool_result_count_mismatch() {
+        let assistant = ChatMessage::assistant_tool_calls(vec![call("one"), call("two")]).unwrap();
+        let tool =
+            ChatMessage::tool_results(vec![ToolResult::success("one", json!(null)).unwrap()])
+                .unwrap();
+
+        assert!(request(vec![assistant, tool]).validate().is_err());
+    }
+
+    #[test]
+    fn rejects_tool_message_without_preceding_calls() {
+        let tool =
+            ChatMessage::tool_results(vec![ToolResult::success("orphan", json!(null)).unwrap()])
+                .unwrap();
+
+        assert!(request(vec![tool]).validate().is_err());
+    }
+
+    #[test]
+    fn rejects_assistant_mixing_text_and_tool_calls() {
+        let assistant = ChatMessage {
+            role: ChatRole::Assistant,
+            text: Some("also explain this".into()),
+            tool_calls: vec![call("demo")],
+            tool_results: vec![],
+        };
+
+        assert!(request(vec![assistant]).validate().is_err());
+    }
+
+    #[test]
+    fn rejects_empty_message_text() {
+        assert!(
+            request(vec![ChatMessage::text(ChatRole::User, "  ")])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            request(vec![ChatMessage {
+                role: ChatRole::Assistant,
+                text: None,
+                tool_calls: vec![],
+                tool_results: vec![],
+            }])
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_tool_names() {
+        let definition = |name: &str| ToolDefinition {
+            name: name.into(),
+            description: String::new(),
+            argument_schema: json!({}),
+            required_permissions: vec![],
+            concurrency: None,
+        };
+
+        let request = ModelRequest {
+            messages: vec![ChatMessage::text(ChatRole::User, "run")],
+            tools: vec![definition("demo"), definition("demo")],
+        };
+        assert!(request.validate().is_err());
     }
 }

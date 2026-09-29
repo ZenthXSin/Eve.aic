@@ -66,6 +66,7 @@ dependencies = [
  "eve-kernel",
  "eve-llm-api",
  "eve-plugin-api",
+ "serde_json",
  "tokio",
 ]
 

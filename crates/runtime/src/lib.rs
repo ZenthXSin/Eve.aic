@@ -10,6 +10,12 @@ use eve_plugin_api::{
 };
 use std::sync::Arc;
 
+mod llm_host;
+pub use llm_host::{
+    ContextBinding, LlmHost, LlmHostConfig, ToolCallDiagnostic, TurnDiagnostics, TurnFailure,
+    TurnOutput, TurnStage,
+};
+
 pub struct DemoReport {
     pub message: String,
     pub expected_failure: String,
