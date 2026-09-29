@@ -207,6 +207,19 @@ impl Kernel {
         self.inner.services.tasks.list(id)
     }
 
+    /// 获取已注册插件的独立清单快照；不等待生命周期锁。
+    pub fn plugin_manifest(&self, id: &PluginId) -> PluginResult<PluginManifest> {
+        let slot = self
+            .inner
+            .plugins
+            .lock()
+            .map_err(|_| PluginError::Lifecycle("插件注册表锁中毒".into()))?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| PluginError::PluginNotFound(id.clone()))?;
+        Ok(slot.manifest.clone())
+    }
+
     /// 宿主停止日志生产后显式刷新；即使插件停止失败，也可尝试排出已有日志。
     pub fn flush_logs(&self) -> PluginResult<()> {
         self.inner.services.logger.flush()
@@ -261,6 +274,10 @@ impl PluginRegistry for Kernel {
 impl RuntimeInspector for Kernel {
     fn plugins(&self) -> PluginResult<Vec<PluginStatus>> {
         Kernel::plugins(self)
+    }
+
+    fn plugin_manifest(&self, id: &PluginId) -> PluginResult<PluginManifest> {
+        Kernel::plugin_manifest(self, id)
     }
 
     fn plugin_tasks(&self, id: &PluginId) -> PluginResult<Vec<eve_plugin_api::TaskInfo>> {
