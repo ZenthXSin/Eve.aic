@@ -437,6 +437,23 @@ pub trait Plugin: Send {
     fn start(&mut self, ctx: PluginContext) -> PluginFuture<'_, Option<Cleanup>>;
 }
 
+/// 用于组合层发现和创建静态插件的工厂契约。
+///
+/// 工厂只负责提供清单和创建实例；创建不会自动启动插件，也不应在构造阶段
+/// 注册 Runtime 资源。目录在登记时保存清单快照，并在创建后再次校验实例清单。
+pub trait PluginFactory: Send + Sync {
+    fn manifest(&self) -> &PluginManifest;
+    fn create(&self) -> PluginResult<Box<dyn Plugin>>;
+}
+
+/// 静态插件目录契约。目录是组合层能力，不参与 Kernel 生命周期或依赖求解。
+pub trait PluginCatalog: Send + Sync {
+    fn register_factory(&self, factory: Arc<dyn PluginFactory>) -> PluginResult<()>;
+    fn manifests(&self) -> PluginResult<Vec<PluginManifest>>;
+    fn find(&self, id: &PluginId, version: &Version) -> PluginResult<Option<PluginManifest>>;
+    fn create(&self, id: &PluginId, version: &Version) -> PluginResult<Box<dyn Plugin>>;
+}
+
 /// 宿主侧插件注册表契约。插件本身不能通过 `PluginContext` 操作注册表。
 pub trait PluginRegistry: Send + Sync {
     fn register(&self, plugin: Box<dyn Plugin>) -> PluginResult<()>;
@@ -489,6 +506,15 @@ pub enum PluginError {
     Log(String),
     Cleanup(String),
     Lifecycle(String),
+    FactoryCreate(String),
+    FactoryNotFound {
+        id: PluginId,
+        version: Version,
+    },
+    FactoryManifestMismatch {
+        expected: Box<PluginManifest>,
+        found: Box<PluginManifest>,
+    },
 }
 
 impl fmt::Display for PluginError {
@@ -545,6 +571,15 @@ impl fmt::Display for PluginError {
             Self::Log(message) => write!(f, "日志错误：{message}"),
             Self::Cleanup(message) => write!(f, "cleanup error: {message}"),
             Self::Lifecycle(message) => write!(f, "lifecycle error: {message}"),
+            Self::FactoryCreate(message) => write!(f, "插件工厂创建失败：{message}"),
+            Self::FactoryNotFound { id, version } => {
+                write!(f, "插件目录中不存在精确版本：{id}@{version}")
+            }
+            Self::FactoryManifestMismatch { expected, found } => write!(
+                f,
+                "插件工厂清单不一致：登记为 {}@{}，实例为 {}@{}",
+                expected.id, expected.version, found.id, found.version
+            ),
         }
     }
 }
