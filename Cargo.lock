@@ -140,6 +140,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-control-api"
+version = "0.1.0"
+dependencies = [
+ "eve-llm-api",
+ "eve-session-api",
+ "serde",
+]
+
+[[package]]
+name = "eve-control-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-control-api",
+ "eve-llm-api",
+ "eve-plugin-api",
+ "eve-session-api",
+ "getrandom 0.4.3",
+ "tokio",
+]
+
+[[package]]
 name = "eve-example-plugins"
 version = "0.1.0"
 dependencies = [
@@ -191,6 +212,8 @@ version = "0.1.0"
 dependencies = [
  "eve-config-api",
  "eve-config-plugin",
+ "eve-control-api",
+ "eve-control-plugin",
  "eve-example-plugins",
  "eve-kernel",
  "eve-llm-api",

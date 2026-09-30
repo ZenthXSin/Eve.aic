@@ -1,0 +1,14 @@
+[package]
+name = "eve-control-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-control-api = { path = "../control-api" }
+eve-plugin-api = { path = "../plugin-api" }
+eve-llm-api = { path = "../llm-api" }
+eve-session-api = { path = "../session-api" }
+tokio.workspace = true
+getrandom = "0.4"

@@ -10,8 +10,10 @@ use eve_plugin_api::{
 };
 use std::sync::Arc;
 
+mod control_runner;
 mod llm_host;
 mod session_host;
+pub use control_runner::SessionControlRunner;
 pub use llm_host::{
     ContextBinding, LlmHost, LlmHostConfig, ToolCallDiagnostic, TurnDiagnostics, TurnFailure,
     TurnOutput, TurnStage,

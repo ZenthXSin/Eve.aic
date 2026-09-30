@@ -13,6 +13,7 @@ eve-config-api = { path = "../config-api" }
 eve-config-plugin = { path = "../config-plugin" }
 eve-llm-api = { path = "../llm-api" }
 eve-session-api = { path = "../session-api" }
+eve-control-api = { path = "../control-api" }
 tokio.workspace = true
 serde_json.workspace = true
 
@@ -20,4 +21,5 @@ serde_json.workspace = true
 tempfile.workspace = true
 eve-llm-openai = { path = "../llm-openai" }
 eve-session-plugin = { path = "../session-plugin" }
+eve-control-plugin = { path = "../control-plugin" }
 tokio = { workspace = true, features = ["net", "io-util", "io-std"] }

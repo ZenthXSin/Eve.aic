@@ -260,7 +260,7 @@ async fn issue_serial_ticket(
     SerialTicket { queue, identity }
 }
 
-async fn contain_panic<T, F>(future: F) -> Result<T, LlmError>
+pub(crate) async fn contain_panic<T, F>(future: F) -> Result<T, LlmError>
 where
     F: Future<Output = Result<T, LlmError>>,
 {
@@ -458,7 +458,12 @@ impl LlmHost {
         events: Option<&EventDelivery<'_>>,
     ) -> Result<TurnOutput, TurnFailure> {
         let mut diagnostics = TurnDiagnostics::default();
-        let mut prepared = match self.prepare(&input, &mut diagnostics).await {
+        let prepared = tokio::select! {
+            biased;
+            _ = wait_closed(events) => Err(LlmError::Cancelled),
+            prepared = self.prepare(&input, &mut diagnostics) => prepared,
+        };
+        let mut prepared = match prepared {
             Ok(value) => value,
             Err(error) => return Err(fail(error, diagnostics)),
         };
