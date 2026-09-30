@@ -47,6 +47,10 @@ jobs:
         run: cargo run -p eve-runtime --locked
       - name: 验证取消生命周期等待后的收尾
         run: cargo run -p eve-runtime --example lifecycle_operations --locked
+      - name: 验证 Mock 工具闭环
+        run: cargo run -p eve-runtime --example llm_tool_loop --locked
+      - name: 验证 OpenAI 本地 HTTP 与插件工具闭环
+        run: cargo run -p eve-runtime --example openai_offline --locked
       - name: 验证两次独立进程恢复状态
         run: |
           function Assert-SavedCounter([string] $Directory, [string] $ExpectedStarts) {

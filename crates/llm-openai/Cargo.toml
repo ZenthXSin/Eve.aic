@@ -1,18 +1,15 @@
 [package]
-name = "eve-runtime"
+name = "eve-llm-openai"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-eve-kernel = { path = "../kernel" }
-eve-plugin-api = { path = "../plugin-api" }
-eve-example-plugins = { path = "../example-plugins" }
 eve-llm-api = { path = "../llm-api" }
-tokio.workspace = true
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-eve-llm-openai = { path = "../llm-openai" }
 tokio = { workspace = true, features = ["net", "io-util"] }

@@ -73,7 +73,17 @@ pub struct FileStateStore {
     directory: PathBuf,
     snapshot: Mutex<Snapshot>,
     // 锁文件不删除；删除会让另一个实例锁住不同文件，破坏目录排他性。
-    _lock: File,
+    _lock: DirectoryLock,
+}
+
+struct DirectoryLock(File);
+
+impl Drop for DirectoryLock {
+    fn drop(&mut self) {
+        // fork/dup 可暂时保留同一打开文件描述；不能只等待最后一个句柄关闭。
+        // Drop 无法返回错误；显式解锁后仍由 File 的析构完成关闭。
+        let _ = self.0.unlock();
+    }
 }
 
 impl FileStateStore {
@@ -93,6 +103,7 @@ impl FileStateStore {
             .map_err(|error| failure("打开状态锁", error))?;
         lock.try_lock()
             .map_err(|error| failure("状态目录被占用或无法加锁", error))?;
+        let lock = DirectoryLock(lock);
 
         let snapshot_path = directory.join("state.json");
         // 先独立解析快照；失败时在返回错误前显式释放目录锁，保证调用方
@@ -201,4 +212,24 @@ impl StateStore for FileStateStore {
 
 fn failure(operation: &str, error: impl fmt::Display) -> PluginError {
     PluginError::State(format!("{operation}失败：{error}"))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drop_releases_directory_lock_while_a_duplicate_handle_is_alive() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileStateStore::open(directory.path()).unwrap();
+        let owner = PluginId::new("duplicate-lock-test").unwrap();
+        store.set(&owner, "saved".into(), vec![7]).unwrap();
+        // 确定性模拟 fork/dup 暂时保留同一打开文件描述；不能依赖调度概率。
+        let duplicate = store._lock.0.try_clone().unwrap();
+        drop(store);
+        let reopened = FileStateStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.get(&owner, "saved").unwrap(), Some(vec![7]));
+        drop(reopened);
+        drop(duplicate);
+    }
 }

@@ -38,7 +38,7 @@ cargo test --workspace
 
 `plugin-api` 定义契约，`kernel` 实现能力，`example-plugins` 演示插件，`runtime` 装配验收。详见[文档中心](./docs/README.md)。
 
-当前 LLM 闭环只使用无网络 Mock Provider，真实 OpenAI 适配器、流式输出和会话恢复留在后续阶段；示例与测试不会读取或写入真实密钥。
+已实现 OpenAI Responses 的非流式文本/函数调用适配器，并通过本地 HTTP 与工具闭环验收；真实模型 smoke test 尚未执行。见[OpenAI 接入](./docs/OpenAI接入.md)。流式输出、reasoning 续传和会话恢复仍待实现。
 
 当前支持单进程可信静态插件；权限检查不是沙箱。仅恢复字节状态，任务和服务由插件重建。退出时须显式停止并刷新日志。
 
