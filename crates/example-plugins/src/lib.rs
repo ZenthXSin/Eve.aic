@@ -6,7 +6,9 @@ use eve_plugin_api::{
 };
 use std::sync::Arc;
 
+mod config;
 mod tasks;
+pub use config::{CONFIG_CONSUMER, CONFIG_REPORT, ConfigConsumerPlugin};
 pub use tasks::{TASK_DEMO, TaskDemoPlugin};
 
 pub const PROVIDER: &str = "demo.provider";

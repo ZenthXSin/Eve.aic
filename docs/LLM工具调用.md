@@ -107,9 +107,9 @@ Channel 输入
 
 确定性 Mock Provider 必须请求一批示例工具，再接收带相同调用 ID 的结果并返回最终文本。无网络集成测试按上表覆盖装配失败和调用失败两类 Service 场景，验证权限检查使用实际所有者 Manifest、后端失败保留、参数分层、工具错误与 panic、Provider 错误和超时、非法回复及轮数上限；并实际验证并行安全调用发生重叠、同一串行作用域按序不重叠、并发上限生效、完成先后变化仍按调用 ID 和原始顺序回传、单项失败/超时/取消不丢弃同批其他结果。同时验证固定前缀、动态槽位、本轮快照稳定和失败诊断。示例使用公开接口启动插件、等待整轮、再停止并确认清理，不写入真实 API 密钥。
 
-## 首个 OpenAI 适配器（后续实现）
+## 首个 OpenAI 适配器
 
-选择 Responses API 与独立 `eve-llm-openai` 实现 crate，使用 `reqwest` + `serde`/`serde_json` 的小型 HTTP 适配器；具体版本在实现时依据 Rust 1.89 的兼容检查锁定。理由是映射与网络层可独立测试，厂商类型只存在于适配器，Kernel、通用 plugin-api 和工具插件不依赖 HTTP 客户端。选择记录见 ADR-0029；实现前必须重新核对 OpenAI 官方文档中的字段、数据控制和支持模型。
+已在独立 `eve-llm-openai` crate 实现 Responses API + `reqwest 0.12.28` 的小型 HTTP 适配器，并锁定 Rust 1.89 可编译的依赖。映射与网络层独立测试，厂商类型只存在于适配器，Kernel、通用 plugin-api 和工具插件不依赖 HTTP 客户端。2026-09-30 已复核官方函数调用、Responses 迁移与数据控制文档；真实模型兼容性仍需手动 smoke test。选择记录见 ADR-0029；配置、错误和验收命令见[OpenAI 接入](./OpenAI接入.md)。
 
 Eve 的工具定义映射为 Responses 的 function 工具；`ToolCall.id` 对应 `call_id`，JSON arguments 解析后进入对象参数；成功值或结构化失败序列化为 `function_call_output.output`，保留同一 `call_id`。请求设置 `parallel_tool_calls: true`，适配器完整保留同一响应中的调用顺序与每个 `call_id`。首版显式 `strict: false` 以保留插件 Schema 原意，仍强制本地参数校验；不能替插件增删 required 字段。
 

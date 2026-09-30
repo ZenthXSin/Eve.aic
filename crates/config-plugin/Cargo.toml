@@ -1,0 +1,18 @@
+[package]
+name = "eve-config-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-plugin-api = { path = "../plugin-api" }
+eve-config-api = { path = "../config-api" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+eve-kernel = { path = "../kernel" }
+eve-example-plugins = { path = "../example-plugins" }
+tokio.workspace = true

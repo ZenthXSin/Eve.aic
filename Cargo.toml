@@ -1,8 +1,11 @@
 [workspace]
 members = [
     "crates/plugin-api",
+    "crates/config-api",
+    "crates/config-plugin",
     "crates/kernel",
     "crates/llm-api",
+    "crates/llm-openai",
     "crates/runtime",
     "crates/example-plugins",
 ]
