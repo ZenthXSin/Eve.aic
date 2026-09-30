@@ -29,6 +29,8 @@ pub struct SessionTurnOutput {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SessionRunError {
+    /// 关闭发生在会话 begin 前，没有创建 Pending 或执行工具。
+    NotStarted(LlmError),
     Session(SessionError),
     Turn(TurnFailure),
     /// 已生成回复（可能已执行工具），但最终提交失败；调用方不得自动重试工具。
@@ -49,6 +51,7 @@ pub enum SessionRunError {
 impl fmt::Display for SessionRunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NotStarted(error) => error.fmt(f),
             Self::Session(error) => error.fmt(f),
             Self::Turn(failure) => failure.error.fmt(f),
             Self::Commit { error, .. } => write!(f, "回复已生成但会话保存失败：{error}"),
@@ -161,7 +164,18 @@ impl SessionLlmHost {
         input: SessionInput,
         sink: Option<&dyn TurnEventSink>,
     ) -> Result<SessionTurnOutput, SessionRunError> {
-        let admission = Arc::new(self.host.kernel.acquire_runtime_admission().await);
+        let closed = async {
+            if let Some(sink) = sink {
+                let _ = crate::llm_host::contain_panic(async { sink.closed().await }).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        let admission = tokio::select! {
+            biased;
+            _ = closed => return Err(SessionRunError::NotStarted(LlmError::Cancelled)),
+            admission = self.host.kernel.acquire_runtime_admission() => Arc::new(admission),
+        };
         let text = input.text.clone();
         let beginning = self
             .service()

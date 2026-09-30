@@ -176,11 +176,18 @@ impl LlmProvider for Provider {
 #[derive(Default)]
 pub struct Context {
     pub history: Mutex<Vec<ChatMessage>>,
+    pub gate: Mutex<Option<Arc<Notify>>>,
+    pub entered: Notify,
 }
 impl ContextAssembler for Context {
     fn assemble(&self, _: TurnInput) -> LlmFuture<'_, ContextSnapshot> {
         let history = self.history.lock().unwrap().clone();
+        let gate = self.gate.lock().unwrap().clone();
         Box::pin(async move {
+            self.entered.notify_one();
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
             Ok(ContextSnapshot {
                 revision: "fixed-1".into(),
                 profile: "用户档案".into(),
