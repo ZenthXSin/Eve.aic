@@ -25,9 +25,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-config-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eve-config-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-config-api",
+ "eve-example-plugins",
+ "eve-kernel",
+ "eve-plugin-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "eve-example-plugins"
 version = "0.1.0"
 dependencies = [
+ "eve-config-api",
  "eve-plugin-api",
 ]
 
@@ -53,9 +76,13 @@ dependencies = [
 name = "eve-runtime"
 version = "0.1.0"
 dependencies = [
+ "eve-config-api",
+ "eve-config-plugin",
  "eve-example-plugins",
  "eve-kernel",
  "eve-plugin-api",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
