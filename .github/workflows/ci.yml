@@ -73,6 +73,8 @@ jobs:
           if ($second.current.revision -ne 4 -or $second.current.namespaces["runtime.llm"]["values"]["max_parallel_tool_calls"] -ne 14 -or $second.backups.Count -ne 4) {
             throw "第二次配置文件修订、值或备份不符"
           }
+      - name: 验证 OpenAI 本地 HTTP 与插件工具闭环
+        run: cargo run -p eve-runtime --example openai_offline --locked
       - name: 验证两次独立进程恢复状态
         run: |
           function Assert-SavedCounter([string] $Directory, [string] $ExpectedStarts) {
