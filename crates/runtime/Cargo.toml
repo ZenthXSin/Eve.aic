@@ -17,3 +17,5 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+eve-llm-openai = { path = "../llm-openai" }
+tokio = { workspace = true, features = ["net", "io-util"] }
