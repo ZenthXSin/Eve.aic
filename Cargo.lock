@@ -196,6 +196,31 @@ dependencies = [
  "eve-llm-api",
  "eve-llm-openai",
  "eve-plugin-api",
+ "eve-session-api",
+ "eve-session-plugin",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "eve-session-api"
+version = "0.1.0"
+dependencies = [
+ "eve-llm-api",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eve-session-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-kernel",
+ "eve-llm-api",
+ "eve-plugin-api",
+ "eve-session-api",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

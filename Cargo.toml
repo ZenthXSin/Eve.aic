@@ -6,6 +6,8 @@ members = [
     "crates/kernel",
     "crates/llm-api",
     "crates/llm-openai",
+    "crates/session-api",
+    "crates/session-plugin",
     "crates/runtime",
     "crates/example-plugins",
 ]

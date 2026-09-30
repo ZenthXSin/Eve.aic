@@ -125,6 +125,8 @@ impl Default for TurnDiagnostics {
 pub struct TurnOutput {
     pub text: String,
     pub diagnostics: TurnDiagnostics,
+    /// 本轮用户输入、配对工具调用/结果和最终回复，不含系统提示或旧历史。
+    pub transcript: Vec<ChatMessage>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -270,8 +272,8 @@ enum PermissionFailure {
 
 pub struct LlmHost {
     provider: Arc<dyn LlmProvider>,
-    registry: Arc<dyn ServiceRegistry>,
-    kernel: Kernel,
+    pub(crate) registry: Arc<dyn ServiceRegistry>,
+    pub(crate) kernel: Kernel,
     permissions: Arc<dyn PermissionChecker>,
     context: ContextBinding,
     bindings: Vec<ToolBinding>,
@@ -318,11 +320,33 @@ impl LlmHost {
 
     pub async fn run_turn(&self, input: TurnInput) -> Result<TurnOutput, TurnFailure> {
         let _admission = self.kernel.acquire_runtime_admission().await;
+        self.run_turn_inner(input, None).await
+    }
+
+    // 会话宿主已持有相同 Kernel 的准入锁，覆盖 Pending 到最终状态提交。
+    pub(crate) async fn run_turn_inner(
+        &self,
+        input: TurnInput,
+        history: Option<Vec<ChatMessage>>,
+    ) -> Result<TurnOutput, TurnFailure> {
         let mut diagnostics = TurnDiagnostics::default();
-        let prepared = match self.prepare(&input, &mut diagnostics).await {
+        let mut prepared = match self.prepare(&input, &mut diagnostics).await {
             Ok(value) => value,
             Err(error) => return Err(fail(error, diagnostics)),
         };
+        if let Some(history) = history {
+            if !prepared.context.history.is_empty() {
+                return Err(fail(
+                    LlmError::Context("会话模式只允许会话服务提供历史".into()),
+                    diagnostics,
+                ));
+            }
+            prepared.context.history = history;
+            if let Err(error) = validate_context(&prepared.context) {
+                return Err(fail(error, diagnostics));
+            }
+        }
+        let mut transcript = vec![ChatMessage::text(ChatRole::User, input.text.clone())];
         let mut messages = build_messages(&self.config, &prepared.context, &input);
         let definitions = prepared
             .tools
@@ -339,7 +363,12 @@ impl LlmHost {
         };
         if let ModelResponse::Final { text } = response {
             diagnostics.stage = TurnStage::Completed;
-            return Ok(TurnOutput { text, diagnostics });
+            transcript.push(ChatMessage::text(ChatRole::Assistant, text.clone()));
+            return Ok(TurnOutput {
+                text,
+                diagnostics,
+                transcript,
+            });
         }
         let ModelResponse::ToolCalls { calls } = response else {
             unreachable!()
@@ -370,6 +399,7 @@ impl LlmHost {
             ChatMessage::tool_results(results.clone())
                 .map_err(|error| fail(error, diagnostics.clone()))?,
         );
+        transcript.extend_from_slice(&messages[messages.len() - 2..]);
         diagnostics.tool_results = results;
         let response = match self
             .complete(
@@ -391,7 +421,12 @@ impl LlmHost {
         match response {
             ModelResponse::Final { text } => {
                 diagnostics.stage = TurnStage::Completed;
-                Ok(TurnOutput { text, diagnostics })
+                transcript.push(ChatMessage::text(ChatRole::Assistant, text.clone()));
+                Ok(TurnOutput {
+                    text,
+                    diagnostics,
+                    transcript,
+                })
             }
             ModelResponse::ToolCalls { .. } => Err(fail(LlmError::RoundLimit, diagnostics)),
         }
@@ -829,17 +864,19 @@ fn validate_context(context: &ContextSnapshot) -> Result<(), LlmError> {
     if context.revision.trim().is_empty() {
         return Err(LlmError::Context("context revision cannot be empty".into()));
     }
-    if context.history.iter().any(|message| {
-        !matches!(message.role, ChatRole::User | ChatRole::Assistant)
-            || message
-                .text
-                .as_ref()
-                .is_none_or(|text| text.trim().is_empty())
-            || !message.tool_calls.is_empty()
-            || !message.tool_results.is_empty()
-    }) {
+    if context
+        .history
+        .iter()
+        .any(|message| message.role == ChatRole::System)
+        || (ModelRequest {
+            messages: context.history.clone(),
+            tools: vec![],
+        })
+        .validate()
+        .is_err()
+    {
         return Err(LlmError::Context(
-            "history must contain complete user or assistant text messages".into(),
+            "历史必须是有效用户/助手消息或完整配对的工具调用与结果".into(),
         ));
     }
     Ok(())

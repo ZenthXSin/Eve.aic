@@ -1,0 +1,18 @@
+[package]
+name = "eve-session-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-plugin-api = { path = "../plugin-api" }
+eve-llm-api = { path = "../llm-api" }
+eve-session-api = { path = "../session-api" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+eve-kernel = { path = "../kernel" }
+tokio.workspace = true
+tempfile.workspace = true

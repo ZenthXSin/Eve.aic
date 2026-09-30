@@ -11,10 +11,12 @@ use eve_plugin_api::{
 use std::sync::Arc;
 
 mod llm_host;
+mod session_host;
 pub use llm_host::{
     ContextBinding, LlmHost, LlmHostConfig, ToolCallDiagnostic, TurnDiagnostics, TurnFailure,
     TurnOutput, TurnStage,
 };
+pub use session_host::{SessionBinding, SessionLlmHost, SessionRunError, SessionTurnOutput};
 
 pub struct DemoReport {
     pub message: String,
