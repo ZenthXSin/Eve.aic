@@ -18,7 +18,9 @@ use scope::PluginScope;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
+use tokio::sync::{
+    Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, OwnedMutexGuard as OwnedAsyncMutexGuard,
+};
 
 // 保留原导出路径，生命周期定义归入契约层。
 pub use catalog::InMemoryPluginCatalog;
@@ -87,6 +89,13 @@ pub struct Kernel {
     inner: Arc<KernelInner>,
 }
 
+/// Holds lifecycle admission while a runtime operation uses registered plugins.
+/// Lifecycle operations through any clone of the same Kernel wait for this guard.
+#[must_use = "dropping the guard releases runtime admission"]
+pub struct RuntimeAdmissionGuard {
+    _guard: OwnedAsyncMutexGuard<()>,
+}
+
 impl Kernel {
     pub fn new() -> Self {
         Self::default()
@@ -107,7 +116,7 @@ impl Kernel {
     }
 
     pub fn register(&self, plugin: Box<dyn Plugin>) -> PluginResult<()> {
-        let _registration = self.registration_guard()?;
+        let _registration = self.registration_guard("不能注册插件")?;
         let manifest = plugin.manifest().clone();
         manifest.validate()?;
         let id = manifest.id.clone();
@@ -129,7 +138,7 @@ impl Kernel {
 
     /// 移除已注册但没有运行中资源的插件；不会删除该插件的 StateStore 数据。
     pub fn unregister(&self, id: &PluginId) -> PluginResult<()> {
-        let _registration = self.registration_guard()?;
+        let _registration = self.registration_guard("不能卸载插件")?;
         let slot = self.slot(id)?;
         let state = *slot.state.lock().expect("state lock poisoned");
         if !matches!(
@@ -162,13 +171,24 @@ impl Kernel {
         Ok(())
     }
 
-    /// 注册表变更与生命周期快照串行化，避免运行中的 start/stop 漏掉新插件。
-    fn registration_guard(&self) -> PluginResult<AsyncMutexGuard<'_, ()>> {
+    /// 注册表变更与生命周期操作及运行期准入串行化，避免变更跨越状态快照。
+    fn registration_guard(&self, action: &'static str) -> PluginResult<AsyncMutexGuard<'_, ()>> {
         self.ensure_lifecycle_healthy()?;
         self.inner
             .lifecycle
             .try_lock()
-            .map_err(|_| PluginError::Lifecycle("生命周期操作正在执行，不能注册插件".into()))
+            .map_err(|_| PluginError::Lifecycle(format!("生命周期操作正在执行，{action}")))
+    }
+
+    /// Reserve lifecycle admission for a complete runtime operation.
+    ///
+    /// `start`, `stop`, and related asynchronous lifecycle operations through any clone
+    /// of this Kernel wait until the returned guard is dropped. Synchronous plugin
+    /// registration and unregistration fail while the guard is held.
+    pub async fn acquire_runtime_admission(&self) -> RuntimeAdmissionGuard {
+        RuntimeAdmissionGuard {
+            _guard: self.inner.lifecycle.clone().lock_owned().await,
+        }
     }
 
     pub fn state(&self, id: &PluginId) -> Option<PluginState> {
@@ -205,6 +225,19 @@ impl Kernel {
     pub fn tasks(&self, id: &PluginId) -> PluginResult<Vec<eve_plugin_api::TaskInfo>> {
         self.slot(id)?;
         self.inner.services.tasks.list(id)
+    }
+
+    /// 获取已注册插件的独立清单快照；不等待生命周期锁。
+    pub fn plugin_manifest(&self, id: &PluginId) -> PluginResult<PluginManifest> {
+        let slot = self
+            .inner
+            .plugins
+            .lock()
+            .map_err(|_| PluginError::Lifecycle("插件注册表锁中毒".into()))?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| PluginError::PluginNotFound(id.clone()))?;
+        Ok(slot.manifest.clone())
     }
 
     /// 宿主停止日志生产后显式刷新；即使插件停止失败，也可尝试排出已有日志。
@@ -261,6 +294,10 @@ impl PluginRegistry for Kernel {
 impl RuntimeInspector for Kernel {
     fn plugins(&self) -> PluginResult<Vec<PluginStatus>> {
         Kernel::plugins(self)
+    }
+
+    fn plugin_manifest(&self, id: &PluginId) -> PluginResult<PluginManifest> {
+        Kernel::plugin_manifest(self, id)
     }
 
     fn plugin_tasks(&self, id: &PluginId) -> PluginResult<Vec<eve_plugin_api::TaskInfo>> {

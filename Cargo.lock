@@ -43,6 +43,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-llm-api"
+version = "0.1.0"
+dependencies = [
+ "eve-plugin-api",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "eve-plugin-api"
 version = "0.1.0"
 dependencies = [
@@ -55,7 +64,9 @@ version = "0.1.0"
 dependencies = [
  "eve-example-plugins",
  "eve-kernel",
+ "eve-llm-api",
  "eve-plugin-api",
+ "serde_json",
  "tokio",
 ]
 
