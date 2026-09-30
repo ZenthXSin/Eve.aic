@@ -4,6 +4,7 @@ members = [
     "crates/config-api",
     "crates/config-plugin",
     "crates/kernel",
+    "crates/llm-api",
     "crates/runtime",
     "crates/example-plugins",
 ]

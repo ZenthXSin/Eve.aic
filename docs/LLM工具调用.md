@@ -37,13 +37,13 @@
 
 ## 装配、权限与生命周期
 
-`LlmHost` 构造时显式接收 Provider、`Arc<dyn ServiceRegistry>`、`Arc<dyn RuntimeInspector>`、`Arc<dyn PermissionChecker>`、`ContextBinding { service_id, expected_owner }`、工具绑定和配置。组合层在创建 Kernel 前克隆 `KernelServices.registry`、`KernelServices.permissions` 的同一组 `Arc` 给宿主；Inspector 使用同一 Kernel 的公开实现，不能为宿主另建一套服务或权限后端。
+`LlmHost` 构造时显式接收 Provider、`Arc<dyn ServiceRegistry>`、`Kernel`、`Arc<dyn PermissionChecker>`、`ContextBinding { service_id, expected_owner }`、工具绑定和配置。组合层在创建 Kernel 前克隆 `KernelServices.registry`、`KernelServices.permissions` 的同一组 `Arc` 给宿主；传入 Kernel 的克隆与执行生命周期操作的句柄共享同一内部状态和准入锁，不能为宿主另建一套插件注册表或权限后端。
 
 定义层为 `RuntimeInspector` 新增 `plugin_manifest(&PluginId) -> PluginResult<PluginManifest>`：返回独立只读快照，未注册返回新增的 `PluginError::PluginNotFound`，不等待生命周期锁。宿主对工具所有者的 Manifest 调用 `PermissionChecker::check`，工具定义所列权限必须逐项通过；这是可信插件的声明检查，不是用户授权系统或操作系统沙箱。
 
 `ToolBinding { name: String, service_id: ServiceId, expected_owner: PluginId }` 必须拒绝空名、重复名和空标识；Context 绑定同样指定 Service ID 与预期所有者。启动所需插件后，每轮在首次 Provider 请求前完成装配预检：核对所有绑定的服务、类型、所有者、Active 状态，以及工具定义名称和参数契约。预检失败不调用 Provider 或工具。工具定义保存为本轮快照，调用前重新获取服务并核对名称、所有者、状态、权限和参数；定义漂移按工具不可用处理，不能临时扩大本轮权限或替换已公布的契约。
 
-Active 快照不是执行租约，服务 `Arc` 也不能阻止 Scope 被清理。首版的 `LlmHost` 是相关插件的唯一组合门面，私有持有 Kernel 的生命周期与注册入口，并以同一个异步 gate 串行 `run_turn`、启动、停止和卸载：先启动，再等待本轮返回，最后停止。相关插件必须在构造宿主前完成注册；首版不暴露构造后的注册入口，后续若加入，必须进入同一个 gate。宿主不能同时暴露可绕过 gate 的 Kernel 操作入口。后台任务不得替换本轮服务；在这个约束外直接并发调用 Kernel，不承诺消除竞态。
+Active 快照不是执行租约，服务 `Arc` 也不能阻止 Scope 被清理。每次 `run_turn` 持有同一 Kernel 的运行准入锁直到整轮结束；通过任意 Kernel 克隆提交的启动、停止等异步生命周期操作都会等待本轮完成，同步注册和卸载则在运行期间返回生命周期错误。整轮正常结束、失败或被取消都会释放准入锁。每轮开始前，绑定的插件应已注册并处于 Active 状态；外层组合层可在两轮之间通过 Kernel 克隆管理插件。Provider 或工具不得在本轮内等待同一 Kernel 的生命周期操作，以免形成重入等待。后台任务不得替换本轮服务。
 
 工具 Future 由宿主直接等待，不会自动成为 TaskManager 中的任务。每个调用在通过分项预检、取得并发槽位且即将首次轮询其 Future 时开始计算 `LlmHostConfig.tool_timeout`；排队中的调用尚未开始，不计入该期限或“已开始工具次数”。期限届满时，宿主先设置该调用的取消标记，在正数 `tool_cancellation_grace` 内继续轮询供工具收尾；期限在同一轮询点与正常完成同时就绪时，期限优先。收尾窗口结束后丢弃尚未完成的 Future，固定生成 `TimedOut` 失败结果，其他同批调用继续。调度器只有在 Future 正常完成或已在收尾窗口后被丢弃时才释放其本地串行作用域；它不保证超时后远端副作用不与后续同作用域调用重叠。调用者丢弃 `run_turn` 时，宿主为所有未完成调用设置取消标记并立即丢弃本地 Provider 与 Tool Future，停止整轮，不再发起第二次 Provider 请求或保证取得诊断；随后 gate 可以释放，后续生命周期操作同样不构成对未确认远端副作用的锁。这不保证工具或远端系统已经停止，也不回滚已发生的副作用。工具应异步、响应取消且可结束。可打断会话和执行租约留待后续契约处理，不增加 Kernel 的模型职责。
 

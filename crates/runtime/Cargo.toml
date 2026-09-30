@@ -11,8 +11,9 @@ eve-plugin-api = { path = "../plugin-api" }
 eve-example-plugins = { path = "../example-plugins" }
 eve-config-api = { path = "../config-api" }
 eve-config-plugin = { path = "../config-plugin" }
+eve-llm-api = { path = "../llm-api" }
 tokio.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-serde_json.workspace = true

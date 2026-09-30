@@ -131,6 +131,14 @@ async fn inspector_returns_sorted_detached_snapshots_and_validates_unknown_plugi
     assert!(
         matches!(inspector.plugin_tasks(&pid("unknown")), Err(PluginError::InvalidLifecycle { plugin, .. }) if plugin == pid("unknown"))
     );
+    assert_eq!(
+        inspector.plugin_manifest(&pid("z-owner")).unwrap(),
+        PluginManifest::new("z-owner", "0.1.0").unwrap()
+    );
+    assert!(matches!(
+        inspector.plugin_manifest(&pid("unknown")),
+        Err(PluginError::PluginNotFound(id)) if id == pid("unknown")
+    ));
     assert!(
         matches!(kernel.tasks(&pid("unknown")), Err(PluginError::InvalidLifecycle { plugin, .. }) if plugin == pid("unknown"))
     );
