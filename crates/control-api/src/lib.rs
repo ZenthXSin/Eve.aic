@@ -100,6 +100,8 @@ pub struct ControlReport {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ControlSnapshot {
     pub key: GenerationKey,
+    /// 当前代真实输入；补充/纠正组合不能让调用方冒充原任务上下文。
+    pub input_text: String,
     pub phase: ControlPhase,
     pub cancel_requested: bool,
     /// 展示资格已撤销；完成后取消也撤销排队事件，但不改写执行结果。
@@ -143,6 +145,14 @@ pub enum CancelDisposition {
 pub trait ControlService: Send + Sync {
     fn submit(
         &self,
+        input: ControlInput,
+        sink: Arc<dyn ControlEventSink>,
+    ) -> ControlResult<GenerationKey>;
+    /// 目标已收尾后，原子比较完整代际并提交替代请求；不隐式取消。
+    /// 比较与提交在同一临界区，避免过时分类覆盖刚完成的新任务。
+    fn submit_if_current(
+        &self,
+        expected: &GenerationKey,
         input: ControlInput,
         sink: Arc<dyn ControlEventSink>,
     ) -> ControlResult<GenerationKey>;

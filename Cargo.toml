@@ -10,6 +10,8 @@ members = [
     "crates/session-plugin",
     "crates/control-api",
     "crates/control-plugin",
+    "crates/message-api",
+    "crates/message-plugin",
     "crates/runtime",
     "crates/example-plugins",
 ]

@@ -113,9 +113,10 @@ fn request_cancel(generation: &Generation) -> ControlResult<CancelDisposition> {
     generation.cancel.send_replace(true);
     Ok(CancelDisposition::Requested)
 }
-impl ControlService for Controller {
-    fn submit(
+impl Controller {
+    fn submit_inner(
         &self,
+        expected: Option<&GenerationKey>,
         input: ControlInput,
         sink: Arc<dyn ControlEventSink>,
     ) -> ControlResult<GenerationKey> {
@@ -123,6 +124,18 @@ impl ControlService for Controller {
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| ControlError::Unavailable)?;
         let mut registry = self.lock()?;
+        if let Some(expected) = expected {
+            if expected.session != input.session.key {
+                return Err(ControlError::OwnerMismatch);
+            }
+            let old = registry
+                .sessions
+                .get(&expected.session.session_id)
+                .ok_or(ControlError::StaleGeneration)?;
+            if old.key != *expected {
+                return Err(ControlError::StaleGeneration);
+            }
+        }
         if let Some(old) = registry.sessions.get(&input.session.key.session_id) {
             let state = old.state.lock().map_err(|_| ControlError::Unavailable)?;
             let never_started = state
@@ -155,6 +168,7 @@ impl ControlService for Controller {
             key: key.clone(),
             state: Mutex::new(ControlSnapshot {
                 key: key.clone(),
+                input_text: input.session.text.clone(),
                 phase: ControlPhase::Starting,
                 cancel_requested: false,
                 events_retired: false,
@@ -209,6 +223,23 @@ impl ControlService for Controller {
             .sessions
             .insert(key.session.session_id.clone(), generation);
         Ok(key)
+    }
+}
+impl ControlService for Controller {
+    fn submit(
+        &self,
+        input: ControlInput,
+        sink: Arc<dyn ControlEventSink>,
+    ) -> ControlResult<GenerationKey> {
+        self.submit_inner(None, input, sink)
+    }
+    fn submit_if_current(
+        &self,
+        expected: &GenerationKey,
+        input: ControlInput,
+        sink: Arc<dyn ControlEventSink>,
+    ) -> ControlResult<GenerationKey> {
+        self.submit_inner(Some(expected), input, sink)
     }
     fn cancel(&self, key: &GenerationKey) -> ControlResult<CancelDisposition> {
         let registry = self.lock()?;
