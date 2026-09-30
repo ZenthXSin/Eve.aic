@@ -17,6 +17,9 @@ pub struct OpenAiConfig {
     /// 独立传输期限；LlmHost 的期限仍可更早终止等待。
     pub request_timeout: Duration,
     pub max_response_bytes: usize,
+    /// None 保持服务默认；窄协议验收可显式选择支持 none 的模型。
+    pub reasoning_effort: Option<String>,
+    pub max_output_tokens: Option<u32>,
 }
 
 impl OpenAiConfig {
@@ -26,7 +29,26 @@ impl OpenAiConfig {
             responses_url: "https://api.openai.com/v1/responses".into(),
             request_timeout: Duration::from_secs(60),
             max_response_bytes: 8 * 1024 * 1024,
+            reasoning_effort: None,
+            max_output_tokens: None,
         }
+    }
+
+    /// 宿主可提供 API 根地址、版本路径或完整 Responses URL。
+    pub fn with_base_url(mut self, base: &str) -> Result<Self, LlmError> {
+        let mut url = Url::parse(base)
+            .map_err(|_| LlmError::Configuration("Responses base URL 无效".into()))?;
+        let path = url.path().trim_end_matches('/');
+        let path = if path.is_empty() {
+            "/v1/responses".into()
+        } else if path.ends_with("/responses") {
+            path.to_owned()
+        } else {
+            format!("{path}/responses")
+        };
+        url.set_path(&path);
+        self.responses_url = url.to_string();
+        Ok(self)
     }
 }
 
@@ -43,9 +65,20 @@ impl OpenAiProvider {
         if config.model.trim().is_empty()
             || config.request_timeout.is_zero()
             || config.max_response_bytes == 0
+            || config.max_output_tokens == Some(0)
         {
             return Err(LlmError::Configuration(
                 "模型、期限和响应上限必须有效".into(),
+            ));
+        }
+        if config.reasoning_effort.as_deref().is_some_and(|effort| {
+            !matches!(
+                effort,
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+            )
+        }) {
+            return Err(LlmError::Configuration(
+                "不支持的 reasoning effort 配置".into(),
             ));
         }
         let endpoint = Url::parse(&config.responses_url)
@@ -95,7 +128,13 @@ impl OpenAiProvider {
     }
 
     async fn request(&self, request: ModelRequest) -> Result<ModelResponse, LlmError> {
-        let body = wire::encode_request(&self.config.model, request)?;
+        let mut body = wire::encode_request(&self.config.model, request)?;
+        if let Some(effort) = &self.config.reasoning_effort {
+            body["reasoning"] = serde_json::json!({"effort": effort});
+        }
+        if let Some(limit) = self.config.max_output_tokens {
+            body["max_output_tokens"] = serde_json::json!(limit);
+        }
         let mut response = self
             .client
             .post(self.endpoint.clone())

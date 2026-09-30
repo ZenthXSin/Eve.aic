@@ -15,7 +15,12 @@ pub(crate) fn encode_request(model: &str, request: ModelRequest) -> Result<Value
                 ChatRole::Assistant => "assistant",
                 ChatRole::Tool => unreachable!("validated tool message has no text"),
             };
-            input.push(json!({"role": role, "content": text}));
+            let mut item = json!({"role": role, "content": text});
+            // Eve 的 assistant 文本历史只有已完成回复，等价于 final_answer。
+            if role == "assistant" {
+                item["phase"] = json!("final_answer");
+            }
+            input.push(item);
         } else if message.role == ChatRole::Assistant {
             for call in message.tool_calls {
                 validate_function_name(&call.name)?;
@@ -105,8 +110,11 @@ pub(crate) fn decode_response(bytes: &[u8]) -> Result<ModelResponse, LlmError> {
             }
             "message" => {
                 completed_item(item)?;
-                if item.get("phase").is_some_and(|v| !v.is_null()) {
-                    return Err(unsupported("通用协议不能保留消息 phase"));
+                if item
+                    .get("phase")
+                    .is_some_and(|v| !v.is_null() && v.as_str() != Some("final_answer"))
+                {
+                    return Err(unsupported("通用协议不能保留中间或未知消息 phase"));
                 }
                 if required_str(item, "role")? != "assistant" || text.is_some() {
                     return Err(unsupported("仅支持单个 assistant 文本消息"));
@@ -237,8 +245,9 @@ mod tests {
         );
         assert_eq!(
             encoded["input"][2],
-            json!({"role":"assistant", "content":"历史回复"})
+            json!({"role":"assistant", "content":"历史回复", "phase":"final_answer"})
         );
+        assert!(encoded["input"][1].get("phase").is_none());
         assert_eq!(encoded["input"][3]["call_id"], "b");
         assert_eq!(encoded["input"][4]["call_id"], "a");
         assert_eq!(encoded["input"][5]["call_id"], "b");
@@ -252,6 +261,28 @@ mod tests {
             failure,
             json!({"error":{"code":"TimedOut", "message":"已超时"}})
         );
+    }
+
+    #[test]
+    fn preserves_completed_phase_and_rejects_intermediate_or_unknown_phase() {
+        for phase in [Value::Null, json!("final_answer")] {
+            let mut item = message("完整回复");
+            item["phase"] = phase;
+            assert_eq!(
+                decode(json!([item])).unwrap(),
+                ModelResponse::Final {
+                    text: "完整回复".into()
+                }
+            );
+        }
+        for phase in [json!("commentary"), json!("unknown"), json!(42)] {
+            let mut item = message("中间信息");
+            item["phase"] = phase;
+            assert!(matches!(
+                decode(json!([item])),
+                Err(LlmError::Unsupported(_))
+            ));
+        }
     }
 
     #[test]

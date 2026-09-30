@@ -24,7 +24,7 @@
 - **日志与诊断**：结构化日志、过滤与内存记录；插件和任务查询、停止错误汇总。
 - **宿主控制**：提交、查询和确认生命周期操作；取消等待仍继续收尾。
 - **配置插件**：版本化普通配置、来源优先级、请求快照、备份与回滚；密钥库等安全配置在后续实现。
-- **最小 LLM 工具闭环**：`eve-llm-api` 定义 Provider、上下文和工具契约，Runtime 以确定性 Mock 完成模型请求、批量工具调用和最终回复；支持工具排序、并发上限、串行作用域、超时、协作式取消、权限与生命周期校验。
+- **最小 LLM 工具闭环**：`eve-llm-api` 定义 Provider、上下文和工具契约，Runtime 支持 Mock 与 Responses Provider，完成模型请求、批量工具调用和最终回复；支持工具排序、并发上限、串行作用域、超时、协作式取消、权限与生命周期校验。
 
 ## 运行与测试
 
@@ -40,7 +40,7 @@ cargo run -p eve-runtime --example configuration
 
 `plugin-api` 定义契约，`kernel` 实现能力，`example-plugins` 演示插件，`runtime` 装配验收。详见[文档中心](./docs/README.md)。
 
-已实现 OpenAI Responses 的非流式文本/函数调用适配器，并通过本地 HTTP 与工具闭环验收；真实模型 smoke test 尚未执行。见[OpenAI 接入](./docs/OpenAI接入.md)。流式输出、reasoning 续传和会话恢复仍待实现。
+已实现 OpenAI Responses 的非流式文本/函数调用适配器，已通过本地 HTTP、真实文本回复及插件工具回传验收，非敏感配置经配置插件读取。见[OpenAI 接入](./docs/OpenAI接入.md)。流式输出、reasoning 续传和会话恢复仍待实现。
 
 当前支持单进程可信静态插件；权限检查不是沙箱。仅恢复字节状态，任务和服务由插件重建。退出时须显式停止并刷新日志。
 
