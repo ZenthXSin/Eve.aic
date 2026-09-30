@@ -47,6 +47,8 @@ jobs:
         run: cargo run -p eve-runtime --locked
       - name: 验证取消生命周期等待后的收尾
         run: cargo run -p eve-runtime --example lifecycle_operations --locked
+      - name: 验证集成后的 Mock LLM 工具闭环
+        run: cargo run -p eve-runtime --example llm_tool_loop --locked
       - name: 验证配置插件及两次独立进程恢复
         run: |
           $env:EVE_LLM_MAX_PARALLEL_TOOL_CALLS = "10"
