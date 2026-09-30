@@ -22,4 +22,6 @@ tempfile.workspace = true
 eve-llm-openai = { path = "../llm-openai" }
 eve-session-plugin = { path = "../session-plugin" }
 eve-control-plugin = { path = "../control-plugin" }
+eve-message-api = { path = "../message-api" }
+eve-message-plugin = { path = "../message-plugin" }
 tokio = { workspace = true, features = ["net", "io-util", "io-std"] }

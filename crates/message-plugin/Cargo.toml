@@ -1,0 +1,15 @@
+[package]
+name = "eve-message-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-message-api = { path = "../message-api" }
+eve-control-api = { path = "../control-api" }
+eve-config-api = { path = "../config-api" }
+eve-plugin-api = { path = "../plugin-api" }
+eve-session-api = { path = "../session-api" }
+tokio.workspace = true
+serde_json.workspace = true

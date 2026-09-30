@@ -200,6 +200,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-message-api"
+version = "0.1.0"
+dependencies = [
+ "eve-config-api",
+ "eve-control-api",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eve-message-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-config-api",
+ "eve-control-api",
+ "eve-message-api",
+ "eve-plugin-api",
+ "eve-session-api",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "eve-plugin-api"
 version = "0.1.0"
 dependencies = [
@@ -218,6 +241,8 @@ dependencies = [
  "eve-kernel",
  "eve-llm-api",
  "eve-llm-openai",
+ "eve-message-api",
+ "eve-message-plugin",
  "eve-plugin-api",
  "eve-session-api",
  "eve-session-plugin",

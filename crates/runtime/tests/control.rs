@@ -969,3 +969,55 @@ async fn channel_panic_is_contained_and_failure_commit_completes() {
     assert!(rig.snapshot("s").history().is_empty());
     rig.stop().await;
 }
+
+#[tokio::test]
+async fn conditional_submit_rejects_finished_replacement_and_preserves_owner_and_busy_checks() {
+    let p = Provider::new(vec![
+        Step::new(final_response("一")),
+        Step::new(final_response("二")),
+        Step::blocked(Arc::new(Notify::new())),
+    ]);
+    let rig = Rig::new(
+        p.clone(),
+        Arc::new(FaultStore::default()),
+        LlmHostConfig::default(),
+    )
+    .await;
+    let control = install(&rig).await;
+    let first = control
+        .submit(request("s", "first", "一"), discard())
+        .unwrap();
+    done(&*control, &first).await;
+    let second = control
+        .submit_if_current(&first, request("s", "second", "二"), discard())
+        .unwrap();
+    done(&*control, &second).await;
+    assert_eq!(
+        control.submit_if_current(&first, request("s", "stale", "三"), discard()),
+        Err(ControlError::StaleGeneration)
+    );
+    assert_eq!(
+        control.submit_if_current(&second, request("other", "wrong", "三"), discard()),
+        Err(ControlError::OwnerMismatch)
+    );
+    let third = control
+        .submit_if_current(&second, request("s", "third", "三"), discard())
+        .unwrap();
+    p.wait_requests(3).await;
+    assert_eq!(
+        control.submit_if_current(&third, request("s", "busy", "四"), discard()),
+        Err(ControlError::Busy)
+    );
+    assert_eq!(
+        control
+            .snapshot(&third.session)
+            .unwrap()
+            .unwrap()
+            .input_text,
+        "三"
+    );
+    control.cancel(&third).unwrap();
+    done(&*control, &third).await;
+    assert_eq!(p.requests.lock().unwrap().len(), 3);
+    rig.stop().await;
+}
