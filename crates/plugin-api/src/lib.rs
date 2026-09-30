@@ -482,6 +482,7 @@ pub enum PluginError {
         plugin: PluginId,
         state: String,
     },
+    PluginNotFound(PluginId),
     PluginFailed {
         plugin: PluginId,
         message: String,
@@ -538,6 +539,7 @@ impl fmt::Display for PluginError {
             Self::InvalidLifecycle { plugin, state } => {
                 write!(f, "invalid lifecycle transition for {plugin}: {state}")
             }
+            Self::PluginNotFound(id) => write!(f, "plugin not found: {id}"),
             Self::PluginFailed { plugin, message } => {
                 write!(f, "plugin {plugin} failed: {message}")
             }
