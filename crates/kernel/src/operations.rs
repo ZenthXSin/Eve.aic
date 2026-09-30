@@ -5,7 +5,7 @@ use eve_plugin_api::{
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::sync::{OwnedMutexGuard, watch};
+use tokio::sync::{OwnedRwLockWriteGuard, watch};
 
 struct OperationEntry {
     id: LifecycleOperationId,
@@ -36,7 +36,7 @@ struct OperationGuard {
     entry: Arc<OperationEntry>,
     started: bool,
     completed: bool,
-    admission: Option<OwnedMutexGuard<()>>,
+    admission: Option<OwnedRwLockWriteGuard<()>>,
 }
 
 impl OperationGuard {
@@ -141,7 +141,7 @@ impl Kernel {
         let executor = tokio::runtime::Handle::try_current()
             .map_err(|_| PluginError::Lifecycle("生命周期操作需要运行中的 Tokio 执行器".into()))?;
         self.ensure_lifecycle_healthy()?;
-        let admission = self.inner.lifecycle.clone().lock_owned().await;
+        let admission = self.inner.lifecycle.clone().write_owned().await;
         // 从准入到 spawn 之间没有 await，同一次 poll 内完成登记及所有权转交。
         let entry = {
             let mut registry = self

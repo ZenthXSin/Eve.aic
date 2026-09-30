@@ -69,13 +69,34 @@ pub struct SessionFailure {
     pub started_tools: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "state", deny_unknown_fields)]
 pub enum SessionTurnStatus {
     Pending,
     Completed { messages: Vec<ChatMessage> },
     Failed { failure: SessionFailure },
     Interrupted,
+}
+
+impl<'de> Deserialize<'de> for SessionTurnStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // serde 的带内部标签 unit variant 会忽略其余字段；使用空 struct
+        // variant 解析，确保 Pending/Interrupted 也严格拒绝未知字段。
+        #[derive(Deserialize)]
+        #[serde(tag = "state", deny_unknown_fields)]
+        enum Wire {
+            Pending {},
+            Completed { messages: Vec<ChatMessage> },
+            Failed { failure: SessionFailure },
+            Interrupted {},
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Pending {} => Self::Pending,
+            Wire::Completed { messages } => Self::Completed { messages },
+            Wire::Failed { failure } => Self::Failed { failure },
+            Wire::Interrupted {} => Self::Interrupted,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -151,7 +172,7 @@ pub fn validate_completed_turn(input: &str, messages: &[ChatMessage]) -> Session
     }
     let middle = &messages[1..messages.len() - 1];
     if !middle.len().is_multiple_of(2)
-        || middle.chunks_exact(2).any(|pair| {
+        || middle.as_chunks::<2>().0.iter().any(|pair| {
             pair[0].role != ChatRole::Assistant
                 || pair[0].tool_calls.is_empty()
                 || pair[1].role != ChatRole::Tool
@@ -214,3 +235,52 @@ pub trait SessionService: Send + Sync {
 }
 #[derive(Clone)]
 pub struct SessionServiceHandle(pub Arc<dyn SessionService>);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn all_statuses_reject_unknown_fields_and_roundtrip() {
+        for status in [
+            SessionTurnStatus::Pending,
+            SessionTurnStatus::Interrupted,
+            SessionTurnStatus::Failed {
+                failure: SessionFailure {
+                    code: SessionFailureCode::Cancelled,
+                    started_tools: None,
+                },
+            },
+            SessionTurnStatus::Completed { messages: vec![] },
+        ] {
+            let mut encoded = serde_json::to_value(&status).unwrap();
+            assert_eq!(
+                serde_json::from_value::<SessionTurnStatus>(encoded.clone()).unwrap(),
+                status
+            );
+            encoded["unknown"] = json!(true);
+            assert!(serde_json::from_value::<SessionTurnStatus>(encoded).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_user_ids_and_incomplete_batches_are_rejected() {
+        for id in ["", " leading", "trailing ", "control\n", &"x".repeat(257)] {
+            assert_eq!(SessionKey::new(id, "u"), Err(SessionError::InvalidInput));
+            assert_eq!(SessionKey::new("s", id), Err(SessionError::InvalidInput));
+        }
+        assert!(SessionKey::new("中文会话", "中文用户").is_ok());
+        let valid = vec![
+            ChatMessage::text(ChatRole::User, "问题"),
+            ChatMessage::text(ChatRole::Assistant, "回复"),
+        ];
+        assert!(validate_completed_turn("问题", &valid).is_ok());
+        let mut incomplete = valid;
+        incomplete.insert(1, ChatMessage::text(ChatRole::Assistant, "多余消息"));
+        assert_eq!(
+            validate_completed_turn("问题", &incomplete),
+            Err(SessionError::InvalidInput)
+        );
+    }
+}

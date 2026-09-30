@@ -241,6 +241,8 @@ async fn refuses_corrupt_versioned_or_duplicate_state_without_resetting_bytes() 
     cases.push(serde_json::to_vec(&unknown).unwrap());
     let wrong = json!({"format_version":1,"sessions":{"s":{"key":{"session_id":"wrong","user_id":"u"},"revision":0,"turns":[]}}});
     cases.push(serde_json::to_vec(&wrong).unwrap());
+    let pending = json!({"format_version":1,"sessions":{"s":{"key":{"session_id":"s","user_id":"u"},"revision":1,"turns":[{"id":1,"input":"问题","status":{"state":"Pending","unknown":"secret"}}]}}});
+    cases.push(serde_json::to_vec(&pending).unwrap());
     for bytes in cases {
         let state = Arc::new(MemoryStateStore::default());
         state
@@ -256,6 +258,93 @@ async fn refuses_corrupt_versioned_or_duplicate_state_without_resetting_bytes() 
         let error = kernel.start(&id()).await.unwrap_err();
         assert!(!error.to_string().contains("secret"));
         assert_eq!(state.get(&id(), SESSION_STATE_KEY).unwrap(), Some(bytes));
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn rejects_bad_tool_pairing_revision_and_ids_from_real_file_without_rewriting() {
+    use eve_kernel::backends::FileStateStore;
+    let messages = vec![
+        ChatMessage::text(ChatRole::User, "问题"),
+        ChatMessage::assistant_tool_calls(vec![
+            ToolCall {
+                id: "b".into(),
+                name: "echo".into(),
+                arguments: json!({}),
+            },
+            ToolCall {
+                id: "a".into(),
+                name: "echo".into(),
+                arguments: json!({}),
+            },
+        ])
+        .unwrap(),
+        ChatMessage::tool_results(vec![
+            ToolResult::success("b", json!(1)).unwrap(),
+            ToolResult::success("a", json!(2)).unwrap(),
+        ])
+        .unwrap(),
+        ChatMessage::text(ChatRole::Assistant, "完成"),
+    ];
+    let snapshot = SessionSnapshot {
+        key: key("s", "u"),
+        revision: 2,
+        turns: vec![SessionTurn {
+            id: 1,
+            input: "问题".into(),
+            status: SessionTurnStatus::Completed { messages },
+        }],
+    };
+    let valid = json!({"format_version":1,"sessions":{"s":snapshot}});
+    let mut cases = vec![];
+    for location in ["swapped", "duplicate", "missing", "revision", "id"] {
+        let mut document = valid.clone();
+        let snapshot = &mut document["sessions"]["s"];
+        match location {
+            "swapped" => snapshot["turns"][0]["status"]["messages"][2]["tool_results"]
+                .as_array_mut()
+                .unwrap()
+                .swap(0, 1),
+            "duplicate" => {
+                snapshot["turns"][0]["status"]["messages"][1]["tool_calls"][1]["id"] = json!("b")
+            }
+            "missing" => {
+                snapshot["turns"][0]["status"]["messages"][2]["tool_results"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop();
+            }
+            "revision" => snapshot["revision"] = json!(3),
+            "id" => snapshot["turns"][0]["id"] = json!(2),
+            _ => unreachable!(),
+        }
+        cases.push(document);
+    }
+    for document in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStateStore::open(dir.path()).unwrap();
+        store
+            .set(
+                &id(),
+                SESSION_STATE_KEY.into(),
+                serde_json::to_vec(&document).unwrap(),
+            )
+            .unwrap();
+        drop(store);
+        let before = std::fs::read(dir.path().join("state.json")).unwrap();
+        let kernel = Kernel::with_services(KernelServices {
+            state: Arc::new(FileStateStore::open(dir.path()).unwrap()),
+            ..KernelServices::default()
+        });
+        kernel
+            .register(Box::new(SessionPlugin::new().unwrap()))
+            .unwrap();
+        assert!(kernel.start(&id()).await.is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join("state.json")).unwrap(),
+            before
+        );
         kernel.stop_all().await.unwrap();
     }
 }
