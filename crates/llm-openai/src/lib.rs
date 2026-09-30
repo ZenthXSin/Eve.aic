@@ -1,10 +1,11 @@
 //! OpenAI Responses 的文本与函数调用适配器；厂商格式不进入通用协议或 Kernel。
 //!
 //! 网络和转换均在返回的 Future 中执行。取消等待会丢弃本地请求，不保证远端停止。
-use eve_llm_api::{LlmError, LlmFuture, LlmProvider, ModelRequest, ModelResponse};
+use eve_llm_api::{LlmError, LlmFuture, LlmProvider, ModelRequest, ModelResponse, ModelTextSink};
 use reqwest::{Client, Url, header::HeaderValue, redirect::Policy};
 use std::time::Duration;
 
+mod stream;
 mod strict_json;
 mod wire;
 
@@ -127,8 +128,13 @@ impl OpenAiProvider {
         })
     }
 
-    async fn request(&self, request: ModelRequest) -> Result<ModelResponse, LlmError> {
+    async fn request(
+        &self,
+        request: ModelRequest,
+        sink: Option<&dyn ModelTextSink>,
+    ) -> Result<ModelResponse, LlmError> {
         let mut body = wire::encode_request(&self.config.model, request)?;
+        body["stream"] = serde_json::json!(sink.is_some());
         if let Some(effort) = &self.config.reasoning_effort {
             body["reasoning"] = serde_json::json!({"effort": effort});
         }
@@ -157,6 +163,44 @@ impl OpenAiProvider {
         {
             return Err(LlmError::Provider("OpenAI 响应超过字节上限".into()));
         }
+        if let Some(sink) = sink {
+            if response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_none_or(|v| {
+                    !v.split(';')
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .eq_ignore_ascii_case("text/event-stream")
+                })
+            {
+                return Err(LlmError::Protocol(
+                    "Responses 流必须使用 text/event-stream".into(),
+                ));
+            }
+            let mut parser = stream::Sse::new();
+            let mut state = stream::ResponseStream::default();
+            let mut received = 0;
+            while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+                if chunk.len() > self.config.max_response_bytes - received {
+                    return Err(LlmError::Provider("OpenAI 响应超过字节上限".into()));
+                }
+                received += chunk.len();
+                for byte in chunk {
+                    if let Some((name, data)) = parser.byte(byte)? {
+                        match state.event(&name, &data)? {
+                            stream::Update::None => {}
+                            stream::Update::Text(text) => sink.text_delta(text).await?,
+                            // 正常终态立即关闭本地流，不等 EOF，不重连、不重复执行。
+                            stream::Update::Completed(response) => return Ok(response),
+                        }
+                    }
+                }
+            }
+            return Err(LlmError::Protocol("Responses 流在正常终态前结束".into()));
+        }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
             if chunk.len() > self.config.max_response_bytes - bytes.len() {
@@ -170,7 +214,21 @@ impl OpenAiProvider {
 
 impl LlmProvider for OpenAiProvider {
     fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
-        Box::pin(self.request(request))
+        Box::pin(self.request(request, None))
+    }
+    fn stream<'a>(
+        &'a self,
+        request: ModelRequest,
+        sink: &'a dyn ModelTextSink,
+    ) -> LlmFuture<'a, ModelResponse> {
+        Box::pin(async move {
+            tokio::time::timeout(
+                self.config.request_timeout,
+                self.request(request, Some(sink)),
+            )
+            .await
+            .map_err(|_| LlmError::ProviderTimeout)?
+        })
     }
 }
 

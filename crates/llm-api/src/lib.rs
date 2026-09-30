@@ -430,6 +430,82 @@ impl std::error::Error for LlmError {}
 
 pub trait LlmProvider: Send + Sync {
     fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse>;
+
+    /// 增量仅供暂时显示；成功返回值才是经验证的完整请求终态。
+    /// 丢弃 Future 停止本地读取；不支持时明确失败，不自动降级。
+    fn stream<'a>(
+        &'a self,
+        _request: ModelRequest,
+        _sink: &'a dyn ModelTextSink,
+    ) -> LlmFuture<'a, ModelResponse> {
+        Box::pin(async { Err(LlmError::Unsupported("Provider 不支持流式输出".into())) })
+    }
+}
+
+pub trait ModelTextSink: Send + Sync {
+    fn text_delta(&self, text: String) -> LlmFuture<'_, ()>;
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ResponseMode {
+    #[default]
+    Complete,
+    Stream,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TurnEvent {
+    /// 普通宿主由调用方把接收器绑定一次调用；会话宿主附加持久化轮次 ID。
+    pub turn_id: Option<u64>,
+    pub kind: TurnEventKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TurnEventKind {
+    ProviderStarted {
+        request: usize,
+    },
+    TextDelta {
+        request: usize,
+        text: String,
+    },
+    ResponseCompleted {
+        request: usize,
+        response: ModelResponse,
+    },
+    ToolBatchStarted {
+        calls: Vec<ToolCall>,
+    },
+    /// 按原调用顺序报告结果；ordinal 从 0 开始，不代表真实完成时间。
+    ToolResult {
+        ordinal: usize,
+        result: ToolResult,
+    },
+    TurnCompleted {
+        text: String,
+    },
+    SessionSaved,
+    Failed {
+        error: LlmError,
+    },
+}
+
+/// 串行 await，无内置队列；桥接通道需使用有界队列，断开返回 Cancelled。
+/// 回调不能阻塞线程，也不能重入当前 Kernel 的生命周期操作。
+pub trait TurnEventSink: Send + Sync {
+    fn emit(&self, event: TurnEvent) -> LlmFuture<'_, ()>;
+    /// 通道断开信号；任意完成均视为 Cancelled。桥接通道应实现此方法，
+    /// 使宿主在等待网络或工具时也能发现接收端离开。默认永久等待。
+    fn closed(&self) -> LlmFuture<'_, ()> {
+        Box::pin(std::future::pending())
+    }
+}
+
+pub struct DiscardTurnEvents;
+impl TurnEventSink for DiscardTurnEvents {
+    fn emit(&self, _: TurnEvent) -> LlmFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

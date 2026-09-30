@@ -42,7 +42,7 @@ cargo run -p eve-runtime --example session_recovery -- <独立状态目录>
 
 `plugin-api` 定义契约，`kernel` 实现能力，`example-plugins` 演示插件，`runtime` 装配验收。详见[文档中心](./docs/README.md)。
 
-Responses 非流式文本/函数调用已通过真实验收，普通配置由插件提供。会话已通过本地多轮、HTTP 与进程恢复验收，见[会话恢复](./docs/会话恢复.md)。流式、reasoning 续传和消息打断待实现。
+Responses 非流式文本/函数调用已通过真实验收，普通配置由插件提供。会话已通过本地多轮、HTTP 与进程恢复验收，见[会话恢复](./docs/会话恢复.md)。流式与工具进度已有本地验收，见[流式输出](./docs/streaming.md)。reasoning 续传和消息打断待实现。
 
 当前支持单进程可信静态插件；权限检查不是沙箱。仅恢复字节状态，任务和服务由插件重建。退出时须显式停止并刷新日志。
 

@@ -20,4 +20,4 @@ serde_json.workspace = true
 tempfile.workspace = true
 eve-llm-openai = { path = "../llm-openai" }
 eve-session-plugin = { path = "../session-plugin" }
-tokio = { workspace = true, features = ["net", "io-util"] }
+tokio = { workspace = true, features = ["net", "io-util", "io-std"] }

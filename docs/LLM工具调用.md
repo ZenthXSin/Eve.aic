@@ -1,6 +1,6 @@
 # 最小 LLM 工具调用契约
 
-本文规定 Eve 的宿主、Provider 适配器和插件能力如何协作。Mock/Responses 闭环已实现，会话恢复的组合契约见[会话恢复](./会话恢复.md)；流式交互仍后置。
+本文规定 Eve 的宿主、Provider 适配器和插件能力如何协作。Mock/Responses 闭环已实现，会话恢复的组合契约见[会话恢复](./会话恢复.md)；流式与工具进度契约见[流式输出](./streaming.md)。
 
 ## 分层
 
@@ -101,7 +101,7 @@ Channel 输入
 
 `run_turn` 返回 `Result<TurnOutput, TurnFailure>`；成功返回文本、诊断与仅本轮的 transcript，失败返回 `LlmError` 与同一诊断。`TurnDiagnostics` 至少保存失败/完成阶段、已开始的 Provider 请求次数、工具批次数、已开始工具次数、每个调用 ID 与原始顺序、并发峰值和已生成的 `ToolResult`。诊断只在返回值内保存，不自动写日志或持久化，不保存密钥；调用者自行决定脱敏与留存。首版丢弃调用不保证取得报告。
 
-最小 LlmHost 不包含流式输出、跨批次并行、会话状态持久化、Jev 或新消息打断。SessionLlmHost 通过独立会话插件提供历史恢复。首版含批次内的协作式取消和逐项超时，但不保证强制终止或副作用回滚。会话控制与重规划由 Issue #29 处理；真实 Provider、最小状态恢复和 VCPToolBox 缺口回顾在 Issue #24 的后续切片交付。
+LlmHost 已提供可选流式输出与工具进度，不包含跨批次并行、会话状态持久化、Jev 或新消息打断。SessionLlmHost 通过独立会话插件提供历史恢复。首版含批次内的协作式取消和逐项超时，但不保证强制终止或副作用回滚。会话控制与重规划由 Issue #29 处理；真实 Provider、最小状态恢复和 VCPToolBox 缺口回顾在 Issue #24 的后续切片交付。
 
 ## 验收
 
