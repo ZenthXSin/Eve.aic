@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 pub const CONFIG_PLUGIN_ID: &str = "eve.config";
 pub const CONFIG_SERVICE_ID: &str = "eve.config.read.v1";
 pub const LLM_NAMESPACE: &str = "runtime.llm";
+pub const RESPONSE_MODE: &str = "response_mode";
 pub const MAX_PARALLEL_TOOL_CALLS: &str = "max_parallel_tool_calls";
 pub const DEFAULT_BACKUP_LIMIT: usize = 20;
 
@@ -128,10 +129,15 @@ pub fn runtime_llm_schema() -> ConfigSchema {
         Some(Value::from(10)),
     );
     field.environment = Some("EVE_LLM_MAX_PARALLEL_TOOL_CALLS".into());
+    let mut mode = ConfigField::new(ConfigKind::String, Some(Value::from("complete")));
+    mode.environment = Some("EVE_LLM_RESPONSE_MODE".into());
     ConfigSchema {
         namespace: LLM_NAMESPACE.into(),
         version: 1,
-        fields: BTreeMap::from([(MAX_PARALLEL_TOOL_CALLS.into(), field)]),
+        fields: BTreeMap::from([
+            (MAX_PARALLEL_TOOL_CALLS.into(), field),
+            (RESPONSE_MODE.into(), mode),
+        ]),
     }
 }
 
@@ -175,6 +181,7 @@ impl ConfigSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LlmRuntimeConfig {
     pub max_parallel_tool_calls: usize,
+    pub response_mode: String,
 }
 
 impl TryFrom<&ConfigSnapshot> for LlmRuntimeConfig {
@@ -189,7 +196,14 @@ impl TryFrom<&ConfigSnapshot> for LlmRuntimeConfig {
                 "{LLM_NAMESPACE}.{MAX_PARALLEL_TOOL_CALLS}"
             )));
         }
+        let response_mode: String = snapshot.get(RESPONSE_MODE)?;
+        if response_mode != "complete" && response_mode != "stream" {
+            return Err(ConfigError::InvalidValue(format!(
+                "{LLM_NAMESPACE}.{RESPONSE_MODE}"
+            )));
+        }
         Ok(Self {
+            response_mode,
             max_parallel_tool_calls: value,
         })
     }

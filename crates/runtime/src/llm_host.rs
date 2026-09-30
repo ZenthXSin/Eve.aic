@@ -4,10 +4,10 @@
 //! 服务仍通过 `plugin-api` 的公开注册表访问，业务插件不依赖本模块。
 use eve_kernel::{Kernel, RuntimeAdmissionGuard};
 use eve_llm_api::{
-    ChatMessage, ChatRole, ContextAssembler, ContextService, ContextSnapshot, LlmError,
-    LlmProvider, ModelRequest, ModelResponse, Tool, ToolBinding, ToolCall, ToolCancellation,
-    ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolFailureCode, ToolResult,
-    ToolService, TurnInput,
+    ChatMessage, ChatRole, ContextAssembler, ContextService, ContextSnapshot, LlmError, LlmFuture,
+    LlmProvider, ModelRequest, ModelResponse, ModelTextSink, ResponseMode, Tool, ToolBinding,
+    ToolCall, ToolCancellation, ToolConcurrency, ToolDefinition, ToolExecutionContext,
+    ToolFailureCode, ToolResult, ToolService, TurnEvent, TurnEventKind, TurnEventSink, TurnInput,
 };
 use eve_plugin_api::{
     Permission, PermissionChecker, PluginError, PluginId, PluginManifest, PluginState,
@@ -38,6 +38,9 @@ pub struct LlmHostConfig {
     pub tool_cancellation_grace: Duration,
     pub max_parallel_tool_calls: usize,
     pub max_tool_rounds: usize,
+    pub response_mode: ResponseMode,
+    pub event_timeout: Duration,
+    pub max_stream_text_bytes: usize,
 }
 
 impl Default for LlmHostConfig {
@@ -51,6 +54,9 @@ impl Default for LlmHostConfig {
             tool_cancellation_grace: Duration::from_millis(100),
             max_parallel_tool_calls: 10,
             max_tool_rounds: 1,
+            response_mode: ResponseMode::Complete,
+            event_timeout: Duration::from_secs(5),
+            max_stream_text_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -66,7 +72,9 @@ impl LlmHostConfig {
         if self.output_format.trim().is_empty() {
             return Err(LlmError::Configuration("输出格式不能为空".into()));
         }
-        if self.provider_timeout.is_zero()
+        if self.event_timeout.is_zero()
+            || self.max_stream_text_bytes == 0
+            || self.provider_timeout.is_zero()
             || self.tool_timeout.is_zero()
             || self.tool_cancellation_grace.is_zero()
             || self.max_parallel_tool_calls == 0
@@ -266,6 +274,69 @@ where
     .await
 }
 
+pub(crate) struct EventDelivery<'a> {
+    pub sink: &'a dyn TurnEventSink,
+    pub turn_id: Option<u64>,
+    pub timeout: Duration,
+}
+impl EventDelivery<'_> {
+    pub(crate) async fn emit(&self, kind: TurnEventKind) -> Result<(), LlmError> {
+        let event = TurnEvent {
+            turn_id: self.turn_id,
+            kind,
+        };
+        tokio::select! {
+            biased;
+            _ = contain_panic(async { self.sink.closed().await }) => Err(LlmError::Cancelled),
+            _ = tokio::time::sleep(self.timeout) => Err(LlmError::Cancelled),
+            result = contain_panic(async { self.sink.emit(event).await }) => result,
+        }
+    }
+}
+async fn emit(events: Option<&EventDelivery<'_>>, kind: TurnEventKind) -> Result<(), LlmError> {
+    if let Some(events) = events {
+        events.emit(kind).await?;
+    }
+    Ok(())
+}
+async fn wait_closed(events: Option<&EventDelivery<'_>>) {
+    if let Some(events) = events {
+        let _ = contain_panic(async { events.sink.closed().await }).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+struct TextDelivery<'a> {
+    events: Option<&'a EventDelivery<'a>>,
+    request: usize,
+    text: StdMutex<String>,
+    limit: usize,
+}
+impl ModelTextSink for TextDelivery<'_> {
+    fn text_delta(&self, text: String) -> LlmFuture<'_, ()> {
+        Box::pin(async move {
+            {
+                let mut combined = self
+                    .text
+                    .lock()
+                    .map_err(|_| LlmError::Backend("增量文本锁失效".into()))?;
+                if text.len() > self.limit - combined.len() {
+                    return Err(LlmError::Protocol("流式文本超过宿主字节上限".into()));
+                }
+                combined.push_str(&text);
+            }
+            emit(
+                self.events,
+                TurnEventKind::TextDelta {
+                    request: self.request,
+                    text,
+                },
+            )
+            .await
+        })
+    }
+}
+
 enum CallLookupError {
     Unavailable,
     OwnerMismatch,
@@ -343,7 +414,39 @@ impl LlmHost {
 
     pub async fn run_turn(&self, input: TurnInput) -> Result<TurnOutput, TurnFailure> {
         let admission = Arc::new(self.kernel.acquire_runtime_admission().await);
-        self.run_turn_inner(input, None, admission).await
+        self.run_turn_inner(input, None, admission, None).await
+    }
+
+    pub async fn run_turn_with_events(
+        &self,
+        input: TurnInput,
+        sink: &dyn TurnEventSink,
+    ) -> Result<TurnOutput, TurnFailure> {
+        let admission = Arc::new(self.kernel.acquire_runtime_admission().await);
+        let events = self.event_delivery(sink, None);
+        let result = self
+            .run_turn_inner(input, None, admission.clone(), Some(&events))
+            .await;
+        if let Err(failure) = &result {
+            let _ = events
+                .emit(TurnEventKind::Failed {
+                    error: failure.error.clone(),
+                })
+                .await;
+        }
+        result
+    }
+
+    pub(crate) fn event_delivery<'a>(
+        &self,
+        sink: &'a dyn TurnEventSink,
+        turn_id: Option<u64>,
+    ) -> EventDelivery<'a> {
+        EventDelivery {
+            sink,
+            turn_id,
+            timeout: self.config.event_timeout,
+        }
     }
 
     // 会话宿主已持有相同 Kernel 的准入锁，覆盖 Pending 到最终状态提交。
@@ -352,6 +455,7 @@ impl LlmHost {
         input: TurnInput,
         history: Option<Vec<ChatMessage>>,
         admission: Arc<RuntimeAdmissionGuard>,
+        events: Option<&EventDelivery<'_>>,
     ) -> Result<TurnOutput, TurnFailure> {
         let mut diagnostics = TurnDiagnostics::default();
         let mut prepared = match self.prepare(&input, &mut diagnostics).await {
@@ -381,13 +485,16 @@ impl LlmHost {
             messages: messages.clone(),
             tools: definitions,
         };
-        let response = match self.complete(request, &mut diagnostics).await {
+        let response = match self.complete(request, &mut diagnostics, events).await {
             Ok(value) => value,
             Err(error) => return Err(fail(error, diagnostics)),
         };
         if let ModelResponse::Final { text } = response {
             diagnostics.stage = TurnStage::Completed;
             transcript.push(ChatMessage::text(ChatRole::Assistant, text.clone()));
+            emit(events, TurnEventKind::TurnCompleted { text: text.clone() })
+                .await
+                .map_err(|error| fail(error, diagnostics.clone()))?;
             return Ok(TurnOutput {
                 text,
                 diagnostics,
@@ -408,8 +515,16 @@ impl LlmHost {
                 ordinal,
             })
             .collect();
+        emit(
+            events,
+            TurnEventKind::ToolBatchStarted {
+                calls: calls.clone(),
+            },
+        )
+        .await
+        .map_err(|error| fail(error, diagnostics.clone()))?;
         let results = match self
-            .execute_calls_ordered(&prepared.tools, &calls, &mut diagnostics, admission)
+            .execute_calls_ordered(&prepared.tools, &calls, &mut diagnostics, admission, events)
             .await
         {
             Ok(results) => results,
@@ -425,6 +540,11 @@ impl LlmHost {
         );
         transcript.extend_from_slice(&messages[messages.len() - 2..]);
         diagnostics.tool_results = results;
+        for (ordinal, result) in diagnostics.tool_results.iter().cloned().enumerate() {
+            emit(events, TurnEventKind::ToolResult { ordinal, result })
+                .await
+                .map_err(|error| fail(error, diagnostics.clone()))?;
+        }
         let response = match self
             .complete(
                 ModelRequest {
@@ -436,6 +556,7 @@ impl LlmHost {
                         .collect(),
                 },
                 &mut diagnostics,
+                events,
             )
             .await
         {
@@ -446,6 +567,9 @@ impl LlmHost {
             ModelResponse::Final { text } => {
                 diagnostics.stage = TurnStage::Completed;
                 transcript.push(ChatMessage::text(ChatRole::Assistant, text.clone()));
+                emit(events, TurnEventKind::TurnCompleted { text: text.clone() })
+                    .await
+                    .map_err(|error| fail(error, diagnostics.clone()))?;
                 Ok(TurnOutput {
                     text,
                     diagnostics,
@@ -507,22 +631,56 @@ impl LlmHost {
         &self,
         request: ModelRequest,
         diagnostics: &mut TurnDiagnostics,
+        events: Option<&EventDelivery<'_>>,
     ) -> Result<ModelResponse, LlmError> {
         request.validate()?;
+        let request_number = diagnostics.provider_requests + 1;
+        emit(
+            events,
+            TurnEventKind::ProviderStarted {
+                request: request_number,
+            },
+        )
+        .await?;
         diagnostics.provider_requests += 1;
-        let provider = self.provider.clone();
-        let future = catch_unwind(AssertUnwindSafe(|| provider.complete(request)))
-            .map_err(|_| LlmError::Provider("Provider 请求发生异常".into()))?;
+        let text = TextDelivery {
+            events,
+            request: request_number,
+            text: StdMutex::new(String::new()),
+            limit: self.config.max_stream_text_bytes,
+        };
+        let future = contain_panic(async {
+            match self.config.response_mode {
+                ResponseMode::Complete => self.provider.complete(request).await,
+                ResponseMode::Stream => self.provider.stream(request, &text).await,
+            }
+        });
         let response = tokio::select! {
             biased;
-            _ = tokio::time::sleep(self.config.provider_timeout) => {
-                return Err(LlmError::ProviderTimeout);
-            }
-            response = contain_panic(future) => {
-                response?
-            }
+            _ = tokio::time::sleep(self.config.provider_timeout) => return Err(LlmError::ProviderTimeout),
+            _ = wait_closed(events) => return Err(LlmError::Cancelled),
+            response = future => response?,
         };
         response.validate()?;
+        if self.config.response_mode == ResponseMode::Stream {
+            let combined = text
+                .text
+                .lock()
+                .map_err(|_| LlmError::Backend("增量文本锁失效".into()))?;
+            match &response {
+                ModelResponse::Final { text } if text == &*combined => {}
+                ModelResponse::ToolCalls { .. } if combined.is_empty() => {}
+                _ => return Err(LlmError::Protocol("流式增量与完整输出不一致".into())),
+            }
+        }
+        emit(
+            events,
+            TurnEventKind::ResponseCompleted {
+                request: request_number,
+                response: response.clone(),
+            },
+        )
+        .await?;
         Ok(response)
     }
 
@@ -556,6 +714,7 @@ impl LlmHost {
         calls: &[ToolCall],
         diagnostics: &mut TurnDiagnostics,
         admission: Arc<RuntimeAdmissionGuard>,
+        events: Option<&EventDelivery<'_>>,
     ) -> Result<Vec<ToolResult>, LlmError> {
         let by_name = prepared
             .iter()
@@ -718,24 +877,59 @@ impl LlmHost {
                 }),
             });
         }
-        for task in &mut tasks.tasks {
-            match (&mut task.handle).await {
-                Ok(result) => results[task.index] = Some(result),
-                Err(error) => {
-                    results[task.index] = Some(
-                        ToolResult::failure(
+        for position in 0..tasks.tasks.len() {
+            let result = tokio::select! {
+                biased;
+                _ = wait_closed(events) => None,
+                result = &mut tasks.tasks[position].handle => Some(result),
+            };
+            if result.is_none() {
+                // 取消后等待剩余 Future 析构，使开始计数和副作用诊断稳定。
+                for task in &tasks.tasks[position..] {
+                    task.cancellation.cancel();
+                    task.handle.abort();
+                }
+                for task in &mut tasks.tasks[position..] {
+                    let result = match (&mut task.handle).await {
+                        Ok(result) => result,
+                        Err(error) => ToolResult::failure(
                             task.call_id.clone(),
-                            ToolFailureCode::ExecutionFailed,
+                            if error.is_panic() {
+                                ToolFailureCode::ExecutionFailed
+                            } else {
+                                ToolFailureCode::Cancelled
+                            },
                             if error.is_panic() {
                                 "工具执行异常"
                             } else {
-                                "tool execution cancelled"
+                                "事件消费者已离开，工具等待已取消"
                             },
                         )
-                        .expect("call id validated"),
-                    );
+                        .expect("validated call id"),
+                    };
+                    results[task.index] = Some(result);
                 }
+                diagnostics.started_tools += started.load(Ordering::SeqCst);
+                diagnostics.peak_parallelism = diagnostics
+                    .peak_parallelism
+                    .max(peak.load(Ordering::SeqCst));
+                diagnostics.tool_results = results.into_iter().flatten().collect();
+                return Err(LlmError::Cancelled);
             }
+            let task = &tasks.tasks[position];
+            results[task.index] = Some(match result.expect("completed task") {
+                Ok(result) => result,
+                Err(error) => ToolResult::failure(
+                    task.call_id.clone(),
+                    ToolFailureCode::ExecutionFailed,
+                    if error.is_panic() {
+                        "工具执行异常"
+                    } else {
+                        "tool execution cancelled"
+                    },
+                )
+                .expect("call id validated"),
+            });
         }
         diagnostics.started_tools += started.load(Ordering::SeqCst);
         diagnostics.peak_parallelism = diagnostics

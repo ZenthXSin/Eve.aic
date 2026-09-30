@@ -6,9 +6,10 @@ use eve_config_api::{
 use eve_config_plugin::{ConfigBootstrap, ConfigPlugin};
 use eve_kernel::{Kernel, KernelServices};
 use eve_llm_api::{
-    ContextAssembler, ContextService, ContextSnapshot, LlmFuture, Tool, ToolBinding, ToolCall,
-    ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolFuture, ToolOutput, ToolService,
-    ToolValidationError, TurnInput,
+    ContextAssembler, ContextService, ContextSnapshot, LlmError, LlmFuture, ResponseMode, Tool,
+    ToolBinding, ToolCall, ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolFuture,
+    ToolOutput, ToolService, ToolValidationError, TurnEvent, TurnEventKind, TurnEventSink,
+    TurnInput,
 };
 use eve_llm_openai::{OpenAiConfig, OpenAiProvider};
 use eve_plugin_api::{
@@ -152,6 +153,32 @@ impl Plugin for ExamplePlugin {
     }
 }
 
+struct ConsoleEvents(tokio::sync::Mutex<tokio::io::Stderr>);
+impl TurnEventSink for ConsoleEvents {
+    fn emit(&self, event: TurnEvent) -> LlmFuture<'_, ()> {
+        Box::pin(async move {
+            use tokio::io::AsyncWriteExt;
+            let message = match event.kind {
+                TurnEventKind::TextDelta { text, .. } => text,
+                TurnEventKind::ToolBatchStarted { calls } => {
+                    format!("已收到 {} 个工具调用。\n", calls.len())
+                }
+                TurnEventKind::ToolResult { ordinal, .. } => {
+                    format!("工具结果 {} 已收集。\n", ordinal + 1)
+                }
+                TurnEventKind::TurnCompleted { .. } => "\n轮次已生成。\n".into(),
+                _ => return Ok(()),
+            };
+            self.0
+                .lock()
+                .await
+                .write_all(message.as_bytes())
+                .await
+                .map_err(|_| LlmError::Backend("控制台进度投递失败".into()))
+        })
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
@@ -208,13 +235,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bindings = if tool_mode { vec![ToolBinding { name:"echo".into(), service_id:ServiceId::new(TOOL)?, expected_owner:owner.clone() }] } else { vec![] };
         let host = LlmHost::new(Arc::new(provider),registry.clone(),kernel.clone(),permissions,
             ContextBinding { service_id:ServiceId::new(CONTEXT)?, expected_owner:owner.clone() },bindings,
-            LlmHostConfig { provider_timeout:timeout, max_parallel_tool_calls:runtime.max_parallel_tool_calls,
+            LlmHostConfig { response_mode: if runtime.response_mode == "stream" { ResponseMode::Stream } else { ResponseMode::Complete }, provider_timeout:timeout, max_parallel_tool_calls:runtime.max_parallel_tool_calls,
                 system_prompt:"你是 Eve 验收助手。严格遵循用户指定的测试步骤。需要调用工具时先只返回函数调用，不要同时输出文本。".into(), ..LlmHostConfig::default() })?;
         let prompt = if tool_mode {
             "请恰好调用一次 echo 工具，text 参数为 Eve 真实工具测试。不要自己生成 receipt。收到工具结果后，最终回复只输出工具返回的 receipt。"
         } else { "不要调用工具，只回复 EVE_TEXT_OK。" };
         let started = std::time::Instant::now();
-        let output = host.run_turn(TurnInput { text:prompt.into() }).await.map_err(|failure| failure.error)?;
+        let output = host.run_turn_with_events(TurnInput { text:prompt.into() }, &ConsoleEvents(tokio::sync::Mutex::new(tokio::io::stderr()))).await.map_err(|failure| failure.error)?;
         if tool_mode {
             let receipt = receipt.lock().map_err(|_| "receipt 锁失效")?.clone().ok_or("模型未执行工具")?;
             if output.diagnostics.provider_requests != 2 || output.diagnostics.started_tools != 1

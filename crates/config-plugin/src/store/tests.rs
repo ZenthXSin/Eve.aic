@@ -502,3 +502,49 @@ fn dangling_and_regular_symlinks_are_not_treated_as_new_config() {
     ));
     assert_eq!(fs::read_to_string(&target).unwrap(), "{}");
 }
+
+#[test]
+fn response_mode_uses_defaults_environment_file_and_rejects_unknown_mode() {
+    for (environment, file, expected) in [
+        (None, None, "complete"),
+        (Some("stream"), None, "stream"),
+        (Some("stream"), Some("complete"), "complete"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut options = bootstrap(directory.path());
+        if let Some(mode) = environment {
+            options.environment = Some(BTreeMap::from([(
+                "EVE_LLM_RESPONSE_MODE".into(),
+                mode.into(),
+            )]));
+        }
+        if let Some(mode) = file {
+            let mut values = overrides(10);
+            values
+                .get_mut(LLM_NAMESPACE)
+                .unwrap()
+                .values
+                .insert("response_mode".into(), Value::from(mode));
+            write_stored(
+                directory.path(),
+                ConfigDocument {
+                    revision: 1,
+                    namespaces: values,
+                },
+            );
+        }
+        let service = FileConfigService::open(&options).unwrap();
+        let mut snapshot = service.snapshot(LLM_NAMESPACE, 1).unwrap();
+        assert_eq!(
+            LlmRuntimeConfig::try_from(&snapshot).unwrap().response_mode,
+            expected
+        );
+        snapshot
+            .values
+            .insert("response_mode".into(), Value::from("typo"));
+        assert!(matches!(
+            LlmRuntimeConfig::try_from(&snapshot),
+            Err(ConfigError::InvalidValue(_))
+        ));
+    }
+}

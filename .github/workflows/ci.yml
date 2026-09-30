@@ -75,6 +75,29 @@ jobs:
           }
       - name: 验证 OpenAI 本地 HTTP 与插件工具闭环
         run: cargo run -p eve-runtime --example openai_offline --locked
+      - name: 验证 Responses SSE、插件工具与会话保存
+        run: cargo run -p eve-runtime --example streaming_offline --locked
+      - name: 验证流式跨进程恢复及取消输入过滤
+        run: |
+          $streamDirectory = Join-Path $env:RUNNER_TEMP "eve-stream-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          function Invoke-Stream([string] $Mode) {
+            $output = @(& cargo run -p eve-runtime --example session_recovery --locked -- $streamDirectory $Mode)
+            if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "流式进程验收失败" }
+            Write-Host $output[0]
+            return ($output[0] | ConvertFrom-Json -AsHashtable)
+          }
+          $first = Invoke-Stream "--stream"
+          $second = Invoke-Stream "--stream"
+          $cancelled = Invoke-Stream "--cancel-stream"
+          $last = Invoke-Stream "--stream"
+          if ($first.turn_id -ne 1 -or $first.tool_executions -ne 1 -or $first.saved_events -ne 1 -or $first.provider_requests -ne 2) { throw "首次流式工具往返不符" }
+          if ($second.turn_id -ne 2 -or $second.history_messages -ne 4 -or $second.tool_executions -ne 0 -or $second.saved_events -ne 1) { throw "流式历史恢复不符" }
+          if ($cancelled.mode -ne "cancelled" -or $cancelled.turn_id -ne 3 -or $cancelled.history_messages -ne 6 -or $cancelled.tool_executions -ne 0 -or $cancelled.saved_events -ne 0) { throw "流取消结果不符" }
+          if ($last.turn_id -ne 4 -or $last.history_messages -ne 6 -or $last.tool_executions -ne 0 -or $last.saved_events -ne 1) { throw "取消输入过滤或旧工具次数不符" }
+          $state = Get-Content -LiteralPath (Join-Path $streamDirectory "state.json") -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
+          $document = [System.Text.Encoding]::UTF8.GetString([byte[]] $state.entries["eve.session"]["sessions.v1"]) | ConvertFrom-Json -AsHashtable
+          $snapshot = $document.sessions["demo-session"]
+          if ($snapshot.revision -ne 8 -or $snapshot.turns[2].status.state -ne "Failed" -or $snapshot.turns[2].status.failure.code -ne "Cancelled") { throw "实际取消记录未正确保存" }
       - name: 验证会话与工具历史跨进程恢复及中断
         run: |
           $sessionDirectory = Join-Path $env:RUNNER_TEMP "eve-session-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"

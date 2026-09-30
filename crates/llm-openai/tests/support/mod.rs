@@ -100,11 +100,14 @@ impl Server {
                     } else {
                         format!("Content-Length: {}", reply.declared_length.unwrap_or(reply.body.len()))
                     };
+                    let content_type = reply.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, v)| v.as_str()).unwrap_or("application/json");
                     let mut headers = format!(
-                        "HTTP/1.1 {} Fixture\r\nConnection: close\r\nContent-Type: application/json\r\n{size}\r\n",
+                        "HTTP/1.1 {} Fixture\r\nConnection: close\r\nContent-Type: {content_type}\r\n{size}\r\n",
                         reply.status
                     );
                     for (key, value) in reply.headers {
+                        if key.eq_ignore_ascii_case("content-type") { continue; }
                         headers.push_str(&format!("{key}: {value}\r\n"));
                     }
                     headers.push_str("\r\n");

@@ -1,6 +1,6 @@
 # OpenAI Responses 接入
 
-已实现 `eve-llm-openai`，依赖 `eve-llm-api` 的公开契约，通过 `reqwest 0.12.28` 发送非流式 Responses HTTP 请求。Kernel 和业务插件不依赖厂商格式或 HTTP 客户端。当前完成转换、本地 HTTP、Runtime 工具循环和取消验收；真实模型验证见下方集成验收记录。
+已实现 `eve-llm-openai`，依赖 `eve-llm-api` 的公开契约，通过 `reqwest 0.12.28` 发送 Responses HTTP 或 SSE 请求，默认非流式。Kernel 和业务插件不依赖厂商格式或 HTTP 客户端。当前完成转换、本地 HTTP、Runtime 工具循环和取消验收；真实模型验证见下方集成验收记录。
 
 ## 宿主装配
 
@@ -21,12 +21,12 @@ let provider = OpenAiProvider::new(OpenAiConfig::new(model), credential)?;
 
 - 请求：有序 system/user/assistant 文本；assistant 函数调用批次与恰好配对的结果；名称排序后的函数定义。适配器仅接受 1–64 字节的 ASCII 字母/数字/下划线/连字符函数名，不通过改名修正。
 - 映射：`ToolCall.id` 保存 `call_id`，而非输出 item 的 `id`；对象参数序列化为 arguments 字符串。成功值序列化为 JSON 字符串；失败为 `{"error":{"code":"InvalidArguments","message":"…"}}` 形式。批次调用与结果顺序保持不变。
-- 每次发送完整上下文；设置 `parallel_tool_calls: true`、`strict: false`、`store: false`、`stream: false`，不使用 `previous_response_id`。不补写或删除插件 Schema 的 required 字段，参数仍由工具本地校验。
+- 每次发送完整上下文；设置 `parallel_tool_calls: true`、`strict: false`、`store: false`，`stream` 由宿主模式决定（默认 false），不使用 `previous_response_id`。不补写或删除插件 Schema 的 required 字段，参数仍由工具本地校验。
 - 回复：单个 assistant 消息中的纯 output_text，或仅包含 function_call 的完整批次。同消息文本分块按序拼接；批次完整解析并校验后才返回宿主，不提前执行部分调用。
 - 消息的 `phase: final_answer` 映射为 Eve 的 `Final`，assistant 文本历史以 final_answer 回传；system/user 不添加 phase。缺失或 null phase 保持兼容；commentary 和未知 phase 明确拒绝。
 - reasoning、内置工具、混合文本/函数调用、refusal、非空 annotations、函数 namespace 和多个文本消息返回 `Unsupported`。这些信息不能被当前 Eve 协议保留；后续需扩展适配器私有续传状态或通用契约，当前不会静默丢弃。
 
-不预设固定模型名或保证所有 OpenAI 模型兼容。模型返回上述不支持的内容时会明确失败；支持 reasoning 续传与流式输出另行交付。`store: false` 只控制响应状态保存，不代表服务端零保留。
+不预设固定模型名或保证所有 OpenAI 模型兼容。模型返回上述不支持的内容时会明确失败；reasoning 续传另行交付；流式文本与函数子集见流式输出协议。`store: false` 只控制响应状态保存，不代表服务端零保留。
 
 ## 错误、期限与取消
 
@@ -112,3 +112,5 @@ CI 只使用回环 HTTP 夹具和确定性 Mock，不读取真实凭据。真实
 ## 会话历史的离线验收
 
 SessionLlmHost 已在文件后端重建后，用本地 Responses HTTP 服务器验收第二轮历史：保留旧 function_call / function_call_output、顺序、参数、成功回执和失败结果，assistant 文本携带 final_answer；旧工具执行次数为 0。该验证不使用 previous_response_id，也不代表已经完成真实 API 多轮兼容性验收。详见[会话恢复](./会话恢复.md)。
+
+流式请求、严格 SSE 支持子集及事件消费详见[流式输出](./streaming.md)。当前真实验收记录仅涵盖既有非流式文本与工具模式，SSE 本地验收不能代替代理/模型的实测。

@@ -1,6 +1,6 @@
 //! 组合层会话宿主；状态业务由可替换 SessionService 实现，模型仍由 LlmHost 调用。
 use crate::{LlmHost, TurnFailure, TurnOutput};
-use eve_llm_api::{LlmError, TurnInput};
+use eve_llm_api::{LlmError, TurnEventKind, TurnEventSink, TurnInput};
 use eve_plugin_api::{LogEntry, LogLevel, LogRecord, Logger, PluginId, PluginState, ServiceId};
 use eve_session_api::{
     SESSION_PLUGIN_ID, SESSION_SERVICE_ID, SessionError, SessionFailure, SessionFailureCode,
@@ -36,6 +36,11 @@ pub enum SessionRunError {
         error: SessionError,
         output: Box<TurnOutput>,
     },
+    /// 会话已保存，但通知投递失败；返回完整输出，不应自动重跑。
+    Delivery {
+        error: LlmError,
+        output: Box<SessionTurnOutput>,
+    },
     FailureRecord {
         error: SessionError,
         failure: TurnFailure,
@@ -47,6 +52,7 @@ impl fmt::Display for SessionRunError {
             Self::Session(error) => error.fmt(f),
             Self::Turn(failure) => failure.error.fmt(f),
             Self::Commit { error, .. } => write!(f, "回复已生成但会话保存失败：{error}"),
+            Self::Delivery { error, .. } => write!(f, "会话已保存但通知投递失败：{error}"),
             Self::FailureRecord { error, .. } => write!(f, "执行失败且状态保存失败：{error}"),
         }
     }
@@ -141,10 +147,40 @@ impl SessionLlmHost {
         &self,
         input: SessionInput,
     ) -> Result<SessionTurnOutput, SessionRunError> {
+        self.run_inner(input, None).await
+    }
+    pub async fn run_turn_with_events(
+        &self,
+        input: SessionInput,
+        sink: &dyn TurnEventSink,
+    ) -> Result<SessionTurnOutput, SessionRunError> {
+        self.run_inner(input, Some(sink)).await
+    }
+    async fn run_inner(
+        &self,
+        input: SessionInput,
+        sink: Option<&dyn TurnEventSink>,
+    ) -> Result<SessionTurnOutput, SessionRunError> {
         let admission = Arc::new(self.host.kernel.acquire_runtime_admission().await);
-        let service = self.service()?;
         let text = input.text.clone();
-        let started = service.begin(input)?;
+        let beginning = self
+            .service()
+            .and_then(|service| service.begin(input).map(|started| (service, started)));
+        let (service, started) = match beginning {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(sink) = sink {
+                    let _ = self
+                        .host
+                        .event_delivery(sink, None)
+                        .emit(TurnEventKind::Failed {
+                            error: LlmError::Backend("会话轮次尚未开始".into()),
+                        })
+                        .await;
+                }
+                return Err(SessionRunError::Session(error));
+            }
+        };
         let mut guard = LeaseGuard {
             service: service.clone(),
             lease: started.lease.clone(),
@@ -152,9 +188,15 @@ impl SessionLlmHost {
             logger: self.logger.clone(),
             owner: self.binding.expected_owner.clone(),
         };
+        let events = sink.map(|sink| self.host.event_delivery(sink, Some(started.lease.turn_id)));
         let result = self
             .host
-            .run_turn_inner(TurnInput { text }, Some(started.history), admission.clone())
+            .run_turn_inner(
+                TurnInput { text },
+                Some(started.history),
+                admission.clone(),
+                events.as_ref(),
+            )
             .await;
         let result = match result {
             Ok(output) => match service.complete(&started.lease, output.transcript.clone()) {
@@ -180,6 +222,30 @@ impl SessionLlmHost {
         };
         // 显式提交失败仍保留 Pending；不能由析构的 Cancelled 覆盖真实结果。
         guard.armed = false;
+        if let Some(events) = events {
+            match result {
+                Ok(output) => {
+                    if let Err(error) = events.emit(TurnEventKind::SessionSaved).await {
+                        return Err(SessionRunError::Delivery {
+                            error,
+                            output: Box::new(output),
+                        });
+                    }
+                    return Ok(output);
+                }
+                Err(error) => {
+                    let llm_error = match &error {
+                        SessionRunError::Turn(failure)
+                        | SessionRunError::FailureRecord { failure, .. } => failure.error.clone(),
+                        _ => LlmError::Backend("会话保存失败，不能自动重试本轮".into()),
+                    };
+                    let _ = events
+                        .emit(TurnEventKind::Failed { error: llm_error })
+                        .await;
+                    return Err(error);
+                }
+            }
+        }
         result
     }
 }
