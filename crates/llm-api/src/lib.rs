@@ -27,6 +27,7 @@ pub enum ChatRole {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub text: Option<String>,
@@ -231,6 +232,7 @@ impl ToolConcurrency {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -255,6 +257,7 @@ impl ToolCall {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolResult {
     pub call_id: String,
     pub output: ToolOutput,
@@ -295,6 +298,7 @@ impl ToolResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ToolOutput {
     Success(Value),
     Failure {

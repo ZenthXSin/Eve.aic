@@ -75,6 +75,31 @@ jobs:
           }
       - name: 验证 OpenAI 本地 HTTP 与插件工具闭环
         run: cargo run -p eve-runtime --example openai_offline --locked
+      - name: 验证会话与工具历史跨进程恢复及中断
+        run: |
+          $sessionDirectory = Join-Path $env:RUNNER_TEMP "eve-session-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          function Invoke-Session([string] $Mode) {
+            if ($Mode -eq "pending") {
+              $output = @(& cargo run -p eve-runtime --example session_recovery --locked -- $sessionDirectory --leave-pending)
+            } else {
+              $output = @(& cargo run -p eve-runtime --example session_recovery --locked -- $sessionDirectory)
+            }
+            if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "会话进程验收失败" }
+            Write-Host $output[0]
+            return ($output[0] | ConvertFrom-Json -AsHashtable)
+          }
+          $first = Invoke-Session "completed"
+          if ($first.turn_id -ne 1 -or $first.history_messages -ne 0 -or $first.tool_executions -ne 1 -or $first.provider_requests -ne 2) { throw "首次工具轮次结果不符" }
+          $second = Invoke-Session "completed"
+          if ($second.turn_id -ne 2 -or $second.history_messages -ne 4 -or $second.tool_executions -ne 0 -or $second.provider_requests -ne 1) { throw "会话历史未恢复或旧工具被重放" }
+          $pending = Invoke-Session "pending"
+          if ($pending.mode -ne "pending" -or $pending.turn_id -ne 3 -or $pending.history_messages -ne 6 -or $pending.tool_executions -ne 0 -or $pending.provider_requests -ne 0) { throw "未完成轮次构造不符" }
+          $recovered = Invoke-Session "completed"
+          if ($recovered.turn_id -ne 4 -or $recovered.history_messages -ne 6 -or $recovered.interrupted -ne 1 -or $recovered.tool_executions -ne 0) { throw "Pending 恢复或失败输入过滤不符" }
+          $state = Get-Content -LiteralPath (Join-Path $sessionDirectory "state.json") -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
+          $document = [System.Text.Encoding]::UTF8.GetString([byte[]] $state.entries["eve.session"]["sessions.v1"]) | ConvertFrom-Json -AsHashtable
+          $snapshot = $document.sessions["demo-session"]
+          if ($document.format_version -ne 1 -or $snapshot.revision -ne 8 -or $snapshot.turns.Count -ne 4 -or $snapshot.turns[2].status.state -ne "Interrupted" -or $snapshot.turns[0].status.messages.Count -ne 4) { throw "实际磁盘会话记录不符" }
       - name: 验证两次独立进程恢复状态
         run: |
           function Assert-SavedCounter([string] $Directory, [string] $ExpectedStarts) {

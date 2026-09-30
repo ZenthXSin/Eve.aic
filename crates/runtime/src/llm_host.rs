@@ -2,7 +2,7 @@
 //!
 //! 本模块负责将已经注册的 Provider、Context 和 Tool 服务组合为一次请求。
 //! 服务仍通过 `plugin-api` 的公开注册表访问，业务插件不依赖本模块。
-use eve_kernel::Kernel;
+use eve_kernel::{Kernel, RuntimeAdmissionGuard};
 use eve_llm_api::{
     ChatMessage, ChatRole, ContextAssembler, ContextService, ContextSnapshot, LlmError,
     LlmProvider, ModelRequest, ModelResponse, Tool, ToolBinding, ToolCall, ToolCancellation,
@@ -13,11 +13,11 @@ use eve_plugin_api::{
     Permission, PermissionChecker, PluginError, PluginId, PluginManifest, PluginState,
     RuntimeInspector, ServiceId, ServiceRegistry,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::task::Poll;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
@@ -125,6 +125,8 @@ impl Default for TurnDiagnostics {
 pub struct TurnOutput {
     pub text: String,
     pub diagnostics: TurnDiagnostics,
+    /// 本轮用户输入、配对工具调用/结果和最终回复，不含系统提示或旧历史。
+    pub transcript: Vec<ChatMessage>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -150,24 +152,43 @@ enum ScopeKey {
 }
 
 struct SerialQueue {
-    tail: Mutex<Option<Arc<Notify>>>,
+    pending: StdMutex<VecDeque<Arc<()>>>,
+    changed: Notify,
 }
 
 struct SerialTicket {
-    predecessor: Option<Arc<Notify>>,
-    release: Arc<Notify>,
+    queue: Arc<SerialQueue>,
+    identity: Arc<()>,
 }
 
 impl Drop for SerialTicket {
     fn drop(&mut self) {
-        self.release.notify_one();
+        self.queue
+            .pending
+            .lock()
+            .expect("串行队列锁有效")
+            .retain(|identity| !Arc::ptr_eq(identity, &self.identity));
+        self.queue.changed.notify_waiters();
     }
 }
 
 impl SerialTicket {
     async fn wait_turn(&self) {
-        if let Some(predecessor) = &self.predecessor {
-            predecessor.notified().await;
+        loop {
+            let changed = self.queue.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self
+                .queue
+                .pending
+                .lock()
+                .expect("串行队列锁有效")
+                .front()
+                .is_some_and(|identity| Arc::ptr_eq(identity, &self.identity))
+            {
+                return;
+            }
+            changed.await;
         }
     }
 }
@@ -216,19 +237,19 @@ async fn issue_serial_ticket(
             .entry(scope)
             .or_insert_with(|| {
                 Arc::new(SerialQueue {
-                    tail: Mutex::new(None),
+                    pending: StdMutex::new(VecDeque::new()),
+                    changed: Notify::new(),
                 })
             })
             .clone()
     };
-    let mut tail = queue.tail.lock().await;
-    let predecessor = tail.take();
-    let release = Arc::new(Notify::new());
-    *tail = Some(release.clone());
-    SerialTicket {
-        predecessor,
-        release,
-    }
+    let identity = Arc::new(());
+    queue
+        .pending
+        .lock()
+        .expect("串行队列锁有效")
+        .push_back(identity.clone());
+    SerialTicket { queue, identity }
 }
 
 async fn contain_panic<T, F>(future: F) -> Result<T, LlmError>
@@ -270,12 +291,14 @@ enum PermissionFailure {
 
 pub struct LlmHost {
     provider: Arc<dyn LlmProvider>,
-    registry: Arc<dyn ServiceRegistry>,
-    kernel: Kernel,
+    pub(crate) registry: Arc<dyn ServiceRegistry>,
+    pub(crate) kernel: Kernel,
     permissions: Arc<dyn PermissionChecker>,
     context: ContextBinding,
     bindings: Vec<ToolBinding>,
     config: LlmHostConfig,
+    tool_slots: Arc<Semaphore>,
+    serial_scopes: Arc<Mutex<HashMap<ScopeKey, Arc<SerialQueue>>>>,
 }
 
 impl LlmHost {
@@ -312,17 +335,42 @@ impl LlmHost {
             permissions,
             context,
             bindings,
+            tool_slots: Arc::new(Semaphore::new(config.max_parallel_tool_calls)),
+            serial_scopes: Arc::new(Mutex::new(HashMap::new())),
             config,
         })
     }
 
     pub async fn run_turn(&self, input: TurnInput) -> Result<TurnOutput, TurnFailure> {
-        let _admission = self.kernel.acquire_runtime_admission().await;
+        let admission = Arc::new(self.kernel.acquire_runtime_admission().await);
+        self.run_turn_inner(input, None, admission).await
+    }
+
+    // 会话宿主已持有相同 Kernel 的准入锁，覆盖 Pending 到最终状态提交。
+    pub(crate) async fn run_turn_inner(
+        &self,
+        input: TurnInput,
+        history: Option<Vec<ChatMessage>>,
+        admission: Arc<RuntimeAdmissionGuard>,
+    ) -> Result<TurnOutput, TurnFailure> {
         let mut diagnostics = TurnDiagnostics::default();
-        let prepared = match self.prepare(&input, &mut diagnostics).await {
+        let mut prepared = match self.prepare(&input, &mut diagnostics).await {
             Ok(value) => value,
             Err(error) => return Err(fail(error, diagnostics)),
         };
+        if let Some(history) = history {
+            if !prepared.context.history.is_empty() {
+                return Err(fail(
+                    LlmError::Context("会话模式只允许会话服务提供历史".into()),
+                    diagnostics,
+                ));
+            }
+            prepared.context.history = history;
+            if let Err(error) = validate_context(&prepared.context) {
+                return Err(fail(error, diagnostics));
+            }
+        }
+        let mut transcript = vec![ChatMessage::text(ChatRole::User, input.text.clone())];
         let mut messages = build_messages(&self.config, &prepared.context, &input);
         let definitions = prepared
             .tools
@@ -339,7 +387,12 @@ impl LlmHost {
         };
         if let ModelResponse::Final { text } = response {
             diagnostics.stage = TurnStage::Completed;
-            return Ok(TurnOutput { text, diagnostics });
+            transcript.push(ChatMessage::text(ChatRole::Assistant, text.clone()));
+            return Ok(TurnOutput {
+                text,
+                diagnostics,
+                transcript,
+            });
         }
         let ModelResponse::ToolCalls { calls } = response else {
             unreachable!()
@@ -356,7 +409,7 @@ impl LlmHost {
             })
             .collect();
         let results = match self
-            .execute_calls_ordered(&prepared.tools, &calls, &mut diagnostics)
+            .execute_calls_ordered(&prepared.tools, &calls, &mut diagnostics, admission)
             .await
         {
             Ok(results) => results,
@@ -370,6 +423,7 @@ impl LlmHost {
             ChatMessage::tool_results(results.clone())
                 .map_err(|error| fail(error, diagnostics.clone()))?,
         );
+        transcript.extend_from_slice(&messages[messages.len() - 2..]);
         diagnostics.tool_results = results;
         let response = match self
             .complete(
@@ -391,7 +445,12 @@ impl LlmHost {
         match response {
             ModelResponse::Final { text } => {
                 diagnostics.stage = TurnStage::Completed;
-                Ok(TurnOutput { text, diagnostics })
+                transcript.push(ChatMessage::text(ChatRole::Assistant, text.clone()));
+                Ok(TurnOutput {
+                    text,
+                    diagnostics,
+                    transcript,
+                })
             }
             ModelResponse::ToolCalls { .. } => Err(fail(LlmError::RoundLimit, diagnostics)),
         }
@@ -496,13 +555,14 @@ impl LlmHost {
         prepared: &[PreparedTool],
         calls: &[ToolCall],
         diagnostics: &mut TurnDiagnostics,
+        admission: Arc<RuntimeAdmissionGuard>,
     ) -> Result<Vec<ToolResult>, LlmError> {
         let by_name = prepared
             .iter()
             .map(|tool| (tool.binding.name.clone(), tool))
             .collect::<HashMap<_, _>>();
-        let semaphore = Arc::new(Semaphore::new(self.config.max_parallel_tool_calls));
-        let scopes = Arc::new(Mutex::new(HashMap::<ScopeKey, Arc<SerialQueue>>::new()));
+        let semaphore = self.tool_slots.clone();
+        let scopes = &self.serial_scopes;
         let mut results = vec![None; calls.len()];
         let mut ready = Vec::with_capacity(calls.len());
         let started = Arc::new(AtomicUsize::new(0));
@@ -604,6 +664,9 @@ impl LlmHost {
             }
             let scope = match definition.concurrency {
                 Some(ToolConcurrency::ParallelSafe) => None,
+                Some(ToolConcurrency::Serial { scope }) if scope == "eve.default" => {
+                    Some(ScopeKey::Default)
+                }
                 Some(ToolConcurrency::Serial { scope }) => Some(ScopeKey::Named(scope)),
                 None => Some(ScopeKey::Default),
             };
@@ -618,13 +681,15 @@ impl LlmHost {
         // Only after validation, reserve serial tickets and start tasks.
         for prepared_call in &mut ready {
             if let Some(scope) = prepared_call.scope.take() {
-                prepared_call.ticket = Some(issue_serial_ticket(&scopes, scope).await);
+                prepared_call.ticket = Some(issue_serial_ticket(scopes, scope).await);
             }
         }
         let mut tasks = ToolTaskGuard {
             tasks: Vec::with_capacity(ready.len()),
         };
         for prepared_call in ready {
+            // 取消外层 Future 后，停止操作仍需等到已创建的工具任务真正析构。
+            let admission = admission.clone();
             let context = ToolExecutionContext::new();
             let cancellation = context.cancellation_handle();
             let call_id = prepared_call.call.id.clone();
@@ -642,6 +707,7 @@ impl LlmHost {
                 call_id,
                 cancellation,
                 handle: tokio::spawn(async move {
+                    let _admission = admission;
                     run_tool(
                         prepared_call.service,
                         prepared_call.call,
@@ -829,17 +895,19 @@ fn validate_context(context: &ContextSnapshot) -> Result<(), LlmError> {
     if context.revision.trim().is_empty() {
         return Err(LlmError::Context("context revision cannot be empty".into()));
     }
-    if context.history.iter().any(|message| {
-        !matches!(message.role, ChatRole::User | ChatRole::Assistant)
-            || message
-                .text
-                .as_ref()
-                .is_none_or(|text| text.trim().is_empty())
-            || !message.tool_calls.is_empty()
-            || !message.tool_results.is_empty()
-    }) {
+    if context
+        .history
+        .iter()
+        .any(|message| message.role == ChatRole::System)
+        || (ModelRequest {
+            messages: context.history.clone(),
+            tools: vec![],
+        })
+        .validate()
+        .is_err()
+    {
         return Err(LlmError::Context(
-            "history must contain complete user or assistant text messages".into(),
+            "历史必须是有效用户/助手消息或完整配对的工具调用与结果".into(),
         ));
     }
     Ok(())

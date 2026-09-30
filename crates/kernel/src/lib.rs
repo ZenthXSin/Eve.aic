@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{
-    Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, OwnedMutexGuard as OwnedAsyncMutexGuard,
+    Mutex as AsyncMutex, OwnedRwLockReadGuard, RwLock as AsyncRwLock, RwLockWriteGuard,
 };
 
 // 保留原导出路径，生命周期定义归入契约层。
@@ -77,7 +77,7 @@ impl Default for KernelConfig {
 
 #[derive(Default)]
 struct KernelInner {
-    lifecycle: Arc<AsyncMutex<()>>,
+    lifecycle: Arc<AsyncRwLock<()>>,
     operations: Mutex<operations::OperationRegistry>,
     plugins: Mutex<HashMap<PluginId, Arc<PluginSlot>>>,
     services: KernelServices,
@@ -93,7 +93,7 @@ pub struct Kernel {
 /// Lifecycle operations through any clone of the same Kernel wait for this guard.
 #[must_use = "dropping the guard releases runtime admission"]
 pub struct RuntimeAdmissionGuard {
-    _guard: OwnedAsyncMutexGuard<()>,
+    _guard: OwnedRwLockReadGuard<()>,
 }
 
 impl Kernel {
@@ -172,22 +172,24 @@ impl Kernel {
     }
 
     /// 注册表变更与生命周期操作及运行期准入串行化，避免变更跨越状态快照。
-    fn registration_guard(&self, action: &'static str) -> PluginResult<AsyncMutexGuard<'_, ()>> {
+    fn registration_guard(&self, action: &'static str) -> PluginResult<RwLockWriteGuard<'_, ()>> {
         self.ensure_lifecycle_healthy()?;
         self.inner
             .lifecycle
-            .try_lock()
+            .try_write()
             .map_err(|_| PluginError::Lifecycle(format!("生命周期操作正在执行，{action}")))
     }
 
-    /// Reserve lifecycle admission for a complete runtime operation.
+    /// Reserve shared lifecycle admission for a complete runtime operation.
     ///
     /// `start`, `stop`, and related asynchronous lifecycle operations through any clone
     /// of this Kernel wait until the returned guard is dropped. Synchronous plugin
     /// registration and unregistration fail while the guard is held.
+    /// Other runtime operations may hold read admission concurrently; queued lifecycle
+    /// writers prevent admission of later operations until the writer has completed.
     pub async fn acquire_runtime_admission(&self) -> RuntimeAdmissionGuard {
         RuntimeAdmissionGuard {
-            _guard: self.inner.lifecycle.clone().lock_owned().await,
+            _guard: self.inner.lifecycle.clone().read_owned().await,
         }
     }
 

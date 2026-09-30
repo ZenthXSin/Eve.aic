@@ -107,3 +107,8 @@ CI 只使用回环 HTTP 夹具和确定性 Mock，不读取真实凭据。真实
 工具结果只有执行后才产生 receipt；第二次模型请求成功返回同一值，计数与结果均由示例断言。发现并修复系统代理 CA 与 final_answer phase 的兼容问题；TLS 验证保持启用。最终代码通过工作区 174 项测试及文档测试、严格 Clippy、格式、Rust 1.89 所有目标与本地 HTTP 示例；其中适配器和 Runtime HTTP 相关测试共 24 项。
 
 本次验证仅覆盖上述非流式、关闭 reasoning 的最小闭环，不证明 reasoning 续传、会话恢复、流式回复、消息打断或密钥引用已实现。凭据仅用于本地宿主环境，不进入配置文件、仓库、PR、Issue 或验收记录。
+
+
+## 会话历史的离线验收
+
+SessionLlmHost 已在文件后端重建后，用本地 Responses HTTP 服务器验收第二轮历史：保留旧 function_call / function_call_output、顺序、参数、成功回执和失败结果，assistant 文本携带 final_answer；旧工具执行次数为 0。该验证不使用 previous_response_id，也不代表已经完成真实 API 多轮兼容性验收。详见[会话恢复](./会话恢复.md)。

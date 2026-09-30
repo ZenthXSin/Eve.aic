@@ -1,6 +1,6 @@
 # 最小 LLM 工具调用契约
 
-本文是 Issue #31 的实现前契约。它规定 Eve 的宿主、Provider 适配器和插件能力如何协作；不表示真实模型、会话恢复或流式交互已经实现。
+本文规定 Eve 的宿主、Provider 适配器和插件能力如何协作。Mock/Responses 闭环已实现，会话恢复的组合契约见[会话恢复](./会话恢复.md)；流式交互仍后置。
 
 ## 分层
 
@@ -19,7 +19,7 @@
 
 - `ChatMessage`：枚举表示 `system`、`user`、`assistant`、`tool` 四种角色。文本消息保存 `String`；assistant 工具调用保存完整、有序的 `Vec<ToolCall>`，tool 消息保存同序的 `Vec<ToolResult>`，不能仅用工具名或文本代替关联信息。
 - `ModelRequest { messages: Vec<ChatMessage>, tools: Vec<ToolDefinition> }`：消息有序，工具按名称稳定排序。模型名称、密钥和厂商配置由适配器持有，不进入消息协议。
-- `ToolDefinition { name: String, description: String, argument_schema: Value, required_permissions: Vec<Permission>, concurrency: Option<ToolConcurrency> }`：名称非空且在宿主内唯一；参数契约是描述对象参数的 JSON Schema 对象。首版由工具的 `validate_arguments` 实现所声明的约束，不宣称提供通用 JSON Schema 引擎。`ToolConcurrency::ParallelSafe` 表示实现可与其他调用同时运行；`Serial { scope: String }` 表示同一非空作用域中的本地 Tool Future 按模型返回顺序互斥。省略声明等价于 `Serial { scope: "eve.default" }`。声明共享可变资源的工具必须使用同一串行作用域；不同显式作用域可以在宿主并发上限内同时运行。该声明不是远端资源锁：超时或取消后已发出的请求仍可能继续产生副作用，工具须自行保证幂等、互斥或补偿。
+- `ToolDefinition { name: String, description: String, argument_schema: Value, required_permissions: Vec<Permission>, concurrency: Option<ToolConcurrency> }`：名称非空且在宿主内唯一；参数契约是描述对象参数的 JSON Schema 对象。首版由工具的 `validate_arguments` 实现所声明的约束，不宣称提供通用 JSON Schema 引擎。`ToolConcurrency::ParallelSafe` 表示实现可与其他调用同时运行；`Serial { scope: String }` 表示同一非空作用域中的本地 Tool Future 按模型返回顺序互斥。省略声明等价于 `Serial { scope: "eve.default" }`。同一 LlmHost 的串行队列和工具执行槽位跨轮次/会话共享，单批内部仍按模型顺序预留；跨批次按预留顺序排队，取消队列中间项不能越过在途项。多个独立 Host 不共享调度器。声明共享可变资源的工具必须使用同一串行作用域；不同显式作用域可以在宿主并发上限内同时运行。该声明不是远端资源锁：超时或取消后已发出的请求仍可能继续产生副作用，工具须自行保证幂等、互斥或补偿。
 - `ToolCall { id: String, name: String, arguments: Value }`：ID 与名称非空，参数必须是 JSON 对象。
 - `ToolResult { call_id: String, output: ToolOutput }`：`ToolOutput::Success(Value)` 或 `Failure { code: ToolFailureCode, message: String }`；ID 必须与请求相同，失败说明必须可安全回传。一个 `ToolCalls` 批次后若继续请求 Provider，必须追加恰好一个同长度、有相同顺序的 `ToolResults` 消息：第 `i` 个结果的 `call_id` 必须等于第 `i` 个调用的 ID，包括宿主合成的所有失败结果。
 - `ModelResponse`：`Final { text: String }` 或 `ToolCalls { calls: Vec<ToolCall> }`。调用批次不能为空，批次内调用 ID 必须唯一；调用顺序是结果回传和串行调度的规范顺序。空白最终文本、空白 ID/名称、重复 ID、JSON 解析失败或非对象参数为协议错误；合法对象未通过工具约束则是 `InvalidArguments` 工具失败，两者不可混用。
@@ -45,7 +45,7 @@
 
 Active 快照不是执行租约，服务 `Arc` 也不能阻止 Scope 被清理。每次 `run_turn` 持有同一 Kernel 的运行准入锁直到整轮结束；通过任意 Kernel 克隆提交的启动、停止等异步生命周期操作都会等待本轮完成，同步注册和卸载则在运行期间返回生命周期错误。整轮正常结束、失败或被取消都会释放准入锁。每轮开始前，绑定的插件应已注册并处于 Active 状态；外层组合层可在两轮之间通过 Kernel 克隆管理插件。Provider 或工具不得在本轮内等待同一 Kernel 的生命周期操作，以免形成重入等待。后台任务不得替换本轮服务。
 
-工具 Future 由宿主直接等待，不会自动成为 TaskManager 中的任务。每个调用在通过分项预检、取得并发槽位且即将首次轮询其 Future 时开始计算 `LlmHostConfig.tool_timeout`；排队中的调用尚未开始，不计入该期限或“已开始工具次数”。期限届满时，宿主先设置该调用的取消标记，在正数 `tool_cancellation_grace` 内继续轮询供工具收尾；期限在同一轮询点与正常完成同时就绪时，期限优先。收尾窗口结束后丢弃尚未完成的 Future，固定生成 `TimedOut` 失败结果，其他同批调用继续。调度器只有在 Future 正常完成或已在收尾窗口后被丢弃时才释放其本地串行作用域；它不保证超时后远端副作用不与后续同作用域调用重叠。调用者丢弃 `run_turn` 时，宿主为所有未完成调用设置取消标记并立即丢弃本地 Provider 与 Tool Future，停止整轮，不再发起第二次 Provider 请求或保证取得诊断；随后 gate 可以释放，后续生命周期操作同样不构成对未确认远端副作用的锁。这不保证工具或远端系统已经停止，也不回滚已发生的副作用。工具应异步、响应取消且可结束。可打断会话和执行租约留待后续契约处理，不增加 Kernel 的模型职责。
+工具 Future 由宿主直接等待，不会自动成为 TaskManager 中的任务。每个调用在通过分项预检、取得并发槽位且即将首次轮询其 Future 时开始计算 `LlmHostConfig.tool_timeout`；排队中的调用尚未开始，不计入该期限或“已开始工具次数”。期限届满时，宿主先设置该调用的取消标记，在正数 `tool_cancellation_grace` 内继续轮询供工具收尾；期限在同一轮询点与正常完成同时就绪时，期限优先。收尾窗口结束后丢弃尚未完成的 Future，固定生成 `TimedOut` 失败结果，其他同批调用继续。调度器只有在 Future 正常完成或已在收尾窗口后被丢弃时才释放其本地串行作用域；它不保证超时后远端副作用不与后续同作用域调用重叠。调用者丢弃 `run_turn` 时，宿主为所有未完成调用设置取消标记并立即丢弃本地 Provider 与 Tool Future，停止整轮，不再发起第二次 Provider 请求或保证取得诊断；工具任务持有共享准入引用直到其 Future 真正析构，随后 gate 才能完全释放；后续生命周期操作不构成对未确认远端副作用的锁。这不保证工具或远端系统已经停止，也不回滚已发生的副作用。工具应异步、响应取消且可结束。可打断会话和执行租约留待后续契约处理，不增加 Kernel 的模型职责。
 
 首个 `LlmHost` 直接接收 `TurnInput`、返回 `TurnOutput` 或 `TurnFailure`，不在 `eve-llm-api` 定义 Channel Service。Channel 插件是组合层调用者，负责把输入转成 `TurnInput` 并将最终文本送回用户；它不参与 Provider 或工具协议。Memory 插件同样由 Context 插件按自己的公开依赖读取，宿主只接受已经组成的动态快照。
 
@@ -99,9 +99,9 @@ Channel 输入
 
 `LlmHostConfig` 的 Provider 超时、工具超时、工具取消收尾窗口和最大并发数均为正数；`max_parallel_tool_calls` 默认值为 `10`。组合层在本轮开始前从配置能力取得并校验这些值，形成不可变快照；确定性 Mock 切片可直接显式构造已校验配置。配置服务的命名空间、来源合并、自举和不可用策略由 Issue #32 定义，不能由 LLM 宿主私自解析环境变量或静默回退。每次 Provider 请求在 `complete` 返回且即将首次轮询其 Future 时独立开始计时；期限在同一轮询点与完成同时就绪时，期限优先，宿主丢弃该 Future 并返回 `LlmError::ProviderTimeout`，不自动重试。调用者丢弃 `run_turn` 时同样丢弃在途 Provider Future。上述本地取消均不能证明远端已停止或不会计费；也不能回滚已经完成的工具副作用。
 
-`run_turn` 返回 `Result<TurnOutput, TurnFailure>`；成功保存文本与诊断，失败保存 `LlmError` 与同一诊断。`TurnDiagnostics` 至少保存失败/完成阶段、已开始的 Provider 请求次数、工具批次数、已开始工具次数、每个调用 ID 与原始顺序、并发峰值和已生成的 `ToolResult`。诊断只在返回值内保存，不自动写日志或持久化，不保存密钥；调用者自行决定脱敏与留存。首版丢弃调用不保证取得报告。
+`run_turn` 返回 `Result<TurnOutput, TurnFailure>`；成功返回文本、诊断与仅本轮的 transcript，失败返回 `LlmError` 与同一诊断。`TurnDiagnostics` 至少保存失败/完成阶段、已开始的 Provider 请求次数、工具批次数、已开始工具次数、每个调用 ID 与原始顺序、并发峰值和已生成的 `ToolResult`。诊断只在返回值内保存，不自动写日志或持久化，不保存密钥；调用者自行决定脱敏与留存。首版丢弃调用不保证取得报告。
 
-首版不包含流式输出、跨批次并行、会话状态恢复、Jev 或新消息打断。首版含批次内的协作式取消和逐项超时，但不保证强制终止或副作用回滚。会话控制与重规划由 Issue #29 处理；真实 Provider、最小状态恢复和 VCPToolBox 缺口回顾在 Issue #24 的后续切片交付。
+最小 LlmHost 不包含流式输出、跨批次并行、会话状态持久化、Jev 或新消息打断。SessionLlmHost 通过独立会话插件提供历史恢复。首版含批次内的协作式取消和逐项超时，但不保证强制终止或副作用回滚。会话控制与重规划由 Issue #29 处理；真实 Provider、最小状态恢复和 VCPToolBox 缺口回顾在 Issue #24 的后续切片交付。
 
 ## 验收
 
@@ -109,7 +109,7 @@ Channel 输入
 
 ## 首个 OpenAI 适配器
 
-已在独立 `eve-llm-openai` crate 实现 Responses API + `reqwest 0.12.28` 的小型 HTTP 适配器，并锁定 Rust 1.89 可编译的依赖。映射与网络层独立测试，厂商类型只存在于适配器，Kernel、通用 plugin-api 和工具插件不依赖 HTTP 客户端。2026-09-30 已复核官方函数调用、Responses 迁移与数据控制文档；真实模型兼容性仍需手动 smoke test。选择记录见 ADR-0029；配置、错误和验收命令见[OpenAI 接入](./OpenAI接入.md)。
+已在独立 `eve-llm-openai` crate 实现 Responses API + `reqwest 0.12.28` 的小型 HTTP 适配器，并锁定 Rust 1.89 可编译的依赖。映射与网络层独立测试，厂商类型只存在于适配器，Kernel、通用 plugin-api 和工具插件不依赖 HTTP 客户端。2026-09-30 已复核官方函数调用、Responses 迁移与数据控制文档；真实文本与工具闭环已完成 smoke test；会话多轮的真实 API 验收仍后置。选择记录见 ADR-0029；配置、错误和验收命令见[OpenAI 接入](./OpenAI接入.md)。
 
 Eve 的工具定义映射为 Responses 的 function 工具；`ToolCall.id` 对应 `call_id`，JSON arguments 解析后进入对象参数；成功值或结构化失败序列化为 `function_call_output.output`，保留同一 `call_id`。请求设置 `parallel_tool_calls: true`，适配器完整保留同一响应中的调用顺序与每个 `call_id`。首版显式 `strict: false` 以保留插件 Schema 原意，仍强制本地参数校验；不能替插件增删 required 字段。
 
