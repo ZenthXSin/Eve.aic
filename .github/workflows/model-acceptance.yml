@@ -1,6 +1,10 @@
 name: 主模型真实多轮验收
 
 on:
+  workflow_run:
+    workflows: ["Rust 持续集成"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       model:
@@ -23,8 +27,18 @@ concurrency:
 
 jobs:
   check:
-    # 只执行已合入主线且经过 CI 的代码，不读取 PR 分支的凭据。
-    if: github.ref == 'refs/heads/main'
+    # 本次标记合并的首次主线 CI 成功后运行一次；其他自动事件跳过。
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.run_attempt == 1 &&
+        startsWith(github.event.workflow_run.head_commit.message,
+                   '运行核心主模型真实验收（2026-10-01 第一次）')))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -41,6 +55,7 @@ jobs:
       - name: 检出主线
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           persist-credentials: false
       - name: 安装 Rust
         run: rustup toolchain install 1.89.0 --profile minimal
@@ -49,8 +64,8 @@ jobs:
       - name: 验收多轮与新进程恢复
         env:
           EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
-          EVE_OPENAI_MODEL: ${{ inputs.model }}
-          EVE_OPENAI_REASONING_EFFORT: ${{ inputs.reasoning_effort }}
+          EVE_OPENAI_MODEL: ${{ github.event_name == 'workflow_run' && 'gpt-5.6-sol' || inputs.model }}
+          EVE_OPENAI_REASONING_EFFORT: ${{ github.event_name == 'workflow_run' && 'none' || inputs.reasoning_effort }}
           EVE_OPENAI_TIMEOUT_SECONDS: "120"
           EVE_OPENAI_MAX_OUTPUT_TOKENS: "512"
           EVE_LLM_RESPONSE_MODE: complete
