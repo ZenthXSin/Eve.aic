@@ -44,7 +44,7 @@ jobs:
       - name: 安装 Rust
         run: rustup toolchain install 1.89.0 --profile minimal
       - name: 构建核心入口
-        run: cargo +1.89.0 build -p eve-app --bin eve --locked
+        run: cargo +1.89.0 build -p eve-app --bin eve --example model_acceptance --locked
       - name: 验收多轮与新进程恢复
         env:
           EVE_OPENAI_BASE_URL: ${{ secrets.EVE_OPENAI_BASE_URL }}
@@ -54,7 +54,7 @@ jobs:
           EVE_OPENAI_TIMEOUT_SECONDS: "120"
           EVE_OPENAI_MAX_OUTPUT_TOKENS: "512"
           EVE_LLM_RESPONSE_MODE: complete
-        run: cargo +1.89.0 run -p eve-app --example model_acceptance --locked -- "$RUNNER_TEMP/eve-model-check"
+        run: ./target/debug/examples/model_acceptance "$RUNNER_TEMP/eve-model-check"
       - name: 保留无正文的验收报告
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
