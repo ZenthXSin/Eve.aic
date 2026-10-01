@@ -273,12 +273,14 @@ pub fn run(
     {
         return Err(CheckError::new("preflight", "invalid_options"));
     }
-    let mut builder = fs::DirBuilder::new();
+    let builder = fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = builder;
         builder.mode(0o700);
-    }
+        builder
+    };
     builder.create(&options.directory).map_err(|e| {
         CheckError::new(
             "preflight",
