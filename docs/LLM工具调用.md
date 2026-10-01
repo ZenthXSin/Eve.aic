@@ -51,7 +51,7 @@ Active 快照不是执行租约，服务 `Arc` 也不能阻止 Scope 被清理�
 
 ## 上下文布局
 
-固定系统规则与输出格式由 `LlmHostConfig` 保存，配置版本非空；工具定义来自装配预检后的快照。Context 插件只返回 `ContextSnapshot { revision: String, profile: String, memories: Vec<String>, history: Vec<ChatMessage> }`，revision 非空，其他动态槽位允许为空。首版 history 只接受已完成的 user/assistant 文本消息，不接受 system 指令或未配对的工具历史。Runtime 是唯一的布局执行者，顺序固定为：
+固定系统规则与输出格式由 `LlmHostConfig` 保存，配置版本非空；当前实现尚未自动读取 `AGENT.md`。后续可将 `AGENT.md` 作为组合层的稳定身份提示词来源，但必须保留显式配置覆盖和来源版本记录。工具定义来自装配预检后的快照。Context 插件只返回 `ContextSnapshot { revision: String, profile: String, memories: Vec<String>, history: Vec<ChatMessage> }`，revision 非空，其他动态槽位允许为空。首版 history 只接受已完成的 user/assistant 文本消息，不接受 system 指令或未配对的工具历史。Runtime 是唯一的布局执行者，顺序固定为：
 
 1. 系统规则和输出格式。
 2. 名称稳定排序后的工具定义。
