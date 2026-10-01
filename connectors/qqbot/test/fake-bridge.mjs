@@ -6,6 +6,7 @@ if (process.env.EVE_OPENAI_API_KEY || process.argv.some(x => x.includes("test-ap
   throw new Error("model_credentials_leaked");
 }
 const send = frame => process.stdout.write(JSON.stringify({ version: 1, ...frame }) + "\n");
+if (scenario.pid_file) fs.writeFileSync(scenario.pid_file, String(process.pid));
 let index = 0;
 const emitNext = () => {
   if (index < scenario.messages.length) send({ type: "message", ...scenario.messages[index] });

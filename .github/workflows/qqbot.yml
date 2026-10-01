@@ -36,20 +36,11 @@ jobs:
         run: npm test
       - name: 安装 Rust
         run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt --component clippy
-      - name: 格式化与编译首版（格式结果用于提交）
+      - name: 验证通道依赖构建
         run: |
-          cargo +1.89.0 fmt --all
+          cargo +1.89.0 fmt --all -- --check
           cargo +1.89.0 check --workspace --all-targets --locked
       - name: 实际 Eve QQBot 进程验收
         run: |
           cargo +1.89.0 build -p eve-app --bin eve-qqbot --locked
           python3 connectors/qqbot/test/eve_e2e.py
-      - name: 记录格式化文件以供同步
-        if: always()
-        run: |
-          python3 - <<'PY'
-          import json, pathlib, subprocess
-          paths = subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines()
-          files = {p: pathlib.Path(p).read_text() for p in paths if p.endswith(".rs")}
-          print("EVE_FORMATTED_FILES=" + json.dumps(files, ensure_ascii=True))
-          PY
