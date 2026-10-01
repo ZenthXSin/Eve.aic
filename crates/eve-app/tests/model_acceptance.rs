@@ -324,10 +324,10 @@ async fn chat_defaults_complete_tool_round_trip_and_restore_in_a_new_process() {
     };
     let mut server = Server::start(vec![
         Reply::json(json!({"choices":[{"index":0,"finish_reason":"tool_calls",
-            "message":{"role":"assistant","content":null,"tool_calls":[
-                {"id":"check-echo","type":"function","function":{"name":"echo",
-                    "arguments":json!({"text":MARKER}).to_string()}}
-            ]}}]})),
+        "message":{"role":"assistant","content":null,"tool_calls":[
+            {"id":"check-echo","type":"function","function":{"name":"echo",
+                "arguments":json!({"text":MARKER}).to_string()}}
+        ]}}]})),
         chat_final(),
         chat_final(),
         chat_final(),
@@ -360,7 +360,11 @@ async fn chat_defaults_complete_tool_round_trip_and_restore_in_a_new_process() {
     assert_eq!(checked["revision_after"], 6);
     assert_eq!(checked["history_prefix_unchanged"], true);
     let initial = server.next().await;
-    assert!(initial.headers.starts_with("POST /v1/chat/completions HTTP/1.1"));
+    assert!(
+        initial
+            .headers
+            .starts_with("POST /v1/chat/completions HTTP/1.1")
+    );
     let first = initial.body;
     assert_eq!(first["model"], "deepseek-v4.1-flash");
     assert_eq!(first["tools"][0]["function"]["name"], "echo");
@@ -405,10 +409,10 @@ async fn chat_incomplete_reply_never_executes_partial_tool_batch() {
     let root = fixture();
     let mut server = Server::start(vec![
         Reply::json(json!({"choices":[{"index":0,"finish_reason":"length",
-            "message":{"role":"assistant","content":null,"tool_calls":[
-                {"id":"check-echo","type":"function","function":{"name":"echo",
-                    "arguments":json!({"text":MARKER}).to_string()}}
-            ]}}]})),
+        "message":{"role":"assistant","content":null,"tool_calls":[
+            {"id":"check-echo","type":"function","function":{"name":"echo",
+                "arguments":json!({"text":MARKER}).to_string()}}
+        ]}}]})),
         Reply::json(json!({"choices":[{"index":0,"finish_reason":"stop",
             "message":{"role":"assistant","content":"后续输入"}}]})),
     ])
@@ -435,7 +439,12 @@ async fn chat_incomplete_reply_never_executes_partial_tool_batch() {
     server.next().await;
     let next = server.next().await.body;
     assert_eq!(
-        next["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "tool").count(),
+        next["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .count(),
         0
     );
     assert!(server.requests.try_recv().is_err());

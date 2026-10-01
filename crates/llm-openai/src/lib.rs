@@ -56,8 +56,8 @@ impl OpenAiConfig {
 
     /// 宿主可提供 API 根地址、版本路径或完整所选协议 URL。
     pub fn with_base_url(mut self, base: &str) -> Result<Self, LlmError> {
-        let mut url = Url::parse(base)
-            .map_err(|_| LlmError::Configuration("OpenAI base URL 无效".into()))?;
+        let mut url =
+            Url::parse(base).map_err(|_| LlmError::Configuration("OpenAI base URL 无效".into()))?;
         let (suffix, other) = match self.protocol {
             OpenAiProtocol::Responses => ("/responses", "/chat/completions"),
             OpenAiProtocol::ChatCompletions => ("/chat/completions", "/responses"),
@@ -159,7 +159,9 @@ impl OpenAiProvider {
         sink: Option<&dyn ModelTextSink>,
     ) -> Result<ModelResponse, LlmError> {
         if sink.is_some() && self.config.protocol == OpenAiProtocol::ChatCompletions {
-            return Err(LlmError::Unsupported("Chat Completions 流式尚未接入".into()));
+            return Err(LlmError::Unsupported(
+                "Chat Completions 流式尚未接入".into(),
+            ));
         }
         let mut body = match self.config.protocol {
             OpenAiProtocol::Responses => wire::encode_request(&self.config.model, request)?,

@@ -54,8 +54,8 @@ pub(crate) fn encode_request(model: &str, request: ModelRequest) -> Result<Value
 }
 
 pub(crate) fn decode_response(bytes: &[u8]) -> Result<ModelResponse, LlmError> {
-    let response: Value = crate::strict_json::from_slice(bytes)
-        .map_err(|_| protocol("Chat 响应不是有效 JSON"))?;
+    let response: Value =
+        crate::strict_json::from_slice(bytes).map_err(|_| protocol("Chat 响应不是有效 JSON"))?;
     if response.get("error").is_some_and(|v| !v.is_null()) {
         return Err(LlmError::Provider("Chat 响应返回错误".into()));
     }
@@ -99,7 +99,9 @@ pub(crate) fn decode_response(bytes: &[u8]) -> Result<ModelResponse, LlmError> {
             .get(key)
             .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
         {
-            return Err(unsupported("通用协议不能保留 Chat reasoning 或其他附加内容"));
+            return Err(unsupported(
+                "通用协议不能保留 Chat reasoning 或其他附加内容",
+            ));
         }
     }
     let text = match message.get("content") {
@@ -134,7 +136,9 @@ pub(crate) fn decode_response(bytes: &[u8]) -> Result<ModelResponse, LlmError> {
     }
     let result = match (finish, calls.is_empty()) {
         ("stop", true) => ModelResponse::Final {
-            text: text.ok_or_else(|| protocol("Chat 完整回复缺少文本"))?.into(),
+            text: text
+                .ok_or_else(|| protocol("Chat 完整回复缺少文本"))?
+                .into(),
         },
         ("tool_calls", false) => {
             if text.is_some_and(|v| !v.trim().is_empty()) {
@@ -212,29 +216,42 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(body["messages"][0], json!({"role":"system","content":"规则"}));
+        assert_eq!(
+            body["messages"][0],
+            json!({"role":"system","content":"规则"})
+        );
         assert_eq!(body["messages"][2]["content"], "历史回复");
         assert_eq!(body["messages"][3]["tool_calls"][0]["id"], "b");
         assert_eq!(body["messages"][3]["tool_calls"][1]["id"], "a");
         assert_eq!(body["messages"][4]["tool_call_id"], "b");
         assert_eq!(body["messages"][5]["tool_call_id"], "a");
         assert_eq!(
-            serde_json::from_str::<Value>(body["messages"][4]["content"].as_str().unwrap()).unwrap(),
+            serde_json::from_str::<Value>(body["messages"][4]["content"].as_str().unwrap())
+                .unwrap(),
             json!({"echo":"中文"})
         );
         assert_eq!(
-            serde_json::from_str::<Value>(body["messages"][5]["content"].as_str().unwrap()).unwrap(),
+            serde_json::from_str::<Value>(body["messages"][5]["content"].as_str().unwrap())
+                .unwrap(),
             json!({"error":{"code":"TimedOut","message":"超时"}})
         );
         assert_eq!(body["tools"][0]["function"]["name"], "echo");
-        assert!(body["tools"][0]["function"].get("required_permissions").is_none());
+        assert!(
+            body["tools"][0]["function"]
+                .get("required_permissions")
+                .is_none()
+        );
         assert!(body.get("input").is_none());
         assert!(body.get("store").is_none());
     }
     #[test]
     fn maps_text_and_complete_call_batches_without_losing_ids() {
         assert_eq!(
-            decode(response(json!({"role":"assistant","content":"完整中文"}), "stop")).unwrap(),
+            decode(response(
+                json!({"role":"assistant","content":"完整中文"}),
+                "stop"
+            ))
+            .unwrap(),
             ModelResponse::Final {
                 text: "完整中文".into()
             }
@@ -254,7 +271,10 @@ mod tests {
     fn rejects_incomplete_mixed_reasoning_and_multiple_choices() {
         for finish in ["length", "content_filter"] {
             assert!(matches!(
-                decode(response(json!({"role":"assistant","content":"部分回复"}), finish)),
+                decode(response(
+                    json!({"role":"assistant","content":"部分回复"}),
+                    finish
+                )),
                 Err(LlmError::Provider(_))
             ));
         }
@@ -271,7 +291,8 @@ mod tests {
                 Err(LlmError::Unsupported(_))
             ));
         }
-        let one = response(json!({"role":"assistant","content":"回复"}), "stop")["choices"][0].clone();
+        let one =
+            response(json!({"role":"assistant","content":"回复"}), "stop")["choices"][0].clone();
         assert!(matches!(
             decode(json!({"choices":[one.clone(),one]})),
             Err(LlmError::Unsupported(_))
@@ -280,7 +301,7 @@ mod tests {
     #[test]
     fn rejects_invalid_batches_and_duplicate_json_without_body_leakage() {
         for calls in [
-            json!([function("same"),function("same")]),
+            json!([function("same"), function("same")]),
             json!([{"id":"a","type":"function","function":{"name":"echo","arguments":"[]"}}]),
             json!([{"id":"a","type":"function","function":{"name":"echo",
                 "arguments":"{\"text\":\"first\",\"text\":\"secret\"}"}}]),
@@ -306,8 +327,14 @@ mod tests {
         }
         for (finish, message) in [
             ("stop", json!({"role":"assistant","content":" " })),
-            ("stop", json!({"role":"assistant","content":"reply","tool_calls":[function("a")]})),
-            ("tool_calls", json!({"role":"assistant","content":null,"tool_calls":[]})),
+            (
+                "stop",
+                json!({"role":"assistant","content":"reply","tool_calls":[function("a")]}),
+            ),
+            (
+                "tool_calls",
+                json!({"role":"assistant","content":null,"tool_calls":[]}),
+            ),
         ] {
             assert!(matches!(
                 decode(response(message, finish)),
