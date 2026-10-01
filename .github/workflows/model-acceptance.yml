@@ -1,6 +1,11 @@
 name: 主模型真实多轮验收
 
 on:
+  # 单次 DeepSeek 实测；仅接受当前仓库的已审阅分支，检出固定 CI 成功版本。
+  pull_request:
+    types: [synchronize]
+    branches: [main]
+    paths: [.github/workflows/model-acceptance.yml]
   workflow_dispatch:
     inputs:
       model:
@@ -29,8 +34,12 @@ concurrency:
 
 jobs:
   check:
-    # 只执行已合入主线且经过 CI 的代码，不读取 PR 分支的凭据。
-    if: github.ref == 'refs/heads/main'
+    # PR 实测固定检出已通过 CI #93 的版本；不执行随后更改的 PR 代码。
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && github.event.pull_request.number == 67 &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.head_ref == 'codex/chat-primary-model')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -44,9 +53,10 @@ jobs:
             echo "请在仓库 Actions Secrets 配置 EVE_OPENAI_API_KEY。"
             exit 1
           fi
-      - name: 检出主线
+      - name: 检出已验证版本
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event_name == 'pull_request' && 'fa010163ee2bed20a34e489e4913aee8141f10e3' || github.sha }}
           persist-credentials: false
       - name: 安装 Rust
         run: rustup toolchain install 1.89.0 --profile minimal
@@ -55,8 +65,8 @@ jobs:
       - name: 验收多轮与新进程恢复
         env:
           EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
-          EVE_OPENAI_MODEL: ${{ inputs.model }}
-          EVE_OPENAI_PROTOCOL: ${{ inputs.protocol }}
+          EVE_OPENAI_MODEL: ${{ inputs.model || 'deepseek-v4.1-flash' }}
+          EVE_OPENAI_PROTOCOL: ${{ inputs.protocol || 'chat' }}
           EVE_OPENAI_REASONING_EFFORT: ${{ inputs.reasoning_effort }}
           EVE_OPENAI_TIMEOUT_SECONDS: "120"
           EVE_OPENAI_MAX_OUTPUT_TOKENS: "512"
