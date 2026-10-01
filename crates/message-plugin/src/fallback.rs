@@ -1,5 +1,5 @@
-use eve_config_api::ConfigService;
 use crate::RulesJudge;
+use eve_config_api::ConfigService;
 use eve_message_api::*;
 use std::{
     future::{Future, poll_fn},
@@ -36,8 +36,15 @@ impl RelationJudge for FallbackJudge {
         Box::pin(async move {
             let rule = RulesJudge.judge(input.clone()).await?;
             // 不把格式错误或混合文字的显式命令交给模型重新解释。
-            if !rule.parts.iter().any(|p| p.intent == MessageIntent::Ambiguous)
-                || input.message.text.lines().any(|line| line.trim_start().starts_with('/'))
+            if !rule
+                .parts
+                .iter()
+                .any(|p| p.intent == MessageIntent::Ambiguous)
+                || input
+                    .message
+                    .text
+                    .lines()
+                    .any(|line| line.trim_start().starts_with('/'))
             {
                 return Ok(rule);
             }

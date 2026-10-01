@@ -39,9 +39,10 @@ impl LlmProvider for Provider {
                 return Err(LlmError::Protocol("判断请求不应包含工具或完整历史".into()));
             }
             let state: serde_json::Value = serde_json::from_str(
-                request.messages[1].text.as_deref().ok_or_else(|| {
-                    LlmError::Protocol("判断输入缺失".into())
-                })?,
+                request.messages[1]
+                    .text
+                    .as_deref()
+                    .ok_or_else(|| LlmError::Protocol("判断输入缺失".into()))?,
             )
             .map_err(|_| LlmError::Protocol("判断输入不是 JSON".into()))?;
             if state["task_text"] != "旧任务" || state.get("target").is_some() {
@@ -58,7 +59,8 @@ impl LlmProvider for Provider {
                 _ => return Err(LlmError::Protocol("没有额外判断请求".into())),
             };
             Ok(ModelResponse::Final {
-                text: json!({"parts":parts,"explanation":"按样本标注返回，不代表真实模型质量"}).to_string(),
+                text: json!({"parts":parts,"explanation":"按样本标注返回，不代表真实模型质量"})
+                    .to_string(),
             })
         })
     }

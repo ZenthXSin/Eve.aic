@@ -927,11 +927,8 @@ async fn optional_judge_failures_fall_back_once_and_cancel_waits_for_commit() {
         .await;
         let s = install_plugin(
             &rig,
-            RelationPlugin::with_fallback(
-                primary,
-                Arc::new(LlmRelationJudge::new(model.clone())),
-            )
-            .unwrap(),
+            RelationPlugin::with_fallback(primary, Arc::new(LlmRelationJudge::new(model.clone())))
+                .unwrap(),
             None,
         )
         .await;
@@ -993,7 +990,13 @@ async fn explicit_and_malformed_commands_never_reach_semantic_providers() {
     }
     assert!(primary.requests.lock().unwrap().is_empty());
     assert!(fallback.requests.lock().unwrap().is_empty());
-    assert!(!s.control.snapshot(&old.session).unwrap().unwrap().cancel_requested);
+    assert!(
+        !s.control
+            .snapshot(&old.session)
+            .unwrap()
+            .unwrap()
+            .cancel_requested
+    );
     cancel(&s, &old).await;
     rig.stop().await;
 }
@@ -1025,16 +1028,28 @@ async fn primary_confidence_snapshot_controls_fallback_and_final_action() {
         .await;
         let old = s.control.submit(request("s", "任务"), discard()).unwrap();
         task.wait_requests(1).await;
-        let ticket = s.messages.submit(message(&old, "m", "顺便问个问题"), discard()).unwrap();
+        let ticket = s
+            .messages
+            .submit(message(&old, "m", "顺便问个问题"), discard())
+            .unwrap();
         primary.wait_requests(1).await;
         config(&s, "confidence_threshold", 90, mode);
         gate.notify_one();
-        assert_eq!(s.messages.wait(&ticket).await.unwrap().outcome, RouteOutcome::Unchanged);
+        assert_eq!(
+            s.messages.wait(&ticket).await.unwrap().outcome,
+            RouteOutcome::Unchanged
+        );
         assert_eq!(
             fallback.requests.lock().unwrap().len(),
             usize::from(mode == ApplyMode::Immediate)
         );
-        assert!(!s.control.snapshot(&old.session).unwrap().unwrap().cancel_requested);
+        assert!(
+            !s.control
+                .snapshot(&old.session)
+                .unwrap()
+                .unwrap()
+                .cancel_requested
+        );
         cancel(&s, &old).await;
         rig.stop().await;
     }
@@ -1043,9 +1058,15 @@ async fn primary_confidence_snapshot_controls_fallback_and_final_action() {
 #[tokio::test]
 async fn semantic_errors_low_confidence_and_timeout_clarify_without_cancelling() {
     for (step, expected) in [
-        (Step::new(final_response("bad json")), ClarifyReason::Judge(RelationError::Protocol)),
+        (
+            Step::new(final_response("bad json")),
+            ClarifyReason::Judge(RelationError::Protocol),
+        ),
         (semantic("cancel", 40, None), ClarifyReason::LowConfidence),
-        (Step::blocked(Arc::new(Notify::new())), ClarifyReason::Judge(RelationError::Timeout)),
+        (
+            Step::blocked(Arc::new(Notify::new())),
+            ClarifyReason::Judge(RelationError::Timeout),
+        ),
     ] {
         let task = Provider::new(vec![Step::blocked(Arc::new(Notify::new()))]);
         let model = Provider::new(vec![step]);
@@ -1057,7 +1078,8 @@ async fn semantic_errors_low_confidence_and_timeout_clarify_without_cancelling()
         .await;
         let s = install_plugin(
             &rig,
-            RelationPlugin::with_fallback(None, Arc::new(LlmRelationJudge::new(model.clone()))).unwrap(),
+            RelationPlugin::with_fallback(None, Arc::new(LlmRelationJudge::new(model.clone())))
+                .unwrap(),
             None,
         )
         .await;
@@ -1066,7 +1088,13 @@ async fn semantic_errors_low_confidence_and_timeout_clarify_without_cancelling()
         task.wait_requests(1).await;
         let report = route(&s, message(&old, "m", "可以调整一下吗")).await;
         assert_eq!(reason(&report), expected);
-        assert!(!s.control.snapshot(&old.session).unwrap().unwrap().cancel_requested);
+        assert!(
+            !s.control
+                .snapshot(&old.session)
+                .unwrap()
+                .unwrap()
+                .cancel_requested
+        );
         assert_eq!(model.requests.lock().unwrap().len(), 1);
         cancel(&s, &old).await;
         rig.stop().await;
@@ -1091,13 +1119,17 @@ async fn late_semantic_cancel_cannot_cancel_a_replacement_generation() {
     .await;
     let s = install_plugin(
         &rig,
-        RelationPlugin::with_fallback(None, Arc::new(LlmRelationJudge::new(model.clone()))).unwrap(),
+        RelationPlugin::with_fallback(None, Arc::new(LlmRelationJudge::new(model.clone())))
+            .unwrap(),
         None,
     )
     .await;
     let old = s.control.submit(request("s", "旧任务"), discard()).unwrap();
     done(&s, &old).await;
-    let ticket = s.messages.submit(message(&old, "m", "取消它"), discard()).unwrap();
+    let ticket = s
+        .messages
+        .submit(message(&old, "m", "取消它"), discard())
+        .unwrap();
     model.wait_requests(1).await;
     let new = s.control.submit(request("s", "新任务"), discard()).unwrap();
     task.wait_requests(2).await;
@@ -1106,7 +1138,13 @@ async fn late_semantic_cancel_cannot_cancel_a_replacement_generation() {
         s.messages.wait(&ticket).await.unwrap().outcome,
         RouteOutcome::Stale { prior: None }
     ));
-    assert!(!s.control.snapshot(&new.session).unwrap().unwrap().cancel_requested);
+    assert!(
+        !s.control
+            .snapshot(&new.session)
+            .unwrap()
+            .unwrap()
+            .cancel_requested
+    );
     cancel(&s, &new).await;
     rig.stop().await;
 }

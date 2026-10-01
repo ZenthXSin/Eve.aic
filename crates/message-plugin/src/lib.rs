@@ -85,9 +85,9 @@ impl Plugin for RelationPlugin {
                 JudgeSource::Direct(judge) => judge,
                 JudgeSource::Fallback { primary, fallback } => {
                     let config = ctx
-                        .service::<eve_config_api::ConfigServiceHandle>(
-                            &ServiceId::new(eve_config_api::CONFIG_SERVICE_ID)?,
-                        )?
+                        .service::<eve_config_api::ConfigServiceHandle>(&ServiceId::new(
+                            eve_config_api::CONFIG_SERVICE_ID,
+                        )?)?
                         .ok_or_else(|| PluginError::State("缺少消息配置服务".into()))?
                         .0
                         .clone();

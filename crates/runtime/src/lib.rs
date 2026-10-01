@@ -12,14 +12,14 @@ use std::sync::Arc;
 
 mod control_runner;
 mod llm_host;
-mod session_host;
 mod relation_judge;
-pub use relation_judge::LlmRelationJudge;
+mod session_host;
 pub use control_runner::SessionControlRunner;
 pub use llm_host::{
     ContextBinding, LlmHost, LlmHostConfig, ToolCallDiagnostic, TurnDiagnostics, TurnFailure,
     TurnOutput, TurnStage,
 };
+pub use relation_judge::LlmRelationJudge;
 pub use session_host::{SessionBinding, SessionLlmHost, SessionRunError, SessionTurnOutput};
 
 pub struct DemoReport {

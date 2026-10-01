@@ -138,16 +138,22 @@ async fn rejects_non_closed_json_duplicate_fields_and_tool_requests() {
         format!("```json\n{valid}\n```"),
         format!("{valid} trailing"),
         valid.replace("\"explanation\":", "\"extra\":true,\"explanation\":"),
-        valid.replace("\"explanation\":", "\"explanation\":\"first\",\"explanation\":"),
+        valid.replace(
+            "\"explanation\":",
+            "\"explanation\":\"first\",\"explanation\":",
+        ),
         valid.replace("\"confidence\":95", "\"confidence\":95,\"confidence\":99"),
         valid.replace("\"cancel\"", "\"unknown\""),
         json!({"parts": [], "explanation":"依据"}).to_string(),
-        json!({"parts": vec![json!({"intent":"cancel","confidence":90});17], "explanation":"依据"}).to_string(),
+        json!({"parts": vec![json!({"intent":"cancel","confidence":90});17], "explanation":"依据"})
+            .to_string(),
         "x".repeat(16385),
     ] {
         let provider = Provider::new(vec![Step::new(final_response(&body))]);
         assert_eq!(
-            LlmRelationJudge::new(provider).judge(input("取消任务")).await,
+            LlmRelationJudge::new(provider)
+                .judge(input("取消任务"))
+                .await,
             Err(RelationError::Protocol)
         );
     }
@@ -155,7 +161,9 @@ async fn rejects_non_closed_json_duplicate_fields_and_tool_requests() {
         calls: vec![],
     }))]);
     assert_eq!(
-        LlmRelationJudge::new(provider).judge(input("取消任务")).await,
+        LlmRelationJudge::new(provider)
+            .judge(input("取消任务"))
+            .await,
         Err(RelationError::Protocol)
     );
 }
@@ -173,14 +181,22 @@ async fn bounds_input_and_returns_errors_without_provider_diagnostics() {
     assert_eq!(judge.judge(invalid).await, Err(RelationError::Protocol));
     assert!(provider.requests.lock().unwrap().is_empty());
     for (error, expected) in [
-        (LlmError::Provider("private credential".into()), RelationError::Unavailable),
+        (
+            LlmError::Provider("private credential".into()),
+            RelationError::Unavailable,
+        ),
         (LlmError::ProviderTimeout, RelationError::Timeout),
-        (LlmError::Protocol("private body".into()), RelationError::Protocol),
+        (
+            LlmError::Protocol("private body".into()),
+            RelationError::Protocol,
+        ),
         (LlmError::Cancelled, RelationError::Unavailable),
     ] {
         let provider = Provider::new(vec![Step::new(Err(error))]);
         assert_eq!(
-            LlmRelationJudge::new(provider).judge(input("取消任务")).await,
+            LlmRelationJudge::new(provider)
+                .judge(input("取消任务"))
+                .await,
             Err(expected)
         );
     }
