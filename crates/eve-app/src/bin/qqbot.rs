@@ -8,7 +8,8 @@ async fn main() {
         let summary = eve_app::run_qqbot(options).await?;
         println!("{}", serde_json::to_string(&summary)?);
         Ok(())
-    }.await;
+    }
+    .await;
     if let Err(error) = result {
         eprintln!("Eve QQBot: {error}");
         std::process::exit(1);

@@ -11,5 +11,5 @@ eve-plugin-api = { path = "../plugin-api" }
 eve-session-api = { path = "../session-api" }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
+ring = "0.17"
 tokio = { workspace = true, features = ["process", "io-util"] }

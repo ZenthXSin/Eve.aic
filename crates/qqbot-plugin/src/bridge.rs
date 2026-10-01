@@ -1,14 +1,27 @@
-use crate::{QqBotConfig, QqBotStatus, state::{Ledger, Message, ReceiptState}};
-use eve_control_api::{CommitState, ControlInput, ControlService, DiscardControlEvents, GenerationKey};
+use crate::{
+    QqBotConfig, QqBotStatus,
+    state::{Ledger, Message, ReceiptState},
+};
+use eve_control_api::{
+    CommitState, ControlInput, ControlService, DiscardControlEvents, GenerationKey,
+};
 use eve_plugin_api::{LogEntry, LogLevel, PluginContext, PluginError, PluginResult, TaskSignal};
 use eve_session_api::SessionInput;
 use serde_json::{Value, json};
 use std::{collections::VecDeque, process::Stdio, sync::Arc, time::Duration};
-use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, process::{ChildStdin, ChildStdout, Command}, sync::watch};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::{ChildStdin, ChildStdout, Command},
+    sync::watch,
+};
 
-fn failure(code: &str) -> PluginError { PluginError::Task(code.into()) }
+fn failure(code: &str) -> PluginError {
+    PluginError::Task(code.into())
+}
 fn warn(ctx: &PluginContext, code: &str) {
-    if let Ok(entry) = LogEntry::new(LogLevel::Warn, "eve.qqbot", code) { let _ = ctx.log(entry); }
+    if let Ok(entry) = LogEntry::new(LogLevel::Warn, "eve.qqbot", code) {
+        let _ = ctx.log(entry);
+    }
 }
 async fn write(stdin: &mut ChildStdin, value: Value) -> PluginResult<()> {
     let mut bytes = serde_json::to_vec(&value).map_err(|_| failure("QQBot 命令编码失败"))?;
@@ -16,8 +29,10 @@ async fn write(stdin: &mut ChildStdin, value: Value) -> PluginResult<()> {
     tokio::time::timeout(Duration::from_secs(2), async {
         stdin.write_all(&bytes).await?;
         stdin.flush().await
-    }).await.map_err(|_| failure("QQBot 命令写入超时"))?
-        .map_err(|_| failure("QQBot 命令写入失败"))
+    })
+    .await
+    .map_err(|_| failure("QQBot 命令写入超时"))?
+    .map_err(|_| failure("QQBot 命令写入失败"))
 }
 struct Frames {
     reader: BufReader<ChildStdout>,
@@ -27,39 +42,83 @@ struct Frames {
 impl Frames {
     async fn next(&mut self) -> PluginResult<Option<Value>> {
         loop {
-            let available = self.reader.fill_buf().await.map_err(|_| failure("QQBot 输入读取失败"))?;
-            if available.is_empty() { return Ok(None); }
+            let available = self
+                .reader
+                .fill_buf()
+                .await
+                .map_err(|_| failure("QQBot 输入读取失败"))?;
+            if available.is_empty() {
+                return Ok(None);
+            }
             let end = available.iter().position(|b| *b == b'\n');
             let count = end.map_or(available.len(), |p| p + 1);
             if !self.discard {
-                if self.partial.len() + count > 65536 { self.partial.clear(); self.discard = true; }
-                else { self.partial.extend_from_slice(&available[..count]); }
+                if self.partial.len() + count > 65536 {
+                    self.partial.clear();
+                    self.discard = true;
+                } else {
+                    self.partial.extend_from_slice(&available[..count]);
+                }
             }
             self.reader.consume(count);
             if end.is_some() {
-                let frame = if self.discard { None } else { serde_json::from_slice(&self.partial).ok() };
-                self.partial.clear(); self.discard = false;
+                let frame = if self.discard {
+                    None
+                } else {
+                    serde_json::from_slice(&self.partial).ok()
+                };
+                self.partial.clear();
+                self.discard = false;
                 return Ok(Some(frame.unwrap_or(Value::Null)));
             }
         }
     }
 }
 pub(crate) async fn run(
-    config: Arc<QqBotConfig>, ctx: PluginContext, control: Arc<dyn ControlService>,
-    mut ledger: Ledger, signal: Arc<dyn TaskSignal>, status: watch::Sender<QqBotStatus>,
+    config: Arc<QqBotConfig>,
+    ctx: PluginContext,
+    control: Arc<dyn ControlService>,
+    mut ledger: Ledger,
+    signal: Arc<dyn TaskSignal>,
+    status: watch::Sender<QqBotStatus>,
 ) -> PluginResult<()> {
     let mut command = Command::new(&config.node_program);
-    command.arg(&config.bridge_script).args(&config.bridge_args).env_clear();
+    command
+        .arg(&config.bridge_script)
+        .args(&config.bridge_args)
+        .env_clear();
     for name in ["PATH", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP"] {
-        if let Some(value) = std::env::var_os(name) { command.env(name, value); }
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
     }
-    command.env("QQBOT_APP_ID", &config.app_id).env("QQBOT_APP_SECRET", &config.app_secret)
-        .env("QQBOT_SANDBOX", if config.sandbox { "true" } else { "false" })
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
-    let mut child = command.spawn().map_err(|_| failure("QQBot Node 子进程启动失败"))?;
-    let mut stdin = child.stdin.take().ok_or_else(|| failure("QQBot stdin 缺失"))?;
-    let stdout = child.stdout.take().ok_or_else(|| failure("QQBot stdout 缺失"))?;
-    let mut frames = Frames { reader: BufReader::new(stdout), partial: Vec::new(), discard: false };
+    command
+        .env("QQBOT_APP_ID", &config.app_id)
+        .env("QQBOT_APP_SECRET", &config.app_secret)
+        .env(
+            "QQBOT_SANDBOX",
+            if config.sandbox { "true" } else { "false" },
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|_| failure("QQBot Node 子进程启动失败"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| failure("QQBot stdin 缺失"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| failure("QQBot stdout 缺失"))?;
+    let mut frames = Frames {
+        reader: BufReader::new(stdout),
+        partial: Vec::new(),
+        discard: false,
+    };
     let mut queue: VecDeque<Message> = VecDeque::new();
     let mut active: Option<(Message, GenerationKey)> = None;
     let mut delivering: Option<Message> = None;
@@ -159,11 +218,20 @@ pub(crate) async fn run(
     let cancelled = if let Some((_, key)) = active {
         let requested = control.cancel(&key);
         let settled = control.wait(&key).await;
-        requested.map_err(|_| failure("QQBot 取消失败")).and(settled.map(|_| ()).map_err(|_| failure("QQBot 取消收尾失败")))
-    } else { Ok(()) };
+        requested.map_err(|_| failure("QQBot 取消失败")).and(
+            settled
+                .map(|_| ())
+                .map_err(|_| failure("QQBot 取消收尾失败")),
+        )
+    } else {
+        Ok(())
+    };
     let _ = write(&mut stdin, json!({"type":"stop","version":1})).await;
     drop(stdin);
-    if tokio::time::timeout(Duration::from_secs(2), child.wait()).await.is_err() {
+    if tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
         let _ = child.kill().await;
         let _ = child.wait().await;
     }

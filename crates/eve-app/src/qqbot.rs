@@ -2,8 +2,8 @@ use crate::{AppError, finish_core, install_core};
 use eve_kernel::{Kernel, KernelServices, backends::FileStateStore};
 use eve_plugin_api::{PluginId, ServiceId};
 use eve_qqbot_plugin::{
-    DEFAULT_QQBOT_APP_ID, QQBOT_PLUGIN_ID, QQBOT_STATUS_SERVICE_ID,
-    QqBotConfig, QqBotPlugin, QqBotStatus, QqBotStatusHandle,
+    DEFAULT_QQBOT_APP_ID, QQBOT_PLUGIN_ID, QQBOT_STATUS_SERVICE_ID, QqBotConfig, QqBotPlugin,
+    QqBotStatus, QqBotStatusHandle,
 };
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
@@ -24,9 +24,11 @@ pub struct QqBotOptions {
 impl Default for QqBotOptions {
     fn default() -> Self {
         Self {
-            state_directory: ".eve".into(), agent_path: "AGENT.md".into(),
+            state_directory: ".eve".into(),
+            agent_path: "AGENT.md".into(),
             node_program: "node".into(),
-            bridge_script: "connectors/qqbot/bridge.mjs".into(), bridge_args: Vec::new(),
+            bridge_script: "connectors/qqbot/bridge.mjs".into(),
+            bridge_args: Vec::new(),
         }
     }
 }
@@ -35,9 +37,13 @@ impl QqBotOptions {
         let mut args = args.into_iter();
         let mut options = Self::default();
         while let Some(arg) = args.next() {
-            if arg == "--help" || arg == "-h" { return Ok(None); }
+            if arg == "--help" || arg == "-h" {
+                return Ok(None);
+            }
             let value = args.next().ok_or("QQBot 参数缺少值")?;
-            if value.is_empty() { return Err("QQBot 参数值不能为空".into()); }
+            if value.is_empty() {
+                return Err("QQBot 参数值不能为空".into());
+            }
             match arg.to_str() {
                 Some("--state-dir") => options.state_directory = value.into(),
                 Some("--agent") => options.agent_path = value.into(),
@@ -53,7 +59,8 @@ impl QqBotOptions {
 async fn interrupted() -> Result<(), AppError> {
     #[cfg(unix)]
     {
-        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
             result = tokio::signal::ctrl_c() => result?,
             _ = terminate.recv() => {},
@@ -79,17 +86,29 @@ pub async fn run_qqbot(options: QqBotOptions) -> Result<QqBotStatus, AppError> {
     let logger = backends.logger.clone();
     let kernel = Kernel::with_services(backends);
     let result = async {
-        install_core(&kernel, registry.clone(), permissions, logger,
-            &options.state_directory, &options.agent_path).await?;
+        install_core(
+            &kernel,
+            registry.clone(),
+            permissions,
+            logger,
+            &options.state_directory,
+            &options.agent_path,
+        )
+        .await?;
         kernel.register(Box::new(QqBotPlugin::new(QqBotConfig {
-            node_program: options.node_program, bridge_script: options.bridge_script,
+            node_program: options.node_program,
+            bridge_script: options.bridge_script,
             bridge_args: options.bridge_args,
             app_id: std::env::var("QQBOT_APP_ID").unwrap_or_else(|_| DEFAULT_QQBOT_APP_ID.into()),
-            app_secret, sandbox,
+            app_secret,
+            sandbox,
         })?))?;
         kernel.start(&PluginId::new(QQBOT_PLUGIN_ID)?).await?;
-        let handle = registry.get(&ServiceId::new(QQBOT_STATUS_SERVICE_ID)?)?
-            .ok_or("QQBot 状态服务缺失")?.value.downcast::<QqBotStatusHandle>()
+        let handle = registry
+            .get(&ServiceId::new(QQBOT_STATUS_SERVICE_ID)?)?
+            .ok_or("QQBot 状态服务缺失")?
+            .value
+            .downcast::<QqBotStatusHandle>()
             .map_err(|_| "QQBot 状态服务类型错误")?;
         let mut status = handle.0.clone();
         tokio::select! {
@@ -102,8 +121,11 @@ pub async fn run_qqbot(options: QqBotOptions) -> Result<QqBotStatus, AppError> {
         }
         kernel.stop(&PluginId::new(QQBOT_PLUGIN_ID)?).await?;
         let summary = *status.borrow();
-        if summary.terminal_error { return Err("QQBot 通道异常结束；状态已保留".into()); }
+        if summary.terminal_error {
+            return Err("QQBot 通道异常结束；状态已保留".into());
+        }
         Ok(summary)
-    }.await;
+    }
+    .await;
     finish_core(&kernel, result).await
 }

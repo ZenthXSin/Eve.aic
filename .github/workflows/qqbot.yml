@@ -24,10 +24,13 @@ jobs:
           node-version: "22"
       - name: 安装 SDK 依赖
         working-directory: connectors/qqbot
-        run: npm install --ignore-scripts --no-audit --no-fund
+        run: npm ci --ignore-scripts --no-audit --no-fund
       - name: 记录实际依赖锁定结果
         working-directory: connectors/qqbot
         run: node -e 'console.log(JSON.stringify(JSON.parse(require("fs").readFileSync("package-lock.json","utf8"))))'
+      - name: 验证实际 SDK 导出
+        working-directory: connectors/qqbot
+        run: node --input-type=module -e 'const { QQBot } = await import("@tencent-connect/qqbot-nodejs"); if (typeof QQBot !== "function") throw new Error("SDK facade missing");'
       - name: Node 桥接测试
         working-directory: connectors/qqbot
         run: npm test

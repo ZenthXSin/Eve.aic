@@ -267,9 +267,9 @@ dependencies = [
  "eve-control-api",
  "eve-plugin-api",
  "eve-session-api",
+ "ring",
  "serde",
  "serde_json",
- "sha2",
  "tokio",
 ]
 

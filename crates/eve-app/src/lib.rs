@@ -224,8 +224,7 @@ pub(crate) async fn install_core(
             ..host_config
         },
     )?;
-    let host =
-        Arc::new(SessionLlmHost::new(host, SessionBinding::builtin()).with_logger(logger));
+    let host = Arc::new(SessionLlmHost::new(host, SessionBinding::builtin()).with_logger(logger));
     kernel.register(Box::new(ControlPlugin::new(
         Arc::new(SessionControlRunner::new(host)),
         [services::OWNER, SESSION_PLUGIN_ID]

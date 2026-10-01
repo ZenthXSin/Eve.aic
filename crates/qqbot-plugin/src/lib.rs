@@ -51,23 +51,36 @@ impl QqBotPlugin {
             id: eve_plugin_api::PluginId::new(CONTROL_PLUGIN_ID)?,
             requirement: Some("^0.1".into()),
         });
-        Ok(Self { manifest, config: Arc::new(config) })
+        Ok(Self {
+            manifest,
+            config: Arc::new(config),
+        })
     }
 }
 impl Plugin for QqBotPlugin {
-    fn manifest(&self) -> &PluginManifest { &self.manifest }
+    fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
     fn start(&mut self, ctx: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         Box::pin(async move {
             let ledger = state::Ledger::load(&ctx)?;
-            let control = ctx.service::<ControlServiceHandle>(&ServiceId::new(CONTROL_SERVICE_ID)?)?
-                .ok_or_else(|| PluginError::State("QQBot 控制服务缺失".into()))?.0.clone();
+            let control = ctx
+                .service::<ControlServiceHandle>(&ServiceId::new(CONTROL_SERVICE_ID)?)?
+                .ok_or_else(|| PluginError::State("QQBot 控制服务缺失".into()))?
+                .0
+                .clone();
             let (status, receiver) = watch::channel(QqBotStatus::default());
-            ctx.provide_service(ServiceId::new(QQBOT_STATUS_SERVICE_ID)?, QqBotStatusHandle(receiver))?;
+            ctx.provide_service(
+                ServiceId::new(QQBOT_STATUS_SERVICE_ID)?,
+                QqBotStatusHandle(receiver),
+            )?;
             let ledger = Arc::new(tokio::sync::Mutex::new(Some(ledger)));
             let config = self.config.clone();
             let task_ctx = ctx.clone();
             ctx.spawn_task(TaskSpec::new(
-                "QQBot JSONL 通道", TaskMode::Background, TaskSchedule::Immediate,
+                "QQBot JSONL 通道",
+                TaskMode::Background,
+                TaskSchedule::Immediate,
                 Arc::new(move |signal| {
                     let config = config.clone();
                     let ctx = task_ctx.clone();
@@ -75,10 +88,16 @@ impl Plugin for QqBotPlugin {
                     let status = status.clone();
                     let ledger = ledger.clone();
                     Box::pin(async move {
-                        let ledger = ledger.lock().await.take()
-                            .ok_or_else(|| PluginError::Task("QQBot 任务不得重复启动".into()))?;
-                        let result = bridge::run(config, ctx, control, ledger, signal, status.clone()).await;
-                        status.send_modify(|s| { s.closed = true; s.terminal_error = result.is_err(); });
+                        let ledger =
+                            ledger.lock().await.take().ok_or_else(|| {
+                                PluginError::Task("QQBot 任务不得重复启动".into())
+                            })?;
+                        let result =
+                            bridge::run(config, ctx, control, ledger, signal, status.clone()).await;
+                        status.send_modify(|s| {
+                            s.closed = true;
+                            s.terminal_error = result.is_err();
+                        });
                         result
                     })
                 }),
