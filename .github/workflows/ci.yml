@@ -45,6 +45,8 @@ jobs:
         run: cargo test --workspace --locked
       - name: 验证核心入口帮助
         run: cargo run -p eve-app --locked -- --help
+      - name: 验证主模型多轮验收帮助
+        run: cargo run -p eve-app --example model_acceptance --locked -- --help
       - name: 运行插件协作验收
         run: cargo run -p eve-runtime --locked
       - name: 验证取消生命周期等待后的收尾
