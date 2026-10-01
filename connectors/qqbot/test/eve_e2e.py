@@ -103,7 +103,10 @@ class Acceptance(unittest.TestCase):
         self.run_eve([self.message("g-2", "two", scope="group", user="user-2")])
         self.run_eve([self.message("g-3", "three", scope="group")], app="other-app")
         self.assertEqual(len(self.documents()["eve.session"]["sessions.v1"]["sessions"]), 3)
-        self.assertTrue(all(len(r["messages"]) == 2 for r in self.requests))
+        for request, expected in zip(self.requests, ["one", "two", "three"]):
+            messages = request["messages"]
+            self.assertEqual([m["content"] for m in messages if m["role"] == "user"], [expected])
+            self.assertFalse(any(m["role"] in ("assistant", "tool") for m in messages))
 
     def test_send_failure_preserves_commit_no_model_or_send_retry(self):
         result = self.run_eve([self.message("in-1", "echo:marker", "marker")], send_fail=True)
@@ -112,6 +115,20 @@ class Acceptance(unittest.TestCase):
         self.assertEqual((again["received"], again["sent"], len(self.requests)), (0, 0, 2))
         record = self.documents()["eve.channel.qqbot"]["receipts.v1"]["entries"][0]
         self.assertEqual(record["state"], "Failed"); self.assertEqual(record["reply"], "marker")
+
+    def test_processing_receipt_does_not_reexecute_after_restart(self):
+        self.run_eve([self.message("in-1", "one")])
+        path = self.work / "state/state.json"
+        state = json.loads(path.read_text())
+        key = state["entries"]["eve.channel.qqbot"]["receipts.v1"]
+        ledger = json.loads(bytes(key))
+        ledger["entries"][0].update(state="Processing", reply=None)
+        state["entries"]["eve.channel.qqbot"]["receipts.v1"] = list(json.dumps(ledger).encode())
+        path.write_text(json.dumps(state))
+        summary = self.run_eve([self.message("in-1", "one")])
+        self.assertEqual(summary["received"], 0)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.documents()["eve.channel.qqbot"]["receipts.v1"]["entries"][0]["state"], "Processing")
 
     def test_corrupt_receipts_not_cleared(self):
         self.run_eve([self.message("in-1", "one")])

@@ -1,0 +1,104 @@
+name: QQBot 首次真实交互
+on:
+  workflow_dispatch:
+    inputs:
+      sandbox:
+        description: 使用 QQ 开放平台沙箱（需将测试用户/群加入范围）
+        type: boolean
+        default: true
+      seconds:
+        description: 交互窗口秒数（60 至 600）
+        type: string
+        default: "300"
+permissions:
+  contents: read
+concurrency:
+  group: eve-qqbot-live
+  cancel-in-progress: false
+jobs:
+  interaction:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检查凭据是否存在
+        env:
+          QQBOT_APP_SECRET: ${{ secrets.QQBOT_APP_SECRET }}
+          EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
+        run: |
+          if [ -z "$QQBOT_APP_SECRET" ]; then
+            echo "缺少仓库 Actions Secret：QQBOT_APP_SECRET。AppID 已内置。"
+            exit 1
+          fi
+          if [ -z "$EVE_OPENAI_API_KEY" ]; then
+            echo "缺少仓库 Actions Secret：EVE_OPENAI_API_KEY。"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+      - name: 安装锁定的 SDK 依赖
+        working-directory: connectors/qqbot
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: 安装 Rust 并构建核心
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal
+          cargo +1.89.0 build -p eve-app --bin eve-qqbot --locked
+      - name: 运行交互窗口
+        env:
+          QQBOT_APP_SECRET: ${{ secrets.QQBOT_APP_SECRET }}
+          EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
+          QQBOT_SANDBOX: ${{ inputs.sandbox }}
+          QQBOT_TEST_SECONDS: ${{ inputs.seconds }}
+          EVE_OPENAI_BASE_URL: https://ai.xn--rhqr8xvr4ahqsgka.com
+          EVE_OPENAI_MODEL: deepseek-v4.1-flash
+          EVE_OPENAI_PROTOCOL: chat
+          EVE_OPENAI_REASONING_EFFORT: none
+          EVE_OPENAI_MAX_OUTPUT_TOKENS: "512"
+          EVE_LLM_RESPONSE_MODE: complete
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, signal, subprocess
+          seconds = int(os.environ["QQBOT_TEST_SECONDS"])
+          if not 60 <= seconds <= 600:
+              raise SystemExit("交互窗口必须在 60 至 600 秒之间。")
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "eve-qqbot-live"
+          root.mkdir()
+          print("QQBot 交互窗口启动：请向测试机器人私聊或在测试群 @ 发送文字。", flush=True)
+          with (root / "stdout").open("w") as out, (root / "stderr").open("w") as err:
+              child = subprocess.Popen(["./target/debug/eve-qqbot", "--state-dir", str(root / "state")], stdout=out, stderr=err)
+              try:
+                  child.wait(timeout=seconds)
+              except subprocess.TimeoutExpired:
+                  child.send_signal(signal.SIGINT)
+                  try:
+                      child.wait(timeout=10)
+                  except subprocess.TimeoutExpired:
+                      child.kill()
+                      child.wait()
+          report = {"process_ok": child.returncode == 0, "interaction_ok": False}
+          try:
+              summary = json.loads((root / "stdout").read_text())
+              for key in ["ready", "closed", "terminal_error", "received", "completed", "sent", "failed"]:
+                  value = summary.get(key)
+                  if type(value) in (bool, int):
+                      report[key] = value
+              report["interaction_ok"] = report["process_ok"] and report.get("ready") is True and report.get("received", 0) >= 1 and report.get("completed", 0) >= 1 and report.get("sent", 0) >= 1 and report.get("failed") == 0
+          except (ValueError, OSError):
+              report["diagnostic"] = "no_valid_summary"
+          (root / "acceptance.json").write_text(json.dumps(report))
+          print(json.dumps(report))
+          if not report["interaction_ok"]:
+              raise SystemExit("尚未通过真实消息接收、模型完成与 QQ 发送验收。")
+          PY
+      - name: 保存无正文的交互报告
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: eve-qqbot-interaction
+          path: ${{ runner.temp }}/eve-qqbot-live/acceptance.json
+          if-no-files-found: ignore
+          retention-days: 7

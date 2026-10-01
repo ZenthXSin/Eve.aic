@@ -170,7 +170,12 @@ pub(crate) async fn run(
                     }
                 }
                 frame = frames.next() => {
-                    let Some(frame) = frame? else { break Ok(()); };
+                    let Some(frame) = frame? else {
+                        if active.is_some() || delivering.is_some() || !queue.is_empty() || !status.borrow().ready {
+                            break Err(failure("QQBot 在未完成交互时断开；保留状态"));
+                        }
+                        break Ok(());
+                    };
                     if frame.get("version").and_then(Value::as_u64) != Some(1) { warn(&ctx, "protocol_version"); }
                     match frame.get("type").and_then(Value::as_str) {
                         Some("ready") => { status.send_modify(|s| s.ready = true); }
@@ -193,6 +198,9 @@ pub(crate) async fn run(
                             let mut payload = frame.clone();
                             if let Some(object) = payload.as_object_mut() {
                                 object.remove("type"); object.remove("version");
+                                if object.keys().any(|key| !["id", "scope", "target_id", "user_id", "text"].contains(&key.as_str())) {
+                                    warn(&ctx, "ignored_message_fields");
+                                }
                                 object.retain(|key, _| ["id", "scope", "target_id", "user_id", "text"].contains(&key.as_str()));
                             }
                             let Ok(message) = serde_json::from_value::<Message>(payload) else { warn(&ctx, "invalid_message"); continue; };

@@ -1,7 +1,7 @@
 use eve_plugin_api::{PluginContext, PluginError, PluginResult};
 use eve_session_api::SessionKey;
-use serde::{Deserialize, Serialize};
 use ring::digest::{SHA256, digest};
+use serde::{Deserialize, Serialize};
 
 const STATE_KEY: &str = "receipts.v1";
 pub(crate) const MAX_BYTES: usize = 1_048_576;
