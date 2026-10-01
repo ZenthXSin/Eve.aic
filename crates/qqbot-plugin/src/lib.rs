@@ -35,7 +35,16 @@ pub struct QqBotStatus {
     pub failed: u64,
 }
 #[derive(Clone)]
-pub struct QqBotStatusHandle(pub watch::Receiver<QqBotStatus>);
+pub struct QqBotStatusHandle {
+    pub status: watch::Receiver<QqBotStatus>,
+    stop: watch::Sender<bool>,
+}
+impl QqBotStatusHandle {
+    /// 先请求并等待 closed，再调用 Kernel stop，避免与在途模型的生命周期准入互相等待。
+    pub fn request_stop(&self) {
+        self.stop.send_replace(true);
+    }
+}
 
 pub struct QqBotPlugin {
     manifest: PluginManifest,
@@ -70,9 +79,10 @@ impl Plugin for QqBotPlugin {
                 .0
                 .clone();
             let (status, receiver) = watch::channel(QqBotStatus::default());
+            let (stop, stop_receiver) = watch::channel(false);
             ctx.provide_service(
                 ServiceId::new(QQBOT_STATUS_SERVICE_ID)?,
-                QqBotStatusHandle(receiver),
+                QqBotStatusHandle { status: receiver, stop },
             )?;
             let ledger = Arc::new(tokio::sync::Mutex::new(Some(ledger)));
             let config = self.config.clone();
@@ -83,6 +93,7 @@ impl Plugin for QqBotPlugin {
                 TaskSchedule::Immediate,
                 Arc::new(move |signal| {
                     let config = config.clone();
+                    let stop_receiver = stop_receiver.clone();
                     let ctx = task_ctx.clone();
                     let control = control.clone();
                     let status = status.clone();
@@ -93,7 +104,7 @@ impl Plugin for QqBotPlugin {
                                 PluginError::Task("QQBot 任务不得重复启动".into())
                             })?;
                         let result =
-                            bridge::run(config, ctx, control, ledger, signal, status.clone()).await;
+                            bridge::run(config, ctx, control, ledger, signal, status.clone(), stop_receiver).await;
                         status.send_modify(|s| {
                             s.closed = true;
                             s.terminal_error = result.is_err();

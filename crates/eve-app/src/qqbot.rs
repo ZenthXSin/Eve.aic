@@ -111,9 +111,15 @@ pub async fn run_qqbot(options: QqBotOptions) -> Result<QqBotStatus, AppError> {
             .value
             .downcast::<QqBotStatusHandle>()
             .map_err(|_| "QQBot 状态服务类型错误")?;
-        let mut status = handle.0.clone();
+        let mut status = handle.status.clone();
         tokio::select! {
-            result = interrupted() => result?,
+            result = interrupted() => {
+                result?;
+                handle.request_stop();
+                while !status.borrow().closed {
+                    status.changed().await.map_err(|_| "QQBot 收尾通知丢失")?;
+                }
+            },
             _ = async {
                 while !status.borrow().closed {
                     if status.changed().await.is_err() { break; }

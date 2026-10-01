@@ -176,7 +176,10 @@ pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstr
     let host_config = LlmHostConfig::default().with_prompt_source(&prompt)?;
     let api_key =
         std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "宿主缺少 EVE_OPENAI_API_KEY。")?;
-    Ok(CoreBootstrap { host_config, api_key })
+    Ok(CoreBootstrap {
+        host_config,
+        api_key,
+    })
 }
 
 pub(crate) async fn install_core(
@@ -187,7 +190,10 @@ pub(crate) async fn install_core(
     state_directory: &std::path::Path,
     bootstrap: CoreBootstrap,
 ) -> Result<Arc<dyn eve_control_api::ControlService>, AppError> {
-    let CoreBootstrap { host_config, api_key } = bootstrap;
+    let CoreBootstrap {
+        host_config,
+        api_key,
+    } = bootstrap;
     kernel.register(Box::new(ConfigPlugin::new(ConfigBootstrap::new(
         state_directory.join("configuration"),
         vec![runtime_llm_schema(), config::openai_schema()],

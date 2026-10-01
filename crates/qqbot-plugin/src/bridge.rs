@@ -81,6 +81,7 @@ pub(crate) async fn run(
     mut ledger: Ledger,
     signal: Arc<dyn TaskSignal>,
     status: watch::Sender<QqBotStatus>,
+    mut stop: watch::Receiver<bool>,
 ) -> PluginResult<()> {
     let mut command = Command::new(&config.node_program);
     command
@@ -148,6 +149,7 @@ pub(crate) async fn run(
             tokio::select! {
                 biased;
                 _ = signal.cancelled() => break Ok(()),
+                _ = stop.changed() => break Ok(()),
                 _ = tokio::time::sleep_until(deadline), if !status.borrow().ready || delivering.is_some() => {
                     break Err(failure("QQBot ready 或 delivery 等待超时"));
                 }
