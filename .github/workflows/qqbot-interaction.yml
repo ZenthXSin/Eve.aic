@@ -1,5 +1,8 @@
 name: QQBot 首次真实交互
 on:
+  pull_request:
+    types: [synchronize]
+    paths: [.github/workflows/qqbot-interaction.yml]
   workflow_dispatch:
     inputs:
       sandbox:
@@ -17,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   interaction:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.number == 68 && github.head_ref == 'codex/qqbot-channel' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -37,6 +40,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+          ref: 090d94662797492cda8dd29acc7f925ec39c4c43
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "22"
@@ -51,8 +55,8 @@ jobs:
         env:
           QQBOT_APP_SECRET: ${{ secrets.QQBOT_APP_SECRET }}
           EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
-          QQBOT_SANDBOX: ${{ inputs.sandbox }}
-          QQBOT_TEST_SECONDS: ${{ inputs.seconds }}
+          QQBOT_SANDBOX: ${{ github.event_name == 'pull_request' && 'true' || inputs.sandbox }}
+          QQBOT_TEST_SECONDS: ${{ inputs.seconds || '180' }}
           EVE_OPENAI_BASE_URL: https://ai.xn--rhqr8xvr4ahqsgka.com
           EVE_OPENAI_MODEL: deepseek-v4.1-flash
           EVE_OPENAI_PROTOCOL: chat
