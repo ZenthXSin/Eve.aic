@@ -268,7 +268,9 @@ fn invalid_file_and_inconsistent_metadata_fail_before_provider_or_tools() {
         let result = assemble();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         if unreadable {
-            let error = result.err().expect("不可读来源不得成功装配");
+            let Err(error) = result else {
+                panic!("不可读来源不得成功装配");
+            };
             assert!(matches!(error, LlmError::Configuration(_)));
             assert!(!format!("{error:?}").contains("PRIVATE_AGENT_BODY"));
         }
