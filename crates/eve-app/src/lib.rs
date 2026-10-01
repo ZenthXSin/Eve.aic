@@ -4,10 +4,12 @@ mod config;
 mod console;
 mod error;
 mod input;
+mod qqbot;
 mod services;
 
 pub use console::ChatRunError;
 pub use error::AppFailure;
+pub use qqbot::{QQBOT_HELP, QqBotOptions, run_qqbot};
 
 use eve_agent_prompt::FileAgentPrompt;
 use eve_config_api::{
@@ -109,10 +111,6 @@ pub async fn run_console(
     mut output: impl Write,
 ) -> Result<ChatSummary, AppError> {
     let key = SessionKey::new(&options.session_id, &options.user_id)?;
-    let prompt = FileAgentPrompt::new(&options.agent_path)?;
-    let host_config = LlmHostConfig::default().with_prompt_source(&prompt)?;
-    let api_key =
-        std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "宿主缺少 EVE_OPENAI_API_KEY。")?;
     let backends = KernelServices {
         state: Arc::new(FileStateStore::open(&options.state_directory)?),
         ..KernelServices::default()
@@ -123,77 +121,15 @@ pub async fn run_console(
     let kernel = Kernel::with_services(backends);
     // 包含注册、启动、装配与对话；任一步失败均走同一停止/日志收尾。
     let result = async {
-        kernel.register(Box::new(ConfigPlugin::new(ConfigBootstrap::new(
-            options.state_directory.join("configuration"),
-            vec![runtime_llm_schema(), config::openai_schema()],
-        ))?))?;
-        kernel.register(Box::new(SessionPlugin::new()?))?;
-        kernel.register(Box::new(services::CoreServices::new()?))?;
-        let owner = PluginId::new(services::OWNER)?;
-        kernel.start(&owner).await?;
-        let entry = registry
-            .get(&ServiceId::new(CONFIG_SERVICE_ID)?)?
-            .ok_or("配置服务缺失。")?;
-        let settings = entry
-            .value
-            .downcast::<ConfigServiceHandle>()
-            .map_err(|_| "配置服务类型错误。")?;
-        let request = settings.0.begin_request(LLM_NAMESPACE, 1)?;
-        let runtime = LlmRuntimeConfig::try_from(&settings.0.read_request(&request)?)?;
-        if runtime.response_mode != "complete" {
-            return Err(
-                "核心入口当前使用非流式模式，请将 runtime.llm.response_mode 配为 complete。".into(),
-            );
-        }
-        let request = settings.0.begin_request(config::OPENAI_NAMESPACE, 1)?;
-        let provider_config = config::provider_config(&settings.0.read_request(&request)?)?;
-        let timeout = provider_config.request_timeout;
-        let provider = OpenAiProvider::new(provider_config, &api_key)?;
-        let host = LlmHost::new(
-            Arc::new(provider),
-            registry.clone(),
-            kernel.clone(),
+        let control = install_core(
+            &kernel,
+            registry,
             permissions,
-            ContextBinding {
-                service_id: ServiceId::new(services::CONTEXT)?,
-                expected_owner: owner.clone(),
-            },
-            vec![ToolBinding {
-                name: "echo".into(),
-                service_id: ServiceId::new(services::TOOL)?,
-                expected_owner: owner,
-            }],
-            LlmHostConfig {
-                provider_timeout: timeout,
-                max_parallel_tool_calls: runtime.max_parallel_tool_calls,
-                response_mode: ResponseMode::Complete,
-                ..host_config
-            },
-        )?;
-        let host =
-            Arc::new(SessionLlmHost::new(host, SessionBinding::builtin()).with_logger(logger));
-        kernel.register(Box::new(ControlPlugin::new(
-            Arc::new(SessionControlRunner::new(host)),
-            [services::OWNER, SESSION_PLUGIN_ID]
-                .into_iter()
-                .map(|id| {
-                    Ok(PluginDependency {
-                        id: PluginId::new(id)?,
-                        requirement: Some("^0.1".into()),
-                    })
-                })
-                .collect::<eve_plugin_api::PluginResult<Vec<_>>>()?,
-        )?))?;
-        kernel.start(&PluginId::new(CONTROL_PLUGIN_ID)?).await?;
-        let entry = registry
-            .get(&ServiceId::new(CONTROL_SERVICE_ID)?)?
-            .ok_or("控制服务缺失。")?;
-        let control = entry
-            .value
-            .downcast::<ControlServiceHandle>()
-            .map_err(|_| "控制服务类型错误。")?
-            .0
-            .clone();
+            logger,
+            &options.state_directory,
+            &options.agent_path,
+        )
+        .await?;
         let receiver = input::start(input)?;
         let result = console::drive(
             control.clone(),
@@ -226,6 +162,99 @@ pub async fn run_console(
         }
     }
     .await;
+    finish_core(&kernel, result).await
+}
+
+pub(crate) async fn install_core(
+    kernel: &Kernel,
+    registry: Arc<dyn eve_plugin_api::ServiceRegistry>,
+    permissions: Arc<dyn eve_plugin_api::PermissionChecker>,
+    logger: Arc<dyn eve_plugin_api::Logger>,
+    state_directory: &std::path::Path,
+    agent_path: &std::path::Path,
+) -> Result<Arc<dyn eve_control_api::ControlService>, AppError> {
+    let prompt = FileAgentPrompt::new(agent_path)?;
+    let host_config = LlmHostConfig::default().with_prompt_source(&prompt)?;
+    let api_key =
+        std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "宿主缺少 EVE_OPENAI_API_KEY。")?;
+    kernel.register(Box::new(ConfigPlugin::new(ConfigBootstrap::new(
+        state_directory.join("configuration"),
+        vec![runtime_llm_schema(), config::openai_schema()],
+    ))?))?;
+    kernel.register(Box::new(SessionPlugin::new()?))?;
+    kernel.register(Box::new(services::CoreServices::new()?))?;
+    let owner = PluginId::new(services::OWNER)?;
+    kernel.start(&owner).await?;
+    let entry = registry
+        .get(&ServiceId::new(CONFIG_SERVICE_ID)?)?
+        .ok_or("配置服务缺失。")?;
+    let settings = entry
+        .value
+        .downcast::<ConfigServiceHandle>()
+        .map_err(|_| "配置服务类型错误。")?;
+    let request = settings.0.begin_request(LLM_NAMESPACE, 1)?;
+    let runtime = LlmRuntimeConfig::try_from(&settings.0.read_request(&request)?)?;
+    if runtime.response_mode != "complete" {
+        return Err(
+            "核心入口当前使用非流式模式，请将 runtime.llm.response_mode 配为 complete。".into(),
+        );
+    }
+    let request = settings.0.begin_request(config::OPENAI_NAMESPACE, 1)?;
+    let provider_config = config::provider_config(&settings.0.read_request(&request)?)?;
+    let timeout = provider_config.request_timeout;
+    let provider = OpenAiProvider::new(provider_config, &api_key)?;
+    let host = LlmHost::new(
+        Arc::new(provider),
+        registry.clone(),
+        kernel.clone(),
+        permissions,
+        ContextBinding {
+            service_id: ServiceId::new(services::CONTEXT)?,
+            expected_owner: owner.clone(),
+        },
+        vec![ToolBinding {
+            name: "echo".into(),
+            service_id: ServiceId::new(services::TOOL)?,
+            expected_owner: owner,
+        }],
+        LlmHostConfig {
+            provider_timeout: timeout,
+            max_parallel_tool_calls: runtime.max_parallel_tool_calls,
+            response_mode: ResponseMode::Complete,
+            ..host_config
+        },
+    )?;
+    let host =
+        Arc::new(SessionLlmHost::new(host, SessionBinding::builtin()).with_logger(logger));
+    kernel.register(Box::new(ControlPlugin::new(
+        Arc::new(SessionControlRunner::new(host)),
+        [services::OWNER, SESSION_PLUGIN_ID]
+            .into_iter()
+            .map(|id| {
+                Ok(PluginDependency {
+                    id: PluginId::new(id)?,
+                    requirement: Some("^0.1".into()),
+                })
+            })
+            .collect::<eve_plugin_api::PluginResult<Vec<_>>>()?,
+    )?))?;
+    kernel.start(&PluginId::new(CONTROL_PLUGIN_ID)?).await?;
+    let entry = registry
+        .get(&ServiceId::new(CONTROL_SERVICE_ID)?)?
+        .ok_or("控制服务缺失。")?;
+    let control = entry
+        .value
+        .downcast::<ControlServiceHandle>()
+        .map_err(|_| "控制服务类型错误。")?
+        .0
+        .clone();
+    Ok(control)
+}
+
+pub(crate) async fn finish_core<T>(
+    kernel: &Kernel,
+    result: Result<T, AppError>,
+) -> Result<T, AppError> {
     let stopped = kernel.stop_all().await;
     // 控制插件持有的执行器含 Kernel；停止后卸载以打破组合层引用环。
     let control_id = PluginId::new(CONTROL_PLUGIN_ID).expect("有效内置 ID");

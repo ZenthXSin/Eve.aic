@@ -1,5 +1,6 @@
 [package]
 name = "eve-app"
+default-run = "eve"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +9,10 @@ license.workspace = true
 [[bin]]
 name = "eve"
 path = "src/main.rs"
+
+[[bin]]
+name = "eve-qqbot"
+path = "src/bin/qqbot.rs"
 
 [dependencies]
 eve-agent-prompt = { path = "../agent-prompt" }
@@ -19,6 +24,7 @@ eve-kernel = { path = "../kernel" }
 eve-llm-api = { path = "../llm-api" }
 eve-llm-openai = { path = "../llm-openai" }
 eve-plugin-api = { path = "../plugin-api" }
+eve-qqbot-plugin = { path = "../qqbot-plugin" }
 eve-runtime = { path = "../runtime" }
 eve-session-api = { path = "../session-api" }
 eve-session-plugin = { path = "../session-plugin" }
