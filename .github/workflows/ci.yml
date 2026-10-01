@@ -43,6 +43,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: 运行测试与文档测试
         run: cargo test --workspace --locked
+      - name: 验证核心入口帮助
+        run: cargo run -p eve-app --locked -- --help
       - name: 运行插件协作验收
         run: cargo run -p eve-runtime --locked
       - name: 验证取消生命周期等待后的收尾
