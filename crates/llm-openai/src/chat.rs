@@ -88,20 +88,20 @@ pub(crate) fn decode_response(bytes: &[u8]) -> Result<ModelResponse, LlmError> {
     if required_str(message, "role")? != "assistant" {
         return Err(protocol("Chat 回复必须属于 assistant"));
     }
-    for key in [
-        "reasoning_content",
-        "reasoning",
-        "refusal",
-        "audio",
-        "function_call",
-    ] {
+    for key in ["reasoning_content", "reasoning"] {
         if message
             .get(key)
             .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
         {
-            return Err(unsupported(
-                "通用协议不能保留 Chat reasoning 或其他附加内容",
-            ));
+            eprintln!("WARN eve.llm.chat: ignored auxiliary reasoning field");
+        }
+    }
+    for key in ["refusal", "audio", "function_call"] {
+        if message
+            .get(key)
+            .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
+        {
+            return Err(unsupported("不支持 Chat 拒绝、音频或旧式函数调用"));
         }
     }
     let text = match message.get("content") {
@@ -142,7 +142,7 @@ pub(crate) fn decode_response(bytes: &[u8]) -> Result<ModelResponse, LlmError> {
         },
         ("tool_calls", false) => {
             if text.is_some_and(|v| !v.trim().is_empty()) {
-                return Err(unsupported("不支持 Chat 文本与工具调用混合输出"));
+                eprintln!("WARN eve.llm.chat: ignored tool-call explanatory text");
             }
             ModelResponse::ToolCalls { calls }
         }
@@ -268,7 +268,7 @@ mod tests {
         );
     }
     #[test]
-    fn rejects_incomplete_mixed_reasoning_and_multiple_choices() {
+    fn rejects_incomplete_unsupported_and_multiple_choices() {
         for finish in ["length", "content_filter"] {
             assert!(matches!(
                 decode(response(
@@ -279,9 +279,6 @@ mod tests {
             ));
         }
         for message in [
-            json!({"role":"assistant","content":"解释","tool_calls":[function("a")]}),
-            json!({"role":"assistant","content":null,"reasoning_content":"私有推理",
-                "tool_calls":[function("a")]}),
             json!({"role":"assistant","content":null,"refusal":"拒绝",
                 "tool_calls":[function("a")]}),
             json!({"role":"assistant","content":[],"tool_calls":[function("a")]}),
@@ -297,6 +294,30 @@ mod tests {
             decode(json!({"choices":[one.clone(),one]})),
             Err(LlmError::Unsupported(_))
         ));
+    }
+    #[test]
+    fn accepts_reasoning_metadata_and_explanation_without_changing_calls() {
+        assert_eq!(
+            decode(response(
+                json!({"role":"assistant","content":"解释","reasoning_content":"内部内容",
+                    "tool_calls":[function("a")]}),
+                "tool_calls",
+            ))
+            .unwrap(),
+            ModelResponse::ToolCalls {
+                calls: vec![call("a")]
+            }
+        );
+        assert_eq!(
+            decode(response(
+                json!({"role":"assistant","content":"最终回复","reasoning":"附加内容"}),
+                "stop",
+            ))
+            .unwrap(),
+            ModelResponse::Final {
+                text: "最终回复".into()
+            }
+        );
     }
     #[test]
     fn rejects_invalid_batches_and_duplicate_json_without_body_leakage() {
