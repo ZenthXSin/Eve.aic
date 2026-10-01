@@ -57,6 +57,6 @@ python3 connectors/qqbot/test/eve_e2e.py
 {"process_ok":true,"interaction_ok":false,"ready":true,"closed":true,"terminal_error":false,"received":0,"completed":0,"sent":0,"failed":0}
 ```
 
-本次窗口没有收到消息，工作流按真实交互条件返回失败；QQ 认证/连接与干净停止已验证，真实接收、模型处理和 QQ 回复仍未验收。需要测试用户/群在沙箱范围内，并在窗口期间发消息后复验。临时 PR 自动触发已移除，后续仅 main 手动运行；源码和报告不含密钥、QQ ID 或正文。
+本次窗口没有消息进入 Eve 的有效处理计数，工作流按真实交互条件返回失败；未记录 QQ 原始事件，不能据此反推平台没有推送。QQ 认证/连接与干净停止已验证，真实接收、模型处理和 QQ 回复仍未验收。最后协议核对发现官方示例的 msg_id 包含 `.` 与 `!`，首版字符限制会误过滤。现已在 Node 与 Rust 分开验证 openid 与不透明消息 ID，保留消息 ID 的原始标点，并补充官方样例的 Node 路由与真实 Eve 工具/恢复测试。来源为 [QQ 官方消息事件](https://github.com/tencent-connect/bot-docs/blob/645787a45937e5d9c4f0f61afefdffde0f38696e/docs/develop/api-v2/server-inter/message/send-receive/event.md)。正文中的提及也保留，不全局删除。该修复需要重新验收真实收发；不能把修复前的零计数解释为用户未发消息。测试用户/群需在沙箱范围内，并在新窗口期间发消息后复验。临时 PR 自动触发已移除，后续仅 main 手动运行；源码和报告不含密钥、QQ ID 或正文。
 
 媒体、QQ 频道、webhook、主动消息、消息修订/并行调度和凭据库接线后置；首版只做已验证的文本闭环。

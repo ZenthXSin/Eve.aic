@@ -13,10 +13,7 @@ pub(crate) fn valid_id(v: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 pub(crate) fn valid_message_id(v: &str) -> bool {
-    !v.is_empty()
-        && v.len() <= 128
-        && v.trim() == v
-        && !v.chars().any(char::is_control)
+    !v.is_empty() && v.len() <= 128 && v.trim() == v && !v.chars().any(char::is_control)
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
