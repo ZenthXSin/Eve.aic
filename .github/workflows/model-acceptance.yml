@@ -1,72 +1,72 @@
 name: 主模型真实多轮验收
 
 on:
-  pull_request:
-    types: [synchronize]
-    branches: [main]
-    paths: [.github/workflows/model-acceptance.yml]
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 支持所选 Chat/Responses 子集的主模型
+        required: true
+        default: deepseek-v4.1-flash
+        type: string
+      protocol:
+        description: 模型 API 协议
+        required: true
+        default: chat
+        type: choice
+        options: [chat, responses]
+      reasoning_effort:
+        description: 可选参数，模型不支持时留空
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: eve-model-acceptance
+  cancel-in-progress: false
+
 jobs:
-  diagnose:
-    if: >-
-      github.event.pull_request.number == 67 &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.head_ref == 'codex/chat-primary-model'
+  check:
+    # 只执行已合入主线且经过 CI 的代码，不读取 PR 分支的凭据。
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 30
+    env:
+      EVE_OPENAI_BASE_URL: "https://ai.xn--rhqr8xvr4ahqsgka.com"
     steps:
-      - name: 检出固定的已验证身份文件
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: fa010163ee2bed20a34e489e4913aee8141f10e3
-          persist-credentials: false
-      - name: 诊断关闭思考输出的显式参数（不输出正文或凭据）
+      - name: 检查主模型凭据
         env:
           EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
-        shell: python
         run: |
-          import json, os, urllib.request, urllib.error
-          from pathlib import Path
-          marker = "EVE_CHAT_PROBE"
-          messages = [
-              {"role": "system", "content": Path("AGENT.md").read_text()},
-              {"role": "user", "content": "这是 Eve 核心验收。请只调用一次 echo 工具，参数 text 为 " + marker + "。收到结果后回复完整口令，并记住供后续对话使用。"},
-              {"role": "assistant", "content": None, "tool_calls": [{"id": "call_eve_probe", "type": "function", "function": {"name": "echo", "arguments": json.dumps({"text": marker})}}]},
-              {"role": "tool", "tool_call_id": "call_eve_probe", "content": json.dumps({"echo": marker})},
-          ]
-          for label, extra in (("reasoning_effort_none", {"reasoning_effort": "none"}), ("thinking_disabled", {"thinking": {"type": "disabled"}})):
-              body = {"model": "deepseek-v4.1-flash", "messages": messages, "tools": [{"type": "function", "function": {"name": "echo", "description": "返回输入文本。", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"], "additionalProperties": False}}}], "max_tokens": 512, "stream": False, **extra}
-              request = urllib.request.Request("https://ai.xn--rhqr8xvr4ahqsgka.com/v1/chat/completions", data=json.dumps(body).encode(), headers={"Authorization": "Bearer " + os.environ["EVE_OPENAI_API_KEY"], "Content-Type": "application/json"}, method="POST")
-              report = {"diagnostic": label}
-              try:
-                  with urllib.request.urlopen(request, timeout=120) as response:
-                      report["http_status"] = response.status
-                      raw = response.read(1048577)
-                      report["within_size_limit"] = len(raw) <= 1048576
-                      if report["within_size_limit"]:
-                          data = json.loads(raw)
-                          choices = data.get("choices", [])
-                          report["choice_count"] = len(choices)
-                          if choices:
-                              choice = choices[0]
-                              report["choice_index_zero"] = choice.get("index") == 0
-                              reason = choice.get("finish_reason")
-                              report["finish_reason"] = reason if reason in ("stop", "tool_calls", "length", "content_filter") else "other"
-                              message = choice.get("message", {})
-                              report["known_message_fields"] = [key for key in ("role", "content", "reasoning_content", "reasoning", "tool_calls", "refusal", "audio", "function_call") if key in message]
-                              report["text_nonempty"] = bool(message.get("content"))
-                              report["reasoning_content_nonempty"] = bool(message.get("reasoning_content"))
-                              report["reasoning_nonempty"] = bool(message.get("reasoning"))
-                              report["refusal_nonempty"] = bool(message.get("refusal"))
-                              report["audio_nonempty"] = bool(message.get("audio"))
-                              report["has_expected_marker"] = isinstance(message.get("content"), str) and marker in message["content"]
-              except urllib.error.HTTPError as error:
-                  report["http_status"] = error.code
-              except urllib.error.URLError:
-                  report["transport_error"] = True
-              except (ValueError, TypeError, KeyError):
-                  report["invalid_response"] = True
-              print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+          if [ -z "$EVE_OPENAI_API_KEY" ]; then
+            echo "请在仓库 Actions Secrets 配置 EVE_OPENAI_API_KEY。"
+            exit 1
+          fi
+      - name: 检出主线
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 安装 Rust
+        run: rustup toolchain install 1.89.0 --profile minimal
+      - name: 构建核心入口
+        run: cargo +1.89.0 build -p eve-app --bin eve --example model_acceptance --locked
+      - name: 验收多轮与新进程恢复
+        env:
+          EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
+          EVE_OPENAI_MODEL: ${{ inputs.model }}
+          EVE_OPENAI_PROTOCOL: ${{ inputs.protocol }}
+          EVE_OPENAI_REASONING_EFFORT: ${{ inputs.reasoning_effort }}
+          EVE_OPENAI_TIMEOUT_SECONDS: "120"
+          EVE_OPENAI_MAX_OUTPUT_TOKENS: "512"
+          EVE_LLM_RESPONSE_MODE: complete
+        run: ./target/debug/examples/model_acceptance "$RUNNER_TEMP/eve-model-check"
+      - name: 保留无正文的验收报告
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: eve-model-acceptance-report
+          path: ${{ runner.temp }}/eve-model-check/acceptance.json
+          if-no-files-found: ignore
+          retention-days: 7

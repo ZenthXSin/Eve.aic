@@ -66,6 +66,10 @@ pub(crate) fn provider_config(snapshot: &ConfigSnapshot) -> Result<OpenAiConfig,
     config.request_timeout = Duration::from_secs(snapshot.get("timeout_seconds")?);
     config.max_output_tokens = Some(snapshot.get("max_output_tokens")?);
     let effort: String = snapshot.get("reasoning_effort")?;
-    config.reasoning_effort = (!effort.is_empty()).then_some(effort);
+    config.reasoning_effort = if effort.is_empty() {
+        (protocol == "chat").then(|| "none".into())
+    } else {
+        Some(effort)
+    };
     Ok(config)
 }
