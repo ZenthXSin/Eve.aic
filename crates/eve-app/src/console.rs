@@ -9,7 +9,9 @@ const MAX_PENDING: usize = 16;
 
 /// 保存完整控制报告，含生成输出、工具回执、提交状态和原始失败。
 #[derive(Debug)]
-pub struct ChatRunError { pub report: Box<ControlReport> }
+pub struct ChatRunError {
+    pub report: Box<ControlReport>,
+}
 impl std::fmt::Display for ChatRunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.report.run.commit {
@@ -20,26 +22,39 @@ impl std::fmt::Display for ChatRunError {
                 Some(RunFailure::Session(error) | RunFailure::Commit(error)) => error.fmt(f),
                 Some(RunFailure::FailureRecord { storage, .. }) => storage.fmt(f),
                 _ => f.write_str("任务未正常完成"),
-            }
+            },
         }
     }
 }
 impl std::error::Error for ChatRunError {}
 
-fn finish(report: ControlReport, output: &mut impl Write, summary: &mut ChatSummary) -> Result<(), AppError> {
+fn finish(
+    report: ControlReport,
+    output: &mut impl Write,
+    summary: &mut ChatSummary,
+) -> Result<(), AppError> {
     if report.run.commit == CommitState::Completed {
         summary.completed_turns += 1;
-        writeln!(output, "Eve：{}", report.run.text.as_deref().ok_or("完成报告缺少文本。")?)?;
+        writeln!(
+            output,
+            "Eve：{}",
+            report.run.text.as_deref().ok_or("完成报告缺少文本。")?
+        )?;
         let cancelled_delivery = report.cancel_requested
             && report.run.failure == Some(RunFailure::Delivery(LlmError::Cancelled));
         if report.run.failure.is_some() && !cancelled_delivery {
-            return Err(ChatRunError { report: Box::new(report) }.into());
+            return Err(ChatRunError {
+                report: Box::new(report),
+            }
+            .into());
         }
         if report.cancel_requested {
             writeln!(output, "Eve：本轮已完成并保存，取消未改写完成历史。")?;
         }
-    } else if matches!(report.run.commit, CommitState::NotStarted | CommitState::Failed)
-        && report.cancel_requested
+    } else if matches!(
+        report.run.commit,
+        CommitState::NotStarted | CommitState::Failed
+    ) && report.cancel_requested
         && report.run.failure == Some(RunFailure::Execution(LlmError::Cancelled))
     {
         summary.cancelled_turns += 1;
@@ -48,15 +63,30 @@ fn finish(report: ControlReport, output: &mut impl Write, summary: &mut ChatSumm
         && matches!(report.run.failure, Some(RunFailure::Execution(_)))
     {
         summary.failed_turns += 1;
-        writeln!(output, "Eve：本轮执行失败：{}。未自动重试。", ChatRunError { report: Box::new(report) })?;
+        writeln!(
+            output,
+            "Eve：本轮执行失败：{}。未自动重试。",
+            ChatRunError {
+                report: Box::new(report)
+            }
+        )?;
     } else {
         let displayed = if let Some(text) = &report.run.text {
             writeln!(output, "Eve：回复已生成但未保存：{text}").and_then(|()| output.flush())
-        } else { Ok(()) };
-        let primary: AppError = ChatRunError { report: Box::new(report) }.into();
+        } else {
+            Ok(())
+        };
+        let primary: AppError = ChatRunError {
+            report: Box::new(report),
+        }
+        .into();
         return Err(match displayed {
             Ok(()) => primary,
-            Err(error) => crate::AppFailure { primary, secondary: vec![error.into()] }.into(),
+            Err(error) => crate::AppFailure {
+                primary,
+                secondary: vec![error.into()],
+            }
+            .into(),
         });
     }
     output.flush()?;
@@ -82,16 +112,27 @@ pub(crate) async fn drive(
     let mut ordinal = 0u64;
     tokio::pin!(shutdown);
     loop {
-        if active.is_none() && !quitting && let Some(text) = pending.pop_front() {
+        if active.is_none()
+            && !quitting
+            && let Some(text) = pending.pop_front()
+        {
             ordinal = ordinal.checked_add(1).ok_or("终端任务编号耗尽。")?;
-            let target = control.submit(ControlInput {
-                session: SessionInput { key: key.clone(), text },
-                task_id: format!("console-{ordinal}"),
-            }, Arc::new(DiscardControlEvents))?;
+            let target = control.submit(
+                ControlInput {
+                    session: SessionInput {
+                        key: key.clone(),
+                        text,
+                    },
+                    task_id: format!("console-{ordinal}"),
+                },
+                Arc::new(DiscardControlEvents),
+            )?;
             let wait = control.wait(&target);
             active = Some((target, wait));
         }
-        if active.is_none() && (quitting || eof && pending.is_empty()) { break; }
+        if active.is_none() && (quitting || eof && pending.is_empty()) {
+            break;
+        }
         let next = tokio::select! {
             biased;
             report = async {
@@ -107,42 +148,53 @@ pub(crate) async fn drive(
             Next::Done(report) => {
                 active = None;
                 finish(report?, output, &mut summary)?;
-            },
+            }
             Next::Shutdown(signal) => {
                 signal?;
                 quitting = true;
                 pending.clear();
                 input.close();
-                if let Some((target, _)) = &active { control.cancel(target)?; }
-            },
+                if let Some((target, _)) = &active {
+                    control.cancel(target)?;
+                }
+            }
             Next::Input(None) => eof = true,
             Next::Input(Some(InputEvent::Failed(error))) => return Err(error),
             Next::Input(Some(InputEvent::TooLarge)) => {
                 writeln!(output, "Eve：输入超过 32768 字节，请缩短后重新提交。")?;
                 output.flush()?;
-            },
+            }
             Next::Input(Some(InputEvent::Line(text))) => match text.trim() {
-                "" => {},
-                "/help" => { writeln!(output, "{HELP}")?; output.flush()?; },
+                "" => {}
+                "/help" => {
+                    writeln!(output, "{HELP}")?;
+                    output.flush()?;
+                }
                 "/cancel" => {
                     pending.clear();
                     if let Some((target, _)) = &active {
                         control.cancel(target)?;
                         writeln!(output, "Eve：取消已请求，正在等待收尾。")?;
-                    } else { writeln!(output, "Eve：当前没有在途任务；待处理输入已清空。")?; }
+                    } else {
+                        writeln!(output, "Eve：当前没有在途任务；待处理输入已清空。")?;
+                    }
                     output.flush()?;
-                },
+                }
                 "/quit" => {
                     quitting = true;
                     pending.clear();
                     input.close();
-                    if let Some((target, _)) = &active { control.cancel(target)?; }
-                },
+                    if let Some((target, _)) = &active {
+                        control.cancel(target)?;
+                    }
+                }
                 _ => {
                     if pending.len() >= MAX_PENDING {
                         writeln!(output, "Eve：已有 16 条待处理输入，请等待后重新提交。")?;
                         output.flush()?;
-                    } else { pending.push_back(text); }
+                    } else {
+                        pending.push_back(text);
+                    }
                 }
             },
         }
@@ -151,9 +203,16 @@ pub(crate) async fn drive(
 }
 
 /// IO 或信号失败也先精确取消并确认收尾；禁止直接 stop 等待中的 Kernel。
-pub(crate) async fn settle(control: &dyn ControlService, key: &SessionKey) -> Result<Option<ControlReport>, AppError> {
-    let Some(snapshot) = control.snapshot(key)? else { return Ok(None); };
-    if snapshot.report.is_some() { return Ok(None); }
+pub(crate) async fn settle(
+    control: &dyn ControlService,
+    key: &SessionKey,
+) -> Result<Option<ControlReport>, AppError> {
+    let Some(snapshot) = control.snapshot(key)? else {
+        return Ok(None);
+    };
+    if snapshot.report.is_some() {
+        return Ok(None);
+    }
     control.cancel(&snapshot.key)?;
     Ok(Some(control.wait(&snapshot.key).await?))
 }
@@ -173,8 +232,12 @@ mod tests {
             },
             cancel_requested: true,
             run: RunReport {
-                turn_id: Some(1), commit, text: Some("已经生成".into()),
-                transcript: Some(vec![]), started_tools: Some(1), tool_results: vec![],
+                turn_id: Some(1),
+                commit,
+                text: Some("已经生成".into()),
+                transcript: Some(vec![]),
+                started_tools: Some(1),
+                tool_results: vec![],
                 failure: Some(RunFailure::Delivery(LlmError::Cancelled)),
             },
         }
@@ -187,12 +250,21 @@ mod tests {
         assert_eq!(summary.completed_turns, 1);
         assert_eq!(summary.cancelled_turns, 0);
         assert_eq!(summary.failed_turns, 0);
-        assert!(String::from_utf8(output).unwrap().contains("取消未改写完成历史"));
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("取消未改写完成历史")
+        );
     }
     #[test]
     fn pending_returns_original_output_and_tool_diagnostics() {
         let expected = report(CommitState::Pending);
-        let error = finish(expected.clone(), &mut Vec::new(), &mut ChatSummary::default()).unwrap_err();
+        let error = finish(
+            expected.clone(),
+            &mut Vec::new(),
+            &mut ChatSummary::default(),
+        )
+        .unwrap_err();
         let actual = error.downcast_ref::<ChatRunError>().unwrap();
         assert_eq!(*actual.report, expected);
     }

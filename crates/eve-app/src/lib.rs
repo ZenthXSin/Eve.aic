@@ -170,25 +170,57 @@ pub async fn run_console(
                 ..host_config
             },
         )?;
-        let host = Arc::new(SessionLlmHost::new(host, SessionBinding::builtin()).with_logger(logger));
+        let host =
+            Arc::new(SessionLlmHost::new(host, SessionBinding::builtin()).with_logger(logger));
         kernel.register(Box::new(ControlPlugin::new(
             Arc::new(SessionControlRunner::new(host)),
-            [services::OWNER, SESSION_PLUGIN_ID].into_iter().map(|id| {
-                Ok(PluginDependency { id: PluginId::new(id)?, requirement: Some("^0.1".into()) })
-            }).collect::<eve_plugin_api::PluginResult<Vec<_>>>()?,
+            [services::OWNER, SESSION_PLUGIN_ID]
+                .into_iter()
+                .map(|id| {
+                    Ok(PluginDependency {
+                        id: PluginId::new(id)?,
+                        requirement: Some("^0.1".into()),
+                    })
+                })
+                .collect::<eve_plugin_api::PluginResult<Vec<_>>>()?,
         )?))?;
         kernel.start(&PluginId::new(CONTROL_PLUGIN_ID)?).await?;
-        let entry = registry.get(&ServiceId::new(CONTROL_SERVICE_ID)?)?.ok_or("控制服务缺失。")?;
-        let control = entry.value.downcast::<ControlServiceHandle>().map_err(|_| "控制服务类型错误。")?.0.clone();
+        let entry = registry
+            .get(&ServiceId::new(CONTROL_SERVICE_ID)?)?
+            .ok_or("控制服务缺失。")?;
+        let control = entry
+            .value
+            .downcast::<ControlServiceHandle>()
+            .map_err(|_| "控制服务类型错误。")?
+            .0
+            .clone();
         let receiver = input::start(input)?;
-        let result = console::drive(control.clone(), key.clone(), receiver, &mut output, tokio::signal::ctrl_c()).await;
+        let result = console::drive(
+            control.clone(),
+            key.clone(),
+            receiver,
+            &mut output,
+            tokio::signal::ctrl_c(),
+        )
+        .await;
         let settled = console::settle(control.as_ref(), &key).await;
         match (result, settled) {
             (result, Ok(None)) => result,
             (Err(primary), Ok(Some(report))) => Err(AppFailure {
-                primary, secondary: vec![ChatRunError { report: Box::new(report) }.into()],
-            }.into()),
-            (Err(primary), Err(error)) => Err(AppFailure { primary, secondary: vec![error] }.into()),
+                primary,
+                secondary: vec![
+                    ChatRunError {
+                        report: Box::new(report),
+                    }
+                    .into(),
+                ],
+            }
+            .into()),
+            (Err(primary), Err(error)) => Err(AppFailure {
+                primary,
+                secondary: vec![error],
+            }
+            .into()),
             (Ok(_), Err(error)) => Err(error),
             (Ok(summary), Ok(Some(_))) => Ok(summary),
         }
@@ -199,7 +231,9 @@ pub async fn run_console(
     let control_id = PluginId::new(CONTROL_PLUGIN_ID).expect("有效内置 ID");
     let removed = if kernel.state(&control_id).is_some() {
         kernel.unregister(&control_id)
-    } else { Ok(()) };
+    } else {
+        Ok(())
+    };
     let flushed = kernel.flush_logs();
     // 三个结果都已执行；同时保留原始输出和各个收尾错误。
     let mut secondary: Vec<AppError> = Vec::new();

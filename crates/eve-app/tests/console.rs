@@ -194,11 +194,7 @@ async fn provider_failure_is_not_retried_or_added_to_completed_history() {
     let mut failed = Reply::json(json!({"error":"fixture-key 不应外泄"}));
     failed.status = 500;
     let mut server = Server::start(vec![failed, Reply::json(final_response("下一轮成功"))]).await;
-    let output = run(
-        command(root.path(), &server.url),
-        "失败输入\n新输入\n",
-    )
-    .await;
+    let output = run(command(root.path(), &server.url), "失败输入\n新输入\n").await;
     assert!(!output.status.success());
     assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-key"));
     assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture-key"));
@@ -281,10 +277,7 @@ async fn corrupt_state_is_preserved_and_session_owner_cannot_be_changed() {
 async fn oversized_input_and_local_commands_do_not_create_turns() {
     let root = fixture();
     let mut server = Server::start(vec![Reply::json(final_response("有效输入成功"))]).await;
-    let text = format!(
-        "{}\n/help\n\n有效输入\n",
-        "长".repeat(12000)
-    );
+    let text = format!("{}\n/help\n\n有效输入\n", "长".repeat(12000));
     let output = run(command(root.path(), &server.url), &text).await;
     assert!(
         output.status.success(),
@@ -367,11 +360,21 @@ struct Interactive {
 impl Interactive {
     fn start(mut command: Command) -> Self {
         command.env("EVE_OPENAI_TIMEOUT_SECONDS", "30");
-        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
         let stdin = child.stdin.take();
-        Self { child: Some(child), stdin }
+        Self {
+            child: Some(child),
+            stdin,
+        }
     }
-    fn write(&mut self, text: &str) { self.write_bytes(text.as_bytes()); }
+    fn write(&mut self, text: &str) {
+        self.write_bytes(text.as_bytes());
+    }
     fn write_bytes(&mut self, bytes: &[u8]) {
         let stdin = self.stdin.as_mut().unwrap();
         stdin.write_all(bytes).unwrap();
@@ -381,10 +384,14 @@ impl Interactive {
         // stdin 故意保持打开；退出不能等标准输入读线程结束。
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if self.child.as_mut().unwrap().try_wait().unwrap().is_some() { break; }
+                if self.child.as_mut().unwrap().try_wait().unwrap().is_some() {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.expect("命令退出/取消收尾超过期限");
+        })
+        .await
+        .expect("命令退出/取消收尾超过期限");
         self.child.take().unwrap().wait_with_output().unwrap()
     }
 }
@@ -399,10 +406,16 @@ impl Drop for Interactive {
 async fn completed(root: &Path, index: usize) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if sessions(root)["sessions"]["default"]["turns"][index]["status"]["state"] == "Completed" { break; }
+            if sessions(root)["sessions"]["default"]["turns"][index]["status"]["state"]
+                == "Completed"
+            {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 fn delayed(text: &str) -> Reply {
     let mut reply = Reply::json(final_response(text));
@@ -416,7 +429,8 @@ async fn cancel_clears_bounded_queue_then_new_input_and_restart_succeed() {
         delayed("不应显示的旧回复"),
         Reply::json(final_response("后续任务完成")),
         Reply::json(final_response("恢复完成")),
-    ]).await;
+    ])
+    .await;
     let mut process = Interactive::start(command(root.path(), &server.url));
     process.write("旧任务\n");
     assert_eq!(user_texts(&server.next().await.body), ["旧任务"]);
@@ -425,18 +439,42 @@ async fn cancel_clears_bounded_queue_then_new_input_and_restart_succeed() {
     completed(root.path(), 1).await;
     process.write("/quit\n");
     let output = process.finish().await;
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("当前轮次已取消并完成收尾"));
     assert!(stdout.contains("已有 16 条待处理输入"));
     assert!(stdout.contains("后续任务完成"));
     assert!(!stdout.contains("不应显示的旧回复"));
     let document = sessions(root.path());
-    assert_eq!(document["sessions"]["default"]["turns"][0]["status"]["failure"]["code"], "Cancelled");
-    assert_eq!(document["sessions"]["default"]["turns"][0]["status"]["failure"]["started_tools"], 0);
-    assert_eq!(document["sessions"]["default"]["turns"].as_array().unwrap().len(), 2);
-    assert!(run(command(root.path(), &server.url), "重启新轮\n").await.status.success());
-    assert_eq!(user_texts(&server.next().await.body), ["新任务", "重启新轮"]);
+    assert_eq!(
+        document["sessions"]["default"]["turns"][0]["status"]["failure"]["code"],
+        "Cancelled"
+    );
+    assert_eq!(
+        document["sessions"]["default"]["turns"][0]["status"]["failure"]["started_tools"],
+        0
+    );
+    assert_eq!(
+        document["sessions"]["default"]["turns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        run(command(root.path(), &server.url), "重启新轮\n")
+            .await
+            .status
+            .success()
+    );
+    assert_eq!(
+        user_texts(&server.next().await.body),
+        ["新任务", "重启新轮"]
+    );
     assert!(server.requests.try_recv().is_err());
 }
 #[tokio::test]
@@ -448,9 +486,22 @@ async fn quit_cancels_inflight_request_with_open_stdin_and_discards_queue() {
     server.next().await;
     process.write("排队输入\n/quit\n");
     let output = process.finish().await;
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(sessions(root.path())["sessions"]["default"]["turns"].as_array().unwrap().len(), 1);
-    assert_eq!(sessions(root.path())["sessions"]["default"]["turns"][0]["status"]["failure"]["code"], "Cancelled");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        sessions(root.path())["sessions"]["default"]["turns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        sessions(root.path())["sessions"]["default"]["turns"][0]["status"]["failure"]["code"],
+        "Cancelled"
+    );
     assert!(server.requests.try_recv().is_err());
 }
 #[tokio::test]
@@ -467,15 +518,29 @@ async fn quit_after_tool_result_waits_for_cancel_and_restart_never_replays_tool(
     process.write("调用一次 echo\n");
     server.next().await;
     let request = server.next().await.body;
-    let result = request["input"].as_array().unwrap().iter().find(|m| m["type"] == "function_call_output").unwrap();
+    let result = request["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["type"] == "function_call_output")
+        .unwrap();
     assert_eq!(result["call_id"], "cancel-echo");
-    assert_eq!(serde_json::from_str::<Value>(result["output"].as_str().unwrap()).unwrap(), json!({"echo":"取消前回执"}));
+    assert_eq!(
+        serde_json::from_str::<Value>(result["output"].as_str().unwrap()).unwrap(),
+        json!({"echo":"取消前回执"})
+    );
     process.write("/quit\n");
     assert!(process.finish().await.status.success());
-    let failure = sessions(root.path())["sessions"]["default"]["turns"][0]["status"]["failure"].clone();
+    let failure =
+        sessions(root.path())["sessions"]["default"]["turns"][0]["status"]["failure"].clone();
     assert_eq!(failure["code"], "Cancelled");
     assert_eq!(failure["started_tools"], 1);
-    assert!(run(command(root.path(), &server.url), "独立新输入\n").await.status.success());
+    assert!(
+        run(command(root.path(), &server.url), "独立新输入\n")
+            .await
+            .status
+            .success()
+    );
     assert_eq!(user_texts(&server.next().await.body), ["独立新输入"]);
     assert!(server.requests.try_recv().is_err());
 }
@@ -490,7 +555,10 @@ async fn invalid_utf8_during_request_cancels_and_saves_failure_before_exit() {
     let output = process.finish().await;
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("UTF-8"));
-    assert_eq!(sessions(root.path())["sessions"]["default"]["turns"][0]["status"]["failure"]["code"], "Cancelled");
+    assert_eq!(
+        sessions(root.path())["sessions"]["default"]["turns"][0]["status"]["failure"]["code"],
+        "Cancelled"
+    );
 }
 #[tokio::test]
 async fn cancellation_record_failure_keeps_pending_and_stops_new_input() {
@@ -512,7 +580,10 @@ async fn cancellation_record_failure_keeps_pending_and_stops_new_input() {
     assert_eq!(std::fs::read(&preserved).unwrap(), original);
     std::fs::remove_dir(&target).unwrap();
     std::fs::rename(&preserved, &target).unwrap();
-    assert_eq!(sessions(root.path())["sessions"]["default"]["turns"][0]["status"]["state"], "Pending");
+    assert_eq!(
+        sessions(root.path())["sessions"]["default"]["turns"][0]["status"]["state"],
+        "Pending"
+    );
 }
 #[cfg(unix)]
 #[tokio::test]
@@ -523,9 +594,18 @@ async fn actual_sigint_cancels_and_exits_even_when_stdin_remains_open() {
     process.write("Ctrl+C 运行中轮次\n");
     server.next().await;
     let pid = process.child.as_ref().unwrap().id();
-    assert!(Command::new("kill").args(["-INT", &pid.to_string()]).status().unwrap().success());
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
     assert!(process.finish().await.status.success());
-    assert_eq!(sessions(root.path())["sessions"]["default"]["turns"][0]["status"]["failure"]["code"], "Cancelled");
+    assert_eq!(
+        sessions(root.path())["sessions"]["default"]["turns"][0]["status"]["failure"]["code"],
+        "Cancelled"
+    );
 }
 
 #[tokio::test]
@@ -538,8 +618,16 @@ async fn same_process_entry_releases_directory_before_second_invocation() {
             ..eve_app::ChatOptions::default()
         };
         let mut output = Vec::new();
-        eve_app::run_console(options.clone(), std::io::Cursor::new("同进程第一轮"), &mut output).await.unwrap();
-        eve_app::run_console(options, std::io::Cursor::new("同进程第二轮"), &mut output).await.unwrap();
+        eve_app::run_console(
+            options.clone(),
+            std::io::Cursor::new("同进程第一轮"),
+            &mut output,
+        )
+        .await
+        .unwrap();
+        eve_app::run_console(options, std::io::Cursor::new("同进程第二轮"), &mut output)
+            .await
+            .unwrap();
         assert!(String::from_utf8(output).unwrap().contains("第二轮完成"));
         return;
     }
@@ -547,17 +635,34 @@ async fn same_process_entry_releases_directory_before_second_invocation() {
     let mut server = Server::start(vec![
         Reply::json(final_response("第一轮完成")),
         Reply::json(final_response("第二轮完成")),
-    ]).await;
+    ])
+    .await;
     // 在独立测试子进程注入环境；测试进程本身不修改全局环境。
     let configured = command(root.path(), &server.url);
     let mut harness = Command::new(std::env::current_exe().unwrap());
     for (name, value) in configured.get_envs() {
-        if let Some(value) = value { harness.env(name, value); } else { harness.env_remove(name); }
+        if let Some(value) = value {
+            harness.env(name, value);
+        } else {
+            harness.env_remove(name);
+        }
     }
-    harness.args(["--exact", "same_process_entry_releases_directory_before_second_invocation", "--nocapture"]);
+    harness.args([
+        "--exact",
+        "same_process_entry_releases_directory_before_second_invocation",
+        "--nocapture",
+    ]);
     harness.env("EVE_TEST_REENTER_ROOT", root.path());
     let result = run(harness, "").await;
-    assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert_eq!(user_texts(&server.next().await.body), ["同进程第一轮"]);
-    assert_eq!(user_texts(&server.next().await.body), ["同进程第一轮", "同进程第二轮"]);
+    assert_eq!(
+        user_texts(&server.next().await.body),
+        ["同进程第一轮", "同进程第二轮"]
+    );
 }
