@@ -15,9 +15,9 @@ let provider = OpenAiProvider::new(config, credential)?;
 
 支持非流式有序 system/user/assistant 文本、assistant tool_calls 批次和逐项 role=tool / tool_call_id 回执；工具定义使用嵌套 function。对象参数和成功/失败回执编码为 JSON 字符串，保留原调用 ID、顺序和完整历史；工具定义按名称排序。空工具列表不发送 tools，Chat 不发送 Responses 的 input、phase、store 或 max_output_tokens。可选输出上限使用 max_tokens，可选 reasoning_effort 使用同名标量，默认均不由库发送。
 
-回复只接受单个 index=0 的 assistant choice。stop 必须是完整非空文本且没有工具；tool_calls 必须含完整合法批次，允许 content 为 null/空，不丢弃非空解释文本。length/content_filter 明确失败，批次完整校验后才允许执行工具。重复 JSON 键、坏参数、空/重复调用 ID、非法消息和终态不匹配拒绝；reasoning_content、refusal、混合文本与工具、音频和旧 function_call 无法被当前通用契约完整保留，返回 Unsupported。请求 Chat stream 也在发 HTTP 前返回 Unsupported。
+回复只接受单个 index=0 的 assistant choice。stop 必须是完整非空文本且没有工具；tool_calls 必须含完整合法批次，允许 content 为 null/空；非空工具说明通过无正文 warning 忽略，保留完整工具批次。length/content_filter 明确失败，批次完整校验后才允许执行工具。重复 JSON 键、坏参数、空/重复调用 ID、非法消息和终态不匹配拒绝；附加 reasoning_content/reasoning 通过无正文 warning 忽略；refusal、音频和旧 function_call 返回 Unsupported。附加内容不进入 Session，也不提供 reasoning 续传。请求 Chat stream 也在发 HTTP 前返回 Unsupported。
 
-核心验收真实启动两个 Eve 子进程，对回环 Chat 服务器完成三轮、四次请求、一次插件 echo、revision 4→6 和重启新轮零工具；同一流程另验收截断回复零工具。Provider HTTP 测试覆盖请求字段、凭据、期限/取消、上限、无重试与错误脱敏。本地 HTTP 通过不表示 deepseek-v4.1-flash 的外部服务实测已通过；新模型的真实验收结果需单独记录。
+核心验收真实启动两个 Eve 子进程，对回环 Chat 服务器完成三轮、四次请求、一次插件 echo、revision 4→6 和重启新轮零工具；同一流程另验收截断回复零工具。Provider HTTP 测试覆盖请求字段、凭据、期限/取消、上限、无重试与错误脱敏。deepseek-v4.1-flash / Chat / none 已于 2026-10-01 完成同一核心的外部三轮、一次工具及独立进程恢复实测，详见[主模型验收](./主模型验收.md)。核心 Chat 普通配置空 reasoning_effort 映射为 none；库自身仍默认不发送可选参数。
 
 ## Responses 接入（既有能力）
 
