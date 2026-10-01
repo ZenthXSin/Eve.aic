@@ -1,0 +1,65 @@
+name: 主模型真实多轮验收
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 支持当前 Responses 子集的主模型
+        required: true
+        default: gpt-5.6-sol
+        type: string
+      reasoning_effort:
+        description: 可选参数，模型不支持时留空
+        required: false
+        default: none
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eve-model-acceptance
+  cancel-in-progress: false
+
+jobs:
+  check:
+    # 只执行已合入主线且经过 CI 的代码，不读取 PR 分支的凭据。
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检查既有服务配置
+        env:
+          EVE_OPENAI_BASE_URL: ${{ secrets.EVE_OPENAI_BASE_URL }}
+          EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
+        run: |
+          if [ -z "$EVE_OPENAI_BASE_URL" ] || [ -z "$EVE_OPENAI_API_KEY" ]; then
+            echo "请在仓库 Actions Secrets 配置 EVE_OPENAI_BASE_URL 与 EVE_OPENAI_API_KEY。"
+            exit 1
+          fi
+      - name: 检出主线
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 安装 Rust
+        run: rustup toolchain install 1.89.0 --profile minimal
+      - name: 构建核心入口
+        run: cargo +1.89.0 build -p eve-app --bin eve --locked
+      - name: 验收多轮与新进程恢复
+        env:
+          EVE_OPENAI_BASE_URL: ${{ secrets.EVE_OPENAI_BASE_URL }}
+          EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
+          EVE_OPENAI_MODEL: ${{ inputs.model }}
+          EVE_OPENAI_REASONING_EFFORT: ${{ inputs.reasoning_effort }}
+          EVE_OPENAI_TIMEOUT_SECONDS: "120"
+          EVE_OPENAI_MAX_OUTPUT_TOKENS: "512"
+          EVE_LLM_RESPONSE_MODE: complete
+        run: cargo +1.89.0 run -p eve-app --example model_acceptance --locked -- "$RUNNER_TEMP/eve-model-check"
+      - name: 保留无正文的验收报告
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: eve-model-acceptance-report
+          path: ${{ runner.temp }}/eve-model-check/acceptance.json
+          if-no-files-found: ignore
+          retention-days: 7
