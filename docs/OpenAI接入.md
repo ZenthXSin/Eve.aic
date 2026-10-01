@@ -113,4 +113,4 @@ CI 只使用回环 HTTP 夹具和确定性 Mock，不读取真实凭据。真实
 
 SessionLlmHost 已在文件后端重建后，用本地 Responses HTTP 服务器验收第二轮历史：保留旧 function_call / function_call_output、顺序、参数、成功回执和失败结果，assistant 文本携带 final_answer；旧工具执行次数为 0。该验证不使用 previous_response_id，也不代表已经完成真实 API 多轮兼容性验收。详见[会话恢复](./会话恢复.md)。
 
-流式请求、严格 SSE 支持子集及事件消费详见[流式输出](./streaming.md)。当前真实验收记录仅涵盖既有非流式文本与工具模式，SSE 本地验收不能代替代理/模型的实测。
+流式请求、严格 SSE 支持子集及事件消费详见[流式输出](./streaming.md)。2026-10-01 新增了核心入口非流式多轮及独立进程恢复的[真实验收记录](./主模型验收.md#2026-10-01-外部实测)：gpt-5.6-sol / none，三轮、一次 echo、恢复轮零工具和 revision 4→6 均通过。真实 SSE 仍待单独验收。
