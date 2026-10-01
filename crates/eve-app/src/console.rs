@@ -94,7 +94,7 @@ fn finish(
 }
 enum Next {
     Input(Option<InputEvent>),
-    Done(ControlResult<ControlReport>),
+    Done(Box<ControlResult<ControlReport>>),
     Shutdown(std::io::Result<()>),
 }
 pub(crate) async fn drive(
@@ -140,14 +140,14 @@ pub(crate) async fn drive(
                     Some((_, wait)) => wait.await,
                     None => std::future::pending().await,
                 }
-            } => Next::Done(report),
+            } => Next::Done(Box::new(report)),
             signal = &mut shutdown, if !quitting => Next::Shutdown(signal),
             event = input.recv(), if !eof && !quitting => Next::Input(event),
         };
         match next {
             Next::Done(report) => {
                 active = None;
-                finish(report?, output, &mut summary)?;
+                finish((*report)?, output, &mut summary)?;
             }
             Next::Shutdown(signal) => {
                 signal?;
