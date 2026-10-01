@@ -274,7 +274,10 @@ fn invalid_file_and_inconsistent_metadata_fail_before_provider_or_tools() {
             assert!(matches!(error, LlmError::Configuration(_)));
             assert!(!format!("{error:?}").contains("PRIVATE_AGENT_BODY"));
         }
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "PRIVATE_AGENT_BODY");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "PRIVATE_AGENT_BODY"
+        );
     }
     let mut config = LlmHostConfig::default()
         .with_prompt_source(&InlineAgentPrompt::new("original"))
