@@ -28,9 +28,13 @@ pub(crate) fn openai_schema() -> ConfigSchema {
         fields: BTreeMap::from([
             (
                 "base_url".into(),
-                string("https://api.openai.com/v1", "EVE_OPENAI_BASE_URL"),
+                string("https://ai.xn--rhqr8xvr4ahqsgka.com", "EVE_OPENAI_BASE_URL"),
             ),
-            ("model".into(), string("", "EVE_OPENAI_MODEL")),
+            (
+                "model".into(),
+                string("deepseek-v4.1-flash", "EVE_OPENAI_MODEL"),
+            ),
+            ("protocol".into(), string("chat", "EVE_OPENAI_PROTOCOL")),
             (
                 "reasoning_effort".into(),
                 string("", "EVE_OPENAI_REASONING_EFFORT"),
@@ -52,7 +56,13 @@ pub(crate) fn provider_config(snapshot: &ConfigSnapshot) -> Result<OpenAiConfig,
         return Err("请配置主模型：EVE_OPENAI_MODEL 或 provider.openai.model。".into());
     }
     let base_url: String = snapshot.get("base_url")?;
-    let mut config = OpenAiConfig::new(model).with_base_url(&base_url)?;
+    let protocol: String = snapshot.get("protocol")?;
+    let config = match protocol.as_str() {
+        "chat" => OpenAiConfig::chat(model),
+        "responses" => OpenAiConfig::new(model),
+        _ => return Err("provider.openai.protocol 必须为 chat 或 responses。".into()),
+    };
+    let mut config = config.with_base_url(&base_url)?;
     config.request_timeout = Duration::from_secs(snapshot.get("timeout_seconds")?);
     config.max_output_tokens = Some(snapshot.get("max_output_tokens")?);
     let effort: String = snapshot.get("reasoning_effort")?;

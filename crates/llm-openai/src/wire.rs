@@ -60,7 +60,7 @@ pub(crate) fn encode_request(model: &str, request: ModelRequest) -> Result<Value
     }))
 }
 
-fn validate_function_name(name: &str) -> Result<(), LlmError> {
+pub(crate) fn validate_function_name(name: &str) -> Result<(), LlmError> {
     if name.is_empty()
         || name.len() > 64
         || !name

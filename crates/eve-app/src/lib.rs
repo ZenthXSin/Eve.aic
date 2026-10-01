@@ -35,8 +35,8 @@ use std::{
 pub type AppError = Box<dyn std::error::Error + Send + Sync>;
 pub const HELP: &str = "Eve 核心对话入口
 用法：eve [--state-dir 目录] [--agent AGENT.md] [--session 会话] [--user 用户]
-主模型：EVE_OPENAI_MODEL；凭据：EVE_OPENAI_API_KEY（仅宿主环境）
-可选：EVE_OPENAI_BASE_URL、EVE_OPENAI_REASONING_EFFORT
+主模型默认 deepseek-v4.1-flash，可用 EVE_OPENAI_MODEL 替换；凭据：EVE_OPENAI_API_KEY
+协议默认 chat；EVE_OPENAI_PROTOCOL 可选 chat/responses\n可选：EVE_OPENAI_BASE_URL、EVE_OPENAI_REASONING_EFFORT
 一行一轮；/cancel 取消当前轮；/quit 或 Ctrl+C 取消并退出；/help 查看说明。
 EOF 处理完已接收输入后退出；最多 16 条待处理输入，取消/退出会清空队列。
 输入上限 32768 字节；当前入口使用非流式模式，串行执行和保存。";

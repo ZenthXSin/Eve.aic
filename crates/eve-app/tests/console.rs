@@ -19,6 +19,7 @@ fn command(root: &Path, url: &str) -> Command {
     for name in [
         "EVE_OPENAI_API_KEY",
         "EVE_OPENAI_MODEL",
+        "EVE_OPENAI_PROTOCOL",
         "EVE_OPENAI_BASE_URL",
         "EVE_OPENAI_REASONING_EFFORT",
         "EVE_OPENAI_TIMEOUT_SECONDS",
@@ -31,6 +32,7 @@ fn command(root: &Path, url: &str) -> Command {
     command
         .env("EVE_OPENAI_API_KEY", "fixture-key")
         .env("EVE_OPENAI_MODEL", "fixture-model")
+        .env("EVE_OPENAI_PROTOCOL", "responses")
         .env("EVE_OPENAI_BASE_URL", url)
         .env("EVE_OPENAI_TIMEOUT_SECONDS", "2")
         .env("EVE_OPENAI_REASONING_EFFORT", "none");

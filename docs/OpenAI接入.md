@@ -1,4 +1,25 @@
-# OpenAI Responses 接入
+# OpenAI 兼容模型接入
+
+## Chat Completions 第一切片
+
+eve-llm-openai 新增显式 Chat Completions 模式；复用现有凭据、TLS、超时、响应上限、取消与错误脱敏传输。定义层与 Kernel 不持有厂商格式。核心入口和手动真实验收默认 deepseek-v4.1-flash / chat，普通配置与宿主环境仍可替换模型、协议和基址。
+
+```rust
+use eve_llm_openai::{OpenAiConfig, OpenAiProvider};
+
+let config = OpenAiConfig::chat(model).with_base_url(base_url)?;
+let provider = OpenAiProvider::new(config, credential)?;
+```
+
+根地址补 /v1/chat/completions，版本/代理路径补 /chat/completions，完整 Chat 端点不重复；明确传入 Responses 完整端点时报告协议不匹配。protocol 显式选定，不做失败后的协议或模型回退。现有 responses_url 字段保留历史名称，在 Chat 模式中保存完整 Chat 端点。
+
+支持非流式有序 system/user/assistant 文本、assistant tool_calls 批次和逐项 role=tool / tool_call_id 回执；工具定义使用嵌套 function。对象参数和成功/失败回执编码为 JSON 字符串，保留原调用 ID、顺序和完整历史；工具定义按名称排序。空工具列表不发送 tools，Chat 不发送 Responses 的 input、phase、store 或 max_output_tokens。可选输出上限使用 max_tokens，可选 reasoning_effort 使用同名标量，默认均不由库发送。
+
+回复只接受单个 index=0 的 assistant choice。stop 必须是完整非空文本且没有工具；tool_calls 必须含完整合法批次，允许 content 为 null/空，不丢弃非空解释文本。length/content_filter 明确失败，批次完整校验后才允许执行工具。重复 JSON 键、坏参数、空/重复调用 ID、非法消息和终态不匹配拒绝；reasoning_content、refusal、混合文本与工具、音频和旧 function_call 无法被当前通用契约完整保留，返回 Unsupported。请求 Chat stream 也在发 HTTP 前返回 Unsupported。
+
+核心验收真实启动两个 Eve 子进程，对回环 Chat 服务器完成三轮、四次请求、一次插件 echo、revision 4→6 和重启新轮零工具；同一流程另验收截断回复零工具。Provider HTTP 测试覆盖请求字段、凭据、期限/取消、上限、无重试与错误脱敏。本地 HTTP 通过不表示 deepseek-v4.1-flash 的外部服务实测已通过；新模型的真实验收结果需单独记录。
+
+## Responses 接入（既有能力）
 
 已实现 `eve-llm-openai`，依赖 `eve-llm-api` 的公开契约，通过 `reqwest 0.12.28` 发送 Responses HTTP 或 SSE 请求，默认非流式。Kernel 和业务插件不依赖厂商格式或 HTTP 客户端。当前完成转换、本地 HTTP、Runtime 工具循环和取消验收；真实模型验证见下方集成验收记录。
 
