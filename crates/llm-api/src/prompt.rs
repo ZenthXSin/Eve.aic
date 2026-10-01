@@ -25,7 +25,11 @@ pub struct SystemPromptSnapshot {
 }
 
 impl SystemPromptSnapshot {
-    pub fn new(text: String, origin: SystemPromptOrigin, revision: String) -> Result<Self, LlmError> {
+    pub fn new(
+        text: String,
+        origin: SystemPromptOrigin,
+        revision: String,
+    ) -> Result<Self, LlmError> {
         if text.trim().is_empty() || text.contains('\0') || revision.trim().is_empty() {
             return Err(LlmError::Configuration("提示词内容或版本无效".into()));
         }

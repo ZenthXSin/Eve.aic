@@ -7,8 +7,8 @@ use eve_llm_api::{
     ChatMessage, ChatRole, ContextAssembler, ContextService, ContextSnapshot, LlmError, LlmFuture,
     LlmProvider, ModelRequest, ModelResponse, ModelTextSink, ResponseMode, SystemPromptMetadata,
     SystemPromptSnapshot, SystemPromptSource, Tool, ToolBinding, ToolCall, ToolCancellation,
-    ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolFailureCode, ToolResult, ToolService,
-    TurnEvent, TurnEventKind, TurnEventSink, TurnInput,
+    ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolFailureCode, ToolResult,
+    ToolService, TurnEvent, TurnEventKind, TurnEventSink, TurnInput,
 };
 use eve_plugin_api::{
     Permission, PermissionChecker, PluginError, PluginId, PluginManifest, PluginState,
@@ -90,7 +90,10 @@ impl LlmHostConfig {
         self.with_prompt_snapshot(source.load()?)
     }
 
-    pub fn with_prompt_snapshot(mut self, snapshot: SystemPromptSnapshot) -> Result<Self, LlmError> {
+    pub fn with_prompt_snapshot(
+        mut self,
+        snapshot: SystemPromptSnapshot,
+    ) -> Result<Self, LlmError> {
         self.system_prompt = snapshot.text().into();
         self.system_prompt_snapshot = Some(snapshot);
         self.validate()?;

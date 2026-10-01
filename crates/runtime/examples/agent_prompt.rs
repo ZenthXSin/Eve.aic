@@ -5,7 +5,10 @@ use eve_llm_api::*;
 use eve_plugin_api::{PluginId, PluginManifest, ServiceId};
 use eve_runtime::{ContextBinding, LlmHost, LlmHostConfig};
 use serde_json::json;
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 #[path = "support/llm_services.rs"]
 mod llm_services;
@@ -49,16 +52,22 @@ impl LlmProvider for CheckingProvider {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
-    let path = args.next().map(std::path::PathBuf::from).unwrap_or_else(|| {
-        std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../AGENT.md"))
-    });
+    let path = args
+        .next()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../AGENT.md"))
+        });
     if args.next().is_some() {
         return Err("用法：agent_prompt [明确选择的 AGENT.md 路径]".into());
     }
     // 文件校验失败时，在 Provider 和插件启动之前结束。
     let config = LlmHostConfig::default().with_prompt_source(&FileAgentPrompt::new(path)?)?;
     let provider = Arc::new(CheckingProvider {
-        prefix: format!("{}\noutput format: {}", config.system_prompt, config.output_format),
+        prefix: format!(
+            "{}\noutput format: {}",
+            config.system_prompt, config.output_format
+        ),
         requests: AtomicUsize::new(0),
     });
     let services = KernelServices::default();
@@ -66,30 +75,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let permissions = services.permissions.clone();
     let kernel = Kernel::with_services(services);
     let owner = PluginId::new(OWNER)?;
-    kernel.register(Box::new(ServicePlugin { manifest: PluginManifest::new(OWNER, "0.1.0")? }))?;
+    kernel.register(Box::new(ServicePlugin {
+        manifest: PluginManifest::new(OWNER, "0.1.0")?,
+    }))?;
     let result = async {
         kernel.start(&owner).await?;
         let host = LlmHost::new(
-            provider.clone(), registry, kernel.clone(), permissions,
-            ContextBinding { service_id: ServiceId::new(CONTEXT)?, expected_owner: owner.clone() },
-            vec![ToolBinding { name: "echo".into(), service_id: ServiceId::new(TOOL)?, expected_owner: owner }],
+            provider.clone(),
+            registry,
+            kernel.clone(),
+            permissions,
+            ContextBinding {
+                service_id: ServiceId::new(CONTEXT)?,
+                expected_owner: owner.clone(),
+            },
+            vec![ToolBinding {
+                name: "echo".into(),
+                service_id: ServiceId::new(TOOL)?,
+                expected_owner: owner,
+            }],
             config,
         )?;
         let metadata = host.system_prompt_metadata().ok_or("缺少提示词来源")?;
-        let output = host.run_turn(TurnInput { text: "执行一次 echo 并报告结果".into() }).await.map_err(|failure| failure.error)?;
+        let output = host
+            .run_turn(TurnInput {
+                text: "执行一次 echo 并报告结果".into(),
+            })
+            .await
+            .map_err(|failure| failure.error)?;
         if output.diagnostics.provider_requests != 2 || output.diagnostics.started_tools != 1 {
             return Err("模型和工具往返次数不符".into());
         }
-        println!("{}", json!({
-            "source": "file",
-            "revision": metadata.revision,
-            "prompt_bytes": metadata.bytes,
-            "provider_requests": output.diagnostics.provider_requests,
-            "started_tools": output.diagnostics.started_tools,
-            "reply": output.text,
-        }));
+        println!(
+            "{}",
+            json!({
+                "source": "file",
+                "revision": metadata.revision,
+                "prompt_bytes": metadata.bytes,
+                "provider_requests": output.diagnostics.provider_requests,
+                "started_tools": output.diagnostics.started_tools,
+                "reply": output.text,
+            })
+        );
         Ok::<_, Box<dyn std::error::Error>>(())
-    }.await;
+    }
+    .await;
     let stopped = kernel.stop_all().await;
     let flushed = kernel.flush_logs();
     result?;

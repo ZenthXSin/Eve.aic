@@ -40,7 +40,9 @@ impl FileAgentPrompt {
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.eq_ignore_ascii_case("AGENTS.md"))
         {
-            return Err(configuration("AGENTS.md 是开发协作约定，不能作为 Agent 来源"));
+            return Err(configuration(
+                "AGENTS.md 是开发协作约定，不能作为 Agent 来源",
+            ));
         }
         let path = if path.is_absolute() {
             path.to_path_buf()
@@ -83,8 +85,8 @@ impl SystemPromptSource for FileAgentPrompt {
         if bytes.len() > MAX_AGENT_PROMPT_BYTES {
             return Err(configuration("AGENT 文件超过 65536 字节上限"));
         }
-        let text = String::from_utf8(bytes)
-            .map_err(|_| configuration("AGENT 文件不是有效 UTF-8"))?;
+        let text =
+            String::from_utf8(bytes).map_err(|_| configuration("AGENT 文件不是有效 UTF-8"))?;
         let text = text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned();
         snapshot(
             text,
@@ -134,7 +136,12 @@ mod tests {
         assert_eq!(file.text(), "abc");
         assert_ne!(
             file.metadata().revision,
-            FileAgentPrompt::new(&path).unwrap().load().unwrap().metadata().revision
+            FileAgentPrompt::new(&path)
+                .unwrap()
+                .load()
+                .unwrap()
+                .metadata()
+                .revision
         );
     }
 
@@ -169,8 +176,15 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), bytes);
         }
         fs::write(&path, vec![b'x'; MAX_AGENT_PROMPT_BYTES]).unwrap();
-        assert_eq!(source.load().unwrap().metadata().bytes, MAX_AGENT_PROMPT_BYTES);
-        assert!(InlineAgentPrompt::new("中".repeat(MAX_AGENT_PROMPT_BYTES / 3 + 1)).load().is_err());
+        assert_eq!(
+            source.load().unwrap().metadata().bytes,
+            MAX_AGENT_PROMPT_BYTES
+        );
+        assert!(
+            InlineAgentPrompt::new("中".repeat(MAX_AGENT_PROMPT_BYTES / 3 + 1))
+                .load()
+                .is_err()
+        );
     }
 
     #[test]
