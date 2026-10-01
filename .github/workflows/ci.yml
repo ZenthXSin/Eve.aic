@@ -73,6 +73,34 @@ jobs:
           if ($second.current.revision -ne 4 -or $second.current.namespaces["runtime.llm"]["values"]["max_parallel_tool_calls"] -ne 14 -or $second.backups.Count -ne 4) {
             throw "第二次配置文件修订、值或备份不符"
           }
+      - name: 验证四类模型配置、固定快照及独立进程恢复
+        run: |
+          $modelDirectory = Join-Path $env:RUNNER_TEMP "eve-models-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          for ($attempt = 1; $attempt -le 2; $attempt++) {
+            $output = @(& cargo run -p eve-runtime --example model_roles --locked -- $modelDirectory)
+            if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "模型配置进程验收失败" }
+            Write-Host $output[0]
+            $report = $output[0] | ConvertFrom-Json -AsHashtable
+            $restored = if ($attempt -eq 1) { 0 } else { 2 }
+            if ($report.restored_revision -ne $restored -or
+                $report.captured_revision -ne $attempt -or $report.current_revision -ne ($attempt + 1) -or
+                $report.captured_primary -cne "primary-$attempt" -or $report.current_primary -cne "primary-$($attempt + 1)" -or
+                $report.enabled_roles -ne 4 -or $report.semantic_dimensions -ne 768 -or $report.model_requests -ne 0) {
+              throw "四角色、固定快照或恢复结果不符"
+            }
+            $state = Get-Content -LiteralPath (Join-Path $modelDirectory "config.json") -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
+            $models = $state.current.namespaces["runtime.models"]
+            if ($state.format_version -ne 1 -or $models.schema_version -ne 1 -or
+                $state.current.revision -ne ($attempt + 1) -or $state.backups.Count -ne ($attempt + 1) -or
+                $models.values.primary_model -cne "primary-$($attempt + 1)" -or $models.values.semantic_dimensions -ne 768) {
+              throw "模型配置实际落盘结果不符"
+            }
+            foreach ($role in @("primary", "auxiliary_small", "jev", "semantic")) {
+              if ($models.values["${role}_enabled"] -ne $true -or $models.values["${role}_provider"] -cne "demo") {
+                throw "模型角色配置未完整保存"
+              }
+            }
+          }
       - name: 验证 OpenAI 本地 HTTP 与插件工具闭环
         run: cargo run -p eve-runtime --example openai_offline --locked
       - name: 验证 Responses SSE、插件工具与会话保存
