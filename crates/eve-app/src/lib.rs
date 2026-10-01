@@ -1,7 +1,10 @@
 //! Eve 的最小可运行组合入口：固定身份、一个主模型、会话历史与插件工具。
 //! 串行读取输入，不包含辅助模型、语义检索、动态驱动或 Web 控制面。
 mod config;
+mod error;
 mod services;
+
+pub use error::AppFailure;
 
 use eve_agent_prompt::FileAgentPrompt;
 use eve_config_api::{
@@ -217,11 +220,21 @@ pub async fn run_console(
                     error,
                     output: generated,
                 }) => {
-                    writeln!(output, "Eve：回复已生成但未保存：{}", generated.text)?;
-                    output.flush()?;
-                    return Err(
-                        format!("会话提交失败：{error}；保留原 Pending，已停止接收输入。").into(),
-                    );
+                    let displayed = writeln!(output, "Eve：回复已生成但未保存：{}", generated.text)
+                        .and_then(|()| output.flush());
+                    let primary: AppError = SessionRunError::Commit {
+                        error,
+                        output: generated,
+                    }
+                    .into();
+                    return Err(match displayed {
+                        Ok(()) => primary,
+                        Err(error) => AppFailure {
+                            primary,
+                            secondary: vec![error.into()],
+                        }
+                        .into(),
+                    });
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -232,19 +245,20 @@ pub async fn run_console(
     .await;
     let stopped = kernel.stop_all().await;
     let flushed = kernel.flush_logs();
-    // 三个结果都已执行；收尾错误不能被主错误遮蔽。
-    let mut errors = Vec::new();
-    if let Err(error) = &result {
-        errors.push(error.to_string());
-    }
+    // 三个结果都已执行；同时保留原始输出和各个收尾错误。
+    let mut secondary: Vec<AppError> = Vec::new();
     if let Err(error) = stopped {
-        errors.push(format!("停止失败：{error}"));
+        secondary.push(error.into());
     }
     if let Err(error) = flushed {
-        errors.push(format!("日志刷新失败：{error}"));
+        secondary.push(error.into());
     }
-    if !errors.is_empty() {
-        return Err(errors.join("；").into());
+    if !secondary.is_empty() {
+        let primary = match result {
+            Err(error) => error,
+            Ok(_) => secondary.remove(0),
+        };
+        return Err(AppFailure { primary, secondary }.into());
     }
     result
 }

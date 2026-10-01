@@ -184,11 +184,8 @@ async fn real_process_chat_tool_round_trip_and_restart_preserve_history_without_
     let inner = sessions(root.path()).to_string();
     assert!(!inner.contains("新身份"));
     assert!(!disk.contains("fixture-key"));
-    assert!(
-        !std::fs::read_to_string(root.path().join("state/configuration/config.json"))
-            .unwrap()
-            .contains("fixture-key")
-    );
+    // 仅从环境读取配置不会自动把配置或凭据写入文件。
+    assert!(!root.path().join("state/configuration/config.json").exists());
     println!("Eve 核心进程验收：两轮聊天、一次工具往返、重启第三轮；历史修订 4→6，旧工具零重放。");
 }
 #[tokio::test]
@@ -303,6 +300,44 @@ async fn oversized_input_and_local_commands_do_not_create_turns() {
             .len(),
         1
     );
+}
+#[tokio::test]
+async fn final_save_failure_keeps_pending_and_stops_after_actual_tool_execution() {
+    let root = fixture();
+    let mut generated = Reply::json(final_response("已生成的完整回复"));
+    generated.body_delay = Duration::from_secs(2);
+    let mut server = Server::start(vec![
+        Reply::json(json!({"status":"completed","error":null,"output":[
+            {"type":"function_call","call_id":"commit-echo","name":"echo","arguments":"{\"text\":\"保存失败回执\"}"}
+        ]})),
+        generated,
+    ])
+    .await;
+    let mut child = command(root.path(), &server.url);
+    child.env("EVE_OPENAI_TIMEOUT_SECONDS", "5");
+    let process = tokio::spawn(async move { run(child, "执行工具后保存\n不能再执行\n").await });
+    server.next().await;
+    let paired = server.next().await.body;
+    assert!(paired["input"].as_array().unwrap().iter().any(|item| {
+        item["type"] == "function_call_output" && item["call_id"] == "commit-echo"
+    }));
+    // Pending 已落盘、工具已真实执行；明确注入最终原子替换失败。
+    let target = root.path().join("state/state.json");
+    let preserved = root.path().join("state/preserved.json");
+    let original = std::fs::read(&target).unwrap();
+    std::fs::rename(&target, &preserved).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    let output = process.await.unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("回复已生成但未保存：已生成的完整回复"));
+    assert!(server.requests.try_recv().is_err());
+    assert_eq!(std::fs::read(&preserved).unwrap(), original);
+    std::fs::remove_dir(&target).unwrap();
+    std::fs::rename(&preserved, &target).unwrap();
+    let document = sessions(root.path());
+    let turns = document["sessions"]["default"]["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0]["status"]["state"], "Pending");
 }
 #[test]
 fn cli_requires_values_and_valid_session_identifiers() {
