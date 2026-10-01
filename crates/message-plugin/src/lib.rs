@@ -1,10 +1,13 @@
 //! 可替换消息判断与动作路由插件；只依赖公开服务，不调用模型或修改 Kernel。
+mod fallback;
 mod router;
 mod rules;
 use eve_message_api::*;
 use eve_plugin_api::{
-    Cleanup, Plugin, PluginContext, PluginFuture, PluginManifest, PluginResult, ServiceId, cleanup,
+    Cleanup, Plugin, PluginContext, PluginDependency, PluginError, PluginFuture, PluginId,
+    PluginManifest, PluginResult, ServiceId, cleanup,
 };
+pub use fallback::FallbackJudge;
 pub use router::MessageRouterPlugin;
 pub use rules::RulesJudge;
 use std::sync::{
@@ -32,14 +35,34 @@ impl RelationJudge for ActiveJudge {
 }
 pub struct RelationPlugin {
     manifest: PluginManifest,
-    judge: Arc<dyn RelationJudge>,
+    source: JudgeSource,
+}
+enum JudgeSource {
+    Direct(Arc<dyn RelationJudge>),
+    Fallback {
+        primary: Option<Arc<dyn RelationJudge>>,
+        fallback: Arc<dyn RelationJudge>,
+    },
 }
 impl RelationPlugin {
     pub fn new(judge: Arc<dyn RelationJudge>) -> PluginResult<Self> {
         Ok(Self {
             manifest: PluginManifest::new(RELATION_PLUGIN_ID, env!("CARGO_PKG_VERSION"))?,
-            judge,
+            source: JudgeSource::Direct(judge),
         })
+    }
+    /// 可选判断器可关闭；复杂判断由宿主注入，插件只读取公开配置并组合回退。
+    pub fn with_fallback(
+        primary: Option<Arc<dyn RelationJudge>>,
+        fallback: Arc<dyn RelationJudge>,
+    ) -> PluginResult<Self> {
+        let mut plugin = Self::new(fallback.clone())?;
+        plugin.manifest.dependencies.push(PluginDependency {
+            id: PluginId::new(eve_config_api::CONFIG_PLUGIN_ID)?,
+            requirement: Some("^0.1".into()),
+        });
+        plugin.source = JudgeSource::Fallback { primary, fallback };
+        Ok(plugin)
     }
     pub fn rules() -> PluginResult<Self> {
         Self::new(Arc::new(RulesJudge))
@@ -50,8 +73,27 @@ impl Plugin for RelationPlugin {
         &self.manifest
     }
     fn start(&mut self, ctx: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
-        let judge = self.judge.clone();
+        let source = match &self.source {
+            JudgeSource::Direct(judge) => JudgeSource::Direct(judge.clone()),
+            JudgeSource::Fallback { primary, fallback } => JudgeSource::Fallback {
+                primary: primary.clone(),
+                fallback: fallback.clone(),
+            },
+        };
         Box::pin(async move {
+            let judge: Arc<dyn RelationJudge> = match source {
+                JudgeSource::Direct(judge) => judge,
+                JudgeSource::Fallback { primary, fallback } => {
+                    let config = ctx
+                        .service::<eve_config_api::ConfigServiceHandle>(
+                            &ServiceId::new(eve_config_api::CONFIG_SERVICE_ID)?,
+                        )?
+                        .ok_or_else(|| PluginError::State("缺少消息配置服务".into()))?
+                        .0
+                        .clone();
+                    Arc::new(FallbackJudge::new(config, primary, fallback))
+                }
+            };
             let active = Arc::new(AtomicBool::new(true));
             let closing = active.clone();
             ctx.cleanup(cleanup(move || async move {
