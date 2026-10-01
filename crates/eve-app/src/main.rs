@@ -15,7 +15,8 @@ async fn main() {
             return Err("存在失败轮次，请查看本轮提示；没有自动重试。".into());
         }
         Ok(())
-    }.await;
+    }
+    .await;
     if let Err(error) = result {
         eprintln!("Eve：{error}");
         std::process::exit(1);

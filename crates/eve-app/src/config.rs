@@ -12,20 +12,37 @@ pub(crate) fn openai_schema() -> ConfigSchema {
         field
     };
     let integer = |default, maximum, environment: &str| {
-        let mut field = ConfigField::new(ConfigKind::Integer {
-            minimum: Some(1), maximum: Some(maximum),
-        }, Some(json!(default)));
+        let mut field = ConfigField::new(
+            ConfigKind::Integer {
+                minimum: Some(1),
+                maximum: Some(maximum),
+            },
+            Some(json!(default)),
+        );
         field.environment = Some(environment.into());
         field
     };
     ConfigSchema {
-        namespace: OPENAI_NAMESPACE.into(), version: 1,
+        namespace: OPENAI_NAMESPACE.into(),
+        version: 1,
         fields: BTreeMap::from([
-            ("base_url".into(), string("https://api.openai.com/v1", "EVE_OPENAI_BASE_URL")),
+            (
+                "base_url".into(),
+                string("https://api.openai.com/v1", "EVE_OPENAI_BASE_URL"),
+            ),
             ("model".into(), string("", "EVE_OPENAI_MODEL")),
-            ("reasoning_effort".into(), string("", "EVE_OPENAI_REASONING_EFFORT")),
-            ("timeout_seconds".into(), integer(120, 600, "EVE_OPENAI_TIMEOUT_SECONDS")),
-            ("max_output_tokens".into(), integer(2048, 16384, "EVE_OPENAI_MAX_OUTPUT_TOKENS")),
+            (
+                "reasoning_effort".into(),
+                string("", "EVE_OPENAI_REASONING_EFFORT"),
+            ),
+            (
+                "timeout_seconds".into(),
+                integer(120, 600, "EVE_OPENAI_TIMEOUT_SECONDS"),
+            ),
+            (
+                "max_output_tokens".into(),
+                integer(2048, 16384, "EVE_OPENAI_MAX_OUTPUT_TOKENS"),
+            ),
         ]),
     }
 }

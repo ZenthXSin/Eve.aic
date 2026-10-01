@@ -12,8 +12,10 @@ impl ContextAssembler for Context {
     fn assemble(&self, _: TurnInput) -> LlmFuture<'_, ContextSnapshot> {
         Box::pin(async {
             Ok(ContextSnapshot {
-                revision: "eve-core-1".into(), profile: String::new(),
-                memories: vec![], history: vec![],
+                revision: "eve-core-1".into(),
+                profile: String::new(),
+                memories: vec![],
+                history: vec![],
             })
         })
     }
@@ -31,30 +33,45 @@ impl Tool for Echo {
     }
     fn validate_arguments(&self, value: &Value) -> Result<(), ToolValidationError> {
         if value.as_object().is_some_and(|object| {
-            object.len() == 1 && object.get("text").and_then(Value::as_str)
-                .is_some_and(|text| text.len() <= 32768)
-        }) { Ok(()) } else {
-            Err(ToolValidationError { message: "echo 参数必须只包含至多 32768 字节的 text 字符串".into() })
+            object.len() == 1
+                && object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.len() <= 32768)
+        }) {
+            Ok(())
+        } else {
+            Err(ToolValidationError {
+                message: "echo 参数必须只包含至多 32768 字节的 text 字符串".into(),
+            })
         }
     }
     fn execute(&self, call: ToolCall, _: ToolExecutionContext) -> ToolFuture<'_> {
         Box::pin(async move { Ok(json!({"echo":call.arguments["text"]})) })
     }
 }
-pub(crate) struct CoreServices { manifest: PluginManifest }
+pub(crate) struct CoreServices {
+    manifest: PluginManifest,
+}
 impl CoreServices {
     pub(crate) fn new() -> PluginResult<Self> {
         let mut manifest = PluginManifest::new(OWNER, env!("CARGO_PKG_VERSION"))?;
-        for name in [eve_config_api::CONFIG_PLUGIN_ID, eve_session_api::SESSION_PLUGIN_ID] {
+        for name in [
+            eve_config_api::CONFIG_PLUGIN_ID,
+            eve_session_api::SESSION_PLUGIN_ID,
+        ] {
             manifest.dependencies.push(PluginDependency {
-                id: PluginId::new(name)?, requirement: Some("^0.1".into()),
+                id: PluginId::new(name)?,
+                requirement: Some("^0.1".into()),
             });
         }
         Ok(Self { manifest })
     }
 }
 impl Plugin for CoreServices {
-    fn manifest(&self) -> &PluginManifest { &self.manifest }
+    fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
     fn start(&mut self, context: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         Box::pin(async move {
             context.provide_service(ServiceId::new(CONTEXT)?, ContextService(Arc::new(Context)))?;
