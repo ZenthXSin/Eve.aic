@@ -13,6 +13,8 @@ path = "src/main.rs"
 eve-agent-prompt = { path = "../agent-prompt" }
 eve-config-api = { path = "../config-api" }
 eve-config-plugin = { path = "../config-plugin" }
+eve-control-api = { path = "../control-api" }
+eve-control-plugin = { path = "../control-plugin" }
 eve-kernel = { path = "../kernel" }
 eve-llm-api = { path = "../llm-api" }
 eve-llm-openai = { path = "../llm-openai" }
@@ -21,7 +23,7 @@ eve-runtime = { path = "../runtime" }
 eve-session-api = { path = "../session-api" }
 eve-session-plugin = { path = "../session-plugin" }
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
 tempfile.workspace = true
