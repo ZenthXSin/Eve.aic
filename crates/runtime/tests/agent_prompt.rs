@@ -258,6 +258,22 @@ fn invalid_file_and_inconsistent_metadata_fail_before_provider_or_tools() {
         std::fs::write(&path, bytes).unwrap();
         assert!(matches!(assemble(), Err(LlmError::Configuration(_))));
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&path, "PRIVATE_AGENT_BODY").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // 特权用户可绕过 mode 位；普通用户必须在 Provider 调用前失败。
+        let unreadable = std::fs::File::open(&path).is_err();
+        let result = assemble();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if unreadable {
+            let error = result.err().expect("不可读来源不得成功装配");
+            assert!(matches!(error, LlmError::Configuration(_)));
+            assert!(!format!("{error:?}").contains("PRIVATE_AGENT_BODY"));
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "PRIVATE_AGENT_BODY");
+    }
     let mut config = LlmHostConfig::default()
         .with_prompt_source(&InlineAgentPrompt::new("original"))
         .unwrap();
@@ -309,10 +325,7 @@ async fn agent_file_cannot_grant_tool_permissions() {
         .unwrap()
         .metadata()
         .clone();
-    let provider = Provider::new(vec![
-        Step::new(calls()),
-        Step::new(final_response("权限不足")),
-    ]);
+    let provider = Provider::new(vec![]);
     let services = KernelServices::default();
     let kernel = Kernel::with_services(KernelServices {
         events: services.events.clone(),
@@ -333,25 +346,16 @@ async fn agent_file_cannot_grant_tool_permissions() {
     kernel.start(&id(OWNER)).await.unwrap();
     let host = make_host(provider.clone(), &services, &kernel, config).unwrap();
     assert_eq!(host.system_prompt_metadata(), Some(&metadata));
-    let output = host
+    let failure = host
         .run_turn(TurnInput {
             text: "开始".into(),
         })
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(failure.error, LlmError::Configuration(_)));
+    assert_eq!(failure.diagnostics.provider_requests, 0);
+    assert_eq!(failure.diagnostics.started_tools, 0);
     assert_eq!(starts.load(Ordering::SeqCst), 0);
-    assert!(
-        output
-            .diagnostics
-            .tool_results
-            .iter()
-            .all(|result| matches!(
-                result.output,
-                ToolOutput::Failure {
-                    code: ToolFailureCode::PermissionDenied,
-                    ..
-                }
-            ))
-    );
+    assert!(provider.requests.lock().unwrap().is_empty());
     kernel.stop_all().await.unwrap();
 }
