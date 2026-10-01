@@ -111,6 +111,7 @@ pub async fn run_console(
     mut output: impl Write,
 ) -> Result<ChatSummary, AppError> {
     let key = SessionKey::new(&options.session_id, &options.user_id)?;
+    let bootstrap = core_bootstrap(&options.agent_path)?;
     let backends = KernelServices {
         state: Arc::new(FileStateStore::open(&options.state_directory)?),
         ..KernelServices::default()
@@ -127,7 +128,7 @@ pub async fn run_console(
             permissions,
             logger,
             &options.state_directory,
-            &options.agent_path,
+            bootstrap,
         )
         .await?;
         let receiver = input::start(input)?;
@@ -165,18 +166,28 @@ pub async fn run_console(
     finish_core(&kernel, result).await
 }
 
+pub(crate) struct CoreBootstrap {
+    host_config: LlmHostConfig,
+    api_key: String,
+}
+
+pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstrap, AppError> {
+    let prompt = FileAgentPrompt::new(agent_path)?;
+    let host_config = LlmHostConfig::default().with_prompt_source(&prompt)?;
+    let api_key =
+        std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "宿主缺少 EVE_OPENAI_API_KEY。")?;
+    Ok(CoreBootstrap { host_config, api_key })
+}
+
 pub(crate) async fn install_core(
     kernel: &Kernel,
     registry: Arc<dyn eve_plugin_api::ServiceRegistry>,
     permissions: Arc<dyn eve_plugin_api::PermissionChecker>,
     logger: Arc<dyn eve_plugin_api::Logger>,
     state_directory: &std::path::Path,
-    agent_path: &std::path::Path,
+    bootstrap: CoreBootstrap,
 ) -> Result<Arc<dyn eve_control_api::ControlService>, AppError> {
-    let prompt = FileAgentPrompt::new(agent_path)?;
-    let host_config = LlmHostConfig::default().with_prompt_source(&prompt)?;
-    let api_key =
-        std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "宿主缺少 EVE_OPENAI_API_KEY。")?;
+    let CoreBootstrap { host_config, api_key } = bootstrap;
     kernel.register(Box::new(ConfigPlugin::new(ConfigBootstrap::new(
         state_directory.join("configuration"),
         vec![runtime_llm_schema(), config::openai_schema()],

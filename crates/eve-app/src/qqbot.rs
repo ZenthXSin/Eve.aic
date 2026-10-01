@@ -1,4 +1,4 @@
-use crate::{AppError, finish_core, install_core};
+use crate::{AppError, core_bootstrap, finish_core, install_core};
 use eve_kernel::{Kernel, KernelServices, backends::FileStateStore};
 use eve_plugin_api::{PluginId, ServiceId};
 use eve_qqbot_plugin::{
@@ -77,6 +77,7 @@ pub async fn run_qqbot(options: QqBotOptions) -> Result<QqBotStatus, AppError> {
         Ok("" | "false") | Err(_) => false,
         _ => return Err("QQBOT_SANDBOX 必须为 true 或 false".into()),
     };
+    let bootstrap = core_bootstrap(&options.agent_path)?;
     let backends = KernelServices {
         state: Arc::new(FileStateStore::open(&options.state_directory)?),
         ..KernelServices::default()
@@ -92,7 +93,7 @@ pub async fn run_qqbot(options: QqBotOptions) -> Result<QqBotStatus, AppError> {
             permissions,
             logger,
             &options.state_directory,
-            &options.agent_path,
+            bootstrap,
         )
         .await?;
         kernel.register(Box::new(QqBotPlugin::new(QqBotConfig {
