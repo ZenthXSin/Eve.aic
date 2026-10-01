@@ -315,7 +315,8 @@ async fn final_save_failure_keeps_pending_and_stops_after_actual_tool_execution(
     .await;
     let mut child = command(root.path(), &server.url);
     child.env("EVE_OPENAI_TIMEOUT_SECONDS", "5");
-    let process = tokio::spawn(async move { run(child, "执行工具后保存\n不能再执行\n").await });
+    let process =
+        tokio::spawn(async move { run(child, "执行工具后保存\n不能再执行\n").await });
     server.next().await;
     let paired = server.next().await.body;
     assert!(paired["input"].as_array().unwrap().iter().any(|item| {
@@ -329,7 +330,9 @@ async fn final_save_failure_keeps_pending_and_stops_after_actual_tool_execution(
     std::fs::create_dir(&target).unwrap();
     let output = process.await.unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("回复已生成但未保存：已生成的完整回复"));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("回复已生成但未保存：已生成的完整回复")
+    );
     assert!(server.requests.try_recv().is_err());
     assert_eq!(std::fs::read(&preserved).unwrap(), original);
     std::fs::remove_dir(&target).unwrap();
