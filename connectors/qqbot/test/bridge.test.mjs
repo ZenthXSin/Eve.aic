@@ -61,3 +61,18 @@ test("无效/超长 JSONL 可跳过，后续 stop 与 EOF 收尾", async () => {
   assert.ok(f.frames.some(x => x.code === "frame_limit"));
   assert.ok(f.frames.some(x => x.code === "invalid_json"));
 });
+
+test("官方不透明消息 ID 的标点保持原值，正文中的提及不被删除", async () => {
+  const f = fixture();
+  const id = "ROBOT1.0_.b6nx.CVryAO0nR58RXuU6SC.m92gc19j02qKqdm8ek!";
+  f.handlers.get("message")({}, {
+    kind: "c2c", messageId: id, senderId: "user-1", content: "转告 <@user-2> 你好",
+    rawEventType: "C2C_MESSAGE_CREATE",
+    replyTarget: { scope: "c2c", targetId: "user-1", msgId: id },
+  });
+  assert.equal(f.frames[0].id, id);
+  assert.equal(f.frames[0].text, "转告 <@user-2> 你好");
+  await f.bridge.command({ type: "reply", version: 1, id, text: "答复" });
+  assert.equal(f.sent[0].target.msgId, id);
+  assert.equal(f.frames.at(-1).ok, true);
+});

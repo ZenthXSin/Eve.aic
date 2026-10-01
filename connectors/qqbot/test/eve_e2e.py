@@ -110,9 +110,9 @@ class Acceptance(unittest.TestCase):
             for owner, entries in state["entries"].items()}
 
     def test_tool_reply_restart_recall_and_duplicate_no_replay(self):
-        first = self.run_eve([self.message("in-1", "echo:marker", "marker")])
+        first = self.run_eve([self.message("ROBOT1.0_.b6nx.CVryAO0nR58RXuU6SC.m92gc19j02qKqdm8ek!", "echo:marker", "marker")])
         self.assertEqual((first["completed"], first["sent"], len(self.requests)), (1, 1, 2))
-        second = self.run_eve([self.message("in-1", "echo:marker", "marker"),
+        second = self.run_eve([self.message("ROBOT1.0_.b6nx.CVryAO0nR58RXuU6SC.m92gc19j02qKqdm8ek!", "echo:marker", "marker"),
             self.message("in-2", "recall:marker", "marker")])
         self.assertEqual((second["received"], second["sent"], len(self.requests)), (1, 1, 3))
         docs = self.documents()

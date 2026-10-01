@@ -1,6 +1,8 @@
 // Tencent SDK adaptation; stdout is reserved for the versioned JSONL protocol.
 export const MAX_FRAME = 65536;
 const validId = v => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v);
+const validMessageId = v => typeof v === "string" && v.trim() === v && v.length > 0 &&
+  Buffer.byteLength(v) <= 128 && !/[\p{Cc}]/u.test(v);
 const validText = v => typeof v === "string" && v.trim() && Buffer.byteLength(v) <= 32768;
 export function optionsFromEnv(env) {
   const appId = env.QQBOT_APP_ID || "1904159860";
@@ -37,7 +39,7 @@ export function createBridge(bot, emit, limit = 128) {
       warn("unsupported_message"); return;
     }
     const target = msg.replyTarget;
-    if (!validId(msg.messageId) || !validId(msg.senderId) || !target ||
+    if (!validMessageId(msg.messageId) || !validId(msg.senderId) || !target ||
         target.scope !== msg.kind || target.msgId !== msg.messageId ||
         !validId(target.targetId) || !validText(msg.content) ||
         (msg.kind === "c2c" && target.targetId !== msg.senderId) ||
@@ -49,7 +51,7 @@ export function createBridge(bot, emit, limit = 128) {
     pending.set(msg.messageId, { target: { ...target }, sending: false });
     send({ type: "message", id: msg.messageId, scope: msg.kind,
       target_id: target.targetId, user_id: msg.senderId,
-      text: msg.content.replace(/<@!?[A-Za-z0-9_-]+>/g, "").trim() });
+      text: msg.content.trim() });
   });
   return {
     stop,
@@ -71,7 +73,7 @@ export function createBridge(bot, emit, limit = 128) {
       try {
         const result = await bot.sendText(item.target, frame.text);
         send({ type: "delivery", id: frame.id, ok: true,
-          ...(validId(result?.id) ? { message_id: result.id } : {}) });
+          ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
       } catch (err) {
         const diagnostic = {};
         if (Number.isInteger(err?.statusCode)) diagnostic.http_status = err.statusCode;

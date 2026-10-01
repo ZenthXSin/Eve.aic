@@ -12,6 +12,12 @@ pub(crate) fn valid_id(v: &str) -> bool {
         && v.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
+pub(crate) fn valid_message_id(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 128
+        && v.trim() == v
+        && !v.chars().any(char::is_control)
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Message {
@@ -23,9 +29,10 @@ pub(crate) struct Message {
 }
 impl Message {
     pub fn valid(&self) -> bool {
-        [&self.id, &self.target_id, &self.user_id]
+        [&self.target_id, &self.user_id]
             .into_iter()
             .all(|v| valid_id(v))
+            && valid_message_id(&self.id)
             && matches!(self.scope.as_str(), "c2c" | "group")
             && (self.scope != "c2c" || self.target_id == self.user_id)
             && !self.text.trim().is_empty()

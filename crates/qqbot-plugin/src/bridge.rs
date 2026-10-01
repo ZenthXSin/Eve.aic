@@ -181,7 +181,16 @@ pub(crate) async fn run(
                     if frame.get("version").and_then(Value::as_u64) != Some(1) { warn(&ctx, "protocol_version"); }
                     match frame.get("type").and_then(Value::as_str) {
                         Some("ready") => { status.send_modify(|s| s.ready = true); }
-                        Some("warning") => warn(&ctx, "bridge_warning"),
+                        Some("warning") => {
+                            let code = match frame.get("code").and_then(Value::as_str) {
+                                Some("invalid_route_or_text") => "bridge_invalid_route_or_text",
+                                Some("unsupported_message") => "bridge_unsupported_message",
+                                Some("pending_limit") => "bridge_pending_limit",
+                                Some("sdk_error") => "bridge_sdk_error",
+                                _ => "bridge_warning",
+                            };
+                            warn(&ctx, code);
+                        }
                         Some("fatal") => break Err(failure("QQBot SDK 启动或连接失败")),
                         Some("delivery") => {
                             let Some(message) = delivering.as_ref() else { warn(&ctx, "unexpected_delivery"); continue; };
