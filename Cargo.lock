@@ -246,6 +246,7 @@ dependencies = [
  "eve-plugin-api",
  "eve-session-api",
  "eve-session-plugin",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

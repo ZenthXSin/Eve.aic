@@ -8,7 +8,7 @@ use eve_llm_api::*;
 use eve_message_api::*;
 use eve_message_plugin::{MessageRouterPlugin, RelationPlugin, RulesJudge};
 use eve_plugin_api::*;
-use eve_runtime::{LlmHostConfig, SessionControlRunner};
+use eve_runtime::{LlmHostConfig, LlmRelationJudge, SessionControlRunner};
 use eve_session_api::*;
 use fixture::*;
 use serde_json::json;
@@ -50,6 +50,13 @@ async fn install_using(
     judge: Arc<dyn RelationJudge>,
     control: Option<Arc<dyn ControlService>>,
 ) -> Setup {
+    install_plugin(rig, RelationPlugin::new(judge).unwrap(), control).await
+}
+async fn install_plugin(
+    rig: &Rig,
+    relation: RelationPlugin,
+    control: Option<Arc<dyn ControlService>>,
+) -> Setup {
     let directory = tempfile::tempdir().unwrap();
     let config = ConfigPlugin::new(
         ConfigBootstrap::new(directory.path(), vec![message_schema()])
@@ -78,9 +85,7 @@ async fn install_using(
         ),
     };
     rig.kernel.register(control_plugin).unwrap();
-    rig.kernel
-        .register(Box::new(RelationPlugin::new(judge).unwrap()))
-        .unwrap();
+    rig.kernel.register(Box::new(relation)).unwrap();
     rig.kernel
         .register(Box::new(MessageRouterPlugin::builtin().unwrap()))
         .unwrap();
@@ -888,4 +893,291 @@ async fn races_and_submit_failure_after_cancel_preserve_actual_side_effect_repor
         assert_eq!(*retained, prior);
         rig.stop().await;
     }
+}
+
+fn semantic(intent: &str, confidence: u8, text: Option<&str>) -> Step {
+    Step::new(final_response(
+        &json!({
+            "parts":[{"intent":intent,"confidence":confidence,"text":text}],
+            "explanation":"可见依据"
+        })
+        .to_string(),
+    ))
+}
+
+#[tokio::test]
+async fn optional_judge_failures_fall_back_once_and_cancel_waits_for_commit() {
+    let primaries: Vec<Option<Arc<dyn RelationJudge>>> = vec![
+        None,
+        Some(Judge::new(Behavior::Error, None)),
+        Some(Judge::new(Behavior::PanicCreate, None)),
+        Some(Judge::new(Behavior::PanicPoll, None)),
+        Some(Judge::new(Behavior::Forged, None)),
+        Some(Judge::new(Behavior::Confidence(70), None)),
+        Some(Judge::new(Behavior::Rules, Some(Arc::new(Notify::new())))),
+    ];
+    for primary in primaries {
+        let task = Provider::new(vec![Step::blocked(Arc::new(Notify::new()))]);
+        let model = Provider::new(vec![semantic("cancel", 95, None)]);
+        let rig = Rig::new(
+            task.clone(),
+            Arc::new(FaultStore::default()),
+            LlmHostConfig::default(),
+        )
+        .await;
+        let s = install_plugin(
+            &rig,
+            RelationPlugin::with_fallback(primary, Arc::new(LlmRelationJudge::new(model.clone())))
+                .unwrap(),
+            None,
+        )
+        .await;
+        config(&s, "judge_timeout_ms", 100, ApplyMode::Immediate);
+        let old = s.control.submit(request("s", "任务"), discard()).unwrap();
+        task.wait_requests(1).await;
+        let report = route(&s, message(&old, "natural", "取消这个任务")).await;
+        let RouteOutcome::Cancelled { prior } = report.outcome else {
+            panic!("回退未完成取消");
+        };
+        assert_eq!(prior.run.commit, CommitState::Failed);
+        assert_eq!(prior.run.started_tools, Some(0));
+        assert_eq!(prior.key, old);
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        assert_eq!(task.requests.lock().unwrap().len(), 1);
+        rig.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn explicit_and_malformed_commands_never_reach_semantic_providers() {
+    let task = Provider::new(vec![Step::blocked(Arc::new(Notify::new()))]);
+    let primary = Provider::new(vec![]);
+    let fallback = Provider::new(vec![]);
+    let rig = Rig::new(
+        task.clone(),
+        Arc::new(FaultStore::default()),
+        LlmHostConfig::default(),
+    )
+    .await;
+    let s = install_plugin(
+        &rig,
+        RelationPlugin::with_fallback(
+            Some(Arc::new(LlmRelationJudge::new(primary.clone()))),
+            Arc::new(LlmRelationJudge::new(fallback.clone())),
+        )
+        .unwrap(),
+        None,
+    )
+    .await;
+    let old = s.control.submit(request("s", "任务"), discard()).unwrap();
+    task.wait_requests(1).await;
+    for (index, text) in [
+        "/continue",
+        "/pause",
+        "/cancel 带有未解释参数",
+        "/add",
+        "/unknown",
+        "/add 新要求\n其他文字",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let report = route(&s, message(&old, &format!("command-{index}"), text)).await;
+        assert!(matches!(
+            report.outcome,
+            RouteOutcome::Unchanged | RouteOutcome::Clarify { .. }
+        ));
+    }
+    assert!(primary.requests.lock().unwrap().is_empty());
+    assert!(fallback.requests.lock().unwrap().is_empty());
+    assert!(
+        !s.control
+            .snapshot(&old.session)
+            .unwrap()
+            .unwrap()
+            .cancel_requested
+    );
+    cancel(&s, &old).await;
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn primary_confidence_snapshot_controls_fallback_and_final_action() {
+    for mode in [ApplyMode::Immediate, ApplyMode::NewRequests] {
+        let gate = Arc::new(Notify::new());
+        let mut step = semantic("unrelated", 85, None);
+        step.gate = Some(gate.clone());
+        let primary = Provider::new(vec![step]);
+        let fallback = Provider::new(vec![semantic("unrelated", 95, None)]);
+        let task = Provider::new(vec![Step::blocked(Arc::new(Notify::new()))]);
+        let rig = Rig::new(
+            task.clone(),
+            Arc::new(FaultStore::default()),
+            LlmHostConfig::default(),
+        )
+        .await;
+        let s = install_plugin(
+            &rig,
+            RelationPlugin::with_fallback(
+                Some(Arc::new(LlmRelationJudge::new(primary.clone()))),
+                Arc::new(LlmRelationJudge::new(fallback.clone())),
+            )
+            .unwrap(),
+            None,
+        )
+        .await;
+        let old = s.control.submit(request("s", "任务"), discard()).unwrap();
+        task.wait_requests(1).await;
+        let ticket = s
+            .messages
+            .submit(message(&old, "m", "顺便问个问题"), discard())
+            .unwrap();
+        primary.wait_requests(1).await;
+        config(&s, "confidence_threshold", 90, mode);
+        gate.notify_one();
+        assert_eq!(
+            s.messages.wait(&ticket).await.unwrap().outcome,
+            RouteOutcome::Unchanged
+        );
+        assert_eq!(
+            fallback.requests.lock().unwrap().len(),
+            usize::from(mode == ApplyMode::Immediate)
+        );
+        assert!(
+            !s.control
+                .snapshot(&old.session)
+                .unwrap()
+                .unwrap()
+                .cancel_requested
+        );
+        cancel(&s, &old).await;
+        rig.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn semantic_errors_low_confidence_and_timeout_clarify_without_cancelling() {
+    for (step, expected) in [
+        (
+            Step::new(final_response("bad json")),
+            ClarifyReason::Judge(RelationError::Protocol),
+        ),
+        (semantic("cancel", 40, None), ClarifyReason::LowConfidence),
+        (
+            Step::blocked(Arc::new(Notify::new())),
+            ClarifyReason::Judge(RelationError::Timeout),
+        ),
+    ] {
+        let task = Provider::new(vec![Step::blocked(Arc::new(Notify::new()))]);
+        let model = Provider::new(vec![step]);
+        let rig = Rig::new(
+            task.clone(),
+            Arc::new(FaultStore::default()),
+            LlmHostConfig::default(),
+        )
+        .await;
+        let s = install_plugin(
+            &rig,
+            RelationPlugin::with_fallback(None, Arc::new(LlmRelationJudge::new(model.clone())))
+                .unwrap(),
+            None,
+        )
+        .await;
+        config(&s, "judge_timeout_ms", 100, ApplyMode::Immediate);
+        let old = s.control.submit(request("s", "任务"), discard()).unwrap();
+        task.wait_requests(1).await;
+        let report = route(&s, message(&old, "m", "可以调整一下吗")).await;
+        assert_eq!(reason(&report), expected);
+        assert!(
+            !s.control
+                .snapshot(&old.session)
+                .unwrap()
+                .unwrap()
+                .cancel_requested
+        );
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        cancel(&s, &old).await;
+        rig.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn late_semantic_cancel_cannot_cancel_a_replacement_generation() {
+    let task = Provider::new(vec![
+        Step::new(final_response("旧完成")),
+        Step::blocked(Arc::new(Notify::new())),
+    ]);
+    let gate = Arc::new(Notify::new());
+    let mut step = semantic("cancel", 95, None);
+    step.gate = Some(gate.clone());
+    let model = Provider::new(vec![step]);
+    let rig = Rig::new(
+        task.clone(),
+        Arc::new(FaultStore::default()),
+        LlmHostConfig::default(),
+    )
+    .await;
+    let s = install_plugin(
+        &rig,
+        RelationPlugin::with_fallback(None, Arc::new(LlmRelationJudge::new(model.clone())))
+            .unwrap(),
+        None,
+    )
+    .await;
+    let old = s.control.submit(request("s", "旧任务"), discard()).unwrap();
+    done(&s, &old).await;
+    let ticket = s
+        .messages
+        .submit(message(&old, "m", "取消它"), discard())
+        .unwrap();
+    model.wait_requests(1).await;
+    let new = s.control.submit(request("s", "新任务"), discard()).unwrap();
+    task.wait_requests(2).await;
+    gate.notify_one();
+    assert!(matches!(
+        s.messages.wait(&ticket).await.unwrap().outcome,
+        RouteOutcome::Stale { prior: None }
+    ));
+    assert!(
+        !s.control
+            .snapshot(&new.session)
+            .unwrap()
+            .unwrap()
+            .cancel_requested
+    );
+    cancel(&s, &new).await;
+    rig.stop().await;
+}
+
+#[tokio::test]
+async fn qualified_optional_result_skips_fallback_provider() {
+    let primary = Provider::new(vec![semantic("unrelated", 95, None)]);
+    let fallback = Provider::new(vec![]);
+    let task = Provider::new(vec![Step::blocked(Arc::new(Notify::new()))]);
+    let rig = Rig::new(
+        task.clone(),
+        Arc::new(FaultStore::default()),
+        LlmHostConfig::default(),
+    )
+    .await;
+    let s = install_plugin(
+        &rig,
+        RelationPlugin::with_fallback(
+            Some(Arc::new(LlmRelationJudge::new(primary.clone()))),
+            Arc::new(LlmRelationJudge::new(fallback.clone())),
+        )
+        .unwrap(),
+        None,
+    )
+    .await;
+    let old = s.control.submit(request("s", "任务"), discard()).unwrap();
+    task.wait_requests(1).await;
+    assert_eq!(
+        route(&s, message(&old, "m", "闲聊")).await.outcome,
+        RouteOutcome::Unchanged
+    );
+    assert_eq!(primary.requests.lock().unwrap().len(), 1);
+    assert!(fallback.requests.lock().unwrap().is_empty());
+    cancel(&s, &old).await;
+    rig.stop().await;
 }

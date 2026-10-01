@@ -103,36 +103,39 @@ jobs:
             if ($snapshot.turns[$index].status.state -ne "Completed" -or
                 $snapshot.turns[$index].status.messages.Count -ne 4) { throw "完整工具历史未保存" }
           }
-      - name: 验证消息判断、混合修订及独立进程恢复
+      - name: 验证规则与 LLM 判断、混合修订及独立进程恢复
         run: |
-          $messageDirectory = Join-Path $env:RUNNER_TEMP "eve-message-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          for ($attempt = 1; $attempt -le 2; $attempt++) {
-            $output = @(& cargo run -p eve-runtime --example message_relations --locked -- $messageDirectory)
-            if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "消息关系进程验收失败" }
-            Write-Host $output[0]
-            $report = $output[0] | ConvertFrom-Json -AsHashtable
-            if ($report.cancelled_generation -ne 1 -or $report.completed_generation -ne 2 -or
-                $report.intent_parts -ne 2 -or $report.turn_id -ne (2 * $attempt) -or
-                $report.history_messages -ne (4 * $attempt) -or $report.tool_executions -ne 1 -or
-                $report.provider_requests -ne 3 -or $report.saved_events -ne 1 -or
-                $report.old_event_accepted -ne $false) { throw "消息修订、代际或恢复结果不符" }
-          }
-          $state = Get-Content -LiteralPath (Join-Path $messageDirectory "state.json") -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
-          $document = [System.Text.Encoding]::UTF8.GetString([byte[]] $state.entries["eve.session"]["sessions.v1"]) | ConvertFrom-Json -AsHashtable
-          $snapshot = $document.sessions["message-session"]
-          if ($snapshot.revision -ne 8 -or $snapshot.turns.Count -ne 4) { throw "消息会话磁盘修订不符" }
-          foreach ($index in @(0, 2)) {
-            if ($snapshot.turns[$index].status.state -ne "Failed" -or
-                $snapshot.turns[$index].status.failure.code -ne "Cancelled" -or
-                $snapshot.turns[$index].status.failure.started_tools -ne 0) { throw "修订取消记录未落盘" }
-          }
-          foreach ($index in @(1, 3)) {
-            if ($snapshot.turns[$index].status.state -ne "Completed" -or
-                $snapshot.turns[$index].status.messages.Count -ne 4) { throw "修订工具历史未保存" }
-            $revision = $snapshot.turns[$index].status.messages[0].text | ConvertFrom-Json -AsHashtable
-            if ($revision.base_request -cne "旧任务" -or $revision.changes.Count -ne 2 -or
-                $revision.changes[0].kind -cne "supplement" -or $revision.changes[0].text -cne "包含本地回执" -or
-                $revision.changes[1].kind -cne "correction" -or $revision.changes[1].text -cne "回执内容改为新任务回执") { throw "用户原文修订未正确保存" }
+          foreach ($example in @("message_relations", "natural_message_relations")) {
+            $messageDirectory = Join-Path $env:RUNNER_TEMP "eve-$example-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+            for ($attempt = 1; $attempt -le 2; $attempt++) {
+              $output = @(& cargo run -p eve-runtime --example $example --locked -- $messageDirectory)
+              if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "消息关系进程验收失败" }
+              Write-Host $output[0]
+              $report = $output[0] | ConvertFrom-Json -AsHashtable
+              if ($example -ceq "natural_message_relations" -and $report.judge_requests -ne 2) { throw "内置判断请求次数不符" }
+              if ($report.cancelled_generation -ne 1 -or $report.completed_generation -ne 2 -or
+                  $report.intent_parts -ne 2 -or $report.turn_id -ne (2 * $attempt) -or
+                  $report.history_messages -ne (4 * $attempt) -or $report.tool_executions -ne 1 -or
+                  $report.provider_requests -ne 3 -or $report.saved_events -ne 1 -or
+                  $report.old_event_accepted -ne $false) { throw "消息修订、代际或恢复结果不符" }
+            }
+            $state = Get-Content -LiteralPath (Join-Path $messageDirectory "state.json") -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
+            $document = [System.Text.Encoding]::UTF8.GetString([byte[]] $state.entries["eve.session"]["sessions.v1"]) | ConvertFrom-Json -AsHashtable
+            $snapshot = $document.sessions["message-session"]
+            if ($snapshot.revision -ne 8 -or $snapshot.turns.Count -ne 4) { throw "消息会话磁盘修订不符" }
+            foreach ($index in @(0, 2)) {
+              if ($snapshot.turns[$index].status.state -ne "Failed" -or
+                  $snapshot.turns[$index].status.failure.code -ne "Cancelled" -or
+                  $snapshot.turns[$index].status.failure.started_tools -ne 0) { throw "修订取消记录未落盘" }
+            }
+            foreach ($index in @(1, 3)) {
+              if ($snapshot.turns[$index].status.state -ne "Completed" -or
+                  $snapshot.turns[$index].status.messages.Count -ne 4) { throw "修订工具历史未保存" }
+              $revision = $snapshot.turns[$index].status.messages[0].text | ConvertFrom-Json -AsHashtable
+              if ($revision.base_request -cne "旧任务" -or $revision.changes.Count -ne 2 -or
+                  $revision.changes[0].kind -cne "supplement" -or $revision.changes[0].text -cne "包含本地回执" -or
+                  $revision.changes[1].kind -cne "correction" -or $revision.changes[1].text -cne "回执内容改为新任务回执") { throw "用户原文修订未正确保存" }
+            }
           }
       - name: 验证流式跨进程恢复及取消输入过滤
         run: |
