@@ -51,6 +51,12 @@ python3 connectors/qqbot/test/eve_e2e.py
 
 离线验收实际运行 Eve、生产 Rust 插件、测试 Node 子进程与 loopback Chat HTTP，覆盖工具/回复、两进程回忆与去重、群发送者/AppID 路由、发送失败保留提交、Processing 不重放、损坏状态保留、SIGTERM 取消与 Node 回收。Node 测试另覆盖 C2C/群原目标与 msg_id、pending 上限、finish、无重试发送失败、坏/超长 JSONL 与 EOF。它们与真实 QQ 交互分别记录，离线通过不代表 QQ 权限、认证或消息发送已经通过。
 
-已通过六项 Node 测试和六项 Eve 进程验收：[离线运行](https://github.com/ZenthXSin/Eve.aic/actions/runs/36902531389)，固定代码 `090d94662797492cda8dd29acc7f925ec39c4c43`。完整工作区 fmt、Clippy、测试、示例与两平台/Rust 1.89 结果以 PR #68 最新 CI 为准。真实 DeepSeek 三轮及恢复已通过，见[主模型验收](./主模型验收.md)；真实 QQ 结果待凭据预检与交互窗口实际完成后补充。
+已通过六项 Node 测试和六项 Eve 进程验收：[离线运行](https://github.com/ZenthXSin/Eve.aic/actions/runs/36902531389)，固定代码 `090d94662797492cda8dd29acc7f925ec39c4c43`。同一代码的[完整 CI](https://github.com/ZenthXSin/Eve.aic/actions/runs/36902531724) 三组全部成功：Ubuntu 309 / Windows 305 项测试与文档测试，各 1 项既有忽略；fmt、严格 Clippy、所有目标、全部既有示例和 Rust 1.89 检查成功。真实 DeepSeek 三轮及恢复已通过，见[主模型验收](./主模型验收.md)；[真实 QQ 沙箱运行](https://github.com/ZenthXSin/Eve.aic/actions/runs/36903380200) 于 2026-10-01 17:59–18:02 UTC 固定检出同一代码：两个仓库 Secret 预检、SDK 安装、构建、认证与 QQ WebSocket ready 均成功，180 秒后 SIGINT 收尾，进程退出码 0。报告如下：
+
+```json
+{"process_ok":true,"interaction_ok":false,"ready":true,"closed":true,"terminal_error":false,"received":0,"completed":0,"sent":0,"failed":0}
+```
+
+本次窗口没有收到消息，工作流按真实交互条件返回失败；QQ 认证/连接与干净停止已验证，真实接收、模型处理和 QQ 回复仍未验收。需要测试用户/群在沙箱范围内，并在窗口期间发消息后复验。临时 PR 自动触发已移除，后续仅 main 手动运行；源码和报告不含密钥、QQ ID 或正文。
 
 媒体、QQ 频道、webhook、主动消息、消息修订/并行调度和凭据库接线后置；首版只做已验证的文本闭环。
