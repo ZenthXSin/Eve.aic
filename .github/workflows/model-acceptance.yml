@@ -1,103 +1,72 @@
 name: 主模型真实多轮验收
 
 on:
-  # 单次 DeepSeek 实测；仅接受当前仓库的已审阅分支，检出固定 CI 成功版本。
   pull_request:
     types: [synchronize]
     branches: [main]
     paths: [.github/workflows/model-acceptance.yml]
-  workflow_dispatch:
-    inputs:
-      model:
-        description: 支持所选 Chat/Responses 子集的主模型
-        required: true
-        default: deepseek-v4.1-flash
-        type: string
-      protocol:
-        description: 模型 API 协议
-        required: true
-        default: chat
-        type: choice
-        options: [chat, responses]
-      reasoning_effort:
-        description: 可选参数，模型不支持时留空
-        required: false
-        default: ""
-        type: string
 
 permissions:
   contents: read
 
-concurrency:
-  group: eve-model-acceptance
-  cancel-in-progress: false
-
 jobs:
-  check:
-    # PR 实测固定检出已通过 CI #93 的版本；不执行随后更改的 PR 代码。
+  diagnose:
     if: >-
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'pull_request' && github.event.pull_request.number == 67 &&
-       github.event.pull_request.head.repo.full_name == github.repository &&
-       github.head_ref == 'codex/chat-primary-model')
+      github.event.pull_request.number == 67 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'codex/chat-primary-model'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      EVE_OPENAI_BASE_URL: "https://ai.xn--rhqr8xvr4ahqsgka.com"
+    timeout-minutes: 8
     steps:
-      - name: 检查主模型凭据
-        env:
-          EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
-        run: |
-          if [ -z "$EVE_OPENAI_API_KEY" ]; then
-            echo "请在仓库 Actions Secrets 配置 EVE_OPENAI_API_KEY。"
-            exit 1
-          fi
-      - name: 检出已验证版本
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: 检出固定的已验证身份文件
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ github.event_name == 'pull_request' && 'fa010163ee2bed20a34e489e4913aee8141f10e3' || github.sha }}
+          ref: fa010163ee2bed20a34e489e4913aee8141f10e3
           persist-credentials: false
-      - name: 安装 Rust
-        run: rustup toolchain install 1.89.0 --profile minimal
-      - name: 构建核心入口
-        run: cargo +1.89.0 build -p eve-app --bin eve --example model_acceptance --locked
-      - name: 验收多轮与新进程恢复
+      - name: 诊断关闭思考输出的显式参数（不输出正文或凭据）
         env:
           EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
-          EVE_OPENAI_MODEL: ${{ inputs.model || 'deepseek-v4.1-flash' }}
-          EVE_OPENAI_PROTOCOL: ${{ inputs.protocol || 'chat' }}
-          EVE_OPENAI_REASONING_EFFORT: ${{ inputs.reasoning_effort }}
-          EVE_OPENAI_TIMEOUT_SECONDS: "120"
-          EVE_OPENAI_MAX_OUTPUT_TOKENS: "512"
-          EVE_LLM_RESPONSE_MODE: complete
-        run: ./target/debug/examples/model_acceptance "$RUNNER_TEMP/eve-model-check"
-      - name: 诊断已保存的子进程错误（不输出正文或凭据）
-        if: failure()
         shell: python
         run: |
-          import json, os, re
+          import json, os, urllib.request, urllib.error
           from pathlib import Path
-          root = Path(os.environ["RUNNER_TEMP"]) / "eve-model-check"
-          sources = []
-          for name in ("first.stdout", "first.stderr", "restart.stdout", "restart.stderr"):
-              path = root / name
-              if path.is_file():
-                  sources.append(path.read_bytes()[:1048576].decode("utf-8", errors="replace"))
-          text = "\n".join(sources)
-          known = {"reasoning_or_auxiliary":"通用协议不能保留 Chat reasoning 或其他附加内容","mixed_text_and_tools":"不支持 Chat 文本与工具调用混合输出","unsupported_content":"只支持 Chat 纯文本 content","index":"Chat choice index 必须为零","required_field":"Chat 响应缺少必需字符串字段","finish_reason":"不支持当前 Chat finish_reason","incomplete":"Chat 输出未完整完成","invalid_arguments":"Chat 函数参数不是有效 JSON","invalid_batch":"Chat 文本或工具调用批次不符合协议","missing_text":"Chat 完整回复缺少文本","choice_count":"只支持单个 Chat choice","provider_error":"Chat 响应返回错误","invalid_json":"Chat 响应不是有效 JSON"}
-          print(json.dumps({
-              "diagnostic": "saved_child_errors",
-              "categories": sorted(set(re.findall(r"(?:configuration error|context error|provider error|protocol error|unsupported|backend error|provider timeout)", text))),
-              "known_causes": sorted(key for key, value in known.items() if value in text),
-              "http_statuses": sorted(set(re.findall(r"HTTP(?: status)?[ :]+([1-5][0-9]{2})", text))),
-              "files_found": len(sources)
-          }, ensure_ascii=False, sort_keys=True))
-      - name: 保留无正文的验收报告
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: eve-model-acceptance-report
-          path: ${{ runner.temp }}/eve-model-check/acceptance.json
-          if-no-files-found: ignore
-          retention-days: 7
+          marker = "EVE_CHAT_PROBE"
+          messages = [
+              {"role": "system", "content": Path("AGENT.md").read_text()},
+              {"role": "user", "content": "这是 Eve 核心验收。请只调用一次 echo 工具，参数 text 为 " + marker + "。收到结果后回复完整口令，并记住供后续对话使用。"},
+              {"role": "assistant", "content": None, "tool_calls": [{"id": "call_eve_probe", "type": "function", "function": {"name": "echo", "arguments": json.dumps({"text": marker})}}]},
+              {"role": "tool", "tool_call_id": "call_eve_probe", "content": json.dumps({"echo": marker})},
+          ]
+          for label, extra in (("reasoning_effort_none", {"reasoning_effort": "none"}), ("thinking_disabled", {"thinking": {"type": "disabled"}})):
+              body = {"model": "deepseek-v4.1-flash", "messages": messages, "tools": [{"type": "function", "function": {"name": "echo", "description": "返回输入文本。", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"], "additionalProperties": False}}}], "max_tokens": 512, "stream": False, **extra}
+              request = urllib.request.Request("https://ai.xn--rhqr8xvr4ahqsgka.com/v1/chat/completions", data=json.dumps(body).encode(), headers={"Authorization": "Bearer " + os.environ["EVE_OPENAI_API_KEY"], "Content-Type": "application/json"}, method="POST")
+              report = {"diagnostic": label}
+              try:
+                  with urllib.request.urlopen(request, timeout=120) as response:
+                      report["http_status"] = response.status
+                      raw = response.read(1048577)
+                      report["within_size_limit"] = len(raw) <= 1048576
+                      if report["within_size_limit"]:
+                          data = json.loads(raw)
+                          choices = data.get("choices", [])
+                          report["choice_count"] = len(choices)
+                          if choices:
+                              choice = choices[0]
+                              report["choice_index_zero"] = choice.get("index") == 0
+                              reason = choice.get("finish_reason")
+                              report["finish_reason"] = reason if reason in ("stop", "tool_calls", "length", "content_filter") else "other"
+                              message = choice.get("message", {})
+                              report["known_message_fields"] = [key for key in ("role", "content", "reasoning_content", "reasoning", "tool_calls", "refusal", "audio", "function_call") if key in message]
+                              report["text_nonempty"] = bool(message.get("content"))
+                              report["reasoning_content_nonempty"] = bool(message.get("reasoning_content"))
+                              report["reasoning_nonempty"] = bool(message.get("reasoning"))
+                              report["refusal_nonempty"] = bool(message.get("refusal"))
+                              report["audio_nonempty"] = bool(message.get("audio"))
+                              report["has_expected_marker"] = isinstance(message.get("content"), str) and marker in message["content"]
+              except urllib.error.HTTPError as error:
+                  report["http_status"] = error.code
+              except urllib.error.URLError:
+                  report["transport_error"] = True
+              except (ValueError, TypeError, KeyError):
+                  report["invalid_response"] = True
+              print(json.dumps(report, ensure_ascii=False, sort_keys=True))
