@@ -257,7 +257,10 @@ fn identifier(
     if required && value.is_empty() {
         return Err(ConfigError::MissingValue(path(&field)));
     }
-    if value.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+    if value
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
         return Err(ConfigError::InvalidValue(path(&field)));
     }
     Ok(value)

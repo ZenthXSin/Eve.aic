@@ -10,17 +10,24 @@ async fn start(directory: &Path) -> (Kernel, ConfigController, Arc<ConfigService
     let registry = backends.registry.clone();
     let kernel = Kernel::with_services(backends);
     let plugin = ConfigPlugin::new(
-        ConfigBootstrap::new(directory, vec![model_roles_schema()])
-            .with_environment(BTreeMap::from([
+        ConfigBootstrap::new(directory, vec![model_roles_schema()]).with_environment(
+            BTreeMap::from([
                 ("EVE_MODELS_PRIMARY_ENABLED".into(), "true".into()),
                 ("EVE_MODELS_PRIMARY_PROVIDER".into(), "mock".into()),
-                ("EVE_MODELS_PRIMARY_MODEL".into(), "environment-model".into()),
-            ])),
+                (
+                    "EVE_MODELS_PRIMARY_MODEL".into(),
+                    "environment-model".into(),
+                ),
+            ]),
+        ),
     )
     .unwrap();
     let admin = plugin.controller();
     kernel.register(Box::new(plugin)).unwrap();
-    kernel.start(&PluginId::new(CONFIG_PLUGIN_ID).unwrap()).await.unwrap();
+    kernel
+        .start(&PluginId::new(CONFIG_PLUGIN_ID).unwrap())
+        .await
+        .unwrap();
     let handle = registry
         .get(&ServiceId::new(CONFIG_SERVICE_ID).unwrap())
         .unwrap()
@@ -58,10 +65,18 @@ async fn captured_roles_stay_fixed_across_updates_and_restart() {
     let directory = tempfile::tempdir().unwrap();
     let (kernel, admin, service) = start(directory.path()).await;
     let first = ModelRolesConfig::capture(service.0.as_ref()).unwrap();
-    assert_eq!(first.require(ModelRole::Primary).unwrap().model, "environment-model");
+    assert_eq!(
+        first.require(ModelRole::Primary).unwrap().model,
+        "environment-model"
+    );
     assert!(first.profile(ModelRole::Jev).is_none());
-    let request = service.0.begin_request(MODELS_NAMESPACE, MODELS_SCHEMA_VERSION).unwrap();
-    admin.replace(0, overrides("new-model"), ApplyMode::NewRequests).unwrap();
+    let request = service
+        .0
+        .begin_request(MODELS_NAMESPACE, MODELS_SCHEMA_VERSION)
+        .unwrap();
+    admin
+        .replace(0, overrides("new-model"), ApplyMode::NewRequests)
+        .unwrap();
     assert_eq!(
         ModelRolesConfig::try_from(&service.0.read_request(&request).unwrap()).unwrap(),
         first
@@ -71,7 +86,9 @@ async fn captured_roles_stay_fixed_across_updates_and_restart() {
     for role in ModelRole::ALL {
         assert!(second.profile(role).is_some());
     }
-    admin.replace(1, overrides("immediate-model"), ApplyMode::Immediate).unwrap();
+    admin
+        .replace(1, overrides("immediate-model"), ApplyMode::Immediate)
+        .unwrap();
     assert_eq!(
         ModelRolesConfig::try_from(&service.0.read_request(&request).unwrap())
             .unwrap()
@@ -80,8 +97,14 @@ async fn captured_roles_stay_fixed_across_updates_and_restart() {
             .model,
         "immediate-model"
     );
-    assert_eq!(first.require(ModelRole::Primary).unwrap().model, "environment-model");
-    assert_eq!(second.require(ModelRole::Primary).unwrap().model, "new-model");
+    assert_eq!(
+        first.require(ModelRole::Primary).unwrap().model,
+        "environment-model"
+    );
+    assert_eq!(
+        second.require(ModelRole::Primary).unwrap().model,
+        "new-model"
+    );
     kernel.stop_all().await.unwrap();
     assert_eq!(
         ModelRolesConfig::capture(service.0.as_ref()),
@@ -90,8 +113,14 @@ async fn captured_roles_stay_fixed_across_updates_and_restart() {
     let (kernel, admin, restored) = start(directory.path()).await;
     let current = ModelRolesConfig::capture(restored.0.as_ref()).unwrap();
     assert_eq!(current.revision(), 2);
-    assert_eq!(current.require(ModelRole::Primary).unwrap().model, "immediate-model");
-    assert_eq!(restored.0.read_request(&request), Err(ConfigError::StaleRequest));
+    assert_eq!(
+        current.require(ModelRole::Primary).unwrap().model,
+        "immediate-model"
+    );
+    assert_eq!(
+        restored.0.read_request(&request),
+        Err(ConfigError::StaleRequest)
+    );
     admin.rollback(2, 1, ApplyMode::NewRequests).unwrap();
     assert_eq!(
         ModelRolesConfig::capture(restored.0.as_ref())
@@ -115,11 +144,18 @@ async fn malformed_updates_do_not_change_revision_or_backups() {
         ("primary_api_key", json!("secret")),
     ] {
         let mut values = overrides("ignored");
-        values.get_mut(MODELS_NAMESPACE).unwrap().values.insert(field.into(), value);
+        values
+            .get_mut(MODELS_NAMESPACE)
+            .unwrap()
+            .values
+            .insert(field.into(), value);
         assert!(admin.replace(0, values, ApplyMode::NewRequests).is_err());
         assert_eq!(admin.current().unwrap().revision, 0);
         assert!(admin.backups().unwrap().is_empty());
-        assert_eq!(ModelRolesConfig::capture(service.0.as_ref()).unwrap(), before);
+        assert_eq!(
+            ModelRolesConfig::capture(service.0.as_ref()).unwrap(),
+            before
+        );
     }
     kernel.stop_all().await.unwrap();
 }
@@ -129,7 +165,11 @@ async fn semantic_validation_is_a_consumer_boundary_and_never_clears_storage() {
     let directory = tempfile::tempdir().unwrap();
     let (kernel, admin, service) = start(directory.path()).await;
     let mut values = overrides("main");
-    values.get_mut(MODELS_NAMESPACE).unwrap().values.insert("semantic_dimensions".into(), json!(0));
+    values
+        .get_mut(MODELS_NAMESPACE)
+        .unwrap()
+        .values
+        .insert("semantic_dimensions".into(), json!(0));
     // 通用存储只校验标量 Schema；跨字段语义由装配消费者拒绝。
     admin.replace(0, values, ApplyMode::NewRequests).unwrap();
     let bytes = std::fs::read(directory.path().join("config.json")).unwrap();
@@ -138,6 +178,9 @@ async fn semantic_validation_is_a_consumer_boundary_and_never_clears_storage() {
     let (kernel, admin, restored) = start(directory.path()).await;
     assert!(ModelRolesConfig::capture(restored.0.as_ref()).is_err());
     assert_eq!(admin.current().unwrap().revision, 1);
-    assert_eq!(std::fs::read(directory.path().join("config.json")).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(directory.path().join("config.json")).unwrap(),
+        bytes
+    );
     kernel.stop_all().await.unwrap();
 }
