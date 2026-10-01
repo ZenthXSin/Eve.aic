@@ -98,7 +98,9 @@ async fn shared_check_verifies_two_processes_and_all_four_real_http_requests() {
     assert_eq!(checked["revision_after"], 6);
     assert_eq!(checked["restart_tool_calls"], 0);
     assert_eq!(report(root.path()), checked);
-    let first = server.next().await.body;
+    let captured = server.next().await;
+    assert!(captured.headers.starts_with("POST /v1/responses HTTP/1.1"));
+    let first = captured.body;
     assert_eq!(user_texts(&first).len(), 1);
     assert!(user_texts(&first)[0].contains(MARKER));
     let returned = server.next().await.body;
