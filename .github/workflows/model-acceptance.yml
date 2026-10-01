@@ -1,6 +1,9 @@
 name: 主模型真实多轮验收
 
 on:
+  pull_request:
+    types: [synchronize]
+    paths: [.github/workflows/model-acceptance.yml]
   workflow_dispatch:
     inputs:
       model:
@@ -30,7 +33,7 @@ concurrency:
 jobs:
   check:
     # 只执行已合入主线且经过 CI 的代码，不读取 PR 分支的凭据。
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.number == 67 && github.head_ref == 'codex/chat-primary-model' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -48,6 +51,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: 93d81b74de6e101ab3af4519bbdd61b6a917e63c
       - name: 安装 Rust
         run: rustup toolchain install 1.89.0 --profile minimal
       - name: 构建核心入口
@@ -55,8 +59,8 @@ jobs:
       - name: 验收多轮与新进程恢复
         env:
           EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
-          EVE_OPENAI_MODEL: ${{ inputs.model }}
-          EVE_OPENAI_PROTOCOL: ${{ inputs.protocol }}
+          EVE_OPENAI_MODEL: ${{ inputs.model || 'deepseek-v4.1-flash' }}
+          EVE_OPENAI_PROTOCOL: ${{ inputs.protocol || 'chat' }}
           EVE_OPENAI_REASONING_EFFORT: ${{ inputs.reasoning_effort }}
           EVE_OPENAI_TIMEOUT_SECONDS: "120"
           EVE_OPENAI_MAX_OUTPUT_TOKENS: "512"
