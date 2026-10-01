@@ -1,10 +1,10 @@
 # AGENT.md 提示词设计
 
-状态：设计记录，待后续实现。
+状态：第一切片实现；动态来源继续作为后续设计。
 
-本文件记录 Eve 的稳定 Agent 提示词来源、动态上下文边界和实现交接内容。本次交接只更新文档，不创建或加载根目录的 `AGENT.md`。
+根目录 [AGENT.md](../AGENT.md) 提供 Eve 的稳定身份。`eve-llm-api` 定义来源与不可变快照，`eve-agent-prompt` 实现文本/文件加载，Runtime 在装配时显式选择后进入固定提示词前缀。
 
-仓库根目录已有 `AGENTS.md`，它是项目协作约定；未来的 `AGENT.md` 是 Eve 运行时读取的 Agent 提示词，两者职责不同，不能互相读取或替代。
+`AGENTS.md` 是项目开发协作约定，文件加载器拒绝选择该文件名；两者不能互相读取或替代。
 
 ## 目标
 
@@ -81,30 +81,40 @@ Eve 的系统提示词应由多个来源分层组成。稳定身份和行为原�
 
 当前主线已经有：
 
-- `LlmHostConfig.system_prompt` 保存固定系统指令。
+- `LlmHostConfig.system_prompt` 保存固定系统指令；`with_prompt_source` 读取一次来源，`system_prompt_snapshot` 保存不可变内容和来源版本。
+- `FileAgentPrompt`、`InlineAgentPrompt` 提供本地实现，自定义来源只需实现公开 `SystemPromptSource`。
 - `ContextSnapshot` 提供 profile、memories 和 history 动态槽位。
 - Runtime 按固定布局组装 system、tool、profile、memory、history 和本轮输入。
 - Tool 权限、参数、插件状态和生命周期由 Runtime/Kernel 校验。
 
 当前尚未实现：
 
-- 根目录 `AGENT.md` 的加载和版本化。
 - `RULE.md`、`MEMORY.md` 和自定义注入的来源管理。
 - `STATE`、`DRIVES`、`AGENDA` 的结构化契约。
 - 动态提示词的检索、压缩、过期和审计。
 - Web 面板中的 Prompt 来源查看、编辑、预览和回滚。
 
+## 第一切片加载契约
+
+组合层显式选择一个来源；直接文本与文件互相替换，不拼接身份。不递归发现 Markdown，也不读取环境变量来决定来源。旧的直接设置 `system_prompt` 仍可使用，此兼容路径没有来源元数据；需要来源版本时使用 `InlineAgentPrompt`。所有现有入口保留原装配选择，新示例明确选择根目录 AGENT.md，库默认不会扫描工作目录。
+
+`FileAgentPrompt::new(path)` 将相对路径按构造时工作目录解析为绝对路径，拒绝空路径、非 UTF-8 路径和 AGENTS.md 文件名。加载普通 UTF-8 文本，去掉可选首字节 BOM；保留其他内容，不求值模板、include、环境变量或命令。文件自身的符号链接、目录及其他非普通文件均拒绝；路径及其祖先目录须受信，不保证对抗并发替换、硬链接或祖先目录链接。
+
+文件大小上限为 65536 字节（含 BOM），显式文本按 UTF-8 字节计同一上限。缺失、不可读、非法 UTF-8、空白、NUL 或超大内容返回 `LlmError::Configuration`，不截断、不创建、不回退。异常诊断不包含文件正文或原始 I/O 错误。调用方必须先取得成功配置再启动使用它的 Provider/工具。
+
+`with_prompt_source` 同步读取恰好一次，形成宿主持有的快照；模型请求和工具循环不做文件 I/O。同一 Host 的所有轮次复用身份；修改文件后，必须显式重新装配新 Host。直接改写已加载配置的 `system_prompt` 会因正文与快照不一致而失败；改用文本时通过 builder 替换来源。
+
+元数据为 `origin`（Inline/File/Custom）、`revision`、有效正文 UTF-8 `bytes`。内置修订为去除 BOM 后正文的 SHA-256，路径和时间不充当内容版本；自定义实现负责自己的修订语义。`SystemPromptSnapshot` 与 `LlmHostConfig` 的 Debug 隐藏正文，Host 通过 `system_prompt_metadata()` 只读查询来源。元数据路径仍是本地诊断信息，调用方对外展示时可进一步脱敏。
+
+请求布局不变：身份 + output_format 位于第一条 system，之后是 Context 修订、资料、记忆、完成历史和本轮用户输入；工具定义仍是结构化 ModelRequest.tools，工具循环只追加配对调用与结果。自然语言身份不改变 Runtime 权限、参数和插件状态检查，也不保证模型抵抗 Prompt 注入。
+
+身份快照不写入 Session/StateStore。重启时从本次显式选择的来源装配身份，Session 独立恢复完成历史，不保存/抽取旧 system，不因身份变化重跑旧工具。损坏会话仍按既有契约失败，身份加载器不会修改文件或清空历史。详见 ADR-0036 与[执行书](./执行书.md)。
+
 ## 后续实现交接
 
-后续实现应在组合层推进，不把 Prompt 语义放入 Kernel：
-
-1. 新增根目录 `AGENT.md`，只写稳定身份、行为原则和动态议程边界。
-2. 为 Agent 来源增加显式加载器或 Context/Prompt 组合服务，不递归读取未声明的 Markdown。
-3. 明确缺失、空文件、解析失败和版本变化的行为。
-4. 保留 `LlmHostConfig.system_prompt` 的显式覆盖能力，并记录最终 Prompt 的来源版本。
-5. 为每个来源保留 scope、priority、trust、revision、TTL 和内容哈希。
-6. 以后扩展 `ContextSnapshot` 时，以结构化 `STATE`、`DRIVES` 和 `AGENDA` 表示动态内容，不把它们全部编码成不可追踪的字符串。
-7. 增加固定规则不可被动态内容重排、工具权限不由 Prompt 授予、旧版本状态不会误用于新任务等验收。
-8. Web 管理面板后续只通过 Control/Context API 查看和管理这些来源，不直接绕过 Runtime 调用模型或工具。
+1. RULE.md、MEMORY.md、自定义注入增加 scope、priority、trust、revision、TTL 和审计字段。
+2. 以结构化 STATE、DRIVES、AGENDA 表示动态内容，并验证过期、旧任务和停止条件。
+3. 完善配置服务接线、热重载、历史来源审计；当前只通过重新装配生效。
+4. Web 管理面板通过 Control/Context API 查看、编辑、预览和回滚来源。
 
 相关设计边界见 [架构设计](./架构设计.md)、[LLM 工具调用](./LLM工具调用.md)、Issue [#27](https://github.com/ZenthXSin/Eve.aic/issues/27)、Issue [#29](https://github.com/ZenthXSin/Eve.aic/issues/29) 和 Issue [#32](https://github.com/ZenthXSin/Eve.aic/issues/32)。

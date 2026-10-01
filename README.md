@@ -25,6 +25,7 @@
 - **宿主控制**：提交、查询和确认生命周期操作；取消等待仍继续收尾。
 - **配置插件**：版本化普通配置、来源优先级、请求快照、备份与回滚；密钥库等安全配置在后续实现。
 - **最小 LLM 工具闭环**：`eve-llm-api` 定义 Provider、上下文和工具契约，Runtime 支持 Mock 与 Responses Provider，完成模型请求、批量工具调用和最终回复；支持工具排序、并发上限、串行作用域、超时、协作式取消、权限与生命周期校验。
+- **Agent 身份**：显式文本/AGENT.md 来源、装配快照与内容版本；修改文件后重新装配，见[提示词契约](./docs/AGENT提示词.md)。
 - **任务控制插件**：显式取消、完整代际标识、旧事件过滤、工具析构与保存收尾；失败不自动重跑。
 - **消息关系插件**：可替换判断、多意图原文范围、明确命令重规划与澄清；副作用未知不重跑。
 - **会话插件**：用户绑定、完整工具历史、同会话在途保护、跨进程恢复与中断记录；保存失败保留原状态，旧工具不自动重放。
@@ -36,6 +37,7 @@
 ```bash
 cargo run -p eve-runtime
 cargo test --workspace
+cargo run -p eve-runtime --example agent_prompt
 cargo run -p eve-runtime --example configuration
 cargo run -p eve-runtime --example session_recovery -- <独立状态目录>
 ```

@@ -49,6 +49,32 @@ jobs:
         run: cargo run -p eve-runtime --example lifecycle_operations --locked
       - name: 验证集成后的 Mock LLM 工具闭环
         run: cargo run -p eve-runtime --example llm_tool_loop --locked
+      - name: 验证 AGENT 文件身份与工具往返
+        run: |
+          function Invoke-Agent([string] $Path) {
+            if ($Path) {
+              $output = @(& cargo run -p eve-runtime --example agent_prompt --locked -- $Path)
+            } else {
+              $output = @(& cargo run -p eve-runtime --example agent_prompt --locked)
+            }
+            if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "Agent 身份示例失败" }
+            Write-Host $output[0]
+            $report = $output[0] | ConvertFrom-Json -AsHashtable
+            if ($report.source -cne "file" -or $report.revision -cnotmatch '^sha256:[0-9a-f]{64}$' -or
+                $report.prompt_bytes -le 0 -or $report.provider_requests -ne 2 -or $report.started_tools -ne 1) {
+              throw "Agent 来源、版本或工具往返不符"
+            }
+            return $report
+          }
+          $default = Invoke-Agent ""
+          $agentFile = Join-Path $env:RUNNER_TEMP "eve-agent-$env:GITHUB_RUN_ID.md"
+          $body = "# 自定义 Eve 身份"
+          [System.IO.File]::WriteAllText($agentFile, $body, [System.Text.UTF8Encoding]::new($false))
+          $explicit = Invoke-Agent $agentFile
+          if ($explicit.revision -ceq $default.revision -or
+              $explicit.prompt_bytes -ne [System.Text.Encoding]::UTF8.GetByteCount($body)) {
+            throw "显式文件没有替换默认文件身份"
+          }
       - name: 验证配置插件及两次独立进程恢复
         run: |
           $env:EVE_LLM_MAX_PARALLEL_TOOL_CALLS = "10"
