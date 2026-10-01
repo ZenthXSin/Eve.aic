@@ -17,6 +17,9 @@ impl std::fmt::Display for ChatRunError {
         match self.report.run.commit {
             CommitState::Pending => f.write_str("会话保存失败；原 Pending 保留，已停止接收输入"),
             CommitState::Unknown => f.write_str("任务状态未知；已停止接收输入，禁止自动重试"),
+            CommitState::Completed if self.report.run.text.is_none() => {
+                f.write_str("完成报告缺少文本。")
+            }
             _ => match &self.report.run.failure {
                 Some(RunFailure::Execution(error) | RunFailure::Delivery(error)) => error.fmt(f),
                 Some(RunFailure::Session(error) | RunFailure::Commit(error)) => error.fmt(f),
@@ -28,69 +31,94 @@ impl std::fmt::Display for ChatRunError {
 }
 impl std::error::Error for ChatRunError {}
 
+/// 终端写入或刷新失败；保留已经收尾的原代报告，不改变提交结果。
+pub struct ChatOutputError {
+    pub output: std::io::Error,
+    pub report: Box<ControlReport>,
+}
+impl std::fmt::Debug for ChatOutputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatOutputError")
+            .field("output", &self.output)
+            .field("commit", &self.report.run.commit)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for ChatOutputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "终端输出失败：{}", self.output)
+    }
+}
+impl std::error::Error for ChatOutputError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.output)
+    }
+}
+
 fn finish(
     report: ControlReport,
     output: &mut impl Write,
     summary: &mut ChatSummary,
 ) -> Result<(), AppError> {
-    if report.run.commit == CommitState::Completed {
-        summary.completed_turns += 1;
-        writeln!(
-            output,
-            "Eve：{}",
-            report.run.text.as_deref().ok_or("完成报告缺少文本。")?
-        )?;
-        let cancelled_delivery = report.cancel_requested
-            && report.run.failure == Some(RunFailure::Delivery(LlmError::Cancelled));
-        if report.run.failure.is_some() && !cancelled_delivery {
-            return Err(ChatRunError {
-                report: Box::new(report),
-            }
-            .into());
-        }
-        if report.cancel_requested {
-            writeln!(output, "Eve：本轮已完成并保存，取消未改写完成历史。")?;
-        }
-    } else if matches!(
+    let completed = report.run.commit == CommitState::Completed;
+    let cancelled_delivery = report.cancel_requested
+        && report.run.failure == Some(RunFailure::Delivery(LlmError::Cancelled));
+    let cancelled = matches!(
         report.run.commit,
         CommitState::NotStarted | CommitState::Failed
     ) && report.cancel_requested
-        && report.run.failure == Some(RunFailure::Execution(LlmError::Cancelled))
-    {
-        summary.cancelled_turns += 1;
-        writeln!(output, "Eve：当前轮次已取消并完成收尾。")?;
-    } else if report.run.commit == CommitState::Failed
-        && matches!(report.run.failure, Some(RunFailure::Execution(_)))
-    {
-        summary.failed_turns += 1;
-        writeln!(
-            output,
-            "Eve：本轮执行失败：{}。未自动重试。",
-            ChatRunError {
-                report: Box::new(report)
-            }
-        )?;
+        && report.run.failure == Some(RunFailure::Execution(LlmError::Cancelled));
+    let execution_failed = report.run.commit == CommitState::Failed
+        && matches!(report.run.failure, Some(RunFailure::Execution(_)));
+    let fatal = if completed {
+        report.run.text.is_none() || report.run.failure.is_some() && !cancelled_delivery
     } else {
-        let displayed = if let Some(text) = &report.run.text {
-            writeln!(output, "Eve：回复已生成但未保存：{text}").and_then(|()| output.flush())
-        } else {
-            Ok(())
-        };
-        let primary: AppError = ChatRunError {
+        !cancelled && !execution_failed
+    };
+    let displayed = (|| -> std::io::Result<()> {
+        if completed {
+            if let Some(text) = &report.run.text {
+                summary.completed_turns += 1;
+                writeln!(output, "Eve：{text}")?;
+                if report.cancel_requested && !fatal {
+                    writeln!(output, "Eve：本轮已完成并保存，取消未改写完成历史。")?;
+                }
+            }
+        } else if cancelled {
+            summary.cancelled_turns += 1;
+            writeln!(output, "Eve：当前轮次已取消并完成收尾。")?;
+        } else if report.run.commit == CommitState::Failed
+            && let Some(RunFailure::Execution(error)) = &report.run.failure
+        {
+            summary.failed_turns += 1;
+            writeln!(output, "Eve：本轮执行失败：{error}。未自动重试。")?;
+        } else if let Some(text) = &report.run.text {
+            writeln!(output, "Eve：回复已生成但未保存：{text}")?;
+        }
+        output.flush()
+    })();
+    match (fatal, displayed) {
+        (false, Ok(())) => Ok(()),
+        (false, Err(output)) => Err(ChatOutputError {
+            output,
             report: Box::new(report),
         }
-        .into();
-        return Err(match displayed {
-            Ok(()) => primary,
-            Err(error) => crate::AppFailure {
-                primary,
-                secondary: vec![error.into()],
+        .into()),
+        (true, result) => {
+            let primary: AppError = ChatRunError {
+                report: Box::new(report),
             }
-            .into(),
-        });
+            .into();
+            Err(match result {
+                Ok(()) => primary,
+                Err(error) => crate::AppFailure {
+                    primary,
+                    secondary: vec![error.into()],
+                }
+                .into(),
+            })
+        }
     }
-    output.flush()?;
-    Ok(())
 }
 enum Next {
     Input(Option<InputEvent>),
@@ -267,5 +295,132 @@ mod tests {
         .unwrap_err();
         let actual = error.downcast_ref::<ChatRunError>().unwrap();
         assert_eq!(*actual.report, expected);
+    }
+    #[derive(Clone, Copy)]
+    enum OutputFault {
+        Write,
+        Flush,
+    }
+    struct FailingOutput(OutputFault);
+    impl Write for FailingOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            match self.0 {
+                OutputFault::Write => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "测试写入失败",
+                )),
+                OutputFault::Flush => Ok(bytes.len()),
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            match self.0 {
+                OutputFault::Write => Ok(()),
+                OutputFault::Flush => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "测试刷新失败",
+                )),
+            }
+        }
+    }
+    fn completed_report() -> ControlReport {
+        use eve_llm_api::{ChatMessage, ChatRole, ToolResult};
+        let mut value = report(CommitState::Completed);
+        value.cancel_requested = false;
+        value.run.failure = None;
+        value.run.transcript = Some(vec![
+            ChatMessage::text(ChatRole::User, "原始输入"),
+            ChatMessage::text(ChatRole::Assistant, "已经生成"),
+        ]);
+        value.run.tool_results =
+            vec![ToolResult::success("echo-1", serde_json::json!({"echo":"回执"})).unwrap()];
+        value
+    }
+    #[test]
+    fn completed_output_failure_preserves_report_and_original_io_error() {
+        for fault in [OutputFault::Write, OutputFault::Flush] {
+            let expected = completed_report();
+            let error = finish(
+                expected.clone(),
+                &mut FailingOutput(fault),
+                &mut ChatSummary::default(),
+            )
+            .unwrap_err();
+            let actual = error.downcast_ref::<ChatOutputError>().unwrap();
+            assert_eq!(*actual.report, expected);
+            assert_eq!(actual.output.kind(), std::io::ErrorKind::BrokenPipe);
+            let source = std::error::Error::source(actual).unwrap();
+            assert!(source.is::<std::io::Error>());
+            assert!(!format!("{actual:?}").contains("原始输入"));
+            assert!(!format!("{actual:?}").contains("已经生成"));
+        }
+    }
+    #[test]
+    fn cancelled_or_failed_output_failure_preserves_original_report() {
+        for fault in [OutputFault::Write, OutputFault::Flush] {
+            for cancelled in [false, true] {
+                let mut expected = report(CommitState::Failed);
+                expected.cancel_requested = cancelled;
+                expected.run.failure = Some(RunFailure::Execution(if cancelled {
+                    LlmError::Cancelled
+                } else {
+                    LlmError::Provider("模型故障".into())
+                }));
+                let error = finish(
+                    expected.clone(),
+                    &mut FailingOutput(fault),
+                    &mut ChatSummary::default(),
+                )
+                .unwrap_err();
+                assert_eq!(
+                    *error.downcast_ref::<ChatOutputError>().unwrap().report,
+                    expected
+                );
+            }
+        }
+    }
+    #[test]
+    fn fatal_report_and_output_failure_are_both_retained() {
+        for fault in [OutputFault::Write, OutputFault::Flush] {
+            for commit in [
+                CommitState::Pending,
+                CommitState::Unknown,
+                CommitState::Completed,
+            ] {
+                let mut expected = report(commit);
+                expected.cancel_requested = false;
+                let error = finish(
+                    expected.clone(),
+                    &mut FailingOutput(fault),
+                    &mut ChatSummary::default(),
+                )
+                .unwrap_err();
+                let actual = error.downcast_ref::<crate::AppFailure>().unwrap();
+                assert_eq!(
+                    *actual.primary.downcast_ref::<ChatRunError>().unwrap().report,
+                    expected
+                );
+                assert_eq!(actual.secondary.len(), 1);
+                assert_eq!(
+                    actual.secondary[0]
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .kind(),
+                    std::io::ErrorKind::BrokenPipe
+                );
+            }
+        }
+    }
+    #[test]
+    fn completed_without_text_returns_original_report() {
+        let mut expected = completed_report();
+        expected.run.text = None;
+        let error = finish(
+            expected.clone(),
+            &mut Vec::new(),
+            &mut ChatSummary::default(),
+        )
+        .unwrap_err();
+        assert_eq!(*error.downcast_ref::<ChatRunError>().unwrap().report, expected);
+        assert_eq!(error.to_string(), "完成报告缺少文本。");
     }
 }
