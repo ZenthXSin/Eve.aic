@@ -78,6 +78,14 @@ pub async fn run_qqbot(options: QqBotOptions) -> Result<QqBotStatus, AppError> {
         _ => return Err("QQBOT_SANDBOX 必须为 true 或 false".into()),
     };
     let bootstrap = core_bootstrap(&options.agent_path)?;
+    let plugin = QqBotPlugin::new(QqBotConfig {
+        node_program: options.node_program,
+        bridge_script: options.bridge_script,
+        bridge_args: options.bridge_args,
+        app_id: std::env::var("QQBOT_APP_ID").unwrap_or_else(|_| DEFAULT_QQBOT_APP_ID.into()),
+        app_secret,
+        sandbox,
+    })?;
     let backends = KernelServices {
         state: Arc::new(FileStateStore::open(&options.state_directory)?),
         ..KernelServices::default()
@@ -96,14 +104,7 @@ pub async fn run_qqbot(options: QqBotOptions) -> Result<QqBotStatus, AppError> {
             bootstrap,
         )
         .await?;
-        kernel.register(Box::new(QqBotPlugin::new(QqBotConfig {
-            node_program: options.node_program,
-            bridge_script: options.bridge_script,
-            bridge_args: options.bridge_args,
-            app_id: std::env::var("QQBOT_APP_ID").unwrap_or_else(|_| DEFAULT_QQBOT_APP_ID.into()),
-            app_secret,
-            sandbox,
-        })?))?;
+        kernel.register(Box::new(plugin))?;
         kernel.start(&PluginId::new(QQBOT_PLUGIN_ID)?).await?;
         let handle = registry
             .get(&ServiceId::new(QQBOT_STATUS_SERVICE_ID)?)?

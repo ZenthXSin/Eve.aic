@@ -82,7 +82,10 @@ impl Plugin for QqBotPlugin {
             let (stop, stop_receiver) = watch::channel(false);
             ctx.provide_service(
                 ServiceId::new(QQBOT_STATUS_SERVICE_ID)?,
-                QqBotStatusHandle { status: receiver, stop },
+                QqBotStatusHandle {
+                    status: receiver,
+                    stop,
+                },
             )?;
             let ledger = Arc::new(tokio::sync::Mutex::new(Some(ledger)));
             let config = self.config.clone();
@@ -103,8 +106,16 @@ impl Plugin for QqBotPlugin {
                             ledger.lock().await.take().ok_or_else(|| {
                                 PluginError::Task("QQBot 任务不得重复启动".into())
                             })?;
-                        let result =
-                            bridge::run(config, ctx, control, ledger, signal, status.clone(), stop_receiver).await;
+                        let result = bridge::run(
+                            config,
+                            ctx,
+                            control,
+                            ledger,
+                            signal,
+                            status.clone(),
+                            stop_receiver,
+                        )
+                        .await;
                         status.send_modify(|s| {
                             s.closed = true;
                             s.terminal_error = result.is_err();
