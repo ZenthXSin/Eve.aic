@@ -27,14 +27,15 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      EVE_OPENAI_BASE_URL: "https://ai.xn--rhqr8xvr4ahqsgka.com"
     steps:
-      - name: 检查既有服务配置
+      - name: 检查主模型凭据
         env:
-          EVE_OPENAI_BASE_URL: ${{ secrets.EVE_OPENAI_BASE_URL }}
           EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
         run: |
-          if [ -z "$EVE_OPENAI_BASE_URL" ] || [ -z "$EVE_OPENAI_API_KEY" ]; then
-            echo "请在仓库 Actions Secrets 配置 EVE_OPENAI_BASE_URL 与 EVE_OPENAI_API_KEY。"
+          if [ -z "$EVE_OPENAI_API_KEY" ]; then
+            echo "请在仓库 Actions Secrets 配置 EVE_OPENAI_API_KEY。"
             exit 1
           fi
       - name: 检出主线
@@ -47,7 +48,6 @@ jobs:
         run: cargo +1.89.0 build -p eve-app --bin eve --example model_acceptance --locked
       - name: 验收多轮与新进程恢复
         env:
-          EVE_OPENAI_BASE_URL: ${{ secrets.EVE_OPENAI_BASE_URL }}
           EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
           EVE_OPENAI_MODEL: ${{ inputs.model }}
           EVE_OPENAI_REASONING_EFFORT: ${{ inputs.reasoning_effort }}
