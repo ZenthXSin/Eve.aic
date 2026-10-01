@@ -118,6 +118,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-agent-prompt"
+version = "0.1.0"
+dependencies = [
+ "eve-llm-api",
+ "ring",
+ "tempfile",
+]
+
+[[package]]
 name = "eve-config-api"
 version = "0.1.0"
 dependencies = [
@@ -233,6 +242,7 @@ dependencies = [
 name = "eve-runtime"
 version = "0.1.0"
 dependencies = [
+ "eve-agent-prompt",
  "eve-config-api",
  "eve-config-plugin",
  "eve-control-api",

@@ -49,6 +49,208 @@ jobs:
         run: cargo run -p eve-runtime --example lifecycle_operations --locked
       - name: 验证集成后的 Mock LLM 工具闭环
         run: cargo run -p eve-runtime --example llm_tool_loop --locked
+      - name: 验证 AGENT 文件身份与工具往返
+        run: |
+          function Invoke-Agent([string] $Path) {
+            if ($Path) {
+              $output = @(& cargo run -p eve-runtime --example agent_prompt --locked -- $Path)
+            } else {
+              $output = @(& cargo run -p eve-runtime --example agent_prompt --locked)
+            }
+            if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "Agent 身份示例失败" }
+            Write-Host $output[0]
+            $report = $output[0] | ConvertFrom-Json -AsHashtable
+            if ($report.source -cne "file" -or $report.revision -cnotmatch '^sha256:[0-9a-f]{64}
+        run: |
+          $env:EVE_LLM_MAX_PARALLEL_TOOL_CALLS = "10"
+          $configDirectory = Join-Path $env:RUNNER_TEMP "eve-config-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $firstOutput = @(& cargo run -p eve-runtime --example configuration --locked -- $configDirectory)
+          if ($LASTEXITCODE -ne 0) { throw "首次配置示例执行失败" }
+          $firstOutput | ForEach-Object { Write-Host $_ }
+          if ($firstOutput.Count -ne 1 -or $firstOutput[0] -cne "启动并发：10；仅新请求：在途 10 / 新请求 11；立即替换：12；重启恢复：12。") {
+            throw "首次配置验收结果不符"
+          }
+          $first = Get-Content -LiteralPath (Join-Path $configDirectory "config.json") -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
+          if ($first.format_version -ne 1 -or $first.current.revision -ne 2 -or $first.current.namespaces["runtime.llm"]["values"]["max_parallel_tool_calls"] -ne 12) {
+            throw "首次配置文件修订或值不符"
+          }
+          $secondOutput = @(& cargo run -p eve-runtime --example configuration --locked -- $configDirectory)
+          if ($LASTEXITCODE -ne 0) { throw "第二次配置示例执行失败" }
+          $secondOutput | ForEach-Object { Write-Host $_ }
+          if ($secondOutput.Count -ne 1 -or $secondOutput[0] -cne "启动并发：12；仅新请求：在途 12 / 新请求 13；立即替换：14；重启恢复：14。") {
+            throw "第二次启动必须恢复文件层配置并遮盖环境值 10"
+          }
+          $second = Get-Content -LiteralPath (Join-Path $configDirectory "config.json") -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
+          if ($second.current.revision -ne 4 -or $second.current.namespaces["runtime.llm"]["values"]["max_parallel_tool_calls"] -ne 14 -or $second.backups.Count -ne 4) {
+            throw "第二次配置文件修订、值或备份不符"
+          }
+      - name: 验证 OpenAI 本地 HTTP 与插件工具闭环
+        run: cargo run -p eve-runtime --example openai_offline --locked
+      - name: 验证 Responses SSE、插件工具与会话保存
+        run: cargo run -p eve-runtime --example streaming_offline --locked
+      - name: 验证显式取消、代际隔离及独立进程恢复
+        run: |
+          $controlDirectory = Join-Path $env:RUNNER_TEMP "eve-control-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          for ($attempt = 1; $attempt -le 2; $attempt++) {
+            $output = @(& cargo run -p eve-runtime --example controlled_session --locked -- $controlDirectory)
+            if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "任务控制进程验收失败" }
+            Write-Host $output[0]
+            $report = $output[0] | ConvertFrom-Json -AsHashtable
+            if ($report.cancelled_generation -ne 1 -or $report.completed_generation -ne 2 -or
+                $report.turn_id -ne (2 * $attempt) -or $report.history_messages -ne (4 * $attempt) -or
+                $report.tool_executions -ne 1 -or $report.provider_requests -ne 3 -or
+                $report.saved_events -ne 1 -or $report.old_event_accepted -ne $false) { throw "取消、代际或恢复结果不符" }
+          }
+          $state = Get-Content -LiteralPath (Join-Path $controlDirectory "state.json") -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
+          $document = [System.Text.Encoding]::UTF8.GetString([byte[]] $state.entries["eve.session"]["sessions.v1"]) | ConvertFrom-Json -AsHashtable
+          $snapshot = $document.sessions["controlled-session"]
+          if ($snapshot.revision -ne 8 -or $snapshot.turns.Count -ne 4) { throw "控制会话磁盘修订不符" }
+          foreach ($index in @(0, 2)) {
+            if ($snapshot.turns[$index].status.state -ne "Failed" -or
+                $snapshot.turns[$index].status.failure.code -ne "Cancelled" -or
+                $snapshot.turns[$index].status.failure.started_tools -ne 0) { throw "取消记录未落盘" }
+          }
+          foreach ($index in @(1, 3)) {
+            if ($snapshot.turns[$index].status.state -ne "Completed" -or
+                $snapshot.turns[$index].status.messages.Count -ne 4) { throw "完整工具历史未保存" }
+          }
+      - name: 验证规则与 LLM 判断、混合修订及独立进程恢复
+        run: |
+          foreach ($example in @("message_relations", "natural_message_relations")) {
+            $messageDirectory = Join-Path $env:RUNNER_TEMP "eve-$example-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+            for ($attempt = 1; $attempt -le 2; $attempt++) {
+              $output = @(& cargo run -p eve-runtime --example $example --locked -- $messageDirectory)
+              if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "消息关系进程验收失败" }
+              Write-Host $output[0]
+              $report = $output[0] | ConvertFrom-Json -AsHashtable
+              if ($example -ceq "natural_message_relations" -and $report.judge_requests -ne 2) { throw "内置判断请求次数不符" }
+              if ($report.cancelled_generation -ne 1 -or $report.completed_generation -ne 2 -or
+                  $report.intent_parts -ne 2 -or $report.turn_id -ne (2 * $attempt) -or
+                  $report.history_messages -ne (4 * $attempt) -or $report.tool_executions -ne 1 -or
+                  $report.provider_requests -ne 3 -or $report.saved_events -ne 1 -or
+                  $report.old_event_accepted -ne $false) { throw "消息修订、代际或恢复结果不符" }
+            }
+            $state = Get-Content -LiteralPath (Join-Path $messageDirectory "state.json") -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
+            $document = [System.Text.Encoding]::UTF8.GetString([byte[]] $state.entries["eve.session"]["sessions.v1"]) | ConvertFrom-Json -AsHashtable
+            $snapshot = $document.sessions["message-session"]
+            if ($snapshot.revision -ne 8 -or $snapshot.turns.Count -ne 4) { throw "消息会话磁盘修订不符" }
+            foreach ($index in @(0, 2)) {
+              if ($snapshot.turns[$index].status.state -ne "Failed" -or
+                  $snapshot.turns[$index].status.failure.code -ne "Cancelled" -or
+                  $snapshot.turns[$index].status.failure.started_tools -ne 0) { throw "修订取消记录未落盘" }
+            }
+            foreach ($index in @(1, 3)) {
+              if ($snapshot.turns[$index].status.state -ne "Completed" -or
+                  $snapshot.turns[$index].status.messages.Count -ne 4) { throw "修订工具历史未保存" }
+              $revision = $snapshot.turns[$index].status.messages[0].text | ConvertFrom-Json -AsHashtable
+              if ($revision.base_request -cne "旧任务" -or $revision.changes.Count -ne 2 -or
+                  $revision.changes[0].kind -cne "supplement" -or $revision.changes[0].text -cne "包含本地回执" -or
+                  $revision.changes[1].kind -cne "correction" -or $revision.changes[1].text -cne "回执内容改为新任务回执") { throw "用户原文修订未正确保存" }
+            }
+          }
+      - name: 验证流式跨进程恢复及取消输入过滤
+        run: |
+          $streamDirectory = Join-Path $env:RUNNER_TEMP "eve-stream-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          function Invoke-Stream([string] $Mode) {
+            $output = @(& cargo run -p eve-runtime --example session_recovery --locked -- $streamDirectory $Mode)
+            if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "流式进程验收失败" }
+            Write-Host $output[0]
+            return ($output[0] | ConvertFrom-Json -AsHashtable)
+          }
+          $first = Invoke-Stream "--stream"
+          $second = Invoke-Stream "--stream"
+          $cancelled = Invoke-Stream "--cancel-stream"
+          $last = Invoke-Stream "--stream"
+          if ($first.turn_id -ne 1 -or $first.tool_executions -ne 1 -or $first.saved_events -ne 1 -or $first.provider_requests -ne 2) { throw "首次流式工具往返不符" }
+          if ($second.turn_id -ne 2 -or $second.history_messages -ne 4 -or $second.tool_executions -ne 0 -or $second.saved_events -ne 1) { throw "流式历史恢复不符" }
+          if ($cancelled.mode -ne "cancelled" -or $cancelled.turn_id -ne 3 -or $cancelled.history_messages -ne 6 -or $cancelled.tool_executions -ne 0 -or $cancelled.saved_events -ne 0) { throw "流取消结果不符" }
+          if ($last.turn_id -ne 4 -or $last.history_messages -ne 6 -or $last.tool_executions -ne 0 -or $last.saved_events -ne 1) { throw "取消输入过滤或旧工具次数不符" }
+          $state = Get-Content -LiteralPath (Join-Path $streamDirectory "state.json") -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
+          $document = [System.Text.Encoding]::UTF8.GetString([byte[]] $state.entries["eve.session"]["sessions.v1"]) | ConvertFrom-Json -AsHashtable
+          $snapshot = $document.sessions["demo-session"]
+          if ($snapshot.revision -ne 8 -or $snapshot.turns[2].status.state -ne "Failed" -or $snapshot.turns[2].status.failure.code -ne "Cancelled") { throw "实际取消记录未正确保存" }
+      - name: 验证会话与工具历史跨进程恢复及中断
+        run: |
+          $sessionDirectory = Join-Path $env:RUNNER_TEMP "eve-session-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          function Invoke-Session([string] $Mode) {
+            if ($Mode -eq "pending") {
+              $output = @(& cargo run -p eve-runtime --example session_recovery --locked -- $sessionDirectory --leave-pending)
+            } else {
+              $output = @(& cargo run -p eve-runtime --example session_recovery --locked -- $sessionDirectory)
+            }
+            if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "会话进程验收失败" }
+            Write-Host $output[0]
+            return ($output[0] | ConvertFrom-Json -AsHashtable)
+          }
+          $first = Invoke-Session "completed"
+          if ($first.turn_id -ne 1 -or $first.history_messages -ne 0 -or $first.tool_executions -ne 1 -or $first.provider_requests -ne 2) { throw "首次工具轮次结果不符" }
+          $second = Invoke-Session "completed"
+          if ($second.turn_id -ne 2 -or $second.history_messages -ne 4 -or $second.tool_executions -ne 0 -or $second.provider_requests -ne 1) { throw "会话历史未恢复或旧工具被重放" }
+          $pending = Invoke-Session "pending"
+          if ($pending.mode -ne "pending" -or $pending.turn_id -ne 3 -or $pending.history_messages -ne 6 -or $pending.tool_executions -ne 0 -or $pending.provider_requests -ne 0) { throw "未完成轮次构造不符" }
+          $recovered = Invoke-Session "completed"
+          if ($recovered.turn_id -ne 4 -or $recovered.history_messages -ne 6 -or $recovered.interrupted -ne 1 -or $recovered.tool_executions -ne 0) { throw "Pending 恢复或失败输入过滤不符" }
+          $state = Get-Content -LiteralPath (Join-Path $sessionDirectory "state.json") -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
+          $document = [System.Text.Encoding]::UTF8.GetString([byte[]] $state.entries["eve.session"]["sessions.v1"]) | ConvertFrom-Json -AsHashtable
+          $snapshot = $document.sessions["demo-session"]
+          if ($document.format_version -ne 1 -or $snapshot.revision -ne 8 -or $snapshot.turns.Count -ne 4 -or $snapshot.turns[2].status.state -ne "Interrupted" -or $snapshot.turns[0].status.messages.Count -ne 4) { throw "实际磁盘会话记录不符" }
+      - name: 验证两次独立进程恢复状态
+        run: |
+          function Assert-SavedCounter([string] $Directory, [string] $ExpectedStarts) {
+            $snapshotPath = Join-Path $Directory "state.json"
+            $snapshot = Get-Content -LiteralPath $snapshotPath -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
+            $starts = $snapshot.entries["demo.state-recovery"].starts
+            if ($snapshot.version -ne 1 -or $starts -isnot [array] -or
+                (ConvertTo-Json -InputObject $starts -Compress) -cne $ExpectedStarts) {
+              throw "磁盘快照必须保存版本 1 和 starts 字节数组 $ExpectedStarts"
+            }
+          }
+
+          $stateDirectory = Join-Path $env:RUNNER_TEMP "eve-state-recovery-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $firstOutput = @(& cargo run -p eve-runtime --example state_recovery --locked -- $stateDirectory)
+          if ($LASTEXITCODE -ne 0) { throw "首次状态恢复示例执行失败" }
+          $firstOutput | ForEach-Object { Write-Host $_ }
+          if ($firstOutput.Count -eq 0 -or $firstOutput[0] -cne "恢复前值：无；写入后值：1。") {
+            throw "首次启动必须从空状态写入计数 1"
+          }
+          Assert-SavedCounter $stateDirectory "[49]"
+
+          $secondOutput = @(& cargo run -p eve-runtime --example state_recovery --locked -- $stateDirectory)
+          if ($LASTEXITCODE -ne 0) { throw "第二次状态恢复示例执行失败" }
+          $secondOutput | ForEach-Object { Write-Host $_ }
+          if ($secondOutput.Count -eq 0 -or $secondOutput[0] -cne "恢复前值：1；写入后值：2。") {
+            throw "第二次启动必须恢复计数 1 并写入计数 2"
+          }
+          Assert-SavedCounter $stateDirectory "[50]"
+
+  msrv:
+    name: 最低 Rust 版本 / 1.89.0
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 安装最低支持版本
+        run: rustup toolchain install 1.89.0 --profile minimal
+      - name: 检查最低版本的所有构建目标
+        run: cargo +1.89.0 check --workspace --all-targets --locked
+ -or
+                $report.prompt_bytes -le 0 -or $report.provider_requests -ne 2 -or $report.started_tools -ne 1) {
+              throw "Agent 来源、版本或工具往返不符"
+            }
+            return $report
+          }
+          $default = Invoke-Agent ""
+          $agentFile = Join-Path $env:RUNNER_TEMP "eve-agent-$env:GITHUB_RUN_ID.md"
+          $body = "# 自定义 Eve 身份"
+          [System.IO.File]::WriteAllText($agentFile, $body, [System.Text.UTF8Encoding]::new($false))
+          $explicit = Invoke-Agent $agentFile
+          if ($explicit.revision -ceq $default.revision -or
+              $explicit.prompt_bytes -ne [System.Text.Encoding]::UTF8.GetByteCount($body)) {
+            throw "显式文件没有替换默认文件身份"
+          }
       - name: 验证配置插件及两次独立进程恢复
         run: |
           $env:EVE_LLM_MAX_PARALLEL_TOOL_CALLS = "10"

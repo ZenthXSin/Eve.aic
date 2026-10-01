@@ -5,9 +5,10 @@
 use eve_kernel::{Kernel, RuntimeAdmissionGuard};
 use eve_llm_api::{
     ChatMessage, ChatRole, ContextAssembler, ContextService, ContextSnapshot, LlmError, LlmFuture,
-    LlmProvider, ModelRequest, ModelResponse, ModelTextSink, ResponseMode, Tool, ToolBinding,
-    ToolCall, ToolCancellation, ToolConcurrency, ToolDefinition, ToolExecutionContext,
-    ToolFailureCode, ToolResult, ToolService, TurnEvent, TurnEventKind, TurnEventSink, TurnInput,
+    LlmProvider, ModelRequest, ModelResponse, ModelTextSink, ResponseMode, SystemPromptMetadata,
+    SystemPromptSnapshot, SystemPromptSource, Tool, ToolBinding, ToolCall, ToolCancellation,
+    ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolFailureCode, ToolResult, ToolService,
+    TurnEvent, TurnEventKind, TurnEventSink, TurnInput,
 };
 use eve_plugin_api::{
     Permission, PermissionChecker, PluginError, PluginId, PluginManifest, PluginState,
@@ -28,10 +29,12 @@ pub struct ContextBinding {
     pub expected_owner: PluginId,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct LlmHostConfig {
     pub version: String,
     pub system_prompt: String,
+    /// 与 system_prompt 一致的不可变来源快照；直接文本兼容路径为 None。
+    pub system_prompt_snapshot: Option<SystemPromptSnapshot>,
     pub output_format: String,
     pub provider_timeout: Duration,
     pub tool_timeout: Duration,
@@ -48,6 +51,7 @@ impl Default for LlmHostConfig {
         Self {
             version: "1".into(),
             system_prompt: "You are Eve's assistant".into(),
+            system_prompt_snapshot: None,
             output_format: "plain text".into(),
             provider_timeout: Duration::from_secs(30),
             tool_timeout: Duration::from_secs(10),
@@ -61,13 +65,53 @@ impl Default for LlmHostConfig {
     }
 }
 
+impl std::fmt::Debug for LlmHostConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmHostConfig")
+            .field("version", &self.version)
+            .field("system_prompt_bytes", &self.system_prompt.len())
+            .field("system_prompt_snapshot", &self.system_prompt_snapshot)
+            .field("output_format", &self.output_format)
+            .field("provider_timeout", &self.provider_timeout)
+            .field("tool_timeout", &self.tool_timeout)
+            .field("tool_cancellation_grace", &self.tool_cancellation_grace)
+            .field("max_parallel_tool_calls", &self.max_parallel_tool_calls)
+            .field("max_tool_rounds", &self.max_tool_rounds)
+            .field("response_mode", &self.response_mode)
+            .field("event_timeout", &self.event_timeout)
+            .field("max_stream_text_bytes", &self.max_stream_text_bytes)
+            .finish()
+    }
+}
+
 impl LlmHostConfig {
+    /// 装配时恰好加载一次；显式选择替换旧来源，不拼接身份文本。
+    pub fn with_prompt_source(self, source: &dyn SystemPromptSource) -> Result<Self, LlmError> {
+        self.with_prompt_snapshot(source.load()?)
+    }
+
+    pub fn with_prompt_snapshot(mut self, snapshot: SystemPromptSnapshot) -> Result<Self, LlmError> {
+        self.system_prompt = snapshot.text().into();
+        self.system_prompt_snapshot = Some(snapshot);
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn validate(&self) -> Result<(), LlmError> {
         if self.version.trim().is_empty() {
             return Err(LlmError::Configuration("配置版本不能为空".into()));
         }
         if self.system_prompt.trim().is_empty() {
             return Err(LlmError::Configuration("系统指令不能为空".into()));
+        }
+        if self
+            .system_prompt_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.text() != self.system_prompt)
+        {
+            return Err(LlmError::Configuration(
+                "固定提示词与来源快照不一致，请显式重新装配来源".into(),
+            ));
         }
         if self.output_format.trim().is_empty() {
             return Err(LlmError::Configuration("输出格式不能为空".into()));
@@ -373,6 +417,14 @@ pub struct LlmHost {
 }
 
 impl LlmHost {
+    /// 来源元数据不包含正文；旧的直接 system_prompt 路径返回 None。
+    pub fn system_prompt_metadata(&self) -> Option<&SystemPromptMetadata> {
+        self.config
+            .system_prompt_snapshot
+            .as_ref()
+            .map(SystemPromptSnapshot::metadata)
+    }
+
     pub fn new(
         provider: Arc<dyn LlmProvider>,
         registry: Arc<dyn ServiceRegistry>,

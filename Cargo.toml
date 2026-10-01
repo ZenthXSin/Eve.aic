@@ -5,6 +5,7 @@ members = [
     "crates/config-plugin",
     "crates/kernel",
     "crates/llm-api",
+    "crates/agent-prompt",
     "crates/llm-openai",
     "crates/session-api",
     "crates/session-plugin",

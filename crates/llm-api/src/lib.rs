@@ -3,6 +3,11 @@
 //! 该 crate 只定义宿主、Provider、上下文和工具之间传递的数据与 trait。
 //! 它不依赖 Tokio，也不包含网络、生命周期或具体模型实现。
 
+mod prompt;
+pub use prompt::{
+    SystemPromptMetadata, SystemPromptOrigin, SystemPromptSnapshot, SystemPromptSource,
+};
+
 use eve_plugin_api::{Permission, PluginId, ServiceId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

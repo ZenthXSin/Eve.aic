@@ -20,6 +20,7 @@ serde.workspace = true
 eve-message-api = { path = "../message-api" }
 
 [dev-dependencies]
+eve-agent-prompt = { path = "../agent-prompt" }
 tempfile.workspace = true
 eve-llm-openai = { path = "../llm-openai" }
 eve-session-plugin = { path = "../session-plugin" }
