@@ -701,8 +701,7 @@ async fn output_failure_preserves_committed_tool_report_and_allows_reopen() {
             agent_path: root.join("AGENT.md"),
             ..eve_app::ChatOptions::default()
         };
-        let fail_on_flush =
-            std::env::var("EVE_TEST_OUTPUT_FAILURE_MODE").unwrap() == "flush";
+        let fail_on_flush = std::env::var("EVE_TEST_OUTPUT_FAILURE_MODE").unwrap() == "flush";
         let error = eve_app::run_console(
             options.clone(),
             std::io::Cursor::new("请回显故障回执\n不能执行的排队输入\n"),
@@ -712,7 +711,10 @@ async fn output_failure_preserves_committed_tool_report_and_allows_reopen() {
         .unwrap_err();
         let actual = error.downcast_ref::<eve_app::ChatOutputError>().unwrap();
         assert_eq!(actual.output.kind(), std::io::ErrorKind::BrokenPipe);
-        assert_eq!(actual.report.run.commit, eve_control_api::CommitState::Completed);
+        assert_eq!(
+            actual.report.run.commit,
+            eve_control_api::CommitState::Completed
+        );
         assert_eq!(actual.report.run.text.as_deref(), Some("故障回执已保存"));
         assert_eq!(actual.report.run.started_tools, Some(1));
         assert_eq!(actual.report.run.tool_results.len(), 1);
@@ -723,7 +725,10 @@ async fn output_failure_preserves_committed_tool_report_and_allows_reopen() {
         assert_eq!(first["turns"].as_array().unwrap().len(), 1);
         assert_eq!(first["turns"][0]["status"]["state"], "Completed");
         assert_eq!(
-            first["turns"][0]["status"]["messages"].as_array().unwrap().len(),
+            first["turns"][0]["status"]["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
             4
         );
         // 输出失败没有改写已提交历史；同进程重新打开状态目录并继续。
@@ -791,10 +796,7 @@ async fn output_failure_preserves_committed_tool_report_and_allows_reopen() {
             json!({"echo":"故障回执"})
         );
         let restored = server.next().await.body;
-        assert_eq!(
-            user_texts(&restored),
-            ["请回显故障回执", "输出故障后继续"]
-        );
+        assert_eq!(user_texts(&restored), ["请回显故障回执", "输出故障后继续"]);
         assert_eq!(
             restored["input"]
                 .as_array()

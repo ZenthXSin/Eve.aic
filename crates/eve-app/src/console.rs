@@ -396,7 +396,11 @@ mod tests {
                 .unwrap_err();
                 let actual = error.downcast_ref::<crate::AppFailure>().unwrap();
                 assert_eq!(
-                    *actual.primary.downcast_ref::<ChatRunError>().unwrap().report,
+                    *actual
+                        .primary
+                        .downcast_ref::<ChatRunError>()
+                        .unwrap()
+                        .report,
                     expected
                 );
                 assert_eq!(actual.secondary.len(), 1);
@@ -420,7 +424,10 @@ mod tests {
             &mut ChatSummary::default(),
         )
         .unwrap_err();
-        assert_eq!(*error.downcast_ref::<ChatRunError>().unwrap().report, expected);
+        assert_eq!(
+            *error.downcast_ref::<ChatRunError>().unwrap().report,
+            expected
+        );
         assert_eq!(error.to_string(), "完成报告缺少文本。");
     }
 }
