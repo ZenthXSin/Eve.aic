@@ -23,7 +23,7 @@ $env:EVE_OPENAI_API_KEY = "<宿主凭据>"
 cargo run -p eve-app --locked -- --state-dir ./.eve --agent ./AGENT.md
 ```
 
-每行一轮，/quit 退出；相同目录、用户与会话恢复历史。当前核心入口串行、非流式，内置本地 echo 验证工具闭环。参数、Provider 兼容性与失败语义见[核心对话](./docs/核心对话.md)。
+每行一轮，/cancel 取消当前轮，/quit 或 Ctrl+C 取消并退出；EOF 处理完队列。相同目录、用户与会话恢复历史。当前核心入口串行、非流式，内置本地 echo 验证工具闭环。参数、Provider 兼容性与失败语义见[核心对话](./docs/核心对话.md)。
 
 ```bash
 cargo test --workspace --locked
@@ -35,7 +35,7 @@ cargo run -p eve-runtime --locked
 
 ## 计划与边界
 
-当前先完成核心对话、工具、状态和退出收尾。辅助小模型、Jev、语义模型、四角色路由、Web 面板、动态提示词与 AGI 驱动先保留 TODO，见[开发计划](./docs/开发计划.md)。
+核心入口已接入对话、工具、状态、在途取消和退出收尾；接着验收真实主模型多轮兼容性。辅助小模型、Jev、语义模型、四角色路由、Web 面板、动态提示词与 AGI 驱动先保留 TODO，见[开发计划](./docs/开发计划.md)。
 
 支持单进程可信静态插件；权限检查不是沙箱。Kernel 不承载模型/记忆业务；定义、实现和组合层分离。密钥只由宿主提供；退出显式停止并刷新日志。
 

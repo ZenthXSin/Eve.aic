@@ -95,7 +95,7 @@ async fn real_process_chat_tool_round_trip_and_restart_preserve_history_without_
     ]).await;
     let first = run(
         command(root.path(), &server.url),
-        "请回显核心回执\n第二轮\n/quit\n",
+        "请回显核心回执\n第二轮\n",
     )
     .await;
     assert!(
@@ -196,7 +196,7 @@ async fn provider_failure_is_not_retried_or_added_to_completed_history() {
     let mut server = Server::start(vec![failed, Reply::json(final_response("下一轮成功"))]).await;
     let output = run(
         command(root.path(), &server.url),
-        "失败输入\n新输入\n/quit\n",
+        "失败输入\n新输入\n",
     )
     .await;
     assert!(!output.status.success());
@@ -282,7 +282,7 @@ async fn oversized_input_and_local_commands_do_not_create_turns() {
     let root = fixture();
     let mut server = Server::start(vec![Reply::json(final_response("有效输入成功"))]).await;
     let text = format!(
-        "{}\n/help\n\n有效输入\n/quit\n不应发送\n",
+        "{}\n/help\n\n有效输入\n",
         "长".repeat(12000)
     );
     let output = run(command(root.path(), &server.url), &text).await;
@@ -358,4 +358,206 @@ fn cli_requires_values_and_valid_session_identifiers() {
         .unwrap();
     assert_eq!(selected.session_id, "my-session");
     assert_eq!(selected.user_id, "my-user");
+}
+
+struct Interactive {
+    child: Option<std::process::Child>,
+    stdin: Option<std::process::ChildStdin>,
+}
+impl Interactive {
+    fn start(mut command: Command) -> Self {
+        command.env("EVE_OPENAI_TIMEOUT_SECONDS", "30");
+        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let stdin = child.stdin.take();
+        Self { child: Some(child), stdin }
+    }
+    fn write(&mut self, text: &str) { self.write_bytes(text.as_bytes()); }
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        let stdin = self.stdin.as_mut().unwrap();
+        stdin.write_all(bytes).unwrap();
+        stdin.flush().unwrap();
+    }
+    async fn finish(mut self) -> Output {
+        // stdin 故意保持打开；退出不能等标准输入读线程结束。
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if self.child.as_mut().unwrap().try_wait().unwrap().is_some() { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("命令退出/取消收尾超过期限");
+        self.child.take().unwrap().wait_with_output().unwrap()
+    }
+}
+impl Drop for Interactive {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+async fn completed(root: &Path, index: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if sessions(root)["sessions"]["default"]["turns"][index]["status"]["state"] == "Completed" { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+}
+fn delayed(text: &str) -> Reply {
+    let mut reply = Reply::json(final_response(text));
+    reply.body_delay = Duration::from_secs(30);
+    reply
+}
+#[tokio::test]
+async fn cancel_clears_bounded_queue_then_new_input_and_restart_succeed() {
+    let root = fixture();
+    let mut server = Server::start(vec![
+        delayed("不应显示的旧回复"),
+        Reply::json(final_response("后续任务完成")),
+        Reply::json(final_response("恢复完成")),
+    ]).await;
+    let mut process = Interactive::start(command(root.path(), &server.url));
+    process.write("旧任务\n");
+    assert_eq!(user_texts(&server.next().await.body), ["旧任务"]);
+    process.write(&("不应启动的排队输入\n".repeat(18) + "/cancel\n新任务\n"));
+    assert_eq!(user_texts(&server.next().await.body), ["新任务"]);
+    completed(root.path(), 1).await;
+    process.write("/quit\n");
+    let output = process.finish().await;
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("当前轮次已取消并完成收尾"));
+    assert!(stdout.contains("已有 16 条待处理输入"));
+    assert!(stdout.contains("后续任务完成"));
+    assert!(!stdout.contains("不应显示的旧回复"));
+    let document = sessions(root.path());
+    assert_eq!(document["sessions"]["default"]["turns"][0]["status"]["failure"]["code"], "Cancelled");
+    assert_eq!(document["sessions"]["default"]["turns"][0]["status"]["failure"]["started_tools"], 0);
+    assert_eq!(document["sessions"]["default"]["turns"].as_array().unwrap().len(), 2);
+    assert!(run(command(root.path(), &server.url), "重启新轮\n").await.status.success());
+    assert_eq!(user_texts(&server.next().await.body), ["新任务", "重启新轮"]);
+    assert!(server.requests.try_recv().is_err());
+}
+#[tokio::test]
+async fn quit_cancels_inflight_request_with_open_stdin_and_discards_queue() {
+    let root = fixture();
+    let mut server = Server::start(vec![delayed("不应显示")]).await;
+    let mut process = Interactive::start(command(root.path(), &server.url));
+    process.write("等待模型\n");
+    server.next().await;
+    process.write("排队输入\n/quit\n");
+    let output = process.finish().await;
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(sessions(root.path())["sessions"]["default"]["turns"].as_array().unwrap().len(), 1);
+    assert_eq!(sessions(root.path())["sessions"]["default"]["turns"][0]["status"]["failure"]["code"], "Cancelled");
+    assert!(server.requests.try_recv().is_err());
+}
+#[tokio::test]
+async fn quit_after_tool_result_waits_for_cancel_and_restart_never_replays_tool() {
+    let root = fixture();
+    let mut server = Server::start(vec![
+        Reply::json(json!({"status":"completed","error":null,"output":[
+            {"type":"function_call","call_id":"cancel-echo","name":"echo","arguments":"{\"text\":\"取消前回执\"}"}
+        ]})),
+        delayed("不应显示的工具最终回复"),
+        Reply::json(final_response("新的独立任务")),
+    ]).await;
+    let mut process = Interactive::start(command(root.path(), &server.url));
+    process.write("调用一次 echo\n");
+    server.next().await;
+    let request = server.next().await.body;
+    let result = request["input"].as_array().unwrap().iter().find(|m| m["type"] == "function_call_output").unwrap();
+    assert_eq!(result["call_id"], "cancel-echo");
+    assert_eq!(serde_json::from_str::<Value>(result["output"].as_str().unwrap()).unwrap(), json!({"echo":"取消前回执"}));
+    process.write("/quit\n");
+    assert!(process.finish().await.status.success());
+    let failure = sessions(root.path())["sessions"]["default"]["turns"][0]["status"]["failure"].clone();
+    assert_eq!(failure["code"], "Cancelled");
+    assert_eq!(failure["started_tools"], 1);
+    assert!(run(command(root.path(), &server.url), "独立新输入\n").await.status.success());
+    assert_eq!(user_texts(&server.next().await.body), ["独立新输入"]);
+    assert!(server.requests.try_recv().is_err());
+}
+#[tokio::test]
+async fn invalid_utf8_during_request_cancels_and_saves_failure_before_exit() {
+    let root = fixture();
+    let mut server = Server::start(vec![delayed("不应显示")]).await;
+    let mut process = Interactive::start(command(root.path(), &server.url));
+    process.write("运行中的输入\n");
+    server.next().await;
+    process.write_bytes(&[0xff, b'\n']);
+    let output = process.finish().await;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("UTF-8"));
+    assert_eq!(sessions(root.path())["sessions"]["default"]["turns"][0]["status"]["failure"]["code"], "Cancelled");
+}
+#[tokio::test]
+async fn cancellation_record_failure_keeps_pending_and_stops_new_input() {
+    let root = fixture();
+    let mut server = Server::start(vec![delayed("不应显示")]).await;
+    let mut process = Interactive::start(command(root.path(), &server.url));
+    process.write("取消保存失败\n");
+    server.next().await;
+    let target = root.path().join("state/state.json");
+    let preserved = root.path().join("state/preserved.json");
+    let original = std::fs::read(&target).unwrap();
+    std::fs::rename(&target, &preserved).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    process.write("/cancel\n不能启动新轮\n");
+    let output = process.finish().await;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Pending"));
+    assert!(server.requests.try_recv().is_err());
+    assert_eq!(std::fs::read(&preserved).unwrap(), original);
+    std::fs::remove_dir(&target).unwrap();
+    std::fs::rename(&preserved, &target).unwrap();
+    assert_eq!(sessions(root.path())["sessions"]["default"]["turns"][0]["status"]["state"], "Pending");
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn actual_sigint_cancels_and_exits_even_when_stdin_remains_open() {
+    let root = fixture();
+    let mut server = Server::start(vec![delayed("不应显示")]).await;
+    let mut process = Interactive::start(command(root.path(), &server.url));
+    process.write("Ctrl+C 运行中轮次\n");
+    server.next().await;
+    let pid = process.child.as_ref().unwrap().id();
+    assert!(Command::new("kill").args(["-INT", &pid.to_string()]).status().unwrap().success());
+    assert!(process.finish().await.status.success());
+    assert_eq!(sessions(root.path())["sessions"]["default"]["turns"][0]["status"]["failure"]["code"], "Cancelled");
+}
+
+#[tokio::test]
+async fn same_process_entry_releases_directory_before_second_invocation() {
+    if let Some(root) = std::env::var_os("EVE_TEST_REENTER_ROOT") {
+        let root = std::path::PathBuf::from(root);
+        let options = eve_app::ChatOptions {
+            state_directory: root.join("state"),
+            agent_path: root.join("AGENT.md"),
+            ..eve_app::ChatOptions::default()
+        };
+        let mut output = Vec::new();
+        eve_app::run_console(options.clone(), std::io::Cursor::new("同进程第一轮"), &mut output).await.unwrap();
+        eve_app::run_console(options, std::io::Cursor::new("同进程第二轮"), &mut output).await.unwrap();
+        assert!(String::from_utf8(output).unwrap().contains("第二轮完成"));
+        return;
+    }
+    let root = fixture();
+    let mut server = Server::start(vec![
+        Reply::json(final_response("第一轮完成")),
+        Reply::json(final_response("第二轮完成")),
+    ]).await;
+    // 在独立测试子进程注入环境；测试进程本身不修改全局环境。
+    let configured = command(root.path(), &server.url);
+    let mut harness = Command::new(std::env::current_exe().unwrap());
+    for (name, value) in configured.get_envs() {
+        if let Some(value) = value { harness.env(name, value); } else { harness.env_remove(name); }
+    }
+    harness.args(["--exact", "same_process_entry_releases_directory_before_second_invocation", "--nocapture"]);
+    harness.env("EVE_TEST_REENTER_ROOT", root.path());
+    let result = run(harness, "").await;
+    assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+    assert_eq!(user_texts(&server.next().await.body), ["同进程第一轮"]);
+    assert_eq!(user_texts(&server.next().await.body), ["同进程第一轮", "同进程第二轮"]);
 }

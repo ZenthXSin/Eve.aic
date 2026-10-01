@@ -1,9 +1,12 @@
 //! Eve 的最小可运行组合入口：固定身份、一个主模型、会话历史与插件工具。
-//! 串行读取输入，不包含辅助模型、语义检索、动态驱动或 Web 控制面。
+//! 输入与受管轮次并发，任务仍串行；不包含额外模型或 Web 控制面。
 mod config;
+mod console;
 mod error;
+mod input;
 mod services;
 
+pub use console::ChatRunError;
 pub use error::AppFailure;
 
 use eve_agent_prompt::FileAgentPrompt;
@@ -11,18 +14,20 @@ use eve_config_api::{
     CONFIG_SERVICE_ID, ConfigServiceHandle, LLM_NAMESPACE, LlmRuntimeConfig, runtime_llm_schema,
 };
 use eve_config_plugin::{ConfigBootstrap, ConfigPlugin};
+use eve_control_api::{CONTROL_PLUGIN_ID, CONTROL_SERVICE_ID, ControlServiceHandle};
+use eve_control_plugin::ControlPlugin;
 use eve_kernel::{Kernel, KernelServices, backends::FileStateStore};
 use eve_llm_api::{ResponseMode, ToolBinding};
 use eve_llm_openai::OpenAiProvider;
-use eve_plugin_api::{PluginId, ServiceId};
+use eve_plugin_api::{PluginDependency, PluginId, ServiceId};
 use eve_runtime::{
-    ContextBinding, LlmHost, LlmHostConfig, SessionBinding, SessionLlmHost, SessionRunError,
+    ContextBinding, LlmHost, LlmHostConfig, SessionBinding, SessionControlRunner, SessionLlmHost,
 };
-use eve_session_api::{SessionInput, SessionKey};
+use eve_session_api::{SESSION_PLUGIN_ID, SessionKey};
 use eve_session_plugin::SessionPlugin;
 use std::{
     ffi::OsString,
-    io::{BufRead, Read, Write},
+    io::{BufRead, Write},
     path::PathBuf,
     sync::Arc,
 };
@@ -32,7 +37,8 @@ pub const HELP: &str = "Eve 核心对话入口
 用法：eve [--state-dir 目录] [--agent AGENT.md] [--session 会话] [--user 用户]
 主模型：EVE_OPENAI_MODEL；凭据：EVE_OPENAI_API_KEY（仅宿主环境）
 可选：EVE_OPENAI_BASE_URL、EVE_OPENAI_REASONING_EFFORT
-一行一轮；空行忽略；/help 查看说明；/quit 或输入结束后停止并刷新。
+一行一轮；/cancel 取消当前轮；/quit 或 Ctrl+C 取消并退出；/help 查看说明。
+EOF 处理完已接收输入后退出；最多 16 条待处理输入，取消/退出会清空队列。
 输入上限 32768 字节；当前入口使用非流式模式，串行执行和保存。";
 const MAX_INPUT_BYTES: usize = 32768;
 
@@ -92,13 +98,14 @@ impl ChatOptions {
 pub struct ChatSummary {
     pub completed_turns: usize,
     pub failed_turns: usize,
+    pub cancelled_turns: usize,
 }
 
-/// 输入等待与轮次执行串行；成功保存后才向终端输出完整回复。
+/// 独立输入线程和受管轮次并发；成功保存后才向终端输出完整回复。
 /// 普通执行失败不重试；保存失败立即停止输入，保留生成内容和 Pending。
 pub async fn run_console(
     options: ChatOptions,
-    mut input: impl BufRead,
+    input: impl BufRead + Send + 'static,
     mut output: impl Write,
 ) -> Result<ChatSummary, AppError> {
     let key = SessionKey::new(&options.session_id, &options.user_id)?;
@@ -163,91 +170,43 @@ pub async fn run_console(
                 ..host_config
             },
         )?;
-        let host = SessionLlmHost::new(host, SessionBinding::builtin()).with_logger(logger);
-        let mut summary = ChatSummary::default();
-        loop {
-            let mut bytes = Vec::new();
-            let count = (&mut input)
-                .take((MAX_INPUT_BYTES + 3) as u64)
-                .read_until(b'\n', &mut bytes)?;
-            if count == 0 {
-                break;
-            }
-            let newline = bytes.last() == Some(&b'\n');
-            if newline {
-                bytes.pop();
-            }
-            if bytes.last() == Some(&b'\r') {
-                bytes.pop();
-            }
-            if bytes.len() > MAX_INPUT_BYTES {
-                if !newline {
-                    input.skip_until(b'\n')?;
-                }
-                writeln!(output, "Eve：输入超过 32768 字节，请缩短后重新提交。")?;
-                output.flush()?;
-                continue;
-            }
-            let text = String::from_utf8(bytes).map_err(|_| "输入必须为 UTF-8。")?;
-            if text.trim().is_empty() {
-                continue;
-            }
-            match text.trim() {
-                "/quit" => break,
-                "/help" => {
-                    writeln!(output, "{HELP}")?;
-                    output.flush()?;
-                    continue;
-                }
-                _ => {}
-            }
-            match host
-                .run_turn(SessionInput {
-                    key: key.clone(),
-                    text,
-                })
-                .await
-            {
-                Ok(turn) => {
-                    summary.completed_turns += 1;
-                    writeln!(output, "Eve：{}", turn.output.text)?;
-                }
-                Err(SessionRunError::Turn(failure)) => {
-                    summary.failed_turns += 1;
-                    writeln!(output, "Eve：本轮执行失败：{}。未自动重试。", failure.error)?;
-                }
-                Err(SessionRunError::Commit {
-                    error,
-                    output: generated,
-                }) => {
-                    let displayed = writeln!(output, "Eve：回复已生成但未保存：{}", generated.text)
-                        .and_then(|()| output.flush());
-                    let primary: AppError = SessionRunError::Commit {
-                        error,
-                        output: generated,
-                    }
-                    .into();
-                    return Err(match displayed {
-                        Ok(()) => primary,
-                        Err(error) => AppFailure {
-                            primary,
-                            secondary: vec![error.into()],
-                        }
-                        .into(),
-                    });
-                }
-                Err(error) => return Err(error.into()),
-            }
-            output.flush()?;
+        let host = Arc::new(SessionLlmHost::new(host, SessionBinding::builtin()).with_logger(logger));
+        kernel.register(Box::new(ControlPlugin::new(
+            Arc::new(SessionControlRunner::new(host)),
+            [services::OWNER, SESSION_PLUGIN_ID].into_iter().map(|id| {
+                Ok(PluginDependency { id: PluginId::new(id)?, requirement: Some("^0.1".into()) })
+            }).collect::<eve_plugin_api::PluginResult<Vec<_>>>()?,
+        )?))?;
+        kernel.start(&PluginId::new(CONTROL_PLUGIN_ID)?).await?;
+        let entry = registry.get(&ServiceId::new(CONTROL_SERVICE_ID)?)?.ok_or("控制服务缺失。")?;
+        let control = entry.value.downcast::<ControlServiceHandle>().map_err(|_| "控制服务类型错误。")?.0.clone();
+        let receiver = input::start(input)?;
+        let result = console::drive(control.clone(), key.clone(), receiver, &mut output, tokio::signal::ctrl_c()).await;
+        let settled = console::settle(control.as_ref(), &key).await;
+        match (result, settled) {
+            (result, Ok(None)) => result,
+            (Err(primary), Ok(Some(report))) => Err(AppFailure {
+                primary, secondary: vec![ChatRunError { report: Box::new(report) }.into()],
+            }.into()),
+            (Err(primary), Err(error)) => Err(AppFailure { primary, secondary: vec![error] }.into()),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(summary), Ok(Some(_))) => Ok(summary),
         }
-        Ok::<_, AppError>(summary)
     }
     .await;
     let stopped = kernel.stop_all().await;
+    // 控制插件持有的执行器含 Kernel；停止后卸载以打破组合层引用环。
+    let control_id = PluginId::new(CONTROL_PLUGIN_ID).expect("有效内置 ID");
+    let removed = if kernel.state(&control_id).is_some() {
+        kernel.unregister(&control_id)
+    } else { Ok(()) };
     let flushed = kernel.flush_logs();
     // 三个结果都已执行；同时保留原始输出和各个收尾错误。
     let mut secondary: Vec<AppError> = Vec::new();
     if let Err(error) = stopped {
+        secondary.push(error.into());
+    }
+    if let Err(error) = removed {
         secondary.push(error.into());
     }
     if let Err(error) = flushed {
