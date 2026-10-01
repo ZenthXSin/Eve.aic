@@ -127,6 +127,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-app"
+version = "0.1.0"
+dependencies = [
+ "eve-agent-prompt",
+ "eve-config-api",
+ "eve-config-plugin",
+ "eve-kernel",
+ "eve-llm-api",
+ "eve-llm-openai",
+ "eve-plugin-api",
+ "eve-runtime",
+ "eve-session-api",
+ "eve-session-plugin",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "eve-config-api"
 version = "0.1.0"
 dependencies = [

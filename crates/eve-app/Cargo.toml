@@ -1,0 +1,28 @@
+[package]
+name = "eve-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "eve"
+path = "src/main.rs"
+
+[dependencies]
+eve-agent-prompt = { path = "../agent-prompt" }
+eve-config-api = { path = "../config-api" }
+eve-config-plugin = { path = "../config-plugin" }
+eve-kernel = { path = "../kernel" }
+eve-llm-api = { path = "../llm-api" }
+eve-llm-openai = { path = "../llm-openai" }
+eve-plugin-api = { path = "../plugin-api" }
+eve-runtime = { path = "../runtime" }
+eve-session-api = { path = "../session-api" }
+eve-session-plugin = { path = "../session-plugin" }
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }

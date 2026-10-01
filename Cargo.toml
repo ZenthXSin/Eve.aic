@@ -14,6 +14,7 @@ members = [
     "crates/message-api",
     "crates/message-plugin",
     "crates/runtime",
+    "crates/eve-app",
     "crates/example-plugins",
 ]
 resolver = "2"
