@@ -14,6 +14,8 @@ eve-config-plugin = { path = "../config-plugin" }
 eve-llm-api = { path = "../llm-api" }
 eve-session-api = { path = "../session-api" }
 eve-control-api = { path = "../control-api" }
+eve-cognition-api = { path = "../cognition-api" }
+eve-cognition-loop-api = { path = "../cognition-loop-api" }
 tokio.workspace = true
 serde_json.workspace = true
 serde.workspace = true
@@ -27,3 +29,5 @@ eve-session-plugin = { path = "../session-plugin" }
 eve-control-plugin = { path = "../control-plugin" }
 eve-message-plugin = { path = "../message-plugin" }
 tokio = { workspace = true, features = ["net", "io-util", "io-std"] }
+eve-cognition-plugin = { path = "../cognition-plugin" }
+eve-cognition-loop-plugin = { path = "../cognition-loop-plugin" }

@@ -169,6 +169,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-cognition-loop-api"
+version = "0.1.0"
+dependencies = [
+ "eve-cognition-api",
+ "eve-control-api",
+ "eve-llm-api",
+]
+
+[[package]]
+name = "eve-cognition-loop-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-cognition-api",
+ "eve-cognition-loop-api",
+ "eve-cognition-plugin",
+ "eve-control-api",
+ "eve-kernel",
+ "eve-llm-api",
+ "eve-plugin-api",
+ "getrandom 0.4.3",
+ "tokio",
+]
+
+[[package]]
 name = "eve-config-api"
 version = "0.1.0"
 dependencies = [
@@ -297,6 +321,10 @@ dependencies = [
 name = "eve-runtime"
 version = "0.1.0"
 dependencies = [
+ "eve-cognition-api",
+ "eve-cognition-loop-api",
+ "eve-cognition-loop-plugin",
+ "eve-cognition-plugin",
  "eve-agent-prompt",
  "eve-config-api",
  "eve-config-plugin",
