@@ -6,7 +6,7 @@ mod error;
 mod input;
 mod services;
 
-pub use console::ChatRunError;
+pub use console::{ChatOutputError, ChatRunError};
 pub use error::AppFailure;
 
 use eve_agent_prompt::FileAgentPrompt;
@@ -103,6 +103,7 @@ pub struct ChatSummary {
 
 /// 独立输入线程和受管轮次并发；成功保存后才向终端输出完整回复。
 /// 普通执行失败不重试；保存失败立即停止输入，保留生成内容和 Pending。
+/// 回复写入/刷新失败返回 ChatOutputError，保留完整报告和原提交状态。
 pub async fn run_console(
     options: ChatOptions,
     input: impl BufRead + Send + 'static,
