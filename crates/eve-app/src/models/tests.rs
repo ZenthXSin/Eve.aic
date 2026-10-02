@@ -207,6 +207,12 @@ async fn primary_selection_is_fixed_during_tools_and_changes_at_next_round() {
         let gate = Arc::new(ToolGate::default());
         let first = h.submit("first", gate.clone());
         let request = server.next().await;
+        let expected_path = if protocol == "chat" {
+            "POST /v1/chat/completions HTTP/1.1"
+        } else {
+            "POST /v1/responses HTTP/1.1"
+        };
+        assert!(request.headers.starts_with(expected_path));
         assert_eq!(request.body["model"], "model-a");
         assert_eq!(
             request.body[if protocol == "chat" {
