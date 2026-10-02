@@ -20,6 +20,7 @@ fn command(root: &Path, url: &str) -> Command {
         "EVE_OPENAI_API_KEY",
         "EVE_OPENAI_MODEL",
         "EVE_OPENAI_PROTOCOL",
+        "EVE_OPENAI_MODEL_ROLE",
         "EVE_OPENAI_BASE_URL",
         "EVE_OPENAI_REASONING_EFFORT",
         "EVE_OPENAI_TIMEOUT_SECONDS",
@@ -28,6 +29,14 @@ fn command(root: &Path, url: &str) -> Command {
         "EVE_LLM_MAX_PARALLEL_TOOL_CALLS",
     ] {
         command.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("EVE_MODELS_"))
+        {
+            command.env_remove(name);
+        }
     }
     command
         .env("EVE_OPENAI_API_KEY", "fixture-key")
@@ -809,5 +818,51 @@ async fn output_failure_preserves_committed_tool_report_and_allows_reopen() {
             1
         );
         assert!(server.requests.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn rejected_primary_role_never_calls_model_or_changes_completed_state() {
+    let root = fixture();
+    let mut server = Server::start(vec![Reply::json(final_response("已保存历史"))]).await;
+    let first = run(command(root.path(), &server.url), "先保存一轮\n").await;
+    assert!(first.status.success());
+    server.next().await;
+    let state_path = root.path().join("state/state.json");
+    let before = std::fs::read(&state_path).unwrap();
+    for invalid in ["disabled", "provider", "reference", "role", "deadline"] {
+        let mut configured = command(root.path(), &server.url);
+        configured.env("EVE_OPENAI_MODEL_ROLE", "primary");
+        if invalid != "disabled" {
+            configured
+                .env("EVE_MODELS_PRIMARY_ENABLED", "true")
+                .env("EVE_MODELS_PRIMARY_PROVIDER", "openai")
+                .env("EVE_MODELS_PRIMARY_MODEL", "configured-primary");
+        }
+        match invalid {
+            "provider" => {
+                configured.env("EVE_MODELS_PRIMARY_PROVIDER", "unknown");
+            }
+            "reference" => {
+                configured.env(
+                    "EVE_MODELS_PRIMARY_CREDENTIAL_REF",
+                    "PRIVATE_REFERENCE_VALUE",
+                );
+            }
+            "role" => {
+                configured.env("EVE_OPENAI_MODEL_ROLE", "jev");
+            }
+            "deadline" => {
+                configured.env("EVE_MODELS_PRIMARY_TIMEOUT_MS", "600001");
+            }
+            _ => {}
+        }
+        let result = run(configured, "这条不能执行\n").await;
+        assert!(!result.status.success(), "{invalid}");
+        let diagnostics = String::from_utf8_lossy(&result.stderr);
+        assert!(!diagnostics.contains("fixture-key"));
+        assert!(!diagnostics.contains("PRIVATE_REFERENCE_VALUE"));
+        assert_eq!(std::fs::read(&state_path).unwrap(), before, "{invalid}");
+        assert!(server.requests.try_recv().is_err(), "{invalid}");
     }
 }

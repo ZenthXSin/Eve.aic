@@ -18,6 +18,7 @@ class Acceptance(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.work = pathlib.Path(self.directory.name)
         self.requests = []
+        self.expected_model = "deepseek-v4.1-flash"
         self.started = threading.Event()
         self.release = threading.Event()
         outer = self
@@ -28,7 +29,7 @@ class Acceptance(unittest.TestCase):
                 assert self.path == "/v1/chat/completions"
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 outer.requests.append(body)
-                assert body["model"] == "deepseek-v4.1-flash"
+                assert body["model"] == outer.expected_model
                 assert body["reasoning_effort"] == "none"
                 messages = body["messages"]
                 latest = messages[-1]
@@ -71,7 +72,7 @@ class Acceptance(unittest.TestCase):
         return {"id": id, "scope": scope, "target_id": user if scope == "c2c" else "group-1",
             "user_id": user, "text": text, "expected": expected if expected is not None else text}
 
-    def run_eve(self, messages, send_fail=False, app="1904159860", success=True, cancel=False):
+    def run_eve(self, messages, send_fail=False, app="1904159860", success=True, cancel=False, environment=None):
         scenario = self.work / "scenario.json"
         scenario.write_text(json.dumps({"messages": messages, "send_fail": send_fail, "pid_file": str(self.work / "child.pid")}), encoding="utf8")
         env = {k: os.environ[k] for k in ("PATH", "SystemRoot", "TEMP", "TMP") if k in os.environ}
@@ -79,6 +80,7 @@ class Acceptance(unittest.TestCase):
             EVE_OPENAI_API_KEY="test-model-secret",
             EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
             EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
+        env.update(environment or {})
         command = [str(BINARY), "--state-dir", str(self.work / "state"),
             "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
             "--bridge-arg", str(scenario)]
@@ -178,6 +180,42 @@ class Acceptance(unittest.TestCase):
         path.write_text(json.dumps(state))
         before = path.read_bytes()
         self.run_eve([self.message("in-2", "two")], success=False)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(len(self.requests), 1)
+
+    def primary_environment(self, model, output_limit="64"):
+        return {
+            "EVE_OPENAI_MODEL_ROLE": "primary",
+            "EVE_MODELS_PRIMARY_ENABLED": "true",
+            "EVE_MODELS_PRIMARY_PROVIDER": "openai",
+            "EVE_MODELS_PRIMARY_MODEL": model,
+            "EVE_MODELS_PRIMARY_TIMEOUT_MS": "5000",
+            "EVE_MODELS_PRIMARY_MAX_OUTPUT_TOKENS": output_limit,
+        }
+
+    def test_primary_role_controls_qq_model_and_restart_keeps_history(self):
+        self.expected_model = "qq-primary-one"
+        first = self.run_eve([self.message("role-1", "echo:marker", "marker")],
+            environment=self.primary_environment(self.expected_model))
+        self.assertEqual((first["completed"], first["sent"], len(self.requests)), (1, 1, 2))
+        self.assertTrue(all(request["model"] == "qq-primary-one" and request["max_tokens"] == 64
+            for request in self.requests))
+        self.expected_model = "qq-primary-two"
+        second = self.run_eve([self.message("role-2", "recall:marker", "marker")],
+            environment=self.primary_environment(self.expected_model, "32"))
+        self.assertEqual((second["completed"], second["sent"], len(self.requests)), (1, 1, 3))
+        self.assertEqual(self.requests[-1]["model"], "qq-primary-two")
+        self.assertEqual(self.requests[-1]["max_tokens"], 32)
+        session = next(iter(self.documents()["eve.session"]["sessions.v1"]["sessions"].values()))
+        self.assertEqual(session["revision"], 4)
+
+    def test_disabled_primary_role_preserves_qq_state_and_starts_no_request(self):
+        self.run_eve([self.message("existing", "saved")])
+        path = self.work / "state/state.json"
+        before = path.read_bytes()
+        environment = self.primary_environment("unused")
+        environment["EVE_MODELS_PRIMARY_ENABLED"] = "false"
+        self.run_eve([self.message("must-not-run", "new")], success=False, environment=environment)
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(len(self.requests), 1)
 

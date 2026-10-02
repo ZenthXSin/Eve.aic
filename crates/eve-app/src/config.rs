@@ -1,5 +1,7 @@
 use crate::AppError;
-use eve_config_api::{ConfigField, ConfigKind, ConfigSchema, ConfigSnapshot};
+use eve_config_api::{
+    ConfigField, ConfigKind, ConfigSchema, ConfigSnapshot, ModelProfile, ModelRole,
+};
 use eve_llm_openai::OpenAiConfig;
 use serde_json::json;
 use std::{collections::BTreeMap, time::Duration};
@@ -35,6 +37,7 @@ pub(crate) fn openai_schema() -> ConfigSchema {
                 string("deepseek-v4.1-flash", "EVE_OPENAI_MODEL"),
             ),
             ("protocol".into(), string("chat", "EVE_OPENAI_PROTOCOL")),
+            ("model_role".into(), string("", "EVE_OPENAI_MODEL_ROLE")),
             (
                 "reasoning_effort".into(),
                 string("", "EVE_OPENAI_REASONING_EFFORT"),
@@ -50,8 +53,36 @@ pub(crate) fn openai_schema() -> ConfigSchema {
         ]),
     }
 }
-pub(crate) fn provider_config(snapshot: &ConfigSnapshot) -> Result<OpenAiConfig, AppError> {
-    let model: String = snapshot.get("model")?;
+pub(crate) fn configured_role(snapshot: &ConfigSnapshot) -> Result<Option<ModelRole>, AppError> {
+    let role: String = snapshot.get("model_role")?;
+    match role.as_str() {
+        "" => Ok(None),
+        "primary" => Ok(Some(ModelRole::Primary)),
+        _ => Err("provider.openai.model_role 必须为空或 primary。".into()),
+    }
+}
+
+pub(crate) fn provider_config(
+    snapshot: &ConfigSnapshot,
+    primary: Option<&ModelProfile>,
+) -> Result<OpenAiConfig, AppError> {
+    if let Some(profile) = primary {
+        if profile.provider != "openai" {
+            return Err("主模型角色当前只支持 provider=openai。".into());
+        }
+        if profile.credential_ref.is_some() {
+            return Err(
+                "主模型角色的凭据引用尚未接线；当前入口使用宿主 EVE_OPENAI_API_KEY。".into(),
+            );
+        }
+        if profile.timeout_ms == 0 || profile.timeout_ms > 600_000 {
+            return Err("主模型角色期限必须在 1 至 600000 毫秒之间。".into());
+        }
+    }
+    let model: String = match primary {
+        Some(profile) => profile.model.clone(),
+        None => snapshot.get("model")?,
+    };
     if model.trim().is_empty() {
         return Err("请配置主模型：EVE_OPENAI_MODEL 或 provider.openai.model。".into());
     }
@@ -63,8 +94,13 @@ pub(crate) fn provider_config(snapshot: &ConfigSnapshot) -> Result<OpenAiConfig,
         _ => return Err("provider.openai.protocol 必须为 chat 或 responses。".into()),
     };
     let mut config = config.with_base_url(&base_url)?;
-    config.request_timeout = Duration::from_secs(snapshot.get("timeout_seconds")?);
-    config.max_output_tokens = Some(snapshot.get("max_output_tokens")?);
+    if let Some(profile) = primary {
+        config.request_timeout = Duration::from_millis(profile.timeout_ms);
+        config.max_output_tokens = profile.max_output_tokens;
+    } else {
+        config.request_timeout = Duration::from_secs(snapshot.get("timeout_seconds")?);
+        config.max_output_tokens = Some(snapshot.get("max_output_tokens")?);
+    }
     let effort: String = snapshot.get("reasoning_effort")?;
     config.reasoning_effort = if effort.is_empty() {
         (protocol == "chat").then(|| "none".into())
@@ -72,4 +108,85 @@ pub(crate) fn provider_config(snapshot: &ConfigSnapshot) -> Result<OpenAiConfig,
         Some(effort)
     };
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot() -> ConfigSnapshot {
+        let schema = openai_schema();
+        ConfigSnapshot {
+            namespace: schema.namespace,
+            schema_version: schema.version,
+            revision: 0,
+            values: schema
+                .fields
+                .into_iter()
+                .map(|(name, field)| (name, field.default.unwrap()))
+                .collect(),
+        }
+    }
+
+    fn profile() -> ModelProfile {
+        ModelProfile {
+            provider: "openai".into(),
+            model: "role-model".into(),
+            credential_ref: None,
+            timeout_ms: 1250,
+            max_concurrent_requests: 1,
+            max_output_tokens: None,
+            semantic: None,
+        }
+    }
+
+    #[test]
+    fn primary_profile_overrides_model_deadline_and_output_limit() {
+        let direct = snapshot();
+        assert_eq!(configured_role(&direct).unwrap(), None);
+        let legacy = provider_config(&direct, None).unwrap();
+        assert_eq!(legacy.model, "deepseek-v4.1-flash");
+        assert_eq!(legacy.request_timeout, Duration::from_secs(120));
+        assert_eq!(legacy.max_output_tokens, Some(2048));
+        let mut primary = profile();
+        let selected = provider_config(&direct, Some(&primary)).unwrap();
+        assert_eq!(selected.model, "role-model");
+        assert_eq!(selected.request_timeout, Duration::from_millis(1250));
+        assert_eq!(selected.max_output_tokens, None);
+        primary.max_output_tokens = Some(96);
+        assert_eq!(
+            provider_config(&direct, Some(&primary))
+                .unwrap()
+                .max_output_tokens,
+            Some(96)
+        );
+    }
+
+    #[test]
+    fn unresolved_reference_unknown_provider_and_unsupported_deadline_do_not_fall_back() {
+        let direct = snapshot();
+        let mut primary = profile();
+        primary.credential_ref = Some("PRIVATE_REFERENCE_VALUE".into());
+        let error = provider_config(&direct, Some(&primary))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(!error.contains("PRIVATE_REFERENCE_VALUE"));
+        primary.credential_ref = None;
+        primary.provider = "unknown".into();
+        assert!(provider_config(&direct, Some(&primary)).is_err());
+        primary.provider = "openai".into();
+        primary.timeout_ms = 600_001;
+        assert!(provider_config(&direct, Some(&primary)).is_err());
+        let mut selected = direct;
+        selected
+            .values
+            .insert("model_role".into(), json!("primary"));
+        assert_eq!(
+            configured_role(&selected).unwrap(),
+            Some(ModelRole::Primary)
+        );
+        selected.values.insert("model_role".into(), json!("jev"));
+        assert!(configured_role(&selected).is_err());
+    }
 }
