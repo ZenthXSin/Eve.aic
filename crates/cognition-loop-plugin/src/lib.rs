@@ -651,6 +651,8 @@ impl Plugin for CognitionLoopPlugin {
                 stats: Mutex::new(LoopStats::default()),
                 task: Mutex::new(None),
             });
+            // 任何启动步骤失败都发布完成信号，回滚不会等待未创建的任务。
+            let guard = CompletionGuard(running.clone());
             let closing = running.clone();
             let controller = self.controller.clone();
             context.cleanup(cleanup(move || async move {
@@ -688,7 +690,6 @@ impl Plugin for CognitionLoopPlugin {
                 context: context.clone(),
                 running: running.clone(),
             };
-            let guard = CompletionGuard(running.clone());
             let completion = running.clone();
             let task = runtime.spawn(async move {
                 let _guard = guard;

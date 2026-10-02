@@ -564,3 +564,63 @@ async fn executing_marker_save_failure_has_zero_submit_and_keeps_ready_bytes() {
         rig.kernel.unregister(&id(owner)).unwrap();
     }
 }
+
+#[tokio::test]
+async fn service_conflict_rolls_back_without_waiting_for_unspawned_worker() {
+    use eve_cognition_loop_plugin::{
+        CognitionLoopPlugin, EchoReceiptVerifier, PriorityDrivePolicy,
+    };
+    use eve_plugin_api::{
+        Cleanup, Plugin, PluginContext, PluginFuture, PluginManifest, ServiceId,
+    };
+    use eve_runtime::ControlGoalExecutor;
+    struct Conflict(PluginManifest);
+    impl Plugin for Conflict {
+        fn manifest(&self) -> &PluginManifest {
+            &self.0
+        }
+        fn start(&mut self, context: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
+            Box::pin(async move {
+                context.provide_service(ServiceId::new(LOOP_STATUS_SERVICE_ID)?, ())?;
+                Ok(None)
+            })
+        }
+    }
+    let model = Model::new(1);
+    let rig = Rig::open(Arc::new(MemoryStateStore::default()), model.clone(), None).await;
+    rig.seed(vec![goal("target")]);
+    let before = rig.admin.snapshot().unwrap();
+    rig.kernel
+        .register(Box::new(Conflict(
+            PluginManifest::new("cognition.conflict", "0.1.0").unwrap(),
+        )))
+        .unwrap();
+    rig.kernel.start(&id("cognition.conflict")).await.unwrap();
+    let executor = Arc::new(
+        ControlGoalExecutor::new(rig.control.clone(), rig.runner.clone(), "internal").unwrap(),
+    );
+    let plugin = CognitionLoopPlugin::new(
+        Arc::new(rig.admin.clone()),
+        Arc::new(PriorityDrivePolicy),
+        Arc::new(EchoReceiptVerifier),
+        executor,
+        options(),
+        vec![],
+    )
+    .unwrap();
+    let controller = plugin.controller();
+    rig.kernel.register(Box::new(plugin)).unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        rig.kernel.start(&id(LOOP_PLUGIN_ID)),
+    )
+    .await
+    .expect("启动回滚不应等待一个未启动的任务");
+    assert!(result.is_err());
+    assert!(controller.stats().is_err());
+    assert_eq!(rig.admin.snapshot().unwrap(), before);
+    assert_eq!(model.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.probe.started.load(Ordering::SeqCst), 0);
+    rig.kernel.unregister(&id(LOOP_PLUGIN_ID)).unwrap();
+    rig.close().await;
+}
