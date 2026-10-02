@@ -132,6 +132,8 @@ impl ControlEventSink for DiscardControlEvents {
 
 /// 组合层装配内置 SessionLlmHost；控制插件不持有模型厂商或 Runtime 私有类型。
 /// run 必须观察 sink.closed，并在返回前等待工具析构及最终状态提交。
+/// worker 被执行器直接丢弃时，上述返回路径可能没有执行；控制器发布的 Unknown
+/// 只表示原始结果不可用，不保证 runner 派生的任务或工具已经完成析构。
 pub trait ControlRunner: Send + Sync {
     fn run<'a>(&'a self, input: SessionInput, sink: &'a dyn TurnEventSink) -> RunFuture<'a>;
 }
@@ -156,10 +158,12 @@ pub trait ControlService: Send + Sync {
         input: ControlInput,
         sink: Arc<dyn ControlEventSink>,
     ) -> ControlResult<GenerationKey>;
-    /// 只发送取消信号，不宣称工具已经停止；wait 才确认收尾。
+    /// 只发送取消信号，不宣称工具已经停止；须读取 wait 报告判断实际结果。
     fn cancel(&self, key: &GenerationKey) -> ControlResult<CancelDisposition>;
     /// 创建时捕获该代完成通知；之后即使新代启动，这个 Future 仍返回原代报告。
     /// 每个会话只保留最新代；新代启动后再创建旧代 wait 返回 StaleGeneration。
+    /// Unknown 表示 worker 的结果不可用，可能早于派生任务或工具析构完成；
+    /// 不得将它视为取消完成、没有副作用或允许重试的依据。
     fn wait(&self, key: &GenerationKey) -> ControlFuture<'static, ControlReport>;
     fn snapshot(&self, key: &SessionKey) -> ControlResult<Option<ControlSnapshot>>;
     /// 包括用户、会话、任务、控制器 epoch 和生成代；取消代及被替换代均不接受。
