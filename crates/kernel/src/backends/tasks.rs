@@ -243,9 +243,7 @@ async fn execute(
             progress.runs
         };
         match spec.schedule {
-            TaskSchedule::Custom { max_runs, .. }
-                if max_runs.is_none_or(|limit| runs < limit) =>
-            {
+            TaskSchedule::Custom { max_runs, .. } if max_runs.is_none_or(|limit| runs < limit) => {
                 if execution.signal.is_cancelled() {
                     return Ok(true);
                 }
