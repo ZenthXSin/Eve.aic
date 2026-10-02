@@ -79,6 +79,38 @@ jobs:
               $explicit.prompt_bytes -ne [System.Text.Encoding]::UTF8.GetByteCount($body)) {
             throw "显式文件没有替换默认文件身份"
           }
+      - name: 验证认知状态、权限与三次独立进程恢复
+        run: |
+          $cognitionDirectory = Join-Path $env:RUNNER_TEMP "eve-cognition-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $previousBytes = ""
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            $output = @(& cargo run -p eve-cognition-plugin --example cognition_state --locked -- $cognitionDirectory)
+            if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "认知状态进程验收失败" }
+            Write-Host $output[0]
+            $report = $output[0] | ConvertFrom-Json -AsHashtable
+            $restored = if ($attempt -eq 1) { 0 } elseif ($attempt -eq 2) { 4 } else { 5 }
+            $revision = if ($attempt -eq 1) { 4 } else { 5 }
+            $blocked = if ($attempt -eq 1) { 0 } else { 1 }
+            if ($report.restored_revision -ne $restored -or $report.revision -ne $revision -or
+                $report.goals -ne 4 -or $report.public_goals -ne 1 -or $report.user_goals -ne 2 -or
+                $report.ready_goals -ne 1 -or $report.completed_goals -ne 1 -or
+                $report.waiting_goals -ne 1 -or $report.blocked_goals -ne $blocked -or
+                $report.closed_services -ne $true -or $report.directory_reopened -ne $true -or
+                $report.model_requests -ne 0 -or $report.tool_executions -ne 0) {
+              throw "认知状态、权限、恢复或旧句柄收尾不符"
+            }
+            $bytes = [System.IO.File]::ReadAllText((Join-Path $cognitionDirectory "state.json"))
+            $outer = $bytes | ConvertFrom-Json -AsHashtable
+            $document = [System.Text.Encoding]::UTF8.GetString([byte[]] $outer.entries["eve.cognition"]["cognition.v1"]) | ConvertFrom-Json -AsHashtable
+            $uncertain = if ($attempt -eq 1) { "Executing" } else { "Blocked" }
+            if ($document.format_version -ne 1 -or $document.subject_id -cne "eve" -or
+                $document.revision -ne $revision -or $document.state.goals["done"].status -cne "Completed" -or
+                $document.state.goals["uncertain"].status -cne $uncertain) {
+              throw "认知快照没有实际保存或在途恢复不符"
+            }
+            if ($attempt -eq 3 -and $bytes -cne $previousBytes) { throw "无变化恢复改写了状态文件" }
+            $previousBytes = $bytes
+          }
       - name: 验证配置插件及两次独立进程恢复
         run: |
           $env:EVE_LLM_MAX_PARALLEL_TOOL_CALLS = "10"
