@@ -171,6 +171,7 @@ pub struct Rig {
     pub kernel: Kernel,
     pub admin: CognitionController,
     pub registry: Arc<dyn ServiceRegistry>,
+    pub events: Arc<dyn EventBus>,
     pub probe: Arc<ToolProbe>,
     pub runner: Arc<BudgetedSessionRunner>,
     pub control: Arc<dyn ControlService>,
@@ -186,6 +187,7 @@ impl Rig {
             ..KernelServices::default()
         };
         let registry = services.registry.clone();
+        let events = services.events.clone();
         let permissions = services.permissions.clone();
         let logger = services.logger.clone();
         let kernel = Kernel::with_services(services);
@@ -250,6 +252,7 @@ impl Rig {
             kernel,
             admin,
             registry,
+            events,
             probe,
             runner,
             control,

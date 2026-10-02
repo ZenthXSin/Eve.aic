@@ -141,7 +141,9 @@ impl LoopControl for LoopController {
                 overflow = true;
             }
         });
-        if overflow { return Err(LoopError::LimitReached); }
+        if overflow {
+            return Err(LoopError::LimitReached);
+        }
         Ok(true)
     }
     fn shutdown(&self) -> LoopFuture<'static, ()> {
@@ -457,9 +459,21 @@ impl Worker {
                     .and_then(|report| report.control.run.started_tools)
             },
             summary: report.as_ref().map_or_else(
-                || if not_started { "未准入执行；模型和工具均未启动" } else { "执行报告不确定；不能推断零副作用" }.into(),
-                |report| format!("验证结果 {}；模型准入 {}，工具准入 {}",
-                    verified, report.usage.model_requests, report.usage.admitted_tool_calls)),
+                || {
+                    if not_started {
+                        "未准入执行；模型和工具均未启动"
+                    } else {
+                        "执行报告不确定；不能推断零副作用"
+                    }
+                    .into()
+                },
+                |report| {
+                    format!(
+                        "验证结果 {}；模型准入 {}，工具准入 {}",
+                        verified, report.usage.model_requests, report.usage.admitted_tool_calls
+                    )
+                },
+            ),
 
             at_ms: now_ms()?,
         };

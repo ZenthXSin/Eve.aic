@@ -117,9 +117,23 @@ async fn no_input_progress_coalesces_wakes_and_uses_real_control_feedback() {
     let controller = rig.start_loop(options()).await;
     for _ in 0..100 {
         controller.wake(WakeReason::StateChanged).unwrap();
+        rig.events
+            .emit(eve_plugin_api::Event::new(LOOP_WAKE_EVENT_ID, Vec::new()).unwrap())
+            .unwrap();
     }
+    let status = rig
+        .registry
+        .get(&eve_plugin_api::ServiceId::new(LOOP_STATUS_SERVICE_ID).unwrap())
+        .unwrap()
+        .unwrap()
+        .value
+        .downcast::<LoopStatusHandle>()
+        .unwrap()
+        .0
+        .clone();
     rig.wait_terminal("target").await;
     controller.shutdown().await.unwrap();
+    assert!(status.stats().is_err());
     let snapshot = rig.admin.snapshot().unwrap();
     let target = &snapshot.state.goals["target"];
     assert_eq!(target.status, GoalStatus::Completed);
@@ -432,7 +446,7 @@ async fn invalid_model_selection_has_zero_requests_and_no_session_pending() {
         store
             .get(
                 &id(SESSION_PLUGIN_ID),
-                eve_session_plugin::SESSION_STATE_KEY
+                eve_session_plugin::SESSION_STATE_KEY,
             )
             .unwrap()
             .is_none()
@@ -458,5 +472,41 @@ async fn drive_ranking_and_start_budget_leave_other_goals_ready() {
     assert_eq!(snapshot.state.drives["eve.loop.drive.0"].strength, 90);
     assert_eq!(model.requests.load(Ordering::SeqCst), 2);
     assert_eq!(controller.stats().unwrap().submitted, 1);
+    rig.close().await;
+}
+
+#[tokio::test]
+async fn control_requests_without_host_budget_binding_cannot_start_a_session() {
+    use eve_control_api::{CommitState, ControlInput, DiscardControlEvents};
+    let store = Arc::new(MemoryStateStore::default());
+    let model = Model::new(1);
+    let rig = Rig::open(store.clone(), model.clone(), None).await;
+    let key = rig
+        .control
+        .submit(
+            ControlInput {
+                session: eve_session_api::SessionInput {
+                    key: eve_session_api::SessionKey::new("bypass", "internal").unwrap(),
+                    text: "尝试不带预算执行".into(),
+                },
+                task_id: "bypass".into(),
+            },
+            Arc::new(DiscardControlEvents),
+        )
+        .unwrap();
+    let report = rig.control.wait(&key).await.unwrap();
+    assert_eq!(report.run.commit, CommitState::NotStarted);
+    assert_eq!(report.run.started_tools, Some(0));
+    assert_eq!(model.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.probe.started.load(Ordering::SeqCst), 0);
+    assert!(
+        store
+            .get(
+                &id(SESSION_PLUGIN_ID),
+                eve_session_plugin::SESSION_STATE_KEY
+            )
+            .unwrap()
+            .is_none()
+    );
     rig.close().await;
 }
