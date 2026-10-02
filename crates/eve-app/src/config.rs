@@ -155,7 +155,9 @@ mod tests {
         assert_eq!(selected.max_output_tokens, None);
         primary.max_output_tokens = Some(96);
         assert_eq!(
-            provider_config(&direct, Some(&primary)).unwrap().max_output_tokens,
+            provider_config(&direct, Some(&primary))
+                .unwrap()
+                .max_output_tokens,
             Some(96)
         );
     }
@@ -165,7 +167,10 @@ mod tests {
         let direct = snapshot();
         let mut primary = profile();
         primary.credential_ref = Some("PRIVATE_REFERENCE_VALUE".into());
-        let error = provider_config(&direct, Some(&primary)).err().unwrap().to_string();
+        let error = provider_config(&direct, Some(&primary))
+            .err()
+            .unwrap()
+            .to_string();
         assert!(!error.contains("PRIVATE_REFERENCE_VALUE"));
         primary.credential_ref = None;
         primary.provider = "unknown".into();
@@ -174,8 +179,13 @@ mod tests {
         primary.timeout_ms = 600_001;
         assert!(provider_config(&direct, Some(&primary)).is_err());
         let mut selected = direct;
-        selected.values.insert("model_role".into(), json!("primary"));
-        assert_eq!(configured_role(&selected).unwrap(), Some(ModelRole::Primary));
+        selected
+            .values
+            .insert("model_role".into(), json!("primary"));
+        assert_eq!(
+            configured_role(&selected).unwrap(),
+            Some(ModelRole::Primary)
+        );
         selected.values.insert("model_role".into(), json!("jev"));
         assert!(configured_role(&selected).is_err());
     }

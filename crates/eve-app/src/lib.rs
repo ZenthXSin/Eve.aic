@@ -226,7 +226,11 @@ pub(crate) async fn install_core(
     let request = settings.0.begin_request(config::OPENAI_NAMESPACE, 1)?;
     let provider_snapshot = settings.0.read_request(&request)?;
     let primary = match config::configured_role(&provider_snapshot)? {
-        Some(role) => Some(ModelRolesConfig::capture(settings.0.as_ref())?.require(role)?.clone()),
+        Some(role) => Some(
+            ModelRolesConfig::capture(settings.0.as_ref())?
+                .require(role)?
+                .clone(),
+        ),
         None => None,
     };
     let provider_config = config::provider_config(&provider_snapshot, primary.as_ref())?;

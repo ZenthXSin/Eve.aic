@@ -31,7 +31,10 @@ fn command(root: &Path, url: &str) -> Command {
         command.env_remove(name);
     }
     for (name, _) in std::env::vars_os() {
-        if name.to_str().is_some_and(|name| name.starts_with("EVE_MODELS_")) {
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("EVE_MODELS_"))
+        {
             command.env_remove(name);
         }
     }
@@ -841,7 +844,10 @@ async fn rejected_primary_role_never_calls_model_or_changes_completed_state() {
                 configured.env("EVE_MODELS_PRIMARY_PROVIDER", "unknown");
             }
             "reference" => {
-                configured.env("EVE_MODELS_PRIMARY_CREDENTIAL_REF", "PRIVATE_REFERENCE_VALUE");
+                configured.env(
+                    "EVE_MODELS_PRIMARY_CREDENTIAL_REF",
+                    "PRIVATE_REFERENCE_VALUE",
+                );
             }
             "role" => {
                 configured.env("EVE_OPENAI_MODEL_ROLE", "jev");

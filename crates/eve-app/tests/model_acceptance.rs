@@ -25,7 +25,10 @@ fn command(url: &str) -> Command {
         c.env_remove(name);
     }
     for (name, _) in std::env::vars_os() {
-        if name.to_str().is_some_and(|name| name.starts_with("EVE_MODELS_")) {
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("EVE_MODELS_"))
+        {
             c.env_remove(name);
         }
     }
@@ -471,10 +474,10 @@ async fn primary_role_drives_chat_tools_and_new_process_selection() {
     };
     let mut server = Server::start(vec![
         Reply::json(json!({"choices":[{"index":0,"finish_reason":"tool_calls",
-            "message":{"role":"assistant","content":null,"tool_calls":[
-                {"id":"check-echo","type":"function","function":{"name":"echo",
-                    "arguments":json!({"text":MARKER}).to_string()}}
-            ]}}]})),
+        "message":{"role":"assistant","content":null,"tool_calls":[
+            {"id":"check-echo","type":"function","function":{"name":"echo",
+                "arguments":json!({"text":MARKER}).to_string()}}
+        ]}}]})),
         chat_final(),
         chat_final(),
         chat_final(),
@@ -497,7 +500,11 @@ async fn primary_role_drives_chat_tools_and_new_process_selection() {
                 .env("EVE_MODELS_PRIMARY_PROVIDER", "openai")
                 .env(
                     "EVE_MODELS_PRIMARY_MODEL",
-                    if launches == 1 { "role-one" } else { "role-two" },
+                    if launches == 1 {
+                        "role-one"
+                    } else {
+                        "role-two"
+                    },
                 )
                 .env("EVE_MODELS_PRIMARY_TIMEOUT_MS", "2500")
                 .env("EVE_MODELS_PRIMARY_MAX_OUTPUT_TOKENS", "96");
@@ -516,7 +523,11 @@ async fn primary_role_drives_chat_tools_and_new_process_selection() {
         .enumerate()
     {
         let captured = server.next().await;
-        assert!(captured.headers.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        assert!(
+            captured
+                .headers
+                .starts_with("POST /v1/chat/completions HTTP/1.1")
+        );
         assert_eq!(captured.body["model"], expected);
         assert_eq!(captured.body["max_tokens"], 96);
         assert_eq!(chat_user_texts(&captured.body).len(), [1, 1, 2, 3][index]);
