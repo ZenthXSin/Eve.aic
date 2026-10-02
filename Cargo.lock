@@ -139,6 +139,7 @@ dependencies = [
  "eve-llm-api",
  "eve-llm-openai",
  "eve-plugin-api",
+ "eve-qqbot-plugin",
  "eve-runtime",
  "eve-session-api",
  "eve-session-plugin",
@@ -257,6 +258,19 @@ name = "eve-plugin-api"
 version = "0.1.0"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "eve-qqbot-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-control-api",
+ "eve-plugin-api",
+ "eve-session-api",
+ "ring",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

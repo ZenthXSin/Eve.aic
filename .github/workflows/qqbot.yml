@@ -1,0 +1,46 @@
+name: QQBot 通道离线验收
+on:
+  pull_request:
+    paths:
+      - "connectors/qqbot/**"
+      - "crates/qqbot-plugin/**"
+      - "crates/eve-app/**"
+      - ".github/workflows/qqbot.yml"
+  push:
+    branches: [main]
+    paths: ["connectors/qqbot/**", "crates/qqbot-plugin/**", "crates/eve-app/**"]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+      - name: 安装 SDK 依赖
+        working-directory: connectors/qqbot
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: 记录实际依赖锁定结果
+        working-directory: connectors/qqbot
+        run: node -e 'console.log(JSON.stringify(JSON.parse(require("fs").readFileSync("package-lock.json","utf8"))))'
+      - name: 验证实际 SDK 导出
+        working-directory: connectors/qqbot
+        run: node --input-type=module -e 'const { QQBot } = await import("@tencent-connect/qqbot-nodejs"); if (typeof QQBot !== "function") throw new Error("SDK facade missing");'
+      - name: Node 桥接测试
+        working-directory: connectors/qqbot
+        run: npm test
+      - name: 安装 Rust
+        run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt --component clippy
+      - name: 验证通道依赖构建
+        run: |
+          cargo +1.89.0 fmt --all -- --check
+          cargo +1.89.0 check --workspace --all-targets --locked
+      - name: 实际 Eve QQBot 进程验收
+        run: |
+          cargo +1.89.0 build -p eve-app --bin eve-qqbot --locked
+          python3 connectors/qqbot/test/eve_e2e.py
