@@ -108,7 +108,8 @@ impl PluginCatalog for InMemoryPluginCatalog {
         }
         let plugin =
             catch_unwind(AssertUnwindSafe(|| factory.create())).map_err(factory_panic)??;
-        let found = plugin.manifest().clone();
+        let found =
+            catch_unwind(AssertUnwindSafe(|| plugin.manifest().clone())).map_err(factory_panic)?;
         found.validate()?;
         if found != expected {
             return Err(PluginError::FactoryManifestMismatch {
