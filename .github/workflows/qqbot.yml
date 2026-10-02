@@ -3,12 +3,18 @@ on:
   pull_request:
     paths:
       - "connectors/qqbot/**"
-      - "crates/qqbot-plugin/**"
-      - "crates/eve-app/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/qqbot.yml"
   push:
     branches: [main]
-    paths: ["connectors/qqbot/**", "crates/qqbot-plugin/**", "crates/eve-app/**"]
+    paths:
+      - "connectors/qqbot/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/qqbot.yml"
 permissions:
   contents: read
 jobs:

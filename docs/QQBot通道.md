@@ -1,6 +1,6 @@
 # QQBot 通道插件
 
-首版接入官方 QQ 开放平台的 C2C 私聊与群 @ 文本。复用腾讯 `@tencent-connect/qqbot-nodejs` 1.0.4，使用 Node 22 桥接 WebSocket 与被动文本回复；Rust `eve-qqbot-plugin` 只依赖公开 Control/Session/Plugin 契约，宿主 `eve-qqbot` 与终端共用 AGENT、配置、主模型、会话及 echo 装配。Kernel 不包含 QQ 业务。来源、版本与 MIT 许可见 [THIRD_PARTY](../connectors/qqbot/THIRD_PARTY.md)。
+首版接入官方 QQ 开放平台的 C2C 私聊与群 @ 文本。复用腾讯 `@tencent-connect/qqbot-nodejs` 1.0.4，使用 Node 22 桥接 WebSocket 与被动文本回复；Rust `eve-qqbot-plugin` 只依赖公开 Control/Message/Session/Plugin 契约，宿主 `eve-qqbot` 与终端共用 AGENT、配置、主模型、会话及 echo 装配。Kernel 不包含 QQ 业务。来源、版本与 MIT 许可见 [THIRD_PARTY](../connectors/qqbot/THIRD_PARTY.md)。
 
 ## 启动与手机配置
 
@@ -41,7 +41,23 @@ stdout 专用于 JSONL，SDK 日志后端为空，异常正文/stack/token 不�
 
 首版映射集中在 `Message::session_key`：AppID、scope、target 和发送者共同确定会话。这是首次测试、路由和恢复的临时边界。后续 AGI/内生驱动阶段统一认知主体、记忆、目标和跨通道经验，保留来源与权限，迁移旧历史；通道不是独立人格。详见[企划案](./企划案.md#通道隔离与统一认知的阶段关系)。
 
-QQ 与终端共用每轮模型解析：在新代执行前捕获当前配置，工具往返保持原选择；宿主通过 ConfigAdmin 更新后，新轮使用新模型。无效新选择不创建 Session Pending、不回退缓存，QQ 回执仍按已有状态机保留失败记录，不自动重试。没有新增 QQ 配置编辑命令，环境或密钥变更仍需重启。Jev 继续 TODO，首版输入语义和消息调度本轮不扩展。
+QQ 与终端共用每轮模型解析：在新代执行前捕获当前配置，工具往返保持原选择；宿主通过 ConfigAdmin 更新后，新轮使用新模型。无效新选择不创建 Session Pending、不回退缓存，QQ 回执仍按已有状态机保留失败记录，不自动重试。没有新增 QQ 配置编辑命令，环境或密钥变更仍需重启。Jev 继续 TODO。
+
+## 明确消息控制
+
+普通文字保持串行排队。任一行去除前导空白后以 `/` 开头时，交给既有规则判断和 MessageService；不调用辅助模型。命令只绑定收到消息时同 AppID、scope、目标和发送者的完整当前代，不能控制另一用户或群的任务。
+
+| 命令 | 行为 |
+| --- | --- |
+| `/add 内容` | 补充当前请求；先取消并等待，再以原文修订开启下一代 |
+| `/correct 内容` | 纠正当前请求，可与 `/add` 多行组合 |
+| `/cancel` | 取消当前任务并返回确认，已完成工具操作不会撤销 |
+| `/new 内容` | 按明确新任务路径执行，不把它当成原任务的安全重试 |
+| `/pause`、`/resume`、`/answer` | 暂停/恢复尚未支持；桥接未提供可信 question 引用，答复请求需澄清 |
+
+没有当前代时回复提示，不自动把控制命令变成普通任务。已有工具执行或副作用未知时，补充/纠正只澄清，不重跑工具；Pending/Unknown 阻塞替代。修订输出关联控制消息的原始 QQ 目标，旧消息结束投递；已完成历史保留。
+
+通道串行处理路由动作、结果接纳与外发，写出前复查完整代际。排队旧结果失效后不外发；已经送交 QQ 的消息无法撤回。普通消息和控制消息共用最多 16 项待处理容量，控制消息同样先保存 Processing 并去重。重启不会重放控制命令或恢复旧代句柄；Processing/ReplyPending 保留原有人工诊断边界。
 
 ## 停止与验收
 
@@ -57,6 +73,8 @@ python3 connectors/qqbot/test/eve_e2e.py
 
 显式 primary 接线新增两个实际 Eve 用例：角色模型/输出上限控制与重启恢复、角色关闭后零请求且原状态不变。[PR #70 离线验收](https://github.com/ZenthXSin/Eve.aic/actions/runs/36958593968) 已通过七项 Node 与八项 Eve 进程用例，完整 CI 和性能证据见[模型配置验收](./模型配置.md#核心主模型接线验收)。
 
+本轮明确控制的离线验收扩展为 18 项实际 Eve 进程用例及 7 项 Node 测试，覆盖取消、原文修订、先保存后替代、工具副作用澄清、跨群/用户隔离、重复消息、替代轮停止恢复，以及完成旧回复排队时的代际过滤。以下历史真实 QQ 记录不覆盖新增控制命令；未知工具副作用与慢工具析构窗口依赖独立 Rust 契约验证。
+
 消息 ID 修复后的代码 `c548ea9b27ed62c3022d80ae8638eabf1c65d8ae` 已通过七项 Node 测试和六项 Eve 进程验收：[通道离线运行](https://github.com/ZenthXSin/Eve.aic/actions/runs/36905216689)，含官方带标点 msg_id 的原路回复、工具闭环与跨进程恢复。同一代码的[完整 CI](https://github.com/ZenthXSin/Eve.aic/actions/runs/36905216703) 三组全部成功：fmt、严格 Clippy、所有目标、工作区测试与文档测试、全部既有示例和 Rust 1.89 检查。真实 DeepSeek 三轮及恢复已通过，见[主模型验收](./主模型验收.md)。
 
 首次[QQ 沙箱运行](https://github.com/ZenthXSin/Eve.aic/actions/runs/36903380200) 于 2026-10-01 17:59–18:02 UTC 检出消息 ID 修复前的 `090d94662797492cda8dd29acc7f925ec39c4c43`：认证与网关 ready 成功，180 秒后干净停止，但有效消息计数为零，未通过真实收发。未记录原始事件，不能据此反推用户未发消息。官方示例的 msg_id 包含 `.` 与 `!`，首版限制会误过滤；现已在 Node/Rust 分开验证 openid 和不透明消息 ID，保留原始标点及正文提及，并通过官方样例的路由、工具与恢复测试。来源为 [QQ 官方消息事件](https://github.com/tencent-connect/bot-docs/blob/645787a45937e5d9c4f0f61afefdffde0f38696e/docs/develop/api-v2/server-inter/message/send-receive/event.md)。
@@ -71,4 +89,4 @@ python3 connectors/qqbot/test/eve_e2e.py
 
 本次只使用 GitHub 托管 Runner，没有部署测试服务器。仅上传无正文计数报告，原始诊断、会话和回执未上传。一次性 PR 触发已移除，工作流恢复为仅 main 的手动入口；需要长期在线或保留本次 Runner 状态，应另行使用持久宿主。
 
-媒体、QQ 频道、webhook、主动消息、消息修订/并行调度和凭据库接线后置；首版只做已验证的文本闭环。
+媒体、QQ 频道、webhook、主动消息、自然语言辅助判断、并行调度和凭据库接线后置。明确修订已接线，暂停检查点和 Jev 仍待独立交付。

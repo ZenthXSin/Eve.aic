@@ -1,5 +1,6 @@
 use crate::{AppError, core_bootstrap, finish_core, install_core};
 use eve_kernel::{Kernel, KernelServices, backends::FileStateStore};
+use eve_message_plugin::{MessageRouterPlugin, RelationPlugin};
 use eve_plugin_api::{PluginId, ServiceId};
 use eve_qqbot_plugin::{
     DEFAULT_QQBOT_APP_ID, QQBOT_PLUGIN_ID, QQBOT_STATUS_SERVICE_ID, QqBotConfig, QqBotPlugin,
@@ -11,6 +12,8 @@ pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
 用法：eve-qqbot [--state-dir 目录] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
+QQ 普通文字排队开始新轮；逐行 /add 内容、/correct 内容、/cancel 控制当前任务。
+修订先取消并等待；已有工具操作时只澄清，/new 内容明确开始独立任务。
 Ctrl+C 或 SIGTERM 取消在途轮次、等待保存并停止桥接子进程。";
 /// 密钥只在创建插件时从环境读取，不包含在启动参数和 Debug 中。
 #[derive(Clone, Debug)]
@@ -104,6 +107,8 @@ pub async fn run_qqbot(options: QqBotOptions) -> Result<QqBotStatus, AppError> {
             bootstrap,
         )
         .await?;
+        kernel.register(Box::new(RelationPlugin::rules()?))?;
+        kernel.register(Box::new(MessageRouterPlugin::builtin()?))?;
         kernel.register(Box::new(plugin))?;
         kernel.start(&PluginId::new(QQBOT_PLUGIN_ID)?).await?;
         let handle = registry
