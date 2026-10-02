@@ -1,5 +1,8 @@
 //! 配置的公开定义层；不依赖 Kernel、文件系统或执行器。
 
+mod models;
+pub use models::*;
+
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{collections::BTreeMap, fmt, sync::Arc};
