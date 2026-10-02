@@ -3,6 +3,8 @@ members = [
     "crates/plugin-api",
     "crates/cognition-api",
     "crates/cognition-plugin",
+    "crates/cognition-loop-api",
+    "crates/cognition-loop-plugin",
     "crates/config-api",
     "crates/config-plugin",
     "crates/kernel",

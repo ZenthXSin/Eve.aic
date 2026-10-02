@@ -9,6 +9,8 @@ pub use prompt::{
 };
 
 use eve_plugin_api::{Permission, PluginId, ServiceId};
+mod budget;
+pub use budget::{BudgetUsage, ExecutionLimits, TurnBudget};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;

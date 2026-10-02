@@ -10,6 +10,8 @@ use eve_plugin_api::{
 };
 use std::sync::Arc;
 
+mod cognition_executor;
+pub use cognition_executor::{BudgetedSessionRunner, ControlGoalExecutor};
 mod control_runner;
 mod llm_host;
 mod relation_judge;

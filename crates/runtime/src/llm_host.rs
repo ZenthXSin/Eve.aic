@@ -411,6 +411,7 @@ enum PermissionFailure {
 pub struct LlmHost {
     provider: Arc<dyn LlmProvider>,
     model_resolver: Option<Arc<dyn LlmModelResolver>>,
+    execution_budget: Option<Arc<eve_llm_api::TurnBudget>>,
     pub(crate) registry: Arc<dyn ServiceRegistry>,
     pub(crate) kernel: Kernel,
     permissions: Arc<dyn PermissionChecker>,
@@ -459,6 +460,7 @@ impl LlmHost {
         Ok(Self {
             provider,
             model_resolver: None,
+            execution_budget: None,
             registry,
             kernel,
             permissions,
@@ -473,6 +475,12 @@ impl LlmHost {
     /// 显式启用每轮模型解析；原 new 构造路径继续固定 Provider。
     pub fn with_model_resolver(mut self, resolver: Arc<dyn LlmModelResolver>) -> Self {
         self.model_resolver = Some(resolver);
+        self
+    }
+
+    /// 每次认知尝试独立预算；克隆继续共享工具槽位和串行队列。
+    pub fn with_execution_budget(mut self, budget: Arc<eve_llm_api::TurnBudget>) -> Self {
+        self.execution_budget = Some(budget);
         self
     }
 
@@ -593,6 +601,11 @@ impl LlmHost {
         let ModelResponse::ToolCalls { calls } = response else {
             unreachable!()
         };
+        if let Some(budget) = &self.execution_budget {
+            budget
+                .reserve_tool_batch(calls.len())
+                .map_err(|error| fail(error, diagnostics.clone()))?;
+        }
         diagnostics.stage = TurnStage::Tools;
         diagnostics.tool_batches += 1;
         diagnostics.calls = calls
@@ -723,6 +736,9 @@ impl LlmHost {
         events: Option<&EventDelivery<'_>>,
     ) -> Result<ModelResponse, LlmError> {
         request.validate()?;
+        if let Some(budget) = &self.execution_budget {
+            budget.reserve_model_request()?;
+        }
         let request_number = diagnostics.provider_requests + 1;
         emit(
             events,

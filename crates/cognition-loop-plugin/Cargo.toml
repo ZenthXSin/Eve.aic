@@ -1,0 +1,19 @@
+[package]
+name = "eve-cognition-loop-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-cognition-api = { path = "../cognition-api" }
+eve-cognition-loop-api = { path = "../cognition-loop-api" }
+eve-control-api = { path = "../control-api" }
+eve-llm-api = { path = "../llm-api" }
+eve-plugin-api = { path = "../plugin-api" }
+tokio.workspace = true
+getrandom = "0.4"
+
+[dev-dependencies]
+eve-cognition-plugin = { path = "../cognition-plugin" }
+eve-kernel = { path = "../kernel" }
