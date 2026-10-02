@@ -1,12 +1,98 @@
 // Test-only process: no SDK/network; exercise the production Rust JSONL boundary.
 import fs from "node:fs";
 import readline from "node:readline";
+import { setTimeout as delay } from "node:timers/promises";
 const scenario = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 if (process.env.EVE_OPENAI_API_KEY || process.argv.some(x => x.includes("test-app-secret"))) {
   throw new Error("model_credentials_leaked");
 }
 const send = frame => process.stdout.write(JSON.stringify({ version: 1, ...frame }) + "\n");
 if (scenario.pid_file) fs.writeFileSync(scenario.pid_file, String(process.pid));
+const record = event => {
+  if (scenario.events_file) fs.appendFileSync(scenario.events_file, JSON.stringify(event) + "\n");
+};
+const checkReply = (cmd, message) => {
+  if (message.expected_type === "finish") throw new Error("retired_result_was_replied");
+  if (cmd.text !== message.expected) throw new Error("wrong_reply_text");
+};
+const deliver = id => send({ type: "delivery", id, ok: !scenario.send_fail, message_id: "out-" + id });
+
+// Script steps synchronize against real HTTP request arrival or Rust commands,
+// so control commands are injected while a particular generation is in flight.
+if (scenario.script) {
+  const pending = new Map();
+  const commands = [];
+  let stopped = false;
+  const until = async predicate => {
+    const deadline = Date.now() + 15000;
+    while (!predicate()) {
+      if (stopped) return false;
+      if (Date.now() >= deadline) throw new Error("scenario_wait_timeout");
+      await delay(10);
+    }
+    return true;
+  };
+  const execute = async () => {
+    send({ type: "ready" });
+    for (const step of scenario.script) {
+      if (stopped) return;
+      if (step.send) {
+        for (const message of Array.isArray(step.send) ? step.send : [step.send]) {
+          if (!pending.has(message.id)) pending.set(message.id, message);
+          record({ direction: "in", ...message });
+          send({ type: "message", ...message });
+        }
+      } else if (step.wait_file) {
+        if (!await until(() => fs.existsSync(step.wait_file))) return;
+      } else if (step.wait_command) {
+        const expected = step.wait_command;
+        if (!await until(() => commands.filter(cmd => cmd.type === expected.type && cmd.id === expected.id).length >= (expected.count ?? 1))) return;
+      } else if (step.touch) {
+        fs.writeFileSync(step.touch, "ready");
+      } else if (step.delivery) {
+        if (!commands.some(cmd => cmd.type === "reply" && cmd.id === step.delivery)) throw new Error("delivery_before_reply");
+        deliver(step.delivery);
+      } else if (step.wait_turn) {
+        if (!await until(() => {
+          const document = JSON.parse(fs.readFileSync(step.wait_turn.path, "utf8"));
+          const sessions = JSON.parse(Buffer.from(document.entries["eve.session"]["sessions.v1"]).toString());
+          return Object.values(sessions.sessions).some(session => session.turns.some(turn =>
+            turn.input === step.wait_turn.input && turn.status.state === step.wait_turn.state));
+        })) return;
+      } else {
+        throw new Error("unknown_scenario_step");
+      }
+    }
+    process.stdout.end(() => process.exit(0));
+  };
+  const consume = async () => {
+    const lines = readline.createInterface({ input: process.stdin });
+    for await (const line of lines) {
+      const cmd = JSON.parse(line);
+      record({ direction: "out", ...cmd });
+      if (cmd.type === "stop") { stopped = true; return; }
+      const message = pending.get(cmd.id);
+      if (!message) throw new Error("wrong_reply_id");
+      if (cmd.type === "reply") {
+        checkReply(cmd, message);
+        if (!message.hold_delivery) deliver(cmd.id);
+      } else if (cmd.type !== "finish") {
+        throw new Error("unexpected_command");
+      } else if (message.expected_type === "reply") {
+        throw new Error("expected_reply_was_finished");
+      }
+      commands.push(cmd);
+    }
+    stopped = true;
+  };
+  try {
+    await Promise.all([execute(), consume()]);
+  } catch (error) {
+    if (scenario.error_file) fs.writeFileSync(scenario.error_file, error.message);
+    process.exitCode = 1;
+    process.stdout.end();
+  }
+} else {
 let index = 0;
 const emitNext = () => {
   if (index < scenario.messages.length) send({ type: "message", ...scenario.messages[index] });
@@ -16,11 +102,13 @@ send({ type: "ready" }); emitNext();
 const lines = readline.createInterface({ input: process.stdin });
 for await (const line of lines) {
   const cmd = JSON.parse(line);
+  record({ direction: "out", ...cmd });
   if (cmd.type === "stop") break;
   if (cmd.id !== scenario.messages[index]?.id) throw new Error("wrong_reply_id");
   if (cmd.type === "reply") {
-    if (cmd.text !== scenario.messages[index].expected) throw new Error("wrong_reply_text");
+    checkReply(cmd, scenario.messages[index]);
     send({ type: "delivery", id: cmd.id, ok: !scenario.send_fail, message_id: "out-1" });
   } else if (cmd.type !== "finish") throw new Error("unexpected_command");
   index++; emitNext();
+}
 }

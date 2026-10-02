@@ -138,6 +138,8 @@ dependencies = [
  "eve-kernel",
  "eve-llm-api",
  "eve-llm-openai",
+ "eve-message-api",
+ "eve-message-plugin",
  "eve-plugin-api",
  "eve-qqbot-plugin",
  "eve-runtime",
@@ -285,6 +287,8 @@ name = "eve-qqbot-plugin"
 version = "0.1.0"
 dependencies = [
  "eve-control-api",
+ "eve-llm-api",
+ "eve-message-api",
  "eve-plugin-api",
  "eve-session-api",
  "ring",

@@ -199,6 +199,7 @@ pub(crate) async fn install_core(
             runtime_llm_schema(),
             config::openai_schema(),
             model_roles_schema(),
+            eve_message_api::message_schema(),
         ],
     ))?;
     install_core_with_config(

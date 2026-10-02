@@ -23,6 +23,8 @@ eve-control-plugin = { path = "../control-plugin" }
 eve-kernel = { path = "../kernel" }
 eve-llm-api = { path = "../llm-api" }
 eve-llm-openai = { path = "../llm-openai" }
+eve-message-api = { path = "../message-api" }
+eve-message-plugin = { path = "../message-plugin" }
 eve-plugin-api = { path = "../plugin-api" }
 eve-qqbot-plugin = { path = "../qqbot-plugin" }
 eve-runtime = { path = "../runtime" }

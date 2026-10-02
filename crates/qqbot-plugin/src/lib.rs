@@ -1,8 +1,9 @@
-//! 官方 QQBot 通道实现；只通过公开 Control/Session 与插件 Context 协作。
+//! 官方 QQBot 通道实现；只通过公开 Control/Message/Session 与插件 Context 协作。
 mod bridge;
 mod state;
 
 use eve_control_api::{CONTROL_PLUGIN_ID, CONTROL_SERVICE_ID, ControlServiceHandle};
+use eve_message_api::{MessageServiceHandle, ROUTER_PLUGIN_ID, ROUTER_SERVICE_ID};
 use eve_plugin_api::{
     Cleanup, Plugin, PluginContext, PluginDependency, PluginError, PluginFuture, PluginManifest,
     PluginResult, ServiceId, TaskMode, TaskSchedule, TaskSpec,
@@ -56,10 +57,12 @@ impl QqBotPlugin {
             return Err(PluginError::State("QQBot 凭据缺失或 AppID 无效".into()));
         }
         let mut manifest = PluginManifest::new(QQBOT_PLUGIN_ID, "0.1.0")?;
-        manifest.dependencies.push(PluginDependency {
-            id: eve_plugin_api::PluginId::new(CONTROL_PLUGIN_ID)?,
-            requirement: Some("^0.1".into()),
-        });
+        for id in [CONTROL_PLUGIN_ID, ROUTER_PLUGIN_ID] {
+            manifest.dependencies.push(PluginDependency {
+                id: eve_plugin_api::PluginId::new(id)?,
+                requirement: Some("^0.1".into()),
+            });
+        }
         Ok(Self {
             manifest,
             config: Arc::new(config),
@@ -76,6 +79,11 @@ impl Plugin for QqBotPlugin {
             let control = ctx
                 .service::<ControlServiceHandle>(&ServiceId::new(CONTROL_SERVICE_ID)?)?
                 .ok_or_else(|| PluginError::State("QQBot 控制服务缺失".into()))?
+                .0
+                .clone();
+            let messages = ctx
+                .service::<MessageServiceHandle>(&ServiceId::new(ROUTER_SERVICE_ID)?)?
+                .ok_or_else(|| PluginError::State("QQBot 消息服务缺失".into()))?
                 .0
                 .clone();
             let (status, receiver) = watch::channel(QqBotStatus::default());
@@ -99,6 +107,7 @@ impl Plugin for QqBotPlugin {
                     let stop_receiver = stop_receiver.clone();
                     let ctx = task_ctx.clone();
                     let control = control.clone();
+                    let messages = messages.clone();
                     let status = status.clone();
                     let ledger = ledger.clone();
                     Box::pin(async move {
@@ -109,7 +118,7 @@ impl Plugin for QqBotPlugin {
                         let result = bridge::run(
                             config,
                             ctx,
-                            control,
+                            bridge::Services { control, messages },
                             ledger,
                             signal,
                             status.clone(),
