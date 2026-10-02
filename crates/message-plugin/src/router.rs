@@ -35,6 +35,24 @@ struct Entry {
     done: watch::Sender<Option<MessageResult<RouteReport>>>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
+struct CompletionGuard(Arc<Entry>);
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        // 执行器可直接丢弃 Future，不经过异步尾部；只终结本消息，不推断原代收尾。
+        // submit 可能仍持有 book 锁，故这里不能访问 book 或调用外部控制服务。
+        self.0.done.send_if_modified(|result| {
+            if result.is_some() {
+                return false;
+            }
+            *result = Some(Ok(RouteReport {
+                message: self.0.message.clone(),
+                decision: None,
+                outcome: RouteOutcome::Blocked { prior: None },
+            }));
+            true
+        });
+    }
+}
 #[derive(Clone)]
 struct Question {
     target: GenerationKey,
@@ -104,7 +122,10 @@ impl MessageService for Router {
             .clone();
         let inner = self.0.clone();
         let working = entry.clone();
+        // 必须在 spawn 前持有守卫，覆盖 worker 尚未首次 poll 就被丢弃的窗口。
+        let completion = CompletionGuard(entry.clone());
         let task = runtime.spawn(async move {
+            let _completion = completion;
             let message = &working.message;
             let result =
                 contain(async { inner.route(&working, request, settings, sink, gate).await })
@@ -448,18 +469,24 @@ impl Inner {
             self.closed.send_replace(true);
             book.entries.values().cloned().collect::<Vec<_>>()
         };
+        let mut result = Ok(());
         for entry in entries {
-            let task = entry
-                .task
-                .lock()
-                .map_err(|_| PluginError::Task("消息任务锁不可用".into()))?
-                .take();
+            let task = match entry.task.lock() {
+                Ok(mut task) => task.take(),
+                Err(_) => {
+                    result = result.and(Err(PluginError::Task("消息任务锁不可用".into())));
+                    continue;
+                }
+            };
             if let Some(task) = task {
-                task.await
-                    .map_err(|_| PluginError::Task("消息路由收尾异常".into()))?;
+                // 旧执行器的取消错误不能跳过新执行器上仍在收尾的其他消息。
+                let joined = task
+                    .await
+                    .map_err(|_| PluginError::Task("消息路由收尾异常".into()));
+                result = result.and(joined);
             }
         }
-        Ok(())
+        result
     }
 }
 #[derive(Clone, Copy)]
