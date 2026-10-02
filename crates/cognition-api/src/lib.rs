@@ -35,19 +35,29 @@ impl Visibility {
             || matches!((self, parent), (Self::User(a), Self::User(b)) if a == b)
     }
     pub fn validate(&self) -> CognitionResult<()> {
-        if let Self::User(id) = self { validate_id(id)?; }
+        if let Self::User(id) = self {
+            validate_id(id)?;
+        }
         Ok(())
     }
 }
 impl ReadAccess {
     pub fn validate(&self) -> CognitionResult<()> {
-        if let Self::User(id) = self { validate_id(id)?; }
+        if let Self::User(id) = self {
+            validate_id(id)?;
+        }
         Ok(())
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum SourceKind { User, Environment, Tool, Inference, Internal }
+pub enum SourceKind {
+    User,
+    Environment,
+    Tool,
+    Inference,
+    Internal,
+}
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
@@ -75,18 +85,37 @@ impl ExecutionBudget {
         if !(1..=100).contains(&self.max_model_requests)
             || self.max_tool_calls > 1000
             || !(1..=10).contains(&self.max_attempts)
-            || !(1..=600_000).contains(&self.timeout_ms) {
+            || !(1..=600_000).contains(&self.timeout_ms)
+        {
             return Err(CognitionError::InvalidInput);
         }
         Ok(())
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum GoalStatus { Ready, Waiting, Executing, Completed, Cancelled, Blocked }
+pub enum GoalStatus {
+    Ready,
+    Waiting,
+    Executing,
+    Completed,
+    Cancelled,
+    Blocked,
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum BlockReason { Interrupted, UnknownCommit, FeedbackSaveFailed, Invalidated }
+pub enum BlockReason {
+    Interrupted,
+    UnknownCommit,
+    FeedbackSaveFailed,
+    Invalidated,
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ExecutionCommit { NotStarted, Completed, Failed, Pending, Unknown }
+pub enum ExecutionCommit {
+    NotStarted,
+    Completed,
+    Failed,
+    Pending,
+    Unknown,
+}
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -137,9 +166,15 @@ impl Goal {
         if self.priority > 100 || self.expires_at_ms == Some(0) {
             return Err(CognitionError::InvalidInput);
         }
-        if let Some(reason) = &self.wait_reason { validate_text(reason)?; }
+        if let Some(reason) = &self.wait_reason {
+            validate_text(reason)?;
+        }
         if let Some(execution) = &self.execution {
-            for id in [&execution.attempt_id, &execution.session_id, &execution.task_id] {
+            for id in [
+                &execution.attempt_id,
+                &execution.session_id,
+                &execution.task_id,
+            ] {
                 validate_id(id)?;
             }
             if execution.turn_id == Some(0) || execution.started_at_ms == 0 {
@@ -149,12 +184,14 @@ impl Goal {
         if let Some(feedback) = &self.feedback {
             validate_text(&feedback.summary)?;
             if feedback.at_ms == 0
-                || (feedback.verification_met && feedback.commit != ExecutionCommit::Completed) {
+                || (feedback.verification_met && feedback.commit != ExecutionCommit::Completed)
+            {
                 return Err(CognitionError::InvalidInput);
             }
         }
         if (self.status == GoalStatus::Waiting) != self.wait_reason.is_some()
-            || (self.status == GoalStatus::Blocked) != self.block_reason.is_some() {
+            || (self.status == GoalStatus::Blocked) != self.block_reason.is_some()
+        {
             return Err(CognitionError::InvalidInput);
         }
         match self.status {
@@ -170,14 +207,20 @@ impl Goal {
             }
             GoalStatus::Completed => {
                 if !self.execution.as_ref().is_some_and(|e| e.turn_id.is_some())
-                    || !self.feedback.as_ref().is_some_and(|f|
-                        f.commit == ExecutionCommit::Completed && f.verification_met) {
+                    || !self.feedback.as_ref().is_some_and(|f| {
+                        f.commit == ExecutionCommit::Completed && f.verification_met
+                    })
+                {
                     return Err(CognitionError::InvalidInput);
                 }
             }
             GoalStatus::Cancelled => {
-                if self.feedback.as_ref().is_some_and(|f|
-                    matches!(f.commit, ExecutionCommit::Pending | ExecutionCommit::Unknown)) {
+                if self.feedback.as_ref().is_some_and(|f| {
+                    matches!(
+                        f.commit,
+                        ExecutionCommit::Pending | ExecutionCommit::Unknown
+                    )
+                }) {
                     return Err(CognitionError::InvalidInput);
                 }
             }
@@ -212,7 +255,13 @@ pub struct Agenda {
     pub valid_until_ms: u64,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum CognitiveEventKind { ExternalInput, StateChanged, DriveEvaluated, AgendaSelected, Feedback }
+pub enum CognitiveEventKind {
+    ExternalInput,
+    StateChanged,
+    DriveEvaluated,
+    AgendaSelected,
+    Feedback,
+}
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CognitiveEvent {
@@ -235,23 +284,33 @@ pub struct CognitiveState {
 }
 impl CognitiveState {
     pub fn validate(&self) -> CognitionResult<()> {
-        if self.goals.len() > MAX_RECORDS || self.drives.len() > MAX_RECORDS
-            || self.events.len() > MAX_RECORDS {
+        if self.goals.len() > MAX_RECORDS
+            || self.drives.len() > MAX_RECORDS
+            || self.events.len() > MAX_RECORDS
+        {
             return Err(CognitionError::LimitReached);
         }
         let mut executing = 0;
         for (id, goal) in &self.goals {
             goal.validate()?;
-            if id != &goal.id { return Err(CognitionError::InvalidInput); }
+            if id != &goal.id {
+                return Err(CognitionError::InvalidInput);
+            }
             executing += usize::from(goal.status == GoalStatus::Executing);
         }
-        if executing > 1 { return Err(CognitionError::Busy); }
+        if executing > 1 {
+            return Err(CognitionError::Busy);
+        }
         for (id, drive) in &self.drives {
             validate_id(id)?;
             drive.visibility.validate()?;
             validate_text(&drive.reason)?;
-            if id != &drive.id || drive.strength > 100 || drive.evaluated_at_ms == 0
-                || drive.valid_until_ms <= drive.evaluated_at_ms || drive.goal_ids.is_empty() {
+            if id != &drive.id
+                || drive.strength > 100
+                || drive.evaluated_at_ms == 0
+                || drive.valid_until_ms <= drive.evaluated_at_ms
+                || drive.goal_ids.is_empty()
+            {
                 return Err(CognitionError::InvalidInput);
             }
             self.validate_goal_refs(&drive.goal_ids, &drive.visibility)?;
@@ -259,16 +318,23 @@ impl CognitiveState {
         if let Some(agenda) = &self.agenda {
             agenda.visibility.validate()?;
             validate_text(&agenda.reason)?;
-            if agenda.valid_until_ms == 0 { return Err(CognitionError::InvalidInput); }
+            if agenda.valid_until_ms == 0 {
+                return Err(CognitionError::InvalidInput);
+            }
             self.validate_goal_refs(&agenda.candidates, &agenda.visibility)?;
-            if agenda.candidates.iter().any(|id| self.goals[id].status != GoalStatus::Ready) {
+            if agenda
+                .candidates
+                .iter()
+                .any(|id| self.goals[id].status != GoalStatus::Ready)
+            {
                 return Err(CognitionError::InvalidInput);
             }
             if let Some(id) = &agenda.selected {
                 self.validate_goal_refs(std::slice::from_ref(id), &agenda.visibility)?;
                 let status = &self.goals[id].status;
                 if !matches!(status, GoalStatus::Ready | GoalStatus::Executing)
-                    || (*status == GoalStatus::Ready && !agenda.candidates.contains(id)) {
+                    || (*status == GoalStatus::Ready && !agenda.candidates.contains(id))
+                {
                     return Err(CognitionError::InvalidInput);
                 }
             }
@@ -286,7 +352,9 @@ impl CognitiveState {
                 self.validate_goal_refs(std::slice::from_ref(id), &event.visibility)?;
             }
             if let Some(cause) = &event.caused_by {
-                let parent = events.get(cause.as_str()).ok_or(CognitionError::InvalidInput)?;
+                let parent = events
+                    .get(cause.as_str())
+                    .ok_or(CognitionError::InvalidInput)?;
                 if !event.visibility.restricts(parent) {
                     return Err(CognitionError::AccessDenied);
                 }
@@ -296,12 +364,18 @@ impl CognitiveState {
         Ok(())
     }
     fn validate_goal_refs(&self, ids: &[String], visibility: &Visibility) -> CognitionResult<()> {
-        if ids.len() > MAX_RECORDS { return Err(CognitionError::LimitReached); }
+        if ids.len() > MAX_RECORDS {
+            return Err(CognitionError::LimitReached);
+        }
         let mut unique = std::collections::BTreeSet::new();
         for id in ids {
-            if !unique.insert(id) { return Err(CognitionError::InvalidInput); }
+            if !unique.insert(id) {
+                return Err(CognitionError::InvalidInput);
+            }
             let goal = self.goals.get(id).ok_or(CognitionError::InvalidInput)?;
-            if !visibility.restricts(&goal.visibility) { return Err(CognitionError::AccessDenied); }
+            if !visibility.restricts(&goal.visibility) {
+                return Err(CognitionError::AccessDenied);
+            }
         }
         Ok(())
     }
@@ -324,8 +398,12 @@ pub struct CognitiveView {
 }
 impl CognitiveView {
     pub fn ready_goal_ids(&self, now_ms: u64) -> Vec<String> {
-        self.state.goals.iter().filter(|(_, g)| g.is_ready(now_ms))
-            .map(|(id, _)| id.clone()).collect()
+        self.state
+            .goals
+            .iter()
+            .filter(|(_, g)| g.is_ready(now_ms))
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 }
 pub trait CognitionReader: Send + Sync {
@@ -336,15 +414,28 @@ pub trait CognitionAdmin: Send + Sync {
     fn snapshot(&self) -> CognitionResult<CognitiveSnapshot>;
     fn reader(&self, access: ReadAccess) -> CognitionResult<Arc<dyn CognitionReader>>;
     /// 成功后整份状态已持久化；目标修订由实现自动增加。
-    fn replace(&self, expected_revision: u64, state: CognitiveState) -> CognitionResult<CognitiveSnapshot>;
+    fn replace(
+        &self,
+        expected_revision: u64,
+        state: CognitiveState,
+    ) -> CognitionResult<CognitiveSnapshot>;
 }
 #[derive(Clone)]
 pub struct CognitionReadHandle(pub Arc<dyn CognitionReader>);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CognitionError {
-    InvalidInput, AccessDenied, SubjectMismatch, StaleRevision, InvalidTransition,
-    Busy, Unavailable, CorruptState, UnsupportedVersion, Storage, LimitReached,
+    InvalidInput,
+    AccessDenied,
+    SubjectMismatch,
+    StaleRevision,
+    InvalidTransition,
+    Busy,
+    Unavailable,
+    CorruptState,
+    UnsupportedVersion,
+    Storage,
+    LimitReached,
 }
 impl fmt::Display for CognitionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -384,5 +475,17 @@ macro_rules! redacted_debug {
         }
     })+ };
 }
-redacted_debug!(Visibility, ReadAccess, Source, ExecutionAttempt, Feedback, Goal,
-    Drive, Agenda, CognitiveEvent, CognitiveState, CognitiveSnapshot, CognitiveView);
+redacted_debug!(
+    Visibility,
+    ReadAccess,
+    Source,
+    ExecutionAttempt,
+    Feedback,
+    Goal,
+    Drive,
+    Agenda,
+    CognitiveEvent,
+    CognitiveState,
+    CognitiveSnapshot,
+    CognitiveView
+);
