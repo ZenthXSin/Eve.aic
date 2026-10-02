@@ -156,19 +156,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eve-cognition-plugin"
-version = "0.1.0"
-dependencies = [
- "eve-cognition-api",
- "eve-kernel",
- "eve-plugin-api",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "eve-cognition-loop-api"
 version = "0.1.0"
 dependencies = [
@@ -189,6 +176,19 @@ dependencies = [
  "eve-llm-api",
  "eve-plugin-api",
  "getrandom 0.4.3",
+ "tokio",
+]
+
+[[package]]
+name = "eve-cognition-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-cognition-api",
+ "eve-kernel",
+ "eve-plugin-api",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -321,11 +321,11 @@ dependencies = [
 name = "eve-runtime"
 version = "0.1.0"
 dependencies = [
+ "eve-agent-prompt",
  "eve-cognition-api",
  "eve-cognition-loop-api",
  "eve-cognition-loop-plugin",
  "eve-cognition-plugin",
- "eve-agent-prompt",
  "eve-config-api",
  "eve-config-plugin",
  "eve-control-api",

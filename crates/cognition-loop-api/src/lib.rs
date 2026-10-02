@@ -2,7 +2,7 @@
 use eve_cognition_api::{CognitionError, ExecutionAttempt, Goal, ReadAccess, SourceKind};
 use eve_control_api::{ControlReport, GenerationKey};
 use eve_llm_api::BudgetUsage;
-use std::{fmt, future::Future, pin::Pin, sync::Arc};
+use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Instant};
 
 pub const LOOP_PLUGIN_ID: &str = "eve.cognition.loop";
 pub const LOOP_STATUS_SERVICE_ID: &str = "eve.cognition.loop.status.v1";
@@ -116,6 +116,15 @@ impl fmt::Debug for GoalExecutionReport {
 /// 未知状态不能伪造为零调用；返回错误时不自动重新提交。
 pub trait GoalExecutor: Send + Sync {
     fn submit(&self, goal: &Goal, attempt: &ExecutionAttempt) -> LoopResult<GenerationKey>;
+    /// 期限在策略评估前确定，包含评估与 Executing 保存耗时。
+    /// 实现必须把同一单调期限交给实际模型/工具预算，不能重新授予完整 timeout。
+    /// 不提供相对 timeout 回退，以免旧执行器忽略保存和排队耗时。
+    fn submit_before(
+        &self,
+        goal: &Goal,
+        attempt: &ExecutionAttempt,
+        deadline: Instant,
+    ) -> LoopResult<GenerationKey>;
     fn cancel(&self, key: &GenerationKey) -> LoopResult<()>;
     fn wait(&self, key: &GenerationKey) -> LoopFuture<'static, GoalExecutionReport>;
 }
