@@ -522,14 +522,13 @@ impl Worker {
                 return Err(error);
             }
         };
-        self.running.update(|stats| {
-            match snapshot.state.goals[&goal.id].status {
+        self.running
+            .update(|stats| match snapshot.state.goals[&goal.id].status {
                 GoalStatus::Completed => stats.completed = stats.completed.saturating_add(1),
                 GoalStatus::Cancelled => stats.cancelled = stats.cancelled.saturating_add(1),
                 GoalStatus::Blocked => stats.blocked = stats.blocked.saturating_add(1),
                 _ => {}
-            }
-        });
+            });
         // 通知只有无正文的全局修订，不能据此读取私有目标；不订阅此事件作唤醒。
         if self
             .context

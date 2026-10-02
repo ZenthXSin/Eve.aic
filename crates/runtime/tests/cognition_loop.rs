@@ -345,7 +345,11 @@ async fn feedback_save_failure_preserves_executing_and_restart_blocks_without_re
     assert!(controller.shutdown().await.is_err());
     let stats = controller.stats().unwrap();
     assert_eq!(
-        (stats.model_requests, stats.admitted_tool_calls, stats.started_tools),
+        (
+            stats.model_requests,
+            stats.admitted_tool_calls,
+            stats.started_tools
+        ),
         (2, 1, 1)
     );
     assert_eq!(
