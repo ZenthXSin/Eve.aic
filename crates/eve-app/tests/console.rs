@@ -666,3 +666,146 @@ async fn same_process_entry_releases_directory_before_second_invocation() {
         ["同进程第一轮", "同进程第二轮"]
     );
 }
+
+#[tokio::test]
+async fn output_failure_preserves_committed_tool_report_and_allows_reopen() {
+    if let Some(root) = std::env::var_os("EVE_TEST_OUTPUT_FAILURE_ROOT") {
+        struct FailingOutput {
+            fail_on_flush: bool,
+        }
+        impl Write for FailingOutput {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.fail_on_flush {
+                    Ok(bytes.len())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "测试终端写入失败",
+                    ))
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.fail_on_flush {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "测试终端刷新失败",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let root = std::path::PathBuf::from(root);
+        let options = eve_app::ChatOptions {
+            state_directory: root.join("state"),
+            agent_path: root.join("AGENT.md"),
+            ..eve_app::ChatOptions::default()
+        };
+        let fail_on_flush = std::env::var("EVE_TEST_OUTPUT_FAILURE_MODE").unwrap() == "flush";
+        let error = eve_app::run_console(
+            options.clone(),
+            std::io::Cursor::new("请回显故障回执\n不能执行的排队输入\n"),
+            FailingOutput { fail_on_flush },
+        )
+        .await
+        .unwrap_err();
+        let actual = error.downcast_ref::<eve_app::ChatOutputError>().unwrap();
+        assert_eq!(actual.output.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            actual.report.run.commit,
+            eve_control_api::CommitState::Completed
+        );
+        assert_eq!(actual.report.run.text.as_deref(), Some("故障回执已保存"));
+        assert_eq!(actual.report.run.started_tools, Some(1));
+        assert_eq!(actual.report.run.tool_results.len(), 1);
+        assert_eq!(actual.report.run.transcript.as_ref().unwrap().len(), 4);
+        assert!(actual.report.run.failure.is_none());
+        let first = sessions(&root)["sessions"]["default"].clone();
+        assert_eq!(first["revision"], 2);
+        assert_eq!(first["turns"].as_array().unwrap().len(), 1);
+        assert_eq!(first["turns"][0]["status"]["state"], "Completed");
+        assert_eq!(
+            first["turns"][0]["status"]["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        // 输出失败没有改写已提交历史；同进程重新打开状态目录并继续。
+        let mut output = Vec::new();
+        let summary = eve_app::run_console(
+            options,
+            std::io::Cursor::new("输出故障后继续\n"),
+            &mut output,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.completed_turns, 1);
+        assert_eq!(String::from_utf8(output).unwrap(), "Eve：恢复完成\n");
+        let restored = sessions(&root)["sessions"]["default"].clone();
+        assert_eq!(restored["revision"], 4);
+        assert_eq!(restored["turns"].as_array().unwrap().len(), 2);
+        assert_eq!(restored["turns"][0], first["turns"][0]);
+        assert_eq!(restored["turns"][1]["status"]["state"], "Completed");
+        return;
+    }
+    for mode in ["write", "flush"] {
+        let root = fixture();
+        let mut server = Server::start(vec![
+            Reply::json(json!({"status":"completed","error":null,"output":[
+                {"type":"function_call","call_id":"echo-fault","name":"echo","arguments":"{\"text\":\"故障回执\"}"}
+            ]})),
+            Reply::json(final_response("故障回执已保存")),
+            Reply::json(final_response("恢复完成")),
+        ]).await;
+        let configured = command(root.path(), &server.url);
+        let mut harness = Command::new(std::env::current_exe().unwrap());
+        for (name, value) in configured.get_envs() {
+            if let Some(value) = value {
+                harness.env(name, value);
+            } else {
+                harness.env_remove(name);
+            }
+        }
+        harness.args([
+            "--exact",
+            "output_failure_preserves_committed_tool_report_and_allows_reopen",
+            "--nocapture",
+        ]);
+        harness
+            .env("EVE_TEST_OUTPUT_FAILURE_ROOT", root.path())
+            .env("EVE_TEST_OUTPUT_FAILURE_MODE", mode);
+        let result = run(harness, "").await;
+        assert!(
+            result.status.success(),
+            "{mode}: {}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(user_texts(&server.next().await.body), ["请回显故障回执"]);
+        let follow = server.next().await.body;
+        let result = follow["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["type"] == "function_call_output")
+            .unwrap();
+        assert_eq!(result["call_id"], "echo-fault");
+        assert_eq!(
+            serde_json::from_str::<Value>(result["output"].as_str().unwrap()).unwrap(),
+            json!({"echo":"故障回执"})
+        );
+        let restored = server.next().await.body;
+        assert_eq!(user_texts(&restored), ["请回显故障回执", "输出故障后继续"]);
+        assert_eq!(
+            restored["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["type"] == "function_call_output")
+                .count(),
+            1
+        );
+        assert!(server.requests.try_recv().is_err());
+    }
+}
