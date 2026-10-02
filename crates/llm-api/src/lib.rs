@@ -447,6 +447,19 @@ pub trait LlmProvider: Send + Sync {
     }
 }
 
+/// 宿主为一轮捕获的模型能力；Provider 应持有固定设置，不在工具往返间改变选择。
+#[derive(Clone)]
+pub struct ModelSelection {
+    pub provider: Arc<dyn LlmProvider>,
+    pub provider_timeout: std::time::Duration,
+}
+
+/// 组合层读取已启动的配置服务并装配 Provider；不在此同步方法中访问网络。
+/// Runtime 每轮恰好解析一次，在途轮次只使用返回的固定选择。
+pub trait LlmModelResolver: Send + Sync {
+    fn resolve(&self) -> Result<ModelSelection, LlmError>;
+}
+
 pub trait ModelTextSink: Send + Sync {
     fn text_delta(&self, text: String) -> LlmFuture<'_, ()>;
 }

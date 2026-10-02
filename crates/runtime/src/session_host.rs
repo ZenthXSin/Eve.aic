@@ -29,7 +29,7 @@ pub struct SessionTurnOutput {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SessionRunError {
-    /// 关闭发生在会话 begin 前，没有创建 Pending 或执行工具。
+    /// 关闭或模型解析失败发生在会话 begin 前，没有创建 Pending 或执行工具。
     NotStarted(LlmError),
     Session(SessionError),
     Turn(TurnFailure),
@@ -176,6 +176,7 @@ impl SessionLlmHost {
             _ = closed => return Err(SessionRunError::NotStarted(LlmError::Cancelled)),
             admission = self.host.kernel.acquire_runtime_admission() => Arc::new(admission),
         };
+        let host = self.host.for_turn().map_err(SessionRunError::NotStarted)?;
         let text = input.text.clone();
         let beginning = self
             .service()
@@ -202,9 +203,8 @@ impl SessionLlmHost {
             logger: self.logger.clone(),
             owner: self.binding.expected_owner.clone(),
         };
-        let events = sink.map(|sink| self.host.event_delivery(sink, Some(started.lease.turn_id)));
-        let result = self
-            .host
+        let events = sink.map(|sink| host.event_delivery(sink, Some(started.lease.turn_id)));
+        let result = host
             .run_turn_inner(
                 TurnInput { text },
                 Some(started.history),
