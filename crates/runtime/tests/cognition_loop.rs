@@ -570,9 +570,7 @@ async fn service_conflict_rolls_back_without_waiting_for_unspawned_worker() {
     use eve_cognition_loop_plugin::{
         CognitionLoopPlugin, EchoReceiptVerifier, PriorityDrivePolicy,
     };
-    use eve_plugin_api::{
-        Cleanup, Plugin, PluginContext, PluginFuture, PluginManifest, ServiceId,
-    };
+    use eve_plugin_api::{Cleanup, Plugin, PluginContext, PluginFuture, PluginManifest, ServiceId};
     use eve_runtime::ControlGoalExecutor;
     struct Conflict(PluginManifest);
     impl Plugin for Conflict {
