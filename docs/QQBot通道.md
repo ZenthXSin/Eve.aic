@@ -53,12 +53,16 @@ python3 connectors/qqbot/test/eve_e2e.py
 
 消息 ID 修复后的代码 `c548ea9b27ed62c3022d80ae8638eabf1c65d8ae` 已通过七项 Node 测试和六项 Eve 进程验收：[通道离线运行](https://github.com/ZenthXSin/Eve.aic/actions/runs/36905216689)，含官方带标点 msg_id 的原路回复、工具闭环与跨进程恢复。同一代码的[完整 CI](https://github.com/ZenthXSin/Eve.aic/actions/runs/36905216703) 三组全部成功：fmt、严格 Clippy、所有目标、工作区测试与文档测试、全部既有示例和 Rust 1.89 检查。真实 DeepSeek 三轮及恢复已通过，见[主模型验收](./主模型验收.md)。
 
-[真实 QQ 沙箱运行](https://github.com/ZenthXSin/Eve.aic/actions/runs/36903380200) 于 2026-10-01 17:59–18:02 UTC 固定检出消息 ID 修复前的 `090d94662797492cda8dd29acc7f925ec39c4c43`：两个仓库 Secret 预检、SDK 安装、构建、认证与 QQ WebSocket ready 均成功，180 秒后 SIGINT 收尾，进程退出码 0。报告如下：
+首次[QQ 沙箱运行](https://github.com/ZenthXSin/Eve.aic/actions/runs/36903380200) 于 2026-10-01 17:59–18:02 UTC 检出消息 ID 修复前的 `090d94662797492cda8dd29acc7f925ec39c4c43`：认证与网关 ready 成功，180 秒后干净停止，但有效消息计数为零，未通过真实收发。未记录原始事件，不能据此反推用户未发消息。官方示例的 msg_id 包含 `.` 与 `!`，首版限制会误过滤；现已在 Node/Rust 分开验证 openid 和不透明消息 ID，保留原始标点及正文提及，并通过官方样例的路由、工具与恢复测试。来源为 [QQ 官方消息事件](https://github.com/tencent-connect/bot-docs/blob/645787a45937e5d9c4f0f61afefdffde0f38696e/docs/develop/api-v2/server-inter/message/send-receive/event.md)。
+
+2026-10-02 的[真实 QQ 沙箱复验](https://github.com/ZenthXSin/Eve.aic/actions/runs/36949675220) 已通过。工作流固定检出 `1ab038ea2d155aef0309fd8a68c2de872f2e71e1`，该版本的[完整 CI](https://github.com/ZenthXSin/Eve.aic/actions/runs/36906219142) 与[通道离线验收](https://github.com/ZenthXSin/Eve.aic/actions/runs/36906219129) 均成功。实际窗口为 UTC 01:11:36–01:21:37，持续 600 秒；采用沙箱、内置 AppID 和 deepseek-v4.1-flash / Chat / none，结束时 SIGINT 收尾，进程退出码 0。安全报告：
 
 ```json
-{"process_ok":true,"interaction_ok":false,"ready":true,"closed":true,"terminal_error":false,"received":0,"completed":0,"sent":0,"failed":0}
+{"process_ok":true,"interaction_ok":true,"ready":true,"closed":true,"terminal_error":false,"received":10,"completed":10,"sent":10,"failed":0}
 ```
 
-本次窗口没有消息进入 Eve 的有效处理计数，工作流按真实交互条件返回失败；未记录 QQ 原始事件，不能据此反推平台没有推送。QQ 认证/连接与干净停止已验证，真实接收、模型处理和 QQ 回复仍未验收。最后协议核对发现官方示例的 msg_id 包含 `.` 与 `!`，首版字符限制会误过滤。现已在 Node 与 Rust 分开验证 openid 与不透明消息 ID，保留消息 ID 的原始标点，并补充官方样例的 Node 路由与真实 Eve 工具/恢复测试。来源为 [QQ 官方消息事件](https://github.com/tencent-connect/bot-docs/blob/645787a45937e5d9c4f0f61afefdffde0f38696e/docs/develop/api-v2/server-inter/message/send-receive/event.md)。正文中的提及也保留，不全局删除。该修复需要重新验收真实收发；不能把修复前的零计数解释为用户未发消息。测试用户/群需在沙箱范围内，并在新窗口期间发消息后复验。临时 PR 自动触发已移除，后续仅 main 手动运行；源码和报告不含密钥、QQ ID 或正文。
+10 条有效消息均完成模型处理并由 QQ SDK 确认发送成功，失败计数为 0；用户在窗口内也确认交互正常。此结果证明本次 QQ 文本接收、模型完成、原路回复与干净停止；安全计数不区分 C2C/群，也不记录正文，不能推断每种通道均已实测，或本次执行过多少工具调用。工具、路由、去重与恢复证据仍见独立离线及主模型验收。
+
+本次只使用 GitHub 托管 Runner，没有部署测试服务器。仅上传无正文计数报告，原始诊断、会话和回执未上传。一次性 PR 触发已移除，工作流恢复为仅 main 的手动入口；需要长期在线或保留本次 Runner 状态，应另行使用持久宿主。
 
 媒体、QQ 频道、webhook、主动消息、消息修订/并行调度和凭据库接线后置；首版只做已验证的文本闭环。
