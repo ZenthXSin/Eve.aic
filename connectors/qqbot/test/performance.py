@@ -60,6 +60,7 @@ class LocalProvider:
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+            disable_nagle_algorithm = True
 
             def log_message(self, *_):
                 pass
@@ -254,7 +255,7 @@ def main():
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
     report = {"format_version": 1, "functional_ok": False, "performance_status": "failed",
-              "provider": "loopback_chat_stub", "qq_transport": "production_bridge_with_sdk_stub",
+              "provider": "loopback_chat_stub", "provider_tcp_nodelay": True, "qq_transport": "production_bridge_with_sdk_stub",
               "build_profile": "release", "platform": platform.platform(),
               "python_version": platform.python_version(), "logical_cpus": os.cpu_count(),
               "source_sha": os.environ.get("GITHUB_SHA", "local")}
