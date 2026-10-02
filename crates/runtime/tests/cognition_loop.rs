@@ -343,6 +343,11 @@ async fn feedback_save_failure_preserves_executing_and_restart_blocks_without_re
     .await
     .unwrap();
     assert!(controller.shutdown().await.is_err());
+    let stats = controller.stats().unwrap();
+    assert_eq!(
+        (stats.model_requests, stats.admitted_tool_calls, stats.started_tools),
+        (2, 1, 1)
+    );
     assert_eq!(
         rig.admin.snapshot().unwrap().state.goals["target"].status,
         GoalStatus::Executing
@@ -509,4 +514,49 @@ async fn control_requests_without_host_budget_binding_cannot_start_a_session() {
             .is_none()
     );
     rig.close().await;
+}
+
+#[tokio::test]
+async fn executing_marker_save_failure_has_zero_submit_and_keeps_ready_bytes() {
+    let store = Arc::new(FaultStore::default());
+    let model = Model::new(1);
+    let rig = Rig::open(store.clone(), model.clone(), None).await;
+    rig.seed(vec![goal("target")]);
+    let original = store
+        .get(&id(COGNITION_PLUGIN_ID), COGNITION_STATE_KEY)
+        .unwrap()
+        .unwrap();
+    store.fail_cognition.store(true, Ordering::SeqCst);
+    let controller = rig.start_loop(options()).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while controller.stats().unwrap().evaluations == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let error = controller.shutdown().await.unwrap_err();
+    assert!(!error.to_string().contains("backend-secret"));
+    let stats = controller.stats().unwrap();
+    assert_eq!(
+        (stats.submitted, stats.model_requests, stats.started_tools),
+        (0, 0, 0)
+    );
+    assert_eq!(model.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.probe.started.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        rig.admin.snapshot().unwrap().state.goals["target"].status,
+        GoalStatus::Ready
+    );
+    assert_eq!(
+        store
+            .get(&id(COGNITION_PLUGIN_ID), COGNITION_STATE_KEY)
+            .unwrap(),
+        Some(original)
+    );
+    store.fail_cognition.store(false, Ordering::SeqCst);
+    assert!(rig.kernel.stop_all().await.is_err());
+    for owner in [LOOP_PLUGIN_ID, eve_control_api::CONTROL_PLUGIN_ID] {
+        rig.kernel.unregister(&id(owner)).unwrap();
+    }
 }

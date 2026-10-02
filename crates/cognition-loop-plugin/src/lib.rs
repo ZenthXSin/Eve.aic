@@ -480,6 +480,20 @@ impl Worker {
         let turn_id = report
             .as_ref()
             .and_then(|report| report.control.run.turn_id);
+        // 执行已确认的计数独立于反馈提交；保存失败也不能伪装成零副作用。
+        if let Some(report) = &report {
+            self.running.update(|stats| {
+                stats.model_requests = stats
+                    .model_requests
+                    .saturating_add(report.usage.model_requests);
+                stats.admitted_tool_calls = stats
+                    .admitted_tool_calls
+                    .saturating_add(report.usage.admitted_tool_calls);
+                stats.started_tools = stats
+                    .started_tools
+                    .saturating_add(report.control.run.started_tools.unwrap_or(0));
+            });
+        }
         let saved = self.save_feedback(goal, attempt, status.clone(), reason, feedback, turn_id);
         let snapshot = match saved {
             Ok(snapshot) => snapshot,
@@ -514,17 +528,6 @@ impl Worker {
                 GoalStatus::Cancelled => stats.cancelled = stats.cancelled.saturating_add(1),
                 GoalStatus::Blocked => stats.blocked = stats.blocked.saturating_add(1),
                 _ => {}
-            }
-            if let Some(report) = &report {
-                stats.model_requests = stats
-                    .model_requests
-                    .saturating_add(report.usage.model_requests);
-                stats.admitted_tool_calls = stats
-                    .admitted_tool_calls
-                    .saturating_add(report.usage.admitted_tool_calls);
-                stats.started_tools = stats
-                    .started_tools
-                    .saturating_add(report.control.run.started_tools.unwrap_or(0));
             }
         });
         // 通知只有无正文的全局修订，不能据此读取私有目标；不订阅此事件作唤醒。
