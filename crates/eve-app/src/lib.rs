@@ -14,8 +14,8 @@ pub use qqbot::{QQBOT_HELP, QqBotOptions, run_qqbot};
 
 use eve_agent_prompt::FileAgentPrompt;
 use eve_config_api::{
-    CONFIG_SERVICE_ID, ConfigServiceHandle, LLM_NAMESPACE, LlmRuntimeConfig,
-    model_roles_schema, runtime_llm_schema,
+    CONFIG_SERVICE_ID, ConfigServiceHandle, LLM_NAMESPACE, LlmRuntimeConfig, model_roles_schema,
+    runtime_llm_schema,
 };
 use eve_config_plugin::{ConfigBootstrap, ConfigPlugin};
 use eve_control_api::{CONTROL_PLUGIN_ID, CONTROL_SERVICE_ID, ControlServiceHandle};
@@ -195,9 +195,21 @@ pub(crate) async fn install_core(
 ) -> Result<Arc<dyn eve_control_api::ControlService>, AppError> {
     let config_plugin = ConfigPlugin::new(ConfigBootstrap::new(
         state_directory.join("configuration"),
-        vec![runtime_llm_schema(), config::openai_schema(), model_roles_schema()],
+        vec![
+            runtime_llm_schema(),
+            config::openai_schema(),
+            model_roles_schema(),
+        ],
     ))?;
-    install_core_with_config(kernel, registry, permissions, logger, bootstrap, config_plugin).await
+    install_core_with_config(
+        kernel,
+        registry,
+        permissions,
+        logger,
+        bootstrap,
+        config_plugin,
+    )
+    .await
 }
 
 async fn install_core_with_config(
@@ -208,7 +220,10 @@ async fn install_core_with_config(
     bootstrap: CoreBootstrap,
     config_plugin: ConfigPlugin,
 ) -> Result<Arc<dyn eve_control_api::ControlService>, AppError> {
-    let CoreBootstrap { host_config, api_key } = bootstrap;
+    let CoreBootstrap {
+        host_config,
+        api_key,
+    } = bootstrap;
     kernel.register(Box::new(config_plugin))?;
     kernel.register(Box::new(SessionPlugin::new()?))?;
     kernel.register(Box::new(services::CoreServices::new()?))?;
@@ -252,7 +267,8 @@ async fn install_core_with_config(
             response_mode: ResponseMode::Complete,
             ..host_config
         },
-    )?.with_model_resolver(resolver);
+    )?
+    .with_model_resolver(resolver);
     let host = Arc::new(SessionLlmHost::new(host, SessionBinding::builtin()).with_logger(logger));
     kernel.register(Box::new(ControlPlugin::new(
         Arc::new(SessionControlRunner::new(host)),

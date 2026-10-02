@@ -5,10 +5,10 @@
 use eve_kernel::{Kernel, RuntimeAdmissionGuard};
 use eve_llm_api::{
     ChatMessage, ChatRole, ContextAssembler, ContextService, ContextSnapshot, LlmError, LlmFuture,
-    LlmModelResolver, LlmProvider, ModelRequest, ModelResponse, ModelTextSink, ResponseMode, SystemPromptMetadata,
-    SystemPromptSnapshot, SystemPromptSource, Tool, ToolBinding, ToolCall, ToolCancellation,
-    ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolFailureCode, ToolResult,
-    ToolService, TurnEvent, TurnEventKind, TurnEventSink, TurnInput,
+    LlmModelResolver, LlmProvider, ModelRequest, ModelResponse, ModelTextSink, ResponseMode,
+    SystemPromptMetadata, SystemPromptSnapshot, SystemPromptSource, Tool, ToolBinding, ToolCall,
+    ToolCancellation, ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolFailureCode,
+    ToolResult, ToolService, TurnEvent, TurnEventKind, TurnEventSink, TurnInput,
 };
 use eve_plugin_api::{
     Permission, PermissionChecker, PluginError, PluginId, PluginManifest, PluginState,
@@ -505,7 +505,10 @@ impl LlmHost {
         let admission = Arc::new(self.kernel.acquire_runtime_admission().await);
         let events = self.event_delivery(sink, None);
         let result = match self.for_turn() {
-            Ok(host) => host.run_turn_inner(input, None, admission.clone(), Some(&events)).await,
+            Ok(host) => {
+                host.run_turn_inner(input, None, admission.clone(), Some(&events))
+                    .await
+            }
             Err(error) => Err(fail(error, TurnDiagnostics::default())),
         };
         if let Err(failure) = &result {
