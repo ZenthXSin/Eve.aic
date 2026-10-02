@@ -602,7 +602,8 @@ impl LlmHost {
             unreachable!()
         };
         if let Some(budget) = &self.execution_budget {
-            budget.reserve_tool_batch(calls.len())
+            budget
+                .reserve_tool_batch(calls.len())
                 .map_err(|error| fail(error, diagnostics.clone()))?;
         }
         diagnostics.stage = TurnStage::Tools;

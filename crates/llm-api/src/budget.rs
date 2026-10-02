@@ -1,6 +1,9 @@
 //! 每次受管执行独立创建的预算；先预留额度，再发起模型请求或工具批次。
 use crate::LlmError;
-use std::{sync::Mutex, time::{Duration, Instant}};
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionLimits {
@@ -36,7 +39,9 @@ impl TurnBudget {
         })
     }
     pub fn usage(&self) -> Result<BudgetUsage, LlmError> {
-        self.usage.lock().map(|usage| *usage)
+        self.usage
+            .lock()
+            .map(|usage| *usage)
             .map_err(|_| LlmError::Backend("执行预算锁不可用".into()))
     }
     fn check_deadline(&self) -> Result<(), LlmError> {
@@ -48,7 +53,9 @@ impl TurnBudget {
     }
     pub fn reserve_model_request(&self) -> Result<(), LlmError> {
         self.check_deadline()?;
-        let mut usage = self.usage.lock()
+        let mut usage = self
+            .usage
+            .lock()
             .map_err(|_| LlmError::Backend("执行预算锁不可用".into()))?;
         if usage.model_requests >= u64::from(self.limits.max_model_requests) {
             return Err(LlmError::Configuration("模型请求预算已耗尽".into()));
@@ -59,11 +66,15 @@ impl TurnBudget {
     /// 整批准入；同时保留至少一个模型请求额度，用于回传工具结果。
     pub fn reserve_tool_batch(&self, calls: usize) -> Result<(), LlmError> {
         self.check_deadline()?;
-        let mut usage = self.usage.lock()
+        let mut usage = self
+            .usage
+            .lock()
             .map_err(|_| LlmError::Backend("执行预算锁不可用".into()))?;
-        let calls = u64::try_from(calls)
-            .map_err(|_| LlmError::Configuration("工具批次超过预算".into()))?;
-        let next = usage.admitted_tool_calls.checked_add(calls)
+        let calls =
+            u64::try_from(calls).map_err(|_| LlmError::Configuration("工具批次超过预算".into()))?;
+        let next = usage
+            .admitted_tool_calls
+            .checked_add(calls)
             .ok_or_else(|| LlmError::Configuration("工具调用计数溢出".into()))?;
         if next > u64::from(self.limits.max_tool_calls)
             || usage.model_requests >= u64::from(self.limits.max_model_requests)
