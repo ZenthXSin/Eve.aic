@@ -206,7 +206,7 @@ impl Goal {
                 }
             }
             GoalStatus::Completed => {
-                if !self.execution.as_ref().is_some_and(|e| e.turn_id.is_some())
+                if self.execution.as_ref().is_none_or(|e| e.turn_id.is_none())
                     || !self.feedback.as_ref().is_some_and(|f| {
                         f.commit == ExecutionCommit::Completed && f.verification_met
                     })
