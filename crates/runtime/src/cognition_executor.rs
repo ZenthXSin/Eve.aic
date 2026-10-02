@@ -8,6 +8,7 @@ use eve_session_api::{SessionInput, SessionKey};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone)]
@@ -76,7 +77,27 @@ impl ControlGoalExecutor {
 }
 impl GoalExecutor for ControlGoalExecutor {
     fn submit(&self, goal: &Goal, attempt: &ExecutionAttempt) -> LoopResult<GenerationKey> {
+        let started = Instant::now();
+        let epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| LoopError::Unavailable)?;
+        let remaining = Duration::from_millis(goal.budget.timeout_ms)
+            .saturating_sub(epoch.saturating_sub(Duration::from_millis(attempt.started_at_ms)));
+        let remaining = goal.expires_at_ms.map_or(remaining, |expires| {
+            remaining.min(Duration::from_millis(expires).saturating_sub(epoch))
+        });
+        self.submit_before(goal, attempt, started + remaining)
+    }
+    fn submit_before(
+        &self,
+        goal: &Goal,
+        attempt: &ExecutionAttempt,
+        deadline: Instant,
+    ) -> LoopResult<GenerationKey> {
         goal.budget.validate()?;
+        if Instant::now() >= deadline {
+            return Err(LoopError::LimitReached);
+        }
         let user = match &goal.visibility {
             Visibility::User(user) => user.as_str(),
             _ => &self.internal_user,
@@ -84,11 +105,14 @@ impl GoalExecutor for ControlGoalExecutor {
         let key =
             SessionKey::new(&attempt.session_id, user).map_err(|_| LoopError::InvalidInput)?;
         let budget = Arc::new(
-            TurnBudget::new(ExecutionLimits {
-                max_model_requests: goal.budget.max_model_requests,
-                max_tool_calls: goal.budget.max_tool_calls,
-                timeout_ms: goal.budget.timeout_ms,
-            })
+            TurnBudget::with_deadline(
+                ExecutionLimits {
+                    max_model_requests: goal.budget.max_model_requests,
+                    max_tool_calls: goal.budget.max_tool_calls,
+                    timeout_ms: goal.budget.timeout_ms,
+                },
+                deadline,
+            )
             .map_err(|_| LoopError::InvalidInput)?,
         );
         {
@@ -98,6 +122,9 @@ impl GoalExecutor for ControlGoalExecutor {
                 .lock()
                 .map_err(|_| LoopError::Unavailable)?;
             if bindings.len() >= MAX_RECORDS || bindings.contains_key(&key.session_id) {
+                return Err(LoopError::LimitReached);
+            }
+            if Instant::now() >= deadline {
                 return Err(LoopError::LimitReached);
             }
             bindings.insert(

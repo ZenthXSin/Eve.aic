@@ -208,7 +208,11 @@ impl Worker {
             if snapshot.subject_id != self.options.scope.subject_id {
                 return Err(CognitionError::SubjectMismatch.into());
             }
-            let time = now_ms()?;
+            let budget_started = Instant::now();
+            let epoch = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| LoopError::Unavailable)?;
+            let time = u64::try_from(epoch.as_millis()).map_err(|_| LoopError::LimitReached)?;
             let submitted = self
                 .running
                 .stats
@@ -263,7 +267,11 @@ impl Worker {
             state
                 .drives
                 .retain(|id, _| !id.starts_with("eve.loop.drive."));
-            for (index, item) in ranked.iter().enumerate() {
+            let drive_capacity = MAX_RECORDS.saturating_sub(state.drives.len());
+            if ranked.len() > drive_capacity {
+                self.warn("驱动记录容量不足；保留宿主驱动，按议程推进最高优先级目标");
+            }
+            for (index, item) in ranked.iter().take(drive_capacity).enumerate() {
                 let id = format!("eve.loop.drive.{index}");
                 state.drives.insert(
                     id.clone(),
@@ -292,6 +300,11 @@ impl Worker {
                 started_at_ms: time,
             };
             let mut goal = state.goals[selected].clone();
+            let timeout = Duration::from_millis(goal.budget.timeout_ms);
+            let remaining = goal.expires_at_ms.map_or(timeout, |expires| {
+                timeout.min(Duration::from_millis(expires).saturating_sub(epoch))
+            });
+            let deadline = budget_started + remaining;
             goal.status = GoalStatus::Executing;
             goal.execution = Some(attempt.clone());
             state.goals.insert(selected.clone(), goal.clone());
@@ -316,7 +329,9 @@ impl Worker {
                 }
                 Err(error) => return Err(error.into()),
             }
-            let result = self.execute(&goal, &attempt, cancellation, evaluated).await;
+            let result = self
+                .execute(&goal, &attempt, cancellation, evaluated, deadline)
+                .await;
             self.running.update(|stats| stats.active = false);
             result?;
         }
@@ -327,11 +342,15 @@ impl Worker {
         attempt: &ExecutionAttempt,
         cancellation: u64,
         evaluated: Instant,
+        deadline: Instant,
     ) -> LoopResult<()> {
-        if *self.running.stop.borrow() || *self.running.cancel.borrow() != cancellation {
+        if *self.running.stop.borrow()
+            || *self.running.cancel.borrow() != cancellation
+            || Instant::now() >= deadline
+        {
             return self.finish(goal, attempt, None, true, true).await;
         }
-        let key = match self.executor.submit(goal, attempt) {
+        let key = match self.executor.submit_before(goal, attempt, deadline) {
             Ok(key) => key,
             Err(_) => return self.finish(goal, attempt, None, false, false).await,
         };
@@ -354,15 +373,6 @@ impl Worker {
                 }
             }
         };
-        let elapsed_ms = now_ms()?.saturating_sub(attempt.started_at_ms);
-        let remaining = goal
-            .expires_at_ms
-            .map_or(goal.budget.timeout_ms, |expires| {
-                expires
-                    .saturating_sub(attempt.started_at_ms)
-                    .min(goal.budget.timeout_ms)
-            })
-            .saturating_sub(elapsed_ms);
         let (report, cancelled) = tokio::select! {
             biased;
             report = &mut wait => (report, false),
@@ -375,7 +385,7 @@ impl Worker {
                 if cancel_result.is_err() { self.warn("取消准入未确认；以实际收尾报告为准"); }
                 (report, true)
             },
-            _ = tokio::time::sleep(Duration::from_millis(remaining)) => {
+            _ = tokio::time::sleep_until(deadline.into()) => {
                 let started = Instant::now();
                 let cancel_result = self.executor.cancel(&key);
                 let report = wait.await;

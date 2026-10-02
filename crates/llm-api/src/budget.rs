@@ -26,6 +26,13 @@ pub struct TurnBudget {
 }
 impl TurnBudget {
     pub fn new(limits: ExecutionLimits) -> Result<Self, LlmError> {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(limits.timeout_ms))
+            .ok_or_else(|| LlmError::Configuration("执行预算无效".into()))?;
+        Self::with_deadline(limits, deadline)
+    }
+    /// 沿用宿主先前确定的期限；绑定和排队不会重新授予执行时间。
+    pub fn with_deadline(limits: ExecutionLimits, deadline: Instant) -> Result<Self, LlmError> {
         if !(1..=100).contains(&limits.max_model_requests)
             || limits.max_tool_calls > 1000
             || !(1..=600_000).contains(&limits.timeout_ms)
@@ -34,7 +41,7 @@ impl TurnBudget {
         }
         Ok(Self {
             limits,
-            deadline: Instant::now() + Duration::from_millis(limits.timeout_ms),
+            deadline: deadline.min(Instant::now() + Duration::from_millis(limits.timeout_ms)),
             usage: Mutex::new(BudgetUsage::default()),
         })
     }
