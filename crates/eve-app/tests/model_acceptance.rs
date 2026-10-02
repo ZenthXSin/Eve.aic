@@ -13,6 +13,7 @@ fn command(url: &str) -> Command {
     for name in [
         "EVE_OPENAI_API_KEY",
         "EVE_OPENAI_MODEL",
+        "EVE_OPENAI_PROTOCOL",
         "EVE_OPENAI_BASE_URL",
         "EVE_OPENAI_REASONING_EFFORT",
         "EVE_OPENAI_TIMEOUT_SECONDS",
@@ -24,6 +25,7 @@ fn command(url: &str) -> Command {
     }
     c.env("EVE_OPENAI_API_KEY", "fixture-secret")
         .env("EVE_OPENAI_MODEL", "fixture-model")
+        .env("EVE_OPENAI_PROTOCOL", "responses")
         .env("EVE_OPENAI_BASE_URL", url)
         .env("EVE_OPENAI_REASONING_EFFORT", "none")
         .env("EVE_OPENAI_TIMEOUT_SECONDS", "2");
@@ -302,4 +304,154 @@ async fn existing_directory_is_untouched_and_never_launches_eve() {
     );
     assert!(!root.path().join("check/state").exists());
     assert!(server.requests.try_recv().is_err());
+}
+
+fn chat_user_texts(request: &Value) -> Vec<&str> {
+    request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .map(|m| m["content"].as_str().unwrap())
+        .collect()
+}
+#[tokio::test]
+async fn chat_defaults_complete_tool_round_trip_and_restore_in_a_new_process() {
+    let root = fixture();
+    let chat_final = || {
+        Reply::json(json!({"choices":[{"index":0,"finish_reason":"stop",
+            "message":{"role":"assistant","content":MARKER}}]}))
+    };
+    let mut server = Server::start(vec![
+        Reply::json(json!({"choices":[{"index":0,"finish_reason":"tool_calls",
+        "message":{"role":"assistant","content":null,"tool_calls":[
+            {"id":"check-echo","type":"function","function":{"name":"echo",
+                "arguments":json!({"text":MARKER}).to_string()}}
+        ]}}]})),
+        chat_final(),
+        chat_final(),
+        chat_final(),
+    ])
+    .await;
+    let options = CheckOptions {
+        directory: root.path().join("check"),
+        agent_path: root.path().join("AGENT.md"),
+        request_timeout: Duration::from_secs(2),
+    };
+    let url = server.url.replace("/responses", "/chat/completions");
+    let checked = tokio::task::spawn_blocking(move || {
+        model_check::run(&options, MARKER, || {
+            let mut c = command(&url);
+            // 验证核心默认模型和协议，空参数在 Chat 下显式使用 none。
+            c.env_remove("EVE_OPENAI_MODEL")
+                .env_remove("EVE_OPENAI_PROTOCOL")
+                .env_remove("EVE_OPENAI_REASONING_EFFORT");
+            c
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(checked["status"], "passed");
+    assert_eq!(checked["completed_turns"], 3);
+    assert_eq!(checked["first_process_tool_calls"], 1);
+    assert_eq!(checked["restart_tool_calls"], 0);
+    assert_eq!(checked["revision_before"], 4);
+    assert_eq!(checked["revision_after"], 6);
+    assert_eq!(checked["history_prefix_unchanged"], true);
+    let initial = server.next().await;
+    assert!(
+        initial
+            .headers
+            .starts_with("POST /v1/chat/completions HTTP/1.1")
+    );
+    let first = initial.body;
+    assert_eq!(first["model"], "deepseek-v4.1-flash");
+    assert_eq!(first["tools"][0]["function"]["name"], "echo");
+    assert!(first.get("input").is_none());
+    assert_eq!(first["reasoning_effort"], "none");
+    assert_eq!(first["max_tokens"], 2048);
+    assert!(chat_user_texts(&first)[0].contains(MARKER));
+    let returned = server.next().await.body;
+    let output = returned["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap();
+    assert_eq!(output["tool_call_id"], "check-echo");
+    assert_eq!(
+        serde_json::from_str::<Value>(output["content"].as_str().unwrap()).unwrap(),
+        json!({"echo":MARKER})
+    );
+    let second = server.next().await.body;
+    let third = server.next().await.body;
+    for (request, count) in [(&second, 2), (&third, 3)] {
+        let users = chat_user_texts(request);
+        assert_eq!(users.len(), count);
+        assert!(users[1..].iter().all(|text| !text.contains(MARKER)));
+        assert_eq!(request["messages"][0], first["messages"][0]);
+        assert_eq!(
+            request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["role"] == "tool")
+                .count(),
+            1
+        );
+        assert_eq!(request["model"], "deepseek-v4.1-flash");
+    }
+    assert!(server.requests.try_recv().is_err());
+}
+#[tokio::test]
+async fn chat_incomplete_reply_never_executes_partial_tool_batch() {
+    let root = fixture();
+    let mut server = Server::start(vec![
+        Reply::json(json!({"choices":[{"index":0,"finish_reason":"length",
+        "message":{"role":"assistant","content":null,"tool_calls":[
+            {"id":"check-echo","type":"function","function":{"name":"echo",
+                "arguments":json!({"text":MARKER}).to_string()}}
+        ]}}]})),
+        Reply::json(json!({"choices":[{"index":0,"finish_reason":"stop",
+            "message":{"role":"assistant","content":"后续输入"}}]})),
+    ])
+    .await;
+    let options = CheckOptions {
+        directory: root.path().join("check"),
+        agent_path: root.path().join("AGENT.md"),
+        request_timeout: Duration::from_secs(2),
+    };
+    let url = server.url.replace("/responses", "/chat/completions");
+    let error = tokio::task::spawn_blocking(move || {
+        model_check::run(&options, MARKER, || {
+            let mut c = command(&url);
+            c.env("EVE_OPENAI_PROTOCOL", "chat")
+                .env_remove("EVE_OPENAI_REASONING_EFFORT");
+            c
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.stage, "first_process");
+    assert_eq!(error.code, "child_failed");
+    server.next().await;
+    let next = server.next().await.body;
+    assert_eq!(
+        next["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .count(),
+        0
+    );
+    assert!(server.requests.try_recv().is_err());
+    let state = sessions(root.path());
+    assert_eq!(
+        state["sessions"]["default"]["turns"][0]["status"]["failure"]["started_tools"],
+        0
+    );
+    assert!(!root.path().join("check/restart.stdout").exists());
 }

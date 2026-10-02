@@ -4,14 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       model:
-        description: 支持当前 Responses 子集的主模型
+        description: 支持所选 Chat/Responses 子集的主模型
         required: true
-        default: gpt-5.6-sol
+        default: deepseek-v4.1-flash
         type: string
+      protocol:
+        description: 模型 API 协议
+        required: true
+        default: chat
+        type: choice
+        options: [chat, responses]
       reasoning_effort:
         description: 可选参数，模型不支持时留空
         required: false
-        default: none
+        default: ""
         type: string
 
 permissions:
@@ -50,6 +56,7 @@ jobs:
         env:
           EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
           EVE_OPENAI_MODEL: ${{ inputs.model }}
+          EVE_OPENAI_PROTOCOL: ${{ inputs.protocol }}
           EVE_OPENAI_REASONING_EFFORT: ${{ inputs.reasoning_effort }}
           EVE_OPENAI_TIMEOUT_SECONDS: "120"
           EVE_OPENAI_MAX_OUTPUT_TOKENS: "512"

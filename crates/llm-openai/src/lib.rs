@@ -1,19 +1,29 @@
-//! OpenAI Responses 的文本与函数调用适配器；厂商格式不进入通用协议或 Kernel。
+//! OpenAI 兼容 Responses/Chat Completions 适配器；厂商格式不进入通用协议或 Kernel。
 //!
 //! 网络和转换均在返回的 Future 中执行。取消等待会丢弃本地请求，不保证远端停止。
 use eve_llm_api::{LlmError, LlmFuture, LlmProvider, ModelRequest, ModelResponse, ModelTextSink};
 use reqwest::{Client, Url, header::HeaderValue, redirect::Policy};
 use std::time::Duration;
 
+mod chat;
 mod stream;
 mod strict_json;
 mod wire;
+
+/// 显式选择线协议；不根据模型名猜测，也不在失败时切换协议。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OpenAiProtocol {
+    #[default]
+    Responses,
+    ChatCompletions,
+}
 
 /// 普通配置。凭据独立交给构造函数，不进入此对象、消息或诊断。
 #[derive(Clone, Debug)]
 pub struct OpenAiConfig {
     pub model: String,
-    /// 完整 Responses URL；默认官方 HTTPS，允许宿主显式指定 HTTPS 或 loopback HTTP。
+    pub protocol: OpenAiProtocol,
+    /// 完整所选协议端点；保留历史字段名，Chat 模式使用 chat/completions URL。
     pub responses_url: String,
     /// 独立传输期限；LlmHost 的期限仍可更早终止等待。
     pub request_timeout: Duration,
@@ -27,6 +37,7 @@ impl OpenAiConfig {
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
+            protocol: OpenAiProtocol::Responses,
             responses_url: "https://api.openai.com/v1/responses".into(),
             request_timeout: Duration::from_secs(60),
             max_response_bytes: 8 * 1024 * 1024,
@@ -35,17 +46,31 @@ impl OpenAiConfig {
         }
     }
 
-    /// 宿主可提供 API 根地址、版本路径或完整 Responses URL。
+    pub fn chat(model: impl Into<String>) -> Self {
+        Self {
+            protocol: OpenAiProtocol::ChatCompletions,
+            responses_url: "https://api.openai.com/v1/chat/completions".into(),
+            ..Self::new(model)
+        }
+    }
+
+    /// 宿主可提供 API 根地址、版本路径或完整所选协议 URL。
     pub fn with_base_url(mut self, base: &str) -> Result<Self, LlmError> {
-        let mut url = Url::parse(base)
-            .map_err(|_| LlmError::Configuration("Responses base URL 无效".into()))?;
+        let mut url =
+            Url::parse(base).map_err(|_| LlmError::Configuration("OpenAI base URL 无效".into()))?;
+        let (suffix, other) = match self.protocol {
+            OpenAiProtocol::Responses => ("/responses", "/chat/completions"),
+            OpenAiProtocol::ChatCompletions => ("/chat/completions", "/responses"),
+        };
         let path = url.path().trim_end_matches('/');
         let path = if path.is_empty() {
-            "/v1/responses".into()
-        } else if path.ends_with("/responses") {
+            format!("/v1{suffix}")
+        } else if path.ends_with(suffix) {
             path.to_owned()
+        } else if path.ends_with(other) {
+            return Err(LlmError::Configuration("API 协议与完整端点不匹配".into()));
         } else {
-            format!("{path}/responses")
+            format!("{path}{suffix}")
         };
         url.set_path(&path);
         self.responses_url = url.to_string();
@@ -83,7 +108,7 @@ impl OpenAiProvider {
             ));
         }
         let endpoint = Url::parse(&config.responses_url)
-            .map_err(|_| LlmError::Configuration("Responses URL 无效".into()))?;
+            .map_err(|_| LlmError::Configuration("OpenAI URL 无效".into()))?;
         let loopback = endpoint.host_str().is_some_and(|host| {
             host == "localhost"
                 || host
@@ -99,7 +124,7 @@ impl OpenAiProvider {
             || endpoint.fragment().is_some()
         {
             return Err(LlmError::Configuration(
-                "Responses URL 必须是无用户信息、查询或片段的 HTTPS，或 loopback HTTP".into(),
+                "OpenAI URL 必须是无用户信息、查询或片段的 HTTPS，或 loopback HTTP".into(),
             ));
         }
         let key = api_key.as_ref();
@@ -133,13 +158,32 @@ impl OpenAiProvider {
         request: ModelRequest,
         sink: Option<&dyn ModelTextSink>,
     ) -> Result<ModelResponse, LlmError> {
-        let mut body = wire::encode_request(&self.config.model, request)?;
+        if sink.is_some() && self.config.protocol == OpenAiProtocol::ChatCompletions {
+            return Err(LlmError::Unsupported(
+                "Chat Completions 流式尚未接入".into(),
+            ));
+        }
+        let mut body = match self.config.protocol {
+            OpenAiProtocol::Responses => wire::encode_request(&self.config.model, request)?,
+            OpenAiProtocol::ChatCompletions => chat::encode_request(&self.config.model, request)?,
+        };
         body["stream"] = serde_json::json!(sink.is_some());
         if let Some(effort) = &self.config.reasoning_effort {
-            body["reasoning"] = serde_json::json!({"effort": effort});
+            match self.config.protocol {
+                OpenAiProtocol::Responses => {
+                    body["reasoning"] = serde_json::json!({"effort": effort});
+                }
+                OpenAiProtocol::ChatCompletions => {
+                    body["reasoning_effort"] = serde_json::json!(effort);
+                }
+            }
         }
         if let Some(limit) = self.config.max_output_tokens {
-            body["max_output_tokens"] = serde_json::json!(limit);
+            let field = match self.config.protocol {
+                OpenAiProtocol::Responses => "max_output_tokens",
+                OpenAiProtocol::ChatCompletions => "max_tokens",
+            };
+            body[field] = serde_json::json!(limit);
         }
         let mut response = self
             .client
@@ -208,7 +252,10 @@ impl OpenAiProvider {
             }
             bytes.extend_from_slice(&chunk);
         }
-        wire::decode_response(&bytes)
+        match self.config.protocol {
+            OpenAiProtocol::Responses => wire::decode_response(&bytes),
+            OpenAiProtocol::ChatCompletions => chat::decode_response(&bytes),
+        }
     }
 }
 
