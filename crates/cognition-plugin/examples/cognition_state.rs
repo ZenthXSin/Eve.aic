@@ -79,7 +79,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         state
             .goals
             .insert("uncertain".into(), goal("uncertain", Visibility::Internal));
+        state.goals.get_mut("ready").unwrap().source.channel = "terminal".into();
+        state.goals.get_mut("ready").unwrap().source.kind = SourceKind::User;
         let mut waiting = goal("waiting", Visibility::User("fixture-user".into()));
+        waiting.source.channel = "qq".into();
+        waiting.source.kind = SourceKind::User;
         waiting.status = GoalStatus::Waiting;
         waiting.wait_reason = Some("等待用户补充".into());
         state.goals.insert("waiting".into(), waiting);

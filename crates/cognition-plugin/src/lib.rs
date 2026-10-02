@@ -45,6 +45,9 @@ impl StoredCognition {
                 doc.state
                     .validate()
                     .map_err(|_| CognitionError::CorruptState)?;
+                if doc.revision == 0 && doc.state != CognitiveState::default() {
+                    return Err(CognitionError::CorruptState);
+                }
                 if doc
                     .state
                     .goals

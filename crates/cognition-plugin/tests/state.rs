@@ -123,6 +123,7 @@ async fn views_bind_identity_and_filter_goals_and_derived_data() {
     state
         .goals
         .insert("internal".into(), goal("internal", Visibility::Internal));
+    state.goals.get_mut("public").unwrap().source.channel = "terminal".into();
     state.drives.insert(
         "private-drive".into(),
         Drive {
@@ -164,6 +165,8 @@ async fn views_bind_identity_and_filter_goals_and_derived_data() {
     assert_eq!(alice_view.state.events.len(), 1);
     assert!(alice_view.state.agenda.is_none());
     assert!(!alice_view.state.goals.contains_key("bob"));
+    assert_eq!(alice_view.state.goals["public"].source.channel, "terminal");
+    assert_eq!(alice_view.state.goals["alice"].source.channel, "qq");
     let bob_view = bob.snapshot().unwrap();
     assert!(bob_view.state.drives.is_empty() && bob_view.state.events.is_empty());
     assert_eq!(internal.snapshot().unwrap().state.goals.len(), 4);
@@ -282,8 +285,14 @@ async fn failed_commit_keeps_disk_memory_and_execution_mark() {
     assert_eq!(new_admin.snapshot(), Err(CognitionError::Unavailable));
     assert_eq!(store.get(&id(), COGNITION_STATE_KEY).unwrap(), bytes);
     store.fail.store(false, Ordering::SeqCst);
+    // Failed 不能自动重启；显式卸载并重新装配，原字节保留。
+    kernel.unregister(&id()).unwrap();
+    let plugin = CognitionPlugin::new("eve").unwrap();
+    let recovered_admin = plugin.controller();
+    kernel.register(Box::new(plugin)).unwrap();
     kernel.start_all().await.unwrap();
-    let recovered = new_admin.snapshot().unwrap();
+    assert_eq!(new_admin.snapshot(), Err(CognitionError::Unavailable));
+    let recovered = recovered_admin.snapshot().unwrap();
     assert_eq!(recovered.revision, 3);
     assert_eq!(recovered.state.goals["g"].status, GoalStatus::Blocked);
     assert_eq!(
@@ -399,6 +408,15 @@ async fn file_restart_preserves_sources_and_only_blocks_executing() {
         after.state.goals["uncertain"].execution,
         saved.state.goals["uncertain"].execution
     );
+    let mut replay = after.state.clone();
+    let goal = replay.goals.get_mut("uncertain").unwrap();
+    goal.status = GoalStatus::Ready;
+    goal.block_reason = None;
+    goal.execution = None;
+    assert_eq!(
+        recovered.replace(5, replay),
+        Err(CognitionError::InvalidTransition)
+    );
     assert!(after.state.agenda.unwrap().selected.is_none());
     assert_eq!(old_reader.snapshot(), Err(CognitionError::Unavailable));
     assert_eq!(admin.snapshot(), Err(CognitionError::Unavailable));
@@ -440,6 +458,27 @@ async fn corrupt_version_subject_and_duplicate_keys_leave_original_bytes_untouch
         *value_doc.pointer_mut(pointer).unwrap() = value;
         cases.push(serde_json::to_vec(&value_doc).unwrap());
     }
+    let mut zero = CognitiveSnapshot {
+        format_version: 1,
+        subject_id: "eve".into(),
+        revision: 0,
+        state: CognitiveState::default(),
+    };
+    zero.state.events.push(CognitiveEvent {
+        id: "uncommitted".into(),
+        kind: CognitiveEventKind::StateChanged,
+        source: Source {
+            kind: SourceKind::Internal,
+            channel: "internal".into(),
+            reference: "fixture".into(),
+        },
+        visibility: Visibility::Public,
+        goal_id: None,
+        caused_by: None,
+        at_ms: 1,
+        summary: "没有修订的事件".into(),
+    });
+    cases.push(serde_json::to_vec(&zero).unwrap());
     let mut unknown = valid.clone();
     unknown["state"]["unknown"] = json!("private-secret");
     cases.push(serde_json::to_vec(&unknown).unwrap());
