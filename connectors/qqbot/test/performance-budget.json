@@ -1,0 +1,23 @@
+{
+  "format_version": 1,
+  "node": {
+    "samples": 5,
+    "messages": 5000,
+    "warmup_messages": 500
+  },
+  "eve": {
+    "samples": 3,
+    "messages": 40,
+    "warmup_messages": 8
+  },
+  "payload_bytes": 256,
+  "budgets": {
+    "node_p95_ms": 5,
+    "node_min_messages_per_second": 5000,
+    "node_peak_rss_mib": 512,
+    "eve_p95_ms": 1000,
+    "eve_min_messages_per_second": 5,
+    "eve_peak_rss_mib": 512,
+    "eve_startup_to_first_request_ms": 5000
+  }
+}

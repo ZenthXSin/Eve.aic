@@ -1,0 +1,60 @@
+name: 自动性能测试
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "connectors/qqbot/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "AGENT.md"
+      - ".github/workflows/performance.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "connectors/qqbot/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "AGENT.md"
+      - ".github/workflows/performance.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: eve-performance-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  performance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: 安装 Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+      - name: 检查性能脚本语法
+        run: |
+          python3 -m py_compile connectors/qqbot/test/performance.py
+          node --check connectors/qqbot/test/bridge_performance.mjs
+          node --check connectors/qqbot/test/performance-bridge.mjs
+      - name: 构建 Release 版 Eve
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal
+          cargo +1.89.0 build -p eve-app --bin eve-qqbot --release --locked
+      - name: 运行通道、工具、持久化与恢复性能测试
+        run: |
+          python3 connectors/qqbot/test/performance.py \
+            --binary target/release/eve-qqbot \
+            --output "$RUNNER_TEMP/eve-performance/acceptance.json"
+      - name: 保存无正文性能报告
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: eve-performance
+          path: ${{ runner.temp }}/eve-performance/acceptance.json
+          if-no-files-found: ignore
+          retention-days: 30
