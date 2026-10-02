@@ -149,6 +149,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-cognition-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "eve-cognition-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-cognition-api",
+ "eve-kernel",
+ "eve-plugin-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "eve-config-api"
 version = "0.1.0"
 dependencies = [
