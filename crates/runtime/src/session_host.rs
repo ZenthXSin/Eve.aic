@@ -111,6 +111,7 @@ impl Drop for LeaseGuard {
     }
 }
 
+#[derive(Clone)]
 pub struct SessionLlmHost {
     host: LlmHost,
     binding: SessionBinding,
@@ -128,6 +129,12 @@ impl SessionLlmHost {
     pub fn with_logger(mut self, logger: Arc<dyn Logger>) -> Self {
         self.logger = logger;
         self
+    }
+    /// 组合层对单次执行附加预算，保留相同会话服务和工具调度对象。
+    pub fn with_execution_budget(&self, budget: Arc<eve_llm_api::TurnBudget>) -> Self {
+        let mut host = self.clone();
+        host.host = host.host.with_execution_budget(budget);
+        host
     }
     fn service(&self) -> Result<Arc<dyn SessionService>, SessionError> {
         let entry = self

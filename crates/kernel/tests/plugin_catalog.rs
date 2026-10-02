@@ -152,3 +152,53 @@ fn factory_callback_can_reenter_catalog_without_holding_catalog_lock() {
         .unwrap();
     assert!(catalog.create(&id, &version).is_ok());
 }
+
+#[test]
+fn created_plugin_manifest_panic_returns_error_and_preserves_catalog() {
+    struct PanickingPlugin;
+    impl Plugin for PanickingPlugin {
+        fn manifest(&self) -> &PluginManifest {
+            panic!("实例清单失败");
+        }
+        fn start(
+            &mut self,
+            _ctx: eve_plugin_api::PluginContext,
+        ) -> PluginFuture<'_, Option<eve_plugin_api::Cleanup>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+    struct PanickingFactory(PluginManifest);
+    impl PluginFactory for PanickingFactory {
+        fn manifest(&self) -> &PluginManifest {
+            &self.0
+        }
+        fn create(&self) -> PluginResult<Box<dyn Plugin>> {
+            Ok(Box::new(PanickingPlugin))
+        }
+    }
+    let catalog = InMemoryPluginCatalog::new();
+    let faulty = manifest("demo.panic", "1.0.0");
+    catalog
+        .register_factory(Arc::new(PanickingFactory(faulty.clone())))
+        .unwrap();
+    assert!(matches!(
+        catalog.create(&faulty.id, &faulty.version),
+        Err(PluginError::FactoryCreate(message)) if message.contains("实例清单失败")
+    ));
+    assert_eq!(
+        catalog.find(&faulty.id, &faulty.version).unwrap(),
+        Some(faulty)
+    );
+    let valid = manifest("demo.valid", "1.0.0");
+    let created = Arc::new(Mutex::new(0));
+    catalog
+        .register_factory(Arc::new(TestFactory {
+            manifest: valid.clone(),
+            created: created.clone(),
+            drift: false,
+        }))
+        .unwrap();
+    assert!(catalog.create(&valid.id, &valid.version).is_ok());
+    assert_eq!(*created.lock().unwrap(), 1);
+    assert_eq!(catalog.manifests().unwrap().len(), 2);
+}

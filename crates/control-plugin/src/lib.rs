@@ -21,6 +21,40 @@ struct Generation {
     done: watch::Sender<Option<ControlReport>>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
+// 在 spawn 前创建并由 worker 持有，即使 Future 从未被轮询也能发布中断报告。
+struct CompletionGuard(Arc<Generation>);
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.report.is_some() {
+            return;
+        }
+        let report = ControlReport {
+            key: self.0.key.clone(),
+            cancel_requested: state.cancel_requested,
+            run: RunReport {
+                turn_id: state.turn_id,
+                commit: CommitState::Unknown,
+                text: None,
+                transcript: None,
+                started_tools: None,
+                tool_results: vec![],
+                failure: Some(RunFailure::Execution(LlmError::Backend(
+                    "控制执行器已中断，执行与提交状态未知".into(),
+                ))),
+            },
+        };
+        state.phase = ControlPhase::Blocked;
+        state.events_retired = true;
+        state.report = Some(report.clone());
+        self.0.cancel.send_replace(true);
+        self.0.done.send_replace(Some(report));
+    }
+}
 struct Registry {
     active: bool,
     next: u64,
@@ -88,9 +122,17 @@ impl Controller {
                 .lock()
                 .map_err(|_| PluginError::State("控制器任务锁不可用".into()))?
                 .take();
-            if let Some(task) = task {
-                task.await
-                    .map_err(|_| PluginError::Task("控制器收尾异常".into()))?;
+            if let Some(task) = task
+                && let Err(error) = task.await
+            {
+                let recovered = error.is_cancelled()
+                    && generation
+                        .state
+                        .lock()
+                        .is_ok_and(|state| state.report.is_some());
+                if !recovered {
+                    return Err(PluginError::Task("控制器收尾异常".into()));
+                }
             }
         }
         Ok(())
@@ -181,7 +223,9 @@ impl Controller {
         });
         let runner = self.runner.clone();
         let running = generation.clone();
+        let completion = CompletionGuard(generation.clone());
         let task = runtime.spawn(async move {
+            let _completion = completion;
             let events = GenerationSink {
                 generation: running.clone(),
                 sink,

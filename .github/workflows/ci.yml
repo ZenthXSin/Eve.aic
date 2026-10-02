@@ -273,6 +273,37 @@ jobs:
           $document = [System.Text.Encoding]::UTF8.GetString([byte[]] $state.entries["eve.session"]["sessions.v1"]) | ConvertFrom-Json -AsHashtable
           $snapshot = $document.sessions["demo-session"]
           if ($document.format_version -ne 1 -or $snapshot.revision -ne 8 -or $snapshot.turns.Count -ne 4 -or $snapshot.turns[2].status.state -ne "Interrupted" -or $snapshot.turns[0].status.messages.Count -ne 4) { throw "实际磁盘会话记录不符" }
+      - name: 验证认知循环无输入推进与三个独立进程零重放
+        run: |
+          $directory = Join-Path $env:RUNNER_TEMP "eve-cognition-loop-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $reports = @()
+          foreach ($mode in @("seed", "run", "run")) {
+            $output = @(& cargo run -p eve-runtime --example cognition_loop --locked -- $directory $mode)
+            if ($LASTEXITCODE -ne 0) { throw "认知循环独立进程失败" }
+            $output | ForEach-Object { Write-Host $_ }
+            $reports += (($output -join "`n") | ConvertFrom-Json -AsHashtable)
+          }
+          if ($reports[0].revision -ne 1 -or $reports[0].status -ne "Ready" -or
+              $reports[1].restored_revision -ne 1 -or $reports[1].revision -ne 3 -or
+              $reports[1].status -ne "Completed" -or $reports[1].model_requests -ne 2 -or
+              $reports[1].tool_executions -ne 1 -or $reports[1].admitted_tool_calls -ne 1 -or
+              $reports[2].restored_revision -ne 3 -or $reports[2].revision -ne 3 -or
+              $reports[2].model_requests -ne 0 -or $reports[2].tool_executions -ne 0) {
+            throw "认知循环保存、无输入执行或零重放不符"
+          }
+          foreach ($report in $reports) {
+            if (-not $report.old_services_closed -or -not $report.directory_reopened) {
+              throw "认知循环句柄或目录锁没有关闭"
+            }
+          }
+          $disk = Get-Content -LiteralPath (Join-Path $directory "state.json") -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
+          $bytes = [byte[]]$disk.entries["eve.cognition"]["cognition.v1"]
+          $snapshot = [System.Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json -AsHashtable
+          if ($snapshot.subject_id -ne "eve" -or $snapshot.revision -ne 3 -or
+              $snapshot.state.goals.demo.status -ne "Completed" -or
+              -not $snapshot.state.goals.demo.feedback.verification_met) {
+            throw "磁盘认知反馈没有保存"
+          }
       - name: 验证两次独立进程恢复状态
         run: |
           function Assert-SavedCounter([string] $Directory, [string] $ExpectedStarts) {
