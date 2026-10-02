@@ -81,14 +81,12 @@ impl LlmProvider for Model {
             .messages
             .iter()
             .any(|message| message.role == ChatRole::Tool);
-        if final_request {
-            if let Some(fault) = &self.fault {
-                if self.fail_cognition {
-                    fault.fail_cognition.store(true, Ordering::SeqCst);
-                }
-                if self.fail_session {
-                    fault.fail_session.store(true, Ordering::SeqCst);
-                }
+        if let Some(fault) = self.fault.as_ref().filter(|_| final_request) {
+            if self.fail_cognition {
+                fault.fail_cognition.store(true, Ordering::SeqCst);
+            }
+            if self.fail_session {
+                fault.fail_session.store(true, Ordering::SeqCst);
             }
         }
         Box::pin(async move {

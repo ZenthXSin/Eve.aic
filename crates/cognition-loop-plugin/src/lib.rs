@@ -28,7 +28,7 @@ fn now_ms() -> LoopResult<u64> {
     u64::try_from(elapsed.as_millis()).map_err(|_| LoopError::LimitReached)
 }
 struct Running {
-    wake: mpsc::Sender<WakeReason>,
+    wake: mpsc::Sender<(WakeReason, Instant)>,
     stop: watch::Sender<bool>,
     cancel: watch::Sender<u64>,
     done: watch::Sender<Option<LoopResult<()>>>,
@@ -47,7 +47,7 @@ impl Running {
             return Err(LoopError::Unavailable);
         }
         self.update(|stats| stats.wakes = stats.wakes.saturating_add(1));
-        match self.wake.try_send(reason) {
+        match self.wake.try_send((reason, Instant::now())) {
             Ok(()) => Ok(true),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.update(|stats| {
@@ -133,9 +133,15 @@ impl LoopControl for LoopController {
         {
             return Ok(false);
         }
-        running
-            .cancel
-            .send_modify(|value| *value = value.wrapping_add(1));
+        let mut overflow = false;
+        running.cancel.send_modify(|value| {
+            if let Some(next) = value.checked_add(1) {
+                *value = next;
+            } else {
+                overflow = true;
+            }
+        });
+        if overflow { return Err(LoopError::LimitReached); }
         Ok(true)
     }
     fn shutdown(&self) -> LoopFuture<'static, ()> {
@@ -177,7 +183,7 @@ impl Worker {
             eprintln!("认知循环诊断投递失败");
         }
     }
-    async fn run(self, mut wake: mpsc::Receiver<WakeReason>) -> LoopResult<()> {
+    async fn run(self, mut wake: mpsc::Receiver<(WakeReason, Instant)>) -> LoopResult<()> {
         let mut stop = self.running.stop.subscribe();
         let mut timer = tokio::time::interval(Duration::from_millis(self.options.poll_interval_ms));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -185,16 +191,15 @@ impl Worker {
             if *stop.borrow() {
                 return Ok(());
             }
-            tokio::select! {
+            let evaluated = tokio::select! {
                 biased;
                 _ = stop.changed() => continue,
-                _ = wake.recv() => {},
-                _ = timer.tick() => {},
-            }
+                signal = wake.recv() => signal.ok_or(LoopError::Unavailable)?.1,
+                _ = timer.tick() => Instant::now(),
+            };
             if *stop.borrow() {
                 return Ok(());
             }
-            let evaluated = Instant::now();
             self.running
                 .update(|stats| stats.evaluations = stats.evaluations.saturating_add(1));
             let snapshot = self.admin.snapshot()?;
@@ -451,12 +456,11 @@ impl Worker {
                     .as_ref()
                     .and_then(|report| report.control.run.started_tools)
             },
-            summary: if verified {
-                "实际提交与工具回执验证通过"
-            } else {
-                "执行已收尾；未满足完成验证或提交不确定"
-            }
-            .into(),
+            summary: report.as_ref().map_or_else(
+                || if not_started { "未准入执行；模型和工具均未启动" } else { "执行报告不确定；不能推断零副作用" }.into(),
+                |report| format!("验证结果 {}；模型准入 {}，工具准入 {}",
+                    verified, report.usage.model_requests, report.usage.admitted_tool_calls)),
+
             at_ms: now_ms()?,
         };
         let turn_id = report
