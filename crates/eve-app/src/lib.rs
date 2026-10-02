@@ -4,6 +4,7 @@ mod config;
 mod console;
 mod error;
 mod input;
+mod models;
 mod qqbot;
 mod services;
 
@@ -13,15 +14,14 @@ pub use qqbot::{QQBOT_HELP, QqBotOptions, run_qqbot};
 
 use eve_agent_prompt::FileAgentPrompt;
 use eve_config_api::{
-    CONFIG_SERVICE_ID, ConfigServiceHandle, LLM_NAMESPACE, LlmRuntimeConfig, ModelRolesConfig,
-    model_roles_schema, runtime_llm_schema,
+    CONFIG_SERVICE_ID, ConfigServiceHandle, LLM_NAMESPACE, LlmRuntimeConfig, model_roles_schema,
+    runtime_llm_schema,
 };
 use eve_config_plugin::{ConfigBootstrap, ConfigPlugin};
 use eve_control_api::{CONTROL_PLUGIN_ID, CONTROL_SERVICE_ID, ControlServiceHandle};
 use eve_control_plugin::ControlPlugin;
 use eve_kernel::{Kernel, KernelServices, backends::FileStateStore};
-use eve_llm_api::{ResponseMode, ToolBinding};
-use eve_llm_openai::OpenAiProvider;
+use eve_llm_api::{LlmModelResolver, ResponseMode, ToolBinding};
 use eve_plugin_api::{PluginDependency, PluginId, ServiceId};
 use eve_runtime::{
     ContextBinding, LlmHost, LlmHostConfig, SessionBinding, SessionControlRunner, SessionLlmHost,
@@ -40,7 +40,7 @@ pub const HELP: &str = "Eve 核心对话入口
 用法：eve [--state-dir 目录] [--agent AGENT.md] [--session 会话] [--user 用户]
 主模型默认 deepseek-v4.1-flash，可用 EVE_OPENAI_MODEL 替换；凭据：EVE_OPENAI_API_KEY
 协议默认 chat；EVE_OPENAI_PROTOCOL 可选 chat/responses\n可选：EVE_OPENAI_BASE_URL、EVE_OPENAI_REASONING_EFFORT
-EVE_OPENAI_MODEL_ROLE=primary 显式使用 runtime.models 的主模型角色配置。
+EVE_OPENAI_MODEL_ROLE=primary 显式使用 runtime.models 的主模型角色配置；每轮固定选择。
 一行一轮；/cancel 取消当前轮；/quit 或 Ctrl+C 取消并退出；/help 查看说明。
 EOF 处理完已接收输入后退出；最多 16 条待处理输入，取消/退出会清空队列。
 输入上限 32768 字节；当前入口使用非流式模式，串行执行和保存。";
@@ -193,18 +193,38 @@ pub(crate) async fn install_core(
     state_directory: &std::path::Path,
     bootstrap: CoreBootstrap,
 ) -> Result<Arc<dyn eve_control_api::ControlService>, AppError> {
-    let CoreBootstrap {
-        host_config,
-        api_key,
-    } = bootstrap;
-    kernel.register(Box::new(ConfigPlugin::new(ConfigBootstrap::new(
+    let config_plugin = ConfigPlugin::new(ConfigBootstrap::new(
         state_directory.join("configuration"),
         vec![
             runtime_llm_schema(),
             config::openai_schema(),
             model_roles_schema(),
         ],
-    ))?))?;
+    ))?;
+    install_core_with_config(
+        kernel,
+        registry,
+        permissions,
+        logger,
+        bootstrap,
+        config_plugin,
+    )
+    .await
+}
+
+async fn install_core_with_config(
+    kernel: &Kernel,
+    registry: Arc<dyn eve_plugin_api::ServiceRegistry>,
+    permissions: Arc<dyn eve_plugin_api::PermissionChecker>,
+    logger: Arc<dyn eve_plugin_api::Logger>,
+    bootstrap: CoreBootstrap,
+    config_plugin: ConfigPlugin,
+) -> Result<Arc<dyn eve_control_api::ControlService>, AppError> {
+    let CoreBootstrap {
+        host_config,
+        api_key,
+    } = bootstrap;
+    kernel.register(Box::new(config_plugin))?;
     kernel.register(Box::new(SessionPlugin::new()?))?;
     kernel.register(Box::new(services::CoreServices::new()?))?;
     let owner = PluginId::new(services::OWNER)?;
@@ -223,21 +243,12 @@ pub(crate) async fn install_core(
             "核心入口当前使用非流式模式，请将 runtime.llm.response_mode 配为 complete。".into(),
         );
     }
-    let request = settings.0.begin_request(config::OPENAI_NAMESPACE, 1)?;
-    let provider_snapshot = settings.0.read_request(&request)?;
-    let primary = match config::configured_role(&provider_snapshot)? {
-        Some(role) => Some(
-            ModelRolesConfig::capture(settings.0.as_ref())?
-                .require(role)?
-                .clone(),
-        ),
-        None => None,
-    };
-    let provider_config = config::provider_config(&provider_snapshot, primary.as_ref())?;
-    let timeout = provider_config.request_timeout;
-    let provider = OpenAiProvider::new(provider_config, &api_key)?;
+    let resolver = Arc::new(models::CoreModelResolver::new(settings.0.clone(), api_key));
+    // 保留启动预检；每轮再捕获最新配置，失败发生在 Session begin 之前。
+    let initial = resolver.resolve()?;
+    let timeout = initial.provider_timeout;
     let host = LlmHost::new(
-        Arc::new(provider),
+        initial.provider,
         registry.clone(),
         kernel.clone(),
         permissions,
@@ -256,7 +267,8 @@ pub(crate) async fn install_core(
             response_mode: ResponseMode::Complete,
             ..host_config
         },
-    )?;
+    )?
+    .with_model_resolver(resolver);
     let host = Arc::new(SessionLlmHost::new(host, SessionBinding::builtin()).with_logger(logger));
     kernel.register(Box::new(ControlPlugin::new(
         Arc::new(SessionControlRunner::new(host)),

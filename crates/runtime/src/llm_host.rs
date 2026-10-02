@@ -5,10 +5,10 @@
 use eve_kernel::{Kernel, RuntimeAdmissionGuard};
 use eve_llm_api::{
     ChatMessage, ChatRole, ContextAssembler, ContextService, ContextSnapshot, LlmError, LlmFuture,
-    LlmProvider, ModelRequest, ModelResponse, ModelTextSink, ResponseMode, SystemPromptMetadata,
-    SystemPromptSnapshot, SystemPromptSource, Tool, ToolBinding, ToolCall, ToolCancellation,
-    ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolFailureCode, ToolResult,
-    ToolService, TurnEvent, TurnEventKind, TurnEventSink, TurnInput,
+    LlmModelResolver, LlmProvider, ModelRequest, ModelResponse, ModelTextSink, ResponseMode,
+    SystemPromptMetadata, SystemPromptSnapshot, SystemPromptSource, Tool, ToolBinding, ToolCall,
+    ToolCancellation, ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolFailureCode,
+    ToolResult, ToolService, TurnEvent, TurnEventKind, TurnEventSink, TurnInput,
 };
 use eve_plugin_api::{
     Permission, PermissionChecker, PluginError, PluginId, PluginManifest, PluginState,
@@ -407,8 +407,10 @@ enum PermissionFailure {
     Backend(PluginError),
 }
 
+#[derive(Clone)]
 pub struct LlmHost {
     provider: Arc<dyn LlmProvider>,
+    model_resolver: Option<Arc<dyn LlmModelResolver>>,
     pub(crate) registry: Arc<dyn ServiceRegistry>,
     pub(crate) kernel: Kernel,
     permissions: Arc<dyn PermissionChecker>,
@@ -456,6 +458,7 @@ impl LlmHost {
         }
         Ok(Self {
             provider,
+            model_resolver: None,
             registry,
             kernel,
             permissions,
@@ -467,9 +470,31 @@ impl LlmHost {
         })
     }
 
+    /// 显式启用每轮模型解析；原 new 构造路径继续固定 Provider。
+    pub fn with_model_resolver(mut self, resolver: Arc<dyn LlmModelResolver>) -> Self {
+        self.model_resolver = Some(resolver);
+        self
+    }
+
+    pub(crate) fn for_turn(&self) -> Result<Self, LlmError> {
+        let mut host = self.clone();
+        if let Some(resolver) = &self.model_resolver {
+            let selected = catch_unwind(AssertUnwindSafe(|| resolver.resolve()))
+                .map_err(|_| LlmError::Backend("模型解析回调发生异常".into()))??;
+            host.provider = selected.provider;
+            host.config.provider_timeout = selected.provider_timeout;
+            host.config.validate()?;
+        }
+        host.model_resolver = None;
+        Ok(host)
+    }
+
     pub async fn run_turn(&self, input: TurnInput) -> Result<TurnOutput, TurnFailure> {
         let admission = Arc::new(self.kernel.acquire_runtime_admission().await);
-        self.run_turn_inner(input, None, admission, None).await
+        self.for_turn()
+            .map_err(|error| fail(error, TurnDiagnostics::default()))?
+            .run_turn_inner(input, None, admission, None)
+            .await
     }
 
     pub async fn run_turn_with_events(
@@ -479,9 +504,13 @@ impl LlmHost {
     ) -> Result<TurnOutput, TurnFailure> {
         let admission = Arc::new(self.kernel.acquire_runtime_admission().await);
         let events = self.event_delivery(sink, None);
-        let result = self
-            .run_turn_inner(input, None, admission.clone(), Some(&events))
-            .await;
+        let result = match self.for_turn() {
+            Ok(host) => {
+                host.run_turn_inner(input, None, admission.clone(), Some(&events))
+                    .await
+            }
+            Err(error) => Err(fail(error, TurnDiagnostics::default())),
+        };
         if let Err(failure) = &result {
             let _ = events
                 .emit(TurnEventKind::Failed {

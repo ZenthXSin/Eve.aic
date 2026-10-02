@@ -17,7 +17,7 @@ QQBOT_SANDBOX=true ./target/debug/eve-qqbot --state-dir .eve-qqbot
 
 核心默认 deepseek-v4.1-flash / Chat / none；模型、协议和基址仍按[核心对话](./核心对话.md)配置。默认启动正式 QQ API；首次测试使用 `QQBOT_SANDBOX=true`，非法布尔值拒绝启动。QQ Bot、测试用户和测试群的权限/沙箱范围按当前开放平台控制台配置。沙箱与正式 API 使用不同固定基址，token 地址固定，不允许通过事件修改。
 
-主模型角色与终端共用同一装配：EVE_OPENAI_MODEL_ROLE=primary 显式使用 runtime.models.primary，默认仍按原 provider.openai 启动。角色的模型、期限和输出限制在进程启动时捕获；更新后重新启动，同一会话恢复已完成历史。字段、凭据引用拒绝与失败保护见[核心对话](./核心对话.md#显式选择主模型角色)。这只接入主模型，其他角色仍是独立配置定义。
+主模型角色与终端共用同一装配：EVE_OPENAI_MODEL_ROLE=primary 显式使用 runtime.models.primary，默认仍按原 provider.openai 启动。启动时预检角色，随后在每轮开始时捕获模型、期限和输出限制；配置服务更新影响新轮，同一会话继续保留已完成历史。字段、凭据引用拒绝与失败保护见[核心对话](./核心对话.md#显式选择主模型角色)。这只接入主模型，其他角色仍是独立配置定义。
 
 手机可在 [GitHub Actions Secrets](https://github.com/ZenthXSin/Eve.aic/settings/secrets/actions) 添加 `QQBOT_APP_SECRET`；已有模型 Secret 继续使用。代码合入 main 后，在 [QQBot 首次真实交互](https://github.com/ZenthXSin/Eve.aic/actions/workflows/qqbot-interaction.yml) 点击 Run workflow，默认沙箱与 300 秒窗口；日志出现窗口启动后，向测试机器人私聊或在测试群 @ 发送文字。至少一次接收、模型完成和 QQ 成功发送且没有失败，报告才判定通过。超时退出不等于成功交互。
 
@@ -40,6 +40,8 @@ stdout 专用于 JSONL，SDK 日志后端为空，异常正文/stack/token 不�
 重启时 Processing 与 ReplyPending 仍是待人工诊断的记录，不自动继续；Session 沿用 Pending → Interrupted 与只回放 Completed 历史的语义。新消息可以恢复已有完成历史，旧工具仅作为历史传给模型。取消不会撤销已经完成的外部副作用。
 
 首版映射集中在 `Message::session_key`：AppID、scope、target 和发送者共同确定会话。这是首次测试、路由和恢复的临时边界。后续 AGI/内生驱动阶段统一认知主体、记忆、目标和跨通道经验，保留来源与权限，迁移旧历史；通道不是独立人格。详见[企划案](./企划案.md#通道隔离与统一认知的阶段关系)。
+
+QQ 与终端共用每轮模型解析：在新代执行前捕获当前配置，工具往返保持原选择；宿主通过 ConfigAdmin 更新后，新轮使用新模型。无效新选择不创建 Session Pending、不回退缓存，QQ 回执仍按已有状态机保留失败记录，不自动重试。没有新增 QQ 配置编辑命令，环境或密钥变更仍需重启。Jev 继续 TODO，首版输入语义和消息调度本轮不扩展。
 
 ## 停止与验收
 

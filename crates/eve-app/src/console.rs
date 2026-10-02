@@ -70,10 +70,20 @@ fn finish(
         && report.run.failure == Some(RunFailure::Execution(LlmError::Cancelled));
     let execution_failed = report.run.commit == CommitState::Failed
         && matches!(report.run.failure, Some(RunFailure::Execution(_)));
+    let configuration_rejected = report.run.commit == CommitState::NotStarted
+        && report.run.turn_id.is_none()
+        && report.run.started_tools == Some(0)
+        && report.run.text.is_none()
+        && report.run.transcript.is_none()
+        && report.run.tool_results.is_empty()
+        && matches!(
+            report.run.failure,
+            Some(RunFailure::Execution(LlmError::Configuration(_)))
+        );
     let fatal = if completed {
         report.run.text.is_none() || report.run.failure.is_some() && !cancelled_delivery
     } else {
-        !cancelled && !execution_failed
+        !cancelled && !execution_failed && !configuration_rejected
     };
     let displayed = (|| -> std::io::Result<()> {
         if completed {
@@ -87,7 +97,7 @@ fn finish(
         } else if cancelled {
             summary.cancelled_turns += 1;
             writeln!(output, "Eve：当前轮次已取消并完成收尾。")?;
-        } else if report.run.commit == CommitState::Failed
+        } else if (execution_failed || configuration_rejected)
             && let Some(RunFailure::Execution(error)) = &report.run.failure
         {
             summary.failed_turns += 1;
@@ -270,6 +280,31 @@ mod tests {
             },
         }
     }
+    #[test]
+    fn configuration_rejection_before_session_begin_allows_next_input() {
+        let mut rejected = report(CommitState::NotStarted);
+        rejected.cancel_requested = false;
+        rejected.run.turn_id = None;
+        rejected.run.text = None;
+        rejected.run.transcript = None;
+        rejected.run.started_tools = Some(0);
+        let error = LlmError::Configuration("无效模型选择".into());
+        rejected.run.failure = Some(RunFailure::Execution(error));
+        let mut output = Vec::new();
+        let mut summary = ChatSummary::default();
+        finish(rejected.clone(), &mut output, &mut summary).unwrap();
+        assert_eq!(summary.failed_turns, 1);
+        assert_eq!(summary.completed_turns, 0);
+        assert!(String::from_utf8(output).unwrap().contains("无效模型选择"));
+        for uncertain_tools in [None, Some(1)] {
+            let mut unsafe_report = rejected.clone();
+            unsafe_report.run.started_tools = uncertain_tools;
+            let mut output = Vec::new();
+            let mut summary = ChatSummary::default();
+            assert!(finish(unsafe_report, &mut output, &mut summary).is_err());
+        }
+    }
+
     #[test]
     fn committed_reply_wins_cancel_race_without_becoming_cancelled_or_failed() {
         let mut output = Vec::new();
