@@ -14,6 +14,7 @@ fn command(url: &str) -> Command {
         "EVE_OPENAI_API_KEY",
         "EVE_OPENAI_MODEL",
         "EVE_OPENAI_PROTOCOL",
+        "EVE_OPENAI_MODEL_ROLE",
         "EVE_OPENAI_BASE_URL",
         "EVE_OPENAI_REASONING_EFFORT",
         "EVE_OPENAI_TIMEOUT_SECONDS",
@@ -22,6 +23,11 @@ fn command(url: &str) -> Command {
         "EVE_LLM_MAX_PARALLEL_TOOL_CALLS",
     ] {
         c.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(|name| name.starts_with("EVE_MODELS_")) {
+            c.env_remove(name);
+        }
     }
     c.env("EVE_OPENAI_API_KEY", "fixture-secret")
         .env("EVE_OPENAI_MODEL", "fixture-model")
@@ -454,4 +460,66 @@ async fn chat_incomplete_reply_never_executes_partial_tool_batch() {
         0
     );
     assert!(!root.path().join("check/restart.stdout").exists());
+}
+
+#[tokio::test]
+async fn primary_role_drives_chat_tools_and_new_process_selection() {
+    let root = fixture();
+    let chat_final = || {
+        Reply::json(json!({"choices":[{"index":0,"finish_reason":"stop",
+            "message":{"role":"assistant","content":MARKER}}]}))
+    };
+    let mut server = Server::start(vec![
+        Reply::json(json!({"choices":[{"index":0,"finish_reason":"tool_calls",
+            "message":{"role":"assistant","content":null,"tool_calls":[
+                {"id":"check-echo","type":"function","function":{"name":"echo",
+                    "arguments":json!({"text":MARKER}).to_string()}}
+            ]}}]})),
+        chat_final(),
+        chat_final(),
+        chat_final(),
+    ])
+    .await;
+    let options = CheckOptions {
+        directory: root.path().join("check"),
+        agent_path: root.path().join("AGENT.md"),
+        request_timeout: Duration::from_secs(3),
+    };
+    let url = server.url.replace("/responses", "/chat/completions");
+    let checked = tokio::task::spawn_blocking(move || {
+        let mut launches = 0;
+        model_check::run(&options, MARKER, || {
+            launches += 1;
+            let mut c = command(&url);
+            c.env("EVE_OPENAI_PROTOCOL", "chat")
+                .env("EVE_OPENAI_MODEL_ROLE", "primary")
+                .env("EVE_MODELS_PRIMARY_ENABLED", "true")
+                .env("EVE_MODELS_PRIMARY_PROVIDER", "openai")
+                .env(
+                    "EVE_MODELS_PRIMARY_MODEL",
+                    if launches == 1 { "role-one" } else { "role-two" },
+                )
+                .env("EVE_MODELS_PRIMARY_TIMEOUT_MS", "2500")
+                .env("EVE_MODELS_PRIMARY_MAX_OUTPUT_TOKENS", "96");
+            c
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(checked["status"], "passed");
+    assert_eq!(checked["completed_turns"], 3);
+    assert_eq!(checked["restart_tool_calls"], 0);
+    assert_eq!(checked["history_prefix_unchanged"], true);
+    for (index, expected) in ["role-one", "role-one", "role-one", "role-two"]
+        .into_iter()
+        .enumerate()
+    {
+        let captured = server.next().await;
+        assert!(captured.headers.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        assert_eq!(captured.body["model"], expected);
+        assert_eq!(captured.body["max_tokens"], 96);
+        assert_eq!(chat_user_texts(&captured.body).len(), [1, 1, 2, 3][index]);
+    }
+    assert!(server.requests.try_recv().is_err());
 }

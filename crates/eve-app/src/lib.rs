@@ -13,7 +13,8 @@ pub use qqbot::{QQBOT_HELP, QqBotOptions, run_qqbot};
 
 use eve_agent_prompt::FileAgentPrompt;
 use eve_config_api::{
-    CONFIG_SERVICE_ID, ConfigServiceHandle, LLM_NAMESPACE, LlmRuntimeConfig, runtime_llm_schema,
+    CONFIG_SERVICE_ID, ConfigServiceHandle, LLM_NAMESPACE, LlmRuntimeConfig, ModelRolesConfig,
+    model_roles_schema, runtime_llm_schema,
 };
 use eve_config_plugin::{ConfigBootstrap, ConfigPlugin};
 use eve_control_api::{CONTROL_PLUGIN_ID, CONTROL_SERVICE_ID, ControlServiceHandle};
@@ -39,6 +40,7 @@ pub const HELP: &str = "Eve 核心对话入口
 用法：eve [--state-dir 目录] [--agent AGENT.md] [--session 会话] [--user 用户]
 主模型默认 deepseek-v4.1-flash，可用 EVE_OPENAI_MODEL 替换；凭据：EVE_OPENAI_API_KEY
 协议默认 chat；EVE_OPENAI_PROTOCOL 可选 chat/responses\n可选：EVE_OPENAI_BASE_URL、EVE_OPENAI_REASONING_EFFORT
+EVE_OPENAI_MODEL_ROLE=primary 显式使用 runtime.models 的主模型角色配置。
 一行一轮；/cancel 取消当前轮；/quit 或 Ctrl+C 取消并退出；/help 查看说明。
 EOF 处理完已接收输入后退出；最多 16 条待处理输入，取消/退出会清空队列。
 输入上限 32768 字节；当前入口使用非流式模式，串行执行和保存。";
@@ -197,7 +199,11 @@ pub(crate) async fn install_core(
     } = bootstrap;
     kernel.register(Box::new(ConfigPlugin::new(ConfigBootstrap::new(
         state_directory.join("configuration"),
-        vec![runtime_llm_schema(), config::openai_schema()],
+        vec![
+            runtime_llm_schema(),
+            config::openai_schema(),
+            model_roles_schema(),
+        ],
     ))?))?;
     kernel.register(Box::new(SessionPlugin::new()?))?;
     kernel.register(Box::new(services::CoreServices::new()?))?;
@@ -218,7 +224,12 @@ pub(crate) async fn install_core(
         );
     }
     let request = settings.0.begin_request(config::OPENAI_NAMESPACE, 1)?;
-    let provider_config = config::provider_config(&settings.0.read_request(&request)?)?;
+    let provider_snapshot = settings.0.read_request(&request)?;
+    let primary = match config::configured_role(&provider_snapshot)? {
+        Some(role) => Some(ModelRolesConfig::capture(settings.0.as_ref())?.require(role)?.clone()),
+        None => None,
+    };
+    let provider_config = config::provider_config(&provider_snapshot, primary.as_ref())?;
     let timeout = provider_config.request_timeout;
     let provider = OpenAiProvider::new(provider_config, &api_key)?;
     let host = LlmHost::new(
