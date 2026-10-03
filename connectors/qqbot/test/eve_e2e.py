@@ -252,7 +252,7 @@ class Acceptance(unittest.TestCase):
         launcher.write_text("#!/usr/bin/env python3\nimport os, sys\nos.execv(" + repr(str(BINARY)) + ", [" + repr(str(BINARY)) + ", *sys.argv[1:], '--bridge-script', " + repr(str(FAKE)) + ", '--bridge-arg', " + repr(str(scenario)) + "])\n")
         launcher.chmod(0o700)
         env = {k: os.environ[k] for k in ("PATH", "SystemRoot", "TEMP", "TMP") if k in os.environ}
-        env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret",
+        env.update(QQBOT_APP_SECRET="test-app-secret", QQBOT_SANDBOX="false", EVE_OPENAI_API_KEY="test-model-secret",
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}", EVE_OPENAI_PROTOCOL="chat")
         script = ROOT / "connectors/qqbot/training-window.py"
         root, output = self.work / "window", self.work / "results"
@@ -265,7 +265,9 @@ class Acceptance(unittest.TestCase):
             ready = subprocess.run(["python3", str(script), "--wait-ready", "--root", str(root), "--output", str(output)],
                                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=15)
             self.assertEqual(ready.returncode, 0, ready.stdout + ready.stderr)
-            self.assertTrue(json.loads((output / "ready.json").read_text())["ready"])
+            checkpoint = json.loads((output / "ready.json").read_text())
+            self.assertTrue(checkpoint["ready"])
+            self.assertFalse(checkpoint["sandbox"])
             self.gate("window-close").touch()
             stdout, stderr = child.communicate(timeout=15)
             self.assertEqual(child.returncode, 0, stdout + stderr)

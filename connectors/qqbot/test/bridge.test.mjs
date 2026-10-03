@@ -23,6 +23,10 @@ function fixture({ fail = false, limit = 128 } = {}) {
   return { bridge, frames, sent, message, handlers };
 }
 test("固定默认 AppID，仅密钥必填，sandbox 与最小 intent", () => {
+  for (const env of [{ QQBOT_APP_SECRET: "test-only" }, { QQBOT_APP_SECRET: "test-only", QQBOT_SANDBOX: "false" }]) {
+    assert.equal(optionsFromEnv(env).baseUrl, "https://api.sgroup.qq.com");
+    assert.equal(optionsFromEnv(env).intents, 1 << 25);
+  }
   const opt = optionsFromEnv({ QQBOT_APP_SECRET: "test-only", QQBOT_SANDBOX: "true" });
   assert.equal(opt.appId, "1904159860");
   assert.equal(opt.intents, 1 << 25);

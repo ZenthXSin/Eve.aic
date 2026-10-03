@@ -3,9 +3,13 @@ on:
   workflow_dispatch:
     inputs:
       sandbox:
-        description: 使用沙箱（测试群须加入 QQ 开放平台沙箱范围）
+        description: 使用沙箱（默认关闭，正式群使用正式环境）
         type: boolean
-        default: true
+        default: false
+      replace_run_id:
+        description: 显式停止并替换的旧训练运行 ID（留空则排队）
+        type: string
+        default: ""
       seconds:
         description: 交流窗口秒数（60 至 21300，预留六小时任务收尾）
         type: string
@@ -16,11 +20,25 @@ on:
 permissions:
   contents: read
   actions: read
-concurrency:
-  group: eve-qqbot-live
-  cancel-in-progress: false
 jobs:
+  replace_previous:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: 停止显式指定的旧训练运行并等待退出
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_REPLACE_RUN_ID: ${{ inputs.replace_run_id }}
+        run: python3 .github/scripts/qqbot-replace-run.py
   build:
+    needs: replace_previous
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -46,6 +64,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    concurrency:
+      group: eve-qqbot-live
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -67,14 +88,15 @@ jobs:
               seconds = int(os.environ["INPUT_SECONDS"])
               sandbox = os.environ["INPUT_SANDBOX"] == "true"
           else:
-              if set(request) != {"version", "request_id", "seconds", "sandbox"} or request["version"] != 1 or type(request["sandbox"]) is not bool:
+              if set(request) - {"version", "request_id", "seconds", "sandbox", "replace_run_id"} or request["version"] != 1 or type(request["sandbox"]) is not bool:
                   raise SystemExit("训练请求无效。")
               seconds, sandbox = request["seconds"], request["sandbox"]
           if type(seconds) is not int or not 60 <= seconds <= 21300:
               raise SystemExit("窗口必须在 60 至 21300 秒之间。")
           with open(os.environ["GITHUB_ENV"], "a") as output:
               output.write(f"QQBOT_TRAINING_SECONDS={seconds}\nQQBOT_SANDBOX={str(sandbox).lower()}\n")
-          print("训练请求已校验。SDK 已订阅私聊与群 @；群权限/沙箱范围由 QQ 开放平台控制台管理。")
+          print("QQ 运行环境：" + ("沙箱" if sandbox else "正式"))
+          print("训练请求已校验。SDK 已订阅私聊与群 @；正式群需平台群聊授权及机器人入群。")
           PY
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
