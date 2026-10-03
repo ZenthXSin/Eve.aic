@@ -35,7 +35,7 @@ def collect(state_path):
         raise ValueError("evidence_version")
     counts = {"received_records": len(receipts["entries"]), "sent": 0, "failed": 0,
               "unconfirmed": 0, "c2c_sent": 0, "group_at_sent": 0,
-              "completed_turns": 0, "failed_turns": 0, "question_replies": 0,
+              "completed_turns": 0, "model_sent": 0, "failed_turns": 0, "question_replies": 0,
               "multi_question_replies": 0, "paragraphs": 0, "reply_characters": 0,
               "feedback_candidates": 0}
     evidence = []
@@ -61,6 +61,7 @@ def collect(state_path):
         identity = "qq:" + hashlib.sha256(routing).hexdigest()
         if (msg["text"], reply) not in completed_inputs.get(identity, set()):
             continue  # 控制确认不冒充模型训练问答。
+        counts["model_sent"] += 1
         questions = len(re.findall(r"[?？]+", reply))
         counts["question_replies"] += int(questions > 0)
         counts["multi_question_replies"] += int(questions > 1)
@@ -190,7 +191,7 @@ def finish(root, output):
     # 公开 artifact 和 Actions 日志只显示计数，不含正文、路由 ID 或诊断。
     safe = {"window": report["window"], "evidence_status": report["evidence_status"], "counts": report["counts"],
             "process_ok": report["window"]["returncode"] == 0,
-            "interaction_ok": report["counts"].get("completed_turns", 0) > 0 and report["counts"].get("sent", 0) > 0,
+            "interaction_ok": report["counts"].get("model_sent", 0) > 0,
             "training_scope": "主动提问和交流证据采集；未更新模型权重或长期偏好"}
     write_json(output / "training-summary.json", safe)
     print(json.dumps(safe, ensure_ascii=False), flush=True)

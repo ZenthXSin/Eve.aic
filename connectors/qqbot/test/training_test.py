@@ -36,6 +36,7 @@ class Reports(unittest.TestCase):
         self.assertEqual(report["counts"]["paragraphs"], 2)
         self.assertEqual(report["counts"]["feedback_candidates"], 1)
         self.assertEqual(report["counts"]["group_at_sent"], 2)
+        self.assertEqual(report["counts"]["model_sent"], 1)
         self.assertEqual(report["counts"]["unconfirmed"], 1)
 
     def test_encrypted_state_roundtrip_authentication_and_no_overwrite(self):
