@@ -141,7 +141,9 @@ def run_window(root, seconds, binary):
         raise ValueError("window_range")
     root.mkdir(parents=True, exist_ok=False)
     started = time.time()
-    window = {"version": 1, "requested_seconds": seconds, "ready": False, "source_sha": os.environ.get("GITHUB_SHA", "local")}
+    window = {"version": 1, "requested_seconds": seconds, "ready": False,
+              "sandbox": os.environ.get("QQBOT_SANDBOX", "") == "true",
+              "source_sha": os.environ.get("GITHUB_SHA", "local")}
     write_json(root / "window.json", window)
     child = None
     with (root / "stdout").open("w") as out, (root / "stderr").open("w") as err:
