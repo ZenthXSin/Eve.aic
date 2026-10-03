@@ -17,6 +17,41 @@ def answer(index, question="single", act="training_answer", flags=None, dimensio
 
 
 class Reviews(unittest.TestCase):
+    def test_chat_subset_complete_output_and_fenced_json_without_explanations(self):
+        from unittest.mock import MagicMock
+        response = MagicMock()
+        response.__enter__.return_value = response
+        def payload(content, finish="stop"):
+            return json.dumps({"choices": [{"index": 0, "finish_reason": finish,
+                "message": {"role": "assistant", "content": content}}]}).encode()
+        response.read.return_value = payload('```json\n{"reviews": []}\n```')
+        with patch.dict(os.environ, EVE_OPENAI_API_KEY="test-key"), patch.object(review.urllib.request, "urlopen", return_value=response) as opened:
+            self.assertEqual(review.judge([]), {"reviews": []})
+            request = opened.call_args.args[0]
+            body = json.loads(request.data)
+            self.assertFalse(body["stream"])
+            self.assertNotIn("response_format", body)
+            self.assertNotIn("test-key", request.data.decode())
+            response.read.return_value = payload('{"reviews": []}', "length")
+            with self.assertRaisesRegex(ValueError, "output_incomplete"):
+                review.judge([])
+            response.read.return_value = payload('说明\n```json\n{"reviews": []}\n```')
+            with self.assertRaisesRegex(ValueError, "model_json"):
+                review.judge([])
+        with self.assertRaises(ValueError):
+            review.strict_json('{"reviews": [], "reviews": []}')
+
+    def test_diagnostics_are_fixed_codes_and_never_exception_text(self):
+        error = review.urllib.error.HTTPError('https://example.com', 400, 'private text and key', {}, None)
+        self.assertEqual(review.error_code(error), "http_400")
+        self.assertEqual(review.error_code(ValueError('private text')), "model_protocol")
+        evidence = [{"session": "s", "input": "private", "reply": "private"}]
+        def fail(_):
+            raise error
+        result = review.review(evidence, fail)
+        self.assertEqual(result["failure_codes"], {"http_400": 1})
+        self.assertNotIn('private', json.dumps(result))
+
     def test_model_cannot_publish_text_identity_or_inferred_preferences(self):
         for item in [dict(answer(0), raw="private"), dict(answer(0), question_act="private"),
                      dict(answer(0), flags=["private"]), answer(0, dimensions=["tone"]),
