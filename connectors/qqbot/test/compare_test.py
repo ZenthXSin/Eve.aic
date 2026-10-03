@@ -29,7 +29,7 @@ class Comparisons(unittest.TestCase):
         self.assertTrue(result["advisory_non_regression"])
         self.assertTrue(result["advisory_improved"])
         self.assertEqual(result["selected_pairs"], 12)
-        self.assertEqual(result["model_requests"], 30)
+        self.assertEqual(result["model_requests"], 36)
         for i in range(0, len(seen), 2):
             self.assertEqual(seen[i][1:3], seen[i + 1][1:3])
             self.assertLessEqual(seen[i][3], 30)
