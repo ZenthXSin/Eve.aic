@@ -1,5 +1,7 @@
 # QQBot 通道插件
 
+新增[主动提问训练](./主动提问训练.md)：`/train start`、`/train stop`、`/train status` 按可信会话启停；六小时上限 Actions 测试结束后保存计数报告和加密交流证据。群聊只处理官方 @ 事件，平台授权及沙箱群范围仍须在 QQ 开放平台控制台配置。
+
 首版接入官方 QQ 开放平台的 C2C 私聊与群 @ 文本。复用腾讯 `@tencent-connect/qqbot-nodejs` 1.0.4，使用 Node 22 桥接 WebSocket 与被动文本回复；Rust `eve-qqbot-plugin` 只依赖公开 Control/Message/Session/Plugin 契约，宿主 `eve-qqbot` 与终端共用 AGENT、配置、主模型、会话及 echo 装配。Kernel 不包含 QQ 业务。来源、版本与 MIT 许可见 [THIRD_PARTY](../connectors/qqbot/THIRD_PARTY.md)。
 
 ## 启动与手机配置
@@ -21,7 +23,7 @@ QQBOT_SANDBOX=true ./target/debug/eve-qqbot --state-dir .eve-qqbot
 
 手机可在 [GitHub Actions Secrets](https://github.com/ZenthXSin/Eve.aic/settings/secrets/actions) 添加 `QQBOT_APP_SECRET`；已有模型 Secret 继续使用。代码合入 main 后，在 [QQBot 首次真实交互](https://github.com/ZenthXSin/Eve.aic/actions/workflows/qqbot-interaction.yml) 点击 Run workflow，默认沙箱与 300 秒窗口；日志出现窗口启动后，向测试机器人私聊或在测试群 @ 发送文字。至少一次接收、模型完成和 QQ 成功发送且没有失败，报告才判定通过。超时退出不等于成功交互。
 
-这只是工作流测试，没有部署到测试服务器。托管 Runner 的临时状态在任务结束后清理，不是持续运行的机器人宿主；长期运行应使用持久目录与进程管理。真实交互只上传无正文的计数报告，不上传 Session、QQ openid、输入、回复、密钥或原始诊断。
+这只是工作流测试，没有部署到测试服务器。托管 Runner 的临时状态在任务结束后清理，不是持续运行的机器人宿主；长期运行应使用持久目录与进程管理。首次真实交互工作流只上传无正文计数；专用训练工作流另以加密包保存交流证据和状态，见[主动提问训练](./主动提问训练.md)。
 
 ## 桥接契约与兼容
 

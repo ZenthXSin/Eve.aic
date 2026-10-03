@@ -38,6 +38,8 @@ eve-qqbot-plugin = { path = "../qqbot-plugin" }
 eve-runtime = { path = "../runtime" }
 eve-session-api = { path = "../session-api" }
 eve-session-plugin = { path = "../session-plugin" }
+eve-training-api = { path = "../training-api" }
+eve-training-plugin = { path = "../training-plugin" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 

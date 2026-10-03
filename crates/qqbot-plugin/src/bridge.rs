@@ -10,6 +10,7 @@ use eve_llm_api::{LlmError, LlmFuture, TurnEvent, TurnEventKind};
 use eve_message_api::{IncomingMessage, MessageFuture, MessageService, RouteOutcome, RouteReport};
 use eve_plugin_api::{LogEntry, LogLevel, PluginContext, PluginError, PluginResult, TaskSignal};
 use eve_session_api::{SessionInput, SessionKey};
+use eve_training_api::{TrainingCommand, TrainingService};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -91,6 +92,7 @@ const BLOCKED: &str = "任务提交状态未确认，当前会话已阻塞；请
 pub(crate) struct Services {
     pub control: Arc<dyn ControlService>,
     pub messages: Arc<dyn MessageService>,
+    pub training: Option<Arc<dyn TrainingService>>,
 }
 struct ChannelEvents {
     signal: Arc<dyn TaskSignal>,
@@ -140,6 +142,10 @@ struct Active {
 struct CommandMessage {
     message: Message,
     target: Option<GenerationKey>,
+}
+struct Queued {
+    message: Message,
+    saved: bool,
 }
 struct Routing {
     message: Message,
@@ -202,7 +208,11 @@ pub(crate) async fn run(
     status: watch::Sender<QqBotStatus>,
     mut stop: watch::Receiver<bool>,
 ) -> PluginResult<()> {
-    let Services { control, messages } = services;
+    let Services {
+        control,
+        messages,
+        training,
+    } = services;
     let (closed, receiver) = watch::channel(false);
     let sink = Arc::new(ChannelEvents {
         signal: signal.clone(),
@@ -246,7 +256,7 @@ pub(crate) async fn run(
         partial: Vec::new(),
         discard: false,
     };
-    let mut queue: VecDeque<Message> = VecDeque::new();
+    let mut queue: VecDeque<Queued> = VecDeque::new();
     let mut commands: VecDeque<CommandMessage> = VecDeque::new();
     let mut active: Vec<Active> = Vec::new();
     let mut controlled_sessions: BTreeMap<String, SessionKey> = BTreeMap::new();
@@ -261,6 +271,61 @@ pub(crate) async fn run(
             // 在 route 完成前不外发任何排队结果，也不开普通任务。
             if routing.is_none() && let Some(command) = commands.pop_front() {
                 let message = command.message;
+                if let Some(training) = &training && let Some(action) = TrainingCommand::parse(&message.text) {
+                    if !ledger.insert(&ctx, &config.app_id, message.clone())? {
+                        warn(&ctx, "receipt_limit");
+                        finish(&mut stdin, &message.id).await?;
+                        continue;
+                    }
+                    let session = message.session_key(&config.app_id)?;
+                    let scope = eve_llm_api::ContextScope { session_id: session.session_id.clone(), user_id: session.user_id.clone() };
+                    if matches!(action, TrainingCommand::Start | TrainingCommand::Stop) {
+                        // 先保存开关；当前代取消并保存后才确认或发出新问题。
+                        training.set_enabled(&scope, action == TrainingCommand::Start)?;
+                        if let Some(snapshot) = control.snapshot(&session).map_err(|_| failure("训练任务快照不可用"))? {
+                            control.cancel(&snapshot.key).map_err(|_| failure("训练任务取消失败"))?;
+                            control.wait(&snapshot.key).await.map_err(|_| failure("训练任务收尾失败"))?;
+                            let retired = active.iter().position(|a| a.key == snapshot.key);
+                            if let Some(index) = retired {
+                                let old = active.remove(index);
+                                mark_failed(&mut ledger, &ctx, &config.app_id, &old.message.id)?;
+                                finish(&mut stdin, &old.message.id).await?;
+                            }
+                        }
+                        let mut kept_replies = VecDeque::new();
+                        while let Some(reply) = replies.pop_front() {
+                            if reply.message.session_key(&config.app_id)? == session {
+                                mark_failed(&mut ledger, &ctx, &config.app_id, &reply.message.id)?;
+                                finish(&mut stdin, &reply.message.id).await?;
+                            } else { kept_replies.push_back(reply); }
+                        }
+                        replies = kept_replies;
+                        // 停止/重启训练不继续处理同一会话已经排队的回答。
+                        let mut retained = VecDeque::new();
+                        while let Some(queued) = queue.pop_front() {
+                            if queued.message.session_key(&config.app_id)? == session {
+                                if queued.saved || ledger.insert(&ctx, &config.app_id, queued.message.clone())? {
+                                    mark_failed(&mut ledger, &ctx, &config.app_id, &queued.message.id)?;
+                                }
+                                finish(&mut stdin, &queued.message.id).await?;
+                            } else { retained.push_back(queued); }
+                        }
+                        queue = retained;
+                    }
+                    if action == TrainingCommand::Start {
+                        // 保留 /train start 原文进入 Session；上下文提供提问策略。
+                        queue.push_front(Queued { message, saved: true });
+                        continue;
+                    }
+                    let text = match action {
+                        TrainingCommand::Stop => "已结束当前会话的主动提问训练，已完成记录保留；普通聊天仍可继续。".into(),
+                        TrainingCommand::Status => if training.enabled(&scope)? { "当前会话：主动提问训练已开启。" } else { "当前会话：主动提问训练已关闭。" }.into(),
+                        TrainingCommand::Help => "训练命令：/train start 开始并提问；/train stop 结束；/train status 查看。一次一个问题，可以跳过或纠正。".into(),
+                        TrainingCommand::Start => unreachable!(),
+                    };
+                    replies.push_back(Reply { message, text, guard: ReplyGuard::NoTask });
+                    continue;
+                }
                 if !ledger.insert(&ctx, &config.app_id, message.clone())? {
                     warn(&ctx, "receipt_limit");
                     finish(&mut stdin, &message.id).await?;
@@ -310,8 +375,9 @@ pub(crate) async fn run(
                 delivering = Some(reply.message);
             }
             if routing.is_none() && commands.is_empty() && active.is_empty()
-                && delivering.is_none() && replies.is_empty() && let Some(message) = queue.pop_front() {
-                if !ledger.insert(&ctx, &config.app_id, message.clone())? {
+                && delivering.is_none() && replies.is_empty() && let Some(queued) = queue.pop_front() {
+                let message = queued.message;
+                if !queued.saved && !ledger.insert(&ctx, &config.app_id, message.clone())? {
                     warn(&ctx, "receipt_limit");
                     finish(&mut stdin, &message.id).await?;
                     continue;
@@ -445,7 +511,7 @@ pub(crate) async fn run(
                             }
                             let Ok(message) = serde_json::from_value::<Message>(payload) else { warn(&ctx, "invalid_message"); continue; };
                             if !message.valid() { warn(&ctx, "invalid_route_or_text"); continue; }
-                            let live = queue.iter().any(|m| m.id == message.id)
+                            let live = queue.iter().any(|m| m.message.id == message.id)
                                 || commands.iter().any(|c| c.message.id == message.id)
                                 || active.iter().any(|a| a.message.id == message.id)
                                 || routing.as_ref().is_some_and(|r| r.message.id == message.id)
@@ -466,7 +532,7 @@ pub(crate) async fn run(
                                         .map_err(|_| failure("QQBot 任务快照不可用"))?.map(|s| s.key);
                                     commands.push_back(CommandMessage { message, target });
                                 } else {
-                                    queue.push_back(message);
+                                    queue.push_back(Queued { message, saved: false });
                                 }
                             }
                         }

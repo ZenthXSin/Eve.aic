@@ -1,0 +1,119 @@
+name: QQBot 六小时主动提问训练
+on:
+  workflow_dispatch:
+    inputs:
+      sandbox:
+        description: 使用沙箱（测试群须加入 QQ 开放平台沙箱范围）
+        type: boolean
+        default: true
+      seconds:
+        description: 交流窗口秒数（60 至 21300，预留六小时任务收尾）
+        type: string
+        default: "21300"
+  push:
+    branches: [main]
+    paths: [".github/qqbot-training-request.json"]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: eve-qqbot-live
+  cancel-in-progress: false
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+      - name: 构建不含凭据的运行包
+        run: |
+          npm --prefix connectors/qqbot ci --ignore-scripts --no-audit --no-fund
+          rustup toolchain install 1.89.0 --profile minimal
+          cargo +1.89.0 build -p eve-app --bin eve-qqbot --locked
+          tar -czf "$RUNNER_TEMP/qqbot-runtime.tar.gz" target/debug/eve-qqbot connectors/qqbot/node_modules
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: qqbot-training-runtime
+          path: ${{ runner.temp }}/qqbot-runtime.tar.gz
+          retention-days: 1
+  training:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: 校验训练请求与凭据
+        env:
+          QQBOT_APP_SECRET: ${{ secrets.QQBOT_APP_SECRET }}
+          EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
+          INPUT_SECONDS: ${{ inputs.seconds }}
+          INPUT_SANDBOX: ${{ inputs.sandbox }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          for name in ("QQBOT_APP_SECRET", "EVE_OPENAI_API_KEY"):
+              if not os.environ.get(name, "").strip():
+                  raise SystemExit("缺少仓库 Actions Secret：" + name)
+          request = json.loads(pathlib.Path(".github/qqbot-training-request.json").read_text())
+          if os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch":
+              seconds = int(os.environ["INPUT_SECONDS"])
+              sandbox = os.environ["INPUT_SANDBOX"] == "true"
+          else:
+              if set(request) != {"version", "request_id", "seconds", "sandbox"} or request["version"] != 1 or type(request["sandbox"]) is not bool:
+                  raise SystemExit("训练请求无效。")
+              seconds, sandbox = request["seconds"], request["sandbox"]
+          if type(seconds) is not int or not 60 <= seconds <= 21300:
+              raise SystemExit("窗口必须在 60 至 21300 秒之间。")
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"QQBOT_TRAINING_SECONDS={seconds}\nQQBOT_SANDBOX={str(sandbox).lower()}\n")
+          print("训练请求已校验。SDK 已订阅私聊与群 @；群权限/沙箱范围由 QQ 开放平台控制台管理。")
+          PY
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: qqbot-training-runtime
+          path: ${{ runner.temp }}/qqbot-runtime
+      - name: 展开同一提交的运行包
+        run: |
+          tar -xzf "$RUNNER_TEMP/qqbot-runtime/qqbot-runtime.tar.gz"
+          chmod +x target/debug/eve-qqbot
+      - name: 启动训练进程
+        env:
+          QQBOT_APP_SECRET: ${{ secrets.QQBOT_APP_SECRET }}
+          EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
+          EVE_OPENAI_BASE_URL: https://ai.xn--rhqr8xvr4ahqsgka.com
+          EVE_OPENAI_MODEL: deepseek-v4.1-flash
+          EVE_OPENAI_PROTOCOL: chat
+          EVE_OPENAI_REASONING_EFFORT: none
+          EVE_OPENAI_MAX_OUTPUT_TOKENS: "512"
+          EVE_LLM_RESPONSE_MODE: complete
+        run: |
+          python3 connectors/qqbot/training-window.py --root "$RUNNER_TEMP/eve-qqbot-training" --output "$RUNNER_TEMP/eve-qqbot-training-artifacts" --seconds "$QQBOT_TRAINING_SECONDS" > "$RUNNER_TEMP/qqbot-training-controller.log" 2>&1 &
+      - name: 确认实际网关就绪
+        run: python3 connectors/qqbot/training-window.py --wait-ready --root "$RUNNER_TEMP/eve-qqbot-training" --output "$RUNNER_TEMP/eve-qqbot-training-artifacts"
+      - name: 保存就绪时间与结束时间
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: eve-qqbot-training-ready
+          path: ${{ runner.temp }}/eve-qqbot-training-artifacts/ready.json
+          retention-days: 7
+      - name: 等待训练结束与结果保存
+        run: python3 connectors/qqbot/training-window.py --wait-result --output "$RUNNER_TEMP/eve-qqbot-training-artifacts" --seconds "$QQBOT_TRAINING_SECONDS"
+      - name: 保存计数报告与加密训练结果
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: eve-qqbot-training-results
+          path: ${{ runner.temp }}/eve-qqbot-training-artifacts/
+          if-no-files-found: warn
+          retention-days: 7

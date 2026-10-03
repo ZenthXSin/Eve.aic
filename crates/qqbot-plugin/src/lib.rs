@@ -8,6 +8,7 @@ use eve_plugin_api::{
     Cleanup, Plugin, PluginContext, PluginDependency, PluginError, PluginFuture, PluginManifest,
     PluginResult, ServiceId, TaskMode, TaskSchedule, TaskSpec,
 };
+use eve_training_api::{TRAINING_PLUGIN_ID, TRAINING_SERVICE_ID, TrainingServiceHandle};
 use serde::Serialize;
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
@@ -50,6 +51,7 @@ impl QqBotStatusHandle {
 pub struct QqBotPlugin {
     manifest: PluginManifest,
     config: Arc<QqBotConfig>,
+    training: bool,
 }
 impl QqBotPlugin {
     pub fn new(config: QqBotConfig) -> PluginResult<Self> {
@@ -66,7 +68,17 @@ impl QqBotPlugin {
         Ok(Self {
             manifest,
             config: Arc::new(config),
+            training: false,
         })
+    }
+    /// 通过公开契约接线；未接线的通道继续使用既有消息规则。
+    pub fn with_training(mut self) -> PluginResult<Self> {
+        self.manifest.dependencies.push(PluginDependency {
+            id: eve_plugin_api::PluginId::new(TRAINING_PLUGIN_ID)?,
+            requirement: Some("^0.1".into()),
+        });
+        self.training = true;
+        Ok(self)
     }
 }
 impl Plugin for QqBotPlugin {
@@ -76,6 +88,16 @@ impl Plugin for QqBotPlugin {
     fn start(&mut self, ctx: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         Box::pin(async move {
             let ledger = state::Ledger::load(&ctx)?;
+            let training = if self.training {
+                Some(
+                    ctx.service::<TrainingServiceHandle>(&ServiceId::new(TRAINING_SERVICE_ID)?)?
+                        .ok_or_else(|| PluginError::State("QQBot 训练服务缺失".into()))?
+                        .0
+                        .clone(),
+                )
+            } else {
+                None
+            };
             let control = ctx
                 .service::<ControlServiceHandle>(&ServiceId::new(CONTROL_SERVICE_ID)?)?
                 .ok_or_else(|| PluginError::State("QQBot 控制服务缺失".into()))?
@@ -108,6 +130,7 @@ impl Plugin for QqBotPlugin {
                     let ctx = task_ctx.clone();
                     let control = control.clone();
                     let messages = messages.clone();
+                    let training = training.clone();
                     let status = status.clone();
                     let ledger = ledger.clone();
                     Box::pin(async move {
@@ -118,7 +141,11 @@ impl Plugin for QqBotPlugin {
                         let result = bridge::run(
                             config,
                             ctx,
-                            bridge::Services { control, messages },
+                            bridge::Services {
+                                control,
+                                messages,
+                                training,
+                            },
                             ledger,
                             signal,
                             status.clone(),

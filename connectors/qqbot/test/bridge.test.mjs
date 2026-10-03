@@ -76,3 +76,19 @@ test("官方不透明消息 ID 的标点保持原值，正文中的提及不被�
   assert.equal(f.sent[0].target.msgId, id);
   assert.equal(f.frames.at(-1).ok, true);
 });
+
+test("群聊只接纳官方 @ 事件，拒绝普通群消息与机器人消息", async () => {
+  const f = fixture();
+  const incoming = {
+    kind: "group", messageId: "group-at-1", senderId: "user-1", content: "/train start",
+    rawEventType: "GROUP_MESSAGE_CREATE", groupOpenid: "group-1",
+    replyTarget: { scope: "group", targetId: "group-1", msgId: "group-at-1" },
+  };
+  f.handlers.get("message")({}, incoming);
+  f.handlers.get("message")({}, { ...incoming, rawEventType: "GROUP_AT_MESSAGE_CREATE", senderIsBot: true });
+  assert.equal(f.frames.filter(x => x.type === "message").length, 0);
+  f.handlers.get("message")({}, { ...incoming, rawEventType: "GROUP_AT_MESSAGE_CREATE" });
+  assert.equal(f.frames.filter(x => x.type === "message").length, 1);
+  await f.bridge.command({ type: "reply", version: 1, id: "group-at-1", text: "你喜欢怎样的称呼？" });
+  assert.deepEqual(f.sent, [{ target: incoming.replyTarget, text: "你喜欢怎样的称呼？" }]);
+});

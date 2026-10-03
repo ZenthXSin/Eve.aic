@@ -541,8 +541,25 @@ pub struct ContextSnapshot {
     pub history: Vec<ChatMessage>,
 }
 
+/// 由会话宿主传入的可信作用域；不从用户文字或模型输出解析。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextScope {
+    pub session_id: String,
+    pub user_id: String,
+}
+
 pub trait ContextAssembler: Send + Sync {
     fn assemble(&self, input: TurnInput) -> LlmFuture<'_, ContextSnapshot>;
+
+    /// 原有装配器继续使用 assemble；需要隔离用户偏好的实现可覆盖此方法。
+    fn assemble_scoped(
+        &self,
+        input: TurnInput,
+        _scope: Option<ContextScope>,
+    ) -> LlmFuture<'_, ContextSnapshot> {
+        self.assemble(input)
+    }
 }
 
 pub struct ToolExecutionContext {
