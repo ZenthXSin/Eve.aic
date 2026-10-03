@@ -10,6 +10,8 @@ on:
       - ".github/workflows/qqbot-training.yml"
       - ".github/qqbot-training-request.json"
       - ".github/scripts/**"
+      - ".github/workflows/qqbot-training-review.yml"
+      - ".github/qqbot-training-review-request.json"
   push:
     branches: [main]
     paths:
@@ -21,6 +23,8 @@ on:
       - ".github/workflows/qqbot-training.yml"
       - ".github/qqbot-training-request.json"
       - ".github/scripts/**"
+      - ".github/workflows/qqbot-training-review.yml"
+      - ".github/qqbot-training-review-request.json"
 permissions:
   contents: read
 jobs:
@@ -58,3 +62,4 @@ jobs:
           python3 connectors/qqbot/test/eve_e2e.py
           python3 -m unittest discover -s connectors/qqbot/test -p 'training_test.py'
           python3 -m unittest discover -s .github/scripts -p 'test_qqbot_replace_run.py'
+          python3 -m unittest discover -s connectors/qqbot/test -p 'review_test.py'
