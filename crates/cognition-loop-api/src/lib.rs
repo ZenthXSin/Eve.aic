@@ -1,6 +1,8 @@
 //! 有界认知循环公开契约；执行权限和实际预算由受信宿主装配。
 mod endogenous;
-pub use endogenous::{EndogenousOptions, EndogenousReport};
+pub use endogenous::{
+    EndogenousOptions, EndogenousPlannerFactory, EndogenousPlanning, EndogenousReport,
+};
 use eve_cognition_api::{CognitionError, ExecutionAttempt, Goal, ReadAccess, SourceKind};
 use eve_control_api::{ControlReport, GenerationKey};
 use eve_llm_api::BudgetUsage;

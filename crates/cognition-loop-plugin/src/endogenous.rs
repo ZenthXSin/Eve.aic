@@ -2,11 +2,34 @@ use eve_cognition_api::{
     CognitionAdmin, CognitionError, CognitiveEvent, CognitiveEventKind, CognitiveState, Drive,
     ExecutionBudget, Goal, GoalStatus, MAX_RECORDS, Source, SourceKind,
 };
-use eve_cognition_loop_api::{EndogenousOptions, EndogenousReport, LoopError, LoopResult};
+use eve_cognition_loop_api::{
+    EndogenousOptions, EndogenousPlannerFactory, EndogenousPlanning, EndogenousReport, LoopError,
+    LoopResult,
+};
 use ring::digest::{Context, SHA256};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
+
+/// 默认反思规划器装配；宿主也可注入其它公开工厂实现。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReflectionPlannerFactory;
+
+impl EndogenousPlannerFactory for ReflectionPlannerFactory {
+    fn create(
+        &self,
+        admin: Arc<dyn CognitionAdmin>,
+        options: EndogenousOptions,
+    ) -> LoopResult<Arc<dyn EndogenousPlanning>> {
+        Ok(Arc::new(EndogenousPlanner::new(admin, options)?))
+    }
+}
+
+impl EndogenousPlanning for EndogenousPlanner {
+    fn reconcile(&self, now_ms: u64) -> LoopResult<EndogenousReport> {
+        EndogenousPlanner::reconcile(self, now_ms)
+    }
+}
 
 /// 从获准的未完成待办派生只思考的候选；不持有模型、工具或外部发送能力。
 ///
