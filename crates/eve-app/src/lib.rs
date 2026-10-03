@@ -1,5 +1,6 @@
 //! Eve 的最小可运行组合入口：固定身份、一个主模型、会话历史与插件工具。
 //! 输入与受管轮次并发，任务仍串行；不包含额外模型或 Web 控制面。
+mod cognition;
 mod config;
 mod console;
 mod error;
@@ -8,6 +9,7 @@ mod models;
 mod qqbot;
 mod services;
 
+pub use cognition::{COGNITION_HELP, CognitionOptions, run_cognition};
 pub use console::{ChatOutputError, ChatRunError};
 pub use error::AppFailure;
 pub use qqbot::{QQBOT_HELP, QqBotOptions, run_qqbot};

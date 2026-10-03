@@ -131,6 +131,10 @@ name = "eve-app"
 version = "0.1.0"
 dependencies = [
  "eve-agent-prompt",
+ "eve-cognition-api",
+ "eve-cognition-loop-api",
+ "eve-cognition-loop-plugin",
+ "eve-cognition-plugin",
  "eve-config-api",
  "eve-config-plugin",
  "eve-control-api",
@@ -178,6 +182,9 @@ dependencies = [
  "eve-llm-api",
  "eve-plugin-api",
  "getrandom 0.4.3",
+ "ring",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

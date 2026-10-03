@@ -14,8 +14,16 @@ path = "src/main.rs"
 name = "eve-qqbot"
 path = "src/bin/qqbot.rs"
 
+[[bin]]
+name = "eve-cognition"
+path = "src/bin/cognition.rs"
+
 [dependencies]
 eve-agent-prompt = { path = "../agent-prompt" }
+eve-cognition-api = { path = "../cognition-api" }
+eve-cognition-plugin = { path = "../cognition-plugin" }
+eve-cognition-loop-api = { path = "../cognition-loop-api" }
+eve-cognition-loop-plugin = { path = "../cognition-loop-plugin" }
 eve-config-api = { path = "../config-api" }
 eve-config-plugin = { path = "../config-plugin" }
 eve-control-api = { path = "../control-api" }
