@@ -33,7 +33,7 @@ class Reviews(unittest.TestCase):
             self.assertNotIn("response_format", body)
             self.assertNotIn("test-key", request.data.decode())
             response.read.return_value = payload('{"reviews": []}', "length")
-            with self.assertRaisesRegex(ValueError, "output_incomplete"):
+            with self.assertRaisesRegex(ValueError, "model_finish_length"):
                 review.judge([])
             response.read.return_value = payload('说明\n```json\n{"reviews": []}\n```')
             with self.assertRaisesRegex(ValueError, "model_json"):
@@ -89,11 +89,11 @@ class Reviews(unittest.TestCase):
         evidence = [{"session": "s", "input": "x", "reply": "y"} for _ in range(100)]
         batches, _, selected = review.evidence_batches(evidence)
         self.assertEqual(selected, 64)
-        self.assertEqual(len(batches), 8)
+        self.assertEqual(len(batches), 16)
         def failing(_):
             raise ValueError("private model error")
         result = review.review(evidence, failing)
-        self.assertEqual((result["requests"], result["failed_batches"], result["unreviewed"]), (8, 8, 64))
+        self.assertEqual((result["requests"], result["failed_batches"], result["unreviewed"]), (16, 16, 64))
         self.assertFalse(result["review_complete"])
         ticks = iter([0, 601])
         result = review.review(evidence, lambda _: self.fail("deadline must stop request"), clock=lambda: next(ticks))

@@ -62,10 +62,10 @@ def compare(evidence, baseline, candidate, identity, generator=generate, evaluat
             rows.extend(pair)
     counts = {v: {"question_acts": Counter(), "issue_flags": Counter(), "paragraphs": 0, "characters": 0} for v in ("baseline", "candidate")}
     assessed = 0
-    for start in range(0, len(rows), 8):
+    for start in range(0, len(rows), review.MAX_BATCH):
         if clock() >= deadline:
             break
-        batch = rows[start:start + 8]
+        batch = rows[start:start + review.MAX_BATCH]
         # 评审不知道哪个提示词生成了回复，只接收相同上下文及有界正文。
         records = [{k: v for k, v in row.items() if k != "variant"} for row in batch]
         requests += 1
