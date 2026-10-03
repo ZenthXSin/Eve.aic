@@ -12,7 +12,10 @@ eve-control-api = { path = "../control-api" }
 eve-llm-api = { path = "../llm-api" }
 eve-plugin-api = { path = "../plugin-api" }
 tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 getrandom = "0.4"
+ring = "0.17"
 
 [dev-dependencies]
 eve-cognition-plugin = { path = "../cognition-plugin" }

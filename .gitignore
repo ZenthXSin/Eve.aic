@@ -9,4 +9,5 @@
 
 # 核心会话与主模型验收的本地状态/诊断
 /.eve/
+/.eve-cognition/
 /.eve-model-check-*/

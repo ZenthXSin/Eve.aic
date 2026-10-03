@@ -1,5 +1,8 @@
 //! 有界认知业务插件；使用公开状态/执行契约，模型装配留在组合层。
+mod endogenous;
+pub use endogenous::EndogenousPlanner;
 mod policy;
+mod reflection;
 use eve_cognition_api::*;
 use eve_cognition_loop_api::*;
 use eve_control_api::CommitState;
@@ -8,6 +11,9 @@ use eve_plugin_api::{
     PluginError, PluginFuture, PluginManifest, PluginResult, ServiceId, cleanup,
 };
 pub use policy::{EchoReceiptVerifier, PriorityDrivePolicy};
+pub use reflection::{
+    MAX_REFLECTION_JSON_BYTES, MAX_REFLECTION_TEXT_BYTES, ReflectionArtifact, ReflectionVerifier,
+};
 use std::{
     collections::BTreeSet,
     sync::{
