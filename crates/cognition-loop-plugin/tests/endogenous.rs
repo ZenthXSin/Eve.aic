@@ -1,6 +1,6 @@
 use eve_cognition_api::*;
 use eve_cognition_loop_api::*;
-use eve_cognition_loop_plugin::EndogenousPlanner;
+use eve_cognition_loop_plugin::{EndogenousPlanner, ReflectionPlannerFactory};
 use eve_cognition_plugin::{COGNITION_STATE_KEY, CognitionController, CognitionPlugin};
 use eve_kernel::{Kernel, KernelServices, backends::MemoryStateStore};
 use eve_plugin_api::{PluginError, PluginId, PluginResult, StateStore};
@@ -100,9 +100,13 @@ async fn derives_once_with_private_provenance_and_frozen_budget() {
     goal.expires_at_ms = Some(5000);
     seed(&admin, vec![goal]);
     let before = admin.snapshot().unwrap();
-    let result = planner(&admin, ReadAccess::User("alice".into()))
-        .reconcile(1000)
+    let public_planner = ReflectionPlannerFactory
+        .create(
+            Arc::new(admin.clone()),
+            options(ReadAccess::User("alice".into())),
+        )
         .unwrap();
+    let result = public_planner.reconcile(1000).unwrap();
     assert_eq!(result.created_goal_ids.len(), 1);
     let after = admin.snapshot().unwrap();
     let child = &after.state.goals[&result.created_goal_ids[0]];

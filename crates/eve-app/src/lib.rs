@@ -9,7 +9,9 @@ mod models;
 mod qqbot;
 mod services;
 
-pub use cognition::{COGNITION_HELP, CognitionOptions, run_cognition};
+pub use cognition::{
+    COGNITION_HELP, CognitionOptions, run_cognition, run_cognition_with_planner_factory,
+};
 pub use console::{ChatOutputError, ChatRunError};
 pub use error::AppFailure;
 pub use qqbot::{QQBOT_HELP, QqBotOptions, run_qqbot};
