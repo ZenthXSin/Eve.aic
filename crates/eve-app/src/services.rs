@@ -52,6 +52,7 @@ impl Tool for Echo {
 }
 pub(crate) struct CoreServices {
     manifest: PluginManifest,
+    context: Arc<dyn ContextAssembler>,
 }
 impl CoreServices {
     pub(crate) fn new() -> PluginResult<Self> {
@@ -65,7 +66,14 @@ impl CoreServices {
                 requirement: Some("^0.1".into()),
             });
         }
-        Ok(Self { manifest })
+        Ok(Self {
+            manifest,
+            context: Arc::new(Context),
+        })
+    }
+    pub(crate) fn with_context(mut self, context: Arc<dyn ContextAssembler>) -> Self {
+        self.context = context;
+        self
     }
 }
 impl Plugin for CoreServices {
@@ -74,7 +82,10 @@ impl Plugin for CoreServices {
     }
     fn start(&mut self, context: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         Box::pin(async move {
-            context.provide_service(ServiceId::new(CONTEXT)?, ContextService(Arc::new(Context)))?;
+            context.provide_service(
+                ServiceId::new(CONTEXT)?,
+                ContextService(self.context.clone()),
+            )?;
             context.provide_service(ServiceId::new(TOOL)?, ToolService(Arc::new(Echo)))?;
             Ok(None)
         })

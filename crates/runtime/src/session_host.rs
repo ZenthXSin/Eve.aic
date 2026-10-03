@@ -215,6 +215,10 @@ impl SessionLlmHost {
             .run_turn_inner(
                 TurnInput { text },
                 Some(started.history),
+                Some(eve_llm_api::ContextScope {
+                    session_id: started.lease.key.session_id.clone(),
+                    user_id: started.lease.key.user_id.clone(),
+                }),
                 admission.clone(),
                 events.as_ref(),
             )

@@ -71,6 +71,7 @@ impl Harness {
             CoreBootstrap {
                 host_config: LlmHostConfig::default(),
                 api_key: "resolver-test-key".into(),
+                context: None,
             },
             plugin,
         )

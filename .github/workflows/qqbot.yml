@@ -7,6 +7,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/qqbot.yml"
+      - ".github/workflows/qqbot-training.yml"
+      - ".github/qqbot-training-request.json"
   push:
     branches: [main]
     paths:
@@ -15,6 +17,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/qqbot.yml"
+      - ".github/workflows/qqbot-training.yml"
+      - ".github/qqbot-training-request.json"
 permissions:
   contents: read
 jobs:
@@ -50,3 +54,4 @@ jobs:
         run: |
           cargo +1.89.0 build -p eve-app --bin eve-qqbot --locked
           python3 connectors/qqbot/test/eve_e2e.py
+          python3 -m unittest discover -s connectors/qqbot/test -p 'training_test.py'

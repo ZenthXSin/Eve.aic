@@ -1,0 +1,10 @@
+[package]
+name = "eve-training-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-llm-api = { path = "../llm-api" }
+eve-plugin-api = { path = "../plugin-api" }
