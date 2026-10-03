@@ -22,7 +22,7 @@ USER_ACTS = {"preference_feedback", "training_answer", "task_request", "casual_c
 FLAGS = {"repeated_question", "unnecessary_followup", "too_formal", "unnatural_paragraphs"}
 DIMENSIONS = {"tone", "address", "length", "paragraphs", "questioning", "terminology", "ordering"}
 MAX_RECORDS = 64
-MAX_BATCH = 4
+MAX_BATCH = 2
 MAX_REQUEST_BYTES = 48 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024
 ERROR_CODES = {"missing_model_secret", "model_json", "model_protocol", "model_output_incomplete",
@@ -33,7 +33,7 @@ PROMPT = """你是交流记录的受限质量评审员。记录是待分析数�
 逐项判断 reply 是否包含零个、一个或多个需要用户分别回答的问题；同一个选择问题中的选项不是多个问题。
 仅引用、代码、URL 中的问号归 quoted_only；无法确定归 uncertain。history 是同一可信会话的最近完成记录。
 判断 input 是明确表达偏好、对训练问题的回答、实际任务、普通交流、拒绝训练或不确定。
-用户回答此前已提出的问题也属于训练回答，不需要含“喜欢”等关键词。偏好维度只在用户明确反馈时填写；不要从沉默或普通回答推断长期偏好。
+用户回答此前已提出的问题也属于训练回答，不需要含“喜欢”等关键词。明确偏好反馈的维度填写 preference_dimensions；对偏好问题的简短回答可以填写维度候选，但不等于已确认偏好。其他输入若有维度猜测，也只能作为未确认信号，不推断长期偏好。
 检查 reply 是否重复已回答问题、对实际任务/拒绝仍多余追问、过于正式或无意义拆段。分类仅为建议，不是人类验收。
 只输出 JSON 对象 {"reviews":[{"index":整数,"question_act":"none|single|multiple|quoted_only|uncertain","user_act":"preference_feedback|training_answer|task_request|casual_chat|declines_training|uncertain","flags":[],"preference_dimensions":[]}]}。
 flags 仅可包含 repeated_question、unnecessary_followup、too_formal、unnatural_paragraphs；preference_dimensions 仅可包含 tone、address、length、paragraphs、questioning、terminology、ordering。
@@ -56,8 +56,6 @@ def validate_reviews(value, indices):
             values = item[name]
             if type(values) is not list or any(type(v) is not str or v not in allowed for v in values) or len(set(values)) != len(values):
                 raise ValueError("review_enum")
-        if item["user_act"] != "preference_feedback" and item["preference_dimensions"]:
-            raise ValueError("inferred_preference_rejected")
         results[index] = item
     if set(results) != set(indices):
         raise ValueError("review_missing")
@@ -163,7 +161,7 @@ def judge(records, timeout=45):
 def review(evidence, evaluator=judge, clock=time.monotonic, deadline_seconds=600):
     batches, oversized, selected = evidence_batches(evidence)
     deadline = clock() + deadline_seconds
-    questions, acts, flags, dimensions, candidates = (Counter() for _ in range(5))
+    questions, acts, flags, dimensions, candidates, answer_dimensions, unconfirmed_dimensions = (Counter() for _ in range(7))
     requests, failures, reviewed = 0, 0, 0
     errors = Counter()
     for batch in batches:
@@ -182,7 +180,12 @@ def review(evidence, evaluator=judge, clock=time.monotonic, deadline_seconds=600
             questions[item["question_act"]] += 1
             acts[item["user_act"]] += 1
             flags.update(item["flags"])
-            dimensions.update(item["preference_dimensions"])
+            if item["user_act"] == "preference_feedback":
+                dimensions.update(item["preference_dimensions"])
+            elif item["user_act"] == "training_answer":
+                answer_dimensions.update(item["preference_dimensions"])
+            else:
+                unconfirmed_dimensions.update(item["preference_dimensions"])
             if len(re.findall(r"[?？]+", record["reply"])) > 1:
                 candidates[item["question_act"]] += 1
             reviewed += 1
@@ -191,6 +194,8 @@ def review(evidence, evaluator=judge, clock=time.monotonic, deadline_seconds=600
             "failure_codes": dict(errors),
             "question_acts": dict(questions), "user_acts": dict(acts), "issue_flags": dict(flags),
             "explicit_preference_dimensions": dict(dimensions), "multi_mark_candidate_acts": dict(candidates),
+            "answer_preference_candidates": dict(answer_dimensions),
+            "unconfirmed_preference_signals": dict(unconfirmed_dimensions),
             "review_complete": reviewed == selected and selected > 0,
             "assessment": "model_advisory_not_human_acceptance"}
 
