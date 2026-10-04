@@ -1,7 +1,12 @@
 import importlib.util
+import contextlib
+import io
 import json
+import os
 from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("compare", Path(__file__).resolve().parents[1] / "training-compare.py")
 compare = importlib.util.module_from_spec(spec)
@@ -19,6 +24,25 @@ def evaluator(records):
 
 
 class Comparisons(unittest.TestCase):
+    def test_public_cli_never_reads_private_source_secret_or_persists_generated_text(self):
+        result = {"complete": True, "advisory_non_regression": True}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "summary.json"
+            with patch.dict(os.environ, {}, clear=True), \
+                 patch("sys.argv", ["training-compare.py", "--synthetic", "--output", str(output)]), \
+                 patch.object(compare.review, "verify_source", side_effect=AssertionError("private source read")), \
+                 patch.object(compare.review.window, "seal", side_effect=AssertionError("QQ secret read")), \
+                 patch.object(compare, "compare", return_value=(result, [{"reply": "unpublished generated text"}])) as run, \
+                 contextlib.redirect_stdout(io.StringIO()) as printed:
+                compare.main()
+            report = json.loads(output.read_text())
+            self.assertEqual(report["evidence_kind"], "public_synthetic")
+            self.assertEqual(len(run.call_args.args[0]), 12)
+            self.assertEqual(len(report["candidate_prompt_sha256"]), 64)
+            self.assertEqual(len(report["fixture_sha256"]), 64)
+            self.assertNotIn("unpublished generated text", output.read_text() + printed.getvalue())
+            self.assertEqual(list(Path(directory).iterdir()), [output])
+
     def test_candidate_pairs_same_real_history_bounded_and_no_private_output(self):
         seen = []
         def generate(prompt, identity, record, timeout):

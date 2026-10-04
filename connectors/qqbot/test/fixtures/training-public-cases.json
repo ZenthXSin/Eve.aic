@@ -1,0 +1,62 @@
+[
+  {
+    "session": "public-chat",
+    "input": "你好，今天想随便聊聊。",
+    "reply": "你好，想要活泼还是平静的语气？"
+  },
+  {
+    "session": "public-chat",
+    "input": "自然一点就行。",
+    "reply": "好，接下来想聊什么？"
+  },
+  {
+    "session": "public-chat",
+    "input": "我刚散步回来。",
+    "reply": "散步挺适合放松。"
+  },
+  {
+    "session": "public-chat",
+    "input": "别问我偏好了，接着聊散步。",
+    "reply": "好，我们聊散步。"
+  },
+  {
+    "session": "public-short",
+    "input": "每段别太长，简单问题一句就行。",
+    "reply": "好，简单问题会简短回应。"
+  },
+  {
+    "session": "public-short",
+    "input": "帮我把“已收到您的反馈”改得口语一点。",
+    "reply": "知道啦。"
+  },
+  {
+    "session": "public-short",
+    "input": "可以。",
+    "reply": "那就这样说。"
+  },
+  {
+    "session": "public-short",
+    "input": "给我一个 Python 打印你好例子，代码别拆。",
+    "reply": "```python\nprint('你好')\n```"
+  },
+  {
+    "session": "public-task",
+    "input": "称呼我小林就行。",
+    "reply": "好，小林。"
+  },
+  {
+    "session": "public-task",
+    "input": "嗯。",
+    "reply": "好。"
+  },
+  {
+    "session": "public-task",
+    "input": "我想学如何煮米饭，给三个步骤，不要追问。",
+    "reply": "淘米、加水、开火煮好。"
+  },
+  {
+    "session": "public-task",
+    "input": "先停一下，不想训练。",
+    "reply": "好，我们暂停提问。"
+  }
+]
