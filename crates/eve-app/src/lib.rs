@@ -10,7 +10,9 @@ mod qqbot;
 mod services;
 mod storage;
 
-pub use cognition::{COGNITION_HELP, CognitionOptions, run_cognition};
+pub use cognition::{
+    COGNITION_HELP, CognitionOptions, run_cognition, run_cognition_with_planner_factory,
+};
 pub use console::{ChatOutputError, ChatRunError};
 pub use error::AppFailure;
 pub use qqbot::{QQBOT_HELP, QqBotOptions, run_qqbot};
@@ -175,6 +177,7 @@ pub async fn run_console(
 pub(crate) struct CoreBootstrap {
     host_config: LlmHostConfig,
     api_key: String,
+    context: Option<Arc<dyn eve_llm_api::ContextAssembler>>,
 }
 
 pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstrap, AppError> {
@@ -185,6 +188,7 @@ pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstr
     Ok(CoreBootstrap {
         host_config,
         api_key,
+        context: None,
     })
 }
 
@@ -227,10 +231,15 @@ async fn install_core_with_config(
     let CoreBootstrap {
         host_config,
         api_key,
+        context,
     } = bootstrap;
     kernel.register(Box::new(config_plugin))?;
     kernel.register(Box::new(SessionPlugin::new()?))?;
-    kernel.register(Box::new(services::CoreServices::new()?))?;
+    let mut core_services = services::CoreServices::new()?;
+    if let Some(context) = context {
+        core_services = core_services.with_context(context);
+    }
+    kernel.register(Box::new(core_services))?;
     let owner = PluginId::new(services::OWNER)?;
     kernel.start(&owner).await?;
     let entry = registry

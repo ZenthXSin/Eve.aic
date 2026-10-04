@@ -1,0 +1,42 @@
+name: 训练策略公开场景对照
+on:
+  push:
+    branches: [main]
+    paths: [".github/qqbot-policy-benchmark-request.json"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: eve-qqbot-policy-public-benchmark
+  cancel-in-progress: false
+jobs:
+  benchmark:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: 核对公开场景请求
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          request = json.loads(Path('.github/qqbot-policy-benchmark-request.json').read_text())
+          if set(request) != {'version', 'request_id'} or type(request['version']) is not int or request['version'] != 1 or not isinstance(request['request_id'], str) or not request['request_id']:
+              raise SystemExit('公开场景请求无效')
+          print('仅使用仓库中新写的公开场景；不下载、读取或解密训练记录。')
+          PY
+      - name: 公开场景同输入旧策略与候选策略对照
+        env:
+          EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
+        run: python3 connectors/qqbot/training-compare.py --synthetic --output "$RUNNER_TEMP/public-policy-comparison.json"
+      - name: 保存公开场景计数
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: eve-qqbot-public-policy-comparison
+          path: ${{ runner.temp }}/public-policy-comparison.json
+          if-no-files-found: warn
+          retention-days: 7

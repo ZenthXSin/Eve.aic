@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
-import { createBridge, consume, optionsFromEnv } from "../bridge-core.mjs";
-function fixture({ fail = false, limit = 128 } = {}) {
+import { createBridge, consume, optionsFromEnv, MAX_MESSAGE_ID_BYTES } from "../bridge-core.mjs";
+function fixture({ fail = false, limit = 128, appId = "1904159860" } = {}) {
   const frames = [], sent = [], handlers = new Map();
   const bot = {
+    appId,
     on: (event, handler) => handlers.set(event, handler),
     stop: () => handlers.set("stopped", true),
     async sendText(target, text) {
@@ -23,6 +24,10 @@ function fixture({ fail = false, limit = 128 } = {}) {
   return { bridge, frames, sent, message, handlers };
 }
 test("固定默认 AppID，仅密钥必填，sandbox 与最小 intent", () => {
+  for (const env of [{ QQBOT_APP_SECRET: "test-only" }, { QQBOT_APP_SECRET: "test-only", QQBOT_SANDBOX: "false" }]) {
+    assert.equal(optionsFromEnv(env).baseUrl, "https://api.sgroup.qq.com");
+    assert.equal(optionsFromEnv(env).intents, 1 << 25);
+  }
   const opt = optionsFromEnv({ QQBOT_APP_SECRET: "test-only", QQBOT_SANDBOX: "true" });
   assert.equal(opt.appId, "1904159860");
   assert.equal(opt.intents, 1 << 25);
@@ -75,4 +80,113 @@ test("官方不透明消息 ID 的标点保持原值，正文中的提及不被�
   await f.bridge.command({ type: "reply", version: 1, id, text: "答复" });
   assert.equal(f.sent[0].target.msgId, id);
   assert.equal(f.frames.at(-1).ok, true);
+});
+
+test("超过旧上限的群消息 ID 原样回复，253 字节边界与 UTF-8 字节一致", async () => {
+  assert.equal(MAX_MESSAGE_ID_BYTES, 253);
+  for (const id of ["ROBOT1.0_" + "g".repeat(128), "x".repeat(253), "界".repeat(84) + "!"]) {
+    const f = fixture(); f.message("group", id);
+    assert.equal(f.frames.find(x => x.type === "message").id, id);
+    await f.bridge.command({ type: "reply", version: 1, id, text: "答复" });
+    assert.equal(f.sent[0].target.msgId, id);
+    assert.equal(f.frames.at(-1).ok, true);
+  }
+  for (const id of ["x".repeat(254), "界".repeat(85), " x", "x\n", "x\u0000y"]) {
+    const f = fixture(); f.message("group", id);
+    assert.equal(f.frames.filter(x => x.type === "message").length, 0);
+    assert.equal(f.sent.length, 0);
+  }
+});
+
+test("群聊接纳官方 @ 事件，拒绝普通群消息与机器人消息", async () => {
+  const f = fixture();
+  const incoming = {
+    kind: "group", messageId: "group-at-1", senderId: "user-1", content: "/train start",
+    rawEventType: "GROUP_MESSAGE_CREATE", groupOpenid: "group-1",
+    replyTarget: { scope: "group", targetId: "group-1", msgId: "group-at-1" },
+  };
+  f.handlers.get("message")({}, incoming);
+  f.handlers.get("message")({}, { ...incoming, rawEventType: "GROUP_AT_MESSAGE_CREATE", senderIsBot: true });
+  assert.equal(f.frames.filter(x => x.type === "message").length, 0);
+  f.handlers.get("message")({}, { ...incoming, rawEventType: "GROUP_AT_MESSAGE_CREATE" });
+  assert.equal(f.frames.filter(x => x.type === "message").length, 1);
+  await f.bridge.command({ type: "reply", version: 1, id: "group-at-1", text: "你喜欢怎样的称呼？" });
+  assert.deepEqual(f.sent, [{ target: incoming.replyTarget, text: "你喜欢怎样的称呼？" }]);
+});
+
+test("普通群事件携带服务端自身提及时可原路回复，不依赖 AppID 等于 openid", async () => {
+  const f = fixture();
+  const incoming = {
+    kind: "group", messageId: "group-mention-1", senderId: "user-1", content: "你好 <@another-user>",
+    rawEventType: "GROUP_MESSAGE_CREATE", groupOpenid: "group-1",
+    mentions: [null, { member_openid: "bot-openid", is_you: true }, { is_you: false }],
+    replyTarget: { scope: "group", targetId: "group-1", msgId: "group-mention-1" },
+  };
+  f.handlers.get("message")({}, incoming);
+  assert.equal(f.frames.find(x => x.type === "message").text, incoming.content);
+  await f.bridge.command({ type: "reply", version: 1, id: incoming.messageId, text: "答复" });
+  assert.deepEqual(f.sent, [{ target: incoming.replyTarget, text: "答复" }]);
+});
+
+test("普通群事件识别当前 AppID 的两种 @ 标记，拒绝其他提及、伪标记与未知事件", () => {
+  const incoming = {
+    kind: "group", messageId: "group-mention-2", senderId: "user-1", content: "你好",
+    rawEventType: "GROUP_MESSAGE_CREATE", groupOpenid: "group-1",
+    replyTarget: { scope: "group", targetId: "group-1", msgId: "group-mention-2" },
+  };
+  for (const content of ["<@102075770> 你好", "你好 <@!102075770>"]) {
+    const f = fixture({ appId: "102075770" });
+    f.handlers.get("message")({}, { ...incoming, content });
+    assert.equal(f.frames.find(x => x.type === "message").text, content.startsWith("<@") ? "你好" : content);
+  }
+  for (const change of [
+    {}, { content: "@机器人 你好" }, { content: "<@!1904159860> 你好" },
+    { content: "<@1020757700> 你好" }, { content: "<@102075770" },
+    { mentions: [{ is_you: false }, { is_you: "true" }] }, { mentions: { is_you: true } },
+    { content: "<@102075770> 你好", senderIsBot: true },
+    { rawEventType: "UNKNOWN", mentions: [{ is_you: true }] },
+    { rawEventType: "UNKNOWN", content: "<@102075770> 你好" },
+  ]) {
+    const f = fixture({ appId: "102075770" });
+    f.handlers.get("message")({}, { ...incoming, ...change });
+    assert.equal(f.frames.filter(x => x.type === "message").length, 0);
+    assert.equal(f.sent.length, 0);
+  }
+  for (const appId of [undefined, "", ".*", "102075770>"]) {
+    const f = fixture({ appId });
+    f.handlers.get("message")({}, { ...incoming, content: "<@102075770> 你好" });
+    assert.equal(f.frames.filter(x => x.type === "message").length, 0);
+  }
+});
+
+test("原生训练命令只剥离开头已确认的自身 @，保留其他提及与原回复路由", async () => {
+  for (const mention of [
+    { member_openid: "bot-openid", is_you: true },
+    { user_openid: "bot-openid", is_you: true },
+    { id: "bot-openid", is_you: true },
+  ]) {
+    const f = fixture({ appId: "102075770" });
+    const target = { scope: "group", targetId: "group-1", msgId: "native-1" };
+    const incoming = { kind: "group", messageId: "native-1", senderId: "user-1",
+      rawEventType: "GROUP_MESSAGE_CREATE", groupOpenid: "group-1", mentions: [mention],
+      replyTarget: target, content: " <@!bot-openid> /train stats " };
+    f.handlers.get("message")({}, incoming);
+    assert.equal(f.frames.find(x => x.type === "message").text, "/train stats");
+    await f.bridge.command({ type: "reply", version: 1, id: "native-1", text: "统计" });
+    assert.deepEqual(f.sent[0].target, target);
+  }
+  for (const content of ["<@other-user> /train reset", "正文 <@bot-openid> /train stop"]) {
+    const f = fixture();
+    f.handlers.get("message")({}, { kind: "group", messageId: "native-2", senderId: "user-1",
+      rawEventType: "GROUP_MESSAGE_CREATE", groupOpenid: "group-1",
+      mentions: [{ member_openid: "bot-openid", is_you: true }],
+      replyTarget: { scope: "group", targetId: "group-1", msgId: "native-2" }, content });
+    assert.equal(f.frames.find(x => x.type === "message").text, content);
+  }
+  const f = fixture();
+  f.handlers.get("message")({}, { kind: "group", messageId: "empty-1", senderId: "user-1",
+    rawEventType: "GROUP_MESSAGE_CREATE", groupOpenid: "group-1",
+    mentions: [{ member_openid: "bot-openid", is_you: true }],
+    replyTarget: { scope: "group", targetId: "group-1", msgId: "empty-1" }, content: "<@bot-openid>" });
+  assert.equal(f.frames.filter(x => x.type === "message").length, 0);
 });

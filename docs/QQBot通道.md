@@ -1,5 +1,7 @@
 # QQBot 通道插件
 
+新增[内置表达与主动提问训练](./主动提问训练.md)：从用户原文保存表达统计，`/train start`、`/train stop` 按可信会话启停，`/train stats` 查看、`/train reset` 重置；六小时上限测试结束后保存计数报告和加密交流证据。群聊处理官方 @ 事件或携带已确认自身提及的群事件，平台授权及沙箱群范围仍须在 QQ 开放平台控制台配置。
+
 首版接入官方 QQ 开放平台的 C2C 私聊与群 @ 文本。复用腾讯 `@tencent-connect/qqbot-nodejs` 1.0.4，使用 Node 22 桥接 WebSocket 与被动文本回复；Rust `eve-qqbot-plugin` 只依赖公开 Control/Message/Session/Plugin 契约，宿主 `eve-qqbot` 与终端共用 AGENT、配置、主模型、会话及 echo 装配。Kernel 不包含 QQ 业务。来源、版本与 MIT 许可见 [THIRD_PARTY](../connectors/qqbot/THIRD_PARTY.md)。
 
 ## 启动与手机配置
@@ -21,7 +23,7 @@ QQBOT_SANDBOX=true ./target/debug/eve-qqbot --state-dir .eve-qqbot
 
 手机可在 [GitHub Actions Secrets](https://github.com/ZenthXSin/Eve.aic/settings/secrets/actions) 添加 `QQBOT_APP_SECRET`；已有模型 Secret 继续使用。代码合入 main 后，在 [QQBot 首次真实交互](https://github.com/ZenthXSin/Eve.aic/actions/workflows/qqbot-interaction.yml) 点击 Run workflow，默认沙箱与 300 秒窗口；日志出现窗口启动后，向测试机器人私聊或在测试群 @ 发送文字。至少一次接收、模型完成和 QQ 成功发送且没有失败，报告才判定通过。超时退出不等于成功交互。
 
-这只是工作流测试，没有部署到测试服务器。托管 Runner 的临时状态在任务结束后清理，不是持续运行的机器人宿主；长期运行应使用持久目录与进程管理。真实交互只上传无正文的计数报告，不上传 Session、QQ openid、输入、回复、密钥或原始诊断。
+这只是工作流测试，没有部署到测试服务器。托管 Runner 的临时状态在任务结束后清理，不是持续运行的机器人宿主；长期运行应使用持久目录与进程管理。首次真实交互工作流只上传无正文计数；专用训练工作流另以加密包保存交流证据和状态，见[主动提问训练](./主动提问训练.md)。
 
 ## 桥接契约与兼容
 
@@ -29,7 +31,9 @@ Node → Rust JSONL：`ready`、`message {id,scope,target_id,user_id,text}`、`d
 
 stdout 专用于 JSONL，SDK 日志后端为空，异常正文/stack/token 不转发。桥接子进程清空宿主环境，只保留基本执行环境与 QQ 凭据，不接收模型 key；凭据不放 argv。单帧 64 KiB、输入/回复 32 KiB，Node pending 最多 128、Rust 待运行最多 16。容量满时 warning 并拒绝新增，保留已有消息和状态。
 
-只订阅 group/C2C intent `1 << 25`，跳过机器人消息、非文本和不支持的范围。Node 保存原事件的 ReplyTarget；Rust 只能凭原消息 id 回复，不能在命令中指定任意目标。被动回复始终关联原 scope、target 和 msg_id，不自动改为主动推送。QQ群原事件来源、SDK 可选元数据与平台错误码不影响合法文本处理。
+平台消息 ID 是不透明字符串，原始标点和内容必须保留。Node 入站/投递与 Rust 入站/恢复统一按 UTF-8 字节限制为 253 字节；这能接纳本次正式群实际出现的 137 字节 ID，并使 `qq:` 前缀后的 Control 任务 ID 保持在公开契约的 256 字节内。空值、首尾空白、控制字符与超长 ID 仍拒绝；AppID、用户和目标 openid 继续沿用独立的 128 字节字母数字/下划线/连字符限制，不随消息 ID 放宽。持久化版本仍为 1，原有回执原样恢复，新长 ID 保存后也能去重与恢复历史；不截断或改写 QQ 被动回复的 `msg_id`。
+
+只订阅 group/C2C intent `1 << 25`，跳过机器人消息、非文本和不支持的范围。群 @ 接纳 `GROUP_AT_MESSAGE_CREATE`；`GROUP_MESSAGE_CREATE` 必须携带服务端 `mentions[].is_you === true`，或正文中的当前 AppID 标记 `<@AppID>` / `<@!AppID>`，才进入处理。这与锁定 SDK 的提及识别方式一致；普通群消息、仅提及其他账号、未知事件和不完整标记仍跳过，不把收到群消息等同于收到自身 @。正文中的提及保持原值。Node 保存原事件的 ReplyTarget；Rust 只能凭原消息 id 回复，不能在命令中指定任意目标。被动回复始终关联原 scope、target 和 msg_id，不自动改为主动推送。QQ群原事件来源、SDK 可选元数据与平台错误码不影响合法文本处理。
 
 ## 去重、提交与恢复
 

@@ -1,0 +1,70 @@
+name: QQ 训练记录受限复核
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: eve-qqbot-training-review
+  cancel-in-progress: false
+jobs:
+  review:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: 核对明确指定的正式训练来源
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, urllib.request
+          from pathlib import Path
+          request = json.loads(Path('.github/qqbot-training-review-request.json').read_text())
+          fields = {'version', 'request_id', 'source_run_id', 'source_sha'}
+          if not fields <= set(request) or set(request) - fields - {'compare'} or request['version'] != 1 or type(request.get('compare', False)) is not bool:
+              raise SystemExit('复核请求无效')
+          run_id, sha = request['source_run_id'], request['source_sha']
+          if type(run_id) is not int or run_id <= 0 or not re.fullmatch('[a-f0-9]{40}', sha):
+              raise SystemExit('来源标识无效')
+          api = urllib.request.Request('https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/actions/runs/' + str(run_id), headers={'Authorization': 'Bearer ' + os.environ['GITHUB_TOKEN'], 'Accept': 'application/vnd.github+json'})
+          with urllib.request.urlopen(api, timeout=20) as response:
+              run = json.load(response)
+          if run['path'] != '.github/workflows/qqbot-training.yml' or run['head_branch'] != 'main' or run['head_sha'] != sha or run['status'] != 'completed' or run['conclusion'] != 'success':
+              raise SystemExit('来源必须是已成功结束且提交匹配的 main 训练运行')
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write('SOURCE_RUN_ID=' + str(run_id) + '\n')
+              output.write('COMPARE_POLICY=' + str(request.get('compare', False)).lower() + '\n')
+          print('已核对训练来源，不启动 QQ 连接。')
+          PY
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: eve-qqbot-training-results
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/training-source
+      - name: 认证解密、核对回执并进行受限主模型分类
+        env:
+          QQBOT_APP_SECRET: ${{ secrets.QQBOT_APP_SECRET }}
+          EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
+        run: python3 connectors/qqbot/training-review.py --source "$RUNNER_TEMP/training-source" --output "$RUNNER_TEMP/training-review-summary.json"
+      - name: 相同历史输入的旧策略与候选策略对照
+        if: always() && env.COMPARE_POLICY == 'true'
+        env:
+          QQBOT_APP_SECRET: ${{ secrets.QQBOT_APP_SECRET }}
+          EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
+        run: python3 connectors/qqbot/training-compare.py --source "$RUNNER_TEMP/training-source" --output "$RUNNER_TEMP/training-comparison-summary.json"
+      - name: 保存无正文的复核计数
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: eve-qqbot-training-review
+          path: |
+            ${{ runner.temp }}/training-review-summary.json
+            ${{ runner.temp }}/training-comparison-summary.json
+            ${{ runner.temp }}/training-comparison-summary.enc
+          if-no-files-found: warn
+          retention-days: 7

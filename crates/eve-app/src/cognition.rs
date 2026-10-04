@@ -3,8 +3,8 @@ use crate::{AppError, AppFailure, config, core_bootstrap, models, services};
 use eve_cognition_api::*;
 use eve_cognition_loop_api::*;
 use eve_cognition_loop_plugin::{
-    CognitionLoopPlugin, EndogenousPlanner, LoopController, PriorityDrivePolicy,
-    ReflectionArtifact, ReflectionVerifier,
+    CognitionLoopPlugin, LoopController, PriorityDrivePolicy, ReflectionArtifact,
+    ReflectionPlannerFactory, ReflectionVerifier,
 };
 use eve_cognition_plugin::{CognitionController, CognitionPlugin};
 use eve_config_api::{
@@ -462,15 +462,15 @@ async fn run_window(
     options: &CognitionOptions,
     seconds: u64,
     max_executions: u16,
+    factory: &dyn EndogenousPlannerFactory,
 ) -> Result<Value, AppError> {
-    let planner = EndogenousPlanner::new(
-        Arc::new(admin.clone()),
-        EndogenousOptions {
-            scope: scope(SourceKind::User, INPUT_CHANNEL),
-            max_derivations: max_executions,
-            timeout_ms: 30_000,
-        },
-    )?;
+    let planner_options = EndogenousOptions {
+        scope: scope(SourceKind::User, INPUT_CHANNEL),
+        max_derivations: max_executions,
+        timeout_ms: 30_000,
+    };
+    planner_options.validate()?;
+    let planner = factory.create(Arc::new(admin.clone()), planner_options)?;
     let began = tokio::time::Instant::now();
     let deadline = began + Duration::from_secs(seconds);
     let stop = interrupted();
@@ -545,6 +545,15 @@ async fn run_window(
 }
 
 pub async fn run_cognition(options: CognitionOptions) -> Result<Value, AppError> {
+    run_cognition_with_planner_factory(options, Arc::new(ReflectionPlannerFactory)).await
+}
+
+/// 受信 Rust 宿主的规划器注入入口；CLI 默认使用内置反思策略。
+/// 工厂仅在 run 中、认知状态恢复后调用；错误仍经过同一插件停止和日志收尾。
+pub async fn run_cognition_with_planner_factory(
+    options: CognitionOptions,
+    factory: Arc<dyn EndogenousPlannerFactory>,
+) -> Result<Value, AppError> {
     let backends = KernelServices {
         state: crate::storage::open_state_store(
             &options.state_directory,
@@ -580,6 +589,7 @@ pub async fn run_cognition(options: CognitionOptions) -> Result<Value, AppError>
                     &options,
                     seconds,
                     max_executions,
+                    factory.as_ref(),
                 )
                 .await
             }

@@ -501,7 +501,7 @@ impl LlmHost {
         let admission = Arc::new(self.kernel.acquire_runtime_admission().await);
         self.for_turn()
             .map_err(|error| fail(error, TurnDiagnostics::default()))?
-            .run_turn_inner(input, None, admission, None)
+            .run_turn_inner(input, None, None, admission, None)
             .await
     }
 
@@ -514,7 +514,7 @@ impl LlmHost {
         let events = self.event_delivery(sink, None);
         let result = match self.for_turn() {
             Ok(host) => {
-                host.run_turn_inner(input, None, admission.clone(), Some(&events))
+                host.run_turn_inner(input, None, None, admission.clone(), Some(&events))
                     .await
             }
             Err(error) => Err(fail(error, TurnDiagnostics::default())),
@@ -546,6 +546,7 @@ impl LlmHost {
         &self,
         input: TurnInput,
         history: Option<Vec<ChatMessage>>,
+        scope: Option<eve_llm_api::ContextScope>,
         admission: Arc<RuntimeAdmissionGuard>,
         events: Option<&EventDelivery<'_>>,
     ) -> Result<TurnOutput, TurnFailure> {
@@ -553,7 +554,7 @@ impl LlmHost {
         let prepared = tokio::select! {
             biased;
             _ = wait_closed(events) => Err(LlmError::Cancelled),
-            prepared = self.prepare(&input, &mut diagnostics) => prepared,
+            prepared = self.prepare(&input, scope, &mut diagnostics) => prepared,
         };
         let mut prepared = match prepared {
             Ok(value) => value,
@@ -685,13 +686,15 @@ impl LlmHost {
     async fn prepare(
         &self,
         input: &TurnInput,
+        scope: Option<eve_llm_api::ContextScope>,
         diagnostics: &mut TurnDiagnostics,
     ) -> Result<PreparedTurn, LlmError> {
         if input.text.trim().is_empty() {
             return Err(LlmError::Context("本轮输入不能为空".into()));
         }
         let assembler = self.context_service()?;
-        let context = contain_panic(async { assembler.assemble(input.clone()).await }).await?;
+        let context =
+            contain_panic(async { assembler.assemble_scoped(input.clone(), scope).await }).await?;
         validate_context(&context)?;
         let mut tools = Vec::with_capacity(self.bindings.len());
         for binding in &self.bindings {

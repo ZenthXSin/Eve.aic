@@ -1,6 +1,6 @@
 //! 有界认知业务插件；使用公开状态/执行契约，模型装配留在组合层。
 mod endogenous;
-pub use endogenous::EndogenousPlanner;
+pub use endogenous::{EndogenousPlanner, ReflectionPlannerFactory};
 mod policy;
 mod reflection;
 use eve_cognition_api::*;

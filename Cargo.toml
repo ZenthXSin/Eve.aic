@@ -21,6 +21,8 @@ members = [
     "crates/runtime",
     "crates/eve-app",
     "crates/qqbot-plugin",
+    "crates/training-api",
+    "crates/training-plugin",
     "crates/example-plugins",
 ]
 resolver = "2"

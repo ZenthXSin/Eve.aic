@@ -7,6 +7,13 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/qqbot.yml"
+      - ".github/workflows/qqbot-training.yml"
+      - ".github/qqbot-training-request.json"
+      - ".github/scripts/**"
+      - ".github/workflows/qqbot-training-review.yml"
+      - ".github/qqbot-training-review-request.json"
+      - ".github/workflows/qqbot-policy-benchmark.yml"
+      - ".github/qqbot-policy-benchmark-request.json"
   push:
     branches: [main]
     paths:
@@ -15,6 +22,13 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/qqbot.yml"
+      - ".github/workflows/qqbot-training.yml"
+      - ".github/qqbot-training-request.json"
+      - ".github/scripts/**"
+      - ".github/workflows/qqbot-training-review.yml"
+      - ".github/qqbot-training-review-request.json"
+      - ".github/workflows/qqbot-policy-benchmark.yml"
+      - ".github/qqbot-policy-benchmark-request.json"
 permissions:
   contents: read
 jobs:
@@ -50,3 +64,7 @@ jobs:
         run: |
           cargo +1.89.0 build -p eve-app --bin eve-qqbot --locked
           python3 connectors/qqbot/test/eve_e2e.py
+          python3 -m unittest discover -s connectors/qqbot/test -p 'training_test.py'
+          python3 -m unittest discover -s .github/scripts -p 'test_qqbot_replace_run.py'
+          python3 -m unittest discover -s connectors/qqbot/test -p 'review_test.py'
+          python3 -m unittest discover -s connectors/qqbot/test -p 'compare_test.py'
