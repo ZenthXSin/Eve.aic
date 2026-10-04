@@ -11,3 +11,6 @@
 /.eve/
 /.eve-cognition/
 /.eve-model-check-*/
+/.eve-qqbot/
+/connectors/qqbot/node_modules/
+__pycache__/

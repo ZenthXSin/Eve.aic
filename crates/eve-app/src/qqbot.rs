@@ -6,13 +6,16 @@ use eve_qqbot_plugin::{
     DEFAULT_QQBOT_APP_ID, QQBOT_PLUGIN_ID, QQBOT_STATUS_SERVICE_ID, QqBotConfig, QqBotPlugin,
     QqBotStatus, QqBotStatusHandle,
 };
+use eve_training_api::{TRAINING_PLUGIN_ID, TRAINING_SERVICE_ID, TrainingServiceHandle};
+use eve_training_plugin::{TrainingContext, TrainingPlugin};
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--state-dir 目录] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--state-dir 目录] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
 QQ 普通文字排队开始新轮；逐行 /add 内容、/correct 内容、/cancel 控制当前任务。
+--training 默认开启主动提问；/train start、/train stop、/train status 按会话启停/查询。
 修订先取消并等待；已有工具操作时只澄清，/new 内容明确开始独立任务。
 Ctrl+C 或 SIGTERM 取消在途轮次、等待保存并停止桥接子进程。";
 /// 密钥只在创建插件时从环境读取，不包含在启动参数和 Debug 中。
@@ -23,6 +26,7 @@ pub struct QqBotOptions {
     pub node_program: OsString,
     pub bridge_script: PathBuf,
     pub bridge_args: Vec<OsString>,
+    pub training: bool,
 }
 impl Default for QqBotOptions {
     fn default() -> Self {
@@ -32,6 +36,7 @@ impl Default for QqBotOptions {
             node_program: "node".into(),
             bridge_script: "connectors/qqbot/bridge.mjs".into(),
             bridge_args: Vec::new(),
+            training: false,
         }
     }
 }
@@ -42,6 +47,10 @@ impl QqBotOptions {
         while let Some(arg) = args.next() {
             if arg == "--help" || arg == "-h" {
                 return Ok(None);
+            }
+            if arg == "--training" {
+                options.training = true;
+                continue;
             }
             let value = args.next().ok_or("QQBot 参数缺少值")?;
             if value.is_empty() {
@@ -80,7 +89,7 @@ pub async fn run_qqbot(options: QqBotOptions) -> Result<QqBotStatus, AppError> {
         Ok("" | "false") | Err(_) => false,
         _ => return Err("QQBOT_SANDBOX 必须为 true 或 false".into()),
     };
-    let bootstrap = core_bootstrap(&options.agent_path)?;
+    let mut bootstrap = core_bootstrap(&options.agent_path)?;
     let plugin = QqBotPlugin::new(QqBotConfig {
         node_program: options.node_program,
         bridge_script: options.bridge_script,
@@ -88,7 +97,8 @@ pub async fn run_qqbot(options: QqBotOptions) -> Result<QqBotStatus, AppError> {
         app_id: std::env::var("QQBOT_APP_ID").unwrap_or_else(|_| DEFAULT_QQBOT_APP_ID.into()),
         app_secret,
         sandbox,
-    })?;
+    })?
+    .with_training()?;
     let backends = KernelServices {
         state: Arc::new(FileStateStore::open(&options.state_directory)?),
         ..KernelServices::default()
@@ -98,6 +108,15 @@ pub async fn run_qqbot(options: QqBotOptions) -> Result<QqBotStatus, AppError> {
     let logger = backends.logger.clone();
     let kernel = Kernel::with_services(backends);
     let result = async {
+        kernel.register(Box::new(TrainingPlugin::new(options.training)?))?;
+        kernel.start(&PluginId::new(TRAINING_PLUGIN_ID)?).await?;
+        let training = registry
+            .get(&ServiceId::new(TRAINING_SERVICE_ID)?)?
+            .ok_or("训练服务缺失")?
+            .value
+            .downcast::<TrainingServiceHandle>()
+            .map_err(|_| "训练服务类型错误")?;
+        bootstrap.context = Some(Arc::new(TrainingContext(training.0.clone())));
         install_core(
             &kernel,
             registry.clone(),
@@ -118,6 +137,20 @@ pub async fn run_qqbot(options: QqBotOptions) -> Result<QqBotStatus, AppError> {
             .downcast::<QqBotStatusHandle>()
             .map_err(|_| "QQBot 状态服务类型错误")?;
         let mut status = handle.status.clone();
+        // stdout 仍只保留最终 JSON 摘要，stderr 不含正文和凭据。
+        while !status.borrow().ready && !status.borrow().closed {
+            tokio::select! {
+                result = interrupted() => {
+                    result?;
+                    handle.request_stop();
+                    break;
+                },
+                result = status.changed() => { result.map_err(|_| "QQBot 就绪通知丢失")?; },
+            }
+        }
+        if status.borrow().ready && !status.borrow().closed {
+            eprintln!("EVE_QQBOT_READY");
+        }
         tokio::select! {
             result = interrupted() => {
                 result?;

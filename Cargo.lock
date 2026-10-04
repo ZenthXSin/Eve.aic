@@ -149,6 +149,8 @@ dependencies = [
  "eve-runtime",
  "eve-session-api",
  "eve-session-plugin",
+ "eve-training-api",
+ "eve-training-plugin",
  "serde_json",
  "tempfile",
  "tokio",
@@ -323,6 +325,7 @@ dependencies = [
  "eve-message-api",
  "eve-plugin-api",
  "eve-session-api",
+ "eve-training-api",
  "ring",
  "serde",
  "serde_json",
@@ -377,6 +380,28 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "eve-training-api"
+version = "0.1.0"
+dependencies = [
+ "eve-llm-api",
+ "eve-plugin-api",
+]
+
+[[package]]
+name = "eve-training-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-kernel",
+ "eve-llm-api",
+ "eve-plugin-api",
+ "eve-training-api",
+ "ring",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

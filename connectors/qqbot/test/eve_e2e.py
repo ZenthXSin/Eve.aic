@@ -124,7 +124,7 @@ class Acceptance(unittest.TestCase):
         return {"touch": str(self.gate(name))}
 
     def run_eve(self, messages=(), send_fail=False, app="1904159860", success=True, cancel=False,
-            environment=None, script=None, cancel_when=None):
+            environment=None, script=None, cancel_when=None, training=False):
         self.runs += 1
         scenario = self.work / "scenario.json"
         events = self.work / f"bridge-events-{self.runs}.jsonl"
@@ -141,6 +141,8 @@ class Acceptance(unittest.TestCase):
         command = [str(BINARY), "--state-dir", str(self.work / "state"),
             "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
             "--bridge-arg", str(scenario)]
+        if training:
+            command.append("--training")
         if cancel:
             child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             try:
@@ -177,6 +179,142 @@ class Acceptance(unittest.TestCase):
         return {owner: {key: json.loads(bytes(value)) for key, value in entries.items()}
             for owner, entries in state["entries"].items()}
 
+    def has_training(self, request):
+        return any(m["role"] == "system" and "主动提问训练模式" in m.get("content", "") for m in request["messages"])
+
+    def test_builtin_expression_learning_from_old_receipts_is_local_idempotent_and_resettable(self):
+        # 旧版记录没有表达统计；启动新版仅在本地导入，不回放请求或投递。
+        self.run_eve([self.message(f"el-{i}", "今天不错", scope="group") for i in range(8)])
+        state_path = self.work / "state/state.json"
+        saved = json.loads(state_path.read_text())
+        saved["entries"].pop("eve.training", None)
+        state_path.write_text(json.dumps(saved))
+        before = len(self.requests)
+        self.run_eve(training=True)
+        self.assertEqual(len(self.requests), before)
+        self.assertEqual(self.replies(), [])
+        learned = self.documents()["eve.training"]["expression.v1"]
+        self.assertEqual(len(learned["rows"]), 8)
+        self.assertNotIn("今天不错", json.dumps(learned, ensure_ascii=False))
+        self.run_eve(training=True)
+        self.assertEqual(self.documents()["eve.training"]["expression.v1"], learned)
+        self.run_eve([self.message("el-stats", "/train stats", "本会话已学习 8 条有效用户表达：字数中位数 4，短消息 100%，单段消息 100%。当前要求始终优先；这是本地表达统计。", scope="group"),
+                      self.message("el-other", "/train stats", "本会话暂无有效表达样本；训练开启后会从普通交流中学习。", scope="group", user="user-2"),
+                      self.message("el-task", "详细解释这个任务", scope="group")], training=True)
+        self.assertEqual(len(self.requests), before + 1)
+        self.assertTrue(any(m["role"] == "system" and "当前可信会话" in m.get("content", "") for m in self.requests[-1]["messages"]))
+        self.run_eve([self.message("el-reset", "/train reset", "已重置本会话的表达统计，原始聊天记录保留；旧消息不会再次计入，可继续从新消息学习。", scope="group")], training=True)
+        self.run_eve(training=True)
+        self.assertFalse(any(r["active"] for r in self.documents()["eve.training"]["expression.v1"]["rows"]))
+        self.assertEqual(len(self.requests), before + 1)
+        self.assertEqual(len(self.sessions()[0]["turns"]), 9)
+
+    def test_training_questions_use_real_history_stop_persists_and_ordinary_chat_continues(self):
+        self.provider_steps = {1: {"text": "你喜欢我怎样称呼你？"}, 2: {"text": "收到。你希望回复更简短吗？"}}
+        self.run_eve([self.message("train-1", "/train start", "你喜欢我怎样称呼你？"),
+                      self.message("train-2", "叫我小星", "收到。你希望回复更简短吗？"),
+                      self.message("train-3", "/train stop", "已结束当前会话的主动提问训练，已完成记录保留；普通聊天仍可继续。"),
+                      self.message("train-4", "普通任务")])
+        self.assertEqual(len(self.requests), 3)
+        self.assertTrue(self.has_training(self.requests[0]))
+        self.assertTrue(self.has_training(self.requests[1]))
+        self.assertFalse(self.has_training(self.requests[2]))
+        self.assertIn({"role": "assistant", "content": "你喜欢我怎样称呼你？"}, self.requests[1]["messages"])
+        self.assertEqual([t["input"] for t in self.sessions()[0]["turns"]], ["/train start", "叫我小星", "普通任务"])
+        # 显式 stop 的持久开关覆盖下一进程的默认训练选项。
+        self.run_eve([self.message("train-5", "重启后聊天")], training=True)
+        self.assertFalse(self.has_training(self.requests[-1]))
+
+    def test_training_group_scope_does_not_change_other_sender_or_group(self):
+        self.run_eve([self.message("tg-1", "/train stop", "已结束当前会话的主动提问训练，已完成记录保留；普通聊天仍可继续。", scope="group"),
+                      self.message("tg-2", "同群另一人", scope="group", user="user-2"),
+                      self.message("tg-3", "另一群", scope="group", target="group-2"),
+                      self.message("tg-4", "原会话", scope="group")], training=True)
+        self.assertEqual([self.has_training(r) for r in self.requests], [True, True, False])
+        for request in self.requests:
+            self.assertFalse(any(m["role"] == "assistant" for m in request["messages"]))
+
+    def test_training_stop_cancels_inflight_question_and_never_sends_it(self):
+        self.provider_steps = {1: {"wait": "training-release", "text": "不应发送的旧问题？"}}
+        self.run_eve(script=[{"send": self.message("ts-1", "/train start", expected_type="finish")},
+            self.wait_request(1), {"send": self.message("ts-2", "/train stop", "已结束当前会话的主动提问训练，已完成记录保留；普通聊天仍可继续。")},
+            self.wait_command("ts-1", "finish"), self.wait_command("ts-2")])
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.replies(), [("ts-2", "已结束当前会话的主动提问训练，已完成记录保留；普通聊天仍可继续。")])
+        self.assertEqual(self.sessions()[0]["turns"][0]["status"]["state"], "Failed")
+        self.assertFalse(self.documents()["eve.training"]["modes.v1"]["modes"][0]["enabled"])
+
+    def test_training_start_receipt_not_replayed_and_corrupt_modes_retained(self):
+        self.run_eve([self.message("tr-1", "/train start")])
+        self.run_eve([self.message("tr-1", "/train start")])
+        self.assertEqual(len(self.requests), 1)
+        state_path = self.work / "state/state.json"
+        state = json.loads(state_path.read_text())
+        state["entries"]["eve.training"]["modes.v1"] = list(b'{"version":99,"modes":[]}')
+        state_path.write_text(json.dumps(state))
+        before = state_path.read_bytes()
+        self.run_eve(success=False)
+        self.assertEqual(state_path.read_bytes(), before)
+        self.assertEqual(len(self.requests), 1)
+
+    def test_training_stop_suppresses_completed_question_waiting_for_delivery(self):
+        self.provider_steps = {1: {"wait": "training-complete", "text": "应丢弃的完成问题？"}}
+        held = self.message("tc-status", "/train status", "当前会话：主动提问训练已开启。")
+        held["hold_delivery"] = True
+        self.run_eve(script=[{"send": self.message("tc-start", "/train start", expected_type="finish")},
+            self.wait_request(1), {"send": held}, self.wait_command("tc-status"), self.open_gate("training-complete"),
+            {"wait_turn": {"path": str(self.work / "state/state.json"), "input": "/train start", "state": "Completed"}},
+            {"send": self.message("tc-stop", "/train stop", "已结束当前会话的主动提问训练，已完成记录保留；普通聊天仍可继续。")},
+            self.wait_command("tc-start", "finish"), {"delivery": "tc-status"}, self.wait_command("tc-stop")])
+        self.assertEqual(self.replies(), [("tc-status", "当前会话：主动提问训练已开启。"),
+            ("tc-stop", "已结束当前会话的主动提问训练，已完成记录保留；普通聊天仍可继续。")])
+
+    def test_training_window_ready_checkpoint_and_encrypted_completed_results(self):
+        self.provider_steps = {1: {"text": "你希望每段几句话？"}}
+        launcher = self.work / "launch-eve"
+        scenario = self.work / "window-scenario.json"
+        scenario.write_text(json.dumps({"script": [
+            {"send": self.message("tw-1", "/train start", "你希望每段几句话？")},
+            self.wait_command("tw-1"), {"wait_file": str(self.gate("window-close"))}]}))
+        launcher.write_text("#!/usr/bin/env python3\nimport os, sys\nos.execv(" + repr(str(BINARY)) + ", [" + repr(str(BINARY)) + ", *sys.argv[1:], '--bridge-script', " + repr(str(FAKE)) + ", '--bridge-arg', " + repr(str(scenario)) + "])\n")
+        launcher.chmod(0o700)
+        env = {k: os.environ[k] for k in ("PATH", "SystemRoot", "TEMP", "TMP") if k in os.environ}
+        env.update(QQBOT_APP_SECRET="test-app-secret", QQBOT_SANDBOX="false", EVE_OPENAI_API_KEY="test-model-secret",
+                   EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}", EVE_OPENAI_PROTOCOL="chat")
+        script = ROOT / "connectors/qqbot/training-window.py"
+        root, output = self.work / "window", self.work / "results"
+        # 共享既有 HTTP 夹具的持久化准入检查目录。
+        (self.work / "state").symlink_to(root / "state", target_is_directory=True)
+        child = subprocess.Popen(["python3", str(script), "--root", str(root), "--output", str(output),
+                                  "--seconds", "60", "--binary", str(launcher)], cwd=ROOT, env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            ready = subprocess.run(["python3", str(script), "--wait-ready", "--root", str(root), "--output", str(output)],
+                                   cwd=ROOT, env=env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(ready.returncode, 0, ready.stdout + ready.stderr)
+            checkpoint = json.loads((output / "ready.json").read_text())
+            self.assertTrue(checkpoint["ready"])
+            self.assertFalse(checkpoint["sandbox"])
+            self.gate("window-close").touch()
+            stdout, stderr = child.communicate(timeout=15)
+            self.assertEqual(child.returncode, 0, stdout + stderr)
+            self.assertNotIn("你希望每段几句话", stdout + stderr)
+            self.assertNotIn("test-app-secret", stdout + stderr)
+            report = json.loads((output / "training-summary.json").read_text())
+            self.assertTrue(report["process_ok"])
+            self.assertTrue(report["interaction_ok"])
+            self.assertEqual(report["counts"]["question_replies"], 1)
+            decrypted = self.work / "decrypted"
+            result = subprocess.run(["python3", str(script), "--decrypt", str(output / "training-state.enc"), "--output", str(decrypted)],
+                                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            evidence = json.loads((decrypted / "training-report.json").read_text())["evidence"]
+            self.assertEqual(evidence[0]["input"], "/train start")
+            self.assertEqual(evidence[0]["reply"], "你希望每段几句话？")
+        finally:
+            if child.poll() is None:
+                child.kill(); child.wait()
+
     def test_tool_reply_restart_recall_and_duplicate_no_replay(self):
         first = self.run_eve([self.message("ROBOT1.0_.b6nx.CVryAO0nR58RXuU6SC.m92gc19j02qKqdm8ek!", "echo:marker", "marker")])
         self.assertEqual((first["completed"], first["sent"], len(self.requests)), (1, 1, 2))
@@ -198,6 +336,30 @@ class Acceptance(unittest.TestCase):
             messages = request["messages"]
             self.assertEqual([m["content"] for m in messages if m["role"] == "user"], [expected])
             self.assertFalse(any(m["role"] in ("assistant", "tool") for m in messages))
+
+    def test_long_group_message_ids_reply_restore_and_deduplicate(self):
+        observed_length_id = "ROBOT1.0_" + "g" * 128
+        boundary_id = "m" * 253
+        self.run_eve([self.message(observed_length_id, "群聊记忆", scope="group"),
+                      self.message(boundary_id, "recall:群聊记忆", "群聊记忆", scope="group")])
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(self.replies(), [(observed_length_id, "群聊记忆"), (boundary_id, "群聊记忆")])
+        self.run_eve([self.message(observed_length_id, "重复不重放", scope="group"),
+                      self.message("restore-long-group", "recall:群聊记忆", "群聊记忆", scope="group")])
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(self.replies(), [("restore-long-group", "群聊记忆")])
+
+    def test_message_id_utf8_boundary_rejects_oversize_before_model_and_ledger(self):
+        valid = "界" * 84 + "!"
+        self.run_eve(script=[
+            {"send": self.message("x" * 254, "超长不执行", scope="group")},
+            {"send": self.message("界" * 85, "UTF-8 超长不执行", scope="group")},
+            {"send": self.message(valid, "字节边界", scope="group")},
+            self.wait_command(valid)])
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.replies(), [(valid, "字节边界")])
+        entries = self.documents()["eve.channel.qqbot"]["receipts.v1"]["entries"]
+        self.assertEqual([(e["message"]["id"], e["state"]) for e in entries], [(valid, "Sent")])
 
     def test_send_failure_preserves_commit_no_model_or_send_retry(self):
         result = self.run_eve([self.message("in-1", "echo:marker", "marker")], send_fail=True)

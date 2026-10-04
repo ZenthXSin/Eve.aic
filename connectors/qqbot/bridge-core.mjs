@@ -1,9 +1,35 @@
 // Tencent SDK adaptation; stdout is reserved for the versioned JSONL protocol.
 export const MAX_FRAME = 65536;
+// The control task ID adds "qq:" and must fit its 256-byte contract.
+export const MAX_MESSAGE_ID_BYTES = 253;
 const validId = v => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v);
 const validMessageId = v => typeof v === "string" && v.trim() === v && v.length > 0 &&
-  Buffer.byteLength(v) <= 128 && !/[\p{Cc}]/u.test(v);
+  Buffer.byteLength(v) <= MAX_MESSAGE_ID_BYTES && !/[\p{Cc}]/u.test(v);
 const validText = v => typeof v === "string" && v.trim() && Buffer.byteLength(v) <= 32768;
+function isGroupAt(msg, appId) {
+  if (msg.rawEventType === "GROUP_AT_MESSAGE_CREATE") return true;
+  if (msg.rawEventType !== "GROUP_MESSAGE_CREATE") return false;
+  if (Array.isArray(msg.mentions) && msg.mentions.some(m => m?.is_you === true)) return true;
+  return validId(appId) && typeof msg.content === "string" &&
+    new RegExp(`<@!?${appId}>`).test(msg.content);
+}
+function userText(msg, appId) {
+  let text = msg.content.trim();
+  if (msg.kind !== "group") return text;
+  const own = new Set(validId(appId) ? [appId] : []);
+  for (const mention of Array.isArray(msg.mentions) ? msg.mentions : []) {
+    if (mention?.is_you !== true) continue;
+    for (const id of [mention.id, mention.member_openid, mention.user_openid]) {
+      if (validId(id)) own.add(id);
+    }
+  }
+  while (true) {
+    const match = /^<@!?([A-Za-z0-9_-]{1,128})>\s*/.exec(text);
+    if (!match || !own.has(match[1])) break;
+    text = text.slice(match[0].length).trimStart();
+  }
+  return text;
+}
 export function optionsFromEnv(env) {
   const appId = env.QQBOT_APP_ID || "1904159860";
   if (!validId(appId) || !env.QQBOT_APP_SECRET?.trim()) throw new Error("credentials_missing");
@@ -35,7 +61,7 @@ export function createBridge(bot, emit, limit = 128) {
   bot.on("message", (_ctx, msg) => {
     if (closed) return;
     if (!["c2c", "group"].includes(msg.kind) || msg.senderIsBot ||
-        (msg.kind === "group" && msg.rawEventType !== "GROUP_AT_MESSAGE_CREATE")) {
+        (msg.kind === "group" && !isGroupAt(msg, bot.appId))) {
       warn("unsupported_message"); return;
     }
     const target = msg.replyTarget;
@@ -48,10 +74,12 @@ export function createBridge(bot, emit, limit = 128) {
     }
     if (pending.has(msg.messageId)) { warn("duplicate_pending"); return; }
     if (pending.size >= limit) { warn("pending_limit"); return; }
+    const text = userText(msg, bot.appId);
+    if (!validText(text)) { warn("invalid_route_or_text"); return; }
     pending.set(msg.messageId, { target: { ...target }, sending: false });
     send({ type: "message", id: msg.messageId, scope: msg.kind,
       target_id: target.targetId, user_id: msg.senderId,
-      text: msg.content.trim() });
+      text });
   });
   return {
     stop,

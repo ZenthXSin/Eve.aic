@@ -59,9 +59,17 @@ async fn run(mut command: Command, input: &str) -> Output {
                 .spawn()
                 .unwrap();
             let mut stdin = child.stdin.take().unwrap();
-            stdin.write_all(&input).unwrap();
+            let write_result = stdin.write_all(&input);
             drop(stdin);
-            child.wait_with_output().unwrap()
+            let output = child.wait_with_output().unwrap();
+            if let Err(error) = write_result {
+                assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+                assert!(
+                    !output.status.success(),
+                    "successful process lost test input"
+                );
+            }
+            output
         }),
     )
     .await
