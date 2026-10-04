@@ -11,6 +11,7 @@ eve-plugin-api = { path = "../plugin-api" }
 eve-training-api = { path = "../training-api" }
 serde.workspace = true
 serde_json.workspace = true
+ring = "0.17"
 
 [dev-dependencies]
 eve-kernel = { path = "../kernel" }

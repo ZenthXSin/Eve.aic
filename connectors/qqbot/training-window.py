@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import subprocess
 import tarfile
 import time
@@ -33,7 +34,21 @@ def collect(state_path):
     sessions = json.loads(bytes(entries.get("eve.session", {}).get("sessions.v1", b'{"format_version":1,"sessions":{}}')))
     if receipts.get("version") != 1 or sessions.get("format_version") != 1:
         raise ValueError("evidence_version")
-    counts = {"received_records": len(receipts["entries"]), "sent": 0, "failed": 0,
+    excluded, prior_turns = set(), {}
+    baseline_path = state_path.parent / "round-baseline.v1.json"
+    if baseline_path.exists():
+        baseline = json.loads(baseline_path.read_bytes())
+        if set(baseline) != {"version", "receipts", "turns"} or baseline["version"] != 1 or type(baseline["receipts"]) is not list or type(baseline["turns"]) is not dict:
+            raise ValueError("round_baseline_invalid")
+        if any(type(v) is not str or not re.fullmatch(r"[a-f0-9]{64}", v) for v in baseline["receipts"]) or len(set(baseline["receipts"])) != len(baseline["receipts"]):
+            raise ValueError("round_baseline_invalid")
+        excluded, prior_turns = set(baseline["receipts"]), baseline["turns"]
+        if not excluded.issubset({receipt_identity(r) for r in receipts["entries"]}) or any(
+                type(count) is not int or count < 0 or key not in sessions["sessions"] or count > len(sessions["sessions"][key]["turns"])
+                for key, count in prior_turns.items()):
+            raise ValueError("round_baseline_mismatch")
+    current_receipts = [r for r in receipts["entries"] if receipt_identity(r) not in excluded]
+    counts = {"received_records": len(current_receipts), "sent": 0, "failed": 0,
               "unconfirmed": 0, "c2c_sent": 0, "group_at_sent": 0,
               "completed_turns": 0, "model_sent": 0, "failed_turns": 0, "question_replies": 0,
               "multi_question_replies": 0, "paragraphs": 0, "reply_characters": 0,
@@ -42,13 +57,13 @@ def collect(state_path):
     completed_inputs = {}
     for session in sessions["sessions"].values():
         identity = session["key"]["session_id"]
-        for turn in session["turns"]:
+        for turn in session["turns"][prior_turns.get(identity, 0):]:
             if turn["status"]["state"] != "Completed":
                 counts["failed_turns"] += 1
                 continue
             counts["completed_turns"] += 1
             completed_inputs.setdefault(identity, set()).add((turn["input"], turn["status"]["messages"][-1]["text"]))
-    for receipt in receipts["entries"]:
+    for receipt in current_receipts:
         status = receipt["state"]
         if status != "Sent":
             counts["failed" if status == "Failed" else "unconfirmed"] += 1
@@ -74,8 +89,33 @@ def collect(state_path):
     return {"evidence_status": "saved", "counts": counts, "evidence": evidence,
             "limitations": ["问号数量和反馈关键词仅是可复核指标，不代表语义判断或已学会偏好。",
                             "只把 Session Completed 且 QQ Sent 的交互列为训练证据。",
-                            "本模式未更新模型权重或长期表达偏好；调整需依据本轮证据另行实现。",
+                            "本地表达统计是弱示范，未更新模型权重或已确认长期偏好。",
                             "失败、中断、未确认发送保留在状态包中，不作为成功训练样本。"]}
+
+
+def receipt_identity(receipt):
+    value = json.dumps([receipt["app_id"], receipt["message"]["id"]], ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def seed_round(root, source):
+    source = source.resolve()
+    if not source.is_dir() or root.resolve().is_relative_to(source):
+        raise ValueError("seed_directory_invalid")
+    paths = list(source.rglob("*"))
+    if any(p.is_symlink() or not (p.is_dir() or p.is_file()) for p in paths) or sum(p.stat().st_size for p in paths if p.is_file()) > MAX_ARCHIVE:
+        raise ValueError("seed_files_invalid")
+    state_path = source / "state.json"
+    if collect(state_path)["evidence_status"] != "saved":
+        raise ValueError("seed_state_invalid")
+    state = json.loads(state_path.read_bytes())["entries"]
+    receipts = json.loads(bytes(state.get("eve.channel.qqbot", {}).get("receipts.v1", b'{"version":1,"entries":[]}')))
+    sessions = json.loads(bytes(state.get("eve.session", {}).get("sessions.v1", b'{"format_version":1,"sessions":{}}')))
+    destination = root / "state"
+    shutil.copytree(source, destination)
+    write_json(destination / "round-baseline.v1.json", {"version": 1,
+        "receipts": [receipt_identity(r) for r in receipts["entries"]],
+        "turns": {key: len(s["turns"]) for key, s in sessions["sessions"].items()}})
 
 
 def password():
@@ -136,7 +176,7 @@ def unseal(source, output):
         archive.extractall(output, filter="data")
 
 
-def run_window(root, seconds, binary):
+def run_window(root, seconds, binary, seed_state=None):
     if not 60 <= seconds <= 21300:
         raise ValueError("window_range")
     root.mkdir(parents=True, exist_ok=False)
@@ -145,6 +185,8 @@ def run_window(root, seconds, binary):
               "sandbox": os.environ.get("QQBOT_SANDBOX", "") == "true",
               "source_sha": os.environ.get("GITHUB_SHA", "local")}
     write_json(root / "window.json", window)
+    if seed_state is not None:
+        seed_round(root, seed_state)
     child = None
     with (root / "stdout").open("w") as out, (root / "stderr").open("w") as err:
         child = subprocess.Popen([str(binary), "--training", "--state-dir", str(root / "state")], stdout=out, stderr=err)
@@ -194,7 +236,7 @@ def finish(root, output):
     safe = {"window": report["window"], "evidence_status": report["evidence_status"], "counts": report["counts"],
             "process_ok": report["window"]["returncode"] == 0,
             "interaction_ok": report["counts"].get("model_sent", 0) > 0,
-            "training_scope": "主动提问和交流证据采集；未更新模型权重或长期偏好"}
+            "training_scope": "主动提问、用户表达统计与交流证据采集；未更新模型权重或已确认长期偏好"}
     write_json(output / "training-summary.json", safe)
     print(json.dumps(safe, ensure_ascii=False), flush=True)
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -210,6 +252,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seconds", type=int, default=21300)
     parser.add_argument("--binary", type=Path, default=Path("target/debug/eve-qqbot").resolve())
+    parser.add_argument("--seed-state", type=Path, help="从已停止窗口复制状态开始新轮；原文件保留，本轮计数排除旧记录")
     parser.add_argument("--decrypt", type=Path)
     parser.add_argument("--wait-ready", action="store_true")
     parser.add_argument("--wait-result", action="store_true")
@@ -258,7 +301,7 @@ def main():
         if not args.root:
             raise ValueError("missing_root")
         password()  # 启动前确认能保存训练结果。
-        run_window(args.root, args.seconds, args.binary)
+        run_window(args.root, args.seconds, args.binary, args.seed_state)
         safe = finish(args.root, args.output)
         if not safe["process_ok"] or not safe["window"]["ready"] or safe["evidence_status"] != "saved":
             raise ValueError("qq_process_failed_state_preserved")

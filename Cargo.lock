@@ -398,6 +398,7 @@ dependencies = [
  "eve-llm-api",
  "eve-plugin-api",
  "eve-training-api",
+ "ring",
  "serde",
  "serde_json",
  "tokio",
