@@ -1,5 +1,5 @@
 use crate::{
-    QqBotConfig, QqBotStatus,
+    QqBotConfig, QqBotStatus, QqCommandHandler, QqCommandInput, commands,
     state::{Ledger, Message, ReceiptState},
 };
 use eve_control_api::{
@@ -91,6 +91,7 @@ const BLOCKED: &str = "任务提交状态未确认，当前会话已阻塞；请
 pub(crate) struct Services {
     pub control: Arc<dyn ControlService>,
     pub messages: Arc<dyn MessageService>,
+    pub command_handler: Option<Arc<dyn QqCommandHandler>>,
 }
 struct ChannelEvents {
     signal: Arc<dyn TaskSignal>,
@@ -156,6 +157,8 @@ enum ReplyGuard {
     Current(GenerationKey),
     Completed(ControlEvent),
     NoTask,
+    // 宿主命令的已保存结果不属于聊天生成代，但仍绑定原消息和持久回执。
+    Command,
 }
 impl ReplyGuard {
     fn accepts(&self, control: &dyn ControlService) -> bool {
@@ -164,7 +167,7 @@ impl ReplyGuard {
                 .snapshot(&key.session)
                 .is_ok_and(|s| s.is_some_and(|s| s.key == *key)),
             Self::Completed(event) => control.accepts(event),
-            Self::NoTask => true,
+            Self::NoTask | Self::Command => true,
         }
     }
 }
@@ -202,7 +205,11 @@ pub(crate) async fn run(
     status: watch::Sender<QqBotStatus>,
     mut stop: watch::Receiver<bool>,
 ) -> PluginResult<()> {
-    let Services { control, messages } = services;
+    let Services {
+        control,
+        messages,
+        command_handler,
+    } = services;
     let (closed, receiver) = watch::channel(false);
     let sink = Arc::new(ChannelEvents {
         signal: signal.clone(),
@@ -265,6 +272,29 @@ pub(crate) async fn run(
                     warn(&ctx, "receipt_limit");
                     finish(&mut stdin, &message.id).await?;
                     continue;
+                }
+                if let Some(handler) = &command_handler {
+                    let session = message.session_key(&config.app_id)?;
+                    match commands::dispatch(handler.as_ref(), QqCommandInput {
+                        message_id: &message.id, session: &session, text: &message.text,
+                    }) {
+                        Ok(Some(text)) => {
+                            replies.push_back(Reply { message, text, guard: ReplyGuard::Command });
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            status.send_modify(|s| s.failed += 1);
+                            mark_failed(&mut ledger, &ctx, &config.app_id, &message.id)?;
+                            warn(&ctx, "host_command_failed_no_retry");
+                            finish(&mut stdin, &message.id).await?;
+                            if matches!(error, PluginError::State(_)) {
+                                // 不传播宿主诊断正文；状态未知时停止后续命令和模型准入。
+                                break Err(failure("QQBot 宿主命令状态不可确认，通道已停止"));
+                            }
+                            continue;
+                        }
+                    }
                 }
                 if let Some(target) = command.target {
                     controlled_sessions.insert(target.session.session_id.clone(), target.session.clone());
