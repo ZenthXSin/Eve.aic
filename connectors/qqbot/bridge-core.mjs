@@ -4,6 +4,13 @@ const validId = v => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v);
 const validMessageId = v => typeof v === "string" && v.trim() === v && v.length > 0 &&
   Buffer.byteLength(v) <= 128 && !/[\p{Cc}]/u.test(v);
 const validText = v => typeof v === "string" && v.trim() && Buffer.byteLength(v) <= 32768;
+function isGroupAt(msg, appId) {
+  if (msg.rawEventType === "GROUP_AT_MESSAGE_CREATE") return true;
+  if (msg.rawEventType !== "GROUP_MESSAGE_CREATE") return false;
+  if (Array.isArray(msg.mentions) && msg.mentions.some(m => m?.is_you === true)) return true;
+  return validId(appId) && typeof msg.content === "string" &&
+    new RegExp(`<@!?${appId}>`).test(msg.content);
+}
 export function optionsFromEnv(env) {
   const appId = env.QQBOT_APP_ID || "1904159860";
   if (!validId(appId) || !env.QQBOT_APP_SECRET?.trim()) throw new Error("credentials_missing");
@@ -35,7 +42,7 @@ export function createBridge(bot, emit, limit = 128) {
   bot.on("message", (_ctx, msg) => {
     if (closed) return;
     if (!["c2c", "group"].includes(msg.kind) || msg.senderIsBot ||
-        (msg.kind === "group" && msg.rawEventType !== "GROUP_AT_MESSAGE_CREATE")) {
+        (msg.kind === "group" && !isGroupAt(msg, bot.appId))) {
       warn("unsupported_message"); return;
     }
     const target = msg.replyTarget;
