@@ -12,6 +12,8 @@ on:
       - ".github/scripts/**"
       - ".github/workflows/qqbot-training-review.yml"
       - ".github/qqbot-training-review-request.json"
+      - ".github/workflows/qqbot-policy-benchmark.yml"
+      - ".github/qqbot-policy-benchmark-request.json"
   push:
     branches: [main]
     paths:
@@ -25,6 +27,8 @@ on:
       - ".github/scripts/**"
       - ".github/workflows/qqbot-training-review.yml"
       - ".github/qqbot-training-review-request.json"
+      - ".github/workflows/qqbot-policy-benchmark.yml"
+      - ".github/qqbot-policy-benchmark-request.json"
 permissions:
   contents: read
 jobs:

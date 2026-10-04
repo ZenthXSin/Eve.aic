@@ -1,6 +1,7 @@
 """同一历史输入的新旧提示词对照；不连接 QQ、不调用工具，正文仅加密保存。"""
 from collections import Counter
 import argparse
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -108,28 +109,41 @@ def compare(evidence, baseline, candidate, identity, generator=generate, evaluat
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--source", type=Path)
+    source.add_argument("--synthetic", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     try:
-        with tempfile.TemporaryDirectory(prefix="eve-training-compare-") as directory:
-            root = Path(directory)
-            saved = review.verify_source(args.source, root / "source")
-            baseline = (ROOT / "connectors/qqbot/test/fixtures/training-v1.txt").read_text().strip()
-            candidate = (ROOT / "crates/training-plugin/src/prompt-v2.txt").read_text().strip()
-            identity = (ROOT / "AGENT.md").read_text()
-            summary, rows = compare(saved["evidence"], baseline, candidate, identity)
-            summary.update(version=1, source_sha=saved["window"]["source_sha"])
-            private = root / "comparison"
-            private.mkdir()
-            review.window.write_json(private / "training-report.json", {"summary": summary, "outputs": rows})
-            review.window.seal(private, args.output.with_suffix(".enc"))
+        baseline = (ROOT / "connectors/qqbot/test/fixtures/training-v1.txt").read_text().strip()
+        candidate = (ROOT / "crates/training-plugin/src/prompt-v2.txt").read_text().strip()
+        identity = (ROOT / "AGENT.md").read_text()
+        if args.synthetic:
+            fixture = ROOT / "connectors/qqbot/test/fixtures/training-public-cases.json"
+            summary, _ = compare(json.loads(fixture.read_bytes()), baseline, candidate, identity)
+            summary.update(version=1, evidence_kind="public_synthetic",
+                           fixture_sha256=hashlib.sha256(fixture.read_bytes()).hexdigest())
+            summary["assessment"] = "public_synthetic_same_inputs_model_advisory"
+            summary["limitations"] = ["12 个独立新写的公开场景，不读取或解密真实交流。",
+                                      "覆盖短答、口语、任务、拒绝提问与自然段；不代表真实用户满意度。",
+                                      "当前新版真实记录复核未追加执行，长期偏好仍待实现。"]
+        else:
+            with tempfile.TemporaryDirectory(prefix="eve-training-compare-") as directory:
+                root = Path(directory)
+                saved = review.verify_source(args.source, root / "source")
+                summary, rows = compare(saved["evidence"], baseline, candidate, identity)
+                summary.update(version=1, source_sha=saved["window"]["source_sha"])
+                private = root / "comparison"
+                private.mkdir()
+                review.window.write_json(private / "training-report.json", {"summary": summary, "outputs": rows})
+                review.window.seal(private, args.output.with_suffix(".enc"))
+        summary["candidate_prompt_sha256"] = hashlib.sha256(candidate.encode()).hexdigest()
         review.window.write_json(args.output, summary)
         print(json.dumps(summary, ensure_ascii=False))
         if not summary["complete"] or not summary["advisory_non_regression"]:
             raise ValueError("comparison_incomplete_or_regressed")
     except (ValueError, TypeError, KeyError, AttributeError, OSError, review.tarfile.TarError, review.subprocess.SubprocessError):
-        raise SystemExit("策略对照未通过；只保留无正文计数和加密输出，不更新用户偏好或发送QQ消息。") from None
+        raise SystemExit("策略对照未通过；公开仅保留无正文计数，不更新用户偏好或发送QQ消息。") from None
 
 
 if __name__ == "__main__":
