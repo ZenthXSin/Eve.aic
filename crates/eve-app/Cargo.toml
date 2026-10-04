@@ -41,6 +41,7 @@ eve-session-plugin = { path = "../session-plugin" }
 eve-training-api = { path = "../training-api" }
 eve-training-plugin = { path = "../training-plugin" }
 serde_json.workspace = true
+ring.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]

@@ -13,7 +13,12 @@ const record = event => {
 };
 const checkReply = (cmd, message) => {
   if (message.expected_type === "finish") throw new Error("retired_result_was_replied");
-  if (cmd.text !== message.expected) throw new Error("wrong_reply_text");
+  if (message.expected_contains !== undefined) {
+    const parts = Array.isArray(message.expected_contains) ? message.expected_contains : [message.expected_contains];
+    if (parts.length === 0 || !parts.every(part => typeof part === "string" && cmd.text.includes(part))) {
+      throw new Error("missing_reply_fragment");
+    }
+  } else if (cmd.text !== message.expected) throw new Error("wrong_reply_text");
 };
 const deliver = id => send({ type: "delivery", id, ok: !scenario.send_fail, message_id: "out-" + id });
 
@@ -58,6 +63,28 @@ if (scenario.script) {
           const sessions = JSON.parse(Buffer.from(document.entries["eve.session"]["sessions.v1"]).toString());
           return Object.values(sessions.sessions).some(session => session.turns.some(turn =>
             turn.input === step.wait_turn.input && turn.status.state === step.wait_turn.state));
+        })) return;
+      } else if (step.wait_cognition) {
+        if (!await until(() => {
+          const wanted = step.wait_cognition;
+          if (!fs.existsSync(wanted.path)) return false;
+          const document = JSON.parse(fs.readFileSync(wanted.path, "utf8"));
+          const bytes = document.entries["eve.cognition"]?.["cognition.v1"];
+          if (!bytes) return false;
+          const cognition = JSON.parse(Buffer.from(bytes).toString());
+          const goals = Object.values(cognition.state.goals);
+          const parent = goals.find(goal => goal.source.kind === "User" && goal.description === wanted.parent_description);
+          return parent && goals.some(goal => goal.source.reference === parent.id && goal.verification === "reflection:v1" && goal.status === wanted.child_state);
+        })) return;
+      } else if (step.wait_receipt) {
+        if (!await until(() => {
+          const wanted = step.wait_receipt;
+          if (!fs.existsSync(wanted.path)) return false;
+          const document = JSON.parse(fs.readFileSync(wanted.path, "utf8"));
+          const bytes = document.entries["eve.channel.qqbot"]?.["receipts.v1"];
+          if (!bytes) return false;
+          const ledger = JSON.parse(Buffer.from(bytes).toString());
+          return ledger.entries.some(entry => entry.message.id === wanted.id && entry.state === wanted.state);
         })) return;
       } else {
         throw new Error("unknown_scenario_step");

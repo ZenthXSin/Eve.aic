@@ -1,18 +1,24 @@
 //! QQ 只通过明确命令保存待办和查询草稿，内部反思没有主动投递能力。
-use crate::{AppError, config, core_bootstrap, models, services};
+use crate::{AppError, core_bootstrap, models, services};
 use eve_cognition_api::*;
 use eve_cognition_loop_api::*;
 use eve_cognition_loop_plugin::{
-    CognitionLoopPlugin, EndogenousPlanner, LoopController, PriorityDrivePolicy,
-    ReflectionArtifact, ReflectionVerifier,
+    CognitionLoopPlugin, LoopController, PriorityDrivePolicy, ReflectionArtifact,
+    ReflectionVerifier,
 };
 use eve_cognition_plugin::{CognitionController, CognitionPlugin};
 use eve_config_api::{CONFIG_SERVICE_ID, ConfigServiceHandle};
 use eve_control_api::ControlServiceHandle;
 use eve_control_plugin::ControlPlugin;
 use eve_kernel::{Kernel, KernelServices};
-use eve_llm_api::{ChatRole, LlmModelResolver};
-use eve_plugin_api::{PluginDependency, PluginError, PluginId, PluginResult, ServiceId};
+use eve_llm_api::{
+    ChatRole, ContextAssembler, ContextService, ContextSnapshot, LlmFuture, LlmModelResolver,
+    TurnInput,
+};
+use eve_plugin_api::{
+    Cleanup, Plugin, PluginContext, PluginDependency, PluginError, PluginFuture, PluginId,
+    PluginManifest, PluginResult, ServiceId,
+};
 use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput};
 use eve_runtime::{
     BudgetedSessionRunner, ContextBinding, ControlGoalExecutor, LlmHost, LlmHostConfig,
@@ -33,6 +39,8 @@ use std::{
 use tokio::{sync::watch, task::JoinHandle};
 
 pub(crate) const CONTROL_ID: &str = "eve.cognition.control";
+const CONTEXT_ID: &str = "eve.cognition.context";
+const CONTEXT_SERVICE: &str = "eve.cognition.context.service";
 const CONTROL_SERVICE: &str = "eve.cognition.control.service";
 const CHANNEL: &str = "qq.goal";
 const INTERNAL_USER: &str = "cognition.internal";
@@ -296,16 +304,99 @@ impl QqCommandHandler for Commands {
     }
 }
 
+/// 反思只接收目标输入及 AGENT 身份，不读取聊天训练、偏好或聊天历史。
+struct ReflectionContext;
+impl ContextAssembler for ReflectionContext {
+    fn assemble(&self, _: TurnInput) -> LlmFuture<'_, ContextSnapshot> {
+        Box::pin(async {
+            Ok(ContextSnapshot {
+                revision: "qq-reflection-1".into(),
+                profile: String::new(),
+                memories: vec![],
+                history: vec![],
+            })
+        })
+    }
+}
+struct ContextPlugin(PluginManifest);
+impl Plugin for ContextPlugin {
+    fn manifest(&self) -> &PluginManifest {
+        &self.0
+    }
+    fn start(&mut self, context: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
+        Box::pin(async move {
+            context.provide_service(
+                ServiceId::new(CONTEXT_SERVICE)?,
+                ContextService(Arc::new(ReflectionContext)),
+            )?;
+            Ok(None)
+        })
+    }
+}
+/// QQ 通道尚未启动时拒绝议程；只允许当前 QQ 待办的子目标进入执行。
+struct QqPolicy {
+    enabled: Arc<AtomicBool>,
+    admin: CognitionController,
+}
+impl DrivePolicy for QqPolicy {
+    fn rank(&self, goals: &[Goal], now_ms: u64) -> LoopResult<Vec<RankedGoal>> {
+        if !self.enabled.load(Ordering::SeqCst) {
+            return Ok(vec![]);
+        }
+        let snapshot = self.admin.snapshot()?;
+        let goals: Vec<_> = goals
+            .iter()
+            .filter(|g| {
+                snapshot
+                    .state
+                    .goals
+                    .get(&g.source.reference)
+                    .is_some_and(|parent| {
+                        parent.source.kind == SourceKind::User
+                            && parent.source.channel == CHANNEL
+                            && parent.status == GoalStatus::Waiting
+                            && matches!(parent.visibility, Visibility::User(_))
+                            && parent.visibility == g.visibility
+                            && parent.expires_at_ms.is_none_or(|expiry| now_ms < expiry)
+                    })
+            })
+            .cloned()
+            .collect();
+        PriorityDrivePolicy.rank(&goals, now_ms)
+    }
+}
+
 pub(crate) struct Background {
     pub commands: Arc<Commands>,
+    enabled: Arc<AtomicBool>,
+    controller: LoopController,
     stop: watch::Sender<bool>,
+    finished: watch::Receiver<bool>,
     task: JoinHandle<Result<(), AppError>>,
 }
 impl Background {
+    pub(crate) fn activate(&self) {
+        self.enabled.store(true, Ordering::SeqCst);
+        self.commands.accepting.store(true, Ordering::SeqCst);
+    }
+    pub(crate) fn finished(&self) -> watch::Receiver<bool> {
+        self.finished.clone()
+    }
     pub(crate) async fn stop(self) -> Result<(), AppError> {
         self.commands.accepting.store(false, Ordering::SeqCst);
+        self.enabled.store(false, Ordering::SeqCst);
         self.stop.send_replace(true);
-        self.task.await.map_err(|_| "认知后台任务异常")?
+        // 即使规划任务 panic，仍先取消、等待循环，再允许 Kernel 关闭。
+        let settled = self.controller.shutdown().await;
+        let joined = self
+            .task
+            .await
+            .map_err(|_| -> AppError { "认知后台任务异常".into() });
+        match (joined, settled) {
+            (Ok(Ok(())), Ok(())) => Ok(()),
+            (Err(error) | Ok(Err(error)), _) => Err(error),
+            (_, Err(error)) => Err(error.into()),
+        }
     }
 }
 
@@ -314,6 +405,7 @@ pub(crate) async fn start(
     backends: &KernelServices,
     agent: &std::path::Path,
     max: u16,
+    factory: Arc<dyn EndogenousPlannerFactory>,
 ) -> Result<Background, AppError> {
     let plugin = CognitionPlugin::new("eve")?;
     let admin = plugin.controller();
@@ -332,8 +424,27 @@ pub(crate) async fn start(
         bootstrap.api_key,
     ));
     let selected = resolver.resolve()?;
-    let host=LlmHost::new(selected.provider,backends.registry.clone(),kernel.clone(),backends.permissions.clone(),ContextBinding{service_id:ServiceId::new(services::CONTEXT)?,expected_owner:PluginId::new(services::OWNER)?},vec![],
-        LlmHostConfig{provider_timeout:selected.provider_timeout.min(Duration::from_secs(30)),output_format:"只返回严格JSON对象：summary和next_step为非空字符串，needs_user_input为布尔值。只形成反思草稿，不调用工具，不声称现实目标已经完成。".into(),..bootstrap.host_config})?.with_model_resolver(resolver);
+    kernel.register(Box::new(ContextPlugin(PluginManifest::new(
+        CONTEXT_ID,
+        env!("CARGO_PKG_VERSION"),
+    )?)))?;
+    kernel.start(&PluginId::new(CONTEXT_ID)?).await?;
+    let host = LlmHost::new(
+        selected.provider,
+        backends.registry.clone(),
+        kernel.clone(),
+        backends.permissions.clone(),
+        ContextBinding {
+            service_id: ServiceId::new(CONTEXT_SERVICE)?,
+            expected_owner: PluginId::new(CONTEXT_ID)?,
+        },
+        vec![],
+        LlmHostConfig {
+            provider_timeout: selected.provider_timeout.min(Duration::from_secs(30)),
+            output_format: "只返回严格JSON对象：summary和next_step为非空字符串，needs_user_input为布尔值。只形成反思草稿，不调用工具，不声称现实目标已经完成。".into(),
+            ..bootstrap.host_config
+        },
+    )?.with_model_resolver(resolver);
     let runner = Arc::new(BudgetedSessionRunner::new(Arc::new(
         SessionLlmHost::new(host, SessionBinding::builtin()).with_logger(backends.logger.clone()),
     )));
@@ -352,7 +463,7 @@ pub(crate) async fn start(
         CONTROL_ID,
         CONTROL_SERVICE,
         runner.clone(),
-        deps(&[services::OWNER, SESSION_PLUGIN_ID])?,
+        deps(&[services::OWNER, CONTEXT_ID, SESSION_PLUGIN_ID])?,
     )?))?;
     kernel.start(&PluginId::new(CONTROL_ID)?).await?;
     let control = backends
@@ -365,18 +476,24 @@ pub(crate) async fn start(
         .0
         .clone();
     let executor = Arc::new(ControlGoalExecutor::new(control, runner, INTERNAL_USER)?);
-    let planner = EndogenousPlanner::new(
-        Arc::new(admin.clone()),
-        EndogenousOptions {
-            scope: scope(SourceKind::User, CHANNEL),
-            max_derivations: max,
-            timeout_ms: 30_000,
-        },
-    )?;
-    planner.reconcile(now_ms()?)?;
+    let planner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        factory.create(
+            Arc::new(admin.clone()),
+            EndogenousOptions {
+                scope: scope(SourceKind::User, CHANNEL),
+                max_derivations: max,
+                timeout_ms: 30_000,
+            },
+        )
+    }))
+    .map_err(|_| "认知规划器创建异常")??;
+    let enabled = Arc::new(AtomicBool::new(false));
     let plugin = CognitionLoopPlugin::new(
         Arc::new(admin.clone()),
-        Arc::new(PriorityDrivePolicy),
+        Arc::new(QqPolicy {
+            enabled: enabled.clone(),
+            admin: admin.clone(),
+        }),
         Arc::new(ReflectionVerifier),
         executor,
         LoopOptions {
@@ -388,7 +505,6 @@ pub(crate) async fn start(
     )?;
     let controller = plugin.controller();
     kernel.register(Box::new(plugin))?;
-    kernel.start(&PluginId::new(LOOP_PLUGIN_ID)?).await?;
     let sessions = backends
         .registry
         .get(&ServiceId::new(SESSION_SERVICE_ID)?)?
@@ -401,10 +517,14 @@ pub(crate) async fn start(
     let commands = Arc::new(Commands {
         admin: Some(admin),
         sessions: Some(sessions),
-        accepting: Arc::new(AtomicBool::new(true)),
+        accepting: Arc::new(AtomicBool::new(false)),
     });
     let (stop, mut stopping) = watch::channel(false);
     let accepting = commands.accepting.clone();
+    let active = enabled.clone();
+    let (done, finished) = watch::channel(false);
+    kernel.start(&PluginId::new(LOOP_PLUGIN_ID)?).await?;
+    let worker = controller.clone();
     let task = tokio::spawn(async move {
         let result: Result<(), AppError> = async {
             let mut timer = tokio::time::interval(Duration::from_millis(250));
@@ -414,21 +534,30 @@ pub(crate) async fn start(
                 if *stopping.borrow() {
                     break;
                 }
-                match planner.reconcile(now_ms()?) {
+                if !active.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let time = now_ms()?;
+                let planned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    planner.reconcile(time)
+                }))
+                .map_err(|_| "认知规划器异常")?;
+                match planned {
                     Ok(_) => {}
                     Err(LoopError::Cognition(CognitionError::StaleRevision)) => continue,
                     Err(error) => return Err(error.into()),
                 }
-                if controller.stats()?.feedback_save_failures > 0 {
+                if worker.stats()?.feedback_save_failures > 0 {
                     return Err("反思反馈保存失败".into());
                 }
-                controller.wake(WakeReason::StateChanged)?;
+                worker.wake(WakeReason::StateChanged)?;
             }
             Ok(())
         }
         .await;
         accepting.store(false, Ordering::SeqCst);
-        let settled = controller.shutdown().await;
+        let settled = worker.shutdown().await;
+        done.send_replace(true);
         match (result, settled) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(e), _) => Err(e),
@@ -437,7 +566,10 @@ pub(crate) async fn start(
     });
     Ok(Background {
         commands,
+        enabled,
+        controller,
         stop,
+        finished,
         task,
     })
 }
