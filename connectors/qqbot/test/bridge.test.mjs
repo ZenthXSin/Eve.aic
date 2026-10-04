@@ -2,9 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import { createBridge, consume, optionsFromEnv } from "../bridge-core.mjs";
-function fixture({ fail = false, limit = 128 } = {}) {
+function fixture({ fail = false, limit = 128, appId = "1904159860" } = {}) {
   const frames = [], sent = [], handlers = new Map();
   const bot = {
+    appId,
     on: (event, handler) => handlers.set(event, handler),
     stop: () => handlers.set("stopped", true),
     async sendText(target, text) {
@@ -81,7 +82,7 @@ test("官方不透明消息 ID 的标点保持原值，正文中的提及不被�
   assert.equal(f.frames.at(-1).ok, true);
 });
 
-test("群聊只接纳官方 @ 事件，拒绝普通群消息与机器人消息", async () => {
+test("群聊接纳官方 @ 事件，拒绝普通群消息与机器人消息", async () => {
   const f = fixture();
   const incoming = {
     kind: "group", messageId: "group-at-1", senderId: "user-1", content: "/train start",
@@ -95,4 +96,49 @@ test("群聊只接纳官方 @ 事件，拒绝普通群消息与机器人消息",
   assert.equal(f.frames.filter(x => x.type === "message").length, 1);
   await f.bridge.command({ type: "reply", version: 1, id: "group-at-1", text: "你喜欢怎样的称呼？" });
   assert.deepEqual(f.sent, [{ target: incoming.replyTarget, text: "你喜欢怎样的称呼？" }]);
+});
+
+test("普通群事件携带服务端自身提及时可原路回复，不依赖 AppID 等于 openid", async () => {
+  const f = fixture();
+  const incoming = {
+    kind: "group", messageId: "group-mention-1", senderId: "user-1", content: "你好 <@another-user>",
+    rawEventType: "GROUP_MESSAGE_CREATE", groupOpenid: "group-1",
+    mentions: [null, { member_openid: "bot-openid", is_you: true }, { is_you: false }],
+    replyTarget: { scope: "group", targetId: "group-1", msgId: "group-mention-1" },
+  };
+  f.handlers.get("message")({}, incoming);
+  assert.equal(f.frames.find(x => x.type === "message").text, incoming.content);
+  await f.bridge.command({ type: "reply", version: 1, id: incoming.messageId, text: "答复" });
+  assert.deepEqual(f.sent, [{ target: incoming.replyTarget, text: "答复" }]);
+});
+
+test("普通群事件识别当前 AppID 的两种 @ 标记，拒绝其他提及、伪标记与未知事件", () => {
+  const incoming = {
+    kind: "group", messageId: "group-mention-2", senderId: "user-1", content: "你好",
+    rawEventType: "GROUP_MESSAGE_CREATE", groupOpenid: "group-1",
+    replyTarget: { scope: "group", targetId: "group-1", msgId: "group-mention-2" },
+  };
+  for (const content of ["<@102075770> 你好", "你好 <@!102075770>"]) {
+    const f = fixture({ appId: "102075770" });
+    f.handlers.get("message")({}, { ...incoming, content });
+    assert.equal(f.frames.find(x => x.type === "message").text, content);
+  }
+  for (const change of [
+    {}, { content: "@机器人 你好" }, { content: "<@!1904159860> 你好" },
+    { content: "<@1020757700> 你好" }, { content: "<@102075770" },
+    { mentions: [{ is_you: false }, { is_you: "true" }] }, { mentions: { is_you: true } },
+    { content: "<@102075770> 你好", senderIsBot: true },
+    { rawEventType: "UNKNOWN", mentions: [{ is_you: true }] },
+    { rawEventType: "UNKNOWN", content: "<@102075770> 你好" },
+  ]) {
+    const f = fixture({ appId: "102075770" });
+    f.handlers.get("message")({}, { ...incoming, ...change });
+    assert.equal(f.frames.filter(x => x.type === "message").length, 0);
+    assert.equal(f.sent.length, 0);
+  }
+  for (const appId of [undefined, "", ".*", "102075770>"]) {
+    const f = fixture({ appId });
+    f.handlers.get("message")({}, { ...incoming, content: "<@102075770> 你好" });
+    assert.equal(f.frames.filter(x => x.type === "message").length, 0);
+  }
 });
