@@ -42,8 +42,6 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
-    env:
-      EVE_POSTGRES_TEST_CONFIG: ${{ runner.temp }}/eve-postgres-test.json
     steps:
       - name: 检出代码
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -53,11 +51,12 @@ jobs:
         run: rustup toolchain install 1.89.0 --profile minimal
       - name: 创建仅供本任务使用的测试连接文件
         env:
-          EVE_POSTGRES_TEST_PORT: ${{ job.services.database.ports[5432] }}
+          EVE_POSTGRES_TEST_PORT: ${{ job.services.database.ports['5432'] }}
         run: |
           python3 - <<'PY'
           import json
           import os
+          config_path = os.path.join(os.environ["RUNNER_TEMP"], "eve-postgres-test.json")
           config = {
               "hostname": "127.0.0.1",
               "port": int(os.environ["EVE_POSTGRES_TEST_PORT"]),
@@ -65,9 +64,11 @@ jobs:
               "user": "eve_test",
               "password": "eve-disposable-ci-password",
           }
-          descriptor = os.open(os.environ["EVE_POSTGRES_TEST_CONFIG"], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          descriptor = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
           with os.fdopen(descriptor, "w") as output:
               json.dump(config, output)
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"EVE_POSTGRES_TEST_CONFIG={config_path}\n")
           PY
       - name: 验证持久化、独占、格式保护与断连关闭
         run: cargo +1.89.0 test -p eve-state-postgres --test persistence --locked -- --ignored --test-threads=1
