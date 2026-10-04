@@ -310,6 +310,30 @@ class Acceptance(unittest.TestCase):
             self.assertEqual([m["content"] for m in messages if m["role"] == "user"], [expected])
             self.assertFalse(any(m["role"] in ("assistant", "tool") for m in messages))
 
+    def test_long_group_message_ids_reply_restore_and_deduplicate(self):
+        observed_length_id = "ROBOT1.0_" + "g" * 128
+        boundary_id = "m" * 253
+        self.run_eve([self.message(observed_length_id, "群聊记忆", scope="group"),
+                      self.message(boundary_id, "recall:群聊记忆", "群聊记忆", scope="group")])
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(self.replies(), [(observed_length_id, "群聊记忆"), (boundary_id, "群聊记忆")])
+        self.run_eve([self.message(observed_length_id, "重复不重放", scope="group"),
+                      self.message("restore-long-group", "recall:群聊记忆", "群聊记忆", scope="group")])
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(self.replies(), [("restore-long-group", "群聊记忆")])
+
+    def test_message_id_utf8_boundary_rejects_oversize_before_model_and_ledger(self):
+        valid = "界" * 84 + "!"
+        self.run_eve(script=[
+            {"send": self.message("x" * 254, "超长不执行", scope="group")},
+            {"send": self.message("界" * 85, "UTF-8 超长不执行", scope="group")},
+            {"send": self.message(valid, "字节边界", scope="group")},
+            self.wait_command(valid)])
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.replies(), [(valid, "字节边界")])
+        entries = self.documents()["eve.channel.qqbot"]["receipts.v1"]["entries"]
+        self.assertEqual([(e["message"]["id"], e["state"]) for e in entries], [(valid, "Sent")])
+
     def test_send_failure_preserves_commit_no_model_or_send_retry(self):
         result = self.run_eve([self.message("in-1", "echo:marker", "marker")], send_fail=True)
         self.assertEqual((result["completed"], result["sent"], result["failed"]), (1, 0, 1))
