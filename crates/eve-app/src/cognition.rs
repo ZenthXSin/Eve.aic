@@ -14,7 +14,7 @@ use eve_config_api::{
 use eve_config_plugin::{ConfigBootstrap, ConfigPlugin};
 use eve_control_api::{CONTROL_PLUGIN_ID, CONTROL_SERVICE_ID, ControlServiceHandle};
 use eve_control_plugin::ControlPlugin;
-use eve_kernel::{Kernel, KernelServices, backends::FileStateStore};
+use eve_kernel::{Kernel, KernelServices};
 use eve_llm_api::{ChatRole, LlmModelResolver, ResponseMode};
 use eve_plugin_api::{PluginDependency, PluginId, ServiceId, ServiceRegistry};
 use eve_runtime::{
@@ -34,12 +34,13 @@ use std::{
 };
 
 pub const COGNITION_HELP: &str = "Eve 本地内生反思入口
-用法：eve-cognition [--state-dir 目录] [--agent AGENT.md] 命令
+用法：eve-cognition [--state-dir 目录] [--agent AGENT.md] [--database-config 凭据文件] 命令
   add --id ID --text 目标文字 [--user owner]  保存等待中的用户目标，不调用模型
   status                                  查看无正文的状态计数
   show --id ID                            显式查看本地目标和已保存反思草稿
   run [--seconds 30] [--max-executions 1]   无需新输入，推进已有目标的反思草稿
 状态目录默认 .eve-cognition；运行窗口 1 至 600 秒，最多执行 1 至 32 项。
+默认文件状态；--database-config 显式选用本地 PostgreSQL，首次使用须选无文件快照的新目录。
 仅有可执行反思时才需要 EVE_OPENAI_API_KEY 和主模型配置；沿用 AGENT.md。
 每项反思最多一次模型请求、零工具、一次尝试、30 秒；父目标仍等待用户处理。
 Ctrl+C 或 SIGTERM 停止派生，取消并等待保存，然后关闭插件。";
@@ -70,6 +71,7 @@ enum CognitionCommand {
 pub struct CognitionOptions {
     pub state_directory: PathBuf,
     pub agent_path: PathBuf,
+    pub database_config: Option<PathBuf>,
     command: CognitionCommand,
 }
 
@@ -78,6 +80,7 @@ impl CognitionOptions {
         let mut args = args.into_iter();
         let mut directory = None;
         let mut agent = None;
+        let mut database_config = None;
         let mut command = None;
         let mut fields = std::collections::BTreeMap::<String, String>::new();
         while let Some(arg) = args.next() {
@@ -94,6 +97,7 @@ impl CognitionOptions {
             if ![
                 "--state-dir",
                 "--agent",
+                "--database-config",
                 "--id",
                 "--text",
                 "--user",
@@ -111,6 +115,7 @@ impl CognitionOptions {
             let duplicate = match arg.as_str() {
                 "--state-dir" => directory.replace(PathBuf::from(value)).is_some(),
                 "--agent" => agent.replace(PathBuf::from(value)).is_some(),
+                "--database-config" => database_config.replace(PathBuf::from(value)).is_some(),
                 _ => fields
                     .insert(
                         arg,
@@ -165,6 +170,7 @@ impl CognitionOptions {
         Ok(Some(Self {
             state_directory: directory.unwrap_or_else(|| ".eve-cognition".into()),
             agent_path: agent.unwrap_or_else(|| "AGENT.md".into()),
+            database_config,
             command,
         }))
     }
@@ -549,7 +555,10 @@ pub async fn run_cognition_with_planner_factory(
     factory: Arc<dyn EndogenousPlannerFactory>,
 ) -> Result<Value, AppError> {
     let backends = KernelServices {
-        state: Arc::new(FileStateStore::open(&options.state_directory)?),
+        state: crate::storage::open_state_store(
+            &options.state_directory,
+            options.database_config.as_deref(),
+        )?,
         ..KernelServices::default()
     };
     let kernel = Kernel::with_services(KernelServices {
