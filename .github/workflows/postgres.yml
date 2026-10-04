@@ -1,0 +1,79 @@
+name: PostgreSQL 状态与认知验收
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/postgres.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/postgres.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  postgres:
+    name: PostgreSQL 18 / 独立测试库
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      database:
+        image: postgres:18
+        env:
+          POSTGRES_DB: eve_test
+          POSTGRES_USER: eve_test
+          POSTGRES_PASSWORD: eve-disposable-ci-password
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U eve_test -d eve_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: 安装 Rust
+        run: rustup toolchain install 1.89.0 --profile minimal
+      - name: 创建仅供本任务使用的测试连接文件
+        env:
+          EVE_POSTGRES_TEST_PORT: ${{ job.services.database.ports['5432'] }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          config_path = os.path.join(os.environ["RUNNER_TEMP"], "eve-postgres-test.json")
+          config = {
+              "hostname": "127.0.0.1",
+              "port": int(os.environ["EVE_POSTGRES_TEST_PORT"]),
+              "database": "eve_test",
+              "user": "eve_test",
+              "password": "eve-disposable-ci-password",
+          }
+          descriptor = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(descriptor, "w") as output:
+              json.dump(config, output)
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"EVE_POSTGRES_TEST_CONFIG={config_path}\n")
+          PY
+      - name: 验证持久化、独占、格式保护与断连关闭
+        run: cargo +1.89.0 test -p eve-state-postgres --test persistence --locked -- --ignored --test-threads=1
+      - name: 验证实际认知进程与 SQL 恢复
+        run: cargo +1.89.0 test -p eve-app --test cognition_postgres --locked -- --ignored --test-threads=1
+      - name: 清理临时连接文件
+        if: always()
+        run: rm -f -- "$EVE_POSTGRES_TEST_CONFIG"

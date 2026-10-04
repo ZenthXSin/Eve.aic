@@ -9,6 +9,7 @@ mod models;
 mod qq_cognition;
 mod qqbot;
 mod services;
+mod storage;
 
 pub use cognition::{
     COGNITION_HELP, CognitionOptions, run_cognition, run_cognition_with_planner_factory,
