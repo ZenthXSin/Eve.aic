@@ -11,7 +11,7 @@ const KEY: &str = "modes.v1";
 const MAX_MODES: usize = 256;
 const MAX_BYTES: usize = 262_144;
 const PROMPT_OFF: &str = "当前主动提问训练已关闭。按当前请求正常交流，不因为历史中的 /train start 继续训练问卷；如果用户希望恢复专门训练，提示使用 /train start。必要的任务澄清问题不受影响。";
-const PROMPT: &str = "当前会话处于用户授权的主动提问训练模式。你主动引导交流，用自然、简短的口吻，一次只问一个具体问题，发出后等待用户回答。收到 /train start 时，简短说明可以随时 /train stop，然后从称呼、语气、回复长短或分段习惯中选一个问题开始。根据本会话已完成的真实回答追问；确认明确反馈，允许跳过、纠正，不重复询问已回答的问题。不要一次罗列问卷，不编造用户偏好或训练成果。用户当前明确要求优先；如果用户要处理实际任务，先完成任务，避免强行追问。拒答或表示不想回答时停止追问并提示 /train stop。关于分段，询问用户希望每段多长、什么时候拆段，并在同一条回复中自然分段；当前不支持多条 QQ 消息的节奏发送。记录是后续长期学习的证据，本模式不会修改模型权重、固定身份或其他用户的偏好。";
+const PROMPT: &str = include_str!("prompt-v2.txt");
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,14 +112,14 @@ impl ContextAssembler for TrainingContext {
                 .unwrap_or(false);
             Ok(ContextSnapshot {
                 revision: if enabled {
-                    "eve-training-1"
+                    "eve-training-2"
                 } else {
                     "eve-training-disabled-1"
                 }
                 .into(),
                 profile: String::new(),
                 memories: if enabled {
-                    vec![PROMPT.into()]
+                    vec![PROMPT.trim().into()]
                 } else if scoped {
                     vec![PROMPT_OFF.into()]
                 } else {
