@@ -428,13 +428,6 @@ pub(crate) async fn run(
                     finish(&mut stdin, &message.id).await?;
                     continue;
                 }
-                if let Some(training) = &training {
-                    let session = message.session_key(&config.app_id)?;
-                    let scope = eve_llm_api::ContextScope { session_id: session.session_id, user_id: session.user_id };
-                    if training.observe_user_message(&scope, &message.id, &message.text).is_err() {
-                        warn(&ctx, "expression_learning_failed");
-                    }
-                }
                 let submitted = control.submit(ControlInput {
                     session: SessionInput { key: message.session_key(&config.app_id)?, text: message.text.clone() },
                     task_id: format!("qq:{}", message.id),
@@ -585,6 +578,15 @@ pub(crate) async fn run(
                                         .map_err(|_| failure("QQBot 任务快照不可用"))?.map(|s| s.key);
                                     commands.push_back(CommandMessage { message, target });
                                 } else {
+                                    // 按普通输入准入时的持久开关采集，不能延后到模型执行。
+                                    // 启停/重置可先于排队任务执行；旧输入必须已有去重凭据。
+                                    if let Some(training) = &training {
+                                        let session = message.session_key(&config.app_id)?;
+                                        let scope = eve_llm_api::ContextScope { session_id: session.session_id, user_id: session.user_id };
+                                        if training.observe_user_message(&scope, &message.id, &message.text).is_err() {
+                                            warn(&ctx, "expression_learning_failed");
+                                        }
+                                    }
                                     queue.push_back(Queued { message, saved: false });
                                 }
                             }

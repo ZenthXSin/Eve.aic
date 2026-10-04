@@ -1,4 +1,5 @@
 """Actual Eve process + production plugin + fake Node/loopback Chat HTTP."""
+import hashlib
 import json
 import os
 import pathlib
@@ -224,6 +225,48 @@ class Acceptance(unittest.TestCase):
         # 显式 stop 的持久开关覆盖下一进程的默认训练选项。
         self.run_eve([self.message("train-5", "重启后聊天")], training=True)
         self.assertFalse(self.has_training(self.requests[-1]))
+
+    def test_training_start_does_not_learn_stopped_queued_input_after_restart(self):
+        self.run_eve([self.message("queue-stop", "/train stop",
+            "已结束当前会话的主动提问训练，已完成记录保留；普通聊天仍可继续。")], training=True)
+        self.provider_steps = {1: {"wait": "queue-release"}}
+        self.run_eve(training=True, script=[
+            {"send": self.message("queue-busy", "另一个用户的任务", user="user-2")},
+            self.wait_request(1),
+            {"send": self.message("queue-off", "停用期间的排队输入", expected_type="finish")},
+            {"send": self.message("queue-start", "/train start")},
+            self.wait_command("queue-off", "finish"), self.open_gate("queue-release"),
+            self.wait_command("queue-busy"), self.wait_command("queue-start")])
+        self.assertEqual(len(self.requests), 2)
+        before = self.documents()["eve.training"]["expression.v1"]
+        self.run_eve(training=True)
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(self.replies(), [])
+        after = self.documents()["eve.training"]["expression.v1"]
+        row = next(r for r in after["rows"] if r["id"] == hashlib.sha256(b"queue-off").hexdigest())
+        self.assertFalse(row["active"], "停用期间排队输入不得在开启后补学")
+        self.assertEqual((row["chars"], row["paragraphs"]), (0, 0))
+        self.assertEqual(after, before)
+
+    def test_training_reset_covers_admitted_queue_and_only_new_input_is_learned(self):
+        self.provider_steps = {1: {"wait": "reset-release"}}
+        self.run_eve(training=True, script=[
+            {"send": self.message("reset-busy", "当前任务")}, self.wait_request(1),
+            {"send": self.message("reset-queued", "重置前已收到的输入")},
+            {"send": self.message("reset-command", "/train reset",
+                "已重置本会话的表达统计，原始聊天记录保留；旧消息不会再次计入，可继续从新消息学习。")},
+            self.wait_command("reset-command"), self.open_gate("reset-release"),
+            self.wait_command("reset-busy"), self.wait_command("reset-queued")])
+        before = self.documents()["eve.training"]["expression.v1"]
+        self.assertEqual(len(before["rows"]), 2)
+        self.assertFalse(any(r["active"] for r in before["rows"]), "重置前已准入队列应包含在重置范围")
+        self.run_eve(training=True)
+        self.assertEqual(self.documents()["eve.training"]["expression.v1"], before)
+        self.assertEqual(len(self.requests), 2)
+        self.run_eve([self.message("reset-new", "重置后新输入")], training=True)
+        rows = self.documents()["eve.training"]["expression.v1"]["rows"]
+        self.assertEqual([r["id"] for r in rows if r["active"]], [hashlib.sha256(b"reset-new").hexdigest()])
+        self.assertEqual(len(self.requests), 3)
 
     def test_training_group_scope_does_not_change_other_sender_or_group(self):
         self.run_eve([self.message("tg-1", "/train stop", "已结束当前会话的主动提问训练，已完成记录保留；普通聊天仍可继续。", scope="group"),
