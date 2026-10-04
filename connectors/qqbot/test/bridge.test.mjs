@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
-import { createBridge, consume, optionsFromEnv } from "../bridge-core.mjs";
+import { createBridge, consume, optionsFromEnv, MAX_MESSAGE_ID_BYTES } from "../bridge-core.mjs";
 function fixture({ fail = false, limit = 128, appId = "1904159860" } = {}) {
   const frames = [], sent = [], handlers = new Map();
   const bot = {
@@ -80,6 +80,22 @@ test("官方不透明消息 ID 的标点保持原值，正文中的提及不被�
   await f.bridge.command({ type: "reply", version: 1, id, text: "答复" });
   assert.equal(f.sent[0].target.msgId, id);
   assert.equal(f.frames.at(-1).ok, true);
+});
+
+test("超过旧上限的群消息 ID 原样回复，253 字节边界与 UTF-8 字节一致", async () => {
+  assert.equal(MAX_MESSAGE_ID_BYTES, 253);
+  for (const id of ["ROBOT1.0_" + "g".repeat(128), "x".repeat(253), "界".repeat(84) + "!"]) {
+    const f = fixture(); f.message("group", id);
+    assert.equal(f.frames.find(x => x.type === "message").id, id);
+    await f.bridge.command({ type: "reply", version: 1, id, text: "答复" });
+    assert.equal(f.sent[0].target.msgId, id);
+    assert.equal(f.frames.at(-1).ok, true);
+  }
+  for (const id of ["x".repeat(254), "界".repeat(85), " x", "x\n", "x\u0000y"]) {
+    const f = fixture(); f.message("group", id);
+    assert.equal(f.frames.filter(x => x.type === "message").length, 0);
+    assert.equal(f.sent.length, 0);
+  }
 });
 
 test("群聊接纳官方 @ 事件，拒绝普通群消息与机器人消息", async () => {

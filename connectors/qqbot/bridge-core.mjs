@@ -1,8 +1,10 @@
 // Tencent SDK adaptation; stdout is reserved for the versioned JSONL protocol.
 export const MAX_FRAME = 65536;
+// The control task ID adds "qq:" and must fit its 256-byte contract.
+export const MAX_MESSAGE_ID_BYTES = 253;
 const validId = v => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v);
 const validMessageId = v => typeof v === "string" && v.trim() === v && v.length > 0 &&
-  Buffer.byteLength(v) <= 128 && !/[\p{Cc}]/u.test(v);
+  Buffer.byteLength(v) <= MAX_MESSAGE_ID_BYTES && !/[\p{Cc}]/u.test(v);
 const validText = v => typeof v === "string" && v.trim() && Buffer.byteLength(v) <= 32768;
 function isGroupAt(msg, appId) {
   if (msg.rawEventType === "GROUP_AT_MESSAGE_CREATE") return true;
