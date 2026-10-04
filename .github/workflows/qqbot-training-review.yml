@@ -1,8 +1,5 @@
 name: QQ 训练记录受限复核
 on:
-  push:
-    branches: [main]
-    paths: [".github/qqbot-training-review-request.json"]
   workflow_dispatch:
 permissions:
   contents: read
