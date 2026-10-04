@@ -13,6 +13,47 @@ spec.loader.exec_module(training)
 
 
 class Reports(unittest.TestCase):
+    def test_new_round_preserves_source_history_and_counts_only_new_receipts_and_turns(self):
+        identity = "qq:" + hashlib.sha256(json.dumps(["1904159860", "c2c", "user-1", "user-1"], separators=(",", ":")).encode()).hexdigest()
+        message = {"id": "old-1", "scope": "c2c", "target_id": "user-1", "user_id": "user-1", "text": "你好"}
+        receipt = {"app_id": "1904159860", "message": message, "state": "Sent", "reply": "你好呀"}
+        turn = {"input": "你好", "status": {"state": "Completed", "messages": [{"role": "Assistant", "text": "你好呀"}]}}
+        receipts = {"version": 1, "entries": [receipt]}
+        sessions = {"format_version": 1, "sessions": {identity: {"key": {"session_id": identity, "user_id": identity}, "turns": [turn]}}}
+        def state():
+            return {"version": 1, "entries": {"eve.channel.qqbot": {"receipts.v1": list(json.dumps(receipts).encode())},
+                "eve.session": {"sessions.v1": list(json.dumps(sessions).encode())}}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "previous-state"
+            source.mkdir()
+            training.write_json(source / "state.json", state())
+            before = (source / "state.json").read_bytes()
+            next_round = root / "next"
+            next_round.mkdir()
+            training.seed_round(next_round, source)
+            path = next_round / "state/state.json"
+            self.assertEqual(training.collect(path)["counts"]["received_records"], 0)
+            receipts["entries"].append({**receipt, "message": {**message, "id": "new-1"}})
+            sessions["sessions"][identity]["turns"].append(turn)
+            training.write_json(path, state())
+            result = training.collect(path)
+            self.assertEqual(result["counts"]["received_records"], 1)
+            self.assertEqual(result["counts"]["completed_turns"], 1)
+            self.assertEqual(result["counts"]["model_sent"], 1)
+            self.assertEqual(result["evidence"][0]["message_id"], "new-1")
+            self.assertEqual((source / "state.json").read_bytes(), before)
+            third = root / "third"
+            third.mkdir()
+            training.seed_round(third, path.parent)
+            self.assertEqual(training.collect(third / "state/state.json")["counts"]["model_sent"], 0)
+            baseline_path = path.parent / "round-baseline.v1.json"
+            baseline = json.loads(baseline_path.read_bytes())
+            baseline["turns"][identity] = 99
+            training.write_json(baseline_path, baseline)
+            with self.assertRaisesRegex(ValueError, "round_baseline_mismatch"):
+                training.collect(path)
+
     def test_report_only_uses_completed_and_sent_model_pairs(self):
         message = {"id": "g.1!", "scope": "group", "target_id": "group-1", "user_id": "user-1", "text": "我喜欢简短分段"}
         reply = "收到。\n\n每段两句合适吗？"

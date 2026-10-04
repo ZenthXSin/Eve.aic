@@ -13,6 +13,23 @@ function isGroupAt(msg, appId) {
   return validId(appId) && typeof msg.content === "string" &&
     new RegExp(`<@!?${appId}>`).test(msg.content);
 }
+function userText(msg, appId) {
+  let text = msg.content.trim();
+  if (msg.kind !== "group") return text;
+  const own = new Set(validId(appId) ? [appId] : []);
+  for (const mention of Array.isArray(msg.mentions) ? msg.mentions : []) {
+    if (mention?.is_you !== true) continue;
+    for (const id of [mention.id, mention.member_openid, mention.user_openid]) {
+      if (validId(id)) own.add(id);
+    }
+  }
+  while (true) {
+    const match = /^<@!?([A-Za-z0-9_-]{1,128})>\s*/.exec(text);
+    if (!match || !own.has(match[1])) break;
+    text = text.slice(match[0].length).trimStart();
+  }
+  return text;
+}
 export function optionsFromEnv(env) {
   const appId = env.QQBOT_APP_ID || "1904159860";
   if (!validId(appId) || !env.QQBOT_APP_SECRET?.trim()) throw new Error("credentials_missing");
@@ -57,10 +74,12 @@ export function createBridge(bot, emit, limit = 128) {
     }
     if (pending.has(msg.messageId)) { warn("duplicate_pending"); return; }
     if (pending.size >= limit) { warn("pending_limit"); return; }
+    const text = userText(msg, bot.appId);
+    if (!validText(text)) { warn("invalid_route_or_text"); return; }
     pending.set(msg.messageId, { target: { ...target }, sending: false });
     send({ type: "message", id: msg.messageId, scope: msg.kind,
       target_id: target.targetId, user_id: msg.senderId,
-      text: msg.content.trim() });
+      text });
   });
   return {
     stop,

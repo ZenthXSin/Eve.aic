@@ -213,6 +213,20 @@ pub(crate) async fn run(
         messages,
         training,
     } = services;
+    // 仅本地学习已验证回执中的用户表达；不提交旧任务、不调用模型或重发消息。
+    if let Some(training) = &training {
+        for entry in &ledger.entries {
+            if entry.app_id != config.app_id {
+                continue;
+            }
+            let session = entry.message.session_key(&config.app_id)?;
+            let scope = eve_llm_api::ContextScope {
+                session_id: session.session_id,
+                user_id: session.user_id,
+            };
+            training.observe_user_message(&scope, &entry.message.id, &entry.message.text)?;
+        }
+    }
     let (closed, receiver) = watch::channel(false);
     let sink = Arc::new(ChannelEvents {
         signal: signal.clone(),
@@ -320,7 +334,12 @@ pub(crate) async fn run(
                     let text = match action {
                         TrainingCommand::Stop => "已结束当前会话的主动提问训练，已完成记录保留；普通聊天仍可继续。".into(),
                         TrainingCommand::Status => if training.enabled(&scope)? { "当前会话：主动提问训练已开启。" } else { "当前会话：主动提问训练已关闭。" }.into(),
-                        TrainingCommand::Help => "训练命令：/train start 开始并提问；/train stop 结束；/train status 查看。一次一个问题，可以跳过或纠正。".into(),
+                        TrainingCommand::Stats => match training.expression_snapshot(&scope)? {
+                            Some(s) => format!("本会话已学习 {} 条有效用户表达：字数中位数 {}，短消息 {}%，单段消息 {}%。{}当前要求始终优先；这是本地表达统计。", s.samples, s.median_chars, s.short_percent, s.single_paragraph_percent, if s.samples < 8 { "不足 8 条，暂不采用本会话统计。" } else { "" }),
+                            None => "本会话暂无有效表达样本；训练开启后会从普通交流中学习。".into(),
+                        },
+                        TrainingCommand::Reset => { training.reset_expression(&scope)?; "已重置本会话的表达统计，原始聊天记录保留；旧消息不会再次计入，可继续从新消息学习。".into() },
+                        TrainingCommand::Help => "训练命令：/train start 开始；/train stop 停止采集和主动训练；/train status 查看开关；/train stats 查看表达统计；/train reset 重置本会话统计。".into(),
                         TrainingCommand::Start => unreachable!(),
                     };
                     replies.push_back(Reply { message, text, guard: ReplyGuard::NoTask });
@@ -381,6 +400,13 @@ pub(crate) async fn run(
                     warn(&ctx, "receipt_limit");
                     finish(&mut stdin, &message.id).await?;
                     continue;
+                }
+                if let Some(training) = &training {
+                    let session = message.session_key(&config.app_id)?;
+                    let scope = eve_llm_api::ContextScope { session_id: session.session_id, user_id: session.user_id };
+                    if training.observe_user_message(&scope, &message.id, &message.text).is_err() {
+                        warn(&ctx, "expression_learning_failed");
+                    }
                 }
                 let submitted = control.submit(ControlInput {
                     session: SessionInput { key: message.session_key(&config.app_id)?, text: message.text.clone() },

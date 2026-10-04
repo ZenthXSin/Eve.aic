@@ -37,7 +37,7 @@ def generate(prompt, identity, record, timeout):
     for turn in record["history"]:
         messages.extend([{"role": "user", "content": turn["input"]}, {"role": "assistant", "content": turn["reply"]}])
     messages.append({"role": "user", "content": record["input"]})
-    return review.chat(messages, 512, timeout)
+    return review.chat(messages, 4096, timeout)
 
 
 def compare(evidence, baseline, candidate, identity, generator=generate, evaluator=review.judge, clock=time.monotonic):
@@ -115,8 +115,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     try:
-        baseline = (ROOT / "connectors/qqbot/test/fixtures/training-v1.txt").read_text().strip()
-        candidate = (ROOT / "crates/training-plugin/src/prompt-v2.txt").read_text().strip()
+        baseline = (ROOT / "crates/training-plugin/src/prompt-v2.txt").read_text().strip()
+        candidate = (ROOT / "crates/training-plugin/src/prompt-v3.txt").read_text().strip()
         identity = (ROOT / "AGENT.md").read_text()
         if args.synthetic:
             fixture = ROOT / "connectors/qqbot/test/fixtures/training-public-cases.json"

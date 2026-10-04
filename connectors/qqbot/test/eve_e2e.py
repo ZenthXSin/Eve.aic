@@ -182,6 +182,33 @@ class Acceptance(unittest.TestCase):
     def has_training(self, request):
         return any(m["role"] == "system" and "主动提问训练模式" in m.get("content", "") for m in request["messages"])
 
+    def test_builtin_expression_learning_from_old_receipts_is_local_idempotent_and_resettable(self):
+        # 旧版记录没有表达统计；启动新版仅在本地导入，不回放请求或投递。
+        self.run_eve([self.message(f"el-{i}", "今天不错", scope="group") for i in range(8)])
+        state_path = self.work / "state/state.json"
+        saved = json.loads(state_path.read_text())
+        saved["entries"].pop("eve.training", None)
+        state_path.write_text(json.dumps(saved))
+        before = len(self.requests)
+        self.run_eve(training=True)
+        self.assertEqual(len(self.requests), before)
+        self.assertEqual(self.replies(), [])
+        learned = self.documents()["eve.training"]["expression.v1"]
+        self.assertEqual(len(learned["rows"]), 8)
+        self.assertNotIn("今天不错", json.dumps(learned, ensure_ascii=False))
+        self.run_eve(training=True)
+        self.assertEqual(self.documents()["eve.training"]["expression.v1"], learned)
+        self.run_eve([self.message("el-stats", "/train stats", "本会话已学习 8 条有效用户表达：字数中位数 4，短消息 100%，单段消息 100%。当前要求始终优先；这是本地表达统计。", scope="group"),
+                      self.message("el-other", "/train stats", "本会话暂无有效表达样本；训练开启后会从普通交流中学习。", scope="group", user="user-2"),
+                      self.message("el-task", "详细解释这个任务", scope="group")], training=True)
+        self.assertEqual(len(self.requests), before + 1)
+        self.assertTrue(any(m["role"] == "system" and "当前可信会话" in m.get("content", "") for m in self.requests[-1]["messages"]))
+        self.run_eve([self.message("el-reset", "/train reset", "已重置本会话的表达统计，原始聊天记录保留；旧消息不会再次计入，可继续从新消息学习。", scope="group")], training=True)
+        self.run_eve(training=True)
+        self.assertFalse(any(r["active"] for r in self.documents()["eve.training"]["expression.v1"]["rows"]))
+        self.assertEqual(len(self.requests), before + 1)
+        self.assertEqual(len(self.sessions()[0]["turns"]), 9)
+
     def test_training_questions_use_real_history_stop_persists_and_ordinary_chat_continues(self):
         self.provider_steps = {1: {"text": "你喜欢我怎样称呼你？"}, 2: {"text": "收到。你希望回复更简短吗？"}}
         self.run_eve([self.message("train-1", "/train start", "你喜欢我怎样称呼你？"),

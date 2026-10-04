@@ -137,7 +137,7 @@ test("普通群事件识别当前 AppID 的两种 @ 标记，拒绝其他提及�
   for (const content of ["<@102075770> 你好", "你好 <@!102075770>"]) {
     const f = fixture({ appId: "102075770" });
     f.handlers.get("message")({}, { ...incoming, content });
-    assert.equal(f.frames.find(x => x.type === "message").text, content);
+    assert.equal(f.frames.find(x => x.type === "message").text, content.startsWith("<@") ? "你好" : content);
   }
   for (const change of [
     {}, { content: "@机器人 你好" }, { content: "<@!1904159860> 你好" },
@@ -157,4 +157,36 @@ test("普通群事件识别当前 AppID 的两种 @ 标记，拒绝其他提及�
     f.handlers.get("message")({}, { ...incoming, content: "<@102075770> 你好" });
     assert.equal(f.frames.filter(x => x.type === "message").length, 0);
   }
+});
+
+test("原生训练命令只剥离开头已确认的自身 @，保留其他提及与原回复路由", async () => {
+  for (const mention of [
+    { member_openid: "bot-openid", is_you: true },
+    { user_openid: "bot-openid", is_you: true },
+    { id: "bot-openid", is_you: true },
+  ]) {
+    const f = fixture({ appId: "102075770" });
+    const target = { scope: "group", targetId: "group-1", msgId: "native-1" };
+    const incoming = { kind: "group", messageId: "native-1", senderId: "user-1",
+      rawEventType: "GROUP_MESSAGE_CREATE", groupOpenid: "group-1", mentions: [mention],
+      replyTarget: target, content: " <@!bot-openid> /train stats " };
+    f.handlers.get("message")({}, incoming);
+    assert.equal(f.frames.find(x => x.type === "message").text, "/train stats");
+    await f.bridge.command({ type: "reply", version: 1, id: "native-1", text: "统计" });
+    assert.deepEqual(f.sent[0].target, target);
+  }
+  for (const content of ["<@other-user> /train reset", "正文 <@bot-openid> /train stop"]) {
+    const f = fixture();
+    f.handlers.get("message")({}, { kind: "group", messageId: "native-2", senderId: "user-1",
+      rawEventType: "GROUP_MESSAGE_CREATE", groupOpenid: "group-1",
+      mentions: [{ member_openid: "bot-openid", is_you: true }],
+      replyTarget: { scope: "group", targetId: "group-1", msgId: "native-2" }, content });
+    assert.equal(f.frames.find(x => x.type === "message").text, content);
+  }
+  const f = fixture();
+  f.handlers.get("message")({}, { kind: "group", messageId: "empty-1", senderId: "user-1",
+    rawEventType: "GROUP_MESSAGE_CREATE", groupOpenid: "group-1",
+    mentions: [{ member_openid: "bot-openid", is_you: true }],
+    replyTarget: { scope: "group", targetId: "group-1", msgId: "empty-1" }, content: "<@bot-openid>" });
+  assert.equal(f.frames.filter(x => x.type === "message").length, 0);
 });
