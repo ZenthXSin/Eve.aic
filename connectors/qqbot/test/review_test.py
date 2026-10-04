@@ -54,7 +54,7 @@ class Reviews(unittest.TestCase):
 
     def test_model_cannot_publish_text_identity_or_inferred_preferences(self):
         for item in [dict(answer(0), raw="private"), dict(answer(0), question_act="private"),
-                     dict(answer(0), flags=["private"]), answer(0, dimensions=["tone"]),
+                     dict(answer(0), flags=["private"]), answer(0, dimensions=["private"]),
                      answer(True), answer(9)]:
             with self.assertRaises((ValueError, TypeError)):
                 review.validate_reviews({"reviews": [item]}, {0})
@@ -62,6 +62,18 @@ class Reviews(unittest.TestCase):
             with self.assertRaises(ValueError):
                 review.validate_reviews({"reviews": items}, {0})
         self.assertEqual(review.validate_reviews({"reviews": [answer(0, act="preference_feedback", dimensions=["tone"])]}, {0})[0]["preference_dimensions"], ["tone"])
+
+    def test_answer_and_unrelated_dimension_signals_never_become_explicit_preferences(self):
+        evidence = [{"session": "s", "input": "one", "reply": "reply"},
+                    {"session": "s", "input": "two", "reply": "reply"},
+                    {"session": "s", "input": "three", "reply": "reply"}]
+        def evaluate(batch):
+            return {"reviews": [answer(r["index"], act=["training_answer", "casual_chat", "preference_feedback"][r["index"]], dimensions=["tone"]) for r in batch]}
+        result = review.review(evidence, evaluate)
+        self.assertEqual(result["explicit_preference_dimensions"], {"tone": 1})
+        self.assertEqual(result["answer_preference_candidates"], {"tone": 1})
+        self.assertEqual(result["unconfirmed_preference_signals"], {"tone": 1})
+        self.assertTrue(result["review_complete"])
 
     def test_same_session_history_answer_without_keyword_and_no_route_ids(self):
         evidence = [{"session": "private-a", "message_id": "sensitive-id", "input": "问候", "reply": "每段一句合适吗？"},
@@ -89,11 +101,11 @@ class Reviews(unittest.TestCase):
         evidence = [{"session": "s", "input": "x", "reply": "y"} for _ in range(100)]
         batches, _, selected = review.evidence_batches(evidence)
         self.assertEqual(selected, 64)
-        self.assertEqual(len(batches), 16)
+        self.assertEqual(len(batches), 32)
         def failing(_):
             raise ValueError("private model error")
         result = review.review(evidence, failing)
-        self.assertEqual((result["requests"], result["failed_batches"], result["unreviewed"]), (16, 16, 64))
+        self.assertEqual((result["requests"], result["failed_batches"], result["unreviewed"]), (32, 32, 64))
         self.assertFalse(result["review_complete"])
         ticks = iter([0, 601])
         result = review.review(evidence, lambda _: self.fail("deadline must stop request"), clock=lambda: next(ticks))

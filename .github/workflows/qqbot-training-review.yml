@@ -55,7 +55,7 @@ jobs:
           EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
         run: python3 connectors/qqbot/training-review.py --source "$RUNNER_TEMP/training-source" --output "$RUNNER_TEMP/training-review-summary.json"
       - name: 相同历史输入的旧策略与候选策略对照
-        if: env.COMPARE_POLICY == 'true'
+        if: always() && env.COMPARE_POLICY == 'true'
         env:
           QQBOT_APP_SECRET: ${{ secrets.QQBOT_APP_SECRET }}
           EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
