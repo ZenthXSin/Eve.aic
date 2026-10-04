@@ -83,4 +83,4 @@ cargo test -p eve-state-postgres --test persistence --locked -- --ignored --test
 cargo test -p eve-app --test cognition_postgres --locked -- --ignored --test-threads=1
 ```
 
-后端测试覆盖原始字节、命名空间隔离、覆盖写、独占锁、重开、未知格式保留以及断连后永久关闭；应用测试启动真实独立 `eve-cognition` 进程和 loopback 模型，检查 SQL 草稿恢复、父目标 Waiting、再次启动零请求以及漏参数/更换目标/已有文件状态的拒绝路径。上述是验收入口与范围，实际通过结果须附对应运行记录；当前不据此宣称 PostgreSQL 上的真实模型或 QQ 交互已经通过。
+后端测试覆盖原始字节、命名空间隔离、覆盖写、独占锁、重开、未知格式保留以及断连后永久关闭；应用测试启动真实独立 `eve-cognition` 进程和 loopback 模型，检查 SQL 草稿恢复、父目标 Waiting、再次启动零请求以及漏参数/更换目标/已有文件状态的拒绝路径。2026-10-04 在合并主线 `fdabc3c` 后以本机专用 `eve_test` 串行复验：后端测试通过（4.28 秒），应用进程测试通过（3.69 秒）；没有使用真实模型或 QQ。独立工作流 `.github/workflows/postgres.yml` 在 Ubuntu 临时 PostgreSQL 18 服务中生成权限 `0600` 的临时连接文件，并以 Rust 1.89 串行执行同两项测试；普通工作区测试继续跳过需要数据库的两项 `#[ignore]` 用例。远程结果以对应 PR 工作流为准。
