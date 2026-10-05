@@ -988,3 +988,127 @@ async fn cancel_between_displayed_parts_stops_the_rest_without_changing_history(
     assert_eq!(user_texts(&server.next().await.body), ["请分段", "新任务"]);
     assert!(server.requests.try_recv().is_err());
 }
+
+fn segment_preferences(root: &Path) -> Option<Value> {
+    let outer: Value =
+        serde_json::from_slice(&std::fs::read(root.join("state/state.json")).ok()?).unwrap();
+    let bytes: Vec<u8> = outer["entries"]["eve.segment.preferences"]["preferences.v1"]
+        .as_array()?
+        .iter()
+        .map(|v| u8::try_from(v.as_u64().unwrap()).unwrap())
+        .collect();
+    Some(serde_json::from_slice(&bytes).unwrap())
+}
+const OFF: &str = "已关闭本会话分段：下一条回复起整条发送；发送 /segment on 可重新开启。";
+
+#[tokio::test]
+async fn segment_settings_are_local_persist_per_session_and_apply_from_next_reply() {
+    let root = fixture();
+    let mut server = Server::start(
+        (0..4)
+            .map(|_| Reply::json(final_response(SEGMENTED)))
+            .collect(),
+    )
+    .await;
+    let output = run(
+        segmented(root.path(), &server.url),
+        "/segment off\n请分段\n/segment\n",
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        eve_lines(&output.stdout),
+        [
+            OFF.to_string(),
+            "本会话分段：关闭，整条发送（已设置）；最多 3 段（默认）；段间停顿 100%（默认），单次不超过 2.5 秒。设置只影响本会话，从下一条回复生效；发送 /segment help 查看命令。".to_string(),
+            SEGMENTED.to_string(),
+        ]
+    );
+    assert_eq!(
+        segment_preferences(root.path()).unwrap(),
+        json!({"version": 1, "scopes": [{"scope": {"channel": "console", "session_id": "default", "user_id": "owner"},
+            "enabled": false, "max_segments": null, "pause_percent": null}]})
+    );
+    // 重启后设置仍然生效；其他会话不受影响。
+    let output = run(segmented(root.path(), &server.url), "请分段\n").await;
+    assert_eq!(eve_lines(&output.stdout), [SEGMENTED]);
+    let mut other = segmented(root.path(), &server.url);
+    other.args(["--session", "other"]);
+    let output = run(other, "/segment parts 2\n请分段\n").await;
+    assert_eq!(
+        eve_lines(&output.stdout),
+        [
+            "已将本会话分段上限设为 2 段，从下一条回复生效。".to_string(),
+            PARTS[0].to_string(),
+            format!("{}\n\n{}", PARTS[1], PARTS[2]),
+        ]
+    );
+    let output = run(
+        segmented(root.path(), &server.url),
+        "/segment reset\n请分段\n",
+    )
+    .await;
+    let lines = eve_lines(&output.stdout);
+    assert!(lines[0].starts_with("已恢复本会话默认分段"));
+    assert_eq!(lines[1..], PARTS);
+    assert_eq!(
+        segment_preferences(root.path()).unwrap()["scopes"],
+        json!([{"scope": {"channel": "console", "session_id": "other", "user_id": "owner"},
+            "enabled": null, "max_segments": 2, "pause_percent": null}])
+    );
+    // 设置命令不进入会话历史，也不请求模型。
+    for _ in 0..4 {
+        let body = server.next().await.body;
+        assert!(user_texts(&body).iter().all(|t| !t.starts_with("/segment")));
+    }
+    assert!(server.requests.try_recv().is_err());
+    let turns = &sessions(root.path())["sessions"]["default"]["turns"];
+    assert_eq!(turns.as_array().unwrap().len(), 3);
+}
+#[tokio::test]
+async fn segment_commands_without_flag_never_reach_the_model_or_state() {
+    let root = fixture();
+    let mut server = Server::start(vec![]).await;
+    let output = run(
+        command(root.path(), &server.url),
+        "/segment off\n/segment parts 4\n",
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        eve_lines(&output.stdout),
+        ["分段显示未开启：以 --segmented 启动后可按会话设置。"; 2]
+    );
+    assert!(segment_preferences(root.path()).is_none());
+    assert!(server.requests.try_recv().is_err());
+}
+#[tokio::test]
+async fn corrupt_segment_settings_refuse_startup_and_keep_bytes() {
+    let root = fixture();
+    let mut server = Server::start(vec![Reply::json(final_response(SEGMENTED))]).await;
+    assert!(
+        run(segmented(root.path(), &server.url), "/segment off\n")
+            .await
+            .status
+            .success()
+    );
+    let path = root.path().join("state/state.json");
+    let mut outer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    outer["entries"]["eve.segment.preferences"]["preferences.v1"] =
+        json!(br#"{"version":1,"scopes":[{"scope":{"channel":"console","session_id":"default","user_id":"owner"},"enabled":null,"max_segments":null,"pause_percent":null}]}"#.to_vec());
+    std::fs::write(&path, serde_json::to_vec(&outer).unwrap()).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let output = run(segmented(root.path(), &server.url), "请分段\n").await;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("分段设置状态损坏；未清空"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(server.requests.try_recv().is_err());
+}

@@ -50,7 +50,7 @@
 
 2026-10-05，已有内生反思与可替换规划、QQ 主动训练和表达统计、训练策略 v3、正式群提及与长消息 ID 修复。本轮已实现 QQ 有来源成功交互、明确偏好的查看/修正/撤销和按可信范围装配 Context；只有显式用户指令成为确认偏好，数值示范不代替确认。反思草稿只完成记录，不代表父目标执行完成或 AGI。事件、服务、状态、权限、任务、日志及独立进程恢复底座继续保留，详见[开发计划](./开发计划.md)。
 
-[#97：排队输入跨训练启停与重置后的补学](https://github.com/ZenthXSin/Eve.aic/issues/97)已由 [PR #98](https://github.com/ZenthXSin/Eve.aic/pull/98) 修复并合入。SQL 后端与入口由 [PR #99](https://github.com/ZenthXSin/Eve.aic/pull/99)、[PR #102](https://github.com/ZenthXSin/Eve.aic/pull/102) 交付，QQ 反思由 [PR #101](https://github.com/ZenthXSin/Eve.aic/pull/101) 交付。三个宿主通过 `--database-config` 显式选择 SQL，默认文件状态且不自动迁移；QQ 的 `--memory` 与 `--cognition` 独立开启，共用所选 StateStore，各自独立提交。当前记忆不补采旧回执；追加 `--memory-learning` 可从已保存经历低频生成候选，只有用户明确确认才进入偏好。终端与 QQ 可用 `--segmented` 把同一轮回复按自然段分条投递，回执逐段记录、重启不补发，见[分段投递](./表达偏好与分段输出.md#首版分段投递已实现)。分段偏好学习、语义检索、目标执行和 AGI 质量评估继续推进。
+[#97：排队输入跨训练启停与重置后的补学](https://github.com/ZenthXSin/Eve.aic/issues/97)已由 [PR #98](https://github.com/ZenthXSin/Eve.aic/pull/98) 修复并合入。SQL 后端与入口由 [PR #99](https://github.com/ZenthXSin/Eve.aic/pull/99)、[PR #102](https://github.com/ZenthXSin/Eve.aic/pull/102) 交付，QQ 反思由 [PR #101](https://github.com/ZenthXSin/Eve.aic/pull/101) 交付。三个宿主通过 `--database-config` 显式选择 SQL，默认文件状态且不自动迁移；QQ 的 `--memory` 与 `--cognition` 独立开启，共用所选 StateStore，各自独立提交。当前记忆不补采旧回执；追加 `--memory-learning` 可从已保存经历低频生成候选，只有用户明确确认才进入偏好。终端与 QQ 可用 `--segmented` 把同一轮回复按自然段分条投递，回执逐段记录、重启不补发，见[分段投递](./表达偏好与分段输出.md#首版分段投递已实现)；每个会话可用 `/segment` 关闭分段或调整段数与停顿，见[会话分段设置](./表达偏好与分段输出.md#会话分段设置已实现)。分段偏好学习、语义检索、目标执行和 AGI 质量评估继续推进。
 
 任务支持前台、后台、定时与重复执行；插件可通过公开接口定义新任务类型和调度规则，扩展无需修改内核。详见[插件开发](./插件开发.md#自定义任务类型与调度)。
 

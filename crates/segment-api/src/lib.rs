@@ -5,6 +5,8 @@ use std::{
     ops::Range,
     panic::{AssertUnwindSafe, catch_unwind},
 };
+mod preference;
+pub use preference::*;
 
 /// 契约硬上限；通道可以更小，例如受平台被动回复次数约束。
 pub const MAX_SEGMENTS: usize = 8;

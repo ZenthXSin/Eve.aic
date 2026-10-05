@@ -440,15 +440,24 @@ pub(crate) async fn run(
                     finish(&mut stdin, &reply.message.id).await?;
                     continue;
                 }
-                // 只分段已完成的模型回复；规划失败或计划无效时整条发送。
+                // 只分段已完成的模型回复；在开始投递时读取会话设置。规划失败或计划无效时整条发送；
+                // 设置读取失败也整条发送，不能用宿主默认覆盖用户已保存的“关闭”。
                 let plan = match (&segmentation, &reply.guard) {
                     (Some(segmentation), ReplyGuard::Completed(_)) => {
-                        match eve_segment_api::plan_or_single(segmentation.planner.as_ref(), &reply.text, segmentation.limits) {
-                            Ok((plan, warning)) => {
-                                if warning.is_some() { warn(&ctx, "segment_plan_fallback"); }
-                                Some(plan).filter(|plan| plan.segments.len() > 1)
-                            }
-                            Err(_) => { warn(&ctx, "segment_plan_unavailable"); None }
+                        let preference = match &segmentation.preferences {
+                            None => Ok(eve_segment_api::SegmentPreference::default()),
+                            Some(store) => store.get(&crate::segment_scope(&reply.message.session_key(&config.app_id)?)),
+                        };
+                        match preference {
+                            Err(_) => { warn(&ctx, "segment_preference_unavailable"); None }
+                            Ok(preference) => match eve_segment_api::plan_with_preference(
+                                segmentation.planner.as_ref(), &reply.text, &segmentation.policy, &preference) {
+                                Ok((plan, warning)) => {
+                                    if warning.is_some() { warn(&ctx, "segment_plan_fallback"); }
+                                    Some(plan).filter(|plan| plan.segments.len() > 1)
+                                }
+                                Err(_) => { warn(&ctx, "segment_plan_unavailable"); None }
+                            },
                         }
                     }
                     _ => None,

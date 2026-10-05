@@ -12,6 +12,7 @@ mod qq_learning_commands;
 mod qq_memory;
 mod qq_memory_observer;
 mod qqbot;
+mod segment_commands;
 mod services;
 mod storage;
 
@@ -56,15 +57,21 @@ pub const HELP: &str = "Eve 核心对话入口
 EVE_OPENAI_MODEL_ROLE=primary 显式使用 runtime.models 的主模型角色配置；每轮固定选择。
 一行一轮；/cancel 取消当前轮；/quit 或 Ctrl+C 取消并退出；/help 查看说明。
 --segmented 保存完整回复后按自然段分至多 3 段显示，段间停顿至多 2.5 秒；/cancel 停止显示剩余片段。
+/segment 查看本会话分段；on、off、reset、parts 2至5、pace 0至200（%）按 --session/--user 保存，从下一条回复生效。
 EOF 处理完已接收输入后退出；最多 16 条待处理输入，取消/退出会清空队列。
 输入上限 32768 字节；当前入口使用非流式模式，串行执行和保存。";
 const MAX_INPUT_BYTES: usize = 32768;
-/// 终端与 QQ 默认一致：最多三段，段前停顿最长 2.5 秒。
-const CONSOLE_SEGMENT_LIMITS: eve_segment_api::SegmentLimits = eve_segment_api::SegmentLimits {
-    max_segments: 3,
-    max_segment_bytes: MAX_INPUT_BYTES,
-    max_pause_ms: 2500,
+/// 终端与 QQ 默认一致：最多三段，段前停顿最长 2.5 秒；会话设置最多 5 段、停顿最长 5 秒。
+const CONSOLE_SEGMENT_POLICY: eve_segment_api::SegmentPolicy = eve_segment_api::SegmentPolicy {
+    defaults: eve_segment_api::SegmentLimits {
+        max_segments: 3,
+        max_segment_bytes: MAX_INPUT_BYTES,
+        max_pause_ms: 2500,
+    },
+    max_segments: 5,
+    max_pause_ms: 5000,
 };
+const CONSOLE_SEGMENT_CHANNEL: &str = "console";
 
 #[derive(Clone, Debug)]
 pub struct ChatOptions {
@@ -157,6 +164,21 @@ pub async fn run_console(
     let kernel = Kernel::with_services(backends);
     // 包含注册、启动、装配与对话；任一步失败均走同一停止/日志收尾。
     let result = async {
+        // 分段设置先于模型装配加载；损坏或版本不兼容时拒绝启动并保留原字节。
+        let preferences: Option<Arc<dyn eve_segment_api::SegmentPreferences>> = if options.segmented
+        {
+            let plugin = eve_segment_plugin::SegmentPreferencePlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel
+                .start(&PluginId::new(
+                    eve_segment_plugin::SEGMENT_PREFERENCES_PLUGIN_ID,
+                )?)
+                .await?;
+            Some(Arc::new(controller))
+        } else {
+            None
+        };
         let control = install_core(
             &kernel,
             registry,
@@ -173,9 +195,16 @@ pub async fn run_console(
             receiver,
             &mut output,
             tokio::signal::ctrl_c(),
-            options.segmented.then(|| console::Segmenter {
+            preferences.map(|preferences| console::Segmenter {
                 planner: Arc::new(eve_segment_plugin::ParagraphPlanner::default()),
-                limits: CONSOLE_SEGMENT_LIMITS,
+                policy: CONSOLE_SEGMENT_POLICY,
+                preferences,
+                // 与 QQ 作用域分开：同一状态目录里的终端会话不会读到 QQ 用户的设置。
+                scope: eve_segment_api::SegmentScope {
+                    channel: CONSOLE_SEGMENT_CHANNEL.into(),
+                    session_id: options.session_id.clone(),
+                    user_id: options.user_id.clone(),
+                },
             }),
         )
         .await;

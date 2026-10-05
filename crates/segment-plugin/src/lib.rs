@@ -5,6 +5,8 @@ use eve_segment_api::{
     fenced_code_spans,
 };
 use std::ops::Range;
+mod preference;
+pub use preference::*;
 
 pub const PARAGRAPH_PLANNER: &str = "paragraph-v3";
 

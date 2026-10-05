@@ -6,4 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+eve-plugin-api = { path = "../plugin-api" }
 eve-segment-api = { path = "../segment-api" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+eve-kernel = { path = "../kernel" }
+tempfile.workspace = true
+tokio.workspace = true
