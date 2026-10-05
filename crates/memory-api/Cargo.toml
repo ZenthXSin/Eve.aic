@@ -1,0 +1,10 @@
+[package]
+name = "eve-memory-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-session-api = { path = "../session-api" }
+serde.workspace = true

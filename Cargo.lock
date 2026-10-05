@@ -286,6 +286,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-memory-api"
+version = "0.1.0"
+dependencies = [
+ "eve-session-api",
+ "serde",
+]
+
+[[package]]
+name = "eve-memory-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-kernel",
+ "eve-llm-api",
+ "eve-memory-api",
+ "eve-plugin-api",
+ "eve-session-api",
+ "eve-session-plugin",
+ "eve-training-api",
+ "eve-training-plugin",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "eve-message-api"
 version = "0.1.0"
 dependencies = [
