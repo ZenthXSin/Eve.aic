@@ -415,6 +415,7 @@ async fn contain_panic<F: Future>(future: F) -> Result<F::Output, ()> {
 }
 pub struct ControlPlugin {
     manifest: PluginManifest,
+    service_id: ServiceId,
     runner: Arc<dyn ControlRunner>,
 }
 impl ControlPlugin {
@@ -423,9 +424,24 @@ impl ControlPlugin {
         runner: Arc<dyn ControlRunner>,
         dependencies: Vec<PluginDependency>,
     ) -> PluginResult<Self> {
-        let mut manifest = PluginManifest::new(CONTROL_PLUGIN_ID, env!("CARGO_PKG_VERSION"))?;
+        Self::with_identity(CONTROL_PLUGIN_ID, CONTROL_SERVICE_ID, runner, dependencies)
+    }
+
+    /// 由受信组合层注册独立控制器；每个实例维护自己的代际、取消与生命周期。
+    /// 服务名仍由 Kernel 检查唯一性，不覆盖其他插件已发布的服务。
+    pub fn with_identity(
+        plugin_id: &str,
+        service_id: &str,
+        runner: Arc<dyn ControlRunner>,
+        dependencies: Vec<PluginDependency>,
+    ) -> PluginResult<Self> {
+        let mut manifest = PluginManifest::new(plugin_id, env!("CARGO_PKG_VERSION"))?;
         manifest.dependencies = dependencies;
-        Ok(Self { manifest, runner })
+        Ok(Self {
+            manifest,
+            service_id: ServiceId::new(service_id)?,
+            runner,
+        })
     }
 }
 impl Plugin for ControlPlugin {
@@ -434,14 +450,12 @@ impl Plugin for ControlPlugin {
     }
     fn start(&mut self, context: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         let runner = self.runner.clone();
+        let service_id = self.service_id.clone();
         Box::pin(async move {
             let controller = Arc::new(Controller::open(runner)?);
             let to_close = controller.clone();
             context.cleanup(cleanup(move || async move { to_close.close().await }))?;
-            context.provide_service(
-                ServiceId::new(CONTROL_SERVICE_ID)?,
-                ControlServiceHandle(controller),
-            )?;
+            context.provide_service(service_id, ControlServiceHandle(controller))?;
             Ok(None)
         })
     }
