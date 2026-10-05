@@ -6,11 +6,11 @@ use eve_segment_api::{
 };
 use std::ops::Range;
 
-pub const PARAGRAPH_PLANNER: &str = "paragraph-v1";
+pub const PARAGRAPH_PLANNER: &str = "paragraph-v2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ParagraphPlanner {
-    /// 非空白字符少于该值的回复整条发送。
+    /// 非空白字符少于该值的回复整条发送；默认为 0，短自然段也分别发送。
     pub min_chars: usize,
     pub base_pause_ms: u64,
     pub pause_per_char_ms: u64,
@@ -18,7 +18,7 @@ pub struct ParagraphPlanner {
 impl Default for ParagraphPlanner {
     fn default() -> Self {
         Self {
-            min_chars: 40,
+            min_chars: 0,
             base_pause_ms: 400,
             pause_per_char_ms: 25,
         }
