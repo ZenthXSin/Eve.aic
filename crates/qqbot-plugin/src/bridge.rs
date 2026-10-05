@@ -1,5 +1,6 @@
 use crate::{
     QqBotConfig, QqBotStatus, QqCommandHandler, QqCommandInput, commands,
+    observer::{CompletedInteraction, Observation},
     state::{Ledger, Message, ReceiptState},
 };
 use eve_control_api::{
@@ -94,6 +95,7 @@ pub(crate) struct Services {
     pub messages: Arc<dyn MessageService>,
     pub command_handler: Option<Arc<dyn QqCommandHandler>>,
     pub training: Option<Arc<dyn TrainingService>>,
+    pub observation: Option<Arc<Observation>>,
 }
 struct ChannelEvents {
     signal: Arc<dyn TaskSignal>,
@@ -137,6 +139,7 @@ impl ControlEventSink for ChannelEvents {
 struct Active {
     message: Message,
     key: GenerationKey,
+    ordinary: bool,
     // 必须在提交时捕获；路由器可能已经替换控制服务中的最新代。
     wait: ControlFuture<'static, ControlReport>,
 }
@@ -147,6 +150,7 @@ struct CommandMessage {
 struct Queued {
     message: Message,
     saved: bool,
+    ordinary: bool,
 }
 struct Routing {
     message: Message,
@@ -157,6 +161,7 @@ struct Reply {
     message: Message,
     text: String,
     guard: ReplyGuard,
+    interaction: Option<CompletedInteraction>,
 }
 enum ReplyGuard {
     // 控制消息的确认仍可用于已取消/阻塞代，但不能用于已被替换的代。
@@ -216,6 +221,7 @@ pub(crate) async fn run(
         messages,
         command_handler,
         training,
+        observation,
     } = services;
     // 仅本地学习已验证回执中的用户表达；不提交旧任务、不调用模型或重发消息。
     if let Some(training) = &training {
@@ -280,7 +286,7 @@ pub(crate) async fn run(
     let mut controlled_sessions: BTreeMap<String, SessionKey> = BTreeMap::new();
     let mut routing: Option<Routing> = None;
     let mut replies: VecDeque<Reply> = VecDeque::new();
-    let mut delivering: Option<Message> = None;
+    let mut delivering: Option<Reply> = None;
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let result: PluginResult<()> = async {
         loop {
@@ -332,7 +338,7 @@ pub(crate) async fn run(
                     }
                     if action == TrainingCommand::Start {
                         // 保留 /train start 原文进入 Session；上下文提供提问策略。
-                        queue.push_front(Queued { message, saved: true });
+                        queue.push_front(Queued { message, saved: true, ordinary: false });
                         continue;
                     }
                     let text = match action {
@@ -346,7 +352,7 @@ pub(crate) async fn run(
                         TrainingCommand::Help => "训练命令：/train start 开始；/train stop 停止采集和主动训练；/train status 查看开关；/train stats 查看表达统计；/train reset 重置本会话统计。".into(),
                         TrainingCommand::Start => unreachable!(),
                     };
-                    replies.push_back(Reply { message, text, guard: ReplyGuard::NoTask });
+                    replies.push_back(Reply { message, text, guard: ReplyGuard::NoTask, interaction: None });
                     continue;
                 }
                 if !ledger.insert(&ctx, &config.app_id, message.clone())? {
@@ -360,7 +366,7 @@ pub(crate) async fn run(
                         message_id: &message.id, session: &session, text: &message.text,
                     }) {
                         Ok(Some(text)) => {
-                            replies.push_back(Reply { message, text, guard: ReplyGuard::Command });
+                            replies.push_back(Reply { message, text, guard: ReplyGuard::Command, interaction: None });
                             continue;
                         }
                         Ok(None) => {}
@@ -390,11 +396,11 @@ pub(crate) async fn run(
                         Ok(ticket) => routing = Some(Routing { message, target, wait: messages.wait(&ticket) }),
                         Err(_) => {
                             warn(&ctx, "message_submit_failed");
-                            replies.push_back(Reply { message, text: "消息控制暂不可用或已达容量上限；当前任务保持不变。".into(), guard: ReplyGuard::Current(target) });
+                            replies.push_back(Reply { message, text: "消息控制暂不可用或已达容量上限；当前任务保持不变。".into(), guard: ReplyGuard::Current(target), interaction: None });
                         }
                     }
                 } else {
-                    replies.push_back(Reply { message, text: NO_TASK.into(), guard: ReplyGuard::NoTask });
+                    replies.push_back(Reply { message, text: NO_TASK.into(), guard: ReplyGuard::NoTask, interaction: None });
                 }
             }
             if routing.is_none() && commands.is_empty() && delivering.is_none()
@@ -418,7 +424,7 @@ pub(crate) async fn run(
                 }
                 write(&mut stdin, json!({"type":"reply","version":1,"id":reply.message.id,"text":reply.text})).await?;
                 deadline = tokio::time::Instant::now() + Duration::from_secs(35);
-                delivering = Some(reply.message);
+                delivering = Some(reply);
             }
             if routing.is_none() && commands.is_empty() && active.is_empty()
                 && delivering.is_none() && replies.is_empty() && let Some(queued) = queue.pop_front() {
@@ -435,7 +441,7 @@ pub(crate) async fn run(
                 match submitted {
                     Ok(key) => {
                         controlled_sessions.insert(key.session.session_id.clone(), key.session.clone());
-                        let wait = control.wait(&key); active.push(Active { message, key, wait });
+                        let wait = control.wait(&key); active.push(Active { message, key, ordinary: queued.ordinary, wait });
                     }
                     Err(_) => {
                         mark_failed(&mut ledger, &ctx, &config.app_id, &message.id)?;
@@ -474,7 +480,7 @@ pub(crate) async fn run(
                     let text = match report.outcome {
                         RouteOutcome::Replaced { generation, .. } => {
                             let wait = control.wait(&generation);
-                            active.push(Active { message: route.message, key: generation, wait });
+                            active.push(Active { message: route.message, key: generation, ordinary: false, wait });
                             continue;
                         }
                         RouteOutcome::Unchanged => "当前任务保持不变。".into(),
@@ -490,7 +496,7 @@ pub(crate) async fn run(
                         RouteOutcome::ControlFailed { .. } => "任务控制未完成；状态已保留，请检查后再发新要求。".into(),
                         RouteOutcome::Stopped { .. } => "消息控制已停止；没有自动重试。".into(),
                     };
-                    replies.push_back(Reply { message: route.message, text, guard: ReplyGuard::Current(route.target) });
+                    replies.push_back(Reply { message: route.message, text, guard: ReplyGuard::Current(route.target), interaction: None });
                 }
                 (index, report) = completed(&mut active), if !active.is_empty() && routing.is_none() => {
                     let current = active.remove(index);
@@ -499,9 +505,18 @@ pub(crate) async fn run(
                         turn_id: report.run.turn_id, kind: TurnEventKind::SessionSaved,
                     }});
                     if report.run.commit == CommitState::Completed && report.run.failure.is_none()
-                        && let Some(text) = report.run.text.filter(|t| !t.trim().is_empty() && t.len() <= 32768) {
+                        && let Some(text) = report.run.text.as_ref().filter(|t| !t.trim().is_empty() && t.len() <= 32768) {
+                        let interaction = if current.ordinary && let Some(observation) = &observation {
+                            match CompletedInteraction::capture(&config.app_id, &current.message, &current.key, &report, observation.sessions.as_ref()) {
+                                Ok(interaction) => interaction,
+                                Err(error) => {
+                                    warn(&ctx, "interaction_evidence_invalid");
+                                    return Err(error);
+                                }
+                            }
+                        } else { None };
                         status.send_modify(|s| s.completed += 1);
-                        replies.push_back(Reply { message: current.message, text, guard });
+                        replies.push_back(Reply { message: current.message, text: text.clone(), guard, interaction });
                     } else {
                         mark_failed(&mut ledger, &ctx, &config.app_id, &current.message.id)?;
                         if !report.cancel_requested {
@@ -534,7 +549,8 @@ pub(crate) async fn run(
                         }
                         Some("fatal") => break Err(failure("QQBot SDK 启动或连接失败")),
                         Some("delivery") => {
-                            let Some(message) = delivering.as_ref() else { warn(&ctx, "unexpected_delivery"); continue; };
+                            let Some(reply) = delivering.as_ref() else { warn(&ctx, "unexpected_delivery"); continue; };
+                            let message = &reply.message;
                             if frame.get("id").and_then(Value::as_str) != Some(message.id.as_str()) {
                                 warn(&ctx, "delivery_id_mismatch"); continue;
                             }
@@ -544,6 +560,12 @@ pub(crate) async fn run(
                             ledger.save(&ctx)?;
                             status.send_modify(|s| { if ok { s.sent += 1; } else { s.failed += 1; } });
                             if !ok { warn(&ctx, "delivery_failed_no_retry"); }
+                            if ok && let Some(interaction) = &reply.interaction
+                                && let Some(observation) = &observation
+                                && let Err(error) = interaction.observe(observation.observer.as_ref(), &config.app_id, message, &reply.text) {
+                                warn(&ctx, "interaction_observer_failed_no_retry");
+                                return Err(error);
+                            }
                             delivering = None;
                         }
                         Some("message") => {
@@ -562,7 +584,7 @@ pub(crate) async fn run(
                                 || active.iter().any(|a| a.message.id == message.id)
                                 || routing.as_ref().is_some_and(|r| r.message.id == message.id)
                                 || replies.iter().any(|r| r.message.id == message.id)
-                                || delivering.as_ref().is_some_and(|m| m.id == message.id);
+                                || delivering.as_ref().is_some_and(|r| r.message.id == message.id);
                             if live { warn(&ctx, "duplicate_pending"); continue; }
                             let duplicate = ledger.find(&config.app_id, &message.id).is_some();
                             let pending = queue.len() + commands.len() + active.len() + replies.len()
@@ -587,7 +609,7 @@ pub(crate) async fn run(
                                             warn(&ctx, "expression_learning_failed");
                                         }
                                     }
-                                    queue.push_back(Queued { message, saved: false });
+                                    queue.push_back(Queued { message, saved: false, ordinary: true });
                                 }
                             }
                         }
