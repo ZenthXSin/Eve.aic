@@ -22,16 +22,21 @@ use std::{
 const SECRET: &str = "qq-planner-fixture-secret";
 const BRIDGE: &str = r#"
 import fs from 'node:fs';
+import net from 'node:net';
 import readline from 'node:readline';
 const [started, stopped, mode] = process.argv.slice(2);
-fs.writeFileSync(started, 'started');
-process.stdout.write(JSON.stringify({type:'ready',version:1})+'\n');
+const probe = net.createServer();
 readline.createInterface({input:process.stdin}).on('line', line => {
   const command = JSON.parse(line);
-  if (command.type === 'stop') {
+  if (command.type === 'stop' && mode !== 'reconcile-unresponsive') {
     fs.writeFileSync(stopped, 'stopped');
     process.exit(0);
   }
+});
+probe.listen(0, '127.0.0.1', () => {
+  // 已监听 stdin 并持有探测端口后，才允许测试注入运行期故障。
+  fs.writeFileSync(started, String(probe.address().port));
+  process.stdout.write(JSON.stringify({type:'ready',version:1})+'\n');
 });
 setTimeout(() => process.exit(mode === 'success' || mode === 'off' ? 0 : 2),
   mode === 'success' || mode === 'off' ? 1000 : 20000);
@@ -145,6 +150,11 @@ fn planner_panic_stops_bridge_and_releases_state() {
     process_case("reconcile-panic");
 }
 
+#[test]
+fn planner_error_reaps_unresponsive_bridge_and_releases_state() {
+    process_case("reconcile-unresponsive");
+}
+
 struct Factory {
     case: String,
     creates: Arc<AtomicUsize>,
@@ -179,6 +189,7 @@ impl EndogenousPlannerFactory for Factory {
             admin,
             case: self.case.clone(),
             ticks: self.ticks.clone(),
+            marker: self.marker.clone(),
         }))
     }
 }
@@ -187,13 +198,22 @@ struct Planner {
     admin: Arc<dyn CognitionAdmin>,
     case: String,
     ticks: Arc<AtomicUsize>,
+    marker: PathBuf,
 }
 impl EndogenousPlanning for Planner {
     fn reconcile(&self, now_ms: u64) -> LoopResult<EndogenousReport> {
         assert!(now_ms > 0);
+        if !self.marker.exists() {
+            // 后台规划可能早于 Node ready；运行期故障测试须等桥接已可接收 stop。
+            return Ok(EndogenousReport {
+                created_goal_ids: Vec::new(),
+                invalidated_goal_ids: Vec::new(),
+                revision: self.admin.snapshot()?.revision,
+            });
+        }
         self.ticks.fetch_add(1, Ordering::SeqCst);
         match self.case.as_str() {
-            "reconcile-error" => return Err(LoopError::Unavailable),
+            "reconcile-error" | "reconcile-unresponsive" => return Err(LoopError::Unavailable),
             "reconcile-panic" => panic!("injected reconcile panic"),
             _ => {}
         }
@@ -280,9 +300,15 @@ async fn planner_process_fixture() {
             assert_eq!(ticks.load(Ordering::SeqCst), 0);
         } else {
             assert_eq!(ticks.load(Ordering::SeqCst), 1);
-            // 即使规划早于 Node ready 帧失败，stop 也应被已启动的桥接接收。
-            assert!(started.exists() && stopped.exists());
+            assert!(started.exists());
+            assert_eq!(stopped.exists(), case != "reconcile-unresponsive");
         }
+    }
+    if started.exists() {
+        let port: u16 = std::fs::read_to_string(&started).unwrap().parse().unwrap();
+        let probe = TcpListener::bind(("127.0.0.1", port))
+            .expect("桥接必须实际退出并释放探测端口，包括不响应 stop 的子进程");
+        drop(probe);
     }
     assert_eq!(stored_cognition(&directory), before);
     let reopened = FileStateStore::open(&directory).expect("所有失败和正常出口均须释放状态目录锁");
