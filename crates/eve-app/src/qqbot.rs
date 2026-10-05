@@ -1,7 +1,7 @@
 use crate::{AppError, AppFailure, core_bootstrap, finish_core, install_core, qq_cognition};
 use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
-use eve_kernel::{Kernel, KernelServices, backends::FileStateStore};
+use eve_kernel::{Kernel, KernelServices};
 use eve_message_plugin::{MessageRouterPlugin, RelationPlugin};
 use eve_plugin_api::{PluginId, ServiceId};
 use eve_qqbot_plugin::{
@@ -14,7 +14,8 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--cognition-max-executions 1至32] [--state-dir 目录] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+--database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
 QQ 普通文字排队开始新轮；逐行 /add 内容、/correct 内容、/cancel 控制当前任务。
@@ -27,6 +28,7 @@ Ctrl+C 或 SIGTERM 取消在途轮次、等待保存并停止桥接子进程。"
 #[derive(Clone, Debug)]
 pub struct QqBotOptions {
     pub state_directory: PathBuf,
+    pub database_config: Option<PathBuf>,
     pub agent_path: PathBuf,
     pub node_program: OsString,
     pub bridge_script: PathBuf,
@@ -39,6 +41,7 @@ impl Default for QqBotOptions {
     fn default() -> Self {
         Self {
             state_directory: ".eve".into(),
+            database_config: None,
             agent_path: "AGENT.md".into(),
             node_program: "node".into(),
             bridge_script: "connectors/qqbot/bridge.mjs".into(),
@@ -71,6 +74,7 @@ impl QqBotOptions {
             }
             match arg.to_str() {
                 Some("--state-dir") => options.state_directory = value.into(),
+                Some("--database-config") => options.database_config = Some(value.into()),
                 Some("--agent") => options.agent_path = value.into(),
                 Some("--node") => options.node_program = value,
                 Some("--bridge-script") => options.bridge_script = value.into(),
@@ -131,7 +135,10 @@ pub async fn run_qqbot_with_planner_factory(
     })?
     .with_training()?;
     let backends = KernelServices {
-        state: Arc::new(FileStateStore::open(&options.state_directory)?),
+        state: crate::storage::open_state_store(
+            &options.state_directory,
+            options.database_config.as_deref(),
+        )?,
         ..KernelServices::default()
     };
     let registry = backends.registry.clone();

@@ -45,7 +45,7 @@
 
 2026-10-04 核对主线 `392d73a89ed8d3afa8233cb3e80c81e74fe4799b`：PR #82–96 与 #98 已合入，已有内生反思入口、可替换规划契约、QQ 主动训练与表达统计、训练策略 v3、正式群提及和长消息 ID 修复。反思草稿与数值示范不代表父目标执行完成、已确认长期偏好或 AGI。事件、服务、状态、权限、任务、日志及独立进程恢复底座继续保留，详见[开发计划](./开发计划.md)。
 
-[#97：排队输入跨训练启停与重置后的补学](https://github.com/ZenthXSin/Eve.aic/issues/97)已由 [PR #98](https://github.com/ZenthXSin/Eve.aic/pull/98) 修复并合入。本地 PostgreSQL 状态后端与 QQ 认知接线仍在独立分支推进，尚未合入；长期交互记忆、偏好确认和多消息分段仍待实现。
+[#97：排队输入跨训练启停与重置后的补学](https://github.com/ZenthXSin/Eve.aic/issues/97)已由 [PR #98](https://github.com/ZenthXSin/Eve.aic/pull/98) 修复并合入。本地 PostgreSQL 字节状态后端已由 [PR #99](https://github.com/ZenthXSin/Eve.aic/pull/99) 合入，QQ 反思接线已由 [PR #101](https://github.com/ZenthXSin/Eve.aic/pull/101) 合入；三个宿主通过 `--database-config` 显式选择 SQL，默认仍为文件状态且不自动迁移。长期交互记忆、偏好确认和多消息分段仍待实现。
 
 任务支持前台、后台、定时与重复执行；插件可通过公开接口定义新任务类型和调度规则，扩展无需修改内核。详见[插件开发](./插件开发.md#自定义任务类型与调度)。
 

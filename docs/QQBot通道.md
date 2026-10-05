@@ -19,6 +19,8 @@ QQBOT_SANDBOX=true ./target/debug/eve-qqbot --state-dir .eve-qqbot
 
 核心默认 deepseek-v4.1-flash / Chat / none；模型、协议和基址仍按[核心对话](./核心对话.md)配置。默认启动正式 QQ API；首次测试使用 `QQBOT_SANDBOX=true`，非法布尔值拒绝启动。QQ Bot、测试用户和测试群的权限/沙箱范围按当前开放平台控制台配置。沙箱与正式 API 使用不同固定基址，token 地址固定，不允许通过事件修改。
 
+本地持久部署可追加 `--database-config /仓库外/连接.json`，把会话、回执、训练开关与表达统计写入同一个本地 PostgreSQL；默认仍使用文件后端。新目录必须没有 `state.json`，此参数不迁移现有 QQ 历史。目录首次绑定 SQL 后，漏参数或更换目标会拒绝启动；完成历史恢复、旧消息不重放及投递不确定时不补发的边界不变。普通配置仍在 `--state-dir/configuration`。配置、单宿主排他和独立测试库验收见[PostgreSQL 状态](./PostgreSQL状态.md)。
+
 主模型角色与终端共用同一装配：EVE_OPENAI_MODEL_ROLE=primary 显式使用 runtime.models.primary，默认仍按原 provider.openai 启动。启动时预检角色，随后在每轮开始时捕获模型、期限和输出限制；配置服务更新影响新轮，同一会话继续保留已完成历史。字段、凭据引用拒绝与失败保护见[核心对话](./核心对话.md#显式选择主模型角色)。这只接入主模型，其他角色仍是独立配置定义。
 
 手机可在 [GitHub Actions Secrets](https://github.com/ZenthXSin/Eve.aic/settings/secrets/actions) 添加 `QQBOT_APP_SECRET`；已有模型 Secret 继续使用。代码合入 main 后，在 [QQBot 首次真实交互](https://github.com/ZenthXSin/Eve.aic/actions/workflows/qqbot-interaction.yml) 点击 Run workflow，默认沙箱与 300 秒窗口；日志出现窗口启动后，向测试机器人私聊或在测试群 @ 发送文字。至少一次接收、模型完成和 QQ 成功发送且没有失败，报告才判定通过。超时退出不等于成功交互。
@@ -53,7 +55,7 @@ QQ 插件只公开同步 `QqCommandHandler` 契约，不依赖认知实现。通
 
 默认 `run_qqbot` 使用 `ReflectionPlannerFactory`；受信 Rust 宿主可通过 `run_qqbot_with_planner_factory(options, factory)` 注入公开 `EndogenousPlannerFactory`。只有显式开启认知才创建规划器；替换实现须遵守来源、权限、预算、修订去重与持久化契约。创建或规划失败不回退为默认实现；修订冲突在后续 tick 重新读取，其余异常进入统一收尾。启动阶段先装配认知与独立执行服务，成功启动 QQ 插件并取得状态句柄后才开放后台规划和执行；启动失败不趁收尾发起反思。
 
-此入口继续使用 `FileStateStore`，在指定目录保存认知、Session、训练及通道回执；没有为 QQ 接入 PostgreSQL 或自动迁移旧目录。独立数据库后端交付不改变这里的存储选择。内生驱动的范围、恢复与后续能力见[认知循环](./认知循环.md#qq-本地组合入口)；本切片尚不具备完整 AGI、目标执行或现实结果验证能力。
+此入口默认使用 `FileStateStore`；追加 `--database-config` 时，认知、Session、训练及通道回执共同使用同一个 PostgreSQL 后端，目录继续保留锁、数据库绑定与普通配置。旧目录不自动迁移，数据库提交结果不确定时不重放，见[PostgreSQL 状态](./PostgreSQL状态.md)。内生驱动的范围、恢复与后续能力见[认知循环](./认知循环.md#qq-本地组合入口)；本切片尚不具备完整 AGI、目标执行或现实结果验证能力。
 
 ## 桥接契约与兼容
 
