@@ -87,6 +87,17 @@ if (scenario.script) {
           const parent = goals.find(goal => goal.source.kind === "User" && goal.description === wanted.parent_description);
           return parent && goals.some(goal => goal.source.reference === parent.id && goal.verification === "reflection:v1" && goal.status === wanted.child_state);
         })) return;
+      } else if (step.wait_part) {
+        if (!await until(() => {
+          const wanted = step.wait_part;
+          if (!fs.existsSync(wanted.path)) return false;
+          const document = JSON.parse(fs.readFileSync(wanted.path, "utf8"));
+          const bytes = document.entries["eve.channel.qqbot"]?.["receipts.v1"];
+          if (!bytes) return false;
+          const ledger = JSON.parse(Buffer.from(bytes).toString());
+          return ledger.entries.some(entry => entry.message.id === wanted.id &&
+            entry.segments?.parts?.[wanted.index]?.state === wanted.state);
+        })) return;
       } else if (step.wait_receipt) {
         if (!await until(() => {
           const wanted = step.wait_receipt;

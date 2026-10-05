@@ -137,16 +137,20 @@ pub(crate) struct Ledger {
 }
 impl Ledger {
     pub fn load(ctx: &PluginContext) -> PluginResult<Self> {
-        let Some(bytes) = ctx.state_get(STATE_KEY)? else {
-            return Ok(Self {
+        match ctx.state_get(STATE_KEY)? {
+            None => Ok(Self {
                 version: 1,
                 entries: Vec::new(),
-            });
-        };
+            }),
+            Some(bytes) => Self::decode(&bytes),
+        }
+    }
+    /// 严格解析；任何不一致都视为损坏，调用方保留原字节。
+    fn decode(bytes: &[u8]) -> PluginResult<Self> {
         if bytes.len() > MAX_BYTES {
             return Err(corrupt());
         }
-        let ledger: Self = serde_json::from_slice(&bytes).map_err(|_| corrupt())?;
+        let ledger: Self = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
         if ledger.version != ledger.format() || ledger.entries.len() > MAX_RECORDS {
             return Err(corrupt());
         }
@@ -242,4 +246,117 @@ fn valid_segments(segments: &Segments, reply: Option<&str>, state: ReceiptState)
 }
 fn corrupt() -> PluginError {
     PluginError::State("QQBot 回执状态损坏或版本不兼容；未清空".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use PartState::*;
+
+    const REPLY: &str = "第一段。\n\n第二段。\n\n第三段。";
+    fn receipt(state: ReceiptState, parts: Option<&[PartState]>) -> Receipt {
+        let ranges = [(0, 12), (14, 26), (28, 40)];
+        Receipt {
+            app_id: "1904159860".into(),
+            message: Message {
+                id: "msg-1".into(),
+                scope: "c2c".into(),
+                target_id: "user-1".into(),
+                user_id: "user-1".into(),
+                text: "你好".into(),
+            },
+            state,
+            reply: (state != ReceiptState::Processing).then(|| REPLY.into()),
+            segments: parts.map(|parts| Segments {
+                planner: "paragraph-v1".into(),
+                parts: parts
+                    .iter()
+                    .zip(ranges)
+                    .map(|(state, (start, end))| Part {
+                        start,
+                        end,
+                        state: *state,
+                    })
+                    .collect(),
+            }),
+        }
+    }
+    fn round_trip(entry: Receipt) -> PluginResult<Ledger> {
+        let mut ledger = Ledger {
+            version: 0,
+            entries: vec![entry],
+        };
+        Ledger::decode(&ledger.encode()?)
+    }
+
+    #[test]
+    fn every_state_the_channel_can_save_reloads() {
+        assert_eq!(&REPLY[0..12], "第一段。");
+        assert_eq!(&REPLY[28..40], "第三段。");
+        let reachable: [(ReceiptState, &[PartState]); 9] = [
+            // 首段写出前、段间停顿、末段在途。
+            (ReceiptState::ReplyPending, &[Sending, Pending, Pending]),
+            (ReceiptState::ReplyPending, &[Sent, Pending, Pending]),
+            (ReceiptState::ReplyPending, &[Sent, Sent, Sending]),
+            (ReceiptState::Sent, &[Sent, Sent, Sent]),
+            // 片段失败、首段写出前旧代失效、段间旧代失效。
+            (ReceiptState::Failed, &[Sent, Failed, Skipped]),
+            (ReceiptState::Failed, &[Failed, Skipped, Skipped]),
+            (ReceiptState::Failed, &[Skipped, Skipped, Skipped]),
+            (ReceiptState::Failed, &[Sent, Skipped, Skipped]),
+            (ReceiptState::Failed, &[Sent, Sent, Skipped]),
+        ];
+        for (state, parts) in reachable {
+            let ledger = round_trip(receipt(state, Some(parts)))
+                .unwrap_or_else(|_| panic!("{state:?} {parts:?} must reload"));
+            assert_eq!(ledger.version, 2);
+        }
+        let plain = round_trip(receipt(ReceiptState::Sent, None)).unwrap();
+        assert_eq!(plain.version, 1);
+    }
+
+    #[test]
+    fn inconsistent_progress_or_format_is_corrupt() {
+        let invalid: [(ReceiptState, &[PartState]); 8] = [
+            (ReceiptState::Processing, &[Pending, Pending, Pending]),
+            (ReceiptState::Sent, &[Sent, Sent, Pending]),
+            (ReceiptState::ReplyPending, &[Sent, Sent, Sent]),
+            (ReceiptState::ReplyPending, &[Sent, Skipped, Pending]),
+            (ReceiptState::ReplyPending, &[Sending, Sending, Pending]),
+            (ReceiptState::Failed, &[Sent, Pending, Skipped]),
+            (ReceiptState::Failed, &[Sent, Failed, Failed]),
+            (ReceiptState::Failed, &[Skipped, Sent, Skipped]),
+        ];
+        for (state, parts) in invalid {
+            assert!(
+                round_trip(receipt(state, Some(parts))).is_err(),
+                "{state:?} {parts:?} must be rejected"
+            );
+        }
+        let single: [PartState; 1] = [Sent];
+        assert!(round_trip(receipt(ReceiptState::Sent, Some(&single))).is_err());
+        let mut v1_with_parts = Ledger {
+            version: 0,
+            entries: vec![receipt(ReceiptState::Sent, Some(&[Sent, Sent, Sent]))],
+        };
+        let mut bytes: serde_json::Value =
+            serde_json::from_slice(&v1_with_parts.encode().unwrap()).unwrap();
+        bytes["version"] = 1.into();
+        assert!(Ledger::decode(&serde_json::to_vec(&bytes).unwrap()).is_err());
+        let mut v2_without = Ledger {
+            version: 0,
+            entries: vec![receipt(ReceiptState::Sent, None)],
+        };
+        let mut bytes: serde_json::Value =
+            serde_json::from_slice(&v2_without.encode().unwrap()).unwrap();
+        bytes["version"] = 2.into();
+        assert!(Ledger::decode(&serde_json::to_vec(&bytes).unwrap()).is_err());
+        // 范围切开字符、遗漏原文或不在完整回复内都拒绝。
+        for (start, end) in [(1, 12), (0, 11), (0, 13)] {
+            let mut entry = receipt(ReceiptState::Sent, Some(&[Sent, Sent, Sent]));
+            let part = &mut entry.segments.as_mut().unwrap().parts[0];
+            (part.start, part.end) = (start, end);
+            assert!(round_trip(entry).is_err(), "{start}..{end}");
+        }
+    }
 }

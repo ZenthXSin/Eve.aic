@@ -23,6 +23,7 @@ PARTS = ["好的主人，结论是可以分段发送。",
          "需要我再演示一次吗？"]
 TEXT = "\n\n".join(PARTS)
 CANCELLED = "已取消当前任务；已完成的工具操作不会撤销。"
+TRAINING_STOPPED = "已结束当前会话的主动提问训练，已完成记录保留；普通聊天仍可继续。"
 
 
 class SegmentAcceptance(unittest.TestCase):
@@ -106,7 +107,7 @@ class SegmentAcceptance(unittest.TestCase):
     def wait_receipt(self, id, state):
         return {"wait_receipt": {"path": str(self.state_path), "id": id, "state": state}}
 
-    def run_eve(self, script, segmented=True, memory=False, terminate_at=None, success=True):
+    def run_eve(self, script, segmented=True, memory=False, training=False, terminate_at=None, success=True):
         self.runs += 1
         events_path = self.work / f"events-{self.runs}.jsonl"
         error_path = self.work / f"error-{self.runs}.txt"
@@ -123,6 +124,8 @@ class SegmentAcceptance(unittest.TestCase):
             command.append("--segmented")
         if memory:
             command.append("--memory")
+        if training:
+            command.append("--training")
         child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             if terminate_at:
@@ -179,7 +182,7 @@ class SegmentAcceptance(unittest.TestCase):
         ledger = self.ledger()
         receipt = self.receipt("seg")
         self.assertEqual((ledger["version"], receipt["state"], receipt["reply"]), (2, "Sent", TEXT))
-        self.assertEqual(receipt["segments"]["planner"], "paragraph-v2")
+        self.assertEqual(receipt["segments"]["planner"], "paragraph-v3")
         reply = receipt["reply"].encode()
         self.assertEqual([reply[p["start"]:p["end"]].decode() for p in receipt["segments"]["parts"]], PARTS)
         self.assertEqual(self.part_states("seg"), ["Sent"] * 3)
@@ -244,6 +247,33 @@ class SegmentAcceptance(unittest.TestCase):
         self.assertEqual([event["text"] for event in self.sent("segment")], PARTS[:1])
         self.assertEqual(self.part_states("seg"), ["Sent", "Skipped", "Skipped"])
         self.assertEqual(len(self.requests), 2)
+
+    def test_training_toggle_between_parts_closes_remaining_parts(self):
+        held = self.message("seg", hold_segments=[0], allow_finish=True)
+        stop = self.message("train", text="/train stop", segments=None, expected=TRAINING_STOPPED)
+        self.run_eve([{"send": held}, self.wait_segment("seg", 1), {"send": stop},
+                      {"deliver_segment": {"id": "seg", "index": 0}},
+                      {"wait_command": {"id": "seg", "type": "finish"}}, self.wait_receipt("train", "Sent")],
+                     training=True)
+        self.assertEqual([event["text"] for event in self.sent("segment")], PARTS[:1])
+        self.assertEqual(self.receipt("seg")["state"], "Failed")
+        self.assertEqual(self.part_states("seg"), ["Sent", "Skipped", "Skipped"])
+        self.assertEqual(len(self.requests), 1)
+
+    def test_stop_during_pause_keeps_unsent_parts_and_restart_never_resends(self):
+        marker = self.work / "paused"
+        self.run_eve([{"send": self.message("seg")},
+                      {"wait_part": {"path": str(self.state_path), "id": "seg", "index": 0, "state": "Sent"}},
+                      {"touch": str(marker)}, {"wait_file": str(self.work / "never")}], terminate_at=marker)
+        self.assertEqual([event["text"] for event in self.sent("segment")], PARTS[:1])
+        self.assertEqual(self.receipt("seg")["state"], "ReplyPending")
+        self.assertEqual(self.part_states("seg"), ["Sent", "Pending", "Pending"])
+        before = self.state_path.read_bytes()
+        duplicate = {**self.message("seg"), "expected_type": "finish"}
+        self.run_eve([{"send": duplicate}, {"wait_command": {"id": "seg", "type": "finish"}}])
+        self.assertFalse(self.sent("segment"))
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertEqual(len(self.requests), 1)
 
     def test_part_failure_is_not_retried_or_remembered(self):
         failing = self.message("seg", fail_segment=1)

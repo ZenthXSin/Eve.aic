@@ -210,7 +210,7 @@ for (const scope of ["c2c", "group"]) test(scope + " 分段按序回复原目标
 test("分段拒绝乱序、重复、越界和整条回复混用", async () => {
   const f = fixture(); f.message();
   for (const bad of [segment(1, 2), segment(0, 1), segment(0, MAX_SEGMENTS + 1), segment(2, 2),
-                     { ...segment(0, 2), text: " " }, { ...segment(0, 2), index: "0" }]) {
+                     { ...segment(0, 2), index: "0" }]) {
     await f.bridge.command(bad);
   }
   assert.equal(f.sent.length, 0);
@@ -248,4 +248,19 @@ test("段间 finish 释放 pending；发送中的 finish 在本段结束后释�
   await g.bridge.command(segment(1, 2));
   assert.equal(g.sent.length, 1);
   assert.equal(g.frames.at(-1).code, "unknown_reply");
+});
+test("QQ 无法承载的正文明确回失败回执并释放消息，不让 Rust 等到超时", async () => {
+  for (const text of [" ", "\uFEFF\uFEFF"]) {
+    const f = fixture(); f.message();
+    await f.bridge.command({ type: "reply", version: 1, id: "in-1", text });
+    assert.deepEqual(f.frames.filter(x => x.type === "delivery"), [{ version: 1, type: "delivery", id: "in-1", ok: false }]);
+    await f.bridge.command({ type: "reply", version: 1, id: "in-1", text: "迟到的回复" });
+    assert.equal(f.sent.length, 0);
+    const g = fixture(); g.message();
+    await g.bridge.command(segment(0, 3));
+    await g.bridge.command(segment(1, 3, text));
+    await g.bridge.command(segment(2, 3));
+    assert.deepEqual(g.frames.filter(x => x.type === "delivery").map(x => [x.index, x.ok]), [[0, true], [1, false]]);
+    assert.deepEqual(g.sent.map(x => x.text), ["第1段"]);
+  }
 });

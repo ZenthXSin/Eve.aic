@@ -139,6 +139,10 @@ pub fn validate_ranges(
         if slice.trim() != slice {
             return Err(SegmentError::InvalidPlan("片段首尾含空白"));
         }
+        // 通道桥接（JavaScript trim）还把 U+FEFF 视为空白；只含它的片段无法投递。
+        if slice.chars().all(|c| c.is_whitespace() || c == '\u{feff}') {
+            return Err(SegmentError::InvalidPlan("片段没有可见内容"));
+        }
         if slice.len() > max_segment_bytes {
             return Err(SegmentError::InvalidPlan("单段超过字节预算"));
         }
@@ -161,27 +165,30 @@ pub fn validate_ranges(
 
 /// 围栏代码块的字节范围：从开围栏首个标记到闭围栏最后一个标记；
 /// 未闭合时延伸到最后一个非空白字符，整体不可拆分。
+/// 有意从宽识别：任意缩进（含列表内嵌套）的围栏都算，多识别只会减少断点。
+/// 反引号围栏的信息串不能含反引号，因此行首的 ```x``` 是行内代码而非围栏。
 pub fn fenced_code_spans(text: &str) -> Vec<Range<usize>> {
     let mut spans = Vec::new();
     let mut open: Option<(usize, char, usize)> = None;
     let mut offset = 0;
     for line in text.split_inclusive('\n') {
         let content = line.trim_end_matches(['\n', '\r']);
-        let indent = content.len() - content.trim_start_matches(' ').len();
+        let indent = content.len() - content.trim_start_matches([' ', '\t']).len();
         let body = &content[indent..];
         let marker = body.chars().next().filter(|c| *c == '`' || *c == '~');
         let run = marker.map_or(0, |c| body.len() - body.trim_start_matches(c).len());
-        if indent <= 3 && run >= 3 {
+        if run >= 3 {
             let c = marker.expect("run implies marker");
+            let info = &body[run..];
             match open {
-                None => open = Some((offset + indent, c, run)),
+                None if c == '~' || !info.contains('`') => open = Some((offset + indent, c, run)),
                 Some((start, open_char, open_run))
-                    if c == open_char && run >= open_run && body[run..].trim().is_empty() =>
+                    if c == open_char && run >= open_run && info.trim().is_empty() =>
                 {
                     spans.push(start..offset + indent + run);
                     open = None;
                 }
-                Some(_) => {}
+                _ => {}
             }
         }
         offset += line.len();
@@ -384,6 +391,40 @@ mod tests {
         assert!(text[spans[0].clone()].contains("still code"));
         assert!(text[spans[0].clone()].ends_with("~~~~~"));
         assert_eq!(&text[spans[1].clone()], "```py\nopen");
+    }
+
+    #[test]
+    fn nested_or_indented_fences_are_protected_and_inline_backticks_are_not_fences() {
+        let nested = "步骤：\n\n1. 安装：\n    ```bash\n    npm install\n\n    npm run build\n    ```\n2. 启动。";
+        let spans = fenced_code_spans(nested);
+        assert_eq!(spans.len(), 1);
+        assert!(nested[spans[0].clone()].contains("npm install\n\n    npm run build"));
+        let inline = "```ls``` 列出文件：\n\n```\necho a\n\necho b\n```\n\n完。";
+        let spans = fenced_code_spans(inline);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(&inline[spans[0].clone()], "```\necho a\n\necho b\n```");
+        let tilde = "~~~ `info` 可以含反引号\ncode\n~~~";
+        assert_eq!(fenced_code_spans(tilde), vec![0..tilde.len()]);
+    }
+
+    #[test]
+    fn segments_need_content_visible_to_the_channel_bridge() {
+        let text = "第一段内容。\n\n\u{feff}\u{feff}\n\n第二段内容。";
+        let second = text.find('\u{feff}').unwrap();
+        let third = text.find("第二").unwrap();
+        let first_end = text.find("\n\n").unwrap();
+        assert_eq!(
+            plan(&[
+                (0, first_end, 0),
+                (second, second + 6, 100),
+                (third, text.len(), 100)
+            ])
+            .validate(text, &LIMITS),
+            Err(SegmentError::InvalidPlan("片段没有可见内容"))
+        );
+        plan(&[(0, first_end, 0), (second, text.len(), 100)])
+            .validate(text, &LIMITS)
+            .unwrap();
     }
 
     struct Fixed(SegmentResult<SegmentPlan>);

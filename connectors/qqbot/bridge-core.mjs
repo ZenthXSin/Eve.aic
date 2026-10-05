@@ -84,14 +84,20 @@ export function createBridge(bot, emit, limit = 128) {
       text });
   });
   // One part at a time, strictly in order; a failed or final part ends the reply.
+  function reject(id, index) {
+    warn("invalid_reply_text");
+    pending.delete(id);
+    send({ type: "delivery", id, ...(index === undefined ? {} : { index }), ok: false });
+  }
   async function segment(frame, item) {
     const { index, count } = frame;
     if (!Number.isInteger(count) || count < 2 || count > MAX_SEGMENTS ||
-        !Number.isInteger(index) || index < 0 || index >= count || !validText(frame.text)) {
+        !Number.isInteger(index) || index < 0 || index >= count) {
       warn("invalid_command"); return;
     }
     if (item.sending) { warn("duplicate_reply"); return; }
     if ((item.next ?? 0) !== index || (item.count ?? count) !== count) { warn("segment_order"); return; }
+    if (!validText(frame.text)) { reject(frame.id, index); return; }
     item.sending = true;
     item.count = count;
     let ok = false;
@@ -127,8 +133,11 @@ export function createBridge(bot, emit, limit = 128) {
         return;
       }
       if (frame.type === "segment") { await segment(frame, item); return; }
-      if (frame.type !== "reply" || !validText(frame.text)) { warn("invalid_command"); return; }
+      if (frame.type !== "reply") { warn("invalid_command"); return; }
       if (item.sending || item.next !== undefined) { warn("duplicate_reply"); return; }
+      // Text Rust accepted but QQ cannot carry (e.g. only U+FEFF) fails this reply
+      // explicitly instead of leaving Rust waiting for a receipt that never comes.
+      if (!validText(frame.text)) { reject(frame.id); return; }
       item.sending = true;
       try {
         const result = await bot.sendText(item.target, frame.text);

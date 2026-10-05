@@ -103,7 +103,7 @@ stdout 专用于 JSONL，SDK 日志后端为空，异常正文/stack/token 不�
 
 插件在 Context 的 `receipts.v1` 保存带 AppID、原路由、输入、阶段与回复的有界回执文档：最多 4096 项、1 MiB；新任务预留最大回复序列化空间。状态严格校验，坏版本/坏字段/重复 ID/损坏字节拒绝启动，不清空、不覆盖、不淘汰旧回执。没有分段记录时文档为格式 1；出现分段片段后写为格式 2，旧版本程序拒绝读取。
 
-收到新消息先持久化 Processing，再提交 Control 或调用已识别命令的宿主处理器。普通模型回复仅在模型成功且 Session 已完成提交后保存为 ReplyPending；同步命令回复在处理器返回后保存为 ReplyPending。随后只调用一次 QQ sendText；delivery 成功改为 Sent，发送失败改为 Failed 并保留已提交历史与回复。网络、回执或停止使结果不确定时保留阶段，不自动重新生成、重新执行工具或重发。相同 AppID/message id 重复、改正文或改路由均 warning 后忽略，不覆盖旧回执。去重不宣称在跨服务崩溃时能实现事务性的 exactly-once。
+收到新消息先持久化 Processing，再提交 Control 或调用已识别命令的宿主处理器。普通模型回复仅在模型成功且 Session 已完成提交后保存为 ReplyPending；同步命令回复在处理器返回后保存为 ReplyPending。未开启分段时随后只调用一次 QQ sendText；delivery 成功改为 Sent，发送失败改为 Failed 并保留已提交历史与回复。开启 `--segmented` 时每个片段调用一次 sendText：中间片段成功后整条仍为 ReplyPending，末段成功才改为 Sent；任一片段失败则整条为 Failed，已发片段保持 Sent、其余为 Skipped，见[持久化与恢复](./表达偏好与分段输出.md#持久化与恢复)。桥接收到 QQ 无法承载的正文（例如只含 U+FEFF）时直接回失败回执，Rust 记为 Failed，不再等待超时。网络、回执或停止使结果不确定时保留阶段，不自动重新生成、重新执行工具或重发。相同 AppID/message id 重复、改正文或改路由均 warning 后忽略，不覆盖旧回执。去重不宣称在跨服务崩溃时能实现事务性的 exactly-once。
 
 重启时 Processing 与 ReplyPending 仍是待人工诊断的记录，不自动继续；Session 沿用 Pending → Interrupted 与只回放 Completed 历史的语义。新消息可以恢复已有完成历史，旧工具仅作为历史传给模型。取消不会撤销已经完成的外部副作用。
 
