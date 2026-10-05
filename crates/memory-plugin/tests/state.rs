@@ -769,6 +769,31 @@ async fn corrupt_unknown_and_inconsistent_persistent_states_are_not_repaired_or_
 }
 
 #[tokio::test]
+async fn duplicate_json_keys_at_document_and_evidence_levels_preserve_original_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = RecordingStore::open(directory.path());
+    let (kernel, admin, _) = open(store.clone()).await;
+    admin
+        .update_preference(
+            &scope("s", "u"),
+            0,
+            statement("first", "first", "style", "保留原始证据"),
+        )
+        .unwrap();
+    let valid = String::from_utf8(store.get(&owner(), MEMORY_STATE_KEY).unwrap().unwrap()).unwrap();
+    kernel.stop_all().await.unwrap();
+    // 重复值完全相同，防止测试仅依靠后续语义校验碰巧拒绝不同值。
+    for field in [
+        format!("\"format_version\":{MEMORY_FORMAT_VERSION}"),
+        "\"message_id\":\"message-first\"".into(),
+    ] {
+        assert!(valid.contains(&field));
+        let damaged = valid.replacen(&field, &format!("{field},{field}"), 1);
+        rejects_persisted_bytes_without_writing(damaged.into_bytes()).await;
+    }
+}
+
+#[tokio::test]
 async fn evidence_capacity_is_global_and_full_replay_is_still_read_only() {
     let directory = tempfile::tempdir().unwrap();
     let store = RecordingStore::open(directory.path());
