@@ -67,18 +67,16 @@ fn clause(text: &str) -> Option<SegmentPreference> {
                 })
             {
                 value.max_segments = Some(n);
-            } else if let Some(p) = ["段间停顿为", "段间停顿设为", "段间停顿", "回复段间停顿"]
-                .into_iter()
-                .find_map(|prefix| {
-                    text.strip_prefix(prefix)?
-                        .strip_suffix(['%', '％'])?
-                        .parse::<u16>()
-                        .ok()
-                })
-            {
-                value.pause_percent = Some(p);
             } else {
-                return None;
+                let p = ["段间停顿为", "段间停顿设为", "段间停顿", "回复段间停顿"]
+                    .into_iter()
+                    .find_map(|prefix| {
+                        text.strip_prefix(prefix)?
+                            .strip_suffix(['%', '％'])?
+                            .parse::<u16>()
+                            .ok()
+                    })?;
+                value.pause_percent = Some(p);
             }
         }
     }
