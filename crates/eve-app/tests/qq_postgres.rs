@@ -238,6 +238,276 @@ fn has_training(request: &Value) -> bool {
     })
 }
 
+fn memory_snapshot(saved: &[StoredRow]) -> Value {
+    let memory = document(saved, "eve.memory", "memory.v1");
+    assert_eq!(memory["format_version"], 1);
+    let scopes = memory["scopes"].as_array().unwrap();
+    assert_eq!(scopes.len(), 1);
+    scopes[0]["snapshot"].clone()
+}
+
+fn assert_preference_context(request: &Value, expected: Option<&str>) {
+    let preferences: Vec<Value> = request["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| {
+            let text = message["content"].as_str()?;
+            if !text.contains("eve-confirmed-preferences-v1") {
+                return None;
+            }
+            assert_eq!(message["role"], "system");
+            Some(serde_json::from_str(&text[text.find('{').unwrap()..]).unwrap())
+        })
+        .collect();
+    match expected {
+        Some(text) => {
+            assert_eq!(preferences.len(), 1);
+            assert_eq!(preferences[0]["preferences"].as_array().unwrap().len(), 1);
+            assert_eq!(preferences[0]["preferences"][0]["text"], text);
+        }
+        None => assert!(preferences.is_empty()),
+    }
+}
+
+fn containing_message(id: &str, text: &str, contains: &str) -> Value {
+    let mut message = message(id, text, "");
+    message["expected_contains"] = json!(contains);
+    message
+}
+
+async fn sql_memory_and_cognition(root: &Path, database: &Path, password: &str) {
+    const PREFERENCE: &str = "SQL_PRIVATE_MEMORY：先给简短结论。";
+    const CORRECTED: &str = "SQL_CORRECTED_MEMORY：先给证据再给结论。";
+    const GOAL: &str = "只在本地形成一份需要用户确认的反思草稿";
+    let artifact = json!({
+        "summary": "SQL_REFLECTION：范围尚未确认。",
+        "next_step": "请用户补充执行范围。",
+        "needs_user_input": true
+    });
+    let mut server = Server::start(vec![
+        Reply::json(final_response("SQL 确认偏好后的回复。")),
+        Reply::json(final_response(&artifact.to_string())),
+        Reply::json(final_response("SQL 修正偏好后的回复。")),
+        Reply::json(final_response("SQL 撤销偏好后的回复。")),
+    ])
+    .await;
+    let url = server.url.clone();
+    let enabled = || {
+        let mut command = command(Entry::Qq, root, &url, Some(database));
+        command.args(["--memory", "--cognition", "--cognition-max-executions", "1"]);
+        command
+    };
+
+    scenario(
+        root,
+        vec![containing_message(
+            "sql-remember",
+            &format!("/remember {PREFERENCE}"),
+            "偏好已保存：",
+        )],
+    );
+    successful(Process::run(enabled(), "", password).await, Entry::Qq);
+    let snapshot = memory_snapshot(&rows(database));
+    assert_eq!(snapshot["revision"], 1);
+    assert_eq!(snapshot["evidence"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["evidence"][0]["source"]["kind"], "UserStatement");
+    assert_eq!(
+        snapshot["evidence"][0]["source"]["text"],
+        format!("/remember {PREFERENCE}")
+    );
+    let preference = &snapshot["preferences"][0];
+    let id = preference["id"].as_str().unwrap().to_owned();
+    assert_eq!(preference["text"], PREFERENCE);
+    assert_eq!(preference["status"], "Confirmed");
+    assert_eq!(
+        preference["history"][0]["evidence_id"],
+        snapshot["evidence"][0]["id"]
+    );
+    // 开启记忆没有补采本 suite 先前关闭记忆时产生的 SQL 聊天回执。
+    assert!(server.requests.try_recv().is_err());
+
+    scenario(
+        root,
+        vec![message(
+            "sql-memory-chat",
+            "重启后使用明确偏好",
+            "SQL 确认偏好后的回复。",
+        )],
+    );
+    successful(Process::run(enabled(), "", password).await, Entry::Qq);
+    assert_preference_context(&server.next().await.body, Some(PREFERENCE));
+    let before_reflection = rows(database);
+    let remembered = document(&before_reflection, "eve.memory", "memory.v1");
+    let snapshot = memory_snapshot(&before_reflection);
+    assert_eq!(snapshot["revision"], 2);
+    assert_eq!(snapshot["evidence"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        snapshot["evidence"][1]["source"]["kind"],
+        "CompletedInteraction"
+    );
+    assert_eq!(
+        snapshot["evidence"][1]["source"]["user_text"],
+        "重启后使用明确偏好"
+    );
+    assert_eq!(
+        snapshot["evidence"][1]["source"]["assistant_text"],
+        "SQL 确认偏好后的回复。"
+    );
+    assert!(
+        document(&before_reflection, QQBOT_PLUGIN_ID, "receipts.v1")["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["message"]["id"] == "sql-memory-chat" && entry["state"] == "Sent")
+    );
+
+    // 替身桥接不直接读取数据库；测试查询已提交的 Completed 后再打开文件门。
+    let completed = root.join("sql-reflection-completed");
+    std::fs::write(
+        root.join("scenario.json"),
+        serde_json::to_vec(&json!({"script": [
+            {"send": containing_message("sql-memory-goal", &format!("/goal {GOAL}"), "待办已保存：")},
+            {"wait_command": {"id":"sql-memory-goal", "type":"reply"}},
+            {"wait_file": completed},
+            {"send": containing_message("sql-memory-mind", "/mind", "SQL_REFLECTION：范围尚未确认。")},
+            {"wait_command": {"id":"sql-memory-mind", "type":"reply"}}
+        ]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let poll = async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let saved = rows(database);
+                if saved
+                    .iter()
+                    .any(|(owner, key, _)| owner == b"eve.cognition" && key == b"cognition.v1")
+                {
+                    let cognition = document(&saved, "eve.cognition", "cognition.v1");
+                    let goals = cognition["state"]["goals"].as_object().unwrap();
+                    if goals.values().any(|goal| {
+                        goal["verification"] == "reflection:v1" && goal["status"] == "Completed"
+                    }) {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("SQL 内生反思未完成");
+        std::fs::write(&completed, b"completed").unwrap();
+    };
+    let (output, ()) = tokio::join!(Process::run(enabled(), "", password), poll);
+    successful(output, Entry::Qq);
+    let reflection_request = server.next().await.body;
+    assert_preference_context(&reflection_request, None);
+    assert!(!has_training(&reflection_request));
+    assert!(!reflection_request.to_string().contains(PREFERENCE));
+    assert!(
+        reflection_request
+            .get("tools")
+            .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty))
+    );
+    let reflected = rows(database);
+    assert_eq!(document(&reflected, "eve.memory", "memory.v1"), remembered);
+    let cognition = document(&reflected, "eve.cognition", "cognition.v1");
+    let goals = cognition["state"]["goals"].as_object().unwrap();
+    assert_eq!(goals.len(), 2);
+    let parent = goals
+        .values()
+        .find(|goal| goal["description"] == GOAL)
+        .unwrap();
+    assert_eq!(parent["status"], "Waiting");
+    let child = goals
+        .values()
+        .find(|goal| goal["source"]["reference"] == parent["id"])
+        .unwrap();
+    assert_eq!(child["status"], "Completed");
+    assert_eq!(child["feedback"]["verification_met"], true);
+    assert_eq!(child["feedback"]["started_tools"], 0);
+
+    scenario(
+        root,
+        vec![
+            message("sql-remember", "/remember 重复消息不能改写偏好", "不得回复"),
+            message("sql-memory-chat", "重复消息不能新建交互", "不得回复"),
+            message("sql-memory-goal", "/goal 重复消息不能新建反思", "不得回复"),
+        ],
+    );
+    let replay = successful(Process::run(enabled(), "", password).await, Entry::Qq);
+    assert_eq!(replay["received"], 0);
+    assert_eq!(replay["sent"], 0);
+    assert_eq!(rows(database), reflected);
+    assert!(server.requests.try_recv().is_err());
+
+    for (command_id, change, confirmation, chat_id, input, reply, expected) in [
+        (
+            "sql-memory-correct",
+            format!("/correct-memory {id} {CORRECTED}"),
+            "偏好已修正：",
+            "sql-memory-corrected-chat",
+            "使用修正后的偏好",
+            "SQL 修正偏好后的回复。",
+            Some(CORRECTED),
+        ),
+        (
+            "sql-memory-forget",
+            format!("/forget {id}"),
+            "偏好已撤销：",
+            "sql-memory-revoked-chat",
+            "撤销后继续聊天",
+            "SQL 撤销偏好后的回复。",
+            None,
+        ),
+    ] {
+        scenario(
+            root,
+            vec![
+                containing_message(command_id, &change, confirmation),
+                message(chat_id, input, reply),
+            ],
+        );
+        successful(Process::run(enabled(), "", password).await, Entry::Qq);
+        assert_preference_context(&server.next().await.body, expected);
+    }
+    let committed = rows(database);
+    let snapshot = memory_snapshot(&committed);
+    assert_eq!(snapshot["revision"], 6);
+    let evidence = snapshot["evidence"].as_array().unwrap();
+    assert_eq!(evidence.len(), 6);
+    assert_eq!(
+        evidence
+            .iter()
+            .filter(|e| e["source"]["kind"] == "CompletedInteraction")
+            .count(),
+        3
+    );
+    let preference = &snapshot["preferences"][0];
+    assert_eq!(preference["status"], "Revoked");
+    assert_eq!(preference["text"], CORRECTED);
+    let history = preference["history"].as_array().unwrap();
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[0]["text"], PREFERENCE);
+    assert_eq!(history[1]["text"], CORRECTED);
+    assert_eq!(history[2]["status"], "Revoked");
+    assert_eq!(
+        document(&committed, "eve.cognition", "cognition.v1"),
+        cognition
+    );
+    assert!(!root.join("state/state.json").exists());
+    for (_, _, bytes) in &committed {
+        for secret in [MODEL_KEY, QQ_KEY, password] {
+            assert!(!String::from_utf8_lossy(bytes).contains(secret));
+        }
+    }
+    scenario(root, vec![]);
+    successful(Process::run(enabled(), "", password).await, Entry::Qq);
+    assert_eq!(rows(database), committed);
+    assert!(server.requests.try_recv().is_err());
+}
+
 #[test]
 fn both_entries_parse_explicit_database_paths_and_keep_file_default() {
     let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
@@ -545,6 +815,7 @@ async fn sql_qq_and_console_preserve_history_training_and_receipts_without_repla
     }
     assert!(server.requests.try_recv().is_err());
     assert_eq!(rows(&database), committed);
+    sql_memory_and_cognition(root.path(), &database, &credentials.password).await;
     admin(&database, |client| {
         client
             .batch_execute("DROP SCHEMA eve_state CASCADE")
