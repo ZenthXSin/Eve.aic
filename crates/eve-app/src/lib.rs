@@ -6,6 +6,7 @@ mod console;
 mod error;
 mod input;
 mod models;
+mod qq_cognition;
 mod qqbot;
 mod services;
 mod storage;
@@ -15,7 +16,7 @@ pub use cognition::{
 };
 pub use console::{ChatOutputError, ChatRunError};
 pub use error::AppFailure;
-pub use qqbot::{QQBOT_HELP, QqBotOptions, run_qqbot};
+pub use qqbot::{QQBOT_HELP, QqBotOptions, run_qqbot, run_qqbot_with_planner_factory};
 
 use eve_agent_prompt::FileAgentPrompt;
 use eve_config_api::{
@@ -320,23 +321,24 @@ pub(crate) async fn finish_core<T>(
     result: Result<T, AppError>,
 ) -> Result<T, AppError> {
     let stopped = kernel.stop_all().await;
-    // 控制插件持有的执行器含 Kernel；停止后卸载以打破组合层引用环。
-    let control_id = PluginId::new(CONTROL_PLUGIN_ID).expect("有效内置 ID");
-    let removed = if kernel.state(&control_id).is_some() {
-        kernel.unregister(&control_id)
-    } else {
-        Ok(())
-    };
-    let flushed = kernel.flush_logs();
-    // 三个结果都已执行；同时保留原始输出和各个收尾错误。
+    // 循环与两个控制执行器都可能持有 Kernel；先停止，再卸载以解除引用环。
     let mut secondary: Vec<AppError> = Vec::new();
     if let Err(error) = stopped {
         secondary.push(error.into());
     }
-    if let Err(error) = removed {
-        secondary.push(error.into());
+    for name in [
+        eve_cognition_loop_api::LOOP_PLUGIN_ID,
+        qq_cognition::CONTROL_ID,
+        CONTROL_PLUGIN_ID,
+    ] {
+        let id = PluginId::new(name).expect("有效内置 ID");
+        if kernel.state(&id).is_some()
+            && let Err(error) = kernel.unregister(&id)
+        {
+            secondary.push(error.into());
+        }
     }
-    if let Err(error) = flushed {
+    if let Err(error) = kernel.flush_logs() {
         secondary.push(error.into());
     }
     if !secondary.is_empty() {

@@ -1,6 +1,9 @@
 //! 官方 QQBot 通道实现；只通过公开 Control/Message/Session 与插件 Context 协作。
 mod bridge;
+mod commands;
 mod state;
+
+pub use commands::{QqCommandHandler, QqCommandInput};
 
 use eve_control_api::{CONTROL_PLUGIN_ID, CONTROL_SERVICE_ID, ControlServiceHandle};
 use eve_message_api::{MessageServiceHandle, ROUTER_PLUGIN_ID, ROUTER_SERVICE_ID};
@@ -51,6 +54,7 @@ impl QqBotStatusHandle {
 pub struct QqBotPlugin {
     manifest: PluginManifest,
     config: Arc<QqBotConfig>,
+    command_handler: Option<Arc<dyn QqCommandHandler>>,
     training: bool,
 }
 impl QqBotPlugin {
@@ -68,8 +72,15 @@ impl QqBotPlugin {
         Ok(Self {
             manifest,
             config: Arc::new(config),
+            command_handler: None,
             training: false,
         })
+    }
+
+    /// 添加宿主命令扩展；默认不安装，原有消息控制行为不变。
+    pub fn with_command_handler(mut self, handler: Arc<dyn QqCommandHandler>) -> Self {
+        self.command_handler = Some(handler);
+        self
     }
     /// 通过公开契约接线；未接线的通道继续使用既有消息规则。
     pub fn with_training(mut self) -> PluginResult<Self> {
@@ -119,6 +130,7 @@ impl Plugin for QqBotPlugin {
             )?;
             let ledger = Arc::new(tokio::sync::Mutex::new(Some(ledger)));
             let config = self.config.clone();
+            let command_handler = self.command_handler.clone();
             let task_ctx = ctx.clone();
             ctx.spawn_task(TaskSpec::new(
                 "QQBot JSONL 通道",
@@ -130,6 +142,7 @@ impl Plugin for QqBotPlugin {
                     let ctx = task_ctx.clone();
                     let control = control.clone();
                     let messages = messages.clone();
+                    let command_handler = command_handler.clone();
                     let training = training.clone();
                     let status = status.clone();
                     let ledger = ledger.clone();
@@ -144,6 +157,7 @@ impl Plugin for QqBotPlugin {
                             bridge::Services {
                                 control,
                                 messages,
+                                command_handler,
                                 training,
                             },
                             ledger,
