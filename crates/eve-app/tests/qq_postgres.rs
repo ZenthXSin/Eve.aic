@@ -938,6 +938,98 @@ fn receipt(saved: &[StoredRow], id: &str) -> Value {
         .clone()
 }
 
+async fn sql_autonomous_confirmation_reconciles_completed_jobs_and_preserves_revocation(
+    root: &Path,
+    database: &Path,
+    password: &str,
+) {
+    let mut server = Server::start(vec![]).await;
+    let before = rows(database);
+    let learning = document(&before, "eve.learning", "learning.v1");
+    let memory = document(&before, "eve.memory", "memory.v1");
+    let old_scope = learning["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| {
+            j["job"]["candidates"][0]["draft"]["text"]
+                == "SQL_OLD_SCOPE_CANDIDATE：旧作用域专属候选。"
+        })
+        .unwrap()["job"]
+        .clone();
+    let candidate = &old_scope["candidates"][0];
+    let id = format!("learned-{}", candidate["id"].as_str().unwrap());
+    let ready = root.join("sql-auto-ready");
+    let done = root.join("sql-auto-done");
+    script(
+        root,
+        vec![json!({"touch":ready}), json!({"wait_file":done})],
+    );
+    let mut automatic = command(Entry::Qq, root, &server.url, Some(database));
+    automatic.arg("--self-learning");
+    let inspect = async {
+        wait_sql(database, |saved| {
+            let current = document(saved, "eve.memory", "memory.v1");
+            current["scopes"].as_array().unwrap().iter().any(|s| {
+                s["snapshot"]["preferences"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["id"] == id)
+            })
+        })
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(650), server.requests.recv())
+                .await
+                .is_err()
+        );
+        std::fs::write(&done, b"done").unwrap();
+    };
+    let (output, ()) = tokio::join!(Process::run(automatic, "", password), inspect);
+    successful(output, Entry::Qq);
+    let saved = rows(database);
+    assert_eq!(document(&saved, "eve.learning", "learning.v1"), learning);
+    let current = document(&saved, "eve.memory", "memory.v1");
+    for scope in memory["scopes"].as_array().unwrap() {
+        let next = current["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["snapshot"]["scope"] == scope["snapshot"]["scope"])
+            .unwrap();
+        assert_eq!(next["snapshot"]["evidence"], scope["snapshot"]["evidence"]);
+        for old in scope["snapshot"]["preferences"].as_array().unwrap() {
+            assert!(
+                next["snapshot"]["preferences"]
+                    .as_array()
+                    .unwrap()
+                    .contains(old)
+            );
+        }
+    }
+    let preference = current["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|s| s["snapshot"]["preferences"].as_array().unwrap())
+        .find(|p| p["id"] == id)
+        .unwrap();
+    assert_eq!(preference["status"], "Confirmed");
+    assert!(
+        candidate["draft"]["evidence_ids"]
+            .as_array()
+            .unwrap()
+            .contains(&preference["history"][0]["evidence_id"])
+    );
+    script(root, vec![]);
+    let mut restart = command(Entry::Qq, root, &server.url, Some(database));
+    restart.arg("--self-learning");
+    successful(Process::run(restart, "", password).await, Entry::Qq);
+    assert_eq!(rows(database), saved);
+    assert!(server.requests.try_recv().is_err());
+}
+
 fn interaction_evidence(saved: &[StoredRow]) -> Vec<Value> {
     document(saved, "eve.memory", "memory.v1")["scopes"]
         .as_array()
@@ -1204,6 +1296,17 @@ async fn sql_segment_case(
     url: &str,
     messages: Vec<Value>,
 ) -> Vec<StoredRow> {
+    sql_segment_case_with_memory(root, database, password, url, messages, false).await
+}
+
+async fn sql_segment_case_with_memory(
+    root: &Path,
+    database: &Path,
+    password: &str,
+    url: &str,
+    messages: Vec<Value>,
+    memory: bool,
+) -> Vec<StoredRow> {
     let last_id = messages.last().unwrap()["id"].as_str().unwrap().to_owned();
     let finished = root.join(format!("{last_id}-persisted"));
     let mut steps = Vec::new();
@@ -1218,6 +1321,9 @@ async fn sql_segment_case(
     segment_script(root, steps);
     let mut enabled = command(Entry::Qq, root, url, Some(database));
     enabled.arg("--segmented");
+    if memory {
+        enabled.arg("--memory");
+    }
     let inspect = async {
         let saved = wait_sql(database, |saved| {
             document(saved, QQBOT_PLUGIN_ID, "receipts.v1")["entries"]
@@ -1354,6 +1460,93 @@ async fn sql_segment_preferences_persist_and_remain_scoped(
         );
     }
     assert!(!root.join("state/state.json").exists());
+}
+
+async fn sql_rhythm_advice_uses_confirmed_sources_and_only_writes_settings(
+    root: &Path,
+    database: &Path,
+    password: &str,
+) {
+    const TEXT: &str = "回复最多两段，段间停顿50%。";
+    let mut server = Server::start(vec![]).await;
+    let remembered = sql_segment_case_with_memory(
+        root,
+        database,
+        password,
+        &server.url,
+        vec![containing_message(
+            "sql-rhythm-remember",
+            &format!("/remember {TEXT}"),
+            "偏好已保存：",
+        )],
+        true,
+    )
+    .await;
+    let memory = document(&remembered, "eve.memory", "memory.v1");
+    let preference = memory["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|scope| scope["snapshot"]["preferences"].as_array().unwrap())
+        .find(|p| p["text"] == TEXT)
+        .unwrap();
+    let id = preference["id"].as_str().unwrap();
+    let displayed = sql_segment_case_with_memory(
+        root,
+        database,
+        password,
+        &server.url,
+        vec![containing_message(
+            "sql-rhythm-view",
+            "/segment suggestions",
+            id,
+        )],
+        true,
+    )
+    .await;
+    assert_eq!(
+        document(&displayed, "eve.segment.preferences", "preferences.v1"),
+        document(&remembered, "eve.segment.preferences", "preferences.v1")
+    );
+    let adopted = sql_segment_case_with_memory(
+        root,
+        database,
+        password,
+        &server.url,
+        vec![containing_message(
+            "sql-rhythm-adopt",
+            &format!("/segment adopt {id} 1"),
+            "已采用偏好",
+        )],
+        true,
+    )
+    .await;
+    let settings = document(&adopted, "eve.segment.preferences", "preferences.v1");
+    assert_eq!(settings["scopes"].as_array().unwrap().len(), 1);
+    assert_eq!(settings["scopes"][0]["enabled"], true);
+    assert_eq!(settings["scopes"][0]["max_segments"], 2);
+    assert_eq!(settings["scopes"][0]["pause_percent"], 50);
+    for (namespace, key) in [
+        ("eve.memory", "memory.v1"),
+        ("eve.learning", "learning.v1"),
+        ("eve.cognition", "cognition.v1"),
+    ] {
+        assert_eq!(
+            adopted
+                .iter()
+                .find(|(n, k, _)| n == namespace.as_bytes() && k == key.as_bytes()),
+            remembered
+                .iter()
+                .find(|(n, k, _)| n == namespace.as_bytes() && k == key.as_bytes())
+        );
+    }
+    segment_script(root, vec![]);
+    let mut restart = command(Entry::Qq, root, &server.url, Some(database));
+    restart.args(["--memory", "--segmented"]);
+    successful(Process::run(restart, "", password).await, Entry::Qq);
+    assert_eq!(rows(database), adopted);
+    assert!(segment_events(root).is_empty());
+    assert!(server.requests.try_recv().is_err());
 }
 
 #[test]
@@ -1677,6 +1870,18 @@ async fn sql_qq_and_console_preserve_history_training_and_receipts_without_repla
     )
     .await;
     sql_segment_preferences_persist_and_remain_scoped(
+        root.path(),
+        &database,
+        &credentials.password,
+    )
+    .await;
+    sql_rhythm_advice_uses_confirmed_sources_and_only_writes_settings(
+        root.path(),
+        &database,
+        &credentials.password,
+    )
+    .await;
+    sql_autonomous_confirmation_reconciles_completed_jobs_and_preserves_revocation(
         root.path(),
         &database,
         &credentials.password,

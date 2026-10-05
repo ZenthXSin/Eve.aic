@@ -65,6 +65,8 @@ Learning 批次先保存 `Running` 和输入，再发起请求；恢复将残留
 
 开启分段后，每个会话可以用 `/segment` 查看，用 `/segment on|off|reset`、`/segment parts 2至5`、`/segment pace 0至200` 修改，从下一条开始投递的回复生效；未开启 `--segmented` 时回复“未开启”。设置独立保存在 `eve.segment.preferences`，损坏时拒绝启动且不清空，见[会话分段设置](./表达偏好与分段输出.md#会话分段设置已实现)。
 
+同时开启 `--memory --segmented` 后，用 `/segment suggestions [页码]` 从本会话已确认偏好查看节奏建议，`/segment adopt 偏好ID 版本` 明确采用。`--memory-learning` 的聊天候选需先 `/accept-memory` 确认，也可直接 `/remember 回复最多分成两段，段间不要停顿。`。查看只读、采用一次应用涉及字段；纠正来源后旧版本被拒绝，撤销来源后不能再次采用。已应用的设置可用 `/segment reset` 恢复默认；命令与质量边界见[节奏建议](./表达偏好与分段输出.md#qq-已确认偏好的节奏建议首版已实现)。
+
 ## 本地内生反思
 
 `--cognition` 显式开启后台反思，默认关闭；普通聊天和训练开关不会自动开启它。每次启动最多执行 32 项，可通过 `--cognition-max-executions 1` 等值限制为 1–32 项。启动示例：
@@ -172,3 +174,7 @@ python3 connectors/qqbot/test/segment_test.py
 本次只使用 GitHub 托管 Runner，没有部署测试服务器。仅上传无正文计数报告，原始诊断、会话和回执未上传。一次性 PR 触发已移除，工作流恢复为仅 main 的手动入口；需要长期在线或保留本次 Runner 状态，应另行使用持久宿主。
 
 媒体、QQ 频道、webhook、主动消息、自然语言辅助判断、并行调度和凭据库接线后置。明确修订已接线，暂停检查点和 Jev 仍待独立交付。
+
+## 自主偏好学习
+
+`--self-learning` 同时开启记忆、持续提炼和分段，证据充分的候选自动确认，明确节奏自动参与后续发送。`/self-learning status` 查看模式及关联情况；手动分段选择优先，`/segment reset` 清除手动选择并恢复跟随学习。默认提炼间隔五分钟，`--learning-cooldown-ms` 可调整。行为、恢复和容量见[自主偏好学习](./自主偏好学习.md)。

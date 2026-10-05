@@ -160,7 +160,8 @@ pub trait MemoryAdmin: Send + Sync {
         expected_revision: u64,
         interaction: CompletedInteraction,
     ) -> MemoryResult<MemorySnapshot>;
-    /// 明确意图必须由宿主确认；证据与偏好历史在一次状态提交中保存。
+    /// 确认必须由可信宿主授权（用户命令或显式开启的自主学习策略）；
+    /// 自动确认引用真实 Existing 交互，不能伪造 UserStatement。证据与历史一次提交。
     /// 任何持久化错误都保留旧内存并关闭实例，因为后端可能已提交但未确认。
     fn update_preference(
         &self,

@@ -392,6 +392,107 @@ class SegmentAcceptance(unittest.TestCase):
         routing = json.dumps(["1904159860", "c2c", "user-1", "user-1"], separators=(",", ":")).encode()
         return "qq:" + hashlib.sha256(routing).hexdigest()
 
+    def remember_rhythm(self, text):
+        self.run_eve([{"send": self.message("rhythm-source", text="/remember " + text,
+                                            segments=None, expected_contains="偏好已保存：")},
+                      self.wait_receipt("rhythm-source", "Sent")], memory=True)
+        snapshot = self.documents()["eve.memory"]["memory.v1"]["scopes"][0]["snapshot"]
+        return snapshot["preferences"][0]["id"]
+
+    def advice_command(self, id, text, contains, **route):
+        return self.message(id, text=text, segments=None, expected_contains=contains, **route)
+
+    def test_advice_is_read_only_until_adopted_and_delivery_survives_restart(self):
+        source = self.remember_rhythm("回复最多分成两段，段间不要停顿。")
+        before = self.documents()["eve.memory"]["memory.v1"]
+        self.run_eve([{"send": self.advice_command("suggest", "/segment suggestions",
+                                                   [source, "第 1 版", "最多 2 段", "停顿 0%", "查看不改变设置"])},
+                      self.wait_receipt("suggest", "Sent")], memory=True)
+        self.assertIsNone(self.preferences())
+        self.assertEqual(self.documents()["eve.memory"]["memory.v1"], before)
+        self.assertFalse(self.requests)
+        adopt = f"/segment adopt {source} 1"
+        parts = [PARTS[0], PARTS[1] + "\n\n" + PARTS[2]]
+        self.run_eve([{"send": self.advice_command("adopt", adopt, "已采用偏好")},
+                      self.wait_receipt("adopt", "Sent"),
+                      {"send": self.message("adopted-chat", segments=parts)},
+                      self.wait_receipt("adopted-chat", "Sent")], memory=True)
+        setting = self.preferences()
+        self.assertEqual(setting["scopes"][0]["max_segments"], 2)
+        self.assertEqual(setting["scopes"][0]["pause_percent"], 0)
+        self.assertIsNone(setting["scopes"][0]["enabled"])
+        self.assertEqual(self.receipt("adopt")["message"]["text"], adopt)
+        self.assertEqual(self.receipt("adopted-chat")["reply"], TEXT)
+        self.assertEqual(len(self.interactions()), 1)
+        frozen = self.state_path.read_bytes()
+        duplicate = self.advice_command("adopt", adopt, "不得重复采用", expected_type="finish")
+        self.run_eve([{"send": duplicate}, {"wait_command": {"id": "adopt", "type": "finish"}}], memory=True)
+        self.assertEqual(self.state_path.read_bytes(), frozen)
+        self.run_eve([{"send": self.message("after-restart", segments=parts)},
+                      self.wait_receipt("after-restart", "Sent"),
+                      {"send": self.message("other-default", user_id="other", target_id="other")},
+                      self.wait_receipt("other-default", "Sent")], memory=True)
+        self.assertEqual(self.preferences(), setting)
+        self.assertEqual(len(self.requests), 3)
+
+    def test_correction_rejects_old_revision_and_revoke_does_not_reapply(self):
+        source = self.remember_rhythm("回复最多两段，段间不要停顿。")
+        corrected = f"/correct-memory {source} 回复最多三段，段间停顿50%。"
+        self.run_eve([{"send": self.advice_command("correct-rhythm", corrected, "偏好已修正：")},
+                      self.wait_receipt("correct-rhythm", "Sent"),
+                      {"send": self.advice_command("stale", f"/segment adopt {source} 1", "版本已变化")},
+                      self.wait_receipt("stale", "Sent"),
+                      {"send": self.advice_command("fresh-list", "/segment suggestions", ["第 2 版", "最多 3 段", "停顿 50%", source])},
+                      self.wait_receipt("fresh-list", "Sent")], memory=True)
+        self.assertIsNone(self.preferences())
+        self.run_eve([{"send": self.advice_command("fresh-adopt", f"/segment adopt {source} 2", "已采用偏好")},
+                      self.wait_receipt("fresh-adopt", "Sent")], memory=True)
+        saved = self.preferences()
+        self.run_eve([{"send": self.advice_command("forget-rhythm", "/forget " + source, "偏好已撤销：")},
+                      self.wait_receipt("forget-rhythm", "Sent"),
+                      {"send": self.advice_command("no-revival", f"/segment adopt {source} 2", "已撤销的偏好不能采用")},
+                      self.wait_receipt("no-revival", "Sent"),
+                      {"send": self.advice_command("revoked-list", "/segment suggestions", "没有可采用的节奏建议")},
+                      self.wait_receipt("revoked-list", "Sent")], memory=True)
+        self.assertEqual(self.preferences(), saved)
+        self.run_eve([{"send": self.command("reset-rhythm", "/segment reset", SEGMENT_RESET)},
+                      self.wait_receipt("reset-rhythm", "Sent")], memory=True)
+        self.assertEqual(self.preferences()["scopes"], [])
+        frozen = self.state_path.read_bytes()
+        duplicate = self.advice_command("fresh-adopt", f"/segment adopt {source} 2", "不得复活", expected_type="finish")
+        self.run_eve([{"send": duplicate}, {"wait_command": {"id": "fresh-adopt", "type": "finish"}}], memory=True)
+        self.assertEqual(self.state_path.read_bytes(), frozen)
+        self.assertFalse(self.requests)
+
+    def test_foreign_sources_disabled_memory_and_unsupported_feedback_do_not_write(self):
+        self.run_eve([{"send": self.advice_command("no-memory", "/segment suggestions", "需要同时启用")},
+                      self.wait_receipt("no-memory", "Sent")])
+        source = self.remember_rhythm("回复最多两段。")
+        other = self.advice_command("foreign", f"/segment adopt {source} 1", "当前会话没有这条已确认偏好",
+                                    user_id="other", target_id="other")
+        self.run_eve([{"send": other}, self.wait_receipt("foreign", "Sent"),
+                      {"send": self.advice_command("vague", f"/correct-memory {source} 说话自然一点。", "偏好已修正：")},
+                      self.wait_receipt("vague", "Sent"),
+                      {"send": self.advice_command("vague-adopt", f"/segment adopt {source} 2", "没有可采用的明确节奏建议")},
+                      self.wait_receipt("vague-adopt", "Sent")], memory=True)
+        self.assertIsNone(self.preferences())
+        self.assertFalse(self.requests)
+
+    def test_capacity_rejection_never_claims_adoption_or_changes_sources(self):
+        source = self.remember_rhythm("回复最多两段，段间不要停顿。")
+        state = json.loads(self.state_path.read_text())
+        full = {"version": 1, "scopes": [{"scope": {"channel": "qq", "session_id": f"filled-{i}", "user_id": "fixture"},
+                 "enabled": False, "max_segments": None, "pause_percent": None} for i in range(1024)]}
+        state["entries"]["eve.segment.preferences"] = {"preferences.v1": list(json.dumps(full).encode())}
+        self.state_path.write_text(json.dumps(state))
+        memory = self.documents()["eve.memory"]["memory.v1"]
+        self.run_eve([{"send": self.advice_command("full-adopt", f"/segment adopt {source} 1", "容量已满")},
+                      self.wait_receipt("full-adopt", "Sent")], memory=True)
+        self.assertNotIn("已采用偏好", self.receipt("full-adopt")["reply"])
+        self.assertEqual(self.preferences(), full)
+        self.assertEqual(self.documents()["eve.memory"]["memory.v1"], memory)
+        self.assertFalse(self.requests)
+
 
 if __name__ == "__main__":
     unittest.main()

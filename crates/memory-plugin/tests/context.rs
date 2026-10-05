@@ -463,6 +463,55 @@ fn replacement_snapshot() -> MemorySnapshot {
 }
 
 #[tokio::test]
+async fn autonomous_context_uses_latest_sources_within_eight_record_budget() {
+    let mut snapshot = replacement_snapshot();
+    snapshot.revision = 12;
+    snapshot.preferences.clear();
+    for revision in 1..=12 {
+        let id = format!("p-{revision:02}");
+        snapshot.evidence.push(InteractionEvidence {
+            id: id.clone(),
+            revision,
+            at_ms: 100 - revision,
+            source: EvidenceSource::UserStatement {
+                message_id: id.clone(),
+                text: "反馈".into(),
+            },
+        });
+        snapshot.preferences.push(Preference {
+            id: id.clone(),
+            text: format!("偏好 {revision}"),
+            status: PreferenceStatus::Confirmed,
+            revision: 1,
+            history: vec![PreferenceVersion {
+                revision: 1,
+                evidence_id: id,
+                at_ms: 100 - revision,
+                text: format!("偏好 {revision}"),
+                status: PreferenceStatus::Confirmed,
+            }],
+        });
+    }
+    let context = MemoryContext::new(
+        "qq",
+        Arc::new(SnapshotMemory::new(snapshot)),
+        Arc::new(BaseContext::default()),
+    )
+    .unwrap()
+    .prefer_recent();
+    let result = context
+        .assemble_scoped(input(), Some(scope("group", "alice")))
+        .await
+        .unwrap();
+    let value = data(&result);
+    let preferences = value["preferences"].as_array().unwrap();
+    assert_eq!(preferences.len(), 8);
+    assert_eq!(preferences[0]["id"], "p-12");
+    assert_eq!(preferences[7]["id"], "p-05");
+    assert!(result.memories.last().unwrap().contains("最新来源优先"));
+}
+
+#[tokio::test]
 async fn invalid_replacement_snapshots_fail_closed_instead_of_adding_foreign_or_partial_data() {
     let original = replacement_snapshot();
     let mut foreign = original.clone();

@@ -1,8 +1,10 @@
 //! 低频偏好候选、单次模型提炼与严格恢复。
+mod confirmation;
 mod extractor;
 mod store;
 mod strict_json;
 
+pub use confirmation::EvidenceConfirmationPolicy;
 use eve_learning_api::*;
 use eve_memory_api::{MemoryScope, MemorySnapshot};
 use eve_plugin_api::{

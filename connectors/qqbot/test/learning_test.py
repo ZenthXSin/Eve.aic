@@ -56,6 +56,9 @@ class LearningAcceptance(unittest.TestCase):
         self.runs = 0
         self.response_gates = {}
         self.learning_response = "valid"
+        self.candidate_text = CANDIDATE
+        self.candidate_confidence = 83
+        self.candidate_sources = None
         self.run_release = threading.Event()
         self.events = []
         outer = self
@@ -106,8 +109,8 @@ class LearningAcceptance(unittest.TestCase):
                 message = {"role": "assistant", "content": text}
                 if kind == "learning":
                     mode = outer.learning_response
-                    draft = {"text": CANDIDATE, "confidence": 83,
-                             "evidence_ids": [item["id"] for item in decoded["evidence"]]}
+                    draft = {"text": outer.candidate_text, "confidence": outer.candidate_confidence,
+                             "evidence_ids": [item["id"] for item in decoded["evidence"]][:outer.candidate_sources]}
                     result = {"candidates": [] if mode == "empty" else [draft]}
                     if mode == "invalid":
                         draft["evidence_ids"] = ["foreign-evidence-must-be-rejected"]
@@ -167,7 +170,7 @@ class LearningAcceptance(unittest.TestCase):
         self.assertFalse(self.run_release.wait(0.65), "process stopped during observation")
 
     def run_eve(self, script, learning=True, memory=True, cognition=False, training=False,
-                app="1904159860", checkpoints=None, stop_at=None, abrupt=False):
+                app="1904159860", checkpoints=None, stop_at=None, abrupt=False, segmented=False, self_learning=False, cooldown_ms=None):
         self.runs += 1
         self.run_release = threading.Event()
         events_path = self.work / f"events-{self.runs}.jsonl"
@@ -187,6 +190,12 @@ class LearningAcceptance(unittest.TestCase):
             command.append("--memory-learning")
         if memory:
             command.append("--memory")
+        if cooldown_ms is not None:
+            command.extend(["--learning-cooldown-ms", str(cooldown_ms)])
+        if self_learning:
+            command.append("--self-learning")
+        if segmented:
+            command.append("--segmented")
         if cognition:
             command.extend(["--cognition", "--cognition-max-executions", "1"])
         if training:
@@ -239,11 +248,11 @@ class LearningAcceptance(unittest.TestCase):
         name = f"inspect-{self.runs + 1}"
         self.run_eve([*(prefix or []), *self.checkpoint(name)], checkpoints={name: callback}, **options)
 
-    def seed(self, count=3, prefix="seed", **route):
+    def seed(self, count=3, prefix="seed", feedback=None, **route):
         previous = len(self.interactions())
         script = []
         for index in range(count):
-            text = f"{prefix}-USER_EVIDENCE-{index}：每次回答请先给简短结论，再给必要依据。"
+            text = feedback or f"{prefix}-USER_EVIDENCE-{index}：每次回答请先给简短结论，再给必要依据。"
             script.extend(self.send(self.message(f"{prefix}-{index}", text, **route)))
         self.inspect_run(lambda: self.wait_until(lambda: len(self.interactions()) == previous + count,
                                                "completed delivery was not imported"),
@@ -253,6 +262,157 @@ class LearningAcceptance(unittest.TestCase):
         self.inspect_run(lambda: self.wait_jobs(1))
         self.assertEqual(len(self.learning_requests()), 1)
         return self.jobs()[0]["candidates"][0]["id"]
+
+    def preferences(self):
+        return [p for snapshot in self.snapshots() for p in snapshot["preferences"]]
+
+    def segment_send(self, message, parts):
+        return [{"send": {**message, "expected_segments": parts}}, self.wait_receipt(message["id"])]
+
+    def test_autonomous_confirmation_changes_context_and_delivery_recovers_and_respects_manual_settings(self):
+        self.candidate_text = "回复最多分成两段，段间不要停顿。"
+        self.seed(feedback=self.candidate_text)
+        self.inspect_run(lambda: self.wait_until(lambda: len(self.preferences()) == 1,
+                                               "candidate was not automatically confirmed"), self_learning=True)
+        candidate = self.jobs()[0]["candidates"][0]
+        source = "learned-" + candidate["id"]
+        preference = self.preferences()[0]
+        self.assertEqual(preference["id"], source)
+        self.assertEqual(preference["status"], "Confirmed")
+        self.assertIn(preference["history"][0]["evidence_id"], candidate["draft"]["evidence_ids"])
+        self.assertEqual(len(self.evidence()), 3, "automatic approval must not forge a statement")
+        self.assertNotIn("eve.segment.preferences", self.documents())
+        before = self.memory()
+        self.inspect_run(self.quiet, self_learning=True)
+        self.assertEqual(self.memory(), before)
+        self.assertEqual(len(self.learning_requests()), 1)
+        text = "可以。\n\n我们接着聊。\n\n我会按原文顺序发送。"
+        two = ["可以。\n\n我们接着聊。", "我会按原文顺序发送。"]
+        three = text.split("\n\n")
+        self.run_eve([
+            *self.send(self.message("auto-status", "/self-learning status", contains="自主学习：开启")),
+            *self.send(self.message("auto-candidates", "/memory-candidates", contains="状态：已自动保存")),
+            *self.segment_send(self.message("auto-chat", text), two),
+            *self.segment_send(self.message("auto-other-user", text, user="other-user"), three),
+            *self.send(self.message("auto-manual", "/segment parts 3", contains="设为 3 段")),
+            *self.segment_send(self.message("auto-override-chat", text), three),
+            *self.send(self.message("auto-reset", "/segment reset", contains="恢复跟随有效学习偏好")),
+            *self.segment_send(self.message("auto-reset-chat", text), two),
+            *self.send(self.message("auto-correct", "/correct-memory " + source + " 回复不要分段。", contains="偏好已修正")),
+            *self.send(self.message("auto-correct-chat", text, expected=text)),
+        ], self_learning=True)
+        current = self.preferences()[0]
+        self.assertEqual(current["revision"], 2)
+        self.assertEqual(current["text"], "回复不要分段。")
+        memory_context = json.dumps(self.chat_requests()[3]["body"], ensure_ascii=False)
+        self.assertIn(self.candidate_text, memory_context)
+        other_context = json.dumps(self.chat_requests()[4]["body"], ensure_ascii=False)
+        self.assertNotIn(source, other_context)
+        self.run_eve([
+            *self.send(self.message("auto-restart-chat", text, expected=text)),
+            *self.send(self.message("auto-forget", "/forget " + source, contains="偏好已撤销")),
+            *self.segment_send(self.message("auto-forgotten-chat", text), three),
+        ], self_learning=True)
+        revoked = self.preferences()[0]
+        self.assertEqual(revoked["status"], "Revoked")
+        self.inspect_run(self.quiet, self_learning=True)
+        self.assertEqual(self.preferences()[0], revoked, "restart must not revive or overwrite a revoked candidate")
+        self.assertEqual(len(self.learning_requests()), 1)
+
+    def test_autonomous_pending_completed_batch_is_reconciled_without_another_model_request(self):
+        self.seed()
+        candidate_id = self.generate()
+        self.assertFalse(self.preferences())
+        self.inspect_run(lambda: self.wait_until(lambda: len(self.preferences()) == 1,
+                                               "completed pending batch did not resume confirmation"), self_learning=True)
+        self.assertEqual(self.preferences()[0]["id"], "learned-" + candidate_id)
+        self.assertEqual(len(self.learning_requests()), 1)
+
+    def test_autonomous_weak_or_single_source_candidate_stays_pending(self):
+        self.seed()
+        self.candidate_confidence = 79
+        self.inspect_run(lambda: self.wait_jobs(1), self_learning=True)
+        self.inspect_run(self.quiet, self_learning=True)
+        self.assertFalse(self.preferences())
+        self.assertEqual(len(self.learning_requests()), 1)
+        self.candidate_confidence = 100
+        self.candidate_sources = 1
+        self.seed(prefix="single", user="single-source-user")
+        self.inspect_run(lambda: self.wait_jobs(2), self_learning=True)
+        self.inspect_run(self.quiet, self_learning=True)
+        self.assertFalse(self.preferences())
+        self.assertEqual(len(self.learning_requests()), 2)
+
+    def test_autonomous_new_chat_feedback_updates_rhythm_and_latest_context_without_commands(self):
+        self.candidate_text = "回复最多分成两段，段间不要停顿。"
+        self.seed(feedback=self.candidate_text)
+        self.inspect_run(lambda: self.wait_until(lambda: len(self.preferences()) == 1, "initial automatic learning missing"),
+                         self_learning=True, cooldown_ms=0)
+        old_id = self.preferences()[0]["id"]
+        self.candidate_text = "回复不要分段。"
+        feedback = []
+        for index in range(3):
+            feedback.extend(self.send(self.message(f"natural-correction-{index}", "我改主意了，以后回复不要分段。")))
+        self.inspect_run(lambda: self.wait_until(lambda: len(self.preferences()) == 2, "new chat correction not learned"),
+                         prefix=feedback, self_learning=True, cooldown_ms=0)
+        new_id = next(p["id"] for p in self.preferences() if p["id"] != old_id)
+        text = "第一段。\n\n第二段。\n\n第三段。"
+        self.run_eve(self.send(self.message("latest-learned-chat", text)), self_learning=True, cooldown_ms=0)
+        context = self.preference_data(self.chat_requests()[-1])[0]["preferences"]
+        self.assertEqual(context[0]["id"], new_id)
+        self.assertEqual(context[1]["id"], old_id)
+        # 撤销新来源自动回到仍有效的旧节奏；新候选不能用新 ID 复活同文撤销偏好。
+        self.inspect_run(lambda: self.wait_jobs(3), prefix=[
+            *self.send(self.message("revoke-natural-correction", "/forget " + new_id, contains="偏好已撤销")),
+            *self.segment_send(self.message("fallback-learned-chat", text), ["第一段。", "第二段。\n\n第三段。"]),
+            *self.send(self.message("new-batch-after-revoke", "以后还是别分段。")),
+        ], self_learning=True, cooldown_ms=0)
+        self.inspect_run(self.quiet, self_learning=True, cooldown_ms=0)
+        self.assertEqual(len(self.preferences()), 2)
+        self.assertEqual(next(p for p in self.preferences() if p["id"] == new_id)["status"], "Revoked")
+        self.assertEqual(len(self.learning_requests()), 3)
+
+    def test_autonomous_mode_continues_past_four_batch_startup_budget(self):
+        for index in range(5):
+            self.seed(prefix=f"continuous-{index}", user=f"continuous-user-{index}")
+        self.inspect_run(lambda: self.wait_until(lambda: len(self.jobs()) == 5 and
+                                               sum(len(s["preferences"]) for s in self.snapshots()) == 5,
+                                               "autonomous learning stopped at the manual four-batch budget"),
+                         self_learning=True)
+        self.assertEqual(len(self.learning_requests()), 5)
+        before = self.memory()
+        self.inspect_run(self.quiet, self_learning=True)
+        self.assertEqual(self.memory(), before)
+        self.assertEqual(len(self.learning_requests()), 5)
+
+    def test_confirmed_chat_candidate_becomes_adoptable_rhythm_without_extra_model_calls(self):
+        self.candidate_text = "回复最多分成两段，段间不要停顿。"
+        self.seed(feedback=self.candidate_text)
+        candidate_id = self.generate()
+        source = "learned-" + candidate_id
+        learning_before = self.learning_bytes()
+        memory_before = self.memory()
+        self.run_eve(self.send(self.message("unconfirmed-advice", "/segment suggestions",
+                                            contains="没有可采用的节奏建议")), segmented=True)
+        self.assertEqual(self.memory(), memory_before)
+        self.run_eve([*self.send(self.message("confirm-rhythm", "/accept-memory " + candidate_id,
+                                             contains="候选偏好已确认：")),
+                      *self.send(self.message("confirmed-advice", "/segment suggestions",
+                                             contains=[source, "第 1 版", "最多 2 段", "停顿 0%", "查看不改变设置"]))],
+                     segmented=True)
+        self.assertNotIn("eve.segment.preferences", self.documents())
+        self.assertEqual(self.learning_bytes(), learning_before)
+        parts = ["可以。\n\n我们接着聊。", "我会按原文顺序发送。"]
+        text = "可以。\n\n我们接着聊。\n\n我会按原文顺序发送。"
+        delivery = {**self.message("rhythm-delivery", text), "expected_segments": parts}
+        self.run_eve([*self.send(self.message("adopt-rhythm", f"/segment adopt {source} 1", contains="已采用偏好")),
+                      {"send": delivery}, self.wait_receipt("rhythm-delivery")], segmented=True)
+        sent = [event for event in self.events if event["direction"] == "out" and event["type"] == "segment"]
+        self.assertEqual([event["text"] for event in sent], parts)
+        self.assertEqual(self.receipt("rhythm-delivery")["reply"], text)
+        self.assertEqual(self.learning_bytes(), learning_before)
+        self.assertEqual(len(self.learning_requests()), 1)
+        self.assertEqual(len(self.chat_requests()), 4)
 
     def assert_reserved_before_request(self, request):
         body = request["body"]

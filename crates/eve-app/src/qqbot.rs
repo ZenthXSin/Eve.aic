@@ -6,8 +6,10 @@ use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
 use eve_config_api::{CONFIG_SERVICE_ID, ConfigServiceHandle};
 use eve_kernel::{Kernel, KernelServices};
-use eve_learning_api::{LEARNING_PLUGIN_ID, LearningAdmin, LearningOptions, PreferenceExtractor};
-use eve_learning_plugin::{LearningPlugin, ModelPreferenceExtractor};
+use eve_learning_api::{
+    AutoConfirmationPolicy, LEARNING_PLUGIN_ID, LearningAdmin, LearningOptions, PreferenceExtractor,
+};
+use eve_learning_plugin::{EvidenceConfirmationPolicy, LearningPlugin, ModelPreferenceExtractor};
 use eve_llm_api::ContextAssembler;
 use eve_memory_api::{MEMORY_PLUGIN_ID, MemoryAdmin};
 use eve_memory_plugin::{MemoryContext, MemoryPlugin};
@@ -20,7 +22,7 @@ use eve_qqbot_plugin::{
 };
 use eve_segment_api::SegmentPreferences;
 use eve_segment_plugin::{
-    ParagraphPlanner, SEGMENT_PREFERENCES_PLUGIN_ID, SegmentPreferencePlugin,
+    ParagraphPlanner, RuleSegmentAdvisor, SEGMENT_PREFERENCES_PLUGIN_ID, SegmentPreferencePlugin,
 };
 use eve_session_api::{SESSION_SERVICE_ID, SessionServiceHandle};
 use eve_training_api::{TRAINING_PLUGIN_ID, TRAINING_SERVICE_ID, TrainingServiceHandle};
@@ -29,7 +31,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-learning] [--segmented] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-learning] [--self-learning] [--segmented] [--learning-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -37,11 +39,14 @@ QQ 普通文字排队开始新轮；逐行 /add 内容、/correct 内容、/canc
 --training 默认开启主动提问；/train start、/train stop、/train status 按会话启停/查询。
 --cognition 开启本地内生反思；/goal 内容保存待办，/goals 查看待办，/mind [目标ID] 查询草稿。
 --memory 开启有来源的交互记忆；/remember 内容、/memories [页码]、/correct-memory ID 内容、/forget ID。
---memory-learning 需同时 --memory；每会话至少 3 条新经历触发首批，后续间隔 5 分钟，单次启动最多 4 次请求。
-/memory-candidates [页码] 查看候选，/accept-memory ID 明确确认后才进入聊天偏好；默认不启用。
+--memory-learning 需同时 --memory；每会话至少 3 条新经历触发首批，后续默认间隔 5 分钟（--learning-cooldown-ms 可调整），单次启动最多 4 次请求。
+--self-learning 开启持续自主学习（同时开启记忆、提炼和分段）；模型自评至少 80 且引用至少两条真实交互时自动确认。
+/self-learning status 查看模式、已关联候选与容量；自动节奏跟随有效偏好，手动设置优先；/segment reset 清除手动设置并恢复跟随学习。
+/memory-candidates [页码] 查看候选；普通提炼模式用 /accept-memory ID 确认，自主模式按策略自动确认。
 明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
 --segmented 把模型回复按自然段分成至多 3 条消息，段间停顿至多 2.5 秒；命令确认整条发送。
 /segment 查看本会话分段；/segment on|off|reset、/segment parts 2至5、/segment pace 0至200（%）按会话保存，从下一条回复生效。
+/segment suggestions [页码] 从本会话已确认偏好查看节奏建议；/segment adopt 偏好ID 版本 明确采用，需同时 --memory 与 --segmented。
 分段前重新核对当前代：/cancel、/add、/correct 后不再发送剩余片段；已发片段不撤回、重启不补发。
 反思默认关闭，每次启动最多执行 32 项；每项一次模型请求、零工具，草稿不代表父目标完成。
 修订先取消并等待；已有工具操作时只澄清，/new 内容明确开始独立任务。
@@ -59,6 +64,8 @@ pub struct QqBotOptions {
     pub cognition: bool,
     pub memory: bool,
     pub memory_learning: bool,
+    pub self_learning: bool,
+    pub learning_options: LearningOptions,
     pub segmented: bool,
     pub cognition_max_executions: u16,
 }
@@ -75,6 +82,8 @@ impl Default for QqBotOptions {
             cognition: false,
             memory: false,
             memory_learning: false,
+            self_learning: false,
+            learning_options: LearningOptions::default(),
             segmented: false,
             cognition_max_executions: 32,
         }
@@ -108,6 +117,10 @@ impl QqBotOptions {
                 options.segmented = true;
                 continue;
             }
+            if arg == "--self-learning" {
+                options.self_learning = true;
+                continue;
+            }
             let value = args.next().ok_or("QQBot 参数缺少值")?;
             if value.is_empty() {
                 return Err("QQBot 参数值不能为空".into());
@@ -126,8 +139,20 @@ impl QqBotOptions {
                         .filter(|value| (1..=32).contains(value))
                         .ok_or("认知执行上限必须为 1 至 32 的整数")?;
                 }
+                Some("--learning-cooldown-ms") => {
+                    options.learning_options.cooldown_ms = value
+                        .to_str()
+                        .and_then(|v| v.parse().ok())
+                        .filter(|v| *v <= 86_400_000)
+                        .ok_or("提炼间隔必须为 0 至 86400000 的毫秒整数")?;
+                }
                 _ => return Err("未知 QQBot 参数；使用 --help".into()),
             }
+        }
+        if options.self_learning {
+            options.memory = true;
+            options.memory_learning = true;
+            options.segmented = true;
         }
         if options.memory_learning && !options.memory {
             return Err("--memory-learning 需要同时开启 --memory".into());
@@ -168,9 +193,25 @@ pub async fn run_qqbot_with_components(
     factory: Arc<dyn EndogenousPlannerFactory>,
     extractor: Option<Arc<dyn PreferenceExtractor>>,
 ) -> Result<QqBotStatus, AppError> {
+    run_qqbot_with_learning_policy(options, factory, extractor, None).await
+}
+
+/// 受信宿主替换自动确认策略；只有 --self-learning 启用时调用。
+pub async fn run_qqbot_with_learning_policy(
+    mut options: QqBotOptions,
+    factory: Arc<dyn EndogenousPlannerFactory>,
+    extractor: Option<Arc<dyn PreferenceExtractor>>,
+    confirmation: Option<Arc<dyn AutoConfirmationPolicy>>,
+) -> Result<QqBotStatus, AppError> {
+    if options.self_learning {
+        options.memory = true;
+        options.memory_learning = true;
+        options.segmented = true;
+    }
     if options.memory_learning && !options.memory {
         return Err("--memory-learning 需要同时开启 --memory".into());
     }
+    options.learning_options.validate()?;
     if !(1..=32).contains(&options.cognition_max_executions) {
         return Err("认知执行上限必须为 1 至 32 的整数".into());
     }
@@ -257,7 +298,12 @@ pub async fn run_qqbot_with_components(
             None
         };
         bootstrap.context = Some(if let Some(memory) = &memory {
-            Arc::new(MemoryContext::new("qq", memory.clone(), context)?)
+            let context = MemoryContext::new("qq", memory.clone(), context)?;
+            Arc::new(if options.self_learning {
+                context.prefer_recent()
+            } else {
+                context
+            })
         } else {
             context
         });
@@ -292,9 +338,18 @@ pub async fn run_qqbot_with_components(
                 memory.clone(),
                 learning.clone(),
                 extractor,
-                LearningOptions::default(),
+                options.learning_options.clone(),
+                if options.self_learning {
+                    Some(confirmation.unwrap_or_else(|| Arc::new(EvidenceConfirmationPolicy)))
+                } else {
+                    None
+                },
             )?);
-            qq_learning_commands::Commands::new(learning.clone(), memory.clone())
+            if options.self_learning {
+                qq_learning_commands::Commands::autonomous(learning.clone(), memory.clone())
+            } else {
+                qq_learning_commands::Commands::new(learning.clone(), memory.clone())
+            }
         } else {
             qq_learning_commands::Commands::disabled()
         };
@@ -318,11 +373,29 @@ pub async fn run_qqbot_with_components(
             .map_or_else(qq_memory::Commands::disabled, |memory| {
                 qq_memory::Commands::new(memory.clone())
             });
-        let segment_commands = segment_preferences
-            .clone()
-            .map_or_else(segment_commands::QqCommands::disabled, |store| {
-                segment_commands::QqCommands::new(store, QQ_SEGMENT_POLICY)
-            });
+        let segment_preferences = if options.self_learning {
+            Some(Arc::new(crate::segment_advice::AutomaticPreferences {
+                manual: segment_preferences.ok_or("自主学习缺少分段设置")?,
+                memory: memory.clone().ok_or("自主学习缺少记忆")?,
+                advisor: Arc::new(RuleSegmentAdvisor),
+                policy: QQ_SEGMENT_POLICY,
+            }) as Arc<dyn SegmentPreferences>)
+        } else {
+            segment_preferences
+        };
+        let segment_commands = segment_preferences.clone().map_or_else(
+            segment_commands::QqCommands::disabled,
+            |store| match &memory {
+                Some(memory) => segment_commands::QqCommands::new_with_advice(
+                    store,
+                    QQ_SEGMENT_POLICY,
+                    memory.clone(),
+                    Arc::new(RuleSegmentAdvisor),
+                    options.self_learning,
+                ),
+                None => segment_commands::QqCommands::new(store, QQ_SEGMENT_POLICY),
+            },
+        );
         let mut plugin = plugin.with_command_handler(Arc::new(CommandHandlers(vec![
             commands,
             memory_commands,
@@ -489,6 +562,36 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<QqBotOptions, AppError> {
         Ok(QqBotOptions::parse(args.iter().map(OsString::from))?.unwrap())
+    }
+
+    #[test]
+    fn autonomous_learning_is_explicit_and_composes_required_capabilities() {
+        assert!(!parse(&[]).unwrap().self_learning);
+        for cooldown in ["0", "86400000"] {
+            assert_eq!(
+                parse(&["--self-learning", "--learning-cooldown-ms", cooldown])
+                    .unwrap()
+                    .learning_options
+                    .cooldown_ms,
+                cooldown.parse::<u64>().unwrap()
+            );
+        }
+        for cooldown in ["-1", "86400001", "bad"] {
+            assert!(parse(&["--learning-cooldown-ms", cooldown]).is_err());
+        }
+        for args in [
+            vec!["--self-learning"],
+            vec!["--memory-learning", "--self-learning"],
+        ] {
+            let options = parse(&args).unwrap();
+            assert!(
+                options.self_learning
+                    && options.memory
+                    && options.memory_learning
+                    && options.segmented
+            );
+            assert!(!options.cognition && !options.training);
+        }
     }
 
     #[test]

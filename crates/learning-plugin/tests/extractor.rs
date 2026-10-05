@@ -113,7 +113,7 @@ fn batch() -> LearningBatch {
             session_id: "app-01-group-02-user-03".into(),
             user_id: "user-03".into(),
         },
-        extractor_version: "preference-extractor:v1".into(),
+        extractor_version: "preference-extractor:v2".into(),
         started_at_ms: 500,
         evidence: vec![evidence(1), evidence(2), evidence(3)],
     }

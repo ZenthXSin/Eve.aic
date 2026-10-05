@@ -1002,6 +1002,22 @@ fn segment_preferences(root: &Path) -> Option<Value> {
 const OFF: &str = "已关闭本会话分段：下一条回复起整条发送；发送 /segment on 可重新开启。";
 
 #[tokio::test]
+async fn qq_advice_commands_on_console_do_not_reach_the_model_or_write_settings() {
+    let root = fixture();
+    let mut server = Server::start(vec![]).await;
+    let output = run(
+        segmented(root.path(), &server.url),
+        "/segment suggestions\n/segment adopt missing 1\n/quit\n",
+    )
+    .await;
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(text.matches("节奏建议当前由 QQ 的交互记忆提供").count(), 2);
+    assert!(server.requests.try_recv().is_err());
+    assert!(segment_preferences(root.path()).is_none());
+}
+
+#[tokio::test]
 async fn segment_settings_are_local_persist_per_session_and_apply_from_next_reply() {
     let root = fixture();
     let mut server = Server::start(

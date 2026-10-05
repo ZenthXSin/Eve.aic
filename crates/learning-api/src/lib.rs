@@ -1,4 +1,4 @@
-//! 有来源的偏好候选；候选不等于用户确认，不直接修改 Memory 或 Context。
+//! 有来源的偏好候选；候选不等于用户确认；宿主显式启用自主模式后，可由受限策略确认。
 use eve_memory_api::{InteractionEvidence, MemoryError, MemoryScope, MemorySnapshot};
 use serde::{Deserialize, Serialize};
 use std::{fmt, future::Future, pin::Pin};
@@ -132,7 +132,19 @@ pub trait PreferenceExtractor: Send + Sync {
     fn version(&self) -> &str;
     fn extract(&self, batch: LearningBatch) -> LearningFuture<'_, Vec<CandidateDraft>>;
 }
-/// 固定跨插件关联键；实际确认来源仍保存真实用户 /accept-memory 命令。
+/// 用户已在宿主启用自主学习时使用的可替换自动确认策略。
+/// 纯判断，不持有写能力；候选、批次和当前记忆均由可信宿主绑定到同一范围。
+/// 返回允许不代表提交成功，也不授予工具、身份合并或自改代码能力。
+pub trait AutoConfirmationPolicy: Send + Sync {
+    fn allows(
+        &self,
+        candidate: &PreferenceCandidate,
+        batch: &LearningBatch,
+        memory: &MemorySnapshot,
+        now_ms: u64,
+    ) -> LearningResult<bool>;
+}
+/// 固定跨插件关联键；实际确认来源保存真实用户命令，或自主模式下所引用的完成交互。
 pub fn preference_id(candidate_id: &str) -> String {
     format!("learned-{candidate_id}")
 }

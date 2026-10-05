@@ -80,6 +80,8 @@ pub enum SegmentChange {
     Enabled(bool),
     MaxSegments(usize),
     PausePercent(u16),
+    /// 用户明确采用的建议；只替换 Some 字段，所有字段在一次提交中应用。
+    Patch(SegmentPreference),
     Reset,
 }
 impl SegmentPreference {
@@ -113,6 +115,14 @@ impl SegmentPreference {
                 ..self
             },
             SegmentChange::Reset => Self::default(),
+            SegmentChange::Patch(patch) => {
+                patch.validate()?;
+                Self {
+                    enabled: patch.enabled.or(self.enabled),
+                    max_segments: patch.max_segments.or(self.max_segments),
+                    pause_percent: patch.pause_percent.or(self.pause_percent),
+                }
+            }
         };
         next.validate()?;
         Ok(next)
@@ -174,7 +184,8 @@ pub struct EffectiveSegmentation {
 }
 
 /// 可信宿主持有的会话分段设置。不得发布到通用服务目录或交给模型、不受信插件。
-/// 只保存用户明确命令；不从自然语言、记忆偏好或模型输出推断。
+/// 持久设置保存用户明确选择；宿主自主模式可用只读适配器叠加学习节奏，
+/// 保持来源撤销可见和手动选择优先，建议器本身不持有写能力。
 pub trait SegmentPreferences: Send + Sync {
     /// 未设置时返回 `SegmentPreference::default()`。
     fn get(&self, scope: &SegmentScope) -> SegmentPreferenceResult<SegmentPreference>;

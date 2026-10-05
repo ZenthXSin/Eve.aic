@@ -1,8 +1,8 @@
 //! 宿主低频扫描已保存经历，持久化准入后才调用受限提炼器。
 use crate::AppError;
 use eve_learning_api::{
-    LearningAdmin, LearningError, LearningFailure, LearningOptions, LearningOutcome,
-    PreferenceExtractor,
+    AutoConfirmationPolicy, LearningAdmin, LearningError, LearningFailure, LearningOptions,
+    LearningOutcome, PreferenceExtractor,
 };
 use eve_memory_api::MemoryAdmin;
 use std::{
@@ -29,6 +29,7 @@ impl Background {
         learning: Arc<dyn LearningAdmin>,
         extractor: Arc<dyn PreferenceExtractor>,
         options: LearningOptions,
+        confirmation: Option<Arc<dyn AutoConfirmationPolicy>>,
     ) -> Result<Self, AppError> {
         options.validate()?;
         let (active, activated) = watch::channel(false);
@@ -36,7 +37,16 @@ impl Background {
         let (finished_sender, finished) = watch::channel(false);
         let task = tokio::spawn(async move {
             // Sender 在 panic 时也释放，宿主将关闭通道，避免假装后台仍正常。
-            let result = run(memory, learning, extractor, options, activated, stopped).await;
+            let result = run(
+                memory,
+                learning,
+                extractor,
+                options,
+                confirmation,
+                activated,
+                stopped,
+            )
+            .await;
             let _ = finished_sender.send(true);
             result
         });
@@ -75,6 +85,7 @@ async fn run(
     learning: Arc<dyn LearningAdmin>,
     extractor: Arc<dyn PreferenceExtractor>,
     options: LearningOptions,
+    confirmation: Option<Arc<dyn AutoConfirmationPolicy>>,
     mut active: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
 ) -> Result<(), AppError> {
@@ -92,6 +103,30 @@ async fn run(
     loop {
         if *stopped.borrow() {
             return Ok(());
+        }
+        // 自主模式按持久化冷却持续接收新证据；总容量仍由 Learning 插件限制。
+        if let Some(policy) = &confirmation {
+            remaining = options.max_executions;
+            let mut scopes = memory.scopes()?;
+            if scopes.len() > eve_memory_api::MAX_EVIDENCE {
+                return Err("自主学习范围超过上限".into());
+            }
+            scopes.sort();
+            scopes.dedup();
+            for scope in scopes {
+                if *stopped.borrow() {
+                    return Ok(());
+                }
+                if scope.channel == "qq" {
+                    crate::qq_learning_commands::auto_confirm(
+                        memory.as_ref(),
+                        learning.as_ref(),
+                        policy.as_ref(),
+                        &scope,
+                        now_ms()?,
+                    )?;
+                }
+            }
         }
         if remaining > 0 {
             let mut scopes = memory.scopes()?;
