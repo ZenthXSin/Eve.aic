@@ -225,22 +225,25 @@ pub trait SegmentPlanner: Send + Sync {
 pub const FALLBACK_PLANNER: &str = "single";
 
 /// 组合层入口：规划失败、panic 或计划无效时降级为整条回复，并返回原因供告警。
-/// 只有回复本身无效时返回错误。
+/// 回复或预算无效、或者规划失败且整条回复也无法满足单段预算时返回错误。
 pub fn plan_or_single(
     planner: &dyn SegmentPlanner,
     text: &str,
     limits: SegmentLimits,
 ) -> SegmentResult<(SegmentPlan, Option<SegmentError>)> {
     limits.validate()?;
-    let fallback = SegmentPlan::single(FALLBACK_PLANNER, text)?;
-    fallback.validate(text, &limits)?;
+    validate_text(text)?;
     let request = SegmentRequest { text, limits };
     let planned = catch_unwind(AssertUnwindSafe(|| planner.plan(&request)))
         .unwrap_or_else(|_| Err(SegmentError::Planner("规划器 panic".into())))
         .and_then(|plan| plan.validate(text, &limits).map(|()| plan));
     Ok(match planned {
         Ok(plan) => (plan, None),
-        Err(error) => (fallback, Some(error)),
+        Err(error) => {
+            let fallback = SegmentPlan::single(FALLBACK_PLANNER, text)?;
+            fallback.validate(text, &limits)?;
+            (fallback, Some(error))
+        }
     })
 }
 
@@ -394,6 +397,39 @@ mod tests {
         fn plan(&self, _: &SegmentRequest<'_>) -> SegmentResult<SegmentPlan> {
             panic!("planner bug")
         }
+    }
+
+    #[test]
+    fn composition_accepts_valid_parts_when_the_whole_reply_exceeds_one_part_budget() {
+        let text = "第一段。\n\n第二段。";
+        let second = text.find("第二段").unwrap();
+        let limits = SegmentLimits {
+            max_segments: 2,
+            max_segment_bytes: "第一段。".len(),
+            max_pause_ms: 1000,
+        };
+        let good = plan(&[(0, "第一段。".len(), 0), (second, text.len(), 300)]);
+        good.validate(text, &limits).unwrap();
+        let (planned, warning) = plan_or_single(&Fixed(Ok(good.clone())), text, limits).unwrap();
+        assert_eq!((planned, warning), (good, None));
+    }
+
+    #[test]
+    fn failed_planner_cannot_fall_back_to_a_reply_that_exceeds_the_part_budget() {
+        let text = "第一段。\n\n第二段。";
+        let limits = SegmentLimits {
+            max_segments: 2,
+            max_segment_bytes: "第一段。".len(),
+            max_pause_ms: 1000,
+        };
+        assert_eq!(
+            plan_or_single(
+                &Fixed(Err(SegmentError::Planner("down".into()))),
+                text,
+                limits
+            ),
+            Err(SegmentError::InvalidPlan("单段超过字节预算"))
+        );
     }
 
     #[test]
