@@ -95,6 +95,31 @@ fn statement(operation: &str, evidence: &str, id: &str, text: &str) -> Preferenc
 }
 
 #[tokio::test]
+async fn host_scope_enumeration_only_returns_durable_scopes_without_creating_or_writing() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = RecordingStore::open(directory.path());
+    let (kernel, admin, _) = open(store.clone()).await;
+    assert!(admin.scopes().unwrap().is_empty());
+    let first = scope("one", "alice");
+    let second = scope("two", "bob");
+    admin.reader(first.clone()).unwrap().snapshot().unwrap();
+    assert!(admin.scopes().unwrap().is_empty());
+    admin
+        .update_preference(&first, 0, statement("op-one", "e-one", "p-one", "简洁"))
+        .unwrap();
+    admin
+        .update_preference(&second, 0, statement("op-two", "e-two", "p-two", "详细"))
+        .unwrap();
+    let writes = store.writes();
+    let mut scopes = admin.scopes().unwrap();
+    scopes.sort();
+    assert_eq!(scopes, vec![first, second]);
+    assert_eq!(store.writes(), writes);
+    kernel.stop_all().await.unwrap();
+    assert!(matches!(admin.scopes(), Err(MemoryError::Unavailable)));
+}
+
+#[tokio::test]
 async fn completed_evidence_preserves_exact_user_and_final_reply_with_zero_write_replay() {
     let directory = tempfile::tempdir().unwrap();
     let store = RecordingStore::open(directory.path());

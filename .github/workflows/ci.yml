@@ -54,6 +54,17 @@ jobs:
             if ($attempt -gt 1 -and $bytes -cne $before) { throw "只读恢复改写交互记忆" }
             $before = $bytes
           }
+      - name: 验证偏好提炼三次独立进程恢复
+        run: |
+          $learningDirectory = Join-Path $env:RUNNER_TEMP "eve-learning-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $before = ""
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            cargo run -p eve-learning-plugin --example recovery --locked -- $learningDirectory
+            if ($LASTEXITCODE -ne 0) { throw "偏好提炼恢复进程失败" }
+            $bytes = [System.IO.File]::ReadAllText((Join-Path $learningDirectory "state.json"))
+            if ($attempt -eq 3 -and $bytes -cne $before) { throw "已恢复的偏好提炼状态被重写" }
+            $before = $bytes
+          }
       - name: 验证核心入口帮助
         run: cargo run -p eve-app --locked -- --help
       - name: 验证内生反思入口帮助

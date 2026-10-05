@@ -1,10 +1,13 @@
 use crate::{
-    AppError, AppFailure, core_bootstrap, finish_core, install_core, qq_cognition, qq_memory,
-    qq_memory_observer,
+    AppError, AppFailure, core_bootstrap, finish_core, install_core, qq_cognition, qq_learning,
+    qq_learning_commands, qq_memory, qq_memory_observer,
 };
 use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
+use eve_config_api::{CONFIG_SERVICE_ID, ConfigServiceHandle};
 use eve_kernel::{Kernel, KernelServices};
+use eve_learning_api::{LEARNING_PLUGIN_ID, LearningAdmin, LearningOptions, PreferenceExtractor};
+use eve_learning_plugin::{LearningPlugin, ModelPreferenceExtractor};
 use eve_llm_api::ContextAssembler;
 use eve_memory_api::{MEMORY_PLUGIN_ID, MemoryAdmin};
 use eve_memory_plugin::{MemoryContext, MemoryPlugin};
@@ -21,7 +24,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-learning] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -29,6 +32,8 @@ QQ 普通文字排队开始新轮；逐行 /add 内容、/correct 内容、/canc
 --training 默认开启主动提问；/train start、/train stop、/train status 按会话启停/查询。
 --cognition 开启本地内生反思；/goal 内容保存待办，/goals 查看待办，/mind [目标ID] 查询草稿。
 --memory 开启有来源的交互记忆；/remember 内容、/memories [页码]、/correct-memory ID 内容、/forget ID。
+--memory-learning 需同时 --memory；每会话至少 3 条新经历触发首批，后续间隔 5 分钟，单次启动最多 4 次请求。
+/memory-candidates [页码] 查看候选，/accept-memory ID 明确确认后才进入聊天偏好；默认不启用。
 明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
 反思默认关闭，每次启动最多执行 32 项；每项一次模型请求、零工具，草稿不代表父目标完成。
 修订先取消并等待；已有工具操作时只澄清，/new 内容明确开始独立任务。
@@ -45,6 +50,7 @@ pub struct QqBotOptions {
     pub training: bool,
     pub cognition: bool,
     pub memory: bool,
+    pub memory_learning: bool,
     pub cognition_max_executions: u16,
 }
 impl Default for QqBotOptions {
@@ -59,6 +65,7 @@ impl Default for QqBotOptions {
             training: false,
             cognition: false,
             memory: false,
+            memory_learning: false,
             cognition_max_executions: 32,
         }
     }
@@ -83,6 +90,10 @@ impl QqBotOptions {
                 options.memory = true;
                 continue;
             }
+            if arg == "--memory-learning" {
+                options.memory_learning = true;
+                continue;
+            }
             let value = args.next().ok_or("QQBot 参数缺少值")?;
             if value.is_empty() {
                 return Err("QQBot 参数值不能为空".into());
@@ -103,6 +114,9 @@ impl QqBotOptions {
                 }
                 _ => return Err("未知 QQBot 参数；使用 --help".into()),
             }
+        }
+        if options.memory_learning && !options.memory {
+            return Err("--memory-learning 需要同时开启 --memory".into());
         }
         Ok(Some(options))
     }
@@ -130,6 +144,19 @@ pub async fn run_qqbot_with_planner_factory(
     options: QqBotOptions,
     factory: Arc<dyn EndogenousPlannerFactory>,
 ) -> Result<QqBotStatus, AppError> {
+    run_qqbot_with_components(options, factory, None).await
+}
+
+/// 受信宿主替换规划和偏好提炼实现。关闭提炼时不调用所传提炼器；
+/// 提炼仍受持久化准入、单次启动预算、超时与停止规则约束。
+pub async fn run_qqbot_with_components(
+    options: QqBotOptions,
+    factory: Arc<dyn EndogenousPlannerFactory>,
+    extractor: Option<Arc<dyn PreferenceExtractor>>,
+) -> Result<QqBotStatus, AppError> {
+    if options.memory_learning && !options.memory {
+        return Err("--memory-learning 需要同时开启 --memory".into());
+    }
     if !(1..=32).contains(&options.cognition_max_executions) {
         return Err("认知执行上限必须为 1 至 32 的整数".into());
     }
@@ -168,6 +195,7 @@ pub async fn run_qqbot_with_planner_factory(
         logger: backends.logger.clone(),
     });
     let mut background: Option<qq_cognition::Background> = None;
+    let mut learning_background: Option<qq_learning::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
     let result: Result<(), AppError> = async {
         kernel.register(Box::new(TrainingPlugin::new(options.training)?))?;
@@ -188,6 +216,15 @@ pub async fn run_qqbot_with_planner_factory(
             None
         };
         let context: Arc<dyn ContextAssembler> = Arc::new(TrainingContext(training.0.clone()));
+        let learning: Option<Arc<dyn LearningAdmin>> = if options.memory_learning {
+            let plugin = LearningPlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(LEARNING_PLUGIN_ID)?).await?;
+            Some(Arc::new(controller))
+        } else {
+            None
+        };
         bootstrap.context = Some(if let Some(memory) = &memory {
             Arc::new(MemoryContext::new("qq", memory.clone(), context)?)
         } else {
@@ -202,6 +239,34 @@ pub async fn run_qqbot_with_planner_factory(
             bootstrap,
         )
         .await?;
+        let learning_commands = if let (Some(learning), Some(memory)) = (&learning, &memory) {
+            let extractor = match extractor {
+                Some(extractor) => extractor,
+                None => {
+                    let settings = registry
+                        .get(&ServiceId::new(CONFIG_SERVICE_ID)?)?
+                        .ok_or("偏好提炼配置服务缺失")?
+                        .value
+                        .downcast::<ConfigServiceHandle>()
+                        .map_err(|_| "偏好提炼配置服务类型错误")?;
+                    let key = std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "缺少模型凭据")?;
+                    let resolver = Arc::new(crate::models::CoreModelResolver::new(
+                        settings.0.clone(),
+                        key,
+                    ));
+                    Arc::new(ModelPreferenceExtractor::new(resolver))
+                }
+            };
+            learning_background = Some(qq_learning::Background::start(
+                memory.clone(),
+                learning.clone(),
+                extractor,
+                LearningOptions::default(),
+            )?);
+            qq_learning_commands::Commands::new(learning.clone(), memory.clone())
+        } else {
+            qq_learning_commands::Commands::disabled()
+        };
         let commands = if options.cognition {
             let started = qq_cognition::start(
                 &kernel,
@@ -222,8 +287,11 @@ pub async fn run_qqbot_with_planner_factory(
             .map_or_else(qq_memory::Commands::disabled, |memory| {
                 qq_memory::Commands::new(memory.clone())
             });
-        let mut plugin =
-            plugin.with_command_handler(Arc::new(CommandHandlers(vec![commands, memory_commands])));
+        let mut plugin = plugin.with_command_handler(Arc::new(CommandHandlers(vec![
+            commands,
+            memory_commands,
+            learning_commands,
+        ])));
         if let Some(memory) = memory {
             let sessions = registry
                 .get(&ServiceId::new(SESSION_SERVICE_ID)?)?
@@ -250,9 +318,15 @@ pub async fn run_qqbot_with_planner_factory(
         if let Some(background) = &background {
             background.activate();
         }
+        if let Some(learning) = &learning_background {
+            learning.activate();
+        }
         wait_channel(
             handle.status.clone(),
             background.as_ref().map(qq_cognition::Background::finished),
+            learning_background
+                .as_ref()
+                .map(qq_learning::Background::finished),
         )
         .await
     }
@@ -273,8 +347,16 @@ pub async fn run_qqbot_with_planner_factory(
     if let Some(handle) = &channel {
         handle.request_stop();
     }
+    if let Some(learning) = &learning_background {
+        learning.request_stop();
+    }
     if let Some(background) = background
         && let Err(error) = background.stop().await
+    {
+        secondary.push(error);
+    }
+    if let Some(learning) = learning_background
+        && let Err(error) = learning.stop().await
     {
         secondary.push(error);
     }
@@ -336,10 +418,12 @@ async fn background_finished(mut receiver: Option<watch::Receiver<bool>>) {
 async fn wait_channel(
     mut status: watch::Receiver<QqBotStatus>,
     background: Option<watch::Receiver<bool>>,
+    learning: Option<watch::Receiver<bool>>,
 ) -> Result<(), AppError> {
     let stop = interrupted();
     let stopped_background = background_finished(background);
-    tokio::pin!(stop, stopped_background);
+    let stopped_learning = background_finished(learning);
+    tokio::pin!(stop, stopped_background, stopped_learning);
     let mut ready_announced = false;
     loop {
         if status.borrow().ready && !status.borrow().closed && !ready_announced {
@@ -352,6 +436,7 @@ async fn wait_channel(
         tokio::select! {
             biased;
             _ = &mut stopped_background => return Err("认知后台已结束；QQ 通道停止准入并保留状态".into()),
+            _ = &mut stopped_learning => return Err("偏好提炼后台已结束；QQ 通道停止准入并保留状态".into()),
             result = &mut stop => return result,
             result = status.changed() => result.map_err(|_| "QQBot 状态通知丢失")?,
         }

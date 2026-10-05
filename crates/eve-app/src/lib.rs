@@ -7,6 +7,8 @@ mod error;
 mod input;
 mod models;
 mod qq_cognition;
+mod qq_learning;
+mod qq_learning_commands;
 mod qq_memory;
 mod qq_memory_observer;
 mod qqbot;
@@ -18,7 +20,9 @@ pub use cognition::{
 };
 pub use console::{ChatOutputError, ChatRunError};
 pub use error::AppFailure;
-pub use qqbot::{QQBOT_HELP, QqBotOptions, run_qqbot, run_qqbot_with_planner_factory};
+pub use qqbot::{
+    QQBOT_HELP, QqBotOptions, run_qqbot, run_qqbot_with_components, run_qqbot_with_planner_factory,
+};
 
 use eve_agent_prompt::FileAgentPrompt;
 use eve_config_api::{

@@ -29,6 +29,9 @@ impl MemoryController {
     }
 }
 impl MemoryAdmin for MemoryController {
+    fn scopes(&self) -> MemoryResult<Vec<MemoryScope>> {
+        self.service()?.scopes()
+    }
     fn reader(&self, scope: MemoryScope) -> MemoryResult<Arc<dyn MemoryService>> {
         scope.validate()?;
         let stored = self.service()?;

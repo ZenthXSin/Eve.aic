@@ -1,0 +1,22 @@
+[package]
+name = "eve-learning-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-learning-api = { path = "../learning-api" }
+eve-memory-api = { path = "../memory-api" }
+eve-plugin-api = { path = "../plugin-api" }
+eve-llm-api = { path = "../llm-api" }
+serde.workspace = true
+serde_json.workspace = true
+ring.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+eve-kernel = { path = "../kernel" }
+eve-memory-plugin = { path = "../memory-plugin" }
+eve-session-api = { path = "../session-api" }
+tempfile.workspace = true

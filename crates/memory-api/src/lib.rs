@@ -145,6 +145,11 @@ pub struct MemoryServiceHandle(pub Arc<dyn MemoryService>);
 
 /// 宿主专用管理能力，不得发布到通用目录或传给模型/非可信通道。
 pub trait MemoryAdmin: Send + Sync {
+    /// 可信宿主枚举已持久保存的范围，用于低频扫描；默认实现明确不支持。
+    /// 不向通用服务目录或模型暴露此管理能力。
+    fn scopes(&self) -> MemoryResult<Vec<MemoryScope>> {
+        Err(MemoryError::Unavailable)
+    }
     fn reader(&self, scope: MemoryScope) -> MemoryResult<Arc<dyn MemoryService>>;
     /// 相同来源重导入先于 CAS 判断，零写入、零修订；时间变化不算新来源。
     /// 不同正文占用同一 ID，或其他 ID 占用已有 message_id/完成轮次，均拒绝。
