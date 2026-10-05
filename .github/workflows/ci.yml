@@ -43,6 +43,17 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: 运行测试与文档测试
         run: cargo test --workspace --locked
+      - name: 验证交互记忆三次独立进程恢复
+        run: |
+          $memoryDirectory = Join-Path $env:RUNNER_TEMP "eve-memory-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $before = ""
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            cargo run -p eve-memory-plugin --example recovery --locked -- $memoryDirectory
+            if ($LASTEXITCODE -ne 0) { throw "交互记忆恢复进程失败" }
+            $bytes = [System.IO.File]::ReadAllText((Join-Path $memoryDirectory "state.json"))
+            if ($attempt -gt 1 -and $bytes -cne $before) { throw "只读恢复改写交互记忆" }
+            $before = $bytes
+          }
       - name: 验证核心入口帮助
         run: cargo run -p eve-app --locked -- --help
       - name: 验证内生反思入口帮助

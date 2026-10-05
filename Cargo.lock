@@ -210,6 +210,8 @@ dependencies = [
  "eve-kernel",
  "eve-llm-api",
  "eve-llm-openai",
+ "eve-memory-api",
+ "eve-memory-plugin",
  "eve-message-api",
  "eve-message-plugin",
  "eve-plugin-api",
