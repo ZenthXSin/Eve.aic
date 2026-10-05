@@ -440,15 +440,25 @@ pub(crate) async fn run(
                     finish(&mut stdin, &reply.message.id).await?;
                     continue;
                 }
-                // 只分段已完成的模型回复；规划失败或计划无效时整条发送。
+                // 只分段已完成的模型回复；规划失败时仅在整条也符合预算时降级。
                 let plan = match (&segmentation, &reply.guard) {
                     (Some(segmentation), ReplyGuard::Completed(_)) => {
                         match eve_segment_api::plan_or_single(segmentation.planner.as_ref(), &reply.text, segmentation.limits) {
                             Ok((plan, warning)) => {
                                 if warning.is_some() { warn(&ctx, "segment_plan_fallback"); }
-                                Some(plan).filter(|plan| plan.segments.len() > 1)
+                                Some(plan)
                             }
-                            Err(_) => { warn(&ctx, "segment_plan_unavailable"); None }
+                            Err(_) => {
+                                // Session 的完成事实不变，完整回复仍留在失败回执中；
+                                // 不绕过宿主预算发送，也不形成已送达的交互证据。
+                                let index = ledger.find(&config.app_id, &reply.message.id).expect("inserted receipt");
+                                ledger.entries[index].reply = Some(reply.text.clone());
+                                mark_failed(&mut ledger, &ctx, &config.app_id, &reply.message.id)?;
+                                status.send_modify(|s| s.failed += 1);
+                                warn(&ctx, "segment_plan_unavailable");
+                                finish(&mut stdin, &reply.message.id).await?;
+                                continue;
+                            }
                         }
                     }
                     _ => None,
@@ -456,6 +466,9 @@ pub(crate) async fn run(
                 let index = ledger.find(&config.app_id, &reply.message.id).expect("inserted receipt");
                 ledger.entries[index].state = ReceiptState::ReplyPending;
                 ledger.entries[index].reply = Some(reply.text.clone());
+                // 单段也必须使用校验过的切片；首尾空白不能让实际投递超出预算。
+                let single = plan.as_ref().filter(|p| p.segments.len() == 1).map(|p| p.segments[0]);
+                let plan = plan.filter(|p| p.segments.len() > 1);
                 let pauses: Vec<u64> = plan.as_ref().map_or_else(Vec::new, |plan| plan.segments.iter().map(|s| s.pause_before_ms).collect());
                 ledger.entries[index].segments = plan.map(|plan| Segments {
                     planner: plan.planner,
@@ -473,7 +486,8 @@ pub(crate) async fn run(
                     continue;
                 }
                 let frame = if pauses.is_empty() {
-                    json!({"type":"reply","version":1,"id":reply.message.id,"text":reply.text})
+                    let text = single.map_or(reply.text.as_str(), |s| &reply.text[s.start..s.end]);
+                    json!({"type":"reply","version":1,"id":reply.message.id,"text":text})
                 } else {
                     segment_frame(&ledger, index, 0)
                 };

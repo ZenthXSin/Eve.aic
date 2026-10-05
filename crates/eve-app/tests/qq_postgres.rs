@@ -928,6 +928,275 @@ async fn sql_learning_requires_confirmation_and_does_not_replay(
     }
 }
 
+fn receipt(saved: &[StoredRow], id: &str) -> Value {
+    document(saved, QQBOT_PLUGIN_ID, "receipts.v1")["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["message"]["id"] == id)
+        .expect("SQL 回执缺失")
+        .clone()
+}
+
+fn interaction_evidence(saved: &[StoredRow]) -> Vec<Value> {
+    document(saved, "eve.memory", "memory.v1")["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|scope| scope["snapshot"]["evidence"].as_array().unwrap())
+        .filter(|evidence| evidence["source"]["kind"] == "CompletedInteraction")
+        .cloned()
+        .collect()
+}
+
+fn segment_script(root: &Path, steps: Vec<Value>) {
+    let events = root.join("sql-segment-events.jsonl");
+    let error = root.join("sql-segment-error.txt");
+    for path in [&events, &error] {
+        if path.exists() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    std::fs::write(
+        root.join("scenario.json"),
+        serde_json::to_vec(&json!({
+            "script":steps, "events_file":events, "error_file":error
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn segment_events(root: &Path) -> Vec<Value> {
+    let error = root.join("sql-segment-error.txt");
+    assert!(
+        !error.exists(),
+        "{}",
+        std::fs::read_to_string(error).unwrap_or_default()
+    );
+    std::fs::read_to_string(root.join("sql-segment-events.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &Value| event["direction"] == "out")
+        .collect()
+}
+
+fn assert_sql_parts(entry: &Value, text: &str, parts: &[&str], states: &[&str]) {
+    assert_eq!(entry["reply"], text);
+    assert_eq!(entry["segments"]["planner"], "paragraph-v2");
+    let saved = entry["segments"]["parts"].as_array().unwrap();
+    assert_eq!(saved.len(), parts.len());
+    assert_eq!(parts.len(), states.len());
+    for ((part, expected), state) in saved.iter().zip(parts).zip(states) {
+        let start = usize::try_from(part["start"].as_u64().unwrap()).unwrap();
+        let end = usize::try_from(part["end"].as_u64().unwrap()).unwrap();
+        assert_eq!(&text[start..end], *expected);
+        assert_eq!(part["state"], *state);
+    }
+}
+
+async fn sql_segmented_delivery_imports_only_fully_sent_interactions(
+    root: &Path,
+    database: &Path,
+    password: &str,
+) {
+    const COMPLETE: &str = "sql-segment-complete";
+    const FAILED: &str = "sql-segment-failed";
+    const INPUT: &str = "请按自然段给我完整回答。";
+    let parts = [
+        "可以，先给结论。",
+        "这里保留完整依据，按原文顺序发送。",
+        "最后补充下一步。",
+    ];
+    let text = parts.join("\n\n");
+    let mut server = Server::start(vec![
+        Reply::json(final_response(&text)),
+        Reply::json(final_response(&text)),
+    ])
+    .await;
+    let url = server.url.clone();
+    let enabled = || {
+        let mut command = command(Entry::Qq, root, &url, Some(database));
+        command.args(["--memory", "--segmented"]);
+        command
+    };
+    let before = rows(database);
+    let memory_before = document(&before, "eve.memory", "memory.v1");
+    let ready = root.join("sql-segment-last-awaiting-ack");
+    let release = root.join("sql-segment-release-last");
+    let finished = root.join("sql-segment-fully-imported");
+    let mut complete = message(COMPLETE, INPUT, "");
+    complete["expected_segments"] = json!(parts);
+    complete["hold_segments"] = json!([2]);
+    segment_script(
+        root,
+        vec![
+            json!({"send":complete}),
+            json!({"wait_command":{"id":COMPLETE,"type":"segment","count":3}}),
+            json!({"touch":ready}),
+            json!({"wait_file":release}),
+            json!({"deliver_segment":{"id":COMPLETE,"index":2}}),
+            json!({"wait_file":finished}),
+        ],
+    );
+    let inspect = async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("最后一段未到达等待回执检查点");
+        let pending = rows(database);
+        let entry = receipt(&pending, COMPLETE);
+        assert_eq!(entry["state"], "ReplyPending");
+        assert_sql_parts(&entry, &text, &parts, &["Sent", "Sent", "Sending"]);
+        assert_eq!(document(&pending, "eve.memory", "memory.v1"), memory_before);
+        std::fs::write(&release, b"release").unwrap();
+        wait_sql(database, |saved| {
+            receipt(saved, COMPLETE)["state"] == "Sent"
+                && interaction_evidence(saved)
+                    .iter()
+                    .any(|evidence| evidence["source"]["message_id"] == COMPLETE)
+        })
+        .await;
+        std::fs::write(&finished, b"imported").unwrap();
+    };
+    let (output, ()) = tokio::join!(Process::run(enabled(), "", password), inspect);
+    let summary = successful(output, Entry::Qq);
+    for (name, expected) in [
+        ("received", 1),
+        ("completed", 1),
+        ("sent", 1),
+        ("failed", 0),
+    ] {
+        assert_eq!(summary[name], expected);
+    }
+    assert!(!has_training(&server.next().await.body));
+    let complete_rows = rows(database);
+    assert_eq!(
+        document(&complete_rows, QQBOT_PLUGIN_ID, "receipts.v1")["version"],
+        2
+    );
+    let entry = receipt(&complete_rows, COMPLETE);
+    assert_eq!(entry["state"], "Sent");
+    assert_sql_parts(&entry, &text, &parts, &["Sent", "Sent", "Sent"]);
+    let interactions = interaction_evidence(&complete_rows);
+    assert_eq!(interactions.len(), interaction_evidence(&before).len() + 1);
+    let imported: Vec<_> = interactions
+        .iter()
+        .filter(|evidence| evidence["source"]["message_id"] == COMPLETE)
+        .collect();
+    assert_eq!(imported.len(), 1);
+    assert_eq!(imported[0]["source"]["user_text"], INPUT);
+    assert_eq!(imported[0]["source"]["assistant_text"], text);
+    let events = segment_events(root);
+    assert_eq!(events.len(), 3);
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(event["type"], "segment");
+        assert_eq!(event["index"], index);
+        assert_eq!(event["count"], 3);
+        assert_eq!(event["text"], parts[index]);
+    }
+
+    let memory_complete = document(&complete_rows, "eve.memory", "memory.v1");
+    let failure_saved = root.join("sql-segment-failure-saved");
+    let mut failing = message(FAILED, "这次第二段无法送达。", "");
+    failing["expected_segments"] = json!(parts);
+    failing["fail_segment"] = json!(1);
+    segment_script(
+        root,
+        vec![
+            json!({"send":failing}),
+            json!({"wait_command":{"id":FAILED,"type":"segment","count":2}}),
+            json!({"wait_file":failure_saved}),
+        ],
+    );
+    let inspect = async {
+        wait_sql(database, |saved| {
+            document(saved, QQBOT_PLUGIN_ID, "receipts.v1")["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["message"]["id"] == FAILED && entry["state"] == "Failed")
+        })
+        .await;
+        std::fs::write(&failure_saved, b"failed").unwrap();
+    };
+    let (output, ()) = tokio::join!(Process::run(enabled(), "", password), inspect);
+    let summary = successful(output, Entry::Qq);
+    for (name, expected) in [
+        ("received", 1),
+        ("completed", 1),
+        ("sent", 0),
+        ("failed", 1),
+    ] {
+        assert_eq!(summary[name], expected);
+    }
+    assert!(!has_training(&server.next().await.body));
+    assert!(server.requests.try_recv().is_err());
+    let failed_rows = rows(database);
+    let entry = receipt(&failed_rows, FAILED);
+    assert_eq!(entry["state"], "Failed");
+    assert_sql_parts(&entry, &text, &parts, &["Sent", "Failed", "Skipped"]);
+    assert_eq!(
+        document(&failed_rows, "eve.memory", "memory.v1"),
+        memory_complete
+    );
+    let events = segment_events(root);
+    assert_eq!(events.len(), 2);
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(event["type"], "segment");
+        assert_eq!(event["index"], index);
+        assert_eq!(event["text"], parts[index]);
+    }
+
+    // 空启动以及平台重复投递都不补发片段，不重新调用模型，也不改任何 SQL 字节。
+    for repeat in [false, true] {
+        let steps = if repeat {
+            [COMPLETE, FAILED]
+                .into_iter()
+                .flat_map(|id| {
+                    let mut duplicate = message(id, "重复消息不得覆盖旧回复。", "不得回复");
+                    duplicate["expected_type"] = json!("finish");
+                    [
+                        json!({"send":duplicate}),
+                        json!({"wait_command":{"id":id,"type":"finish"}}),
+                    ]
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        segment_script(root, steps);
+        let summary = successful(Process::run(enabled(), "", password).await, Entry::Qq);
+        for name in ["received", "completed", "sent", "failed"] {
+            assert_eq!(summary[name], 0);
+        }
+        let events = segment_events(root);
+        assert_eq!(events.len(), if repeat { 2 } else { 0 });
+        assert!(events.iter().all(|event| event["type"] == "finish"));
+        assert_eq!(rows(database), failed_rows);
+        assert!(server.requests.try_recv().is_err());
+    }
+    for (namespace, key) in [
+        ("eve.learning", "learning.v1"),
+        ("eve.cognition", "cognition.v1"),
+    ] {
+        assert_eq!(
+            document(&failed_rows, namespace, key),
+            document(&before, namespace, key)
+        );
+    }
+    assert!(!root.join("state/state.json").exists());
+    for (_, _, bytes) in &failed_rows {
+        for secret in [MODEL_KEY, QQ_KEY, password] {
+            assert!(!String::from_utf8_lossy(bytes).contains(secret));
+        }
+    }
+}
+
 #[test]
 fn both_entries_parse_explicit_database_paths_and_keep_file_default() {
     let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
@@ -1237,6 +1506,12 @@ async fn sql_qq_and_console_preserve_history_training_and_receipts_without_repla
     assert_eq!(rows(&database), committed);
     sql_memory_and_cognition(root.path(), &database, &credentials.password).await;
     sql_learning_requires_confirmation_and_does_not_replay(
+        root.path(),
+        &database,
+        &credentials.password,
+    )
+    .await;
+    sql_segmented_delivery_imports_only_fully_sent_interactions(
         root.path(),
         &database,
         &credentials.password,
