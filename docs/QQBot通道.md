@@ -63,7 +63,7 @@ QQ 插件只公开同步 `QqCommandHandler` 契约，不依赖认知实现。通
 
 默认 `run_qqbot` 使用 `ReflectionPlannerFactory`；受信 Rust 宿主可通过 `run_qqbot_with_planner_factory(options, factory)` 注入公开 `EndogenousPlannerFactory`。只有显式开启认知才创建规划器；替换实现须遵守来源、权限、预算、修订去重与持久化契约。创建或规划失败不回退为默认实现；修订冲突在后续 tick 重新读取，其余异常进入统一收尾。启动阶段先装配认知与独立执行服务，成功启动 QQ 插件并取得状态句柄后才开放后台规划和执行；启动失败不趁收尾发起反思。
 
-此入口继续使用 `FileStateStore`，在指定目录保存认知、Session、训练及通道回执；没有为 QQ 接入 PostgreSQL 或自动迁移旧目录。独立数据库后端交付不改变这里的存储选择。内生驱动的范围、恢复与后续能力见[认知循环](./认知循环.md#qq-本地组合入口)；本切片尚不具备完整 AGI、目标执行或现实结果验证能力。
+此入口默认使用 `FileStateStore`；追加 `--database-config` 时，认知、Session、训练及通道回执共同使用同一个 PostgreSQL 后端，目录继续保留锁、数据库绑定与普通配置。旧目录不自动迁移，数据库提交结果不确定时不重放，见[PostgreSQL 状态](./PostgreSQL状态.md)。内生驱动的范围、恢复与后续能力见[认知循环](./认知循环.md#qq-本地组合入口)；本切片尚不具备完整 AGI、目标执行或现实结果验证能力。
 
 ## 桥接契约与兼容
 
