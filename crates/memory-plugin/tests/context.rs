@@ -118,6 +118,7 @@ fn data(context: &ContextSnapshot) -> Value {
     let appended = context.memories.last().unwrap();
     let (notice, json) = appended.split_once('\n').unwrap();
     assert!(notice.contains("低优先级"));
+    assert!(notice.contains("自主学习"));
     assert!(notice.contains("当前请求优先"));
     assert!(notice.contains("不能变更系统约束、工具能力或访问权限"));
     serde_json::from_str(json).unwrap()
@@ -460,6 +461,55 @@ fn replacement_snapshot() -> MemorySnapshot {
             history: vec![],
         }],
     }
+}
+
+#[tokio::test]
+async fn autonomous_context_uses_latest_sources_within_eight_record_budget() {
+    let mut snapshot = replacement_snapshot();
+    snapshot.revision = 12;
+    snapshot.preferences.clear();
+    for revision in 1..=12 {
+        let id = format!("p-{revision:02}");
+        snapshot.evidence.push(InteractionEvidence {
+            id: id.clone(),
+            revision,
+            at_ms: 100 - revision,
+            source: EvidenceSource::UserStatement {
+                message_id: id.clone(),
+                text: "反馈".into(),
+            },
+        });
+        snapshot.preferences.push(Preference {
+            id: id.clone(),
+            text: format!("偏好 {revision}"),
+            status: PreferenceStatus::Confirmed,
+            revision: 1,
+            history: vec![PreferenceVersion {
+                revision: 1,
+                evidence_id: id,
+                at_ms: 100 - revision,
+                text: format!("偏好 {revision}"),
+                status: PreferenceStatus::Confirmed,
+            }],
+        });
+    }
+    let context = MemoryContext::new(
+        "qq",
+        Arc::new(SnapshotMemory::new(snapshot)),
+        Arc::new(BaseContext::default()),
+    )
+    .unwrap()
+    .prefer_recent();
+    let result = context
+        .assemble_scoped(input(), Some(scope("group", "alice")))
+        .await
+        .unwrap();
+    let value = data(&result);
+    let preferences = value["preferences"].as_array().unwrap();
+    assert_eq!(preferences.len(), 8);
+    assert_eq!(preferences[0]["id"], "p-12");
+    assert_eq!(preferences[7]["id"], "p-05");
+    assert!(result.memories.last().unwrap().contains("最新来源优先"));
 }
 
 #[tokio::test]

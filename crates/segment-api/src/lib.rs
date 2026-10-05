@@ -7,6 +7,8 @@ use std::{
 };
 mod preference;
 pub use preference::*;
+mod advice;
+pub use advice::*;
 
 /// 契约硬上限；通道可以更小，例如受平台被动回复次数约束。
 pub const MAX_SEGMENTS: usize = 8;

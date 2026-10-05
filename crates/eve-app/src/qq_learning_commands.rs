@@ -1,7 +1,8 @@
 //! 用户显式确认不可变偏好候选；只读跨插件对账，确认只写一次 Memory。
 use eve_learning_api::{
-    JobStatus, LearningAdmin, LearningError, LearningSnapshot, MAX_BATCH_EVIDENCE,
-    MAX_CANDIDATE_BYTES, MAX_CANDIDATES, MAX_JOBS, PreferenceCandidate, preference_id,
+    AutoConfirmationPolicy, JobStatus, LearningAdmin, LearningError, LearningSnapshot,
+    MAX_BATCH_EVIDENCE, MAX_CANDIDATE_BYTES, MAX_CANDIDATES, MAX_JOBS, PreferenceCandidate,
+    preference_id,
 };
 use eve_memory_api::{
     EvidenceSource, MAX_TEXT_BYTES, MemoryAdmin, MemoryError, MemoryScope, MemorySnapshot,
@@ -23,16 +24,31 @@ const PAGE_SIZE: usize = 5;
 
 pub(crate) struct Commands {
     services: Option<(Arc<dyn LearningAdmin>, Arc<dyn MemoryAdmin>)>,
+    automatic: bool,
 }
 impl Commands {
     pub(crate) fn new(learning: Arc<dyn LearningAdmin>, memory: Arc<dyn MemoryAdmin>) -> Arc<Self> {
         Arc::new(Self {
             services: Some((learning, memory)),
+            automatic: false,
+        })
+    }
+
+    pub(crate) fn autonomous(
+        learning: Arc<dyn LearningAdmin>,
+        memory: Arc<dyn MemoryAdmin>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            services: Some((learning, memory)),
+            automatic: true,
         })
     }
 
     pub(crate) fn disabled() -> Arc<Self> {
-        Arc::new(Self { services: None })
+        Arc::new(Self {
+            services: None,
+            automatic: false,
+        })
     }
 
     fn execute(&self, input: &QqCommandInput<'_>, command: Command<'_>) -> PluginResult<String> {
@@ -76,6 +92,39 @@ impl Commands {
             Err(error) => return explain_memory(error),
         };
         let now_ms = now_ms()?;
+        if command == Command::Status {
+            let mut saved = 0;
+            let mut pending = 0;
+            for candidate in &candidates {
+                if confirmed(&snapshot, candidate)?.is_some() {
+                    saved += 1;
+                } else if candidate.expires_at_ms > now_ms {
+                    pending += 1;
+                }
+            }
+            return Ok(format!(
+                "自主学习：{}。本会话已关联 {saved} 条候选，仍有 {pending} 条未确认且未过期。自动门槛：模型自评至少 80、至少两条真实交互引用。/memories 查看或纠正、撤销；/segment 查看有效节奏。{}",
+                if self.automatic {
+                    "开启"
+                } else {
+                    "关闭（提炼保留手动确认）"
+                },
+                if snapshot.preferences.len() >= eve_memory_api::MAX_PREFERENCES
+                    || snapshot
+                        .preferences
+                        .iter()
+                        .map(|p| p.history.len())
+                        .sum::<usize>()
+                        >= eve_memory_api::MAX_HISTORY
+                {
+                    "本会话记忆或历史容量已满，保留候选，不自动覆盖历史。"
+                } else if learning_snapshot.jobs.len() >= MAX_JOBS {
+                    "本会话提炼容量已满，不自动删除旧批次。"
+                } else {
+                    "每范围至少 3 条新经历触发，按启动配置的冷却间隔执行；自主模式持续运行，不受四批启动额度限制。"
+                }
+            ));
+        }
         if let Command::Candidates(page) = command {
             return list(&candidates, &snapshot, page, now_ms);
         }
@@ -216,7 +265,7 @@ fn candidates<'a>(
 }
 
 /// 固定关联键不足以证明已确认，还须验证首版正文与真实用户确认来源。
-fn confirmed<'a>(
+pub(crate) fn confirmed<'a>(
     snapshot: &'a MemorySnapshot,
     candidate: &PreferenceCandidate,
 ) -> PluginResult<Option<&'a Preference>> {
@@ -248,15 +297,98 @@ fn confirmed<'a>(
         .filter(|item| item.id == first.evidence_id);
     let source = evidence.next().ok_or_else(failure)?;
     if evidence.next().is_some()
-        || !matches!(
+        || !(matches!(
             &source.source,
             EvidenceSource::UserStatement { text, .. }
                 if parse(text) == Some(Command::Accept(&candidate.id))
-        )
+        ) || (matches!(source.source, EvidenceSource::CompletedInteraction { .. })
+            && candidate.draft.evidence_ids.contains(&source.id)))
     {
         return Err(failure());
     }
     Ok(Some(preference))
+}
+
+/// 自动确认只写 Memory，使用原始完成证据；不伪造用户命令。
+/// 固定关联键使崩溃后可对账。纠正、撤销、同文偏好均不被后台覆盖或复活。
+pub(crate) fn auto_confirm(
+    memory: &dyn MemoryAdmin,
+    learning: &dyn LearningAdmin,
+    policy: &dyn AutoConfirmationPolicy,
+    scope: &MemoryScope,
+    at_ms: u64,
+) -> PluginResult<()> {
+    let jobs = learning.snapshot(scope).map_err(|_| failure())?;
+    let mut pending = candidates(&jobs, scope)?;
+    pending.reverse(); // 先确认旧证据，新的纠正具有更高来源修订。
+    for candidate in pending {
+        let snapshot = memory
+            .reader(scope.clone())
+            .and_then(|r| r.snapshot())
+            .map_err(|_| failure())?;
+        if snapshot.scope != *scope {
+            return Err(failure());
+        }
+        if confirmed(&snapshot, candidate)?.is_some()
+            || snapshot.preferences.iter().any(|p| {
+                p.text == candidate.draft.text
+                    || (p.status == PreferenceStatus::Revoked
+                        && p.history.iter().any(|h| h.text == candidate.draft.text))
+            })
+        {
+            continue;
+        }
+        let batch = jobs
+            .jobs
+            .iter()
+            .find(|j| j.batch.id == candidate.batch_id)
+            .ok_or_else(failure)?;
+        if candidate.created_at_ms > at_ms || candidate.expires_at_ms <= at_ms {
+            continue;
+        }
+        if candidate.draft.evidence_ids.iter().any(|id| {
+            let source = batch.batch.evidence.iter().find(|e| e.id == *id);
+            !snapshot
+                .evidence
+                .iter()
+                .any(|current| Some(current) == source)
+        }) {
+            return Err(failure());
+        }
+        let allowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            policy.allows(candidate, &batch.batch, &snapshot, at_ms)
+        }))
+        .map_err(|_| failure())?
+        .map_err(|_| failure())?;
+        if !allowed {
+            continue;
+        }
+        let evidence = candidate
+            .draft
+            .evidence_ids
+            .iter()
+            .filter_map(|id| snapshot.evidence.iter().find(|e| e.id == *id))
+            .max_by_key(|e| e.revision)
+            .ok_or_else(failure)?;
+        let change = PreferenceChange {
+            operation_id: preference_id(&candidate.id),
+            at_ms,
+            evidence: PreferenceEvidence::Existing(evidence.id.clone()),
+            action: PreferenceAction::Confirm {
+                id: preference_id(&candidate.id),
+                text: candidate.draft.text.clone(),
+            },
+        };
+        match memory.update_preference(scope, snapshot.revision, change) {
+            Ok(saved) if saved.scope == *scope => {
+                confirmed(&saved, candidate)?.ok_or_else(failure)?;
+            }
+            // 新一轮扫描重新核对；冲突时不覆盖并发命令，容量满保留候选供查看。
+            Err(MemoryError::StaleRevision | MemoryError::LimitReached) => return Ok(()),
+            _ => return Err(failure()),
+        }
+    }
+    Ok(())
 }
 
 fn status(preference: Option<&Preference>) -> &'static str {
@@ -315,7 +447,11 @@ fn list(
         reply.push_str(&format!(
             "\n候选 ID：{}\n状态：{}；模型自评：{}%\n首次确认有效期：{}（Unix 毫秒，{}）\n来源证据：{}\n候选正文：\n{}\n确认：/accept-memory {}",
             candidate.id,
-            status(preference),
+            if preference.is_some_and(|p| p.revision == 1 && snapshot.evidence.iter().any(|e|
+                p.history.first().is_some_and(|h| h.evidence_id == e.id)
+                    && matches!(e.source, EvidenceSource::CompletedInteraction { .. }))) {
+                "已自动保存"
+            } else { status(preference) },
             candidate.draft.confidence,
             candidate.expires_at_ms,
             expiry,
@@ -361,6 +497,7 @@ fn message_digest(input: &QqCommandInput<'_>) -> String {
 
 #[derive(Eq, PartialEq)]
 enum Command<'a> {
+    Status,
     Candidates(usize),
     Accept(&'a str),
     Help,
@@ -368,6 +505,7 @@ enum Command<'a> {
 impl fmt::Debug for Command<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::Status => "Status",
             Self::Candidates(_) => "Candidates(<redacted>)",
             Self::Accept(_) => "Accept(<redacted>)",
             Self::Help => "Help",
@@ -381,6 +519,8 @@ fn parse(text: &str) -> Option<Command<'_>> {
     let (name, tail) = text.split_at(end);
     let tail = tail.trim();
     Some(match name {
+        "/self-learning" if tail.is_empty() || tail == "status" => Command::Status,
+        "/self-learning" => Command::Help,
         "/memory-candidates" if tail.is_empty() => Command::Candidates(1),
         "/memory-candidates" => tail
             .parse::<usize>()

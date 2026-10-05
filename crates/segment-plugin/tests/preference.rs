@@ -140,6 +140,78 @@ async fn explicit_settings_persist_in_canonical_json_and_scopes_stay_isolated() 
 }
 
 #[tokio::test]
+async fn suggestion_patch_is_one_commit_and_ambiguous_failure_reopens_as_a_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = RecordingStore::open(dir.path());
+    let (kernel, prefs) = open(store.clone()).await.unwrap();
+    let qq = scope("qq", "s", "u");
+    prefs.update(&qq, SegmentChange::Enabled(false)).unwrap();
+    let patch = SegmentPreference {
+        max_segments: Some(2),
+        pause_percent: Some(50),
+        ..Default::default()
+    };
+    let before_writes = store.writes();
+    let expected = SegmentPreference {
+        enabled: Some(false),
+        ..patch
+    };
+    assert_eq!(
+        prefs.update(&qq, SegmentChange::Patch(patch)).unwrap(),
+        expected
+    );
+    assert_eq!(store.writes(), before_writes + 1);
+    let before_bytes = store.bytes().unwrap();
+    prefs.update(&qq, SegmentChange::Patch(patch)).unwrap();
+    assert_eq!(store.writes(), before_writes + 1);
+    assert_eq!(
+        prefs.update(
+            &qq,
+            SegmentChange::Patch(SegmentPreference {
+                max_segments: Some(4),
+                pause_percent: Some(201),
+                ..Default::default()
+            })
+        ),
+        Err(SegmentPreferenceError::InvalidInput)
+    );
+    assert_eq!(store.bytes().unwrap(), before_bytes);
+    let replacement = SegmentPreference {
+        max_segments: Some(5),
+        pause_percent: Some(0),
+        ..Default::default()
+    };
+    store.fail_write.store(true, Ordering::SeqCst);
+    assert_eq!(
+        prefs.update(&qq, SegmentChange::Patch(replacement)),
+        Err(SegmentPreferenceError::Storage)
+    );
+    assert_eq!(prefs.get(&qq), Err(SegmentPreferenceError::Unavailable));
+    assert_eq!(store.bytes().unwrap(), before_bytes);
+    kernel.stop_all().await.unwrap();
+    store.fail_write.store(false, Ordering::SeqCst);
+    let (kernel, reopened) = open(store.clone()).await.unwrap();
+    assert_eq!(reopened.get(&qq).unwrap(), expected);
+    store.fail_after_write.store(true, Ordering::SeqCst);
+    assert_eq!(
+        reopened.update(&qq, SegmentChange::Patch(replacement)),
+        Err(SegmentPreferenceError::Storage)
+    );
+    assert_eq!(reopened.get(&qq), Err(SegmentPreferenceError::Unavailable));
+    kernel.stop_all().await.unwrap();
+    store.fail_after_write.store(false, Ordering::SeqCst);
+    let (kernel, recovered) = open(store.clone()).await.unwrap();
+    assert_eq!(
+        recovered.get(&qq).unwrap(),
+        SegmentPreference {
+            enabled: Some(false),
+            ..replacement
+        }
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
 async fn unchanged_values_rejected_inputs_and_default_reset_do_not_write() {
     let dir = tempfile::tempdir().unwrap();
     let store = RecordingStore::open(dir.path());

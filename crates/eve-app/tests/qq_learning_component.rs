@@ -1,10 +1,11 @@
 //! 公开宿主组件替换：真实 Session/Memory 恢复、Node 生命周期与离线提炼器。
-use eve_app::{QqBotOptions, run_qqbot_with_components};
+use eve_app::{QqBotOptions, run_qqbot_with_learning_policy};
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
 use eve_kernel::{Kernel, KernelServices, backends::FileStateStore};
 use eve_learning_api::{
-    CandidateDraft, JobStatus, LEARNING_PLUGIN_ID, LEARNING_STATE_KEY, LearningBatch,
-    LearningFuture, LearningJob, PreferenceExtractor,
+    AutoConfirmationPolicy, CandidateDraft, JobStatus, LEARNING_PLUGIN_ID, LEARNING_STATE_KEY,
+    LearningBatch, LearningFuture, LearningJob, LearningResult, PreferenceCandidate,
+    PreferenceExtractor,
 };
 use eve_llm_api::{ChatMessage, ChatRole};
 use eve_memory_api::{
@@ -43,10 +44,14 @@ probe.listen(0, '127.0.0.1', () => {
   fs.writeFileSync(started, String(probe.address().port));
   process.stdout.write(JSON.stringify({type:'ready',version:1})+'\n');
   if (mode === 'off') setTimeout(() => process.exit(0), 500);
-  if (mode === 'success') setInterval(() => {
+  if (mode === 'success' || mode === 'automatic') setInterval(() => {
     const entries = JSON.parse(fs.readFileSync(state)).entries;
     const bytes = entries['eve.learning']?.['learning.v1'];
     if (bytes && JSON.parse(Buffer.from(bytes)).jobs.some(item => item.job.status === 'Completed')) {
+      if (mode === 'automatic') {
+        const memory = JSON.parse(Buffer.from(entries['eve.memory']['memory.v1']));
+        if (!memory.scopes.some(s => s.snapshot.preferences.length)) return;
+      }
       process.exit(0);
     }
   }, 10);
@@ -143,6 +148,35 @@ fn injected_extractor_reads_recovered_evidence_and_persists_only_a_candidate() {
 #[test]
 fn invalid_injected_candidate_stops_bridge_and_preserves_reserved_batch() {
     process_case("invalid");
+}
+
+#[test]
+fn injected_auto_policy_confirms_recovered_evidence_without_model_or_forged_statement() {
+    process_case("automatic");
+}
+
+struct Policy {
+    case: String,
+    calls: Arc<AtomicUsize>,
+}
+impl AutoConfirmationPolicy for Policy {
+    fn allows(
+        &self,
+        candidate: &PreferenceCandidate,
+        batch: &LearningBatch,
+        memory: &MemorySnapshot,
+        _: u64,
+    ) -> LearningResult<bool> {
+        assert_eq!(self.case, "automatic", "关闭自主模式时不得调用确认策略");
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            candidate.draft.confidence, 73,
+            "替代策略不硬编码内置自评门槛"
+        );
+        assert_eq!(batch.scope, memory.scope);
+        assert_eq!(batch.evidence, memory.evidence);
+        Ok(true)
+    }
 }
 
 fn stored(directory: &Path, owner: &str, key: &str) -> Option<Value> {
@@ -277,6 +311,7 @@ async fn learning_component_process_fixture() {
     let before = stored(&directory, MEMORY_PLUGIN_ID, MEMORY_STATE_KEY);
     let calls = Arc::new(AtomicUsize::new(0));
     let versions = Arc::new(AtomicUsize::new(0));
+    let policy_calls = Arc::new(AtomicUsize::new(0));
     let extractor = Arc::new(Extractor {
         case: case.clone(),
         calls: calls.clone(),
@@ -285,7 +320,7 @@ async fn learning_component_process_fixture() {
         started: started.clone(),
         expected: expected.clone(),
     });
-    let result = run_qqbot_with_components(
+    let result = run_qqbot_with_learning_policy(
         QqBotOptions {
             state_directory: directory.clone(),
             agent_path: agent,
@@ -298,14 +333,23 @@ async fn learning_component_process_fixture() {
             ],
             memory: true,
             memory_learning: case != "off",
+            self_learning: case == "automatic",
             ..QqBotOptions::default()
         },
         Arc::new(ReflectionPlannerFactory),
         Some(extractor),
+        Some(Arc::new(Policy {
+            case: case.clone(),
+            calls: policy_calls.clone(),
+        })),
     )
     .await;
     assert_eq!(calls.load(Ordering::SeqCst), usize::from(case != "off"));
     assert_eq!(versions.load(Ordering::SeqCst) > 0, case != "off");
+    assert_eq!(
+        policy_calls.load(Ordering::SeqCst),
+        usize::from(case == "automatic")
+    );
     if case == "invalid" {
         assert!(result.is_err(), "非法替代组件输出必须关闭宿主");
         assert!(stopped.exists(), "后台错误后须实际停止 Node 桥接");
@@ -352,10 +396,24 @@ async fn learning_component_process_fixture() {
             );
         }
     }
-    assert_eq!(
-        stored(&directory, MEMORY_PLUGIN_ID, MEMORY_STATE_KEY),
-        before,
-        "候选和失败均不得修改真实记忆或隐式确认偏好"
-    );
+    if case == "automatic" {
+        let saved = stored(&directory, MEMORY_PLUGIN_ID, MEMORY_STATE_KEY).unwrap();
+        let snapshot = &saved["scopes"][0]["snapshot"];
+        assert_eq!(
+            snapshot["evidence"],
+            before.unwrap()["scopes"][0]["snapshot"]["evidence"]
+        );
+        assert_eq!(snapshot["preferences"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            snapshot["preferences"][0]["history"][0]["evidence_id"],
+            "component-evidence-2"
+        );
+    } else {
+        assert_eq!(
+            stored(&directory, MEMORY_PLUGIN_ID, MEMORY_STATE_KEY),
+            before,
+            "候选和失败均不得修改真实记忆或隐式确认偏好"
+        );
+    }
     let _reopened = FileStateStore::open(&directory).expect("正常和失败出口均须释放状态锁");
 }

@@ -12,6 +12,7 @@ mod qq_learning_commands;
 mod qq_memory;
 mod qq_memory_observer;
 mod qqbot;
+mod segment_advice;
 mod segment_commands;
 mod services;
 mod storage;
@@ -22,7 +23,8 @@ pub use cognition::{
 pub use console::{ChatOutputError, ChatRunError};
 pub use error::AppFailure;
 pub use qqbot::{
-    QQBOT_HELP, QqBotOptions, run_qqbot, run_qqbot_with_components, run_qqbot_with_planner_factory,
+    QQBOT_HELP, QqBotOptions, run_qqbot, run_qqbot_with_components, run_qqbot_with_learning_policy,
+    run_qqbot_with_planner_factory,
 };
 
 use eve_agent_prompt::FileAgentPrompt;

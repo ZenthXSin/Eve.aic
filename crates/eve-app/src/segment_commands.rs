@@ -18,14 +18,16 @@ const LIMIT_REACHED: &str = "分段设置容量已满；原设置保留，本次
 const OFF_NOTE: &str = "当前分段已关闭，发送 /segment on 后生效。";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SegmentCommand {
+pub(crate) enum SegmentCommand<'a> {
     Status,
     Help,
     Set(SegmentChange),
+    Suggestions(usize),
+    Adopt(&'a str, u64),
 }
-impl SegmentCommand {
+impl<'a> SegmentCommand<'a> {
     /// 首个词必须正好是 `/segment`；参数小写精确匹配，其他写法回复用法。
-    pub(crate) fn parse(text: &str) -> Option<Self> {
+    pub(crate) fn parse(text: &'a str) -> Option<Self> {
         let mut words = text.split_whitespace();
         if words.next()? != "/segment" {
             return None;
@@ -36,6 +38,32 @@ impl SegmentCommand {
             ["on"] => Self::Set(SegmentChange::Enabled(true)),
             ["off"] => Self::Set(SegmentChange::Enabled(false)),
             ["reset"] => Self::Set(SegmentChange::Reset),
+            ["suggestions"] => Self::Suggestions(1),
+            ["suggestions", page] => page
+                .parse()
+                .ok()
+                .filter(|p| *p > 0)
+                .map_or(Self::Help, Self::Suggestions),
+            ["adopt", ..] => {
+                // 公共偏好 ID 可包含非控制空白，保持原 ID，只把最后一个词当作版本。
+                let body = text
+                    .trim()
+                    .strip_prefix("/segment")
+                    .unwrap()
+                    .trim_start()
+                    .strip_prefix("adopt")
+                    .unwrap()
+                    .trim();
+                body.rsplit_once(char::is_whitespace)
+                    .and_then(|(id, revision)| {
+                        revision
+                            .parse()
+                            .ok()
+                            .filter(|r| *r > 0)
+                            .map(|r| Self::Adopt(id.trim_end(), r))
+                    })
+                    .unwrap_or(Self::Help)
+            }
             ["parts", n] => n
                 .parse()
                 .map_or(Self::Help, |n| Self::Set(SegmentChange::MaxSegments(n))),
@@ -54,11 +82,11 @@ fn seconds(ms: u64) -> String {
 }
 fn help(policy: &SegmentPolicy) -> String {
     format!(
-        "分段命令：/segment 查看；/segment on 开启；/segment off 整条发送；/segment parts 段数（{MIN_PREFERRED_SEGMENTS} 至 {}，默认 {}）；/segment pace 百分比（0 至 {MAX_PAUSE_PERCENT}，默认 {DEFAULT_PAUSE_PERCENT}，0 为不停顿）；/segment reset 恢复默认。只影响本会话，从下一条回复生效。",
+        "分段命令：/segment 查看；/segment on 开启；/segment off 整条发送；/segment parts 段数（{MIN_PREFERRED_SEGMENTS} 至 {}，默认 {}）；/segment pace 百分比（0 至 {MAX_PAUSE_PERCENT}，默认 {DEFAULT_PAUSE_PERCENT}，0 为不停顿）；/segment reset 恢复默认；QQ 开启记忆后用 /segment suggestions [页码] 查看建议，/segment adopt 偏好ID 版本 明确采用。只影响本会话，从下一条回复生效。",
         policy.max_segments, policy.defaults.max_segments
     )
 }
-fn status(preference: &SegmentPreference, policy: &SegmentPolicy) -> String {
+pub(crate) fn status(preference: &SegmentPreference, policy: &SegmentPolicy) -> String {
     let source = |set: bool| if set { "已设置" } else { "默认" };
     let Ok(effective) = preference.effective(policy) else {
         return help(policy);
@@ -83,12 +111,18 @@ pub(crate) fn execute(
     store: &dyn SegmentPreferences,
     scope: &SegmentScope,
     policy: &SegmentPolicy,
-    command: SegmentCommand,
+    command: SegmentCommand<'_>,
 ) -> Result<String, SegmentPreferenceError> {
     let change = match command {
         SegmentCommand::Help => return Ok(help(policy)),
         SegmentCommand::Status => return Ok(status(&store.get(scope)?, policy)),
         SegmentCommand::Set(change) => change,
+        SegmentCommand::Suggestions(_) | SegmentCommand::Adopt(_, _) => {
+            return Ok(
+                "节奏建议当前由 QQ 的交互记忆提供；终端可用 /segment parts 和 pace 直接设置。"
+                    .into(),
+            );
+        }
     };
     // 先按宿主上限检查，越界时不访问存储。
     match change {
@@ -104,6 +138,12 @@ pub(crate) fn execute(
             return Ok(format!(
                 "停顿比例须为 0 至 {MAX_PAUSE_PERCENT} 的整数（默认 {DEFAULT_PAUSE_PERCENT}，0 为不停顿）。设置未改变。"
             ));
+        }
+        SegmentChange::Patch(patch)
+            if patch.validate().is_err()
+                || patch.max_segments.is_some_and(|n| n > policy.max_segments) =>
+        {
+            return Ok(help(policy));
         }
         _ => {}
     }
@@ -132,25 +172,49 @@ pub(crate) fn execute(
             "已将本会话段间停顿设为 {p}%（单次不超过 {} 秒），从下一条回复生效。{off}",
             seconds(effective.limits.max_pause_ms)
         ),
+        SegmentChange::Reset if !next.is_default() => format!(
+            "已清除本会话手动设置，恢复跟随有效学习偏好。{}",
+            status(&next, policy)
+        ),
         SegmentChange::Reset => format!(
             "已恢复本会话默认分段：开启，最多 {} 段，段间停顿 {DEFAULT_PAUSE_PERCENT}%，从下一条回复生效。",
             policy.defaults.max_segments
         ),
+        SegmentChange::Patch(_) => status(&next, policy),
     })
 }
 
 /// QQ 宿主命令；未开启分段时仍识别 `/segment`，回复未开启而不交给模型。
 pub(crate) struct QqCommands {
     store: Option<(Arc<dyn SegmentPreferences>, SegmentPolicy)>,
+    advice: Option<crate::segment_advice::Commands>,
 }
 impl QqCommands {
     pub(crate) fn new(store: Arc<dyn SegmentPreferences>, policy: SegmentPolicy) -> Arc<Self> {
         Arc::new(Self {
             store: Some((store, policy)),
+            advice: None,
         })
     }
     pub(crate) fn disabled() -> Arc<Self> {
-        Arc::new(Self { store: None })
+        Arc::new(Self {
+            store: None,
+            advice: None,
+        })
+    }
+    pub(crate) fn new_with_advice(
+        store: Arc<dyn SegmentPreferences>,
+        policy: SegmentPolicy,
+        memory: Arc<dyn eve_memory_api::MemoryAdmin>,
+        advisor: Arc<dyn eve_segment_api::SegmentAdvisor>,
+        automatic: bool,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            store: Some((store, policy)),
+            advice: Some(crate::segment_advice::Commands::new(
+                memory, advisor, automatic,
+            )),
+        })
     }
 }
 impl QqCommandHandler for QqCommands {
@@ -161,6 +225,19 @@ impl QqCommandHandler for QqCommands {
         let Some((store, policy)) = &self.store else {
             return Ok(Some(QQ_DISABLED.into()));
         };
+        if matches!(
+            command,
+            SegmentCommand::Suggestions(_) | SegmentCommand::Adopt(_, _)
+        ) {
+            return match &self.advice {
+                Some(advice) => advice
+                    .execute(&input, store.as_ref(), policy, command)
+                    .map(Some),
+                None => Ok(Some(
+                    "节奏建议需要同时启用 --memory 与 --segmented。".into(),
+                )),
+            };
+        }
         execute(
             store.as_ref(),
             &segment_scope(input.session),
@@ -245,6 +322,21 @@ mod tests {
             ("/segment pace 50%", set(SegmentChange::PausePercent(50))),
             ("/segment pace 150％", set(SegmentChange::PausePercent(150))),
             ("/segment pace 0", set(SegmentChange::PausePercent(0))),
+            ("/segment suggestions", Some(SegmentCommand::Suggestions(1))),
+            (
+                "/segment suggestions 2",
+                Some(SegmentCommand::Suggestions(2)),
+            ),
+            (
+                "/segment adopt source 3",
+                Some(SegmentCommand::Adopt("source", 3)),
+            ),
+            (
+                "/segment adopt source with spaces 3",
+                Some(SegmentCommand::Adopt("source with spaces", 3)),
+            ),
+            ("/segment suggestions 0", Some(SegmentCommand::Help)),
+            ("/segment adopt source 0", Some(SegmentCommand::Help)),
             ("/segment help", Some(SegmentCommand::Help)),
             ("/segment parts", Some(SegmentCommand::Help)),
             ("/segment parts two", Some(SegmentCommand::Help)),

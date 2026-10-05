@@ -7,6 +7,8 @@ use eve_segment_api::{
 use std::ops::Range;
 mod preference;
 pub use preference::*;
+mod advice;
+pub use advice::*;
 
 pub const PARAGRAPH_PLANNER: &str = "paragraph-v3";
 
