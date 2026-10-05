@@ -1,4 +1,4 @@
-name: PostgreSQL 状态与认知验收
+name: PostgreSQL 状态与宿主验收
 
 on:
   pull_request:
@@ -6,6 +6,7 @@ on:
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "connectors/qqbot/test/fake-bridge.mjs"
       - ".github/workflows/postgres.yml"
   push:
     branches: [main]
@@ -13,6 +14,7 @@ on:
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "connectors/qqbot/test/fake-bridge.mjs"
       - ".github/workflows/postgres.yml"
   workflow_dispatch:
 
@@ -49,6 +51,10 @@ jobs:
           persist-credentials: false
       - name: 安装 Rust
         run: rustup toolchain install 1.89.0 --profile minimal
+      - name: 安装离线 QQ 桥接测试运行时
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
       - name: 创建仅供本任务使用的测试连接文件
         env:
           EVE_POSTGRES_TEST_PORT: ${{ job.services.database.ports['5432'] }}
@@ -74,6 +80,8 @@ jobs:
         run: cargo +1.89.0 test -p eve-state-postgres --test persistence --locked -- --ignored --test-threads=1
       - name: 验证实际认知进程与 SQL 恢复
         run: cargo +1.89.0 test -p eve-app --test cognition_postgres --locked -- --ignored --test-threads=1
+      - name: 验证实际 QQ 与终端进程的 SQL 恢复
+        run: cargo +1.89.0 test -p eve-app --test qq_postgres --locked -- --ignored --test-threads=1
       - name: 清理临时连接文件
         if: always()
         run: rm -f -- "$EVE_POSTGRES_TEST_CONFIG"
