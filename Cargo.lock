@@ -221,6 +221,7 @@ dependencies = [
  "eve-training-api",
  "eve-training-plugin",
  "postgres",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
@@ -310,6 +311,7 @@ name = "eve-control-plugin"
 version = "0.1.0"
 dependencies = [
  "eve-control-api",
+ "eve-kernel",
  "eve-llm-api",
  "eve-plugin-api",
  "eve-session-api",
