@@ -26,6 +26,35 @@ concurrency:
   group: eve-performance-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  cognition-evaluation:
+    name: 内生执行离线评估
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: 检查评估脚本语法
+        run: python3 -m py_compile benchmarks/cognition/evaluate.py
+      - name: 构建认知入口
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal
+          cargo +1.89.0 build -p eve-app --bin eve-cognition --locked
+      - name: 运行七项本机替身进程评估
+        run: |
+          python3 benchmarks/cognition/evaluate.py \
+            --binary target/debug/eve-cognition \
+            --source-sha "$GITHUB_SHA" \
+            --output "$RUNNER_TEMP/eve-cognition-evaluation.json"
+      - name: 保存无正文认知评估报告
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: eve-cognition-evaluation
+          path: ${{ runner.temp }}/eve-cognition-evaluation.json
+          if-no-files-found: ignore
+          retention-days: 30
   performance:
     runs-on: ubuntu-latest
     timeout-minutes: 20
