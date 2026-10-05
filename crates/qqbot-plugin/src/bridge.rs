@@ -1,5 +1,5 @@
 use crate::{
-    QqBotConfig, QqBotStatus,
+    QqBotConfig, QqBotStatus, QqCommandHandler, QqCommandInput, commands,
     state::{Ledger, Message, ReceiptState},
 };
 use eve_control_api::{
@@ -92,6 +92,7 @@ const BLOCKED: &str = "任务提交状态未确认，当前会话已阻塞；请
 pub(crate) struct Services {
     pub control: Arc<dyn ControlService>,
     pub messages: Arc<dyn MessageService>,
+    pub command_handler: Option<Arc<dyn QqCommandHandler>>,
     pub training: Option<Arc<dyn TrainingService>>,
 }
 struct ChannelEvents {
@@ -162,6 +163,8 @@ enum ReplyGuard {
     Current(GenerationKey),
     Completed(ControlEvent),
     NoTask,
+    // 宿主命令的已保存结果不属于聊天生成代，但仍绑定原消息和持久回执。
+    Command,
 }
 impl ReplyGuard {
     fn accepts(&self, control: &dyn ControlService) -> bool {
@@ -170,7 +173,7 @@ impl ReplyGuard {
                 .snapshot(&key.session)
                 .is_ok_and(|s| s.is_some_and(|s| s.key == *key)),
             Self::Completed(event) => control.accepts(event),
-            Self::NoTask => true,
+            Self::NoTask | Self::Command => true,
         }
     }
 }
@@ -211,6 +214,7 @@ pub(crate) async fn run(
     let Services {
         control,
         messages,
+        command_handler,
         training,
     } = services;
     // 仅本地学习已验证回执中的用户表达；不提交旧任务、不调用模型或重发消息。
@@ -350,6 +354,29 @@ pub(crate) async fn run(
                     finish(&mut stdin, &message.id).await?;
                     continue;
                 }
+                if let Some(handler) = &command_handler {
+                    let session = message.session_key(&config.app_id)?;
+                    match commands::dispatch(handler.as_ref(), QqCommandInput {
+                        message_id: &message.id, session: &session, text: &message.text,
+                    }) {
+                        Ok(Some(text)) => {
+                            replies.push_back(Reply { message, text, guard: ReplyGuard::Command });
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            status.send_modify(|s| s.failed += 1);
+                            mark_failed(&mut ledger, &ctx, &config.app_id, &message.id)?;
+                            warn(&ctx, "host_command_failed_no_retry");
+                            finish(&mut stdin, &message.id).await?;
+                            if matches!(error, PluginError::State(_)) {
+                                // 不传播宿主诊断正文；状态未知时停止后续命令和模型准入。
+                                break Err(failure("QQBot 宿主命令状态不可确认，通道已停止"));
+                            }
+                            continue;
+                        }
+                    }
+                }
                 if let Some(target) = command.target {
                     controlled_sessions.insert(target.session.session_id.clone(), target.session.clone());
                     let incoming = IncomingMessage {
@@ -400,13 +427,6 @@ pub(crate) async fn run(
                     warn(&ctx, "receipt_limit");
                     finish(&mut stdin, &message.id).await?;
                     continue;
-                }
-                if let Some(training) = &training {
-                    let session = message.session_key(&config.app_id)?;
-                    let scope = eve_llm_api::ContextScope { session_id: session.session_id, user_id: session.user_id };
-                    if training.observe_user_message(&scope, &message.id, &message.text).is_err() {
-                        warn(&ctx, "expression_learning_failed");
-                    }
                 }
                 let submitted = control.submit(ControlInput {
                     session: SessionInput { key: message.session_key(&config.app_id)?, text: message.text.clone() },
@@ -558,6 +578,15 @@ pub(crate) async fn run(
                                         .map_err(|_| failure("QQBot 任务快照不可用"))?.map(|s| s.key);
                                     commands.push_back(CommandMessage { message, target });
                                 } else {
+                                    // 按普通输入准入时的持久开关采集，不能延后到模型执行。
+                                    // 启停/重置可先于排队任务执行；旧输入必须已有去重凭据。
+                                    if let Some(training) = &training {
+                                        let session = message.session_key(&config.app_id)?;
+                                        let scope = eve_llm_api::ContextScope { session_id: session.session_id, user_id: session.user_id };
+                                        if training.observe_user_message(&scope, &message.id, &message.text).is_err() {
+                                            warn(&ctx, "expression_learning_failed");
+                                        }
+                                    }
                                     queue.push_back(Queued { message, saved: false });
                                 }
                             }

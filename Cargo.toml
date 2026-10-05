@@ -8,6 +8,7 @@ members = [
     "crates/config-api",
     "crates/config-plugin",
     "crates/kernel",
+    "crates/state-postgres",
     "crates/llm-api",
     "crates/agent-prompt",
     "crates/llm-openai",
@@ -35,6 +36,7 @@ version = "0.1.0"
 license = "MIT"
 
 [workspace.dependencies]
+ring = "0.17"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

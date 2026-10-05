@@ -25,6 +25,36 @@ QQBOT_SANDBOX=true ./target/debug/eve-qqbot --state-dir .eve-qqbot
 
 这只是工作流测试，没有部署到测试服务器。托管 Runner 的临时状态在任务结束后清理，不是持续运行的机器人宿主；长期运行应使用持久目录与进程管理。首次真实交互工作流只上传无正文计数；专用训练工作流另以加密包保存交流证据和状态，见[主动提问训练](./主动提问训练.md)。
 
+当前用户验收直接在本地运行，不为实机交互调度工作流。沿用已有 `--state-dir` 保留会话、训练统计与回执；宿主输出 `EVE_QQBOT_READY` 后再通知用户去 QQ 测试。该标志只说明通道已就绪，实际收发仍需单独确认。
+
+## 本地内生反思
+
+`--cognition` 显式开启后台反思，默认关闭；普通聊天和训练开关不会自动开启它。每次启动最多执行 32 项，可通过 `--cognition-max-executions 1` 等值限制为 1–32 项。启动示例：
+
+```sh
+# 凭据与普通 QQ 启动相同；继续使用原状态目录。
+./target/debug/eve-qqbot --state-dir .eve-qqbot --cognition --cognition-max-executions 1
+```
+
+| 命令 | 行为 |
+| --- | --- |
+| `/goal 待办内容` | 保存明确提出的待办；正文最多 8192 UTF-8 字节，保存后由后台检查是否需要反思 |
+| `/goals` | 列出当前可信会话最多 10 项待办的 ID 和状态 |
+| `/mind` | 查看当前会话最近保存待办的反思状态或草稿 |
+| `/mind 目标ID` | 查看当前会话指定待办的反思状态或草稿 |
+
+命令不会等待模型返回；查询只读取已保存状态。关闭认知时，这些命令回复“内生反思未启用”；参数不合法时返回用法，不转为普通模型请求。普通聊天不被自动提取为待办，`/goal` 也不授权工具操作。内部完成不会主动发 QQ 消息，用户用 `/mind` 发起查询后才原路回复。
+
+父目标保存为 `Waiting`、用户来源 `qq.goal`。内置规划器对同一父目标同一修订最多派生一次反思；每个子目标至多一次模型请求、零工具调用，最长 30 秒。草稿必须是已提交 Session 中通过结构验证的 `summary`、`next_step`、`needs_user_input`。子目标 `Completed` 只表示草稿已保存，父目标仍为 `Waiting`，建议和现实结果尚待验证。达到启动上限后，未开始的待办保留；新的启动可以继续评估，已尝试的同修订目标不会因此重试。
+
+反思使用独立 Context，以及通过独立插件 ID 和服务 ID 注册的 Control：只接收 AGENT 身份、目标输入及受限输出格式，不读取聊天训练、表达统计、偏好或聊天历史，也不公布工具。前台聊天仍使用原 TrainingContext 和 Control；`/cancel` 等前台命令不控制内部反思代际。反思只执行当前有效、仍为 `Waiting` 的 QQ 用户父目标的子目标。命令中的目标身份与可见范围由通道绑定，按 AppID、C2C/群、目标和发送者共同隔离；正文里的用户或目标 ID 不能扩大读取权限。
+
+QQ 插件只公开同步 `QqCommandHandler` 契约，不依赖认知实现。通道先持久化 `Processing`，再调用一次宿主命令处理器；处理器可返回独立回复，或在没有业务副作用时继续既有控制路径。认知保存与 QQ 回执没有跨插件事务：例如待办已经保存但回复尚未保存时崩溃，用户可能没有收到确认，重启也不会重放旧命令或补发回复。可用新消息 `/goals`、`/mind` 核对已保存记录。处理器异常不回退重跑，状态错误停止通道并保留现场。
+
+默认 `run_qqbot` 使用 `ReflectionPlannerFactory`；受信 Rust 宿主可通过 `run_qqbot_with_planner_factory(options, factory)` 注入公开 `EndogenousPlannerFactory`。只有显式开启认知才创建规划器；替换实现须遵守来源、权限、预算、修订去重与持久化契约。创建或规划失败不回退为默认实现；修订冲突在后续 tick 重新读取，其余异常进入统一收尾。启动阶段先装配认知与独立执行服务，成功启动 QQ 插件并取得状态句柄后才开放后台规划和执行；启动失败不趁收尾发起反思。
+
+此入口继续使用 `FileStateStore`，在指定目录保存认知、Session、训练及通道回执；没有为 QQ 接入 PostgreSQL 或自动迁移旧目录。独立数据库后端交付不改变这里的存储选择。内生驱动的范围、恢复与后续能力见[认知循环](./认知循环.md#qq-本地组合入口)；本切片尚不具备完整 AGI、目标执行或现实结果验证能力。
+
 ## 桥接契约与兼容
 
 Node → Rust JSONL：`ready`、`message {id,scope,target_id,user_id,text}`、`delivery {id,ok,message_id?}`、`warning`、`fatal`；Rust → Node：`reply {id,text}`、`finish {id}`、`stop`。双方发布 `version:1`。缺失/不同版本记录 warning 后按已知字段处理；额外消息字段记录 warning 后忽略。非法路由、空文本、未知或超长帧跳过，密钥缺失、损坏持久化状态和不能确认的运行失败明确报告。
@@ -33,13 +63,13 @@ stdout 专用于 JSONL，SDK 日志后端为空，异常正文/stack/token 不�
 
 平台消息 ID 是不透明字符串，原始标点和内容必须保留。Node 入站/投递与 Rust 入站/恢复统一按 UTF-8 字节限制为 253 字节；这能接纳本次正式群实际出现的 137 字节 ID，并使 `qq:` 前缀后的 Control 任务 ID 保持在公开契约的 256 字节内。空值、首尾空白、控制字符与超长 ID 仍拒绝；AppID、用户和目标 openid 继续沿用独立的 128 字节字母数字/下划线/连字符限制，不随消息 ID 放宽。持久化版本仍为 1，原有回执原样恢复，新长 ID 保存后也能去重与恢复历史；不截断或改写 QQ 被动回复的 `msg_id`。
 
-只订阅 group/C2C intent `1 << 25`，跳过机器人消息、非文本和不支持的范围。群 @ 接纳 `GROUP_AT_MESSAGE_CREATE`；`GROUP_MESSAGE_CREATE` 必须携带服务端 `mentions[].is_you === true`，或正文中的当前 AppID 标记 `<@AppID>` / `<@!AppID>`，才进入处理。这与锁定 SDK 的提及识别方式一致；普通群消息、仅提及其他账号、未知事件和不完整标记仍跳过，不把收到群消息等同于收到自身 @。正文中的提及保持原值。Node 保存原事件的 ReplyTarget；Rust 只能凭原消息 id 回复，不能在命令中指定任意目标。被动回复始终关联原 scope、target 和 msg_id，不自动改为主动推送。QQ群原事件来源、SDK 可选元数据与平台错误码不影响合法文本处理。
+只订阅 group/C2C intent `1 << 25`，跳过机器人消息、非文本和不支持的范围。群 @ 接纳 `GROUP_AT_MESSAGE_CREATE`；`GROUP_MESSAGE_CREATE` 必须携带服务端 `mentions[].is_you === true`，或正文中的当前 AppID 标记 `<@AppID>` / `<@!AppID>`，才进入处理。这与锁定 SDK 的提及识别方式一致；普通群消息、仅提及其他账号、未知事件和不完整标记仍跳过，不把收到群消息等同于收到自身 @。Node 对正文去除首尾空白，群消息另移除开头连续的已确认自身提及，使 `@机器人 /goal 内容` 等命令可识别；自身身份来自 AppID 或 `is_you` 元数据中的有效 ID，正文中其他位置的提及及其他账号提及保持原值。Node 保存原事件的 ReplyTarget；Rust 只能凭原消息 id 回复，不能在命令中指定任意目标。被动回复始终关联原 scope、target 和 msg_id，不自动改为主动推送。QQ群原事件来源、SDK 可选元数据与平台错误码不影响合法文本处理。
 
 ## 去重、提交与恢复
 
 插件在 Context 的 `receipts.v1` 保存带 AppID、原路由、输入、阶段与回复的有界回执文档：最多 4096 项、1 MiB；新任务预留最大回复序列化空间。状态严格校验，坏版本/坏字段/重复 ID/损坏字节拒绝启动，不清空、不覆盖、不淘汰旧回执。
 
-收到新消息先持久化 Processing，再提交 Control。仅模型成功且 Session 已完成提交时，将回复保存为 ReplyPending，随后只调用一次 QQ sendText；delivery 成功改为 Sent，发送失败改为 Failed 并保留已提交历史与回复。网络、回执或停止使结果不确定时保留阶段，不自动重新生成、重新执行工具或重发。相同 AppID/message id 重复、改正文或改路由均 warning 后忽略，不覆盖旧回执。去重不宣称在跨服务崩溃时能实现事务性的 exactly-once。
+收到新消息先持久化 Processing，再提交 Control 或调用已识别命令的宿主处理器。普通模型回复仅在模型成功且 Session 已完成提交后保存为 ReplyPending；同步命令回复在处理器返回后保存为 ReplyPending。随后只调用一次 QQ sendText；delivery 成功改为 Sent，发送失败改为 Failed 并保留已提交历史与回复。网络、回执或停止使结果不确定时保留阶段，不自动重新生成、重新执行工具或重发。相同 AppID/message id 重复、改正文或改路由均 warning 后忽略，不覆盖旧回执。去重不宣称在跨服务崩溃时能实现事务性的 exactly-once。
 
 重启时 Processing 与 ReplyPending 仍是待人工诊断的记录，不自动继续；Session 沿用 Pending → Interrupted 与只回放 Completed 历史的语义。新消息可以恢复已有完成历史，旧工具仅作为历史传给模型。取消不会撤销已经完成的外部副作用。
 
@@ -65,15 +95,20 @@ QQ 与终端共用每轮模型解析：在新代执行前捕获当前配置，�
 
 ## 停止与验收
 
-宿主收到 Ctrl+C / Unix SIGTERM 时，先通过 QQ 状态服务 request_stop 请求停止，等待在途 Control 取消并保存、桥接 stop 与子进程退出，再停止 Kernel 插件并刷新日志。这样避免 Kernel 的生命周期准入等待与在途模型形成等待冲突。桥接子进程不配合时有界终止并回收，不以发出信号代替确认退出。非关键消息/投递故障使用 warning 并继续；状态损坏和保存失败保留数据并终止。
+宿主收到 Ctrl+C / Unix SIGTERM、桥接 EOF、启动失败或认知后台异常时，统一收尾：先通过 QQ 状态服务 request_stop 关闭通道准入，同时停止认知规划并取消、等待内部执行；随后等待前台 Control 保存、桥接 stop 与子进程退出，最后停止 Kernel 插件并刷新日志。这样避免 Kernel 的生命周期准入等待与在途模型形成等待冲突。即使后台规划任务异常，仍先等待认知循环实际结束。桥接子进程不配合时有界终止并回收，不以发出信号代替确认退出。非关键消息/投递故障使用 warning 并继续；状态损坏和保存失败保留数据并终止。
+
+认知恢复将旧 `Executing` 标为 `Blocked/Interrupted`，保留执行与 Session 关联；Session 的旧 Pending 仍转为 Interrupted。已完成草稿可由新查询读取，失败、取消或不确定的同修订反思不自动重试；QQ 的旧 Processing/ReplyPending 也不自动发送。认知、Session 和 QQ 回执各自保存，不能从任一记录缺失推断另一项业务从未发生。
 
 ```sh
 npm --prefix connectors/qqbot test
 cargo build -p eve-app --bin eve-qqbot --locked
 python3 connectors/qqbot/test/eve_e2e.py
+python3 connectors/qqbot/test/cognition_test.py
 ```
 
 离线验收实际运行 Eve、生产 Rust 插件、测试 Node 子进程与 loopback Chat HTTP，覆盖工具/回复、两进程回忆与去重、群发送者/AppID 路由、发送失败保留提交、Processing 不重放、损坏状态保留、SIGTERM 取消与 Node 回收。Node 测试另覆盖 C2C/群原目标与 msg_id、pending 上限、finish、无重试发送失败、坏/超长 JSONL 与 EOF。它们与真实 QQ 交互分别记录，离线通过不代表 QQ 权限、认证或消息发送已经通过。
+
+新增认知进程验收覆盖默认关闭与无效命令零请求、后台反思不受训练上下文影响、前台取消与后台执行独立、群/用户/AppID 隔离、已保存草稿跨进程查询与去重、非法草稿阻塞、SIGTERM 取消收尾和再次启动零重放。这些使用本地 HTTP 替身，不代表新增 QQ 命令已完成实机验收。
 
 显式 primary 接线新增两个实际 Eve 用例：角色模型/输出上限控制与重启恢复、角色关闭后零请求且原状态不变。[PR #70 离线验收](https://github.com/ZenthXSin/Eve.aic/actions/runs/36958593968) 已通过七项 Node 与八项 Eve 进程用例，完整 CI 和性能证据见[模型配置验收](./模型配置.md#核心主模型接线验收)。
 

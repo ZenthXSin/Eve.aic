@@ -12,3 +12,6 @@ eve-llm-api = { path = "../llm-api" }
 eve-session-api = { path = "../session-api" }
 tokio.workspace = true
 getrandom = "0.4"
+
+[dev-dependencies]
+eve-kernel = { path = "../kernel" }
