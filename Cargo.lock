@@ -208,6 +208,8 @@ dependencies = [
  "eve-control-api",
  "eve-control-plugin",
  "eve-kernel",
+ "eve-learning-api",
+ "eve-learning-plugin",
  "eve-llm-api",
  "eve-llm-openai",
  "eve-memory-api",
@@ -334,6 +336,32 @@ name = "eve-kernel"
 version = "0.1.0"
 dependencies = [
  "eve-plugin-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "eve-learning-api"
+version = "0.1.0"
+dependencies = [
+ "eve-memory-api",
+ "serde",
+]
+
+[[package]]
+name = "eve-learning-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-kernel",
+ "eve-learning-api",
+ "eve-llm-api",
+ "eve-memory-api",
+ "eve-memory-plugin",
+ "eve-plugin-api",
+ "eve-session-api",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

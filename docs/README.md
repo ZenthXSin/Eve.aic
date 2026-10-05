@@ -4,6 +4,8 @@
 
 ## 文档分类
 
+- [偏好提炼](./偏好提炼.md)：低频候选、用户确认、预算、来源与失败恢复。
+
 - [企划案](./企划案.md)：项目愿景、目标和范围。
 - [开发计划](./开发计划.md)：阶段目标、优先级和完成条件。
 - [持续认知与内生驱动](./认知循环.md)：统一主体、STATE/DRIVES/AGENDA、有界反思、可替换规划契约与恢复。
@@ -48,7 +50,7 @@
 
 2026-10-05，已有内生反思与可替换规划、QQ 主动训练和表达统计、训练策略 v3、正式群提及与长消息 ID 修复。本轮已实现 QQ 有来源成功交互、明确偏好的查看/修正/撤销和按可信范围装配 Context；只有显式用户指令成为确认偏好，数值示范不代替确认。反思草稿只完成记录，不代表父目标执行完成或 AGI。事件、服务、状态、权限、任务、日志及独立进程恢复底座继续保留，详见[开发计划](./开发计划.md)。
 
-[#97：排队输入跨训练启停与重置后的补学](https://github.com/ZenthXSin/Eve.aic/issues/97)已由 [PR #98](https://github.com/ZenthXSin/Eve.aic/pull/98) 修复并合入。SQL 后端与入口由 [PR #99](https://github.com/ZenthXSin/Eve.aic/pull/99)、[PR #102](https://github.com/ZenthXSin/Eve.aic/pull/102) 交付，QQ 反思由 [PR #101](https://github.com/ZenthXSin/Eve.aic/pull/101) 交付。三个宿主通过 `--database-config` 显式选择 SQL，默认文件状态且不自动迁移；QQ 的 `--memory` 与 `--cognition` 独立开启，共用所选 StateStore，各自独立提交。当前记忆不补采旧回执、不自动提炼；低频提炼、语义检索、目标执行、多消息分段和 AGI 质量评估继续推进。
+[#97：排队输入跨训练启停与重置后的补学](https://github.com/ZenthXSin/Eve.aic/issues/97)已由 [PR #98](https://github.com/ZenthXSin/Eve.aic/pull/98) 修复并合入。SQL 后端与入口由 [PR #99](https://github.com/ZenthXSin/Eve.aic/pull/99)、[PR #102](https://github.com/ZenthXSin/Eve.aic/pull/102) 交付，QQ 反思由 [PR #101](https://github.com/ZenthXSin/Eve.aic/pull/101) 交付。三个宿主通过 `--database-config` 显式选择 SQL，默认文件状态且不自动迁移；QQ 的 `--memory` 与 `--cognition` 独立开启，共用所选 StateStore，各自独立提交。当前记忆不补采旧回执；追加 `--memory-learning` 可从已保存经历低频生成候选，只有用户明确确认才进入偏好。语义检索、目标执行、多消息分段和 AGI 质量评估继续推进。
 
 任务支持前台、后台、定时与重复执行；插件可通过公开接口定义新任务类型和调度规则，扩展无需修改内核。详见[插件开发](./插件开发.md#自定义任务类型与调度)。
 

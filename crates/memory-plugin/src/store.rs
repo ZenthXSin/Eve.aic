@@ -218,6 +218,15 @@ impl StoredMemory {
         }
         Ok(inner)
     }
+    pub(super) fn scopes(&self) -> MemoryResult<Vec<MemoryScope>> {
+        Ok(self
+            .lock()?
+            .document
+            .scopes
+            .iter()
+            .map(|record| record.snapshot.scope.clone())
+            .collect())
+    }
     pub(super) fn snapshot(&self, scope: &MemoryScope) -> MemoryResult<MemorySnapshot> {
         let inner = self.lock()?;
         Ok(inner

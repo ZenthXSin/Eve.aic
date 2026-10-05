@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/learning-api",
+    "crates/learning-plugin",
     "crates/plugin-api",
     "crates/cognition-api",
     "crates/cognition-plugin",

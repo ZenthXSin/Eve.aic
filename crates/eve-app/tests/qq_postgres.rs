@@ -17,6 +17,12 @@ use std::{
     thread,
     time::Duration,
 };
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 
 const MODEL_KEY: &str = "postgres-qq-model-fixture";
 const QQ_KEY: &str = "postgres-qq-app-fixture";
@@ -508,6 +514,420 @@ async fn sql_memory_and_cognition(root: &Path, database: &Path, password: &str) 
     assert!(server.requests.try_recv().is_err());
 }
 
+/// 模型响应由测试在读取已提交的 SQL Running 后显式放行，不靠延时捕捉中间状态。
+struct LearningServer {
+    url: String,
+    requests: mpsc::UnboundedReceiver<(Value, oneshot::Sender<Value>)>,
+    task: JoinHandle<()>,
+}
+impl LearningServer {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+        let (sender, requests) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut bytes = vec![];
+                    let header_end = loop {
+                        let mut chunk = [0; 4096];
+                        let count = socket.read(&mut chunk).await.unwrap();
+                        assert!(count > 0);
+                        bytes.extend_from_slice(&chunk[..count]);
+                        assert!(bytes.len() < 1024 * 1024);
+                        if let Some(index) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break index + 4;
+                        }
+                    };
+                    let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+                    assert!(headers.starts_with("POST /v1/responses HTTP/1.1\r\n"));
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|length| length.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    assert!(length < 1024 * 1024);
+                    while bytes.len() < header_end + length {
+                        let mut chunk = [0; 4096];
+                        let count = socket.read(&mut chunk).await.unwrap();
+                        assert!(count > 0);
+                        bytes.extend_from_slice(&chunk[..count]);
+                    }
+                    let request =
+                        serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                    let (reply, response) = oneshot::channel::<Value>();
+                    assert!(sender.send((request, reply)).is_ok());
+                    let body = serde_json::to_vec(&final_response(
+                        &response.await.unwrap().to_string(),
+                    ))
+                    .unwrap();
+                    let header = format!(
+                        "HTTP/1.1 200 Fixture\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    socket.write_all(header.as_bytes()).await.unwrap();
+                    socket.write_all(&body).await.unwrap();
+                })
+                .await
+                .expect("SQL 提炼模型夹具未有界完成");
+            }
+        });
+        Self {
+            url,
+            requests,
+            task,
+        }
+    }
+}
+impl Drop for LearningServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn wait_sql(database: &Path, ready: impl Fn(&[StoredRow]) -> bool) -> Vec<StoredRow> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let saved = rows(database);
+            if ready(&saved) {
+                return saved;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("SQL 状态未到达验收检查点")
+}
+
+fn learning_message(id: &str, text: &str, expected: &str) -> Value {
+    let mut message = containing_message(id, text, expected);
+    message["target_id"] = json!("sql-learning-user");
+    message["user_id"] = json!("sql-learning-user");
+    message
+}
+
+fn learning_memory(memory: &Value) -> &Value {
+    &memory["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|scope| is_learning_scope(scope))
+        .expect("SQL 新作用域的交互记忆缺失")["snapshot"]
+}
+
+fn is_learning_scope(scope: &Value) -> bool {
+    scope["snapshot"]["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|evidence| {
+            evidence["source"]["message_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("sql-learning-seed-"))
+        })
+}
+
+fn script(root: &Path, steps: Vec<Value>) {
+    std::fs::write(
+        root.join("scenario.json"),
+        serde_json::to_vec(&json!({"script": steps})).unwrap(),
+    )
+    .unwrap();
+}
+
+async fn sql_learning_requires_confirmation_and_does_not_replay(
+    root: &Path,
+    database: &Path,
+    password: &str,
+) {
+    const PREFERENCE: &str = "SQL_LEARNED_PREFERENCE：先给简短结论，再给必要依据。";
+    let mut chat = Server::start(
+        (0..3)
+            .map(|_| Reply::json(final_response("SQL 新作用域的普通回复。")))
+            .collect(),
+    )
+    .await;
+    let seeded = root.join("sql-learning-seeded");
+    let mut steps = vec![
+        json!({"send":learning_message("sql-learning-stop", "/train stop", "已结束当前会话的主动提问训练")}),
+        json!({"wait_command":{"id":"sql-learning-stop", "type":"reply"}}),
+    ];
+    for index in 0..3 {
+        let id = format!("sql-learning-seed-{index}");
+        steps.push(json!({"send":learning_message(
+            &id,
+            &format!("第 {index} 次说明：每次回答先给简短结论，再给必要依据。"),
+            "SQL 新作用域的普通回复。"
+        )}));
+        steps.push(json!({"wait_command":{"id":id, "type":"reply"}}));
+    }
+    steps.push(json!({"wait_file":seeded}));
+    script(root, steps);
+    let mut seed = command(Entry::Qq, root, &chat.url, Some(database));
+    seed.arg("--memory");
+    let poll = async {
+        wait_sql(database, |saved| {
+            let memory = document(saved, "eve.memory", "memory.v1");
+            memory["scopes"].as_array().unwrap().iter().any(|scope| {
+                is_learning_scope(scope)
+                    && scope["snapshot"]["evidence"]
+                        .as_array()
+                        .is_some_and(|evidence| evidence.len() == 3)
+            })
+        })
+        .await;
+        std::fs::write(&seeded, b"seeded").unwrap();
+    };
+    let (output, ()) = tokio::join!(Process::run(seed, "", password), poll);
+    successful(output, Entry::Qq);
+    for _ in 0..3 {
+        let request = chat.next().await.body;
+        assert!(!has_training(&request));
+        assert_preference_context(&request, None);
+    }
+    assert!(chat.requests.try_recv().is_err());
+    let before = rows(database);
+    let memory = document(&before, "eve.memory", "memory.v1");
+    let snapshot = learning_memory(&memory);
+    assert_eq!(snapshot["revision"], 3);
+    assert_eq!(snapshot["preferences"], json!([]));
+    assert!(
+        snapshot["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|evidence| {
+                evidence["source"]["kind"] == "CompletedInteraction"
+                    && evidence["source"]["message_id"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("sql-learning-seed-")
+            })
+    );
+    let receipts = document(&before, QQBOT_PLUGIN_ID, "receipts.v1");
+    for index in 0..3 {
+        let id = format!("sql-learning-seed-{index}");
+        assert!(
+            receipts["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| { entry["message"]["id"] == id && entry["state"] == "Sent" })
+        );
+    }
+
+    // 先前记忆测试的旧作用域也有三条经历；保留它并验证提炼不会跨作用域拼批。
+    assert_eq!(memory["scopes"].as_array().unwrap().len(), 2);
+    let mut server = LearningServer::start().await;
+    let url = server.url.clone();
+    let enabled = || {
+        let mut command = command(Entry::Qq, root, &url, Some(database));
+        command.args(["--memory", "--memory-learning"]);
+        command
+    };
+    let completed = root.join("sql-learning-completed");
+    script(root, vec![json!({"wait_file":completed})]);
+    let inspect = async {
+        let mut seen = vec![];
+        for _ in 0..2 {
+            let (request, reply) =
+                tokio::time::timeout(Duration::from_secs(10), server.requests.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let input = request["input"].as_array().unwrap();
+            assert_eq!(input.len(), 2);
+            assert_eq!(input[0]["role"], "system");
+            assert_eq!(input[1]["role"], "user");
+            assert!(!has_training(&request));
+            assert_preference_context(&request, None);
+            assert!(
+                request
+                    .get("tools")
+                    .is_none_or(|tools| { tools.as_array().is_some_and(Vec::is_empty) })
+            );
+            let batch: Value = serde_json::from_str(input[1]["content"].as_str().unwrap()).unwrap();
+            let saved = rows(database);
+            let learning = document(&saved, "eve.learning", "learning.v1");
+            let record = learning["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|record| record["job"]["batch"]["id"] == batch["id"])
+                .unwrap();
+            assert_eq!(record["job"]["status"], "Running");
+            assert_eq!(record["job"]["batch"], batch);
+            assert_eq!(record["job"]["candidates"], json!([]));
+            let source = &memory["scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|scope| scope["snapshot"]["scope"] == batch["scope"])
+                .unwrap()["snapshot"];
+            assert_eq!(record["memory_revision"], source["revision"]);
+            let expected: Vec<_> = source["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|evidence| evidence["source"]["kind"] == "CompletedInteraction")
+                .cloned()
+                .collect();
+            assert_eq!(batch["evidence"], json!(expected));
+            assert_eq!(expected.len(), 3);
+            assert!(!seen.contains(&batch["scope"]));
+            seen.push(batch["scope"].clone());
+            let ids: Vec<_> = expected.iter().map(|evidence| &evidence["id"]).collect();
+            let text = if batch["scope"] == snapshot["scope"] {
+                PREFERENCE
+            } else {
+                "SQL_OLD_SCOPE_CANDIDATE：旧作用域专属候选。"
+            };
+            assert!(
+                reply
+                    .send(json!({"candidates":[{
+                        "text":text, "confidence":83, "evidence_ids":ids
+                    }]}))
+                    .is_ok()
+            );
+        }
+        wait_sql(database, |saved| {
+            let learning = document(saved, "eve.learning", "learning.v1");
+            let jobs = learning["jobs"].as_array().unwrap();
+            jobs.len() == 2
+                && jobs
+                    .iter()
+                    .all(|record| record["job"]["status"] == "Completed")
+        })
+        .await;
+        std::fs::write(&completed, b"completed").unwrap();
+    };
+    let (output, ()) = tokio::join!(Process::run(enabled(), "", password), inspect);
+    successful(output, Entry::Qq);
+    assert!(server.requests.try_recv().is_err());
+    let extracted = rows(database);
+    assert_eq!(document(&extracted, "eve.memory", "memory.v1"), memory);
+    assert_eq!(
+        document(&extracted, "eve.cognition", "cognition.v1"),
+        document(&before, "eve.cognition", "cognition.v1")
+    );
+    let learning = document(&extracted, "eve.learning", "learning.v1");
+    let candidate = &learning["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["job"]["batch"]["scope"] == snapshot["scope"])
+        .unwrap()["job"]["candidates"][0];
+    let candidate_id = candidate["id"].as_str().unwrap();
+    let preference_id = format!("learned-{candidate_id}");
+    let acceptance = format!("/accept-memory {candidate_id}");
+    assert_eq!(candidate["draft"]["text"], PREFERENCE);
+    assert_eq!(candidate["draft"]["confidence"], 83);
+    assert_eq!(
+        candidate["draft"]["evidence_ids"].as_array().unwrap().len(),
+        3
+    );
+    scenario(
+        root,
+        vec![learning_message(
+            "sql-learning-accept",
+            &acceptance,
+            "候选偏好已确认：",
+        )],
+    );
+    successful(Process::run(enabled(), "", password).await, Entry::Qq);
+    let accepted = rows(database);
+    let accepted_memory = document(&accepted, "eve.memory", "memory.v1");
+    let snapshot = learning_memory(&accepted_memory);
+    assert_eq!(snapshot["revision"], 4);
+    assert_eq!(snapshot["preferences"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["evidence"].as_array().unwrap().len(), 4);
+    let preference = &snapshot["preferences"][0];
+    assert_eq!(preference["id"], preference_id);
+    assert_eq!(preference["text"], PREFERENCE);
+    assert_eq!(preference["status"], "Confirmed");
+    assert_eq!(
+        snapshot["evidence"][3]["source"],
+        json!({
+            "kind":"UserStatement", "message_id":"sql-learning-accept", "text":acceptance
+        })
+    );
+    assert_eq!(
+        preference["history"][0]["evidence_id"],
+        snapshot["evidence"][3]["id"]
+    );
+    assert_eq!(document(&accepted, "eve.learning", "learning.v1"), learning);
+
+    // 空消息重启保持桥接存活两轮扫描：旧批次不重请求，所有 SQL 原始行逐字节不变。
+    let ready = root.join("sql-learning-idle-ready");
+    let idle = root.join("sql-learning-idle-completed");
+    script(
+        root,
+        vec![json!({"touch":ready}), json!({"wait_file":idle})],
+    );
+    let inspect = async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(650), server.requests.recv())
+                .await
+                .is_err()
+        );
+        std::fs::write(&idle, b"idle").unwrap();
+    };
+    let (output, ()) = tokio::join!(Process::run(enabled(), "", password), inspect);
+    successful(output, Entry::Qq);
+    assert_eq!(rows(database), accepted);
+
+    scenario(
+        root,
+        vec![learning_message(
+            "sql-learning-forget",
+            &format!("/forget {preference_id}"),
+            "偏好已撤销：",
+        )],
+    );
+    successful(Process::run(enabled(), "", password).await, Entry::Qq);
+    let revoked = rows(database);
+    let revoked_memory = document(&revoked, "eve.memory", "memory.v1");
+    let preference = &learning_memory(&revoked_memory)["preferences"][0];
+    assert_eq!(preference["status"], "Revoked");
+    assert_eq!(preference["history"].as_array().unwrap().len(), 2);
+    scenario(
+        root,
+        vec![learning_message(
+            "sql-learning-accept-after-forget",
+            &acceptance,
+            "目前已撤销：",
+        )],
+    );
+    successful(Process::run(enabled(), "", password).await, Entry::Qq);
+    let final_rows = rows(database);
+    assert_eq!(
+        document(&final_rows, "eve.memory", "memory.v1"),
+        revoked_memory
+    );
+    assert_eq!(
+        document(&final_rows, "eve.learning", "learning.v1"),
+        learning
+    );
+    assert!(server.requests.try_recv().is_err());
+    assert!(!root.join("state/state.json").exists());
+    for (_, _, bytes) in &final_rows {
+        for secret in [MODEL_KEY, QQ_KEY, password] {
+            assert!(!String::from_utf8_lossy(bytes).contains(secret));
+        }
+    }
+}
+
 #[test]
 fn both_entries_parse_explicit_database_paths_and_keep_file_default() {
     let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
@@ -816,6 +1236,12 @@ async fn sql_qq_and_console_preserve_history_training_and_receipts_without_repla
     assert!(server.requests.try_recv().is_err());
     assert_eq!(rows(&database), committed);
     sql_memory_and_cognition(root.path(), &database, &credentials.password).await;
+    sql_learning_requires_confirmation_and_does_not_replay(
+        root.path(),
+        &database,
+        &credentials.password,
+    )
+    .await;
     admin(&database, |client| {
         client
             .batch_execute("DROP SCHEMA eve_state CASCADE")

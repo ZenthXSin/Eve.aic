@@ -35,7 +35,21 @@ QQBOT_SANDBOX=true ./target/debug/eve-qqbot --state-dir .eve-qqbot
 
 读取范围绑定当前可信 QQ 完整会话及用户，不跨 AppID、私聊/群、目标或发送者。已确认偏好由 `MemoryContext` 包装既有 `TrainingContext`，最多添加 8 条、8192 字节，当前请求优先；内部反思继续使用独立空 Context。`/train stop`、`/train reset` 不影响明确偏好。
 
-普通消息只有在实际 Session 已 `Completed` 且 QQ `Sent` 已保存后才导入用户原文和最终回复；命令、控制替代轮、取消和失败轮不冒充成功交互。只观察本次新成功消息，不从旧回执补采，也不自动从聊天提炼偏好。命令来源和偏好同次提交，但记忆与 QQ 回执没有跨服务事务：确认回复缺失时偏好可能已保存，已送达交互也可能因崩溃尚未导入。使用新 `/memories` 核对，恢复不自动重放。记忆与 QQ 宿主共用所选的文件或 PostgreSQL 后端，各插件仍独立提交；容量和失败恢复边界见[交互记忆](./交互记忆.md#持久化与失败恢复)。
+普通消息只有在实际 Session 已 `Completed` 且 QQ `Sent` 已保存后才导入用户原文和最终回复；命令、控制替代轮、取消和失败轮不冒充成功交互。只观察本次新成功消息，不从旧回执补采；单独开启 `--memory` 不调用模型提炼。命令来源和偏好同次提交，但记忆与 QQ 回执没有跨服务事务：确认回复缺失时偏好可能已保存，已送达交互也可能因崩溃尚未导入。使用新 `/memories` 核对，恢复不自动重放。记忆与 QQ 宿主共用所选的文件或 PostgreSQL 后端，各插件仍独立提交；容量和失败恢复边界见[交互记忆](./交互记忆.md#持久化与失败恢复)。
+
+## 本地偏好候选提炼
+
+`--memory-learning` 在 `--memory` 基础上开启[低频偏好提炼](./偏好提炼.md)，默认关闭，缺少 `--memory` 时拒绝启动：
+
+```sh
+./target/debug/eve-qqbot --state-dir .eve-qqbot --memory --memory-learning
+```
+
+同一可信会话至少积累 3 条尚未消费的完成交互才可开始，每批最多 8 条、完整批次 JSON 最多 32768 字节，同范围从上次批次开始起冷却 5 分钟。首次开启可处理 Memory 中此前已经保存的证据，不补采 QQ 旧回执。每次进程启动所有范围合计最多 4 批，每批最多一次 30 秒、零工具的主模型请求；不读取其他范围、训练统计、明确命令证据或反思 Context。无新证据时不调用模型，失败和空结果也不重试原批。
+
+`/memory-candidates [页码]` 每页查看最多 5 条候选，包含完整正文、来源证据 ID、自评和期限；模型自评不是事实概率。`/accept-memory 候选ID` 明确确认后，才成为下一轮 Context 可以使用的偏好。首次确认期限为创建后 7 天；已确认偏好仍由 `/correct-memory`、`/forget` 控制，重复接受不覆盖修正或恢复撤销。候选不会主动推送，这些查询与确认命令均不调用模型；关闭时返回“偏好提炼未启用”。
+
+Learning 批次先保存 `Running` 和输入，再发起请求；恢复将残留 `Running` 记为 `Interrupted`，不自动继续。确认只用一次 Memory CAS 保存真实命令与偏好，Learning 候选保持不变；新查询核对首版来源与当前偏好状态，避免跨插件接受状态双写。新增 `eve.learning/learning.v1`，不改变原 `memory.v1`；文件和 PostgreSQL 都按各插件独立提交，损坏或提交无法确认时停止并保留状态。全局容量、输入和输出边界及恢复说明见[偏好提炼](./偏好提炼.md)。
 
 ## 本地内生反思
 
@@ -105,7 +119,7 @@ QQ 与终端共用每轮模型解析：在新代执行前捕获当前配置，�
 
 ## 停止与验收
 
-宿主收到 Ctrl+C / Unix SIGTERM、桥接 EOF、启动失败或认知后台异常时，统一收尾：先通过 QQ 状态服务 request_stop 关闭通道准入，同时停止认知规划并取消、等待内部执行；随后等待前台 Control 保存、桥接 stop 与子进程退出，最后停止 Kernel 插件并刷新日志。这样避免 Kernel 的生命周期准入等待与在途模型形成等待冲突。即使后台规划任务异常，仍先等待认知循环实际结束。桥接子进程不配合时有界终止并回收，不以发出信号代替确认退出。非关键消息/投递故障使用 warning 并继续；状态损坏和保存失败保留数据并终止。
+宿主收到 Ctrl+C / Unix SIGTERM、桥接 EOF、启动失败、认知或偏好提炼后台异常时，统一收尾：先通过 QQ 状态服务 request_stop 关闭通道准入，同时停止认知规划和提炼，并取消、等待内部执行；随后等待前台 Control 保存、桥接 stop 与子进程退出，最后停止 Kernel 插件并刷新日志。这样避免 Kernel 的生命周期准入等待与在途模型形成等待冲突。即使后台规划任务异常，仍先等待认知循环实际结束；在途提炼正常取消后保存失败结局，突发退出则在重启时标记 Interrupted。桥接子进程不配合时有界终止并回收，不以发出信号代替确认退出。非关键消息/投递故障使用 warning 并继续；状态损坏和保存失败保留数据并终止。
 
 认知恢复将旧 `Executing` 标为 `Blocked/Interrupted`，保留执行与 Session 关联；Session 的旧 Pending 仍转为 Interrupted。已完成草稿可由新查询读取，失败、取消或不确定的同修订反思不自动重试；QQ 的旧 Processing/ReplyPending 也不自动发送。认知、Session 和 QQ 回执各自保存，不能从任一记录缺失推断另一项业务从未发生。
 
@@ -115,11 +129,14 @@ cargo build -p eve-app --bin eve-qqbot --locked
 python3 connectors/qqbot/test/eve_e2e.py
 python3 connectors/qqbot/test/cognition_test.py
 python3 connectors/qqbot/test/memory_test.py
+python3 connectors/qqbot/test/learning_test.py
 ```
 
 离线验收实际运行 Eve、生产 Rust 插件、测试 Node 子进程与 loopback Chat HTTP，覆盖工具/回复、两进程回忆与去重、群发送者/AppID 路由、发送失败保留提交、Processing 不重放、损坏状态保留、SIGTERM 取消与 Node 回收。Node 测试另覆盖 C2C/群原目标与 msg_id、pending 上限、finish、无重试发送失败、坏/超长 JSONL 与 EOF。它们与真实 QQ 交互分别记录，离线通过不代表 QQ 权限、认证或消息发送已经通过。
 
 新增认知进程验收覆盖默认关闭与无效命令零请求、后台反思不受训练上下文影响、前台取消与后台执行独立、群/用户/AppID 隔离、已保存草稿跨进程查询与去重、非法草稿阻塞、SIGTERM 取消收尾和再次启动零重放。这些使用本地 HTTP 替身，不代表新增 QQ 命令已完成实机验收。
+
+偏好提炼进程验收另覆盖三条完成交互门槛、Running 先于 HTTP 请求保存、候选不自动注入 Context、确认后修正撤销及重复接受、可信范围隔离、持久冷却和每次启动四批上限，以及错误、取消、突发退出后的零重试。实际模型候选质量与 QQ 新命令仍须本地实机验证，不能以替身返回的合格 JSON 代替用户认可。
 
 显式 primary 接线新增两个实际 Eve 用例：角色模型/输出上限控制与重启恢复、角色关闭后零请求且原状态不变。[PR #70 离线验收](https://github.com/ZenthXSin/Eve.aic/actions/runs/36958593968) 已通过七项 Node 与八项 Eve 进程用例，完整 CI 和性能证据见[模型配置验收](./模型配置.md#核心主模型接线验收)。
 
