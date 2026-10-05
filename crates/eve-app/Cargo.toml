@@ -39,6 +39,8 @@ eve-memory-api = { path = "../memory-api" }
 eve-memory-plugin = { path = "../memory-plugin" }
 eve-plugin-api = { path = "../plugin-api" }
 eve-qqbot-plugin = { path = "../qqbot-plugin" }
+eve-segment-api = { path = "../segment-api" }
+eve-segment-plugin = { path = "../segment-plugin" }
 eve-runtime = { path = "../runtime" }
 eve-session-api = { path = "../session-api" }
 eve-session-plugin = { path = "../session-plugin" }

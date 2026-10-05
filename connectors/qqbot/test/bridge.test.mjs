@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
-import { createBridge, consume, optionsFromEnv, MAX_MESSAGE_ID_BYTES } from "../bridge-core.mjs";
-function fixture({ fail = false, limit = 128, appId = "1904159860" } = {}) {
+import { createBridge, consume, optionsFromEnv, MAX_MESSAGE_ID_BYTES, MAX_SEGMENTS } from "../bridge-core.mjs";
+function fixture({ fail = false, limit = 128, appId = "1904159860", hold = null } = {}) {
   const frames = [], sent = [], handlers = new Map();
   const bot = {
     appId,
@@ -10,7 +10,8 @@ function fixture({ fail = false, limit = 128, appId = "1904159860" } = {}) {
     stop: () => handlers.set("stopped", true),
     async sendText(target, text) {
       sent.push({ target, text });
-      if (fail) throw new Error("sensitive secret and message");
+      if (hold) await hold;
+      if (typeof fail === "function" ? fail(sent.length) : fail) throw new Error("sensitive secret and message");
       return { id: "out-1" };
     },
   };
@@ -189,4 +190,62 @@ test("原生训练命令只剥离开头已确认的自身 @，保留其他提及
     mentions: [{ member_openid: "bot-openid", is_you: true }],
     replyTarget: { scope: "group", targetId: "group-1", msgId: "empty-1" }, content: "<@bot-openid>" });
   assert.equal(f.frames.filter(x => x.type === "message").length, 0);
+});
+
+const segment = (index, count, text = `第${index + 1}段`, id = "in-1") =>
+  ({ type: "segment", version: 1, id, index, count, text });
+for (const scope of ["c2c", "group"]) test(scope + " 分段按序回复原目标，末段后释放 pending", async () => {
+  const f = fixture(); f.message(scope);
+  await f.bridge.command(segment(0, 3));
+  await f.bridge.command(segment(1, 3));
+  await f.bridge.command(segment(2, 3));
+  const target = { scope, targetId: scope === "group" ? "group-1" : "user-1", msgId: "in-1" };
+  assert.deepEqual(f.sent, [0, 1, 2].map(i => ({ target, text: `第${i + 1}段` })));
+  assert.deepEqual(f.frames.filter(x => x.type === "delivery").map(x => [x.index, x.ok]), [[0, true], [1, true], [2, true]]);
+  await f.bridge.command(segment(2, 3));
+  await f.bridge.command({ type: "reply", version: 1, id: "in-1", text: "再次答复" });
+  assert.equal(f.sent.length, 3);
+  assert.equal(f.frames.at(-1).code, "unknown_reply");
+});
+test("分段拒绝乱序、重复、越界和整条回复混用", async () => {
+  const f = fixture(); f.message();
+  for (const bad of [segment(1, 2), segment(0, 1), segment(0, MAX_SEGMENTS + 1), segment(2, 2),
+                     { ...segment(0, 2), text: " " }, { ...segment(0, 2), index: "0" }]) {
+    await f.bridge.command(bad);
+  }
+  assert.equal(f.sent.length, 0);
+  await f.bridge.command(segment(0, 2));
+  await f.bridge.command(segment(0, 2));
+  await f.bridge.command({ ...segment(1, 3) });
+  await f.bridge.command({ type: "reply", version: 1, id: "in-1", text: "整条" });
+  assert.deepEqual(f.sent.map(x => x.text), ["第1段"]);
+  const codes = f.frames.filter(x => x.type === "warning").map(x => x.code);
+  for (const code of ["invalid_command", "segment_order", "duplicate_reply"]) assert.ok(codes.includes(code), code);
+  await f.bridge.command(segment(1, 2));
+  assert.deepEqual(f.sent.map(x => x.text), ["第1段", "第2段"]);
+});
+test("分段失败即结束，不重试也不继续后续片段", async () => {
+  const f = fixture({ fail: n => n === 2 }); f.message();
+  await f.bridge.command(segment(0, 3));
+  await f.bridge.command(segment(1, 3));
+  await f.bridge.command(segment(2, 3));
+  assert.deepEqual(f.sent.map(x => x.text), ["第1段", "第2段"]);
+  assert.deepEqual(f.frames.filter(x => x.type === "delivery").map(x => [x.index, x.ok]), [[0, true], [1, false]]);
+  assert.ok(!JSON.stringify(f.frames).includes("sensitive"));
+});
+test("段间 finish 释放 pending；发送中的 finish 在本段结束后释放", async () => {
+  const f = fixture(); f.message();
+  await f.bridge.command(segment(0, 3));
+  await f.bridge.command({ type: "finish", version: 1, id: "in-1" });
+  await f.bridge.command(segment(1, 3));
+  assert.equal(f.sent.length, 1);
+  let release;
+  const g = fixture({ hold: new Promise(resolve => { release = resolve; }) }); g.message();
+  const sending = g.bridge.command(segment(0, 2));
+  await g.bridge.command({ type: "finish", version: 1, id: "in-1" });
+  release();
+  await sending;
+  await g.bridge.command(segment(1, 2));
+  assert.equal(g.sent.length, 1);
+  assert.equal(g.frames.at(-1).code, "unknown_reply");
 });

@@ -21,6 +21,13 @@ const checkReply = (cmd, message) => {
   } else if (cmd.text !== message.expected) throw new Error("wrong_reply_text");
 };
 const deliver = id => send({ type: "delivery", id, ok: !scenario.send_fail, message_id: "out-" + id });
+const deliverSegment = (id, index, ok = true) => send({ type: "delivery", id, index, ok, message_id: `out-${id}-${index}` });
+const checkSegment = (cmd, message) => {
+  if (message.expected_type === "finish") throw new Error("retired_result_was_replied");
+  const expected = message.expected_segments;
+  if (!Array.isArray(expected)) throw new Error("unexpected_segment");
+  if (cmd.count !== expected.length || cmd.text !== expected[cmd.index]) throw new Error("wrong_segment_text");
+};
 
 // Script steps synchronize against real HTTP request arrival or Rust commands,
 // so control commands are injected while a particular generation is in flight.
@@ -57,6 +64,10 @@ if (scenario.script) {
       } else if (step.delivery) {
         if (!commands.some(cmd => cmd.type === "reply" && cmd.id === step.delivery)) throw new Error("delivery_before_reply");
         deliver(step.delivery);
+      } else if (step.deliver_segment) {
+        const { id, index, ok } = step.deliver_segment;
+        if (!commands.some(cmd => cmd.type === "segment" && cmd.id === id && cmd.index === index)) throw new Error("delivery_before_segment");
+        deliverSegment(id, index, ok ?? true);
       } else if (step.wait_turn) {
         if (!await until(() => {
           const document = JSON.parse(fs.readFileSync(step.wait_turn.path, "utf8"));
@@ -96,16 +107,22 @@ if (scenario.script) {
     const lines = readline.createInterface({ input: process.stdin });
     for await (const line of lines) {
       const cmd = JSON.parse(line);
-      record({ direction: "out", ...cmd });
+      record({ direction: "out", ...cmd, ...(cmd.type === "segment" ? { at: Date.now() } : {}) });
       if (cmd.type === "stop") { stopped = true; return; }
       const message = pending.get(cmd.id);
       if (!message) throw new Error("wrong_reply_id");
       if (cmd.type === "reply") {
+        if (message.expected_segments) throw new Error("expected_segments_got_reply");
         checkReply(cmd, message);
         if (!message.hold_delivery) deliver(cmd.id);
+      } else if (cmd.type === "segment") {
+        checkSegment(cmd, message);
+        if (!(message.hold_segments ?? []).includes(cmd.index)) {
+          deliverSegment(cmd.id, cmd.index, message.fail_segment !== cmd.index);
+        }
       } else if (cmd.type !== "finish") {
         throw new Error("unexpected_command");
-      } else if (message.expected_type === "reply") {
+      } else if (message.expected_type === "reply" && !message.allow_finish) {
         throw new Error("expected_reply_was_finished");
       }
       commands.push(cmd);

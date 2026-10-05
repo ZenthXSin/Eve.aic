@@ -1,11 +1,26 @@
 use crate::{AppError, ChatSummary, HELP, input::InputEvent};
 use eve_control_api::*;
 use eve_llm_api::LlmError;
+use eve_segment_api::{SegmentLimits, SegmentPlanner, plan_or_single};
 use eve_session_api::{SessionInput, SessionKey};
-use std::{collections::VecDeque, future::Future, io::Write, sync::Arc};
-use tokio::sync::mpsc;
+use std::{collections::VecDeque, future::Future, io::Write, sync::Arc, time::Duration};
+use tokio::{sync::mpsc, time::Instant};
 
 const MAX_PENDING: usize = 16;
+
+/// 终端分段显示：完整回复保存后，先显示首段，其余片段按停顿依次显示。
+pub(crate) struct Segmenter {
+    pub planner: Arc<dyn SegmentPlanner>,
+    pub limits: SegmentLimits,
+}
+/// 尚未显示的片段及其段前停顿；只是显示队列，不是新的会话输入。
+type Later = VecDeque<(String, u64)>;
+/// 剩余片段与原报告；显示失败时仍以 ChatOutputError 返回已保存的完整报告。
+#[derive(Debug)]
+struct Display {
+    later: Later,
+    report: Option<Box<ControlReport>>,
+}
 
 /// 保存完整控制报告，含生成输出、工具回执、提交状态和原始失败。
 #[derive(Debug)]
@@ -59,7 +74,8 @@ fn finish(
     report: ControlReport,
     output: &mut impl Write,
     summary: &mut ChatSummary,
-) -> Result<(), AppError> {
+    segmenter: Option<&Segmenter>,
+) -> Result<Display, AppError> {
     let completed = report.run.commit == CommitState::Completed;
     let cancelled_delivery = report.cancel_requested
         && report.run.failure == Some(RunFailure::Delivery(LlmError::Cancelled));
@@ -85,11 +101,29 @@ fn finish(
     } else {
         !cancelled && !execution_failed && !configuration_rejected
     };
+    let mut later = Later::new();
     let displayed = (|| -> std::io::Result<()> {
         if completed {
             if let Some(text) = &report.run.text {
                 summary.completed_turns += 1;
-                writeln!(output, "Eve：{text}")?;
+                // 规划失败、计划无效或已请求取消时整条显示。
+                let plan = segmenter
+                    .filter(|_| !fatal && !report.cancel_requested)
+                    .and_then(|s| plan_or_single(s.planner.as_ref(), text, s.limits).ok())
+                    .map(|(plan, _)| plan)
+                    .filter(|plan| plan.segments.len() > 1);
+                match plan {
+                    Some(plan) => {
+                        let mut parts = plan
+                            .segments
+                            .iter()
+                            .map(|s| (text[s.start..s.end].to_owned(), s.pause_before_ms));
+                        let (first, _) = parts.next().expect("multi-segment plan");
+                        writeln!(output, "Eve：{first}")?;
+                        later.extend(parts);
+                    }
+                    None => writeln!(output, "Eve：{text}")?,
+                }
                 if report.cancel_requested && !fatal {
                     writeln!(output, "Eve：本轮已完成并保存，取消未改写完成历史。")?;
                 }
@@ -108,7 +142,10 @@ fn finish(
         output.flush()
     })();
     match (fatal, displayed) {
-        (false, Ok(())) => Ok(()),
+        (false, Ok(())) => Ok(Display {
+            report: (!later.is_empty()).then(|| Box::new(report)),
+            later,
+        }),
         (false, Err(output)) => Err(ChatOutputError {
             output,
             report: Box::new(report),
@@ -134,6 +171,7 @@ enum Next {
     Input(Option<InputEvent>),
     Done(Box<ControlResult<ControlReport>>),
     Shutdown(std::io::Result<()>),
+    Segment,
 }
 pub(crate) async fn drive(
     control: Arc<dyn ControlService>,
@@ -141,8 +179,12 @@ pub(crate) async fn drive(
     mut input: mpsc::Receiver<InputEvent>,
     output: &mut impl Write,
     shutdown: impl Future<Output = std::io::Result<()>>,
+    segmenter: Option<Segmenter>,
 ) -> Result<ChatSummary, AppError> {
     let mut pending = VecDeque::new();
+    let mut later = Later::new();
+    let mut shown: Option<Box<ControlReport>> = None;
+    let mut next_at: Option<Instant> = None;
     let mut active: Option<(GenerationKey, ControlFuture<'static, ControlReport>)> = None;
     let mut summary = ChatSummary::default();
     let mut eof = false;
@@ -150,7 +192,9 @@ pub(crate) async fn drive(
     let mut ordinal = 0u64;
     tokio::pin!(shutdown);
     loop {
+        // 剩余片段显示完之前不开始下一轮；EOF 也先显示完已保存回复。
         if active.is_none()
+            && later.is_empty()
             && !quitting
             && let Some(text) = pending.pop_front()
         {
@@ -168,7 +212,7 @@ pub(crate) async fn drive(
             let wait = control.wait(&target);
             active = Some((target, wait));
         }
-        if active.is_none() && (quitting || eof && pending.is_empty()) {
+        if active.is_none() && later.is_empty() && (quitting || eof && pending.is_empty()) {
             break;
         }
         let next = tokio::select! {
@@ -181,16 +225,39 @@ pub(crate) async fn drive(
             } => Next::Done(Box::new(report)),
             signal = &mut shutdown, if !quitting => Next::Shutdown(signal),
             event = input.recv(), if !eof && !quitting => Next::Input(event),
+            _ = tokio::time::sleep_until(next_at.unwrap_or_else(Instant::now)), if next_at.is_some() => Next::Segment,
         };
         match next {
             Next::Done(report) => {
                 active = None;
-                finish((*report)?, output, &mut summary)?;
+                let display = finish((*report)?, output, &mut summary, segmenter.as_ref())?;
+                (later, shown) = (display.later, display.report);
+                next_at = later
+                    .front()
+                    .map(|(_, pause)| Instant::now() + Duration::from_millis(*pause));
+            }
+            Next::Segment => {
+                if let Some((text, _)) = later.pop_front()
+                    && let Err(error) =
+                        writeln!(output, "Eve：{text}").and_then(|()| output.flush())
+                {
+                    return Err(ChatOutputError {
+                        output: error,
+                        report: shown.take().expect("segmented display keeps its report"),
+                    }
+                    .into());
+                }
+                next_at = later
+                    .front()
+                    .map(|(_, pause)| Instant::now() + Duration::from_millis(*pause));
             }
             Next::Shutdown(signal) => {
                 signal?;
                 quitting = true;
                 pending.clear();
+                later.clear();
+                shown = None;
+                next_at = None;
                 input.close();
                 if let Some((target, _)) = &active {
                     control.cancel(target)?;
@@ -213,6 +280,11 @@ pub(crate) async fn drive(
                     if let Some((target, _)) = &active {
                         control.cancel(target)?;
                         writeln!(output, "Eve：取消已请求，正在等待收尾。")?;
+                    } else if !later.is_empty() {
+                        later.clear();
+                        shown = None;
+                        next_at = None;
+                        writeln!(output, "Eve：已停止显示剩余分段；完整回复已保存。")?;
                     } else {
                         writeln!(output, "Eve：当前没有在途任务；待处理输入已清空。")?;
                     }
@@ -221,6 +293,9 @@ pub(crate) async fn drive(
                 "/quit" => {
                     quitting = true;
                     pending.clear();
+                    later.clear();
+                    shown = None;
+                    next_at = None;
                     input.close();
                     if let Some((target, _)) = &active {
                         control.cancel(target)?;
@@ -292,7 +367,7 @@ mod tests {
         rejected.run.failure = Some(RunFailure::Execution(error));
         let mut output = Vec::new();
         let mut summary = ChatSummary::default();
-        finish(rejected.clone(), &mut output, &mut summary).unwrap();
+        finish(rejected.clone(), &mut output, &mut summary, None).unwrap();
         assert_eq!(summary.failed_turns, 1);
         assert_eq!(summary.completed_turns, 0);
         assert!(String::from_utf8(output).unwrap().contains("无效模型选择"));
@@ -301,7 +376,7 @@ mod tests {
             unsafe_report.run.started_tools = uncertain_tools;
             let mut output = Vec::new();
             let mut summary = ChatSummary::default();
-            assert!(finish(unsafe_report, &mut output, &mut summary).is_err());
+            assert!(finish(unsafe_report, &mut output, &mut summary, None).is_err());
         }
     }
 
@@ -309,7 +384,13 @@ mod tests {
     fn committed_reply_wins_cancel_race_without_becoming_cancelled_or_failed() {
         let mut output = Vec::new();
         let mut summary = ChatSummary::default();
-        finish(report(CommitState::Completed), &mut output, &mut summary).unwrap();
+        finish(
+            report(CommitState::Completed),
+            &mut output,
+            &mut summary,
+            None,
+        )
+        .unwrap();
         assert_eq!(summary.completed_turns, 1);
         assert_eq!(summary.cancelled_turns, 0);
         assert_eq!(summary.failed_turns, 0);
@@ -326,6 +407,7 @@ mod tests {
             expected.clone(),
             &mut Vec::new(),
             &mut ChatSummary::default(),
+            None,
         )
         .unwrap_err();
         let actual = error.downcast_ref::<ChatRunError>().unwrap();
@@ -378,6 +460,7 @@ mod tests {
                 expected.clone(),
                 &mut FailingOutput(fault),
                 &mut ChatSummary::default(),
+                None,
             )
             .unwrap_err();
             let actual = error.downcast_ref::<ChatOutputError>().unwrap();
@@ -404,6 +487,7 @@ mod tests {
                     expected.clone(),
                     &mut FailingOutput(fault),
                     &mut ChatSummary::default(),
+                    None,
                 )
                 .unwrap_err();
                 assert_eq!(
@@ -427,6 +511,7 @@ mod tests {
                     expected.clone(),
                     &mut FailingOutput(fault),
                     &mut ChatSummary::default(),
+                    None,
                 )
                 .unwrap_err();
                 let actual = error.downcast_ref::<crate::AppFailure>().unwrap();
@@ -457,6 +542,7 @@ mod tests {
             expected.clone(),
             &mut Vec::new(),
             &mut ChatSummary::default(),
+            None,
         )
         .unwrap_err();
         assert_eq!(

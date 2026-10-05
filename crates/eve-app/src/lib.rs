@@ -49,15 +49,22 @@ use std::{
 
 pub type AppError = Box<dyn std::error::Error + Send + Sync>;
 pub const HELP: &str = "Eve 核心对话入口
-用法：eve [--state-dir 目录] [--database-config 文件] [--agent AGENT.md] [--session 会话] [--user 用户]
+用法：eve [--state-dir 目录] [--database-config 文件] [--agent AGENT.md] [--session 会话] [--user 用户] [--segmented]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 主模型默认 deepseek-v4.1-flash，可用 EVE_OPENAI_MODEL 替换；凭据：EVE_OPENAI_API_KEY
 协议默认 chat；EVE_OPENAI_PROTOCOL 可选 chat/responses\n可选：EVE_OPENAI_BASE_URL、EVE_OPENAI_REASONING_EFFORT
 EVE_OPENAI_MODEL_ROLE=primary 显式使用 runtime.models 的主模型角色配置；每轮固定选择。
 一行一轮；/cancel 取消当前轮；/quit 或 Ctrl+C 取消并退出；/help 查看说明。
+--segmented 保存完整回复后按自然段分至多 3 段显示，段间停顿至多 2.5 秒；/cancel 停止显示剩余片段。
 EOF 处理完已接收输入后退出；最多 16 条待处理输入，取消/退出会清空队列。
 输入上限 32768 字节；当前入口使用非流式模式，串行执行和保存。";
 const MAX_INPUT_BYTES: usize = 32768;
+/// 终端与 QQ 默认一致：最多三段，段前停顿最长 2.5 秒。
+const CONSOLE_SEGMENT_LIMITS: eve_segment_api::SegmentLimits = eve_segment_api::SegmentLimits {
+    max_segments: 3,
+    max_segment_bytes: MAX_INPUT_BYTES,
+    max_pause_ms: 2500,
+};
 
 #[derive(Clone, Debug)]
 pub struct ChatOptions {
@@ -66,6 +73,7 @@ pub struct ChatOptions {
     pub agent_path: PathBuf,
     pub session_id: String,
     pub user_id: String,
+    pub segmented: bool,
 }
 impl Default for ChatOptions {
     fn default() -> Self {
@@ -75,6 +83,7 @@ impl Default for ChatOptions {
             agent_path: "AGENT.md".into(),
             session_id: "default".into(),
             user_id: "owner".into(),
+            segmented: false,
         }
     }
 }
@@ -85,6 +94,10 @@ impl ChatOptions {
         while let Some(arg) = args.next() {
             if arg == "--help" || arg == "-h" {
                 return Ok(None);
+            }
+            if arg == "--segmented" {
+                options.segmented = true;
+                continue;
             }
             if !matches!(
                 arg.to_str(),
@@ -160,6 +173,10 @@ pub async fn run_console(
             receiver,
             &mut output,
             tokio::signal::ctrl_c(),
+            options.segmented.then(|| console::Segmenter {
+                planner: Arc::new(eve_segment_plugin::ParagraphPlanner::default()),
+                limits: CONSOLE_SEGMENT_LIMITS,
+            }),
         )
         .await;
         let settled = console::settle(control.as_ref(), &key).await;

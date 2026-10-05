@@ -2,6 +2,8 @@
 export const MAX_FRAME = 65536;
 // The control task ID adds "qq:" and must fit its 256-byte contract.
 export const MAX_MESSAGE_ID_BYTES = 253;
+// QQ passive replies to one inbound message are limited; segmented replies stay within it.
+export const MAX_SEGMENTS = 5;
 const validId = v => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v);
 const validMessageId = v => typeof v === "string" && v.trim() === v && v.length > 0 &&
   Buffer.byteLength(v) <= MAX_MESSAGE_ID_BYTES && !/[\p{Cc}]/u.test(v);
@@ -81,6 +83,34 @@ export function createBridge(bot, emit, limit = 128) {
       target_id: target.targetId, user_id: msg.senderId,
       text });
   });
+  // One part at a time, strictly in order; a failed or final part ends the reply.
+  async function segment(frame, item) {
+    const { index, count } = frame;
+    if (!Number.isInteger(count) || count < 2 || count > MAX_SEGMENTS ||
+        !Number.isInteger(index) || index < 0 || index >= count || !validText(frame.text)) {
+      warn("invalid_command"); return;
+    }
+    if (item.sending) { warn("duplicate_reply"); return; }
+    if ((item.next ?? 0) !== index || (item.count ?? count) !== count) { warn("segment_order"); return; }
+    item.sending = true;
+    item.count = count;
+    let ok = false;
+    try {
+      const result = await bot.sendText(item.target, frame.text);
+      ok = true;
+      send({ type: "delivery", id: frame.id, index, ok: true,
+        ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
+    } catch (err) {
+      const diagnostic = {};
+      if (Number.isInteger(err?.statusCode)) diagnostic.http_status = err.statusCode;
+      if (Number.isInteger(err?.code)) diagnostic.biz_code = err.code;
+      send({ type: "delivery", id: frame.id, index, ok: false, ...diagnostic });
+    } finally {
+      item.sending = false;
+      item.next = index + 1;
+      if (!ok || item.next === count || item.finished) pending.delete(frame.id);
+    }
+  }
   return {
     stop,
     warn,
@@ -93,10 +123,12 @@ export function createBridge(bot, emit, limit = 128) {
       if (!item) { warn("unknown_reply"); return; }
       if (frame.type === "finish") {
         if (!item.sending) pending.delete(frame.id);
+        else item.finished = true;
         return;
       }
+      if (frame.type === "segment") { await segment(frame, item); return; }
       if (frame.type !== "reply" || !validText(frame.text)) { warn("invalid_command"); return; }
-      if (item.sending) { warn("duplicate_reply"); return; }
+      if (item.sending || item.next !== undefined) { warn("duplicate_reply"); return; }
       item.sending = true;
       try {
         const result = await bot.sendText(item.target, frame.text);
