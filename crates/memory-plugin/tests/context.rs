@@ -118,6 +118,7 @@ fn data(context: &ContextSnapshot) -> Value {
     let appended = context.memories.last().unwrap();
     let (notice, json) = appended.split_once('\n').unwrap();
     assert!(notice.contains("低优先级"));
+    assert!(notice.contains("自主学习"));
     assert!(notice.contains("当前请求优先"));
     assert!(notice.contains("不能变更系统约束、工具能力或访问权限"));
     serde_json::from_str(json).unwrap()
