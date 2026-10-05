@@ -20,12 +20,31 @@ fn parts(text: &str) -> Vec<String> {
 }
 
 #[test]
-fn short_or_single_paragraph_replies_are_sent_whole() {
+fn single_paragraph_replies_are_sent_whole() {
     assert_eq!(parts("好的，主人。"), ["好的，主人。"]);
-    let short = "好的。\n\n马上处理。";
-    assert_eq!(parts(short), [short]);
     let one = "这是一个比较长的单段回复，没有空行也没有换行，所以无论多长都应该作为一条消息完整发送给用户。";
     assert_eq!(parts(one), [one]);
+}
+
+#[test]
+fn short_natural_paragraphs_are_separate_messages() {
+    assert_eq!(
+        parts("好。\n\n你先说，我听着。"),
+        ["好。", "你先说，我听着。"]
+    );
+    assert_eq!(parts("好的。\n马上处理。"), ["好的。", "马上处理。"]);
+}
+
+#[test]
+fn explicit_minimum_length_can_keep_short_paragraphs_together() {
+    let text = "好的。\n\n马上处理。";
+    let planner = ParagraphPlanner {
+        min_chars: 40,
+        ..ParagraphPlanner::default()
+    };
+    let plan = planner.plan(&SegmentRequest { text, limits: QQ }).unwrap();
+    plan.validate(text, &QQ).unwrap();
+    assert_eq!(plan.texts(text).collect::<Vec<_>>(), [text]);
 }
 
 #[test]

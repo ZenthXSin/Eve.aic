@@ -179,7 +179,7 @@ class SegmentAcceptance(unittest.TestCase):
         ledger = self.ledger()
         receipt = self.receipt("seg")
         self.assertEqual((ledger["version"], receipt["state"], receipt["reply"]), (2, "Sent", TEXT))
-        self.assertEqual(receipt["segments"]["planner"], "paragraph-v1")
+        self.assertEqual(receipt["segments"]["planner"], "paragraph-v2")
         reply = receipt["reply"].encode()
         self.assertEqual([reply[p["start"]:p["end"]].decode() for p in receipt["segments"]["parts"]], PARTS)
         self.assertEqual(self.part_states("seg"), ["Sent"] * 3)
@@ -200,6 +200,23 @@ class SegmentAcceptance(unittest.TestCase):
         self.assertFalse(self.sent("segment"))
         self.assertNotIn("segments", self.receipt("short"))
         self.assertEqual(self.ledger()["version"], 1)
+
+    def test_short_natural_paragraphs_are_sent_separately_and_remembered_once(self):
+        parts = ["好。", "你先说，我听着。"]
+        text = "\n\n".join(parts)
+        message = self.message("short-parts", text=text, segments=parts)
+        summary = self.run_eve([{"send": message}, self.wait_receipt("short-parts", "Sent")], memory=True)
+        self.assertEqual((summary["completed"], summary["sent"], summary["failed"]), (1, 1, 0))
+        self.assertEqual([(event["index"], event["count"], event["text"])
+                          for event in self.sent("segment")],
+                         [(index, 2, part) for index, part in enumerate(parts)])
+        self.assertFalse(self.sent("reply"))
+        self.assertEqual(self.part_states("short-parts"), ["Sent", "Sent"])
+        self.assertEqual(self.receipt("short-parts")["reply"], text)
+        evidence = self.interactions()
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0]["source"]["assistant_text"], text)
+        self.assertEqual(len(self.requests), 1)
 
     def test_cancel_between_parts_stops_remaining_and_restart_does_not_resend(self):
         held = self.message("seg", hold_segments=[0], allow_finish=True)
