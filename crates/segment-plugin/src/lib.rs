@@ -185,7 +185,7 @@ fn blocks(text: &str) -> Vec<Block> {
             after_blank = true;
             continue;
         }
-        if after_blank && !current.is_empty() && !(indented(content(line)) && !line.code) {
+        if after_blank && !current.is_empty() && (!indented(content(line)) || line.code) {
             groups.push(std::mem::take(&mut current));
         }
         after_blank = false;

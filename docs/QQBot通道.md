@@ -59,6 +59,8 @@ Learning 批次先保存 `Running` 和输入，再发起请求；恢复将残留
 ./target/debug/eve-qqbot --state-dir .eve-qqbot --segmented
 ```
 
+公开 `QqBotPlugin::with_segmenter` 可以设置更小的单段字节预算；规划失败也不能绕过预算整条发送。无法合法降级时保留已完成 Session 和完整失败回执、不导入交互记忆，当前桥接条目结束后继续处理新消息。
+
 每段写出前重新核对当前代，`/cancel`、`/add`、`/correct` 或训练开关会关闭剩余片段；已发片段无法撤回。片段失败不重试，全部片段送达才记为 `Sent` 并导入交互记忆。回执以字节范围记录每段状态，重启不补发也不重发。规划规则、回执格式 2 与恢复语义见[分段投递](./表达偏好与分段输出.md#首版分段投递已实现)。
 
 开启分段后，每个会话可以用 `/segment` 查看，用 `/segment on|off|reset`、`/segment parts 2至5`、`/segment pace 0至200` 修改，从下一条开始投递的回复生效；未开启 `--segmented` 时回复“未开启”。设置独立保存在 `eve.segment.preferences`，损坏时拒绝启动且不清空，见[会话分段设置](./表达偏好与分段输出.md#会话分段设置已实现)。
@@ -142,6 +144,7 @@ python3 connectors/qqbot/test/eve_e2e.py
 python3 connectors/qqbot/test/cognition_test.py
 python3 connectors/qqbot/test/memory_test.py
 python3 connectors/qqbot/test/learning_test.py
+python3 connectors/qqbot/test/segment_test.py
 ```
 
 离线验收实际运行 Eve、生产 Rust 插件、测试 Node 子进程与 loopback Chat HTTP，覆盖工具/回复、两进程回忆与去重、群发送者/AppID 路由、发送失败保留提交、Processing 不重放、损坏状态保留、SIGTERM 取消与 Node 回收。Node 测试另覆盖 C2C/群原目标与 msg_id、pending 上限、finish、无重试发送失败、坏/超长 JSONL 与 EOF。它们与真实 QQ 交互分别记录，离线通过不代表 QQ 权限、认证或消息发送已经通过。
