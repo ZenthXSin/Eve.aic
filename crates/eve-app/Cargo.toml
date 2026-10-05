@@ -33,6 +33,8 @@ eve-llm-api = { path = "../llm-api" }
 eve-llm-openai = { path = "../llm-openai" }
 eve-message-api = { path = "../message-api" }
 eve-message-plugin = { path = "../message-plugin" }
+eve-memory-api = { path = "../memory-api" }
+eve-memory-plugin = { path = "../memory-plugin" }
 eve-plugin-api = { path = "../plugin-api" }
 eve-qqbot-plugin = { path = "../qqbot-plugin" }
 eve-runtime = { path = "../runtime" }

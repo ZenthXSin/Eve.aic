@@ -23,6 +23,8 @@ members = [
     "crates/qqbot-plugin",
     "crates/training-api",
     "crates/training-plugin",
+    "crates/memory-api",
+    "crates/memory-plugin",
     "crates/example-plugins",
 ]
 resolver = "2"

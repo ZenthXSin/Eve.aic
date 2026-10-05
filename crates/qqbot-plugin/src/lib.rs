@@ -1,9 +1,11 @@
 //! 官方 QQBot 通道实现；只通过公开 Control/Message/Session 与插件 Context 协作。
 mod bridge;
 mod commands;
+mod observer;
 mod state;
 
 pub use commands::{QqCommandHandler, QqCommandInput};
+pub use observer::{QqInteraction, QqInteractionObserver, QqInteractionSource};
 
 use eve_control_api::{CONTROL_PLUGIN_ID, CONTROL_SERVICE_ID, ControlServiceHandle};
 use eve_message_api::{MessageServiceHandle, ROUTER_PLUGIN_ID, ROUTER_SERVICE_ID};
@@ -11,6 +13,7 @@ use eve_plugin_api::{
     Cleanup, Plugin, PluginContext, PluginDependency, PluginError, PluginFuture, PluginManifest,
     PluginResult, ServiceId, TaskMode, TaskSchedule, TaskSpec,
 };
+use eve_session_api::{SESSION_PLUGIN_ID, SESSION_SERVICE_ID, SessionServiceHandle};
 use eve_training_api::{TRAINING_PLUGIN_ID, TRAINING_SERVICE_ID, TrainingServiceHandle};
 use serde::Serialize;
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
@@ -56,6 +59,7 @@ pub struct QqBotPlugin {
     config: Arc<QqBotConfig>,
     command_handler: Option<Arc<dyn QqCommandHandler>>,
     training: bool,
+    observer: Option<Arc<dyn QqInteractionObserver>>,
 }
 impl QqBotPlugin {
     pub fn new(config: QqBotConfig) -> PluginResult<Self> {
@@ -74,6 +78,7 @@ impl QqBotPlugin {
             config: Arc::new(config),
             command_handler: None,
             training: false,
+            observer: None,
         })
     }
 
@@ -91,6 +96,20 @@ impl QqBotPlugin {
         self.training = true;
         Ok(self)
     }
+    /// 接收已提交且确认发送的普通交互；未接线时不读取 Session 或执行观察。
+    pub fn with_interaction_observer(
+        mut self,
+        observer: Arc<dyn QqInteractionObserver>,
+    ) -> PluginResult<Self> {
+        if self.observer.is_none() {
+            self.manifest.dependencies.push(PluginDependency {
+                id: eve_plugin_api::PluginId::new(SESSION_PLUGIN_ID)?,
+                requirement: Some("^0.1".into()),
+            });
+        }
+        self.observer = Some(observer);
+        Ok(self)
+    }
 }
 impl Plugin for QqBotPlugin {
     fn manifest(&self) -> &PluginManifest {
@@ -99,6 +118,18 @@ impl Plugin for QqBotPlugin {
     fn start(&mut self, ctx: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         Box::pin(async move {
             let ledger = state::Ledger::load(&ctx)?;
+            let observation = if let Some(observer) = &self.observer {
+                Some(Arc::new(observer::Observation {
+                    observer: observer.clone(),
+                    sessions: ctx
+                        .service::<SessionServiceHandle>(&ServiceId::new(SESSION_SERVICE_ID)?)?
+                        .ok_or_else(|| PluginError::State("QQBot 交互观察所需会话服务缺失".into()))?
+                        .0
+                        .clone(),
+                }))
+            } else {
+                None
+            };
             let training = if self.training {
                 Some(
                     ctx.service::<TrainingServiceHandle>(&ServiceId::new(TRAINING_SERVICE_ID)?)?
@@ -144,6 +175,7 @@ impl Plugin for QqBotPlugin {
                     let messages = messages.clone();
                     let command_handler = command_handler.clone();
                     let training = training.clone();
+                    let observation = observation.clone();
                     let status = status.clone();
                     let ledger = ledger.clone();
                     Box::pin(async move {
@@ -159,6 +191,7 @@ impl Plugin for QqBotPlugin {
                                 messages,
                                 command_handler,
                                 training,
+                                observation,
                             },
                             ledger,
                             signal,

@@ -1,26 +1,35 @@
-use crate::{AppError, AppFailure, core_bootstrap, finish_core, install_core, qq_cognition};
+use crate::{
+    AppError, AppFailure, core_bootstrap, finish_core, install_core, qq_cognition, qq_memory,
+    qq_memory_observer,
+};
 use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
 use eve_kernel::{Kernel, KernelServices};
+use eve_llm_api::ContextAssembler;
+use eve_memory_api::{MEMORY_PLUGIN_ID, MemoryAdmin};
+use eve_memory_plugin::{MemoryContext, MemoryPlugin};
 use eve_message_plugin::{MessageRouterPlugin, RelationPlugin};
-use eve_plugin_api::{PluginId, ServiceId};
+use eve_plugin_api::{PluginId, PluginResult, ServiceId};
 use eve_qqbot_plugin::{
     DEFAULT_QQBOT_APP_ID, QQBOT_PLUGIN_ID, QQBOT_STATUS_SERVICE_ID, QqBotConfig, QqBotPlugin,
-    QqBotStatus, QqBotStatusHandle,
+    QqBotStatus, QqBotStatusHandle, QqCommandHandler, QqCommandInput,
 };
+use eve_session_api::{SESSION_SERVICE_ID, SessionServiceHandle};
 use eve_training_api::{TRAINING_PLUGIN_ID, TRAINING_SERVICE_ID, TrainingServiceHandle};
 use eve_training_plugin::{TrainingContext, TrainingPlugin};
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
 QQ 普通文字排队开始新轮；逐行 /add 内容、/correct 内容、/cancel 控制当前任务。
 --training 默认开启主动提问；/train start、/train stop、/train status 按会话启停/查询。
 --cognition 开启本地内生反思；/goal 内容保存待办，/goals 查看待办，/mind [目标ID] 查询草稿。
+--memory 开启有来源的交互记忆；/remember 内容、/memories [页码]、/correct-memory ID 内容、/forget ID。
+明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
 反思默认关闭，每次启动最多执行 32 项；每项一次模型请求、零工具，草稿不代表父目标完成。
 修订先取消并等待；已有工具操作时只澄清，/new 内容明确开始独立任务。
 Ctrl+C 或 SIGTERM 取消在途轮次、等待保存并停止桥接子进程。";
@@ -35,6 +44,7 @@ pub struct QqBotOptions {
     pub bridge_args: Vec<OsString>,
     pub training: bool,
     pub cognition: bool,
+    pub memory: bool,
     pub cognition_max_executions: u16,
 }
 impl Default for QqBotOptions {
@@ -48,6 +58,7 @@ impl Default for QqBotOptions {
             bridge_args: Vec::new(),
             training: false,
             cognition: false,
+            memory: false,
             cognition_max_executions: 32,
         }
     }
@@ -66,6 +77,10 @@ impl QqBotOptions {
             }
             if arg == "--cognition" {
                 options.cognition = true;
+                continue;
+            }
+            if arg == "--memory" {
+                options.memory = true;
                 continue;
             }
             let value = args.next().ok_or("QQBot 参数缺少值")?;
@@ -163,7 +178,21 @@ pub async fn run_qqbot_with_planner_factory(
             .value
             .downcast::<TrainingServiceHandle>()
             .map_err(|_| "训练服务类型错误")?;
-        bootstrap.context = Some(Arc::new(TrainingContext(training.0.clone())));
+        let memory: Option<Arc<dyn MemoryAdmin>> = if options.memory {
+            let plugin = MemoryPlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(MEMORY_PLUGIN_ID)?).await?;
+            Some(Arc::new(controller))
+        } else {
+            None
+        };
+        let context: Arc<dyn ContextAssembler> = Arc::new(TrainingContext(training.0.clone()));
+        bootstrap.context = Some(if let Some(memory) = &memory {
+            Arc::new(MemoryContext::new("qq", memory.clone(), context)?)
+        } else {
+            context
+        });
         install_core(
             &kernel,
             registry.clone(),
@@ -188,9 +217,28 @@ pub async fn run_qqbot_with_planner_factory(
         } else {
             qq_cognition::Commands::disabled()
         };
+        let memory_commands = memory
+            .as_ref()
+            .map_or_else(qq_memory::Commands::disabled, |memory| {
+                qq_memory::Commands::new(memory.clone())
+            });
+        let mut plugin =
+            plugin.with_command_handler(Arc::new(CommandHandlers(vec![commands, memory_commands])));
+        if let Some(memory) = memory {
+            let sessions = registry
+                .get(&ServiceId::new(SESSION_SERVICE_ID)?)?
+                .ok_or("交互记忆需要会话服务")?
+                .value
+                .downcast::<SessionServiceHandle>()
+                .map_err(|_| "交互记忆会话服务类型错误")?;
+            plugin = plugin.with_interaction_observer(Arc::new(qq_memory_observer::Observer {
+                memory,
+                sessions: sessions.0.clone(),
+            }))?;
+        }
         kernel.register(Box::new(RelationPlugin::rules()?))?;
         kernel.register(Box::new(MessageRouterPlugin::builtin()?))?;
-        kernel.register(Box::new(plugin.with_command_handler(commands)))?;
+        kernel.register(Box::new(plugin))?;
         kernel.start(&PluginId::new(QQBOT_PLUGIN_ID)?).await?;
         let handle = registry
             .get(&ServiceId::new(QQBOT_STATUS_SERVICE_ID)?)?
@@ -255,6 +303,22 @@ pub async fn run_qqbot_with_planner_factory(
         (Err(primary), _) => Err(Box::new(AppFailure { primary, secondary }) as AppError),
     };
     finish_core(&kernel, result).await
+}
+
+struct CommandHandlers(Vec<Arc<dyn QqCommandHandler>>);
+impl QqCommandHandler for CommandHandlers {
+    fn handle(&self, input: QqCommandInput<'_>) -> PluginResult<Option<String>> {
+        for handler in &self.0 {
+            if let Some(reply) = handler.handle(QqCommandInput {
+                message_id: input.message_id,
+                session: input.session,
+                text: input.text,
+            })? {
+                return Ok(Some(reply));
+            }
+        }
+        Ok(None)
+    }
 }
 
 async fn background_finished(mut receiver: Option<watch::Receiver<bool>>) {

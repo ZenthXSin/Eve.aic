@@ -1,27 +1,22 @@
 [package]
-name = "eve-qqbot-plugin"
+name = "eve-memory-plugin"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-eve-control-api = { path = "../control-api" }
-eve-llm-api = { path = "../llm-api" }
-eve-message-api = { path = "../message-api" }
+eve-memory-api = { path = "../memory-api" }
 eve-plugin-api = { path = "../plugin-api" }
 eve-session-api = { path = "../session-api" }
-eve-training-api = { path = "../training-api" }
+eve-llm-api = { path = "../llm-api" }
 serde.workspace = true
 serde_json.workspace = true
-ring = "0.17"
-tokio = { workspace = true, features = ["process", "io-util"] }
 
 [dev-dependencies]
-eve-config-plugin = { path = "../config-plugin" }
 eve-kernel = { path = "../kernel" }
-eve-control-plugin = { path = "../control-plugin" }
-eve-message-plugin = { path = "../message-plugin" }
 eve-session-plugin = { path = "../session-plugin" }
+eve-training-api = { path = "../training-api" }
 eve-training-plugin = { path = "../training-plugin" }
 tempfile.workspace = true
+tokio.workspace = true

@@ -7,6 +7,8 @@ mod error;
 mod input;
 mod models;
 mod qq_cognition;
+mod qq_memory;
+mod qq_memory_observer;
 mod qqbot;
 mod services;
 mod storage;

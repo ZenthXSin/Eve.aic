@@ -29,6 +29,14 @@ QQBOT_SANDBOX=true ./target/debug/eve-qqbot --state-dir .eve-qqbot
 
 当前用户验收直接在本地运行，不为实机交互调度工作流。沿用已有 `--state-dir` 保留会话、训练统计与回执；宿主输出 `EVE_QQBOT_READY` 后再通知用户去 QQ 测试。该标志只说明通道已就绪，实际收发仍需单独确认。
 
+## 本地交互记忆
+
+`--memory` 显式开启[交互记忆与明确偏好](./交互记忆.md)，默认关闭，可与训练和内生反思独立组合。`/remember 偏好内容` 保存明确偏好，`/memories [页码]` 分页查看，`/correct-memory 偏好ID 新内容` 修正，`/forget 偏好ID` 撤销；证据和旧版本保留。命令不调用模型，关闭时返回未启用，不转成普通聊天。
+
+读取范围绑定当前可信 QQ 完整会话及用户，不跨 AppID、私聊/群、目标或发送者。已确认偏好由 `MemoryContext` 包装既有 `TrainingContext`，最多添加 8 条、8192 字节，当前请求优先；内部反思继续使用独立空 Context。`/train stop`、`/train reset` 不影响明确偏好。
+
+普通消息只有在实际 Session 已 `Completed` 且 QQ `Sent` 已保存后才导入用户原文和最终回复；命令、控制替代轮、取消和失败轮不冒充成功交互。只观察本次新成功消息，不从旧回执补采，也不自动从聊天提炼偏好。命令来源和偏好同次提交，但记忆与 QQ 回执没有跨服务事务：确认回复缺失时偏好可能已保存，已送达交互也可能因崩溃尚未导入。使用新 `/memories` 核对，恢复不自动重放。记忆与 QQ 宿主共用所选的文件或 PostgreSQL 后端，各插件仍独立提交；容量和失败恢复边界见[交互记忆](./交互记忆.md#持久化与失败恢复)。
+
 ## 本地内生反思
 
 `--cognition` 显式开启后台反思，默认关闭；普通聊天和训练开关不会自动开启它。每次启动最多执行 32 项，可通过 `--cognition-max-executions 1` 等值限制为 1–32 项。启动示例：
@@ -106,6 +114,7 @@ npm --prefix connectors/qqbot test
 cargo build -p eve-app --bin eve-qqbot --locked
 python3 connectors/qqbot/test/eve_e2e.py
 python3 connectors/qqbot/test/cognition_test.py
+python3 connectors/qqbot/test/memory_test.py
 ```
 
 离线验收实际运行 Eve、生产 Rust 插件、测试 Node 子进程与 loopback Chat HTTP，覆盖工具/回复、两进程回忆与去重、群发送者/AppID 路由、发送失败保留提交、Processing 不重放、损坏状态保留、SIGTERM 取消与 Node 回收。Node 测试另覆盖 C2C/群原目标与 msg_id、pending 上限、finish、无重试发送失败、坏/超长 JSONL 与 EOF。它们与真实 QQ 交互分别记录，离线通过不代表 QQ 权限、认证或消息发送已经通过。
