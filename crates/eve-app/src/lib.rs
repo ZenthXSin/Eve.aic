@@ -28,7 +28,7 @@ use eve_config_api::{
 use eve_config_plugin::{ConfigBootstrap, ConfigPlugin};
 use eve_control_api::{CONTROL_PLUGIN_ID, CONTROL_SERVICE_ID, ControlServiceHandle};
 use eve_control_plugin::ControlPlugin;
-use eve_kernel::{Kernel, KernelServices, backends::FileStateStore};
+use eve_kernel::{Kernel, KernelServices};
 use eve_llm_api::{LlmModelResolver, ResponseMode, ToolBinding};
 use eve_plugin_api::{PluginDependency, PluginId, ServiceId};
 use eve_runtime::{
@@ -45,7 +45,8 @@ use std::{
 
 pub type AppError = Box<dyn std::error::Error + Send + Sync>;
 pub const HELP: &str = "Eve 核心对话入口
-用法：eve [--state-dir 目录] [--agent AGENT.md] [--session 会话] [--user 用户]
+用法：eve [--state-dir 目录] [--database-config 文件] [--agent AGENT.md] [--session 会话] [--user 用户]
+--database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 主模型默认 deepseek-v4.1-flash，可用 EVE_OPENAI_MODEL 替换；凭据：EVE_OPENAI_API_KEY
 协议默认 chat；EVE_OPENAI_PROTOCOL 可选 chat/responses\n可选：EVE_OPENAI_BASE_URL、EVE_OPENAI_REASONING_EFFORT
 EVE_OPENAI_MODEL_ROLE=primary 显式使用 runtime.models 的主模型角色配置；每轮固定选择。
@@ -57,6 +58,7 @@ const MAX_INPUT_BYTES: usize = 32768;
 #[derive(Clone, Debug)]
 pub struct ChatOptions {
     pub state_directory: PathBuf,
+    pub database_config: Option<PathBuf>,
     pub agent_path: PathBuf,
     pub session_id: String,
     pub user_id: String,
@@ -65,6 +67,7 @@ impl Default for ChatOptions {
     fn default() -> Self {
         Self {
             state_directory: ".eve".into(),
+            database_config: None,
             agent_path: "AGENT.md".into(),
             session_id: "default".into(),
             user_id: "owner".into(),
@@ -81,7 +84,7 @@ impl ChatOptions {
             }
             if !matches!(
                 arg.to_str(),
-                Some("--state-dir" | "--agent" | "--session" | "--user")
+                Some("--state-dir" | "--database-config" | "--agent" | "--session" | "--user")
             ) {
                 return Err("未知启动参数；使用 --help 查看用法。".into());
             }
@@ -91,6 +94,7 @@ impl ChatOptions {
             }
             match arg.to_str() {
                 Some("--state-dir") => options.state_directory = value.into(),
+                Some("--database-config") => options.database_config = Some(value.into()),
                 Some("--agent") => options.agent_path = value.into(),
                 Some("--session") => {
                     options.session_id =
@@ -124,7 +128,10 @@ pub async fn run_console(
     let key = SessionKey::new(&options.session_id, &options.user_id)?;
     let bootstrap = core_bootstrap(&options.agent_path)?;
     let backends = KernelServices {
-        state: Arc::new(FileStateStore::open(&options.state_directory)?),
+        state: storage::open_state_store(
+            &options.state_directory,
+            options.database_config.as_deref(),
+        )?,
         ..KernelServices::default()
     };
     let registry = backends.registry.clone();

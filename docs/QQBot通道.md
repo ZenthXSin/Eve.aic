@@ -19,6 +19,8 @@ QQBOT_SANDBOX=true ./target/debug/eve-qqbot --state-dir .eve-qqbot
 
 核心默认 deepseek-v4.1-flash / Chat / none；模型、协议和基址仍按[核心对话](./核心对话.md)配置。默认启动正式 QQ API；首次测试使用 `QQBOT_SANDBOX=true`，非法布尔值拒绝启动。QQ Bot、测试用户和测试群的权限/沙箱范围按当前开放平台控制台配置。沙箱与正式 API 使用不同固定基址，token 地址固定，不允许通过事件修改。
 
+本地持久部署可追加 `--database-config /仓库外/连接.json`，把会话、回执、训练开关与表达统计写入同一个本地 PostgreSQL；默认仍使用文件后端。新目录必须没有 `state.json`，此参数不迁移现有 QQ 历史。目录首次绑定 SQL 后，漏参数或更换目标会拒绝启动；完成历史恢复、旧消息不重放及投递不确定时不补发的边界不变。普通配置仍在 `--state-dir/configuration`。配置、单宿主排他和独立测试库验收见[PostgreSQL 状态](./PostgreSQL状态.md)。
+
 主模型角色与终端共用同一装配：EVE_OPENAI_MODEL_ROLE=primary 显式使用 runtime.models.primary，默认仍按原 provider.openai 启动。启动时预检角色，随后在每轮开始时捕获模型、期限和输出限制；配置服务更新影响新轮，同一会话继续保留已完成历史。字段、凭据引用拒绝与失败保护见[核心对话](./核心对话.md#显式选择主模型角色)。这只接入主模型，其他角色仍是独立配置定义。
 
 手机可在 [GitHub Actions Secrets](https://github.com/ZenthXSin/Eve.aic/settings/secrets/actions) 添加 `QQBOT_APP_SECRET`；已有模型 Secret 继续使用。代码合入 main 后，在 [QQBot 首次真实交互](https://github.com/ZenthXSin/Eve.aic/actions/workflows/qqbot-interaction.yml) 点击 Run workflow，默认沙箱与 300 秒窗口；日志出现窗口启动后，向测试机器人私聊或在测试群 @ 发送文字。至少一次接收、模型完成和 QQ 成功发送且没有失败，报告才判定通过。超时退出不等于成功交互。
