@@ -13,8 +13,10 @@ use eve_plugin_api::{
     Cleanup, Plugin, PluginContext, PluginDependency, PluginError, PluginFuture, PluginManifest,
     PluginResult, ServiceId, TaskMode, TaskSchedule, TaskSpec,
 };
-use eve_segment_api::{SegmentLimits, SegmentPlanner};
-use eve_session_api::{SESSION_PLUGIN_ID, SESSION_SERVICE_ID, SessionServiceHandle};
+use eve_segment_api::{
+    SegmentLimits, SegmentPlanner, SegmentPolicy, SegmentPreferences, SegmentScope,
+};
+use eve_session_api::{SESSION_PLUGIN_ID, SESSION_SERVICE_ID, SessionKey, SessionServiceHandle};
 use eve_training_api::{TRAINING_PLUGIN_ID, TRAINING_SERVICE_ID, TrainingServiceHandle};
 use serde::Serialize;
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
@@ -31,6 +33,21 @@ pub const QQ_SEGMENT_LIMITS: SegmentLimits = SegmentLimits {
     max_segment_bytes: 32768,
     max_pause_ms: 2500,
 };
+/// 会话设置可选范围：段数至多到平台上限，停顿最长 5 秒；未设置时仍用默认预算。
+pub const QQ_SEGMENT_POLICY: SegmentPolicy = SegmentPolicy {
+    defaults: QQ_SEGMENT_LIMITS,
+    max_segments: QQ_MAX_SEGMENTS,
+    max_pause_ms: 5000,
+};
+pub const QQ_SEGMENT_CHANNEL: &str = "qq";
+/// 投递与命令处理共用同一作用域推导；会话已按 AppID、私聊/群、目标与发送者绑定。
+pub fn segment_scope(session: &SessionKey) -> SegmentScope {
+    SegmentScope {
+        channel: QQ_SEGMENT_CHANNEL.into(),
+        session_id: session.session_id.clone(),
+        user_id: session.user_id.clone(),
+    }
+}
 
 /// 不实现 Debug，避免将密钥带入宿主诊断。
 pub struct QqBotConfig {
@@ -73,7 +90,8 @@ pub struct QqBotPlugin {
 }
 pub(crate) struct Segmentation {
     pub planner: Arc<dyn SegmentPlanner>,
-    pub limits: SegmentLimits,
+    pub policy: SegmentPolicy,
+    pub preferences: Option<Arc<dyn SegmentPreferences>>,
 }
 impl QqBotPlugin {
     pub fn new(config: QqBotConfig) -> PluginResult<Self> {
@@ -109,7 +127,34 @@ impl QqBotPlugin {
         {
             return Err(PluginError::State("QQBot 分段预算无效".into()));
         }
-        self.segmentation = Some(Arc::new(Segmentation { planner, limits }));
+        self.segmentation = Some(Arc::new(Segmentation {
+            planner,
+            policy: SegmentPolicy::fixed(limits),
+            preferences: None,
+        }));
+        Ok(self)
+    }
+    /// 回复开始投递时按可信会话读取用户分段设置；必须先 `with_segmenter`，
+    /// 且策略默认值与其预算一致、上限不超过平台限制。读取失败时整条发送。
+    pub fn with_segment_preferences(
+        mut self,
+        preferences: Arc<dyn SegmentPreferences>,
+        policy: SegmentPolicy,
+    ) -> PluginResult<Self> {
+        let Some(current) = self.segmentation.as_ref() else {
+            return Err(PluginError::State("QQBot 分段设置需要先开启分段".into()));
+        };
+        if policy.validate().is_err()
+            || policy.defaults != current.policy.defaults
+            || policy.max_segments > QQ_MAX_SEGMENTS
+        {
+            return Err(PluginError::State("QQBot 分段策略无效".into()));
+        }
+        self.segmentation = Some(Arc::new(Segmentation {
+            planner: current.planner.clone(),
+            policy,
+            preferences: Some(preferences),
+        }));
         Ok(self)
     }
 

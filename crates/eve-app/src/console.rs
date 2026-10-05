@@ -1,7 +1,10 @@
+use crate::segment_commands::{CONSOLE_DISABLED, CONSOLE_STATE_FAILURE, SegmentCommand, execute};
 use crate::{AppError, ChatSummary, HELP, input::InputEvent};
 use eve_control_api::*;
 use eve_llm_api::LlmError;
-use eve_segment_api::{SegmentLimits, SegmentPlanner, plan_or_single};
+use eve_segment_api::{
+    SegmentPlanner, SegmentPolicy, SegmentPreferences, SegmentScope, plan_with_preference,
+};
 use eve_session_api::{SessionInput, SessionKey};
 use std::{collections::VecDeque, future::Future, io::Write, sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::Instant};
@@ -9,9 +12,12 @@ use tokio::{sync::mpsc, time::Instant};
 const MAX_PENDING: usize = 16;
 
 /// 终端分段显示：完整回复保存后，先显示首段，其余片段按停顿依次显示。
+/// 每条回复显示前读取本会话设置；读取失败时整条显示。
 pub(crate) struct Segmenter {
     pub planner: Arc<dyn SegmentPlanner>,
-    pub limits: SegmentLimits,
+    pub policy: SegmentPolicy,
+    pub preferences: Arc<dyn SegmentPreferences>,
+    pub scope: SegmentScope,
 }
 /// 尚未显示的片段及其段前停顿；只是显示队列，不是新的会话输入。
 type Later = VecDeque<(String, u64)>;
@@ -109,7 +115,10 @@ fn finish(
                 // 规划失败、计划无效或已请求取消时整条显示。
                 let plan = segmenter
                     .filter(|_| !fatal && !report.cancel_requested)
-                    .and_then(|s| plan_or_single(s.planner.as_ref(), text, s.limits).ok())
+                    .and_then(|s| {
+                        let preference = s.preferences.get(&s.scope).ok()?;
+                        plan_with_preference(s.planner.as_ref(), text, &s.policy, &preference).ok()
+                    })
                     .map(|(plan, _)| plan)
                     .filter(|plan| plan.segments.len() > 1);
                 match plan {
@@ -267,6 +276,17 @@ pub(crate) async fn drive(
             Next::Input(Some(InputEvent::Failed(error))) => return Err(error),
             Next::Input(Some(InputEvent::TooLarge)) => {
                 writeln!(output, "Eve：输入超过 32768 字节，请缩短后重新提交。")?;
+                output.flush()?;
+            }
+            // 本地命令：不进入队列、不创建会话轮次；未开启分段时也不交给模型。
+            Next::Input(Some(InputEvent::Line(text))) if SegmentCommand::parse(&text).is_some() => {
+                let command = SegmentCommand::parse(&text).expect("checked by guard");
+                let reply = match &segmenter {
+                    None => CONSOLE_DISABLED.to_owned(),
+                    Some(s) => execute(s.preferences.as_ref(), &s.scope, &s.policy, command)
+                        .map_err(|_| -> AppError { CONSOLE_STATE_FAILURE.into() })?,
+                };
+                writeln!(output, "Eve：{reply}")?;
                 output.flush()?;
             }
             Next::Input(Some(InputEvent::Line(text))) => match text.trim() {

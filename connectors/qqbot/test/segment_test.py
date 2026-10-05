@@ -3,6 +3,7 @@
 替身模型原样回复用户正文，因此多段输入会得到同样分段的完整回复。
 停止只针对本测试创建的 Popen；时序通过桥接命令与回执握手，不靠固定延时。
 """
+import hashlib
 import json
 import os
 import pathlib
@@ -23,6 +24,10 @@ PARTS = ["好的主人，结论是可以分段发送。",
          "需要我再演示一次吗？"]
 TEXT = "\n\n".join(PARTS)
 CANCELLED = "已取消当前任务；已完成的工具操作不会撤销。"
+TRAINING_STOPPED = "已结束当前会话的主动提问训练，已完成记录保留；普通聊天仍可继续。"
+SEGMENT_OFF = "已关闭本会话分段：下一条回复起整条发送；发送 /segment on 可重新开启。"
+SEGMENT_RESET = "已恢复本会话默认分段：开启，最多 3 段，段间停顿 100%，从下一条回复生效。"
+SEGMENT_DISABLED = "分段投递未开启：通道启动时未加 --segmented，回复始终整条发送。"
 
 
 class SegmentAcceptance(unittest.TestCase):
@@ -106,7 +111,7 @@ class SegmentAcceptance(unittest.TestCase):
     def wait_receipt(self, id, state):
         return {"wait_receipt": {"path": str(self.state_path), "id": id, "state": state}}
 
-    def run_eve(self, script, segmented=True, memory=False, terminate_at=None, success=True):
+    def run_eve(self, script, segmented=True, memory=False, training=False, terminate_at=None, success=True):
         self.runs += 1
         events_path = self.work / f"events-{self.runs}.jsonl"
         error_path = self.work / f"error-{self.runs}.txt"
@@ -123,6 +128,8 @@ class SegmentAcceptance(unittest.TestCase):
             command.append("--segmented")
         if memory:
             command.append("--memory")
+        if training:
+            command.append("--training")
         child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             if terminate_at:
@@ -179,7 +186,7 @@ class SegmentAcceptance(unittest.TestCase):
         ledger = self.ledger()
         receipt = self.receipt("seg")
         self.assertEqual((ledger["version"], receipt["state"], receipt["reply"]), (2, "Sent", TEXT))
-        self.assertEqual(receipt["segments"]["planner"], "paragraph-v2")
+        self.assertEqual(receipt["segments"]["planner"], "paragraph-v3")
         reply = receipt["reply"].encode()
         self.assertEqual([reply[p["start"]:p["end"]].decode() for p in receipt["segments"]["parts"]], PARTS)
         self.assertEqual(self.part_states("seg"), ["Sent"] * 3)
@@ -245,6 +252,33 @@ class SegmentAcceptance(unittest.TestCase):
         self.assertEqual(self.part_states("seg"), ["Sent", "Skipped", "Skipped"])
         self.assertEqual(len(self.requests), 2)
 
+    def test_training_toggle_between_parts_closes_remaining_parts(self):
+        held = self.message("seg", hold_segments=[0], allow_finish=True)
+        stop = self.message("train", text="/train stop", segments=None, expected=TRAINING_STOPPED)
+        self.run_eve([{"send": held}, self.wait_segment("seg", 1), {"send": stop},
+                      {"deliver_segment": {"id": "seg", "index": 0}},
+                      {"wait_command": {"id": "seg", "type": "finish"}}, self.wait_receipt("train", "Sent")],
+                     training=True)
+        self.assertEqual([event["text"] for event in self.sent("segment")], PARTS[:1])
+        self.assertEqual(self.receipt("seg")["state"], "Failed")
+        self.assertEqual(self.part_states("seg"), ["Sent", "Skipped", "Skipped"])
+        self.assertEqual(len(self.requests), 1)
+
+    def test_stop_during_pause_keeps_unsent_parts_and_restart_never_resends(self):
+        marker = self.work / "paused"
+        self.run_eve([{"send": self.message("seg")},
+                      {"wait_part": {"path": str(self.state_path), "id": "seg", "index": 0, "state": "Sent"}},
+                      {"touch": str(marker)}, {"wait_file": str(self.work / "never")}], terminate_at=marker)
+        self.assertEqual([event["text"] for event in self.sent("segment")], PARTS[:1])
+        self.assertEqual(self.receipt("seg")["state"], "ReplyPending")
+        self.assertEqual(self.part_states("seg"), ["Sent", "Pending", "Pending"])
+        before = self.state_path.read_bytes()
+        duplicate = {**self.message("seg"), "expected_type": "finish"}
+        self.run_eve([{"send": duplicate}, {"wait_command": {"id": "seg", "type": "finish"}}])
+        self.assertFalse(self.sent("segment"))
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertEqual(len(self.requests), 1)
+
     def test_part_failure_is_not_retried_or_remembered(self):
         failing = self.message("seg", fail_segment=1)
         summary = self.run_eve([{"send": failing}, self.wait_receipt("seg", "Failed")], memory=True)
@@ -279,6 +313,84 @@ class SegmentAcceptance(unittest.TestCase):
         self.assertIn("回执状态损坏或版本不兼容", stderr)
         self.assertEqual(self.state_path.read_bytes(), before)
         self.assertEqual(len(self.requests), 1)
+
+
+    def preferences(self):
+        return self.documents().get("eve.segment.preferences", {}).get("preferences.v1")
+
+    def command(self, id, text, expected, user="user-1"):
+        return self.message(id, text=text, segments=None, expected=expected, user_id=user, target_id=user)
+
+    def test_session_can_disable_segments_and_setting_survives_restart(self):
+        self.run_eve([{"send": self.command("off", "/segment off", SEGMENT_OFF)}, self.wait_receipt("off", "Sent"),
+                      {"send": self.message("whole-1", segments=None)}, self.wait_receipt("whole-1", "Sent")])
+        self.assertEqual([event["text"] for event in self.sent("reply")], [SEGMENT_OFF, TEXT])
+        self.assertFalse(self.sent("segment"))
+        self.assertNotIn("segments", self.receipt("whole-1"))
+        self.assertEqual(self.preferences(), {"version": 1, "scopes": [
+            {"scope": {"channel": "qq", "session_id": self.session_id(), "user_id": self.session_id()},
+             "enabled": False, "max_segments": None, "pause_percent": None}]})
+        self.run_eve([{"send": self.message("whole-2", segments=None)}, self.wait_receipt("whole-2", "Sent"),
+                      {"send": self.command("reset", "/segment reset", SEGMENT_RESET)}, self.wait_receipt("reset", "Sent"),
+                      {"send": self.message("seg")}, self.wait_receipt("seg", "Sent")])
+        self.assertEqual([event["text"] for event in self.sent("segment")], PARTS)
+        self.assertEqual(self.preferences(), {"version": 1, "scopes": []})
+        self.assertEqual(len(self.requests), 3)
+
+    def test_parts_and_pace_narrow_only_this_session(self):
+        user2 = {**self.message("other"), "user_id": "user-2", "target_id": "user-2"}
+        self.run_eve([{"send": self.command("parts", "/segment parts 2", "已将本会话分段上限设为 2 段，从下一条回复生效。")},
+                      self.wait_receipt("parts", "Sent"),
+                      {"send": self.command("pace", "/segment pace 0", "已将本会话段间停顿设为 0%（单次不超过 0 秒），从下一条回复生效。")},
+                      self.wait_receipt("pace", "Sent"),
+                      {"send": self.message("narrow", segments=[PARTS[0], PARTS[1] + "\n\n" + PARTS[2]])},
+                      self.wait_receipt("narrow", "Sent"),
+                      {"send": user2}, self.wait_receipt("other", "Sent")])
+        narrow = [event for event in self.sent("segment") if event["id"] == "narrow"]
+        self.assertLess(narrow[1]["at"] - narrow[0]["at"], 700)
+        other = [event for event in self.sent("segment") if event["id"] == "other"]
+        self.assertEqual([event["text"] for event in other], PARTS)
+        self.assertGreaterEqual(other[1]["at"] - other[0]["at"], min(2500, 400 + 25 * len(PARTS[1])) - 50)
+
+    def test_setting_during_pause_applies_from_next_reply(self):
+        held = self.message("seg", hold_segments=[0])
+        self.run_eve([{"send": held}, self.wait_segment("seg", 1),
+                      {"send": self.command("off", "/segment off", SEGMENT_OFF)},
+                      {"deliver_segment": {"id": "seg", "index": 0}},
+                      self.wait_receipt("seg", "Sent"), self.wait_receipt("off", "Sent"),
+                      {"send": self.message("next", segments=None)}, self.wait_receipt("next", "Sent")])
+        self.assertEqual([event["text"] for event in self.sent("segment")], PARTS)
+        out = [event for event in self.events if event["direction"] == "out" and event["type"] in ("segment", "reply")]
+        self.assertEqual([(event["id"], event["type"]) for event in out],
+                         [("seg", "segment")] * 3 + [("off", "reply"), ("next", "reply")])
+
+    def test_rejected_values_and_disabled_flag_never_write_or_call_the_model(self):
+        self.run_eve([{"send": self.command("p6", "/segment parts 6", "段数须为 2 至 5 的整数；需要整条发送请用 /segment off。设置未改变。")},
+                      self.wait_receipt("p6", "Sent"),
+                      {"send": self.command("p300", "/segment pace 300", "停顿比例须为 0 至 200 的整数（默认 100，0 为不停顿）。设置未改变。")},
+                      self.wait_receipt("p300", "Sent")])
+        self.assertIsNone(self.preferences())
+        self.run_eve([{"send": self.command("disabled", "/segment off", SEGMENT_DISABLED)},
+                      self.wait_receipt("disabled", "Sent"),
+                      {"send": self.message("whole", segments=None)}, self.wait_receipt("whole", "Sent")],
+                     segmented=False)
+        self.assertIsNone(self.preferences())
+        self.assertEqual(len(self.requests), 1)
+
+    def test_corrupt_segment_settings_refuse_startup_without_clearing(self):
+        self.run_eve([{"send": self.command("off", "/segment off", SEGMENT_OFF)}, self.wait_receipt("off", "Sent")])
+        state = json.loads(self.state_path.read_text())
+        state["entries"]["eve.segment.preferences"]["preferences.v1"] = list(b'{"version":9,"scopes":[]}')
+        self.state_path.write_text(json.dumps(state))
+        before = self.state_path.read_bytes()
+        stderr = self.run_eve([{"send": self.message("seg")}], success=False)
+        self.assertIn("分段设置状态版本不兼容；未清空", stderr)
+        self.assertEqual(self.state_path.read_bytes(), before)
+        self.assertEqual(len(self.requests), 0)
+
+    def session_id(self):
+        routing = json.dumps(["1904159860", "c2c", "user-1", "user-1"], separators=(",", ":")).encode()
+        return "qq:" + hashlib.sha256(routing).hexdigest()
 
 
 if __name__ == "__main__":

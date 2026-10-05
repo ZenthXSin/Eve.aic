@@ -506,7 +506,13 @@ version = "0.1.0"
 name = "eve-segment-plugin"
 version = "0.1.0"
 dependencies = [
+ "eve-kernel",
+ "eve-plugin-api",
  "eve-segment-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

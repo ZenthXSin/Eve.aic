@@ -1,6 +1,6 @@
 use crate::{
     AppError, AppFailure, core_bootstrap, finish_core, install_core, qq_cognition, qq_learning,
-    qq_learning_commands, qq_memory, qq_memory_observer,
+    qq_learning_commands, qq_memory, qq_memory_observer, segment_commands,
 };
 use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
@@ -14,10 +14,14 @@ use eve_memory_plugin::{MemoryContext, MemoryPlugin};
 use eve_message_plugin::{MessageRouterPlugin, RelationPlugin};
 use eve_plugin_api::{PluginId, PluginResult, ServiceId};
 use eve_qqbot_plugin::{
-    DEFAULT_QQBOT_APP_ID, QQ_SEGMENT_LIMITS, QQBOT_PLUGIN_ID, QQBOT_STATUS_SERVICE_ID, QqBotConfig,
-    QqBotPlugin, QqBotStatus, QqBotStatusHandle, QqCommandHandler, QqCommandInput,
+    DEFAULT_QQBOT_APP_ID, QQ_SEGMENT_LIMITS, QQ_SEGMENT_POLICY, QQBOT_PLUGIN_ID,
+    QQBOT_STATUS_SERVICE_ID, QqBotConfig, QqBotPlugin, QqBotStatus, QqBotStatusHandle,
+    QqCommandHandler, QqCommandInput,
 };
-use eve_segment_plugin::ParagraphPlanner;
+use eve_segment_api::SegmentPreferences;
+use eve_segment_plugin::{
+    ParagraphPlanner, SEGMENT_PREFERENCES_PLUGIN_ID, SegmentPreferencePlugin,
+};
 use eve_session_api::{SESSION_SERVICE_ID, SessionServiceHandle};
 use eve_training_api::{TRAINING_PLUGIN_ID, TRAINING_SERVICE_ID, TrainingServiceHandle};
 use eve_training_plugin::{TrainingContext, TrainingPlugin};
@@ -37,6 +41,7 @@ QQ 普通文字排队开始新轮；逐行 /add 内容、/correct 内容、/canc
 /memory-candidates [页码] 查看候选，/accept-memory ID 明确确认后才进入聊天偏好；默认不启用。
 明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
 --segmented 把模型回复按自然段分成至多 3 条消息，段间停顿至多 2.5 秒；命令确认整条发送。
+/segment 查看本会话分段；/segment on|off|reset、/segment parts 2至5、/segment pace 0至200（%）按会话保存，从下一条回复生效。
 分段前重新核对当前代：/cancel、/add、/correct 后不再发送剩余片段；已发片段不撤回、重启不补发。
 反思默认关闭，每次启动最多执行 32 项；每项一次模型请求、零工具，草稿不代表父目标完成。
 修订先取消并等待；已有工具操作时只澄清，/new 内容明确开始独立任务。
@@ -214,6 +219,18 @@ pub async fn run_qqbot_with_components(
     let result: Result<(), AppError> = async {
         kernel.register(Box::new(TrainingPlugin::new(options.training)?))?;
         kernel.start(&PluginId::new(TRAINING_PLUGIN_ID)?).await?;
+        // 分段设置先于模型与通道加载；损坏或版本不兼容时在这里拒绝启动并保留原字节。
+        let segment_preferences: Option<Arc<dyn SegmentPreferences>> = if options.segmented {
+            let plugin = SegmentPreferencePlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel
+                .start(&PluginId::new(SEGMENT_PREFERENCES_PLUGIN_ID)?)
+                .await?;
+            Some(Arc::new(controller))
+        } else {
+            None
+        };
         let training = registry
             .get(&ServiceId::new(TRAINING_SERVICE_ID)?)?
             .ok_or("训练服务缺失")?
@@ -301,11 +318,20 @@ pub async fn run_qqbot_with_components(
             .map_or_else(qq_memory::Commands::disabled, |memory| {
                 qq_memory::Commands::new(memory.clone())
             });
+        let segment_commands = segment_preferences
+            .clone()
+            .map_or_else(segment_commands::QqCommands::disabled, |store| {
+                segment_commands::QqCommands::new(store, QQ_SEGMENT_POLICY)
+            });
         let mut plugin = plugin.with_command_handler(Arc::new(CommandHandlers(vec![
             commands,
             memory_commands,
             learning_commands,
+            segment_commands,
         ])));
+        if let Some(store) = segment_preferences {
+            plugin = plugin.with_segment_preferences(store, QQ_SEGMENT_POLICY)?;
+        }
         if let Some(memory) = memory {
             let sessions = registry
                 .get(&ServiceId::new(SESSION_SERVICE_ID)?)?
