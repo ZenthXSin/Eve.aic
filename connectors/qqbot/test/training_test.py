@@ -80,6 +80,28 @@ class Reports(unittest.TestCase):
         self.assertEqual(report["counts"]["model_sent"], 1)
         self.assertEqual(report["counts"]["unconfirmed"], 1)
 
+    def test_segmented_receipts_count_as_one_full_reply(self):
+        message = {"id": "c.1", "scope": "c2c", "target_id": "user-1", "user_id": "user-1", "text": "分段问题"}
+        reply = "第一段。\n\n第二段要问吗？"
+        first = len("第一段。".encode())
+        parts = [{"start": 0, "end": first, "state": "Sent"},
+                 {"start": first + 2, "end": len(reply.encode()), "state": "Sent"}]
+        identity = "qq:" + hashlib.sha256(json.dumps(["1904159860", "c2c", "user-1", "user-1"], separators=(",", ":")).encode()).hexdigest()
+        receipts = {"version": 2, "entries": [{"app_id": "1904159860", "message": message, "state": "Sent", "reply": reply,
+                                               "segments": {"planner": "paragraph-v1", "parts": parts}},
+            {"app_id": "1904159860", "message": {**message, "id": "c.2"}, "state": "Failed", "reply": reply,
+             "segments": {"planner": "paragraph-v1", "parts": [{**parts[0]}, {**parts[1], "state": "Failed"}]}}]}
+        sessions = {"format_version": 1, "sessions": {identity: {"key": {"session_id": identity, "user_id": identity}, "turns": [
+            {"input": message["text"], "status": {"state": "Completed", "messages": [{"role": "User", "text": message["text"]}, {"role": "Assistant", "text": reply}]}}]}}}
+        state = {"version": 1, "entries": {"eve.channel.qqbot": {"receipts.v1": list(json.dumps(receipts).encode())},
+                                           "eve.session": {"sessions.v1": list(json.dumps(sessions).encode())}}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text(json.dumps(state))
+            report = training.collect(path)
+        self.assertEqual((report["counts"]["model_sent"], report["counts"]["failed"]), (1, 1))
+        self.assertEqual(report["counts"]["paragraphs"], 2)
+
     def test_encrypted_state_roundtrip_authentication_and_no_overwrite(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, QQBOT_APP_SECRET="test-only-password"):
             root = Path(directory) / "root"

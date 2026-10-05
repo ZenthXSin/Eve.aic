@@ -219,6 +219,8 @@ dependencies = [
  "eve-plugin-api",
  "eve-qqbot-plugin",
  "eve-runtime",
+ "eve-segment-api",
+ "eve-segment-plugin",
  "eve-session-api",
  "eve-session-plugin",
  "eve-state-postgres",
@@ -456,6 +458,7 @@ dependencies = [
  "eve-message-api",
  "eve-message-plugin",
  "eve-plugin-api",
+ "eve-segment-api",
  "eve-session-api",
  "eve-session-plugin",
  "eve-training-api",
@@ -493,6 +496,17 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "eve-segment-api"
+version = "0.1.0"
+
+[[package]]
+name = "eve-segment-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-segment-api",
 ]
 
 [[package]]

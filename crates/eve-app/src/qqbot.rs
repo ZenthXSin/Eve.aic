@@ -14,9 +14,10 @@ use eve_memory_plugin::{MemoryContext, MemoryPlugin};
 use eve_message_plugin::{MessageRouterPlugin, RelationPlugin};
 use eve_plugin_api::{PluginId, PluginResult, ServiceId};
 use eve_qqbot_plugin::{
-    DEFAULT_QQBOT_APP_ID, QQBOT_PLUGIN_ID, QQBOT_STATUS_SERVICE_ID, QqBotConfig, QqBotPlugin,
-    QqBotStatus, QqBotStatusHandle, QqCommandHandler, QqCommandInput,
+    DEFAULT_QQBOT_APP_ID, QQ_SEGMENT_LIMITS, QQBOT_PLUGIN_ID, QQBOT_STATUS_SERVICE_ID, QqBotConfig,
+    QqBotPlugin, QqBotStatus, QqBotStatusHandle, QqCommandHandler, QqCommandInput,
 };
+use eve_segment_plugin::ParagraphPlanner;
 use eve_session_api::{SESSION_SERVICE_ID, SessionServiceHandle};
 use eve_training_api::{TRAINING_PLUGIN_ID, TRAINING_SERVICE_ID, TrainingServiceHandle};
 use eve_training_plugin::{TrainingContext, TrainingPlugin};
@@ -24,7 +25,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-learning] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-learning] [--segmented] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -35,6 +36,8 @@ QQ 普通文字排队开始新轮；逐行 /add 内容、/correct 内容、/canc
 --memory-learning 需同时 --memory；每会话至少 3 条新经历触发首批，后续间隔 5 分钟，单次启动最多 4 次请求。
 /memory-candidates [页码] 查看候选，/accept-memory ID 明确确认后才进入聊天偏好；默认不启用。
 明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
+--segmented 把模型回复按自然段分成至多 3 条消息，段间停顿至多 2.5 秒；命令确认整条发送。
+分段前重新核对当前代：/cancel、/add、/correct 后不再发送剩余片段；已发片段不撤回、重启不补发。
 反思默认关闭，每次启动最多执行 32 项；每项一次模型请求、零工具，草稿不代表父目标完成。
 修订先取消并等待；已有工具操作时只澄清，/new 内容明确开始独立任务。
 Ctrl+C 或 SIGTERM 取消在途轮次、等待保存并停止桥接子进程。";
@@ -51,6 +54,7 @@ pub struct QqBotOptions {
     pub cognition: bool,
     pub memory: bool,
     pub memory_learning: bool,
+    pub segmented: bool,
     pub cognition_max_executions: u16,
 }
 impl Default for QqBotOptions {
@@ -66,6 +70,7 @@ impl Default for QqBotOptions {
             cognition: false,
             memory: false,
             memory_learning: false,
+            segmented: false,
             cognition_max_executions: 32,
         }
     }
@@ -92,6 +97,10 @@ impl QqBotOptions {
             }
             if arg == "--memory-learning" {
                 options.memory_learning = true;
+                continue;
+            }
+            if arg == "--segmented" {
+                options.segmented = true;
                 continue;
             }
             let value = args.next().ok_or("QQBot 参数缺少值")?;
@@ -176,6 +185,11 @@ pub async fn run_qqbot_with_components(
         sandbox,
     })?
     .with_training()?;
+    let plugin = if options.segmented {
+        plugin.with_segmenter(Arc::new(ParagraphPlanner::default()), QQ_SEGMENT_LIMITS)?
+    } else {
+        plugin
+    };
     let backends = KernelServices {
         state: crate::storage::open_state_store(
             &options.state_directory,

@@ -13,6 +13,7 @@ use eve_plugin_api::{
     Cleanup, Plugin, PluginContext, PluginDependency, PluginError, PluginFuture, PluginManifest,
     PluginResult, ServiceId, TaskMode, TaskSchedule, TaskSpec,
 };
+use eve_segment_api::{SegmentLimits, SegmentPlanner};
 use eve_session_api::{SESSION_PLUGIN_ID, SESSION_SERVICE_ID, SessionServiceHandle};
 use eve_training_api::{TRAINING_PLUGIN_ID, TRAINING_SERVICE_ID, TrainingServiceHandle};
 use serde::Serialize;
@@ -22,6 +23,14 @@ use tokio::sync::watch;
 pub const QQBOT_PLUGIN_ID: &str = "eve.channel.qqbot";
 pub const QQBOT_STATUS_SERVICE_ID: &str = "eve.channel.qqbot.status";
 pub const DEFAULT_QQBOT_APP_ID: &str = "1904159860";
+/// 平台对同一条消息的被动回复次数有限；分段数不能超过该值。
+pub const QQ_MAX_SEGMENTS: usize = 5;
+/// QQ 默认分段预算：最多三段，单段与整条回复同上限，段前停顿最长 2.5 秒。
+pub const QQ_SEGMENT_LIMITS: SegmentLimits = SegmentLimits {
+    max_segments: 3,
+    max_segment_bytes: 32768,
+    max_pause_ms: 2500,
+};
 
 /// 不实现 Debug，避免将密钥带入宿主诊断。
 pub struct QqBotConfig {
@@ -60,6 +69,11 @@ pub struct QqBotPlugin {
     command_handler: Option<Arc<dyn QqCommandHandler>>,
     training: bool,
     observer: Option<Arc<dyn QqInteractionObserver>>,
+    segmentation: Option<Arc<Segmentation>>,
+}
+pub(crate) struct Segmentation {
+    pub planner: Arc<dyn SegmentPlanner>,
+    pub limits: SegmentLimits,
 }
 impl QqBotPlugin {
     pub fn new(config: QqBotConfig) -> PluginResult<Self> {
@@ -79,7 +93,24 @@ impl QqBotPlugin {
             command_handler: None,
             training: false,
             observer: None,
+            segmentation: None,
         })
+    }
+    /// 把已完成的模型回复按计划分成少量消息投递；命令确认仍整条发送。
+    /// 未接线时与原单条回复完全一致。
+    pub fn with_segmenter(
+        mut self,
+        planner: Arc<dyn SegmentPlanner>,
+        limits: SegmentLimits,
+    ) -> PluginResult<Self> {
+        if limits.validate().is_err()
+            || limits.max_segments > QQ_MAX_SEGMENTS
+            || limits.max_segment_bytes > 32768
+        {
+            return Err(PluginError::State("QQBot 分段预算无效".into()));
+        }
+        self.segmentation = Some(Arc::new(Segmentation { planner, limits }));
+        Ok(self)
     }
 
     /// 添加宿主命令扩展；默认不安装，原有消息控制行为不变。
@@ -162,6 +193,7 @@ impl Plugin for QqBotPlugin {
             let ledger = Arc::new(tokio::sync::Mutex::new(Some(ledger)));
             let config = self.config.clone();
             let command_handler = self.command_handler.clone();
+            let segmentation = self.segmentation.clone();
             let task_ctx = ctx.clone();
             ctx.spawn_task(TaskSpec::new(
                 "QQBot JSONL 通道",
@@ -176,6 +208,7 @@ impl Plugin for QqBotPlugin {
                     let command_handler = command_handler.clone();
                     let training = training.clone();
                     let observation = observation.clone();
+                    let segmentation = segmentation.clone();
                     let status = status.clone();
                     let ledger = ledger.clone();
                     Box::pin(async move {
@@ -192,6 +225,7 @@ impl Plugin for QqBotPlugin {
                                 command_handler,
                                 training,
                                 observation,
+                                segmentation,
                             },
                             ledger,
                             signal,

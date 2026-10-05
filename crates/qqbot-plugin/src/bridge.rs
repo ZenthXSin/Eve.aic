@@ -1,7 +1,7 @@
 use crate::{
-    QqBotConfig, QqBotStatus, QqCommandHandler, QqCommandInput, commands,
+    QqBotConfig, QqBotStatus, QqCommandHandler, QqCommandInput, Segmentation, commands,
     observer::{CompletedInteraction, Observation},
-    state::{Ledger, Message, ReceiptState},
+    state::{Ledger, Message, Part, PartState, ReceiptState, Segments},
 };
 use eve_control_api::{
     CommitState, ControlEvent, ControlEventSink, ControlFuture, ControlInput, ControlReport,
@@ -96,6 +96,7 @@ pub(crate) struct Services {
     pub command_handler: Option<Arc<dyn QqCommandHandler>>,
     pub training: Option<Arc<dyn TrainingService>>,
     pub observation: Option<Arc<Observation>>,
+    pub segmentation: Option<Arc<Segmentation>>,
 }
 struct ChannelEvents {
     signal: Arc<dyn TaskSignal>,
@@ -163,6 +164,29 @@ struct Reply {
     guard: ReplyGuard,
     interaction: Option<CompletedInteraction>,
 }
+/// 一次只投递一条回复。分段时逐段写出并等待回执；段间停顿结束、
+/// 路由与命令都收尾后，重新核对代际再写下一段。
+struct Delivery {
+    reply: Reply,
+    pauses: Vec<u64>,
+    index: usize,
+    pause_until: Option<tokio::time::Instant>,
+}
+impl Delivery {
+    fn segmented(&self) -> bool {
+        !self.pauses.is_empty()
+    }
+    fn awaiting(&self) -> bool {
+        self.pause_until.is_none()
+    }
+}
+fn segment_frame(ledger: &Ledger, index: usize, part: usize) -> Value {
+    let entry = &ledger.entries[index];
+    let reply = entry.reply.as_deref().expect("segmented receipt has reply");
+    let parts = &entry.segments.as_ref().expect("segmented receipt").parts;
+    json!({"type":"segment","version":1,"id":entry.message.id,"index":part,
+        "count":parts.len(),"text":&reply[parts[part].start..parts[part].end]})
+}
 enum ReplyGuard {
     // 控制消息的确认仍可用于已取消/阻塞代，但不能用于已被替换的代。
     Current(GenerationKey),
@@ -188,6 +212,10 @@ fn explicit(text: &str) -> bool {
 fn mark_failed(ledger: &mut Ledger, ctx: &PluginContext, app: &str, id: &str) -> PluginResult<()> {
     let index = ledger.find(app, id).expect("inserted receipt");
     ledger.entries[index].state = ReceiptState::Failed;
+    // 只在没有片段写出时调用：尚未写出的片段全部跳过，已发送片段保持原状。
+    if let Some(segments) = ledger.entries[index].segments.as_mut() {
+        segments.skip_rest();
+    }
     ledger.save(ctx)
 }
 async fn finish(stdin: &mut ChildStdin, id: &str) -> PluginResult<()> {
@@ -222,6 +250,7 @@ pub(crate) async fn run(
         command_handler,
         training,
         observation,
+        segmentation,
     } = services;
     // 仅本地学习已验证回执中的用户表达；不提交旧任务、不调用模型或重发消息。
     if let Some(training) = &training {
@@ -286,7 +315,7 @@ pub(crate) async fn run(
     let mut controlled_sessions: BTreeMap<String, SessionKey> = BTreeMap::new();
     let mut routing: Option<Routing> = None;
     let mut replies: VecDeque<Reply> = VecDeque::new();
-    let mut delivering: Option<Reply> = None;
+    let mut delivering: Option<Delivery> = None;
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let result: PluginResult<()> = async {
         loop {
@@ -411,9 +440,30 @@ pub(crate) async fn run(
                     finish(&mut stdin, &reply.message.id).await?;
                     continue;
                 }
+                // 只分段已完成的模型回复；规划失败或计划无效时整条发送。
+                let plan = match (&segmentation, &reply.guard) {
+                    (Some(segmentation), ReplyGuard::Completed(_)) => {
+                        match eve_segment_api::plan_or_single(segmentation.planner.as_ref(), &reply.text, segmentation.limits) {
+                            Ok((plan, warning)) => {
+                                if warning.is_some() { warn(&ctx, "segment_plan_fallback"); }
+                                Some(plan).filter(|plan| plan.segments.len() > 1)
+                            }
+                            Err(_) => { warn(&ctx, "segment_plan_unavailable"); None }
+                        }
+                    }
+                    _ => None,
+                };
                 let index = ledger.find(&config.app_id, &reply.message.id).expect("inserted receipt");
                 ledger.entries[index].state = ReceiptState::ReplyPending;
                 ledger.entries[index].reply = Some(reply.text.clone());
+                let pauses: Vec<u64> = plan.as_ref().map_or_else(Vec::new, |plan| plan.segments.iter().map(|s| s.pause_before_ms).collect());
+                ledger.entries[index].segments = plan.map(|plan| Segments {
+                    planner: plan.planner,
+                    parts: plan.segments.iter().enumerate().map(|(i, s)| Part {
+                        start: s.start, end: s.end,
+                        state: if i == 0 { PartState::Sending } else { PartState::Pending },
+                    }).collect(),
+                });
                 ledger.save(&ctx)?;
                 // 保存也是同步操作；再次检查后至 write 完成不准入任何控制动作。
                 if !reply.guard.accepts(control.as_ref()) {
@@ -422,9 +472,39 @@ pub(crate) async fn run(
                     finish(&mut stdin, &reply.message.id).await?;
                     continue;
                 }
-                write(&mut stdin, json!({"type":"reply","version":1,"id":reply.message.id,"text":reply.text})).await?;
+                let frame = if pauses.is_empty() {
+                    json!({"type":"reply","version":1,"id":reply.message.id,"text":reply.text})
+                } else {
+                    segment_frame(&ledger, index, 0)
+                };
+                write(&mut stdin, frame).await?;
                 deadline = tokio::time::Instant::now() + Duration::from_secs(35);
-                delivering = Some(reply);
+                delivering = Some(Delivery { reply, pauses, index: 0, pause_until: None });
+            }
+            // 段间停顿结束后写下一段；路由或命令尚未收尾时先等待，取消或新代可在此关闭剩余片段。
+            if routing.is_none() && commands.is_empty()
+                && let Some(delivery) = delivering.as_mut()
+                && delivery.pause_until.is_some_and(|until| until <= tokio::time::Instant::now()) {
+                let id = delivery.reply.message.id.clone();
+                let index = ledger.find(&config.app_id, &id).expect("inserted receipt");
+                let part = delivery.index;
+                let stale = if !delivery.reply.guard.accepts(control.as_ref()) {
+                    true
+                } else {
+                    ledger.entries[index].segments.as_mut().expect("segmented receipt").parts[part].state = PartState::Sending;
+                    ledger.save(&ctx)?;
+                    !delivery.reply.guard.accepts(control.as_ref())
+                };
+                if stale {
+                    delivering = None;
+                    mark_failed(&mut ledger, &ctx, &config.app_id, &id)?;
+                    warn(&ctx, "stale_segments_suppressed");
+                    finish(&mut stdin, &id).await?;
+                    continue;
+                }
+                write(&mut stdin, segment_frame(&ledger, index, part)).await?;
+                deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+                delivery.pause_until = None;
             }
             if routing.is_none() && commands.is_empty() && active.is_empty()
                 && delivering.is_none() && replies.is_empty() && let Some(queued) = queue.pop_front() {
@@ -455,9 +535,12 @@ pub(crate) async fn run(
                 biased;
                 _ = signal.cancelled() => break Ok(()),
                 _ = stop.changed() => break Ok(()),
-                _ = tokio::time::sleep_until(deadline), if !status.borrow().ready || delivering.is_some() => {
+                _ = tokio::time::sleep_until(deadline), if !status.borrow().ready || delivering.as_ref().is_some_and(Delivery::awaiting) => {
                     break Err(failure("QQBot ready 或 delivery 等待超时"));
                 }
+                // 停顿结束时唤醒：每次循环先处理一条待路由命令，命令清空后才写下一段。
+                _ = tokio::time::sleep_until(delivering.as_ref().and_then(|d| d.pause_until).unwrap_or(deadline)),
+                    if routing.is_none() && delivering.as_ref().is_some_and(|d| !d.awaiting()) => {}
                 report = async { routing.as_mut().expect("routing message").wait.as_mut().await }, if routing.is_some() => {
                     let route = routing.take().expect("routing message");
                     let report = report.map_err(|_| failure("QQBot 消息控制收尾失败"))?;
@@ -549,15 +632,41 @@ pub(crate) async fn run(
                         }
                         Some("fatal") => break Err(failure("QQBot SDK 启动或连接失败")),
                         Some("delivery") => {
-                            let Some(reply) = delivering.as_ref() else { warn(&ctx, "unexpected_delivery"); continue; };
-                            let message = &reply.message;
+                            let Some(delivery) = delivering.as_mut().filter(|d| d.awaiting()) else { warn(&ctx, "unexpected_delivery"); continue; };
+                            let message = &delivery.reply.message;
                             if frame.get("id").and_then(Value::as_str) != Some(message.id.as_str()) {
                                 warn(&ctx, "delivery_id_mismatch"); continue;
                             }
                             let Some(ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
                             let index = ledger.find(&config.app_id, &message.id).expect("inserted receipt");
-                            ledger.entries[index].state = if ok { ReceiptState::Sent } else { ReceiptState::Failed };
-                            ledger.save(&ctx)?;
+                            if delivery.segmented() {
+                                let part = delivery.index;
+                                if frame.get("index").and_then(Value::as_u64) != u64::try_from(part).ok() {
+                                    warn(&ctx, "delivery_index_mismatch"); continue;
+                                }
+                                let segments = ledger.entries[index].segments.as_mut().expect("segmented receipt");
+                                let last = part + 1 == segments.parts.len();
+                                segments.parts[part].state = if ok { PartState::Sent } else { PartState::Failed };
+                                if !ok {
+                                    segments.skip_rest();
+                                    ledger.entries[index].state = ReceiptState::Failed;
+                                } else if last {
+                                    ledger.entries[index].state = ReceiptState::Sent;
+                                }
+                                ledger.save(&ctx)?;
+                                if ok && !last {
+                                    // 已确认片段不再重发；下一段只在停顿后重新核对代际才写出。
+                                    delivery.index += 1;
+                                    delivery.pause_until = Some(tokio::time::Instant::now()
+                                        + Duration::from_millis(delivery.pauses[delivery.index]));
+                                    continue;
+                                }
+                            } else {
+                                ledger.entries[index].state = if ok { ReceiptState::Sent } else { ReceiptState::Failed };
+                                ledger.save(&ctx)?;
+                            }
+                            let reply = &delivery.reply;
+                            let message = &reply.message;
                             status.send_modify(|s| { if ok { s.sent += 1; } else { s.failed += 1; } });
                             if !ok { warn(&ctx, "delivery_failed_no_retry"); }
                             if ok && let Some(interaction) = &reply.interaction
@@ -584,7 +693,7 @@ pub(crate) async fn run(
                                 || active.iter().any(|a| a.message.id == message.id)
                                 || routing.as_ref().is_some_and(|r| r.message.id == message.id)
                                 || replies.iter().any(|r| r.message.id == message.id)
-                                || delivering.as_ref().is_some_and(|r| r.message.id == message.id);
+                                || delivering.as_ref().is_some_and(|d| d.reply.message.id == message.id);
                             if live { warn(&ctx, "duplicate_pending"); continue; }
                             let duplicate = ledger.find(&config.app_id, &message.id).is_some();
                             let pending = queue.len() + commands.len() + active.len() + replies.len()

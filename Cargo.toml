@@ -27,6 +27,8 @@ members = [
     "crates/training-plugin",
     "crates/memory-api",
     "crates/memory-plugin",
+    "crates/segment-api",
+    "crates/segment-plugin",
     "crates/example-plugins",
 ]
 resolver = "2"

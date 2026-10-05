@@ -874,3 +874,117 @@ async fn rejected_primary_role_never_calls_model_or_changes_completed_state() {
         assert!(server.requests.try_recv().is_err(), "{invalid}");
     }
 }
+
+const SEGMENTED: &str = "好的主人，结论是可以分段显示。\n\n完整回复仍然只保存一次，分段只决定在哪里断开，以及每段之前停顿多久。\n\n需要我再演示一次吗？";
+const PARTS: [&str; 3] = [
+    "好的主人，结论是可以分段显示。",
+    "完整回复仍然只保存一次，分段只决定在哪里断开，以及每段之前停顿多久。",
+    "需要我再演示一次吗？",
+];
+fn segmented(root: &Path, url: &str) -> Command {
+    let mut command = command(root, url);
+    command.arg("--segmented");
+    command
+}
+/// 完整回复以未拆分的原文保存在完成轮次中。
+fn saves_full_reply(turn: &Value) -> bool {
+    let encoded = serde_json::to_string(SEGMENTED).unwrap();
+    turn["status"]["state"] == "Completed"
+        && turn["status"]
+            .to_string()
+            .contains(encoded.trim_matches('"'))
+}
+fn eve_lines(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8(stdout.to_vec())
+        .unwrap()
+        .split("Eve：")
+        .skip(1)
+        .map(|line| line.trim_end().to_owned())
+        .collect()
+}
+#[tokio::test]
+async fn segmented_reply_displays_parts_in_order_after_saving_the_full_reply_once() {
+    let root = fixture();
+    let mut server = Server::start(vec![
+        Reply::json(final_response(SEGMENTED)),
+        Reply::json(final_response("短回复整条显示。")),
+    ])
+    .await;
+    let started = std::time::Instant::now();
+    let output = run(segmented(root.path(), &server.url), "请分段\n下一轮\n").await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut expected: Vec<String> = PARTS.iter().map(|p| p.to_string()).collect();
+    expected.push("短回复整条显示。".into());
+    assert_eq!(eve_lines(&output.stdout), expected);
+    // 两次段前停顿：400 ms 基础值加每字 25 ms，上限 2.5 秒。
+    let pauses: u64 = PARTS[1..]
+        .iter()
+        .map(|p| (400 + 25 * p.chars().count() as u64).min(2500))
+        .sum();
+    assert!(started.elapsed() >= Duration::from_millis(pauses));
+    let turns = &sessions(root.path())["sessions"]["default"]["turns"];
+    assert_eq!(turns.as_array().unwrap().len(), 2);
+    assert!(saves_full_reply(&turns[0]));
+    assert_eq!(user_texts(&server.next().await.body), ["请分段"]);
+    // 下一轮在剩余片段显示后才开始，历史中是完整回复而不是片段。
+    let second = server.next().await.body;
+    assert_eq!(user_texts(&second), ["请分段", "下一轮"]);
+    assert!(
+        second
+            .to_string()
+            .contains("以及每段之前停顿多久。\\n\\n需要我再演示一次吗？")
+    );
+}
+// 测试线程会阻塞读取子进程输出；替身 HTTP 服务需要另一个运行时线程。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_between_displayed_parts_stops_the_rest_without_changing_history() {
+    let root = fixture();
+    let mut server = Server::start(vec![
+        Reply::json(final_response(SEGMENTED)),
+        Reply::json(final_response("新任务完成")),
+    ])
+    .await;
+    let mut child = segmented(root.path(), &server.url)
+        .env("EVE_OPENAI_TIMEOUT_SECONDS", "30")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (lines, received) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines() {
+            if lines.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let next = || received.recv_timeout(Duration::from_secs(10)).unwrap();
+    stdin.write_all("请分段\n".as_bytes()).unwrap();
+    stdin.flush().unwrap();
+    assert_eq!(next(), format!("Eve：{}", PARTS[0]));
+    stdin.write_all("/cancel\n新任务\n".as_bytes()).unwrap();
+    stdin.flush().unwrap();
+    assert_eq!(next(), "Eve：已停止显示剩余分段；完整回复已保存。");
+    assert_eq!(next(), "Eve：新任务完成");
+    stdin.write_all(b"/quit\n").unwrap();
+    stdin.flush().unwrap();
+    let status = child.wait().unwrap();
+    reader.join().unwrap();
+    assert!(status.success());
+    assert!(received.try_recv().is_err());
+    let turns = &sessions(root.path())["sessions"]["default"]["turns"];
+    assert_eq!(turns.as_array().unwrap().len(), 2);
+    assert_eq!(turns[0]["status"]["state"], "Completed");
+    assert!(saves_full_reply(&turns[0]));
+    server.next().await;
+    assert_eq!(user_texts(&server.next().await.body), ["请分段", "新任务"]);
+    assert!(server.requests.try_recv().is_err());
+}
