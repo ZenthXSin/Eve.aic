@@ -55,7 +55,7 @@ impl QqInteraction<'_> {
 
 /// 由宿主显式接线的同步、有限本地操作；不得发起模型、网络或嵌套通道任务。
 ///
-/// 仅普通消息成功投递后调用，不包括命令、控制替代轮、工具内部消息或失败轮。
+/// 仅普通消息成功投递后调用，不包括命令、训练发起轮、控制替代轮、工具内部消息或失败轮。
 /// Err/panic 后通道保留 Sent，记录警告并关闭，绝不自动再调。
 /// 首版不在重启时补采；观察持久化与 QQ 回执不构成跨服务事务。
 pub trait QqInteractionObserver: Send + Sync {
@@ -117,6 +117,7 @@ impl CompletedInteraction {
             return Err(invalid());
         };
         if turn.input != message.text
+            || messages.first().and_then(|first| first.text.as_deref()) != Some(&message.text)
             || messages.last().and_then(|last| last.text.as_deref()) != Some(text)
         {
             return Err(invalid());
@@ -148,5 +149,217 @@ impl CompletedInteraction {
         catch_unwind(AssertUnwindSafe(|| observer.observe(&interaction)))
             .map_err(|_| PluginError::State("QQBot 交互观察者异常".into()))?
             .map_err(|_| PluginError::State("QQBot 交互观察失败；Sent 已保留且未重试".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eve_control_api::{RunFailure, RunReport};
+    use eve_llm_api::{ChatMessage, ChatRole, LlmError};
+    use eve_session_api::{
+        SessionError, SessionFailure, SessionInput, SessionResult, SessionSnapshot, SessionTurn,
+        StartedTurn, TurnLease,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Snapshot(Option<SessionSnapshot>);
+    impl SessionService for Snapshot {
+        fn snapshot(&self, _: &SessionKey) -> SessionResult<Option<SessionSnapshot>> {
+            Ok(self.0.clone())
+        }
+        fn begin(&self, _: SessionInput) -> SessionResult<StartedTurn> {
+            Err(SessionError::Unavailable)
+        }
+        fn complete(&self, _: &TurnLease, _: Vec<ChatMessage>) -> SessionResult<()> {
+            Err(SessionError::Unavailable)
+        }
+        fn fail(&self, _: &TurnLease, _: SessionFailure) -> SessionResult<()> {
+            Err(SessionError::Unavailable)
+        }
+    }
+
+    fn fixture() -> (Message, ControlReport, SessionSnapshot) {
+        let message = Message {
+            id: "opaque+/平台消息=".into(),
+            scope: "c2c".into(),
+            target_id: "alice".into(),
+            user_id: "alice".into(),
+            text: "用户原文".into(),
+        };
+        let key = message.session_key("app").unwrap();
+        let messages = vec![
+            ChatMessage::text(ChatRole::User, &message.text),
+            ChatMessage::text(ChatRole::Assistant, "模型回复"),
+        ];
+        let report = ControlReport {
+            key: GenerationKey {
+                session: key.clone(),
+                task_id: format!("qq:{}", message.id),
+                controller_epoch: [1; 16],
+                generation: 1,
+            },
+            cancel_requested: false,
+            run: RunReport {
+                turn_id: Some(1),
+                commit: CommitState::Completed,
+                text: Some("模型回复".into()),
+                transcript: Some(messages.clone()),
+                started_tools: Some(0),
+                tool_results: vec![],
+                failure: None,
+            },
+        };
+        let snapshot = SessionSnapshot {
+            key,
+            revision: 2,
+            turns: vec![SessionTurn {
+                id: 1,
+                input: message.text.clone(),
+                status: SessionTurnStatus::Completed { messages },
+            }],
+        };
+        (message, report, snapshot)
+    }
+
+    #[test]
+    fn exact_committed_turn_is_required() {
+        let (message, report, snapshot) = fixture();
+        let capture = |r: &ControlReport, s: Option<SessionSnapshot>| {
+            CompletedInteraction::capture("app", &message, &report.key, r, &Snapshot(s))
+        };
+        assert!(capture(&report, Some(snapshot.clone())).unwrap().is_some());
+        assert!(capture(&report, None).is_err());
+        for alter in [
+            |r: &mut ControlReport| r.key.controller_epoch = [2; 16],
+            |r: &mut ControlReport| r.key.generation += 1,
+            |r: &mut ControlReport| r.key.task_id = "qq:another".into(),
+            |r: &mut ControlReport| r.key.session.user_id = "another".into(),
+            |r: &mut ControlReport| r.run.turn_id = None,
+            |r: &mut ControlReport| r.run.turn_id = Some(2),
+            |r: &mut ControlReport| r.run.commit = CommitState::Pending,
+            |r: &mut ControlReport| r.run.text = Some("未提交的回复".into()),
+            |r: &mut ControlReport| {
+                r.run.failure = Some(RunFailure::Execution(LlmError::Cancelled));
+            },
+        ] {
+            let mut changed = report.clone();
+            alter(&mut changed);
+            assert!(capture(&changed, Some(snapshot.clone())).is_err());
+        }
+        for alter in [
+            |s: &mut SessionSnapshot| s.key.user_id = "another".into(),
+            |s: &mut SessionSnapshot| s.revision += 1,
+            |s: &mut SessionSnapshot| s.turns[0].id = 2,
+            |s: &mut SessionSnapshot| s.turns[0].status = SessionTurnStatus::Interrupted,
+            |s: &mut SessionSnapshot| {
+                s.turns[0].input = "不同的用户输入".into();
+                if let SessionTurnStatus::Completed { messages } = &mut s.turns[0].status {
+                    messages[0].text = Some("不同的用户输入".into());
+                }
+            },
+            |s: &mut SessionSnapshot| {
+                if let SessionTurnStatus::Completed { messages } = &mut s.turns[0].status {
+                    messages[1].text = Some("不同的模型回复".into());
+                }
+            },
+            |s: &mut SessionSnapshot| {
+                if let SessionTurnStatus::Completed { messages } = &mut s.turns[0].status {
+                    messages[1].role = ChatRole::User;
+                }
+            },
+        ] {
+            let mut changed = snapshot.clone();
+            alter(&mut changed);
+            assert!(capture(&report, Some(changed)).is_err());
+        }
+    }
+
+    #[test]
+    fn source_cannot_cross_app_group_or_sender() {
+        let (message, report, snapshot) = fixture();
+        for (app, scope, target, user) in [
+            ("other_app", "c2c", "alice", "alice"),
+            ("app", "group", "alice", "alice"),
+            ("app", "group", "group_b", "alice"),
+            ("app", "c2c", "bob", "bob"),
+        ] {
+            let mut changed = message.clone();
+            changed.scope = scope.into();
+            changed.target_id = target.into();
+            changed.user_id = user.into();
+            assert!(
+                CompletedInteraction::capture(
+                    app,
+                    &changed,
+                    &report.key,
+                    &report,
+                    &Snapshot(Some(snapshot.clone())),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn commands_and_cancelled_generations_are_not_observed() {
+        let (mut message, mut report, _) = fixture();
+        report.cancel_requested = true;
+        assert!(
+            CompletedInteraction::capture("app", &message, &report.key, &report, &Snapshot(None))
+                .unwrap()
+                .is_none()
+        );
+        report.cancel_requested = false;
+        for text in ["/new 替代任务", "/train start", "说明\n  /cancel"] {
+            message.text = text.into();
+            assert!(
+                CompletedInteraction::capture(
+                    "app",
+                    &message,
+                    &report.key,
+                    &report,
+                    &Snapshot(None)
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+    }
+
+    struct BrokenObserver {
+        calls: AtomicUsize,
+        panic: bool,
+    }
+    impl QqInteractionObserver for BrokenObserver {
+        fn observe(&self, _: &QqInteraction<'_>) -> PluginResult<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(!self.panic, "opaque panic detail");
+            Err(PluginError::State("opaque backend detail".into()))
+        }
+    }
+    #[test]
+    fn observer_error_and_panic_are_contained_without_retry() {
+        let (message, report, snapshot) = fixture();
+        let captured = CompletedInteraction::capture(
+            "app",
+            &message,
+            &report.key,
+            &report,
+            &Snapshot(Some(snapshot)),
+        )
+        .unwrap()
+        .unwrap();
+        for panic in [false, true] {
+            let observer = BrokenObserver {
+                calls: AtomicUsize::new(0),
+                panic,
+            };
+            let error = captured
+                .observe(&observer, "app", &message, "模型回复")
+                .unwrap_err();
+            assert!(!error.to_string().contains("opaque"));
+            assert_eq!(observer.calls.load(Ordering::SeqCst), 1);
+        }
     }
 }

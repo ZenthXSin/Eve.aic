@@ -138,6 +138,7 @@ impl ControlEventSink for ChannelEvents {
 struct Active {
     message: Message,
     key: GenerationKey,
+    ordinary: bool,
     // 必须在提交时捕获；路由器可能已经替换控制服务中的最新代。
     wait: ControlFuture<'static, ControlReport>,
 }
@@ -148,6 +149,7 @@ struct CommandMessage {
 struct Queued {
     message: Message,
     saved: bool,
+    ordinary: bool,
 }
 struct Routing {
     message: Message,
@@ -332,7 +334,7 @@ pub(crate) async fn run(
                     }
                     if action == TrainingCommand::Start {
                         // 保留 /train start 原文进入 Session；上下文提供提问策略。
-                        queue.push_front(Queued { message, saved: true });
+                        queue.push_front(Queued { message, saved: true, ordinary: false });
                         continue;
                     }
                     let text = match action {
@@ -412,7 +414,7 @@ pub(crate) async fn run(
                 match submitted {
                     Ok(key) => {
                         controlled_sessions.insert(key.session.session_id.clone(), key.session.clone());
-                        let wait = control.wait(&key); active.push(Active { message, key, wait });
+                        let wait = control.wait(&key); active.push(Active { message, key, ordinary: queued.ordinary, wait });
                     }
                     Err(_) => {
                         mark_failed(&mut ledger, &ctx, &config.app_id, &message.id)?;
@@ -451,7 +453,7 @@ pub(crate) async fn run(
                     let text = match report.outcome {
                         RouteOutcome::Replaced { generation, .. } => {
                             let wait = control.wait(&generation);
-                            active.push(Active { message: route.message, key: generation, wait });
+                            active.push(Active { message: route.message, key: generation, ordinary: false, wait });
                             continue;
                         }
                         RouteOutcome::Unchanged => "当前任务保持不变。".into(),
@@ -477,7 +479,7 @@ pub(crate) async fn run(
                     }});
                     if report.run.commit == CommitState::Completed && report.run.failure.is_none()
                         && let Some(text) = report.run.text.as_ref().filter(|t| !t.trim().is_empty() && t.len() <= 32768) {
-                        let interaction = if let Some(observation) = &observation {
+                        let interaction = if current.ordinary && let Some(observation) = &observation {
                             match CompletedInteraction::capture(&config.app_id, &current.message, &current.key, &report, observation.sessions.as_ref()) {
                                 Ok(interaction) => interaction,
                                 Err(error) => {
@@ -580,7 +582,7 @@ pub(crate) async fn run(
                                             warn(&ctx, "expression_learning_failed");
                                         }
                                     }
-                                    queue.push_back(Queued { message, saved: false });
+                                    queue.push_back(Queued { message, saved: false, ordinary: true });
                                 }
                             }
                         }

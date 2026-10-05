@@ -319,15 +319,22 @@ dependencies = [
 name = "eve-qqbot-plugin"
 version = "0.1.0"
 dependencies = [
+ "eve-config-plugin",
  "eve-control-api",
+ "eve-control-plugin",
+ "eve-kernel",
  "eve-llm-api",
  "eve-message-api",
+ "eve-message-plugin",
  "eve-plugin-api",
  "eve-session-api",
+ "eve-session-plugin",
  "eve-training-api",
+ "eve-training-plugin",
  "ring",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
