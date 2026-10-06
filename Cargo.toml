@@ -14,6 +14,7 @@ members = [
     "crates/llm-api",
     "crates/agent-prompt",
     "crates/llm-openai",
+    "crates/jev",
     "crates/session-api",
     "crates/session-plugin",
     "crates/control-api",
