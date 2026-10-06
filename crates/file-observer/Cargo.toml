@@ -1,5 +1,5 @@
 [package]
-name = "eve-cognition-plugin"
+name = "eve-file-observer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,12 +7,11 @@ license.workspace = true
 
 [dependencies]
 eve-cognition-api = { path = "../cognition-api" }
-eve-plugin-api = { path = "../plugin-api" }
-serde.workspace = true
+ring.workspace = true
 serde_json.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
-ring.workspace = true
-eve-kernel = { path = "../kernel" }
-tokio.workspace = true
 tempfile.workspace = true

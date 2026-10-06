@@ -6,7 +6,9 @@ use eve_cognition_loop_plugin::{
     CognitionLoopPlugin, LoopController, PriorityDrivePolicy, ReflectionArtifact,
     ReflectionPlannerFactory, ReflectionVerifier, current_reflection,
 };
-use eve_cognition_plugin::{CognitionController, CognitionPlugin, UserGoalFeedback};
+use eve_cognition_plugin::{
+    CognitionController, CognitionPlugin, UserGoalFeedback, UserGoalFileObservation,
+};
 use eve_config_api::{
     CONFIG_SERVICE_ID, ConfigServiceHandle, LLM_NAMESPACE, LlmRuntimeConfig, model_roles_schema,
     runtime_llm_schema,
@@ -14,6 +16,7 @@ use eve_config_api::{
 use eve_config_plugin::{ConfigBootstrap, ConfigPlugin};
 use eve_control_api::{CONTROL_PLUGIN_ID, CONTROL_SERVICE_ID, ControlServiceHandle};
 use eve_control_plugin::ControlPlugin;
+use eve_file_observer::BoundFileObserver;
 use eve_kernel::{Kernel, KernelServices};
 use eve_llm_api::{ChatRole, LlmModelResolver, ResponseMode};
 use eve_plugin_api::{PluginDependency, PluginId, ServiceId, ServiceRegistry};
@@ -41,7 +44,10 @@ pub const COGNITION_HELP: &str = "Eve 本地内生反思入口
   status                                  查看无正文的状态计数
   show --id ID                            查看目标及草稿，current/stale 标明是否属于当前修订
   run [--seconds 30] [--max-executions 1]   无需新输入，推进已有目标的反思草稿
+      [--observe-goal ID --observe-file 路径 [--observe-user owner]]
+                                          观察指定文本文件，内容变化后保存证据并重规划
 状态目录默认 .eve-cognition；运行窗口 1 至 600 秒，最多执行 1 至 32 项。
+文件观察只在本次 run 生效；上限 64 KiB，仅前缀进入规划，完整字节保存 SHA-256。
 默认文件状态；--database-config 显式选用本地 PostgreSQL，首次使用须选无文件快照的新目录。
 仅有可执行反思时才需要 EVE_OPENAI_API_KEY 和主模型配置；沿用 AGENT.md。
 每项反思最多一次模型请求、零工具、一次尝试、30 秒；父目标仍等待用户处理。
@@ -71,7 +77,15 @@ enum CognitionCommand {
     Run {
         seconds: u64,
         max_executions: u16,
+        observation: Option<FileObservationOptions>,
     },
+}
+
+#[derive(Clone, Debug)]
+struct FileObservationOptions {
+    goal_id: String,
+    file: PathBuf,
+    user: String,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +102,7 @@ impl CognitionOptions {
         let mut directory = None;
         let mut agent = None;
         let mut database_config = None;
+        let mut observation_file = None;
         let mut command = None;
         let mut fields = std::collections::BTreeMap::<String, String>::new();
         while let Some(arg) = args.next() {
@@ -112,6 +127,9 @@ impl CognitionOptions {
                 "--max-executions",
                 "--revision",
                 "--feedback-id",
+                "--observe-goal",
+                "--observe-file",
+                "--observe-user",
             ]
             .contains(&arg.as_str())
             {
@@ -125,6 +143,7 @@ impl CognitionOptions {
                 "--state-dir" => directory.replace(PathBuf::from(value)).is_some(),
                 "--agent" => agent.replace(PathBuf::from(value)).is_some(),
                 "--database-config" => database_config.replace(PathBuf::from(value)).is_some(),
+                "--observe-file" => observation_file.replace(PathBuf::from(value)).is_some(),
                 _ => fields
                     .insert(
                         arg,
@@ -189,14 +208,35 @@ impl CognitionOptions {
                 if !(1..=600).contains(&seconds) || !(1..=32).contains(&max_executions) {
                     return Err("运行秒数须在 1 至 600，执行上限须在 1 至 32。".into());
                 }
+                let observation = match (fields.remove("--observe-goal"), observation_file.take()) {
+                    (Some(goal_id), Some(file)) => {
+                        let user = fields
+                            .remove("--observe-user")
+                            .unwrap_or_else(|| "owner".into());
+                        validate_id(&goal_id)?;
+                        validate_id(&user)?;
+                        Some(FileObservationOptions {
+                            goal_id,
+                            file,
+                            user,
+                        })
+                    }
+                    (None, None) => None,
+                    _ => {
+                        return Err(
+                            "文件观察必须同时指定 --observe-goal 和 --observe-file。".into()
+                        );
+                    }
+                };
                 CognitionCommand::Run {
                     seconds,
                     max_executions,
+                    observation,
                 }
             }
             _ => unreachable!(),
         };
-        if !fields.is_empty() {
+        if !fields.is_empty() || observation_file.is_some() {
             return Err("当前认知命令不接受所给参数。".into());
         }
         Ok(Some(Self {
@@ -515,6 +555,83 @@ fn combine<T>(result: Result<T, AppError>, extra: Vec<AppError>) -> Result<T, Ap
     Err(AppFailure { primary, secondary }.into())
 }
 
+struct FileObservationBinding {
+    options: FileObservationOptions,
+    reader: BoundFileObserver,
+    service: UserGoalFileObservation,
+    reads: u64,
+    saved: u64,
+    duplicates: u64,
+}
+impl FileObservationBinding {
+    fn new(
+        admin: &CognitionController,
+        options: &FileObservationOptions,
+    ) -> Result<Self, AppError> {
+        // 在访问文件前确认目标和所属用户；路径不会进入持久化契约。
+        Self::parent_revision(admin, options, now_ms()?)?;
+        Ok(Self {
+            options: options.clone(),
+            reader: BoundFileObserver::bind(&options.file)?,
+            service: UserGoalFileObservation::new(
+                Arc::new(admin.clone()),
+                SUBJECT.into(),
+                options.user.clone(),
+                INPUT_CHANNEL.into(),
+            )?,
+            reads: 0,
+            saved: 0,
+            duplicates: 0,
+        })
+    }
+
+    fn parent_revision(
+        admin: &CognitionController,
+        options: &FileObservationOptions,
+        at_ms: u64,
+    ) -> Result<u64, AppError> {
+        let snapshot = admin.snapshot()?;
+        let goal = snapshot
+            .state
+            .goals
+            .get(&options.goal_id)
+            .filter(|goal| {
+                goal.source.kind == SourceKind::User
+                    && goal.source.channel == INPUT_CHANNEL
+                    && goal.verification == "user-goal:v1"
+                    && goal.visibility == Visibility::User(options.user.clone())
+            })
+            .ok_or("观察目标不存在或不属于指定用户的本地目标。")?;
+        if goal.status != GoalStatus::Waiting
+            || goal.expires_at_ms.is_some_and(|expiry| at_ms >= expiry)
+        {
+            return Err("观察目标已终止或过期，未继续读取文件。".into());
+        }
+        Ok(goal.revision)
+    }
+
+    fn poll(&mut self, admin: &CognitionController) -> Result<(), AppError> {
+        let at_ms = now_ms()?;
+        let revision = Self::parent_revision(admin, &self.options, at_ms)?;
+        let input = self
+            .reader
+            .read_input(&self.options.goal_id, revision, at_ms)?;
+        self.reads += 1;
+        let report = self.service.submit(input)?;
+        if report.duplicate {
+            self.duplicates += 1;
+        } else {
+            self.saved += 1;
+        }
+        Ok(())
+    }
+
+    fn report(&self) -> Value {
+        json!({"goal_id":self.options.goal_id, "source_id":self.reader.source_id(),
+            "reads":self.reads, "saved":self.saved, "duplicates":self.duplicates})
+    }
+}
+
 async fn run_window(
     kernel: &Kernel,
     backends: &KernelServices,
@@ -531,6 +648,13 @@ async fn run_window(
     };
     planner_options.validate()?;
     let planner = factory.create(Arc::new(admin.clone()), planner_options)?;
+    let mut observation = match &options.command {
+        CognitionCommand::Run {
+            observation: Some(binding),
+            ..
+        } => Some(FileObservationBinding::new(admin, binding)?),
+        _ => None,
+    };
     let began = tokio::time::Instant::now();
     let deadline = began + Duration::from_secs(seconds);
     let stop = interrupted();
@@ -546,6 +670,18 @@ async fn run_window(
                 signal = &mut stop => { signal?; was_interrupted = true; break; }
                 _ = tokio::time::sleep_until(deadline) => break,
                 _ = timer.tick() => {}
+            }
+            if let Some(binding) = &mut observation {
+                match binding.poll(admin) {
+                    Ok(()) => {}
+                    Err(error)
+                        if error.downcast_ref::<CognitionError>()
+                            == Some(&CognitionError::StaleRevision) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             match planner.reconcile(now_ms()?) {
                 Ok(_) => {}
@@ -601,6 +737,9 @@ async fn run_window(
     report["elapsed_ms"] = json!(began.elapsed().as_millis());
     report["interrupted"] = json!(was_interrupted);
     report["loop"] = loop_report(stats);
+    if let Some(binding) = observation {
+        report["observation"] = binding.report();
+    }
     Ok(report)
 }
 
@@ -642,6 +781,7 @@ pub async fn run_cognition_with_planner_factory(
             CognitionCommand::Run {
                 seconds,
                 max_executions,
+                ..
             } => {
                 run_window(
                     &kernel,

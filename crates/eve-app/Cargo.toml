@@ -29,6 +29,7 @@ eve-web-panel-api = { path = "../web-panel-api" }
 eve-web-panel = { path = "../web-panel" }
 eve-cognition-api = { path = "../cognition-api" }
 eve-cognition-plugin = { path = "../cognition-plugin" }
+eve-file-observer = { path = "../file-observer" }
 eve-cognition-loop-api = { path = "../cognition-loop-api" }
 eve-cognition-loop-plugin = { path = "../cognition-loop-plugin" }
 eve-config-api = { path = "../config-api" }
