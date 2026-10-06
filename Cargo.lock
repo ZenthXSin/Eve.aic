@@ -207,6 +207,7 @@ dependencies = [
  "eve-config-plugin",
  "eve-control-api",
  "eve-control-plugin",
+ "eve-jev",
  "eve-kernel",
  "eve-learning-api",
  "eve-learning-plugin",
@@ -334,6 +335,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-jev"
+version = "0.1.0"
+dependencies = [
+ "eve-control-api",
+ "eve-message-api",
+ "eve-session-api",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "eve-kernel"
 version = "0.1.0"
 dependencies = [
@@ -432,6 +446,7 @@ version = "0.1.0"
 dependencies = [
  "eve-config-api",
  "eve-control-api",
+ "eve-llm-api",
  "eve-message-api",
  "eve-plugin-api",
  "eve-session-api",

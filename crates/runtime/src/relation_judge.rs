@@ -1,12 +1,18 @@
 //! 内置模型调用到公开消息判断契约的适配；不执行工具或控制动作。
-use eve_llm_api::{ChatMessage, ChatRole, LlmError, LlmProvider, ModelRequest, ModelResponse};
+use eve_llm_api::{
+    ChatMessage, ChatRole, LlmError, LlmModelResolver, LlmProvider, ModelRequest, ModelResponse,
+};
 use eve_message_api::{
     IntentPart, RelationDecision, RelationError, RelationFuture, RelationInput, RelationJudge,
     TextSpan,
 };
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::Arc;
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::Arc,
+};
+use tokio::time::{Instant, timeout_at};
 
 const MAX_INPUT_BYTES: usize = 65536;
 const MAX_OUTPUT_BYTES: usize = 16384;
@@ -21,12 +27,27 @@ confidence 是 0 到 100 的整数，是未经校准的自评；不确定、冲�
 /// 由宿主选择 Provider，并通过 RelationPlugin 注入。默认装配仍使用规则。
 /// 期限、停止与 panic 隔离由消息路由/回退链持有；本适配器只发一次非流式请求。
 pub struct LlmRelationJudge {
-    provider: Arc<dyn LlmProvider>,
+    source: ModelSource,
+}
+
+enum ModelSource {
+    Fixed(Arc<dyn LlmProvider>),
+    Resolver(Arc<dyn LlmModelResolver>),
 }
 
 impl LlmRelationJudge {
     pub fn new(provider: Arc<dyn LlmProvider>) -> Self {
-        Self { provider }
+        Self {
+            source: ModelSource::Fixed(provider),
+        }
+    }
+
+    /// 每次判断恰好解析一次当前模型，并固定使用该次选择及 Provider 期限。
+    /// 外层回退链的总期限和取消仍可提前丢弃本次请求，不产生重试。
+    pub fn with_resolver(resolver: Arc<dyn LlmModelResolver>) -> Self {
+        Self {
+            source: ModelSource::Resolver(resolver),
+        }
     }
 }
 
@@ -79,15 +100,28 @@ impl RelationJudge for LlmRelationJudge {
                 ],
                 tools: vec![],
             };
-            let response = self
-                .provider
-                .complete(request)
-                .await
-                .map_err(|error| match error {
-                    LlmError::ProviderTimeout => RelationError::Timeout,
-                    LlmError::Protocol(_) => RelationError::Protocol,
-                    _ => RelationError::Unavailable,
-                })?;
+            let (provider, deadline) = match &self.source {
+                ModelSource::Fixed(provider) => (provider.clone(), None),
+                ModelSource::Resolver(resolver) => {
+                    let selected = catch_unwind(AssertUnwindSafe(|| resolver.resolve()))
+                        .map_err(|_| RelationError::Unavailable)?
+                        .map_err(relation_error)?;
+                    if selected.provider_timeout.is_zero() {
+                        return Err(RelationError::Unavailable);
+                    }
+                    let deadline = Instant::now()
+                        .checked_add(selected.provider_timeout)
+                        .ok_or(RelationError::Unavailable)?;
+                    (selected.provider, Some(deadline))
+                }
+            };
+            let response = match deadline {
+                Some(deadline) => timeout_at(deadline, provider.complete(request))
+                    .await
+                    .map_err(|_| RelationError::Timeout)?,
+                None => provider.complete(request).await,
+            }
+            .map_err(relation_error)?;
             let ModelResponse::Final { text } = response else {
                 return Err(RelationError::Protocol);
             };
@@ -144,5 +178,13 @@ impl RelationJudge for LlmRelationJudge {
             decision.validate(&input)?;
             Ok(decision)
         })
+    }
+}
+
+fn relation_error(error: LlmError) -> RelationError {
+    match error {
+        LlmError::ProviderTimeout => RelationError::Timeout,
+        LlmError::Protocol(_) => RelationError::Protocol,
+        _ => RelationError::Unavailable,
     }
 }

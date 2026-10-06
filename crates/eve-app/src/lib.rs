@@ -11,17 +11,23 @@ mod qq_learning;
 mod qq_learning_commands;
 mod qq_memory;
 mod qq_memory_observer;
+mod qq_message_judge;
 mod qqbot;
 mod segment_advice;
 mod segment_commands;
 mod services;
 mod storage;
 
+#[cfg(test)]
+#[path = "../../llm-openai/tests/support/mod.rs"]
+mod http_support;
+
 pub use cognition::{
     COGNITION_HELP, CognitionOptions, run_cognition, run_cognition_with_planner_factory,
 };
 pub use console::{ChatOutputError, ChatRunError};
 pub use error::AppFailure;
+pub use qq_message_judge::MessageJudgeMode;
 pub use qqbot::{
     QQBOT_HELP, QqBotOptions, run_qqbot, run_qqbot_with_components, run_qqbot_with_learning_policy,
     run_qqbot_with_planner_factory,
@@ -267,6 +273,7 @@ pub(crate) async fn install_core(
         vec![
             runtime_llm_schema(),
             config::openai_schema(),
+            qq_message_judge::provider_schema(),
             model_roles_schema(),
             eve_message_api::message_schema(),
         ],

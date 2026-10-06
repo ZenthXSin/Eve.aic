@@ -4,8 +4,8 @@ use crate::{
     state::{Ledger, Message, Part, PartState, ReceiptState, Segments},
 };
 use eve_control_api::{
-    CommitState, ControlEvent, ControlEventSink, ControlFuture, ControlInput, ControlReport,
-    ControlService, GenerationKey,
+    CommitState, ControlEvent, ControlEventSink, ControlFuture, ControlInput, ControlPhase,
+    ControlReport, ControlService, GenerationKey,
 };
 use eve_llm_api::{LlmError, LlmFuture, TurnEvent, TurnEventKind};
 use eve_message_api::{IncomingMessage, MessageFuture, MessageService, RouteOutcome, RouteReport};
@@ -97,6 +97,7 @@ pub(crate) struct Services {
     pub training: Option<Arc<dyn TrainingService>>,
     pub observation: Option<Arc<Observation>>,
     pub segmentation: Option<Arc<Segmentation>>,
+    pub natural_message_judgement: bool,
 }
 struct ChannelEvents {
     signal: Arc<dyn TaskSignal>,
@@ -137,6 +138,31 @@ impl ControlEventSink for ChannelEvents {
     }
 }
 
+/// 独立路由可被后到的显式命令撤销；已创建的替代代也沿用这个关闭信号。
+struct RoutingEvents {
+    channel: Arc<ChannelEvents>,
+    cancelled: watch::Sender<bool>,
+}
+impl ControlEventSink for RoutingEvents {
+    fn emit(&self, event: ControlEvent) -> LlmFuture<'_, ()> {
+        Box::pin(async move {
+            if *self.cancelled.borrow() {
+                Err(LlmError::Cancelled)
+            } else {
+                self.channel.emit(event).await
+            }
+        })
+    }
+    fn closed(&self) -> LlmFuture<'_, ()> {
+        Box::pin(async move {
+            tokio::select! {
+                result = self.channel.closed() => result,
+                _ = closing(self.cancelled.subscribe()) => Ok(()),
+            }
+        })
+    }
+}
+
 struct Active {
     message: Message,
     key: GenerationKey,
@@ -147,6 +173,9 @@ struct Active {
 struct CommandMessage {
     message: Message,
     target: Option<GenerationKey>,
+    natural: bool,
+    superseded: bool,
+    saved: bool,
 }
 struct Queued {
     message: Message,
@@ -157,6 +186,7 @@ struct Routing {
     message: Message,
     target: GenerationKey,
     wait: MessageFuture<'static, RouteReport>,
+    cancelled: Option<watch::Sender<bool>>,
 }
 struct Reply {
     message: Message,
@@ -209,6 +239,59 @@ impl ReplyGuard {
 fn explicit(text: &str) -> bool {
     text.lines().any(|line| line.trim_start().starts_with('/'))
 }
+/// 只抢占无需模型判断且参数完整的任务改动；未知、冲突、缺少可信引用的
+/// /answer 等交给公开路由器处理，不让一段看似命令的文字取消在途判断。
+fn preempts_natural(text: &str, training: bool) -> bool {
+    if training
+        && matches!(
+            TrainingCommand::parse(text),
+            Some(TrainingCommand::Start | TrainingCommand::Stop)
+        )
+    {
+        return true;
+    }
+    let mut cancel = 0;
+    let mut new = 0;
+    let mut revise = 0;
+    let mut count = 0;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        count += 1;
+        if count > 16 {
+            return false;
+        }
+        let end = line.find(char::is_whitespace).unwrap_or(line.len());
+        let payload = line[end..].trim();
+        match &line[..end] {
+            "/cancel" if payload.is_empty() => cancel += 1,
+            "/new" if !payload.is_empty() => new += 1,
+            "/add" | "/correct" if !payload.is_empty() => revise += 1,
+            _ => return false,
+        }
+    }
+    (cancel == 1 && count == 1) || (new == 1 && revise == 0) || (revise > 0 && new == 0)
+}
+fn same_session(a: &Message, b: &Message) -> bool {
+    a.scope == b.scope && a.target_id == b.target_id && a.user_id == b.user_id
+}
+fn pending_control(
+    message: &Message,
+    routing: &[Routing],
+    commands: &VecDeque<CommandMessage>,
+) -> bool {
+    routing.iter().any(|r| same_session(message, &r.message))
+        || commands.iter().any(|c| same_session(message, &c.message))
+}
+async fn routed(routing: &mut [Routing]) -> (usize, eve_message_api::MessageResult<RouteReport>) {
+    poll_fn(|cx| {
+        for (index, route) in routing.iter_mut().enumerate() {
+            if let Poll::Ready(report) = route.wait.as_mut().poll(cx) {
+                return Poll::Ready((index, report));
+            }
+        }
+        Poll::Pending
+    })
+    .await
+}
 fn mark_failed(ledger: &mut Ledger, ctx: &PluginContext, app: &str, id: &str) -> PluginResult<()> {
     let index = ledger.find(app, id).expect("inserted receipt");
     ledger.entries[index].state = ReceiptState::Failed;
@@ -223,9 +306,13 @@ async fn finish(stdin: &mut ChildStdin, id: &str) -> PluginResult<()> {
 }
 async fn completed(
     active: &mut [Active],
+    eligible: &[bool],
 ) -> (usize, eve_control_api::ControlResult<ControlReport>) {
     poll_fn(|cx| {
         for (index, active) in active.iter_mut().enumerate() {
+            if !eligible[index] {
+                continue;
+            }
             if let Poll::Ready(report) = active.wait.as_mut().poll(cx) {
                 return Poll::Ready((index, report));
             }
@@ -251,6 +338,7 @@ pub(crate) async fn run(
         training,
         observation,
         segmentation,
+        natural_message_judgement,
     } = services;
     // 仅本地学习已验证回执中的用户表达；不提交旧任务、不调用模型或重发消息。
     if let Some(training) = &training {
@@ -313,17 +401,28 @@ pub(crate) async fn run(
     let mut commands: VecDeque<CommandMessage> = VecDeque::new();
     let mut active: Vec<Active> = Vec::new();
     let mut controlled_sessions: BTreeMap<String, SessionKey> = BTreeMap::new();
-    let mut routing: Option<Routing> = None;
+    let mut routing: Vec<Routing> = Vec::new();
     let mut replies: VecDeque<Reply> = VecDeque::new();
     let mut delivering: Option<Delivery> = None;
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let result: PluginResult<()> = async {
         loop {
             if sink.is_closed() { break Ok(()); }
-            // 所有通道取消/切换与写入在这个循环串行执行。路由 Future 由服务持有，
-            // 在 route 完成前不外发任何排队结果，也不开普通任务。
-            if routing.is_none() && let Some(command) = commands.pop_front() {
+            // 同会话输出与任务准入等候路由收尾；独立会话可继续处理。
+            // 显式命令不等待已撤销的自然判断，路由任务仍由 MessageService 收尾。
+            let command_index = commands.iter().position(|command| command.superseded ||
+                !routing.iter().any(|route| same_session(&command.message, &route.message)
+                    && (command.natural || route.cancelled.is_none())));
+            if let Some(index) = command_index {
+                let command = commands.remove(index).expect("queued command");
                 let message = command.message;
+                if command.superseded {
+                    if command.saved || ledger.insert(&ctx, &config.app_id, message.clone())? {
+                        mark_failed(&mut ledger, &ctx, &config.app_id, &message.id)?;
+                    }
+                    finish(&mut stdin, &message.id).await?;
+                    continue;
+                }
                 if let Some(training) = &training && let Some(action) = TrainingCommand::parse(&message.text) {
                     if !ledger.insert(&ctx, &config.app_id, message.clone())? {
                         warn(&ctx, "receipt_limit");
@@ -384,12 +483,12 @@ pub(crate) async fn run(
                     replies.push_back(Reply { message, text, guard: ReplyGuard::NoTask, interaction: None });
                     continue;
                 }
-                if !ledger.insert(&ctx, &config.app_id, message.clone())? {
+                if !command.saved && !ledger.insert(&ctx, &config.app_id, message.clone())? {
                     warn(&ctx, "receipt_limit");
                     finish(&mut stdin, &message.id).await?;
                     continue;
                 }
-                if let Some(handler) = &command_handler {
+                if !command.natural && let Some(handler) = &command_handler {
                     let session = message.session_key(&config.app_id)?;
                     match commands::dispatch(handler.as_ref(), QqCommandInput {
                         message_id: &message.id, session: &session, text: &message.text,
@@ -421,8 +520,13 @@ pub(crate) async fn run(
                         // QQ v1 桥接尚未验证澄清引用；不得从文字推断 question_id。
                         reply_to: None,
                     };
-                    match messages.submit(incoming, sink.clone()) {
-                        Ok(ticket) => routing = Some(Routing { message, target, wait: messages.wait(&ticket) }),
+                    let cancelled = command.natural.then(|| watch::channel(false).0);
+                    let route_sink: Arc<dyn ControlEventSink> = match &cancelled {
+                        Some(cancelled) => Arc::new(RoutingEvents { channel: sink.clone(), cancelled: cancelled.clone() }),
+                        None => sink.clone(),
+                    };
+                    match messages.submit(incoming, route_sink) {
+                        Ok(ticket) => routing.push(Routing { message, target, wait: messages.wait(&ticket), cancelled }),
                         Err(_) => {
                             warn(&ctx, "message_submit_failed");
                             replies.push_back(Reply { message, text: "消息控制暂不可用或已达容量上限；当前任务保持不变。".into(), guard: ReplyGuard::Current(target), interaction: None });
@@ -431,9 +535,11 @@ pub(crate) async fn run(
                 } else {
                     replies.push_back(Reply { message, text: NO_TASK.into(), guard: ReplyGuard::NoTask, interaction: None });
                 }
+                continue;
             }
-            if routing.is_none() && commands.is_empty() && delivering.is_none()
-                && let Some(reply) = replies.pop_front() {
+            if delivering.is_none()
+                && let Some(index) = replies.iter().position(|reply| !pending_control(&reply.message, &routing, &commands)) {
+                let reply = replies.remove(index).expect("queued reply");
                 if !reply.guard.accepts(control.as_ref()) {
                     mark_failed(&mut ledger, &ctx, &config.app_id, &reply.message.id)?;
                     warn(&ctx, "stale_reply_suppressed");
@@ -511,8 +617,8 @@ pub(crate) async fn run(
                 delivering = Some(Delivery { reply, pauses, index: 0, pause_until: None });
             }
             // 段间停顿结束后写下一段；路由或命令尚未收尾时先等待，取消或新代可在此关闭剩余片段。
-            if routing.is_none() && commands.is_empty()
-                && let Some(delivery) = delivering.as_mut()
+            if let Some(delivery) = delivering.as_mut()
+                && !pending_control(&delivery.reply.message, &routing, &commands)
                 && delivery.pause_until.is_some_and(|until| until <= tokio::time::Instant::now()) {
                 let id = delivery.reply.message.id.clone();
                 let index = ledger.find(&config.app_id, &id).expect("inserted receipt");
@@ -535,8 +641,18 @@ pub(crate) async fn run(
                 deadline = tokio::time::Instant::now() + Duration::from_secs(35);
                 delivery.pause_until = None;
             }
-            if routing.is_none() && commands.is_empty() && active.is_empty()
-                && delivering.is_none() && replies.is_empty() && let Some(queued) = queue.pop_front() {
+            let next_ordinary = queue.iter().position(|queued| {
+                if !natural_message_judgement {
+                    return routing.is_empty() && commands.is_empty() && active.is_empty()
+                        && delivering.is_none() && replies.is_empty();
+                }
+                !pending_control(&queued.message, &routing, &commands)
+                    && !active.iter().any(|a| same_session(&queued.message, &a.message))
+                    && !replies.iter().any(|r| same_session(&queued.message, &r.message))
+                    && !delivering.as_ref().is_some_and(|d| same_session(&queued.message, &d.reply.message))
+            });
+            if let Some(index) = next_ordinary {
+                let queued = queue.remove(index).expect("queued ordinary message");
                 let message = queued.message;
                 if !queued.saved && !ledger.insert(&ctx, &config.app_id, message.clone())? {
                     warn(&ctx, "receipt_limit");
@@ -559,7 +675,9 @@ pub(crate) async fn run(
                         finish(&mut stdin, &message.id).await?;
                     }
                 }
+                continue;
             }
+            let eligible: Vec<bool> = active.iter().map(|a| !pending_control(&a.message, &routing, &commands)).collect();
             tokio::select! {
                 biased;
                 _ = signal.cancelled() => break Ok(()),
@@ -569,9 +687,9 @@ pub(crate) async fn run(
                 }
                 // 停顿结束时唤醒：每次循环先处理一条待路由命令，命令清空后才写下一段。
                 _ = tokio::time::sleep_until(delivering.as_ref().and_then(|d| d.pause_until).unwrap_or(deadline)),
-                    if routing.is_none() && delivering.as_ref().is_some_and(|d| !d.awaiting()) => {}
-                report = async { routing.as_mut().expect("routing message").wait.as_mut().await }, if routing.is_some() => {
-                    let route = routing.take().expect("routing message");
+                    if delivering.as_ref().is_some_and(|d| !d.awaiting() && !pending_control(&d.reply.message, &routing, &commands)) => {}
+                (index, report) = routed(&mut routing), if !routing.is_empty() => {
+                    let route = routing.remove(index);
                     let report = report.map_err(|_| failure("QQBot 消息控制收尾失败"))?;
                     // 已被路由取消的旧轮不再显示。prior 仍由 MessageService/Control 保留，
                     // 不能把它当作控制消息或替代代的完成输出。
@@ -589,8 +707,22 @@ pub(crate) async fn run(
                         mark_failed(&mut ledger, &ctx, &config.app_id, &old.message.id)?;
                         finish(&mut stdin, &old.message.id).await?;
                     }
+                    if route.cancelled.as_ref().is_some_and(|cancelled| *cancelled.borrow())
+                        && !matches!(report.outcome, RouteOutcome::Replaced { .. }) {
+                        mark_failed(&mut ledger, &ctx, &config.app_id, &route.message.id)?;
+                        finish(&mut stdin, &route.message.id).await?;
+                        continue;
+                    }
                     let text = match report.outcome {
                         RouteOutcome::Replaced { generation, .. } => {
+                            if !control.snapshot(&generation.session)
+                                .map_err(|_| failure("QQBot 替代任务快照不可用"))?
+                                .is_some_and(|snapshot| snapshot.key == generation) {
+                                mark_failed(&mut ledger, &ctx, &config.app_id, &route.message.id)?;
+                                warn(&ctx, "stale_replacement_suppressed");
+                                finish(&mut stdin, &route.message.id).await?;
+                                continue;
+                            }
                             let wait = control.wait(&generation);
                             active.push(Active { message: route.message, key: generation, ordinary: false, wait });
                             continue;
@@ -610,7 +742,7 @@ pub(crate) async fn run(
                     };
                     replies.push_back(Reply { message: route.message, text, guard: ReplyGuard::Current(route.target), interaction: None });
                 }
-                (index, report) = completed(&mut active), if !active.is_empty() && routing.is_none() => {
+                (index, report) = completed(&mut active, &eligible), if !active.is_empty() => {
                     let current = active.remove(index);
                     let report = report.map_err(|_| failure("QQBot 控制任务收尾失败"))?;
                     let guard = ReplyGuard::Completed(ControlEvent { key: report.key.clone(), event: TurnEvent {
@@ -640,7 +772,7 @@ pub(crate) async fn run(
                 }
                 frame = frames.next() => {
                     let Some(frame) = frame? else {
-                        if !active.is_empty() || routing.is_some() || delivering.is_some() || !queue.is_empty()
+                        if !active.is_empty() || !routing.is_empty() || delivering.is_some() || !queue.is_empty()
                             || !commands.is_empty() || !replies.is_empty() || !status.borrow().ready {
                             break Err(failure("QQBot 在未完成交互时断开；保留状态"));
                         }
@@ -720,13 +852,13 @@ pub(crate) async fn run(
                             let live = queue.iter().any(|m| m.message.id == message.id)
                                 || commands.iter().any(|c| c.message.id == message.id)
                                 || active.iter().any(|a| a.message.id == message.id)
-                                || routing.as_ref().is_some_and(|r| r.message.id == message.id)
+                                || routing.iter().any(|r| r.message.id == message.id)
                                 || replies.iter().any(|r| r.message.id == message.id)
                                 || delivering.as_ref().is_some_and(|d| d.reply.message.id == message.id);
                             if live { warn(&ctx, "duplicate_pending"); continue; }
                             let duplicate = ledger.find(&config.app_id, &message.id).is_some();
                             let pending = queue.len() + commands.len() + active.len() + replies.len()
-                                + usize::from(routing.is_some()) + usize::from(delivering.is_some());
+                                + routing.len() + usize::from(delivering.is_some());
                             if duplicate || pending >= MAX_PENDING {
                                 warn(&ctx, if duplicate { "duplicate_no_replay" } else { "queue_limit" });
                                 finish(&mut stdin, &message.id).await?;
@@ -736,7 +868,19 @@ pub(crate) async fn run(
                                     let session = message.session_key(&config.app_id)?;
                                     let target = control.snapshot(&session)
                                         .map_err(|_| failure("QQBot 任务快照不可用"))?.map(|s| s.key);
-                                    commands.push_back(CommandMessage { message, target });
+                                    if preempts_natural(&message.text, training.is_some()) {
+                                        for route in &routing {
+                                            if same_session(&message, &route.message) && let Some(cancelled) = &route.cancelled {
+                                                cancelled.send_replace(true);
+                                            }
+                                        }
+                                        for command in &mut commands {
+                                            if command.natural && same_session(&message, &command.message) {
+                                                command.superseded = true;
+                                            }
+                                        }
+                                    }
+                                    commands.push_back(CommandMessage { message, target, natural: false, superseded: false, saved: false });
                                 } else {
                                     // 按普通输入准入时的持久开关采集，不能延后到模型执行。
                                     // 启停/重置可先于排队任务执行；旧输入必须已有去重凭据。
@@ -747,7 +891,24 @@ pub(crate) async fn run(
                                             warn(&ctx, "expression_learning_failed");
                                         }
                                     }
-                                    queue.push_back(Queued { message, saved: false, ordinary: true });
+                                    let target = if natural_message_judgement {
+                                        control.snapshot(&message.session_key(&config.app_id)?)
+                                            .map_err(|_| failure("QQBot 任务快照不可用"))?
+                                            .filter(|s| !s.cancel_requested && matches!(s.phase,
+                                                ControlPhase::Starting | ControlPhase::Generating | ControlPhase::Tools | ControlPhase::Committing))
+                                            .map(|s| s.key)
+                                    } else { None };
+                                    if target.is_some() {
+                                        // 捕获代际时即持久化；即使仍在等同会话的判断，重启也不能把旧控制文字当新任务。
+                                        if !ledger.insert(&ctx, &config.app_id, message.clone())? {
+                                            warn(&ctx, "receipt_limit");
+                                            finish(&mut stdin, &message.id).await?;
+                                            continue;
+                                        }
+                                        commands.push_back(CommandMessage { message, target, natural: true, superseded: false, saved: true });
+                                    } else {
+                                        queue.push_back(Queued { message, saved: false, ordinary: true });
+                                    }
                                 }
                             }
                         }
@@ -761,10 +922,10 @@ pub(crate) async fn run(
     // 先等路由收尾，再查询目标会话最新代，随后取消并等待全部本地执行器。
     closed.send_replace(true);
     let mut cleanup_error = None;
-    if let Some(route) = routing
-        && route.wait.await.is_err()
-    {
-        cleanup_error = Some(failure("QQBot 消息控制收尾失败"));
+    for route in routing {
+        if route.wait.await.is_err() {
+            cleanup_error = Some(failure("QQBot 消息控制收尾失败"));
+        }
     }
     let mut settling = Vec::new();
     for session in controlled_sessions.into_values() {
@@ -795,4 +956,41 @@ pub(crate) async fn run(
         let _ = child.wait().await;
     }
     result.and(cleanup_error.map_or(Ok(()), Err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preempts_natural;
+
+    #[test]
+    fn only_complete_unambiguous_task_commands_preempt_natural_judgment() {
+        for text in [
+            "/cancel",
+            " /correct 中文\n/add 保留细节 ",
+            "/new 新任务",
+            "/cancel\n/new 新任务",
+            "/train start",
+            "/train stop",
+        ] {
+            assert!(preempts_natural(text, true), "{text}");
+        }
+        for text in [
+            "/cancelxxx",
+            "/cancel extra",
+            "/cancel\n/cancel",
+            "/correct",
+            "/new a\n/new b",
+            "/new a\n/correct b",
+            "/correct a\n/unrelated",
+            "/cancel\n未知",
+            "/answer a",
+            "/memory status",
+            "/train status",
+            "/train start extra",
+        ] {
+            assert!(!preempts_natural(text, true), "{text}");
+        }
+        assert!(!preempts_natural("/train start", false));
+        assert!(!preempts_natural(&"/add a\n".repeat(17), true));
+    }
 }

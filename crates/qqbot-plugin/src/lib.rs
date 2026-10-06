@@ -87,6 +87,7 @@ pub struct QqBotPlugin {
     training: bool,
     observer: Option<Arc<dyn QqInteractionObserver>>,
     segmentation: Option<Arc<Segmentation>>,
+    natural_message_judgement: bool,
 }
 pub(crate) struct Segmentation {
     pub planner: Arc<dyn SegmentPlanner>,
@@ -112,8 +113,17 @@ impl QqBotPlugin {
             training: false,
             observer: None,
             segmentation: None,
+            natural_message_judgement: false,
         })
     }
+    /// 显式开启在途普通文字判断；判断实现由宿主安装的 MessageService 决定。
+    /// 默认关闭，普通文字继续排队。只捕获尚未收尾且没有请求取消的当前代，
+    /// 判定中的显式命令可抢先执行；其他会话不会等待该判断。
+    pub fn with_natural_message_judgement(mut self, enabled: bool) -> Self {
+        self.natural_message_judgement = enabled;
+        self
+    }
+
     /// 把已完成的模型回复按计划分成少量消息投递；命令确认仍整条发送。
     /// 未接线时与原单条回复完全一致。
     pub fn with_segmenter(
@@ -239,6 +249,7 @@ impl Plugin for QqBotPlugin {
             let config = self.config.clone();
             let command_handler = self.command_handler.clone();
             let segmentation = self.segmentation.clone();
+            let natural_message_judgement = self.natural_message_judgement;
             let task_ctx = ctx.clone();
             ctx.spawn_task(TaskSpec::new(
                 "QQBot JSONL 通道",
@@ -271,6 +282,7 @@ impl Plugin for QqBotPlugin {
                                 training,
                                 observation,
                                 segmentation,
+                                natural_message_judgement,
                             },
                             ledger,
                             signal,
