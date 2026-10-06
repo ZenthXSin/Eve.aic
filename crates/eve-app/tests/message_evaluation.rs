@@ -252,6 +252,10 @@ async fn default_rules_runs_all_public_cases_offline_and_reports_hash_and_utf8_s
     let result = report(&run(cmd).await);
     assert_eq!(result["schema_version"], 1);
     assert_eq!(result["mode"], "rules");
+    assert!(result["started_at_unix_ms"].as_u64().unwrap() > 1_700_000_000_000);
+    let config_hash = result["configuration_sha256"].as_str().unwrap();
+    assert_eq!(config_hash.len(), 64);
+    assert!(config_hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert_eq!(result["summary"]["cases"], 30);
     assert_eq!(result["summary"]["successful_judgements"], 30);
     assert_eq!(result["summary"]["errors"], 0);
@@ -279,6 +283,15 @@ async fn default_rules_runs_all_public_cases_offline_and_reports_hash_and_utf8_s
     assert!(result["summary"].get("fallbacks").is_none());
     assert!(primary.requests.try_recv().is_err());
     assert!(jev.requests.try_recv().is_err());
+    let repeated = report(&run(command(root.path())).await);
+    assert_eq!(repeated["configuration_sha256"], config_hash);
+    assert_eq!(repeated["dataset_sha256"], result["dataset_sha256"]);
+    let mut changed = command(root.path());
+    changed.env("EVE_MESSAGE_JUDGE_TIMEOUT_MS", "2500");
+    let changed = report(&run(changed).await);
+    assert_eq!(changed["judge_timeout_ms"], 2500);
+    assert_ne!(changed["configuration_sha256"], config_hash);
+    assert_eq!(changed["dataset_sha256"], result["dataset_sha256"]);
     temporary_is_empty(root.path());
 }
 
@@ -399,6 +412,36 @@ async fn explicit_state_directory_and_report_are_created_once_and_existing_data_
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("拒绝覆盖"));
     assert_eq!(std::fs::read(&destination).unwrap(), original);
     assert!(!new_state.exists());
+    assert!(primary.requests.try_recv().is_err());
+    assert!(jev.requests.try_recv().is_err());
+    temporary_is_empty(root.path());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dangling_output_symlink_is_rejected_before_any_model_request() {
+    let root = tempfile::tempdir().unwrap();
+    let text = "请修改报告。";
+    let input = dataset(root.path(), vec![natural_case("never_send", text)]);
+    let destination = root.path().join("existing-link.json");
+    let missing_target = root.path().join("missing-target.json");
+    std::os::unix::fs::symlink(&missing_target, &destination).unwrap();
+    let mut primary = Server::start(vec![correction_reply(text)]).await;
+    let mut jev = Server::start(vec![]).await;
+    let state = root.path().join("must-not-be-created");
+    let mut cmd = model_command(root.path(), &primary, &jev);
+    cmd.args(["--mode", "primary", "--dataset"])
+        .arg(input)
+        .arg("--output")
+        .arg(&destination)
+        .arg("--state-dir")
+        .arg(&state);
+    let output = run(cmd).await;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("拒绝覆盖"));
+    assert_eq!(std::fs::read_link(&destination).unwrap(), missing_target);
+    assert!(!missing_target.exists());
+    assert!(!state.exists());
     assert!(primary.requests.try_recv().is_err());
     assert!(jev.requests.try_recv().is_err());
     temporary_is_empty(root.path());

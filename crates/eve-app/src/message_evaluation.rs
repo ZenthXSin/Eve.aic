@@ -163,13 +163,15 @@ fn configuration_sha256(
 }
 
 fn profile_fingerprint(profile: Option<&eve_config_api::ModelProfile>) -> serde_json::Value {
-    profile.map_or(serde_json::Value::Null, |profile| serde_json::json!({
-        "provider": profile.provider,
-        "model": profile.model,
-        "timeout_ms": profile.timeout_ms,
-        "max_concurrent_requests": profile.max_concurrent_requests,
-        "max_output_tokens": profile.max_output_tokens,
-    }))
+    profile.map_or(serde_json::Value::Null, |profile| {
+        serde_json::json!({
+            "provider": profile.provider,
+            "model": profile.model,
+            "timeout_ms": profile.timeout_ms,
+            "max_concurrent_requests": profile.max_concurrent_requests,
+            "max_output_tokens": profile.max_output_tokens,
+        })
+    })
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -286,7 +288,7 @@ fn dataset(path: &PathBuf) -> Result<(Dataset, String), AppError> {
                         span: part.span,
                     })
                     .collect(),
-                explanation: "公开人工标注".into(),
+                explanation: "项目内公开预期标注".into(),
             };
             decision
                 .validate(&case.input)
@@ -339,8 +341,12 @@ pub async fn run_message_evaluation(
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
         .ok_or("系统时间无法用于评估记录。")?;
     // 提前检测已有报告，避免完成收费请求之后才发现不能写出。
-    if options.output.as_ref().is_some_and(|path| path.exists()) {
-        return Err("评估报告文件已存在，拒绝覆盖。".into());
+    if let Some(path) = &options.output {
+        match fs::symlink_metadata(path) {
+            Ok(_) => return Err("评估报告文件已存在，拒绝覆盖。".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("无法检查评估报告路径，未调用模型。".into()),
+        }
     }
     let directory = EvaluationDirectory::create(options.state_directory)?;
     let backends = KernelServices {
