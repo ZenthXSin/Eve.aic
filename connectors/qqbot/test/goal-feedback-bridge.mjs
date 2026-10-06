@@ -76,6 +76,10 @@ const execute = async () => {
     } else if (step.wait_sent) {
       if (!await until(() => documents()["eve.channel.qqbot"]?.["receipts.v1"]?.entries
         .some(entry => entry.message.id === step.wait_sent && entry.state === "Sent"))) return;
+    } else if (step.wait_receipt) {
+      const wanted = step.wait_receipt;
+      if (!await until(() => documents()["eve.channel.qqbot"]?.["receipts.v1"]?.entries
+        .some(entry => entry.message.id === wanted.id && entry.state === wanted.state))) return;
     } else if (step.capture_goal) {
       const wanted = step.capture_goal;
       if (!await until(() => {
@@ -113,7 +117,7 @@ const consume = async () => {
       for (const text of message.excludes ?? []) {
         if (cmd.text.includes(text)) throw new Error("unexpected_reply_fragment:" + text);
       }
-      send({ type: "delivery", id: cmd.id, ok: true, message_id: "out-" + cmd.id });
+      send({ type: "delivery", id: cmd.id, ok: message.delivery_ok ?? true, message_id: "out-" + cmd.id });
     } else if (cmd.type !== "finish" || message.expected_type !== "finish") {
       throw new Error("unexpected_command_type");
     }
