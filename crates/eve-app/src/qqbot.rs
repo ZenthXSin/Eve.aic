@@ -1,6 +1,7 @@
 use crate::{
-    AppError, AppFailure, core_bootstrap, finish_core, install_core, qq_cognition, qq_learning,
-    qq_learning_commands, qq_memory, qq_memory_observer, segment_commands,
+    AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, install_core,
+    qq_cognition, qq_learning, qq_learning_commands, qq_memory, qq_memory_observer,
+    segment_commands,
 };
 use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
@@ -13,7 +14,7 @@ use eve_learning_plugin::{EvidenceConfirmationPolicy, LearningPlugin, ModelPrefe
 use eve_llm_api::ContextAssembler;
 use eve_memory_api::{MEMORY_PLUGIN_ID, MemoryAdmin};
 use eve_memory_plugin::{MemoryContext, MemoryPlugin};
-use eve_message_plugin::{MessageRouterPlugin, RelationPlugin};
+use eve_message_plugin::MessageRouterPlugin;
 use eve_plugin_api::{PluginId, PluginResult, ServiceId};
 use eve_qqbot_plugin::{
     DEFAULT_QQBOT_APP_ID, QQ_SEGMENT_LIMITS, QQ_SEGMENT_POLICY, QQBOT_PLUGIN_ID,
@@ -31,11 +32,13 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-learning] [--self-learning] [--segmented] [--learning-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-learning] [--self-learning] [--segmented] [--message-judge off|primary|jev] [--learning-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
 QQ 普通文字排队开始新轮；逐行 /add 内容、/correct 内容、/cancel 控制当前任务。
+--message-judge 默认 off；primary 开启在途自然消息的主模型判断，jev 先用独立 Jev 判断并至多回退主模型一次。
+jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_JEV_BASE_URL 独立配置。实验判断尚待真实语义评估。
 --training 默认开启主动提问；/train start、/train stop、/train status 按会话启停/查询。
 --cognition 开启本地内生反思；/goal 内容保存待办，/goals 查看待办，/mind [目标ID] 查询草稿。
 --memory 开启有来源的交互记忆；/remember 内容、/memories [页码]、/correct-memory ID 内容、/forget ID。
@@ -67,6 +70,7 @@ pub struct QqBotOptions {
     pub self_learning: bool,
     pub learning_options: LearningOptions,
     pub segmented: bool,
+    pub message_judge: MessageJudgeMode,
     pub cognition_max_executions: u16,
 }
 impl Default for QqBotOptions {
@@ -85,6 +89,7 @@ impl Default for QqBotOptions {
             self_learning: false,
             learning_options: LearningOptions::default(),
             segmented: false,
+            message_judge: MessageJudgeMode::Off,
             cognition_max_executions: 32,
         }
     }
@@ -132,6 +137,14 @@ impl QqBotOptions {
                 Some("--node") => options.node_program = value,
                 Some("--bridge-script") => options.bridge_script = value.into(),
                 Some("--bridge-arg") => options.bridge_args.push(value),
+                Some("--message-judge") => {
+                    options.message_judge = match value.to_str() {
+                        Some("off") => MessageJudgeMode::Off,
+                        Some("primary") => MessageJudgeMode::Primary,
+                        Some("jev") => MessageJudgeMode::Jev,
+                        _ => return Err("--message-judge 必须为 off、primary 或 jev".into()),
+                    };
+                }
                 Some("--cognition-max-executions") => {
                     options.cognition_max_executions = value
                         .to_str()
@@ -230,7 +243,8 @@ pub async fn run_qqbot_with_learning_policy(
         app_secret,
         sandbox,
     })?
-    .with_training()?;
+    .with_training()?
+    .with_natural_message_judgement(options.message_judge != MessageJudgeMode::Off);
     let plugin = if options.segmented {
         plugin.with_segmenter(Arc::new(ParagraphPlanner::default()), QQ_SEGMENT_LIMITS)?
     } else {
@@ -417,7 +431,16 @@ pub async fn run_qqbot_with_learning_policy(
                 sessions: sessions.0.clone(),
             }))?;
         }
-        kernel.register(Box::new(RelationPlugin::rules()?))?;
+        let settings = registry
+            .get(&ServiceId::new(CONFIG_SERVICE_ID)?)?
+            .ok_or("消息判断配置服务缺失")?
+            .value
+            .downcast::<ConfigServiceHandle>()
+            .map_err(|_| "消息判断配置服务类型错误")?;
+        kernel.register(Box::new(crate::qq_message_judge::relation_plugin(
+            options.message_judge,
+            settings.0.clone(),
+        )?))?;
         kernel.register(Box::new(MessageRouterPlugin::builtin()?))?;
         kernel.register(Box::new(plugin))?;
         kernel.start(&PluginId::new(QQBOT_PLUGIN_ID)?).await?;
@@ -562,6 +585,32 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<QqBotOptions, AppError> {
         Ok(QqBotOptions::parse(args.iter().map(OsString::from))?.unwrap())
+    }
+
+    #[test]
+    fn natural_message_judgement_requires_explicit_mode() {
+        assert_eq!(parse(&[]).unwrap().message_judge, MessageJudgeMode::Off);
+        assert_eq!(
+            parse(&["--self-learning"]).unwrap().message_judge,
+            MessageJudgeMode::Off
+        );
+        for (name, expected) in [
+            ("off", MessageJudgeMode::Off),
+            ("primary", MessageJudgeMode::Primary),
+            ("jev", MessageJudgeMode::Jev),
+        ] {
+            assert_eq!(
+                parse(&["--message-judge", name]).unwrap().message_judge,
+                expected
+            );
+        }
+        for args in [
+            vec!["--message-judge"],
+            vec!["--message-judge", ""],
+            vec!["--message-judge", "auto"],
+        ] {
+            assert!(parse(&args).is_err());
+        }
     }
 
     #[test]

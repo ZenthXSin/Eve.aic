@@ -64,6 +64,7 @@ jobs:
         run: |
           cargo +1.89.0 build -p eve-app --bin eve-qqbot --locked
           python3 connectors/qqbot/test/eve_e2e.py
+          python3 connectors/qqbot/test/message_judge_test.py
           python3 connectors/qqbot/test/cognition_test.py
           python3 connectors/qqbot/test/memory_test.py
           python3 connectors/qqbot/test/learning_test.py

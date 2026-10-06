@@ -207,6 +207,7 @@ dependencies = [
  "eve-config-plugin",
  "eve-control-api",
  "eve-control-plugin",
+ "eve-jev",
  "eve-kernel",
  "eve-learning-api",
  "eve-learning-plugin",
@@ -445,6 +446,7 @@ version = "0.1.0"
 dependencies = [
  "eve-config-api",
  "eve-control-api",
+ "eve-llm-api",
  "eve-message-api",
  "eve-plugin-api",
  "eve-session-api",

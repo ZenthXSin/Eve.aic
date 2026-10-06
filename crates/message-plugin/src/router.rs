@@ -13,8 +13,9 @@ use std::{
     collections::HashMap,
     future::{Future, poll_fn},
     panic::{AssertUnwindSafe, catch_unwind},
+    pin::Pin,
     sync::{Arc, Mutex},
-    task::Poll,
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 use tokio::{
@@ -227,6 +228,8 @@ impl Inner {
         gate: Arc<AsyncMutex<()>>,
     ) -> MessageResult<RouteReport> {
         let m = &entry.message;
+        // 通道撤销本条判断时必须丢弃尚未准入的动作；丢弃 wait 票据本身不撤销。
+        let mut disconnected = sink.closed();
         let report = |decision, outcome| {
             Ok(RouteReport {
                 message: m.clone(),
@@ -266,12 +269,14 @@ impl Inner {
         };
         let judged = tokio::select! { biased;
             _=self.closed()=>return report(None,RouteOutcome::Stopped { prior:None }),
+            _=&mut disconnected=>return report(None,RouteOutcome::Stopped { prior:None }),
             _=tokio::time::sleep(Duration::from_millis(initial.judge_timeout_ms))=>Err(RelationError::Timeout),
             result=contain(async { self.judge.judge(input.clone()).await })=>result.unwrap_or(Err(RelationError::Panicked)),
         };
         let judged = judged.and_then(|d| d.validate(&input).map(|()| d));
         let _gate = tokio::select! { biased;
             _=self.closed()=>return report(judged.ok(),RouteOutcome::Stopped { prior:None }),
+            _=&mut disconnected=>return report(judged.ok(),RouteOutcome::Stopped { prior:None }),
             guard=gate.lock()=>guard,
         };
         let Some(now) = self.current(&m.target)? else {
@@ -284,6 +289,12 @@ impl Inner {
                     prior: now.report.map(Box::new),
                 },
             );
+        }
+        // cancel 不更换 generation，完成后的 cancel 还可能只撤销展示资格。
+        // 判断使用的状态已失效时，旧纠正/新任务均不得覆盖后来的明确取消。
+        // 初始已取消的目标仍允许新到的 /new 等明确动作。
+        if cancellation_changed(&snapshot, &now) {
+            return report(judged.ok(), RouteOutcome::Stale { prior: None });
         }
         let decision = match judged {
             Ok(d) => d,
@@ -370,15 +381,38 @@ impl Inner {
         {
             return report(Some(decision), clarify(m, ClarifyReason::TooLarge, None));
         }
+        if ready(disconnected.as_mut()) {
+            return report(Some(decision), RouteOutcome::Stopped { prior: None });
+        }
+        // 配置/问题读取也是可替换服务调用，动作前再次读取权威状态。
+        let Some(current) = self.current(&m.target)? else {
+            return report(Some(decision), RouteOutcome::Stale { prior: None });
+        };
+        if current.phase == ControlPhase::Blocked {
+            return report(
+                Some(decision),
+                RouteOutcome::Blocked {
+                    prior: current.report.map(Box::new),
+                },
+            );
+        }
+        if cancellation_changed(&snapshot, &current) {
+            return report(Some(decision), RouteOutcome::Stale { prior: None });
+        }
         // 捕获原代结果后才取消；外部切换不能让等待句柄误指向新代。
         let waiting = self.control.wait(&m.target);
-        match self.control.cancel(&m.target) {
-            Ok(_) => {}
+        let cancellation = match self.control.cancel(&m.target) {
+            // 捕捉最后一次 snapshot 与 cancel 之间另一请求已准入取消的竞争。
+            Ok(CancelDisposition::AlreadyRequested) if !snapshot.cancel_requested => {
+                return report(Some(decision), RouteOutcome::Stale { prior: None });
+            }
+            Ok(disposition) => disposition,
             Err(ControlError::StaleGeneration) => {
                 return report(Some(decision), RouteOutcome::Stale { prior: None });
             }
             Err(_) => return Err(MessageError::Unavailable),
-        }
+        };
+        // 取消已经准入后，即使通道关闭也等待原代工具析构和提交，不提前宣称收尾。
         let prior = waiting.await.map_err(|_| MessageError::Unavailable)?;
         if matches!(
             prior.run.commit,
@@ -387,6 +421,25 @@ impl Inner {
             return report(
                 Some(decision),
                 RouteOutcome::Blocked {
+                    prior: Some(Box::new(prior)),
+                },
+            );
+        }
+        if ready(disconnected.as_mut()) {
+            return report(
+                Some(decision),
+                RouteOutcome::Stopped {
+                    prior: Some(Box::new(prior)),
+                },
+            );
+        }
+        if !snapshot.cancel_requested
+            && prior.cancel_requested
+            && cancellation != CancelDisposition::Requested
+        {
+            return report(
+                Some(decision),
+                RouteOutcome::Stale {
                     prior: Some(Box::new(prior)),
                 },
             );
@@ -434,10 +487,18 @@ impl Inner {
                 clarify(m, ClarifyReason::SideEffects, Some(Box::new(prior))),
             );
         }
+        if ready(disconnected.as_mut()) {
+            return report(
+                Some(decision),
+                RouteOutcome::Stopped {
+                    prior: Some(Box::new(prior)),
+                },
+            );
+        }
         let outcome = match self.control.submit_if_current(
             &m.target,
             new_input.expect("replacement action"),
-            sink,
+            sink.clone(),
         ) {
             Ok(generation) => {
                 book.questions.remove(&m.target.session.session_id);
@@ -489,6 +550,20 @@ impl Inner {
         result
     }
 }
+fn cancellation_changed(before: &ControlSnapshot, now: &ControlSnapshot) -> bool {
+    before.cancel_requested != now.cancel_requested || before.events_retired != now.events_retired
+}
+
+/// 只观察当前状态，不让这个检查产生新的异步等待窗口。
+fn ready<F: Future + ?Sized>(future: Pin<&mut F>) -> bool {
+    future
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_ready()
+}
+
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone, Copy)]
 enum Action {
     Keep,
