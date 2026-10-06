@@ -1,0 +1,18 @@
+[package]
+name = "eve-action-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-action-api = { path = "../action-api" }
+eve-plugin-api = { path = "../plugin-api" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+ring.workspace = true
+
+[dev-dependencies]
+eve-kernel = { path = "../kernel" }
+tempfile.workspace = true
