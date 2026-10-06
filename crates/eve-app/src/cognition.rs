@@ -1,5 +1,6 @@
 //! 本地内生反思宿主：用户目标保持 Waiting，只对派生草稿安装受限执行能力。
-use crate::{AppError, AppFailure, config, core_bootstrap, models, services};
+use crate::cognition_action::ExportPlanOptions;
+use crate::{AppError, AppFailure, cognition_action, config, core_bootstrap, models, services};
 use eve_cognition_api::*;
 use eve_cognition_loop_api::*;
 use eve_cognition_loop_plugin::{
@@ -43,6 +44,8 @@ pub const COGNITION_HELP: &str = "Eve 本地内生反思入口
                                           保存用户新事实并使旧草稿过期，不调用模型
   status                                  查看无正文的状态计数
   show --id ID                            查看目标及草稿，current/stale 标明是否属于当前修订
+  export-plan --id ID --revision N --observe-file 路径 --input-sha256 SHA --output 路径 [--user owner]
+                                          显式创建并读回验证当前草稿产物，不覆盖文件、不完成父目标
   run [--seconds 30] [--max-executions 1]   无需新输入，推进已有目标的反思草稿
       [--observe-goal ID --observe-file 路径 [--observe-user owner]]
                                           观察指定文本文件，内容变化后保存证据并重规划
@@ -74,6 +77,7 @@ enum CognitionCommand {
     Show {
         id: String,
     },
+    ExportPlan(ExportPlanOptions),
     Run {
         seconds: u64,
         max_executions: u16,
@@ -103,6 +107,7 @@ impl CognitionOptions {
         let mut agent = None;
         let mut database_config = None;
         let mut observation_file = None;
+        let mut output_file = None;
         let mut command = None;
         let mut fields = std::collections::BTreeMap::<String, String>::new();
         while let Some(arg) = args.next() {
@@ -110,7 +115,7 @@ impl CognitionOptions {
                 return Ok(None);
             }
             let arg = arg.into_string().map_err(|_| "命令参数必须为 UTF-8。")?;
-            if ["add", "feedback", "status", "show", "run"].contains(&arg.as_str()) {
+            if ["add", "feedback", "status", "show", "run", "export-plan"].contains(&arg.as_str()) {
                 if command.replace(arg).is_some() {
                     return Err("只能指定一个认知命令。".into());
                 }
@@ -130,6 +135,8 @@ impl CognitionOptions {
                 "--observe-goal",
                 "--observe-file",
                 "--observe-user",
+                "--input-sha256",
+                "--output",
             ]
             .contains(&arg.as_str())
             {
@@ -144,6 +151,7 @@ impl CognitionOptions {
                 "--agent" => agent.replace(PathBuf::from(value)).is_some(),
                 "--database-config" => database_config.replace(PathBuf::from(value)).is_some(),
                 "--observe-file" => observation_file.replace(PathBuf::from(value)).is_some(),
+                "--output" => output_file.replace(PathBuf::from(value)).is_some(),
                 _ => fields
                     .insert(
                         arg,
@@ -194,6 +202,35 @@ impl CognitionOptions {
                 validate_id(&id)?;
                 CognitionCommand::Show { id }
             }
+            "export-plan" => {
+                let goal_id = fields.remove("--id").ok_or("export-plan 缺少 --id。")?;
+                let expected_goal_revision = fields
+                    .remove("--revision")
+                    .ok_or("export-plan 缺少 --revision。")?
+                    .parse::<u64>()
+                    .map_err(|_| "行动目标修订必须为正整数。")?;
+                let user_id = fields.remove("--user").unwrap_or_else(|| "owner".into());
+                let input_sha256 = fields
+                    .remove("--input-sha256")
+                    .ok_or("export-plan 缺少 --input-sha256。")?;
+                let observe_file = observation_file
+                    .take()
+                    .ok_or("export-plan 缺少 --observe-file。")?;
+                let output_file = output_file.take().ok_or("export-plan 缺少 --output。")?;
+                validate_id(&goal_id)?;
+                validate_id(&user_id)?;
+                if expected_goal_revision == 0 || !cognition_action::valid_sha256(&input_sha256) {
+                    return Err("行动目标修订须为正整数，输入摘要须为 64 位小写 SHA-256。".into());
+                }
+                CognitionCommand::ExportPlan(ExportPlanOptions {
+                    goal_id,
+                    expected_goal_revision,
+                    user_id,
+                    input_sha256,
+                    observe_file,
+                    output_file,
+                })
+            }
             "run" => {
                 let seconds = fields
                     .remove("--seconds")
@@ -236,7 +273,7 @@ impl CognitionOptions {
             }
             _ => unreachable!(),
         };
-        if !fields.is_empty() || observation_file.is_some() {
+        if !fields.is_empty() || observation_file.is_some() || output_file.is_some() {
             return Err("当前认知命令不接受所给参数。".into());
         }
         Ok(Some(Self {
@@ -430,7 +467,8 @@ async fn show(
             json!({"goal": child, "artifact": artifact, "current":current, "stale":!current}),
         );
     }
-    Ok(json!({"command": "show", "goal": goal, "reflections": reflections}))
+    let actions = cognition_action::action_records(kernel, id).await?;
+    Ok(json!({"command": "show", "goal": goal, "reflections": reflections, "actions": actions}))
 }
 
 async fn interrupted() -> Result<(), AppError> {
@@ -778,6 +816,10 @@ pub async fn run_cognition_with_planner_factory(
             CognitionCommand::Feedback { input, user } => feedback(&admin, input, user),
             CognitionCommand::Status => Ok(status("status", &admin.snapshot()?)),
             CognitionCommand::Show { id } => show(&kernel, &backends.registry, &admin, &id).await,
+            CognitionCommand::ExportPlan(action_options) => {
+                cognition_action::export_plan(&kernel, &backends.registry, &admin, action_options)
+                    .await
+            }
             CognitionCommand::Run {
                 seconds,
                 max_executions,
