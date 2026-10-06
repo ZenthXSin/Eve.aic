@@ -120,7 +120,17 @@ impl CognitionOptions {
                 return Ok(None);
             }
             let arg = arg.into_string().map_err(|_| "命令参数必须为 UTF-8。")?;
-            if ["add", "feedback", "status", "agenda", "show", "run", "export-plan"].contains(&arg.as_str()) {
+            if [
+                "add",
+                "feedback",
+                "status",
+                "agenda",
+                "show",
+                "run",
+                "export-plan",
+            ]
+            .contains(&arg.as_str())
+            {
                 if command.replace(arg).is_some() {
                     return Err("只能指定一个认知命令。".into());
                 }
