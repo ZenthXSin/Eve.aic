@@ -6,6 +6,8 @@ import http.server
 import json
 import os
 from pathlib import Path
+import re
+import signal
 import subprocess
 import tempfile
 import threading
@@ -183,27 +185,55 @@ class Scenario:
         require(report["command"] == "add", "add:command")
         require(report["goal_id"] == identifier, "add:durable-identifier")
 
-    def run(self, *, credentials=True):
+    def run(self, *, credentials=True, expected_terminal=None):
         before = len(self.provider.requests)
-        report = self.command(
-            "run", "--seconds", "1", "--max-executions", "1", credentials=credentials,
-        )
+        if expected_terminal is None:
+            # 空闲场景没有模型完成门槛，窗口结束报告用于检查零提交。
+            report = self.command(
+                "run", "--seconds", "1", "--max-executions", "1", credentials=credentials,
+            )
+        else:
+            previous = {
+                identifier for identifier, goal in self.snapshot()["state"]["goals"].items()
+                if goal["status"] == expected_terminal
+            }
+            process = self.spawn(
+                "run", "--seconds", "30", "--max-executions", "1", credentials=credentials,
+            )
+            deadline = time.monotonic() + 12
+            while True:
+                require(process.poll() is None, "gate:process-alive-until-durable-terminal")
+                completed = [goal for identifier, goal in self.snapshot()["state"]["goals"].items()
+                             if identifier not in previous and goal["status"] == expected_terminal]
+                require(len(completed) <= 1, "gate:no-extra-terminal-goals")
+                if completed:
+                    break
+                require(time.monotonic() < deadline, "gate:durable-terminal-timeout")
+                time.sleep(0.01)
+            process.send_signal(signal.SIGINT)
+            report = self.finish(process, "run")
         self.record_run(report, before)
         return report
 
-    def record_run(self, report, before):
+    def record_run(self, report, before, *, execution_limit=1):
         stats = report["loop"]
         observed = len(self.provider.requests) - before
-        self.runs.append({
+        metrics = {
             "model_requests": stats["model_requests"],
             "observed_http_requests": observed,
             "submitted": stats["submitted"], "completed": stats["completed"],
             "blocked": stats["blocked"],
             "admitted_tool_calls": stats["admitted_tool_calls"],
             "started_tools": stats["started_tools"],
-        })
+        }
+        if report.get("observation") is not None:
+            metrics["file_observation"] = {
+                key: report["observation"][key] for key in ("reads", "saved", "duplicates")
+            }
+        self.runs.append(metrics)
         require(stats["model_requests"] == observed, "run:observed-http-count")
-        require(observed <= 1 and stats["submitted"] <= 1, "run:startup-budget")
+        require(observed <= execution_limit and stats["submitted"] <= execution_limit,
+                "run:startup-budget")
         require(stats["admitted_tool_calls"] == 0, "run:no-admitted-tools")
         require(stats["started_tools"] == 0, "run:no-started-tools")
 
@@ -216,6 +246,97 @@ class Scenario:
     def snapshot(self):
         outer = json.loads(self.state_bytes())
         return json.loads(bytes(outer["entries"]["eve.cognition"]["cognition.v1"]))
+
+    def feedback(self, identifier, revision, feedback_id, text, *, user="owner"):
+        before = len(self.provider.requests)
+        report = self.command(
+            "feedback", "--id", identifier, "--revision", str(revision),
+            "--feedback-id", feedback_id, "--text", text, "--user", user,
+        )
+        require(report["command"] == "feedback", "feedback:command")
+        require(len(self.provider.requests) == before, "feedback:no-http")
+        return report
+
+    def observed_arguments(self, identifier, path, *, user="owner", limit=1, seconds=30):
+        return (
+            "run", "--seconds", str(seconds), "--max-executions", str(limit),
+            "--observe-goal", identifier, "--observe-file", str(path),
+            "--observe-user", user,
+        )
+
+    def start_observed(self, identifier, path, *, user="owner", limit=1):
+        before = len(self.provider.requests)
+        process = self.spawn(*self.observed_arguments(identifier, path, user=user, limit=limit))
+        return process, before
+
+    def wait_completed(self, process, identifier, expected, revision):
+        # 只读取本场景临时目录中的状态。时间是故障看门狗，Completed 落盘才是通过门槛。
+        deadline = time.monotonic() + 12
+        while True:
+            require(process.poll() is None, "gate:process-alive-until-durable-completion")
+            snapshot = self.snapshot()
+            goals = snapshot["state"]["goals"]
+            children = [goal for goal in goals.values()
+                        if goal["source"]["kind"] == "Inference"
+                        and goal["source"]["reference"] == identifier
+                        and goal["status"] == "Completed"
+                        and goal["feedback"]["verification_met"] is True]
+            require(len(children) <= expected, "gate:no-extra-completions")
+            if len(children) == expected and goals[identifier]["revision"] == revision:
+                return snapshot
+            require(time.monotonic() < deadline, "gate:durable-completion-timeout")
+            time.sleep(0.01)
+
+    def stop_observed(self, process, before, *, limit=1):
+        # Popen 是本场景直接创建的唯一进程句柄；不使用 PID 文件或进程组。
+        require(process.poll() is None, "stop:owned-process-alive")
+        process.send_signal(signal.SIGINT)
+        report = self.finish(process, "run")
+        self.record_run(report, before, execution_limit=limit)
+        return report
+
+    def idle_observed(self, identifier, path, *, user="owner"):
+        before = len(self.provider.requests)
+        # 无需模型完成的有限观察窗口；报告必须证明实际执行了至少一次读取。
+        report = self.command(
+            *self.observed_arguments(identifier, path, user=user, seconds=1),
+            credentials=False,
+        )
+        self.record_run(report, before)
+        expect_idle(report)
+        observation = report["observation"]
+        require(observation["reads"] >= 1, "unchanged:actually-read-file")
+        require(observation["saved"] == 0, "unchanged:no-new-observation")
+        require(observation["duplicates"] == observation["reads"], "unchanged:all-reads-deduplicated")
+        return report
+
+    def rejected_owner(self, identifier, path, *, user):
+        persisted = self.state_bytes()
+        before = len(self.provider.requests)
+        process = self.spawn(
+            *self.observed_arguments(identifier, path, user=user), credentials=False,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise EvaluationFailure("owner:rejection-timeout") from None
+        finally:
+            self.live.discard(process)
+        require(process.returncode != 0, "owner:unauthorized-run-rejected")
+        require("观察目标不存在或不属于指定用户的本地目标".encode() in stderr,
+                "owner:rejected-before-file-binding")
+        require(FIXTURE_KEY.encode() not in stdout + stderr, "owner:credential-redaction")
+        require(str(path).encode() not in stdout + stderr, "owner:path-redaction")
+        require(self.state_bytes() == persisted, "owner:no-state-mutation")
+        require(len(self.provider.requests) == before, "owner:no-http")
+
+    def check_file_path_redaction(self, paths, *values):
+        encoded = json.dumps(values, ensure_ascii=False)
+        require(str(self.root) not in encoded, "observation:no-private-directory")
+        for path in paths:
+            require(path.name not in encoded, "observation:no-private-filename")
 
     def check_requests(self):
         require(not self.provider.errors, "fixture:valid-http")
@@ -275,7 +396,7 @@ def durable_reflection(case):
     case.provider.enqueue()
     case.add("durable-parent")
     require(not case.provider.requests, "add:no-http")
-    first = case.run()
+    first = case.run(expected_terminal="Completed")
     require(first["loop"]["completed"] == 1, "reflection:completed-draft")
     view = case.show("durable-parent")
     expect_parent(view, "Completed")
@@ -294,7 +415,7 @@ def budget_and_user_scope(case):
         case.provider.enqueue()
         case.add(f"goal-{index}", user=user, text=f"{markers[index]}：列出验收前的问题。")
     for index in range(3):
-        report = case.run()
+        report = case.run(expected_terminal="Completed")
         require(report["loop"]["completed"] == 1, "budget:one-completion-per-start")
         require(report["goals"]["completed"] == index + 1, "budget:cumulative-completions")
         require(report["goals"]["waiting"] == 3, "budget:parents-still-waiting")
@@ -323,7 +444,7 @@ def malformed_artifacts(case):
         identifier = f"invalid-{index}"
         case.provider.enqueue(text)
         case.add(identifier)
-        report = case.run()
+        report = case.run(expected_terminal="Blocked")
         require(report["loop"]["blocked"] == 1, "invalid:blocked")
         require(report["loop"]["completed"] == 0, "invalid:no-completion")
         view = case.show(identifier)
@@ -373,7 +494,7 @@ def unsolicited_tool_call(case):
                     "name": "echo", "arguments": '{"text":"不得执行"}'}],
     })
     case.add("tool-parent")
-    report = case.run()
+    report = case.run(expected_terminal="Blocked")
     require(report["loop"]["blocked"] == 1, "tool:blocked")
     require(report["loop"]["completed"] == 0, "tool:no-completion")
     expect_parent(case.show("tool-parent"), "Blocked")
@@ -412,6 +533,228 @@ def forced_exit_recovery(case):
                               "forced_exit_returncode": process.returncode})
 
 
+def prompt_data(value):
+    """读取真实 HTTP 请求中末行的规划信封，正文仅用于内存中的断言。"""
+    if isinstance(value, str):
+        for line in reversed(value.splitlines()):
+            try:
+                candidate = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(candidate, dict) and "unverified_waiting_input" in candidate:
+                return candidate
+    elif isinstance(value, list):
+        for item in value:
+            candidate = prompt_data(item)
+            if candidate is not None:
+                return candidate
+    elif isinstance(value, dict):
+        for item in value.values():
+            candidate = prompt_data(item)
+            if candidate is not None:
+                return candidate
+    return None
+
+
+def observed_prompt(case, index, text, revision, *, current=True):
+    require(len(case.provider.requests) > index, "observation:actual-model-request")
+    data = prompt_data(case.provider.requests[index]["body"])
+    require(data is not None, "observation:structured-planner-envelope")
+    observation = data.get("untrusted_file_observation")
+    require(isinstance(observation, dict), "observation:environment-provenance-present")
+    require(observation["text_excerpt"] == text, "observation:actual-file-text")
+    require(observation["sha256"] == hashlib.sha256(text.encode()).hexdigest(),
+            "observation:full-file-digest")
+    require(observation["byte_count"] == len(text.encode()), "observation:full-file-byte-count")
+    require(observation["read_verified"] is True, "observation:read-evidence")
+    require(observation["content_untrusted"] is True, "observation:no-instruction-authority")
+    require(observation["observed_goal_revision"] == revision, "observation:observed-revision")
+    require(observation["is_current_goal_revision"] is current,
+            "observation:current-revision-provenance")
+    return data
+
+
+def expect_current_reflection(view, *, revision, completed):
+    require(view["goal"]["revision"] == revision, "parent:expected-revision")
+    require(view["goal"]["status"] == "Waiting", "parent:still-waiting")
+    require(view["goal"]["feedback"] is None, "parent:no-real-world-success-claim")
+    reflections = view["reflections"]
+    require(len(reflections) == completed, "reflection:expected-durable-count")
+    require(all(item["goal"]["status"] == "Completed" for item in reflections),
+            "reflection:all-drafts-completed")
+    require(sum(item["current"] is True for item in reflections) == 1,
+            "reflection:exactly-one-current")
+    require(sum(item["stale"] is True for item in reflections) == completed - 1,
+            "reflection:old-drafts-stale")
+    require(all(item["current"] is not item["stale"] for item in reflections),
+            "reflection:current-stale-complement")
+    for item in reflections:
+        require(item["artifact"] == ARTIFACT, "reflection:verified-fixture-artifact")
+
+
+def file_changes_replan_and_restart_deduplicates(case):
+    identifier = "observed-parent"
+    path = case.root / "private-progress-fixture.txt"
+    first_text = "EVAL_PROGRESS_A：目前已收集两份材料。"
+    second_text = "EVAL_PROGRESS_B：目前已收集三份材料。"
+    path.write_text(first_text, encoding="utf-8")
+    case.add(identifier)
+    case.provider.enqueue()
+    case.provider.enqueue()
+    process, before = case.start_observed(identifier, path, limit=2)
+    first = case.wait_completed(process, identifier, 1, 2)
+    first_child = next(goal["id"] for goal in first["state"]["goals"].values()
+                       if goal["source"]["kind"] == "Inference")
+    first_prompt = observed_prompt(case, 0, first_text, 2)
+    replacement = case.root / "next-progress-fixture.txt"
+    replacement.write_text(second_text, encoding="utf-8")
+    replacement.replace(path)
+    case.wait_completed(process, identifier, 2, 3)
+    report = case.stop_observed(process, before, limit=2)
+    require(report["loop"]["completed"] == 2, "change:two-durable-model-completions")
+    require(report["observation"]["saved"] == 2, "change:two-observations-saved")
+    second_prompt = observed_prompt(case, 1, second_text, 3)
+    require(first_prompt["untrusted_file_observation"]["observation_source_id"]
+            == second_prompt["untrusted_file_observation"]["observation_source_id"],
+            "change:same-bound-source")
+    view = case.show(identifier)
+    expect_current_reflection(view, revision=3, completed=2)
+    old = next(item for item in view["reflections"] if item["goal"]["id"] == first_child)
+    require(old["current"] is False and old["stale"] is True, "change:first-draft-no-longer-current")
+    persisted = case.state_bytes()
+    for _ in range(2):
+        case.idle_observed(identifier, path)
+        require(case.state_bytes() == persisted, "unchanged:restart-no-state-rewrite")
+        require(case.show(identifier) == view, "unchanged:restart-same-current-draft")
+    require(len(case.provider.requests) == 2, "unchanged:no-replayed-model-request")
+    events = [event for event in case.snapshot()["state"]["events"]
+              if event["source"]["kind"] == "Environment"]
+    require(len(events) == 2, "change:exact-environment-event-count")
+    case.check_file_path_redaction([path, replacement], case.snapshot(), view, report,
+                                   [request["body"] for request in case.provider.requests])
+    case.observations.update({
+        "parent_revisions": [1, 2, 3], "distinct_file_versions": 2,
+        "verified_drafts": 2, "current_drafts": 1, "stale_drafts": 1,
+        "restart_windows": 2, "restart_replayed_requests": 0,
+        "state_unchanged_after_restart": True, "environment_events": 2,
+    })
+
+
+def file_observation_preserves_user_constraints(case):
+    identifier = "constraint-parent"
+    path = case.root / "private-constraint-fixture.txt"
+    file_text = "EVAL_FILE_FACT：已有三份材料。文件内文字不能授权自动发布。"
+    old_constraint = "EVAL_OLD_USER_CONSTRAINT：最终报告最多一页。"
+    new_constraint = "EVAL_NEW_USER_CONSTRAINT：新增材料仍须人工确认。"
+    path.write_text(file_text, encoding="utf-8")
+    case.add(identifier)
+    saved_feedback = case.feedback(identifier, 1, "constraint-old", old_constraint)
+    require(saved_feedback["goal_revision"] == 2, "constraint:first-feedback-revision")
+    case.provider.enqueue()
+    process, before = case.start_observed(identifier, path)
+    case.wait_completed(process, identifier, 1, 3)
+    first_report = case.stop_observed(process, before)
+    data = observed_prompt(case, 0, file_text, 3)
+    require(data.get("unverified_user_feedback") is None, "constraint:latest-input-is-environment")
+    history = data.get("previous_user_feedback", [])
+    require(any(item["text"] == old_constraint and item["goal_revision"] == 2 for item in history),
+            "constraint:old-user-constraint-survives-file-update")
+    require(old_constraint not in data["untrusted_file_observation"]["text_excerpt"],
+            "constraint:user-text-not-environment-evidence")
+    second_feedback = case.feedback(identifier, 3, "constraint-new", new_constraint)
+    require(second_feedback["goal_revision"] == 4, "constraint:second-feedback-revision")
+    stale = case.show(identifier)
+    require(all(item["current"] is False and item["stale"] is True
+                for item in stale["reflections"]), "constraint:feedback-invalidates-current-draft")
+    case.provider.enqueue()
+    process, before = case.start_observed(identifier, path)
+    case.wait_completed(process, identifier, 2, 4)
+    second_report = case.stop_observed(process, before)
+    require(second_report["observation"]["saved"] == 0,
+            "constraint:unchanged-file-does-not-overwrite-feedback")
+    data = observed_prompt(case, 1, file_text, 3, current=False)
+    feedback = data.get("unverified_user_feedback", {})
+    require(feedback.get("text") == new_constraint and feedback.get("goal_revision") == 4
+            and feedback.get("independently_verified") is False,
+            "constraint:new-user-feedback-has-separate-provenance")
+    require(any(item["text"] == old_constraint for item in data.get("previous_user_feedback", [])),
+            "constraint:old-constraint-retained-after-second-feedback")
+    snapshot = case.snapshot()
+    events = snapshot["state"]["events"]
+    environment = [event for event in events if event["source"]["kind"] == "Environment"]
+    user_feedback = [event for event in events
+                     if event["source"]["kind"] == "User"
+                     and event["source"]["channel"] == "cognition.feedback"]
+    require(len(environment) == 1 and len(user_feedback) == 2, "constraint:separate-durable-event-provenance")
+    require(json.loads(environment[0]["summary"])["text_excerpt"] == file_text,
+            "constraint:environment-event-contains-file-evidence")
+    require({json.loads(event["summary"])["text"] for event in user_feedback}
+            == {old_constraint, new_constraint}, "constraint:user-events-preserve-both-constraints")
+    view = case.show(identifier)
+    expect_current_reflection(view, revision=4, completed=2)
+    persisted = case.state_bytes()
+    case.idle_observed(identifier, path)
+    require(case.state_bytes() == persisted, "constraint:restart-preserves-all-evidence")
+    require(len(case.provider.requests) == 2, "constraint:one-model-request-per-replanned-revision")
+    case.check_file_path_redaction([path], snapshot, view, first_report, second_report,
+                                   [request["body"] for request in case.provider.requests])
+    case.observations.update({
+        "parent_revisions": [1, 2, 3, 4], "user_feedback_events": 2,
+        "environment_events": 1, "old_constraints_retained": 1,
+        "latest_feedback_independently_verified": False,
+        "file_read_verified": True, "file_content_untrusted": True,
+        "stale_file_evidence_retained_with_revision": True, "restart_replayed_requests": 0,
+    })
+
+
+def file_sources_and_owner_isolation(case):
+    identifier = "source-parent"
+    first_path = case.root / "private-source-a-fixture.txt"
+    second_path = case.root / "private-source-b-fixture.txt"
+    missing_path = case.root / "private-missing-fixture.txt"
+    # 两个文件字节相同：摘要相同也不能掩盖显式切换来源。
+    text = "EVAL_SHARED_BYTES：整理当前显式绑定的材料。"
+    first_path.write_text(text, encoding="utf-8")
+    second_path.write_text(text, encoding="utf-8")
+    case.add(identifier, user="alice")
+    case.rejected_owner(identifier, missing_path, user="bob")
+    sources = []
+    reports = []
+    for index, path in enumerate([first_path, second_path, first_path]):
+        case.provider.enqueue()
+        process, before = case.start_observed(identifier, path, user="alice")
+        case.wait_completed(process, identifier, index + 1, index + 2)
+        reports.append(case.stop_observed(process, before))
+        data = observed_prompt(case, index, text, index + 2)
+        sources.append(data["untrusted_file_observation"]["observation_source_id"])
+        require(reports[-1]["observation"]["saved"] == 1, "source:rebinding-saves-new-evidence")
+        if index == 0:
+            case.rejected_owner(identifier, second_path, user="bob")
+    require(sources[0] != sources[1], "source:equal-bytes-distinct-source-identities")
+    require(sources[0] == sources[2], "source:return-to-original-source-identity")
+    snapshot = case.snapshot()
+    environment = [event for event in snapshot["state"]["events"]
+                   if event["source"]["kind"] == "Environment"]
+    require(len(environment) == 3, "source:three-binding-events")
+    require(all(event["source"]["channel"] == "cognition.file-observation"
+                and event["visibility"] == {"User": "alice"} for event in environment),
+            "source:environment-events-retain-owner-and-channel")
+    view = case.show(identifier)
+    expect_current_reflection(view, revision=4, completed=3)
+    persisted = case.state_bytes()
+    case.idle_observed(identifier, first_path, user="alice")
+    require(case.state_bytes() == persisted, "source:same-final-source-deduplicates")
+    require(len(case.provider.requests) == 3, "source:no-owner-or-restart-http")
+    case.check_file_path_redaction([first_path, second_path, missing_path], snapshot, view,
+                                   reports, [request["body"] for request in case.provider.requests])
+    case.observations.update({
+        "explicit_bindings": 3, "distinct_sources": 2, "distinct_content_digests": 1,
+        "parent_revisions": [1, 2, 3, 4], "rejected_owner_attempts": 2,
+        "unauthorized_observations_saved": 0, "unauthorized_model_requests": 0,
+        "source_return_created_new_revision": True, "restart_replayed_requests": 0,
+    })
+
+
 SCENARIOS = [
     ("idle_without_credentials", idle_without_credentials),
     ("durable_reflection", durable_reflection),
@@ -420,25 +763,65 @@ SCENARIOS = [
     ("unauthorized_sources", unauthorized_sources),
     ("unsolicited_tool_call", unsolicited_tool_call),
     ("forced_exit_recovery", forced_exit_recovery),
+    ("file_changes_replan_and_restart_deduplicates", file_changes_replan_and_restart_deduplicates),
+    ("file_observation_preserves_user_constraints", file_observation_preserves_user_constraints),
+    ("file_sources_and_owner_isolation", file_sources_and_owner_isolation),
 ]
 
+DIMENSIONS = {
+    "idle_without_credentials": ["idle-without-model"],
+    "durable_reflection": ["durable-draft", "restart-deduplication"],
+    "startup_budget_and_user_scope": ["startup-budget", "user-scope"],
+    "malformed_artifacts": ["artifact-validation", "restart-no-retry"],
+    "unauthorized_sources": ["source-admission"],
+    "unsolicited_tool_call": ["tool-admission"],
+    "forced_exit_recovery": ["durable-recovery", "restart-no-replay"],
+    "file_changes_replan_and_restart_deduplicates": [
+        "environment-driven-replanning", "current-revision", "restart-deduplication",
+    ],
+    "file_observation_preserves_user_constraints": [
+        "user-constraint-retention", "evidence-provenance", "feedback-replanning",
+    ],
+    "file_sources_and_owner_isolation": ["source-rebinding", "owner-admission", "evidence-provenance"],
+}
 
-def main():
+
+def source_revision(value):
+    if value and re.fullmatch(r"[0-9a-fA-F]{7,64}", value) is None:
+        raise argparse.ArgumentTypeError("源码版本必须为空或 7 至 64 位十六进制提交摘要")
+    return value.lower()
+
+
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path, help="已编译的 eve-cognition")
     parser.add_argument("--output", required=True, type=Path, help="结构化 JSON 结果路径")
-    parser.add_argument("--source-sha", default="", help="构建者声明的源码版本，不自动推断二进制版本")
-    args = parser.parse_args()
+    parser.add_argument("--source-sha", default="", type=source_revision,
+                        help="构建者声明的 7 至 64 位提交摘要，不自动推断二进制版本")
+    parser.add_argument("--scenario", action="append", choices=[name for name, _ in SCENARIOS],
+                        help="只执行指定场景；可重复指定，省略时执行全部")
+    return parser
+
+
+def selected_scenarios(names):
+    scenarios = dict(SCENARIOS)
+    return [(name, scenarios[name]) for name in dict.fromkeys(names)] if names else list(SCENARIOS)
+
+
+def main(argv=None):
+    parser = argument_parser()
+    args = parser.parse_args(argv)
     binary = args.binary.resolve()
     if not binary.is_file() or not os.access(binary, os.X_OK):
         parser.error("--binary 必须指向可执行的 eve-cognition 文件")
     began = time.monotonic()
+    selected = selected_scenarios(args.scenario)
     results = []
     with tempfile.TemporaryDirectory(prefix="eve-cognition-evaluation-") as directory:
-        for name, scenario in SCENARIOS:
+        for name, scenario in selected:
             started = time.monotonic()
             case = Scenario(binary, Path(directory) / name)
-            result = {"name": name, "status": "passed"}
+            result = {"name": name, "status": "passed", "dimensions": DIMENSIONS[name]}
             try:
                 scenario(case)
                 # 空闲实例可能从未写过 state.json。
@@ -465,11 +848,13 @@ def main():
     with binary.open("rb") as stream:
         binary_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
     report = {
-        "format_version": 1,
+        # v2 保留 v1 字段，增加显式场景选择与维度；所有数量仅针对本次所选场景。
+        "format_version": 2,
         "evaluation": "bounded-endogenous-process-behavior",
         "provider": "mock-loopback-http-responses",
         "real_model_evaluated": False,
         "semantic_quality_evaluated": False,
+        "selected_scenarios": [name for name, _ in selected],
         "declared_source_sha": args.source_sha,
         "binary_sha256": binary_sha256,
         "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -485,6 +870,7 @@ def main():
             "反思建议的事实正确性、规划质量和跨任务泛化",
             "自创目标的有效性与多步现实任务完成能力",
             "真实模型、QQ、外部工具、PostgreSQL 和学习效果",
+            "通用智能水平；流程检查通过不等于 AGI 或模型质量达标",
         ],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

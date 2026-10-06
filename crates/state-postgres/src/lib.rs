@@ -90,11 +90,27 @@ struct Worker {
 /// 不缓存 get，不暴露客户端，也不会在断连后重建连接或假定提交失败可安全重试。
 pub struct PostgresStateStore {
     worker: Mutex<Worker>,
+    read_only: bool,
 }
 
 impl PostgresStateStore {
     pub fn connect(options: ConnectionOptions) -> PluginResult<Self> {
-        let config = options.config()?;
+        Self::connect_mode(options, false)
+    }
+
+    /// 只读打开已有 schema；不会初始化、修复或改写状态。
+    /// 仍独占数据库宿主锁，set 被拒绝后连接继续支持读取。
+    pub fn connect_read_only(options: ConnectionOptions) -> PluginResult<Self> {
+        Self::connect_mode(options, true)
+    }
+
+    fn connect_mode(options: ConnectionOptions, read_only: bool) -> PluginResult<Self> {
+        let mut config = options.config()?;
+        if read_only {
+            config.options(
+                "-c statement_timeout=5000 -c lock_timeout=5000 -c default_transaction_read_only=on",
+            );
+        }
         let (sender, receiver) = mpsc::sync_channel(1);
         let (startup, ready) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
@@ -108,7 +124,7 @@ impl PostgresStateStore {
                         return;
                     }
                 };
-                if let Err(error) = initialize(&mut client) {
+                if let Err(error) = initialize(&mut client, !read_only) {
                     let _ = startup.send(Err(error));
                     return;
                 }
@@ -146,6 +162,7 @@ impl PostgresStateStore {
                     thread: Some(thread),
                     closed: false,
                 }),
+                read_only,
             }),
             Ok(Err(error)) => {
                 let _ = thread.join();
@@ -205,6 +222,9 @@ impl StateStore for PostgresStateStore {
         })
     }
     fn set(&self, namespace: &PluginId, key: String, value: Vec<u8>) -> PluginResult<()> {
+        if self.read_only {
+            return Err(failure("PostgreSQL 只读状态后端拒绝写入。"));
+        }
         self.request(|reply| {
             Request::Set(
                 namespace.as_str().as_bytes().to_vec(),
@@ -220,7 +240,7 @@ fn failure(message: &'static str) -> PluginError {
     PluginError::State(message.into())
 }
 
-fn initialize(client: &mut Client) -> PluginResult<()> {
+fn initialize(client: &mut Client, allow_initialize: bool) -> PluginResult<()> {
     let acquired: bool = client
         .query_one("SELECT pg_catalog.pg_try_advisory_lock($1)", &[&LOCK_KEY])
         .and_then(|row| row.try_get(0))
@@ -239,6 +259,11 @@ fn initialize(client: &mut Client) -> PluginResult<()> {
         .and_then(|row| row.try_get(0))
         .map_err(|_| failure("PostgreSQL 状态 schema 检查失败。"))?;
     if !exists {
+        if !allow_initialize {
+            return Err(failure(
+                "PostgreSQL 状态 schema 不存在；只读后端不会初始化新状态。",
+            ));
+        }
         transaction.batch_execute("CREATE SCHEMA eve_state;
             CREATE TABLE eve_state.metadata (singleton BOOLEAN PRIMARY KEY CHECK (singleton), format_version INTEGER NOT NULL);
             INSERT INTO eve_state.metadata (singleton,format_version) VALUES (true,1);
