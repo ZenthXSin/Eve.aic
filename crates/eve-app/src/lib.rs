@@ -5,6 +5,7 @@ mod config;
 mod console;
 mod error;
 mod input;
+mod message_evaluation;
 mod models;
 mod qq_cognition;
 mod qq_learning;
@@ -23,6 +24,10 @@ pub use cognition::{
 };
 pub use console::{ChatOutputError, ChatRunError};
 pub use error::AppFailure;
+pub use message_evaluation::{
+    MESSAGE_EVALUATION_HELP, MessageEvaluationOptions, MessageEvaluationReport,
+    message_evaluation_json, run_message_evaluation,
+};
 pub use qq_message_judge::MessageJudgeMode;
 pub use qqbot::{
     QQBOT_HELP, QqBotOptions, run_qqbot, run_qqbot_with_components, run_qqbot_with_learning_policy,
