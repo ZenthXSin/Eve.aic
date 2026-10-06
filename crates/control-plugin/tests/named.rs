@@ -282,3 +282,177 @@ fn default_identity_is_compatible_and_named_identifiers_are_validated() {
             .is_err()
     );
 }
+
+fn input_for(session: &str, user: &str, text: &str) -> ControlInput {
+    ControlInput {
+        session: SessionInput {
+            key: SessionKey::new(session, user).unwrap(),
+            text: text.into(),
+        },
+        task_id: format!("task-{session}"),
+    }
+}
+
+#[tokio::test]
+async fn lists_admitted_keys_before_runner_starts_with_bounded_owned_pages() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct DeferredRunner(Arc<AtomicUsize>);
+    impl ControlRunner for DeferredRunner {
+        fn run<'a>(&'a self, _: SessionInput, sink: &'a dyn TurnEventSink) -> RunFuture<'a> {
+            Box::pin(async move {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                sink.closed().await.unwrap();
+                RunReport {
+                    turn_id: None,
+                    commit: CommitState::NotStarted,
+                    text: None,
+                    transcript: None,
+                    started_tools: Some(0),
+                    tool_results: vec![],
+                    failure: Some(RunFailure::Execution(LlmError::Cancelled)),
+                }
+            })
+        }
+    }
+    let backends = KernelServices::default();
+    let registry = backends.registry.clone();
+    let kernel = Kernel::with_services(backends);
+    let calls = Arc::new(AtomicUsize::new(0));
+    kernel
+        .register(Box::new(
+            ControlPlugin::new(Arc::new(DeferredRunner(calls.clone())), vec![]).unwrap(),
+        ))
+        .unwrap();
+    kernel.start_all().await.unwrap();
+    let control = service(registry.as_ref(), CONTROL_SERVICE_ID);
+    assert!(control.list_keys(None, 100).unwrap().is_empty());
+    let mut expected = Vec::new();
+    // 当前线程不让出执行权：这些任务已准入，但 runner 与 Session 均未开始。
+    for index in (0..103).rev() {
+        let session = format!("session-{index:03}");
+        let owner = format!("owner-{}", index % 7);
+        let key = control
+            .submit(
+                input_for(&session, &owner, "不返回任务正文"),
+                Arc::new(DiscardControlEvents),
+            )
+            .unwrap();
+        expected.push(key.session);
+    }
+    expected.reverse();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(control.list_keys(None, 100).unwrap(), expected[..100]);
+    assert_eq!(
+        control.list_keys(Some("session-099"), 100).unwrap(),
+        expected[100..]
+    );
+    assert!(
+        control
+            .list_keys(Some("session-102"), 1)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        control.list_keys(Some("session-050x"), 2).unwrap(),
+        expected[51..53]
+    );
+    assert_eq!(control.list_keys(Some(" "), 1).unwrap(), expected[..1]);
+    assert_eq!(
+        control.list_keys(Some("session-050 "), 1).unwrap(),
+        expected[51..52]
+    );
+    assert!(
+        control
+            .list_keys(Some(&"界".repeat(85)), 1)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    for after in [
+        Some(""),
+        Some("line\nbreak"),
+        Some("delete\u{7f}"),
+        Some("\u{85}"),
+    ] {
+        assert_eq!(control.list_keys(after, 1), Err(ControlError::InvalidInput));
+    }
+    for after in [&"x".repeat(257), &"界".repeat(86)] {
+        assert_eq!(
+            control.list_keys(Some(after), 1),
+            Err(ControlError::InvalidInput)
+        );
+    }
+    for limit in [0, 101, usize::MAX] {
+        assert_eq!(
+            control.list_keys(None, limit),
+            Err(ControlError::InvalidInput)
+        );
+    }
+    // 无效的跨所有者准入不能污染列举出来的可信身份。
+    assert_eq!(
+        control.submit(
+            input_for("session-000", "wrong-owner", "伪造"),
+            Arc::new(DiscardControlEvents)
+        ),
+        Err(ControlError::OwnerMismatch)
+    );
+    assert_eq!(control.list_keys(None, 1).unwrap(), expected[..1]);
+    tokio::time::timeout(Duration::from_secs(3), kernel.stop_all())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(control.list_keys(None, 1), Err(ControlError::Unavailable));
+    assert_eq!(
+        control.list_keys(Some(""), 0),
+        Err(ControlError::Unavailable)
+    );
+}
+
+#[tokio::test]
+async fn listed_keys_stay_with_their_controller_and_restart_does_not_restore_tasks() {
+    let (kernel, registry) = setup();
+    kernel.start_all().await.unwrap();
+    let normal = service(registry.as_ref(), CONTROL_SERVICE_ID);
+    let internal = service(registry.as_ref(), INTERNAL_SERVICE);
+    let a = normal
+        .submit(
+            input_for("normal-only", "owner-normal", "finish"),
+            Arc::new(DiscardControlEvents),
+        )
+        .unwrap();
+    let b = internal
+        .submit(
+            input_for("internal-only", "owner-internal", "wait"),
+            Arc::new(DiscardControlEvents),
+        )
+        .unwrap();
+    wait(normal.as_ref(), &a).await;
+    assert_eq!(
+        normal.list_keys(None, 100).unwrap(),
+        vec![a.session.clone()]
+    );
+    assert_eq!(
+        internal.list_keys(None, 100).unwrap(),
+        vec![b.session.clone()]
+    );
+    let normal_before = normal.snapshot(&a.session).unwrap();
+    kernel
+        .stop(&PluginId::new(INTERNAL_PLUGIN).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(internal.list_keys(None, 1), Err(ControlError::Unavailable));
+    kernel
+        .start(&PluginId::new(INTERNAL_PLUGIN).unwrap())
+        .await
+        .unwrap();
+    let restarted = service(registry.as_ref(), INTERNAL_SERVICE);
+    assert!(restarted.list_keys(None, 100).unwrap().is_empty());
+    assert_eq!(normal.list_keys(None, 100).unwrap(), vec![a.session]);
+    assert_eq!(
+        normal
+            .snapshot(&normal_before.as_ref().unwrap().key.session)
+            .unwrap(),
+        normal_before
+    );
+    kernel.stop_all().await.unwrap();
+}

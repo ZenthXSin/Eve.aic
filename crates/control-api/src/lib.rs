@@ -145,6 +145,15 @@ pub enum CancelDisposition {
     AlreadyFinished,
 }
 pub trait ControlService: Send + Sync {
+    /// 分页列出本控制器已准入任务的完整可信会话身份，包括尚未进入 Session 的任务，
+    /// 不返回正文或诊断，也不执行、恢复或重放任务。控制器重启后旧任务不重新准入。
+    /// 按 session_id 升序，after 是独占游标，可不对应已有会话；Some 游标须非空、
+    /// UTF-8 字节数不超过 256 且无控制字符，允许空格。limit 必须为 1..=100。
+    /// 单页是读取时的快照，跨页不提供事务快照；调用者以末项 session_id 继续。
+    /// 停止后的句柄不可用；旧的自定义实现默认不支持枚举。
+    fn list_keys(&self, _after: Option<&str>, _limit: usize) -> ControlResult<Vec<SessionKey>> {
+        Err(ControlError::Unavailable)
+    }
     fn submit(
         &self,
         input: ControlInput,
@@ -196,3 +205,45 @@ impl fmt::Display for ControlError {
     }
 }
 impl std::error::Error for ControlError {}
+
+#[cfg(test)]
+mod enumeration_compatibility {
+    use super::*;
+
+    struct CustomControl;
+    impl ControlService for CustomControl {
+        fn submit(
+            &self,
+            _: ControlInput,
+            _: Arc<dyn ControlEventSink>,
+        ) -> ControlResult<GenerationKey> {
+            Err(ControlError::Unavailable)
+        }
+        fn submit_if_current(
+            &self,
+            _: &GenerationKey,
+            _: ControlInput,
+            _: Arc<dyn ControlEventSink>,
+        ) -> ControlResult<GenerationKey> {
+            Err(ControlError::Unavailable)
+        }
+        fn cancel(&self, _: &GenerationKey) -> ControlResult<CancelDisposition> {
+            Err(ControlError::Unavailable)
+        }
+        fn wait(&self, _: &GenerationKey) -> ControlFuture<'static, ControlReport> {
+            Box::pin(async { Err(ControlError::Unavailable) })
+        }
+        fn snapshot(&self, _: &SessionKey) -> ControlResult<Option<ControlSnapshot>> {
+            Ok(None)
+        }
+        fn accepts(&self, _: &ControlEvent) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn existing_custom_service_can_omit_enumeration() {
+        let custom: &dyn ControlService = &CustomControl;
+        assert_eq!(custom.list_keys(None, 10), Err(ControlError::Unavailable));
+    }
+}
