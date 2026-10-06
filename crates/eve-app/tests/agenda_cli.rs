@@ -311,6 +311,25 @@ fn assert_private_text_absent(report: &Value) {
 }
 
 #[tokio::test]
+async fn agenda_refuses_missing_or_empty_state_without_creating_backend_files() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let mut server = Server::start(vec![]).await;
+
+    let mut absent = command(root.path(), &server.url);
+    absent.arg("agenda");
+    assert!(!Process::start(absent).finish().await.status.success());
+    assert!(!state.exists());
+
+    std::fs::create_dir(&state).unwrap();
+    let mut empty = command(root.path(), &server.url);
+    empty.arg("agenda");
+    assert!(!Process::start(empty).finish().await.status.success());
+    assert!(std::fs::read_dir(&state).unwrap().next().is_none());
+    assert!(server.requests.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn agenda_is_offline_read_only_and_rejects_unrelated_arguments() {
     let root = tempfile::tempdir().unwrap();
     let mut server = Server::start(vec![]).await;
