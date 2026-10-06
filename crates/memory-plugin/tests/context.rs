@@ -151,7 +151,7 @@ async fn trusted_channel_session_and_user_scope_isolates_preferences() {
         .await
         .unwrap();
     preserved_base(&result);
-    assert_eq!(result.revision, "base-7:eve-memory-1:1");
+    assert_eq!(result.revision, "base-7:eve-memory-2:1");
     assert_eq!(
         data(&result)["preferences"][0]["text"],
         "先给结论，然后展开细节"
@@ -372,7 +372,7 @@ async fn training_context_is_preserved_and_no_scope_does_not_read_memory() {
     assert_eq!(after.memories[..before.memories.len()], before.memories);
     assert_eq!(
         after.revision,
-        format!("{}:eve-memory-1:1", before.revision)
+        format!("{}:eve-memory-2:1", before.revision)
     );
     training.set_enabled(&owner, false).unwrap();
     let disabled = context

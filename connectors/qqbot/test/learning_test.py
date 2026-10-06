@@ -59,6 +59,7 @@ class LearningAcceptance(unittest.TestCase):
         self.candidate_text = CANDIDATE
         self.candidate_confidence = 83
         self.candidate_sources = None
+        self.chat_response = None
         self.run_release = threading.Event()
         self.events = []
         outer = self
@@ -106,6 +107,8 @@ class LearningAcceptance(unittest.TestCase):
                 status = 200
                 finish = "stop"
                 text = json.dumps(ARTIFACT, ensure_ascii=False) if kind == "reflection" else latest
+                if kind == "chat" and outer.chat_response is not None:
+                    text = outer.chat_response(body, latest)
                 message = {"role": "assistant", "content": text}
                 if kind == "learning":
                     mode = outer.learning_response
@@ -268,6 +271,51 @@ class LearningAcceptance(unittest.TestCase):
 
     def segment_send(self, message, parts):
         return [{"send": {**message, "expected_segments": parts}}, self.wait_receipt(message["id"])]
+
+    def test_content_rules_generate_new_topic_reply_and_follow_correction_scope_and_revocation(self):
+        self.candidate_text = "解释问题时先给结论，再给依据；信息足够时不追加追问。"
+        self.seed(feedback="以后解释问题先给结论再给依据，信息够了不要追问；刚才的天气例子只是改写示范。")
+        self.inspect_run(lambda: self.wait_until(lambda: len(self.preferences()) == 1,
+                                               "content rule was not automatically confirmed"), self_learning=True)
+        candidate = self.jobs()[0]["candidates"][0]
+        source = "learned-" + candidate["id"]
+        self.assertEqual(self.jobs()[0]["batch"]["extractor_version"], "preference-extractor:v3")
+        self.assertEqual(self.preferences()[0]["text"], self.candidate_text)
+        corrected = "解释问题时先给依据，再给结论；信息足够时不追加追问。"
+
+        # 确定性模型替身验证真实进程把规则交给新主题的生成请求；不声称真实模型质量。
+        def generate(body, latest):
+            preferences = self.preference_data({"body": body})
+            texts = [item["text"] for data in preferences for item in data["preferences"]]
+            if latest == "解释两数相加":
+                if self.candidate_text in texts:
+                    return "结果是四。因为二加二等于四。"
+                if corrected in texts:
+                    return "二加二等于四，所以结果是四。"
+                return "你希望怎样解释两数相加？"
+            return latest
+
+        self.chat_response = generate
+        self.run_eve([
+            *self.send(self.message("content-new-topic", "解释两数相加", expected="结果是四。因为二加二等于四。")),
+            *self.send(self.message("content-other-user", "解释两数相加", user="another-user",
+                                    expected="你希望怎样解释两数相加？")),
+            *self.send(self.message("content-correct", "/correct-memory " + source + " " + corrected, contains="偏好已修正")),
+            *self.send(self.message("content-corrected-topic", "解释两数相加", expected="二加二等于四，所以结果是四。")),
+        ], self_learning=True, training=True)
+        self.run_eve([
+            *self.send(self.message("content-restored-topic", "解释两数相加", expected="二加二等于四，所以结果是四。")),
+            *self.send(self.message("content-forget", "/forget " + source, contains="偏好已撤销")),
+            *self.send(self.message("content-revoked-topic", "解释两数相加", expected="你希望怎样解释两数相加？")),
+        ], self_learning=True, training=True)
+        self.assertEqual(len(self.learning_requests()), 1, "restart must not replay consumed evidence")
+        self.assertEqual(self.preferences()[0]["status"], "Revoked")
+        for request in self.chat_requests()[3:]:
+            self.assertEqual(request["body"]["messages"][-1]["content"], "解释两数相加")
+            # 新主题不会重新注入天气示范原文；保留的真实会话历史仍按原契约装配。
+            for message in request["body"]["messages"]:
+                if message["role"] == "system" and "eve-confirmed-preferences-v1" in message.get("content", ""):
+                    self.assertNotIn("天气例子", message["content"])
 
     def test_autonomous_confirmation_changes_context_and_delivery_recovers_and_respects_manual_settings(self):
         self.candidate_text = "回复最多分成两段，段间不要停顿。"

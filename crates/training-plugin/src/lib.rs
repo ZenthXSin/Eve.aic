@@ -13,7 +13,7 @@ const KEY: &str = "modes.v1";
 const MAX_MODES: usize = 256;
 const MAX_BYTES: usize = 262_144;
 const PROMPT_OFF: &str = "当前主动提问训练已关闭。按当前请求正常交流，不因为历史中的 /train start 继续训练问卷；如果用户希望恢复专门训练，提示使用 /train start。必要的任务澄清问题不受影响。";
-const PROMPT: &str = include_str!("prompt-v3.txt");
+const PROMPT: &str = include_str!("prompt-v4.txt");
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -196,7 +196,7 @@ impl ContextAssembler for TrainingContext {
                 s.question_percent, s.formal_percent, s.casual_percent
             )).unwrap_or_default();
             let base_revision = if enabled {
-                "eve-training-3"
+                "eve-training-4"
             } else {
                 "eve-training-disabled-1"
             };
