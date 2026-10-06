@@ -50,3 +50,5 @@ HTTP 不跟随重定向、不自动重试，JSON state 不超过 65536 字节，
 本地验收入口：`cargo test -p eve-jev -p eve-message-plugin -p eve-qqbot-plugin --locked`、`cargo test -p eve-runtime --test relation_judge --test messages --locked`、`cargo test -p eve-app --lib --locked`；构建 `eve-qqbot` 后运行 `python3 connectors/qqbot/test/message_judge_test.py`。进程测试只连接环回替身，只停止自己创建的子进程，覆盖独立凭据、回退、期限、原文修订、工具保护、取消抢占、隔离及重启去重；执行结果以本次 PR 记录为准。
 
 后续用同一公开标注集比较规则、主模型和 Jev 的误取消、纠正遗漏、原文匹配及延迟，再单独验证真实任务完成率和请求/回退成本。没有真实接口证据时保持草稿和默认关闭；实际 QQ 验收在本地进行，不在工作流里连接正式 QQ。
+
+公开标注评估入口已增加 `eve-message-evaluate`，默认仅跑规则，模型模式须显式选择；30 例样本与评分范围见[公开消息评估](../benchmarks/messages/README.md)。它不执行真实任务，不据此报告任务完成率；当前尚无精确请求/回退观测，不推算这些指标。

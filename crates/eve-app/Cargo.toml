@@ -18,6 +18,10 @@ path = "src/bin/qqbot.rs"
 name = "eve-cognition"
 path = "src/bin/cognition.rs"
 
+[[bin]]
+name = "eve-message-evaluate"
+path = "src/bin/message-evaluate.rs"
+
 [dependencies]
 eve-agent-prompt = { path = "../agent-prompt" }
 eve-cognition-api = { path = "../cognition-api" }
