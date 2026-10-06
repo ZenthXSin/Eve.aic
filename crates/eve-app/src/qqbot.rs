@@ -1,6 +1,7 @@
 use crate::{
-    AppError, AppFailure, core_bootstrap, finish_core, install_core, qq_cognition, qq_learning,
-    qq_learning_commands, qq_memory, qq_memory_observer, segment_commands,
+    AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, install_core,
+    qq_cognition, qq_learning, qq_learning_commands, qq_memory, qq_memory_observer,
+    segment_commands,
 };
 use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
@@ -13,7 +14,7 @@ use eve_learning_plugin::{EvidenceConfirmationPolicy, LearningPlugin, ModelPrefe
 use eve_llm_api::ContextAssembler;
 use eve_memory_api::{MEMORY_PLUGIN_ID, MemoryAdmin};
 use eve_memory_plugin::{MemoryContext, MemoryPlugin};
-use eve_message_plugin::{MessageRouterPlugin, RelationPlugin};
+use eve_message_plugin::MessageRouterPlugin;
 use eve_plugin_api::{PluginId, PluginResult, ServiceId};
 use eve_qqbot_plugin::{
     DEFAULT_QQBOT_APP_ID, QQ_SEGMENT_LIMITS, QQ_SEGMENT_POLICY, QQBOT_PLUGIN_ID,
@@ -31,13 +32,17 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-learning] [--self-learning] [--segmented] [--learning-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-learning] [--self-learning] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
 QQ 普通文字排队开始新轮；逐行 /add 内容、/correct 内容、/cancel 控制当前任务。
+--message-judge 默认 off；primary 开启在途自然消息的主模型判断，jev 先用独立 Jev 判断并至多回退主模型一次。
+jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_JEV_BASE_URL 独立配置。实验判断尚待真实语义评估。
+--web-listen 127.0.0.1:8765 开启本机控制面板，默认关闭；专用 EVE_WEB_TOKEN 为 32 至 256 字节可见 ASCII，不使用模型密钥。
+浏览器访问启动时打印的本机地址，输入令牌后查看会话、任务与请求取消；面板不启动新任务，不提供停服或删除入口。
 --training 默认开启主动提问；/train start、/train stop、/train status 按会话启停/查询。
---cognition 开启本地内生反思；/goal 内容保存待办，/goals 查看待办，/mind [目标ID] 查询草稿。
+--cognition 开启本地内生反思；/goal 内容保存待办，/goals 查看版本，/mind [目标ID] 查询当前草稿；/goal-feedback 目标ID 版本 反馈内容触发重新评估。
 --memory 开启有来源的交互记忆；/remember 内容、/memories [页码]、/correct-memory ID 内容、/forget ID。
 --memory-learning 需同时 --memory；每会话至少 3 条新经历触发首批，后续默认间隔 5 分钟（--learning-cooldown-ms 可调整），单次启动最多 4 次请求。
 --self-learning 开启持续自主学习（同时开启记忆、提炼和分段）；模型自评至少 80 且引用至少两条真实交互时自动确认。
@@ -67,6 +72,8 @@ pub struct QqBotOptions {
     pub self_learning: bool,
     pub learning_options: LearningOptions,
     pub segmented: bool,
+    pub message_judge: MessageJudgeMode,
+    pub web_listen: Option<std::net::SocketAddr>,
     pub cognition_max_executions: u16,
 }
 impl Default for QqBotOptions {
@@ -85,6 +92,8 @@ impl Default for QqBotOptions {
             self_learning: false,
             learning_options: LearningOptions::default(),
             segmented: false,
+            message_judge: MessageJudgeMode::Off,
+            web_listen: None,
             cognition_max_executions: 32,
         }
     }
@@ -132,6 +141,23 @@ impl QqBotOptions {
                 Some("--node") => options.node_program = value,
                 Some("--bridge-script") => options.bridge_script = value.into(),
                 Some("--bridge-arg") => options.bridge_args.push(value),
+                Some("--web-listen") => {
+                    options.web_listen = Some(
+                        value
+                            .to_str()
+                            .and_then(|value| value.parse::<std::net::SocketAddr>().ok())
+                            .filter(|address| address.ip().is_loopback())
+                            .ok_or("--web-listen 必须为环回 IP 与端口，例如 127.0.0.1:8765")?,
+                    );
+                }
+                Some("--message-judge") => {
+                    options.message_judge = match value.to_str() {
+                        Some("off") => MessageJudgeMode::Off,
+                        Some("primary") => MessageJudgeMode::Primary,
+                        Some("jev") => MessageJudgeMode::Jev,
+                        _ => return Err("--message-judge 必须为 off、primary 或 jev".into()),
+                    };
+                }
                 Some("--cognition-max-executions") => {
                     options.cognition_max_executions = value
                         .to_str()
@@ -212,6 +238,16 @@ pub async fn run_qqbot_with_learning_policy(
         return Err("--memory-learning 需要同时开启 --memory".into());
     }
     options.learning_options.validate()?;
+    let panel_config = options
+        .web_listen
+        .map(|address| -> Result<_, AppError> {
+            let token =
+                std::env::var("EVE_WEB_TOKEN").map_err(|_| "开启本机面板需要 EVE_WEB_TOKEN")?;
+            let config = eve_web_panel::PanelConfig { address, token };
+            config.validate()?;
+            Ok(config)
+        })
+        .transpose()?;
     if !(1..=32).contains(&options.cognition_max_executions) {
         return Err("认知执行上限必须为 1 至 32 的整数".into());
     }
@@ -230,7 +266,8 @@ pub async fn run_qqbot_with_learning_policy(
         app_secret,
         sandbox,
     })?
-    .with_training()?;
+    .with_training()?
+    .with_natural_message_judgement(options.message_judge != MessageJudgeMode::Off);
     let plugin = if options.segmented {
         plugin.with_segmenter(Arc::new(ParagraphPlanner::default()), QQ_SEGMENT_LIMITS)?
     } else {
@@ -257,6 +294,7 @@ pub async fn run_qqbot_with_learning_policy(
     let mut background: Option<qq_cognition::Background> = None;
     let mut learning_background: Option<qq_learning::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
+    let mut panel: Option<eve_web_panel::LocalPanel> = None;
     let result: Result<(), AppError> = async {
         kernel.register(Box::new(TrainingPlugin::new(options.training)?))?;
         kernel.start(&PluginId::new(TRAINING_PLUGIN_ID)?).await?;
@@ -307,7 +345,7 @@ pub async fn run_qqbot_with_learning_policy(
         } else {
             context
         });
-        install_core(
+        let control = install_core(
             &kernel,
             registry.clone(),
             permissions,
@@ -417,7 +455,16 @@ pub async fn run_qqbot_with_learning_policy(
                 sessions: sessions.0.clone(),
             }))?;
         }
-        kernel.register(Box::new(RelationPlugin::rules()?))?;
+        let settings = registry
+            .get(&ServiceId::new(CONFIG_SERVICE_ID)?)?
+            .ok_or("消息判断配置服务缺失")?
+            .value
+            .downcast::<ConfigServiceHandle>()
+            .map_err(|_| "消息判断配置服务类型错误")?;
+        kernel.register(Box::new(crate::qq_message_judge::relation_plugin(
+            options.message_judge,
+            settings.0.clone(),
+        )?))?;
         kernel.register(Box::new(MessageRouterPlugin::builtin()?))?;
         kernel.register(Box::new(plugin))?;
         kernel.start(&PluginId::new(QQBOT_PLUGIN_ID)?).await?;
@@ -428,6 +475,31 @@ pub async fn run_qqbot_with_learning_policy(
             .downcast::<QqBotStatusHandle>()
             .map_err(|_| "QQBot 状态服务类型错误")?;
         channel = Some(handle.clone());
+        if let Some(config) = panel_config {
+            let sessions = registry
+                .get(&ServiceId::new(SESSION_SERVICE_ID)?)?
+                .ok_or("面板会话服务缺失")?
+                .value
+                .downcast::<SessionServiceHandle>()
+                .map_err(|_| "面板会话服务类型错误")?;
+            let started_at_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis()
+                .try_into()
+                .map_err(|_| "系统时间超出面板记录范围")?;
+            let started = eve_web_panel::LocalPanel::bind(
+                config,
+                Arc::new(crate::web_panel::QqPanel {
+                    sessions: sessions.0.clone(),
+                    control,
+                    channel: handle.clone(),
+                    started_at_unix_ms,
+                }),
+            )
+            .await?;
+            eprintln!("EVE_WEB_READY http://{}", started.address());
+            panel = Some(started);
+        }
         if let Some(background) = &background {
             background.activate();
         }
@@ -440,6 +512,7 @@ pub async fn run_qqbot_with_learning_policy(
             learning_background
                 .as_ref()
                 .map(qq_learning::Background::finished),
+            panel.as_ref().map(eve_web_panel::LocalPanel::finished),
         )
         .await
     }
@@ -447,6 +520,13 @@ pub async fn run_qqbot_with_learning_policy(
     // 先关闭通道准入并结束反思执行，再等待桥接收尾，最后进入 Kernel 生命周期写准入。
     // 启动失败、后台异常、EOF 和系统信号全部经过这里。
     let mut secondary = Vec::<AppError>::new();
+    // 先撤销管理入口，再收尾 QQ 和 Kernel；HTTP 请求不拥有后台轮次。
+    if let Some(panel) = panel.take() {
+        panel.request_stop();
+        if let Err(error) = panel.stop().await {
+            secondary.push(error.into());
+        }
+    }
     if channel.is_none() {
         match registry.get(&ServiceId::new(QQBOT_STATUS_SERVICE_ID).expect("有效 QQ 状态 ID")) {
             Ok(Some(entry)) => match entry.value.downcast::<QqBotStatusHandle>() {
@@ -532,11 +612,13 @@ async fn wait_channel(
     mut status: watch::Receiver<QqBotStatus>,
     background: Option<watch::Receiver<bool>>,
     learning: Option<watch::Receiver<bool>>,
+    panel: Option<watch::Receiver<bool>>,
 ) -> Result<(), AppError> {
     let stop = interrupted();
     let stopped_background = background_finished(background);
     let stopped_learning = background_finished(learning);
-    tokio::pin!(stop, stopped_background, stopped_learning);
+    let stopped_panel = background_finished(panel);
+    tokio::pin!(stop, stopped_background, stopped_learning, stopped_panel);
     let mut ready_announced = false;
     loop {
         if status.borrow().ready && !status.borrow().closed && !ready_announced {
@@ -550,6 +632,7 @@ async fn wait_channel(
             biased;
             _ = &mut stopped_background => return Err("认知后台已结束；QQ 通道停止准入并保留状态".into()),
             _ = &mut stopped_learning => return Err("偏好提炼后台已结束；QQ 通道停止准入并保留状态".into()),
+            _ = &mut stopped_panel => return Err("本机面板异常结束；QQ 通道停止准入并保留状态".into()),
             result = &mut stop => return result,
             result = status.changed() => result.map_err(|_| "QQBot 状态通知丢失")?,
         }
@@ -562,6 +645,32 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<QqBotOptions, AppError> {
         Ok(QqBotOptions::parse(args.iter().map(OsString::from))?.unwrap())
+    }
+
+    #[test]
+    fn natural_message_judgement_requires_explicit_mode() {
+        assert_eq!(parse(&[]).unwrap().message_judge, MessageJudgeMode::Off);
+        assert_eq!(
+            parse(&["--self-learning"]).unwrap().message_judge,
+            MessageJudgeMode::Off
+        );
+        for (name, expected) in [
+            ("off", MessageJudgeMode::Off),
+            ("primary", MessageJudgeMode::Primary),
+            ("jev", MessageJudgeMode::Jev),
+        ] {
+            assert_eq!(
+                parse(&["--message-judge", name]).unwrap().message_judge,
+                expected
+            );
+        }
+        for args in [
+            vec!["--message-judge"],
+            vec!["--message-judge", ""],
+            vec!["--message-judge", "auto"],
+        ] {
+            assert!(parse(&args).is_err());
+        }
     }
 
     #[test]

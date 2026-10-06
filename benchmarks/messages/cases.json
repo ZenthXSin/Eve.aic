@@ -1,0 +1,1590 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "command_cancel",
+      "note": "完整取消命令。",
+      "input": {
+        "message": {
+          "message_id": "command_cancel",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "/cancel",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "cancel",
+            "span": null
+          }
+        ]
+      ]
+    },
+    {
+      "id": "command_continue",
+      "note": "完整继续命令。",
+      "input": {
+        "message": {
+          "message_id": "command_continue",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "/continue",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "continue",
+            "span": null
+          }
+        ]
+      ]
+    },
+    {
+      "id": "command_correct_utf8",
+      "note": "空白命令参数及中文表情的 UTF-8 字节范围。",
+      "input": {
+        "message": {
+          "message_id": "command_correct_utf8",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "  /correct 改成两页 📚  ",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "correction",
+            "span": {
+              "start": 11,
+              "end": 28
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "command_add",
+      "note": "补充命令只抽取参数。",
+      "input": {
+        "message": {
+          "message_id": "command_add",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "/add 附上预算",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "supplement",
+            "span": {
+              "start": 5,
+              "end": 17
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "command_multiple",
+      "note": "逐行改正和补充。",
+      "input": {
+        "message": {
+          "message_id": "command_multiple",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "/correct 两页\n/add 预算明细",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "correction",
+            "span": {
+              "start": 9,
+              "end": 15
+            }
+          },
+          {
+            "intent": "supplement",
+            "span": {
+              "start": 21,
+              "end": 33
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "command_new",
+      "note": "明确新任务原文。",
+      "input": {
+        "message": {
+          "message_id": "command_new",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "/new 帮我列出午餐菜单",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "new_task",
+            "span": {
+              "start": 5,
+              "end": 29
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "command_pause",
+      "note": "暂停意图标签不等于实际可执行。",
+      "input": {
+        "message": {
+          "message_id": "command_pause",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "/pause",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "pause",
+            "span": null
+          }
+        ]
+      ]
+    },
+    {
+      "id": "command_resume",
+      "note": "恢复意图标签不等于实际可执行。",
+      "input": {
+        "message": {
+          "message_id": "command_resume",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "/resume",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "resume",
+            "span": null
+          }
+        ]
+      ]
+    },
+    {
+      "id": "command_unrelated",
+      "note": "完整无关标签命令。",
+      "input": {
+        "message": {
+          "message_id": "command_unrelated",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "/unrelated",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "unrelated",
+            "span": null
+          }
+        ]
+      ]
+    },
+    {
+      "id": "command_invalid_payload",
+      "note": "取消命令夹带参数不能被模型重解。",
+      "input": {
+        "message": {
+          "message_id": "command_invalid_payload",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "/cancel 不是真的",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "ambiguous",
+            "span": null
+          }
+        ]
+      ]
+    },
+    {
+      "id": "command_mixed_unknown",
+      "note": "明确命令夹未解析普通文字需要澄清。",
+      "input": {
+        "message": {
+          "message_id": "command_mixed_unknown",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "/correct 两页\n顺便看看",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "ambiguous",
+            "span": null
+          }
+        ]
+      ]
+    },
+    {
+      "id": "negated_cancel",
+      "note": "否定取消，明确继续当前任务。",
+      "input": {
+        "message": {
+          "message_id": "negated_cancel",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "不要取消，继续写报告。",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "continue",
+            "span": null
+          }
+        ]
+      ]
+    },
+    {
+      "id": "quoted_cancel",
+      "note": "被引号引用的取消要求属于报告内容而非控制请求。",
+      "input": {
+        "message": {
+          "message_id": "quoted_cancel",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "请在报告中补充一句“取消任务”。",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "supplement",
+            "span": {
+              "start": 0,
+              "end": 48
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "hypothetical_cancel",
+      "note": "假设句不是取消当前任务。",
+      "input": {
+        "message": {
+          "message_id": "hypothetical_cancel",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "如果我以后说取消任务，你再停；现在继续写。",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "continue",
+            "span": null
+          }
+        ]
+      ]
+    },
+    {
+      "id": "natural_cancel",
+      "note": "自然语言直接终止。",
+      "input": {
+        "message": {
+          "message_id": "natural_cancel",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "这份报告不用写了，请停止当前任务。",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "cancel",
+            "span": null
+          }
+        ]
+      ]
+    },
+    {
+      "id": "correction_pages",
+      "note": "改正当前页数。",
+      "input": {
+        "message": {
+          "message_id": "correction_pages",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "把三页改成两页。",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "correction",
+            "span": {
+              "start": 0,
+              "end": 24
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "supplement_budget",
+      "note": "只追加信息。",
+      "input": {
+        "message": {
+          "message_id": "supplement_budget",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "另外补上预算明细。",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "supplement",
+            "span": {
+              "start": 0,
+              "end": 27
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "correction_and_supplement",
+      "note": "两个互不覆盖的原文意图片段。",
+      "input": {
+        "message": {
+          "message_id": "correction_and_supplement",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "请把报告改成两页，并补上预算。",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "correction",
+            "span": {
+              "start": 0,
+              "end": 24
+            }
+          },
+          {
+            "intent": "supplement",
+            "span": {
+              "start": 30,
+              "end": 42
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "correction_tools_started",
+      "note": "工具已开始仍可判断改正意图；本入口不执行修订。",
+      "input": {
+        "message": {
+          "message_id": "correction_tools_started",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "改成英文版本。",
+          "reply_to": null
+        },
+        "phase": "Tools",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 1,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "correction",
+            "span": {
+              "start": 0,
+              "end": 21
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "correction_tools_unknown",
+      "note": "工具数未知不改变语义标注；不据此推断安全重放。",
+      "input": {
+        "message": {
+          "message_id": "correction_tools_unknown",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "把结论改得简洁一点。",
+          "reply_to": null
+        },
+        "phase": "Tools",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": null,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "correction",
+            "span": {
+              "start": 0,
+              "end": 30
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "answer_valid_reference",
+      "note": "当前澄清且回复引用匹配。",
+      "input": {
+        "message": {
+          "message_id": "answer_valid_reference",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "两页。",
+          "reply_to": "public-question"
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": {
+          "question_id": "public-question",
+          "source_text": "请调整报告页数。",
+          "prompt": "调整到几页？"
+        }
+      },
+      "accepted": [
+        [
+          {
+            "intent": "answer",
+            "span": {
+              "start": 0,
+              "end": 9
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "answer_missing_reference",
+      "note": "有澄清但无可信回复引用，不接受 answer。",
+      "input": {
+        "message": {
+          "message_id": "answer_missing_reference",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "两页。",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": {
+          "question_id": "public-question",
+          "source_text": "请调整报告页数。",
+          "prompt": "调整到几页？"
+        }
+      },
+      "accepted": [
+        [
+          {
+            "intent": "ambiguous",
+            "span": null
+          }
+        ]
+      ]
+    },
+    {
+      "id": "answer_wrong_reference",
+      "note": "过期或错误回复引用不接受 answer。",
+      "input": {
+        "message": {
+          "message_id": "answer_wrong_reference",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "两页。",
+          "reply_to": "old-question"
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": {
+          "question_id": "public-question",
+          "source_text": "请调整报告页数。",
+          "prompt": "调整到几页？"
+        }
+      },
+      "accepted": [
+        [
+          {
+            "intent": "ambiguous",
+            "span": null
+          }
+        ]
+      ]
+    },
+    {
+      "id": "command_answer_valid",
+      "note": "明确 answer 命令带当前可信引用。",
+      "input": {
+        "message": {
+          "message_id": "command_answer_valid",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "/answer 两页",
+          "reply_to": "public-question"
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": {
+          "question_id": "public-question",
+          "source_text": "请调整报告页数。",
+          "prompt": "调整到几页？"
+        }
+      },
+      "accepted": [
+        [
+          {
+            "intent": "answer",
+            "span": {
+              "start": 8,
+              "end": 14
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "unrelated_greeting",
+      "note": "寒暄与报告无关。",
+      "input": {
+        "message": {
+          "message_id": "unrelated_greeting",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "早上好，今天真暖和。",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "unrelated",
+            "span": null
+          }
+        ]
+      ]
+    },
+    {
+      "id": "natural_new_task",
+      "note": "明确另起一项不同任务。",
+      "input": {
+        "message": {
+          "message_id": "natural_new_task",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "另开一个任务：帮我写一封生日邀请。",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "new_task",
+            "span": {
+              "start": 0,
+              "end": 51
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "ambiguous_cancel_quote",
+      "note": "仅提及取消一词，缺少请求语义。",
+      "input": {
+        "message": {
+          "message_id": "ambiguous_cancel_quote",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "“取消”这个词。",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "unrelated",
+            "span": null
+          }
+        ],
+        [
+          {
+            "intent": "ambiguous",
+            "span": null
+          }
+        ]
+      ]
+    },
+    {
+      "id": "ambiguous_revision",
+      "note": "修订目标缺失应澄清。",
+      "input": {
+        "message": {
+          "message_id": "ambiguous_revision",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "那个不对，改一下。",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "ambiguous",
+            "span": null
+          }
+        ]
+      ]
+    },
+    {
+      "id": "cancel_and_new_task",
+      "note": "取消旧任务并独立新任务两个意图。",
+      "input": {
+        "message": {
+          "message_id": "cancel_and_new_task",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "停止这份报告；新任务是列出书单。",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "cancel",
+            "span": null
+          },
+          {
+            "intent": "new_task",
+            "span": {
+              "start": 21,
+              "end": 48
+            }
+          }
+        ]
+      ]
+    },
+    {
+      "id": "unicode_supplement",
+      "note": "保留 emoji、组合字符和中文原文；字节跨度不同于字符索引。",
+      "input": {
+        "message": {
+          "message_id": "unicode_supplement",
+          "target": {
+            "session": {
+              "session_id": "public-message-benchmark",
+              "user_id": "public-author"
+            },
+            "task_id": "report-task",
+            "controller_epoch": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "generation": 1
+          },
+          "text": "加上咖啡 ☕️ 和书籍 📚 的预算。",
+          "reply_to": null
+        },
+        "phase": "Generating",
+        "task_text": "生成三页中文报告，说明计划。",
+        "cancel_requested": false,
+        "started_tools": 0,
+        "clarification": null
+      },
+      "accepted": [
+        [
+          {
+            "intent": "supplement",
+            "span": {
+              "start": 0,
+              "end": 47
+            }
+          }
+        ]
+      ]
+    }
+  ]
+}

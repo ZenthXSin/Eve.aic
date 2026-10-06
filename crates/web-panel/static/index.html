@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="referrer" content="no-referrer">
+  <title>Eve · 本地控制台</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div id="login-view" class="login-layout">
+    <div class="login-intro">
+      <a class="brand" href="/" aria-label="Eve 本地控制台"><span class="brand-mark" aria-hidden="true">E</span><span>Eve<span class="brand-caption">本地控制台</span></span></a>
+      <p class="eyebrow">保持对当前运行的了解</p>
+      <h1>看见进度，<br>掌握下一步。</h1>
+      <p class="login-description">查看 QQ 通道状态、正在执行的任务，以及本机保存的会话记录。</p>
+      <div class="intro-note"><span class="small-dot" aria-hidden="true"></span>仅连接此 Eve 实例</div>
+    </div>
+    <main class="login-card">
+      <span class="section-kicker">访问验证</span>
+      <h2>进入控制台</h2>
+      <p class="muted">粘贴启动面板时设置的访问令牌。</p>
+      <form id="login-form">
+        <label for="access-token">访问令牌</label>
+        <input id="access-token" name="access-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" minlength="32" maxlength="256" required aria-describedby="token-note">
+        <p id="token-note" class="field-note">令牌仅在当前页面内存中使用，刷新或退出后需要重新输入。</p>
+        <p id="login-error" class="form-error" role="alert" hidden></p>
+        <button id="login-submit" class="button primary wide" type="submit">连接本地实例 <span aria-hidden="true">→</span></button>
+      </form>
+    </main>
+  </div>
+
+  <div id="console-view" class="console-layout" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="Eve 本地控制台"><span class="brand-mark" aria-hidden="true">E</span><span>Eve<span class="brand-caption">本地控制台</span></span></a>
+      <nav aria-label="控制台导航">
+        <button class="nav-item active" type="button" data-view="tasks" aria-current="page"><span aria-hidden="true">◎</span>任务状态</button>
+        <button class="nav-item" type="button" data-view="sessions"><span aria-hidden="true">▤</span>会话记录</button>
+      </nav>
+      <div class="sidebar-foot"><span class="small-dot" aria-hidden="true"></span>本机运行实例<p>会话与任务来自当前服务。<br>不提供新建任务或停服操作。</p></div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <div><p class="eyebrow">运行观察</p><h1 id="page-title">任务状态</h1></div>
+        <div class="topbar-actions"><span id="refresh-state" class="refresh-state" role="status">正在连接</span><button id="refresh-button" class="button secondary" type="button">刷新</button><button id="logout-button" class="button text-button" type="button">退出</button></div>
+      </header>
+      <div id="global-error" class="notice error-notice" role="alert" hidden></div>
+
+      <section class="overview" aria-label="QQ 通道运行概览">
+        <div class="channel-card"><div class="card-label">QQ 通道</div><div class="channel-state"><span id="channel-dot" class="status-dot neutral" aria-hidden="true"></span><strong id="channel-state">等待状态</strong></div><p id="channel-detail" class="muted">正在读取当前实例</p><p id="started-at" class="small-text"></p></div>
+        <div class="metric-card"><span class="card-label">收到消息</span><strong id="metric-received">—</strong><span class="metric-caption">当前实例</span></div>
+        <div class="metric-card"><span class="card-label">完成处理</span><strong id="metric-completed">—</strong><span class="metric-caption">当前实例</span></div>
+        <div class="metric-card"><span class="card-label">发送成功</span><strong id="metric-sent">—</strong><span class="metric-caption">当前实例</span></div>
+        <div class="metric-card"><span class="card-label">失败记录</span><strong id="metric-failed">—</strong><span class="metric-caption">当前实例</span></div>
+      </section>
+
+      <section id="tasks-view" class="workspace" aria-label="任务状态">
+        <div class="list-panel">
+          <div class="panel-heading"><div><h2>受管任务</h2><p>选择任务，查看当前代际与进度。</p></div><span id="task-count" class="count-pill">0</span></div>
+          <p id="tasks-error" class="inline-error" role="alert" hidden></p>
+          <div id="tasks-list" class="record-list" aria-label="任务列表"></div>
+          <p id="tasks-empty" class="empty-list">正在读取任务…</p>
+          <div class="list-footer"><button id="tasks-more" class="button secondary" type="button" hidden>加载更多任务</button></div>
+        </div>
+        <section id="task-detail" class="detail-panel" aria-label="选中任务详情"><div class="empty-detail"><span class="empty-symbol" aria-hidden="true">◎</span><h2>选择一个任务</h2><p>在这里查看执行状态，以及针对当前代际请求取消。</p></div></section>
+      </section>
+
+      <section id="sessions-view" class="workspace" aria-label="会话记录" hidden>
+        <div class="list-panel">
+          <div class="panel-heading"><div><h2>本机会话</h2><p>查看本实例已保存的用户对话。</p></div><span id="session-count" class="count-pill">0</span></div>
+          <p id="sessions-error" class="inline-error" role="alert" hidden></p>
+          <div id="sessions-list" class="record-list" aria-label="会话列表"></div>
+          <p id="sessions-empty" class="empty-list">正在读取会话…</p>
+          <div class="list-footer"><button id="sessions-more" class="button secondary" type="button" hidden>加载更多会话</button></div>
+        </div>
+        <section id="session-detail" class="detail-panel" aria-label="会话详情"><div class="empty-detail"><span class="empty-symbol" aria-hidden="true">▤</span><h2>选择一段会话</h2><p>仅展示用户与助手文字，工具参数和结果不在此展示。</p></div></section>
+      </section>
+      <footer class="page-footer">每 3 秒刷新通道与任务 · 页面隐藏时暂停自动刷新</footer>
+    </main>
+  </div>
+</body>
+</html>
