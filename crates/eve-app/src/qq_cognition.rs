@@ -1,12 +1,12 @@
-//! QQ 只通过明确命令保存待办和查询草稿，内部反思没有主动投递能力。
+//! QQ 明确保存待办与用户反馈，后台按目标修订重新反思；没有主动投递能力。
 use crate::{AppError, core_bootstrap, models, services};
 use eve_cognition_api::*;
 use eve_cognition_loop_api::*;
 use eve_cognition_loop_plugin::{
     CognitionLoopPlugin, LoopController, PriorityDrivePolicy, ReflectionArtifact,
-    ReflectionVerifier,
+    ReflectionVerifier, current_reflection,
 };
-use eve_cognition_plugin::{CognitionController, CognitionPlugin};
+use eve_cognition_plugin::{CognitionController, CognitionPlugin, UserGoalFeedback};
 use eve_config_api::{CONFIG_SERVICE_ID, ConfigServiceHandle};
 use eve_control_api::ControlServiceHandle;
 use eve_control_plugin::ControlPlugin;
@@ -44,7 +44,8 @@ const CONTEXT_SERVICE: &str = "eve.cognition.context.service";
 const CONTROL_SERVICE: &str = "eve.cognition.control.service";
 const CHANNEL: &str = "qq.goal";
 const INTERNAL_USER: &str = "cognition.internal";
-const HELP: &str = "用法：/goal 待办内容、/goals、/mind [目标ID]。";
+const HELP: &str =
+    "用法：/goal 待办内容、/goals、/mind [目标ID]、/goal-feedback 目标ID 版本 反馈内容。";
 
 fn failure() -> PluginError {
     PluginError::State("认知状态读取或保存失败；未自动重试".into())
@@ -88,6 +89,7 @@ pub(crate) struct Commands {
     admin: Option<CognitionController>,
     sessions: Option<Arc<dyn SessionService>>,
     accepting: Arc<AtomicBool>,
+    planning_budget: Option<(LoopController, u16)>,
 }
 impl Commands {
     pub(crate) fn disabled() -> Arc<Self> {
@@ -95,6 +97,7 @@ impl Commands {
             admin: None,
             sessions: None,
             accepting: Arc::new(AtomicBool::new(false)),
+            planning_budget: None,
         })
     }
     fn state(&self, user: &str) -> PluginResult<CognitiveView> {
@@ -121,7 +124,10 @@ impl Commands {
             {
                 return Err(failure());
             }
-            return Ok(format!("待办已保存：{id}。发送 /mind 查看草稿。"));
+            return Ok(format!(
+                "待办已保存：{id}，版本 {}。发送 /mind 查看草稿。",
+                existing.revision
+            ));
         }
         let source = Source {
             kind: SourceKind::User,
@@ -164,13 +170,68 @@ impl Commands {
             summary: "QQ 用户明确保存待办，等待内部反思。".into(),
         });
         match admin.replace(snapshot.revision, state) {
-            Ok(_) => Ok(format!(
-                "待办已保存：{id}。正在后台整理，稍后发送 /mind 查看草稿。"
+            Ok(saved) => Ok(format!(
+                "待办已保存：{id}，版本 {}。正在后台整理，稍后发送 /mind 查看草稿。",
+                saved.state.goals[&id].revision
             )),
             Err(CognitionError::StaleRevision) => {
                 Ok("认知状态正在更新，本条待办未保存；请重新发送 /goal。".into())
             }
             Err(CognitionError::LimitReached) => Ok("认知记录已达容量上限，未保存新待办。".into()),
+            Err(_) => Err(failure()),
+        }
+    }
+    fn feedback(&self, input: &QqCommandInput<'_>, tail: &str) -> PluginResult<String> {
+        let Some((goal_id, remaining)) = tail.split_once(char::is_whitespace) else {
+            return Ok(HELP.into());
+        };
+        let Some((revision, text)) = remaining.trim_start().split_once(char::is_whitespace) else {
+            return Ok(HELP.into());
+        };
+        let Ok(expected_goal_revision) = revision.parse::<u64>() else {
+            return Ok(HELP.into());
+        };
+        let feedback_id = id_for(input).replacen("qq-goal-", "qq-goal-feedback-", 1);
+        let request = GoalFeedbackInput {
+            goal_id: goal_id.into(),
+            expected_goal_revision,
+            feedback_id,
+            text: text.trim().into(),
+            at_ms: now_ms().map_err(|_| failure())?,
+        };
+        if request.validate().is_err() {
+            return Ok(format!(
+                "{HELP} 版本须为正整数，反馈为 1 至 4096 UTF-8 字节。"
+            ));
+        }
+        let admin = self.admin.as_ref().ok_or_else(failure)?;
+        let service = UserGoalFeedback::new(
+            Arc::new(admin.clone()),
+            "eve".into(),
+            input.session.user_id.clone(),
+            CHANNEL.into(),
+            "qq.goal.feedback".into(),
+        )
+        .map_err(|_| failure())?;
+        match service.submit(request) {
+            Ok(report) => {
+                let budget_exhausted = self.planning_budget.as_ref().is_some_and(|(controller, max)| {
+                    controller.stats().is_ok_and(|stats| stats.submitted >= u64::from(*max))
+                });
+                let next = if report.duplicate {
+                    "本条已处理，不重复更新或规划。"
+                } else if budget_exhausted {
+                    "本次启动的执行名额已用尽，新反馈仍已保存；后续启动再评估，不自动重试旧执行。"
+                } else {
+                    "后台将按新版本重新评估；旧草稿保留为历史，原待办仍未完成。"
+                };
+                Ok(format!("反馈已保存：{}，版本 {}。{} 发送 /mind 目标ID 查看当前状态。", report.goal_id, report.goal_revision, next))
+            }
+            Err(CognitionError::AccessDenied) => Ok("当前会话未找到该待办，发送 /goals 查看。".into()),
+            Err(CognitionError::StaleRevision) => Ok("目标版本已变化或认知状态正在更新，本条反馈未保存；请用 /goals 查看当前版本后重新发送。".into()),
+            Err(CognitionError::InvalidTransition) => Ok("该待办已结束、失效或不接受新反馈，原状态保留。".into()),
+            Err(CognitionError::InvalidInput) => Ok(format!("{HELP} 反馈结构无效或消息标识冲突，未覆盖原记录。")),
+            Err(CognitionError::LimitReached) => Ok("认知记录已达容量上限，反馈未保存。".into()),
             Err(_) => Err(failure()),
         }
     }
@@ -194,7 +255,7 @@ impl Commands {
             "当前会话待办（最多 10 项）：\n{}\n发送 /mind 目标ID 查看草稿。",
             goals
                 .iter()
-                .map(|g| format!("{}：{:?}", g.id, g.status))
+                .map(|g| format!("{}：{:?}，版本 {}", g.id, g.status, g.revision))
                 .collect::<Vec<_>>()
                 .join("\n")
         ))
@@ -220,26 +281,20 @@ impl Commands {
         let Some(parent) = parent else {
             return Ok("当前会话未找到该待办，发送 /goals 查看。".into());
         };
-        let child = view
-            .state
-            .goals
-            .values()
-            .filter(|g| {
-                g.source.kind == SourceKind::Inference
-                    && g.source.channel == "endogenous"
-                    && g.source.reference == parent.id
-                    && g.visibility == parent.visibility
-            })
-            .max_by_key(|g| g.feedback.as_ref().map_or(0, |f| f.at_ms));
+        let child =
+            current_reflection(&view.state, &view.subject_id, parent).map_err(|_| failure())?;
         let Some(child) = child else {
-            return Ok("待办已保存，反思尚未开始；请稍后发送 /mind。".into());
+            return Ok(format!(
+                "待办已保存，当前版本 {} 的反思尚未开始；旧草稿不作为当前建议。请稍后发送 /mind。",
+                parent.revision
+            ));
         };
         if child.status != GoalStatus::Completed
             || !child.feedback.as_ref().is_some_and(|f| f.verification_met)
         {
             return Ok(format!(
-                "反思状态：{:?}。原待办仍未完成；不会自动重试不确定的执行。",
-                child.status
+                "反思状态：{:?}，目标版本 {}。原待办仍未完成；旧草稿不作为当前建议，不会自动重试不确定的执行。",
+                child.status, parent.revision
             ));
         }
         let execution = child.execution.as_ref().ok_or_else(failure)?;
@@ -266,7 +321,8 @@ impl Commands {
             .ok_or_else(failure)?;
         let artifact = ReflectionArtifact::parse(&text).map_err(|_| failure())?;
         Ok(format!(
-            "反思草稿（建议尚未验证，原待办未完成）：\n{}\n建议下一步：{}\n需要补充信息：{}",
+            "反思草稿（建议尚未验证，原待办未完成）：\n目标版本：{}\n{}\n建议下一步：{}\n需要补充信息：{}",
+            parent.revision,
             artifact.summary,
             artifact.next_step,
             if artifact.needs_user_input {
@@ -283,7 +339,7 @@ impl QqCommandHandler for Commands {
         let end = text.find(char::is_whitespace).unwrap_or(text.len());
         let (command, tail) = text.split_at(end);
         let tail = tail.trim();
-        if !matches!(command, "/goal" | "/goals" | "/mind") {
+        if !matches!(command, "/goal" | "/goals" | "/mind" | "/goal-feedback") {
             return Ok(None);
         }
         if self.admin.is_none() {
@@ -294,6 +350,7 @@ impl QqCommandHandler for Commands {
         }
         let reply = match command {
             "/goal" if !tail.is_empty() => self.add(&input, tail)?,
+            "/goal-feedback" => self.feedback(&input, tail)?,
             "/goals" if tail.is_empty() => self.goals(&input.session.user_id)?,
             "/mind" if tail.split_whitespace().count() <= 1 => {
                 self.mind(&input.session.user_id, (!tail.is_empty()).then_some(tail))?
@@ -344,25 +401,24 @@ impl DrivePolicy for QqPolicy {
             return Ok(vec![]);
         }
         let snapshot = self.admin.snapshot()?;
-        let goals: Vec<_> = goals
-            .iter()
-            .filter(|g| {
-                snapshot
-                    .state
-                    .goals
-                    .get(&g.source.reference)
-                    .is_some_and(|parent| {
-                        parent.source.kind == SourceKind::User
-                            && parent.source.channel == CHANNEL
-                            && parent.status == GoalStatus::Waiting
-                            && matches!(parent.visibility, Visibility::User(_))
-                            && parent.visibility == g.visibility
-                            && parent.expires_at_ms.is_none_or(|expiry| now_ms < expiry)
-                    })
-            })
-            .cloned()
-            .collect();
-        PriorityDrivePolicy.rank(&goals, now_ms)
+        let mut current = Vec::new();
+        for goal in goals {
+            let Some(parent) = snapshot.state.goals.get(&goal.source.reference) else {
+                continue;
+            };
+            if parent.source.kind == SourceKind::User
+                && parent.source.channel == CHANNEL
+                && parent.status == GoalStatus::Waiting
+                && matches!(parent.visibility, Visibility::User(_))
+                && parent.visibility == goal.visibility
+                && parent.expires_at_ms.is_none_or(|expiry| now_ms < expiry)
+                && current_reflection(&snapshot.state, &snapshot.subject_id, parent)?
+                    .is_some_and(|child| child.id == goal.id)
+            {
+                current.push(goal.clone());
+            }
+        }
+        PriorityDrivePolicy.rank(&current, now_ms)
     }
 }
 
@@ -518,6 +574,7 @@ pub(crate) async fn start(
         admin: Some(admin),
         sessions: Some(sessions),
         accepting: Arc::new(AtomicBool::new(false)),
+        planning_budget: Some((controller.clone(), max)),
     });
     let (stop, mut stopping) = watch::channel(false);
     let accepting = commands.accepting.clone();
