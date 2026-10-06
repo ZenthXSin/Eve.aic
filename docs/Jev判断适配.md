@@ -2,7 +2,7 @@
 
 `eve-jev` 是实现公开 `RelationJudge` 的独立 HTTP 适配器，协议依据 TypeSafe 官方 Python SDK 固定版本 [`f078f1e`](https://github.com/typesafe-ai/typesafe-sdk-python/tree/f078f1e208a0d885154dc758344ae4fce77ac168)：`POST /v1/systemone`，Bearer 凭据，输入 `state/model/questions`。适配器只判断消息，不执行工具或控制动作。
 
-本分支增加 QQ 宿主装配，保持实验功能默认关闭。终端入口仍未接入自然消息判断；本地替身验收只证明接线和恢复边界，真实 Jev 的分类质量、概率校准及延迟仍待评估，不据此开启正式训练。
+QQ 宿主通过显式开关装配，保持实验功能默认关闭。终端入口仍未接入自然消息判断；本地替身验收只证明接线和恢复边界。OpenRouter 支持相同 TypeSafe 协议，可复用此适配器；真实调用和公开样本评估仍不代表线上任务完成率或置信度已校准。
 
 ## QQ 开关与独立配置
 
@@ -31,11 +31,34 @@ Jev 模式需要宿主环境中的 `EVE_JEV_API_KEY`，不会读取主模型密�
 
 启动只预检并构造客户端，不发送健康探测请求。缺凭据、角色关闭或配置错误会拒绝启动；运行中的 Jev 配置变坏则返回不可用并进入主模型回退。每次判断捕获同一修订的角色与 Provider 配置，最多重读四次；在途请求固定选择，新请求使用新配置，宿主只缓存最近一个客户端选择。凭据在宿主启动时读取，变更凭据需重启。
 
+## 通过 OpenRouter 使用原生 Jev
+
+OpenRouter 的 [TypeSafe SDK 兼容说明](https://openrouter.ai/blog/insights/what-is-jev/#typesafe-javascript-sdk-pointed-at-openrouter) 明确支持 `POST https://openrouter.ai/api/v1/systemone`，请求仍是 `state/model/questions`，返回 `answers` 中的 `choice` / `noul`。无需切换 Chat Completions，也无需新增模型 Provider。这里固定 `typesafe/jev-1.13`，避免最新别名变化影响验收。
+
+先在宿主私有环境中设置 `EVE_JEV_API_KEY` 为 OpenRouter 密钥，并保留原来的 `EVE_OPENAI_API_KEY` 供主模型回退。以下配置不含密钥：
+
+```bash
+export EVE_JEV_BASE_URL=https://openrouter.ai/api
+export EVE_MODELS_JEV_ENABLED=true
+export EVE_MODELS_JEV_PROVIDER=jev
+export EVE_MODELS_JEV_MODEL=typesafe/jev-1.13
+export EVE_MODELS_JEV_CREDENTIAL_REF=env:EVE_JEV_API_KEY
+export EVE_MODELS_JEV_TIMEOUT_MS=3000
+export EVE_MODELS_JEV_MAX_CONCURRENT_REQUESTS=4
+export EVE_MODELS_JEV_MAX_OUTPUT_TOKENS=0
+export EVE_MESSAGE_JUDGE_TIMEOUT_MS=6000
+eve-qqbot --message-judge jev --state-dir /path/to/qq-state
+```
+
+`base_url` 必须是 `https://openrouter.ai/api`，适配器会追加 `/v1/systemone`；不要填写 `/api/v1` 或 Chat 端点。`jev_provider` 继续填写 `jev`，它选择线协议，服务商由独立地址和凭据确定。服务响应的顶层 `model/provider/id/usage` 元数据不参与路由；`answers` 仍接受严格校验，不将服务商返回的模型名、请求标识或费用交给动作执行器。HTTP 错误进入已有一次主模型回退。
+
+以上期限是可调整的实验配置，Jev 最多使用总期限的一半；部署时检查已保存的普通配置，因为文件配置优先于环境。替换凭据或从关闭模式启用后需要受控重启：先停止准入、保存当前状态与报告，保留原训练窗口截止时间及样本基线，再从同一状态目录启动。不得通过清空状态解决配置问题，也不重放旧判断或重新观察已有样本。
+
 ## 回退、原文与取消
 
 复用 `RelationPlugin::with_fallback`，不另造动作执行器。`runtime.messages.judge_timeout_ms`（环境 `EVE_MESSAGE_JUDGE_TIMEOUT_MS`，默认 2000 毫秒）限制整次判断，Jev 至多使用链内预算的一半，低置信度、含混、非法结构、HTTP 失败或超时后至多调用主模型一次。主模型由 `LlmRelationJudge::with_resolver` 在本次回退开始时解析，单次请求固定 Provider 和其期限。主模型也失败、超时或低置信度时，路由器给出澄清，不因判断失败取消任务。消息准入时固定的外层期限始终优先，不会因回退延长。
 
-Jev 一次请求同时询问 `choice` 单意图与 `noul` 完整单意图条件。只有无需裁剪、整条用户原文可直接使用时，才在本地绑定 UTF-8 全文范围；不生成修订文字。多意图、需要切分或缺失可信引用时交给主模型或澄清。分数取 choice 自评、选中概率和 noul 概率的最小值再向下取整，未经校准，不代表真实正确率。宿主继续校验阈值、范围、作用域、代际及工具副作用。
+Jev 一次请求同时询问 `choice` 单意图与 `noul` 完整单意图条件。Noul 使用一个明确命题，只评估最新 `state.message`，`task_text` 作为背景，不把原任务计为第二个意图。只有无需裁剪、整条用户原文可直接使用时，才在本地绑定 UTF-8 全文范围；不生成修订文字。多意图、需要切分或缺失可信引用时交给主模型或澄清。分数取 choice 自评、选中概率和 noul 概率的最小值再向下取整，未经校准，不代表真实正确率。宿主继续校验阈值、范围、作用域、代际及工具副作用。公开开发集实测和限制见[评估记录](../benchmarks/messages/README.md#2026-10-06-openrouter-原生-jev-实测)。
 
 开启自然判断后，不同会话可并行推进，同会话的旧回复和后续任务等待自己的判断收尾。完整且有效的任务修改命令撤销同会话尚未完成的自然判断；只读、无效、冲突命令和无可信引用的 `/answer` 不撤销判断。路由器在判断、等待动作锁和动作前检查通道关闭，并检查权威快照的取消状态/展示退休状态。取消已准入后仍等待原代工具析构与最终提交，再决定是否允许替代代。已经执行或无法确认工具数的修订只澄清，绝不重放旧工具；明确 `/new` 保留开启独立任务的语义。底层条件提交仍以完整代际为原子比较条件，不将布尔取消状态描述为跨调用者的原子版本号。
 
