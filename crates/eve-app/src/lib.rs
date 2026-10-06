@@ -19,6 +19,10 @@ mod segment_commands;
 mod services;
 mod storage;
 
+#[cfg(test)]
+#[path = "../../llm-openai/tests/support/mod.rs"]
+mod http_support;
+
 pub use cognition::{
     COGNITION_HELP, CognitionOptions, run_cognition, run_cognition_with_planner_factory,
 };
