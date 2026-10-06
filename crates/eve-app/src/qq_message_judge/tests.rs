@@ -191,6 +191,118 @@ fn primary_reply(text: &str) -> Reply {
     ))
 }
 
+fn openrouter_reply() -> Reply {
+    let mut body: Value = serde_json::from_slice(&jev_reply(0.99).body).unwrap();
+    body["model"] = json!("typesafe/jev-1.13-20260917");
+    body["provider"] = json!("TypeSafe");
+    body["id"] = json!("synthetic-openrouter-decision");
+    body["usage"] = json!({"input_tokens": 100, "output_tokens": 20, "cost": 0.0000042});
+    Reply::json(body)
+}
+
+#[tokio::test]
+async fn openrouter_typesafe_prefix_envelope_fallback_and_restart_use_independent_credentials() {
+    let root = tempfile::tempdir().unwrap();
+    let text = "把解释改成中文。";
+    let mut primary = Server::start(vec![primary_reply(text)]).await;
+    let mut unavailable = Reply::json(json!({"error": {"message": "synthetic unavailable"}}));
+    unavailable.status = 502;
+    let mut jev = Server::start(vec![openrouter_reply(), unavailable, openrouter_reply()]).await;
+    let base = format!("{}/api", jev.url.trim_end_matches("/v1/responses"));
+    let h = Harness::start(root.path(), &primary.url, &jev.url).await;
+    h.update(
+        &[
+            (PROVIDER_NAMESPACE, "base_url", json!(base)),
+            (MODELS_NAMESPACE, "jev_model", json!("typesafe/jev-1.13")),
+            (
+                MODELS_NAMESPACE,
+                "jev_credential_ref",
+                json!("env:EVE_JEV_API_KEY"),
+            ),
+        ],
+        ApplyMode::Immediate,
+    );
+    let judge = h.install(h.plugin(MessageJudgeMode::Jev).unwrap()).await;
+    // 启动预检不发送请求；明确命令同样不访问任一模型。
+    assert!(primary.requests.try_recv().is_err());
+    assert!(jev.requests.try_recv().is_err());
+    assert_eq!(
+        judge.judge(input("/cancel")).await.unwrap().parts[0].intent,
+        MessageIntent::Cancel
+    );
+    assert!(primary.requests.try_recv().is_err());
+    assert!(jev.requests.try_recv().is_err());
+    assert_eq!(
+        judge.judge(input(text)).await.unwrap().parts[0].confidence,
+        99
+    );
+    let request = jev.next().await;
+    assert_request(
+        &request,
+        "/api/v1/systemone",
+        "typesafe/jev-1.13",
+        JEV_SECRET,
+        PRIMARY_SECRET,
+    );
+    assert_eq!(request.body["state"]["message"], text);
+    assert_eq!(request.body["questions"]["intent"]["type"], "choice");
+    assert_eq!(request.body["questions"]["whole_message"]["type"], "noul");
+    assert!(request.body.get("messages").is_none());
+    assert!(request.body.get("tools").is_none());
+    assert!(primary.requests.try_recv().is_err());
+    assert_eq!(
+        judge.judge(input(text)).await.unwrap().parts[0].confidence,
+        95
+    );
+    assert_request(
+        &jev.next().await,
+        "/api/v1/systemone",
+        "typesafe/jev-1.13",
+        JEV_SECRET,
+        PRIMARY_SECRET,
+    );
+    assert_request(
+        &primary.next().await,
+        "/v1/responses",
+        "primary-a",
+        PRIMARY_SECRET,
+        JEV_SECRET,
+    );
+    assert!(primary.requests.try_recv().is_err());
+    assert!(jev.requests.try_recv().is_err());
+    h.stop().await;
+    let restored = Harness::start(root.path(), &primary.url, &jev.url).await;
+    let judge = restored
+        .install(restored.plugin(MessageJudgeMode::Jev).unwrap())
+        .await;
+    assert_eq!(
+        restored
+            .settings
+            .snapshot(PROVIDER_NAMESPACE, 1)
+            .unwrap()
+            .get::<String>("base_url")
+            .unwrap(),
+        base
+    );
+    // 恢复普通配置，不重放之前的判断或失败请求。
+    assert!(primary.requests.try_recv().is_err());
+    assert!(jev.requests.try_recv().is_err());
+    assert_eq!(
+        judge.judge(input(text)).await.unwrap().parts[0].confidence,
+        99
+    );
+    assert_request(
+        &jev.next().await,
+        "/api/v1/systemone",
+        "typesafe/jev-1.13",
+        JEV_SECRET,
+        PRIMARY_SECRET,
+    );
+    assert!(primary.requests.try_recv().is_err());
+    assert!(jev.requests.try_recv().is_err());
+    restored.stop().await;
+}
+
 fn assert_request(request: &Captured, path: &str, model: &str, own_key: &str, other_key: &str) {
     assert!(
         request

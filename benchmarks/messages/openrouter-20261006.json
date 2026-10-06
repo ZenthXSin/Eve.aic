@@ -1,0 +1,174 @@
+{
+  "schema_version": 1,
+  "evaluation_date_utc": "2026-10-06",
+  "dataset": "benchmarks/messages/cases.json",
+  "dataset_sha256": "ae8bf7ce2778e0e8a30ae070e393856fb602bec2a910a2d6ef74d36bec5937c1",
+  "sample_source": "项目内公开构造样本；同一集合用于开发问题描述，不是独立验证集",
+  "private_qq_samples": false,
+  "jev_provider": "OpenRouter TypeSafe /v1/systemone",
+  "jev_model": "typesafe/jev-1.13",
+  "primary_model": "deepseek-v4.1-flash",
+  "judge_timeout_ms": 6000,
+  "confidence_threshold": 80,
+  "whole_message_minimum": 0.8,
+  "revised_jev_source_sha256": "51678349ec714d6c36684cf3e52f40167ea57153f919ac11064d3eab2196eed3",
+  "reports": [
+    {
+      "label": "rules",
+      "started_at_unix_ms": 1791269730485,
+      "configuration_sha256": "a3845dd814a42fc530e75317b170ae57d691a08b95e2f08bb97cbe46b4ab9fb8",
+      "summary": {
+        "cases": 30,
+        "successful_judgements": 30,
+        "exact_matches": 16,
+        "label_matches": 16,
+        "raw_span_matches": 20,
+        "false_cancellations": 0,
+        "correction_required_cases": 6,
+        "missed_corrections": 4,
+        "low_confidence_or_ambiguous": 20,
+        "errors": 0,
+        "timeouts": 0,
+        "mean_latency_ms": 0.004030433333333334,
+        "diagnostic_counts": {
+          "rules_started": 30,
+          "auxiliary_started": 0,
+          "primary_started": 0,
+          "classifier_calls": 0,
+          "model_provider_calls": 0,
+          "fallbacks": 0
+        },
+        "incomplete_diagnostics": 0
+      },
+      "fallback_reasons": {},
+      "auxiliary_without_fallback": []
+    },
+    {
+      "label": "primary",
+      "started_at_unix_ms": 1791269792661,
+      "configuration_sha256": "1d277d074c73f881f6765d7873976fdcb198e92e34c524b11ffe6695a057d361",
+      "summary": {
+        "cases": 30,
+        "successful_judgements": 26,
+        "exact_matches": 23,
+        "label_matches": 25,
+        "raw_span_matches": 23,
+        "false_cancellations": 0,
+        "correction_required_cases": 6,
+        "missed_corrections": 0,
+        "low_confidence_or_ambiguous": 3,
+        "errors": 4,
+        "timeouts": 3,
+        "mean_latency_ms": 2176.3357482666665,
+        "diagnostic_counts": {
+          "rules_started": 30,
+          "auxiliary_started": 0,
+          "primary_started": 18,
+          "classifier_calls": 0,
+          "model_provider_calls": 18,
+          "fallbacks": 0
+        },
+        "incomplete_diagnostics": 0
+      },
+      "fallback_reasons": {},
+      "auxiliary_without_fallback": []
+    },
+    {
+      "label": "jev_original_question",
+      "started_at_unix_ms": 1791269730493,
+      "configuration_sha256": "a21a742ad8894302e71a8eb56378e32a7d5e027618a6f2f531283223739bad91",
+      "summary": {
+        "cases": 30,
+        "successful_judgements": 29,
+        "exact_matches": 26,
+        "label_matches": 27,
+        "raw_span_matches": 26,
+        "false_cancellations": 0,
+        "correction_required_cases": 6,
+        "missed_corrections": 0,
+        "low_confidence_or_ambiguous": 4,
+        "errors": 1,
+        "timeouts": 1,
+        "mean_latency_ms": 2070.958844733333,
+        "diagnostic_counts": {
+          "rules_started": 30,
+          "auxiliary_started": 18,
+          "primary_started": 18,
+          "classifier_calls": 18,
+          "model_provider_calls": 18,
+          "fallbacks": 18
+        },
+        "incomplete_diagnostics": 0
+      },
+      "fallback_reasons": {
+        "ambiguous": 18
+      },
+      "auxiliary_without_fallback": []
+    },
+    {
+      "label": "jev_single_proposition",
+      "started_at_unix_ms": 1791270052774,
+      "configuration_sha256": "a21a742ad8894302e71a8eb56378e32a7d5e027618a6f2f531283223739bad91",
+      "summary": {
+        "cases": 30,
+        "successful_judgements": 28,
+        "exact_matches": 25,
+        "label_matches": 26,
+        "raw_span_matches": 25,
+        "false_cancellations": 0,
+        "correction_required_cases": 6,
+        "missed_corrections": 0,
+        "low_confidence_or_ambiguous": 3,
+        "errors": 2,
+        "timeouts": 2,
+        "mean_latency_ms": 1786.4233795666664,
+        "diagnostic_counts": {
+          "rules_started": 30,
+          "auxiliary_started": 18,
+          "primary_started": 13,
+          "classifier_calls": 18,
+          "model_provider_calls": 13,
+          "fallbacks": 13
+        },
+        "incomplete_diagnostics": 0
+      },
+      "fallback_reasons": {
+        "ambiguous": 9,
+        "low_confidence": 4
+      },
+      "auxiliary_without_fallback": [
+        {
+          "id": "quoted_cancel",
+          "latency_ms": 165.254,
+          "exact_match": true
+        },
+        {
+          "id": "correction_pages",
+          "latency_ms": 245.51,
+          "exact_match": true
+        },
+        {
+          "id": "supplement_budget",
+          "latency_ms": 188.515,
+          "exact_match": true
+        },
+        {
+          "id": "correction_tools_started",
+          "latency_ms": 146.38,
+          "exact_match": true
+        },
+        {
+          "id": "unicode_supplement",
+          "latency_ms": 193.43,
+          "exact_match": true
+        }
+      ]
+    }
+  ],
+  "limits": [
+    "只评估消息判断，不执行任务、工具或 QQ 发送",
+    "阶段和调用次数为本地观察，不能推算 HTTP 请求次数或费用",
+    "主模型返回具有波动性，未据此做统计显著性或线上质量保证",
+    "两次 Jev 评估只改变完整单意图问题，未降低阈值"
+  ]
+}
