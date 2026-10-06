@@ -1,0 +1,19 @@
+[package]
+name = "eve-jev"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-message-diagnostics = { path = "../message-diagnostics" }
+eve-message-api = { path = "../message-api" }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+eve-control-api = { path = "../control-api" }
+eve-session-api = { path = "../session-api" }
+tokio = { workspace = true, features = ["net", "io-util"] }

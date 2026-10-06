@@ -4,9 +4,9 @@ use eve_cognition_api::*;
 use eve_cognition_loop_api::*;
 use eve_cognition_loop_plugin::{
     CognitionLoopPlugin, LoopController, PriorityDrivePolicy, ReflectionArtifact,
-    ReflectionPlannerFactory, ReflectionVerifier,
+    ReflectionPlannerFactory, ReflectionVerifier, current_reflection,
 };
-use eve_cognition_plugin::{CognitionController, CognitionPlugin};
+use eve_cognition_plugin::{CognitionController, CognitionPlugin, UserGoalFeedback};
 use eve_config_api::{
     CONFIG_SERVICE_ID, ConfigServiceHandle, LLM_NAMESPACE, LlmRuntimeConfig, model_roles_schema,
     runtime_llm_schema,
@@ -36,8 +36,10 @@ use std::{
 pub const COGNITION_HELP: &str = "Eve 本地内生反思入口
 用法：eve-cognition [--state-dir 目录] [--agent AGENT.md] [--database-config 凭据文件] 命令
   add --id ID --text 目标文字 [--user owner]  保存等待中的用户目标，不调用模型
+  feedback --id ID --revision N --feedback-id ID --text 反馈 [--user owner]
+                                          保存用户新事实并使旧草稿过期，不调用模型
   status                                  查看无正文的状态计数
-  show --id ID                            显式查看本地目标和已保存反思草稿
+  show --id ID                            查看目标及草稿，current/stale 标明是否属于当前修订
   run [--seconds 30] [--max-executions 1]   无需新输入，推进已有目标的反思草稿
 状态目录默认 .eve-cognition；运行窗口 1 至 600 秒，最多执行 1 至 32 项。
 默认文件状态；--database-config 显式选用本地 PostgreSQL，首次使用须选无文件快照的新目录。
@@ -47,6 +49,7 @@ Ctrl+C 或 SIGTERM 停止派生，取消并等待保存，然后关闭插件。"
 
 const SUBJECT: &str = "eve";
 const INPUT_CHANNEL: &str = "cognition.cli";
+const FEEDBACK_CHANNEL: &str = "cognition.feedback";
 const INTERNAL_USER: &str = "cognition.internal";
 const POLL_MS: u64 = 250;
 
@@ -55,6 +58,10 @@ enum CognitionCommand {
     Add {
         id: String,
         text: String,
+        user: String,
+    },
+    Feedback {
+        input: GoalFeedbackInput,
         user: String,
     },
     Status,
@@ -88,7 +95,7 @@ impl CognitionOptions {
                 return Ok(None);
             }
             let arg = arg.into_string().map_err(|_| "命令参数必须为 UTF-8。")?;
-            if ["add", "status", "show", "run"].contains(&arg.as_str()) {
+            if ["add", "feedback", "status", "show", "run"].contains(&arg.as_str()) {
                 if command.replace(arg).is_some() {
                     return Err("只能指定一个认知命令。".into());
                 }
@@ -103,6 +110,8 @@ impl CognitionOptions {
                 "--user",
                 "--seconds",
                 "--max-executions",
+                "--revision",
+                "--feedback-id",
             ]
             .contains(&arg.as_str())
             {
@@ -138,6 +147,29 @@ impl CognitionOptions {
                 CognitionCommand::Add { id, text, user }
             }
             "status" => CognitionCommand::Status,
+            "feedback" => {
+                let goal_id = fields.remove("--id").ok_or("feedback 缺少 --id。")?;
+                let expected_goal_revision = fields
+                    .remove("--revision")
+                    .ok_or("feedback 缺少 --revision。")?
+                    .parse::<u64>()
+                    .map_err(|_| "反馈目标修订必须为正整数。")?;
+                let feedback_id = fields
+                    .remove("--feedback-id")
+                    .ok_or("feedback 缺少 --feedback-id。")?;
+                let text = fields.remove("--text").ok_or("feedback 缺少 --text。")?;
+                let user = fields.remove("--user").unwrap_or_else(|| "owner".into());
+                validate_id(&user)?;
+                let input = GoalFeedbackInput {
+                    goal_id,
+                    expected_goal_revision,
+                    feedback_id,
+                    text,
+                    at_ms: now_ms()?,
+                };
+                input.validate()?;
+                CognitionCommand::Feedback { input, user }
+            }
             "show" => {
                 let id = fields.remove("--id").ok_or("show 缺少 --id。")?;
                 validate_id(&id)?;
@@ -269,6 +301,25 @@ fn add(
     Ok(report)
 }
 
+fn feedback(
+    admin: &CognitionController,
+    input: GoalFeedbackInput,
+    user: String,
+) -> Result<Value, AppError> {
+    let service = UserGoalFeedback::new(
+        Arc::new(admin.clone()),
+        SUBJECT.into(),
+        user,
+        INPUT_CHANNEL.into(),
+        FEEDBACK_CHANNEL.into(),
+    )?;
+    let report = service.submit(input)?;
+    Ok(
+        json!({"command":"feedback", "goal_id":report.goal_id, "goal_revision":report.goal_revision,
+        "revision":report.revision, "duplicate":report.duplicate}),
+    )
+}
+
 async fn show(
     kernel: &Kernel,
     registry: &Arc<dyn ServiceRegistry>,
@@ -291,6 +342,13 @@ async fn show(
             && child.source.channel == "endogenous"
             && (child.source.reference == id || child.id == id)
     }) {
+        let parent = snapshot
+            .state
+            .goals
+            .get(&child.source.reference)
+            .ok_or("反思草稿缺少父目标，保留状态等待检查。")?;
+        let current = current_reflection(&snapshot.state, &snapshot.subject_id, parent)?
+            .is_some_and(|current| current.id == child.id);
         let verified = child.status == GoalStatus::Completed
             && child
                 .feedback
@@ -328,7 +386,9 @@ async fn show(
         } else {
             None
         };
-        reflections.push(json!({"goal": child, "artifact": artifact}));
+        reflections.push(
+            json!({"goal": child, "artifact": artifact, "current":current, "stale":!current}),
+        );
     }
     Ok(json!({"command": "show", "goal": goal, "reflections": reflections}))
 }
@@ -576,6 +636,7 @@ pub async fn run_cognition_with_planner_factory(
         kernel.start(&PluginId::new(COGNITION_PLUGIN_ID)?).await?;
         match options.command.clone() {
             CognitionCommand::Add { id, text, user } => add(&admin, id, text, user),
+            CognitionCommand::Feedback { input, user } => feedback(&admin, input, user),
             CognitionCommand::Status => Ok(status("status", &admin.snapshot()?)),
             CognitionCommand::Show { id } => show(&kernel, &backends.registry, &admin, &id).await,
             CognitionCommand::Run {

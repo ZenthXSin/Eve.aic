@@ -1,10 +1,12 @@
 //! 通过公开 StateStore 持久化认知快照；不调用模型或执行工具。
+mod goal_feedback;
 mod strict_json;
 use eve_cognition_api::*;
 use eve_plugin_api::{
     Cleanup, Plugin, PluginContext, PluginError, PluginFuture, PluginManifest, PluginResult,
     ServiceId, cleanup,
 };
+pub use goal_feedback::UserGoalFeedback;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub const COGNITION_STATE_KEY: &str = "cognition.v1";

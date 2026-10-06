@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/web-panel-api",
+    "crates/web-panel",
     "crates/learning-api",
     "crates/learning-plugin",
     "crates/plugin-api",
@@ -14,11 +16,13 @@ members = [
     "crates/llm-api",
     "crates/agent-prompt",
     "crates/llm-openai",
+    "crates/jev",
     "crates/session-api",
     "crates/session-plugin",
     "crates/control-api",
     "crates/control-plugin",
     "crates/message-api",
+    "crates/message-diagnostics",
     "crates/message-plugin",
     "crates/runtime",
     "crates/eve-app",
