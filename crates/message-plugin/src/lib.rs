@@ -21,11 +21,18 @@ struct ActiveJudge {
 }
 impl RelationJudge for ActiveJudge {
     fn judge(&self, input: RelationInput) -> RelationFuture<'_> {
+        self.judge_observed(input, Arc::new(DiscardRelationObservations))
+    }
+    fn judge_observed(
+        &self,
+        input: RelationInput,
+        observer: Arc<dyn RelationObserver>,
+    ) -> RelationFuture<'_> {
         Box::pin(async move {
             if !self.active.load(Ordering::SeqCst) {
                 return Err(RelationError::Unavailable);
             }
-            let result = self.judge.judge(input).await;
+            let result = self.judge.judge_observed(input, observer).await;
             if !self.active.load(Ordering::SeqCst) {
                 return Err(RelationError::Unavailable);
             }

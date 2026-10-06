@@ -23,6 +23,7 @@ name = "eve-message-evaluate"
 path = "src/bin/message-evaluate.rs"
 
 [dependencies]
+eve-message-diagnostics = { path = "../message-diagnostics" }
 eve-agent-prompt = { path = "../agent-prompt" }
 eve-cognition-api = { path = "../cognition-api" }
 eve-cognition-plugin = { path = "../cognition-plugin" }

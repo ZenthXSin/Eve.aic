@@ -20,6 +20,7 @@ members = [
     "crates/control-api",
     "crates/control-plugin",
     "crates/message-api",
+    "crates/message-diagnostics",
     "crates/message-plugin",
     "crates/runtime",
     "crates/eve-app",

@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+eve-message-diagnostics = { path = "../message-diagnostics" }
 eve-kernel = { path = "../kernel" }
 eve-plugin-api = { path = "../plugin-api" }
 eve-example-plugins = { path = "../example-plugins" }

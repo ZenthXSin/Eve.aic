@@ -11,6 +11,9 @@ use eve_message_api::{
     RELATION_SERVICE_ID, RelationDecision, RelationError, RelationInput, RelationServiceHandle,
     TextSpan, message_schema,
 };
+use eve_message_diagnostics::{
+    BoundedRelationDiagnostics, RelationDiagnosticCounts, RelationDiagnostics,
+};
 use eve_plugin_api::{PluginId, ServiceId};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -34,7 +37,7 @@ pub const MESSAGE_EVALUATION_HELP: &str = "Eve 消息语义评估
 primary 使用明确规则→主模型；jev 使用明确规则→Jev→主模型，均复用 QQ 的判断装配。
 模型模式会发送样本中的任务和消息文本；凭据只读取 EVE_OPENAI_API_KEY / EVE_JEV_API_KEY。
 默认创建并清理独立临时配置目录；--state-dir 只能是尚不存在的新目录，运行后保留。
-不启动 QQ、任务控制或工具；不计算任务完成率，不估计不可观测的请求数或回退率。
+不启动 QQ、任务控制或工具；记录本地判断阶段与调用尝试，不推算 HTTP 请求、计费或任务完成率。
 样本上限 1 MiB、128 例；报告上限 4 MiB；--output 拒绝覆盖已有文件。";
 
 #[derive(Clone, Debug)]
@@ -196,6 +199,8 @@ struct EvaluationSummary {
     errors: usize,
     timeouts: usize,
     mean_latency_ms: f64,
+    diagnostic_counts: Option<RelationDiagnosticCounts>,
+    incomplete_diagnostics: usize,
 }
 
 #[derive(Serialize)]
@@ -212,6 +217,7 @@ struct CaseReport {
     low_confidence_or_ambiguous: bool,
     latency_ms: f64,
     error: Option<&'static str>,
+    diagnostics: RelationDiagnostics,
 }
 
 #[derive(Serialize)]
@@ -396,13 +402,17 @@ pub async fn run_message_evaluation(
             .map_err(|_| "评估判断服务类型无效。")?
             .0
             .clone();
-        let mut summary = EvaluationSummary::default();
+        let mut summary = EvaluationSummary {
+            diagnostic_counts: Some(RelationDiagnosticCounts::default()),
+            ..EvaluationSummary::default()
+        };
         let mut cases = Vec::with_capacity(dataset.cases.len());
         for case in dataset.cases {
             let start = Instant::now();
+            let diagnostics = Arc::new(BoundedRelationDiagnostics::default());
             let result = tokio::time::timeout(
                 Duration::from_millis(config.judge_timeout_ms),
-                judge.judge(case.input.clone()),
+                judge.judge_observed(case.input.clone(), diagnostics.clone()),
             )
             .await
             .unwrap_or(Err(RelationError::Timeout));
@@ -410,7 +420,22 @@ pub async fn run_message_evaluation(
                 decision.validate(&case.input)?;
                 Ok(decision)
             });
-            let report = score(case, result, start.elapsed(), config.confidence_threshold);
+            let diagnostics = diagnostics.snapshot();
+            match (&mut summary.diagnostic_counts, &diagnostics.counts) {
+                (Some(total), Some(current)) => total.accumulate(current),
+                (_, None) => {
+                    summary.incomplete_diagnostics += 1;
+                    summary.diagnostic_counts = None;
+                }
+                _ => {}
+            }
+            let report = score(
+                case,
+                result,
+                start.elapsed(),
+                config.confidence_threshold,
+                diagnostics,
+            );
             summary.cases += 1;
             summary.successful_judgements += usize::from(report.error.is_none());
             summary.exact_matches += usize::from(report.exact_match);
@@ -427,7 +452,7 @@ pub async fn run_message_evaluation(
         }
         summary.mean_latency_ms /= summary.cases as f64;
         Ok::<_, AppError>(MessageEvaluationReport {
-            schema_version: 1,
+            schema_version: 2,
             started_at_unix_ms,
             mode: match options.mode {
                 MessageJudgeMode::Off => "rules",
@@ -523,6 +548,7 @@ fn score(
     result: Result<RelationDecision, RelationError>,
     elapsed: Duration,
     threshold: u8,
+    diagnostics: RelationDiagnostics,
 ) -> CaseReport {
     let (actual, error) = match result {
         Ok(decision) => (
@@ -586,6 +612,7 @@ fn score(
         low_confidence_or_ambiguous: actual
             .iter()
             .any(|part| part.intent == MessageIntent::Ambiguous || part.confidence < threshold),
+        diagnostics,
         accepted: case.accepted,
         actual,
         latency_ms: elapsed.as_secs_f64() * 1000.0,

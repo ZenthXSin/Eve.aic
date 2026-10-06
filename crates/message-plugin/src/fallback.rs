@@ -1,6 +1,7 @@
 use crate::RulesJudge;
 use eve_config_api::ConfigService;
 use eve_message_api::*;
+use eve_message_diagnostics::RelationObservationGuard;
 use std::{
     future::{Future, poll_fn},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -33,13 +34,23 @@ impl FallbackJudge {
 
 impl RelationJudge for FallbackJudge {
     fn judge(&self, input: RelationInput) -> RelationFuture<'_> {
+        self.judge_observed(input, Arc::new(DiscardRelationObservations))
+    }
+    fn judge_observed(
+        &self,
+        input: RelationInput,
+        observer: Arc<dyn RelationObserver>,
+    ) -> RelationFuture<'_> {
         Box::pin(async move {
-            let rule = RulesJudge.judge(input.clone()).await?;
-            // 不把格式错误或混合文字的显式命令交给模型重新解释。
+            observe_relation(observer.as_ref(), RelationObservation::Supported);
+            let rule = RulesJudge
+                .judge_observed(input.clone(), observer.clone())
+                .await?;
+            // 格式错误或混合显式命令不会交给模型重新解释。
             if !rule
                 .parts
                 .iter()
-                .any(|p| p.intent == MessageIntent::Ambiguous)
+                .any(|part| part.intent == MessageIntent::Ambiguous)
                 || input
                     .message
                     .text
@@ -58,37 +69,74 @@ impl RelationJudge for FallbackJudge {
             let budget = Duration::from_millis(initial.judge_timeout_ms);
             let deadline = started + budget;
             if let Some(primary) = &self.primary {
-                // 最多使用总期限的一半，为后续内置判断留出时间。
+                let guard =
+                    RelationObservationGuard::stage(observer.clone(), RelationStage::Auxiliary);
                 let result = timeout_at(
                     started + budget / 2,
-                    contain(async { primary.judge(input.clone()).await }),
+                    contain(async {
+                        primary
+                            .judge_observed(input.clone(), observer.clone())
+                            .await
+                    }),
                 )
                 .await;
-                if let Ok(Ok(decision)) = result {
-                    let current = self
-                        .config
-                        .read_request(&request)
-                        .map_err(|_| RelationError::Unavailable)?;
-                    let settings = MessageConfig::try_from(&current)
-                        .map_err(|_| RelationError::Unavailable)?;
-                    if decision.validate(&input).is_ok()
-                        && decision.parts.iter().all(|part| {
-                            part.confidence >= settings.confidence_threshold
-                                && part.intent != MessageIntent::Ambiguous
-                        })
-                    {
-                        return Ok(decision);
+                let reason = match result {
+                    Err(_) => {
+                        guard.finish(RelationOutcome::Timeout);
+                        FallbackReason::Timeout
                     }
-                }
+                    Ok(Err(error)) => {
+                        guard.finish(error.into());
+                        error.into()
+                    }
+                    Ok(Ok(decision)) => {
+                        guard.finish(RelationOutcome::Completed);
+                        let current = self
+                            .config
+                            .read_request(&request)
+                            .map_err(|_| RelationError::Unavailable)?;
+                        let settings = MessageConfig::try_from(&current)
+                            .map_err(|_| RelationError::Unavailable)?;
+                        if decision.validate(&input).is_err() {
+                            FallbackReason::InvalidDecision
+                        } else if decision
+                            .parts
+                            .iter()
+                            .any(|part| part.intent == MessageIntent::Ambiguous)
+                        {
+                            FallbackReason::Ambiguous
+                        } else if decision
+                            .parts
+                            .iter()
+                            .any(|part| part.confidence < settings.confidence_threshold)
+                        {
+                            FallbackReason::LowConfidence
+                        } else {
+                            return Ok(decision);
+                        }
+                    }
+                };
+                observe_relation(observer.as_ref(), RelationObservation::Fallback { reason });
             }
-            let decision = timeout_at(
+            // Primary 模式直接到此处，不报告一个不存在的失败回退。
+            let guard = RelationObservationGuard::stage(observer.clone(), RelationStage::Primary);
+            let result = timeout_at(
                 deadline,
-                contain(async { self.fallback.judge(input.clone()).await }),
+                contain(async { self.fallback.judge_observed(input.clone(), observer).await }),
             )
-            .await
-            .map_err(|_| RelationError::Timeout)??;
-            decision.validate(&input)?;
-            Ok(decision)
+            .await;
+            let result = result
+                .map_err(|_| RelationError::Timeout)
+                .and_then(|result| result)
+                .and_then(|decision| {
+                    decision.validate(&input)?;
+                    Ok(decision)
+                });
+            guard.finish(match &result {
+                Ok(_) => RelationOutcome::Completed,
+                Err(error) => (*error).into(),
+            });
+            result
         })
     }
 }
