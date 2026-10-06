@@ -22,7 +22,7 @@ ARTIFACT = {
 DISABLED = "内生反思未启用。"
 NO_GOALS = "当前会话还没有待办，发送 /goal 内容 添加。"
 NO_OWNED = "当前会话未找到该待办，发送 /goals 查看。"
-HELP = "用法：/goal 待办内容、/goals、/mind [目标ID]。"
+HELP = "用法：/goal 待办内容、/goals、/mind [目标ID]、/goal-feedback 目标ID 版本 反馈内容。"
 CANCELLED = "已取消当前任务；已完成的工具操作不会撤销。"
 
 

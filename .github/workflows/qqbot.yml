@@ -67,6 +67,7 @@ jobs:
           python3 connectors/qqbot/test/message_judge_test.py
           python3 connectors/qqbot/test/web_panel_test.py
           python3 connectors/qqbot/test/cognition_test.py
+          python3 connectors/qqbot/test/goal_feedback_test.py
           python3 connectors/qqbot/test/memory_test.py
           python3 connectors/qqbot/test/learning_test.py
           python3 connectors/qqbot/test/segment_test.py

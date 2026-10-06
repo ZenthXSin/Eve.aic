@@ -42,7 +42,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --web-listen 127.0.0.1:8765 开启本机控制面板，默认关闭；专用 EVE_WEB_TOKEN 为 32 至 256 字节可见 ASCII，不使用模型密钥。
 浏览器访问启动时打印的本机地址，输入令牌后查看会话、任务与请求取消；面板不启动新任务，不提供停服或删除入口。
 --training 默认开启主动提问；/train start、/train stop、/train status 按会话启停/查询。
---cognition 开启本地内生反思；/goal 内容保存待办，/goals 查看待办，/mind [目标ID] 查询草稿。
+--cognition 开启本地内生反思；/goal 内容保存待办，/goals 查看版本，/mind [目标ID] 查询当前草稿；/goal-feedback 目标ID 版本 反馈内容触发重新评估。
 --memory 开启有来源的交互记忆；/remember 内容、/memories [页码]、/correct-memory ID 内容、/forget ID。
 --memory-learning 需同时 --memory；每会话至少 3 条新经历触发首批，后续默认间隔 5 分钟（--learning-cooldown-ms 可调整），单次启动最多 4 次请求。
 --self-learning 开启持续自主学习（同时开启记忆、提炼和分段）；模型自评至少 80 且引用至少两条真实交互时自动确认。
