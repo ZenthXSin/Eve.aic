@@ -69,6 +69,41 @@ impl Process {
         }
         output
     }
+
+    async fn stop_after_saved_goal(mut self, root: &Path, parent: &str, expected: &str) {
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let snapshot = cognition(root);
+                if snapshot["state"]["goals"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .any(|goal| {
+                        goal["source"]["kind"] == "Inference"
+                            && goal["source"]["reference"] == parent
+                            && goal["status"] == expected
+                            && goal["feedback"].is_object()
+                    })
+                {
+                    break;
+                }
+                assert!(
+                    self.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+                    "认知子进程在保存期望终态前退出：{snapshot}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("认知子进程未保存期望终态");
+        // 仅终止自己持有的 Child，且必须先观察到反馈已持久化。随后新进程
+        // 验证终态与会话记录，避免把运行窗口到时导致的取消误当成校验失败。
+        self.0.as_mut().unwrap().kill().unwrap();
+        let output = self.0.take().unwrap().wait_with_output().unwrap();
+        for bytes in [&output.stdout, &output.stderr] {
+            assert!(!String::from_utf8_lossy(bytes).contains(KEY));
+        }
+    }
 }
 impl Drop for Process {
     fn drop(&mut self) {
@@ -293,25 +328,52 @@ async fn derived_reflections_inherit_user_visibility_without_cross_user_context(
 #[tokio::test]
 async fn malformed_or_empty_artifacts_block_child_and_are_not_retried_after_restart() {
     // 验证结构质量；不把合法 JSON 当作建议真实性或现实目标完成的证据。
-    for text in [
+    for (index, text) in [
         "这段不是 JSON",
         r#"{"summary":" ","next_step":"","needs_user_input":true}"#,
         r#"{"summary":"摘要","summary":"覆盖","next_step":"询问条件","needs_user_input":true}"#,
         r#"{"summary":"摘要","next_step":"询问条件","needs_user_input":true,"execute":true}"#,
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let root = fixture();
-        let mut server = Server::start(vec![Reply::json(final_response(text))]).await;
+        let mut response = Reply::json(final_response(text));
+        if index == 0 {
+            // 回归触发条件：响应晚于原测试的 1 秒运行窗口；完成门必须是
+            // 已保存 Blocked，不能依赖机器能否在 1 秒内完成 HTTP 与验证。
+            response.body_delay = Duration::from_millis(1500);
+        }
+        let mut server = Server::start(vec![response]).await;
         add(root.path(), &server.url, "invalid-parent", PARENT, "owner").await;
-        let first = execute(root.path(), &server.url, "1").await;
-        assert_eq!(first["loop"]["model_requests"], 1);
-        assert_eq!(first["loop"]["completed"], 0);
-        assert_eq!(first["loop"]["blocked"], 1);
-        assert_zero_tools(&first);
+        let mut command = command(root.path(), &server.url);
+        command.args(["run", "--seconds", "30", "--max-executions", "1"]);
+        let process = Process::start(command);
         assert_no_tools(&server.next().await.body);
+        process
+            .stop_after_saved_goal(root.path(), "invalid-parent", "Blocked")
+            .await;
+        assert!(server.requests.try_recv().is_err());
         let view = show(root.path(), &server.url, "invalid-parent").await;
         assert_eq!(view["goal"]["status"], "Waiting");
         assert_eq!(view["reflections"].as_array().unwrap().len(), 1);
         assert_eq!(view["reflections"][0]["goal"]["status"], "Blocked");
+        assert_eq!(
+            view["reflections"][0]["goal"]["block_reason"],
+            "Invalidated"
+        );
+        assert_eq!(
+            view["reflections"][0]["goal"]["feedback"]["commit"],
+            "Completed"
+        );
+        assert_eq!(
+            view["reflections"][0]["goal"]["feedback"]["verification_met"],
+            false
+        );
+        assert_eq!(
+            view["reflections"][0]["goal"]["feedback"]["started_tools"],
+            0
+        );
         assert!(view["reflections"][0]["artifact"].is_null());
         let restarted = execute(root.path(), &server.url, "1").await;
         assert_eq!(restarted["loop"]["submitted"], 0);
