@@ -1,11 +1,14 @@
 //! 可信本地主机的记忆只读入口；只经公开插件契约读取，不向模型授予管理能力。
 use crate::{AppError, memory_cli_view as view};
 use eve_kernel::{Kernel, KernelServices};
-use eve_memory_api::{MEMORY_PLUGIN_ID, MemoryAdmin, MemoryScope, validate_id};
-use eve_memory_plugin::MemoryPlugin;
+use eve_memory_api::{
+    DEFAULT_RECALL_RESULTS, MEMORY_PLUGIN_ID, MemoryAdmin, MemoryRecallFactory,
+    MemoryRecallRequest, MemoryScope, validate_id,
+};
+use eve_memory_plugin::{LexicalMemoryRecall, MemoryPlugin};
 use eve_plugin_api::PluginId;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
+use std::{collections::BTreeMap, ffi::OsString, path::PathBuf, sync::Arc};
 
 pub const MEMORY_CLI_HELP: &str = "Eve 本地记忆只读入口
 用法：eve-memory --state-dir 已有目录 [--database-config 凭据文件] 命令
@@ -13,9 +16,11 @@ pub const MEMORY_CLI_HELP: &str = "Eve 本地记忆只读入口
   --channel 通道 --session 会话 --user 用户 list [--page 1] [--page-size 20]
   --channel 通道 --session 会话 --user 用户 show --id 偏好ID [--page 1] [--page-size 20]
   --channel 通道 --session 会话 --user 用户 evidence --id 证据ID
+  --channel 通道 --session 会话 --user 用户 recall --query 关键词 [--limit 5]
   scopes [--page 1] [--page-size 20]
-list/show/evidence 可加 --include-content，显式显示至多 512 UTF-8 字节的正文预览。
+list/show/evidence/recall 可加 --include-content，显式显示至多 512 UTF-8 字节的正文预览。
 默认只输出标识、来源、计数和有效状态，不输出正文。页大小为 1 至 50。
+recall 为本地词法召回，查询上限 1024 UTF-8 字节，最多 1 至 8 项；分数不代表事实可信度。
 作用域三个字段必须完整提供；scopes 只供可信本地管理员枚举已有作用域。
 命令不调用模型，不修改记忆，不初始化新状态目录；使用现有后端排他锁。
 PostgreSQL 只接受已绑定的状态目录与匹配配置；不会自动迁移或清空损坏状态。
@@ -29,6 +34,7 @@ enum MemoryCommand {
     List,
     Show { id: String },
     Evidence { id: String },
+    Recall { request: MemoryRecallRequest },
     Scopes,
 }
 
@@ -39,6 +45,7 @@ impl MemoryCommand {
             Self::List => "list",
             Self::Show { .. } => "show",
             Self::Evidence { .. } => "evidence",
+            Self::Recall { .. } => "recall",
             Self::Scopes => "scopes",
         }
     }
@@ -71,7 +78,7 @@ impl MemoryCliOptions {
             let arg = arg
                 .into_string()
                 .map_err(|_| "记忆命令参数必须为 UTF-8。")?;
-            if ["status", "list", "show", "evidence", "scopes"].contains(&arg.as_str()) {
+            if ["status", "list", "show", "evidence", "recall", "scopes"].contains(&arg.as_str()) {
                 if command.replace(arg).is_some() {
                     return Err("只能指定一个记忆命令。".into());
                 }
@@ -92,6 +99,8 @@ impl MemoryCliOptions {
                 "--id",
                 "--page",
                 "--page-size",
+                "--query",
+                "--limit",
             ]
             .contains(&arg.as_str())
             {
@@ -135,6 +144,16 @@ impl MemoryCliOptions {
                 }
             }
             "scopes" => MemoryCommand::Scopes,
+            "recall" => {
+                let query = fields.remove("--query").ok_or("recall 缺少 --query。")?;
+                if !query.chars().any(char::is_alphanumeric) {
+                    return Err("召回查询须包含文字或数字，不能只有空白、标点或符号。".into());
+                }
+                let limit = positive_number(fields.remove("--limit"), DEFAULT_RECALL_RESULTS)?;
+                let request = MemoryRecallRequest { query, limit };
+                request.validate()?;
+                MemoryCommand::Recall { request }
+            }
             _ => unreachable!(),
         };
         let scope = if matches!(command, MemoryCommand::Scopes) {
@@ -226,13 +245,32 @@ pub async fn run_memory_cli(options: MemoryCliOptions) -> Result<Value, AppError
             view::scopes(admin.scopes()?, options.page, options.page_size)?
         } else {
             let scope = options.scope.as_ref().ok_or("记忆作用域缺失。")?;
-            let snapshot = admin.reader(scope.clone())?.snapshot()?;
-            if snapshot.scope != *scope {
-                return Err("记忆读取返回了不匹配的作用域。".into());
-            }
             report["scope"] = serde_json::to_value(scope)?;
-            report["revision"] = json!(snapshot.revision);
-            match &options.command {
+            if let MemoryCommand::Recall { request } = &options.command {
+                let recall = LexicalMemoryRecall::new(Arc::new(admin)).reader(scope.clone())?;
+                let response = recall.recall(request)?;
+                response.validate_for(scope, request)?;
+                report["revision"] = json!(response.revision);
+                let hits: Vec<_> = response.hits.into_iter().map(|hit| {
+                    let mut value = json!({
+                        "score": hit.score,
+                        "source": hit.source,
+                        "excerpt_bytes": hit.excerpt.len(),
+                        "excerpt_truncated": hit.excerpt_truncated,
+                    });
+                    if options.include_content {
+                        value["content"] = json!({"text": hit.excerpt, "truncated": hit.excerpt_truncated});
+                    }
+                    value
+                }).collect();
+                json!({"limit": request.limit, "hit_count": hits.len(), "hits": hits, "ranking": "lexical", "score_is_confidence": false})
+            } else {
+                let snapshot = admin.reader(scope.clone())?.snapshot()?;
+                if snapshot.scope != *scope {
+                    return Err("记忆读取返回了不匹配的作用域。".into());
+                }
+                report["revision"] = json!(snapshot.revision);
+                match &options.command {
                 MemoryCommand::Status => view::status(&snapshot),
                 MemoryCommand::List => view::list(
                     &snapshot,
@@ -250,7 +288,8 @@ pub async fn run_memory_cli(options: MemoryCliOptions) -> Result<Value, AppError
                 MemoryCommand::Evidence { id } => {
                     view::evidence(&snapshot, id, options.include_content)?
                 }
-                MemoryCommand::Scopes => unreachable!(),
+                MemoryCommand::Scopes | MemoryCommand::Recall { .. } => unreachable!(),
+                }
             }
         };
         report
