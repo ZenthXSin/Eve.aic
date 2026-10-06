@@ -1,8 +1,5 @@
-#[path = "../../../llm-openai/tests/support/mod.rs"]
-mod http_support;
-
 use super::*;
-use crate::config;
+use crate::{config, http_support};
 use eve_config_api::{
     ApplyMode, CONFIG_PLUGIN_ID, CONFIG_SERVICE_ID, ConfigAdmin, ConfigRequest, ConfigResult,
     ConfigServiceHandle, NamespaceValues, model_roles_schema,
