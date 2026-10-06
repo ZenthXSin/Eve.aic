@@ -257,6 +257,7 @@ dependencies = [
  "eve-config-plugin",
  "eve-control-api",
  "eve-control-plugin",
+ "eve-file-observer",
  "eve-jev",
  "eve-kernel",
  "eve-learning-api",
@@ -292,6 +293,7 @@ dependencies = [
 name = "eve-cognition-api"
 version = "0.1.0"
 dependencies = [
+ "ring",
  "serde",
  "serde_json",
 ]
@@ -330,6 +332,7 @@ dependencies = [
  "eve-cognition-api",
  "eve-kernel",
  "eve-plugin-api",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
@@ -386,6 +389,17 @@ version = "0.1.0"
 dependencies = [
  "eve-config-api",
  "eve-plugin-api",
+]
+
+[[package]]
+name = "eve-file-observer"
+version = "0.1.0"
+dependencies = [
+ "eve-cognition-api",
+ "libc",
+ "ring",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

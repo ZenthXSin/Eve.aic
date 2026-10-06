@@ -1,5 +1,7 @@
 //! 统一认知状态的公开契约；不包含存储、调度、模型或执行权限实现。
+mod file_observation;
 mod goal_feedback;
+pub use file_observation::*;
 pub use goal_feedback::*;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt, sync::Arc};
