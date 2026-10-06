@@ -1,16 +1,96 @@
 use eve_cognition_api::{
-    CognitionAdmin, CognitionError, CognitiveEvent, CognitiveEventKind, CognitiveState, Drive,
-    ExecutionBudget, FILE_OBSERVATION_CHANNEL, FileObservation, Goal, GoalStatus, GoalUserFeedback,
-    MAX_RECORDS, Source, SourceKind,
+    CognitionAdmin, CognitionError, CognitiveEvent, CognitiveEventKind, CognitiveSnapshot,
+    CognitiveState, Drive, ExecutionBudget, FILE_OBSERVATION_CHANNEL, FileObservation, Goal,
+    GoalStatus, GoalUserFeedback, MAX_RECORDS, Source, SourceKind,
 };
 use eve_cognition_loop_api::{
+    AgendaBlocker, AgendaEvaluation, AgendaExclusion, AgendaExclusionReason, DrivePolicy,
     EndogenousOptions, EndogenousPlannerFactory, EndogenousPlanning, EndogenousReport, LoopError,
     LoopResult,
 };
 use ring::digest::{Context, SHA256};
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+};
+
+/// 预览本次反思派生的父目标议程；与 reconcile 使用相同准入和证据排序。
+///
+/// 不保存候选、不消耗派生名额，也不修改已过期的旧草稿。不可见目标不会出现于
+/// 诊断；可见但来源未授权的目标会标记 ScopeDenied。启动派生上限只阻止准入，
+/// 不抹去剩余候选；在途执行由执行循环收尾，不阻止预先准备新的反思候选。
+pub fn evaluate_reflection_agenda(
+    snapshot: &CognitiveSnapshot,
+    options: &EndogenousOptions,
+    created: u16,
+    now_ms: u64,
+) -> LoopResult<AgendaEvaluation> {
+    options.validate()?;
+    if now_ms == 0 {
+        return Err(LoopError::InvalidInput);
+    }
+    if snapshot.subject_id != options.scope.subject_id {
+        return Err(CognitionError::SubjectMismatch.into());
+    }
+    let mut eligible = Vec::new();
+    let mut excluded = Vec::new();
+    for parent in snapshot.state.goals.values() {
+        if !parent.visibility.visible_to(&options.scope.access) {
+            continue;
+        }
+        let reason = if !options.scope.permits(parent) {
+            Some(AgendaExclusionReason::ScopeDenied)
+        } else if parent.status != GoalStatus::Waiting {
+            Some(AgendaExclusionReason::NotReady)
+        } else if parent.expires_at_ms.is_some_and(|end| now_ms >= end) {
+            Some(AgendaExclusionReason::Expired)
+        } else if parent.budget.validate().is_err() {
+            Some(AgendaExclusionReason::InvalidBudget)
+        } else if current_reflection(&snapshot.state, &snapshot.subject_id, parent)?.is_some() {
+            Some(AgendaExclusionReason::AlreadyDerived)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            excluded.push(AgendaExclusion {
+                goal_id: parent.id.clone(),
+                reason,
+            });
+        } else {
+            eligible.push(parent.clone());
+        }
+    }
+    let ranked = crate::EvidenceDrivePolicy.rank_with_state(snapshot, &eligible, now_ms)?;
+    let mut unique = BTreeSet::new();
+    for item in &ranked {
+        if !eligible.iter().any(|goal| goal.id == item.goal_id)
+            || !unique.insert(item.goal_id.as_str())
+            || item.strength > 100
+            || eve_cognition_api::validate_text(&item.reason).is_err()
+        {
+            return Err(LoopError::InvalidInput);
+        }
+    }
+    for parent in &eligible {
+        if !unique.contains(parent.id.as_str()) {
+            excluded.push(AgendaExclusion {
+                goal_id: parent.id.clone(),
+                reason: AgendaExclusionReason::PolicyOmitted,
+            });
+        }
+    }
+    excluded.sort_by(|left, right| left.goal_id.cmp(&right.goal_id));
+    Ok(AgendaEvaluation {
+        evaluated_at_ms: now_ms,
+        revision: snapshot.revision,
+        ranked,
+        excluded,
+        blocker: (created >= options.max_derivations)
+            .then_some(AgendaBlocker::DerivationLimitReached),
+    })
+}
 
 /// 默认反思规划器装配；宿主也可注入其它公开工厂实现。
 #[derive(Clone, Copy, Debug, Default)]
@@ -62,26 +142,20 @@ impl EndogenousPlanner {
         }
         let mut created = self.created.lock().map_err(|_| LoopError::Unavailable)?;
         let snapshot = self.admin.snapshot()?;
-        if snapshot.subject_id != self.options.scope.subject_id {
-            return Err(CognitionError::SubjectMismatch.into());
-        }
+        let agenda = evaluate_reflection_agenda(&snapshot, &self.options, *created, now_ms)?;
         let mut state = snapshot.state;
         let invalidated_goal_ids =
             self.invalidate_ready(&snapshot.subject_id, &mut state, now_ms)?;
-        let mut selected = None;
-        for parent in state.goals.values().filter(|parent| {
-            *created < self.options.max_derivations
-                && parent.status == GoalStatus::Waiting
-                && parent.expires_at_ms.is_none_or(|expires| now_ms < expires)
-                && self.options.scope.permits(parent)
-        }) {
-            let ids = DerivedIds::new(&snapshot.subject_id, parent);
-            if !ids.already_derived(&state, parent)? {
-                selected = Some((parent.clone(), ids));
-                break;
-            }
-        }
-        let Some((parent, ids)) = selected else {
+        let selected = agenda
+            .ranked
+            .first()
+            .filter(|_| agenda.blocker.is_none())
+            .map(|candidate| {
+                let parent = state.goals[&candidate.goal_id].clone();
+                let ids = DerivedIds::new(&snapshot.subject_id, &parent);
+                (parent, ids, candidate)
+            });
+        let Some((parent, ids, ranked)) = selected else {
             let revision = if invalidated_goal_ids.is_empty() {
                 snapshot.revision
             } else {
@@ -148,8 +222,8 @@ impl EndogenousPlanner {
                 id: ids.drive,
                 visibility: parent.visibility.clone(),
                 goal_ids: vec![ids.goal.clone()],
-                strength: parent.priority,
-                reason: "未验证待办可先生成一份只思考的反思草稿；父任务仍等待确认".into(),
+                strength: ranked.strength,
+                reason: ranked.reason.clone(),
                 evaluated_at_ms: now_ms,
                 valid_until_ms,
             },
@@ -310,10 +384,6 @@ impl DerivedIds {
             input: format!("eve.reflection.input.{hash}"),
             created: format!("eve.reflection.created.{hash}"),
         }
-    }
-
-    fn already_derived(&self, state: &CognitiveState, parent: &Goal) -> LoopResult<bool> {
-        Ok(self.current(state, parent)?.is_some())
     }
 
     fn current<'a>(

@@ -1,6 +1,10 @@
 //! 有界认知业务插件；使用公开状态/执行契约，模型装配留在组合层。
+mod agenda;
+pub use agenda::evaluate_agenda;
 mod endogenous;
-pub use endogenous::{EndogenousPlanner, ReflectionPlannerFactory, current_reflection};
+pub use endogenous::{
+    EndogenousPlanner, ReflectionPlannerFactory, current_reflection, evaluate_reflection_agenda,
+};
 mod policy;
 mod reflection;
 use eve_cognition_api::*;
@@ -10,12 +14,13 @@ use eve_plugin_api::{
     Cleanup, Event, EventId, LogEntry, LogLevel, Plugin, PluginContext, PluginDependency,
     PluginError, PluginFuture, PluginManifest, PluginResult, ServiceId, cleanup,
 };
-pub use policy::{EchoReceiptVerifier, PriorityDrivePolicy};
+pub use policy::{
+    EchoReceiptVerifier, EvidenceDrivePolicy, PriorityDrivePolicy, ReflectionDrivePolicy,
+};
 pub use reflection::{
     MAX_REFLECTION_JSON_BYTES, MAX_REFLECTION_TEXT_BYTES, ReflectionArtifact, ReflectionVerifier,
 };
 use std::{
-    collections::BTreeSet,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -225,49 +230,20 @@ impl Worker {
                 .lock()
                 .map_err(|_| LoopError::Unavailable)?
                 .submitted;
-            if submitted >= u64::from(self.options.max_executions)
-                || snapshot
-                    .state
-                    .goals
-                    .values()
-                    .any(|goal| goal.status == GoalStatus::Executing)
-            {
+            let evaluation = evaluate_agenda(
+                &snapshot,
+                &self.options,
+                self.policy.as_ref(),
+                self.verifier.as_ref(),
+                submitted,
+                time,
+            )?;
+            if evaluation.blocker.is_some() || evaluation.ranked.is_empty() {
                 self.running
                     .update(|stats| stats.idle_ticks = stats.idle_ticks.saturating_add(1));
                 continue;
             }
-            let goals: Vec<_> = snapshot
-                .state
-                .goals
-                .values()
-                .filter(|goal| {
-                    goal.is_ready(time)
-                        && self.options.scope.permits(goal)
-                        && self.verifier.supports(goal)
-                })
-                .cloned()
-                .collect();
-            if goals.is_empty() {
-                self.running
-                    .update(|stats| stats.idle_ticks = stats.idle_ticks.saturating_add(1));
-                continue;
-            }
-            let ranked = self.policy.rank(&goals, time)?;
-            if ranked.is_empty() {
-                self.running
-                    .update(|stats| stats.idle_ticks = stats.idle_ticks.saturating_add(1));
-                continue;
-            }
-            let mut unique = BTreeSet::new();
-            for item in &ranked {
-                if !goals.iter().any(|goal| goal.id == item.goal_id)
-                    || !unique.insert(&item.goal_id)
-                    || item.strength > 100
-                    || validate_text(&item.reason).is_err()
-                {
-                    return Err(LoopError::InvalidInput);
-                }
-            }
+            let ranked = evaluation.ranked;
             let selected = &ranked[0].goal_id;
             let mut state = snapshot.state;
             state
