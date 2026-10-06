@@ -811,14 +811,21 @@ pub async fn run_cognition_with_planner_factory(
     factory: Arc<dyn EndogenousPlannerFactory>,
 ) -> Result<Value, AppError> {
     let backends = KernelServices {
-        state: crate::storage::open_state_store(
-            &options.state_directory,
-            options.database_config.as_deref(),
-        )?,
+        state: if matches!(&options.command, CognitionCommand::Agenda) {
+            crate::storage::open_existing_state_store(
+                &options.state_directory,
+                options.database_config.as_deref(),
+            )?
+        } else {
+            crate::storage::open_state_store(
+                &options.state_directory,
+                options.database_config.as_deref(),
+            )?
+        },
         ..KernelServices::default()
     };
     // 只读评估保留原始 Executing 状态，不启动会恢复并改写快照的认知插件。
-    // 存储后端的排他锁和首次绑定初始化仍由受信本地宿主处理。
+    // 只打开已有后端，保留排他锁，不初始化目录、数据库绑定或 SQL schema。
     if matches!(&options.command, CognitionCommand::Agenda) {
         return agenda(&read_cognitive_snapshot(backends.state.as_ref(), SUBJECT)?);
     }
