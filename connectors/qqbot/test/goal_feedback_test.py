@@ -105,16 +105,18 @@ class GoalFeedbackAcceptance(unittest.TestCase):
         return self.work / f"reflection-{number}.arrived"
 
     def message(self, message_id, text, contains=(), excludes=(), expected_type="reply",
-                scope="c2c", user="user-1", target=None):
+                scope="c2c", user="user-1", target=None, delivery_ok=True):
         return {"id": message_id, "text": text, "scope": scope, "user_id": user,
                 "target_id": target or (user if scope == "c2c" else "group-1"),
-                "expected_type": expected_type, "contains": list(contains), "excludes": list(excludes)}
+                "expected_type": expected_type, "contains": list(contains), "excludes": list(excludes),
+                "delivery_ok": delivery_ok}
 
     def send(self, message, count=1):
         script = [{"send": message}, {"wait_command": {"id": message["id"],
                   "type": message["expected_type"], "count": count}}]
         if message["expected_type"] == "reply":
-            script.append({"wait_sent": message["id"]})
+            script.append({"wait_receipt": {"id": message["id"],
+                          "state": "Sent" if message["delivery_ok"] else "Failed"}})
         return script
 
     def capture(self, name="before", source="goal"):
@@ -131,7 +133,7 @@ class GoalFeedbackAcceptance(unittest.TestCase):
         return self.message(message_id, "/goal-feedback {{" + parent + ".id}} {{" + parent +
                             ".revision}} " + text, contains=["反馈已保存"], **route)
 
-    def run_eve(self, script, budget=2, cognition=True, app="1904159860"):
+    def run_eve(self, script, budget=2, cognition=True, app="1904159860", expected_failed=0):
         self.runs += 1
         self.run_release = threading.Event()
         events_file = self.work / f"events-{self.runs}.jsonl"
@@ -168,7 +170,7 @@ class GoalFeedbackAcceptance(unittest.TestCase):
         summary = json.loads(stdout)
         self.assertTrue(summary["closed"])
         self.assertFalse(summary["terminal_error"])
-        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["failed"], expected_failed)
         return summary
 
     def assert_feedback_state(self, expected_requests=2):
@@ -256,6 +258,59 @@ class GoalFeedbackAcceptance(unittest.TestCase):
                                             contains=[THIRD], excludes=[OLD, NEW])))
         self.assertEqual(len(self.requests), 3)
         self.assertEqual(self.cognition(), current_state)
+
+    def test_successive_inflight_feedback_cancels_unstarted_draft_and_only_executes_latest(self):
+        newest = "时间预算改为十分钟；必须先归类文具。"
+        self.gates = {1: "release-first"}
+        self.run_eve([
+            *self.add(), {"wait_file": str(self.arrived(1))},
+            *self.send(self.feedback()), self.capture("after"), self.wait_child("after", "Ready"),
+            *self.send(self.feedback("feedback-latest", parent="after", text=newest)),
+            self.capture("latest"), self.wait_child("after", "Cancelled"),
+            *self.send(self.message("mind-latest-pending", "/mind {{latest.id}}", excludes=[OLD, NEW])),
+            {"touch": str(self.gate("release-first"))}, self.wait_child("latest"),
+            *self.send(self.message("mind-latest", "/mind {{latest.id}}", contains=[NEW], excludes=[OLD])),
+        ], budget=3)
+        self.assertEqual(len(self.requests), 2)
+        latest_input = self.requests[1]["body"]["messages"][-1]["content"]
+        self.assertIn(newest, latest_input)
+        self.assertIn(FEEDBACK, latest_input)
+        children = [goal for goal in self.cognition()["goals"].values()
+                    if goal["source"]["kind"] == "Inference"]
+        self.assertEqual(sorted(goal["status"] for goal in children),
+                         ["Cancelled", "Completed", "Completed"])
+        cancelled = next(goal for goal in children if goal["status"] == "Cancelled")
+        self.assertIsNone(cancelled["execution"])
+        self.assertIsNone(cancelled["feedback"])
+        persisted = self.cognition()
+        parent_id = self.bindings["latest"]["id"]
+        self.run_eve(self.send(self.message("latest-restart", "/mind " + parent_id,
+                                           contains=[NEW], excludes=[OLD])))
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(self.cognition(), persisted)
+
+    def test_failed_confirmation_preserves_feedback_and_restart_never_resends_or_replans_it(self):
+        self.run_eve([
+            *self.add(), self.wait_child(),
+            *self.send(self.feedback(delivery_ok=False)), self.capture("after"), self.wait_child("after"),
+            *self.send(self.message("mind-after-failed-confirmation", "/mind {{after.id}}",
+                                   contains=[NEW], excludes=[OLD])),
+        ], expected_failed=1)
+        self.assert_feedback_state()
+        receipts = self.documents()["eve.channel.qqbot"]["receipts.v1"]["entries"]
+        self.assertEqual(next(row for row in receipts if row["message"]["id"] == "feedback")["state"],
+                         "Failed")
+        persisted = self.cognition()
+        parent_id = self.bindings["after"]["id"]
+        self.run_eve([
+            *self.send(self.message("feedback", "duplicate failed confirmation", expected_type="finish")),
+            *self.send(self.message("mind-after-restart", "/mind " + parent_id,
+                                   contains=[NEW], excludes=[OLD])),
+        ])
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(self.cognition(), persisted)
+        self.assertFalse(any(event.get("type") == "reply" and event.get("id") == "feedback"
+                             for event in self.events))
 
     def test_exhausted_budget_still_saves_feedback_and_next_process_only_runs_new_revision(self):
         self.run_eve([
