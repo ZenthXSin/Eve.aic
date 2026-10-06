@@ -527,3 +527,150 @@ async fn stopping_after_authentication_but_before_body_completion_never_admits_c
     assert!(service.cancels.lock().unwrap().is_empty());
     panel.stop().await.unwrap();
 }
+
+struct Judgments {
+    calls: Mutex<Vec<(Option<u64>, usize)>>,
+}
+impl PanelService for Judgments {
+    fn status(&self) -> PanelResult<PanelStatus> {
+        Err(PanelError::Unavailable)
+    }
+    fn sessions(&self, _: Option<&str>, _: usize) -> PanelResult<Page<SessionSummary>> {
+        Err(PanelError::Unavailable)
+    }
+    fn tasks(&self, _: Option<&str>, _: usize) -> PanelResult<Page<TaskSummary>> {
+        Err(PanelError::Unavailable)
+    }
+    fn session(&self, _: &SessionKey, _: Option<u64>, _: usize) -> PanelResult<SessionDetail> {
+        Err(PanelError::Unavailable)
+    }
+    fn cancel(&self, _: &GenerationKey) -> PanelResult<CancelStatus> {
+        Err(PanelError::Unavailable)
+    }
+    fn judgments(&self, before: Option<u64>, limit: usize) -> PanelResult<JudgmentLog> {
+        self.calls.lock().unwrap().push((before, limit));
+        Ok(JudgmentLog {
+            mode: "primary",
+            capacity: 128,
+            recorded_total: 2,
+            evicted: 0,
+            items: vec![JudgmentView {
+                sequence: 2,
+                finished_at_unix_ms: 1_700_000_000_000,
+                elapsed_micros: 900,
+                result: "decided",
+                failure: None,
+                intents: vec!["cancel"],
+                coverage: "complete",
+                counts: Some(JudgmentCounts {
+                    rules: 1,
+                    auxiliary: 0,
+                    primary: 0,
+                    classifier_calls: 0,
+                    model_provider_calls: 0,
+                    fallbacks: 0,
+                }),
+                steps: vec![JudgmentStep {
+                    kind: "stage",
+                    name: "rules",
+                    outcome: Some("completed"),
+                    elapsed_micros: Some(12),
+                }],
+                fallbacks: vec![],
+            }],
+            next_before: Some(2),
+        })
+    }
+}
+
+#[tokio::test]
+async fn judgment_log_is_authenticated_bounded_and_unavailable_by_default() {
+    let client = client();
+    // 旧实现未覆盖新方法时，默认是明确的不可用，而不是空列表。
+    let legacy = Arc::new(Service::default());
+    let panel_legacy = panel(legacy.clone()).await;
+    assert_code(
+        client
+            .get(url(&panel_legacy, "/api/judgments"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+    )
+    .await;
+    panel_legacy.stop().await.unwrap();
+
+    let service = Arc::new(Judgments {
+        calls: Mutex::new(vec![]),
+    });
+    let panel = LocalPanel::bind(
+        PanelConfig {
+            address: "127.0.0.1:0".parse().unwrap(),
+            token: TOKEN.into(),
+        },
+        service.clone(),
+    )
+    .await
+    .unwrap();
+    assert_code(
+        client
+            .get(url(&panel, "/api/judgments"))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+    )
+    .await;
+    for query in [
+        "limit=0",
+        "limit=51",
+        "limit=-1",
+        "before=0",
+        "before=-1",
+        "before=bad",
+        "before=1&before=2",
+        "after=1",
+    ] {
+        assert_code(
+            client
+                .get(url(&panel, &format!("/api/judgments?{query}")))
+                .bearer_auth(TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+        )
+        .await;
+    }
+    assert!(service.calls.lock().unwrap().is_empty());
+    let response = client
+        .get(url(&panel, "/api/judgments"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(body["mode"], "primary");
+    assert_eq!(body["items"][0]["intents"], json!(["cancel"]));
+    assert_eq!(body["items"][0]["failure"], Value::Null);
+    assert_eq!(body["items"][0]["counts"]["rules"], 1);
+    assert_eq!(body["items"][0]["steps"][0]["name"], "rules");
+    assert_eq!(body["next_before"], 2);
+    client
+        .get(url(&panel, "/api/judgments?before=2&limit=50"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        *service.calls.lock().unwrap(),
+        vec![(None, 25), (Some(2), 50)]
+    );
+    panel.stop().await.unwrap();
+}

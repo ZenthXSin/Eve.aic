@@ -27,7 +27,22 @@
   let cancelConfirm = null;
   let cancelPending = null;
   let cancelFeedback = null;
+  let judgments = [];
+  let judgmentMeta = null;
+  let judgmentBefore = null;
+  let judgmentPages = 1;
+  let judgmentLoading = false;
+  let selectedJudgment = null;
   const controllers = new Set();
+  const judgmentLabels = {
+    result: { decided: "已判定", failed: "判断失败", dropped: "已丢弃" },
+    outcome: { completed: "完成", unavailable: "不可用", protocol: "格式无效", timeout: "超时", panicked: "内部异常", dropped: "被丢弃" },
+    intent: { supplement: "补充", correction: "纠正", answer: "回答", new_task: "新任务", cancel: "取消", continue: "继续", unrelated: "无关", ambiguous: "含混", pause: "暂停", resume: "恢复" },
+    coverage: { complete: "完整", unsupported: "判断器不支持观察", overflow: "事件超出上限", invalid: "事件不完整", unreported: "未报告" },
+    step: { rules: "明确命令规则", auxiliary: "辅助判断", primary: "主模型判断", classifier_call: "分类器调用", model_provider_call: "模型 Provider 调用" },
+    fallback: { unavailable: "不可用", protocol: "格式无效", timeout: "超时", panicked: "内部异常", invalid_decision: "决定无效", ambiguous: "含混", low_confidence: "置信度低" },
+    mode: { off: "仅明确命令规则", primary: "主模型自然判断", jev: "Jev 自然判断" },
+  };
 
   class ApiError extends Error {
     constructor(message, silent = false) { super(message); this.silent = silent; }
@@ -157,6 +172,19 @@
     cancelConfirm = null;
     cancelPending = null;
     cancelFeedback = null;
+    judgments = [];
+    judgmentMeta = null;
+    judgmentBefore = null;
+    judgmentPages = 1;
+    judgmentLoading = false;
+    selectedJudgment = null;
+    $("judgments-list").replaceChildren();
+    $("judgment-detail").replaceChildren();
+    $("judgment-count").textContent = "0";
+    $("judgments-empty").textContent = "正在读取判断记录…";
+    $("judgments-empty").hidden = false;
+    $("judgments-more").hidden = true;
+    showError("judgments-error", "");
     $("tasks-list").replaceChildren();
     $("sessions-list").replaceChildren();
     $("task-detail").replaceChildren();
@@ -492,11 +520,134 @@
     parent.append(message);
   }
 
+  function label(map, value, fallback = "未知") { return typeof value === "string" && map[value] ? map[value] : fallback; }
+  function micros(value) {
+    if (!Number.isSafeInteger(value) || value < 0) return "未知";
+    return value < 1000 ? `${value} 微秒` : `${(value / 1000).toLocaleString("zh-CN", { maximumFractionDigits: 1 })} 毫秒`;
+  }
+  function clock(value) {
+    const time = new Date(value);
+    return Number.isSafeInteger(value) && !Number.isNaN(time.getTime()) ? time.toLocaleTimeString("zh-CN", { hour12: false }) : "时间未知";
+  }
+  function validJudgment(item) {
+    return item && Number.isSafeInteger(item.sequence) && item.sequence > 0 && typeof item.result === "string" &&
+      Array.isArray(item.intents) && Array.isArray(item.steps) && Array.isArray(item.fallbacks) && typeof item.coverage === "string";
+  }
+  function judgmentBadge(item) {
+    const style = item.result === "decided" ? "good" : item.result === "failed" ? "bad" : "warning";
+    return node("span", `badge ${style}`, label(judgmentLabels.result, item.result));
+  }
+  function judgmentSummary(item) {
+    if (item.result === "decided") return item.intents.map((intent) => label(judgmentLabels.intent, intent)).join("、") || "无意图";
+    if (item.result === "failed") return `原因：${label(judgmentLabels.outcome, item.failure)}`;
+    return "调用方在结束前丢弃，不代表远端已停止";
+  }
+
+  async function loadJudgments(more = false) {
+    if (judgmentLoading) return;
+    judgmentLoading = true;
+    const requestEpoch = epoch;
+    renderJudgments();
+    try {
+      const query = new URLSearchParams({ limit: "25" });
+      if (more && judgmentBefore !== null) query.set("before", String(judgmentBefore));
+      const body = await api(`/api/judgments?${query.toString()}`);
+      if (epoch !== requestEpoch) return;
+      if (!body || !Array.isArray(body.items) || !body.items.every(validJudgment) ||
+        !(body.next_before === null || Number.isSafeInteger(body.next_before))) {
+        throw new ApiError("判断记录格式无效，请刷新重试。");
+      }
+      judgments = more ? judgments.concat(body.items) : body.items;
+      judgmentPages = more ? judgmentPages + 1 : 1;
+      judgmentBefore = body.next_before;
+      judgmentMeta = body;
+      showError("judgments-error", "");
+    } catch (error) {
+      if (epoch !== requestEpoch) return;
+      if (error instanceof ApiError && error.message.startsWith("当前服务暂不可用")) {
+        showError("judgments-error", "当前实例未提供判断诊断。");
+      } else reportError("judgments-error", error);
+    } finally {
+      if (epoch === requestEpoch) {
+        judgmentLoading = false;
+        renderJudgments();
+      }
+    }
+  }
+
+  function renderJudgments() {
+    $("judgments-list").replaceChildren();
+    for (const item of judgments) {
+      const button = node("button", `record-button${selectedJudgment === item.sequence ? " selected" : ""}`);
+      button.type = "button";
+      button.setAttribute("aria-pressed", String(selectedJudgment === item.sequence));
+      const top = node("div", "record-topline");
+      top.append(node("span", "record-name", `第 ${count(item.sequence)} 次 · ${clock(item.finished_at_unix_ms)}`), judgmentBadge(item));
+      button.append(top, node("p", "record-meta", judgmentSummary(item)), node("p", "record-meta", `本机耗时 ${micros(item.elapsed_micros)} · 观察${label(judgmentLabels.coverage, item.coverage)}`));
+      button.addEventListener("click", () => { selectedJudgment = item.sequence; renderJudgments(); });
+      $("judgments-list").append(button);
+    }
+    if (judgmentMeta) {
+      const mode = label(judgmentLabels.mode, judgmentMeta.mode);
+      const evicted = judgmentMeta.evicted > 0 ? `，已移出最早的 ${count(judgmentMeta.evicted)} 次` : "";
+      $("judgments-scope").textContent = `${mode}。本进程共记录 ${count(judgmentMeta.recorded_total)} 次，最多保留最近 ${count(judgmentMeta.capacity)} 次${evicted}；只保存在内存中，重启后清空。`;
+    }
+    $("judgment-count").textContent = count(judgments.length);
+    $("judgments-empty").hidden = judgments.length > 0;
+    $("judgments-empty").textContent = judgmentLoading ? "正在读取判断记录…" : !$("judgments-error").hidden ? "暂时无法读取判断记录。" : "本次启动后还没有消息判断。明确命令或自然判断发生后会显示在这里。";
+    $("judgments-more").hidden = judgmentBefore === null;
+    $("judgments-more").disabled = judgmentLoading;
+    renderJudgmentDetail();
+  }
+
+  function renderJudgmentDetail() {
+    if (selectedJudgment === null) {
+      emptyDetail("judgment-detail", "◇", "选择一次判断", "查看阶段、本地调用尝试、回退原因与耗时。不显示消息正文或身份。");
+      return;
+    }
+    const item = judgments.find((entry) => entry.sequence === selectedJudgment);
+    if (!item) {
+      emptyDetail("judgment-detail", "◇", "记录已不在当前列表", "该判断可能已被更新的记录移出。请从列表重新选择。");
+      return;
+    }
+    const heading = node("div", "detail-heading");
+    heading.append(judgmentBadge(item), node("h2", "", `第 ${count(item.sequence)} 次判断`), node("p", "", `结束于 ${clock(item.finished_at_unix_ms)}（本机时钟）`));
+    const body = node("div", "detail-body");
+    const grid = node("dl", "detail-grid");
+    grid.append(
+      detailPair("结果", judgmentSummary(item)),
+      detailPair("本机耗时", micros(item.elapsed_micros)),
+      detailPair("观察覆盖", label(judgmentLabels.coverage, item.coverage)),
+      detailPair("回退", item.fallbacks.length ? item.fallbacks.map((reason) => label(judgmentLabels.fallback, reason)).join("、") : "无"),
+    );
+    const counts = item.counts;
+    if (counts) {
+      grid.append(
+        detailPair("阶段开始次数", `规则 ${count(counts.rules)} · 辅助 ${count(counts.auxiliary)} · 主模型 ${count(counts.primary)}`),
+        detailPair("本地调用尝试", `分类器 ${count(counts.classifier_calls)} · 模型 Provider ${count(counts.model_provider_calls)}`),
+      );
+    } else {
+      grid.append(detailPair("计数", "观察不完整，不显示计数"));
+    }
+    body.append(grid);
+    const steps = node("ol", "judgment-steps");
+    for (const step of item.steps) {
+      const row = node("li", "judgment-step");
+      const outcome = step.outcome === null ? "未观察到结束" : label(judgmentLabels.outcome, step.outcome);
+      row.append(node("span", "record-name", label(judgmentLabels.step, step.name)), node("span", "record-meta", `${step.kind === "attempt" ? "调用尝试" : "阶段"} · ${outcome} · ${step.elapsed_micros === null ? "耗时未知" : micros(step.elapsed_micros)}`));
+      steps.append(row);
+    }
+    if (item.steps.length) body.append(steps);
+    body.append(node("p", "truncation-note", "调用尝试是本机适配器的调用次数，不代表网络请求、远端收到的请求、token 或费用；耗时是本机经过时间。"));
+    $("judgment-detail").replaceChildren(heading, body);
+  }
+
   function switchView(next) {
     view = next;
     $("tasks-view").hidden = next !== "tasks";
     $("sessions-view").hidden = next !== "sessions";
-    $("page-title").textContent = next === "tasks" ? "任务状态" : "会话记录";
+    $("judgments-view").hidden = next !== "judgments";
+    $("page-title").textContent = next === "tasks" ? "任务状态" : next === "sessions" ? "会话记录" : "判断诊断";
     for (const item of document.querySelectorAll("[data-view]")) {
       const active = item.dataset.view === next;
       item.classList.toggle("active", active);
@@ -504,6 +655,7 @@
       else item.removeAttribute("aria-current");
     }
     if (next === "sessions" && sessions.length === 0) void loadSessions();
+    if (next === "judgments") void loadJudgments();
   }
 
   async function refresh() {
@@ -516,6 +668,8 @@
       const results = await Promise.allSettled([
         api("/api/status").then(renderStatus),
         loadTasks(),
+        // 停在判断页且未加载更早记录时刷新首页；判断错误显示在本页，不影响全局状态。
+        view === "judgments" && judgmentPages === 1 ? loadJudgments() : Promise.resolve(),
       ]);
       if (epoch !== requestEpoch) return;
       const failure = results.find((result) => result.status === "rejected");
@@ -587,9 +741,11 @@
       void loadSessions();
       if (selectedSession) void loadSession(selectedSession, selectedSessionBefore);
     }
+    if (view === "judgments" && judgmentPages > 1) void loadJudgments();
   });
   $("tasks-more").addEventListener("click", () => { void loadTasks(true).catch(() => {}); });
   $("sessions-more").addEventListener("click", () => { void loadSessions(true); });
+  $("judgments-more").addEventListener("click", () => { void loadJudgments(true); });
   for (const item of document.querySelectorAll("[data-view]")) item.addEventListener("click", () => switchView(item.dataset.view));
   document.addEventListener("visibilitychange", () => {
     clearTimeout(pollTimer);

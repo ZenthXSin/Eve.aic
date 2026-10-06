@@ -38,6 +38,7 @@
       <nav aria-label="控制台导航">
         <button class="nav-item active" type="button" data-view="tasks" aria-current="page"><span aria-hidden="true">◎</span>任务状态</button>
         <button class="nav-item" type="button" data-view="sessions"><span aria-hidden="true">▤</span>会话记录</button>
+        <button class="nav-item" type="button" data-view="judgments"><span aria-hidden="true">◇</span>判断诊断</button>
       </nav>
       <div class="sidebar-foot"><span class="small-dot" aria-hidden="true"></span>本机运行实例<p>会话与任务来自当前服务。<br>不提供新建任务或停服操作。</p></div>
     </aside>
@@ -77,6 +78,16 @@
           <div class="list-footer"><button id="sessions-more" class="button secondary" type="button" hidden>加载更多会话</button></div>
         </div>
         <section id="session-detail" class="detail-panel" aria-label="会话详情"><div class="empty-detail"><span class="empty-symbol" aria-hidden="true">▤</span><h2>选择一段会话</h2><p>仅展示用户与助手文字，工具参数和结果不在此展示。</p></div></section>
+      </section>
+      <section id="judgments-view" class="workspace" aria-label="判断诊断" hidden>
+        <div class="list-panel">
+          <div class="panel-heading"><div><h2>实时消息判断</h2><p id="judgments-scope">本进程最近的消息判断，只保存在内存中，重启后清空。</p></div><span id="judgment-count" class="count-pill">0</span></div>
+          <p id="judgments-error" class="inline-error" role="alert" hidden></p>
+          <div id="judgments-list" class="record-list" aria-label="判断列表"></div>
+          <p id="judgments-empty" class="empty-list">正在读取判断记录…</p>
+          <div class="list-footer"><button id="judgments-more" class="button secondary" type="button" hidden>加载更早记录</button></div>
+        </div>
+        <section id="judgment-detail" class="detail-panel" aria-label="判断详情"><div class="empty-detail"><span class="empty-symbol" aria-hidden="true">◇</span><h2>选择一次判断</h2><p>查看阶段、本地调用尝试、回退原因与耗时。不显示消息正文或身份。</p></div></section>
       </section>
       <footer class="page-footer">每 3 秒刷新通道与任务 · 页面隐藏时暂停自动刷新</footer>
     </main>

@@ -16,4 +16,4 @@ EVE_WEB_ARTIFACTS=/tmp/eve-web-browser-artifacts \
 node connectors/qqbot/test/web_panel_browser.mjs
 ```
 
-脚本自己启动真实 Eve 进程、环回模型和 QQ 替身，使用合成令牌与合成正文。验证登录、仅内存令牌、任务取消确认、历史分页、截断标注、正文按纯文本展示、移动端布局、退出与刷新重新登录；截图保存为 `desktop.png` 和 `mobile.png`。不读取实际 QQ/模型凭据，不接触已有状态目录，停止只作用于脚本持有的子进程。
+脚本自己启动真实 Eve 进程、环回模型和 QQ 替身，使用合成令牌与合成正文。验证登录、仅内存令牌、任务取消确认、历史分页、截断标注、正文按纯文本展示、判断诊断（明确命令规则的一次判断、不显示正文或身份）、移动端布局、退出与刷新重新登录；截图保存为 `desktop.png`、`judgments.png`、`mobile-judgments.png` 和 `mobile.png`。不读取实际 QQ/模型凭据，不接触已有状态目录，停止只作用于脚本持有的子进程。

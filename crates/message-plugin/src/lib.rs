@@ -40,9 +40,13 @@ impl RelationJudge for ActiveJudge {
         })
     }
 }
+/// 宿主在启动时包装最终判断器（例如记录实时诊断）；不能绕过停止后的不可用检查。
+pub type JudgeDecorator =
+    Arc<dyn Fn(Arc<dyn RelationJudge>) -> Arc<dyn RelationJudge> + Send + Sync>;
 pub struct RelationPlugin {
     manifest: PluginManifest,
     source: JudgeSource,
+    decorator: Option<JudgeDecorator>,
 }
 enum JudgeSource {
     Direct(Arc<dyn RelationJudge>),
@@ -56,7 +60,12 @@ impl RelationPlugin {
         Ok(Self {
             manifest: PluginManifest::new(RELATION_PLUGIN_ID, env!("CARGO_PKG_VERSION"))?,
             source: JudgeSource::Direct(judge),
+            decorator: None,
         })
+    }
+    pub fn with_judge_decorator(mut self, decorator: JudgeDecorator) -> Self {
+        self.decorator = Some(decorator);
+        self
     }
     /// 可选判断器可关闭；复杂判断由宿主注入，插件只读取公开配置并组合回退。
     pub fn with_fallback(
@@ -87,6 +96,7 @@ impl Plugin for RelationPlugin {
                 fallback: fallback.clone(),
             },
         };
+        let decorator = self.decorator.clone();
         Box::pin(async move {
             let judge: Arc<dyn RelationJudge> = match source {
                 JudgeSource::Direct(judge) => judge,
@@ -100,6 +110,10 @@ impl Plugin for RelationPlugin {
                         .clone();
                     Arc::new(FallbackJudge::new(config, primary, fallback))
                 }
+            };
+            let judge = match decorator {
+                Some(decorate) => decorate(judge),
+                None => judge,
             };
             let active = Arc::new(AtomicBool::new(true));
             let closing = active.clone();

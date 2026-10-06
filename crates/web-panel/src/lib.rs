@@ -105,6 +105,7 @@ impl LocalPanel {
             .route("/api/tasks", get(tasks))
             .route("/api/session", post(session))
             .route("/api/cancel", post(cancel))
+            .route("/api/judgments", get(judgments))
             .fallback(|| async { error(StatusCode::NOT_FOUND, "not_found") })
             .layer(DefaultBodyLimit::max(16384))
             .layer(middleware::from_fn_with_state(shared.clone(), protect))
@@ -384,6 +385,28 @@ async fn cancel(
     }
     match shared.service.cancel(&body.target) {
         Ok(status) => (StatusCode::ACCEPTED, Json(json!({"status": status}))).into_response(),
+        Err(e) => failure(e),
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JudgmentListing {
+    before: Option<u64>,
+    #[serde(default = "page_size")]
+    limit: usize,
+}
+async fn judgments(
+    State(shared): State<Arc<Shared>>,
+    query: Result<Query<JudgmentListing>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Ok(Query(page)) = query else {
+        return error(StatusCode::BAD_REQUEST, "invalid_query");
+    };
+    if !(1..=50).contains(&page.limit) || page.before == Some(0) {
+        return error(StatusCode::BAD_REQUEST, "invalid_query");
+    }
+    match shared.service.judgments(page.before, page.limit) {
+        Ok(value) => Json(value).into_response(),
         Err(e) => failure(e),
     }
 }
