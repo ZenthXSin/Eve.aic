@@ -35,13 +35,15 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: 检查评估脚本语法
-        run: python3 -m py_compile benchmarks/cognition/evaluate.py
+      - name: 检查评估脚本与报告边界
+        run: |
+          python3 -m py_compile benchmarks/cognition/evaluate.py
+          python3 -m unittest discover -s benchmarks/cognition -p 'test_*.py'
       - name: 构建认知入口
         run: |
           rustup toolchain install 1.89.0 --profile minimal
           cargo +1.89.0 build -p eve-app --bin eve-cognition --locked
-      - name: 运行七项本机替身进程评估
+      - name: 运行本机替身认知场景评估
         run: |
           python3 benchmarks/cognition/evaluate.py \
             --binary target/debug/eve-cognition \

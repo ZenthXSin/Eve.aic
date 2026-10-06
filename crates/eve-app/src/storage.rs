@@ -1,7 +1,7 @@
 //! 组合层选择文件或本地 SQL 状态；目录和数据库绑定都由宿主持有。
 use crate::AppError;
 use eve_kernel::backends::FileStateStore;
-use eve_plugin_api::PluginId;
+use eve_plugin_api::{PluginError, PluginId, PluginResult, StateStore};
 use eve_state_postgres::{ConnectionOptions, PostgresStateStore};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -25,6 +25,18 @@ struct DatabaseStore {
     // 保留同 state-dir 的本地排他锁；数据库连接另有跨目录的数据库级排他锁。
     postgres: PostgresStateStore,
     _directory: FileStateStore,
+}
+
+struct ExistingReadOnlyStore(Arc<dyn StateStore>);
+
+impl StateStore for ExistingReadOnlyStore {
+    fn get(&self, namespace: &PluginId, key: &str) -> PluginResult<Option<Vec<u8>>> {
+        self.0.get(namespace, key)
+    }
+
+    fn set(&self, _namespace: &PluginId, _key: String, _value: Vec<u8>) -> PluginResult<()> {
+        Err(PluginError::State("只读状态入口拒绝写入。".into()))
+    }
 }
 
 impl eve_plugin_api::StateStore for DatabaseStore {
@@ -66,7 +78,49 @@ pub(crate) fn open_state_store(
     directory_path: &Path,
     database_config: Option<&Path>,
 ) -> Result<Arc<dyn eve_plugin_api::StateStore>, AppError> {
+    open_state_store_mode(directory_path, database_config, false)
+}
+
+/// 只读打开已有后端。允许创建排他锁文件，但不创建目录、快照、绑定或 SQL schema。
+/// 已有宿主持锁时仍拒绝打开；不能用此入口绕过后端的单宿主约束。
+pub(crate) fn open_existing_state_store(
+    directory_path: &Path,
+    database_config: Option<&Path>,
+) -> Result<Arc<dyn StateStore>, AppError> {
+    let state = open_state_store_mode(directory_path, database_config, true)?;
+    Ok(Arc::new(ExistingReadOnlyStore(state)))
+}
+
+fn require_existing_state(directory_path: &Path, database: bool) -> Result<(), AppError> {
+    if !fs::metadata(directory_path).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err("状态目录不存在或不可读；只读入口不会初始化新目录。".into());
+    }
+    let filename = if database {
+        "state.backend.json"
+    } else {
+        "state.json"
+    };
+    let metadata = fs::symlink_metadata(directory_path.join(filename))
+        .map_err(|_| "缺少既有状态快照或后端绑定；只读入口不会初始化新状态。")?;
+    if !metadata.file_type().is_file() {
+        return Err("既有状态快照或后端绑定必须为普通文件。".into());
+    }
+    Ok(())
+}
+
+fn open_state_store_mode(
+    directory_path: &Path,
+    database_config: Option<&Path>,
+    existing_only: bool,
+) -> Result<Arc<dyn StateStore>, AppError> {
+    if existing_only {
+        require_existing_state(directory_path, database_config.is_some())?;
+    }
     let directory = FileStateStore::open(directory_path)?;
+    if existing_only {
+        // 获取目录锁后重新检查，不能将等待打开期间消失的快照当作空库。
+        require_existing_state(directory.directory(), database_config.is_some())?;
+    }
     let marker = directory.directory().join("state.backend.json");
     let marker_exists = match fs::symlink_metadata(&marker) {
         Ok(_) => true,
@@ -107,8 +161,14 @@ pub(crate) fn open_state_store(
         if saved != binding {
             return Err("数据库目标与该目录的持久化绑定不一致，未切换数据库。".into());
         }
+    } else if existing_only {
+        return Err("缺少既有数据库绑定；只读入口不会创建绑定。".into());
     }
-    let postgres = PostgresStateStore::connect(connection)?;
+    let postgres = if existing_only {
+        PostgresStateStore::connect_read_only(connection)?
+    } else {
+        PostgresStateStore::connect(connection)?
+    };
     if !marker_exists {
         let mut file_options = OpenOptions::new();
         file_options.create_new(true).write(true);

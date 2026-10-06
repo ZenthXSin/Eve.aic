@@ -78,8 +78,12 @@ jobs:
           PY
       - name: 验证持久化、独占、格式保护与断连关闭
         run: cargo +1.89.0 test -p eve-state-postgres --test persistence --locked -- --ignored --test-threads=1
+      - name: 验证只读后端保留数据且不初始化或修复 schema
+        run: cargo +1.89.0 test -p eve-state-postgres --test read_only --locked -- --ignored --test-threads=1
       - name: 验证实际认知进程与 SQL 恢复
         run: cargo +1.89.0 test -p eve-app --test cognition_postgres --locked -- --ignored --test-threads=1
+      - name: 验证实际只读记忆进程与 SQL 来源记录
+        run: cargo +1.89.0 test -p eve-app --test memory_cli_postgres --locked -- --ignored --test-threads=1
       - name: 验证实际 QQ 与终端进程的 SQL 恢复
         run: cargo +1.89.0 test -p eve-app --test qq_postgres --locked -- --ignored --test-threads=1
       - name: 清理临时连接文件

@@ -5,6 +5,8 @@ mod config;
 mod console;
 mod error;
 mod input;
+mod memory_cli;
+mod memory_cli_view;
 mod message_evaluation;
 mod models;
 mod qq_cognition;
@@ -29,6 +31,7 @@ pub use cognition::{
 };
 pub use console::{ChatOutputError, ChatRunError};
 pub use error::AppFailure;
+pub use memory_cli::{MEMORY_CLI_HELP, MemoryCliOptions, run_memory_cli};
 pub use message_evaluation::{
     MESSAGE_EVALUATION_HELP, MessageEvaluationOptions, MessageEvaluationReport,
     message_evaluation_json, run_message_evaluation,
