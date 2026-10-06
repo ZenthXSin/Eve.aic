@@ -3,6 +3,11 @@ use eve_memory_api::{InteractionEvidence, MemoryError, MemoryScope, MemorySnapsh
 use serde::{Deserialize, Serialize};
 use std::{fmt, future::Future, pin::Pin};
 
+mod decisions;
+pub use decisions::{
+    DecisionReason, LearningDecision, LearningDecisionAction, LearningDecisionRecord,
+};
+
 pub const LEARNING_PLUGIN_ID: &str = "eve.learning";
 pub const LEARNING_STATE_KEY: &str = "learning.v1";
 pub const MAX_JOBS: usize = 128;
@@ -12,6 +17,8 @@ pub const MAX_INPUT_BYTES: usize = 32768;
 pub const MAX_OUTPUT_BYTES: usize = 8192;
 pub const MAX_CANDIDATES: usize = 3;
 pub const MAX_CANDIDATE_BYTES: usize = 1024;
+/// 决策历史不自动淘汰；达到容量后须保留已有记录并拒绝新增。
+pub const MAX_DECISIONS: usize = 1024;
 pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
 pub const CANDIDATE_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 pub type LearningResult<T> = Result<T, LearningError>;
@@ -111,6 +118,23 @@ pub enum LearningOutcome {
 /// 仅可信宿主持有。不发布跨作用域管理能力给模型或不受信插件。
 pub trait LearningAdmin: Send + Sync {
     fn snapshot(&self, scope: &MemoryScope) -> LearningResult<LearningSnapshot>;
+    /// 只返回当前可信宿主绑定范围的决策，按范围内连续 sequence 排序。
+    /// 决策记录是提交前的意图，不证明偏好已经写入记忆。
+    fn decisions(&self, _scope: &MemoryScope) -> LearningResult<Vec<LearningDecisionRecord>> {
+        Err(LearningError::Unavailable)
+    }
+    /// 原子追加决策；宿主之后仍须重新校验候选、来源和当前记忆，并用记忆 CAS 提交。
+    /// 同一范围内该候选的最新记录与本次 same_outcome 时复用原记录，零写入；重放时间和记忆修订
+    /// 变化不产生新记录。同一候选的有效策略、证据或动作变化可以追加新决策。
+    /// 存储失败不能静默丢弃历史，也不能把意图标记成记忆提交成功。
+    fn record_decision(
+        &self,
+        _scope: &MemoryScope,
+        _decision: LearningDecision,
+        _at_ms: u64,
+    ) -> LearningResult<LearningDecisionRecord> {
+        Err(LearningError::Unavailable)
+    }
     /// 原子保存 Running 与确切消费证据，成功返回后才可进行一次模型调用。
     /// 仅新增 CompletedInteraction 触发；失败、空候选、重启都不再消费同一证据。
     fn reserve(
@@ -136,6 +160,10 @@ pub trait PreferenceExtractor: Send + Sync {
 /// 纯判断，不持有写能力；候选、批次和当前记忆均由可信宿主绑定到同一范围。
 /// 返回允许不代表提交成功，也不授予工具、身份合并或自改代码能力。
 pub trait AutoConfirmationPolicy: Send + Sync {
+    /// 持久记录决策来源；自定义策略修改判断规则时应使用新的稳定版本。
+    fn version(&self) -> &str {
+        "legacy-auto-confirm-v1"
+    }
     fn allows(
         &self,
         candidate: &PreferenceCandidate,
@@ -143,6 +171,42 @@ pub trait AutoConfirmationPolicy: Send + Sync {
         memory: &MemorySnapshot,
         now_ms: u64,
     ) -> LearningResult<bool>;
+    /// 兼容原有布尔策略，默认只产生确认或暂缓；宿主负责再次约束和提交。
+    fn decide(
+        &self,
+        candidate: &PreferenceCandidate,
+        batch: &LearningBatch,
+        memory: &MemorySnapshot,
+        now_ms: u64,
+    ) -> LearningResult<LearningDecision> {
+        batch
+            .scope
+            .validate()
+            .map_err(|_| LearningError::InvalidInput)?;
+        if candidate.batch_id != batch.id || memory.scope != batch.scope {
+            return Err(LearningError::InvalidInput);
+        }
+        let allowed = self.allows(candidate, batch, memory, now_ms)?;
+        let decision = LearningDecision {
+            candidate_id: candidate.id.clone(),
+            batch_id: batch.id.clone(),
+            policy_version: self.version().to_owned(),
+            memory_revision: memory.revision,
+            evidence_ids: candidate.draft.evidence_ids.clone(),
+            action: if allowed {
+                LearningDecisionAction::Confirm
+            } else {
+                LearningDecisionAction::Defer
+            },
+            reason: if allowed {
+                DecisionReason::Eligible
+            } else {
+                DecisionReason::PolicyDenied
+            },
+        };
+        decision.validate()?;
+        Ok(decision)
+    }
 }
 /// 固定跨插件关联键；实际确认来源保存真实用户命令，或自主模式下所引用的完成交互。
 pub fn preference_id(candidate_id: &str) -> String {

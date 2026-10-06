@@ -1,0 +1,18 @@
+[
+  {"id":"new-literal","candidate":"先给结论","previous":null,"origin":null,"old_source_revision":null,"confidence":90,"expired":false,"expected":"Confirm"},
+  {"id":"exact-duplicate","candidate":"先给结论","previous":"先给结论","origin":"automatic","old_source_revision":1,"confidence":90,"expired":false,"expected":"Reject"},
+  {"id":"whitespace-and-ending","candidate":" 先给结论。 ","previous":"先给结论","origin":"automatic","old_source_revision":1,"confidence":90,"expired":false,"expected":"Reject"},
+  {"id":"paragraph-alias","candidate":"回复最多三段","previous":"回复最多3段","origin":"automatic","old_source_revision":1,"confidence":90,"expired":false,"expected":"Reject"},
+  {"id":"new-paragraph-value","candidate":"回复最多4段","previous":"回复最多3段","origin":"automatic","old_source_revision":1,"confidence":90,"expired":false,"expected":"Update"},
+  {"id":"manual-blocks-update","candidate":"回复最多4段","previous":"回复最多3段","origin":"manual","old_source_revision":null,"confidence":90,"expired":false,"expected":"Defer"},
+  {"id":"revoked-same-text","candidate":"回复最多3段","previous":"回复最多3段","origin":"revoked","old_source_revision":1,"confidence":90,"expired":false,"expected":"Reject"},
+  {"id":"revoked-key-value-change","candidate":"回复最多4段","previous":"回复最多3段","origin":"revoked","old_source_revision":1,"confidence":90,"expired":false,"expected":"Defer"},
+  {"id":"source-revision-stale","candidate":"回复最多4段","previous":"回复最多3段","origin":"automatic","old_source_revision":50,"confidence":90,"expired":false,"expected":"Defer"},
+  {"id":"confidence-below-threshold","candidate":"先给结论","previous":null,"origin":null,"old_source_revision":null,"confidence":79,"expired":false,"expected":"Defer"},
+  {"id":"expired-candidate","candidate":"先给结论","previous":null,"origin":null,"old_source_revision":null,"confidence":90,"expired":true,"expected":"Reject"},
+  {"id":"unknown-synonym-not-guessed","candidate":"先说结论","previous":"先给结论","origin":"automatic","old_source_revision":1,"confidence":90,"expired":false,"expected":"Confirm"},
+  {"id":"internal-space-not-deleted","candidate":"先给 结论","previous":"先给结论","origin":"automatic","old_source_revision":1,"confidence":90,"expired":false,"expected":"Confirm"},
+  {"id":"pause-value-update","candidate":"段间停顿50%","previous":"段间停顿100%","origin":"automatic","old_source_revision":1,"confidence":90,"expired":false,"expected":"Update"},
+  {"id":"pause-value-duplicate","candidate":"段间停顿短一点","previous":"段间停顿50%","origin":"automatic","old_source_revision":1,"confidence":90,"expired":false,"expected":"Reject"},
+  {"id":"unrelated-preference-preserved","candidate":"先给结论","previous":"回复最多3段","origin":"automatic","old_source_revision":1,"confidence":90,"expired":false,"expected":"Confirm"}
+]
