@@ -3,9 +3,11 @@ use eve_llm_api::{
     ChatMessage, ChatRole, LlmError, LlmModelResolver, LlmProvider, ModelRequest, ModelResponse,
 };
 use eve_message_api::{
-    IntentPart, RelationDecision, RelationError, RelationFuture, RelationInput, RelationJudge,
-    TextSpan,
+    DiscardRelationObservations, IntentPart, RelationAttempt, RelationDecision, RelationError,
+    RelationFuture, RelationInput, RelationJudge, RelationObservation, RelationObserver,
+    RelationOutcome, TextSpan, observe_relation,
 };
+use eve_message_diagnostics::RelationObservationGuard;
 use serde::Deserialize;
 use serde_json::json;
 use std::{
@@ -68,7 +70,15 @@ struct WirePart {
 
 impl RelationJudge for LlmRelationJudge {
     fn judge(&self, input: RelationInput) -> RelationFuture<'_> {
+        self.judge_observed(input, Arc::new(DiscardRelationObservations))
+    }
+    fn judge_observed(
+        &self,
+        input: RelationInput,
+        observer: Arc<dyn RelationObserver>,
+    ) -> RelationFuture<'_> {
         Box::pin(async move {
+            observe_relation(observer.as_ref(), RelationObservation::Supported);
             input
                 .message
                 .validate()
@@ -115,13 +125,21 @@ impl RelationJudge for LlmRelationJudge {
                     (selected.provider, Some(deadline))
                 }
             };
+            // 记录公开 Provider complete 的本地调用；不推断其内部 HTTP 重试或计费。
+            let guard =
+                RelationObservationGuard::attempt(observer, RelationAttempt::ModelProviderCall);
             let response = match deadline {
                 Some(deadline) => timeout_at(deadline, provider.complete(request))
                     .await
-                    .map_err(|_| RelationError::Timeout)?,
-                None => provider.complete(request).await,
-            }
-            .map_err(relation_error)?;
+                    .map_err(|_| RelationError::Timeout)
+                    .and_then(|result| result.map_err(relation_error)),
+                None => provider.complete(request).await.map_err(relation_error),
+            };
+            guard.finish(match &response {
+                Ok(_) => RelationOutcome::Completed,
+                Err(error) => (*error).into(),
+            });
+            let response = response?;
             let ModelResponse::Final { text } = response else {
                 return Err(RelationError::Protocol);
             };

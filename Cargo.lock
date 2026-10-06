@@ -216,6 +216,7 @@ dependencies = [
  "eve-memory-api",
  "eve-memory-plugin",
  "eve-message-api",
+ "eve-message-diagnostics",
  "eve-message-plugin",
  "eve-plugin-api",
  "eve-qqbot-plugin",
@@ -340,6 +341,7 @@ version = "0.1.0"
 dependencies = [
  "eve-control-api",
  "eve-message-api",
+ "eve-message-diagnostics",
  "eve-session-api",
  "reqwest",
  "serde",
@@ -441,6 +443,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-message-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "eve-control-api",
+ "eve-message-api",
+ "eve-session-api",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "eve-message-plugin"
 version = "0.1.0"
 dependencies = [
@@ -448,6 +461,7 @@ dependencies = [
  "eve-control-api",
  "eve-llm-api",
  "eve-message-api",
+ "eve-message-diagnostics",
  "eve-plugin-api",
  "eve-session-api",
  "serde_json",
@@ -503,6 +517,7 @@ dependencies = [
  "eve-llm-api",
  "eve-llm-openai",
  "eve-message-api",
+ "eve-message-diagnostics",
  "eve-message-plugin",
  "eve-plugin-api",
  "eve-session-api",

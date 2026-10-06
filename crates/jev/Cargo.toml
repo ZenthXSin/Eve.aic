@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+eve-message-diagnostics = { path = "../message-diagnostics" }
 eve-message-api = { path = "../message-api" }
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde.workspace = true

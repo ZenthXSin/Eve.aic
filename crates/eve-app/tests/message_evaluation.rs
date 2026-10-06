@@ -250,7 +250,7 @@ async fn default_rules_runs_all_public_cases_offline_and_reports_hash_and_utf8_s
         .env("EVE_OPENAI_MODEL_ROLE", "unsupported-model-role")
         .env("EVE_MODELS_JEV_ENABLED", "invalid-boolean");
     let result = report(&run(cmd).await);
-    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["schema_version"], 2);
     assert_eq!(result["mode"], "rules");
     assert!(result["started_at_unix_ms"].as_u64().unwrap() > 1_700_000_000_000);
     let config_hash = result["configuration_sha256"].as_str().unwrap();
@@ -262,6 +262,18 @@ async fn default_rules_runs_all_public_cases_offline_and_reports_hash_and_utf8_s
     assert_eq!(result["summary"]["false_cancellations"], 0);
     assert_eq!(result["summary"]["exact_matches"], 16);
     assert_eq!(result["summary"]["missed_corrections"], 4);
+    assert_eq!(
+        result["summary"]["diagnostic_counts"],
+        json!({"rules_started":30,"auxiliary_started":0,"primary_started":0,"classifier_calls":0,"model_provider_calls":0,"fallbacks":0})
+    );
+    assert_eq!(result["summary"]["incomplete_diagnostics"], 0);
+    assert!(
+        result["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|case| case["diagnostics"]["coverage"] == "complete")
+    );
     let bytes = std::fs::read(repository().join("benchmarks/messages/cases.json")).unwrap();
     let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
     let expected_hash: String = digest
@@ -490,6 +502,10 @@ async fn primary_scoring_distinguishes_labels_spans_cancellation_and_low_confide
     let result = report(&run(cmd).await);
     let summary = &result["summary"];
     assert_eq!(summary["cases"], 5);
+    assert_eq!(
+        summary["diagnostic_counts"],
+        json!({"rules_started":5,"auxiliary_started":0,"primary_started":5,"classifier_calls":0,"model_provider_calls":5,"fallbacks":0})
+    );
     assert_eq!(summary["exact_matches"], 3);
     assert_eq!(summary["label_matches"], 4);
     assert_eq!(summary["raw_span_matches"], 3);
@@ -537,6 +553,20 @@ async fn jev_uses_its_own_key_and_falls_back_once_for_low_confidence_or_protocol
     cmd.args(["--mode", "jev", "--dataset"]).arg(input);
     let result = report(&run(cmd).await);
     assert_eq!(result["summary"]["exact_matches"], 4);
+    assert_eq!(
+        result["summary"]["diagnostic_counts"],
+        json!({"rules_started":4,"auxiliary_started":3,"primary_started":2,"classifier_calls":3,"model_provider_calls":2,"fallbacks":2})
+    );
+    for (index, reason) in [(2, "low_confidence"), (3, "protocol")] {
+        let events = result["cases"][index]["diagnostics"]["events"]
+            .as_array()
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event["event"] == "fallback" && event["reason"] == reason)
+        );
+    }
     assert_eq!(result["summary"]["errors"], 0);
     for _ in 0..3 {
         let body = assert_request(
@@ -583,6 +613,21 @@ async fn jev_and_primary_share_total_timeout_and_record_the_failed_correction() 
     assert_eq!(result["summary"]["timeouts"], 1);
     assert_eq!(result["summary"]["missed_corrections"], 1);
     assert_eq!(result["cases"][0]["error"], "timeout");
+    assert_eq!(
+        result["summary"]["diagnostic_counts"],
+        json!({"rules_started":1,"auxiliary_started":1,"primary_started":1,"classifier_calls":1,"model_provider_calls":1,"fallbacks":1})
+    );
+    let events = result["cases"][0]["diagnostics"]["events"]
+        .as_array()
+        .unwrap();
+    assert!(events.iter().any(|event| event["event"] == "finished"
+        && event["operation"]["kind"] == "attempt"
+        && event["operation"]["name"] == "classifier_call"
+        && event["outcome"] == "dropped"));
+    assert!(events.iter().any(|event| event["event"] == "finished"
+        && event["operation"]["kind"] == "stage"
+        && event["operation"]["name"] == "auxiliary"
+        && event["outcome"] == "timeout"));
     assert!(result["cases"][0]["actual"].as_array().unwrap().is_empty());
     let elapsed = result["cases"][0]["latency_ms"].as_f64().unwrap();
     assert!((250.0..1500.0).contains(&elapsed), "{elapsed} ms");

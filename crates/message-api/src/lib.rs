@@ -1,4 +1,6 @@
 //! 消息关系与动作报告定义层，不包含判断模型、执行器或磁盘实现。
+mod diagnostics;
+pub use diagnostics::*;
 use eve_config_api::{ConfigError, ConfigField, ConfigKind, ConfigSchema, ConfigSnapshot};
 use eve_control_api::{ControlPhase, ControlReport, GenerationKey};
 use serde::{Deserialize, Serialize};
@@ -151,6 +153,18 @@ pub enum RelationError {
 }
 pub trait RelationJudge: Send + Sync {
     fn judge(&self, input: RelationInput) -> RelationFuture<'_>;
+
+    /// 兼容旧实现，但明确标记不可观测；不能把缺失诊断解释为零调用。
+    fn judge_observed(
+        &self,
+        input: RelationInput,
+        observer: Arc<dyn RelationObserver>,
+    ) -> RelationFuture<'_> {
+        Box::pin(async move {
+            observe_relation(observer.as_ref(), RelationObservation::Unsupported);
+            self.judge(input).await
+        })
+    }
 }
 #[derive(Clone)]
 pub struct RelationServiceHandle(pub Arc<dyn RelationJudge>);

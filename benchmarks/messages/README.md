@@ -41,4 +41,10 @@ cargo run -p eve-app --bin eve-message-evaluate -- --mode jev --output /tmp/eve-
 - `low_confidence_or_ambiguous`：成功结果含低于阈值的标签或含混标签。规则对自然文字保守输出含混，因此预期会在该集合上漏掉许多自然修订；这是真实运行的规则基线，不应调整标注来迎合规则。
 - `latency_ms`、`timeouts` 和 `errors`：记录本次实际调用及验证的结果；错误仅固定类别。报告不包含模型解释或原始 Provider 诊断，`actual.raw_text` 只来自通过范围验证的公开样本原文。
 
-运行器只装配 ConfigPlugin 和 RelationService，不注册消息路由、Control、QQ 或工具。它没有执行任务，因此不报告任务完成率。当前公开接口也无法精确区分一次成功判断经过了多少个请求、是否发生回退，故不输出请求数或回退率；不得从标签结果或耗时推算。需要这些指标时应先为公开契约增加准确观测能力，再使用同一标注集评估。
+运行器只装配 ConfigPlugin 和 RelationService，不注册消息路由、Control、QQ 或工具。它没有执行任务，因此不报告任务完成率。
+
+报告升级为 `schema_version: 2`，样本仍是版本 1。每例 `diagnostics` 记录本次调用的阶段、开始/终止、耗时及实际回退原因；`summary.diagnostic_counts` 汇总规则、辅助、主模型阶段启动数，`classifier_calls`、`model_provider_calls` 和 `fallbacks`。明确规则快路径调用尝试为零；直接主模型模式不算一次失败回退。两种 calls 都是本地适配器调用边界，不能解释成实际 HTTP 请求数、服务端执行次数或计费。
+
+可替换旧判断器默认返回 `coverage: unsupported`；事件超过 64 条、终态不完整或未声明支持时，也将 `counts` 设为 `null`。任何一例不完整时汇总计数同样为 `null`，`incomplete_diagnostics` 说明数量，保留有界已观察事件供检查。不会用零掩盖不可观测结果。事件无路由 ID、正文、端点、凭据或模型解释；每次调用独立收集，不持久化或重放请求。
+
+辅助阶段被半期限中止时，阶段事件为 `timeout`，其内部调用因 Future 被丢弃记录 `dropped`；这是同一执行链的不同层级，不能加起来当作两次超时。外部取消、外层总期限或 panic 都可能导致 `dropped`，不能据此推断服务端已取消。实现契约和扩展方法见[消息判断诊断](../../docs/消息判断诊断.md)。

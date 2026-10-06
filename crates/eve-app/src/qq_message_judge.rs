@@ -6,7 +6,10 @@ use eve_config_api::{
 };
 use eve_jev::{JevConfig, JevConfigurationError, JevRelationJudge};
 use eve_llm_api::LlmModelResolver;
-use eve_message_api::{RelationError, RelationFuture, RelationInput, RelationJudge};
+use eve_message_api::{
+    DiscardRelationObservations, RelationError, RelationFuture, RelationInput, RelationJudge,
+    RelationObservation, RelationObserver, observe_relation,
+};
 use eve_message_plugin::RelationPlugin;
 use eve_runtime::LlmRelationJudge;
 use serde_json::json;
@@ -171,9 +174,17 @@ impl JevRoleJudge {
 
 impl RelationJudge for JevRoleJudge {
     fn judge(&self, input: RelationInput) -> RelationFuture<'_> {
+        self.judge_observed(input, Arc::new(DiscardRelationObservations))
+    }
+    fn judge_observed(
+        &self,
+        input: RelationInput,
+        observer: Arc<dyn RelationObserver>,
+    ) -> RelationFuture<'_> {
         Box::pin(async move {
+            observe_relation(observer.as_ref(), RelationObservation::Supported);
             let selected = self.resolve().map_err(|_| RelationError::Unavailable)?;
-            selected.judge(input).await
+            selected.judge_observed(input, observer).await
         })
     }
 }

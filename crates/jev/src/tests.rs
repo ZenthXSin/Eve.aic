@@ -1,6 +1,7 @@
 use super::*;
 use eve_control_api::{ControlPhase, GenerationKey};
-use eve_message_api::{ClarificationContext, IncomingMessage};
+use eve_message_api::{ClarificationContext, IncomingMessage, RelationOperation};
+use eve_message_diagnostics::{BoundedRelationDiagnostics, DiagnosticCoverage};
 use eve_session_api::SessionKey;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -336,4 +337,86 @@ async fn timeout_cancellation_and_full_capacity_release_request_slots() {
     let (_socket, _) = listener.accept().await.unwrap();
     third.abort();
     assert!(third.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn diagnostics_distinguish_preflight_rejection_capacity_timeout_and_drop() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let judge = Arc::new(
+        JevRelationJudge::new(
+            JevConfig {
+                base_url: format!("http://{}", listener.local_addr().unwrap()),
+                timeout: Duration::from_millis(150),
+                ..JevConfig::default()
+            },
+            "test-key",
+        )
+        .unwrap(),
+    );
+    let preflight = Arc::new(BoundedRelationDiagnostics::default());
+    let mut oversized = input();
+    oversized.task_text = "界".repeat(MAX_INPUT_BYTES);
+    assert_eq!(
+        judge.judge_observed(oversized, preflight.clone()).await,
+        Err(RelationError::Unavailable)
+    );
+    assert_eq!(preflight.snapshot().coverage, DiagnosticCoverage::Complete);
+    assert_eq!(preflight.snapshot().counts.unwrap().classifier_calls, 0);
+
+    let timed = Arc::new(BoundedRelationDiagnostics::default());
+    let first = tokio::spawn({
+        let judge = judge.clone();
+        let observer = timed.clone();
+        async move { judge.judge_observed(input(), observer).await }
+    });
+    let (_first_socket, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let busy = Arc::new(BoundedRelationDiagnostics::default());
+    assert_eq!(
+        judge.judge_observed(input(), busy.clone()).await,
+        Err(RelationError::Unavailable)
+    );
+    assert_eq!(busy.snapshot().coverage, DiagnosticCoverage::Complete);
+    assert_eq!(busy.snapshot().counts.unwrap().classifier_calls, 0);
+    assert_eq!(first.await.unwrap(), Err(RelationError::Timeout));
+    assert_eq!(timed.snapshot().counts.unwrap().classifier_calls, 1);
+    assert!(matches!(
+        timed.snapshot().events.last(),
+        Some(RelationObservation::Finished {
+            operation: RelationOperation::Attempt(RelationAttempt::ClassifierCall),
+            outcome: RelationOutcome::Timeout,
+            ..
+        })
+    ));
+
+    let dropped = Arc::new(BoundedRelationDiagnostics::default());
+    let second = tokio::spawn({
+        let judge = judge.clone();
+        let observer = dropped.clone();
+        async move { judge.judge_observed(input(), observer).await }
+    });
+    let (_second_socket, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    second.abort();
+    assert!(second.await.unwrap_err().is_cancelled());
+    assert_eq!(dropped.snapshot().coverage, DiagnosticCoverage::Complete);
+    assert_eq!(dropped.snapshot().counts.unwrap().classifier_calls, 1);
+    assert!(matches!(
+        dropped.snapshot().events.last(),
+        Some(RelationObservation::Finished {
+            operation: RelationOperation::Attempt(RelationAttempt::ClassifierCall),
+            outcome: RelationOutcome::Dropped,
+            ..
+        })
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "本地两次实际准入以外不应重试或发送额外请求"
+    );
 }

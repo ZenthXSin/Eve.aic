@@ -1,15 +1,17 @@
 //! TypeSafe/SystemOne 的有界消息判断适配；只实现公开 RelationJudge。
 use eve_message_api::{
-    IntentPart, MessageIntent, RelationDecision, RelationError, RelationFuture, RelationInput,
-    RelationJudge, TextSpan,
+    DiscardRelationObservations, IntentPart, MessageIntent, RelationAttempt, RelationDecision,
+    RelationError, RelationFuture, RelationInput, RelationJudge, RelationObservation,
+    RelationObserver, RelationOutcome, TextSpan, observe_relation,
 };
+use eve_message_diagnostics::RelationObservationGuard;
 use reqwest::{Client, Url, header::HeaderValue};
 use serde::{
     Deserialize, Deserializer,
     de::{MapAccess, Visitor},
 };
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, fmt, time::Duration};
+use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
@@ -109,6 +111,7 @@ impl JevRelationJudge {
         let client = Client::builder()
             .timeout(config.timeout)
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(|_| JevConfigurationError)?;
         let slots = Semaphore::new(config.max_concurrent_requests);
@@ -289,37 +292,56 @@ fn decision(bytes: &[u8], input: &RelationInput) -> Result<RelationDecision, Rel
 
 impl RelationJudge for JevRelationJudge {
     fn judge(&self, input: RelationInput) -> RelationFuture<'_> {
+        self.judge_observed(input, Arc::new(DiscardRelationObservations))
+    }
+    fn judge_observed(
+        &self,
+        input: RelationInput,
+        observer: Arc<dyn RelationObserver>,
+    ) -> RelationFuture<'_> {
         Box::pin(async move {
+            observe_relation(observer.as_ref(), RelationObservation::Supported);
             let body = request(&input, &self.config.model)?;
             let _slot = self
                 .slots
                 .try_acquire()
                 .map_err(|_| RelationError::Unavailable)?;
-            let mut response = self
-                .client
-                .post(self.endpoint.clone())
-                .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
-                .json(&body)
-                .send()
-                .await
-                .map_err(http_error)?;
-            if !response.status().is_success() {
-                return Err(RelationError::Unavailable);
-            }
-            if response
-                .content_length()
-                .is_some_and(|n| n > MAX_OUTPUT_BYTES as u64)
-            {
-                return Err(RelationError::Protocol);
-            }
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(http_error)? {
-                if bytes.len() + chunk.len() > MAX_OUTPUT_BYTES {
+            // 从本地 send 到有界响应完成；不证明远端收到请求、执行或计费。
+            let guard =
+                RelationObservationGuard::attempt(observer, RelationAttempt::ClassifierCall);
+            let result = async {
+                let mut response = self
+                    .client
+                    .post(self.endpoint.clone())
+                    .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(http_error)?;
+                if !response.status().is_success() {
+                    return Err(RelationError::Unavailable);
+                }
+                if response
+                    .content_length()
+                    .is_some_and(|n| n > MAX_OUTPUT_BYTES as u64)
+                {
                     return Err(RelationError::Protocol);
                 }
-                bytes.extend_from_slice(&chunk);
+                let mut bytes = Vec::new();
+                while let Some(chunk) = response.chunk().await.map_err(http_error)? {
+                    if bytes.len() + chunk.len() > MAX_OUTPUT_BYTES {
+                        return Err(RelationError::Protocol);
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                decision(&bytes, &input)
             }
-            decision(&bytes, &input)
+            .await;
+            guard.finish(match &result {
+                Ok(_) => RelationOutcome::Completed,
+                Err(error) => (*error).into(),
+            });
+            result
         })
     }
 }

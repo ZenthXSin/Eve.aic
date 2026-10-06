@@ -1,19 +1,15 @@
 [package]
-name = "eve-message-plugin"
+name = "eve-message-diagnostics"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-eve-message-diagnostics = { path = "../message-diagnostics" }
 eve-message-api = { path = "../message-api" }
-eve-control-api = { path = "../control-api" }
-eve-config-api = { path = "../config-api" }
-eve-plugin-api = { path = "../plugin-api" }
-eve-session-api = { path = "../session-api" }
-tokio.workspace = true
-serde_json.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
-eve-llm-api = { path = "../llm-api" }
+eve-control-api = { path = "../control-api" }
+eve-session-api = { path = "../session-api" }
+tokio.workspace = true

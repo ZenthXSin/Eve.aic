@@ -6,6 +6,7 @@ use eve_llm_api::{
     ModelSelection,
 };
 use eve_message_api::*;
+use eve_message_diagnostics::{BoundedRelationDiagnostics, DiagnosticCoverage};
 use eve_runtime::LlmRelationJudge;
 use fixture::{Provider, Step, final_response, key};
 use serde_json::json;
@@ -420,4 +421,68 @@ async fn explicit_cancellation_drops_request_and_next_judgement_resolves_again()
     assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
     assert_eq!(next.requests.lock().unwrap().len(), 1);
     assert_eq!(blocked.started.load(Ordering::SeqCst), 1);
+}
+
+struct PanickingObserver;
+impl RelationObserver for PanickingObserver {
+    fn observe(&self, _: RelationObservation) {
+        panic!("synthetic observer panic");
+    }
+}
+
+#[tokio::test]
+async fn observer_panics_leave_actual_provider_result_and_call_count_unchanged() {
+    let provider = Provider::new(vec![Step::new(final_response(&wire(
+        "correction",
+        95,
+        Some("修改报告"),
+    )))]);
+    let judge = LlmRelationJudge::new(provider.clone());
+    let result = judge
+        .judge_observed(input("修改报告"), Arc::new(PanickingObserver))
+        .await
+        .unwrap();
+    assert_eq!(result.parts[0].intent, MessageIntent::Correction);
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn shared_judge_diagnostics_are_request_scoped_during_concurrent_cancellation() {
+    let provider = Arc::new(PendingProvider::default());
+    let judge = Arc::new(LlmRelationJudge::new(provider.clone()));
+    let left = Arc::new(BoundedRelationDiagnostics::default());
+    let right = Arc::new(BoundedRelationDiagnostics::default());
+    let first = tokio::spawn({
+        let judge = judge.clone();
+        let observer = left.clone();
+        async move { judge.judge_observed(input("修改左边"), observer).await }
+    });
+    provider.entered.notified().await;
+    let second = tokio::spawn({
+        let judge = judge.clone();
+        let observer = right.clone();
+        async move { judge.judge_observed(input("修改右边"), observer).await }
+    });
+    provider.entered.notified().await;
+    first.abort();
+    let _ = first.await;
+    assert_eq!(left.snapshot().coverage, DiagnosticCoverage::Complete);
+    assert_eq!(left.snapshot().counts.unwrap().model_provider_calls, 1);
+    assert_eq!(right.snapshot().coverage, DiagnosticCoverage::Invalid);
+    assert_eq!(provider.active.load(Ordering::SeqCst), 1);
+    second.abort();
+    let _ = second.await;
+    assert_eq!(right.snapshot().coverage, DiagnosticCoverage::Complete);
+    assert_eq!(right.snapshot().counts.unwrap().model_provider_calls, 1);
+    assert_eq!(provider.started.load(Ordering::SeqCst), 2);
+    for observer in [left, right] {
+        assert!(matches!(
+            observer.snapshot().events.last(),
+            Some(RelationObservation::Finished {
+                operation: RelationOperation::Attempt(RelationAttempt::ModelProviderCall),
+                outcome: RelationOutcome::Dropped,
+                ..
+            })
+        ));
+    }
 }
