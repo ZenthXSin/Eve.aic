@@ -479,6 +479,7 @@ version = "0.1.0"
 dependencies = [
  "eve-session-api",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -493,6 +494,7 @@ dependencies = [
  "eve-session-plugin",
  "eve-training-api",
  "eve-training-plugin",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
