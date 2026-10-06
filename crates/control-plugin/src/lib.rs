@@ -9,6 +9,7 @@ use eve_session_api::SessionKey;
 use std::{
     collections::BTreeMap,
     future::{Future, poll_fn},
+    ops::Bound::{Excluded, Unbounded},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -270,6 +271,23 @@ impl Controller {
     }
 }
 impl ControlService for Controller {
+    fn list_keys(&self, after: Option<&str>, limit: usize) -> ControlResult<Vec<SessionKey>> {
+        let registry = self.lock()?;
+        if !(1..=100).contains(&limit)
+            || after.is_some_and(|cursor| {
+                cursor.is_empty() || cursor.len() > 256 || cursor.chars().any(char::is_control)
+            })
+        {
+            return Err(ControlError::InvalidInput);
+        }
+        let start = after.map_or(Unbounded, Excluded);
+        Ok(registry
+            .sessions
+            .range::<str, _>((start, Unbounded))
+            .take(limit)
+            .map(|(_, generation)| generation.key.session.clone())
+            .collect())
+    }
     fn submit(
         &self,
         input: ControlInput,

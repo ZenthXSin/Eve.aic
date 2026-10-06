@@ -18,6 +18,7 @@ mod segment_advice;
 mod segment_commands;
 mod services;
 mod storage;
+mod web_panel;
 
 #[cfg(test)]
 #[path = "../../llm-openai/tests/support/mod.rs"]

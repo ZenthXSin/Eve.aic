@@ -178,3 +178,7 @@ python3 connectors/qqbot/test/segment_test.py
 ## 自主偏好学习
 
 `--self-learning` 同时开启记忆、持续提炼和分段，证据充分的候选自动确认，明确节奏自动参与后续发送。`/self-learning status` 查看模式及关联情况；手动分段选择优先，`/segment reset` 清除手动选择并恢复跟随学习。默认提炼间隔五分钟，`--learning-cooldown-ms` 可调整。行为、恢复和容量见[自主偏好学习](./自主偏好学习.md)。
+
+## 本机控制面板
+
+`--web-listen 127.0.0.1:8765` 显式启用本机面板，需要独立 `EVE_WEB_TOKEN`。浏览器查看本实例状态、会话/任务分页和精确代际取消；不提供新任务或停服操作。令牌、环回访问、取消准入与停止/恢复边界见[Web 控制面板](./Web控制面板.md)。

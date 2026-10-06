@@ -9,6 +9,7 @@ use eve_session_api::*;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
+    ops::Bound::{Excluded, Unbounded},
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -135,6 +136,24 @@ impl StoredSessions {
     }
 }
 impl SessionService for StoredSessions {
+    fn list_keys(&self, after: Option<&str>, limit: usize) -> SessionResult<Vec<SessionKey>> {
+        let inner = self.lock()?;
+        if !(1..=100).contains(&limit)
+            || after.is_some_and(|cursor| {
+                cursor.is_empty() || cursor.len() > 256 || cursor.chars().any(char::is_control)
+            })
+        {
+            return Err(SessionError::InvalidInput);
+        }
+        let start = after.map_or(Unbounded, Excluded);
+        Ok(inner
+            .document
+            .sessions
+            .range::<str, _>((start, Unbounded))
+            .take(limit)
+            .map(|(_, snapshot)| snapshot.key.clone())
+            .collect())
+    }
     fn snapshot(&self, key: &SessionKey) -> SessionResult<Option<SessionSnapshot>> {
         key.validate()?;
         let inner = self.lock()?;

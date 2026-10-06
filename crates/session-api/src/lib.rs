@@ -226,6 +226,14 @@ impl fmt::Display for SessionError {
 impl std::error::Error for SessionError {}
 
 pub trait SessionService: Send + Sync {
+    /// 分页列出本服务已有历史的完整可信身份，不返回正文或诊断，也不创建或重放轮次。
+    /// 按 session_id 升序，after 是独占游标，可不对应已有会话；Some 游标须非空、
+    /// UTF-8 字节数不超过 256 且无控制字符，允许空格。limit 必须为 1..=100。
+    /// 单页是读取时的快照，跨页不提供事务快照；调用者以末项 session_id 继续。
+    /// 停止后的句柄不可用；旧的自定义实现默认不支持枚举。
+    fn list_keys(&self, _after: Option<&str>, _limit: usize) -> SessionResult<Vec<SessionKey>> {
+        Err(SessionError::Unavailable)
+    }
     fn snapshot(&self, key: &SessionKey) -> SessionResult<Option<SessionSnapshot>>;
     /// 成功后输入与 Pending 已提交；同一会话只允许一个在途轮次。
     fn begin(&self, input: SessionInput) -> SessionResult<StartedTurn>;
@@ -282,5 +290,32 @@ mod tests {
             validate_completed_turn("问题", &incomplete),
             Err(SessionError::InvalidInput)
         );
+    }
+}
+
+#[cfg(test)]
+mod enumeration_compatibility {
+    use super::*;
+
+    struct CustomSessions;
+    impl SessionService for CustomSessions {
+        fn snapshot(&self, _: &SessionKey) -> SessionResult<Option<SessionSnapshot>> {
+            Ok(None)
+        }
+        fn begin(&self, _: SessionInput) -> SessionResult<StartedTurn> {
+            Err(SessionError::Unavailable)
+        }
+        fn complete(&self, _: &TurnLease, _: Vec<ChatMessage>) -> SessionResult<()> {
+            Err(SessionError::Unavailable)
+        }
+        fn fail(&self, _: &TurnLease, _: SessionFailure) -> SessionResult<()> {
+            Err(SessionError::Unavailable)
+        }
+    }
+
+    #[test]
+    fn existing_custom_service_can_omit_enumeration() {
+        let custom: &dyn SessionService = &CustomSessions;
+        assert_eq!(custom.list_keys(None, 10), Err(SessionError::Unavailable));
     }
 }

@@ -403,3 +403,118 @@ async fn simultaneous_begin_has_exactly_one_winner() {
     );
     kernel.stop_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn lists_bounded_owned_keys_in_cursor_order_without_mutating_history() {
+    let state = Arc::new(FaultStore::default());
+    let (kernel, _, sessions) = open(state.clone()).await;
+    assert!(sessions.list_keys(None, 100).unwrap().is_empty());
+    let mut expected = Vec::new();
+    // 反序写入超过单页上限，确保排序与分页不依赖插入顺序。
+    for index in (0..103).rev() {
+        let session = format!("session-{index:03}");
+        let owner = format!("owner-{}", index % 7);
+        let started = sessions
+            .begin(input(&session, &owner, "不会出现在枚举结果的正文"))
+            .unwrap();
+        sessions
+            .complete(&started.lease, simple("不会出现在枚举结果的正文"))
+            .unwrap();
+        expected.push(started.lease.key);
+    }
+    expected.reverse();
+    let saved = state.get(&id(), SESSION_STATE_KEY).unwrap();
+    // 写入失败模式证明列举不依赖持久写入，也不新开轮次。
+    state.fail.store(true, Ordering::SeqCst);
+    assert_eq!(sessions.list_keys(None, 100).unwrap(), expected[..100]);
+    assert_eq!(
+        sessions.list_keys(Some("session-099"), 100).unwrap(),
+        expected[100..]
+    );
+    assert!(
+        sessions
+            .list_keys(Some("session-102"), 1)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        sessions.list_keys(Some("session-050x"), 2).unwrap(),
+        expected[51..53]
+    );
+    assert_eq!(sessions.list_keys(Some(" "), 1).unwrap(), expected[..1]);
+    assert_eq!(
+        sessions.list_keys(Some("session-050 "), 1).unwrap(),
+        expected[51..52]
+    );
+    assert!(
+        sessions
+            .list_keys(Some(&"界".repeat(85)), 1)
+            .unwrap()
+            .is_empty()
+    );
+    for after in [
+        Some(""),
+        Some("line\nbreak"),
+        Some("delete\u{7f}"),
+        Some("\u{85}"),
+    ] {
+        assert_eq!(
+            sessions.list_keys(after, 1),
+            Err(SessionError::InvalidInput)
+        );
+    }
+    for after in [&"x".repeat(257), &"界".repeat(86)] {
+        assert_eq!(
+            sessions.list_keys(Some(after), 1),
+            Err(SessionError::InvalidInput)
+        );
+    }
+    for limit in [0, 101, usize::MAX] {
+        assert_eq!(
+            sessions.list_keys(None, limit),
+            Err(SessionError::InvalidInput)
+        );
+    }
+    assert_eq!(state.get(&id(), SESSION_STATE_KEY).unwrap(), saved);
+    kernel.stop_all().await.unwrap();
+    assert_eq!(sessions.list_keys(None, 1), Err(SessionError::Unavailable));
+    assert_eq!(
+        sessions.list_keys(Some(""), 0),
+        Err(SessionError::Unavailable)
+    );
+}
+
+#[tokio::test]
+async fn recovered_history_keys_are_read_only_and_old_handles_stay_unavailable() {
+    let state = Arc::new(FaultStore::default());
+    let (kernel, registry, sessions) = open(state.clone()).await;
+    let done = sessions
+        .begin(input("finished", "owner-done", "已完成历史"))
+        .unwrap();
+    sessions
+        .complete(&done.lease, simple("已完成历史"))
+        .unwrap();
+    let pending = sessions
+        .begin(input("pending", "owner-pending", "上次在途"))
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    kernel.start(&id()).await.unwrap();
+    let recovered = service(&kernel, &registry);
+    let saved = state.get(&id(), SESSION_STATE_KEY).unwrap();
+    state.fail.store(true, Ordering::SeqCst);
+    assert_eq!(
+        recovered.list_keys(None, 2).unwrap(),
+        vec![done.lease.key.clone(), pending.lease.key.clone()]
+    );
+    assert_eq!(
+        recovered.list_keys(Some("finished"), 1).unwrap(),
+        vec![pending.lease.key.clone()]
+    );
+    let history = recovered.snapshot(&pending.lease.key).unwrap().unwrap();
+    assert_eq!(history.turns.len(), 1);
+    assert_eq!(history.turns[0].status, SessionTurnStatus::Interrupted);
+    assert_eq!(history.revision, 2);
+    assert_eq!(sessions.list_keys(None, 2), Err(SessionError::Unavailable));
+    assert_eq!(state.get(&id(), SESSION_STATE_KEY).unwrap(), saved);
+    kernel.stop_all().await.unwrap();
+}
