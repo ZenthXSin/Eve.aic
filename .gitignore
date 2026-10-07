@@ -13,4 +13,5 @@
 /.eve-model-check-*/
 /.eve-qqbot/
 /connectors/qqbot/node_modules/
+/dist/
 __pycache__/

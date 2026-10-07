@@ -1,0 +1,57 @@
+name: Windows 便携版打包
+
+on:
+  push:
+    branches: [main, 'codex/windows-*']
+  pull_request:
+    paths: ['packaging/windows/**', 'scripts/package-windows.ps1', 'scripts/test-windows-package.py', '.github/workflows/windows-package.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: 检出精确源码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: 安装构建工具
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.22.0'
+      - name: 构建 Windows x64 原生 exe
+        env:
+          RUSTFLAGS: '-C target-feature=+crt-static'
+          CARGO_INCREMENTAL: '0'
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.89.0 build -p eve-app --bins --release --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 打包 exe、页面与 QQ 运行环境
+        run: ./scripts/package-windows.ps1
+      - name: 验证解压后的 Windows 程序、启动脚本与 Web
+        run: |
+          python scripts/test-windows-package.py dist
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 上传已验收便携包
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Eve-windows-x64
+          path: |
+            dist/Eve-windows-x64-*.zip
+            dist/SHA256SUMS.txt
+            dist/windows-acceptance.json
+          if-no-files-found: error
+          retention-days: 30
