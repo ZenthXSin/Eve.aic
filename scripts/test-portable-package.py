@@ -82,6 +82,10 @@ def run(root, config, bridge, scenario, stop_gate, requests, expected_requests):
         state_file = root / "data/qq/state.json"
         deadline = time.monotonic() + 12
         while time.monotonic() < deadline:
+            if not state_file.exists():
+                require(child.poll() is None, "宿主在首次保存前退出：" + "".join(lines))
+                time.sleep(0.02)
+                continue
             document = json.loads(state_file.read_text(encoding="utf-8"))
             receipts = json.loads(bytes(document["entries"].get("eve.channel.qqbot", {}).get("receipts.v1", [])) or b'{}')
             if any(item["message"]["id"] == "package-chat" and item["state"] == "Sent"
