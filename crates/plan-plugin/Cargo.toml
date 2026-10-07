@@ -6,10 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+eve-llm-api = { path = "../llm-api" }
 eve-plan-api = { path = "../plan-api" }
 eve-plugin-api = { path = "../plugin-api" }
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 eve-kernel = { path = "../kernel" }
