@@ -24,15 +24,16 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-def run(root, config, bridge, scenario, stop_gate, requests, expected_requests):
+def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, label):
     config_path = root / "config.json"
     before = config_path.read_bytes()
-    if os.name == "nt":
+    if label == "windows-x64":
         command = ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
                    "-ExecutionPolicy", "Bypass", "-File", str(root / "Launch.ps1"),
                    "-NoPrompt", "-BridgeScript", str(bridge), "-BridgeArg", str(scenario)]
     else:
-        command = [str(root / "runtime/bin/node"), str(root / "Launch.mjs"), "qq",
+        node = root / ("runtime/node.exe" if os.name == "nt" else "runtime/bin/node")
+        command = [str(node), str(root / "Launch.mjs"), "qq",
                    "--no-prompt", "--bridge-script", str(bridge), "--bridge-arg", str(scenario)]
     child = subprocess.Popen(command, cwd=root.parent, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
@@ -94,9 +95,16 @@ def run(root, config, bridge, scenario, stop_gate, requests, expected_requests):
             time.sleep(0.02)
         else:
             raise RuntimeError("发行 exe 没有实际确认完成 QQ 消息")
-        code, raw = api("/api/memory/scopes", {}, token)
-        scopes = json.loads(raw)
-        require(code == 200 and len(scopes["items"]) == 1, "记忆作用域页没有实际读取交互")
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            code, raw = api("/api/memory/scopes", {}, token)
+            require(code == 200, "记忆作用域接口不可用")
+            scopes = json.loads(raw)
+            if len(scopes["items"]) == 1:
+                break
+            time.sleep(0.02)
+        else:
+            raise RuntimeError("记忆作用域页没有实际读取交互")
         scope = scopes["items"][0]["scope"]
         require(api("/api/memory/scope", {"scope": scope}, token)[0] == 200, "记忆详情无法读取")
         code, raw = api("/api/memory/learning", {"scope": scope}, token)
@@ -187,14 +195,16 @@ def main():
             config["qq"]["app_secret"] = "test-app-secret"
             config["web"] = {"listen": "127.0.0.1:0", "token": "synthetic-package-panel-token-12345678901234567890"}
             (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
-            if os.name == "nt":
+            if manifest["platform_label"] == "windows-x64":
                 validation_command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                                       "-File", str(root / "Launch.ps1"), "-ValidateOnly"]
             else:
-                validation_command = [str(root / "runtime/bin/node"), str(root / "Launch.mjs"), "qq", "--validate-only"]
-                script_extension = "command" if sys.platform == "darwin" else "sh"
-                for name in ("Start-Eve", "Start-Console", "Open-Panel"):
-                    require(os.access(root / f"{name}.{script_extension}", os.X_OK), "解压丢失启动脚本执行权限")
+                node = root / ("runtime/node.exe" if os.name == "nt" else "runtime/bin/node")
+                validation_command = [str(node), str(root / "Launch.mjs"), "qq", "--validate-only"]
+                if os.name != "nt":
+                    script_extension = "command" if sys.platform == "darwin" else "sh"
+                    for name in ("Start-Eve", "Start-Console", "Open-Panel"):
+                        require(os.access(root / f"{name}.{script_extension}", os.X_OK), "解压丢失启动脚本执行权限")
             validation = subprocess.run(validation_command, capture_output=True, timeout=20)
             require(validation.returncode == 0, "启动器配置预检失败：" + validation.stderr.decode(errors="replace"))
             bridge = work / "离线 桥接.mjs"
@@ -211,8 +221,12 @@ def main():
                     steps += [{"wait_receipt": {"path": str(root / "data/qq/state.json"), "id": message["id"], "state": "Sent"}}]
                 steps += [{"wait_file": str(stop_gate)}]
                 scenario.write_text(json.dumps({"script": steps}), encoding="utf-8")
-                run(root, config, bridge, scenario, stop_gate, requests, 1)
+                run(root, config, bridge, scenario, stop_gate, requests, 1, manifest["platform_label"])
             require(len(requests) == 1, "恢复产生了新的模型请求")
+            if manifest["platform_label"] != "windows-x64":
+                subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name("test-launcher-signal.py")), str(root)],
+                               check=True, timeout=90)
+                require(len(requests) == 1, "信号验收重放了模型请求")
     finally:
         server.shutdown()
         server.server_close()
@@ -220,7 +234,9 @@ def main():
     report = {"format_version": 2, "platform": sys.platform, "platform_label": manifest["platform_label"],
               "target": manifest["target"], "archive": archive.name,
               "source_commit": manifest["source_commit"], "archive_sha256": expected,
-              "powershell_5_1": os.name == "nt", "posix_launcher": os.name != "nt",
+              "powershell_5_1": manifest["platform_label"] == "windows-x64",
+              "node_launcher": manifest["platform_label"] != "windows-x64",
+              "console_ctrl_c": True if manifest["platform_label"] != "windows-x64" else None,
               "unicode_and_space_path": True, "web_http": True,
               "memory_and_learning_views": True, "qq_segmented_delivery": True,
               "recovery_without_replay": True, "external_model_requests": 0,

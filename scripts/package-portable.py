@@ -53,6 +53,7 @@ def package(target, binary_directory, output_directory):
         shutil.copy2(binary_directory / (binary + extension), bundle)
     shutil.copy2(ROOT / "AGENT.md", bundle)
     shutil.copy2(ROOT / "packaging/windows/config.example.json", bundle)
+    shutil.copy2(ROOT / "packaging/common/Launch.mjs", bundle)
     if windows:
         for file in ("Launch.ps1", "Open-Panel.ps1", "Start-Eve.cmd", "Start-Console.cmd", "Open-Panel.cmd", "使用说明.md"):
             source_file = ROOT / "packaging/windows" / file
@@ -62,8 +63,13 @@ def package(target, binary_directory, output_directory):
                 (bundle / source_file.name).write_bytes(source_file.read_text().replace("\n", "\r\n").encode("ascii"))
             else:
                 shutil.copy2(source_file, bundle)
+        if label == "windows-arm64":
+            for script, mode in (("Start-Eve", "qq"), ("Start-Console", "console"), ("Open-Panel", "panel")):
+                (bundle / f"{script}.cmd").write_bytes((
+                    '@echo off\r\nchcp 65001 >nul\r\n'
+                    '"%~dp0runtime\\node.exe" "%~dp0Launch.mjs" ' + mode + '\r\npause\r\n').encode("ascii"))
     else:
-        for file in ("Launch.mjs", "使用说明.md"):
+        for file in ("使用说明.md",):
             shutil.copy2(ROOT / "packaging/posix" / file, bundle)
         script_extension = "command" if label.startswith("macos-") else "sh"
         for script, mode in (("Start-Eve", "qq"), ("Start-Console", "console"), ("Open-Panel", "panel")):

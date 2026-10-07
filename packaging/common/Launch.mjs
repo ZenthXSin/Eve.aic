@@ -5,6 +5,8 @@ import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
+const windows = process.platform === 'win32';
+const nodePath = path.join(root, windows ? 'runtime/node.exe' : 'runtime/bin/node');
 const argv = process.argv.slice(2);
 const mode = argv.shift() || 'qq';
 const options = { noPrompt: false, validateOnly: false, bridge: '', bridgeArg: '' };
@@ -90,15 +92,17 @@ async function main() {
   if (mode === 'panel') {
     if (config.web.listen.endsWith(':0')) throw new Error('端口 0 请使用 EVE_WEB_READY 输出的实际地址。');
     console.log(`地址：http://${config.web.listen}\n本机登录令牌：${config.web.token}`);
-    const open = spawn(process.platform === 'darwin' ? 'open' : 'xdg-open', [`http://${config.web.listen}`], { detached: true, stdio: 'ignore' });
+    const url = `http://${config.web.listen}`;
+    const browser = windows ? 'rundll32.exe' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+    const open = spawn(browser, windows ? ['url.dll,FileProtocolHandler', url] : [url], { detached: true, stdio: 'ignore' });
     open.on('error', () => console.log('请手动在浏览器打开上述地址。'));
     open.unref();
     return;
   }
-  const binary = path.join(root, mode === 'qq' ? 'eve-qqbot' : 'eve');
+  const binary = path.join(root, (mode === 'qq' ? 'eve-qqbot' : 'eve') + (windows ? '.exe' : ''));
   const bridge = options.bridge || path.join(root, 'connectors/qqbot/bridge.mjs');
   const required = [binary, path.join(root, 'AGENT.md')];
-  if (mode === 'qq') required.push(path.join(root, 'runtime/bin/node'), bridge, path.join(root, 'connectors/qqbot/node_modules/@tencent-connect/qqbot-nodejs/package.json'));
+  if (mode === 'qq') required.push(nodePath, bridge, path.join(root, 'connectors/qqbot/node_modules/@tencent-connect/qqbot-nodejs/package.json'));
   for (const file of required) await fs.access(file);
   if (options.validateOnly) { console.log('配置及发行包检查通过。'); return; }
   if (changed) {
@@ -118,7 +122,7 @@ async function main() {
   if (mode === 'qq') {
     Object.assign(env, { QQBOT_APP_ID: config.qq.app_id, QQBOT_APP_SECRET: config.qq.app_secret,
       QQBOT_SANDBOX: String(config.qq.sandbox), EVE_WEB_TOKEN: config.web.token, EVE_JEV_API_KEY: '' });
-    args.push('--node', path.join(root, 'runtime/bin/node'), '--bridge-script', bridge, '--memory', '--web-listen', config.web.listen);
+    args.push('--node', nodePath, '--bridge-script', bridge, '--memory', '--web-listen', config.web.listen);
     if (options.bridgeArg) args.push('--bridge-arg', options.bridgeArg);
     for (const [key, flag] of [['training', '--training'], ['cognition', '--cognition'], ['self_learning', '--self-learning'], ['memory_recall', '--memory-recall']]) {
       if (config.features[key]) args.push(flag);
@@ -133,7 +137,9 @@ async function main() {
     console.log('QQ 启动中；看到 EVE_QQBOT_READY / EVE_WEB_READY 后打开 Open-Panel。');
   }
   const child = spawn(binary, args, { cwd: root, env, stdio: 'inherit' });
-  const interrupt = () => child.kill('SIGINT');
+  // Windows 控制台向父子进程同时广播 Ctrl+C；Node 的 kill(SIGINT) 会强制终止，
+  // 因此这里只保留父进程等待，让 Rust 自己完成控制台信号收尾。
+  const interrupt = () => { if (!windows) child.kill('SIGINT'); };
   const terminate = () => child.kill('SIGTERM');
   process.on('SIGINT', interrupt);
   process.on('SIGTERM', terminate);

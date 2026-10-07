@@ -18,4 +18,6 @@
 /packaging/windows/data/
 /packaging/posix/config.json
 /packaging/posix/data/
+/packaging/common/config.json
+/packaging/common/data/
 __pycache__/
