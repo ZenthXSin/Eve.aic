@@ -49,9 +49,9 @@ process.stdout.end(() => process.exit(0));
             def read(stream):
                 for line in stream:
                     lines.append(line)
-                    if "EVE_QQBOT_READY" in line:
+                    if line.startswith("EVE_QQBOT_READY"):
                         ready.put(True)
-                    if "EVE_WEB_READY " in line:
+                    if line.startswith("EVE_WEB_READY http://"):
                         web.put(line.split("EVE_WEB_READY ", 1)[1].strip())
 
             readers = [threading.Thread(target=read, args=(stream,), daemon=True)
