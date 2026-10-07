@@ -18,7 +18,13 @@ impl eve_config_api::ConfigValidator for CoreConfigValidator {
             ConfigError, LLM_NAMESPACE, LlmRuntimeConfig, MODELS_NAMESPACE, ModelRolesConfig,
         };
         let invalid = || ConfigError::InvalidValue("宿主配置".into());
-        LlmRuntimeConfig::try_from(snapshots.get(LLM_NAMESPACE).ok_or_else(invalid)?)?;
+        let runtime =
+            LlmRuntimeConfig::try_from(snapshots.get(LLM_NAMESPACE).ok_or_else(invalid)?)?;
+        if runtime.response_mode != "complete" {
+            return Err(ConfigError::InvalidValue(format!(
+                "{LLM_NAMESPACE}.response_mode"
+            )));
+        }
         eve_message_api::MessageConfig::try_from(
             snapshots
                 .get(eve_message_api::MESSAGE_NAMESPACE)
@@ -150,6 +156,48 @@ pub(crate) fn provider_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_validator_accepts_supported_restart_settings_and_rejects_stream() {
+        use eve_config_api::{
+            ConfigValidator, LLM_NAMESPACE, model_roles_schema, runtime_llm_schema,
+        };
+        let schemas = [
+            runtime_llm_schema(),
+            model_roles_schema(),
+            openai_schema(),
+            eve_message_api::message_schema(),
+        ];
+        let mut snapshots: BTreeMap<_, _> = schemas
+            .into_iter()
+            .map(|schema| {
+                let namespace = schema.namespace;
+                let snapshot = ConfigSnapshot {
+                    namespace: namespace.clone(),
+                    schema_version: schema.version,
+                    revision: 0,
+                    values: schema
+                        .fields
+                        .into_iter()
+                        .filter_map(|(id, field)| field.default.map(|value| (id, value)))
+                        .collect(),
+                };
+                (namespace, snapshot)
+            })
+            .collect();
+        CoreConfigValidator.validate(&snapshots).unwrap();
+        let runtime = snapshots.get_mut(LLM_NAMESPACE).unwrap();
+        runtime
+            .values
+            .insert("max_parallel_tool_calls".into(), json!(11));
+        CoreConfigValidator.validate(&snapshots).unwrap();
+        snapshots
+            .get_mut(LLM_NAMESPACE)
+            .unwrap()
+            .values
+            .insert("response_mode".into(), json!("stream"));
+        assert!(CoreConfigValidator.validate(&snapshots).is_err());
+    }
 
     fn snapshot() -> ConfigSnapshot {
         let schema = openai_schema();

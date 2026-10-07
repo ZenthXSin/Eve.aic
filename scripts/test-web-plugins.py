@@ -159,10 +159,18 @@ def main():
                 save(primary, {"model": "next-model"})
                 save(primary, {"model": "stale-model"}, 409)
                 runtime = page("runtime.llm")
-                result = save(runtime, {"response_mode": "stream"})
-                require("runtime.llm.response_mode" in result["restart_required"], "没有标记待重启字段")
+                config_file = state / "configuration" / "config.json"
+                before_invalid = config_file.read_bytes()
+                save(runtime, {"response_mode": "stream"}, 400)
+                require(config_file.read_bytes() == before_invalid and page("runtime.llm") == runtime,
+                        "宿主不支持的配置改变了磁盘或内存")
+                old_parallel = next(f for f in runtime["fields"] if f["id"] == "max_parallel_tool_calls")["value"]
+                new_parallel = old_parallel + 1
+                result = save(runtime, {"max_parallel_tool_calls": new_parallel})
+                require("runtime.llm.max_parallel_tool_calls" in result["restart_required"], "没有标记待重启字段")
                 runtime = page("runtime.llm")
-                require(next(f for f in runtime["fields"] if f["id"] == "response_mode")["value"] == "complete", "启动时捕获字段错误地热更新")
+                require(next(f for f in runtime["fields"] if f["id"] == "max_parallel_tool_calls")["value"] == old_parallel,
+                        "启动时捕获字段错误地热更新")
                 duplicate = json.dumps({"plugin_id": "eve.config", "page_id": "provider.openai", "instance": primary["instance"], "expected_revision": 0})[:-1] + ',"values":{"model":null,"model":"bad"}}'
                 require(api(url, "/api/plugin-pages/save", raw=duplicate.encode())[0] == 400, "重复字段未拒绝")
 
@@ -209,6 +217,9 @@ def main():
                 recovered = api(url, "/api/plugin-pages/read", {"plugin_id": "eve.config", "page_id": "provider.openai"})[1]
                 require(recovered["revision"] == old["revision"] and recovered["instance"] != old["instance"], "独立进程配置恢复失败")
                 require(next(f for f in recovered["fields"] if f["id"] == "model")["value"] == "next-model", "文件覆盖没有优先于启动环境")
+                recovered_runtime = api(url, "/api/plugin-pages/read", {"plugin_id": "eve.config", "page_id": "runtime.llm"})[1]
+                require(next(f for f in recovered_runtime["fields"] if f["id"] == "max_parallel_tool_calls")["value"] == new_parallel,
+                        "重启后没有应用保存的并行数")
                 require(api(url, "/api/plugin-pages/save", {"plugin_id": "eve.config", "page_id": "provider.openai", "instance": old["instance"],
                         "expected_revision": recovered["revision"], "values": {"model": "old-instance"}})[0] == 409, "旧实例页面能够修改新服务")
                 restart_gate.touch()

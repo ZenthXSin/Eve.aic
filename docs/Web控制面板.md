@@ -91,7 +91,7 @@ API 设置 5 秒异步请求期限、16 个同时处理请求和 16 KiB JSON 请
 
 QQ 面板中的配置插件提供 `provider.openai`、`provider.jev`、`runtime.models`、`runtime.llm`、`runtime.messages` 五个页面。保存只 patch 用户编辑的字段，其他字段和命名空间保留；恢复默认移除文件覆盖，重新使用启动环境或 Schema 默认值。提交携带配置服务实例和期望修订，重复 JSON 字段拒绝，旧修订或旧服务实例返回 409。宿主通过可替换 `ConfigValidator` 在写文件前验证完整候选配置，防止保存无效主模型协议、角色或运行方式。
 
-主模型、Jev 连接与角色配置适用于新请求；既有请求保留其捕获值。`runtime.llm` 与 `runtime.messages` 在当前宿主启动时捕获，因此标明修改需重启，并同时显示当前生效值和已保存覆盖值。`runtime.models` 是角色配置；QQ 消息判断模式仍由启动器 `jev.enabled` / `--message-judge` 选择，勾选角色并不会改变当前通道的模式。普通配置页不管理 QQ/模型实际密钥，也不编辑启动器根目录的 `config.json`；保存位置为当前 state-dir 下 `configuration/config.json`，含既有自动备份，恢复时文件覆盖优先于启动环境。同步文件提交的边界沿用配置插件说明。
+主模型、Jev 连接与角色配置适用于新请求；既有请求保留其捕获值。`runtime.llm` 与 `runtime.messages` 在当前宿主启动时捕获，因此标明修改需重启，并同时显示当前生效值和已保存覆盖值。核心和 QQ 入口当前只支持 `response_mode=complete`，保存 `stream` 会被宿主校验拒绝，保留原配置。`runtime.models` 是角色配置；QQ 消息判断模式仍由启动器 `jev.enabled` / `--message-judge` 选择，勾选角色并不会改变当前通道的模式。普通配置页不管理 QQ/模型实际密钥，也不编辑启动器根目录的 `config.json`；保存位置为当前 state-dir 下 `configuration/config.json`，含既有自动备份，恢复时文件覆盖优先于启动环境。同步文件提交的边界沿用配置插件说明。
 
 自动刷新页面目录不会覆盖正在编辑的表单；切换配置页前需保存或重新读取以放弃编辑。保存失败或响应丢失时保留编辑，先重新读取配置修订确认真实保存状态，不自动重复提交。退出清空页面字段和令牌。
 
