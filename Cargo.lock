@@ -590,6 +590,7 @@ name = "eve-plan-plugin"
 version = "0.1.0"
 dependencies = [
  "eve-kernel",
+ "eve-llm-api",
  "eve-plan-api",
  "eve-plugin-api",
  "serde",

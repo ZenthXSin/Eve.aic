@@ -1,23 +1,27 @@
-//! 本地操作者提供的有条件多步计划：绑定当前目标修订与输入，按依赖逐步执行宿主登记的能力。
+//! 有条件多步计划：本地操作者提供，或由模型建议后经操作者确认；绑定当前目标修订与输入，
+//! 按依赖逐步执行宿主登记的能力。
 //!
 //! 计划只引用能力 ID；路径由每次命令显式绑定，不进入计划或状态。步骤效果只按宿主独立读取的
-//! 证据判定。计划完成不改变父目标，父目标仍保持 Waiting。
+//! 证据判定。模型建议不授予执行权限。计划完成不改变父目标，父目标仍保持 Waiting。
 use crate::{
     AppError,
+    cognition::{interrupted, plan_model_resolver},
     cognition_action::{self, ExportPlanOptions},
-    cognition_action_admission::current_plan_binding,
+    cognition_action_admission::{current_plan_binding, plan_context},
 };
 use eve_action_api::{ActionFailure, ActionStatus, MAX_ACTION_TIMEOUT_MS};
 use eve_cognition_plugin::CognitionController;
 use eve_file_observer::BoundFileObserver;
 use eve_kernel::Kernel;
 use eve_plan_api::*;
-use eve_plan_plugin::{PlanController, PlanPlugin};
-use eve_plugin_api::{PluginId, ServiceRegistry};
+use eve_plan_plugin::{ModelPlanProposer, PlanController, PlanPlugin};
+use eve_plugin_api::{PluginId, ServiceId, ServiceRegistry};
+use eve_session_api::{SESSION_PLUGIN_ID, SESSION_SERVICE_ID, SessionServiceHandle};
+use eve_session_plugin::SessionPlugin;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -33,12 +37,14 @@ pub(crate) fn capabilities() -> Vec<CapabilitySpec> {
     vec![
         CapabilitySpec {
             id: OBSERVE.into(),
+            description: "重新读取操作者在执行时绑定的文本文件，得到完整字节 SHA-256；只读，不修改目标或输入证据。".into(),
             max_attempts: MAX_STEP_ATTEMPTS,
             max_timeout_ms: MAX_STEP_TIMEOUT_MS,
             requires_input: false,
         },
         CapabilitySpec {
             id: EXPORT.into(),
+            description: "把当前目标修订已验证的反思草稿导出到操作者指定的新文件并独立回读；有外部副作用，timeout_ms 须为 30000。".into(),
             max_attempts: 1,
             max_timeout_ms: MAX_ACTION_TIMEOUT_MS,
             requires_input: true,
@@ -53,6 +59,13 @@ pub(crate) struct PlanCreateOptions {
     pub user_id: String,
     pub input_sha256: Option<String>,
     pub steps_file: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PlanProposeOptions {
+    pub goal_id: String,
+    pub goal_revision: u64,
+    pub user_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -104,7 +117,7 @@ fn current_binding(
     })
 }
 
-/// 同一目标的活动计划若已过时则封存，使新计划不会被旧绑定挡住。
+/// 同一目标的待确认或活动计划若已过时则封存，使新计划不会被旧绑定挡住。
 fn reconcile_goal(
     journal: &PlanController,
     admin: &CognitionController,
@@ -113,7 +126,7 @@ fn reconcile_goal(
     at_ms: u64,
 ) -> Result<(), AppError> {
     for plan in journal.snapshot()?.plans {
-        if plan.status == PlanStatus::Active && plan.binding.goal_id == goal_id {
+        if plan.is_open() && plan.binding.goal_id == goal_id {
             let current = current_binding(admin, &plan, user_id, at_ms)?;
             journal.invalidate(&plan.id, plan.revision, &current, at_ms)?;
         }
@@ -133,12 +146,7 @@ pub(crate) async fn create(
     let text = String::from_utf8(std::fs::read(&options.steps_file)?)
         .map_err(|_| "步骤文件必须为 UTF-8 JSON。")?;
     let steps: StepsFile = serde_json::from_str(&text).map_err(|_| PlanError::InvalidInput)?;
-    // 导出步骤使用受控行动固定的期限，计划不能声明更短的期限后被忽略。
-    if steps
-        .steps
-        .iter()
-        .any(|step| step.capability == EXPORT && step.timeout_ms != MAX_ACTION_TIMEOUT_MS)
-    {
+    if !export_timeouts_fixed(&steps.steps) {
         return Err("导出步骤沿用受控行动 30 秒期限，timeout_ms 须为 30000。".into());
     }
     let at_ms = now_ms()?;
@@ -167,6 +175,188 @@ pub(crate) async fn create(
     )
 }
 
+/// 导出步骤使用受控行动固定的期限，计划不能声明更短的期限后被忽略。
+fn export_timeouts_fixed(steps: &[StepSpec]) -> bool {
+    steps
+        .iter()
+        .all(|step| step.capability != EXPORT || step.timeout_ms == MAX_ACTION_TIMEOUT_MS)
+}
+
+fn proposal_view(record: &ProposalRecord, plan: Option<&Plan>) -> Value {
+    json!({"proposal": record, "plan": plan.map(plan_view)})
+}
+
+async fn open_sessions(
+    kernel: &Kernel,
+    registry: &Arc<dyn ServiceRegistry>,
+) -> Result<Arc<SessionServiceHandle>, AppError> {
+    kernel.register(Box::new(SessionPlugin::new()?))?;
+    kernel.start(&PluginId::new(SESSION_PLUGIN_ID)?).await?;
+    Ok(registry
+        .get(&ServiceId::new(SESSION_SERVICE_ID)?)?
+        .ok_or("会话服务缺失。")?
+        .value
+        .downcast::<SessionServiceHandle>()
+        .map_err(|_| "会话服务类型错误。")?)
+}
+
+/// 请模型为当前目标修订建议一份计划。每个绑定（目标修订与输入摘要）至多保存一条请求记录、
+/// 发起一次无工具请求；已有记录时直接返回，不再请求。建议校验通过后保存为待确认计划。
+pub(crate) async fn propose(
+    kernel: &Kernel,
+    registry: &Arc<dyn ServiceRegistry>,
+    admin: &CognitionController,
+    state_directory: &Path,
+    agent_path: &Path,
+    options: PlanProposeOptions,
+) -> Result<Value, AppError> {
+    let at_ms = now_ms()?;
+    let (revision, input) = current_plan_binding(admin, &options.goal_id, &options.user_id, at_ms)?;
+    if revision != options.goal_revision {
+        return Err("目标修订已变化，请查看当前修订后再请求计划建议。".into());
+    }
+    let binding = PlanBinding {
+        goal_id: options.goal_id.clone(),
+        goal_revision: revision,
+        input_sha256: input,
+    };
+    let journal = open_plans(kernel).await?;
+    reconcile_goal(&journal, admin, &options.goal_id, &options.user_id, at_ms)?;
+    let existing = |journal: &PlanController| -> Result<Option<Value>, AppError> {
+        let snapshot = journal.snapshot()?;
+        let id = proposal_id(SUBJECT, &binding)?;
+        Ok(snapshot
+            .proposals
+            .iter()
+            .find(|record| record.id == id)
+            .map(|record| {
+                let plan = match &record.status {
+                    ProposalStatus::Proposed { plan_id } => {
+                        snapshot.plans.iter().find(|plan| &plan.id == plan_id)
+                    }
+                    _ => None,
+                };
+                proposal_view(record, plan)
+            }))
+    };
+    if let Some(view) = existing(&journal)? {
+        return Ok(json!({"command": "plan-propose", "duplicate": true,
+            "model_request_attempted": false, "result": view}));
+    }
+    // 上下文与模型配置在保存请求记录之前准备；这些失败不消耗该修订的建议机会。
+    let sessions = open_sessions(kernel, registry).await?;
+    let (goal, draft) = plan_context(
+        admin,
+        sessions.0.as_ref(),
+        &options.goal_id,
+        &options.user_id,
+        at_ms,
+    )?;
+    let request = ProposalRequest::new(
+        SUBJECT,
+        binding.clone(),
+        goal,
+        draft.map(|artifact| ProposalDraft {
+            summary: artifact.summary,
+            next_step: artifact.next_step,
+        }),
+        &capabilities(),
+    )?;
+    let proposer = ModelPlanProposer::new(
+        plan_model_resolver(kernel, registry, state_directory, agent_path).await?,
+    );
+    let reserved = journal.reserve_proposal(&binding, proposer.version(), at_ms)?;
+    if reserved.duplicate {
+        let view = existing(&journal)?.ok_or(PlanError::CorruptState)?;
+        return Ok(json!({"command": "plan-propose", "duplicate": true,
+            "model_request_attempted": false, "result": view}));
+    }
+    let requested = reserved.record.requested_at_ms;
+    let result = {
+        let stop = interrupted();
+        tokio::pin!(stop);
+        tokio::select! {
+            biased;
+            _ = &mut stop => Err(ProposalFailure::Cancelled),
+            result = proposer.propose(request) => result,
+        }
+    };
+    let outcome = match result {
+        Ok(steps) if steps.is_empty() => ProposalOutcome::Empty,
+        Ok(steps) if !export_timeouts_fixed(&steps) => {
+            ProposalOutcome::Failed(ProposalFailure::InvalidOutput)
+        }
+        Ok(steps) => {
+            // 请求期间目标或输入变化时，建议不再对应当前目标，不保存为计划。
+            let current =
+                current_plan_binding(admin, &options.goal_id, &options.user_id, now_ms()?).ok();
+            if current != Some((binding.goal_revision, binding.input_sha256.clone())) {
+                ProposalOutcome::Failed(ProposalFailure::BindingChanged)
+            } else {
+                ProposalOutcome::Steps(steps)
+            }
+        }
+        Err(failure) => ProposalOutcome::Failed(failure),
+    };
+    let finished = journal.finish_proposal(
+        &reserved.record.id,
+        outcome,
+        &capabilities(),
+        now_ms()?.max(requested),
+    )?;
+    Ok(json!({"command": "plan-propose", "duplicate": false,
+        "model_request_attempted": true,
+        "result": proposal_view(&finished.record, finished.plan.as_ref())}))
+}
+
+fn find_plan(journal: &PlanController, plan_id: &str) -> Result<Plan, AppError> {
+    Ok(journal
+        .snapshot()?
+        .plans
+        .into_iter()
+        .find(|plan| plan.id == plan_id)
+        .ok_or(PlanError::NotFound)?)
+}
+
+/// 操作者确认待确认的建议。确认前核对目标所有权与当前绑定；已变化时封存为过时，不执行步骤。
+pub(crate) async fn confirm(
+    kernel: &Kernel,
+    admin: &CognitionController,
+    plan_id: &str,
+    user_id: &str,
+) -> Result<Value, AppError> {
+    let journal = open_plans(kernel).await?;
+    let plan = find_plan(&journal, plan_id)?;
+    if plan.status != PlanStatus::Proposed {
+        return Err(PlanError::InvalidTransition.into());
+    }
+    let at_ms = now_ms()?;
+    let current = current_binding(admin, &plan, user_id, at_ms)?;
+    let plan = journal.confirm(&plan.id, plan.revision, &current, at_ms)?;
+    let confirmed = plan.status == PlanStatus::Active;
+    let mut report = json!({"command": "plan-confirm", "confirmed": confirmed,
+        "plan": plan_view(&plan)});
+    if !confirmed {
+        report["reason"] = json!("binding_changed");
+    }
+    Ok(report)
+}
+
+/// 操作者撤销待确认或活动计划；只核对目标所有权，不执行任何能力。
+pub(crate) async fn withdraw(
+    kernel: &Kernel,
+    admin: &CognitionController,
+    plan_id: &str,
+    user_id: &str,
+) -> Result<Value, AppError> {
+    let journal = open_plans(kernel).await?;
+    let plan = find_plan(&journal, plan_id)?;
+    let at_ms = now_ms()?;
+    current_plan_binding(admin, &plan.binding.goal_id, user_id, at_ms)?;
+    let plan = journal.withdraw(&plan.id, plan.revision, at_ms)?;
+    Ok(json!({"command": "plan-withdraw", "plan": plan_view(&plan)}))
+}
+
 /// 打开账本会先封存遗留 Executing，属于恢复性读取；不执行步骤，不改变认知状态。
 pub(crate) async fn show(
     kernel: &Kernel,
@@ -176,10 +366,10 @@ pub(crate) async fn show(
 ) -> Result<Value, AppError> {
     let journal = open_plans(kernel).await?;
     let at_ms = now_ms()?;
-    let plans: Vec<_> = journal
-        .snapshot()?
+    let snapshot = journal.snapshot()?;
+    let plans: Vec<_> = snapshot
         .plans
-        .into_iter()
+        .iter()
         .filter(|plan| {
             goal_id
                 .as_deref()
@@ -187,15 +377,24 @@ pub(crate) async fn show(
         })
         .map(|plan| {
             // 只报告绑定是否仍成立；封存由 plan-step 或新建计划时执行。
-            let current = current_binding(admin, &plan, user_id, at_ms)
+            let current = current_binding(admin, plan, user_id, at_ms)
                 .ok()
                 .map(|current| current == plan.binding);
-            let mut view = plan_view(&plan);
+            let mut view = plan_view(plan);
             view["binding_current"] = json!(current);
             view
         })
         .collect();
-    Ok(json!({"command": "plan-show", "plans": plans}))
+    let proposals: Vec<_> = snapshot
+        .proposals
+        .iter()
+        .filter(|record| {
+            goal_id
+                .as_deref()
+                .is_none_or(|id| record.binding.goal_id == id)
+        })
+        .collect();
+    Ok(json!({"command": "plan-show", "plans": plans, "proposals": proposals}))
 }
 
 pub(crate) async fn step(

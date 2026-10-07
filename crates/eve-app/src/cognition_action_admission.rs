@@ -66,48 +66,7 @@ pub(crate) fn prepare_proposal(
     let (event, observation) = latest_observation(&snapshot.state, parent, at_ms)?;
     match_actual_observation(input, observed, &observation, at_ms)?;
     let reflection = completed_current_reflection(&snapshot.state, parent)?;
-    let execution = reflection
-        .execution
-        .as_ref()
-        .ok_or(CognitionError::CorruptState)?;
-    // 不使用通用内部用户兜底：文件行动只导出同一显式用户拥有的反思。
-    let Visibility::User(reflection_user) = &reflection.visibility else {
-        return Err(CognitionError::AccessDenied.into());
-    };
-    let key = SessionKey::new(&execution.session_id, reflection_user)?;
-    let session = sessions
-        .snapshot(&key)?
-        .ok_or("已验证反思的会话记录缺失，未生成文档行动。")?;
-    session.validate()?;
-    if session.key != key {
-        return Err(CognitionError::AccessDenied.into());
-    }
-    let turn_id = execution.turn_id.ok_or(CognitionError::CorruptState)?;
-    let turn = session
-        .turns
-        .iter()
-        .find(|turn| turn.id == turn_id)
-        .ok_or("已验证反思的执行轮次缺失，未生成文档行动。")?;
-    if turn.input != reflection.description {
-        return Err(CognitionError::CorruptState.into());
-    }
-    let SessionTurnStatus::Completed { messages } = &turn.status else {
-        return Err("反思会话轮次尚未提交完成，未生成文档行动。".into());
-    };
-    if messages.iter().any(|message| {
-        message.role == ChatRole::Tool
-            || !message.tool_calls.is_empty()
-            || !message.tool_results.is_empty()
-    }) {
-        return Err("反思会话包含工具活动，不能作为文档草稿导出。".into());
-    }
-    let text = messages
-        .last()
-        .filter(|message| message.role == ChatRole::Assistant)
-        .and_then(|message| message.text.as_deref())
-        .ok_or(CognitionError::CorruptState)?;
-    let artifact = ReflectionArtifact::parse(text)
-        .map_err(|_| "已验证反思的产物结构不一致，未生成文档行动。")?;
+    let artifact = saved_artifact(sessions, reflection)?;
     // 序列化已验证结构，不复制模型外围正文；不能截断成另一份未经核对的产物。
     let mut bytes = serde_json::to_vec_pretty(&artifact)?;
     bytes.push(b'\n');
@@ -286,21 +245,95 @@ pub(crate) fn current_plan_binding(
     Ok((parent.revision, input))
 }
 
+/// 读取真实 Session 中已验证反思的结构化产物；会话、轮次或产物与目标记录不符时报错。
+fn saved_artifact(
+    sessions: &dyn SessionService,
+    reflection: &Goal,
+) -> Result<ReflectionArtifact, AppError> {
+    let execution = reflection
+        .execution
+        .as_ref()
+        .ok_or(CognitionError::CorruptState)?;
+    // 不使用通用内部用户兜底：只读取同一显式用户拥有的反思。
+    let Visibility::User(reflection_user) = &reflection.visibility else {
+        return Err(CognitionError::AccessDenied.into());
+    };
+    let key = SessionKey::new(&execution.session_id, reflection_user)?;
+    let session = sessions
+        .snapshot(&key)?
+        .ok_or("已验证反思的会话记录缺失，未生成文档行动。")?;
+    session.validate()?;
+    if session.key != key {
+        return Err(CognitionError::AccessDenied.into());
+    }
+    let turn_id = execution.turn_id.ok_or(CognitionError::CorruptState)?;
+    let turn = session
+        .turns
+        .iter()
+        .find(|turn| turn.id == turn_id)
+        .ok_or("已验证反思的执行轮次缺失，未生成文档行动。")?;
+    if turn.input != reflection.description {
+        return Err(CognitionError::CorruptState.into());
+    }
+    let SessionTurnStatus::Completed { messages } = &turn.status else {
+        return Err("反思会话轮次尚未提交完成，未生成文档行动。".into());
+    };
+    if messages.iter().any(|message| {
+        message.role == ChatRole::Tool
+            || !message.tool_calls.is_empty()
+            || !message.tool_results.is_empty()
+    }) {
+        return Err("反思会话包含工具活动，不能作为文档草稿导出。".into());
+    }
+    let text = messages
+        .last()
+        .filter(|message| message.role == ChatRole::Assistant)
+        .and_then(|message| message.text.as_deref())
+        .ok_or(CognitionError::CorruptState)?;
+    Ok(ReflectionArtifact::parse(text)
+        .map_err(|_| "已验证反思的产物结构不一致，未生成文档行动。")?)
+}
+
+/// 计划建议的上下文：目标描述与当前修订已验证的反思草稿（尚未完成时为空）。
+/// 目标所有权与等待状态和文档行动准入相同；派生记录残缺时报错，不退回旧草稿。
+pub(crate) fn plan_context(
+    admin: &dyn CognitionAdmin,
+    sessions: &dyn SessionService,
+    goal_id: &str,
+    user_id: &str,
+    at_ms: u64,
+) -> Result<(String, Option<ReflectionArtifact>), AppError> {
+    validate_id(goal_id)?;
+    validate_id(user_id)?;
+    let snapshot = checked_snapshot(admin)?;
+    let parent = owned_waiting_parent(&snapshot, goal_id, user_id, at_ms)?;
+    let artifact = match current_reflection(&snapshot.state, SUBJECT, parent)? {
+        Some(reflection) if verified_reflection(reflection, parent) => {
+            Some(saved_artifact(sessions, reflection)?)
+        }
+        _ => None,
+    };
+    Ok((parent.description.clone(), artifact))
+}
+
+fn verified_reflection(reflection: &Goal, parent: &Goal) -> bool {
+    reflection.status == GoalStatus::Completed
+        && reflection.visibility == parent.visibility
+        && reflection.revision != 0
+        && reflection.feedback.as_ref().is_some_and(|feedback| {
+            feedback.commit == ExecutionCommit::Completed
+                && feedback.verification_met
+                && feedback.started_tools == Some(0)
+        })
+}
+
 fn completed_current_reflection<'a>(
     state: &'a CognitiveState,
     parent: &Goal,
 ) -> Result<&'a Goal, AppError> {
     let reflection = current_reflection(state, SUBJECT, parent)?
         .ok_or("当前目标修订还没有反思草稿，未生成文档行动。")?;
-    if reflection.status != GoalStatus::Completed
-        || reflection.visibility != parent.visibility
-        || reflection.revision == 0
-        || !reflection.feedback.as_ref().is_some_and(|feedback| {
-            feedback.commit == ExecutionCommit::Completed
-                && feedback.verification_met
-                && feedback.started_tools == Some(0)
-        })
-    {
+    if !verified_reflection(reflection, parent) {
         return Err("当前反思尚无已提交且零工具的有效产物，未生成文档行动。".into());
     }
     Ok(reflection)

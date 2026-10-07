@@ -169,6 +169,17 @@ fn goal(root: &Path) -> Value {
     cognition(root)["state"]["goals"]["goal"].clone()
 }
 
+fn with_model(command: &mut Command, server: &Server) {
+    command
+        .env("EVE_OPENAI_API_KEY", KEY)
+        .env("EVE_OPENAI_MODEL", "plan-fixture")
+        .env("EVE_OPENAI_PROTOCOL", "responses")
+        .env("EVE_OPENAI_BASE_URL", &server.url)
+        .env("EVE_OPENAI_TIMEOUT_SECONDS", "30")
+        .env("EVE_OPENAI_REASONING_EFFORT", "none")
+        .env("EVE_LLM_RESPONSE_MODE", "complete");
+}
+
 /// 保存目标、观察输入文件并完成一次反思；返回当前目标修订与输入摘要。
 async fn prepared(root: &Path, server: &mut Server) -> (u64, String) {
     invoke(
@@ -183,14 +194,8 @@ async fn prepared(root: &Path, server: &mut Server) -> (u64, String) {
     )
     .await;
     let mut command = command(root);
+    with_model(&mut command, server);
     command
-        .env("EVE_OPENAI_API_KEY", KEY)
-        .env("EVE_OPENAI_MODEL", "plan-fixture")
-        .env("EVE_OPENAI_PROTOCOL", "responses")
-        .env("EVE_OPENAI_BASE_URL", &server.url)
-        .env("EVE_OPENAI_TIMEOUT_SECONDS", "30")
-        .env("EVE_OPENAI_REASONING_EFFORT", "none")
-        .env("EVE_LLM_RESPONSE_MODE", "complete")
         .args([
             "run",
             "--seconds",
@@ -520,4 +525,263 @@ async fn invalid_or_mismatched_plans_are_rejected_without_state_change() {
     )
     .await;
     assert!(server.requests.try_recv().is_err(), "拒绝计划不调用模型");
+}
+
+fn proposal_reply(steps: Value) -> Reply {
+    Reply::json(final_response(&json!({"steps": steps}).to_string()))
+}
+async fn propose(root: &Path, server: &Server, revision: u64) -> Value {
+    let mut command = command(root);
+    with_model(&mut command, server);
+    command.args([
+        "plan-propose",
+        "--id",
+        "goal",
+        "--revision",
+        &revision.to_string(),
+    ]);
+    success(Process::start(command).finish().await)
+}
+async fn feedback(root: &Path, revision: u64, id: &str) {
+    invoke(
+        root,
+        &[
+            "feedback",
+            "--id",
+            "goal",
+            "--revision",
+            &revision.to_string(),
+            "--feedback-id",
+            id,
+            "--text",
+            "只整理材料 B。",
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn model_proposal_waits_for_operator_confirmation_and_is_requested_once() {
+    let root = fixture();
+    let digest = sha256(INPUT.as_bytes());
+    let mut server = Server::start(vec![reflection(), proposal_reply(three_steps(&digest))]).await;
+    let (revision, input) = prepared(root.path(), &mut server).await;
+    assert_eq!(input, digest);
+
+    let proposed = propose(root.path(), &server, revision).await;
+    assert_eq!(proposed["duplicate"], false);
+    assert_eq!(proposed["model_request_attempted"], true);
+    let result = &proposed["result"];
+    assert_eq!(result["proposal"]["status"]["kind"], "proposed");
+    assert_eq!(result["plan"]["plan"]["status"], "proposed");
+    assert_eq!(result["plan"]["plan"]["origin"]["kind"], "model");
+    assert_eq!(result["plan"]["ready_steps"], json!([]), "未确认不准入");
+    assert_eq!(result["plan"]["plan"]["binding"]["input_sha256"], input);
+    let plan_id = result["plan"]["plan"]["id"].as_str().unwrap().to_owned();
+
+    let request = server.next().await;
+    assert_eq!(request.body["tools"], json!([]), "建议请求不安装工具");
+    let body = request.body.to_string();
+    assert!(
+        body.contains("整理材料并准备一份可审阅的计划。"),
+        "目标描述作为数据"
+    );
+    assert!(
+        body.contains("先核对材料再导出清单。"),
+        "当前修订的已验证草稿作为数据"
+    );
+    assert!(body.contains(OBSERVE) && body.contains(EXPORT));
+    assert!(
+        !body.contains("private-source.txt") && !body.contains("材料 A 已检查"),
+        "路径与文件正文不进入建议请求"
+    );
+
+    // 待确认的建议既不能执行，也挡住同一目标的其他计划；重复请求不再调用模型。
+    rejected(
+        root.path(),
+        &[
+            "plan-step",
+            "--plan",
+            &plan_id,
+            "--step",
+            "check",
+            "--observe-file",
+            source(root.path()).to_str().unwrap(),
+        ],
+    )
+    .await;
+    let steps = steps_file(root.path(), "steps.json", three_steps(&input));
+    rejected(
+        root.path(),
+        &[
+            "plan-create",
+            "--id",
+            "goal",
+            "--revision",
+            &revision.to_string(),
+            "--input-sha256",
+            &input,
+            "--steps",
+            &steps,
+        ],
+    )
+    .await;
+    let again = propose(root.path(), &server, revision).await;
+    assert_eq!(again["duplicate"], true);
+    assert_eq!(again["model_request_attempted"], false);
+    assert_eq!(again["result"]["plan"]["plan"]["id"], plan_id);
+    rejected(
+        root.path(),
+        &["plan-confirm", "--plan", &plan_id, "--user", "intruder"],
+    )
+    .await;
+
+    let confirmed = invoke(root.path(), &["plan-confirm", "--plan", &plan_id]).await;
+    assert_eq!(confirmed["confirmed"], true);
+    assert_eq!(confirmed["plan"]["plan"]["status"], "active");
+    assert_eq!(confirmed["plan"]["ready_steps"], json!(["check"]));
+    rejected(root.path(), &["plan-confirm", "--plan", &plan_id]).await;
+    let checked = step(root.path(), &plan_id, "check", false).await;
+    assert_eq!(checked["step"]["status"], "satisfied");
+
+    let withdrawn = invoke(root.path(), &["plan-withdraw", "--plan", &plan_id]).await;
+    assert_eq!(withdrawn["plan"]["plan"]["status"], "withdrawn");
+    assert_eq!(
+        statuses(&withdrawn["plan"]),
+        ["satisfied", "blocked", "blocked"]
+    );
+    assert!(!destination(root.path()).exists(), "撤销后不执行导出");
+    rejected(root.path(), &["plan-withdraw", "--plan", &plan_id]).await;
+    let shown = invoke(root.path(), &["plan-show", "--id", "goal"]).await;
+    assert_eq!(shown["proposals"].as_array().unwrap().len(), 1);
+    assert_eq!(goal(root.path())["status"], "Waiting", "父目标保持等待");
+    assert!(server.requests.try_recv().is_err(), "每个修订只请求一次");
+}
+
+#[tokio::test]
+async fn invalid_proposals_and_changed_goals_never_become_runnable_plans() {
+    let root = fixture();
+    let input = sha256(INPUT.as_bytes());
+    let mut shell = three_steps(&input);
+    shell[0]["capability"] = json!("eve.shell.v1");
+    let observe_only = json!([
+        {"id": "wait", "title": "等待材料更新", "capability": OBSERVE, "depends_on": [],
+         "max_attempts": 2, "timeout_ms": 5000, "effect": {"kind": "digest_differs", "sha256": input}}
+    ]);
+    let mut server = Server::start(vec![
+        reflection(),
+        proposal_reply(shell),
+        proposal_reply(observe_only),
+    ])
+    .await;
+    let (revision, _) = prepared(root.path(), &mut server).await;
+
+    // 缺少模型配置、修订不符或他人目标：保存请求记录之前拒绝，不消耗该修订的建议机会。
+    rejected(
+        root.path(),
+        &[
+            "plan-propose",
+            "--id",
+            "goal",
+            "--revision",
+            &revision.to_string(),
+        ],
+    )
+    .await;
+    let mut wrong = command(root.path());
+    with_model(&mut wrong, &server);
+    wrong.args(["plan-propose", "--id", "goal", "--revision", "99"]);
+    let baseline = state_bytes(root.path());
+    assert!(!Process::start(wrong).finish().await.status.success());
+    let mut intruder = command(root.path());
+    with_model(&mut intruder, &server);
+    intruder.args([
+        "plan-propose",
+        "--id",
+        "goal",
+        "--revision",
+        &revision.to_string(),
+        "--user",
+        "intruder",
+    ]);
+    assert!(!Process::start(intruder).finish().await.status.success());
+    assert_eq!(state_bytes(root.path()), baseline);
+    assert!(server.requests.try_recv().is_err());
+
+    let invalid = propose(root.path(), &server, revision).await;
+    assert_eq!(invalid["result"]["proposal"]["status"]["kind"], "failed");
+    assert_eq!(
+        invalid["result"]["proposal"]["status"]["failure"],
+        "invalid_output"
+    );
+    assert_eq!(invalid["result"]["plan"], Value::Null);
+    server.next().await;
+    let again = propose(root.path(), &server, revision).await;
+    assert_eq!(again["duplicate"], true, "失败也不重新请求同一修订");
+    assert!(server.requests.try_recv().is_err());
+
+    // 新修订可以再请求一次；当前修订尚无反思草稿时只交目标描述。
+    feedback(root.path(), revision, "fact-1").await;
+    let proposed = propose(root.path(), &server, revision + 1).await;
+    let request = server.next().await;
+    assert!(
+        !request.body.to_string().contains("先核对材料再导出清单。"),
+        "过时草稿不进入请求"
+    );
+    let plan_id = proposed["result"]["plan"]["plan"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(proposed["result"]["plan"]["plan"]["status"], "proposed");
+
+    // 确认前目标又有新反馈：建议封存为过时，不执行任何步骤。
+    feedback(root.path(), revision + 1, "fact-2").await;
+    let late = invoke(root.path(), &["plan-confirm", "--plan", &plan_id]).await;
+    assert_eq!(late["confirmed"], false);
+    assert_eq!(late["reason"], "binding_changed");
+    assert_eq!(late["plan"]["plan"]["status"], "stale");
+    assert_eq!(statuses(&late["plan"]), ["invalidated"]);
+    assert!(server.requests.try_recv().is_err());
+}
+
+fn ledger(root: &Path) -> Value {
+    let file: Value = serde_json::from_slice(&state_bytes(root)).unwrap();
+    let bytes: Vec<u8> =
+        serde_json::from_value(file["entries"]["eve.plan"]["plans.v1"].clone()).unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn proposal_record_is_saved_before_the_request_and_never_replayed_after_a_crash() {
+    let root = fixture();
+    let mut slow = proposal_reply(json!([]));
+    slow.body_delay = Duration::from_secs(20);
+    let mut server = Server::start(vec![reflection(), slow]).await;
+    let (revision, _) = prepared(root.path(), &mut server).await;
+    let mut command = command(root.path());
+    with_model(&mut command, &server);
+    command.args([
+        "plan-propose",
+        "--id",
+        "goal",
+        "--revision",
+        &revision.to_string(),
+    ]);
+    let mut process = Process::start(command);
+    // 模型收到请求时，请求记录已经落盘。
+    server.next().await;
+    let saved = ledger(root.path());
+    assert_eq!(saved["schema_version"], 2);
+    assert_eq!(saved["proposals"][0]["status"]["kind"], "requested");
+    process.0.as_mut().unwrap().kill().unwrap();
+    process.0.take().unwrap().wait_with_output().unwrap();
+
+    let shown = invoke(root.path(), &["plan-show", "--id", "goal"]).await;
+    assert_eq!(shown["proposals"][0]["status"]["kind"], "failed");
+    assert_eq!(shown["proposals"][0]["status"]["failure"], "interrupted");
+    let again = propose(root.path(), &server, revision).await;
+    assert_eq!(again["duplicate"], true, "中断的请求不自动重放");
+    assert_eq!(again["model_request_attempted"], false);
+    assert!(server.requests.try_recv().is_err());
+    assert!(shown["plans"].as_array().unwrap().is_empty());
 }

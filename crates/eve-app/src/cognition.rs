@@ -1,6 +1,6 @@
 //! 本地内生反思宿主：用户目标保持 Waiting，只对派生草稿安装受限执行能力。
 use crate::cognition_action::ExportPlanOptions;
-use crate::cognition_plan::{PlanCreateOptions, PlanStepOptions};
+use crate::cognition_plan::{PlanCreateOptions, PlanProposeOptions, PlanStepOptions};
 use crate::{
     AppError, AppFailure, cognition_action, cognition_plan, config, core_bootstrap, models,
     services,
@@ -58,6 +58,10 @@ pub const COGNITION_HELP: &str = "Eve 本地内生反思入口
   plan-show [--id ID] [--user owner]      查看计划、就绪步骤及绑定是否仍成立；会封存遗留执行
   plan-step --plan 计划ID --step 步骤ID [--observe-file 路径] [--output 路径] [--user owner]
                                           执行一个就绪步骤；效果只按独立读取的证据判定
+  plan-propose --id ID --revision N [--user owner]
+                                          请模型就当前修订建议一份计划；校验后待确认，每个修订至多请求一次
+  plan-confirm --plan 计划ID [--user owner]   确认待确认的建议；绑定已变化时封存为过时
+  plan-withdraw --plan 计划ID [--user owner]  撤销待确认或活动计划；有步骤执行中时拒绝
   run [--seconds 30] [--max-executions 1]   无需新输入，推进已有目标的反思草稿
       [--observe-goal ID --observe-file 路径 [--observe-user owner]]
                                           观察指定文本文件，内容变化后保存证据并重规划
@@ -65,7 +69,7 @@ pub const COGNITION_HELP: &str = "Eve 本地内生反思入口
 文件观察只在本次 run 生效；上限 64 KiB，仅前缀进入规划，完整字节保存 SHA-256。
 agenda 不恢复或改写认知快照，两个阶段分别显示已有 Ready 目标与待派生 Waiting 目标。
 默认文件状态；--database-config 显式选用本地 PostgreSQL，首次使用须选无文件快照的新目录。
-仅有可执行反思时才需要 EVE_OPENAI_API_KEY 和主模型配置；沿用 AGENT.md。
+仅有可执行反思或 plan-propose 时才需要 EVE_OPENAI_API_KEY 和主模型配置；沿用 AGENT.md。
 每项反思最多一次模型请求、零工具、一次尝试、30 秒；父目标仍等待用户处理。
 Ctrl+C 或 SIGTERM 停止派生，取消并等待保存，然后关闭插件。";
 
@@ -98,6 +102,15 @@ enum CognitionCommand {
         user: String,
     },
     PlanStep(PlanStepOptions),
+    PlanPropose(PlanProposeOptions),
+    PlanConfirm {
+        plan_id: String,
+        user: String,
+    },
+    PlanWithdraw {
+        plan_id: String,
+        user: String,
+    },
     Run {
         seconds: u64,
         max_executions: u16,
@@ -146,6 +159,9 @@ impl CognitionOptions {
                 "plan-create",
                 "plan-show",
                 "plan-step",
+                "plan-propose",
+                "plan-confirm",
+                "plan-withdraw",
             ]
             .contains(&arg.as_str())
             {
@@ -322,6 +338,38 @@ impl CognitionOptions {
                     observe_file: observation_file.take(),
                     output_file: output_file.take(),
                 })
+            }
+            "plan-propose" => {
+                let goal_id = fields.remove("--id").ok_or("plan-propose 缺少 --id。")?;
+                let goal_revision = fields
+                    .remove("--revision")
+                    .ok_or("plan-propose 缺少 --revision。")?
+                    .parse::<u64>()
+                    .map_err(|_| "计划目标修订必须为正整数。")?;
+                let user_id = fields.remove("--user").unwrap_or_else(|| "owner".into());
+                validate_id(&goal_id)?;
+                validate_id(&user_id)?;
+                if goal_revision == 0 {
+                    return Err("计划目标修订必须为正整数。".into());
+                }
+                CognitionCommand::PlanPropose(PlanProposeOptions {
+                    goal_id,
+                    goal_revision,
+                    user_id,
+                })
+            }
+            name @ ("plan-confirm" | "plan-withdraw") => {
+                let plan_id = fields
+                    .remove("--plan")
+                    .ok_or_else(|| format!("{name} 缺少 --plan。"))?;
+                let user = fields.remove("--user").unwrap_or_else(|| "owner".into());
+                validate_id(&plan_id)?;
+                validate_id(&user)?;
+                if name == "plan-confirm" {
+                    CognitionCommand::PlanConfirm { plan_id, user }
+                } else {
+                    CognitionCommand::PlanWithdraw { plan_id, user }
+                }
             }
             "run" => {
                 let seconds = fields
@@ -623,7 +671,7 @@ async fn show(
     Ok(json!({"command": "show", "goal": goal, "reflections": reflections, "actions": actions}))
 }
 
-async fn interrupted() -> Result<(), AppError> {
+pub(crate) async fn interrupted() -> Result<(), AppError> {
     #[cfg(unix)]
     {
         let mut terminate =
@@ -643,33 +691,19 @@ async fn start_loop(
     max_executions: u16,
 ) -> Result<LoopController, AppError> {
     let bootstrap = core_bootstrap(&options.agent_path)?;
-    let plugin = ConfigPlugin::new(ConfigBootstrap::new(
-        options.state_directory.join("configuration"),
-        vec![
-            runtime_llm_schema(),
-            config::openai_schema(),
-            model_roles_schema(),
-        ],
-    ))?;
-    kernel.register(Box::new(plugin))?;
+    register_config(kernel, &options.state_directory)?;
     kernel.register(Box::new(SessionPlugin::new()?))?;
     kernel.register(Box::new(services::CoreServices::new()?))?;
     let owner = PluginId::new(services::OWNER)?;
     kernel.start(&owner).await?;
-    let settings = backends
-        .registry
-        .get(&ServiceId::new(CONFIG_SERVICE_ID)?)?
-        .ok_or("配置服务缺失。")?
-        .value
-        .downcast::<ConfigServiceHandle>()
-        .map_err(|_| "配置服务类型错误。")?;
-    let request = settings.0.begin_request(LLM_NAMESPACE, 1)?;
-    let runtime = LlmRuntimeConfig::try_from(&settings.0.read_request(&request)?)?;
+    let settings = config_service(&backends.registry)?;
+    let request = settings.begin_request(LLM_NAMESPACE, 1)?;
+    let runtime = LlmRuntimeConfig::try_from(&settings.read_request(&request)?)?;
     if runtime.response_mode != "complete" {
         return Err("内生反思当前要求 complete 模式。".into());
     }
     let resolver = Arc::new(models::CoreModelResolver::new(
-        settings.0.clone(),
+        settings.clone(),
         bootstrap.api_key,
     ));
     let selected = resolver.resolve()?;
@@ -722,6 +756,60 @@ async fn start_loop(
     kernel.register(Box::new(plugin))?;
     kernel.start(&PluginId::new(LOOP_PLUGIN_ID)?).await?;
     Ok(controller)
+}
+
+fn register_config(kernel: &Kernel, state_directory: &std::path::Path) -> Result<(), AppError> {
+    let plugin = ConfigPlugin::new(ConfigBootstrap::new(
+        state_directory.join("configuration"),
+        vec![
+            runtime_llm_schema(),
+            config::openai_schema(),
+            model_roles_schema(),
+        ],
+    ))?;
+    kernel.register(Box::new(plugin))?;
+    Ok(())
+}
+
+fn config_service(
+    registry: &Arc<dyn ServiceRegistry>,
+) -> Result<Arc<dyn eve_config_api::ConfigService>, AppError> {
+    Ok(registry
+        .get(&ServiceId::new(CONFIG_SERVICE_ID)?)?
+        .ok_or("配置服务缺失。")?
+        .value
+        .downcast::<ConfigServiceHandle>()
+        .map_err(|_| "配置服务类型错误。")?
+        .0
+        .clone())
+}
+
+/// 计划建议只需主模型选择：启动配置插件并按与反思相同的规则解析 Provider。
+/// 不启动会话、上下文或控制插件；建议请求不进入会话历史，也不安装工具。
+pub(crate) async fn plan_model_resolver(
+    kernel: &Kernel,
+    registry: &Arc<dyn ServiceRegistry>,
+    state_directory: &std::path::Path,
+    agent_path: &std::path::Path,
+) -> Result<Arc<dyn LlmModelResolver>, AppError> {
+    let bootstrap = core_bootstrap(agent_path)?;
+    register_config(kernel, state_directory)?;
+    kernel
+        .start(&PluginId::new(eve_config_api::CONFIG_PLUGIN_ID)?)
+        .await?;
+    let settings = config_service(registry)?;
+    let request = settings.begin_request(LLM_NAMESPACE, 1)?;
+    let runtime = LlmRuntimeConfig::try_from(&settings.read_request(&request)?)?;
+    if runtime.response_mode != "complete" {
+        return Err("计划建议当前要求 complete 模式。".into());
+    }
+    let resolver = Arc::new(models::CoreModelResolver::new(
+        settings.clone(),
+        bootstrap.api_key,
+    ));
+    // 在保存请求记录之前确认模型配置可用；配置错误不消耗该修订的建议机会。
+    resolver.resolve()?;
+    Ok(resolver)
 }
 
 fn loop_report(stats: LoopStats) -> Value {
@@ -984,6 +1072,23 @@ pub async fn run_cognition_with_planner_factory(
             }
             CognitionCommand::PlanStep(step_options) => {
                 cognition_plan::step(&kernel, &backends.registry, &admin, step_options).await
+            }
+            CognitionCommand::PlanPropose(propose_options) => {
+                cognition_plan::propose(
+                    &kernel,
+                    &backends.registry,
+                    &admin,
+                    &options.state_directory,
+                    &options.agent_path,
+                    propose_options,
+                )
+                .await
+            }
+            CognitionCommand::PlanConfirm { plan_id, user } => {
+                cognition_plan::confirm(&kernel, &admin, &plan_id, &user).await
+            }
+            CognitionCommand::PlanWithdraw { plan_id, user } => {
+                cognition_plan::withdraw(&kernel, &admin, &plan_id, &user).await
             }
             CognitionCommand::Run {
                 seconds,
