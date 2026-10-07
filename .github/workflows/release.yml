@@ -5,7 +5,7 @@ on:
     branches: [main]
     tags: ['v*']
   pull_request:
-    paths: ['packaging/**', 'scripts/package-*.ps1', 'scripts/package-*.py', 'scripts/test-*package.py', 'scripts/test-launcher-signal.py', '.github/workflows/release.yml']
+    paths: ['packaging/**', 'scripts/package-*.ps1', 'scripts/package-*.py', 'scripts/test-*package.py', 'scripts/test-launcher-signal.py', 'scripts/release-portable.py', 'scripts/test-release-portable.py', '.github/workflows/release.yml']
   workflow_dispatch:
 
 permissions:
@@ -16,8 +16,30 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
+  prepare:
+    name: 校验发行逻辑与分配版本
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      publish: ${{ steps.version.outputs.publish }}
+      automatic: ${{ steps.version.outputs.automatic }}
+    steps:
+      - name: 检出精确源码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: 验证版本选择、失败保护和草稿恢复
+        run: python scripts/test-release-portable.py
+      - name: 为主线或标签选择发行版本
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/release-portable.py prepare
+
   build:
     name: 构建与验收 / ${{ matrix.label }}
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -51,6 +73,7 @@ jobs:
       - name: 打包运行器与固定 QQ 运行环境
         env:
           EVE_BUILD_TARGET: ${{ matrix.target }}
+          EVE_RELEASE_VERSION: ${{ needs.prepare.outputs.release_tag }}
         shell: bash
         run: python scripts/package-portable.py --target "$EVE_BUILD_TARGET"
       - name: 解压后原生进程验收
@@ -70,80 +93,30 @@ jobs:
 
   publish:
     name: 自动发布 Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    if: needs.prepare.outputs.publish == 'true'
+    needs: [prepare, build]
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
+    concurrency:
+      group: portable-release-publish
+      cancel-in-progress: false
     permissions:
       contents: write
+      actions: read
     steps:
+      - name: 检出精确源码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - name: 下载六个平台的验收产物
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: Eve-*
           path: release-assets
           merge-multiple: true
-      - name: 核对完整版本并生成校验清单
-        env:
-          EVE_RELEASE_SHA: ${{ github.sha }}
-          EVE_RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          python - <<'PY'
-          import hashlib, json, os, pathlib, re
-          folder = pathlib.Path('release-assets')
-          tag = os.environ['EVE_RELEASE_TAG']
-          if not re.fullmatch(r'v\d+\.\d+\.\d+(?:-[A-Za-z0-9][A-Za-z0-9.-]*)?', tag):
-              raise SystemExit('标签必须为 v主版本.次版本.补丁版本，可带预发布后缀')
-          labels = {'windows-x64', 'windows-arm64', 'linux-x64', 'linux-arm64', 'macos-x64', 'macos-arm64'}
-          reports = {}
-          checksums = []
-          for file in sorted(folder.glob('acceptance-*.json')):
-              report = json.loads(file.read_text(encoding='utf-8'))
-              label = report['platform_label']
-              if label not in labels or label in reports or report['source_commit'] != os.environ['EVE_RELEASE_SHA']:
-                  raise SystemExit('平台重复、缺失或源码版本不一致')
-              archive = folder / report['archive']
-              with archive.open('rb') as reader:
-                  checksum = hashlib.file_digest(reader, 'sha256').hexdigest()
-              if checksum != report['archive_sha256'] or not all(report[key] for key in
-                  ['unicode_and_space_path', 'web_http', 'memory_and_learning_views', 'qq_segmented_delivery', 'recovery_without_replay']):
-                  raise SystemExit('发行包散列或进程验收不符')
-              if report['node_launcher'] and report['console_ctrl_c'] is not True:
-                  raise SystemExit('Node 启动器没有通过实际 Ctrl+C 收尾验收')
-              reports[label] = report
-              checksums.append(f'{checksum}  {archive.name}\n')
-          if set(reports) != labels:
-              raise SystemExit('六个平台没有全部完成原生验收，不发布部分 Release')
-          (folder / 'SHA256SUMS.txt').write_text(''.join(checksums), encoding='utf-8')
-          (folder / 'release-verification.json').write_text(json.dumps(reports, ensure_ascii=False, indent=2), encoding='utf-8')
-          for file in list(folder.glob('acceptance-*.json')) + list(folder.glob('SHA256SUMS-*.txt')):
-              file.unlink()
-          pathlib.Path('release-notes.md').write_text(
-              '# Eve ' + tag + '\n\n'
-              'Windows、Linux、macOS，各提供 x64 与 ARM64 原生运行包。包含 Eve 运行器、Web 页面、固定 Node 与 QQ 桥接，无需安装 Rust 或 Node。\n\n'
-              '完整解压后使用包内 Start-Eve 启动；首次输入自己的主模型与 QQ 密钥，再使用 Open-Panel 打开本机面板。详细说明在包内。\n\n'
-              'Windows 使用 ZIP；Linux/macOS 使用 tar.gz 以保留执行权限。Linux 需 Ubuntu 24.04 或相容 glibc，macOS 需 11+，macOS 包未签名/公证。\n\n'
-              '六个平台均已通过原生 exe/程序启动、中文与空格路径、Web 鉴权、记忆/学习读取、分段投递与恢复零重放验收。使用合成凭据与回环替身，没有连接正式 QQ 或外部模型。\n\n'
-              '源码提交：`' + os.environ['EVE_RELEASE_SHA'] + '`。发行包不含用户密钥与历史数据；校验见 SHA256SUMS.txt，原生验收记录见 release-verification.json。\n', encoding='utf-8')
-          PY
-      - name: 完整上传后发布，已发布版本不覆盖
+      - name: 核对主线 CI 和资产，完整上传后公开
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          EVE_RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          if gh release view "$EVE_RELEASE_TAG" --json isDraft --jq .isDraft > release-state.txt 2>/dev/null; then
-            if [ "$(cat release-state.txt)" != "true" ]; then
-              echo '该版本已经公开发布，不覆盖已发布文件；请使用新版本标签。'
-              exit 1
-            fi
-            gh release upload "$EVE_RELEASE_TAG" release-assets/* --clobber
-          else
-            gh release create "$EVE_RELEASE_TAG" release-assets/* --verify-tag --draft --title "Eve $EVE_RELEASE_TAG" --notes-file release-notes.md
-          fi
-          if [[ "$EVE_RELEASE_TAG" == *-* ]]; then
-            gh release edit "$EVE_RELEASE_TAG" --draft=false --prerelease --notes-file release-notes.md
-          else
-            gh release edit "$EVE_RELEASE_TAG" --draft=false --latest --notes-file release-notes.md
-          fi
+          EVE_RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          EVE_RELEASE_AUTOMATIC: ${{ needs.prepare.outputs.automatic }}
+        run: python scripts/release-portable.py publish

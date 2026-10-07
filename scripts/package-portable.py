@@ -41,7 +41,7 @@ def package(target, binary_directory, output_directory):
         raise RuntimeError("打包必须使用相符平台的原生运行环境。")
     source = checked(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     tree = checked(["git", "-C", str(ROOT), "rev-parse", "HEAD^{tree}"], capture_output=True, text=True).stdout.strip()
-    version = os.environ.get("GITHUB_REF_NAME", "") if os.environ.get("GITHUB_REF_TYPE") == "tag" else ""
+    version = os.environ.get("EVE_RELEASE_VERSION", "") or (os.environ.get("GITHUB_REF_NAME", "") if os.environ.get("GITHUB_REF_TYPE") == "tag" else "")
     if version and not re.fullmatch(r"v\d+\.\d+\.\d+(?:-[A-Za-z0-9][A-Za-z0-9.-]*)?", version):
         raise RuntimeError("发布标签必须为 v主版本.次版本.补丁版本，可带预发布后缀。")
     name = f"Eve-{version or source[:7]}-{label}"
