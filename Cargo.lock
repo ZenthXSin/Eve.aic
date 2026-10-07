@@ -393,6 +393,7 @@ dependencies = [
  "eve-example-plugins",
  "eve-kernel",
  "eve-plugin-api",
+ "eve-web-panel-api",
  "serde",
  "serde_json",
  "tempfile",
@@ -756,6 +757,7 @@ dependencies = [
  "eve-memory-api",
  "eve-session-api",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

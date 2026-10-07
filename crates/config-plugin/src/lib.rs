@@ -1,6 +1,7 @@
 //! 普通配置的内置插件实现；密钥库、2FA 与凭据代理在后续切片交付。
 
 mod store;
+mod web_pages;
 
 use eve_config_api::*;
 use eve_plugin_api::{
@@ -19,6 +20,7 @@ pub struct ConfigBootstrap {
     pub directory: PathBuf,
     pub schemas: Vec<ConfigSchema>,
     pub environment: Option<BTreeMap<String, String>>,
+    pub validator: Option<Arc<dyn ConfigValidator>>,
 }
 
 impl ConfigBootstrap {
@@ -27,10 +29,15 @@ impl ConfigBootstrap {
             directory: directory.into(),
             schemas,
             environment: None,
+            validator: None,
         }
     }
     pub fn with_environment(mut self, environment: BTreeMap<String, String>) -> Self {
         self.environment = Some(environment);
+        self
+    }
+    pub fn with_validator(mut self, validator: Arc<dyn ConfigValidator>) -> Self {
+        self.validator = Some(validator);
         self
     }
 }
@@ -83,6 +90,7 @@ pub struct ConfigPlugin {
     manifest: PluginManifest,
     bootstrap: ConfigBootstrap,
     controller: ConfigController,
+    web_permit: Option<eve_web_panel_api::PageWritePermit>,
 }
 
 impl ConfigPlugin {
@@ -91,10 +99,16 @@ impl ConfigPlugin {
             manifest: PluginManifest::new(CONFIG_PLUGIN_ID, env!("CARGO_PKG_VERSION"))?,
             bootstrap,
             controller: ConfigController::default(),
+            web_permit: None,
         })
     }
     pub fn controller(&self) -> ConfigController {
         self.controller.clone()
+    }
+    /// 宿主显式授信后注册配置页；读页面不授予普通插件配置写入能力。
+    pub fn with_web_pages(mut self, permit: eve_web_panel_api::PageWritePermit) -> Self {
+        self.web_permit = Some(permit);
+        self
     }
 }
 
@@ -125,6 +139,15 @@ impl Plugin for ConfigPlugin {
                 ServiceId::new(CONFIG_SERVICE_ID)?,
                 ConfigServiceHandle(service.clone()),
             )?;
+            if let Some(permit) = &self.web_permit {
+                ctx.provide_service(
+                    ServiceId::new(eve_web_panel_api::page_service_id(CONFIG_PLUGIN_ID))?,
+                    eve_web_panel_api::PluginPagesHandle(Arc::new(web_pages::ConfigPages {
+                        service: service.clone(),
+                        permit: permit.clone(),
+                    })),
+                )?;
+            }
             *self
                 .controller
                 .inner

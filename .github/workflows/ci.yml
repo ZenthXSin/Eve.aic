@@ -43,6 +43,23 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: 运行测试与文档测试
         run: cargo test --workspace --locked
+      - name: 验证 Web 插件页、配置恢复与 QQ 插件启停
+        run: |
+          cargo build -p eve-app --bin eve-qqbot --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $qqBinary = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
+          python -X utf8 scripts/test-web-plugins.py $qqBinary
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 验证浏览器中的插件配置、冲突、启停与窄屏
+        if: runner.os == 'Linux'
+        run: |
+          $browserDirectory = Join-Path $env:RUNNER_TEMP "eve-web-browser"
+          npm install --prefix $browserDirectory --no-audit --no-fund playwright-core@1.57.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:EVE_PLAYWRIGHT_MODULE = Join-Path $browserDirectory "node_modules/playwright-core/index.mjs"
+          $env:EVE_TEST_BROWSER = (Get-Command google-chrome -ErrorAction Stop).Source
+          python -X utf8 scripts/test-web-plugins.py target/debug/eve-qqbot --browser
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证交互记忆三次独立进程恢复
         run: |
           $memoryDirectory = Join-Path $env:RUNNER_TEMP "eve-memory-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"

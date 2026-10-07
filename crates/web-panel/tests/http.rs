@@ -15,6 +15,65 @@ use tokio::net::TcpStream;
 
 const TOKEN: &str = "synthetic-panel-token-never-persisted-123456789";
 
+#[tokio::test]
+async fn extension_endpoints_require_authentication_and_validate_before_optional_services() {
+    let service = Arc::new(Service::default());
+    let panel = panel(service.clone()).await;
+    for path in [
+        "/api/plugins",
+        "/api/plugins/operations",
+        "/api/plugin-pages",
+    ] {
+        assert_code(
+            client().get(url(&panel, path)).send().await.unwrap(),
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        )
+        .await;
+        assert_code(
+            client()
+                .get(url(&panel, path))
+                .bearer_auth(TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+        )
+        .await;
+    }
+    for (path, invalid) in [
+        (
+            "/api/plugins/action",
+            json!({"instance":"i","plugin_id":"../bad","expected_state":"Active","action":"stop"}),
+        ),
+        ("/api/plugins/ack", json!({"id":0})),
+        (
+            "/api/plugin-pages/read",
+            json!({"plugin_id":"eve.config","page_id":"../bad"}),
+        ),
+        (
+            "/api/plugin-pages/save",
+            json!({"plugin_id":"eve.config","page_id":"runtime.llm","instance":"i","expected_revision":0,"values":{}}),
+        ),
+    ] {
+        assert_code(
+            client()
+                .post(url(&panel, path))
+                .bearer_auth(TOKEN)
+                .json(&invalid)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+        )
+        .await;
+    }
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+    panel.stop().await.unwrap();
+}
+
 fn target() -> GenerationKey {
     GenerationKey {
         session: SessionKey::new("会话-A", "用户-A").unwrap(),

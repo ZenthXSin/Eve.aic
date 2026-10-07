@@ -41,8 +41,10 @@
         <button class="nav-item" type="button" data-view="judgments"><span aria-hidden="true">◇</span>判断诊断</button>
         <button class="nav-item" type="button" data-view="goals"><span aria-hidden="true">◈</span>认知目标</button>
         <button class="nav-item" type="button" data-view="memory"><span aria-hidden="true">✦</span>记忆偏好</button>
+        <button class="nav-item" type="button" data-view="plugins"><span aria-hidden="true">⚙</span>插件管理</button>
+        <button class="nav-item" type="button" data-view="plugin-pages"><span aria-hidden="true">▦</span>插件页面</button>
       </nav>
-      <div class="sidebar-foot"><span class="small-dot" aria-hidden="true"></span>本机运行实例<p>会话与任务来自当前服务。<br>不提供新建任务或停服操作。</p></div>
+      <div class="sidebar-foot"><span class="small-dot" aria-hidden="true"></span>本机运行实例<p>查看运行状态，管理可独立启停的插件与配置。</p></div>
     </aside>
 
     <main class="main-content">
@@ -112,6 +114,28 @@
         <section id="memory-detail" class="detail-panel" aria-label="记忆详情"><div class="empty-detail"><span class="empty-symbol" aria-hidden="true">✦</span><h2>选择一个作用域</h2><p>查看已确认和已撤销的偏好、版本历史，以及每个版本的来源。来源正文需单独打开。</p></div></section>
       </section>
       <footer class="page-footer">每 3 秒刷新通道与任务 · 页面隐藏时暂停自动刷新</footer>
+      <section id="plugins-view" class="workspace" aria-label="插件管理" hidden>
+        <div class="list-panel">
+          <div class="panel-heading"><div><h2>已注册插件</h2><p>查看状态、版本与依赖，启停可独立管理的插件。</p></div></div>
+          <p id="plugins-error" class="inline-error" role="alert" hidden></p>
+          <p id="plugins-feedback" class="detail-note" role="status"></p>
+          <div id="plugins-list" class="record-list"></div>
+        </div>
+        <section class="detail-panel" aria-label="插件操作记录">
+          <div class="panel-heading"><div><h2>操作记录</h2><p>操作完成后可移除记录；失败记录保留到手动移除。</p></div></div>
+          <div id="plugin-operations" class="detail-body"></div>
+        </section>
+      </section>
+      <section id="plugin-pages-view" class="workspace" aria-label="插件页面" hidden>
+        <div class="list-panel">
+          <div class="panel-heading"><div><h2>插件提供的页面</h2><p>配置、字段与保存逻辑由各插件提供。</p></div></div>
+          <p id="plugin-pages-error" class="inline-error" role="alert" hidden></p>
+          <div id="plugin-pages-list" class="record-list"></div>
+        </div>
+        <section id="plugin-page-detail" class="detail-panel" aria-label="插件页面详情">
+          <div class="empty-detail"><h2>选择一个插件页面</h2><p>在这里修改配置、恢复默认值并查看生效方式。</p></div>
+        </section>
+      </section>
     </main>
   </div>
 </body>

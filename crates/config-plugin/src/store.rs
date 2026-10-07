@@ -18,6 +18,30 @@ const FORMAT_VERSION: u32 = 1;
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 type Snapshots = BTreeMap<String, ConfigSnapshot>;
 
+fn panel_error(error: ConfigError) -> eve_web_panel_api::PanelError {
+    use eve_web_panel_api::PanelError;
+    match error {
+        ConfigError::RevisionConflict { .. } | ConfigError::StaleRequest => PanelError::Stale,
+        ConfigError::UnknownNamespace(_) => PanelError::NotFound,
+        ConfigError::Storage(_) | ConfigError::Unavailable => PanelError::Unavailable,
+        _ => PanelError::InvalidInput,
+    }
+}
+fn page_descriptor(namespace: &str) -> eve_web_panel_api::PageDescriptor {
+    eve_web_panel_api::PageDescriptor {
+        id: namespace.into(),
+        title: match namespace {
+            "runtime.llm" => "模型运行设置",
+            "provider.openai" => "主模型连接",
+            "provider.jev" => "Jev 连接",
+            "runtime.models" => "模型角色与 Jev",
+            "runtime.messages" => "消息路由设置",
+            _ => namespace,
+        }.into(),
+        description: "保存后适用于新请求；标记需重启的字段在重启后生效。恢复默认会移除该字段的文件覆盖，继续使用环境配置或 Schema 默认值。".into(),
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredConfig {
@@ -59,10 +83,136 @@ pub(crate) struct FileConfigService {
     schemas: BTreeMap<String, ConfigSchema>,
     environment: BTreeMap<String, String>,
     session: String,
+    validator: Option<std::sync::Arc<dyn ConfigValidator>>,
     state: Mutex<State>,
 }
 
 impl FileConfigService {
+    pub(crate) fn web_pages(
+        &self,
+    ) -> eve_web_panel_api::PanelResult<Vec<eve_web_panel_api::PageDescriptor>> {
+        let _state = self.state().map_err(panel_error)?;
+        if self.schemas.len() > eve_web_panel_api::MAX_PLUGIN_PAGES {
+            return Err(eve_web_panel_api::PanelError::Unavailable);
+        }
+        Ok(self
+            .schemas
+            .keys()
+            .map(|namespace| page_descriptor(namespace))
+            .collect())
+    }
+    pub(crate) fn web_read(
+        &self,
+        namespace: &str,
+    ) -> eve_web_panel_api::PanelResult<eve_web_panel_api::PluginPage> {
+        use eve_web_panel_api::*;
+        let state = self.state().map_err(panel_error)?;
+        let schema = self.schemas.get(namespace).ok_or(PanelError::NotFound)?;
+        let overrides = state.stored.current.namespaces.get(namespace);
+        let snapshot = select(&state.live, namespace, schema.version).map_err(panel_error)?;
+        let fields = schema
+            .fields
+            .iter()
+            .map(|(id, field)| {
+                let override_value = overrides.and_then(|entry| entry.values.get(id)).cloned();
+                let source = if override_value.is_some() {
+                    "override"
+                } else if field
+                    .environment
+                    .as_ref()
+                    .is_some_and(|key| self.environment.contains_key(key))
+                {
+                    "environment"
+                } else {
+                    "default"
+                };
+                PageField {
+                    id: id.clone(),
+                    label: id.clone(),
+                    value: snapshot.values.get(id).cloned(),
+                    override_value,
+                    source,
+                    restart_required: field.restart_required,
+                    kind: match field.kind {
+                        ConfigKind::Boolean => PageFieldKind::Boolean,
+                        ConfigKind::String => PageFieldKind::Text,
+                        ConfigKind::Integer { minimum, maximum } => {
+                            PageFieldKind::Integer { minimum, maximum }
+                        }
+                    },
+                }
+            })
+            .collect();
+        let page = PluginPage {
+            descriptor: page_descriptor(namespace),
+            instance: self.session.clone(),
+            revision: state.stored.current.revision,
+            fields,
+        };
+        page.validate()?;
+        Ok(page)
+    }
+    pub(crate) fn web_save(
+        &self,
+        request: &eve_web_panel_api::PageSaveRequest,
+    ) -> eve_web_panel_api::PanelResult<eve_web_panel_api::PageSaved> {
+        use eve_web_panel_api::*;
+        if request.plugin_id != CONFIG_PLUGIN_ID
+            || request.values.is_empty()
+            || request.values.len() > MAX_PAGE_FIELDS
+        {
+            return Err(PanelError::InvalidInput);
+        }
+        let mut state = self.state().map_err(panel_error)?;
+        if request.instance != self.session
+            || request.expected_revision != state.stored.current.revision
+        {
+            return Err(PanelError::Stale);
+        }
+        let schema = self
+            .schemas
+            .get(&request.page_id)
+            .ok_or(PanelError::NotFound)?;
+        let mut overrides = state.stored.current.namespaces.clone();
+        let entry = overrides
+            .entry(schema.namespace.clone())
+            .or_insert_with(|| NamespaceValues {
+                schema_version: schema.version,
+                values: BTreeMap::new(),
+            });
+        for (id, value) in &request.values {
+            let field = schema.fields.get(id).ok_or(PanelError::InvalidInput)?;
+            if field.sensitive || field.encrypted {
+                return Err(PanelError::Forbidden);
+            }
+            if let Some(value) = value {
+                if value.to_string().len() > 8192 {
+                    return Err(PanelError::InvalidInput);
+                }
+                field
+                    .validate_value(&format!("{}.{}", schema.namespace, id), value)
+                    .map_err(panel_error)?;
+                entry.values.insert(id.clone(), value.clone());
+            } else {
+                entry.values.remove(id);
+            }
+        }
+        if entry.values.is_empty() {
+            overrides.remove(&schema.namespace);
+        }
+        let change = self
+            .replace_locked(
+                &mut state,
+                request.expected_revision,
+                overrides,
+                ApplyMode::NewRequests,
+            )
+            .map_err(panel_error)?;
+        Ok(PageSaved {
+            revision: change.revision,
+            restart_required: change.restart_required,
+        })
+    }
     pub(crate) fn open(bootstrap: &ConfigBootstrap) -> ConfigResult<Self> {
         let mut schemas = BTreeMap::new();
         let mut environment_names = BTreeSet::new();
@@ -146,6 +296,9 @@ impl FileConfigService {
             ));
         }
         let live = resolve(&schemas, &environment, &stored.current)?;
+        if let Some(validator) = &bootstrap.validator {
+            validator.validate(&live)?;
+        }
         let immediate_revision = stored.current.revision;
         let time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -161,6 +314,7 @@ impl FileConfigService {
             schemas,
             environment,
             session,
+            validator: bootstrap.validator.clone(),
             state: Mutex::new(State {
                 lock_file: Some(lock_file),
                 stored,
@@ -230,6 +384,9 @@ impl FileConfigService {
             namespaces: overrides,
         };
         let mut live = resolve(&self.schemas, &self.environment, &document)?;
+        if let Some(validator) = &self.validator {
+            validator.validate(&live)?;
+        }
         let mut restart_required = Vec::new();
         for (namespace, schema) in &self.schemas {
             let values = &mut live.get_mut(namespace).expect("resolved schema").values;

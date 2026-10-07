@@ -10,7 +10,9 @@ use axum::{
 use eve_control_api::GenerationKey;
 use eve_memory_api::MemoryScope;
 use eve_session_api::SessionKey;
-use eve_web_panel_api::{PanelError, PanelService};
+use eve_web_panel_api::{
+    MAX_PAGE_FIELDS, PageSaveRequest, PanelError, PanelService, PluginAction, valid_panel_id,
+};
 use ring::{
     hmac,
     rand::{SecureRandom, SystemRandom},
@@ -113,6 +115,13 @@ impl LocalPanel {
             .route("/api/memory/scope", post(memory))
             .route("/api/memory/evidence", post(memory_evidence))
             .route("/api/memory/learning", post(memory_learning))
+            .route("/api/plugins", get(plugins))
+            .route("/api/plugins/action", post(plugin_action))
+            .route("/api/plugins/operations", get(plugin_operations))
+            .route("/api/plugins/ack", post(plugin_acknowledge))
+            .route("/api/plugin-pages", get(plugin_pages))
+            .route("/api/plugin-pages/read", post(plugin_page))
+            .route("/api/plugin-pages/save", post(save_plugin_page))
             .fallback(|| async { error(StatusCode::NOT_FOUND, "not_found") })
             .layer(DefaultBodyLimit::max(16384))
             .layer(middleware::from_fn_with_state(shared.clone(), protect))
@@ -180,9 +189,123 @@ fn error(status: StatusCode, code: &'static str) -> Response {
 fn failure(error_value: PanelError) -> Response {
     match error_value {
         PanelError::InvalidInput => error(StatusCode::BAD_REQUEST, "invalid_input"),
+        PanelError::Forbidden => error(StatusCode::FORBIDDEN, "forbidden"),
         PanelError::NotFound => error(StatusCode::NOT_FOUND, "not_found"),
         PanelError::Stale => error(StatusCode::CONFLICT, "stale_generation"),
         PanelError::Unavailable => error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+    }
+}
+
+async fn plugins(State(shared): State<Arc<Shared>>) -> Response {
+    match shared.service.plugins() {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+async fn plugin_operations(State(shared): State<Arc<Shared>>) -> Response {
+    match shared.service.plugin_operations() {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+async fn plugin_pages(State(shared): State<Arc<Shared>>) -> Response {
+    match shared.service.plugin_pages() {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+async fn plugin_action(
+    State(shared): State<Arc<Shared>>,
+    body: Result<Json<PluginAction>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_json");
+    };
+    if !valid_panel_id(&body.plugin_id)
+        || body.instance.is_empty()
+        || body.instance.len() > 256
+        || body.expected_state.is_empty()
+        || body.expected_state.len() > 32
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid_input");
+    }
+    if !shared.open.load(Ordering::Acquire) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "stopping");
+    }
+    match shared.service.plugin_action(body).await {
+        Ok(value) => (StatusCode::ACCEPTED, Json(value)).into_response(),
+        Err(e) => failure(e),
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginAcknowledge {
+    id: u64,
+}
+async fn plugin_acknowledge(
+    State(shared): State<Arc<Shared>>,
+    body: Result<Json<PluginAcknowledge>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_json");
+    };
+    if body.id == 0 {
+        return error(StatusCode::BAD_REQUEST, "invalid_input");
+    }
+    if !shared.open.load(Ordering::Acquire) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "stopping");
+    }
+    match shared.service.acknowledge_plugin_operation(body.id).await {
+        Ok(removed) => Json(json!({"removed":removed})).into_response(),
+        Err(e) => failure(e),
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginPageRead {
+    plugin_id: String,
+    page_id: String,
+}
+async fn plugin_page(
+    State(shared): State<Arc<Shared>>,
+    body: Result<Json<PluginPageRead>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_json");
+    };
+    if !valid_panel_id(&body.plugin_id) || !valid_panel_id(&body.page_id) {
+        return error(StatusCode::BAD_REQUEST, "invalid_input");
+    }
+    match shared.service.plugin_page(&body.plugin_id, &body.page_id) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+async fn save_plugin_page(
+    State(shared): State<Arc<Shared>>,
+    body: Result<Json<PageSaveRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_json");
+    };
+    if !valid_panel_id(&body.plugin_id)
+        || !valid_panel_id(&body.page_id)
+        || body.instance.is_empty()
+        || body.instance.len() > 256
+        || body.values.len() > MAX_PAGE_FIELDS
+        || body.values.is_empty()
+        || body.values.iter().any(|(id, value)| {
+            !valid_panel_id(id) || value.as_ref().is_some_and(|v| v.to_string().len() > 8192)
+        })
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid_input");
+    }
+    if !shared.open.load(Ordering::Acquire) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "stopping");
+    }
+    match shared.service.save_plugin_page(body) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
     }
 }
 fn headers(mut response: Response) -> Response {

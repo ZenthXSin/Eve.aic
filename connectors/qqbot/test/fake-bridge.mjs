@@ -36,7 +36,7 @@ if (scenario.script) {
   const commands = [];
   let stopped = false;
   const until = async predicate => {
-    const deadline = Date.now() + 15000;
+    const deadline = Date.now() + (scenario.wait_timeout_ms ?? 15000);
     while (!predicate()) {
       if (stopped) return false;
       if (Date.now() >= deadline) throw new Error("scenario_wait_timeout");
