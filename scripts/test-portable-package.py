@@ -233,7 +233,8 @@ def main():
         thread.join(timeout=5)
     report = {"format_version": 2, "platform": sys.platform, "platform_label": manifest["platform_label"],
               "target": manifest["target"], "archive": archive.name,
-              "source_commit": manifest["source_commit"], "archive_sha256": expected,
+              "source_commit": manifest["source_commit"], "version": manifest["version"],
+              "source_tree": manifest["source_tree"], "archive_sha256": expected,
               "powershell_5_1": manifest["platform_label"] == "windows-x64",
               "node_launcher": manifest["platform_label"] != "windows-x64",
               "console_ctrl_c": True if manifest["platform_label"] != "windows-x64" else None,

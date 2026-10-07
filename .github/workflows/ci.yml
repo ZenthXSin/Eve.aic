@@ -37,6 +37,8 @@ jobs:
           rustup default stable
       - name: 检查代码格式
         run: cargo fmt --all -- --check
+      - name: 验证自动发行的版本与恢复语义
+        run: python -X utf8 scripts/test-release-portable.py
       - name: 检查所有构建目标
         run: cargo check --workspace --all-targets --locked
       - name: 检查 Clippy 警告
