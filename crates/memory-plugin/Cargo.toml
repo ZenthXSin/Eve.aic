@@ -12,6 +12,7 @@ eve-session-api = { path = "../session-api" }
 eve-llm-api = { path = "../llm-api" }
 serde.workspace = true
 serde_json.workspace = true
+ring.workspace = true
 
 [dev-dependencies]
 eve-kernel = { path = "../kernel" }

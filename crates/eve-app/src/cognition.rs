@@ -1,13 +1,16 @@
 //! 本地内生反思宿主：用户目标保持 Waiting，只对派生草稿安装受限执行能力。
-use crate::{AppError, AppFailure, config, core_bootstrap, models, services};
+use crate::cognition_action::ExportPlanOptions;
+use crate::{AppError, AppFailure, cognition_action, config, core_bootstrap, models, services};
 use eve_cognition_api::*;
 use eve_cognition_loop_api::*;
 use eve_cognition_loop_plugin::{
-    CognitionLoopPlugin, LoopController, PriorityDrivePolicy, ReflectionArtifact,
-    ReflectionPlannerFactory, ReflectionVerifier, current_reflection,
+    CognitionLoopPlugin, LoopController, ReflectionArtifact, ReflectionDrivePolicy,
+    ReflectionPlannerFactory, ReflectionVerifier, current_reflection, evaluate_agenda,
+    evaluate_reflection_agenda,
 };
 use eve_cognition_plugin::{
     CognitionController, CognitionPlugin, UserGoalFeedback, UserGoalFileObservation,
+    read_cognitive_snapshot,
 };
 use eve_config_api::{
     CONFIG_SERVICE_ID, ConfigServiceHandle, LLM_NAMESPACE, LlmRuntimeConfig, model_roles_schema,
@@ -42,12 +45,16 @@ pub const COGNITION_HELP: &str = "Eve 本地内生反思入口
   feedback --id ID --revision N --feedback-id ID --text 反馈 [--user owner]
                                           保存用户新事实并使旧草稿过期，不调用模型
   status                                  查看无正文的状态计数
+  agenda                                  只读预览执行议程与等待目标的下一次派生，不调用模型
   show --id ID                            查看目标及草稿，current/stale 标明是否属于当前修订
+  export-plan --id ID --revision N --observe-file 路径 --input-sha256 SHA --output 路径 [--user owner]
+                                          显式创建并读回验证当前草稿产物，不覆盖文件、不完成父目标
   run [--seconds 30] [--max-executions 1]   无需新输入，推进已有目标的反思草稿
       [--observe-goal ID --observe-file 路径 [--observe-user owner]]
                                           观察指定文本文件，内容变化后保存证据并重规划
 状态目录默认 .eve-cognition；运行窗口 1 至 600 秒，最多执行 1 至 32 项。
 文件观察只在本次 run 生效；上限 64 KiB，仅前缀进入规划，完整字节保存 SHA-256。
+agenda 不恢复或改写认知快照，两个阶段分别显示已有 Ready 目标与待派生 Waiting 目标。
 默认文件状态；--database-config 显式选用本地 PostgreSQL，首次使用须选无文件快照的新目录。
 仅有可执行反思时才需要 EVE_OPENAI_API_KEY 和主模型配置；沿用 AGENT.md。
 每项反思最多一次模型请求、零工具、一次尝试、30 秒；父目标仍等待用户处理。
@@ -71,9 +78,11 @@ enum CognitionCommand {
         user: String,
     },
     Status,
+    Agenda,
     Show {
         id: String,
     },
+    ExportPlan(ExportPlanOptions),
     Run {
         seconds: u64,
         max_executions: u16,
@@ -103,6 +112,7 @@ impl CognitionOptions {
         let mut agent = None;
         let mut database_config = None;
         let mut observation_file = None;
+        let mut output_file = None;
         let mut command = None;
         let mut fields = std::collections::BTreeMap::<String, String>::new();
         while let Some(arg) = args.next() {
@@ -110,7 +120,17 @@ impl CognitionOptions {
                 return Ok(None);
             }
             let arg = arg.into_string().map_err(|_| "命令参数必须为 UTF-8。")?;
-            if ["add", "feedback", "status", "show", "run"].contains(&arg.as_str()) {
+            if [
+                "add",
+                "feedback",
+                "status",
+                "agenda",
+                "show",
+                "run",
+                "export-plan",
+            ]
+            .contains(&arg.as_str())
+            {
                 if command.replace(arg).is_some() {
                     return Err("只能指定一个认知命令。".into());
                 }
@@ -130,6 +150,8 @@ impl CognitionOptions {
                 "--observe-goal",
                 "--observe-file",
                 "--observe-user",
+                "--input-sha256",
+                "--output",
             ]
             .contains(&arg.as_str())
             {
@@ -144,6 +166,7 @@ impl CognitionOptions {
                 "--agent" => agent.replace(PathBuf::from(value)).is_some(),
                 "--database-config" => database_config.replace(PathBuf::from(value)).is_some(),
                 "--observe-file" => observation_file.replace(PathBuf::from(value)).is_some(),
+                "--output" => output_file.replace(PathBuf::from(value)).is_some(),
                 _ => fields
                     .insert(
                         arg,
@@ -166,6 +189,7 @@ impl CognitionOptions {
                 CognitionCommand::Add { id, text, user }
             }
             "status" => CognitionCommand::Status,
+            "agenda" => CognitionCommand::Agenda,
             "feedback" => {
                 let goal_id = fields.remove("--id").ok_or("feedback 缺少 --id。")?;
                 let expected_goal_revision = fields
@@ -193,6 +217,35 @@ impl CognitionOptions {
                 let id = fields.remove("--id").ok_or("show 缺少 --id。")?;
                 validate_id(&id)?;
                 CognitionCommand::Show { id }
+            }
+            "export-plan" => {
+                let goal_id = fields.remove("--id").ok_or("export-plan 缺少 --id。")?;
+                let expected_goal_revision = fields
+                    .remove("--revision")
+                    .ok_or("export-plan 缺少 --revision。")?
+                    .parse::<u64>()
+                    .map_err(|_| "行动目标修订必须为正整数。")?;
+                let user_id = fields.remove("--user").unwrap_or_else(|| "owner".into());
+                let input_sha256 = fields
+                    .remove("--input-sha256")
+                    .ok_or("export-plan 缺少 --input-sha256。")?;
+                let observe_file = observation_file
+                    .take()
+                    .ok_or("export-plan 缺少 --observe-file。")?;
+                let output_file = output_file.take().ok_or("export-plan 缺少 --output。")?;
+                validate_id(&goal_id)?;
+                validate_id(&user_id)?;
+                if expected_goal_revision == 0 || !cognition_action::valid_sha256(&input_sha256) {
+                    return Err("行动目标修订须为正整数，输入摘要须为 64 位小写 SHA-256。".into());
+                }
+                CognitionCommand::ExportPlan(ExportPlanOptions {
+                    goal_id,
+                    expected_goal_revision,
+                    user_id,
+                    input_sha256,
+                    observe_file,
+                    output_file,
+                })
             }
             "run" => {
                 let seconds = fields
@@ -236,7 +289,7 @@ impl CognitionOptions {
             }
             _ => unreachable!(),
         };
-        if !fields.is_empty() || observation_file.is_some() {
+        if !fields.is_empty() || observation_file.is_some() || output_file.is_some() {
             return Err("当前认知命令不接受所给参数。".into());
         }
         Ok(Some(Self {
@@ -280,6 +333,66 @@ fn status(command: &str, snapshot: &CognitiveSnapshot) -> Value {
         "completed": count(GoalStatus::Completed), "cancelled": count(GoalStatus::Cancelled),
         "blocked": count(GoalStatus::Blocked)
     }})
+}
+
+fn reflection_loop_options(max_executions: u16) -> LoopOptions {
+    LoopOptions {
+        scope: scope(SourceKind::Inference, "endogenous"),
+        poll_interval_ms: 60_000,
+        max_executions,
+    }
+}
+
+fn reflection_planner_options(max_derivations: u16) -> EndogenousOptions {
+    EndogenousOptions {
+        scope: scope(SourceKind::User, INPUT_CHANNEL),
+        max_derivations,
+        timeout_ms: 30_000,
+    }
+}
+
+fn reflection_execution_agenda(
+    snapshot: &CognitiveSnapshot,
+    max_executions: u16,
+    submitted: u64,
+    at_ms: u64,
+) -> LoopResult<AgendaEvaluation> {
+    evaluate_agenda(
+        snapshot,
+        &reflection_loop_options(max_executions),
+        &ReflectionDrivePolicy::new(scope(SourceKind::User, INPUT_CHANNEL))?,
+        &ReflectionVerifier,
+        submitted,
+        at_ms,
+    )
+}
+
+fn agenda_phase(stage: &str, evaluation: AgendaEvaluation) -> Value {
+    let ranked: Vec<_> = evaluation
+        .ranked
+        .into_iter()
+        .map(|goal| json!({"goal_id":goal.goal_id, "strength":goal.strength, "reason":goal.reason}))
+        .collect();
+    let excluded: Vec<_> = evaluation
+        .excluded
+        .into_iter()
+        .map(|goal| json!({"goal_id":goal.goal_id, "reason":format!("{:?}", goal.reason)}))
+        .collect();
+    json!({"stage":stage, "revision":evaluation.revision,
+        "evaluated_at_ms":evaluation.evaluated_at_ms, "ranked":ranked, "excluded":excluded,
+        "blocker":evaluation.blocker.map(|blocker| format!("{blocker:?}"))})
+}
+
+fn agenda(snapshot: &CognitiveSnapshot) -> Result<Value, AppError> {
+    let at_ms = now_ms()?;
+    let execution = reflection_execution_agenda(snapshot, 32, 0, at_ms)?;
+    let reflection =
+        evaluate_reflection_agenda(snapshot, &reflection_planner_options(32), 0, at_ms)?;
+    Ok(
+        json!({"command":"agenda", "revision":snapshot.revision, "evaluated_at_ms":at_ms,
+        "execution_agenda":agenda_phase("ready_execution", execution),
+        "reflection_preview":agenda_phase("waiting_derivation", reflection)}),
+    )
 }
 
 fn add(
@@ -430,7 +543,8 @@ async fn show(
             json!({"goal": child, "artifact": artifact, "current":current, "stale":!current}),
         );
     }
-    Ok(json!({"command": "show", "goal": goal, "reflections": reflections}))
+    let actions = cognition_action::action_records(kernel, id).await?;
+    Ok(json!({"command": "show", "goal": goal, "reflections": reflections, "actions": actions}))
 }
 
 async fn interrupted() -> Result<(), AppError> {
@@ -519,14 +633,13 @@ async fn start_loop(
     let executor = Arc::new(ControlGoalExecutor::new(control, runner, INTERNAL_USER)?);
     let plugin = CognitionLoopPlugin::new(
         Arc::new(admin.clone()),
-        Arc::new(PriorityDrivePolicy),
+        Arc::new(ReflectionDrivePolicy::new(scope(
+            SourceKind::User,
+            INPUT_CHANNEL,
+        ))?),
         Arc::new(ReflectionVerifier),
         executor,
-        LoopOptions {
-            scope: scope(SourceKind::Inference, "endogenous"),
-            poll_interval_ms: 60_000,
-            max_executions,
-        },
+        reflection_loop_options(max_executions),
         dependencies(&[COGNITION_PLUGIN_ID, CONTROL_PLUGIN_ID])?,
     )?;
     let controller = plugin.controller();
@@ -641,11 +754,7 @@ async fn run_window(
     max_executions: u16,
     factory: &dyn EndogenousPlannerFactory,
 ) -> Result<Value, AppError> {
-    let planner_options = EndogenousOptions {
-        scope: scope(SourceKind::User, INPUT_CHANNEL),
-        max_derivations: max_executions,
-        timeout_ms: 30_000,
-    };
+    let planner_options = reflection_planner_options(max_executions);
     planner_options.validate()?;
     let planner = factory.create(Arc::new(admin.clone()), planner_options)?;
     let mut observation = match &options.command {
@@ -697,17 +806,13 @@ async fn run_window(
                     continue;
                 }
             }
-            let current_time = now_ms()?;
-            if controller.is_none()
-                && admin.snapshot()?.state.goals.values().any(|goal| {
-                    goal.is_ready(current_time)
-                        && goal.source.kind == SourceKind::Inference
-                        && goal.source.channel == "endogenous"
-                        && goal.verification == "reflection:v1"
-                })
-            {
-                controller =
-                    Some(start_loop(kernel, backends, options, admin, max_executions).await?);
+            if controller.is_none() {
+                let execution =
+                    reflection_execution_agenda(&admin.snapshot()?, max_executions, 0, now_ms()?)?;
+                if execution.blocker.is_none() && !execution.ranked.is_empty() {
+                    controller =
+                        Some(start_loop(kernel, backends, options, admin, max_executions).await?);
+                }
             }
             if let Some(handle) = &controller {
                 handle.wake(WakeReason::StateChanged)?;
@@ -754,12 +859,24 @@ pub async fn run_cognition_with_planner_factory(
     factory: Arc<dyn EndogenousPlannerFactory>,
 ) -> Result<Value, AppError> {
     let backends = KernelServices {
-        state: crate::storage::open_state_store(
-            &options.state_directory,
-            options.database_config.as_deref(),
-        )?,
+        state: if matches!(&options.command, CognitionCommand::Agenda) {
+            crate::storage::open_existing_state_store(
+                &options.state_directory,
+                options.database_config.as_deref(),
+            )?
+        } else {
+            crate::storage::open_state_store(
+                &options.state_directory,
+                options.database_config.as_deref(),
+            )?
+        },
         ..KernelServices::default()
     };
+    // 只读评估保留原始 Executing 状态，不启动会恢复并改写快照的认知插件。
+    // 只打开已有后端，保留排他锁，不初始化目录、数据库绑定或 SQL schema。
+    if matches!(&options.command, CognitionCommand::Agenda) {
+        return agenda(&read_cognitive_snapshot(backends.state.as_ref(), SUBJECT)?);
+    }
     let kernel = Kernel::with_services(KernelServices {
         events: backends.events.clone(),
         registry: backends.registry.clone(),
@@ -777,7 +894,12 @@ pub async fn run_cognition_with_planner_factory(
             CognitionCommand::Add { id, text, user } => add(&admin, id, text, user),
             CognitionCommand::Feedback { input, user } => feedback(&admin, input, user),
             CognitionCommand::Status => Ok(status("status", &admin.snapshot()?)),
+            CognitionCommand::Agenda => unreachable!("agenda 在启动认知插件前读取原快照"),
             CognitionCommand::Show { id } => show(&kernel, &backends.registry, &admin, &id).await,
+            CognitionCommand::ExportPlan(action_options) => {
+                cognition_action::export_plan(&kernel, &backends.registry, &admin, action_options)
+                    .await
+            }
             CognitionCommand::Run {
                 seconds,
                 max_executions,

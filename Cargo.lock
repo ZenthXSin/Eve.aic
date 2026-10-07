@@ -236,6 +236,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-action-api"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eve-action-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-action-api",
+ "eve-kernel",
+ "eve-plugin-api",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "eve-agent-prompt"
 version = "0.1.0"
 dependencies = [
@@ -248,7 +271,10 @@ dependencies = [
 name = "eve-app"
 version = "0.1.0"
 dependencies = [
+ "eve-action-api",
+ "eve-action-plugin",
  "eve-agent-prompt",
+ "eve-artifact-file",
  "eve-cognition-api",
  "eve-cognition-loop-api",
  "eve-cognition-loop-plugin",
@@ -287,6 +313,16 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "eve-artifact-file"
+version = "0.1.0"
+dependencies = [
+ "eve-action-api",
+ "libc",
+ "ring",
+ "tempfile",
 ]
 
 [[package]]
@@ -479,6 +515,7 @@ version = "0.1.0"
 dependencies = [
  "eve-session-api",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -493,6 +530,7 @@ dependencies = [
  "eve-session-plugin",
  "eve-training-api",
  "eve-training-plugin",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

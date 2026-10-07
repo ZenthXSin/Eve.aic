@@ -3,7 +3,7 @@ use crate::{AppError, core_bootstrap, models, services};
 use eve_cognition_api::*;
 use eve_cognition_loop_api::*;
 use eve_cognition_loop_plugin::{
-    CognitionLoopPlugin, LoopController, PriorityDrivePolicy, ReflectionArtifact,
+    CognitionLoopPlugin, LoopController, ReflectionArtifact, ReflectionDrivePolicy,
     ReflectionVerifier, current_reflection,
 };
 use eve_cognition_plugin::{CognitionController, CognitionPlugin, UserGoalFeedback};
@@ -401,24 +401,36 @@ impl DrivePolicy for QqPolicy {
             return Ok(vec![]);
         }
         let snapshot = self.admin.snapshot()?;
-        let mut current = Vec::new();
-        for goal in goals {
-            let Some(parent) = snapshot.state.goals.get(&goal.source.reference) else {
-                continue;
-            };
-            if parent.source.kind == SourceKind::User
-                && parent.source.channel == CHANNEL
-                && parent.status == GoalStatus::Waiting
-                && matches!(parent.visibility, Visibility::User(_))
-                && parent.visibility == goal.visibility
-                && parent.expires_at_ms.is_none_or(|expiry| now_ms < expiry)
-                && current_reflection(&snapshot.state, &snapshot.subject_id, parent)?
-                    .is_some_and(|child| child.id == goal.id)
-            {
-                current.push(goal.clone());
-            }
+        self.rank_with_state(&snapshot, goals, now_ms)
+    }
+
+    fn rank_with_state(
+        &self,
+        snapshot: &CognitiveSnapshot,
+        goals: &[Goal],
+        now_ms: u64,
+    ) -> LoopResult<Vec<RankedGoal>> {
+        if !self.enabled.load(Ordering::SeqCst) {
+            return Ok(vec![]);
         }
-        PriorityDrivePolicy.rank(&current, now_ms)
+        // QQ 待办必须属于明确用户；宿主的 Internal 读取范围不扩大此准入条件。
+        let user_goals: Vec<_> = goals
+            .iter()
+            .filter(|goal| {
+                matches!(goal.visibility, Visibility::User(_))
+                    && snapshot
+                        .state
+                        .goals
+                        .get(&goal.source.reference)
+                        .is_some_and(|parent| parent.visibility == goal.visibility)
+            })
+            .cloned()
+            .collect();
+        ReflectionDrivePolicy::new(scope(SourceKind::User, CHANNEL))?.rank_with_state(
+            snapshot,
+            &user_goals,
+            now_ms,
+        )
     }
 }
 
@@ -629,4 +641,103 @@ pub(crate) async fn start(
         finished,
         task,
     })
+}
+
+#[cfg(test)]
+mod agenda_policy_tests {
+    use super::*;
+    use eve_cognition_loop_plugin::EndogenousPlanner;
+
+    fn parent(id: &str, visibility: Visibility) -> Goal {
+        Goal {
+            id: id.into(),
+            revision: 0,
+            source: Source {
+                kind: SourceKind::User,
+                channel: CHANNEL.into(),
+                reference: id.into(),
+            },
+            visibility,
+            description: "整理待办的下一步".into(),
+            verification: "user-goal:v1".into(),
+            priority: 50,
+            budget: ExecutionBudget {
+                max_model_requests: 1,
+                max_tool_calls: 0,
+                max_attempts: 1,
+                timeout_ms: 30_000,
+            },
+            stop_condition: "user-confirmation".into(),
+            expires_at_ms: None,
+            status: GoalStatus::Waiting,
+            wait_reason: Some("等待反思".into()),
+            block_reason: None,
+            execution: None,
+            feedback: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn qq_agenda_preserves_user_only_admission_and_supplied_snapshot() {
+        let kernel = Kernel::with_services(KernelServices::default());
+        let plugin = CognitionPlugin::new("eve").unwrap();
+        let admin = plugin.controller();
+        kernel.register(Box::new(plugin)).unwrap();
+        kernel
+            .start(&PluginId::new(COGNITION_PLUGIN_ID).unwrap())
+            .await
+            .unwrap();
+        let initial = admin.snapshot().unwrap();
+        let mut state = initial.state;
+        for goal in [
+            parent("public", Visibility::Public),
+            parent("internal", Visibility::Internal),
+            parent("user", Visibility::User("qq-user".into())),
+        ] {
+            state.goals.insert(goal.id.clone(), goal);
+        }
+        admin.replace(initial.revision, state).unwrap();
+        let planner = EndogenousPlanner::new(
+            Arc::new(admin.clone()),
+            EndogenousOptions {
+                scope: scope(SourceKind::User, CHANNEL),
+                max_derivations: 3,
+                timeout_ms: 30_000,
+            },
+        )
+        .unwrap();
+        for _ in 0..3 {
+            assert_eq!(planner.reconcile(1_000).unwrap().created_goal_ids.len(), 1);
+        }
+        let snapshot = admin.snapshot().unwrap();
+        let goals: Vec<_> = snapshot
+            .state
+            .goals
+            .values()
+            .filter(|goal| goal.status == GoalStatus::Ready)
+            .cloned()
+            .collect();
+        assert_eq!(goals.len(), 3);
+        // 关闭管理句柄后仍须只使用传入快照，不能再读取一次插件状态。
+        kernel.stop_all().await.unwrap();
+        assert!(admin.snapshot().is_err());
+        let enabled = Arc::new(AtomicBool::new(true));
+        let policy = QqPolicy {
+            enabled: enabled.clone(),
+            admin,
+        };
+        let ranked = policy.rank_with_state(&snapshot, &goals, 1_000).unwrap();
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(
+            snapshot.state.goals[&ranked[0].goal_id].source.reference,
+            "user"
+        );
+        enabled.store(false, Ordering::SeqCst);
+        assert!(
+            policy
+                .rank_with_state(&snapshot, &goals, 1_000)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }

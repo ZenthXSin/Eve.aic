@@ -22,7 +22,14 @@ path = "src/bin/cognition.rs"
 name = "eve-message-evaluate"
 path = "src/bin/message-evaluate.rs"
 
+[[bin]]
+name = "eve-memory"
+path = "src/bin/memory.rs"
+
 [dependencies]
+eve-action-api = { path = "../action-api" }
+eve-action-plugin = { path = "../action-plugin" }
+eve-artifact-file = { path = "../artifact-file" }
 eve-message-diagnostics = { path = "../message-diagnostics" }
 eve-agent-prompt = { path = "../agent-prompt" }
 eve-web-panel-api = { path = "../web-panel-api" }

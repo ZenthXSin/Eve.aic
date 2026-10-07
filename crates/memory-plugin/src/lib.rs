@@ -1,5 +1,7 @@
 //! 有界交互证据与明确偏好；宿主保留管理能力，不发布通用管理服务。
 mod context;
+mod recall;
+mod recall_context;
 mod store;
 mod strict_json;
 
@@ -9,6 +11,8 @@ use eve_plugin_api::{
     Cleanup, Plugin, PluginContext, PluginError, PluginFuture, PluginManifest, PluginResult,
     cleanup,
 };
+pub use recall::{LexicalMemoryRecall, ScopedLexicalRecall};
+pub use recall_context::MemoryRecallContext;
 use std::sync::{Arc, Mutex};
 use store::StoredMemory;
 

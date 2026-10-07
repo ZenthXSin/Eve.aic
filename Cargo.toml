@@ -1,5 +1,8 @@
 [workspace]
 members = [
+    "crates/action-api",
+    "crates/action-plugin",
+    "crates/artifact-file",
     "crates/web-panel-api",
     "crates/web-panel",
     "crates/learning-api",

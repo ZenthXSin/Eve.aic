@@ -3,7 +3,9 @@ mod endogenous;
 pub use endogenous::{
     EndogenousOptions, EndogenousPlannerFactory, EndogenousPlanning, EndogenousReport,
 };
-use eve_cognition_api::{CognitionError, ExecutionAttempt, Goal, ReadAccess, SourceKind};
+use eve_cognition_api::{
+    CognitionError, CognitiveSnapshot, ExecutionAttempt, Goal, ReadAccess, SourceKind,
+};
 use eve_control_api::{ControlReport, GenerationKey};
 use eve_llm_api::BudgetUsage;
 use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Instant};
@@ -96,7 +98,7 @@ impl LoopOptions {
         Ok(())
     }
 }
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RankedGoal {
     pub goal_id: String,
     pub strength: u8,
@@ -105,6 +107,52 @@ pub struct RankedGoal {
 /// 只接收宿主已按来源、范围、状态与验证能力过滤的候选。
 pub trait DrivePolicy: Send + Sync {
     fn rank(&self, goals: &[Goal], now_ms: u64) -> LoopResult<Vec<RankedGoal>>;
+
+    /// 使用候选所属的同一持久快照解释评分；旧策略仍可仅实现 rank。
+    /// 实现不得扩大传入候选集、改写状态或调用模型。
+    fn rank_with_state(
+        &self,
+        _snapshot: &CognitiveSnapshot,
+        goals: &[Goal],
+        now_ms: u64,
+    ) -> LoopResult<Vec<RankedGoal>> {
+        self.rank(goals, now_ms)
+    }
+}
+
+/// 只读评估结果；只有宿主持有的执行循环可以据此准入。
+/// 分数随 evaluated_at_ms 改变，不能把旧预览当成执行授权。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgendaEvaluation {
+    pub evaluated_at_ms: u64,
+    pub revision: u64,
+    pub ranked: Vec<RankedGoal>,
+    pub excluded: Vec<AgendaExclusion>,
+    pub blocker: Option<AgendaBlocker>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgendaExclusion {
+    pub goal_id: String,
+    pub reason: AgendaExclusionReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgendaExclusionReason {
+    ScopeDenied,
+    NotReady,
+    Expired,
+    InvalidBudget,
+    UnsupportedVerification,
+    PolicyOmitted,
+    AlreadyDerived,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgendaBlocker {
+    ExecutionLimitReached,
+    DerivationLimitReached,
+    AlreadyExecuting,
 }
 #[derive(Clone)]
 pub struct GoalExecutionReport {
