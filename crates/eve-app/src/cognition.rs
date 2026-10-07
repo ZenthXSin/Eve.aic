@@ -1,6 +1,10 @@
 //! 本地内生反思宿主：用户目标保持 Waiting，只对派生草稿安装受限执行能力。
 use crate::cognition_action::ExportPlanOptions;
-use crate::{AppError, AppFailure, cognition_action, config, core_bootstrap, models, services};
+use crate::cognition_plan::{PlanCreateOptions, PlanStepOptions};
+use crate::{
+    AppError, AppFailure, cognition_action, cognition_plan, config, core_bootstrap, models,
+    services,
+};
 use eve_cognition_api::*;
 use eve_cognition_loop_api::*;
 use eve_cognition_loop_plugin::{
@@ -49,6 +53,11 @@ pub const COGNITION_HELP: &str = "Eve 本地内生反思入口
   show --id ID                            查看目标及草稿，current/stale 标明是否属于当前修订
   export-plan --id ID --revision N --observe-file 路径 --input-sha256 SHA --output 路径 [--user owner]
                                           显式创建并读回验证当前草稿产物，不覆盖文件、不完成父目标
+  plan-create --id ID --revision N --steps 步骤.json [--input-sha256 SHA] [--user owner]
+                                          绑定当前目标修订与输入，保存有依赖、预算和效果条件的计划
+  plan-show [--id ID] [--user owner]      查看计划、就绪步骤及绑定是否仍成立；会封存遗留执行
+  plan-step --plan 计划ID --step 步骤ID [--observe-file 路径] [--output 路径] [--user owner]
+                                          执行一个就绪步骤；效果只按独立读取的证据判定
   run [--seconds 30] [--max-executions 1]   无需新输入，推进已有目标的反思草稿
       [--observe-goal ID --observe-file 路径 [--observe-user owner]]
                                           观察指定文本文件，内容变化后保存证据并重规划
@@ -83,6 +92,12 @@ enum CognitionCommand {
         id: String,
     },
     ExportPlan(ExportPlanOptions),
+    PlanCreate(PlanCreateOptions),
+    PlanShow {
+        goal_id: Option<String>,
+        user: String,
+    },
+    PlanStep(PlanStepOptions),
     Run {
         seconds: u64,
         max_executions: u16,
@@ -128,6 +143,9 @@ impl CognitionOptions {
                 "show",
                 "run",
                 "export-plan",
+                "plan-create",
+                "plan-show",
+                "plan-step",
             ]
             .contains(&arg.as_str())
             {
@@ -152,6 +170,9 @@ impl CognitionOptions {
                 "--observe-user",
                 "--input-sha256",
                 "--output",
+                "--steps",
+                "--plan",
+                "--step",
             ]
             .contains(&arg.as_str())
             {
@@ -245,6 +266,61 @@ impl CognitionOptions {
                     input_sha256,
                     observe_file,
                     output_file,
+                })
+            }
+            "plan-create" => {
+                let goal_id = fields.remove("--id").ok_or("plan-create 缺少 --id。")?;
+                let goal_revision = fields
+                    .remove("--revision")
+                    .ok_or("plan-create 缺少 --revision。")?
+                    .parse::<u64>()
+                    .map_err(|_| "计划目标修订必须为正整数。")?;
+                let steps_file = PathBuf::from(
+                    fields
+                        .remove("--steps")
+                        .ok_or("plan-create 缺少 --steps。")?,
+                );
+                let input_sha256 = fields.remove("--input-sha256");
+                let user_id = fields.remove("--user").unwrap_or_else(|| "owner".into());
+                validate_id(&goal_id)?;
+                validate_id(&user_id)?;
+                if goal_revision == 0
+                    || input_sha256
+                        .as_deref()
+                        .is_some_and(|value| !cognition_action::valid_sha256(value))
+                {
+                    return Err("计划目标修订须为正整数，输入摘要须为 64 位小写 SHA-256。".into());
+                }
+                CognitionCommand::PlanCreate(PlanCreateOptions {
+                    goal_id,
+                    goal_revision,
+                    user_id,
+                    input_sha256,
+                    steps_file,
+                })
+            }
+            "plan-show" => {
+                let goal_id = fields.remove("--id");
+                let user = fields.remove("--user").unwrap_or_else(|| "owner".into());
+                if let Some(id) = &goal_id {
+                    validate_id(id)?;
+                }
+                validate_id(&user)?;
+                CognitionCommand::PlanShow { goal_id, user }
+            }
+            "plan-step" => {
+                let plan_id = fields.remove("--plan").ok_or("plan-step 缺少 --plan。")?;
+                let step_id = fields.remove("--step").ok_or("plan-step 缺少 --step。")?;
+                let user_id = fields.remove("--user").unwrap_or_else(|| "owner".into());
+                for id in [&plan_id, &step_id, &user_id] {
+                    validate_id(id)?;
+                }
+                CognitionCommand::PlanStep(PlanStepOptions {
+                    plan_id,
+                    step_id,
+                    user_id,
+                    observe_file: observation_file.take(),
+                    output_file: output_file.take(),
                 })
             }
             "run" => {
@@ -899,6 +975,15 @@ pub async fn run_cognition_with_planner_factory(
             CognitionCommand::ExportPlan(action_options) => {
                 cognition_action::export_plan(&kernel, &backends.registry, &admin, action_options)
                     .await
+            }
+            CognitionCommand::PlanCreate(plan_options) => {
+                cognition_plan::create(&kernel, &admin, plan_options).await
+            }
+            CognitionCommand::PlanShow { goal_id, user } => {
+                cognition_plan::show(&kernel, &admin, goal_id, &user).await
+            }
+            CognitionCommand::PlanStep(step_options) => {
+                cognition_plan::step(&kernel, &backends.registry, &admin, step_options).await
             }
             CognitionCommand::Run {
                 seconds,

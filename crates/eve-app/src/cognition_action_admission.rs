@@ -222,22 +222,24 @@ fn checked_snapshot(admin: &dyn CognitionAdmin) -> Result<CognitiveSnapshot, App
     Ok(snapshot)
 }
 
-fn eligible_parent<'a>(
+/// 属于该用户、仍在等待且未过期的本地用户目标；不比较修订。
+fn owned_waiting_parent<'a>(
     snapshot: &'a CognitiveSnapshot,
-    input: &DocumentActionRequest,
+    goal_id: &str,
+    user_id: &str,
     at_ms: u64,
 ) -> Result<&'a Goal, AppError> {
     let parent = snapshot
         .state
         .goals
-        .get(&input.goal_id)
+        .get(goal_id)
         .filter(|goal| {
             goal.source.kind == SourceKind::User
                 && goal.source.channel == INPUT_CHANNEL
                 && goal.source.reference == goal.id
                 && goal.verification == "user-goal:v1"
                 && goal.stop_condition == "user-confirmation"
-                && goal.visibility == Visibility::User(input.user_id.clone())
+                && goal.visibility == Visibility::User(user_id.into())
         })
         .ok_or(CognitionError::AccessDenied)?;
     if parent.status != GoalStatus::Waiting
@@ -245,10 +247,43 @@ fn eligible_parent<'a>(
     {
         return Err(CognitionError::InvalidTransition.into());
     }
+    Ok(parent)
+}
+
+fn eligible_parent<'a>(
+    snapshot: &'a CognitiveSnapshot,
+    input: &DocumentActionRequest,
+    at_ms: u64,
+) -> Result<&'a Goal, AppError> {
+    let parent = owned_waiting_parent(snapshot, &input.goal_id, &input.user_id, at_ms)?;
     if parent.revision != input.expected_goal_revision {
         return Err(CognitionError::StaleRevision.into());
     }
     Ok(parent)
+}
+
+/// 多步计划的当前绑定：目标当前修订与最近一次文件观察摘要，规则与文档行动准入相同。
+/// 没有任何文件观察记录时摘要为空；观察记录残缺或矛盾时报错，不退回旧证据。
+pub(crate) fn current_plan_binding(
+    admin: &dyn CognitionAdmin,
+    goal_id: &str,
+    user_id: &str,
+    at_ms: u64,
+) -> Result<(u64, Option<String>), AppError> {
+    validate_id(goal_id)?;
+    validate_id(user_id)?;
+    let snapshot = checked_snapshot(admin)?;
+    let parent = owned_waiting_parent(&snapshot, goal_id, user_id, at_ms)?;
+    let observed = snapshot.state.events.iter().any(|event| {
+        event.goal_id.as_deref() == Some(goal_id)
+            && event.source.channel == FILE_OBSERVATION_CHANNEL
+    });
+    let input = if observed {
+        Some(latest_observation(&snapshot.state, parent, at_ms)?.1.sha256)
+    } else {
+        None
+    };
+    Ok((parent.revision, input))
 }
 
 fn completed_current_reflection<'a>(
