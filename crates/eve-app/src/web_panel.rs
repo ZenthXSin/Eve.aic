@@ -26,6 +26,8 @@ pub(crate) struct QqPanel {
     pub judgments: Option<(Arc<RecentRelationJudgments>, &'static str)>,
     /// 开启 --cognition 时绑定 Internal 的只读句柄；面板不持有认知管理能力。
     pub cognition: Option<Arc<dyn CognitionReader>>,
+    /// 开启 --memory 时的只读记忆视图；面板不能确认、更正或撤销偏好。
+    pub memory: Option<crate::web_panel_memory::MemoryView>,
 }
 fn session_error(error: SessionError) -> PanelError {
     match error {
@@ -255,6 +257,26 @@ impl PanelService for QqPanel {
     fn goal(&self, id: &str) -> PanelResult<GoalDetail> {
         let reader = self.cognition.as_ref().ok_or(PanelError::Unavailable)?;
         crate::web_panel_cognition::goal(reader.as_ref(), self.sessions.as_ref(), id)
+    }
+    fn memory_scopes(
+        &self,
+        after: Option<&eve_memory_api::MemoryScope>,
+        limit: usize,
+    ) -> PanelResult<MemoryScopePage> {
+        let view = self.memory.as_ref().ok_or(PanelError::Unavailable)?;
+        crate::web_panel_memory::scopes(view, after, limit)
+    }
+    fn memory(&self, scope: &eve_memory_api::MemoryScope) -> PanelResult<MemoryDetail> {
+        let view = self.memory.as_ref().ok_or(PanelError::Unavailable)?;
+        crate::web_panel_memory::detail(view, scope)
+    }
+    fn memory_evidence(
+        &self,
+        scope: &eve_memory_api::MemoryScope,
+        id: &str,
+    ) -> PanelResult<MemoryEvidenceDetail> {
+        let view = self.memory.as_ref().ok_or(PanelError::Unavailable)?;
+        crate::web_panel_memory::evidence(view, scope, id)
     }
 }
 

@@ -40,6 +40,12 @@
   let goalLoading = false;
   let selectedGoal = null;
   let goalRequest = 0;
+  let memoryScopes = [];
+  let memoryAfter = null;
+  let memoryLoading = false;
+  let selectedMemory = null;
+  let memoryRequest = 0;
+  let evidenceRequest = 0;
   const controllers = new Set();
   const judgmentLabels = {
     result: { decided: "已判定", failed: "判断失败", dropped: "已丢弃" },
@@ -58,6 +64,10 @@
     commit: { not_started: "尚未开始提交", completed: "成功结果已保存", failed: "失败记录已保存", pending: "提交未完成，需处理", unknown: "保存状态未知" },
     event: { external_input: "外部输入", state_changed: "状态变化", drive_evaluated: "派生评估", agenda_selected: "议程选择", feedback: "执行反馈" },
     draft: { saved: "草稿已保存", not_saved: "没有已保存草稿", unavailable: "草稿正文不可用" },
+  };
+  const memoryLabels = {
+    status: { confirmed: "已确认", revoked: "已撤销" },
+    kind: { user_statement: "用户明确声明", completed_interaction: "已完成对话", missing: "来源记录缺失" },
   };
 
   class ApiError extends Error {
@@ -201,6 +211,19 @@
     goalLoading = false;
     selectedGoal = null;
     goalRequest += 1;
+    memoryScopes = [];
+    memoryAfter = null;
+    memoryLoading = false;
+    selectedMemory = null;
+    memoryRequest += 1;
+    evidenceRequest += 1;
+    $("memory-list").replaceChildren();
+    $("memory-detail").replaceChildren();
+    $("memory-count").textContent = "0";
+    $("memory-empty").textContent = "正在读取记忆作用域…";
+    $("memory-empty").hidden = false;
+    $("memory-more").hidden = true;
+    showError("memory-error", "");
     $("goals-list").replaceChildren();
     $("goal-detail").replaceChildren();
     $("goal-count").textContent = "0";
@@ -859,13 +882,174 @@
     $("goal-detail").replaceChildren(heading, detail);
   }
 
+  function validScope(scope) {
+    return scope && typeof scope.channel === "string" && typeof scope.session_id === "string" && typeof scope.user_id === "string";
+  }
+  function scopeId(scope) { return JSON.stringify([scope.channel, scope.session_id, scope.user_id]); }
+  function memoryBadge(status) {
+    return node("span", `badge ${status === "confirmed" ? "good" : ""}`.trim(), label(memoryLabels.status, status));
+  }
+
+  async function loadMemoryScopes(append = false) {
+    if (!token || memoryLoading || (append && memoryAfter === null)) return;
+    memoryLoading = true;
+    const requestEpoch = epoch;
+    renderMemoryScopes();
+    try {
+      const body = await api("/api/memory/scopes", append ? { after: memoryAfter, limit: 25 } : { limit: 25 });
+      if (epoch !== requestEpoch) return;
+      if (!body || !Array.isArray(body.items) || !body.items.every((item) => item && validScope(item.scope)) ||
+        !(body.next_after === null || validScope(body.next_after))) {
+        throw new ApiError("记忆作用域格式无效，请刷新重试。");
+      }
+      const merged = append ? [...memoryScopes, ...body.items] : body.items;
+      memoryScopes = [...new Map(merged.map((item) => [scopeId(item.scope), item])).values()];
+      memoryAfter = body.next_after;
+      showError("memory-error", "");
+    } catch (error) {
+      if (epoch !== requestEpoch) return;
+      if (error instanceof ApiError && error.message.startsWith("当前服务暂不可用")) {
+        showError("memory-error", "当前实例未开启交互记忆（需以 --memory 启动），或记忆状态暂时无法读取。");
+      } else reportError("memory-error", error);
+    } finally {
+      if (epoch === requestEpoch) {
+        memoryLoading = false;
+        renderMemoryScopes();
+      }
+    }
+  }
+
+  function renderMemoryScopes() {
+    $("memory-list").replaceChildren();
+    for (const item of memoryScopes) {
+      const id = scopeId(item.scope);
+      const selected = selectedMemory === id;
+      const entry = node("button", `record-button${selected ? " selected" : ""}`);
+      entry.type = "button";
+      entry.setAttribute("aria-pressed", String(selected));
+      const top = node("div", "record-topline");
+      top.append(node("span", "record-name", `用户 ${item.scope.user_id}`), node("span", "badge", `${count(item.confirmed)} 条生效`));
+      entry.append(top, node("p", "record-meta", `${item.scope.channel} · 会话 ${item.scope.session_id}`),
+        node("p", "record-meta", `已撤销 ${count(item.revoked)} · 来源 ${count(item.evidence)} · 修订 ${count(item.revision)}`));
+      entry.addEventListener("click", () => { void loadMemory(item.scope); });
+      $("memory-list").append(entry);
+    }
+    $("memory-count").textContent = count(memoryScopes.length);
+    $("memory-empty").hidden = memoryScopes.length > 0;
+    $("memory-empty").textContent = memoryLoading ? "正在读取记忆作用域…" : !$("memory-error").hidden ? "暂时无法读取记忆。" : "还没有保存的记忆。用户通过 /remember 保存偏好或完成对话后会显示在这里。";
+    $("memory-more").hidden = memoryAfter === null;
+    $("memory-more").disabled = memoryLoading;
+  }
+
+  async function loadMemory(scope) {
+    const request = ++memoryRequest;
+    evidenceRequest += 1;
+    const requestEpoch = epoch;
+    selectedMemory = scopeId(scope);
+    renderMemoryScopes();
+    emptyDetail("memory-detail", "✦", "正在读取记忆", "正在读取偏好与版本历史。");
+    try {
+      const body = await api("/api/memory/scope", { scope });
+      if (request !== memoryRequest || requestEpoch !== epoch) return;
+      if (!body || !validScope(body.scope) || scopeId(body.scope) !== scopeId(scope) || !Array.isArray(body.preferences)) {
+        throw new ApiError("服务返回的记忆格式无效，请重新选择。");
+      }
+      renderMemoryDetail(body);
+    } catch (error) {
+      if (request === memoryRequest && requestEpoch === epoch && !error.silent) {
+        emptyDetail("memory-detail", "✦", "未能读取记忆", errorText(error));
+        const actions = node("div", "detail-actions");
+        actions.append(button("重新读取", "secondary", () => { void loadMemory(scope); }));
+        $("memory-detail").firstChild.append(actions);
+      }
+    }
+  }
+
+  function renderMemoryDetail(body) {
+    const heading = node("div", "detail-heading");
+    const effective = body.preferences.filter((item) => item && item.effective).length;
+    heading.append(node("span", "section-kicker", `作用域修订 ${count(body.revision)}`), node("h2", "", `用户 ${body.scope.user_id}`),
+      node("p", "", `${body.scope.channel} · 会话 ${body.scope.session_id} · 偏好 ${count(body.preferences.length)} 条，生效 ${count(effective)} 条 · 来源 ${count(body.evidence)} 条`));
+    const actions = node("div", "detail-actions");
+    actions.append(button("刷新此作用域", "secondary", () => { void loadMemory(body.scope); }));
+    heading.append(actions);
+    const detail = node("div", "detail-body");
+    detail.append(node("p", "detail-note", "只有“已确认”且为最新版本的偏好会进入对话上下文。撤销和更正都保留历史与来源，不删除记录。"));
+    if (!body.preferences.length) detail.append(node("p", "muted", "此作用域还没有偏好，只有交互来源。"));
+    const evidenceBox = node("section", "goal-section");
+    evidenceBox.id = "memory-evidence";
+    for (const item of body.preferences) {
+      if (!item || typeof item.id !== "string" || !Array.isArray(item.history)) continue;
+      const card = node("article", "reflection-card");
+      const top = node("div", "record-topline");
+      top.append(node("span", "record-name", item.id), memoryBadge(item.status));
+      card.append(top, node("p", "", item.text));
+      if (item.text_truncated) card.append(node("p", "truncation-note", "仅显示前 4096 字节。"));
+      card.append(node("p", "record-meta", item.effective ? `版本 ${count(item.revision)} · 当前生效` : `版本 ${count(item.revision)} · 已撤销，不再进入对话上下文`));
+      const versions = node("ol", "judgment-steps");
+      for (const version of item.history) {
+        if (!version || typeof version.evidence_id !== "string") continue;
+        const row = node("li", "judgment-step");
+        row.append(node("span", "record-name", `版本 ${count(version.revision)}${version.current ? "（最新）" : ""} · ${label(memoryLabels.status, version.status)}`),
+          node("span", "record-meta", `${label(memoryLabels.kind, version.evidence_kind)} · ${goalDate(version.at_ms)}`));
+        row.append(node("p", "event-summary", version.text));
+        if (version.text_truncated) row.append(node("p", "truncation-note", "仅显示前 512 字节。"));
+        if (version.evidence_kind !== "missing") {
+          const open = button("查看来源", "secondary", () => { void loadEvidence(body.scope, version.evidence_id); });
+          open.setAttribute("aria-label", `查看版本 ${version.revision} 的来源`);
+          row.append(open);
+        }
+        versions.append(row);
+      }
+      card.append(versions);
+      detail.append(card);
+    }
+    detail.append(evidenceBox);
+    $("memory-detail").replaceChildren(heading, detail);
+  }
+
+  async function loadEvidence(scope, id) {
+    const request = ++evidenceRequest;
+    const requestEpoch = epoch;
+    const box = $("memory-evidence");
+    if (!box) return;
+    box.replaceChildren(node("h3", "", "来源"), node("p", "muted", "正在读取来源…"));
+    box.scrollIntoView({ block: "nearest" });
+    try {
+      const body = await api("/api/memory/evidence", { scope, id });
+      if (request !== evidenceRequest || requestEpoch !== epoch || !$("memory-evidence")) return;
+      if (!body || body.id !== id || typeof body.user_text !== "string" || !Array.isArray(body.references)) {
+        throw new ApiError("来源格式无效，请重新打开。");
+      }
+      const target = $("memory-evidence");
+      target.replaceChildren(node("h3", "", `来源 ${body.id}`),
+        node("p", "record-meta", `${label(memoryLabels.kind, body.kind)} · ${goalDate(body.at_ms)}${body.turn_id === null ? "" : ` · 对话轮次 ${body.turn_id}`}`));
+      const conversation = node("div", "conversation");
+      appendMessage(conversation, "user", body.kind === "user_statement" ? "用户声明" : "用户输入", body.user_text);
+      if (body.user_text_truncated) conversation.append(node("p", "truncation-note", "仅显示前 2048 字节，完整记录保留。"));
+      if (typeof body.assistant_text === "string") {
+        appendMessage(conversation, "assistant", "Eve（当时回复）", body.assistant_text);
+        if (body.assistant_text_truncated) conversation.append(node("p", "truncation-note", "仅显示前 2048 字节，完整记录保留。"));
+      }
+      target.append(conversation);
+      const refs = body.references.map((ref) => `${ref.preference_id} 版本 ${ref.revision}${ref.effective ? "（生效）" : ref.current ? "（最新，未生效）" : "（历史）"}`);
+      target.append(node("p", "record-meta", `引用此来源的偏好版本：${refs.join("、") || "无"}${body.references_total > body.references.length ? `，另有 ${count(body.references_total - body.references.length)} 条未列出` : ""}`));
+      target.append(node("p", "truncation-note", "助手回复是当时的历史内容，不是已核实的事实；用户声明也只代表用户当时的说法。"));
+    } catch (error) {
+      if (request === evidenceRequest && requestEpoch === epoch && !error.silent && $("memory-evidence")) {
+        $("memory-evidence").replaceChildren(node("h3", "", "来源"), node("p", "inline-error", errorText(error)));
+      }
+    }
+  }
+
   function switchView(next) {
     view = next;
     $("tasks-view").hidden = next !== "tasks";
     $("sessions-view").hidden = next !== "sessions";
     $("judgments-view").hidden = next !== "judgments";
     $("goals-view").hidden = next !== "goals";
-    $("page-title").textContent = { tasks: "任务状态", sessions: "会话记录", judgments: "判断诊断", goals: "认知目标" }[next];
+    $("memory-view").hidden = next !== "memory";
+    $("page-title").textContent = { tasks: "任务状态", sessions: "会话记录", judgments: "判断诊断", goals: "认知目标", memory: "记忆偏好" }[next];
     for (const item of document.querySelectorAll("[data-view]")) {
       const active = item.dataset.view === next;
       item.classList.toggle("active", active);
@@ -875,6 +1059,7 @@
     if (next === "sessions" && sessions.length === 0) void loadSessions();
     if (next === "judgments") void loadJudgments();
     if (next === "goals") void loadGoals();
+    if (next === "memory" && memoryScopes.length === 0) void loadMemoryScopes();
   }
 
   async function refresh() {
@@ -942,6 +1127,7 @@
       $("console-view").hidden = false;
       emptyDetail("task-detail", "◎", "选择一个任务", "在这里查看执行状态，以及针对当前代际请求取消。");
       emptyDetail("session-detail", "▤", "选择一段会话", "仅展示用户与助手文字，工具参数和结果不在此展示。");
+      emptyDetail("memory-detail", "✦", "选择一个作用域", "查看已确认和已撤销的偏好、版本历史，以及每个版本的来源。来源正文需单独打开。");
       emptyDetail("goal-detail", "◈", "选择一个目标", "查看状态、来源记录，以及当前和历史反思草稿。草稿是未验证的建议，不代表目标完成。");
       switchView("tasks");
       void refresh();
@@ -964,11 +1150,17 @@
     }
     if (view === "judgments" && judgmentPages > 1) void loadJudgments();
     if (view === "goals" && selectedGoal !== null) void loadGoal(selectedGoal);
+    if (view === "memory") {
+      void loadMemoryScopes();
+      const current = memoryScopes.find((item) => scopeId(item.scope) === selectedMemory);
+      if (current) void loadMemory(current.scope);
+    }
   });
   $("tasks-more").addEventListener("click", () => { void loadTasks(true).catch(() => {}); });
   $("sessions-more").addEventListener("click", () => { void loadSessions(true); });
   $("judgments-more").addEventListener("click", () => { void loadJudgments(true); });
   $("goals-more").addEventListener("click", () => { void loadGoals(true); });
+  $("memory-more").addEventListener("click", () => { void loadMemoryScopes(true); });
   for (const item of document.querySelectorAll("[data-view]")) item.addEventListener("click", () => switchView(item.dataset.view));
   document.addEventListener("visibilitychange", () => {
     clearTimeout(pollTimer);

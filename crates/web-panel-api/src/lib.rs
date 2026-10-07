@@ -1,5 +1,6 @@
 //! 本机管理面板的公开契约；不包含 HTTP、模型调用、磁盘实现或 Kernel。
 use eve_control_api::GenerationKey;
+use eve_memory_api::MemoryScope;
 use eve_session_api::SessionKey;
 use serde::Serialize;
 
@@ -255,6 +256,84 @@ pub struct GoalDetail {
     pub reflection_check: &'static str,
 }
 
+/// 记忆作用域摘要。作用域标识与会话页相同，属于本机操作者可见信息；不含正文。
+#[derive(Clone, Debug, Serialize)]
+pub struct MemoryScopeSummary {
+    pub scope: MemoryScope,
+    /// 只属于该作用域的修订。
+    pub revision: u64,
+    pub evidence: usize,
+    pub confirmed: usize,
+    pub revoked: usize,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct MemoryScopePage {
+    pub items: Vec<MemoryScopeSummary>,
+    /// 继续分页时作为 `after` 传回；各页不是同一事务快照。
+    pub next_after: Option<MemoryScope>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct PreferenceVersionView {
+    pub revision: u64,
+    /// `confirmed` 或 `revoked`。
+    pub status: &'static str,
+    pub at_ms: u64,
+    /// 是否为该偏好的最新版本；只有最新且确认的版本才进入对话上下文。
+    pub current: bool,
+    pub text: String,
+    pub text_truncated: bool,
+    pub evidence_id: String,
+    /// `user_statement`、`completed_interaction`；引用的证据不在快照中时为 `missing`。
+    pub evidence_kind: &'static str,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct PreferenceView {
+    pub id: String,
+    pub status: &'static str,
+    pub revision: u64,
+    /// 当前确认、会进入对话上下文；撤销后为 false，历史与来源仍保留。
+    pub effective: bool,
+    pub text: String,
+    pub text_truncated: bool,
+    /// 历史版本，新的在前。
+    pub history: Vec<PreferenceVersionView>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct MemoryDetail {
+    pub scope: MemoryScope,
+    pub revision: u64,
+    pub evidence: usize,
+    /// 按偏好 ID 升序；数量与历史总数受记忆存储上限约束。
+    pub preferences: Vec<PreferenceView>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct EvidenceReference {
+    pub preference_id: String,
+    pub revision: u64,
+    pub current: bool,
+    pub effective: bool,
+}
+/// 单条来源正文；须由操作者显式打开。消息 ID 不返回。
+#[derive(Clone, Debug, Serialize)]
+pub struct MemoryEvidenceDetail {
+    pub scope: MemoryScope,
+    pub id: String,
+    pub revision: u64,
+    pub at_ms: u64,
+    /// `user_statement` 或 `completed_interaction`。
+    pub kind: &'static str,
+    /// 用户明确声明，或已完成交互中的用户输入；有界预览并标注截断。
+    pub user_text: String,
+    pub user_text_truncated: bool,
+    /// 仅已完成交互：当时的助手回复，是历史内容，不是已核实事实。
+    pub assistant_text: Option<String>,
+    pub assistant_text_truncated: bool,
+    pub turn_id: Option<u64>,
+    /// 引用这条证据的偏好版本，按偏好 ID 与修订排序，最多列出有限条。
+    pub references: Vec<EvidenceReference>,
+    pub references_total: usize,
+}
+
 /// 受信宿主提供服务，HTTP 实现仅消费此契约。cancel 只准入取消，不等待或声明提交完成。
 /// 每页 1..=100 项；历史最多 50 轮，每段正文最多 8192 字节并明确标注截断。
 /// 暴露给本机操作者；不存在通过 HTTP 指定其他 Provider、执行工具或新任务的入口。
@@ -280,6 +359,27 @@ pub trait PanelService: Send + Sync {
     }
     /// 单个目标及其反思草稿和最近来源记录；不存在时返回 NotFound。
     fn goal(&self, _id: &str) -> PanelResult<GoalDetail> {
+        Err(PanelError::Unavailable)
+    }
+    /// 已持久保存的记忆作用域，按 (channel, session_id, user_id) 升序，每页 1..=100 项。
+    /// 未开启记忆的实现返回 Unavailable；读取不创建作用域。
+    fn memory_scopes(
+        &self,
+        _after: Option<&MemoryScope>,
+        _limit: usize,
+    ) -> PanelResult<MemoryScopePage> {
+        Err(PanelError::Unavailable)
+    }
+    /// 已存在作用域的偏好与版本历史；不存在的作用域返回 NotFound，不当作空记忆。
+    fn memory(&self, _scope: &MemoryScope) -> PanelResult<MemoryDetail> {
+        Err(PanelError::Unavailable)
+    }
+    /// 同一作用域内的一条来源证据；不存在时返回 NotFound。
+    fn memory_evidence(
+        &self,
+        _scope: &MemoryScope,
+        _id: &str,
+    ) -> PanelResult<MemoryEvidenceDetail> {
         Err(PanelError::Unavailable)
     }
 }

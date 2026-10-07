@@ -467,6 +467,7 @@ pub async fn run_qqbot_with_learning_policy(
         if let Some(store) = segment_preferences {
             plugin = plugin.with_segment_preferences(store, QQ_SEGMENT_POLICY)?;
         }
+        let panel_memory = memory.clone();
         if let Some(memory) = memory {
             let sessions = registry
                 .get(&ServiceId::new(SESSION_SERVICE_ID)?)?
@@ -540,6 +541,7 @@ pub async fn run_qqbot_with_learning_policy(
                         .as_ref()
                         .map(qq_cognition::Background::reader)
                         .transpose()?,
+                    memory: panel_memory.map(crate::web_panel_memory::MemoryView::new),
                 }),
             )
             .await?;

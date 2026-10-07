@@ -890,3 +890,337 @@ async fn goal_views_are_authenticated_strictly_queried_and_unavailable_by_defaul
     );
     panel.stop().await.unwrap();
 }
+
+struct Memories {
+    calls: Mutex<Vec<String>>,
+}
+fn memory_scope(user: &str) -> eve_memory_api::MemoryScope {
+    eve_memory_api::MemoryScope {
+        channel: "qq".into(),
+        session_id: "会话-A".into(),
+        user_id: user.into(),
+    }
+}
+impl PanelService for Memories {
+    fn status(&self) -> PanelResult<PanelStatus> {
+        Err(PanelError::Unavailable)
+    }
+    fn sessions(&self, _: Option<&str>, _: usize) -> PanelResult<Page<SessionSummary>> {
+        Err(PanelError::Unavailable)
+    }
+    fn tasks(&self, _: Option<&str>, _: usize) -> PanelResult<Page<TaskSummary>> {
+        Err(PanelError::Unavailable)
+    }
+    fn session(&self, _: &SessionKey, _: Option<u64>, _: usize) -> PanelResult<SessionDetail> {
+        Err(PanelError::Unavailable)
+    }
+    fn cancel(&self, _: &GenerationKey) -> PanelResult<CancelStatus> {
+        Err(PanelError::Unavailable)
+    }
+    fn memory_scopes(
+        &self,
+        after: Option<&eve_memory_api::MemoryScope>,
+        limit: usize,
+    ) -> PanelResult<MemoryScopePage> {
+        self.calls.lock().unwrap().push(format!(
+            "scopes:{:?}:{limit}",
+            after.map(|scope| scope.user_id.clone())
+        ));
+        Ok(MemoryScopePage {
+            items: vec![MemoryScopeSummary {
+                scope: memory_scope("用户-A"),
+                revision: 3,
+                evidence: 2,
+                confirmed: 1,
+                revoked: 0,
+            }],
+            next_after: Some(memory_scope("用户-A")),
+        })
+    }
+    fn memory(&self, scope: &eve_memory_api::MemoryScope) -> PanelResult<MemoryDetail> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("detail:{}", scope.user_id));
+        if scope.user_id != "用户-A" {
+            return Err(PanelError::NotFound);
+        }
+        Ok(MemoryDetail {
+            scope: scope.clone(),
+            revision: 3,
+            evidence: 2,
+            preferences: vec![PreferenceView {
+                id: "偏好-1".into(),
+                status: "confirmed",
+                revision: 1,
+                effective: true,
+                text: "<b>先给结论</b>".into(),
+                text_truncated: false,
+                history: vec![PreferenceVersionView {
+                    revision: 1,
+                    status: "confirmed",
+                    at_ms: 10,
+                    current: true,
+                    text: "<b>先给结论</b>".into(),
+                    text_truncated: false,
+                    evidence_id: "证据-1".into(),
+                    evidence_kind: "user_statement",
+                }],
+            }],
+        })
+    }
+    fn memory_evidence(
+        &self,
+        scope: &eve_memory_api::MemoryScope,
+        id: &str,
+    ) -> PanelResult<MemoryEvidenceDetail> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("evidence:{}:{id}", scope.user_id));
+        if id != "证据-1" {
+            return Err(PanelError::NotFound);
+        }
+        Ok(MemoryEvidenceDetail {
+            scope: scope.clone(),
+            id: id.into(),
+            revision: 1,
+            at_ms: 10,
+            kind: "completed_interaction",
+            user_text: "请简短".into(),
+            user_text_truncated: false,
+            assistant_text: Some("好的".into()),
+            assistant_text_truncated: false,
+            turn_id: Some(2),
+            references: vec![EvidenceReference {
+                preference_id: "偏好-1".into(),
+                revision: 1,
+                current: true,
+                effective: true,
+            }],
+            references_total: 1,
+        })
+    }
+}
+
+#[tokio::test]
+async fn memory_views_are_authenticated_strict_json_and_unavailable_by_default() {
+    let client = client();
+    let scope = json!({"channel": "qq", "session_id": "会话-A", "user_id": "用户-A"});
+    let paths = [
+        ("/api/memory/scopes", json!({})),
+        ("/api/memory/scope", json!({"scope": scope})),
+        (
+            "/api/memory/evidence",
+            json!({"scope": scope, "id": "证据-1"}),
+        ),
+    ];
+    let legacy = Arc::new(Service::default());
+    let panel_legacy = panel(legacy.clone()).await;
+    for (path, body) in &paths {
+        assert_code(
+            client
+                .post(url(&panel_legacy, path))
+                .bearer_auth(TOKEN)
+                .json(body)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+        )
+        .await;
+    }
+    panel_legacy.stop().await.unwrap();
+
+    let service = Arc::new(Memories {
+        calls: Mutex::new(vec![]),
+    });
+    let panel = LocalPanel::bind(
+        PanelConfig {
+            address: "127.0.0.1:0".parse().unwrap(),
+            token: TOKEN.into(),
+        },
+        service.clone(),
+    )
+    .await
+    .unwrap();
+    for (path, body) in &paths {
+        assert_code(
+            client
+                .post(url(&panel, path))
+                .json(body)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        )
+        .await;
+        let response = client
+            .get(url(&panel, path))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+    let blank = json!({"channel": "qq", "session_id": "", "user_id": "用户-A"});
+    let control = json!({"channel": "qq", "session_id": "会话\n", "user_id": "用户-A"});
+    let extra = json!({"channel": "qq", "session_id": "会话-A", "user_id": "用户-A", "x": 1});
+    for (path, body, code) in [
+        ("/api/memory/scopes", json!({"limit": 0}), "invalid_input"),
+        ("/api/memory/scopes", json!({"limit": 101}), "invalid_input"),
+        (
+            "/api/memory/scopes",
+            json!({"after": blank}),
+            "invalid_input",
+        ),
+        (
+            "/api/memory/scopes",
+            json!({"after": control}),
+            "invalid_input",
+        ),
+        ("/api/memory/scopes", json!({"before": 1}), "invalid_json"),
+        (
+            "/api/memory/scopes",
+            json!({"after": extra}),
+            "invalid_json",
+        ),
+        ("/api/memory/scope", json!({}), "invalid_json"),
+        (
+            "/api/memory/scope",
+            json!({"scope": blank}),
+            "invalid_input",
+        ),
+        (
+            "/api/memory/scope",
+            json!({"scope": scope, "limit": 1}),
+            "invalid_json",
+        ),
+        (
+            "/api/memory/evidence",
+            json!({"scope": scope}),
+            "invalid_json",
+        ),
+        (
+            "/api/memory/evidence",
+            json!({"scope": scope, "id": ""}),
+            "invalid_input",
+        ),
+        (
+            "/api/memory/evidence",
+            json!({"scope": scope, "id": " 证据"}),
+            "invalid_input",
+        ),
+        (
+            "/api/memory/evidence",
+            json!({"scope": scope, "id": "a".repeat(257)}),
+            "invalid_input",
+        ),
+        (
+            "/api/memory/evidence",
+            json!({"scope": control, "id": "证据-1"}),
+            "invalid_input",
+        ),
+    ] {
+        assert_code(
+            client
+                .post(url(&panel, path))
+                .bearer_auth(TOKEN)
+                .json(&body)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            code,
+        )
+        .await;
+    }
+    assert_code(
+        client
+            .post(url(&panel, "/api/memory/scope"))
+            .bearer_auth(TOKEN)
+            .body(json!({"scope": scope}).to_string())
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "json_required",
+    )
+    .await;
+    assert!(service.calls.lock().unwrap().is_empty());
+
+    let response = client
+        .post(url(&panel, "/api/memory/scopes"))
+        .bearer_auth(TOKEN)
+        .json(&json!({"after": scope, "limit": 100}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(body["items"][0]["scope"]["user_id"], "用户-A");
+    assert_eq!(body["items"][0]["confirmed"], 1);
+    assert_eq!(body["next_after"]["user_id"], "用户-A");
+    let body = client
+        .post(url(&panel, "/api/memory/scope"))
+        .bearer_auth(TOKEN)
+        .json(&json!({"scope": scope}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(body["preferences"][0]["effective"], true);
+    assert_eq!(
+        body["preferences"][0]["history"][0]["evidence_kind"],
+        "user_statement"
+    );
+    let body = client
+        .post(url(&panel, "/api/memory/evidence"))
+        .bearer_auth(TOKEN)
+        .json(&json!({"scope": scope, "id": "证据-1"}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(body["assistant_text"], "好的");
+    assert_eq!(body["references_total"], 1);
+    let other = json!({"channel": "qq", "session_id": "会话-A", "user_id": "用户-B"});
+    for (path, body) in [
+        ("/api/memory/scope", json!({"scope": other})),
+        (
+            "/api/memory/evidence",
+            json!({"scope": scope, "id": "缺失"}),
+        ),
+    ] {
+        assert_code(
+            client
+                .post(url(&panel, path))
+                .bearer_auth(TOKEN)
+                .json(&body)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::NOT_FOUND,
+            "not_found",
+        )
+        .await;
+    }
+    assert_eq!(
+        *service.calls.lock().unwrap(),
+        vec![
+            "scopes:Some(\"用户-A\"):100".to_owned(),
+            "detail:用户-A".into(),
+            "evidence:用户-A:证据-1".into(),
+            "detail:用户-B".into(),
+            "evidence:用户-A:缺失".into(),
+        ]
+    );
+    panel.stop().await.unwrap();
+}

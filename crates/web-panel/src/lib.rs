@@ -8,6 +8,7 @@ use axum::{
     routing::{get, post},
 };
 use eve_control_api::GenerationKey;
+use eve_memory_api::MemoryScope;
 use eve_session_api::SessionKey;
 use eve_web_panel_api::{PanelError, PanelService};
 use ring::{
@@ -108,6 +109,9 @@ impl LocalPanel {
             .route("/api/judgments", get(judgments))
             .route("/api/goals", get(goals))
             .route("/api/goal", get(goal))
+            .route("/api/memory/scopes", post(memory_scopes))
+            .route("/api/memory/scope", post(memory))
+            .route("/api/memory/evidence", post(memory_evidence))
             .fallback(|| async { error(StatusCode::NOT_FOUND, "not_found") })
             .layer(DefaultBodyLimit::max(16384))
             .layer(middleware::from_fn_with_state(shared.clone(), protect))
@@ -440,14 +444,84 @@ async fn goal(
         return error(StatusCode::BAD_REQUEST, "invalid_query");
     };
     // 与认知契约的 ID 规则一致；非法 ID 不进入宿主读取。
-    if query.id.is_empty()
-        || query.id.len() > 256
-        || query.id.trim() != query.id
-        || query.id.chars().any(char::is_control)
-    {
+    if !valid_id(&query.id) {
         return error(StatusCode::BAD_REQUEST, "invalid_query");
     }
     match shared.service.goal(&query.id) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 256 && id.trim() == id && !id.chars().any(char::is_control)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryListing {
+    after: Option<MemoryScope>,
+    #[serde(default = "page_size")]
+    limit: usize,
+}
+async fn memory_scopes(
+    State(shared): State<Arc<Shared>>,
+    body: Result<Json<MemoryListing>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_json");
+    };
+    if !(1..=100).contains(&body.limit)
+        || body
+            .after
+            .as_ref()
+            .is_some_and(|scope| scope.validate().is_err())
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid_input");
+    }
+    match shared
+        .service
+        .memory_scopes(body.after.as_ref(), body.limit)
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryTarget {
+    scope: MemoryScope,
+}
+async fn memory(
+    State(shared): State<Arc<Shared>>,
+    body: Result<Json<MemoryTarget>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_json");
+    };
+    if body.scope.validate().is_err() {
+        return error(StatusCode::BAD_REQUEST, "invalid_input");
+    }
+    match shared.service.memory(&body.scope) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvidenceTarget {
+    scope: MemoryScope,
+    id: String,
+}
+async fn memory_evidence(
+    State(shared): State<Arc<Shared>>,
+    body: Result<Json<EvidenceTarget>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_json");
+    };
+    if body.scope.validate().is_err() || !valid_id(&body.id) {
+        return error(StatusCode::BAD_REQUEST, "invalid_input");
+    }
+    match shared.service.memory_evidence(&body.scope, &body.id) {
         Ok(value) => Json(value).into_response(),
         Err(e) => failure(e),
     }

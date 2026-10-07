@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 eve-web-panel-api = { path = "../web-panel-api" }
 eve-control-api = { path = "../control-api" }
+eve-memory-api = { path = "../memory-api" }
 eve-session-api = { path = "../session-api" }
 axum = { version = "=0.8.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
 ring.workspace = true
