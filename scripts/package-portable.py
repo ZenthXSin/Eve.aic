@@ -54,16 +54,17 @@ def package(target, binary_directory, output_directory):
     shutil.copy2(ROOT / "AGENT.md", bundle)
     shutil.copy2(ROOT / "packaging/windows/config.example.json", bundle)
     if windows:
-        for source_file in (ROOT / "packaging/windows").iterdir():
+        for file in ("Launch.ps1", "Open-Panel.ps1", "Start-Eve.cmd", "Start-Console.cmd", "Open-Panel.cmd", "使用说明.md"):
+            source_file = ROOT / "packaging/windows" / file
             if source_file.suffix == ".ps1":
                 (bundle / source_file.name).write_text(source_file.read_text(encoding="utf-8"), encoding="utf-8-sig")
             elif source_file.suffix == ".cmd":
                 (bundle / source_file.name).write_bytes(source_file.read_text().replace("\n", "\r\n").encode("ascii"))
-            elif source_file.name != "config.example.json":
+            else:
                 shutil.copy2(source_file, bundle)
     else:
-        for source_file in (ROOT / "packaging/posix").iterdir():
-            shutil.copy2(source_file, bundle)
+        for file in ("Launch.mjs", "使用说明.md"):
+            shutil.copy2(ROOT / "packaging/posix" / file, bundle)
         script_extension = "command" if label.startswith("macos-") else "sh"
         for script, mode in (("Start-Eve", "qq"), ("Start-Console", "console"), ("Open-Panel", "panel")):
             shell = bundle / f"{script}.{script_extension}"
