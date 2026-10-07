@@ -1,0 +1,31 @@
+{
+  "format_version": 1,
+  "qq": {
+    "app_id": "102075770",
+    "app_secret": "",
+    "sandbox": false
+  },
+  "model": {
+    "base_url": "https://ai.xn--rhqr8xvr4ahqsgka.com",
+    "name": "deepseek-v4.1-flash",
+    "protocol": "chat",
+    "api_key": ""
+  },
+  "jev": {
+    "enabled": false,
+    "base_url": "https://openrouter.ai/api",
+    "model": "typesafe/jev-1.13",
+    "api_key": ""
+  },
+  "features": {
+    "training": true,
+    "cognition": true,
+    "self_learning": true,
+    "memory_recall": true,
+    "segmented": true
+  },
+  "web": {
+    "listen": "127.0.0.1:8765",
+    "token": ""
+  }
+}

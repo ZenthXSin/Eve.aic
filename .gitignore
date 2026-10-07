@@ -13,4 +13,11 @@
 /.eve-model-check-*/
 /.eve-qqbot/
 /connectors/qqbot/node_modules/
+/dist/
+/packaging/windows/config.json
+/packaging/windows/data/
+/packaging/posix/config.json
+/packaging/posix/data/
+/packaging/common/config.json
+/packaging/common/data/
 __pycache__/
