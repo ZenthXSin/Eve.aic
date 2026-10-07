@@ -4,14 +4,72 @@ mod goal_feedback;
 mod strict_json;
 use eve_cognition_api::*;
 use eve_plugin_api::{
-    Cleanup, Plugin, PluginContext, PluginError, PluginFuture, PluginManifest, PluginResult,
-    ServiceId, cleanup,
+    Cleanup, Plugin, PluginContext, PluginError, PluginFuture, PluginId, PluginManifest,
+    PluginResult, ServiceId, StateStore, cleanup,
 };
 pub use file_observation::UserGoalFileObservation;
 pub use goal_feedback::UserGoalFeedback;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 pub const COGNITION_STATE_KEY: &str = "cognition.v1";
+
+/// 宿主读取完整持久快照，不启动插件、不恢复在途目标，也不写入状态。
+///
+/// 返回值包含所有可见范围的数据；宿主向用户展示时必须自行绑定读权限。
+/// 缺失状态返回修订为零的空快照，损坏或不兼容的状态返回脱敏错误。
+pub fn read_cognitive_snapshot(
+    store: &dyn StateStore,
+    subject_id: &str,
+) -> CognitionResult<CognitiveSnapshot> {
+    validate_id(subject_id)?;
+    let namespace = PluginId::new(COGNITION_PLUGIN_ID).map_err(|_| CognitionError::InvalidInput)?;
+    let bytes = store
+        .get(&namespace, COGNITION_STATE_KEY)
+        .map_err(|_| CognitionError::Storage)?;
+    decode_snapshot(bytes.as_deref(), subject_id)
+}
+
+fn decode_snapshot(bytes: Option<&[u8]>, subject_id: &str) -> CognitionResult<CognitiveSnapshot> {
+    validate_id(subject_id)?;
+    let Some(bytes) = bytes else {
+        return Ok(CognitiveSnapshot {
+            format_version: COGNITION_FORMAT_VERSION,
+            subject_id: subject_id.into(),
+            revision: 0,
+            state: CognitiveState::default(),
+        });
+    };
+    if bytes.len() > MAX_STATE_BYTES {
+        return Err(CognitionError::LimitReached);
+    }
+    let value = strict_json::from_slice(bytes).map_err(|_| CognitionError::CorruptState)?;
+    let snapshot: CognitiveSnapshot =
+        serde_json::from_value(value).map_err(|_| CognitionError::CorruptState)?;
+    if snapshot.format_version != COGNITION_FORMAT_VERSION {
+        return Err(CognitionError::UnsupportedVersion);
+    }
+    if snapshot.subject_id != subject_id {
+        return Err(CognitionError::SubjectMismatch);
+    }
+    validate_id(&snapshot.subject_id).map_err(|_| CognitionError::CorruptState)?;
+    snapshot
+        .state
+        .validate()
+        .map_err(|_| CognitionError::CorruptState)?;
+    if snapshot.revision == 0 && snapshot.state != CognitiveState::default() {
+        return Err(CognitionError::CorruptState);
+    }
+    if snapshot
+        .state
+        .goals
+        .values()
+        .any(|goal| goal.revision == 0 || goal.revision > snapshot.revision)
+    {
+        return Err(CognitionError::CorruptState);
+    }
+    Ok(snapshot)
+}
+
 struct Inner {
     snapshot: CognitiveSnapshot,
     context: Option<PluginContext>,
@@ -24,45 +82,7 @@ impl StoredCognition {
         let bytes = context
             .state_get(COGNITION_STATE_KEY)
             .map_err(|_| CognitionError::Storage)?;
-        let mut snapshot = match bytes {
-            None => CognitiveSnapshot {
-                format_version: COGNITION_FORMAT_VERSION,
-                subject_id: subject_id.into(),
-                revision: 0,
-                state: CognitiveState::default(),
-            },
-            Some(bytes) => {
-                if bytes.len() > MAX_STATE_BYTES {
-                    return Err(CognitionError::LimitReached);
-                }
-                let value =
-                    strict_json::from_slice(&bytes).map_err(|_| CognitionError::CorruptState)?;
-                let doc: CognitiveSnapshot =
-                    serde_json::from_value(value).map_err(|_| CognitionError::CorruptState)?;
-                if doc.format_version != COGNITION_FORMAT_VERSION {
-                    return Err(CognitionError::UnsupportedVersion);
-                }
-                if doc.subject_id != subject_id {
-                    return Err(CognitionError::SubjectMismatch);
-                }
-                validate_id(&doc.subject_id).map_err(|_| CognitionError::CorruptState)?;
-                doc.state
-                    .validate()
-                    .map_err(|_| CognitionError::CorruptState)?;
-                if doc.revision == 0 && doc.state != CognitiveState::default() {
-                    return Err(CognitionError::CorruptState);
-                }
-                if doc
-                    .state
-                    .goals
-                    .values()
-                    .any(|g| g.revision == 0 || g.revision > doc.revision)
-                {
-                    return Err(CognitionError::CorruptState);
-                }
-                doc
-            }
-        };
+        let mut snapshot = decode_snapshot(bytes.as_deref(), subject_id)?;
         let mut recovered = false;
         for goal in snapshot.state.goals.values_mut() {
             if goal.status == GoalStatus::Executing {

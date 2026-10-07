@@ -1,7 +1,8 @@
-//! 用户显式确认不可变偏好候选；只读跨插件对账，确认只写一次 Memory。
+//! 用户确认与受限自主学习；决策意图和真实 Memory 历史分别核对。
 use eve_learning_api::{
-    AutoConfirmationPolicy, JobStatus, LearningAdmin, LearningError, LearningSnapshot,
-    MAX_BATCH_EVIDENCE, MAX_CANDIDATE_BYTES, MAX_CANDIDATES, MAX_JOBS, PreferenceCandidate,
+    AutoConfirmationPolicy, DecisionReason, JobStatus, LearningAdmin, LearningDecisionAction,
+    LearningDecisionRecord, LearningError, LearningSnapshot, MAX_BATCH_EVIDENCE,
+    MAX_CANDIDATE_BYTES, MAX_CANDIDATES, MAX_DECISIONS, MAX_JOBS, PreferenceCandidate,
     preference_id,
 };
 use eve_memory_api::{
@@ -19,7 +20,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const HELP: &str = "用法：/memory-candidates [页码]、/accept-memory 候选ID。";
+const HELP: &str =
+    "用法：/memory-candidates [页码]、/memory-decision 候选ID、/accept-memory 候选ID。";
 const PAGE_SIZE: usize = 5;
 
 pub(crate) struct Commands {
@@ -65,13 +67,28 @@ impl Commands {
             return Ok(HELP.into());
         }
         let scope = crate::qq_memory::scope(input.session);
+        // 先固定 Memory CAS 基线，再读只追加的决策与候选。
+        // 后台在此期间保存的新偏好会使手动命令 CAS 失效，不能漏掉关联后重复确认。
+        let snapshot = match memory
+            .reader(scope.clone())
+            .and_then(|reader| reader.snapshot())
+        {
+            Ok(snapshot) if snapshot.scope == scope => snapshot,
+            Ok(_) => return Err(failure()),
+            Err(error) => return explain_memory(error),
+        };
+        let records = match learning.decisions(&scope) {
+            Ok(records) => records,
+            Err(error) => return explain_learning(error),
+        };
         let learning_snapshot = match learning.snapshot(&scope) {
             Ok(snapshot) => snapshot,
             Err(error) => return explain_learning(error),
         };
         let candidates = candidates(&learning_snapshot, &scope)?;
+        validate_records(&records, &candidates)?;
         // 先在当前可信作用域查候选，不能凭跨作用域的偏好 ID 进行确认。
-        let selected = if let Command::Accept(id) = command {
+        let selected = if let Command::Accept(id) | Command::Decision(id) = command {
             let Some(candidate) = candidates
                 .iter()
                 .copied()
@@ -83,27 +100,19 @@ impl Commands {
         } else {
             None
         };
-        let snapshot = match memory
-            .reader(scope.clone())
-            .and_then(|reader| reader.snapshot())
-        {
-            Ok(snapshot) if snapshot.scope == scope => snapshot,
-            Ok(_) => return Err(failure()),
-            Err(error) => return explain_memory(error),
-        };
         let now_ms = now_ms()?;
         if command == Command::Status {
             let mut saved = 0;
             let mut pending = 0;
             for candidate in &candidates {
-                if confirmed(&snapshot, candidate)?.is_some() {
+                if linked_candidate(&snapshot, candidate, &records)?.is_some() {
                     saved += 1;
                 } else if candidate.expires_at_ms > now_ms {
                     pending += 1;
                 }
             }
             return Ok(format!(
-                "自主学习：{}。本会话已关联 {saved} 条候选，仍有 {pending} 条未确认且未过期。自动门槛：模型自评至少 80、至少两条真实交互引用。/memories 查看或纠正、撤销；/segment 查看有效节奏。{}",
+                "自主学习：{}。本会话已关联 {saved} 条候选，仍有 {pending} 条未确认且未过期。内置默认门槛：模型自评至少 80、至少两条真实交互引用；替换策略以决策版本为准。明确冲突优先保留手动修正和撤销。/memory-decision 候选ID 查看决策与实际保存；/memories 查看或纠正、撤销；/segment 查看有效节奏。{}",
                 if self.automatic {
                     "开启"
                 } else {
@@ -118,6 +127,8 @@ impl Commands {
                         >= eve_memory_api::MAX_HISTORY
                 {
                     "本会话记忆或历史容量已满，保留候选，不自动覆盖历史。"
+                } else if records.len() >= MAX_DECISIONS {
+                    "本会话学习决策容量已满，停止新增自动写入，保留全部历史。"
                 } else if learning_snapshot.jobs.len() >= MAX_JOBS {
                     "本会话提炼容量已满，不自动删除旧批次。"
                 } else {
@@ -126,11 +137,14 @@ impl Commands {
             ));
         }
         if let Command::Candidates(page) = command {
-            return list(&candidates, &snapshot, page, now_ms);
+            return list(&candidates, &snapshot, &records, page, now_ms);
         }
         let candidate = selected.ok_or_else(failure)?;
+        if matches!(command, Command::Decision(_)) {
+            return decision_details(candidate, &snapshot, &records);
+        }
         let id = preference_id(&candidate.id);
-        if let Some(preference) = confirmed(&snapshot, candidate)? {
+        if let Some(preference) = linked_candidate(&snapshot, candidate, &records)? {
             // 过期只限制首次确认；重启和重复确认不能复活撤销或覆盖后续修改。
             return Ok(current_reply(preference));
         }
@@ -309,8 +323,92 @@ pub(crate) fn confirmed<'a>(
     Ok(Some(preference))
 }
 
-/// 自动确认只写 Memory，使用原始完成证据；不伪造用户命令。
-/// 固定关联键使崩溃后可对账。纠正、撤销、同文偏好均不被后台覆盖或复活。
+fn validate_records(
+    records: &[LearningDecisionRecord],
+    candidates: &[&PreferenceCandidate],
+) -> PluginResult<()> {
+    if records.len() > MAX_DECISIONS {
+        return Err(failure());
+    }
+    for (index, record) in records.iter().enumerate() {
+        let decision = &record.decision;
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.id == decision.candidate_id)
+            .ok_or_else(failure)?;
+        if record.sequence != index as u64 + 1
+            || record.at_ms < candidate.created_at_ms
+            || decision.batch_id != candidate.batch_id
+            || decision.evidence_ids != candidate.draft.evidence_ids
+            || decision.validate().is_err()
+        {
+            return Err(failure());
+        }
+    }
+    Ok(())
+}
+
+/// 账本只是意图；必须在目标真实历史中找到指定后继版本及原始完成来源。
+/// 遍历所有旧意图，使后来用户更正、撤销仍保留候选曾成功更新的事实。
+fn linked_candidate<'a>(
+    snapshot: &'a MemorySnapshot,
+    candidate: &PreferenceCandidate,
+    records: &[LearningDecisionRecord],
+) -> PluginResult<Option<&'a Preference>> {
+    if let Some(preference) = confirmed(snapshot, candidate)? {
+        return Ok(Some(preference));
+    }
+    for record in records.iter().rev().filter(|record| {
+        record.decision.candidate_id == candidate.id
+            && record.decision.batch_id == candidate.batch_id
+            && record.decision.evidence_ids == candidate.draft.evidence_ids
+    }) {
+        let LearningDecisionAction::Update {
+            preference_id,
+            expected_revision,
+        } = &record.decision.action
+        else {
+            continue;
+        };
+        let Some(next_revision) = expected_revision.checked_add(1) else {
+            return Err(failure());
+        };
+        let Some(preference) = snapshot.preferences.iter().find(|p| p.id == *preference_id) else {
+            continue;
+        };
+        let Some(version) = preference
+            .history
+            .iter()
+            .find(|h| h.revision == next_revision)
+        else {
+            continue;
+        };
+        if version.status != PreferenceStatus::Confirmed
+            || version.text != candidate.draft.text
+            || !candidate.draft.evidence_ids.contains(&version.evidence_id)
+        {
+            continue;
+        }
+        let source = snapshot
+            .evidence
+            .iter()
+            .find(|e| e.id == version.evidence_id)
+            .ok_or_else(failure)?;
+        let current = preference.history.last().ok_or_else(failure)?;
+        if !matches!(source.source, EvidenceSource::CompletedInteraction { .. })
+            || current.revision != preference.revision
+            || current.status != preference.status
+            || current.text != preference.text
+        {
+            return Err(failure());
+        }
+        return Ok(Some(preference));
+    }
+    Ok(None)
+}
+
+/// 决策先持久保存，再用当前 Memory CAS 提交；重启依真实历史核对结果。
+/// 故障时可能仅留意图，不能向用户声称已经保存。
 pub(crate) fn auto_confirm(
     memory: &dyn MemoryAdmin,
     learning: &dyn LearningAdmin,
@@ -320,6 +418,8 @@ pub(crate) fn auto_confirm(
 ) -> PluginResult<()> {
     let jobs = learning.snapshot(scope).map_err(|_| failure())?;
     let mut pending = candidates(&jobs, scope)?;
+    let records = learning.decisions(scope).map_err(|_| failure())?;
+    validate_records(&records, &pending)?;
     pending.reverse(); // 先确认旧证据，新的纠正具有更高来源修订。
     for candidate in pending {
         let snapshot = memory
@@ -329,13 +429,7 @@ pub(crate) fn auto_confirm(
         if snapshot.scope != *scope {
             return Err(failure());
         }
-        if confirmed(&snapshot, candidate)?.is_some()
-            || snapshot.preferences.iter().any(|p| {
-                p.text == candidate.draft.text
-                    || (p.status == PreferenceStatus::Revoked
-                        && p.history.iter().any(|h| h.text == candidate.draft.text))
-            })
-        {
+        if linked_candidate(&snapshot, candidate, &records)?.is_some() {
             continue;
         }
         let batch = jobs
@@ -343,7 +437,7 @@ pub(crate) fn auto_confirm(
             .iter()
             .find(|j| j.batch.id == candidate.batch_id)
             .ok_or_else(failure)?;
-        if candidate.created_at_ms > at_ms || candidate.expires_at_ms <= at_ms {
+        if candidate.created_at_ms > at_ms {
             continue;
         }
         if candidate.draft.evidence_ids.iter().any(|id| {
@@ -355,14 +449,52 @@ pub(crate) fn auto_confirm(
         }) {
             return Err(failure());
         }
-        let allowed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            policy.allows(candidate, &batch.batch, &snapshot, at_ms)
+        let decision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let proposal = policy.decide(candidate, &batch.batch, &snapshot, at_ms)?;
+            if proposal.policy_version != policy.version() {
+                return Err(LearningError::InvalidInput);
+            }
+            eve_learning_plugin::constrain_decision(
+                candidate,
+                &batch.batch,
+                &snapshot,
+                at_ms,
+                proposal,
+            )
         }))
         .map_err(|_| failure())?
         .map_err(|_| failure())?;
-        if !allowed {
-            continue;
+        match learning.record_decision(scope, decision.clone(), at_ms) {
+            Ok(record) if record.decision.same_outcome(&decision) => {}
+            // 没有可持久审计意图时不得继续写 Memory。
+            Err(LearningError::LimitReached) => return Ok(()),
+            _ => return Err(failure()),
         }
+        let action = match &decision.action {
+            LearningDecisionAction::Confirm => PreferenceAction::Confirm {
+                id: preference_id(&candidate.id),
+                text: candidate.draft.text.clone(),
+            },
+            LearningDecisionAction::Update {
+                preference_id,
+                expected_revision,
+            } => {
+                let Some(target) = snapshot.preferences.iter().find(|p| p.id == *preference_id)
+                else {
+                    return Err(failure());
+                };
+                if target.revision != *expected_revision
+                    || target.status != PreferenceStatus::Confirmed
+                {
+                    return Err(failure());
+                }
+                PreferenceAction::Correct {
+                    id: preference_id.clone(),
+                    text: candidate.draft.text.clone(),
+                }
+            }
+            LearningDecisionAction::Defer | LearningDecisionAction::Reject => continue,
+        };
         let evidence = candidate
             .draft
             .evidence_ids
@@ -374,14 +506,12 @@ pub(crate) fn auto_confirm(
             operation_id: preference_id(&candidate.id),
             at_ms,
             evidence: PreferenceEvidence::Existing(evidence.id.clone()),
-            action: PreferenceAction::Confirm {
-                id: preference_id(&candidate.id),
-                text: candidate.draft.text.clone(),
-            },
+            action,
         };
         match memory.update_preference(scope, snapshot.revision, change) {
             Ok(saved) if saved.scope == *scope => {
-                confirmed(&saved, candidate)?.ok_or_else(failure)?;
+                let committed_records = learning.decisions(scope).map_err(|_| failure())?;
+                linked_candidate(&saved, candidate, &committed_records)?.ok_or_else(failure)?;
             }
             // 新一轮扫描重新核对；冲突时不覆盖并发命令，容量满保留候选供查看。
             Err(MemoryError::StaleRevision | MemoryError::LimitReached) => return Ok(()),
@@ -417,6 +547,7 @@ fn current_reply(preference: &Preference) -> String {
 fn list(
     candidates: &[&PreferenceCandidate],
     snapshot: &MemorySnapshot,
+    records: &[LearningDecisionRecord],
     page: usize,
     now_ms: u64,
 ) -> PluginResult<String> {
@@ -435,7 +566,7 @@ fn list(
         .skip((page - 1) * PAGE_SIZE)
         .take(PAGE_SIZE)
     {
-        let preference = confirmed(snapshot, candidate)?;
+        let preference = linked_candidate(snapshot, candidate, records)?;
         let expiry = if candidate.expires_at_ms <= now_ms {
             "已过期；仅限制首次确认".into()
         } else {
@@ -462,6 +593,87 @@ fn list(
         if let Some(preference) = preference {
             reply.push_str(&format!("\n已关联偏好：{}", preference.id));
         }
+        if let Some(record) = records
+            .iter()
+            .rev()
+            .find(|r| r.decision.candidate_id == candidate.id)
+        {
+            reply.push_str(&format!(
+                "\n最近学习决策：{}；{}\n详情：/memory-decision {}",
+                action_text(&record.decision.action),
+                reason_text(&record.decision.reason),
+                candidate.id,
+            ));
+        }
+    }
+    if reply.len() >= MAX_TEXT_BYTES {
+        return Err(failure());
+    }
+    Ok(reply)
+}
+
+fn action_text(action: &LearningDecisionAction) -> String {
+    match action {
+        LearningDecisionAction::Confirm => "confirm：新增确认".into(),
+        LearningDecisionAction::Update {
+            preference_id,
+            expected_revision,
+        } => format!("update：更新偏好 {preference_id}，目标偏好版本 {expected_revision}",),
+        LearningDecisionAction::Defer => "defer：暂缓自动保存".into(),
+        LearningDecisionAction::Reject => "reject：拒绝自动保存".into(),
+    }
+}
+
+fn reason_text(reason: &DecisionReason) -> &'static str {
+    match reason {
+        DecisionReason::Eligible => "满足来源门槛",
+        DecisionReason::EvidenceThreshold => "自评或真实来源数量未达门槛",
+        DecisionReason::Expired => "已过首次确认期限",
+        DecisionReason::PolicyDenied => "替换策略未授权此动作",
+        DecisionReason::Duplicate => "已有规范化等价偏好",
+        DecisionReason::RevokedConflict => "与用户撤销记录冲突，不自动恢复",
+        DecisionReason::ManualConflict => "与用户手动确认或更正冲突，保留手动选择",
+        DecisionReason::AmbiguousConflict => "存在多个或不明确的更新目标",
+        DecisionReason::StaleEvidence => "候选来源修订未晚于当前偏好来源",
+        DecisionReason::ExplicitRevisionUpdate => "明确偏好键已有更新的真实来源",
+        DecisionReason::AlreadyLinked => "候选已有可核对的保存历史",
+    }
+}
+
+fn decision_details(
+    candidate: &PreferenceCandidate,
+    snapshot: &MemorySnapshot,
+    records: &[LearningDecisionRecord],
+) -> PluginResult<String> {
+    let history: Vec<_> = records
+        .iter()
+        .filter(|r| r.decision.candidate_id == candidate.id)
+        .collect();
+    let mut reply = format!(
+        "候选 ID：{}\n学习决策共 {} 条（最多显示最近 8 条）。决策记录是提交意图，实际保存另按 Memory 历史核对。",
+        candidate.id,
+        history.len(),
+    );
+    if history.is_empty() {
+        reply.push_str("\n尚无自动学习决策；手动确认不伪造自动决策。");
+    }
+    for record in history.iter().rev().take(8) {
+        let decision = &record.decision;
+        reply.push_str(&format!(
+            "\n决策序号：{}；时间：{}（Unix 毫秒）\n策略版本：{}；读取记忆版本：{}\n动作：{}\n理由：{}\n来源证据：{}",
+            record.sequence, record.at_ms, decision.policy_version, decision.memory_revision,
+            action_text(&decision.action), reason_text(&decision.reason), decision.evidence_ids.join("、"),
+        ));
+    }
+    if let Some(preference) = linked_candidate(snapshot, candidate, records)? {
+        reply.push_str(&format!(
+            "\n实际保存：偏好 {}；当前版本 {}；状态：{}。",
+            preference.id,
+            preference.revision,
+            status(Some(preference)),
+        ));
+    } else {
+        reply.push_str("\n实际保存：尚无该候选对应的确认或更新历史。");
     }
     if reply.len() >= MAX_TEXT_BYTES {
         return Err(failure());
@@ -499,6 +711,7 @@ fn message_digest(input: &QqCommandInput<'_>) -> String {
 enum Command<'a> {
     Status,
     Candidates(usize),
+    Decision(&'a str),
     Accept(&'a str),
     Help,
 }
@@ -507,6 +720,7 @@ impl fmt::Debug for Command<'_> {
         formatter.write_str(match self {
             Self::Status => "Status",
             Self::Candidates(_) => "Candidates(<redacted>)",
+            Self::Decision(_) => "Decision(<redacted>)",
             Self::Accept(_) => "Accept(<redacted>)",
             Self::Help => "Help",
         })
@@ -532,6 +746,12 @@ fn parse(text: &str) -> Option<Command<'_>> {
             Command::Accept(tail)
         }
         "/accept-memory" => Command::Help,
+        "/memory-decision"
+            if validate_id(tail).is_ok() && !tail.chars().any(char::is_whitespace) =>
+        {
+            Command::Decision(tail)
+        }
+        "/memory-decision" => Command::Help,
         _ => return None,
     })
 }
@@ -541,8 +761,8 @@ mod tests {
     use super::*;
     use eve_kernel::{Kernel, KernelServices, backends::MemoryStateStore};
     use eve_learning_api::{
-        CandidateDraft, LearningBatch, LearningJob, LearningOptions, LearningOutcome,
-        LearningResult,
+        CandidateDraft, LearningBatch, LearningDecision, LearningDecisionRecord, LearningJob,
+        LearningOptions, LearningOutcome, LearningResult,
     };
     use eve_memory_api::{CompletedInteraction, InteractionEvidence, MemoryResult, MemoryService};
     use eve_memory_plugin::{MemoryController, MemoryPlugin};
@@ -557,9 +777,12 @@ mod tests {
     };
 
     #[derive(Default)]
-    struct FixedLearning {
-        snapshots: Mutex<BTreeMap<MemoryScope, LearningSnapshot>>,
-        error: Mutex<Option<LearningError>>,
+    pub(super) struct FixedLearning {
+        pub(super) snapshots: Mutex<BTreeMap<MemoryScope, LearningSnapshot>>,
+        pub(super) error: Mutex<Option<LearningError>>,
+        pub(super) record_error: Mutex<Option<LearningError>>,
+        pub(super) records: Mutex<BTreeMap<MemoryScope, Vec<LearningDecisionRecord>>>,
+        pub(super) record_writes: AtomicUsize,
     }
     impl LearningAdmin for FixedLearning {
         fn snapshot(&self, scope: &MemoryScope) -> LearningResult<LearningSnapshot> {
@@ -589,12 +812,56 @@ mod tests {
         fn finish(&self, _: &LearningBatch, _: u64, _: LearningOutcome) -> LearningResult<()> {
             panic!("确认只写一次 Memory，不跨插件写 Accepted")
         }
+        fn decisions(&self, scope: &MemoryScope) -> LearningResult<Vec<LearningDecisionRecord>> {
+            if let Some(error) = self.error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            Ok(self
+                .records
+                .lock()
+                .unwrap()
+                .get(scope)
+                .cloned()
+                .unwrap_or_default())
+        }
+        fn record_decision(
+            &self,
+            scope: &MemoryScope,
+            decision: LearningDecision,
+            at_ms: u64,
+        ) -> LearningResult<LearningDecisionRecord> {
+            if let Some(error) = self.error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            if let Some(error) = self.record_error.lock().unwrap().clone() {
+                return Err(error);
+            }
+            decision.validate()?;
+            let mut records = self.records.lock().unwrap();
+            let records = records.entry(scope.clone()).or_default();
+            if let Some(previous) = records
+                .iter()
+                .rev()
+                .find(|record| record.decision.candidate_id == decision.candidate_id)
+                .filter(|record| record.decision.same_outcome(&decision))
+            {
+                return Ok(previous.clone());
+            }
+            let record = LearningDecisionRecord {
+                sequence: records.len() as u64 + 1,
+                at_ms,
+                decision,
+            };
+            records.push(record.clone());
+            self.record_writes.fetch_add(1, Ordering::SeqCst);
+            Ok(record)
+        }
     }
 
     #[derive(Default)]
-    struct RecordingStore {
+    pub(super) struct RecordingStore {
         inner: MemoryStateStore,
-        writes: AtomicUsize,
+        pub(super) writes: AtomicUsize,
         fail_after_commit: AtomicBool,
     }
     impl StateStore for RecordingStore {
@@ -646,10 +913,10 @@ mod tests {
         }
     }
 
-    fn session() -> SessionKey {
+    pub(super) fn session() -> SessionKey {
         SessionKey::new("qq-full-app-group-session-hash", "qq-full-user-hash").unwrap()
     }
-    fn run(
+    pub(super) fn run(
         commands: &Commands,
         session: &SessionKey,
         message_id: &str,
@@ -661,7 +928,7 @@ mod tests {
             text,
         })
     }
-    async fn memory(store: Arc<RecordingStore>) -> (Kernel, MemoryController) {
+    pub(super) async fn memory(store: Arc<RecordingStore>) -> (Kernel, MemoryController) {
         let kernel = Kernel::with_services(KernelServices {
             state: store,
             ..KernelServices::default()
@@ -724,7 +991,7 @@ mod tests {
             .insert(scope.clone(), fixture(scope, count));
         learning
     }
-    fn snapshot(admin: &dyn MemoryAdmin, session: &SessionKey) -> MemorySnapshot {
+    pub(super) fn snapshot(admin: &dyn MemoryAdmin, session: &SessionKey) -> MemorySnapshot {
         admin
             .reader(crate::qq_memory::scope(session))
             .unwrap()
@@ -861,7 +1128,7 @@ mod tests {
         assert_eq!(store.writes.load(Ordering::SeqCst), 3);
         kernel.stop_all().await.unwrap();
     }
-    fn run_memory(
+    pub(super) fn run_memory(
         commands: &crate::qq_memory::Commands,
         session: &SessionKey,
         id: &str,
@@ -1285,7 +1552,7 @@ mod tests {
             preferences: vec![],
         };
         let selected = candidates(&learning, &scope).unwrap();
-        let reply = list(&selected, &memory, 1, 3).unwrap();
+        let reply = list(&selected, &memory, &[], 1, 3).unwrap();
         assert!(reply.len() < MAX_TEXT_BYTES);
         assert_eq!(
             reply.matches(&"t".repeat(MAX_CANDIDATE_BYTES)).count(),
@@ -1299,3 +1566,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "qq_learning_decision_tests.rs"]
+mod decision_tests;

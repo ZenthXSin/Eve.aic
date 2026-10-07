@@ -1,10 +1,12 @@
 //! 低频偏好候选、单次模型提炼与严格恢复。
 mod confirmation;
+mod decision;
 mod extractor;
 mod store;
 mod strict_json;
 
 pub use confirmation::EvidenceConfirmationPolicy;
+pub use decision::{EVIDENCE_POLICY_VERSION, constrain_decision};
 use eve_learning_api::*;
 use eve_memory_api::{MemoryScope, MemorySnapshot};
 use eve_plugin_api::{
@@ -33,6 +35,17 @@ impl LearningController {
 impl LearningAdmin for LearningController {
     fn snapshot(&self, scope: &MemoryScope) -> LearningResult<LearningSnapshot> {
         self.service()?.snapshot(scope)
+    }
+    fn decisions(&self, scope: &MemoryScope) -> LearningResult<Vec<LearningDecisionRecord>> {
+        self.service()?.decisions(scope)
+    }
+    fn record_decision(
+        &self,
+        scope: &MemoryScope,
+        decision: LearningDecision,
+        at_ms: u64,
+    ) -> LearningResult<LearningDecisionRecord> {
+        self.service()?.record_decision(scope, decision, at_ms)
     }
     fn reserve(
         &self,

@@ -1,9 +1,12 @@
-//! QQ 用户通过显式命令保存、查看、修正和撤销偏好；不推断偏好或调用模型。
+//! QQ 用户通过显式命令管理偏好和检索历史来源；不推断偏好或调用模型。
 use eve_memory_api::{
-    MAX_PREFERENCE_BYTES, MAX_TEXT_BYTES, MemoryAdmin, MemoryError, MemoryScope, MemorySnapshot,
-    PreferenceAction, PreferenceChange, PreferenceEvidence, PreferenceStatus, UserStatement,
-    validate_id, validate_text,
+    DEFAULT_RECALL_RESULTS, MAX_PREFERENCE_BYTES, MAX_RECALL_QUERY_BYTES,
+    MAX_RECALL_RESPONSE_BYTES, MAX_TEXT_BYTES, MemoryAdmin, MemoryError, MemoryRecallFactory,
+    MemoryRecallRequest, MemoryRecallResponse, MemoryRecallSource, MemoryScope, MemorySnapshot,
+    PreferenceAction, PreferenceChange, PreferenceEvidence, PreferenceStatus, RecallField,
+    UserStatement, validate_id, validate_text,
 };
+use eve_memory_plugin::LexicalMemoryRecall;
 use eve_plugin_api::{PluginError, PluginResult};
 use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput};
 use eve_session_api::SessionKey;
@@ -13,8 +16,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const HELP: &str =
-    "用法：/remember 偏好内容、/memories [页码]、/correct-memory 偏好ID 新内容、/forget 偏好ID。";
+const HELP: &str = "用法：/remember 偏好内容、/memories [页码]、/recall 关键词、/correct-memory 偏好ID 新内容、/forget 偏好ID。";
 const PAGE_SIZE: usize = 10;
 const PREVIEW_BYTES: usize = 512;
 
@@ -50,6 +52,10 @@ fn failure() -> PluginError {
     PluginError::State("记忆状态无法确认；服务已停止，请重新打开后查看持久状态。".into())
 }
 
+fn recall_failure() -> PluginError {
+    PluginError::State("记忆检索结果无法确认；请重新打开服务后重试。".into())
+}
+
 fn explain(error: MemoryError) -> PluginResult<String> {
     match error {
         MemoryError::InvalidInput => Ok(format!(
@@ -70,14 +76,30 @@ fn explain(error: MemoryError) -> PluginResult<String> {
 
 pub(crate) struct Commands {
     admin: Option<Arc<dyn MemoryAdmin>>,
+    recall: Option<Arc<dyn MemoryRecallFactory>>,
 }
 impl Commands {
     pub(crate) fn new(admin: Arc<dyn MemoryAdmin>) -> Arc<Self> {
-        Arc::new(Self { admin: Some(admin) })
+        let recall = Arc::new(LexicalMemoryRecall::new(admin.clone()));
+        Self::with_recall(admin, recall)
+    }
+
+    /// 组合层可替换检索实现；命令始终校验返回范围和公开结果契约。
+    pub(crate) fn with_recall(
+        admin: Arc<dyn MemoryAdmin>,
+        recall: Arc<dyn MemoryRecallFactory>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            admin: Some(admin),
+            recall: Some(recall),
+        })
     }
 
     pub(crate) fn disabled() -> Arc<Self> {
-        Arc::new(Self { admin: None })
+        Arc::new(Self {
+            admin: None,
+            recall: None,
+        })
     }
 
     fn execute(&self, input: &QqCommandInput<'_>, command: Command<'_>) -> PluginResult<String> {
@@ -90,10 +112,32 @@ impl Commands {
         if input.session.validate().is_err() || validate_id(input.message_id).is_err() {
             return Err(PluginError::Task("QQ 记忆命令输入无效。".into()));
         }
+        let scope = scope(input.session);
+        if let Command::Recall(query) = command {
+            let request = MemoryRecallRequest {
+                query: query.into(),
+                limit: DEFAULT_RECALL_RESULTS,
+            };
+            if request.validate().is_err() {
+                return Ok(format!(
+                    "用法：/recall 关键词。关键词须为 1 至 {MAX_RECALL_QUERY_BYTES} UTF-8 字节，且不能包含控制字符；每次最多显示 {DEFAULT_RECALL_RESULTS} 条。"
+                ));
+            }
+            let result = self
+                .recall
+                .as_ref()
+                .ok_or_else(recall_failure)?
+                .reader(scope.clone())
+                .and_then(|reader| reader.recall(&request))
+                .map_err(|_| recall_failure())?;
+            result
+                .validate_for(&scope, &request)
+                .map_err(|_| recall_failure())?;
+            return recall_list(&result);
+        }
         if let Err(error) = validate_text(input.text, MAX_TEXT_BYTES) {
             return explain(error);
         }
-        let scope = scope(input.session);
         let snapshot = match admin
             .reader(scope.clone())
             .and_then(|reader| reader.snapshot())
@@ -145,7 +189,7 @@ impl Commands {
                     format!("偏好已撤销：{id}。历史来源仍保留，该偏好不再作为当前偏好使用。"),
                 )
             }
-            Command::Help | Command::Memories(_) => unreachable!(),
+            Command::Help | Command::Memories(_) | Command::Recall(_) => unreachable!(),
         };
         let (preference_id, expected_text) = match &action {
             PreferenceAction::Confirm { id, text } | PreferenceAction::Correct { id, text } => {
@@ -210,6 +254,67 @@ impl QqCommandHandler for Commands {
     }
 }
 
+fn recall_list(result: &MemoryRecallResponse) -> PluginResult<String> {
+    let mut reply = format!(
+        "当前会话记忆检索（memory revision={}，最多 {DEFAULT_RECALL_RESULTS} 条）：",
+        result.revision
+    );
+    if result.hits.is_empty() {
+        reply.push_str("\n未找到匹配记忆。");
+    }
+    for (index, hit) in result.hits.iter().enumerate() {
+        match &hit.source {
+            MemoryRecallSource::ConfirmedPreference {
+                preference_id,
+                preference_revision,
+                evidence_id,
+                evidence_revision,
+                ..
+            } => reply.push_str(&format!(
+                "\n{}. [已确认偏好] preference={} version={} evidence={} evidence_revision={}",
+                index + 1,
+                preview(preference_id),
+                preference_revision,
+                preview(evidence_id),
+                evidence_revision
+            )),
+            MemoryRecallSource::CompletedInteraction {
+                evidence_id,
+                evidence_revision,
+                message_id,
+                session_revision,
+                turn_id,
+                field,
+                ..
+            } => {
+                let label = match field {
+                    RecallField::User => "用户原话",
+                    RecallField::Assistant => "历史助手回复",
+                };
+                reply.push_str(&format!(
+                    "\n{}. [{}] evidence={} evidence_revision={} message={} session_revision={} turn={}",
+                    index + 1,
+                    label,
+                    preview(evidence_id),
+                    evidence_revision,
+                    preview(message_id),
+                    session_revision,
+                    turn_id
+                ));
+            }
+        }
+        reply.push_str(&format!("\n片段：{}", preview(&hit.excerpt)));
+        if hit.excerpt_truncated {
+            reply.push_str("（原文有截断）");
+        }
+    }
+    reply.push_str("\n边界：历史助手回复不是偏好或当前事实；片段只表示已保存的历史来源。");
+    if reply.len() > MAX_RECALL_RESPONSE_BYTES {
+        return Err(recall_failure());
+    }
+    Ok(reply)
+}
+
 fn list(snapshot: &MemorySnapshot, page: usize) -> String {
     if snapshot.preferences.is_empty() {
         return "当前会话没有偏好。发送 /remember 偏好内容 保存。".into();
@@ -245,15 +350,27 @@ fn list(snapshot: &MemorySnapshot, page: usize) -> String {
 enum Command<'a> {
     Remember(&'a str),
     Memories(usize),
+    Recall(&'a str),
     Correct { id: &'a str, text: &'a str },
     Forget(&'a str),
     Help,
 }
 
 fn parse(text: &str) -> Option<Command<'_>> {
-    let text = text.trim();
-    let end = text.find(char::is_whitespace).unwrap_or(text.len());
+    let text = text.trim_start();
+    let end = text
+        .find(|character: char| character.is_whitespace() || character.is_control())
+        .unwrap_or(text.len());
     let (name, tail) = text.split_at(end);
+    if name == "/recall" {
+        // 空格只作命令分隔；查询里的换行/制表符保留给公开契约拒绝，不能静默删除。
+        let query = tail.trim_matches(' ');
+        return Some(if query.is_empty() {
+            Command::Help
+        } else {
+            Command::Recall(query)
+        });
+    }
     let tail = tail.trim();
     Some(match name {
         "/remember" if !tail.is_empty() => Command::Remember(tail),
@@ -284,7 +401,12 @@ fn preview(text: &str) -> String {
     let normalized: String = text
         .chars()
         .map(|character| {
-            if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                )
+            {
                 ' '
             } else {
                 character
@@ -328,6 +450,10 @@ mod tests {
             })
         );
         assert_eq!(parse("/forget id-1"), Some(Command::Forget("id-1")));
+        assert_eq!(
+            parse(" /recall 用户原话 "),
+            Some(Command::Recall("用户原话"))
+        );
     }
 
     #[test]
@@ -343,6 +469,8 @@ mod tests {
             "/memories -1",
             "/memories text",
             "/memories 9999999999999999999999999999999999999999",
+            "/recall",
+            "/recall   ",
         ] {
             assert_eq!(parse(text), Some(Command::Help), "{text}");
         }
@@ -353,6 +481,7 @@ mod tests {
     #[test]
     fn preview_preserves_utf8_without_emitting_extra_list_lines() {
         assert_eq!(preview("第一行\n第二行\t第三行"), "第一行 第二行 第三行");
+        assert_eq!(preview("来源\u{202e}反向\u{2066}伪装"), "来源 反向 伪装");
         let value = preview(&"好".repeat(PREVIEW_BYTES));
         assert!(value.ends_with('…'));
         assert!(value.len() <= PREVIEW_BYTES);
@@ -363,8 +492,8 @@ mod tests {
     }
 
     use eve_memory_api::{
-        CompletedInteraction, EvidenceSource, InteractionEvidence, MemoryResult, MemoryService,
-        Preference, PreferenceVersion,
+        CompletedInteraction, EvidenceSource, InteractionEvidence, MemoryRecallHit,
+        MemoryRecallService, MemoryResult, MemoryService, Preference, PreferenceVersion,
     };
     use std::{collections::BTreeMap, sync::Mutex};
 
@@ -373,6 +502,7 @@ mod tests {
         snapshots: BTreeMap<MemoryScope, MemorySnapshot>,
         operations: BTreeMap<(MemoryScope, String), PreferenceChange>,
         calls: Vec<(MemoryScope, u64, PreferenceChange)>,
+        reads: usize,
         writes: usize,
         read_error: Option<MemoryError>,
         write_error: Option<MemoryError>,
@@ -405,6 +535,7 @@ mod tests {
     }
     impl MemoryAdmin for MockAdmin {
         fn reader(&self, scope: MemoryScope) -> MemoryResult<Arc<dyn MemoryService>> {
+            self.0.lock().unwrap().reads += 1;
             Ok(Arc::new(MockReader(self.clone(), scope)))
         }
         fn import_completed(
@@ -542,6 +673,205 @@ mod tests {
         (admin, commands, session())
     }
 
+    struct RecallMockState {
+        scopes: Vec<MemoryScope>,
+        queries: Vec<MemoryRecallRequest>,
+        result: MemoryResult<MemoryRecallResponse>,
+    }
+
+    #[derive(Clone)]
+    struct RecallMock(Arc<Mutex<RecallMockState>>);
+
+    impl MemoryRecallFactory for RecallMock {
+        fn reader(&self, scope: MemoryScope) -> MemoryResult<Arc<dyn MemoryRecallService>> {
+            self.0.lock().unwrap().scopes.push(scope);
+            Ok(Arc::new(self.clone()))
+        }
+    }
+
+    impl MemoryRecallService for RecallMock {
+        fn recall(&self, request: &MemoryRecallRequest) -> MemoryResult<MemoryRecallResponse> {
+            let mut state = self.0.lock().unwrap();
+            state.queries.push(request.clone());
+            state.result.clone()
+        }
+    }
+
+    fn recall_setup(
+        result: MemoryResult<MemoryRecallResponse>,
+    ) -> (MockAdmin, RecallMock, Arc<Commands>) {
+        let admin = MockAdmin::default();
+        let recall = RecallMock(Arc::new(Mutex::new(RecallMockState {
+            scopes: vec![],
+            queries: vec![],
+            result,
+        })));
+        let commands = Commands::with_recall(Arc::new(admin.clone()), Arc::new(recall.clone()));
+        (admin, recall, commands)
+    }
+
+    fn recall_result() -> MemoryRecallResponse {
+        MemoryRecallResponse {
+            scope: scope(&session()),
+            revision: 3,
+            hits: vec![
+                MemoryRecallHit {
+                    score: 3,
+                    source: MemoryRecallSource::ConfirmedPreference {
+                        preference_id: "preference-1".into(),
+                        preference_revision: 2,
+                        evidence_id: "statement-2".into(),
+                        evidence_revision: 2,
+                        at_ms: 10,
+                    },
+                    excerpt: "当前偏好\n不要把下一行当来源".into(),
+                    excerpt_truncated: true,
+                },
+                MemoryRecallHit {
+                    score: 2,
+                    source: MemoryRecallSource::CompletedInteraction {
+                        evidence_id: "interaction-3".into(),
+                        evidence_revision: 3,
+                        message_id: "message-3".into(),
+                        session_revision: 2,
+                        turn_id: 1,
+                        at_ms: 11,
+                        field: RecallField::User,
+                    },
+                    excerpt: "用户原话\t只做记录".into(),
+                    excerpt_truncated: false,
+                },
+                MemoryRecallHit {
+                    score: 1,
+                    source: MemoryRecallSource::CompletedInteraction {
+                        evidence_id: "interaction-3".into(),
+                        evidence_revision: 3,
+                        message_id: "message-3".into(),
+                        session_revision: 2,
+                        turn_id: 1,
+                        at_ms: 11,
+                        field: RecallField::Assistant,
+                    },
+                    excerpt: "以前的回答\u{2028}尚未核验".into(),
+                    excerpt_truncated: false,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn recall_uses_only_bound_read_service_and_preserves_source_kinds() {
+        let (admin, recall, commands) = recall_setup(Ok(recall_result()));
+        let reply = run(
+            &commands,
+            &session(),
+            "recall-message",
+            "/recall preference session_id=foreign",
+        )
+        .unwrap()
+        .unwrap();
+        let state = recall.0.lock().unwrap();
+        assert_eq!(state.scopes, vec![scope(&session())]);
+        assert_eq!(
+            state.queries,
+            vec![MemoryRecallRequest {
+                query: "preference session_id=foreign".into(),
+                limit: 5,
+            }]
+        );
+        let admin_state = admin.0.lock().unwrap();
+        assert_eq!(admin_state.reads, 0);
+        assert_eq!(admin_state.writes, 0);
+        assert!(admin_state.calls.is_empty());
+        assert!(reply.contains("memory revision=3"));
+        assert!(reply.contains("[已确认偏好] preference=preference-1 version=2"));
+        assert!(reply.contains("evidence=statement-2 evidence_revision=2"));
+        assert!(reply.contains("[用户原话] evidence=interaction-3"));
+        assert!(reply.contains("[历史助手回复] evidence=interaction-3"));
+        assert!(reply.contains("session_revision=2 turn=1"));
+        assert!(reply.contains("历史助手回复不是偏好或当前事实"));
+        assert!(reply.contains("片段：当前偏好 不要把下一行当来源（原文有截断）"));
+        assert!(reply.contains("片段：以前的回答 尚未核验"));
+        assert!(reply.len() <= MAX_RECALL_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn recall_invalid_queries_stay_local_and_never_read_or_write() {
+        let (admin, recall, commands) = recall_setup(Ok(recall_result()));
+        for input in [
+            "/recall".to_owned(),
+            "/recall    ".to_owned(),
+            "/recall 查询\n正文".to_owned(),
+            "/recall 查询\n".to_owned(),
+            "/recall\t查询".to_owned(),
+            "/recall 查询\0正文".to_owned(),
+            "/recall\0查询".to_owned(),
+            format!("/recall {}", "好".repeat(MAX_RECALL_QUERY_BYTES)),
+        ] {
+            let reply = run(&commands, &session(), "query-message", &input)
+                .unwrap()
+                .unwrap();
+            assert!(reply.contains("用法："));
+            assert!(reply.contains("/recall 关键词"));
+        }
+        assert!(recall.0.lock().unwrap().scopes.is_empty());
+        assert!(recall.0.lock().unwrap().queries.is_empty());
+        let state = admin.0.lock().unwrap();
+        assert_eq!(state.reads, 0);
+        assert_eq!(state.writes, 0);
+        assert!(state.calls.is_empty());
+    }
+
+    #[test]
+    fn recall_rejects_foreign_invalid_and_unavailable_service_results() {
+        let original = recall_result();
+        let mut foreign = original.clone();
+        foreign.scope.session_id = "foreign-session".into();
+        let mut invalid_revision = original.clone();
+        invalid_revision.revision = 1;
+        let mut oversized_excerpt = original.clone();
+        oversized_excerpt.hits[0].excerpt = "a".repeat(PREVIEW_BYTES + 1);
+        let mut duplicate = original.clone();
+        duplicate.hits.push(original.hits[0].clone());
+        for result in [
+            Ok(foreign),
+            Ok(invalid_revision),
+            Ok(oversized_excerpt),
+            Ok(duplicate),
+            Err(MemoryError::Storage),
+            Err(MemoryError::Unavailable),
+            Err(MemoryError::InvalidInput),
+        ] {
+            let (admin, _, commands) = recall_setup(result);
+            let outcome = run(&commands, &session(), "query-message", "/recall 关键词");
+            let Err(PluginError::State(message)) = outcome else {
+                panic!("无法确认的召回结果必须拒绝")
+            };
+            assert!(message.contains("检索结果无法确认"));
+            assert!(!message.contains("当前偏好"));
+            assert!(!message.contains("以前的回答"));
+            let state = admin.0.lock().unwrap();
+            assert_eq!(state.reads, 0);
+            assert_eq!(state.writes, 0);
+        }
+    }
+
+    #[test]
+    fn recall_empty_result_keeps_snapshot_revision_and_source_boundary() {
+        let (admin, _, commands) = recall_setup(Ok(MemoryRecallResponse {
+            scope: scope(&session()),
+            revision: 19,
+            hits: vec![],
+        }));
+        let reply = run(&commands, &session(), "query-message", "/recall 没有的内容")
+            .unwrap()
+            .unwrap();
+        assert!(reply.contains("memory revision=19"));
+        assert!(reply.contains("未找到匹配记忆"));
+        assert!(reply.contains("历史助手回复不是偏好或当前事实"));
+        assert_eq!(admin.0.lock().unwrap().reads, 0);
+    }
+
     #[test]
     fn disabled_recognized_commands_never_fall_back_to_chat() {
         let commands = Commands::disabled();
@@ -549,6 +879,8 @@ mod tests {
             "/remember 新偏好",
             "/remember",
             "/memories",
+            "/recall 关键词",
+            "/recall",
             "/correct-memory id 新值",
             "/forget id",
         ] {

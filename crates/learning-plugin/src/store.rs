@@ -13,6 +13,8 @@ use std::{
 };
 
 const FORMAT_VERSION: u32 = 1;
+const DECISIONS_STATE_KEY: &str = "learning.decisions.v1";
+const MAX_DECISIONS_STATE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,8 +29,22 @@ struct JobRecord {
     /// 只保存批次来源的修订，不复制偏好和未消费的原始记忆。
     memory_revision: u64,
 }
+/// 决策账本单独保存，旧批次文档的格式和大小预算保持不变。
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecisionsDocument {
+    format_version: u32,
+    records: Vec<ScopedDecisionRecord>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopedDecisionRecord {
+    scope: MemoryScope,
+    record: LearningDecisionRecord,
+}
 struct Inner {
     document: Document,
+    decisions: DecisionsDocument,
     context: Option<PluginContext>,
 }
 pub(super) struct StoredLearning {
@@ -59,6 +75,31 @@ impl StoredLearning {
                 document
             }
         };
+        let decisions = match context
+            .state_get(DECISIONS_STATE_KEY)
+            .map_err(|_| LearningError::Storage)?
+        {
+            None => DecisionsDocument {
+                format_version: FORMAT_VERSION,
+                records: vec![],
+            },
+            Some(bytes) => {
+                if bytes.len() > MAX_DECISIONS_STATE_BYTES {
+                    return Err(LearningError::CorruptState);
+                }
+                let value =
+                    strict_json::from_slice(&bytes).map_err(|_| LearningError::CorruptState)?;
+                let decisions: DecisionsDocument =
+                    serde_json::from_value(value).map_err(|_| LearningError::CorruptState)?;
+                if decisions.format_version != FORMAT_VERSION {
+                    return Err(LearningError::UnsupportedVersion);
+                }
+                validate_decisions_document(&decisions, &document)
+                    .map_err(|_| LearningError::CorruptState)?;
+                decisions
+            }
+        };
+        // 必须先读验两个文档；损坏的决策账本不能触发旧批次的恢复写入。
         let mut interrupted = false;
         for record in &mut document.jobs {
             if record.job.status == JobStatus::Running {
@@ -76,6 +117,7 @@ impl StoredLearning {
         Ok(Self {
             inner: Mutex::new(Inner {
                 document,
+                decisions,
                 context: Some(context),
             }),
         })
@@ -100,6 +142,60 @@ impl StoredLearning {
                 .map(|record| record.job.clone())
                 .collect(),
         })
+    }
+    pub(super) fn decisions(
+        &self,
+        scope: &MemoryScope,
+    ) -> LearningResult<Vec<LearningDecisionRecord>> {
+        let inner = self.lock()?;
+        scope.validate().map_err(|_| LearningError::InvalidInput)?;
+        Ok(inner
+            .decisions
+            .records
+            .iter()
+            .filter(|record| record.scope == *scope)
+            .map(|record| record.record.clone())
+            .collect())
+    }
+    pub(super) fn record_decision(
+        &self,
+        scope: &MemoryScope,
+        decision: LearningDecision,
+        at_ms: u64,
+    ) -> LearningResult<LearningDecisionRecord> {
+        let mut inner = self.lock()?;
+        validate_decision_binding(&inner.document, scope, &decision, at_ms)?;
+        // 只与该候选最近一次决定比较；A→B→A 必须保留三个历史结局。
+        // Memory 的其他写入提升修订号，不应让轮询重复写入同一决定。
+        if let Some(previous) = inner.decisions.records.iter().rev().find(|record| {
+            record.scope == *scope && record.record.decision.candidate_id == decision.candidate_id
+        }) && previous.record.decision.same_outcome(&decision)
+        {
+            return Ok(previous.record.clone());
+        }
+        if inner.decisions.records.len() >= MAX_DECISIONS {
+            return Err(LearningError::LimitReached);
+        }
+        let sequence = inner
+            .decisions
+            .records
+            .iter()
+            .rev()
+            .find(|record| record.scope == *scope)
+            .map_or(Some(1), |record| record.record.sequence.checked_add(1))
+            .ok_or(LearningError::LimitReached)?;
+        let record = LearningDecisionRecord {
+            sequence,
+            at_ms,
+            decision,
+        };
+        let mut next = inner.decisions.clone();
+        next.records.push(ScopedDecisionRecord {
+            scope: scope.clone(),
+            record: record.clone(),
+        });
+        persist_decisions(&mut inner, next)?;
+        Ok(record)
     }
     pub(super) fn reserve(
         &self,
@@ -280,6 +376,87 @@ fn persist(inner: &mut Inner, next: Document) -> LearningResult<()> {
         return Err(LearningError::Storage);
     }
     inner.document = next;
+    Ok(())
+}
+fn persist_decisions(inner: &mut Inner, next: DecisionsDocument) -> LearningResult<()> {
+    if next.records.len() > MAX_DECISIONS {
+        return Err(LearningError::LimitReached);
+    }
+    let bytes = serde_json::to_vec(&next).map_err(|_| LearningError::InvalidInput)?;
+    if bytes.len() > MAX_DECISIONS_STATE_BYTES {
+        return Err(LearningError::LimitReached);
+    }
+    let context = inner.context.as_ref().ok_or(LearningError::Unavailable)?;
+    // 账本提交和记忆修改分属两个插件；这里仅确认决策意图已持久保存。
+    // 即使错误出现在实际写入之后，也关闭两个学习句柄并等待重新打开核对。
+    if context.state_set(DECISIONS_STATE_KEY, bytes).is_err() {
+        inner.context = None;
+        return Err(LearningError::Storage);
+    }
+    inner.decisions = next;
+    Ok(())
+}
+
+fn validate_decision_binding(
+    document: &Document,
+    scope: &MemoryScope,
+    decision: &LearningDecision,
+    at_ms: u64,
+) -> LearningResult<()> {
+    scope.validate().map_err(|_| LearningError::InvalidInput)?;
+    decision.validate()?;
+    let job = document
+        .jobs
+        .iter()
+        .find(|record| record.job.batch.scope == *scope && record.job.batch.id == decision.batch_id)
+        .ok_or(LearningError::Conflict)?;
+    if job.job.status != JobStatus::Completed || decision.memory_revision < job.memory_revision {
+        return Err(LearningError::Conflict);
+    }
+    let candidate = job
+        .job
+        .candidates
+        .iter()
+        .find(|candidate| candidate.id == decision.candidate_id)
+        .ok_or(LearningError::Conflict)?;
+    if candidate.batch_id != decision.batch_id
+        || candidate.draft.evidence_ids != decision.evidence_ids
+        || at_ms < candidate.created_at_ms
+    {
+        return Err(LearningError::Conflict);
+    }
+    Ok(())
+}
+
+fn validate_decisions_document(
+    decisions: &DecisionsDocument,
+    document: &Document,
+) -> LearningResult<()> {
+    if decisions.records.len() > MAX_DECISIONS {
+        return Err(LearningError::CorruptState);
+    }
+    let mut sequences = BTreeMap::new();
+    let mut last_by_candidate: BTreeMap<_, &LearningDecision> = BTreeMap::new();
+    for entry in &decisions.records {
+        let record = &entry.record;
+        validate_decision_binding(document, &entry.scope, &record.decision, record.at_ms)?;
+        let expected = sequences
+            .get(&entry.scope)
+            .copied()
+            .unwrap_or(0_u64)
+            .checked_add(1)
+            .ok_or(LearningError::CorruptState)?;
+        if record.sequence != expected {
+            return Err(LearningError::CorruptState);
+        }
+        sequences.insert(&entry.scope, record.sequence);
+        let key = (&entry.scope, &record.decision.candidate_id);
+        if let Some(previous) = last_by_candidate.insert(key, &record.decision)
+            && previous.same_outcome(&record.decision)
+        {
+            return Err(LearningError::CorruptState);
+        }
+    }
     Ok(())
 }
 fn encode(document: &Document) -> LearningResult<Vec<u8>> {

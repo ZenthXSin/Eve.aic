@@ -19,7 +19,7 @@ import memory_test
 from memory_test import ARTIFACT, BINARY, FAKE, ROOT
 
 DISABLED = "偏好提炼未启用。"
-HELP = "用法：/memory-candidates [页码]、/accept-memory 候选ID。"
+HELP = "用法：/memory-candidates [页码]、/memory-decision 候选ID、/accept-memory 候选ID。"
 EMPTY = "当前会话没有偏好候选。"
 NOT_OWNED = "当前会话没有这条候选。发送 /memory-candidates 查看候选 ID。"
 CANDIDATE = "LEARNED_CANDIDATE_MARKER：回答先给简短结论，再给必要依据。"
