@@ -12,8 +12,21 @@ use std::io::Write;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 const VERSION: u32 = 1;
+/// Windows 上其他进程（读者、杀毒或索引服务）短暂打开 `state.json` 时，替换会
+/// 返回拒绝访问或共享冲突；按此退避重试同一临时文件，总等待约 1.3 秒。
+const REPLACE_RETRY_DELAYS: [Duration; 8] = [
+    Duration::from_millis(5),
+    Duration::from_millis(10),
+    Duration::from_millis(20),
+    Duration::from_millis(40),
+    Duration::from_millis(80),
+    Duration::from_millis(160),
+    Duration::from_millis(320),
+    Duration::from_millis(640),
+];
 type Entries = BTreeMap<String, BTreeMap<String, Vec<u8>>>;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -172,12 +185,56 @@ impl FileStateStore {
             .sync_all()
             .map_err(|error| failure("同步状态临时文件", error))?;
         // 唯一提交点。绝不先删除旧快照；失败时尝试清理临时文件并保留旧文件。
-        temporary
-            .persist(self.directory.join("state.json"))
-            .map_err(|error| failure("提交状态快照", error.error))?;
+        // 暂时性替换失败只重试同一次替换，不重写内容，也不改变提交点。
+        let target = self.directory.join("state.json");
+        replace_with_retry(
+            temporary,
+            |temporary| {
+                temporary
+                    .persist(&target)
+                    .map(drop)
+                    .map_err(|error| (error.error, error.file))
+            },
+            transient_replace_error,
+            std::thread::sleep,
+        )
+        .map_err(|error| failure("提交状态快照", error))?;
         // 提交后不再执行可能返回 Err 的 I/O，避免磁盘已更新却报告未提交。
         Ok(())
     }
+}
+
+/// 替换失败时取回待提交文件；只对暂时性错误按固定退避重试，用尽后返回最后的错误。
+fn replace_with_retry<T>(
+    mut pending: T,
+    mut replace: impl FnMut(T) -> Result<(), (std::io::Error, T)>,
+    transient: impl Fn(&std::io::Error) -> bool,
+    mut wait: impl FnMut(Duration),
+) -> std::io::Result<()> {
+    for delay in REPLACE_RETRY_DELAYS {
+        match replace(pending) {
+            Ok(()) => return Ok(()),
+            Err((error, returned)) if transient(&error) => {
+                pending = returned;
+                wait(delay);
+            }
+            Err((error, _)) => return Err(error),
+        }
+    }
+    replace(pending).map_err(|(error, _)| error)
+}
+
+#[cfg(windows)]
+fn transient_replace_error(error: &std::io::Error) -> bool {
+    // ERROR_ACCESS_DENIED、ERROR_SHARING_VIOLATION、ERROR_LOCK_VIOLATION：目标被
+    // 其他句柄打开时替换会暂时失败。权限等持久错误在退避用尽后同样返回。
+    matches!(error.raw_os_error(), Some(5 | 32 | 33))
+}
+
+#[cfg(not(windows))]
+fn transient_replace_error(_: &std::io::Error) -> bool {
+    // rename 覆盖已打开的目标不会因读者失败，其他错误都不是暂时性的。
+    false
 }
 
 impl StateStore for FileStateStore {
@@ -212,6 +269,74 @@ impl StateStore for FileStateStore {
 
 fn failure(operation: &str, error: impl fmt::Display) -> PluginError {
     PluginError::State(format!("{operation}失败：{error}"))
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    fn busy() -> Error {
+        Error::new(ErrorKind::PermissionDenied, "目标被占用")
+    }
+
+    #[test]
+    fn transient_failures_retry_the_same_pending_file_until_replaced() {
+        let mut attempts = Vec::new();
+        let mut waits = Vec::new();
+        replace_with_retry(
+            "临时文件",
+            |pending| {
+                attempts.push(pending);
+                if attempts.len() < 3 {
+                    Err((busy(), pending))
+                } else {
+                    Ok(())
+                }
+            },
+            |error| error.kind() == ErrorKind::PermissionDenied,
+            |delay| waits.push(delay),
+        )
+        .unwrap();
+        assert_eq!(attempts, ["临时文件"; 3]);
+        assert_eq!(waits, REPLACE_RETRY_DELAYS[..2]);
+    }
+
+    #[test]
+    fn permanent_failures_return_at_once_and_retries_are_bounded() {
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+        let error = replace_with_retry(
+            (),
+            |pending| {
+                attempts += 1;
+                Err((Error::new(ErrorKind::NotFound, "目录已删除"), pending))
+            },
+            |error| error.kind() == ErrorKind::PermissionDenied,
+            |delay| waits.push(delay),
+        )
+        .unwrap_err();
+        assert_eq!(
+            (error.kind(), attempts, waits.len()),
+            (ErrorKind::NotFound, 1, 0)
+        );
+
+        let mut attempts = 0;
+        let error = replace_with_retry(
+            (),
+            |pending| {
+                attempts += 1;
+                Err((busy(), pending))
+            },
+            |_| true,
+            |delay| waits.push(delay),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        assert_eq!(attempts, REPLACE_RETRY_DELAYS.len() + 1);
+        assert_eq!(waits, REPLACE_RETRY_DELAYS);
+        assert!(waits.iter().sum::<Duration>() < Duration::from_millis(1500));
+    }
 }
 
 #[cfg(all(test, unix))]
