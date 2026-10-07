@@ -19,6 +19,7 @@ const token = "synthetic-memory-browser-token-12345678901234";
 const untrusted = '<img src=x onerror="window.eveXss=true">';
 const first = `${untrusted}回答先给结论`;
 const corrected = "更正：先给证据再给结论";
+const learned = `${untrusted}学到的偏好：先列要点`;
 const statePath = path.join(work, "state/state.json");
 let requests = 0;
 const sockets = new Set();
@@ -28,9 +29,19 @@ const model = http.createServer(async (request, response) => {
   const body = JSON.parse(raw);
   assert.equal(request.url, "/v1/chat/completions");
   requests++;
+  const latest = body.messages.at(-1).content;
+  let content = latest;
+  try {
+    const decoded = JSON.parse(latest);
+    // 偏好提炼请求：返回一条只引用真实批次证据的候选。
+    if (decoded && decoded.extractor_version && Array.isArray(decoded.evidence)) {
+      content = JSON.stringify({ candidates: [{ text: learned, confidence: 83,
+        evidence_ids: decoded.evidence.map(item => item.id).slice(0, 2) }] });
+    }
+  } catch {}
   response.writeHead(200, { "Content-Type": "application/json" });
   response.end(JSON.stringify({ choices: [{ index: 0, finish_reason: "stop",
-    message: { role: "assistant", content: body.messages.at(-1).content } }] }));
+    message: { role: "assistant", content } }] }));
 });
 model.on("connection", socket => { sockets.add(socket); socket.on("close", () => sockets.delete(socket)); });
 await new Promise(resolve => model.listen(0, "127.0.0.1", resolve));
@@ -43,7 +54,7 @@ Object.assign(env, { QQBOT_APP_SECRET: "test-app-secret", EVE_OPENAI_API_KEY: "t
   EVE_OPENAI_BASE_URL: `http://127.0.0.1:${model.address().port}`, EVE_OPENAI_PROTOCOL: "chat",
   EVE_LLM_RESPONSE_MODE: "complete", EVE_WEB_TOKEN: token });
 let runs = 0;
-const launch = (script, panel) => {
+const launch = (script, panel, extra = []) => {
   runs++;
   const scenario = path.join(work, `scenario-${runs}.json`);
   fs.writeFileSync(scenario, JSON.stringify({ script, events_file: path.join(work, `events-${runs}.jsonl`),
@@ -51,6 +62,7 @@ const launch = (script, panel) => {
   const args = ["--state-dir", path.join(work, "state"), "--agent", path.join(root, "AGENT.md"), "--memory",
     "--bridge-script", path.join(root, "connectors/qqbot/test/fake-bridge.mjs"), "--bridge-arg", scenario];
   if (panel) args.push("--web-listen", "127.0.0.1:0");
+  args.push(...extra);
   const child = spawn(binary, args, { env, stdio: ["ignore", "pipe", "pipe"] });
   const run = { child, stdout: "", stderr: "", error: path.join(work, `bridge-error-${runs}`) };
   child.stdout.on("data", bytes => { run.stdout += bytes; });
@@ -73,14 +85,15 @@ let active;
 try {
   active = launch([...send(message("remember-a", `/remember ${first}`, "偏好已保存：")),
     ...send(message("remember-b", "/remember 用中文回复", "偏好已保存：")),
-    ...send(message("chat", "你好"))], false);
+    ...send(message("chat-1", "你好")), ...send(message("chat-2", "今天天气如何")),
+    ...send(message("chat-3", "请总结一下"))], false);
   await finish(active);
   const preference = memory().scopes[0].snapshot.preferences.find(item => item.text === first);
   assert.ok(preference, "first preference saved");
   const paused = path.join(work, "paused");
   const end = path.join(work, "end");
   active = launch([...send(message("correct", `/correct-memory ${preference.id} ${corrected}`, "偏好已修正：")),
-    { touch: paused }, { wait_file: end }], true);
+    { touch: paused }, { wait_file: end }], true, ["--memory-learning"]);
   const deadline = Date.now() + 20000;
   while (!active.stderr.includes("EVE_WEB_READY ") || !fs.existsSync(paused)) {
     assert.equal(active.child.exitCode, null, "owned Eve exited before browser synchronization");
@@ -88,6 +101,16 @@ try {
     await delay(20);
   }
   const url = active.stderr.match(/EVE_WEB_READY (http:\/\/[^\s]+)/)[1];
+  // 等待后台提炼批次完成；面板读取本身不触发提炼。
+  const jobs = () => {
+    const entry = JSON.parse(fs.readFileSync(statePath, "utf8")).entries["eve.learning"]?.["learning.v1"];
+    return entry ? JSON.parse(Buffer.from(entry).toString("utf8")).jobs : [];
+  };
+  while (!jobs().some(record => record.job.status === "Completed")) {
+    assert.equal(active.child.exitCode, null, "owned Eve exited before learning finished");
+    assert.ok(Date.now() < deadline, "learning batch did not finish");
+    await delay(20);
+  }
   const stateBefore = fs.readFileSync(statePath, "utf8");
   browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
@@ -118,6 +141,12 @@ try {
   for (const hidden of ["remember-a", "synthetic-user", "test-model-secret"]) assert.equal((detail + source).includes(hidden), false, hidden);
   assert.equal(await page.locator("#memory-detail img").count(), 0);
   assert.equal(await page.evaluate(() => window.eveXss), undefined);
+  await page.waitForFunction(() => document.querySelector("#memory-learning").textContent.includes("学习候选（1）"));
+  const learning = await page.locator("#memory-learning").textContent();
+  for (const expected of ["手动模式", learned, "待确认", "模型自评 83（不是校准概率）", "尚无自动学习决策", "实际保存：记忆历史中没有", "决策记录是提交前的意图"]) {
+    assert.ok(learning.includes(expected), expected);
+  }
+  assert.equal(await page.locator("#memory-detail img").count(), 0);
   await page.screenshot({ path: path.join(artifacts, "memory.png"), fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), "mobile memory overflows horizontally");
@@ -132,9 +161,9 @@ try {
   assert.equal(fs.readFileSync(statePath, "utf8"), stateBefore, "browser reads must not write state");
   fs.writeFileSync(end, "done");
   await finish(active);
-  assert.equal(requests, 1);
+  assert.equal(requests, 4);
   console.log(JSON.stringify({ passed: true, model_requests: requests, browser_errors: errors.length,
-    checks: ["scope-list", "preference-history", "explicit-source", "xss-text", "read-only-state", "mobile-layout", "logout"], artifacts }));
+    checks: ["scope-list", "preference-history", "explicit-source", "learning-candidates", "xss-text", "read-only-state", "mobile-layout", "logout"], artifacts }));
 } finally {
   if (browser) await browser.close();
   if (active && active.child.exitCode === null) { active.child.kill("SIGKILL"); await active.exited; }

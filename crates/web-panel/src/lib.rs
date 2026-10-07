@@ -112,6 +112,7 @@ impl LocalPanel {
             .route("/api/memory/scopes", post(memory_scopes))
             .route("/api/memory/scope", post(memory))
             .route("/api/memory/evidence", post(memory_evidence))
+            .route("/api/memory/learning", post(memory_learning))
             .fallback(|| async { error(StatusCode::NOT_FOUND, "not_found") })
             .layer(DefaultBodyLimit::max(16384))
             .layer(middleware::from_fn_with_state(shared.clone(), protect))
@@ -522,6 +523,21 @@ async fn memory_evidence(
         return error(StatusCode::BAD_REQUEST, "invalid_input");
     }
     match shared.service.memory_evidence(&body.scope, &body.id) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+async fn memory_learning(
+    State(shared): State<Arc<Shared>>,
+    body: Result<Json<MemoryTarget>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_json");
+    };
+    if body.scope.validate().is_err() {
+        return error(StatusCode::BAD_REQUEST, "invalid_input");
+    }
+    match shared.service.memory_learning(&body.scope) {
         Ok(value) => Json(value).into_response(),
         Err(e) => failure(e),
     }

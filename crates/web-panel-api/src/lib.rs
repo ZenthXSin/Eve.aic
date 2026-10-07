@@ -334,6 +334,75 @@ pub struct MemoryEvidenceDetail {
     pub references_total: usize,
 }
 
+/// 一次偏好提炼批次；不含输入正文。
+#[derive(Clone, Debug, Serialize)]
+pub struct LearningJobView {
+    pub batch_id: String,
+    /// `running`、`completed`、`failed` 或 `interrupted`。
+    pub status: &'static str,
+    /// failed 时为 `provider`、`invalid_output`、`timeout` 或 `cancelled`。
+    pub failure: Option<&'static str>,
+    pub started_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
+    pub evidence: usize,
+    pub candidates: usize,
+}
+/// 学习决策是提交前的意图，不证明偏好已写入记忆。
+#[derive(Clone, Debug, Serialize)]
+pub struct LearningDecisionView {
+    pub sequence: u64,
+    pub at_ms: u64,
+    /// `confirm`、`update`、`defer` 或 `reject`。
+    pub action: &'static str,
+    /// update 时的目标偏好与当时的目标修订。
+    pub update_preference: Option<String>,
+    pub update_revision: Option<u64>,
+    /// `eligible`、`evidence_threshold`、`expired`、`policy_denied`、`duplicate`、
+    /// `revoked_conflict`、`manual_conflict`、`ambiguous_conflict`、`stale_evidence`、
+    /// `explicit_revision_update` 或 `already_linked`。
+    pub reason: &'static str,
+    pub policy_version: String,
+    pub memory_revision: u64,
+}
+/// 按记忆真实历史核对出的关联偏好。
+#[derive(Clone, Debug, Serialize)]
+pub struct LinkedPreference {
+    pub preference_id: String,
+    pub revision: u64,
+    pub status: &'static str,
+    pub effective: bool,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct LearningCandidateView {
+    pub id: String,
+    pub batch_id: String,
+    /// 模型提炼的候选正文，受学习契约上限约束；不是用户已确认的偏好。
+    pub text: String,
+    /// 模型自评 0..=100，不是经过校准的概率。
+    pub confidence: u8,
+    pub evidence_ids: Vec<String>,
+    pub created_at_ms: u64,
+    pub expires_at_ms: u64,
+    /// 尚未保存且已过首次确认期限。
+    pub expired: bool,
+    /// 与 QQ `/memory-decision` 相同的核对结果；决策记录本身不算保存。
+    pub saved: Option<LinkedPreference>,
+    /// 该候选的决策，新的在前，最多列出有限条。
+    pub decisions: Vec<LearningDecisionView>,
+    pub decisions_total: usize,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct LearningView {
+    pub scope: MemoryScope,
+    /// 宿主以 `--self-learning` 启动时为 true：按证据策略自动确认；否则候选需用户明确确认。
+    pub autonomous: bool,
+    /// 新的在前。
+    pub jobs: Vec<LearningJobView>,
+    /// 新的在前。
+    pub candidates: Vec<LearningCandidateView>,
+    pub decisions_total: usize,
+}
+
 /// 受信宿主提供服务，HTTP 实现仅消费此契约。cancel 只准入取消，不等待或声明提交完成。
 /// 每页 1..=100 项；历史最多 50 轮，每段正文最多 8192 字节并明确标注截断。
 /// 暴露给本机操作者；不存在通过 HTTP 指定其他 Provider、执行工具或新任务的入口。
@@ -372,6 +441,10 @@ pub trait PanelService: Send + Sync {
     }
     /// 已存在作用域的偏好与版本历史；不存在的作用域返回 NotFound，不当作空记忆。
     fn memory(&self, _scope: &MemoryScope) -> PanelResult<MemoryDetail> {
+        Err(PanelError::Unavailable)
+    }
+    /// 已存在作用域的偏好提炼批次、候选与学习决策；未开启偏好提炼的实现返回 Unavailable。
+    fn memory_learning(&self, _scope: &MemoryScope) -> PanelResult<LearningView> {
         Err(PanelError::Unavailable)
     }
     /// 同一作用域内的一条来源证据；不存在时返回 NotFound。

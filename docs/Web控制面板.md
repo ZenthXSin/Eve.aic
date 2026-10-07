@@ -24,7 +24,7 @@ API 设置 5 秒异步请求期限、16 个同时处理请求和 16 KiB JSON 请
 - `eve-app` 在 QQ 宿主中组合已有 `SessionService`、`ControlService` 和通道状态；不旁路读取数据库，不从 HTTP 创建 Provider 或执行工具。
 - `SessionService::list_keys` / `ControlService::list_keys` 为兼容现有自定义实现新增默认不可用方法。内置实现按 `session_id` 字典序、独占游标、每页 1–100 项枚举完整可信身份；`BTreeMap.range` 有界读取，不将单页读取描述为跨页事务快照。停止后旧服务不可用。
 
-接口为 `GET /api/status`、`GET /api/sessions?after=...&limit=25`、`GET /api/tasks?after=...&limit=25`、`GET /api/judgments?before=...&limit=25`、`GET /api/goals?after=...&limit=25`、`GET /api/goal?id=...`、`POST /api/memory/scopes {after?,limit?}`、`POST /api/memory/scope {scope}`、`POST /api/memory/evidence {scope,id}`、`POST /api/session {key,before?,limit?}` 和 `POST /api/cancel {target:GenerationKey}`。错误使用固定类别，不带密钥、输入或原始 Provider 报错。提交取消必须携带浏览器所见的完整会话、用户、任务、启动 epoch 和代号；代已变化时返回冲突，不偷换成最新任务。
+接口为 `GET /api/status`、`GET /api/sessions?after=...&limit=25`、`GET /api/tasks?after=...&limit=25`、`GET /api/judgments?before=...&limit=25`、`GET /api/goals?after=...&limit=25`、`GET /api/goal?id=...`、`POST /api/memory/scopes {after?,limit?}`、`POST /api/memory/scope {scope}`、`POST /api/memory/evidence {scope,id}`、`POST /api/memory/learning {scope}`、`POST /api/session {key,before?,limit?}` 和 `POST /api/cancel {target:GenerationKey}`。错误使用固定类别，不带密钥、输入或原始 Provider 报错。提交取消必须携带浏览器所见的完整会话、用户、任务、启动 epoch 和代号；代已变化时返回冲突，不偷换成最新任务。
 
 ## 实时判断诊断
 
@@ -63,6 +63,15 @@ API 设置 5 秒异步请求期限、16 个同时处理请求和 16 KiB JSON 请
 作用域详情按偏好 ID 列出全部偏好（数量受记忆存储上限约束）：当前正文（最多 4096 字节）、状态、最新修订、是否生效，以及按修订从新到旧的历史版本。每个版本给出状态、时间、正文预览（最多 512 字节）和引用的证据 ID 与类型；证据已不在快照中时标为“来源记录缺失”。只有最新且已确认的版本会进入对话上下文；撤销与更正都保留历史和来源，页面如实标注。
 
 来源正文需操作者在某个版本上单独点“查看来源”才读取，与 `eve-memory evidence --include-content` 的显式查看一致。来源区分“用户明确声明”和“已完成对话”：对话来源把当时的用户输入和助手回复分列，每段最多 2048 字节并标注截断；助手回复是历史内容，不是已核实的事实。来源同时列出引用它的偏好版本（最多 50 条，另给总数）。接口不返回平台消息 ID；作用域标识与会话页一致，是宿主绑定的 `qq:` 摘要。
+
+### 学习候选
+
+以 `--memory-learning` 或 `--self-learning` 启动时，记忆详情下方显示该作用域的偏好提炼批次、候选与学习决策；未开启时 `POST /api/memory/learning` 返回 503，页面注明未开启。宿主把学习管理句柄包进只提供快照与决策读取的 `LearningRead`，面板不能记录决策、预留批次或确认候选。
+
+- 与 QQ `/memory-decision` 共用同一组核对函数和读取顺序：先固定记忆快照，再读只追加的决策账本与学习快照，校验候选属于本作用域批次、只引用批次内真实已完成对话、账本序号连续且与候选一致。任一校验失败时整体返回 503，不显示部分结果。
+- “实际保存”只按记忆真实历史核对：首版正文与来源须对应真实用户确认命令，或自主模式下候选所引用的已完成对话；更新类决策还须在目标偏好中找到对应的后继版本。决策记录只是提交前的意图，有确认决策但记忆中没有对应历史时仍显示“未保存”。
+- 每个候选给出正文（受学习契约上限约束）、模型自评（0–100，不是校准概率）、引用对话数、生成时间与首次确认期限；未保存且已过期限标为“已过期”。决策新的在前，最多 8 条，给出动作、理由、策略版本与读取时的记忆修订，另给总数。
+- 批次只显示状态、失败类别、时间与证据/候选数量，不显示提炼输入正文。页面注明当前是自主学习还是需用户 `/accept-memory` 的手动模式。
 
 记忆页同样只读，不写 StateStore，重启后从持久记忆状态重新读取；记忆状态损坏仍在启动时显式失败。偏好撤销、训练开关等管理操作需单独的公开管理契约、陈旧版本检测与确认流程，未在本页提供。
 

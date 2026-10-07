@@ -69,6 +69,18 @@
     status: { confirmed: "已确认", revoked: "已撤销" },
     kind: { user_statement: "用户明确声明", completed_interaction: "已完成对话", missing: "来源记录缺失" },
   };
+  const learningLabels = {
+    job: { running: "进行中", completed: "已完成", failed: "失败", interrupted: "已中断" },
+    failure: { provider: "模型服务失败", invalid_output: "输出格式无效", timeout: "超时", cancelled: "已取消" },
+    action: { confirm: "新增确认", update: "更新偏好", defer: "暂缓自动保存", reject: "拒绝自动保存" },
+    reason: {
+      eligible: "满足来源门槛", evidence_threshold: "自评或真实来源数量未达门槛", expired: "已过首次确认期限",
+      policy_denied: "替换策略未授权此动作", duplicate: "已有规范化等价偏好", revoked_conflict: "与用户撤销记录冲突，不自动恢复",
+      manual_conflict: "与用户手动确认或更正冲突，保留手动选择", ambiguous_conflict: "存在多个或不明确的更新目标",
+      stale_evidence: "候选来源修订未晚于当前偏好来源", explicit_revision_update: "明确偏好键已有更新的真实来源",
+      already_linked: "候选已有可核对的保存历史",
+    },
+  };
 
   class ApiError extends Error {
     constructor(message, silent = false) { super(message); this.silent = silent; }
@@ -1004,8 +1016,71 @@
       card.append(versions);
       detail.append(card);
     }
-    detail.append(evidenceBox);
+    const learningBox = node("section", "goal-section");
+    learningBox.id = "memory-learning";
+    learningBox.append(node("h3", "", "学习候选"), node("p", "muted", "正在读取偏好提炼记录…"));
+    detail.append(learningBox, evidenceBox);
     $("memory-detail").replaceChildren(heading, detail);
+    void loadLearning(body.scope, memoryRequest);
+  }
+
+  async function loadLearning(scope, request) {
+    const requestEpoch = epoch;
+    try {
+      const body = await api("/api/memory/learning", { scope });
+      if (request !== memoryRequest || requestEpoch !== epoch || !$("memory-learning")) return;
+      if (!body || !Array.isArray(body.jobs) || !Array.isArray(body.candidates) || typeof body.autonomous !== "boolean") {
+        throw new ApiError("学习记录格式无效，请刷新重试。");
+      }
+      renderLearning(body);
+    } catch (error) {
+      if (request !== memoryRequest || requestEpoch !== epoch || error.silent || !$("memory-learning")) return;
+      const unavailable = error instanceof ApiError && error.message.startsWith("当前服务暂不可用");
+      $("memory-learning").replaceChildren(node("h3", "", "学习候选"),
+        node("p", unavailable ? "muted" : "inline-error", unavailable ? "未开启偏好提炼（需以 --memory-learning 或 --self-learning 启动），或学习记录暂时无法读取、核对。" : errorText(error)));
+    }
+  }
+
+  function renderLearning(body) {
+    const box = $("memory-learning");
+    box.replaceChildren(node("h3", "", `学习候选（${count(body.candidates.length)}）`));
+    box.append(node("p", "detail-note", body.autonomous
+      ? "自主学习：宿主按证据策略自动确认候选；与用户手动更正、撤销冲突时保留手动选择。"
+      : "手动模式：候选需用户在 QQ 中发送 /accept-memory 候选ID 确认后才会保存。"));
+    const tally = {};
+    for (const job of body.jobs) if (job && typeof job.status === "string") tally[job.status] = (tally[job.status] || 0) + 1;
+    const failures = body.jobs.filter((job) => job && job.failure).map((job) => label(learningLabels.failure, job.failure));
+    const parts = Object.entries(tally).map(([status, value]) => `${label(learningLabels.job, status)} ${count(value)}`);
+    box.append(node("p", "record-meta", `提炼批次 ${count(body.jobs.length)} 次${parts.length ? `：${parts.join("、")}` : ""}${failures.length ? `（失败原因：${failures.join("、")}）` : ""} · 学习决策共 ${count(body.decisions_total)} 条`));
+    if (!body.candidates.length) box.append(node("p", "muted", "还没有提炼出候选偏好。"));
+    for (const item of body.candidates) {
+      if (!item || typeof item.id !== "string" || !Array.isArray(item.decisions)) continue;
+      const card = node("article", "reflection-card");
+      const top = node("div", "record-topline");
+      const saved = item.saved && typeof item.saved.preference_id === "string" ? item.saved : null;
+      const state = saved ? (saved.effective ? "已保存，生效中" : "已保存，后被撤销") : item.expired ? "已过期，未保存" : "待确认";
+      top.append(node("span", "record-name", item.id), node("span", `badge ${saved ? (saved.effective ? "good" : "") : item.expired ? "" : "warning"}`.trim(), state));
+      card.append(top, node("p", "", item.text));
+      card.append(node("p", "record-meta", `模型自评 ${count(item.confidence)}（不是校准概率）· 引用对话 ${count(item.evidence_ids.length)} 条 · 生成于 ${goalDate(item.created_at_ms)} · 确认期限 ${goalDate(item.expires_at_ms)}`));
+      card.append(node("p", "record-meta", saved ? `实际保存：偏好 ${saved.preference_id}，当前版本 ${count(saved.revision)}（按记忆历史核对）` : "实际保存：记忆历史中没有该候选对应的确认或更新。"));
+      if (item.decisions.length) {
+        const list = node("ol", "judgment-steps");
+        for (const decision of item.decisions) {
+          if (!decision || typeof decision.action !== "string") continue;
+          const target = decision.action === "update" && typeof decision.update_preference === "string" ? `（目标 ${decision.update_preference} 版本 ${count(decision.update_revision)}）` : "";
+          const row = node("li", "judgment-step");
+          row.append(node("span", "record-name", `#${count(decision.sequence)} ${label(learningLabels.action, decision.action)}${target}`),
+            node("span", "record-meta", `${label(learningLabels.reason, decision.reason)} · 策略 ${text(decision.policy_version)} · 读取记忆版本 ${count(decision.memory_revision)} · ${goalDate(decision.at_ms)}`));
+          list.append(row);
+        }
+        card.append(list);
+        if (item.decisions_total > item.decisions.length) card.append(node("p", "truncation-note", `另有 ${count(item.decisions_total - item.decisions.length)} 条更早决策未列出。`));
+      } else {
+        card.append(node("p", "muted", "尚无自动学习决策；手动确认不会伪造自动决策。"));
+      }
+      box.append(card);
+    }
+    box.append(node("p", "truncation-note", "决策记录是提交前的意图，是否真正保存以记忆历史为准；候选正文是模型提炼结果，不等于用户已确认。"));
   }
 
   async function loadEvidence(scope, id) {

@@ -25,7 +25,7 @@ impl MemoryView {
         Ok(scopes)
     }
     /// 记忆实现对未知作用域返回空快照；面板先确认作用域已持久保存，避免把输错当成“没有记忆”。
-    fn snapshot(&self, scope: &MemoryScope) -> PanelResult<MemorySnapshot> {
+    pub(crate) fn snapshot(&self, scope: &MemoryScope) -> PanelResult<MemorySnapshot> {
         if !self.scopes()?.contains(scope) {
             return Err(PanelError::NotFound);
         }

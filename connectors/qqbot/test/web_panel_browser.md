@@ -23,4 +23,4 @@ node connectors/qqbot/test/web_panel_memory_browser.mjs
 
 `web_panel_cognition_browser.mjs` 以 `--cognition` 启动真实 Eve，经 QQ 替身保存一条含 HTML 文本的 `/goal`、等待第一份反思草稿，再提交 `/goal-feedback` 生成第二份草稿。浏览器验证目标列表只显示父目标、详情中当前草稿在前且历史草稿保留、“未验证”标注、HTML 按纯文本显示、浏览期间状态文件字节不变、手机布局与退出；截图保存为 `goals.png` 和 `mobile-goals.png`。主脚本另验证未开启认知或记忆时页面提示不可用。
 
-`web_panel_memory_browser.mjs` 以 `--memory` 两次启动真实 Eve：第一次经 QQ 替身保存两条偏好（其一含 HTML 文本）并完成一轮对话；第二次更正其中一条后打开面板。浏览器验证作用域列表、偏好与版本历史（新的在前）、显式打开来源后用户声明按纯文本显示、浏览期间状态文件字节不变、手机布局与退出；截图保存为 `memory.png` 和 `mobile-memory.png`。
+`web_panel_memory_browser.mjs` 以 `--memory` 两次启动真实 Eve：第一次经 QQ 替身保存两条偏好（其一含 HTML 文本）并完成三轮对话；第二次加 `--memory-learning`，更正其中一条并等待一次提炼批次完成后打开面板。浏览器验证作用域列表、偏好与版本历史（新的在前）、显式打开来源后用户声明按纯文本显示、手动模式下的待确认学习候选与“决策不等于保存”说明、浏览期间状态文件字节不变、手机布局与退出；截图保存为 `memory.png` 和 `mobile-memory.png`。

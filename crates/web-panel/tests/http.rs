@@ -969,6 +969,48 @@ impl PanelService for Memories {
             }],
         })
     }
+    fn memory_learning(&self, scope: &eve_memory_api::MemoryScope) -> PanelResult<LearningView> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("learning:{}", scope.user_id));
+        Ok(LearningView {
+            scope: scope.clone(),
+            autonomous: false,
+            jobs: vec![LearningJobView {
+                batch_id: "批次-1".into(),
+                status: "failed",
+                failure: Some("timeout"),
+                started_at_ms: 1,
+                finished_at_ms: Some(2),
+                evidence: 1,
+                candidates: 0,
+            }],
+            candidates: vec![LearningCandidateView {
+                id: "候选-1".into(),
+                batch_id: "批次-0".into(),
+                text: "<i>候选</i>".into(),
+                confidence: 70,
+                evidence_ids: vec!["证据-1".into()],
+                created_at_ms: 1,
+                expires_at_ms: 2,
+                expired: true,
+                saved: None,
+                decisions: vec![LearningDecisionView {
+                    sequence: 1,
+                    at_ms: 1,
+                    action: "defer",
+                    update_preference: None,
+                    update_revision: None,
+                    reason: "evidence_threshold",
+                    policy_version: "v1".into(),
+                    memory_revision: 1,
+                }],
+                decisions_total: 1,
+            }],
+            decisions_total: 1,
+        })
+    }
     fn memory_evidence(
         &self,
         scope: &eve_memory_api::MemoryScope,
@@ -1014,6 +1056,7 @@ async fn memory_views_are_authenticated_strict_json_and_unavailable_by_default()
             "/api/memory/evidence",
             json!({"scope": scope, "id": "证据-1"}),
         ),
+        ("/api/memory/learning", json!({"scope": scope})),
     ];
     let legacy = Arc::new(Service::default());
     let panel_legacy = panel(legacy.clone()).await;
@@ -1123,6 +1166,16 @@ async fn memory_views_are_authenticated_strict_json_and_unavailable_by_default()
             json!({"scope": control, "id": "证据-1"}),
             "invalid_input",
         ),
+        (
+            "/api/memory/learning",
+            json!({"scope": blank}),
+            "invalid_input",
+        ),
+        (
+            "/api/memory/learning",
+            json!({"scope": scope, "id": "x"}),
+            "invalid_json",
+        ),
     ] {
         assert_code(
             client
@@ -1191,6 +1244,22 @@ async fn memory_views_are_authenticated_strict_json_and_unavailable_by_default()
         .unwrap();
     assert_eq!(body["assistant_text"], "好的");
     assert_eq!(body["references_total"], 1);
+    let body = client
+        .post(url(&panel, "/api/memory/learning"))
+        .bearer_auth(TOKEN)
+        .json(&json!({"scope": scope}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(body["jobs"][0]["failure"], "timeout");
+    assert_eq!(body["candidates"][0]["saved"], Value::Null);
+    assert_eq!(
+        body["candidates"][0]["decisions"][0]["reason"],
+        "evidence_threshold"
+    );
     let other = json!({"channel": "qq", "session_id": "会话-A", "user_id": "用户-B"});
     for (path, body) in [
         ("/api/memory/scope", json!({"scope": other})),
@@ -1218,6 +1287,7 @@ async fn memory_views_are_authenticated_strict_json_and_unavailable_by_default()
             "scopes:Some(\"用户-A\"):100".to_owned(),
             "detail:用户-A".into(),
             "evidence:用户-A:证据-1".into(),
+            "learning:用户-A".into(),
             "detail:用户-B".into(),
             "evidence:用户-A:缺失".into(),
         ]

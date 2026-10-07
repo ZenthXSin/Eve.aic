@@ -542,6 +542,9 @@ pub async fn run_qqbot_with_learning_policy(
                         .map(qq_cognition::Background::reader)
                         .transpose()?,
                     memory: panel_memory.map(crate::web_panel_memory::MemoryView::new),
+                    learning: learning.clone().map(|admin| {
+                        crate::web_panel_learning::LearningRead::new(admin, options.self_learning)
+                    }),
                 }),
             )
             .await?;

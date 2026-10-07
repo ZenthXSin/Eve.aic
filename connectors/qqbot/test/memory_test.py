@@ -369,6 +369,7 @@ class MemoryAcceptance(unittest.TestCase):
             seen["unknown_scope"] = self.panel("/api/memory/scope", {"scope": {**scope, "user_id": "nobody"}})[0]
             seen["unknown_source"] = self.panel("/api/memory/evidence", {"scope": scope, "id": "missing"})[0]
             seen["invalid"] = self.panel("/api/memory/scope", {"scope": {**scope, "session_id": ""}})[0]
+            seen["learning"] = self.panel("/api/memory/learning", {"scope": scope})
             seen["unchanged"] = before == self.memory()
 
         self.run_eve([*self.send(self.message("correct", f"/correct-memory {id} {CORRECTION}", contains="偏好已修正：")),
@@ -404,6 +405,7 @@ class MemoryAcceptance(unittest.TestCase):
                          ("completed_interaction", "第一轮正常对话", []))
         self.assertIn("第一轮正常对话", chat["assistant_text"])
         self.assertEqual((seen["unknown_scope"], seen["unknown_source"], seen["invalid"]), (404, 404, 400))
+        self.assertEqual(seen["learning"], (503, {"error": "unavailable"}), "learning view needs --memory-learning")
         self.assertTrue(seen["unchanged"], "panel reads must not write memory")
         rendered = json.dumps([seen["scopes"], seen["detail"], seen["first_source"], seen["chat_source"]],
                               ensure_ascii=False)

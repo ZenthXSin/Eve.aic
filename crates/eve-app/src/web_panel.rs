@@ -28,6 +28,8 @@ pub(crate) struct QqPanel {
     pub cognition: Option<Arc<dyn CognitionReader>>,
     /// 开启 --memory 时的只读记忆视图；面板不能确认、更正或撤销偏好。
     pub memory: Option<crate::web_panel_memory::MemoryView>,
+    /// 开启 --memory-learning 时的只读学习视图；面板不能记录决策或确认候选。
+    pub learning: Option<crate::web_panel_learning::LearningRead>,
 }
 fn session_error(error: SessionError) -> PanelError {
     match error {
@@ -277,6 +279,16 @@ impl PanelService for QqPanel {
     ) -> PanelResult<MemoryEvidenceDetail> {
         let view = self.memory.as_ref().ok_or(PanelError::Unavailable)?;
         crate::web_panel_memory::evidence(view, scope, id)
+    }
+    fn memory_learning(&self, scope: &eve_memory_api::MemoryScope) -> PanelResult<LearningView> {
+        let read = self.learning.as_ref().ok_or(PanelError::Unavailable)?;
+        let view = self.memory.as_ref().ok_or(PanelError::Unavailable)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+            .ok_or(PanelError::Unavailable)?;
+        crate::web_panel_learning::learning(read, view, scope, now_ms)
     }
 }
 

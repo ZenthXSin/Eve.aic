@@ -224,7 +224,7 @@ fn explain_learning(error: LearningError) -> PluginResult<String> {
     }
 }
 
-fn candidates<'a>(
+pub(crate) fn candidates<'a>(
     snapshot: &'a LearningSnapshot,
     scope: &MemoryScope,
 ) -> PluginResult<Vec<&'a PreferenceCandidate>> {
@@ -323,7 +323,7 @@ pub(crate) fn confirmed<'a>(
     Ok(Some(preference))
 }
 
-fn validate_records(
+pub(crate) fn validate_records(
     records: &[LearningDecisionRecord],
     candidates: &[&PreferenceCandidate],
 ) -> PluginResult<()> {
@@ -350,7 +350,7 @@ fn validate_records(
 
 /// 账本只是意图；必须在目标真实历史中找到指定后继版本及原始完成来源。
 /// 遍历所有旧意图，使后来用户更正、撤销仍保留候选曾成功更新的事实。
-fn linked_candidate<'a>(
+pub(crate) fn linked_candidate<'a>(
     snapshot: &'a MemorySnapshot,
     candidate: &PreferenceCandidate,
     records: &[LearningDecisionRecord],
