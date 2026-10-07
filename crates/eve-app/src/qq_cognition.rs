@@ -65,6 +65,17 @@ fn scope(kind: SourceKind, channel: &str) -> ExecutionScope {
         }],
     }
 }
+/// 反思输入的父目标来源：用户待办，以及显式开启兴趣学习时的派生学习目标。
+fn reflection_scope(interest_goals: bool) -> ExecutionScope {
+    let mut scope = scope(SourceKind::User, CHANNEL);
+    if interest_goals {
+        scope.sources.push(AllowedSource {
+            kind: SourceKind::Inference,
+            channel: eve_interest_api::INTEREST_GOAL_CHANNEL.into(),
+        });
+    }
+    scope
+}
 fn id_for(input: &QqCommandInput<'_>) -> String {
     let mut hash = Context::new(&SHA256);
     for part in [
@@ -390,10 +401,11 @@ impl Plugin for ContextPlugin {
         })
     }
 }
-/// QQ 通道尚未启动时拒绝议程；只允许当前 QQ 待办的子目标进入执行。
+/// QQ 通道尚未启动时拒绝议程；只允许当前 QQ 待办及已授权学习目标的子目标进入执行。
 struct QqPolicy {
     enabled: Arc<AtomicBool>,
     admin: CognitionController,
+    parents: ExecutionScope,
 }
 impl DrivePolicy for QqPolicy {
     fn rank(&self, goals: &[Goal], now_ms: u64) -> LoopResult<Vec<RankedGoal>> {
@@ -426,7 +438,7 @@ impl DrivePolicy for QqPolicy {
             })
             .cloned()
             .collect();
-        ReflectionDrivePolicy::new(scope(SourceKind::User, CHANNEL))?.rank_with_state(
+        ReflectionDrivePolicy::new(self.parents.clone())?.rank_with_state(
             snapshot,
             &user_goals,
             now_ms,
@@ -449,6 +461,10 @@ impl Background {
     }
     pub(crate) fn finished(&self) -> watch::Receiver<bool> {
         self.finished.clone()
+    }
+    /// 兴趣学习派生器需要写入自身来源的学习目标；只交给同一受信宿主。
+    pub(crate) fn admin(&self) -> Result<CognitionController, AppError> {
+        Ok(self.commands.admin.clone().ok_or("认知管理句柄缺失")?)
     }
     /// 本机面板只取得绑定 Internal 的读取句柄，不持有可写的管理能力。
     pub(crate) fn reader(&self) -> Result<Arc<dyn CognitionReader>, AppError> {
@@ -479,6 +495,7 @@ pub(crate) async fn start(
     agent: &std::path::Path,
     max: u16,
     factory: Arc<dyn EndogenousPlannerFactory>,
+    interest_goals: bool,
 ) -> Result<Background, AppError> {
     let plugin = CognitionPlugin::new("eve")?;
     let admin = plugin.controller();
@@ -553,7 +570,7 @@ pub(crate) async fn start(
         factory.create(
             Arc::new(admin.clone()),
             EndogenousOptions {
-                scope: scope(SourceKind::User, CHANNEL),
+                scope: reflection_scope(interest_goals),
                 max_derivations: max,
                 timeout_ms: 30_000,
             },
@@ -566,6 +583,7 @@ pub(crate) async fn start(
         Arc::new(QqPolicy {
             enabled: enabled.clone(),
             admin: admin.clone(),
+            parents: reflection_scope(interest_goals),
         }),
         Arc::new(ReflectionVerifier),
         executor,
@@ -730,6 +748,7 @@ mod agenda_policy_tests {
         let policy = QqPolicy {
             enabled: enabled.clone(),
             admin,
+            parents: reflection_scope(false),
         };
         let ranked = policy.rank_with_state(&snapshot, &goals, 1_000).unwrap();
         assert_eq!(ranked.len(), 1);

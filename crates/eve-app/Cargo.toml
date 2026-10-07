@@ -46,6 +46,8 @@ eve-control-plugin = { path = "../control-plugin" }
 eve-jev = { path = "../jev" }
 eve-kernel = { path = "../kernel" }
 eve-learning-api = { path = "../learning-api" }
+eve-interest-api = { path = "../interest-api" }
+eve-interest-plugin = { path = "../interest-plugin" }
 eve-plan-api = { path = "../plan-api" }
 eve-plan-plugin = { path = "../plan-plugin" }
 eve-learning-plugin = { path = "../learning-plugin" }

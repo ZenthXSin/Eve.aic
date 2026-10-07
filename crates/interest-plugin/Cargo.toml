@@ -1,0 +1,26 @@
+[package]
+name = "eve-interest-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-interest-api = { path = "../interest-api" }
+eve-memory-api = { path = "../memory-api" }
+eve-cognition-api = { path = "../cognition-api" }
+eve-plugin-api = { path = "../plugin-api" }
+eve-llm-api = { path = "../llm-api" }
+serde.workspace = true
+serde_json.workspace = true
+ring.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+eve-kernel = { path = "../kernel" }
+eve-memory-plugin = { path = "../memory-plugin" }
+eve-cognition-plugin = { path = "../cognition-plugin" }
+eve-cognition-loop-api = { path = "../cognition-loop-api" }
+eve-cognition-loop-plugin = { path = "../cognition-loop-plugin" }
+eve-session-api = { path = "../session-api" }
+tempfile.workspace = true

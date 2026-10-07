@@ -1,10 +1,12 @@
 use crate::{
-    AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_cognition, qq_learning,
-    qq_learning_commands, qq_memory, qq_memory_observer, segment_commands,
+    AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_cognition, qq_interest,
+    qq_learning, qq_learning_commands, qq_memory, qq_memory_observer, segment_commands,
 };
 use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
 use eve_config_api::{CONFIG_SERVICE_ID, ConfigServiceHandle};
+use eve_interest_api::{INTEREST_PLUGIN_ID, InterestObserver, ObservationOptions};
+use eve_interest_plugin::{InterestPlugin, LearningGoalDeriver, ModelInterestObserver};
 use eve_kernel::{Kernel, KernelServices};
 use eve_learning_api::{
     AutoConfirmationPolicy, LEARNING_PLUGIN_ID, LearningAdmin, LearningOptions, PreferenceExtractor,
@@ -31,7 +33,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--memory-learning] [--self-learning] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--memory-learning] [--self-learning] [--interest-learning] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -49,6 +51,8 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 /self-learning status 查看模式、已关联候选与容量；自动节奏跟随有效偏好，手动设置优先；/segment reset 清除手动设置并恢复跟随学习。
 /memory-candidates [页码] 查看候选；普通提炼模式用 /accept-memory ID 确认，自主模式按策略自动确认。
 /memory-decision 候选ID 查看学习决策、来源与目标版本，并核对实际保存状态。
+--interest-learning 从普通聊天观察用户明确表达的兴趣、经验与困难（同时开启记忆和认知），只保存可逐字核对的原话，并派生低优先级的后台学习目标；同一会话默认间隔 5 分钟（--interest-cooldown-ms 可调整），每批一次无工具请求。
+/interests 查看本会话记录的兴趣与学习目标；/forget-interest 兴趣ID 撤回兴趣并取消对应学习目标。
 明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
 --segmented 把模型回复按自然段分成至多 3 条消息，段间停顿至多 2.5 秒；命令确认整条发送。
 /segment 查看本会话分段；/segment on|off|reset、/segment parts 2至5、/segment pace 0至200（%）按会话保存，从下一条回复生效。
@@ -73,6 +77,8 @@ pub struct QqBotOptions {
     pub memory_learning: bool,
     pub self_learning: bool,
     pub learning_options: LearningOptions,
+    pub interest_learning: bool,
+    pub interest_options: ObservationOptions,
     pub segmented: bool,
     pub message_judge: MessageJudgeMode,
     pub web_listen: Option<std::net::SocketAddr>,
@@ -94,6 +100,8 @@ impl Default for QqBotOptions {
             memory_learning: false,
             self_learning: false,
             learning_options: LearningOptions::default(),
+            interest_learning: false,
+            interest_options: ObservationOptions::default(),
             segmented: false,
             message_judge: MessageJudgeMode::Off,
             web_listen: None,
@@ -135,6 +143,10 @@ impl QqBotOptions {
             }
             if arg == "--self-learning" {
                 options.self_learning = true;
+                continue;
+            }
+            if arg == "--interest-learning" {
+                options.interest_learning = true;
                 continue;
             }
             let value = args.next().ok_or("QQBot 参数缺少值")?;
@@ -179,6 +191,13 @@ impl QqBotOptions {
                         .filter(|v| *v <= 86_400_000)
                         .ok_or("提炼间隔必须为 0 至 86400000 的毫秒整数")?;
                 }
+                Some("--interest-cooldown-ms") => {
+                    options.interest_options.cooldown_ms = value
+                        .to_str()
+                        .and_then(|v| v.parse().ok())
+                        .filter(|v| *v <= 86_400_000)
+                        .ok_or("兴趣观察间隔必须为 0 至 86400000 的毫秒整数")?;
+                }
                 _ => return Err("未知 QQBot 参数；使用 --help".into()),
             }
         }
@@ -186,6 +205,10 @@ impl QqBotOptions {
             options.memory = true;
             options.memory_learning = true;
             options.segmented = true;
+        }
+        if options.interest_learning {
+            options.memory = true;
+            options.cognition = true;
         }
         if options.memory_learning && !options.memory {
             return Err("--memory-learning 需要同时开启 --memory".into());
@@ -234,15 +257,39 @@ pub async fn run_qqbot_with_components(
 
 /// 受信宿主替换自动确认策略；只有 --self-learning 启用时调用。
 pub async fn run_qqbot_with_learning_policy(
+    options: QqBotOptions,
+    factory: Arc<dyn EndogenousPlannerFactory>,
+    extractor: Option<Arc<dyn PreferenceExtractor>>,
+    confirmation: Option<Arc<dyn AutoConfirmationPolicy>>,
+) -> Result<QqBotStatus, AppError> {
+    run_qqbot_composed(options, factory, extractor, confirmation, None).await
+}
+
+/// 受信宿主替换兴趣观察器；只有 --interest-learning 启用时调用。观察仍受持久化准入、
+/// 超时、停止规则与原话逐字核对约束，目标派生不调用模型。
+pub async fn run_qqbot_with_interest_observer(
+    options: QqBotOptions,
+    factory: Arc<dyn EndogenousPlannerFactory>,
+    observer: Option<Arc<dyn InterestObserver>>,
+) -> Result<QqBotStatus, AppError> {
+    run_qqbot_composed(options, factory, None, None, observer).await
+}
+
+async fn run_qqbot_composed(
     mut options: QqBotOptions,
     factory: Arc<dyn EndogenousPlannerFactory>,
     extractor: Option<Arc<dyn PreferenceExtractor>>,
     confirmation: Option<Arc<dyn AutoConfirmationPolicy>>,
+    interest_observer: Option<Arc<dyn InterestObserver>>,
 ) -> Result<QqBotStatus, AppError> {
     if options.self_learning {
         options.memory = true;
         options.memory_learning = true;
         options.segmented = true;
+    }
+    if options.interest_learning {
+        options.memory = true;
+        options.cognition = true;
     }
     if options.memory_learning && !options.memory {
         return Err("--memory-learning 需要同时开启 --memory".into());
@@ -251,6 +298,7 @@ pub async fn run_qqbot_with_learning_policy(
         return Err("--memory-recall 需要同时开启 --memory".into());
     }
     options.learning_options.validate()?;
+    options.interest_options.validate()?;
     let panel_config = options
         .web_listen
         .map(|address| -> Result<_, AppError> {
@@ -306,6 +354,7 @@ pub async fn run_qqbot_with_learning_policy(
     });
     let mut background: Option<qq_cognition::Background> = None;
     let mut learning_background: Option<qq_learning::Background> = None;
+    let mut interest_background: Option<qq_interest::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
     let mut panel: Option<eve_web_panel::LocalPanel> = None;
     let page_permit = eve_web_panel_api::PageWritePermit::default();
@@ -348,6 +397,16 @@ pub async fn run_qqbot_with_learning_policy(
             kernel.register(Box::new(plugin))?;
             kernel.start(&PluginId::new(LEARNING_PLUGIN_ID)?).await?;
             Some(Arc::new(controller))
+        } else {
+            None
+        };
+        // 兴趣账本先于模型与通道加载；损坏或版本不兼容时拒绝启动并保留原字节。
+        let interests = if options.interest_learning {
+            let plugin = InterestPlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(INTEREST_PLUGIN_ID)?).await?;
+            Some(controller)
         } else {
             None
         };
@@ -425,6 +484,7 @@ pub async fn run_qqbot_with_learning_policy(
                 &options.agent_path,
                 options.cognition_max_executions,
                 factory,
+                options.interest_learning,
             )
             .await?;
             let commands = started.commands.clone();
@@ -432,6 +492,38 @@ pub async fn run_qqbot_with_learning_policy(
             commands
         } else {
             qq_cognition::Commands::disabled()
+        };
+        let interest_commands = if let Some(interests) = &interests {
+            let memory = memory.clone().ok_or("兴趣观察缺少记忆服务")?;
+            let cognition = Arc::new(background.as_ref().ok_or("兴趣观察缺少认知服务")?.admin()?);
+            let observer = match interest_observer {
+                Some(observer) => observer,
+                None => {
+                    let settings = registry
+                        .get(&ServiceId::new(CONFIG_SERVICE_ID)?)?
+                        .ok_or("兴趣观察配置服务缺失")?
+                        .value
+                        .downcast::<ConfigServiceHandle>()
+                        .map_err(|_| "兴趣观察配置服务类型错误")?;
+                    let key = std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "缺少模型凭据")?;
+                    Arc::new(ModelInterestObserver::new(Arc::new(
+                        crate::models::CoreModelResolver::new(settings.0.clone(), key),
+                    )))
+                }
+            };
+            let deriver = Arc::new(LearningGoalDeriver::new(cognition.clone(), "eve")?);
+            let dirty = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            interest_background = Some(qq_interest::Background::start(
+                memory,
+                Arc::new(interests.clone()),
+                observer,
+                deriver.clone(),
+                options.interest_options.clone(),
+                dirty.clone(),
+            )?);
+            qq_interest::Commands::enabled(Arc::new(interests.clone()), deriver, cognition, dirty)
+        } else {
+            qq_interest::Commands::disabled()
         };
         let memory_commands = memory
             .as_ref()
@@ -471,6 +563,7 @@ pub async fn run_qqbot_with_learning_policy(
             commands,
             memory_commands,
             learning_commands,
+            interest_commands,
             segment_commands,
         ])));
         if let Some(store) = segment_preferences {
@@ -578,12 +671,18 @@ pub async fn run_qqbot_with_learning_policy(
         if let Some(learning) = &learning_background {
             learning.activate();
         }
+        if let Some(interest) = &interest_background {
+            interest.activate();
+        }
         wait_channel(
             handle.status.clone(),
             background.as_ref().map(qq_cognition::Background::finished),
             learning_background
                 .as_ref()
                 .map(qq_learning::Background::finished),
+            interest_background
+                .as_ref()
+                .map(qq_interest::Background::finished),
             panel.as_ref().map(eve_web_panel::LocalPanel::finished),
         )
         .await
@@ -614,6 +713,15 @@ pub async fn run_qqbot_with_learning_policy(
     }
     if let Some(learning) = &learning_background {
         learning.request_stop();
+    }
+    if let Some(interest) = &interest_background {
+        interest.request_stop();
+    }
+    // 兴趣派生写认知状态；先结束兴趣后台，再停止认知插件。
+    if let Some(interest) = interest_background
+        && let Err(error) = interest.stop().await
+    {
+        secondary.push(error);
     }
     if let Some(background) = background
         && let Err(error) = background.stop().await
@@ -684,13 +792,21 @@ async fn wait_channel(
     mut status: watch::Receiver<QqBotStatus>,
     background: Option<watch::Receiver<bool>>,
     learning: Option<watch::Receiver<bool>>,
+    interest: Option<watch::Receiver<bool>>,
     panel: Option<watch::Receiver<bool>>,
 ) -> Result<(), AppError> {
     let stop = interrupted();
     let stopped_background = background_finished(background);
     let stopped_learning = background_finished(learning);
+    let stopped_interest = background_finished(interest);
     let stopped_panel = background_finished(panel);
-    tokio::pin!(stop, stopped_background, stopped_learning, stopped_panel);
+    tokio::pin!(
+        stop,
+        stopped_background,
+        stopped_learning,
+        stopped_interest,
+        stopped_panel
+    );
     let mut ready_announced = false;
     loop {
         if status.borrow().ready && !status.borrow().closed && !ready_announced {
@@ -704,6 +820,7 @@ async fn wait_channel(
             biased;
             _ = &mut stopped_background => return Err("认知后台已结束；QQ 通道停止准入并保留状态".into()),
             _ = &mut stopped_learning => return Err("偏好提炼后台已结束；QQ 通道停止准入并保留状态".into()),
+            _ = &mut stopped_interest => return Err("兴趣观察后台已结束；QQ 通道停止准入并保留状态".into()),
             _ = &mut stopped_panel => return Err("本机面板异常结束；QQ 通道停止准入并保留状态".into()),
             result = &mut stop => return result,
             result = status.changed() => result.map_err(|_| "QQBot 状态通知丢失")?,
@@ -739,6 +856,23 @@ mod recall_options_tests {
             assert!(options.memory && options.memory_recall);
         }
         assert!(parse(&["--memory-recall", "true"]).is_err());
+    }
+
+    #[test]
+    fn interest_learning_is_explicit_and_composes_memory_and_cognition() {
+        let default = parse(&[]).unwrap();
+        assert!(!default.interest_learning);
+        assert_eq!(default.interest_options, ObservationOptions::default());
+        for args in [vec!["--self-learning"], vec!["--memory", "--cognition"]] {
+            assert!(!parse(&args).unwrap().interest_learning);
+        }
+        let options = parse(&["--interest-learning", "--interest-cooldown-ms", "0"]).unwrap();
+        assert!(options.interest_learning && options.memory && options.cognition);
+        assert!(!options.memory_learning && !options.self_learning);
+        assert_eq!(options.interest_options.cooldown_ms, 0);
+        for invalid in ["-1", "86400001", "soon"] {
+            assert!(parse(&["--interest-cooldown-ms", invalid]).is_err());
+        }
     }
 
     #[tokio::test]

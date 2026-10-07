@@ -1,0 +1,11 @@
+[package]
+name = "eve-interest-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-memory-api = { path = "../memory-api" }
+serde.workspace = true
+serde_json.workspace = true

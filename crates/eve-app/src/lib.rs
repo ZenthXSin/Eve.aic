@@ -13,6 +13,7 @@ mod memory_cli_view;
 mod message_evaluation;
 mod models;
 mod qq_cognition;
+mod qq_interest;
 mod qq_learning;
 mod qq_learning_commands;
 mod qq_memory;
@@ -45,7 +46,8 @@ pub use message_evaluation::{
 };
 pub use qq_message_judge::MessageJudgeMode;
 pub use qqbot::{
-    QQBOT_HELP, QqBotOptions, run_qqbot, run_qqbot_with_components, run_qqbot_with_learning_policy,
+    QQBOT_HELP, QqBotOptions, run_qqbot, run_qqbot_with_components,
+    run_qqbot_with_interest_observer, run_qqbot_with_learning_policy,
     run_qqbot_with_planner_factory,
 };
 

@@ -9,6 +9,8 @@ members = [
     "crates/web-panel",
     "crates/learning-api",
     "crates/learning-plugin",
+    "crates/interest-api",
+    "crates/interest-plugin",
     "crates/plugin-api",
     "crates/cognition-api",
     "crates/cognition-plugin",
