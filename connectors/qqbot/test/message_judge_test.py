@@ -8,11 +8,14 @@ import os
 import pathlib
 import signal
 import subprocess
+import queue
 import tempfile
 import threading
 import time
 import traceback
 import unittest
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import eve_e2e as support
@@ -25,6 +28,7 @@ SIDE_EFFECTS = support.SIDE_EFFECTS
 BRIDGE = ROOT / "connectors/qqbot/test/message-judge-bridge.mjs"
 CLARIFY = "请明确这条消息是补充、纠正、澄清答复还是新任务。"
 UNCHANGED = "当前任务保持不变。"
+PANEL_TOKEN = "synthetic-judge-panel-token-1234567890abcdef"
 LABELS = ("supplement", "correction", "answer", "new_task", "cancel", "continue",
           "unrelated", "ambiguous", "pause", "resume")
 
@@ -175,7 +179,8 @@ class MessageJudgeAcceptance(unittest.TestCase):
     def wait_receipt(self, id, state="Sent"):
         return {"wait_receipt": {"path": str(self.work / "state/state.json"), "id": id, "state": state}}
 
-    def run_eve(self, script, mode="jev", timeout_ms=2000, terminate_at=None, environment=None, success=True):
+    def run_eve(self, script, mode="jev", timeout_ms=2000, terminate_at=None, environment=None, success=True,
+                inspect=None):
         self.runs += 1
         events = self.work / f"events-{self.runs}.jsonl"
         error = self.work / f"error-{self.runs}.txt"
@@ -202,15 +207,21 @@ class MessageJudgeAcceptance(unittest.TestCase):
                    "--bridge-script", str(BRIDGE), "--bridge-arg", str(scenario)]
         if mode is not None:
             command.extend(["--message-judge", mode])
+        if inspect:
+            env["EVE_WEB_TOKEN"] = PANEL_TOKEN
+            command.extend(["--web-listen", "127.0.0.1:0"])
         child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            if terminate_at:
+            if inspect:
+                stdout, stderr = self.inspect_panel(child, inspect)
+            elif terminate_at:
                 deadline = time.monotonic() + 12
                 while not terminate_at.exists() and child.poll() is None and time.monotonic() < deadline:
                     time.sleep(0.01)
                 self.assertTrue(terminate_at.exists(), "owned process did not reach stop synchronization")
                 child.send_signal(signal.SIGTERM)
-            stdout, stderr = child.communicate(timeout=25)
+            if not inspect:
+                stdout, stderr = child.communicate(timeout=25)
         finally:
             if child.poll() is None:
                 child.kill()
@@ -218,7 +229,7 @@ class MessageJudgeAcceptance(unittest.TestCase):
         self.bridge_events = ([json.loads(line) for line in events.read_text().splitlines()] if events.exists() else [])
         self.assertFalse(error.exists(), error.read_text() if error.exists() else "")
         self.assertFalse(self.errors, "\n".join(self.errors))
-        for secret in ("test-app-secret", "test-model-secret", "test-jev-secret"):
+        for secret in ("test-app-secret", "test-model-secret", "test-jev-secret", PANEL_TOKEN):
             self.assertNotIn(secret, stdout + stderr)
         if not success:
             self.assertNotEqual(child.returncode, 0)
@@ -228,6 +239,37 @@ class MessageJudgeAcceptance(unittest.TestCase):
         self.assertTrue(summary["closed"])
         self.assertFalse(summary["terminal_error"])
         return summary
+
+    def inspect_panel(self, child, inspect):
+        """读完两条输出管道，面板就绪后在进程运行期间调用 inspect(url)。"""
+        output = {"stdout": [], "stderr": []}
+        ready = queue.Queue()
+
+        def drain(name, stream):
+            for line in stream:
+                output[name].append(line)
+                if name == "stderr" and line.startswith("EVE_WEB_READY "):
+                    ready.put(line.split(None, 1)[1].strip())
+        readers = [threading.Thread(target=drain, args=(name, getattr(child, name)), daemon=True)
+                   for name in output]
+        for reader in readers:
+            reader.start()
+        try:
+            inspect(ready.get(timeout=12))
+        finally:
+            child.wait(timeout=25)
+            for reader in readers:
+                reader.join(timeout=5)
+        return "".join(output["stdout"]), "".join(output["stderr"])
+
+    def panel(self, url, path):
+        request = urllib.request.Request(url + path, headers={"Authorization": "Bearer " + PANEL_TOKEN})
+        try:
+            response = urllib.request.urlopen(request, timeout=6)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            return response.status, json.loads(response.read())
 
     def counts(self):
         return tuple(len(self.calls[kind]) for kind in ("task", "primary", "jev"))
@@ -386,6 +428,55 @@ class MessageJudgeAcceptance(unittest.TestCase):
                       self.wait_receipt("fresh")])
         self.assertEqual(self.counts(), (2, 0, 1))
         self.assertEqual(self.replies(), [("fresh", "新任务")])
+
+    def test_web_panel_lists_live_judgments_without_text_or_identifiers(self):
+        self.steps[("task", 1)] = {"wait": "release-base"}
+        self.steps[("jev", 1)] = {"intent": "continue"}
+        self.steps[("jev", 2)] = {"intent": "continue", "confidence": 0.4}
+        self.steps[("primary", 1)] = {"intent": "continue"}
+        seen = {}
+
+        def inspect(url):
+            deadline = time.monotonic() + 12
+            while True:
+                code, log = self.panel(url, "/api/judgments?limit=2")
+                if code == 200 and log["recorded_total"] >= 3:
+                    break
+                self.assertLess(time.monotonic(), deadline, "judgments did not reach the panel")
+                time.sleep(0.02)
+            _, older = self.panel(url, f"/api/judgments?limit=2&before={log['next_before']}")
+            seen.update(log=log, older=older, bad=self.panel(url, "/api/judgments?limit=51"))
+            self.gate("inspected").touch()
+
+        self.run_eve([
+            {"send": self.message("base", "原始任务")}, self.wait_request("task"),
+            {"send": self.message("keep", "/continue", UNCHANGED)}, self.wait_command("keep"),
+            {"send": self.message("jev-keep", "先按原计划继续-私密正文", UNCHANGED)}, self.wait_command("jev-keep"),
+            {"send": self.message("fallback", "照旧就行-私密正文", UNCHANGED)}, self.wait_command("fallback"),
+            {"wait_file": str(self.gate("inspected"))}, self.open_gate("release-base"),
+            self.wait_receipt("base")], inspect=inspect)
+        self.assertEqual(self.counts(), (1, 1, 2))
+        log, older = seen["log"], seen["older"]
+        self.assertEqual(seen["bad"], (400, {"error": "invalid_query"}))
+        self.assertEqual((log["mode"], log["capacity"], log["recorded_total"], log["evicted"]), ("jev", 128, 3, 0))
+        items = log["items"] + older["items"]
+        self.assertEqual([item["sequence"] for item in items], [3, 2, 1])
+        self.assertIsNone(older["next_before"])
+        for item in items:
+            self.assertEqual((item["result"], item["failure"], item["intents"], item["coverage"]),
+                             ("decided", None, ["continue"], "complete"))
+            self.assertTrue(all(step["outcome"] == "completed" for step in item["steps"]))
+        counts = [tuple(item["counts"][name] for name in ("rules", "auxiliary", "primary", "classifier_calls",
+                                                           "model_provider_calls", "fallbacks")) for item in items]
+        self.assertEqual(counts, [(1, 1, 1, 1, 1, 1), (1, 1, 0, 1, 0, 0), (1, 0, 0, 0, 0, 0)])
+        self.assertEqual([item["fallbacks"] for item in items], [["low_confidence"], [], []])
+        self.assertEqual([(step["kind"], step["name"]) for step in items[0]["steps"]],
+                         [("stage", "rules"), ("stage", "auxiliary"), ("attempt", "classifier_call"),
+                          ("stage", "primary"), ("attempt", "model_provider_call")])
+        # 面板只给出枚举、计数和本机时间；正文、会话、用户与消息标识留在宿主内。
+        exposed = json.dumps(seen, ensure_ascii=False)
+        for private in ("私密正文", "原始任务", "user-1", "jev-keep", "fallback\"", "离线替身"):
+            self.assertNotIn(private, exposed)
 
     def test_jev_key_is_required_independently_of_primary_key(self):
         self.run_eve([], environment={"EVE_JEV_API_KEY": None}, success=False)

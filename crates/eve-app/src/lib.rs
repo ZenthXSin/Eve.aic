@@ -23,6 +23,9 @@ mod segment_commands;
 mod services;
 mod storage;
 mod web_panel;
+mod web_panel_cognition;
+mod web_panel_learning;
+mod web_panel_memory;
 
 #[cfg(test)]
 #[path = "../../llm-openai/tests/support/mod.rs"]

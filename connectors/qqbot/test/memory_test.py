@@ -13,6 +13,8 @@ import threading
 import time
 import traceback
 import unittest
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -25,6 +27,7 @@ HELP = "用法：/remember 偏好内容、/memories [页码]、/recall 关键词
 MEMORY_KIND = "eve-confirmed-preferences-v1"
 PREFERENCE = "PRIVATE_MEMORY_MARKER：回答请先给简短结论。"
 CORRECTION = "CORRECTED_MEMORY_MARKER：先给必要证据，再给结论。"
+PANEL_TOKEN = "synthetic-memory-panel-token-12345678901234567"
 ARTIFACT = {"summary": "LOCAL_REFLECTION_MARKER：待办仍需用户确认。",
             "next_step": "请求用户明确执行范围。", "needs_user_input": True}
 
@@ -166,8 +169,31 @@ class MemoryAcceptance(unittest.TestCase):
         return [{"send": {**self.message(id, text, **route), "expected_type": "finish"}},
                 {"wait_command": {"id": id, "type": "finish"}}]
 
+    def panel(self, path, body=None, token=PANEL_TOKEN, method=None):
+        """Call the owned Eve panel announced on this run's stderr file."""
+        deadline = time.monotonic() + 10
+        url = None
+        while url is None:
+            self.assertLess(time.monotonic(), deadline, "panel did not announce readiness")
+            for line in self.panel_stderr.read_text().splitlines():
+                if line.startswith("EVE_WEB_READY "):
+                    url = line.split(None, 1)[1].strip()
+            time.sleep(0.01)
+        data = None if body is None else json.dumps(body).encode()
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        request = urllib.request.Request(url + path, data=data, headers=headers, method=method)
+        try:
+            response = urllib.request.urlopen(request, timeout=6)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            raw = response.read()
+            return response.status, json.loads(raw) if raw else None
+
     def run_eve(self, script, memory=True, cognition=False, training=False, app="1904159860",
-                checkpoints=None, send_fail=False, cancel_at=None, success=True):
+                checkpoints=None, send_fail=False, cancel_at=None, success=True, panel=False):
         self.runs += 1
         self.run_release = threading.Event()
         events_path = self.work / f"events-{self.runs}.jsonl"
@@ -189,6 +215,10 @@ class MemoryAcceptance(unittest.TestCase):
             command.extend(["--cognition", "--cognition-max-executions", "1"])
         if training:
             command.append("--training")
+        self.panel_stderr = self.work / f"stderr-{self.runs}.txt"
+        if panel:
+            env["EVE_WEB_TOKEN"] = PANEL_TOKEN
+            command.extend(["--web-listen", "127.0.0.1:0"])
 
         def inspect():
             for name, callback in (checkpoints or {}).items():
@@ -201,7 +231,9 @@ class MemoryAcceptance(unittest.TestCase):
                     self.gate(name + "-continue").touch()
 
         inspector = threading.Thread(target=inspect, daemon=True)
-        child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        sink = open(self.panel_stderr, "w")
+        child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+                                 stderr=sink if panel else subprocess.PIPE, text=True)
         inspector.start()
         try:
             if cancel_at:
@@ -216,6 +248,9 @@ class MemoryAcceptance(unittest.TestCase):
                 child.communicate()
             self.run_release.set()
             inspector.join(timeout=2)
+            sink.close()
+        if panel:
+            stderr = self.panel_stderr.read_text()
         self.events = [json.loads(line) for line in events_path.read_text().splitlines()] if events_path.exists() else []
         self.assertFalse(inspector.is_alive(), "snapshot inspector did not stop")
         self.assertFalse(error_path.exists(), error_path.read_text() if error_path.exists() else "")
@@ -313,6 +348,70 @@ class MemoryAcceptance(unittest.TestCase):
                          [PREFERENCE, CORRECTION, CORRECTION])
         self.assertEqual(len(self.interactions()), 3)
         self.assertEqual(len(self.evidence()), 6)
+
+    def test_web_panel_reads_preferences_history_and_sources_without_writing(self):
+        id = self.remember()
+        self.run_eve(self.send(self.message("chat-first", "第一轮正常对话")))
+        seen = {}
+
+        def inspect():
+            before = self.memory()
+            seen["unauthorized"] = self.panel("/api/memory/scopes", {}, token=None)[0]
+            seen["get"] = self.panel("/api/memory/scopes", method="GET")[0]
+            seen["scopes"] = self.panel("/api/memory/scopes", {})
+            scope = seen["scopes"][1]["items"][0]["scope"]
+            seen["detail"] = self.panel("/api/memory/scope", {"scope": scope})
+            history = seen["detail"][1]["preferences"][0]["history"]
+            seen["first_source"] = self.panel("/api/memory/evidence",
+                                              {"scope": scope, "id": history[-1]["evidence_id"]})
+            chat = next(item["id"] for item in self.interactions())
+            seen["chat_source"] = self.panel("/api/memory/evidence", {"scope": scope, "id": chat})
+            seen["unknown_scope"] = self.panel("/api/memory/scope", {"scope": {**scope, "user_id": "nobody"}})[0]
+            seen["unknown_source"] = self.panel("/api/memory/evidence", {"scope": scope, "id": "missing"})[0]
+            seen["invalid"] = self.panel("/api/memory/scope", {"scope": {**scope, "session_id": ""}})[0]
+            seen["learning"] = self.panel("/api/memory/learning", {"scope": scope})
+            seen["unchanged"] = before == self.memory()
+
+        self.run_eve([*self.send(self.message("correct", f"/correct-memory {id} {CORRECTION}", contains="偏好已修正：")),
+                      *self.send(self.message("forget", "/forget " + id, contains="偏好已撤销：")),
+                      *self.checkpoint("panel")], panel=True, checkpoints={"panel": inspect})
+        self.assertEqual((seen["unauthorized"], seen["get"]), (401, 405))
+        status, page = seen["scopes"]
+        self.assertEqual(status, 200)
+        self.assertEqual(len(page["items"]), 1)
+        summary = page["items"][0]
+        self.assertEqual((summary["confirmed"], summary["revoked"]), (0, 1))
+        self.assertEqual(summary["evidence"], len(self.evidence()))
+        self.assertRegex(summary["scope"]["user_id"], r"^qq:[0-9a-f]{64}$")
+        status, detail = seen["detail"]
+        self.assertEqual(status, 200)
+        preference = detail["preferences"][0]
+        self.assertEqual((preference["id"], preference["status"], preference["effective"], preference["text"]),
+                         (id, "revoked", False, CORRECTION))
+        self.assertEqual([(v["revision"], v["status"], v["current"], v["text"], v["evidence_kind"])
+                          for v in preference["history"]],
+                         [(3, "revoked", True, CORRECTION, "user_statement"),
+                          (2, "confirmed", False, CORRECTION, "user_statement"),
+                          (1, "confirmed", False, PREFERENCE, "user_statement")])
+        status, first = seen["first_source"]
+        self.assertEqual(status, 200)
+        self.assertEqual((first["kind"], first["user_text"], first["assistant_text"]),
+                         ("user_statement", "/remember " + PREFERENCE, None))
+        self.assertEqual([(r["preference_id"], r["revision"], r["current"], r["effective"]) for r in first["references"]],
+                         [(id, 1, False, False)])
+        status, chat = seen["chat_source"]
+        self.assertEqual(status, 200)
+        self.assertEqual((chat["kind"], chat["user_text"], chat["references"]),
+                         ("completed_interaction", "第一轮正常对话", []))
+        self.assertIn("第一轮正常对话", chat["assistant_text"])
+        self.assertEqual((seen["unknown_scope"], seen["unknown_source"], seen["invalid"]), (404, 404, 400))
+        self.assertEqual(seen["learning"], (503, {"error": "unavailable"}), "learning view needs --memory-learning")
+        self.assertTrue(seen["unchanged"], "panel reads must not write memory")
+        rendered = json.dumps([seen["scopes"], seen["detail"], seen["first_source"], seen["chat_source"]],
+                              ensure_ascii=False)
+        for raw in ["user-1", "chat-first", "\"remember\""]:
+            self.assertNotIn(raw, rendered)
+        self.assertEqual(len(self.requests), 1)
 
     def test_private_user_group_and_application_boundaries(self):
         id = self.remember(scope="group")

@@ -45,6 +45,7 @@ class LearningAcceptance(unittest.TestCase):
     send = memory_test.MemoryAcceptance.send
     duplicate = memory_test.MemoryAcceptance.duplicate
     preference_data = memory_test.MemoryAcceptance.preference_data
+    panel = memory_test.MemoryAcceptance.panel
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -173,7 +174,8 @@ class LearningAcceptance(unittest.TestCase):
         self.assertFalse(self.run_release.wait(0.65), "process stopped during observation")
 
     def run_eve(self, script, learning=True, memory=True, cognition=False, training=False,
-                app="1904159860", checkpoints=None, stop_at=None, abrupt=False, segmented=False, self_learning=False, cooldown_ms=None):
+                app="1904159860", checkpoints=None, stop_at=None, abrupt=False, segmented=False, self_learning=False, cooldown_ms=None,
+                panel=False):
         self.runs += 1
         self.run_release = threading.Event()
         events_path = self.work / f"events-{self.runs}.jsonl"
@@ -203,6 +205,10 @@ class LearningAcceptance(unittest.TestCase):
             command.extend(["--cognition", "--cognition-max-executions", "1"])
         if training:
             command.append("--training")
+        self.panel_stderr = self.work / f"stderr-{self.runs}.txt"
+        if panel:
+            env["EVE_WEB_TOKEN"] = memory_test.PANEL_TOKEN
+            command.extend(["--web-listen", "127.0.0.1:0"])
 
         def inspect():
             for name, callback in (checkpoints or {}).items():
@@ -215,7 +221,9 @@ class LearningAcceptance(unittest.TestCase):
                     self.gate(name + "-continue").touch()
 
         inspector = threading.Thread(target=inspect, daemon=True)
-        child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        sink = open(self.panel_stderr, "w")
+        child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+                                 stderr=sink if panel else subprocess.PIPE, text=True)
         inspector.start()
         try:
             if stop_at is not None:
@@ -232,6 +240,9 @@ class LearningAcceptance(unittest.TestCase):
                 child.communicate()
             self.run_release.set()
             inspector.join(timeout=2)
+            sink.close()
+        if panel:
+            stderr = self.panel_stderr.read_text()
         self.events = ([json.loads(line) for line in events_path.read_text().splitlines()]
                        if events_path.exists() else [])
         self.assertFalse(inspector.is_alive(), "state inspector did not stop")
@@ -365,6 +376,53 @@ class LearningAcceptance(unittest.TestCase):
         self.assertEqual(revoked["status"], "Revoked")
         self.inspect_run(self.quiet, self_learning=True)
         self.assertEqual(self.preferences()[0], revoked, "restart must not revive or overwrite a revoked candidate")
+        self.assertEqual(len(self.learning_requests()), 1)
+
+    def test_web_panel_reads_candidates_decisions_and_saved_state_without_writing(self):
+        self.seed()
+        seen = {}
+
+        def read(name):
+            state = lambda: (self.memory(), self.documents().get("eve.learning"))
+            before = state()
+            scope = self.panel("/api/memory/scopes", {})[1]["items"][0]["scope"]
+            seen[name] = self.panel("/api/memory/learning", {"scope": scope})
+            seen[name + "_detail"] = self.panel("/api/memory/scope", {"scope": scope})
+            seen[name + "_unchanged"] = before == state()
+
+        def manual():
+            self.wait_jobs(1)
+            read("manual")
+
+        def automatic():
+            self.wait_until(lambda: len(self.preferences()) == 1, "candidate was not automatically confirmed")
+            read("auto")
+
+        self.inspect_run(manual, panel=True)
+        self.inspect_run(automatic, self_learning=True, panel=True)
+        candidate = self.jobs()[0]["candidates"][0]
+        status, manual_view = seen["manual"]
+        self.assertEqual(status, 200)
+        self.assertFalse(manual_view["autonomous"])
+        self.assertEqual([(job["status"], job["candidates"]) for job in manual_view["jobs"]], [("completed", 1)])
+        pending = manual_view["candidates"][0]
+        self.assertEqual((pending["id"], pending["text"], pending["confidence"]), (candidate["id"], CANDIDATE, 83))
+        self.assertEqual((pending["saved"], pending["expired"], pending["decisions"]), (None, False, []))
+        self.assertEqual(seen["manual_detail"][1]["preferences"], [])
+        status, auto_view = seen["auto"]
+        self.assertEqual(status, 200)
+        self.assertTrue(auto_view["autonomous"])
+        saved = auto_view["candidates"][0]
+        self.assertEqual(saved["saved"], {"preference_id": "learned-" + candidate["id"], "revision": 1,
+                                          "status": "confirmed", "effective": True})
+        self.assertEqual([(d["action"], d["reason"]) for d in saved["decisions"]], [("confirm", "eligible")])
+        self.assertEqual(saved["decisions_total"], 1)
+        preference = seen["auto_detail"][1]["preferences"][0]
+        self.assertEqual((preference["id"], preference["effective"]), ("learned-" + candidate["id"], True))
+        self.assertEqual(preference["history"][0]["evidence_kind"], "completed_interaction")
+        self.assertTrue(seen["manual_unchanged"] and seen["auto_unchanged"], "panel reads must not write state")
+        rendered = json.dumps([seen["manual"], seen["auto"]], ensure_ascii=False)
+        self.assertNotIn("user-1", rendered)
         self.assertEqual(len(self.learning_requests()), 1)
 
     def test_autonomous_pending_completed_batch_is_reconciled_without_another_model_request(self):

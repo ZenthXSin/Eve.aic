@@ -467,6 +467,7 @@ pub async fn run_qqbot_with_learning_policy(
         if let Some(store) = segment_preferences {
             plugin = plugin.with_segment_preferences(store, QQ_SEGMENT_POLICY)?;
         }
+        let panel_memory = memory.clone();
         if let Some(memory) = memory {
             let sessions = registry
                 .get(&ServiceId::new(SESSION_SERVICE_ID)?)?
@@ -485,10 +486,25 @@ pub async fn run_qqbot_with_learning_policy(
             .value
             .downcast::<ConfigServiceHandle>()
             .map_err(|_| "消息判断配置服务类型错误")?;
-        kernel.register(Box::new(crate::qq_message_judge::relation_plugin(
-            options.message_judge,
-            settings.0.clone(),
-        )?))?;
+        let relation =
+            crate::qq_message_judge::relation_plugin(options.message_judge, settings.0.clone())?;
+        // 只有开启本机面板时才记录实时判断；记录只在内存中，重启后清空。
+        let judgments = panel_config
+            .as_ref()
+            .map(|_| Arc::new(eve_message_diagnostics::RecentRelationJudgments::default()));
+        let relation = match &judgments {
+            Some(recent) => {
+                let recent = recent.clone();
+                relation.with_judge_decorator(Arc::new(move |judge| {
+                    Arc::new(eve_message_diagnostics::RecordingRelationJudge::new(
+                        judge,
+                        recent.clone(),
+                    ))
+                }))
+            }
+            None => relation,
+        };
+        kernel.register(Box::new(relation))?;
         kernel.register(Box::new(MessageRouterPlugin::builtin()?))?;
         kernel.register(Box::new(plugin))?;
         kernel.start(&PluginId::new(QQBOT_PLUGIN_ID)?).await?;
@@ -518,6 +534,17 @@ pub async fn run_qqbot_with_learning_policy(
                     control,
                     channel: handle.clone(),
                     started_at_unix_ms,
+                    judgments: judgments
+                        .clone()
+                        .map(|recent| (recent, options.message_judge.name())),
+                    cognition: background
+                        .as_ref()
+                        .map(qq_cognition::Background::reader)
+                        .transpose()?,
+                    memory: panel_memory.map(crate::web_panel_memory::MemoryView::new),
+                    learning: learning.clone().map(|admin| {
+                        crate::web_panel_learning::LearningRead::new(admin, options.self_learning)
+                    }),
                 }),
             )
             .await?;

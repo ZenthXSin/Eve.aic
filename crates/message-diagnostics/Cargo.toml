@@ -10,6 +10,7 @@ eve-message-api = { path = "../message-api" }
 serde.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 eve-control-api = { path = "../control-api" }
 eve-session-api = { path = "../session-api" }
 tokio.workspace = true

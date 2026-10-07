@@ -10,6 +10,12 @@ use std::{
     time::Instant,
 };
 
+mod recent;
+pub use recent::{
+    JudgmentResult, MAX_RECENT_JUDGMENTS, RecentJudgmentPage, RecentRelationJudgments,
+    RecordingRelationJudge, RelationJudgmentRecord,
+};
+
 pub const MAX_OBSERVATIONS: usize = 64;
 
 /// 在实际动作开始时创建；取消或 panic 丢弃 Future 时仍产生一次 Dropped。

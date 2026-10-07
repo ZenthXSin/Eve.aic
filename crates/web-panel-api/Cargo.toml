@@ -7,5 +7,6 @@ license.workspace = true
 
 [dependencies]
 eve-control-api = { path = "../control-api" }
+eve-memory-api = { path = "../memory-api" }
 eve-session-api = { path = "../session-api" }
 serde.workspace = true

@@ -31,6 +31,15 @@ pub enum MessageJudgeMode {
     Primary,
     Jev,
 }
+impl MessageJudgeMode {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Primary => "primary",
+            Self::Jev => "jev",
+        }
+    }
+}
 
 pub(crate) fn provider_schema() -> ConfigSchema {
     let mut base_url = ConfigField::new(ConfigKind::String, Some(json!(eve_jev::DEFAULT_BASE_URL)));

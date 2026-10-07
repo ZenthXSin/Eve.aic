@@ -555,6 +555,7 @@ dependencies = [
  "eve-message-api",
  "eve-session-api",
  "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -712,6 +713,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "eve-control-api",
+ "eve-memory-api",
  "eve-session-api",
  "eve-web-panel-api",
  "reqwest",
@@ -726,6 +728,7 @@ name = "eve-web-panel-api"
 version = "0.1.0"
 dependencies = [
  "eve-control-api",
+ "eve-memory-api",
  "eve-session-api",
  "serde",
 ]

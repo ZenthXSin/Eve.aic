@@ -43,8 +43,9 @@ for (let i = 0; i < 26; i++) {
   script.push({ send: message(`history-${i}`, text) }, { wait_receipt: { path: path.join(work, "state/state.json"), id: `history-${i}`, state: "Sent" } });
 }
 script.push({ send: message("active", "等待面板取消的任务", { expected_type: "finish" }) },
-  { wait_file: path.join(work, "model-wait") }, { wait_command: { id: "active", type: "finish" } },
-  { wait_file: path.join(work, "end") });
+  { wait_file: path.join(work, "model-wait") },
+  { send: message("keep", "/continue", { expected: "当前任务保持不变。" }) }, { wait_command: { id: "keep", type: "reply" } },
+  { wait_command: { id: "active", type: "finish" } }, { wait_file: path.join(work, "end") });
 const scenario = path.join(work, "scenario.json");
 const bridgeError = path.join(work, "bridge-error");
 fs.writeFileSync(scenario, JSON.stringify({ script, error_file: bridgeError }));
@@ -113,13 +114,33 @@ try {
   await page.waitForFunction(() => document.querySelector("#session-detail").textContent.includes("合成测试记录 1"));
   await page.getByRole("button", { name: "回到最新" }).click();
   await page.getByRole("button", { name: "更早轮次" }).waitFor();
+  await page.locator('[data-view="judgments"]').click();
+  await page.locator("#judgments-list .record-button").first().waitFor();
+  assert.equal(await page.locator("#judgments-list .record-button").count(), 1);
+  assert.ok((await page.locator("#judgments-scope").textContent()).includes("仅明确命令规则"));
+  await page.locator("#judgments-list .record-button").first().click();
+  await page.waitForFunction(() => document.querySelector("#judgment-detail").textContent.includes("明确命令规则"));
+  const judgment = await page.locator("#judgment-detail").textContent();
+  for (const expected of ["继续", "规则 1 · 辅助 0 · 主模型 0", "不代表网络请求"]) assert.ok(judgment.includes(expected), expected);
+  for (const hidden of ["/continue", "synthetic-user", "keep"]) assert.equal(judgment.includes(hidden), false, hidden);
+  await page.screenshot({ path: path.join(artifacts, "judgments.png"), fullPage: true });
+  await page.locator('[data-view="goals"]').click();
+  await page.waitForFunction(() => document.querySelector("#goals-error").textContent.includes("未开启认知"));
+  assert.equal(await page.locator("#goals-list .record-button").count(), 0);
+  await page.locator('[data-view="memory"]').click();
+  await page.waitForFunction(() => document.querySelector("#memory-error").textContent.includes("未开启交互记忆"));
+  assert.equal(await page.locator("#memory-list .record-button").count(), 0);
+  await page.locator('[data-view="judgments"]').click();
   await page.setViewportSize({ width: 390, height: 844 });
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), "mobile judgments overflow horizontally");
+  await page.screenshot({ path: path.join(artifacts, "mobile-judgments.png"), fullPage: true });
   await page.locator('[data-view="tasks"]').click();
   await page.screenshot({ path: path.join(artifacts, "mobile.png"), fullPage: true });
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), "mobile layout overflows horizontally");
   await page.locator("#logout-button").click();
   await page.locator("#login-view").waitFor({ state: "visible" });
   assert.equal(await page.locator("#tasks-list").textContent(), "");
+  assert.equal(await page.locator("#judgments-list").textContent(), "");
   await page.reload();
   await page.locator("#login-view").waitFor({ state: "visible" });
   assert.deepEqual(errors, []);
@@ -132,7 +153,7 @@ try {
   assert.equal(requests, 27);
   for (const secret of [token, "test-model-secret", "test-app-secret"]) assert.equal((stdout + stderr).includes(secret), false);
   console.log(JSON.stringify({ passed: true, model_requests: requests, browser_errors: errors.length,
-    checks: ["login", "memory-only-token", "task-cancel-confirmation", "history-pagination", "truncation", "xss-text", "mobile-layout", "logout", "reload"], artifacts }));
+    checks: ["login", "memory-only-token", "task-cancel-confirmation", "history-pagination", "truncation", "xss-text", "judgment-diagnostics", "goals-unavailable", "memory-unavailable", "mobile-layout", "logout", "reload"], artifacts }));
 } finally {
   if (browser) await browser.close();
   if (child.exitCode === null) { child.kill("SIGKILL"); await exited; }

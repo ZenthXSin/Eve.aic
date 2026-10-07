@@ -27,7 +27,60 @@
   let cancelConfirm = null;
   let cancelPending = null;
   let cancelFeedback = null;
+  let judgments = [];
+  let judgmentMeta = null;
+  let judgmentBefore = null;
+  let judgmentPages = 1;
+  let judgmentLoading = false;
+  let selectedJudgment = null;
+  let goals = [];
+  let goalMeta = null;
+  let goalCursor = null;
+  let goalPages = 1;
+  let goalLoading = false;
+  let selectedGoal = null;
+  let goalRequest = 0;
+  let memoryScopes = [];
+  let memoryAfter = null;
+  let memoryLoading = false;
+  let selectedMemory = null;
+  let memoryRequest = 0;
+  let evidenceRequest = 0;
   const controllers = new Set();
+  const judgmentLabels = {
+    result: { decided: "已判定", failed: "判断失败", dropped: "已丢弃" },
+    outcome: { completed: "完成", unavailable: "不可用", protocol: "格式无效", timeout: "超时", panicked: "内部异常", dropped: "被丢弃" },
+    intent: { supplement: "补充", correction: "纠正", answer: "回答", new_task: "新任务", cancel: "取消", continue: "继续", unrelated: "无关", ambiguous: "含混", pause: "暂停", resume: "恢复" },
+    coverage: { complete: "完整", unsupported: "判断器不支持观察", overflow: "事件超出上限", invalid: "事件不完整", unreported: "未报告" },
+    step: { rules: "明确命令规则", auxiliary: "辅助判断", primary: "主模型判断", classifier_call: "分类器调用", model_provider_call: "模型 Provider 调用" },
+    fallback: { unavailable: "不可用", protocol: "格式无效", timeout: "超时", panicked: "内部异常", invalid_decision: "决定无效", ambiguous: "含混", low_confidence: "置信度低" },
+    mode: { off: "仅明确命令规则", primary: "主模型自然判断", jev: "Jev 自然判断" },
+  };
+  const goalLabels = {
+    status: { ready: "待执行", waiting: "等待中", executing: "执行中", completed: "执行记录已验证", cancelled: "已取消", blocked: "需要处理" },
+    source: { user: "用户", environment: "环境观察", tool: "工具", inference: "推断", internal: "内部" },
+    visibility: { public: "公开", user: "仅该用户", internal: "内部" },
+    block: { interrupted: "执行中断", unknown_commit: "提交状态未知", feedback_save_failed: "反馈保存失败", invalidated: "输入已变化而失效" },
+    commit: { not_started: "尚未开始提交", completed: "成功结果已保存", failed: "失败记录已保存", pending: "提交未完成，需处理", unknown: "保存状态未知" },
+    event: { external_input: "外部输入", state_changed: "状态变化", drive_evaluated: "派生评估", agenda_selected: "议程选择", feedback: "执行反馈" },
+    draft: { saved: "草稿已保存", not_saved: "没有已保存草稿", unavailable: "草稿正文不可用" },
+  };
+  const memoryLabels = {
+    status: { confirmed: "已确认", revoked: "已撤销" },
+    kind: { user_statement: "用户明确声明", completed_interaction: "已完成对话", missing: "来源记录缺失" },
+  };
+  const learningLabels = {
+    job: { running: "进行中", completed: "已完成", failed: "失败", interrupted: "已中断" },
+    failure: { provider: "模型服务失败", invalid_output: "输出格式无效", timeout: "超时", cancelled: "已取消" },
+    action: { confirm: "新增确认", update: "更新偏好", defer: "暂缓自动保存", reject: "拒绝自动保存" },
+    reason: {
+      eligible: "满足来源门槛", evidence_threshold: "自评或真实来源数量未达门槛", expired: "已过首次确认期限",
+      policy_denied: "替换策略未授权此动作", duplicate: "已有规范化等价偏好", revoked_conflict: "与用户撤销记录冲突，不自动恢复",
+      manual_conflict: "与用户手动确认或更正冲突，保留手动选择", ambiguous_conflict: "存在多个或不明确的更新目标",
+      stale_evidence: "候选来源修订未晚于当前偏好来源", explicit_revision_update: "明确偏好键已有更新的真实来源",
+      already_linked: "候选已有可核对的保存历史",
+    },
+  };
 
   class ApiError extends Error {
     constructor(message, silent = false) { super(message); this.silent = silent; }
@@ -157,6 +210,46 @@
     cancelConfirm = null;
     cancelPending = null;
     cancelFeedback = null;
+    judgments = [];
+    judgmentMeta = null;
+    judgmentBefore = null;
+    judgmentPages = 1;
+    judgmentLoading = false;
+    selectedJudgment = null;
+    goals = [];
+    goalMeta = null;
+    goalCursor = null;
+    goalPages = 1;
+    goalLoading = false;
+    selectedGoal = null;
+    goalRequest += 1;
+    memoryScopes = [];
+    memoryAfter = null;
+    memoryLoading = false;
+    selectedMemory = null;
+    memoryRequest += 1;
+    evidenceRequest += 1;
+    $("memory-list").replaceChildren();
+    $("memory-detail").replaceChildren();
+    $("memory-count").textContent = "0";
+    $("memory-empty").textContent = "正在读取记忆作用域…";
+    $("memory-empty").hidden = false;
+    $("memory-more").hidden = true;
+    showError("memory-error", "");
+    $("goals-list").replaceChildren();
+    $("goal-detail").replaceChildren();
+    $("goal-count").textContent = "0";
+    $("goals-empty").textContent = "正在读取认知目标…";
+    $("goals-empty").hidden = false;
+    $("goals-more").hidden = true;
+    showError("goals-error", "");
+    $("judgments-list").replaceChildren();
+    $("judgment-detail").replaceChildren();
+    $("judgment-count").textContent = "0";
+    $("judgments-empty").textContent = "正在读取判断记录…";
+    $("judgments-empty").hidden = false;
+    $("judgments-more").hidden = true;
+    showError("judgments-error", "");
     $("tasks-list").replaceChildren();
     $("sessions-list").replaceChildren();
     $("task-detail").replaceChildren();
@@ -492,11 +585,546 @@
     parent.append(message);
   }
 
+  function label(map, value, fallback = "未知") { return typeof value === "string" && map[value] ? map[value] : fallback; }
+  function micros(value) {
+    if (!Number.isSafeInteger(value) || value < 0) return "未知";
+    return value < 1000 ? `${value} 微秒` : `${(value / 1000).toLocaleString("zh-CN", { maximumFractionDigits: 1 })} 毫秒`;
+  }
+  function clock(value) {
+    const time = new Date(value);
+    return Number.isSafeInteger(value) && !Number.isNaN(time.getTime()) ? time.toLocaleTimeString("zh-CN", { hour12: false }) : "时间未知";
+  }
+  function validJudgment(item) {
+    return item && Number.isSafeInteger(item.sequence) && item.sequence > 0 && typeof item.result === "string" &&
+      Array.isArray(item.intents) && Array.isArray(item.steps) && Array.isArray(item.fallbacks) && typeof item.coverage === "string";
+  }
+  function judgmentBadge(item) {
+    const style = item.result === "decided" ? "good" : item.result === "failed" ? "bad" : "warning";
+    return node("span", `badge ${style}`, label(judgmentLabels.result, item.result));
+  }
+  function judgmentSummary(item) {
+    if (item.result === "decided") return item.intents.map((intent) => label(judgmentLabels.intent, intent)).join("、") || "无意图";
+    if (item.result === "failed") return `原因：${label(judgmentLabels.outcome, item.failure)}`;
+    return "调用方在结束前丢弃，不代表远端已停止";
+  }
+
+  async function loadJudgments(more = false) {
+    if (judgmentLoading) return;
+    judgmentLoading = true;
+    const requestEpoch = epoch;
+    renderJudgments();
+    try {
+      const query = new URLSearchParams({ limit: "25" });
+      if (more && judgmentBefore !== null) query.set("before", String(judgmentBefore));
+      const body = await api(`/api/judgments?${query.toString()}`);
+      if (epoch !== requestEpoch) return;
+      if (!body || !Array.isArray(body.items) || !body.items.every(validJudgment) ||
+        !(body.next_before === null || Number.isSafeInteger(body.next_before))) {
+        throw new ApiError("判断记录格式无效，请刷新重试。");
+      }
+      judgments = more ? judgments.concat(body.items) : body.items;
+      judgmentPages = more ? judgmentPages + 1 : 1;
+      judgmentBefore = body.next_before;
+      judgmentMeta = body;
+      showError("judgments-error", "");
+    } catch (error) {
+      if (epoch !== requestEpoch) return;
+      if (error instanceof ApiError && error.message.startsWith("当前服务暂不可用")) {
+        showError("judgments-error", "当前实例未提供判断诊断。");
+      } else reportError("judgments-error", error);
+    } finally {
+      if (epoch === requestEpoch) {
+        judgmentLoading = false;
+        renderJudgments();
+      }
+    }
+  }
+
+  function renderJudgments() {
+    $("judgments-list").replaceChildren();
+    for (const item of judgments) {
+      const button = node("button", `record-button${selectedJudgment === item.sequence ? " selected" : ""}`);
+      button.type = "button";
+      button.setAttribute("aria-pressed", String(selectedJudgment === item.sequence));
+      const top = node("div", "record-topline");
+      top.append(node("span", "record-name", `第 ${count(item.sequence)} 次 · ${clock(item.finished_at_unix_ms)}`), judgmentBadge(item));
+      button.append(top, node("p", "record-meta", judgmentSummary(item)), node("p", "record-meta", `本机耗时 ${micros(item.elapsed_micros)} · 观察${label(judgmentLabels.coverage, item.coverage)}`));
+      button.addEventListener("click", () => { selectedJudgment = item.sequence; renderJudgments(); });
+      $("judgments-list").append(button);
+    }
+    if (judgmentMeta) {
+      const mode = label(judgmentLabels.mode, judgmentMeta.mode);
+      const evicted = judgmentMeta.evicted > 0 ? `，已移出最早的 ${count(judgmentMeta.evicted)} 次` : "";
+      $("judgments-scope").textContent = `${mode}。本进程共记录 ${count(judgmentMeta.recorded_total)} 次，最多保留最近 ${count(judgmentMeta.capacity)} 次${evicted}；只保存在内存中，重启后清空。`;
+    }
+    $("judgment-count").textContent = count(judgments.length);
+    $("judgments-empty").hidden = judgments.length > 0;
+    $("judgments-empty").textContent = judgmentLoading ? "正在读取判断记录…" : !$("judgments-error").hidden ? "暂时无法读取判断记录。" : "本次启动后还没有消息判断。明确命令或自然判断发生后会显示在这里。";
+    $("judgments-more").hidden = judgmentBefore === null;
+    $("judgments-more").disabled = judgmentLoading;
+    renderJudgmentDetail();
+  }
+
+  function renderJudgmentDetail() {
+    if (selectedJudgment === null) {
+      emptyDetail("judgment-detail", "◇", "选择一次判断", "查看阶段、本地调用尝试、回退原因与耗时。不显示消息正文或身份。");
+      return;
+    }
+    const item = judgments.find((entry) => entry.sequence === selectedJudgment);
+    if (!item) {
+      emptyDetail("judgment-detail", "◇", "记录已不在当前列表", "该判断可能已被更新的记录移出。请从列表重新选择。");
+      return;
+    }
+    const heading = node("div", "detail-heading");
+    heading.append(judgmentBadge(item), node("h2", "", `第 ${count(item.sequence)} 次判断`), node("p", "", `结束于 ${clock(item.finished_at_unix_ms)}（本机时钟）`));
+    const body = node("div", "detail-body");
+    const grid = node("dl", "detail-grid");
+    grid.append(
+      detailPair("结果", judgmentSummary(item)),
+      detailPair("本机耗时", micros(item.elapsed_micros)),
+      detailPair("观察覆盖", label(judgmentLabels.coverage, item.coverage)),
+      detailPair("回退", item.fallbacks.length ? item.fallbacks.map((reason) => label(judgmentLabels.fallback, reason)).join("、") : "无"),
+    );
+    const counts = item.counts;
+    if (counts) {
+      grid.append(
+        detailPair("阶段开始次数", `规则 ${count(counts.rules)} · 辅助 ${count(counts.auxiliary)} · 主模型 ${count(counts.primary)}`),
+        detailPair("本地调用尝试", `分类器 ${count(counts.classifier_calls)} · 模型 Provider ${count(counts.model_provider_calls)}`),
+      );
+    } else {
+      grid.append(detailPair("计数", "观察不完整，不显示计数"));
+    }
+    body.append(grid);
+    const steps = node("ol", "judgment-steps");
+    for (const step of item.steps) {
+      const row = node("li", "judgment-step");
+      const outcome = step.outcome === null ? "未观察到结束" : label(judgmentLabels.outcome, step.outcome);
+      row.append(node("span", "record-name", label(judgmentLabels.step, step.name)), node("span", "record-meta", `${step.kind === "attempt" ? "调用尝试" : "阶段"} · ${outcome} · ${step.elapsed_micros === null ? "耗时未知" : micros(step.elapsed_micros)}`));
+      steps.append(row);
+    }
+    if (item.steps.length) body.append(steps);
+    body.append(node("p", "truncation-note", "调用尝试是本机适配器的调用次数，不代表网络请求、远端收到的请求、token 或费用；耗时是本机经过时间。"));
+    $("judgment-detail").replaceChildren(heading, body);
+  }
+
+  function validGoal(item) {
+    return item && typeof item.id === "string" && item.id.length > 0 && Number.isSafeInteger(item.revision) &&
+      typeof item.status === "string" && typeof item.description === "string" && Number.isSafeInteger(item.reflections);
+  }
+  function goalBadge(status) {
+    const style = status === "blocked" ? "bad" : status === "completed" ? "good" : status === "executing" ? "active" : status === "cancelled" ? "" : "warning";
+    return node("span", `badge ${style}`.trim(), label(goalLabels.status, status));
+  }
+  function goalDate(value) {
+    const time = new Date(value);
+    return Number.isSafeInteger(value) && value > 0 && !Number.isNaN(time.getTime()) ? time.toLocaleString("zh-CN", { hour12: false }) : "时间未知";
+  }
+  function goalSource(item) { return `${label(goalLabels.source, item.source_kind)} · ${text(item.source_channel, "未知通道")}`; }
+  function goalOwner(item) {
+    const scope = label(goalLabels.visibility, item.visibility);
+    return item.visibility === "user" && typeof item.owner === "string" ? `${scope}（${item.owner}）` : scope;
+  }
+
+  async function loadGoals(append = false) {
+    if (!token || goalLoading || (append && goalCursor === null)) return;
+    goalLoading = true;
+    const requestEpoch = epoch;
+    renderGoals();
+    try {
+      let cursor = append ? goalCursor : null;
+      const collected = [];
+      const seen = new Set();
+      let meta = null;
+      const pages = append ? 1 : goalPages;
+      for (let page = 0; page < pages; page += 1) {
+        const body = await api(cursorUrl("/api/goals", cursor));
+        if (!body || !Array.isArray(body.items) || !body.items.every(validGoal) ||
+          !(body.next_cursor === null || typeof body.next_cursor === "string") || !Number.isSafeInteger(body.revision)) {
+          throw new ApiError("目标列表格式无效，请刷新重试。");
+        }
+        meta = body;
+        collected.push(...body.items);
+        cursor = body.next_cursor;
+        if (cursor === null) break;
+        if (seen.has(cursor)) throw new ApiError("目标分页游标重复，请刷新重试。");
+        seen.add(cursor);
+      }
+      if (epoch !== requestEpoch) return;
+      const merged = append ? [...goals, ...collected] : collected;
+      goals = [...new Map(merged.map((item) => [item.id, item])).values()];
+      goalCursor = cursor;
+      goalMeta = meta;
+      if (append) goalPages += 1;
+      showError("goals-error", "");
+    } catch (error) {
+      if (epoch !== requestEpoch) return;
+      if (error instanceof ApiError && error.message.startsWith("当前服务暂不可用")) {
+        showError("goals-error", "当前实例未开启认知（需以 --cognition 启动），或认知状态暂时无法读取。");
+      } else reportError("goals-error", error);
+    } finally {
+      if (epoch === requestEpoch) {
+        goalLoading = false;
+        renderGoals();
+      }
+    }
+  }
+
+  function renderGoals() {
+    $("goals-list").replaceChildren();
+    for (const item of goals) {
+      const selected = selectedGoal === item.id;
+      const entry = node("button", `record-button${selected ? " selected" : ""}`);
+      entry.type = "button";
+      entry.setAttribute("aria-pressed", String(selected));
+      const top = node("div", "record-topline");
+      top.append(node("span", "record-name", item.description + (item.description_truncated ? "…" : "")), goalBadge(item.status));
+      const extra = item.reflection_of ? `反思子目标，父目标 ${item.reflection_of} 不在当前状态中` : `反思草稿 ${count(item.reflections)} 份`;
+      entry.append(top, node("p", "record-meta", `${goalSource(item)} · 版本 ${count(item.revision)}`), node("p", "record-meta", `${goalOwner(item)} · ${extra}`));
+      entry.addEventListener("click", () => { void loadGoal(item.id); });
+      $("goals-list").append(entry);
+    }
+    if (goalMeta) $("goals-scope").textContent = `认知状态修订 ${count(goalMeta.revision)}。只读查看已保存的待办、状态与反思草稿；不能在此修改目标或触发规划。`;
+    $("goal-count").textContent = count(goals.length);
+    $("goals-empty").hidden = goals.length > 0;
+    $("goals-empty").textContent = goalLoading ? "正在读取认知目标…" : !$("goals-error").hidden ? "暂时无法读取认知目标。" : "还没有保存的认知目标。用户通过 /goal 保存待办后会显示在这里。";
+    $("goals-more").hidden = goalCursor === null;
+    $("goals-more").disabled = goalLoading;
+  }
+
+  async function loadGoal(id) {
+    const request = ++goalRequest;
+    const requestEpoch = epoch;
+    selectedGoal = id;
+    renderGoals();
+    emptyDetail("goal-detail", "◈", "正在读取目标", "正在读取目标状态、来源记录与反思草稿。");
+    try {
+      const body = await api(`/api/goal?${new URLSearchParams({ id }).toString()}`);
+      if (request !== goalRequest || requestEpoch !== epoch) return;
+      if (!body || !validGoal(body.goal) || body.goal.id !== id || !Array.isArray(body.reflections) || !Array.isArray(body.events) ||
+        !body.budget || typeof body.reflection_check !== "string") {
+        throw new ApiError("服务返回的目标格式无效，请重新选择目标。");
+      }
+      renderGoalDetail(body);
+    } catch (error) {
+      if (request === goalRequest && requestEpoch === epoch && !error.silent) {
+        emptyDetail("goal-detail", "◈", "未能读取目标", errorText(error));
+        const actions = node("div", "detail-actions");
+        actions.append(button("重新读取", "secondary", () => { void loadGoal(id); }));
+        $("goal-detail").firstChild.append(actions);
+      }
+    }
+  }
+
+  function renderGoalDetail(body) {
+    const goal = body.goal;
+    const heading = node("div", "detail-heading");
+    const title = Array.from(goal.description);
+    const short = title.length > 60 ? `${title.slice(0, 60).join("")}…` : goal.description;
+    heading.append(goalBadge(goal.status), node("h2", "", short), node("p", "", `目标 ${goal.id} · 版本 ${count(goal.revision)} · 认知状态修订 ${count(body.revision)}`));
+    const actions = node("div", "detail-actions");
+    actions.append(button("刷新此目标", "secondary", () => { void loadGoal(goal.id); }));
+    if (goal.reflection_of) actions.append(button("查看父目标", "secondary", () => { void loadGoal(goal.reflection_of); }));
+    heading.append(actions);
+    const detail = node("div", "detail-body");
+    if (short !== goal.description) detail.append(node("p", "goal-text", goal.description));
+    if (goal.description_truncated) detail.append(node("p", "truncation-note", "仅显示前 8192 字节，完整记录保留。"));
+    const grid = node("dl", "detail-grid");
+    const budget = body.budget;
+    grid.append(
+      detailPair("状态", label(goalLabels.status, goal.status)),
+      detailPair("来源", goalSource(goal)),
+      detailPair("可见范围", goalOwner(goal)),
+      detailPair("优先级", count(goal.priority)),
+      detailPair("预算", `模型请求 ≤ ${count(budget.max_model_requests)} · 工具 ≤ ${count(budget.max_tool_calls)} · 尝试 ≤ ${count(budget.max_attempts)} · 超时 ${count(budget.timeout_ms)} 毫秒`),
+      detailPair("有效期", body.expires_at_ms === null ? "未设置" : goalDate(body.expires_at_ms)),
+    );
+    if (body.wait_reason) grid.append(detailPair("等待原因", body.wait_reason));
+    if (body.block_reason) grid.append(detailPair("阻塞原因", label(goalLabels.block, body.block_reason)));
+    if (body.execution) grid.append(detailPair("执行记录", `任务 ${body.execution.task_id} · 轮次 ${body.execution.turn_id === null ? "尚未确定" : String(body.execution.turn_id)}`));
+    if (body.feedback) {
+      grid.append(detailPair("执行反馈", `${label(goalLabels.commit, body.feedback.commit)} · ${body.feedback.verification_met ? "满足验证条件" : "未满足验证条件"}`));
+    }
+    detail.append(grid);
+    detail.append(node("p", "detail-note", goal.reflection_of
+      ? `这是目标 ${goal.reflection_of} 的反思子目标。完成只说明草稿已保存并通过结构校验，父目标与现实目标都没有因此完成。`
+      : "“执行记录已验证”只表示该目标记录满足自身验证条件；反思草稿是模型建议，不代表现实目标完成。"));
+
+    const drafts = node("section", "goal-section");
+    drafts.append(node("h3", "", `反思草稿（${count(body.reflections.length)}）`));
+    if (body.reflection_check === "inconsistent") {
+      drafts.append(node("p", "inline-error", "当前修订的派生记录残缺或矛盾，没有草稿被标为当前；请检查本地认知状态。"));
+    }
+    if (!body.reflections.length) drafts.append(node("p", "muted", "此目标还没有反思子目标。"));
+    for (const item of body.reflections) {
+      if (!item || typeof item.goal_id !== "string") continue;
+      const card = node("article", "reflection-card");
+      const top = node("div", "record-topline");
+      const version = Number.isSafeInteger(item.parent_revision) ? `对应目标版本 ${count(item.parent_revision)}` : "对应版本未知";
+      top.append(node("span", "record-name", version), node("span", `badge ${item.current ? "good" : ""}`.trim(), item.current ? "当前草稿" : "历史草稿"));
+      card.append(top, node("p", "record-meta", `${label(goalLabels.status, item.status)} · ${label(goalLabels.draft, item.draft_state)} · ${item.goal_id}`));
+      if (item.draft && typeof item.draft.summary === "string") {
+        card.append(node("p", "", item.draft.summary), node("p", "", `建议下一步：${text(item.draft.next_step, "未提供")}`),
+          node("p", "record-meta", `需要用户补充信息：${item.draft.needs_user_input ? "是" : "否"}`));
+      } else if (item.draft_state === "unavailable") {
+        card.append(node("p", "turn-note", "子目标标记为已保存，但会话结果缺失或格式不一致；不显示正文，也不视为已保存。"));
+      }
+      if (!item.current) card.append(node("p", "truncation-note", "历史草稿不作为当前建议。"));
+      drafts.append(card);
+    }
+    drafts.append(node("p", "truncation-note", "草稿是模型建议，尚未验证；原待办仍保持未完成，需用户确认后再行动。"));
+    detail.append(drafts);
+
+    const events = node("section", "goal-section");
+    events.append(node("h3", "", `来源记录（最近 ${count(body.events.length)} 条）`));
+    if (!body.events.length) events.append(node("p", "muted", "没有与此目标直接关联的来源记录。"));
+    const list = node("ol", "judgment-steps");
+    for (const item of body.events) {
+      if (!item || typeof item.summary !== "string") continue;
+      const row = node("li", "judgment-step");
+      row.append(node("span", "record-name", label(goalLabels.event, item.kind)), node("span", "record-meta", `${label(goalLabels.source, item.source_kind)} · ${text(item.source_channel, "未知通道")} · ${goalDate(item.at_ms)}`));
+      const summary = node("p", "event-summary", item.summary);
+      row.append(summary);
+      if (item.summary_truncated) row.append(node("p", "truncation-note", "仅显示前 2048 字节。"));
+      list.append(row);
+    }
+    if (body.events.length) events.append(list);
+    if (body.events_omitted > 0) events.append(node("p", "truncation-note", `另有 ${count(body.events_omitted)} 条更早记录未列出。`));
+    events.append(node("p", "truncation-note", "用户反馈与文件片段是保存时的外部数据，未经验证。"));
+    detail.append(events);
+    $("goal-detail").replaceChildren(heading, detail);
+  }
+
+  function validScope(scope) {
+    return scope && typeof scope.channel === "string" && typeof scope.session_id === "string" && typeof scope.user_id === "string";
+  }
+  function scopeId(scope) { return JSON.stringify([scope.channel, scope.session_id, scope.user_id]); }
+  function memoryBadge(status) {
+    return node("span", `badge ${status === "confirmed" ? "good" : ""}`.trim(), label(memoryLabels.status, status));
+  }
+
+  async function loadMemoryScopes(append = false) {
+    if (!token || memoryLoading || (append && memoryAfter === null)) return;
+    memoryLoading = true;
+    const requestEpoch = epoch;
+    renderMemoryScopes();
+    try {
+      const body = await api("/api/memory/scopes", append ? { after: memoryAfter, limit: 25 } : { limit: 25 });
+      if (epoch !== requestEpoch) return;
+      if (!body || !Array.isArray(body.items) || !body.items.every((item) => item && validScope(item.scope)) ||
+        !(body.next_after === null || validScope(body.next_after))) {
+        throw new ApiError("记忆作用域格式无效，请刷新重试。");
+      }
+      const merged = append ? [...memoryScopes, ...body.items] : body.items;
+      memoryScopes = [...new Map(merged.map((item) => [scopeId(item.scope), item])).values()];
+      memoryAfter = body.next_after;
+      showError("memory-error", "");
+    } catch (error) {
+      if (epoch !== requestEpoch) return;
+      if (error instanceof ApiError && error.message.startsWith("当前服务暂不可用")) {
+        showError("memory-error", "当前实例未开启交互记忆（需以 --memory 启动），或记忆状态暂时无法读取。");
+      } else reportError("memory-error", error);
+    } finally {
+      if (epoch === requestEpoch) {
+        memoryLoading = false;
+        renderMemoryScopes();
+      }
+    }
+  }
+
+  function renderMemoryScopes() {
+    $("memory-list").replaceChildren();
+    for (const item of memoryScopes) {
+      const id = scopeId(item.scope);
+      const selected = selectedMemory === id;
+      const entry = node("button", `record-button${selected ? " selected" : ""}`);
+      entry.type = "button";
+      entry.setAttribute("aria-pressed", String(selected));
+      const top = node("div", "record-topline");
+      top.append(node("span", "record-name", `用户 ${item.scope.user_id}`), node("span", "badge", `${count(item.confirmed)} 条生效`));
+      entry.append(top, node("p", "record-meta", `${item.scope.channel} · 会话 ${item.scope.session_id}`),
+        node("p", "record-meta", `已撤销 ${count(item.revoked)} · 来源 ${count(item.evidence)} · 修订 ${count(item.revision)}`));
+      entry.addEventListener("click", () => { void loadMemory(item.scope); });
+      $("memory-list").append(entry);
+    }
+    $("memory-count").textContent = count(memoryScopes.length);
+    $("memory-empty").hidden = memoryScopes.length > 0;
+    $("memory-empty").textContent = memoryLoading ? "正在读取记忆作用域…" : !$("memory-error").hidden ? "暂时无法读取记忆。" : "还没有保存的记忆。用户通过 /remember 保存偏好或完成对话后会显示在这里。";
+    $("memory-more").hidden = memoryAfter === null;
+    $("memory-more").disabled = memoryLoading;
+  }
+
+  async function loadMemory(scope) {
+    const request = ++memoryRequest;
+    evidenceRequest += 1;
+    const requestEpoch = epoch;
+    selectedMemory = scopeId(scope);
+    renderMemoryScopes();
+    emptyDetail("memory-detail", "✦", "正在读取记忆", "正在读取偏好与版本历史。");
+    try {
+      const body = await api("/api/memory/scope", { scope });
+      if (request !== memoryRequest || requestEpoch !== epoch) return;
+      if (!body || !validScope(body.scope) || scopeId(body.scope) !== scopeId(scope) || !Array.isArray(body.preferences)) {
+        throw new ApiError("服务返回的记忆格式无效，请重新选择。");
+      }
+      renderMemoryDetail(body);
+    } catch (error) {
+      if (request === memoryRequest && requestEpoch === epoch && !error.silent) {
+        emptyDetail("memory-detail", "✦", "未能读取记忆", errorText(error));
+        const actions = node("div", "detail-actions");
+        actions.append(button("重新读取", "secondary", () => { void loadMemory(scope); }));
+        $("memory-detail").firstChild.append(actions);
+      }
+    }
+  }
+
+  function renderMemoryDetail(body) {
+    const heading = node("div", "detail-heading");
+    const effective = body.preferences.filter((item) => item && item.effective).length;
+    heading.append(node("span", "section-kicker", `作用域修订 ${count(body.revision)}`), node("h2", "", `用户 ${body.scope.user_id}`),
+      node("p", "", `${body.scope.channel} · 会话 ${body.scope.session_id} · 偏好 ${count(body.preferences.length)} 条，生效 ${count(effective)} 条 · 来源 ${count(body.evidence)} 条`));
+    const actions = node("div", "detail-actions");
+    actions.append(button("刷新此作用域", "secondary", () => { void loadMemory(body.scope); }));
+    heading.append(actions);
+    const detail = node("div", "detail-body");
+    detail.append(node("p", "detail-note", "只有“已确认”且为最新版本的偏好会进入对话上下文。撤销和更正都保留历史与来源，不删除记录。"));
+    if (!body.preferences.length) detail.append(node("p", "muted", "此作用域还没有偏好，只有交互来源。"));
+    const evidenceBox = node("section", "goal-section");
+    evidenceBox.id = "memory-evidence";
+    for (const item of body.preferences) {
+      if (!item || typeof item.id !== "string" || !Array.isArray(item.history)) continue;
+      const card = node("article", "reflection-card");
+      const top = node("div", "record-topline");
+      top.append(node("span", "record-name", item.id), memoryBadge(item.status));
+      card.append(top, node("p", "", item.text));
+      if (item.text_truncated) card.append(node("p", "truncation-note", "仅显示前 4096 字节。"));
+      card.append(node("p", "record-meta", item.effective ? `版本 ${count(item.revision)} · 当前生效` : `版本 ${count(item.revision)} · 已撤销，不再进入对话上下文`));
+      const versions = node("ol", "judgment-steps");
+      for (const version of item.history) {
+        if (!version || typeof version.evidence_id !== "string") continue;
+        const row = node("li", "judgment-step");
+        row.append(node("span", "record-name", `版本 ${count(version.revision)}${version.current ? "（最新）" : ""} · ${label(memoryLabels.status, version.status)}`),
+          node("span", "record-meta", `${label(memoryLabels.kind, version.evidence_kind)} · ${goalDate(version.at_ms)}`));
+        row.append(node("p", "event-summary", version.text));
+        if (version.text_truncated) row.append(node("p", "truncation-note", "仅显示前 512 字节。"));
+        if (version.evidence_kind !== "missing") {
+          const open = button("查看来源", "secondary", () => { void loadEvidence(body.scope, version.evidence_id); });
+          open.setAttribute("aria-label", `查看版本 ${version.revision} 的来源`);
+          row.append(open);
+        }
+        versions.append(row);
+      }
+      card.append(versions);
+      detail.append(card);
+    }
+    const learningBox = node("section", "goal-section");
+    learningBox.id = "memory-learning";
+    learningBox.append(node("h3", "", "学习候选"), node("p", "muted", "正在读取偏好提炼记录…"));
+    detail.append(learningBox, evidenceBox);
+    $("memory-detail").replaceChildren(heading, detail);
+    void loadLearning(body.scope, memoryRequest);
+  }
+
+  async function loadLearning(scope, request) {
+    const requestEpoch = epoch;
+    try {
+      const body = await api("/api/memory/learning", { scope });
+      if (request !== memoryRequest || requestEpoch !== epoch || !$("memory-learning")) return;
+      if (!body || !Array.isArray(body.jobs) || !Array.isArray(body.candidates) || typeof body.autonomous !== "boolean") {
+        throw new ApiError("学习记录格式无效，请刷新重试。");
+      }
+      renderLearning(body);
+    } catch (error) {
+      if (request !== memoryRequest || requestEpoch !== epoch || error.silent || !$("memory-learning")) return;
+      const unavailable = error instanceof ApiError && error.message.startsWith("当前服务暂不可用");
+      $("memory-learning").replaceChildren(node("h3", "", "学习候选"),
+        node("p", unavailable ? "muted" : "inline-error", unavailable ? "未开启偏好提炼（需以 --memory-learning 或 --self-learning 启动），或学习记录暂时无法读取、核对。" : errorText(error)));
+    }
+  }
+
+  function renderLearning(body) {
+    const box = $("memory-learning");
+    box.replaceChildren(node("h3", "", `学习候选（${count(body.candidates.length)}）`));
+    box.append(node("p", "detail-note", body.autonomous
+      ? "自主学习：宿主按证据策略自动确认候选；与用户手动更正、撤销冲突时保留手动选择。"
+      : "手动模式：候选需用户在 QQ 中发送 /accept-memory 候选ID 确认后才会保存。"));
+    const tally = {};
+    for (const job of body.jobs) if (job && typeof job.status === "string") tally[job.status] = (tally[job.status] || 0) + 1;
+    const failures = body.jobs.filter((job) => job && job.failure).map((job) => label(learningLabels.failure, job.failure));
+    const parts = Object.entries(tally).map(([status, value]) => `${label(learningLabels.job, status)} ${count(value)}`);
+    box.append(node("p", "record-meta", `提炼批次 ${count(body.jobs.length)} 次${parts.length ? `：${parts.join("、")}` : ""}${failures.length ? `（失败原因：${failures.join("、")}）` : ""} · 学习决策共 ${count(body.decisions_total)} 条`));
+    if (!body.candidates.length) box.append(node("p", "muted", "还没有提炼出候选偏好。"));
+    for (const item of body.candidates) {
+      if (!item || typeof item.id !== "string" || !Array.isArray(item.decisions)) continue;
+      const card = node("article", "reflection-card");
+      const top = node("div", "record-topline");
+      const saved = item.saved && typeof item.saved.preference_id === "string" ? item.saved : null;
+      const state = saved ? (saved.effective ? "已保存，生效中" : "已保存，后被撤销") : item.expired ? "已过期，未保存" : "待确认";
+      top.append(node("span", "record-name", item.id), node("span", `badge ${saved ? (saved.effective ? "good" : "") : item.expired ? "" : "warning"}`.trim(), state));
+      card.append(top, node("p", "", item.text));
+      card.append(node("p", "record-meta", `模型自评 ${count(item.confidence)}（不是校准概率）· 引用对话 ${count(item.evidence_ids.length)} 条 · 生成于 ${goalDate(item.created_at_ms)} · 确认期限 ${goalDate(item.expires_at_ms)}`));
+      card.append(node("p", "record-meta", saved ? `实际保存：偏好 ${saved.preference_id}，当前版本 ${count(saved.revision)}（按记忆历史核对）` : "实际保存：记忆历史中没有该候选对应的确认或更新。"));
+      if (item.decisions.length) {
+        const list = node("ol", "judgment-steps");
+        for (const decision of item.decisions) {
+          if (!decision || typeof decision.action !== "string") continue;
+          const target = decision.action === "update" && typeof decision.update_preference === "string" ? `（目标 ${decision.update_preference} 版本 ${count(decision.update_revision)}）` : "";
+          const row = node("li", "judgment-step");
+          row.append(node("span", "record-name", `#${count(decision.sequence)} ${label(learningLabels.action, decision.action)}${target}`),
+            node("span", "record-meta", `${label(learningLabels.reason, decision.reason)} · 策略 ${text(decision.policy_version)} · 读取记忆版本 ${count(decision.memory_revision)} · ${goalDate(decision.at_ms)}`));
+          list.append(row);
+        }
+        card.append(list);
+        if (item.decisions_total > item.decisions.length) card.append(node("p", "truncation-note", `另有 ${count(item.decisions_total - item.decisions.length)} 条更早决策未列出。`));
+      } else {
+        card.append(node("p", "muted", "尚无自动学习决策；手动确认不会伪造自动决策。"));
+      }
+      box.append(card);
+    }
+    box.append(node("p", "truncation-note", "决策记录是提交前的意图，是否真正保存以记忆历史为准；候选正文是模型提炼结果，不等于用户已确认。"));
+  }
+
+  async function loadEvidence(scope, id) {
+    const request = ++evidenceRequest;
+    const requestEpoch = epoch;
+    const box = $("memory-evidence");
+    if (!box) return;
+    box.replaceChildren(node("h3", "", "来源"), node("p", "muted", "正在读取来源…"));
+    box.scrollIntoView({ block: "nearest" });
+    try {
+      const body = await api("/api/memory/evidence", { scope, id });
+      if (request !== evidenceRequest || requestEpoch !== epoch || !$("memory-evidence")) return;
+      if (!body || body.id !== id || typeof body.user_text !== "string" || !Array.isArray(body.references)) {
+        throw new ApiError("来源格式无效，请重新打开。");
+      }
+      const target = $("memory-evidence");
+      target.replaceChildren(node("h3", "", `来源 ${body.id}`),
+        node("p", "record-meta", `${label(memoryLabels.kind, body.kind)} · ${goalDate(body.at_ms)}${body.turn_id === null ? "" : ` · 对话轮次 ${body.turn_id}`}`));
+      const conversation = node("div", "conversation");
+      appendMessage(conversation, "user", body.kind === "user_statement" ? "用户声明" : "用户输入", body.user_text);
+      if (body.user_text_truncated) conversation.append(node("p", "truncation-note", "仅显示前 2048 字节，完整记录保留。"));
+      if (typeof body.assistant_text === "string") {
+        appendMessage(conversation, "assistant", "Eve（当时回复）", body.assistant_text);
+        if (body.assistant_text_truncated) conversation.append(node("p", "truncation-note", "仅显示前 2048 字节，完整记录保留。"));
+      }
+      target.append(conversation);
+      const refs = body.references.map((ref) => `${ref.preference_id} 版本 ${ref.revision}${ref.effective ? "（生效）" : ref.current ? "（最新，未生效）" : "（历史）"}`);
+      target.append(node("p", "record-meta", `引用此来源的偏好版本：${refs.join("、") || "无"}${body.references_total > body.references.length ? `，另有 ${count(body.references_total - body.references.length)} 条未列出` : ""}`));
+      target.append(node("p", "truncation-note", "助手回复是当时的历史内容，不是已核实的事实；用户声明也只代表用户当时的说法。"));
+    } catch (error) {
+      if (request === evidenceRequest && requestEpoch === epoch && !error.silent && $("memory-evidence")) {
+        $("memory-evidence").replaceChildren(node("h3", "", "来源"), node("p", "inline-error", errorText(error)));
+      }
+    }
+  }
+
   function switchView(next) {
     view = next;
     $("tasks-view").hidden = next !== "tasks";
     $("sessions-view").hidden = next !== "sessions";
-    $("page-title").textContent = next === "tasks" ? "任务状态" : "会话记录";
+    $("judgments-view").hidden = next !== "judgments";
+    $("goals-view").hidden = next !== "goals";
+    $("memory-view").hidden = next !== "memory";
+    $("page-title").textContent = { tasks: "任务状态", sessions: "会话记录", judgments: "判断诊断", goals: "认知目标", memory: "记忆偏好" }[next];
     for (const item of document.querySelectorAll("[data-view]")) {
       const active = item.dataset.view === next;
       item.classList.toggle("active", active);
@@ -504,6 +1132,9 @@
       else item.removeAttribute("aria-current");
     }
     if (next === "sessions" && sessions.length === 0) void loadSessions();
+    if (next === "judgments") void loadJudgments();
+    if (next === "goals") void loadGoals();
+    if (next === "memory" && memoryScopes.length === 0) void loadMemoryScopes();
   }
 
   async function refresh() {
@@ -516,6 +1147,9 @@
       const results = await Promise.allSettled([
         api("/api/status").then(renderStatus),
         loadTasks(),
+        // 停在判断页且未加载更早记录时刷新首页；判断错误显示在本页，不影响全局状态。
+        view === "judgments" && judgmentPages === 1 ? loadJudgments() : Promise.resolve(),
+        view === "goals" ? loadGoals() : Promise.resolve(),
       ]);
       if (epoch !== requestEpoch) return;
       const failure = results.find((result) => result.status === "rejected");
@@ -568,6 +1202,8 @@
       $("console-view").hidden = false;
       emptyDetail("task-detail", "◎", "选择一个任务", "在这里查看执行状态，以及针对当前代际请求取消。");
       emptyDetail("session-detail", "▤", "选择一段会话", "仅展示用户与助手文字，工具参数和结果不在此展示。");
+      emptyDetail("memory-detail", "✦", "选择一个作用域", "查看已确认和已撤销的偏好、版本历史，以及每个版本的来源。来源正文需单独打开。");
+      emptyDetail("goal-detail", "◈", "选择一个目标", "查看状态、来源记录，以及当前和历史反思草稿。草稿是未验证的建议，不代表目标完成。");
       switchView("tasks");
       void refresh();
     } catch (error) {
@@ -587,9 +1223,19 @@
       void loadSessions();
       if (selectedSession) void loadSession(selectedSession, selectedSessionBefore);
     }
+    if (view === "judgments" && judgmentPages > 1) void loadJudgments();
+    if (view === "goals" && selectedGoal !== null) void loadGoal(selectedGoal);
+    if (view === "memory") {
+      void loadMemoryScopes();
+      const current = memoryScopes.find((item) => scopeId(item.scope) === selectedMemory);
+      if (current) void loadMemory(current.scope);
+    }
   });
   $("tasks-more").addEventListener("click", () => { void loadTasks(true).catch(() => {}); });
   $("sessions-more").addEventListener("click", () => { void loadSessions(true); });
+  $("judgments-more").addEventListener("click", () => { void loadJudgments(true); });
+  $("goals-more").addEventListener("click", () => { void loadGoals(true); });
+  $("memory-more").addEventListener("click", () => { void loadMemoryScopes(true); });
   for (const item of document.querySelectorAll("[data-view]")) item.addEventListener("click", () => switchView(item.dataset.view));
   document.addEventListener("visibilitychange", () => {
     clearTimeout(pollTimer);
