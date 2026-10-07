@@ -6,8 +6,8 @@ use crate::{
     },
 };
 use eve_action_api::{
-    ACTION_PLUGIN_ID, ActionError, ActionJournal, ActionPrecondition, ActionRecord, ActionResult,
-    DocumentActionProposal,
+    ACTION_PLUGIN_ID, ActionError, ActionExecutionReport, ActionJournal, ActionPrecondition,
+    ActionRecord, ActionResult, DocumentActionProposal,
 };
 use eve_action_plugin::{
     ActionCancellation, ActionController, ActionPlugin, execute_document_action,
@@ -98,6 +98,17 @@ pub(crate) async fn export_plan(
     admin: &CognitionController,
     options: ExportPlanOptions,
 ) -> Result<Value, AppError> {
+    let record = export_plan_record(kernel, registry, admin, options).await?;
+    Ok(json!({"command": "export-plan", "action": record}))
+}
+
+/// 与 export-plan 相同的准入、显式绑定和一次性执行；返回实际保存的行动记录及是否重复。
+pub(crate) async fn export_plan_record(
+    kernel: &Kernel,
+    registry: &Arc<dyn ServiceRegistry>,
+    admin: &CognitionController,
+    options: ExportPlanOptions,
+) -> Result<ActionExecutionReport, AppError> {
     let request = DocumentActionRequest {
         goal_id: options.goal_id,
         expected_goal_revision: options.expected_goal_revision,
@@ -151,7 +162,7 @@ pub(crate) async fn export_plan(
             result?
         }
     };
-    Ok(json!({"command": "export-plan", "action": result}))
+    Ok(result)
 }
 
 async fn interrupted() -> Result<(), AppError> {

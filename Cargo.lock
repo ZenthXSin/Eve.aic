@@ -295,6 +295,8 @@ dependencies = [
  "eve-message-api",
  "eve-message-diagnostics",
  "eve-message-plugin",
+ "eve-plan-api",
+ "eve-plan-plugin",
  "eve-plugin-api",
  "eve-qqbot-plugin",
  "eve-runtime",
@@ -571,6 +573,28 @@ dependencies = [
  "eve-plugin-api",
  "eve-session-api",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "eve-plan-api"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eve-plan-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-kernel",
+ "eve-plan-api",
+ "eve-plugin-api",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
