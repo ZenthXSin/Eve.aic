@@ -8,6 +8,9 @@ import threading
 import time
 import traceback
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -17,6 +20,7 @@ OLD = "FIRST_DRAFT_ONLY：还不知道执行范围。"
 NEW = "SECOND_DRAFT_ONLY：已根据用户补充只整理书桌。"
 THIRD = "THIRD_DRAFT_ONLY：保留书桌范围并将预算改为十分钟。"
 FEEDBACK = "只整理书桌；不要移动书架，预算为二十分钟。"
+PANEL_TOKEN = "synthetic-goal-panel-token-1234567890123456789"
 
 
 class GoalFeedbackAcceptance(unittest.TestCase):
@@ -133,7 +137,37 @@ class GoalFeedbackAcceptance(unittest.TestCase):
         return self.message(message_id, "/goal-feedback {{" + parent + ".id}} {{" + parent +
                             ".revision}} " + text, contains=["反馈已保存"], **route)
 
-    def run_eve(self, script, budget=2, cognition=True, app="1904159860", expected_failed=0):
+    def panel_request(self, url, path, token=PANEL_TOKEN, method="GET"):
+        headers = {"Authorization": "Bearer " + token} if token else {}
+        request = urllib.request.Request(url + path, method=method, headers=headers)
+        try:
+            response = urllib.request.urlopen(request, timeout=6)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            raw = response.read()
+            return response.status, json.loads(raw) if raw else None
+
+    def watch_panel(self, stderr_file, panel, failures):
+        """Wait for the owned Eve panel and the bridge pause, inspect, then release the bridge."""
+        paused, resume, inspect = panel
+        try:
+            deadline = time.monotonic() + 20
+            url = None
+            while url is None or not paused.exists():
+                assert time.monotonic() < deadline, "panel or bridge pause did not become ready"
+                if url is None and stderr_file.exists():
+                    for line in stderr_file.read_text().splitlines():
+                        if line.startswith("EVE_WEB_READY "):
+                            url = line.split(None, 1)[1].strip()
+                time.sleep(0.01)
+            inspect(url)
+        except Exception:
+            failures.append(traceback.format_exc())
+        finally:
+            resume.write_text("ready")
+
+    def run_eve(self, script, budget=2, cognition=True, app="1904159860", expected_failed=0, panel=None):
         self.runs += 1
         self.run_release = threading.Event()
         events_file = self.work / f"events-{self.runs}.jsonl"
@@ -152,14 +186,29 @@ class GoalFeedbackAcceptance(unittest.TestCase):
                    "--bridge-script", str(BRIDGE), "--bridge-arg", str(scenario)]
         if cognition:
             command.extend(["--cognition", "--cognition-max-executions", str(budget)])
-        child = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        try:
-            stdout, stderr = child.communicate(timeout=25)
-        finally:
-            if child.poll() is None:
-                child.kill()
-                child.communicate()
-            self.run_release.set()
+        failures = []
+        watcher = None
+        stderr_file = self.work / f"stderr-{self.runs}.txt"
+        if panel is not None:
+            environment["EVE_WEB_TOKEN"] = PANEL_TOKEN
+            command.extend(["--web-listen", "127.0.0.1:0"])
+        with open(stderr_file, "w") as stderr_sink:
+            child = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE,
+                                     stderr=stderr_sink if panel is not None else subprocess.PIPE, text=True)
+            if panel is not None:
+                watcher = threading.Thread(target=self.watch_panel, args=(stderr_file, panel, failures), daemon=True)
+                watcher.start()
+            try:
+                stdout, stderr = child.communicate(timeout=30)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate()
+                self.run_release.set()
+        if watcher is not None:
+            watcher.join(timeout=10)
+            stderr = stderr_file.read_text()
+        self.assertFalse(failures, "\n".join(failures))
         self.events = [json.loads(line) for line in events_file.read_text().splitlines()] if events_file.exists() else []
         self.bindings = json.loads(bindings_file.read_text()) if bindings_file.exists() else {}
         self.assertFalse(error_file.exists(), error_file.read_text() if error_file.exists() else "")
@@ -345,6 +394,60 @@ class GoalFeedbackAcceptance(unittest.TestCase):
                      app="other-app")
         self.assertEqual(self.cognition(), before)
         self.assertEqual(len(self.requests), 1)
+
+    def test_web_panel_reads_current_and_historical_drafts_without_writing(self):
+        paused, resume = self.work / "panel.paused", self.work / "panel.resume"
+        seen = {}
+
+        def inspect(url):
+            before = self.documents()["eve.cognition"]["cognition.v1"]
+            seen["unauthorized"] = self.panel_request(url, "/api/goals", token=None)[0]
+            seen["list"] = self.panel_request(url, "/api/goals?limit=100")
+            parent = next(item for item in seen["list"][1]["items"] if item["source_channel"] == "qq.goal")
+            seen["detail"] = self.panel_request(url, "/api/goal?" + urllib.parse.urlencode({"id": parent["id"]}))
+            current = next(item for item in seen["detail"][1]["reflections"] if item["current"])
+            seen["child"] = self.panel_request(url, "/api/goal?" + urllib.parse.urlencode({"id": current["goal_id"]}))
+            seen["missing"] = self.panel_request(url, "/api/goal?id=missing-goal")[0]
+            seen["invalid"] = self.panel_request(url, "/api/goal?id=%20padded")[0]
+            seen["write"] = self.panel_request(url, "/api/goal?id=" + parent["id"], method="DELETE")[0]
+            seen["unchanged"] = before == self.documents()["eve.cognition"]["cognition.v1"]
+
+        self.run_eve([
+            *self.add(), self.wait_child(),
+            *self.send(self.feedback()), self.capture("after"), self.wait_child("after"),
+            {"touch": str(paused)}, {"wait_file": str(resume)},
+        ], panel=(paused, resume, inspect))
+        self.assert_feedback_state()
+        before, after = self.bindings["before"], self.bindings["after"]
+        self.assertEqual(seen["unauthorized"], 401)
+        status, page = seen["list"]
+        self.assertEqual(status, 200)
+        self.assertEqual([item["id"] for item in page["items"]], [after["id"]])
+        parent = page["items"][0]
+        self.assertEqual((parent["status"], parent["revision"], parent["reflections"]), ("waiting", after["revision"], 2))
+        self.assertEqual((parent["visibility"], parent["source_kind"]), ("user", "user"))
+        # 与会话页相同，只显示宿主绑定的 QQ 用户摘要标识，不显示平台原始 ID。
+        self.assertRegex(parent["owner"], r"^qq:[0-9a-f]{64}$")
+        self.assertNotIn("user-1", json.dumps(seen["list"][1]))
+        self.assertIsNone(parent["reflection_of"])
+        status, detail = seen["detail"]
+        self.assertEqual(status, 200)
+        self.assertEqual(detail["reflection_check"], "ok")
+        drafts = [(item["current"], item["parent_revision"], item["draft_state"], item["draft"]["summary"])
+                  for item in detail["reflections"]]
+        self.assertEqual(drafts, [(True, after["revision"], "saved", NEW), (False, before["revision"], "saved", OLD)])
+        self.assertTrue(detail["reflections"][0]["draft"]["needs_user_input"])
+        self.assertTrue(any(event["kind"] == "external_input" and event["source_kind"] == "user" and
+                            FEEDBACK in event["summary"] for event in detail["events"]))
+        for raw in ["user-1", "c2c"]:
+            self.assertNotIn(raw, json.dumps(detail, ensure_ascii=False))
+        status, child = seen["child"]
+        self.assertEqual(status, 200)
+        self.assertEqual((child["goal"]["reflection_of"], child["goal"]["status"]), (after["id"], "completed"))
+        self.assertEqual(child["reflections"], [])
+        self.assertEqual((seen["missing"], seen["invalid"], seen["write"]), (404, 400, 405))
+        self.assertTrue(seen["unchanged"], "panel reads must not write cognition state")
+        self.assertEqual(len(self.requests), 2)
 
     def test_disabled_and_malformed_feedback_commands_never_call_a_model(self):
         self.run_eve(self.send(self.message("disabled", "/goal-feedback target 1 条件",

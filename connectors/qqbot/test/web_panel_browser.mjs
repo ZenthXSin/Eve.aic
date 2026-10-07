@@ -124,6 +124,10 @@ try {
   for (const expected of ["继续", "规则 1 · 辅助 0 · 主模型 0", "不代表网络请求"]) assert.ok(judgment.includes(expected), expected);
   for (const hidden of ["/continue", "synthetic-user", "keep"]) assert.equal(judgment.includes(hidden), false, hidden);
   await page.screenshot({ path: path.join(artifacts, "judgments.png"), fullPage: true });
+  await page.locator('[data-view="goals"]').click();
+  await page.waitForFunction(() => document.querySelector("#goals-error").textContent.includes("未开启认知"));
+  assert.equal(await page.locator("#goals-list .record-button").count(), 0);
+  await page.locator('[data-view="judgments"]').click();
   await page.setViewportSize({ width: 390, height: 844 });
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), "mobile judgments overflow horizontally");
   await page.screenshot({ path: path.join(artifacts, "mobile-judgments.png"), fullPage: true });
@@ -146,7 +150,7 @@ try {
   assert.equal(requests, 27);
   for (const secret of [token, "test-model-secret", "test-app-secret"]) assert.equal((stdout + stderr).includes(secret), false);
   console.log(JSON.stringify({ passed: true, model_requests: requests, browser_errors: errors.length,
-    checks: ["login", "memory-only-token", "task-cancel-confirmation", "history-pagination", "truncation", "xss-text", "judgment-diagnostics", "mobile-layout", "logout", "reload"], artifacts }));
+    checks: ["login", "memory-only-token", "task-cancel-confirmation", "history-pagination", "truncation", "xss-text", "judgment-diagnostics", "goals-unavailable", "mobile-layout", "logout", "reload"], artifacts }));
 } finally {
   if (browser) await browser.close();
   if (child.exitCode === null) { child.kill("SIGKILL"); await exited; }

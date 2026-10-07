@@ -33,6 +33,13 @@
   let judgmentPages = 1;
   let judgmentLoading = false;
   let selectedJudgment = null;
+  let goals = [];
+  let goalMeta = null;
+  let goalCursor = null;
+  let goalPages = 1;
+  let goalLoading = false;
+  let selectedGoal = null;
+  let goalRequest = 0;
   const controllers = new Set();
   const judgmentLabels = {
     result: { decided: "已判定", failed: "判断失败", dropped: "已丢弃" },
@@ -42,6 +49,15 @@
     step: { rules: "明确命令规则", auxiliary: "辅助判断", primary: "主模型判断", classifier_call: "分类器调用", model_provider_call: "模型 Provider 调用" },
     fallback: { unavailable: "不可用", protocol: "格式无效", timeout: "超时", panicked: "内部异常", invalid_decision: "决定无效", ambiguous: "含混", low_confidence: "置信度低" },
     mode: { off: "仅明确命令规则", primary: "主模型自然判断", jev: "Jev 自然判断" },
+  };
+  const goalLabels = {
+    status: { ready: "待执行", waiting: "等待中", executing: "执行中", completed: "执行记录已验证", cancelled: "已取消", blocked: "需要处理" },
+    source: { user: "用户", environment: "环境观察", tool: "工具", inference: "推断", internal: "内部" },
+    visibility: { public: "公开", user: "仅该用户", internal: "内部" },
+    block: { interrupted: "执行中断", unknown_commit: "提交状态未知", feedback_save_failed: "反馈保存失败", invalidated: "输入已变化而失效" },
+    commit: { not_started: "尚未开始提交", completed: "成功结果已保存", failed: "失败记录已保存", pending: "提交未完成，需处理", unknown: "保存状态未知" },
+    event: { external_input: "外部输入", state_changed: "状态变化", drive_evaluated: "派生评估", agenda_selected: "议程选择", feedback: "执行反馈" },
+    draft: { saved: "草稿已保存", not_saved: "没有已保存草稿", unavailable: "草稿正文不可用" },
   };
 
   class ApiError extends Error {
@@ -178,6 +194,20 @@
     judgmentPages = 1;
     judgmentLoading = false;
     selectedJudgment = null;
+    goals = [];
+    goalMeta = null;
+    goalCursor = null;
+    goalPages = 1;
+    goalLoading = false;
+    selectedGoal = null;
+    goalRequest += 1;
+    $("goals-list").replaceChildren();
+    $("goal-detail").replaceChildren();
+    $("goal-count").textContent = "0";
+    $("goals-empty").textContent = "正在读取认知目标…";
+    $("goals-empty").hidden = false;
+    $("goals-more").hidden = true;
+    showError("goals-error", "");
     $("judgments-list").replaceChildren();
     $("judgment-detail").replaceChildren();
     $("judgment-count").textContent = "0";
@@ -642,12 +672,200 @@
     $("judgment-detail").replaceChildren(heading, body);
   }
 
+  function validGoal(item) {
+    return item && typeof item.id === "string" && item.id.length > 0 && Number.isSafeInteger(item.revision) &&
+      typeof item.status === "string" && typeof item.description === "string" && Number.isSafeInteger(item.reflections);
+  }
+  function goalBadge(status) {
+    const style = status === "blocked" ? "bad" : status === "completed" ? "good" : status === "executing" ? "active" : status === "cancelled" ? "" : "warning";
+    return node("span", `badge ${style}`.trim(), label(goalLabels.status, status));
+  }
+  function goalDate(value) {
+    const time = new Date(value);
+    return Number.isSafeInteger(value) && value > 0 && !Number.isNaN(time.getTime()) ? time.toLocaleString("zh-CN", { hour12: false }) : "时间未知";
+  }
+  function goalSource(item) { return `${label(goalLabels.source, item.source_kind)} · ${text(item.source_channel, "未知通道")}`; }
+  function goalOwner(item) {
+    const scope = label(goalLabels.visibility, item.visibility);
+    return item.visibility === "user" && typeof item.owner === "string" ? `${scope}（${item.owner}）` : scope;
+  }
+
+  async function loadGoals(append = false) {
+    if (!token || goalLoading || (append && goalCursor === null)) return;
+    goalLoading = true;
+    const requestEpoch = epoch;
+    renderGoals();
+    try {
+      let cursor = append ? goalCursor : null;
+      const collected = [];
+      const seen = new Set();
+      let meta = null;
+      const pages = append ? 1 : goalPages;
+      for (let page = 0; page < pages; page += 1) {
+        const body = await api(cursorUrl("/api/goals", cursor));
+        if (!body || !Array.isArray(body.items) || !body.items.every(validGoal) ||
+          !(body.next_cursor === null || typeof body.next_cursor === "string") || !Number.isSafeInteger(body.revision)) {
+          throw new ApiError("目标列表格式无效，请刷新重试。");
+        }
+        meta = body;
+        collected.push(...body.items);
+        cursor = body.next_cursor;
+        if (cursor === null) break;
+        if (seen.has(cursor)) throw new ApiError("目标分页游标重复，请刷新重试。");
+        seen.add(cursor);
+      }
+      if (epoch !== requestEpoch) return;
+      const merged = append ? [...goals, ...collected] : collected;
+      goals = [...new Map(merged.map((item) => [item.id, item])).values()];
+      goalCursor = cursor;
+      goalMeta = meta;
+      if (append) goalPages += 1;
+      showError("goals-error", "");
+    } catch (error) {
+      if (epoch !== requestEpoch) return;
+      if (error instanceof ApiError && error.message.startsWith("当前服务暂不可用")) {
+        showError("goals-error", "当前实例未开启认知（需以 --cognition 启动），或认知状态暂时无法读取。");
+      } else reportError("goals-error", error);
+    } finally {
+      if (epoch === requestEpoch) {
+        goalLoading = false;
+        renderGoals();
+      }
+    }
+  }
+
+  function renderGoals() {
+    $("goals-list").replaceChildren();
+    for (const item of goals) {
+      const selected = selectedGoal === item.id;
+      const entry = node("button", `record-button${selected ? " selected" : ""}`);
+      entry.type = "button";
+      entry.setAttribute("aria-pressed", String(selected));
+      const top = node("div", "record-topline");
+      top.append(node("span", "record-name", item.description + (item.description_truncated ? "…" : "")), goalBadge(item.status));
+      const extra = item.reflection_of ? `反思子目标，父目标 ${item.reflection_of} 不在当前状态中` : `反思草稿 ${count(item.reflections)} 份`;
+      entry.append(top, node("p", "record-meta", `${goalSource(item)} · 版本 ${count(item.revision)}`), node("p", "record-meta", `${goalOwner(item)} · ${extra}`));
+      entry.addEventListener("click", () => { void loadGoal(item.id); });
+      $("goals-list").append(entry);
+    }
+    if (goalMeta) $("goals-scope").textContent = `认知状态修订 ${count(goalMeta.revision)}。只读查看已保存的待办、状态与反思草稿；不能在此修改目标或触发规划。`;
+    $("goal-count").textContent = count(goals.length);
+    $("goals-empty").hidden = goals.length > 0;
+    $("goals-empty").textContent = goalLoading ? "正在读取认知目标…" : !$("goals-error").hidden ? "暂时无法读取认知目标。" : "还没有保存的认知目标。用户通过 /goal 保存待办后会显示在这里。";
+    $("goals-more").hidden = goalCursor === null;
+    $("goals-more").disabled = goalLoading;
+  }
+
+  async function loadGoal(id) {
+    const request = ++goalRequest;
+    const requestEpoch = epoch;
+    selectedGoal = id;
+    renderGoals();
+    emptyDetail("goal-detail", "◈", "正在读取目标", "正在读取目标状态、来源记录与反思草稿。");
+    try {
+      const body = await api(`/api/goal?${new URLSearchParams({ id }).toString()}`);
+      if (request !== goalRequest || requestEpoch !== epoch) return;
+      if (!body || !validGoal(body.goal) || body.goal.id !== id || !Array.isArray(body.reflections) || !Array.isArray(body.events) ||
+        !body.budget || typeof body.reflection_check !== "string") {
+        throw new ApiError("服务返回的目标格式无效，请重新选择目标。");
+      }
+      renderGoalDetail(body);
+    } catch (error) {
+      if (request === goalRequest && requestEpoch === epoch && !error.silent) {
+        emptyDetail("goal-detail", "◈", "未能读取目标", errorText(error));
+        const actions = node("div", "detail-actions");
+        actions.append(button("重新读取", "secondary", () => { void loadGoal(id); }));
+        $("goal-detail").firstChild.append(actions);
+      }
+    }
+  }
+
+  function renderGoalDetail(body) {
+    const goal = body.goal;
+    const heading = node("div", "detail-heading");
+    const title = Array.from(goal.description);
+    const short = title.length > 60 ? `${title.slice(0, 60).join("")}…` : goal.description;
+    heading.append(goalBadge(goal.status), node("h2", "", short), node("p", "", `目标 ${goal.id} · 版本 ${count(goal.revision)} · 认知状态修订 ${count(body.revision)}`));
+    const actions = node("div", "detail-actions");
+    actions.append(button("刷新此目标", "secondary", () => { void loadGoal(goal.id); }));
+    if (goal.reflection_of) actions.append(button("查看父目标", "secondary", () => { void loadGoal(goal.reflection_of); }));
+    heading.append(actions);
+    const detail = node("div", "detail-body");
+    if (short !== goal.description) detail.append(node("p", "goal-text", goal.description));
+    if (goal.description_truncated) detail.append(node("p", "truncation-note", "仅显示前 8192 字节，完整记录保留。"));
+    const grid = node("dl", "detail-grid");
+    const budget = body.budget;
+    grid.append(
+      detailPair("状态", label(goalLabels.status, goal.status)),
+      detailPair("来源", goalSource(goal)),
+      detailPair("可见范围", goalOwner(goal)),
+      detailPair("优先级", count(goal.priority)),
+      detailPair("预算", `模型请求 ≤ ${count(budget.max_model_requests)} · 工具 ≤ ${count(budget.max_tool_calls)} · 尝试 ≤ ${count(budget.max_attempts)} · 超时 ${count(budget.timeout_ms)} 毫秒`),
+      detailPair("有效期", body.expires_at_ms === null ? "未设置" : goalDate(body.expires_at_ms)),
+    );
+    if (body.wait_reason) grid.append(detailPair("等待原因", body.wait_reason));
+    if (body.block_reason) grid.append(detailPair("阻塞原因", label(goalLabels.block, body.block_reason)));
+    if (body.execution) grid.append(detailPair("执行记录", `任务 ${body.execution.task_id} · 轮次 ${body.execution.turn_id === null ? "尚未确定" : String(body.execution.turn_id)}`));
+    if (body.feedback) {
+      grid.append(detailPair("执行反馈", `${label(goalLabels.commit, body.feedback.commit)} · ${body.feedback.verification_met ? "满足验证条件" : "未满足验证条件"}`));
+    }
+    detail.append(grid);
+    detail.append(node("p", "detail-note", goal.reflection_of
+      ? `这是目标 ${goal.reflection_of} 的反思子目标。完成只说明草稿已保存并通过结构校验，父目标与现实目标都没有因此完成。`
+      : "“执行记录已验证”只表示该目标记录满足自身验证条件；反思草稿是模型建议，不代表现实目标完成。"));
+
+    const drafts = node("section", "goal-section");
+    drafts.append(node("h3", "", `反思草稿（${count(body.reflections.length)}）`));
+    if (body.reflection_check === "inconsistent") {
+      drafts.append(node("p", "inline-error", "当前修订的派生记录残缺或矛盾，没有草稿被标为当前；请检查本地认知状态。"));
+    }
+    if (!body.reflections.length) drafts.append(node("p", "muted", "此目标还没有反思子目标。"));
+    for (const item of body.reflections) {
+      if (!item || typeof item.goal_id !== "string") continue;
+      const card = node("article", "reflection-card");
+      const top = node("div", "record-topline");
+      const version = Number.isSafeInteger(item.parent_revision) ? `对应目标版本 ${count(item.parent_revision)}` : "对应版本未知";
+      top.append(node("span", "record-name", version), node("span", `badge ${item.current ? "good" : ""}`.trim(), item.current ? "当前草稿" : "历史草稿"));
+      card.append(top, node("p", "record-meta", `${label(goalLabels.status, item.status)} · ${label(goalLabels.draft, item.draft_state)} · ${item.goal_id}`));
+      if (item.draft && typeof item.draft.summary === "string") {
+        card.append(node("p", "", item.draft.summary), node("p", "", `建议下一步：${text(item.draft.next_step, "未提供")}`),
+          node("p", "record-meta", `需要用户补充信息：${item.draft.needs_user_input ? "是" : "否"}`));
+      } else if (item.draft_state === "unavailable") {
+        card.append(node("p", "turn-note", "子目标标记为已保存，但会话结果缺失或格式不一致；不显示正文，也不视为已保存。"));
+      }
+      if (!item.current) card.append(node("p", "truncation-note", "历史草稿不作为当前建议。"));
+      drafts.append(card);
+    }
+    drafts.append(node("p", "truncation-note", "草稿是模型建议，尚未验证；原待办仍保持未完成，需用户确认后再行动。"));
+    detail.append(drafts);
+
+    const events = node("section", "goal-section");
+    events.append(node("h3", "", `来源记录（最近 ${count(body.events.length)} 条）`));
+    if (!body.events.length) events.append(node("p", "muted", "没有与此目标直接关联的来源记录。"));
+    const list = node("ol", "judgment-steps");
+    for (const item of body.events) {
+      if (!item || typeof item.summary !== "string") continue;
+      const row = node("li", "judgment-step");
+      row.append(node("span", "record-name", label(goalLabels.event, item.kind)), node("span", "record-meta", `${label(goalLabels.source, item.source_kind)} · ${text(item.source_channel, "未知通道")} · ${goalDate(item.at_ms)}`));
+      const summary = node("p", "event-summary", item.summary);
+      row.append(summary);
+      if (item.summary_truncated) row.append(node("p", "truncation-note", "仅显示前 2048 字节。"));
+      list.append(row);
+    }
+    if (body.events.length) events.append(list);
+    if (body.events_omitted > 0) events.append(node("p", "truncation-note", `另有 ${count(body.events_omitted)} 条更早记录未列出。`));
+    events.append(node("p", "truncation-note", "用户反馈与文件片段是保存时的外部数据，未经验证。"));
+    detail.append(events);
+    $("goal-detail").replaceChildren(heading, detail);
+  }
+
   function switchView(next) {
     view = next;
     $("tasks-view").hidden = next !== "tasks";
     $("sessions-view").hidden = next !== "sessions";
     $("judgments-view").hidden = next !== "judgments";
-    $("page-title").textContent = next === "tasks" ? "任务状态" : next === "sessions" ? "会话记录" : "判断诊断";
+    $("goals-view").hidden = next !== "goals";
+    $("page-title").textContent = { tasks: "任务状态", sessions: "会话记录", judgments: "判断诊断", goals: "认知目标" }[next];
     for (const item of document.querySelectorAll("[data-view]")) {
       const active = item.dataset.view === next;
       item.classList.toggle("active", active);
@@ -656,6 +874,7 @@
     }
     if (next === "sessions" && sessions.length === 0) void loadSessions();
     if (next === "judgments") void loadJudgments();
+    if (next === "goals") void loadGoals();
   }
 
   async function refresh() {
@@ -670,6 +889,7 @@
         loadTasks(),
         // 停在判断页且未加载更早记录时刷新首页；判断错误显示在本页，不影响全局状态。
         view === "judgments" && judgmentPages === 1 ? loadJudgments() : Promise.resolve(),
+        view === "goals" ? loadGoals() : Promise.resolve(),
       ]);
       if (epoch !== requestEpoch) return;
       const failure = results.find((result) => result.status === "rejected");
@@ -722,6 +942,7 @@
       $("console-view").hidden = false;
       emptyDetail("task-detail", "◎", "选择一个任务", "在这里查看执行状态，以及针对当前代际请求取消。");
       emptyDetail("session-detail", "▤", "选择一段会话", "仅展示用户与助手文字，工具参数和结果不在此展示。");
+      emptyDetail("goal-detail", "◈", "选择一个目标", "查看状态、来源记录，以及当前和历史反思草稿。草稿是未验证的建议，不代表目标完成。");
       switchView("tasks");
       void refresh();
     } catch (error) {
@@ -742,10 +963,12 @@
       if (selectedSession) void loadSession(selectedSession, selectedSessionBefore);
     }
     if (view === "judgments" && judgmentPages > 1) void loadJudgments();
+    if (view === "goals" && selectedGoal !== null) void loadGoal(selectedGoal);
   });
   $("tasks-more").addEventListener("click", () => { void loadTasks(true).catch(() => {}); });
   $("sessions-more").addEventListener("click", () => { void loadSessions(true); });
   $("judgments-more").addEventListener("click", () => { void loadJudgments(true); });
+  $("goals-more").addEventListener("click", () => { void loadGoals(true); });
   for (const item of document.querySelectorAll("[data-view]")) item.addEventListener("click", () => switchView(item.dataset.view));
   document.addEventListener("visibilitychange", () => {
     clearTimeout(pollTimer);

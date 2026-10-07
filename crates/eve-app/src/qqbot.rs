@@ -536,6 +536,10 @@ pub async fn run_qqbot_with_learning_policy(
                     judgments: judgments
                         .clone()
                         .map(|recent| (recent, options.message_judge.name())),
+                    cognition: background
+                        .as_ref()
+                        .map(qq_cognition::Background::reader)
+                        .transpose()?,
                 }),
             )
             .await?;

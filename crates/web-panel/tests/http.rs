@@ -674,3 +674,219 @@ async fn judgment_log_is_authenticated_bounded_and_unavailable_by_default() {
     );
     panel.stop().await.unwrap();
 }
+
+struct Goals {
+    calls: Mutex<Vec<String>>,
+}
+impl PanelService for Goals {
+    fn status(&self) -> PanelResult<PanelStatus> {
+        Err(PanelError::Unavailable)
+    }
+    fn sessions(&self, _: Option<&str>, _: usize) -> PanelResult<Page<SessionSummary>> {
+        Err(PanelError::Unavailable)
+    }
+    fn tasks(&self, _: Option<&str>, _: usize) -> PanelResult<Page<TaskSummary>> {
+        Err(PanelError::Unavailable)
+    }
+    fn session(&self, _: &SessionKey, _: Option<u64>, _: usize) -> PanelResult<SessionDetail> {
+        Err(PanelError::Unavailable)
+    }
+    fn cancel(&self, _: &GenerationKey) -> PanelResult<CancelStatus> {
+        Err(PanelError::Unavailable)
+    }
+    fn goals(&self, after: Option<&str>, limit: usize) -> PanelResult<GoalPage> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("list:{after:?}:{limit}"));
+        Ok(GoalPage {
+            subject_id: "eve".into(),
+            revision: 7,
+            items: vec![summary()],
+            next_cursor: Some("目标-1".into()),
+        })
+    }
+    fn goal(&self, id: &str) -> PanelResult<GoalDetail> {
+        self.calls.lock().unwrap().push(format!("detail:{id}"));
+        if id != "目标-1" {
+            return Err(PanelError::NotFound);
+        }
+        Ok(GoalDetail {
+            subject_id: "eve".into(),
+            revision: 7,
+            goal: summary(),
+            verification: "user-goal:v1".into(),
+            stop_condition: "user-confirmation".into(),
+            wait_reason: Some("等待反思草稿".into()),
+            block_reason: None,
+            expires_at_ms: None,
+            budget: GoalBudget {
+                max_model_requests: 1,
+                max_tool_calls: 0,
+                max_attempts: 1,
+                timeout_ms: 30_000,
+            },
+            execution: None,
+            feedback: None,
+            events: vec![],
+            events_omitted: 0,
+            reflections: vec![ReflectionView {
+                goal_id: "反思-2".into(),
+                parent_revision: Some(2),
+                status: "completed",
+                current: true,
+                draft_state: "saved",
+                draft: Some(ReflectionDraft {
+                    summary: "<b>草稿</b>".into(),
+                    next_step: "请确认".into(),
+                    needs_user_input: true,
+                }),
+            }],
+            reflection_check: "ok",
+        })
+    }
+}
+fn summary() -> GoalSummary {
+    GoalSummary {
+        id: "目标-1".into(),
+        revision: 2,
+        status: "waiting",
+        priority: 50,
+        source_kind: "user",
+        source_channel: "qq.goal".into(),
+        visibility: "user",
+        owner: Some("用户-A".into()),
+        reflection_of: None,
+        reflections: 1,
+        description: "整理房间".into(),
+        description_truncated: false,
+    }
+}
+
+#[tokio::test]
+async fn goal_views_are_authenticated_strictly_queried_and_unavailable_by_default() {
+    let client = client();
+    let legacy = Arc::new(Service::default());
+    let panel_legacy = panel(legacy.clone()).await;
+    for path in ["/api/goals", "/api/goal?id=目标-1"] {
+        assert_code(
+            client
+                .get(url(&panel_legacy, path))
+                .bearer_auth(TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+        )
+        .await;
+    }
+    panel_legacy.stop().await.unwrap();
+
+    let service = Arc::new(Goals {
+        calls: Mutex::new(vec![]),
+    });
+    let panel = LocalPanel::bind(
+        PanelConfig {
+            address: "127.0.0.1:0".parse().unwrap(),
+            token: TOKEN.into(),
+        },
+        service.clone(),
+    )
+    .await
+    .unwrap();
+    for path in ["/api/goals", "/api/goal?id=目标-1"] {
+        assert_code(
+            client.get(url(&panel, path)).send().await.unwrap(),
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        )
+        .await;
+        for method in [Method::PUT, Method::DELETE] {
+            let response = client
+                .request(method, url(&panel, path))
+                .bearer_auth(TOKEN)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        }
+    }
+    let long = "a".repeat(257);
+    for path in [
+        "/api/goals?limit=0".to_owned(),
+        "/api/goals?limit=101".into(),
+        "/api/goals?after=".into(),
+        format!("/api/goals?after={long}"),
+        "/api/goals?after=%01".into(),
+        "/api/goals?before=1".into(),
+        "/api/goal".into(),
+        "/api/goal?id=".into(),
+        "/api/goal?id=%20padded".into(),
+        "/api/goal?id=bad%0A".into(),
+        format!("/api/goal?id={long}"),
+        "/api/goal?id=a&id=b".into(),
+        "/api/goal?id=a&limit=1".into(),
+    ] {
+        assert_code(
+            client
+                .get(url(&panel, &path))
+                .bearer_auth(TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+        )
+        .await;
+    }
+    assert!(service.calls.lock().unwrap().is_empty());
+
+    let response = client
+        .get(url(&panel, "/api/goals?after=目标-0&limit=100"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(body["revision"], 7);
+    assert_eq!(body["items"][0]["status"], "waiting");
+    assert_eq!(body["items"][0]["owner"], "用户-A");
+    assert_eq!(body["next_cursor"], "目标-1");
+
+    let body = client
+        .get(url(&panel, "/api/goal?id=目标-1"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(body["goal"]["id"], "目标-1");
+    assert_eq!(body["reflections"][0]["current"], true);
+    assert_eq!(body["reflections"][0]["draft"]["summary"], "<b>草稿</b>");
+    assert_eq!(body["reflection_check"], "ok");
+    assert_code(
+        client
+            .get(url(&panel, "/api/goal?id=missing"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::NOT_FOUND,
+        "not_found",
+    )
+    .await;
+    assert_eq!(
+        *service.calls.lock().unwrap(),
+        vec![
+            "list:Some(\"目标-0\"):100".to_owned(),
+            "detail:目标-1".into(),
+            "detail:missing".into(),
+        ]
+    );
+    panel.stop().await.unwrap();
+}

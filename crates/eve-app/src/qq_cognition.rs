@@ -43,7 +43,7 @@ const CONTEXT_ID: &str = "eve.cognition.context";
 const CONTEXT_SERVICE: &str = "eve.cognition.context.service";
 const CONTROL_SERVICE: &str = "eve.cognition.control.service";
 const CHANNEL: &str = "qq.goal";
-const INTERNAL_USER: &str = "cognition.internal";
+pub(crate) const INTERNAL_USER: &str = "cognition.internal";
 const HELP: &str =
     "用法：/goal 待办内容、/goals、/mind [目标ID]、/goal-feedback 目标ID 版本 反馈内容。";
 
@@ -449,6 +449,11 @@ impl Background {
     }
     pub(crate) fn finished(&self) -> watch::Receiver<bool> {
         self.finished.clone()
+    }
+    /// 本机面板只取得绑定 Internal 的读取句柄，不持有可写的管理能力。
+    pub(crate) fn reader(&self) -> Result<Arc<dyn CognitionReader>, AppError> {
+        let admin = self.commands.admin.as_ref().ok_or("认知管理句柄缺失")?;
+        Ok(admin.reader(ReadAccess::Internal)?)
     }
     pub(crate) async fn stop(self) -> Result<(), AppError> {
         self.commands.accepting.store(false, Ordering::SeqCst);

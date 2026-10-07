@@ -1,4 +1,5 @@
 //! QQ 宿主到公开面板契约的组合；不从 StateStore 旁路读取或修改数据。
+use eve_cognition_api::CognitionReader;
 use eve_control_api::{
     CancelDisposition, CommitState, ControlError, ControlService, ControlSnapshot, GenerationKey,
 };
@@ -23,6 +24,8 @@ pub(crate) struct QqPanel {
     pub started_at_unix_ms: u64,
     /// 本进程最近判断与启动时选择的判断方式；未开启面板时不记录。
     pub judgments: Option<(Arc<RecentRelationJudgments>, &'static str)>,
+    /// 开启 --cognition 时绑定 Internal 的只读句柄；面板不持有认知管理能力。
+    pub cognition: Option<Arc<dyn CognitionReader>>,
 }
 fn session_error(error: SessionError) -> PanelError {
     match error {
@@ -59,12 +62,16 @@ fn summary(snapshot: ControlSnapshot) -> TaskSummary {
         started_tools: snapshot.report.and_then(|report| report.run.started_tools),
     }
 }
-fn text(value: &str) -> (String, bool) {
-    let mut end = value.len().min(8192);
+/// 按 UTF-8 字符边界截取至多 max 字节，并报告是否截断。
+pub(crate) fn clip(value: &str, max: usize) -> (String, bool) {
+    let mut end = value.len().min(max);
     while !value.is_char_boundary(end) {
         end -= 1;
     }
     (value[..end].to_owned(), end < value.len())
+}
+fn text(value: &str) -> (String, bool) {
+    clip(value, 8192)
 }
 fn cursor(keys: &[SessionKey], limit: usize) -> Option<String> {
     (keys.len() == limit).then(|| keys.last().expect("nonempty page").session_id.clone())
@@ -240,6 +247,14 @@ impl PanelService for QqPanel {
             items: page.records.into_iter().map(judgment).collect(),
             next_before: page.next_before,
         })
+    }
+    fn goals(&self, after: Option<&str>, limit: usize) -> PanelResult<GoalPage> {
+        let reader = self.cognition.as_ref().ok_or(PanelError::Unavailable)?;
+        crate::web_panel_cognition::goals(reader.as_ref(), after, limit)
+    }
+    fn goal(&self, id: &str) -> PanelResult<GoalDetail> {
+        let reader = self.cognition.as_ref().ok_or(PanelError::Unavailable)?;
+        crate::web_panel_cognition::goal(reader.as_ref(), self.sessions.as_ref(), id)
     }
 }
 

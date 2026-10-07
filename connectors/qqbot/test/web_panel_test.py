@@ -111,6 +111,9 @@ class WebPanelAcceptance(unittest.TestCase):
             code, status = self.api(url, "/api/status")
             self.assertEqual(code, 200)
             self.assertTrue(status["qq"]["ready"])
+            # 未以 --cognition 启动时认知页明确不可用，不返回空列表冒充“没有目标”。
+            for path in ["/api/goals", "/api/goal?id=any-goal"]:
+                self.assertEqual(self.api(url, path), (503, {"error": "unavailable"}))
             code, sessions = self.api(url, "/api/sessions?limit=1")
             self.assertEqual(code, 200)
             key = sessions["sessions"][0]["key"]

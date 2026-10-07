@@ -149,3 +149,10 @@ input:focus { border-color: var(--accent); background: #fff; }
 .judgment-steps { list-style: none; margin: 0 0 18px; padding: 0; display: grid; gap: 8px; }
 .judgment-step { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 14px; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
 .judgment-step .record-meta { margin-top: 0; }
+.goal-section { margin: 22px 0 0; }
+.goal-section h3 { margin: 0 0 10px; font-size: 15px; }
+.goal-text { margin: 0 0 16px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.reflection-card { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; }
+.reflection-card .record-topline { margin-bottom: 6px; }
+.reflection-card p { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.event-summary { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }

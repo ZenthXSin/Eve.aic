@@ -106,6 +106,8 @@ impl LocalPanel {
             .route("/api/session", post(session))
             .route("/api/cancel", post(cancel))
             .route("/api/judgments", get(judgments))
+            .route("/api/goals", get(goals))
+            .route("/api/goal", get(goal))
             .fallback(|| async { error(StatusCode::NOT_FOUND, "not_found") })
             .layer(DefaultBodyLimit::max(16384))
             .layer(middleware::from_fn_with_state(shared.clone(), protect))
@@ -406,6 +408,46 @@ async fn judgments(
         return error(StatusCode::BAD_REQUEST, "invalid_query");
     }
     match shared.service.judgments(page.before, page.limit) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+async fn goals(
+    State(shared): State<Arc<Shared>>,
+    query: Result<Query<Listing>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Ok(Query(page)) = query else {
+        return error(StatusCode::BAD_REQUEST, "invalid_query");
+    };
+    if !valid_page(&page) {
+        return error(StatusCode::BAD_REQUEST, "invalid_query");
+    }
+    match shared.service.goals(page.after.as_deref(), page.limit) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoalQuery {
+    id: String,
+}
+async fn goal(
+    State(shared): State<Arc<Shared>>,
+    query: Result<Query<GoalQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return error(StatusCode::BAD_REQUEST, "invalid_query");
+    };
+    // 与认知契约的 ID 规则一致；非法 ID 不进入宿主读取。
+    if query.id.is_empty()
+        || query.id.len() > 256
+        || query.id.trim() != query.id
+        || query.id.chars().any(char::is_control)
+    {
+        return error(StatusCode::BAD_REQUEST, "invalid_query");
+    }
+    match shared.service.goal(&query.id) {
         Ok(value) => Json(value).into_response(),
         Err(e) => failure(e),
     }
