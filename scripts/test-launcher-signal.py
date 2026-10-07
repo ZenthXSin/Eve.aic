@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.request
 
 
 def main():
@@ -36,18 +37,22 @@ process.stdout.write(JSON.stringify({version:1,type:'ready'})+'\\n');
 for await (const line of readline.createInterface({input:process.stdin})) {
   if (JSON.parse(line).type === 'stop') break;
 }
+process.stdout.end(() => process.exit(0));
 ''', encoding="utf-8")
             node = root / ("runtime/node.exe" if os.name == "nt" else "runtime/bin/node")
             child = subprocess.Popen([str(node), str(root / "Launch.mjs"), "qq", "--no-prompt", "--bridge-script", str(bridge)],
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
             lines = []
             ready = queue.Queue()
+            web = queue.Queue()
 
             def read(stream):
                 for line in stream:
                     lines.append(line)
                     if "EVE_QQBOT_READY" in line:
                         ready.put(True)
+                    if "EVE_WEB_READY " in line:
+                        web.put(line.split("EVE_WEB_READY ", 1)[1].strip())
 
             readers = [threading.Thread(target=read, args=(stream,), daemon=True)
                        for stream in (child.stdout, child.stderr)]
@@ -55,6 +60,11 @@ for await (const line of readline.createInterface({input:process.stdin})) {
                 reader.start()
             try:
                 ready.get(timeout=30)
+                url = web.get(timeout=5)
+                token = json.loads((root / "config.json").read_text(encoding="utf-8"))["web"]["token"]
+                with urllib.request.urlopen(urllib.request.Request(url + "/api/status", headers={"Authorization": "Bearer " + token}), timeout=5) as response:
+                    if response.status != 200:
+                        raise RuntimeError("信号发送前宿主没有进入工作状态")
                 if os.name == "nt":
                     if not console.GenerateConsoleCtrlEvent(0, 0):
                         raise OSError(ctypes.get_last_error(), "无法向本测试控制台发送 Ctrl+C")
