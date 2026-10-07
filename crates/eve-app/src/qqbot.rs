@@ -1,7 +1,6 @@
 use crate::{
-    AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, install_core,
-    qq_cognition, qq_learning, qq_learning_commands, qq_memory, qq_memory_observer,
-    segment_commands,
+    AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_cognition, qq_learning,
+    qq_learning_commands, qq_memory, qq_memory_observer, segment_commands,
 };
 use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
@@ -309,6 +308,9 @@ pub async fn run_qqbot_with_learning_policy(
     let mut learning_background: Option<qq_learning::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
     let mut panel: Option<eve_web_panel::LocalPanel> = None;
+    let page_permit = eve_web_panel_api::PageWritePermit::default();
+    // 插件只能弱引用此宿主诊断句柄，避免 QQ 插件与 Kernel 形成引用环。
+    let runtime_inspector: Arc<dyn eve_plugin_api::RuntimeInspector> = Arc::new(kernel.clone());
     let result: Result<(), AppError> = async {
         kernel.register(Box::new(TrainingPlugin::new(options.training)?))?;
         kernel.start(&PluginId::new(TRAINING_PLUGIN_ID)?).await?;
@@ -369,13 +371,14 @@ pub async fn run_qqbot_with_learning_policy(
         } else {
             context
         });
-        let control = install_core(
+        let control = crate::install_core_with_pages(
             &kernel,
             registry.clone(),
             permissions,
             logger,
             &options.state_directory,
             bootstrap,
+            options.web_listen.map(|_| page_permit.clone()),
         )
         .await?;
         let learning_commands = if let (Some(learning), Some(memory)) = (&learning, &memory) {
@@ -445,6 +448,12 @@ pub async fn run_qqbot_with_learning_policy(
         } else {
             segment_preferences
         };
+        let segment_preferences = segment_preferences.map(|inner| {
+            Arc::new(crate::web_panel_plugins::ManagedSegmentPreferences {
+                inspector: Arc::downgrade(&runtime_inspector),
+                inner,
+            }) as Arc<dyn SegmentPreferences>
+        });
         let segment_commands = segment_preferences.clone().map_or_else(
             segment_commands::QqCommands::disabled,
             |store| match &memory {
@@ -530,6 +539,18 @@ pub async fn run_qqbot_with_learning_policy(
             let started = eve_web_panel::LocalPanel::bind(
                 config,
                 Arc::new(crate::web_panel::QqPanel {
+                    plugins: crate::web_panel_plugins::PanelPlugins::new(
+                        runtime_inspector.clone(),
+                        Arc::new(kernel.clone()),
+                        registry.clone(),
+                        page_permit.clone(),
+                        if options.segmented {
+                            std::collections::BTreeSet::from([SEGMENT_PREFERENCES_PLUGIN_ID.into()])
+                        } else {
+                            Default::default()
+                        },
+                    )
+                    .map_err(|_| "面板插件管理初始化失败")?,
                     sessions: sessions.0.clone(),
                     control,
                     channel: handle.clone(),

@@ -7,6 +7,43 @@ use serde_json::json;
 use std::{collections::BTreeMap, time::Duration};
 
 pub(crate) const OPENAI_NAMESPACE: &str = "provider.openai";
+
+pub(crate) struct CoreConfigValidator;
+impl eve_config_api::ConfigValidator for CoreConfigValidator {
+    fn validate(
+        &self,
+        snapshots: &BTreeMap<String, ConfigSnapshot>,
+    ) -> eve_config_api::ConfigResult<()> {
+        use eve_config_api::{
+            ConfigError, LLM_NAMESPACE, LlmRuntimeConfig, MODELS_NAMESPACE, ModelRolesConfig,
+        };
+        let invalid = || ConfigError::InvalidValue("宿主配置".into());
+        LlmRuntimeConfig::try_from(snapshots.get(LLM_NAMESPACE).ok_or_else(invalid)?)?;
+        eve_message_api::MessageConfig::try_from(
+            snapshots
+                .get(eve_message_api::MESSAGE_NAMESPACE)
+                .ok_or_else(invalid)?,
+        )
+        .map_err(|_| invalid())?;
+        let roles =
+            ModelRolesConfig::try_from(snapshots.get(MODELS_NAMESPACE).ok_or_else(invalid)?)?;
+        let primary = snapshots.get(OPENAI_NAMESPACE).ok_or_else(invalid)?;
+        let role = configured_role(primary).map_err(|_| invalid())?;
+        let profile = role.map(|r| roles.require(r)).transpose()?;
+        provider_config(primary, profile).map_err(|_| invalid())?;
+        if let Some(profile) = roles.profile(ModelRole::Jev)
+            && (profile.provider != "jev"
+                || profile.max_output_tokens.is_some()
+                || profile
+                    .credential_ref
+                    .as_deref()
+                    .is_some_and(|r| r != "env:EVE_JEV_API_KEY"))
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
 pub(crate) fn openai_schema() -> ConfigSchema {
     let string = |default, environment: &str| {
         let mut field = ConfigField::new(ConfigKind::String, Some(json!(default)));

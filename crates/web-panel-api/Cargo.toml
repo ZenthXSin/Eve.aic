@@ -10,3 +10,4 @@ eve-control-api = { path = "../control-api" }
 eve-memory-api = { path = "../memory-api" }
 eve-session-api = { path = "../session-api" }
 serde.workspace = true
+serde_json.workspace = true

@@ -27,6 +27,7 @@ mod web_panel;
 mod web_panel_cognition;
 mod web_panel_learning;
 mod web_panel_memory;
+mod web_panel_plugins;
 
 #[cfg(test)]
 #[path = "../../llm-openai/tests/support/mod.rs"]
@@ -283,16 +284,50 @@ pub(crate) async fn install_core(
     state_directory: &std::path::Path,
     bootstrap: CoreBootstrap,
 ) -> Result<Arc<dyn eve_control_api::ControlService>, AppError> {
-    let config_plugin = ConfigPlugin::new(ConfigBootstrap::new(
-        state_directory.join("configuration"),
-        vec![
-            runtime_llm_schema(),
-            config::openai_schema(),
-            qq_message_judge::provider_schema(),
-            model_roles_schema(),
-            eve_message_api::message_schema(),
-        ],
-    ))?;
+    install_core_with_pages(
+        kernel,
+        registry,
+        permissions,
+        logger,
+        state_directory,
+        bootstrap,
+        None,
+    )
+    .await
+}
+pub(crate) async fn install_core_with_pages(
+    kernel: &Kernel,
+    registry: Arc<dyn eve_plugin_api::ServiceRegistry>,
+    permissions: Arc<dyn eve_plugin_api::PermissionChecker>,
+    logger: Arc<dyn eve_plugin_api::Logger>,
+    state_directory: &std::path::Path,
+    bootstrap: CoreBootstrap,
+    page_permit: Option<eve_web_panel_api::PageWritePermit>,
+) -> Result<Arc<dyn eve_control_api::ControlService>, AppError> {
+    let mut schemas = vec![
+        runtime_llm_schema(),
+        config::openai_schema(),
+        qq_message_judge::provider_schema(),
+        model_roles_schema(),
+        eve_message_api::message_schema(),
+    ];
+    // 这些设置由宿主启动时捕获；页面不能把保存描述为当前实例已热更新。
+    for schema in &mut schemas {
+        if schema.namespace == eve_config_api::LLM_NAMESPACE
+            || schema.namespace == eve_message_api::MESSAGE_NAMESPACE
+        {
+            for field in schema.fields.values_mut() {
+                field.restart_required = true;
+            }
+        }
+    }
+    let mut config_plugin = ConfigPlugin::new(
+        ConfigBootstrap::new(state_directory.join("configuration"), schemas)
+            .with_validator(Arc::new(config::CoreConfigValidator)),
+    )?;
+    if let Some(permit) = page_permit {
+        config_plugin = config_plugin.with_web_pages(permit);
+    }
     install_core_with_config(
         kernel,
         registry,

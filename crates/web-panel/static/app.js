@@ -46,6 +46,13 @@
   let selectedMemory = null;
   let memoryRequest = 0;
   let evidenceRequest = 0;
+  let pluginsRequest = 0;
+  let pluginPagesRequest = 0;
+  let pluginPageRequest = 0;
+  let pluginActionPending = false;
+  let selectedPluginPage = null;
+  let pluginPageDirty = false;
+  let pluginPageSaving = false;
   const controllers = new Set();
   const judgmentLabels = {
     result: { decided: "已判定", failed: "判断失败", dropped: "已丢弃" },
@@ -160,7 +167,7 @@
           400: "请求无效，请刷新当前记录后重试。",
           403: "当前访问被拒绝。",
           404: "记录不存在，可能已变化，请刷新列表。",
-          409: "任务状态已经变化，请刷新后重新选择。",
+          409: "记录或配置已经变化，请刷新后重新操作。",
           413: "请求或记录超过面板的大小限制。",
           429: "请求较多，请稍后重试。",
           503: "当前服务暂不可用，请稍后刷新。",
@@ -229,6 +236,17 @@
     selectedMemory = null;
     memoryRequest += 1;
     evidenceRequest += 1;
+    pluginsRequest += 1;
+    pluginPagesRequest += 1;
+    pluginPageRequest += 1;
+    selectedPluginPage = null;
+    pluginPageDirty = false;
+    pluginPageSaving = false;
+    pluginActionPending = false;
+    for (const id of ["plugins-list", "plugin-operations", "plugin-pages-list", "plugin-page-detail"]) $(id).replaceChildren();
+    $("plugins-feedback").textContent = "";
+    showError("plugins-error", "");
+    showError("plugin-pages-error", "");
     $("memory-list").replaceChildren();
     $("memory-detail").replaceChildren();
     $("memory-count").textContent = "0";
@@ -1117,6 +1135,181 @@
     }
   }
 
+  async function loadPlugins() {
+    const request = ++pluginsRequest;
+    const requestEpoch = epoch;
+    try {
+      const [body, operations] = await Promise.all([api("/api/plugins"), api("/api/plugins/operations")]);
+      if (request !== pluginsRequest || requestEpoch !== epoch) return;
+      if (!body || typeof body.instance !== "string" || !Array.isArray(body.items) || !Array.isArray(operations)) {
+        throw new ApiError("插件列表格式无效。");
+      }
+      $("plugins-list").replaceChildren();
+      const reasons = { host_bound: "宿主已绑定此插件，调整后需重启程序。", protected_dependency: "宿主固定插件依赖它，不能单独停止。", failed: "插件启动或收尾失败，需要处理后重启程序。" };
+      const states = { Registered: "尚未启动", Starting: "正在启动", Active: "运行中", Stopping: "正在停止", Stopped: "已停止", Failed: "失败" };
+      for (const plugin of body.items) {
+        const card = node("article", "plugin-card");
+        card.append(node("h3", "", plugin.id), node("p", "record-meta", `版本 ${plugin.version} · ${states[plugin.state] || plugin.state}`),
+          node("p", "muted", `依赖：${plugin.dependencies.join("、") || "无"} · 权限：${plugin.permissions.join("、") || "无"}`));
+        if (plugin.reason) card.append(node("p", "detail-note", reasons[plugin.reason] || "当前状态不能操作。"));
+        if (plugin.can_start || plugin.can_stop) {
+          const action = plugin.can_stop ? "stop" : "start";
+          const control = button(action === "stop" ? "停止插件" : "启动插件", action === "stop" ? "danger-outline" : "secondary", async () => {
+            if (pluginActionPending) return;
+            pluginActionPending = true;
+            control.disabled = true;
+            showError("plugins-error", "");
+            try {
+              const receipt = await api("/api/plugins/action", { instance: body.instance, plugin_id: plugin.id, expected_state: plugin.state, action });
+              if (requestEpoch !== epoch) return;
+              $("plugins-feedback").textContent = `已提交操作 ${receipt.id}，完成状态请查看右侧记录。`;
+              await loadPlugins();
+            } catch (error) { if (requestEpoch === epoch) reportError("plugins-error", error); }
+            finally { if (requestEpoch === epoch) { pluginActionPending = false; control.disabled = false; } }
+          });
+          control.disabled = pluginActionPending;
+          card.append(control);
+        }
+        $("plugins-list").append(card);
+      }
+      const box = $("plugin-operations");
+      box.replaceChildren();
+      if (!operations.length) box.append(node("p", "muted", "本次面板访问还没有提交插件操作。"));
+      const statesOfOperation = { running: "进行中", completed: "已完成", failed: "失败，需处理", interrupted: "中断，需处理" };
+      for (const operation of operations) {
+        const card = node("article", "plugin-card");
+        card.append(node("h3", "", `${operation.id} · ${operation.action === "stop" ? "停止" : "启动"} ${operation.plugin_id}`), node("p", "muted", statesOfOperation[operation.state] || "未知状态"));
+        if (operation.state !== "running") {
+          const remove = button("移除记录", "secondary", async () => {
+            remove.disabled = true;
+            try { await api("/api/plugins/ack", { id: operation.id }); if (requestEpoch === epoch) await loadPlugins(); }
+            catch (error) { if (requestEpoch === epoch) reportError("plugins-error", error); }
+            finally { if (requestEpoch === epoch) remove.disabled = false; }
+          });
+          card.append(remove);
+        }
+        box.append(card);
+      }
+      showError("plugins-error", "");
+    } catch (error) { if (request === pluginsRequest && requestEpoch === epoch) reportError("plugins-error", error); }
+  }
+
+  async function loadPluginPages() {
+    const request = ++pluginPagesRequest;
+    const requestEpoch = epoch;
+    try {
+      const pages = await api("/api/plugin-pages");
+      if (request !== pluginPagesRequest || requestEpoch !== epoch) return;
+      if (!Array.isArray(pages)) throw new ApiError("插件页面目录格式无效。");
+      const list = $("plugin-pages-list");
+      list.replaceChildren();
+      if (!pages.length) list.append(node("p", "empty-list", "当前运行的插件未提供页面。"));
+      for (const link of pages) {
+        const open = button(link.page.title, "secondary", () => {
+          if (pluginPageSaving || pluginPageDirty) { showError("plugin-pages-error", "请先保存修改，或在右侧重新读取以放弃编辑，再切换页面。"); return; }
+          void openPluginPage(link);
+        });
+        const card = node("article", "plugin-card");
+        card.append(open, node("p", "record-meta", link.plugin_id));
+        list.append(card);
+      }
+      showError("plugin-pages-error", "");
+      // 定时刷新目录，保留右侧尚未保存的表单。
+    } catch (error) { if (request === pluginPagesRequest && requestEpoch === epoch) reportError("plugin-pages-error", error); }
+  }
+
+  async function openPluginPage(link, feedback = "") {
+    const request = ++pluginPageRequest;
+    const requestEpoch = epoch;
+    try {
+      const page = await api("/api/plugin-pages/read", { plugin_id: link.plugin_id, page_id: link.page.id });
+      if (request !== pluginPageRequest || requestEpoch !== epoch) return;
+      if (!page || !Array.isArray(page.fields) || !Number.isSafeInteger(page.revision) || typeof page.instance !== "string") throw new ApiError("插件页面格式无效。");
+      selectedPluginPage = link;
+      pluginPageDirty = false;
+      const form = node("form", "plugin-form");
+      form.append(node("h2", "", page.descriptor.title), node("p", "muted", page.descriptor.description), node("p", "record-meta", `插件 ${link.plugin_id} · 配置修订 ${page.revision}`));
+      const notice = node("p", "detail-note", feedback);
+      notice.setAttribute("role", "status");
+      const errorBox = node("p", "inline-error");
+      errorBox.setAttribute("role", "alert");
+      form.append(notice, errorBox);
+      const inputs = [];
+      for (const [index, field] of page.fields.entries()) {
+        if (!field.kind || !["boolean", "text", "integer"].includes(field.kind.type)) throw new ApiError("不支持的插件字段类型。");
+        const row = node("div", "plugin-field");
+        const label = node("label", "", field.label);
+        const input = node("input");
+        input.id = `plugin-field-${index}`;
+        label.htmlFor = input.id;
+        const initial = field.override_value === null ? field.value : field.override_value;
+        if (field.kind.type === "boolean") { input.type = "checkbox"; input.checked = initial === true; }
+        else {
+          input.type = field.kind.type === "integer" ? "number" : "text";
+          input.value = initial === null ? "" : String(initial);
+          if (field.kind.type === "integer") {
+            input.step = "1";
+            if (field.kind.minimum !== null) input.min = String(field.kind.minimum);
+            if (field.kind.maximum !== null) input.max = String(field.kind.maximum);
+          } else input.maxLength = 8192;
+          input.required = true;
+          // 字符串可以为空；只有数字需要非空。
+          if (field.kind.type === "text") input.required = false;
+        }
+        const reset = node("input");
+        reset.type = "checkbox";
+        const resetLabel = node("label", "reset-field");
+        resetLabel.append(reset, document.createTextNode("恢复默认（移除文件覆盖）"));
+        const item = { field, input, reset, changed: false };
+        const changed = () => { item.changed = true; pluginPageDirty = true; };
+        input.addEventListener("input", changed);
+        input.addEventListener("change", changed);
+        reset.addEventListener("change", () => { input.disabled = reset.checked; changed(); });
+        const source = { override: "文件覆盖", environment: "启动时环境配置", default: "默认值" }[field.source] || field.source;
+        row.append(label, input, resetLabel, node("p", "small-text", `${source}${field.restart_required ? " · 修改需重启" : " · 修改用于新请求"}`));
+        if (field.restart_required) row.append(node("p", "small-text", `当前生效：${field.value === null ? "未设置" : String(field.value)}`));
+        form.append(row);
+        inputs.push(item);
+      }
+      const actions = node("div", "plugin-actions");
+      const save = node("button", "button primary", "保存修改");
+      save.type = "submit";
+      const reload = button("重新读取（放弃编辑）", "secondary", () => { if (!pluginPageSaving) void openPluginPage(link); });
+      actions.append(save, reload);
+      form.append(actions);
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (pluginPageSaving) return;
+        const values = Object.create(null);
+        for (const item of inputs.filter((entry) => entry.changed)) {
+          let value = item.reset.checked ? null : item.field.kind.type === "boolean" ? item.input.checked : item.input.value;
+          if (value !== null && item.field.kind.type === "integer") {
+            value = Number(value);
+            if (!item.input.value.trim() || !Number.isSafeInteger(value)) { errorBox.textContent = "整数配置必须填写有效整数。"; return; }
+          }
+          values[item.field.id] = value;
+        }
+        if (!Object.keys(values).length) { notice.textContent = "没有需要保存的修改。"; return; }
+        pluginPageSaving = true;
+        save.disabled = true;
+        reload.disabled = true;
+        errorBox.textContent = "";
+        try {
+          const result = await api("/api/plugin-pages/save", { plugin_id: link.plugin_id, page_id: link.page.id, instance: page.instance, expected_revision: page.revision, values });
+          if (requestEpoch !== epoch || request !== pluginPageRequest) return;
+          pluginPageDirty = false;
+          await openPluginPage(link, `已保存修订 ${result.revision}。${result.restart_required.length ? `以下字段重启后生效：${result.restart_required.join("、")}` : "新请求使用更新后的配置。"}`);
+        } catch (error) {
+          if (requestEpoch === epoch && request === pluginPageRequest && !error.silent) errorBox.textContent = `${errorText(error)} 修改仍保留；先重新读取确认保存状态，再决定是否重试。`;
+        } finally {
+          if (requestEpoch === epoch) { pluginPageSaving = false; save.disabled = false; reload.disabled = false; }
+        }
+      });
+      $("plugin-page-detail").replaceChildren(form);
+      showError("plugin-pages-error", "");
+    } catch (error) { if (request === pluginPageRequest && requestEpoch === epoch) reportError("plugin-pages-error", error); }
+  }
+
   function switchView(next) {
     view = next;
     $("tasks-view").hidden = next !== "tasks";
@@ -1124,7 +1317,9 @@
     $("judgments-view").hidden = next !== "judgments";
     $("goals-view").hidden = next !== "goals";
     $("memory-view").hidden = next !== "memory";
-    $("page-title").textContent = { tasks: "任务状态", sessions: "会话记录", judgments: "判断诊断", goals: "认知目标", memory: "记忆偏好" }[next];
+    $("plugins-view").hidden = next !== "plugins";
+    $("plugin-pages-view").hidden = next !== "plugin-pages";
+    $("page-title").textContent = { tasks: "任务状态", sessions: "会话记录", judgments: "判断诊断", goals: "认知目标", memory: "记忆偏好", plugins: "插件管理", "plugin-pages": "插件页面" }[next];
     for (const item of document.querySelectorAll("[data-view]")) {
       const active = item.dataset.view === next;
       item.classList.toggle("active", active);
@@ -1135,6 +1330,8 @@
     if (next === "judgments") void loadJudgments();
     if (next === "goals") void loadGoals();
     if (next === "memory" && memoryScopes.length === 0) void loadMemoryScopes();
+    if (next === "plugins") void loadPlugins();
+    if (next === "plugin-pages") void loadPluginPages();
   }
 
   async function refresh() {
@@ -1150,6 +1347,8 @@
         // 停在判断页且未加载更早记录时刷新首页；判断错误显示在本页，不影响全局状态。
         view === "judgments" && judgmentPages === 1 ? loadJudgments() : Promise.resolve(),
         view === "goals" ? loadGoals() : Promise.resolve(),
+        view === "plugins" ? loadPlugins() : Promise.resolve(),
+        view === "plugin-pages" ? loadPluginPages() : Promise.resolve(),
       ]);
       if (epoch !== requestEpoch) return;
       const failure = results.find((result) => result.status === "rejected");
@@ -1204,6 +1403,7 @@
       emptyDetail("session-detail", "▤", "选择一段会话", "仅展示用户与助手文字，工具参数和结果不在此展示。");
       emptyDetail("memory-detail", "✦", "选择一个作用域", "查看已确认和已撤销的偏好、版本历史，以及每个版本的来源。来源正文需单独打开。");
       emptyDetail("goal-detail", "◈", "选择一个目标", "查看状态、来源记录，以及当前和历史反思草稿。草稿是未验证的建议，不代表目标完成。");
+      emptyDetail("plugin-page-detail", "▦", "选择一个插件页面", "在这里修改配置、恢复默认值并查看生效方式。");
       switchView("tasks");
       void refresh();
     } catch (error) {

@@ -17,6 +17,11 @@ pub const DEFAULT_BACKUP_LIMIT: usize = 20;
 pub type ConfigResult<T> = Result<T, ConfigError>;
 pub type ConfigOverrides = BTreeMap<String, NamespaceValues>;
 
+/// 宿主提供的业务校验；在提交之前检查完整候选配置，不发起模型或网络调用。
+pub trait ConfigValidator: Send + Sync {
+    fn validate(&self, snapshots: &BTreeMap<String, ConfigSnapshot>) -> ConfigResult<()>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ConfigKind {

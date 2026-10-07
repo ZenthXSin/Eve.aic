@@ -51,6 +51,15 @@ button { border: 0; }
 label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 10px; }
 input { width: 100%; border: 1px solid #bbc1cf; background: #fafbfc; border-radius: 8px; padding: 12px; color: var(--ink); }
 input:focus { border-color: var(--accent); background: #fff; }
+.plugin-card { padding: 16px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.plugin-card h3 { font-size: 14px; margin-bottom: 8px; }
+.plugin-card .button { margin-top: 10px; }
+.plugin-form { padding: 22px; display: grid; gap: 22px; }
+.plugin-field { display: grid; gap: 8px; overflow-wrap: anywhere; }
+.plugin-field label { margin: 0; }
+.plugin-field input[type="checkbox"] { width: auto; margin: 0 8px 0 0; }
+.plugin-field .reset-field { font-weight: 400; font-size: 12px; color: var(--muted); }
+.plugin-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 .field-note { color: var(--muted); font-size: 12px; line-height: 1.75; margin: 10px 0 25px; }
 .form-error { color: var(--bad); font-size: 13px; margin-bottom: 16px; line-height: 1.6; }
 .console-layout { display: grid; grid-template-columns: 208px minmax(0, 1fr); min-height: 100vh; }

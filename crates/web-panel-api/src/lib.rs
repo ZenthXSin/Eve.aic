@@ -3,6 +3,8 @@ use eve_control_api::GenerationKey;
 use eve_memory_api::MemoryScope;
 use eve_session_api::SessionKey;
 use serde::Serialize;
+mod extensions;
+pub use extensions::*;
 
 pub type PanelResult<T> = Result<T, PanelError>;
 
@@ -12,6 +14,7 @@ pub enum PanelError {
     NotFound,
     Stale,
     Unavailable,
+    Forbidden,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -407,6 +410,27 @@ pub struct LearningView {
 /// 每页 1..=100 项；历史最多 50 轮，每段正文最多 8192 字节并明确标注截断。
 /// 暴露给本机操作者；不存在通过 HTTP 指定其他 Provider、执行工具或新任务的入口。
 pub trait PanelService: Send + Sync {
+    fn plugins(&self) -> PanelResult<PluginList> {
+        Err(PanelError::Unavailable)
+    }
+    fn plugin_action(&self, _request: PluginAction) -> PanelFuture<'_, OperationReceipt> {
+        Box::pin(async { Err(PanelError::Unavailable) })
+    }
+    fn plugin_operations(&self) -> PanelResult<Vec<PluginOperation>> {
+        Err(PanelError::Unavailable)
+    }
+    fn acknowledge_plugin_operation(&self, _id: u64) -> PanelFuture<'_, bool> {
+        Box::pin(async { Err(PanelError::Unavailable) })
+    }
+    fn plugin_pages(&self) -> PanelResult<Vec<PluginPageLink>> {
+        Err(PanelError::Unavailable)
+    }
+    fn plugin_page(&self, _plugin: &str, _page: &str) -> PanelResult<PluginPage> {
+        Err(PanelError::Unavailable)
+    }
+    fn save_plugin_page(&self, _request: PageSaveRequest) -> PanelResult<PageSaved> {
+        Err(PanelError::Unavailable)
+    }
     fn status(&self) -> PanelResult<PanelStatus>;
     fn sessions(&self, after: Option<&str>, limit: usize) -> PanelResult<Page<SessionSummary>>;
     fn tasks(&self, after: Option<&str>, limit: usize) -> PanelResult<Page<TaskSummary>>;

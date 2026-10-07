@@ -30,6 +30,7 @@ pub(crate) struct QqPanel {
     pub memory: Option<crate::web_panel_memory::MemoryView>,
     /// 开启 --memory-learning 时的只读学习视图；面板不能记录决策或确认候选。
     pub learning: Option<crate::web_panel_learning::LearningRead>,
+    pub plugins: crate::web_panel_plugins::PanelPlugins,
 }
 fn session_error(error: SessionError) -> PanelError {
     match error {
@@ -81,6 +82,27 @@ fn cursor(keys: &[SessionKey], limit: usize) -> Option<String> {
     (keys.len() == limit).then(|| keys.last().expect("nonempty page").session_id.clone())
 }
 impl PanelService for QqPanel {
+    fn plugins(&self) -> PanelResult<PluginList> {
+        self.plugins.plugins()
+    }
+    fn plugin_action(&self, request: PluginAction) -> PanelFuture<'_, OperationReceipt> {
+        Box::pin(self.plugins.action(request))
+    }
+    fn plugin_operations(&self) -> PanelResult<Vec<PluginOperation>> {
+        self.plugins.operations()
+    }
+    fn acknowledge_plugin_operation(&self, id: u64) -> PanelFuture<'_, bool> {
+        Box::pin(self.plugins.acknowledge(id))
+    }
+    fn plugin_pages(&self) -> PanelResult<Vec<PluginPageLink>> {
+        self.plugins.pages()
+    }
+    fn plugin_page(&self, plugin: &str, page: &str) -> PanelResult<PluginPage> {
+        self.plugins.read(plugin, page)
+    }
+    fn save_plugin_page(&self, request: PageSaveRequest) -> PanelResult<PageSaved> {
+        self.plugins.save(request)
+    }
     fn status(&self) -> PanelResult<PanelStatus> {
         let QqBotStatus {
             ready,
