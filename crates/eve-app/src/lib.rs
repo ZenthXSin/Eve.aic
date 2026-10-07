@@ -3,6 +3,7 @@
 mod cognition;
 mod cognition_action;
 mod cognition_action_admission;
+mod cognition_plan;
 mod config;
 mod console;
 mod error;

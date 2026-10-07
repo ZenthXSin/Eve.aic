@@ -2,6 +2,8 @@
 members = [
     "crates/action-api",
     "crates/action-plugin",
+    "crates/plan-api",
+    "crates/plan-plugin",
     "crates/artifact-file",
     "crates/web-panel-api",
     "crates/web-panel",
