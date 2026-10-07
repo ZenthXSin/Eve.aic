@@ -306,6 +306,40 @@ fn denied_windows_replacement_preserves_the_existing_file_and_memory() {
     assert_eq!(store.get(&pid("owner"), "key").unwrap(), Some(vec![3]));
 }
 
+#[cfg(windows)]
+#[test]
+fn briefly_held_windows_snapshot_is_replaced_after_the_reader_closes() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.json");
+    let store = FileStateStore::open(directory.path()).unwrap();
+    store.set(&pid("owner"), "key".into(), vec![1]).unwrap();
+
+    // 模拟其他进程短暂读取快照：句柄在退避窗口内关闭，提交应在重试后成功。
+    let held_file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x0000_0001 | 0x0000_0002)
+        .open(&path)
+        .unwrap();
+    let reader = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        drop(held_file);
+    });
+    store.set(&pid("owner"), "key".into(), vec![2]).unwrap();
+    reader.join().unwrap();
+    assert_eq!(store.get(&pid("owner"), "key").unwrap(), Some(vec![2]));
+    let leftovers: Vec<_> = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "重试不得遗留临时文件：{leftovers:?}");
+    drop(store);
+    let store = FileStateStore::open(directory.path()).unwrap();
+    assert_eq!(store.get(&pid("owner"), "key").unwrap(), Some(vec![2]));
+}
+
 struct RecoveryPlugin {
     manifest: PluginManifest,
     seen: Arc<Mutex<Vec<Option<u8>>>>,
