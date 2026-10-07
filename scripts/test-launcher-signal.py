@@ -23,11 +23,18 @@ def main():
         console.FreeConsole()
         if not console.AllocConsole():
             raise OSError(ctypes.get_last_error(), "无法分配本测试的独立控制台")
+        console.SetConsoleCtrlHandler.argtypes = [ctypes.c_void_p, wintypes.BOOL]
+        console.SetConsoleCtrlHandler.restype = wintypes.BOOL
+        # runner 可能把忽略 Ctrl+C 的属性传给 Python；该属性还会传给所有子进程。
+        # 安装自定义处理器不会清除此属性，独立测试控制台必须显式恢复 Ctrl+C。
+        if not console.SetConsoleCtrlHandler(None, False):
+            raise OSError(ctypes.get_last_error(), "无法恢复本测试控制台的 Ctrl+C")
         callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
         handler = callback(lambda event: event in (0, 1))
-        console.SetConsoleCtrlHandler.argtypes = [callback, wintypes.BOOL]
-        if not console.SetConsoleCtrlHandler(handler, True):
+        if not console.SetConsoleCtrlHandler(ctypes.cast(handler, ctypes.c_void_p), True):
             raise OSError(ctypes.get_last_error(), "无法安装辅助进程信号处理器")
+        console.GetConsoleProcessList.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
+        console.GetConsoleProcessList.restype = wintypes.DWORD
     try:
         with tempfile.TemporaryDirectory(prefix="eve-owned-signal-") as temporary:
             bridge = pathlib.Path(temporary) / "bridge.mjs"
@@ -66,11 +73,18 @@ process.stdout.end(() => process.exit(0));
                     if response.status != 200:
                         raise RuntimeError("信号发送前宿主没有进入工作状态")
                 if os.name == "nt":
+                    processes = (wintypes.DWORD * 32)()
+                    count = console.GetConsoleProcessList(processes, len(processes))
+                    if not 3 <= count <= len(processes) or child.pid not in processes[:count]:
+                        raise RuntimeError("启动器和宿主未连接本测试控制台，不能验收广播信号")
                     if not console.GenerateConsoleCtrlEvent(0, 0):
                         raise OSError(ctypes.get_last_error(), "无法向本测试控制台发送 Ctrl+C")
                 else:
                     child.send_signal(signal.SIGINT)
-                child.wait(timeout=30)
+                try:
+                    child.wait(timeout=30)
+                except subprocess.TimeoutExpired as error:
+                    raise RuntimeError("Ctrl+C 后未取得正常退出：" + "".join(lines[-30:])) from error
                 for reader in readers:
                     reader.join(timeout=3)
                 if child.returncode != 0:
