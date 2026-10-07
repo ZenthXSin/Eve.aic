@@ -75,7 +75,7 @@ def main():
                            {"wait_receipt": {"path": str(state_file), "id": message["id"], "state": "Sent"}}]
             script += [{"wait_file": str(gates[3])}]
             scenario = work / "scenario.json"
-            scenario.write_text(json.dumps({"script": script}), encoding="utf-8")
+            scenario.write_text(json.dumps({"script": script, "wait_timeout_ms": 90000}), encoding="utf-8")
             env = {key: value for key, value in os.environ.items() if not key.startswith(("EVE_", "QQBOT_"))}
             env.update({"QQBOT_APP_ID": "100000000", "QQBOT_APP_SECRET": "test-app-secret",
                         "QQBOT_SANDBOX": "false", "EVE_OPENAI_API_KEY": "test-model-secret",
