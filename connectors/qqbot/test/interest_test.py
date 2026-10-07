@@ -53,6 +53,7 @@ class InterestAcceptance(unittest.TestCase):
         self.run_release = threading.Event()
         self.observe = self.default_observe
         self.provider_failure = False
+        self.failing = set()
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -76,12 +77,7 @@ class InterestAcceptance(unittest.TestCase):
                     decoded = json.loads(latest)
                 except (ValueError, TypeError):
                     decoded = None
-                if isinstance(decoded, dict) and "observer_version" in decoded and "known_interests" in decoded:
-                    kind = "interest"
-                elif "unverified_waiting_input" in latest:
-                    kind = "reflection"
-                else:
-                    kind = "chat"
+                kind = outer.classify(decoded, latest)
                 release = outer.run_release
                 with outer.lock:
                     outer.requests.append({"kind": kind, "body": body, "run": outer.runs,
@@ -95,15 +91,9 @@ class InterestAcceptance(unittest.TestCase):
                         if release.wait(0.01):
                             return
                         assert time.monotonic() < deadline, "response gate timed out"
-                status = 200
-                if kind == "interest":
-                    if outer.provider_failure:
-                        status = 503
-                    text = json.dumps(outer.observe(decoded), ensure_ascii=False)
-                elif kind == "reflection":
-                    text = json.dumps(ARTIFACT, ensure_ascii=False)
-                else:
-                    text = latest
+                failing = kind in outer.failing or (kind == "interest" and outer.provider_failure)
+                status = 503 if failing else 200
+                text = outer.reply(kind, decoded, latest)
                 response = ({"error": {"message": "local provider unavailable", "type": "test_error"}}
                             if status != 200 else {"choices": [{"index": 0, "finish_reason": "stop",
                                                                  "message": {"role": "assistant", "content": text}}]})
@@ -125,6 +115,20 @@ class InterestAcceptance(unittest.TestCase):
         self.server.server_close()
         self.thread.join()
         self.directory.cleanup()
+
+    def classify(self, decoded, latest):
+        if isinstance(decoded, dict) and "observer_version" in decoded and "known_interests" in decoded:
+            return "interest"
+        if "unverified_waiting_input" in latest:
+            return "reflection"
+        return "chat"
+
+    def reply(self, kind, decoded, latest):
+        if kind == "interest":
+            return json.dumps(self.observe(decoded), ensure_ascii=False)
+        if kind == "reflection":
+            return json.dumps(ARTIFACT, ensure_ascii=False)
+        return latest
 
     # 确定性观察替身：只按批次中真实的用户原文作答，不读取助手回复。
     def default_observe(self, batch):
@@ -183,7 +187,7 @@ class InterestAcceptance(unittest.TestCase):
         self.assertFalse(self.run_release.wait(0.65), "process stopped during observation")
 
     def run_eve(self, script, interest=True, memory=False, cognition=False, max_executions=1,
-                checkpoints=None, stop_at=None):
+                checkpoints=None, stop_at=None, extra=None):
         self.runs += 1
         self.run_release = threading.Event()
         events_path = self.work / f"events-{self.runs}.jsonl"
@@ -206,6 +210,7 @@ class InterestAcceptance(unittest.TestCase):
             command.append("--memory")
         if cognition:
             command.append("--cognition")
+        command.extend(extra or [])
 
         def inspect():
             for name, callback in (checkpoints or {}).items():

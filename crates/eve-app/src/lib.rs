@@ -19,6 +19,7 @@ mod qq_learning_commands;
 mod qq_memory;
 mod qq_memory_observer;
 mod qq_message_judge;
+mod qq_research;
 mod qqbot;
 mod segment_advice;
 mod segment_commands;
@@ -46,9 +47,9 @@ pub use message_evaluation::{
 };
 pub use qq_message_judge::MessageJudgeMode;
 pub use qqbot::{
-    QQBOT_HELP, QqBotOptions, run_qqbot, run_qqbot_with_components,
-    run_qqbot_with_interest_observer, run_qqbot_with_learning_policy,
-    run_qqbot_with_planner_factory,
+    InterestComponents, QQBOT_HELP, QqBotOptions, run_qqbot, run_qqbot_with_components,
+    run_qqbot_with_interest_components, run_qqbot_with_interest_observer,
+    run_qqbot_with_learning_policy, run_qqbot_with_planner_factory,
 };
 
 use eve_agent_prompt::FileAgentPrompt;
