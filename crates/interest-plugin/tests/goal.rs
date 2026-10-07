@@ -13,10 +13,7 @@ use eve_interest_plugin::{
     InterestController, InterestPlugin, LearningGoalDeriver, learning_goal_id,
 };
 use eve_kernel::{Kernel, KernelServices, backends::MemoryStateStore};
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use support::*;
 
 async fn open() -> (Kernel, InterestController, CognitionController) {
@@ -240,7 +237,7 @@ async fn goals_from_other_sources_are_never_overwritten() {
 /// 首次提交返回修订冲突，验证派生器暂缓并在下一次核对时成功。
 struct Racing {
     inner: CognitionController,
-    conflicts: AtomicUsize,
+    conflicts: Mutex<usize>,
 }
 impl CognitionAdmin for Racing {
     fn snapshot(&self) -> CognitionResult<CognitiveSnapshot> {
@@ -250,15 +247,12 @@ impl CognitionAdmin for Racing {
         self.inner.reader(access)
     }
     fn replace(&self, expected: u64, state: CognitiveState) -> CognitionResult<CognitiveSnapshot> {
-        if self
-            .conflicts
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                left.checked_sub(1)
-            })
-            .is_ok()
-        {
+        let mut left = self.conflicts.lock().unwrap();
+        if *left > 0 {
+            *left -= 1;
             return Err(CognitionError::StaleRevision);
         }
+        drop(left);
         self.inner.replace(expected, state)
     }
 }
@@ -270,7 +264,7 @@ async fn stale_revisions_defer_without_partial_goals_and_next_reconcile_succeeds
     let deriver = LearningGoalDeriver::new(
         Arc::new(Racing {
             inner: cognition.clone(),
-            conflicts: AtomicUsize::new(1),
+            conflicts: Mutex::new(1),
         }),
         "eve",
     )
