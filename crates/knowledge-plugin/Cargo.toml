@@ -1,0 +1,21 @@
+[package]
+name = "eve-knowledge-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-knowledge-api = { path = "../knowledge-api" }
+eve-plugin-api = { path = "../plugin-api" }
+eve-llm-api = { path = "../llm-api" }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-native-roots"] }
+serde.workspace = true
+serde_json.workspace = true
+ring.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+eve-kernel = { path = "../kernel" }
+tokio = { workspace = true, features = ["net", "io-util"] }
+tempfile.workspace = true

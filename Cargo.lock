@@ -288,6 +288,8 @@ dependencies = [
  "eve-interest-plugin",
  "eve-jev",
  "eve-kernel",
+ "eve-knowledge-api",
+ "eve-knowledge-plugin",
  "eve-learning-api",
  "eve-learning-plugin",
  "eve-llm-api",
@@ -493,6 +495,32 @@ name = "eve-kernel"
 version = "0.1.0"
 dependencies = [
  "eve-plugin-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "eve-knowledge-api"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
+name = "eve-knowledge-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-kernel",
+ "eve-knowledge-api",
+ "eve-llm-api",
+ "eve-plugin-api",
+ "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

@@ -182,6 +182,8 @@ python3 connectors/qqbot/test/segment_test.py
 
 `--interest-learning` 同时开启记忆和认知，从普通聊天观察用户明确表达的兴趣、经验与困难，只保存能在原话中逐字核对的陈述，并派生低优先级后台学习目标；`/interests` 查看，`/forget-interest 兴趣ID` 撤回并取消目标。默认观察间隔五分钟，`--interest-cooldown-ms` 可调整，见[兴趣观察](./兴趣观察.md)。
 
+`--research-source URL`（可重复，需同时 `--interest-learning`）为等待中的学习目标在入口页面同源目录内受控研究：只读 GET、每个目标修订至多一次、累计至多三次，失败不重试、中断不重放。`/knowledge 兴趣ID` 查看来源原文（网址、抓取时间、版本、逐字引用）与未验证推测，见[受控研究与领域知识](./受控研究与领域知识.md)。
+
 `--self-learning` 同时开启记忆、持续提炼和分段，证据充分的候选自动确认，明确节奏自动参与后续发送。`/self-learning status` 查看模式及关联情况；手动分段选择优先，`/segment reset` 清除手动选择并恢复跟随学习。默认提炼间隔五分钟，`--learning-cooldown-ms` 可调整。行为、恢复和容量见[自主偏好学习](./自主偏好学习.md)。
 
 ## 本机控制面板

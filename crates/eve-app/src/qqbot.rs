@@ -1,6 +1,7 @@
 use crate::{
     AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_cognition, qq_interest,
-    qq_learning, qq_learning_commands, qq_memory, qq_memory_observer, segment_commands,
+    qq_learning, qq_learning_commands, qq_memory, qq_memory_observer, qq_research,
+    segment_commands,
 };
 use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
@@ -8,6 +9,12 @@ use eve_config_api::{CONFIG_SERVICE_ID, ConfigServiceHandle};
 use eve_interest_api::{INTEREST_PLUGIN_ID, InterestObserver, ObservationOptions};
 use eve_interest_plugin::{InterestPlugin, LearningGoalDeriver, ModelInterestObserver};
 use eve_kernel::{Kernel, KernelServices};
+use eve_knowledge_api::{
+    KNOWLEDGE_PLUGIN_ID, KnowledgeExtractor, SourceFetcher, SourcePolicy, SourceSelector,
+};
+use eve_knowledge_plugin::{
+    HttpSourceFetcher, KnowledgePlugin, ModelKnowledgeExtractor, ModelSourceSelector, Researcher,
+};
 use eve_learning_api::{
     AutoConfirmationPolicy, LEARNING_PLUGIN_ID, LearningAdmin, LearningOptions, PreferenceExtractor,
 };
@@ -33,7 +40,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--memory-learning] [--self-learning] [--interest-learning] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -53,6 +60,8 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 /memory-decision 候选ID 查看学习决策、来源与目标版本，并核对实际保存状态。
 --interest-learning 从普通聊天观察用户明确表达的兴趣、经验与困难（同时开启记忆和认知），只保存可逐字核对的原话，并派生低优先级的后台学习目标；同一会话默认间隔 5 分钟（--interest-cooldown-ms 可调整），每批一次无工具请求。
 /interests 查看本会话记录的兴趣与学习目标；/forget-interest 兴趣ID 撤回兴趣并取消对应学习目标。
+--research-source 需同时 --interest-learning，可重复至多 8 个；为等待中的学习目标在这些入口页面的同源目录内受控研究（只读 GET，每个目标修订至多一次，每个目标累计至多 3 次）。
+/knowledge 兴趣ID 查看研究到的资料：来源原文附网址、抓取时间、版本与逐字引用，未验证推测单独标注；研究不重试、中断不重放。
 明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
 --segmented 把模型回复按自然段分成至多 3 条消息，段间停顿至多 2.5 秒；命令确认整条发送。
 /segment 查看本会话分段；/segment on|off|reset、/segment parts 2至5、/segment pace 0至200（%）按会话保存，从下一条回复生效。
@@ -79,6 +88,8 @@ pub struct QqBotOptions {
     pub learning_options: LearningOptions,
     pub interest_learning: bool,
     pub interest_options: ObservationOptions,
+    /// 受控研究的入口页面；为空表示不研究。
+    pub research_sources: Vec<String>,
     pub segmented: bool,
     pub message_judge: MessageJudgeMode,
     pub web_listen: Option<std::net::SocketAddr>,
@@ -102,6 +113,7 @@ impl Default for QqBotOptions {
             learning_options: LearningOptions::default(),
             interest_learning: false,
             interest_options: ObservationOptions::default(),
+            research_sources: Vec::new(),
             segmented: false,
             message_judge: MessageJudgeMode::Off,
             web_listen: None,
@@ -160,6 +172,11 @@ impl QqBotOptions {
                 Some("--node") => options.node_program = value,
                 Some("--bridge-script") => options.bridge_script = value.into(),
                 Some("--bridge-arg") => options.bridge_args.push(value),
+                Some("--research-source") => options.research_sources.push(
+                    value
+                        .into_string()
+                        .map_err(|_| "研究入口页面必须为 UTF-8 URL")?,
+                ),
                 Some("--web-listen") => {
                     options.web_listen = Some(
                         value
@@ -216,9 +233,32 @@ impl QqBotOptions {
         if options.memory_recall && !options.memory {
             return Err("--memory-recall 需要同时开启 --memory".into());
         }
+        research_policy(&options)?;
         Ok(Some(options))
     }
 }
+/// 研究入口页面只在显式开启兴趣学习时生效；校验不发起网络请求。
+fn research_policy(options: &QqBotOptions) -> Result<Option<SourcePolicy>, AppError> {
+    if options.research_sources.is_empty() {
+        return Ok(None);
+    }
+    if !options.interest_learning {
+        return Err("--research-source 需要同时开启 --interest-learning".into());
+    }
+    Ok(Some(SourcePolicy::new(&options.research_sources).map_err(
+        |_| "研究入口页面无效：至多 8 个互不重复、不含用户信息与片段的 http/https URL",
+    )?))
+}
+
+/// 兴趣学习的可替换实现；未提供的部分使用默认的模型观察器、HTTP 抓取器与模型选择/提炼器。
+#[derive(Clone, Default)]
+pub struct InterestComponents {
+    pub observer: Option<Arc<dyn InterestObserver>>,
+    pub fetcher: Option<Arc<dyn SourceFetcher>>,
+    pub selector: Option<Arc<dyn SourceSelector>>,
+    pub extractor: Option<Arc<dyn KnowledgeExtractor>>,
+}
+
 async fn interrupted() -> Result<(), AppError> {
     #[cfg(unix)]
     {
@@ -262,7 +302,14 @@ pub async fn run_qqbot_with_learning_policy(
     extractor: Option<Arc<dyn PreferenceExtractor>>,
     confirmation: Option<Arc<dyn AutoConfirmationPolicy>>,
 ) -> Result<QqBotStatus, AppError> {
-    run_qqbot_composed(options, factory, extractor, confirmation, None).await
+    run_qqbot_composed(
+        options,
+        factory,
+        extractor,
+        confirmation,
+        InterestComponents::default(),
+    )
+    .await
 }
 
 /// 受信宿主替换兴趣观察器；只有 --interest-learning 启用时调用。观察仍受持久化准入、
@@ -272,7 +319,25 @@ pub async fn run_qqbot_with_interest_observer(
     factory: Arc<dyn EndogenousPlannerFactory>,
     observer: Option<Arc<dyn InterestObserver>>,
 ) -> Result<QqBotStatus, AppError> {
-    run_qqbot_composed(options, factory, None, None, observer).await
+    run_qqbot_with_interest_components(
+        options,
+        factory,
+        InterestComponents {
+            observer,
+            ..InterestComponents::default()
+        },
+    )
+    .await
+}
+
+/// 受信宿主替换兴趣观察与受控研究的实现。研究只在配置 --research-source 时运行，
+/// 仍受来源范围、持久化准入、每个目标修订一次、累计次数、超时与停止规则约束。
+pub async fn run_qqbot_with_interest_components(
+    options: QqBotOptions,
+    factory: Arc<dyn EndogenousPlannerFactory>,
+    components: InterestComponents,
+) -> Result<QqBotStatus, AppError> {
+    run_qqbot_composed(options, factory, None, None, components).await
 }
 
 async fn run_qqbot_composed(
@@ -280,7 +345,7 @@ async fn run_qqbot_composed(
     factory: Arc<dyn EndogenousPlannerFactory>,
     extractor: Option<Arc<dyn PreferenceExtractor>>,
     confirmation: Option<Arc<dyn AutoConfirmationPolicy>>,
-    interest_observer: Option<Arc<dyn InterestObserver>>,
+    interest_components: InterestComponents,
 ) -> Result<QqBotStatus, AppError> {
     if options.self_learning {
         options.memory = true;
@@ -299,6 +364,7 @@ async fn run_qqbot_composed(
     }
     options.learning_options.validate()?;
     options.interest_options.validate()?;
+    let research_policy = research_policy(&options)?;
     let panel_config = options
         .web_listen
         .map(|address| -> Result<_, AppError> {
@@ -355,6 +421,7 @@ async fn run_qqbot_composed(
     let mut background: Option<qq_cognition::Background> = None;
     let mut learning_background: Option<qq_learning::Background> = None;
     let mut interest_background: Option<qq_interest::Background> = None;
+    let mut research_background: Option<qq_research::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
     let mut panel: Option<eve_web_panel::LocalPanel> = None;
     let page_permit = eve_web_panel_api::PageWritePermit::default();
@@ -406,6 +473,16 @@ async fn run_qqbot_composed(
             let controller = plugin.controller();
             kernel.register(Box::new(plugin))?;
             kernel.start(&PluginId::new(INTEREST_PLUGIN_ID)?).await?;
+            Some(controller)
+        } else {
+            None
+        };
+        // 知识账本同样先于通道加载；损坏时拒绝启动并保留原字节。
+        let knowledge = if research_policy.is_some() {
+            let plugin = KnowledgePlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(KNOWLEDGE_PLUGIN_ID)?).await?;
             Some(controller)
         } else {
             None
@@ -493,23 +570,32 @@ async fn run_qqbot_composed(
         } else {
             qq_cognition::Commands::disabled()
         };
+        // 兴趣观察与受控研究共用主模型配置；只在需要默认模型实现时读取凭据。
+        let core_resolver = || -> Result<Arc<dyn eve_llm_api::LlmModelResolver>, AppError> {
+            let settings = registry
+                .get(&ServiceId::new(CONFIG_SERVICE_ID)?)?
+                .ok_or("兴趣学习配置服务缺失")?
+                .value
+                .downcast::<ConfigServiceHandle>()
+                .map_err(|_| "兴趣学习配置服务类型错误")?;
+            let key = std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "缺少模型凭据")?;
+            Ok(Arc::new(crate::models::CoreModelResolver::new(
+                settings.0.clone(),
+                key,
+            )))
+        };
+        let InterestComponents {
+            observer: interest_observer,
+            fetcher,
+            selector,
+            extractor: knowledge_extractor,
+        } = interest_components;
         let interest_commands = if let Some(interests) = &interests {
             let memory = memory.clone().ok_or("兴趣观察缺少记忆服务")?;
             let cognition = Arc::new(background.as_ref().ok_or("兴趣观察缺少认知服务")?.admin()?);
             let observer = match interest_observer {
                 Some(observer) => observer,
-                None => {
-                    let settings = registry
-                        .get(&ServiceId::new(CONFIG_SERVICE_ID)?)?
-                        .ok_or("兴趣观察配置服务缺失")?
-                        .value
-                        .downcast::<ConfigServiceHandle>()
-                        .map_err(|_| "兴趣观察配置服务类型错误")?;
-                    let key = std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "缺少模型凭据")?;
-                    Arc::new(ModelInterestObserver::new(Arc::new(
-                        crate::models::CoreModelResolver::new(settings.0.clone(), key),
-                    )))
-                }
+                None => Arc::new(ModelInterestObserver::new(core_resolver()?)),
             };
             let deriver = Arc::new(LearningGoalDeriver::new(cognition.clone(), "eve")?);
             let dirty = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -521,9 +607,46 @@ async fn run_qqbot_composed(
                 options.interest_options.clone(),
                 dirty.clone(),
             )?);
-            qq_interest::Commands::enabled(Arc::new(interests.clone()), deriver, cognition, dirty)
+            qq_interest::Commands::enabled(
+                Arc::new(interests.clone()),
+                deriver,
+                cognition.clone(),
+                dirty,
+            )
         } else {
             qq_interest::Commands::disabled()
+        };
+        let research_commands = if let (Some(knowledge), Some(policy), Some(interests)) =
+            (&knowledge, research_policy, &interests)
+        {
+            let cognition = Arc::new(background.as_ref().ok_or("受控研究缺少认知服务")?.admin()?);
+            let fetcher: Arc<dyn SourceFetcher> = match fetcher {
+                Some(fetcher) => fetcher,
+                None => Arc::new(HttpSourceFetcher::new()?),
+            };
+            let selector: Arc<dyn SourceSelector> = match selector {
+                Some(selector) => selector,
+                None => Arc::new(ModelSourceSelector::new(core_resolver()?)),
+            };
+            let extractor: Arc<dyn KnowledgeExtractor> = match knowledge_extractor {
+                Some(extractor) => extractor,
+                None => Arc::new(ModelKnowledgeExtractor::new(core_resolver()?)),
+            };
+            let researcher = Arc::new(Researcher::new(
+                Arc::new(knowledge.clone()),
+                fetcher,
+                selector,
+                extractor,
+            ));
+            research_background = Some(qq_research::Background::start(
+                Arc::new(knowledge.clone()),
+                cognition,
+                researcher,
+                policy,
+            ));
+            qq_research::Commands::enabled(Arc::new(interests.clone()), Arc::new(knowledge.clone()))
+        } else {
+            qq_research::Commands::disabled()
         };
         let memory_commands = memory
             .as_ref()
@@ -564,6 +687,7 @@ async fn run_qqbot_composed(
             memory_commands,
             learning_commands,
             interest_commands,
+            research_commands,
             segment_commands,
         ])));
         if let Some(store) = segment_preferences {
@@ -674,6 +798,9 @@ async fn run_qqbot_composed(
         if let Some(interest) = &interest_background {
             interest.activate();
         }
+        if let Some(research) = &research_background {
+            research.activate();
+        }
         wait_channel(
             handle.status.clone(),
             background.as_ref().map(qq_cognition::Background::finished),
@@ -683,6 +810,9 @@ async fn run_qqbot_composed(
             interest_background
                 .as_ref()
                 .map(qq_interest::Background::finished),
+            research_background
+                .as_ref()
+                .map(qq_research::Background::finished),
             panel.as_ref().map(eve_web_panel::LocalPanel::finished),
         )
         .await
@@ -716,6 +846,15 @@ async fn run_qqbot_composed(
     }
     if let Some(interest) = &interest_background {
         interest.request_stop();
+    }
+    if let Some(research) = &research_background {
+        research.request_stop();
+    }
+    // 研究读取学习目标并写知识账本；在停止认知与 Kernel 前写入取消结局。
+    if let Some(research) = research_background
+        && let Err(error) = research.stop().await
+    {
+        secondary.push(error);
     }
     // 兴趣派生写认知状态；先结束兴趣后台，再停止认知插件。
     if let Some(interest) = interest_background
@@ -793,18 +932,21 @@ async fn wait_channel(
     background: Option<watch::Receiver<bool>>,
     learning: Option<watch::Receiver<bool>>,
     interest: Option<watch::Receiver<bool>>,
+    research: Option<watch::Receiver<bool>>,
     panel: Option<watch::Receiver<bool>>,
 ) -> Result<(), AppError> {
     let stop = interrupted();
     let stopped_background = background_finished(background);
     let stopped_learning = background_finished(learning);
     let stopped_interest = background_finished(interest);
+    let stopped_research = background_finished(research);
     let stopped_panel = background_finished(panel);
     tokio::pin!(
         stop,
         stopped_background,
         stopped_learning,
         stopped_interest,
+        stopped_research,
         stopped_panel
     );
     let mut ready_announced = false;
@@ -821,6 +963,7 @@ async fn wait_channel(
             _ = &mut stopped_background => return Err("认知后台已结束；QQ 通道停止准入并保留状态".into()),
             _ = &mut stopped_learning => return Err("偏好提炼后台已结束；QQ 通道停止准入并保留状态".into()),
             _ = &mut stopped_interest => return Err("兴趣观察后台已结束；QQ 通道停止准入并保留状态".into()),
+            _ = &mut stopped_research => return Err("受控研究后台已结束；QQ 通道停止准入并保留状态".into()),
             _ = &mut stopped_panel => return Err("本机面板异常结束；QQ 通道停止准入并保留状态".into()),
             result = &mut stop => return result,
             result = status.changed() => result.map_err(|_| "QQBot 状态通知丢失")?,
@@ -873,6 +1016,48 @@ mod recall_options_tests {
         for invalid in ["-1", "86400001", "soon"] {
             assert!(parse(&["--interest-cooldown-ms", invalid]).is_err());
         }
+    }
+
+    #[test]
+    fn research_sources_are_explicit_validated_and_require_interest_learning() {
+        assert!(parse(&[]).unwrap().research_sources.is_empty());
+        let seed = "https://docs.example/wiki/";
+        let error = parse(&["--research-source", seed]).unwrap_err().to_string();
+        assert!(error.contains("--interest-learning"));
+        let options = parse(&[
+            "--interest-learning",
+            "--research-source",
+            seed,
+            "--research-source",
+            "http://127.0.0.1:8080/watercolor/index.html",
+        ])
+        .unwrap();
+        assert_eq!(options.research_sources.len(), 2);
+        assert!(research_policy(&options).unwrap().is_some());
+        for invalid in [
+            "ftp://docs.example/",
+            "https://user@docs.example/",
+            "https://docs.example/#top",
+            "docs.example/wiki",
+        ] {
+            assert!(parse(&["--interest-learning", "--research-source", invalid]).is_err());
+        }
+        let duplicate = [
+            "--interest-learning",
+            "--research-source",
+            seed,
+            "--research-source",
+            seed,
+        ];
+        assert!(parse(&duplicate).is_err());
+        let mut many = vec!["--interest-learning"];
+        let seeds: Vec<String> = (0..9)
+            .map(|n| format!("https://docs.example/{n}/"))
+            .collect();
+        for seed in &seeds {
+            many.extend(["--research-source", seed.as_str()]);
+        }
+        assert!(parse(&many).is_err());
     }
 
     #[tokio::test]

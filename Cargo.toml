@@ -11,6 +11,8 @@ members = [
     "crates/learning-plugin",
     "crates/interest-api",
     "crates/interest-plugin",
+    "crates/knowledge-api",
+    "crates/knowledge-plugin",
     "crates/plugin-api",
     "crates/cognition-api",
     "crates/cognition-plugin",
