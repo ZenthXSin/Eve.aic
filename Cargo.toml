@@ -16,6 +16,8 @@ members = [
     "crates/practice-api",
     "crates/practice-plugin",
     "crates/practice-mindustry",
+    "crates/skill-api",
+    "crates/skill-plugin",
     "crates/plugin-api",
     "crates/cognition-api",
     "crates/cognition-plugin",

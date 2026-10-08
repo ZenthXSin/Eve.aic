@@ -21,6 +21,7 @@ mod qq_memory_observer;
 mod qq_message_judge;
 mod qq_practice;
 mod qq_research;
+mod qq_skill;
 mod qqbot;
 mod segment_advice;
 mod segment_commands;
