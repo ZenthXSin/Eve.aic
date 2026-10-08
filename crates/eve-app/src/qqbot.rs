@@ -1,6 +1,6 @@
 use crate::{
     AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_cognition, qq_interest,
-    qq_learning, qq_learning_commands, qq_memory, qq_memory_observer, qq_research,
+    qq_learning, qq_learning_commands, qq_memory, qq_memory_observer, qq_practice, qq_research,
     segment_commands,
 };
 use eve_cognition_loop_api::EndogenousPlannerFactory;
@@ -10,7 +10,8 @@ use eve_interest_api::{INTEREST_PLUGIN_ID, InterestObserver, ObservationOptions}
 use eve_interest_plugin::{InterestPlugin, LearningGoalDeriver, ModelInterestObserver};
 use eve_kernel::{Kernel, KernelServices};
 use eve_knowledge_api::{
-    KNOWLEDGE_PLUGIN_ID, KnowledgeExtractor, SourceFetcher, SourcePolicy, SourceSelector,
+    KNOWLEDGE_PLUGIN_ID, KnowledgeAdmin, KnowledgeExtractor, SourceFetcher, SourcePolicy,
+    SourceSelector,
 };
 use eve_knowledge_plugin::{
     HttpSourceFetcher, KnowledgePlugin, ModelKnowledgeExtractor, ModelSourceSelector, Researcher,
@@ -24,6 +25,9 @@ use eve_memory_api::{MEMORY_PLUGIN_ID, MemoryAdmin};
 use eve_memory_plugin::{LexicalMemoryRecall, MemoryContext, MemoryPlugin, MemoryRecallContext};
 use eve_message_plugin::MessageRouterPlugin;
 use eve_plugin_api::{PluginId, PluginResult, ServiceId};
+use eve_practice_api::{PRACTICE_PLUGIN_ID, PracticeDrafter, PracticeRunner};
+use eve_practice_mindustry::{MindustryServerRunner, RuntimeCommand};
+use eve_practice_plugin::{ModelPracticeDrafter, PracticePlugin, Practitioner};
 use eve_qqbot_plugin::{
     DEFAULT_QQBOT_APP_ID, QQ_SEGMENT_LIMITS, QQ_SEGMENT_POLICY, QQBOT_PLUGIN_ID,
     QQBOT_STATUS_SERVICE_ID, QqBotConfig, QqBotPlugin, QqBotStatus, QqBotStatusHandle,
@@ -40,7 +44,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -62,6 +66,8 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 /interests 查看本会话记录的兴趣与学习目标；/forget-interest 兴趣ID 撤回兴趣并取消对应学习目标。
 --research-source 需同时 --interest-learning，可重复至多 8 个；为等待中的学习目标在这些入口页面的同源目录内受控研究（只读 GET，每个目标修订至多一次，每个目标累计至多 3 次）。
 /knowledge 兴趣ID 查看研究到的资料：来源原文附网址、抓取时间、版本与逐字引用，未验证推测单独标注；研究不重试、中断不重放。
+--practice-mindustry-server 需同时 --interest-learning；为等待中的学习目标制作只含数据文件的最小 Mindustry 模组，用操作者提供的无头服务端 jar 在全新目录中实际加载并探测内容属性（--practice-java 默认 java），每个目标修订至多一次、每次至多三次尝试，只有实际加载且全部探测通过才记为已验证。
+/practice 兴趣ID 查看实践记录：每次尝试的产物文件、运行版本、加载状态、警告与探测期望/实际值；中断不重放。
 明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
 --segmented 把模型回复按自然段分成至多 3 条消息，段间停顿至多 2.5 秒；命令确认整条发送。
 /segment 查看本会话分段；/segment on|off|reset、/segment parts 2至5、/segment pace 0至200（%）按会话保存，从下一条回复生效。
@@ -90,6 +96,10 @@ pub struct QqBotOptions {
     pub interest_options: ObservationOptions,
     /// 受控研究的入口页面；为空表示不研究。
     pub research_sources: Vec<String>,
+    /// 实践验证使用的 Mindustry 无头服务端 jar；为空表示不实践。
+    pub practice_server_jar: Option<PathBuf>,
+    pub practice_java: OsString,
+    pub practice_java_args: Vec<OsString>,
     pub segmented: bool,
     pub message_judge: MessageJudgeMode,
     pub web_listen: Option<std::net::SocketAddr>,
@@ -114,6 +124,9 @@ impl Default for QqBotOptions {
             interest_learning: false,
             interest_options: ObservationOptions::default(),
             research_sources: Vec::new(),
+            practice_server_jar: None,
+            practice_java: "java".into(),
+            practice_java_args: Vec::new(),
             segmented: false,
             message_judge: MessageJudgeMode::Off,
             web_listen: None,
@@ -172,6 +185,11 @@ impl QqBotOptions {
                 Some("--node") => options.node_program = value,
                 Some("--bridge-script") => options.bridge_script = value.into(),
                 Some("--bridge-arg") => options.bridge_args.push(value),
+                Some("--practice-mindustry-server") => {
+                    options.practice_server_jar = Some(value.into());
+                }
+                Some("--practice-java") => options.practice_java = value,
+                Some("--practice-java-arg") => options.practice_java_args.push(value),
                 Some("--research-source") => options.research_sources.push(
                     value
                         .into_string()
@@ -234,6 +252,14 @@ impl QqBotOptions {
             return Err("--memory-recall 需要同时开启 --memory".into());
         }
         research_policy(&options)?;
+        if options.practice_server_jar.is_none()
+            && (options.practice_java != "java" || !options.practice_java_args.is_empty())
+        {
+            return Err("--practice-java 需要同时指定 --practice-mindustry-server".into());
+        }
+        if options.practice_server_jar.is_some() && !options.interest_learning {
+            return Err("--practice-mindustry-server 需要同时开启 --interest-learning".into());
+        }
         Ok(Some(options))
     }
 }
@@ -257,6 +283,10 @@ pub struct InterestComponents {
     pub fetcher: Option<Arc<dyn SourceFetcher>>,
     pub selector: Option<Arc<dyn SourceSelector>>,
     pub extractor: Option<Arc<dyn KnowledgeExtractor>>,
+    /// 替换实践草稿器；默认使用主模型的单次无工具请求。
+    pub drafter: Option<Arc<dyn PracticeDrafter>>,
+    /// 替换实践运行器；提供时即使未配置服务端 jar 也开启实践。
+    pub runner: Option<Arc<dyn PracticeRunner>>,
 }
 
 async fn interrupted() -> Result<(), AppError> {
@@ -365,6 +395,11 @@ async fn run_qqbot_composed(
     options.learning_options.validate()?;
     options.interest_options.validate()?;
     let research_policy = research_policy(&options)?;
+    let practice_enabled =
+        options.practice_server_jar.is_some() || interest_components.runner.is_some();
+    if practice_enabled && !options.interest_learning {
+        return Err("实践验证需要同时开启 --interest-learning".into());
+    }
     let panel_config = options
         .web_listen
         .map(|address| -> Result<_, AppError> {
@@ -422,6 +457,7 @@ async fn run_qqbot_composed(
     let mut learning_background: Option<qq_learning::Background> = None;
     let mut interest_background: Option<qq_interest::Background> = None;
     let mut research_background: Option<qq_research::Background> = None;
+    let mut practice_background: Option<qq_practice::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
     let mut panel: Option<eve_web_panel::LocalPanel> = None;
     let page_permit = eve_web_panel_api::PageWritePermit::default();
@@ -483,6 +519,16 @@ async fn run_qqbot_composed(
             let controller = plugin.controller();
             kernel.register(Box::new(plugin))?;
             kernel.start(&PluginId::new(KNOWLEDGE_PLUGIN_ID)?).await?;
+            Some(controller)
+        } else {
+            None
+        };
+        // 实践账本同样先于通道加载；损坏时拒绝启动并保留原字节。
+        let practice = if practice_enabled {
+            let plugin = PracticePlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(PRACTICE_PLUGIN_ID)?).await?;
             Some(controller)
         } else {
             None
@@ -589,6 +635,8 @@ async fn run_qqbot_composed(
             fetcher,
             selector,
             extractor: knowledge_extractor,
+            drafter: practice_drafter,
+            runner: practice_runner,
         } = interest_components;
         let interest_commands = if let Some(interests) = &interests {
             let memory = memory.clone().ok_or("兴趣观察缺少记忆服务")?;
@@ -648,6 +696,46 @@ async fn run_qqbot_composed(
         } else {
             qq_research::Commands::disabled()
         };
+        let practice_commands = if let (Some(practice), Some(interests)) = (&practice, &interests) {
+            let cognition = Arc::new(background.as_ref().ok_or("实践验证缺少认知服务")?.admin()?);
+            let runner: Arc<dyn PracticeRunner> = match practice_runner {
+                Some(runner) => runner,
+                None => Arc::new(
+                    MindustryServerRunner::new(
+                        RuntimeCommand {
+                            program: options.practice_java.clone(),
+                            prefix_args: options.practice_java_args.clone(),
+                        },
+                        options
+                            .practice_server_jar
+                            .clone()
+                            .ok_or("实践验证缺少运行环境")?,
+                    )
+                    .map_err(|error| format!("实践运行环境无效：{error}"))?,
+                ),
+            };
+            let drafter: Arc<dyn PracticeDrafter> = match practice_drafter {
+                Some(drafter) => drafter,
+                None => Arc::new(ModelPracticeDrafter::new(core_resolver()?)),
+            };
+            let practitioner = Arc::new(Practitioner::new(
+                Arc::new(practice.clone()),
+                drafter,
+                runner,
+            ));
+            practice_background = Some(qq_practice::Background::start(
+                Arc::new(practice.clone()),
+                cognition,
+                knowledge
+                    .clone()
+                    .map(|knowledge| Arc::new(knowledge) as Arc<dyn KnowledgeAdmin>),
+                practitioner,
+                options.state_directory.join("practice-work"),
+            ));
+            qq_practice::Commands::enabled(Arc::new(interests.clone()), Arc::new(practice.clone()))
+        } else {
+            qq_practice::Commands::disabled()
+        };
         let memory_commands = memory
             .as_ref()
             .map_or_else(qq_memory::Commands::disabled, |memory| {
@@ -688,6 +776,7 @@ async fn run_qqbot_composed(
             learning_commands,
             interest_commands,
             research_commands,
+            practice_commands,
             segment_commands,
         ])));
         if let Some(store) = segment_preferences {
@@ -801,6 +890,9 @@ async fn run_qqbot_composed(
         if let Some(research) = &research_background {
             research.activate();
         }
+        if let Some(practice) = &practice_background {
+            practice.activate();
+        }
         wait_channel(
             handle.status.clone(),
             background.as_ref().map(qq_cognition::Background::finished),
@@ -813,6 +905,9 @@ async fn run_qqbot_composed(
             research_background
                 .as_ref()
                 .map(qq_research::Background::finished),
+            practice_background
+                .as_ref()
+                .map(qq_practice::Background::finished),
             panel.as_ref().map(eve_web_panel::LocalPanel::finished),
         )
         .await
@@ -849,6 +944,15 @@ async fn run_qqbot_composed(
     }
     if let Some(research) = &research_background {
         research.request_stop();
+    }
+    if let Some(practice) = &practice_background {
+        practice.request_stop();
+    }
+    // 实践读取学习目标与知识并写实践账本；先终止运行中的进程并写入取消结局。
+    if let Some(practice) = practice_background
+        && let Err(error) = practice.stop().await
+    {
+        secondary.push(error);
     }
     // 研究读取学习目标并写知识账本；在停止认知与 Kernel 前写入取消结局。
     if let Some(research) = research_background
@@ -933,6 +1037,7 @@ async fn wait_channel(
     learning: Option<watch::Receiver<bool>>,
     interest: Option<watch::Receiver<bool>>,
     research: Option<watch::Receiver<bool>>,
+    practice: Option<watch::Receiver<bool>>,
     panel: Option<watch::Receiver<bool>>,
 ) -> Result<(), AppError> {
     let stop = interrupted();
@@ -940,6 +1045,7 @@ async fn wait_channel(
     let stopped_learning = background_finished(learning);
     let stopped_interest = background_finished(interest);
     let stopped_research = background_finished(research);
+    let stopped_practice = background_finished(practice);
     let stopped_panel = background_finished(panel);
     tokio::pin!(
         stop,
@@ -947,6 +1053,7 @@ async fn wait_channel(
         stopped_learning,
         stopped_interest,
         stopped_research,
+        stopped_practice,
         stopped_panel
     );
     let mut ready_announced = false;
@@ -964,6 +1071,7 @@ async fn wait_channel(
             _ = &mut stopped_learning => return Err("偏好提炼后台已结束；QQ 通道停止准入并保留状态".into()),
             _ = &mut stopped_interest => return Err("兴趣观察后台已结束；QQ 通道停止准入并保留状态".into()),
             _ = &mut stopped_research => return Err("受控研究后台已结束；QQ 通道停止准入并保留状态".into()),
+            _ = &mut stopped_practice => return Err("实践验证后台已结束；QQ 通道停止准入并保留状态".into()),
             _ = &mut stopped_panel => return Err("本机面板异常结束；QQ 通道停止准入并保留状态".into()),
             result = &mut stop => return result,
             result = status.changed() => result.map_err(|_| "QQBot 状态通知丢失")?,
