@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -52,7 +52,14 @@ impl Drop for Process {
     }
 }
 
+/// 每个用例都启动完整宿主和 Node 桥接子进程；并行运行时，负载较高的运行器（例如 Windows CI）
+/// 可能让桥接来不及在宿主的停止宽限期内响应。串行执行只消除测试之间的资源竞争，不放宽宿主行为。
+static PROCESS_CASES: Mutex<()> = Mutex::new(());
+
 fn process_case(case: &str) {
+    let _serial = PROCESS_CASES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
@@ -93,7 +100,8 @@ fn process_case(case: &str) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut process = Process(Some(command.spawn().unwrap()));
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // 只是防止测试无限挂起的安全期限；宿主的停止语义由下方断言检查。
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if process.0.as_mut().unwrap().try_wait().unwrap().is_some() {
             break;
