@@ -284,6 +284,8 @@ dependencies = [
  "eve-control-api",
  "eve-control-plugin",
  "eve-file-observer",
+ "eve-interest-api",
+ "eve-interest-plugin",
  "eve-jev",
  "eve-kernel",
  "eve-learning-api",
@@ -439,6 +441,37 @@ dependencies = [
  "ring",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "eve-interest-api"
+version = "0.1.0"
+dependencies = [
+ "eve-memory-api",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eve-interest-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-cognition-api",
+ "eve-cognition-loop-api",
+ "eve-cognition-loop-plugin",
+ "eve-cognition-plugin",
+ "eve-interest-api",
+ "eve-kernel",
+ "eve-llm-api",
+ "eve-memory-api",
+ "eve-memory-plugin",
+ "eve-plugin-api",
+ "eve-session-api",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
