@@ -184,6 +184,8 @@ python3 connectors/qqbot/test/segment_test.py
 
 `--research-source URL`（可重复，需同时 `--interest-learning`）为等待中的学习目标在入口页面同源目录内受控研究：只读 GET、每个目标修订至多一次、累计至多三次，失败不重试、中断不重放。`/knowledge 兴趣ID` 查看来源原文（网址、抓取时间、版本、逐字引用）与未验证推测，见[受控研究与领域知识](./受控研究与领域知识.md)。
 
+`--practice-mindustry-server jar`（需同时 `--interest-learning`）为等待中的学习目标制作只含数据文件的最小 Mindustry 模组，用操作者提供的无头服务端在全新目录中实际加载并探测内容属性，至多三次尝试、依据运行证据修正；只有实际加载且全部探测通过才记为已验证。`/practice 兴趣ID` 查看产物、运行版本、警告与探测期望/实际值，见[实践验证](./实践验证.md)。
+
 `--self-learning` 同时开启记忆、持续提炼和分段，证据充分的候选自动确认，明确节奏自动参与后续发送。`/self-learning status` 查看模式及关联情况；手动分段选择优先，`/segment reset` 清除手动选择并恢复跟随学习。默认提炼间隔五分钟，`--learning-cooldown-ms` 可调整。行为、恢复和容量见[自主偏好学习](./自主偏好学习.md)。
 
 ## 本机控制面板

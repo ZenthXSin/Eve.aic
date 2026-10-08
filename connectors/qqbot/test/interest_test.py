@@ -187,7 +187,7 @@ class InterestAcceptance(unittest.TestCase):
         self.assertFalse(self.run_release.wait(0.65), "process stopped during observation")
 
     def run_eve(self, script, interest=True, memory=False, cognition=False, max_executions=1,
-                checkpoints=None, stop_at=None, extra=None):
+                checkpoints=None, stop_at=None, extra=None, timeout=30):
         self.runs += 1
         self.run_release = threading.Event()
         events_path = self.work / f"events-{self.runs}.jsonl"
@@ -230,7 +230,7 @@ class InterestAcceptance(unittest.TestCase):
                 self.wait_until(lambda: stop_at.exists() or child.poll() is not None, "stop gate was not reached")
                 self.assertTrue(stop_at.exists(), "process exited before stop synchronization")
                 child.kill()
-            stdout, stderr = child.communicate(timeout=30)
+            stdout, stderr = child.communicate(timeout=timeout)
         finally:
             if child.poll() is None:
                 child.kill()

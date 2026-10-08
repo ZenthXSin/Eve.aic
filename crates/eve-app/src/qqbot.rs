@@ -98,7 +98,8 @@ pub struct QqBotOptions {
     pub research_sources: Vec<String>,
     /// 实践验证使用的 Mindustry 无头服务端 jar；为空表示不实践。
     pub practice_server_jar: Option<PathBuf>,
-    pub practice_java: OsString,
+    /// 启动运行环境的程序；未显式提供时为 java。
+    pub practice_java: Option<OsString>,
     pub practice_java_args: Vec<OsString>,
     pub segmented: bool,
     pub message_judge: MessageJudgeMode,
@@ -125,7 +126,7 @@ impl Default for QqBotOptions {
             interest_options: ObservationOptions::default(),
             research_sources: Vec::new(),
             practice_server_jar: None,
-            practice_java: "java".into(),
+            practice_java: None,
             practice_java_args: Vec::new(),
             segmented: false,
             message_judge: MessageJudgeMode::Off,
@@ -188,7 +189,7 @@ impl QqBotOptions {
                 Some("--practice-mindustry-server") => {
                     options.practice_server_jar = Some(value.into());
                 }
-                Some("--practice-java") => options.practice_java = value,
+                Some("--practice-java") => options.practice_java = Some(value),
                 Some("--practice-java-arg") => options.practice_java_args.push(value),
                 Some("--research-source") => options.research_sources.push(
                     value
@@ -253,7 +254,7 @@ impl QqBotOptions {
         }
         research_policy(&options)?;
         if options.practice_server_jar.is_none()
-            && (options.practice_java != "java" || !options.practice_java_args.is_empty())
+            && (options.practice_java.is_some() || !options.practice_java_args.is_empty())
         {
             return Err("--practice-java 需要同时指定 --practice-mindustry-server".into());
         }
@@ -703,7 +704,10 @@ async fn run_qqbot_composed(
                 None => Arc::new(
                     MindustryServerRunner::new(
                         RuntimeCommand {
-                            program: options.practice_java.clone(),
+                            program: options
+                                .practice_java
+                                .clone()
+                                .unwrap_or_else(|| "java".into()),
                             prefix_args: options.practice_java_args.clone(),
                         },
                         options
@@ -1124,6 +1128,44 @@ mod recall_options_tests {
         for invalid in ["-1", "86400001", "soon"] {
             assert!(parse(&["--interest-cooldown-ms", invalid]).is_err());
         }
+    }
+
+    #[test]
+    fn practice_runtime_is_explicit_and_requires_interest_learning() {
+        let default = parse(&[]).unwrap();
+        assert!(default.practice_server_jar.is_none() && default.practice_java_args.is_empty());
+        assert!(default.practice_java.is_none());
+        let error = parse(&["--practice-mindustry-server", "server.jar"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--interest-learning"));
+        for orphan in [
+            vec!["--interest-learning", "--practice-java", "java"],
+            vec!["--interest-learning", "--practice-java-arg", "-Dx=y"],
+        ] {
+            assert!(
+                parse(&orphan)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("--practice-mindustry-server")
+            );
+        }
+        let options = parse(&[
+            "--interest-learning",
+            "--practice-mindustry-server",
+            "server.jar",
+            "--practice-java",
+            "python3",
+            "--practice-java-arg",
+            "fake.py",
+        ])
+        .unwrap();
+        assert_eq!(
+            options.practice_server_jar,
+            Some(PathBuf::from("server.jar"))
+        );
+        assert_eq!(options.practice_java, Some(OsString::from("python3")));
+        assert_eq!(options.practice_java_args, [OsString::from("fake.py")]);
     }
 
     #[test]
