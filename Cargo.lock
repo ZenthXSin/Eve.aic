@@ -669,6 +669,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-practice-api"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eve-practice-mindustry"
+version = "0.1.0"
+dependencies = [
+ "eve-practice-api",
+ "ring",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "eve-practice-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-kernel",
+ "eve-llm-api",
+ "eve-plugin-api",
+ "eve-practice-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "eve-qqbot-plugin"
 version = "0.1.0"
 dependencies = [
