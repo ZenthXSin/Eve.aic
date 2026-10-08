@@ -1,7 +1,7 @@
 use crate::{
     AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_cognition, qq_interest,
     qq_learning, qq_learning_commands, qq_memory, qq_memory_observer, qq_practice, qq_research,
-    segment_commands,
+    qq_skill, segment_commands,
 };
 use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
@@ -38,13 +38,17 @@ use eve_segment_plugin::{
     ParagraphPlanner, RuleSegmentAdvisor, SEGMENT_PREFERENCES_PLUGIN_ID, SegmentPreferencePlugin,
 };
 use eve_session_api::{SESSION_SERVICE_ID, SessionServiceHandle};
+use eve_skill_api::{SKILL_PLUGIN_ID, SkillAdmin, SkillDistiller, SkillSelector};
+use eve_skill_plugin::{
+    Consolidator, ModelSkillDistiller, ModelSkillSelector, SkillAwareDrafter, SkillPlugin,
+};
 use eve_training_api::{TRAINING_PLUGIN_ID, TRAINING_SERVICE_ID, TrainingServiceHandle};
 use eve_training_plugin::{TrainingContext, TrainingPlugin};
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--skill-learning] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -68,6 +72,8 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 /knowledge 兴趣ID 查看研究到的资料：来源原文附网址、抓取时间、版本与逐字引用，未验证推测单独标注；研究不重试、中断不重放。
 --practice-mindustry-server 需同时 --interest-learning；为等待中的学习目标制作只含数据文件的最小 Mindustry 模组，用操作者提供的无头服务端 jar 在全新目录中实际加载并探测内容属性（--practice-java 默认 java），每个目标修订至多一次、每次至多三次尝试，只有实际加载且全部探测通过才记为已验证。
 /practice 兴趣ID 查看实践记录：每次尝试的产物文件、运行版本、加载状态、警告与探测期望/实际值；中断不重放。
+--skill-learning 需同时 --practice-mindustry-server；把实际验证通过的实践提炼为参数化技能，宿主核对能逐字还原原产物，再用与原值不同的参数在同一运行环境中实际运行通过后自动启用；后续任务的第一次尝试可选用已启用的技能，调用结果以实际运行证据为准。
+/skills 列出技能；/skill 技能ID 查看版本、验证证据、启用记录与调用；/skill disable|rollback 技能ID、/skill enable 技能ID 版本 停用、回退或启用某个已验证版本。
 明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
 --segmented 把模型回复按自然段分成至多 3 条消息，段间停顿至多 2.5 秒；命令确认整条发送。
 /segment 查看本会话分段；/segment on|off|reset、/segment parts 2至5、/segment pace 0至200（%）按会话保存，从下一条回复生效。
@@ -101,6 +107,8 @@ pub struct QqBotOptions {
     /// 启动运行环境的程序；未显式提供时为 java。
     pub practice_java: Option<OsString>,
     pub practice_java_args: Vec<OsString>,
+    /// 把已验证的实践固化为技能并在后续任务中复用；需要实践验证。
+    pub skill_learning: bool,
     pub segmented: bool,
     pub message_judge: MessageJudgeMode,
     pub web_listen: Option<std::net::SocketAddr>,
@@ -128,6 +136,7 @@ impl Default for QqBotOptions {
             practice_server_jar: None,
             practice_java: None,
             practice_java_args: Vec::new(),
+            skill_learning: false,
             segmented: false,
             message_judge: MessageJudgeMode::Off,
             web_listen: None,
@@ -173,6 +182,10 @@ impl QqBotOptions {
             }
             if arg == "--interest-learning" {
                 options.interest_learning = true;
+                continue;
+            }
+            if arg == "--skill-learning" {
+                options.skill_learning = true;
                 continue;
             }
             let value = args.next().ok_or("QQBot 参数缺少值")?;
@@ -261,6 +274,9 @@ impl QqBotOptions {
         if options.practice_server_jar.is_some() && !options.interest_learning {
             return Err("--practice-mindustry-server 需要同时开启 --interest-learning".into());
         }
+        if options.skill_learning && options.practice_server_jar.is_none() {
+            return Err("--skill-learning 需要同时指定 --practice-mindustry-server".into());
+        }
         Ok(Some(options))
     }
 }
@@ -288,6 +304,9 @@ pub struct InterestComponents {
     pub drafter: Option<Arc<dyn PracticeDrafter>>,
     /// 替换实践运行器；提供时即使未配置服务端 jar 也开启实践。
     pub runner: Option<Arc<dyn PracticeRunner>>,
+    /// 替换技能提炼器与选择器；默认各使用主模型的单次无工具请求。是否固化技能仍由 --skill-learning 决定。
+    pub distiller: Option<Arc<dyn SkillDistiller>>,
+    pub skill_selector: Option<Arc<dyn SkillSelector>>,
 }
 
 async fn interrupted() -> Result<(), AppError> {
@@ -400,6 +419,9 @@ async fn run_qqbot_composed(
         options.practice_server_jar.is_some() || interest_components.runner.is_some();
     if practice_enabled && !options.interest_learning {
         return Err("实践验证需要同时开启 --interest-learning".into());
+    }
+    if options.skill_learning && !practice_enabled {
+        return Err("技能固化需要同时开启实践验证".into());
     }
     let panel_config = options
         .web_listen
@@ -534,6 +556,16 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        // 技能账本同样先于通道加载；损坏时拒绝启动并保留原字节。
+        let skills = if options.skill_learning {
+            let plugin = SkillPlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(SKILL_PLUGIN_ID)?).await?;
+            Some(controller)
+        } else {
+            None
+        };
         let context: Arc<dyn ContextAssembler> = if let Some(memory) = &memory {
             let context = MemoryContext::new("qq", memory.clone(), context)?;
             Arc::new(if options.self_learning {
@@ -638,6 +670,8 @@ async fn run_qqbot_composed(
             extractor: knowledge_extractor,
             drafter: practice_drafter,
             runner: practice_runner,
+            distiller: skill_distiller,
+            skill_selector,
         } = interest_components;
         let interest_commands = if let Some(interests) = &interests {
             let memory = memory.clone().ok_or("兴趣观察缺少记忆服务")?;
@@ -718,28 +752,65 @@ async fn run_qqbot_composed(
                     .map_err(|error| format!("实践运行环境无效：{error}"))?,
                 ),
             };
-            let drafter: Arc<dyn PracticeDrafter> = match practice_drafter {
+            let mut drafter: Arc<dyn PracticeDrafter> = match practice_drafter {
                 Some(drafter) => drafter,
                 None => Arc::new(ModelPracticeDrafter::new(core_resolver()?)),
+            };
+            let skill_parts = match &skills {
+                Some(skills) => {
+                    let admin: Arc<dyn SkillAdmin> = Arc::new(skills.clone());
+                    let selector: Arc<dyn SkillSelector> = match skill_selector {
+                        Some(selector) => selector,
+                        None => Arc::new(ModelSkillSelector::new(core_resolver()?)),
+                    };
+                    let distiller: Arc<dyn SkillDistiller> = match skill_distiller {
+                        Some(distiller) => distiller,
+                        None => Arc::new(ModelSkillDistiller::new(core_resolver()?)),
+                    };
+                    // 后续任务的第一次尝试先经一次有记录的技能选择；其余照常草稿。
+                    drafter = Arc::new(SkillAwareDrafter::new(
+                        admin.clone(),
+                        selector,
+                        drafter,
+                        Arc::new(|| {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(1, |elapsed| {
+                                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                                })
+                        }),
+                    ));
+                    Some(qq_practice::Skills {
+                        admin: admin.clone(),
+                        consolidator: Arc::new(Consolidator::new(admin, distiller, runner.clone())),
+                    })
+                }
+                None => None,
             };
             let practitioner = Arc::new(Practitioner::new(
                 Arc::new(practice.clone()),
                 drafter,
                 runner,
             ));
-            practice_background = Some(qq_practice::Background::start(
-                Arc::new(practice.clone()),
+            practice_background = Some(qq_practice::Background::start(qq_practice::Services {
+                practice: Arc::new(practice.clone()),
                 cognition,
-                knowledge
+                knowledge: knowledge
                     .clone()
                     .map(|knowledge| Arc::new(knowledge) as Arc<dyn KnowledgeAdmin>),
                 practitioner,
-                options.state_directory.join("practice-work"),
-            ));
+                workspace_root: options.state_directory.join("practice-work"),
+                skills: skill_parts,
+            }));
             qq_practice::Commands::enabled(Arc::new(interests.clone()), Arc::new(practice.clone()))
         } else {
             qq_practice::Commands::disabled()
         };
+        let skill_commands = skills
+            .as_ref()
+            .map_or_else(qq_skill::Commands::disabled, |skills| {
+                qq_skill::Commands::enabled(Arc::new(skills.clone()))
+            });
         let memory_commands = memory
             .as_ref()
             .map_or_else(qq_memory::Commands::disabled, |memory| {
@@ -781,6 +852,7 @@ async fn run_qqbot_composed(
             interest_commands,
             research_commands,
             practice_commands,
+            skill_commands,
             segment_commands,
         ])));
         if let Some(store) = segment_preferences {
@@ -1166,6 +1238,23 @@ mod recall_options_tests {
         );
         assert_eq!(options.practice_java, Some(OsString::from("python3")));
         assert_eq!(options.practice_java_args, [OsString::from("fake.py")]);
+    }
+
+    #[test]
+    fn skill_learning_is_explicit_and_requires_a_practice_runtime() {
+        assert!(!parse(&[]).unwrap().skill_learning);
+        let error = parse(&["--interest-learning", "--skill-learning"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--practice-mindustry-server"));
+        let options = parse(&[
+            "--interest-learning",
+            "--practice-mindustry-server",
+            "server.jar",
+            "--skill-learning",
+        ])
+        .unwrap();
+        assert!(options.skill_learning);
     }
 
     #[test]

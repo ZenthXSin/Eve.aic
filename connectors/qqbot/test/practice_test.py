@@ -67,8 +67,9 @@ class PracticeAcceptance(unittest.TestCase):
     def tearDown(self):
         base().tearDown(self)
 
-    def run_eve(self, script, research=True, practice=True, real=False, **options):
+    def run_eve(self, script, research=True, practice=True, real=False, more=(), **options):
         extra = ["--research-source", self.seed] if research else []
+        extra += list(more)
         if practice and real:
             extra += ["--practice-mindustry-server", REAL_JAR]
         elif practice:

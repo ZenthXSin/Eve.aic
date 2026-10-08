@@ -153,8 +153,6 @@ pub fn validate_draft(
     profile: &RunnerProfile,
     draft: &PracticeDraft,
 ) -> PracticeResult<()> {
-    let invalid = || PracticeError::InvalidInput;
-    validate_text(&draft.rationale, MAX_RATIONALE_BYTES)?;
     let notes: BTreeSet<_> = task.notes.iter().map(|note| note.id.as_str()).collect();
     let mut used = BTreeSet::new();
     if draft
@@ -162,8 +160,15 @@ pub fn validate_draft(
         .iter()
         .any(|id| !notes.contains(id.as_str()) || !used.insert(id.as_str()))
     {
-        return Err(invalid());
+        return Err(PracticeError::InvalidInput);
     }
+    validate_artifact(profile, draft)
+}
+
+/// 不依赖任务资料的部分：说明、文件与探测的通用形状；技能实例等宿主生成的草稿也用它核对。
+pub fn validate_artifact(profile: &RunnerProfile, draft: &PracticeDraft) -> PracticeResult<()> {
+    let invalid = || PracticeError::InvalidInput;
+    validate_text(&draft.rationale, MAX_RATIONALE_BYTES)?;
     if !draft.applicable {
         return if draft.files.is_empty() && draft.probes.is_empty() {
             Ok(())

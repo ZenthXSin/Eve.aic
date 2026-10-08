@@ -7,8 +7,11 @@ on:
       - "crates/practice-api/**"
       - "crates/practice-plugin/**"
       - "crates/practice-mindustry/**"
+      - "crates/skill-api/**"
+      - "crates/skill-plugin/**"
       - "crates/eve-app/**"
       - "connectors/qqbot/test/practice_test.py"
+      - "connectors/qqbot/test/skill_test.py"
       - "connectors/qqbot/test/fake_mindustry.py"
       - ".github/workflows/mindustry.yml"
       - "Cargo.toml"
@@ -19,8 +22,11 @@ on:
       - "crates/practice-api/**"
       - "crates/practice-plugin/**"
       - "crates/practice-mindustry/**"
+      - "crates/skill-api/**"
+      - "crates/skill-plugin/**"
       - "crates/eve-app/**"
       - "connectors/qqbot/test/practice_test.py"
+      - "connectors/qqbot/test/skill_test.py"
       - "connectors/qqbot/test/fake_mindustry.py"
       - ".github/workflows/mindustry.yml"
       - "Cargo.toml"
@@ -61,3 +67,7 @@ jobs:
         run: |
           cargo +1.89.0 build -p eve-app --bin eve-qqbot --locked
           python3 connectors/qqbot/test/practice_test.py PracticeAcceptance.test_real_runtime_verifies_the_drafted_mod
+      - name: 实际 Eve QQBot 进程用真实服务端验证技能与后续调用
+        env:
+          EVE_MINDUSTRY_SERVER_JAR: ${{ runner.temp }}/server-release.jar
+        run: python3 connectors/qqbot/test/skill_test.py SkillAcceptance.test_real_runtime_verifies_skill_holdout_and_invocation

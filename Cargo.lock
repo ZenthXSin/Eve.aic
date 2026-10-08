@@ -311,6 +311,8 @@ dependencies = [
  "eve-segment-plugin",
  "eve-session-api",
  "eve-session-plugin",
+ "eve-skill-api",
+ "eve-skill-plugin",
  "eve-state-postgres",
  "eve-training-api",
  "eve-training-plugin",
@@ -792,6 +794,32 @@ dependencies = [
  "eve-llm-api",
  "eve-plugin-api",
  "eve-session-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "eve-skill-api"
+version = "0.1.0"
+dependencies = [
+ "eve-practice-api",
+ "ring",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eve-skill-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-kernel",
+ "eve-llm-api",
+ "eve-plugin-api",
+ "eve-practice-api",
+ "eve-practice-plugin",
+ "eve-skill-api",
  "serde",
  "serde_json",
  "tempfile",

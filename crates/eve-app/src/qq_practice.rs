@@ -13,6 +13,8 @@ use eve_practice_api::{
 };
 use eve_practice_plugin::Practitioner;
 use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput};
+use eve_skill_api::{INSTANCE_RATIONALE, SkillAdmin, SkillError, SkillFailure};
+use eve_skill_plugin::Consolidator;
 use std::{
     cmp::Reverse,
     fmt::Write,
@@ -25,6 +27,8 @@ use tokio::{sync::watch, task::JoinHandle};
 const SUBJECT: &str = "eve";
 /// 一次实践（至多三次草稿请求与三次实际运行）的总时长上限。
 const PRACTICE_TIMEOUT: Duration = Duration::from_secs(900);
+/// 一次技能提炼（一次提炼请求与一次验证运行）的总时长上限。
+const DISTILL_TIMEOUT: Duration = Duration::from_secs(600);
 const HELP: &str = "用法：/practice 兴趣ID 查看 Eve 为这条兴趣做过的实践与真实运行证据；兴趣 ID 可用 /interests 查看。";
 const DISABLED: &str = "实践验证未启用。";
 const SHOWN_RUNS: usize = 2;
@@ -35,6 +39,22 @@ fn now_ms() -> Result<u64, AppError> {
     )?)
 }
 
+/// 开启技能固化时，实践后台同时提炼技能并结算技能调用。
+pub(crate) struct Skills {
+    pub(crate) admin: Arc<dyn SkillAdmin>,
+    pub(crate) consolidator: Arc<Consolidator>,
+}
+
+/// 实践后台依赖的服务与工作目录。
+pub(crate) struct Services {
+    pub(crate) practice: Arc<dyn PracticeAdmin>,
+    pub(crate) cognition: Arc<dyn CognitionAdmin>,
+    pub(crate) knowledge: Option<Arc<dyn KnowledgeAdmin>>,
+    pub(crate) practitioner: Arc<Practitioner>,
+    pub(crate) workspace_root: PathBuf,
+    pub(crate) skills: Option<Skills>,
+}
+
 pub(crate) struct Background {
     active: watch::Sender<bool>,
     stop: watch::Sender<bool>,
@@ -42,28 +62,13 @@ pub(crate) struct Background {
     task: JoinHandle<Result<(), AppError>>,
 }
 impl Background {
-    pub(crate) fn start(
-        practice: Arc<dyn PracticeAdmin>,
-        cognition: Arc<dyn CognitionAdmin>,
-        knowledge: Option<Arc<dyn KnowledgeAdmin>>,
-        practitioner: Arc<Practitioner>,
-        workspace_root: PathBuf,
-    ) -> Self {
+    pub(crate) fn start(services: Services) -> Self {
         let (active, activated) = watch::channel(false);
         let (stop, stopped) = watch::channel(false);
         let (finished_sender, finished) = watch::channel(false);
         let task = tokio::spawn(async move {
             // Sender 在 panic 时也释放；宿主随后关闭通道，不假装后台仍正常。
-            let result = run(
-                practice,
-                cognition,
-                knowledge,
-                practitioner,
-                workspace_root,
-                activated,
-                stopped,
-            )
-            .await;
+            let result = run(services, activated, stopped).await;
             let _ = finished_sender.send(true);
             result
         });
@@ -161,14 +166,18 @@ fn task(
 }
 
 async fn run(
-    practice: Arc<dyn PracticeAdmin>,
-    cognition: Arc<dyn CognitionAdmin>,
-    knowledge: Option<Arc<dyn KnowledgeAdmin>>,
-    practitioner: Arc<Practitioner>,
-    workspace_root: PathBuf,
+    services: Services,
     mut active: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
 ) -> Result<(), AppError> {
+    let Services {
+        practice,
+        cognition,
+        knowledge,
+        practitioner,
+        workspace_root,
+        skills,
+    } = services;
     loop {
         if *active.borrow() {
             break;
@@ -184,8 +193,20 @@ async fn run(
         std::fs::remove_dir_all(&workspace_root).map_err(|_| "无法清理实践工作目录")?;
     }
     std::fs::create_dir_all(&workspace_root).map_err(|_| "无法创建实践工作目录")?;
+    // 上次进程退出前选定技能的调用，依据实践账本核对结果；不重放。
+    if let Some(skills) = &skills {
+        eve_skill_plugin::settle(&*skills.admin, &practice.snapshot()?, now_ms()?)?;
+    }
     let mut practicing = true;
+    let mut distilling = skills.is_some();
     loop {
+        if *stopped.borrow() {
+            return Ok(());
+        }
+        // 先固化已验证的方法，再开始下一项实践，使后续任务可以复用。
+        if let Some(skills) = skills.as_ref().filter(|_| distilling) {
+            distilling = consolidate(&*practice, skills, &workspace_root, &mut stopped).await?;
+        }
         if *stopped.borrow() {
             return Ok(());
         }
@@ -230,6 +251,9 @@ async fn run(
                     &mut stopped,
                 )
                 .await?;
+                if let Some(skills) = &skills {
+                    eve_skill_plugin::settle(&*skills.admin, &practice.snapshot()?, now_ms()?)?;
+                }
                 // 一次只实践一个目标；下一轮重新读取认知状态。
                 break;
             }
@@ -270,6 +294,59 @@ async fn execute(
         practice.abandon(&run.id, now_ms()?.max(began), failure)?;
     }
     Ok(())
+}
+
+/// 提炼最早一次尚未提炼的已验证实践；返回 false 表示容量已满，之后不再提炼。
+async fn consolidate(
+    practice: &dyn PracticeAdmin,
+    skills: &Skills,
+    workspace_root: &std::path::Path,
+    stopped: &mut watch::Receiver<bool>,
+) -> Result<bool, AppError> {
+    let consolidator = &skills.consolidator;
+    let Some(candidate) = consolidator.candidate(&skills.admin.snapshot()?, &practice.snapshot()?)
+    else {
+        return Ok(true);
+    };
+    let entry = match skills.admin.begin_distillation(
+        &candidate.owner,
+        candidate.origin,
+        candidate.source,
+        consolidator.runner(),
+        consolidator.distiller_version(),
+        now_ms()?,
+    ) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return Ok(true),
+        // 容量满保留原记录：停止新的提炼，已有技能仍可使用与查看。
+        Err(SkillError::LimitReached) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let began = entry.started_at_ms;
+    let abandoned = {
+        let work = consolidator.consolidate(&entry, &candidate.evidence, workspace_root, || {
+            now_ms().unwrap_or(began)
+        });
+        tokio::pin!(work);
+        tokio::select! {
+            biased;
+            _ = stop_requested(stopped) => Some(SkillFailure::Cancelled),
+            result = tokio::time::timeout(DISTILL_TIMEOUT, &mut work) => match result {
+                Ok(Ok(_)) => None,
+                // 存储失败时句柄已关闭；提炼留在 Running，重启后记为中断。
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => Some(SkillFailure::Timeout),
+            },
+        }
+    };
+    // 放弃时验证运行的进程已随 future 终止；只记录原因，结果未知，不重放。
+    if let Some(failure) = abandoned {
+        let _ = std::fs::remove_dir_all(Consolidator::workspace(workspace_root, &entry.id));
+        skills
+            .admin
+            .abandon_distillation(&entry.id, now_ms()?.max(began), failure)?;
+    }
+    Ok(true)
 }
 
 /// /practice 兴趣ID：只读当前会话自己的兴趣对应的实践记录。
@@ -421,6 +498,9 @@ fn render_attempt(reply: &mut String, attempt: &PracticeAttempt) {
     {
         let files: Vec<&str> = draft.files.iter().map(|file| file.path.as_str()).collect();
         let _ = write!(reply, "\n    产物：{}", files.join("、"));
+        if draft.rationale.starts_with(INSTANCE_RATIONALE) {
+            let _ = write!(reply, "｜{}", draft.rationale);
+        }
         if !draft.notes_used.is_empty() {
             let _ = write!(reply, "｜依据资料 {} 条", draft.notes_used.len());
         }
