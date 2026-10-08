@@ -1,0 +1,63 @@
+name: Mindustry 真实运行验收
+
+# 用固定版本、校验摘要的 Mindustry 无头服务端实际加载最小模组，区分确定性替身与真实运行证据。
+on:
+  pull_request:
+    paths:
+      - "crates/practice-api/**"
+      - "crates/practice-plugin/**"
+      - "crates/practice-mindustry/**"
+      - "crates/eve-app/**"
+      - "connectors/qqbot/test/practice_test.py"
+      - "connectors/qqbot/test/fake_mindustry.py"
+      - ".github/workflows/mindustry.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches: [main]
+    paths:
+      - "crates/practice-api/**"
+      - "crates/practice-plugin/**"
+      - "crates/practice-mindustry/**"
+      - "crates/eve-app/**"
+      - "connectors/qqbot/test/practice_test.py"
+      - "connectors/qqbot/test/fake_mindustry.py"
+      - ".github/workflows/mindustry.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  real:
+    name: Mindustry v160.7 无头服务端
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MINDUSTRY_VERSION: v160.7
+      MINDUSTRY_SHA256: f7b899a4038b95b14a824d5f8993984f79d73baa3254c385b6538327f9c0befd
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+      - name: 下载并校验 Mindustry 服务端
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/server-release.jar" \
+            "https://github.com/Anuken/Mindustry/releases/download/${MINDUSTRY_VERSION}/server-release.jar"
+          echo "${MINDUSTRY_SHA256}  $RUNNER_TEMP/server-release.jar" | sha256sum -c -
+          java -version
+      - name: 安装 Rust
+        run: rustup toolchain install 1.89.0 --profile minimal
+      - name: 运行器在真实服务端中的加载、警告与崩溃证据
+        env:
+          EVE_MINDUSTRY_SERVER_JAR: ${{ runner.temp }}/server-release.jar
+        run: cargo +1.89.0 test -p eve-practice-mindustry --test real --locked -- --ignored --nocapture
+      - name: 实际 Eve QQBot 进程用真实服务端完成实践
+        env:
+          EVE_MINDUSTRY_SERVER_JAR: ${{ runner.temp }}/server-release.jar
+        run: |
+          cargo +1.89.0 build -p eve-app --bin eve-qqbot --locked
+          python3 connectors/qqbot/test/practice_test.py PracticeAcceptance.test_real_runtime_verifies_the_drafted_mod
