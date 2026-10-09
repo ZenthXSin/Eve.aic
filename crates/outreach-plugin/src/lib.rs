@@ -1,9 +1,12 @@
-//! 主动交流账本与单次模型邀请撰写器。
+//! 主动交流账本，以及单次模型请求的邀请撰写器、时机判断器与回应识别器。
 mod composer;
 mod store;
 mod strict_json;
 
-pub use composer::{COMPOSER_VERSION, JUDGE_VERSION, ModelInvitationComposer, ModelTimingJudge};
+pub use composer::{
+    COMPOSER_VERSION, JUDGE_VERSION, ModelInvitationComposer, ModelResponseJudge, ModelTimingJudge,
+    RESPONSE_JUDGE_VERSION,
+};
 use eve_outreach_api::*;
 use eve_plugin_api::{
     Cleanup, Plugin, PluginContext, PluginError, PluginFuture, PluginManifest, PluginResult,
@@ -84,6 +87,22 @@ impl OutreachAdmin for OutreachController {
     }
     fn set_quiet(&self, owner: &str, quiet: bool, at_ms: u64) -> OutreachResult<OwnerPreference> {
         self.service()?.set_quiet(owner, quiet, at_ms)
+    }
+    fn begin_response(
+        &self,
+        id: &str,
+        turns: Vec<ResponseTurn>,
+        at_ms: u64,
+    ) -> OutreachResult<Invitation> {
+        self.service()?.begin_response(id, turns, at_ms)
+    }
+    fn record_response(
+        &self,
+        id: &str,
+        at_ms: u64,
+        outcome: Result<ResponseVerdict, OutreachFailure>,
+    ) -> OutreachResult<Invitation> {
+        self.service()?.record_response(id, at_ms, outcome)
     }
 }
 

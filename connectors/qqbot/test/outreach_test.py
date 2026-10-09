@@ -3,7 +3,8 @@
 用户只在私聊里提一次兴趣：学习目标实践验证通过后，Eve 依据账本中的事实撰写一条邀请；
 用户下次私聊找它时，先由时机判断器看过这条消息与回复，合适才随被动回复附带，以平台回执为准；
 操作者开启时，等待一段时间仍未送达则主动私聊一次。要求安静、撤回兴趣、平台拒绝与进程中断
-都有明确且不重放的行为。
+都有明确且不重放的行为。送达之后，识别器看用户接下来的私聊判断怎样回应并逐字引用原话；
+负面反馈让之后的邀请间隔加倍、不再主动私聊，并作为数据交给下一次时机判断。
 
 全部使用确定性替身，只证明宿主契约、投递时机与恢复语义，不代表真实模型的撰写质量，
 也不是正式 QQ 的主动消息验收（平台配额与用户开关只能在正式环境验证）。
@@ -11,6 +12,7 @@
 import json
 import os
 import subprocess
+import time
 import unittest
 
 import practice_test
@@ -21,6 +23,10 @@ DISABLED = "主动交流未启用。"
 CHAT = "今天天气不错，随便聊聊。"
 LATER = "晚上吃什么好呢？"
 QUOTE = "我喜欢 Mindustry 这个游戏的模组"
+BUSY = "我在上班，晚点再说吧。"
+IDEA = "那就加一个会发光的墙吧！"
+MAP = "我还想学怎么做 Mindustry 的地图。"
+MAP_QUOTE = "我还想学怎么做 Mindustry 的地图"
 
 
 def base():
@@ -46,20 +52,25 @@ class OutreachAcceptance(unittest.TestCase):
         base().setUp(self)
         self.compose = self.default_compose
         self.judge = self.default_judge
+        self.respond = self.default_respond
 
     def tearDown(self):
         base().tearDown(self)
 
-    def run_eve(self, script, outreach=True, proactive_after=None, **options):
+    def run_eve(self, script, outreach=True, proactive_after=None, cooldown=None, **options):
         more = ["--outreach"] if outreach else []
         if proactive_after is not None:
             more += ["--outreach-proactive-after-ms", str(proactive_after)]
+        if cooldown is not None:
+            more += ["--outreach-cooldown-ms", str(cooldown)]
         options.setdefault("research", False)
         return base().run_eve(self, script, more=more, **options)
 
     def classify(self, decoded, latest):
         if isinstance(decoded, dict) and "invitation_id" in decoded and "facts" in decoded:
             return "compose"
+        if isinstance(decoded, dict) and "judge_version" in decoded and "turns" in decoded:
+            return "respond"
         if isinstance(decoded, dict) and "judge_version" in decoded and "user_message" in decoded:
             return "judge"
         return base().classify(self, decoded, latest)
@@ -69,6 +80,8 @@ class OutreachAcceptance(unittest.TestCase):
             return json.dumps(self.compose(decoded), ensure_ascii=False)
         if kind == "judge":
             return json.dumps(self.judge(decoded), ensure_ascii=False)
+        if kind == "respond":
+            return json.dumps(self.respond(decoded), ensure_ascii=False)
         return base().reply(self, kind, decoded, latest)
 
     # 确定性撰写替身：只引用请求里的用户原话。
@@ -79,6 +92,15 @@ class OutreachAcceptance(unittest.TestCase):
     # 确定性时机判断替身：用户在说不再感兴趣时不附带，其余时候附带。
     def default_judge(self, request):
         return {"decision": "not_now" if request["user_message"] == QUIT else "invite"}
+
+    # 确定性回应识别替身：只按请求里用户的原话作答，引用逐字取自用户消息。
+    def default_respond(self, request):
+        for turn in reversed(request["turns"]):
+            if turn["user_message"] == BUSY:
+                return {"kind": "bad_timing", "quote": "我在上班"}
+            if turn["user_message"] == IDEA:
+                return {"kind": "request", "quote": "加一个会发光的墙"}
+        return {"kind": "unrelated"}
 
     def ledger(self):
         return self.documents().get("eve.outreach", {}).get("outreach.v1") or {"invitations": [], "preferences": []}
@@ -104,6 +126,13 @@ class OutreachAcceptance(unittest.TestCase):
         for path in sorted(self.work.glob("events-*.jsonl")):
             events += [json.loads(line) for line in path.read_text(encoding="utf8").splitlines()]
         return [event for event in events if event.get("direction") == "out" and event.get("type") == "push"]
+
+    def reply_text(self, id):
+        events = []
+        for path in sorted(self.work.glob("events-*.jsonl")):
+            events += [json.loads(line) for line in path.read_text(encoding="utf8").splitlines()]
+        return next(event["text"] for event in reversed(events)
+                    if event.get("direction") == "out" and event.get("type") == "reply" and event.get("id") == id)
 
     def with_invitation(self, id, text):
         return self.message(id, text, expected=None, contains=None) | {
@@ -173,6 +202,112 @@ class OutreachAcceptance(unittest.TestCase):
             *self.checkpoint("idle")], checkpoints={"idle": self.quiet})
         self.assertEqual(len(self.kind("compose")), 1, "restart must not replay composing")
         self.assertEqual(self.ledger(), before)
+
+    def answered(self, count):
+        return lambda: self.wait_for(
+            lambda: sum(1 for invitation in self.invitations() for response in invitation.get("responses", [])
+                        if response["outcome"] is not None) >= count,
+            "response was not recognized", 25)
+
+    def test_the_users_answer_after_delivery_is_recognized_once_with_a_verbatim_quote(self):
+        self.run_eve([*self.send(self.message("casual", MINDUSTRY)), *self.checkpoint("composed"),
+                      *self.send_invited("chat", CHAT),
+                      *self.send(self.message("busy", BUSY)), *self.checkpoint("answered"),
+                      *self.send(self.message("later", LATER)),
+                      *self.send(self.message("status", "/outreach", contains=[
+                          "你最近说过不方便或不需要", "你的回应：当时不方便（“我在上班”）"])),
+                      *self.checkpoint("settled")],
+                     checkpoints={"composed": lambda: self.wait_status("Pending"),
+                                  "answered": self.answered(1), "settled": self.quiet},
+                     max_executions=4)
+        [invitation] = self.invitations()
+        [response] = invitation["responses"]
+        self.assertEqual([turn["message_id"] for turn in response["turns"]], ["busy"],
+                         "附带邀请的那条消息本身不算回应")
+        self.assertEqual(response["outcome"], {"verdict": {
+            "kind": "BadTiming", "message_id": "busy", "quote": "我在上班"}})
+        [request] = self.kind("respond")
+        self.assertIsNone(request["state"]["eve.outreach"]["outreach.v1"]["invitations"][0]["responses"][0]["outcome"],
+                          "识别前已保存确切输入")
+        judged = json.loads(request["body"]["messages"][-1]["content"])
+        self.assertEqual(judged["invitation"], invitation_text(QUOTE))
+        self.assertEqual(judged["turns"], [{"message_id": "busy", "user_message": BUSY, "reply": BUSY}])
+        self.assertFalse(request["body"].get("tools"))
+        for domain in ("Mindustry", "模组", "游戏"):
+            self.assertNotIn(domain, request["body"]["messages"][0]["content"], "识别规则与领域无关")
+
+        # 得出结论后不再识别；重启也不重放。
+        before = self.ledger()
+        self.run_eve([*self.send(self.message("again", IDEA)), *self.checkpoint("idle")],
+                     checkpoints={"idle": self.quiet})
+        self.assertEqual(len(self.kind("respond")), 1)
+        self.assertEqual(self.ledger(), before)
+
+    def test_unrelated_chat_keeps_listening_until_the_user_proposes_an_idea(self):
+        self.run_eve([*self.send(self.message("casual", MINDUSTRY)), *self.checkpoint("composed"),
+                      *self.send_invited("chat", CHAT),
+                      *self.send(self.message("later", LATER)), *self.checkpoint("unrelated"),
+                      *self.send(self.message("idea", IDEA)), *self.checkpoint("proposed"),
+                      *self.send(self.message("status", "/outreach", contains="你的回应：提出了想法（“加一个会发光的墙”）")),
+                      *self.checkpoint("settled")],
+                     checkpoints={"composed": lambda: self.wait_status("Pending"),
+                                  "unrelated": self.answered(1), "proposed": self.answered(2),
+                                  "settled": self.quiet},
+                     max_executions=4)
+        [invitation] = self.invitations()
+        self.assertEqual([([turn["message_id"] for turn in response["turns"]], response["outcome"])
+                          for response in invitation["responses"]],
+                         [(["later"], {"verdict": {"kind": "Unrelated", "message_id": None, "quote": None}}),
+                          (["idea"], {"verdict": {"kind": "Request", "message_id": "idea",
+                                                  "quote": "加一个会发光的墙"}})])
+        self.assertNotIn("你最近说过不方便", self.reply_text("status"))
+
+    def test_negative_feedback_stops_proactive_pushes_and_informs_the_next_timing_judgement(self):
+        def observe(batch):
+            result = self.default_observe(batch)
+            for evidence in batch["evidence"]:
+                if evidence["source"]["user_text"] == MAP:
+                    result["updates"].append({
+                        "target": {"new": {"topic": "Mindustry 地图制作"}},
+                        "statements": [{"kind": "interest", "quote": MAP_QUOTE, "evidence_id": evidence["id"]}]})
+            return result
+        self.observe = observe
+        cooldown = 3000
+
+        def first():
+            return next(invitation for invitation in self.invitations() if invitation["delivered_at_ms"])
+
+        def cooled():
+            # 负面反馈后冷却期加倍；等加倍的冷却期过去，主动私聊仍不发生。
+            wait = first()["delivered_at_ms"] + 2 * cooldown + 500 - time.time() * 1000
+            self.assertFalse(self.run_release.wait(max(wait, 0) / 1000), "process stopped")
+            self.quiet()
+
+        second = invitation_text(MAP_QUOTE)
+        self.run_eve([*self.send(self.message("casual", MINDUSTRY)), *self.checkpoint("pushed"),
+                      *self.send(self.message("busy", BUSY)), *self.checkpoint("answered"),
+                      *self.send(self.message("map", MAP)), *self.checkpoint("second"),
+                      *self.checkpoint("cooled"),
+                      {"send": self.message("chat", CHAT, expected=None, contains=None) | {
+                          "expected_segments": [CHAT, second]}},
+                      {"wait_command": {"id": "chat", "type": "segment", "count": 2}}, self.wait_receipt("chat"),
+                      *self.send(self.message("status", "/outreach", contains="之后间隔更久，也不再主动私聊")),
+                      *self.checkpoint("settled")],
+                     checkpoints={"pushed": lambda: self.wait_status("Delivered"),
+                                  "answered": self.answered(1),
+                                  "second": lambda: self.wait_status("Pending", seconds=40),
+                                  "cooled": cooled, "settled": self.quiet},
+                     proactive_after=0, cooldown=cooldown, max_executions=8, timeout=60)
+        self.assertEqual(len(self.pushes()), 1, "负面反馈之后不再主动私聊")
+        pushed, invited = sorted(self.invitations(), key=lambda invitation: invitation["delivered_at_ms"])
+        self.assertEqual(pushed["attempts"][0]["channel"], "proactive")
+        self.assertEqual(pushed["responses"][0]["outcome"]["verdict"]["kind"], "BadTiming")
+        self.assertEqual(invited["attempts"][0]["channel"], {"passive": {"message_id": "chat"}})
+        self.assertGreaterEqual(invited["delivered_at_ms"] - pushed["delivered_at_ms"], 2 * cooldown)
+        judged = [json.loads(request["body"]["messages"][-1]["content"]) for request in self.kind("judge")]
+        self.assertEqual(judged[-1]["user_message"], CHAT)
+        self.assertEqual(judged[-1]["feedback"], [{"kind": "BadTiming", "quote": "我在上班"}],
+                         "先前反馈作为数据交给时机判断")
 
     def test_quiet_holds_the_invitation_until_the_user_turns_outreach_back_on(self):
         self.run_eve([*self.send(self.message("casual", MINDUSTRY)), *self.checkpoint("composed"),

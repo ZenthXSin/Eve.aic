@@ -1,6 +1,9 @@
 //! QQ 宿主的主动交流：学习目标有了实际验证的进展后，依据账本中的事实撰写一条邀请，
 //! 每个学习目标只邀请一次；何时送达由通道的两个投递点按宿主策略决定（私聊被动窗口附带，
 //! 或操作者开启时主动私聊）。准入、撰写与每次投递都先持久化，中断不重放，结果未知不重发。
+//! 送达之后，后台从交互记忆读取同一用户接下来的几轮私聊，交给回应识别器判断用户怎样回应；
+//! 识别前先保存确切输入，每轮对话只识别一次。用户的反馈决定之后的冷却期与是否主动私聊，
+//! 也作为数据交给之后的时机判断。
 use crate::AppError;
 use eve_cognition_api::{CognitionAdmin, Goal, GoalStatus, SourceKind, Visibility};
 use eve_interest_api::{
@@ -9,11 +12,13 @@ use eve_interest_api::{
 use eve_llm_api::{
     ContextAssembler, ContextScope, ContextSnapshot, LlmError, LlmFuture, TurnInput,
 };
-use eve_memory_api::MemoryScope;
+use eve_memory_api::{EvidenceSource, MemoryAdmin, MemoryScope};
 use eve_outreach_api::{
     AttemptResult, ComposeRequest, DeliveryChannel, Fact, FactKind, Invitation, InvitationComposer,
-    InvitationStatus, JudgeRequest, MAX_FACT_BYTES, MAX_MOMENT_BYTES, Milestone, OutreachAdmin,
-    OutreachError, OutreachFailure, OutreachPolicy, TimingJudge, Verdict,
+    InvitationStatus, JudgeRequest, MAX_FACT_BYTES, MAX_MOMENT_BYTES, MAX_RESPONSE_TURNS,
+    Milestone, OutreachAdmin, OutreachError, OutreachFailure, OutreachPolicy, RESPONSE_WINDOW_MS,
+    ResponseJudge, ResponseKind, ResponseRequest, ResponseTurn, ResponseTurnText, TimingJudge,
+    Verdict,
 };
 use eve_plugin_api::{PluginError, PluginResult};
 use eve_practice_api::{PracticeAdmin, PracticeRun, PracticeStatus};
@@ -35,6 +40,8 @@ use tokio::{sync::watch, task::JoinHandle};
 const COMPOSE_TIMEOUT: Duration = Duration::from_secs(120);
 /// 时机判断的上限；短于通道的等待上限，保证判断总能写入结局。
 const JUDGE_TIMEOUT: Duration = Duration::from_secs(25);
+/// 一次回应识别的总时长上限。
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 /// 技能固化开启时，等实践的提炼结束再邀请（这样可以提到技能）；超过这段时间仍没有提炼记录
 /// （例如技能容量已满）则不再等待。
 const DISTILL_GRACE_MS: u64 = 15 * 60 * 1000;
@@ -57,14 +64,16 @@ fn prefix(text: &str, limit: usize) -> &str {
     &text[..end]
 }
 
-/// 后台撰写依赖的服务。
+/// 后台撰写与回应识别依赖的服务。
 pub(crate) struct Services {
     pub(crate) outreach: Arc<dyn OutreachAdmin>,
     pub(crate) cognition: Arc<dyn CognitionAdmin>,
     pub(crate) interests: Arc<dyn InterestAdmin>,
     pub(crate) practice: Arc<dyn PracticeAdmin>,
     pub(crate) skills: Option<Arc<dyn SkillAdmin>>,
+    pub(crate) memory: Arc<dyn MemoryAdmin>,
     pub(crate) composer: Arc<dyn InvitationComposer>,
+    pub(crate) responder: Arc<dyn ResponseJudge>,
 }
 
 pub(crate) struct Background {
@@ -163,6 +172,9 @@ async fn run(
                 Err(OutreachError::LimitReached) => inviting = false,
                 Err(error) => return Err(error.into()),
             }
+            continue;
+        }
+        if listen(&services, &mut stopped).await? {
             continue;
         }
         tokio::select! {
@@ -393,6 +405,122 @@ async fn compose(
     Ok(())
 }
 
+fn scope(owner: &str) -> MemoryScope {
+    MemoryScope {
+        channel: "qq".into(),
+        session_id: owner.into(),
+        user_id: owner.into(),
+    }
+}
+
+/// 为最早一条仍在等待回应、送达后有了新对话的邀请做一次回应识别；做了返回 true。
+async fn listen(
+    services: &Services,
+    stopped: &mut watch::Receiver<bool>,
+) -> Result<bool, AppError> {
+    let snapshot = services.outreach.snapshot()?;
+    let now = now_ms()?;
+    let mut listening: Vec<&Invitation> = snapshot
+        .listening()
+        .filter(|invitation| {
+            invitation
+                .delivered_at_ms
+                .is_some_and(|at| now.saturating_sub(at) <= RESPONSE_WINDOW_MS)
+        })
+        .collect();
+    listening.sort_by_key(|invitation| (invitation.delivered_at_ms, invitation.id.clone()));
+    for invitation in listening {
+        let Some(delivered) = invitation.delivered_at_ms else {
+            continue;
+        };
+        let memory = services
+            .memory
+            .reader(scope(&invitation.owner))?
+            .snapshot()?;
+        let mut heard: Vec<(ResponseTurn, ResponseTurnText)> = memory
+            .evidence
+            .iter()
+            .filter_map(|evidence| match &evidence.source {
+                EvidenceSource::CompletedInteraction {
+                    message_id,
+                    user_text,
+                    assistant_text,
+                    ..
+                } => Some((
+                    ResponseTurn {
+                        evidence_id: evidence.id.clone(),
+                        message_id: message_id.clone(),
+                        at_ms: evidence.at_ms,
+                    },
+                    ResponseTurnText {
+                        message_id: message_id.clone(),
+                        user_message: prefix(user_text, MAX_MOMENT_BYTES).into(),
+                        reply: prefix(assistant_text, MAX_MOMENT_BYTES).into(),
+                    },
+                )),
+                EvidenceSource::UserStatement { .. } => None,
+            })
+            .filter(|(turn, _)| {
+                turn.at_ms >= delivered
+                    && turn.at_ms - delivered <= RESPONSE_WINDOW_MS
+                    && !invitation.heard(&turn.message_id)
+                    && eve_outreach_api::validate_id(&turn.message_id).is_ok()
+                    && eve_outreach_api::validate_id(&turn.evidence_id).is_ok()
+            })
+            .collect();
+        if heard.is_empty() {
+            continue;
+        }
+        heard.sort_by(|(left, _), (right, _)| {
+            (left.at_ms, &left.evidence_id).cmp(&(right.at_ms, &right.evidence_id))
+        });
+        // 同一条消息只取最早的一份证据。
+        let mut seen = std::collections::BTreeSet::new();
+        heard.retain(|(turn, _)| seen.insert(turn.message_id.clone()));
+        heard.truncate(MAX_RESPONSE_TURNS);
+        let (turns, texts): (Vec<ResponseTurn>, Vec<ResponseTurnText>) = heard.into_iter().unzip();
+        let started = now
+            .max(after(invitation))
+            .max(turns.last().map_or(0, |turn| turn.at_ms));
+        // 先保存确切输入再请求识别器；这批对话只识别一次，中断不重放。
+        services
+            .outreach
+            .begin_response(&invitation.id, turns, started)?;
+        let request = ResponseRequest {
+            invitation_id: invitation.id.clone(),
+            judge_version: services.responder.version().into(),
+            invitation: prefix(
+                invitation.text.as_deref().unwrap_or_default(),
+                MAX_MOMENT_BYTES,
+            )
+            .into(),
+            turns: texts,
+        };
+        let result = {
+            let work = services.responder.judge(request.clone());
+            tokio::pin!(work);
+            tokio::select! {
+                biased;
+                _ = stop_requested(stopped) => Err(OutreachFailure::Cancelled),
+                result = tokio::time::timeout(RESPONSE_TIMEOUT, &mut work) => match result {
+                    // 宿主再核对一次：引用必须出自所指那轮的用户原话。
+                    Ok(Ok(verdict)) => eve_outreach_api::validate_verdict(&request, &verdict)
+                        .map(|()| verdict)
+                        .map_err(|_| OutreachFailure::InvalidOutput),
+                    Ok(Err(OutreachError::Outreach(failure))) => Err(failure),
+                    Ok(Err(_)) => Err(OutreachFailure::InvalidOutput),
+                    Err(_) => Err(OutreachFailure::Timeout),
+                },
+            }
+        };
+        services
+            .outreach
+            .record_response(&invitation.id, now_ms()?.max(started), result)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn plugin_error(error: OutreachError) -> PluginError {
     PluginError::State(error.to_string())
 }
@@ -403,6 +531,18 @@ fn after(invitation: &Invitation) -> u64 {
         .attempts
         .iter()
         .flat_map(|attempt| [Some(attempt.started_at_ms), attempt.finished_at_ms])
+        .chain(
+            invitation
+                .judgements
+                .iter()
+                .flat_map(|judgement| [Some(judgement.started_at_ms), judgement.finished_at_ms]),
+        )
+        .chain(
+            invitation
+                .responses
+                .iter()
+                .flat_map(|response| [Some(response.started_at_ms), response.finished_at_ms]),
+        )
         .flatten()
         .chain(invitation.composed_at_ms)
         .chain([invitation.created_at_ms])
@@ -458,6 +598,7 @@ impl QqOutreach for ChannelAdapter {
                 .into(),
                 user_message: prefix(&moment.user_text, MAX_MOMENT_BYTES).into(),
                 reply: prefix(&moment.reply_text, MAX_MOMENT_BYTES).into(),
+                feedback: snapshot.feedback_notes(&moment.session.user_id),
             };
             let result = match tokio::time::timeout(JUDGE_TIMEOUT, judge.judge(request)).await {
                 Ok(Ok(verdict)) => Ok(verdict),
@@ -670,6 +811,11 @@ fn status(snapshot: &eve_outreach_api::OutreachSnapshot, owner: &str) -> String 
         reply.push_str("\n还没有邀请。");
         return reply;
     }
+    if snapshot.negative_streak(owner) > 0 {
+        reply.push_str(
+            "\n你最近说过不方便或不需要：之后间隔更久，也不再主动私聊，等你来找我时再看时机。",
+        );
+    }
     invitations.sort_by_key(|invitation| Reverse(invitation.created_at_ms));
     for invitation in invitations.into_iter().take(SHOWN) {
         let label = match invitation.status {
@@ -719,6 +865,20 @@ fn status(snapshot: &eve_outreach_api::OutreachSnapshot, owner: &str) -> String 
             && invitation.status == InvitationStatus::Delivered
         {
             let _ = write!(reply, "\n  内容：{}", prefix(text, 300));
+        }
+        if let Some(verdict) = invitation.feedback() {
+            let label = match verdict.kind {
+                ResponseKind::Request => "提出了想法",
+                ResponseKind::Interested => "有兴趣",
+                ResponseKind::Declined => "不需要",
+                ResponseKind::BadTiming => "当时不方便",
+                ResponseKind::Unrelated => "没有回应",
+            };
+            let _ = write!(
+                reply,
+                "\n  你的回应：{label}（“{}”）",
+                prefix(verdict.quote.as_deref().unwrap_or_default(), 200)
+            );
         }
     }
     reply
