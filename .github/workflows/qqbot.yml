@@ -83,3 +83,9 @@ jobs:
           python3 -m unittest discover -s .github/scripts -p 'test_qqbot_replace_run.py'
           python3 -m unittest discover -s connectors/qqbot/test -p 'review_test.py'
           python3 -m unittest discover -s connectors/qqbot/test -p 'compare_test.py'
+      - name: 留出领域：静态网页在真实无头 Chrome 中的实践与完整行为链
+        run: |
+          export EVE_TEST_BROWSER="$(command -v google-chrome)"
+          "$EVE_TEST_BROWSER" --version
+          cargo +1.89.0 test -p eve-practice-browser --test real --locked -- --ignored --nocapture
+          python3 connectors/qqbot/test/holdout_test.py

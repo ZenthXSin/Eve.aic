@@ -33,6 +33,7 @@ use eve_outreach_plugin::{
 };
 use eve_plugin_api::{PluginId, PluginResult, ServiceId};
 use eve_practice_api::{PRACTICE_PLUGIN_ID, PracticeDrafter, PracticeRunner};
+use eve_practice_browser::BrowserRunner;
 use eve_practice_mindustry::{MindustryServerRunner, RuntimeCommand};
 use eve_practice_plugin::{ModelPracticeDrafter, PracticePlugin, Practitioner};
 use eve_qqbot_plugin::{
@@ -55,7 +56,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--skill-learning] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -78,9 +79,10 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --research-source 需同时 --interest-learning，可重复至多 8 个；为等待中的学习目标在这些入口页面的同源目录内受控研究（只读 GET，每个目标修订至多一次，每个目标累计至多 3 次）。
 /knowledge 兴趣ID 查看研究到的资料：来源原文附网址、抓取时间、版本与逐字引用，未验证推测单独标注；研究不重试、中断不重放。
 --practice-mindustry-server 需同时 --interest-learning；为等待中的学习目标制作只含数据文件的最小 Mindustry 模组，用操作者提供的无头服务端 jar 在全新目录中实际加载并探测内容属性（--practice-java 默认 java），每个目标修订至多一次、每次至多三次尝试，只有实际加载且全部探测通过才记为已验证。
+--practice-browser 需同时 --interest-learning，与 --practice-mindustry-server 二选一；为等待中的学习目标制作只含 HTML 与 CSS 的静态网页，用操作者提供的无头 Chromium 在全新目录中实际打开并探测元素的计算样式与文字（不能含脚本或外部资源，不访问网络），其余规则同上。
 /practice 兴趣ID 查看实践记录：每次尝试的产物文件、运行版本、加载状态、警告与探测期望/实际值；中断不重放。
---skill-learning 需同时 --practice-mindustry-server；把实际验证通过的实践提炼为参数化技能，宿主核对能逐字还原原产物，再用与原值不同的参数在同一运行环境中实际运行通过后自动启用；后续任务的第一次尝试可选用已启用的技能，调用结果以实际运行证据为准。
---outreach 需同时 --practice-mindustry-server；学习目标有了实际验证的进展后撰写一条邀请（只用账本中的用户原话、实践证据与已启用技能），在用户下次私聊找 Eve 时先判断此刻是否合适（看用户这条消息与回复），合适才随被动回复附带，以平台回执为准；同一用户默认 24 小时内至多送达一条（--outreach-cooldown-ms 可调整），群聊不附带。
+--skill-learning 需同时指定实践运行环境（--practice-mindustry-server 或 --practice-browser）；把实际验证通过的实践提炼为参数化技能，宿主核对能逐字还原原产物，再用与原值不同的参数在同一运行环境中实际运行通过后自动启用；后续任务的第一次尝试可选用已启用的技能，调用结果以实际运行证据为准。
+--outreach 需同时指定实践运行环境（--practice-mindustry-server 或 --practice-browser）；学习目标有了实际验证的进展后撰写一条邀请（只用账本中的用户原话、实践证据与已启用技能），在用户下次私聊找 Eve 时先判断此刻是否合适（看用户这条消息与回复），合适才随被动回复附带，以平台回执为准；同一用户默认 24 小时内至多送达一条（--outreach-cooldown-ms 可调整），群聊不附带。
 --outreach-proactive-after-ms 需同时 --outreach；邀请在被动窗口等待超过该时间仍未送达时主动私聊一次（受平台配额与用户开关限制，被拒绝时保持待投递）。
 /outreach 查看邀请状态与回执；/outreach off 请 Eve 不再主动提起，/outreach on 恢复。
 /skills 列出技能；/skill 技能ID 查看版本、验证证据、启用记录与调用；/skill disable|rollback 技能ID、/skill enable 技能ID 版本 停用、回退或启用某个已验证版本。
@@ -114,6 +116,8 @@ pub struct QqBotOptions {
     pub research_sources: Vec<String>,
     /// 实践验证使用的 Mindustry 无头服务端 jar；为空表示不实践。
     pub practice_server_jar: Option<PathBuf>,
+    /// 静态网页实践使用的无头 Chromium 程序；与 Mindustry 服务端二选一。
+    pub practice_browser: Option<PathBuf>,
     /// 启动运行环境的程序；未显式提供时为 java。
     pub practice_java: Option<OsString>,
     pub practice_java_args: Vec<OsString>,
@@ -150,6 +154,7 @@ impl Default for QqBotOptions {
             interest_options: ObservationOptions::default(),
             research_sources: Vec::new(),
             practice_server_jar: None,
+            practice_browser: None,
             practice_java: None,
             practice_java_args: Vec::new(),
             skill_learning: false,
@@ -222,6 +227,9 @@ impl QqBotOptions {
                 Some("--node") => options.node_program = value,
                 Some("--bridge-script") => options.bridge_script = value.into(),
                 Some("--bridge-arg") => options.bridge_args.push(value),
+                Some("--practice-browser") => {
+                    options.practice_browser = Some(value.into());
+                }
                 Some("--practice-mindustry-server") => {
                     options.practice_server_jar = Some(value.into());
                 }
@@ -315,8 +323,17 @@ impl QqBotOptions {
         if options.practice_server_jar.is_some() && !options.interest_learning {
             return Err("--practice-mindustry-server 需要同时开启 --interest-learning".into());
         }
-        if options.skill_learning && options.practice_server_jar.is_none() {
-            return Err("--skill-learning 需要同时指定 --practice-mindustry-server".into());
+        if options.practice_browser.is_some() && !options.interest_learning {
+            return Err("--practice-browser 需要同时开启 --interest-learning".into());
+        }
+        if options.practice_server_jar.is_some() && options.practice_browser.is_some() {
+            return Err(
+                "--practice-mindustry-server 与 --practice-browser 只能选一个实践运行环境".into(),
+            );
+        }
+        let runtime = options.practice_server_jar.is_some() || options.practice_browser.is_some();
+        if options.skill_learning && !runtime {
+            return Err("--skill-learning 需要同时指定实践运行环境（--practice-mindustry-server 或 --practice-browser）".into());
         }
         if (options.outreach_cooldown_ms.is_some() || options.outreach_proactive_after_ms.is_some())
             && !options.outreach
@@ -326,8 +343,8 @@ impl QqBotOptions {
                     .into(),
             );
         }
-        if options.outreach && options.practice_server_jar.is_none() {
-            return Err("--outreach 需要同时指定 --practice-mindustry-server".into());
+        if options.outreach && !runtime {
+            return Err("--outreach 需要同时指定实践运行环境（--practice-mindustry-server 或 --practice-browser）".into());
         }
         Ok(Some(options))
     }
@@ -472,8 +489,9 @@ async fn run_qqbot_composed(
     options.learning_options.validate()?;
     options.interest_options.validate()?;
     let research_policy = research_policy(&options)?;
-    let practice_enabled =
-        options.practice_server_jar.is_some() || interest_components.runner.is_some();
+    let practice_enabled = options.practice_server_jar.is_some()
+        || options.practice_browser.is_some()
+        || interest_components.runner.is_some();
     if practice_enabled && !options.interest_learning {
         return Err("实践验证需要同时开启 --interest-learning".into());
     }
@@ -815,9 +833,14 @@ async fn run_qqbot_composed(
         };
         let practice_commands = if let (Some(practice), Some(interests)) = (&practice, &interests) {
             let cognition = Arc::new(background.as_ref().ok_or("实践验证缺少认知服务")?.admin()?);
-            let runner: Arc<dyn PracticeRunner> = match practice_runner {
-                Some(runner) => runner,
-                None => Arc::new(
+            let runner: Arc<dyn PracticeRunner> = match (practice_runner, &options.practice_browser)
+            {
+                (Some(runner), _) => runner,
+                (None, Some(browser)) => Arc::new(
+                    BrowserRunner::new(browser.clone())
+                        .map_err(|error| format!("实践运行环境无效：{error}"))?,
+                ),
+                (None, None) => Arc::new(
                     MindustryServerRunner::new(
                         RuntimeCommand {
                             program: options
@@ -1426,6 +1449,37 @@ mod recall_options_tests {
         );
         assert_eq!(options.practice_java, Some(OsString::from("python3")));
         assert_eq!(options.practice_java_args, [OsString::from("fake.py")]);
+    }
+
+    #[test]
+    fn browser_runtime_is_an_alternative_practice_runtime() {
+        assert!(parse(&[]).unwrap().practice_browser.is_none());
+        assert!(
+            parse(&["--practice-browser", "chrome"])
+                .unwrap_err()
+                .to_string()
+                .contains("--interest-learning")
+        );
+        let both = parse(&[
+            "--interest-learning",
+            "--practice-browser",
+            "chrome",
+            "--practice-mindustry-server",
+            "server.jar",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(both.contains("只能选一个"));
+        let options = parse(&[
+            "--interest-learning",
+            "--practice-browser",
+            "chrome",
+            "--skill-learning",
+            "--outreach",
+        ])
+        .unwrap();
+        assert_eq!(options.practice_browser, Some(PathBuf::from("chrome")));
+        assert!(options.skill_learning && options.outreach);
     }
 
     #[test]
