@@ -35,6 +35,8 @@ if (scenario.script) {
   const pending = new Map();
   const commands = [];
   let stopped = false;
+  // 主动私聊的平台结果：默认成功；脚本可改为拒绝（带错误码）或暂不回执。
+  let pushMode = { ok: true };
   const until = async predicate => {
     const deadline = Date.now() + (scenario.wait_timeout_ms ?? 15000);
     while (!predicate()) {
@@ -61,6 +63,8 @@ if (scenario.script) {
         if (!await until(() => commands.filter(cmd => cmd.type === expected.type && cmd.id === expected.id).length >= (expected.count ?? 1))) return;
       } else if (step.touch) {
         fs.writeFileSync(step.touch, "ready");
+      } else if (step.push_mode) {
+        pushMode = step.push_mode;
       } else if (step.delivery) {
         if (!commands.some(cmd => cmd.type === "reply" && cmd.id === step.delivery)) throw new Error("delivery_before_reply");
         deliver(step.delivery);
@@ -120,6 +124,15 @@ if (scenario.script) {
       const cmd = JSON.parse(line);
       record({ direction: "out", ...cmd, ...(cmd.type === "segment" ? { at: Date.now() } : {}) });
       if (cmd.type === "stop") { stopped = true; return; }
+      if (cmd.type === "push") {
+        if (!/^[A-Za-z0-9_-]{1,128}$/.test(cmd.target_id ?? "") || typeof cmd.text !== "string") throw new Error("invalid_push");
+        commands.push(cmd);
+        if (pushMode.hold) continue;
+        const { ok, ...diagnostic } = pushMode;
+        send(ok ? { type: "delivery", id: cmd.id, push: true, ok: true, message_id: "push-" + cmd.id }
+                : { type: "delivery", id: cmd.id, push: true, ok: false, ...diagnostic });
+        continue;
+      }
       const message = pending.get(cmd.id);
       if (!message) throw new Error("wrong_reply_id");
       if (cmd.type === "reply") {

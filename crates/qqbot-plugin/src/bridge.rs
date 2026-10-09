@@ -1,7 +1,11 @@
 use crate::{
     QqBotConfig, QqBotStatus, QqCommandHandler, QqCommandInput, Segmentation, commands,
     observer::{CompletedInteraction, Observation},
-    state::{Ledger, Message, Part, PartState, ReceiptState, Segments},
+    outreach::{
+        OUTREACH_PLANNER, QQ_OUTREACH_JUDGE_TIMEOUT, QQ_OUTREACH_MAX_REPLY_PARTS, QqOutreach,
+        QqOutreachMoment, QqOutreachResult, valid_text as valid_outreach_text,
+    },
+    state::{Ledger, Message, Part, PartState, ReceiptState, Segments, valid_message_id},
 };
 use eve_control_api::{
     CommitState, ControlEvent, ControlEventSink, ControlFuture, ControlInput, ControlPhase,
@@ -98,6 +102,50 @@ pub(crate) struct Services {
     pub observation: Option<Arc<Observation>>,
     pub segmentation: Option<Arc<Segmentation>>,
     pub natural_message_judgement: bool,
+    pub outreach: Option<Arc<OutreachHook>>,
+}
+/// 宿主接线的主动交流；`push_interval` 为空时不主动私聊。
+pub(crate) struct OutreachHook {
+    pub inner: Arc<dyn QqOutreach>,
+    pub push_interval: Option<Duration>,
+}
+/// 回执写入宿主失败只记录警告；宿主自行在重启时核对未结束的尝试。
+fn report(hook: &OutreachHook, ctx: &PluginContext, id: &str, result: QqOutreachResult) {
+    if hook.inner.delivered(id, result).is_err() {
+        warn(ctx, "outreach_receipt_unrecorded");
+    }
+}
+fn outreach_result(frame: &Value, ok: bool) -> QqOutreachResult {
+    if ok {
+        QqOutreachResult::Sent {
+            platform_message_id: frame
+                .get("message_id")
+                .and_then(Value::as_str)
+                .filter(|id| valid_message_id(id))
+                .map(str::to_string),
+        }
+    } else {
+        QqOutreachResult::Failed {
+            http_status: frame
+                .get("http_status")
+                .and_then(Value::as_u64)
+                .and_then(|status| u16::try_from(status).ok()),
+            biz_code: frame.get("biz_code").and_then(Value::as_i64),
+        }
+    }
+}
+/// 主动私聊的路由只取自本通道已确认的私聊回执；宿主只给出会话的用户标识。
+fn c2c_route(ledger: &Ledger, app: &str, user_id: &str) -> PluginResult<Option<String>> {
+    for entry in ledger.entries.iter().rev() {
+        if entry.app_id == app
+            && entry.message.scope == "c2c"
+            && entry.state == ReceiptState::Sent
+            && entry.message.session_key(app)?.user_id == user_id
+        {
+            return Ok(Some(entry.message.target_id.clone()));
+        }
+    }
+    Ok(None)
 }
 struct ChannelEvents {
     signal: Arc<dyn TaskSignal>,
@@ -193,6 +241,25 @@ struct Reply {
     text: String,
     guard: ReplyGuard,
     interaction: Option<CompletedInteraction>,
+    /// 宿主对附带邀请的时机判断；None 表示尚未判断。
+    invite: Option<bool>,
+}
+type Judging = (
+    Reply,
+    std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
+);
+async fn judged(judging: &mut Option<Judging>) -> bool {
+    poll_fn(|cx| match judging.as_mut() {
+        Some((_, wait)) => wait.as_mut().poll(cx),
+        None => Poll::Pending,
+    })
+    .await
+}
+/// 可以附带邀请的回复：已完成的模型回复，私聊，且不是命令。
+fn invitable(reply: &Reply) -> bool {
+    matches!(reply.guard, ReplyGuard::Completed(_))
+        && reply.message.scope == "c2c"
+        && !explicit(&reply.message.text)
 }
 /// 一次只投递一条回复。分段时逐段写出并等待回执；段间停顿结束、
 /// 路由与命令都收尾后，重新核对代际再写下一段。
@@ -201,6 +268,8 @@ struct Delivery {
     pauses: Vec<u64>,
     index: usize,
     pause_until: Option<tokio::time::Instant>,
+    /// 随这条被动回复附带的邀请及其片段序号。
+    appendix: Option<(String, usize)>,
 }
 impl Delivery {
     fn segmented(&self) -> bool {
@@ -339,6 +408,7 @@ pub(crate) async fn run(
         observation,
         segmentation,
         natural_message_judgement,
+        outreach,
     } = services;
     // 仅本地学习已验证回执中的用户表达；不提交旧任务、不调用模型或重发消息。
     if let Some(training) = &training {
@@ -405,6 +475,12 @@ pub(crate) async fn run(
     let mut replies: VecDeque<Reply> = VecDeque::new();
     let mut delivering: Option<Delivery> = None;
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    // 正在主动私聊的邀请；一次只发送一条，期间不开始新的回复投递。
+    let mut pushing: Option<String> = None;
+    // 正在等宿主判断时机的回复；判断结束后回到队首照常投递。
+    let mut judging: Option<Judging> = None;
+    let push_interval = outreach.as_ref().and_then(|hook| hook.push_interval);
+    let mut next_push = tokio::time::Instant::now();
     let result: PluginResult<()> = async {
         loop {
             if sink.is_closed() { break Ok(()); }
@@ -480,7 +556,7 @@ pub(crate) async fn run(
                         TrainingCommand::Help => "训练命令：/train start 开始；/train stop 停止采集和主动训练；/train status 查看开关；/train stats 查看表达统计；/train reset 重置本会话统计。".into(),
                         TrainingCommand::Start => unreachable!(),
                     };
-                    replies.push_back(Reply { message, text, guard: ReplyGuard::NoTask, interaction: None });
+                    replies.push_back(Reply { message, text, guard: ReplyGuard::NoTask, interaction: None, invite: None });
                     continue;
                 }
                 if !command.saved && !ledger.insert(&ctx, &config.app_id, message.clone())? {
@@ -494,7 +570,7 @@ pub(crate) async fn run(
                         message_id: &message.id, session: &session, text: &message.text,
                     }) {
                         Ok(Some(text)) => {
-                            replies.push_back(Reply { message, text, guard: ReplyGuard::Command, interaction: None });
+                            replies.push_back(Reply { message, text, guard: ReplyGuard::Command, interaction: None, invite: None });
                             continue;
                         }
                         Ok(None) => {}
@@ -529,15 +605,15 @@ pub(crate) async fn run(
                         Ok(ticket) => routing.push(Routing { message, target, wait: messages.wait(&ticket), cancelled }),
                         Err(_) => {
                             warn(&ctx, "message_submit_failed");
-                            replies.push_back(Reply { message, text: "消息控制暂不可用或已达容量上限；当前任务保持不变。".into(), guard: ReplyGuard::Current(target), interaction: None });
+                            replies.push_back(Reply { message, text: "消息控制暂不可用或已达容量上限；当前任务保持不变。".into(), guard: ReplyGuard::Current(target), interaction: None, invite: None });
                         }
                     }
                 } else {
-                    replies.push_back(Reply { message, text: NO_TASK.into(), guard: ReplyGuard::NoTask, interaction: None });
+                    replies.push_back(Reply { message, text: NO_TASK.into(), guard: ReplyGuard::NoTask, interaction: None, invite: None });
                 }
                 continue;
             }
-            if delivering.is_none()
+            if delivering.is_none() && pushing.is_none() && judging.is_none()
                 && let Some(index) = replies.iter().position(|reply| !pending_control(&reply.message, &routing, &commands)) {
                 let reply = replies.remove(index).expect("queued reply");
                 if !reply.guard.accepts(control.as_ref()) {
@@ -545,6 +621,27 @@ pub(crate) async fn run(
                     warn(&ctx, "stale_reply_suppressed");
                     finish(&mut stdin, &reply.message.id).await?;
                     continue;
+                }
+                // 有到期的邀请时，先等宿主看过用户这条消息与回复，判断此刻是否合适附带。
+                if let Some(hook) = &outreach && reply.invite.is_none() && invitable(&reply) {
+                    let session = reply.message.session_key(&config.app_id)?;
+                    match hook.inner.due(&session) {
+                        Ok(true) => {
+                            let wait = hook.inner.judge(QqOutreachMoment {
+                                session,
+                                message_id: reply.message.id.clone(),
+                                user_text: reply.message.text.clone(),
+                                reply_text: reply.text.clone(),
+                            });
+                            let wait = Box::pin(async move {
+                                matches!(tokio::time::timeout(QQ_OUTREACH_JUDGE_TIMEOUT, wait).await, Ok(Ok(true)))
+                            });
+                            judging = Some((reply, wait));
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(_) => warn(&ctx, "outreach_unavailable"),
+                    }
                 }
                 // 只分段已完成的模型回复；在开始投递时读取会话设置。
                 // 设置读取失败时保持整条投递，但仍须满足宿主预算。
@@ -591,16 +688,59 @@ pub(crate) async fn run(
                 let single = plan.as_ref().filter(|p| p.segments.len() == 1).map(|p| p.segments[0]);
                 let plan = plan.filter(|p| p.segments.len() > 1);
                 let pauses: Vec<u64> = plan.as_ref().map_or_else(Vec::new, |plan| plan.segments.iter().map(|s| s.pause_before_ms).collect());
-                ledger.entries[index].segments = plan.map(|plan| Segments {
-                    planner: plan.planner,
-                    parts: plan.segments.iter().enumerate().map(|(i, s)| Part {
-                        start: s.start, end: s.end,
-                        state: if i == 0 { PartState::Sending } else { PartState::Pending },
-                    }).collect(),
+                let parts = |ranges: &mut dyn Iterator<Item = (usize, usize)>| ranges.enumerate().map(|(i, (start, end))| Part {
+                    start, end,
+                    state: if i == 0 { PartState::Sending } else { PartState::Pending },
+                }).collect();
+                ledger.entries[index].segments = plan.as_ref().map(|plan| Segments {
+                    planner: plan.planner.clone(),
+                    parts: parts(&mut plan.segments.iter().map(|s| (s.start, s.end))),
                 });
-                ledger.save(&ctx)?;
+                let mut pauses = pauses;
+                // 普通私聊回复可以在被动窗口内附带一条邀请，作为最后一段发出；回复本身不变。
+                let mut appendix = None;
+                if let Some(hook) = &outreach
+                    && reply.invite == Some(true)
+                    && invitable(&reply)
+                    && plan.as_ref().map_or(1, |plan| plan.segments.len()) <= QQ_OUTREACH_MAX_REPLY_PARTS {
+                    match hook.inner.attach(&reply.message.session_key(&config.app_id)?, &reply.message.id) {
+                        Ok(Some(invitation)) => {
+                            let base = match (&plan, single) {
+                                (Some(plan), _) => Some((plan.planner.as_str(), plan.segments.iter().map(|s| (s.start..s.end, s.pause_before_ms)).collect())),
+                                (None, Some(s)) => Some((OUTREACH_PLANNER, vec![(s.start..s.end, 0)])),
+                                (None, None) => None,
+                            };
+                            match crate::outreach::append(&reply.text, base, &invitation.text) {
+                                Some(appended) => {
+                                    ledger.entries[index].segments = Some(Segments {
+                                        planner: appended.planner,
+                                        parts: parts(&mut appended.ranges.iter().map(|r| (r.start, r.end))),
+                                    });
+                                    ledger.entries[index].reply = Some(appended.text);
+                                    pauses = appended.pauses;
+                                    appendix = Some((invitation.id, appended.part));
+                                }
+                                None => {
+                                    warn(&ctx, "outreach_not_appended");
+                                    report(hook, &ctx, &invitation.id, QqOutreachResult::NotSent);
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => warn(&ctx, "outreach_unavailable"),
+                    }
+                }
+                if let Err(error) = ledger.save(&ctx) {
+                    if let (Some(hook), Some((id, _))) = (&outreach, &appendix) {
+                        report(hook, &ctx, id, QqOutreachResult::NotSent);
+                    }
+                    return Err(error);
+                }
                 // 保存也是同步操作；再次检查后至 write 完成不准入任何控制动作。
                 if !reply.guard.accepts(control.as_ref()) {
+                    if let (Some(hook), Some((id, _))) = (&outreach, &appendix) {
+                        report(hook, &ctx, id, QqOutreachResult::NotSent);
+                    }
                     mark_failed(&mut ledger, &ctx, &config.app_id, &reply.message.id)?;
                     warn(&ctx, "stale_reply_suppressed");
                     finish(&mut stdin, &reply.message.id).await?;
@@ -614,7 +754,7 @@ pub(crate) async fn run(
                 };
                 write(&mut stdin, frame).await?;
                 deadline = tokio::time::Instant::now() + Duration::from_secs(35);
-                delivering = Some(Delivery { reply, pauses, index: 0, pause_until: None });
+                delivering = Some(Delivery { reply, pauses, index: 0, pause_until: None, appendix });
             }
             // 段间停顿结束后写下一段；路由或命令尚未收尾时先等待，取消或新代可在此关闭剩余片段。
             if let Some(delivery) = delivering.as_mut()
@@ -631,6 +771,10 @@ pub(crate) async fn run(
                     !delivery.reply.guard.accepts(control.as_ref())
                 };
                 if stale {
+                    // 后续片段（含附带的邀请）都没有写出。
+                    if let (Some(hook), Some((id, _))) = (&outreach, delivery.appendix.take()) {
+                        report(hook, &ctx, &id, QqOutreachResult::NotSent);
+                    }
                     delivering = None;
                     mark_failed(&mut ledger, &ctx, &config.app_id, &id)?;
                     warn(&ctx, "stale_segments_suppressed");
@@ -644,7 +788,10 @@ pub(crate) async fn run(
             let next_ordinary = queue.iter().position(|queued| {
                 if !natural_message_judgement {
                     return routing.is_empty() && commands.is_empty() && active.is_empty()
-                        && delivering.is_none() && replies.is_empty();
+                        && delivering.is_none() && replies.is_empty() && judging.is_none();
+                }
+                if judging.as_ref().is_some_and(|(reply, _)| same_session(&queued.message, &reply.message)) {
+                    return false;
                 }
                 !pending_control(&queued.message, &routing, &commands)
                     && !active.iter().any(|a| same_session(&queued.message, &a.message))
@@ -677,13 +824,43 @@ pub(crate) async fn run(
                 }
                 continue;
             }
+            // 主动私聊：通道空闲时定期询问宿主；路由只取自已确认的私聊回执。
+            let push_ready = push_interval.is_some() && pushing.is_none() && delivering.is_none()
+                && judging.is_none() && replies.is_empty() && status.borrow().ready;
+            if push_ready && let (Some(hook), Some(interval)) = (&outreach, push_interval)
+                && tokio::time::Instant::now() >= next_push {
+                next_push = tokio::time::Instant::now() + interval;
+                match hook.inner.next_push() {
+                    Ok(Some(push)) => {
+                        let target = c2c_route(&ledger, &config.app_id, &push.user_id)?;
+                        match target.filter(|_| valid_message_id(&push.message.id) && valid_outreach_text(&push.message.text)) {
+                            Some(target) => {
+                                write(&mut stdin, json!({"type":"push","version":1,"id":push.message.id,
+                                    "target_id":target,"text":push.message.text})).await?;
+                                deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+                                pushing = Some(push.message.id);
+                            }
+                            None => report(hook, &ctx, &push.message.id, QqOutreachResult::NotSent),
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => warn(&ctx, "outreach_unavailable"),
+                }
+                continue;
+            }
             let eligible: Vec<bool> = active.iter().map(|a| !pending_control(&a.message, &routing, &commands)).collect();
             tokio::select! {
                 biased;
                 _ = signal.cancelled() => break Ok(()),
                 _ = stop.changed() => break Ok(()),
-                _ = tokio::time::sleep_until(deadline), if !status.borrow().ready || delivering.as_ref().is_some_and(Delivery::awaiting) => {
+                _ = tokio::time::sleep_until(deadline), if !status.borrow().ready || delivering.as_ref().is_some_and(Delivery::awaiting) || pushing.is_some() => {
                     break Err(failure("QQBot ready 或 delivery 等待超时"));
+                }
+                _ = tokio::time::sleep_until(next_push), if push_ready => {}
+                invite = judged(&mut judging), if judging.is_some() => {
+                    let (mut reply, _) = judging.take().expect("judging reply");
+                    reply.invite = Some(invite);
+                    replies.push_front(reply);
                 }
                 // 停顿结束时唤醒：每次循环先处理一条待路由命令，命令清空后才写下一段。
                 _ = tokio::time::sleep_until(delivering.as_ref().and_then(|d| d.pause_until).unwrap_or(deadline)),
@@ -740,7 +917,7 @@ pub(crate) async fn run(
                         RouteOutcome::ControlFailed { .. } => "任务控制未完成；状态已保留，请检查后再发新要求。".into(),
                         RouteOutcome::Stopped { .. } => "消息控制已停止；没有自动重试。".into(),
                     };
-                    replies.push_back(Reply { message: route.message, text, guard: ReplyGuard::Current(route.target), interaction: None });
+                    replies.push_back(Reply { message: route.message, text, guard: ReplyGuard::Current(route.target), interaction: None, invite: None });
                 }
                 (index, report) = completed(&mut active, &eligible), if !active.is_empty() => {
                     let current = active.remove(index);
@@ -760,7 +937,7 @@ pub(crate) async fn run(
                             }
                         } else { None };
                         status.send_modify(|s| s.completed += 1);
-                        replies.push_back(Reply { message: current.message, text: text.clone(), guard, interaction });
+                        replies.push_back(Reply { message: current.message, text: text.clone(), guard, interaction, invite: None });
                     } else {
                         mark_failed(&mut ledger, &ctx, &config.app_id, &current.message.id)?;
                         if !report.cancel_requested {
@@ -772,7 +949,7 @@ pub(crate) async fn run(
                 }
                 frame = frames.next() => {
                     let Some(frame) = frame? else {
-                        if !active.is_empty() || !routing.is_empty() || delivering.is_some() || !queue.is_empty()
+                        if !active.is_empty() || !routing.is_empty() || delivering.is_some() || pushing.is_some() || judging.is_some() || !queue.is_empty()
                             || !commands.is_empty() || !replies.is_empty() || !status.borrow().ready {
                             break Err(failure("QQBot 在未完成交互时断开；保留状态"));
                         }
@@ -792,6 +969,14 @@ pub(crate) async fn run(
                             warn(&ctx, code);
                         }
                         Some("fatal") => break Err(failure("QQBot SDK 启动或连接失败")),
+                        Some("delivery") if frame.get("push").and_then(Value::as_bool) == Some(true) => {
+                            let (Some(hook), Some(current)) = (&outreach, pushing.as_deref()) else { warn(&ctx, "unexpected_delivery"); continue; };
+                            if frame.get("id").and_then(Value::as_str) != Some(current) { warn(&ctx, "delivery_id_mismatch"); continue; }
+                            let Some(ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
+                            if !ok { warn(&ctx, "outreach_push_failed_no_retry"); }
+                            report(hook, &ctx, current, outreach_result(&frame, ok));
+                            pushing = None;
+                        }
                         Some("delivery") => {
                             let Some(delivery) = delivering.as_mut().filter(|d| d.awaiting()) else { warn(&ctx, "unexpected_delivery"); continue; };
                             let message = &delivery.reply.message;
@@ -815,6 +1000,14 @@ pub(crate) async fn run(
                                     ledger.entries[index].state = ReceiptState::Sent;
                                 }
                                 ledger.save(&ctx)?;
+                                // 邀请段的回执如实交回宿主；前面片段失败时邀请没有写出。
+                                if let (Some(hook), Some((id, appended))) = (&outreach, &delivery.appendix) {
+                                    if part == *appended {
+                                        report(hook, &ctx, id, outreach_result(&frame, ok));
+                                    } else if !ok {
+                                        report(hook, &ctx, id, QqOutreachResult::NotSent);
+                                    }
+                                }
                                 if ok && !last {
                                     // 已确认片段不再重发；下一段只在停顿后重新核对代际才写出。
                                     delivery.index += 1;
@@ -854,11 +1047,12 @@ pub(crate) async fn run(
                                 || active.iter().any(|a| a.message.id == message.id)
                                 || routing.iter().any(|r| r.message.id == message.id)
                                 || replies.iter().any(|r| r.message.id == message.id)
+                                || judging.as_ref().is_some_and(|(r, _)| r.message.id == message.id)
                                 || delivering.as_ref().is_some_and(|d| d.reply.message.id == message.id);
                             if live { warn(&ctx, "duplicate_pending"); continue; }
                             let duplicate = ledger.find(&config.app_id, &message.id).is_some();
                             let pending = queue.len() + commands.len() + active.len() + replies.len()
-                                + routing.len() + usize::from(delivering.is_some());
+                                + routing.len() + usize::from(delivering.is_some()) + usize::from(judging.is_some());
                             if duplicate || pending >= MAX_PENDING {
                                 warn(&ctx, if duplicate { "duplicate_no_replay" } else { "queue_limit" });
                                 finish(&mut stdin, &message.id).await?;
@@ -918,6 +1112,25 @@ pub(crate) async fn run(
             }
         }
     }.await;
+    // 停止时尚未写出的邀请段确定没有发送；已写出但未收到回执的留给宿主重启时核对。
+    if let (Some(hook), Some(delivery)) = (&outreach, &delivering)
+        && let Some((id, part)) = &delivery.appendix
+        && ledger
+            .find(&config.app_id, &delivery.reply.message.id)
+            .is_some_and(|index| {
+                ledger.entries[index]
+                    .segments
+                    .as_ref()
+                    .is_some_and(|segments| {
+                        matches!(
+                            segments.parts[*part].state,
+                            PartState::Pending | PartState::Skipped
+                        )
+                    })
+            })
+    {
+        report(hook, &ctx, id, QqOutreachResult::NotSent);
+    }
     // MessageService 拥有准入动作；停止不能丢弃 wait 后遗留它启动的替代代。
     // 先等路由收尾，再查询目标会话最新代，随后取消并等待全部本地执行器。
     closed.send_replace(true);

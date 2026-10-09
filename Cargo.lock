@@ -299,6 +299,8 @@ dependencies = [
  "eve-message-api",
  "eve-message-diagnostics",
  "eve-message-plugin",
+ "eve-outreach-api",
+ "eve-outreach-plugin",
  "eve-plan-api",
  "eve-plan-plugin",
  "eve-plugin-api",
@@ -640,6 +642,29 @@ dependencies = [
  "eve-plugin-api",
  "eve-session-api",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "eve-outreach-api"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eve-outreach-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-kernel",
+ "eve-llm-api",
+ "eve-outreach-api",
+ "eve-plugin-api",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

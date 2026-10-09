@@ -1,7 +1,7 @@
 use crate::{
     AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_cognition, qq_interest,
-    qq_learning, qq_learning_commands, qq_memory, qq_memory_observer, qq_practice, qq_research,
-    qq_skill, segment_commands,
+    qq_learning, qq_learning_commands, qq_memory, qq_memory_observer, qq_outreach, qq_practice,
+    qq_research, qq_skill, segment_commands,
 };
 use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
@@ -24,6 +24,10 @@ use eve_llm_api::ContextAssembler;
 use eve_memory_api::{MEMORY_PLUGIN_ID, MemoryAdmin};
 use eve_memory_plugin::{LexicalMemoryRecall, MemoryContext, MemoryPlugin, MemoryRecallContext};
 use eve_message_plugin::MessageRouterPlugin;
+use eve_outreach_api::{
+    InvitationComposer, OUTREACH_PLUGIN_ID, OutreachAdmin, OutreachPolicy, TimingJudge,
+};
+use eve_outreach_plugin::{ModelInvitationComposer, ModelTimingJudge, OutreachPlugin};
 use eve_plugin_api::{PluginId, PluginResult, ServiceId};
 use eve_practice_api::{PRACTICE_PLUGIN_ID, PracticeDrafter, PracticeRunner};
 use eve_practice_mindustry::{MindustryServerRunner, RuntimeCommand};
@@ -48,7 +52,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--skill-learning] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--skill-learning] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -73,6 +77,9 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --practice-mindustry-server 需同时 --interest-learning；为等待中的学习目标制作只含数据文件的最小 Mindustry 模组，用操作者提供的无头服务端 jar 在全新目录中实际加载并探测内容属性（--practice-java 默认 java），每个目标修订至多一次、每次至多三次尝试，只有实际加载且全部探测通过才记为已验证。
 /practice 兴趣ID 查看实践记录：每次尝试的产物文件、运行版本、加载状态、警告与探测期望/实际值；中断不重放。
 --skill-learning 需同时 --practice-mindustry-server；把实际验证通过的实践提炼为参数化技能，宿主核对能逐字还原原产物，再用与原值不同的参数在同一运行环境中实际运行通过后自动启用；后续任务的第一次尝试可选用已启用的技能，调用结果以实际运行证据为准。
+--outreach 需同时 --practice-mindustry-server；学习目标有了实际验证的进展后撰写一条邀请（只用账本中的用户原话、实践证据与已启用技能），在用户下次私聊找 Eve 时先判断此刻是否合适（看用户这条消息与回复），合适才随被动回复附带，以平台回执为准；同一用户默认 24 小时内至多送达一条（--outreach-cooldown-ms 可调整），群聊不附带。
+--outreach-proactive-after-ms 需同时 --outreach；邀请在被动窗口等待超过该时间仍未送达时主动私聊一次（受平台配额与用户开关限制，被拒绝时保持待投递）。
+/outreach 查看邀请状态与回执；/outreach off 请 Eve 不再主动提起，/outreach on 恢复。
 /skills 列出技能；/skill 技能ID 查看版本、验证证据、启用记录与调用；/skill disable|rollback 技能ID、/skill enable 技能ID 版本 停用、回退或启用某个已验证版本。
 明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
 --segmented 把模型回复按自然段分成至多 3 条消息，段间停顿至多 2.5 秒；命令确认整条发送。
@@ -109,6 +116,12 @@ pub struct QqBotOptions {
     pub practice_java_args: Vec<OsString>,
     /// 把已验证的实践固化为技能并在后续任务中复用；需要实践验证。
     pub skill_learning: bool,
+    /// 学习目标取得实际验证的进展后择机邀请用户；需要实践验证。
+    pub outreach: bool,
+    /// 同一用户两次送达之间的最短间隔；未提供时为 24 小时。
+    pub outreach_cooldown_ms: Option<u64>,
+    /// 邀请在被动窗口等待多久后主动私聊；未提供时不主动私聊。
+    pub outreach_proactive_after_ms: Option<u64>,
     pub segmented: bool,
     pub message_judge: MessageJudgeMode,
     pub web_listen: Option<std::net::SocketAddr>,
@@ -137,6 +150,9 @@ impl Default for QqBotOptions {
             practice_java: None,
             practice_java_args: Vec::new(),
             skill_learning: false,
+            outreach: false,
+            outreach_cooldown_ms: None,
+            outreach_proactive_after_ms: None,
             segmented: false,
             message_judge: MessageJudgeMode::Off,
             web_listen: None,
@@ -186,6 +202,10 @@ impl QqBotOptions {
             }
             if arg == "--skill-learning" {
                 options.skill_learning = true;
+                continue;
+            }
+            if arg == "--outreach" {
+                options.outreach = true;
                 continue;
             }
             let value = args.next().ok_or("QQBot 参数缺少值")?;
@@ -240,6 +260,24 @@ impl QqBotOptions {
                         .filter(|v| *v <= 86_400_000)
                         .ok_or("提炼间隔必须为 0 至 86400000 的毫秒整数")?;
                 }
+                Some("--outreach-cooldown-ms") => {
+                    options.outreach_cooldown_ms = Some(
+                        value
+                            .to_str()
+                            .and_then(|v| v.parse().ok())
+                            .filter(|v| *v <= 30 * 86_400_000)
+                            .ok_or("邀请冷却必须为 0 至 2592000000 的毫秒整数")?,
+                    );
+                }
+                Some("--outreach-proactive-after-ms") => {
+                    options.outreach_proactive_after_ms = Some(
+                        value
+                            .to_str()
+                            .and_then(|v| v.parse().ok())
+                            .filter(|v| *v <= 30 * 86_400_000)
+                            .ok_or("主动私聊等待必须为 0 至 2592000000 的毫秒整数")?,
+                    );
+                }
                 Some("--interest-cooldown-ms") => {
                     options.interest_options.cooldown_ms = value
                         .to_str()
@@ -277,6 +315,17 @@ impl QqBotOptions {
         if options.skill_learning && options.practice_server_jar.is_none() {
             return Err("--skill-learning 需要同时指定 --practice-mindustry-server".into());
         }
+        if (options.outreach_cooldown_ms.is_some() || options.outreach_proactive_after_ms.is_some())
+            && !options.outreach
+        {
+            return Err(
+                "--outreach-cooldown-ms 与 --outreach-proactive-after-ms 需要同时开启 --outreach"
+                    .into(),
+            );
+        }
+        if options.outreach && options.practice_server_jar.is_none() {
+            return Err("--outreach 需要同时指定 --practice-mindustry-server".into());
+        }
         Ok(Some(options))
     }
 }
@@ -307,6 +356,9 @@ pub struct InterestComponents {
     /// 替换技能提炼器与选择器；默认各使用主模型的单次无工具请求。是否固化技能仍由 --skill-learning 决定。
     pub distiller: Option<Arc<dyn SkillDistiller>>,
     pub skill_selector: Option<Arc<dyn SkillSelector>>,
+    /// 替换邀请撰写器与时机判断器；默认各使用主模型的单次无工具请求。是否主动交流仍由 --outreach 决定。
+    pub composer: Option<Arc<dyn InvitationComposer>>,
+    pub timing_judge: Option<Arc<dyn TimingJudge>>,
 }
 
 async fn interrupted() -> Result<(), AppError> {
@@ -423,6 +475,9 @@ async fn run_qqbot_composed(
     if options.skill_learning && !practice_enabled {
         return Err("技能固化需要同时开启实践验证".into());
     }
+    if options.outreach && !practice_enabled {
+        return Err("主动交流需要同时开启实践验证".into());
+    }
     let panel_config = options
         .web_listen
         .map(|address| -> Result<_, AppError> {
@@ -481,6 +536,7 @@ async fn run_qqbot_composed(
     let mut interest_background: Option<qq_interest::Background> = None;
     let mut research_background: Option<qq_research::Background> = None;
     let mut practice_background: Option<qq_practice::Background> = None;
+    let mut outreach_background: Option<qq_outreach::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
     let mut panel: Option<eve_web_panel::LocalPanel> = None;
     let page_permit = eve_web_panel_api::PageWritePermit::default();
@@ -566,6 +622,16 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        // 邀请账本同样先于通道加载；损坏时拒绝启动并保留原字节。
+        let outreach = if options.outreach {
+            let plugin = OutreachPlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(OUTREACH_PLUGIN_ID)?).await?;
+            Some(controller)
+        } else {
+            None
+        };
         let context: Arc<dyn ContextAssembler> = if let Some(memory) = &memory {
             let context = MemoryContext::new("qq", memory.clone(), context)?;
             Arc::new(if options.self_learning {
@@ -575,6 +641,14 @@ async fn run_qqbot_composed(
             })
         } else {
             context
+        };
+        // 送达过的邀请作为数据交给后续对话，用户接下来的话可能是在回应它。
+        let context: Arc<dyn ContextAssembler> = match &outreach {
+            Some(outreach) => Arc::new(qq_outreach::OutreachContext {
+                wrapped: context,
+                outreach: Arc::new(outreach.clone()),
+            }),
+            None => context,
         };
         bootstrap.context = Some(if options.memory_recall {
             let memory = memory.clone().ok_or("记忆召回缺少记忆服务")?;
@@ -672,6 +746,8 @@ async fn run_qqbot_composed(
             runner: practice_runner,
             distiller: skill_distiller,
             skill_selector,
+            composer: invitation_composer,
+            timing_judge,
         } = interest_components;
         let interest_commands = if let Some(interests) = &interests {
             let memory = memory.clone().ok_or("兴趣观察缺少记忆服务")?;
@@ -811,6 +887,33 @@ async fn run_qqbot_composed(
             .map_or_else(qq_skill::Commands::disabled, |skills| {
                 qq_skill::Commands::enabled(Arc::new(skills.clone()))
             });
+        let outreach_policy = OutreachPolicy {
+            cooldown_ms: options
+                .outreach_cooldown_ms
+                .unwrap_or(OutreachPolicy::default().cooldown_ms),
+            proactive_after_ms: options.outreach_proactive_after_ms,
+        };
+        let outreach_commands = if let (Some(outreach), Some(practice), Some(interests)) =
+            (&outreach, &practice, &interests)
+        {
+            let composer: Arc<dyn InvitationComposer> = match invitation_composer {
+                Some(composer) => composer,
+                None => Arc::new(ModelInvitationComposer::new(core_resolver()?)),
+            };
+            outreach_background = Some(qq_outreach::Background::start(qq_outreach::Services {
+                outreach: Arc::new(outreach.clone()),
+                cognition: Arc::new(background.as_ref().ok_or("主动交流缺少认知服务")?.admin()?),
+                interests: Arc::new(interests.clone()),
+                practice: Arc::new(practice.clone()),
+                skills: skills
+                    .clone()
+                    .map(|skills| Arc::new(skills) as Arc<dyn SkillAdmin>),
+                composer,
+            }));
+            qq_outreach::Commands::enabled(Arc::new(outreach.clone()))
+        } else {
+            qq_outreach::Commands::disabled()
+        };
         let memory_commands = memory
             .as_ref()
             .map_or_else(qq_memory::Commands::disabled, |memory| {
@@ -853,8 +956,26 @@ async fn run_qqbot_composed(
             research_commands,
             practice_commands,
             skill_commands,
+            outreach_commands,
             segment_commands,
         ])));
+        if let Some(outreach) = &outreach {
+            let judge: Arc<dyn TimingJudge> = match timing_judge {
+                Some(judge) => judge,
+                None => Arc::new(ModelTimingJudge::new(core_resolver()?)),
+            };
+            // 主动私聊开启时，通道空闲后每 2 秒询问一次；是否发送由宿主策略决定。
+            plugin = plugin.with_outreach(
+                Arc::new(qq_outreach::ChannelAdapter {
+                    outreach: Arc::new(outreach.clone()) as Arc<dyn OutreachAdmin>,
+                    judge,
+                    policy: outreach_policy,
+                }),
+                outreach_policy
+                    .proactive_after_ms
+                    .map(|_| std::time::Duration::from_secs(2)),
+            )?;
+        }
         if let Some(store) = segment_preferences {
             plugin = plugin.with_segment_preferences(store, QQ_SEGMENT_POLICY)?;
         }
@@ -969,6 +1090,9 @@ async fn run_qqbot_composed(
         if let Some(practice) = &practice_background {
             practice.activate();
         }
+        if let Some(outreach) = &outreach_background {
+            outreach.activate();
+        }
         wait_channel(
             handle.status.clone(),
             background.as_ref().map(qq_cognition::Background::finished),
@@ -983,7 +1107,20 @@ async fn run_qqbot_composed(
                 .map(qq_research::Background::finished),
             practice_background
                 .as_ref()
-                .map(qq_practice::Background::finished),
+                .map(|practice| {
+                    (
+                        practice.finished(),
+                        "实践验证后台已结束；QQ 通道停止准入并保留状态",
+                    )
+                })
+                .into_iter()
+                .chain(outreach_background.as_ref().map(|outreach| {
+                    (
+                        outreach.finished(),
+                        "主动交流后台已结束；QQ 通道停止准入并保留状态",
+                    )
+                }))
+                .collect(),
             panel.as_ref().map(eve_web_panel::LocalPanel::finished),
         )
         .await
@@ -1023,6 +1160,15 @@ async fn run_qqbot_composed(
     }
     if let Some(practice) = &practice_background {
         practice.request_stop();
+    }
+    if let Some(outreach) = &outreach_background {
+        outreach.request_stop();
+    }
+    // 撰写读取学习目标、实践与技能并写邀请账本；先写入取消结局。
+    if let Some(outreach) = outreach_background
+        && let Err(error) = outreach.stop().await
+    {
+        secondary.push(error);
     }
     // 实践读取学习目标与知识并写实践账本；先终止运行中的进程并写入取消结局。
     if let Some(practice) = practice_background
@@ -1095,6 +1241,29 @@ impl QqCommandHandler for CommandHandlers {
     }
 }
 
+/// 任一后台结束时返回其说明；没有后台时永不返回。
+async fn any_finished(receivers: Vec<(watch::Receiver<bool>, &'static str)>) -> &'static str {
+    let mut waits: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = &'static str> + Send>>> =
+        receivers
+            .into_iter()
+            .map(|(receiver, message)| {
+                Box::pin(async move {
+                    background_finished(Some(receiver)).await;
+                    message
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = &'static str> + Send>>
+            })
+            .collect();
+    std::future::poll_fn(|cx| {
+        for wait in &mut waits {
+            if let std::task::Poll::Ready(message) = wait.as_mut().poll(cx) {
+                return std::task::Poll::Ready(message);
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
 async fn background_finished(mut receiver: Option<watch::Receiver<bool>>) {
     let Some(receiver) = &mut receiver else {
         std::future::pending::<()>().await;
@@ -1113,7 +1282,7 @@ async fn wait_channel(
     learning: Option<watch::Receiver<bool>>,
     interest: Option<watch::Receiver<bool>>,
     research: Option<watch::Receiver<bool>>,
-    practice: Option<watch::Receiver<bool>>,
+    later: Vec<(watch::Receiver<bool>, &'static str)>,
     panel: Option<watch::Receiver<bool>>,
 ) -> Result<(), AppError> {
     let stop = interrupted();
@@ -1121,7 +1290,7 @@ async fn wait_channel(
     let stopped_learning = background_finished(learning);
     let stopped_interest = background_finished(interest);
     let stopped_research = background_finished(research);
-    let stopped_practice = background_finished(practice);
+    let stopped_later = any_finished(later);
     let stopped_panel = background_finished(panel);
     tokio::pin!(
         stop,
@@ -1129,7 +1298,7 @@ async fn wait_channel(
         stopped_learning,
         stopped_interest,
         stopped_research,
-        stopped_practice,
+        stopped_later,
         stopped_panel
     );
     let mut ready_announced = false;
@@ -1147,7 +1316,7 @@ async fn wait_channel(
             _ = &mut stopped_learning => return Err("偏好提炼后台已结束；QQ 通道停止准入并保留状态".into()),
             _ = &mut stopped_interest => return Err("兴趣观察后台已结束；QQ 通道停止准入并保留状态".into()),
             _ = &mut stopped_research => return Err("受控研究后台已结束；QQ 通道停止准入并保留状态".into()),
-            _ = &mut stopped_practice => return Err("实践验证后台已结束；QQ 通道停止准入并保留状态".into()),
+            message = &mut stopped_later => return Err(message.into()),
             _ = &mut stopped_panel => return Err("本机面板异常结束；QQ 通道停止准入并保留状态".into()),
             result = &mut stop => return result,
             result = status.changed() => result.map_err(|_| "QQBot 状态通知丢失")?,

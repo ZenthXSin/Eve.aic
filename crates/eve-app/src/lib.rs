@@ -19,6 +19,7 @@ mod qq_learning_commands;
 mod qq_memory;
 mod qq_memory_observer;
 mod qq_message_judge;
+mod qq_outreach;
 mod qq_practice;
 mod qq_research;
 mod qq_skill;
