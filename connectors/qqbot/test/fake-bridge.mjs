@@ -7,6 +7,15 @@ if (process.env.EVE_OPENAI_API_KEY || process.argv.some(x => x.includes("test-ap
   throw new Error("model_credentials_leaked");
 }
 const send = frame => process.stdout.write(JSON.stringify({ version: 1, ...frame }) + "\n");
+// 宿主以原子替换写入状态；Windows 上读取恰逢替换时会暂时拒绝打开，视为尚未写入，由等待循环稍后再读。
+const readState = path => {
+  try {
+    return JSON.parse(fs.readFileSync(path, "utf8"));
+  } catch (error) {
+    if (["ENOENT", "EPERM", "EBUSY", "EACCES"].includes(error?.code) || error instanceof SyntaxError) return null;
+    throw error;
+  }
+};
 if (scenario.pid_file) fs.writeFileSync(scenario.pid_file, String(process.pid));
 const record = event => {
   if (scenario.events_file) fs.appendFileSync(scenario.events_file, JSON.stringify(event) + "\n");
@@ -74,7 +83,8 @@ if (scenario.script) {
         deliverSegment(id, index, ok ?? true);
       } else if (step.wait_turn) {
         if (!await until(() => {
-          const document = JSON.parse(fs.readFileSync(step.wait_turn.path, "utf8"));
+          const document = readState(step.wait_turn.path);
+          if (!document) return false;
           const sessions = JSON.parse(Buffer.from(document.entries["eve.session"]["sessions.v1"]).toString());
           return Object.values(sessions.sessions).some(session => session.turns.some(turn =>
             turn.input === step.wait_turn.input && turn.status.state === step.wait_turn.state));
@@ -82,8 +92,8 @@ if (scenario.script) {
       } else if (step.wait_cognition) {
         if (!await until(() => {
           const wanted = step.wait_cognition;
-          if (!fs.existsSync(wanted.path)) return false;
-          const document = JSON.parse(fs.readFileSync(wanted.path, "utf8"));
+          const document = readState(wanted.path);
+          if (!document) return false;
           const bytes = document.entries["eve.cognition"]?.["cognition.v1"];
           if (!bytes) return false;
           const cognition = JSON.parse(Buffer.from(bytes).toString());
@@ -94,8 +104,8 @@ if (scenario.script) {
       } else if (step.wait_part) {
         if (!await until(() => {
           const wanted = step.wait_part;
-          if (!fs.existsSync(wanted.path)) return false;
-          const document = JSON.parse(fs.readFileSync(wanted.path, "utf8"));
+          const document = readState(wanted.path);
+          if (!document) return false;
           const bytes = document.entries["eve.channel.qqbot"]?.["receipts.v1"];
           if (!bytes) return false;
           const ledger = JSON.parse(Buffer.from(bytes).toString());
@@ -105,8 +115,8 @@ if (scenario.script) {
       } else if (step.wait_receipt) {
         if (!await until(() => {
           const wanted = step.wait_receipt;
-          if (!fs.existsSync(wanted.path)) return false;
-          const document = JSON.parse(fs.readFileSync(wanted.path, "utf8"));
+          const document = readState(wanted.path);
+          if (!document) return false;
           const bytes = document.entries["eve.channel.qqbot"]?.["receipts.v1"];
           if (!bytes) return false;
           const ledger = JSON.parse(Buffer.from(bytes).toString());
