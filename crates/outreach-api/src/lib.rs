@@ -9,6 +9,9 @@
 //! 送达之后，识别器看用户接下来的几轮对话，判断用户是否在回应邀请、怎样回应，并逐字引用
 //! 用户原话作为依据。连续的负面反馈（不需要、时机不对）让同一用户的冷却期加倍并停止主动私聊，
 //! 直到用户再次正面回应；之前的反馈也作为数据交给之后的时机判断。
+//!
+//! 用户在回应中提出具体想法时，派生器把这条原话确定性地变成一个后续创作目标：沿用学习目标的
+//! 知识与已启用的技能去做，做成后再走同样的邀请流程告诉用户；最初的学习目标关闭时一并取消。
 use serde::{Deserialize, Serialize};
 use std::{cmp::Reverse, fmt, future::Future, pin::Pin};
 
@@ -41,6 +44,10 @@ pub const MAX_RESPONSE_OUTPUT_BYTES: usize = 2048;
 pub const MAX_COOLDOWN_DOUBLINGS: u32 = 3;
 /// 交给时机判断器的先前反馈条数上限。
 pub const MAX_FEEDBACK_NOTES: usize = 3;
+/// 后续创作目标的来源通道与核对标记。
+pub const REQUEST_GOAL_CHANNEL: &str = "outreach.request";
+pub const REQUEST_GOAL_VERIFICATION: &str = "outreach-request:v1";
+pub const REQUEST_MARKER_SCHEMA: &str = "outreach-request-goal:v1";
 pub const MAX_STATE_BYTES: usize = 2 * 1024 * 1024;
 
 pub type OutreachResult<T> = Result<T, OutreachError>;
@@ -553,6 +560,39 @@ pub trait ResponseJudge: Send + Sync {
     fn judge(&self, request: ResponseRequest) -> OutreachFuture<'_, ResponseVerdict>;
 }
 
+/// 后续创作目标等待原因中的机器可读标记。learning_goal_id 是最初由兴趣派生的学习目标，
+/// 用户连续提出想法时保持不变；parent_goal_id 是这次邀请所属的目标。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestMarker {
+    pub schema: String,
+    pub invitation_id: String,
+    pub parent_goal_id: String,
+    pub learning_goal_id: String,
+}
+impl RequestMarker {
+    pub fn parse(text: &str) -> Option<Self> {
+        let marker: Self = serde_json::from_str(text).ok()?;
+        (marker.schema == REQUEST_MARKER_SCHEMA).then_some(marker)
+    }
+}
+
+/// 本次同步对后续创作目标做出的修改；暂缓的邀请下次重新核对。
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RequestReport {
+    pub created: Vec<String>,
+    pub cancelled: Vec<String>,
+    /// 修订冲突或认知容量不足而暂缓的邀请 ID。
+    pub deferred: Vec<String>,
+}
+
+/// 可替换派生器：由识别为“提出想法”的回应确定性地同步后续创作目标；零模型请求，可重复调用。
+/// 最初的学习目标关闭（例如用户撤回兴趣）时取消仍在等待的后续目标。
+pub trait RequestGoalDeriver: Send + Sync {
+    fn version(&self) -> &str;
+    fn reconcile(&self, snapshot: &OutreachSnapshot, now_ms: u64) -> OutreachResult<RequestReport>;
+}
+
 /// 仅可信宿主持有；不发布给模型或不受信插件。
 pub trait OutreachAdmin: Send + Sync {
     fn snapshot(&self) -> OutreachResult<OutreachSnapshot>;
@@ -742,11 +782,18 @@ fn quote_matches(text: &str, quote: &str) -> bool {
     !quote.is_empty() && compact(text).contains(&quote)
 }
 
-/// 同一学习目标只邀请一次；重复准入得到同一 ID。
-pub fn invitation_id(goal_id: &str) -> String {
+/// 同一主体与邀请固定映射到一个后续创作目标；重启或重复同步都不会另建目标。
+pub fn request_goal_id(subject: &str, invitation_id: &str) -> String {
+    format!(
+        "eve.outreach.request.{}",
+        digest(&["outreach.request.goal:v1", subject, invitation_id])
+    )
+}
+
+fn digest(parts: &[&str]) -> String {
     use ring::digest::{Context, SHA256};
     let mut context = Context::new(&SHA256);
-    for part in ["outreach.invitation:v1", goal_id] {
+    for part in parts {
         context.update(&(part.len() as u64).to_be_bytes());
         context.update(part.as_bytes());
     }
@@ -756,7 +803,12 @@ pub fn invitation_id(goal_id: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    format!("invite-{}", &digest[..32])
+    digest[..32].to_string()
+}
+
+/// 同一学习目标只邀请一次；重复准入得到同一 ID。
+pub fn invitation_id(goal_id: &str) -> String {
+    format!("invite-{}", digest(&["outreach.invitation:v1", goal_id]))
 }
 
 macro_rules! redacted { ($($ty:ty),+ $(,)?) => { $(impl fmt::Debug for $ty { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(concat!(stringify!($ty), "(<redacted>)")) } })+ }; }

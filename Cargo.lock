@@ -658,6 +658,8 @@ dependencies = [
 name = "eve-outreach-plugin"
 version = "0.1.0"
 dependencies = [
+ "eve-cognition-api",
+ "eve-cognition-plugin",
  "eve-kernel",
  "eve-llm-api",
  "eve-outreach-api",

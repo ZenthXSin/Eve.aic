@@ -29,7 +29,7 @@ use eve_outreach_api::{
     TimingJudge,
 };
 use eve_outreach_plugin::{
-    ModelInvitationComposer, ModelResponseJudge, ModelTimingJudge, OutreachPlugin,
+    ModelInvitationComposer, ModelResponseJudge, ModelTimingJudge, OutreachPlugin, RequestGoals,
 };
 use eve_plugin_api::{PluginId, PluginResult, ServiceId};
 use eve_practice_api::{PRACTICE_PLUGIN_ID, PracticeDrafter, PracticeRunner};
@@ -910,9 +910,15 @@ async fn run_qqbot_composed(
                 Some(judge) => judge,
                 None => Arc::new(ModelResponseJudge::new(core_resolver()?)),
             };
+            let cognition: Arc<dyn eve_cognition_api::CognitionAdmin> =
+                Arc::new(background.as_ref().ok_or("主动交流缺少认知服务")?.admin()?);
+            let requests = Arc::new(
+                RequestGoals::new(cognition.clone(), "eve")
+                    .map_err(|_| "主动交流无法创建后续创作派生器")?,
+            );
             outreach_background = Some(qq_outreach::Background::start(qq_outreach::Services {
                 outreach: Arc::new(outreach.clone()),
-                cognition: Arc::new(background.as_ref().ok_or("主动交流缺少认知服务")?.admin()?),
+                cognition,
                 interests: Arc::new(interests.clone()),
                 practice: Arc::new(practice.clone()),
                 skills: skills
@@ -921,6 +927,7 @@ async fn run_qqbot_composed(
                 memory: memory.clone().ok_or("主动交流缺少记忆服务")?,
                 composer,
                 responder,
+                requests,
             }));
             qq_outreach::Commands::enabled(Arc::new(outreach.clone()))
         } else {
