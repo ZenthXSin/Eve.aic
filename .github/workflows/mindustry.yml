@@ -9,9 +9,13 @@ on:
       - "crates/practice-mindustry/**"
       - "crates/skill-api/**"
       - "crates/skill-plugin/**"
+      - "crates/outreach-api/**"
+      - "crates/outreach-plugin/**"
       - "crates/eve-app/**"
       - "connectors/qqbot/test/practice_test.py"
       - "connectors/qqbot/test/skill_test.py"
+      - "connectors/qqbot/test/outreach_test.py"
+      - "connectors/qqbot/test/journey_test.py"
       - "connectors/qqbot/test/fake_mindustry.py"
       - ".github/workflows/mindustry.yml"
       - "Cargo.toml"
@@ -24,9 +28,13 @@ on:
       - "crates/practice-mindustry/**"
       - "crates/skill-api/**"
       - "crates/skill-plugin/**"
+      - "crates/outreach-api/**"
+      - "crates/outreach-plugin/**"
       - "crates/eve-app/**"
       - "connectors/qqbot/test/practice_test.py"
       - "connectors/qqbot/test/skill_test.py"
+      - "connectors/qqbot/test/outreach_test.py"
+      - "connectors/qqbot/test/journey_test.py"
       - "connectors/qqbot/test/fake_mindustry.py"
       - ".github/workflows/mindustry.yml"
       - "Cargo.toml"
@@ -71,3 +79,7 @@ jobs:
         env:
           EVE_MINDUSTRY_SERVER_JAR: ${{ runner.temp }}/server-release.jar
         run: python3 connectors/qqbot/test/skill_test.py SkillAcceptance.test_real_runtime_verifies_skill_holdout_and_invocation
+      - name: 实际 Eve QQBot 进程用真实服务端走完整行为链（阶段之间独立重启）
+        env:
+          EVE_MINDUSTRY_SERVER_JAR: ${{ runner.temp }}/server-release.jar
+        run: python3 connectors/qqbot/test/journey_test.py
