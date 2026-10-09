@@ -100,7 +100,7 @@ QQ 插件只公开同步 `QqCommandHandler` 契约，不依赖认知实现。通
 
 ## 桥接契约与兼容
 
-Node → Rust JSONL：`ready`、`message {id,scope,target_id,user_id,text}`、`delivery {id,index?,ok,message_id?}`、`warning`、`fatal`；Rust → Node：`reply {id,text}`、`segment {id,index,count,text}`、`finish {id}`、`stop`。`segment` 必须从 0 起按序、一段完成后才发下一段，`count` 为 2–5 且同一消息不变，不能与 `reply` 混用；末段送达或任一段失败后释放该消息，段间 `finish` 关闭剩余片段。双方发布 `version:1`。缺失/不同版本记录 warning 后按已知字段处理；额外消息字段记录 warning 后忽略。非法路由、空文本、未知或超长帧跳过，密钥缺失、损坏持久化状态和不能确认的运行失败明确报告。
+Node → Rust JSONL：`ready`、`message {id,scope,target_id,user_id,text}`、`delivery {id,index?,push?,ok,message_id?}`、`warning`、`fatal`；Rust → Node：`reply {id,text}`、`segment {id,index,count,text}`、`finish {id}`、`push {id,target_id,text}`、`stop`。`push` 只用于宿主开启的主动私聊邀请：不带消息 ID，目标只取自 Rust 已确认的私聊回执，回执以 `push:true` 区分，失败不重试。`segment` 必须从 0 起按序、一段完成后才发下一段，`count` 为 2–5 且同一消息不变，不能与 `reply` 混用；末段送达或任一段失败后释放该消息，段间 `finish` 关闭剩余片段。双方发布 `version:1`。缺失/不同版本记录 warning 后按已知字段处理；额外消息字段记录 warning 后忽略。非法路由、空文本、未知或超长帧跳过，密钥缺失、损坏持久化状态和不能确认的运行失败明确报告。
 
 stdout 专用于 JSONL，SDK 日志后端为空，异常正文/stack/token 不转发。桥接子进程清空宿主环境，只保留基本执行环境与 QQ 凭据，不接收模型 key；凭据不放 argv。单帧 64 KiB、输入/回复 32 KiB，Node pending 最多 128、Rust 待运行最多 16。容量满时 warning 并拒绝新增，保留已有消息和状态。
 
@@ -176,7 +176,7 @@ python3 connectors/qqbot/test/segment_test.py
 
 本次只使用 GitHub 托管 Runner，没有部署测试服务器。仅上传无正文计数报告，原始诊断、会话和回执未上传。一次性 PR 触发已移除，工作流恢复为仅 main 的手动入口；需要长期在线或保留本次 Runner 状态，应另行使用持久宿主。
 
-媒体、QQ 频道、webhook、主动消息和凭据库接线后置。明确修订已接线，自然消息判断现有默认关闭的 primary/Jev 实验入口；真实质量评估与暂停检查点仍待后续交付。
+媒体、QQ 频道、webhook 和凭据库接线后置；主动消息只用于[主动交流与邀请](./主动交流与邀请.md)的私聊邀请，默认关闭。明确修订已接线，自然消息判断现有默认关闭的 primary/Jev 实验入口；真实质量评估与暂停检查点仍待后续交付。
 
 ## 自主偏好学习
 
@@ -187,6 +187,8 @@ python3 connectors/qqbot/test/segment_test.py
 `--practice-mindustry-server jar`（需同时 `--interest-learning`）为等待中的学习目标制作只含数据文件的最小 Mindustry 模组，用操作者提供的无头服务端在全新目录中实际加载并探测内容属性，至多三次尝试、依据运行证据修正；只有实际加载且全部探测通过才记为已验证。`/practice 兴趣ID` 查看产物、运行版本、警告与探测期望/实际值，见[实践验证](./实践验证.md)。
 
 `--skill-learning`（需同时 `--practice-mindustry-server`）把实际验证通过的实践提炼为参数化技能：宿主核对模板能逐字还原原产物，再用自己选取的不同参数在同一运行环境中实际运行通过才自动启用；同一用户的后续任务第一次尝试可选用技能。`/skills` 列出技能，`/skill 技能ID` 查看版本、验证证据、启用记录与调用，`/skill disable|rollback 技能ID`、`/skill enable 技能ID 版本` 停用、回退或启用，见[技能固化与复用](./技能固化与复用.md)。
+
+`--outreach`（需同时 `--practice-mindustry-server`）在学习目标有了已验证的进展后撰写一条邀请：用户下次私聊找 Eve 时先判断时机，合适才作为最后一段随被动回复附带，以平台回执为准；`--outreach-proactive-after-ms` 开启等待后的主动私聊，`--outreach-cooldown-ms` 调整同一用户的送达间隔；`/outreach` 查看状态与回执，`/outreach off|on` 关闭或恢复，见[主动交流与邀请](./主动交流与邀请.md)。
 
 `--self-learning` 同时开启记忆、持续提炼和分段，证据充分的候选自动确认，明确节奏自动参与后续发送。`/self-learning status` 查看模式及关联情况；手动分段选择优先，`/segment reset` 清除手动选择并恢复跟随学习。默认提炼间隔五分钟，`--learning-cooldown-ms` 可调整。行为、恢复和容量见[自主偏好学习](./自主偏好学习.md)。
 

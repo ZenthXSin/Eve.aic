@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
-import { createBridge, consume, optionsFromEnv, MAX_MESSAGE_ID_BYTES, MAX_SEGMENTS } from "../bridge-core.mjs";
+import { createBridge, consume, optionsFromEnv, MAX_MESSAGE_ID_BYTES, MAX_PUSH_BYTES, MAX_SEGMENTS } from "../bridge-core.mjs";
 function fixture({ fail = false, limit = 128, appId = "1904159860", hold = null } = {}) {
   const frames = [], sent = [], handlers = new Map();
   const bot = {
@@ -263,4 +263,26 @@ test("QQ 无法承载的正文明确回失败回执并释放消息，不让 Rust
     assert.deepEqual(g.frames.filter(x => x.type === "delivery").map(x => [x.index, x.ok]), [[0, true], [1, false]]);
     assert.deepEqual(g.sent.map(x => x.text), ["第1段"]);
   }
+});
+test("主动私聊不带 msg_id，只发往 Rust 给出的私聊目标，并回真实回执", async () => {
+  const f = fixture();
+  await f.bridge.command({ type: "push", version: 1, id: "invite-1", target_id: "user-1", text: "要不要一起做？" });
+  assert.deepEqual(f.sent, [{ target: { scope: "c2c", targetId: "user-1" }, text: "要不要一起做？" }]);
+  assert.deepEqual(f.frames.at(-1), { version: 1, type: "delivery", id: "invite-1", push: true, ok: true, message_id: "out-1" });
+  // 不合规的目标被忽略；正文无法承载时明确回失败，不发送。
+  await f.bridge.command({ type: "push", version: 1, id: "invite-2", target_id: "../x", text: "x" });
+  await f.bridge.command({ type: "push", version: 1, id: "invite-3", target_id: "user-1", text: "长".repeat(MAX_PUSH_BYTES) });
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.frames.filter(x => x.type === "warning").at(0).code, "invalid_command");
+  assert.deepEqual(f.frames.at(-1), { version: 1, type: "delivery", id: "invite-3", push: true, ok: false });
+});
+test("主动私聊被平台拒绝时回失败回执与错误码，不重试、不泄漏正文", async () => {
+  const f = fixture({ fail: true });
+  await f.bridge.command({ type: "push", version: 1, id: "invite-1", target_id: "user-1", text: "要不要一起做？" });
+  assert.equal(f.sent.length, 1);
+  const delivery = f.frames.at(-1);
+  assert.equal(delivery.push, true);
+  assert.equal(delivery.ok, false);
+  assert.ok(!JSON.stringify(f.frames).includes("sensitive"));
+  assert.ok(!JSON.stringify(f.frames).includes("要不要"));
 });

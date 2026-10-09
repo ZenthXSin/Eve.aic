@@ -175,9 +175,11 @@ def main():
                 require(api(url, "/api/plugin-pages/save", raw=duplicate.encode())[0] == 400, "重复字段未拒绝")
 
                 def received(message_id):
-                    if not state_file.exists():
+                    # 后端以原子替换写入状态；Windows 上读取恰逢替换时会暂时拒绝打开，视为尚未写入，稍后再读。
+                    try:
+                        state_data = json.loads(state_file.read_text(encoding="utf-8"))
+                    except (FileNotFoundError, PermissionError, json.JSONDecodeError):
                         return False
-                    state_data = json.loads(state_file.read_text(encoding="utf-8"))
                     receipts = json.loads(bytes(state_data["entries"].get("eve.channel.qqbot", {}).get("receipts.v1", [])) or b'{}')
                     return any(entry["message"]["id"] == message_id and entry["state"] == "Sent" for entry in receipts.get("entries", []))
 

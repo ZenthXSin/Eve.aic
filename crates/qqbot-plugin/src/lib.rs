@@ -2,10 +2,16 @@
 mod bridge;
 mod commands;
 mod observer;
+mod outreach;
 mod state;
 
 pub use commands::{QqCommandHandler, QqCommandInput};
 pub use observer::{QqInteraction, QqInteractionObserver, QqInteractionSource};
+pub use outreach::{
+    QQ_OUTREACH_JUDGE_TIMEOUT, QQ_OUTREACH_MAX_BYTES, QQ_OUTREACH_MAX_REPLY_PARTS,
+    QQ_OUTREACH_PAUSE_MS, QqOutreach, QqOutreachFuture, QqOutreachMessage, QqOutreachMoment,
+    QqOutreachPush, QqOutreachResult,
+};
 
 use eve_control_api::{CONTROL_PLUGIN_ID, CONTROL_SERVICE_ID, ControlServiceHandle};
 use eve_message_api::{MessageServiceHandle, ROUTER_PLUGIN_ID, ROUTER_SERVICE_ID};
@@ -19,7 +25,7 @@ use eve_segment_api::{
 use eve_session_api::{SESSION_PLUGIN_ID, SESSION_SERVICE_ID, SessionKey, SessionServiceHandle};
 use eve_training_api::{TRAINING_PLUGIN_ID, TRAINING_SERVICE_ID, TrainingServiceHandle};
 use serde::Serialize;
-use std::{ffi::OsString, path::PathBuf, sync::Arc};
+use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::watch;
 
 pub const QQBOT_PLUGIN_ID: &str = "eve.channel.qqbot";
@@ -88,6 +94,7 @@ pub struct QqBotPlugin {
     observer: Option<Arc<dyn QqInteractionObserver>>,
     segmentation: Option<Arc<Segmentation>>,
     natural_message_judgement: bool,
+    outreach: Option<Arc<bridge::OutreachHook>>,
 }
 pub(crate) struct Segmentation {
     pub planner: Arc<dyn SegmentPlanner>,
@@ -114,6 +121,7 @@ impl QqBotPlugin {
             observer: None,
             segmentation: None,
             natural_message_judgement: false,
+            outreach: None,
         })
     }
     /// 显式开启在途普通文字判断；判断实现由宿主安装的 MessageService 决定。
@@ -164,6 +172,23 @@ impl QqBotPlugin {
             planner: current.planner.clone(),
             policy,
             preferences: Some(preferences),
+        }));
+        Ok(self)
+    }
+
+    /// 接入宿主的主动交流：普通私聊回复经宿主判断时机合适后，在被动窗口内附带邀请；`push_interval` 给出时，
+    /// 通道空闲后按该间隔询问是否主动私聊。未接线时不发送任何邀请。
+    pub fn with_outreach(
+        mut self,
+        outreach: Arc<dyn QqOutreach>,
+        push_interval: Option<Duration>,
+    ) -> PluginResult<Self> {
+        if push_interval.is_some_and(|interval| interval.is_zero()) {
+            return Err(PluginError::State("QQBot 主动私聊间隔无效".into()));
+        }
+        self.outreach = Some(Arc::new(bridge::OutreachHook {
+            inner: outreach,
+            push_interval,
         }));
         Ok(self)
     }
@@ -250,6 +275,7 @@ impl Plugin for QqBotPlugin {
             let command_handler = self.command_handler.clone();
             let segmentation = self.segmentation.clone();
             let natural_message_judgement = self.natural_message_judgement;
+            let outreach = self.outreach.clone();
             let task_ctx = ctx.clone();
             ctx.spawn_task(TaskSpec::new(
                 "QQBot JSONL 通道",
@@ -265,6 +291,7 @@ impl Plugin for QqBotPlugin {
                     let training = training.clone();
                     let observation = observation.clone();
                     let segmentation = segmentation.clone();
+                    let outreach = outreach.clone();
                     let status = status.clone();
                     let ledger = ledger.clone();
                     Box::pin(async move {
@@ -283,6 +310,7 @@ impl Plugin for QqBotPlugin {
                                 observation,
                                 segmentation,
                                 natural_message_judgement,
+                                outreach,
                             },
                             ledger,
                             signal,

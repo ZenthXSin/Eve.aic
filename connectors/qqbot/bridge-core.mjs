@@ -4,6 +4,8 @@ export const MAX_FRAME = 65536;
 export const MAX_MESSAGE_ID_BYTES = 253;
 // QQ passive replies to one inbound message are limited; segmented replies stay within it.
 export const MAX_SEGMENTS = 5;
+// Proactive invitations are short host-composed texts; Rust enforces the same bound.
+export const MAX_PUSH_BYTES = 2048;
 const validId = v => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v);
 const validMessageId = v => typeof v === "string" && v.trim() === v && v.length > 0 &&
   Buffer.byteLength(v) <= MAX_MESSAGE_ID_BYTES && !/[\p{Cc}]/u.test(v);
@@ -117,6 +119,26 @@ export function createBridge(bot, emit, limit = 128) {
       if (!ok || item.next === count || item.finished) pending.delete(frame.id);
     }
   }
+  // A proactive private message: no msg_id, so the platform applies its own quota and
+  // the user's opt-out; refusals come back as a failed receipt and are never retried here.
+  async function push(frame) {
+    if (!validMessageId(frame.id) || !validId(frame.target_id)) { warn("invalid_command"); return; }
+    if (!validText(frame.text) || Buffer.byteLength(frame.text) > MAX_PUSH_BYTES) {
+      warn("invalid_reply_text");
+      send({ type: "delivery", id: frame.id, push: true, ok: false });
+      return;
+    }
+    try {
+      const result = await bot.sendText({ scope: "c2c", targetId: frame.target_id }, frame.text);
+      send({ type: "delivery", id: frame.id, push: true, ok: true,
+        ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
+    } catch (err) {
+      const diagnostic = {};
+      if (Number.isInteger(err?.statusCode)) diagnostic.http_status = err.statusCode;
+      if (Number.isInteger(err?.code)) diagnostic.biz_code = err.code;
+      send({ type: "delivery", id: frame.id, push: true, ok: false, ...diagnostic });
+    }
+  }
   return {
     stop,
     warn,
@@ -125,6 +147,7 @@ export function createBridge(bot, emit, limit = 128) {
       if (frame.version !== 1) warn("protocol_version");
       if (frame.type === "stop") { stop(); return; }
       if (closed) return;
+      if (frame.type === "push") { await push(frame); return; }
       const item = pending.get(frame.id);
       if (!item) { warn("unknown_reply"); return; }
       if (frame.type === "finish") {
