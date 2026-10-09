@@ -67,6 +67,15 @@ impl StoredOutreach {
                 judgement.outcome = Some(JudgementOutcome::Interrupted);
                 changed = true;
             }
+            // 回应识别不重放；这批对话不再识别，不伪造完成时间。
+            if let Some(response) = invitation
+                .responses
+                .last_mut()
+                .filter(|response| response.outcome.is_none())
+            {
+                response.outcome = Some(ResponseOutcome::Interrupted);
+                changed = true;
+            }
             match invitation.status {
                 // 撰写请求不重放；不伪造完成时间。
                 InvitationStatus::Composing => {
@@ -154,6 +163,7 @@ impl StoredOutreach {
             attempts: vec![],
             delivered_at_ms: None,
             closed_at_ms: None,
+            responses: vec![],
         };
         let mut next = inner.ledger.clone();
         next.invitations.push(invitation.clone());
@@ -379,6 +389,53 @@ impl StoredOutreach {
         Ok(preference)
     }
 
+    pub(super) fn begin_response(
+        &self,
+        id: &str,
+        turns: Vec<ResponseTurn>,
+        at_ms: u64,
+    ) -> OutreachResult<Invitation> {
+        self.update(id, at_ms, |_, entry| {
+            if !entry.listening() || at_ms < last_time(entry) {
+                return Err(OutreachError::Conflict);
+            }
+            let delivered = entry.delivered_at_ms.ok_or(OutreachError::Conflict)?;
+            validate_turns(entry, &turns, delivered, at_ms)?;
+            entry.responses.push(ResponseJudgement {
+                turns,
+                started_at_ms: at_ms,
+                finished_at_ms: None,
+                outcome: None,
+            });
+            Ok(())
+        })
+    }
+
+    pub(super) fn record_response(
+        &self,
+        id: &str,
+        at_ms: u64,
+        outcome: Result<ResponseVerdict, OutreachFailure>,
+    ) -> OutreachResult<Invitation> {
+        self.update(id, at_ms, |_, entry| {
+            let Some(response) = entry.responses.last_mut() else {
+                return Err(OutreachError::Conflict);
+            };
+            if response.outcome.is_some() || at_ms < response.started_at_ms {
+                return Err(OutreachError::Conflict);
+            }
+            response.outcome = Some(match outcome {
+                Ok(verdict) => {
+                    validate_response_verdict(response, &verdict)?;
+                    ResponseOutcome::Verdict(verdict)
+                }
+                Err(failure) => ResponseOutcome::Failed(failure),
+            });
+            response.finished_at_ms = Some(at_ms);
+            Ok(())
+        })
+    }
+
     fn update(
         &self,
         id: &str,
@@ -423,11 +480,64 @@ fn last_time(entry: &Invitation) -> u64 {
                 .iter()
                 .flat_map(|judgement| [Some(judgement.started_at_ms), judgement.finished_at_ms]),
         )
+        .chain(
+            entry
+                .responses
+                .iter()
+                .flat_map(|response| [Some(response.started_at_ms), response.finished_at_ms]),
+        )
         .flatten()
         .chain(entry.composed_at_ms)
         .chain([entry.created_at_ms])
         .max()
         .unwrap_or(0)
+}
+
+/// 一次识别的输入：1 至 3 轮、按时间先后、都在送达之后的回应窗口内且不晚于识别开始；
+/// 不含附带邀请的那条消息，也不与之前识别过的对话重复。
+fn validate_turns(
+    entry: &Invitation,
+    turns: &[ResponseTurn],
+    delivered: u64,
+    started: u64,
+) -> OutreachResult<()> {
+    let invalid = || OutreachError::InvalidInput;
+    if turns.is_empty() || turns.len() > MAX_RESPONSE_TURNS {
+        return Err(invalid());
+    }
+    let mut previous = delivered;
+    let mut seen = BTreeSet::new();
+    for turn in turns {
+        validate_id(&turn.evidence_id)?;
+        validate_id(&turn.message_id)?;
+        if turn.at_ms < previous
+            || turn.at_ms > started
+            || turn.at_ms - delivered > RESPONSE_WINDOW_MS
+            || entry.heard(&turn.message_id)
+            || !seen.insert(turn.message_id.as_str())
+        {
+            return Err(invalid());
+        }
+        previous = turn.at_ms;
+    }
+    Ok(())
+}
+
+/// 结论须指向这次识别输入中的一条消息。
+fn validate_response_verdict(
+    response: &ResponseJudgement,
+    verdict: &ResponseVerdict,
+) -> OutreachResult<()> {
+    validate_verdict_shape(verdict)?;
+    if let Some(message_id) = &verdict.message_id
+        && !response
+            .turns
+            .iter()
+            .any(|turn| turn.message_id == *message_id)
+    {
+        return Err(OutreachError::InvalidInput);
+    }
+    Ok(())
 }
 
 fn validate_milestone(milestone: &Milestone) -> OutreachResult<()> {
@@ -480,6 +590,7 @@ fn encode(ledger: &Ledger) -> OutreachResult<Vec<u8>> {
                 entry.status,
                 InvitationStatus::Composing | InvitationStatus::Delivering
             ) || entry.judging()
+                || entry.responding()
         })
         .count();
     if bytes.len().saturating_add(open * 32) > MAX_STATE_BYTES {
@@ -653,6 +764,48 @@ fn validate_invitation(entry: &Invitation) -> OutreachResult<()> {
         entry.delivered_at_ms.is_none() || entry.status == InvitationStatus::Delivered;
     if !consistent || !closed_ok || !delivered_ok {
         return Err(invalid());
+    }
+    validate_responses(entry)
+}
+
+/// 回应识别只在送达之后，按时间先后、每轮对话至多一次；只有最后一次可以未结束；
+/// 得出回应结论后不再识别。
+fn validate_responses(entry: &Invitation) -> OutreachResult<()> {
+    let invalid = || OutreachError::InvalidInput;
+    if entry.responses.is_empty() {
+        return Ok(());
+    }
+    let Some(delivered) = entry.delivered_at_ms else {
+        return Err(invalid());
+    };
+    if entry.status != InvitationStatus::Delivered || entry.responses.len() > MAX_RESPONSES {
+        return Err(invalid());
+    }
+    let mut earlier = entry.clone();
+    earlier.responses.clear();
+    let mut previous = delivered;
+    let last = entry.responses.len() - 1;
+    for (index, response) in entry.responses.iter().enumerate() {
+        if earlier.feedback().is_some() || response.started_at_ms < previous {
+            return Err(invalid());
+        }
+        validate_turns(&earlier, &response.turns, delivered, response.started_at_ms)?;
+        match (response.finished_at_ms, &response.outcome) {
+            (Some(at), Some(outcome)) if at >= response.started_at_ms => {
+                match outcome {
+                    ResponseOutcome::Verdict(verdict) => {
+                        validate_response_verdict(response, verdict)?
+                    }
+                    ResponseOutcome::Failed(_) => {}
+                    ResponseOutcome::Interrupted => return Err(invalid()),
+                }
+                previous = at;
+            }
+            (None, Some(ResponseOutcome::Interrupted)) => previous = response.started_at_ms,
+            (None, None) if index == last => {}
+            _ => return Err(invalid()),
+        }
+        earlier.responses.push(response.clone());
     }
     Ok(())
 }

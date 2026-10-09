@@ -25,9 +25,12 @@ use eve_memory_api::{MEMORY_PLUGIN_ID, MemoryAdmin};
 use eve_memory_plugin::{LexicalMemoryRecall, MemoryContext, MemoryPlugin, MemoryRecallContext};
 use eve_message_plugin::MessageRouterPlugin;
 use eve_outreach_api::{
-    InvitationComposer, OUTREACH_PLUGIN_ID, OutreachAdmin, OutreachPolicy, TimingJudge,
+    InvitationComposer, OUTREACH_PLUGIN_ID, OutreachAdmin, OutreachPolicy, ResponseJudge,
+    TimingJudge,
 };
-use eve_outreach_plugin::{ModelInvitationComposer, ModelTimingJudge, OutreachPlugin};
+use eve_outreach_plugin::{
+    ModelInvitationComposer, ModelResponseJudge, ModelTimingJudge, OutreachPlugin,
+};
 use eve_plugin_api::{PluginId, PluginResult, ServiceId};
 use eve_practice_api::{PRACTICE_PLUGIN_ID, PracticeDrafter, PracticeRunner};
 use eve_practice_mindustry::{MindustryServerRunner, RuntimeCommand};
@@ -356,9 +359,11 @@ pub struct InterestComponents {
     /// 替换技能提炼器与选择器；默认各使用主模型的单次无工具请求。是否固化技能仍由 --skill-learning 决定。
     pub distiller: Option<Arc<dyn SkillDistiller>>,
     pub skill_selector: Option<Arc<dyn SkillSelector>>,
-    /// 替换邀请撰写器与时机判断器；默认各使用主模型的单次无工具请求。是否主动交流仍由 --outreach 决定。
+    /// 替换邀请撰写器、时机判断器与回应识别器；默认各使用主模型的单次无工具请求。
+    /// 是否主动交流仍由 --outreach 决定。
     pub composer: Option<Arc<dyn InvitationComposer>>,
     pub timing_judge: Option<Arc<dyn TimingJudge>>,
+    pub response_judge: Option<Arc<dyn ResponseJudge>>,
 }
 
 async fn interrupted() -> Result<(), AppError> {
@@ -748,6 +753,7 @@ async fn run_qqbot_composed(
             skill_selector,
             composer: invitation_composer,
             timing_judge,
+            response_judge,
         } = interest_components;
         let interest_commands = if let Some(interests) = &interests {
             let memory = memory.clone().ok_or("兴趣观察缺少记忆服务")?;
@@ -900,6 +906,10 @@ async fn run_qqbot_composed(
                 Some(composer) => composer,
                 None => Arc::new(ModelInvitationComposer::new(core_resolver()?)),
             };
+            let responder: Arc<dyn ResponseJudge> = match response_judge {
+                Some(judge) => judge,
+                None => Arc::new(ModelResponseJudge::new(core_resolver()?)),
+            };
             outreach_background = Some(qq_outreach::Background::start(qq_outreach::Services {
                 outreach: Arc::new(outreach.clone()),
                 cognition: Arc::new(background.as_ref().ok_or("主动交流缺少认知服务")?.admin()?),
@@ -908,7 +918,9 @@ async fn run_qqbot_composed(
                 skills: skills
                     .clone()
                     .map(|skills| Arc::new(skills) as Arc<dyn SkillAdmin>),
+                memory: memory.clone().ok_or("主动交流缺少记忆服务")?,
                 composer,
+                responder,
             }));
             qq_outreach::Commands::enabled(Arc::new(outreach.clone()))
         } else {

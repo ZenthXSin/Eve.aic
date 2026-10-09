@@ -403,6 +403,198 @@ async fn cancellation_quiet_preference_and_failed_commits() {
     kernel.stop_all().await.unwrap();
 }
 
+fn turn(message: &str, at: u64) -> ResponseTurn {
+    ResponseTurn {
+        evidence_id: format!("evidence-{message}"),
+        message_id: message.into(),
+        at_ms: at,
+    }
+}
+
+fn verdict(kind: ResponseKind, message: &str, quote: &str) -> ResponseVerdict {
+    ResponseVerdict {
+        kind,
+        message_id: Some(message.into()),
+        quote: Some(quote.into()),
+    }
+}
+
+/// 被动附带并送达，返回已送达的邀请。
+fn delivered(admin: &OutreachController, owner: &str, goal: &str, at: u64) -> Invitation {
+    let invitation = pending(admin, owner, goal, at);
+    invite(admin, &invitation.id, &format!("msg-{goal}"), at + 10);
+    admin
+        .claim(&invitation.id, at + 20, passive(&format!("msg-{goal}")))
+        .unwrap();
+    admin
+        .record_delivery(
+            &invitation.id,
+            at + 30,
+            AttemptResult::Sent {
+                platform_message_id: Some(format!("out-{goal}")),
+            },
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn responses_are_saved_before_judging_and_settle_once_with_a_quoted_verdict() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path());
+    let (kernel, admin) = open(store.clone()).await.unwrap();
+    let waiting = pending(&admin, "owner-a", "goal-0", 50);
+    assert!(
+        admin
+            .begin_response(&waiting.id, vec![turn("early", 60)], 70)
+            .is_err(),
+        "尚未送达不识别"
+    );
+    let invitation = delivered(&admin, "owner-a", "goal-1", 100);
+    let id = invitation.id.clone();
+    assert!(
+        admin
+            .snapshot()
+            .unwrap()
+            .listening()
+            .any(|entry| entry.id == id)
+    );
+    // 送达之前、附带邀请的那条消息、窗口之外、乱序、超出轮数或晚于识别开始的对话都被拒绝。
+    for turns in [
+        vec![turn("before", 120)],
+        vec![turn("msg-goal-1", 140)],
+        vec![turn("b", 150), turn("a", 140)],
+        vec![turn("a", 140), turn("a", 150)],
+        vec![
+            turn("a", 140),
+            turn("b", 141),
+            turn("c", 142),
+            turn("d", 143),
+        ],
+        vec![turn("future", 400)],
+        vec![],
+    ] {
+        assert!(admin.begin_response(&id, turns, 300).is_err());
+    }
+    let late = 130 + RESPONSE_WINDOW_MS + 1;
+    assert!(
+        admin
+            .begin_response(&id, vec![turn("late", late)], late + 1)
+            .is_err(),
+        "回应窗口之外"
+    );
+    assert_eq!(admin.snapshot().unwrap().invitations[1].responses, vec![]);
+
+    let started = admin
+        .begin_response(&id, vec![turn("chat", 200)], 210)
+        .unwrap();
+    assert!(started.responding() && !started.listening());
+    assert_eq!(
+        store.saved()["invitations"][1]["responses"][0]["outcome"],
+        Value::Null,
+        "识别前已保存确切输入"
+    );
+    assert!(
+        admin
+            .begin_response(&id, vec![turn("more", 205)], 220)
+            .is_err(),
+        "一次只识别一批"
+    );
+    assert!(
+        admin
+            .record_response(
+                &id,
+                230,
+                Ok(verdict(ResponseKind::BadTiming, "other", "我在上班"))
+            )
+            .is_err(),
+        "结论须指向本次输入中的消息"
+    );
+    let unrelated = admin
+        .record_response(
+            &id,
+            230,
+            Ok(ResponseVerdict {
+                kind: ResponseKind::Unrelated,
+                message_id: None,
+                quote: None,
+            }),
+        )
+        .unwrap();
+    assert!(unrelated.feedback().is_none() && unrelated.listening());
+    assert!(
+        admin
+            .begin_response(&id, vec![turn("chat", 200)], 240)
+            .is_err(),
+        "同一轮对话只识别一次"
+    );
+    admin
+        .begin_response(&id, vec![turn("busy", 250), turn("again", 260)], 270)
+        .unwrap();
+    let answered = admin
+        .record_response(
+            &id,
+            280,
+            Ok(verdict(ResponseKind::BadTiming, "busy", "我在上班")),
+        )
+        .unwrap();
+    assert_eq!(answered.feedback().unwrap().kind, ResponseKind::BadTiming);
+    assert!(!answered.listening());
+    assert!(
+        admin
+            .begin_response(&id, vec![turn("later", 290)], 300)
+            .is_err(),
+        "得出结论后不再识别"
+    );
+    let snapshot = admin.snapshot().unwrap();
+    assert_eq!(snapshot.negative_streak("owner-a"), 1);
+    let [note] = snapshot.feedback_notes("owner-a").try_into().ok().unwrap();
+    assert_eq!(note.quote, "我在上班");
+
+    // 识别时进程退出：重启记为中断，这批对话不再识别；失败同样不重放。
+    let other = delivered(&admin, "owner-b", "goal-2", 400);
+    admin
+        .begin_response(&other.id, vec![turn("hello", 500)], 510)
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    let (kernel, admin) = open(store.clone()).await.unwrap();
+    let entry = admin
+        .snapshot()
+        .unwrap()
+        .invitations
+        .into_iter()
+        .find(|entry| entry.id == other.id)
+        .unwrap();
+    assert_eq!(
+        entry.responses[0].outcome,
+        Some(ResponseOutcome::Interrupted)
+    );
+    assert_eq!(entry.responses[0].finished_at_ms, None);
+    assert!(entry.listening());
+    assert!(
+        admin
+            .begin_response(&other.id, vec![turn("hello", 500)], 520)
+            .is_err()
+    );
+    admin
+        .begin_response(&other.id, vec![turn("next", 530)], 540)
+        .unwrap();
+    let failed = admin
+        .record_response(&other.id, 550, Err(OutreachFailure::InvalidOutput))
+        .unwrap();
+    assert_eq!(
+        failed.responses[1].outcome,
+        Some(ResponseOutcome::Failed(OutreachFailure::InvalidOutput))
+    );
+    admin
+        .begin_response(&other.id, vec![turn("third", 560)], 570)
+        .unwrap();
+    let exhausted = admin
+        .record_response(&other.id, 580, Err(OutreachFailure::Timeout))
+        .unwrap();
+    assert!(!exhausted.listening(), "识别次数有上限");
+    kernel.stop_all().await.unwrap();
+}
+
 #[tokio::test]
 async fn corrupt_or_inconsistent_ledgers_are_refused_and_preserved() {
     let directory = tempfile::tempdir().unwrap();
@@ -421,8 +613,20 @@ async fn corrupt_or_inconsistent_ledgers_are_refused_and_preserved() {
         )
         .unwrap();
     pending(&admin, "owner-a", "goal-2", 140);
+    admin
+        .begin_response(&invitation.id, vec![turn("reply", 150)], 160)
+        .unwrap();
+    admin
+        .record_response(
+            &invitation.id,
+            170,
+            Ok(verdict(ResponseKind::Request, "reply", "加一个炮台")),
+        )
+        .unwrap();
     kernel.stop_all().await.unwrap();
     let valid = store.saved();
+    assert!(open(store.clone()).await.is_ok(), "有效账本可以打开");
+    store.overwrite(&serde_json::to_vec(&valid).unwrap());
 
     let mut cases: Vec<Vec<u8>> = vec![
         b"{\"format_version\":1,\"format_version\":1,\"invitations\":[],\"preferences\":[]}"
@@ -466,6 +670,32 @@ async fn corrupt_or_inconsistent_ledgers_are_refused_and_preserved() {
     }));
     cases.push(mutate(&|value| {
         value["invitations"][0]["judgements"][0]["outcome"] = json!({"verdict": "NotNow"})
+    }));
+    // 回应识别在送达之前、指向附带邀请的消息、结论引用不在输入中、无引用的正面结论、
+    // 得出结论后又识别、未送达的邀请带识别。
+    cases.push(mutate(&|value| {
+        value["invitations"][0]["responses"][0]["turns"][0]["at_ms"] = json!(120)
+    }));
+    cases.push(mutate(&|value| {
+        value["invitations"][0]["responses"][0]["turns"][0]["message_id"] = json!("msg-1")
+    }));
+    cases.push(mutate(&|value| {
+        value["invitations"][0]["responses"][0]["outcome"]["verdict"]["message_id"] =
+            json!("elsewhere")
+    }));
+    cases.push(mutate(&|value| {
+        value["invitations"][0]["responses"][0]["outcome"]["verdict"]["quote"] = Value::Null
+    }));
+    cases.push(mutate(&|value| {
+        let again = json!({"turns": [{"evidence_id": "e2", "message_id": "again", "at_ms": 180}],
+                           "started_at_ms": 190, "finished_at_ms": null, "outcome": null});
+        value["invitations"][0]["responses"]
+            .as_array_mut()
+            .unwrap()
+            .push(again);
+    }));
+    cases.push(mutate(&|value| {
+        value["invitations"][1]["responses"] = value["invitations"][0]["responses"].clone()
     }));
     for bytes in cases {
         store.overwrite(&bytes);

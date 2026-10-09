@@ -5,8 +5,12 @@
 //! 同一学习目标只邀请一次。投递只走两条路：用户下一次在私聊里找 Eve 时随被动回复附带
 //! （先由时机判断器看过用户这条消息与 Eve 的回复，适合才附带），或在操作者开启时主动私聊。
 //! 判断与投递都先保存再执行，以平台真实回执为准；结果未知时不重发，也不当作已送达。
+//!
+//! 送达之后，识别器看用户接下来的几轮对话，判断用户是否在回应邀请、怎样回应，并逐字引用
+//! 用户原话作为依据。连续的负面反馈（不需要、时机不对）让同一用户的冷却期加倍并停止主动私聊，
+//! 直到用户再次正面回应；之前的反馈也作为数据交给之后的时机判断。
 use serde::{Deserialize, Serialize};
-use std::{fmt, future::Future, pin::Pin};
+use std::{cmp::Reverse, fmt, future::Future, pin::Pin};
 
 pub const OUTREACH_PLUGIN_ID: &str = "eve.outreach";
 pub const OUTREACH_STATE_KEY: &str = "outreach.v1";
@@ -24,6 +28,19 @@ pub const MAX_JUDGEMENTS: usize = 12;
 /// 交给判断器的用户消息与回复各截取的上限。
 pub const MAX_MOMENT_BYTES: usize = 2048;
 pub const MAX_JUDGE_OUTPUT_BYTES: usize = 1024;
+/// 每条已送达邀请的回应识别上限；用尽后不再识别。
+pub const MAX_RESPONSES: usize = 3;
+/// 一次回应识别交给识别器的后续对话轮数上限。
+pub const MAX_RESPONSE_TURNS: usize = 3;
+/// 送达后多久之内的对话算作可能的回应。
+pub const RESPONSE_WINDOW_MS: u64 = 3 * 24 * 60 * 60 * 1000;
+/// 回应依据的用户原话引用上限。
+pub const MAX_QUOTE_BYTES: usize = 512;
+pub const MAX_RESPONSE_OUTPUT_BYTES: usize = 2048;
+/// 连续负面反馈使冷却期加倍的次数上限（至多 8 倍）。
+pub const MAX_COOLDOWN_DOUBLINGS: u32 = 3;
+/// 交给时机判断器的先前反馈条数上限。
+pub const MAX_FEEDBACK_NOTES: usize = 3;
 pub const MAX_STATE_BYTES: usize = 2 * 1024 * 1024;
 
 pub type OutreachResult<T> = Result<T, OutreachError>;
@@ -128,6 +145,68 @@ pub struct Judgement {
     pub outcome: Option<JudgementOutcome>,
 }
 
+/// 识别出的用户回应。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ResponseKind {
+    /// 提出了具体的想法或需求。
+    Request,
+    /// 表示有兴趣，但还没有具体想法。
+    Interested,
+    /// 表示不需要或不感兴趣。
+    Declined,
+    /// 表示此刻不方便、被打扰或时机不对。
+    BadTiming,
+    /// 这些对话没有回应邀请。
+    Unrelated,
+}
+impl ResponseKind {
+    /// 负面反馈：之后放慢主动交流。
+    pub fn is_negative(self) -> bool {
+        matches!(self, Self::Declined | Self::BadTiming)
+    }
+    /// 正面反馈：清除之前连续的负面反馈。
+    pub fn is_positive(self) -> bool {
+        matches!(self, Self::Request | Self::Interested)
+    }
+}
+
+/// 送达后用户的一轮对话；账本只保存引用，原文在交互记忆中。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseTurn {
+    pub evidence_id: String,
+    pub message_id: String,
+    pub at_ms: u64,
+}
+
+/// 识别结论：除 Unrelated 外，须指明用户哪条消息，并逐字引用其中的原话作为依据。
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseVerdict {
+    pub kind: ResponseKind,
+    pub message_id: Option<String>,
+    pub quote: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseOutcome {
+    Verdict(ResponseVerdict),
+    Failed(OutreachFailure),
+    /// 识别时进程退出；这批对话不重放。
+    Interrupted,
+}
+
+/// 针对送达后若干轮对话的一次回应识别；先保存确切输入再请求识别器。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseJudgement {
+    pub turns: Vec<ResponseTurn>,
+    pub started_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
+    pub outcome: Option<ResponseOutcome>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CancelReason {
     /// 学习目标已取消或结束，例如用户撤回了兴趣。
@@ -174,6 +253,9 @@ pub struct Invitation {
     pub attempts: Vec<DeliveryAttempt>,
     pub delivered_at_ms: Option<u64>,
     pub closed_at_ms: Option<u64>,
+    /// 送达后的回应识别，按时间先后。
+    #[serde(default)]
+    pub responses: Vec<ResponseJudgement>,
 }
 impl Invitation {
     /// 正在进行的时机判断。
@@ -202,6 +284,42 @@ impl Invitation {
     /// 撰写完成的时间；投递策略从此开始计时。
     pub fn pending_since_ms(&self) -> Option<u64> {
         self.composed_at_ms
+    }
+    /// 正在进行的回应识别。
+    pub fn responding(&self) -> bool {
+        self.responses
+            .last()
+            .is_some_and(|response| response.outcome.is_none())
+    }
+    /// 用户对这条邀请的回应：第一个不是 Unrelated 的识别结论。
+    pub fn feedback(&self) -> Option<&ResponseVerdict> {
+        self.responses
+            .iter()
+            .find_map(|response| match &response.outcome {
+                Some(ResponseOutcome::Verdict(verdict))
+                    if verdict.kind != ResponseKind::Unrelated =>
+                {
+                    Some(verdict)
+                }
+                _ => None,
+            })
+    }
+    /// 还在等用户回应：已送达、没有结论、识别次数未用尽，且没有正在进行的识别。
+    pub fn listening(&self) -> bool {
+        self.status == InvitationStatus::Delivered
+            && self.feedback().is_none()
+            && self.responses.len() < MAX_RESPONSES
+            && !self.responding()
+    }
+    /// 这轮对话是否已经交给过识别器，或是附带邀请的那条消息本身。
+    pub fn heard(&self, message_id: &str) -> bool {
+        self.responses
+            .iter()
+            .flat_map(|response| &response.turns)
+            .any(|turn| turn.message_id == message_id)
+            || self.attempts.iter().any(|attempt| {
+                matches!(&attempt.channel, DeliveryChannel::Passive { message_id: id } if id == message_id)
+            })
     }
 }
 
@@ -253,8 +371,58 @@ impl OutreachSnapshot {
             .find(|invitation| invitation.goal_id == goal_id)
     }
 
-    /// 某个用户此刻可以投递的邀请：没有要求安静、没有正在发送的邀请、距上次送达已过冷却期；
-    /// 取等待最久的一条。
+    /// 用户最近连续的负面反馈次数：从最近送达的邀请往前数，遇到正面反馈即停；
+    /// 没有回应的邀请不计。
+    pub fn negative_streak(&self, owner: &str) -> u32 {
+        let mut delivered: Vec<&Invitation> = self
+            .for_owner(owner)
+            .filter(|invitation| invitation.delivered_at_ms.is_some())
+            .collect();
+        delivered.sort_by_key(|invitation| Reverse((invitation.delivered_at_ms, &invitation.id)));
+        let mut streak = 0;
+        for invitation in delivered {
+            match invitation.feedback().map(|verdict| verdict.kind) {
+                Some(kind) if kind.is_negative() => streak += 1,
+                Some(kind) if kind.is_positive() => break,
+                _ => {}
+            }
+        }
+        streak
+    }
+
+    /// 这个用户当前的冷却期：每次连续负面反馈加倍，至多 8 倍。
+    pub fn cooldown_for(&self, owner: &str, policy: &OutreachPolicy) -> u64 {
+        let doublings = self.negative_streak(owner).min(MAX_COOLDOWN_DOUBLINGS);
+        policy.cooldown_ms.saturating_mul(1 << doublings)
+    }
+
+    /// 用户对最近几条邀请的回应，新的在前；交给时机判断器作为数据。
+    pub fn feedback_notes(&self, owner: &str) -> Vec<FeedbackNote> {
+        let mut answered: Vec<(&Invitation, &ResponseVerdict)> = self
+            .for_owner(owner)
+            .filter_map(|invitation| invitation.feedback().map(|verdict| (invitation, verdict)))
+            .collect();
+        answered
+            .sort_by_key(|(invitation, _)| Reverse((invitation.delivered_at_ms, &invitation.id)));
+        answered
+            .into_iter()
+            .take(MAX_FEEDBACK_NOTES)
+            .map(|(_, verdict)| FeedbackNote {
+                kind: verdict.kind,
+                quote: verdict.quote.clone().unwrap_or_default(),
+            })
+            .collect()
+    }
+
+    /// 还在等用户回应的邀请。
+    pub fn listening(&self) -> impl Iterator<Item = &Invitation> {
+        self.invitations
+            .iter()
+            .filter(|invitation| invitation.listening())
+    }
+
+    /// 某个用户此刻可以投递的邀请：没有要求安静、没有正在发送的邀请、距上次送达已过冷却期
+    /// （连续负面反馈时加倍）；取等待最久的一条。
     pub fn due_for(
         &self,
         owner: &str,
@@ -276,7 +444,8 @@ impl OutreachSnapshot {
             .iter()
             .filter_map(|invitation| invitation.delivered_at_ms)
             .max();
-        if busy || recent.is_some_and(|at| now_ms.saturating_sub(at) < policy.cooldown_ms) {
+        let cooldown = self.cooldown_for(owner, policy);
+        if busy || recent.is_some_and(|at| now_ms.saturating_sub(at) < cooldown) {
             return None;
         }
         owned
@@ -297,7 +466,8 @@ impl OutreachSnapshot {
     }
 
     /// 可以主动私聊的邀请：在被动窗口等待已超过设定时间，且这条邀请还没有主动发送过。
-    /// 主动消息受平台配额限制，每条邀请至多主动尝试一次。
+    /// 主动消息受平台配额限制，每条邀请至多主动尝试一次；用户最近的反馈是负面的，
+    /// 只等用户自己找 Eve 时再看时机。
     pub fn due_proactive(&self, now_ms: u64, policy: &OutreachPolicy) -> Option<&Invitation> {
         let after = policy.proactive_after_ms?;
         let mut owners: Vec<&str> = self
@@ -309,6 +479,7 @@ impl OutreachSnapshot {
         owners.dedup();
         owners
             .into_iter()
+            .filter(|owner| self.negative_streak(owner) == 0)
             .filter_map(|owner| self.due_for(owner, now_ms, policy))
             .filter(|invitation| {
                 invitation.proactive_attempts() == 0
@@ -334,7 +505,15 @@ pub trait InvitationComposer: Send + Sync {
     fn compose(&self, request: ComposeRequest) -> OutreachFuture<'_, String>;
 }
 
-/// 时机判断请求：邀请正文、用户这条私聊消息与 Eve 刚写好的回复（都已截断）。
+/// 用户对之前某条邀请的回应及原话。
+#[derive(Clone, Eq, PartialEq, Serialize)]
+pub struct FeedbackNote {
+    pub kind: ResponseKind,
+    pub quote: String,
+}
+
+/// 时机判断请求：邀请正文、用户这条私聊消息与 Eve 刚写好的回复（都已截断），
+/// 以及用户对之前邀请的回应。
 #[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct JudgeRequest {
     pub invitation_id: String,
@@ -342,12 +521,36 @@ pub struct JudgeRequest {
     pub invitation: String,
     pub user_message: String,
     pub reply: String,
+    pub feedback: Vec<FeedbackNote>,
 }
 
 /// 可替换判断器；至多一次模型请求、零工具。
 pub trait TimingJudge: Send + Sync {
     fn version(&self) -> &str;
     fn judge(&self, request: JudgeRequest) -> OutreachFuture<'_, Verdict>;
+}
+
+/// 送达后一轮对话的原文（都已截断）。
+#[derive(Clone, Eq, PartialEq, Serialize)]
+pub struct ResponseTurnText {
+    pub message_id: String,
+    pub user_message: String,
+    pub reply: String,
+}
+
+/// 回应识别请求：已送达的邀请正文与之后的几轮对话。
+#[derive(Clone, Eq, PartialEq, Serialize)]
+pub struct ResponseRequest {
+    pub invitation_id: String,
+    pub judge_version: String,
+    pub invitation: String,
+    pub turns: Vec<ResponseTurnText>,
+}
+
+/// 可替换回应识别器；至多一次模型请求、零工具。结论须通过 [`validate_verdict`]。
+pub trait ResponseJudge: Send + Sync {
+    fn version(&self) -> &str;
+    fn judge(&self, request: ResponseRequest) -> OutreachFuture<'_, ResponseVerdict>;
 }
 
 /// 仅可信宿主持有；不发布给模型或不受信插件。
@@ -394,6 +597,21 @@ pub trait OutreachAdmin: Send + Sync {
     /// 学习目标关闭时取消尚未送达的邀请；正在发送的邀请不能取消。
     fn cancel(&self, id: &str, at_ms: u64, reason: CancelReason) -> OutreachResult<Invitation>;
     fn set_quiet(&self, owner: &str, quiet: bool, at_ms: u64) -> OutreachResult<OwnerPreference>;
+    /// 保存一次回应识别及其确切输入，返回后才可请求识别器。只针对仍在等待回应的已送达邀请；
+    /// 对话须发生在送达之后、回应窗口之内，不是附带邀请的那条消息，且每轮只识别一次。
+    fn begin_response(
+        &self,
+        id: &str,
+        turns: Vec<ResponseTurn>,
+        at_ms: u64,
+    ) -> OutreachResult<Invitation>;
+    /// 保存识别结论或失败；失败与中断都不重放同一批对话。
+    fn record_response(
+        &self,
+        id: &str,
+        at_ms: u64,
+        outcome: Result<ResponseVerdict, OutreachFailure>,
+    ) -> OutreachResult<Invitation>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -463,6 +681,67 @@ pub fn validate_facts(facts: &[Fact]) -> OutreachResult<()> {
     Ok(())
 }
 
+/// 用户原话引用：非空、首尾无空白、至多 512 字节，除换行外不含控制字符。
+pub fn validate_quote(value: &str) -> OutreachResult<()> {
+    if value.trim().is_empty()
+        || value.trim() != value
+        || value.len() > MAX_QUOTE_BYTES
+        || value.chars().any(|c| c.is_control() && c != '\n')
+    {
+        return Err(OutreachError::InvalidInput);
+    }
+    Ok(())
+}
+
+/// 结论本身的形状：Unrelated 不带消息与引用，其余两者都有且合规。
+pub fn validate_verdict_shape(verdict: &ResponseVerdict) -> OutreachResult<()> {
+    match (verdict.kind, &verdict.message_id, &verdict.quote) {
+        (ResponseKind::Unrelated, None, None) => Ok(()),
+        (ResponseKind::Unrelated, _, _) => Err(OutreachError::InvalidInput),
+        (_, Some(message_id), Some(quote)) => {
+            validate_id(message_id)?;
+            validate_quote(quote)
+        }
+        _ => Err(OutreachError::InvalidInput),
+    }
+}
+
+/// 核对识别结论与请求一致：引用必须是所指消息中用户原文的连续片段（忽略空白差异），
+/// 不能取自 Eve 的回复或邀请。
+pub fn validate_verdict(
+    request: &ResponseRequest,
+    verdict: &ResponseVerdict,
+) -> OutreachResult<()> {
+    validate_verdict_shape(verdict)?;
+    let (Some(message_id), Some(quote)) = (&verdict.message_id, &verdict.quote) else {
+        return Ok(());
+    };
+    let turn = request
+        .turns
+        .iter()
+        .find(|turn| turn.message_id == *message_id)
+        .ok_or(OutreachError::InvalidInput)?;
+    if !quote_matches(&turn.user_message, quote) {
+        return Err(OutreachError::InvalidInput);
+    }
+    Ok(())
+}
+
+/// 第一条原文包含引用的对话；用于把识别器给出的原话定位到消息。
+pub fn locate_quote<'a>(turns: &'a [ResponseTurnText], quote: &str) -> Option<&'a str> {
+    turns
+        .iter()
+        .find(|turn| quote_matches(&turn.user_message, quote))
+        .map(|turn| turn.message_id.as_str())
+}
+
+fn quote_matches(text: &str, quote: &str) -> bool {
+    let compact =
+        |value: &str| -> String { value.chars().filter(|c| !c.is_whitespace()).collect() };
+    let quote = compact(quote);
+    !quote.is_empty() && compact(text).contains(&quote)
+}
+
 /// 同一学习目标只邀请一次；重复准入得到同一 ID。
 pub fn invitation_id(goal_id: &str) -> String {
     use ring::digest::{Context, SHA256};
@@ -486,7 +765,11 @@ redacted!(
     Invitation,
     OutreachSnapshot,
     ComposeRequest,
-    JudgeRequest
+    JudgeRequest,
+    ResponseVerdict,
+    FeedbackNote,
+    ResponseTurnText,
+    ResponseRequest
 );
 
 #[cfg(test)]
@@ -515,6 +798,7 @@ mod tests {
             attempts: vec![],
             delivered_at_ms: None,
             closed_at_ms: None,
+            responses: vec![],
         }
     }
 
@@ -596,5 +880,138 @@ mod tests {
                 .is_none(),
             "默认不主动发送"
         );
+    }
+
+    fn answered(id: &str, delivered: u64, kind: ResponseKind) -> Invitation {
+        let mut entry = invitation("a", id, InvitationStatus::Delivered, 10);
+        entry.delivered_at_ms = Some(delivered);
+        let verdict = if kind == ResponseKind::Unrelated {
+            ResponseVerdict {
+                kind,
+                message_id: None,
+                quote: None,
+            }
+        } else {
+            ResponseVerdict {
+                kind,
+                message_id: Some(format!("reply-{id}")),
+                quote: Some("原话".into()),
+            }
+        };
+        entry.responses.push(ResponseJudgement {
+            turns: vec![ResponseTurn {
+                evidence_id: format!("evidence-{id}"),
+                message_id: format!("reply-{id}"),
+                at_ms: delivered + 1,
+            }],
+            started_at_ms: delivered + 2,
+            finished_at_ms: Some(delivered + 3),
+            outcome: Some(ResponseOutcome::Verdict(verdict)),
+        });
+        entry
+    }
+
+    #[test]
+    fn negative_feedback_slows_outreach_until_a_positive_response() {
+        let policy = OutreachPolicy {
+            cooldown_ms: 1000,
+            proactive_after_ms: Some(0),
+        };
+        let pending = invitation("a", "next", InvitationStatus::Pending, 100);
+        let mut snapshot = OutreachSnapshot {
+            invitations: vec![answered("1", 100, ResponseKind::BadTiming), pending],
+            preferences: vec![],
+        };
+        assert_eq!(snapshot.negative_streak("a"), 1);
+        assert_eq!(snapshot.cooldown_for("a", &policy), 2000);
+        assert!(snapshot.due_for("a", 1500, &policy).is_none(), "冷却期加倍");
+        assert_eq!(snapshot.due_for("a", 2100, &policy).unwrap().id, "next");
+        assert!(
+            snapshot.due_proactive(9000, &policy).is_none(),
+            "负面反馈后不再主动私聊"
+        );
+        let [note] = snapshot.feedback_notes("a").try_into().ok().unwrap();
+        assert_eq!(
+            (note.kind, note.quote.as_str()),
+            (ResponseKind::BadTiming, "原话")
+        );
+
+        // 没有回应的邀请不计入，也不打断连续计数；加倍有上限。
+        for (index, kind) in [
+            ResponseKind::Unrelated,
+            ResponseKind::Declined,
+            ResponseKind::BadTiming,
+            ResponseKind::Declined,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("later-{index}");
+            snapshot
+                .invitations
+                .push(answered(&id, 200 + index as u64, kind));
+        }
+        assert_eq!(snapshot.negative_streak("a"), 4);
+        assert_eq!(snapshot.cooldown_for("a", &policy), 8000);
+        assert_eq!(snapshot.feedback_notes("a").len(), MAX_FEEDBACK_NOTES);
+
+        // 用户再次正面回应后恢复原策略。
+        snapshot
+            .invitations
+            .push(answered("positive", 300, ResponseKind::Interested));
+        assert_eq!(snapshot.negative_streak("a"), 0);
+        assert_eq!(snapshot.cooldown_for("a", &policy), 1000);
+        assert_eq!(snapshot.due_proactive(9000, &policy).unwrap().id, "next");
+        assert_eq!(snapshot.negative_streak("b"), 0);
+    }
+
+    #[test]
+    fn verdicts_must_quote_the_user_and_name_the_message() {
+        let request = ResponseRequest {
+            invitation_id: "invite-1".into(),
+            judge_version: "judge:v1".into(),
+            invitation: "要不要一起做？".into(),
+            turns: vec![
+                ResponseTurnText {
+                    message_id: "m1".into(),
+                    user_message: "今天好累".into(),
+                    reply: "辛苦了，要不要一起做？".into(),
+                },
+                ResponseTurnText {
+                    message_id: "m2".into(),
+                    user_message: "我在 上班，晚点说".into(),
+                    reply: "好的".into(),
+                },
+            ],
+        };
+        let verdict = |kind, message: Option<&str>, quote: Option<&str>| ResponseVerdict {
+            kind,
+            message_id: message.map(Into::into),
+            quote: quote.map(Into::into),
+        };
+        assert!(validate_verdict(&request, &verdict(ResponseKind::Unrelated, None, None)).is_ok());
+        assert!(
+            validate_verdict(
+                &request,
+                &verdict(ResponseKind::BadTiming, Some("m2"), Some("我在上班"))
+            )
+            .is_ok(),
+            "忽略空白差异"
+        );
+        for (kind, message, quote) in [
+            (ResponseKind::Unrelated, Some("m1"), None),
+            (ResponseKind::BadTiming, None, Some("我在上班")),
+            (ResponseKind::BadTiming, Some("m1"), Some("我在上班")),
+            (ResponseKind::BadTiming, Some("m3"), Some("我在上班")),
+            (ResponseKind::Interested, Some("m1"), Some("一起做")),
+            (ResponseKind::Declined, Some("m2"), Some(" 我在上班")),
+        ] {
+            assert!(
+                validate_verdict(&request, &verdict(kind, message, quote)).is_err(),
+                "{kind:?} {message:?} {quote:?}"
+            );
+        }
+        assert_eq!(locate_quote(&request.turns, "晚点说"), Some("m2"));
+        assert_eq!(locate_quote(&request.turns, "一起做"), None, "不取自回复");
     }
 }
