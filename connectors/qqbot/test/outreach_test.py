@@ -4,7 +4,8 @@
 用户下次私聊找它时，先由时机判断器看过这条消息与回复，合适才随被动回复附带，以平台回执为准；
 操作者开启时，等待一段时间仍未送达则主动私聊一次。要求安静、撤回兴趣、平台拒绝与进程中断
 都有明确且不重放的行为。送达之后，识别器看用户接下来的私聊判断怎样回应并逐字引用原话；
-负面反馈让之后的邀请间隔加倍、不再主动私聊，并作为数据交给下一次时机判断。
+负面反馈让之后的邀请间隔加倍、不再主动私聊，并作为数据交给下一次时机判断。用户提出具体想法时，
+原话变成后续创作目标，实践验证后再经邀请告诉用户；撤回兴趣时一并取消。
 
 全部使用确定性替身，只证明宿主契约、投递时机与恢复语义，不代表真实模型的撰写质量，
 也不是正式 QQ 的主动消息验收（平台配额与用户开关只能在正式环境验证）。
@@ -16,6 +17,7 @@ import time
 import unittest
 
 import practice_test
+import skill_test
 from interest_test import MINDUSTRY, QUIT
 from memory_test import BINARY, ROOT
 
@@ -27,6 +29,7 @@ BUSY = "我在上班，晚点再说吧。"
 IDEA = "那就加一个会发光的墙吧！"
 MAP = "我还想学怎么做 Mindustry 的地图。"
 MAP_QUOTE = "我还想学怎么做 Mindustry 的地图"
+WISH = "加一个会发光的墙"
 
 
 def base():
@@ -57,8 +60,10 @@ class OutreachAcceptance(unittest.TestCase):
     def tearDown(self):
         base().tearDown(self)
 
-    def run_eve(self, script, outreach=True, proactive_after=None, cooldown=None, **options):
+    def run_eve(self, script, outreach=True, proactive_after=None, cooldown=None, skills=False, **options):
         more = ["--outreach"] if outreach else []
+        if skills:
+            more.append("--skill-learning")
         if proactive_after is not None:
             more += ["--outreach-proactive-after-ms", str(proactive_after)]
         if cooldown is not None:
@@ -71,6 +76,10 @@ class OutreachAcceptance(unittest.TestCase):
             return "compose"
         if isinstance(decoded, dict) and "judge_version" in decoded and "turns" in decoded:
             return "respond"
+        if isinstance(decoded, dict) and "distillation_id" in decoded:
+            return "distill"
+        if isinstance(decoded, dict) and "selection_id" in decoded:
+            return "skill_select"
         if isinstance(decoded, dict) and "judge_version" in decoded and "user_message" in decoded:
             return "judge"
         return base().classify(self, decoded, latest)
@@ -82,6 +91,11 @@ class OutreachAcceptance(unittest.TestCase):
             return json.dumps(self.judge(decoded), ensure_ascii=False)
         if kind == "respond":
             return json.dumps(self.respond(decoded), ensure_ascii=False)
+        # 技能提炼与选择沿用技能验收的确定性替身。
+        if kind == "distill":
+            return json.dumps(skill_test.SkillAcceptance.default_distill(self, decoded), ensure_ascii=False)
+        if kind == "skill_select":
+            return json.dumps(skill_test.SkillAcceptance.default_skill_select(self, decoded), ensure_ascii=False)
         return base().reply(self, kind, decoded, latest)
 
     # 确定性撰写替身：只引用请求里的用户原话。
@@ -254,7 +268,8 @@ class OutreachAcceptance(unittest.TestCase):
                                   "unrelated": self.answered(1), "proposed": self.answered(2),
                                   "settled": self.quiet},
                      max_executions=4)
-        [invitation] = self.invitations()
+        # 提出的想法另外派生后续创作（见下一项验收）；这里只看第一条邀请。
+        invitation = min(self.invitations(), key=lambda invitation: invitation["created_at_ms"])
         self.assertEqual([([turn["message_id"] for turn in response["turns"]], response["outcome"])
                           for response in invitation["responses"]],
                          [(["later"], {"verdict": {"kind": "Unrelated", "message_id": None, "quote": None}}),
@@ -308,6 +323,87 @@ class OutreachAcceptance(unittest.TestCase):
         self.assertEqual(judged[-1]["user_message"], CHAT)
         self.assertEqual(judged[-1]["feedback"], [{"kind": "BadTiming", "quote": "我在上班"}],
                          "先前反馈作为数据交给时机判断")
+
+    def request_goals(self):
+        return [goal for goal in self.goals() if goal["source"]["channel"] == "outreach.request"]
+
+    def follow_up(self, skills=False):
+        def followed():
+            self.wait_for(lambda: any(invitation["goal_id"] != first["goal_id"] and invitation["status"] == "Pending"
+                                      for invitation in self.invitations()),
+                          "follow-up was not invited", 40)
+            # 等上一条送达后的冷却期过去，下一条私聊才是可以附带的时机。
+            wait = first["delivered_at_ms"] + 1000 + 300 - time.time() * 1000
+            self.assertFalse(self.run_release.wait(max(wait, 0) / 1000), "process stopped")
+
+        first = {}
+
+        def delivered():
+            self.wait_status("Delivered")
+            first.update(self.invitations()[0])
+
+        report = invitation_text(WISH)
+        self.run_eve([*self.send(self.message("casual", MINDUSTRY)), *self.checkpoint("composed"),
+                      *self.send_invited("chat", CHAT), *self.checkpoint("delivered"),
+                      *self.send(self.message("idea", IDEA)), *self.checkpoint("followed"),
+                      {"send": self.message("later", LATER, expected=None, contains=None) | {
+                          "expected_segments": [LATER, report]}},
+                      {"wait_command": {"id": "later", "type": "segment", "count": 2}}, self.wait_receipt("later"),
+                      *self.checkpoint("settled")],
+                     checkpoints={"composed": lambda: self.wait_status("Pending"), "delivered": delivered,
+                                  "followed": followed, "settled": self.quiet},
+                     cooldown=1000, skills=skills, max_executions=8, timeout=60)
+        [goal] = self.request_goals()
+        original, follow_up = sorted(self.practice_runs(), key=lambda run: run["started_at_ms"])
+        reported = next(invitation for invitation in self.invitations() if invitation["goal_id"] == goal["id"])
+        return first, goal, original, follow_up, reported
+
+    def test_a_proposed_idea_is_practised_as_a_follow_up_and_reported_back(self):
+        first, goal, original, follow_up, reported = self.follow_up()
+        learning = next(goal for goal in self.goals() if goal["source"]["channel"] == "interest.learning")
+        self.assertEqual((goal["source"]["kind"], goal["source"]["reference"]), ("Inference", first["id"]),
+                         "模型识别的类别不冒充用户指令")
+        self.assertEqual(json.loads(goal["wait_reason"])["learning_goal_id"], learning["id"])
+        self.assertIn(f"“{WISH}”（消息 idea）", goal["description"])
+        self.assertEqual(original["task"]["goal_id"], learning["id"])
+        self.assertEqual(follow_up["task"]["goal_id"], goal["id"])
+        self.assertIn(WISH, follow_up["task"]["brief"])
+        self.assertEqual(follow_up["status"], "Verified", "后续创作同样以实际运行验证为准")
+        self.assertEqual(reported["status"], "Delivered")
+        self.assertEqual(reported["milestone"]["practice_run_id"], follow_up["id"])
+        self.assertIn({"kind": "UserQuote", "text": WISH}, reported["facts"])
+        self.assertEqual(reported["attempts"][0]["channel"], {"passive": {"message_id": "later"}})
+
+    def test_a_follow_up_reuses_the_verified_skill_and_the_report_mentions_it(self):
+        first, goal, original, follow_up, reported = self.follow_up(skills=True)
+        skills = self.documents()["eve.skill"]["skill.v1"]
+        [skill] = skills["skills"]
+        self.assertEqual(first["milestone"]["skill_id"], skill["id"], "第一条邀请等提炼结束、提到技能")
+        [selection] = skills["selections"]
+        self.assertEqual((selection["id"], selection["status"], selection["outcome"]),
+                         (follow_up["id"], "Chosen", "Verified"), "后续创作选用已验证的技能并实际运行通过")
+        self.assertEqual(reported["milestone"], {"practice_run_id": follow_up["id"], "skill_id": skill["id"]})
+        self.assertIn("Skill", [fact["kind"] for fact in reported["facts"]])
+
+    def test_withdrawing_the_interest_cancels_the_follow_up_creation(self):
+        self.run_eve([*self.send(self.message("casual", MINDUSTRY)), *self.checkpoint("composed"),
+                      *self.send_invited("chat", CHAT),
+                      *self.send(self.message("idea", IDEA)), *self.checkpoint("requested"),
+                      *self.send(self.message("quit", QUIT)), *self.checkpoint("cancelled"),
+                      *self.checkpoint("settled")],
+                     checkpoints={"composed": lambda: self.wait_status("Pending"),
+                                  "requested": lambda: self.wait_for(self.request_goals, "no follow-up goal", 25),
+                                  "cancelled": lambda: self.wait_for(
+                                      lambda: self.request_goals()[0]["status"] == "Cancelled",
+                                      "follow-up goal was not cancelled", 25),
+                                  "settled": self.quiet},
+                     cooldown=1000, max_executions=8, timeout=60)
+        [goal] = self.request_goals()
+        self.assertIsNone(goal["wait_reason"])
+        for invitation in self.invitations():
+            if invitation["goal_id"] == goal["id"]:
+                self.assertEqual(invitation["attempts"], [], "撤回后不再告诉用户")
+                self.assertIn(invitation["status"], ({"Cancelled": "GoalClosed"}, "Failed", "Interrupted"))
 
     def test_quiet_holds_the_invitation_until_the_user_turns_outreach_back_on(self):
         self.run_eve([*self.send(self.message("casual", MINDUSTRY)), *self.checkpoint("composed"),

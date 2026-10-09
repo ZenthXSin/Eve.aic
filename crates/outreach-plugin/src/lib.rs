@@ -1,5 +1,7 @@
-//! 主动交流账本，以及单次模型请求的邀请撰写器、时机判断器与回应识别器。
+//! 主动交流账本，单次模型请求的邀请撰写器、时机判断器与回应识别器，
+//! 以及由用户提出的想法确定性派生后续创作目标的派生器。
 mod composer;
+mod goal;
 mod store;
 mod strict_json;
 
@@ -12,6 +14,7 @@ use eve_plugin_api::{
     Cleanup, Plugin, PluginContext, PluginError, PluginFuture, PluginManifest, PluginResult,
     cleanup,
 };
+pub use goal::{REQUEST_DERIVER_VERSION, RequestGoals};
 use std::sync::{Arc, Mutex};
 use store::StoredOutreach;
 

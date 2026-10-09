@@ -3,7 +3,8 @@
 //! 或操作者开启时主动私聊）。准入、撰写与每次投递都先持久化，中断不重放，结果未知不重发。
 //! 送达之后，后台从交互记忆读取同一用户接下来的几轮私聊，交给回应识别器判断用户怎样回应；
 //! 识别前先保存确切输入，每轮对话只识别一次。用户的反馈决定之后的冷却期与是否主动私聊，
-//! 也作为数据交给之后的时机判断。
+//! 也作为数据交给之后的时机判断。用户提出具体想法时，派生器把原话变成后续创作目标，
+//! 实践验证后同样经邀请告诉用户。
 use crate::AppError;
 use eve_cognition_api::{CognitionAdmin, Goal, GoalStatus, SourceKind, Visibility};
 use eve_interest_api::{
@@ -16,7 +17,8 @@ use eve_memory_api::{EvidenceSource, MemoryAdmin, MemoryScope};
 use eve_outreach_api::{
     AttemptResult, ComposeRequest, DeliveryChannel, Fact, FactKind, Invitation, InvitationComposer,
     InvitationStatus, JudgeRequest, MAX_FACT_BYTES, MAX_MOMENT_BYTES, MAX_RESPONSE_TURNS,
-    Milestone, OutreachAdmin, OutreachError, OutreachFailure, OutreachPolicy, RESPONSE_WINDOW_MS,
+    Milestone, OutreachAdmin, OutreachError, OutreachFailure, OutreachPolicy, REQUEST_GOAL_CHANNEL,
+    REQUEST_GOAL_VERIFICATION, RESPONSE_WINDOW_MS, RequestGoalDeriver, RequestMarker,
     ResponseJudge, ResponseKind, ResponseRequest, ResponseTurn, ResponseTurnText, TimingJudge,
     Verdict,
 };
@@ -74,6 +76,7 @@ pub(crate) struct Services {
     pub(crate) memory: Arc<dyn MemoryAdmin>,
     pub(crate) composer: Arc<dyn InvitationComposer>,
     pub(crate) responder: Arc<dyn ResponseJudge>,
+    pub(crate) requests: Arc<dyn RequestGoalDeriver>,
 }
 
 pub(crate) struct Background {
@@ -125,15 +128,30 @@ async fn stop_requested(receiver: &mut watch::Receiver<bool>) {
     }
 }
 
-/// 兴趣派生、仍在等待中的学习目标及其可见用户。
-fn learning_goal(goal: &Goal) -> Option<&str> {
+/// 可以邀请的目标：兴趣派生的学习目标，或用户提出想法后派生的后续创作目标（带标记）。
+enum Origin {
+    Learning,
+    Request(RequestMarker),
+}
+
+fn outreach_goal(goal: &Goal) -> Option<(&str, Origin)> {
     let Visibility::User(owner) = &goal.visibility else {
         return None;
     };
-    (goal.source.kind == SourceKind::Inference
-        && goal.source.channel == INTEREST_GOAL_CHANNEL
-        && goal.verification == INTEREST_GOAL_VERIFICATION)
-        .then_some(owner.as_str())
+    if goal.source.kind != SourceKind::Inference {
+        return None;
+    }
+    if goal.source.channel == INTEREST_GOAL_CHANNEL
+        && goal.verification == INTEREST_GOAL_VERIFICATION
+    {
+        return Some((owner, Origin::Learning));
+    }
+    if goal.source.channel == REQUEST_GOAL_CHANNEL && goal.verification == REQUEST_GOAL_VERIFICATION
+    {
+        let marker = RequestMarker::parse(goal.wait_reason.as_deref()?)?;
+        return Some((owner, Origin::Request(marker)));
+    }
+    None
 }
 
 async fn run(
@@ -157,6 +175,10 @@ async fn run(
             return Ok(());
         }
         cancel_closed(&services)?;
+        // 用户提出的想法确定性地同步为后续创作目标；修订冲突或容量不足时下一轮再核对。
+        services
+            .requests
+            .reconcile(&services.outreach.snapshot()?, now_ms()?)?;
         if inviting && let Some(candidate) = candidate(&services)? {
             match services.outreach.begin(
                 &candidate.owner,
@@ -240,16 +262,16 @@ fn candidate(services: &Services) -> Result<Option<Candidate>, AppError> {
         None => None,
     };
     let now = now_ms()?;
-    let mut goals: Vec<(&Goal, &str)> = cognition
+    let mut goals: Vec<(&Goal, &str, Origin)> = cognition
         .state
         .goals
         .values()
         .filter(|goal| goal.status == GoalStatus::Waiting)
-        .filter_map(|goal| learning_goal(goal).map(|owner| (goal, owner)))
-        .filter(|(goal, _)| outreach.for_goal(&goal.id).is_none())
+        .filter_map(|goal| outreach_goal(goal).map(|(owner, origin)| (goal, owner, origin)))
+        .filter(|(goal, _, _)| outreach.for_goal(&goal.id).is_none())
         .collect();
-    goals.sort_by_key(|(goal, _)| goal.id.clone());
-    for (goal, owner) in goals {
+    goals.sort_by_key(|(goal, _, _)| goal.id.clone());
+    for (goal, owner, origin) in goals {
         let mut runs: Vec<&PracticeRun> = practice
             .runs_for(&goal.id)
             .filter(|run| run.status == PracticeStatus::Verified)
@@ -307,12 +329,22 @@ fn candidate(services: &Services) -> Result<Option<Candidate>, AppError> {
             }
         }
         let mut facts = Vec::new();
-        let scope = MemoryScope {
-            channel: "qq".into(),
-            session_id: owner.into(),
-            user_id: owner.into(),
-        };
-        if let Ok(snapshot) = services.interests.snapshot(&scope)
+        // 后续创作引用用户提出想法时的原话；学习目标引用兴趣的原话。
+        if let Origin::Request(marker) = &origin
+            && let Some(quote) = outreach
+                .invitations
+                .iter()
+                .find(|invitation| invitation.id == marker.invitation_id)
+                .and_then(|invitation| invitation.feedback())
+                .and_then(|verdict| verdict.quote.as_deref())
+        {
+            facts.push(Fact {
+                kind: FactKind::UserQuote,
+                text: prefix(quote, MAX_FACT_BYTES).into(),
+            });
+        }
+        if let Origin::Learning = origin
+            && let Ok(snapshot) = services.interests.snapshot(&scope(owner))
             && let Some(interest) = snapshot.interests.iter().find(|interest| {
                 interest.id == goal.source.reference && interest.status == InterestStatus::Active
             })

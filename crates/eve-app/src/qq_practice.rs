@@ -6,6 +6,7 @@ use eve_interest_api::{INTEREST_GOAL_CHANNEL, INTEREST_GOAL_VERIFICATION, Intere
 use eve_interest_plugin::learning_goal_id;
 use eve_knowledge_api::{KnowledgeAdmin, KnowledgeStatus, RunStatus as ResearchStatus};
 use eve_memory_api::validate_id;
+use eve_outreach_api::{REQUEST_GOAL_CHANNEL, REQUEST_GOAL_VERIFICATION, RequestMarker};
 use eve_plugin_api::{PluginError, PluginResult};
 use eve_practice_api::{
     AttemptOutcome, MAX_BRIEF_BYTES, MAX_NOTE_BYTES, MAX_NOTES, PracticeAdmin, PracticeAttempt,
@@ -104,37 +105,67 @@ async fn stop_requested(receiver: &mut watch::Receiver<bool>) {
     }
 }
 
-/// 只实践兴趣派生、仍在等待中的学习目标；用户待办、反思子目标和已取消目标都不实践。
-fn eligible(goal: &Goal) -> Option<&str> {
+/// 要实践的目标：兴趣派生的学习目标，以及用户回应邀请时提出想法派生的后续创作目标；
+/// 只实践仍在等待的。用户待办、反思子目标和已取消目标都不实践。
+struct Eligible<'a> {
+    owner: &'a str,
+    /// 读取哪个目标研究得到的知识；后续创作沿用最初学习目标的知识。
+    knowledge_goal: String,
+    /// 后续创作不单独研究，不等待研究。
+    researched: bool,
+}
+
+fn eligible(goal: &Goal) -> Option<Eligible<'_>> {
     let Visibility::User(owner) = &goal.visibility else {
         return None;
     };
-    (goal.source.kind == SourceKind::Inference
-        && goal.source.channel == INTEREST_GOAL_CHANNEL
+    if goal.source.kind != SourceKind::Inference || goal.status != GoalStatus::Waiting {
+        return None;
+    }
+    if goal.source.channel == INTEREST_GOAL_CHANNEL
         && goal.verification == INTEREST_GOAL_VERIFICATION
-        && goal.status == GoalStatus::Waiting)
-        .then_some(owner.as_str())
+    {
+        return Some(Eligible {
+            owner,
+            knowledge_goal: goal.id.clone(),
+            researched: true,
+        });
+    }
+    if goal.source.channel == REQUEST_GOAL_CHANNEL && goal.verification == REQUEST_GOAL_VERIFICATION
+    {
+        let marker = RequestMarker::parse(goal.wait_reason.as_deref()?)?;
+        return Some(Eligible {
+            owner,
+            knowledge_goal: marker.learning_goal_id,
+            researched: false,
+        });
+    }
+    None
 }
 
 /// 开启研究时等该修订的研究结束（或该目标研究次数用尽），再把有来源的知识交给草稿器；
 /// 来源原文在前，未验证推测在后。
 fn task(
     goal: &Goal,
-    owner: &str,
+    eligible: &Eligible<'_>,
     knowledge: Option<&Arc<dyn KnowledgeAdmin>>,
 ) -> Result<Option<PracticeTask>, AppError> {
     let mut notes = Vec::new();
     if let Some(knowledge) = knowledge {
         let snapshot = knowledge.snapshot()?;
-        let runs: Vec<_> = snapshot.runs_for(&goal.id).collect();
-        let settled = runs.iter().any(|run| {
-            run.topic.goal_revision == goal.revision && run.status != ResearchStatus::Running
-        }) || (runs.len() >= eve_knowledge_api::MAX_RUNS_PER_GOAL
-            && runs.iter().all(|run| run.status != ResearchStatus::Running));
+        let runs: Vec<_> = snapshot.runs_for(&eligible.knowledge_goal).collect();
+        let settled = if eligible.researched {
+            runs.iter().any(|run| {
+                run.topic.goal_revision == goal.revision && run.status != ResearchStatus::Running
+            }) || (runs.len() >= eve_knowledge_api::MAX_RUNS_PER_GOAL
+                && runs.iter().all(|run| run.status != ResearchStatus::Running))
+        } else {
+            runs.iter().all(|run| run.status != ResearchStatus::Running)
+        };
         if !settled {
             return Ok(None);
         }
-        let mut entries: Vec<_> = snapshot.entries_for(&goal.id).collect();
+        let mut entries: Vec<_> = snapshot.entries_for(&eligible.knowledge_goal).collect();
         entries.sort_by_key(|entry| entry.status != KnowledgeStatus::SourceQuoted);
         for entry in entries.into_iter().take(MAX_NOTES) {
             let mut text = entry.statement.clone();
@@ -158,7 +189,7 @@ fn task(
     Ok(Some(PracticeTask {
         goal_id: goal.id.clone(),
         goal_revision: goal.revision,
-        owner: owner.into(),
+        owner: eligible.owner.into(),
         brief: brief.into(),
         brief_truncated: brief.len() != goal.description.len(),
         notes,
@@ -214,18 +245,18 @@ async fn run(
             let snapshot = cognition
                 .snapshot()
                 .map_err(|_| "实践验证无法读取学习目标")?;
-            let mut goals: Vec<(&Goal, &str)> = snapshot
+            let mut goals: Vec<(&Goal, Eligible<'_>)> = snapshot
                 .state
                 .goals
                 .values()
-                .filter_map(|goal| eligible(goal).map(|owner| (goal, owner)))
+                .filter_map(|goal| eligible(goal).map(|eligible| (goal, eligible)))
                 .collect();
             goals.sort_by_key(|(goal, _)| (Reverse(goal.priority), goal.id.clone()));
-            for (goal, owner) in goals {
+            for (goal, eligible) in goals {
                 if *stopped.borrow() {
                     return Ok(());
                 }
-                let Some(task) = task(goal, owner, knowledge.as_ref())? else {
+                let Some(task) = task(goal, &eligible, knowledge.as_ref())? else {
                     continue;
                 };
                 let run = match practice.begin(
