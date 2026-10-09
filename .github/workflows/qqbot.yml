@@ -77,6 +77,7 @@ jobs:
           python3 connectors/qqbot/test/practice_test.py
           python3 connectors/qqbot/test/skill_test.py
           python3 connectors/qqbot/test/outreach_test.py
+          python3 connectors/qqbot/test/journey_test.py
           python3 connectors/qqbot/test/segment_test.py
           python3 -m unittest discover -s connectors/qqbot/test -p 'training_test.py'
           python3 -m unittest discover -s .github/scripts -p 'test_qqbot_replace_run.py'
