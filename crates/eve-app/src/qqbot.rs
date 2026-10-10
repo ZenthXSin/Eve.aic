@@ -49,6 +49,7 @@ use eve_session_api::{SESSION_SERVICE_ID, SessionServiceHandle};
 use eve_skill_api::{SKILL_PLUGIN_ID, SkillAdmin, SkillDistiller, SkillSelector};
 use eve_skill_plugin::{
     Consolidator, ModelSkillDistiller, ModelSkillSelector, SkillAwareDrafter, SkillPlugin,
+    SkillTool,
 };
 use eve_training_api::{TRAINING_PLUGIN_ID, TRAINING_SERVICE_ID, TrainingServiceHandle};
 use eve_training_plugin::{TrainingContext, TrainingPlugin};
@@ -673,6 +674,22 @@ async fn run_qqbot_composed(
             }),
             None => context,
         };
+        // 已启用的技能作为对话工具：只能调用当前用户自己的技能，每次调用都实际运行验证。
+        let skill_runner: Arc<std::sync::OnceLock<Arc<dyn PracticeRunner>>> = Arc::default();
+        let context: Arc<dyn ContextAssembler> = match &skills {
+            Some(skills) => {
+                bootstrap.tools.push(Arc::new(SkillTool::new(
+                    Arc::new(skills.clone()),
+                    skill_runner.clone(),
+                    options.state_directory.join("skill-tool-work"),
+                )));
+                Arc::new(qq_skill::SkillContext {
+                    wrapped: context,
+                    skills: Arc::new(skills.clone()),
+                })
+            }
+            None => context,
+        };
         bootstrap.context = Some(if options.memory_recall {
             let memory = memory.clone().ok_or("记忆召回缺少记忆服务")?;
             Arc::new(MemoryRecallContext::new(
@@ -857,6 +874,7 @@ async fn run_qqbot_composed(
                     .map_err(|error| format!("实践运行环境无效：{error}"))?,
                 ),
             };
+            let _ = skill_runner.set(runner.clone());
             let mut drafter: Arc<dyn PracticeDrafter> = match practice_drafter {
                 Some(drafter) => drafter,
                 None => Arc::new(ModelPracticeDrafter::new(core_resolver()?)),

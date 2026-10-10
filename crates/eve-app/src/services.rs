@@ -50,9 +50,15 @@ impl Tool for Echo {
         Box::pin(async move { Ok(json!({"echo":call.arguments["text"]})) })
     }
 }
+/// 宿主额外工具的服务 ID。
+pub(crate) fn tool_service_id(name: &str) -> String {
+    format!("eve.app.tool.{name}")
+}
+
 pub(crate) struct CoreServices {
     manifest: PluginManifest,
     context: Arc<dyn ContextAssembler>,
+    tools: Vec<Arc<dyn Tool>>,
 }
 impl CoreServices {
     pub(crate) fn new() -> PluginResult<Self> {
@@ -69,7 +75,12 @@ impl CoreServices {
         Ok(Self {
             manifest,
             context: Arc::new(Context),
+            tools: vec![],
         })
+    }
+    pub(crate) fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.tools = tools;
+        self
     }
     pub(crate) fn with_context(mut self, context: Arc<dyn ContextAssembler>) -> Self {
         self.context = context;
@@ -87,6 +98,10 @@ impl Plugin for CoreServices {
                 ContextService(self.context.clone()),
             )?;
             context.provide_service(ServiceId::new(TOOL)?, ToolService(Arc::new(Echo)))?;
+            for tool in &self.tools {
+                let id = tool_service_id(&tool.definition().name);
+                context.provide_service(ServiceId::new(id)?, ToolService(tool.clone()))?;
+            }
             Ok(None)
         })
     }

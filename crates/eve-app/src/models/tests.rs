@@ -69,6 +69,7 @@ impl Harness {
                 host_config: LlmHostConfig::default(),
                 api_key: "resolver-test-key".into(),
                 context: None,
+                tools: vec![],
             },
             plugin,
         )

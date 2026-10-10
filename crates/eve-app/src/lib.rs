@@ -268,6 +268,8 @@ pub(crate) struct CoreBootstrap {
     host_config: LlmHostConfig,
     api_key: String,
     context: Option<Arc<dyn eve_llm_api::ContextAssembler>>,
+    /// 宿主额外提供给对话模型的工具；名称不能与内置工具重复。
+    tools: Vec<Arc<dyn eve_llm_api::Tool>>,
 }
 
 pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstrap, AppError> {
@@ -279,6 +281,7 @@ pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstr
         host_config,
         api_key,
         context: None,
+        tools: vec![],
     })
 }
 
@@ -357,10 +360,19 @@ async fn install_core_with_config(
         host_config,
         api_key,
         context,
+        tools,
     } = bootstrap;
+    let mut bindings = Vec::with_capacity(tools.len() + 1);
+    for tool in &tools {
+        let name = tool.definition().name;
+        if name == "echo" || bindings.iter().any(|(existing, _)| existing == &name) {
+            return Err(format!("工具名称重复：{name}").into());
+        }
+        bindings.push((name.clone(), services::tool_service_id(&name)));
+    }
     kernel.register(Box::new(config_plugin))?;
     kernel.register(Box::new(SessionPlugin::new()?))?;
-    let mut core_services = services::CoreServices::new()?;
+    let mut core_services = services::CoreServices::new()?.with_tools(tools);
     if let Some(context) = context {
         core_services = core_services.with_context(context);
     }
@@ -394,11 +406,19 @@ async fn install_core_with_config(
             service_id: ServiceId::new(services::CONTEXT)?,
             expected_owner: owner.clone(),
         },
-        vec![ToolBinding {
+        std::iter::once(Ok(ToolBinding {
             name: "echo".into(),
             service_id: ServiceId::new(services::TOOL)?,
-            expected_owner: owner,
-        }],
+            expected_owner: owner.clone(),
+        }))
+        .chain(bindings.into_iter().map(|(name, service)| {
+            Ok::<_, AppError>(ToolBinding {
+                name,
+                service_id: ServiceId::new(service)?,
+                expected_owner: owner.clone(),
+            })
+        }))
+        .collect::<Result<Vec<_>, AppError>>()?,
         LlmHostConfig {
             provider_timeout: timeout,
             max_parallel_tool_calls: runtime.max_parallel_tool_calls,

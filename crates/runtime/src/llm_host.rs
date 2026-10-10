@@ -554,7 +554,7 @@ impl LlmHost {
         let prepared = tokio::select! {
             biased;
             _ = wait_closed(events) => Err(LlmError::Cancelled),
-            prepared = self.prepare(&input, scope, &mut diagnostics) => prepared,
+            prepared = self.prepare(&input, scope.clone(), &mut diagnostics) => prepared,
         };
         let mut prepared = match prepared {
             Ok(value) => value,
@@ -627,7 +627,14 @@ impl LlmHost {
         .await
         .map_err(|error| fail(error, diagnostics.clone()))?;
         let results = match self
-            .execute_calls_ordered(&prepared.tools, &calls, &mut diagnostics, admission, events)
+            .execute_calls_ordered(
+                &prepared.tools,
+                &calls,
+                &mut diagnostics,
+                admission,
+                events,
+                scope.clone(),
+            )
             .await
         {
             Ok(results) => results,
@@ -823,6 +830,7 @@ impl LlmHost {
         diagnostics: &mut TurnDiagnostics,
         admission: Arc<RuntimeAdmissionGuard>,
         events: Option<&EventDelivery<'_>>,
+        caller: Option<eve_llm_api::ContextScope>,
     ) -> Result<Vec<ToolResult>, LlmError> {
         let by_name = prepared
             .iter()
@@ -957,7 +965,7 @@ impl LlmHost {
         for prepared_call in ready {
             // 取消外层 Future 后，停止操作仍需等到已创建的工具任务真正析构。
             let admission = admission.clone();
-            let context = ToolExecutionContext::new();
+            let context = ToolExecutionContext::new().with_scope(caller.clone());
             let cancellation = context.cancellation_handle();
             let call_id = prepared_call.call.id.clone();
             let run_config = ToolRunConfig {
