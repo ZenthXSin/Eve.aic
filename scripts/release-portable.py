@@ -101,13 +101,13 @@ def verify(folder, tag, source):
             raise ValueError("发行包文件名与平台/版本不一致")
         archive = folder / expected
         if digest(archive) != report["archive_sha256"] or any(report.get(key) is not True for key in
-                ("unicode_and_space_path", "web_http", "memory_and_learning_views", "qq_segmented_delivery", "recovery_without_replay")):
+                ("unicode_and_space_path", "web_http", "memory_and_learning_views", "qq_segmented_delivery", "recovery_without_replay",
+                 "client_update_download_verified", "client_update_next_start", "client_update_rollback", "client_update_preserved_user_files")):
             raise ValueError("发行包散列或实际进程验收不符")
         if report.get("external_model_requests") != 0 or report.get("production_qq_connections") != 0:
             raise ValueError("发行验收不是独立替身环境")
-        if not label.startswith("windows-") or label == "windows-arm64":
-            if report.get("node_launcher") is not True or report.get("console_ctrl_c") is not True:
-                raise ValueError("Node 启动器没有通过实际 Ctrl+C 收尾验收")
+        if report.get("node_launcher") is not True or report.get("console_ctrl_c") is not True:
+            raise ValueError("Node 启动器没有通过实际 Ctrl+C 收尾验收")
         reports[label] = report
         archives.append(archive)
     if set(reports) != LABELS:

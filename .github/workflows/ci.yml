@@ -37,8 +37,14 @@ jobs:
           rustup default stable
       - name: 检查代码格式
         run: cargo fmt --all -- --check
+      - name: 安装与便携包一致的 Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.22.0'
       - name: 验证自动发行的版本与恢复语义
         run: python -X utf8 scripts/test-release-portable.py
+      - name: 验证客户端更新、资产校验与失败恢复
+        run: node scripts/test-client-update.mjs
       - name: 检查所有构建目标
         run: cargo check --workspace --all-targets --locked
       - name: 检查 Clippy 警告

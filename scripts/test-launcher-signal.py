@@ -47,7 +47,11 @@ for await (const line of readline.createInterface({input:process.stdin})) {
 process.stdout.end(() => process.exit(0));
 ''', encoding="utf-8")
             node = root / ("runtime/node.exe" if os.name == "nt" else "runtime/bin/node")
-            child = subprocess.Popen([str(node), str(root / "Launch.mjs"), "qq", "--no-prompt", "--bridge-script", str(bridge)],
+            command = [str(node), str(root / "Launch.mjs"), "qq", "--no-prompt", "--no-check-updates", "--bridge-script", str(bridge)]
+            if "--powershell" in sys.argv[2:]:
+                command = ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                           "-File", str(root / "Launch.ps1"), "-NoPrompt", "-NoCheckUpdates", "-BridgeScript", str(bridge)]
+            child = subprocess.Popen(command,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
             lines = []
             ready = queue.Queue()

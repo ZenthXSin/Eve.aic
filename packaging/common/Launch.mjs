@@ -3,19 +3,30 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { createUpdater, UpdateBusy } from './Updater.mjs';
+import { stableVersion } from './update-contract.mjs';
 
-const root = fileURLToPath(new URL('.', import.meta.url));
+const packageRoot = path.resolve(fileURLToPath(new URL('.', import.meta.url)));
+let root = packageRoot;
 const windows = process.platform === 'win32';
-const nodePath = path.join(root, windows ? 'runtime/node.exe' : 'runtime/bin/node');
+const nodePath = path.join(packageRoot, windows ? 'runtime/node.exe' : 'runtime/bin/node');
 const argv = process.argv.slice(2);
 const mode = argv.shift() || 'qq';
-const options = { noPrompt: false, validateOnly: false, bridge: '', bridgeArg: '' };
+const options = { noPrompt: false, validateOnly: false, bridge: '', bridgeArg: '', configPath: '', noUpdate: false, noCheck: false, skipUpdate: false, skipSelection: false, rollback: false, status: false };
 for (let i = 0; i < argv.length; i++) {
   const flag = argv[i];
   if (flag === '--no-prompt') options.noPrompt = true;
   else if (flag === '--validate-only') options.validateOnly = true;
   else if (flag === '--bridge-script' && argv[i + 1]) options.bridge = argv[++i];
   else if (flag === '--bridge-arg' && argv[i + 1]) options.bridgeArg = argv[++i];
+  else if (flag === '--user-root' && argv[i + 1]) root = path.resolve(argv[++i]);
+  else if (flag === '--config-path' && argv[i + 1]) options.configPath = path.resolve(argv[++i]);
+  else if (flag === '--no-update') options.noUpdate = true;
+  else if (flag === '--no-check-updates') options.noCheck = true;
+  else if (flag === '--skip-update') options.skipUpdate = true;
+  else if (flag === '--skip-selection') options.skipSelection = true;
+  else if (flag === '--rollback') options.rollback = true;
+  else if (flag === '--status') options.status = true;
   else throw new Error('启动参数无效。');
 }
 
@@ -47,21 +58,28 @@ async function readSecret(label) {
 }
 
 async function loadConfig() {
-  const configPath = path.join(root, 'config.json');
+  const configPath = options.configPath || path.join(root, 'config.json');
   let contents;
   try { contents = await fs.readFile(configPath, 'utf8'); }
   catch (error) {
     if (error.code !== 'ENOENT') throw new Error('config.json 无法读取，原文件未修改。');
     if (options.noPrompt || options.validateOnly || mode === 'panel') throw new Error('请先运行 Start-Eve 完成配置。');
-    contents = await fs.readFile(path.join(root, 'config.example.json'), 'utf8');
+    contents = await fs.readFile(path.join(packageRoot, 'config.example.json'), 'utf8');
   }
   try { return { config: JSON.parse(contents), configPath }; }
   catch { throw new Error('config.json 不是有效 JSON，原文件未修改。'); }
 }
 
 function validText(value) { return typeof value === 'string' && value.trim().length > 0; }
+function updateOptions(config) {
+  const enabled = config.updates?.enabled ?? true;
+  const hours = config.updates?.check_interval_hours ?? 6;
+  if (typeof enabled !== 'boolean' || typeof hours !== 'number' || !Number.isFinite(hours) || hours < 0.25 || hours > 168) throw new Error('更新配置无效：enabled 为布尔值，check_interval_hours 为 0.25 至 168。');
+  return { enabled: enabled && !options.noUpdate, intervalMs: hours * 3600000 };
+}
 function validate(config) {
   if (config.format_version !== 1) throw new Error('配置版本不支持。');
+  updateOptions(config);
   if (!validText(config.model?.api_key) || !validText(config.model?.name)) throw new Error('模型名称或 API 密钥为空。');
   if (!['chat', 'responses'].includes(config.model.protocol)) throw new Error('模型协议只能为 chat 或 responses。');
   for (const key of ['training', 'cognition', 'self_learning', 'memory_recall', 'segmented']) {
@@ -77,7 +95,17 @@ function validate(config) {
 }
 
 async function main() {
-  if (!['qq', 'console', 'panel'].includes(mode)) throw new Error('仅支持 qq / console / panel 模式。');
+  if (!['qq', 'console', 'panel', 'update'].includes(mode)) throw new Error('仅支持 qq / console / panel / update 模式。');
+  if (mode === 'update') {
+    const updater = createUpdater(root);
+    if (options.status) {
+      const current = await updater.metadata(), saved = await updater.status();
+      console.log(JSON.stringify({ current: saved.active?.version || current.version, pending: saved.pending?.version || null,
+        previous: saved.previous?.version || (saved.active ? current.version : null), outcome: saved.outcome, checked_at_ms: saved.checked_at_ms }));
+    } else if (options.rollback) await updater.rollback();
+    else { const result = await updater.check({ force: true }); if (result.outcome === 'current') console.log('当前已是最新稳定版本。'); }
+    return;
+  }
   const { config, configPath } = await loadConfig();
   let changed = false;
   if (!options.noPrompt && !options.validateOnly && mode !== 'panel') {
@@ -99,10 +127,10 @@ async function main() {
     open.unref();
     return;
   }
-  const binary = path.join(root, (mode === 'qq' ? 'eve-qqbot' : 'eve') + (windows ? '.exe' : ''));
-  const bridge = options.bridge || path.join(root, 'connectors/qqbot/bridge.mjs');
+  const binary = path.join(packageRoot, (mode === 'qq' ? 'eve-qqbot' : 'eve') + (windows ? '.exe' : ''));
+  const bridge = options.bridge || path.join(packageRoot, 'connectors/qqbot/bridge.mjs');
   const required = [binary, path.join(root, 'AGENT.md')];
-  if (mode === 'qq') required.push(nodePath, bridge, path.join(root, 'connectors/qqbot/node_modules/@tencent-connect/qqbot-nodejs/package.json'));
+  if (mode === 'qq') required.push(nodePath, bridge, path.join(packageRoot, 'connectors/qqbot/node_modules/@tencent-connect/qqbot-nodejs/package.json'));
   for (const file of required) await fs.access(file);
   if (options.validateOnly) { console.log('配置及发行包检查通过。'); return; }
   if (changed) {
@@ -113,6 +141,38 @@ async function main() {
     } finally { await fs.rm(temporary, { force: true }); }
     console.log('配置已保存到本机 config.json，请保持此文件私有。');
   }
+  let updater, selected = { appRoot: packageRoot };
+  const settings = updateOptions(config);
+  if (!options.skipUpdate) {
+    try {
+      const manifest = JSON.parse(await fs.readFile(path.join(packageRoot, 'build-info.json'), 'utf8'));
+      if (stableVersion(manifest.version) && manifest.updater_protocol === 1) {
+        updater = createUpdater(root, { configPath, mode });
+        if (!options.skipSelection) selected = await updater.resolveInstalled({ activate: settings.enabled });
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') console.log('更新状态暂不可用，原文件保留；启动随包版本。');
+    }
+  }
+  const controller = new AbortController(); let pending, timer;
+  const check = () => {
+    if (!updater || !settings.enabled || options.noCheck || pending) return;
+    pending = updater.check({ signal: controller.signal, intervalMs: settings.intervalMs })
+      .catch(error => { if (error instanceof UpdateBusy) console.log('另一个启动器正在检查更新，当前版本继续运行。'); })
+      .finally(() => { pending = null; });
+  };
+  const delegated = selected.appRoot !== packageRoot;
+  const running = delegated
+    ? runChild(path.join(selected.appRoot, windows ? 'runtime/node.exe' : 'runtime/bin/node'),
+        [path.join(selected.appRoot, 'Launch.mjs'), ...process.argv.slice(2), '--user-root', root, '--skip-selection'], process.env)
+    : launchHere();
+  if (delegated) updater = null; // 新版启动器负责之后的检查；根目录只保留兼容的启动引导。
+  check();
+  if (updater && settings.enabled && !options.noCheck) { timer = setInterval(check, settings.intervalMs); timer.unref(); }
+  try { await running; }
+  finally { clearInterval(timer); controller.abort(); if (pending) await pending; }
+
+  function launchHere() {
   const env = { ...process.env,
     EVE_OPENAI_API_KEY: config.model.api_key, EVE_OPENAI_BASE_URL: config.model.base_url,
     EVE_OPENAI_MODEL: config.model.name, EVE_OPENAI_PROTOCOL: config.model.protocol,
@@ -136,6 +196,11 @@ async function main() {
     }
     console.log('QQ 启动中；看到 EVE_QQBOT_READY / EVE_WEB_READY 后打开 Open-Panel。');
   }
+  return runChild(binary, args, env);
+  }
+}
+
+async function runChild(binary, args, env) {
   const child = spawn(binary, args, { cwd: root, env, stdio: 'inherit' });
   // Windows 控制台向父子进程同时广播 Ctrl+C；Node 的 kill(SIGINT) 会强制终止，
   // 因此这里只保留父进程等待，让 Rust 自己完成控制台信号收尾。
