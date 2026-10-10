@@ -32,6 +32,8 @@ const PRACTICE_TIMEOUT: Duration = Duration::from_secs(900);
 const DISTILL_TIMEOUT: Duration = Duration::from_secs(600);
 const HELP: &str = "用法：/practice 兴趣ID 查看 Eve 为这条兴趣做过的实践与真实运行证据；兴趣 ID 可用 /interests 查看。";
 const DISABLED: &str = "实践验证未启用。";
+const NO_GAPS: &str =
+    "还没有发现能力缺口：目前的实践都在运行环境的能力范围内，也没有反复出现的问题。";
 const SHOWN_RUNS: usize = 2;
 
 fn now_ms() -> Result<u64, AppError> {
@@ -415,8 +417,45 @@ fn parse(text: &str) -> Option<Option<&str>> {
     })
 }
 
+/// /gaps：当前用户实践中暴露的能力缺口，由实践账本推导。
+fn gaps(practice: &dyn PracticeAdmin, owner: &str) -> PluginResult<String> {
+    let snapshot = practice.snapshot().map_err(|_| failure_text())?;
+    let gaps = eve_practice_api::capability_gaps(&snapshot, owner);
+    if gaps.is_empty() {
+        return Ok(NO_GAPS.into());
+    }
+    let mut reply =
+        String::from("能力缺口（由实践记录推导，可作为需要新的运行环境或工具的依据）：");
+    for gap in gaps {
+        let _ = match gap.kind {
+            eve_practice_api::GapKind::NoRuntime => write!(
+                reply,
+                "\n- 运行环境 {} 做不了 {} 个目标，共 {} 次：{}",
+                gap.runner_id,
+                gap.goals.len(),
+                gap.occurrences,
+                prefix(&gap.summary, 200)
+            ),
+            eve_practice_api::GapKind::RepeatedIssue => write!(
+                reply,
+                "\n- 反复出现的问题（{} 次，涉及 {} 个目标）：{}",
+                gap.occurrences,
+                gap.goals.len(),
+                prefix(&gap.summary, 200)
+            ),
+        };
+    }
+    Ok(reply)
+}
+
 impl QqCommandHandler for Commands {
     fn handle(&self, input: QqCommandInput<'_>) -> PluginResult<Option<String>> {
+        if input.text.trim() == "/gaps" {
+            return Ok(Some(match &self.enabled {
+                Some(enabled) => gaps(&*enabled.practice, &input.session.user_id)?,
+                None => DISABLED.into(),
+            }));
+        }
         let Some(command) = parse(input.text) else {
             return Ok(None);
         };
