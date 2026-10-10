@@ -88,13 +88,17 @@ test('稳定版本按数值比较，拒绝预发行、降级、错误平台和�
   assert.equal(updatePlan(release, base).label, 'linux-x64');
   assert.equal(updatePlan({ ...release, tag_name: 'v0.9.0' }, base), null);
   assert.throws(() => updatePlan({ ...release, prerelease: true }, base));
+  assert.throws(() => updatePlan({ ...release, draft: undefined }, base));
+  assert.throws(() => updatePlan({ ...release, prerelease: undefined }, base));
   assert.throws(() => compareVersions('v01.0.0', base.version));
+  assert.throws(() => compareVersions(['v1.1.0'], base.version));
   assert.throws(() => updatePlan({ ...release, assets: [{ ...release.assets[0], browser_download_url: 'https://example.com/evil' }] }, base));
   assert.throws(() => updatePlan({ ...release, assets: [] }, base));
 });
 test('六个平台均选用对应原生资产', () => {
-  for (const platform_label of [undefined, 'unknown', '__proto__']) {
+  for (const platform_label of [undefined, 'unknown', '__proto__', ['linux-x64']]) {
     assert.throws(() => currentManifest({ ...base, platform_label, target: undefined }));
+    assert.throws(() => currentManifest({ ...base, platform_label }));
   }
   for (const [label, target] of Object.entries(TARGETS)) {
     const release = releaseOf(Buffer.from('archive'), 'v2.0.0', label);
@@ -127,6 +131,7 @@ test('清单拒绝用户数据、大小写冲突和状态代际不兼容', () =>
   const { manifest, files } = tree(), plan = { version: manifest.version, target: manifest.target, label: manifest.platform_label };
   for (const mutated of [
     { ...manifest, state_schema_generation: 2 }, { ...manifest, updater_protocol: 2 },
+    { ...manifest, source_commit: ['a'.repeat(40)] },
     { ...manifest, files_sha256: { ...manifest.files_sha256, 'config.json': digest('private') } },
     { ...manifest, files_sha256: { ...manifest.files_sha256, 'agent.md': digest('collision') } },
   ]) assert.throws(() => verifyManifest(mutated, plan));

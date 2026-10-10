@@ -11,6 +11,7 @@ export const TARGETS = {
 };
 
 export function stableVersion(value) {
+  if (typeof value !== 'string') return null;
   const match = /^v(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})$/.exec(value ?? '');
   return match ? match.slice(1).map(Number) : null;
 }
@@ -27,13 +28,13 @@ export function safeRelative(value) {
   return value;
 }
 export function currentManifest(value) {
-  if (!value || value.format_version !== 1 || !Object.hasOwn(TARGETS, value.platform_label) || TARGETS[value.platform_label] !== value.target || !stableVersion(value.version)) throw new Error('当前运行包没有有效稳定发行信息。');
+  if (!value || value.format_version !== 1 || typeof value.platform_label !== 'string' || !Object.hasOwn(TARGETS, value.platform_label) || TARGETS[value.platform_label] !== value.target || !stableVersion(value.version)) throw new Error('当前运行包没有有效稳定发行信息。');
   if (value.updater_protocol !== PROTOCOL || value.state_schema_generation !== 1) throw new Error('运行包更新协议不兼容。');
   return value;
 }
 export function updatePlan(release, current) {
   currentManifest(current);
-  if (!release || release.draft || release.prerelease || !stableVersion(release.tag_name)) throw new Error('最新发行不是公开稳定版本。');
+  if (!release || release.draft !== false || release.prerelease !== false || !stableVersion(release.tag_name)) throw new Error('最新发行不是公开稳定版本。');
   if (compareVersions(release.tag_name, current.version) <= 0) return null;
   const extension = current.platform_label.startsWith('windows-') ? '.zip' : '.tar.gz';
   const name = `Eve-${release.tag_name}-${current.platform_label}${extension}`;
@@ -47,7 +48,8 @@ export function updatePlan(release, current) {
 export function verifyManifest(manifest, plan, names) {
   currentManifest(manifest);
   if (manifest.version !== plan.version || manifest.target !== plan.target || manifest.platform_label !== plan.label ||
-      !/^[a-f0-9]{40}$/.test(manifest.source_commit ?? '') || !/^[a-f0-9]{40}$/.test(manifest.source_tree ?? '') ||
+      typeof manifest.source_commit !== 'string' || typeof manifest.source_tree !== 'string' ||
+      !/^[a-f0-9]{40}$/.test(manifest.source_commit) || !/^[a-f0-9]{40}$/.test(manifest.source_tree) ||
       manifest.credentials_included !== false || manifest.user_data_included !== false) throw new Error('新版发行信息不符。');
   const entries = Object.entries(manifest.files_sha256 ?? {});
   if (!entries.length || entries.length > MAX_FILES) throw new Error('更新文件清单无效。');
