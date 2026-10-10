@@ -35,6 +35,7 @@ mod web_panel_autonomy;
 mod web_panel_cognition;
 mod web_panel_learning;
 mod web_panel_memory;
+mod web_panel_plans;
 mod web_panel_plugins;
 
 #[cfg(test)]

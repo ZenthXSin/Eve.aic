@@ -1278,6 +1278,7 @@ async fn run_qqbot_composed(
                                 .map(|outreach| Arc::new(outreach) as Arc<dyn OutreachAdmin>),
                         }
                     }),
+                    plans: plan_journal.clone(),
                 }),
             )
             .await?;
