@@ -20,7 +20,9 @@ if (scenario.pid_file) fs.writeFileSync(scenario.pid_file, String(process.pid));
 const record = event => {
   if (scenario.events_file) fs.appendFileSync(scenario.events_file, JSON.stringify(event) + "\n");
 };
+// accept_any：真实模型的回复无法预知，只记录不核对（用于真实模型验收，不用于确定性测试）。
 const checkReply = (cmd, message) => {
+  if (message.accept_any) return;
   if (message.expected_type === "finish") throw new Error("retired_result_was_replied");
   if (message.expected_contains !== undefined) {
     const parts = Array.isArray(message.expected_contains) ? message.expected_contains : [message.expected_contains];
@@ -32,6 +34,7 @@ const checkReply = (cmd, message) => {
 const deliver = id => send({ type: "delivery", id, ok: !scenario.send_fail, message_id: "out-" + id });
 const deliverSegment = (id, index, ok = true) => send({ type: "delivery", id, index, ok, message_id: `out-${id}-${index}` });
 const checkSegment = (cmd, message) => {
+  if (message.accept_any) return;
   if (message.expected_type === "finish") throw new Error("retired_result_was_replied");
   const expected = message.expected_segments;
   if (!Array.isArray(expected)) throw new Error("unexpected_segment");
@@ -146,7 +149,7 @@ if (scenario.script) {
       const message = pending.get(cmd.id);
       if (!message) throw new Error("wrong_reply_id");
       if (cmd.type === "reply") {
-        if (message.expected_segments) throw new Error("expected_segments_got_reply");
+        if (message.expected_segments && !message.accept_any) throw new Error("expected_segments_got_reply");
         checkReply(cmd, message);
         if (!message.hold_delivery) deliver(cmd.id);
       } else if (cmd.type === "segment") {
@@ -156,7 +159,7 @@ if (scenario.script) {
         }
       } else if (cmd.type !== "finish") {
         throw new Error("unexpected_command");
-      } else if (message.expected_type === "reply" && !message.allow_finish) {
+      } else if (message.expected_type === "reply" && !message.allow_finish && !message.accept_any) {
         throw new Error("expected_reply_was_finished");
       }
       commands.push(cmd);

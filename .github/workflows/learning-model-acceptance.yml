@@ -1,0 +1,85 @@
+name: 自主学习真实模型验收
+
+# 真实模型 + 真实 Mindustry 服务端走一遍首个自主学习目标，QQ 平台仍为替身；只在主线手动触发，消耗模型额度。
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 主模型
+        required: true
+        default: deepseek-v4.1-flash
+        type: string
+      protocol:
+        description: 模型 API 协议
+        required: true
+        default: chat
+        type: choice
+        options: [chat, responses]
+      research_source:
+        description: 研究入口页面
+        required: true
+        default: https://mindustrygame.github.io/wiki/modding/1-modding/
+        type: string
+      budget_seconds:
+        description: 第一阶段（研究、实践、固化与撰写）的时间预算
+        required: true
+        default: "1500"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eve-learning-model-acceptance
+  cancel-in-progress: false
+
+jobs:
+  journey:
+    # 只执行已合入主线且经过 CI 的代码，不读取 PR 分支的凭据。
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MINDUSTRY_VERSION: v160.7
+      MINDUSTRY_SHA256: f7b899a4038b95b14a824d5f8993984f79d73baa3254c385b6538327f9c0befd
+      EVE_OPENAI_BASE_URL: "https://ai.xn--rhqr8xvr4ahqsgka.com"
+    steps:
+      - name: 检查主模型凭据
+        env:
+          EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
+        run: |
+          if [ -z "$EVE_OPENAI_API_KEY" ]; then
+            echo "请在仓库 Actions Secrets 配置 EVE_OPENAI_API_KEY。"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+      - name: 下载并校验 Mindustry 服务端
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/server-release.jar" \
+            "https://github.com/Anuken/Mindustry/releases/download/${MINDUSTRY_VERSION}/server-release.jar"
+          echo "${MINDUSTRY_SHA256}  $RUNNER_TEMP/server-release.jar" | sha256sum -c -
+      - name: 安装 Rust
+        run: rustup toolchain install 1.89.0 --profile minimal
+      - name: 构建 QQBot 入口
+        run: cargo +1.89.0 build -p eve-app --bin eve-qqbot --locked
+      - name: 真实模型走完整条行为链
+        env:
+          EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
+          EVE_OPENAI_MODEL: ${{ inputs.model }}
+          EVE_OPENAI_PROTOCOL: ${{ inputs.protocol }}
+          EVE_RESEARCH_SOURCE: ${{ inputs.research_source }}
+          EVE_LEARNING_BUDGET_SECONDS: ${{ inputs.budget_seconds }}
+          EVE_MINDUSTRY_SERVER_JAR: ${{ runner.temp }}/server-release.jar
+        run: python3 scripts/learning-model-acceptance.py target/debug/eve-qqbot "$RUNNER_TEMP/learning-report.json"
+      - name: 上传报告
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: learning-model-report
+          path: ${{ runner.temp }}/learning-report.json
+          if-no-files-found: ignore
