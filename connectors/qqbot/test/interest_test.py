@@ -5,6 +5,7 @@
 确定性替身只证明宿主契约与恢复语义，不代表真实模型的观察质量。
 """
 import json
+import contextlib
 import os
 import pathlib
 import subprocess
@@ -24,6 +25,7 @@ WATERCOLOR = "我最近迷上了水彩画，但调色总是很脏。"
 DISABLED = "兴趣观察未启用。"
 EMPTY = "当前会话还没有记录兴趣。"
 WITHDRAWN = "已撤回这条兴趣；之后不会再据此后台学习或主动提起。"
+PANEL_TOKEN = memory_test.PANEL_TOKEN
 
 
 class InterestAcceptance(unittest.TestCase):
@@ -40,6 +42,7 @@ class InterestAcceptance(unittest.TestCase):
     wait_reply = memory_test.MemoryAcceptance.wait_reply
     wait_receipt = memory_test.MemoryAcceptance.wait_receipt
     send = memory_test.MemoryAcceptance.send
+    panel = memory_test.MemoryAcceptance.panel
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -187,7 +190,7 @@ class InterestAcceptance(unittest.TestCase):
         self.assertFalse(self.run_release.wait(0.65), "process stopped during observation")
 
     def run_eve(self, script, interest=True, memory=False, cognition=False, max_executions=1,
-                checkpoints=None, stop_at=None, extra=None, timeout=30, env_extra=None):
+                checkpoints=None, stop_at=None, extra=None, timeout=30, env_extra=None, panel=False):
         self.runs += 1
         self.run_release = threading.Event()
         events_path = self.work / f"events-{self.runs}.jsonl"
@@ -212,6 +215,10 @@ class InterestAcceptance(unittest.TestCase):
         if cognition:
             command.append("--cognition")
         command.extend(extra or [])
+        if panel:
+            env["EVE_WEB_TOKEN"] = PANEL_TOKEN
+            command.extend(["--web-listen", "127.0.0.1:0"])
+            self.panel_stderr = self.work / f"panel-{self.runs}.stderr"
 
         def inspect():
             for name, callback in (checkpoints or {}).items():
@@ -224,20 +231,23 @@ class InterestAcceptance(unittest.TestCase):
                     self.gate(name + "-continue").touch()
 
         inspector = threading.Thread(target=inspect, daemon=True)
-        child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        inspector.start()
-        try:
-            if stop_at is not None:
-                self.wait_until(lambda: stop_at.exists() or child.poll() is not None, "stop gate was not reached")
-                self.assertTrue(stop_at.exists(), "process exited before stop synchronization")
-                child.kill()
-            stdout, stderr = child.communicate(timeout=timeout)
-        finally:
-            if child.poll() is None:
-                child.kill()
-                child.communicate()
-            self.run_release.set()
-            inspector.join(timeout=2)
+        with self.panel_stderr.open("w", encoding="utf8") if panel else contextlib.nullcontext(None) as panel_log:
+            child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=panel_log or subprocess.PIPE, text=True)
+            inspector.start()
+            try:
+                if stop_at is not None:
+                    self.wait_until(lambda: stop_at.exists() or child.poll() is not None, "stop gate was not reached")
+                    self.assertTrue(stop_at.exists(), "process exited before stop synchronization")
+                    child.kill()
+                stdout, stderr = child.communicate(timeout=timeout)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate()
+                self.run_release.set()
+                inspector.join(timeout=2)
+        if panel:
+            stderr = self.panel_stderr.read_text(encoding="utf8")
         self.assertFalse(inspector.is_alive(), "state inspector did not stop")
         self.assertFalse(error_path.exists(), error_path.read_text() if error_path.exists() else "")
         self.assertFalse(self.errors, "\n".join(self.errors))
@@ -263,6 +273,86 @@ class InterestAcceptance(unittest.TestCase):
         goal = self.learning_goal(interests[0]["id"])
         child = goal and self.reflection(goal["id"])
         return bool(child and child["status"] == "Completed")
+
+    def settings_page(self):
+        code, page = self.panel("/api/plugin-pages/read", {"plugin_id": "eve.interest.settings", "page_id": "learning"})
+        self.assertEqual(code, 200)
+        return page
+
+    def configure(self, **values):
+        page = self.settings_page()
+        code, result = self.panel("/api/plugin-pages/save", {"plugin_id": "eve.interest.settings", "page_id": "learning",
+            "instance": page["instance"], "expected_revision": page["revision"], "values": values})
+        self.assertEqual(code, 200)
+        self.assertEqual(result["restart_required"], [])
+        return page
+
+    def test_web_hot_enable_cooldown_pause_resume_and_restart_preserve_history(self):
+        def enable():
+            self.quiet()
+            self.assertFalse(self.kind("interest"), "面板存在不等于自动开始观察")
+            self.assertEqual(next(f for f in self.settings_page()["fields"] if f["id"] == "enabled")["value"], False)
+            self.configure(enabled=True, cooldown_ms=0)
+            self.wait_until(self.reflected, "无需重启的兴趣观察与后台反思未生效")
+            self.configure(cooldown_ms=86400000)
+
+        def pause():
+            self.quiet()
+            self.assertEqual(len(self.kind("interest")), 1, "热修改间隔未限制新观察")
+            self.configure(enabled=False)
+
+        def resume():
+            self.quiet()
+            self.assertEqual(len(self.kind("interest")), 1, "暂停后仍准入新观察")
+            self.configure(enabled=True, cooldown_ms=0)
+            self.wait_until(lambda: len(self.interests()) == 2 and any(i["status"] == "Withdrawn" for i in self.interests()), "恢复后未处理暂停期间的新交互")
+            self.assertEqual(len(self.kind("interest")), 2)
+            self.configure(enabled=False)
+
+        self.run_eve([*self.send(self.message("web-interest", MINDUSTRY)), *self.checkpoint("enable"),
+                      *self.send(self.message("web-watercolor", WATERCOLOR)), *self.checkpoint("pause"),
+                      *self.send(self.message("web-quit", QUIT)), *self.checkpoint("resume")], interest=False, panel=True,
+                     checkpoints={"enable":enable, "pause":pause, "resume":resume})
+        before = self.interest_state()
+        count = len(self.kind("interest"))
+        requests_before_restart = len(self.requests)
+        def recovered():
+            self.assertFalse(next(f for f in self.settings_page()["fields"] if f["id"] == "enabled")["value"])
+            self.quiet()
+            self.assertEqual(self.interest_state(), before)
+            self.assertEqual(len(self.kind("interest")), count, "重启重放已观察批次")
+            self.assertEqual(len(self.requests), requests_before_restart, "暂停配置在重启后仍发起兴趣反思")
+        self.inspect_run(recovered, interest=False, panel=True)
+
+    def test_web_fast_pause_resume_cancels_inflight_observation_without_replay(self):
+        self.response_gates[("interest", 1)] = "blocked-observer"
+        def enable():
+            self.configure(enabled=True, cooldown_ms=0)
+        def cancel():
+            self.wait_until(lambda: self.arrived("interest", 1).exists(), "观察请求未到达替身")
+            self.configure(enabled=False)
+            self.configure(enabled=True)
+            self.wait_until(lambda: self.jobs() and self.jobs()[0]["status"] == {"Failed":"Cancelled"}, "暂停没有保存被取消批次")
+            self.gate("blocked-observer").touch()
+            self.quiet()
+            self.assertFalse(self.interests(), "暂停后旧请求结果仍被采用")
+            self.assertEqual(len(self.kind("interest")), 1, "快速恢复重试已消费批次")
+        def learned():
+            self.wait_until(lambda: len(self.interests()) == 1, "恢复后没有观察新交互")
+            self.assertEqual(self.interests()[0]["topic"], "水彩画调色")
+            self.assertEqual(len(self.kind("interest")), 2)
+        self.run_eve([*self.checkpoint("enable"), *self.send(self.message("web-blocked", MINDUSTRY)), *self.checkpoint("cancel"),
+                      *self.send(self.message("web-new", WATERCOLOR)), *self.checkpoint("learned")], interest=False, panel=True,
+                     checkpoints={"enable":enable, "cancel":cancel, "learned":learned})
+
+    def test_saved_web_enable_applies_to_next_headless_boot_without_cli_flag(self):
+        self.inspect_run(lambda: self.configure(enabled=True, cooldown_ms=0), interest=False, panel=True)
+        self.assertFalse(self.requests, "保存开关本身不能调用模型")
+        self.inspect_run(lambda: self.wait_until(self.reflected, "持久面板配置没有在无参数后台生效"),
+                         prefix=self.send(self.message("saved-web-enable", MINDUSTRY)), interest=False)
+        self.assertEqual([request["kind"] for request in self.requests], ["chat", "interest", "reflection"])
+        self.inspect_run(self.quiet, interest=False)
+        self.assertEqual(len(self.kind("interest")), 1, "无面板恢复重放已观察消息")
 
     def test_one_casual_mention_becomes_sourced_interest_and_background_learning_without_replay(self):
         self.inspect_run(lambda: self.wait_until(self.reflected, "learning goal was not reflected in background"),

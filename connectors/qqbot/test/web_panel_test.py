@@ -111,13 +111,16 @@ class WebPanelAcceptance(unittest.TestCase):
             code, status = self.api(url, "/api/status")
             self.assertEqual(code, 200)
             self.assertTrue(status["qq"]["ready"])
-            # 未以 --cognition 启动时认知页明确不可用，不返回空列表冒充“没有目标”。
-            for path in ["/api/goals", "/api/goal?id=any-goal"]:
-                self.assertEqual(self.api(url, path), (503, {"error": "unavailable"}))
+            # 面板预装记忆和认知以支持兴趣热启用；无兴趣参数仍不请求观察模型。
+            code, goals = self.api(url, "/api/goals")
+            self.assertEqual(code, 200)
+            self.assertEqual(goals["items"], [])
+            self.assertEqual(self.api(url, "/api/goal?id=any-goal"), (404, {"error": "not_found"}))
             scope = {"channel": "qq", "session_id": "any-session", "user_id": "any-user"}
-            for path, body in [("/api/memory/scopes", {}), ("/api/memory/scope", {"scope": scope}),
+            self.assertEqual(self.api(url, "/api/memory/scopes", {})[0], 200)
+            for path, body in [("/api/memory/scope", {"scope": scope}),
                                ("/api/memory/evidence", {"scope": scope, "id": "any-evidence"})]:
-                self.assertEqual(self.api(url, path, body), (503, {"error": "unavailable"}))
+                self.assertEqual(self.api(url, path, body), (404, {"error": "not_found"}))
             code, sessions = self.api(url, "/api/sessions?limit=1")
             self.assertEqual(code, 200)
             key = sessions["sessions"][0]["key"]

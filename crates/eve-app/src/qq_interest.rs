@@ -4,8 +4,8 @@ use crate::AppError;
 use eve_cognition_api::{CognitionAdmin, GoalStatus};
 use eve_interest_api::{
     InterestAdmin, InterestError, InterestGoalDeriver, InterestObserver, InterestRecord,
-    InterestStatus, ObservationFailure, ObservationOptions, ObservationOutcome, StatementKind,
-    WithdrawalRequest,
+    InterestSettingsReader, InterestSettingsSnapshot, InterestStatus, ObservationFailure,
+    ObservationOutcome, StatementKind, WithdrawalRequest,
 };
 use eve_interest_plugin::learning_goal_id;
 use eve_memory_api::{MemoryAdmin, validate_id};
@@ -45,17 +45,17 @@ impl Background {
         interests: Arc<dyn InterestAdmin>,
         observer: Arc<dyn InterestObserver>,
         deriver: Arc<dyn InterestGoalDeriver>,
-        options: ObservationOptions,
+        settings: Arc<dyn InterestSettingsReader>,
         dirty: Arc<AtomicBool>,
     ) -> Result<Self, AppError> {
-        options.validate()?;
+        settings.snapshot()?.settings.validate()?;
         let (active, activated) = watch::channel(false);
         let (stop, stopped) = watch::channel(false);
         let (finished_sender, finished) = watch::channel(false);
         let task = tokio::spawn(async move {
             // Sender 在 panic 时也释放；宿主随后关闭通道，不假装后台仍正常。
             let result = run(
-                memory, interests, observer, deriver, options, dirty, activated, stopped,
+                memory, interests, observer, deriver, settings, dirty, activated, stopped,
             )
             .await;
             let _ = finished_sender.send(true);
@@ -93,13 +93,31 @@ async fn stop_requested(receiver: &mut watch::Receiver<bool>) {
     }
 }
 
+async fn observation_paused(
+    settings: &dyn InterestSettingsReader,
+    began: &InterestSettingsSnapshot,
+) {
+    let mut revision = began.revision;
+    loop {
+        match settings.changed(revision).await {
+            Ok(next)
+                if next.settings.enabled && next.paused_at_revision == began.paused_at_revision =>
+            {
+                revision = next.revision;
+            }
+            // 包含快速暂停再启用，以及配置提交未知时的关闭；都必须终结此批次。
+            _ => return,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run(
     memory: Arc<dyn MemoryAdmin>,
     interests: Arc<dyn InterestAdmin>,
     observer: Arc<dyn InterestObserver>,
     deriver: Arc<dyn InterestGoalDeriver>,
-    options: ObservationOptions,
+    settings: Arc<dyn InterestSettingsReader>,
     dirty: Arc<AtomicBool>,
     mut active: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
@@ -121,6 +139,15 @@ async fn run(
         if *stopped.borrow() {
             return Ok(());
         }
+        let current = settings.snapshot()?;
+        if !current.settings.enabled {
+            tokio::select! {
+                biased;
+                _ = stop_requested(&mut stopped) => return Ok(()),
+                changed = settings.changed(current.revision) => { changed?; },
+            }
+            continue;
+        }
         if observing {
             let mut scopes = memory.scopes()?;
             if scopes.len() > eve_memory_api::MAX_EVIDENCE {
@@ -136,21 +163,29 @@ async fn run(
                 if scope.channel != "qq" {
                     continue;
                 }
+                let current = settings.snapshot()?;
+                if !current.settings.enabled {
+                    break;
+                }
                 let snapshot = memory.reader(scope.clone())?.snapshot()?;
                 if snapshot.scope != scope {
                     return Err("兴趣观察来源作用域不匹配".into());
                 }
-                let batch =
-                    match interests.reserve(&snapshot, now_ms()?, observer.version(), &options) {
-                        Ok(Some(batch)) => batch,
-                        Ok(None) => continue,
-                        // 容量满保留原记录：停止新观察，已有兴趣仍继续同步目标。
-                        Err(InterestError::LimitReached) => {
-                            observing = false;
-                            break;
-                        }
-                        Err(error) => return Err(error.into()),
-                    };
+                let batch = match interests.reserve(
+                    &snapshot,
+                    now_ms()?,
+                    observer.version(),
+                    &current.settings.observation,
+                ) {
+                    Ok(Some(batch)) => batch,
+                    Ok(None) => continue,
+                    // 容量满保留原记录：停止新观察，已有兴趣仍继续同步目标。
+                    Err(InterestError::LimitReached) => {
+                        observing = false;
+                        break;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 let began = batch.started_at_ms;
                 let outcome = {
                     let request = observer.observe(batch.clone());
@@ -158,6 +193,7 @@ async fn run(
                     tokio::select! {
                         biased;
                         _ = stop_requested(&mut stopped) => ObservationOutcome::Failed(ObservationFailure::Cancelled),
+                        _ = observation_paused(settings.as_ref(), &current) => ObservationOutcome::Failed(ObservationFailure::Cancelled),
                         result = tokio::time::timeout(Duration::from_secs(30), &mut request) => match result {
                             Ok(Ok(updates)) => ObservationOutcome::Completed(updates),
                             Ok(Err(InterestError::Observation(failure))) => ObservationOutcome::Failed(failure),
@@ -173,7 +209,7 @@ async fn run(
                 }
             }
         }
-        if dirty.swap(false, Ordering::SeqCst) {
+        if settings.snapshot()?.settings.enabled && dirty.swap(false, Ordering::SeqCst) {
             let mut records = Vec::new();
             for scope in interests.scopes()? {
                 records.extend(interests.snapshot(&scope)?.interests);
@@ -187,6 +223,7 @@ async fn run(
         tokio::select! {
             biased;
             _ = stop_requested(&mut stopped) => return Ok(()),
+            changed = settings.changed(current.revision) => { changed?; },
             _ = tokio::time::sleep(Duration::from_millis(250)) => {},
         }
     }

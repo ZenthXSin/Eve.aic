@@ -1,6 +1,7 @@
 //! 兴趣观察账本、单次模型观察器与学习目标派生器。
 mod goal;
 mod observer;
+mod settings;
 mod store;
 mod strict_json;
 
@@ -12,6 +13,7 @@ use eve_plugin_api::{
 };
 pub use goal::{DERIVER_VERSION, LearningGoalDeriver, learning_goal_id};
 pub use observer::{ModelInterestObserver, OBSERVER_VERSION};
+pub use settings::{InterestSettingsController, InterestSettingsPlugin};
 use std::sync::{Arc, Mutex};
 use store::StoredInterests;
 

@@ -481,6 +481,7 @@ dependencies = [
  "eve-memory-plugin",
  "eve-plugin-api",
  "eve-session-api",
+ "eve-web-panel-api",
  "ring",
  "serde",
  "serde_json",
