@@ -17,7 +17,7 @@ BINARY = pathlib.Path(os.environ.get("EVE_QQBOT_BINARY", ROOT / "target/debug/ev
 FAKE = ROOT / "connectors/qqbot/test/fake-bridge.mjs"
 CANCELLED = "已取消当前任务；已完成的工具操作不会撤销。"
 NO_CURRENT = "当前会话没有可控制的任务，请先发送普通文字开始任务。"
-SIDE_EFFECTS = "已有工具执行或副作用未知；请确认接下来要执行的新任务。"
+SIDE_EFFECTS = "刚才已有工具执行，重新运行可能重复操作。要继续处理新要求，请发“新任务：……”或 /new 内容；已发生的操作不会自动撤销。"
 UNSUPPORTED = "尚未支持任务暂停恢复；请明确继续、取消或开始新任务。"
 
 class Acceptance(unittest.TestCase):

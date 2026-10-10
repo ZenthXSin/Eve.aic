@@ -28,6 +28,11 @@
     "enabled": true,
     "check_interval_hours": 6
   },
+  "developer": {
+    "enabled": false,
+    "config_file": "developer-tools.json",
+    "github_token": ""
+  },
   "web": {
     "listen": "127.0.0.1:8765",
     "token": ""

@@ -125,10 +125,10 @@ impl LlmHostConfig {
             || self.tool_timeout.is_zero()
             || self.tool_cancellation_grace.is_zero()
             || self.max_parallel_tool_calls == 0
-            || self.max_tool_rounds != 1
+            || !(1..=32).contains(&self.max_tool_rounds)
         {
             return Err(LlmError::Configuration(
-                "timeouts and concurrency must be positive; tool rounds must be 1".into(),
+                "timeouts and concurrency must be positive; tool rounds must be 1..=32".into(),
             ));
         }
         Ok(())
@@ -579,114 +579,103 @@ impl LlmHost {
             .map(|tool| tool.definition.clone())
             .collect::<Vec<_>>();
         let mut messages = build_messages(&self.config, &prepared.context, &input, &definitions);
-        let request = ModelRequest {
-            messages: messages.clone(),
-            tools: definitions,
-        };
-        let response = match self.complete(request, &mut diagnostics, events).await {
-            Ok(value) => value,
-            Err(error) => return Err(fail(error, diagnostics)),
-        };
-        if let ModelResponse::Final { text } = response {
-            diagnostics.stage = TurnStage::Completed;
-            transcript.push(ChatMessage::text(ChatRole::Assistant, text.clone()));
-            emit(events, TurnEventKind::TurnCompleted { text: text.clone() })
+        let mut seen_calls = HashSet::new();
+        loop {
+            let response = match self
+                .complete(
+                    ModelRequest {
+                        messages: messages.clone(),
+                        tools: definitions.clone(),
+                    },
+                    &mut diagnostics,
+                    events,
+                )
                 .await
-                .map_err(|error| fail(error, diagnostics.clone()))?;
-            return Ok(TurnOutput {
-                text,
-                diagnostics,
-                transcript,
-            });
-        }
-        let ModelResponse::ToolCalls { calls } = response else {
-            unreachable!()
-        };
-        if let Some(budget) = &self.execution_budget {
-            budget
-                .reserve_tool_batch(calls.len())
-                .map_err(|error| fail(error, diagnostics.clone()))?;
-        }
-        diagnostics.stage = TurnStage::Tools;
-        diagnostics.tool_batches += 1;
-        diagnostics.calls = calls
-            .iter()
-            .enumerate()
-            .map(|(ordinal, call)| ToolCallDiagnostic {
-                id: call.id.clone(),
-                name: call.name.clone(),
-                ordinal,
-            })
-            .collect();
-        emit(
-            events,
-            TurnEventKind::ToolBatchStarted {
-                calls: calls.clone(),
-            },
-        )
-        .await
-        .map_err(|error| fail(error, diagnostics.clone()))?;
-        let results = match self
-            .execute_calls_ordered(
-                &prepared.tools,
-                &calls,
-                &mut diagnostics,
-                admission,
-                events,
-                scope.clone(),
-            )
-            .await
-        {
-            Ok(results) => results,
-            Err(error) => return Err(fail(error, diagnostics)),
-        };
-        messages.push(
-            ChatMessage::assistant_tool_calls(calls.clone())
-                .map_err(|error| fail(error, diagnostics.clone()))?,
-        );
-        messages.push(
-            ChatMessage::tool_results(results.clone())
-                .map_err(|error| fail(error, diagnostics.clone()))?,
-        );
-        transcript.extend_from_slice(&messages[messages.len() - 2..]);
-        diagnostics.tool_results = results;
-        for (ordinal, result) in diagnostics.tool_results.iter().cloned().enumerate() {
-            emit(events, TurnEventKind::ToolResult { ordinal, result })
-                .await
-                .map_err(|error| fail(error, diagnostics.clone()))?;
-        }
-        let response = match self
-            .complete(
-                ModelRequest {
-                    messages,
-                    tools: prepared
-                        .tools
-                        .iter()
-                        .map(|tool| tool.definition.clone())
-                        .collect(),
-                },
-                &mut diagnostics,
-                events,
-            )
-            .await
-        {
-            Ok(value) => value,
-            Err(error) => return Err(fail(error, diagnostics)),
-        };
-        match response {
-            ModelResponse::Final { text } => {
+            {
+                Ok(value) => value,
+                Err(error) => return Err(fail(error, diagnostics)),
+            };
+            if let ModelResponse::Final { text } = response {
                 diagnostics.stage = TurnStage::Completed;
                 transcript.push(ChatMessage::text(ChatRole::Assistant, text.clone()));
                 emit(events, TurnEventKind::TurnCompleted { text: text.clone() })
                     .await
                     .map_err(|error| fail(error, diagnostics.clone()))?;
-                Ok(TurnOutput {
+                return Ok(TurnOutput {
                     text,
                     diagnostics,
                     transcript,
-                })
+                });
             }
-            ModelResponse::ToolCalls { .. } => Err(fail(LlmError::RoundLimit, diagnostics)),
+            let ModelResponse::ToolCalls { calls } = response else {
+                unreachable!()
+            };
+            if diagnostics.tool_batches >= self.config.max_tool_rounds {
+                return Err(fail(LlmError::RoundLimit, diagnostics));
+            }
+            if calls.iter().any(|call| !seen_calls.insert(call.id.clone())) {
+                return Err(fail(
+                    LlmError::Protocol("不同工具批次不能复用调用 ID".into()),
+                    diagnostics,
+                ));
+            }
+            if let Some(budget) = &self.execution_budget {
+                budget
+                    .reserve_tool_batch(calls.len())
+                    .map_err(|error| fail(error, diagnostics.clone()))?;
+            }
+            diagnostics.stage = TurnStage::Tools;
+            diagnostics.tool_batches += 1;
+            let ordinal_offset = diagnostics.calls.len();
+            diagnostics
+                .calls
+                .extend(
+                    calls
+                        .iter()
+                        .enumerate()
+                        .map(|(ordinal, call)| ToolCallDiagnostic {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            ordinal: ordinal_offset + ordinal,
+                        }),
+                );
+            emit(
+                events,
+                TurnEventKind::ToolBatchStarted {
+                    calls: calls.clone(),
+                },
+            )
+            .await
+            .map_err(|error| fail(error, diagnostics.clone()))?;
+            let results = match self
+                .execute_calls_ordered(
+                    &prepared.tools,
+                    &calls,
+                    &mut diagnostics,
+                    admission.clone(),
+                    events,
+                    scope.clone(),
+                )
+                .await
+            {
+                Ok(results) => results,
+                Err(error) => return Err(fail(error, diagnostics)),
+            };
+            messages.push(
+                ChatMessage::assistant_tool_calls(calls.clone())
+                    .map_err(|error| fail(error, diagnostics.clone()))?,
+            );
+            messages.push(
+                ChatMessage::tool_results(results.clone())
+                    .map_err(|error| fail(error, diagnostics.clone()))?,
+            );
+            transcript.extend_from_slice(&messages[messages.len() - 2..]);
+            diagnostics.tool_results.extend(results.clone());
+            for (ordinal, result) in results.into_iter().enumerate() {
+                emit(events, TurnEventKind::ToolResult { ordinal, result })
+                    .await
+                    .map_err(|error| fail(error, diagnostics.clone()))?;
+            }
         }
     }
 
@@ -1029,7 +1018,9 @@ impl LlmHost {
                 diagnostics.peak_parallelism = diagnostics
                     .peak_parallelism
                     .max(peak.load(Ordering::SeqCst));
-                diagnostics.tool_results = results.into_iter().flatten().collect();
+                diagnostics
+                    .tool_results
+                    .extend(results.into_iter().flatten());
                 return Err(LlmError::Cancelled);
             }
             let task = &tasks.tasks[position];

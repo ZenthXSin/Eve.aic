@@ -6,6 +6,7 @@ mod cognition_action_admission;
 mod cognition_plan;
 mod config;
 mod console;
+mod developer;
 mod error;
 mod input;
 mod memory_cli;
@@ -92,6 +93,7 @@ pub const HELP: &str = "Eve 核心对话入口
 协议默认 chat；EVE_OPENAI_PROTOCOL 可选 chat/responses\n可选：EVE_OPENAI_BASE_URL、EVE_OPENAI_REASONING_EFFORT
 EVE_OPENAI_MODEL_ROLE=primary 显式使用 runtime.models 的主模型角色配置；每轮固定选择。
 一行一轮；/cancel 取消当前轮；/quit 或 Ctrl+C 取消并退出；/help 查看说明。
+EVE_DEVELOPER_CONFIG 可装配文件、命令、GitHub 与自身升级准备工具；仅配置操作者可执行，凭据为宿主环境引用。
 --segmented 保存完整回复后按自然段分至多 3 段显示，段间停顿至多 2.5 秒；/cancel 停止显示剩余片段。
 /segment 查看本会话分段；on、off、reset、parts 2至5、pace 0至200（%）按 --session/--user 保存，从下一条回复生效。
 EOF 处理完已接收输入后退出；最多 16 条待处理输入，取消/退出会清空队列。
@@ -186,7 +188,8 @@ pub async fn run_console(
     mut output: impl Write,
 ) -> Result<ChatSummary, AppError> {
     let key = SessionKey::new(&options.session_id, &options.user_id)?;
-    let bootstrap = core_bootstrap(&options.agent_path)?;
+    let mut bootstrap = core_bootstrap(&options.agent_path)?;
+    developer::install(&mut bootstrap, &options.state_directory)?;
     let backends = KernelServices {
         state: storage::open_state_store(
             &options.state_directory,

@@ -80,6 +80,10 @@ function updateOptions(config) {
 function validate(config) {
   if (config.format_version !== 1) throw new Error('配置版本不支持。');
   updateOptions(config);
+  if (config.developer?.enabled) {
+    if (config.developer.enabled !== true || !validText(config.developer.config_file)) throw new Error('开发工具需要独立配置文件路径。');
+    if (config.developer.github_token !== undefined && typeof config.developer.github_token !== 'string') throw new Error('GitHub token 必须为字符串。');
+  }
   if (!validText(config.model?.api_key) || !validText(config.model?.name)) throw new Error('模型名称或 API 密钥为空。');
   if (!['chat', 'responses'].includes(config.model.protocol)) throw new Error('模型协议只能为 chat 或 responses。');
   for (const key of ['training', 'cognition', 'self_learning', 'memory_recall', 'segmented']) {
@@ -177,6 +181,12 @@ async function main() {
     EVE_OPENAI_API_KEY: config.model.api_key, EVE_OPENAI_BASE_URL: config.model.base_url,
     EVE_OPENAI_MODEL: config.model.name, EVE_OPENAI_PROTOCOL: config.model.protocol,
     EVE_OPENAI_MODEL_ROLE: '', EVE_OPENAI_REASONING_EFFORT: 'none', EVE_LLM_RESPONSE_MODE: 'complete' };
+  // 发行包使用自己的显式开关，不让继承的设置意外开放宿主命令。
+  delete env.EVE_DEVELOPER_CONFIG;
+  if (config.developer?.enabled) {
+    env.EVE_DEVELOPER_CONFIG = path.resolve(root, config.developer.config_file);
+    if (config.developer.github_token) env.EVE_GITHUB_TOKEN = config.developer.github_token;
+  }
   const args = ['--state-dir', path.join(root, 'data', mode), '--agent', path.join(root, 'AGENT.md')];
   if (config.features.segmented) args.push('--segmented');
   if (mode === 'qq') {

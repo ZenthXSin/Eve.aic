@@ -96,6 +96,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --tool-forging 需同时指定实践运行环境；同一运行环境下反复出现的问题，由一次无工具模型请求锻造成只读草稿文件的检查规则，宿主用实践账本中的真实草稿回放验证（出现过问题的全部拦下、验证通过的一个不误报）后自动启用；之后的实践在实际运行前先经它检查，拦下的草稿不运行、带着说明交给草稿器修正。
 --plans 需同时开启受控研究或实践运行环境；/goal 保存的待办可以请模型建议多步计划（/plan propose 待办ID，每个待办版本至多一次、只建议不执行），确认后（/plan confirm 待办ID）由后台按依赖推进：计划只能使用已开启的受控研究与实践验证，步骤效果按研究与实践账本中的证据判定；/plans [待办ID] 查看进度与证据，/plan withdraw 待办ID 撤销。计划完成不改变待办状态。
 /tools 列出锻造的工具；/tool 工具ID 查看版本、回放验证与调用；/tool disable|rollback 工具ID、/tool enable 工具ID 版本 停用、回退或启用某个已验证版本。
+EVE_DEVELOPER_CONFIG 指定独立开发工具 JSON：源码工作区、操作者、命令/GitHub/升级开关与 token 环境引用；未配置时不注册。命令以宿主权限执行，仅供明确操作者；不是 QQ 测试环境开关。/help tools 查看实际已装配能力。
 明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
 --segmented 把模型回复按自然段分成至多 3 条消息，段间停顿至多 2.5 秒；命令确认整条发送。
 /segment 查看本会话分段；/segment on|off|reset、/segment parts 2至5、/segment pace 0至200（%）按会话保存，从下一条回复生效。
@@ -868,6 +869,7 @@ async fn run_qqbot_composed(
         }
         .tools();
         bootstrap.tools.extend(dialogue_tools);
+        crate::developer::install(&mut bootstrap, &options.state_directory)?;
         let tool_definitions: Vec<_> = std::iter::once(crate::services::echo_definition())
             .chain(bootstrap.tools.iter().map(|tool| tool.definition()))
             .collect();

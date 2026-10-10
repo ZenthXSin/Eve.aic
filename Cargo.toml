@@ -49,6 +49,8 @@ members = [
     "crates/runtime",
     "crates/eve-app",
     "crates/dialogue-tools",
+    "crates/developer-api",
+    "crates/developer-tools",
     "crates/qqbot-plugin",
     "crates/training-api",
     "crates/training-plugin",
