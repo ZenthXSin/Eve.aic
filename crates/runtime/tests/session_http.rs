@@ -73,7 +73,7 @@ async fn file_recovery_sends_paired_history_and_final_answer_phase_with_stable_p
     );
     let n = original.len() - 1;
     assert_eq!(
-        &tool_request["input"].as_array().unwrap()[n..],
+        &tool_request["input"].as_array().unwrap()[original.len()..],
         &recovered[n..n + 4]
     );
     assert_eq!(recovered[n]["call_id"], "call-b");
