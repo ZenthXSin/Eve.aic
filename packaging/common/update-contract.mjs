@@ -27,7 +27,7 @@ export function safeRelative(value) {
   return value;
 }
 export function currentManifest(value) {
-  if (!value || value.format_version !== 1 || TARGETS[value.platform_label] !== value.target || !stableVersion(value.version)) throw new Error('当前运行包没有有效稳定发行信息。');
+  if (!value || value.format_version !== 1 || !Object.hasOwn(TARGETS, value.platform_label) || TARGETS[value.platform_label] !== value.target || !stableVersion(value.version)) throw new Error('当前运行包没有有效稳定发行信息。');
   if (value.updater_protocol !== PROTOCOL || value.state_schema_generation !== 1) throw new Error('运行包更新协议不兼容。');
   return value;
 }

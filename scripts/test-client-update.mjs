@@ -6,7 +6,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { gzipSync, crc32 } from 'node:zlib';
 import { createUpdater, UpdateBusy } from '../packaging/common/Updater.mjs';
-import { updatePlan, compareVersions, safeRelative, verifyManifest, TARGETS } from '../packaging/common/update-contract.mjs';
+import { currentManifest, updatePlan, compareVersions, safeRelative, verifyManifest, TARGETS } from '../packaging/common/update-contract.mjs';
 import { unpack } from '../packaging/common/update-archive.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
@@ -93,6 +93,9 @@ test('稳定版本按数值比较，拒绝预发行、降级、错误平台和�
   assert.throws(() => updatePlan({ ...release, assets: [] }, base));
 });
 test('六个平台均选用对应原生资产', () => {
+  for (const platform_label of [undefined, 'unknown', '__proto__']) {
+    assert.throws(() => currentManifest({ ...base, platform_label, target: undefined }));
+  }
   for (const [label, target] of Object.entries(TARGETS)) {
     const release = releaseOf(Buffer.from('archive'), 'v2.0.0', label);
     assert.equal(updatePlan(release, { ...base, platform_label: label, target }).target, target);
