@@ -18,9 +18,15 @@ impl QqCommandHandler for Help {
         if words.first() != Some(&"/help") {
             return Ok(None);
         }
+        if words.as_slice() == ["/help", "identity"] {
+            return Ok(Some(format!(
+                "本会话宿主绑定的操作者标识：{}\n开发工具 operators 可填写这个标识；其他群/会话使用各自独立标识。",
+                input.session.user_id
+            )));
+        }
         if !matches!(words.as_slice(), ["/help"] | ["/help", "tools"]) {
             return Ok(Some(
-                "用法：/help 查看常用命令和实际对话工具；/help tools 查看工具说明。".into(),
+                "用法：/help 查看常用命令和实际对话工具；/help tools 查看工具说明；/help identity 查看本会话操作者标识。".into(),
             ));
         }
         let names = self

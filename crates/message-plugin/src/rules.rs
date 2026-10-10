@@ -2,6 +2,50 @@ use eve_message_api::*;
 use eve_message_diagnostics::RelationObservationGuard;
 use std::sync::Arc;
 pub struct RulesJudge;
+/// 只识别明确标签，避免从任意聊天猜测取消/更正。标签答复由路由器绑定最近待澄清原文。
+pub(crate) fn classification_reply(text: &str) -> Option<MessageIntent> {
+    match text.trim().trim_end_matches(['。', '.', '！', '!']) {
+        "补充" | "这是补充" | "这是补充，继续原任务" => {
+            Some(MessageIntent::Supplement)
+        }
+        "纠正" | "这是纠正" => Some(MessageIntent::Correction),
+        "澄清答复" | "这是澄清答复" => Some(MessageIntent::Answer),
+        "新任务" | "这是新任务" => Some(MessageIntent::NewTask),
+        _ => None,
+    }
+}
+fn natural(text: &str) -> Option<(MessageIntent, Option<usize>)> {
+    if let Some(intent) = classification_reply(text) {
+        return Some((intent, Some(0)));
+    }
+    for (prefix, intent) in [
+        ("补充：", MessageIntent::Supplement),
+        ("补充:", MessageIntent::Supplement),
+        ("这是补充：", MessageIntent::Supplement),
+        ("我补充一下：", MessageIntent::Supplement),
+        ("纠正：", MessageIntent::Correction),
+        ("纠正:", MessageIntent::Correction),
+        ("这是纠正：", MessageIntent::Correction),
+        ("前面说错了：", MessageIntent::Correction),
+        ("答复：", MessageIntent::Answer),
+        ("这是澄清答复：", MessageIntent::Answer),
+        ("新任务：", MessageIntent::NewTask),
+        ("新任务:", MessageIntent::NewTask),
+        ("先停下，改做：", MessageIntent::NewTask),
+    ] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                return Some((intent, Some(text.len() - rest.len())));
+            }
+        }
+    }
+    match text {
+        "继续原任务" | "继续" => Some((MessageIntent::Continue, None)),
+        "取消当前任务" | "停止当前任务" => Some((MessageIntent::Cancel, None)),
+        _ => None,
+    }
+}
 impl RelationJudge for RulesJudge {
     fn judge(&self, input: RelationInput) -> RelationFuture<'_> {
         self.judge_observed(input, Arc::new(DiscardRelationObservations))
@@ -55,6 +99,18 @@ impl RelationJudge for RulesJudge {
                                 span,
                             }
                         }
+                        _ if natural(trimmed).is_some() => {
+                            let (intent, start) = natural(trimmed).expect("checked natural marker");
+                            let base = offset + line.len() - line.trim_start().len();
+                            IntentPart {
+                                intent,
+                                confidence: 100,
+                                span: start.map(|start| TextSpan {
+                                    start: base + start,
+                                    end: base + trimmed.len(),
+                                }),
+                            }
+                        }
                         _ => IntentPart {
                             intent: MessageIntent::Ambiguous,
                             confidence: 0,
@@ -78,7 +134,9 @@ impl RelationJudge for RulesJudge {
                     target: input.message.target.clone(),
                     message_id: input.message.message_id.clone(),
                     parts,
-                    explanation: "根据逐行明确命令判断；其他文字需要澄清。".into(),
+                    explanation:
+                        "根据逐行明确命令或明确中文关系标记判断；其他文字由可选语义判断处理。"
+                            .into(),
                 };
                 decision.validate(&input)?;
                 Ok(decision)

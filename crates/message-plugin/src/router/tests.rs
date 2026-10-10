@@ -237,6 +237,63 @@ fn message(control: &Control, text: &str) -> IncomingMessage {
         reply_to: None,
     }
 }
+
+#[tokio::test]
+async fn natural_label_reply_uses_latest_clarification_source_instead_of_label_text() {
+    for label in [
+        "这是补充，继续原任务",
+        "这是纠正",
+        "这是新任务",
+        "这是澄清答复",
+    ] {
+        let control = Control::new(None);
+        let router = router(control.clone(), Arc::new(RulesJudge));
+        let ticket = router
+            .submit(
+                message(&control, "请也处理这份源码"),
+                Arc::new(DiscardControlEvents),
+            )
+            .unwrap();
+        let report = bounded(router.wait(&ticket)).await.unwrap();
+        assert!(matches!(report.outcome, RouteOutcome::Clarify { .. }));
+        let mut followup = message(&control, label);
+        followup.message_id = "label-reply".into();
+        let ticket = router
+            .submit(followup, Arc::new(DiscardControlEvents))
+            .unwrap();
+        let report = bounded(router.wait(&ticket)).await.unwrap();
+        assert!(
+            matches!(report.outcome, RouteOutcome::Replaced { .. }),
+            "{report:?}"
+        );
+        let submitted = control.submissions.lock().unwrap();
+        let text = &submitted.last().unwrap().session.text;
+        assert!(text.contains("请也处理这份源码"));
+        assert!(!text.contains(label));
+    }
+}
+
+#[tokio::test]
+async fn classification_without_question_does_not_cancel_or_invent_a_request() {
+    let control = Control::new(None);
+    let router = router(control.clone(), Arc::new(RulesJudge));
+    let ticket = router
+        .submit(
+            message(&control, "这是补充，继续原任务"),
+            Arc::new(DiscardControlEvents),
+        )
+        .unwrap();
+    let report = bounded(router.wait(&ticket)).await.unwrap();
+    assert!(matches!(
+        report.outcome,
+        RouteOutcome::Clarify {
+            reason: ClarifyReason::MissingQuestion,
+            ..
+        }
+    ));
+    assert_eq!(control.cancellations.load(Ordering::SeqCst), 0);
+    assert!(control.submissions.lock().unwrap().is_empty());
+}
 async fn bounded<F: Future>(future: F) -> F::Output {
     tokio::time::timeout(Duration::from_secs(2), future)
         .await

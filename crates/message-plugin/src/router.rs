@@ -318,12 +318,16 @@ impl Inner {
             .parts
             .iter()
             .any(|p| p.intent == MessageIntent::Answer);
-        let question = if answer {
+        let classification_reply = crate::rules::classification_reply(&m.text).is_some();
+        let question = if answer || classification_reply {
             let book = self.book.lock().map_err(|_| MessageError::Unavailable)?;
             let question = book
                 .questions
                 .get(&m.target.session.session_id)
-                .filter(|q| q.target == m.target && Some(&q.id) == m.reply_to.as_ref())
+                .filter(|q| {
+                    q.target == m.target
+                        && (classification_reply || Some(&q.id) == m.reply_to.as_ref())
+                })
                 .cloned();
             if question.is_none() {
                 return report(
@@ -339,13 +343,17 @@ impl Inner {
             Action::New => Some(ControlInput {
                 session: SessionInput {
                     key: m.target.session.clone(),
-                    text: decision
-                        .parts
-                        .iter()
-                        .find(|p| p.intent == MessageIntent::NewTask)
-                        .and_then(|p| p.span)
-                        .map(|s| m.text[s.start..s.end].to_string())
-                        .expect("validated new intent"),
+                    text: if classification_reply {
+                        question.as_ref().expect("checked question").source.clone()
+                    } else {
+                        decision
+                            .parts
+                            .iter()
+                            .find(|p| p.intent == MessageIntent::NewTask)
+                            .and_then(|p| p.span)
+                            .map(|s| m.text[s.start..s.end].to_string())
+                            .expect("validated new intent")
+                    },
                 },
                 task_id: m.message_id.clone(),
             }),
@@ -360,7 +368,12 @@ impl Inner {
                     .into_iter()
                     .map(|p| {
                         let s = p.span.expect("filtered");
-                        json!({"kind":p.intent,"text":&m.text[s.start..s.end]})
+                        let text = if classification_reply {
+                            question.as_ref().expect("checked question").source.as_str()
+                        } else {
+                            &m.text[s.start..s.end]
+                        };
+                        json!({"kind":p.intent,"text":text})
                     })
                     .collect::<Vec<_>>();
                 let text=json!({"request_kind":"revision","base_request":now.input_text,"changes":changes,
@@ -616,11 +629,15 @@ fn clarify(
     prior: Option<Box<ControlReport>>,
 ) -> RouteOutcome {
     let prompt = match reason {
-        ClarifyReason::SideEffects => "已有工具执行或副作用未知；请确认接下来要执行的新任务。",
+        ClarifyReason::SideEffects => {
+            "刚才已有工具执行，重新运行可能重复操作。要继续处理新要求，请发“新任务：……”或 /new 内容；已发生的操作不会自动撤销。"
+        }
         ClarifyReason::MissingQuestion => "请引用当前任务最近一次澄清问题，或明确说明新要求。",
         ClarifyReason::Unsupported => "尚未支持任务暂停恢复；请明确继续、取消或开始新任务。",
         ClarifyReason::TooLarge => "组合后的请求过长；请提供精简的新要求。",
-        _ => "请明确这条消息是补充、纠正、澄清答复还是新任务。",
+        _ => {
+            "你这条是在补充刚才的要求，还是想换个任务？可以直接回“这是补充，继续原任务”或“这是新任务”；也可以说“纠正：……”并说明改哪里。不需要特殊格式。"
+        }
     };
     RouteOutcome::Clarify {
         reason,

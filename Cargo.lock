@@ -283,6 +283,8 @@ dependencies = [
  "eve-config-plugin",
  "eve-control-api",
  "eve-control-plugin",
+ "eve-developer-api",
+ "eve-developer-tools",
  "eve-dialogue-tools",
  "eve-file-observer",
  "eve-interest-api",
@@ -436,6 +438,29 @@ dependencies = [
  "eve-plugin-api",
  "eve-session-api",
  "getrandom 0.4.3",
+ "tokio",
+]
+
+[[package]]
+name = "eve-developer-api"
+version = "0.1.0"
+dependencies = [
+ "eve-llm-api",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eve-developer-tools"
+version = "0.1.0"
+dependencies = [
+ "eve-developer-api",
+ "eve-llm-api",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

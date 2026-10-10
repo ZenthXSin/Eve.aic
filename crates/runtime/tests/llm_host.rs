@@ -597,6 +597,98 @@ async fn reports_provider_error_timeout_and_round_limit() {
 }
 
 #[tokio::test]
+async fn multiple_tool_batches_keep_paired_history_and_all_diagnostics() {
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("read-one", "echo", json!({"step":1}))]),
+        tool_response(vec![call("write-two", "echo", json!({"step":2}))]),
+        tool_response(vec![call("verify-three", "echo", json!({"step":3}))]),
+        final_response("已按实际结果完成"),
+    ]);
+    let tool = Arc::new(TestTool::new(
+        "echo",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    ));
+    let (host, context, _) = make_host(
+        provider.clone(),
+        vec![tool],
+        LlmHostConfig {
+            max_tool_rounds: 3,
+            ..LlmHostConfig::default()
+        },
+    )
+    .await;
+    let output = host.run_turn(turn()).await.unwrap();
+    assert_eq!(output.diagnostics.tool_batches, 3);
+    assert_eq!(output.diagnostics.started_tools, 3);
+    assert_eq!(output.diagnostics.provider_requests, 4);
+    assert_eq!(context.snapshots.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        output
+            .diagnostics
+            .calls
+            .iter()
+            .map(|c| c.ordinal)
+            .collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    assert_eq!(
+        output
+            .diagnostics
+            .tool_results
+            .iter()
+            .map(|r| r.call_id.as_str())
+            .collect::<Vec<_>>(),
+        ["read-one", "write-two", "verify-three"]
+    );
+    assert_eq!(output.transcript.len(), 8);
+    for request in provider.requests.lock().unwrap().iter() {
+        request.validate().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn repeated_ids_and_round_overflow_never_execute_the_next_batch() {
+    for same_id in [true, false] {
+        let provider = RecordingProvider::scripted(vec![
+            tool_response(vec![call("first", "echo", json!({}))]),
+            tool_response(vec![call(
+                if same_id { "first" } else { "second" },
+                "echo",
+                json!({}),
+            )]),
+            tool_response(vec![call("overflow", "echo", json!({}))]),
+        ]);
+        let tool = Arc::new(TestTool::new(
+            "echo",
+            Some(ToolConcurrency::ParallelSafe),
+            ToolMode::Echo,
+        ));
+        let (host, _, _) = make_host(
+            provider,
+            vec![tool],
+            LlmHostConfig {
+                max_tool_rounds: 2,
+                ..LlmHostConfig::default()
+            },
+        )
+        .await;
+        let failure = host.run_turn(turn()).await.unwrap_err();
+        if same_id {
+            assert!(matches!(failure.error, LlmError::Protocol(_)));
+            assert_eq!(failure.diagnostics.started_tools, 1);
+        } else {
+            assert_eq!(failure.error, LlmError::RoundLimit);
+            assert_eq!(failure.diagnostics.started_tools, 2);
+        }
+        assert_eq!(
+            failure.diagnostics.tool_results.len(),
+            failure.diagnostics.started_tools
+        );
+    }
+}
+
+#[tokio::test]
 async fn tool_timeout_requests_cancellation_and_preserves_call_id() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let provider = RecordingProvider::scripted(vec![
