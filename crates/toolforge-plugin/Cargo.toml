@@ -1,0 +1,22 @@
+[package]
+name = "eve-toolforge-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-toolforge-api = { path = "../toolforge-api" }
+eve-practice-api = { path = "../practice-api" }
+eve-plugin-api = { path = "../plugin-api" }
+eve-llm-api = { path = "../llm-api" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+eve-kernel = { path = "../kernel" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+serde_json.workspace = true
+eve-practice-plugin = { path = "../practice-plugin" }

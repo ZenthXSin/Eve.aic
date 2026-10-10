@@ -1,7 +1,7 @@
 use crate::{
     AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_cognition, qq_interest,
     qq_learning, qq_learning_commands, qq_memory, qq_memory_observer, qq_outreach, qq_practice,
-    qq_research, qq_skill, segment_commands,
+    qq_research, qq_skill, qq_tools, segment_commands,
 };
 use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
@@ -51,13 +51,15 @@ use eve_skill_plugin::{
     Consolidator, ModelSkillDistiller, ModelSkillSelector, SkillAwareDrafter, SkillPlugin,
     SkillTool,
 };
+use eve_toolforge_api::{TOOLFORGE_PLUGIN_ID, ToolAdmin, ToolForger};
+use eve_toolforge_plugin::{Forge, ForgedChecks, ModelToolForger, ToolForgePlugin};
 use eve_training_api::{TRAINING_PLUGIN_ID, TRAINING_SERVICE_ID, TrainingServiceHandle};
 use eve_training_plugin::{TrainingContext, TrainingPlugin};
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -87,6 +89,8 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --outreach-proactive-after-ms 需同时 --outreach；邀请在被动窗口等待超过该时间仍未送达时主动私聊一次（受平台配额与用户开关限制，被拒绝时保持待投递）。
 /outreach 查看邀请状态与回执；/outreach off 请 Eve 不再主动提起，/outreach on 恢复。
 /skills 列出技能；/skill 技能ID 查看版本、验证证据、启用记录与调用；/skill disable|rollback 技能ID、/skill enable 技能ID 版本 停用、回退或启用某个已验证版本。
+--tool-forging 需同时指定实践运行环境；同一运行环境下反复出现的问题，由一次无工具模型请求锻造成只读草稿文件的检查规则，宿主用实践账本中的真实草稿回放验证（出现过问题的全部拦下、验证通过的一个不误报）后自动启用；之后的实践在实际运行前先经它检查，拦下的草稿不运行、带着说明交给草稿器修正。
+/tools 列出锻造的工具；/tool 工具ID 查看版本、回放验证与调用；/tool disable|rollback 工具ID、/tool enable 工具ID 版本 停用、回退或启用某个已验证版本。
 明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
 --segmented 把模型回复按自然段分成至多 3 条消息，段间停顿至多 2.5 秒；命令确认整条发送。
 /segment 查看本会话分段；/segment on|off|reset、/segment parts 2至5、/segment pace 0至200（%）按会话保存，从下一条回复生效。
@@ -124,6 +128,8 @@ pub struct QqBotOptions {
     pub practice_java_args: Vec<OsString>,
     /// 把已验证的实践固化为技能并在后续任务中复用；需要实践验证。
     pub skill_learning: bool,
+    /// 把反复出现的问题锻造成运行前检查工具；需要实践验证。
+    pub tool_forging: bool,
     /// 学习目标取得实际验证的进展后择机邀请用户；需要实践验证。
     pub outreach: bool,
     /// 同一用户两次送达之间的最短间隔；未提供时为 24 小时。
@@ -159,6 +165,7 @@ impl Default for QqBotOptions {
             practice_java: None,
             practice_java_args: Vec::new(),
             skill_learning: false,
+            tool_forging: false,
             outreach: false,
             outreach_cooldown_ms: None,
             outreach_proactive_after_ms: None,
@@ -211,6 +218,10 @@ impl QqBotOptions {
             }
             if arg == "--skill-learning" {
                 options.skill_learning = true;
+                continue;
+            }
+            if arg == "--tool-forging" {
+                options.tool_forging = true;
                 continue;
             }
             if arg == "--outreach" {
@@ -336,6 +347,9 @@ impl QqBotOptions {
         if options.skill_learning && !runtime {
             return Err("--skill-learning 需要同时指定实践运行环境（--practice-mindustry-server 或 --practice-browser）".into());
         }
+        if options.tool_forging && !runtime {
+            return Err("--tool-forging 需要同时指定实践运行环境（--practice-mindustry-server 或 --practice-browser）".into());
+        }
         if (options.outreach_cooldown_ms.is_some() || options.outreach_proactive_after_ms.is_some())
             && !options.outreach
         {
@@ -377,6 +391,8 @@ pub struct InterestComponents {
     /// 替换技能提炼器与选择器；默认各使用主模型的单次无工具请求。是否固化技能仍由 --skill-learning 决定。
     pub distiller: Option<Arc<dyn SkillDistiller>>,
     pub skill_selector: Option<Arc<dyn SkillSelector>>,
+    /// 替换工具锻造器；默认使用主模型的单次无工具请求。是否锻造仍由 --tool-forging 决定。
+    pub forger: Option<Arc<dyn ToolForger>>,
     /// 替换邀请撰写器、时机判断器与回应识别器；默认各使用主模型的单次无工具请求。
     /// 是否主动交流仍由 --outreach 决定。
     pub composer: Option<Arc<dyn InvitationComposer>>,
@@ -498,6 +514,9 @@ async fn run_qqbot_composed(
     }
     if options.skill_learning && !practice_enabled {
         return Err("技能固化需要同时开启实践验证".into());
+    }
+    if options.tool_forging && !practice_enabled {
+        return Err("工具锻造需要同时开启实践验证".into());
     }
     if options.outreach && !practice_enabled {
         return Err("主动交流需要同时开启实践验证".into());
@@ -646,6 +665,16 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        // 工具账本同样先于通道加载；损坏时拒绝启动并保留原字节。
+        let tools = if options.tool_forging {
+            let plugin = ToolForgePlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(TOOLFORGE_PLUGIN_ID)?).await?;
+            Some(controller)
+        } else {
+            None
+        };
         // 邀请账本同样先于通道加载；损坏时拒绝启动并保留原字节。
         let outreach = if options.outreach {
             let plugin = OutreachPlugin::new()?;
@@ -786,6 +815,7 @@ async fn run_qqbot_composed(
             runner: practice_runner,
             distiller: skill_distiller,
             skill_selector,
+            forger: tool_forger,
             composer: invitation_composer,
             timing_judge,
             response_judge,
@@ -910,11 +940,30 @@ async fn run_qqbot_composed(
                 }
                 None => None,
             };
-            let practitioner = Arc::new(Practitioner::new(
-                Arc::new(practice.clone()),
-                drafter,
-                runner,
-            ));
+            let mut practitioner =
+                Practitioner::new(Arc::new(practice.clone()), drafter, runner.clone());
+            let forging = match &tools {
+                Some(tools) => {
+                    let admin: Arc<dyn ToolAdmin> = Arc::new(tools.clone());
+                    let forger: Arc<dyn ToolForger> = match tool_forger {
+                        Some(forger) => forger,
+                        None => Arc::new(ModelToolForger::new(core_resolver()?)),
+                    };
+                    // 已启用的锻造工具在实际运行前检查草稿；拦下的草稿不运行。
+                    practitioner =
+                        practitioner.with_check(Arc::new(ForgedChecks::new(admin.clone())));
+                    Some(qq_practice::Forging {
+                        forge: Arc::new(Forge::new(
+                            admin.clone(),
+                            forger,
+                            runner.profile().clone(),
+                        )),
+                        admin,
+                    })
+                }
+                None => None,
+            };
+            let practitioner = Arc::new(practitioner);
             practice_background = Some(qq_practice::Background::start(qq_practice::Services {
                 practice: Arc::new(practice.clone()),
                 cognition,
@@ -924,6 +973,7 @@ async fn run_qqbot_composed(
                 practitioner,
                 workspace_root: options.state_directory.join("practice-work"),
                 skills: skill_parts,
+                forging,
             }));
             qq_practice::Commands::enabled(Arc::new(interests.clone()), Arc::new(practice.clone()))
         } else {
@@ -933,6 +983,11 @@ async fn run_qqbot_composed(
             .as_ref()
             .map_or_else(qq_skill::Commands::disabled, |skills| {
                 qq_skill::Commands::enabled(Arc::new(skills.clone()))
+            });
+        let tool_commands = tools
+            .as_ref()
+            .map_or_else(qq_tools::Commands::disabled, |tools| {
+                qq_tools::Commands::enabled(Arc::new(tools.clone()))
             });
         let outreach_policy = OutreachPolicy {
             cooldown_ms: options
@@ -1016,6 +1071,7 @@ async fn run_qqbot_composed(
             research_commands,
             practice_commands,
             skill_commands,
+            tool_commands,
             outreach_commands,
             segment_commands,
         ])));
@@ -1532,6 +1588,23 @@ mod recall_options_tests {
         ])
         .unwrap();
         assert!(options.skill_learning);
+    }
+
+    #[test]
+    fn tool_forging_is_explicit_and_requires_a_practice_runtime() {
+        assert!(!parse(&[]).unwrap().tool_forging);
+        let error = parse(&["--interest-learning", "--tool-forging"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--tool-forging"));
+        let options = parse(&[
+            "--interest-learning",
+            "--practice-browser",
+            "chrome",
+            "--tool-forging",
+        ])
+        .unwrap();
+        assert!(options.tool_forging && !options.skill_learning);
     }
 
     #[test]

@@ -23,6 +23,7 @@ mod qq_outreach;
 mod qq_practice;
 mod qq_research;
 mod qq_skill;
+mod qq_tools;
 mod qqbot;
 mod segment_advice;
 mod segment_commands;

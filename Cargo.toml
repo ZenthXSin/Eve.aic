@@ -19,6 +19,8 @@ members = [
     "crates/practice-browser",
     "crates/skill-api",
     "crates/skill-plugin",
+    "crates/toolforge-api",
+    "crates/toolforge-plugin",
     "crates/outreach-api",
     "crates/outreach-plugin",
     "crates/plugin-api",
