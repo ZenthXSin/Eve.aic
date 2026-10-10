@@ -1037,9 +1037,64 @@
     const learningBox = node("section", "goal-section");
     learningBox.id = "memory-learning";
     learningBox.append(node("h3", "", "学习候选"), node("p", "muted", "正在读取偏好提炼记录…"));
-    detail.append(learningBox, evidenceBox);
+    const autonomyBox = node("section", "goal-section");
+    autonomyBox.id = "memory-autonomy";
+    autonomyBox.append(node("h3", "", "自主学习"), node("p", "muted", "正在读取兴趣、知识、实践、技能与邀请…"));
+    detail.append(learningBox, autonomyBox, evidenceBox);
     $("memory-detail").replaceChildren(heading, detail);
     void loadLearning(body.scope, memoryRequest);
+    void loadAutonomy(body.scope, memoryRequest);
+  }
+
+  const autonomyLabels = {
+    interest: { active: "进行中", withdrawn: "已撤回" },
+    practice: { running: "运行中", verified: "已验证", unverified: "未验证", not_applicable: "不适用", failed: "失败", interrupted: "中断" },
+    invitation: { composing: "撰写中", pending: "等待时机", delivering: "发送中", delivered: "已送达", unknown: "结果未知", cancelled: "已取消", failed: "失败", interrupted: "中断" },
+    feedback: { request: "提出了想法", interested: "有兴趣", declined: "不需要", bad_timing: "当时不方便", unrelated: "没有回应" },
+  };
+
+  async function loadAutonomy(scope, request) {
+    const requestEpoch = epoch;
+    try {
+      const body = await api("/api/memory/autonomy", { scope });
+      if (request !== memoryRequest || requestEpoch !== epoch || !$("memory-autonomy")) return;
+      if (!body || !["interests", "knowledge", "practice", "skills", "invitations"].every((key) => Array.isArray(body[key]))) {
+        throw new ApiError("自主学习记录格式无效，请刷新重试。");
+      }
+      renderAutonomy(body);
+    } catch (error) {
+      if (request !== memoryRequest || requestEpoch !== epoch || error.silent || !$("memory-autonomy")) return;
+      const unavailable = error instanceof ApiError && error.message.startsWith("当前服务暂不可用");
+      $("memory-autonomy").replaceChildren(node("h3", "", "自主学习"),
+        node("p", unavailable ? "muted" : "inline-error", unavailable ? "未开启兴趣学习（需以 --interest-learning 启动），或记录暂时无法读取。" : errorText(error)));
+    }
+  }
+
+  function renderAutonomy(body) {
+    const box = $("memory-autonomy");
+    const parts = [node("h3", "", "自主学习")];
+    const list = (title, rows) => {
+      parts.push(node("h4", "", title));
+      if (!rows.length) { parts.push(node("p", "muted", "暂无记录。")); return; }
+      const container = node("div", "record-list");
+      for (const [name, meta] of rows) {
+        const row = node("div", "record-row");
+        row.append(node("span", "record-name", name), node("span", "record-meta", meta));
+        container.append(row);
+      }
+      parts.push(container);
+    };
+    list("兴趣", body.interests.map((item) => [`${text(item.topic)}（${label(autonomyLabels.interest, item.status)}）`,
+      `原话：${item.quotes.map((quote) => `“${text(quote)}”`).join("；") || "—"} · ${goalDate(item.updated_at_ms)}`]));
+    list("领域知识", body.knowledge.map((item) => [text(item.statement),
+      `${item.source_quoted ? "附来源原文" : "未验证推测"}${item.version ? ` · 版本 ${text(item.version)}` : ""}${item.url ? ` · ${text(item.url)}` : ""}`]));
+    list("实践", body.practice.map((item) => [`${item.follow_up ? "后续创作" : "学习目标"} · ${label(autonomyLabels.practice, item.status)}`,
+      `尝试 ${count(item.attempts)} 次 · 探测 ${count(item.probes_passed)}/${count(item.probes_total)} 通过${item.runtime_version ? ` · ${text(item.runtime_version)}` : ""} · ${goalDate(item.started_at_ms)}`]));
+    list("技能", body.skills.map((item) => [`${text(item.name)}${item.enabled ? `（启用第 ${count(item.enabled)} 版）` : "（已停用）"}`,
+      `${count(item.versions)} 个版本 · 后台调用 ${count(item.task_verified)}/${count(item.task_invocations)} 通过 · 对话调用 ${count(item.tool_verified)}/${count(item.tool_calls)} 通过`]));
+    list("主动邀请", body.invitations.map((item) => [`${label(autonomyLabels.invitation, item.status)}${item.feedback ? ` · 回应：${label(autonomyLabels.feedback, item.feedback)}` : ""}`,
+      `${item.text ? text(item.text) : "—"}${item.quote ? ` · 原话“${text(item.quote)}”` : ""}${item.delivered_at_ms ? ` · ${goalDate(item.delivered_at_ms)}` : ""}`]));
+    box.replaceChildren(...parts);
   }
 
   async function loadLearning(scope, request) {

@@ -394,6 +394,69 @@ pub struct LearningCandidateView {
     pub decisions: Vec<LearningDecisionView>,
     pub decisions_total: usize,
 }
+/// 一个用户的自主学习进展：兴趣、领域知识、实践、技能与主动邀请；只读。
+#[derive(Clone, Debug, Serialize)]
+pub struct AutonomyView {
+    pub scope: MemoryScope,
+    pub interests: Vec<AutonomyInterest>,
+    pub knowledge: Vec<AutonomyKnowledge>,
+    /// 新的在前。
+    pub practice: Vec<AutonomyPractice>,
+    pub skills: Vec<AutonomySkill>,
+    /// 新的在前。
+    pub invitations: Vec<AutonomyInvitation>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct AutonomyInterest {
+    pub id: String,
+    pub topic: String,
+    pub status: &'static str,
+    /// 用户原话，至多 3 条。
+    pub quotes: Vec<String>,
+    pub updated_at_ms: u64,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct AutonomyKnowledge {
+    pub statement: String,
+    /// 附有可核对的来源原文。
+    pub source_quoted: bool,
+    pub url: Option<String>,
+    pub version: Option<String>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct AutonomyPractice {
+    pub id: String,
+    /// 用户回应邀请时提出想法派生的后续创作。
+    pub follow_up: bool,
+    pub status: &'static str,
+    pub attempts: usize,
+    pub runtime_version: Option<String>,
+    pub probes_passed: usize,
+    pub probes_total: usize,
+    pub started_at_ms: u64,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct AutonomySkill {
+    pub id: String,
+    pub name: String,
+    pub enabled: Option<u32>,
+    pub versions: usize,
+    pub task_invocations: usize,
+    pub task_verified: usize,
+    pub tool_calls: usize,
+    pub tool_verified: usize,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct AutonomyInvitation {
+    pub id: String,
+    pub status: &'static str,
+    pub text: Option<String>,
+    pub delivered_at_ms: Option<u64>,
+    /// 识别出的回应类别与用户原话。
+    pub feedback: Option<&'static str>,
+    pub quote: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct LearningView {
     pub scope: MemoryScope,
@@ -468,6 +531,9 @@ pub trait PanelService: Send + Sync {
         Err(PanelError::Unavailable)
     }
     /// 已存在作用域的偏好提炼批次、候选与学习决策；未开启偏好提炼的实现返回 Unavailable。
+    fn memory_autonomy(&self, _scope: &MemoryScope) -> PanelResult<AutonomyView> {
+        Err(PanelError::Unavailable)
+    }
     fn memory_learning(&self, _scope: &MemoryScope) -> PanelResult<LearningView> {
         Err(PanelError::Unavailable)
     }
