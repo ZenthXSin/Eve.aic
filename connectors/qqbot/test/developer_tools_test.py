@@ -31,6 +31,9 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
                      env_extra={"EVE_DEVELOPER_CONFIG": str(self.developer_config)})
 
     def test_actual_three_step_edit_command_and_restart_keep_complete_history_without_replay(self):
+        config = json.loads(self.developer_config.read_text())
+        config["storage_directory"] = str(self.work / "developer-data")
+        self.developer_config.write_text(json.dumps(config))
         names = {"echo", "search_memory", "list_files", "read_file", "write_file",
                  "run_command", "github_api", "prepare_self_upgrade"}
         def respond(body):
@@ -54,7 +57,8 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         self.enabled([*self.send(self.message("help", "/help tools", contains=["8 个", "github_api", "run_command"])),
                       *self.send(self.message("edit", "修改源码并执行验证", expected="实际读写和命令已完成"))])
         self.assertEqual(self.chat_rounds, 4)
-        journal = self.work / "state/developer-tools/operations.jsonl"
+        journal = self.work / "developer-data/operations.jsonl"
+        self.assertFalse((self.work / "state/developer-tools").exists())
         before = journal.read_bytes()
         def restored(body):
             self.current_capabilities(body)

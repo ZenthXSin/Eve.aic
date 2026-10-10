@@ -11,6 +11,9 @@ use std::{
 #[serde(deny_unknown_fields)]
 pub struct DeveloperConfig {
     pub workspace: PathBuf,
+    /// 独立持久账本/候选目录；None 时由宿主使用状态目录下的 developer-tools。
+    #[serde(default)]
+    pub storage_directory: Option<PathBuf>,
     pub operators: BTreeSet<String>,
     #[serde(default)]
     pub commands: bool,
@@ -47,6 +50,10 @@ fn cargo() -> String {
 impl DeveloperConfig {
     pub fn validate(&self) -> Result<(), &'static str> {
         if !self.workspace.is_absolute()
+            || self
+                .storage_directory
+                .as_ref()
+                .is_some_and(|p| !p.is_absolute())
             || self.operators.is_empty()
             || self.operators.iter().any(|s| {
                 s.is_empty() || s.len() > 256 || s.trim() != s || s.chars().any(char::is_control)
@@ -142,4 +149,24 @@ pub trait DeveloperBackend: Send + Sync {
         operation: DeveloperOperation,
         context: ToolExecutionContext,
     ) -> ToolFuture<'_>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn host_configuration_accepts_separate_durable_storage_and_rejects_other_secret_references() {
+        let base =
+            serde_json::json!({"workspace":std::env::current_dir().unwrap(),"operators":["owner"]});
+        let mut config: DeveloperConfig = serde_json::from_value(base).unwrap();
+        assert!(config.storage_directory.is_none());
+        config.validate().unwrap();
+        config.storage_directory = Some(std::env::temp_dir());
+        config.validate().unwrap();
+        config.storage_directory = Some("relative".into());
+        assert!(config.validate().is_err());
+        config.storage_directory = None;
+        config.github_token_env = "QQBOT_APP_SECRET".into();
+        assert!(config.validate().is_err());
+    }
 }

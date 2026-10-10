@@ -9,6 +9,7 @@ use tokio::{
 fn config(root: &Path) -> DeveloperConfig {
     DeveloperConfig {
         workspace: root.into(),
+        storage_directory: None,
         operators: BTreeSet::from(["owner".into()]),
         commands: true,
         github: true,

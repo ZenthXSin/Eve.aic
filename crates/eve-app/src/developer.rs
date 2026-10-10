@@ -20,9 +20,13 @@ pub(crate) fn install(bootstrap: &mut CoreBootstrap, state: &Path) -> Result<(),
     {
         return Err("配置了 GitHub 写仓库，但对应的凭据环境变量为空".into());
     }
+    let storage = config
+        .storage_directory
+        .clone()
+        .unwrap_or_else(|| state.join("developer-tools"));
     let backend = Arc::new(eve_developer_tools::LocalDeveloper::new(
         config.clone(),
-        state.join("developer-tools"),
+        storage,
         token,
     )?);
     bootstrap.host_config.max_tool_rounds = config.max_tool_rounds;
