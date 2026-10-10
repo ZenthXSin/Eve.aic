@@ -98,7 +98,8 @@ pub(crate) struct Appended {
 }
 
 /// 把邀请作为最后一段附在回复后；原回复的片段与停顿不变。`base` 为原回复的规划器与片段，
-/// 没有时整条回复（去掉首尾空白）为一段。结果不满足回执的片段规则时返回 None。
+/// 没有时整条回复（去掉首尾空白）为一段。邀请段前的停顿沿用原回复规划中最长的段间停顿
+/// （来自用户的分段节奏偏好），原回复只有一段时用默认停顿。结果不满足回执的片段规则时返回 None。
 pub(crate) fn append(
     reply: &str,
     base: Option<(&str, BaseParts)>,
@@ -129,7 +130,13 @@ pub(crate) fn append(
     if text.len() > 32768 {
         return None;
     }
-    parts.push((start..text.len(), QQ_OUTREACH_PAUSE_MS));
+    let pause = parts
+        .iter()
+        .map(|(_, pause)| *pause)
+        .max()
+        .filter(|pause| *pause > 0)
+        .unwrap_or(QQ_OUTREACH_PAUSE_MS);
+    parts.push((start..text.len(), pause));
     eve_segment_api::validate_ranges(&text, parts.iter().map(|(range, _)| range.clone()), 32768)
         .ok()?;
     let part = parts.len() - 1;
@@ -170,7 +177,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(appended.planner, "paragraph-v1");
-        assert_eq!(appended.pauses, vec![0, 800, QQ_OUTREACH_PAUSE_MS]);
+        assert_eq!(appended.pauses, vec![0, 800, 800], "沿用已学的段间节奏");
         assert_eq!(&appended.text[appended.ranges[2].clone()], "一起来？");
     }
 
