@@ -4,6 +4,7 @@ mod invocation;
 mod model;
 mod store;
 mod strict_json;
+mod tool;
 
 pub use consolidator::{Candidate, Consolidator};
 use eve_plugin_api::{
@@ -16,6 +17,7 @@ pub use invocation::{Clock, SkillAwareDrafter, settle};
 pub use model::{DISTILLER_VERSION, ModelSkillDistiller, ModelSkillSelector, SELECTOR_VERSION};
 use std::sync::{Arc, Mutex};
 use store::StoredSkills;
+pub use tool::{SKILL_TOOL_NAME, SkillTool};
 
 /// 管理能力只交给可信宿主，不发布到通用服务目录。
 #[derive(Clone, Default)]
@@ -106,6 +108,27 @@ impl SkillAdmin for SkillController {
     }
     fn settle(&self, id: &str, at_ms: u64, outcome: InvocationOutcome) -> SkillResult<Selection> {
         self.service()?.settle(id, at_ms, outcome)
+    }
+    fn begin_tool_call(
+        &self,
+        id: &str,
+        owner: &str,
+        skill: SkillRef,
+        arguments: Arguments,
+        now_ms: u64,
+    ) -> SkillResult<ToolCallRecord> {
+        self.service()?
+            .begin_tool_call(id, owner, skill, arguments, now_ms)
+    }
+    fn record_tool_call(
+        &self,
+        id: &str,
+        at_ms: u64,
+        outcome: InvocationOutcome,
+        evidence: Option<RunEvidence>,
+    ) -> SkillResult<ToolCallRecord> {
+        self.service()?
+            .record_tool_call(id, at_ms, outcome, evidence)
     }
 }
 

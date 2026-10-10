@@ -17,6 +17,8 @@ struct Ledger {
     skills: Vec<Skill>,
     distillations: Vec<Distillation>,
     selections: Vec<Selection>,
+    #[serde(default)]
+    tool_calls: Vec<ToolCallRecord>,
 }
 impl Ledger {
     fn snapshot(&self) -> SkillSnapshot {
@@ -24,6 +26,7 @@ impl Ledger {
             skills: self.skills.clone(),
             distillations: self.distillations.clone(),
             selections: self.selections.clone(),
+            tool_calls: self.tool_calls.clone(),
         }
     }
 }
@@ -46,6 +49,7 @@ impl StoredSkills {
                 skills: vec![],
                 distillations: vec![],
                 selections: vec![],
+                tool_calls: vec![],
             },
             Some(bytes) => {
                 if bytes.len() > MAX_STATE_BYTES {
@@ -78,6 +82,12 @@ impl StoredSkills {
         for selection in &mut ledger.selections {
             if selection.status == SelectionStatus::Running {
                 selection.status = SelectionStatus::Interrupted;
+                interrupted = true;
+            }
+        }
+        for call in &mut ledger.tool_calls {
+            if call.outcome.is_none() {
+                call.outcome = Some(InvocationOutcome::Interrupted);
                 interrupted = true;
             }
         }
@@ -493,6 +503,84 @@ impl StoredSkills {
         Ok(result)
     }
 
+    pub(super) fn begin_tool_call(
+        &self,
+        id: &str,
+        owner: &str,
+        skill: SkillRef,
+        arguments: Arguments,
+        now_ms: u64,
+    ) -> SkillResult<ToolCallRecord> {
+        validate_id(id)?;
+        validate_id(owner)?;
+        if now_ms == 0 {
+            return Err(SkillError::InvalidInput);
+        }
+        let mut inner = self.lock()?;
+        let snapshot = inner.ledger.snapshot();
+        if inner
+            .ledger
+            .tool_calls
+            .iter()
+            .any(|call| call.id == id || call.outcome.is_none())
+        {
+            return Err(SkillError::Conflict);
+        }
+        let usable = snapshot
+            .skill(&skill.skill_id)
+            .is_some_and(|entry| entry.owner == owner && entry.enabled == Some(skill.version));
+        let template = snapshot.source(&skill).and_then(|source| source.template());
+        match template {
+            Some(proposal)
+                if usable && argument_issues(&proposal.template, &arguments).is_empty() => {}
+            _ => return Err(SkillError::InvalidInput),
+        }
+        if inner.ledger.tool_calls.len() >= MAX_TOOL_CALLS {
+            return Err(SkillError::LimitReached);
+        }
+        let call = ToolCallRecord {
+            id: id.into(),
+            owner: owner.into(),
+            skill,
+            arguments,
+            started_at_ms: now_ms,
+            finished_at_ms: None,
+            outcome: None,
+            evidence: None,
+        };
+        let mut next = inner.ledger.clone();
+        next.tool_calls.push(call.clone());
+        persist(&mut inner, next)?;
+        Ok(call)
+    }
+
+    pub(super) fn record_tool_call(
+        &self,
+        id: &str,
+        at_ms: u64,
+        outcome: InvocationOutcome,
+        evidence: Option<RunEvidence>,
+    ) -> SkillResult<ToolCallRecord> {
+        let mut inner = self.lock()?;
+        let snapshot = inner.ledger.snapshot();
+        let mut next = inner.ledger.clone();
+        let call = next
+            .tool_calls
+            .iter_mut()
+            .find(|call| call.id == id)
+            .ok_or(SkillError::NotFound)?;
+        if call.outcome.is_some() || at_ms < call.started_at_ms {
+            return Err(SkillError::Conflict);
+        }
+        call.outcome = Some(outcome);
+        call.evidence = evidence;
+        call.finished_at_ms = Some(at_ms);
+        validate_tool_call(call, &snapshot)?;
+        let call = call.clone();
+        persist(&mut inner, next)?;
+        Ok(call)
+    }
+
     fn update_distillation(
         &self,
         id: &str,
@@ -598,6 +686,7 @@ fn encode(ledger: &Ledger) -> SkillResult<Vec<u8>> {
     if ledger.skills.len() > MAX_SKILLS
         || ledger.distillations.len() > MAX_DISTILLATIONS
         || ledger.selections.len() > MAX_SELECTIONS
+        || ledger.tool_calls.len() > MAX_TOOL_CALLS
     {
         return Err(SkillError::LimitReached);
     }
@@ -613,7 +702,14 @@ fn encode(ledger: &Ledger) -> SkillResult<Vec<u8>> {
             .iter()
             .filter(|entry| entry.status == SelectionStatus::Running)
             .count();
-    let recovery = running * ("Interrupted".len() - "Running".len());
+    // 运行中的工具调用重启时写入 "Interrupted"，比 null 多出的字节同样预留。
+    let calling = ledger
+        .tool_calls
+        .iter()
+        .filter(|call| call.outcome.is_none())
+        .count();
+    let recovery = running * ("Interrupted".len() - "Running".len())
+        + calling * ("\"Interrupted\"".len() - "null".len());
     if bytes.len().saturating_add(recovery) > MAX_STATE_BYTES {
         return Err(SkillError::LimitReached);
     }
@@ -627,6 +723,7 @@ fn validate_ledger(ledger: &Ledger) -> SkillResult<()> {
         || ledger.skills.len() > MAX_SKILLS
         || ledger.distillations.len() > MAX_DISTILLATIONS
         || ledger.selections.len() > MAX_SELECTIONS
+        || ledger.tool_calls.len() > MAX_TOOL_CALLS
     {
         return Err(invalid());
     }
@@ -656,7 +753,54 @@ fn validate_ledger(ledger: &Ledger) -> SkillResult<()> {
         }
         selecting += usize::from(selection.status == SelectionStatus::Running);
     }
-    if running > 1 || selecting > 1 {
+    let mut call_ids = BTreeSet::new();
+    let mut calling = 0;
+    for call in &ledger.tool_calls {
+        validate_tool_call(call, &snapshot)?;
+        if !call_ids.insert(call.id.as_str()) {
+            return Err(invalid());
+        }
+        calling += usize::from(call.outcome.is_none());
+    }
+    if running > 1 || selecting > 1 || calling > 1 {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// 工具调用：技能与版本属于该用户、参数合规；Verified 的证据满足验证条件，
+/// 运行过的结论带证据，进行中或中断的没有完成时间与证据。
+fn validate_tool_call(call: &ToolCallRecord, snapshot: &SkillSnapshot) -> SkillResult<()> {
+    let invalid = || SkillError::InvalidInput;
+    validate_id(&call.id)?;
+    validate_id(&call.owner)?;
+    let template = snapshot
+        .skill(&call.skill.skill_id)
+        .filter(|skill| skill.owner == call.owner)
+        .and_then(|_| snapshot.source(&call.skill))
+        .and_then(|source| source.template())
+        .ok_or_else(invalid)?;
+    let draft = instantiate(&template.template, &call.arguments).map_err(|_| invalid())?;
+    if call.started_at_ms == 0 {
+        return Err(invalid());
+    }
+    if let Some(evidence) = &call.evidence {
+        evidence.validate(&draft).map_err(|_| invalid())?;
+    }
+    let consistent = match (call.outcome, call.finished_at_ms, &call.evidence) {
+        (None | Some(InvocationOutcome::Interrupted), None, None) => true,
+        (Some(InvocationOutcome::Verified), Some(at), Some(evidence)) => {
+            at >= call.started_at_ms && evidence.verified(&draft)
+        }
+        (Some(InvocationOutcome::Failed), Some(at), Some(evidence)) => {
+            at >= call.started_at_ms && !evidence.verified(&draft)
+        }
+        (Some(InvocationOutcome::Rejected | InvocationOutcome::Abandoned), Some(at), None) => {
+            at >= call.started_at_ms
+        }
+        _ => false,
+    };
+    if !consistent {
         return Err(invalid());
     }
     Ok(())

@@ -27,6 +27,8 @@ pub const MAX_VERSIONS: usize = 8;
 pub const MAX_CHANGES: usize = 64;
 pub const MAX_DISTILLATIONS: usize = 32;
 pub const MAX_SELECTIONS: usize = 64;
+/// 对话中直接调用技能工具的记录总数，不自动淘汰；满后拒绝新的调用。
+pub const MAX_TOOL_CALLS: usize = 256;
 pub const MAX_PARAMETERS: usize = 8;
 pub const MAX_OPTIONS: usize = 8;
 /// 交给选择器的候选技能上限。
@@ -295,6 +297,21 @@ pub struct Selection {
     pub settled_at_ms: Option<u64>,
 }
 
+/// 对话中直接调用一个已启用技能的记录：先保存再运行，结果以实际运行证据为准。
+/// 只能调用当前对话用户自己的技能；outcome 为 None 表示仍在运行，Interrupted 表示进程退出前没有结果。
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCallRecord {
+    pub id: String,
+    pub owner: String,
+    pub skill: SkillRef,
+    pub arguments: Arguments,
+    pub started_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
+    pub outcome: Option<InvocationOutcome>,
+    pub evidence: Option<RunEvidence>,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct SkillSummary {
     pub skill: SkillRef,
@@ -322,6 +339,7 @@ pub struct SkillSnapshot {
     pub skills: Vec<Skill>,
     pub distillations: Vec<Distillation>,
     pub selections: Vec<Selection>,
+    pub tool_calls: Vec<ToolCallRecord>,
 }
 impl SkillSnapshot {
     pub fn skills_for<'a>(&'a self, owner: &'a str) -> impl Iterator<Item = &'a Skill> {
@@ -510,6 +528,45 @@ pub trait SkillAdmin: Send + Sync {
     ) -> SkillResult<Selection>;
     /// 依据实践账本写入调用结果；只能对 Chosen 的选择写一次。
     fn settle(&self, id: &str, at_ms: u64, outcome: InvocationOutcome) -> SkillResult<Selection>;
+    /// 保存一次对话中的技能调用，返回后才可运行；技能必须属于该用户且该版本已启用，参数须合规。
+    /// 同一时间只运行一次调用。
+    fn begin_tool_call(
+        &self,
+        id: &str,
+        owner: &str,
+        skill: SkillRef,
+        arguments: Arguments,
+        now_ms: u64,
+    ) -> SkillResult<ToolCallRecord>;
+    /// 保存调用结果与运行证据；只能写一次。Verified 必须有满足验证条件的证据。
+    fn record_tool_call(
+        &self,
+        id: &str,
+        at_ms: u64,
+        outcome: InvocationOutcome,
+        evidence: Option<RunEvidence>,
+    ) -> SkillResult<ToolCallRecord>;
+}
+
+/// 一次技能工具调用的 ID：由用户与对话中的调用 ID 确定。
+pub fn tool_call_id(owner: &str, call_id: &str, started_at_ms: u64) -> String {
+    let mut context = Context::new(&SHA256);
+    for part in [
+        "skill.tool-call:v1",
+        owner,
+        call_id,
+        &started_at_ms.to_string(),
+    ] {
+        context.update(&(part.len() as u64).to_be_bytes());
+        context.update(part.as_bytes());
+    }
+    let digest: String = context
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("skill-call-{}", &digest[..32])
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
