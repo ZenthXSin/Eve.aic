@@ -87,7 +87,13 @@ def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, 
                 require(child.poll() is None, "宿主在首次保存前退出：" + "".join(lines))
                 time.sleep(0.02)
                 continue
-            document = json.loads(state_file.read_text(encoding="utf-8"))
+            try:
+                document = json.loads(state_file.read_text(encoding="utf-8"))
+            except (PermissionError, FileNotFoundError):
+                # Windows 原子替换快照时可能短暂拒绝并行打开；只在原截止时间内重试。
+                require(child.poll() is None, "宿主在读取保存结果前退出：" + "".join(lines))
+                time.sleep(0.02)
+                continue
             receipts = json.loads(bytes(document["entries"].get("eve.channel.qqbot", {}).get("receipts.v1", [])) or b'{}')
             if any(item["message"]["id"] == "package-chat" and item["state"] == "Sent"
                    for item in receipts.get("entries", [])):
