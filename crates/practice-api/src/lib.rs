@@ -486,6 +486,105 @@ impl PracticeSnapshot {
     }
 }
 
+/// 同一问题至少出现这么多次才算反复出现的能力缺口。
+pub const GAP_REPEAT: usize = 2;
+/// 列出的能力缺口条数上限。
+pub const MAX_GAPS: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GapKind {
+    /// 当前运行环境做不了这些目标（草稿器判断不适用）。
+    NoRuntime,
+    /// 多次实践反复出现同一个结构问题或运行警告。
+    RepeatedIssue,
+}
+
+/// 由实践账本推导的能力缺口，不另行保存；是“需要新的运行环境或工具”的依据。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityGap {
+    pub kind: GapKind,
+    pub runner_id: String,
+    /// 最近一次出现时的原文：不适用的理由，或问题、警告本身。
+    pub summary: String,
+    pub goals: Vec<String>,
+    pub occurrences: usize,
+    pub last_at_ms: u64,
+}
+
+/// 某个用户的能力缺口：不适用的目标按运行器归为一条；结构问题与运行警告去掉数字、合并空白后
+/// 按原文归类，出现至少 `GAP_REPEAT` 次才列出。按出现次数、最近时间排序，至多 `MAX_GAPS` 条。
+pub fn capability_gaps(snapshot: &PracticeSnapshot, owner: &str) -> Vec<CapabilityGap> {
+    use std::collections::BTreeMap;
+    let normalize = |text: &str| -> String {
+        let cleaned: String = text
+            .chars()
+            .map(|c| if c.is_ascii_digit() { '#' } else { c })
+            .collect();
+        cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let mut groups: BTreeMap<(bool, String, String), CapabilityGap> = BTreeMap::new();
+    let mut note =
+        |kind: GapKind, runner: &str, key: String, summary: &str, goal: &str, at: u64| {
+            let entry = groups
+                .entry((kind == GapKind::NoRuntime, runner.to_string(), key))
+                .or_insert_with(|| CapabilityGap {
+                    kind,
+                    runner_id: runner.into(),
+                    summary: summary.into(),
+                    goals: vec![],
+                    occurrences: 0,
+                    last_at_ms: 0,
+                });
+            entry.occurrences += 1;
+            if !entry.goals.iter().any(|existing| existing == goal) {
+                entry.goals.push(goal.into());
+            }
+            if at >= entry.last_at_ms {
+                entry.last_at_ms = at;
+                entry.summary = summary.into();
+            }
+        };
+    for run in snapshot.runs.iter().filter(|run| run.task.owner == owner) {
+        let runner = run.runner.runner_id.as_str();
+        let goal = run.task.goal_id.as_str();
+        for attempt in &run.attempts {
+            let at = attempt.finished_at_ms.unwrap_or(attempt.started_at_ms);
+            if attempt.outcome == Some(AttemptOutcome::NotApplicable) {
+                let reason = attempt
+                    .draft
+                    .as_ref()
+                    .map(|draft| draft.rationale.as_str())
+                    .unwrap_or_default();
+                note(GapKind::NoRuntime, runner, String::new(), reason, goal, at);
+                continue;
+            }
+            let warnings = attempt
+                .evidence
+                .iter()
+                .flat_map(|evidence| evidence.warnings.iter());
+            for issue in attempt.issues.iter().chain(warnings) {
+                note(
+                    GapKind::RepeatedIssue,
+                    runner,
+                    normalize(issue),
+                    issue,
+                    goal,
+                    at,
+                );
+            }
+        }
+    }
+    let mut gaps: Vec<CapabilityGap> = groups
+        .into_values()
+        .filter(|gap| gap.kind == GapKind::NoRuntime || gap.occurrences >= GAP_REPEAT)
+        .collect();
+    gaps.sort_by(|left, right| {
+        (right.occurrences, right.last_at_ms).cmp(&(left.occurrences, left.last_at_ms))
+    });
+    gaps.truncate(MAX_GAPS);
+    gaps
+}
+
 /// 仅可信宿主持有；不发布给模型或不受信插件。
 pub trait PracticeAdmin: Send + Sync {
     fn snapshot(&self) -> PracticeResult<PracticeSnapshot>;
