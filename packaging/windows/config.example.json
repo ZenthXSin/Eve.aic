@@ -24,6 +24,10 @@
     "memory_recall": true,
     "segmented": true
   },
+  "updates": {
+    "enabled": true,
+    "check_interval_hours": 6
+  },
   "web": {
     "listen": "127.0.0.1:8765",
     "token": ""

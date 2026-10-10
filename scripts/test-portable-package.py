@@ -24,17 +24,17 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, label):
+def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, label, updated=None):
     config_path = root / "config.json"
     before = config_path.read_bytes()
     if label == "windows-x64":
         command = ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
                    "-ExecutionPolicy", "Bypass", "-File", str(root / "Launch.ps1"),
-                   "-NoPrompt", "-BridgeScript", str(bridge), "-BridgeArg", str(scenario)]
+                   "-NoPrompt", "-NoCheckUpdates", "-BridgeScript", str(bridge), "-BridgeArg", str(scenario)]
     else:
         node = root / ("runtime/node.exe" if os.name == "nt" else "runtime/bin/node")
         command = [str(node), str(root / "Launch.mjs"), "qq",
-                   "--no-prompt", "--bridge-script", str(bridge), "--bridge-arg", str(scenario)]
+                   "--no-prompt", "--no-check-updates", "--bridge-script", str(bridge), "--bridge-arg", str(scenario)]
     child = subprocess.Popen(command, cwd=root.parent, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
     lines = []
@@ -87,7 +87,13 @@ def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, 
                 require(child.poll() is None, "宿主在首次保存前退出：" + "".join(lines))
                 time.sleep(0.02)
                 continue
-            document = json.loads(state_file.read_text(encoding="utf-8"))
+            try:
+                document = json.loads(state_file.read_text(encoding="utf-8"))
+            except (PermissionError, FileNotFoundError):
+                # Windows 原子替换快照时可能短暂拒绝并行打开；只在原截止时间内重试。
+                require(child.poll() is None, "宿主在读取保存结果前退出：" + "".join(lines))
+                time.sleep(0.02)
+                continue
             receipts = json.loads(bytes(document["entries"].get("eve.channel.qqbot", {}).get("receipts.v1", [])) or b'{}')
             if any(item["message"]["id"] == "package-chat" and item["state"] == "Sent"
                    for item in receipts.get("entries", [])):
@@ -117,6 +123,8 @@ def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, 
         require(child.returncode == 0, "原生启动器退出失败：" + "".join(lines))
         require(config_path.read_bytes() == before, "启动器重写了现有配置")
         output = "".join(lines)
+        if updated is not None:
+            require(("EVE_UPDATE_NATIVE_CANDIDATE" in output) == updated, "实际启动器没有使用所选更新版本")
         for secret in (config["qq"]["app_secret"], config["model"]["api_key"], token):
             require(secret not in output, "启动日志泄漏了合成凭据")
         sessions = json.loads(bytes(json.loads(state_file.read_text(encoding="utf-8"))["entries"]["eve.session"]["sessions.v1"]))
@@ -223,10 +231,23 @@ def main():
                 scenario.write_text(json.dumps({"script": steps}), encoding="utf-8")
                 run(root, config, bridge, scenario, stop_gate, requests, 1, manifest["platform_label"])
             require(len(requests) == 1, "恢复产生了新的模型请求")
-            if manifest["platform_label"] != "windows-x64":
-                subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name("test-launcher-signal.py")), str(root)],
+            from client_update_native import exercise
+            def restart_update(update_root, updated, gate_name):
+                update_stop = work / ("update-stop-" + gate_name)
+                update_scenario = work / ("update-scenario-" + gate_name + ".json")
+                update_scenario.write_text(json.dumps({"script": [{"send": message},
+                    {"wait_command": {"id": message["id"], "type": "finish"}},
+                    {"wait_file": str(update_stop)}]}), encoding="utf8")
+                run(update_root, config, bridge, update_scenario, update_stop, requests, 1,
+                    manifest["platform_label"], updated=updated)
+            exercise(root, work, manifest, restart_update)
+            subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name("test-launcher-signal.py")), str(root)],
+                           check=True, timeout=90)
+            require(len(requests) == 1, "信号验收重放了模型请求")
+            if manifest["platform_label"] == "windows-x64":
+                subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name("test-launcher-signal.py")), str(root), "--powershell"],
                                check=True, timeout=90)
-                require(len(requests) == 1, "信号验收重放了模型请求")
+                require(len(requests) == 1, "PowerShell 信号验收重放了模型请求")
     finally:
         server.shutdown()
         server.server_close()
@@ -236,11 +257,13 @@ def main():
               "source_commit": manifest["source_commit"], "version": manifest["version"],
               "source_tree": manifest["source_tree"], "archive_sha256": expected,
               "powershell_5_1": manifest["platform_label"] == "windows-x64",
-              "node_launcher": manifest["platform_label"] != "windows-x64",
-              "console_ctrl_c": True if manifest["platform_label"] != "windows-x64" else None,
+              "node_launcher": True,
+              "console_ctrl_c": True,
               "unicode_and_space_path": True, "web_http": True,
               "memory_and_learning_views": True, "qq_segmented_delivery": True,
               "recovery_without_replay": True, "external_model_requests": 0,
+              "client_update_download_verified": True, "client_update_next_start": True,
+              "client_update_rollback": True, "client_update_preserved_user_files": True,
               "production_qq_connections": 0}
     (dist / f"acceptance-{manifest['platform_label']}.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False))

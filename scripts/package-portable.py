@@ -53,9 +53,10 @@ def package(target, binary_directory, output_directory):
         shutil.copy2(binary_directory / (binary + extension), bundle)
     shutil.copy2(ROOT / "AGENT.md", bundle)
     shutil.copy2(ROOT / "packaging/windows/config.example.json", bundle)
-    shutil.copy2(ROOT / "packaging/common/Launch.mjs", bundle)
+    for file in ("Launch.mjs", "Updater.mjs", "update-contract.mjs", "update-archive.mjs"):
+        shutil.copy2(ROOT / "packaging/common" / file, bundle)
     if windows:
-        for file in ("Launch.ps1", "Open-Panel.ps1", "Start-Eve.cmd", "Start-Console.cmd", "Open-Panel.cmd", "使用说明.md"):
+        for file in ("Launch.ps1", "Open-Panel.ps1", "Start-Eve.cmd", "Start-Console.cmd", "Open-Panel.cmd", "Update-Eve.cmd", "使用说明.md"):
             source_file = ROOT / "packaging/windows" / file
             if source_file.suffix == ".ps1":
                 (bundle / source_file.name).write_text(source_file.read_text(encoding="utf-8"), encoding="utf-8-sig")
@@ -64,17 +65,17 @@ def package(target, binary_directory, output_directory):
             else:
                 shutil.copy2(source_file, bundle)
         if label == "windows-arm64":
-            for script, mode in (("Start-Eve", "qq"), ("Start-Console", "console"), ("Open-Panel", "panel")):
+            for script, mode in (("Start-Eve", "qq"), ("Start-Console", "console"), ("Open-Panel", "panel"), ("Update-Eve", "update")):
                 (bundle / f"{script}.cmd").write_bytes((
                     '@echo off\r\nchcp 65001 >nul\r\n'
-                    '"%~dp0runtime\\node.exe" "%~dp0Launch.mjs" ' + mode + '\r\npause\r\n').encode("ascii"))
+                    '"%~dp0runtime\\node.exe" "%~dp0Launch.mjs" ' + mode + ' %*\r\npause\r\n').encode("ascii"))
     else:
         for file in ("使用说明.md",):
             shutil.copy2(ROOT / "packaging/posix" / file, bundle)
         script_extension = "command" if label.startswith("macos-") else "sh"
-        for script, mode in (("Start-Eve", "qq"), ("Start-Console", "console"), ("Open-Panel", "panel")):
+        for script, mode in (("Start-Eve", "qq"), ("Start-Console", "console"), ("Open-Panel", "panel"), ("Update-Eve", "update")):
             shell = bundle / f"{script}.{script_extension}"
-            shell.write_text('#!/bin/sh\nEVE_PACKAGE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1\nexec "$EVE_PACKAGE_DIR/runtime/bin/node" "$EVE_PACKAGE_DIR/Launch.mjs" ' + mode + '\n', encoding="utf-8")
+            shell.write_text('#!/bin/sh\nEVE_PACKAGE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1\nexec "$EVE_PACKAGE_DIR/runtime/bin/node" "$EVE_PACKAGE_DIR/Launch.mjs" ' + mode + ' "$@"\n', encoding="utf-8")
             shell.chmod(0o755)
     bridge = bundle / "connectors/qqbot"
     bridge.mkdir(parents=True)
@@ -119,7 +120,8 @@ def package(target, binary_directory, output_directory):
     manifest = {"format_version": 1, "source_commit": source, "source_tree": tree, "version": version,
                 "target": target, "platform_label": label, "rust_version": "1.89.0", "static_crt": windows,
                 "node_version": NODE_VERSION, "node_archive_sha256": pinned_digest,
-                "credentials_included": False, "user_data_included": False, "files_sha256": files}
+                "credentials_included": False, "user_data_included": False, "files_sha256": files,
+                "updater_protocol": 1, "state_schema_generation": 1}
     (bundle / "build-info.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     if windows:
         archive = pathlib.Path(shutil.make_archive(str(output_directory / name), "zip", root_dir=output_directory, base_dir=name))

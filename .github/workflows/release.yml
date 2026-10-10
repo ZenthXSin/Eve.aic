@@ -5,7 +5,7 @@ on:
     branches: [main]
     tags: ['v*']
   pull_request:
-    paths: ['packaging/**', 'scripts/package-*.ps1', 'scripts/package-*.py', 'scripts/test-*package.py', 'scripts/test-launcher-signal.py', 'scripts/release-portable.py', 'scripts/test-release-portable.py', '.github/workflows/release.yml']
+    paths: ['packaging/**', 'scripts/package-*.ps1', 'scripts/package-*.py', 'scripts/test-*package.py', 'scripts/test-launcher-signal.py', 'scripts/*client-update*.mjs', 'scripts/client_update_native.py', 'scripts/release-portable.py', 'scripts/test-release-portable.py', '.github/workflows/release.yml']
   workflow_dispatch:
 
 permissions:
@@ -31,6 +31,12 @@ jobs:
           persist-credentials: false
       - name: 验证版本选择、失败保护和草稿恢复
         run: python scripts/test-release-portable.py
+      - name: 安装与便携包一致的 Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.22.0'
+      - name: 验证客户端更新与恢复
+        run: node scripts/test-client-update.mjs
       - name: 为主线或标签选择发行版本
         id: version
         env:
