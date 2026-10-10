@@ -16,6 +16,8 @@ use eve_practice_plugin::Practitioner;
 use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput};
 use eve_skill_api::{INSTANCE_RATIONALE, SkillAdmin, SkillError, SkillFailure};
 use eve_skill_plugin::Consolidator;
+use eve_toolforge_api::{ForgeFailure, ForgeStatus, ToolAdmin, ToolError};
+use eve_toolforge_plugin::Forge;
 use std::{
     cmp::Reverse,
     fmt::Write,
@@ -30,6 +32,8 @@ const SUBJECT: &str = "eve";
 const PRACTICE_TIMEOUT: Duration = Duration::from_secs(900);
 /// 一次技能提炼（一次提炼请求与一次验证运行）的总时长上限。
 const DISTILL_TIMEOUT: Duration = Duration::from_secs(600);
+/// 一次工具锻造（一次锻造请求与只读回放验证）的总时长上限。
+const FORGE_TIMEOUT: Duration = Duration::from_secs(120);
 const HELP: &str = "用法：/practice 兴趣ID 查看 Eve 为这条兴趣做过的实践与真实运行证据；兴趣 ID 可用 /interests 查看。";
 const DISABLED: &str = "实践验证未启用。";
 const NO_GAPS: &str =
@@ -48,6 +52,12 @@ pub(crate) struct Skills {
     pub(crate) consolidator: Arc<Consolidator>,
 }
 
+/// 开启工具锻造时，实践后台同时把反复出现的问题锻造成运行前检查工具。
+pub(crate) struct Forging {
+    pub(crate) admin: Arc<dyn ToolAdmin>,
+    pub(crate) forge: Arc<Forge>,
+}
+
 /// 实践后台依赖的服务与工作目录。
 pub(crate) struct Services {
     pub(crate) practice: Arc<dyn PracticeAdmin>,
@@ -56,6 +66,7 @@ pub(crate) struct Services {
     pub(crate) practitioner: Arc<Practitioner>,
     pub(crate) workspace_root: PathBuf,
     pub(crate) skills: Option<Skills>,
+    pub(crate) forging: Option<Forging>,
 }
 
 pub(crate) struct Background {
@@ -210,6 +221,7 @@ async fn run(
         practitioner,
         workspace_root,
         skills,
+        forging,
     } = services;
     loop {
         if *active.borrow() {
@@ -232,6 +244,7 @@ async fn run(
     }
     let mut practicing = true;
     let mut distilling = skills.is_some();
+    let mut forging_open = forging.is_some();
     loop {
         if *stopped.borrow() {
             return Ok(());
@@ -239,6 +252,10 @@ async fn run(
         // 先固化已验证的方法，再开始下一项实践，使后续任务可以复用。
         if let Some(skills) = skills.as_ref().filter(|_| distilling) {
             distilling = consolidate(&*practice, skills, &workspace_root, &mut stopped).await?;
+        }
+        // 再把反复出现的问题锻造成运行前检查，使下一项实践即可使用。
+        if let Some(forging) = forging.as_ref().filter(|_| forging_open) {
+            forging_open = forge(&*practice, forging, &mut stopped).await?;
         }
         if *stopped.borrow() {
             return Ok(());
@@ -378,6 +395,54 @@ async fn consolidate(
         skills
             .admin
             .abandon_distillation(&entry.id, now_ms()?.max(began), failure)?;
+    }
+    Ok(true)
+}
+
+/// 锻造或复用最早一个可以处理的缺口；返回 false 表示容量已满，之后不再锻造。
+async fn forge(
+    practice: &dyn PracticeAdmin,
+    forging: &Forging,
+    stopped: &mut watch::Receiver<bool>,
+) -> Result<bool, AppError> {
+    let Some(candidate) = forging
+        .forge
+        .candidate(&forging.admin.snapshot()?, &practice.snapshot()?)
+    else {
+        return Ok(true);
+    };
+    let entry = match forging.forge.begin(&candidate, now_ms()?) {
+        Ok(Some(entry)) if entry.status == ForgeStatus::Running => entry,
+        // 已复用已启用的工具，或这个缺口已处理过。
+        Ok(_) => return Ok(true),
+        // 容量满保留原记录：停止新的锻造，已有工具仍可使用与查看。
+        Err(ToolError::LimitReached) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let began = entry.started_at_ms;
+    let abandoned = {
+        let work = forging
+            .forge
+            .complete(&entry, &candidate, || now_ms().unwrap_or(began));
+        tokio::pin!(work);
+        tokio::select! {
+            biased;
+            _ = stop_requested(stopped) => Some(ForgeFailure::Cancelled),
+            result = tokio::time::timeout(FORGE_TIMEOUT, &mut work) => match result {
+                Ok(Ok(_)) => None,
+                // 容量满时锻造结果无法写入：保留 Running，重启后记为中断；停止新的锻造。
+                Ok(Err(ToolError::LimitReached)) => return Ok(false),
+                // 存储失败时句柄已关闭；锻造留在 Running，重启后记为中断。
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => Some(ForgeFailure::Timeout),
+            },
+        }
+    };
+    // 放弃时锻造请求已随 future 取消；只记录原因，不重放。
+    if let Some(failure) = abandoned {
+        forging
+            .admin
+            .abandon_forge(&entry.id, now_ms()?.max(began), failure)?;
     }
     Ok(true)
 }

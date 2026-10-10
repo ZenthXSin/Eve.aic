@@ -56,6 +56,8 @@ eve-practice-mindustry = { path = "../practice-mindustry" }
 eve-practice-browser = { path = "../practice-browser" }
 eve-skill-api = { path = "../skill-api" }
 eve-skill-plugin = { path = "../skill-plugin" }
+eve-toolforge-api = { path = "../toolforge-api" }
+eve-toolforge-plugin = { path = "../toolforge-plugin" }
 eve-outreach-api = { path = "../outreach-api" }
 eve-outreach-plugin = { path = "../outreach-plugin" }
 eve-plan-api = { path = "../plan-api" }

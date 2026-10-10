@@ -10,6 +10,7 @@ pub struct Practitioner {
     admin: Arc<dyn PracticeAdmin>,
     drafter: Arc<dyn PracticeDrafter>,
     runner: Arc<dyn PracticeRunner>,
+    check: Option<Arc<dyn DraftCheck>>,
 }
 
 impl Practitioner {
@@ -22,7 +23,14 @@ impl Practitioner {
             admin,
             drafter,
             runner,
+            check: None,
         }
+    }
+
+    /// 运行器结构检查通过后、实际运行前再做的附加检查；发现问题时这次尝试不运行。
+    pub fn with_check(mut self, check: Arc<dyn DraftCheck>) -> Self {
+        self.check = Some(check);
+        self
     }
 
     pub fn drafter_version(&self) -> &str {
@@ -80,10 +88,22 @@ impl Practitioner {
                         Err(PracticeError::Practice(failure)) => Err(failure),
                         Err(error) => return Err(error),
                     };
-                    let issues = match &result {
+                    let mut issues = match &result {
                         Ok(draft) if draft.applicable => sanitize(self.runner.check(draft)),
                         _ => Vec::new(),
                     };
+                    if let (Ok(draft), Some(check), true) =
+                        (&result, &self.check, issues.is_empty())
+                        && draft.applicable
+                    {
+                        let found = check.check(&run, draft, at_ms(now_ms()))?;
+                        issues = sanitize(
+                            found
+                                .into_iter()
+                                .map(|issue| format!("{DRAFT_CHECK_MARK}{issue}"))
+                                .collect(),
+                        );
+                    }
                     run = self
                         .admin
                         .record_draft(&run.id, at_ms(now_ms()), result, issues)?;

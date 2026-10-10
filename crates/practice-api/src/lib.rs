@@ -342,6 +342,21 @@ pub trait PracticeRunner: Send + Sync {
     ) -> BoxFuture<'a, RunEvidence>;
 }
 
+/// 运行器之外的运行前检查，例如按反复出现的能力缺口锻造的定义检查；只读草稿，不触碰文件系统。
+/// 只在运行器结构检查通过、即将实际运行时调用。返回的问题加上 `DRAFT_CHECK_MARK` 前缀后与草稿
+/// 一同记录为被拒绝的尝试，草稿器据此修正；错误表示调用无法可靠记录，宿主须停止并重新打开核对。
+pub trait DraftCheck: Send + Sync {
+    fn check(
+        &self,
+        run: &PracticeRun,
+        draft: &PracticeDraft,
+        at_ms: u64,
+    ) -> PracticeResult<Vec<String>>;
+}
+
+/// 运行前附加检查给出的问题在实践记录中的前缀；能力缺口不把它们算作新的缺口。
+pub const DRAFT_CHECK_MARK: &str = "[预检] ";
+
 /// 上一次尝试的结果，供草稿器依据实际证据修正。
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -499,11 +514,22 @@ pub enum GapKind {
     RepeatedIssue,
 }
 
+/// 归类问题原文：数字换成 `#`，合并空白。能力缺口与针对它锻造的工具使用同一个键。
+pub fn gap_key(text: &str) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+        .collect();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// 由实践账本推导的能力缺口，不另行保存；是“需要新的运行环境或工具”的依据。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityGap {
     pub kind: GapKind,
     pub runner_id: String,
+    /// 归类键（`gap_key`）；不适用的缺口为空。
+    pub key: String,
     /// 最近一次出现时的原文：不适用的理由，或问题、警告本身。
     pub summary: String,
     pub goals: Vec<String>,
@@ -511,25 +537,20 @@ pub struct CapabilityGap {
     pub last_at_ms: u64,
 }
 
-/// 某个用户的能力缺口：不适用的目标按运行器归为一条；结构问题与运行警告去掉数字、合并空白后
-/// 按原文归类，出现至少 `GAP_REPEAT` 次才列出。按出现次数、最近时间排序，至多 `MAX_GAPS` 条。
+/// 某个用户的能力缺口：不适用的目标按运行器归为一条；结构问题与运行警告按 `gap_key` 归类，
+/// 出现至少 `GAP_REPEAT` 次才列出。运行前附加检查给出的问题已有工具覆盖，不算缺口。
+/// 按出现次数、最近时间排序，至多 `MAX_GAPS` 条。
 pub fn capability_gaps(snapshot: &PracticeSnapshot, owner: &str) -> Vec<CapabilityGap> {
     use std::collections::BTreeMap;
-    let normalize = |text: &str| -> String {
-        let cleaned: String = text
-            .chars()
-            .map(|c| if c.is_ascii_digit() { '#' } else { c })
-            .collect();
-        cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
-    };
     let mut groups: BTreeMap<(bool, String, String), CapabilityGap> = BTreeMap::new();
     let mut note =
         |kind: GapKind, runner: &str, key: String, summary: &str, goal: &str, at: u64| {
             let entry = groups
-                .entry((kind == GapKind::NoRuntime, runner.to_string(), key))
+                .entry((kind == GapKind::NoRuntime, runner.to_string(), key.clone()))
                 .or_insert_with(|| CapabilityGap {
                     kind,
                     runner_id: runner.into(),
+                    key: key.clone(),
                     summary: summary.into(),
                     goals: vec![],
                     occurrences: 0,
@@ -562,11 +583,16 @@ pub fn capability_gaps(snapshot: &PracticeSnapshot, owner: &str) -> Vec<Capabili
                 .evidence
                 .iter()
                 .flat_map(|evidence| evidence.warnings.iter());
-            for issue in attempt.issues.iter().chain(warnings) {
+            for issue in attempt
+                .issues
+                .iter()
+                .chain(warnings)
+                .filter(|issue| !issue.starts_with(DRAFT_CHECK_MARK))
+            {
                 note(
                     GapKind::RepeatedIssue,
                     runner,
-                    normalize(issue),
+                    gap_key(issue),
                     issue,
                     goal,
                     at,
