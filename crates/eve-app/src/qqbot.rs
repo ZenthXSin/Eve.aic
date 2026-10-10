@@ -1,7 +1,7 @@
 use crate::{
     AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_cognition, qq_interest,
-    qq_learning, qq_learning_commands, qq_memory, qq_memory_observer, qq_outreach, qq_practice,
-    qq_research, qq_skill, qq_tools, segment_commands,
+    qq_learning, qq_learning_commands, qq_memory, qq_memory_observer, qq_outreach, qq_plan,
+    qq_practice, qq_research, qq_semantic, qq_skill, qq_tools, segment_commands,
 };
 use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
@@ -31,8 +31,10 @@ use eve_outreach_api::{
 use eve_outreach_plugin::{
     ModelInvitationComposer, ModelResponseJudge, ModelTimingJudge, OutreachPlugin, RequestGoals,
 };
+use eve_plan_api::{PLAN_PLUGIN_ID, PlanJournal, PlanProposer};
+use eve_plan_plugin::{ModelPlanProposer, PlanPlugin};
 use eve_plugin_api::{PluginId, PluginResult, ServiceId};
-use eve_practice_api::{PRACTICE_PLUGIN_ID, PracticeDrafter, PracticeRunner};
+use eve_practice_api::{PRACTICE_PLUGIN_ID, PracticeAdmin, PracticeDrafter, PracticeRunner};
 use eve_practice_browser::BrowserRunner;
 use eve_practice_mindustry::{MindustryServerRunner, RuntimeCommand};
 use eve_practice_plugin::{ModelPracticeDrafter, PracticePlugin, Practitioner};
@@ -45,6 +47,7 @@ use eve_segment_api::SegmentPreferences;
 use eve_segment_plugin::{
     ParagraphPlanner, RuleSegmentAdvisor, SEGMENT_PREFERENCES_PLUGIN_ID, SegmentPreferencePlugin,
 };
+use eve_semantic_plugin::{HybridRecall, Indexer, SEMANTIC_PLUGIN_ID, SemanticPlugin};
 use eve_session_api::{SESSION_SERVICE_ID, SessionServiceHandle};
 use eve_skill_api::{SKILL_PLUGIN_ID, SkillAdmin, SkillDistiller, SkillSelector};
 use eve_skill_plugin::{
@@ -59,7 +62,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -72,6 +75,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --cognition 开启本地内生反思；/goal 内容保存待办，/goals 查看版本，/mind [目标ID] 查询当前草稿；/goal-feedback 目标ID 版本 反馈内容触发重新评估。
 --memory 开启有来源的交互记忆；/remember 内容、/memories [页码]、/correct-memory ID 内容、/forget ID、/recall 关键词。
 --memory-recall 需同时 --memory；按本轮输入检索当前可信会话的已保存交互与有效偏好，最多 3 条低优先级来源片段，默认关闭。
+--semantic-recall 需同时 --memory-recall，并启用 embedding 语义模型角色（EVE_MODELS_SEMANTIC_ENABLED、_PROVIDER=openai、_MODEL、_DIMENSIONS）；后台为已保存的记忆建立向量索引，召回时把词项排名与向量相似度排名融合，没有共同字词的相近说法也能找到；向量模型不可用时改用词项召回并在资料中标明。/semantic 查看索引进度。
 --memory-learning 需同时 --memory；每会话至少 3 条新经历触发首批，后续默认间隔 5 分钟（--learning-cooldown-ms 可调整），单次启动最多 4 次请求。
 --self-learning 开启持续自主学习（同时开启记忆、提炼和分段）；内置策略要求自评至少 80、至少两条真实交互，并复核重复、手动及撤销冲突。
 /self-learning status 查看模式、已关联候选与容量；自动节奏跟随有效偏好，手动设置优先；/segment reset 清除手动设置并恢复跟随学习。
@@ -90,6 +94,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 /outreach 查看邀请状态与回执；/outreach off 请 Eve 不再主动提起，/outreach on 恢复。
 /skills 列出技能；/skill 技能ID 查看版本、验证证据、启用记录与调用；/skill disable|rollback 技能ID、/skill enable 技能ID 版本 停用、回退或启用某个已验证版本。
 --tool-forging 需同时指定实践运行环境；同一运行环境下反复出现的问题，由一次无工具模型请求锻造成只读草稿文件的检查规则，宿主用实践账本中的真实草稿回放验证（出现过问题的全部拦下、验证通过的一个不误报）后自动启用；之后的实践在实际运行前先经它检查，拦下的草稿不运行、带着说明交给草稿器修正。
+--plans 需同时开启受控研究或实践运行环境；/goal 保存的待办可以请模型建议多步计划（/plan propose 待办ID，每个待办版本至多一次、只建议不执行），确认后（/plan confirm 待办ID）由后台按依赖推进：计划只能使用已开启的受控研究与实践验证，步骤效果按研究与实践账本中的证据判定；/plans [待办ID] 查看进度与证据，/plan withdraw 待办ID 撤销。计划完成不改变待办状态。
 /tools 列出锻造的工具；/tool 工具ID 查看版本、回放验证与调用；/tool disable|rollback 工具ID、/tool enable 工具ID 版本 停用、回退或启用某个已验证版本。
 明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
 --segmented 把模型回复按自然段分成至多 3 条消息，段间停顿至多 2.5 秒；命令确认整条发送。
@@ -112,6 +117,8 @@ pub struct QqBotOptions {
     pub cognition: bool,
     pub memory: bool,
     pub memory_recall: bool,
+    /// 记忆召回同时按语义模型角色的向量相似度排序；需要 --memory-recall。
+    pub semantic_recall: bool,
     pub memory_learning: bool,
     pub self_learning: bool,
     pub learning_options: LearningOptions,
@@ -130,6 +137,8 @@ pub struct QqBotOptions {
     pub skill_learning: bool,
     /// 把反复出现的问题锻造成运行前检查工具；需要实践验证。
     pub tool_forging: bool,
+    /// 用户待办的多步计划入口；需要受控研究或实践验证作为计划能力。
+    pub plans: bool,
     /// 学习目标取得实际验证的进展后择机邀请用户；需要实践验证。
     pub outreach: bool,
     /// 同一用户两次送达之间的最短间隔；未提供时为 24 小时。
@@ -154,6 +163,7 @@ impl Default for QqBotOptions {
             cognition: false,
             memory: false,
             memory_recall: false,
+            semantic_recall: false,
             memory_learning: false,
             self_learning: false,
             learning_options: LearningOptions::default(),
@@ -166,6 +176,7 @@ impl Default for QqBotOptions {
             practice_java_args: Vec::new(),
             skill_learning: false,
             tool_forging: false,
+            plans: false,
             outreach: false,
             outreach_cooldown_ms: None,
             outreach_proactive_after_ms: None,
@@ -200,6 +211,10 @@ impl QqBotOptions {
                 options.memory_recall = true;
                 continue;
             }
+            if arg == "--semantic-recall" {
+                options.semantic_recall = true;
+                continue;
+            }
             if arg == "--memory-learning" {
                 options.memory_learning = true;
                 continue;
@@ -222,6 +237,10 @@ impl QqBotOptions {
             }
             if arg == "--tool-forging" {
                 options.tool_forging = true;
+                continue;
+            }
+            if arg == "--plans" {
+                options.plans = true;
                 continue;
             }
             if arg == "--outreach" {
@@ -326,6 +345,9 @@ impl QqBotOptions {
         if options.memory_recall && !options.memory {
             return Err("--memory-recall 需要同时开启 --memory".into());
         }
+        if options.semantic_recall && !options.memory_recall {
+            return Err("--semantic-recall 需要同时开启 --memory-recall".into());
+        }
         research_policy(&options)?;
         if options.practice_server_jar.is_none()
             && (options.practice_java.is_some() || !options.practice_java_args.is_empty())
@@ -349,6 +371,9 @@ impl QqBotOptions {
         }
         if options.tool_forging && !runtime {
             return Err("--tool-forging 需要同时指定实践运行环境（--practice-mindustry-server 或 --practice-browser）".into());
+        }
+        if options.plans && !runtime && options.research_sources.is_empty() {
+            return Err("--plans 需要同时开启受控研究（--research-source）或实践运行环境，作为计划可用的能力".into());
         }
         if (options.outreach_cooldown_ms.is_some() || options.outreach_proactive_after_ms.is_some())
             && !options.outreach
@@ -393,6 +418,8 @@ pub struct InterestComponents {
     pub skill_selector: Option<Arc<dyn SkillSelector>>,
     /// 替换工具锻造器；默认使用主模型的单次无工具请求。是否锻造仍由 --tool-forging 决定。
     pub forger: Option<Arc<dyn ToolForger>>,
+    /// 替换计划建议器；默认使用主模型的单次无工具请求。是否开启计划入口仍由 --plans 决定。
+    pub plan_proposer: Option<Arc<dyn PlanProposer>>,
     /// 替换邀请撰写器、时机判断器与回应识别器；默认各使用主模型的单次无工具请求。
     /// 是否主动交流仍由 --outreach 决定。
     pub composer: Option<Arc<dyn InvitationComposer>>,
@@ -518,6 +545,9 @@ async fn run_qqbot_composed(
     if options.tool_forging && !practice_enabled {
         return Err("工具锻造需要同时开启实践验证".into());
     }
+    if options.plans && !practice_enabled && research_policy.is_none() {
+        return Err("计划入口需要同时开启受控研究或实践验证".into());
+    }
     if options.outreach && !practice_enabled {
         return Err("主动交流需要同时开启实践验证".into());
     }
@@ -580,6 +610,8 @@ async fn run_qqbot_composed(
     let mut research_background: Option<qq_research::Background> = None;
     let mut practice_background: Option<qq_practice::Background> = None;
     let mut outreach_background: Option<qq_outreach::Background> = None;
+    let mut plan_background: Option<qq_plan::Background> = None;
+    let mut semantic_background: Option<qq_semantic::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
     let mut panel: Option<eve_web_panel::LocalPanel> = None;
     let page_permit = eve_web_panel_api::PageWritePermit::default();
@@ -675,6 +707,16 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        // 计划账本同样先于通道加载；损坏时拒绝启动并保留原字节，遗留执行中的步骤封存为中断。
+        let plans = if options.plans {
+            let plugin = PlanPlugin::new("eve")?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(PLAN_PLUGIN_ID)?).await?;
+            Some(controller)
+        } else {
+            None
+        };
         // 邀请账本同样先于通道加载；损坏时拒绝启动并保留原字节。
         let outreach = if options.outreach {
             let plugin = OutreachPlugin::new()?;
@@ -719,13 +761,35 @@ async fn run_qqbot_composed(
             }
             None => context,
         };
+        // 语义索引账本同样先于通道加载；损坏时拒绝启动并保留原字节。
+        let semantic = if options.semantic_recall {
+            let plugin = SemanticPlugin::new()?;
+            let index = plugin.index();
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(SEMANTIC_PLUGIN_ID)?).await?;
+            Some((index, Arc::new(qq_semantic::DeferredEmbeddings::new())))
+        } else {
+            None
+        };
         bootstrap.context = Some(if options.memory_recall {
             let memory = memory.clone().ok_or("记忆召回缺少记忆服务")?;
-            Arc::new(MemoryRecallContext::new(
-                "qq",
-                Arc::new(LexicalMemoryRecall::new(memory)),
-                context,
-            )?)
+            let lexical: Arc<dyn eve_memory_api::MemoryRecallFactory> =
+                Arc::new(LexicalMemoryRecall::new(memory.clone()));
+            match &semantic {
+                // 词项与语义混合召回；向量模型在核心装配后注入，通道收消息前完成。
+                Some((index, embeddings)) => Arc::new(MemoryRecallContext::with_async_recall(
+                    "qq",
+                    Arc::new(HybridRecall::new(
+                        memory,
+                        lexical.clone(),
+                        index.clone(),
+                        embeddings.clone(),
+                    )),
+                    lexical,
+                    context,
+                )?),
+                None => Arc::new(MemoryRecallContext::new("qq", lexical, context)?),
+            }
         } else {
             context
         });
@@ -739,6 +803,30 @@ async fn run_qqbot_composed(
             options.web_listen.map(|_| page_permit.clone()),
         )
         .await?;
+        // 配置服务此时可用：读取语义模型角色，无效时拒绝启动；注入后再启动建索引后台。
+        let semantic_commands = match &semantic {
+            Some((index, embeddings)) => {
+                let settings = registry
+                    .get(&ServiceId::new(CONFIG_SERVICE_ID)?)?
+                    .ok_or("语义召回配置服务缺失")?
+                    .value
+                    .downcast::<ConfigServiceHandle>()
+                    .map_err(|_| "语义召回配置服务类型错误")?;
+                let key = std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "缺少模型凭据")?;
+                let provider: Arc<dyn eve_semantic_api::EmbeddingProvider> =
+                    Arc::new(qq_semantic::configured(settings.0.as_ref(), &key)?);
+                embeddings.set(provider.clone());
+                let started = qq_semantic::Background::start(Indexer::new(
+                    memory.clone().ok_or("语义召回缺少记忆服务")?,
+                    index.clone(),
+                    provider,
+                ));
+                let commands = started.commands();
+                semantic_background = Some(started);
+                commands
+            }
+            None => qq_semantic::Commands::disabled(),
+        };
         let learning_commands = if let (Some(learning), Some(memory)) = (&learning, &memory) {
             let extractor = match extractor {
                 Some(extractor) => extractor,
@@ -816,10 +904,54 @@ async fn run_qqbot_composed(
             distiller: skill_distiller,
             skill_selector,
             forger: tool_forger,
+            plan_proposer,
             composer: invitation_composer,
             timing_judge,
             response_judge,
         } = interest_components;
+        // 计划只能使用操作者已开启的受控研究与实践验证；步骤由对应后台执行。
+        let plan_journal: Option<Arc<dyn PlanJournal>> = plans
+            .clone()
+            .map(|plans| Arc::new(plans) as Arc<dyn PlanJournal>);
+        let plan_commands = if let Some(journal) = &plan_journal {
+            let capabilities = qq_plan::capabilities(knowledge.is_some(), practice.is_some());
+            let proposer: Arc<dyn PlanProposer> = match plan_proposer {
+                Some(proposer) => proposer,
+                None => Arc::new(ModelPlanProposer::new(core_resolver()?)),
+            };
+            let cognition: Arc<dyn eve_cognition_api::CognitionAdmin> =
+                Arc::new(background.as_ref().ok_or("计划入口缺少认知服务")?.admin()?);
+            let sessions = registry
+                .get(&ServiceId::new(SESSION_SERVICE_ID)?)?
+                .ok_or("计划入口需要会话服务")?
+                .value
+                .downcast::<SessionServiceHandle>()
+                .map_err(|_| "计划入口会话服务类型错误")?;
+            let started = qq_plan::Background::start(qq_plan::Services {
+                plans: journal.clone(),
+                cognition: cognition.clone(),
+                knowledge: knowledge
+                    .clone()
+                    .map(|knowledge| Arc::new(knowledge) as Arc<dyn KnowledgeAdmin>),
+                practice: practice
+                    .clone()
+                    .map(|practice| Arc::new(practice) as Arc<dyn PracticeAdmin>),
+                proposer: proposer.clone(),
+                capabilities: capabilities.clone(),
+            });
+            let commands = qq_plan::Commands::enabled(
+                journal.clone(),
+                cognition,
+                sessions.0.clone(),
+                capabilities,
+                proposer.version().into(),
+                started.requests(),
+            );
+            plan_background = Some(started);
+            commands
+        } else {
+            qq_plan::Commands::disabled()
+        };
         let interest_commands = if let Some(interests) = &interests {
             let memory = memory.clone().ok_or("兴趣观察缺少记忆服务")?;
             let cognition = Arc::new(background.as_ref().ok_or("兴趣观察缺少认知服务")?.admin()?);
@@ -873,6 +1005,7 @@ async fn run_qqbot_composed(
                 cognition,
                 researcher,
                 policy,
+                plan_journal.clone(),
             ));
             qq_research::Commands::enabled(Arc::new(interests.clone()), Arc::new(knowledge.clone()))
         } else {
@@ -974,6 +1107,7 @@ async fn run_qqbot_composed(
                 workspace_root: options.state_directory.join("practice-work"),
                 skills: skill_parts,
                 forging,
+                plans: plan_journal.clone(),
             }));
             qq_practice::Commands::enabled(Arc::new(interests.clone()), Arc::new(practice.clone()))
         } else {
@@ -1072,6 +1206,8 @@ async fn run_qqbot_composed(
             practice_commands,
             skill_commands,
             tool_commands,
+            plan_commands,
+            semantic_commands,
             outreach_commands,
             segment_commands,
         ])));
@@ -1226,6 +1362,12 @@ async fn run_qqbot_composed(
         if let Some(outreach) = &outreach_background {
             outreach.activate();
         }
+        if let Some(plans) = &plan_background {
+            plans.activate();
+        }
+        if let Some(semantic) = &semantic_background {
+            semantic.activate();
+        }
         wait_channel(
             handle.status.clone(),
             background.as_ref().map(qq_cognition::Background::finished),
@@ -1251,6 +1393,18 @@ async fn run_qqbot_composed(
                     (
                         outreach.finished(),
                         "主动交流后台已结束；QQ 通道停止准入并保留状态",
+                    )
+                }))
+                .chain(plan_background.as_ref().map(|plans| {
+                    (
+                        plans.finished(),
+                        "计划后台已结束；QQ 通道停止准入并保留状态",
+                    )
+                }))
+                .chain(semantic_background.as_ref().map(|semantic| {
+                    (
+                        semantic.finished(),
+                        "语义索引后台已结束；QQ 通道停止准入并保留状态",
                     )
                 }))
                 .collect(),
@@ -1296,6 +1450,24 @@ async fn run_qqbot_composed(
     }
     if let Some(outreach) = &outreach_background {
         outreach.request_stop();
+    }
+    if let Some(plans) = &plan_background {
+        plans.request_stop();
+    }
+    if let Some(semantic) = &semantic_background {
+        semantic.request_stop();
+    }
+    // 语义索引后台读取记忆并写索引账本；请求失败不写入，先结束进行中的请求。
+    if let Some(semantic) = semantic_background
+        && let Err(error) = semantic.stop().await
+    {
+        secondary.push(error);
+    }
+    // 计划后台读取研究、实践与认知状态并写计划账本；先结束进行中的建议请求。
+    if let Some(plans) = plan_background
+        && let Err(error) = plans.stop().await
+    {
+        secondary.push(error);
     }
     // 撰写读取学习目标、实践与技能并写邀请账本；先写入取消结局。
     if let Some(outreach) = outreach_background
@@ -1605,6 +1777,42 @@ mod recall_options_tests {
         ])
         .unwrap();
         assert!(options.tool_forging && !options.skill_learning);
+    }
+
+    #[test]
+    fn semantic_recall_is_explicit_and_requires_memory_recall() {
+        assert!(!parse(&[]).unwrap().semantic_recall);
+        let error = parse(&["--memory", "--semantic-recall"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--memory-recall"));
+        let options = parse(&["--memory", "--memory-recall", "--semantic-recall"]).unwrap();
+        assert!(options.semantic_recall && options.memory_recall);
+    }
+
+    #[test]
+    fn plans_are_explicit_and_require_research_or_a_practice_runtime() {
+        assert!(!parse(&[]).unwrap().plans);
+        let error = parse(&["--interest-learning", "--plans"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--plans"));
+        let research = parse(&[
+            "--interest-learning",
+            "--research-source",
+            "https://docs.example/wiki/",
+            "--plans",
+        ])
+        .unwrap();
+        assert!(research.plans);
+        let practice = parse(&[
+            "--interest-learning",
+            "--practice-mindustry-server",
+            "server.jar",
+            "--plans",
+        ])
+        .unwrap();
+        assert!(practice.plans);
     }
 
     #[test]

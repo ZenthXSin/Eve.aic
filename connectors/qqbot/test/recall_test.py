@@ -77,7 +77,7 @@ class RecallAcceptance(unittest.TestCase):
             self, id, text, expected=expected, contains=contains, **route)
 
     def run_eve(self, script, memory=True, cognition=False, recall=False,
-                app="1904159860", checkpoints=None, send_fail=False, success=True):
+                app="1904159860", checkpoints=None, send_fail=False, success=True, extra=(), env_extra=None):
         """使用既有替身协议，并为独立召回 opt-in 添加真实命令行参数。"""
         self.runs += 1
         self.run_release = threading.Event()
@@ -91,6 +91,7 @@ class RecallAcceptance(unittest.TestCase):
             EVE_OPENAI_API_KEY="test-model-secret",
             EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
             EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
+        env.update(env_extra or {})
         command = [str(memory_harness.BINARY), "--state-dir", str(self.work / "state"),
             "--agent", str(memory_harness.ROOT / "AGENT.md"), "--bridge-script",
             str(memory_harness.FAKE), "--bridge-arg", str(scenario)]
@@ -100,6 +101,7 @@ class RecallAcceptance(unittest.TestCase):
             command.extend(["--cognition", "--cognition-max-executions", "1"])
         if recall:
             command.append("--memory-recall")
+        command.extend(extra)
 
         def inspect():
             for name, callback in (checkpoints or {}).items():

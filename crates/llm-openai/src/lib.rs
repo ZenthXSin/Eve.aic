@@ -5,7 +5,10 @@ use eve_llm_api::{LlmError, LlmFuture, LlmProvider, ModelRequest, ModelResponse,
 use reqwest::{Client, Url, header::HeaderValue, redirect::Policy};
 use std::time::Duration;
 
+pub use embeddings::OpenAiEmbeddings;
+
 mod chat;
+mod embeddings;
 mod stream;
 mod strict_json;
 mod wire;
