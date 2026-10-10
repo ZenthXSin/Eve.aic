@@ -1129,6 +1129,23 @@ async fn run_qqbot_composed(
                     learning: learning.clone().map(|admin| {
                         crate::web_panel_learning::LearningRead::new(admin, options.self_learning)
                     }),
+                    autonomy: interests.clone().map(|interests| {
+                        crate::web_panel_autonomy::AutonomyRead {
+                            interests: Arc::new(interests),
+                            knowledge: knowledge.clone().map(|knowledge| {
+                                Arc::new(knowledge) as Arc<dyn eve_knowledge_api::KnowledgeAdmin>
+                            }),
+                            practice: practice.clone().map(|practice| {
+                                Arc::new(practice) as Arc<dyn eve_practice_api::PracticeAdmin>
+                            }),
+                            skills: skills
+                                .clone()
+                                .map(|skills| Arc::new(skills) as Arc<dyn SkillAdmin>),
+                            outreach: outreach
+                                .clone()
+                                .map(|outreach| Arc::new(outreach) as Arc<dyn OutreachAdmin>),
+                        }
+                    }),
                 }),
             )
             .await?;

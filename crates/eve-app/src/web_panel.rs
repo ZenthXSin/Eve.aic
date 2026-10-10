@@ -30,6 +30,8 @@ pub(crate) struct QqPanel {
     pub memory: Option<crate::web_panel_memory::MemoryView>,
     /// 开启 --memory-learning 时的只读学习视图；面板不能记录决策或确认候选。
     pub learning: Option<crate::web_panel_learning::LearningRead>,
+    /// 开启 --interest-learning 时的只读自主学习视图；面板不能撤回兴趣、启停技能或投递邀请。
+    pub autonomy: Option<crate::web_panel_autonomy::AutonomyRead>,
     pub plugins: crate::web_panel_plugins::PanelPlugins,
 }
 fn session_error(error: SessionError) -> PanelError {
@@ -301,6 +303,10 @@ impl PanelService for QqPanel {
     ) -> PanelResult<MemoryEvidenceDetail> {
         let view = self.memory.as_ref().ok_or(PanelError::Unavailable)?;
         crate::web_panel_memory::evidence(view, scope, id)
+    }
+    fn memory_autonomy(&self, scope: &eve_memory_api::MemoryScope) -> PanelResult<AutonomyView> {
+        let read = self.autonomy.as_ref().ok_or(PanelError::Unavailable)?;
+        crate::web_panel_autonomy::autonomy(read, scope)
     }
     fn memory_learning(&self, scope: &eve_memory_api::MemoryScope) -> PanelResult<LearningView> {
         let read = self.learning.as_ref().ok_or(PanelError::Unavailable)?;

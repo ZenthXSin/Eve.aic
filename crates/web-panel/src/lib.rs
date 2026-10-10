@@ -115,6 +115,7 @@ impl LocalPanel {
             .route("/api/memory/scope", post(memory))
             .route("/api/memory/evidence", post(memory_evidence))
             .route("/api/memory/learning", post(memory_learning))
+            .route("/api/memory/autonomy", post(memory_autonomy))
             .route("/api/plugins", get(plugins))
             .route("/api/plugins/action", post(plugin_action))
             .route("/api/plugins/operations", get(plugin_operations))
@@ -650,6 +651,22 @@ async fn memory_evidence(
         Err(e) => failure(e),
     }
 }
+async fn memory_autonomy(
+    State(shared): State<Arc<Shared>>,
+    body: Result<Json<MemoryTarget>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_json");
+    };
+    if body.scope.validate().is_err() {
+        return error(StatusCode::BAD_REQUEST, "invalid_input");
+    }
+    match shared.service.memory_autonomy(&body.scope) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+
 async fn memory_learning(
     State(shared): State<Arc<Shared>>,
     body: Result<Json<MemoryTarget>, axum::extract::rejection::JsonRejection>,

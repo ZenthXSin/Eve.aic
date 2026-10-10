@@ -24,7 +24,7 @@ API 设置 5 秒异步请求期限、16 个同时处理请求和 16 KiB JSON 请
 - `eve-app` 在 QQ 宿主中组合已有 `SessionService`、`ControlService` 和通道状态；不旁路读取数据库，不从 HTTP 创建 Provider 或执行工具。
 - `SessionService::list_keys` / `ControlService::list_keys` 为兼容现有自定义实现新增默认不可用方法。内置实现按 `session_id` 字典序、独占游标、每页 1–100 项枚举完整可信身份；`BTreeMap.range` 有界读取，不将单页读取描述为跨页事务快照。停止后旧服务不可用。
 
-接口为 `GET /api/status`、`GET /api/sessions?after=...&limit=25`、`GET /api/tasks?after=...&limit=25`、`GET /api/judgments?before=...&limit=25`、`GET /api/goals?after=...&limit=25`、`GET /api/goal?id=...`、`POST /api/memory/scopes {after?,limit?}`、`POST /api/memory/scope {scope}`、`POST /api/memory/evidence {scope,id}`、`POST /api/memory/learning {scope}`、`POST /api/session {key,before?,limit?}` 和 `POST /api/cancel {target:GenerationKey}`。错误使用固定类别，不带密钥、输入或原始 Provider 报错。提交取消必须携带浏览器所见的完整会话、用户、任务、启动 epoch 和代号；代已变化时返回冲突，不偷换成最新任务。
+接口为 `GET /api/status`、`GET /api/sessions?after=...&limit=25`、`GET /api/tasks?after=...&limit=25`、`GET /api/judgments?before=...&limit=25`、`GET /api/goals?after=...&limit=25`、`GET /api/goal?id=...`、`POST /api/memory/scopes {after?,limit?}`、`POST /api/memory/scope {scope}`、`POST /api/memory/evidence {scope,id}`、`POST /api/memory/learning {scope}`、`POST /api/memory/autonomy {scope}`、`POST /api/session {key,before?,limit?}` 和 `POST /api/cancel {target:GenerationKey}`。错误使用固定类别，不带密钥、输入或原始 Provider 报错。提交取消必须携带浏览器所见的完整会话、用户、任务、启动 epoch 和代号；代已变化时返回冲突，不偷换成最新任务。
 
 ## 实时判断诊断
 
@@ -77,6 +77,10 @@ API 设置 5 秒异步请求期限、16 个同时处理请求和 16 KiB JSON 请
 
 ## 控制和恢复语义
 
+
+### 自主学习
+
+以 `--interest-learning` 启动时，记忆详情中还显示该用户的自主学习进展：兴趣与原话、领域知识（是否附来源原文、版本与网址）、最近的实践（学习目标或后续创作、结局、尝试次数、探测通过数与运行版本）、技能（启用版本、后台与对话中的调用及通过次数）以及主动邀请（状态、正文与识别出的回应）。未开启时 `POST /api/memory/autonomy` 返回 503。宿主把各账本句柄包进只调用读取方法的 `AutonomyRead`，面板不能撤回兴趣、启停技能或投递邀请。
 ### 插件管理与插件页面
 
 “插件管理”列出实际注册的插件、版本、运行状态、依赖与权限。宿主明确允许独立启停的插件才显示操作按钮；当前 QQ 宿主允许管理 `eve.segment.preferences`。QQ 通道、配置、控制、会话、认知与学习等已被宿主绑定的插件标为“调整后需重启程序”。停止操作会级联处理依赖者，因此不能通过可管理插件间接停止宿主固定插件。安装、卸载和外置动态加载不在此入口提供。
