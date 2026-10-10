@@ -32,6 +32,8 @@ pub(crate) struct QqPanel {
     pub learning: Option<crate::web_panel_learning::LearningRead>,
     /// 开启 --interest-learning 时的只读自主学习视图；面板不能撤回兴趣、启停技能或投递邀请。
     pub autonomy: Option<crate::web_panel_autonomy::AutonomyRead>,
+    /// 开启 --plans 时的计划账本；面板只能查看与撤销，不能建议、确认或开始步骤。
+    pub plans: Option<std::sync::Arc<dyn eve_plan_api::PlanJournal>>,
     pub plugins: crate::web_panel_plugins::PanelPlugins,
 }
 fn session_error(error: SessionError) -> PanelError {
@@ -303,6 +305,15 @@ impl PanelService for QqPanel {
     ) -> PanelResult<MemoryEvidenceDetail> {
         let view = self.memory.as_ref().ok_or(PanelError::Unavailable)?;
         crate::web_panel_memory::evidence(view, scope, id)
+    }
+    fn goal_plans(&self, goal_id: &str) -> PanelResult<GoalPlans> {
+        let plans = self.plans.as_ref().ok_or(PanelError::Unavailable)?;
+        let reader = self.cognition.as_ref().ok_or(PanelError::Unavailable)?;
+        crate::web_panel_plans::goal_plans(plans.as_ref(), reader.as_ref(), goal_id)
+    }
+    fn withdraw_plan(&self, plan_id: &str, revision: u64) -> PanelResult<PlanView> {
+        let plans = self.plans.as_ref().ok_or(PanelError::Unavailable)?;
+        crate::web_panel_plans::withdraw(plans.as_ref(), plan_id, revision)
     }
     fn memory_autonomy(&self, scope: &eve_memory_api::MemoryScope) -> PanelResult<AutonomyView> {
         let read = self.autonomy.as_ref().ok_or(PanelError::Unavailable)?;

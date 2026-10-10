@@ -394,6 +394,79 @@ pub struct LearningCandidateView {
     pub decisions: Vec<LearningDecisionView>,
     pub decisions_total: usize,
 }
+/// 一个目标的多步计划与建议请求记录。计划完成只说明每一步的效果条件都由证据满足，
+/// 不代表目标或现实任务完成。
+#[derive(Clone, Debug, Serialize)]
+pub struct GoalPlans {
+    pub goal_id: String,
+    /// 读取时目标的当前版本；计划绑定的版本不同即已不对应当前目标。
+    pub goal_revision: u64,
+    /// 新的在前。
+    pub plans: Vec<PlanView>,
+    /// 新的在前。
+    pub proposals: Vec<PlanProposalView>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct PlanView {
+    pub id: String,
+    /// 计划记录修订；撤销时须提交读取到的修订。
+    pub revision: u64,
+    pub goal_revision: u64,
+    /// `proposed`、`active`、`completed`、`blocked`、`stale` 或 `withdrawn`。
+    pub status: &'static str,
+    /// `operator` 或 `model`。
+    pub origin: &'static str,
+    pub created_at_ms: u64,
+    pub confirmed_at_ms: Option<u64>,
+    pub withdrawn_at_ms: Option<u64>,
+    pub stale_at_ms: Option<u64>,
+    /// 待确认或进行中，且没有执行中的步骤；只有此时可以撤销。
+    pub withdrawable: bool,
+    pub steps: Vec<PlanStepView>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct PlanStepView {
+    pub id: String,
+    /// 计划给出的说明；是数据，不是指令。
+    pub title: String,
+    pub capability: String,
+    pub depends_on: Vec<String>,
+    /// `pending`、`executing`、`satisfied`、`failed`、`blocked` 或 `invalidated`。
+    pub status: &'static str,
+    pub max_attempts: u8,
+    pub timeout_ms: u64,
+    pub attempts: Vec<PlanAttemptView>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct PlanAttemptView {
+    pub number: u8,
+    pub started_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
+    pub effect_met: bool,
+    /// `capability_failed`、`effect_not_met`、`timeout`、`cancelled`、`interrupted` 或 `binding_changed`。
+    pub failure: Option<&'static str>,
+    pub evidence: Option<PlanEvidenceView>,
+}
+/// 宿主读取到的证据；源 ID 是账本记录 ID，不是路径或凭据。
+#[derive(Clone, Debug, Serialize)]
+pub struct PlanEvidenceView {
+    pub source_id: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub verified_at_ms: u64,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct PlanProposalView {
+    pub id: String,
+    pub goal_revision: u64,
+    /// `requested`、`proposed`、`empty` 或 `failed`。
+    pub status: &'static str,
+    /// 失败原因：`provider`、`timeout`、`cancelled`、`invalid_output`、`interrupted` 或 `binding_changed`。
+    pub failure: Option<&'static str>,
+    pub requested_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
+}
+
 /// 一个用户的自主学习进展：兴趣、领域知识、实践、技能与主动邀请；只读。
 #[derive(Clone, Debug, Serialize)]
 pub struct AutonomyView {
@@ -535,6 +608,15 @@ pub trait PanelService: Send + Sync {
         Err(PanelError::Unavailable)
     }
     fn memory_learning(&self, _scope: &MemoryScope) -> PanelResult<LearningView> {
+        Err(PanelError::Unavailable)
+    }
+    /// 目标的多步计划与建议记录；宿主未开启计划入口时返回 Unavailable，不存在的目标返回 NotFound。
+    fn goal_plans(&self, _goal_id: &str) -> PanelResult<GoalPlans> {
+        Err(PanelError::Unavailable)
+    }
+    /// 本机操作者撤销待确认或进行中的计划。修订已变化、计划已结束或有步骤执行中时返回 Stale，
+    /// 不改动任何记录；成功只阻止未开始的步骤，已有证据保留。
+    fn withdraw_plan(&self, _plan_id: &str, _revision: u64) -> PanelResult<PlanView> {
         Err(PanelError::Unavailable)
     }
     /// 同一作用域内的一条来源证据；不存在时返回 NotFound。

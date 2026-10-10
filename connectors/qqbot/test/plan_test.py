@@ -7,7 +7,10 @@
 建议器是确定性替身，只证明宿主契约与恢复语义，不代表真实模型的计划质量。
 """
 import json
+import socket
 import unittest
+import urllib.error
+import urllib.request
 
 import practice_test
 
@@ -49,7 +52,7 @@ class PlanAcceptance(unittest.TestCase):
         base().tearDown(self)
 
     def run_eve(self, script, plans=True, **options):
-        more = ["--plans"] if plans else []
+        more = (["--plans"] if plans else []) + list(options.pop("more", []))
         options.setdefault("max_executions", 4)
         return base().run_eve(self, script, more=more, **options)
 
@@ -79,6 +82,51 @@ class PlanAcceptance(unittest.TestCase):
         self.inspect_run(lambda: self.wait_for(lambda: self.user_goal() is not None, "goal was not saved", 15),
                          prefix=self.send(self.message("goal", f"/goal {text}", contains="待办已保存")))
         return self.user_goal()
+
+    def test_panel_plan_reading_and_revision_guarded_withdrawal_persist_without_execution(self):
+        goal = self.save_goal()
+        gid = goal["id"]
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        token = "synthetic-plan-panel-token-1234567890"
+
+        def api(endpoint, body=None, supplied_token=token):
+            request = urllib.request.Request(f"http://127.0.0.1:{port}" + endpoint,
+                data=None if body is None else json.dumps(body).encode(),
+                headers={"Authorization": "Bearer " + supplied_token, "Content-Type": "application/json"})
+            try:
+                response = urllib.request.urlopen(request, timeout=5)
+            except urllib.error.HTTPError as error:
+                response = error
+            with response:
+                return response.status, json.loads(response.read())
+
+        def inspect_and_withdraw():
+            self.wait_for(self.proposed, "plan was not proposed", 15)
+            self.assertEqual(api("/api/goal/plans?id=" + gid, supplied_token="invalid")[0], 401)
+            self.assertEqual(api("/api/goal/plans?id=%20")[0], 400)
+            code, view = api("/api/goal/plans?id=" + gid)
+            self.assertEqual(code, 200)
+            self.assertEqual((view["goal_id"], view["plans"][0]["status"]), (gid, "proposed"))
+            plan = view["plans"][0]
+            request = {"plan_id": plan["id"], "revision": plan["revision"]}
+            self.assertEqual(api("/api/goal/plans/withdraw", {**request, "revision": plan["revision"] + 1})[0], 409)
+            self.assertEqual(self.plans()[0]["status"], "proposed")
+            code, result = api("/api/goal/plans/withdraw", request)
+            self.assertEqual((code, result["plan"]["status"]), (200, "withdrawn"))
+            self.assertEqual(api("/api/goal/plans/withdraw", request)[0], 409)
+            self.assertEqual(api("/api/goal/plans?id=" + gid)[1]["plans"][0]["status"], "withdrawn")
+
+        options = {"more": ["--web-listen", f"127.0.0.1:{port}"], "env_extra": {"EVE_WEB_TOKEN": token}}
+        self.inspect_run(inspect_and_withdraw,
+            prefix=self.send(self.message("propose", f"/plan propose {gid}", contains="已请求计划建议")), **options)
+        before = self.ledger()
+        self.inspect_run(lambda: self.assertEqual(
+            api("/api/goal/plans?id=" + gid)[1]["plans"][0]["status"], "withdrawn"), **options)
+        self.assertEqual(self.ledger(), before)
+        self.assertEqual(len(self.kind("plan")), 1)
+        self.assertEqual((self.research_runs(), self.practice_runs()), ([], []))
 
     def test_confirmed_plan_researches_then_practices_and_settles_from_ledger_evidence(self):
         goal = self.save_goal()
