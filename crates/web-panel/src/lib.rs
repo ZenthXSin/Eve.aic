@@ -111,6 +111,8 @@ impl LocalPanel {
             .route("/api/judgments", get(judgments))
             .route("/api/goals", get(goals))
             .route("/api/goal", get(goal))
+            .route("/api/goal/plans", get(goal_plans))
+            .route("/api/goal/plans/withdraw", post(withdraw_plan))
             .route("/api/memory/scopes", post(memory_scopes))
             .route("/api/memory/scope", post(memory))
             .route("/api/memory/evidence", post(memory_evidence))
@@ -574,6 +576,46 @@ async fn goal(
     }
     match shared.service.goal(&query.id) {
         Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+async fn goal_plans(
+    State(shared): State<Arc<Shared>>,
+    query: Result<Query<GoalQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return error(StatusCode::BAD_REQUEST, "invalid_query");
+    };
+    if !valid_id(&query.id) {
+        return error(StatusCode::BAD_REQUEST, "invalid_query");
+    }
+    match shared.service.goal_plans(&query.id) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanWithdraw {
+    plan_id: String,
+    revision: u64,
+}
+async fn withdraw_plan(
+    State(shared): State<Arc<Shared>>,
+    body: Result<Json<PlanWithdraw>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_json");
+    };
+    if !valid_id(&body.plan_id) || body.revision == 0 {
+        return error(StatusCode::BAD_REQUEST, "invalid_input");
+    }
+    // 请求可能在读取正文时遇到宿主停止；不让旧连接在准入关闭后提交新动作。
+    if !shared.open.load(Ordering::Acquire) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "stopping");
+    }
+    match shared.service.withdraw_plan(&body.plan_id, body.revision) {
+        Ok(plan) => Json(json!({"plan": plan})).into_response(),
         Err(e) => failure(e),
     }
 }
