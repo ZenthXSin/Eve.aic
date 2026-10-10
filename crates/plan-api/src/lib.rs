@@ -24,7 +24,9 @@ pub const MAX_PROPOSALS: usize = 64;
 pub const MAX_PROPOSAL_TEXT_BYTES: usize = 8192;
 pub const MAX_STEPS: usize = 8;
 pub const MAX_STEP_ATTEMPTS: u8 = 3;
-pub const MAX_STEP_TIMEOUT_MS: u64 = 30_000;
+/// 任何步骤的期限上限；每种能力在登记时再给出自己的上限（文件观察与导出仍为 30 秒，
+/// 研究与实践这类后台能力可到数分钟）。
+pub const MAX_STEP_TIMEOUT_MS: u64 = 1_800_000;
 pub const MAX_TITLE_BYTES: usize = 256;
 pub const MAX_PLAN_JSON_BYTES: usize = 16_384;
 pub const MAX_PLAN_STATE_BYTES: usize = 2_097_152;

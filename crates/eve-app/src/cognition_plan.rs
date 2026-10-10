@@ -31,6 +31,8 @@ pub(crate) const OBSERVE: &str = "eve.file.observe.v1";
 /// 以受控行动导出当前目标修订已完成的反思草稿到新文件，并独立回读。
 pub(crate) const EXPORT: &str = "eve.artifact.export.v1";
 const SUBJECT: &str = "eve";
+/// 文件观察是一次本地读取，期限上限 30 秒。
+const OBSERVE_TIMEOUT_MS: u64 = 30_000;
 
 /// 宿主登记的能力上限。导出有外部副作用，只允许一次尝试，且须绑定输入摘要。
 pub(crate) fn capabilities() -> Vec<CapabilitySpec> {
@@ -39,7 +41,7 @@ pub(crate) fn capabilities() -> Vec<CapabilitySpec> {
             id: OBSERVE.into(),
             description: "重新读取操作者在执行时绑定的文本文件，得到完整字节 SHA-256；只读，不修改目标或输入证据。".into(),
             max_attempts: MAX_STEP_ATTEMPTS,
-            max_timeout_ms: MAX_STEP_TIMEOUT_MS,
+            max_timeout_ms: OBSERVE_TIMEOUT_MS,
             requires_input: false,
         },
         CapabilitySpec {

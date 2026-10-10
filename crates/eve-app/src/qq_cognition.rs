@@ -42,7 +42,9 @@ pub(crate) const CONTROL_ID: &str = "eve.cognition.control";
 const CONTEXT_ID: &str = "eve.cognition.context";
 const CONTEXT_SERVICE: &str = "eve.cognition.context.service";
 const CONTROL_SERVICE: &str = "eve.cognition.control.service";
-const CHANNEL: &str = "qq.goal";
+/// QQ 用户以 /goal 保存的待办的来源渠道；计划入口据此核对待办归属。
+pub(crate) const GOAL_CHANNEL: &str = "qq.goal";
+const CHANNEL: &str = GOAL_CHANNEL;
 pub(crate) const INTERNAL_USER: &str = "cognition.internal";
 const HELP: &str =
     "用法：/goal 待办内容、/goals、/mind [目标ID]、/goal-feedback 目标ID 版本 反馈内容。";

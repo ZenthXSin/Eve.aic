@@ -1,12 +1,13 @@
 //! QQ 宿主的实践验证：为等待中的兴趣学习目标做最小产物并在操作者提供的运行环境中实际运行，
 //! 每个目标修订至多一次；准入与每一步先持久化，停止、超时与失败都留下记录且不重放。
-use crate::AppError;
+use crate::{AppError, qq_plan};
 use eve_cognition_api::{CognitionAdmin, Goal, GoalStatus, SourceKind, Visibility};
 use eve_interest_api::{INTEREST_GOAL_CHANNEL, INTEREST_GOAL_VERIFICATION, InterestAdmin};
 use eve_interest_plugin::learning_goal_id;
 use eve_knowledge_api::{KnowledgeAdmin, KnowledgeStatus, RunStatus as ResearchStatus};
 use eve_memory_api::validate_id;
 use eve_outreach_api::{REQUEST_GOAL_CHANNEL, REQUEST_GOAL_VERIFICATION, RequestMarker};
+use eve_plan_api::PlanJournal;
 use eve_plugin_api::{PluginError, PluginResult};
 use eve_practice_api::{
     AttemptOutcome, MAX_BRIEF_BYTES, MAX_NOTE_BYTES, MAX_NOTES, PracticeAdmin, PracticeAttempt,
@@ -67,6 +68,8 @@ pub(crate) struct Services {
     pub(crate) workspace_root: PathBuf,
     pub(crate) skills: Option<Skills>,
     pub(crate) forging: Option<Forging>,
+    /// 开启计划入口时，计划步骤请求实践的用户待办也会实践。
+    pub(crate) plans: Option<Arc<dyn PlanJournal>>,
 }
 
 pub(crate) struct Background {
@@ -222,6 +225,7 @@ async fn run(
         workspace_root,
         skills,
         forging,
+        plans,
     } = services;
     loop {
         if *active.borrow() {
@@ -264,11 +268,26 @@ async fn run(
             let snapshot = cognition
                 .snapshot()
                 .map_err(|_| "实践验证无法读取学习目标")?;
+            let requested = match &plans {
+                Some(plans) => qq_plan::requested(&plans.snapshot()?, qq_plan::PRACTICE),
+                None => Vec::new(),
+            };
             let mut goals: Vec<(&Goal, Eligible<'_>)> = snapshot
                 .state
                 .goals
                 .values()
-                .filter_map(|goal| eligible(goal).map(|eligible| (goal, eligible)))
+                .filter_map(|goal| {
+                    eligible(goal)
+                        .or_else(|| {
+                            // 计划步骤请求的用户待办：用同一待办研究到的知识，研究已由计划排在前面。
+                            qq_plan::requested_goal(goal, &requested).map(|owner| Eligible {
+                                owner,
+                                knowledge_goal: goal.id.clone(),
+                                researched: false,
+                            })
+                        })
+                        .map(|eligible| (goal, eligible))
+                })
                 .collect();
             goals.sort_by_key(|(goal, _)| (Reverse(goal.priority), goal.id.clone()));
             for (goal, eligible) in goals {

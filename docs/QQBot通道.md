@@ -190,6 +190,8 @@ python3 connectors/qqbot/test/segment_test.py
 
 `--skill-learning`（需同时指定实践运行环境）把实际验证通过的实践提炼为参数化技能：宿主核对模板能逐字还原原产物，再用自己选取的不同参数在同一运行环境中实际运行通过才自动启用；同一用户的后续任务第一次尝试可选用技能。`/skills` 列出技能，`/skill 技能ID` 查看版本、验证证据、启用记录与调用，`/skill disable|rollback 技能ID`、`/skill enable 技能ID 版本` 停用、回退或启用，见[技能固化与复用](./技能固化与复用.md)。
 
+`--plans`（需同时开启受控研究或实践运行环境）让用户为自己的待办请模型建议多步计划：`/plan propose 待办ID` 每个版本至多一次、只建议不执行，`/plan confirm 待办ID` 确认后由后台按依赖推进，计划只能使用已开启的受控研究与实践验证，步骤效果按账本证据判定；`/plans [待办ID]` 查看进度与证据，`/plan withdraw 待办ID` 撤销，见[多步计划](./多步计划.md#qq-入口)。
+
 `--outreach`（需同时指定实践运行环境）在学习目标有了已验证的进展后撰写一条邀请：用户下次私聊找 Eve 时先判断时机，合适才作为最后一段随被动回复附带，以平台回执为准；`--outreach-proactive-after-ms` 开启等待后的主动私聊，`--outreach-cooldown-ms` 调整同一用户的送达间隔；`/outreach` 查看状态与回执，`/outreach off|on` 关闭或恢复，见[主动交流与邀请](./主动交流与邀请.md)。
 
 `--self-learning` 同时开启记忆、持续提炼和分段，证据充分的候选自动确认，明确节奏自动参与后续发送。`/self-learning status` 查看模式及关联情况；手动分段选择优先，`/segment reset` 清除手动选择并恢复跟随学习。默认提炼间隔五分钟，`--learning-cooldown-ms` 可调整。行为、恢复和容量见[自主偏好学习](./自主偏好学习.md)。
