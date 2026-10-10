@@ -283,6 +283,7 @@ dependencies = [
  "eve-config-plugin",
  "eve-control-api",
  "eve-control-plugin",
+ "eve-dialogue-tools",
  "eve-file-observer",
  "eve-interest-api",
  "eve-interest-plugin",
@@ -435,6 +436,26 @@ dependencies = [
  "eve-plugin-api",
  "eve-session-api",
  "getrandom 0.4.3",
+ "tokio",
+]
+
+[[package]]
+name = "eve-dialogue-tools"
+version = "0.1.0"
+dependencies = [
+ "eve-cognition-api",
+ "eve-interest-api",
+ "eve-knowledge-api",
+ "eve-llm-api",
+ "eve-memory-api",
+ "eve-outreach-api",
+ "eve-plan-api",
+ "eve-practice-api",
+ "eve-skill-api",
+ "eve-toolforge-api",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

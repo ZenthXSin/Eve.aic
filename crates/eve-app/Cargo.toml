@@ -27,6 +27,7 @@ name = "eve-memory"
 path = "src/bin/memory.rs"
 
 [dependencies]
+eve-dialogue-tools = { path = "../dialogue-tools" }
 eve-action-api = { path = "../action-api" }
 eve-action-plugin = { path = "../action-plugin" }
 eve-artifact-file = { path = "../artifact-file" }

@@ -1,0 +1,24 @@
+[package]
+name = "eve-dialogue-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-llm-api = { path = "../llm-api" }
+eve-memory-api = { path = "../memory-api" }
+eve-interest-api = { path = "../interest-api" }
+eve-cognition-api = { path = "../cognition-api" }
+eve-knowledge-api = { path = "../knowledge-api" }
+eve-practice-api = { path = "../practice-api" }
+eve-skill-api = { path = "../skill-api" }
+eve-toolforge-api = { path = "../toolforge-api" }
+eve-plan-api = { path = "../plan-api" }
+eve-outreach-api = { path = "../outreach-api" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

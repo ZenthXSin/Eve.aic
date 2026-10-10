@@ -100,6 +100,8 @@ class InterestAcceptance(unittest.TestCase):
                 response = ({"error": {"message": "local provider unavailable", "type": "test_error"}}
                             if status != 200 else {"choices": [{"index": 0, "finish_reason": "stop",
                                                                  "message": {"role": "assistant", "content": text}}]})
+                if status == 200 and hasattr(outer, "provider_response"):
+                    response = outer.provider_response(body, kind, response)
                 encoded = json.dumps(response).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
