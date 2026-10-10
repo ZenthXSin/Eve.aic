@@ -53,6 +53,19 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
         for name in self.definitions(body):
             self.assertIn(name, text)
 
+    def current_capabilities(self, body):
+        # 紧邻本轮输入的宿主事实必须覆盖旧助手自述，并与真正协议定义一致。
+        messages = body["messages"]
+        current = max(index for index, message in enumerate(messages) if message["role"] == "user")
+        self.assertEqual(messages[current - 1]["role"], "system")
+        notice = messages[current - 1]["content"]
+        self.assertNotIn("memory: ", notice)
+        data = json.loads(notice.splitlines()[1])
+        self.assertEqual(data["kind"], "eve.runtime.tool-capabilities")
+        self.assertEqual(data["count"], len(self.definitions(body)))
+        self.assertEqual({tool["name"] for tool in data["tools"]}, self.definitions(body))
+        return data
+
     def results(self, body):
         messages = body["messages"]
         current = max(index for index, message in enumerate(messages) if message["role"] == "user")
@@ -104,6 +117,53 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
                       *self.send(self.message("query", "查看记忆", expected="只读取当前会话"))],
                      interest=False, memory=True, research=False, practice=False)
         self.assertEqual(self.chat_rounds, 2)
+
+    def test_existing_session_refreshes_tools_without_erasing_history_or_replaying(self):
+        old_reply = "只有一个 echo 工具，不联网也不读写文件。"
+
+        def old(body):
+            self.assertEqual(self.definitions(body), {"echo", "search_memory"})
+            self.current_capabilities(body)
+            return text_response(old_reply)
+
+        self.callback = old
+        self.run_eve(self.send(self.message("old", "你现在有什么工具呢", expected=old_reply)),
+                     interest=False, memory=True, research=False, practice=False,
+                     more=["--memory-recall"])
+
+        def upgraded(body):
+            self.assertEqual(self.definitions(body), ALL_TOOLS)
+            self.current_capabilities(body)
+            self.assertIn({"role": "assistant", "content": old_reply}, body["messages"])
+            self.assertTrue(any(m["role"] == "system" and "eve-memory-recall-v1" in
+                                m.get("content", "") for m in body["messages"]),
+                            "旧回答的召回也保留，但不能覆盖本轮能力")
+            if not self.results(body):
+                return tool_response([("list_interests", {}), ("list_goals", {})])
+            self.assertEqual(len(self.results(body)), 2)
+            return text_response("当前可调用 14 个工具，刚才已核对兴趣与目标。")
+
+        self.callback = upgraded
+        self.full([*self.send(self.message("help-upgraded", "/help", contains="14 个")),
+                   *self.send(self.message("upgraded", "你现在有什么工具呢", expected=
+                                          "当前可调用 14 个工具，刚才已核对兴趣与目标。"))],
+                  more=["--self-learning", "--memory-recall", "--training", "--skill-learning",
+                        "--tool-forging", "--plans", "--outreach"])
+        self.assertEqual(len(self.kind("chat")), 3)
+        self.assertEqual(self.practice_runs(), [])
+
+        def reduced(body):
+            self.assertEqual(self.definitions(body), {"echo", "search_memory"})
+            self.current_capabilities(body)
+            self.assertTrue(any(m["role"] == "assistant" and "14 个工具" in
+                                (m.get("content") or "") for m in body["messages"]))
+            return text_response("当前只装配了 2 个工具，原历史仍保留。")
+
+        self.callback = reduced
+        self.run_eve(self.send(self.message("reduced", "你现在有什么工具呢", expected=
+                                           "当前只装配了 2 个工具，原历史仍保留。")),
+                     interest=False, memory=True, research=False, practice=False)
+        self.assertEqual(len(self.kind("chat")), 4)
 
     def test_direct_practice_persists_real_evidence_and_restarts_without_replay(self):
         def goal():

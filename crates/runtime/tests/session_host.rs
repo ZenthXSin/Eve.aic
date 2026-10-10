@@ -320,12 +320,17 @@ async fn two_turns_replay_complete_tool_history_without_executing_old_calls() {
         [first.output.transcript.clone(), second.output.transcript].concat()
     );
     let requests = provider.requests.lock().unwrap().clone();
-    let prefix_len = requests[0].messages.len() - 1;
+    // 固定上下文位于历史之前；本轮能力事实在恢复后的历史之后重新生成。
+    let prefix_len = requests[0].messages.len() - 2;
     assert_eq!(
         &requests[0].messages[..prefix_len],
         &requests[2].messages[..prefix_len]
     );
     assert_eq!(requests[0].tools, requests[2].tools);
+    assert_eq!(
+        requests[0].messages[prefix_len],
+        requests[2].messages[prefix_len + first.output.transcript.len()]
+    );
     assert_eq!(
         &requests[2].messages[prefix_len..prefix_len + 4],
         first.output.transcript
