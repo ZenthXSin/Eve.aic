@@ -1,7 +1,7 @@
 use crate::{
     AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_cognition, qq_interest,
     qq_learning, qq_learning_commands, qq_memory, qq_memory_observer, qq_outreach, qq_plan,
-    qq_practice, qq_research, qq_skill, qq_tools, segment_commands,
+    qq_practice, qq_research, qq_semantic, qq_skill, qq_tools, segment_commands,
 };
 use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
@@ -47,6 +47,7 @@ use eve_segment_api::SegmentPreferences;
 use eve_segment_plugin::{
     ParagraphPlanner, RuleSegmentAdvisor, SEGMENT_PREFERENCES_PLUGIN_ID, SegmentPreferencePlugin,
 };
+use eve_semantic_plugin::{HybridRecall, Indexer, SEMANTIC_PLUGIN_ID, SemanticPlugin};
 use eve_session_api::{SESSION_SERVICE_ID, SessionServiceHandle};
 use eve_skill_api::{SKILL_PLUGIN_ID, SkillAdmin, SkillDistiller, SkillSelector};
 use eve_skill_plugin::{
@@ -61,7 +62,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -74,6 +75,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --cognition 开启本地内生反思；/goal 内容保存待办，/goals 查看版本，/mind [目标ID] 查询当前草稿；/goal-feedback 目标ID 版本 反馈内容触发重新评估。
 --memory 开启有来源的交互记忆；/remember 内容、/memories [页码]、/correct-memory ID 内容、/forget ID、/recall 关键词。
 --memory-recall 需同时 --memory；按本轮输入检索当前可信会话的已保存交互与有效偏好，最多 3 条低优先级来源片段，默认关闭。
+--semantic-recall 需同时 --memory-recall，并启用 embedding 语义模型角色（EVE_MODELS_SEMANTIC_ENABLED、_PROVIDER=openai、_MODEL、_DIMENSIONS）；后台为已保存的记忆建立向量索引，召回时把词项排名与向量相似度排名融合，没有共同字词的相近说法也能找到；向量模型不可用时改用词项召回并在资料中标明。/semantic 查看索引进度。
 --memory-learning 需同时 --memory；每会话至少 3 条新经历触发首批，后续默认间隔 5 分钟（--learning-cooldown-ms 可调整），单次启动最多 4 次请求。
 --self-learning 开启持续自主学习（同时开启记忆、提炼和分段）；内置策略要求自评至少 80、至少两条真实交互，并复核重复、手动及撤销冲突。
 /self-learning status 查看模式、已关联候选与容量；自动节奏跟随有效偏好，手动设置优先；/segment reset 清除手动设置并恢复跟随学习。
@@ -115,6 +117,8 @@ pub struct QqBotOptions {
     pub cognition: bool,
     pub memory: bool,
     pub memory_recall: bool,
+    /// 记忆召回同时按语义模型角色的向量相似度排序；需要 --memory-recall。
+    pub semantic_recall: bool,
     pub memory_learning: bool,
     pub self_learning: bool,
     pub learning_options: LearningOptions,
@@ -159,6 +163,7 @@ impl Default for QqBotOptions {
             cognition: false,
             memory: false,
             memory_recall: false,
+            semantic_recall: false,
             memory_learning: false,
             self_learning: false,
             learning_options: LearningOptions::default(),
@@ -204,6 +209,10 @@ impl QqBotOptions {
             }
             if arg == "--memory-recall" {
                 options.memory_recall = true;
+                continue;
+            }
+            if arg == "--semantic-recall" {
+                options.semantic_recall = true;
                 continue;
             }
             if arg == "--memory-learning" {
@@ -335,6 +344,9 @@ impl QqBotOptions {
         }
         if options.memory_recall && !options.memory {
             return Err("--memory-recall 需要同时开启 --memory".into());
+        }
+        if options.semantic_recall && !options.memory_recall {
+            return Err("--semantic-recall 需要同时开启 --memory-recall".into());
         }
         research_policy(&options)?;
         if options.practice_server_jar.is_none()
@@ -599,6 +611,7 @@ async fn run_qqbot_composed(
     let mut practice_background: Option<qq_practice::Background> = None;
     let mut outreach_background: Option<qq_outreach::Background> = None;
     let mut plan_background: Option<qq_plan::Background> = None;
+    let mut semantic_background: Option<qq_semantic::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
     let mut panel: Option<eve_web_panel::LocalPanel> = None;
     let page_permit = eve_web_panel_api::PageWritePermit::default();
@@ -748,13 +761,35 @@ async fn run_qqbot_composed(
             }
             None => context,
         };
+        // 语义索引账本同样先于通道加载；损坏时拒绝启动并保留原字节。
+        let semantic = if options.semantic_recall {
+            let plugin = SemanticPlugin::new()?;
+            let index = plugin.index();
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(SEMANTIC_PLUGIN_ID)?).await?;
+            Some((index, Arc::new(qq_semantic::DeferredEmbeddings::new())))
+        } else {
+            None
+        };
         bootstrap.context = Some(if options.memory_recall {
             let memory = memory.clone().ok_or("记忆召回缺少记忆服务")?;
-            Arc::new(MemoryRecallContext::new(
-                "qq",
-                Arc::new(LexicalMemoryRecall::new(memory)),
-                context,
-            )?)
+            let lexical: Arc<dyn eve_memory_api::MemoryRecallFactory> =
+                Arc::new(LexicalMemoryRecall::new(memory.clone()));
+            match &semantic {
+                // 词项与语义混合召回；向量模型在核心装配后注入，通道收消息前完成。
+                Some((index, embeddings)) => Arc::new(MemoryRecallContext::with_async_recall(
+                    "qq",
+                    Arc::new(HybridRecall::new(
+                        memory,
+                        lexical.clone(),
+                        index.clone(),
+                        embeddings.clone(),
+                    )),
+                    lexical,
+                    context,
+                )?),
+                None => Arc::new(MemoryRecallContext::new("qq", lexical, context)?),
+            }
         } else {
             context
         });
@@ -768,6 +803,30 @@ async fn run_qqbot_composed(
             options.web_listen.map(|_| page_permit.clone()),
         )
         .await?;
+        // 配置服务此时可用：读取语义模型角色，无效时拒绝启动；注入后再启动建索引后台。
+        let semantic_commands = match &semantic {
+            Some((index, embeddings)) => {
+                let settings = registry
+                    .get(&ServiceId::new(CONFIG_SERVICE_ID)?)?
+                    .ok_or("语义召回配置服务缺失")?
+                    .value
+                    .downcast::<ConfigServiceHandle>()
+                    .map_err(|_| "语义召回配置服务类型错误")?;
+                let key = std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "缺少模型凭据")?;
+                let provider: Arc<dyn eve_semantic_api::EmbeddingProvider> =
+                    Arc::new(qq_semantic::configured(settings.0.as_ref(), &key)?);
+                embeddings.set(provider.clone());
+                let started = qq_semantic::Background::start(Indexer::new(
+                    memory.clone().ok_or("语义召回缺少记忆服务")?,
+                    index.clone(),
+                    provider,
+                ));
+                let commands = started.commands();
+                semantic_background = Some(started);
+                commands
+            }
+            None => qq_semantic::Commands::disabled(),
+        };
         let learning_commands = if let (Some(learning), Some(memory)) = (&learning, &memory) {
             let extractor = match extractor {
                 Some(extractor) => extractor,
@@ -1148,6 +1207,7 @@ async fn run_qqbot_composed(
             skill_commands,
             tool_commands,
             plan_commands,
+            semantic_commands,
             outreach_commands,
             segment_commands,
         ])));
@@ -1305,6 +1365,9 @@ async fn run_qqbot_composed(
         if let Some(plans) = &plan_background {
             plans.activate();
         }
+        if let Some(semantic) = &semantic_background {
+            semantic.activate();
+        }
         wait_channel(
             handle.status.clone(),
             background.as_ref().map(qq_cognition::Background::finished),
@@ -1336,6 +1399,12 @@ async fn run_qqbot_composed(
                     (
                         plans.finished(),
                         "计划后台已结束；QQ 通道停止准入并保留状态",
+                    )
+                }))
+                .chain(semantic_background.as_ref().map(|semantic| {
+                    (
+                        semantic.finished(),
+                        "语义索引后台已结束；QQ 通道停止准入并保留状态",
                     )
                 }))
                 .collect(),
@@ -1384,6 +1453,15 @@ async fn run_qqbot_composed(
     }
     if let Some(plans) = &plan_background {
         plans.request_stop();
+    }
+    if let Some(semantic) = &semantic_background {
+        semantic.request_stop();
+    }
+    // 语义索引后台读取记忆并写索引账本；请求失败不写入，先结束进行中的请求。
+    if let Some(semantic) = semantic_background
+        && let Err(error) = semantic.stop().await
+    {
+        secondary.push(error);
     }
     // 计划后台读取研究、实践与认知状态并写计划账本；先结束进行中的建议请求。
     if let Some(plans) = plan_background
@@ -1699,6 +1777,17 @@ mod recall_options_tests {
         ])
         .unwrap();
         assert!(options.tool_forging && !options.skill_learning);
+    }
+
+    #[test]
+    fn semantic_recall_is_explicit_and_requires_memory_recall() {
+        assert!(!parse(&[]).unwrap().semantic_recall);
+        let error = parse(&["--memory", "--semantic-recall"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--memory-recall"));
+        let options = parse(&["--memory", "--memory-recall", "--semantic-recall"]).unwrap();
+        assert!(options.semantic_recall && options.memory_recall);
     }
 
     #[test]

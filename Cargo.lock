@@ -312,6 +312,8 @@ dependencies = [
  "eve-runtime",
  "eve-segment-api",
  "eve-segment-plugin",
+ "eve-semantic-api",
+ "eve-semantic-plugin",
  "eve-session-api",
  "eve-session-plugin",
  "eve-skill-api",
@@ -577,6 +579,7 @@ name = "eve-llm-openai"
 version = "0.1.0"
 dependencies = [
  "eve-llm-api",
+ "eve-semantic-api",
  "reqwest",
  "serde",
  "serde_json",
@@ -813,6 +816,29 @@ dependencies = [
  "eve-kernel",
  "eve-plugin-api",
  "eve-segment-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "eve-semantic-api"
+version = "0.1.0"
+
+[[package]]
+name = "eve-semantic-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-kernel",
+ "eve-llm-api",
+ "eve-memory-api",
+ "eve-memory-plugin",
+ "eve-plugin-api",
+ "eve-semantic-api",
+ "eve-session-api",
+ "eve-session-plugin",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
