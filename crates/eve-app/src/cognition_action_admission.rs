@@ -246,7 +246,7 @@ pub(crate) fn current_plan_binding(
 }
 
 /// 读取真实 Session 中已验证反思的结构化产物；会话、轮次或产物与目标记录不符时报错。
-fn saved_artifact(
+pub(crate) fn saved_artifact(
     sessions: &dyn SessionService,
     reflection: &Goal,
 ) -> Result<ReflectionArtifact, AppError> {
@@ -316,7 +316,7 @@ pub(crate) fn plan_context(
     Ok((parent.description.clone(), artifact))
 }
 
-fn verified_reflection(reflection: &Goal, parent: &Goal) -> bool {
+pub(crate) fn verified_reflection(reflection: &Goal, parent: &Goal) -> bool {
     reflection.status == GoalStatus::Completed
         && reflection.visibility == parent.visibility
         && reflection.revision != 0

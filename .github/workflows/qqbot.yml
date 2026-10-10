@@ -77,6 +77,7 @@ jobs:
           python3 connectors/qqbot/test/practice_test.py
           python3 connectors/qqbot/test/skill_test.py
           python3 connectors/qqbot/test/toolforge_test.py
+          python3 connectors/qqbot/test/plan_test.py
           python3 connectors/qqbot/test/outreach_test.py
           python3 connectors/qqbot/test/journey_test.py
           python3 connectors/qqbot/test/segment_test.py

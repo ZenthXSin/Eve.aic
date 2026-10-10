@@ -1,6 +1,6 @@
 //! QQ 宿主的受控研究：为等待中的兴趣学习目标在操作者配置的来源范围内研究，
 //! 每个目标修订至多一次；准入与每个阶段先持久化，停止、超时与失败都留下记录且不重试。
-use crate::AppError;
+use crate::{AppError, qq_plan};
 use eve_cognition_api::{CognitionAdmin, Goal, GoalStatus, SourceKind, Visibility};
 use eve_interest_api::{
     INTEREST_GOAL_CHANNEL, INTEREST_GOAL_VERIFICATION, InterestAdmin, InterestStatus,
@@ -13,6 +13,7 @@ use eve_knowledge_api::{
 };
 use eve_knowledge_plugin::Researcher;
 use eve_memory_api::validate_id;
+use eve_plan_api::PlanJournal;
 use eve_plugin_api::{PluginError, PluginResult};
 use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput};
 use std::{
@@ -50,13 +51,17 @@ impl Background {
         cognition: Arc<dyn CognitionAdmin>,
         researcher: Arc<Researcher>,
         policy: SourcePolicy,
+        plans: Option<Arc<dyn PlanJournal>>,
     ) -> Self {
         let (active, activated) = watch::channel(false);
         let (stop, stopped) = watch::channel(false);
         let (finished_sender, finished) = watch::channel(false);
         let task = tokio::spawn(async move {
             // Sender 在 panic 时也释放；宿主随后关闭通道，不假装后台仍正常。
-            let result = run(knowledge, cognition, researcher, policy, activated, stopped).await;
+            let result = run(
+                knowledge, cognition, researcher, policy, plans, activated, stopped,
+            )
+            .await;
             let _ = finished_sender.send(true);
             result
         });
@@ -120,6 +125,7 @@ async fn run(
     cognition: Arc<dyn CognitionAdmin>,
     researcher: Arc<Researcher>,
     policy: SourcePolicy,
+    plans: Option<Arc<dyn PlanJournal>>,
     mut active: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
 ) -> Result<(), AppError> {
@@ -143,11 +149,20 @@ async fn run(
             let snapshot = cognition
                 .snapshot()
                 .map_err(|_| "受控研究无法读取学习目标")?;
+            // 兴趣派生的学习目标，以及计划步骤正在请求研究的用户待办。
+            let requested = match &plans {
+                Some(plans) => qq_plan::requested(&plans.snapshot()?, qq_plan::RESEARCH),
+                None => Vec::new(),
+            };
             let mut goals: Vec<(&Goal, &str)> = snapshot
                 .state
                 .goals
                 .values()
-                .filter_map(|goal| eligible(goal).map(|owner| (goal, owner)))
+                .filter_map(|goal| {
+                    eligible(goal)
+                        .or_else(|| qq_plan::requested_goal(goal, &requested))
+                        .map(|owner| (goal, owner))
+                })
                 .collect();
             goals.sort_by_key(|(goal, _)| (Reverse(goal.priority), goal.id.clone()));
             for (goal, owner) in goals {
