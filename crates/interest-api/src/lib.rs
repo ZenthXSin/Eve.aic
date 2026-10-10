@@ -8,6 +8,8 @@ use eve_memory_api::{
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt, future::Future, pin::Pin};
+mod settings;
+pub use settings::*;
 
 pub const INTEREST_PLUGIN_ID: &str = "eve.interest";
 pub const INTEREST_STATE_KEY: &str = "interests.v1";
@@ -39,7 +41,8 @@ pub type InterestResult<T> = Result<T, InterestError>;
 pub type InterestFuture<'a, T> = Pin<Box<dyn Future<Output = InterestResult<T>> + Send + 'a>>;
 
 /// 低频观察节奏；默认每条新送达的交互都可触发，但同一作用域受冷却限制。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservationOptions {
     pub min_new_evidence: usize,
     pub max_batch_evidence: usize,

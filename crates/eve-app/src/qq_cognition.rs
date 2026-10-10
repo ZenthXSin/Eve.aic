@@ -408,6 +408,7 @@ struct QqPolicy {
     enabled: Arc<AtomicBool>,
     admin: CognitionController,
     parents: ExecutionScope,
+    interest_settings: Option<Arc<dyn eve_interest_api::InterestSettingsReader>>,
 }
 impl DrivePolicy for QqPolicy {
     fn rank(&self, goals: &[Goal], now_ms: u64) -> LoopResult<Vec<RankedGoal>> {
@@ -428,6 +429,11 @@ impl DrivePolicy for QqPolicy {
             return Ok(vec![]);
         }
         // QQ 待办必须属于明确用户；宿主的 Internal 读取范围不扩大此准入条件。
+        let interests_enabled = self.interest_settings.as_ref().is_none_or(|settings| {
+            settings
+                .snapshot()
+                .is_ok_and(|snapshot| snapshot.settings.enabled)
+        });
         let user_goals: Vec<_> = goals
             .iter()
             .filter(|goal| {
@@ -436,7 +442,12 @@ impl DrivePolicy for QqPolicy {
                         .state
                         .goals
                         .get(&goal.source.reference)
-                        .is_some_and(|parent| parent.visibility == goal.visibility)
+                        .is_some_and(|parent| {
+                            parent.visibility == goal.visibility
+                                && (parent.source.channel
+                                    != eve_interest_api::INTEREST_GOAL_CHANNEL
+                                    || interests_enabled)
+                        })
             })
             .cloned()
             .collect();
@@ -498,6 +509,7 @@ pub(crate) async fn start(
     max: u16,
     factory: Arc<dyn EndogenousPlannerFactory>,
     interest_goals: bool,
+    interest_settings: Option<Arc<dyn eve_interest_api::InterestSettingsReader>>,
 ) -> Result<Background, AppError> {
     let plugin = CognitionPlugin::new("eve")?;
     let admin = plugin.controller();
@@ -586,6 +598,7 @@ pub(crate) async fn start(
             enabled: enabled.clone(),
             admin: admin.clone(),
             parents: reflection_scope(interest_goals),
+            interest_settings,
         }),
         Arc::new(ReflectionVerifier),
         executor,
@@ -760,6 +773,7 @@ mod agenda_policy_tests {
             enabled: enabled.clone(),
             admin,
             parents: reflection_scope(false),
+            interest_settings: None,
         };
         let ranked = policy.rank_with_state(&snapshot, &goals, 1_000).unwrap();
         assert_eq!(ranked.len(), 1);

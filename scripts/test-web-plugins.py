@@ -136,7 +136,8 @@ def main():
                     require(api(url, path, token=None)[0] == 401, "未登录插件接口没有被拒绝")
                 require(api(url, "/api/plugins")[0] == 200, "无法读取真实插件")
                 links = api(url, "/api/plugin-pages")[1]
-                require(len(links) == 5 and all(link["plugin_id"] == "eve.config" for link in links), "配置插件没有注册全部页面")
+                require(len([link for link in links if link["plugin_id"] == "eve.config"]) == 5, "配置插件没有注册全部页面")
+                require(any(link["plugin_id"] == "eve.interest.settings" and link["page"]["id"] == "learning" for link in links), "未传启动参数时缺少兴趣学习页面")
                 if "--browser" in sys.argv:
                     subprocess.run(["node", str(ROOT / "scripts/test-web-plugins-browser.mjs"), url, TOKEN], check=True,
                                    timeout=60, env=os.environ.copy())

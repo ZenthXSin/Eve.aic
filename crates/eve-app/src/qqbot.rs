@@ -515,77 +515,19 @@ async fn run_qqbot_composed(
     confirmation: Option<Arc<dyn AutoConfirmationPolicy>>,
     interest_components: InterestComponents,
 ) -> Result<QqBotStatus, AppError> {
-    if options.self_learning {
-        options.memory = true;
-        options.memory_learning = true;
-        options.segmented = true;
-    }
-    if options.interest_learning {
-        options.memory = true;
-        options.cognition = true;
-    }
-    if options.memory_learning && !options.memory {
+    // 明确的启动依赖错误仍在打开存储前拒绝；面板允许预装热启用所需记忆。
+    let memory_available = options.memory
+        || options.self_learning
+        || options.interest_learning
+        || options.web_listen.is_some();
+    if options.memory_learning && !memory_available {
         return Err("--memory-learning 需要同时开启 --memory".into());
     }
-    if options.memory_recall && !options.memory {
+    if options.memory_recall && !memory_available {
         return Err("--memory-recall 需要同时开启 --memory".into());
     }
     options.learning_options.validate()?;
     options.interest_options.validate()?;
-    let research_policy = research_policy(&options)?;
-    let practice_enabled = options.practice_server_jar.is_some()
-        || options.practice_browser.is_some()
-        || interest_components.runner.is_some();
-    if practice_enabled && !options.interest_learning {
-        return Err("实践验证需要同时开启 --interest-learning".into());
-    }
-    if options.skill_learning && !practice_enabled {
-        return Err("技能固化需要同时开启实践验证".into());
-    }
-    if options.tool_forging && !practice_enabled {
-        return Err("工具锻造需要同时开启实践验证".into());
-    }
-    if options.plans && !practice_enabled && research_policy.is_none() {
-        return Err("计划入口需要同时开启受控研究或实践验证".into());
-    }
-    if options.outreach && !practice_enabled {
-        return Err("主动交流需要同时开启实践验证".into());
-    }
-    let panel_config = options
-        .web_listen
-        .map(|address| -> Result<_, AppError> {
-            let token =
-                std::env::var("EVE_WEB_TOKEN").map_err(|_| "开启本机面板需要 EVE_WEB_TOKEN")?;
-            let config = eve_web_panel::PanelConfig { address, token };
-            config.validate()?;
-            Ok(config)
-        })
-        .transpose()?;
-    if !(1..=32).contains(&options.cognition_max_executions) {
-        return Err("认知执行上限必须为 1 至 32 的整数".into());
-    }
-    let app_secret = std::env::var("QQBOT_APP_SECRET").map_err(|_| "缺少 QQBOT_APP_SECRET")?;
-    let sandbox = match std::env::var("QQBOT_SANDBOX").as_deref() {
-        Ok("true") => true,
-        Ok("" | "false") | Err(_) => false,
-        _ => return Err("QQBOT_SANDBOX 必须为 true 或 false".into()),
-    };
-    let mut bootstrap = core_bootstrap(&options.agent_path)?;
-    let plugin = QqBotPlugin::new(QqBotConfig {
-        node_program: options.node_program,
-        bridge_script: options.bridge_script,
-        bridge_args: options.bridge_args,
-        app_id: std::env::var("QQBOT_APP_ID").unwrap_or_else(|_| DEFAULT_QQBOT_APP_ID.into()),
-        app_secret,
-        sandbox,
-    })?
-    .with_training()?
-    .with_natural_message_judgement(options.message_judge != MessageJudgeMode::Off);
-    let plugin = if options.segmented {
-        plugin.with_segmenter(Arc::new(ParagraphPlanner::default()), QQ_SEGMENT_LIMITS)?
-    } else {
-        plugin
-    };
     let backends = KernelServices {
         state: crate::storage::open_state_store(
             &options.state_directory,
@@ -618,6 +560,100 @@ async fn run_qqbot_composed(
     // 插件只能弱引用此宿主诊断句柄，避免 QQ 插件与 Kernel 形成引用环。
     let runtime_inspector: Arc<dyn eve_plugin_api::RuntimeInspector> = Arc::new(kernel.clone());
     let result: Result<(), AppError> = async {
+        // 面板只保存配置；独立后台通过只读契约订阅，所有异常仍走统一收尾。
+        let settings = eve_interest_plugin::InterestSettingsPlugin::new(
+            eve_interest_api::InterestLearningSettings {
+                enabled: options.interest_learning,
+                observation: options.interest_options.clone(),
+            },
+        )?;
+        let interest_settings = settings.controller();
+        let settings = if options.web_listen.is_some() {
+            settings.with_web_pages(page_permit.clone())
+        } else {
+            settings
+        };
+        kernel.register(Box::new(settings))?;
+        kernel
+            .start(&PluginId::new(
+                eve_interest_api::INTEREST_SETTINGS_PLUGIN_ID,
+            )?)
+            .await?;
+        let snapshot = eve_interest_api::InterestSettingsReader::snapshot(&interest_settings)?;
+        // 有面板时预装记忆、认知和账本，观察默认仍关闭；启用无需重建 QQ 通道。
+        options.interest_learning |= options.web_listen.is_some() || snapshot.settings.enabled;
+        if options.self_learning {
+            options.memory = true;
+            options.memory_learning = true;
+            options.segmented = true;
+        }
+        if options.interest_learning {
+            options.memory = true;
+            options.cognition = true;
+        }
+        if options.memory_learning && !options.memory {
+            return Err("--memory-learning 需要同时开启 --memory".into());
+        }
+        if options.memory_recall && !options.memory {
+            return Err("--memory-recall 需要同时开启 --memory".into());
+        }
+        options.learning_options.validate()?;
+        options.interest_options.validate()?;
+        let research_policy = research_policy(&options)?;
+        let practice_enabled = options.practice_server_jar.is_some()
+            || options.practice_browser.is_some()
+            || interest_components.runner.is_some();
+        if practice_enabled && !options.interest_learning {
+            return Err("实践验证需要同时开启 --interest-learning".into());
+        }
+        if options.skill_learning && !practice_enabled {
+            return Err("技能固化需要同时开启实践验证".into());
+        }
+        if options.tool_forging && !practice_enabled {
+            return Err("工具锻造需要同时开启实践验证".into());
+        }
+        if options.plans && !practice_enabled && research_policy.is_none() {
+            return Err("计划入口需要同时开启受控研究或实践验证".into());
+        }
+        if options.outreach && !practice_enabled {
+            return Err("主动交流需要同时开启实践验证".into());
+        }
+        let panel_config = options
+            .web_listen
+            .map(|address| -> Result<_, AppError> {
+                let token =
+                    std::env::var("EVE_WEB_TOKEN").map_err(|_| "开启本机面板需要 EVE_WEB_TOKEN")?;
+                let config = eve_web_panel::PanelConfig { address, token };
+                config.validate()?;
+                Ok(config)
+            })
+            .transpose()?;
+        if !(1..=32).contains(&options.cognition_max_executions) {
+            return Err("认知执行上限必须为 1 至 32 的整数".into());
+        }
+        let app_secret = std::env::var("QQBOT_APP_SECRET").map_err(|_| "缺少 QQBOT_APP_SECRET")?;
+        let sandbox = match std::env::var("QQBOT_SANDBOX").as_deref() {
+            Ok("true") => true,
+            Ok("" | "false") | Err(_) => false,
+            _ => return Err("QQBOT_SANDBOX 必须为 true 或 false".into()),
+        };
+        let mut bootstrap = core_bootstrap(&options.agent_path)?;
+        let plugin = QqBotPlugin::new(QqBotConfig {
+            node_program: options.node_program,
+            bridge_script: options.bridge_script,
+            bridge_args: options.bridge_args,
+            app_id: std::env::var("QQBOT_APP_ID").unwrap_or_else(|_| DEFAULT_QQBOT_APP_ID.into()),
+            app_secret,
+            sandbox,
+        })?
+        .with_training()?
+        .with_natural_message_judgement(options.message_judge != MessageJudgeMode::Off);
+        let plugin = if options.segmented {
+            plugin.with_segmenter(Arc::new(ParagraphPlanner::default()), QQ_SEGMENT_LIMITS)?
+        } else {
+            plugin
+        };
+
         kernel.register(Box::new(TrainingPlugin::new(options.training)?))?;
         kernel.start(&PluginId::new(TRAINING_PLUGIN_ID)?).await?;
         // 分段设置先于模型与通道加载；损坏或版本不兼容时在这里拒绝启动并保留原字节。
@@ -872,6 +908,10 @@ async fn run_qqbot_composed(
                 options.cognition_max_executions,
                 factory,
                 options.interest_learning,
+                interests.as_ref().map(|_| {
+                    Arc::new(interest_settings.clone())
+                        as Arc<dyn eve_interest_api::InterestSettingsReader>
+                }),
             )
             .await?;
             let commands = started.commands.clone();
@@ -966,7 +1006,7 @@ async fn run_qqbot_composed(
                 Arc::new(interests.clone()),
                 observer,
                 deriver.clone(),
-                options.interest_options.clone(),
+                Arc::new(interest_settings.clone()),
                 dirty.clone(),
             )?);
             qq_interest::Commands::enabled(
