@@ -21,6 +21,9 @@ impl ContextAssembler for Context {
     }
 }
 struct Echo;
+pub(crate) fn echo_definition() -> ToolDefinition {
+    Echo.definition()
+}
 impl Tool for Echo {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {

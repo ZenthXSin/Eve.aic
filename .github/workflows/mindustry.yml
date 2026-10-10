@@ -12,6 +12,8 @@ on:
       - "crates/outreach-api/**"
       - "crates/outreach-plugin/**"
       - "crates/eve-app/**"
+      - "crates/dialogue-tools/**"
+      - "connectors/qqbot/test/dialogue_tools_test.py"
       - "connectors/qqbot/test/practice_test.py"
       - "connectors/qqbot/test/skill_test.py"
       - "connectors/qqbot/test/outreach_test.py"
@@ -31,6 +33,8 @@ on:
       - "crates/outreach-api/**"
       - "crates/outreach-plugin/**"
       - "crates/eve-app/**"
+      - "crates/dialogue-tools/**"
+      - "connectors/qqbot/test/dialogue_tools_test.py"
       - "connectors/qqbot/test/practice_test.py"
       - "connectors/qqbot/test/skill_test.py"
       - "connectors/qqbot/test/outreach_test.py"
@@ -83,3 +87,7 @@ jobs:
         env:
           EVE_MINDUSTRY_SERVER_JAR: ${{ runner.temp }}/server-release.jar
         run: python3 connectors/qqbot/test/journey_test.py
+      - name: 对话工具直接运行真实模组并跨进程核对不重放
+        env:
+          EVE_MINDUSTRY_SERVER_JAR: ${{ runner.temp }}/server-release.jar
+        run: python3 connectors/qqbot/test/dialogue_tools_test.py DialogueToolsAcceptance.test_direct_practice_persists_real_evidence_and_restarts_without_replay

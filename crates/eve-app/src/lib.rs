@@ -13,6 +13,7 @@ mod memory_cli_view;
 mod message_evaluation;
 mod models;
 mod qq_cognition;
+mod qq_help;
 mod qq_interest;
 mod qq_learning;
 mod qq_learning_commands;

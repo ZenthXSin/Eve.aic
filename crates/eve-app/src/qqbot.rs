@@ -783,6 +783,9 @@ async fn run_qqbot_composed(
         };
         // 已启用的技能作为对话工具：只能调用当前用户自己的技能，每次调用都实际运行验证。
         let skill_runner: Arc<std::sync::OnceLock<Arc<dyn PracticeRunner>>> = Arc::default();
+        let dialogue_cognition: Arc<
+            std::sync::OnceLock<Arc<dyn eve_cognition_api::CognitionAdmin>>,
+        > = Arc::default();
         let context: Arc<dyn ContextAssembler> = match &skills {
             Some(skills) => {
                 bootstrap.tools.push(Arc::new(SkillTool::new(
@@ -829,6 +832,54 @@ async fn run_qqbot_composed(
         } else {
             context
         });
+        // 后台能力不自动成为对话工具：显式装配公开 Tool，并让帮助和能力上下文共用注册源。
+        let dialogue_fetcher: Option<Arc<dyn SourceFetcher>> = if research_policy.is_some() {
+            Some(match interest_components.fetcher.clone() {
+                Some(fetcher) => fetcher,
+                None => Arc::new(HttpSourceFetcher::new()?),
+            })
+        } else {
+            None
+        };
+        let dialogue_tools = eve_dialogue_tools::Services {
+            memory: memory.clone(),
+            interests: interests
+                .clone()
+                .map(|v| Arc::new(v) as Arc<dyn eve_interest_api::InterestAdmin>),
+            cognition: options.cognition.then(|| dialogue_cognition.clone()),
+            knowledge: knowledge
+                .clone()
+                .map(|v| Arc::new(v) as Arc<dyn KnowledgeAdmin>),
+            practice: practice
+                .clone()
+                .map(|v| Arc::new(v) as Arc<dyn PracticeAdmin>),
+            skills: skills.clone().map(|v| Arc::new(v) as Arc<dyn SkillAdmin>),
+            checks: tools.clone().map(|v| Arc::new(v) as Arc<dyn ToolAdmin>),
+            plans: plans.clone().map(|v| Arc::new(v) as Arc<dyn PlanJournal>),
+            outreach: outreach
+                .clone()
+                .map(|v| Arc::new(v) as Arc<dyn OutreachAdmin>),
+            source: research_policy.clone().zip(dialogue_fetcher.clone()),
+            runner: practice.is_some().then(|| skill_runner.clone()),
+            draft_check: tools.clone().map(|v| {
+                Arc::new(ForgedChecks::new(Arc::new(v))) as Arc<dyn eve_practice_api::DraftCheck>
+            }),
+            workspace_root: options.state_directory.join("dialogue-practice-work"),
+        }
+        .tools();
+        bootstrap.tools.extend(dialogue_tools);
+        let tool_definitions: Vec<_> = std::iter::once(crate::services::echo_definition())
+            .chain(bootstrap.tools.iter().map(|tool| tool.definition()))
+            .collect();
+        let help_commands = crate::qq_help::Help::handler(tool_definitions.clone());
+        bootstrap.context = Some(Arc::new(eve_dialogue_tools::CapabilitiesContext {
+            inner: bootstrap.context.take().ok_or("对话上下文缺失")?,
+            definitions: tool_definitions,
+            source_seeds: research_policy
+                .as_ref()
+                .map_or_else(Vec::new, |policy| policy.seeds().to_vec()),
+            runner: practice.is_some().then(|| skill_runner.clone()),
+        }));
         let control = crate::install_core_with_pages(
             &kernel,
             registry.clone(),
@@ -915,6 +966,7 @@ async fn run_qqbot_composed(
             )
             .await?;
             let commands = started.commands.clone();
+            let _ = dialogue_cognition.set(Arc::new(started.admin()?));
             background = Some(started);
             commands
         } else {
@@ -1024,7 +1076,7 @@ async fn run_qqbot_composed(
             let cognition = Arc::new(background.as_ref().ok_or("受控研究缺少认知服务")?.admin()?);
             let fetcher: Arc<dyn SourceFetcher> = match fetcher {
                 Some(fetcher) => fetcher,
-                None => Arc::new(HttpSourceFetcher::new()?),
+                None => dialogue_fetcher.clone().ok_or("受控来源读取器缺失")?,
             };
             let selector: Arc<dyn SourceSelector> = match selector {
                 Some(selector) => selector,
@@ -1238,6 +1290,7 @@ async fn run_qqbot_composed(
             },
         );
         let mut plugin = plugin.with_command_handler(Arc::new(CommandHandlers(vec![
+            help_commands,
             commands,
             memory_commands,
             learning_commands,
