@@ -1314,13 +1314,13 @@
         const reset = node("input");
         reset.type = "checkbox";
         const resetLabel = node("label", "reset-field");
-        resetLabel.append(reset, document.createTextNode("恢复默认（移除文件覆盖）"));
+        resetLabel.append(reset, document.createTextNode("恢复默认（移除已保存配置）"));
         const item = { field, input, reset, changed: false };
         const changed = () => { item.changed = true; pluginPageDirty = true; };
         input.addEventListener("input", changed);
         input.addEventListener("change", changed);
         reset.addEventListener("change", () => { input.disabled = reset.checked; changed(); });
-        const source = { override: "文件覆盖", environment: "启动时环境配置", default: "默认值" }[field.source] || field.source;
+        const source = { override: "已保存配置", environment: "启动时环境配置", default: "默认值" }[field.source] || field.source;
         row.append(label, input, resetLabel, node("p", "small-text", `${source}${field.restart_required ? " · 修改需重启" : " · 修改用于新请求"}`));
         if (field.restart_required) row.append(node("p", "small-text", `当前生效：${field.value === null ? "未设置" : String(field.value)}`));
         form.append(row);
