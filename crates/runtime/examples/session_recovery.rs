@@ -35,7 +35,7 @@ impl LlmProvider for RecoveryProvider {
             } else {
                 "继续会话"
             };
-            let tail_len = history_len + 1 + if round == 1 { 2 } else { 0 };
+            let tail_len = history_len + 2 + if round == 1 { 2 } else { 0 };
             let prefix_len = request
                 .messages
                 .len()
@@ -45,7 +45,8 @@ impl LlmProvider for RecoveryProvider {
                 .iter()
                 .any(|m| m.role != ChatRole::System)
                 || request.messages[prefix_len..prefix_len + history_len] != self.history
-                || request.messages[prefix_len + history_len]
+                || request.messages[prefix_len + history_len].role != ChatRole::System
+                || request.messages[prefix_len + history_len + 1]
                     != ChatMessage::text(ChatRole::User, current)
                 || request.tools.len() != 1
                 || request.tools[0].name != "receipt"

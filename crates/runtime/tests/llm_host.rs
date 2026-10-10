@@ -418,7 +418,14 @@ async fn records_request_layout_sorted_tools_and_single_context_snapshot() {
     assert_eq!(requests[0].messages[1].role, ChatRole::System);
     assert_eq!(requests[0].messages[2].role, ChatRole::System);
     assert_eq!(requests[0].messages[3].role, ChatRole::System);
-    assert_eq!(requests[0].messages[4].role, ChatRole::User);
+    assert_eq!(requests[0].messages[4].role, ChatRole::System);
+    let notice = requests[0].messages[4].text.as_deref().unwrap();
+    let capabilities: serde_json::Value =
+        serde_json::from_str(notice.lines().nth(1).unwrap()).unwrap();
+    assert_eq!(capabilities["count"], 2);
+    assert_eq!(capabilities["tools"][0]["name"], "alpha");
+    assert_eq!(capabilities["tools"][1]["name"], "beta");
+    assert_eq!(requests[0].messages[5].role, ChatRole::User);
     assert_eq!(
         requests[0]
             .tools

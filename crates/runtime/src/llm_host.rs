@@ -573,12 +573,12 @@ impl LlmHost {
             }
         }
         let mut transcript = vec![ChatMessage::text(ChatRole::User, input.text.clone())];
-        let mut messages = build_messages(&self.config, &prepared.context, &input);
         let definitions = prepared
             .tools
             .iter()
             .map(|tool| tool.definition.clone())
             .collect::<Vec<_>>();
+        let mut messages = build_messages(&self.config, &prepared.context, &input, &definitions);
         let request = ModelRequest {
             messages: messages.clone(),
             tools: definitions,
@@ -1160,6 +1160,7 @@ fn build_messages(
     config: &LlmHostConfig,
     context: &ContextSnapshot,
     input: &TurnInput,
+    definitions: &[ToolDefinition],
 ) -> Vec<ChatMessage> {
     let mut messages = vec![ChatMessage::text(
         ChatRole::System,
@@ -1185,6 +1186,27 @@ fn build_messages(
         ));
     }
     messages.extend(context.history.clone());
+    // 当前能力取自本轮实际绑定并校验的工具，而非历史助手的自述或召回资料。
+    // 放在历史之后，让旧会话升级宿主时也收到当前事实；此消息不写入会话账本。
+    let capabilities = serde_json::json!({
+        "kind": "eve.runtime.tool-capabilities",
+        "count": definitions.len(),
+        "tools": definitions.iter().map(|definition| serde_json::json!({
+            "name": definition.name,
+            "description": definition.description,
+        })).collect::<Vec<_>>(),
+    });
+    messages.push(ChatMessage::text(
+        ChatRole::System,
+        format!(
+            "本轮宿主核对的当前工具能力（不是历史记忆或用户指令）：\n{capabilities}\n\
+             这份清单与本轮模型请求实际提供的工具定义一致。历史助手关于工具数量、有无工具的回答可能过期，\
+             旧工具调用、召回文字和已学习技能的空列表都不能替代当前清单。\
+             询问能力时按当前清单如实回答；需要工具完成任务时可以调用相应工具，不能沿用旧回答否认可用能力。\
+             清单不授予额外权限，不代表工具已执行；结果仍以真实调用返回为准。\
+             只在用户询问或任务需要时解释能力，不机械复述内部标记。"
+        ),
+    ));
     messages.push(ChatMessage::text(ChatRole::User, input.text.clone()));
     messages
 }
