@@ -639,10 +639,18 @@ pub(crate) async fn start(
                     Err(LoopError::Cognition(CognitionError::StaleRevision)) => continue,
                     Err(error) => return Err(error.into()),
                 }
-                if worker.stats()?.feedback_save_failures > 0 {
+                // 收尾会并发关闭循环准入；本轮已无须唤醒，不能把它当作循环故障。
+                let stats = match worker.stats() {
+                    Err(LoopError::Unavailable) if *stopping.borrow() => break,
+                    stats => stats?,
+                };
+                if stats.feedback_save_failures > 0 {
                     return Err("反思反馈保存失败".into());
                 }
-                worker.wake(WakeReason::StateChanged)?;
+                match worker.wake(WakeReason::StateChanged) {
+                    Err(LoopError::Unavailable) if *stopping.borrow() => break,
+                    woken => woken?,
+                };
             }
             Ok(())
         }
@@ -650,10 +658,11 @@ pub(crate) async fn start(
         accepting.store(false, Ordering::SeqCst);
         let settled = worker.shutdown().await;
         done.send_replace(true);
+        // 循环自身先失败时，规划任务随后只会看到“不可用”；优先报告循环的真实错误。
         match (result, settled) {
             (Ok(()), Ok(())) => Ok(()),
-            (Err(e), _) => Err(e),
             (_, Err(e)) => Err(e.into()),
+            (Err(e), Ok(())) => Err(e),
         }
     });
     Ok(Background {
