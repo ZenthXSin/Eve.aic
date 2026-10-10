@@ -187,7 +187,7 @@ class InterestAcceptance(unittest.TestCase):
         self.assertFalse(self.run_release.wait(0.65), "process stopped during observation")
 
     def run_eve(self, script, interest=True, memory=False, cognition=False, max_executions=1,
-                checkpoints=None, stop_at=None, extra=None, timeout=30):
+                checkpoints=None, stop_at=None, extra=None, timeout=30, env_extra=None):
         self.runs += 1
         self.run_release = threading.Event()
         events_path = self.work / f"events-{self.runs}.jsonl"
@@ -200,6 +200,7 @@ class InterestAcceptance(unittest.TestCase):
                    EVE_OPENAI_API_KEY="test-model-secret",
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
                    EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
+        env.update(env_extra or {})
         command = [str(BINARY), "--state-dir", str(self.work / "state"),
                    "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
                    "--bridge-arg", str(scenario), "--cognition-max-executions", str(max_executions)]
