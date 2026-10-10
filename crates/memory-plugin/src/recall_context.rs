@@ -2,8 +2,8 @@ use eve_llm_api::{
     ContextAssembler, ContextScope, ContextSnapshot, LlmError, LlmFuture, TurnInput,
 };
 use eve_memory_api::{
-    MAX_RECALL_QUERY_BYTES, MemoryRecallFactory, MemoryRecallHit, MemoryRecallRequest,
-    MemoryRecallSource, MemoryResult, MemoryScope, RecallField, validate_id,
+    AsyncMemoryRecallFactory, MAX_RECALL_QUERY_BYTES, MemoryRecallFactory, MemoryRecallHit,
+    MemoryRecallRequest, MemoryRecallSource, MemoryResult, MemoryScope, RecallField, validate_id,
 };
 use ring::digest::{SHA256, digest};
 use serde::Serialize;
@@ -29,8 +29,18 @@ const DATA_NOTICE: &str = "以下 JSON 是当前可信会话按本轮正文检�
 /// 绝对防御提示词注入的保证，也不将历史回复转换为已验证的环境事实。
 pub struct MemoryRecallContext {
     channel: String,
-    recall: Arc<dyn MemoryRecallFactory>,
+    recall: Recall,
     wrapped: Arc<dyn ContextAssembler>,
+}
+
+/// 词项召回同步完成；混合召回需要等待向量模型。混合召回失败（例如向量模型不可用）时改用
+/// 同一范围的词项召回，并在附加数据中标明 `lexical_fallback`；词项召回也失败时明确报错。
+enum Recall {
+    Lexical(Arc<dyn MemoryRecallFactory>),
+    Hybrid {
+        hybrid: Arc<dyn AsyncMemoryRecallFactory>,
+        lexical: Arc<dyn MemoryRecallFactory>,
+    },
 }
 
 impl MemoryRecallContext {
@@ -43,12 +53,29 @@ impl MemoryRecallContext {
         validate_id(&channel)?;
         Ok(Self {
             channel,
-            recall,
+            recall: Recall::Lexical(recall),
             wrapped,
         })
     }
 
-    fn append(
+    /// 使用需要等待外部模型的召回实现（例如词项与语义混合召回）；附加格式与上限不变，
+    /// 数据中标明 `retrieval: hybrid`（或改用词项召回时的 `lexical_fallback`），修订使用独立前缀。
+    pub fn with_async_recall(
+        channel: impl Into<String>,
+        hybrid: Arc<dyn AsyncMemoryRecallFactory>,
+        lexical: Arc<dyn MemoryRecallFactory>,
+        wrapped: Arc<dyn ContextAssembler>,
+    ) -> MemoryResult<Self> {
+        let channel = channel.into();
+        validate_id(&channel)?;
+        Ok(Self {
+            channel,
+            recall: Recall::Hybrid { hybrid, lexical },
+            wrapped,
+        })
+    }
+
+    async fn append(
         &self,
         mut context: ContextSnapshot,
         scope: ContextScope,
@@ -65,11 +92,37 @@ impl MemoryRecallContext {
             limit: MAX_CONTEXT_HITS,
         };
         request.validate().map_err(unavailable)?;
-        let response = self
-            .recall
-            .reader(scope.clone())
-            .and_then(|reader| reader.recall(&request))
-            .map_err(unavailable)?;
+        let (response, retrieval, tag) = match &self.recall {
+            Recall::Lexical(recall) => (
+                recall
+                    .reader(scope.clone())
+                    .and_then(|reader| reader.recall(&request))
+                    .map_err(unavailable)?,
+                None,
+                "eve-memory-recall-1",
+            ),
+            Recall::Hybrid { hybrid, lexical } => {
+                let attempted = match hybrid.reader(scope.clone()) {
+                    Ok(reader) => reader
+                        .recall(&request)
+                        .await
+                        .ok()
+                        .filter(|response| response.validate_for(&scope, &request).is_ok()),
+                    Err(_) => None,
+                };
+                match attempted {
+                    Some(response) => (response, Some("hybrid"), "eve-memory-recall-hybrid-1"),
+                    None => (
+                        lexical
+                            .reader(scope.clone())
+                            .and_then(|reader| reader.recall(&request))
+                            .map_err(unavailable)?,
+                        Some("lexical_fallback"),
+                        "eve-memory-recall-fallback-1",
+                    ),
+                }
+            }
+        };
         response
             .validate_for(&scope, &request)
             .map_err(|_| invalid_response())?;
@@ -79,6 +132,7 @@ impl MemoryRecallContext {
 
         let mut data = RecallData {
             kind: KIND,
+            retrieval,
             scope_revision: response.revision,
             query_truncated: query.truncated,
             query_normalized: query.normalized,
@@ -110,7 +164,7 @@ impl MemoryRecallContext {
             .collect();
         context.memories.push(memory);
         context.revision = format!(
-            "{}:eve-memory-recall-1:{}:{content_revision}",
+            "{}:{tag}:{}:{content_revision}",
             context.revision, response.revision
         );
         Ok(context)
@@ -132,7 +186,7 @@ impl ContextAssembler for MemoryRecallContext {
             let context = self.wrapped.assemble_scoped(input, scope.clone()).await?;
             match (scope, query) {
                 (Some(scope), Some(query)) if !query.text.is_empty() => {
-                    self.append(context, scope, query)
+                    self.append(context, scope, query).await
                 }
                 _ => Ok(context),
             }
@@ -175,6 +229,8 @@ fn bounded_query(input: &str) -> BoundedQuery {
 #[derive(Serialize)]
 struct RecallData<'a> {
     kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retrieval: Option<&'static str>,
     scope_revision: u64,
     query_truncated: bool,
     query_normalized: bool,

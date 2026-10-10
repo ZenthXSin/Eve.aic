@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    future::Future,
+    pin::Pin,
     sync::Arc,
 };
 
@@ -196,6 +198,20 @@ pub trait MemoryRecallService: Send + Sync {
 /// 仅由可信宿主持有，不能发布给模型或非可信通道。
 pub trait MemoryRecallFactory: Send + Sync {
     fn reader(&self, scope: MemoryScope) -> MemoryResult<Arc<dyn MemoryRecallService>>;
+}
+
+pub type RecallFuture<'a> =
+    Pin<Box<dyn Future<Output = MemoryResult<MemoryRecallResponse>> + Send + 'a>>;
+
+/// 召回时需要等待外部模型的实现（例如语义检索）。约束与同步召回相同：只读绑定范围内的
+/// 现行偏好与已导入交互，返回值同样须通过 `validate_for`，不写入记忆或查询历史。
+pub trait AsyncMemoryRecallService: Send + Sync {
+    fn recall<'a>(&'a self, request: &'a MemoryRecallRequest) -> RecallFuture<'a>;
+}
+
+/// 仅由可信宿主持有，不能发布给模型或非可信通道。
+pub trait AsyncMemoryRecallFactory: Send + Sync {
+    fn reader(&self, scope: MemoryScope) -> MemoryResult<Arc<dyn AsyncMemoryRecallService>>;
 }
 
 macro_rules! redacted_debug {
