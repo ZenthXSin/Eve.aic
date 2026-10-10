@@ -970,7 +970,7 @@ async fn run_qqbot_composed(
                 responder,
                 requests,
             }));
-            qq_outreach::Commands::enabled(Arc::new(outreach.clone()))
+            qq_outreach::Commands::enabled(Arc::new(outreach.clone()), Arc::new(practice.clone()))
         } else {
             qq_outreach::Commands::disabled()
         };

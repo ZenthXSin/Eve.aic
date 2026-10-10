@@ -788,14 +788,23 @@ impl ContextAssembler for OutreachContext {
 /// /outreach：查看与开关当前会话的主动邀请。
 pub(crate) struct Commands {
     outreach: Option<Arc<dyn OutreachAdmin>>,
+    /// 用于显示按用户想法继续创作的实践进展；只读。
+    practice: Option<Arc<dyn PracticeAdmin>>,
 }
 impl Commands {
     pub(crate) fn disabled() -> Arc<dyn QqCommandHandler> {
-        Arc::new(Self { outreach: None })
+        Arc::new(Self {
+            outreach: None,
+            practice: None,
+        })
     }
-    pub(crate) fn enabled(outreach: Arc<dyn OutreachAdmin>) -> Arc<dyn QqCommandHandler> {
+    pub(crate) fn enabled(
+        outreach: Arc<dyn OutreachAdmin>,
+        practice: Arc<dyn PracticeAdmin>,
+    ) -> Arc<dyn QqCommandHandler> {
         Arc::new(Self {
             outreach: Some(outreach),
+            practice: Some(practice),
         })
     }
 }
@@ -813,7 +822,17 @@ impl QqCommandHandler for Commands {
         let failure = || PluginError::State("主动交流记录暂时不可用".into());
         let rest: Vec<&str> = words.collect();
         let reply = match rest.as_slice() {
-            [] => status(&outreach.snapshot().map_err(|_| failure())?, owner),
+            [] => {
+                let practice = match &self.practice {
+                    Some(practice) => Some(practice.snapshot().map_err(|_| failure())?),
+                    None => None,
+                };
+                status(
+                    &outreach.snapshot().map_err(|_| failure())?,
+                    practice.as_ref(),
+                    owner,
+                )
+            }
             [switch @ ("on" | "off")] => {
                 let quiet = *switch == "off";
                 let at = now_ms().map_err(|_| failure())?;
@@ -832,7 +851,11 @@ impl QqCommandHandler for Commands {
     }
 }
 
-fn status(snapshot: &eve_outreach_api::OutreachSnapshot, owner: &str) -> String {
+fn status(
+    snapshot: &eve_outreach_api::OutreachSnapshot,
+    practice: Option<&eve_practice_api::PracticeSnapshot>,
+    owner: &str,
+) -> String {
     let mut reply = if snapshot.quiet(owner) {
         "主动邀请：已关闭（发送 /outreach on 恢复）".to_string()
     } else {
@@ -911,6 +934,24 @@ fn status(snapshot: &eve_outreach_api::OutreachSnapshot, owner: &str) -> String 
                 "\n  你的回应：{label}（“{}”）",
                 prefix(verdict.quote.as_deref().unwrap_or_default(), 200)
             );
+            // 提出的想法派生为后续创作；显示它的实践进展。
+            if verdict.kind == ResponseKind::Request {
+                let goal = eve_outreach_api::request_goal_id("eve", &invitation.id);
+                let progress = practice
+                    .and_then(|snapshot| {
+                        snapshot.runs_for(&goal).max_by_key(|run| run.started_at_ms)
+                    })
+                    .map(|run| match run.status {
+                        PracticeStatus::Running => "正在做",
+                        PracticeStatus::Verified => "已经做好并实际验证通过",
+                        PracticeStatus::Unverified => "试了几次还没有验证通过",
+                        PracticeStatus::NotApplicable => "当前运行环境做不了",
+                        PracticeStatus::Failed(_) => "这次没有做成",
+                        PracticeStatus::Interrupted => "做的时候中断了，不会重放",
+                    })
+                    .unwrap_or("准备按你的想法开始做");
+                let _ = write!(reply, "\n  按你的想法继续创作：{progress}");
+            }
         }
     }
     reply
