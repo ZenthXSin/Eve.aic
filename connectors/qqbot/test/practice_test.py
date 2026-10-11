@@ -185,6 +185,10 @@ class PracticeAcceptance(unittest.TestCase):
             *self.send(self.message("other", f"/practice {interest['id']}", user="user-2",
                                     contains="当前会话没有这条兴趣")),
             *self.send(self.message("help", "/practice", contains="用法：/practice")),
+            # 两次尝试都引用了同一条资料：第一次实际运行未通过，第二次验证通过；按实践记录派生，不单独保存。
+            *self.send(self.message("knowledge", f"/knowledge {interest['id']}", contains=[
+                "实践：引用它的草稿验证通过 1 次、未通过 1 次", f"最近通过：{run['id']} 第 2 次尝试",
+                "build 160.7"])),
             *self.checkpoint("quiet")], checkpoints={"quiet": self.quiet})
         self.assertEqual(len(self.kind("draft")), 2, "restart must not replay drafting")
         self.assertEqual(len(self.launches()), 2, "restart must not rerun the runtime")

@@ -6,7 +6,13 @@
 //! 账本、草稿器与运行器均可替换，宿主负责绑定目标、可见范围与工作目录。
 use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, fmt, future::Future, path::Path, pin::Pin};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    future::Future,
+    path::Path,
+    pin::Pin,
+};
 
 pub const PRACTICE_PLUGIN_ID: &str = "eve.practice";
 pub const PRACTICE_STATE_KEY: &str = "practice.v1";
@@ -473,6 +479,72 @@ impl PracticeRun {
     }
 }
 
+/// 一条资料在实际运行中的佐证：引用它的草稿实际运行后验证通过与未通过的次数。
+///
+/// 只计实际运行过的尝试（`Verified` 或 `Failed`）；结构检查不通过、不适用、草稿失败或中断的尝试不计。
+/// 通过只说明引用它的草稿在运行环境中实际验证通过，不证明资料的每一句都对；未通过也可能是草稿其他部分
+/// 有误，不据此否定资料。
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NoteTally {
+    pub verified: u32,
+    pub failed: u32,
+    /// 最近一次验证通过的尝试。
+    pub last_verified: Option<NoteEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoteEvidence {
+    pub run_id: String,
+    pub attempt: usize,
+    pub runtime_version: String,
+    pub at_ms: u64,
+}
+
+/// 按资料 ID 汇总实践记录中草稿引用的实际运行结果。这是派生数据，不单独保存，每次从实践记录重新计算；
+/// 只认同一次实践任务里确实给过草稿器的资料，同一尝试重复引用只计一次。
+pub fn note_tallies<'a>(
+    runs: impl IntoIterator<Item = &'a PracticeRun>,
+) -> BTreeMap<String, NoteTally> {
+    let mut tallies: BTreeMap<String, NoteTally> = BTreeMap::new();
+    for run in runs {
+        let given: BTreeSet<&str> = run.task.notes.iter().map(|note| note.id.as_str()).collect();
+        for attempt in &run.attempts {
+            let verified = match attempt.outcome {
+                Some(AttemptOutcome::Verified) => true,
+                Some(AttemptOutcome::Failed) => false,
+                _ => continue,
+            };
+            let (Some(draft), Some(evidence)) = (&attempt.draft, &attempt.evidence) else {
+                continue;
+            };
+            let mut cited = BTreeSet::new();
+            for id in &draft.notes_used {
+                if !given.contains(id.as_str()) || !cited.insert(id.as_str()) {
+                    continue;
+                }
+                let tally = tallies.entry(id.clone()).or_default();
+                if !verified {
+                    tally.failed += 1;
+                    continue;
+                }
+                tally.verified += 1;
+                let at_ms = attempt.finished_at_ms.unwrap_or(attempt.started_at_ms);
+                if tally.last_verified.as_ref().is_none_or(|last| {
+                    (last.at_ms, last.run_id.as_str()) < (at_ms, run.id.as_str())
+                }) {
+                    tally.last_verified = Some(NoteEvidence {
+                        run_id: run.id.clone(),
+                        attempt: attempt.number,
+                        runtime_version: evidence.runtime_version.clone(),
+                        at_ms,
+                    });
+                }
+            }
+        }
+    }
+    tallies
+}
+
 /// 同一目标修订的实践标识；重复准入得到同一 ID。
 pub fn run_id(goal_id: &str, goal_revision: u64) -> String {
     let mut context = Context::new(&SHA256);
@@ -831,6 +903,92 @@ mod tests {
         for (index, bad) in cases.iter().enumerate() {
             assert!(validate_draft(&task(), &profile(), bad).is_err(), "{index}");
         }
+    }
+
+    fn attempt(number: usize, outcome: AttemptOutcome, notes: &[&str], at: u64) -> PracticeAttempt {
+        let mut draft = draft();
+        draft.notes_used = notes.iter().map(|id| id.to_string()).collect();
+        PracticeAttempt {
+            number,
+            stage: AttemptStage::Running,
+            started_at_ms: at,
+            finished_at_ms: Some(at + 1),
+            draft: Some(draft),
+            issues: vec![],
+            evidence: Some(RunEvidence {
+                runtime_version: format!("build {number}"),
+                exit: RunExit::Completed,
+                loaded: true,
+                warnings: vec![],
+                probes: vec![],
+                log_excerpt: String::new(),
+                log_sha256: "0".repeat(64),
+                log_bytes: 0,
+                duration_ms: 1,
+            }),
+            outcome: Some(outcome),
+        }
+    }
+
+    #[test]
+    fn note_tallies_count_only_attempts_that_actually_ran_with_notes_that_were_given() {
+        let mut task = task();
+        task.notes.push(TaskNote {
+            id: "knowledge-2".into(),
+            text: "未验证的推测".into(),
+            source: None,
+            version: None,
+            source_quoted: false,
+        });
+        let mut rejected = attempt(3, AttemptOutcome::Rejected, &["knowledge-2"], 30);
+        rejected.evidence = None;
+        let run = PracticeRun {
+            id: "practice-1".into(),
+            task,
+            runner: profile(),
+            drafter_version: "drafter".into(),
+            started_at_ms: 1,
+            finished_at_ms: Some(100),
+            status: PracticeStatus::Verified,
+            attempts: vec![
+                attempt(
+                    1,
+                    AttemptOutcome::Failed,
+                    &["knowledge-1", "knowledge-2"],
+                    10,
+                ),
+                attempt(
+                    2,
+                    AttemptOutcome::Verified,
+                    &["knowledge-1", "knowledge-9"],
+                    20,
+                ),
+                rejected,
+            ],
+        };
+        let tallies = note_tallies([&run]);
+        let first = &tallies["knowledge-1"];
+        assert_eq!((first.verified, first.failed), (1, 1));
+        let evidence = first.last_verified.as_ref().unwrap();
+        assert_eq!(
+            (
+                evidence.run_id.as_str(),
+                evidence.attempt,
+                evidence.runtime_version.as_str()
+            ),
+            ("practice-1", 2, "build 2")
+        );
+        let second = &tallies["knowledge-2"];
+        assert_eq!(
+            (second.verified, second.failed),
+            (0, 1),
+            "结构检查没过的尝试不计"
+        );
+        assert!(second.last_verified.is_none());
+        assert!(
+            !tallies.contains_key("knowledge-9"),
+            "没有给过草稿器的资料不计"
+        );
     }
 
     #[test]

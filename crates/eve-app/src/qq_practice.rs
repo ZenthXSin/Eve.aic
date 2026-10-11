@@ -4,14 +4,17 @@ use crate::{AppError, qq_budget, qq_plan};
 use eve_cognition_api::{CognitionAdmin, Goal, GoalStatus, SourceKind, Visibility};
 use eve_interest_api::{INTEREST_GOAL_CHANNEL, INTEREST_GOAL_VERIFICATION, InterestAdmin};
 use eve_interest_plugin::learning_goal_id;
-use eve_knowledge_api::{KnowledgeAdmin, KnowledgeStatus, RunStatus as ResearchStatus};
+use eve_knowledge_api::{
+    KnowledgeAdmin, KnowledgeSnapshot, KnowledgeStatus, RunStatus as ResearchStatus,
+};
 use eve_memory_api::validate_id;
 use eve_outreach_api::{REQUEST_GOAL_CHANNEL, REQUEST_GOAL_VERIFICATION, RequestMarker};
 use eve_plan_api::PlanJournal;
 use eve_plugin_api::{PluginError, PluginResult};
 use eve_practice_api::{
-    AttemptOutcome, MAX_BRIEF_BYTES, MAX_NOTE_BYTES, MAX_NOTES, PracticeAdmin, PracticeAttempt,
-    PracticeError, PracticeFailure, PracticeRun, PracticeStatus, PracticeTask, RunExit, TaskNote,
+    AttemptOutcome, MAX_BRIEF_BYTES, MAX_NOTE_BYTES, MAX_NOTES, NoteTally, PracticeAdmin,
+    PracticeAttempt, PracticeError, PracticeFailure, PracticeRun, PracticeStatus, PracticeTask,
+    RunExit, TaskNote, note_tallies,
 };
 use eve_practice_plugin::Practitioner;
 use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput};
@@ -21,6 +24,7 @@ use eve_toolforge_api::{ForgeFailure, ForgeStatus, ToolAdmin, ToolError};
 use eve_toolforge_plugin::Forge;
 use std::{
     cmp::Reverse,
+    collections::BTreeMap,
     fmt::Write,
     path::PathBuf,
     sync::Arc,
@@ -167,11 +171,12 @@ fn eligible(goal: &Goal) -> Option<Eligible<'_>> {
 }
 
 /// 开启研究时等该修订的研究结束（或该目标研究次数用尽），再把有来源的知识交给草稿器；
-/// 来源原文在前，未验证推测在后。
+/// 有实践佐证的在前，其次来源原文，未验证推测在后。资料前标注引用它的草稿实际运行的结果。
 fn task(
     goal: &Goal,
     eligible: &Eligible<'_>,
     knowledge: Option<&Arc<dyn KnowledgeAdmin>>,
+    tallies: &BTreeMap<String, NoteTally>,
 ) -> Result<Option<PracticeTask>, AppError> {
     let mut notes = Vec::new();
     if let Some(knowledge) = knowledge {
@@ -188,25 +193,7 @@ fn task(
         if !settled {
             return Ok(None);
         }
-        let mut entries: Vec<_> = snapshot.entries_for(&eligible.knowledge_goal).collect();
-        entries.sort_by_key(|entry| entry.status != KnowledgeStatus::SourceQuoted);
-        for entry in entries.into_iter().take(MAX_NOTES) {
-            let mut text = entry.statement.clone();
-            if let Some(source) = &entry.source {
-                let _ = write!(text, "（原文：“{}”）", source.quote);
-            }
-            notes.push(TaskNote {
-                id: entry.id.clone(),
-                text: prefix(&text, MAX_NOTE_BYTES).into(),
-                source: entry
-                    .source
-                    .as_ref()
-                    .and_then(|source| snapshot.document(&source.document_id))
-                    .map(|document| prefix(&document.url, MAX_NOTE_BYTES).to_string()),
-                version: entry.version.clone(),
-                source_quoted: entry.status == KnowledgeStatus::SourceQuoted,
-            });
-        }
+        notes = task_notes(&snapshot, &eligible.knowledge_goal, tallies);
     }
     let brief = prefix(&goal.description, MAX_BRIEF_BYTES);
     Ok(Some(PracticeTask {
@@ -217,6 +204,63 @@ fn task(
         brief_truncated: brief.len() != goal.description.len(),
         notes,
     }))
+}
+
+/// 交给草稿器的资料：有实践佐证的在前，其次来源原文，未验证推测在后；资料前标注引用它的草稿实际运行的结果。
+fn task_notes(
+    snapshot: &KnowledgeSnapshot,
+    knowledge_goal: &str,
+    tallies: &BTreeMap<String, NoteTally>,
+) -> Vec<TaskNote> {
+    let mut entries: Vec<_> = snapshot.entries_for(knowledge_goal).collect();
+    entries.sort_by_key(|entry| {
+        (
+            tallies
+                .get(&entry.id)
+                .is_none_or(|tally| tally.verified == 0),
+            entry.status != KnowledgeStatus::SourceQuoted,
+        )
+    });
+    entries
+        .into_iter()
+        .take(MAX_NOTES)
+        .map(|entry| {
+            let mut text = tallies
+                .get(&entry.id)
+                .map(corroboration)
+                .unwrap_or_default();
+            text.push_str(&entry.statement);
+            if let Some(source) = &entry.source {
+                let _ = write!(text, "（原文：“{}”）", source.quote);
+            }
+            TaskNote {
+                id: entry.id.clone(),
+                text: prefix(&text, MAX_NOTE_BYTES).into(),
+                source: entry
+                    .source
+                    .as_ref()
+                    .and_then(|source| snapshot.document(&source.document_id))
+                    .map(|document| prefix(&document.url, MAX_NOTE_BYTES).to_string()),
+                version: entry.version.clone(),
+                source_quoted: entry.status == KnowledgeStatus::SourceQuoted,
+            }
+        })
+        .collect()
+}
+
+/// 资料前的实践标注：引用它的草稿实际运行的结果。通过只说明草稿整体验证通过，不证明资料每一句都对。
+pub(crate) fn corroboration(tally: &NoteTally) -> String {
+    if tally.verified > 0 {
+        format!(
+            "【实践佐证：引用它的草稿实际运行验证通过 {} 次、未通过 {} 次】",
+            tally.verified, tally.failed
+        )
+    } else {
+        format!(
+            "【引用它的草稿实际运行 {} 次都未通过，可能有误】",
+            tally.failed
+        )
+    }
 }
 
 async fn run(
@@ -304,11 +348,17 @@ async fn run(
                 })
                 .collect();
             goals.sort_by_key(|(goal, _)| (Reverse(goal.priority), goal.id.clone()));
+            // 实践佐证是从实践记录派生的数据，每轮重新计算，不单独保存。
+            let tallies = if knowledge.is_some() && !goals.is_empty() {
+                note_tallies(&practice.snapshot()?.runs)
+            } else {
+                BTreeMap::new()
+            };
             for (goal, eligible) in goals {
                 if *stopped.borrow() {
                     return Ok(());
                 }
-                let Some(task) = task(goal, &eligible, knowledge.as_ref())? else {
+                let Some(task) = task(goal, &eligible, knowledge.as_ref(), &tallies)? else {
                     continue;
                 };
                 let run = match practice.begin(
@@ -720,6 +770,80 @@ fn failure_text() -> PluginError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(id: &str, status: KnowledgeStatus) -> eve_knowledge_api::KnowledgeEntry {
+        let quoted = status == KnowledgeStatus::SourceQuoted;
+        eve_knowledge_api::KnowledgeEntry {
+            id: id.into(),
+            goal_id: "goal".into(),
+            owner: "user".into(),
+            run_id: "research".into(),
+            kind: if quoted {
+                eve_knowledge_api::KnowledgeKind::Fact
+            } else {
+                eve_knowledge_api::KnowledgeKind::Hypothesis
+            },
+            status,
+            statement: format!("资料 {id}"),
+            version: None,
+            source: quoted.then(|| eve_knowledge_api::KnowledgeSource {
+                document_id: "document".into(),
+                quote: "原文".into(),
+            }),
+            created_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn corroborated_notes_come_first_and_carry_their_practice_outcomes() {
+        let snapshot = KnowledgeSnapshot {
+            runs: vec![],
+            documents: vec![],
+            entries: vec![
+                entry("quoted", KnowledgeStatus::SourceQuoted),
+                entry("guess", KnowledgeStatus::Unverified),
+                entry("failing", KnowledgeStatus::SourceQuoted),
+            ],
+        };
+        let tallies = BTreeMap::from([
+            (
+                "guess".to_string(),
+                NoteTally {
+                    verified: 2,
+                    failed: 1,
+                    last_verified: None,
+                },
+            ),
+            (
+                "failing".to_string(),
+                NoteTally {
+                    verified: 0,
+                    failed: 3,
+                    last_verified: None,
+                },
+            ),
+        ]);
+        let notes = task_notes(&snapshot, "goal", &tallies);
+        let ids: Vec<&str> = notes.iter().map(|note| note.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["guess", "quoted", "failing"],
+            "有实践佐证的未验证推测排在最前"
+        );
+        assert!(
+            notes[0].text.starts_with(
+                "【实践佐证：引用它的草稿实际运行验证通过 2 次、未通过 1 次】资料 guess"
+            )
+        );
+        assert!(!notes[0].source_quoted, "实践佐证不改变资料本身的来源状态");
+        assert_eq!(notes[1].text, "资料 quoted（原文：“原文”）");
+        assert!(
+            notes[2]
+                .text
+                .starts_with("【引用它的草稿实际运行 3 次都未通过，可能有误】")
+        );
+        assert!(task_notes(&snapshot, "other", &tallies).is_empty());
+    }
 
     #[test]
     fn command_parsing() {

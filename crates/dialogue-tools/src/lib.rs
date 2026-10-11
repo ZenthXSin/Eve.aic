@@ -188,7 +188,7 @@ impl Tool for DialogueTool {
             ),
             Kind::Knowledge => (
                 "list_knowledge",
-                "读取当前用户已有的领域知识及来源链接；SourceQuoted 是来源引用，Unverified 是未验证假设。",
+                "读取当前用户已有的领域知识及来源链接；SourceQuoted 是来源引用，Unverified 是未验证假设；practice 是引用它的草稿实际运行验证通过与未通过的次数，通过只说明草稿整体通过。",
                 empty_schema(),
             ),
             Kind::Practice => (
@@ -357,9 +357,20 @@ impl Tool for DialogueTool {
                         .ok_or_else(unavailable)?
                         .snapshot()
                         .map_err(|_| unavailable())?;
+                    // 引用资料的草稿实际运行的结果，从实践记录派生；没有开启实践时为 null。
+                    let tallies = match &s.practice {
+                        Some(practice) => Some(eve_practice_api::note_tallies(
+                            &practice.snapshot().map_err(|_| unavailable())?.runs,
+                        )),
+                        None => None,
+                    };
                     view(snapshot.entries.iter().filter(|e| e.owner == scope.user_id).map(|e| {
                         let source = e.source.as_ref().and_then(|source| snapshot.document(&source.document_id).map(|d| json!({"url":d.url,"quote":source.quote,"sha256":d.sha256})));
-                        json!({"id":e.id,"goal_id":e.goal_id,"statement":e.statement,"kind":e.kind,"status":e.status,"version":e.version,"source":source})
+                        let practice = tallies.as_ref().map(|tallies| {
+                            let tally = tallies.get(&e.id).cloned().unwrap_or_default();
+                            json!({"drafts_verified":tally.verified,"drafts_failed":tally.failed,"last_verified":tally.last_verified.map(|last| json!({"run_id":last.run_id,"attempt":last.attempt,"runtime_version":last.runtime_version}))})
+                        });
+                        json!({"id":e.id,"goal_id":e.goal_id,"statement":e.statement,"kind":e.kind,"status":e.status,"version":e.version,"source":source,"practice":practice})
                     }).collect())
                 }
                 Kind::Practice => {
