@@ -105,6 +105,28 @@ pub struct FileArguments {
     #[serde(default)]
     pub expected_sha256: Option<String>,
 }
+/// 精确替换：old_string 必须在文件中恰好出现一次；expected_sha256 为上次读取的文件 SHA。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditArguments {
+    pub path: String,
+    pub old_string: String,
+    pub new_string: String,
+    pub expected_sha256: String,
+}
+/// 字面文本搜索；path 为工作区相对目录，默认根目录。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchArguments {
+    #[serde(default = "dot")]
+    pub path: String,
+    pub query: String,
+    #[serde(default = "search_limit")]
+    pub max_results: usize,
+}
+fn search_limit() -> usize {
+    50
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandArguments {
@@ -138,6 +160,8 @@ pub enum DeveloperOperation {
     List(FileArguments),
     Read(FileArguments),
     Write(FileArguments),
+    Edit(EditArguments),
+    Search(SearchArguments),
     Command(CommandArguments),
     Github(GithubArguments),
     PrepareUpgrade,

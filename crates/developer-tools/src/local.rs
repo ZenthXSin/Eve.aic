@@ -3,7 +3,7 @@ use eve_llm_api::{ToolExecutionContext, ToolExecutionError, ToolFuture};
 use reqwest::{Client, Url, redirect::Policy};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs::{self, OpenOptions},
     io::Write,
     path::{Component, Path, PathBuf},
@@ -19,6 +19,10 @@ use tokio::{
 
 const MAX_FILE: usize = 8 * 1024 * 1024;
 const MAX_OUTPUT: usize = 32 * 1024;
+const MAX_SEARCH_FILES: usize = 20_000;
+const MAX_SEARCH_LINE: usize = 240;
+/// 搜索跳过的目录名：版本库、工具账本与构建产物，不属于源码阅读范围。
+const SKIPPED_NAMES: [&str; 3] = [".git", ".eve-developer", "target"];
 fn failed(message: impl Into<String>) -> ToolExecutionError {
     ToolExecutionError::Failed(message.into())
 }
@@ -28,6 +32,23 @@ fn hash(bytes: &[u8]) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+/// 统计模式的出现次数（含重叠），只数到 2 即可判断是否唯一。
+fn occurrences(text: &str, pattern: &str) -> usize {
+    if pattern.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(offset) = text[start..].find(pattern) {
+        count += 1;
+        if count > 1 {
+            break;
+        }
+        let at = start + offset;
+        start = at + text[at..].chars().next().map_or(1, char::len_utf8);
+    }
+    count
 }
 fn shorten(text: &str, limit: usize) -> (&str, bool) {
     let mut n = text.len().min(limit);
@@ -188,6 +209,117 @@ impl LocalDeveloper {
             .and_then(|_| file.sync_all())
             .map_err(|_| failed("操作账本提交失败；操作结果不确定，不能自动重试"))
     }
+    /// 原子替换或新建文件：expected 为空串表示只新建；提交前再次核对文件仍为 expected。
+    fn replace_file(
+        &self,
+        path: &Path,
+        expected: &str,
+        content: &[u8],
+        context: &ToolExecutionContext,
+    ) -> Result<(), ToolExecutionError> {
+        let mut tmp = tempfile::NamedTempFile::new_in(path.parent().expect("checked parent"))
+            .map_err(|_| failed("临时文件不可创建"))?;
+        tmp.write_all(content)
+            .and_then(|_| tmp.as_file().sync_all())
+            .map_err(|_| failed("文件写入失败，原文件保留"))?;
+        self.authorize(context)?;
+        // 防止在写临时文件期间被外部编辑覆盖。
+        let current = fs::read(path).ok().map(|b| hash(&b));
+        if current.as_deref().unwrap_or("") != expected {
+            return Err(failed("文件在提交前变化，未覆盖"));
+        }
+        if expected.is_empty() {
+            tmp.persist_noclobber(path)
+                .map_err(|_| failed("新文件提交失败，未覆盖已有文件"))?;
+        } else {
+            tmp.persist(path)
+                .map_err(|_| failed("文件原子替换失败，保留待核对状态"))?;
+        }
+        Ok(())
+    }
+    /// 在工作区目录中按字面文本搜索 UTF-8 文件，按目录广度优先、名称排序输出；不跟随符号链接。
+    fn search(&self, a: SearchArguments) -> Result<Value, ToolExecutionError> {
+        let start = self.path(&a.path, false)?;
+        if !fs::metadata(&start)
+            .map_err(|_| failed("目录不可读取"))?
+            .is_dir()
+        {
+            return Err(failed("搜索只接受工作区内的目录"));
+        }
+        // 结果路径与 read_file 一致，都相对于工作区根目录。
+        let prefix = Path::new(&a.path)
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        let mut queue = VecDeque::from([(start, prefix)]);
+        let mut matches = Vec::new();
+        let mut used = 0usize;
+        let mut files = 0usize;
+        let mut truncated = false;
+        'walk: while let Some((dir, prefix)) = queue.pop_front() {
+            let mut entries = fs::read_dir(&dir)
+                .map_err(|_| failed("目录不可读取"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| failed("目录条目不可读取"))?;
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let kind = entry.file_type().map_err(|_| failed("文件类型不可读取"))?;
+                if kind.is_symlink() || SKIPPED_NAMES.contains(&name.as_str()) {
+                    continue;
+                }
+                let relative = if prefix.is_empty() {
+                    name
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                if kind.is_dir() {
+                    queue.push_back((entry.path(), relative));
+                    continue;
+                }
+                if !kind.is_file() {
+                    continue;
+                }
+                if files == MAX_SEARCH_FILES {
+                    truncated = true;
+                    break 'walk;
+                }
+                files += 1;
+                if entry.metadata().is_ok_and(|m| m.len() > MAX_FILE as u64) {
+                    continue;
+                }
+                let Ok(bytes) = fs::read(entry.path()) else {
+                    continue;
+                };
+                let Ok(text) = std::str::from_utf8(&bytes) else {
+                    continue;
+                };
+                for (index, line) in text.lines().enumerate() {
+                    if !line.contains(&a.query) {
+                        continue;
+                    }
+                    // 先脱敏再截断，避免凭据被截断后只露出一部分。
+                    let redacted = self.redact(line);
+                    let (shown, cut) = shorten(&redacted, MAX_SEARCH_LINE);
+                    let item = json!({"path":relative,"line":index+1,"text":shown,"truncated":cut});
+                    let size = item.to_string().len();
+                    if matches.len() >= a.max_results || used + size > MAX_OUTPUT {
+                        truncated = true;
+                        break 'walk;
+                    }
+                    used += size;
+                    matches.push(item);
+                }
+            }
+        }
+        Ok(
+            json!({"query":a.query,"path":a.path,"matches":matches,"files_scanned":files,"truncated":truncated,"untrusted_data":true}),
+        )
+    }
     async fn execute_inner(
         &self,
         operation: DeveloperOperation,
@@ -242,29 +374,38 @@ impl LocalDeveloper {
                     return Err(failed("文件已变化；重新读取后再修改，未覆盖"));
                 }
                 let content = a.content.ok_or_else(|| failed("缺少文件内容"))?;
-                let mut tmp =
-                    tempfile::NamedTempFile::new_in(path.parent().expect("checked parent"))
-                        .map_err(|_| failed("临时文件不可创建"))?;
-                tmp.write_all(content.as_bytes())
-                    .and_then(|_| tmp.as_file().sync_all())
-                    .map_err(|_| failed("文件写入失败，原文件保留"))?;
-                self.authorize(context)?;
-                // 防止在写临时文件期间被外部编辑覆盖。
-                let current = fs::read(&path).ok().map(|b| hash(&b));
-                if current.as_deref().unwrap_or("") != expected {
-                    return Err(failed("文件在提交前变化，未覆盖"));
-                }
-                if old.is_none() {
-                    tmp.persist_noclobber(path)
-                        .map_err(|_| failed("新文件提交失败，未覆盖已有文件"))?;
-                } else {
-                    tmp.persist(path)
-                        .map_err(|_| failed("文件原子替换失败，保留待核对状态"))?;
-                }
+                self.replace_file(&path, expected, content.as_bytes(), context)?;
                 Ok(
                     json!({"success":true,"path":a.path,"sha256":hash(content.as_bytes()),"bytes":content.len()}),
                 )
             }
+            DeveloperOperation::Edit(a) => {
+                let path = self.path(&a.path, false)?;
+                let metadata = fs::metadata(&path).map_err(|_| failed("文件不可读取"))?;
+                if !metadata.is_file() {
+                    return Err(failed("文件工具只修改普通文件，不打开目录、设备或管道"));
+                }
+                if metadata.len() > MAX_FILE as u64 {
+                    return Err(failed("文件超过 8 MiB；请用命令处理"));
+                }
+                let bytes = fs::read(&path).map_err(|_| failed("已有文件不可读取，未修改"))?;
+                if hash(&bytes) != a.expected_sha256 {
+                    return Err(failed("文件已变化；重新读取后再修改，未修改"));
+                }
+                let text =
+                    std::str::from_utf8(&bytes).map_err(|_| failed("文件不是 UTF-8 文本"))?;
+                match occurrences(text, &a.old_string) {
+                    0 => return Err(failed("要替换的文本不存在，未修改")),
+                    1 => {}
+                    _ => return Err(failed("要替换的文本出现多次；请提供更长的上下文，未修改")),
+                }
+                let updated = text.replacen(&a.old_string, &a.new_string, 1);
+                self.replace_file(&path, &a.expected_sha256, updated.as_bytes(), context)?;
+                Ok(
+                    json!({"success":true,"path":a.path,"sha256":hash(updated.as_bytes()),"bytes":updated.len()}),
+                )
+            }
+            DeveloperOperation::Search(a) => self.search(a),
             DeveloperOperation::Command(a) => {
                 if !self.config.commands {
                     return Err(failed("命令执行未启用"));
@@ -705,6 +846,8 @@ impl DeveloperBackend for LocalDeveloper {
                 DeveloperOperation::List(_) => "list",
                 DeveloperOperation::Read(_) => "read",
                 DeveloperOperation::Write(_) => "write",
+                DeveloperOperation::Edit(_) => "edit",
+                DeveloperOperation::Search(_) => "search",
                 DeveloperOperation::Command(_) => "command",
                 DeveloperOperation::Github(_) => "github",
                 DeveloperOperation::PrepareUpgrade => "upgrade",
