@@ -73,6 +73,10 @@ impl Gate {
             ),
         })
     }
+    /// 对话工具 show_budget 只读取快照；未启用预算时为空，工具随之不注册。
+    pub(crate) fn budget(&self) -> Option<Arc<dyn AutonomyBudget>> {
+        self.budget.clone()
+    }
     pub(crate) fn commands(&self) -> Arc<dyn QqCommandHandler> {
         Arc::new(Commands {
             budget: self.budget.clone(),

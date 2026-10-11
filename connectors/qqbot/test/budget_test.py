@@ -14,12 +14,34 @@ from interest_test import MINDUSTRY, WATERCOLOR
 from memory_test import BINARY, FAKE, ROOT
 
 DISABLED = "自主运行预算未启用"
+ASK = "后台预算还剩多少？"
 # 30 天窗口按 Unix 纪元对齐，测试期间几乎不会跨窗口。
 WINDOW = ["--autonomy-budget-window-hours", "720"]
 
 
 def base():
     return interest_test.InterestAcceptance
+
+
+def tool_names(body):
+    return {entry["function"]["name"] for entry in body.get("tools", [])}
+
+
+def tool_results(body):
+    messages = body["messages"]
+    current = max(index for index, message in enumerate(messages) if message["role"] == "user")
+    return [json.loads(m["content"]) for m in messages[current + 1:] if m["role"] == "tool"]
+
+
+def tool_call(name):
+    return {"choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+        "role": "assistant", "content": None, "tool_calls": [
+            {"id": f"call-{name}", "type": "function", "function": {"name": name, "arguments": "{}"}}]}}]}
+
+
+def text(content):
+    return {"choices": [{"index": 0, "finish_reason": "stop", "message": {
+        "role": "assistant", "content": content}}]}
 
 
 class BudgetAcceptance(unittest.TestCase):
@@ -90,6 +112,44 @@ class BudgetAcceptance(unittest.TestCase):
         self.run_eve([*self.send(self.message("again", "/budget", contains=["已用 2 次、剩余 0 次", "兴趣观察 2"])),
                       *self.checkpoint("quiet-full")], extra=self.budget(2), checkpoints={"quiet-full": self.quiet})
         self.assertEqual(len(self.kind("interest")), 2)
+
+    def test_chat_answers_budget_questions_with_the_read_only_tool(self):
+        seen = []
+
+        def asked(body, kind, fallback):
+            if kind != "chat":
+                return fallback
+            results = tool_results(body)
+            if not results:
+                self.assertIn("show_budget", tool_names(body))
+                return tool_call("show_budget")
+            seen.append(results[0])
+            return text(f"后台预算本窗口还剩 {results[0]['remaining']} 次")
+
+        self.provider_response = asked
+        self.run_eve([*self.send(self.message("ask", ASK, contains=["后台预算本窗口还剩"]))],
+                     extra=self.budget(3))
+        [result] = seen
+        self.assertEqual((result["limit"], result["window_ms"]), (3, 720 * 3_600_000))
+        self.assertEqual(result["used"] + result["remaining"], 3)
+        self.assertGreater(result["resets_in_minutes"], 0)
+        self.assertLessEqual(set(result["by_category"]), {"interest"})
+        # 查看不记账也不写状态：账本只可能来自这条消息引起的至多一次兴趣观察。
+        ledger = self.ledger()
+        self.assertTrue(ledger is None or ledger["current"]["used"] <= 1, ledger)
+
+        # 未开启预算时不注册该工具，模型也就无从声称看到了预算。
+        offered = []
+
+        def plain(body, kind, fallback):
+            if kind == "chat":
+                offered.append(tool_names(body))
+            return fallback
+
+        self.provider_response = plain
+        self.run_eve([*self.send(self.message("ask-off", ASK))])
+        self.assertTrue(offered)
+        self.assertTrue(all("show_budget" not in names for names in offered))
 
     def test_disabled_budget_is_explicit_and_corrupt_ledger_refuses_to_start_and_is_preserved(self):
         self.run_eve([*self.send(self.message("off", "/budget", contains=DISABLED))])

@@ -1039,6 +1039,7 @@ async fn run_qqbot_composed(
             outreach: outreach
                 .clone()
                 .map(|v| Arc::new(v) as Arc<dyn OutreachAdmin>),
+            budget: budget_gate.budget(),
             source: research_policy.clone().zip(dialogue_fetcher.clone()),
             runner: practice.is_some().then(|| skill_runner.clone()),
             draft_check: tools.clone().map(|v| {
