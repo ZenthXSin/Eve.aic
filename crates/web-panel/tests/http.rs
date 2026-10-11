@@ -1353,3 +1353,282 @@ async fn memory_views_are_authenticated_strict_json_and_unavailable_by_default()
     );
     panel.stop().await.unwrap();
 }
+
+struct Plans {
+    calls: Mutex<Vec<String>>,
+}
+fn plan_view(revision: u64, status: &'static str, withdrawable: bool) -> PlanView {
+    PlanView {
+        id: "计划-1".into(),
+        revision,
+        goal_revision: 3,
+        status,
+        origin: "model",
+        created_at_ms: 1_000,
+        confirmed_at_ms: Some(2_000),
+        withdrawn_at_ms: (status == "withdrawn").then_some(3_000),
+        stale_at_ms: None,
+        withdrawable,
+        steps: vec![PlanStepView {
+            id: "读资料".into(),
+            title: "<b>读取资料</b>".into(),
+            capability: "eve.research.v1".into(),
+            depends_on: vec![],
+            status: "satisfied",
+            max_attempts: 1,
+            timeout_ms: 60_000,
+            attempts: vec![PlanAttemptView {
+                number: 1,
+                started_at_ms: 2_100,
+                finished_at_ms: Some(2_200),
+                effect_met: true,
+                failure: None,
+                evidence: Some(PlanEvidenceView {
+                    source_id: "knowledge-1".into(),
+                    sha256: "a".repeat(64),
+                    bytes: 12,
+                    verified_at_ms: 2_200,
+                }),
+            }],
+        }],
+    }
+}
+impl PanelService for Plans {
+    fn status(&self) -> PanelResult<PanelStatus> {
+        Err(PanelError::Unavailable)
+    }
+    fn sessions(&self, _: Option<&str>, _: usize) -> PanelResult<Page<SessionSummary>> {
+        Err(PanelError::Unavailable)
+    }
+    fn tasks(&self, _: Option<&str>, _: usize) -> PanelResult<Page<TaskSummary>> {
+        Err(PanelError::Unavailable)
+    }
+    fn session(&self, _: &SessionKey, _: Option<u64>, _: usize) -> PanelResult<SessionDetail> {
+        Err(PanelError::Unavailable)
+    }
+    fn cancel(&self, _: &GenerationKey) -> PanelResult<CancelStatus> {
+        Err(PanelError::Unavailable)
+    }
+    fn goal_plans(&self, goal_id: &str) -> PanelResult<GoalPlans> {
+        self.calls.lock().unwrap().push(format!("plans:{goal_id}"));
+        if goal_id != "目标-1" {
+            return Err(PanelError::NotFound);
+        }
+        Ok(GoalPlans {
+            goal_id: goal_id.into(),
+            goal_revision: 3,
+            plans: vec![plan_view(2, "active", true)],
+            proposals: vec![PlanProposalView {
+                id: "建议-1".into(),
+                goal_revision: 3,
+                status: "proposed",
+                failure: None,
+                requested_at_ms: 900,
+                finished_at_ms: Some(950),
+            }],
+        })
+    }
+    fn withdraw_plan(&self, plan_id: &str, revision: u64) -> PanelResult<PlanView> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("withdraw:{plan_id}:{revision}"));
+        match (plan_id, revision) {
+            ("计划-1", 2) => Ok(plan_view(3, "withdrawn", false)),
+            ("计划-1", _) => Err(PanelError::Stale),
+            _ => Err(PanelError::NotFound),
+        }
+    }
+}
+
+#[tokio::test]
+async fn plan_views_are_authenticated_strict_and_withdrawal_needs_the_read_revision() {
+    let client = client();
+    let legacy = Arc::new(Service::default());
+    let panel_legacy = panel(legacy.clone()).await;
+    assert_code(
+        client
+            .get(url(&panel_legacy, "/api/goal/plans?id=目标-1"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+    )
+    .await;
+    assert_code(
+        client
+            .post(url(&panel_legacy, "/api/goal/plans/withdraw"))
+            .bearer_auth(TOKEN)
+            .json(&json!({"plan_id":"计划-1","revision":2}))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+    )
+    .await;
+    panel_legacy.stop().await.unwrap();
+
+    let service = Arc::new(Plans {
+        calls: Mutex::new(vec![]),
+    });
+    let panel = LocalPanel::bind(
+        PanelConfig {
+            address: "127.0.0.1:0".parse().unwrap(),
+            token: TOKEN.into(),
+        },
+        service.clone(),
+    )
+    .await
+    .unwrap();
+    assert_code(
+        client
+            .get(url(&panel, "/api/goal/plans?id=目标-1"))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+    )
+    .await;
+    assert_code(
+        client
+            .post(url(&panel, "/api/goal/plans/withdraw"))
+            .json(&json!({"plan_id":"计划-1","revision":2}))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+    )
+    .await;
+    for (method, path) in [
+        (Method::PUT, "/api/goal/plans?id=目标-1"),
+        (Method::DELETE, "/api/goal/plans?id=目标-1"),
+        (Method::GET, "/api/goal/plans/withdraw"),
+    ] {
+        let response = client
+            .request(method, url(&panel, path))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+    let long = "a".repeat(257);
+    for path in [
+        "/api/goal/plans".to_owned(),
+        "/api/goal/plans?id=".into(),
+        "/api/goal/plans?id=%20padded".into(),
+        "/api/goal/plans?id=bad%0A".into(),
+        format!("/api/goal/plans?id={long}"),
+        "/api/goal/plans?id=a&id=b".into(),
+        "/api/goal/plans?id=a&limit=1".into(),
+    ] {
+        assert_code(
+            client
+                .get(url(&panel, &path))
+                .bearer_auth(TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+        )
+        .await;
+    }
+    for (body, code) in [
+        (json!({"plan_id":"计划-1"}), "invalid_json"),
+        (
+            json!({"plan_id":"计划-1","revision":2,"goal_id":"目标-1"}),
+            "invalid_json",
+        ),
+        (json!({"plan_id":"计划-1","revision":-1}), "invalid_json"),
+        (json!({"plan_id":"计划-1","revision":0}), "invalid_input"),
+        (json!({"plan_id":"","revision":2}), "invalid_input"),
+        (json!({"plan_id":" 计划-1","revision":2}), "invalid_input"),
+        (json!({"plan_id":long,"revision":2}), "invalid_input"),
+    ] {
+        assert_code(
+            client
+                .post(url(&panel, "/api/goal/plans/withdraw"))
+                .bearer_auth(TOKEN)
+                .json(&body)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            code,
+        )
+        .await;
+    }
+    assert!(service.calls.lock().unwrap().is_empty());
+
+    let response = client
+        .get(url(&panel, "/api/goal/plans?id=目标-1"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(body["goal_revision"], 3);
+    assert_eq!(body["plans"][0]["status"], "active");
+    assert_eq!(body["plans"][0]["withdrawable"], true);
+    assert_eq!(body["plans"][0]["steps"][0]["title"], "<b>读取资料</b>");
+    assert_eq!(
+        body["plans"][0]["steps"][0]["attempts"][0]["evidence"]["source_id"],
+        "knowledge-1"
+    );
+    assert_eq!(body["proposals"][0]["status"], "proposed");
+    assert_code(
+        client
+            .get(url(&panel, "/api/goal/plans?id=missing"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::NOT_FOUND,
+        "not_found",
+    )
+    .await;
+
+    let withdraw = |plan_id: &str, revision: u64| {
+        client
+            .post(url(&panel, "/api/goal/plans/withdraw"))
+            .bearer_auth(TOKEN)
+            .json(&json!({"plan_id":plan_id,"revision":revision}))
+            .send()
+    };
+    assert_code(
+        withdraw("计划-1", 1).await.unwrap(),
+        StatusCode::CONFLICT,
+        "stale_generation",
+    )
+    .await;
+    assert_code(
+        withdraw("计划-9", 2).await.unwrap(),
+        StatusCode::NOT_FOUND,
+        "not_found",
+    )
+    .await;
+    let response = withdraw("计划-1", 2).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(body["plan"]["status"], "withdrawn");
+    assert_eq!(body["plan"]["withdrawable"], false);
+    assert_eq!(
+        *service.calls.lock().unwrap(),
+        vec![
+            "plans:目标-1".to_owned(),
+            "plans:missing".into(),
+            "withdraw:计划-1:1".into(),
+            "withdraw:计划-9:2".into(),
+            "withdraw:计划-1:2".into(),
+        ]
+    );
+    panel.stop().await.unwrap();
+}
