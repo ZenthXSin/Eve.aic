@@ -133,6 +133,11 @@ struct Eligible<'a> {
     researched: bool,
 }
 
+/// 等待中的兴趣学习目标或后续创作目标的可见用户；其他目标不实践。
+pub(crate) fn eligible_owner(goal: &Goal) -> Option<&str> {
+    eligible(goal).map(|eligible| eligible.owner)
+}
+
 fn eligible(goal: &Goal) -> Option<Eligible<'_>> {
     let Visibility::User(owner) = &goal.visibility else {
         return None;

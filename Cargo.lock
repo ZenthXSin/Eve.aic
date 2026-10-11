@@ -277,6 +277,8 @@ dependencies = [
  "eve-artifact-file",
  "eve-budget-api",
  "eve-budget-plugin",
+ "eve-clarify-api",
+ "eve-clarify-plugin",
  "eve-cognition-api",
  "eve-cognition-loop-api",
  "eve-cognition-loop-plugin",
@@ -360,6 +362,29 @@ name = "eve-budget-plugin"
 version = "0.1.0"
 dependencies = [
  "eve-budget-api",
+ "eve-kernel",
+ "eve-llm-api",
+ "eve-plugin-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "eve-clarify-api"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eve-clarify-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-clarify-api",
  "eve-kernel",
  "eve-llm-api",
  "eve-plugin-api",
