@@ -819,6 +819,7 @@ fn summary() -> GoalSummary {
         reflections: 1,
         description: "整理房间".into(),
         description_truncated: false,
+        completion: None,
     }
 }
 

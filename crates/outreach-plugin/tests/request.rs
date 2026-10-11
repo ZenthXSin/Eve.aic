@@ -62,6 +62,7 @@ fn learning_goal(cognition: &CognitionController, id: &str) {
                 block_reason: None,
                 execution: None,
                 feedback: None,
+                completion: None,
             },
         );
     });

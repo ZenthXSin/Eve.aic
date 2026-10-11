@@ -62,6 +62,7 @@ pub fn goal(name: &str) -> Goal {
         block_reason: None,
         execution: None,
         feedback: None,
+        completion: None,
     }
 }
 pub fn options() -> LoopOptions {

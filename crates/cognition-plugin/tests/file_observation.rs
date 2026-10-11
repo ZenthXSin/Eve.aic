@@ -67,6 +67,7 @@ fn seed(admin: &CognitionController) {
             block_reason: None,
             execution: None,
             feedback: None,
+            completion: None,
         },
     );
     admin.replace(0, state).unwrap();

@@ -33,6 +33,7 @@ fn goal(id: &str, visibility: Visibility) -> Goal {
         block_reason: None,
         execution: None,
         feedback: None,
+        completion: None,
     }
 }
 fn execute(goal: &mut Goal, turn_id: Option<u64>) {

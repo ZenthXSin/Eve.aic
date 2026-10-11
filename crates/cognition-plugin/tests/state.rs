@@ -56,6 +56,7 @@ fn goal(name: &str, visibility: Visibility) -> Goal {
         block_reason: None,
         execution: None,
         feedback: None,
+        completion: None,
     }
 }
 fn executing(goal: &mut Goal, name: &str) {

@@ -194,6 +194,7 @@ fn parent(id: &str, text: &str, priority: u8) -> Goal {
         block_reason: None,
         execution: None,
         feedback: None,
+        completion: None,
     }
 }
 

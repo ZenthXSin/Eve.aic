@@ -559,6 +559,7 @@ mod tests {
             block_reason: None,
             execution: None,
             feedback: None,
+            completion: None,
         };
         let mut state = CognitiveState::default();
         state.goals.insert(parent.id.clone(), parent);

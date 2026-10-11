@@ -213,6 +213,29 @@ fn validate_transition(old: &Goal, next: &Goal) -> CognitionResult<()> {
     if old.source != next.source || old.visibility != next.visibility {
         return Err(CognitionError::AccessDenied);
     }
+    // 用户确认完成：只能把等待中的目标一次性标为完成；确认的是当前版本，内容不变，没有执行记录。
+    if old.completion.is_some() || next.completion.is_some() {
+        let confirmed = old.status == GoalStatus::Waiting
+            && old.completion.is_none()
+            && next.status == GoalStatus::Completed
+            && next
+                .completion
+                .as_ref()
+                .is_some_and(|completion| completion.goal_revision == old.revision)
+            && next.execution.is_none()
+            && next.feedback.is_none()
+            && old.description == next.description
+            && old.verification == next.verification
+            && old.budget == next.budget
+            && old.priority == next.priority
+            && old.stop_condition == next.stop_condition
+            && old.expires_at_ms == next.expires_at_ms;
+        return if confirmed {
+            Ok(())
+        } else {
+            Err(CognitionError::InvalidTransition)
+        };
+    }
     let allowed = match old.status {
         GoalStatus::Ready => matches!(
             next.status,

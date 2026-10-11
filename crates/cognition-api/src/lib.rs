@@ -139,6 +139,39 @@ pub struct Feedback {
     pub summary: String,
     pub at_ms: u64,
 }
+/// 目标所属用户在对话中确认完成的记录。依据一份所有步骤效果条件都已被证据满足的计划；
+/// 只由宿主在用户明确确认后写入，模型或计划本身不能代替用户确认。
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionConfirmation {
+    pub plan_id: String,
+    pub plan_revision: u64,
+    /// 确认前目标的版本；所依据的计划必须绑定这一版本。
+    pub goal_revision: u64,
+    /// 确认者，必须是目标所属用户。
+    pub confirmed_by: String,
+    /// 确认所在的会话。
+    pub session_id: String,
+    /// 确认来源，例如工具调用 ID 的摘要；不保存用户原话。
+    pub source_id: String,
+    pub at_ms: u64,
+}
+impl CompletionConfirmation {
+    pub fn validate(&self) -> CognitionResult<()> {
+        for id in [
+            &self.plan_id,
+            &self.confirmed_by,
+            &self.session_id,
+            &self.source_id,
+        ] {
+            validate_id(id)?;
+        }
+        if self.plan_revision == 0 || self.goal_revision == 0 || self.at_ms == 0 {
+            return Err(CognitionError::InvalidInput);
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Goal {
@@ -157,6 +190,9 @@ pub struct Goal {
     pub block_reason: Option<BlockReason>,
     pub execution: Option<ExecutionAttempt>,
     pub feedback: Option<Feedback>,
+    /// 用户确认完成；只在 Completed 且没有执行记录时出现。没有时不写入状态，旧状态文件不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<CompletionConfirmation>,
 }
 impl Goal {
     pub fn validate(&self) -> CognitionResult<()> {
@@ -193,6 +229,14 @@ impl Goal {
                 return Err(CognitionError::InvalidInput);
             }
         }
+        if let Some(completion) = &self.completion {
+            completion.validate()?;
+            if self.status != GoalStatus::Completed
+                || self.visibility != Visibility::User(completion.confirmed_by.clone())
+            {
+                return Err(CognitionError::InvalidInput);
+            }
+        }
         if (self.status == GoalStatus::Waiting) != self.wait_reason.is_some()
             || (self.status == GoalStatus::Blocked) != self.block_reason.is_some()
         {
@@ -209,12 +253,17 @@ impl Goal {
                     return Err(CognitionError::InvalidInput);
                 }
             }
+            // 两种完成：执行并验证通过；或用户确认（此时没有执行记录与反馈）。
             GoalStatus::Completed => {
-                if self.execution.as_ref().is_none_or(|e| e.turn_id.is_none())
-                    || !self.feedback.as_ref().is_some_and(|f| {
-                        f.commit == ExecutionCommit::Completed && f.verification_met
-                    })
-                {
+                let invalid = if self.completion.is_some() {
+                    self.execution.is_some() || self.feedback.is_some()
+                } else {
+                    self.execution.as_ref().is_none_or(|e| e.turn_id.is_none())
+                        || !self.feedback.as_ref().is_some_and(|f| {
+                            f.commit == ExecutionCommit::Completed && f.verification_met
+                        })
+                };
+                if invalid {
                     return Err(CognitionError::InvalidInput);
                 }
             }
@@ -485,6 +534,7 @@ redacted_debug!(
     Source,
     ExecutionAttempt,
     Feedback,
+    CompletionConfirmation,
     Goal,
     Drive,
     Agenda,

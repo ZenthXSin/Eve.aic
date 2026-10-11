@@ -169,6 +169,7 @@ impl Commands {
             block_reason: None,
             execution: None,
             feedback: None,
+            completion: None,
         };
         let mut state = snapshot.state;
         state.goals.insert(id.clone(), goal);
@@ -268,7 +269,13 @@ impl Commands {
             "当前会话待办（最多 10 项）：\n{}\n发送 /mind 目标ID 查看草稿。",
             goals
                 .iter()
-                .map(|g| format!("{}：{:?}，版本 {}", g.id, g.status, g.revision))
+                .map(|g| match &g.completion {
+                    Some(completion) => format!(
+                        "{}：已完成（你已确认，依据计划 {}），版本 {}",
+                        g.id, completion.plan_id, g.revision
+                    ),
+                    None => format!("{}：{:?}，版本 {}", g.id, g.status, g.revision),
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         ))
@@ -294,6 +301,12 @@ impl Commands {
         let Some(parent) = parent else {
             return Ok("当前会话未找到该待办，发送 /goals 查看。".into());
         };
+        if let Some(completion) = &parent.completion {
+            return Ok(format!(
+                "这件待办你已确认完成：依据计划 {}（各步都被证据满足），版本 {}。",
+                completion.plan_id, parent.revision
+            ));
+        }
         let child =
             current_reflection(&view.state, &view.subject_id, parent).map_err(|_| failure())?;
         let Some(child) = child else {
@@ -721,6 +734,7 @@ mod agenda_policy_tests {
             block_reason: None,
             execution: None,
             feedback: None,
+            completion: None,
         }
     }
 

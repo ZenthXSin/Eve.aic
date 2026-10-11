@@ -136,6 +136,7 @@ mod tests {
             block_reason: None,
             execution: None,
             feedback: None,
+            completion: None,
         }
     }
 

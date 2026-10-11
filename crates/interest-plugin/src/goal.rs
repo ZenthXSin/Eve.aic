@@ -91,6 +91,7 @@ impl LearningGoalDeriver {
                     block_reason: None,
                     execution: None,
                     feedback: None,
+                    completion: None,
                 };
                 state.goals.insert(id.clone(), goal);
                 (Change::Created, "created")

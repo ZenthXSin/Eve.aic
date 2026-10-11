@@ -744,7 +744,8 @@
     return item && typeof item.id === "string" && item.id.length > 0 && Number.isSafeInteger(item.revision) &&
       typeof item.status === "string" && typeof item.description === "string" && Number.isSafeInteger(item.reflections);
   }
-  function goalBadge(status) {
+  function goalBadge(status, completion = null) {
+    if (status === "completed" && completion) return node("span", "badge good", "用户已确认完成");
     const style = status === "blocked" ? "bad" : status === "completed" ? "good" : status === "executing" ? "active" : status === "cancelled" ? "" : "warning";
     return node("span", `badge ${style}`.trim(), label(goalLabels.status, status));
   }
@@ -810,7 +811,7 @@
       entry.type = "button";
       entry.setAttribute("aria-pressed", String(selected));
       const top = node("div", "record-topline");
-      top.append(node("span", "record-name", item.description + (item.description_truncated ? "…" : "")), goalBadge(item.status));
+      top.append(node("span", "record-name", item.description + (item.description_truncated ? "…" : "")), goalBadge(item.status, item.completion));
       const extra = item.reflection_of ? `反思子目标，父目标 ${item.reflection_of} 不在当前状态中` : `反思草稿 ${count(item.reflections)} 份`;
       entry.append(top, node("p", "record-meta", `${goalSource(item)} · 版本 ${count(item.revision)}`), node("p", "record-meta", `${goalOwner(item)} · ${extra}`));
       entry.addEventListener("click", () => { void loadGoal(item.id); });
@@ -858,7 +859,7 @@
     const heading = node("div", "detail-heading");
     const title = Array.from(goal.description);
     const short = title.length > 60 ? `${title.slice(0, 60).join("")}…` : goal.description;
-    heading.append(goalBadge(goal.status), node("h2", "", short), node("p", "", `目标 ${goal.id} · 版本 ${count(goal.revision)} · 认知状态修订 ${count(body.revision)}`));
+    heading.append(goalBadge(goal.status, goal.completion), node("h2", "", short), node("p", "", `目标 ${goal.id} · 版本 ${count(goal.revision)} · 认知状态修订 ${count(body.revision)}`));
     const actions = node("div", "detail-actions");
     actions.append(button("刷新此目标", "secondary", () => { void loadGoal(goal.id); }));
     if (goal.reflection_of) actions.append(button("查看父目标", "secondary", () => { void loadGoal(goal.reflection_of); }));
@@ -869,13 +870,17 @@
     const grid = node("dl", "detail-grid");
     const budget = body.budget;
     grid.append(
-      detailPair("状态", label(goalLabels.status, goal.status)),
+      detailPair("状态", goal.completion ? "用户已确认完成" : label(goalLabels.status, goal.status)),
       detailPair("来源", goalSource(goal)),
       detailPair("可见范围", goalOwner(goal)),
       detailPair("优先级", count(goal.priority)),
       detailPair("预算", `模型请求 ≤ ${count(budget.max_model_requests)} · 工具 ≤ ${count(budget.max_tool_calls)} · 尝试 ≤ ${count(budget.max_attempts)} · 超时 ${count(budget.timeout_ms)} 毫秒`),
       detailPair("有效期", body.expires_at_ms === null ? "未设置" : goalDate(body.expires_at_ms)),
     );
+    if (goal.completion) {
+      const done = goal.completion;
+      grid.append(detailPair("完成确认", `用户在私聊中确认 · 依据计划 ${text(done.plan_id)}（修订 ${count(done.plan_revision)}）· 确认时目标版本 ${count(done.goal_revision)} · ${goalDate(done.at_ms)}`));
+    }
     if (body.wait_reason) grid.append(detailPair("等待原因", body.wait_reason));
     if (body.block_reason) grid.append(detailPair("阻塞原因", label(goalLabels.block, body.block_reason)));
     if (body.execution) grid.append(detailPair("执行记录", `任务 ${body.execution.task_id} · 轮次 ${body.execution.turn_id === null ? "尚未确定" : String(body.execution.turn_id)}`));

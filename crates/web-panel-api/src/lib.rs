@@ -172,6 +172,17 @@ pub struct GoalSummary {
     pub reflections: usize,
     pub description: String,
     pub description_truncated: bool,
+    /// 用户在对话中确认完成时给出；此时 completed 表示用户确认，而不是执行记录验证。
+    pub completion: Option<GoalCompletionView>,
+}
+/// 用户确认完成的依据：计划各步都已被证据满足，用户在私聊中确认。不含确认者会话与原话。
+#[derive(Clone, Debug, Serialize)]
+pub struct GoalCompletionView {
+    pub plan_id: String,
+    pub plan_revision: u64,
+    /// 确认时目标的版本。
+    pub goal_revision: u64,
+    pub at_ms: u64,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct GoalPage {

@@ -1,8 +1,8 @@
 use crate::{
     AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_agenda, qq_budget,
-    qq_clarify, qq_cognition, qq_interest, qq_learning, qq_learning_commands, qq_memory,
-    qq_memory_observer, qq_outreach, qq_plan, qq_practice, qq_reminder, qq_research, qq_semantic,
-    qq_skill, qq_tools, segment_commands,
+    qq_clarify, qq_cognition, qq_completion, qq_interest, qq_learning, qq_learning_commands,
+    qq_memory, qq_memory_observer, qq_outreach, qq_plan, qq_practice, qq_reminder, qq_research,
+    qq_semantic, qq_skill, qq_tools, segment_commands,
 };
 use eve_budget_api::{AutonomyBudget, BUDGET_PLUGIN_ID, BudgetPolicy};
 use eve_budget_plugin::BudgetPlugin;
@@ -10,6 +10,8 @@ use eve_clarify_api::CLARIFY_PLUGIN_ID;
 use eve_clarify_plugin::{ClarifyPlugin, ModelClarificationComposer};
 use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
+use eve_completion_api::{COMPLETION_PLUGIN_ID, CompletionLedger};
+use eve_completion_plugin::CompletionPlugin;
 use eve_config_api::{CONFIG_SERVICE_ID, ConfigServiceHandle};
 use eve_interest_api::{INTEREST_PLUGIN_ID, InterestObserver, ObservationOptions};
 use eve_interest_plugin::{InterestPlugin, LearningGoalDeriver, ModelInterestObserver};
@@ -69,7 +71,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--goal-completion] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -105,6 +107,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --clarify 需同时开启受控研究或实践运行环境；学习目标在当前版本卡住时（实践尝试用尽仍未验证、运行环境做不了，或只开启研究时没有找到可引用的资料），写一个具体问题，在用户下次私聊时先判断时机，合适才随回复附带，不主动私聊；每个目标版本至多问一次，同一用户默认 24 小时内至多送达一个问题，之后的下一轮私聊记为回复，由兴趣观察照常处理。/clarify 查看，/clarify off|on 关闭或恢复。
 --agenda-context 需同时 --interest-learning；用户私聊时，把 Eve 为这位用户的兴趣在后台做到哪一步（研究、实践、请求澄清，按记录整理）作为低优先级数据交给对话，用户问起时据实回答；只读记录，不改变后台行为。
 --reminders 开启私聊提醒：用户自然地说“半小时后提醒我喝水”或“明早 9 点提醒我交作业”，模型调用提醒工具记下并如实回复，想取消时直接说；到时先主动私聊一次，发不出去时随用户下一条私聊的回复附带，到期 7 天仍未送达不再投递。没有命令；只在私聊中成立。--reminder-utc-offset 设置本地时区（默认 +08:00）。
+--goal-completion 需同时 --plans；待办的计划各步都被证据满足后，随用户下一次私聊的回复问一句这件事算不算完成，每份计划至多问一次；用户明确说完成了，模型调用确认工具，宿主核对计划仍对应当前版本后把待办标为已完成，并记下依据的计划与确认来源。没有命令；只在私聊中成立。
 --autonomy-budget 需同时 --interest-learning；兴趣观察、受控研究、实践草稿、技能、工具锻造、主动交流与请求澄清的后台模型请求在每个窗口（--autonomy-budget-window-hours 默认 24 小时，按 UTC 整点对齐）合计至多该次数；每次请求前先保存计数，重启不清零、失败不退还，余额不够一项工作时后台不开始新工作，重置后继续；回复用户消息、/plan propose、反思、提炼与语义索引不计入。/budget 查看用量与重置时间。
 /tools 列出锻造的工具；/tool 工具ID 查看版本、回放验证与调用；/tool disable|rollback 工具ID、/tool enable 工具ID 版本 停用、回退或启用某个已验证版本。
 EVE_DEVELOPER_CONFIG 指定独立开发工具 JSON：源码工作区、操作者、命令/GitHub/升级开关与 token 环境引用；未配置时不注册。命令以宿主权限执行，仅供明确操作者；不是 QQ 测试环境开关。/help tools 查看实际已装配能力。
@@ -159,6 +162,8 @@ pub struct QqBotOptions {
     pub agenda_context: bool,
     /// 私聊提醒：模型按用户自然的说法调用提醒工具，到时私聊提醒。
     pub reminders: bool,
+    /// 计划各步都被证据满足后，随用户下一次私聊的回复问一句待办是否完成；用户确认后标为完成。需要计划入口。
+    pub goal_completion: bool,
     /// 提醒使用的本地时区与 UTC 的偏移（分钟）；未提供时为东八区。
     pub reminder_utc_offset_minutes: Option<i32>,
     /// 同一用户两次送达之间的最短间隔；未提供时为 24 小时。
@@ -205,6 +210,7 @@ impl Default for QqBotOptions {
             clarify: false,
             agenda_context: false,
             reminders: false,
+            goal_completion: false,
             reminder_utc_offset_minutes: None,
             outreach_cooldown_ms: None,
             outreach_proactive_after_ms: None,
@@ -287,6 +293,10 @@ impl QqBotOptions {
             }
             if arg == "--reminders" {
                 options.reminders = true;
+                continue;
+            }
+            if arg == "--goal-completion" {
+                options.goal_completion = true;
                 continue;
             }
             let value = args.next().ok_or("QQBot 参数缺少值")?;
@@ -456,6 +466,9 @@ impl QqBotOptions {
         }
         if options.reminder_utc_offset_minutes.is_some() && !options.reminders {
             return Err("--reminder-utc-offset 需要同时开启 --reminders".into());
+        }
+        if options.goal_completion && !options.plans {
+            return Err("--goal-completion 需要同时开启 --plans：只有计划各步都被证据满足后才问用户是否完成".into());
         }
         if options.clarify && !runtime && options.research_sources.is_empty() {
             return Err("--clarify 需要同时开启受控研究（--research-source）或实践运行环境，作为判断目标是否卡住的依据".into());
@@ -874,6 +887,16 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        // 完成确认提问账本同样先于通道加载；损坏时拒绝启动并保留原字节，发送中的提问记为结果未知。
+        let completion = if options.goal_completion {
+            let plugin = CompletionPlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(COMPLETION_PLUGIN_ID)?).await?;
+            Some(controller)
+        } else {
+            None
+        };
         // 请求澄清账本同样先于通道加载；损坏时拒绝启动并保留原字节。
         let clarify = if options.clarify {
             let plugin = ClarifyPlugin::new()?;
@@ -952,6 +975,27 @@ async fn run_qqbot_composed(
         let dialogue_cognition: Arc<
             std::sync::OnceLock<Arc<dyn eve_cognition_api::CognitionAdmin>>,
         > = Arc::default();
+        // 待办完成确认：私聊时交给对话等待用户确认的待办；用户明确说完成了才调用确认工具。
+        let completion_plans: Option<Arc<dyn eve_plan_api::PlanJournal>> = plans
+            .clone()
+            .map(|plans| Arc::new(plans) as Arc<dyn eve_plan_api::PlanJournal>);
+        let context: Arc<dyn ContextAssembler> = match (&completion, &completion_plans) {
+            (Some(completion), Some(plans)) => {
+                bootstrap.tools.push(Arc::new(qq_completion::ConfirmTool {
+                    cognition: dialogue_cognition.clone(),
+                    plans: plans.clone(),
+                    conversations: conversations.clone(),
+                }));
+                Arc::new(qq_completion::CompletionContext {
+                    wrapped: context,
+                    cognition: dialogue_cognition.clone(),
+                    plans: plans.clone(),
+                    ledger: Arc::new(completion.clone()) as Arc<dyn CompletionLedger>,
+                    conversations: conversations.clone(),
+                })
+            }
+            _ => context,
+        };
         let context: Arc<dyn ContextAssembler> = match &skills {
             Some(skills) => {
                 bootstrap.tools.push(Arc::new(SkillTool::new(
@@ -1531,6 +1575,17 @@ async fn run_qqbot_composed(
                 qq_reminder::ID_PREFIX,
                 Arc::new(qq_reminder::ChannelAdapter {
                     reminders: Arc::new(reminders.clone()),
+                }),
+            ));
+        }
+        // 待办完成确认只随回复附带，不主动私聊。
+        if let (Some(completion), Some(plans)) = (&completion, &completion_plans) {
+            sources.push((
+                eve_completion_api::ID_PREFIX,
+                Arc::new(qq_completion::ChannelAdapter {
+                    cognition: dialogue_cognition.clone(),
+                    plans: plans.clone(),
+                    ledger: Arc::new(completion.clone()),
                 }),
             ));
         }
@@ -2179,6 +2234,22 @@ mod recall_options_tests {
             );
         }
         assert_eq!(parse_utc_offset("+14:00"), Some(840));
+    }
+
+    #[test]
+    fn goal_completion_is_explicit_and_requires_plans() {
+        assert!(!parse(&[]).unwrap().goal_completion);
+        let error = parse(&["--goal-completion"]).unwrap_err().to_string();
+        assert!(error.contains("--plans"));
+        let options = parse(&[
+            "--interest-learning",
+            "--research-source",
+            "https://docs.example/wiki/",
+            "--plans",
+            "--goal-completion",
+        ])
+        .unwrap();
+        assert!(options.plans && options.goal_completion);
     }
 
     #[test]
