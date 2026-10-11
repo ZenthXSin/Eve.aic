@@ -1,7 +1,7 @@
 use crate::{
     AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_budget, qq_clarify,
     qq_cognition, qq_interest, qq_learning, qq_learning_commands, qq_memory, qq_memory_observer,
-    qq_outreach, qq_plan, qq_practice, qq_research, qq_semantic, qq_skill, qq_tools,
+    qq_outreach, qq_plan, qq_practice, qq_reminder, qq_research, qq_semantic, qq_skill, qq_tools,
     segment_commands,
 };
 use eve_budget_api::{AutonomyBudget, BUDGET_PLUGIN_ID, BudgetPolicy};
@@ -48,6 +48,8 @@ use eve_qqbot_plugin::{
     QQBOT_STATUS_SERVICE_ID, QqBotConfig, QqBotPlugin, QqBotStatus, QqBotStatusHandle,
     QqCommandHandler, QqCommandInput, QqOutreach,
 };
+use eve_reminder_api::{REMINDER_PLUGIN_ID, ReminderAdmin};
+use eve_reminder_plugin::ReminderPlugin;
 use eve_segment_api::SegmentPreferences;
 use eve_segment_plugin::{
     ParagraphPlanner, RuleSegmentAdvisor, SEGMENT_PREFERENCES_PLUGIN_ID, SegmentPreferencePlugin,
@@ -67,7 +69,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--reminders] [--reminder-utc-offset ±HH:MM] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -101,6 +103,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --tool-forging 需同时指定实践运行环境；同一运行环境下反复出现的问题，由一次无工具模型请求锻造成只读草稿文件的检查规则，宿主用实践账本中的真实草稿回放验证（出现过问题的全部拦下、验证通过的一个不误报）后自动启用；之后的实践在实际运行前先经它检查，拦下的草稿不运行、带着说明交给草稿器修正。
 --plans 需同时开启受控研究或实践运行环境；/goal 保存的待办可以请模型建议多步计划（/plan propose 待办ID，每个待办版本至多一次、只建议不执行），确认后（/plan confirm 待办ID）由后台按依赖推进：计划只能使用已开启的受控研究与实践验证，步骤效果按研究与实践账本中的证据判定；/plans [待办ID] 查看进度与证据，/plan withdraw 待办ID 撤销。计划完成不改变待办状态。
 --clarify 需同时开启受控研究或实践运行环境；学习目标在当前版本卡住时（实践尝试用尽仍未验证、运行环境做不了，或只开启研究时没有找到可引用的资料），写一个具体问题，在用户下次私聊时先判断时机，合适才随回复附带，不主动私聊；每个目标版本至多问一次，同一用户默认 24 小时内至多送达一个问题，之后的下一轮私聊记为回复，由兴趣观察照常处理。/clarify 查看，/clarify off|on 关闭或恢复。
+--reminders 开启私聊提醒：用户自然地说“半小时后提醒我喝水”或“明早 9 点提醒我交作业”，模型调用提醒工具记下并如实回复，想取消时直接说；到时先主动私聊一次，发不出去时随用户下一条私聊的回复附带，到期 7 天仍未送达不再投递。没有命令；只在私聊中成立。--reminder-utc-offset 设置本地时区（默认 +08:00）。
 --autonomy-budget 需同时 --interest-learning；兴趣观察、受控研究、实践草稿、技能、工具锻造、主动交流与请求澄清的后台模型请求在每个窗口（--autonomy-budget-window-hours 默认 24 小时，按 UTC 整点对齐）合计至多该次数；每次请求前先保存计数，重启不清零、失败不退还，余额不够一项工作时后台不开始新工作，重置后继续；回复用户消息、/plan propose、反思、提炼与语义索引不计入。/budget 查看用量与重置时间。
 /tools 列出锻造的工具；/tool 工具ID 查看版本、回放验证与调用；/tool disable|rollback 工具ID、/tool enable 工具ID 版本 停用、回退或启用某个已验证版本。
 EVE_DEVELOPER_CONFIG 指定独立开发工具 JSON：源码工作区、操作者、命令/GitHub/升级开关与 token 环境引用；未配置时不注册。命令以宿主权限执行，仅供明确操作者；不是 QQ 测试环境开关。/help tools 查看实际已装配能力。
@@ -151,6 +154,10 @@ pub struct QqBotOptions {
     pub outreach: bool,
     /// 学习目标卡住时请用户补充信息；需要受控研究或实践验证。
     pub clarify: bool,
+    /// 私聊提醒：模型按用户自然的说法调用提醒工具，到时私聊提醒。
+    pub reminders: bool,
+    /// 提醒使用的本地时区与 UTC 的偏移（分钟）；未提供时为东八区。
+    pub reminder_utc_offset_minutes: Option<i32>,
     /// 同一用户两次送达之间的最短间隔；未提供时为 24 小时。
     pub outreach_cooldown_ms: Option<u64>,
     /// 邀请在被动窗口等待多久后主动私聊；未提供时不主动私聊。
@@ -193,6 +200,8 @@ impl Default for QqBotOptions {
             plans: false,
             outreach: false,
             clarify: false,
+            reminders: false,
+            reminder_utc_offset_minutes: None,
             outreach_cooldown_ms: None,
             outreach_proactive_after_ms: None,
             autonomy_budget: None,
@@ -268,6 +277,10 @@ impl QqBotOptions {
                 options.clarify = true;
                 continue;
             }
+            if arg == "--reminders" {
+                options.reminders = true;
+                continue;
+            }
             let value = args.next().ok_or("QQBot 参数缺少值")?;
             if value.is_empty() {
                 return Err("QQBot 参数值不能为空".into());
@@ -339,6 +352,14 @@ impl QqBotOptions {
                             .and_then(|v| v.parse().ok())
                             .filter(|v| *v <= 30 * 86_400_000)
                             .ok_or("主动私聊等待必须为 0 至 2592000000 的毫秒整数")?,
+                    );
+                }
+                Some("--reminder-utc-offset") => {
+                    options.reminder_utc_offset_minutes = Some(
+                        value
+                            .to_str()
+                            .and_then(parse_utc_offset)
+                            .ok_or("提醒时区须为 -12:00 至 +14:00 的 ±HH:MM")?,
                     );
                 }
                 Some("--autonomy-budget") => {
@@ -422,6 +443,9 @@ impl QqBotOptions {
                     .into(),
             );
         }
+        if options.reminder_utc_offset_minutes.is_some() && !options.reminders {
+            return Err("--reminder-utc-offset 需要同时开启 --reminders".into());
+        }
         if options.clarify && !runtime && options.research_sources.is_empty() {
             return Err("--clarify 需要同时开启受控研究（--research-source）或实践运行环境，作为判断目标是否卡住的依据".into());
         }
@@ -436,6 +460,21 @@ impl QqBotOptions {
         }
         Ok(Some(options))
     }
+}
+/// 解析 `±HH:MM` 时区偏移为分钟，范围 -12:00 至 +14:00。
+fn parse_utc_offset(text: &str) -> Option<i32> {
+    let (sign, rest) = match text.as_bytes().first()? {
+        b'+' => (1, &text[1..]),
+        b'-' => (-1, &text[1..]),
+        _ => return None,
+    };
+    let (hours, minutes) = rest.split_once(':')?;
+    if hours.len() != 2 || minutes.len() != 2 {
+        return None;
+    }
+    let (hours, minutes): (i32, i32) = (hours.parse().ok()?, minutes.parse().ok()?);
+    let total = sign * (hours * 60 + minutes);
+    (minutes < 60 && (-12 * 60..=14 * 60).contains(&total)).then_some(total)
 }
 /// 研究入口页面只在显式开启兴趣学习时生效；校验不发起网络请求。
 fn research_policy(options: &QqBotOptions) -> Result<Option<SourcePolicy>, AppError> {
@@ -697,6 +736,8 @@ async fn run_qqbot_composed(
         })?
         .with_training()?
         .with_natural_message_judgement(options.message_judge != MessageJudgeMode::Off);
+        // 会话是私聊还是群聊由通道登记；只在私聊中成立的能力据此判断。
+        let conversations = plugin.conversations();
         let plugin = if options.segmented {
             plugin.with_segmenter(Arc::new(ParagraphPlanner::default()), QQ_SEGMENT_LIMITS)?
         } else {
@@ -812,6 +853,16 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        // 提醒账本同样先于通道加载；损坏时拒绝启动并保留原字节，发送中的提醒记为结果未知。
+        let reminders = if options.reminders {
+            let plugin = ReminderPlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(REMINDER_PLUGIN_ID)?).await?;
+            Some(controller)
+        } else {
+            None
+        };
         // 请求澄清账本同样先于通道加载；损坏时拒绝启动并保留原字节。
         let clarify = if options.clarify {
             let plugin = ClarifyPlugin::new()?;
@@ -838,6 +889,34 @@ async fn run_qqbot_composed(
                 wrapped: context,
                 outreach: Arc::new(outreach.clone()),
             }),
+            None => context,
+        };
+        // 私聊提醒：模型按用户自然的说法调用提醒工具；私聊时交给对话当前本地时间与等待中的提醒。
+        let reminder_time = qq_reminder::LocalTime {
+            offset_minutes: options.reminder_utc_offset_minutes.unwrap_or(8 * 60),
+        };
+        let context: Arc<dyn ContextAssembler> = match &reminders {
+            Some(reminders) => {
+                let admin: Arc<dyn ReminderAdmin> = Arc::new(reminders.clone());
+                bootstrap.tools.push(Arc::new(qq_reminder::SetReminderTool {
+                    reminders: admin.clone(),
+                    conversations: conversations.clone(),
+                    local: reminder_time,
+                }));
+                bootstrap
+                    .tools
+                    .push(Arc::new(qq_reminder::CancelReminderTool {
+                        reminders: admin.clone(),
+                        conversations: conversations.clone(),
+                        local: reminder_time,
+                    }));
+                Arc::new(qq_reminder::ReminderContext {
+                    wrapped: context,
+                    reminders: admin,
+                    conversations: conversations.clone(),
+                    local: reminder_time,
+                })
+            }
             None => context,
         };
         // 已启用的技能作为对话工具：只能调用当前用户自己的技能，每次调用都实际运行验证。
@@ -1417,6 +1496,15 @@ async fn run_qqbot_composed(
         ])));
         // 邀请与请求澄清共用通道的投递点：邀请优先判断，投递结果按 ID 前缀交回各自账本。
         let mut sources: Vec<(&'static str, Arc<dyn QqOutreach>)> = Vec::new();
+        // 提醒是用户自己要的，最先投递。
+        if let Some(reminders) = &reminders {
+            sources.push((
+                qq_reminder::ID_PREFIX,
+                Arc::new(qq_reminder::ChannelAdapter {
+                    reminders: Arc::new(reminders.clone()),
+                }),
+            ));
+        }
         if let Some(outreach) = &outreach {
             let judge: Arc<dyn TimingJudge> = match timing_judge {
                 Some(judge) => judge,
@@ -1445,10 +1533,9 @@ async fn run_qqbot_composed(
         }
         if !sources.is_empty() {
             // 主动私聊开启时，通道空闲后每 2 秒询问一次；是否发送由宿主策略决定。请求澄清不主动私聊。
-            let push = outreach
-                .as_ref()
-                .and(outreach_policy.proactive_after_ms)
-                .map(|_| std::time::Duration::from_secs(2));
+            let push = (reminders.is_some()
+                || outreach.is_some() && outreach_policy.proactive_after_ms.is_some())
+            .then(|| std::time::Duration::from_secs(2));
             let adapter: Arc<dyn QqOutreach> = if sources.len() == 1 {
                 sources.remove(0).1
             } else {
@@ -2035,6 +2122,22 @@ mod recall_options_tests {
         assert!(error.contains("--memory-recall"));
         let options = parse(&["--memory", "--memory-recall", "--semantic-recall"]).unwrap();
         assert!(options.semantic_recall && options.memory_recall);
+    }
+
+    #[test]
+    fn reminders_are_explicit_and_the_offset_is_bounded() {
+        let options = parse(&[]).unwrap();
+        assert!(!options.reminders);
+        assert!(parse(&["--reminder-utc-offset", "+08:00"]).is_err());
+        let options = parse(&["--reminders", "--reminder-utc-offset", "-05:30"]).unwrap();
+        assert_eq!(options.reminder_utc_offset_minutes, Some(-330));
+        for bad in ["8", "+8:00", "+15:00", "-12:30", "+08:60", "08:00"] {
+            assert!(
+                parse(&["--reminders", "--reminder-utc-offset", bad]).is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(parse_utc_offset("+14:00"), Some(840));
     }
 
     #[test]

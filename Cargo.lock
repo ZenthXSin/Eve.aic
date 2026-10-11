@@ -316,6 +316,8 @@ dependencies = [
  "eve-practice-mindustry",
  "eve-practice-plugin",
  "eve-qqbot-plugin",
+ "eve-reminder-api",
+ "eve-reminder-plugin",
  "eve-runtime",
  "eve-segment-api",
  "eve-segment-plugin",
@@ -865,6 +867,28 @@ dependencies = [
  "eve-training-api",
  "eve-training-plugin",
  "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "eve-reminder-api"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eve-reminder-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-kernel",
+ "eve-plugin-api",
+ "eve-reminder-api",
  "serde",
  "serde_json",
  "tempfile",

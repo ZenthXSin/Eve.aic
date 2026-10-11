@@ -25,6 +25,8 @@ members = [
     "crates/budget-plugin",
     "crates/clarify-api",
     "crates/clarify-plugin",
+    "crates/reminder-api",
+    "crates/reminder-plugin",
     "crates/semantic-plugin",
     "crates/toolforge-plugin",
     "crates/outreach-api",
