@@ -86,6 +86,7 @@ jobs:
           python3 connectors/qqbot/test/agenda_test.py
           python3 connectors/qqbot/test/reminder_test.py
           python3 connectors/qqbot/test/completion_test.py
+          python3 connectors/qqbot/test/pursuit_test.py
           python3 connectors/qqbot/test/outreach_test.py
           python3 connectors/qqbot/test/journey_test.py
           python3 connectors/qqbot/test/segment_test.py

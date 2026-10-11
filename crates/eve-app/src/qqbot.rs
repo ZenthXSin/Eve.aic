@@ -1,8 +1,8 @@
 use crate::{
     AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_agenda, qq_budget,
     qq_clarify, qq_cognition, qq_completion, qq_interest, qq_learning, qq_learning_commands,
-    qq_memory, qq_memory_observer, qq_outreach, qq_plan, qq_practice, qq_reminder, qq_research,
-    qq_semantic, qq_skill, qq_tools, segment_commands,
+    qq_memory, qq_memory_observer, qq_outreach, qq_plan, qq_practice, qq_pursuit, qq_reminder,
+    qq_research, qq_semantic, qq_skill, qq_tools, segment_commands,
 };
 use eve_budget_api::{AutonomyBudget, BUDGET_PLUGIN_ID, BudgetPolicy};
 use eve_budget_plugin::BudgetPlugin;
@@ -71,7 +71,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--goal-completion] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -108,6 +108,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --agenda-context 需同时 --interest-learning；用户私聊时，把 Eve 为这位用户的兴趣在后台做到哪一步（研究、实践、请求澄清，按记录整理）作为低优先级数据交给对话，用户问起时据实回答；只读记录，不改变后台行为。
 --reminders 开启私聊提醒：用户自然地说“半小时后提醒我喝水”或“明早 9 点提醒我交作业”，模型调用提醒工具记下并如实回复，想取消时直接说；到时先主动私聊一次，发不出去时随用户下一条私聊的回复附带，到期 7 天仍未送达不再投递。没有命令；只在私聊中成立。--reminder-utc-offset 设置本地时区（默认 +08:00）。
 --goal-completion 需同时 --plans；待办的计划各步都被证据满足后，随用户下一次私聊的回复问一句这件事算不算完成，每份计划至多问一次；用户明确说完成了，模型调用确认工具，宿主核对计划仍对应当前版本后把待办标为已完成，并记下依据的计划与确认来源。没有命令；只在私聊中成立。
+--learning-stop 需同时 --interest-learning；兴趣学习目标的研究与实践次数都用完、也没有在问你或等你回复时，后台把它标为已取消并记下原因（目标的停止条件“学习预算耗尽”），兴趣本身保留；不开启时目标一直等待。无论是否开启，/interests 与议程上下文都会说明每个学习目标接下来会做什么、在等什么。
 --autonomy-budget 需同时 --interest-learning；兴趣观察、受控研究、实践草稿、技能、工具锻造、主动交流与请求澄清的后台模型请求在每个窗口（--autonomy-budget-window-hours 默认 24 小时，按 UTC 整点对齐）合计至多该次数；每次请求前先保存计数，重启不清零、失败不退还，余额不够一项工作时后台不开始新工作，重置后继续；回复用户消息、/plan propose、反思、提炼与语义索引不计入。/budget 查看用量与重置时间。
 /tools 列出锻造的工具；/tool 工具ID 查看版本、回放验证与调用；/tool disable|rollback 工具ID、/tool enable 工具ID 版本 停用、回退或启用某个已验证版本。
 EVE_DEVELOPER_CONFIG 指定独立开发工具 JSON：源码工作区、操作者、命令/GitHub/升级开关与 token 环境引用；未配置时不注册。命令以宿主权限执行，仅供明确操作者；不是 QQ 测试环境开关。/help tools 查看实际已装配能力。
@@ -164,6 +165,8 @@ pub struct QqBotOptions {
     pub reminders: bool,
     /// 计划各步都被证据满足后，随用户下一次私聊的回复问一句待办是否完成；用户确认后标为完成。需要计划入口。
     pub goal_completion: bool,
+    /// 兴趣学习目标的研究与实践次数都用完、再无可做时，后台把它标为已取消并记下原因。需要兴趣学习。
+    pub learning_stop: bool,
     /// 提醒使用的本地时区与 UTC 的偏移（分钟）；未提供时为东八区。
     pub reminder_utc_offset_minutes: Option<i32>,
     /// 同一用户两次送达之间的最短间隔；未提供时为 24 小时。
@@ -211,6 +214,7 @@ impl Default for QqBotOptions {
             agenda_context: false,
             reminders: false,
             goal_completion: false,
+            learning_stop: false,
             reminder_utc_offset_minutes: None,
             outreach_cooldown_ms: None,
             outreach_proactive_after_ms: None,
@@ -297,6 +301,10 @@ impl QqBotOptions {
             }
             if arg == "--goal-completion" {
                 options.goal_completion = true;
+                continue;
+            }
+            if arg == "--learning-stop" {
+                options.learning_stop = true;
                 continue;
             }
             let value = args.next().ok_or("QQBot 参数缺少值")?;
@@ -466,6 +474,9 @@ impl QqBotOptions {
         }
         if options.reminder_utc_offset_minutes.is_some() && !options.reminders {
             return Err("--reminder-utc-offset 需要同时开启 --reminders".into());
+        }
+        if options.learning_stop && !options.interest_learning {
+            return Err("--learning-stop 需要同时开启 --interest-learning".into());
         }
         if options.goal_completion && !options.plans {
             return Err("--goal-completion 需要同时开启 --plans：只有计划各步都被证据满足后才问用户是否完成".into());
@@ -664,6 +675,7 @@ async fn run_qqbot_composed(
     let mut practice_background: Option<qq_practice::Background> = None;
     let mut outreach_background: Option<qq_outreach::Background> = None;
     let mut clarify_background: Option<qq_clarify::Background> = None;
+    let mut pursuit_background: Option<qq_pursuit::Background> = None;
     let mut plan_background: Option<qq_plan::Background> = None;
     let mut semantic_background: Option<qq_semantic::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
@@ -907,6 +919,45 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        // 预算账本同样先于后台加载；损坏时拒绝启动并保留原字节。
+        let budget_gate = match options.autonomy_budget {
+            Some(limit) => {
+                let plugin = BudgetPlugin::new(BudgetPolicy {
+                    window_ms: options.autonomy_budget_window_hours.unwrap_or(24) * 3_600_000,
+                    limit,
+                })?;
+                let controller = plugin.controller();
+                kernel.register(Box::new(plugin))?;
+                kernel.start(&PluginId::new(BUDGET_PLUGIN_ID)?).await?;
+                qq_budget::Gate::new(Some(Arc::new(controller) as Arc<dyn AutonomyBudget>))
+            }
+            None => qq_budget::Gate::default(),
+        };
+        // 认知服务启动后才绑定；对话工具与推进判断在此之前不读写目标。
+        let dialogue_cognition: Arc<
+            std::sync::OnceLock<Arc<dyn eve_cognition_api::CognitionAdmin>>,
+        > = Arc::default();
+        // 学习目标的推进判断只读各账本，交给议程上下文与 /interests；开启 --learning-stop 时由后台执行停止。
+        let pursuit = interests.as_ref().map(|interests| {
+            Arc::new(qq_pursuit::Pursuit {
+                cognition: dialogue_cognition.clone(),
+                interests: Arc::new(interests.clone()),
+                knowledge: knowledge
+                    .clone()
+                    .map(|knowledge| Arc::new(knowledge) as Arc<dyn KnowledgeAdmin>),
+                practice: practice
+                    .clone()
+                    .map(|practice| Arc::new(practice) as Arc<dyn PracticeAdmin>),
+                clarify: clarify
+                    .clone()
+                    .map(|clarify| Arc::new(clarify) as Arc<dyn eve_clarify_api::ClarifyAdmin>),
+                outreach: outreach
+                    .clone()
+                    .map(|outreach| Arc::new(outreach) as Arc<dyn eve_outreach_api::OutreachAdmin>),
+                gate: budget_gate.clone(),
+                policy: Arc::new(eve_pursuit_plugin::RulePursuitPolicy),
+            })
+        });
         let context: Arc<dyn ContextAssembler> = if let Some(memory) = &memory {
             let context = MemoryContext::new("qq", memory.clone(), context)?;
             Arc::new(if options.self_learning {
@@ -939,6 +990,7 @@ async fn run_qqbot_composed(
                 clarify: clarify
                     .clone()
                     .map(|clarify| Arc::new(clarify) as Arc<dyn eve_clarify_api::ClarifyAdmin>),
+                pursuit: pursuit.clone(),
             }),
             _ => context,
         };
@@ -972,9 +1024,6 @@ async fn run_qqbot_composed(
         };
         // 已启用的技能作为对话工具：只能调用当前用户自己的技能，每次调用都实际运行验证。
         let skill_runner: Arc<std::sync::OnceLock<Arc<dyn PracticeRunner>>> = Arc::default();
-        let dialogue_cognition: Arc<
-            std::sync::OnceLock<Arc<dyn eve_cognition_api::CognitionAdmin>>,
-        > = Arc::default();
         // 待办完成确认：私聊时交给对话等待用户确认的待办；用户明确说完成了才调用确认工具。
         let completion_plans: Option<Arc<dyn eve_plan_api::PlanJournal>> = plans
             .clone()
@@ -1019,20 +1068,6 @@ async fn run_qqbot_composed(
             Some((index, Arc::new(qq_semantic::DeferredEmbeddings::new())))
         } else {
             None
-        };
-        // 预算账本同样先于后台加载；损坏时拒绝启动并保留原字节。
-        let budget_gate = match options.autonomy_budget {
-            Some(limit) => {
-                let plugin = BudgetPlugin::new(BudgetPolicy {
-                    window_ms: options.autonomy_budget_window_hours.unwrap_or(24) * 3_600_000,
-                    limit,
-                })?;
-                let controller = plugin.controller();
-                kernel.register(Box::new(plugin))?;
-                kernel.start(&PluginId::new(BUDGET_PLUGIN_ID)?).await?;
-                qq_budget::Gate::new(Some(Arc::new(controller) as Arc<dyn AutonomyBudget>))
-            }
-            None => qq_budget::Gate::default(),
         };
         bootstrap.context = Some(if options.memory_recall {
             let memory = memory.clone().ok_or("记忆召回缺少记忆服务")?;
@@ -1295,6 +1330,7 @@ async fn run_qqbot_composed(
                 deriver,
                 cognition.clone(),
                 dirty,
+                pursuit.clone(),
             )
         } else {
             qq_interest::Commands::disabled()
@@ -1516,6 +1552,10 @@ async fn run_qqbot_composed(
         } else {
             qq_clarify::Commands::disabled()
         };
+        if options.learning_stop {
+            let pursuit = pursuit.clone().ok_or("学习目标停止缺少兴趣学习")?;
+            pursuit_background = Some(qq_pursuit::Background::start(pursuit));
+        }
         let memory_commands = memory
             .as_ref()
             .map_or_else(qq_memory::Commands::disabled, |memory| {
@@ -1765,6 +1805,9 @@ async fn run_qqbot_composed(
         if let Some(clarify) = &clarify_background {
             clarify.activate();
         }
+        if let Some(pursuit) = &pursuit_background {
+            pursuit.activate();
+        }
         if let Some(plans) = &plan_background {
             plans.activate();
         }
@@ -1802,6 +1845,12 @@ async fn run_qqbot_composed(
                     (
                         clarify.finished(),
                         "请求澄清后台已结束；QQ 通道停止准入并保留状态",
+                    )
+                }))
+                .chain(pursuit_background.as_ref().map(|pursuit| {
+                    (
+                        pursuit.finished(),
+                        "学习目标停止后台已结束；QQ 通道停止准入并保留状态",
                     )
                 }))
                 .chain(plan_background.as_ref().map(|plans| {
@@ -1863,6 +1912,9 @@ async fn run_qqbot_composed(
     if let Some(clarify) = &clarify_background {
         clarify.request_stop();
     }
+    if let Some(pursuit) = &pursuit_background {
+        pursuit.request_stop();
+    }
     if let Some(plans) = &plan_background {
         plans.request_stop();
     }
@@ -1878,6 +1930,12 @@ async fn run_qqbot_composed(
     // 计划后台读取研究、实践与认知状态并写计划账本；先结束进行中的建议请求。
     if let Some(plans) = plan_background
         && let Err(error) = plans.stop().await
+    {
+        secondary.push(error);
+    }
+    // 学习目标停止只读各账本并写认知状态；先结束，避免与其他后台的收尾交错。
+    if let Some(pursuit) = pursuit_background
+        && let Err(error) = pursuit.stop().await
     {
         secondary.push(error);
     }
@@ -2217,6 +2275,18 @@ mod recall_options_tests {
             parse(&["--interest-learning", "--agenda-context"])
                 .unwrap()
                 .agenda_context
+        );
+    }
+
+    #[test]
+    fn learning_stop_is_explicit_and_requires_interest_learning() {
+        assert!(!parse(&[]).unwrap().learning_stop);
+        let error = parse(&["--learning-stop"]).unwrap_err().to_string();
+        assert!(error.contains("--interest-learning"));
+        assert!(
+            parse(&["--interest-learning", "--learning-stop"])
+                .unwrap()
+                .learning_stop
         );
     }
 

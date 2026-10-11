@@ -218,6 +218,14 @@ fn marker(interest: &InterestRecord) -> InterestResult<String> {
     .map_err(|_| InterestError::InvalidInput)
 }
 
+/// 学习目标描述已同步到的兴趣修订；目标不在等待或不是这条兴趣派生的时为空。
+pub fn synced_interest_revision(goal: &Goal, interest: &InterestRecord) -> Option<u64> {
+    if goal.status != GoalStatus::Waiting {
+        return None;
+    }
+    parse_marker(goal.wait_reason.as_deref(), interest).ok()
+}
+
 fn parse_marker(reason: Option<&str>, interest: &InterestRecord) -> InterestResult<u64> {
     let marker: Marker = serde_json::from_str(reason.ok_or(InterestError::Derivation)?)
         .map_err(|_| InterestError::Derivation)?;
