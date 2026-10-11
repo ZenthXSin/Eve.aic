@@ -13,6 +13,7 @@ mod memory_cli;
 mod memory_cli_view;
 mod message_evaluation;
 mod models;
+mod qq_agenda;
 mod qq_budget;
 mod qq_clarify;
 mod qq_cognition;
