@@ -103,6 +103,7 @@ pub(crate) struct Services {
     pub segmentation: Option<Arc<Segmentation>>,
     pub natural_message_judgement: bool,
     pub outreach: Option<Arc<OutreachHook>>,
+    pub conversations: crate::QqConversations,
 }
 /// 宿主接线的主动交流；`push_interval` 为空时不主动私聊。
 pub(crate) struct OutreachHook {
@@ -409,6 +410,7 @@ pub(crate) async fn run(
         segmentation,
         natural_message_judgement,
         outreach,
+        conversations,
     } = services;
     // 仅本地学习已验证回执中的用户表达；不提交旧任务、不调用模型或重发消息。
     if let Some(training) = &training {
@@ -806,8 +808,11 @@ pub(crate) async fn run(
                     finish(&mut stdin, &message.id).await?;
                     continue;
                 }
+                let key = message.session_key(&config.app_id)?;
+                // 先登记会话类型，本轮工具执行时即可读取。
+                conversations.record(&key, &message.scope);
                 let submitted = control.submit(ControlInput {
-                    session: SessionInput { key: message.session_key(&config.app_id)?, text: message.text.clone() },
+                    session: SessionInput { key, text: message.text.clone() },
                     task_id: format!("qq:{}", message.id),
                 }, sink.clone());
                 match submitted {

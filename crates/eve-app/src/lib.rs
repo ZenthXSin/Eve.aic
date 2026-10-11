@@ -27,6 +27,7 @@ mod qq_message_judge;
 mod qq_outreach;
 mod qq_plan;
 mod qq_practice;
+mod qq_reminder;
 mod qq_research;
 mod qq_semantic;
 mod qq_skill;

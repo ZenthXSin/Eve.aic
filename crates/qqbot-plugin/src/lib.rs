@@ -1,11 +1,13 @@
 //! 官方 QQBot 通道实现；只通过公开 Control/Message/Session 与插件 Context 协作。
 mod bridge;
 mod commands;
+mod conversations;
 mod observer;
 mod outreach;
 mod state;
 
 pub use commands::{QqCommandHandler, QqCommandInput};
+pub use conversations::QqConversations;
 pub use observer::{QqInteraction, QqInteractionObserver, QqInteractionSource};
 pub use outreach::{
     QQ_OUTREACH_JUDGE_TIMEOUT, QQ_OUTREACH_MAX_BYTES, QQ_OUTREACH_MAX_REPLY_PARTS,
@@ -95,6 +97,7 @@ pub struct QqBotPlugin {
     segmentation: Option<Arc<Segmentation>>,
     natural_message_judgement: bool,
     outreach: Option<Arc<bridge::OutreachHook>>,
+    conversations: QqConversations,
 }
 pub(crate) struct Segmentation {
     pub planner: Arc<dyn SegmentPlanner>,
@@ -122,7 +125,12 @@ impl QqBotPlugin {
             segmentation: None,
             natural_message_judgement: false,
             outreach: None,
+            conversations: QqConversations::default(),
         })
+    }
+    /// 通道已提交过轮次的会话是私聊还是群聊；只读，供只在私聊中成立的宿主能力判断。
+    pub fn conversations(&self) -> QqConversations {
+        self.conversations.clone()
     }
     /// 显式开启在途普通文字判断；判断实现由宿主安装的 MessageService 决定。
     /// 默认关闭，普通文字继续排队。只捕获尚未收尾且没有请求取消的当前代，
@@ -276,6 +284,7 @@ impl Plugin for QqBotPlugin {
             let segmentation = self.segmentation.clone();
             let natural_message_judgement = self.natural_message_judgement;
             let outreach = self.outreach.clone();
+            let conversations = self.conversations.clone();
             let task_ctx = ctx.clone();
             ctx.spawn_task(TaskSpec::new(
                 "QQBot JSONL 通道",
@@ -292,6 +301,7 @@ impl Plugin for QqBotPlugin {
                     let observation = observation.clone();
                     let segmentation = segmentation.clone();
                     let outreach = outreach.clone();
+                    let conversations = conversations.clone();
                     let status = status.clone();
                     let ledger = ledger.clone();
                     Box::pin(async move {
@@ -311,6 +321,7 @@ impl Plugin for QqBotPlugin {
                                 segmentation,
                                 natural_message_judgement,
                                 outreach,
+                                conversations,
                             },
                             ledger,
                             signal,
