@@ -1,0 +1,19 @@
+[package]
+name = "eve-budget-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-budget-api = { path = "../budget-api" }
+eve-plugin-api = { path = "../plugin-api" }
+eve-llm-api = { path = "../llm-api" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+eve-kernel = { path = "../kernel" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+serde_json.workspace = true

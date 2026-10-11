@@ -1,6 +1,6 @@
 //! QQ 宿主的兴趣观察：低频扫描已送达交互，持久化准入后才调用观察器；
 //! 学习目标派生只读写本地状态，不调用模型。
-use crate::AppError;
+use crate::{AppError, qq_budget};
 use eve_cognition_api::{CognitionAdmin, GoalStatus};
 use eve_interest_api::{
     InterestAdmin, InterestError, InterestGoalDeriver, InterestObserver, InterestRecord,
@@ -47,6 +47,7 @@ impl Background {
         deriver: Arc<dyn InterestGoalDeriver>,
         settings: Arc<dyn InterestSettingsReader>,
         dirty: Arc<AtomicBool>,
+        gate: qq_budget::Gate,
     ) -> Result<Self, AppError> {
         settings.snapshot()?.settings.validate()?;
         let (active, activated) = watch::channel(false);
@@ -55,7 +56,7 @@ impl Background {
         let task = tokio::spawn(async move {
             // Sender 在 panic 时也释放；宿主随后关闭通道，不假装后台仍正常。
             let result = run(
-                memory, interests, observer, deriver, settings, dirty, activated, stopped,
+                memory, interests, observer, deriver, settings, dirty, gate, activated, stopped,
             )
             .await;
             let _ = finished_sender.send(true);
@@ -119,6 +120,7 @@ async fn run(
     deriver: Arc<dyn InterestGoalDeriver>,
     settings: Arc<dyn InterestSettingsReader>,
     dirty: Arc<AtomicBool>,
+    gate: qq_budget::Gate,
     mut active: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
 ) -> Result<(), AppError> {
@@ -165,6 +167,10 @@ async fn run(
                 }
                 let current = settings.snapshot()?;
                 if !current.settings.enabled {
+                    break;
+                }
+                // 余额不够一次观察：本轮不开始，证据留到预算窗口重置后再观察。
+                if !gate.admits(qq_budget::INTEREST_UNITS)? {
                     break;
                 }
                 let snapshot = memory.reader(scope.clone())?.snapshot()?;

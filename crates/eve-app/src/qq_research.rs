@@ -1,6 +1,6 @@
 //! QQ 宿主的受控研究：为等待中的兴趣学习目标在操作者配置的来源范围内研究，
 //! 每个目标修订至多一次；准入与每个阶段先持久化，停止、超时与失败都留下记录且不重试。
-use crate::{AppError, qq_plan};
+use crate::{AppError, qq_budget, qq_plan};
 use eve_cognition_api::{CognitionAdmin, Goal, GoalStatus, SourceKind, Visibility};
 use eve_interest_api::{
     INTEREST_GOAL_CHANNEL, INTEREST_GOAL_VERIFICATION, InterestAdmin, InterestStatus,
@@ -52,6 +52,7 @@ impl Background {
         researcher: Arc<Researcher>,
         policy: SourcePolicy,
         plans: Option<Arc<dyn PlanJournal>>,
+        gate: qq_budget::Gate,
     ) -> Self {
         let (active, activated) = watch::channel(false);
         let (stop, stopped) = watch::channel(false);
@@ -59,7 +60,7 @@ impl Background {
         let task = tokio::spawn(async move {
             // Sender 在 panic 时也释放；宿主随后关闭通道，不假装后台仍正常。
             let result = run(
-                knowledge, cognition, researcher, policy, plans, activated, stopped,
+                knowledge, cognition, researcher, policy, plans, gate, activated, stopped,
             )
             .await;
             let _ = finished_sender.send(true);
@@ -120,12 +121,14 @@ fn topic(goal: &Goal, owner: &str) -> ResearchTopic {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     knowledge: Arc<dyn KnowledgeAdmin>,
     cognition: Arc<dyn CognitionAdmin>,
     researcher: Arc<Researcher>,
     policy: SourcePolicy,
     plans: Option<Arc<dyn PlanJournal>>,
+    gate: qq_budget::Gate,
     mut active: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
 ) -> Result<(), AppError> {
@@ -145,7 +148,8 @@ async fn run(
         if *stopped.borrow() {
             return Ok(());
         }
-        if researching {
+        // 余额不够一次研究（选来源与提取各一次请求）：不开始新研究，预算窗口重置后继续。
+        if researching && gate.admits(qq_budget::RESEARCH_UNITS)? {
             let snapshot = cognition
                 .snapshot()
                 .map_err(|_| "受控研究无法读取学习目标")?;
@@ -389,7 +393,7 @@ fn prefix(text: &str, limit: usize) -> &str {
 }
 
 /// 毫秒时间戳的 UTC 日期时间，精确到分钟。
-fn utc(ms: u64) -> String {
+pub(crate) fn utc(ms: u64) -> String {
     let seconds = ms / 1000;
     let days = (seconds / 86_400) as i64;
     let (hour, minute) = ((seconds % 86_400) / 3600, (seconds % 3600) / 60);

@@ -60,6 +60,8 @@ eve-practice-browser = { path = "../practice-browser" }
 eve-skill-api = { path = "../skill-api" }
 eve-skill-plugin = { path = "../skill-plugin" }
 eve-toolforge-api = { path = "../toolforge-api" }
+eve-budget-api = { path = "../budget-api" }
+eve-budget-plugin = { path = "../budget-plugin" }
 eve-semantic-api = { path = "../semantic-api" }
 eve-semantic-plugin = { path = "../semantic-plugin" }
 eve-toolforge-plugin = { path = "../toolforge-plugin" }

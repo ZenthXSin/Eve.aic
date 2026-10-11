@@ -21,6 +21,8 @@ members = [
     "crates/skill-plugin",
     "crates/toolforge-api",
     "crates/semantic-api",
+    "crates/budget-api",
+    "crates/budget-plugin",
     "crates/semantic-plugin",
     "crates/toolforge-plugin",
     "crates/outreach-api",
