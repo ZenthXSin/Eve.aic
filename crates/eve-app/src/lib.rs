@@ -14,6 +14,7 @@ mod memory_cli_view;
 mod message_evaluation;
 mod models;
 mod qq_budget;
+mod qq_clarify;
 mod qq_cognition;
 mod qq_help;
 mod qq_interest;

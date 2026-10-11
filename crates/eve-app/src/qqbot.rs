@@ -1,10 +1,13 @@
 use crate::{
-    AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_budget, qq_cognition,
-    qq_interest, qq_learning, qq_learning_commands, qq_memory, qq_memory_observer, qq_outreach,
-    qq_plan, qq_practice, qq_research, qq_semantic, qq_skill, qq_tools, segment_commands,
+    AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_budget, qq_clarify,
+    qq_cognition, qq_interest, qq_learning, qq_learning_commands, qq_memory, qq_memory_observer,
+    qq_outreach, qq_plan, qq_practice, qq_research, qq_semantic, qq_skill, qq_tools,
+    segment_commands,
 };
 use eve_budget_api::{AutonomyBudget, BUDGET_PLUGIN_ID, BudgetPolicy};
 use eve_budget_plugin::BudgetPlugin;
+use eve_clarify_api::CLARIFY_PLUGIN_ID;
+use eve_clarify_plugin::{ClarifyPlugin, ModelClarificationComposer};
 use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
 use eve_config_api::{CONFIG_SERVICE_ID, ConfigServiceHandle};
@@ -43,7 +46,7 @@ use eve_practice_plugin::{ModelPracticeDrafter, PracticePlugin, Practitioner};
 use eve_qqbot_plugin::{
     DEFAULT_QQBOT_APP_ID, QQ_SEGMENT_LIMITS, QQ_SEGMENT_POLICY, QQBOT_PLUGIN_ID,
     QQBOT_STATUS_SERVICE_ID, QqBotConfig, QqBotPlugin, QqBotStatus, QqBotStatusHandle,
-    QqCommandHandler, QqCommandInput,
+    QqCommandHandler, QqCommandInput, QqOutreach,
 };
 use eve_segment_api::SegmentPreferences;
 use eve_segment_plugin::{
@@ -64,7 +67,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -97,7 +100,8 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 /skills 列出技能；/skill 技能ID 查看版本、验证证据、启用记录与调用；/skill disable|rollback 技能ID、/skill enable 技能ID 版本 停用、回退或启用某个已验证版本。
 --tool-forging 需同时指定实践运行环境；同一运行环境下反复出现的问题，由一次无工具模型请求锻造成只读草稿文件的检查规则，宿主用实践账本中的真实草稿回放验证（出现过问题的全部拦下、验证通过的一个不误报）后自动启用；之后的实践在实际运行前先经它检查，拦下的草稿不运行、带着说明交给草稿器修正。
 --plans 需同时开启受控研究或实践运行环境；/goal 保存的待办可以请模型建议多步计划（/plan propose 待办ID，每个待办版本至多一次、只建议不执行），确认后（/plan confirm 待办ID）由后台按依赖推进：计划只能使用已开启的受控研究与实践验证，步骤效果按研究与实践账本中的证据判定；/plans [待办ID] 查看进度与证据，/plan withdraw 待办ID 撤销。计划完成不改变待办状态。
---autonomy-budget 需同时 --interest-learning；兴趣观察、受控研究、实践草稿、技能、工具锻造与主动交流的后台模型请求在每个窗口（--autonomy-budget-window-hours 默认 24 小时，按 UTC 整点对齐）合计至多该次数；每次请求前先保存计数，重启不清零、失败不退还，余额不够一项工作时后台不开始新工作，重置后继续；回复用户消息、/plan propose、反思、提炼与语义索引不计入。/budget 查看用量与重置时间。
+--clarify 需同时开启受控研究或实践运行环境；学习目标在当前版本卡住时（实践尝试用尽仍未验证、运行环境做不了，或只开启研究时没有找到可引用的资料），写一个具体问题，在用户下次私聊时先判断时机，合适才随回复附带，不主动私聊；每个目标版本至多问一次，同一用户默认 24 小时内至多送达一个问题，之后的下一轮私聊记为回复，由兴趣观察照常处理。/clarify 查看，/clarify off|on 关闭或恢复。
+--autonomy-budget 需同时 --interest-learning；兴趣观察、受控研究、实践草稿、技能、工具锻造、主动交流与请求澄清的后台模型请求在每个窗口（--autonomy-budget-window-hours 默认 24 小时，按 UTC 整点对齐）合计至多该次数；每次请求前先保存计数，重启不清零、失败不退还，余额不够一项工作时后台不开始新工作，重置后继续；回复用户消息、/plan propose、反思、提炼与语义索引不计入。/budget 查看用量与重置时间。
 /tools 列出锻造的工具；/tool 工具ID 查看版本、回放验证与调用；/tool disable|rollback 工具ID、/tool enable 工具ID 版本 停用、回退或启用某个已验证版本。
 EVE_DEVELOPER_CONFIG 指定独立开发工具 JSON：源码工作区、操作者、命令/GitHub/升级开关与 token 环境引用；未配置时不注册。命令以宿主权限执行，仅供明确操作者；不是 QQ 测试环境开关。/help tools 查看实际已装配能力。
 明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
@@ -145,6 +149,8 @@ pub struct QqBotOptions {
     pub plans: bool,
     /// 学习目标取得实际验证的进展后择机邀请用户；需要实践验证。
     pub outreach: bool,
+    /// 学习目标卡住时请用户补充信息；需要受控研究或实践验证。
+    pub clarify: bool,
     /// 同一用户两次送达之间的最短间隔；未提供时为 24 小时。
     pub outreach_cooldown_ms: Option<u64>,
     /// 邀请在被动窗口等待多久后主动私聊；未提供时不主动私聊。
@@ -186,6 +192,7 @@ impl Default for QqBotOptions {
             tool_forging: false,
             plans: false,
             outreach: false,
+            clarify: false,
             outreach_cooldown_ms: None,
             outreach_proactive_after_ms: None,
             autonomy_budget: None,
@@ -255,6 +262,10 @@ impl QqBotOptions {
             }
             if arg == "--outreach" {
                 options.outreach = true;
+                continue;
+            }
+            if arg == "--clarify" {
+                options.clarify = true;
                 continue;
             }
             let value = args.next().ok_or("QQBot 参数缺少值")?;
@@ -410,6 +421,9 @@ impl QqBotOptions {
                 "--outreach-cooldown-ms 与 --outreach-proactive-after-ms 需要同时开启 --outreach"
                     .into(),
             );
+        }
+        if options.clarify && !runtime && options.research_sources.is_empty() {
+            return Err("--clarify 需要同时开启受控研究（--research-source）或实践运行环境，作为判断目标是否卡住的依据".into());
         }
         if options.autonomy_budget_window_hours.is_some() && options.autonomy_budget.is_none() {
             return Err("--autonomy-budget-window-hours 需要同时指定 --autonomy-budget".into());
@@ -586,6 +600,7 @@ async fn run_qqbot_composed(
     let mut research_background: Option<qq_research::Background> = None;
     let mut practice_background: Option<qq_practice::Background> = None;
     let mut outreach_background: Option<qq_outreach::Background> = None;
+    let mut clarify_background: Option<qq_clarify::Background> = None;
     let mut plan_background: Option<qq_plan::Background> = None;
     let mut semantic_background: Option<qq_semantic::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
@@ -793,6 +808,16 @@ async fn run_qqbot_composed(
             let controller = plugin.controller();
             kernel.register(Box::new(plugin))?;
             kernel.start(&PluginId::new(OUTREACH_PLUGIN_ID)?).await?;
+            Some(controller)
+        } else {
+            None
+        };
+        // 请求澄清账本同样先于通道加载；损坏时拒绝启动并保留原字节。
+        let clarify = if options.clarify {
+            let plugin = ClarifyPlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(CLARIFY_PLUGIN_ID)?).await?;
             Some(controller)
         } else {
             None
@@ -1310,6 +1335,29 @@ async fn run_qqbot_composed(
         } else {
             qq_outreach::Commands::disabled()
         };
+        let clarify_commands = if let (Some(clarify), Some(interests)) = (&clarify, &interests) {
+            let cognition: Arc<dyn eve_cognition_api::CognitionAdmin> =
+                Arc::new(background.as_ref().ok_or("请求澄清缺少认知服务")?.admin()?);
+            clarify_background = Some(qq_clarify::Background::start(qq_clarify::Services {
+                clarify: Arc::new(clarify.clone()),
+                cognition,
+                interests: Arc::new(interests.clone()),
+                memory: memory.clone().ok_or("请求澄清缺少记忆服务")?,
+                knowledge: knowledge
+                    .clone()
+                    .map(|knowledge| Arc::new(knowledge) as Arc<dyn KnowledgeAdmin>),
+                practice: practice
+                    .clone()
+                    .map(|practice| Arc::new(practice) as Arc<dyn PracticeAdmin>),
+                composer: Arc::new(ModelClarificationComposer::new(budgeted(
+                    qq_budget::CLARIFY,
+                )?)),
+                gate: budget_gate.clone(),
+            }));
+            qq_clarify::Commands::enabled(Arc::new(clarify.clone()))
+        } else {
+            qq_clarify::Commands::disabled()
+        };
         let memory_commands = memory
             .as_ref()
             .map_or_else(qq_memory::Commands::disabled, |memory| {
@@ -1358,25 +1406,49 @@ async fn run_qqbot_composed(
             semantic_commands,
             budget_gate.commands(),
             outreach_commands,
+            clarify_commands,
             segment_commands,
         ])));
+        // 邀请与请求澄清共用通道的投递点：邀请优先判断，投递结果按 ID 前缀交回各自账本。
+        let mut sources: Vec<(&'static str, Arc<dyn QqOutreach>)> = Vec::new();
         if let Some(outreach) = &outreach {
             let judge: Arc<dyn TimingJudge> = match timing_judge {
                 Some(judge) => judge,
                 None => Arc::new(ModelTimingJudge::new(budgeted(qq_budget::OUTREACH)?)),
             };
-            // 主动私聊开启时，通道空闲后每 2 秒询问一次；是否发送由宿主策略决定。
-            plugin = plugin.with_outreach(
+            sources.push((
+                "invite-",
                 Arc::new(qq_outreach::ChannelAdapter {
                     outreach: Arc::new(outreach.clone()) as Arc<dyn OutreachAdmin>,
                     judge,
                     policy: outreach_policy,
                     gate: budget_gate.clone(),
                 }),
-                outreach_policy
-                    .proactive_after_ms
-                    .map(|_| std::time::Duration::from_secs(2)),
-            )?;
+            ));
+        }
+        if let Some(clarify) = &clarify {
+            sources.push((
+                qq_clarify::ID_PREFIX,
+                Arc::new(qq_clarify::ChannelAdapter {
+                    clarify: Arc::new(clarify.clone()),
+                    judge: Arc::new(ModelTimingJudge::new(budgeted(qq_budget::CLARIFY)?)),
+                    policy: eve_clarify_api::ClarifyPolicy::default(),
+                    gate: budget_gate.clone(),
+                }),
+            ));
+        }
+        if !sources.is_empty() {
+            // 主动私聊开启时，通道空闲后每 2 秒询问一次；是否发送由宿主策略决定。请求澄清不主动私聊。
+            let push = outreach
+                .as_ref()
+                .and(outreach_policy.proactive_after_ms)
+                .map(|_| std::time::Duration::from_secs(2));
+            let adapter: Arc<dyn QqOutreach> = if sources.len() == 1 {
+                sources.remove(0).1
+            } else {
+                Arc::new(qq_clarify::Combined(sources))
+            };
+            plugin = plugin.with_outreach(adapter, push)?;
         }
         if let Some(store) = segment_preferences {
             plugin = plugin.with_segment_preferences(store, QQ_SEGMENT_POLICY)?;
@@ -1513,6 +1585,9 @@ async fn run_qqbot_composed(
         if let Some(outreach) = &outreach_background {
             outreach.activate();
         }
+        if let Some(clarify) = &clarify_background {
+            clarify.activate();
+        }
         if let Some(plans) = &plan_background {
             plans.activate();
         }
@@ -1544,6 +1619,12 @@ async fn run_qqbot_composed(
                     (
                         outreach.finished(),
                         "主动交流后台已结束；QQ 通道停止准入并保留状态",
+                    )
+                }))
+                .chain(clarify_background.as_ref().map(|clarify| {
+                    (
+                        clarify.finished(),
+                        "请求澄清后台已结束；QQ 通道停止准入并保留状态",
                     )
                 }))
                 .chain(plan_background.as_ref().map(|plans| {
@@ -1602,6 +1683,9 @@ async fn run_qqbot_composed(
     if let Some(outreach) = &outreach_background {
         outreach.request_stop();
     }
+    if let Some(clarify) = &clarify_background {
+        clarify.request_stop();
+    }
     if let Some(plans) = &plan_background {
         plans.request_stop();
     }
@@ -1617,6 +1701,12 @@ async fn run_qqbot_composed(
     // 计划后台读取研究、实践与认知状态并写计划账本；先结束进行中的建议请求。
     if let Some(plans) = plan_background
         && let Err(error) = plans.stop().await
+    {
+        secondary.push(error);
+    }
+    // 请求澄清读取学习目标、研究与实践并写澄清账本；先写入取消结局。
+    if let Some(clarify) = clarify_background
+        && let Err(error) = clarify.stop().await
     {
         secondary.push(error);
     }
@@ -1939,6 +2029,23 @@ mod recall_options_tests {
         assert!(error.contains("--memory-recall"));
         let options = parse(&["--memory", "--memory-recall", "--semantic-recall"]).unwrap();
         assert!(options.semantic_recall && options.memory_recall);
+    }
+
+    #[test]
+    fn clarify_is_explicit_and_requires_research_or_a_practice_runtime() {
+        assert!(!parse(&[]).unwrap().clarify);
+        let error = parse(&["--interest-learning", "--clarify"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--research-source"));
+        let options = parse(&[
+            "--interest-learning",
+            "--research-source",
+            "https://example.org/docs/",
+            "--clarify",
+        ])
+        .unwrap();
+        assert!(options.clarify);
     }
 
     #[test]
