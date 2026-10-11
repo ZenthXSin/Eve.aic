@@ -121,8 +121,20 @@ impl StoredReminders {
             .iter()
             .filter(|entry| entry.owner == owner && entry.status == ReminderStatus::Scheduled)
             .count();
-        if scheduled >= MAX_SCHEDULED_PER_OWNER || inner.ledger.reminders.len() >= MAX_REMINDERS {
+        if scheduled >= MAX_SCHEDULED_PER_OWNER {
             return Err(ReminderError::LimitReached);
+        }
+        let mut next = inner.ledger.clone();
+        // 满了时腾出最早结束的一条；等待中、发送中与结果未知的记录从不删除。
+        if next.reminders.len() >= MAX_REMINDERS {
+            let oldest = next
+                .reminders
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| entry.closed_at_ms.map(|at| (at, index)))
+                .min()
+                .ok_or(ReminderError::LimitReached)?;
+            next.reminders.remove(oldest.1);
         }
         let reminder = Reminder {
             id,
@@ -136,7 +148,6 @@ impl StoredReminders {
             delivered_at_ms: None,
             closed_at_ms: None,
         };
-        let mut next = inner.ledger.clone();
         next.reminders.push(reminder.clone());
         persist(&mut inner, next)?;
         Ok(reminder)

@@ -8,7 +8,7 @@ use std::fmt;
 
 pub const REMINDER_PLUGIN_ID: &str = "eve.reminder";
 pub const REMINDER_STATE_KEY: &str = "reminders.v1";
-/// 账本至多保存的提醒；满了保留原记录，不再新增。
+/// 账本至多保存的提醒；满了时删除最早结束（已送达、已取消、已过期）的一条，没有可删的就不再新增。
 pub const MAX_REMINDERS: usize = 512;
 /// 同一用户同时等待中的提醒上限。
 pub const MAX_SCHEDULED_PER_OWNER: usize = 20;

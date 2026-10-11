@@ -163,7 +163,9 @@ class ReminderAcceptance(unittest.TestCase):
         self.assertEqual((reminder["owner"], reminder["text"], reminder["status"], reminder["attempts"]),
                          (identity("user-1"), "喝水", "Scheduled", []))
         self.assertEqual(reminder["due_at_ms"] - reminder["created_at_ms"], 30 * MINUTE)
-        self.assertEqual(reminder["source_message_id"], "tool:call-set_reminder-0")
+        # 来源是这次工具调用 ID 的摘要；同一次调用重复执行时得到同一条提醒。
+        self.assertEqual(reminder["source_message_id"],
+                         "tool:" + hashlib.sha256(b"call-set_reminder-0").hexdigest())
         # 回复前已经保存：带工具结果的那次请求发出时，账本里已有这条提醒。
         answered = next(r for r in self.kind("chat") if self.results(r["body"]))
         self.assertEqual(answered["state"]["eve.reminder"]["reminders.v1"]["reminders"][0]["status"], "Scheduled")

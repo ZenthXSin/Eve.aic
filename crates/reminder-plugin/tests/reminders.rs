@@ -246,6 +246,54 @@ async fn owners_cancel_only_their_own_and_limits_and_expiry_hold() {
 }
 
 #[tokio::test]
+async fn a_full_ledger_makes_room_only_by_dropping_the_oldest_finished_reminder() {
+    let world = World::new();
+    let (kernel, admin) = world.open().await.unwrap();
+    let now = 1_000_000;
+    for index in 0..MAX_REMINDERS {
+        let owner = format!("user-{}", index / MAX_SCHEDULED_PER_OWNER);
+        admin
+            .create(&owner, "事项", now + MINUTE, &format!("m{index}"), now)
+            .unwrap();
+    }
+    let later = reminder_id("user-0", "m0");
+    let earlier = reminder_id("user-1", &format!("m{MAX_SCHEDULED_PER_OWNER}"));
+    admin.cancel("user-0", &later, now + 2).unwrap();
+    admin.cancel("user-1", &earlier, now + 1).unwrap();
+    admin
+        .create("user-new", "新的", now + 2 * MINUTE, "n1", now + 3)
+        .unwrap();
+    let snapshot = admin.snapshot().unwrap();
+    assert_eq!(snapshot.reminders.len(), MAX_REMINDERS);
+    assert!(
+        snapshot.reminders.iter().all(|entry| entry.id != earlier),
+        "最早结束的一条腾出位置"
+    );
+    assert!(snapshot.reminders.iter().any(|entry| entry.id == later));
+    admin
+        .create("user-new", "再一个", now + 2 * MINUTE, "n2", now + 4)
+        .unwrap();
+    assert_eq!(
+        admin
+            .create("user-new", "没有可腾的", now + 2 * MINUTE, "n3", now + 5)
+            .unwrap_err(),
+        ReminderError::LimitReached,
+        "等待中的提醒从不删除"
+    );
+    kernel.stop_all().await.unwrap();
+    let (kernel, admin) = world.open().await.unwrap();
+    let snapshot = admin.snapshot().unwrap();
+    assert_eq!(snapshot.reminders.len(), MAX_REMINDERS);
+    assert!(
+        snapshot
+            .reminders
+            .iter()
+            .all(|entry| entry.status == ReminderStatus::Scheduled)
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_restart_while_sending_is_unknown_and_storage_failure_closes_the_instance() {
     let world = World::new();
     let (kernel, admin) = world.open().await.unwrap();
