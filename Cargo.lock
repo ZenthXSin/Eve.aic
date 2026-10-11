@@ -518,6 +518,7 @@ dependencies = [
 name = "eve-dialogue-tools"
 version = "0.1.0"
 dependencies = [
+ "eve-budget-api",
  "eve-cognition-api",
  "eve-interest-api",
  "eve-knowledge-api",

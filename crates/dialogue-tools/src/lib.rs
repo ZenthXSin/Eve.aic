@@ -1,5 +1,6 @@
 //! 对话工具的实现层。只依赖公开契约；身份由本轮宿主范围绑定，不接受模型自报 owner。
 mod practice;
+use eve_budget_api::AutonomyBudget;
 use eve_cognition_api::{CognitionAdmin, ReadAccess, Visibility};
 use eve_interest_api::InterestAdmin;
 use eve_knowledge_api::{KnowledgeAdmin, SourceFetcher, SourcePolicy};
@@ -15,6 +16,7 @@ use serde_json::{Value, json};
 use std::{
     path::PathBuf,
     sync::{Arc, OnceLock},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// 宿主持有的能力适配，管理句柄不会作为工具参数或工具结果暴露。
@@ -29,6 +31,8 @@ pub struct Services {
     pub checks: Option<Arc<dyn ToolAdmin>>,
     pub plans: Option<Arc<dyn PlanJournal>>,
     pub outreach: Option<Arc<dyn OutreachAdmin>>,
+    /// 只读取快照；记账仍只由后台组件在请求前进行。
+    pub budget: Option<Arc<dyn AutonomyBudget>>,
     pub source: Option<(SourcePolicy, Arc<dyn SourceFetcher>)>,
     pub runner: Option<Arc<OnceLock<Arc<dyn PracticeRunner>>>>,
     pub draft_check: Option<Arc<dyn DraftCheck>>,
@@ -46,6 +50,7 @@ enum Kind {
     Checks,
     Plans,
     Outreach,
+    Budget,
     Source,
     CheckDraft,
     Run,
@@ -67,6 +72,7 @@ impl Services {
                 self.plans.is_some() && self.cognition.is_some(),
             ),
             (Kind::Outreach, self.outreach.is_some()),
+            (Kind::Budget, self.budget.is_some()),
             (Kind::Source, self.source.is_some()),
             (Kind::CheckDraft, self.runner.is_some()),
             (
@@ -91,6 +97,13 @@ impl Services {
 struct DialogueTool {
     services: Arc<Services>,
     kind: Kind,
+}
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or(1)
 }
 pub(crate) fn failed(message: impl Into<String>) -> ToolExecutionError {
     ToolExecutionError::Failed(message.into())
@@ -214,6 +227,11 @@ impl Tool for DialogueTool {
             Kind::Outreach => (
                 "list_outreach",
                 "查看当前用户的主动跟进邀请和实际投递状态；只读，不发送消息，也不更改安静偏好。",
+                empty_schema(),
+            ),
+            Kind::Budget => (
+                "show_budget",
+                "查看自主运行预算：后台学习在当前窗口已用多少次模型请求、还剩多少、多久后重置，以及按用途的用量（interest 兴趣观察、research 受控研究、practice 实践草稿、skill 技能、forge 工具锻造、outreach 主动交流、clarify 请求澄清）。全局用量，不含任何用户内容；回复用户消息不计入。只读。",
                 empty_schema(),
             ),
             Kind::Source => (
@@ -447,6 +465,27 @@ impl Tool for DialogueTool {
                     Ok(
                         json!({"quiet":snapshot.quiet(&scope.user_id),"invitations":view(snapshot.for_owner(&scope.user_id).map(|i| json!({"id":i.id,"goal_id":i.goal_id,"status":i.status,"text":i.text,"delivered_at_ms":i.delivered_at_ms})).collect())?}),
                     )
+                }
+                Kind::Budget => {
+                    let now = now_ms();
+                    let snapshot = s
+                        .budget
+                        .as_ref()
+                        .ok_or_else(unavailable)?
+                        .snapshot(now)
+                        .map_err(|_| unavailable())?;
+                    Ok(json!({
+                        "limit": snapshot.policy.limit,
+                        "window_ms": snapshot.policy.window_ms,
+                        "used": snapshot.current.used,
+                        "remaining": snapshot.remaining(),
+                        "by_category": snapshot.current.by_category,
+                        "window_started_at_ms": snapshot.current.start_ms,
+                        "resets_at_ms": snapshot.resets_at_ms,
+                        "resets_in_minutes": snapshot.resets_at_ms.saturating_sub(now).div_ceil(60_000),
+                        "previous_window": snapshot.history.first().map(|w| json!({"start_ms": w.start_ms, "used": w.used})),
+                        "counting": "计数在请求发出前保存，中断或失败的请求不退还；余额不够时后台不开始新工作，重置后继续。",
+                    }))
                 }
                 Kind::Source => {
                     let (policy, fetcher) = s.source.as_ref().ok_or_else(unavailable)?;
