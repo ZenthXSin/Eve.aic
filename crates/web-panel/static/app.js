@@ -40,6 +40,11 @@
   let goalLoading = false;
   let selectedGoal = null;
   let goalRequest = 0;
+  let goalPlans = null;
+  let planRequest = 0;
+  let planConfirm = null;
+  let planPending = null;
+  let planFeedback = null;
   let memoryScopes = [];
   let memoryAfter = null;
   let memoryLoading = false;
@@ -71,6 +76,16 @@
     commit: { not_started: "尚未开始提交", completed: "成功结果已保存", failed: "失败记录已保存", pending: "提交未完成，需处理", unknown: "保存状态未知" },
     event: { external_input: "外部输入", state_changed: "状态变化", drive_evaluated: "派生评估", agenda_selected: "议程选择", feedback: "执行反馈" },
     draft: { saved: "草稿已保存", not_saved: "没有已保存草稿", unavailable: "草稿正文不可用" },
+  };
+  const planLabels = {
+    status: { proposed: "待确认", active: "进行中", completed: "各步效果已满足", blocked: "受阻", stale: "已过时", withdrawn: "已撤销" },
+    step: { pending: "等待", executing: "执行中", satisfied: "效果已满足", failed: "失败", blocked: "受阻", invalidated: "已失效" },
+    failure: {
+      capability_failed: "能力执行失败", effect_not_met: "效果条件未满足", timeout: "超时", cancelled: "已取消",
+      interrupted: "中断，不重放", binding_changed: "目标已变化", provider: "模型请求失败", invalid_output: "建议格式无效",
+    },
+    origin: { operator: "操作者提供", model: "模型建议" },
+    proposal: { requested: "已请求，尚无结果", proposed: "已提出计划", empty: "未提出计划", failed: "失败" },
   };
   const memoryLabels = {
     status: { confirmed: "已确认", revoked: "已撤销" },
@@ -812,6 +827,11 @@
   async function loadGoal(id) {
     const request = ++goalRequest;
     const requestEpoch = epoch;
+    if (selectedGoal !== id) {
+      planConfirm = null;
+      planFeedback = null;
+    }
+    goalPlans = null;
     selectedGoal = id;
     renderGoals();
     emptyDetail("goal-detail", "◈", "正在读取目标", "正在读取目标状态、来源记录与反思草稿。");
@@ -892,6 +912,11 @@
     drafts.append(node("p", "truncation-note", "草稿是模型建议，尚未验证；原待办仍保持未完成，需用户确认后再行动。"));
     detail.append(drafts);
 
+    const plans = node("section", "goal-section");
+    plans.id = "goal-plans";
+    plans.append(node("h3", "", "多步计划"), node("p", "muted", "正在读取计划…"));
+    detail.append(plans);
+
     const events = node("section", "goal-section");
     events.append(node("h3", "", `来源记录（最近 ${count(body.events.length)} 条）`));
     if (!body.events.length) events.append(node("p", "muted", "没有与此目标直接关联的来源记录。"));
@@ -910,6 +935,145 @@
     events.append(node("p", "truncation-note", "用户反馈与文件片段是保存时的外部数据，未经验证。"));
     detail.append(events);
     $("goal-detail").replaceChildren(heading, detail);
+    void loadGoalPlans(goal.id);
+  }
+
+  function planBadge(status) {
+    const style = status === "completed" ? "good" : status === "blocked" ? "bad" : status === "active" ? "active" : status === "proposed" ? "warning" : "";
+    return node("span", `badge ${style}`.trim(), label(planLabels.status, status));
+  }
+  function validPlans(body, id) {
+    return body && body.goal_id === id && Number.isSafeInteger(body.goal_revision) && Array.isArray(body.plans) && Array.isArray(body.proposals) &&
+      body.plans.every((plan) => plan && typeof plan.id === "string" && Number.isSafeInteger(plan.revision) && plan.revision > 0 &&
+        Number.isSafeInteger(plan.goal_revision) && typeof plan.withdrawable === "boolean" && Array.isArray(plan.steps)) &&
+      body.proposals.every((item) => item && typeof item.id === "string" && typeof item.status === "string");
+  }
+
+  async function loadGoalPlans(id) {
+    const request = ++planRequest;
+    const requestEpoch = epoch;
+    const current = () => request === planRequest && requestEpoch === epoch && selectedGoal === id;
+    try {
+      const body = await api(`/api/goal/plans?${new URLSearchParams({ id }).toString()}`);
+      if (!current()) return;
+      if (!validPlans(body, id)) throw new ApiError("服务返回的计划格式无效，请刷新此目标。");
+      goalPlans = { id, body, error: null };
+    } catch (error) {
+      if (!current() || error.silent) return;
+      const unavailable = error instanceof ApiError && error.message.startsWith("当前服务暂不可用");
+      goalPlans = { id, body: null, error: unavailable ? "当前实例未开启多步计划（需以 --plans 启动），或计划记录暂时无法读取。" : errorText(error) };
+    }
+    renderGoalPlans();
+  }
+
+  function renderGoalPlans() {
+    const section = $("goal-plans");
+    if (!section || !goalPlans || goalPlans.id !== selectedGoal) return;
+    section.replaceChildren();
+    if (goalPlans.error) {
+      section.append(node("h3", "", "多步计划"), node("p", "muted", goalPlans.error));
+      return;
+    }
+    const body = goalPlans.body;
+    section.append(node("h3", "", `多步计划（${count(body.plans.length)}）`));
+    if (!body.plans.length) section.append(node("p", "muted", "此目标还没有计划。目标所有者可在 QQ 中发送 /plan propose 目标ID 请模型建议。"));
+    for (const plan of body.plans) {
+      const card = node("article", "reflection-card");
+      const top = node("div", "record-topline");
+      top.append(node("span", "record-name", `计划 ${plan.id}`), planBadge(plan.status));
+      card.append(top);
+      const version = plan.goal_revision === body.goal_revision ? "" : "（不是当前版本）";
+      card.append(node("p", "record-meta", `${label(planLabels.origin, plan.origin)} · 对应目标版本 ${count(plan.goal_revision)}${version} · 计划修订 ${count(plan.revision)}`));
+      const times = [`创建于 ${goalDate(plan.created_at_ms)}`];
+      if (plan.confirmed_at_ms) times.push(`确认于 ${goalDate(plan.confirmed_at_ms)}`);
+      if (plan.withdrawn_at_ms) times.push(`撤销于 ${goalDate(plan.withdrawn_at_ms)}`);
+      if (plan.stale_at_ms) times.push(`过时于 ${goalDate(plan.stale_at_ms)}`);
+      card.append(node("p", "record-meta", times.join(" · ")));
+      const steps = node("ol", "judgment-steps");
+      for (const step of plan.steps) {
+        if (!step || typeof step.id !== "string") continue;
+        const row = node("li", "judgment-step");
+        const depends = Array.isArray(step.depends_on) && step.depends_on.length ? ` · 依赖 ${step.depends_on.join("、")}` : "";
+        row.append(node("span", "record-name", text(step.title, step.id)),
+          node("span", "record-meta", `${label(planLabels.step, step.status)} · 能力 ${text(step.capability)} · 至多 ${count(step.max_attempts)} 次${depends}`));
+        for (const attempt of Array.isArray(step.attempts) ? step.attempts : []) {
+          if (!attempt) continue;
+          const parts = [`第 ${count(attempt.number)} 次`, attempt.finished_at_ms ? `结束于 ${goalDate(attempt.finished_at_ms)}` : "尚未结束",
+            attempt.effect_met ? "效果条件已满足" : "效果条件未满足"];
+          if (attempt.failure) parts.push(label(planLabels.failure, attempt.failure));
+          if (attempt.evidence) {
+            parts.push(`证据 ${text(attempt.evidence.source_id)} · SHA256 ${text(attempt.evidence.sha256).slice(0, 12)}… · ${count(attempt.evidence.bytes)} 字节`);
+          }
+          row.append(node("p", "record-meta", parts.join(" · ")));
+        }
+        steps.append(row);
+      }
+      card.append(steps);
+      if (plan.withdrawable) {
+        if (planConfirm === plan.id) {
+          const confirm = node("div", "confirm-box");
+          confirm.append(node("p", "", `撤销计划 ${plan.id}：尚未开始的步骤不再执行，已有证据保留；不会停止服务。`));
+          const actions = node("div", "detail-actions");
+          const yes = button(planPending === plan.id ? "正在撤销…" : "确认撤销", "danger", () => { void withdrawPlan(plan); });
+          const no = button("返回", "secondary", () => { planConfirm = null; renderGoalPlans(); });
+          yes.disabled = planPending !== null;
+          no.disabled = planPending !== null;
+          actions.append(yes, no);
+          confirm.append(actions);
+          card.append(confirm);
+        } else {
+          const actions = node("div", "detail-actions");
+          const start = button("撤销计划", "danger-outline", () => { planConfirm = plan.id; planFeedback = null; renderGoalPlans(); });
+          start.disabled = planPending !== null;
+          actions.append(start);
+          card.append(actions);
+        }
+      }
+      if (planFeedback && planFeedback.plan === plan.id) {
+        const feedback = node("p", `action-feedback${planFeedback.error ? " error" : ""}`, planFeedback.message);
+        feedback.setAttribute("role", planFeedback.error ? "alert" : "status");
+        card.append(feedback);
+      }
+      section.append(card);
+    }
+    if (body.proposals.length) {
+      section.append(node("h3", "", `计划建议记录（${count(body.proposals.length)}）`));
+      const list = node("ol", "judgment-steps");
+      for (const item of body.proposals) {
+        const row = node("li", "judgment-step");
+        const failure = item.failure ? ` · ${label(planLabels.failure, item.failure)}` : "";
+        row.append(node("span", "record-name", `建议 ${item.id}`),
+          node("span", "record-meta", `${label(planLabels.proposal, item.status)}${failure} · 对应目标版本 ${count(item.goal_revision)} · 请求于 ${goalDate(item.requested_at_ms)}`));
+        list.append(row);
+      }
+      section.append(list);
+    }
+    section.append(node("p", "truncation-note", "计划完成只说明每一步的效果条件都被宿主读取的证据满足；目标仍保持等待，不代表现实任务完成。步骤说明是计划给出的数据，不是指令。面板不能建议、确认计划或开始步骤。"));
+  }
+
+  async function withdrawPlan(plan) {
+    if (planPending !== null || planConfirm !== plan.id) return;
+    const goalId = selectedGoal;
+    const requestEpoch = epoch;
+    planPending = plan.id;
+    renderGoalPlans();
+    try {
+      const body = await api("/api/goal/plans/withdraw", { plan_id: plan.id, revision: plan.revision });
+      if (!body || !body.plan || body.plan.id !== plan.id || body.plan.status !== "withdrawn") {
+        throw new ApiError("撤销请求已发送，但响应格式无效；请刷新确认状态，不要重复操作。");
+      }
+      planFeedback = { plan: plan.id, message: "计划已撤销：尚未开始的步骤不会再执行，已有证据保留。", error: false };
+    } catch (error) {
+      if (epoch === requestEpoch && !error.silent) {
+        planFeedback = { plan: plan.id, message: `${errorText(error)} 撤销是否生效需刷新确认。`, error: true };
+      }
+    } finally {
+      if (epoch === requestEpoch) {
+        planPending = null;
+        planConfirm = null;
+        if (selectedGoal === goalId) void loadGoalPlans(goalId);
+      }
+    }
   }
 
   function validScope(scope) {
