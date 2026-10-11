@@ -29,6 +29,8 @@ members = [
     "crates/reminder-plugin",
     "crates/completion-api",
     "crates/completion-plugin",
+    "crates/pursuit-api",
+    "crates/pursuit-plugin",
     "crates/semantic-plugin",
     "crates/toolforge-plugin",
     "crates/outreach-api",

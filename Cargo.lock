@@ -317,6 +317,8 @@ dependencies = [
  "eve-practice-browser",
  "eve-practice-mindustry",
  "eve-practice-plugin",
+ "eve-pursuit-api",
+ "eve-pursuit-plugin",
  "eve-qqbot-plugin",
  "eve-reminder-api",
  "eve-reminder-plugin",
@@ -870,6 +872,27 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "eve-pursuit-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "eve-pursuit-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-cognition-api",
+ "eve-cognition-plugin",
+ "eve-kernel",
+ "eve-plugin-api",
+ "eve-pursuit-api",
+ "ring",
+ "serde_json",
  "tokio",
 ]
 

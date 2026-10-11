@@ -1,0 +1,18 @@
+[package]
+name = "eve-pursuit-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-cognition-api = { path = "../cognition-api" }
+eve-pursuit-api = { path = "../pursuit-api" }
+ring.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+eve-cognition-plugin = { path = "../cognition-plugin" }
+eve-kernel = { path = "../kernel" }
+eve-plugin-api = { path = "../plugin-api" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

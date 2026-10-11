@@ -68,6 +68,8 @@ eve-reminder-api = { path = "../reminder-api" }
 eve-reminder-plugin = { path = "../reminder-plugin" }
 eve-completion-api = { path = "../completion-api" }
 eve-completion-plugin = { path = "../completion-plugin" }
+eve-pursuit-api = { path = "../pursuit-api" }
+eve-pursuit-plugin = { path = "../pursuit-plugin" }
 eve-semantic-api = { path = "../semantic-api" }
 eve-semantic-plugin = { path = "../semantic-plugin" }
 eve-toolforge-plugin = { path = "../toolforge-plugin" }

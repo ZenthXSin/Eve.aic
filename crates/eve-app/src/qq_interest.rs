@@ -1,6 +1,9 @@
 //! QQ 宿主的兴趣观察：低频扫描已送达交互，持久化准入后才调用观察器；
 //! 学习目标派生只读写本地状态，不调用模型。
-use crate::{AppError, qq_budget};
+use crate::{
+    AppError, qq_budget,
+    qq_pursuit::{Next, Pursuit, describe},
+};
 use eve_cognition_api::{CognitionAdmin, GoalStatus};
 use eve_interest_api::{
     InterestAdmin, InterestError, InterestGoalDeriver, InterestObserver, InterestRecord,
@@ -244,6 +247,8 @@ struct Enabled {
     deriver: Arc<dyn InterestGoalDeriver>,
     cognition: Arc<dyn CognitionAdmin>,
     dirty: Arc<AtomicBool>,
+    /// 推进判断；列表中说明每个学习目标接下来的情况。
+    pursuit: Option<Arc<Pursuit>>,
 }
 impl Commands {
     pub(crate) fn disabled() -> Arc<dyn QqCommandHandler> {
@@ -254,6 +259,7 @@ impl Commands {
         deriver: Arc<dyn InterestGoalDeriver>,
         cognition: Arc<dyn CognitionAdmin>,
         dirty: Arc<AtomicBool>,
+        pursuit: Option<Arc<Pursuit>>,
     ) -> Arc<dyn QqCommandHandler> {
         Arc::new(Self {
             enabled: Some(Enabled {
@@ -261,6 +267,7 @@ impl Commands {
                 deriver,
                 cognition,
                 dirty,
+                pursuit,
             }),
         })
     }
@@ -307,20 +314,34 @@ impl QqCommandHandler for Commands {
                 if snapshot.interests.is_empty() {
                     return Ok(Some("当前会话还没有记录兴趣。".into()));
                 }
+                let next = match &enabled.pursuit {
+                    Some(pursuit) => pursuit
+                        .next_for(&snapshot.interests.iter().collect::<Vec<_>>())
+                        .map_err(|_| failure_text())?,
+                    None => Default::default(),
+                };
                 let mut reply = String::from(
                     "已记录的兴趣（来自你的原话；可用 /forget-interest 兴趣ID 撤回）：",
                 );
                 for interest in &snapshot.interests {
+                    let id = learning_goal_id(SUBJECT, &interest.id);
                     let goal = goals
                         .state
                         .goals
-                        .get(&learning_goal_id(SUBJECT, &interest.id))
-                        .map_or("未派生", |goal| match goal.status {
-                            GoalStatus::Waiting => "后台学习中",
-                            GoalStatus::Cancelled => "已取消",
-                            GoalStatus::Completed => "已完成",
-                            GoalStatus::Blocked => "已阻塞",
-                            GoalStatus::Ready | GoalStatus::Executing => "进行中",
+                        .get(&id)
+                        .map_or("未派生".to_string(), |goal| {
+                            let status = match goal.status {
+                                GoalStatus::Waiting => "后台学习中",
+                                GoalStatus::Cancelled => "已取消",
+                                GoalStatus::Completed => "已完成",
+                                GoalStatus::Blocked => "已阻塞",
+                                GoalStatus::Ready | GoalStatus::Executing => "进行中",
+                            };
+                            match next.get(&id) {
+                                Some(next @ Next::Stopped(_)) => describe(next).to_string(),
+                                Some(next) => format!("{status}（接下来：{}）", describe(next)),
+                                None => status.to_string(),
+                            }
                         });
                     let _ = write!(
                         reply,

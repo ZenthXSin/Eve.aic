@@ -11,7 +11,7 @@ use eve_plugin_api::{
     Cleanup, Plugin, PluginContext, PluginError, PluginFuture, PluginManifest, PluginResult,
     cleanup,
 };
-pub use goal::{DERIVER_VERSION, LearningGoalDeriver, learning_goal_id};
+pub use goal::{DERIVER_VERSION, LearningGoalDeriver, learning_goal_id, synced_interest_revision};
 pub use observer::{ModelInterestObserver, OBSERVER_VERSION};
 pub use settings::{InterestSettingsController, InterestSettingsPlugin};
 use std::sync::{Arc, Mutex};
