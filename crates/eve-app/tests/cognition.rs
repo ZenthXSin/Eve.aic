@@ -56,7 +56,8 @@ impl Process {
     }
 
     async fn finish(mut self) -> Output {
-        tokio::time::timeout(Duration::from_secs(15), async {
+        // 只用于发现卡住的子进程；须明显长于运行窗口加上启动与收尾。
+        tokio::time::timeout(Duration::from_secs(30), async {
             while self.0.as_mut().unwrap().try_wait().unwrap().is_none() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -139,9 +140,19 @@ async fn add(root: &Path, url: &str, id: &str, text: &str, user: &str) -> Value 
     report
 }
 
+/// 运行窗口总会跑满；窗口内要冷启动循环、完成一次模型往返并保存结果，
+/// 慢磁盘的 CI 机器上 1 秒不够，因此留足余量。
+const EXECUTION_WINDOW_SECONDS: &str = "10";
+
 async fn execute(root: &Path, url: &str, limit: &str) -> Value {
     let mut command = command(root, url);
-    command.args(["run", "--seconds", "1", "--max-executions", limit]);
+    command.args([
+        "run",
+        "--seconds",
+        EXECUTION_WINDOW_SECONDS,
+        "--max-executions",
+        limit,
+    ]);
     success(run(command).await)
 }
 
