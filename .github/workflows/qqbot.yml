@@ -83,6 +83,7 @@ jobs:
           python3 connectors/qqbot/test/semantic_test.py
           python3 connectors/qqbot/test/budget_test.py
           python3 connectors/qqbot/test/clarify_test.py
+          python3 connectors/qqbot/test/agenda_test.py
           python3 connectors/qqbot/test/outreach_test.py
           python3 connectors/qqbot/test/journey_test.py
           python3 connectors/qqbot/test/segment_test.py

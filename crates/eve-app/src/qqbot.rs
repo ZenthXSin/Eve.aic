@@ -1,8 +1,8 @@
 use crate::{
-    AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_budget, qq_clarify,
-    qq_cognition, qq_interest, qq_learning, qq_learning_commands, qq_memory, qq_memory_observer,
-    qq_outreach, qq_plan, qq_practice, qq_research, qq_semantic, qq_skill, qq_tools,
-    segment_commands,
+    AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_agenda, qq_budget,
+    qq_clarify, qq_cognition, qq_interest, qq_learning, qq_learning_commands, qq_memory,
+    qq_memory_observer, qq_outreach, qq_plan, qq_practice, qq_research, qq_semantic, qq_skill,
+    qq_tools, segment_commands,
 };
 use eve_budget_api::{AutonomyBudget, BUDGET_PLUGIN_ID, BudgetPolicy};
 use eve_budget_plugin::BudgetPlugin;
@@ -67,7 +67,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -101,6 +101,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --tool-forging 需同时指定实践运行环境；同一运行环境下反复出现的问题，由一次无工具模型请求锻造成只读草稿文件的检查规则，宿主用实践账本中的真实草稿回放验证（出现过问题的全部拦下、验证通过的一个不误报）后自动启用；之后的实践在实际运行前先经它检查，拦下的草稿不运行、带着说明交给草稿器修正。
 --plans 需同时开启受控研究或实践运行环境；/goal 保存的待办可以请模型建议多步计划（/plan propose 待办ID，每个待办版本至多一次、只建议不执行），确认后（/plan confirm 待办ID）由后台按依赖推进：计划只能使用已开启的受控研究与实践验证，步骤效果按研究与实践账本中的证据判定；/plans [待办ID] 查看进度与证据，/plan withdraw 待办ID 撤销。计划完成不改变待办状态。
 --clarify 需同时开启受控研究或实践运行环境；学习目标在当前版本卡住时（实践尝试用尽仍未验证、运行环境做不了，或只开启研究时没有找到可引用的资料），写一个具体问题，在用户下次私聊时先判断时机，合适才随回复附带，不主动私聊；每个目标版本至多问一次，同一用户默认 24 小时内至多送达一个问题，之后的下一轮私聊记为回复，由兴趣观察照常处理。/clarify 查看，/clarify off|on 关闭或恢复。
+--agenda-context 需同时 --interest-learning；用户私聊时，把 Eve 为这位用户的兴趣在后台做到哪一步（研究、实践、请求澄清，按记录整理）作为低优先级数据交给对话，用户问起时据实回答；只读记录，不改变后台行为。
 --autonomy-budget 需同时 --interest-learning；兴趣观察、受控研究、实践草稿、技能、工具锻造、主动交流与请求澄清的后台模型请求在每个窗口（--autonomy-budget-window-hours 默认 24 小时，按 UTC 整点对齐）合计至多该次数；每次请求前先保存计数，重启不清零、失败不退还，余额不够一项工作时后台不开始新工作，重置后继续；回复用户消息、/plan propose、反思、提炼与语义索引不计入。/budget 查看用量与重置时间。
 /tools 列出锻造的工具；/tool 工具ID 查看版本、回放验证与调用；/tool disable|rollback 工具ID、/tool enable 工具ID 版本 停用、回退或启用某个已验证版本。
 EVE_DEVELOPER_CONFIG 指定独立开发工具 JSON：源码工作区、操作者、命令/GitHub/升级开关与 token 环境引用；未配置时不注册。命令以宿主权限执行，仅供明确操作者；不是 QQ 测试环境开关。/help tools 查看实际已装配能力。
@@ -151,6 +152,8 @@ pub struct QqBotOptions {
     pub outreach: bool,
     /// 学习目标卡住时请用户补充信息；需要受控研究或实践验证。
     pub clarify: bool,
+    /// 把自己为当前用户在后台的学习进展作为对话上下文；需要兴趣学习。
+    pub agenda_context: bool,
     /// 同一用户两次送达之间的最短间隔；未提供时为 24 小时。
     pub outreach_cooldown_ms: Option<u64>,
     /// 邀请在被动窗口等待多久后主动私聊；未提供时不主动私聊。
@@ -193,6 +196,7 @@ impl Default for QqBotOptions {
             plans: false,
             outreach: false,
             clarify: false,
+            agenda_context: false,
             outreach_cooldown_ms: None,
             outreach_proactive_after_ms: None,
             autonomy_budget: None,
@@ -266,6 +270,10 @@ impl QqBotOptions {
             }
             if arg == "--clarify" {
                 options.clarify = true;
+                continue;
+            }
+            if arg == "--agenda-context" {
+                options.agenda_context = true;
                 continue;
             }
             let value = args.next().ok_or("QQBot 参数缺少值")?;
@@ -421,6 +429,9 @@ impl QqBotOptions {
                 "--outreach-cooldown-ms 与 --outreach-proactive-after-ms 需要同时开启 --outreach"
                     .into(),
             );
+        }
+        if options.agenda_context && !options.interest_learning {
+            return Err("--agenda-context 需要同时开启 --interest-learning".into());
         }
         if options.clarify && !runtime && options.research_sources.is_empty() {
             return Err("--clarify 需要同时开启受控研究（--research-source）或实践运行环境，作为判断目标是否卡住的依据".into());
@@ -839,6 +850,23 @@ async fn run_qqbot_composed(
                 outreach: Arc::new(outreach.clone()),
             }),
             None => context,
+        };
+        // 自己为当前用户在后台的学习进展作为数据交给对话；只读研究、实践与澄清记录。
+        let context: Arc<dyn ContextAssembler> = match (&interests, options.agenda_context) {
+            (Some(interests), true) => Arc::new(qq_agenda::AgendaContext {
+                wrapped: context,
+                interests: Arc::new(interests.clone()),
+                knowledge: knowledge
+                    .clone()
+                    .map(|knowledge| Arc::new(knowledge) as Arc<dyn KnowledgeAdmin>),
+                practice: practice
+                    .clone()
+                    .map(|practice| Arc::new(practice) as Arc<dyn PracticeAdmin>),
+                clarify: clarify
+                    .clone()
+                    .map(|clarify| Arc::new(clarify) as Arc<dyn eve_clarify_api::ClarifyAdmin>),
+            }),
+            _ => context,
         };
         // 已启用的技能作为对话工具：只能调用当前用户自己的技能，每次调用都实际运行验证。
         let skill_runner: Arc<std::sync::OnceLock<Arc<dyn PracticeRunner>>> = Arc::default();
@@ -2035,6 +2063,18 @@ mod recall_options_tests {
         assert!(error.contains("--memory-recall"));
         let options = parse(&["--memory", "--memory-recall", "--semantic-recall"]).unwrap();
         assert!(options.semantic_recall && options.memory_recall);
+    }
+
+    #[test]
+    fn agenda_context_is_explicit_and_requires_interest_learning() {
+        assert!(!parse(&[]).unwrap().agenda_context);
+        let error = parse(&["--agenda-context"]).unwrap_err().to_string();
+        assert!(error.contains("--interest-learning"));
+        assert!(
+            parse(&["--interest-learning", "--agenda-context"])
+                .unwrap()
+                .agenda_context
+        );
     }
 
     #[test]
