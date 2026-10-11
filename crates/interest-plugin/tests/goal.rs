@@ -222,6 +222,7 @@ async fn goals_from_other_sources_are_never_overwritten() {
             block_reason: None,
             execution: None,
             feedback: None,
+            completion: None,
         },
     );
     let saved = cognition.replace(0, state).unwrap();

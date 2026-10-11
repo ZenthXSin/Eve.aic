@@ -213,6 +213,7 @@ impl EndogenousPlanner {
             block_reason: None,
             execution: None,
             feedback: None,
+            completion: None,
         };
         child.validate()?;
         state.goals.insert(ids.goal.clone(), child);
@@ -771,6 +772,7 @@ mod tests {
             block_reason: None,
             execution: None,
             feedback: None,
+            completion: None,
         }
     }
 

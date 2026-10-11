@@ -283,6 +283,8 @@ dependencies = [
  "eve-cognition-loop-api",
  "eve-cognition-loop-plugin",
  "eve-cognition-plugin",
+ "eve-completion-api",
+ "eve-completion-plugin",
  "eve-config-api",
  "eve-config-plugin",
  "eve-control-api",
@@ -440,6 +442,27 @@ dependencies = [
  "eve-kernel",
  "eve-plugin-api",
  "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "eve-completion-api"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+]
+
+[[package]]
+name = "eve-completion-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-completion-api",
+ "eve-kernel",
+ "eve-plugin-api",
  "serde",
  "serde_json",
  "tempfile",

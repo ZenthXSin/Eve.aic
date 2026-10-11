@@ -72,6 +72,15 @@ fn summary(state: &CognitiveState, goal: &Goal, max: usize) -> GoalSummary {
             .count(),
         description,
         description_truncated,
+        completion: goal
+            .completion
+            .as_ref()
+            .map(|completion| GoalCompletionView {
+                plan_id: completion.plan_id.clone(),
+                plan_revision: completion.plan_revision,
+                goal_revision: completion.goal_revision,
+                at_ms: completion.at_ms,
+            }),
     }
 }
 
@@ -400,6 +409,7 @@ mod tests {
             block_reason: None,
             execution: None,
             feedback: None,
+            completion: None,
         }
     }
 

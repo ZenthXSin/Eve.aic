@@ -64,6 +64,7 @@ fn executing_snapshot() -> CognitiveSnapshot {
                 started_at_ms: 1,
             }),
             feedback: None,
+            completion: None,
         },
     );
     state.agenda = Some(Agenda {

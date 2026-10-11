@@ -556,6 +556,7 @@ fn add(
         block_reason: None,
         execution: None,
         feedback: None,
+        completion: None,
     };
     let mut state = snapshot.state;
     state.goals.insert(id.clone(), goal);

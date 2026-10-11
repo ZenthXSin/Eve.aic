@@ -17,6 +17,7 @@ mod qq_agenda;
 mod qq_budget;
 mod qq_clarify;
 mod qq_cognition;
+mod qq_completion;
 mod qq_help;
 mod qq_interest;
 mod qq_learning;

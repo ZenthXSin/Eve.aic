@@ -67,6 +67,7 @@ fn parent(id: &str, user: &str) -> Goal {
         block_reason: None,
         execution: None,
         feedback: None,
+        completion: None,
     }
 }
 fn options(access: ReadAccess) -> EndogenousOptions {

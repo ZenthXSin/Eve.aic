@@ -61,6 +61,7 @@ fn waiting(id: &str, user: &str) -> Goal {
         block_reason: None,
         execution: None,
         feedback: None,
+        completion: None,
     }
 }
 fn seed(admin: &CognitionController) {
