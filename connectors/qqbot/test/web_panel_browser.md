@@ -24,3 +24,12 @@ node connectors/qqbot/test/web_panel_memory_browser.mjs
 `web_panel_cognition_browser.mjs` 以 `--cognition` 启动真实 Eve，经 QQ 替身保存一条含 HTML 文本的 `/goal`、等待第一份反思草稿，再提交 `/goal-feedback` 生成第二份草稿。浏览器验证目标列表只显示父目标、详情中当前草稿在前且历史草稿保留、“未验证”标注、HTML 按纯文本显示、浏览期间状态文件字节不变、手机布局与退出；截图保存为 `goals.png` 和 `mobile-goals.png`。主脚本另验证未开启认知或记忆时页面提示不可用。
 
 `web_panel_memory_browser.mjs` 以 `--memory` 两次启动真实 Eve：第一次经 QQ 替身保存两条偏好（其一含 HTML 文本）并完成三轮对话；第二次加 `--memory-learning`，更正其中一条并等待一次提炼批次完成后打开面板。浏览器验证作用域列表、偏好与版本历史（新的在前）、显式打开来源后用户声明按纯文本显示、手动模式下的待确认学习候选与“决策不等于保存”说明、浏览期间状态文件字节不变、手机布局与退出；截图保存为 `memory.png` 和 `mobile-memory.png`。
+
+计划区块的浏览器验收由 `plan_test.py` 在真实 Eve 面板运行时调用 `web_panel_plans_browser.mjs`，只在设置 `EVE_PLAYWRIGHT_MODULE` 时运行，例如：
+
+```bash
+EVE_PLAYWRIGHT_MODULE=/tmp/eve-web-playwright/node_modules/playwright/index.mjs \
+python3 connectors/qqbot/test/plan_test.py PlanAcceptance.test_panel_page_shows_plans_and_withdraws_only_after_second_confirmation
+```
+
+它在目标详情中核对计划、步骤、能力与建议记录按纯文本显示；第一次点击“撤销计划”只出现确认框，返回后不发送请求，再次确认后才撤销，撤销后不再提供按钮；手机宽度不出现横向滚动。截图保存为 `plans.png` 和 `mobile-plans.png`。Python 侧随后核对账本中的计划确为已撤销，且没有开始任何研究或实践。

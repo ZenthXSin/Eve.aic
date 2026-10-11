@@ -7,7 +7,10 @@
 建议器是确定性替身，只证明宿主契约与恢复语义，不代表真实模型的计划质量。
 """
 import json
+import os
+import pathlib
 import socket
+import subprocess
 import unittest
 import urllib.error
 import urllib.request
@@ -126,6 +129,29 @@ class PlanAcceptance(unittest.TestCase):
             api("/api/goal/plans?id=" + gid)[1]["plans"][0]["status"], "withdrawn"), **options)
         self.assertEqual(self.ledger(), before)
         self.assertEqual(len(self.kind("plan")), 1)
+        self.assertEqual((self.research_runs(), self.practice_runs()), ([], []))
+
+    @unittest.skipUnless(os.environ.get("EVE_PLAYWRIGHT_MODULE"),
+                         "可选浏览器验收：设置 EVE_PLAYWRIGHT_MODULE 指向 Playwright 的 index.mjs")
+    def test_panel_page_shows_plans_and_withdraws_only_after_second_confirmation(self):
+        goal = self.save_goal()
+        gid = goal["id"]
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        token = "synthetic-plan-browser-token-1234567890"
+        script = pathlib.Path(__file__).with_name("web_panel_plans_browser.mjs")
+
+        def browse():
+            self.wait_for(self.proposed, "plan was not proposed", 15)
+            result = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=120, env={
+                **os.environ, "EVE_PANEL_URL": f"http://127.0.0.1:{port}", "EVE_PANEL_TOKEN": token, "EVE_GOAL_ID": gid})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(json.loads(result.stdout.strip().splitlines()[-1]), {"ok": True, "withdrawals": 1})
+            self.assertEqual(self.plans()[0]["status"], "withdrawn")
+
+        self.inspect_run(browse, prefix=self.send(self.message("propose", f"/plan propose {gid}", contains="已请求计划建议")),
+                         more=["--web-listen", f"127.0.0.1:{port}"], env_extra={"EVE_WEB_TOKEN": token}, timeout=150)
         self.assertEqual((self.research_runs(), self.practice_runs()), ([], []))
 
     def test_confirmed_plan_researches_then_practices_and_settles_from_ledger_evidence(self):

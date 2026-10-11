@@ -28,7 +28,24 @@ API 设置 5 秒异步请求期限、16 个同时处理请求和 16 KiB JSON 请
 - `eve-app` 在 QQ 宿主中组合已有 `SessionService`、`ControlService` 和通道状态；不旁路读取数据库，不从 HTTP 创建 Provider 或执行工具。
 - `SessionService::list_keys` / `ControlService::list_keys` 为兼容现有自定义实现新增默认不可用方法。内置实现按 `session_id` 字典序、独占游标、每页 1–100 项枚举完整可信身份；`BTreeMap.range` 有界读取，不将单页读取描述为跨页事务快照。停止后旧服务不可用。
 
-接口为 `GET /api/status`、`GET /api/sessions?after=...&limit=25`、`GET /api/tasks?after=...&limit=25`、`GET /api/judgments?before=...&limit=25`、`GET /api/goals?after=...&limit=25`、`GET /api/goal?id=...`、`POST /api/memory/scopes {after?,limit?}`、`POST /api/memory/scope {scope}`、`POST /api/memory/evidence {scope,id}`、`POST /api/memory/learning {scope}`、`POST /api/memory/autonomy {scope}`、`POST /api/session {key,before?,limit?}` 和 `POST /api/cancel {target:GenerationKey}`。错误使用固定类别，不带密钥、输入或原始 Provider 报错。提交取消必须携带浏览器所见的完整会话、用户、任务、启动 epoch 和代号；代已变化时返回冲突，不偷换成最新任务。
+接口为 `GET /api/status`、`GET /api/sessions?after=...&limit=25`、`GET /api/tasks?after=...&limit=25`、`GET /api/judgments?before=...&limit=25`、`GET /api/goals?after=...&limit=25`、`GET /api/goal?id=...`、`GET /api/goal/plans?id=...`、`POST /api/goal/plans/withdraw {plan_id,revision}`、`POST /api/memory/scopes {after?,limit?}`、`POST /api/memory/scope {scope}`、`POST /api/memory/evidence {scope,id}`、`POST /api/memory/learning {scope}`、`POST /api/memory/autonomy {scope}`、`POST /api/session {key,before?,limit?}` 和 `POST /api/cancel {target:GenerationKey}`。错误使用固定类别，不带密钥、输入或原始 Provider 报错。提交取消必须携带浏览器所见的完整会话、用户、任务、启动 epoch 和代号；代已变化时返回冲突，不偷换成最新任务。
+
+## 目标的多步计划
+
+“认知目标”页的目标详情中有“多步计划”区块，读取 `GET /api/goal/plans?id=目标ID`：
+
+- 显示该目标的计划（新的在前）：状态、来源（操作者提供或模型建议）、对应目标版本（不是当前版本时注明）、计划修订与各时间点。
+- 每个步骤显示能力、状态、尝试次数上限与依赖；每次尝试显示是否满足效果条件、失败原因，以及宿主读取到的证据（账本记录 ID、SHA256 前缀与字节数）。
+- 列出计划建议记录及失败原因。
+- 步骤说明是计划给出的数据，按纯文本显示，不是指令。
+
+待确认或进行中、且没有执行中步骤的计划可以撤销：
+
+- 先点“撤销计划”，再点“确认撤销”，页面发出 `POST /api/goal/plans/withdraw {plan_id,revision}`，提交读取时的计划修订。
+- 修订已变化、计划已结束或有步骤正在执行时返回 409，记录不变。
+- 撤销成功只阻止尚未开始的步骤，已有证据保留。
+
+面板不能建议、确认计划或开始步骤；确认仍由目标所有者在 QQ（`/plan confirm`）或本机命令行完成。计划完成只说明每一步的效果条件都被证据满足，目标仍保持等待；用户在私聊中确认完成后，目标状态显示为“用户已确认完成”，详情多一行“完成确认”，见[待办完成确认](./待办完成确认.md)。面板不能替用户确认完成。未以 `--plans` 启动时接口返回 503，页面提示未开启。读取认知与计划账本是两次独立快照，不是一次事务。
 
 ## 实时判断诊断
 
@@ -113,6 +130,6 @@ QQ 面板中的配置插件提供 `provider.openai`、`provider.jev`、`runtime.
 
 ## 后续顺序
 
-本机状态、会话、取消操作、实时判断诊断、认知目标与记忆偏好只读页、插件启停与插件配置页面已交付；接下来推进偏好撤销等范围明确的管理操作。判断置信度数值与模型健康状态尚未进入公开观察契约，页面不显示。远程认证授权、事件流和人工批准任务执行在其后实现；不把未实现的暂停恢复、重试或模型健康数据画成可操作按钮。
+本机状态、会话、取消操作、实时判断诊断、认知目标与记忆偏好只读页、目标的多步计划查看与撤销、插件启停与插件配置页面已交付；接下来推进偏好撤销等范围明确的管理操作。判断置信度数值与模型健康状态尚未进入公开观察契约，页面不显示。远程认证授权、事件流和人工批准任务执行在其后实现；不把未实现的暂停恢复、重试或模型健康数据画成可操作按钮。
 
 验收覆盖真实环回 HTTP、实际 Eve+QQ 替身子进程和浏览器交互，结果记录在 PR 中。`python scripts/test-web-plugins.py target/debug/eve-qqbot` 可重现插件管理、配置恢复与分段启停验收；加 `--browser` 并安装 `playwright-core` 可执行网页交互。CI 在 Ubuntu 和 Windows 执行子进程验收。本切片不通过工作流连接真实 QQ 或真实模型。
