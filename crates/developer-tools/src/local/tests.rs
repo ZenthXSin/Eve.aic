@@ -222,7 +222,7 @@ async fn tools_reject_identity_urls_and_extra_arguments_and_only_register_enable
     c.github = false;
     let backend = Arc::new(LocalDeveloper::new(c.clone(), ledger.path().into(), None).unwrap());
     let tools = crate::tools(&c, backend);
-    assert_eq!(tools.len(), 3);
+    assert_eq!(tools.len(), 5);
     let read = tools
         .iter()
         .find(|t| t.definition().name == "read_file")
@@ -240,6 +240,306 @@ async fn tools_reject_identity_urls_and_extra_arguments_and_only_register_enable
         name: "read_file".into(),
         arguments: json!({"path":"foo"}),
     };
+    let edit = tools
+        .iter()
+        .find(|t| t.definition().name == "edit_file")
+        .unwrap();
+    let digest = "0".repeat(64);
+    assert!(
+        edit.validate_arguments(
+            &json!({"path":"a","old_string":"","new_string":"x","expected_sha256":digest})
+        )
+        .is_err()
+    );
+    assert!(
+        edit.validate_arguments(
+            &json!({"path":"a","old_string":"x","new_string":"x","expected_sha256":digest})
+        )
+        .is_err()
+    );
+    assert!(
+        edit.validate_arguments(
+            &json!({"path":"a","old_string":"x","new_string":"y","expected_sha256":"short"})
+        )
+        .is_err()
+    );
+    assert!(
+        edit.validate_arguments(&json!({"path":"a","old_string":"x","new_string":"y","expected_sha256":digest,"user_id":"owner"}))
+            .is_err()
+    );
+    assert!(
+        edit.validate_arguments(
+            &json!({"path":"a","old_string":"x","new_string":"y","expected_sha256":digest})
+        )
+        .is_ok()
+    );
+    let search = tools
+        .iter()
+        .find(|t| t.definition().name == "search_files")
+        .unwrap();
+    assert!(search.validate_arguments(&json!({"path":"src"})).is_err());
+    assert!(search.validate_arguments(&json!({"query":""})).is_err());
+    assert!(
+        search
+            .validate_arguments(&json!({"query":"x","max_results":0}))
+            .is_err()
+    );
+    assert!(
+        search
+            .validate_arguments(&json!({"query":"x","max_results":101}))
+            .is_err()
+    );
+    assert!(
+        search
+            .validate_arguments(&json!({"query":"x","path":"src"}))
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn edit_replaces_one_exact_occurrence_and_refuses_stale_missing_or_ambiguous_text() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let backend = LocalDeveloper::new(config(root.path()), ledger.path().into(), None).unwrap();
+    let mut create = file("notes.txt");
+    create.content = Some("one\ntwo\nthree\n".into());
+    create.expected_sha256 = Some("".into());
+    backend
+        .execute(DeveloperOperation::Write(create), context("owner"))
+        .await
+        .unwrap();
+    let original = hash(b"one\ntwo\nthree\n");
+    let edit = |path: &str, old: &str, new: &str, sha: &str| EditArguments {
+        path: path.into(),
+        old_string: old.into(),
+        new_string: new.into(),
+        expected_sha256: sha.into(),
+    };
+    let refused = |result: Result<Value, ToolExecutionError>| match result {
+        Err(ToolExecutionError::Failed(message)) => message,
+        Err(_) => panic!("拒绝类型不符"),
+        Ok(_) => panic!("应当拒绝却成功"),
+    };
+
+    let stale = refused(
+        backend
+            .execute(
+                DeveloperOperation::Edit(edit("notes.txt", "two", "2", &hash(b"stale"))),
+                context("owner"),
+            )
+            .await,
+    );
+    assert!(stale.contains("文件已变化"));
+    let missing = refused(
+        backend
+            .execute(
+                DeveloperOperation::Edit(edit("notes.txt", "four", "4", &original)),
+                context("owner"),
+            )
+            .await,
+    );
+    assert!(missing.contains("不存在"));
+    // 重叠出现也算多处：aa 在 aaa 中出现两次，不能任选一处替换。
+    let mut overlap = file("overlap.txt");
+    overlap.content = Some("aaa".into());
+    overlap.expected_sha256 = Some("".into());
+    backend
+        .execute(DeveloperOperation::Write(overlap), context("owner"))
+        .await
+        .unwrap();
+    let ambiguous = refused(
+        backend
+            .execute(
+                DeveloperOperation::Edit(edit("overlap.txt", "aa", "b", &hash(b"aaa"))),
+                context("owner"),
+            )
+            .await,
+    );
+    assert!(ambiguous.contains("多次"));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("overlap.txt")).unwrap(),
+        "aaa"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("notes.txt")).unwrap(),
+        "one\ntwo\nthree\n"
+    );
+
+    let done = backend
+        .execute(
+            DeveloperOperation::Edit(edit("notes.txt", "two", "2", &original)),
+            context("owner"),
+        )
+        .await
+        .unwrap();
+    let updated = "one\n2\nthree\n";
+    assert_eq!(done["success"], true);
+    assert_eq!(done["sha256"], hash(updated.as_bytes()));
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("notes.txt")).unwrap(),
+        updated
+    );
+    // 旧修订不能再次用于替换，必须重新读取。
+    let replay = refused(
+        backend
+            .execute(
+                DeveloperOperation::Edit(edit("notes.txt", "2", "two", &original)),
+                context("owner"),
+            )
+            .await,
+    );
+    assert!(replay.contains("文件已变化"));
+    let foreign = refused(
+        backend
+            .execute(
+                DeveloperOperation::Edit(edit("notes.txt", "2", "x", &hash(updated.as_bytes()))),
+                context("foreign"),
+            )
+            .await,
+    );
+    assert!(foreign.contains("仅供宿主配置的操作者"));
+    let journal = std::fs::read_to_string(ledger.path().join("operations.jsonl")).unwrap();
+    assert!(journal.contains("\"kind\":\"edit\",\"state\":\"started\""));
+    assert!(journal.contains("\"kind\":\"edit\",\"state\":\"finished\""));
+}
+
+#[tokio::test]
+async fn search_is_literal_bounded_redacted_and_skips_version_control_build_and_links() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let secret = "github-secret-token-for-search";
+    let backend = LocalDeveloper::new(
+        config(root.path()),
+        ledger.path().into(),
+        Some(secret.into()),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join("src/nested")).unwrap();
+    std::fs::create_dir_all(root.path().join("target")).unwrap();
+    std::fs::create_dir_all(root.path().join(".git")).unwrap();
+    std::fs::write(
+        root.path().join("src/a.rs"),
+        "fn needle() {}\nno match\nneedle again\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("src/nested/b.txt"), "needle\n").unwrap();
+    std::fs::write(
+        root.path().join("src/nested/c.txt"),
+        format!("{secret} needle"),
+    )
+    .unwrap();
+    std::fs::write(root.path().join("target/x.txt"), "needle").unwrap();
+    std::fs::write(root.path().join(".git/config"), "needle").unwrap();
+    std::fs::write(root.path().join("binary.dat"), b"\xff needle").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(root.path().join("src/a.rs"), root.path().join("link.rs")).unwrap();
+    let search = |path: &str, query: &str, max_results: usize| SearchArguments {
+        path: path.into(),
+        query: query.into(),
+        max_results,
+    };
+
+    let all = backend
+        .execute(
+            DeveloperOperation::Search(search(".", "needle", 50)),
+            context("owner"),
+        )
+        .await
+        .unwrap();
+    let hits: Vec<(String, u64)> = all["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["path"].as_str().unwrap().to_string(),
+                m["line"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        hits,
+        vec![
+            ("src/a.rs".to_string(), 1),
+            ("src/a.rs".to_string(), 3),
+            ("src/nested/b.txt".to_string(), 1),
+            ("src/nested/c.txt".to_string(), 1),
+        ]
+    );
+    assert_eq!(all["truncated"], false);
+    assert_eq!(all["untrusted_data"], true);
+    assert!(
+        all["matches"][3]["text"]
+            .as_str()
+            .unwrap()
+            .contains("[GITHUB_CREDENTIAL_REDACTED]")
+    );
+    assert!(!all.to_string().contains(secret));
+
+    // 字面匹配：正则写法不被解释。
+    let literal = backend
+        .execute(
+            DeveloperOperation::Search(search(".", r"fn\s+needle", 50)),
+            context("owner"),
+        )
+        .await
+        .unwrap();
+    assert!(literal["matches"].as_array().unwrap().is_empty());
+
+    let one = backend
+        .execute(
+            DeveloperOperation::Search(search(".", "needle", 1)),
+            context("owner"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(one["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(one["truncated"], true);
+
+    let nested = backend
+        .execute(
+            DeveloperOperation::Search(search("src/nested", "needle", 50)),
+            context("owner"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(nested["matches"].as_array().unwrap().len(), 2);
+    assert_eq!(nested["matches"][0]["path"], "src/nested/b.txt");
+    assert_eq!(nested["matches"][1]["path"], "src/nested/c.txt");
+
+    // 输出总量有上限：即使调用方要求很多，也在约 32 KiB 内截断。
+    let mut many = String::new();
+    for _ in 0..200 {
+        many.push_str(&format!("needle {}\n", "x".repeat(300)));
+    }
+    std::fs::write(root.path().join("many.txt"), many).unwrap();
+    let bounded = backend
+        .execute(
+            DeveloperOperation::Search(search("", "needle", 1000)),
+            context("owner"),
+        )
+        .await
+        .unwrap();
+    assert!(bounded["matches"].as_array().unwrap().len() < 200);
+    assert_eq!(bounded["truncated"], true);
+    assert!(bounded.to_string().len() <= MAX_OUTPUT + 1024);
+
+    let file_target = backend
+        .execute(
+            DeveloperOperation::Search(search("src/a.rs", "needle", 50)),
+            context("owner"),
+        )
+        .await;
+    assert!(
+        matches!(file_target, Err(ToolExecutionError::Failed(message)) if message.contains("只接受"))
+    );
+    let escape = backend
+        .execute(
+            DeveloperOperation::Search(search("../", "needle", 50)),
+            context("owner"),
+        )
+        .await;
+    assert!(escape.is_err());
 }
 #[cfg(unix)]
 #[tokio::test]

@@ -34,8 +34,8 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         config = json.loads(self.developer_config.read_text())
         config["storage_directory"] = str(self.work / "developer-data")
         self.developer_config.write_text(json.dumps(config))
-        names = {"echo", "search_memory", "list_files", "read_file", "write_file",
-                 "run_command", "github_api", "prepare_self_upgrade"}
+        names = {"echo", "search_memory", "list_files", "read_file", "write_file", "edit_file",
+                 "search_files", "run_command", "github_api", "prepare_self_upgrade"}
         def respond(body):
             self.assertEqual(self.definitions(body), names)
             self.current_capabilities(body)
@@ -44,26 +44,31 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
                 return tool_response([("read_file", {"path": "README.md"})])
             if len(results) == 1:
                 self.assertEqual(results[0]["content"], "真实源码测试")
-                return tool_response([("write_file", {"path": "README.md", "content": "已修改并验证", "expected_sha256": results[0]["sha256"]})])
-            if len(results) == 2:
+                return tool_response([("edit_file", {"path": "README.md", "old_string": "真实源码测试", "new_string": "已修改并验证", "expected_sha256": results[0]["sha256"]}),
+                                      ("write_file", {"path": "notes.txt", "content": "已修改并验证", "expected_sha256": ""})])
+            if len(results) == 3:
                 self.assertTrue(results[1]["success"])
+                self.assertTrue(results[2]["success"])
+                return tool_response([("search_files", {"query": "已修改并验证"})])
+            if len(results) == 4:
+                self.assertEqual(sorted(m["path"] for m in results[3]["matches"]), ["README.md", "notes.txt"])
                 return tool_response([("run_command", {"program": sys.executable, "args": ["-c",
-                    "from pathlib import Path; assert Path('README.md').read_text(encoding='utf8')=='已修改并验证'; Path('ran.txt').write_text('1'); print('验证通过')"]})])
-            self.assertEqual(len(results), 3)
+                    "from pathlib import Path; assert Path('README.md').read_text(encoding='utf8')=='已修改并验证'; assert Path('notes.txt').read_text(encoding='utf8')=='已修改并验证'; Path('ran.txt').write_text('1'); print('验证通过')"]})])
+            self.assertEqual(len(results), 5)
             self.assertEqual(results[-1]["exit_code"], 0)
             self.assertIn("验证通过", results[-1]["stdout"])
             return text_response("实际读写和命令已完成")
         self.callback = respond
-        self.enabled([*self.send(self.message("help", "/help tools", contains=["8 个", "github_api", "run_command"])),
+        self.enabled([*self.send(self.message("help", "/help tools", contains=["10 个", "github_api", "run_command", "edit_file", "search_files"])),
                       *self.send(self.message("edit", "修改源码并执行验证", expected="实际读写和命令已完成"))])
-        self.assertEqual(self.chat_rounds, 4)
+        self.assertEqual(self.chat_rounds, 5)
         journal = self.work / "developer-data/operations.jsonl"
         self.assertFalse((self.work / "state/developer-tools").exists())
         before = journal.read_bytes()
         def restored(body):
             self.current_capabilities(body)
-            self.assertEqual(sum(len(m.get("tool_calls", [])) for m in body["messages"]), 3)
-            self.assertEqual(sum(m["role"] == "tool" for m in body["messages"]), 3)
+            self.assertEqual(sum(len(m.get("tool_calls", [])) for m in body["messages"]), 5)
+            self.assertEqual(sum(m["role"] == "tool" for m in body["messages"]), 5)
             return text_response("原工具未重放")
         self.callback = restored
         self.enabled(self.send(self.message("restart", "查看之前的工作", expected="原工具未重放")))
