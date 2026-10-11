@@ -1,8 +1,10 @@
 use crate::{
-    AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_cognition, qq_interest,
-    qq_learning, qq_learning_commands, qq_memory, qq_memory_observer, qq_outreach, qq_plan,
-    qq_practice, qq_research, qq_semantic, qq_skill, qq_tools, segment_commands,
+    AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_budget, qq_cognition,
+    qq_interest, qq_learning, qq_learning_commands, qq_memory, qq_memory_observer, qq_outreach,
+    qq_plan, qq_practice, qq_research, qq_semantic, qq_skill, qq_tools, segment_commands,
 };
+use eve_budget_api::{AutonomyBudget, BUDGET_PLUGIN_ID, BudgetPolicy};
+use eve_budget_plugin::BudgetPlugin;
 use eve_cognition_loop_api::EndogenousPlannerFactory;
 use eve_cognition_loop_plugin::ReflectionPlannerFactory;
 use eve_config_api::{CONFIG_SERVICE_ID, ConfigServiceHandle};
@@ -62,7 +64,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -95,6 +97,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 /skills 列出技能；/skill 技能ID 查看版本、验证证据、启用记录与调用；/skill disable|rollback 技能ID、/skill enable 技能ID 版本 停用、回退或启用某个已验证版本。
 --tool-forging 需同时指定实践运行环境；同一运行环境下反复出现的问题，由一次无工具模型请求锻造成只读草稿文件的检查规则，宿主用实践账本中的真实草稿回放验证（出现过问题的全部拦下、验证通过的一个不误报）后自动启用；之后的实践在实际运行前先经它检查，拦下的草稿不运行、带着说明交给草稿器修正。
 --plans 需同时开启受控研究或实践运行环境；/goal 保存的待办可以请模型建议多步计划（/plan propose 待办ID，每个待办版本至多一次、只建议不执行），确认后（/plan confirm 待办ID）由后台按依赖推进：计划只能使用已开启的受控研究与实践验证，步骤效果按研究与实践账本中的证据判定；/plans [待办ID] 查看进度与证据，/plan withdraw 待办ID 撤销。计划完成不改变待办状态。
+--autonomy-budget 需同时 --interest-learning；兴趣观察、受控研究、实践草稿、技能、工具锻造与主动交流的后台模型请求在每个窗口（--autonomy-budget-window-hours 默认 24 小时，按 UTC 整点对齐）合计至多该次数；每次请求前先保存计数，重启不清零、失败不退还，余额不够一项工作时后台不开始新工作，重置后继续；回复用户消息、/plan propose、反思、提炼与语义索引不计入。/budget 查看用量与重置时间。
 /tools 列出锻造的工具；/tool 工具ID 查看版本、回放验证与调用；/tool disable|rollback 工具ID、/tool enable 工具ID 版本 停用、回退或启用某个已验证版本。
 EVE_DEVELOPER_CONFIG 指定独立开发工具 JSON：源码工作区、操作者、命令/GitHub/升级开关与 token 环境引用；未配置时不注册。命令以宿主权限执行，仅供明确操作者；不是 QQ 测试环境开关。/help tools 查看实际已装配能力。
 明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
@@ -146,6 +149,10 @@ pub struct QqBotOptions {
     pub outreach_cooldown_ms: Option<u64>,
     /// 邀请在被动窗口等待多久后主动私聊；未提供时不主动私聊。
     pub outreach_proactive_after_ms: Option<u64>,
+    /// 后台学习组件在每个窗口内合计可发起的模型请求数；未提供时不限总量。
+    pub autonomy_budget: Option<u32>,
+    /// 预算窗口长度（小时）；未提供时为 24。
+    pub autonomy_budget_window_hours: Option<u64>,
     pub segmented: bool,
     pub message_judge: MessageJudgeMode,
     pub web_listen: Option<std::net::SocketAddr>,
@@ -181,6 +188,8 @@ impl Default for QqBotOptions {
             outreach: false,
             outreach_cooldown_ms: None,
             outreach_proactive_after_ms: None,
+            autonomy_budget: None,
+            autonomy_budget_window_hours: None,
             segmented: false,
             message_judge: MessageJudgeMode::Off,
             web_listen: None,
@@ -321,6 +330,24 @@ impl QqBotOptions {
                             .ok_or("主动私聊等待必须为 0 至 2592000000 的毫秒整数")?,
                     );
                 }
+                Some("--autonomy-budget") => {
+                    options.autonomy_budget = Some(
+                        value
+                            .to_str()
+                            .and_then(|v| v.parse().ok())
+                            .filter(|v| (1..=eve_budget_api::MAX_LIMIT).contains(v))
+                            .ok_or("自主运行预算必须为 1 至 1000000 的整数")?,
+                    );
+                }
+                Some("--autonomy-budget-window-hours") => {
+                    options.autonomy_budget_window_hours = Some(
+                        value
+                            .to_str()
+                            .and_then(|v| v.parse().ok())
+                            .filter(|v| (1..=720).contains(v))
+                            .ok_or("自主运行预算窗口必须为 1 至 720 小时的整数")?,
+                    );
+                }
                 Some("--interest-cooldown-ms") => {
                     options.interest_options.cooldown_ms = value
                         .to_str()
@@ -383,6 +410,12 @@ impl QqBotOptions {
                 "--outreach-cooldown-ms 与 --outreach-proactive-after-ms 需要同时开启 --outreach"
                     .into(),
             );
+        }
+        if options.autonomy_budget_window_hours.is_some() && options.autonomy_budget.is_none() {
+            return Err("--autonomy-budget-window-hours 需要同时指定 --autonomy-budget".into());
+        }
+        if options.autonomy_budget.is_some() && !options.interest_learning {
+            return Err("--autonomy-budget 需要同时开启 --interest-learning".into());
         }
         if options.outreach && !runtime {
             return Err("--outreach 需要同时指定实践运行环境（--practice-mindustry-server 或 --practice-browser）".into());
@@ -811,6 +844,20 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        // 预算账本同样先于后台加载；损坏时拒绝启动并保留原字节。
+        let budget_gate = match options.autonomy_budget {
+            Some(limit) => {
+                let plugin = BudgetPlugin::new(BudgetPolicy {
+                    window_ms: options.autonomy_budget_window_hours.unwrap_or(24) * 3_600_000,
+                    limit,
+                })?;
+                let controller = plugin.controller();
+                kernel.register(Box::new(plugin))?;
+                kernel.start(&PluginId::new(BUDGET_PLUGIN_ID)?).await?;
+                qq_budget::Gate::new(Some(Arc::new(controller) as Arc<dyn AutonomyBudget>))
+            }
+            None => qq_budget::Gate::default(),
+        };
         bootstrap.context = Some(if options.memory_recall {
             let memory = memory.clone().ok_or("记忆召回缺少记忆服务")?;
             let lexical: Arc<dyn eve_memory_api::MemoryRecallFactory> =
@@ -988,6 +1035,8 @@ async fn run_qqbot_composed(
                 key,
             )))
         };
+        // 后台学习组件的模型请求按用途计入自主运行预算；未启用预算时原样使用主模型。
+        let budgeted = |category: &str| budget_gate.wrap(core_resolver()?, category);
         let InterestComponents {
             observer: interest_observer,
             fetcher,
@@ -1051,7 +1100,7 @@ async fn run_qqbot_composed(
             let cognition = Arc::new(background.as_ref().ok_or("兴趣观察缺少认知服务")?.admin()?);
             let observer = match interest_observer {
                 Some(observer) => observer,
-                None => Arc::new(ModelInterestObserver::new(core_resolver()?)),
+                None => Arc::new(ModelInterestObserver::new(budgeted(qq_budget::INTEREST)?)),
             };
             let deriver = Arc::new(LearningGoalDeriver::new(cognition.clone(), "eve")?);
             let dirty = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -1062,6 +1111,7 @@ async fn run_qqbot_composed(
                 deriver.clone(),
                 Arc::new(interest_settings.clone()),
                 dirty.clone(),
+                budget_gate.clone(),
             )?);
             qq_interest::Commands::enabled(
                 Arc::new(interests.clone()),
@@ -1082,11 +1132,11 @@ async fn run_qqbot_composed(
             };
             let selector: Arc<dyn SourceSelector> = match selector {
                 Some(selector) => selector,
-                None => Arc::new(ModelSourceSelector::new(core_resolver()?)),
+                None => Arc::new(ModelSourceSelector::new(budgeted(qq_budget::RESEARCH)?)),
             };
             let extractor: Arc<dyn KnowledgeExtractor> = match knowledge_extractor {
                 Some(extractor) => extractor,
-                None => Arc::new(ModelKnowledgeExtractor::new(core_resolver()?)),
+                None => Arc::new(ModelKnowledgeExtractor::new(budgeted(qq_budget::RESEARCH)?)),
             };
             let researcher = Arc::new(Researcher::new(
                 Arc::new(knowledge.clone()),
@@ -1100,6 +1150,7 @@ async fn run_qqbot_composed(
                 researcher,
                 policy,
                 plan_journal.clone(),
+                budget_gate.clone(),
             ));
             qq_research::Commands::enabled(Arc::new(interests.clone()), Arc::new(knowledge.clone()))
         } else {
@@ -1134,18 +1185,18 @@ async fn run_qqbot_composed(
             let _ = skill_runner.set(runner.clone());
             let mut drafter: Arc<dyn PracticeDrafter> = match practice_drafter {
                 Some(drafter) => drafter,
-                None => Arc::new(ModelPracticeDrafter::new(core_resolver()?)),
+                None => Arc::new(ModelPracticeDrafter::new(budgeted(qq_budget::PRACTICE)?)),
             };
             let skill_parts = match &skills {
                 Some(skills) => {
                     let admin: Arc<dyn SkillAdmin> = Arc::new(skills.clone());
                     let selector: Arc<dyn SkillSelector> = match skill_selector {
                         Some(selector) => selector,
-                        None => Arc::new(ModelSkillSelector::new(core_resolver()?)),
+                        None => Arc::new(ModelSkillSelector::new(budgeted(qq_budget::SKILL)?)),
                     };
                     let distiller: Arc<dyn SkillDistiller> = match skill_distiller {
                         Some(distiller) => distiller,
-                        None => Arc::new(ModelSkillDistiller::new(core_resolver()?)),
+                        None => Arc::new(ModelSkillDistiller::new(budgeted(qq_budget::SKILL)?)),
                     };
                     // 后续任务的第一次尝试先经一次有记录的技能选择；其余照常草稿。
                     drafter = Arc::new(SkillAwareDrafter::new(
@@ -1174,7 +1225,7 @@ async fn run_qqbot_composed(
                     let admin: Arc<dyn ToolAdmin> = Arc::new(tools.clone());
                     let forger: Arc<dyn ToolForger> = match tool_forger {
                         Some(forger) => forger,
-                        None => Arc::new(ModelToolForger::new(core_resolver()?)),
+                        None => Arc::new(ModelToolForger::new(budgeted(qq_budget::FORGE)?)),
                     };
                     // 已启用的锻造工具在实际运行前检查草稿；拦下的草稿不运行。
                     practitioner =
@@ -1202,6 +1253,7 @@ async fn run_qqbot_composed(
                 skills: skill_parts,
                 forging,
                 plans: plan_journal.clone(),
+                gate: budget_gate.clone(),
             }));
             qq_practice::Commands::enabled(Arc::new(interests.clone()), Arc::new(practice.clone()))
         } else {
@@ -1228,11 +1280,11 @@ async fn run_qqbot_composed(
         {
             let composer: Arc<dyn InvitationComposer> = match invitation_composer {
                 Some(composer) => composer,
-                None => Arc::new(ModelInvitationComposer::new(core_resolver()?)),
+                None => Arc::new(ModelInvitationComposer::new(budgeted(qq_budget::OUTREACH)?)),
             };
             let responder: Arc<dyn ResponseJudge> = match response_judge {
                 Some(judge) => judge,
-                None => Arc::new(ModelResponseJudge::new(core_resolver()?)),
+                None => Arc::new(ModelResponseJudge::new(budgeted(qq_budget::OUTREACH)?)),
             };
             let cognition: Arc<dyn eve_cognition_api::CognitionAdmin> =
                 Arc::new(background.as_ref().ok_or("主动交流缺少认知服务")?.admin()?);
@@ -1252,6 +1304,7 @@ async fn run_qqbot_composed(
                 composer,
                 responder,
                 requests,
+                gate: budget_gate.clone(),
             }));
             qq_outreach::Commands::enabled(Arc::new(outreach.clone()), Arc::new(practice.clone()))
         } else {
@@ -1303,13 +1356,14 @@ async fn run_qqbot_composed(
             tool_commands,
             plan_commands,
             semantic_commands,
+            budget_gate.commands(),
             outreach_commands,
             segment_commands,
         ])));
         if let Some(outreach) = &outreach {
             let judge: Arc<dyn TimingJudge> = match timing_judge {
                 Some(judge) => judge,
-                None => Arc::new(ModelTimingJudge::new(core_resolver()?)),
+                None => Arc::new(ModelTimingJudge::new(budgeted(qq_budget::OUTREACH)?)),
             };
             // 主动私聊开启时，通道空闲后每 2 秒询问一次；是否发送由宿主策略决定。
             plugin = plugin.with_outreach(
@@ -1317,6 +1371,7 @@ async fn run_qqbot_composed(
                     outreach: Arc::new(outreach.clone()) as Arc<dyn OutreachAdmin>,
                     judge,
                     policy: outreach_policy,
+                    gate: budget_gate.clone(),
                 }),
                 outreach_policy
                     .proactive_after_ms
@@ -1884,6 +1939,54 @@ mod recall_options_tests {
         assert!(error.contains("--memory-recall"));
         let options = parse(&["--memory", "--memory-recall", "--semantic-recall"]).unwrap();
         assert!(options.semantic_recall && options.memory_recall);
+    }
+
+    #[test]
+    fn autonomy_budget_is_explicit_bounded_and_requires_interest_learning() {
+        let options = parse(&[]).unwrap();
+        assert_eq!(
+            (
+                options.autonomy_budget,
+                options.autonomy_budget_window_hours
+            ),
+            (None, None)
+        );
+        let error = parse(&["--autonomy-budget", "10"]).unwrap_err().to_string();
+        assert!(error.contains("--interest-learning"));
+        let error = parse(&["--interest-learning", "--autonomy-budget-window-hours", "6"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--autonomy-budget"));
+        for bad in ["0", "1000001", "-1", "x"] {
+            assert!(parse(&["--interest-learning", "--autonomy-budget", bad]).is_err());
+        }
+        for bad in ["0", "721", "1.5"] {
+            assert!(
+                parse(&[
+                    "--interest-learning",
+                    "--autonomy-budget",
+                    "5",
+                    "--autonomy-budget-window-hours",
+                    bad
+                ])
+                .is_err()
+            );
+        }
+        let options = parse(&[
+            "--interest-learning",
+            "--autonomy-budget",
+            "40",
+            "--autonomy-budget-window-hours",
+            "6",
+        ])
+        .unwrap();
+        assert_eq!(
+            (
+                options.autonomy_budget,
+                options.autonomy_budget_window_hours
+            ),
+            (Some(40), Some(6))
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! QQ 宿主的实践验证：为等待中的兴趣学习目标做最小产物并在操作者提供的运行环境中实际运行，
 //! 每个目标修订至多一次；准入与每一步先持久化，停止、超时与失败都留下记录且不重放。
-use crate::{AppError, qq_plan};
+use crate::{AppError, qq_budget, qq_plan};
 use eve_cognition_api::{CognitionAdmin, Goal, GoalStatus, SourceKind, Visibility};
 use eve_interest_api::{INTEREST_GOAL_CHANNEL, INTEREST_GOAL_VERIFICATION, InterestAdmin};
 use eve_interest_plugin::learning_goal_id;
@@ -70,6 +70,8 @@ pub(crate) struct Services {
     pub(crate) forging: Option<Forging>,
     /// 开启计划入口时，计划步骤请求实践的用户待办也会实践。
     pub(crate) plans: Option<Arc<dyn PlanJournal>>,
+    /// 自主运行预算：余额不够一项工作时不开始。
+    pub(crate) gate: qq_budget::Gate,
 }
 
 pub(crate) struct Background {
@@ -226,6 +228,7 @@ async fn run(
         skills,
         forging,
         plans,
+        gate,
     } = services;
     loop {
         if *active.borrow() {
@@ -254,17 +257,23 @@ async fn run(
             return Ok(());
         }
         // 先固化已验证的方法，再开始下一项实践，使后续任务可以复用。
-        if let Some(skills) = skills.as_ref().filter(|_| distilling) {
+        // 预算余额不够时本轮跳过，保留待处理的记录，预算窗口重置后继续。
+        if let Some(skills) = skills.as_ref().filter(|_| distilling)
+            && gate.admits(qq_budget::SINGLE_UNIT)?
+        {
             distilling = consolidate(&*practice, skills, &workspace_root, &mut stopped).await?;
         }
         // 再把反复出现的问题锻造成运行前检查，使下一项实践即可使用。
-        if let Some(forging) = forging.as_ref().filter(|_| forging_open) {
+        if let Some(forging) = forging.as_ref().filter(|_| forging_open)
+            && gate.admits(qq_budget::SINGLE_UNIT)?
+        {
             forging_open = forge(&*practice, forging, &mut stopped).await?;
         }
         if *stopped.borrow() {
             return Ok(());
         }
-        if practicing {
+        // 余额不够一次实践（至多三次草稿与一次技能选择）：不开始新实践。
+        if practicing && gate.admits(qq_budget::PRACTICE_UNITS)? {
             let snapshot = cognition
                 .snapshot()
                 .map_err(|_| "实践验证无法读取学习目标")?;

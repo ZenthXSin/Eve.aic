@@ -5,7 +5,7 @@
 //! 识别前先保存确切输入，每轮对话只识别一次。用户的反馈决定之后的冷却期与是否主动私聊，
 //! 也作为数据交给之后的时机判断。用户提出具体想法时，派生器把原话变成后续创作目标，
 //! 实践验证后同样经邀请告诉用户。
-use crate::AppError;
+use crate::{AppError, qq_budget};
 use eve_cognition_api::{CognitionAdmin, Goal, GoalStatus, SourceKind, Visibility};
 use eve_interest_api::{
     INTEREST_GOAL_CHANNEL, INTEREST_GOAL_VERIFICATION, InterestAdmin, InterestStatus, StatementKind,
@@ -77,6 +77,8 @@ pub(crate) struct Services {
     pub(crate) composer: Arc<dyn InvitationComposer>,
     pub(crate) responder: Arc<dyn ResponseJudge>,
     pub(crate) requests: Arc<dyn RequestGoalDeriver>,
+    /// 自主运行预算：余额不够时不撰写新邀请、不判断回应。
+    pub(crate) gate: qq_budget::Gate,
 }
 
 pub(crate) struct Background {
@@ -179,7 +181,11 @@ async fn run(
         services
             .requests
             .reconcile(&services.outreach.snapshot()?, now_ms()?)?;
-        if inviting && let Some(candidate) = candidate(&services)? {
+        let affordable = services.gate.admits(qq_budget::SINGLE_UNIT)?;
+        if inviting
+            && affordable
+            && let Some(candidate) = candidate(&services)?
+        {
             match services.outreach.begin(
                 &candidate.owner,
                 &candidate.goal_id,
@@ -196,7 +202,8 @@ async fn run(
             }
             continue;
         }
-        if listen(&services, &mut stopped).await? {
+        // 余额用尽时回应留在账本中等待；超过回应窗口后不再判断。
+        if affordable && listen(&services, &mut stopped).await? {
             continue;
         }
         tokio::select! {
@@ -587,11 +594,18 @@ pub(crate) struct ChannelAdapter {
     pub(crate) outreach: Arc<dyn OutreachAdmin>,
     pub(crate) judge: Arc<dyn TimingJudge>,
     pub(crate) policy: OutreachPolicy,
+    /// 余额不够一次时机判断时，本条消息不判断、不附带邀请。
+    pub(crate) gate: qq_budget::Gate,
 }
 impl ChannelAdapter {
     fn now(&self) -> PluginResult<u64> {
         now_ms().map_err(|_| PluginError::State("系统时间不可用".into()))
     }
+}
+
+fn affordable(gate: &qq_budget::Gate) -> PluginResult<bool> {
+    gate.admits(qq_budget::SINGLE_UNIT)
+        .map_err(|_| PluginError::State("自主运行预算不可用".into()))
 }
 impl QqOutreach for ChannelAdapter {
     fn due(&self, session: &SessionKey) -> PluginResult<bool> {
@@ -599,13 +613,15 @@ impl QqOutreach for ChannelAdapter {
         let snapshot = self.outreach.snapshot().map_err(plugin_error)?;
         Ok(snapshot
             .judgeable_for(&session.user_id, now, &self.policy)
-            .is_some())
+            .is_some()
+            && affordable(&self.gate)?)
     }
 
     fn judge(&self, moment: QqOutreachMoment) -> QqOutreachFuture {
         let outreach = self.outreach.clone();
         let judge = self.judge.clone();
         let policy = self.policy;
+        let gate = self.gate.clone();
         Box::pin(async move {
             let now = now_ms().map_err(|_| PluginError::State("系统时间不可用".into()))?;
             let snapshot = outreach.snapshot().map_err(plugin_error)?;
@@ -615,6 +631,9 @@ impl QqOutreach for ChannelAdapter {
             else {
                 return Ok(false);
             };
+            if !affordable(&gate)? {
+                return Ok(false);
+            }
             // 先保存判断再请求判断器；同一条消息只判断一次，中断不重放。
             let started = now.max(after(&invitation));
             outreach

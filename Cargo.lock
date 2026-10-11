@@ -275,6 +275,8 @@ dependencies = [
  "eve-action-plugin",
  "eve-agent-prompt",
  "eve-artifact-file",
+ "eve-budget-api",
+ "eve-budget-plugin",
  "eve-cognition-api",
  "eve-cognition-loop-api",
  "eve-cognition-loop-plugin",
@@ -344,6 +346,27 @@ dependencies = [
  "libc",
  "ring",
  "tempfile",
+]
+
+[[package]]
+name = "eve-budget-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "eve-budget-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-budget-api",
+ "eve-kernel",
+ "eve-llm-api",
+ "eve-plugin-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
