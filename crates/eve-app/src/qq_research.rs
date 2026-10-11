@@ -15,9 +15,11 @@ use eve_knowledge_plugin::Researcher;
 use eve_memory_api::validate_id;
 use eve_plan_api::PlanJournal;
 use eve_plugin_api::{PluginError, PluginResult};
+use eve_practice_api::{NoteTally, PracticeAdmin, note_tallies};
 use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput};
 use std::{
     cmp::Reverse,
+    collections::BTreeMap,
     fmt::Write,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -229,6 +231,8 @@ pub(crate) struct Commands {
 struct Enabled {
     interests: Arc<dyn InterestAdmin>,
     knowledge: Arc<dyn KnowledgeAdmin>,
+    /// 开启实践验证时，显示引用每条资料的草稿实际运行的结果。
+    practice: Option<Arc<dyn PracticeAdmin>>,
 }
 impl Commands {
     pub(crate) fn disabled() -> Arc<dyn QqCommandHandler> {
@@ -237,11 +241,13 @@ impl Commands {
     pub(crate) fn enabled(
         interests: Arc<dyn InterestAdmin>,
         knowledge: Arc<dyn KnowledgeAdmin>,
+        practice: Option<Arc<dyn PracticeAdmin>>,
     ) -> Arc<dyn QqCommandHandler> {
         Arc::new(Self {
             enabled: Some(Enabled {
                 interests,
                 knowledge,
+                practice,
             }),
         })
     }
@@ -315,13 +321,27 @@ impl QqCommandHandler for Commands {
                 }
             }));
         }
-        Ok(Some(render(&interest.topic, &entries, &knowledge)))
+        let tallies = match &enabled.practice {
+            Some(practice) => note_tallies(&practice.snapshot().map_err(|_| failure_text())?.runs),
+            None => BTreeMap::new(),
+        };
+        Ok(Some(render(
+            &interest.topic,
+            &entries,
+            &knowledge,
+            &tallies,
+        )))
     }
 }
 
-fn render(topic: &str, entries: &[&KnowledgeEntry], knowledge: &KnowledgeSnapshot) -> String {
+fn render(
+    topic: &str,
+    entries: &[&KnowledgeEntry],
+    knowledge: &KnowledgeSnapshot,
+    tallies: &BTreeMap<String, NoteTally>,
+) -> String {
     let mut reply = format!(
-        "「{topic}」的学习资料（共 {} 条；“来源原文”只表示网页原文这样写，尚未经过实践验证）：",
+        "「{topic}」的学习资料（共 {} 条；“来源原文”只表示网页原文这样写，尚未经过实践验证；“实践”一行是引用它的草稿在运行环境中实际运行的结果，通过只说明草稿整体验证通过）：",
         entries.len()
     );
     for entry in entries.iter().take(SHOWN_ENTRIES) {
@@ -342,6 +362,23 @@ fn render(topic: &str, entries: &[&KnowledgeEntry], knowledge: &KnowledgeSnapsho
             }
             _ => {
                 let _ = write!(reply, "\n- [未验证推测] {}", entry.statement);
+            }
+        }
+        if let Some(tally) = tallies.get(&entry.id) {
+            let _ = write!(
+                reply,
+                "\n  实践：引用它的草稿验证通过 {} 次、未通过 {} 次",
+                tally.verified, tally.failed
+            );
+            if let Some(last) = &tally.last_verified {
+                let _ = write!(
+                    reply,
+                    "（最近通过：{} 第 {} 次尝试，{}，{}）",
+                    last.run_id,
+                    last.attempt,
+                    last.runtime_version,
+                    utc(last.at_ms)
+                );
             }
         }
     }

@@ -1177,7 +1177,13 @@ async fn run_qqbot_composed(
                 plan_journal.clone(),
                 budget_gate.clone(),
             ));
-            qq_research::Commands::enabled(Arc::new(interests.clone()), Arc::new(knowledge.clone()))
+            qq_research::Commands::enabled(
+                Arc::new(interests.clone()),
+                Arc::new(knowledge.clone()),
+                practice
+                    .clone()
+                    .map(|practice| Arc::new(practice) as Arc<dyn PracticeAdmin>),
+            )
         } else {
             qq_research::Commands::disabled()
         };
