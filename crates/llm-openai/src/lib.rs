@@ -160,6 +160,7 @@ impl OpenAiProvider {
         &self,
         request: ModelRequest,
         sink: Option<&dyn ModelTextSink>,
+        json_output: bool,
     ) -> Result<ModelResponse, LlmError> {
         if sink.is_some() && self.config.protocol == OpenAiProtocol::ChatCompletions {
             return Err(LlmError::Unsupported(
@@ -171,6 +172,16 @@ impl OpenAiProvider {
             OpenAiProtocol::ChatCompletions => chat::encode_request(&self.config.model, request)?,
         };
         body["stream"] = serde_json::json!(sink.is_some());
+        if json_output {
+            match self.config.protocol {
+                OpenAiProtocol::Responses => {
+                    body["text"] = serde_json::json!({"format":{"type":"json_object"}});
+                }
+                OpenAiProtocol::ChatCompletions => {
+                    body["response_format"] = serde_json::json!({"type":"json_object"});
+                }
+            }
+        }
         if let Some(effort) = &self.config.reasoning_effort {
             match self.config.protocol {
                 OpenAiProtocol::Responses => {
@@ -264,7 +275,10 @@ impl OpenAiProvider {
 
 impl LlmProvider for OpenAiProvider {
     fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
-        Box::pin(self.request(request, None))
+        Box::pin(self.request(request, None, false))
+    }
+    fn complete_json(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
+        Box::pin(self.request(request, None, true))
     }
     fn stream<'a>(
         &'a self,
@@ -274,7 +288,7 @@ impl LlmProvider for OpenAiProvider {
         Box::pin(async move {
             tokio::time::timeout(
                 self.config.request_timeout,
-                self.request(request, Some(sink)),
+                self.request(request, Some(sink), false),
             )
             .await
             .map_err(|_| LlmError::ProviderTimeout)?

@@ -24,6 +24,32 @@ fn config(url: &str) -> OpenAiConfig {
         .with_base_url(&url.replace("/responses", "/chat/completions"))
         .unwrap()
 }
+
+#[tokio::test]
+async fn json_completion_is_per_request_and_an_unsupported_server_is_not_retried() {
+    let mut bad = reply("unsupported");
+    bad.status = 400;
+    let mut server = Server::start(vec![reply("{\"value\":1}"), reply("自然回复"), bad]).await;
+    let provider = OpenAiProvider::new(config(&server.url), "fixture-key").unwrap();
+    assert_eq!(
+        provider.complete_json(request()).await.unwrap(),
+        ModelResponse::Final {
+            text: "{\"value\":1}".into()
+        }
+    );
+    assert_eq!(
+        server.next().await.body["response_format"],
+        json!({"type":"json_object"})
+    );
+    provider.complete(request()).await.unwrap();
+    assert!(server.next().await.body.get("response_format").is_none());
+    assert!(matches!(
+        provider.complete_json(request()).await,
+        Err(LlmError::Provider(_))
+    ));
+    server.next().await;
+    assert!(server.requests.try_recv().is_err());
+}
 #[test]
 fn explicit_protocol_normalizes_roots_versions_and_complete_chat_urls() {
     for (base, expected) in [

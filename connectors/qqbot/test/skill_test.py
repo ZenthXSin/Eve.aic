@@ -154,6 +154,7 @@ class SkillAcceptance(unittest.TestCase):
         # 提炼请求只含已验证产物与证据，不含用户原话；发出前已保存 Running/Proposing。
         [request] = self.kind("distill")
         self.assertFalse(request["body"].get("tools"))
+        self.assertEqual(request["body"]["response_format"], {"type": "json_object"})
         content = request["body"]["messages"][-1]["content"]
         self.assertNotIn("不知道怎么创作", content)
         self.assertNotIn("brief", json.loads(content))
