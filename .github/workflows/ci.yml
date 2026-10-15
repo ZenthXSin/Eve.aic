@@ -17,7 +17,8 @@ jobs:
   stable:
     name: Stable / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # Windows 的完整构建、测试和独立进程示例已接近 15 分钟；保留所有检查并留出运行余量。
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 25 || 15 }}
     strategy:
       fail-fast: false
       matrix:
