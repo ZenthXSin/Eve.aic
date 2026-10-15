@@ -22,6 +22,35 @@ pub(crate) fn valid_message_id(v: &str) -> bool {
         && v.trim() == v
         && !v.chars().any(char::is_control)
 }
+/// 通道只保存用户本次发送的图片引用；不会下载，也不等同于视觉解析结果。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ImageAttachment {
+    pub content_type: String,
+    pub url: String,
+}
+impl ImageAttachment {
+    fn valid(&self) -> bool {
+        self.content_type
+            .strip_prefix("image/")
+            .is_some_and(|subtype| {
+                !subtype.is_empty()
+                    && subtype.len() <= 64
+                    && subtype
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
+            })
+            && self.url.starts_with("https://")
+            && self.url.len() <= 4096
+            && self.url[8..]
+                .split_once('/')
+                .is_some_and(|(host, _)| !host.is_empty())
+            && !self
+                .url
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace())
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Message {
@@ -30,8 +59,20 @@ pub(crate) struct Message {
     pub target_id: String,
     pub user_id: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ImageAttachment>,
 }
 impl Message {
+    pub fn turn_text(&self) -> String {
+        if self.attachments.is_empty() {
+            return self.text.clone();
+        }
+        format!(
+            "{}\n\n【通道附件信息】收到 {} 个图片附件，已保存引用，尚未获取像素或进行视觉解析。不能声称已经看见或推测图片内容；按用户文字处理任务，涉及图片内容时如实说明当前限制。",
+            self.text,
+            self.attachments.len()
+        )
+    }
     pub fn valid(&self) -> bool {
         [&self.target_id, &self.user_id]
             .into_iter()
@@ -39,8 +80,10 @@ impl Message {
             && valid_message_id(&self.id)
             && matches!(self.scope.as_str(), "c2c" | "group")
             && (self.scope != "c2c" || self.target_id == self.user_id)
-            && !self.text.trim().is_empty()
+            && (!self.text.trim().is_empty() || !self.attachments.is_empty())
             && self.text.len() <= 32768
+            && self.attachments.len() <= 4
+            && self.attachments.iter().all(ImageAttachment::valid)
     }
     /// 首版临时会话映射；未来统一认知时只替换此策略并迁移旧历史。
     pub fn session_key(&self, app_id: &str) -> PluginResult<SessionKey> {
@@ -259,6 +302,7 @@ mod tests {
         Receipt {
             app_id: "1904159860".into(),
             message: Message {
+                attachments: vec![],
                 id: "msg-1".into(),
                 scope: "c2c".into(),
                 target_id: "user-1".into(),

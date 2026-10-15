@@ -18,7 +18,7 @@ function isGroupAt(msg, appId) {
     new RegExp(`<@!?${appId}>`).test(msg.content);
 }
 function userText(msg, appId) {
-  let text = msg.content.trim();
+  let text = typeof msg.content === "string" ? msg.content.trim() : "";
   if (msg.kind !== "group") return text;
   const own = new Set(validId(appId) ? [appId] : []);
   for (const mention of Array.isArray(msg.mentions) ? msg.mentions : []) {
@@ -33,6 +33,16 @@ function userText(msg, appId) {
     text = text.slice(match[0].length).trimStart();
   }
   return text;
+}
+// Only the envelope's own attachments belong to this message. msg_elements can
+// contain quoted images; never treat those as freshly uploaded pictures.
+function imageAttachments(msg) {
+  if (!Array.isArray(msg.attachments)) return [];
+  return msg.attachments.filter(a => a && typeof a.content_type === "string" &&
+    /^image\/[a-z0-9.+-]{1,64}$/i.test(a.content_type) &&
+    typeof a.url === "string" && a.url.length <= 4096 &&
+    /^https:\/\/[^/\s]+\//.test(a.url) && !/[\p{Cc}]/u.test(a.url))
+    .slice(0, 4).map(a => ({ content_type: a.content_type.toLowerCase(), url: a.url }));
 }
 export function optionsFromEnv(env) {
   const appId = env.QQBOT_APP_ID || "1904159860";
@@ -69,9 +79,10 @@ export function createBridge(bot, emit, limit = 128) {
       warn("unsupported_message"); return;
     }
     const target = msg.replyTarget;
+    const attachments = imageAttachments(msg);
     if (!validMessageId(msg.messageId) || !validId(msg.senderId) || !target ||
         target.scope !== msg.kind || target.msgId !== msg.messageId ||
-        !validId(target.targetId) || !validText(msg.content) ||
+        !validId(target.targetId) || (typeof msg.content !== "string" || Buffer.byteLength(msg.content) > 32768) ||
         (msg.kind === "c2c" && target.targetId !== msg.senderId) ||
         (msg.kind === "group" && target.targetId !== msg.groupOpenid)) {
       warn("invalid_route_or_text"); return;
@@ -79,11 +90,11 @@ export function createBridge(bot, emit, limit = 128) {
     if (pending.has(msg.messageId)) { warn("duplicate_pending"); return; }
     if (pending.size >= limit) { warn("pending_limit"); return; }
     const text = userText(msg, bot.appId);
-    if (!validText(text)) { warn("invalid_route_or_text"); return; }
+    if (!validText(text) && !attachments.length) { warn("invalid_route_or_text"); return; }
     pending.set(msg.messageId, { target: { ...target }, sending: false });
     send({ type: "message", id: msg.messageId, scope: msg.kind,
       target_id: target.targetId, user_id: msg.senderId,
-      text });
+      text, ...(attachments.length ? { attachments } : {}) });
   });
   // One part at a time, strictly in order; a failed or final part ends the reply.
   function reject(id, index) {

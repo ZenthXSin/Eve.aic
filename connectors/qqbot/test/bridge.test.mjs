@@ -286,3 +286,35 @@ test("主动私聊被平台拒绝时回失败回执与错误码，不重试、�
   assert.ok(!JSON.stringify(f.frames).includes("sensitive"));
   assert.ok(!JSON.stringify(f.frames).includes("要不要"));
 });
+
+test("纯图片和图文保留本条图片引用，不抓取、不混入引用图、不改变路由", async () => {
+  const f = fixture();
+  const message = { kind: "c2c", messageId: "image-1", senderId: "user-1", content: "",
+    replyTarget: { scope: "c2c", targetId: "user-1", msgId: "image-1" },
+    attachments: [{ content_type: "image/png", url: "https://media.example.invalid/image.png", filename: "untrusted-name" }] };
+  f.handlers.get("message")({}, message);
+  assert.equal(f.frames[0].text, "");
+  assert.deepEqual(f.frames[0].attachments, [{ content_type: "image/png", url: "https://media.example.invalid/image.png" }]);
+  await f.bridge.command({type: "reply", id: "image-1", text: "图片已收到，尚未解析。"});
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].target.targetId, "user-1");
+  f.handlers.get("message")({}, {...message, messageId: "text-image", content: "看看这张图", replyTarget: {...message.replyTarget, msgId: "text-image"}});
+  assert.equal(f.frames.find(x => x.id === "text-image").text, "看看这张图");
+  f.handlers.get("message")({}, {...message, messageId: "quoted", attachments: [],
+    msgElements: [{attachments: message.attachments}], replyTarget: {...message.replyTarget, msgId: "quoted"}});
+  assert.ok(!f.frames.some(x => x.type === "message" && x.id === "quoted"));
+  f.handlers.get("message")({}, {...message, messageId: "unsafe", attachments: [{content_type:"image/png",url:"file:///private"}], replyTarget: {...message.replyTarget, msgId: "unsafe"}});
+  assert.ok(!f.frames.some(x => x.type === "message" && x.id === "unsafe"));
+});
+
+test("群图片只接收艾特当前机器人的消息", () => {
+  const f = fixture();
+  const incoming = {kind:"group", rawEventType:"GROUP_AT_MESSAGE_CREATE", groupOpenid:"group-1",
+    messageId:"group-image", senderId:"user-1", content:"", attachments:[{content_type:"image/jpeg",url:"https://media.example.invalid/photo.jpg"}],
+    replyTarget:{scope:"group",targetId:"group-1",msgId:"group-image"}};
+  f.handlers.get("message")({}, incoming);
+  assert.equal(f.frames[0].scope, "group");
+  assert.equal(f.frames[0].attachments.length, 1);
+  f.handlers.get("message")({}, {...incoming,rawEventType:"GROUP_MESSAGE_CREATE",messageId:"no-at",replyTarget:{...incoming.replyTarget,msgId:"no-at"}});
+  assert.equal(f.frames.filter(frame => frame.type === "message").length, 1);
+});

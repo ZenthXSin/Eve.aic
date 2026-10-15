@@ -229,6 +229,7 @@ async fn non_completed_or_mismatched_session_inputs_never_become_evidence() {
         .fail(
             &pending.lease,
             SessionFailure {
+                evidence: None,
                 code: SessionFailureCode::Cancelled,
                 started_tools: Some(0),
             },

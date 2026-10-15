@@ -100,6 +100,7 @@ mod tests {
     fn forwards_full_validated_route_and_opaque_message_once_without_rewriting_text() {
         let handler = Capture::default();
         let message = Message {
+            attachments: vec![],
             id: "ROBOT1.0_.opaque!".into(),
             scope: "group".into(),
             target_id: "group-1".into(),

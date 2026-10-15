@@ -102,6 +102,28 @@ class Reports(unittest.TestCase):
         self.assertEqual((report["counts"]["model_sent"], report["counts"]["failed"]), (1, 1))
         self.assertEqual(report["counts"]["paragraphs"], 2)
 
+    def test_sent_failure_notice_does_not_count_as_training_or_experience_acceptance(self):
+        message = {"id": "failed", "scope": "c2c", "target_id": "user-1", "user_id": "user-1", "text": "执行检查"}
+        identity = "qq:" + hashlib.sha256(json.dumps(["1904159860", "c2c", "user-1", "user-1"], separators=(",", ":")).encode()).hexdigest()
+        receipts = {"version": 1, "entries": [{"app_id":"1904159860", "message":message, "state":"Sent", "reply":"模型请求失败，已停止。"}]}
+        sessions = {"format_version":1,"sessions":{identity:{"key":{"session_id":identity,"user_id":identity},"turns":[
+            {"id":1,"input":message["text"],"status":{"state":"Failed","failure":{"code":"Provider","started_tools":1,"evidence":{"provider_http_status":503,"tool_names":["run_command"],"tool_results":[]}}}}]}}}
+        state = {"version":1,"entries":{"eve.channel.qqbot":{"receipts.v1":list(json.dumps(receipts).encode())},
+                                        "eve.session":{"sessions.v1":list(json.dumps(sessions).encode())}}}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, QQBOT_APP_SECRET="test-only-password"):
+            root = Path(directory) / "run"; (root / "state").mkdir(parents=True)
+            training.write_json(root / "state/state.json", state)
+            training.write_json(root / "window.json", {"returncode":0,"ready":True})
+            report = training.collect(root / "state/state.json")
+            self.assertEqual(report["evidence"], [])
+            self.assertEqual(report["counts"]["failed_after_tools"], 1)
+            self.assertEqual(report["failures"][0]["status"]["failure"]["evidence"]["provider_http_status"], 503)
+            summary = training.finish(root, Path(directory) / "output")
+            self.assertTrue(summary["process_ok"])
+            self.assertFalse(summary["interaction_ok"])
+            self.assertEqual(summary["experience_acceptance"], "not_evaluated")
+            self.assertNotIn(message["text"], json.dumps(summary, ensure_ascii=False))
+
     def test_encrypted_state_roundtrip_authentication_and_no_overwrite(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, QQBOT_APP_SECRET="test-only-password"):
             root = Path(directory) / "root"

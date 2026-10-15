@@ -1,6 +1,6 @@
 //! 内置会话插件，通过 StateStore 保存版本化历史；不调用模型或依赖文件实现。
 mod strict_json;
-use eve_llm_api::ChatMessage;
+use eve_llm_api::{ChatMessage, ChatRole};
 use eve_plugin_api::{
     Cleanup, Plugin, PluginContext, PluginError, PluginFuture, PluginManifest, PluginResult,
     ServiceId, cleanup,
@@ -12,6 +12,21 @@ use std::{
     ops::Bound::{Excluded, Unbounded},
     sync::{Arc, Mutex, MutexGuard},
 };
+
+/// 失败输入仍可解释后续“进展如何”，但宿主告知未完成，工具调用绝不重放。
+fn history_with_failures(snapshot: &SessionSnapshot) -> Vec<ChatMessage> {
+    snapshot.turns.iter().flat_map(|turn| match &turn.status {
+            SessionTurnStatus::Completed { messages } => messages.clone(),
+            SessionTurnStatus::Failed { failure } if failure.code != SessionFailureCode::Cancelled && failure.started_tools != Some(0) => {
+                let started = failure.started_tools.map_or("执行数量未知".into(), |n| format!("已启动 {n} 次工具调用"));
+                let http = failure.evidence.as_ref().and_then(|e| e.provider_http_status)
+                    .map_or(String::new(), |s| format!("，模型服务 HTTP {s}"));
+                vec![ChatMessage::text(ChatRole::User, turn.input.clone()),
+                     ChatMessage::text(ChatRole::Assistant, format!("【宿主失败记录，非模型回答】本轮未完成：{:?}{http}；{started}。已完成的工具结果保留在失败账本，副作用不会撤销。不得声称尚未开始、任务已经完成或仍在后台继续；先核对实际状态，不能自动重放工具。", failure.code))]
+            }
+            _ => vec![],
+        }).collect()
+}
 
 pub const SESSION_STATE_KEY: &str = "sessions.v1";
 const FORMAT_VERSION: u32 = 1;
@@ -120,6 +135,9 @@ impl StoredSessions {
         if let SessionTurnStatus::Completed { messages } = &status {
             validate_completed_turn(&turn.input, messages)?;
         }
+        if let SessionTurnStatus::Failed { failure } = &status {
+            failure.validate()?;
+        }
         turn.status = status;
         snapshot.revision = snapshot
             .revision
@@ -206,7 +224,7 @@ impl SessionService for StoredSessions {
                 turn_id: id,
             },
             revision: snapshot.revision,
-            history: snapshot.history(),
+            history: history_with_failures(snapshot),
         };
         self.save(&mut inner, next)?;
         Ok(result)

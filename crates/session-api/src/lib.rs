@@ -1,5 +1,5 @@
 //! 会话历史与轮次记录的公开契约，不包含存储、模型调用或运行时实现。
-use eve_llm_api::{ChatMessage, ChatRole, ModelRequest};
+use eve_llm_api::{ChatMessage, ChatRole, ModelRequest, ToolResult};
 use serde::{Deserialize, Serialize};
 use std::{fmt, sync::Arc};
 
@@ -61,12 +61,42 @@ pub enum SessionFailureCode {
     Cancelled,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// 仅持久化已完成的工具回执和受限诊断，不保存供应商原始错误、URL 或提示词。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionFailureEvidence {
+    pub provider_http_status: Option<u16>,
+    pub tool_names: Vec<String>,
+    pub tool_results: Vec<ToolResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionFailure {
     pub code: SessionFailureCode,
     /// None 表示执行数量未知，不能据此断言没有副作用。
     pub started_tools: Option<u64>,
+    /// 旧记录缺省为 None；回执仅供核对，不能据此自动重放失败任务。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<SessionFailureEvidence>,
+}
+
+impl SessionFailure {
+    pub fn validate(&self) -> SessionResult<()> {
+        if let Some(e) = &self.evidence {
+            let mut ids = std::collections::BTreeSet::new();
+            if e.provider_http_status
+                .is_some_and(|status| !(100..=599).contains(&status))
+                || e.tool_names.iter().any(|name| name.trim().is_empty())
+                || e.tool_results
+                    .iter()
+                    .any(|r| r.call_id.trim().is_empty() || !ids.insert(&r.call_id))
+            {
+                return Err(SessionError::InvalidInput);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -141,6 +171,10 @@ impl SessionSnapshot {
                 }
                 SessionTurnStatus::Completed { messages } => {
                     validate_completed_turn(&turn.input, messages)?;
+                    revision = revision.checked_add(1).ok_or(SessionError::LimitReached)?;
+                }
+                SessionTurnStatus::Failed { failure } => {
+                    failure.validate().map_err(|_| SessionError::CorruptState)?;
                     revision = revision.checked_add(1).ok_or(SessionError::LimitReached)?;
                 }
                 _ => {
@@ -256,6 +290,7 @@ mod tests {
             SessionTurnStatus::Interrupted,
             SessionTurnStatus::Failed {
                 failure: SessionFailure {
+                    evidence: None,
                     code: SessionFailureCode::Cancelled,
                     started_tools: None,
                 },

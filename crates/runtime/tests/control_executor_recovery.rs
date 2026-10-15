@@ -276,6 +276,7 @@ fn interrupted_session_status(failure_commit_failed: bool) -> SessionTurnStatus 
     } else {
         SessionTurnStatus::Failed {
             failure: SessionFailure {
+                evidence: None,
                 code: SessionFailureCode::Cancelled,
                 started_tools: None,
             },

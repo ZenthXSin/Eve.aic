@@ -26,6 +26,16 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
             "operators": [principal], "commands": True, "github": True,
             "self_upgrade": True, "max_tool_rounds": 4}), encoding="utf8")
 
+    def receipt(self, message_id):
+        return next(r for r in self.documents()["eve.channel.qqbot"]["receipts.v1"]["entries"] if r["message"]["id"] == message_id)
+
+    def turn(self, text):
+        return next(t for session in self.documents()["eve.session"]["sessions.v1"]["sessions"].values() for t in session["turns"] if t["input"] == text)
+
+    def interactions(self):
+        memory = self.documents().get("eve.memory", {}).get("memory.v1", {})
+        return [e for scope in memory.get("scopes", []) for e in scope["snapshot"]["evidence"] if e["source"]["kind"] == "CompletedInteraction"]
+
     def enabled(self, script):
         self.run_eve(script, interest=False, memory=True, research=False, practice=False,
                      env_extra={"EVE_DEVELOPER_CONFIG": str(self.developer_config)})
@@ -74,6 +84,61 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         self.enabled(self.send(self.message("restart", "查看之前的工作", expected="原工具未重放")))
         self.assertEqual(journal.read_bytes(), before)
         self.assertEqual((self.source / "ran.txt").read_text(), "1")
+
+    def test_provider_failure_after_command_notifies_preserves_receipts_and_restart_never_replays(self):
+        def first(body):
+            self.current_capabilities(body)
+            self.failing.add("chat")  # Only the response after the real command fails HTTP 503.
+            return tool_response([("run_command", {"program": sys.executable, "args": ["-c",
+                "from pathlib import Path; p=Path('once.txt'); p.write_text(p.read_text()+'x' if p.exists() else 'x'); print('ACTUAL_COMMAND_RECEIPT')"]})])
+        self.callback = first
+        self.enabled(self.send(self.message("failed-command", "执行一次本地检查", contains=["HTTP 503", "已启动 1 次", "本轮已停止", "没有自动重试"])))
+        self.assertEqual((self.source / "once.txt").read_text(), "x")
+        failed = self.turn("执行一次本地检查")["status"]
+        self.assertEqual(failed["state"], "Failed")
+        evidence = failed["failure"]["evidence"]
+        self.assertEqual(evidence["provider_http_status"], 503)
+        self.assertEqual(evidence["tool_names"], ["run_command"])
+        self.assertIn("ACTUAL_COMMAND_RECEIPT", json.dumps(evidence["tool_results"]))
+        self.assertEqual(len(self.interactions()), 0)
+        self.assertEqual(self.receipt("failed-command")["state"], "Sent")  # Sent fault notice, not successful model answer.
+        self.failing.clear()
+        def restored(body):
+            self.current_capabilities(body)
+            notice = "\n".join(str(m.get("content", "")) for m in body["messages"])
+            self.assertIn("宿主失败记录", notice)
+            self.assertIn("HTTP 503", notice)
+            self.assertIn("已启动 1 次", notice)
+            self.assertNotIn("ACTUAL_COMMAND_RECEIPT", notice)  # Raw failed output is stored, never replayed as instructions/history.
+            self.assertFalse(any(m.get("tool_calls") for m in body["messages"]))
+            return text_response("此前已执行检查，后续模型回复失败；没有重跑。")
+        self.callback = restored
+        duplicate = {**self.message("failed-command", "执行一次本地检查"), "expected_type": "finish"}
+        self.enabled([{"send": duplicate}, {"wait_command": {"id":"failed-command", "type":"finish"}},
+                      *self.send(self.message("after-restart", "刚才的检查进展如何", expected="此前已执行检查，后续模型回复失败；没有重跑。"))])
+        self.assertEqual((self.source / "once.txt").read_text(), "x")
+        self.assertEqual(len(self.interactions()), 1)
+
+    def test_image_only_input_saves_reference_and_truthful_limit_without_training_placeholder(self):
+        url = "https://media.example.invalid/images/sample.png?synthetic=signed-reference"
+        def respond(body):
+            content = body["messages"][-1]["content"]
+            self.assertIn("收到 1 个图片附件", content)
+            self.assertIn("尚未获取像素或进行视觉解析", content)
+            self.assertNotIn(url, json.dumps(body))
+            return text_response("图片附件收到了，目前尚不能读取图片内容。")
+        self.callback = respond
+        image = {**self.message("image-only", "", expected="图片附件收到了，目前尚不能读取图片内容。"),
+                 "attachments": [{"content_type": "image/png", "url": url}]}
+        self.run_eve(self.send(image), interest=False, memory=True, research=False, practice=False,
+                     more=["--training"], env_extra={"EVE_DEVELOPER_CONFIG": str(self.developer_config)})
+        receipt = self.receipt("image-only")
+        self.assertEqual(receipt["state"], "Sent")
+        self.assertEqual(receipt["message"]["text"], "")
+        self.assertEqual(receipt["message"]["attachments"][0]["url"], url)
+        self.assertEqual(len(self.interactions()), 0)
+        expression = self.documents().get("eve.training", {}).get("expression.v1", {"scopes": []})
+        self.assertEqual(expression["scopes"], [])
 
     def test_other_qq_user_cannot_use_files_commands_or_github(self):
         def respond(body):

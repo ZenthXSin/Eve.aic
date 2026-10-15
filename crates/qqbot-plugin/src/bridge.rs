@@ -9,7 +9,7 @@ use crate::{
 };
 use eve_control_api::{
     CommitState, ControlEvent, ControlEventSink, ControlFuture, ControlInput, ControlPhase,
-    ControlReport, ControlService, GenerationKey,
+    ControlReport, ControlService, GenerationKey, RunFailure,
 };
 use eve_llm_api::{LlmError, LlmFuture, TurnEvent, TurnEventKind};
 use eve_message_api::{IncomingMessage, MessageFuture, MessageService, RouteOutcome, RouteReport};
@@ -306,6 +306,37 @@ impl ReplyGuard {
         }
     }
 }
+/// 宿主故障通知不依赖再次调用模型，不进入成功交互观察或训练证据。
+fn failed_turn_notice(report: &ControlReport) -> String {
+    let error = match report.run.failure.as_ref() {
+        Some(RunFailure::Execution(error)) => Some(error),
+        Some(RunFailure::FailureRecord { execution, .. }) => Some(execution),
+        _ => None,
+    };
+    let reason = match error {
+        Some(error) if error.provider_http_status().is_some() => {
+            let status = error.provider_http_status().expect("checked status");
+            match status {
+                402 => "模型服务拒绝请求（HTTP 402），需要检查额度或单次输出预算".into(),
+                429 => "模型服务限流（HTTP 429）".into(),
+                _ => format!("模型服务请求失败（HTTP {status}）"),
+            }
+        }
+        Some(LlmError::ProviderTimeout) => "模型服务响应超时".into(),
+        Some(LlmError::Provider(_)) => "模型服务未能完成回复".into(),
+        Some(LlmError::RoundLimit) => "本轮达到工具调用次数上限".into(),
+        _ => "本轮执行或状态保存未能完成".into(),
+    };
+    let effects = match report.run.started_tools {
+        Some(0) => "尚未启动工具调用。".into(),
+        Some(n) => format!(
+            "已启动 {n} 次工具调用，收到 {} 条工具回执；已发生的操作不会自动撤销。",
+            report.run.tool_results.len()
+        ),
+        None => "工具执行情况尚未确认，不能保证没有副作用。".into(),
+    };
+    format!("{reason}。{effects}本轮已停止，没有自动重试；继续前需要核对现有结果。")
+}
 fn explicit(text: &str) -> bool {
     text.lines().any(|line| line.trim_start().starts_with('/'))
 }
@@ -594,7 +625,7 @@ pub(crate) async fn run(
                     let incoming = IncomingMessage {
                         message_id: message.id.clone(),
                         target: target.clone(),
-                        text: message.text.clone(),
+                        text: message.turn_text(),
                         // QQ v1 桥接尚未验证澄清引用；不得从文字推断 question_id。
                         reply_to: None,
                     };
@@ -812,7 +843,7 @@ pub(crate) async fn run(
                 // 先登记会话类型，本轮工具执行时即可读取。
                 conversations.record(&key, &message.scope);
                 let submitted = control.submit(ControlInput {
-                    session: SessionInput { key, text: message.text.clone() },
+                    session: SessionInput { key, text: message.turn_text() },
                     task_id: format!("qq:{}", message.id),
                 }, sink.clone());
                 match submitted {
@@ -944,12 +975,16 @@ pub(crate) async fn run(
                         status.send_modify(|s| s.completed += 1);
                         replies.push_back(Reply { message: current.message, text: text.clone(), guard, interaction, invite: None });
                     } else {
-                        mark_failed(&mut ledger, &ctx, &config.app_id, &current.message.id)?;
                         if !report.cancel_requested {
                             status.send_modify(|s| s.failed += 1);
                             warn(&ctx, "turn_failed");
+                            replies.push_back(Reply { message: current.message,
+                                text: failed_turn_notice(&report), guard: ReplyGuard::Current(report.key),
+                                interaction: None, invite: None });
+                        } else {
+                            mark_failed(&mut ledger, &ctx, &config.app_id, &current.message.id)?;
+                            finish(&mut stdin, &current.message.id).await?;
                         }
-                        finish(&mut stdin, &current.message.id).await?;
                     }
                 }
                 frame = frames.next() => {
@@ -1040,10 +1075,10 @@ pub(crate) async fn run(
                             let mut payload = frame.clone();
                             if let Some(object) = payload.as_object_mut() {
                                 object.remove("type"); object.remove("version");
-                                if object.keys().any(|key| !["id", "scope", "target_id", "user_id", "text"].contains(&key.as_str())) {
+                                if object.keys().any(|key| !["id", "scope", "target_id", "user_id", "text", "attachments"].contains(&key.as_str())) {
                                     warn(&ctx, "ignored_message_fields");
                                 }
-                                object.retain(|key, _| ["id", "scope", "target_id", "user_id", "text"].contains(&key.as_str()));
+                                object.retain(|key, _| ["id", "scope", "target_id", "user_id", "text", "attachments"].contains(&key.as_str()));
                             }
                             let Ok(message) = serde_json::from_value::<Message>(payload) else { warn(&ctx, "invalid_message"); continue; };
                             if !message.valid() { warn(&ctx, "invalid_route_or_text"); continue; }
@@ -1083,7 +1118,7 @@ pub(crate) async fn run(
                                 } else {
                                     // 按普通输入准入时的持久开关采集，不能延后到模型执行。
                                     // 启停/重置可先于排队任务执行；旧输入必须已有去重凭据。
-                                    if let Some(training) = &training {
+                                    if message.attachments.is_empty() && let Some(training) = &training {
                                         let session = message.session_key(&config.app_id)?;
                                         let scope = eve_llm_api::ContextScope { session_id: session.session_id, user_id: session.user_id };
                                         if training.observe_user_message(&scope, &message.id, &message.text).is_err() {
@@ -1106,7 +1141,8 @@ pub(crate) async fn run(
                                         }
                                         commands.push_back(CommandMessage { message, target, natural: true, superseded: false, saved: true });
                                     } else {
-                                        queue.push_back(Queued { message, saved: false, ordinary: true });
+                                        let ordinary = message.attachments.is_empty();
+                                        queue.push_back(Queued { message, saved: false, ordinary });
                                     }
                                 }
                             }
