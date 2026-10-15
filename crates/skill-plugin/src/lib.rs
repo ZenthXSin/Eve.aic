@@ -49,6 +49,9 @@ impl SkillAdmin for SkillController {
         self.service()?
             .begin_distillation(owner, origin, source, runner, distiller_version, now_ms)
     }
+    fn begin_correction(&self, id: &str, now_ms: u64) -> SkillResult<Option<Distillation>> {
+        self.service()?.begin_correction(id, now_ms)
+    }
     fn record_proposal(
         &self,
         id: &str,

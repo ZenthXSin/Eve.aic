@@ -29,7 +29,7 @@ use eve_qqbot_plugin::{
     QqOutreachMoment, QqOutreachPush, QqOutreachResult,
 };
 use eve_session_api::SessionKey;
-use eve_skill_api::{DistillStatus, SelectionStatus, SkillAdmin, SkillRef, distillation_id};
+use eve_skill_api::{DistillStatus, SelectionStatus, SkillAdmin, SkillRef};
 use std::{
     cmp::Reverse,
     fmt::Write,
@@ -303,9 +303,11 @@ fn candidate(services: &Services) -> Result<Option<Candidate>, AppError> {
                 })
                 .and_then(|selection| selection.choice.as_ref())
                 .map(|choice| choice.skill.clone());
-            let distilled = skills.distillation(&distillation_id(&run.id));
+            let distilled = skills.distillation_for_practice(&run.id);
             let settled = chosen.is_some()
-                || distilled.is_some_and(|entry| entry.status != DistillStatus::Running)
+                || distilled.is_some_and(|entry| {
+                    entry.status != DistillStatus::Running && !entry.can_correct()
+                })
                 || now.saturating_sub(run.finished_at_ms.unwrap_or(now)) >= DISTILL_GRACE_MS;
             if !settled {
                 continue;

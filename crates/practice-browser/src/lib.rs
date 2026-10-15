@@ -186,24 +186,79 @@ impl BrowserRunner {
         else {
             return failed(RunExit::StartFailed, "无法读取运行环境输出", started);
         };
+        // 缓冲区放在取消的 future 之外；超时也保留实际启动/渲染诊断。
+        let (mut out, mut err) = (Vec::new(), Vec::new());
         let read = async {
-            let (mut out, mut err) = (Vec::new(), Vec::new());
-            let limit = MAX_CAPTURE_BYTES as u64;
-            let mut limited_out = (&mut stdout).take(limit);
-            let mut limited_err = (&mut stderr).take(limit);
-            let _ = tokio::join!(
-                limited_out.read_to_end(&mut out),
-                limited_err.read_to_end(&mut err)
+            let (stdout_result, stderr_result) = tokio::join!(
+                capture(&mut stdout, &mut out),
+                capture(&mut stderr, &mut err)
             );
             let status = child.wait().await;
-            (out, err, status)
+            stdout_result?;
+            stderr_result?;
+            status
         };
-        let (exit, out, err) = match tokio::time::timeout(RUN_TIMEOUT, read).await {
-            Ok((out, err, _)) => (RunExit::Completed, out, err),
-            Err(_) => (RunExit::Timeout, Vec::new(), Vec::new()),
+        let exit = match tokio::time::timeout(RUN_TIMEOUT, read).await {
+            Ok(Ok(status)) if status.success() => RunExit::Completed,
+            Ok(_) => RunExit::Crashed,
+            Err(_) => {
+                let _ = child.kill().await;
+                RunExit::Timeout
+            }
         };
         let workspace_text = workspace.to_string_lossy().to_string();
         evidence(exit, draft, &out, &err, &workspace_text, started)
+    }
+}
+
+/// 每路仅保留有界前缀，继续排空多余输出，避免浏览器因管道满而无法退出。
+async fn capture(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    output: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        let saved = count.min(MAX_CAPTURE_BYTES.saturating_sub(output.len()));
+        output.extend_from_slice(&chunk[..saved]);
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn output_cap_still_drains_and_cancellation_keeps_the_observed_prefix() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let mut saved = Vec::new();
+        let producer = async {
+            writer
+                .write_all(&vec![b'x'; MAX_CAPTURE_BYTES + 8192])
+                .await
+                .unwrap();
+            writer.shutdown().await.unwrap();
+        };
+        let consumer = capture(&mut reader, &mut saved);
+        let (_, result) = tokio::join!(producer, consumer);
+        result.unwrap();
+        assert_eq!(saved.len(), MAX_CAPTURE_BYTES);
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(b"observed before timeout").await.unwrap();
+        let mut partial = Vec::new();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                capture(&mut reader, &mut partial)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(partial, b"observed before timeout");
     }
 }
 

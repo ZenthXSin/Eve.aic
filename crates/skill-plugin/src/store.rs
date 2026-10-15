@@ -150,6 +150,7 @@ impl StoredSkills {
         }
         let distillation = Distillation {
             id,
+            correction_of: None,
             owner: owner.into(),
             origin,
             source,
@@ -169,6 +170,56 @@ impl StoredSkills {
         next.distillations.push(distillation.clone());
         persist(&mut inner, next)?;
         Ok(Some(distillation))
+    }
+
+    pub(super) fn begin_correction(
+        &self,
+        id: &str,
+        now_ms: u64,
+    ) -> SkillResult<Option<Distillation>> {
+        let mut inner = self.lock()?;
+        let parent = inner
+            .ledger
+            .distillations
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or(SkillError::InvalidInput)?
+            .clone();
+        if !parent.can_correct() {
+            return Ok(None);
+        }
+        if now_ms < parent.finished_at_ms.ok_or(SkillError::CorruptState)? {
+            return Err(SkillError::InvalidInput);
+        }
+        let child_id = correction_id(&parent.id);
+        if inner.ledger.distillations.len() >= MAX_DISTILLATIONS
+            || inner.ledger.skills.len() >= MAX_SKILLS
+            || inner
+                .ledger
+                .distillations
+                .iter()
+                .any(|entry| entry.id == child_id || entry.status == DistillStatus::Running)
+        {
+            return Ok(None);
+        }
+        let child = Distillation {
+            id: child_id,
+            correction_of: Some(parent.id),
+            started_at_ms: now_ms,
+            finished_at_ms: None,
+            stage: DistillStage::Proposing,
+            status: DistillStatus::Running,
+            proposal: None,
+            issues: vec![],
+            holdout: None,
+            evidence: None,
+            skill: None,
+            ..parent
+        };
+        let mut next = inner.ledger.clone();
+        next.distillations.push(child.clone());
+        persist(&mut inner, next)?;
+        Ok(Some(child))
     }
 
     pub(super) fn record_proposal(
@@ -813,7 +864,25 @@ fn validate_distillation(entry: &Distillation, snapshot: &SkillSnapshot) -> Skil
     validate_id(&entry.distiller_version)?;
     validate_issues(&entry.issues)?;
     entry.runner.validate().map_err(|_| invalid())?;
-    if entry.id != distillation_id(&entry.origin.practice_run_id)
+    let expected_id = if let Some(parent_id) = &entry.correction_of {
+        let parent = snapshot.distillation(parent_id).ok_or_else(invalid)?;
+        if !parent.can_correct()
+            || parent.owner != entry.owner
+            || parent.origin != entry.origin
+            || parent.source != entry.source
+            || parent.runner != entry.runner
+            || parent.distiller_version != entry.distiller_version
+            || parent
+                .finished_at_ms
+                .is_none_or(|at| entry.started_at_ms < at)
+        {
+            return Err(invalid());
+        }
+        correction_id(parent_id)
+    } else {
+        distillation_id(&entry.origin.practice_run_id)
+    };
+    if entry.id != expected_id
         || entry.started_at_ms == 0
         || !entry.source.applicable
         || validate_artifact(&entry.runner, &entry.source).is_err()

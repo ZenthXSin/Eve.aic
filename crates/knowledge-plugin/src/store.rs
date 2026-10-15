@@ -182,10 +182,12 @@ impl StoredKnowledge {
                 {
                     return Err(KnowledgeError::InvalidInput);
                 }
-                // 候选只能来自本次实际抓到的入口页面链接，不接受外部补充的 URL。
+                // 候选只能来自本次实际抓到的入口正文或页面链接，不接受外部补充的 URL。
                 let mut offered = BTreeSet::new();
                 for attempt in &attempts {
                     if let Ok(page) = &attempt.result {
+                        let entry = crate::research::entry_candidate(page);
+                        offered.insert((entry.url, entry.text));
                         for link in &page.links {
                             offered.insert((link.url.clone(), link.text.clone()));
                         }
@@ -194,8 +196,7 @@ impl StoredKnowledge {
                 let mut seen = BTreeSet::new();
                 if candidates.len() > MAX_CANDIDATES
                     || candidates.iter().any(|candidate| {
-                        run.seeds.contains(&candidate.url)
-                            || !seen.insert(candidate.url.as_str())
+                        !seen.insert(candidate.url.as_str())
                             || !offered.contains(&(candidate.url.clone(), candidate.text.clone()))
                     })
                 {
@@ -348,7 +349,21 @@ fn record_attempts(
             Err(failure) => FetchOutcome::Failed { failure },
             Ok(page) => {
                 page.validate(policy)?;
-                let id = document_id(&page.final_url, &page.sha256);
+                let mut id = document_id(&page.final_url, &page.sha256);
+                if documents.iter().any(|document| {
+                    document.id == id
+                        && (document.text != page.text
+                            || document.title != page.title
+                            || document.text_truncated != page.text_truncated)
+                }) {
+                    id = document_view_id(
+                        &page.final_url,
+                        &page.sha256,
+                        &page.title,
+                        &page.text,
+                        page.text_truncated,
+                    );
+                }
                 if !documents.iter().any(|document| document.id == id) {
                     if documents.len() >= MAX_DOCUMENTS {
                         return Err(KnowledgeError::LimitReached);
@@ -571,7 +586,6 @@ fn validate_run(
     if run.candidates.len() > MAX_CANDIDATES
         || run.candidates.iter().any(|candidate| {
             !policy.allows(&candidate.url)
-                || run.seeds.contains(&candidate.url)
                 || !seen.insert(candidate.url.as_str())
                 || candidate.text.len() > MAX_LABEL_BYTES
                 || candidate.text.chars().any(char::is_control)

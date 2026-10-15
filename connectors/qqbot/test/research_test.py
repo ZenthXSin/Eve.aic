@@ -211,6 +211,7 @@ class ResearchAcceptance(unittest.TestCase):
         request = json.loads(selection["body"]["messages"][-1]["content"])
         urls = [candidate["url"] for candidate in request["candidates"]]
         self.assertEqual([url.removeprefix(self.base) for url in urls], [
+            "/docs/index.html",
             "/docs/start.html", "/docs/faq.html", "/docs/blocks.html", "/docs/watercolor.html",
             "/docs/woodwork.html"])
         self.assertIn("不是用户下达的任务", request["brief"])

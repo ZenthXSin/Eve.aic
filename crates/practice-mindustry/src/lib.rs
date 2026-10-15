@@ -23,7 +23,17 @@ use tokio::{
 
 pub const RUNNER_ID: &str = "mindustry-content-mod:v1";
 const DOMAIN: &str = "Mindustry（工厂建造塔防游戏）的内容模组：只由 mod.hjson 与 content 目录下的 hjson/json 数据文件组成，在操作者提供的无头服务端中实际加载，并查询内容的类型与属性。不能运行脚本、Java 代码，也不包含贴图。";
-const LAYOUT: &str = "根目录必须有 mod.hjson，含 name（小写字母、数字、-）、displayName、author、version、minGameVersion（数字）。内容文件只能放在 content/blocks、content/items、content/liquids、content/units 下，扩展名 .hjson 或 .json，文件名（小写字母、数字、-）即内容名，游戏中的完整名称为 <mod name>-<文件名>。type 只能写不带包名的类型名（例如 Wall、Conveyor、Item）；requirements 只能引用游戏中存在的物品。不得包含 scripts 目录、.js、.java、.class、.jar 或贴图，mod.hjson 不得包含 main 或 java 字段。探测的 subject 必须是本模组内容的完整名称；property 可取 exists（\"true\" 或 \"false\"）、class（类型名）或内容字段名，数值按游戏中的实际数值比较。";
+const LAYOUT: &str = concat!(
+    "根目录必须有 mod.hjson，含 name（小写字母、数字、-）、displayName、author、version、minGameVersion（数字）。",
+    "内容文件只能放在 content/blocks、content/items、content/liquids、content/units 下，扩展名 .hjson 或 .json，",
+    "文件名（小写字母、数字、-）即内容名，游戏中的完整名称为 <mod name>-<文件名>。",
+    "新内容使用独特文件名，避免与原版内容重名而被解释为覆盖。新方块明确写 type: Wall 或 Conveyor 等不带包名的类型；",
+    "物品和液体的类型由所在目录决定，不写 type: Item 或 Liquid，否则游戏报告未知字段。",
+    "requirements 是物品/数量字符串的数组，例如 [ copper/6 ]，不是对象；只引用游戏或本模组中确实存在的物品。",
+    "不得包含 scripts 目录、.js、.java、.class、.jar 或贴图，mod.hjson 不得包含 main 或 java 字段。",
+    "探测的 subject 必须是本模组内容的完整名称；property 可取 exists（\"true\" 或 \"false\"）、class（类型名）",
+    "或内容字段名，数值按游戏中的实际数值比较。"
+);
 const PROPERTIES: [&str; 15] = [
     "exists",
     "class",

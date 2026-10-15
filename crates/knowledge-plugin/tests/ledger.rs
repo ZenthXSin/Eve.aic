@@ -34,7 +34,7 @@ async fn every_stage_is_saved_before_its_external_effect_and_completion_keeps_so
     });
     fetcher.serve(SEED, Ok(index));
     fetcher.serve(START, Ok(page(START, START_TEXT, &[])));
-    let selector = FakeSelector::new(Some(store.clone()), vec![0]);
+    let selector = FakeSelector::new(Some(store.clone()), vec![1]);
     let extractor = FakeExtractor::new(Some(store.clone()), |_| {
         Ok(serde_json::to_value(output_json()).unwrap())
     });
@@ -59,7 +59,7 @@ async fn every_stage_is_saved_before_its_external_effect_and_completion_keeps_so
         .iter()
         .map(|c| c.url.as_str())
         .collect();
-    assert_eq!(urls, [START, BLOCKS], "入口自身不作为候选");
+    assert_eq!(urls, [SEED, START, BLOCKS], "入口正文和出链去重后都可选择");
     assert_eq!(selection.0.brief, topic("goal-a", 1).brief);
     let extraction = extractor.requests.lock().unwrap()[0].clone();
     assert_eq!(
@@ -112,6 +112,97 @@ async fn every_stage_is_saved_before_its_external_effect_and_completion_keeps_so
 
 fn fetcher_urls(calls: &[(String, Option<Value>)]) -> Vec<&str> {
     calls.iter().map(|(url, _)| url.as_str()).collect()
+}
+
+#[tokio::test]
+async fn entry_article_without_links_is_learned_and_old_text_views_are_preserved() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = RecordingStore::open(directory.path());
+    let (kernel, admin) = open(store.clone()).await;
+    let old_page = page(SEED, "Large navigation formerly hid the article", &[]);
+    let old = admin
+        .begin(topic("entry-article", 1), &policy(), "old-parser:v1", 100)
+        .unwrap()
+        .unwrap();
+    admin
+        .advance(
+            &old.id,
+            ResearchProgress::Discovered {
+                attempts: vec![attempt(SEED, 110, Ok(old_page.clone()))],
+                candidates: vec![],
+            },
+        )
+        .unwrap();
+    admin
+        .finish(
+            &old.id,
+            120,
+            ResearchOutcome::Completed(ExtractionOutput::default()),
+        )
+        .unwrap();
+    let original = admin.snapshot().unwrap().documents[0].clone();
+
+    // 响应原字节不变，但新版解析器提取到了正文；必须保存新视图，不能命中旧导航缓存。
+    let mut article = page(SEED, START_TEXT, &[]);
+    article.sha256 = old_page.sha256;
+    article.byte_count = old_page.byte_count;
+    let expected_id = document_view_id(SEED, &article.sha256, &article.title, START_TEXT, false);
+    let fetcher = FakeFetcher::new(Some(store.clone()));
+    fetcher.serve(SEED, Ok(article));
+    let selector = FakeSelector::new(Some(store.clone()), vec![0]);
+    let claim_document = expected_id.clone();
+    let extractor = FakeExtractor::new(Some(store.clone()), move |_| {
+        let mut value = output_json();
+        value["claims"][0]["document_id"] = json!(claim_document);
+        Ok(value)
+    });
+    let research = researcher(&admin, fetcher.clone(), selector.clone(), extractor.clone());
+    let run = admin
+        .begin(
+            topic("entry-article", 2),
+            &policy(),
+            &research.version(),
+            200,
+        )
+        .unwrap()
+        .unwrap();
+    let outcome = research.research(&run, || 210).await.unwrap();
+    let finished = admin.finish(&run.id, 220, outcome).unwrap();
+    assert_eq!(finished.status, RunStatus::Completed);
+    assert_eq!(fetcher_urls(&fetcher.calls.lock().unwrap()), [SEED, SEED]);
+    assert_eq!(
+        selector.requests.lock().unwrap()[0].0.candidates[0].url,
+        SEED
+    );
+    assert_eq!(
+        extractor.requests.lock().unwrap()[0].0.documents[0].text,
+        START_TEXT
+    );
+    let snapshot = admin.snapshot().unwrap();
+    assert_eq!(snapshot.documents.len(), 2);
+    assert_eq!(snapshot.document(&original.id).unwrap(), &original);
+    let corrected = snapshot.document(&expected_id).unwrap();
+    assert_eq!(corrected.sha256, original.sha256);
+    assert_eq!(corrected.text, START_TEXT);
+    let mut tampered_view = corrected.clone();
+    tampered_view.text.push_str(" changed");
+    assert!(tampered_view.validate().is_err());
+    assert!(snapshot.entries.iter().any(|entry| {
+        entry
+            .source
+            .as_ref()
+            .is_some_and(|source| source.document_id == expected_id)
+    }));
+    kernel.stop_all().await.unwrap();
+    let (kernel, recovered) = open(store).await;
+    assert_eq!(recovered.snapshot().unwrap(), snapshot);
+    assert!(
+        recovered
+            .begin(topic("entry-article", 2), &policy(), "v", 300)
+            .unwrap()
+            .is_none()
+    );
+    kernel.stop_all().await.unwrap();
 }
 
 fn output_json() -> Value {
