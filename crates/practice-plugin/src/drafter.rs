@@ -6,7 +6,7 @@ use eve_practice_api::{
 };
 use std::{sync::Arc, time::Duration};
 
-pub const DRAFTER_VERSION: &str = "practice-drafter:v1";
+pub const DRAFTER_VERSION: &str = "practice-drafter:v2";
 const MAX_PROVIDER_TIMEOUT: Duration = Duration::from_secs(90);
 
 // 规则与领域无关；运行器的领域、布局与探测属性都作为请求数据给出。
@@ -52,7 +52,7 @@ impl PracticeDrafter for ModelPracticeDrafter {
             let selection = self.resolver.resolve().map_err(provider_error)?;
             let response = tokio::time::timeout(
                 selection.provider_timeout.min(MAX_PROVIDER_TIMEOUT),
-                selection.provider.complete(model_request),
+                selection.provider.complete_json(model_request),
             )
             .await
             .map_err(|_| PracticeError::Practice(PracticeFailure::Timeout))?

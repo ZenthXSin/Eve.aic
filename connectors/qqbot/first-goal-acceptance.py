@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import signal
 import secrets
+import shutil
 import subprocess
 import threading
 import time
@@ -54,13 +55,17 @@ class Trial:
         self.local_token = secrets.token_urlsafe(32)
         self.root = args.output.resolve()
         self.root.mkdir(mode=0o700, parents=True, exist_ok=False)
+        # 四次独立启动固定使用同一份程序，后续本地构建不会混入本轮证据。
+        self.binary = self.root / ("eve-qqbot" + args.binary.suffix)
+        shutil.copyfile(args.binary, self.binary)
+        self.binary.chmod(0o700)
         self.lock = threading.Lock()
         self.records = []
         self.phase = 0
         self.child = None
         self.handles = []
         self.report = {"transport": "local_protocol_fixture", "official_qq_tested": False,
-                       "binary_sha256": digest(args.binary), "model": args.model,
+                       "binary_sha256": digest(self.binary), "model": args.model,
                        "runtime_program_or_jar_sha256": digest(args.mindustry_server or args.browser)}
         try:
             self.report["source_commit"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, stderr=subprocess.DEVNULL, text=True).strip()
@@ -192,7 +197,7 @@ class Trial:
             EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}", EVE_OPENAI_PROTOCOL="chat",
             EVE_OPENAI_MAX_OUTPUT_TOKENS="8192", EVE_OPENAI_TIMEOUT_SECONDS="90", EVE_LLM_RESPONSE_MODE="complete",
             EVE_DEVELOPER_CONFIG=str(self.root / "developer.json"))
-        command = [str(self.args.binary), "--state-dir", str(self.root / "state"), "--agent", str(self.args.agent),
+        command = [str(self.binary), "--state-dir", str(self.root / "state"), "--agent", str(self.args.agent),
             "--bridge-script", str(BRIDGE), "--bridge-arg", str(self.root / f"scenario-{self.phase}.json"),
             "--interest-learning", "--interest-cooldown-ms", "0", "--cognition-max-executions", "8",
             "--memory-recall", "--segmented", "--skill-learning", "--tool-forging", "--agenda-context", "--clarify",
