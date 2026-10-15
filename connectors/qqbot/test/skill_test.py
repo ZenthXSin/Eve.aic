@@ -128,7 +128,11 @@ class SkillAcceptance(unittest.TestCase):
 
     def distilled(self, count=1):
         entries = self.distillations()
-        return len(entries) == count and all(entry["status"] != "Running" for entry in entries)
+        originals = [entry for entry in entries if not entry.get("correction_of")]
+        corrected = {entry["correction_of"] for entry in entries if entry.get("correction_of")}
+        return (len(originals) == count and all(entry["status"] != "Running" for entry in entries)
+                and all(entry["id"] in corrected for entry in originals
+                        if entry["status"] in ("Rejected", {"Failed": "InvalidOutput"})))
 
     def invoked(self):
         return any(selection.get("outcome") for selection in self.selections())
@@ -239,15 +243,49 @@ class SkillAcceptance(unittest.TestCase):
     def test_unfaithful_templates_are_rejected_without_running(self):
         self.distill = lambda request: self.default_distill(request, original="999")
         self.learn_skill()
-        [distillation] = self.distillations()
-        self.assertEqual(distillation["status"], "Rejected")
-        self.assertIn("逐字还原", distillation["issues"][0])
-        self.assertIsNone(distillation["holdout"])
+        [original, correction] = self.distillations()
+        self.assertEqual([original["status"], correction["status"]], ["Rejected", "Rejected"])
+        self.assertEqual(correction["correction_of"], original["id"])
+        self.assertTrue(all("逐字还原" in entry["issues"][0] for entry in [original, correction]))
+        self.assertTrue(all(entry["holdout"] is None for entry in [original, correction]))
         self.assertEqual(self.skills(), [])
         self.assertEqual(len(self.launches()), 2, "被拒绝的模板从不运行")
         self.run_eve([*self.send(self.message("skills", "/skills", contains=EMPTY)), *self.checkpoint("quiet")],
                      checkpoints={"quiet": self.quiet})
-        self.assertEqual(len(self.kind("distill")), 1, "被拒绝的提炼不重试")
+        self.assertEqual(len(self.kind("distill")), 2, "追加一次纠正后不再请求，重启也不重放")
+
+    def test_rejected_proposal_is_corrected_once_from_persisted_feedback(self):
+        self.distill = lambda request: self.default_distill(request, original="999" if not request.get("previous") else None)
+        self.learn_skill()
+        [original, corrected] = self.distillations()
+        self.assertEqual([original["status"], corrected["status"]], ["Rejected", "Verified"])
+        self.assertEqual(corrected["correction_of"], original["id"])
+        requests = self.kind("distill")
+        self.assertEqual(len(requests), 2)
+        request = json.loads(requests[1]["body"]["messages"][-1]["content"])
+        self.assertEqual(request["previous"]["proposal"], original["proposal"])
+        self.assertEqual(request["previous"]["issues"], original["issues"])
+        saved = requests[1]["state"]["eve.skill"]["skill.v1"]["distillations"]
+        self.assertEqual([entry["status"] for entry in saved], ["Rejected", "Running"])
+        self.assertEqual(len(self.skills()), 1)
+        before = self.ledger()
+        self.run_eve(self.checkpoint("quiet"), checkpoints={"quiet": self.quiet})
+        self.assertEqual(self.ledger(), before)
+        self.assertEqual(len(self.kind("distill")), 2)
+
+    def test_graceful_shutdown_cancels_running_correction_and_never_replays_it(self):
+        self.distill = lambda request: self.default_distill(request, original="999")
+        self.response_gates = {("distill", 2): "blocked-correction"}
+        self.inspect_run(lambda: self.wait_for(lambda: self.arrived("distill", 2).exists(), "correction not started", 20),
+                         prefix=self.send(self.message("casual", MINDUSTRY)), max_executions=4)
+        [original, correction] = self.distillations()
+        self.assertEqual(original["status"], "Rejected")
+        self.assertEqual(correction["status"], {"Failed": "Cancelled"})
+        self.response_gates = {}
+        before = self.ledger()
+        self.run_eve(self.checkpoint("quiet"), checkpoints={"quiet": self.quiet})
+        self.assertEqual(self.ledger(), before)
+        self.assertEqual(len(self.kind("distill")), 2)
 
     def test_interrupted_distillation_is_interrupted_after_restart_without_replay(self):
         self.response_gates = {("distill", 1): "never-released"}

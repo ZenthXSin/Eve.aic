@@ -243,7 +243,17 @@ impl SourceDocument {
             &self.title,
             &self.text,
         )?;
-        if self.fetched_at_ms == 0 || self.id != document_id(&self.url, &self.sha256) {
+        if self.fetched_at_ms == 0
+            || (self.id != document_id(&self.url, &self.sha256)
+                && self.id
+                    != document_view_id(
+                        &self.url,
+                        &self.sha256,
+                        &self.title,
+                        &self.text,
+                        self.text_truncated,
+                    ))
+        {
             return Err(KnowledgeError::InvalidInput);
         }
         Ok(())
@@ -253,6 +263,28 @@ impl SourceDocument {
 /// 来源文档的稳定标识；长度前缀避免字段边界歧义。
 pub fn document_id(url: &str, sha256: &str) -> String {
     format!("source-{}", digest(&["knowledge.source:v1", url, sha256]))
+}
+
+/// 同一响应字节被新版正文解析器提取为不同视图时保留独立版本，不覆盖旧引用。
+/// 原始 SHA256 继续指向完整响应；视图标识另外绑定标题、正文和截断状态。
+pub fn document_view_id(
+    url: &str,
+    sha256: &str,
+    title: &str,
+    text: &str,
+    truncated: bool,
+) -> String {
+    format!(
+        "source-{}",
+        digest(&[
+            "knowledge.source-view:v1",
+            url,
+            sha256,
+            title,
+            text,
+            if truncated { "truncated" } else { "full" },
+        ])
+    )
 }
 
 /// 同一目标修订的研究标识；重复准入得到同一 ID。

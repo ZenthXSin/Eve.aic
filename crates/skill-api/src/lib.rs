@@ -158,6 +158,9 @@ pub enum DistillStatus {
 #[serde(deny_unknown_fields)]
 pub struct Distillation {
     pub id: String,
+    /// 被拒候选的一次独立纠正；旧记录保持不变。旧数据省略该字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correction_of: Option<String>,
     /// 来源实践可见的用户；技能只属于该用户。
     pub owner: String,
     pub origin: SkillOrigin,
@@ -177,6 +180,13 @@ pub struct Distillation {
     pub skill: Option<SkillRef>,
 }
 impl Distillation {
+    pub fn can_correct(&self) -> bool {
+        self.correction_of.is_none()
+            && matches!(
+                self.status,
+                DistillStatus::Rejected | DistillStatus::Failed(SkillFailure::InvalidOutput)
+            )
+    }
     pub fn template(&self) -> Option<&SkillProposal> {
         match &self.proposal {
             Some(Proposal::Skill(proposal)) => Some(proposal),
@@ -351,6 +361,12 @@ impl SkillSnapshot {
     pub fn distillation(&self, id: &str) -> Option<&Distillation> {
         self.distillations.iter().find(|entry| entry.id == id)
     }
+    /// 已有一次纠正时以纠正记录为准，避免把原先的拒绝当成最终结局。
+    pub fn distillation_for_practice(&self, practice_run_id: &str) -> Option<&Distillation> {
+        let original = distillation_id(practice_run_id);
+        self.distillation(&correction_id(&original))
+            .or_else(|| self.distillation(&original))
+    }
     pub fn selection(&self, id: &str) -> Option<&Selection> {
         self.selections.iter().find(|entry| entry.id == id)
     }
@@ -436,6 +452,15 @@ pub struct DistillRequest {
     pub source: PracticeDraft,
     pub evidence: RunEvidence,
     pub existing: Vec<SkillSummary>,
+    /// 宿主已记录的前次拒绝理由；不能改变来源草稿、运行器或验证标准。
+    pub previous: Option<ProposalFeedback>,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize)]
+pub struct ProposalFeedback {
+    pub proposal: Option<Proposal>,
+    pub issues: Vec<String>,
+    pub failure: Option<SkillFailure>,
 }
 
 /// 可替换提炼器；至多一次模型请求、零工具，输出须是结构完整的提案。
@@ -474,6 +499,12 @@ pub trait SkillAdmin: Send + Sync {
         distiller_version: &str,
         now_ms: u64,
     ) -> SkillResult<Option<Distillation>>;
+    /// 只为 Rejected 或 Failed(InvalidOutput) 的原始提炼追加一次纠正。
+    /// 原记录不变；成功保存新的 Running 记录之后才能再次请求模型。
+    /// 不支持该能力的替换账本维持原来的单次提炼行为。
+    fn begin_correction(&self, _id: &str, _now_ms: u64) -> SkillResult<Option<Distillation>> {
+        Ok(None)
+    }
     /// 保存提炼结果与宿主的检查。没有问题的技能提案须同时给出宿主选取的验证参数，
     /// 进入 Verifying，返回后才可实际运行；其余情况在同一次提交中写入结局。
     fn record_proposal(
@@ -617,6 +648,14 @@ pub fn distillation_id(practice_run_id: &str) -> String {
     format!(
         "distill-{}",
         &digest(&["skill.distill:v1", practice_run_id])[..32]
+    )
+}
+
+/// 同一被拒提炼至多一个纠正 ID；重启或重复事件不能放大尝试次数。
+pub fn correction_id(parent_id: &str) -> String {
+    format!(
+        "distill-{}",
+        &digest(&["skill.correction:v1", parent_id])[..32]
     )
 }
 

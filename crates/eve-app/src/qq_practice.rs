@@ -474,10 +474,23 @@ async fn consolidate(
     };
     // 放弃时验证运行的进程已随 future 终止；只记录原因，结果未知，不重放。
     if let Some(failure) = abandoned {
-        let _ = std::fs::remove_dir_all(Consolidator::workspace(workspace_root, &entry.id));
-        skills
-            .admin
-            .abandon_distillation(&entry.id, now_ms()?.max(began), failure)?;
+        let snapshot = skills.admin.snapshot()?;
+        let current = snapshot
+            .distillation(&eve_skill_api::correction_id(&entry.id))
+            .filter(|record| record.status == eve_skill_api::DistillStatus::Running)
+            .or_else(|| {
+                snapshot
+                    .distillation(&entry.id)
+                    .filter(|record| record.status == eve_skill_api::DistillStatus::Running)
+            });
+        if let Some(current) = current {
+            let _ = std::fs::remove_dir_all(Consolidator::workspace(workspace_root, &current.id));
+            skills.admin.abandon_distillation(
+                &current.id,
+                now_ms()?.max(current.started_at_ms),
+                failure,
+            )?;
+        }
     }
     Ok(true)
 }

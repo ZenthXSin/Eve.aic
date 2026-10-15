@@ -23,6 +23,7 @@ pub struct Consolidator {
     admin: Arc<dyn SkillAdmin>,
     distiller: Arc<dyn SkillDistiller>,
     runner: Arc<dyn PracticeRunner>,
+    correct_rejected: bool,
 }
 
 impl Consolidator {
@@ -35,7 +36,14 @@ impl Consolidator {
             admin,
             distiller,
             runner,
+            correct_rejected: false,
         }
+    }
+
+    /// 为格式错误或检查拒绝追加一次有独立账本的纠正；运行错误及未知副作用不重试。
+    pub fn with_correction(mut self) -> Self {
+        self.correct_rejected = true;
+        self
     }
 
     pub fn distiller_version(&self) -> &str {
@@ -101,10 +109,20 @@ impl Consolidator {
         now_ms: impl Fn() -> u64 + Send + Sync,
     ) -> SkillResult<Distillation> {
         let mut entry = distillation.clone();
-        let workspace = Self::workspace(workspace_root, &entry.id);
         loop {
+            let workspace = Self::workspace(workspace_root, &entry.id);
             if entry.status != DistillStatus::Running {
                 let _ = std::fs::remove_dir_all(&workspace);
+                if self.correct_rejected
+                    && entry.can_correct()
+                    && let Some(child) = self.admin.begin_correction(
+                        &entry.id,
+                        now_ms().max(entry.finished_at_ms.unwrap_or(entry.started_at_ms)),
+                    )?
+                {
+                    entry = child;
+                    continue;
+                }
                 return Ok(entry);
             }
             let at_ms = |at: u64| at.max(entry.started_at_ms);
@@ -122,6 +140,19 @@ impl Consolidator {
                         })
                         .collect();
                     existing.truncate(MAX_CANDIDATES);
+                    let previous = if let Some(id) = &entry.correction_of {
+                        let previous = snapshot.distillation(id).ok_or(SkillError::CorruptState)?;
+                        Some(ProposalFeedback {
+                            proposal: previous.proposal.clone(),
+                            issues: previous.issues.clone(),
+                            failure: match previous.status {
+                                DistillStatus::Failed(failure) => Some(failure),
+                                _ => None,
+                            },
+                        })
+                    } else {
+                        None
+                    };
                     let request = DistillRequest {
                         distillation_id: entry.id.clone(),
                         distiller_version: self.distiller.version().into(),
@@ -129,6 +160,7 @@ impl Consolidator {
                         source: entry.source.clone(),
                         evidence: source_evidence.clone(),
                         existing,
+                        previous,
                     };
                     let result = match self.distiller.distill(request).await {
                         Ok(proposal) => Ok(proposal),

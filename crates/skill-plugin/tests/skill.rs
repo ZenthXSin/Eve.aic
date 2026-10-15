@@ -380,8 +380,19 @@ impl World {
     }
     /// 提炼最早一次尚未提炼的已验证实践。
     async fn consolidate(&self, reply: Result<Proposal, SkillFailure>) -> Distillation {
-        self.distiller.replies.lock().unwrap().push_back(reply);
-        let consolidator = self.consolidator();
+        self.consolidate_replies(vec![reply], false).await
+    }
+    async fn consolidate_replies(
+        &self,
+        replies: Vec<Result<Proposal, SkillFailure>>,
+        correct: bool,
+    ) -> Distillation {
+        self.distiller.replies.lock().unwrap().extend(replies);
+        let consolidator = if correct {
+            self.consolidator().with_correction()
+        } else {
+            self.consolidator()
+        };
         let candidate = consolidator
             .candidate(
                 &self.host.skills.snapshot().unwrap(),
@@ -550,6 +561,176 @@ async fn unfaithful_templates_and_overstated_ranges_do_not_become_skills() {
         DistillStatus::Failed(SkillFailure::InvalidOutput)
     );
     world.host.kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn rejected_candidate_is_preserved_and_one_saved_correction_can_become_a_skill() {
+    let world = World::new().await;
+    world.practice("goal-1", vec![item("lamp", "7")]).await;
+    let runs_before = world.runner.runs.lock().unwrap().len();
+    let fixed = world
+        .consolidate_replies(
+            vec![Ok(proposal(None, 900, "8")), Ok(proposal(None, 900, "7"))],
+            true,
+        )
+        .await;
+    assert_eq!(fixed.status, DistillStatus::Verified);
+    let snapshot = world.host.skills.snapshot().unwrap();
+    assert_eq!(snapshot.distillations.len(), 2);
+    let original = &snapshot.distillations[0];
+    assert_eq!(original.status, DistillStatus::Rejected);
+    assert_eq!(fixed.correction_of.as_deref(), Some(original.id.as_str()));
+    assert_eq!(fixed.id, correction_id(&original.id));
+    assert_eq!(
+        world.runner.runs.lock().unwrap().len(),
+        runs_before + 1,
+        "被拒的提案从未运行"
+    );
+    {
+        let requests = world.distiller.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].0.previous.is_none());
+        let feedback = requests[1].0.previous.as_ref().unwrap();
+        assert_eq!(feedback.proposal, original.proposal);
+        assert_eq!(feedback.issues, original.issues);
+        assert_eq!(requests[1].1["distillations"][0]["status"], "Rejected");
+        assert_eq!(
+            requests[1].1["distillations"][1]["status"], "Running",
+            "纠正请求之前已落盘"
+        );
+    }
+    assert!(
+        world
+            .host
+            .skills
+            .begin_correction(&original.id, world.now())
+            .unwrap()
+            .is_none()
+    );
+    world.host.kernel.stop_all().await.unwrap();
+    let reopened = open(world.store.clone()).await.unwrap();
+    assert_eq!(reopened.skills.snapshot().unwrap(), snapshot);
+    assert!(
+        world
+            .consolidator()
+            .with_correction()
+            .candidate(&snapshot, &reopened.practice.snapshot().unwrap())
+            .is_none()
+    );
+    reopened.kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_output_can_correct_once_but_a_second_rejection_is_final() {
+    let world = World::new().await;
+    world.practice("goal-1", vec![item("lamp", "7")]).await;
+    let fixed = world
+        .consolidate_replies(
+            vec![
+                Err(SkillFailure::InvalidOutput),
+                Ok(proposal(None, 900, "7")),
+            ],
+            true,
+        )
+        .await;
+    assert_eq!(fixed.status, DistillStatus::Verified);
+    assert_eq!(
+        world.distiller.requests.lock().unwrap()[1]
+            .0
+            .previous
+            .as_ref()
+            .unwrap()
+            .failure,
+        Some(SkillFailure::InvalidOutput)
+    );
+    world.host.kernel.stop_all().await.unwrap();
+
+    let world = World::new().await;
+    world.practice("goal-1", vec![item("lamp", "7")]).await;
+    let rejected = world
+        .consolidate_replies(
+            vec![Ok(proposal(None, 900, "8")), Ok(proposal(None, 900, "9"))],
+            true,
+        )
+        .await;
+    assert_eq!(rejected.status, DistillStatus::Rejected);
+    assert!(rejected.correction_of.is_some());
+    assert!(!rejected.can_correct());
+    assert_eq!(world.distiller.requests.lock().unwrap().len(), 2);
+    assert_eq!(world.host.skills.snapshot().unwrap().distillations.len(), 2);
+    assert!(
+        world
+            .host
+            .skills
+            .begin_correction(&rejected.id, world.now())
+            .unwrap()
+            .is_none()
+    );
+    world.host.kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn infrastructure_failures_and_uncertain_runtime_effects_are_not_corrected() {
+    let world = World::new().await;
+    for (index, failure) in [
+        SkillFailure::Provider,
+        SkillFailure::Timeout,
+        SkillFailure::Cancelled,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        world
+            .practice(&format!("goal-{index}"), vec![item("lamp", "7")])
+            .await;
+        let failed = world.consolidate_replies(vec![Err(failure)], true).await;
+        assert_eq!(failed.status, DistillStatus::Failed(failure));
+        assert!(failed.correction_of.is_none());
+    }
+    world
+        .practice("goal-runtime", vec![item("lamp", "7")])
+        .await;
+    let unverified = world
+        .consolidate_replies(vec![Ok(proposal(None, 5000, "7"))], true)
+        .await;
+    assert_eq!(unverified.status, DistillStatus::Unverified);
+    assert_eq!(world.distiller.requests.lock().unwrap().len(), 4);
+    world.host.kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn interrupted_correction_is_sealed_without_replay_and_bad_lineage_keeps_bytes() {
+    let world = World::new().await;
+    world.practice("goal-1", vec![item("lamp", "7")]).await;
+    let original = world.consolidate(Ok(proposal(None, 900, "8"))).await;
+    let child = world
+        .host
+        .skills
+        .begin_correction(&original.id, world.now())
+        .unwrap()
+        .unwrap();
+    world.host.kernel.stop_all().await.unwrap();
+    let reopened = open(world.store.clone()).await.unwrap();
+    let snapshot = reopened.skills.snapshot().unwrap();
+    assert_eq!(snapshot.distillation(&original.id).unwrap(), &original);
+    assert_eq!(
+        snapshot.distillation(&child.id).unwrap().status,
+        DistillStatus::Interrupted
+    );
+    assert!(
+        reopened
+            .skills
+            .begin_correction(&original.id, world.now())
+            .unwrap()
+            .is_none()
+    );
+    reopened.kernel.stop_all().await.unwrap();
+    let mut corrupted = world.store.saved();
+    corrupted["distillations"][1]["correction_of"] = json!(child.id);
+    let bytes = serde_json::to_vec(&corrupted).unwrap();
+    world.store.overwrite(&bytes);
+    assert!(open(world.store.clone()).await.is_err());
+    assert_eq!(world.store.raw().unwrap(), bytes);
 }
 
 #[tokio::test]

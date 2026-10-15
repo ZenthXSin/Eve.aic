@@ -1432,7 +1432,9 @@ async fn run_qqbot_composed(
                     ));
                     Some(qq_practice::Skills {
                         admin: admin.clone(),
-                        consolidator: Arc::new(Consolidator::new(admin, distiller, runner.clone())),
+                        consolidator: Arc::new(
+                            Consolidator::new(admin, distiller, runner.clone()).with_correction(),
+                        ),
                     })
                 }
                 None => None,

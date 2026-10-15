@@ -50,6 +50,10 @@ pub(crate) fn parse_html(input: &str) -> ParsedHtml {
     // ASCII 小写不改变字节偏移，只用于大小写不敏感地查找结束标签。
     let lower = input.to_ascii_lowercase();
     let mut text = TextBuilder::default();
+    let mut main_text = TextBuilder::default();
+    let mut article_text = TextBuilder::default();
+    let mut main_depth = 0_usize;
+    let mut article_depth = 0_usize;
     let mut title = TextBuilder::default();
     let mut links = Vec::new();
     let mut anchor: Option<(String, TextBuilder)> = None;
@@ -65,6 +69,12 @@ pub(crate) fn parse_html(input: &str) -> ParsedHtml {
                 title.push(&decoded);
             } else {
                 text.push(&decoded);
+                if main_depth > 0 {
+                    main_text.push(&decoded);
+                }
+                if article_depth > 0 {
+                    article_text.push(&decoded);
+                }
                 if let Some((_, label)) = &mut anchor {
                     label.push(&decoded);
                 }
@@ -94,6 +104,13 @@ pub(crate) fn parse_html(input: &str) -> ParsedHtml {
             });
             continue;
         }
+        if !closing {
+            match name.as_str() {
+                "main" => main_depth += 1,
+                "article" => article_depth += 1,
+                _ => {}
+            }
+        }
         match name.as_str() {
             "title" => in_title = !closing,
             "a" if closing => {
@@ -109,19 +126,43 @@ pub(crate) fn parse_html(input: &str) -> ParsedHtml {
             }
             name if BLOCKS.contains(&name) => {
                 text.newline();
+                if main_depth > 0 {
+                    main_text.newline();
+                }
+                if article_depth > 0 {
+                    article_text.newline();
+                }
                 if let Some((_, label)) = &mut anchor {
                     label.space();
                 }
             }
             _ => {}
         }
+        if closing {
+            match name.as_str() {
+                "main" => main_depth = main_depth.saturating_sub(1),
+                "article" => article_depth = article_depth.saturating_sub(1),
+                _ => {}
+            }
+        }
     }
     if let Some((href, label)) = anchor.take() {
         links.push((href, label.finish()));
     }
+    // 文档站点的侧栏可能远长于文章；在有界截断前优先取文章/主区域。
+    // 链接仍来自整页，只由来源策略授予读取范围，不因这些语义标签扩大权限。
+    let article_text = article_text.finish();
+    let main_text = main_text.finish();
+    let text = if !article_text.is_empty() {
+        article_text
+    } else if !main_text.is_empty() {
+        main_text
+    } else {
+        text.finish()
+    };
     ParsedHtml {
         title: title.finish(),
-        text: text.finish(),
+        text,
         links,
     }
 }
@@ -287,6 +328,28 @@ mod tests {
                 ("next.html#top".into(), "Next".into()),
                 ("plain.html".into(), "Plain".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn article_survives_large_navigation_and_keeps_discovery_links() {
+        let navigation = "<a href='/docs/menu'>Navigation</a>".repeat(2000);
+        let parsed = parse_html(&format!(
+            "<title>Actual guide</title><main><nav>{navigation}</nav><article><h1>Guide</h1><p>Use mod.hjson &amp; content/items.</p><script>hidden()</script><a href='next.html'>Next step</a></article><footer>Footer</footer></main>"
+        ));
+        assert_eq!(parsed.title, "Actual guide");
+        assert_eq!(
+            parsed.text,
+            "Guide\nUse mod.hjson & content/items.\nNext step"
+        );
+        assert_eq!(parsed.links.len(), 2001);
+        assert_eq!(parsed.links.last().unwrap().0, "next.html");
+        assert_eq!(
+            parse_html(
+                "<header>Outside</header><main><p>Main only</p></main><footer>Outside</footer>"
+            )
+            .text,
+            "Main only"
         );
     }
 

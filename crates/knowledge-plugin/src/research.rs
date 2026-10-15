@@ -53,8 +53,18 @@ impl Researcher {
             });
         }
         let reachable = attempts.iter().any(|attempt| attempt.result.is_ok());
-        let mut seen: BTreeSet<String> = run.seeds.iter().cloned().collect();
+        let mut seen = BTreeSet::new();
         let mut candidates = Vec::new();
+        // 操作者可以直接配置文章；入口本身也是真实抓取的来源，不能只研究它的出链。
+        // 先保留各个入口，避免第一个目录的导航占满全部候选。
+        for attempt in &attempts {
+            if let Ok(page) = &attempt.result {
+                let entry = entry_candidate(page);
+                if candidates.len() < MAX_CANDIDATES && seen.insert(entry.url.clone()) {
+                    candidates.push(entry);
+                }
+            }
+        }
         for attempt in &attempts {
             let Ok(page) = &attempt.result else {
                 continue;
@@ -181,5 +191,21 @@ impl Researcher {
             Err(KnowledgeError::Research(failure)) => ResearchOutcome::Failed(failure),
             Err(error) => return Err(error),
         })
+    }
+}
+
+pub(crate) fn entry_candidate(page: &FetchedPage) -> LinkCandidate {
+    let label = if page.title.trim().is_empty() {
+        page.text.split_whitespace().collect::<Vec<_>>().join(" ")
+    } else {
+        page.title.clone()
+    };
+    let end = (0..=label.len().min(MAX_LABEL_BYTES))
+        .rev()
+        .find(|end| label.is_char_boundary(*end))
+        .unwrap_or(0);
+    LinkCandidate {
+        url: page.final_url.clone(),
+        text: label[..end].to_owned(),
     }
 }
