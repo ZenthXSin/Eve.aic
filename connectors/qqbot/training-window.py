@@ -53,18 +53,24 @@ def collect(state_path):
               "unconfirmed": 0, "c2c_sent": 0, "group_at_sent": 0,
               "completed_turns": 0, "model_sent": 0, "failed_turns": 0, "question_replies": 0,
               "multi_question_replies": 0, "paragraphs": 0, "reply_characters": 0,
-              "feedback_candidates": 0}
-    evidence = []
+              "feedback_candidates": 0, "failed_after_tools": 0, "image_received": 0}
+    evidence, failures = [], []
     completed_inputs = {}
     for session in sessions["sessions"].values():
         identity = session["key"]["session_id"]
         for turn in session["turns"][prior_turns.get(identity, 0):]:
             if turn["status"]["state"] != "Completed":
                 counts["failed_turns"] += 1
+                failure = turn["status"].get("failure", {})
+                started = failure.get("started_tools")
+                counts["failed_after_tools"] += int(type(started) is int and started > 0)
+                failures.append({"session": identity, "turn_id": turn.get("id"), "input": turn["input"],
+                                 "status": turn["status"]})
                 continue
             counts["completed_turns"] += 1
             completed_inputs.setdefault(identity, set()).add((turn["input"], turn["status"]["messages"][-1]["text"]))
     for receipt in current_receipts:
+        counts["image_received"] += len(receipt["message"].get("attachments", []))
         status = receipt["state"]
         if status != "Sent":
             counts["failed" if status == "Failed" else "unconfirmed"] += 1
@@ -87,7 +93,7 @@ def collect(state_path):
         counts["feedback_candidates"] += int(feedback)
         evidence.append({"session": identity, "scope": msg["scope"], "message_id": msg["id"],
                          "input": msg["text"], "reply": reply, "feedback_candidate": feedback})
-    return {"evidence_status": "saved", "counts": counts, "evidence": evidence,
+    return {"evidence_status": "saved", "counts": counts, "evidence": evidence, "failures": failures,
             "limitations": ["问号数量和反馈关键词仅是可复核指标，不代表语义判断或已学会偏好。",
                             "只把 Session Completed 且 QQ Sent 的交互列为训练证据。",
                             "本地表达统计是弱示范，未更新模型权重或已确认长期偏好。",
@@ -236,7 +242,10 @@ def finish(root, output):
     # 公开 artifact 和 Actions 日志只显示计数，不含正文、路由 ID 或诊断。
     safe = {"window": report["window"], "evidence_status": report["evidence_status"], "counts": report["counts"],
             "process_ok": report["window"]["returncode"] == 0,
-            "interaction_ok": report["counts"].get("model_sent", 0) > 0,
+            "interaction_ok": (report["counts"].get("model_sent", 0) > 0
+                               and all(report["counts"].get(key, 0) == 0
+                                       for key in ("failed", "failed_turns", "unconfirmed"))),
+            "experience_acceptance": "not_evaluated",
             "training_scope": "主动提问、用户表达统计与交流证据采集；未更新模型权重或已确认长期偏好"}
     write_json(output / "training-summary.json", safe)
     print(json.dumps(safe, ensure_ascii=False), flush=True)

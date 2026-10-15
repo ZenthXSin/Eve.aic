@@ -64,6 +64,7 @@ impl ControlRunner for Runner {
                         .fail(
                             &started.lease,
                             SessionFailure {
+                                evidence: None,
                                 code: SessionFailureCode::Cancelled,
                                 started_tools: Some(self.started_tools),
                             },

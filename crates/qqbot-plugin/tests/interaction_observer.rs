@@ -122,6 +122,7 @@ impl ControlRunner for Runner {
                     .fail(
                         &started.lease,
                         SessionFailure {
+                            evidence: None,
                             code: SessionFailureCode::Provider,
                             started_tools: Some(0),
                         },
@@ -496,13 +497,18 @@ async fn completed_report_cannot_replace_session_evidence() {
         let mut h = Harness::open(
             store,
             Some(observer.clone()),
-            json!({"messages": [message("m1", "问题")]}),
+            json!({"messages": [if failed {
+                let mut incoming = message("m1", "问题");
+                incoming["expected"] = "本轮执行或状态保存未能完成。尚未启动工具调用。本轮已停止，没有自动重试；继续前需要核对现有结果。".into();
+                incoming
+            } else { message("m1", "问题") }]}),
             failed,
             !failed,
         )
         .await;
         let status = h.closed().await;
-        assert_eq!(status.sent, 0);
+        assert_eq!(status.sent, u64::from(failed));
+        assert_eq!(status.failed, u64::from(failed));
         assert_eq!(status.terminal_error, !failed);
         assert!(observer.seen.lock().unwrap().is_empty());
     }

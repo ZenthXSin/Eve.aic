@@ -4,7 +4,7 @@ use eve_llm_api::{LlmError, TurnEventKind, TurnEventSink, TurnInput};
 use eve_plugin_api::{LogEntry, LogLevel, LogRecord, Logger, PluginId, PluginState, ServiceId};
 use eve_session_api::{
     SESSION_PLUGIN_ID, SESSION_SERVICE_ID, SessionError, SessionFailure, SessionFailureCode,
-    SessionInput, SessionService, SessionServiceHandle, TurnLease,
+    SessionFailureEvidence, SessionInput, SessionService, SessionServiceHandle, TurnLease,
 };
 use std::{fmt, sync::Arc, time::SystemTime};
 
@@ -82,6 +82,7 @@ impl Drop for LeaseGuard {
                 .fail(
                     &self.lease,
                     SessionFailure {
+                        evidence: None,
                         code: SessionFailureCode::Cancelled,
                         started_tools: None,
                     },
@@ -236,6 +237,19 @@ impl SessionLlmHost {
             },
             Err(failure) => {
                 let summary = SessionFailure {
+                    evidence: (failure.error.provider_http_status().is_some()
+                        || !failure.diagnostics.calls.is_empty()
+                        || !failure.diagnostics.tool_results.is_empty())
+                    .then(|| SessionFailureEvidence {
+                        provider_http_status: failure.error.provider_http_status(),
+                        tool_names: failure
+                            .diagnostics
+                            .calls
+                            .iter()
+                            .map(|call| call.name.clone())
+                            .collect(),
+                        tool_results: failure.diagnostics.tool_results.clone(),
+                    }),
                     code: failure_code(&failure.error),
                     started_tools: Some(failure.diagnostics.started_tools as u64),
                 };

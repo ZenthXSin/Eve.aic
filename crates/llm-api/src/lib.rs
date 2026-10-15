@@ -433,6 +433,23 @@ impl fmt::Display for LlmError {
         }
     }
 }
+impl LlmError {
+    /// 只提取本地 HTTP 适配器的固定状态码，不把供应商错误正文带入记录或回复。
+    pub fn provider_http_status(&self) -> Option<u16> {
+        let Self::Provider(message) = self else {
+            return None;
+        };
+        let digits = message.strip_prefix("OpenAI HTTP ")?;
+        if digits.len() != 3 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        digits
+            .parse::<u16>()
+            .ok()
+            .filter(|status| (100..=599).contains(status))
+    }
+}
+
 impl std::error::Error for LlmError {}
 
 pub trait LlmProvider: Send + Sync {
@@ -808,5 +825,29 @@ mod tests {
             tools: vec![definition("demo"), definition("demo")],
         };
         assert!(request.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod http_failure_status_tests {
+    use super::LlmError;
+    #[test]
+    fn only_fixed_http_adapter_codes_are_safe_diagnostics() {
+        assert_eq!(
+            LlmError::Provider("OpenAI HTTP 402".into()).provider_http_status(),
+            Some(402)
+        );
+        for message in [
+            "OpenAI HTTP 402 secret",
+            "OpenAI HTTP 099",
+            "OpenAI HTTP 600",
+            "HTTP 402",
+            "secret",
+        ] {
+            assert_eq!(
+                LlmError::Provider(message.into()).provider_http_status(),
+                None
+            );
+        }
     }
 }

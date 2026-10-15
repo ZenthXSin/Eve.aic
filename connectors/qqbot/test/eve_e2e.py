@@ -498,8 +498,13 @@ class Acceptance(unittest.TestCase):
             if event.get("direction") == "out" and event.get("type") == "reply"]
 
     def assert_cancelled(self, turn, tools=0):
-        self.assertEqual(turn["status"], {"state": "Failed", "failure": {
-            "code": "Cancelled", "started_tools": tools}})
+        self.assertEqual(turn["status"]["state"], "Failed")
+        failure = dict(turn["status"]["failure"])
+        evidence = failure.pop("evidence", None)
+        self.assertEqual(failure, {"code": "Cancelled", "started_tools": tools})
+        if evidence is not None:
+            self.assertIsNone(evidence["provider_http_status"])
+            self.assertEqual(set(evidence), {"provider_http_status", "tool_names", "tool_results"})
 
     def test_explicit_cancel_inflight_filters_old_reply_and_restart_does_not_replay(self):
         self.provider_steps[1] = {"wait": "never-release-old", "text": "old-result"}

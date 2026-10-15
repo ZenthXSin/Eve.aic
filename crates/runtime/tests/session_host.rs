@@ -475,6 +475,7 @@ async fn context_history_conflict_is_recorded_before_network() {
         rig.snapshot("s").turns[0].status,
         SessionTurnStatus::Failed {
             failure: SessionFailure {
+                evidence: None,
                 code: SessionFailureCode::Context,
                 started_tools: Some(0)
             }
@@ -522,15 +523,22 @@ async fn provider_protocol_unsupported_and_round_limit_failures_are_not_replayed
             rig.host.run_turn(input("s", "失败输入")).await,
             Err(SessionRunError::Turn(_))
         ));
+        let SessionTurnStatus::Failed { failure } = rig.snapshot("s").turns[0].status.clone()
+        else {
+            panic!("must stay failed")
+        };
+        assert_eq!(failure.code, code);
+        assert_eq!(failure.started_tools, Some(started));
         assert_eq!(
-            rig.snapshot("s").turns[0].status,
-            SessionTurnStatus::Failed {
-                failure: SessionFailure {
-                    code,
-                    started_tools: Some(started)
-                }
-            }
+            failure
+                .evidence
+                .as_ref()
+                .map_or(0, |e| e.tool_results.len()),
+            if started > 0 { 2 } else { 0 }
         );
+        if started > 0 {
+            assert_eq!(failure.evidence.as_ref().unwrap().tool_names.len(), 2);
+        }
         assert!(rig.snapshot("s").history().is_empty());
         rig.host.run_turn(input("s", "明确新输入")).await.unwrap();
         assert_eq!(
@@ -547,8 +555,8 @@ async fn provider_protocol_unsupported_and_round_limit_failures_are_not_replayed
                 .as_deref(),
             Some("明确新输入")
         );
-        assert!(
-            !provider
+        assert_eq!(
+            provider
                 .requests
                 .lock()
                 .unwrap()
@@ -556,7 +564,11 @@ async fn provider_protocol_unsupported_and_round_limit_failures_are_not_replayed
                 .unwrap()
                 .messages
                 .iter()
-                .any(|m| m.text.as_deref() == Some("失败输入"))
+                .any(|m| m
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("宿主失败记录"))),
+            started > 0
         );
         assert_eq!(rig.starts.load(Ordering::SeqCst), started as usize);
         rig.stop().await;
@@ -617,6 +629,7 @@ async fn provider_timeout_records_failure_and_releases_admission() {
         rig.snapshot("s").turns[0].status,
         SessionTurnStatus::Failed {
             failure: SessionFailure {
+                evidence: None,
                 code: SessionFailureCode::ProviderTimeout,
                 started_tools: Some(0)
             }
@@ -740,6 +753,7 @@ async fn cancellation_records_unknown_side_effects_or_preserves_pending_with_dia
                 rig.snapshot("private-session").turns[0].status,
                 SessionTurnStatus::Failed {
                     failure: SessionFailure {
+                        evidence: None,
                         code: SessionFailureCode::Cancelled,
                         started_tools: None
                     }
