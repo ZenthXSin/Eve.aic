@@ -161,6 +161,12 @@ impl LlmProvider for BudgetedProvider {
             self.inner.complete(request).await
         })
     }
+    fn complete_json(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
+        Box::pin(async move {
+            self.admit()?;
+            self.inner.complete_json(request).await
+        })
+    }
     fn stream<'a>(
         &'a self,
         request: ModelRequest,

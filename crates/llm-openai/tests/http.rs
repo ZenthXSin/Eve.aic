@@ -18,6 +18,22 @@ fn config(url: &str) -> OpenAiConfig {
     }
 }
 
+#[tokio::test]
+async fn responses_json_completion_uses_text_format_without_changing_ordinary_chat() {
+    let mut server = Server::start(vec![
+        Reply::json(final_response("{}")),
+        Reply::json(final_response("自然回复")),
+    ])
+    .await;
+    let provider = OpenAiProvider::new(config(&server.url), "fake-key").unwrap();
+    provider.complete_json(request()).await.unwrap();
+    let body = server.next().await.body;
+    assert_eq!(body["text"]["format"], json!({"type":"json_object"}));
+    assert!(body.get("response_format").is_none());
+    provider.complete(request()).await.unwrap();
+    assert!(server.next().await.body.get("text").is_none());
+}
+
 #[test]
 fn validates_config_and_credentials_without_network_or_secret_diagnostics() {
     for url in [

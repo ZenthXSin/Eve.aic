@@ -438,6 +438,12 @@ impl std::error::Error for LlmError {}
 pub trait LlmProvider: Send + Sync {
     fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse>;
 
+    /// 请求 JSON 对象文本；实现可启用模型的 JSON 模式。兼容旧 Provider 时仍沿用
+    /// complete；调用方必须自行严格检查 JSON、字段及业务约束，不能信任格式承诺。
+    fn complete_json(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
+        self.complete(request)
+    }
+
     /// 增量仅供暂时显示；成功返回值才是经验证的完整请求终态。
     /// 丢弃 Future 停止本地读取；不支持时明确失败，不自动降级。
     fn stream<'a>(

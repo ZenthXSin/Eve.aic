@@ -199,6 +199,37 @@ impl LlmProvider for Echo {
             })
         })
     }
+    fn complete_json(&self, _request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(ModelResponse::Final { text: "{}".into() }) })
+    }
+}
+
+#[tokio::test]
+async fn json_request_keeps_its_mode_and_reserves_before_sending_without_refund() {
+    let world = World::new();
+    let (kernel, budget) = world
+        .open(BudgetPolicy {
+            window_ms: MAX_WINDOW_MS,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    let echo = Arc::new(Echo {
+        calls: AtomicUsize::new(0),
+    });
+    let resolver =
+        BudgetedResolver::new(Arc::new(Fixed(echo.clone())), Arc::new(budget), "skill").unwrap();
+    let selection = resolver.resolve().unwrap();
+    let pending = selection.provider.complete_json(request());
+    assert_eq!(echo.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        pending.await.unwrap(),
+        ModelResponse::Final { text: "{}".into() }
+    );
+    assert!(selection.provider.complete_json(request()).await.is_err());
+    assert_eq!(echo.calls.load(Ordering::SeqCst), 1);
+    kernel.stop_all().await.unwrap();
 }
 struct Fixed(Arc<Echo>);
 impl LlmModelResolver for Fixed {

@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import signal
 import secrets
+import shutil
 import subprocess
 import threading
 import time
@@ -54,13 +55,18 @@ class Trial:
         self.local_token = secrets.token_urlsafe(32)
         self.root = args.output.resolve()
         self.root.mkdir(mode=0o700, parents=True, exist_ok=False)
+        # 四次独立启动固定使用同一份程序，后续本地构建不会混入本轮证据。
+        self.binary = self.root / ("eve-qqbot" + args.binary.suffix)
+        shutil.copyfile(args.binary, self.binary)
+        self.binary.chmod(0o700)
         self.lock = threading.Lock()
         self.records = []
         self.phase = 0
         self.child = None
         self.handles = []
         self.report = {"transport": "local_protocol_fixture", "official_qq_tested": False,
-                       "binary_sha256": digest(args.binary), "model": args.model,
+                       "binary_sha256": digest(self.binary), "model": args.model,
+                       "max_output_tokens": args.max_output_tokens,
                        "runtime_program_or_jar_sha256": digest(args.mindustry_server or args.browser)}
         try:
             self.report["source_commit"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, stderr=subprocess.DEVNULL, text=True).strip()
@@ -190,9 +196,9 @@ class Trial:
         env.update(QQBOT_APP_ID=APP, QQBOT_APP_SECRET="internal-protocol-fixture",
             EVE_OPENAI_API_KEY=self.local_token, EVE_OPENAI_MODEL=self.args.model,
             EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}", EVE_OPENAI_PROTOCOL="chat",
-            EVE_OPENAI_MAX_OUTPUT_TOKENS="8192", EVE_OPENAI_TIMEOUT_SECONDS="90", EVE_LLM_RESPONSE_MODE="complete",
+            EVE_OPENAI_MAX_OUTPUT_TOKENS=str(self.args.max_output_tokens), EVE_OPENAI_TIMEOUT_SECONDS="90", EVE_LLM_RESPONSE_MODE="complete",
             EVE_DEVELOPER_CONFIG=str(self.root / "developer.json"))
-        command = [str(self.args.binary), "--state-dir", str(self.root / "state"), "--agent", str(self.args.agent),
+        command = [str(self.binary), "--state-dir", str(self.root / "state"), "--agent", str(self.args.agent),
             "--bridge-script", str(BRIDGE), "--bridge-arg", str(self.root / f"scenario-{self.phase}.json"),
             "--interest-learning", "--interest-cooldown-ms", "0", "--cognition-max-executions", "8",
             "--memory-recall", "--segmented", "--skill-learning", "--tool-forging", "--agenda-context", "--clarify",
@@ -306,6 +312,7 @@ def main():
     runtime.add_argument("--browser", type=Path)
     parser.add_argument("--record-text", action="store_true")
     parser.add_argument("--max-requests", type=int, default=100)
+    parser.add_argument("--max-output-tokens", type=int, default=4096)
     parser.add_argument("--stage-timeout", type=int, default=360)
     args = parser.parse_args()
     url = urllib.parse.urlsplit(args.endpoint)
@@ -313,6 +320,8 @@ def main():
         parser.error("endpoint 必须是没有用户信息、查询或片段的完整 HTTPS Chat Completions 地址")
     if not 1 <= args.max_requests <= 200 or not 30 <= args.stage_timeout <= 600:
         parser.error("请求上限须为1至200，阶段期限须为30至600秒")
+    if not 256 <= args.max_output_tokens <= 16384:
+        parser.error("单次输出 token 上限须为256至16384")
     key = os.environ.get("EVE_OPENAI_API_KEY", "")
     if not key.strip():
         parser.error("须在私有环境中设置 EVE_OPENAI_API_KEY")
