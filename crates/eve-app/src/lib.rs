@@ -7,6 +7,7 @@ mod cognition_plan;
 mod config;
 mod console;
 mod developer;
+mod dialogue;
 mod error;
 mod input;
 mod memory_cli;
@@ -18,6 +19,7 @@ mod qq_budget;
 mod qq_clarify;
 mod qq_cognition;
 mod qq_completion;
+mod qq_conversation;
 mod qq_help;
 mod qq_host_facts;
 mod qq_interest;
@@ -336,6 +338,8 @@ pub(crate) async fn install_core_with_pages(
         runtime_llm_schema(),
         config::openai_schema(),
         config::model_uses_schema(),
+        config::memory_digest_schema(),
+        config::dialogue_schema(),
         qq_message_judge::provider_schema(),
         model_roles_schema(),
         eve_message_api::message_schema(),

@@ -339,7 +339,7 @@ class MemoryAcceptance(unittest.TestCase):
         self.assertEqual([item["text"] for item in first[0]["preferences"]], [PREFERENCE])
         self.assertEqual([item["text"] for item in corrected[0]["preferences"]], [CORRECTION])
         self.assertEqual(revoked, [])
-        self.assertTrue(any("主动提问训练模式" in (message.get("content") or "")
+        self.assertTrue(any("从交互中学习表达" in (message.get("content") or "")
                             for message in self.requests[0]["body"]["messages"]))
         preference = self.only_snapshot()["preferences"][0]
         self.assertEqual([version["status"] for version in preference["history"]],

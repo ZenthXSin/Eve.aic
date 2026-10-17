@@ -32,15 +32,18 @@ def samples(evidence, limit=MAX_SAMPLES):
     return selected
 
 
-def generate(prompt, identity, record, timeout):
+def generate(prompt, identity, record, timeout, response_policy=None):
     messages = [{"role": "system", "content": identity}, {"role": "system", "content": prompt}]
     for turn in record["history"]:
         messages.extend([{"role": "user", "content": turn["input"]}, {"role": "assistant", "content": turn["reply"]}])
+    if response_policy:
+        messages.append({"role": "system", "content": response_policy})
     messages.append({"role": "user", "content": record["input"]})
     return review.chat(messages, 4096, timeout)
 
 
-def compare(evidence, baseline, candidate, identity, generator=generate, evaluator=review.judge, clock=time.monotonic):
+def compare(evidence, baseline, candidate, identity, generator=generate, evaluator=review.judge, clock=time.monotonic,
+            candidate_identity=None, candidate_response_policy=None):
     selected = samples(evidence)
     deadline = clock() + 600
     rows, requests, failures = [], 0, Counter()
@@ -51,7 +54,9 @@ def compare(evidence, baseline, candidate, identity, generator=generate, evaluat
                 break
             requests += 1
             try:
-                text = generator(prompt, identity, record, timeout=min(30, max(0.1, deadline - clock())))
+                selected_identity = identity if variant == "baseline" or candidate_identity is None else candidate_identity
+                extra = {"response_policy": candidate_response_policy} if variant == "candidate" and candidate_response_policy else {}
+                text = generator(prompt, selected_identity, record, timeout=min(30, max(0.1, deadline - clock())), **extra)
                 if type(text) is not str or not text.strip() or len(text.encode()) > 32768:
                     raise ValueError("model_protocol")
             except (ValueError, TypeError, KeyError, IndexError, AttributeError, OSError) as error:
@@ -101,8 +106,10 @@ def compare(evidence, baseline, candidate, identity, generator=generate, evaluat
                "advisory_improved": non_regression and any(new < old for old, new in zip(*metrics)),
                "question_assessment_resolved": resolved,
                "assessment": "same_inputs_two_recent_turns_model_advisory",
+               "same_identity": candidate_identity is None or candidate_identity == identity,
+               "candidate_response_policy": bool(candidate_response_policy),
                "limitations": ["优先覆盖旧多问号候选及分布样本，最多12对；不代表全量用户质量。",
-                               "两种策略使用同一身份、输入和最近两轮历史；不含工具或QQ发送。",
+                               "两种策略使用同一输入和最近两轮历史；身份是否一致由 same_identity 标明，不含工具或QQ发送。",
                                "分类只为主模型建议，长期偏好和真人满意度仍需另外验收。"]}
     return summary, rows
 
@@ -113,31 +120,43 @@ def main():
     source.add_argument("--source", type=Path)
     source.add_argument("--synthetic", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--baseline-prompt", type=Path, default=ROOT / "crates/training-plugin/src/prompt-v4.txt")
+    parser.add_argument("--candidate-prompt", type=Path, default=ROOT / "crates/training-plugin/src/prompt-v5.txt")
+    parser.add_argument("--baseline-agent", type=Path)
+    parser.add_argument("--candidate-policy", type=Path, default=ROOT / "crates/eve-app/src/dialogue-policy.txt")
     args = parser.parse_args()
     try:
-        baseline = (ROOT / "crates/training-plugin/src/prompt-v2.txt").read_text().strip()
-        candidate = (ROOT / "crates/training-plugin/src/prompt-v3.txt").read_text().strip()
+        baseline = args.baseline_prompt.read_text().strip()
+        candidate = args.candidate_prompt.read_text().strip()
         identity = (ROOT / "AGENT.md").read_text()
+        baseline_identity = args.baseline_agent.read_text() if args.baseline_agent else identity
+        response_policy = args.candidate_policy.read_text().strip()
         if args.synthetic:
             fixture = ROOT / "connectors/qqbot/test/fixtures/training-public-cases.json"
-            summary, _ = compare(json.loads(fixture.read_bytes()), baseline, candidate, identity)
+            summary, _ = compare(json.loads(fixture.read_bytes()), baseline, candidate, baseline_identity,
+                                 candidate_identity=identity, candidate_response_policy=response_policy)
             summary.update(version=1, evidence_kind="public_synthetic",
                            fixture_sha256=hashlib.sha256(fixture.read_bytes()).hexdigest())
             summary["assessment"] = "public_synthetic_same_inputs_model_advisory"
             summary["limitations"] = ["12 个独立新写的公开场景，不读取或解密真实交流。",
                                       "覆盖短答、口语、任务、拒绝提问与自然段；不代表真实用户满意度。",
-                                      "当前新版真实记录复核未追加执行，长期偏好仍待实现。"]
+                                      "不验证完整宿主工具、记忆装配、正式QQ或真人满意度。"]
         else:
             with tempfile.TemporaryDirectory(prefix="eve-training-compare-") as directory:
                 root = Path(directory)
                 saved = review.verify_source(args.source, root / "source")
-                summary, rows = compare(saved["evidence"], baseline, candidate, identity)
+                summary, rows = compare(saved["evidence"], baseline, candidate, baseline_identity,
+                                        candidate_identity=identity, candidate_response_policy=response_policy)
                 summary.update(version=1, source_sha=saved["window"]["source_sha"])
                 private = root / "comparison"
                 private.mkdir()
                 review.window.write_json(private / "training-report.json", {"summary": summary, "outputs": rows})
                 review.window.seal(private, args.output.with_suffix(".enc"))
         summary["candidate_prompt_sha256"] = hashlib.sha256(candidate.encode()).hexdigest()
+        summary["baseline_prompt_sha256"] = hashlib.sha256(baseline.encode()).hexdigest()
+        summary["baseline_agent_sha256"] = hashlib.sha256(baseline_identity.encode()).hexdigest()
+        summary["candidate_agent_sha256"] = hashlib.sha256(identity.encode()).hexdigest()
+        summary["candidate_policy_sha256"] = hashlib.sha256(response_policy.encode()).hexdigest()
         review.window.write_json(args.output, summary)
         print(json.dumps(summary, ensure_ascii=False))
         if not summary["complete"] or not summary["advisory_non_regression"]:

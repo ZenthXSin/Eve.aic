@@ -15,6 +15,7 @@ struct CapturedModel {
     role_revision: Option<u64>,
     /// 用途配置的单次输出上限；None 表示沿用主模型。
     use_limit: Option<u32>,
+    natural_style: bool,
 }
 struct CachedModel {
     captured: CapturedModel,
@@ -138,11 +139,25 @@ fn capture(
             }
             None => None,
         };
+        let natural_style = if use_name == Some("dialogue") {
+            let snapshot = settings
+                .snapshot(crate::dialogue::NAMESPACE, 1)
+                .map_err(|error| LlmError::Configuration(error.to_string()))?;
+            if provider.revision != snapshot.revision {
+                continue;
+            }
+            snapshot
+                .get("natural_style")
+                .map_err(|error| LlmError::Configuration(error.to_string()))?
+        } else {
+            false
+        };
         return Ok(CapturedModel {
             provider,
             primary,
             role_revision,
             use_limit,
+            natural_style,
         });
     }
     Err(LlmError::Configuration(
@@ -162,9 +177,16 @@ impl LlmModelResolver for CoreModelResolver {
             return Ok(previous.selected.clone());
         }
         let config = selected_config(&captured)?;
+        let provider_timeout = config.request_timeout;
+        let provider: Arc<dyn eve_llm_api::LlmProvider> =
+            Arc::new(OpenAiProvider::new(config, &self.api_key)?);
         let selected = ModelSelection {
-            provider_timeout: config.request_timeout,
-            provider: Arc::new(OpenAiProvider::new(config, &self.api_key)?),
+            provider_timeout,
+            provider: if captured.natural_style {
+                Arc::new(crate::dialogue::NaturalDialogue(provider))
+            } else {
+                provider
+            },
         };
         *cached = Some(CachedModel {
             captured,

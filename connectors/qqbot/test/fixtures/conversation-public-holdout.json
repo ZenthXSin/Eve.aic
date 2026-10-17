@@ -1,0 +1,8 @@
+[
+  {"session":"holdout-home","input":"回来了，刚把屋子收拾完。","reply":"回来啦。"},
+  {"session":"holdout-rest","input":"这会儿只想放空一会儿。","reply":"那就歇会儿。"},
+  {"session":"holdout-win","input":"我今天终于把卡了很久的关打过了。","reply":"这下痛快了。"},
+  {"session":"holdout-name","input":"叫我阿禾就好，不用一直叫。","reply":"好，阿禾。"},
+  {"session":"holdout-close","input":"嗯，先这样。","reply":"好。"},
+  {"session":"holdout-rewrite","input":"帮我把“感谢您的耐心等待”换成平常聊天会说的话。","reply":"久等啦。"}
+]

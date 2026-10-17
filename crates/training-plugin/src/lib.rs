@@ -13,7 +13,7 @@ const KEY: &str = "modes.v1";
 const MAX_MODES: usize = 256;
 const MAX_BYTES: usize = 262_144;
 const PROMPT_OFF: &str = "当前主动提问训练已关闭。按当前请求正常交流，不因为历史中的 /train start 继续训练问卷；如果用户希望恢复专门训练，提示使用 /train start。必要的任务澄清问题不受影响。";
-const PROMPT: &str = include_str!("prompt-v4.txt");
+const PROMPT: &str = include_str!("prompt-v5.txt");
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -134,6 +134,27 @@ impl TrainingService for StoredModes {
         }
         Ok(inner.expressions.snapshot(None))
     }
+    fn is_expression_source(
+        &self,
+        scope: &ContextScope,
+        id: &str,
+        text: &str,
+    ) -> PluginResult<bool> {
+        if !valid(scope) {
+            return Err(error("训练会话作用域无效"));
+        }
+        let inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
+        if inner.context.is_none() {
+            return Err(error("训练服务已停止"));
+        }
+        let enabled = inner
+            .snapshot
+            .modes
+            .iter()
+            .find(|m| m.scope == *scope)
+            .map_or(self.default_enabled, |m| m.enabled);
+        Ok(enabled && inner.expressions.contains(scope, id, text))
+    }
     fn reset_expression(&self, scope: &ContextScope) -> PluginResult<()> {
         if !valid(scope) {
             return Err(error("训练会话作用域无效"));
@@ -196,7 +217,7 @@ impl ContextAssembler for TrainingContext {
                 s.question_percent, s.formal_percent, s.casual_percent
             )).unwrap_or_default();
             let base_revision = if enabled {
-                "eve-training-4"
+                "eve-training-5"
             } else {
                 "eve-training-disabled-1"
             };
