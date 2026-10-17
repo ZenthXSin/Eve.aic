@@ -1026,6 +1026,16 @@ async fn run_qqbot_composed(
             }
             None => context,
         };
+        // 宿主实际保存了什么、单次回复上限多少，作为数据交给对话，避免模型对用户说错或长文被截断。
+        let context: Arc<dyn ContextAssembler> = Arc::new(crate::qq_host_facts::HostFactsContext {
+            wrapped: context,
+            registry: registry.clone(),
+            memory: options.memory,
+            interests: interests.as_ref().map(|_| {
+                Arc::new(interest_settings.clone())
+                    as Arc<dyn eve_interest_api::InterestSettingsReader>
+            }),
+        });
         // 已启用的技能作为对话工具：只能调用当前用户自己的技能，每次调用都实际运行验证。
         let skill_runner: Arc<std::sync::OnceLock<Arc<dyn PracticeRunner>>> = Arc::default();
         // 待办完成确认：私聊时交给对话等待用户确认的待办；用户明确说完成了才调用确认工具。

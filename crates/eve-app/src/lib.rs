@@ -19,6 +19,7 @@ mod qq_clarify;
 mod qq_cognition;
 mod qq_completion;
 mod qq_help;
+mod qq_host_facts;
 mod qq_interest;
 mod qq_learning;
 mod qq_learning_commands;
