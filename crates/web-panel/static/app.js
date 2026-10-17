@@ -327,7 +327,15 @@
   const roleLabels = {
     dialogue: "对话", interest: "兴趣观察", research: "研究", practice: "实践", skill: "技能",
     forge: "工具锻造", outreach: "主动交流", clarify: "请求澄清", plan: "计划建议",
+    preference: "偏好提炼", reflection: "反思",
   };
+  const sourceLabels = { override: "面板或配置文件覆盖", environment: "环境变量", default: "默认值" };
+
+  function limitText(tokens, key, source) {
+    const amount = Number.isInteger(tokens) ? `单次输出上限 ${count(tokens)}` : "单次输出上限未设置，由服务端决定";
+    const from = sourceLabels[source] ? `（${sourceLabels[source]}）` : "";
+    return `${amount}，取自 ${text(key, "未知配置")}${from}`;
+  }
   const failureLabels = {
     payment_required: "额度不足，或按当前上下文与单次输出上限不可负担",
     rate_limited: "被限流",
@@ -354,7 +362,7 @@
     const model = body.model;
     $("readiness-model").textContent = model ? `${text(model.model, "未知")}（${text(model.protocol, "未知协议")}）` : "配置无法读取";
     $("readiness-limit").textContent = model
-      ? (Number.isInteger(model.max_output_tokens) ? `单次输出上限 ${count(model.max_output_tokens)}` : "单次输出上限未设置，由服务端决定") + `，取自 ${text(model.max_output_tokens_key, "未知配置")}`
+      ? limitText(model.max_output_tokens, model.max_output_tokens_key, model.max_output_tokens_source)
       : "—";
     $("readiness-vision").textContent = body.vision === "not_configured" ? "未配置" : "未知";
     const list = $("readiness-roles");
@@ -371,6 +379,8 @@
       }
       if (Number.isFinite(role.last_success_at_ms)) parts.push(`最近成功：${goalDate(role.last_success_at_ms)}`);
       if (role.state === "unverified") parts.push("本进程还没有这项用途的请求");
+      const limit = role.output_limit;
+      parts.push(limit ? limitText(limit.max_output_tokens, limit.key, limit.source) : "单次输出上限无法读取");
       row.append(node("strong", "", text(roleLabels[role.role], role.role)), node("span", `badge ${style}`.trim(), label), node("span", "role-detail", parts.join(" · ")));
       list.append(row);
     }

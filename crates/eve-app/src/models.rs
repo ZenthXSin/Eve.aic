@@ -1,8 +1,8 @@
 //! 核心主模型的每轮解析实现；读取公开配置契约，不把模型配置交给 Kernel。
 use crate::config;
 use eve_config_api::{
-    ConfigService, ConfigSnapshot, MODELS_NAMESPACE, MODELS_SCHEMA_VERSION, ModelProfile,
-    ModelRolesConfig,
+    ConfigService, ConfigSnapshot, ConfigSource, MODELS_NAMESPACE, MODELS_SCHEMA_VERSION,
+    ModelProfile, ModelRolesConfig,
 };
 use eve_llm_api::{LlmError, LlmModelResolver, ModelSelection};
 use eve_llm_openai::OpenAiProvider;
@@ -13,6 +13,8 @@ struct CapturedModel {
     provider: ConfigSnapshot,
     primary: Option<ModelProfile>,
     role_revision: Option<u64>,
+    /// 用途配置的单次输出上限；None 表示沿用主模型。
+    use_limit: Option<u32>,
 }
 struct CachedModel {
     captured: CapturedModel,
@@ -23,6 +25,7 @@ struct CachedModel {
 pub(crate) struct CoreModelResolver {
     settings: Arc<dyn ConfigService>,
     api_key: String,
+    use_name: Option<String>,
     cached: Mutex<Option<CachedModel>>,
 }
 impl CoreModelResolver {
@@ -30,12 +33,19 @@ impl CoreModelResolver {
         Self {
             settings,
             api_key,
+            use_name: None,
             cached: Mutex::new(None),
         }
     }
 
+    /// 按用途读取 runtime.model_uses 中的单次输出上限；宿主须登记该命名空间，缺失时解析失败。
+    pub(crate) fn with_use(mut self, name: &str) -> Self {
+        self.use_name = Some(name.into());
+        self
+    }
+
     fn capture(&self) -> Result<CapturedModel, LlmError> {
-        capture(&*self.settings)
+        capture(&*self.settings, self.use_name.as_deref())
     }
 }
 
@@ -44,15 +54,24 @@ pub(crate) struct ModelSummary {
     pub(crate) model: String,
     pub(crate) protocol: &'static str,
     pub(crate) max_output_tokens: Option<u32>,
-    /// 单次输出上限取自哪个配置键。
-    pub(crate) max_output_tokens_key: &'static str,
+    /// 单次输出上限取自哪个配置键（命名空间.字段）。
+    pub(crate) max_output_tokens_key: String,
+    /// 该键当前生效值的来源；配置服务不提供时为空。
+    pub(crate) max_output_tokens_source: Option<ConfigSource>,
 }
 
-/// 按与每轮解析相同的规则读取当前主模型配置。
-pub(crate) fn summary(settings: &dyn ConfigService) -> Result<ModelSummary, LlmError> {
-    let captured = capture(settings)?;
-    let config = config::provider_config(&captured.provider, captured.primary.as_ref())
-        .map_err(|error| LlmError::Configuration(error.to_string()))?;
+/// 按与每轮解析相同的规则读取当前模型配置；给出用途时按该用途的单次输出上限。
+pub(crate) fn summary(
+    settings: &dyn ConfigService,
+    use_name: Option<&str>,
+) -> Result<ModelSummary, LlmError> {
+    let captured = capture(settings, use_name)?;
+    let config = selected_config(&captured)?;
+    let (namespace, field) = match (use_name, captured.use_limit, &captured.primary) {
+        (Some(name), Some(_), _) => (config::MODEL_USES_NAMESPACE, config::use_limit_field(name)),
+        (_, _, Some(_)) => (MODELS_NAMESPACE, "primary_max_output_tokens".into()),
+        _ => (config::OPENAI_NAMESPACE, "max_output_tokens".into()),
+    };
     Ok(ModelSummary {
         model: config.model,
         protocol: match config.protocol {
@@ -60,15 +79,25 @@ pub(crate) fn summary(settings: &dyn ConfigService) -> Result<ModelSummary, LlmE
             eve_llm_openai::OpenAiProtocol::ChatCompletions => "chat",
         },
         max_output_tokens: config.max_output_tokens,
-        max_output_tokens_key: if captured.primary.is_some() {
-            "runtime.models.primary_max_output_tokens"
-        } else {
-            "provider.openai.max_output_tokens"
-        },
+        max_output_tokens_source: settings.field_source(namespace, &field).ok(),
+        max_output_tokens_key: format!("{namespace}.{field}"),
     })
 }
 
-fn capture(settings: &dyn ConfigService) -> Result<CapturedModel, LlmError> {
+/// 主模型配置叠加用途上限；用途上限只替换单次输出上限，不改变模型、端点或期限。
+fn selected_config(captured: &CapturedModel) -> Result<eve_llm_openai::OpenAiConfig, LlmError> {
+    let mut config = config::provider_config(&captured.provider, captured.primary.as_ref())
+        .map_err(|error| LlmError::Configuration(error.to_string()))?;
+    if let Some(limit) = captured.use_limit {
+        config.max_output_tokens = Some(limit);
+    }
+    Ok(config)
+}
+
+fn capture(
+    settings: &dyn ConfigService,
+    use_name: Option<&str>,
+) -> Result<CapturedModel, LlmError> {
     // 两个命名空间沿用同一 ConfigDocument revision；有界重读避免混用修订。
     for _ in 0..4 {
         let provider = settings
@@ -94,10 +123,26 @@ fn capture(settings: &dyn ConfigService) -> Result<CapturedModel, LlmError> {
             }
             None => (None, None),
         };
+        let use_limit = match use_name {
+            Some(name) => {
+                let snapshot = settings
+                    .snapshot(config::MODEL_USES_NAMESPACE, 1)
+                    .map_err(|error| LlmError::Configuration(error.to_string()))?;
+                if provider.revision != snapshot.revision {
+                    continue;
+                }
+                let limit: u32 = snapshot
+                    .get(&config::use_limit_field(name))
+                    .map_err(|error| LlmError::Configuration(error.to_string()))?;
+                (limit != 0).then_some(limit)
+            }
+            None => None,
+        };
         return Ok(CapturedModel {
             provider,
             primary,
             role_revision,
+            use_limit,
         });
     }
     Err(LlmError::Configuration(
@@ -116,8 +161,7 @@ impl LlmModelResolver for CoreModelResolver {
         {
             return Ok(previous.selected.clone());
         }
-        let config = config::provider_config(&captured.provider, captured.primary.as_ref())
-            .map_err(|error| LlmError::Configuration(error.to_string()))?;
+        let config = selected_config(&captured)?;
         let selected = ModelSelection {
             provider_timeout: config.request_timeout,
             provider: Arc::new(OpenAiProvider::new(config, &self.api_key)?),

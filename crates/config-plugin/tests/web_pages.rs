@@ -72,8 +72,25 @@ async fn granted_pages_commit_patches_keep_snapshots_and_recover_after_restart()
         .value
         .downcast::<ConfigServiceHandle>()
         .unwrap();
+    let source = |field: &str| settings.0.field_source(LLM_NAMESPACE, field);
+    assert_eq!(
+        source(MAX_PARALLEL_TOOL_CALLS),
+        Ok(ConfigSource::Environment)
+    );
+    assert_eq!(source(RESPONSE_MODE), Ok(ConfigSource::Default));
+    assert!(matches!(
+        source("missing"),
+        Err(ConfigError::UnknownField(_))
+    ));
+    assert!(matches!(
+        settings.0.field_source("missing", RESPONSE_MODE),
+        Err(ConfigError::UnknownNamespace(_))
+    ));
     let captured = settings.0.begin_request(LLM_NAMESPACE, 1).unwrap();
     let saved = provider.0.save(&change, &permit).unwrap();
+    assert_eq!(source(MAX_PARALLEL_TOOL_CALLS), Ok(ConfigSource::Override));
+    // 需重启的字段仍按启动时的值生效，来源也按启动时说明。
+    assert_eq!(source(RESPONSE_MODE), Ok(ConfigSource::Default));
     assert_eq!(saved.revision, 1);
     assert_eq!(
         saved.restart_required,

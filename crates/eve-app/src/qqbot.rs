@@ -1201,9 +1201,14 @@ async fn run_qqbot_composed(
                         .downcast::<ConfigServiceHandle>()
                         .map_err(|_| "偏好提炼配置服务类型错误")?;
                     let key = std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "缺少模型凭据")?;
-                    let resolver = Arc::new(crate::models::CoreModelResolver::new(
-                        settings.0.clone(),
-                        key,
+                    model_health.register("preference");
+                    let resolver = Arc::new(eve_model_health::ObservedResolver::new(
+                        Arc::new(
+                            crate::models::CoreModelResolver::new(settings.0.clone(), key)
+                                .with_use("preference"),
+                        ),
+                        "preference",
+                        model_health.clone(),
                     ));
                     Arc::new(ModelPreferenceExtractor::new(resolver))
                 }
@@ -1239,6 +1244,7 @@ async fn run_qqbot_composed(
                     Arc::new(interest_settings.clone())
                         as Arc<dyn eve_interest_api::InterestSettingsReader>
                 }),
+                model_health.clone(),
             )
             .await?;
             let commands = started.commands.clone();
@@ -1249,25 +1255,25 @@ async fn run_qqbot_composed(
             qq_cognition::Commands::disabled()
         };
         // 兴趣观察与受控研究共用主模型配置；只在需要默认模型实现时读取凭据。
-        let core_resolver = || -> Result<Arc<dyn eve_llm_api::LlmModelResolver>, AppError> {
-            let settings = registry
-                .get(&ServiceId::new(CONFIG_SERVICE_ID)?)?
-                .ok_or("兴趣学习配置服务缺失")?
-                .value
-                .downcast::<ConfigServiceHandle>()
-                .map_err(|_| "兴趣学习配置服务类型错误")?;
-            let key = std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "缺少模型凭据")?;
-            Ok(Arc::new(crate::models::CoreModelResolver::new(
-                settings.0.clone(),
-                key,
-            )))
-        };
+        let core_resolver =
+            |role: &str| -> Result<Arc<dyn eve_llm_api::LlmModelResolver>, AppError> {
+                let settings = registry
+                    .get(&ServiceId::new(CONFIG_SERVICE_ID)?)?
+                    .ok_or("兴趣学习配置服务缺失")?
+                    .value
+                    .downcast::<ConfigServiceHandle>()
+                    .map_err(|_| "兴趣学习配置服务类型错误")?;
+                let key = std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "缺少模型凭据")?;
+                Ok(Arc::new(
+                    crate::models::CoreModelResolver::new(settings.0.clone(), key).with_use(role),
+                ))
+            };
         // 后台学习组件的模型请求按用途计入自主运行预算；未启用预算时原样使用主模型。
         // 健康记录包在预算之内：预算拒绝没有发出请求，不算模型的结局。
         let observed = |role: &str| -> Result<Arc<dyn eve_llm_api::LlmModelResolver>, AppError> {
             model_health.register(role);
             Ok(Arc::new(eve_model_health::ObservedResolver::new(
-                core_resolver()?,
+                core_resolver(role)?,
                 role,
                 model_health.clone(),
             )))

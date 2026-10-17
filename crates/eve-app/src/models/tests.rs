@@ -41,6 +41,7 @@ impl Harness {
                 vec![
                     runtime_llm_schema(),
                     config::openai_schema(),
+                    config::model_uses_schema(),
                     model_roles_schema(),
                 ],
             )
@@ -317,6 +318,80 @@ async fn primary_selection_is_fixed_during_tools_and_changes_at_next_round() {
         assert!(server.requests.try_recv().is_err());
         reopened.stop().await;
     }
+}
+
+#[tokio::test]
+async fn use_limits_override_only_the_output_limit_and_report_their_source() {
+    let root = tempfile::tempdir().unwrap();
+    let mut server = Server::start(vec![
+        final_reply("chat"),
+        final_reply("chat"),
+        final_reply("chat"),
+    ])
+    .await;
+    let h = Harness::start(root.path(), &server.url, "chat").await;
+    let limit = |name: Option<&str>| {
+        let summary = summary(&*h.settings, name).unwrap();
+        (
+            summary.max_output_tokens,
+            summary.max_output_tokens_key,
+            summary.max_output_tokens_source,
+        )
+    };
+    let primary = (
+        Some(32),
+        "runtime.models.primary_max_output_tokens".to_string(),
+        Some(ConfigSource::Environment),
+    );
+    // 用途没有单独配置时沿用主模型的键与来源。
+    assert_eq!(limit(Some("dialogue")), primary);
+    let first = h.submit("first", Arc::new(DiscardControlEvents));
+    assert_eq!(h.done(&first).await.run.commit, CommitState::Completed);
+    assert_eq!(server.next().await.body["max_tokens"], 32);
+
+    h.update(
+        &[(
+            config::MODEL_USES_NAMESPACE,
+            "dialogue_max_output_tokens",
+            json!(80),
+        )],
+        ApplyMode::Immediate,
+    );
+    assert_eq!(
+        limit(Some("dialogue")),
+        (
+            Some(80),
+            "runtime.model_uses.dialogue_max_output_tokens".to_string(),
+            Some(ConfigSource::Override)
+        )
+    );
+    // 其他用途与主模型摘要不受影响。
+    assert_eq!(limit(Some("plan")), primary);
+    assert_eq!(limit(None), primary);
+    assert!(matches!(
+        summary(&*h.settings, Some("unknown")),
+        Err(LlmError::Configuration(_))
+    ));
+    let second = h.submit("second", Arc::new(DiscardControlEvents));
+    assert_eq!(h.done(&second).await.run.commit, CommitState::Completed);
+    let body = server.next().await.body;
+    assert_eq!(body["max_tokens"], 80);
+    assert_eq!(body["model"], "model-a", "用途上限不改变模型");
+
+    // 0 表示沿用主模型。
+    h.update(
+        &[(
+            config::MODEL_USES_NAMESPACE,
+            "dialogue_max_output_tokens",
+            json!(0),
+        )],
+        ApplyMode::Immediate,
+    );
+    assert_eq!(limit(Some("dialogue")).0, Some(32));
+    let third = h.submit("third", Arc::new(DiscardControlEvents));
+    assert_eq!(h.done(&third).await.run.commit, CommitState::Completed);
+    assert_eq!(server.next().await.body["max_tokens"], 32);
+    h.stop().await;
 }
 
 #[tokio::test]

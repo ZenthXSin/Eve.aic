@@ -65,6 +65,8 @@ struct State {
     stored: StoredConfig,
     live: Snapshots,
     initial: Snapshots,
+    /// 启动时的覆盖值；需重启的字段按它说明当前生效值的来源。
+    initial_overrides: ConfigOverrides,
     immediate: Snapshots,
     immediate_revision: u64,
 }
@@ -115,17 +117,7 @@ impl FileConfigService {
             .iter()
             .map(|(id, field)| {
                 let override_value = overrides.and_then(|entry| entry.values.get(id)).cloned();
-                let source = if override_value.is_some() {
-                    "override"
-                } else if field
-                    .environment
-                    .as_ref()
-                    .is_some_and(|key| self.environment.contains_key(key))
-                {
-                    "environment"
-                } else {
-                    "default"
-                };
+                let source = self.source_of(field, override_value.is_some()).as_str();
                 PageField {
                     id: id.clone(),
                     label: id.clone(),
@@ -317,6 +309,7 @@ impl FileConfigService {
             validator: bootstrap.validator.clone(),
             state: Mutex::new(State {
                 lock_file: Some(lock_file),
+                initial_overrides: stored.current.namespaces.clone(),
                 stored,
                 initial: live.clone(),
                 immediate: live.clone(),
@@ -324,6 +317,21 @@ impl FileConfigService {
                 immediate_revision,
             }),
         })
+    }
+
+    /// 与 resolve 相同的优先级：覆盖值、环境变量、默认值。
+    fn source_of(&self, field: &ConfigField, overridden: bool) -> ConfigSource {
+        if overridden {
+            ConfigSource::Override
+        } else if field
+            .environment
+            .as_ref()
+            .is_some_and(|key| self.environment.contains_key(key))
+        {
+            ConfigSource::Environment
+        } else {
+            ConfigSource::Default
+        }
     }
 
     fn state(&self) -> ConfigResult<MutexGuard<'_, State>> {
@@ -451,6 +459,27 @@ impl ConfigService for FileConfigService {
             select(&state.live, &initial.namespace, initial.schema_version)?;
             Ok(initial.clone())
         }
+    }
+    fn field_source(&self, namespace: &str, field: &str) -> ConfigResult<ConfigSource> {
+        let state = self.state()?;
+        let schema = self
+            .schemas
+            .get(namespace)
+            .ok_or_else(|| ConfigError::UnknownNamespace(namespace.into()))?;
+        let definition = schema
+            .fields
+            .get(field)
+            .ok_or_else(|| ConfigError::UnknownField(format!("{namespace}.{field}")))?;
+        // 需重启的字段仍按启动时的值生效，来源也按启动时说明。
+        let overrides = if definition.restart_required {
+            &state.initial_overrides
+        } else {
+            &state.stored.current.namespaces
+        };
+        let overridden = overrides
+            .get(namespace)
+            .is_some_and(|entry| entry.values.contains_key(field));
+        Ok(self.source_of(definition, overridden))
     }
 }
 

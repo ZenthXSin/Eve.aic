@@ -91,11 +91,63 @@ pub(crate) fn openai_schema() -> ConfigSchema {
             ),
             (
                 "max_output_tokens".into(),
-                integer(2048, 16384, "EVE_OPENAI_MAX_OUTPUT_TOKENS"),
+                integer(
+                    2048,
+                    MAX_OUTPUT_TOKENS_LIMIT,
+                    "EVE_OPENAI_MAX_OUTPUT_TOKENS",
+                ),
             ),
         ]),
     }
 }
+/// 按用途的单次输出上限；0 表示沿用主模型的上限。随每次模型解析读取，保存后下一次请求生效。
+pub(crate) const MODEL_USES_NAMESPACE: &str = "runtime.model_uses";
+/// 用途名与健康记录、自主预算类别一致。
+pub(crate) const MODEL_USES: [&str; 11] = [
+    "dialogue",
+    "plan",
+    "interest",
+    "research",
+    "practice",
+    "skill",
+    "forge",
+    "outreach",
+    "clarify",
+    "preference",
+    "reflection",
+];
+/// 单次输出上限与 provider.openai.max_output_tokens 的上限一致。
+const MAX_OUTPUT_TOKENS_LIMIT: i64 = 16384;
+
+pub(crate) fn use_limit_field(name: &str) -> String {
+    format!("{name}_max_output_tokens")
+}
+
+pub(crate) fn model_uses_schema() -> ConfigSchema {
+    let fields = MODEL_USES
+        .into_iter()
+        .map(|name| {
+            let mut field = ConfigField::new(
+                ConfigKind::Integer {
+                    minimum: Some(0),
+                    maximum: Some(MAX_OUTPUT_TOKENS_LIMIT),
+                },
+                Some(json!(0)),
+            );
+            field.environment = Some(format!(
+                "EVE_MODEL_USE_{}_MAX_OUTPUT_TOKENS",
+                name.to_ascii_uppercase()
+            ));
+            (use_limit_field(name), field)
+        })
+        .collect();
+    ConfigSchema {
+        namespace: MODEL_USES_NAMESPACE.into(),
+        version: 1,
+        fields,
+    }
+}
+
 pub(crate) fn configured_role(snapshot: &ConfigSnapshot) -> Result<Option<ModelRole>, AppError> {
     let role: String = snapshot.get("model_role")?;
     match role.as_str() {
@@ -273,5 +325,31 @@ mod tests {
         );
         selected.values.insert("model_role".into(), json!("jev"));
         assert!(configured_role(&selected).is_err());
+    }
+
+    #[test]
+    fn every_composed_model_use_has_a_limit_field() {
+        use crate::{qq_budget, qq_cognition};
+        let schema = model_uses_schema();
+        schema.validate().unwrap();
+        // 宿主按这些名称解析模型；缺字段会让该用途每次解析都失败。
+        for name in [
+            "dialogue",
+            "plan",
+            "preference",
+            qq_cognition::REFLECTION_USE,
+            qq_budget::INTEREST,
+            qq_budget::RESEARCH,
+            qq_budget::PRACTICE,
+            qq_budget::SKILL,
+            qq_budget::FORGE,
+            qq_budget::OUTREACH,
+            qq_budget::CLARIFY,
+        ] {
+            let field = &schema.fields[&use_limit_field(name)];
+            assert_eq!(field.default, Some(json!(0)), "{name} 默认沿用主模型");
+            assert!(!field.restart_required, "{name} 保存后下一次请求生效");
+        }
+        assert_eq!(schema.fields.len(), MODEL_USES.len());
     }
 }

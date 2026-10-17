@@ -515,6 +515,10 @@ impl Background {
     }
 }
 
+/// 反思用途名，与 runtime.model_uses 字段一致。
+pub(crate) const REFLECTION_USE: &str = "reflection";
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start(
     kernel: &Kernel,
     backends: &KernelServices,
@@ -523,6 +527,7 @@ pub(crate) async fn start(
     factory: Arc<dyn EndogenousPlannerFactory>,
     interest_goals: bool,
     interest_settings: Option<Arc<dyn eve_interest_api::InterestSettingsReader>>,
+    health: Arc<eve_model_health::HealthBook>,
 ) -> Result<Background, AppError> {
     let plugin = CognitionPlugin::new("eve")?;
     let admin = plugin.controller();
@@ -536,9 +541,15 @@ pub(crate) async fn start(
         .downcast::<ConfigServiceHandle>()
         .map_err(|_| "配置类型错误")?;
     let bootstrap = core_bootstrap(agent)?;
-    let resolver = Arc::new(models::CoreModelResolver::new(
-        settings.0.clone(),
-        bootstrap.api_key,
+    // 反思每轮重新解析模型（含用途上限），结局计入健康记录。
+    health.register(REFLECTION_USE);
+    let resolver: Arc<dyn LlmModelResolver> = Arc::new(eve_model_health::ObservedResolver::new(
+        Arc::new(
+            models::CoreModelResolver::new(settings.0.clone(), bootstrap.api_key)
+                .with_use(REFLECTION_USE),
+        ),
+        REFLECTION_USE,
+        health,
     ));
     let selected = resolver.resolve()?;
     kernel.register(Box::new(ContextPlugin(PluginManifest::new(
