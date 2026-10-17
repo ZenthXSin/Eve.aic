@@ -230,7 +230,7 @@ class GoalFeedbackAcceptance(unittest.TestCase):
         self.assertEqual(parent["description"], "整理房间的计划")
         self.assertIn(FEEDBACK, json.dumps(state, ensure_ascii=False))
         self.assertEqual(len(self.requests), expected_requests)
-        self.assertFalse(any("主动提问训练模式" in json.dumps(request["body"], ensure_ascii=False)
+        self.assertFalse(any("当前会话允许从交互中学习表达" in json.dumps(request["body"], ensure_ascii=False)
                              for request in self.requests))
         for goal in state["goals"].values():
             if goal["source"]["kind"] == "Inference":

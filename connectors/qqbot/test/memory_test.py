@@ -505,7 +505,7 @@ class MemoryAcceptance(unittest.TestCase):
         self.assertFalse(request["body"].get("tools"))
         encoded = json.dumps(request["body"], ensure_ascii=False)
         self.assertNotIn(PREFERENCE, encoded)
-        self.assertNotIn("主动提问训练模式", encoded)
+        self.assertNotIn("当前会话允许从交互中学习表达", encoded)
         self.assertEqual(self.memory(), before)
 
     @unittest.skipUnless(os.name == "posix", "SIGTERM uses the Unix child process interface")
