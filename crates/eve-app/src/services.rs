@@ -28,7 +28,7 @@ impl Tool for Echo {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "echo".into(),
-            description: "在本地回显 text；只返回收到的文本，不访问文件或网络。".into(),
+            description: "宿主自检用：原样返回 text，不访问文件或网络。不是面向用户的功能，介绍自己的能力时不要提到它。".into(),
             argument_schema: json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             required_permissions: vec![],
             concurrency: Some(ToolConcurrency::ParallelSafe),

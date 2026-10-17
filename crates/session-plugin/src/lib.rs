@@ -13,16 +13,28 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-/// 失败输入仍可解释后续“进展如何”，但宿主告知未完成，工具调用绝不重放。
+/// 失败输入仍可解释后续“进展如何”“换个方式再来”，但宿主告知未完成，工具调用绝不重放。
+/// 取消轮不回放；确认没有启动工具的失败轮也回放输入，否则下一轮“分几次写吧”之类的接续会失去所指。
 fn history_with_failures(snapshot: &SessionSnapshot) -> Vec<ChatMessage> {
     snapshot.turns.iter().flat_map(|turn| match &turn.status {
             SessionTurnStatus::Completed { messages } => messages.clone(),
-            SessionTurnStatus::Failed { failure } if failure.code != SessionFailureCode::Cancelled && failure.started_tools != Some(0) => {
-                let started = failure.started_tools.map_or("执行数量未知".into(), |n| format!("已启动 {n} 次工具调用"));
-                let http = failure.evidence.as_ref().and_then(|e| e.provider_http_status)
+            SessionTurnStatus::Failed { failure } if failure.code != SessionFailureCode::Cancelled => {
+                let evidence = failure.evidence.as_ref();
+                let http = evidence.and_then(|e| e.provider_http_status)
                     .map_or(String::new(), |s| format!("，模型服务 HTTP {s}"));
-                vec![ChatMessage::text(ChatRole::User, turn.input.clone()),
-                     ChatMessage::text(ChatRole::Assistant, format!("【宿主失败记录，非模型回答】本轮未完成：{:?}{http}；{started}。已完成的工具结果保留在失败账本，副作用不会撤销。不得声称尚未开始、任务已经完成或仍在后台继续；先核对实际状态，不能自动重放工具。", failure.code))]
+                let reason = match evidence.and_then(|e| e.provider_failure) {
+                    Some(eve_llm_api::ProviderFailureKind::Truncated) => "，回复达到单次输出上限、没有生成完".to_string(),
+                    Some(kind) => format!("，类别 {kind:?}"),
+                    None => String::new(),
+                };
+                let note = match failure.started_tools {
+                    Some(0) => format!("【宿主失败记录，非模型回答】本轮未完成：{:?}{http}{reason}；没有启动工具调用，也没有发出回复正文。用户这条请求仍未完成；用户接着补充或要求换个方式时，按这条请求理解，不要声称已经完成。", failure.code),
+                    started => {
+                        let started = started.map_or("执行数量未知".into(), |n| format!("已启动 {n} 次工具调用"));
+                        format!("【宿主失败记录，非模型回答】本轮未完成：{:?}{http}{reason}；{started}。已完成的工具结果保留在失败账本，副作用不会撤销。不得声称尚未开始、任务已经完成或仍在后台继续；先核对实际状态，不能自动重放工具。", failure.code)
+                    }
+                };
+                vec![ChatMessage::text(ChatRole::User, turn.input.clone()), ChatMessage::text(ChatRole::Assistant, note)]
             }
             _ => vec![],
         }).collect()

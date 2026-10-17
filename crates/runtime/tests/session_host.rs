@@ -555,7 +555,7 @@ async fn provider_protocol_unsupported_and_round_limit_failures_are_not_replayed
                 .as_deref(),
             Some("明确新输入")
         );
-        assert_eq!(
+        assert!(
             provider
                 .requests
                 .lock()
@@ -567,8 +567,9 @@ async fn provider_protocol_unsupported_and_round_limit_failures_are_not_replayed
                 .any(|m| m
                     .text
                     .as_deref()
-                    .is_some_and(|text| text.contains("宿主失败记录"))),
-            started > 0
+                    .is_some_and(|text| text.contains("宿主失败记录")
+                        && (started > 0 || text.contains("没有启动工具调用")))),
+            "失败输入与宿主失败记录都会回放，没有启动工具时如实说明"
         );
         assert_eq!(rig.starts.load(Ordering::SeqCst), started as usize);
         rig.stop().await;
