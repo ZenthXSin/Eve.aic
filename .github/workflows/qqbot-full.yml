@@ -1,0 +1,155 @@
+name: QQBot 全功能体验
+on:
+  workflow_dispatch:
+    inputs:
+      sandbox:
+        description: 使用沙箱（默认关闭，连接正式 QQ 环境）
+        type: boolean
+        default: false
+      seconds:
+        description: 体验窗口秒数（60 至 21300，预留六小时任务收尾）
+        type: string
+        default: "21300"
+      continue_run_id:
+        description: 接着某次已结束的全功能体验运行的状态继续（填运行 ID；留空则全新开始）
+        type: string
+        default: ""
+      research_sources:
+        description: 受控研究入口页，空格分隔，至多 8 个（留空则不做受控研究）
+        type: string
+        default: "https://developer.mozilla.org/zh-CN/docs/Web/CSS/"
+permissions:
+  contents: read
+  actions: read
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+      - name: 构建不含凭据的运行包
+        run: |
+          npm --prefix connectors/qqbot ci --ignore-scripts --no-audit --no-fund
+          rustup toolchain install 1.89.0 --profile minimal
+          cargo +1.89.0 build -p eve-app --bin eve-qqbot --locked
+          tar -czf "$RUNNER_TEMP/qqbot-runtime.tar.gz" target/debug/eve-qqbot connectors/qqbot/node_modules
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: qqbot-full-runtime
+          path: ${{ runner.temp }}/qqbot-runtime.tar.gz
+          retention-days: 1
+  experience:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    concurrency:
+      group: eve-qqbot-live
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: 校验输入、凭据与续接来源
+        env:
+          QQBOT_APP_SECRET: ${{ secrets.QQBOT_APP_SECRET }}
+          EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_SECONDS: ${{ inputs.seconds }}
+          INPUT_SANDBOX: ${{ inputs.sandbox }}
+          INPUT_CONTINUE: ${{ inputs.continue_run_id }}
+          INPUT_SOURCES: ${{ inputs.research_sources }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, urllib.request
+          for name in ("QQBOT_APP_SECRET", "EVE_OPENAI_API_KEY"):
+              if not os.environ.get(name, "").strip():
+                  raise SystemExit("缺少仓库 Actions Secret：" + name)
+          if not re.fullmatch(r"[0-9]{1,5}", os.environ["INPUT_SECONDS"]) or not 60 <= int(os.environ["INPUT_SECONDS"]) <= 21300:
+              raise SystemExit("窗口必须在 60 至 21300 秒之间。")
+          sources = os.environ["INPUT_SOURCES"].split()
+          if len(sources) > 8 or len(set(sources)) != len(sources) or any(not re.fullmatch(r"https://[A-Za-z0-9.-]+(?::[0-9]+)?(?:/[A-Za-z0-9._~%/-]*)?", s) for s in sources):
+              raise SystemExit("研究入口须为至多 8 个不重复的 https 地址（路径只含字母、数字与 ._~%/-）。")
+          continued = os.environ["INPUT_CONTINUE"].strip()
+          if continued:
+              if not re.fullmatch(r"[1-9][0-9]{0,19}", continued):
+                  raise SystemExit("续接运行 ID 无效。")
+              api = urllib.request.Request("https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/runs/" + continued,
+                                           headers={"Authorization": "Bearer " + os.environ["GITHUB_TOKEN"], "Accept": "application/vnd.github+json"})
+              with urllib.request.urlopen(api, timeout=20) as response:
+                  run = json.load(response)
+              if run["path"] != ".github/workflows/qqbot-full.yml" or run["head_branch"] != "main" or run["status"] != "completed":
+                  raise SystemExit("续接来源必须是 main 上已经结束的全功能体验运行。")
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"QQBOT_WINDOW_SECONDS={int(os.environ['INPUT_SECONDS'])}\nQQBOT_SANDBOX={os.environ['INPUT_SANDBOX']}\n")
+              output.write("CONTINUE_RUN_ID=" + continued + "\nRESEARCH_SOURCES=" + " ".join(sources) + "\n")
+          print("QQ 运行环境：" + ("沙箱" if os.environ["INPUT_SANDBOX"] == "true" else "正式"))
+          print("续接运行：" + (continued or "无，全新状态") + "；受控研究入口 " + str(len(sources)) + " 个。")
+          PY
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: qqbot-full-runtime
+          path: ${{ runner.temp }}/qqbot-runtime
+      - name: 展开同一提交的运行包
+        run: |
+          tar -xzf "$RUNNER_TEMP/qqbot-runtime/qqbot-runtime.tar.gz"
+          chmod +x target/debug/eve-qqbot
+          google-chrome --version
+      - name: 下载续接来源的加密状态包
+        if: env.CONTINUE_RUN_ID != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: eve-qqbot-full-results
+          run-id: ${{ env.CONTINUE_RUN_ID }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/full-source
+      - name: 认证解密续接状态
+        if: env.CONTINUE_RUN_ID != ''
+        env:
+          QQBOT_APP_SECRET: ${{ secrets.QQBOT_APP_SECRET }}
+        run: python3 connectors/qqbot/training-window.py --decrypt "$RUNNER_TEMP/full-source/training-state.enc" --output "$RUNNER_TEMP/full-restored"
+      - name: 启动全功能 Eve
+        env:
+          QQBOT_APP_SECRET: ${{ secrets.QQBOT_APP_SECRET }}
+          EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}
+          EVE_OPENAI_BASE_URL: https://ai.xn--rhqr8xvr4ahqsgka.com
+          EVE_OPENAI_MODEL: deepseek-v4.1-flash
+          EVE_OPENAI_PROTOCOL: chat
+          EVE_OPENAI_REASONING_EFFORT: none
+          EVE_OPENAI_MAX_OUTPUT_TOKENS: "4096"
+          EVE_OPENAI_TIMEOUT_SECONDS: "60"
+          EVE_LLM_RESPONSE_MODE: complete
+        run: |
+          args=(--profile full --practice-browser "$(command -v google-chrome)" --root "$RUNNER_TEMP/eve-qqbot-full" --output "$RUNNER_TEMP/eve-qqbot-full-artifacts" --seconds "$QQBOT_WINDOW_SECONDS")
+          for source in $RESEARCH_SOURCES; do args+=(--research-source "$source"); done
+          if [ -n "$CONTINUE_RUN_ID" ]; then args+=(--seed-state "$RUNNER_TEMP/full-restored/state"); fi
+          python3 connectors/qqbot/training-window.py "${args[@]}" > "$RUNNER_TEMP/qqbot-full-controller.log" 2>&1 &
+      - name: 确认实际网关就绪
+        run: python3 connectors/qqbot/training-window.py --profile full --wait-ready --root "$RUNNER_TEMP/eve-qqbot-full" --output "$RUNNER_TEMP/eve-qqbot-full-artifacts"
+      - name: 等待体验结束与结果保存
+        run: python3 connectors/qqbot/training-window.py --profile full --wait-result --output "$RUNNER_TEMP/eve-qqbot-full-artifacts" --seconds "$QQBOT_WINDOW_SECONDS"
+      - name: 取消时先让 Eve 收尾并保存
+        if: cancelled()
+        run: |
+          pkill -INT -f "training-window.py --profile full --practice-browser" || true
+          for _ in $(seq 1 150); do
+            [ -f "$RUNNER_TEMP/eve-qqbot-full-artifacts/controller-result.json" ] && exit 0
+            sleep 1
+          done
+          echo "收尾超时：最新状态可能没有保存。"
+      - name: 保存计数报告与加密状态包
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: eve-qqbot-full-results
+          path: ${{ runner.temp }}/eve-qqbot-full-artifacts/
+          if-no-files-found: warn
+          retention-days: 30

@@ -54,6 +54,21 @@ class Reports(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "round_baseline_mismatch"):
                 training.collect(path)
 
+    def test_host_command_profiles(self):
+        state = Path("state")
+        self.assertEqual(training.host_command("eve", state), ["eve", "--training", "--state-dir", "state"])
+        full = training.host_command("eve", state, "full", Path("/usr/bin/chrome"), ["https://a.example/docs/", "https://b.example/"])
+        self.assertEqual(full[:len(training.FULL_PROFILE) + 1], ["eve", *training.FULL_PROFILE])
+        self.assertEqual(full[len(training.FULL_PROFILE) + 1:], ["--practice-browser", "/usr/bin/chrome",
+            "--research-source", "https://a.example/docs/", "--research-source", "https://b.example/", "--state-dir", "state"])
+        self.assertEqual(training.host_command("eve", state, "full", "chrome")[-2:], ["--state-dir", "state"])
+        for args, code in ((("training", "chrome"), "training_profile_extra"), (("full", None), "full_profile_browser"),
+                           (("full", "chrome", ["https://a.example/"] * 2), "full_profile_research_sources"),
+                           (("full", "chrome", [f"https://{i}.example/" for i in range(9)]), "full_profile_research_sources"),
+                           (("unknown",), "profile")):
+            with self.assertRaisesRegex(ValueError, code):
+                training.host_command("eve", state, *args)
+
     def test_report_only_uses_completed_and_sent_model_pairs(self):
         message = {"id": "g.1!", "scope": "group", "target_id": "group-1", "user_id": "user-1", "text": "我喜欢简短分段"}
         reply = "收到。\n\n每段两句合适吗？"
