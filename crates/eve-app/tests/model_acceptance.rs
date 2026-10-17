@@ -245,7 +245,12 @@ async fn http_failure_is_not_retried_and_raw_diagnostics_do_not_enter_report() {
     let first = server.next().await.body;
     let second = server.next().await.body;
     assert!(user_texts(&first)[0].contains(MARKER));
-    assert!(!user_texts(&second)[0].contains(MARKER));
+    // 失败轮的原话随宿主失败记录回放，本轮的新输入在最后，不含失败输入的标记。
+    let texts = user_texts(&second);
+    assert!(texts[0].contains(MARKER));
+    assert!(!texts.last().unwrap().contains(MARKER));
+    assert!(second.to_string().contains("没有启动工具调用"));
+    assert!(!second.to_string().contains("fixture-secret"));
     assert!(server.requests.try_recv().is_err());
     let state = sessions(root.path());
     assert_eq!(

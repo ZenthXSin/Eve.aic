@@ -218,7 +218,12 @@ async fn provider_failure_is_not_retried_or_added_to_completed_history() {
     assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-key"));
     assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture-key"));
     assert_eq!(user_texts(&server.next().await.body), ["失败输入"]);
-    assert_eq!(user_texts(&server.next().await.body), ["新输入"]);
+    // 失败轮不进入完成历史；下一轮带上原话与宿主失败记录，说明它没有完成、没有启动工具。
+    let next = server.next().await.body;
+    assert_eq!(user_texts(&next), ["失败输入", "新输入"]);
+    let note = next.to_string();
+    assert!(note.contains("宿主失败记录") && note.contains("没有启动工具调用"));
+    assert!(!note.contains("fixture-key"));
     assert!(server.requests.try_recv().is_err());
     let turns = sessions(root.path())["sessions"]["default"]["turns"]
         .as_array()
