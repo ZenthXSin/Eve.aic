@@ -45,7 +45,7 @@ async fn json_completion_is_per_request_and_an_unsupported_server_is_not_retried
     assert!(server.next().await.body.get("response_format").is_none());
     assert!(matches!(
         provider.complete_json(request()).await,
-        Err(LlmError::Provider(_))
+        Err(LlmError::ProviderFailed(_))
     ));
     server.next().await;
     assert!(server.requests.try_recv().is_err());
@@ -145,7 +145,7 @@ async fn failures_and_size_limits_are_sanitized_without_retry() {
     let provider = OpenAiProvider::new(config(&server.url), "fixture-key").unwrap();
     assert_eq!(
         provider.complete(request()).await.unwrap_err(),
-        LlmError::Provider("OpenAI HTTP 500".into())
+        LlmError::ProviderFailed(eve_llm_api::ProviderFailure::http(500).unwrap())
     );
     server.next().await;
     assert!(server.requests.try_recv().is_err());
@@ -162,7 +162,10 @@ async fn failures_and_size_limits_are_sanitized_without_retry() {
             .complete(request())
             .await
             .unwrap_err();
-        assert!(matches!(error, LlmError::Provider(_)));
+        assert_eq!(
+            error.provider_failure().unwrap().kind,
+            eve_llm_api::ProviderFailureKind::ResponseTooLarge
+        );
         assert!(!error.to_string().contains("超过上限"));
         server.next().await;
     }

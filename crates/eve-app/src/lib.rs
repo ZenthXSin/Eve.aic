@@ -285,6 +285,8 @@ pub(crate) struct CoreBootstrap {
     context: Option<Arc<dyn eve_llm_api::ContextAssembler>>,
     /// 宿主额外提供给对话模型的工具；名称不能与内置工具重复。
     tools: Vec<Arc<dyn eve_llm_api::Tool>>,
+    /// 记录对话模型每次请求的结局；只观察，不改变请求。
+    health: Option<Arc<dyn eve_llm_api::ModelHealthObserver>>,
 }
 
 pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstrap, AppError> {
@@ -297,6 +299,7 @@ pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstr
         api_key,
         context: None,
         tools: vec![],
+        health: None,
     })
 }
 
@@ -376,6 +379,7 @@ async fn install_core_with_config(
         api_key,
         context,
         tools,
+        health,
     } = bootstrap;
     let mut bindings = Vec::with_capacity(tools.len() + 1);
     for tool in &tools {
@@ -408,7 +412,15 @@ async fn install_core_with_config(
             "核心入口当前使用非流式模式，请将 runtime.llm.response_mode 配为 complete。".into(),
         );
     }
-    let resolver = Arc::new(models::CoreModelResolver::new(settings.0.clone(), api_key));
+    let resolver: Arc<dyn LlmModelResolver> = {
+        let core = Arc::new(models::CoreModelResolver::new(settings.0.clone(), api_key));
+        match health {
+            Some(observer) => Arc::new(eve_model_health::ObservedResolver::new(
+                core, "dialogue", observer,
+            )),
+            None => core,
+        }
+    };
     // 保留启动预检；每轮再捕获最新配置，失败发生在 Session begin 之前。
     let initial = resolver.resolve()?;
     let timeout = initial.provider_timeout;

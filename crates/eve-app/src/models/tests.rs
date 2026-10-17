@@ -70,6 +70,7 @@ impl Harness {
                 api_key: "resolver-test-key".into(),
                 context: None,
                 tools: vec![],
+                health: None,
             },
             plugin,
         )

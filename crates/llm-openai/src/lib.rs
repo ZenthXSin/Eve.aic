@@ -1,7 +1,10 @@
 //! OpenAI 兼容 Responses/Chat Completions 适配器；厂商格式不进入通用协议或 Kernel。
 //!
 //! 网络和转换均在返回的 Future 中执行。取消等待会丢弃本地请求，不保证远端停止。
-use eve_llm_api::{LlmError, LlmFuture, LlmProvider, ModelRequest, ModelResponse, ModelTextSink};
+use eve_llm_api::{
+    LlmError, LlmFuture, LlmProvider, ModelRequest, ModelResponse, ModelTextSink, ProviderFailure,
+    ProviderFailureKind,
+};
 use reqwest::{Client, Url, header::HeaderValue, redirect::Policy};
 use std::time::Duration;
 
@@ -210,16 +213,17 @@ impl OpenAiProvider {
         let status = response.status();
         if !status.is_success() {
             // 原始响应体、URL 和后端错误可能包含凭据或用户输入，不进入通用诊断。
-            return Err(LlmError::Provider(format!(
-                "OpenAI HTTP {}",
-                status.as_u16()
-            )));
+            // 只保留状态码与固定类别。
+            return Err(LlmError::ProviderFailed(
+                ProviderFailure::http(status.as_u16())
+                    .unwrap_or(ProviderFailure::new(ProviderFailureKind::UnexpectedStatus)),
+            ));
         }
         if response
             .content_length()
             .is_some_and(|n| n > self.config.max_response_bytes as u64)
         {
-            return Err(LlmError::Provider("OpenAI 响应超过字节上限".into()));
+            return Err(failed(ProviderFailureKind::ResponseTooLarge));
         }
         if let Some(sink) = sink {
             if response
@@ -243,7 +247,7 @@ impl OpenAiProvider {
             let mut received = 0;
             while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
                 if chunk.len() > self.config.max_response_bytes - received {
-                    return Err(LlmError::Provider("OpenAI 响应超过字节上限".into()));
+                    return Err(failed(ProviderFailureKind::ResponseTooLarge));
                 }
                 received += chunk.len();
                 for byte in chunk {
@@ -262,7 +266,7 @@ impl OpenAiProvider {
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
             if chunk.len() > self.config.max_response_bytes - bytes.len() {
-                return Err(LlmError::Provider("OpenAI 响应超过字节上限".into()));
+                return Err(failed(ProviderFailureKind::ResponseTooLarge));
             }
             bytes.extend_from_slice(&chunk);
         }
@@ -300,6 +304,25 @@ fn transport_error(error: reqwest::Error) -> LlmError {
     if error.is_timeout() {
         LlmError::ProviderTimeout
     } else {
-        LlmError::Provider("OpenAI 网络请求失败".into())
+        failed(ProviderFailureKind::Network)
     }
+}
+
+pub(crate) fn failed(kind: ProviderFailureKind) -> LlmError {
+    LlmError::ProviderFailed(ProviderFailure::new(kind))
+}
+
+/// Responses 未完成时，按 `incomplete_details.reason` 区分截断与内容过滤；其他原因不猜测。
+pub(crate) fn incomplete(response: &serde_json::Value) -> LlmError {
+    failed(
+        match response
+            .get("incomplete_details")
+            .and_then(|details| details.get("reason"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("max_output_tokens") => ProviderFailureKind::Truncated,
+            Some("content_filter") => ProviderFailureKind::ContentFiltered,
+            _ => ProviderFailureKind::Incomplete,
+        },
+    )
 }

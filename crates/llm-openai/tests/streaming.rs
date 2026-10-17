@@ -170,7 +170,7 @@ async fn validates_sse_frames_mime_status_and_byte_limits() {
             .stream(request(), &Sink::default())
             .await
             .unwrap_err(),
-        LlmError::Provider("OpenAI HTTP 429".into())
+        LlmError::ProviderFailed(ProviderFailure::http(429).unwrap())
     );
     let server = Server::start(vec![sse::reply(&normal)]).await;
     let p = OpenAiProvider::new(
@@ -184,7 +184,7 @@ async fn validates_sse_frames_mime_status_and_byte_limits() {
     .unwrap();
     assert!(matches!(
         p.stream(request(), &Sink::default()).await,
-        Err(LlmError::Provider(_))
+        Err(LlmError::ProviderFailed(_))
     ));
 }
 struct Slow;

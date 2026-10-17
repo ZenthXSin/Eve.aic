@@ -324,6 +324,69 @@
     $("started-at").textContent = Number.isFinite(body.started_at_unix_ms) && !Number.isNaN(time.getTime()) ? `启动于 ${time.toLocaleString("zh-CN", { hour12: false })}` : "启动时间未知";
   }
 
+  const roleLabels = {
+    dialogue: "对话", interest: "兴趣观察", research: "研究", practice: "实践", skill: "技能",
+    forge: "工具锻造", outreach: "主动交流", clarify: "请求澄清", plan: "计划建议",
+  };
+  const failureLabels = {
+    payment_required: "额度不足，或按当前上下文与单次输出上限不可负担",
+    rate_limited: "被限流",
+    unauthorized: "凭据或权限被拒绝",
+    rejected: "请求被拒绝",
+    server_error: "服务端出错",
+    unexpected_status: "非预期的 HTTP 状态",
+    truncated: "达到单次输出上限，回复不完整",
+    content_filtered: "被内容策略中止",
+    incomplete: "响应未完成",
+    network: "无法连接模型服务",
+    response_too_large: "响应超过本地接收上限",
+    other: "其他失败",
+    timed_out: "超时",
+    invalid_response: "响应不符合协议",
+    misconfigured: "模型配置无法解析，未发出请求",
+  };
+
+  function renderReadiness(body) {
+    if (!body || !Array.isArray(body.roles) || !Number.isInteger(body.tools_registered)) {
+      throw new ApiError("就绪状态格式无效，请刷新重试。");
+    }
+    $("readiness-tools").textContent = `${count(body.tools_registered)} 个`;
+    const model = body.model;
+    $("readiness-model").textContent = model ? `${text(model.model, "未知")}（${text(model.protocol, "未知协议")}）` : "配置无法读取";
+    $("readiness-limit").textContent = model
+      ? (Number.isInteger(model.max_output_tokens) ? `单次输出上限 ${count(model.max_output_tokens)}` : "单次输出上限未设置，由服务端决定") + `，取自 ${text(model.max_output_tokens_key, "未知配置")}`
+      : "—";
+    $("readiness-vision").textContent = body.vision === "not_configured" ? "未配置" : "未知";
+    const list = $("readiness-roles");
+    list.replaceChildren();
+    for (const role of body.roles) {
+      const row = node("div", "readiness-role");
+      const [label, style] = role.state === "responsive" ? ["可响应", "good"] : role.state === "failing" ? ["请求失败", "bad"] : ["尚未验证", ""];
+      const parts = [`请求 ${count(role.requests)} 次`, `失败 ${count(role.failures)} 次`];
+      if (role.consecutive_failures > 0) parts.push(`连续失败 ${count(role.consecutive_failures)} 次`);
+      const failure = role.last_failure;
+      if (failure) {
+        const status = Number.isInteger(failure.http_status) ? `（HTTP ${failure.http_status}）` : "";
+        parts.push(`最近失败：${text(failureLabels[failure.kind], "未知类别")}${status}，${goalDate(failure.at_ms)}`);
+      }
+      if (Number.isFinite(role.last_success_at_ms)) parts.push(`最近成功：${goalDate(role.last_success_at_ms)}`);
+      if (role.state === "unverified") parts.push("本进程还没有这项用途的请求");
+      row.append(node("strong", "", text(roleLabels[role.role], role.role)), node("span", `badge ${style}`.trim(), label), node("span", "role-detail", parts.join(" · ")));
+      list.append(row);
+    }
+  }
+
+  async function loadReadiness() {
+    try {
+      renderReadiness(await api("/api/readiness"));
+      showError("readiness-error", "");
+    } catch (error) {
+      if (error.silent) return;
+      // 就绪状态读取失败只在本区块提示，不影响通道与任务状态。
+      showError("readiness-error", errorText(error));
+    }
+  }
+
   function badgeForTask(task) {
     const label = task.cancel_requested && task.phase !== "Finished" ? "已请求取消" : text(phases[task.phase], "状态未知");
     const style = task.phase === "Blocked" ? "bad" : task.phase === "Finished" ? "good" : task.cancel_requested ? "warning" : "active";
@@ -1567,6 +1630,7 @@
     const flight = (async () => {
       const results = await Promise.allSettled([
         api("/api/status").then(renderStatus),
+        loadReadiness(),
         loadTasks(),
         // 停在判断页且未加载更早记录时刷新首页；判断错误显示在本页，不影响全局状态。
         view === "judgments" && judgmentPages === 1 ? loadJudgments() : Promise.resolve(),

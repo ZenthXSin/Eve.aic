@@ -237,11 +237,16 @@ impl SessionLlmHost {
             },
             Err(failure) => {
                 let summary = SessionFailure {
-                    evidence: (failure.error.provider_http_status().is_some()
+                    evidence: (failure.error.provider_failure().is_some()
+                        || failure.error.provider_http_status().is_some()
                         || !failure.diagnostics.calls.is_empty()
                         || !failure.diagnostics.tool_results.is_empty())
                     .then(|| SessionFailureEvidence {
                         provider_http_status: failure.error.provider_http_status(),
+                        provider_failure: failure
+                            .error
+                            .provider_failure()
+                            .map(|failure| failure.kind),
                         tool_names: failure
                             .diagnostics
                             .calls
@@ -291,7 +296,7 @@ impl SessionLlmHost {
 fn failure_code(error: &LlmError) -> SessionFailureCode {
     match error {
         LlmError::Configuration(_) | LlmError::Context(_) => SessionFailureCode::Context,
-        LlmError::Provider(_) => SessionFailureCode::Provider,
+        LlmError::Provider(_) | LlmError::ProviderFailed(_) => SessionFailureCode::Provider,
         LlmError::ProviderTimeout => SessionFailureCode::ProviderTimeout,
         LlmError::Protocol(_) => SessionFailureCode::Protocol,
         LlmError::Unsupported(_) => SessionFailureCode::Unsupported,

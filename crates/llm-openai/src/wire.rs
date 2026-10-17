@@ -78,8 +78,11 @@ pub(crate) fn decode_response(bytes: &[u8]) -> Result<ModelResponse, LlmError> {
     let response: Value =
         crate::strict_json::from_slice(bytes).map_err(|_| protocol("OpenAI 响应不是有效 JSON"))?;
     let status = required_str(&response, "status")?;
-    if status != "completed" || response.get("error").is_some_and(|v| !v.is_null()) {
-        return Err(LlmError::Provider("OpenAI 响应未成功完成".into()));
+    if response.get("error").is_some_and(|v| !v.is_null()) {
+        return Err(crate::failed(eve_llm_api::ProviderFailureKind::Other));
+    }
+    if status != "completed" {
+        return Err(crate::incomplete(&response));
     }
     let output = response
         .get("output")
@@ -161,7 +164,7 @@ fn completed_item(item: &Value) -> Result<(), LlmError> {
             .as_str()
             .ok_or_else(|| protocol("OpenAI item status 必须是字符串"))?;
         if status != "completed" {
-            return Err(LlmError::Provider("OpenAI 输出项未完成".into()));
+            return Err(crate::failed(eve_llm_api::ProviderFailureKind::Incomplete));
         }
     }
     Ok(())
@@ -365,16 +368,41 @@ mod tests {
 
     #[test]
     fn maps_failed_incomplete_and_unfinished_items_to_provider_errors() {
+        use eve_llm_api::ProviderFailureKind as Kind;
+        let kind = |response: Value| {
+            let error = decode_response(&serde_json::to_vec(&response).unwrap()).unwrap_err();
+            assert!(!error.to_string().contains("secret"));
+            error.provider_failure().unwrap().kind
+        };
         for status in ["failed", "incomplete", "in_progress", "queued", "cancelled"] {
             let response =
                 json!({"status":status, "output":[message("text")], "error":{"message":"secret"}});
-            let error = decode_response(&serde_json::to_vec(&response).unwrap()).unwrap_err();
-            assert!(matches!(error, LlmError::Provider(_)));
-            assert!(!error.to_string().contains("secret"));
+            assert_eq!(kind(response), Kind::Other);
+            assert_eq!(
+                kind(json!({"status":status, "output":[message("text")]})),
+                Kind::Incomplete
+            );
+        }
+        // 未完成的原因只认两种固定值，其余不猜测。
+        for (reason, expected) in [
+            ("max_output_tokens", Kind::Truncated),
+            ("content_filter", Kind::ContentFiltered),
+            ("secret", Kind::Incomplete),
+        ] {
+            let response = json!({"status":"incomplete", "output":[message("text")],
+                "incomplete_details":{"reason":reason}});
+            assert_eq!(kind(response), expected);
         }
         let mut item = function("a");
         item["status"] = json!("in_progress");
-        assert!(matches!(decode(json!([item])), Err(LlmError::Provider(_))));
+        assert_eq!(
+            decode(json!([item]))
+                .unwrap_err()
+                .provider_failure()
+                .unwrap()
+                .kind,
+            Kind::Incomplete
+        );
     }
 
     #[test]

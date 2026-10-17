@@ -10,7 +10,9 @@ pub use prompt::{
 
 use eve_plugin_api::{Permission, PluginId, ServiceId};
 mod budget;
+mod failure;
 pub use budget::{BudgetUsage, ExecutionLimits, TurnBudget};
+pub use failure::{ModelHealthObserver, ModelOutcome, ProviderFailure, ProviderFailureKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -410,6 +412,8 @@ pub enum LlmError {
     Configuration(String),
     Context(String),
     Provider(String),
+    /// Provider 给出的有限失败类别与状态码；不含供应商错误正文。
+    ProviderFailed(ProviderFailure),
     ProviderTimeout,
     Protocol(String),
     Unsupported(String),
@@ -427,6 +431,10 @@ impl fmt::Display for LlmError {
             Self::Configuration(s) => write!(f, "configuration error: {s}"),
             Self::Context(s) => write!(f, "context error: {s}"),
             Self::Provider(s) => write!(f, "provider error: {s}"),
+            Self::ProviderFailed(failure) => match failure.http_status {
+                Some(status) => write!(f, "provider failure: {:?} (HTTP {status})", failure.kind),
+                None => write!(f, "provider failure: {:?}", failure.kind),
+            },
             Self::Protocol(s) => write!(f, "protocol error: {s}"),
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
             Self::Backend(s) => write!(f, "backend error: {s}"),
@@ -436,8 +444,14 @@ impl fmt::Display for LlmError {
 impl LlmError {
     /// 只提取本地 HTTP 适配器的固定状态码，不把供应商错误正文带入记录或回复。
     pub fn provider_http_status(&self) -> Option<u16> {
-        let Self::Provider(message) = self else {
-            return None;
+        let message = match self {
+            Self::ProviderFailed(failure) => {
+                return failure
+                    .http_status
+                    .filter(|status| (100..=599).contains(status));
+            }
+            Self::Provider(message) => message,
+            _ => return None,
         };
         let digits = message.strip_prefix("OpenAI HTTP ")?;
         if digits.len() != 3 || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -447,6 +461,16 @@ impl LlmError {
             .parse::<u16>()
             .ok()
             .filter(|status| (100..=599).contains(status))
+    }
+}
+
+impl LlmError {
+    /// Provider 给出的失败类别；旧格式的固定 HTTP 文本按状态码分类，其余返回 None。
+    pub fn provider_failure(&self) -> Option<ProviderFailure> {
+        match self {
+            Self::ProviderFailed(failure) => Some(*failure),
+            _ => ProviderFailure::http(self.provider_http_status()?),
+        }
     }
 }
 
@@ -849,5 +873,39 @@ mod http_failure_status_tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn typed_failures_carry_bounded_kinds_and_statuses() {
+        use super::{ProviderFailure, ProviderFailureKind as Kind};
+        for (status, kind) in [
+            (402, Kind::PaymentRequired),
+            (429, Kind::RateLimited),
+            (401, Kind::Unauthorized),
+            (403, Kind::Unauthorized),
+            (400, Kind::Rejected),
+            (413, Kind::Rejected),
+            (500, Kind::ServerError),
+            (503, Kind::ServerError),
+            (307, Kind::UnexpectedStatus),
+        ] {
+            let error = LlmError::ProviderFailed(ProviderFailure::http(status).unwrap());
+            assert_eq!(error.provider_http_status(), Some(status));
+            assert_eq!(error.provider_failure().unwrap().kind, kind);
+        }
+        assert_eq!(ProviderFailure::http(200), None);
+        assert_eq!(ProviderFailure::http(600), None);
+        // 旧格式的固定文本仍按状态码分类。
+        assert_eq!(
+            LlmError::Provider("OpenAI HTTP 402".into())
+                .provider_failure()
+                .unwrap()
+                .kind,
+            Kind::PaymentRequired
+        );
+        let truncated = LlmError::ProviderFailed(ProviderFailure::new(Kind::Truncated));
+        assert_eq!(truncated.provider_http_status(), None);
+        assert_eq!(truncated.to_string(), "provider failure: Truncated");
+        assert_eq!(LlmError::Provider("secret".into()).provider_failure(), None);
     }
 }

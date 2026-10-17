@@ -35,6 +35,36 @@ pub(crate) struct QqPanel {
     /// 开启 --plans 时的计划账本；面板只能查看与撤销，不能建议、确认或开始步骤。
     pub plans: Option<std::sync::Arc<dyn eve_plan_api::PlanJournal>>,
     pub plugins: crate::web_panel_plugins::PanelPlugins,
+    pub readiness: PanelReadiness,
+}
+
+/// 就绪状态的来源：模型健康记录、当前模型配置与对话工具数。
+pub(crate) struct PanelReadiness {
+    pub health: Arc<eve_model_health::HealthBook>,
+    pub settings: Arc<dyn eve_config_api::ConfigService>,
+    pub tools_registered: usize,
+}
+
+fn failure_view(outcome: eve_llm_api::ModelOutcome, at_ms: u64) -> ModelFailureView {
+    use eve_llm_api::ModelOutcome;
+    let (kind, http_status) = match outcome {
+        ModelOutcome::Failed { failure } => (
+            serde_json::to_value(failure.kind)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "other".into()),
+            failure.http_status,
+        ),
+        ModelOutcome::TimedOut => ("timed_out".into(), None),
+        ModelOutcome::InvalidResponse => ("invalid_response".into(), None),
+        ModelOutcome::Misconfigured => ("misconfigured".into(), None),
+        ModelOutcome::Succeeded => ("succeeded".into(), None),
+    };
+    ModelFailureView {
+        kind,
+        http_status,
+        at_ms,
+    }
 }
 fn session_error(error: SessionError) -> PanelError {
     match error {
@@ -128,6 +158,49 @@ impl PanelService for QqPanel {
                 sent,
                 failed,
             },
+        })
+    }
+    fn readiness(&self) -> PanelResult<Readiness> {
+        let channel = *self.channel.status.borrow();
+        let model = crate::models::summary(&*self.readiness.settings)
+            .ok()
+            .map(|summary| ModelConfigView {
+                model: summary.model,
+                protocol: summary.protocol.into(),
+                max_output_tokens: summary.max_output_tokens,
+                max_output_tokens_key: summary.max_output_tokens_key.into(),
+            });
+        let roles = self
+            .readiness
+            .health
+            .snapshot()
+            .into_iter()
+            .map(|(role, health)| ModelRoleHealth {
+                role,
+                state: match health.last_succeeded {
+                    None => ModelState::Unverified,
+                    Some(true) => ModelState::Responsive,
+                    Some(false) => ModelState::Failing,
+                },
+                requests: health.requests,
+                failures: health.failures,
+                consecutive_failures: health.consecutive_failures,
+                last_success_at_ms: health.last_success_at_ms,
+                last_failure: health
+                    .last_failure
+                    .map(|(outcome, at_ms)| failure_view(outcome, at_ms)),
+            })
+            .collect();
+        Ok(Readiness {
+            channel: ChannelReadiness {
+                connected: channel.ready && !channel.closed,
+                closed: channel.closed,
+                terminal_error: channel.terminal_error,
+            },
+            tools_registered: self.readiness.tools_registered,
+            model,
+            roles,
+            vision: VisionState::NotConfigured,
         })
     }
     fn sessions(&self, after: Option<&str>, limit: usize) -> PanelResult<Page<SessionSummary>> {

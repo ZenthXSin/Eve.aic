@@ -32,6 +32,68 @@ pub struct ChannelStatus {
     pub sent: u64,
     pub failed: u64,
 }
+/// 运行就绪状态：分别说明通道、工具、模型与视觉，不合成一个笼统的“全功能就绪”。
+/// 模型状态来自本进程实际请求的结局，重启后清零；没有请求时为尚未验证。
+#[derive(Clone, Debug, Serialize)]
+pub struct Readiness {
+    pub channel: ChannelReadiness,
+    /// 对话模型可调用的工具数；只说明已注册，不代表能成功执行。
+    pub tools_registered: usize,
+    /// 当前主模型配置；读取失败时为空。
+    pub model: Option<ModelConfigView>,
+    /// 按用途的模型健康，用途名按字典序。
+    pub roles: Vec<ModelRoleHealth>,
+    pub vision: VisionState,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct ChannelReadiness {
+    /// QQ 网关已连接；不代表模型可用。
+    pub connected: bool,
+    pub closed: bool,
+    pub terminal_error: bool,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelConfigView {
+    pub model: String,
+    pub protocol: String,
+    /// 每次请求发送的单次输出上限；为空时不发送，由服务端决定。
+    pub max_output_tokens: Option<u32>,
+    /// 上限取自哪个配置键。
+    pub max_output_tokens_key: String,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelState {
+    /// 本进程还没有该用途的请求结局。
+    Unverified,
+    /// 最近一次请求成功。
+    Responsive,
+    /// 最近一次请求失败。
+    Failing,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelRoleHealth {
+    pub role: String,
+    pub state: ModelState,
+    pub requests: u64,
+    pub failures: u64,
+    pub consecutive_failures: u32,
+    pub last_success_at_ms: Option<u64>,
+    pub last_failure: Option<ModelFailureView>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelFailureView {
+    /// 固定类别，例如 payment_required、rate_limited、truncated、timed_out、misconfigured。
+    pub kind: String,
+    pub http_status: Option<u16>,
+    pub at_ms: u64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisionState {
+    /// 没有配置视觉模型；图片只接收引用，不解析。
+    NotConfigured,
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct Page<T> {
     pub items: Vec<T>,
@@ -588,6 +650,10 @@ pub trait PanelService: Send + Sync {
         limit: usize,
     ) -> PanelResult<SessionDetail>;
     fn cancel(&self, target: &GenerationKey) -> PanelResult<CancelStatus>;
+    /// 通道、工具、模型与视觉的就绪状态。未接入模型健康记录的实现返回 Unavailable。
+    fn readiness(&self) -> PanelResult<Readiness> {
+        Err(PanelError::Unavailable)
+    }
     /// 序号小于 `before` 的最近判断，新的在前，每页 1..=50 项。未接入诊断的实现返回 Unavailable。
     fn judgments(&self, _before: Option<u64>, _limit: usize) -> PanelResult<JudgmentLog> {
         Err(PanelError::Unavailable)

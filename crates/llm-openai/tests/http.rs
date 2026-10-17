@@ -1,5 +1,8 @@
 mod support;
-use eve_llm_api::{ChatMessage, ChatRole, LlmError, LlmProvider, ModelRequest, ModelResponse};
+use eve_llm_api::{
+    ChatMessage, ChatRole, LlmError, LlmProvider, ModelRequest, ModelResponse, ProviderFailure,
+    ProviderFailureKind,
+};
 use eve_llm_openai::{OpenAiConfig, OpenAiProvider};
 use serde_json::json;
 use std::time::Duration;
@@ -114,15 +117,26 @@ async fn invalid_request_never_reaches_http() {
 
 #[tokio::test]
 async fn http_errors_are_sanitized_and_not_retried() {
-    for status in [400, 401, 429, 500] {
+    for (status, kind) in [
+        (400, ProviderFailureKind::Rejected),
+        (401, ProviderFailureKind::Unauthorized),
+        (402, ProviderFailureKind::PaymentRequired),
+        (429, ProviderFailureKind::RateLimited),
+        (500, ProviderFailureKind::ServerError),
+    ] {
         let mut reply = Reply::json(json!({"error":{"message":"fake-key private-input"}}));
         reply.status = status;
         let mut server = Server::start(vec![reply]).await;
         let provider = OpenAiProvider::new(config(&server.url), "fake-key").unwrap();
+        let error = provider.complete(request()).await.unwrap_err();
         assert_eq!(
-            provider.complete(request()).await.unwrap_err(),
-            LlmError::Provider(format!("OpenAI HTTP {status}"))
+            error,
+            LlmError::ProviderFailed(ProviderFailure {
+                kind,
+                http_status: Some(status)
+            })
         );
+        assert!(!error.to_string().contains("private-input"));
         server.next().await;
         assert!(server.requests.try_recv().is_err());
     }
@@ -138,7 +152,7 @@ async fn redirects_are_not_followed_with_credentials() {
     let provider = OpenAiProvider::new(config(&server.url), "fake-key").unwrap();
     assert_eq!(
         provider.complete(request()).await.unwrap_err(),
-        LlmError::Provider("OpenAI HTTP 307".into())
+        LlmError::ProviderFailed(ProviderFailure::http(307).unwrap())
     );
     server.next().await;
     assert!(target.requests.try_recv().is_err());
@@ -157,7 +171,7 @@ async fn bounds_fixed_and_chunked_response_bodies() {
         let provider = OpenAiProvider::new(cfg, "fake-key").unwrap();
         assert_eq!(
             provider.complete(request()).await.unwrap_err(),
-            LlmError::Provider("OpenAI 响应超过字节上限".into())
+            LlmError::ProviderFailed(ProviderFailure::new(ProviderFailureKind::ResponseTooLarge))
         );
         server.next().await;
     }
@@ -198,10 +212,11 @@ async fn rejects_bad_json_and_incomplete_http_responses_without_body_leakage() {
         LlmError::Protocol("OpenAI 响应不是有效 JSON".into())
     );
     server.next().await;
-    assert!(matches!(
-        provider.complete(request()).await,
-        Err(LlmError::Provider(_))
-    ));
+    // 达到单次输出上限的未完成响应记为截断。
+    assert_eq!(
+        provider.complete(request()).await.unwrap_err(),
+        LlmError::ProviderFailed(ProviderFailure::new(ProviderFailureKind::Truncated))
+    );
     server.next().await;
 }
 
@@ -234,7 +249,7 @@ async fn transport_failures_and_truncated_bodies_are_sanitized() {
     let provider = OpenAiProvider::new(config(&url), "fake-key").unwrap();
     assert_eq!(
         provider.complete(request()).await.unwrap_err(),
-        LlmError::Provider("OpenAI 网络请求失败".into())
+        LlmError::ProviderFailed(ProviderFailure::new(ProviderFailureKind::Network))
     );
 
     let mut reply = Reply::json(final_response("回复"));
@@ -243,7 +258,7 @@ async fn transport_failures_and_truncated_bodies_are_sanitized() {
     let provider = OpenAiProvider::new(config(&server.url), "fake-key").unwrap();
     assert_eq!(
         provider.complete(request()).await.unwrap_err(),
-        LlmError::Provider("OpenAI 网络请求失败".into())
+        LlmError::ProviderFailed(ProviderFailure::new(ProviderFailureKind::Network))
     );
     server.next().await;
 }

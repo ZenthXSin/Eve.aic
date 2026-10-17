@@ -104,6 +104,7 @@ impl LocalPanel {
             .route("/app.js", get(script))
             .route("/style.css", get(styles))
             .route("/api/status", get(status))
+            .route("/api/readiness", get(readiness))
             .route("/api/sessions", get(sessions))
             .route("/api/tasks", get(tasks))
             .route("/api/session", post(session))
@@ -414,6 +415,12 @@ async fn styles() -> impl IntoResponse {
 }
 async fn status(State(shared): State<Arc<Shared>>) -> Response {
     match shared.service.status() {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+async fn readiness(State(shared): State<Arc<Shared>>) -> Response {
+    match shared.service.readiness() {
         Ok(value) => Json(value).into_response(),
         Err(e) => failure(e),
     }

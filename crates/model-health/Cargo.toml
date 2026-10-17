@@ -1,0 +1,12 @@
+[package]
+name = "eve-model-health"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-llm-api = { path = "../llm-api" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
