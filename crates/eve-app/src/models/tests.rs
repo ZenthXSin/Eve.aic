@@ -43,6 +43,7 @@ impl Harness {
                     config::openai_schema(),
                     config::model_uses_schema(),
                     config::dialogue_schema(),
+                    config::history_schema(),
                     model_roles_schema(),
                 ],
             )

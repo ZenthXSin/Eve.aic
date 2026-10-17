@@ -411,6 +411,8 @@ enum PermissionFailure {
 pub struct LlmHost {
     provider: Arc<dyn LlmProvider>,
     model_resolver: Option<Arc<dyn LlmModelResolver>>,
+    history_resolver: Option<Arc<dyn eve_llm_api::HistoryWindowResolver>>,
+    history_window: Option<eve_llm_api::HistoryWindow>,
     execution_budget: Option<Arc<eve_llm_api::TurnBudget>>,
     pub(crate) registry: Arc<dyn ServiceRegistry>,
     pub(crate) kernel: Kernel,
@@ -460,6 +462,8 @@ impl LlmHost {
         Ok(Self {
             provider,
             model_resolver: None,
+            history_resolver: None,
+            history_window: None,
             execution_budget: None,
             registry,
             kernel,
@@ -478,6 +482,15 @@ impl LlmHost {
         self
     }
 
+    /// 显式启用历史窗口；未装配时保留原有完整历史行为。
+    pub fn with_history_resolver(
+        mut self,
+        resolver: Arc<dyn eve_llm_api::HistoryWindowResolver>,
+    ) -> Self {
+        self.history_resolver = Some(resolver);
+        self
+    }
+
     /// 每次认知尝试独立预算；克隆继续共享工具槽位和串行队列。
     pub fn with_execution_budget(mut self, budget: Arc<eve_llm_api::TurnBudget>) -> Self {
         self.execution_budget = Some(budget);
@@ -486,6 +499,13 @@ impl LlmHost {
 
     pub(crate) fn for_turn(&self) -> Result<Self, LlmError> {
         let mut host = self.clone();
+        if let Some(resolver) = &self.history_resolver {
+            let window = catch_unwind(AssertUnwindSafe(|| resolver.resolve()))
+                .map_err(|_| LlmError::Backend("历史窗口解析回调发生异常".into()))??;
+            window.validate()?;
+            host.history_window = Some(window);
+        }
+        host.history_resolver = None;
         if let Some(resolver) = &self.model_resolver {
             let selected = catch_unwind(AssertUnwindSafe(|| resolver.resolve()))
                 .map_err(|_| LlmError::Backend("模型解析回调发生异常".into()))??;
@@ -571,6 +591,11 @@ impl LlmHost {
             if let Err(error) = validate_context(&prepared.context) {
                 return Err(fail(error, diagnostics));
             }
+        }
+        if let Some(window) = self.history_window
+            && let Err(error) = crate::history::apply(&mut prepared.context, window)
+        {
+            return Err(fail(error, diagnostics));
         }
         let mut transcript = vec![ChatMessage::text(ChatRole::User, input.text.clone())];
         let definitions = prepared

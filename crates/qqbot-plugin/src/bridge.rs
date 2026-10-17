@@ -322,6 +322,10 @@ fn failed_turn_notice(report: &ControlReport) -> String {
         Some(LlmError::ProviderTimeout) => "模型服务响应超时".into(),
         Some(LlmError::Provider(_)) => "模型服务未能完成回复".into(),
         Some(LlmError::RoundLimit) => "本轮达到工具调用次数上限".into(),
+        Some(LlmError::HistoryWindowExceeded) => {
+            "最近一轮历史超过上下文窗口，原记录仍保留；请在面板 runtime.history 调大 max_bytes"
+                .into()
+        }
         _ => "本轮执行或状态保存未能完成".into(),
     };
     let effects = match report.run.started_tools {

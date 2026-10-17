@@ -106,7 +106,10 @@ impl ModelOutcome {
                 failure: ProviderFailure::new(ProviderFailureKind::Other),
             },
             // 上下文、工具轮次与宿主后端的失败不是模型请求的结局。
-            LlmError::Context(_) | LlmError::RoundLimit | LlmError::Backend(_) => return None,
+            LlmError::Context(_)
+            | LlmError::HistoryWindowExceeded
+            | LlmError::RoundLimit
+            | LlmError::Backend(_) => return None,
         })
     }
 }

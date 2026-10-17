@@ -13,6 +13,7 @@ use std::sync::Arc;
 mod cognition_executor;
 pub use cognition_executor::{BudgetedSessionRunner, ControlGoalExecutor};
 mod control_runner;
+mod history;
 mod llm_host;
 mod relation_judge;
 mod session_host;

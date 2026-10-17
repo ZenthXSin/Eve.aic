@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 HERE = pathlib.Path(__file__).resolve().parent
+HISTORY_TURNS = 16  # 核心入口默认的完整历史窗口；完整持久账本在每轮末独立核对。
 
 
 def require(condition, diagnostic):
@@ -176,7 +177,14 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes):
     tool_count = sum(message["text"].startswith("echo:") for message in messages)
     require(not provider.errors and len(requests) == count + tool_count, "wrong_model_request_count")
     require(sum(request["tool"] for request in requests) == tool_count, "wrong_tool_result_count")
-    require(requests[0]["user_count"] == initial_turns + 1, "history_not_restored")
+    completed = initial_turns
+    for request in requests:
+        require(request["user_count"] == min(completed, HISTORY_TURNS) + 1, "wrong_history_window")
+        if request["tool"]:
+            completed += 1
+        elif not messages[completed - initial_turns]["text"].startswith("echo:"):
+            completed += 1
+    require(completed == initial_turns + count, "missing_request_round")
     metrics = json.loads(metrics_path.read_text())
     latencies = metrics["latency_ms"]
     require(len(latencies) == count and all(math.isfinite(value) and value >= 0 for value in latencies),
