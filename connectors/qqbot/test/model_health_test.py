@@ -138,7 +138,7 @@ class ModelHealthAcceptance(interest_test.InterestAcceptance):
                        if line.startswith("EVE_WEB_READY "))
             result = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=120, env={
                 **os.environ, "EVE_PANEL_URL": url, "EVE_PANEL_TOKEN": PANEL_TOKEN,
-                "EVE_WEB_ARTIFACTS": str(self.work / "browser")})
+                "EVE_WEB_ARTIFACTS": os.environ.get("EVE_WEB_ARTIFACTS", str(self.work / "browser"))})
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(json.loads(result.stdout.strip().splitlines()[-1]), {"ok": True})
 
