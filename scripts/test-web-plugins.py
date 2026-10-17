@@ -136,7 +136,7 @@ def main():
                     require(api(url, path, token=None)[0] == 401, "未登录插件接口没有被拒绝")
                 require(api(url, "/api/plugins")[0] == 200, "无法读取真实插件")
                 links = api(url, "/api/plugin-pages")[1]
-                require(len([link for link in links if link["plugin_id"] == "eve.config"]) == 5, "配置插件没有注册全部页面")
+                require(len([link for link in links if link["plugin_id"] == "eve.config"]) == 6, "配置插件没有注册全部页面")
                 require(any(link["plugin_id"] == "eve.interest.settings" and link["page"]["id"] == "learning" for link in links), "未传启动参数时缺少兴趣学习页面")
                 if "--browser" in sys.argv:
                     subprocess.run(["node", str(ROOT / "scripts/test-web-plugins-browser.mjs"), url, TOKEN], check=True,
@@ -172,6 +172,11 @@ def main():
                 runtime = page("runtime.llm")
                 require(next(f for f in runtime["fields"] if f["id"] == "max_parallel_tool_calls")["value"] == old_parallel,
                         "启动时捕获字段错误地热更新")
+                uses = page("runtime.model_uses")
+                result = save(uses, {"dialogue_max_output_tokens": 512})
+                require(not any(k.startswith("runtime.model_uses.") for k in result["restart_required"]), f"用途输出上限不应需要重启：{result['restart_required']}")
+                require(next(f for f in page("runtime.model_uses")["fields"] if f["id"] == "dialogue_max_output_tokens")["value"] == 512,
+                        "用途输出上限保存后未立即生效")
                 duplicate = json.dumps({"plugin_id": "eve.config", "page_id": "provider.openai", "instance": primary["instance"], "expected_revision": 0})[:-1] + ',"values":{"model":null,"model":"bad"}}'
                 require(api(url, "/api/plugin-pages/save", raw=duplicate.encode())[0] == 400, "重复字段未拒绝")
 
