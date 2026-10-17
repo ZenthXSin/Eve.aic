@@ -192,6 +192,13 @@ impl Expressions {
         }
         changed
     }
+    pub(crate) fn contains(&self, scope: &ContextScope, id: &str, text: &str) -> bool {
+        let id = hash(id.as_bytes());
+        let body = hash(text.as_bytes());
+        self.rows
+            .iter()
+            .any(|r| r.active && r.scope == *scope && r.id == id && r.body == body)
+    }
     pub(crate) fn snapshot(&self, scope: Option<&ContextScope>) -> Option<ExpressionSnapshot> {
         let rows: Vec<_> = self
             .rows

@@ -963,6 +963,12 @@ async fn run_qqbot_composed(
             })
         });
         let context: Arc<dyn ContextAssembler> = if let Some(memory) = &memory {
+            let context = Arc::new(crate::qq_conversation::ConversationContext {
+                wrapped: context,
+                memory: memory.clone(),
+                training: training.0.clone(),
+                registry: registry.clone(),
+            });
             let context = MemoryContext::new("qq", memory.clone(), context)?;
             Arc::new(if options.self_learning {
                 context.prefer_recent()

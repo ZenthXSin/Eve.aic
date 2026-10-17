@@ -183,7 +183,7 @@ class Acceptance(unittest.TestCase):
             for owner, entries in state["entries"].items()}
 
     def has_training(self, request):
-        return any(m["role"] == "system" and "主动提问训练模式" in m.get("content", "") for m in request["messages"])
+        return any(m["role"] == "system" and "当前会话允许从交互中学习表达" in m.get("content", "") for m in request["messages"])
 
     def test_builtin_expression_learning_from_old_receipts_is_local_idempotent_and_resettable(self):
         # 旧版记录没有表达统计；启动新版仅在本地导入，不回放请求或投递。

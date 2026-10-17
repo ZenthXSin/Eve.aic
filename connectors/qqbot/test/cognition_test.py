@@ -206,7 +206,7 @@ class CognitionAcceptance(unittest.TestCase):
                             for goal in observed_goals.values()))
         self.assertFalse(request.get("tools"))
         self.assertFalse(any(message["role"] == "tool" for message in request["messages"]))
-        self.assertFalse(any("主动提问训练模式" in message.get("content", "")
+        self.assertFalse(any("当前会话允许从交互中学习表达" in message.get("content", "")
                              for message in request["messages"]))
         parent = self.parent(description)
         child = self.child(description)
@@ -281,7 +281,7 @@ class CognitionAcceptance(unittest.TestCase):
         self.assert_one_reflection(description)
         chats = [request["body"] for request in self.requests if request["kind"] == "chat"]
         self.assertEqual(len(chats), 2)
-        self.assertTrue(all(any("主动提问训练模式" in message.get("content", "")
+        self.assertTrue(all(any("当前会话允许从交互中学习表达" in message.get("content", "")
                                for message in chat["messages"]) for chat in chats))
         self.assertFalse(any(event.get("type") == "reply" and event.get("id") == "front"
                              for event in self.events))

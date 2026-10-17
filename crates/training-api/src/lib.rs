@@ -39,6 +39,15 @@ pub trait TrainingService: Send + Sync {
     ) -> PluginResult<Option<ExpressionSnapshot>> {
         Ok(None)
     }
+    /// 只核对本会话仍有效的表达样本及原文摘要；停止、重置或未实现时不得提供新示例。
+    fn is_expression_source(
+        &self,
+        _scope: &ContextScope,
+        _message_id: &str,
+        _text: &str,
+    ) -> PluginResult<bool> {
+        Ok(false)
+    }
     /// 跨会话仅汇总数值特征，供样本不足时采用一般表达习惯。
     fn expression_baseline(&self) -> PluginResult<Option<ExpressionSnapshot>> {
         Ok(None)

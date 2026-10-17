@@ -179,6 +179,51 @@ pub(crate) fn model_uses_schema() -> ConfigSchema {
     }
 }
 
+pub(crate) fn memory_digest_schema() -> ConfigSchema {
+    let field = |default, minimum, maximum, environment: &str| {
+        let mut value = ConfigField::new(
+            ConfigKind::Integer {
+                minimum: Some(minimum),
+                maximum: Some(maximum),
+            },
+            Some(json!(default)),
+        );
+        value.environment = Some(environment.into());
+        value
+    };
+    let mut enabled = ConfigField::new(ConfigKind::Boolean, Some(json!(true)));
+    enabled.environment = Some("EVE_MEMORY_DIGEST_ENABLED".into());
+    ConfigSchema {
+        namespace: crate::qq_conversation::NAMESPACE.into(),
+        version: 1,
+        fields: BTreeMap::from([
+            ("enabled".into(), enabled),
+            (
+                "max_episodes".into(),
+                field(4, 0, 8, "EVE_MEMORY_DIGEST_MAX_EPISODES"),
+            ),
+            (
+                "max_expression_examples".into(),
+                field(3, 0, 4, "EVE_MEMORY_DIGEST_MAX_EXPRESSION_EXAMPLES"),
+            ),
+            (
+                "max_bytes".into(),
+                field(6144, 512, 16384, "EVE_MEMORY_DIGEST_MAX_BYTES"),
+            ),
+        ]),
+    }
+}
+
+pub(crate) fn dialogue_schema() -> ConfigSchema {
+    let mut field = ConfigField::new(ConfigKind::Boolean, Some(json!(true)));
+    field.environment = Some("EVE_DIALOGUE_NATURAL_STYLE".into());
+    ConfigSchema {
+        namespace: crate::dialogue::NAMESPACE.into(),
+        version: 1,
+        fields: BTreeMap::from([("natural_style".into(), field)]),
+    }
+}
+
 pub(crate) fn configured_role(snapshot: &ConfigSnapshot) -> Result<Option<ModelRole>, AppError> {
     let role: String = snapshot.get("model_role")?;
     match role.as_str() {

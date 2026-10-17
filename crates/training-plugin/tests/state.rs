@@ -154,6 +154,12 @@ async fn expressions_persist_deduplicate_reset_and_preserve_state_on_failure() {
     let old = service(&registry);
     let one = scope("group-1", "user-1");
     old.observe_user_message(&one, "m-1", "今天下雨了").unwrap();
+    assert!(old.is_expression_source(&one, "m-1", "今天下雨了").unwrap());
+    assert!(!old.is_expression_source(&one, "m-1", "另一段原文").unwrap());
+    assert!(
+        !old.is_expression_source(&scope("group-1", "user-2"), "m-1", "今天下雨了")
+            .unwrap()
+    );
     let first = old.expression_snapshot(&one).unwrap().unwrap();
     old.observe_user_message(&one, "m-1", "今天下雨了").unwrap();
     assert_eq!(old.expression_snapshot(&one).unwrap(), Some(first.clone()));
@@ -170,6 +176,7 @@ async fn expressions_persist_deduplicate_reset_and_preserve_state_on_failure() {
     state.fail.store(false, Ordering::SeqCst);
     old.observe_user_message(&one, "m-2", "天气如何？").unwrap();
     old.set_enabled(&one, false).unwrap();
+    assert!(!old.is_expression_source(&one, "m-1", "今天下雨了").unwrap());
     old.observe_user_message(&one, "off", "停止后不学习")
         .unwrap();
     assert_eq!(old.expression_snapshot(&one).unwrap().unwrap().samples, 2);
@@ -178,6 +185,7 @@ async fn expressions_persist_deduplicate_reset_and_preserve_state_on_failure() {
         .unwrap();
     assert_eq!(old.expression_snapshot(&one).unwrap().unwrap().samples, 2);
     old.reset_expression(&one).unwrap();
+    assert!(!old.is_expression_source(&one, "m-1", "今天下雨了").unwrap());
     old.observe_user_message(&one, "m-1", "今天下雨了").unwrap();
     assert_eq!(old.expression_snapshot(&one).unwrap(), None);
     old.observe_user_message(&one, "m-3", "新的示范").unwrap();
@@ -261,7 +269,7 @@ async fn expression_features_exclude_commands_quoted_material_and_freeze_scoped_
         .assemble_scoped(input(), Some(one.clone()))
         .await
         .unwrap();
-    assert!(frozen.revision.starts_with("eve-training-4:"));
+    assert!(frozen.revision.starts_with("eve-training-5:"));
     assert!(frozen.profile.contains("当前可信会话"));
     assert!(!frozen.profile.contains("我想出去"));
     let fallback = context

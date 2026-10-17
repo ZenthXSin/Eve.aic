@@ -24,6 +24,17 @@ def evaluator(records):
 
 
 class Comparisons(unittest.TestCase):
+    def test_explicit_identity_change_is_used_and_labelled_without_changing_inputs(self):
+        seen = []
+        def generate(prompt, identity, record, timeout):
+            seen.append((identity, record))
+            return "回复"
+        report, _ = compare.compare(evidence(1), "old", "new", "old-identity", generate, evaluator,
+                                    candidate_identity="new-identity")
+        self.assertFalse(report["same_identity"])
+        self.assertEqual([identity for identity, _ in seen], ["old-identity", "new-identity"])
+        self.assertEqual(seen[0][1], seen[1][1])
+
     def test_public_cli_never_reads_private_source_secret_or_persists_generated_text(self):
         result = {"complete": True, "advisory_non_regression": True}
         with tempfile.TemporaryDirectory() as directory:
