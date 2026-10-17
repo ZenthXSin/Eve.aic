@@ -136,7 +136,10 @@ def main():
                     require(api(url, path, token=None)[0] == 401, "未登录插件接口没有被拒绝")
                 require(api(url, "/api/plugins")[0] == 200, "无法读取真实插件")
                 links = api(url, "/api/plugin-pages")[1]
-                require(len([link for link in links if link["plugin_id"] == "eve.config"]) == 6, "配置插件没有注册全部页面")
+                config_pages = [link["page"]["id"] for link in links if link["plugin_id"] == "eve.config"]
+                required_pages = {"provider.jev", "provider.openai", "runtime.llm", "runtime.messages", "runtime.model_uses", "runtime.models"}
+                require(required_pages.issubset(config_pages) and len(config_pages) == len(set(config_pages)),
+                        "配置插件缺少基础页面或存在重复页面")
                 require(any(link["plugin_id"] == "eve.interest.settings" and link["page"]["id"] == "learning" for link in links), "未传启动参数时缺少兴趣学习页面")
                 if "--browser" in sys.argv:
                     subprocess.run(["node", str(ROOT / "scripts/test-web-plugins-browser.mjs"), url, TOKEN], check=True,
