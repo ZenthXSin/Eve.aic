@@ -997,17 +997,15 @@ pub(crate) async fn run(
                         } else { None };
                         status.send_modify(|s| s.completed += 1);
                         replies.push_back(Reply { message: current.message, text: text.clone(), guard, interaction, invite: None });
+                    } else if !report.cancel_requested {
+                        status.send_modify(|s| s.failed += 1);
+                        warn(&ctx, "turn_failed");
+                        replies.push_back(Reply { message: current.message,
+                            text: failed_turn_notice(&report), guard: ReplyGuard::Current(report.key),
+                            interaction: None, invite: None });
                     } else {
-                        if !report.cancel_requested {
-                            status.send_modify(|s| s.failed += 1);
-                            warn(&ctx, "turn_failed");
-                            replies.push_back(Reply { message: current.message,
-                                text: failed_turn_notice(&report), guard: ReplyGuard::Current(report.key),
-                                interaction: None, invite: None });
-                        } else {
-                            mark_failed(&mut ledger, &ctx, &config.app_id, &current.message.id)?;
-                            finish(&mut stdin, &current.message.id).await?;
-                        }
+                        mark_failed(&mut ledger, &ctx, &config.app_id, &current.message.id)?;
+                        finish(&mut stdin, &current.message.id).await?;
                     }
                 }
                 frame = frames.next() => {
