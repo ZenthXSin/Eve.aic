@@ -15,6 +15,33 @@ import time
 
 MAGIC = b"EVE-QQ-TRAINING-1\n"
 MAX_ARCHIVE = 32 * 1024 * 1024
+MAX_RESEARCH_SOURCES = 8
+# 全功能体验：已合入 main 的 QQ 能力一次开启；语义召回需要独立 embedding 角色，控制面板只监听本机，均不在此列。
+FULL_PROFILE = ["--training", "--cognition", "--memory", "--self-learning", "--memory-recall", "--interest-learning",
+                "--skill-learning", "--tool-forging", "--plans", "--outreach", "--outreach-proactive-after-ms", "1800000",
+                "--clarify", "--agenda-context", "--reminders", "--goal-completion", "--learning-stop",
+                "--autonomy-budget", "200", "--segmented", "--message-judge", "primary"]
+SUMMARY_TITLES = {"training": "QQ 主动提问训练结果", "full": "QQ 全功能体验结果"}
+SCOPES = {"training": "主动提问、用户表达统计与交流证据采集；未更新模型权重或已确认长期偏好",
+          "full": "全功能体验交流证据采集；计数只覆盖 QQ 回执与会话，后台学习、计划与提醒的记录在加密状态包中"}
+
+
+def host_command(binary, state_dir, profile="training", browser=None, research_sources=()):
+    if profile == "training":
+        if browser or research_sources:
+            raise ValueError("training_profile_extra")
+        extra = ["--training"]
+    elif profile == "full":
+        if not browser:
+            raise ValueError("full_profile_browser")
+        if len(research_sources) > MAX_RESEARCH_SOURCES or len(set(research_sources)) != len(research_sources):
+            raise ValueError("full_profile_research_sources")
+        extra = [*FULL_PROFILE, "--practice-browser", str(browser)]
+        for source in research_sources:
+            extra += ["--research-source", source]
+    else:
+        raise ValueError("profile")
+    return [str(binary), *extra, "--state-dir", str(state_dir)]
 
 
 def write_json(path, value):
@@ -183,20 +210,21 @@ def unseal(source, output):
         archive.extractall(output, filter="data")
 
 
-def run_window(root, seconds, binary, seed_state=None):
+def run_window(root, seconds, binary, seed_state=None, command=None):
     if not 60 <= seconds <= 21300:
         raise ValueError("window_range")
     root.mkdir(parents=True, exist_ok=False)
     started = time.time()
     window = {"version": 1, "requested_seconds": seconds, "ready": False,
               "sandbox": os.environ.get("QQBOT_SANDBOX", "") == "true",
-              "source_sha": os.environ.get("GITHUB_SHA", "local")}
+              "source_sha": os.environ.get("GITHUB_SHA", "local"), "continued": seed_state is not None}
     write_json(root / "window.json", window)
     if seed_state is not None:
         seed_round(root, seed_state)
     child = None
     with (root / "stdout").open("w") as out, (root / "stderr").open("w") as err:
-        child = subprocess.Popen([str(binary), "--training", "--state-dir", str(root / "state")], stdout=out, stderr=err)
+        command = command or host_command(binary, root / "state")
+        child = subprocess.Popen(command, stdout=out, stderr=err)
         interrupted = False
         def stopping(_signal, _frame):
             nonlocal interrupted
@@ -208,7 +236,7 @@ def run_window(root, seconds, binary, seed_state=None):
                     ready_at = time.time()
                     window.update(ready=True, ready_at=ready_at, deadline=min(ready_at + seconds, started + 21300))
                     write_json(root / "window.json", window)
-                    print("QQBot 网关已就绪：可私聊或在已授权群 @ 机器人；/train start 开始主动提问。", flush=True)
+                    print("QQBot 网关已就绪：可私聊或在已授权群 @ 机器人；/train start 开始主动提问，/help tools 查看已装配的工具。", flush=True)
                     print(f"窗口预计结束 UTC：{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(window['deadline']))}", flush=True)
                 if time.time() >= window.get("deadline", started + 60):
                     break
@@ -229,7 +257,7 @@ def run_window(root, seconds, binary, seed_state=None):
     return window
 
 
-def finish(root, output):
+def finish(root, output, profile="training"):
     try:
         report = collect(root / "state/state.json")
     except (ValueError, KeyError, TypeError, OSError):
@@ -246,13 +274,13 @@ def finish(root, output):
                                and all(report["counts"].get(key, 0) == 0
                                        for key in ("failed", "failed_turns", "unconfirmed"))),
             "experience_acceptance": "not_evaluated",
-            "training_scope": "主动提问、用户表达统计与交流证据采集；未更新模型权重或已确认长期偏好"}
+            "training_scope": SCOPES[profile]}
     write_json(output / "training-summary.json", safe)
     print(json.dumps(safe, ensure_ascii=False), flush=True)
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf8") as summary:
-            summary.write("## QQ 主动提问训练结果\n\n```json\n" + json.dumps(safe, ensure_ascii=False, indent=2) + "\n```\n\n交流记录和完整报告在加密状态包中。依据实际证据进行下一轮调整。\n")
+            summary.write("## " + SUMMARY_TITLES[profile] + "\n\n```json\n" + json.dumps(safe, ensure_ascii=False, indent=2) + "\n```\n\n交流记录和完整报告在加密状态包中。依据实际证据进行下一轮调整。\n")
     return safe
 
 
@@ -266,7 +294,11 @@ def main():
     parser.add_argument("--decrypt", type=Path)
     parser.add_argument("--wait-ready", action="store_true")
     parser.add_argument("--wait-result", action="store_true")
+    parser.add_argument("--profile", choices=sorted(SUMMARY_TITLES), default="training")
+    parser.add_argument("--practice-browser", type=Path, help="全功能体验的无头 Chromium/Chrome 程序")
+    parser.add_argument("--research-source", action="append", default=[], help="全功能体验的受控研究入口页，可重复至多 8 个")
     args = parser.parse_args()
+    title = SUMMARY_TITLES[args.profile]
     controller = not (args.decrypt or args.wait_ready or args.wait_result)
     exit_code = 0
     try:
@@ -298,7 +330,7 @@ def main():
                         print(content, flush=True)
                         if os.environ.get("GITHUB_STEP_SUMMARY"):
                             with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf8") as step:
-                                step.write("## QQ 主动提问训练结果\n\n```json\n" + content + "\n```\n\n完整交流证据已加密保存，供下一轮调整。\n")
+                                step.write("## " + title + "\n\n```json\n" + content + "\n```\n\n完整交流证据已加密保存，供下一轮调整。\n")
                     if result["exit_code"]:
                         raise ValueError("controller_failed_state_preserved")
                     return
@@ -311,8 +343,9 @@ def main():
         if not args.root:
             raise ValueError("missing_root")
         password()  # 启动前确认能保存训练结果。
-        run_window(args.root, args.seconds, args.binary, args.seed_state)
-        safe = finish(args.root, args.output)
+        command = host_command(args.binary, args.root / "state", args.profile, args.practice_browser, args.research_source)
+        run_window(args.root, args.seconds, args.binary, args.seed_state, command)
+        safe = finish(args.root, args.output, args.profile)
         if not safe["process_ok"] or not safe["window"]["ready"] or safe["evidence_status"] != "saved":
             raise ValueError("qq_process_failed_state_preserved")
     except (ValueError, OSError, subprocess.SubprocessError, tarfile.TarError) as error:

@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import signal
 import tempfile
@@ -15,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 BINARY = pathlib.Path(os.environ.get("EVE_QQBOT_BINARY", ROOT / "target/debug/eve-qqbot"))
 FAKE = ROOT / "connectors/qqbot/test/fake-bridge.mjs"
+BROWSER = os.environ.get("EVE_TEST_BROWSER") or shutil.which("google-chrome")
 CANCELLED = "已取消当前任务；已完成的工具操作不会撤销。"
 NO_CURRENT = "当前会话没有可控制的任务，请先发送普通文字开始任务。"
 SIDE_EFFECTS = "刚才已有工具执行，重新运行可能重复操作。要继续处理新要求，请发“新任务：……”或 /new 内容；已发生的操作不会自动撤销。"
@@ -357,6 +359,63 @@ class Acceptance(unittest.TestCase):
         finally:
             if child.poll() is None:
                 child.kill(); child.wait()
+
+    @unittest.skipUnless(BROWSER, "需要 EVE_TEST_BROWSER 或 PATH 中的 google-chrome（全功能体验开启网页实践）")
+    def test_full_experience_window_starts_every_capability_and_continues_from_encrypted_state(self):
+        launcher = self.work / "launch-eve"
+        scenario = self.work / "full-scenario.json"
+        launcher.write_text("#!/usr/bin/env python3\nimport os, sys\nos.execv(" + repr(str(BINARY)) + ", [" + repr(str(BINARY)) + ", *sys.argv[1:], '--bridge-script', " + repr(str(FAKE)) + ", '--bridge-arg', " + repr(str(scenario)) + "])\n")
+        launcher.chmod(0o700)
+        env = {k: os.environ[k] for k in ("PATH", "SystemRoot", "TEMP", "TMP") if k in os.environ}
+        env.update(QQBOT_APP_SECRET="test-app-secret", QQBOT_SANDBOX="false", EVE_OPENAI_API_KEY="test-model-secret",
+                   EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}", EVE_OPENAI_PROTOCOL="chat")
+        script = ROOT / "connectors/qqbot/training-window.py"
+
+        def window(name, message, gate, seed=None):
+            scenario.write_text(json.dumps({"script": [{"send": message}, self.wait_command(message["id"]),
+                                                       {"wait_file": str(self.gate(gate))}]}))
+            root, output = self.work / name, self.work / (name + "-results")
+            command = ["python3", str(script), "--profile", "full", "--practice-browser", BROWSER,
+                       "--research-source", "https://example.com/docs/", "--root", str(root), "--output", str(output),
+                       "--seconds", "60", "--binary", str(launcher)]
+            child = subprocess.Popen(command + (["--seed-state", str(seed)] if seed else []), cwd=ROOT, env=env,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                ready = subprocess.run(["python3", str(script), "--profile", "full", "--wait-ready", "--root", str(root),
+                                        "--output", str(output)], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+                self.assertEqual(ready.returncode, 0, ready.stdout + ready.stderr)
+                self.gate(gate).touch()
+                stdout, stderr = child.communicate(timeout=60)
+                self.assertEqual(child.returncode, 0, stdout + stderr)
+                self.assertNotIn("test-app-secret", stdout + stderr)
+                self.assertNotIn(message["text"], stdout + stderr)
+            finally:
+                if child.poll() is None:
+                    child.kill(); child.wait()
+            summary = json.loads((output / "training-summary.json").read_text())
+            self.assertTrue(summary["process_ok"])
+            self.assertTrue(summary["interaction_ok"])
+            self.assertEqual(summary["counts"]["model_sent"], 1)
+            self.assertIn("全功能体验", summary["training_scope"])
+            restored = self.work / (name + "-restored")
+            result = subprocess.run(["python3", str(script), "--decrypt", str(output / "training-state.enc"),
+                                     "--output", str(restored)], cwd=ROOT, env=env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return root, restored
+
+        # 共享既有 HTTP 夹具的持久化准入检查目录。
+        (self.work / "state").symlink_to(self.work / "first/state", target_is_directory=True)
+        first, restored = window("first", self.message("full-1", "我最近在学 CSS 网格布局"), "first-close")
+        owners = set(json.loads((first / "state/state.json").read_text())["entries"])
+        # 预算、兴趣与记忆只有对应能力开启才落盘，证明全功能参数实际传给了宿主。
+        for owner in ("eve.session", "eve.channel.qqbot", "eve.training", "eve.memory", "eve.interest", "eve.budget"):
+            self.assertIn(owner, owners)
+        _, again = window("second", self.message("full-2", "recall:我最近在学 CSS 网格布局", "我最近在学 CSS 网格布局"),
+                             "second-close", seed=restored / "state")
+        self.assertTrue(json.loads((again / "window.json").read_text())["continued"])
+        self.assertEqual(len(json.loads((again / "training-report.json").read_text())["evidence"]), 1)
+        # 原加密包解出的状态保持不变，可以再次续接。
+        self.assertEqual(json.loads((restored / "state/state.json").read_bytes())["entries"].keys(), owners)
 
     def test_tool_reply_restart_recall_and_duplicate_no_replay(self):
         first = self.run_eve([self.message("ROBOT1.0_.b6nx.CVryAO0nR58RXuU6SC.m92gc19j02qKqdm8ek!", "echo:marker", "marker")])
