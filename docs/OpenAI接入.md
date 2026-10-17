@@ -55,7 +55,7 @@ let provider = OpenAiProvider::new(OpenAiConfig::new(model), credential)?;
 | --- | --- |
 | 无效模型/URL/凭据/期限/上限 | `Configuration`，不发请求 |
 | Eve 消息非法、空回复、坏 JSON、重复 JSON 键、非对象参数、空或重复调用 ID | `Protocol` |
-| HTTP 非 2xx（含重定向）、响应未 completed、输出项未完成、网络失败、响应超过上限 | `Provider`，只保存安全类别或 HTTP 状态码 |
+| HTTP 非 2xx（含重定向）、响应未 completed、输出项未完成、截断、内容过滤、网络失败、响应超过上限 | `ProviderFailed`：固定类别与 HTTP 状态码，不含响应正文，类别见[模型健康与就绪状态](./模型健康与就绪状态.md#失败类别) |
 | HTTP 客户端传输期限届满 | `ProviderTimeout` |
 | 当前协议不能完整映射的输出或函数名 | `Unsupported` |
 

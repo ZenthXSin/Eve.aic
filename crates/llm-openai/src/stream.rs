@@ -123,8 +123,11 @@ impl ResponseStream {
         {
             return Err(invalid());
         }
-        if matches!(kind, "error" | "response.failed" | "response.incomplete") {
-            return Err(LlmError::Provider("Responses 流未成功完成".into()));
+        if kind == "response.incomplete" {
+            return Err(crate::incomplete(&event["response"]));
+        }
+        if matches!(kind, "error" | "response.failed") {
+            return Err(crate::failed(eve_llm_api::ProviderFailureKind::Other));
         }
         if kind == "response.created" {
             if self.response_id.is_some() || !self.items.is_empty() {

@@ -66,6 +66,9 @@ pub enum SessionFailureCode {
 #[serde(deny_unknown_fields)]
 pub struct SessionFailureEvidence {
     pub provider_http_status: Option<u16>,
+    /// Provider 给出的失败类别；旧记录与没有类别的失败缺省为 None，写出时省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_failure: Option<eve_llm_api::ProviderFailureKind>,
     pub tool_names: Vec<String>,
     pub tool_results: Vec<ToolResult>,
 }

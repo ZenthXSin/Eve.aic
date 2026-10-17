@@ -1633,3 +1633,28 @@ async fn plan_views_are_authenticated_strict_and_withdrawal_needs_the_read_revis
     );
     panel.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn readiness_requires_the_token_and_is_unavailable_by_default() {
+    let client = client();
+    let panel = panel(Arc::new(Service::default())).await;
+    let response = client
+        .get(url(&panel, "/api/readiness"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // 未接入模型健康记录的实现明确返回不可用，不显示成“已就绪”。
+    assert_code(
+        client
+            .get(url(&panel, "/api/readiness"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+    )
+    .await;
+    panel.stop().await.unwrap();
+}

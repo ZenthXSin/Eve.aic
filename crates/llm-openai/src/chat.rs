@@ -1,5 +1,7 @@
 //! Chat Completions 私有线协议；完整转换后才交给通用模型/工具契约。
-use eve_llm_api::{ChatRole, LlmError, ModelRequest, ModelResponse, ToolCall, ToolOutput};
+use eve_llm_api::{
+    ChatRole, LlmError, ModelRequest, ModelResponse, ProviderFailureKind, ToolCall, ToolOutput,
+};
 use serde_json::{Value, json};
 
 pub(crate) fn encode_request(model: &str, request: ModelRequest) -> Result<Value, LlmError> {
@@ -57,7 +59,7 @@ pub(crate) fn decode_response(bytes: &[u8]) -> Result<ModelResponse, LlmError> {
     let response: Value =
         crate::strict_json::from_slice(bytes).map_err(|_| protocol("Chat 响应不是有效 JSON"))?;
     if response.get("error").is_some_and(|v| !v.is_null()) {
-        return Err(LlmError::Provider("Chat 响应返回错误".into()));
+        return Err(crate::failed(ProviderFailureKind::Other));
     }
     let choices = response
         .get("choices")
@@ -76,9 +78,8 @@ pub(crate) fn decode_response(bytes: &[u8]) -> Result<ModelResponse, LlmError> {
     let finish = required_str(choice, "finish_reason")?;
     match finish {
         "stop" | "tool_calls" => {}
-        "length" | "content_filter" => {
-            return Err(LlmError::Provider("Chat 输出未完整完成".into()));
-        }
+        "length" => return Err(crate::failed(ProviderFailureKind::Truncated)),
+        "content_filter" => return Err(crate::failed(ProviderFailureKind::ContentFiltered)),
         _ => return Err(unsupported("不支持当前 Chat finish_reason")),
     }
     let message = choice
@@ -269,14 +270,17 @@ mod tests {
     }
     #[test]
     fn rejects_incomplete_unsupported_and_multiple_choices() {
-        for finish in ["length", "content_filter"] {
-            assert!(matches!(
-                decode(response(
-                    json!({"role":"assistant","content":"部分回复"}),
-                    finish
-                )),
-                Err(LlmError::Provider(_))
-            ));
+        for (finish, kind) in [
+            ("length", ProviderFailureKind::Truncated),
+            ("content_filter", ProviderFailureKind::ContentFiltered),
+        ] {
+            let error = decode(response(
+                json!({"role":"assistant","content":"部分回复"}),
+                finish,
+            ))
+            .unwrap_err();
+            assert_eq!(error.provider_failure().unwrap().kind, kind);
+            assert_eq!(error.provider_http_status(), None);
         }
         for message in [
             json!({"role":"assistant","content":null,"refusal":"拒绝",

@@ -165,3 +165,12 @@ input:focus { border-color: var(--accent); background: #fff; }
 .reflection-card .record-topline { margin-bottom: 6px; }
 .reflection-card p { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .event-summary { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+
+.readiness { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 18px 21px; margin-bottom: 18px; }
+.readiness-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; }
+.readiness-summary > div { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.readiness-summary strong { font-size: 15px; font-weight: 620; overflow-wrap: anywhere; }
+.readiness-roles { display: grid; gap: 6px; margin-top: 10px; }
+.readiness-role { display: grid; grid-template-columns: minmax(90px, 140px) auto 1fr; gap: 10px; align-items: center; font-size: 12px; padding: 7px 0; border-top: 1px solid var(--line); }
+.readiness-role .role-detail { color: #566277; overflow-wrap: anywhere; }
+@media (max-width: 640px) { .readiness-role { grid-template-columns: 1fr auto; } .readiness-role .role-detail { grid-column: 1 / -1; } }

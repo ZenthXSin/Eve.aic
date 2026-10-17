@@ -762,6 +762,10 @@ async fn run_qqbot_composed(
             _ => return Err("QQBOT_SANDBOX 必须为 true 或 false".into()),
         };
         let mut bootstrap = core_bootstrap(&options.agent_path)?;
+        // 按用途记录本进程实际模型请求的结局，供面板区分“通道已连接”与“模型能完成请求”；只在内存中。
+        let model_health = Arc::new(eve_model_health::HealthBook::new());
+        model_health.register("dialogue");
+        bootstrap.health = Some(model_health.clone());
         let plugin = QqBotPlugin::new(QqBotConfig {
             node_program: options.node_program,
             bridge_script: options.bridge_script,
@@ -1132,6 +1136,7 @@ async fn run_qqbot_composed(
         let tool_definitions: Vec<_> = std::iter::once(crate::services::echo_definition())
             .chain(bootstrap.tools.iter().map(|tool| tool.definition()))
             .collect();
+        let tools_registered = tool_definitions.len();
         let help_commands = crate::qq_help::Help::handler(tool_definitions.clone());
         bootstrap.context = Some(Arc::new(eve_dialogue_tools::CapabilitiesContext {
             inner: bootstrap.context.take().ok_or("对话上下文缺失")?,
@@ -1248,7 +1253,16 @@ async fn run_qqbot_composed(
             )))
         };
         // 后台学习组件的模型请求按用途计入自主运行预算；未启用预算时原样使用主模型。
-        let budgeted = |category: &str| budget_gate.wrap(core_resolver()?, category);
+        // 健康记录包在预算之内：预算拒绝没有发出请求，不算模型的结局。
+        let observed = |role: &str| -> Result<Arc<dyn eve_llm_api::LlmModelResolver>, AppError> {
+            model_health.register(role);
+            Ok(Arc::new(eve_model_health::ObservedResolver::new(
+                core_resolver()?,
+                role,
+                model_health.clone(),
+            )))
+        };
+        let budgeted = |category: &str| budget_gate.wrap(observed(category)?, category);
         let InterestComponents {
             observer: interest_observer,
             fetcher,
@@ -1272,7 +1286,7 @@ async fn run_qqbot_composed(
             let capabilities = qq_plan::capabilities(knowledge.is_some(), practice.is_some());
             let proposer: Arc<dyn PlanProposer> = match plan_proposer {
                 Some(proposer) => proposer,
-                None => Arc::new(ModelPlanProposer::new(core_resolver()?)),
+                None => Arc::new(ModelPlanProposer::new(observed("plan")?)),
             };
             let cognition: Arc<dyn eve_cognition_api::CognitionAdmin> =
                 Arc::new(background.as_ref().ok_or("计划入口缺少认知服务")?.admin()?);
@@ -1780,6 +1794,18 @@ async fn run_qqbot_composed(
                         }
                     }),
                     plans: plan_journal.clone(),
+                    readiness: crate::web_panel::PanelReadiness {
+                        health: model_health.clone(),
+                        settings: registry
+                            .get(&ServiceId::new(CONFIG_SERVICE_ID)?)?
+                            .ok_or("面板配置服务缺失")?
+                            .value
+                            .downcast::<ConfigServiceHandle>()
+                            .map_err(|_| "面板配置服务类型错误")?
+                            .0
+                            .clone(),
+                        tools_registered,
+                    },
                 }),
             )
             .await?;
@@ -1869,6 +1895,13 @@ async fn run_qqbot_composed(
                 }))
                 .collect(),
             panel.as_ref().map(eve_web_panel::LocalPanel::finished),
+            serde_json::json!({
+                "channel": "connected",
+                "tools_registered": tools_registered,
+                "model": "unverified",
+                "vision": "not_configured",
+            })
+            .to_string(),
         )
         .await
     }
@@ -2059,6 +2092,7 @@ async fn background_finished(mut receiver: Option<watch::Receiver<bool>>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_channel(
     mut status: watch::Receiver<QqBotStatus>,
     background: Option<watch::Receiver<bool>>,
@@ -2067,6 +2101,7 @@ async fn wait_channel(
     research: Option<watch::Receiver<bool>>,
     later: Vec<(watch::Receiver<bool>, &'static str)>,
     panel: Option<watch::Receiver<bool>>,
+    readiness: String,
 ) -> Result<(), AppError> {
     let stop = interrupted();
     let stopped_background = background_finished(background);
@@ -2088,6 +2123,8 @@ async fn wait_channel(
     loop {
         if status.borrow().ready && !status.borrow().closed && !ready_announced {
             eprintln!("EVE_QQBOT_READY");
+            // 通道就绪只说明网关已连接；模型要等实际请求才知道能否完成。
+            eprintln!("EVE_READINESS {readiness}");
             ready_announced = true;
         }
         if status.borrow().closed {

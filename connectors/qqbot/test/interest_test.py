@@ -96,6 +96,8 @@ class InterestAcceptance(unittest.TestCase):
                         assert time.monotonic() < deadline, "response gate timed out"
                 failing = kind in outer.failing or (kind == "interest" and outer.provider_failure)
                 status = 503 if failing else 200
+                if hasattr(outer, "http_status"):
+                    status = outer.http_status(kind, number) or status
                 text = outer.reply(kind, decoded, latest)
                 response = ({"error": {"message": "local provider unavailable", "type": "test_error"}}
                             if status != 200 else {"choices": [{"index": 0, "finish_reason": "stop",

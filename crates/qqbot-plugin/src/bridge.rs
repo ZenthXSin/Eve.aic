@@ -11,7 +11,9 @@ use eve_control_api::{
     CommitState, ControlEvent, ControlEventSink, ControlFuture, ControlInput, ControlPhase,
     ControlReport, ControlService, GenerationKey, RunFailure,
 };
-use eve_llm_api::{LlmError, LlmFuture, TurnEvent, TurnEventKind};
+use eve_llm_api::{
+    LlmError, LlmFuture, ProviderFailure, ProviderFailureKind, TurnEvent, TurnEventKind,
+};
 use eve_message_api::{IncomingMessage, MessageFuture, MessageService, RouteOutcome, RouteReport};
 use eve_plugin_api::{LogEntry, LogLevel, PluginContext, PluginError, PluginResult, TaskSignal};
 use eve_session_api::{SessionInput, SessionKey};
@@ -314,13 +316,8 @@ fn failed_turn_notice(report: &ControlReport) -> String {
         _ => None,
     };
     let reason = match error {
-        Some(error) if error.provider_http_status().is_some() => {
-            let status = error.provider_http_status().expect("checked status");
-            match status {
-                402 => "模型服务拒绝请求（HTTP 402），需要检查额度或单次输出预算".into(),
-                429 => "模型服务限流（HTTP 429）".into(),
-                _ => format!("模型服务请求失败（HTTP {status}）"),
-            }
+        Some(error) if error.provider_failure().is_some() => {
+            failure_reason(error.provider_failure().expect("checked failure"))
         }
         Some(LlmError::ProviderTimeout) => "模型服务响应超时".into(),
         Some(LlmError::Provider(_)) => "模型服务未能完成回复".into(),
@@ -336,6 +333,28 @@ fn failed_turn_notice(report: &ControlReport) -> String {
         None => "工具执行情况尚未确认，不能保证没有副作用。".into(),
     };
     format!("{reason}。{effects}本轮已停止，没有自动重试；继续前需要核对现有结果。")
+}
+/// 只用固定类别与状态码说明，不转述供应商错误正文。
+fn failure_reason(failure: ProviderFailure) -> String {
+    let status = failure
+        .http_status
+        .map_or(String::new(), |status| format!("（HTTP {status}）"));
+    match failure.kind {
+        ProviderFailureKind::PaymentRequired => {
+            format!("模型服务拒绝请求{status}，需要检查额度或单次输出预算")
+        }
+        ProviderFailureKind::RateLimited => format!("模型服务限流{status}"),
+        ProviderFailureKind::Unauthorized => format!("模型服务拒绝了凭据或权限{status}"),
+        ProviderFailureKind::Rejected => format!("模型服务拒绝了这次请求{status}"),
+        ProviderFailureKind::ServerError => format!("模型服务内部出错{status}"),
+        ProviderFailureKind::Truncated => "模型回复达到单次输出上限，未完整生成".into(),
+        ProviderFailureKind::ContentFiltered => "模型服务按内容策略中止了回复".into(),
+        ProviderFailureKind::Network => "无法连接模型服务".into(),
+        ProviderFailureKind::ResponseTooLarge => "模型回复超过本地接收上限".into(),
+        ProviderFailureKind::Incomplete
+        | ProviderFailureKind::UnexpectedStatus
+        | ProviderFailureKind::Other => format!("模型服务未能完成回复{status}"),
+    }
 }
 fn explicit(text: &str) -> bool {
     text.lines().any(|line| line.trim_start().starts_with('/'))
@@ -1215,6 +1234,35 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     use super::preempts_natural;
+
+    #[test]
+    fn failure_notices_name_the_fixed_kind_and_status_only() {
+        use super::{ProviderFailure, ProviderFailureKind as Kind, failure_reason};
+        assert_eq!(
+            failure_reason(ProviderFailure::http(402).unwrap()),
+            "模型服务拒绝请求（HTTP 402），需要检查额度或单次输出预算"
+        );
+        assert_eq!(
+            failure_reason(ProviderFailure::http(429).unwrap()),
+            "模型服务限流（HTTP 429）"
+        );
+        assert_eq!(
+            failure_reason(ProviderFailure::http(503).unwrap()),
+            "模型服务内部出错（HTTP 503）"
+        );
+        assert_eq!(
+            failure_reason(ProviderFailure::new(Kind::Truncated)),
+            "模型回复达到单次输出上限，未完整生成"
+        );
+        assert_eq!(
+            failure_reason(ProviderFailure::new(Kind::Network)),
+            "无法连接模型服务"
+        );
+        assert_eq!(
+            failure_reason(ProviderFailure::http(307).unwrap()),
+            "模型服务未能完成回复（HTTP 307）"
+        );
+    }
 
     #[test]
     fn only_complete_unambiguous_task_commands_preempt_natural_judgment() {
