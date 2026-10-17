@@ -58,11 +58,13 @@ impl EmbeddingProvider for DeferredEmbeddings {
     }
 }
 
-/// 读取语义模型角色：须启用 embedding、提供者为 openai，端点沿用主模型的 OpenAI 兼容地址，
-/// 凭据沿用 EVE_OPENAI_API_KEY。两个配置命名空间须来自同一配置修订。
+/// 读取语义模型角色：须启用 embedding、提供者为 openai。
+/// 默认沿用主模型端点和凭据；可显式选择语义端点及宿主注入的独立凭据。
+/// 两个配置命名空间须来自同一配置修订；语义提供者在启动时捕获，不随主模型热修改。
 pub(crate) fn configured(
     settings: &dyn ConfigService,
     api_key: &str,
+    semantic_api_key: Option<&str>,
 ) -> Result<OpenAiEmbeddings, AppError> {
     for _ in 0..4 {
         let provider = settings.snapshot(OPENAI_NAMESPACE, 1)?;
@@ -77,22 +79,29 @@ pub(crate) fn configured(
         let Some(SemanticOptions::Embedding { dimensions }) = profile.semantic else {
             return Err("语义召回需要语义模型角色的 operation 为 embedding，并给出维度".into());
         };
-        if profile.provider != "openai"
-            || profile
-                .credential_ref
-                .as_deref()
-                .is_some_and(|reference| reference != "env:EVE_OPENAI_API_KEY")
-        {
-            return Err("语义模型角色的提供者须为 openai，凭据沿用 EVE_OPENAI_API_KEY".into());
+        if profile.provider != "openai" {
+            return Err("语义模型角色的提供者须为 openai".into());
         }
-        let base: String = provider.get("base_url")?;
+        let key = match profile.credential_ref.as_deref() {
+            None | Some("env:EVE_OPENAI_API_KEY") => api_key,
+            Some("env:EVE_SEMANTIC_API_KEY") => semantic_api_key
+                .filter(|key| !key.trim().is_empty())
+                .ok_or("已选择独立语义凭据，但 EVE_SEMANTIC_API_KEY 为空")?,
+            Some(_) => return Err("语义模型只支持宿主提供的主模型或独立语义凭据引用".into()),
+        };
+        let semantic_base: String = provider.get("semantic_base_url")?;
+        let base = if semantic_base.is_empty() {
+            provider.get("base_url")?
+        } else {
+            semantic_base
+        };
         return OpenAiEmbeddings::new(
             &base,
             EmbeddingProfile {
                 model: profile.model.clone(),
                 dimensions,
             },
-            api_key,
+            key,
             Duration::from_millis(profile.timeout_ms),
         )
         .map_err(|_| "语义模型配置无效：模型、维度、端点或凭据不符合要求".into());

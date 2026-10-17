@@ -1176,8 +1176,10 @@ async fn run_qqbot_composed(
                     .downcast::<ConfigServiceHandle>()
                     .map_err(|_| "语义召回配置服务类型错误")?;
                 let key = std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "缺少模型凭据")?;
-                let provider: Arc<dyn eve_semantic_api::EmbeddingProvider> =
-                    Arc::new(qq_semantic::configured(settings.0.as_ref(), &key)?);
+                let semantic_key = std::env::var("EVE_SEMANTIC_API_KEY").ok();
+                let provider: Arc<dyn eve_semantic_api::EmbeddingProvider> = Arc::new(
+                    qq_semantic::configured(settings.0.as_ref(), &key, semantic_key.as_deref())?,
+                );
                 embeddings.set(provider.clone());
                 let started = qq_semantic::Background::start(Indexer::new(
                     memory.clone().ok_or("语义召回缺少记忆服务")?,
