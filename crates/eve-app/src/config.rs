@@ -123,6 +123,34 @@ pub(crate) fn use_limit_field(name: &str) -> String {
     format!("{name}_max_output_tokens")
 }
 
+pub(crate) fn history_schema() -> ConfigSchema {
+    let field = |default, minimum, maximum, environment: &str| {
+        let mut value = ConfigField::new(
+            ConfigKind::Integer {
+                minimum: Some(minimum),
+                maximum: Some(maximum),
+            },
+            Some(json!(default)),
+        );
+        value.environment = Some(environment.into());
+        value
+    };
+    ConfigSchema {
+        namespace: crate::history::NAMESPACE.into(),
+        version: 1,
+        fields: BTreeMap::from([
+            (
+                "max_turns".into(),
+                field(16, 1, 256, "EVE_HISTORY_MAX_TURNS"),
+            ),
+            (
+                "max_bytes".into(),
+                field(65536, 1024, 8388608, "EVE_HISTORY_MAX_BYTES"),
+            ),
+        ]),
+    }
+}
+
 pub(crate) fn model_uses_schema() -> ConfigSchema {
     let fields = MODEL_USES
         .into_iter()

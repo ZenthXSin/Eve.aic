@@ -42,6 +42,7 @@ impl Harness {
                     runtime_llm_schema(),
                     config::openai_schema(),
                     config::model_uses_schema(),
+                    config::history_schema(),
                     model_roles_schema(),
                 ],
             )

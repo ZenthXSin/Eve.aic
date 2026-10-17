@@ -11,8 +11,10 @@ pub use prompt::{
 use eve_plugin_api::{Permission, PluginId, ServiceId};
 mod budget;
 mod failure;
+mod history;
 pub use budget::{BudgetUsage, ExecutionLimits, TurnBudget};
 pub use failure::{ModelHealthObserver, ModelOutcome, ProviderFailure, ProviderFailureKind};
+pub use history::{HistoryWindow, HistoryWindowResolver};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -409,6 +411,8 @@ fn role_name(role: &ChatRole) -> &'static str {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LlmError {
+    /// 最近一个完整历史轮次无法放入显式窗口；尚未请求模型或执行工具。
+    HistoryWindowExceeded,
     Configuration(String),
     Context(String),
     Provider(String),
@@ -425,6 +429,9 @@ pub enum LlmError {
 impl fmt::Display for LlmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::HistoryWindowExceeded => f.write_str(
+                "最近一轮历史超过 runtime.history.max_bytes；请在面板调整历史窗口，原记录仍保留",
+            ),
             Self::ProviderTimeout => f.write_str("provider timeout"),
             Self::RoundLimit => f.write_str("tool round limit exhausted"),
             Self::Cancelled => f.write_str("turn cancelled"),
