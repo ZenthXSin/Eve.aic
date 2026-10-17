@@ -8,6 +8,7 @@ mod config;
 mod console;
 mod developer;
 mod error;
+mod history;
 mod input;
 mod memory_cli;
 mod memory_cli_view;
@@ -336,6 +337,7 @@ pub(crate) async fn install_core_with_pages(
         runtime_llm_schema(),
         config::openai_schema(),
         config::model_uses_schema(),
+        config::history_schema(),
         qq_message_judge::provider_schema(),
         model_roles_schema(),
         eve_message_api::message_schema(),
@@ -457,7 +459,8 @@ async fn install_core_with_config(
             ..host_config
         },
     )?
-    .with_model_resolver(resolver);
+    .with_model_resolver(resolver)
+    .with_history_resolver(Arc::new(history::ConfiguredHistory(settings.0.clone())));
     let host = Arc::new(SessionLlmHost::new(host, SessionBinding::builtin()).with_logger(logger));
     kernel.register(Box::new(ControlPlugin::new(
         Arc::new(SessionControlRunner::new(host)),
