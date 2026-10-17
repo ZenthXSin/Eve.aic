@@ -335,6 +335,7 @@ pub(crate) async fn install_core_with_pages(
     let mut schemas = vec![
         runtime_llm_schema(),
         config::openai_schema(),
+        config::model_uses_schema(),
         qq_message_judge::provider_schema(),
         model_roles_schema(),
         eve_message_api::message_schema(),
@@ -414,7 +415,9 @@ async fn install_core_with_config(
         );
     }
     let resolver: Arc<dyn LlmModelResolver> = {
-        let core = Arc::new(models::CoreModelResolver::new(settings.0.clone(), api_key));
+        let core = Arc::new(
+            models::CoreModelResolver::new(settings.0.clone(), api_key).with_use("dialogue"),
+        );
         match health {
             Some(observer) => Arc::new(eve_model_health::ObservedResolver::new(
                 core, "dialogue", observer,

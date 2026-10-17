@@ -1,5 +1,5 @@
 // 可选浏览器验收：由 model_health_test.py 在真实 Eve 面板运行时调用。
-// 核对“运行就绪”区块分开显示工具、主模型、视觉与对话模型最近的失败，手机宽度下不横向滚动。
+// 核对“运行就绪”区块分开显示工具、主模型、视觉与对话模型最近的失败，以及各用途的单次输出上限与来源；手机宽度下不横向滚动。
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -28,7 +28,8 @@ try {
   await page.waitForFunction(() => (document.querySelector("#readiness-roles")?.textContent || "").includes("请求失败"));
   const readiness = await page.locator("#readiness").textContent();
   for (const expected of ["对话工具", "主模型", "单次输出上限", "provider.openai.max_output_tokens", "视觉", "未配置",
-    "对话", "请求失败", "额度不足", "HTTP 402", "请求 1 次", "失败 1 次", "重启后清零"]) {
+    "对话", "请求失败", "额度不足", "HTTP 402", "请求 1 次", "失败 1 次", "重启后清零",
+    "单次输出上限 1,500", "runtime.model_uses.dialogue_max_output_tokens（环境变量）"]) {
     assert.ok(readiness.includes(expected), `就绪区块缺少：${expected}`);
   }
   assert.ok(!readiness.includes("local provider unavailable"), "不显示供应商错误正文");

@@ -162,13 +162,17 @@ impl PanelService for QqPanel {
     }
     fn readiness(&self) -> PanelResult<Readiness> {
         let channel = *self.channel.status.borrow();
-        let model = crate::models::summary(&*self.readiness.settings)
+        let settings = &*self.readiness.settings;
+        let model = crate::models::summary(settings, None)
             .ok()
             .map(|summary| ModelConfigView {
                 model: summary.model,
                 protocol: summary.protocol.into(),
                 max_output_tokens: summary.max_output_tokens,
-                max_output_tokens_key: summary.max_output_tokens_key.into(),
+                max_output_tokens_key: summary.max_output_tokens_key,
+                max_output_tokens_source: summary
+                    .max_output_tokens_source
+                    .map(|source| source.as_str().into()),
             });
         let roles = self
             .readiness
@@ -176,7 +180,6 @@ impl PanelService for QqPanel {
             .snapshot()
             .into_iter()
             .map(|(role, health)| ModelRoleHealth {
-                role,
                 state: match health.last_succeeded {
                     None => ModelState::Unverified,
                     Some(true) => ModelState::Responsive,
@@ -189,6 +192,16 @@ impl PanelService for QqPanel {
                 last_failure: health
                     .last_failure
                     .map(|(outcome, at_ms)| failure_view(outcome, at_ms)),
+                output_limit: crate::models::summary(settings, Some(&role))
+                    .ok()
+                    .map(|summary| OutputLimitView {
+                        max_output_tokens: summary.max_output_tokens,
+                        key: summary.max_output_tokens_key,
+                        source: summary
+                            .max_output_tokens_source
+                            .map(|source| source.as_str().into()),
+                    }),
+                role,
             })
             .collect();
         Ok(Readiness {

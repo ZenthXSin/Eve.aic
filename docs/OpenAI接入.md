@@ -103,6 +103,8 @@ TLS 使用 rustls 与系统证书库，兼容系统已信任的代理或私有 C
 | `EVE_LLM_MAX_PARALLEL_TOOL_CALLS` | 工具并发上限 | 10，必须为正数 |
 | `EVE_OPENAI_API_KEY` | 宿主运行凭据 | 必填，不进入配置 Schema |
 
+QQ 宿主还可以按用途单独设置单次输出上限（`runtime.model_uses`，例如 `EVE_MODEL_USE_DIALOGUE_MAX_OUTPUT_TOKENS`），见[模型健康与就绪状态](模型健康与就绪状态.md)。
+
 非敏感配置沿用默认值 < 环境 < 文件的优先级。可在模式参数后传入独立配置目录，否则使用自动删除的临时目录。每轮装配时读取配置快照；运行中不自动重建 Provider，也没有新增配置文件监听器。
 
 在宿主环境提供凭据与上述配置后执行：

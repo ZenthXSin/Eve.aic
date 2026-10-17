@@ -267,11 +267,36 @@ pub struct ConfigBackup {
     pub pinned: bool,
 }
 
+/// 当前生效值取自哪里；优先级为覆盖文件、环境变量、Schema 默认值。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigSource {
+    /// 配置文件中的覆盖值（面板保存或手工写入）。
+    Override,
+    Environment,
+    Default,
+}
+
+impl ConfigSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Override => "override",
+            Self::Environment => "environment",
+            Self::Default => "default",
+        }
+    }
+}
+
 /// 同步读取契约；适配器负责传输 DTO。消费者不依赖任何实现类型。
 pub trait ConfigService: Send + Sync {
     fn snapshot(&self, namespace: &str, schema_version: u32) -> ConfigResult<ConfigSnapshot>;
     fn begin_request(&self, namespace: &str, schema_version: u32) -> ConfigResult<ConfigRequest>;
     fn read_request(&self, request: &ConfigRequest) -> ConfigResult<ConfigSnapshot>;
+    /// 当前生效值的来源；不返回值本身。不提供来源的实现返回 Unavailable，调用方不应猜测。
+    fn field_source(&self, namespace: &str, field: &str) -> ConfigResult<ConfigSource> {
+        let _ = (namespace, field);
+        Err(ConfigError::Unavailable)
+    }
 }
 
 #[derive(Clone)]

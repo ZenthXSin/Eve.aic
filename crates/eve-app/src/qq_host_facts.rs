@@ -22,14 +22,16 @@ pub(crate) struct HostFactsContext {
 }
 
 impl HostFactsContext {
-    /// 每轮按与模型解析相同的规则读取主模型的单次输出上限；读取失败时为空，不猜测。
+    /// 每轮按与对话模型解析相同的规则读取单次输出上限（含对话用途的单独配置）；读取失败时为空，不猜测。
     fn reply_limit(&self) -> Option<u32> {
         let entry = self
             .registry
             .get(&ServiceId::new(CONFIG_SERVICE_ID).ok()?)
             .ok()??;
         let settings = entry.value.downcast::<ConfigServiceHandle>().ok()?;
-        crate::models::summary(&*settings.0).ok()?.max_output_tokens
+        crate::models::summary(&*settings.0, Some("dialogue"))
+            .ok()?
+            .max_output_tokens
     }
 }
 

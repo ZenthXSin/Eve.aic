@@ -60,6 +60,16 @@ pub struct ModelConfigView {
     pub max_output_tokens: Option<u32>,
     /// 上限取自哪个配置键。
     pub max_output_tokens_key: String,
+    /// 该键当前值的来源：override、environment 或 default；配置服务不提供时为空。
+    pub max_output_tokens_source: Option<String>,
+}
+/// 一个用途实际使用的单次输出上限；用途没有单独配置时沿用主模型的键。
+#[derive(Clone, Debug, Serialize)]
+pub struct OutputLimitView {
+    /// 为空时不发送，由服务端决定。
+    pub max_output_tokens: Option<u32>,
+    pub key: String,
+    pub source: Option<String>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +90,8 @@ pub struct ModelRoleHealth {
     pub consecutive_failures: u32,
     pub last_success_at_ms: Option<u64>,
     pub last_failure: Option<ModelFailureView>,
+    /// 该用途的单次输出上限；配置读取失败时为空。
+    pub output_limit: Option<OutputLimitView>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelFailureView {
