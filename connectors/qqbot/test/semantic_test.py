@@ -8,7 +8,9 @@
 import json
 import os
 import subprocess
+import threading
 import unittest
+from http.server import ThreadingHTTPServer
 
 import memory_test as memory_harness
 import recall_test
@@ -34,8 +36,10 @@ class SemanticAcceptance(recall_test.RecallAcceptance):
         recall_test.RecallAcceptance.setUp(self)
         self.embeddings = []
         self.embedding_failure = False
+        self.embedding_authorizations = []
         outer = self
         chat_handler = self.server.RequestHandlerClass
+        self.chat_handler = chat_handler
 
         class EmbeddingHandler(chat_handler):
             def respond(self):
@@ -44,6 +48,7 @@ class SemanticAcceptance(recall_test.RecallAcceptance):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 with outer.lock:
                     outer.embeddings.append(body)
+                    outer.embedding_authorizations.append(self.headers.get("Authorization"))
                 if outer.embedding_failure:
                     encoded = json.dumps({"error": {"message": "embedding unavailable"}}).encode()
                     status = 503
@@ -114,6 +119,41 @@ class SemanticAcceptance(recall_test.RecallAcceptance):
         self.assertEqual(data["retrieval"], "lexical_fallback")
         self.assertTrue(data["hits"])
         self.assertEqual(self.index()["entries"], [], "请求失败不写入索引")
+
+    def test_independent_embedding_endpoint_and_key_do_not_change_chat_requests(self):
+        self.seed_interaction("source", HISTORY)
+        embedding_server = ThreadingHTTPServer(("127.0.0.1", 0), self.server.RequestHandlerClass)
+        worker = threading.Thread(target=embedding_server.serve_forever, daemon=True)
+        worker.start()
+        self.server.RequestHandlerClass = self.chat_handler  # 主模型线路不提供 embeddings。
+        try:
+            self.semantic_run([*self.checkpoint("indexed"), *self.send(self.message("separate", PARAPHRASE))],
+                              checkpoints={"indexed": self.indexed(2)}, env={
+                                  "EVE_OPENAI_SEMANTIC_BASE_URL": f"http://127.0.0.1:{embedding_server.server_port}",
+                                  "EVE_MODELS_SEMANTIC_CREDENTIAL_REF": "env:EVE_SEMANTIC_API_KEY",
+                                  "EVE_SEMANTIC_API_KEY": "test-independent-semantic-key"})
+            [data] = self.recall_data(self.requests[-1])
+            self.assertEqual(data["retrieval"], "hybrid")
+            self.assertTrue(self.embeddings)
+            self.assertEqual(set(self.embedding_authorizations), {"Bearer test-independent-semantic-key"})
+            self.assertFalse(any("test-independent-semantic-key" in json.dumps(r["body"]) for r in self.requests))
+            self.assertNotIn("test-independent-semantic-key", json.dumps(self.documents()))
+        finally:
+            embedding_server.shutdown()
+            worker.join(timeout=5)
+            embedding_server.server_close()
+
+    def test_missing_or_unknown_independent_credential_ref_refuses_before_channel_connects(self):
+        env = {**SEMANTIC_ENV, "QQBOT_APP_SECRET": "test-app-secret", "QQBOT_APP_ID": "1904159860",
+               "EVE_OPENAI_API_KEY": "test-model-secret",
+               "EVE_OPENAI_BASE_URL": f"http://127.0.0.1:{self.server.server_port}"}
+        args = ["--memory", "--memory-recall", "--semantic-recall"]
+        self.assertIn("EVE_SEMANTIC_API_KEY 为空", self.refused(args, {
+            **env, "EVE_MODELS_SEMANTIC_CREDENTIAL_REF": "env:EVE_SEMANTIC_API_KEY"}))
+        self.assertIn("语义模型只支持", self.refused(args, {
+            **env, "EVE_MODELS_SEMANTIC_CREDENTIAL_REF": "env:OTHER_PRIVATE_KEY"}))
+        self.assertFalse(self.requests)
+        self.assertFalse(self.embeddings)
 
     def refused(self, arguments, env=None):
         child = subprocess.Popen([str(memory_harness.BINARY), *arguments, "--state-dir", str(self.work / "state"),

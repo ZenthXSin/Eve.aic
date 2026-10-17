@@ -67,6 +67,8 @@ pub(crate) fn openai_schema() -> ConfigSchema {
         field.environment = Some(environment.into());
         field
     };
+    let mut semantic_base = string("", "EVE_OPENAI_SEMANTIC_BASE_URL");
+    semantic_base.restart_required = true;
     ConfigSchema {
         namespace: OPENAI_NAMESPACE.into(),
         version: 1,
@@ -75,6 +77,7 @@ pub(crate) fn openai_schema() -> ConfigSchema {
                 "base_url".into(),
                 string("https://ai.xn--rhqr8xvr4ahqsgka.com", "EVE_OPENAI_BASE_URL"),
             ),
+            ("semantic_base_url".into(), semantic_base),
             (
                 "model".into(),
                 string("deepseek-v4.1-flash", "EVE_OPENAI_MODEL"),
