@@ -371,12 +371,21 @@ class Acceptance(unittest.TestCase):
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}", EVE_OPENAI_PROTOCOL="chat")
         script = ROOT / "connectors/qqbot/training-window.py"
 
-        def window(name, message, gate, seed=None):
+        browser = ["--practice-browser", BROWSER, "--research-source", "https://example.com/docs/"]
+        jar = self.work / "server-release.jar"
+        jar.write_bytes(b"PK")  # 宿主启动只核对 jar 非空；本测试不触发实际实践运行。
+        # 续接窗口换成默认的 Mindustry 实践、继承的 JSON 预检规则与本地资料，宿主须照常就绪并读回原状态；
+        # 与 qqbot-full.yml 一样用仓库相对路径传规则与资料目录。
+        mindustry = ["--practice-mindustry-server", str(jar),
+                     "--practice-mindustry-json-rules", "vendor/eve-portable-mindustry-json-validator",
+                     "--research-corpus", "vendor/eve-portable-knowledge",
+                     "--research-source", "eve-corpus://eve-portable/mindustry/"]
+
+        def window(name, message, gate, practice, seed=None):
             scenario.write_text(json.dumps({"script": [{"send": message}, self.wait_command(message["id"]),
                                                        {"wait_file": str(self.gate(gate))}]}))
             root, output = self.work / name, self.work / (name + "-results")
-            command = ["python3", str(script), "--profile", "full", "--practice-browser", BROWSER,
-                       "--research-source", "https://example.com/docs/", "--root", str(root), "--output", str(output),
+            command = ["python3", str(script), "--profile", "full", *practice, "--root", str(root), "--output", str(output),
                        "--seconds", "60", "--binary", str(launcher)]
             child = subprocess.Popen(command + (["--seed-state", str(seed)] if seed else []), cwd=ROOT, env=env,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -405,13 +414,13 @@ class Acceptance(unittest.TestCase):
 
         # 共享既有 HTTP 夹具的持久化准入检查目录。
         (self.work / "state").symlink_to(self.work / "first/state", target_is_directory=True)
-        first, restored = window("first", self.message("full-1", "我最近在学 CSS 网格布局"), "first-close")
+        first, restored = window("first", self.message("full-1", "我最近在学 CSS 网格布局"), "first-close", browser)
         owners = set(json.loads((first / "state/state.json").read_text())["entries"])
         # 预算、兴趣与记忆只有对应能力开启才落盘，证明全功能参数实际传给了宿主。
         for owner in ("eve.session", "eve.channel.qqbot", "eve.training", "eve.memory", "eve.interest", "eve.budget"):
             self.assertIn(owner, owners)
         _, again = window("second", self.message("full-2", "recall:我最近在学 CSS 网格布局", "我最近在学 CSS 网格布局"),
-                             "second-close", seed=restored / "state")
+                             "second-close", mindustry, seed=restored / "state")
         self.assertTrue(json.loads((again / "window.json").read_text())["continued"])
         self.assertEqual(len(json.loads((again / "training-report.json").read_text())["evidence"]), 1)
         # 原加密包解出的状态保持不变，可以再次续接。

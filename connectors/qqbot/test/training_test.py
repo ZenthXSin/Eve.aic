@@ -62,7 +62,20 @@ class Reports(unittest.TestCase):
         self.assertEqual(full[len(training.FULL_PROFILE) + 1:], ["--practice-browser", "/usr/bin/chrome",
             "--research-source", "https://a.example/docs/", "--research-source", "https://b.example/", "--state-dir", "state"])
         self.assertEqual(training.host_command("eve", state, "full", "chrome")[-2:], ["--state-dir", "state"])
-        for args, code in ((("training", "chrome"), "training_profile_extra"), (("full", None), "full_profile_browser"),
+        corpus_seed = "eve-corpus://eve-portable/mindustry/"
+        mindustry = training.host_command("eve", state, "full", None, [corpus_seed], "server.jar", "rules", "corpus")
+        self.assertEqual(mindustry[len(training.FULL_PROFILE) + 1:], ["--practice-mindustry-server", "server.jar",
+            "--practice-mindustry-json-rules", "rules", "--research-corpus", "corpus",
+            "--research-source", corpus_seed, "--state-dir", "state"])
+        self.assertNotIn("--practice-browser", mindustry)
+        for args, code in ((("training", "chrome"), "training_profile_extra"),
+                           (("training", None, (), "server.jar"), "training_profile_extra"),
+                           (("training", None, (), None, None, "corpus"), "training_profile_extra"),
+                           (("full", None), "full_profile_runtime"),
+                           (("full", "chrome", (), "server.jar"), "full_profile_runtime"),
+                           (("full", "chrome", (), None, "rules"), "full_profile_runtime"),
+                           (("full", "chrome", [corpus_seed]), "full_profile_corpus"),
+                           (("full", "chrome", ["https://a.example/"], None, None, "corpus"), "full_profile_corpus"),
                            (("full", "chrome", ["https://a.example/"] * 2), "full_profile_research_sources"),
                            (("full", "chrome", [f"https://{i}.example/" for i in range(9)]), "full_profile_research_sources"),
                            (("unknown",), "profile")):

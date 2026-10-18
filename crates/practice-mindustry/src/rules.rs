@@ -35,7 +35,11 @@ pub struct MindustryJsonRules {
 
 impl MindustryJsonRules {
     /// 核对目录下的 `eve_modcheck.py` 与 `vendor.py`；任一缺失或摘要不符都返回原因。
+    ///
+    /// 相对目录按当前工作目录转成绝对路径，预检以规则目录为工作目录启动时仍能找到脚本。
     pub fn open(directory: &Path) -> Result<Self, String> {
+        let directory =
+            std::path::absolute(directory).map_err(|_| "无法解析规则目录".to_string())?;
         let driver = directory.join("eve_modcheck.py");
         let vendor = directory.join("vendor.py");
         for (path, expected) in [(&driver, DRIVER_SHA256), (&vendor, VENDOR_SHA256)] {
@@ -96,6 +100,12 @@ mod tests {
         let rules = MindustryJsonRules::open(&directory()).unwrap();
         assert!(rules.driver().ends_with("eve_modcheck.py"));
         assert!(rules.vendor().ends_with("vendor.py"));
+        // cargo test 的工作目录是本 crate，相对路径也要解析成绝对路径。
+        let relative = MindustryJsonRules::open(Path::new(
+            "../../vendor/eve-portable-mindustry-json-validator",
+        ))
+        .unwrap();
+        assert!(relative.driver().is_absolute() && relative.vendor().is_absolute());
 
         let copy = tempfile::tempdir().unwrap();
         for file in ["eve_modcheck.py", "vendor.py"] {
