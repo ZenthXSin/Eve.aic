@@ -1,7 +1,7 @@
 # 继承清单：eve-portable → Eve.aic
 
 旧包：https://gitee.com/zenthxsin/eve-portable，固定版本 `e7e43b4db4de38775a8d28f59dd4ec69e5e1686e`。
-相关 PR：[#201](https://github.com/ZenthXSin/Eve.aic/pull/201)（JSON 校验规则）、[#203](https://github.com/ZenthXSin/Eve.aic/pull/203)（接入 QQ 宿主）、执行规则与语言风格（本 PR）。
+相关 PR：[#201](https://github.com/ZenthXSin/Eve.aic/pull/201)（JSON 校验规则）、[#203](https://github.com/ZenthXSin/Eve.aic/pull/203)（接入 QQ 宿主）、[#204](https://github.com/ZenthXSin/Eve.aic/pull/204)（执行规则与语言风格）、Mindustry 资料（本 PR）。
 
 本清单只记录**已经落地并验证**的继承内容；旧包里其余部分逐项标注“未继承”及原因，不把整理过的文档当成已装配的能力。
 
@@ -16,6 +16,7 @@
 | 规则文件摘要核对 | 旧包没有 | `crates/practice-mindustry/src/rules.rs`（`MindustryJsonRules`） | MIT | `rules::tests::accepts_the_pinned_copy_and_rejects_any_modified_file` |
 | 目录级命令行入口 | 旧包 `scripts/validator.py <file.json>` | `scripts/check_mindustry_json.py` | MIT | 对含坏 JSON 的样例模组实跑，退出码 1 |
 | 来源与边界文档 | — | `docs/继承-eve-portable-json校验.md`、`vendor/.../README.md` | — | 文档本身 |
+| Mindustry 资料 186 篇（含长期记忆技术节选） | `knowledge/mindustry/`、`knowledge/mod-making-guide/`、`knowledge/concepts/`（Mindustry/Arc/JSON 主题）、`memory/MEMORY.md` 技术小节 | `vendor/eve-portable-knowledge/`，经 `--research-corpus` 与 `eve-corpus://` 入口进入受控研究 | AGPL-3.0（副本自带 `LICENSE`） | `knowledge-plugin` 资料源单元测试；`research_test.py` 真实进程选文、逐字引用、不访问网络 |
 | 执行规则中与当前身份一致的部分 | `rules/RULE.md`：冲突取舍顺序、回复不写出内部判断、能验证就实际验证、Mindustry 结论要有出处 | `AGENT.md`“沿用旧 Eve 的做法”一节 | 改写而非复制，MIT | QQ 进程测试使用根目录 AGENT.md 装配 |
 | 语言风格中与当前身份一致的部分 | `language-style/LANGUAGE_STYLE.md`：先说结论、短句、偶尔轻语气词；代码问题先给可行性与关键几行 | 同上 | 同上 | 同上 |
 
@@ -23,7 +24,7 @@
 
 | 旧包内容 | 原因 | 后续条件 |
 | --- | --- | --- |
-| `knowledge/`、`memory/`、`data/` 旧知识库与记忆 | 有版本与来源，但格式不匹配 Eve 的知识契约；直接灌入会把旧会话事实当成当前事实 | 需要按知识插件契约逐条导入并标来源/版本 |
+| `knowledge/` 其余部分（`mindustry-source-files/` 1769 篇源码摘录、`sources/` 58 MB、`entities/`、`analysis/`、其他主题的 `concepts/`）、命中敏感模式的 7 篇；`memory/` 的身份、关系与环境小节；`data/` 向量索引 | 体积大且以源码摘录为主，或混有旧环境与非 Mindustry 内容；旧向量索引依赖旧的嵌入模型 | 按同样的导入规则逐类评估；语义检索沿用 Eve 自己的 `--semantic-recall` |
 | `skills/*/SKILL.md` 及其余脚本 | 大多是流程文档或依赖旧环境（固定路径、xvfb、Gradle、旧账号） | 每项单独评估是否有可执行接入点 |
 | `源码和示例/Mindustry`、`Arc` 源码副本 | 体积大且是特定 commit 的快照 | 需要时通过 `github_api` 按 commit 查证，而不是复制进仓库 |
 | 无头 UI 测试与完整 GL 验证器 | 依赖 xvfb/GL 环境与 jar，宿主没有装配 | 与现有 `Mindustry 真实运行验收` 作业合并评估 |
