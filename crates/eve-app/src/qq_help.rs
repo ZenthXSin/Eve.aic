@@ -45,7 +45,7 @@ impl QqCommandHandler for Help {
                 text.push_str(&format!("\n{}：{description}", definition.name));
             }
         } else {
-            text.push_str("\n/train start|stop|status：主动提问训练\n/self-learning status：自主学习状态\n/segment on|off|reset：分段输出\n/remember 内容、/memories、/recall 关键词：记忆\n/interests：兴趣；/knowledge 兴趣ID：资料\n/practice 兴趣ID：实践证据\n/skills、/tools：已固化技能和检查规则，列表可为空\n/goals、/mind、/plans：目标与计划\n/budget：后台自主运行预算\n/clarify、/clarify off|on：卡住时的提问\n/outreach、/outreach off|on：主动跟进\n/cancel：取消当前任务\n/help tools：实际聊天工具说明\n\n命令对应能力未装配时会明确提示。工具调用以真实结果为准；检查规则不等于任意代码插件。");
+            text.push_str("\n/name 名字、/name：设置或查看自己的称呼\n/train start|stop|status：主动提问训练\n/self-learning status：自主学习状态\n/segment on|off|reset：分段输出\n/remember 内容、/memories、/recall 关键词：记忆\n/interests：兴趣；/knowledge 兴趣ID：资料\n/practice 兴趣ID：实践证据\n/skills、/tools：已固化技能和检查规则，列表可为空\n/goals、/mind、/plans：目标与计划\n/budget：后台自主运行预算\n/clarify、/clarify off|on：卡住时的提问\n/outreach、/outreach off|on：主动跟进\n/cancel：取消当前任务\n/help tools：实际聊天工具说明\n\n命令对应能力未装配时会明确提示。工具调用以真实结果为准；检查规则不等于任意代码插件。");
         }
         Ok(Some(text))
     }

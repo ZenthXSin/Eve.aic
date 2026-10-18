@@ -4,6 +4,7 @@ mod commands;
 mod conversations;
 mod observer;
 mod outreach;
+mod participants;
 mod state;
 
 pub use commands::{QqCommandHandler, QqCommandInput};
@@ -14,6 +15,7 @@ pub use outreach::{
     QQ_OUTREACH_PAUSE_MS, QqOutreach, QqOutreachFuture, QqOutreachMessage, QqOutreachMoment,
     QqOutreachPush, QqOutreachResult,
 };
+pub use participants::QqParticipantObserver;
 
 use eve_control_api::{CONTROL_PLUGIN_ID, CONTROL_SERVICE_ID, ControlServiceHandle};
 use eve_message_api::{MessageServiceHandle, ROUTER_PLUGIN_ID, ROUTER_SERVICE_ID};
@@ -98,6 +100,7 @@ pub struct QqBotPlugin {
     natural_message_judgement: bool,
     outreach: Option<Arc<bridge::OutreachHook>>,
     conversations: QqConversations,
+    participant_observer: Option<Arc<dyn QqParticipantObserver>>,
 }
 pub(crate) struct Segmentation {
     pub planner: Arc<dyn SegmentPlanner>,
@@ -126,11 +129,16 @@ impl QqBotPlugin {
             natural_message_judgement: false,
             outreach: None,
             conversations: QqConversations::default(),
+            participant_observer: None,
         })
     }
     /// 通道已提交过轮次的会话是私聊还是群聊；只读，供只在私聊中成立的宿主能力判断。
     pub fn conversations(&self) -> QqConversations {
         self.conversations.clone()
+    }
+    pub fn with_participant_observer(mut self, observer: Arc<dyn QqParticipantObserver>) -> Self {
+        self.participant_observer = Some(observer);
+        self
     }
     /// 显式开启在途普通文字判断；判断实现由宿主安装的 MessageService 决定。
     /// 默认关闭，普通文字继续排队。只捕获尚未收尾且没有请求取消的当前代，
@@ -285,6 +293,7 @@ impl Plugin for QqBotPlugin {
             let natural_message_judgement = self.natural_message_judgement;
             let outreach = self.outreach.clone();
             let conversations = self.conversations.clone();
+            let participant_observer = self.participant_observer.clone();
             let task_ctx = ctx.clone();
             ctx.spawn_task(TaskSpec::new(
                 "QQBot JSONL 通道",
@@ -302,6 +311,7 @@ impl Plugin for QqBotPlugin {
                     let segmentation = segmentation.clone();
                     let outreach = outreach.clone();
                     let conversations = conversations.clone();
+                    let participant_observer = participant_observer.clone();
                     let status = status.clone();
                     let ledger = ledger.clone();
                     Box::pin(async move {
@@ -322,6 +332,7 @@ impl Plugin for QqBotPlugin {
                                 natural_message_judgement,
                                 outreach,
                                 conversations,
+                                participant_observer,
                             },
                             ledger,
                             signal,

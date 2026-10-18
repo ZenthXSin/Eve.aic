@@ -104,9 +104,11 @@ export function createBridge(bot, emit, limit = 128) {
     if (pending.size >= limit) { warn("pending_limit"); return; }
     const text = userText(msg, bot.appId);
     if (!validText(text) && !attachments.length) { warn("invalid_route_or_text"); return; }
+    const senderName = typeof msg.senderName === "string" ? msg.senderName.trim() : "";
+    const validName = senderName && Buffer.byteLength(senderName) <= 128 && [...senderName].length <= 48 && !/[\p{Cc}]/u.test(senderName);
     const frame = { type: "message", id: msg.messageId, scope: msg.kind,
       target_id: target.targetId, user_id: msg.senderId,
-      text, ...(attachments.length ? { attachments } : {}) };
+      text, ...(attachments.length ? { attachments } : {}), ...(validName ? { sender_name: senderName } : {}) };
     // JSON escaping can expand a legal body beyond the Rust wire-frame limit.
     if (Buffer.byteLength(JSON.stringify({ version: 1, ...frame })) > MAX_FRAME) {
       warn("frame_limit"); return;

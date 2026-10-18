@@ -96,6 +96,16 @@ impl Message {
         }
         SessionKey::new(key.clone(), key).map_err(|_| corrupt())
     }
+    pub fn conversation_key(&self, app_id: &str) -> PluginResult<String> {
+        let identity =
+            serde_json::to_vec(&(app_id, &self.scope, &self.target_id)).map_err(|_| corrupt())?;
+        let mut key = String::from("qq:");
+        for byte in digest(&SHA256, &identity).as_ref() {
+            use std::fmt::Write;
+            write!(&mut key, "{byte:02x}").expect("writing a String cannot fail");
+        }
+        Ok(key)
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum ReceiptState {

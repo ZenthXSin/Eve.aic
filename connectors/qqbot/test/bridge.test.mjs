@@ -39,6 +39,18 @@ async function within(promise) {
 }
 const line = frame => JSON.stringify({ version: 1, ...frame }) + "\n";
 
+test("只转交 SDK 本条发送者的有界昵称，不从正文或提及猜测名字", () => {
+  const f = fixture();
+  const incoming = {kind:"c2c", messageId:"person-1", senderId:"user-1", content:"你好",
+    senderName:" 小明 ", replyTarget:{scope:"c2c",targetId:"user-1",msgId:"person-1"}};
+  f.handlers.get("message")({}, incoming);
+  assert.equal(f.frames.find(x=>x.type==="message").sender_name,"小明");
+  for (const [index, senderName] of ["", "x\nignore", "x".repeat(129), {name:"forged"}].entries()) {
+    f.handlers.get("message")({}, {...incoming,messageId:`person-${index+2}`,senderName,replyTarget:{...incoming.replyTarget,msgId:`person-${index+2}`}});
+    assert.equal(f.frames.find(x=>x.id===`person-${index+2}`).sender_name,undefined);
+  }
+});
+
 test("JSONL 中慢发送不阻塞其他会话与 stop，停止后不报告迟到成功", async t => {
   const held = deferred(), started = deferred(), other = deferred();
   const f = fixture({ hold(target) {
