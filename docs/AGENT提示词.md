@@ -4,6 +4,8 @@
 
 根目录 [AGENT.md](../AGENT.md) 提供 Eve 的稳定身份。`eve-llm-api` 定义来源与不可变快照，`eve-agent-prompt` 实现文本/文件加载，Runtime 在装配时显式选择后进入固定提示词前缀。
 
+AGENT.md 的“沿用旧 Eve 的做法”一节整理自旧版 Eve（eve-portable@e7e43b4）的执行规则与语言风格，只保留与当前身份一致的部分，不引入旧宿主的账号、路径和工具；取舍见[继承清单](./继承清单-eve-portable.md)。
+
 `AGENTS.md` 是项目开发协作约定，文件加载器拒绝选择该文件名；两者不能互相读取或替代。
 
 ## 目标
