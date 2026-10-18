@@ -6,8 +6,11 @@
 //! 它给出的问题只写进本次尝试的记录，不改变运行器对“是否真的通过”的判断。
 
 use crate::rules::MindustryJsonRules;
-use eve_practice_api::{ArtifactFile, MAX_ISSUE_BYTES, MAX_ISSUES};
-use std::{ffi::OsString, path::Path, process::Stdio, time::Duration};
+use eve_practice_api::{
+    ArtifactFile, DraftCheck, MAX_ISSUE_BYTES, MAX_ISSUES, PracticeDraft, PracticeResult,
+    PracticeRun,
+};
+use std::{ffi::OsString, path::Path, process::Stdio, sync::Arc, time::Duration};
 use tokio::{io::AsyncWriteExt, process::Command};
 
 /// 解释器命令；默认 `python3`（Windows 上通常是 `python`），可加前置参数。
@@ -30,6 +33,9 @@ impl Default for PythonCommand {
 }
 
 const TIMEOUT: Duration = Duration::from_secs(60);
+/// 预检问题的开头；游戏遇到警告仍会加载模组，所以实践只按错误拦下草稿。
+const ERROR_MARK: &str = "JSON 预检错误";
+const WARNING_MARK: &str = "JSON 预检警告";
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// 送入预检的文件：内容文件，或根目录的 mod 清单。脚本、贴图、包文件永远不会被选中。
@@ -143,6 +149,93 @@ impl JsonPrecheck {
     }
 }
 
+impl JsonPrecheck {
+    /// 启动时实跑一次最小清单：解释器缺失、规则包无法导入或输出不合约定时返回原因，
+    /// 由宿主拒绝启动，而不是等到第一次实践才发现。
+    pub async fn probe(&self) -> Result<(), String> {
+        let manifest = ArtifactFile {
+            path: "mod.hjson".into(),
+            content: "name: \"eve-probe\"\nversion: \"1\"\nminGameVersion: 146\n".into(),
+        };
+        self.check("eve-probe", std::slice::from_ref(&manifest))
+            .await
+            .map(drop)
+    }
+}
+
+/// 把 JSON 预检接成实践运行前检查：取 mod 清单的 name 作为命名前缀，送检清单与内容文件。
+///
+/// 只有错误会作为运行前问题拦下这次运行；警告（例如缺少 name 字段而按文件名推断）游戏照常加载，
+/// 不交给草稿器，以免正确的草稿永远跑不到真实运行。
+///
+/// 预检只是“值不值得实际运行”的提示，是否通过以真实运行为准。所以解释器在运行中失败、
+/// 超时或输出不合约定时，这次尝试不加预检问题、照常实际运行，并把原因交给 `on_unavailable`
+/// 由宿主如实记录；不能当作“没有发现问题”报告给用户，也不让实践因此失败。
+pub struct JsonDraftCheck {
+    precheck: JsonPrecheck,
+    on_unavailable: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+impl JsonDraftCheck {
+    pub fn new(precheck: JsonPrecheck, on_unavailable: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        Self {
+            precheck,
+            on_unavailable,
+        }
+    }
+}
+
+impl DraftCheck for JsonDraftCheck {
+    fn check(
+        &self,
+        _run: &PracticeRun,
+        draft: &PracticeDraft,
+        _at_ms: u64,
+    ) -> PracticeResult<Vec<String>> {
+        let mod_name = mod_name(&draft.files);
+        // 同步契约：在独立线程的单线程运行时里等待规则跑完（单次 60 秒上限），
+        // 避免在调用方的异步运行时里嵌套阻塞。
+        let precheck = self.precheck.clone();
+        let files = draft.files.clone();
+        let result = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| "无法创建 JSON 预检运行时".to_string())
+                .and_then(|runtime| runtime.block_on(precheck.check(&mod_name, &files)))
+        })
+        .join()
+        .unwrap_or_else(|_| Err("JSON 预检线程异常结束".into()));
+        match result {
+            // 运行前检查的任何问题都会拦下这次运行；警告不影响游戏加载，只把错误交给草稿器。
+            Ok(issues) => Ok(issues
+                .into_iter()
+                .filter(|issue| issue.starts_with(ERROR_MARK))
+                .collect()),
+            Err(reason) => {
+                (self.on_unavailable)(&reason);
+                Ok(Vec::new())
+            }
+        }
+    }
+}
+
+/// 清单里的 name；没有清单或没写 name 时用 `mod`。
+fn mod_name(files: &[ArtifactFile]) -> String {
+    files
+        .iter()
+        .filter(|file| file.path == "mod.hjson" || file.path == "mod.json")
+        .find_map(|file| {
+            file.content.lines().find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                let key = key.trim().trim_matches('"');
+                let value = value.trim().trim_end_matches(',').trim().trim_matches('"');
+                (key == "name" && !value.is_empty()).then(|| value.to_string())
+            })
+        })
+        .unwrap_or_else(|| "mod".into())
+}
+
 fn parent(path: &Path) -> &Path {
     path.parent().unwrap_or_else(|| Path::new("."))
 }
@@ -168,9 +261,13 @@ fn parse(text: &str) -> Result<Vec<String>, String> {
             if text.is_empty() {
                 continue;
             }
-            let mark = if level == "WARN" { "警告" } else { "错误" };
+            let mark = if level == "WARN" {
+                WARNING_MARK
+            } else {
+                ERROR_MARK
+            };
             issues.push(format!(
-                "JSON 预检{mark}：{}（{}）",
+                "{mark}：{}（{}）",
                 prefix(text, MAX_ISSUE_BYTES.saturating_sub(path.len() + 32)),
                 path
             ));
