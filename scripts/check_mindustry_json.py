@@ -6,6 +6,7 @@ mod.hjson 与 content/**/*.hjson|json 送进去，按 JSON 结果判断有没有
 用法：python3 scripts/check_mindustry_json.py <模组目录>
 """
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -28,6 +29,8 @@ def blocks(root: pathlib.Path):
 
 
 def main(argv):
+    # 输出被管道接收时（如 CI）Windows 默认用本地代码页，中文结果无法编码。
+    sys.stdout.reconfigure(encoding="utf-8")
     if len(argv) != 2:
         print(__doc__)
         return 2
@@ -48,6 +51,9 @@ def main(argv):
         input="\n".join(body) + "\n",
         capture_output=True,
         text=True,
+        # 两端都按 UTF-8；Windows 默认代码页无法编码中文结果。
+        encoding="utf-8",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         check=False,
     )
     if completed.returncode != 0:

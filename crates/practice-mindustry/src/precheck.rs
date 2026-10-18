@@ -106,6 +106,8 @@ impl JsonPrecheck {
         }
         // 解释器不读用户目录、不写字节码缓存：规则包保持只读。
         command.env("PYTHONDONTWRITEBYTECODE", "1");
+        // 管道编码固定为 UTF-8；Windows 默认按本地代码页输出，中文结果会让调用层异常退出。
+        command.env("PYTHONIOENCODING", "utf-8");
         let mut child = command
             .spawn()
             .map_err(|_| "无法启动 JSON 预检解释器；检查 Python 是否可用".to_string())?;
