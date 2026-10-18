@@ -103,6 +103,8 @@ pub trait ConversationSummarizer: Send + Sync {
 }
 /// 仅可信宿主持有；不会向模型发布跨用户的账本管理接口。
 pub trait SummaryAdmin: Send + Sync {
+    /// 仅返回全局网络失败的时间元数据，供可信宿主在其他作用域准入前冷却。
+    fn last_provider_failure_at(&self) -> MemoryResult<Option<u64>>;
     fn jobs(&self, scope: &MemoryScope) -> MemoryResult<Vec<SummaryJob>>;
     fn reserve(
         &self,

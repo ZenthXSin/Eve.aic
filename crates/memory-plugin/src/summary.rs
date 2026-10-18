@@ -27,6 +27,9 @@ impl SummaryController {
     }
 }
 impl SummaryAdmin for SummaryController {
+    fn last_provider_failure_at(&self) -> MemoryResult<Option<u64>> {
+        self.service()?.last_provider_failure_at()
+    }
     fn jobs(&self, scope: &MemoryScope) -> MemoryResult<Vec<SummaryJob>> {
         self.service()?.jobs(scope)
     }

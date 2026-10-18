@@ -22,6 +22,24 @@ pub(super) struct StoredSummaries {
     inner: Mutex<Inner>,
 }
 impl StoredSummaries {
+    pub(super) fn last_provider_failure_at(&self) -> MemoryResult<Option<u64>> {
+        let inner = self.inner.lock().map_err(|_| MemoryError::Unavailable)?;
+        if inner.context.is_none() {
+            return Err(MemoryError::Unavailable);
+        }
+        Ok(inner
+            .document
+            .jobs
+            .iter()
+            .filter(|job| {
+                matches!(
+                    job.status,
+                    SummaryStatus::Failed(SummaryFailure::Provider | SummaryFailure::Timeout)
+                )
+            })
+            .filter_map(|job| job.finished_at_ms)
+            .max())
+    }
     pub(super) fn open(context: PluginContext) -> MemoryResult<Self> {
         let mut document = match context
             .state_get(SUMMARY_STATE_KEY)

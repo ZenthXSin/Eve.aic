@@ -179,6 +179,20 @@ class SummaryAcceptance(digest.ConversationDigestAcceptance):
         self.run_summary([*self.send(self.message("timeout", FIRST)), *self.checkpoint("timeout")],
             panel=True, env_extra={"EVE_OPENAI_TIMEOUT_SECONDS": "1"}, checkpoints={"timeout": timed_out})
 
+    def test_provider_failure_cooldown_protects_other_scopes_and_survives_restart(self):
+        self.mode = "provider"
+        def failed():
+            self.wait_jobs(1, {"Failed": "Provider"})
+        def paused():
+            self.assertFalse(self.run_release.wait(0.7))
+            self.assertEqual(len(self.jobs()), 1)
+            self.assertEqual(len(self.summary_requests()), 1)
+        extra = {"EVE_MEMORY_SUMMARY_COOLDOWN_MS": "10000"}
+        self.run_summary([*self.send(self.message("first", FIRST)), *self.checkpoint("failed"),
+            *self.send(self.message("other", SECOND, user="other-user")), *self.checkpoint("paused")],
+            env_extra=extra, checkpoints={"failed": failed, "paused": paused})
+        self.run_summary([*self.checkpoint("restart")], env_extra=extra, checkpoints={"restart": paused})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

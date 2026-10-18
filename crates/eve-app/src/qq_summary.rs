@@ -189,10 +189,20 @@ async fn run(
                 cooldown_ms: config.get("cooldown_ms")?,
             };
             options.validate()?;
+            let provider_ready = summaries
+                .last_provider_failure_at()?
+                .is_none_or(|failed_at| {
+                    now_ms()
+                        .checked_sub(failed_at)
+                        .is_some_and(|elapsed| elapsed >= options.cooldown_ms)
+                });
             let mut scopes = memory.scopes()?;
             scopes.sort();
             scopes.dedup();
             for scope in scopes {
+                if !provider_ready {
+                    break;
+                }
                 if *stopped.borrow() {
                     return Ok(());
                 }
@@ -227,7 +237,14 @@ async fn run(
                     }
                     result => result,
                 };
+                let provider_failed = matches!(
+                    result,
+                    Err(SummaryFailure::Provider | SummaryFailure::Timeout)
+                );
                 summaries.finish(&batch, now_ms().max(batch.started_at_ms), result)?;
+                if provider_failed {
+                    break;
+                }
             }
         }
         tokio::select! { biased; _ = stop_requested(&mut stopped) => return Ok(()), _ = tokio::time::sleep(Duration::from_millis(500)) => {} }
