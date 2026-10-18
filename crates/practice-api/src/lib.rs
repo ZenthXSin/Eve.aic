@@ -360,6 +360,24 @@ pub trait DraftCheck: Send + Sync {
     ) -> PracticeResult<Vec<String>>;
 }
 
+/// 按顺序运行多个运行前检查并合并问题；任一检查返回错误时整体返回该错误，不吞掉。
+pub struct DraftChecks(pub Vec<std::sync::Arc<dyn DraftCheck>>);
+
+impl DraftCheck for DraftChecks {
+    fn check(
+        &self,
+        run: &PracticeRun,
+        draft: &PracticeDraft,
+        at_ms: u64,
+    ) -> PracticeResult<Vec<String>> {
+        let mut issues = Vec::new();
+        for check in &self.0 {
+            issues.extend(check.check(run, draft, at_ms)?);
+        }
+        Ok(issues)
+    }
+}
+
 /// 运行前附加检查给出的问题在实践记录中的前缀；能力缺口不把它们算作新的缺口。
 pub const DRAFT_CHECK_MARK: &str = "[预检] ";
 
@@ -1067,5 +1085,42 @@ mod tests {
         assert_ne!(run_id("g", 1), run_id("g", 2));
         assert!(is_subject("eve-sample-wall") && !is_subject("-x") && !is_subject("a.b"));
         assert!(is_property("itemCapacity") && !is_property("__proto__"));
+    }
+
+    struct Fixed(PracticeResult<Vec<String>>);
+    impl DraftCheck for Fixed {
+        fn check(&self, _: &PracticeRun, _: &PracticeDraft, _: u64) -> PracticeResult<Vec<String>> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn draft_checks_keep_every_issue_in_order_and_never_swallow_errors() {
+        let run = PracticeRun {
+            id: run_id("g", 1),
+            task: task(),
+            runner: profile(),
+            drafter_version: "d:v1".into(),
+            started_at_ms: 1,
+            finished_at_ms: None,
+            status: PracticeStatus::Running,
+            attempts: vec![],
+        };
+        let ok = |issues: &[&str]| -> std::sync::Arc<dyn DraftCheck> {
+            std::sync::Arc::new(Fixed(Ok(issues.iter().map(|s| s.to_string()).collect())))
+        };
+        let both = DraftChecks(vec![ok(&["a"]), ok(&[]), ok(&["b", "c"])]);
+        assert_eq!(both.check(&run, &draft(), 1).unwrap(), ["a", "b", "c"]);
+        assert!(
+            DraftChecks(vec![])
+                .check(&run, &draft(), 1)
+                .unwrap()
+                .is_empty()
+        );
+        let failing = DraftChecks(vec![
+            ok(&["a"]),
+            std::sync::Arc::new(Fixed(Err(PracticeError::Unavailable))),
+        ]);
+        assert!(failing.check(&run, &draft(), 1).is_err());
     }
 }

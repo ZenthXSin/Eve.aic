@@ -9,7 +9,7 @@ license.workspace = true
 eve-practice-api = { path = "../practice-api" }
 ring.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["process", "io-util"] }
+tokio = { workspace = true, features = ["process", "io-util", "rt", "time"] }
 
 [dev-dependencies]
 eve-kernel = { path = "../kernel" }

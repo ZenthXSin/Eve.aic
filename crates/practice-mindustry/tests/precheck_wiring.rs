@@ -5,7 +5,7 @@ mod support;
 
 use eve_kernel::{Kernel, KernelServices, backends::FileStateStore};
 use eve_practice_api::*;
-use eve_practice_mindustry::{JsonPrecheck, MindustryJsonRules, PythonCommand};
+use eve_practice_mindustry::{JsonDraftCheck, JsonPrecheck, MindustryJsonRules, PythonCommand};
 use eve_practice_plugin::{PracticeController, PracticePlugin, Practitioner};
 use eve_toolforge_plugin::{ForgedChecks, ToolForgeController, ToolForgePlugin};
 use std::{path::Path, sync::Arc};
@@ -127,10 +127,10 @@ async fn inherited_rules_run_before_the_real_run_and_are_recorded_as_precheck_is
     let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../vendor/eve-portable-mindustry-json-validator");
     let rules = MindustryJsonRules::open(&directory).unwrap();
-    let check: Arc<dyn DraftCheck> = Arc::new(support::JsonPrecheckCheck::new(JsonPrecheck::new(
-        rules,
-        PythonCommand::default(),
-    )));
+    let check: Arc<dyn DraftCheck> = Arc::new(JsonDraftCheck::new(
+        JsonPrecheck::new(rules, PythonCommand::default()),
+        Arc::new(|reason: &str| panic!("真实规则不应不可用：{reason}")),
+    ));
     let workspace = tempfile::tempdir().unwrap();
     let (kernel, practice, tools) = open().await;
     let run = practice_once(

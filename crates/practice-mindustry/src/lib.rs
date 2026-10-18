@@ -12,7 +12,7 @@ use eve_practice_api::{
     BoxFuture, MAX_ISSUE_BYTES, MAX_ISSUES, MAX_LOG_EXCERPT_BYTES, PracticeDraft, PracticeRunner,
     ProbeResult, RunEvidence, RunExit, RunnerProfile,
 };
-pub use precheck::{JsonPrecheck, PythonCommand};
+pub use precheck::{JsonDraftCheck, JsonPrecheck, PythonCommand};
 use ring::digest::{Context, SHA256};
 pub use rules::MindustryJsonRules;
 use std::{
