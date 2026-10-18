@@ -11,6 +11,10 @@ use std::{
     time::Duration,
 };
 
+pub(crate) fn timing_enabled() -> bool {
+    std::env::var("EVE_TRACE_DIALOGUE_TIMING").is_ok_and(|v| matches!(v.as_str(), "1" | "true"))
+}
+
 #[derive(PartialEq)]
 struct CapturedModel {
     provider: ConfigSnapshot,
@@ -192,8 +196,11 @@ impl LlmModelResolver for CoreModelResolver {
             config.request_timeout = config.request_timeout.min(cap);
         }
         let provider_timeout = config.request_timeout;
-        let provider: Arc<dyn eve_llm_api::LlmProvider> =
-            Arc::new(OpenAiProvider::new(config, &self.api_key)?);
+        let mut provider = OpenAiProvider::new(config, &self.api_key)?;
+        if self.use_name.as_deref() == Some("dialogue") && timing_enabled() {
+            provider = provider.with_timing_diagnostics();
+        }
+        let provider: Arc<dyn eve_llm_api::LlmProvider> = Arc::new(provider);
         let selected = ModelSelection {
             provider_timeout,
             provider: if captured.natural_style {

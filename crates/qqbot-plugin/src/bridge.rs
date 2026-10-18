@@ -41,6 +41,17 @@ fn warn(ctx: &PluginContext, code: &str) {
         let _ = ctx.log(entry);
     }
 }
+fn timing(enabled: bool, phase: &str, turn: Option<u64>) {
+    if enabled {
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        eprintln!(
+            "EVE_QQ_TIMING {}",
+            json!({"phase":phase,"turn":turn,"at_ms":at})
+        );
+    }
+}
 async fn write(stdin: &mut ChildStdin, value: Value) -> PluginResult<()> {
     let mut bytes = serde_json::to_vec(&value).map_err(|_| failure("QQBot 命令编码失败"))?;
     bytes.push(b'\n');
@@ -107,6 +118,7 @@ pub(crate) struct Services {
     pub outreach: Option<Arc<OutreachHook>>,
     pub conversations: crate::QqConversations,
     pub participant_observer: Option<Arc<dyn crate::QqParticipantObserver>>,
+    pub timing_diagnostics: bool,
 }
 /// 宿主接线的主动交流；`push_interval` 为空时不主动私聊。
 pub(crate) struct OutreachHook {
@@ -155,6 +167,7 @@ struct ChannelEvents {
     signal: Arc<dyn TaskSignal>,
     stop: watch::Receiver<bool>,
     closed: watch::Receiver<bool>,
+    timing_diagnostics: bool,
 }
 impl ChannelEvents {
     fn is_closed(&self) -> bool {
@@ -169,8 +182,20 @@ async fn closing(mut receiver: watch::Receiver<bool>) {
     }
 }
 impl ControlEventSink for ChannelEvents {
-    fn emit(&self, _: ControlEvent) -> LlmFuture<'_, ()> {
+    fn emit(&self, event: ControlEvent) -> LlmFuture<'_, ()> {
         Box::pin(async move {
+            let stage = match &event.event.kind {
+                TurnEventKind::ProviderStarted { .. } => Some("provider_begin"),
+                TurnEventKind::ResponseCompleted { .. } => Some("provider_completed"),
+                TurnEventKind::ToolBatchStarted { .. } => Some("tools_begin"),
+                TurnEventKind::ToolResult { .. } => Some("tool_result"),
+                TurnEventKind::SessionSaved => Some("session_saved"),
+                TurnEventKind::Failed { .. } => Some("turn_failed"),
+                _ => None,
+            };
+            if let Some(stage) = stage {
+                timing(self.timing_diagnostics, stage, event.event.turn_id);
+            }
             if self.is_closed() {
                 Err(LlmError::Cancelled)
             } else {
@@ -467,6 +492,7 @@ pub(crate) async fn run(
         outreach,
         conversations,
         participant_observer,
+        timing_diagnostics,
     } = services;
     // 仅本地学习已验证回执中的用户表达；不提交旧任务、不调用模型或重发消息。
     if let Some(training) = &training {
@@ -487,6 +513,7 @@ pub(crate) async fn run(
         signal: signal.clone(),
         stop: stop.clone(),
         closed: receiver,
+        timing_diagnostics,
     });
     let mut command = Command::new(&config.node_program);
     command
@@ -857,6 +884,7 @@ pub(crate) async fn run(
                     && !delivering.as_ref().is_some_and(|d| same_session(&queued.message, &d.reply.message))
             });
             if let Some(index) = next_ordinary {
+                timing(timing_diagnostics, "admission_begin", None);
                 let queued = queue.remove(index).expect("queued ordinary message");
                 let message = queued.message;
                 if !queued.saved && !ledger.insert(&ctx, &config.app_id, message.clone())? {
@@ -873,6 +901,7 @@ pub(crate) async fn run(
                 }, sink.clone());
                 match submitted {
                     Ok(key) => {
+                        timing(timing_diagnostics, "admitted", None);
                         controlled_sessions.insert(key.session.session_id.clone(), key.session.clone());
                         let wait = control.wait(&key); active.push(Active { message, key, ordinary: queued.ordinary, wait });
                     }
@@ -927,6 +956,7 @@ pub(crate) async fn run(
                 _ = tokio::time::sleep_until(delivering.as_ref().and_then(|d| d.pause_until).unwrap_or(deadline)),
                     if delivering.as_ref().is_some_and(|d| !d.awaiting() && !pending_control(&d.reply.message, &routing, &commands)) => {}
                 (index, report) = routed(&mut routing), if !routing.is_empty() => {
+                    timing(timing_diagnostics, "routing_completed", None);
                     let route = routing.remove(index);
                     let report = report.map_err(|_| failure("QQBot 消息控制收尾失败"))?;
                     // 已被路由取消的旧轮不再显示。prior 仍由 MessageService/Control 保留，
@@ -1129,6 +1159,7 @@ pub(crate) async fn run(
                                 finish(&mut stdin, &message.id).await?;
                             } else {
                                 status.send_modify(|s| s.received += 1);
+                                timing(timing_diagnostics, "message_received", None);
                                 if let Some(observer) = &participant_observer {
                                     let session = message.session_key(&config.app_id)?;
                                     if let Err(error) = observer.observe(&session, &message.conversation_key(&config.app_id)?, &message.text, sender_name.as_deref()) {

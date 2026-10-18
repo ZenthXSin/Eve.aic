@@ -888,7 +888,8 @@ async fn run_qqbot_composed(
         })?
         .with_training()?
         .with_participant_observer(Arc::new(crate::qq_people::Observer(people.clone())))
-        .with_natural_message_judgement(options.message_judge != MessageJudgeMode::Off);
+        .with_natural_message_judgement(options.message_judge != MessageJudgeMode::Off)
+        .with_timing_diagnostics(crate::models::timing_enabled());
         // 会话是私聊还是群聊由通道登记；只在私聊中成立的能力据此判断。
         let conversations = plugin.conversations();
         let plugin = if options.segmented {
