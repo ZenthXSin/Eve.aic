@@ -26,6 +26,7 @@ pub struct DeveloperConfig {
     #[serde(default = "timeout")]
     pub command_timeout_ms: u64,
     #[serde(default = "rounds")]
+    /// 0 表示不限制工具批次数；正数为显式上限。
     pub max_tool_rounds: usize,
     #[serde(default)]
     pub self_upgrade: bool,
@@ -59,7 +60,6 @@ impl DeveloperConfig {
                 s.is_empty() || s.len() > 256 || s.trim() != s || s.chars().any(char::is_control)
             })
             || !(1..=600_000).contains(&self.command_timeout_ms)
-            || !(1..=32).contains(&self.max_tool_rounds)
             || !matches!(
                 self.github_token_env.as_str(),
                 "EVE_GITHUB_TOKEN" | "GH_TOKEN" | "GITHUB_TOKEN"
@@ -309,6 +309,10 @@ mod tests {
         let mut config: DeveloperConfig = serde_json::from_value(base).unwrap();
         assert!(config.storage_directory.is_none());
         config.validate().unwrap();
+        for rounds in [0, 8, 32, 64] {
+            config.max_tool_rounds = rounds;
+            config.validate().unwrap();
+        }
         config.storage_directory = Some(std::env::temp_dir());
         config.validate().unwrap();
         config.storage_directory = Some("relative".into());
