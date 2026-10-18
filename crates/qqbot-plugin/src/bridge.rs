@@ -1016,7 +1016,10 @@ pub(crate) async fn run(
                         }
                         break Ok(());
                     };
-                    if frame.get("version").and_then(Value::as_u64) != Some(1) { warn(&ctx, "protocol_version"); }
+                    if frame.get("version").and_then(Value::as_u64) != Some(1) {
+                        warn(&ctx, "protocol_version");
+                        continue;
+                    }
                     match frame.get("type").and_then(Value::as_str) {
                         Some("ready") => { status.send_modify(|s| s.ready = true); }
                         Some("warning") => {
@@ -1024,6 +1027,9 @@ pub(crate) async fn run(
                                 Some("invalid_route_or_text") => "bridge_invalid_route_or_text",
                                 Some("unsupported_message") => "bridge_unsupported_message",
                                 Some("pending_limit") => "bridge_pending_limit",
+                                Some("outbound_limit") => "bridge_outbound_limit",
+                                Some("frame_limit") => "bridge_frame_limit",
+                                Some("protocol_version") => "bridge_protocol_version",
                                 Some("sdk_error") => "bridge_sdk_error",
                                 _ => "bridge_warning",
                             };
