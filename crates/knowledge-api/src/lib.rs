@@ -3,6 +3,8 @@
 //! 知识属于 Eve 自身，与用户偏好分开保存。每条知识要么附带能在已抓取网页正文中逐字核对的
 //! 引用（`SourceQuoted`：只说明来源原文这样写，不代表已经实践验证），要么明确标为未验证假设。
 //! 研究只访问操作者配置的入口页面所在范围；网页正文始终是数据，不授予任何执行能力。
+//! 来源可以是 http/https 网页，也可以是宿主随附的固定版本本地资料（`eve-corpus://资料名/路径`），
+//! 两者走同一套选择、抓取、逐字引用与版本核对。
 //! 账本、抓取器、来源选择器与知识提炼器均可替换，宿主负责绑定目标与可见范围。
 use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
@@ -44,6 +46,8 @@ pub const MAX_ENTRIES: usize = 256;
 /// 同一目标在所有修订中的研究次数上限；重启不会重置。
 pub const MAX_RUNS_PER_GOAL: usize = 3;
 pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
+/// 宿主随附的固定版本本地资料的 URL 方案：`eve-corpus://资料名/相对路径`。
+pub const CORPUS_SCHEME: &str = "eve-corpus";
 
 pub type KnowledgeResult<T> = Result<T, KnowledgeError>;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -80,7 +84,7 @@ impl SourcePolicy {
     }
 }
 
-/// 只接受规范形式的 http/https URL：有主机、无用户信息与片段。
+/// 只接受规范形式的 http/https 或本地资料 URL：有主机、无用户信息与片段；本地资料不带端口。
 pub fn canonical_url(text: &str) -> Option<Url> {
     if text.len() > MAX_URL_BYTES {
         return None;
@@ -94,7 +98,9 @@ fn parse_web_url(text: &str) -> Option<Url> {
         return None;
     }
     let url = Url::parse(text).ok()?;
-    if !matches!(url.scheme(), "http" | "https")
+    let corpus = url.scheme() == CORPUS_SCHEME;
+    if !(matches!(url.scheme(), "http" | "https") || corpus)
+        || (corpus && url.port().is_some())
         || url.host_str().is_none_or(str::is_empty)
         || !url.username().is_empty()
         || url.password().is_some()
@@ -870,9 +876,25 @@ mod tests {
             "https://docs.example/wiki/modding/../secret",
             "file:///wiki/modding/a.html",
             "https://docs.example/wiki/modding/a b.html",
+            "eve-corpus://docs.example/wiki/modding/a.md",
         ] {
             assert!(!policy.allows(denied), "{denied}");
         }
+        // 本地资料与网页同样按入口所在目录限定范围，资料名相当于主机。
+        let corpus = SourcePolicy::new(&["eve-corpus://eve-portable/mindustry/".into()]).unwrap();
+        assert!(corpus.allows("eve-corpus://eve-portable/mindustry/power-system.md"));
+        assert!(corpus.allows("eve-corpus://eve-portable/mindustry/?page=2"));
+        for denied in [
+            "eve-corpus://eve-portable/concepts/a.md",
+            "eve-corpus://other/mindustry/a.md",
+            "eve-corpus://eve-portable/mindustry/../memory/a.md",
+            "eve-corpus://eve-portable:1/mindustry/a.md",
+            "https://eve-portable/mindustry/a.md",
+        ] {
+            assert!(!corpus.allows(denied), "{denied}");
+        }
+        assert!(SourcePolicy::new(&["eve-corpus://eve-portable:80/".into()]).is_err());
+        assert!(SourcePolicy::new(&["eve-corpus:///mindustry/".into()]).is_err());
         for invalid in [
             vec![],
             vec!["ftp://docs.example/".into()],

@@ -1,4 +1,5 @@
-//! 领域知识账本、受控 HTTP 抓取器、单次模型来源选择与知识提炼，以及串起各阶段的研究流程。
+//! 领域知识账本、受控 HTTP 抓取器、固定版本本地资料源、单次模型来源选择与知识提炼，以及串起各阶段的研究流程。
+mod corpus;
 mod fetch;
 mod html;
 mod model;
@@ -6,6 +7,7 @@ mod research;
 mod store;
 mod strict_json;
 
+pub use corpus::{CorpusSourceFetcher, RoutingSourceFetcher};
 use eve_knowledge_api::*;
 use eve_plugin_api::{
     Cleanup, Plugin, PluginContext, PluginError, PluginFuture, PluginManifest, PluginResult,

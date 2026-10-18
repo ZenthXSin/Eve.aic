@@ -17,11 +17,12 @@ use eve_interest_api::{INTEREST_PLUGIN_ID, InterestObserver, ObservationOptions}
 use eve_interest_plugin::{InterestPlugin, LearningGoalDeriver, ModelInterestObserver};
 use eve_kernel::{Kernel, KernelServices};
 use eve_knowledge_api::{
-    KNOWLEDGE_PLUGIN_ID, KnowledgeAdmin, KnowledgeExtractor, SourceFetcher, SourcePolicy,
-    SourceSelector,
+    CORPUS_SCHEME, KNOWLEDGE_PLUGIN_ID, KnowledgeAdmin, KnowledgeExtractor, SourceFetcher,
+    SourcePolicy, SourceSelector,
 };
 use eve_knowledge_plugin::{
-    HttpSourceFetcher, KnowledgePlugin, ModelKnowledgeExtractor, ModelSourceSelector, Researcher,
+    CorpusSourceFetcher, HttpSourceFetcher, KnowledgePlugin, ModelKnowledgeExtractor,
+    ModelSourceSelector, Researcher, RoutingSourceFetcher,
 };
 use eve_learning_api::{
     AutoConfirmationPolicy, LEARNING_PLUGIN_ID, LearningAdmin, LearningOptions, PreferenceExtractor,
@@ -79,7 +80,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-mindustry-json-rules 目录] [--practice-python 程序] [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-mindustry-json-rules 目录] [--practice-python 程序] [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -101,6 +102,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --interest-learning 从普通聊天观察用户明确表达的兴趣、经验与困难（同时开启记忆和认知），只保存可逐字核对的原话，并派生低优先级的后台学习目标；同一会话默认间隔 5 分钟（--interest-cooldown-ms 可调整），每批一次无工具请求。
 /interests 查看本会话记录的兴趣与学习目标；/forget-interest 兴趣ID 撤回兴趣并取消对应学习目标。
 --research-source 需同时 --interest-learning，可重复至多 8 个；为等待中的学习目标在这些入口页面的同源目录内受控研究（只读 GET，每个目标修订至多一次，每个目标累计至多 3 次）。
+--research-corpus 指定宿主随附的固定版本本地资料目录（例如 vendor/eve-portable-knowledge，启动时核对清单摘要，不符拒绝启动）；--research-source 可用 eve-corpus://资料名/目录/ 指向其中的目录，研究照常选文、逐字引用，来源记为 eve-corpus 地址。
 /knowledge 兴趣ID 查看研究到的资料：来源原文附网址、抓取时间、版本与逐字引用，未验证推测单独标注；研究不重试、中断不重放。
 --practice-mindustry-server 需同时 --interest-learning；为等待中的学习目标制作只含数据文件的最小 Mindustry 模组，用操作者提供的无头服务端 jar 在全新目录中实际加载并探测内容属性（--practice-java 默认 java），每个目标修订至多一次、每次至多三次尝试，只有实际加载且全部探测通过才记为已验证。
 --practice-mindustry-json-rules 需同时 --practice-mindustry-server；用继承自 eve-portable 的 Mindustry JSON 校验规则（目录内 vendor.py 与 eve_modcheck.py，启动时核对摘要并实跑一次，不符或解释器不可用则拒绝启动）在每次实际运行前先查草稿的清单与内容文件，问题以 [预检] 记入尝试、草稿器据此修正、该次不运行；运行中解释器失败时如实记录警告并照常实际运行。--practice-python 指定解释器（默认 python3，Windows 为 python）。
@@ -151,6 +153,8 @@ pub struct QqBotOptions {
     pub interest_options: ObservationOptions,
     /// 受控研究的入口页面；为空表示不研究。
     pub research_sources: Vec<String>,
+    /// 宿主随附的固定版本本地资料目录（含 MANIFEST.json）；研究入口可用 eve-corpus:// 指向其中的目录。
+    pub research_corpus: Option<PathBuf>,
     /// 实践验证使用的 Mindustry 无头服务端 jar；为空表示不实践。
     pub practice_server_jar: Option<PathBuf>,
     /// 静态网页实践使用的无头 Chromium 程序；与 Mindustry 服务端二选一。
@@ -215,6 +219,7 @@ impl Default for QqBotOptions {
             interest_learning: false,
             interest_options: ObservationOptions::default(),
             research_sources: Vec::new(),
+            research_corpus: None,
             practice_server_jar: None,
             practice_browser: None,
             practice_java: None,
@@ -345,6 +350,7 @@ impl QqBotOptions {
                     options.practice_json_rules = Some(value.into());
                 }
                 Some("--practice-python") => options.practice_python = Some(value),
+                Some("--research-corpus") => options.research_corpus = Some(value.into()),
                 Some("--research-source") => options.research_sources.push(
                     value
                         .into_string()
@@ -546,9 +552,37 @@ fn research_policy(options: &QqBotOptions) -> Result<Option<SourcePolicy>, AppEr
     if !options.interest_learning {
         return Err("--research-source 需要同时开启 --interest-learning".into());
     }
+    let corpus_seeds = options
+        .research_sources
+        .iter()
+        .any(|seed| seed.starts_with(&format!("{CORPUS_SCHEME}:")));
+    if corpus_seeds && options.research_corpus.is_none() {
+        return Err("eve-corpus:// 研究入口需要同时指定 --research-corpus".into());
+    }
+    if !corpus_seeds && options.research_corpus.is_some() {
+        return Err("--research-corpus 需要至少一个 eve-corpus:// 研究入口".into());
+    }
     Ok(Some(SourcePolicy::new(&options.research_sources).map_err(
-        |_| "研究入口页面无效：至多 8 个互不重复、不含用户信息与片段的 http/https URL",
+        |_| "研究入口页面无效：至多 8 个互不重复、不含用户信息与片段的 http/https 或 eve-corpus:// URL",
     )?))
+}
+
+/// 打开本地资料并核对清单摘要；每个 eve-corpus:// 入口都必须指向这份资料。
+fn research_corpus(options: &QqBotOptions) -> Result<Option<Arc<CorpusSourceFetcher>>, AppError> {
+    let Some(directory) = &options.research_corpus else {
+        return Ok(None);
+    };
+    let corpus =
+        CorpusSourceFetcher::open(directory).map_err(|error| format!("本地资料无效：{error}"))?;
+    let prefix = format!("{CORPUS_SCHEME}://{}/", corpus.name());
+    if let Some(seed) = options
+        .research_sources
+        .iter()
+        .find(|seed| seed.starts_with(&format!("{CORPUS_SCHEME}:")) && !seed.starts_with(&prefix))
+    {
+        return Err(format!("研究入口 {seed} 不属于本地资料 {}", corpus.name()).into());
+    }
+    Ok(Some(Arc::new(corpus)))
 }
 
 /// 兴趣学习的可替换实现；未提供的部分使用默认的模型观察器、HTTP 抓取器与模型选择/提炼器。
@@ -754,6 +788,7 @@ async fn run_qqbot_composed(
         options.learning_options.validate()?;
         options.interest_options.validate()?;
         let research_policy = research_policy(&options)?;
+        let research_corpus = research_corpus(&options)?;
         let practice_enabled = options.practice_server_jar.is_some()
             || options.practice_browser.is_some()
             || interest_components.runner.is_some();
@@ -1208,11 +1243,18 @@ async fn run_qqbot_composed(
             context
         });
         // 后台能力不自动成为对话工具：显式装配公开 Tool，并让帮助和能力上下文共用注册源。
+        // 本地资料地址交给资料源，其他地址交给网页抓取器（或替换实现）。
+        let routed = |web: Arc<dyn SourceFetcher>| -> Arc<dyn SourceFetcher> {
+            match &research_corpus {
+                Some(corpus) => Arc::new(RoutingSourceFetcher::new(Some(corpus.clone()), web)),
+                None => web,
+            }
+        };
         let dialogue_fetcher: Option<Arc<dyn SourceFetcher>> = if research_policy.is_some() {
-            Some(match interest_components.fetcher.clone() {
+            Some(routed(match interest_components.fetcher.clone() {
                 Some(fetcher) => fetcher,
                 None => Arc::new(HttpSourceFetcher::new()?),
-            })
+            }))
         } else {
             None
         };
@@ -1492,7 +1534,7 @@ async fn run_qqbot_composed(
         {
             let cognition = Arc::new(background.as_ref().ok_or("受控研究缺少认知服务")?.admin()?);
             let fetcher: Arc<dyn SourceFetcher> = match fetcher {
-                Some(fetcher) => fetcher,
+                Some(fetcher) => routed(fetcher),
                 None => dialogue_fetcher.clone().ok_or("受控来源读取器缺失")?,
             };
             let selector: Arc<dyn SourceSelector> = match selector {
@@ -2650,6 +2692,72 @@ mod recall_options_tests {
         ])
         .unwrap();
         assert!(practice.plans);
+    }
+
+    #[test]
+    fn local_corpus_seeds_require_the_matching_vendored_corpus() {
+        let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor/eve-portable-knowledge")
+            .to_string_lossy()
+            .into_owned();
+        let seed = "eve-corpus://eve-portable/mindustry/";
+        assert!(parse(&[]).unwrap().research_corpus.is_none());
+        for (args, expected) in [
+            (
+                vec!["--interest-learning", "--research-source", seed],
+                "--research-corpus",
+            ),
+            (
+                vec![
+                    "--interest-learning",
+                    "--research-corpus",
+                    &corpus,
+                    "--research-source",
+                    "https://docs.example/",
+                ],
+                "eve-corpus://",
+            ),
+        ] {
+            assert!(parse(&args).unwrap_err().to_string().contains(expected));
+        }
+        let options = parse(&[
+            "--interest-learning",
+            "--research-corpus",
+            &corpus,
+            "--research-source",
+            seed,
+        ])
+        .unwrap();
+        let opened = research_corpus(&options).unwrap().unwrap();
+        assert_eq!(opened.name(), "eve-portable");
+        let foreign = parse(&[
+            "--interest-learning",
+            "--research-corpus",
+            &corpus,
+            "--research-source",
+            "eve-corpus://other/notes/",
+        ])
+        .unwrap();
+        assert!(
+            research_corpus(&foreign)
+                .unwrap_err()
+                .to_string()
+                .contains("不属于本地资料")
+        );
+        let missing = parse(&[
+            "--interest-learning",
+            "--research-corpus",
+            "/nonexistent",
+            "--research-source",
+            seed,
+        ])
+        .unwrap();
+        assert!(
+            research_corpus(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("本地资料无效")
+        );
     }
 
     #[test]
