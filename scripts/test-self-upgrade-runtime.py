@@ -66,7 +66,7 @@ while True:time.sleep(.05)
         self.command=[str(self.old),str(self.helper),'--agent',str(self.initial/'AGENT.md'),
             '--bridge-script',str(self.initial/'connectors/qqbot/bridge.mjs'),'--state-dir',str(self.state),'--events',str(self.events)]
         self.process=None
-        self.env=dict(os.environ,PYTHONHOME=sys.base_prefix)
+        self.env=dict(os.environ,PYTHONHOME=sys.base_prefix,PYTHONUTF8='1')
         lib=sysconfig.get_config_var('LIBDIR')
         if lib and os.name!='nt':self.env['LD_LIBRARY_PATH']=lib+os.pathsep+self.env.get('LD_LIBRARY_PATH','')
         self.env['PATH']=str(Path(sys.executable).parent)+os.pathsep+self.env.get('PATH','')

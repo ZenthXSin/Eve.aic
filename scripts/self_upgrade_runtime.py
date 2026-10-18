@@ -303,6 +303,8 @@ class Supervisor:
             waiting_since = None
             quiet_since = None
             prepared = None
+            state_stamp = None
+            gate = False
             while not self.stopping:
                 if self.child.process.poll() is not None:
                     raise ValueError('active_process_exited')
@@ -319,12 +321,21 @@ class Supervisor:
                             self.publish(phase='waiting')
                         if time.monotonic() - waiting_since > self.options.drain_timeout:
                             raise ValueError('reply_or_idle_timeout')
-                        if delivery_gate(self.state, request):
+                        stat = self.state.stat()
+                        stamp = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+                        if state_stamp != stamp:
+                            gate = delivery_gate(self.state, request)
+                            state_stamp = stamp
+                        if gate:
                             quiet_since = quiet_since or time.monotonic()
                             if time.monotonic() - quiet_since >= self.options.quiet_seconds:
                                 if prepared[0] != request: raise ValueError('request_changed')
+                                if not delivery_gate(self.state, request):
+                                    quiet_since = None
+                                    continue
                                 self.switch(*prepared)
                                 prepared = waiting_since = quiet_since = None
+                                state_stamp = None
                         else:
                             quiet_since = None
                     except (ValueError, OSError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as error:
@@ -336,6 +347,7 @@ class Supervisor:
                         code = str(error) if type(error) is ValueError and str(error).replace('_','').isalnum() else type(error).__name__
                         self.publish(phase='running', result='rejected', error=code[:100])
                         prepared = waiting_since = quiet_since = None
+                        state_stamp = None
                 time.sleep(0.1)
             return self.child.stop(self.options.stop_timeout)
         finally:
