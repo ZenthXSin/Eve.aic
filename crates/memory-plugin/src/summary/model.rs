@@ -45,7 +45,10 @@ impl ConversationSummarizer for ModelConversationSummarizer {
             };
             let selection = self.resolver.resolve().map_err(failure)?;
             let response = tokio::time::timeout(
-                selection.provider_timeout.min(Duration::from_secs(30)),
+                selection
+                    .provider_timeout
+                    .saturating_add(Duration::from_secs(1))
+                    .min(Duration::from_secs(30)),
                 selection.provider.complete(request),
             )
             .await

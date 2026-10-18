@@ -1300,9 +1300,13 @@ async fn run_qqbot_composed(
                     .downcast::<ConfigServiceHandle>()
                     .map_err(|_| "兴趣学习配置服务类型错误")?;
                 let key = std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "缺少模型凭据")?;
-                Ok(Arc::new(
-                    crate::models::CoreModelResolver::new(settings.0.clone(), key).with_use(role),
-                ))
+                let resolver =
+                    crate::models::CoreModelResolver::new(settings.0.clone(), key).with_use(role);
+                Ok(Arc::new(if role == "summary" {
+                    resolver.with_timeout_cap(std::time::Duration::from_secs(29))
+                } else {
+                    resolver
+                }))
             };
         // 后台学习组件的模型请求按用途计入自主运行预算；未启用预算时原样使用主模型。
         // 健康记录包在预算之内：预算拒绝没有发出请求，不算模型的结局。

@@ -83,8 +83,9 @@ class SummaryAcceptance(digest.ConversationDigestAcceptance):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True); self.thread.start()
 
     def run_summary(self, script, **options):
-        return self.run_eve(script, env_extra={"EVE_MEMORY_SUMMARY_ENABLED": "true",
-            "EVE_MEMORY_SUMMARY_MIN_NEW_EVIDENCE": "1", "EVE_MEMORY_SUMMARY_COOLDOWN_MS": "1000"}, **options)
+        env = {"EVE_MEMORY_SUMMARY_ENABLED": "true", "EVE_MEMORY_SUMMARY_MIN_NEW_EVIDENCE": "1",
+               "EVE_MEMORY_SUMMARY_COOLDOWN_MS": "1000", **options.pop("env_extra", {})}
+        return self.run_eve(script, env_extra=env, **options)
 
     def jobs(self):
         return self.documents().get("eve.memory-summary", {}).get("summaries.v1", {}).get("jobs", [])
@@ -165,6 +166,18 @@ class SummaryAcceptance(digest.ConversationDigestAcceptance):
             *self.send(self.message("two", SECOND)), *self.checkpoint("budget")],
             panel=True, command_extra=flags, checkpoints={"pause": pause_interest, "first": lambda: self.wait_jobs(1), "budget": exhausted})
         self.run_summary([*self.checkpoint("restart")], command_extra=flags, checkpoints={"restart": exhausted})
+
+    def test_provider_timeout_is_visible_in_model_health_before_component_deadline(self):
+        self.mode = "hold"
+        def timed_out():
+            self.wait_jobs(1, {"Failed": "Timeout"})
+            status, ready = self.panel("/api/readiness")
+            self.assertEqual(status, 200)
+            role = next(r for r in ready["roles"] if r["role"] == "summary")
+            self.assertEqual((role["requests"], role["failures"], role["state"]), (1, 1, "failing"))
+            self.assertEqual(role["last_failure"]["kind"], "timed_out")
+        self.run_summary([*self.send(self.message("timeout", FIRST)), *self.checkpoint("timeout")],
+            panel=True, env_extra={"EVE_OPENAI_TIMEOUT_SECONDS": "1"}, checkpoints={"timeout": timed_out})
 
 
 if __name__ == "__main__":
