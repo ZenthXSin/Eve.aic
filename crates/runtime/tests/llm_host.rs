@@ -648,8 +648,48 @@ async fn multiple_tool_batches_keep_paired_history_and_all_diagnostics() {
 }
 
 #[tokio::test]
+async fn explicit_unlimited_and_large_limits_keep_running_past_thirty_two_batches() {
+    for max_tool_rounds in [0, 40] {
+        let mut script = (0..40)
+            .map(|index| {
+                tool_response(vec![call(
+                    &format!("step-{index}"),
+                    "echo",
+                    json!({"step":index}),
+                )])
+            })
+            .collect::<Vec<_>>();
+        script.push(final_response("完整执行四十批"));
+        let provider = RecordingProvider::scripted(script);
+        let tool = Arc::new(TestTool::new(
+            "echo",
+            Some(ToolConcurrency::ParallelSafe),
+            ToolMode::Echo,
+        ));
+        let (host, _, _) = make_host(
+            provider.clone(),
+            vec![tool],
+            LlmHostConfig {
+                max_tool_rounds,
+                ..LlmHostConfig::default()
+            },
+        )
+        .await;
+        let output = host.run_turn(turn()).await.unwrap();
+        assert_eq!(output.diagnostics.tool_batches, 40);
+        assert_eq!(output.diagnostics.started_tools, 40);
+        assert_eq!(output.diagnostics.tool_results.len(), 40);
+        assert_eq!(output.diagnostics.provider_requests, 41);
+        assert_eq!(output.transcript.len(), 82);
+        for request in provider.requests.lock().unwrap().iter() {
+            request.validate().unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn repeated_ids_and_round_overflow_never_execute_the_next_batch() {
-    for same_id in [true, false] {
+    for (same_id, max_tool_rounds) in [(true, 0), (true, 2), (false, 2)] {
         let provider = RecordingProvider::scripted(vec![
             tool_response(vec![call("first", "echo", json!({}))]),
             tool_response(vec![call(
@@ -668,7 +708,7 @@ async fn repeated_ids_and_round_overflow_never_execute_the_next_batch() {
             provider,
             vec![tool],
             LlmHostConfig {
-                max_tool_rounds: 2,
+                max_tool_rounds,
                 ..LlmHostConfig::default()
             },
         )
@@ -703,6 +743,7 @@ async fn tool_timeout_requests_cancellation_and_preserves_call_id() {
     let config = LlmHostConfig {
         tool_timeout: Duration::from_millis(5),
         tool_cancellation_grace: Duration::from_millis(20),
+        max_tool_rounds: 0,
         ..LlmHostConfig::default()
     };
     let (host, _, _) = make_host(provider, vec![tool], config).await;
@@ -924,8 +965,16 @@ async fn dropping_run_turn_drops_in_flight_tool_future() {
         Some(ToolConcurrency::ParallelSafe),
         ToolMode::WaitForDrop(dropped.clone()),
     ));
-    let (host, _, tools, kernel) =
-        make_host_with_registry(provider, vec![tool], LlmHostConfig::default(), None).await;
+    let (host, _, tools, kernel) = make_host_with_registry(
+        provider,
+        vec![tool],
+        LlmHostConfig {
+            max_tool_rounds: 0,
+            ..LlmHostConfig::default()
+        },
+        None,
+    )
+    .await;
     let task = tokio::spawn(async move { host.run_turn(turn()).await });
     for _ in 0..100 {
         if !tools[0].starts.lock().expect("starts lock").is_empty() {

@@ -155,6 +155,27 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         self.assertFalse((self.source / "forbidden").exists())
         self.assertFalse((self.work / "state/developer-tools/operations.jsonl").exists())
 
+    def test_explicit_unlimited_runs_forty_batches_and_restart_never_replays_them(self):
+        config = json.loads(self.developer_config.read_text())
+        config["max_tool_rounds"] = 0
+        self.developer_config.write_text(json.dumps(config))
+        def respond(body):
+            results = self.results(body)
+            if len(results) == 40:
+                self.assertTrue(all(r["content"] == "真实源码测试" for r in results))
+                return text_response("四十批完成")
+            reply = tool_response([("read_file", {"path": "README.md"})])
+            reply["choices"][0]["message"]["tool_calls"][0]["id"] = f"read-{len(results)}"
+            return reply
+        self.callback = respond
+        self.enabled(self.send(self.message("long-tools", "连续只读核对四十批", expected="四十批完成")))
+        self.assertEqual(self.chat_rounds, 41)
+        journal = self.work / "state/developer-tools/operations.jsonl"
+        before = journal.read_bytes()
+        self.callback = lambda body: text_response("此前操作未重放")
+        self.enabled(self.send(self.message("long-tools-restored", "查看完成状态", expected="此前操作未重放")))
+        self.assertEqual(journal.read_bytes(), before)
+
     def test_invalid_arguments_and_missing_eve_source_never_claim_self_upgrade(self):
         def respond(body):
             if not self.results(body):
