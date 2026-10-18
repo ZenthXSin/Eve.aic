@@ -820,6 +820,8 @@ async fn upgrade_runs_real_rust_checks_and_builds_an_immutable_candidate_without
     assert_eq!(fs::read_to_string(&resource).unwrap(), "合成候选身份资料");
     fs::write(root.path().join("AGENT.md"), "后来的源文件修改").unwrap();
     assert_eq!(fs::read_to_string(resource).unwrap(), "合成候选身份资料");
+    // 结束上面的构建输出篡改场景；下一次只改变运行资源，保持原二进制。
+    fs::copy(&candidate, root.path().join("target/debug/eve-qqbot")).unwrap();
     let later = backend
         .execute(DeveloperOperation::PrepareUpgrade, context("owner"))
         .await
