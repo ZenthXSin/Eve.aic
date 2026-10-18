@@ -8,6 +8,8 @@ try {
   bridge = createBridge(bot, emit);
   process.on("SIGINT", () => bridge.stop());
   process.on("SIGTERM", () => bridge.stop());
+  // 监督器向 Eve 的独立 Windows 进程组发送 Ctrl+Break；由 Rust 完成回执收尾后发 stop。
+  if (process.platform === "win32") process.on("SIGBREAK", () => {});
   const running = bot.start().catch(() => {
     emit({ type: "fatal", version: 1, code: "sdk_start_failed" });
     process.exitCode = 1;

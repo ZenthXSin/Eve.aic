@@ -16,6 +16,8 @@ enum Kind {
     Command,
     Github,
     Upgrade,
+    ApplyUpgrade,
+    UpgradeStatus,
 }
 pub fn tools(config: &DeveloperConfig, backend: Arc<dyn DeveloperBackend>) -> Vec<Arc<dyn Tool>> {
     [
@@ -27,6 +29,8 @@ pub fn tools(config: &DeveloperConfig, backend: Arc<dyn DeveloperBackend>) -> Ve
         (Kind::Command, config.commands),
         (Kind::Github, config.github),
         (Kind::Upgrade, config.self_upgrade),
+        (Kind::ApplyUpgrade, config.live_upgrade.is_some()),
+        (Kind::UpgradeStatus, config.live_upgrade.is_some()),
     ]
     .into_iter()
     .filter(|(_, on)| *on)
@@ -131,11 +135,23 @@ impl DeveloperTool {
                 })?;
                 Ok(DeveloperOperation::Github(a))
             }
-            Kind::Upgrade => {
+            Kind::Upgrade | Kind::UpgradeStatus => {
                 if arguments.as_object().is_none_or(|v| !v.is_empty()) {
                     return Err(bad());
                 }
-                Ok(DeveloperOperation::PrepareUpgrade)
+                Ok(if matches!(self.kind, Kind::Upgrade) {
+                    DeveloperOperation::PrepareUpgrade
+                } else {
+                    DeveloperOperation::UpgradeStatus
+                })
+            }
+            Kind::ApplyUpgrade => {
+                let a: ApplyUpgradeArguments =
+                    serde_json::from_value(arguments.clone()).map_err(|_| bad())?;
+                if !valid_candidate_sha(&a.candidate_sha256) {
+                    return Err(bad());
+                }
+                Ok(DeveloperOperation::ApplyUpgrade(a))
             }
         }
     }
@@ -201,7 +217,20 @@ impl Tool for DeveloperTool {
             ),
             Kind::Upgrade => (
                 "prepare_self_upgrade",
-                "在当前源码工作区实际执行 cargo fmt --check、Clippy、cargo test --workspace --locked 和 cargo build -p eve-app --bins --locked，保存候选版本摘要与验证证据。准备成功不代表运行中版本已替换；通过 GitHub PR/CI/Release 和客户端更新应用升级。",
+                "实际执行格式、Clippy、工作区测试与构建，冻结候选可执行文件、运行资源及摘要。准备成功尚未切换；宿主装配 apply_self_upgrade 时可提交实时切换，否则走 PR/发行更新。",
+                object(json!({}), &[]),
+            ),
+            Kind::ApplyUpgrade => (
+                "apply_self_upgrade",
+                "将 prepare_self_upgrade 返回的 candidate_sha256 交给独立运行监督器。queued=true 仅表示已排队：本轮必须先结束回复，不在本轮轮询等待应用；回复送达且通道空闲后短暂重连切换。后续新轮可用 self_upgrade_status 核对实际结果；启动失败回退旧二进制，保留实际状态。不能指定路径、命令或自行杀死宿主。",
+                object(
+                    json!({"candidate_sha256":{"type":"string","pattern":"^[a-f0-9]{64}$"}}),
+                    &["candidate_sha256"],
+                ),
+            ),
+            Kind::UpgradeStatus => (
+                "self_upgrade_status",
+                "读取独立运行监督器的心跳、当前二进制摘要、切换阶段及真实结果。applied、rolled_back 与未知/失败分开；不要把提交请求冒充已经升级。",
                 object(json!({}), &[]),
             ),
         };

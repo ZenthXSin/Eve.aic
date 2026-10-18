@@ -4,6 +4,7 @@ import hashlib
 import pathlib
 import sys
 import unittest
+import time
 
 import dialogue_tools_test as dialogue
 from dialogue_tools_test import tool_response, text_response
@@ -190,6 +191,36 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         self.callback = respond
         self.enabled(self.send(self.message("invalid", "核对升级", expected="升级尚未准备，运行版本未变化")))
         self.assertFalse((self.work / "state/developer-tools/candidates").exists())
+
+    def test_live_upgrade_request_uses_host_turn_and_scope_and_does_not_claim_applied(self):
+        queue = self.work / "upgrade-queue"
+        queue.mkdir()
+        storage = self.work / "live-developer"
+        candidate_id = "a" * 64
+        candidate = storage / "candidates" / candidate_id
+        candidate.mkdir(parents=True)
+        (candidate / "manifest.json").write_text(json.dumps({"format_version":1,"prepared":True,"success":True,
+            "candidate_sha256":candidate_id,"checks":[{"success":True}]*4}))
+        config = json.loads(self.developer_config.read_text())
+        config.update(live_upgrade=str(queue),storage_directory=str(storage))
+        self.developer_config.write_text(json.dumps(config))
+        (queue / "supervisor.json").write_text(json.dumps({"format_version":1,"pid":1,
+            "heartbeat_ms":int(time.time()*1000),"phase":"running","active_sha256":"b"*64,
+            "candidate_sha256":None,"result":None}))
+        def respond(body):
+            self.assertTrue({"apply_self_upgrade","self_upgrade_status"} <= self.definitions(body))
+            results = self.results(body)
+            if not results:
+                return tool_response([("apply_self_upgrade", {"candidate_sha256":candidate_id})])
+            self.assertTrue(results[0]["queued"])
+            self.assertFalse(results[0]["applied"])
+            return text_response("切换已排队，尚未声称应用成功")
+        self.callback=respond
+        self.enabled(self.send(self.message("apply", "应用已验证候选", expected="切换已排队，尚未声称应用成功")))
+        request=json.loads((queue/"request.json").read_text())
+        self.assertEqual(request["turn_id"],self.turn("应用已验证候选")["id"])
+        self.assertEqual(request["requested_by"],config["operators"][0])
+        self.assertEqual(request["session_id"],config["operators"][0])
 
 if __name__ == "__main__":
     unittest.main()

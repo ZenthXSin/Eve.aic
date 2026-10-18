@@ -655,7 +655,15 @@ async fn interrupted() -> Result<(), AppError> {
             _ = terminate.recv() => {},
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let mut stop = tokio::signal::windows::ctrl_break()?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = stop.recv() => {},
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     tokio::signal::ctrl_c().await?;
     Ok(())
 }

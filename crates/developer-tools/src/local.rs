@@ -16,6 +16,7 @@ use tokio::{
     process::Command,
     sync::Mutex,
 };
+mod live_upgrade;
 
 const MAX_FILE: usize = 8 * 1024 * 1024;
 const MAX_OUTPUT: usize = 32 * 1024;
@@ -414,6 +415,8 @@ impl LocalDeveloper {
             }
             DeveloperOperation::Github(a) => self.github(a).await,
             DeveloperOperation::PrepareUpgrade => self.upgrade(context).await,
+            DeveloperOperation::ApplyUpgrade(a) => self.apply_upgrade(a, context),
+            DeveloperOperation::UpgradeStatus => self.upgrade_status(),
         }
     }
     async fn command(
@@ -749,42 +752,7 @@ impl LocalDeveloper {
             "eve-qqbot"
         });
         let bytes = fs::read(binary).map_err(|_| failed("构建未生成 QQ 可执行文件"))?;
-        let digest = hash(&bytes);
-        let directory = self.journal.join("candidates").join(&digest);
-        fs::create_dir_all(&directory).map_err(|_| failed("候选目录不可创建"))?;
-        let candidate = directory.join(if cfg!(windows) {
-            "eve-qqbot.exe"
-        } else {
-            "eve-qqbot"
-        });
-        let mut temporary =
-            tempfile::NamedTempFile::new_in(&directory).map_err(|_| failed("候选文件不可创建"))?;
-        temporary
-            .write_all(&bytes)
-            .and_then(|_| temporary.as_file().sync_all())
-            .map_err(|_| failed("候选文件保存失败"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            temporary
-                .as_file()
-                .set_permissions(fs::Permissions::from_mode(0o700))
-                .map_err(|_| failed("候选可执行权限设置失败"))?;
-        }
-        temporary
-            .persist(&candidate)
-            .map_err(|_| failed("候选文件提交失败"))?;
-        let manifest = json!({"format_version":1,"success":true,"prepared":true,"applied":false,"source":before,"binary_sha256":digest,"candidate_path":candidate,"checks":checks,"next":"提交工作分支和 PR；CI 通过后合并发行，客户端核验更新并在下次启动应用。运行中的版本未替换。"});
-        let mut temporary =
-            tempfile::NamedTempFile::new_in(&directory).map_err(|_| failed("候选清单不可创建"))?;
-        temporary
-            .write_all(manifest.to_string().as_bytes())
-            .and_then(|_| temporary.as_file().sync_all())
-            .map_err(|_| failed("候选清单保存失败"))?;
-        temporary
-            .persist(directory.join("manifest.json"))
-            .map_err(|_| failed("候选清单提交失败"))?;
-        Ok(manifest)
+        self.publish_upgrade(before, bytes, checks, context).await
     }
     async fn source_fingerprint(
         &self,
@@ -852,6 +820,8 @@ impl DeveloperBackend for LocalDeveloper {
                 DeveloperOperation::Command(_) => "command",
                 DeveloperOperation::Github(_) => "github",
                 DeveloperOperation::PrepareUpgrade => "upgrade",
+                DeveloperOperation::ApplyUpgrade(_) => "apply_upgrade",
+                DeveloperOperation::UpgradeStatus => "upgrade_status",
             };
             let id = self.next.fetch_add(1, Ordering::SeqCst);
             self.record(id, kind, "started", None)?;

@@ -46,6 +46,8 @@ jobs:
         run: python -X utf8 scripts/test-release-portable.py
       - name: 验证客户端更新、资产校验与失败恢复
         run: node scripts/test-client-update.mjs
+      - name: 验证实时升级切换、失败回退与不回放
+        run: python -X utf8 scripts/test-self-upgrade-runtime.py
       - name: 检查所有构建目标
         run: cargo check --workspace --all-targets --locked
       - name: 检查 Clippy 警告
