@@ -1,0 +1,10 @@
+[package]
+name = "eve-people-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-plugin-api = { path = "../plugin-api" }
+serde.workspace = true

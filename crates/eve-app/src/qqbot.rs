@@ -774,6 +774,12 @@ async fn run_qqbot_composed(
         let model_health = Arc::new(eve_model_health::HealthBook::new());
         model_health.register("dialogue");
         bootstrap.health = Some(model_health.clone());
+        let people_plugin = eve_people_plugin::PeoplePlugin::new()?;
+        let people: Arc<dyn eve_people_api::PeopleDirectory> = Arc::new(people_plugin.controller());
+        kernel.register(Box::new(people_plugin))?;
+        kernel
+            .start(&PluginId::new(eve_people_api::PEOPLE_PLUGIN_ID)?)
+            .await?;
         let plugin = QqBotPlugin::new(QqBotConfig {
             node_program: options.node_program,
             bridge_script: options.bridge_script,
@@ -783,6 +789,7 @@ async fn run_qqbot_composed(
             sandbox,
         })?
         .with_training()?
+        .with_participant_observer(Arc::new(crate::qq_people::Observer(people.clone())))
         .with_natural_message_judgement(options.message_judge != MessageJudgeMode::Off);
         // 会话是私聊还是群聊由通道登记；只在私聊中成立的能力据此判断。
         let conversations = plugin.conversations();
@@ -1061,6 +1068,11 @@ async fn run_qqbot_composed(
             None => context,
         };
         // 宿主实际保存了什么、单次回复上限多少，作为数据交给对话，避免模型对用户说错或长文被截断。
+        let context: Arc<dyn ContextAssembler> = Arc::new(crate::qq_people::Context {
+            wrapped: context,
+            people: people.clone(),
+            registry: registry.clone(),
+        });
         let context: Arc<dyn ContextAssembler> = Arc::new(crate::qq_host_facts::HostFactsContext {
             wrapped: context,
             registry: registry.clone(),
@@ -1677,6 +1689,7 @@ async fn run_qqbot_composed(
             },
         );
         let mut plugin = plugin.with_command_handler(Arc::new(CommandHandlers(vec![
+            Arc::new(crate::qq_people::Commands(people)),
             help_commands,
             commands,
             memory_commands,

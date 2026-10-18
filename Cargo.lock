@@ -311,6 +311,8 @@ dependencies = [
  "eve-model-health",
  "eve-outreach-api",
  "eve-outreach-plugin",
+ "eve-people-api",
+ "eve-people-plugin",
  "eve-plan-api",
  "eve-plan-plugin",
  "eve-plugin-api",
@@ -805,6 +807,26 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "eve-people-api"
+version = "0.1.0"
+dependencies = [
+ "eve-plugin-api",
+ "serde",
+]
+
+[[package]]
+name = "eve-people-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-kernel",
+ "eve-people-api",
+ "eve-plugin-api",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
