@@ -55,6 +55,8 @@ eve-interest-api = { path = "../interest-api" }
 eve-interest-plugin = { path = "../interest-plugin" }
 eve-knowledge-api = { path = "../knowledge-api" }
 eve-knowledge-plugin = { path = "../knowledge-plugin" }
+eve-reference-api = { path = "../reference-api" }
+eve-reference-plugin = { path = "../reference-plugin" }
 eve-practice-api = { path = "../practice-api" }
 eve-practice-plugin = { path = "../practice-plugin" }
 eve-practice-mindustry = { path = "../practice-mindustry" }

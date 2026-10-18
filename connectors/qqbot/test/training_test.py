@@ -68,6 +68,11 @@ class Reports(unittest.TestCase):
             "--practice-mindustry-json-rules", "rules", "--research-corpus", "corpus",
             "--research-source", corpus_seed, "--state-dir", "state"])
         self.assertNotIn("--practice-browser", mindustry)
+        self.assertEqual(training.FULL_PROFILE[-2:], ["--max-tool-rounds", "8"])
+        referenced = training.host_command("eve", state, "full", "chrome", (), None, None, None,
+                                           ["mindustry=/src/m", "arc=/src/a"])
+        self.assertEqual(referenced[-6:], ["--reference", "mindustry=/src/m", "--reference", "arc=/src/a",
+                                           "--state-dir", "state"])
         for args, code in ((("training", "chrome"), "training_profile_extra"),
                            (("training", None, (), "server.jar"), "training_profile_extra"),
                            (("training", None, (), None, None, "corpus"), "training_profile_extra"),
@@ -78,6 +83,11 @@ class Reports(unittest.TestCase):
                            (("full", "chrome", ["https://a.example/"], None, None, "corpus"), "full_profile_corpus"),
                            (("full", "chrome", ["https://a.example/"] * 2), "full_profile_research_sources"),
                            (("full", "chrome", [f"https://{i}.example/" for i in range(9)]), "full_profile_research_sources"),
+                           (("training", None, (), None, None, None, ["a=/x"]), "training_profile_extra"),
+                           (("full", "chrome", (), None, None, None, ["a=/x", "a=/y"]), "full_profile_references"),
+                           (("full", "chrome", (), None, None, None, ["a="]), "full_profile_references"),
+                           (("full", "chrome", (), None, None, None, [f"r{i}=/x" for i in range(9)]),
+                            "full_profile_references"),
                            (("unknown",), "profile")):
             with self.assertRaisesRegex(ValueError, code):
                 training.host_command("eve", state, *args)

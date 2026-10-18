@@ -15,6 +15,7 @@
 | `seconds` | 21300 | 60 至 21300；从网关就绪开始计时 |
 | `continue_run_id` | 空 | 接着某次已结束的全功能体验运行的状态继续；留空则全新开始 |
 | `practice` | `mindustry` | 实践运行环境：`mindustry` 用校验过摘要的 Mindustry v160.7 无头服务端，并先跑继承的 JSON 预检；`browser` 用无头 Chrome 做网页实践 |
+| `reasoning_effort` | `high` | 主模型推理强度：high、medium、low，none 为关闭 |
 | `research_sources` | 继承资料的 `mindustry/`、`mod-making-guide/` 与 Mindustry 模组 Wiki | 受控研究入口，空格分隔，至多 8 个；可写 https 地址或 `eve-corpus://eve-portable/` 下的资料目录；留空则不做受控研究 |
 
 工作流与[主动提问训练](./主动提问训练.md)共用并发组 `eve-qqbot-live`，同一时刻只有一个窗口连接机器人；训练窗口还在运行时，新的体验窗口会排队等它结束。
@@ -25,13 +26,14 @@
 
 - 对话：主动提问训练、分段投递、在途消息的主模型判断（`--message-judge primary`）、私聊提醒。
 - 记忆：交互记忆、按本轮输入召回、持续自主学习（含偏好提炼与自动采纳）。
+- 回复时查证：用 `search_reference` 和 `read_reference` 查 Mindustry v160.7 源码（含中英文名称表）、对应的 Arc 源码和继承资料，并引用路径与行号；单轮至多 8 批工具调用，见[回复时参考资料](./回复时参考资料.md)。
 - 后台学习：内生反思、兴趣观察、受控研究（入口含 `eve-corpus://` 时同时装配仓库内的[继承资料](./继承-eve-portable-资料.md)）、实践（默认 Mindustry 加 JSON 预检，可选网页）、技能固化、工具锻造。
 - 计划与交流：多步计划、待办完成确认、学习停止、请求澄清、议程上下文、主动邀请（被动窗口等待 30 分钟仍未送达时主动私聊一次）。
 - 预算：后台模型请求每 24 小时合计至多 200 次（`/budget` 查看），回复用户消息不计入。
 
 没有开启：语义召回需要单独的 embedding 模型角色；控制面板只监听本机，在 Actions 上无法访问；开发工具需要操作者配置。Mindustry 与网页实践只能二选一，由宿主参数校验保证。
 
-模型与训练工作流相同（deepseek-v4.1-flash、Chat、不推理），单次输出上限 4096 token、请求期限 60 秒。各命令和行为见 [QQBot 通道](./QQBot通道.md)；私聊发 `/help tools` 可查看实际已装配的工具。
+模型为 deepseek-v4.1-flash（Chat 协议），默认开启 high 推理，单次输出上限 8192 token、请求期限 120 秒。各命令和行为见 [QQBot 通道](./QQBot通道.md)；私聊发 `/help tools` 可查看实际已装配的工具。
 
 ## 状态保存与续接
 

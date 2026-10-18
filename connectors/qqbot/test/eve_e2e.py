@@ -379,7 +379,8 @@ class Acceptance(unittest.TestCase):
         mindustry = ["--practice-mindustry-server", str(jar),
                      "--practice-mindustry-json-rules", "vendor/eve-portable-mindustry-json-validator",
                      "--research-corpus", "vendor/eve-portable-knowledge",
-                     "--research-source", "eve-corpus://eve-portable/mindustry/"]
+                     "--research-source", "eve-corpus://eve-portable/mindustry/",
+                     "--reference", "eve-portable=vendor/eve-portable-knowledge"]
 
         def window(name, message, gate, practice, seed=None):
             scenario.write_text(json.dumps({"script": [{"send": message}, self.wait_command(message["id"]),
