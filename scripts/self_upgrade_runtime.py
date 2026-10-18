@@ -17,7 +17,7 @@ VERSION = 1
 MAX_JSON = 1024 * 1024
 
 def digest(path):
-    if not path.is_file() or path.is_symlink() or path.stat().st_size > 256 * 1024 * 1024:
+    if not path.is_file() or path.is_symlink() or path.stat().st_size > 2 * 1024 * 1024 * 1024:
         raise ValueError('invalid_binary_or_resource')
     with path.open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()

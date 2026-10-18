@@ -17,6 +17,15 @@ SCRIPT = Path(__file__).with_name('self_upgrade_runtime.py')
 spec = importlib.util.spec_from_file_location('upgrade_runtime', SCRIPT)
 runtime = importlib.util.module_from_spec(spec); spec.loader.exec_module(runtime)
 
+class DigestTests(unittest.TestCase):
+    def test_large_cargo_debug_binary_is_hashed_without_the_old_256_mib_rejection(self):
+        with tempfile.TemporaryDirectory(prefix='eve-upgrade-digest-') as directory:
+            path=Path(directory)/'debug-binary'
+            with path.open('wb') as stream:stream.truncate(256*1024*1024+1)
+            self.assertEqual(len(runtime.digest(path)),64)
+            with path.open('ab') as stream:stream.truncate(2*1024*1024*1024+1)
+            with self.assertRaises(ValueError):runtime.digest(path)
+
 class UpgradeRuntimeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
