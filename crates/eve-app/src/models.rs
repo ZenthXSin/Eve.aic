@@ -6,7 +6,10 @@ use eve_config_api::{
 };
 use eve_llm_api::{LlmError, LlmModelResolver, ModelSelection};
 use eve_llm_openai::OpenAiProvider;
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 #[derive(PartialEq)]
 struct CapturedModel {
@@ -27,6 +30,7 @@ pub(crate) struct CoreModelResolver {
     settings: Arc<dyn ConfigService>,
     api_key: String,
     use_name: Option<String>,
+    timeout_cap: Option<Duration>,
     cached: Mutex<Option<CachedModel>>,
 }
 impl CoreModelResolver {
@@ -35,6 +39,7 @@ impl CoreModelResolver {
             settings,
             api_key,
             use_name: None,
+            timeout_cap: None,
             cached: Mutex::new(None),
         }
     }
@@ -42,6 +47,12 @@ impl CoreModelResolver {
     /// 按用途读取 runtime.model_uses 中的单次输出上限；宿主须登记该命名空间，缺失时解析失败。
     pub(crate) fn with_use(mut self, name: &str) -> Self {
         self.use_name = Some(name.into());
+        self
+    }
+
+    /// 用途的供应商请求期限，留给组件收尾余量，避免外层取消吞掉健康结局。
+    pub(crate) fn with_timeout_cap(mut self, cap: Duration) -> Self {
+        self.timeout_cap = Some(cap);
         self
     }
 
@@ -176,7 +187,10 @@ impl LlmModelResolver for CoreModelResolver {
         {
             return Ok(previous.selected.clone());
         }
-        let config = selected_config(&captured)?;
+        let mut config = selected_config(&captured)?;
+        if let Some(cap) = self.timeout_cap {
+            config.request_timeout = config.request_timeout.min(cap);
+        }
         let provider_timeout = config.request_timeout;
         let provider: Arc<dyn eve_llm_api::LlmProvider> =
             Arc::new(OpenAiProvider::new(config, &self.api_key)?);

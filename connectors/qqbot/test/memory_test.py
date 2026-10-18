@@ -193,7 +193,8 @@ class MemoryAcceptance(unittest.TestCase):
             return response.status, json.loads(raw) if raw else None
 
     def run_eve(self, script, memory=True, cognition=False, training=False, app="1904159860",
-                checkpoints=None, send_fail=False, cancel_at=None, success=True, panel=False):
+                checkpoints=None, send_fail=False, cancel_at=None, success=True, panel=False, env_extra=None,
+                command_extra=None):
         self.runs += 1
         self.run_release = threading.Event()
         events_path = self.work / f"events-{self.runs}.jsonl"
@@ -206,6 +207,7 @@ class MemoryAcceptance(unittest.TestCase):
             EVE_OPENAI_API_KEY="test-model-secret",
             EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
             EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
+        env.update(env_extra or {})
         command = [str(BINARY), "--state-dir", str(self.work / "state"),
             "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
             "--bridge-arg", str(scenario)]
@@ -215,6 +217,7 @@ class MemoryAcceptance(unittest.TestCase):
             command.extend(["--cognition", "--cognition-max-executions", "1"])
         if training:
             command.append("--training")
+        command.extend(command_extra or [])
         self.panel_stderr = self.work / f"stderr-{self.runs}.txt"
         if panel:
             env["EVE_WEB_TOKEN"] = PANEL_TOKEN
