@@ -169,7 +169,7 @@ impl LocalDeveloper {
             return Err(failed("实时升级未启用或候选摘要无效"));
         }
         let (queue, status) = self.supervisor()?;
-        if !matches!(status.phase.as_str(), "running" | "waiting") {
+        if !matches!(status.phase.as_str(), "starting" | "running" | "waiting") {
             return Err(failed("监督器正在切换或需要检查，未提交新请求"));
         }
         let candidate = self.journal.join("candidates").join(&a.candidate_sha256);

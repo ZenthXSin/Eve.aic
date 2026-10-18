@@ -240,15 +240,19 @@ class Supervisor:
         subprocess.run([str(binary), '--help'], check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         bridge = resources / 'connectors/qqbot'
         modules = bridge / 'node_modules'
-        if not modules.exists():
-            old_bridge = Path(argument(self.command, '--bridge-script')).parent
+        original_bridge = Path(argument(self.command, '--bridge-script'))
+        bundled_bridge = original_bridge.name == 'bridge.mjs' and original_bridge.parent.name == 'qqbot'
+        if bundled_bridge and not modules.exists():
+            old_bridge = original_bridge.parent
             if (old_bridge / 'node_modules').exists() and digest(bridge / 'package-lock.json') == digest(old_bridge / 'package-lock.json'):
                 shutil.copytree(old_bridge / 'node_modules', modules, symlinks=True)
             else:
                 subprocess.run(['npm', 'ci', '--ignore-scripts', '--no-audit', '--no-fund'], cwd=bridge,
                                check=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         result = [str(binary), *self.command[1:]]
-        for flag, value in [('--agent', resources / 'AGENT.md'), ('--bridge-script', bridge / 'bridge.mjs')]:
+        replacements = [('--agent', resources / 'AGENT.md')]
+        if bundled_bridge: replacements.append(('--bridge-script', bridge / 'bridge.mjs'))
+        for flag, value in replacements:
             result = replace_argument(result, flag, value)
         for flag, relative in [('--practice-mindustry-json-rules', 'vendor/eve-portable-mindustry-json-validator'),
                                ('--research-corpus', 'vendor/eve-portable-knowledge')]:
