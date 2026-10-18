@@ -106,6 +106,7 @@ pub(crate) struct Services {
     pub natural_message_judgement: bool,
     pub outreach: Option<Arc<OutreachHook>>,
     pub conversations: crate::QqConversations,
+    pub participant_observer: Option<Arc<dyn crate::QqParticipantObserver>>,
 }
 /// 宿主接线的主动交流；`push_interval` 为空时不主动私聊。
 pub(crate) struct OutreachHook {
@@ -465,6 +466,7 @@ pub(crate) async fn run(
         natural_message_judgement,
         outreach,
         conversations,
+        participant_observer,
     } = services;
     // 仅本地学习已验证回执中的用户表达；不提交旧任务、不调用模型或重发消息。
     if let Some(training) = &training {
@@ -1016,7 +1018,10 @@ pub(crate) async fn run(
                         }
                         break Ok(());
                     };
-                    if frame.get("version").and_then(Value::as_u64) != Some(1) { warn(&ctx, "protocol_version"); }
+                    if frame.get("version").and_then(Value::as_u64) != Some(1) {
+                        warn(&ctx, "protocol_version");
+                        continue;
+                    }
                     match frame.get("type").and_then(Value::as_str) {
                         Some("ready") => { status.send_modify(|s| s.ready = true); }
                         Some("warning") => {
@@ -1024,6 +1029,9 @@ pub(crate) async fn run(
                                 Some("invalid_route_or_text") => "bridge_invalid_route_or_text",
                                 Some("unsupported_message") => "bridge_unsupported_message",
                                 Some("pending_limit") => "bridge_pending_limit",
+                                Some("outbound_limit") => "bridge_outbound_limit",
+                                Some("frame_limit") => "bridge_frame_limit",
+                                Some("protocol_version") => "bridge_protocol_version",
                                 Some("sdk_error") => "bridge_sdk_error",
                                 _ => "bridge_warning",
                             };
@@ -1094,8 +1102,10 @@ pub(crate) async fn run(
                         }
                         Some("message") => {
                             let mut payload = frame.clone();
+                            let sender_name = payload.get("sender_name").and_then(Value::as_str).map(str::to_owned);
                             if let Some(object) = payload.as_object_mut() {
                                 object.remove("type"); object.remove("version");
+                                object.remove("sender_name");
                                 if object.keys().any(|key| !["id", "scope", "target_id", "user_id", "text", "attachments"].contains(&key.as_str())) {
                                     warn(&ctx, "ignored_message_fields");
                                 }
@@ -1119,6 +1129,13 @@ pub(crate) async fn run(
                                 finish(&mut stdin, &message.id).await?;
                             } else {
                                 status.send_modify(|s| s.received += 1);
+                                if let Some(observer) = &participant_observer {
+                                    let session = message.session_key(&config.app_id)?;
+                                    if let Err(error) = observer.observe(&session, &message.conversation_key(&config.app_id)?, &message.text, sender_name.as_deref()) {
+                                        if matches!(error, PluginError::State(_)) { return Err(error); }
+                                        warn(&ctx, "participant_metadata_not_saved");
+                                    }
+                                }
                                 if explicit(&message.text) {
                                     let session = message.session_key(&config.app_id)?;
                                     let target = control.snapshot(&session)

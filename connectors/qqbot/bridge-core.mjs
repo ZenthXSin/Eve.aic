@@ -57,12 +57,25 @@ export function optionsFromEnv(env) {
 }
 export function createBridge(bot, emit, limit = 128) {
   const pending = new Map();
+  const pushing = new Set();
   const warned = new Set();
+  let activeSends = 0;
   let closed = false;
   const send = frame => { if (!closed) emit({ version: 1, ...frame }); };
   const warn = code => {
     if (!warned.has(code)) { warned.add(code); send({ type: "warning", code }); }
   };
+  // Share one bound across passive replies, segments and proactive messages.
+  // Admission failure happens before the SDK call and is never queued/retried.
+  async function sendText(target, text) {
+    if (activeSends >= limit) {
+      warn("outbound_limit");
+      throw new Error("outbound_limit");
+    }
+    activeSends++;
+    try { return await bot.sendText(target, text); }
+    finally { activeSends--; }
+  }
   const stop = () => {
     if (closed) return;
     closed = true;
@@ -91,10 +104,17 @@ export function createBridge(bot, emit, limit = 128) {
     if (pending.size >= limit) { warn("pending_limit"); return; }
     const text = userText(msg, bot.appId);
     if (!validText(text) && !attachments.length) { warn("invalid_route_or_text"); return; }
-    pending.set(msg.messageId, { target: { ...target }, sending: false });
-    send({ type: "message", id: msg.messageId, scope: msg.kind,
+    const senderName = typeof msg.senderName === "string" ? msg.senderName.trim() : "";
+    const validName = senderName && Buffer.byteLength(senderName) <= 128 && [...senderName].length <= 48 && !/[\p{Cc}]/u.test(senderName);
+    const frame = { type: "message", id: msg.messageId, scope: msg.kind,
       target_id: target.targetId, user_id: msg.senderId,
-      text, ...(attachments.length ? { attachments } : {}) });
+      text, ...(attachments.length ? { attachments } : {}), ...(validName ? { sender_name: senderName } : {}) };
+    // JSON escaping can expand a legal body beyond the Rust wire-frame limit.
+    if (Buffer.byteLength(JSON.stringify({ version: 1, ...frame })) > MAX_FRAME) {
+      warn("frame_limit"); return;
+    }
+    pending.set(msg.messageId, { target: { ...target }, sending: false });
+    send(frame);
   });
   // One part at a time, strictly in order; a failed or final part ends the reply.
   function reject(id, index) {
@@ -115,7 +135,7 @@ export function createBridge(bot, emit, limit = 128) {
     item.count = count;
     let ok = false;
     try {
-      const result = await bot.sendText(item.target, frame.text);
+      const result = await sendText(item.target, frame.text);
       ok = true;
       send({ type: "delivery", id: frame.id, index, ok: true,
         ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
@@ -134,13 +154,15 @@ export function createBridge(bot, emit, limit = 128) {
   // the user's opt-out; refusals come back as a failed receipt and are never retried here.
   async function push(frame) {
     if (!validMessageId(frame.id) || !validId(frame.target_id)) { warn("invalid_command"); return; }
+    if (pushing.has(frame.id)) { warn("duplicate_reply"); return; }
     if (!validText(frame.text) || Buffer.byteLength(frame.text) > MAX_PUSH_BYTES) {
       warn("invalid_reply_text");
       send({ type: "delivery", id: frame.id, push: true, ok: false });
       return;
     }
+    pushing.add(frame.id);
     try {
-      const result = await bot.sendText({ scope: "c2c", targetId: frame.target_id }, frame.text);
+      const result = await sendText({ scope: "c2c", targetId: frame.target_id }, frame.text);
       send({ type: "delivery", id: frame.id, push: true, ok: true,
         ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
     } catch (err) {
@@ -148,6 +170,8 @@ export function createBridge(bot, emit, limit = 128) {
       if (Number.isInteger(err?.statusCode)) diagnostic.http_status = err.statusCode;
       if (Number.isInteger(err?.code)) diagnostic.biz_code = err.code;
       send({ type: "delivery", id: frame.id, push: true, ok: false, ...diagnostic });
+    } finally {
+      pushing.delete(frame.id);
     }
   }
   return {
@@ -155,7 +179,7 @@ export function createBridge(bot, emit, limit = 128) {
     warn,
     async command(frame) {
       if (!frame || typeof frame !== "object" || Array.isArray(frame)) { warn("invalid_command"); return; }
-      if (frame.version !== 1) warn("protocol_version");
+      if (frame.version !== 1) { warn("protocol_version"); return; }
       if (frame.type === "stop") { stop(); return; }
       if (closed) return;
       if (frame.type === "push") { await push(frame); return; }
@@ -174,7 +198,7 @@ export function createBridge(bot, emit, limit = 128) {
       if (!validText(frame.text)) { reject(frame.id); return; }
       item.sending = true;
       try {
-        const result = await bot.sendText(item.target, frame.text);
+        const result = await sendText(item.target, frame.text);
         send({ type: "delivery", id: frame.id, ok: true,
           ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
       } catch (err) {
@@ -190,6 +214,7 @@ export function createBridge(bot, emit, limit = 128) {
 }
 export async function consume(input, bridge) {
   let bytes = Buffer.alloc(0), discarding = false;
+  const outstanding = new Set();
   for await (const chunk of input) {
     const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     let start = 0;
@@ -197,7 +222,21 @@ export async function consume(input, bridge) {
       if (incoming[i] !== 10) continue;
       if (!discarding && bytes.length + i - start <= MAX_FRAME) {
         const line = Buffer.concat([bytes, incoming.subarray(start, i)]).toString("utf8");
-        try { await bridge.command(JSON.parse(line)); } catch { bridge.warn("invalid_json"); }
+        let frame;
+        try { frame = JSON.parse(line); } catch { bridge.warn("invalid_json"); }
+        if (frame !== undefined) {
+          // Network sends must not hold up the input reader or stop/finish.
+          // createBridge admits at most `limit` actual SDK sends at once.
+          const command = bridge.command(frame).catch(() => bridge.warn("invalid_command"));
+          outstanding.add(command);
+          void command.then(() => outstanding.delete(command));
+          if (frame?.version === 1 && frame.type === "stop") {
+            await command;
+            return; // In-flight remote sends have unknown outcomes; do not resend.
+          }
+          // Release completed commands even within a large input chunk.
+          await Promise.resolve();
+        }
       } else bridge.warn("frame_limit");
       bytes = Buffer.alloc(0); discarding = false; start = i + 1;
     }
@@ -207,5 +246,6 @@ export async function consume(input, bridge) {
       } else bytes = Buffer.concat([bytes, incoming.subarray(start)]);
     }
   }
+  await Promise.all(outstanding);
   bridge.stop();
 }

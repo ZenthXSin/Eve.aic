@@ -18,6 +18,10 @@ impl eve_config_api::ConfigValidator for CoreConfigValidator {
             ConfigError, LLM_NAMESPACE, LlmRuntimeConfig, MODELS_NAMESPACE, ModelRolesConfig,
         };
         let invalid = || ConfigError::InvalidValue("宿主配置".into());
+        if let Some(people) = snapshots.get(crate::qq_people::NAMESPACE) {
+            crate::qq_people::settings(people)
+                .map_err(|_| ConfigError::InvalidValue(crate::qq_people::NAMESPACE.into()))?;
+        }
         let runtime =
             LlmRuntimeConfig::try_from(snapshots.get(LLM_NAMESPACE).ok_or_else(invalid)?)?;
         if runtime.response_mode != "complete" {

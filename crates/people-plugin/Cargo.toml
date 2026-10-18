@@ -1,0 +1,16 @@
+[package]
+name = "eve-people-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-people-api = { path = "../people-api" }
+eve-plugin-api = { path = "../plugin-api" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+eve-kernel = { path = "../kernel" }
+tokio.workspace = true

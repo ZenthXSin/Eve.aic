@@ -82,6 +82,8 @@ jobs:
           python3 connectors/qqbot/test/toolforge_test.py
           python3 connectors/qqbot/test/dialogue_tools_test.py
           python3 connectors/qqbot/test/developer_tools_test.py
+          python3 connectors/qqbot/test/transport_test.py
+          python3 connectors/qqbot/test/people_test.py
           python3 connectors/qqbot/test/model_health_test.py
           python3 connectors/qqbot/test/history_window_test.py
           python3 connectors/qqbot/test/plan_test.py
