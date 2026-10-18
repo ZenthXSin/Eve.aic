@@ -15,6 +15,18 @@ let provider = OpenAiProvider::new(config, credential)?;
 
 支持非流式有序 system/user/assistant 文本、assistant tool_calls 批次和逐项 role=tool / tool_call_id 回执；工具定义使用嵌套 function。对象参数和成功/失败回执编码为 JSON 字符串，保留原调用 ID、顺序和完整历史；工具定义按名称排序。空工具列表不发送 tools，Chat 不发送 Responses 的 input、phase、store 或 max_output_tokens。可选输出上限使用 max_tokens，可选 reasoning_effort 使用同名标量，默认均不由库发送。
 
+## 提示词前缀与上游缓存
+
+Runtime 将固定 AGENT 与本轮实际工具的完整说明放在请求开头，再接按原顺序保留的完整历史。每轮变化的档案、记忆召回、时钟与上下文修订放到历史之后；当前输入前再用只含工具名称的精简清单复核，避免旧会话沿用“没有工具”的过期回答。工具集合或说明真实改变时，开头清单也会改变；不冻结旧权限、旧记忆或旧配置来提高命中。
+
+这是请求布局优化，不保存或复用旧模型回复，不跳过模型与工具，也不修改已保存的对话。切换布局后的首次请求需要重新预热；历史窗口裁剪、总结、工具变动及上游路由、缓存保留策略仍可能导致未命中。
+
+命中以模型服务返回的用量和站点账单为准，例如 Chat 的 `usage.prompt_tokens_details.cached_tokens` 或 DeepSeek 的 `usage.prompt_cache_hit_tokens`。缺失这些字段只能说明本次未报告命中数，不应伪造为已命中或承诺固定命中率。当前适配器不将用量写入通用 `ModelResponse`；排查站点的零命中时，应对照同一服务的实际响应用量，而非从 Eve 的请求计数推算。
+
+2026-10-18 在当前用户授权的同一模型服务上，使用实际 QQ 宿主、30 个工具、本地桥接及四轮合成消息进行对照：旧布局四轮均未报告命中；新布局后两轮各报告 7680 个缓存 token，分别占该轮输入的约 57.8% 和 56.6%。四轮合计为 15360 / 51765，约 29.7%；小样本结果不代表长期账单命中率。真实 QQ 消息未用于该验收。
+
+## Chat 响应与验收
+
 回复只接受单个 index=0 的 assistant choice。stop 必须是完整非空文本且没有工具；tool_calls 必须含完整合法批次，允许 content 为 null/空；非空工具说明通过无正文 warning 忽略，保留完整工具批次。length/content_filter 明确失败，批次完整校验后才允许执行工具。重复 JSON 键、坏参数、空/重复调用 ID、非法消息和终态不匹配拒绝；附加 reasoning_content/reasoning 通过无正文 warning 忽略；refusal、音频和旧 function_call 返回 Unsupported。附加内容不进入 Session，也不提供 reasoning 续传。请求 Chat stream 也在发 HTTP 前返回 Unsupported。
 
 核心验收真实启动两个 Eve 子进程，对回环 Chat 服务器完成三轮、四次请求、一次插件 echo、revision 4→6 和重启新轮零工具；同一流程另验收截断回复零工具。Provider HTTP 测试覆盖请求字段、凭据、期限/取消、上限、无重试与错误脱敏。deepseek-v4.1-flash / Chat / none 已于 2026-10-01 完成同一核心的外部三轮、一次工具及独立进程恢复实测，详见[主模型验收](./主模型验收.md)。核心 Chat 普通配置空 reasoning_effort 映射为 none；库自身仍默认不发送可选参数。
