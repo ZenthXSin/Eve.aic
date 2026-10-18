@@ -40,6 +40,7 @@ pub struct LlmHostConfig {
     pub tool_timeout: Duration,
     pub tool_cancellation_grace: Duration,
     pub max_parallel_tool_calls: usize,
+    /// 0 表示不限制工具批次数；正数为本轮显式上限。取消、预算及超时仍独立生效。
     pub max_tool_rounds: usize,
     pub response_mode: ResponseMode,
     pub event_timeout: Duration,
@@ -125,10 +126,9 @@ impl LlmHostConfig {
             || self.tool_timeout.is_zero()
             || self.tool_cancellation_grace.is_zero()
             || self.max_parallel_tool_calls == 0
-            || !(1..=32).contains(&self.max_tool_rounds)
         {
             return Err(LlmError::Configuration(
-                "timeouts and concurrency must be positive; tool rounds must be 1..=32".into(),
+                "timeouts and concurrency must be positive".into(),
             ));
         }
         Ok(())
@@ -635,7 +635,9 @@ impl LlmHost {
             let ModelResponse::ToolCalls { calls } = response else {
                 unreachable!()
             };
-            if diagnostics.tool_batches >= self.config.max_tool_rounds {
+            if self.config.max_tool_rounds != 0
+                && diagnostics.tool_batches >= self.config.max_tool_rounds
+            {
                 return Err(fail(LlmError::RoundLimit, diagnostics));
             }
             if calls.iter().any(|call| !seen_calls.insert(call.id.clone())) {
