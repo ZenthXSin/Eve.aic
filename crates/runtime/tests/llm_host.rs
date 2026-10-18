@@ -597,6 +597,88 @@ async fn reports_provider_error_timeout_and_round_limit() {
 }
 
 #[tokio::test]
+async fn exhausted_rounds_close_with_a_tool_free_answer_when_configured() {
+    let tool = || {
+        Arc::new(TestTool::new(
+            "echo",
+            Some(ToolConcurrency::ParallelSafe),
+            ToolMode::Echo,
+        ))
+    };
+    let config = LlmHostConfig {
+        max_tool_rounds: 2,
+        final_answer_on_round_limit: true,
+        ..LlmHostConfig::default()
+    };
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("first", "echo", json!({"step":1}))]),
+        tool_response(vec![call("second", "echo", json!({"step":2}))]),
+        tool_response(vec![call("over", "echo", json!({"step":3}))]),
+        final_response("按已查到的两步结果作答，其余尚未核实"),
+    ]);
+    let (host, _, _) = make_host(provider.clone(), vec![tool()], config.clone()).await;
+    let output = host.run_turn(turn()).await.unwrap();
+    assert_eq!(output.text, "按已查到的两步结果作答，其余尚未核实");
+    assert_eq!(
+        (
+            output.diagnostics.tool_batches,
+            output.diagnostics.provider_requests
+        ),
+        (2, 4)
+    );
+    assert_eq!(output.diagnostics.started_tools, 2, "超出上限的那批不执行");
+    let requests = provider.requests.lock().unwrap().clone();
+    assert!(requests[..3].iter().all(|request| request.tools.len() == 1));
+    assert!(
+        requests[..3]
+            .iter()
+            .all(|request| request.messages.iter().all(|message| !message
+                .text
+                .as_deref()
+                .unwrap_or("")
+                .contains("已用完"))),
+        "未超限前的请求与原来一致"
+    );
+    let last = &requests[3];
+    assert!(last.tools.is_empty(), "收尾请求不再提供工具");
+    let notice = last.messages.last().unwrap();
+    assert_eq!(notice.role, ChatRole::System);
+    assert!(
+        notice
+            .text
+            .as_deref()
+            .unwrap()
+            .contains("已用完 2 批工具调用")
+    );
+    assert_eq!(
+        last.messages
+            .iter()
+            .filter(|message| message.role == ChatRole::Tool)
+            .count(),
+        2,
+        "已有工具结果保留在收尾请求中"
+    );
+    for request in requests.iter() {
+        request.validate().unwrap();
+    }
+
+    // 收尾时模型仍要求调用工具：不执行，以 RoundLimit 失败。
+    let stubborn = RecordingProvider::scripted(vec![
+        tool_response(vec![call("first", "echo", json!({}))]),
+        tool_response(vec![call("second", "echo", json!({}))]),
+        tool_response(vec![call("third", "echo", json!({}))]),
+        tool_response(vec![call("fourth", "echo", json!({}))]),
+    ]);
+    let (host, _, _) = make_host(stubborn, vec![tool()], config).await;
+    let failure = host
+        .run_turn(turn())
+        .await
+        .expect_err("round limit expected");
+    assert_eq!(failure.error, LlmError::RoundLimit);
+    assert_eq!(failure.diagnostics.started_tools, 2);
+}
+
+#[tokio::test]
 async fn multiple_tool_batches_keep_paired_history_and_all_diagnostics() {
     let provider = RecordingProvider::scripted(vec![
         tool_response(vec![call("read-one", "echo", json!({"step":1}))]),

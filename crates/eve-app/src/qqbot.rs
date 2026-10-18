@@ -80,7 +80,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至32] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-mindustry-json-rules 目录] [--practice-python 程序] [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-mindustry-json-rules 目录] [--practice-python 程序] [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -103,7 +103,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 /interests 查看本会话记录的兴趣与学习目标；/forget-interest 兴趣ID 撤回兴趣并取消对应学习目标。
 --research-source 需同时 --interest-learning，可重复至多 8 个；为等待中的学习目标在这些入口页面的同源目录内受控研究（只读 GET，每个目标修订至多一次，每个目标累计至多 3 次）。
 --research-corpus 指定宿主随附的固定版本本地资料目录（例如 vendor/eve-portable-knowledge，启动时核对清单摘要，不符拒绝启动）；--research-source 可用 eve-corpus://资料名/目录/ 指向其中的目录，研究照常选文、逐字引用，来源记为 eve-corpus 地址。
---reference 名称=目录 装配回复时可查的只读参考资料（至多 8 份，启动时读入内存，目录无效或超过上限拒绝启动）；模型用 search_reference 搜索、read_reference 按行读取并引用“资料名/路径:行号”。目录是 git 检出时记录其提交。--max-tool-rounds 设定单轮回复至多的工具批次（默认 1，查资料建议 8）。
+--reference 名称=目录 装配回复时可查的只读参考资料（至多 8 份，启动时读入内存，目录无效或超过上限拒绝启动）；模型用 search_reference 搜索、read_reference 按行读取并引用“资料名/路径:行号”。目录是 git 检出时记录其提交。--max-tool-rounds 设定单轮回复至多的工具批次（默认 1）；用尽时不让本轮失败，而是不再提供工具，让模型依据已有结果作答并说明未核实的部分。
 /knowledge 兴趣ID 查看研究到的资料：来源原文附网址、抓取时间、版本与逐字引用，未验证推测单独标注；研究不重试、中断不重放。
 --practice-mindustry-server 需同时 --interest-learning；为等待中的学习目标制作只含数据文件的最小 Mindustry 模组，用操作者提供的无头服务端 jar 在全新目录中实际加载并探测内容属性（--practice-java 默认 java），每个目标修订至多一次、每次至多三次尝试，只有实际加载且全部探测通过才记为已验证。
 --practice-mindustry-json-rules 需同时 --practice-mindustry-server；用继承自 eve-portable 的 Mindustry JSON 校验规则（目录内 vendor.py 与 eve_modcheck.py，启动时核对摘要并实跑一次，不符或解释器不可用则拒绝启动）在每次实际运行前先查草稿的清单与内容文件，问题以 [预检] 记入尝试、草稿器据此修正、该次不运行；运行中解释器失败时如实记录警告并照常实际运行。--practice-python 指定解释器（默认 python3，Windows 为 python）。
@@ -380,8 +380,8 @@ impl QqBotOptions {
                         value
                             .to_str()
                             .and_then(|value| value.parse::<usize>().ok())
-                            .filter(|rounds| (1..=32).contains(rounds))
-                            .ok_or("--max-tool-rounds 须为 1 至 32")?,
+                            .filter(|rounds| (1..=64).contains(rounds))
+                            .ok_or("--max-tool-rounds 须为 1 至 64")?,
                     );
                 }
                 Some("--research-source") => options.research_sources.push(
@@ -1338,6 +1338,8 @@ async fn run_qqbot_composed(
         if let Some(rounds) = options.max_tool_rounds {
             bootstrap.host_config.max_tool_rounds = rounds;
         }
+        // 工具批次用尽时不让本轮失败：不再提供工具，模型依据已有结果作答并说明未核实部分。
+        bootstrap.host_config.final_answer_on_round_limit = true;
         crate::developer::install(&mut bootstrap, &options.state_directory)?;
         let tool_definitions: Vec<_> = std::iter::once(crate::services::echo_definition())
             .chain(bootstrap.tools.iter().map(|tool| tool.definition()))
@@ -2775,8 +2777,8 @@ mod recall_options_tests {
             (vec!["--reference", "mindustry"], "名称=目录"),
             (vec!["--reference", "mindustry="], "名称=目录"),
             (vec!["--reference", "a=/x", "--reference", "a=/y"], "重复"),
-            (vec!["--max-tool-rounds", "0"], "1 至 32"),
-            (vec!["--max-tool-rounds", "33"], "1 至 32"),
+            (vec!["--max-tool-rounds", "0"], "1 至 64"),
+            (vec!["--max-tool-rounds", "65"], "1 至 64"),
         ] {
             let error = parse(&args).unwrap_err().to_string();
             assert!(error.contains(expected), "{args:?}: {error}");
