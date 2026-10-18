@@ -20,16 +20,19 @@ MAX_RESEARCH_SOURCES = 8
 FULL_PROFILE = ["--training", "--cognition", "--memory", "--self-learning", "--memory-recall", "--interest-learning",
                 "--skill-learning", "--tool-forging", "--plans", "--outreach", "--outreach-proactive-after-ms", "1800000",
                 "--clarify", "--agenda-context", "--reminders", "--goal-completion", "--learning-stop",
-                "--autonomy-budget", "200", "--segmented", "--message-judge", "primary"]
+                "--autonomy-budget", "200", "--segmented", "--message-judge", "primary",
+                # 查参考资料需要“搜索→读取→作答”多轮工具调用。
+                "--max-tool-rounds", "8"]
+MAX_REFERENCES = 8
 SUMMARY_TITLES = {"training": "QQ 主动提问训练结果", "full": "QQ 全功能体验结果"}
 SCOPES = {"training": "主动提问、用户表达统计与交流证据采集；未更新模型权重或已确认长期偏好",
           "full": "全功能体验交流证据采集；计数只覆盖 QQ 回执与会话，后台学习、计划与提醒的记录在加密状态包中"}
 
 
 def host_command(binary, state_dir, profile="training", browser=None, research_sources=(),
-                 mindustry_jar=None, json_rules=None, corpus=None):
+                 mindustry_jar=None, json_rules=None, corpus=None, references=()):
     if profile == "training":
-        if browser or research_sources or mindustry_jar or json_rules or corpus:
+        if browser or research_sources or mindustry_jar or json_rules or corpus or references:
             raise ValueError("training_profile_extra")
         extra = ["--training"]
     elif profile == "full":
@@ -52,6 +55,13 @@ def host_command(binary, state_dir, profile="training", browser=None, research_s
             extra += ["--research-corpus", str(corpus)]
         for source in research_sources:
             extra += ["--research-source", source]
+        # 回复时可查的参考资料：名称=目录，名称不得重复；格式由宿主再核对。
+        names = [reference.partition("=")[0] for reference in references]
+        if (len(references) > MAX_REFERENCES or len(set(names)) != len(names)
+                or any(not name or not value for name, _, value in (r.partition("=") for r in references))):
+            raise ValueError("full_profile_references")
+        for reference in references:
+            extra += ["--reference", reference]
     else:
         raise ValueError("profile")
     return [str(binary), *extra, "--state-dir", str(state_dir)]
@@ -313,6 +323,7 @@ def main():
     parser.add_argument("--practice-mindustry-json-rules", type=Path, help="继承来的 Mindustry JSON 预检规则目录")
     parser.add_argument("--research-corpus", type=Path, help="随仓库提供的本地资料目录")
     parser.add_argument("--research-source", action="append", default=[], help="全功能体验的受控研究入口页，可重复至多 8 个")
+    parser.add_argument("--reference", action="append", default=[], help="全功能体验回复时可查的参考资料，名称=目录，可重复至多 8 个")
     args = parser.parse_args()
     title = SUMMARY_TITLES[args.profile]
     controller = not (args.decrypt or args.wait_ready or args.wait_result)
@@ -360,7 +371,8 @@ def main():
             raise ValueError("missing_root")
         password()  # 启动前确认能保存训练结果。
         command = host_command(args.binary, args.root / "state", args.profile, args.practice_browser, args.research_source,
-                               args.practice_mindustry_server, args.practice_mindustry_json_rules, args.research_corpus)
+                               args.practice_mindustry_server, args.practice_mindustry_json_rules, args.research_corpus,
+                               args.reference)
         run_window(args.root, args.seconds, args.binary, args.seed_state, command)
         safe = finish(args.root, args.output, args.profile)
         if not safe["process_ok"] or not safe["window"]["ready"] or safe["evidence_status"] != "saved":

@@ -19,6 +19,11 @@ on:
         type: choice
         options: [mindustry, browser]
         default: mindustry
+      reasoning_effort:
+        description: 主模型推理强度（none 为关闭）
+        type: choice
+        options: [high, medium, low, none]
+        default: high
       research_sources:
         description: 受控研究入口，空格分隔，至多 8 个；https 网页或 eve-corpus://eve-portable/ 下的本地资料（留空则不做受控研究）
         type: string
@@ -56,6 +61,9 @@ jobs:
     env:
       MINDUSTRY_VERSION: v160.7
       MINDUSTRY_SHA256: f7b899a4038b95b14a824d5f8993984f79d73baa3254c385b6538327f9c0befd
+      # 回复时可查的参考源码：与服务端同版本的 Mindustry 与其 gradle.properties 固定的 Arc 提交。
+      MINDUSTRY_SOURCE_COMMIT: 17012d61d9e4c3cbd9820d87e81c24495486ac53
+      ARC_SOURCE_COMMIT: 7445105cd2683daf5b9ac7033ebb07265d3e814d
     concurrency:
       group: eve-qqbot-live
       cancel-in-progress: false
@@ -123,6 +131,18 @@ jobs:
             "https://github.com/Anuken/Mindustry/releases/download/${MINDUSTRY_VERSION}/server-release.jar"
           echo "${MINDUSTRY_SHA256}  $RUNNER_TEMP/server-release.jar" | sha256sum -c -
           java -version
+      - name: 拉取并核对参考源码
+        run: |
+          fetch() {
+            git clone -q --depth 1 --branch "$MINDUSTRY_VERSION" --filter=blob:none --no-checkout "$1" "$2"
+            git -C "$2" sparse-checkout set --no-cone "${@:4}"
+            git -C "$2" checkout -q
+            test "$(git -C "$2" rev-parse HEAD)" = "$3" || { echo "$1 的 $MINDUSTRY_VERSION 不是固定提交 $3"; exit 1; }
+          }
+          fetch https://github.com/Anuken/Mindustry "$RUNNER_TEMP/reference/mindustry" "$MINDUSTRY_SOURCE_COMMIT" \
+            /core/src/ /core/assets/bundles/bundle.properties /core/assets/bundles/bundle_zh_CN.properties
+          fetch https://github.com/Anuken/Arc "$RUNNER_TEMP/reference/arc" "$ARC_SOURCE_COMMIT" /arc-core/src/
+          du -sh "$RUNNER_TEMP/reference/mindustry" "$RUNNER_TEMP/reference/arc"
       - name: 下载续接来源的加密状态包
         if: env.CONTINUE_RUN_ID != ''
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -143,9 +163,9 @@ jobs:
           EVE_OPENAI_BASE_URL: https://ai.xn--rhqr8xvr4ahqsgka.com
           EVE_OPENAI_MODEL: deepseek-v4.1-flash
           EVE_OPENAI_PROTOCOL: chat
-          EVE_OPENAI_REASONING_EFFORT: none
-          EVE_OPENAI_MAX_OUTPUT_TOKENS: "4096"
-          EVE_OPENAI_TIMEOUT_SECONDS: "60"
+          EVE_OPENAI_REASONING_EFFORT: ${{ inputs.reasoning_effort }}
+          EVE_OPENAI_MAX_OUTPUT_TOKENS: "8192"
+          EVE_OPENAI_TIMEOUT_SECONDS: "120"
           EVE_LLM_RESPONSE_MODE: complete
         run: |
           if [ "$PRACTICE" = mindustry ]; then
@@ -155,6 +175,8 @@ jobs:
           fi
           args=(--profile full "${practice[@]}" --root "$RUNNER_TEMP/eve-qqbot-full" --output "$RUNNER_TEMP/eve-qqbot-full-artifacts" --seconds "$QQBOT_WINDOW_SECONDS")
           if [ -n "$RESEARCH_CORPUS" ]; then args+=(--research-corpus vendor/eve-portable-knowledge); fi
+          args+=(--reference "mindustry=$RUNNER_TEMP/reference/mindustry" --reference "arc=$RUNNER_TEMP/reference/arc"
+                 --reference eve-portable=vendor/eve-portable-knowledge)
           for source in $RESEARCH_SOURCES; do args+=(--research-source "$source"); done
           if [ -n "$CONTINUE_RUN_ID" ]; then args+=(--seed-state "$RUNNER_TEMP/full-restored/state"); fi
           python3 connectors/qqbot/training-window.py "${args[@]}" > "$RUNNER_TEMP/qqbot-full-controller.log" 2>&1 &

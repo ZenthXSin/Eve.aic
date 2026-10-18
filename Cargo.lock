@@ -323,6 +323,8 @@ dependencies = [
  "eve-pursuit-api",
  "eve-pursuit-plugin",
  "eve-qqbot-plugin",
+ "eve-reference-api",
+ "eve-reference-plugin",
  "eve-reminder-api",
  "eve-reminder-plugin",
  "eve-runtime",
@@ -948,6 +950,25 @@ dependencies = [
  "eve-training-api",
  "eve-training-plugin",
  "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "eve-reference-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "eve-reference-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-llm-api",
+ "eve-reference-api",
  "serde",
  "serde_json",
  "tempfile",
