@@ -126,27 +126,9 @@ impl DeveloperTool {
             Kind::Github => {
                 let a: GithubArguments =
                     serde_json::from_value(arguments.clone()).map_err(|_| bad())?;
-                if !valid_repository(&a.repository)
-                    || !["GET", "POST", "PATCH", "PUT", "DELETE"].contains(&a.method.as_str())
-                    || a.resource.len() > 4096
-                    || a.resource.starts_with('/')
-                    || a.resource.contains(['?', '#', '%', '\\'])
-                    || a.resource.chars().any(char::is_control)
-                    || a.resource.split('/').any(|p| matches!(p, "." | ".."))
-                    || a.query.len() > 24
-                    || a.query.iter().any(|(k, v)| {
-                        k.len() > 64
-                            || v.len() > 8192
-                            || k.chars().any(char::is_control)
-                            || v.chars().any(char::is_control)
-                    })
-                    || a.body
-                        .as_ref()
-                        .is_some_and(|v| v.to_string().len() > 256 * 1024)
-                    || (a.method == "GET" && a.body.is_some())
-                {
-                    return Err(bad());
-                }
+                let a = a.normalized().map_err(|message| ToolValidationError {
+                    message: message.into(),
+                })?;
                 Ok(DeveloperOperation::Github(a))
             }
             Kind::Upgrade => {
@@ -211,9 +193,9 @@ impl Tool for DeveloperTool {
             ),
             Kind::Github => (
                 "github_api",
-                "调用 GitHub REST 仓库 API：源码 contents/README/git/trees/blobs/refs、branches/commits、issues/pulls 及评论/差异、Actions、releases、statuses/check-runs；搜索资源 search/code|issues|commits|repositories。分页用 query。token 由宿主添加，不能自报凭据或URL；写操作仅限配置仓库。返回来源数据，HTTP失败不等于成功。",
+                "调用 GitHub REST 仓库 API。例：repository=Anuken/Mindustry，resource=contents/core/src/mindustry/world/blocks/defense/MendProjector.java，query={ref:master}。resource 为空读仓库信息，文件路径放 contents/ 后；不要重复 repos/owner/repo 前缀，也不要把路径放 query。支持 git/trees|blobs|refs、branches/commits、issues/pulls、Actions、releases、statuses/check-runs；搜索用 search/code|issues|commits|repositories，query.q 指定条件。token 由宿主添加，不能自报凭据或 URL；仅配置操作者可用，写入仅限配置仓库。单次参数或 HTTP 失败不表示工具不存在，按真实回执修正参数或报告限制。",
                 object(
-                    json!({"method":{"type":"string","enum":["GET","POST","PATCH","PUT","DELETE"]},"repository":{"type":"string"},"resource":{"type":"string"},"query":{"type":"object","additionalProperties":{"type":"string"}},"body":{"type":"object"}}),
+                    json!({"method":{"type":"string","enum":["GET","POST","PATCH","PUT","DELETE"]},"repository":{"type":"string","description":"owner/repo，例如 Anuken/Mindustry"},"resource":{"type":"string","description":"仓库内 REST 相对资源，例如 contents/README.md；空串读取仓库信息"},"query":{"type":"object","description":"查询参数，例如 ref=master、per_page=10 或搜索 q；文件路径放 resource","additionalProperties":{"type":"string"}},"body":{"type":"object"}}),
                     &["method", "repository"],
                 ),
             ),

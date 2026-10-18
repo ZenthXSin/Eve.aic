@@ -214,6 +214,116 @@ async fn github_actual_http_binds_host_token_decodes_source_and_redacts_result()
     );
 }
 #[tokio::test]
+async fn github_prefix_and_query_path_reach_actual_source_without_expanding_permissions() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut backend = LocalDeveloper::new(config(root.path()), ledger.path().into(), None).unwrap();
+    backend.api = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        for expected in [
+            "/repos/test/repo/contents/README.md?ref=main",
+            "/repos/test/repo/git/blobs/abc",
+            "/repos/test/repo",
+        ] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let n = socket.read(&mut request).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..n])
+                    .starts_with(&format!("GET {expected} HTTP/1.1"))
+            );
+            let body = r#"{"path":"README.md","encoding":"base64","content":"aGVsbG8gRXZl"}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    let a = GithubArguments {
+        method: "GET".into(),
+        repository: "test/repo".into(),
+        resource: "repos/test/repo/contents".into(),
+        query: BTreeMap::from([
+            ("path".into(), "README.md".into()),
+            ("ref".into(), "main".into()),
+        ]),
+        body: None,
+    };
+    let tool = crate::tools(
+        &backend.config,
+        Arc::new(LocalDeveloper::new(backend.config.clone(), ledger.path().into(), None).unwrap()),
+    )
+    .into_iter()
+    .find(|t| t.definition().name == "github_api")
+    .unwrap();
+    tool.validate_arguments(&serde_json::to_value(&a).unwrap())
+        .unwrap();
+    let result = backend
+        .execute(DeveloperOperation::Github(a.clone()), context("owner"))
+        .await
+        .unwrap();
+    assert_eq!(result["data"]["text"], "hello Eve");
+    assert_eq!(result["resource"], "contents/README.md");
+    for resource in ["repos/test/repo/git/blobs/abc", "repos/test/repo"] {
+        let mut b = a.clone();
+        b.resource = resource.into();
+        b.query.clear();
+        assert_eq!(
+            backend
+                .execute(DeveloperOperation::Github(b), context("owner"))
+                .await
+                .unwrap()["success"],
+            true
+        );
+    }
+    for resource in [
+        "repos/foreign/repo/contents",
+        "repos/test/repo/actions/secrets",
+        "repos/test/repo/contents/../issues",
+    ] {
+        let mut b = a.clone();
+        b.resource = resource.into();
+        b.query.clear();
+        assert!(
+            backend
+                .execute(DeveloperOperation::Github(b), context("owner"))
+                .await
+                .is_err()
+        );
+    }
+    let mut write = a.clone();
+    write.query.clear();
+    write.method = "PUT".into();
+    write.repository = "foreign/repo".into();
+    write.resource = "repos/foreign/repo/contents/README.md".into();
+    assert!(
+        backend
+            .execute(DeveloperOperation::Github(write), context("owner"))
+            .await
+            .is_err()
+    );
+    assert!(
+        backend
+            .execute(DeveloperOperation::Github(a), context("other-user"))
+            .await
+            .is_err()
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn tools_reject_identity_urls_and_extra_arguments_and_only_register_enabled_services() {
     let root = tempfile::tempdir().unwrap();
     let ledger = tempfile::tempdir().unwrap();
