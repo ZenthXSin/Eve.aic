@@ -155,6 +155,74 @@ pub struct GithubArguments {
     pub body: Option<Value>,
 }
 
+impl GithubArguments {
+    /// 将同仓库 REST 前缀及 GET contents 的 query.path 归一化；不扩展权限。
+    /// Tool 适配器与直接使用后端的调用方均应采用此契约。
+    pub fn normalized(mut self) -> Result<Self, &'static str> {
+        if !valid_repository(&self.repository)
+            || !["GET", "POST", "PATCH", "PUT", "DELETE"].contains(&self.method.as_str())
+            || !valid_github_resource(&self.resource)
+            || self.query.len() > 24
+            || self.query.iter().any(|(k, v)| {
+                k.len() > 64
+                    || v.len() > 8192
+                    || k.chars().any(char::is_control)
+                    || v.chars().any(char::is_control)
+            })
+            || self
+                .body
+                .as_ref()
+                .is_some_and(|v| v.to_string().len() > 256 * 1024)
+            || (self.method == "GET" && self.body.is_some())
+        {
+            return Err(
+                "GitHub 参数无效：repository 使用 owner/repo，resource 使用 contents/文件路径等相对资源；不能提供 URL 或路径跳转",
+            );
+        }
+        if let Some(rest) = self.resource.strip_prefix("repos/") {
+            let mut parts = rest.splitn(3, '/');
+            let repository = format!(
+                "{}/{}",
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or("")
+            );
+            if !repository.eq_ignore_ascii_case(&self.repository) {
+                return Err("GitHub resource 的仓库前缀与 repository 不一致；不会请求其他仓库");
+            }
+            self.resource = parts.next().unwrap_or("").to_owned();
+            if !valid_github_resource(&self.resource) || self.resource.starts_with("repos/") {
+                return Err(
+                    "GitHub resource 只能包含一次同仓库前缀，后面须为 contents/文件路径等相对资源",
+                );
+            }
+        }
+        if let Some(path) = self.query.remove("path") {
+            if self.method != "GET"
+                || self.resource != "contents"
+                || path.is_empty()
+                || !valid_github_resource(&path)
+            {
+                return Err(
+                    "GitHub query.path 仅用于 GET contents，且不能与 resource 中的文件路径重复；请传 resource=contents/文件路径，query 只传 ref 等参数",
+                );
+            }
+            self.resource = format!("contents/{path}");
+            if !valid_github_resource(&self.resource) {
+                return Err("GitHub contents 文件路径超过上限");
+            }
+        }
+        Ok(self)
+    }
+}
+
+fn valid_github_resource(value: &str) -> bool {
+    value.len() <= 4096
+        && !value.starts_with('/')
+        && !value.contains(['?', '#', '%', '\\', ':'])
+        && !value.chars().any(char::is_control)
+        && !value.split('/').any(|p| matches!(p, "." | ".."))
+}
+
 #[derive(Clone, Debug)]
 pub enum DeveloperOperation {
     List(FileArguments),
@@ -178,6 +246,62 @@ pub trait DeveloperBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn github_routes_normalize_without_changing_repository_or_hiding_conflicts() {
+        let base = GithubArguments {
+            method: "GET".into(),
+            repository: "Anuken/Mindustry".into(),
+            resource: "repos/Anuken/Mindustry/contents".into(),
+            query: BTreeMap::from([
+                ("path".into(), "core/src/MendProjector.java".into()),
+                ("ref".into(), "master".into()),
+            ]),
+            body: None,
+        };
+        let normalized = base.clone().normalized().unwrap();
+        assert_eq!(normalized.resource, "contents/core/src/MendProjector.java");
+        assert_eq!(
+            normalized.query,
+            BTreeMap::from([("ref".into(), "master".into())])
+        );
+        assert_eq!(
+            normalized.clone().normalized().unwrap().resource,
+            normalized.resource
+        );
+        for resource in [
+            "repos/foreign/repo/contents",
+            "repos/Anuken/Mindustry/repos/Anuken/Mindustry/contents",
+            "repos/Anuken/Mindustry//contents",
+            "contents/a",
+            "https://api.github.com/repos/Anuken/Mindustry/contents",
+            "/contents",
+            "contents/../issues",
+            "contents/%2e%2e/issues",
+            "contents/a?ref=main",
+        ] {
+            let mut a = base.clone();
+            a.resource = resource.into();
+            assert!(a.normalized().is_err(), "{resource}");
+        }
+        for path in [
+            "../issues",
+            "/issues",
+            "a/../../issues",
+            "%2e%2e/issues",
+            "https://other.invalid/",
+        ] {
+            let mut a = base.clone();
+            a.query.insert("path".into(), path.into());
+            assert!(a.normalized().is_err(), "{path}");
+        }
+        let mut write = base.clone();
+        write.method = "PUT".into();
+        assert!(write.normalized().is_err());
+        let mut info = base;
+        info.query.clear();
+        info.resource = "repos/anuken/mindustry".into();
+        assert_eq!(info.normalized().unwrap().resource, "");
+    }
     #[test]
     fn host_configuration_accepts_separate_durable_storage_and_rejects_other_secret_references() {
         let base =

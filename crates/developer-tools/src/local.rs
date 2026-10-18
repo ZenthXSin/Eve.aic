@@ -513,6 +513,7 @@ impl LocalDeveloper {
         if !self.config.github {
             return Err(failed("GitHub 未启用"));
         }
+        let a = a.normalized().map_err(failed)?;
         let search = a.resource.starts_with("search/");
         let first = a.resource.split('/').next().unwrap_or("");
         if search {
@@ -549,7 +550,7 @@ impl LocalDeveloper {
         .contains(&first)
         {
             return Err(failed(
-                "GitHub 工具只提供仓库源码与协作资源，不提供账户或密钥管理",
+                "GitHub resource 不支持此资源；读取源码请使用 contents/文件路径，仓库信息使用空 resource，搜索使用 search/code 等；不提供账户或密钥管理",
             ));
         }
         if a.method != "GET"
@@ -579,7 +580,7 @@ impl LocalDeveloper {
             .api
             .join(&path)
             .map_err(|_| failed("GitHub 路径无效"))?;
-        {
+        if !a.query.is_empty() {
             let mut q = url.query_pairs_mut();
             for (k, v) in &a.query {
                 q.append_pair(k, v);
