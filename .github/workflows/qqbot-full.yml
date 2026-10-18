@@ -14,10 +14,15 @@ on:
         description: 接着某次已结束的全功能体验运行的状态继续（填运行 ID；留空则全新开始）
         type: string
         default: ""
+      practice:
+        description: 实践运行环境（mindustry 为真实 Mindustry v160.7 服务端加 JSON 预检；browser 为无头 Chrome 网页）
+        type: choice
+        options: [mindustry, browser]
+        default: mindustry
       research_sources:
-        description: 受控研究入口页，空格分隔，至多 8 个（留空则不做受控研究）
+        description: 受控研究入口，空格分隔，至多 8 个；https 网页或 eve-corpus://eve-portable/ 下的本地资料（留空则不做受控研究）
         type: string
-        default: "https://developer.mozilla.org/zh-CN/docs/Web/CSS/"
+        default: "eve-corpus://eve-portable/mindustry/ eve-corpus://eve-portable/mod-making-guide/ https://mindustrygame.github.io/wiki/modding/1-modding/"
 permissions:
   contents: read
   actions: read
@@ -48,6 +53,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      MINDUSTRY_VERSION: v160.7
+      MINDUSTRY_SHA256: f7b899a4038b95b14a824d5f8993984f79d73baa3254c385b6538327f9c0befd
     concurrency:
       group: eve-qqbot-live
       cancel-in-progress: false
@@ -64,6 +72,7 @@ jobs:
           INPUT_SANDBOX: ${{ inputs.sandbox }}
           INPUT_CONTINUE: ${{ inputs.continue_run_id }}
           INPUT_SOURCES: ${{ inputs.research_sources }}
+          INPUT_PRACTICE: ${{ inputs.practice }}
         run: |
           python3 - <<'PY'
           import json, os, re, urllib.request
@@ -72,9 +81,12 @@ jobs:
                   raise SystemExit("缺少仓库 Actions Secret：" + name)
           if not re.fullmatch(r"[0-9]{1,5}", os.environ["INPUT_SECONDS"]) or not 60 <= int(os.environ["INPUT_SECONDS"]) <= 21300:
               raise SystemExit("窗口必须在 60 至 21300 秒之间。")
+          if os.environ["INPUT_PRACTICE"] not in ("mindustry", "browser"):
+              raise SystemExit("实践运行环境只能是 mindustry 或 browser。")
           sources = os.environ["INPUT_SOURCES"].split()
-          if len(sources) > 8 or len(set(sources)) != len(sources) or any(not re.fullmatch(r"https://[A-Za-z0-9.-]+(?::[0-9]+)?(?:/[A-Za-z0-9._~%/-]*)?", s) for s in sources):
-              raise SystemExit("研究入口须为至多 8 个不重复的 https 地址（路径只含字母、数字与 ._~%/-）。")
+          if len(sources) > 8 or len(set(sources)) != len(sources) or any(not re.fullmatch(r"(?:https://[A-Za-z0-9.-]+(?::[0-9]+)?|eve-corpus://eve-portable)(?:/[A-Za-z0-9._~%/-]*)?", s) for s in sources):
+              raise SystemExit("研究入口须为至多 8 个不重复的 https 地址或 eve-corpus://eve-portable/ 资料路径（路径只含字母、数字与 ._~%/-）。")
+          corpus = any(s.startswith("eve-corpus:") for s in sources)
           continued = os.environ["INPUT_CONTINUE"].strip()
           if continued:
               if not re.fullmatch(r"[1-9][0-9]{0,19}", continued):
@@ -88,8 +100,9 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a") as output:
               output.write(f"QQBOT_WINDOW_SECONDS={int(os.environ['INPUT_SECONDS'])}\nQQBOT_SANDBOX={os.environ['INPUT_SANDBOX']}\n")
               output.write("CONTINUE_RUN_ID=" + continued + "\nRESEARCH_SOURCES=" + " ".join(sources) + "\n")
-          print("QQ 运行环境：" + ("沙箱" if os.environ["INPUT_SANDBOX"] == "true" else "正式"))
-          print("续接运行：" + (continued or "无，全新状态") + "；受控研究入口 " + str(len(sources)) + " 个。")
+              output.write("PRACTICE=" + os.environ["INPUT_PRACTICE"] + "\nRESEARCH_CORPUS=" + ("true" if corpus else "") + "\n")
+          print("QQ 运行环境：" + ("沙箱" if os.environ["INPUT_SANDBOX"] == "true" else "正式") + "；实践运行环境：" + os.environ["INPUT_PRACTICE"])
+          print("续接运行：" + (continued or "无，全新状态") + "；受控研究入口 " + str(len(sources)) + " 个" + ("，含继承的本地资料。" if corpus else "。"))
           PY
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
@@ -103,6 +116,13 @@ jobs:
           tar -xzf "$RUNNER_TEMP/qqbot-runtime/qqbot-runtime.tar.gz"
           chmod +x target/debug/eve-qqbot
           google-chrome --version
+      - name: 下载并校验 Mindustry 服务端
+        if: env.PRACTICE == 'mindustry'
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/server-release.jar" \
+            "https://github.com/Anuken/Mindustry/releases/download/${MINDUSTRY_VERSION}/server-release.jar"
+          echo "${MINDUSTRY_SHA256}  $RUNNER_TEMP/server-release.jar" | sha256sum -c -
+          java -version
       - name: 下载续接来源的加密状态包
         if: env.CONTINUE_RUN_ID != ''
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -128,7 +148,13 @@ jobs:
           EVE_OPENAI_TIMEOUT_SECONDS: "60"
           EVE_LLM_RESPONSE_MODE: complete
         run: |
-          args=(--profile full --practice-browser "$(command -v google-chrome)" --root "$RUNNER_TEMP/eve-qqbot-full" --output "$RUNNER_TEMP/eve-qqbot-full-artifacts" --seconds "$QQBOT_WINDOW_SECONDS")
+          if [ "$PRACTICE" = mindustry ]; then
+            practice=(--practice-mindustry-server "$RUNNER_TEMP/server-release.jar" --practice-mindustry-json-rules vendor/eve-portable-mindustry-json-validator)
+          else
+            practice=(--practice-browser "$(command -v google-chrome)")
+          fi
+          args=(--profile full "${practice[@]}" --root "$RUNNER_TEMP/eve-qqbot-full" --output "$RUNNER_TEMP/eve-qqbot-full-artifacts" --seconds "$QQBOT_WINDOW_SECONDS")
+          if [ -n "$RESEARCH_CORPUS" ]; then args+=(--research-corpus vendor/eve-portable-knowledge); fi
           for source in $RESEARCH_SOURCES; do args+=(--research-source "$source"); done
           if [ -n "$CONTINUE_RUN_ID" ]; then args+=(--seed-state "$RUNNER_TEMP/full-restored/state"); fi
           python3 connectors/qqbot/training-window.py "${args[@]}" > "$RUNNER_TEMP/qqbot-full-controller.log" 2>&1 &
@@ -139,7 +165,7 @@ jobs:
       - name: 取消时先让 Eve 收尾并保存
         if: cancelled()
         run: |
-          pkill -INT -f "training-window.py --profile full --practice-browser" || true
+          pkill -INT -f "training-window.py --profile full --practice-" || true
           for _ in $(seq 1 150); do
             [ -f "$RUNNER_TEMP/eve-qqbot-full-artifacts/controller-result.json" ] && exit 0
             sleep 1
