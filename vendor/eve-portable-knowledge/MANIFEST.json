@@ -1,0 +1,939 @@
+{
+ "format_version": 1,
+ "corpus": "eve-portable",
+ "upstream": "https://gitee.com/zenthxsin/eve-portable",
+ "commit": "e7e43b4db4de38775a8d28f59dd4ec69e5e1686e",
+ "license": "AGPL-3.0",
+ "files": [
+  {
+   "path": "concepts/arc-draw-screen-rendering.md",
+   "sha256": "3378517c18d147b8b6f45211d1a14ed8339fe46e3241e7d3b312f1e06c732dc0",
+   "bytes": 906
+  },
+  {
+   "path": "concepts/arc-reflection.md",
+   "sha256": "525075e7cbeb21ce1ceda3a0da2dc7ce71733539e636bee52f2f29cc1acf1543",
+   "bytes": 5552
+  },
+  {
+   "path": "concepts/arc-seq-why-not-list.md",
+   "sha256": "8f5a0692f20526dce5676d9b063b28d038f76e51ab0a206c3b1bb8a7568d187a",
+   "bytes": 4750
+  },
+  {
+   "path": "concepts/arc-time-timer.md",
+   "sha256": "31def13db153d66b3c46c9a8e860d15f430c89171bd32e9172aca91f6e11fc00",
+   "bytes": 9298
+  },
+  {
+   "path": "concepts/arc-util-overview.md",
+   "sha256": "96c7a9ceb5b55b8ee514ed70a73e509120f6443042773d4102694f32c3fc0bd5",
+   "bytes": 1683
+  },
+  {
+   "path": "concepts/json-common-issues.md",
+   "sha256": "938867ccdc678d0a41e32d9386d86f694d2d518ece0225ebab7406c3fd258943",
+   "bytes": 2839
+  },
+  {
+   "path": "concepts/json-problem-solving-flow.md",
+   "sha256": "83ce5881f72e7fdeb7e12b735acbf797ac8a21d8e6e6cd6df5588d14752ee8f1",
+   "bytes": 3003
+  },
+  {
+   "path": "concepts/mdt-mindustry-source-first-rule.md",
+   "sha256": "ac6be01526029f958e3d48546e80b9b93bdc9d4cf33ea29eab7ccc160dd45d2a",
+   "bytes": 1552
+  },
+  {
+   "path": "concepts/mdt-tools-pack-stbimage-byteorder.md",
+   "sha256": "65ef074dd54b6a2be2b611f8ef929ef72418ddc31aad01d028c6243a79fafc7f",
+   "bytes": 2126
+  },
+  {
+   "path": "concepts/mindustry-aegires-energy-field.md",
+   "sha256": "56c49fcc67128f7a6c882d508fb164ee2704c3d043bbab67f9f9950768da8115",
+   "bytes": 1223
+  },
+  {
+   "path": "concepts/mindustry-audio-system.md",
+   "sha256": "8af73c4951c6b0c267e3444098d33a9d6720feec1c72df5e568b1243a5cbf823",
+   "bytes": 2937
+  },
+  {
+   "path": "concepts/mindustry-autotiler.md",
+   "sha256": "b2304f4ecf102ec1d3967f98b194ddb82dace35455b8366404cba150cf179731",
+   "bytes": 2210
+  },
+  {
+   "path": "concepts/mindustry-basic-generator-ore.md",
+   "sha256": "0a7813c89f43994495dbf7e211532e44931393310bd6cccbff9cd9c091d2b532",
+   "bytes": 1554
+  },
+  {
+   "path": "concepts/mindustry-block-full-fields.md",
+   "sha256": "dcd47b8a8bf4b66653eb4495657ee81ff83cd5724cecca7158bded7720264521",
+   "bytes": 6109
+  },
+  {
+   "path": "concepts/mindustry-block-indexer.md",
+   "sha256": "aef162523ae4e665fbc7e536e50fe72d08d124986831519653bb1b2637e59190",
+   "bytes": 2419
+  },
+  {
+   "path": "concepts/mindustry-block-init-auto-calc.md",
+   "sha256": "2fa85869982868e0fcf98424401b7121fb75831a2993cc491d8eb3c2ff47f737",
+   "bytes": 5628
+  },
+  {
+   "path": "concepts/mindustry-block-tech-tree-json.md",
+   "sha256": "952440b1400ec8152743086c1b0bbb432aa7f2204380db71c7391682cc2c54f9",
+   "bytes": 2576
+  },
+  {
+   "path": "concepts/mindustry-building-tile-coordinate-relationship.md",
+   "sha256": "9822085d2c60e039edf3d3be30f6ca3dd269e250f61b310d1522769d784dc04c",
+   "bytes": 2158
+  },
+  {
+   "path": "concepts/mindustry-building-tile-power-liquid.md",
+   "sha256": "c2943925f0ef7aba97a775ef3cb74c56d1291d5d13885069ba49baf38a72df1b",
+   "bytes": 10700
+  },
+  {
+   "path": "concepts/mindustry-bullet-burning.md",
+   "sha256": "3360d8a1084656ea7a633ee68ad1dbc9c304a9aed0ae0a25aa34e91eefaa4396",
+   "bytes": 2000
+  },
+  {
+   "path": "concepts/mindustry-bullet-type-fields.md",
+   "sha256": "602ad098f3c9f9cfd7fdc7de443f578fc9a5bb56e2ebad5e68c169622dc73a12",
+   "bytes": 6181
+  },
+  {
+   "path": "concepts/mindustry-bullet-unit-content-pattern.md",
+   "sha256": "59f3d82d1749bee9b7fb7a280582b8b5dfadf336f517e5516b9af28e552faa96",
+   "bytes": 3380
+  },
+  {
+   "path": "concepts/mindustry-campaign-unitfactory-objectives.md",
+   "sha256": "a4b971ba04d5529c47433242b43b5a305a0453bd4e7817a26fb8db0f178e011d",
+   "bytes": 11409
+  },
+  {
+   "path": "concepts/mindustry-consume-system.md",
+   "sha256": "437758e6780d4296b69d29abc481b140e586b3a0d1e444bd6c1738812e64b736",
+   "bytes": 5573
+  },
+  {
+   "path": "concepts/mindustry-content-blocks-directory.md",
+   "sha256": "e0f22ac96339ec0ed388b64747233072e35c0e00254066afb007e49feb1ac4de",
+   "bytes": 940
+  },
+  {
+   "path": "concepts/mindustry-content-init-modcontentload-events.md",
+   "sha256": "f6c97ce1611416df8e3ccd6805465ad801de87dca06f23ea967753ec19256465",
+   "bytes": 1591
+  },
+  {
+   "path": "concepts/mindustry-content-loading-chain.md",
+   "sha256": "25f89c6a3e0134882df68ee8a07367b224adc30ff54b65bd47643c871f69bcc6",
+   "bytes": 2801
+  },
+  {
+   "path": "concepts/mindustry-content-loading-gamestate-rules-save.md",
+   "sha256": "04624a96f8b5eae06bc36ad4498643b659ba0133aef88a0ba64acabdd09d84aa",
+   "bytes": 11397
+  },
+  {
+   "path": "concepts/mindustry-content-parser.md",
+   "sha256": "c55adb6ce7a8212310dea4fc62495284b23f5cdc71255241132fd615e9725692",
+   "bytes": 4046
+  },
+  {
+   "path": "concepts/mindustry-content-type-resolution.md",
+   "sha256": "59c12afaba804c1b1e41b64efce6931016c13a91319b3cff99c7103959cd60a7",
+   "bytes": 11448
+  },
+  {
+   "path": "concepts/mindustry-continuous-laser-width.md",
+   "sha256": "614b131fbe7084b825da95cf6805784f94d086c9b93a13223d31cf609e5cc92c",
+   "bytes": 3117
+  },
+  {
+   "path": "concepts/mindustry-conveyor-multilink-analysis.md",
+   "sha256": "490e76654d638879ff3c235b55fd45566812f4117c1498247e7b71e583d019f5",
+   "bytes": 3109
+  },
+  {
+   "path": "concepts/mindustry-coreblock-item-capacity.md",
+   "sha256": "a7e854673d50b543dd95ba606ef3a923cd809155d296c86cda8a55bc5616702d",
+   "bytes": 538
+  },
+  {
+   "path": "concepts/mindustry-coreblock-storage-capacity.md",
+   "sha256": "6f28b5814563b3e2e143d22177e0d2bbae9ab8036fa216329a5cd27bd3ea4034",
+   "bytes": 4272
+  },
+  {
+   "path": "concepts/mindustry-custom-shader.md",
+   "sha256": "d2ee8be1eb381a2bed693dfec87dc50eb733fc78aa14a3589f4f623fa9511792",
+   "bytes": 4081
+  },
+  {
+   "path": "concepts/mindustry-damage-type-system-candidates.md",
+   "sha256": "da9e0d41deb75bbeffafc74121de3199974b7062ec591e0563d49d05c9cc5a7e",
+   "bytes": 17392
+  },
+  {
+   "path": "concepts/mindustry-data-patch-vs-json-mod.md",
+   "sha256": "68c07e00cf29bd6a5d66ca8bd325a2dccd4726637609bfbf2b6f9896edc0a08b",
+   "bytes": 3189
+  },
+  {
+   "path": "concepts/mindustry-datapatcher-sync.md",
+   "sha256": "a44679d0f6b9b0b2e019f5f9a579acbf787260834d2dad1a45b0d36945491459",
+   "bytes": 1631
+  },
+  {
+   "path": "concepts/mindustry-deep-qa-compendium.md",
+   "sha256": "b9c4f817f5e7a28a716efbdf5e5537d1043fb139cb3a992872c9307732fe260f",
+   "bytes": 1974
+  },
+  {
+   "path": "concepts/mindustry-defense-blocks.md",
+   "sha256": "42ab00965c4889f78e5c2d67255057ba111f09ebdf413ca069d6d1c774d37138",
+   "bytes": 4093
+  },
+  {
+   "path": "concepts/mindustry-distribution-liquids-storage.md",
+   "sha256": "1c687e6ff580c2b5b255c4f6d82464869eebd9e16e177ccc0623a386a385b8e9",
+   "bytes": 10505
+  },
+  {
+   "path": "concepts/mindustry-drawblock-system.md",
+   "sha256": "d1019136a451fe5587098abd5be02e280cf375b6d816b86e34b9afbe19be66d0",
+   "bytes": 10159
+  },
+  {
+   "path": "concepts/mindustry-drawflame-top-texture.md",
+   "sha256": "070430fc8ee8fa0302fc2cc4037aa751b9816b761f083de6269dd4b130a89833",
+   "bytes": 758
+  },
+  {
+   "path": "concepts/mindustry-drawing-api-coordinate-origins.md",
+   "sha256": "564742251c57070ca9c6efc3004f7c411f5a143ef49b222c20b1338a9e576502",
+   "bytes": 2480
+  },
+  {
+   "path": "concepts/mindustry-drawpart-system.md",
+   "sha256": "eaa18217a57724472d7c1c744e068990b9c59ea095e8ba62ebab64f6aa6c4190",
+   "bytes": 6213
+  },
+  {
+   "path": "concepts/mindustry-electric-arc-effect.md",
+   "sha256": "059542b049f29163cfc7f56d32df21d17f5cb86f51b9e3b1dca8337b87aff7f4",
+   "bytes": 1130
+  },
+  {
+   "path": "concepts/mindustry-environment-block-fields.md",
+   "sha256": "2d76c0cf39bd2813008e4b551d5934550b608fa8ca64de89429cabedfe4bfde4",
+   "bytes": 9891
+  },
+  {
+   "path": "concepts/mindustry-free-camera.md",
+   "sha256": "c9c47c6bf0b3f41bc7b18846df8ca092f8735ae51cee4dd0c7a40c438c3dfbce",
+   "bytes": 3306
+  },
+  {
+   "path": "concepts/mindustry-genericcrafter-payload-io.md",
+   "sha256": "d8d2bf09d3b97cfd78154ca135c311cea5baa9e52d5ec4b6bd932b01be4bb485",
+   "bytes": 2123
+  },
+  {
+   "path": "concepts/mindustry-genericcrafter-payload-production.md",
+   "sha256": "192dd8455936457d395307ea26914ca85b414fd2446ad2cc70b533ac31e74adb",
+   "bytes": 4550
+  },
+  {
+   "path": "concepts/mindustry-heat-system.md",
+   "sha256": "9ffccea96547093ee1ee33b04c1d319bd7f300307f5dd5d171fed95a58c294f1",
+   "bytes": 7019
+  },
+  {
+   "path": "concepts/mindustry-heatblock-4-state-tiling.md",
+   "sha256": "8bf74d87bcfa082e7f193868583bde6fcb7839ad19e5842d24f76578d9d8cf20",
+   "bytes": 4809
+  },
+  {
+   "path": "concepts/mindustry-heatnode-fast-linking.md",
+   "sha256": "7b8bdf45ef00d2531245fd019781385c679c1ba6be6a4ce97afb3fcc1253479a",
+   "bytes": 2969
+  },
+  {
+   "path": "concepts/mindustry-ios-java-mod-loading.md",
+   "sha256": "0b238a2387ab7572c392590d5c2fa28da3a319d14c06d382739a3676a7b1f64b",
+   "bytes": 783
+  },
+  {
+   "path": "concepts/mindustry-item-team-attribute-schematic-techtree.md",
+   "sha256": "b6d8803cfbbd51618c369e4af2522124487ac715203b71e56e0094041a318c82",
+   "bytes": 10271
+  },
+  {
+   "path": "concepts/mindustry-java-shell-ejection-effect.md",
+   "sha256": "3da84a30c4e4ddc6aff966df9d90997f27af6a25bf893c3bc0172f578129f3d2",
+   "bytes": 1693
+  },
+  {
+   "path": "concepts/mindustry-js-json-type-conflict.md",
+   "sha256": "99ddca8f17300e1b036b3454b7089f7746a68e6df269dbc6dff480f3b5257a39",
+   "bytes": 2240
+  },
+  {
+   "path": "concepts/mindustry-js-nativearray-type-mismatch.md",
+   "sha256": "51e5b59c735ccc81d81ddcda91d9a266ae3fe9226a5e981a676dad40ef1b41d9",
+   "bytes": 1165
+  },
+  {
+   "path": "concepts/mindustry-js-stellar-planet-generator.md",
+   "sha256": "e027939d52d3635721197bb83e0d5aa522767c4f9aa5b0ffa51d3d5c9f0cc178",
+   "bytes": 1553
+  },
+  {
+   "path": "concepts/mindustry-js-write-read.md",
+   "sha256": "e12a85f28d7873e31ed996a690f5c593f08d198b013d1cea83fd430069c73c0d",
+   "bytes": 3872
+  },
+  {
+   "path": "concepts/mindustry-json-and-java-hybrid-mod-pattern.md",
+   "sha256": "fe6144365deeb4f2107a13987987938cf9f441a9fa811022dfccce7124f22c22",
+   "bytes": 1308
+  },
+  {
+   "path": "concepts/mindustry-json-drawcrucibleflame.md",
+   "sha256": "0a9c2fc85a74e5683195af4c186a1a6ecf964810ba81654f8d5ec30d4555175d",
+   "bytes": 2195
+  },
+  {
+   "path": "concepts/mindustry-json-interface-existence-check.md",
+   "sha256": "f43efaa71b1fdd48f388cfa1872cf3b160079f73ebdb8020837ffc0842f0cbb2",
+   "bytes": 1538
+  },
+  {
+   "path": "concepts/mindustry-json-interfaces.md",
+   "sha256": "3f2b342c7b334d33f03679cad51dac50862c06c4b2978dbc100ec39a2074a685",
+   "bytes": 1457
+  },
+  {
+   "path": "concepts/mindustry-json-invalid-block-type-fallback.md",
+   "sha256": "8df957f1b7dfa5a66c49f4c9639f8f529577473b57dc8612e2cbbb5ea84e347f",
+   "bytes": 3101
+  },
+  {
+   "path": "concepts/mindustry-json-mod-deserialization.md",
+   "sha256": "4b6e9a2aae7dd4b8f9fe19b4345aa164b8c26a14982749440ab1ec6f284b884d",
+   "bytes": 5406
+  },
+  {
+   "path": "concepts/mindustry-json-multi-liquid-input.md",
+   "sha256": "73b3f0fb236c429f1540631b2c31a360a05772c0910d125907ecdd133a70c56e",
+   "bytes": 1071
+  },
+  {
+   "path": "concepts/mindustry-json-parser-tolerance.md",
+   "sha256": "f50d56c30a4fa8213e2fdfe140aa71194b509a16956752ac92415ab3a1c8f058",
+   "bytes": 1084
+  },
+  {
+   "path": "concepts/mindustry-json-piston-animation.md",
+   "sha256": "1c58741e2aba4364cfaa1f9fa45aa3563528e3b875fa25a2f47362817af38dff",
+   "bytes": 3219
+  },
+  {
+   "path": "concepts/mindustry-json-planet-generator-template.md",
+   "sha256": "538474d548e034214e152131d11beab47cda2b6cf8df5896d779893575d015a8",
+   "bytes": 1857
+  },
+  {
+   "path": "concepts/mindustry-json-screen-shake.md",
+   "sha256": "0953a53d984ff70a6cbd93dbf45ad8b7c059ed832db84979934dae7b3cd7330b",
+   "bytes": 1212
+  },
+  {
+   "path": "concepts/mindustry-json-skill-rules.md",
+   "sha256": "ab58c6e1bafd95dd85b670a8df9535818758cd2a2cd760ef948ebd2b14df4db0",
+   "bytes": 1672
+  },
+  {
+   "path": "concepts/mindustry-json-type-real-existence.md",
+   "sha256": "afaab2331dc091d5bf1bfbc2373ffa419fddf2c258fa063883a27d14ba81f939",
+   "bytes": 1451
+  },
+  {
+   "path": "concepts/mindustry-json-unit-snippet-issues.md",
+   "sha256": "9167a574586bf4cc9e2a7953ca341d20de250fe30f74a65827f8bf3ca6c5a40c",
+   "bytes": 1766
+  },
+  {
+   "path": "concepts/mindustry-kotlin-mod-structure.md",
+   "sha256": "781984d01976801b506f267cfdef2d1baaf3f56558399f9ca7599031c9d720e4",
+   "bytes": 3169
+  },
+  {
+   "path": "concepts/mindustry-kotlin-multi-recipe-crafter.md",
+   "sha256": "07c3ae0b9cec7bcb279d0f37444dbeed23bade1daf30684964ea81df846347c4",
+   "bytes": 1644
+  },
+  {
+   "path": "concepts/mindustry-kotlin-settings-integration.md",
+   "sha256": "6bebe7a69733e78ce1b6814eb06185ed82be538c45d43142502525a94f3353c1",
+   "bytes": 1447
+  },
+  {
+   "path": "concepts/mindustry-ksp-custom-unitenity-generation.md",
+   "sha256": "136701fde10211e9d451834575f69b908c9ab27b999f83d484555a3c5ae432f1",
+   "bytes": 1129
+  },
+  {
+   "path": "concepts/mindustry-launch-pad-evaluation-system.md",
+   "sha256": "90bf7e5befaed2b12cc94fc6a9d4b122e429e03404d967430045bb37dafcd6a5",
+   "bytes": 6488
+  },
+  {
+   "path": "concepts/mindustry-like-png-terrain-generator.md",
+   "sha256": "764d6f7af169c49619c472b0d2484b0defbcc21919156c30c4931c1f8b2214fb",
+   "bytes": 3265
+  },
+  {
+   "path": "concepts/mindustry-liquid-system.md",
+   "sha256": "77c5aeb84e4d742afbc6286ca6d284ecaed097129613da5e6dc2b43aeecc8a44",
+   "bytes": 7730
+  },
+  {
+   "path": "concepts/mindustry-liquidmodule-get-apparent-memory-leak.md",
+   "sha256": "22780876e80a2b13b81910685767a589c391918fdde6eb4d18b32a5012d1e937",
+   "bytes": 2481
+  },
+  {
+   "path": "concepts/mindustry-load-production.md",
+   "sha256": "3e5fc75eea6f72abf233a1ff6a6c90b2dd283287a93e2429f6df18547a549949",
+   "bytes": 1983
+  },
+  {
+   "path": "concepts/mindustry-logic-ai-effect.md",
+   "sha256": "35e28c0b520797a7289cb1c3c4e1d4720b20812df1e9b1bb1145746043950a9d",
+   "bytes": 12120
+  },
+  {
+   "path": "concepts/mindustry-logic-setammo-bugs.md",
+   "sha256": "e0b8c762c0e3beb66582fe8a1eac69d66379087351a771ccdf685aab714f77df",
+   "bytes": 1174
+  },
+  {
+   "path": "concepts/mindustry-map-image-import-color-mapping.md",
+   "sha256": "163140dd693406fc04c5eae6c1c2dede4e3e3ddb622735c703ae0252c7acf1e4",
+   "bytes": 1136
+  },
+  {
+   "path": "concepts/mindustry-mod-lifecycle-parser-boundary.md",
+   "sha256": "352fd92056ad2f20224e817d55ec3821e02a1aaa66846a6e86e44333ae50d7d5",
+   "bytes": 2401
+  },
+  {
+   "path": "concepts/mindustry-mod-search-mechanism.md",
+   "sha256": "a2ddc43ab25b93379f0058e2e20e102da9a8c722989d3dbb46d1bc3752d33069",
+   "bytes": 1868
+  },
+  {
+   "path": "concepts/mindustry-multi-recipe-crafter.md",
+   "sha256": "aa93aa4beea92174caa99e1e77c6a5f86900c58e66f440b28b79a4302f547216",
+   "bytes": 1882
+  },
+  {
+   "path": "concepts/mindustry-networking-system.md",
+   "sha256": "ebd29426b4e543a8ee9647c474c85307e3a6aad24861091dbf22e5c2a190529e",
+   "bytes": 9083
+  },
+  {
+   "path": "concepts/mindustry-pathfinder-system.md",
+   "sha256": "6022f2520025cf26e39992aad2f3accb9def4d815842586dc8ad27bdbe6454f8",
+   "bytes": 2190
+  },
+  {
+   "path": "concepts/mindustry-payload-io-snippets.md",
+   "sha256": "e4c84db2714c0c127750917b816e8440b2e2cc972975b8248fd1f95ee7c991a7",
+   "bytes": 1585
+  },
+  {
+   "path": "concepts/mindustry-payload-system.md",
+   "sha256": "05dcac0ca759c84fe1ee53e2a31c7769404bcb354701ab3116784e2d9885a38c",
+   "bytes": 9192
+  },
+  {
+   "path": "concepts/mindustry-percent-damage.md",
+   "sha256": "6c3e2a8342fbe0101e16046f80ff3d694ea760df51846d6c079164948a26b19b",
+   "bytes": 2333
+  },
+  {
+   "path": "concepts/mindustry-placement-ui-hud.md",
+   "sha256": "67441efdee78fdf24263195344690536c99b0ee5e42fd7e5bde567360a09adfd",
+   "bytes": 2056
+  },
+  {
+   "path": "concepts/mindustry-planet-orbit-position.md",
+   "sha256": "a5e555f394924bc99f3b7e0faa47338b3c681b6b8b800396ab6054e9c47008e3",
+   "bytes": 3007
+  },
+  {
+   "path": "concepts/mindustry-planet-sector-weather-payload.md",
+   "sha256": "296075547fcd37a5911e6580e3e258681291a4f728d47dbfbafdce71365cf8bf",
+   "bytes": 13397
+  },
+  {
+   "path": "concepts/mindustry-power-system-persistence.md",
+   "sha256": "990d45da31c1a62144344a3adc797253cf7f138e4a59ccaad2356dc332a937e0",
+   "bytes": 1347
+  },
+  {
+   "path": "concepts/mindustry-power-system.md",
+   "sha256": "0121d8b04115d5e4294d4c473ad61baef2a5342343265ae145a5ba6507abf27b",
+   "bytes": 13628
+  },
+  {
+   "path": "concepts/mindustry-production-blocks.md",
+   "sha256": "294b6428290bdbba050c2a8e0e6db0c12801e97bc646856e81eebb26b9d9244f",
+   "bytes": 5203
+  },
+  {
+   "path": "concepts/mindustry-public-fields-vs-getters-setters.md",
+   "sha256": "7a86e725ee9b3ff2f8cc4a3e19130c7b2bb439c8ed98111c0e7ae49b1741ae40",
+   "bytes": 4494
+  },
+  {
+   "path": "concepts/mindustry-recipe-graph-selector.md",
+   "sha256": "4120f72e274fa1e2b3c4cca5829358cd5167041f06f2a28dceb7b0ff5bfb9266",
+   "bytes": 2708
+  },
+  {
+   "path": "concepts/mindustry-rendering-input-network.md",
+   "sha256": "5a9c32cbd0d68396fc731dd2ac4100005b538bf54d353fec3e6ea7386617e6fe",
+   "bytes": 9355
+  },
+  {
+   "path": "concepts/mindustry-rules-detailed.md",
+   "sha256": "328f2e7ff7088e6713e17b5e3aaad4f876cede570aa96b3449a668f37f9793ca",
+   "bytes": 6994
+  },
+  {
+   "path": "concepts/mindustry-save-system.md",
+   "sha256": "77f606a731b8468b4379f1c9d4f59b46f39a65df6659e86e61b0db499ccdedf4",
+   "bytes": 2711
+  },
+  {
+   "path": "concepts/mindustry-schematics-system.md",
+   "sha256": "9e36248eb76d55604a268ec315061cbfb4b5ef6db7a82a0c33f61dcb4081cc05",
+   "bytes": 2673
+  },
+  {
+   "path": "concepts/mindustry-sectorpreset-json-interfaces.md",
+   "sha256": "55cc6cc2de77bbb701f975237e4cb714ced4c6835cadd6b87cab207640ce40b7",
+   "bytes": 4131
+  },
+  {
+   "path": "concepts/mindustry-shell-ejection-effect.md",
+   "sha256": "d80d20e910662d2850fce394a4b124ae1dbac54407ba65c1b0655c7554ea10ef",
+   "bytes": 1839
+  },
+  {
+   "path": "concepts/mindustry-stats-system.md",
+   "sha256": "a678dcd1dc046aaea69bdc5dbe0928be578b418d17441a59eba3fb44a0545107",
+   "bytes": 3472
+  },
+  {
+   "path": "concepts/mindustry-suicide-unit-config.md",
+   "sha256": "7f162ecd33190bf993fb0b6ce885df25fcd583670c65fbd87a6128b14f4027c9",
+   "bytes": 864
+  },
+  {
+   "path": "concepts/mindustry-thorium-reactor-safety-logic.md",
+   "sha256": "0c65c2776113bf426eb7e3314caa3eeaeea8f9a607739d6c007cc728f0566cc5",
+   "bytes": 1916
+  },
+  {
+   "path": "concepts/mindustry-tile-floor-overlay-block-rendering.md",
+   "sha256": "67c8d2aeb217fbee1ccf1e310af94b0c919b0bf52cd0ee078046428dc8d07c77",
+   "bytes": 5206
+  },
+  {
+   "path": "concepts/mindustry-turret-system.md",
+   "sha256": "484dbc80161a8c948b04f79b9cfa36a1de2b6596fe6fddd8ad5fd32b6172bc1d",
+   "bytes": 9661
+  },
+  {
+   "path": "concepts/mindustry-typed-damage-system-evaluation.md",
+   "sha256": "8ce4e6410bca4cbf061f7fdcfdbb48dcf2378b45f9658702e3fdbdfb271aa3d2",
+   "bytes": 2192
+  },
+  {
+   "path": "concepts/mindustry-ui-components-reference.md",
+   "sha256": "f9d1a829d4ca19f19e3452a009c20c98800c589efbf629564736badec0618baf",
+   "bytes": 8551
+  },
+  {
+   "path": "concepts/mindustry-ui-system.md",
+   "sha256": "fc83000d107307e895ef4f612824f32c287de481bfeb2e0019b5934f6570f0a2",
+   "bytes": 3854
+  },
+  {
+   "path": "concepts/mindustry-unit-engine-position.md",
+   "sha256": "681ec2864f9bd3fd83dcb93bb5dc77631bfb00b07563edf0c74449bca99290ed",
+   "bytes": 2499
+  },
+  {
+   "path": "concepts/mindustry-unit-system.md",
+   "sha256": "d063b258a7ff7457d893047d0f918a55112ce98cbc148b2e6ab55b9cbc5096d8",
+   "bytes": 10922
+  },
+  {
+   "path": "concepts/mindustry-vanilla-glow-drawblocks.md",
+   "sha256": "8a59175fb2e1f9255d4c770242316a67e6997adf41d583d97346ded8164aabbd",
+   "bytes": 1484
+  },
+  {
+   "path": "concepts/mindustry-vanilla-shader-rendering-from-zero.md",
+   "sha256": "0233a0bd668e4dee8f923afc40e07d60ad8b5697d12db5cef00c7ec93c1c97bb",
+   "bytes": 3420
+  },
+  {
+   "path": "concepts/mindustry-vanilla-shader-rendering.md",
+   "sha256": "2f69e5d96872611cbb5e1a15b022bffc408ccf29ca69b50759b06a5ff8e820ec",
+   "bytes": 4267
+  },
+  {
+   "path": "concepts/mindustry-version-numbering.md",
+   "sha256": "197c73d96b20694977ecc93976af1148737f01e7c7882ec012165118a0649ece",
+   "bytes": 1363
+  },
+  {
+   "path": "concepts/mindustry-wave-spawner.md",
+   "sha256": "77dfb3e3828cdcada7f8fa15a4845ad60e1d084ed07d2b3fb1f45ebd62227dd6",
+   "bytes": 3412
+  },
+  {
+   "path": "concepts/mindustry-weather-json.md",
+   "sha256": "0206180d4f4d583f42f1349f96010111cccef16fb9d5c2b94b8a770b5f00de5e",
+   "bytes": 2185
+  },
+  {
+   "path": "concepts/mindustry-world-unit-moving-buildings.md",
+   "sha256": "9cb54f9de74120991f7291f187da50e2fa480219351f3c03963208d139136bb1",
+   "bytes": 4611
+  },
+  {
+   "path": "memory/technical-notes.md",
+   "sha256": "97cc541fff60ce83e32f5a08ee4b4f87266cd409595bc2b1e236dd417cda2ad4",
+   "bytes": 7515
+  },
+  {
+   "path": "mindustry/ai-system.md",
+   "sha256": "b73222c8472577d9ab8c922d6bb0456ab4db9df364d0963c8cd268825308156b",
+   "bytes": 9537
+  },
+  {
+   "path": "mindustry/arc-framework.md",
+   "sha256": "df9c6e3e32cd4765f28b17557922935e74d199c40db8c8a87086095e33d76094",
+   "bytes": 2408
+  },
+  {
+   "path": "mindustry/block-building-system.md",
+   "sha256": "4baa6731dcb7af5e98ed2fa920016434223b2876d65b9d74ed32f550f5f6e7af",
+   "bytes": 3222
+  },
+  {
+   "path": "mindustry/campaign-system.md",
+   "sha256": "aa9985f084203b2b0e77e9b02dce31f589d8a363e6c1ad2d9964d63655be5144",
+   "bytes": 4369
+  },
+  {
+   "path": "mindustry/consumption-calculation-thorium-reactor.md",
+   "sha256": "43dbac8fa97aea8f0e3664c6006162a8dce5f9be5f28a8ba9a5a10ac77d9516e",
+   "bytes": 1514
+  },
+  {
+   "path": "mindustry/content-system.md",
+   "sha256": "0d08525ec88c1cbad48d2556f5ee6a99d39ed6b1048dc158484ab610addf2d9f",
+   "bytes": 5807
+  },
+  {
+   "path": "mindustry/core-packages.md",
+   "sha256": "2b1f30f905713eeae9a727773dc183731d7d5f73abeb7a76e2ff90062ddd47cf",
+   "bytes": 1871
+  },
+  {
+   "path": "mindustry/entity-ecs-detail.md",
+   "sha256": "c380e88fa7d97c8016507ae9c4c543d726f43e11515a0b0fdaa7373d044903e2",
+   "bytes": 345
+  },
+  {
+   "path": "mindustry/entity-ecs-system.md",
+   "sha256": "d68c2b26954ee656840d8a7ba158762c7727c5ce1046615b3cfce23af8025290",
+   "bytes": 4454
+  },
+  {
+   "path": "mindustry/events-system.md",
+   "sha256": "7ebc0bb7a0c906c2de3bfb9f6b710868a45dd5c23a9673ca1715637c19323a9a",
+   "bytes": 9217
+  },
+  {
+   "path": "mindustry/java-mod-structure.md",
+   "sha256": "61c4252393d14f9d2767e827450b38d79b8bbdc189dd5dc9c45e91e41f49a599",
+   "bytes": 3512
+  },
+  {
+   "path": "mindustry/key-classes.md",
+   "sha256": "8bef71c25854401089945d8b8c0b8130b754fbc808fca249bc652ceb95398804",
+   "bytes": 2752
+  },
+  {
+   "path": "mindustry/logic-system.md",
+   "sha256": "290991966f4b6fcc9eac8bab824bd084046e2592346392eedcb1edd0822ed332",
+   "bytes": 5567
+  },
+  {
+   "path": "mindustry/mindustry-program-entry.md",
+   "sha256": "f6602cddde05dcadda1724c63a7a7018bdf0ebf06c9d01c320207a22896c24cc",
+   "bytes": 1615
+  },
+  {
+   "path": "mindustry/mod-java-kotlin-loading.md",
+   "sha256": "f4f27c8d6c0c5beada5f1596825f835e34e9c924211a1d1c5c90b7670c93a0bc",
+   "bytes": 2228
+  },
+  {
+   "path": "mindustry/mod-lifecycle.md",
+   "sha256": "ce8ad723aeaa30709f66bb28ca9e2e8dc4d2a2eea99e485979a08ffe3ef98052",
+   "bytes": 2769
+  },
+  {
+   "path": "mindustry/mod-loading-callchain.md",
+   "sha256": "b00d78f866ed19a4b93df8a82ac269de23b1fc5fff924448321d4093d5daf75e",
+   "bytes": 4646
+  },
+  {
+   "path": "mindustry/mod-loading-system.md",
+   "sha256": "09b4d2ba77a9f74b990852bd690a41cd96ad4688b7d4102580e30f097b831f9c",
+   "bytes": 8678
+  },
+  {
+   "path": "mindustry/mod-meta-format.md",
+   "sha256": "0bd5e9d26a9e07f64bc75d8bdab85492c1d3a54f34c82fb4c584d8a6801e3406",
+   "bytes": 3115
+  },
+  {
+   "path": "mindustry/mod-system-complete-outline.md",
+   "sha256": "22853f32223c06deee5561b06aecce2950cf918cd63cce9d065d188c6ea6f9f2",
+   "bytes": 3238
+  },
+  {
+   "path": "mindustry/modding-api.md",
+   "sha256": "d8edfbb38cb2cb0695c2b29d9eb2644b21fceb45e1819ecfe7d7248fa3bf5d02",
+   "bytes": 5174
+  },
+  {
+   "path": "mindustry/networking-system.md",
+   "sha256": "15d73985c6886fc66344b44978c96be691631e18f855af270008283c1e9c4610",
+   "bytes": 4825
+  },
+  {
+   "path": "mindustry/power-system.md",
+   "sha256": "9ac23e589539b5a11ef0d9445159769ef5b7863ff82c8779575e9cc0a94d80c4",
+   "bytes": 8108
+  },
+  {
+   "path": "mindustry/project-structure.md",
+   "sha256": "0c64bd1ab7dc1cd3a72414044c0b4a1d76b06ae73796c631b35e9b8f56def294",
+   "bytes": 4198
+  },
+  {
+   "path": "mindustry/rendering-system.md",
+   "sha256": "c473a035cc0595b77bc98ca92f5512265bfbd9b6a029222037d42255f733ad8e",
+   "bytes": 3567
+  },
+  {
+   "path": "mindustry/research-tech-tree-system.md",
+   "sha256": "0b90e9c32049064961f80657d7ea2cfc95b77d483d905cad6d310f15bbecfac5",
+   "bytes": 4379
+  },
+  {
+   "path": "mindustry/save-load-detail.md",
+   "sha256": "18f004f1839c26502c1e5fc7c4f5b8150ed8c6a814aa907f8c0cb588f9cf7566",
+   "bytes": 317
+  },
+  {
+   "path": "mindustry/save-load-system.md",
+   "sha256": "92e75f9632649d7acd4f5fb2b1f3d64c4fa659228f6d03563f4bc1cded75cf95",
+   "bytes": 1068
+  },
+  {
+   "path": "mindustry/status-ability-system.md",
+   "sha256": "0fb5bba452c42180820b8b80002efc9b1b46a1795317ea206b874ce716b59bae",
+   "bytes": 5744
+  },
+  {
+   "path": "mindustry/structure-overview.md",
+   "sha256": "1b3b3d6c4b28be0a4b66dea454e481dc65c606214968b27c8bcc1dfde5ba1e5b",
+   "bytes": 2321
+  },
+  {
+   "path": "mindustry/ui-system.md",
+   "sha256": "59df13ce3fc0da335f2e6db5dfb3787fe3df5083e1413aab2f2214e9aa7d09e0",
+   "bytes": 8671
+  },
+  {
+   "path": "mindustry/unit-system.md",
+   "sha256": "0ac8707b6a6db5721c0d748479e6e7d628fcc8695eba62a0d6fbdf2561146907",
+   "bytes": 9305
+  },
+  {
+   "path": "mindustry/vars-asset.md",
+   "sha256": "68d3ece4fdd0538158a32d9e262b60a6459ca1bf421c3789d619542e47f6000c",
+   "bytes": 272
+  },
+  {
+   "path": "mindustry/vars-audio.md",
+   "sha256": "68d3ece4fdd0538158a32d9e262b60a6459ca1bf421c3789d619542e47f6000c",
+   "bytes": 272
+  },
+  {
+   "path": "mindustry/vars-content.md",
+   "sha256": "68d3ece4fdd0538158a32d9e262b60a6459ca1bf421c3789d619542e47f6000c",
+   "bytes": 272
+  },
+  {
+   "path": "mindustry/vars-control.md",
+   "sha256": "68d3ece4fdd0538158a32d9e262b60a6459ca1bf421c3789d619542e47f6000c",
+   "bytes": 272
+  },
+  {
+   "path": "mindustry/vars-game.md",
+   "sha256": "68d3ece4fdd0538158a32d9e262b60a6459ca1bf421c3789d619542e47f6000c",
+   "bytes": 272
+  },
+  {
+   "path": "mindustry/vars-index.md",
+   "sha256": "68d3ece4fdd0538158a32d9e262b60a6459ca1bf421c3789d619542e47f6000c",
+   "bytes": 272
+  },
+  {
+   "path": "mindustry/vars-input.md",
+   "sha256": "68d3ece4fdd0538158a32d9e262b60a6459ca1bf421c3789d619542e47f6000c",
+   "bytes": 272
+  },
+  {
+   "path": "mindustry/vars-network.md",
+   "sha256": "68d3ece4fdd0538158a32d9e262b60a6459ca1bf421c3789d619542e47f6000c",
+   "bytes": 272
+  },
+  {
+   "path": "mindustry/vars-platform.md",
+   "sha256": "68d3ece4fdd0538158a32d9e262b60a6459ca1bf421c3789d619542e47f6000c",
+   "bytes": 272
+  },
+  {
+   "path": "mindustry/vars-renderer.md",
+   "sha256": "68d3ece4fdd0538158a32d9e262b60a6459ca1bf421c3789d619542e47f6000c",
+   "bytes": 272
+  },
+  {
+   "path": "mindustry/vars-services.md",
+   "sha256": "68d3ece4fdd0538158a32d9e262b60a6459ca1bf421c3789d619542e47f6000c",
+   "bytes": 272
+  },
+  {
+   "path": "mindustry/vars-settings.md",
+   "sha256": "68d3ece4fdd0538158a32d9e262b60a6459ca1bf421c3789d619542e47f6000c",
+   "bytes": 272
+  },
+  {
+   "path": "mindustry/vars-system.md",
+   "sha256": "4b0d324bc50049918d1a5fdb8868617f27cba3f185a31916a48155df097568f8",
+   "bytes": 5792
+  },
+  {
+   "path": "mindustry/vars-ui.md",
+   "sha256": "68d3ece4fdd0538158a32d9e262b60a6459ca1bf421c3789d619542e47f6000c",
+   "bytes": 272
+  },
+  {
+   "path": "mindustry/vars-world.md",
+   "sha256": "68d3ece4fdd0538158a32d9e262b60a6459ca1bf421c3789d619542e47f6000c",
+   "bytes": 272
+  },
+  {
+   "path": "mindustry/world-system.md",
+   "sha256": "c745dad939a14ef0ff0bbeceae81942517eef13805d611274f6cdc72995c5982",
+   "bytes": 2200
+  },
+  {
+   "path": "mod-making-guide/allure-analysis.md",
+   "sha256": "5a04db3f590ad73b0eecde697b80b368dd2dad9e526ff716c6d5ba76179ee972",
+   "bytes": 958
+  },
+  {
+   "path": "mod-making-guide/asthosus-analysis.md",
+   "sha256": "f9547914daaebfcc667f1d4d276e0b3f0714da795ecae04c95c333ea524115a0",
+   "bytes": 1050
+  },
+  {
+   "path": "mod-making-guide/commandblocks-analysis.md",
+   "sha256": "d252ad229547097f370e38c4faac1a282a126469774d856f2de49c26c663eb11",
+   "bytes": 1049
+  },
+  {
+   "path": "mod-making-guide/exogenesis-analysis.md",
+   "sha256": "ef9b2b3bc0fcc0c88584d43f498e10e90bf7d0dd8ee5799521ec0ca853937f14",
+   "bytes": 938
+  },
+  {
+   "path": "mod-making-guide/factoriodustry-analysis.md",
+   "sha256": "6632a003e2d69a08002683835f87789b2701abe1fa90f83e251c010aa608d922",
+   "bytes": 776
+  },
+  {
+   "path": "mod-making-guide/fading-revelations-analysis.md",
+   "sha256": "ed2477b648f02ece56e63e293773b7e8f537a0d29d935b22e1d6769527d2d9da",
+   "bytes": 883
+  },
+  {
+   "path": "mod-making-guide/hai-analysis.md",
+   "sha256": "f44280f275a59bfb4742b60871e4dcd0e8f51a539aec6a90080be6568003e52d",
+   "bytes": 893
+  },
+  {
+   "path": "mod-making-guide/index.md",
+   "sha256": "070694d88eed7b723b6133cdc1b1fe3370f21aa0bc41bd56c374a8be63e1ac82",
+   "bytes": 12484
+  },
+  {
+   "path": "mod-making-guide/json-mod-guide.md",
+   "sha256": "7c5a84bdd1f63debd8d2fc3f731f092310cef1fd807f0643b835ddc1e172d7ee",
+   "bytes": 10645
+  },
+  {
+   "path": "mod-making-guide/mindustry-tool-mod-analysis.md",
+   "sha256": "440fc78ccc2c4cc45a3800c3e9cf5e33ae2ff16593b565988c7fc8b42398ddb0",
+   "bytes": 1158
+  },
+  {
+   "path": "mod-making-guide/sapphirium-analysis.md",
+   "sha256": "f9cb06ac850f0613cf26e8eccc539cfc3fbbb095c1238bd0d690d22cefcd78d4",
+   "bytes": 1140
+  },
+  {
+   "path": "mod-making-guide/scheme-size-analysis.md",
+   "sha256": "3463a12435a47296b8a9499184fe433b44b5a33268c5901bcb35ec86f01dbeea",
+   "bytes": 758
+  }
+ ]
+}

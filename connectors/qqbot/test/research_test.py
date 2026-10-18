@@ -7,6 +7,7 @@
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import threading
 import traceback
@@ -24,6 +25,10 @@ START_QUOTE = "每个模组都需要在根目录放置 mod.hjson 文件。"
 SCRIPT_QUOTE = "模组可以使用 JavaScript 编写脚本。"
 WATER_QUOTE = "调色时先用清水打湿纸面，再少量多次加入颜料，避免颜色发脏。"
 HYPOTHESIS = "可能需要先在本机安装游戏才能测试模组"
+CORPUS = ROOT / "vendor" / "eve-portable-knowledge"
+CORPUS_SEED = "eve-corpus://eve-portable/mindustry/"
+CORPUS_TITLE = "Mindustry 电力系统源码验证"
+CORPUS_QUOTE = "PowerBlock 构造时直接设置 `hasPower=true`，不依赖 ConsumePower.apply()"
 
 PAGES = {
     "/docs/index.html": """<html><head><title>资料目录</title></head><body><h1>资料目录</h1>
@@ -122,8 +127,8 @@ class ResearchAcceptance(unittest.TestCase):
         self.site_thread.join()
         base().tearDown(self)
 
-    def run_eve(self, script, research=True, **options):
-        extra = ["--research-source", self.seed] if research else []
+    def run_eve(self, script, research=True, more=(), **options):
+        extra = (["--research-source", self.seed] if research else []) + list(more)
         return base().run_eve(self, script, extra=extra, **options)
 
     def classify(self, decoded, latest):
@@ -263,6 +268,58 @@ class ResearchAcceptance(unittest.TestCase):
         self.assertEqual(len(self.site_requests), 3, "restart must not refetch")
         self.assertEqual(sum(1 for request in self.requests if request["kind"] in ("select", "extract")), 2)
         self.assertEqual(self.knowledge(), before["eve.knowledge"]["knowledge.v1"])
+
+    def test_inherited_corpus_is_researched_like_any_source_with_corpus_urls_and_verbatim_quotes(self):
+        # 旧 Eve 的资料随仓库提供：入口是资料目录，候选是目录中的资料标题；全程不访问网络。
+        def select(request):
+            by_text = {candidate["text"]: candidate["index"] for candidate in request["candidates"]}
+            self.assertTrue(all(candidate["url"].startswith(CORPUS_SEED) for candidate in request["candidates"]))
+            return {"selected": [by_text[CORPUS_TITLE]]}
+
+        def extract(request):
+            [document] = [item for item in request["documents"] if item["url"].endswith("/power-system.md")]
+            return {"claims": [{"document_id": document["document_id"], "kind": "fact",
+                                "statement": "电力方块默认带有电力系统", "quote": CORPUS_QUOTE, "version": "v146"}],
+                    "hypotheses": []}
+
+        self.select, self.extract = select, extract
+        corpus = ["--research-corpus", str(CORPUS), "--research-source", CORPUS_SEED]
+        self.inspect_run(lambda: self.wait_until(self.researched, "corpus research did not finish"),
+                         prefix=self.send(self.message("casual", MINDUSTRY)), research=False, more=corpus)
+        self.assertEqual(self.site_requests, [], "本地资料不经网络读取")
+        state = self.knowledge()
+        [run] = state["runs"]
+        self.assertEqual((run["status"], run["seeds"]), ("Completed", [CORPUS_SEED]))
+        page = CORPUS_SEED + "power-system.md"
+        self.assertEqual({document["url"] for document in state["documents"]}, {CORPUS_SEED, page})
+        [entry] = [entry for entry in state["entries"] if entry["status"] == "SourceQuoted"]
+        document = next(item for item in state["documents"] if item["id"] == entry["source"]["document_id"])
+        self.assertEqual(document["url"], page)
+        self.assertIn(CORPUS_QUOTE, document["text"])
+        self.assertEqual(document["sha256"], next(item["sha256"] for item in json.loads(
+            (CORPUS / "MANIFEST.json").read_text(encoding="utf8"))["files"] if item["path"] == "mindustry/power-system.md"))
+        [interest] = self.interests()
+        self.run_eve([*self.send(self.message("own", f"/knowledge {interest['id']}", contains=[
+                          "来源原文·事实", "电力方块默认带有电力系统", page, CORPUS_QUOTE])),
+                      *self.checkpoint("quiet")], checkpoints={"quiet": self.quiet}, research=False, more=corpus)
+        self.assertEqual(self.site_requests, [])
+
+    def test_inherited_corpus_must_be_intact_and_match_its_seeds(self):
+        env = {key: os.environ[key] for key in ("PATH", "SystemRoot", "TEMP", "TMP") if key in os.environ}
+        env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret")
+        tampered = self.work / "tampered-corpus"
+        shutil.copytree(CORPUS, tampered)
+        with open(tampered / "mindustry" / "power-system.md", "a", encoding="utf8") as file:
+            file.write("\n改过\n")
+        for extra, expected in ((["--research-source", CORPUS_SEED], "--research-corpus"),
+                                (["--research-corpus", str(tampered), "--research-source", CORPUS_SEED], "资料与清单不符"),
+                                (["--research-corpus", str(CORPUS), "--research-source", "eve-corpus://other/x/"],
+                                 "不属于本地资料")):
+            result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
+                                     "--agent", str(ROOT / "AGENT.md"), "--interest-learning", *extra],
+                                    env=env, capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(expected, result.stderr)
 
     def test_withdrawal_stops_research_and_held_out_domain_reuses_the_same_contract(self):
         self.inspect_run(lambda: self.wait_until(self.researched, "first research did not finish"),
