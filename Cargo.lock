@@ -885,7 +885,10 @@ dependencies = [
 name = "eve-practice-mindustry"
 version = "0.1.0"
 dependencies = [
+ "eve-kernel",
  "eve-practice-api",
+ "eve-practice-plugin",
+ "eve-toolforge-plugin",
  "ring",
  "serde_json",
  "tempfile",
