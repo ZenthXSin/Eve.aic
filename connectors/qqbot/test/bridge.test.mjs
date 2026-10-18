@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Readable } from "node:stream";
-import { createBridge, consume, optionsFromEnv, MAX_MESSAGE_ID_BYTES, MAX_PUSH_BYTES, MAX_SEGMENTS } from "../bridge-core.mjs";
+import { Readable, PassThrough } from "node:stream";
+import { createBridge, consume, optionsFromEnv, MAX_FRAME, MAX_MESSAGE_ID_BYTES, MAX_PUSH_BYTES, MAX_SEGMENTS } from "../bridge-core.mjs";
 function fixture({ fail = false, limit = 128, appId = "1904159860", hold = null } = {}) {
   const frames = [], sent = [], handlers = new Map();
   const bot = {
@@ -10,7 +10,7 @@ function fixture({ fail = false, limit = 128, appId = "1904159860", hold = null 
     stop: () => handlers.set("stopped", true),
     async sendText(target, text) {
       sent.push({ target, text });
-      if (hold) await hold;
+      if (hold) await (typeof hold === "function" ? hold(target, text) : hold);
       if (typeof fail === "function" ? fail(sent.length) : fail) throw new Error("sensitive secret and message");
       return { id: "out-1" };
     },
@@ -24,6 +24,112 @@ function fixture({ fail = false, limit = 128, appId = "1904159860", hold = null 
   });
   return { bridge, frames, sent, message, handlers };
 }
+function deferred() {
+  let resolve;
+  const promise = new Promise(r => { resolve = r; });
+  return { promise, resolve };
+}
+async function within(promise) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("bridge_operation_blocked")), 1000);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+const line = frame => JSON.stringify({ version: 1, ...frame }) + "\n";
+
+test("JSONL 中慢发送不阻塞其他会话与 stop，停止后不报告迟到成功", async t => {
+  const held = deferred(), started = deferred(), other = deferred();
+  const f = fixture({ hold(target) {
+    if (target.msgId === "in-1") { started.resolve(); return held.promise; }
+    other.resolve();
+  } });
+  f.message(); f.message("c2c", "in-2");
+  const input = new PassThrough();
+  const consuming = consume(input, f.bridge);
+  t.after(async () => { held.resolve(); input.end(); await consuming; });
+  input.write(line({ type: "reply", id: "in-1", text: "慢回复" }));
+  await within(started.promise);
+  input.write(line({ type: "reply", id: "in-2", text: "其他会话" }));
+  await within(other.promise);
+  input.write(line({ type: "stop" }));
+  await within(consuming);
+  assert.equal(f.handlers.get("stopped"), true);
+  assert.deepEqual(f.sent.map(s => s.text), ["慢回复", "其他会话"]);
+  held.resolve();
+  await new Promise(setImmediate);
+  assert.equal(f.frames.some(x => x.type === "delivery" && x.id === "in-1"), false);
+});
+
+test("共享发送容量已满时主动推送明确失败且不请求 SDK，完成后容量恢复", async t => {
+  const held = deferred();
+  const f = fixture({ limit: 1, hold: held.promise });
+  f.message();
+  const sending = f.bridge.command({ version: 1, type: "reply", id: "in-1", text: "占用发送" });
+  t.after(async () => { held.resolve(); await sending; });
+  await within(f.bridge.command({ version: 1, type: "push", id: "invite-busy", target_id: "user-2", text: "新消息" }));
+  assert.equal(f.sent.length, 1);
+  assert.ok(f.frames.some(x => x.code === "outbound_limit"));
+  assert.ok(f.frames.some(x => x.type === "delivery" && x.id === "invite-busy" && x.push && x.ok === false));
+  held.resolve(); await sending;
+  await f.bridge.command({ version: 1, type: "push", id: "invite-next", target_id: "user-2", text: "恢复后" });
+  assert.equal(f.sent.length, 2);
+  assert.equal(f.frames.at(-1).ok, true);
+});
+
+test("未知或缺失协议版本不发送、结束路由或停止进程", async () => {
+  for (const version of [undefined, 0, 2, "1"]) {
+    const f = fixture(); f.message();
+    for (const type of ["reply", "push", "finish", "stop"]) {
+      await f.bridge.command({ version, type, id: "in-1", target_id: "user-2", text: "不能发送" });
+    }
+    assert.equal(f.sent.length, 0);
+    assert.equal(f.handlers.get("stopped"), undefined);
+    await f.bridge.command({ version: 1, type: "reply", id: "in-1", text: "合法版本" });
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.frames.at(-1).ok, true);
+  }
+});
+
+test("主动消息的并发重复命令不再次请求 SDK，也不覆盖原回执", async t => {
+  const held = deferred();
+  const f = fixture({ hold: held.promise });
+  const frame = { version: 1, type: "push", id: "same-invitation", target_id: "user-1", text: "只发一次" };
+  const first = f.bridge.command(frame);
+  t.after(async () => { held.resolve(); await first; });
+  await f.bridge.command(frame);
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.frames.some(x => x.type === "delivery"), false);
+  held.resolve(); await first;
+  assert.equal(f.frames.filter(x => x.type === "delivery").length, 1);
+  assert.equal(f.frames.at(-1).ok, true);
+});
+
+test("正文虽未超限但转义后超过 JSONL 上限的消息不发给 Rust，后续仍可接收", () => {
+  const f = fixture();
+  const text = "x" + "\0".repeat(12000);
+  assert.ok(Buffer.byteLength(text) < 32768);
+  assert.ok(Buffer.byteLength(JSON.stringify(text)) > MAX_FRAME);
+  f.handlers.get("message")({}, { kind: "c2c", messageId: "oversized-wire", senderId: "user-1", content: text,
+    replyTarget: { scope: "c2c", targetId: "user-1", msgId: "oversized-wire" } });
+  assert.equal(f.frames.some(x => x.type === "message"), false);
+  assert.ok(f.frames.some(x => x.code === "frame_limit"));
+  f.message("c2c", "oversized-wire");
+  assert.equal(f.frames.filter(x => x.type === "message").length, 1);
+});
+
+test("普通 EOF 等待已准入的发送结局后收尾", async () => {
+  const held = deferred(), started = deferred();
+  const f = fixture({ hold() { started.resolve(); return held.promise; } });
+  f.message();
+  const consuming = consume(Readable.from([line({ type: "reply", id: "in-1", text: "EOF 前的回复" })]), f.bridge);
+  await within(started.promise);
+  assert.equal(f.handlers.get("stopped"), undefined);
+  held.resolve(); await consuming;
+  assert.equal(f.frames.find(x => x.type === "delivery").ok, true);
+  assert.equal(f.handlers.get("stopped"), true);
+});
 test("固定默认 AppID，仅密钥必填，sandbox 与最小 intent", () => {
   for (const env of [{ QQBOT_APP_SECRET: "test-only" }, { QQBOT_APP_SECRET: "test-only", QQBOT_SANDBOX: "false" }]) {
     assert.equal(optionsFromEnv(env).baseUrl, "https://api.sgroup.qq.com");
@@ -55,7 +161,7 @@ test("有界 pending、重复与 finish，不产生额外发送", async () => {
 });
 test("发送失败无重试，不泄漏正文或异常", async () => {
   const f = fixture({ fail: true }); f.message();
-  await f.bridge.command({ type: "reply", id: "in-1", text: "答复" });
+  await f.bridge.command({ type: "reply", version: 1, id: "in-1", text: "答复" });
   assert.equal(f.frames.find(x => x.type === "delivery").ok, false);
   assert.equal(f.sent.length, 1);
   assert.ok(!JSON.stringify(f.frames).includes("sensitive"));
@@ -295,7 +401,7 @@ test("纯图片和图文保留本条图片引用，不抓取、不混入引用�
   f.handlers.get("message")({}, message);
   assert.equal(f.frames[0].text, "");
   assert.deepEqual(f.frames[0].attachments, [{ content_type: "image/png", url: "https://media.example.invalid/image.png" }]);
-  await f.bridge.command({type: "reply", id: "image-1", text: "图片已收到，尚未解析。"});
+  await f.bridge.command({type: "reply", version: 1, id: "image-1", text: "图片已收到，尚未解析。"});
   assert.equal(f.sent.length, 1);
   assert.equal(f.sent[0].target.targetId, "user-1");
   f.handlers.get("message")({}, {...message, messageId: "text-image", content: "看看这张图", replyTarget: {...message.replyTarget, msgId: "text-image"}});
