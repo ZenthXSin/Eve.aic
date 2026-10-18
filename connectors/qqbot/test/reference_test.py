@@ -1,7 +1,7 @@
 """实际 eve-qqbot 的回复时参考资料验收；只连接本地模型替身和 fake bridge。
 
 --reference 装配的资料在回复中可查：模型先 search_reference，再 read_reference 读带行号的原文，
-最后按工具结果作答；--max-tool-rounds 放宽单轮工具批次。资料目录无效时在连接 QQ 之前拒绝启动。
+最后按工具结果作答；--max-tool-rounds 放宽单轮工具批次，用尽时不再提供工具、让模型收尾作答而不是失败。资料目录无效时在连接 QQ 之前拒绝启动。
 确定性替身只证明宿主契约与工具往返，不代表真实模型会主动查证。
 """
 import json
@@ -96,6 +96,29 @@ class ReferenceAcceptance(unittest.TestCase):
                                              "line": 2, "text": "public float reload = 250f;"})
         self.assertEqual(excerpt["text"], "2:     public float reload = 250f;\n")
         self.assertEqual((excerpt["revision"], excerpt["total_lines"]), (REVISION, 4))
+
+    def test_exhausted_tool_rounds_close_with_an_answer_instead_of_failing(self):
+        requests = []
+
+        def respond(body, kind, fallback):
+            if kind != "chat":
+                return fallback
+            requests.append(body)
+            if len(requests) <= 2:
+                return tool_call("search_reference", {"query": "reload", "root": "game"}, len(requests))
+            return text("只查到 reload = 250f，范围还没来得及核实")
+
+        self.provider_response = respond
+        self.run_eve([*self.send(self.message(
+            "limit", QUESTION, expected="只查到 reload = 250f，范围还没来得及核实"))],
+            interest=False, extra=[*self.references, "--max-tool-rounds", "1"])
+        self.assertEqual(len(requests), 3)
+        self.assertTrue(requests[1].get("tools"), "未超限的请求照常提供工具")
+        closing = requests[2]
+        self.assertFalse(closing.get("tools"), "收尾请求不再提供工具")
+        self.assertEqual(closing["messages"][-1]["role"], "system")
+        self.assertIn("已用完 1 批工具调用", closing["messages"][-1]["content"])
+        self.assertEqual(len(tool_results(closing)), 1, "已查到的结果仍在收尾请求中")
 
     def test_inherited_corpus_is_searchable_from_replies(self):
         found = []

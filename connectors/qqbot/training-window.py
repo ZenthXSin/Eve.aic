@@ -22,7 +22,7 @@ FULL_PROFILE = ["--training", "--cognition", "--memory", "--self-learning", "--m
                 "--clarify", "--agenda-context", "--reminders", "--goal-completion", "--learning-stop",
                 "--autonomy-budget", "200", "--segmented", "--message-judge", "primary",
                 # 查参考资料需要“搜索→读取→作答”多轮工具调用。
-                "--max-tool-rounds", "8"]
+                "--max-tool-rounds", "50"]
 MAX_REFERENCES = 8
 SUMMARY_TITLES = {"training": "QQ 主动提问训练结果", "full": "QQ 全功能体验结果"}
 SCOPES = {"training": "主动提问、用户表达统计与交流证据采集；未更新模型权重或已确认长期偏好",

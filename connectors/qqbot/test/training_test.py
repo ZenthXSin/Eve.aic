@@ -68,7 +68,7 @@ class Reports(unittest.TestCase):
             "--practice-mindustry-json-rules", "rules", "--research-corpus", "corpus",
             "--research-source", corpus_seed, "--state-dir", "state"])
         self.assertNotIn("--practice-browser", mindustry)
-        self.assertEqual(training.FULL_PROFILE[-2:], ["--max-tool-rounds", "8"])
+        self.assertEqual(training.FULL_PROFILE[-2:], ["--max-tool-rounds", "50"])
         referenced = training.host_command("eve", state, "full", "chrome", (), None, None, None,
                                            ["mindustry=/src/m", "arc=/src/a"])
         self.assertEqual(referenced[-6:], ["--reference", "mindustry=/src/m", "--reference", "arc=/src/a",

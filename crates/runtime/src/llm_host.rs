@@ -42,6 +42,9 @@ pub struct LlmHostConfig {
     pub max_parallel_tool_calls: usize,
     /// 0 表示不限制工具批次数；正数为本轮显式上限。取消、预算及超时仍独立生效。
     pub max_tool_rounds: usize,
+    /// 批次用尽后的处理：false 时本轮以 RoundLimit 失败；true 时再请求一次且不提供工具，
+    /// 让模型只依据已有工具结果作答（仍要求工具调用时才以 RoundLimit 失败）。
+    pub final_answer_on_round_limit: bool,
     pub response_mode: ResponseMode,
     pub event_timeout: Duration,
     pub max_stream_text_bytes: usize,
@@ -59,6 +62,7 @@ impl Default for LlmHostConfig {
             tool_cancellation_grace: Duration::from_millis(100),
             max_parallel_tool_calls: 10,
             max_tool_rounds: 1,
+            final_answer_on_round_limit: false,
             response_mode: ResponseMode::Complete,
             event_timeout: Duration::from_secs(5),
             max_stream_text_bytes: 8 * 1024 * 1024,
@@ -78,6 +82,10 @@ impl std::fmt::Debug for LlmHostConfig {
             .field("tool_cancellation_grace", &self.tool_cancellation_grace)
             .field("max_parallel_tool_calls", &self.max_parallel_tool_calls)
             .field("max_tool_rounds", &self.max_tool_rounds)
+            .field(
+                "final_answer_on_round_limit",
+                &self.final_answer_on_round_limit,
+            )
             .field("response_mode", &self.response_mode)
             .field("event_timeout", &self.event_timeout)
             .field("max_stream_text_bytes", &self.max_stream_text_bytes)
@@ -605,12 +613,18 @@ impl LlmHost {
             .collect::<Vec<_>>();
         let mut messages = build_messages(&self.config, &prepared.context, &input, &definitions);
         let mut seen_calls = HashSet::new();
+        // 批次用尽后模型仍要调用工具时进入收尾：本批不执行，只再请求一次且不提供工具。
+        let mut closing = false;
         loop {
             let response = match self
                 .complete(
                     ModelRequest {
                         messages: messages.clone(),
-                        tools: definitions.clone(),
+                        tools: if closing {
+                            Vec::new()
+                        } else {
+                            definitions.clone()
+                        },
                     },
                     &mut diagnostics,
                     events,
@@ -638,7 +652,15 @@ impl LlmHost {
             if self.config.max_tool_rounds != 0
                 && diagnostics.tool_batches >= self.config.max_tool_rounds
             {
-                return Err(fail(LlmError::RoundLimit, diagnostics));
+                if closing || !self.config.final_answer_on_round_limit {
+                    return Err(fail(LlmError::RoundLimit, diagnostics));
+                }
+                closing = true;
+                messages.push(ChatMessage::text(
+                    ChatRole::System,
+                    round_limit_notice(self.config.max_tool_rounds),
+                ));
+                continue;
             }
             if calls.iter().any(|call| !seen_calls.insert(call.id.clone())) {
                 return Err(fail(
@@ -1172,6 +1194,13 @@ struct ToolRunConfig {
     peak: Arc<AtomicUsize>,
     timeout: Duration,
     grace: Duration,
+}
+
+/// 工具批次用尽后的收尾说明：不再调用工具，只依据已有结果作答，未查证的如实说明。
+fn round_limit_notice(rounds: usize) -> String {
+    format!(
+        "本轮已用完 {rounds} 批工具调用，不能再调用工具。请只依据上面已有的工具结果直接回复用户：已查证的内容给出出处；没查到或没来得及查的部分明确说明尚未核实，不要编造，也不要声称还会继续查。"
+    )
 }
 
 fn build_messages(
