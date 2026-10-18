@@ -1,13 +1,20 @@
 //! Mindustry 内容模组的实践运行器：在全新目录中用操作者提供的无头服务端实际加载草稿，
 //! 查询加载状态与内容属性，采集版本、警告和日志。只接受纯数据文件；
 //! 探测查询由运行器按受限标识构造，不执行草稿或模型提供的代码。
+//!
+//! 此外向上提供继承自 eve-portable 的 JSON 内容预检（`rules`、`precheck`）：
+//! 用按版本摘要核对的规则在运行前先查一遍，早一点给出能看懂的问题。
 mod layout;
+pub mod precheck;
+pub mod rules;
 
 use eve_practice_api::{
     BoxFuture, MAX_ISSUE_BYTES, MAX_ISSUES, MAX_LOG_EXCERPT_BYTES, PracticeDraft, PracticeRunner,
     ProbeResult, RunEvidence, RunExit, RunnerProfile,
 };
+pub use precheck::{JsonPrecheck, PythonCommand};
 use ring::digest::{Context, SHA256};
+pub use rules::MindustryJsonRules;
 use std::{
     ffi::OsString,
     io::Read,
