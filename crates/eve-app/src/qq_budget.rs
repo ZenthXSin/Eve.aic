@@ -93,6 +93,7 @@ fn label(category: &str) -> &str {
         FORGE => "工具锻造",
         OUTREACH => "主动交流",
         CLARIFY => "请求澄清",
+        "summary" => "情景语义摘要",
         other => other,
     }
 }
@@ -125,7 +126,7 @@ fn describe(snapshot: &BudgetSnapshot) -> String {
     }
     if snapshot.remaining() == 0 {
         reply.push_str(
-            " 余额用尽：后台不再开始新的观察、研究、实践或邀请，已保存的记录不变，重置后继续。",
+            " 余额用尽：后台不再开始新的观察、研究、实践、邀请或情景摘要，已保存的记录不变，重置后继续。",
         );
     }
     if let Some(last) = snapshot.history.first() {

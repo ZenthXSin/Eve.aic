@@ -2,7 +2,7 @@ use crate::{
     AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_agenda, qq_budget,
     qq_clarify, qq_cognition, qq_completion, qq_interest, qq_learning, qq_learning_commands,
     qq_memory, qq_memory_observer, qq_outreach, qq_plan, qq_practice, qq_pursuit, qq_reminder,
-    qq_research, qq_semantic, qq_skill, qq_tools, segment_commands,
+    qq_research, qq_semantic, qq_skill, qq_summary, qq_tools, segment_commands,
 };
 use eve_budget_api::{AutonomyBudget, BUDGET_PLUGIN_ID, BudgetPolicy};
 use eve_budget_plugin::BudgetPlugin;
@@ -28,8 +28,13 @@ use eve_learning_api::{
 };
 use eve_learning_plugin::{EvidenceConfirmationPolicy, LearningPlugin, ModelPreferenceExtractor};
 use eve_llm_api::ContextAssembler;
-use eve_memory_api::{MEMORY_PLUGIN_ID, MemoryAdmin};
-use eve_memory_plugin::{LexicalMemoryRecall, MemoryContext, MemoryPlugin, MemoryRecallContext};
+use eve_memory_api::{
+    ConversationSummarizer, MEMORY_PLUGIN_ID, MemoryAdmin, SUMMARY_PLUGIN_ID, SummaryAdmin,
+};
+use eve_memory_plugin::{
+    ConversationSummaryPlugin, LexicalMemoryRecall, MemoryContext, MemoryPlugin,
+    MemoryRecallContext, ModelConversationSummarizer,
+};
 use eve_message_plugin::MessageRouterPlugin;
 use eve_outreach_api::{
     InvitationComposer, OUTREACH_PLUGIN_ID, OutreachAdmin, OutreachPolicy, ResponseJudge,
@@ -109,7 +114,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --reminders 开启私聊提醒：用户自然地说“半小时后提醒我喝水”或“明早 9 点提醒我交作业”，模型调用提醒工具记下并如实回复，想取消时直接说；到时先主动私聊一次，发不出去时随用户下一条私聊的回复附带，到期 7 天仍未送达不再投递。没有命令；只在私聊中成立。--reminder-utc-offset 设置本地时区（默认 +08:00）。
 --goal-completion 需同时 --plans；待办的计划各步都被证据满足后，随用户下一次私聊的回复问一句这件事算不算完成，每份计划至多问一次；用户明确说完成了，模型调用确认工具，宿主核对计划仍对应当前版本后把待办标为已完成，并记下依据的计划与确认来源。没有命令；只在私聊中成立。
 --learning-stop 需同时 --interest-learning；兴趣学习目标的研究与实践次数都用完、也没有在问你或等你回复时，后台把它标为已取消并记下原因（目标的停止条件“学习预算耗尽”），兴趣本身保留；不开启时目标一直等待。无论是否开启，/interests 与议程上下文都会说明每个学习目标接下来会做什么、在等什么。
---autonomy-budget 需同时 --interest-learning；兴趣观察、受控研究、实践草稿、技能、工具锻造、主动交流与请求澄清的后台模型请求在每个窗口（--autonomy-budget-window-hours 默认 24 小时，按 UTC 整点对齐）合计至多该次数；每次请求前先保存计数，重启不清零、失败不退还，余额不够一项工作时后台不开始新工作，重置后继续；回复用户消息、/plan propose、反思、提炼与语义索引不计入。/budget 查看用量与重置时间。
+--autonomy-budget 需同时 --interest-learning；兴趣观察、受控研究、实践草稿、技能、工具锻造、主动交流、请求澄清与情景语义摘要的后台模型请求在每个窗口（--autonomy-budget-window-hours 默认 24 小时，按 UTC 整点对齐）合计至多该次数；每次请求前先保存计数，重启不清零、失败不退还，余额不够一项工作时后台不开始新工作，重置后继续；回复用户消息、/plan propose、反思、偏好提炼与语义索引不计入。/budget 查看用量与重置时间。
 /tools 列出锻造的工具；/tool 工具ID 查看版本、回放验证与调用；/tool disable|rollback 工具ID、/tool enable 工具ID 版本 停用、回退或启用某个已验证版本。
 EVE_DEVELOPER_CONFIG 指定独立开发工具 JSON：源码工作区、操作者、命令/GitHub/升级开关与 token 环境引用；未配置时不注册。命令以宿主权限执行，仅供明确操作者；不是 QQ 测试环境开关。/help tools 查看实际已装配能力。
 明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
@@ -527,6 +532,8 @@ fn research_policy(options: &QqBotOptions) -> Result<Option<SourcePolicy>, AppEr
 /// 兴趣学习的可替换实现；未提供的部分使用默认的模型观察器、HTTP 抓取器与模型选择/提炼器。
 #[derive(Clone, Default)]
 pub struct InterestComponents {
+    /// 替换用户情景摘要器；装配 --memory 后仍由 runtime.memory_summary 控制准入。
+    pub summarizer: Option<Arc<dyn ConversationSummarizer>>,
     pub observer: Option<Arc<dyn InterestObserver>>,
     pub fetcher: Option<Arc<dyn SourceFetcher>>,
     pub selector: Option<Arc<dyn SourceSelector>>,
@@ -678,6 +685,7 @@ async fn run_qqbot_composed(
     let mut pursuit_background: Option<qq_pursuit::Background> = None;
     let mut plan_background: Option<qq_plan::Background> = None;
     let mut semantic_background: Option<qq_semantic::Background> = None;
+    let mut summary_background: Option<qq_summary::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
     let mut panel: Option<eve_web_panel::LocalPanel> = None;
     let page_permit = eve_web_panel_api::PageWritePermit::default();
@@ -809,6 +817,15 @@ async fn run_qqbot_composed(
             let controller = plugin.controller();
             kernel.register(Box::new(plugin))?;
             kernel.start(&PluginId::new(MEMORY_PLUGIN_ID)?).await?;
+            Some(Arc::new(controller))
+        } else {
+            None
+        };
+        let summaries: Option<Arc<dyn SummaryAdmin>> = if memory.is_some() {
+            let plugin = ConversationSummaryPlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(SUMMARY_PLUGIN_ID)?).await?;
             Some(Arc::new(controller))
         } else {
             None
@@ -962,6 +979,17 @@ async fn run_qqbot_composed(
                 policy: Arc::new(eve_pursuit_plugin::RulePursuitPolicy),
             })
         });
+        let context: Arc<dyn ContextAssembler> =
+            if let (Some(memory), Some(summaries)) = (&memory, &summaries) {
+                Arc::new(qq_summary::SummaryContext {
+                    wrapped: context,
+                    memory: memory.clone(),
+                    summaries: summaries.clone(),
+                    registry: registry.clone(),
+                })
+            } else {
+                context
+            };
         let context: Arc<dyn ContextAssembler> = if let Some(memory) = &memory {
             let context = Arc::new(crate::qq_conversation::ConversationContext {
                 wrapped: context,
@@ -1288,6 +1316,7 @@ async fn run_qqbot_composed(
         };
         let budgeted = |category: &str| budget_gate.wrap(observed(category)?, category);
         let InterestComponents {
+            summarizer,
             observer: interest_observer,
             fetcher,
             selector,
@@ -1302,6 +1331,19 @@ async fn run_qqbot_composed(
             timing_judge,
             response_judge,
         } = interest_components;
+        if let (Some(memory), Some(summaries)) = (&memory, &summaries) {
+            let summarizer = match summarizer {
+                Some(summarizer) => summarizer,
+                None => Arc::new(ModelConversationSummarizer::new(budgeted("summary")?)),
+            };
+            summary_background = Some(qq_summary::Background::start(
+                memory.clone(),
+                summaries.clone(),
+                summarizer,
+                registry.clone(),
+                budget_gate.clone(),
+            )?);
+        }
         // 计划只能使用操作者已开启的受控研究与实践验证；步骤由对应后台执行。
         let plan_journal: Option<Arc<dyn PlanJournal>> = plans
             .clone()
@@ -1866,6 +1908,9 @@ async fn run_qqbot_composed(
         if let Some(semantic) = &semantic_background {
             semantic.activate();
         }
+        if let Some(summary) = &summary_background {
+            summary.activate();
+        }
         wait_channel(
             handle.status.clone(),
             background.as_ref().map(qq_cognition::Background::finished),
@@ -1915,6 +1960,12 @@ async fn run_qqbot_composed(
                     (
                         semantic.finished(),
                         "语义索引后台已结束；QQ 通道停止准入并保留状态",
+                    )
+                }))
+                .chain(summary_background.as_ref().map(|summary| {
+                    (
+                        summary.finished(),
+                        "语义摘要后台已结束；QQ 通道停止准入并保留状态",
                     )
                 }))
                 .collect(),
@@ -1979,6 +2030,14 @@ async fn run_qqbot_composed(
     }
     if let Some(semantic) = &semantic_background {
         semantic.request_stop();
+    }
+    if let Some(summary) = &summary_background {
+        summary.request_stop();
+    }
+    if let Some(summary) = summary_background
+        && let Err(error) = summary.stop().await
+    {
+        secondary.push(error);
     }
     // 语义索引后台读取记忆并写索引账本；请求失败不写入，先结束进行中的请求。
     if let Some(semantic) = semantic_background

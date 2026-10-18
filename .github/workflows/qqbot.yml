@@ -70,6 +70,7 @@ jobs:
           python3 connectors/qqbot/test/goal_feedback_test.py
           python3 connectors/qqbot/test/memory_test.py
           python3 connectors/qqbot/test/conversation_digest_test.py
+          python3 connectors/qqbot/test/summary_test.py
           python3 connectors/qqbot/test/recall_test.py
           python3 connectors/qqbot/test/learning_test.py
           python3 connectors/qqbot/test/learning_decision_test.py

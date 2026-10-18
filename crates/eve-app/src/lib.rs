@@ -37,6 +37,7 @@ mod qq_reminder;
 mod qq_research;
 mod qq_semantic;
 mod qq_skill;
+mod qq_summary;
 mod qq_tools;
 mod qqbot;
 mod segment_advice;
@@ -340,6 +341,7 @@ pub(crate) async fn install_core_with_pages(
         config::openai_schema(),
         config::model_uses_schema(),
         config::memory_digest_schema(),
+        config::memory_summary_schema(),
         config::dialogue_schema(),
         config::history_schema(),
         qq_message_judge::provider_schema(),

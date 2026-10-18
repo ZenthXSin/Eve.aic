@@ -6,6 +6,11 @@ mod recall;
 mod recall_context;
 mod store;
 mod strict_json;
+mod summary;
+pub use summary::{
+    ConversationSummaryPlugin, ModelConversationSummarizer, SUMMARY_STATE_KEY, SummaryController,
+    effective_points, validate_summary_points,
+};
 
 pub use context::MemoryContext;
 use eve_memory_api::*;

@@ -106,7 +106,7 @@ pub(crate) fn openai_schema() -> ConfigSchema {
 /// 按用途的单次输出上限；0 表示沿用主模型的上限。随每次模型解析读取，保存后下一次请求生效。
 pub(crate) const MODEL_USES_NAMESPACE: &str = "runtime.model_uses";
 /// 用途名与健康记录、自主预算类别一致。
-pub(crate) const MODEL_USES: [&str; 11] = [
+pub(crate) const MODEL_USES: [&str; 12] = [
     "dialogue",
     "plan",
     "interest",
@@ -118,6 +118,7 @@ pub(crate) const MODEL_USES: [&str; 11] = [
     "clarify",
     "preference",
     "reflection",
+    "summary",
 ];
 /// 单次输出上限与 provider.openai.max_output_tokens 的上限一致。
 const MAX_OUTPUT_TOKENS_LIMIT: i64 = 16384;
@@ -209,6 +210,41 @@ pub(crate) fn memory_digest_schema() -> ConfigSchema {
             (
                 "max_bytes".into(),
                 field(6144, 512, 16384, "EVE_MEMORY_DIGEST_MAX_BYTES"),
+            ),
+        ]),
+    }
+}
+
+pub(crate) fn memory_summary_schema() -> ConfigSchema {
+    let integer = |default, min, max, environment: &str| {
+        let mut field = ConfigField::new(
+            ConfigKind::Integer {
+                minimum: Some(min),
+                maximum: Some(max),
+            },
+            Some(json!(default)),
+        );
+        field.environment = Some(environment.into());
+        field
+    };
+    let mut enabled = ConfigField::new(ConfigKind::Boolean, Some(json!(false)));
+    enabled.environment = Some("EVE_MEMORY_SUMMARY_ENABLED".into());
+    ConfigSchema {
+        namespace: crate::qq_summary::NAMESPACE.into(),
+        version: 1,
+        fields: BTreeMap::from([
+            ("enabled".into(), enabled),
+            (
+                "min_new_evidence".into(),
+                integer(4, 1, 8, "EVE_MEMORY_SUMMARY_MIN_NEW_EVIDENCE"),
+            ),
+            (
+                "cooldown_ms".into(),
+                integer(300000, 1000, 86400000, "EVE_MEMORY_SUMMARY_COOLDOWN_MS"),
+            ),
+            (
+                "context_max_bytes".into(),
+                integer(4096, 512, 8192, "EVE_MEMORY_SUMMARY_CONTEXT_MAX_BYTES"),
             ),
         ]),
     }
