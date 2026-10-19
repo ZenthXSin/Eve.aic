@@ -1,0 +1,604 @@
+//! 后台任务账本：创建、开始、结束与通知尝试都先持久化。重启时执行中的任务记为已中断（不重跑），
+//! 发送中的通知记为结果未知（不重发）。
+use crate::strict_json;
+use eve_plugin_api::{PluginContext, PluginError, PluginResult};
+use eve_task_api::*;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeSet,
+    sync::{Mutex, MutexGuard},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+const FORMAT_VERSION: u32 = 1;
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Ledger {
+    format_version: u32,
+    tasks: Vec<Task>,
+}
+struct Inner {
+    ledger: Ledger,
+    context: Option<PluginContext>,
+}
+pub(super) struct StoredTasks {
+    inner: Mutex<Inner>,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+impl StoredTasks {
+    pub(super) fn open(context: PluginContext) -> TaskResult<Self> {
+        let mut ledger = match context
+            .state_get(TASK_STATE_KEY)
+            .map_err(|_| TaskError::Storage)?
+        {
+            None => Ledger {
+                format_version: FORMAT_VERSION,
+                tasks: vec![],
+            },
+            Some(bytes) => {
+                if bytes.len() > MAX_STATE_BYTES {
+                    return Err(TaskError::CorruptState);
+                }
+                let value = strict_json::from_slice(&bytes).map_err(|_| TaskError::CorruptState)?;
+                if value.get("format_version").and_then(|value| value.as_u64())
+                    != Some(u64::from(FORMAT_VERSION))
+                {
+                    return Err(if value.get("format_version").is_some() {
+                        TaskError::UnsupportedVersion
+                    } else {
+                        TaskError::CorruptState
+                    });
+                }
+                let ledger: Ledger =
+                    serde_json::from_value(value).map_err(|_| TaskError::CorruptState)?;
+                validate_ledger(&ledger)?;
+                ledger
+            }
+        };
+        let mut changed = false;
+        let now = now_ms();
+        for task in &mut ledger.tasks {
+            if task.status == TaskStatus::Running {
+                // 执行中进程退出：不知道做到了哪一步，不自动重跑。已请求取消的按取消结束。
+                let at = now.max(last_time(task));
+                task.finished_at_ms = Some(at);
+                if task.cancel_requested {
+                    task.status = TaskStatus::Cancelled;
+                } else {
+                    task.status = TaskStatus::Interrupted;
+                    task.notice = Some(Notice {
+                        status: NoticeStatus::Pending,
+                        attempts: vec![],
+                        closed_at_ms: None,
+                    });
+                }
+                changed = true;
+            }
+            if let Some(notice) = &mut task.notice
+                && notice.status == NoticeStatus::Delivering
+            {
+                // 发送前后进程退出：是否送达不确定，不重发，也不当作已送达。
+                if let Some(attempt) = notice.attempts.last_mut() {
+                    attempt.result = Some(DeliveryResult::Unknown);
+                }
+                notice.status = NoticeStatus::Unknown;
+                changed = true;
+            }
+        }
+        if changed {
+            validate_ledger(&ledger)?;
+            let bytes = encode(&ledger)?;
+            context
+                .state_set(TASK_STATE_KEY, bytes)
+                .map_err(|_| TaskError::Storage)?;
+        }
+        Ok(Self {
+            inner: Mutex::new(Inner {
+                ledger,
+                context: Some(context),
+            }),
+        })
+    }
+
+    fn lock(&self) -> TaskResult<MutexGuard<'_, Inner>> {
+        let inner = self.inner.lock().map_err(|_| TaskError::Unavailable)?;
+        if inner.context.is_none() {
+            return Err(TaskError::Unavailable);
+        }
+        Ok(inner)
+    }
+
+    pub(super) fn snapshot(&self) -> TaskResult<TaskSnapshot> {
+        Ok(TaskSnapshot {
+            tasks: self.lock()?.ledger.tasks.clone(),
+        })
+    }
+
+    pub(super) fn create(
+        &self,
+        owner: &TaskOwner,
+        spec: TaskSpec,
+        source: &str,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        validate_owner(owner)?;
+        validate_id(source)?;
+        validate_spec(&spec)?;
+        if now_ms == 0 {
+            return Err(TaskError::InvalidInput);
+        }
+        let id = task_id(&owner.user_id, source);
+        let mut inner = self.lock()?;
+        // 同一次派发重复执行：返回原记录。
+        if let Some(existing) = inner.ledger.tasks.iter().find(|task| task.id == id) {
+            return Ok(existing.clone());
+        }
+        let mine = || {
+            inner
+                .ledger
+                .tasks
+                .iter()
+                .filter(|task| task.owner.user_id == owner.user_id)
+        };
+        let active = mine().filter(|task| !task.status.finished()).count();
+        let recent = mine()
+            .filter(|task| now_ms.saturating_sub(task.created_at_ms) < DAY_MS)
+            .count();
+        if active >= MAX_ACTIVE_PER_OWNER || recent >= MAX_CREATED_PER_OWNER_PER_DAY {
+            return Err(TaskError::LimitReached);
+        }
+        let mut next = inner.ledger.clone();
+        // 满了时腾出最早了结的一条；进行中与通知未了结的任务从不删除。
+        if next.tasks.len() >= MAX_TASKS {
+            let oldest = next
+                .tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(index, task)| task.settled_at().map(|at| (at, index)))
+                .min()
+                .ok_or(TaskError::LimitReached)?;
+            next.tasks.remove(oldest.1);
+        }
+        let task = Task {
+            id,
+            owner: owner.clone(),
+            spec,
+            source: source.into(),
+            created_at_ms: now_ms,
+            status: TaskStatus::Queued,
+            cancel_requested: false,
+            started_at_ms: None,
+            finished_at_ms: None,
+            usage: None,
+            result: None,
+            failure: None,
+            notice: None,
+        };
+        next.tasks.push(task.clone());
+        persist(&mut inner, next)?;
+        Ok(task)
+    }
+
+    pub(super) fn start(&self, id: &str, now_ms: u64) -> TaskResult<Task> {
+        self.update(id, now_ms, |task| {
+            if task.status != TaskStatus::Queued {
+                return Err(TaskError::InvalidTransition);
+            }
+            task.status = TaskStatus::Running;
+            task.started_at_ms = Some(now_ms.max(last_time(task)));
+            Ok(())
+        })
+    }
+
+    pub(super) fn finish(
+        &self,
+        id: &str,
+        end: TaskEnd,
+        usage: TaskUsage,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        self.update(id, now_ms, |task| {
+            if task.status != TaskStatus::Running {
+                return Err(TaskError::InvalidTransition);
+            }
+            if usage.tool_calls > task.spec.max_steps {
+                return Err(TaskError::InvalidInput);
+            }
+            let notice = Some(Notice {
+                status: NoticeStatus::Pending,
+                attempts: vec![],
+                closed_at_ms: None,
+            });
+            match end {
+                TaskEnd::Completed { result } => {
+                    if result.trim().is_empty() {
+                        return Err(TaskError::InvalidInput);
+                    }
+                    task.status = TaskStatus::Completed;
+                    task.result = Some(bounded(&result, MAX_RESULT_BYTES));
+                    task.notice = notice;
+                }
+                TaskEnd::Failed { reason } => {
+                    if reason.trim().is_empty() {
+                        return Err(TaskError::InvalidInput);
+                    }
+                    task.status = TaskStatus::Failed;
+                    task.failure = Some(bounded(&reason, MAX_FAILURE_BYTES));
+                    task.notice = notice;
+                }
+                TaskEnd::Cancelled => {
+                    if !task.cancel_requested {
+                        return Err(TaskError::InvalidTransition);
+                    }
+                    task.status = TaskStatus::Cancelled;
+                }
+            }
+            task.usage = Some(usage);
+            task.finished_at_ms = Some(now_ms.max(last_time(task)));
+            Ok(())
+        })
+    }
+
+    pub(super) fn cancel(&self, user_id: &str, id: &str, now_ms: u64) -> TaskResult<Task> {
+        self.update(id, now_ms, |task| {
+            // 其他用户的任务如同不存在。
+            if task.owner.user_id != user_id {
+                return Err(TaskError::NotFound);
+            }
+            match task.status {
+                TaskStatus::Queued => {
+                    task.status = TaskStatus::Cancelled;
+                    task.finished_at_ms = Some(now_ms.max(last_time(task)));
+                    Ok(())
+                }
+                TaskStatus::Running if !task.cancel_requested => {
+                    task.cancel_requested = true;
+                    Ok(())
+                }
+                _ => Err(TaskError::InvalidTransition),
+            }
+        })
+    }
+
+    pub(super) fn claim(
+        &self,
+        id: &str,
+        channel: DeliveryChannel,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        validate_channel(&channel)?;
+        self.update(id, now_ms, |task| {
+            let at = now_ms.max(last_time(task));
+            let notice = task
+                .notice
+                .as_mut()
+                .filter(|notice| notice.status == NoticeStatus::Pending)
+                .ok_or(TaskError::InvalidTransition)?;
+            if notice.attempts.len() >= MAX_ATTEMPTS
+                || (channel == DeliveryChannel::Proactive && notice.proactive_attempts() > 0)
+                || matches!(&channel, DeliveryChannel::Passive { message_id } if notice.carried_by(message_id))
+            {
+                return Err(TaskError::InvalidTransition);
+            }
+            notice.attempts.push(DeliveryAttempt {
+                channel,
+                started_at_ms: at,
+                finished_at_ms: None,
+                result: None,
+            });
+            notice.status = NoticeStatus::Delivering;
+            Ok(())
+        })
+    }
+
+    pub(super) fn record_delivery(
+        &self,
+        id: &str,
+        result: DeliveryResult,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        validate_result(&result)?;
+        if result == DeliveryResult::Unknown {
+            // 结果未知只由重启核对写入。
+            return Err(TaskError::InvalidInput);
+        }
+        self.update(id, now_ms, |task| {
+            let at = now_ms.max(last_time(task));
+            let notice = task
+                .notice
+                .as_mut()
+                .filter(|notice| notice.status == NoticeStatus::Delivering)
+                .ok_or(TaskError::InvalidTransition)?;
+            let attempts = notice.attempts.len();
+            let attempt = notice
+                .attempts
+                .last_mut()
+                .filter(|attempt| attempt.result.is_none())
+                .ok_or(TaskError::InvalidTransition)?;
+            attempt.finished_at_ms = Some(at);
+            attempt.result = Some(result.clone());
+            match result {
+                DeliveryResult::Sent { .. } => {
+                    notice.status = NoticeStatus::Delivered;
+                    notice.closed_at_ms = Some(at);
+                }
+                _ if attempts >= MAX_ATTEMPTS => {
+                    notice.status = NoticeStatus::Expired;
+                    notice.closed_at_ms = Some(at);
+                }
+                _ => notice.status = NoticeStatus::Pending,
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn expire(&self, id: &str, now_ms: u64) -> TaskResult<Task> {
+        self.update(id, now_ms, |task| {
+            let finished = task.finished_at_ms.ok_or(TaskError::InvalidTransition)?;
+            let at = now_ms.max(last_time(task));
+            let notice = task
+                .notice
+                .as_mut()
+                .filter(|notice| notice.status == NoticeStatus::Pending)
+                .ok_or(TaskError::InvalidTransition)?;
+            if now_ms.saturating_sub(finished) <= DELIVERY_WINDOW_MS {
+                return Err(TaskError::InvalidTransition);
+            }
+            notice.status = NoticeStatus::Expired;
+            notice.closed_at_ms = Some(at);
+            Ok(())
+        })
+    }
+
+    fn update(
+        &self,
+        id: &str,
+        now_ms: u64,
+        apply: impl FnOnce(&mut Task) -> TaskResult<()>,
+    ) -> TaskResult<Task> {
+        if now_ms == 0 {
+            return Err(TaskError::InvalidInput);
+        }
+        let mut inner = self.lock()?;
+        let mut next = inner.ledger.clone();
+        let position = next
+            .tasks
+            .iter()
+            .position(|task| task.id == id)
+            .ok_or(TaskError::NotFound)?;
+        let mut task = next.tasks[position].clone();
+        apply(&mut task)?;
+        validate_task(&task).map_err(|_| TaskError::InvalidInput)?;
+        next.tasks[position] = task.clone();
+        persist(&mut inner, next)?;
+        Ok(task)
+    }
+
+    pub(super) fn close(&self) -> PluginResult<()> {
+        self.inner
+            .lock()
+            .map_err(|_| PluginError::State("后台任务状态锁不可用".into()))?
+            .context = None;
+        Ok(())
+    }
+}
+
+/// 任务上最近一次已记录的时间；之后的记录不能更早。
+fn last_time(task: &Task) -> u64 {
+    let notice = task.notice.iter().flat_map(|notice| {
+        notice
+            .attempts
+            .iter()
+            .flat_map(|attempt| [Some(attempt.started_at_ms), attempt.finished_at_ms])
+            .chain([notice.closed_at_ms])
+    });
+    [
+        Some(task.created_at_ms),
+        task.started_at_ms,
+        task.finished_at_ms,
+    ]
+    .into_iter()
+    .chain(notice)
+    .flatten()
+    .max()
+    .unwrap_or(0)
+}
+
+fn validate_channel(channel: &DeliveryChannel) -> TaskResult<()> {
+    match channel {
+        DeliveryChannel::Passive { message_id } => validate_id(message_id),
+        DeliveryChannel::Proactive => Ok(()),
+    }
+}
+
+fn validate_result(result: &DeliveryResult) -> TaskResult<()> {
+    match result {
+        DeliveryResult::Sent {
+            platform_message_id: Some(id),
+        } => validate_id(id),
+        _ => Ok(()),
+    }
+}
+
+fn persist(inner: &mut Inner, next: Ledger) -> TaskResult<()> {
+    let bytes = encode(&next)?;
+    let context = inner.context.as_ref().ok_or(TaskError::Unavailable)?;
+    // 失败也可能已经提交；关闭整个实例，禁止旧缓存继续读取或覆盖后端。
+    if context.state_set(TASK_STATE_KEY, bytes).is_err() {
+        inner.context = None;
+        return Err(TaskError::Storage);
+    }
+    inner.ledger = next;
+    Ok(())
+}
+
+fn encode(ledger: &Ledger) -> TaskResult<Vec<u8>> {
+    if ledger.tasks.len() > MAX_TASKS {
+        return Err(TaskError::LimitReached);
+    }
+    let bytes = serde_json::to_vec(ledger).map_err(|_| TaskError::InvalidInput)?;
+    // 重启时写入的中断与未知结局比原状态略长；为进行中的任务预留空间，保证能保存。
+    let open = ledger
+        .tasks
+        .iter()
+        .filter(|task| !task.status.finished() || task.notice.is_some())
+        .count();
+    // 进行中的任务结束时还要写入结果；按上限预留。
+    let pending_results = ledger
+        .tasks
+        .iter()
+        .filter(|task| !task.status.finished())
+        .count();
+    if bytes
+        .len()
+        .saturating_add(open * 160)
+        .saturating_add(pending_results * (MAX_RESULT_BYTES * 2))
+        > MAX_STATE_BYTES
+    {
+        return Err(TaskError::LimitReached);
+    }
+    Ok(bytes)
+}
+
+/// 启动时完整核对；任何不一致都拒绝打开并保留原字节。
+fn validate_ledger(ledger: &Ledger) -> TaskResult<()> {
+    if ledger.tasks.len() > MAX_TASKS {
+        return Err(TaskError::CorruptState);
+    }
+    let mut ids = BTreeSet::new();
+    for task in &ledger.tasks {
+        validate_task(task).map_err(|_| TaskError::CorruptState)?;
+        if !ids.insert(task.id.as_str()) {
+            return Err(TaskError::CorruptState);
+        }
+    }
+    Ok(())
+}
+
+fn validate_task(task: &Task) -> TaskResult<()> {
+    validate_id(&task.id)?;
+    validate_owner(&task.owner)?;
+    validate_id(&task.source)?;
+    validate_spec(&task.spec)?;
+    let invalid = Err(TaskError::CorruptState);
+    if task.id != task_id(&task.owner.user_id, &task.source) || task.created_at_ms == 0 {
+        return invalid;
+    }
+    let started = task.started_at_ms;
+    let finished = task.finished_at_ms;
+    if started.is_some_and(|at| at < task.created_at_ms)
+        || finished.is_some_and(|at| at < started.unwrap_or(task.created_at_ms))
+        || task
+            .usage
+            .is_some_and(|usage| usage.tool_calls > task.spec.max_steps)
+        || task
+            .result
+            .as_ref()
+            .is_some_and(|text| text.trim().is_empty() || text.len() > MAX_RESULT_BYTES)
+        || task
+            .failure
+            .as_ref()
+            .is_some_and(|text| text.trim().is_empty() || text.len() > MAX_FAILURE_BYTES)
+    {
+        return invalid;
+    }
+    let shape = (
+        started.is_some(),
+        finished.is_some(),
+        task.usage.is_some(),
+        task.result.is_some(),
+        task.failure.is_some(),
+        task.notice.is_some(),
+    );
+    let consistent = match task.status {
+        TaskStatus::Queued => {
+            shape == (false, false, false, false, false, false) && !task.cancel_requested
+        }
+        TaskStatus::Running => shape == (true, false, false, false, false, false),
+        TaskStatus::Completed => shape == (true, true, true, true, false, true),
+        TaskStatus::Failed => shape == (true, true, true, false, true, true),
+        TaskStatus::Interrupted => {
+            shape == (true, true, false, false, false, true) && !task.cancel_requested
+        }
+        // 排队中取消没有开始与用量；执行中取消保存用量，重启时才发现的取消没有用量。
+        TaskStatus::Cancelled => {
+            shape.1
+                && (shape.0 || !shape.2)
+                && !shape.3
+                && !shape.4
+                && !shape.5
+                && (shape.0 == task.cancel_requested)
+        }
+    };
+    if !consistent {
+        return invalid;
+    }
+    if let Some(notice) = &task.notice {
+        validate_notice(notice, finished.unwrap_or(0))?;
+    }
+    Ok(())
+}
+
+fn validate_notice(notice: &Notice, finished: u64) -> TaskResult<()> {
+    let invalid = Err(TaskError::CorruptState);
+    if notice.attempts.len() > MAX_ATTEMPTS || notice.proactive_attempts() > 1 {
+        return invalid;
+    }
+    let mut carried = BTreeSet::new();
+    for (index, attempt) in notice.attempts.iter().enumerate() {
+        validate_channel(&attempt.channel)?;
+        if let Some(result) = &attempt.result {
+            validate_result(result)?;
+        }
+        let last = index + 1 == notice.attempts.len();
+        if let DeliveryChannel::Passive { message_id } = &attempt.channel
+            && !carried.insert(message_id.as_str())
+        {
+            return invalid;
+        }
+        if attempt.started_at_ms < finished
+            || (attempt.result.is_none() && !last)
+            || (!last && matches!(attempt.result, Some(DeliveryResult::Sent { .. })))
+            || (!last && attempt.result == Some(DeliveryResult::Unknown))
+            || attempt
+                .finished_at_ms
+                .is_some_and(|at| at < attempt.started_at_ms)
+            || attempt.finished_at_ms.is_some() != attempt.result.is_some()
+                && attempt.result != Some(DeliveryResult::Unknown)
+        {
+            return invalid;
+        }
+    }
+    let last_result = notice.attempts.last().map(|attempt| &attempt.result);
+    let sent = matches!(last_result, Some(Some(DeliveryResult::Sent { .. })));
+    let open_or_unknown = matches!(
+        last_result,
+        Some(None) | Some(Some(DeliveryResult::Unknown))
+    );
+    let consistent = match notice.status {
+        NoticeStatus::Pending => !sent && !open_or_unknown && notice.closed_at_ms.is_none(),
+        NoticeStatus::Delivering => {
+            matches!(last_result, Some(None)) && notice.closed_at_ms.is_none()
+        }
+        NoticeStatus::Delivered => sent && notice.closed_at_ms.is_some(),
+        NoticeStatus::Unknown => {
+            matches!(last_result, Some(Some(DeliveryResult::Unknown)))
+                && notice.closed_at_ms.is_none()
+        }
+        NoticeStatus::Expired => !sent && !open_or_unknown && notice.closed_at_ms.is_some(),
+    };
+    if !consistent {
+        return invalid;
+    }
+    Ok(())
+}

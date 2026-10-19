@@ -1127,6 +1127,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-task-api"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eve-task-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-kernel",
+ "eve-plugin-api",
+ "eve-task-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "eve-toolforge-api"
 version = "0.1.0"
 dependencies = [
