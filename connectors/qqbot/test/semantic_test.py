@@ -37,6 +37,7 @@ class SemanticAcceptance(recall_test.RecallAcceptance):
         self.embeddings = []
         self.embedding_failure = False
         self.embedding_authorizations = []
+        self.before_embedding = None
         outer = self
         chat_handler = self.server.RequestHandlerClass
         self.chat_handler = chat_handler
@@ -49,6 +50,8 @@ class SemanticAcceptance(recall_test.RecallAcceptance):
                 with outer.lock:
                     outer.embeddings.append(body)
                     outer.embedding_authorizations.append(self.headers.get("Authorization"))
+                if outer.before_embedding:
+                    outer.before_embedding(body)
                 if outer.embedding_failure:
                     encoded = json.dumps({"error": {"message": "embedding unavailable"}}).encode()
                     status = 503

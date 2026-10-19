@@ -48,6 +48,8 @@ pub struct LlmHostConfig {
     pub response_mode: ResponseMode,
     pub event_timeout: Duration,
     pub max_stream_text_bytes: usize,
+    /// 可选阶段计时，只输出本地时间、轮次与阶段，不含用户内容。
+    pub timing_diagnostics: bool,
 }
 
 impl Default for LlmHostConfig {
@@ -66,6 +68,7 @@ impl Default for LlmHostConfig {
             response_mode: ResponseMode::Complete,
             event_timeout: Duration::from_secs(5),
             max_stream_text_bytes: 8 * 1024 * 1024,
+            timing_diagnostics: false,
         }
     }
 }
@@ -579,6 +582,19 @@ impl LlmHost {
         events: Option<&EventDelivery<'_>>,
     ) -> Result<TurnOutput, TurnFailure> {
         let mut diagnostics = TurnDiagnostics::default();
+        let context_started = std::time::Instant::now();
+        let trace_context = |stage: &str| {
+            if self.config.timing_diagnostics {
+                let at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis());
+                eprintln!(
+                    "EVE_CONTEXT_TIMING {}",
+                    serde_json::json!({"phase":stage,"turn":events.and_then(|e| e.turn_id),"at_ms":at,"elapsed_ms":context_started.elapsed().as_millis()})
+                );
+            }
+        };
+        trace_context("begin");
         let prepared = tokio::select! {
             biased;
             _ = wait_closed(events) => Err(LlmError::Cancelled),
@@ -588,6 +604,7 @@ impl LlmHost {
             Ok(value) => value,
             Err(error) => return Err(fail(error, diagnostics)),
         };
+        trace_context("ready");
         if let Some(history) = history {
             if !prepared.context.history.is_empty() {
                 return Err(fail(

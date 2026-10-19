@@ -101,6 +101,7 @@ pub struct QqBotPlugin {
     outreach: Option<Arc<bridge::OutreachHook>>,
     conversations: QqConversations,
     participant_observer: Option<Arc<dyn QqParticipantObserver>>,
+    timing_diagnostics: bool,
 }
 pub(crate) struct Segmentation {
     pub planner: Arc<dyn SegmentPlanner>,
@@ -130,6 +131,7 @@ impl QqBotPlugin {
             outreach: None,
             conversations: QqConversations::default(),
             participant_observer: None,
+            timing_diagnostics: false,
         })
     }
     /// 通道已提交过轮次的会话是私聊还是群聊；只读，供只在私聊中成立的宿主能力判断。
@@ -145,6 +147,11 @@ impl QqBotPlugin {
     /// 判定中的显式命令可抢先执行；其他会话不会等待该判断。
     pub fn with_natural_message_judgement(mut self, enabled: bool) -> Self {
         self.natural_message_judgement = enabled;
+        self
+    }
+    /// 只记录准入与执行阶段，不输出路由标识、消息正文或工具参数。
+    pub fn with_timing_diagnostics(mut self, enabled: bool) -> Self {
+        self.timing_diagnostics = enabled;
         self
     }
 
@@ -294,6 +301,7 @@ impl Plugin for QqBotPlugin {
             let outreach = self.outreach.clone();
             let conversations = self.conversations.clone();
             let participant_observer = self.participant_observer.clone();
+            let timing_diagnostics = self.timing_diagnostics;
             let task_ctx = ctx.clone();
             ctx.spawn_task(TaskSpec::new(
                 "QQBot JSONL 通道",
@@ -333,6 +341,7 @@ impl Plugin for QqBotPlugin {
                                 outreach,
                                 conversations,
                                 participant_observer,
+                                timing_diagnostics,
                             },
                             ledger,
                             signal,

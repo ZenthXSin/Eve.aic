@@ -297,7 +297,8 @@ pub(crate) struct CoreBootstrap {
 
 pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstrap, AppError> {
     let prompt = FileAgentPrompt::new(agent_path)?;
-    let host_config = LlmHostConfig::default().with_prompt_source(&prompt)?;
+    let mut host_config = LlmHostConfig::default().with_prompt_source(&prompt)?;
+    host_config.timing_diagnostics = models::timing_enabled();
     let api_key =
         std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "宿主缺少 EVE_OPENAI_API_KEY。")?;
     Ok(CoreBootstrap {

@@ -14,6 +14,7 @@ mod chat;
 mod embeddings;
 mod stream;
 mod strict_json;
+mod timing;
 mod wire;
 
 /// 显式选择线协议；不根据模型名猜测，也不在失败时切换协议。
@@ -90,6 +91,7 @@ pub struct OpenAiProvider {
     endpoint: Url,
     authorization: HeaderValue,
     client: Client,
+    timing_diagnostics: bool,
 }
 
 impl OpenAiProvider {
@@ -156,7 +158,14 @@ impl OpenAiProvider {
             endpoint,
             authorization,
             client,
+            timing_diagnostics: false,
         })
+    }
+
+    /// 只记录本地 HTTP 发起/响应头/解码时间，不保证远端已经接收，不输出正文或凭据。
+    pub fn with_timing_diagnostics(mut self) -> Self {
+        self.timing_diagnostics = true;
+        self
     }
 
     async fn request(
@@ -202,6 +211,7 @@ impl OpenAiProvider {
             };
             body[field] = serde_json::json!(limit);
         }
+        let mut timing = timing::RequestTiming::start(self.timing_diagnostics);
         let mut response = self
             .client
             .post(self.endpoint.clone())
@@ -211,6 +221,9 @@ impl OpenAiProvider {
             .await
             .map_err(transport_error)?;
         let status = response.status();
+        if let Some(timing) = &timing {
+            timing.record("headers", Some(status.as_u16()));
+        }
         if !status.is_success() {
             // 原始响应体、URL 和后端错误可能包含凭据或用户输入，不进入通用诊断。
             // 只保留状态码与固定类别。
@@ -256,7 +269,12 @@ impl OpenAiProvider {
                             stream::Update::None => {}
                             stream::Update::Text(text) => sink.text_delta(text).await?,
                             // 正常终态立即关闭本地流，不等 EOF，不重连、不重复执行。
-                            stream::Update::Completed(response) => return Ok(response),
+                            stream::Update::Completed(response) => {
+                                if let Some(timing) = &mut timing {
+                                    timing.finish();
+                                }
+                                return Ok(response);
+                            }
                         }
                     }
                 }
@@ -270,10 +288,16 @@ impl OpenAiProvider {
             }
             bytes.extend_from_slice(&chunk);
         }
-        match self.config.protocol {
+        let decoded = match self.config.protocol {
             OpenAiProtocol::Responses => wire::decode_response(&bytes),
             OpenAiProtocol::ChatCompletions => chat::decode_response(&bytes),
+        };
+        if decoded.is_ok()
+            && let Some(timing) = &mut timing
+        {
+            timing.finish();
         }
+        decoded
     }
 }
 

@@ -118,6 +118,7 @@ class RecallAcceptance(unittest.TestCase):
         inspector.start()
         try:
             stdout, stderr = child.communicate(timeout=30)
+            self.last_stderr = stderr
         finally:
             if child.poll() is None:
                 child.kill()
