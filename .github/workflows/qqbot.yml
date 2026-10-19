@@ -87,6 +87,7 @@ jobs:
           python3 connectors/qqbot/test/people_test.py
           python3 connectors/qqbot/test/model_health_test.py
           python3 connectors/qqbot/test/request_timing_test.py
+          python3 connectors/qqbot/test/admission_benchmark.py --binary target/debug/eve-qqbot --payload-mib 1 --samples 2
           python3 connectors/qqbot/test/memory_continuity_test.py
           python3 connectors/qqbot/test/tool_progress_test.py
           python3 connectors/qqbot/test/history_window_test.py

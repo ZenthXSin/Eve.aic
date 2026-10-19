@@ -789,6 +789,13 @@ async fn upgrade_runs_real_rust_checks_and_builds_an_immutable_candidate_without
     c.self_upgrade = true;
     c.cargo_program = wrapper.to_string_lossy().into_owned();
     c.command_timeout_ms = 60_000;
+    // 工作区即使残留旧调试产物，也只能发布本次优化构建生成的候选。
+    fs::create_dir_all(root.path().join("target/debug")).unwrap();
+    fs::write(
+        root.path().join("target/debug/eve-qqbot"),
+        b"stale debug output",
+    )
+    .unwrap();
     let backend = LocalDeveloper::new(c, ledger.path().into(), None).unwrap();
     let result = backend
         .execute(DeveloperOperation::PrepareUpgrade, context("owner"))
@@ -810,7 +817,7 @@ async fn upgrade_runs_real_rust_checks_and_builds_an_immutable_candidate_without
             .success()
     );
     // 后来的构建输出变化不能改写已准备的候选。
-    fs::write(root.path().join("target/debug/eve-qqbot"), b"later build").unwrap();
+    fs::write(root.path().join("target/release/eve-qqbot"), b"later build").unwrap();
     assert_eq!(
         hash(&fs::read(&candidate).unwrap()),
         result["binary_sha256"]
@@ -821,7 +828,7 @@ async fn upgrade_runs_real_rust_checks_and_builds_an_immutable_candidate_without
     fs::write(root.path().join("AGENT.md"), "后来的源文件修改").unwrap();
     assert_eq!(fs::read_to_string(resource).unwrap(), "合成候选身份资料");
     // 结束上面的构建输出篡改场景；下一次只改变运行资源，保持原二进制。
-    fs::copy(&candidate, root.path().join("target/debug/eve-qqbot")).unwrap();
+    fs::copy(&candidate, root.path().join("target/release/eve-qqbot")).unwrap();
     let later = backend
         .execute(DeveloperOperation::PrepareUpgrade, context("owner"))
         .await

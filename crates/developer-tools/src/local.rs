@@ -671,7 +671,7 @@ impl LocalDeveloper {
                 "warnings",
             ],
             vec!["test", "--workspace", "--locked"],
-            vec!["build", "-p", "eve-app", "--bins", "--locked"],
+            vec!["build", "-p", "eve-app", "--bins", "--release", "--locked"],
         ] {
             let args = self
                 .config
@@ -746,7 +746,7 @@ impl LocalDeveloper {
         if !target.is_absolute() {
             return Err(failed("Cargo 输出目录必须是绝对路径"));
         }
-        let binary = target.join("debug").join(if cfg!(windows) {
+        let binary = target.join("release").join(if cfg!(windows) {
             "eve-qqbot.exe"
         } else {
             "eve-qqbot"

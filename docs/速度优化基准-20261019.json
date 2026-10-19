@@ -1,0 +1,135 @@
+{
+  "synthetic_only": true,
+  "samples_per_binary": 5,
+  "runs": [
+    {
+      "binary": "/workspace/eve-people-check-target/debug/eve-qqbot",
+      "binary_sha256": "3ec0d8ee961690868f7a75fe41fc1afd669d08c58f08fdb525f46508c94a5331",
+      "initial_state_bytes": 16777276,
+      "final_state_bytes": 16802658,
+      "metrics": {
+        "admission_ms": {
+          "median": 946,
+          "samples": [
+            1406,
+            1035,
+            937,
+            943,
+            946
+          ]
+        },
+        "synthetic_model_ms": {
+          "median": 2,
+          "samples": [
+            3,
+            2,
+            2,
+            2,
+            2
+          ]
+        },
+        "after_model_ms": {
+          "median": 633,
+          "samples": [
+            661,
+            727,
+            621,
+            633,
+            632
+          ]
+        },
+        "total_ms": {
+          "median": 1967,
+          "samples": [
+            2418,
+            2225,
+            1967,
+            1927,
+            1940
+          ]
+        }
+      },
+      "unchanged_payload": true,
+      "completed_turns": 5,
+      "tool_names": [
+        "echo",
+        "list_goals",
+        "list_interests",
+        "search_memory"
+      ],
+      "identical_model_requests": true,
+      "equivalent_model_requests": true,
+      "comparable_requests_sha256": "4759a10ddf282cc5f6b9a1adeeba81ced0d0d76b518d99d8f4e6cc88849fd2d8",
+      "binary_profile": "debug"
+    },
+    {
+      "binary": "/workspace/eve-release-target/release/eve-qqbot",
+      "binary_sha256": "0b739474143438aed17d0e9427cd08edb0864d5317b9023e092a8ba2acaaf62c",
+      "initial_state_bytes": 16777276,
+      "final_state_bytes": 16802658,
+      "metrics": {
+        "admission_ms": {
+          "median": 109,
+          "samples": [
+            159,
+            109,
+            106,
+            116,
+            106
+          ]
+        },
+        "synthetic_model_ms": {
+          "median": 1,
+          "samples": [
+            2,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        "after_model_ms": {
+          "median": 76,
+          "samples": [
+            79,
+            76,
+            77,
+            71,
+            75
+          ]
+        },
+        "total_ms": {
+          "median": 229,
+          "samples": [
+            280,
+            229,
+            221,
+            233,
+            226
+          ]
+        }
+      },
+      "unchanged_payload": true,
+      "completed_turns": 5,
+      "tool_names": [
+        "echo",
+        "list_goals",
+        "list_interests",
+        "search_memory"
+      ],
+      "identical_model_requests": false,
+      "equivalent_model_requests": true,
+      "comparable_requests_sha256": "4759a10ddf282cc5f6b9a1adeeba81ced0d0d76b518d99d8f4e6cc88849fd2d8",
+      "binary_profile": "release"
+    }
+  ],
+  "comparison_ignores_only": [
+    "system.eve.conversation-digest-v1.episodes[*].at_ms"
+  ],
+  "source_base": "c3bacc22a2656aa9d9c3c4fb5c22e86c8e91ad80",
+  "source_note": "同一本 PR 工作区代码的优化/未优化构建；提交前生成，不代表线上已切换。",
+  "rust_source_sha256": {
+    "crates/developer-tools/src/local.rs": "7b4d52bb279973194d34f168f46bd3e262974534ea50c75583b499f7ae5c6358",
+    "crates/qqbot-plugin/src/bridge.rs": "ebaab10ad5776e9d7fe17546f915dbca055cf5d7be3ef84dd003e96771bcb395"
+  }
+}
