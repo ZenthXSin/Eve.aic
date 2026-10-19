@@ -118,8 +118,22 @@ def delivery_gate(state_path, request):
         return json.loads(bytes(entries[owner][key]), object_pairs_hook=unique_object)
     sessions = document('eve.session', 'sessions.v1')
     receipts = document('eve.channel.qqbot', 'receipts.v1')
-    if sessions['format_version'] != 1 or receipts['version'] not in (1, 2):
+    if sessions['format_version'] != 1 or receipts['version'] not in (1, 2, 3):
         raise ValueError('unknown_ledger_version')
+    for receipt in receipts['entries']:
+        progress = receipt.get('progress', [])
+        if not isinstance(progress, list) or len(progress) > 3:
+            raise ValueError('invalid_progress_ledger')
+        if progress and receipts['version'] != 3:
+            raise ValueError('invalid_progress_ledger')
+        for part in progress:
+            if (not isinstance(part, dict) or set(part) != {'text', 'state'}
+                    or not isinstance(part['text'], str) or not part['text'].strip()
+                    or len(part['text'].encode()) > 1024
+                    or part['state'] not in ('Sending', 'Sent', 'Failed')):
+                raise ValueError('invalid_progress_ledger')
+            if part['state'] == 'Sending':
+                return False
     session = sessions['sessions'].get(request['session_id'])
     if not session or session['key']['user_id'] != request['requested_by']:
         raise ValueError('request_scope_mismatch')

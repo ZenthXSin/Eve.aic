@@ -825,23 +825,51 @@ async fn evidence_capacity_is_global_and_full_replay_is_still_read_only() {
     let store = RecordingStore::open(directory.path());
     let (kernel, admin, sessions) = open(store.clone()).await;
     let one = scope("s", "u");
-    let mut first_source = None;
-    for index in 0..MAX_EVIDENCE {
-        let completed = complete_session(&*sessions, &key(&one), &format!("原文 {index}"), "回复");
-        let source = interaction(&format!("e-{index}"), completed, index as u64 + 1);
-        if index == 0 {
-            first_source = Some(source.clone());
-        }
-        let saved = admin.import_completed(&one, index as u64, source).unwrap();
-        assert_eq!(saved.evidence.len(), index + 1);
-    }
+    let completed = complete_session(&*sessions, &key(&one), "原文 0", "回复");
+    let first_source = interaction("e-0", completed, 1);
+    admin
+        .import_completed(&one, 0, first_source.clone())
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    // 一次加载合法的满容量来源，避免为边界测试逐条重复写入数千份整库快照。
+    let mut document: Value =
+        serde_json::from_slice(&store.get(&owner(), MEMORY_STATE_KEY).unwrap().unwrap()).unwrap();
+    let snapshot = &mut document["scopes"][0]["snapshot"];
+    let template = snapshot["evidence"][0].clone();
+    snapshot["evidence"] = Value::Array(
+        (0..MAX_EVIDENCE)
+            .map(|i| {
+                let mut evidence = template.clone();
+                evidence["id"] = json!(format!("e-{i}"));
+                evidence["revision"] = json!(i + 1);
+                evidence["at_ms"] = json!(i + 1);
+                evidence["source"]["message_id"] = json!(format!(
+                    "{}-{i}",
+                    template["source"]["message_id"].as_str().unwrap()
+                ));
+                evidence["source"]["turn_id"] = json!(i + 1);
+                evidence["source"]["session_revision"] = json!((i + 1) * 2);
+                if i == 0 {
+                    evidence = template.clone();
+                }
+                evidence
+            })
+            .collect(),
+    );
+    snapshot["revision"] = json!(MAX_EVIDENCE);
+    store
+        .set(
+            &owner(),
+            MEMORY_STATE_KEY.into(),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+    let (kernel, admin, _sessions) = open(store.clone()).await;
     let saved = admin.reader(one.clone()).unwrap().snapshot().unwrap();
     let bytes = store.get(&owner(), MEMORY_STATE_KEY).unwrap().unwrap();
     let writes = store.writes();
     assert_eq!(
-        admin
-            .import_completed(&one, 0, first_source.unwrap())
-            .unwrap(),
+        admin.import_completed(&one, 0, first_source).unwrap(),
         saved
     );
     let another = scope("other-session", "other-user");

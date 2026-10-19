@@ -98,6 +98,25 @@ while True:time.sleep(.05)
               'eve.channel.qqbot':{'receipts.v1':list(json.dumps(ledger).encode())}}}
         runtime.atomic(self.state/'state.json',state)
 
+    def test_progress_ledger_three_accepts_settled_delivery_but_not_unknown_or_corrupt_progress(self):
+        path=self.state/'state.json'
+        state=runtime.read_json(path)
+        ledger=json.loads(bytes(state['entries']['eve.channel.qqbot']['receipts.v1']))
+        ledger['version']=3
+        ledger['entries'][0]['progress']=[{'text':'工具回执已返回','state':'Sent'}]
+        request={'session_id':self.session,'requested_by':self.session,'turn_id':1}
+        def save():
+            state['entries']['eve.channel.qqbot']['receipts.v1']=list(json.dumps(ledger).encode())
+            runtime.atomic(path,state)
+        save();self.assertTrue(runtime.delivery_gate(path,request))
+        ledger['entries'][0]['progress'][0]['state']='Sending'
+        save();self.assertFalse(runtime.delivery_gate(path,request))
+        ledger['entries'][0]['progress'][0]['state']='Failed'
+        save();self.assertTrue(runtime.delivery_gate(path,request))
+        ledger['entries'][0]['progress'][0]['state']='invalid'
+        save()
+        with self.assertRaisesRegex(ValueError,'invalid_progress_ledger'):runtime.delivery_gate(path,request)
+
     def candidate(self,tag):
         resources={}
         for p in self.initial.rglob('*'):

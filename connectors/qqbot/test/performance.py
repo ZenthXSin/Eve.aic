@@ -150,7 +150,7 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes):
                 for line in pathlib.Path("/proc/" + str(child.pid) + "/status").read_text().splitlines():
                     if line.startswith(("VmRSS:", "VmHWM:")):
                         peak[0] = max(peak[0], int(line.split()[1]) / 1024)
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 pass
             stopped.wait(0.005)
 
