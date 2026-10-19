@@ -35,10 +35,14 @@ fn format_for(document: &Document) -> u32 {
     }
 }
 
+type DecodedKey = (String, MemoryScope);
+/// 解开的证据与最近一次使用的序号。
+type DecodedEntry = (Arc<Vec<InteractionEvidence>>, u64);
+
 /// 已核对并解开的分块；分块不可变，按名称与作用域缓存。
 #[derive(Default)]
 struct DecodedChunks {
-    entries: BTreeMap<(String, MemoryScope), (Arc<Vec<InteractionEvidence>>, u64)>,
+    entries: BTreeMap<DecodedKey, DecodedEntry>,
     tick: u64,
     total: usize,
 }
