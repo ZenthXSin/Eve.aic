@@ -12,7 +12,7 @@ async fn main() {
         let stdout = std::io::stdout();
         let summary = run_console(options, std::io::BufReader::new(stdin), stdout.lock()).await?;
         if summary.failed_turns > 0 {
-            return Err("存在失败轮次，请查看本轮提示；没有自动重试。".into());
+            return Err("存在失败轮次，请查看本轮提示；不再自动重试。".into());
         }
         Ok(())
     }

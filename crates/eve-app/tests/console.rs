@@ -208,10 +208,30 @@ async fn real_process_chat_tool_round_trip_and_restart_preserve_history_without_
     println!("Eve 核心进程验收：两轮聊天、一次工具往返、重启第三轮；历史修订 4→6，旧工具零重放。");
 }
 #[tokio::test]
-async fn provider_failure_is_not_retried_or_added_to_completed_history() {
+async fn transient_provider_failure_recovers_with_one_completed_turn() {
     let root = fixture();
     let mut failed = Reply::json(json!({"error":"fixture-key 不应外泄"}));
-    failed.status = 500;
+    failed.status = 503;
+    let mut server = Server::start(vec![failed, Reply::json(final_response("自动恢复"))]).await;
+    let mut cmd = command(root.path(), &server.url);
+    cmd.env("EVE_OPENAI_TIMEOUT_SECONDS", "10");
+    let output = run(cmd, "需要恢复\n").await;
+    assert!(output.status.success());
+    let first = server.next().await.body;
+    assert_eq!(server.next().await.body, first);
+    assert!(server.requests.try_recv().is_err());
+    let saved = sessions(root.path());
+    let turns = saved["sessions"]["default"]["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0]["status"]["state"], "Completed");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-key"));
+}
+
+#[tokio::test]
+async fn permanent_provider_failure_is_not_retried_or_added_to_completed_history() {
+    let root = fixture();
+    let mut failed = Reply::json(json!({"error":"fixture-key 不应外泄"}));
+    failed.status = 400;
     let mut server = Server::start(vec![failed, Reply::json(final_response("下一轮成功"))]).await;
     let output = run(command(root.path(), &server.url), "失败输入\n新输入\n").await;
     assert!(!output.status.success());

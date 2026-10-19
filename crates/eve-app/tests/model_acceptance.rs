@@ -233,10 +233,10 @@ async fn wrong_restart_reply_keeps_old_completed_prefix_and_records_failure() {
     assert_eq!(report(root.path())["stage"], "restart_checkpoint");
 }
 #[tokio::test]
-async fn http_failure_is_not_retried_and_raw_diagnostics_do_not_enter_report() {
+async fn permanent_http_failure_is_not_retried_and_raw_diagnostics_do_not_enter_report() {
     let root = fixture();
     let mut bad = Reply::json(json!({"error":"fixture-secret private body"}));
-    bad.status = 500;
+    bad.status = 400;
     let mut server = Server::start(vec![bad, Reply::json(final_response("后续输入"))]).await;
     let error = check(root.path(), &server.url).await.unwrap_err();
     assert_eq!(error.stage, "first_process");

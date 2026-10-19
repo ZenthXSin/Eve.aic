@@ -12,6 +12,7 @@ pub use embeddings::OpenAiEmbeddings;
 
 mod chat;
 mod embeddings;
+mod retry;
 mod stream;
 mod strict_json;
 mod timing;
@@ -92,6 +93,7 @@ pub struct OpenAiProvider {
     authorization: HeaderValue,
     client: Client,
     timing_diagnostics: bool,
+    transient_retries: bool,
 }
 
 impl OpenAiProvider {
@@ -159,12 +161,20 @@ impl OpenAiProvider {
             authorization,
             client,
             timing_diagnostics: false,
+            transient_retries: false,
         })
     }
 
     /// 只记录本地 HTTP 发起/响应头/解码时间，不保证远端已经接收，不输出正文或凭据。
     pub fn with_timing_diagnostics(mut self) -> Self {
         self.timing_diagnostics = true;
+        self
+    }
+
+    /// 完整响应在原请求期限内最多退避重试三次；不重放工具、不续接部分流。
+    /// 默认关闭，由聊天组合层显式启用，后台学习保持原有一次性执行语义。
+    pub fn with_transient_retries(mut self) -> Self {
+        self.transient_retries = true;
         self
     }
 
@@ -211,12 +221,24 @@ impl OpenAiProvider {
             };
             body[field] = serde_json::json!(limit);
         }
+        if self.transient_retries && sink.is_none() {
+            return self.request_retried(&body).await;
+        }
+        self.request_once(&body, sink, &mut None).await
+    }
+
+    async fn request_once(
+        &self,
+        body: &serde_json::Value,
+        sink: Option<&dyn ModelTextSink>,
+        retry_after: &mut Option<Duration>,
+    ) -> Result<ModelResponse, LlmError> {
         let mut timing = timing::RequestTiming::start(self.timing_diagnostics);
         let mut response = self
             .client
             .post(self.endpoint.clone())
             .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
-            .json(&body)
+            .json(body)
             .send()
             .await
             .map_err(transport_error)?;
@@ -225,6 +247,12 @@ impl OpenAiProvider {
             timing.record("headers", Some(status.as_u16()));
         }
         if !status.is_success() {
+            *retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(Duration::from_secs);
             // 原始响应体、URL 和后端错误可能包含凭据或用户输入，不进入通用诊断。
             // 只保留状态码与固定类别。
             return Err(LlmError::ProviderFailed(

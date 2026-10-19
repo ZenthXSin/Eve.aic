@@ -197,6 +197,9 @@ impl LlmModelResolver for CoreModelResolver {
         }
         let provider_timeout = config.request_timeout;
         let mut provider = OpenAiProvider::new(config, &self.api_key)?;
+        if self.use_name.as_deref() == Some("dialogue") {
+            provider = provider.with_transient_retries();
+        }
         if self.use_name.as_deref() == Some("dialogue") && timing_enabled() {
             provider = provider.with_timing_diagnostics();
         }
