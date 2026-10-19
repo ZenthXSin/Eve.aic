@@ -124,7 +124,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --autonomy-budget 需同时 --interest-learning；兴趣观察、受控研究、实践草稿、技能、工具锻造、主动交流、请求澄清与情景语义摘要的后台模型请求在每个窗口（--autonomy-budget-window-hours 默认 24 小时，按 UTC 整点对齐）合计至多该次数；每次请求前先保存计数，重启不清零、失败不退还，余额不够一项工作时后台不开始新工作，重置后继续；回复用户消息、/plan propose、反思、偏好提炼与语义索引不计入。/budget 查看用量与重置时间。
 /tools 列出锻造的工具；/tool 工具ID 查看版本、回放验证与调用；/tool disable|rollback 工具ID、/tool enable 工具ID 版本 停用、回退或启用某个已验证版本。
 EVE_DEVELOPER_CONFIG 指定独立开发工具 JSON：源码工作区、操作者、命令/GitHub/升级开关与 token 环境引用；未配置时不注册。命令以宿主权限执行，仅供明确操作者；不是 QQ 测试环境开关。/help tools 查看实际已装配能力。
-明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
+记忆保留原始会话来源；跨会话个人记忆按可信平台身份或面板账号绑定读取，默认不把私聊带入群。面板 runtime.memory_continuity 可热配置；内部反思不读取聊天偏好。
 --segmented 把模型回复按自然段分成至多 3 条消息，段间停顿至多 2.5 秒；命令确认整条发送。
 --markdown 让被动回复与主动私聊以 markdown 消息（msg_type=2）发送，需要机器人已通过平台 Markdown 权限审核；未审核时平台会拒绝发送，默认关闭。
 /segment 查看本会话分段；/segment on|off|reset、/segment parts 2至5、/segment pace 0至200（%）按会话保存，从下一条回复生效。
@@ -937,6 +937,16 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        let memory_continuity: Option<Arc<dyn eve_memory_api::MemoryContinuityFactory>> =
+            memory.as_ref().map(|memory| {
+                Arc::new(eve_memory_plugin::MemoryContinuity::new(
+                    memory.clone(),
+                    Arc::new(crate::qq_memory_continuity::Policy {
+                        registry: registry.clone(),
+                        conversations: conversations.clone(),
+                    }),
+                )) as Arc<dyn eve_memory_api::MemoryContinuityFactory>
+            });
         let summaries: Option<Arc<dyn SummaryAdmin>> = if memory.is_some() {
             let plugin = ConversationSummaryPlugin::new()?;
             let controller = plugin.controller();
@@ -1300,6 +1310,13 @@ async fn run_qqbot_composed(
         } else {
             context
         });
+        if let Some(continuity) = &memory_continuity {
+            bootstrap.context = Some(Arc::new(eve_memory_plugin::MemoryContinuityContext::new(
+                "qq",
+                continuity.clone(),
+                bootstrap.context.take().ok_or("对话上下文缺失")?,
+            )?));
+        }
         // 后台能力不自动成为对话工具：显式装配公开 Tool，并让帮助和能力上下文共用注册源。
         // 本地资料地址交给资料源，其他地址交给网页抓取器（或替换实现）。
         let routed = |web: Arc<dyn SourceFetcher>| -> Arc<dyn SourceFetcher> {
@@ -1318,6 +1335,7 @@ async fn run_qqbot_composed(
         };
         let dialogue_tools = eve_dialogue_tools::Services {
             memory: memory.clone(),
+            memory_continuity: memory_continuity.clone(),
             interests: interests
                 .clone()
                 .map(|v| Arc::new(v) as Arc<dyn eve_interest_api::InterestAdmin>),
@@ -1834,11 +1852,12 @@ async fn run_qqbot_composed(
             let pursuit = pursuit.clone().ok_or("学习目标停止缺少兴趣学习")?;
             pursuit_background = Some(qq_pursuit::Background::start(pursuit));
         }
-        let memory_commands = memory
-            .as_ref()
-            .map_or_else(qq_memory::Commands::disabled, |memory| {
-                qq_memory::Commands::new(memory.clone())
-            });
+        let memory_commands =
+            memory
+                .as_ref()
+                .map_or_else(qq_memory::Commands::disabled, |memory| {
+                    qq_memory::Commands::with_continuity(memory.clone(), memory_continuity.clone())
+                });
         let segment_preferences = if options.self_learning {
             Some(Arc::new(crate::segment_advice::AutomaticPreferences {
                 manual: segment_preferences.ok_or("自主学习缺少分段设置")?,

@@ -22,6 +22,11 @@ impl eve_config_api::ConfigValidator for CoreConfigValidator {
             crate::qq_people::settings(people)
                 .map_err(|_| ConfigError::InvalidValue(crate::qq_people::NAMESPACE.into()))?;
         }
+        if let Some(continuity) = snapshots.get(crate::qq_memory_continuity::NAMESPACE) {
+            crate::qq_memory_continuity::identity_groups(continuity).map_err(|_| {
+                ConfigError::InvalidValue(crate::qq_memory_continuity::NAMESPACE.into())
+            })?;
+        }
         let runtime =
             LlmRuntimeConfig::try_from(snapshots.get(LLM_NAMESPACE).ok_or_else(invalid)?)?;
         if runtime.response_mode != "complete" {

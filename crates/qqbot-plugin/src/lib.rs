@@ -8,7 +8,7 @@ mod participants;
 mod state;
 
 pub use commands::{QqCommandHandler, QqCommandInput};
-pub use conversations::QqConversations;
+pub use conversations::{QqConversationIdentity, QqConversations};
 pub use observer::{QqInteraction, QqInteractionObserver, QqInteractionSource};
 pub use outreach::{
     QQ_OUTREACH_JUDGE_TIMEOUT, QQ_OUTREACH_MAX_BYTES, QQ_OUTREACH_MAX_REPLY_PARTS,

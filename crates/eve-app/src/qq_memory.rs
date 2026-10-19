@@ -77,11 +77,27 @@ fn explain(error: MemoryError) -> PluginResult<String> {
 pub(crate) struct Commands {
     admin: Option<Arc<dyn MemoryAdmin>>,
     recall: Option<Arc<dyn MemoryRecallFactory>>,
+    continuity: Option<Arc<dyn eve_memory_api::MemoryContinuityFactory>>,
 }
 impl Commands {
     pub(crate) fn new(admin: Arc<dyn MemoryAdmin>) -> Arc<Self> {
         let recall = Arc::new(LexicalMemoryRecall::new(admin.clone()));
         Self::with_recall(admin, recall)
+    }
+
+    pub(crate) fn with_continuity(
+        admin: Arc<dyn MemoryAdmin>,
+        continuity: Option<Arc<dyn eve_memory_api::MemoryContinuityFactory>>,
+    ) -> Arc<Self> {
+        if continuity.is_none() {
+            return Self::new(admin);
+        }
+        let recall = Arc::new(LexicalMemoryRecall::new(admin.clone()));
+        Arc::new(Self {
+            admin: Some(admin),
+            recall: Some(recall),
+            continuity,
+        })
     }
 
     /// 组合层可替换检索实现；命令始终校验返回范围和公开结果契约。
@@ -92,6 +108,7 @@ impl Commands {
         Arc::new(Self {
             admin: Some(admin),
             recall: Some(recall),
+            continuity: None,
         })
     }
 
@@ -99,6 +116,7 @@ impl Commands {
         Arc::new(Self {
             admin: None,
             recall: None,
+            continuity: None,
         })
     }
 
@@ -133,7 +151,47 @@ impl Commands {
             result
                 .validate_for(&scope, &request)
                 .map_err(|_| recall_failure())?;
-            return recall_list(&result);
+            let mut reply = recall_list(&result)?;
+            if let Some(continuity) = &self.continuity {
+                let shared = continuity
+                    .reader(scope.clone())
+                    .and_then(|r| r.read(query))
+                    .map_err(|_| recall_failure())?;
+                shared
+                    .validate_for(&scope, query)
+                    .map_err(|_| recall_failure())?;
+                let mut rows = Vec::new();
+                for source in shared.sources {
+                    for preference in source
+                        .preferences
+                        .into_iter()
+                        .filter(|p| p.text.to_lowercase().contains(&query.to_lowercase()))
+                    {
+                        rows.push(format!(
+                            "\n[跨会话有效偏好] 来源={} revision={} preference={} version={}：{}",
+                            source.scope.session_id,
+                            source.revision,
+                            preference.id,
+                            preference.revision,
+                            preview(&preference.text)
+                        ));
+                    }
+                    for hit in source.hits {
+                        rows.push(format!(
+                            "\n[跨会话历史片段] 来源={} revision={}：{}",
+                            source.scope.session_id,
+                            source.revision,
+                            preview(&hit.excerpt)
+                        ));
+                    }
+                }
+                for row in rows.into_iter().take(3) {
+                    if reply.len() + row.len() <= MAX_RECALL_RESPONSE_BYTES {
+                        reply.push_str(&row);
+                    }
+                }
+            }
+            return Ok(reply);
         }
         if let Err(error) = validate_text(input.text, MAX_TEXT_BYTES) {
             return explain(error);
