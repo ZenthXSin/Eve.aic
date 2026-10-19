@@ -1003,7 +1003,9 @@ impl LlmHost {
         for prepared_call in ready {
             // 取消外层 Future 后，停止操作仍需等到已创建的工具任务真正析构。
             let admission = admission.clone();
-            let context = ToolExecutionContext::new().with_scope(caller.clone());
+            let context = ToolExecutionContext::new()
+                .with_scope(caller.clone())
+                .with_turn_id(events.and_then(|event| event.turn_id));
             let cancellation = context.cancellation_handle();
             let call_id = prepared_call.call.id.clone();
             let run_config = ToolRunConfig {

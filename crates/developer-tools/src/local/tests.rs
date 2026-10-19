@@ -18,6 +18,7 @@ fn config(root: &Path) -> DeveloperConfig {
         command_timeout_ms: 10_000,
         max_tool_rounds: 8,
         self_upgrade: false,
+        live_upgrade: None,
         cargo_program: "cargo".into(),
         cargo_arguments: vec![],
     }
@@ -737,6 +738,16 @@ async fn upgrade_runs_real_rust_checks_and_builds_an_immutable_candidate_without
     )
     .unwrap();
     fs::write(root.path().join(".gitignore"), "/target/\n").unwrap();
+    fs::write(root.path().join("AGENT.md"), "合成候选身份资料").unwrap();
+    fs::create_dir_all(root.path().join("connectors/qqbot")).unwrap();
+    for name in [
+        "bridge.mjs",
+        "bridge-core.mjs",
+        "package.json",
+        "package-lock.json",
+    ] {
+        fs::write(root.path().join("connectors/qqbot").join(name), "{}").unwrap();
+    }
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let wrapper = root.path().join("cargo-fixture.sh");
     fs::write(
@@ -805,4 +816,111 @@ async fn upgrade_runs_real_rust_checks_and_builds_an_immutable_candidate_without
         result["binary_sha256"]
     );
     assert!(candidate.parent().unwrap().join("manifest.json").is_file());
+    let resource = candidate.parent().unwrap().join("resources/AGENT.md");
+    assert_eq!(fs::read_to_string(&resource).unwrap(), "合成候选身份资料");
+    fs::write(root.path().join("AGENT.md"), "后来的源文件修改").unwrap();
+    assert_eq!(fs::read_to_string(resource).unwrap(), "合成候选身份资料");
+    // 结束上面的构建输出篡改场景；下一次只改变运行资源，保持原二进制。
+    fs::copy(&candidate, root.path().join("target/debug/eve-qqbot")).unwrap();
+    let later = backend
+        .execute(DeveloperOperation::PrepareUpgrade, context("owner"))
+        .await
+        .unwrap();
+    assert_eq!(later["binary_sha256"], result["binary_sha256"]);
+    assert_ne!(later["candidate_sha256"], result["candidate_sha256"]);
+    // 真正的 Rust 生产者与 Python 消费者必须对候选/资源身份算出同一摘要。
+    let verifier =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/self_upgrade_runtime.py");
+    let request = json!({"format_version":1,"candidate_sha256":later["candidate_sha256"],
+        "candidate_directory":Path::new(later["candidate_path"].as_str().unwrap()).parent().unwrap(),
+        "session_id":"test-session","requested_by":"owner","turn_id":1});
+    assert!(std::process::Command::new("python3").args(["-c",
+        "import importlib.util,json,pathlib,sys; s=importlib.util.spec_from_file_location('upgrade',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); m.validate_candidate(json.loads(sys.argv[2]),pathlib.Path(sys.argv[3]))",
+        verifier.to_str().unwrap(), &request.to_string(), ledger.path().join("candidates").to_str().unwrap()]).status().unwrap().success());
+}
+
+#[tokio::test]
+async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_without_applying() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let queue = tempfile::tempdir().unwrap();
+    let mut c = config(root.path());
+    c.self_upgrade = true;
+    c.live_upgrade = Some(queue.path().into());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let status = UpgradeSupervisor {
+        format_version: 1,
+        pid: 1,
+        heartbeat_ms: now,
+        phase: "running".into(),
+        active_sha256: "b".repeat(64),
+        candidate_sha256: None,
+        result: None,
+        error: None,
+    };
+    fs::write(
+        queue.path().join("supervisor.json"),
+        serde_json::to_vec(&status).unwrap(),
+    )
+    .unwrap();
+    let id = "a".repeat(64);
+    let candidate = ledger.path().join("candidates").join(&id);
+    fs::create_dir_all(&candidate).unwrap();
+    fs::write(candidate.join("manifest.json"), json!({"format_version":1,"prepared":true,"success":true,
+        "candidate_sha256":id,"checks":[{"success":true},{"success":true},{"success":true},{"success":true}]}).to_string()).unwrap();
+    let backend = LocalDeveloper::new(c, ledger.path().into(), None).unwrap();
+    let operation = DeveloperOperation::ApplyUpgrade(ApplyUpgradeArguments {
+        candidate_sha256: id.clone(),
+    });
+    assert!(
+        backend
+            .execute(operation.clone(), context("stranger").with_turn_id(Some(1)))
+            .await
+            .is_err()
+    );
+    assert!(
+        backend
+            .execute(operation.clone(), context("owner"))
+            .await
+            .is_err()
+    );
+    assert!(!queue.path().join("request.json").exists());
+    let result = backend
+        .execute(operation.clone(), context("owner").with_turn_id(Some(1)))
+        .await
+        .unwrap();
+    assert_eq!(result["queued"], true);
+    assert_eq!(result["applied"], false);
+    let before = fs::read(queue.path().join("request.json")).unwrap();
+    let request: UpgradeRequest = serde_json::from_slice(&before).unwrap();
+    assert_eq!(request.turn_id, 1);
+    assert_eq!(request.requested_by, "owner");
+    backend
+        .execute(operation.clone(), context("owner").with_turn_id(Some(1)))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(queue.path().join("request.json")).unwrap(), before);
+    assert!(
+        backend
+            .execute(operation, context("owner").with_turn_id(Some(2)))
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(queue.path().join("request.json")).unwrap(), before);
+    let mut stale = status;
+    stale.heartbeat_ms = 0;
+    fs::write(
+        queue.path().join("supervisor.json"),
+        serde_json::to_vec(&stale).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        backend
+            .execute(DeveloperOperation::UpgradeStatus, context("owner"))
+            .await
+            .is_err()
+    );
 }

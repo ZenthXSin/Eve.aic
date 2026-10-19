@@ -619,12 +619,14 @@ pub trait ContextAssembler: Send + Sync {
 pub struct ToolExecutionContext {
     cancelled: Arc<AtomicBool>,
     scope: Option<ContextScope>,
+    turn_id: Option<u64>,
 }
 impl ToolExecutionContext {
     pub fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             scope: None,
+            turn_id: None,
         }
     }
     /// 绑定本轮的可信会话范围；由宿主依据通道身份设置，模型参数不能改变它。
@@ -635,6 +637,14 @@ impl ToolExecutionContext {
     /// 本轮的可信会话范围；没有范围的轮次（例如本地终端）为 None。
     pub fn scope(&self) -> Option<&ContextScope> {
         self.scope.as_ref()
+    }
+    /// 由会话宿主绑定的持久轮次；模型参数不能指定。
+    pub fn with_turn_id(mut self, turn_id: Option<u64>) -> Self {
+        self.turn_id = turn_id;
+        self
+    }
+    pub fn turn_id(&self) -> Option<u64> {
+        self.turn_id
     }
     pub fn cancellation_handle(&self) -> ToolCancellation {
         ToolCancellation(self.cancelled.clone())

@@ -46,6 +46,16 @@ jobs:
         run: python -X utf8 scripts/test-release-portable.py
       - name: 验证客户端更新、资产校验与失败恢复
         run: node scripts/test-client-update.mjs
+      - name: 验证实时升级切换、失败回退与不回放
+        run: |
+          $output = & python -X utf8 scripts/test-self-upgrade-runtime.py 2>&1
+          $result = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($result -ne 0) {
+            $details = ($output -join "`n").Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=实时升级进程验收失败::$details"
+            exit $result
+          }
       - name: 检查所有构建目标
         run: cargo check --workspace --all-targets --locked
       - name: 检查 Clippy 警告

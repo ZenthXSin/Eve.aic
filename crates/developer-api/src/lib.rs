@@ -7,6 +7,9 @@ use std::{
     path::PathBuf,
 };
 
+mod upgrade;
+pub use upgrade::*;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeveloperConfig {
@@ -30,6 +33,9 @@ pub struct DeveloperConfig {
     pub max_tool_rounds: usize,
     #[serde(default)]
     pub self_upgrade: bool,
+    /// 独立监督器的可信请求目录；未配置时只准备候选，不注册实时切换工具。
+    #[serde(default)]
+    pub live_upgrade: Option<PathBuf>,
     #[serde(default = "cargo")]
     pub cargo_program: String,
     #[serde(default)]
@@ -65,6 +71,10 @@ impl DeveloperConfig {
                 "EVE_GITHUB_TOKEN" | "GH_TOKEN" | "GITHUB_TOKEN"
             )
             || (self.self_upgrade && !self.commands)
+            || self
+                .live_upgrade
+                .as_ref()
+                .is_some_and(|p| !p.is_absolute() || !self.self_upgrade || !self.commands)
             || self.cargo_program.trim().is_empty()
             || self.cargo_arguments.len() > 8
             || self
@@ -233,6 +243,8 @@ pub enum DeveloperOperation {
     Command(CommandArguments),
     Github(GithubArguments),
     PrepareUpgrade,
+    ApplyUpgrade(ApplyUpgradeArguments),
+    UpgradeStatus,
 }
 /// 可替换后端；接收宿主的可信会话身份与取消状态，而非模型自报 owner。
 pub trait DeveloperBackend: Send + Sync {
