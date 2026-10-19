@@ -80,5 +80,6 @@ pub fn memory(scope: MemoryScope, count: usize) -> MemorySnapshot {
             })
             .collect(),
         preferences: vec![],
+        archived_evidence: 0,
     }
 }

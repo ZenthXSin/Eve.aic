@@ -460,6 +460,7 @@ fn replacement_snapshot() -> MemorySnapshot {
             revision: 1,
             history: vec![],
         }],
+        archived_evidence: 0,
     }
 }
 

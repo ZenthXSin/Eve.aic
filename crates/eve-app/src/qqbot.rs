@@ -929,7 +929,13 @@ async fn run_qqbot_composed(
             .downcast::<TrainingServiceHandle>()
             .map_err(|_| "训练服务类型错误")?;
         let memory: Option<Arc<dyn MemoryAdmin>> = if options.memory {
-            let plugin = MemoryPlugin::new()?;
+            let archive = eve_memory_plugin::FileEvidenceArchive::open(
+                crate::storage::memory_archive_directory(&options.state_directory),
+            )?;
+            let plugin = MemoryPlugin::new()?.with_archive(
+                Arc::new(archive),
+                eve_memory_plugin::ArchivePolicy::default(),
+            )?;
             let controller = plugin.controller();
             kernel.register(Box::new(plugin))?;
             kernel.start(&PluginId::new(MEMORY_PLUGIN_ID)?).await?;

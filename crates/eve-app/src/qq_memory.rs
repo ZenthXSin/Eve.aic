@@ -584,6 +584,7 @@ mod tests {
                     revision: 0,
                     evidence: vec![],
                     preferences: vec![],
+                    archived_evidence: 0,
                 });
             if state.foreign_snapshot {
                 snapshot.scope.user_id = "foreign-user".into();
@@ -626,6 +627,7 @@ mod tests {
                     revision: 0,
                     evidence: vec![],
                     preferences: vec![],
+                    archived_evidence: 0,
                 });
             let key = (scope.clone(), change.operation_id.clone());
             if let Some(previous) = state.operations.get(&key) {

@@ -262,6 +262,7 @@ mod tests {
                     revision: 0,
                     evidence: vec![],
                     preferences: vec![],
+                    archived_evidence: 0,
                 });
             Ok(Arc::new(Reader(snapshot)))
         }
@@ -353,12 +354,14 @@ mod tests {
                 },
             ],
             preferences: vec![confirmed, revoked],
+            archived_evidence: 0,
         };
         let other = MemorySnapshot {
             scope: scope("user-b"),
             revision: 1,
             evidence: vec![],
             preferences: vec![],
+            archived_evidence: 0,
         };
         MemoryView::new(Arc::new(Admin {
             snapshots: vec![owner, other],

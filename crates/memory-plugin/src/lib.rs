@@ -1,4 +1,6 @@
 //! 有界交互证据与明确偏好；宿主保留管理能力，不发布通用管理服务。
+mod archive;
+pub use archive::{ArchivePolicy, FileEvidenceArchive};
 mod context;
 mod continuity;
 pub use continuity::{MemoryContinuity, MemoryContinuityContext};
@@ -14,6 +16,7 @@ pub use summary::{
     effective_points, validate_summary_points,
 };
 
+use archive::ArchiveConfig;
 pub use context::MemoryContext;
 use eve_memory_api::*;
 use eve_plugin_api::{
@@ -51,6 +54,9 @@ impl MemoryAdmin for MemoryController {
         stored.snapshot(&scope)?;
         Ok(Arc::new(ScopedReader { stored, scope }))
     }
+    fn archive_status(&self) -> MemoryResult<MemoryArchiveStatus> {
+        self.service()?.archive_status()
+    }
     fn import_completed(
         &self,
         scope: &MemoryScope,
@@ -78,18 +84,36 @@ impl MemoryService for ScopedReader {
     fn snapshot(&self) -> MemoryResult<MemorySnapshot> {
         self.stored.snapshot(&self.scope)
     }
+    fn archived(&self, after_revision: u64, limit: usize) -> MemoryResult<ArchivedEvidencePage> {
+        self.stored.archived(&self.scope, after_revision, limit)
+    }
 }
 
 pub struct MemoryPlugin {
     manifest: PluginManifest,
     controller: MemoryController,
+    archive: Option<ArchiveConfig>,
 }
 impl MemoryPlugin {
     pub fn new() -> PluginResult<Self> {
         Ok(Self {
             manifest: PluginManifest::new(MEMORY_PLUGIN_ID, env!("CARGO_PKG_VERSION"))?,
             controller: MemoryController::default(),
+            archive: None,
         })
+    }
+    /// 装配不可变归档存储；热层超过策略阈值时把较早的完成交互移入分块。
+    /// 已经归档过的状态必须继续装配同一存储，否则拒绝启动。
+    pub fn with_archive(
+        mut self,
+        store: Arc<dyn EvidenceArchiveStore>,
+        policy: ArchivePolicy,
+    ) -> PluginResult<Self> {
+        policy
+            .validate()
+            .map_err(|_| PluginError::State("交互记忆归档策略无效".into()))?;
+        self.archive = Some(ArchiveConfig { store, policy });
+        Ok(self)
     }
     pub fn controller(&self) -> MemoryController {
         self.controller.clone()
@@ -102,8 +126,14 @@ impl Plugin for MemoryPlugin {
     fn start(&mut self, context: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         Box::pin(async move {
             let stored = Arc::new(
-                StoredMemory::open(context.clone())
-                    .map_err(|error| PluginError::State(error.to_string()))?,
+                StoredMemory::open(context.clone(), self.archive.clone()).map_err(|error| {
+                    PluginError::State(match error {
+                        MemoryError::Unavailable => {
+                            "交互记忆已有归档分块，但未装配归档存储；未清空".into()
+                        }
+                        error => error.to_string(),
+                    })
+                })?,
             );
             let to_close = stored.clone();
             let controller = self.controller.clone();

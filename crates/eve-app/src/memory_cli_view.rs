@@ -14,6 +14,7 @@ const REFERENCE_LIMIT: usize = 50;
 pub(crate) fn status(snapshot: &MemorySnapshot) -> Value {
     json!({
         "evidence_count": snapshot.evidence.len(),
+        "archived_evidence_count": snapshot.archived_evidence,
         "preference_count": snapshot.preferences.len(),
         "confirmed_count": snapshot.preferences.iter()
             .filter(|value| value.status == PreferenceStatus::Confirmed).count(),
@@ -127,6 +128,27 @@ pub(crate) fn evidence(
             "items": items,
         },
     }))
+}
+
+/// 一页已归档证据；正文同样只在显式开启时给出有界预览。
+pub(crate) fn archived(
+    page: eve_memory_api::ArchivedEvidencePage,
+    after: u64,
+    limit: usize,
+    include_content: bool,
+) -> Value {
+    let rows: Vec<_> = page
+        .evidence
+        .iter()
+        .map(|evidence| evidence_view(evidence, include_content))
+        .collect();
+    json!({
+        "after_revision": after,
+        "limit": limit,
+        "archived": rows,
+        "archived_order": "revision_ascending",
+        "next_after": page.next_after,
+    })
 }
 
 pub(crate) fn scopes(
