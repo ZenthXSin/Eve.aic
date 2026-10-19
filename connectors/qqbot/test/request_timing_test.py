@@ -8,6 +8,7 @@ import semantic_test as semantic
 
 
 class RequestTimingAcceptance(semantic.SemanticAcceptance):
+    panel = semantic.memory_harness.MemoryAcceptance.panel
     for name in dir(semantic.SemanticAcceptance):
         if name.startswith('test_'): locals()[name] = None
     del name
@@ -56,6 +57,61 @@ class RequestTimingAcceptance(semantic.SemanticAcceptance):
         for _, data in events:
             self.assertLessEqual(set(data), {'request', 'phase', 'at_ms', 'elapsed_ms', 'http_status', 'turn'})
         self.assertNotIn(query, self.last_stderr)
+
+    def test_slow_semantic_query_falls_back_before_the_embedding_server_finishes(self):
+        self.seed_interaction('source', semantic.HISTORY)
+        query = '回答简短：合成的慢查询验收'
+        entered, release = threading.Event(), threading.Event()
+        before = len(self.requests)
+        waits = []
+
+        def block_query(body):
+            if body['input'] == [query]:
+                waits.append(time.monotonic())
+                entered.set()
+                if not release.wait(5): raise AssertionError('query gate was not released')
+
+        def verify_primary_precedes_release():
+            try:
+                self.assertTrue(entered.wait(3))
+                self.wait_until(lambda: len(self.requests) > before, 'primary stayed blocked by embeddings')
+                self.assertFalse(release.is_set())
+                self.assertLess(time.monotonic() - waits[0], 2.5)
+                [data] = self.recall_data(self.requests[-1])
+                self.assertEqual(data['retrieval'], 'lexical_fallback')
+                self.assertTrue(data['hits'])
+            finally:
+                release.set()
+
+        self.before_embedding = block_query
+
+        def set_budget_without_restart():
+            self.indexed(2)()
+            code, page = self.panel('/api/plugin-pages/read', {'plugin_id': 'eve.config', 'page_id': 'provider.openai'})
+            self.assertEqual(code, 200)
+            field = next(field for field in page['fields'] if field['id'] == 'semantic_query_timeout_ms')
+            self.assertEqual(field['value'], 5000)
+            self.assertFalse(field['restart_required'])
+            code, saved = self.panel('/api/plugin-pages/save', {'plugin_id': 'eve.config', 'page_id': 'provider.openai',
+                'instance': page['instance'], 'expected_revision': page['revision'], 'values': {'semantic_query_timeout_ms': 250}})
+            self.assertEqual(code, 200)
+            self.assertEqual(saved['restart_required'], [])
+
+        self.semantic_run([*self.checkpoint('indexed'), {'send': self.message('bounded', query)},
+                           *self.checkpoint('primary'), self.wait_reply('bounded'), self.wait_receipt('bounded')],
+                          panel=True,
+                          checkpoints={'indexed': set_budget_without_restart, 'primary': verify_primary_precedes_release},
+                          env={'EVE_TRACE_DIALOGUE_TIMING': '1', 'EVE_SEMANTIC_QUERY_TIMEOUT_MS': '5000',
+                               'EVE_MODELS_SEMANTIC_TIMEOUT_MS': '10000'})
+        self.assertEqual(len(self.requests), before + 1)
+        traces = [json.loads(line.split(' ', 1)[1]) for line in self.last_stderr.splitlines()
+                  if line.startswith('EVE_RECALL_TIMING ')]
+        self.assertEqual([item['phase'] for item in traces], ['embedding_begin', 'embedding_timeout'])
+        self.assertEqual(traces[-1]['budget_ms'], 250)
+        self.assertGreaterEqual(traces[-1]['elapsed_ms'], 200)
+        self.assertLess(traces[-1]['elapsed_ms'], 2000)
+        self.assertNotIn(query, self.last_stderr)
+        self.assertTrue(self.index()['entries'], 'existing index must be preserved')
 
 
 if __name__ == '__main__': unittest.main()

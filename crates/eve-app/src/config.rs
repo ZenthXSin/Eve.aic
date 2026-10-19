@@ -83,6 +83,10 @@ pub(crate) fn openai_schema() -> ConfigSchema {
             ),
             ("semantic_base_url".into(), semantic_base),
             (
+                "semantic_query_timeout_ms".into(),
+                integer(1500, 30_000, "EVE_SEMANTIC_QUERY_TIMEOUT_MS"),
+            ),
+            (
                 "model".into(),
                 string("deepseek-v4.1-flash", "EVE_OPENAI_MODEL"),
             ),

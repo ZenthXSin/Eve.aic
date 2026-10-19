@@ -25,6 +25,8 @@ QQBOT_SANDBOX=true ./target/debug/eve-qqbot --state-dir .eve-qqbot
 
 语义召回默认沿用主模型的端点和凭据。若对话与向量模型分属不同服务，可在面板“插件页面 → 主模型连接”设置 `provider.openai.semantic_base_url`（环境变量 `EVE_OPENAI_SEMANTIC_BASE_URL`），并把 `runtime.models.semantic_credential_ref` 设为 `env:EVE_SEMANTIC_API_KEY`，由宿主环境提供独立密钥 `EVE_SEMANTIC_API_KEY`。端点为空表示沿用主模型；凭据引用为空或 `env:EVE_OPENAI_API_KEY` 时沿用主模型密钥。独立凭据缺失、引用不受支持或端点无效时在连接 QQ 前拒绝启动，不静默换用别的凭据。语义提供者在启动时捕获，修改后须重启；端点字段在面板标注需重启。配置只保存端点及凭据引用，不保存密钥；重启保留原记忆、索引和失败记录，不重放旧消息或工具操作。
 
+在线语义查询会先于主对话请求执行，因此使用独立的短等待预算：面板“主模型连接”的 `semantic_query_timeout_ms` 默认 1500 毫秒、范围 1 至 30000，环境变量 `EVE_SEMANTIC_QUERY_TIMEOUT_MS`。保存后下一次查询生效，无需重启。超时取消本地等待，改用同一可信作用域的词项召回，有命中时明确标记 `lexical_fallback`；不会自动重试或把迟到结果补入本轮。后台建索引继续使用原向量模型超时，已有记忆、索引和历史保留。该预算只限制在线查询的向量等待，不承诺整轮回复时间，也不代表远端一定取消计费。
+
 手机可在 [GitHub Actions Secrets](https://github.com/ZenthXSin/Eve.aic/settings/secrets/actions) 添加 `QQBOT_APP_SECRET`；已有模型 Secret 继续使用。代码合入 main 后，在 [QQBot 首次真实交互](https://github.com/ZenthXSin/Eve.aic/actions/workflows/qqbot-interaction.yml) 点击 Run workflow，默认沙箱与 300 秒窗口；日志出现窗口启动后，向测试机器人私聊或在测试群 @ 发送文字。至少一次接收、模型完成和 QQ 成功发送且没有失败，报告才判定通过。超时退出不等于成功交互。
 
 这只是工作流测试，没有部署到测试服务器。托管 Runner 的临时状态在任务结束后清理，不是持续运行的机器人宿主；长期运行应使用持久目录与进程管理。首次真实交互工作流只上传无正文计数；专用训练工作流另以加密包保存交流证据和状态，见[主动提问训练](./主动提问训练.md)。
