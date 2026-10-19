@@ -260,6 +260,7 @@ impl Harness {
             app_id: "app".into(),
             app_secret: "test-app-secret".into(),
             sandbox: true,
+            markdown: false,
         })
         .unwrap()
         .with_segmenter(planner, LIMITS)

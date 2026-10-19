@@ -246,6 +246,7 @@ impl Harness {
             app_id: "app".into(),
             app_secret: "test-app-secret".into(),
             sandbox: true,
+            markdown: false,
         })
         .unwrap();
         plugin = plugin.with_command_handler(Arc::new(ReadOnlyHandler(

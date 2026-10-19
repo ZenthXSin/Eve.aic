@@ -154,6 +154,13 @@ test("固定默认 AppID，仅密钥必填，sandbox 与最小 intent", () => {
   assert.throws(() => optionsFromEnv({}));
   assert.throws(() => optionsFromEnv({ QQBOT_APP_SECRET: "test", QQBOT_SANDBOX: "yes" }));
 });
+test("markdown 默认关闭，仅在显式 true 时开启，非法值拒绝启动", () => {
+  assert.equal(optionsFromEnv({ QQBOT_APP_SECRET: "test-only" }).markdownSupport, false);
+  assert.equal(optionsFromEnv({ QQBOT_APP_SECRET: "test-only", QQBOT_MARKDOWN: "" }).markdownSupport, false);
+  assert.equal(optionsFromEnv({ QQBOT_APP_SECRET: "test-only", QQBOT_MARKDOWN: "false" }).markdownSupport, false);
+  assert.equal(optionsFromEnv({ QQBOT_APP_SECRET: "test-only", QQBOT_MARKDOWN: "true" }).markdownSupport, true);
+  assert.throws(() => optionsFromEnv({ QQBOT_APP_SECRET: "test", QQBOT_MARKDOWN: "1" }));
+});
 for (const scope of ["c2c", "group"]) test(scope + " 回复只能使用原目标与 msg_id", async () => {
   const f = fixture(); f.message(scope);
   assert.equal(f.frames[0].user_id, "user-1");

@@ -80,7 +80,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-mindustry-json-rules 目录] [--practice-python 程序] [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-mindustry-json-rules 目录] [--practice-python 程序] [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--markdown] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -126,6 +126,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 EVE_DEVELOPER_CONFIG 指定独立开发工具 JSON：源码工作区、操作者、命令/GitHub/升级开关与 token 环境引用；未配置时不注册。命令以宿主权限执行，仅供明确操作者；不是 QQ 测试环境开关。/help tools 查看实际已装配能力。
 明确偏好只用于本会话后续聊天，原始经历与修正历史保留；内部反思不读取聊天偏好。
 --segmented 把模型回复按自然段分成至多 3 条消息，段间停顿至多 2.5 秒；命令确认整条发送。
+--markdown 让被动回复与主动私聊以 markdown 消息（msg_type=2）发送，需要机器人已通过平台 Markdown 权限审核；未审核时平台会拒绝发送，默认关闭。
 /segment 查看本会话分段；/segment on|off|reset、/segment parts 2至5、/segment pace 0至200（%）按会话保存，从下一条回复生效。
 /segment suggestions [页码] 从本会话已确认偏好查看节奏建议；/segment adopt 偏好ID 版本 明确采用，需同时 --memory 与 --segmented。
 分段前重新核对当前代：/cancel、/add、/correct 后不再发送剩余片段；已发片段不撤回、重启不补发。
@@ -200,6 +201,8 @@ pub struct QqBotOptions {
     /// 预算窗口长度（小时）；未提供时为 24。
     pub autonomy_budget_window_hours: Option<u64>,
     pub segmented: bool,
+    /// 机器人拥有平台审核通过的 Markdown 权限时，被动回复与主动私聊改用 markdown 消息。
+    pub markdown: bool,
     pub message_judge: MessageJudgeMode,
     pub web_listen: Option<std::net::SocketAddr>,
     pub cognition_max_executions: u16,
@@ -248,6 +251,7 @@ impl Default for QqBotOptions {
             autonomy_budget: None,
             autonomy_budget_window_hours: None,
             segmented: false,
+            markdown: false,
             message_judge: MessageJudgeMode::Off,
             web_listen: None,
             cognition_max_executions: 32,
@@ -288,6 +292,10 @@ impl QqBotOptions {
             }
             if arg == "--segmented" {
                 options.segmented = true;
+                continue;
+            }
+            if arg == "--markdown" {
+                options.markdown = true;
                 continue;
             }
             if arg == "--self-learning" {
@@ -885,6 +893,7 @@ async fn run_qqbot_composed(
             app_id: std::env::var("QQBOT_APP_ID").unwrap_or_else(|_| DEFAULT_QQBOT_APP_ID.into()),
             app_secret,
             sandbox,
+            markdown: options.markdown,
         })?
         .with_training()?
         .with_participant_observer(Arc::new(crate::qq_people::Observer(people.clone())))
@@ -2755,6 +2764,13 @@ mod recall_options_tests {
         ])
         .unwrap();
         assert!(practice.plans);
+    }
+
+    #[test]
+    fn markdown_is_opt_in_and_off_by_default() {
+        assert!(!parse(&[]).unwrap().markdown);
+        assert!(!parse(&["--segmented"]).unwrap().markdown);
+        assert!(parse(&["--markdown"]).unwrap().markdown);
     }
 
     #[test]

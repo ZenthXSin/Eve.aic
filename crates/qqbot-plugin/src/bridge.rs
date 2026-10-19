@@ -532,6 +532,10 @@ pub(crate) async fn run(
             "QQBOT_SANDBOX",
             if config.sandbox { "true" } else { "false" },
         )
+        .env(
+            "QQBOT_MARKDOWN",
+            if config.markdown { "true" } else { "false" },
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
