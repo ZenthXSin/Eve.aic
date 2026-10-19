@@ -4,6 +4,7 @@ mod background_embeddings;
 mod indexer;
 mod items;
 mod recall;
+mod segments;
 mod store;
 mod strict_json;
 
@@ -15,6 +16,7 @@ use eve_plugin_api::{
 use eve_semantic_api::EmbeddingProfile;
 pub use indexer::{IndexStatus, IndexStepError, Indexer};
 pub use recall::{HybridRecall, MIN_SIMILARITY};
+pub use segments::{SEGMENT_EVIDENCE, SegmentError, SegmentStore};
 use std::sync::{Arc, Mutex};
 use store::StoredIndex;
 pub use store::{IndexEntry, IndexError, MAX_ENTRIES, SEMANTIC_PLUGIN_ID, SEMANTIC_STATE_KEY};
@@ -23,8 +25,13 @@ pub use store::{IndexEntry, IndexError, MAX_ENTRIES, SEMANTIC_PLUGIN_ID, SEMANTI
 #[derive(Clone, Default)]
 pub struct SemanticIndex {
     active: Arc<Mutex<Option<Arc<StoredIndex>>>>,
+    /// 归档记忆的向量分段；未装配时只为热层建索引。
+    segments: Option<Arc<SegmentStore>>,
 }
 impl SemanticIndex {
+    pub(crate) fn segments(&self) -> Option<&Arc<SegmentStore>> {
+        self.segments.as_ref()
+    }
     fn service(&self) -> Result<Arc<StoredIndex>, IndexError> {
         self.active
             .lock()
@@ -58,6 +65,11 @@ impl SemanticPlugin {
     }
     pub fn index(&self) -> SemanticIndex {
         self.index.clone()
+    }
+    /// 装配归档记忆的向量分段目录：已归档的旧原文也建索引、参与语义召回。
+    pub fn with_segments(mut self, segments: Arc<SegmentStore>) -> Self {
+        self.index.segments = Some(segments);
+        self
     }
 }
 impl Plugin for SemanticPlugin {

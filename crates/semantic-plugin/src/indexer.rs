@@ -2,13 +2,12 @@
 //! 已不再可召回的条目（例如撤销的偏好）一并移出。先请求向量，成功后一次提交；请求失败不写入。
 use crate::{
     SemanticIndex,
-    items::{content_hash, items, prefix, scope_key},
+    items::{content_hash, embed_input, layout, scope_key},
+    segments::{SegmentError, SegmentKey, content_key, profile_key},
     store::{IndexEntry, IndexError},
 };
 use eve_memory_api::MemoryAdmin;
-use eve_semantic_api::{
-    EmbeddingError, EmbeddingProvider, MAX_EMBED_BATCH, MAX_EMBED_INPUT_BYTES, QuantizedVector,
-};
+use eve_semantic_api::{EmbeddingError, EmbeddingProvider, MAX_EMBED_BATCH, QuantizedVector};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -43,6 +42,8 @@ struct Pending {
 
 struct Plan {
     pending: Vec<Pending>,
+    /// 尚未写出向量分段的归档段及其条目。
+    blocks: Vec<(SegmentKey, Vec<Pending>)>,
     stale: Vec<(String, String)>,
     indexed: usize,
 }
@@ -68,21 +69,23 @@ impl Indexer {
             .filter(|entry| entry.belongs_to(profile))
             .map(|entry| ((entry.scope, entry.item), entry.content_sha256))
             .collect();
+        let segments = self.index.segments();
         let mut wanted = BTreeSet::new();
         let mut pending = Vec::new();
+        let mut blocks = Vec::new();
         let mut indexed = 0;
         for scope in self.memory.scopes().map_err(|_| IndexStepError::Memory)? {
-            let snapshot = self
+            let reader = self
                 .memory
                 .reader(scope.clone())
-                .and_then(|reader| reader.snapshot())
                 .map_err(|_| IndexStepError::Memory)?;
+            let layout =
+                layout(reader.as_ref(), segments.is_some()).map_err(|_| IndexStepError::Memory)?;
             let key = scope_key(&scope);
-            for item in items(&snapshot).map_err(|_| IndexStepError::Memory)? {
-                let input = prefix(&item.text, MAX_EMBED_INPUT_BYTES).trim().to_string();
-                if input.is_empty() || input.contains('\0') {
+            for item in layout.ledger {
+                let Some(input) = embed_input(&item) else {
                     continue;
-                }
+                };
                 let hash = content_hash(&input);
                 wanted.insert((key.clone(), item.key.clone()));
                 if current.get(&(key.clone(), item.key.clone())) == Some(&hash) {
@@ -96,6 +99,47 @@ impl Indexer {
                     });
                 }
             }
+            let Some(segments) = segments else {
+                continue;
+            };
+            for block in layout.blocks {
+                let items: Vec<Pending> = block
+                    .items
+                    .into_iter()
+                    .filter_map(|item| {
+                        let input = embed_input(&item)?;
+                        Some(Pending {
+                            scope: key.clone(),
+                            content_sha256: content_hash(&input),
+                            item: item.key,
+                            input,
+                        })
+                    })
+                    .collect();
+                let pairs: Vec<(String, String)> = items
+                    .iter()
+                    .map(|item| (item.item.clone(), item.content_sha256.clone()))
+                    .collect();
+                let segment = SegmentKey {
+                    profile: profile_key(profile),
+                    scope: key.clone(),
+                    first_revision: block.first_revision,
+                    last_revision: block.last_revision,
+                    content: content_key(&pairs),
+                };
+                if segments
+                    .contains(&segment)
+                    .map_err(|_| IndexStepError::Memory)?
+                {
+                    indexed += items.len();
+                } else {
+                    // 分段写出之前，这些条目若已在 index.v1 中就继续保留，召回不出现空档。
+                    for item in &items {
+                        wanted.insert((item.scope.clone(), item.item.clone()));
+                    }
+                    blocks.push((segment, items));
+                }
+            }
         }
         let stale = current
             .into_keys()
@@ -103,6 +147,7 @@ impl Indexer {
             .collect();
         Ok(Plan {
             pending,
+            blocks,
             stale,
             indexed,
         })
@@ -112,47 +157,87 @@ impl Indexer {
         let plan = self.plan()?;
         Ok(IndexStatus {
             indexed: plan.indexed,
-            pending: plan.pending.len(),
+            pending: plan.pending.len()
+                + plan
+                    .blocks
+                    .iter()
+                    .map(|(_, items)| items.len())
+                    .sum::<usize>(),
         })
     }
 
-    /// 至多一次向量请求。返回本次新写入的条数；没有待处理条目且没有过期条目时为 0 且不写入。
+    async fn embed(
+        &self,
+        batch: Vec<Pending>,
+        now_ms: u64,
+    ) -> Result<Vec<IndexEntry>, IndexStepError> {
+        let inputs: Vec<String> = batch.iter().map(|item| item.input.clone()).collect();
+        let vectors = self
+            .embedder
+            .embed(&inputs)
+            .await
+            .map_err(IndexStepError::Embedding)?;
+        eve_semantic_api::validate_vectors(self.embedder.profile(), inputs.len(), &vectors)
+            .map_err(IndexStepError::Embedding)?;
+        let profile = self.embedder.profile();
+        let mut entries = Vec::with_capacity(batch.len());
+        for (item, vector) in batch.into_iter().zip(vectors) {
+            let quantized = QuantizedVector::quantize(&vector)
+                .ok_or(IndexStepError::Embedding(EmbeddingError::InvalidOutput))?;
+            entries.push(IndexEntry {
+                model: profile.model.clone(),
+                dimensions: profile.dimensions,
+                scope: item.scope,
+                item: item.item,
+                content_sha256: item.content_sha256,
+                scale: quantized.scale,
+                vector: quantized.to_hex(),
+                indexed_at_ms: now_ms.max(1),
+            });
+        }
+        Ok(entries)
+    }
+
+    /// 热层条目优先：至多一次向量请求。热层都已建好时，为一段归档证据建索引并写出分段：
+    /// 分批请求，全部成功才写出，任何一批失败都不写入。返回本次新写入的条数。
     pub async fn step(&self, now_ms: u64) -> Result<usize, IndexStepError> {
         let plan = self.plan()?;
         let batch: Vec<Pending> = plan.pending.into_iter().take(MAX_EMBED_BATCH).collect();
-        if batch.is_empty() && plan.stale.is_empty() {
+        if !batch.is_empty() || !plan.stale.is_empty() {
+            let upserts = if batch.is_empty() {
+                vec![]
+            } else {
+                self.embed(batch, now_ms).await?
+            };
+            let written = upserts.len();
+            self.index
+                .apply(self.embedder.profile(), upserts, plan.stale)
+                .map_err(IndexStepError::Index)?;
+            return Ok(written);
+        }
+        let Some((segment, items)) = plan.blocks.into_iter().next() else {
             return Ok(0);
+        };
+        let segments = self
+            .index
+            .segments()
+            .ok_or(IndexStepError::Index(IndexError::Unavailable))?;
+        let mut entries = Vec::with_capacity(items.len());
+        let mut items = items.into_iter().peekable();
+        while items.peek().is_some() {
+            let batch: Vec<Pending> = items.by_ref().take(MAX_EMBED_BATCH).collect();
+            entries.extend(self.embed(batch, now_ms).await?);
         }
-        let mut upserts = Vec::new();
-        if !batch.is_empty() {
-            let inputs: Vec<String> = batch.iter().map(|item| item.input.clone()).collect();
-            let vectors = self
-                .embedder
-                .embed(&inputs)
-                .await
-                .map_err(IndexStepError::Embedding)?;
-            eve_semantic_api::validate_vectors(self.embedder.profile(), inputs.len(), &vectors)
-                .map_err(IndexStepError::Embedding)?;
-            let profile = self.embedder.profile();
-            for (item, vector) in batch.into_iter().zip(vectors) {
-                let quantized = QuantizedVector::quantize(&vector)
-                    .ok_or(IndexStepError::Embedding(EmbeddingError::InvalidOutput))?;
-                upserts.push(IndexEntry {
-                    model: profile.model.clone(),
-                    dimensions: profile.dimensions,
-                    scope: item.scope,
-                    item: item.item,
-                    content_sha256: item.content_sha256,
-                    scale: quantized.scale,
-                    vector: quantized.to_hex(),
-                    indexed_at_ms: now_ms.max(1),
-                });
-            }
-        }
-        let written = upserts.len();
-        self.index
-            .apply(self.embedder.profile(), upserts, plan.stale)
-            .map_err(IndexStepError::Index)?;
+        let written = entries.len();
+        segments
+            .put(self.embedder.profile(), &segment, entries)
+            .map_err(|error| {
+                IndexStepError::Index(match error {
+                    SegmentError::Storage => IndexError::Storage,
+                    SegmentError::CorruptState => IndexError::CorruptState,
+                    SegmentError::InvalidInput => IndexError::InvalidInput,
+                })
+            })?;
         Ok(written)
     }
 }

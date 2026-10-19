@@ -1336,7 +1336,12 @@ async fn run_qqbot_composed(
         };
         // 语义索引账本同样先于通道加载；损坏时拒绝启动并保留原字节。
         let semantic = if options.semantic_recall {
-            let plugin = SemanticPlugin::new()?;
+            // 已归档的旧原文也建索引：它们的向量写成状态目录下独立的压缩分段，不进入状态文件。
+            let segments = eve_semantic_plugin::SegmentStore::open(
+                options.state_directory.join("semantic-archive"),
+            )
+            .map_err(|_| "语义归档分段目录不可用")?;
+            let plugin = SemanticPlugin::new()?.with_segments(Arc::new(segments));
             let index = plugin.index();
             kernel.register(Box::new(plugin))?;
             kernel.start(&PluginId::new(SEMANTIC_PLUGIN_ID)?).await?;
