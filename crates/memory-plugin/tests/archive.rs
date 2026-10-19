@@ -303,9 +303,14 @@ async fn restart_keeps_archive_and_missing_or_tampered_chunks_are_never_skipped(
         (before, chunks)
     };
     drop(state);
-    // 格式 2 由新程序写出；旧格式读取器遇到它按未知版本拒绝。
+    // 新分块都经无损压缩，文档写格式 3；旧读取器遇到它按未知版本拒绝。
     let raw = support::raw_state(state_dir.path(), MEMORY_PLUGIN_ID, MEMORY_STATE_KEY);
-    assert!(raw.contains("\"format_version\":2"), "{raw}");
+    assert!(raw.contains("\"format_version\":3"), "{raw}");
+    assert!(raw.contains("\"compressed\":true"), "{raw}");
+    assert!(
+        chunks.iter().all(|name| name.ends_with(".json.zz")),
+        "{chunks:?}"
+    );
 
     let state = RecordingStore::open(state_dir.path());
     let rig = start(
@@ -787,4 +792,164 @@ async fn full_scope_capacity_refuses_new_scopes_without_writing_and_keeps_existi
         2
     );
     stop(rig).await;
+}
+
+/// 把状态目录里本插件的热层文档读成 JSON，或写回。
+fn read_document(directory: &Path) -> serde_json::Value {
+    serde_json::from_str(&support::raw_state(
+        directory,
+        MEMORY_PLUGIN_ID,
+        MEMORY_STATE_KEY,
+    ))
+    .unwrap()
+}
+fn write_document(directory: &Path, document: &serde_json::Value) {
+    let path = directory.join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    state["entries"][MEMORY_PLUGIN_ID][MEMORY_STATE_KEY] =
+        serde_json::to_value(serde_json::to_vec(document).unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+}
+fn sha256(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn compressed_archives_stay_part_of_memory_and_old_plain_chunks_still_read() {
+    use std::io::Read;
+    let state_dir = tempfile::tempdir().unwrap();
+    let archive_dir = tempfile::tempdir().unwrap();
+    let owner = scope("whole");
+    let state = RecordingStore::open(state_dir.path());
+    let rig = start(
+        Some(state.clone()),
+        Some((flaky(archive_dir.path()), small_policy())),
+    )
+    .await
+    .unwrap();
+    for number in 1..=12 {
+        import(&rig, &owner, number).unwrap();
+    }
+    let reader = rig.admin.reader(owner.clone()).unwrap();
+    let hot = reader.snapshot().unwrap();
+    assert!(hot.archived_evidence >= 4);
+    // 完整记忆：热层与归档按修订合并，一条不少、原文不变，看起来与从未归档一样。
+    let complete = reader.complete_snapshot().unwrap();
+    assert_eq!(complete.archived_evidence, 0);
+    assert_eq!(complete.revision, hot.revision);
+    assert_eq!(
+        complete
+            .evidence
+            .iter()
+            .map(|e| e.revision)
+            .collect::<Vec<_>>(),
+        (1..=12).collect::<Vec<u64>>()
+    );
+    for (index, item) in complete.evidence.iter().enumerate() {
+        assert_eq!(completed_texts(item), texts(&owner, index + 1));
+    }
+    // 召回能找到已经归档的旧原文。
+    let archived = complete
+        .evidence
+        .iter()
+        .find(|e| !hot.evidence.iter().any(|h| h.id == e.id))
+        .unwrap();
+    let recall = LexicalMemoryRecall::new(Arc::new(rig.admin.clone()))
+        .reader(owner.clone())
+        .unwrap()
+        .recall(&MemoryRecallRequest {
+            query: completed_texts(archived).0,
+            limit: 8,
+        })
+        .unwrap();
+    assert!(recall.hits.iter().any(|hit| matches!(
+        &hit.source,
+        MemoryRecallSource::CompletedInteraction { evidence_id, .. } if evidence_id == &archived.id
+    )));
+    stop(rig).await;
+    drop(state);
+
+    // 压缩是无损的，且比原 JSON 小。
+    let document = read_document(state_dir.path());
+    let mut raw_total = 0;
+    let mut stored_total = 0;
+    for chunk in document["scopes"][0]["archive"].as_array().unwrap() {
+        assert_eq!(chunk["compressed"], true);
+        let name = format!(
+            "evidence-{:010}-{}.json.zz",
+            chunk["sequence"].as_u64().unwrap(),
+            chunk["sha256"].as_str().unwrap()
+        );
+        let stored = std::fs::read(archive_dir.path().join(name)).unwrap();
+        let mut raw = Vec::new();
+        flate2::read::ZlibDecoder::new(stored.as_slice())
+            .read_to_end(&mut raw)
+            .unwrap();
+        raw_total += raw.len();
+        stored_total += stored.len();
+    }
+    assert!(stored_total < raw_total, "{stored_total} >= {raw_total}");
+
+    // 模拟 #222 时期的状态：分块都是未压缩 JSON、文档格式 2。重启后照常完整可读。
+    let mut document = read_document(state_dir.path());
+    for chunk in document["scopes"][0]["archive"].as_array_mut().unwrap() {
+        let old_name = format!(
+            "evidence-{:010}-{}.json.zz",
+            chunk["sequence"].as_u64().unwrap(),
+            chunk["sha256"].as_str().unwrap()
+        );
+        let stored = std::fs::read(archive_dir.path().join(&old_name)).unwrap();
+        let mut plain = Vec::new();
+        flate2::read::ZlibDecoder::new(stored.as_slice())
+            .read_to_end(&mut plain)
+            .unwrap();
+        let sha = sha256(&plain);
+        std::fs::write(
+            archive_dir.path().join(format!(
+                "evidence-{:010}-{sha}.json",
+                chunk["sequence"].as_u64().unwrap()
+            )),
+            &plain,
+        )
+        .unwrap();
+        std::fs::remove_file(archive_dir.path().join(old_name)).unwrap();
+        let object = chunk.as_object_mut().unwrap();
+        object.remove("compressed");
+        object.insert("sha256".into(), sha.into());
+        object.insert("bytes".into(), plain.len().into());
+    }
+    document["format_version"] = 2.into();
+    write_document(state_dir.path(), &document);
+    let state = RecordingStore::open(state_dir.path());
+    let rig = start(
+        Some(state.clone()),
+        Some((flaky(archive_dir.path()), small_policy())),
+    )
+    .await
+    .unwrap();
+    let reader = rig.admin.reader(owner.clone()).unwrap();
+    assert!(reader.complete_snapshot().unwrap() == complete);
+    // 之后新归档的分块照常压缩；新旧分块合起来仍是完整记忆。
+    for number in 13..=20 {
+        import(&rig, &owner, number).unwrap();
+    }
+    assert_complete(&rig.admin, &owner, 20);
+    let complete = reader.complete_snapshot().unwrap();
+    assert_eq!(complete.evidence.len(), 20);
+    stop(rig).await;
+    drop(state);
+    let document = read_document(state_dir.path());
+    assert_eq!(document["format_version"], 3);
+    let archive = document["scopes"][0]["archive"].as_array().unwrap();
+    assert!(
+        archive
+            .iter()
+            .any(|chunk| chunk.get("compressed").is_none())
+    );
+    assert!(archive.iter().any(|chunk| chunk["compressed"] == true));
 }

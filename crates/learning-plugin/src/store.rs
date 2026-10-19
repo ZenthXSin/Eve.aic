@@ -582,9 +582,10 @@ fn validate_memory(memory: &MemorySnapshot) -> LearningResult<()> {
         .scope
         .validate()
         .map_err(|_| LearningError::InvalidInput)?;
-    if memory.evidence.len() > eve_memory_api::MAX_EVIDENCE
+    // 完整记忆可以超过热层容量；只核对修订不少于证据条数且有界。
+    if memory.evidence.len() as u64 > memory.revision
         || memory.revision
-            > (eve_memory_api::MAX_EVIDENCE + eve_memory_api::MAX_HISTORY) as u64
+            > (memory.evidence.len() + eve_memory_api::MAX_HISTORY) as u64
                 + memory.archived_evidence
     {
         return Err(LearningError::InvalidInput);

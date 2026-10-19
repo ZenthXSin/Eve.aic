@@ -42,7 +42,8 @@ impl ScopedLexicalRecall {
 impl MemoryRecallService for ScopedLexicalRecall {
     fn recall(&self, request: &MemoryRecallRequest) -> MemoryResult<MemoryRecallResponse> {
         request.validate()?;
-        let snapshot = self.memory.snapshot()?;
+        // 归档只是存储形式：召回在完整记忆中查找，旧原文同样可以被找到。
+        let snapshot = self.memory.complete_snapshot()?;
         validate_snapshot(&snapshot, &self.scope).map_err(|_| MemoryError::CorruptState)?;
         let query = Query::new(&request.query);
         let mut candidates = Vec::new();
@@ -151,10 +152,11 @@ pub(crate) fn validate_snapshot(
     scope: &MemoryScope,
 ) -> MemoryResult<()> {
     snapshot.scope.validate()?;
+    // 完整记忆可以超过热层容量；修订与证据、历史条数的一致性在下面逐项核对。
     if &snapshot.scope != scope
-        || snapshot.evidence.len() > MAX_EVIDENCE
         || snapshot.preferences.len() > MAX_PREFERENCES
-        || snapshot.revision > (MAX_EVIDENCE + MAX_HISTORY) as u64 + snapshot.archived_evidence
+        || snapshot.revision
+            > (snapshot.evidence.len() + MAX_HISTORY) as u64 + snapshot.archived_evidence
     {
         return Err(MemoryError::CorruptState);
     }

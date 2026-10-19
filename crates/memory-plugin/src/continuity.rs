@@ -76,7 +76,7 @@ impl MemoryContinuityReader for Reader {
                 .service
                 .memory
                 .reader(grant.scope.clone())?
-                .snapshot()?;
+                .complete_snapshot()?;
             validate_snapshot(&snapshot, &grant.scope)?;
             let mut preferences = Vec::new();
             for preference in snapshot
