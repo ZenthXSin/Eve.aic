@@ -77,6 +77,7 @@ fn stage(kind: &TurnEventKind) -> &'static str {
         TurnEventKind::ResponseCompleted { .. } => "response",
         TurnEventKind::ToolBatchStarted { .. } => "batch",
         TurnEventKind::ToolResult { .. } => "tool",
+        TurnEventKind::ToolProgress { .. } => "progress",
         TurnEventKind::TurnCompleted { .. } => "completed",
         TurnEventKind::SessionSaved => "saved",
         TurnEventKind::Failed { .. } => "failed",

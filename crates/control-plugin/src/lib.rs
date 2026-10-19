@@ -389,9 +389,9 @@ impl TurnEventSink for GenerationSink {
                     TurnEventKind::ProviderStarted { .. }
                     | TurnEventKind::TextDelta { .. }
                     | TurnEventKind::ResponseCompleted { .. } => ControlPhase::Generating,
-                    TurnEventKind::ToolBatchStarted { .. } | TurnEventKind::ToolResult { .. } => {
-                        ControlPhase::Tools
-                    }
+                    TurnEventKind::ToolBatchStarted { .. }
+                    | TurnEventKind::ToolResult { .. }
+                    | TurnEventKind::ToolProgress { .. } => ControlPhase::Tools,
                     TurnEventKind::TurnCompleted { .. }
                     | TurnEventKind::SessionSaved
                     | TurnEventKind::Failed { .. } => ControlPhase::Committing,

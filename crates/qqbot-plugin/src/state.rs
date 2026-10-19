@@ -9,7 +9,7 @@ const MAX_RECORDS: usize = 4096;
 // ControlInput.task_id adds "qq:" to the platform message ID (256-byte limit).
 const MAX_MESSAGE_ID_BYTES: usize = 253;
 // 至多 8 个片段的范围与状态及规划器标识序列化后的上限。
-const SEGMENT_RESERVE: usize = 512;
+const SEGMENT_RESERVE: usize = 20 * 1024;
 pub(crate) fn valid_id(v: &str) -> bool {
     !v.is_empty()
         && v.len() <= 128
@@ -180,8 +180,16 @@ pub(crate) struct Receipt {
     pub reply: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segments: Option<Segments>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub progress: Vec<Progress>,
 }
-/// 格式 1 不含片段；出现分段回执时整体写为格式 2，旧版本拒绝读取而不是忽略片段。
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Progress {
+    pub text: String,
+    pub state: PartState,
+}
+/// 格式 1 不含片段，2 包含分段，3 包含途中进展。旧版本拒绝读取而不是忽略投递记录。
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Ledger {
@@ -221,6 +229,17 @@ impl Ledger {
                 || entry.segments.as_ref().is_some_and(|segments| {
                     !valid_segments(segments, entry.reply.as_deref(), entry.state)
                 })
+                || entry.progress.len() > 3
+                || entry.progress.iter().any(|p| {
+                    p.text.trim().is_empty()
+                        || p.text.len() > 1024
+                        || !matches!(
+                            p.state,
+                            PartState::Sending | PartState::Sent | PartState::Failed
+                        )
+                })
+                || entry.progress.len() + entry.segments.as_ref().map_or(1, |s| s.parts.len())
+                    > crate::QQ_MAX_SEGMENTS
             {
                 return Err(corrupt());
             }
@@ -228,7 +247,9 @@ impl Ledger {
         Ok(ledger)
     }
     fn format(&self) -> u8 {
-        if self.entries.iter().any(|e| e.segments.is_some()) {
+        if self.entries.iter().any(|e| !e.progress.is_empty()) {
+            3
+        } else if self.entries.iter().any(|e| e.segments.is_some()) {
             2
         } else {
             1
@@ -258,6 +279,7 @@ impl Ledger {
             state: ReceiptState::Processing,
             reply: None,
             segments: None,
+            progress: vec![],
         });
         let bytes = self.encode()?;
         // 预留最大回复转义后的大小与片段记录。
@@ -320,6 +342,7 @@ mod tests {
                 text: "你好".into(),
             },
             state,
+            progress: vec![],
             reply: (state != ReceiptState::Processing).then(|| REPLY.into()),
             segments: parts.map(|parts| Segments {
                 planner: "paragraph-v1".into(),
@@ -367,6 +390,30 @@ mod tests {
         }
         let plain = round_trip(receipt(ReceiptState::Sent, None)).unwrap();
         assert_eq!(plain.version, 1);
+    }
+
+    #[test]
+    fn progress_round_trips_without_becoming_a_success_and_preserves_unknown_delivery() {
+        for state in [Sending, Sent, Failed] {
+            let mut entry = receipt(ReceiptState::Processing, None);
+            entry.progress.push(Progress {
+                text: "资料检索已返回结果。".into(),
+                state,
+            });
+            let ledger = round_trip(entry).unwrap();
+            assert_eq!(ledger.version, 3);
+            assert_eq!(ledger.entries[0].state, ReceiptState::Processing);
+            assert_eq!(ledger.entries[0].progress[0].state, state);
+            assert!(ledger.entries[0].reply.is_none());
+        }
+        let mut entry = receipt(ReceiptState::Sent, Some(&[Sent, Sent, Sent]));
+        for _ in 0..3 {
+            entry.progress.push(Progress {
+                text: "回执".into(),
+                state: Sent,
+            });
+        }
+        assert!(round_trip(entry).is_err(), "进度加分段不得突破 QQ 五次配额");
     }
 
     #[test]

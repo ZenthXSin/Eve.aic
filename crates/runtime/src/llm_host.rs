@@ -42,6 +42,10 @@ pub struct LlmHostConfig {
     pub max_parallel_tool_calls: usize,
     /// 0 表示不限制工具批次数；正数为本轮显式上限。取消、预算及超时仍独立生效。
     pub max_tool_rounds: usize,
+    /// 每轮按单个调用计数（含失败、拒绝），并行批次不折算为一次。
+    pub max_tool_calls: usize,
+    /// 基于已返回的工具结果报告至多三个里程碑，不包含工具参数或结果正文。
+    pub tool_progress_reports: bool,
     /// 批次用尽后的处理：false 时本轮以 RoundLimit 失败；true 时再请求一次且不提供工具，
     /// 让模型只依据已有工具结果作答（仍要求工具调用时才以 RoundLimit 失败）。
     pub final_answer_on_round_limit: bool,
@@ -64,6 +68,8 @@ impl Default for LlmHostConfig {
             tool_cancellation_grace: Duration::from_millis(100),
             max_parallel_tool_calls: 10,
             max_tool_rounds: 1,
+            max_tool_calls: 50,
+            tool_progress_reports: false,
             final_answer_on_round_limit: false,
             response_mode: ResponseMode::Complete,
             event_timeout: Duration::from_secs(5),
@@ -85,6 +91,8 @@ impl std::fmt::Debug for LlmHostConfig {
             .field("tool_cancellation_grace", &self.tool_cancellation_grace)
             .field("max_parallel_tool_calls", &self.max_parallel_tool_calls)
             .field("max_tool_rounds", &self.max_tool_rounds)
+            .field("max_tool_calls", &self.max_tool_calls)
+            .field("tool_progress_reports", &self.tool_progress_reports)
             .field(
                 "final_answer_on_round_limit",
                 &self.final_answer_on_round_limit,
@@ -137,6 +145,7 @@ impl LlmHostConfig {
             || self.tool_timeout.is_zero()
             || self.tool_cancellation_grace.is_zero()
             || self.max_parallel_tool_calls == 0
+            || self.max_tool_calls == 0
         {
             return Err(LlmError::Configuration(
                 "timeouts and concurrency must be positive".into(),
@@ -632,6 +641,7 @@ impl LlmHost {
         let mut seen_calls = HashSet::new();
         // 批次用尽后模型仍要调用工具时进入收尾：本批不执行，只再请求一次且不提供工具。
         let mut closing = false;
+        let mut progress_reports = 0;
         loop {
             let response = match self
                 .complete(
@@ -666,8 +676,15 @@ impl LlmHost {
             let ModelResponse::ToolCalls { calls } = response else {
                 unreachable!()
             };
-            if self.config.max_tool_rounds != 0
-                && diagnostics.tool_batches >= self.config.max_tool_rounds
+            let calls_exhausted = calls.len()
+                > self
+                    .config
+                    .max_tool_calls
+                    .saturating_sub(diagnostics.calls.len());
+            if closing
+                || calls_exhausted
+                || (self.config.max_tool_rounds != 0
+                    && diagnostics.tool_batches >= self.config.max_tool_rounds)
             {
                 if closing || !self.config.final_answer_on_round_limit {
                     return Err(fail(LlmError::RoundLimit, diagnostics));
@@ -675,7 +692,11 @@ impl LlmHost {
                 closing = true;
                 messages.push(ChatMessage::text(
                     ChatRole::System,
-                    round_limit_notice(self.config.max_tool_rounds),
+                    if calls_exhausted {
+                        call_limit_notice(self.config.max_tool_calls, diagnostics.calls.len())
+                    } else {
+                        round_limit_notice(self.config.max_tool_rounds)
+                    },
                 ));
                 continue;
             }
@@ -741,6 +762,36 @@ impl LlmHost {
                 emit(events, TurnEventKind::ToolResult { ordinal, result })
                     .await
                     .map_err(|error| fail(error, diagnostics.clone()))?;
+            }
+            if self.config.tool_progress_reports
+                && progress_reports < 3
+                && diagnostics.calls.len() >= [1, 15, 35][progress_reports]
+            {
+                emit(
+                    events,
+                    TurnEventKind::ToolProgress {
+                        completed_calls: diagnostics.tool_results.len(),
+                        failed_calls: diagnostics
+                            .tool_results
+                            .iter()
+                            .filter(|r| matches!(r.output, eve_llm_api::ToolOutput::Failure { .. }))
+                            .count(),
+                        tool_names: calls.iter().map(|c| c.name.clone()).collect(),
+                    },
+                )
+                .await
+                .map_err(|error| fail(error, diagnostics.clone()))?;
+                progress_reports += 1;
+            }
+            // 恰好耗尽后直接收尾，不额外请求一个注定不能执行的工具批次。
+            if diagnostics.calls.len() == self.config.max_tool_calls
+                && self.config.final_answer_on_round_limit
+            {
+                closing = true;
+                messages.push(ChatMessage::text(
+                    ChatRole::System,
+                    call_limit_notice(self.config.max_tool_calls, diagnostics.calls.len()),
+                ));
             }
         }
     }
@@ -1222,6 +1273,12 @@ fn round_limit_notice(rounds: usize) -> String {
     )
 }
 
+fn call_limit_notice(limit: usize, used: usize) -> String {
+    format!(
+        "本轮工具调用上限为 {limit} 次，已处理 {used} 次；下一批超出剩余额度或额度已用尽，不再执行。请只依据已有工具结果直接回复：说明已完成、失败和未完成的事项；未核实的不要编造，不要声称后台仍会继续。"
+    )
+}
+
 fn build_messages(
     config: &LlmHostConfig,
     context: &ContextSnapshot,
@@ -1240,6 +1297,8 @@ fn build_messages(
     let capabilities = serde_json::json!({
         "kind": "eve.runtime.tool-capabilities",
         "count": definitions.len(),
+        "max_tool_calls": config.max_tool_calls,
+        "tool_progress_reports": config.tool_progress_reports,
         "tools": definitions.iter().map(|definition| serde_json::json!({
             "name": definition.name,
             "description": definition.description,
@@ -1253,7 +1312,9 @@ fn build_messages(
              旧工具调用、召回文字和已学习技能的空列表都不能替代当前清单。\
              询问能力时按当前清单如实回答；用户已明确要求执行且工具可用时，直接调用并核验结果，不再反问是否开始。不能沿用旧回答否认可用能力，也不能把一个专用工具的限制套用到其他工具。\
              清单不授予额外权限，不代表工具已执行；结果仍以真实调用返回为准。\
-             只在用户询问或任务需要时解释能力，不机械复述内部标记。"
+             只在用户询问或任务需要时解释能力，不机械复述内部标记。\
+             max_tool_calls 是每轮单个工具调用总上限，失败和并行调用也计数；超出余额的批次整体不执行，依据已有结果收尾。\
+             tool_progress_reports 为 true 时宿主依据真实回执途中汇报一至三次；进展不代表任务成功，不能声称停止后还会后台继续。"
         ),
     ));
     // 历史按完整轮次只追加；把每轮变化的修订、召回和时钟放到其后，

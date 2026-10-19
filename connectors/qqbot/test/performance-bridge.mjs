@@ -7,14 +7,19 @@ import { createBridge, consume } from "../bridge-core.mjs";
 const scenario = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 if (process.env.EVE_OPENAI_API_KEY) throw new Error("model_credentials_leaked");
 const handlers = new Map(), latencies = [];
-let index = 0, start = 0, peakRss = 0;
+let index = 0, start = 0, peakRss = 0, progress = 0;
 const bot = {
   on: (name, handler) => handlers.set(name, handler),
   stop() {},
   async sendText(target, text) {
     const message = scenario.messages[index];
     assert.deepEqual(target, { scope: "c2c", targetId: "perf-user", msgId: message.id });
-    assert.equal(text, message.expected);
+    // 工具轮次的途中进展（#217）走同一被动窗口；正文由宿主生成，只核对不是最终回复。
+    if (text !== message.expected) {
+      assert.ok(message.text.startsWith("echo:") && text.trim().length > 0, "unexpected_text");
+      progress++;
+      return { id: "perf-progress." + index + "." + progress + "!" };
+    }
     return { id: "perf-out." + index + "!" };
   },
 };
@@ -34,7 +39,11 @@ function next() {
 const bridge = createBridge(bot, frame => {
   if (frame.type === "message") start = performance.now();
   process.stdout.write(JSON.stringify(frame) + "\n");
-  if (frame.type === "delivery") {
+  if (frame.type === "delivery" && frame.progress) {
+    // 进展回执不结束本条消息，计时到最终回复回执为止。
+    assert.equal(frame.ok, true);
+    assert.equal(frame.id, scenario.messages[index].id);
+  } else if (frame.type === "delivery") {
     assert.equal(frame.ok, true);
     assert.equal(frame.id, scenario.messages[index].id);
     latencies.push(performance.now() - start);

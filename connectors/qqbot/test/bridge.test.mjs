@@ -39,6 +39,39 @@ async function within(promise) {
 }
 const line = frame => JSON.stringify({ version: 1, ...frame }) + "\n";
 
+test("进展与最终分段共用五条配额，重复进展不重发，原始路由保持不变", async () => {
+  const f = fixture(); f.message("group");
+  for (let index = 0; index < 3; index++) {
+    const frame = { version: 1, type: "progress", id: "in-1", index, text: `已核对步骤 ${index + 1}` };
+    await f.bridge.command(frame);
+    await f.bridge.command(frame);
+  }
+  assert.equal(f.sent.length, 3);
+  await f.bridge.command({ version: 1, type: "segment", id: "in-1", index: 0, count: 3, text: "超过剩余配额" });
+  assert.equal(f.sent.length, 3);
+  for (let index = 0; index < 2; index++) {
+    await f.bridge.command({ version: 1, type: "segment", id: "in-1", index, count: 2, text: `结果 ${index}` });
+  }
+  assert.equal(f.sent.length, 5);
+  assert.ok(f.sent.every(s => s.target.scope === "group" && s.target.msgId === "in-1"));
+  assert.equal(f.frames.filter(x => x.type === "delivery" && x.progress).length, 3);
+});
+
+test("失败进展不重试且保留最终回复路由，finish 后不再发旧进展", async () => {
+  const f = fixture({ fail: n => n === 1 }); f.message();
+  const progress = { version: 1, type: "progress", id: "in-1", index: 0, text: "命令已返回结果" };
+  await f.bridge.command(progress);
+  assert.equal(f.frames.at(-1).ok, false);
+  await f.bridge.command(progress);
+  assert.equal(f.sent.length, 1);
+  await f.bridge.command({ version: 1, type: "reply", id: "in-1", text: "最终结果" });
+  assert.equal(f.frames.at(-1).ok, true);
+  f.message("c2c", "cancelled");
+  await f.bridge.command({ version: 1, type: "finish", id: "cancelled" });
+  await f.bridge.command({ ...progress, id: "cancelled" });
+  assert.equal(f.sent.length, 2);
+});
+
 test("只转交 SDK 本条发送者的有界昵称，不从正文或提及猜测名字", () => {
   const f = fixture();
   const incoming = {kind:"c2c", messageId:"person-1", senderId:"user-1", content:"你好",

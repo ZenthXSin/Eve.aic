@@ -555,6 +555,12 @@ pub enum TurnEventKind {
         ordinal: usize,
         result: ToolResult,
     },
+    /// 完整工具批次返回后的有界进展；不代表整轮成功或业务目标完成。
+    ToolProgress {
+        completed_calls: usize,
+        failed_calls: usize,
+        tool_names: Vec<String>,
+    },
     TurnCompleted {
         text: String,
     },

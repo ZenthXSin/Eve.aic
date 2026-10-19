@@ -148,6 +148,11 @@ if (scenario.script) {
       }
       const message = pending.get(cmd.id);
       if (!message) throw new Error("wrong_reply_id");
+      if (cmd.type === "progress") {
+        commands.push(cmd);
+        if (!message.hold_progress) send({ type: "delivery", id: cmd.id, progress: true, index: cmd.index, ok: !message.fail_progress });
+        continue;
+      }
       if (cmd.type === "reply") {
         if (message.expected_segments && !message.accept_any) throw new Error("expected_segments_got_reply");
         checkReply(cmd, message);
@@ -186,6 +191,10 @@ for await (const line of lines) {
   record({ direction: "out", ...cmd });
   if (cmd.type === "stop") break;
   if (cmd.id !== scenario.messages[index]?.id) throw new Error("wrong_reply_id");
+  if (cmd.type === "progress") {
+    send({ type: "delivery", id: cmd.id, progress: true, index: cmd.index, ok: true });
+    continue;
+  }
   if (cmd.type === "reply") {
     checkReply(cmd, scenario.messages[index]);
     send({ type: "delivery", id: cmd.id, ok: !scenario.send_fail, message_id: "out-1" });

@@ -26,6 +26,128 @@ fn owner_id() -> PluginId {
     PluginId::new(OWNER).expect("valid test owner")
 }
 
+#[derive(Default)]
+struct ProgressRecorder(Mutex<Vec<(usize, usize)>>);
+impl eve_llm_api::TurnEventSink for ProgressRecorder {
+    fn emit(&self, event: eve_llm_api::TurnEvent) -> LlmFuture<'_, ()> {
+        Box::pin(async move {
+            if let eve_llm_api::TurnEventKind::ToolProgress {
+                completed_calls,
+                failed_calls,
+                ..
+            } = event.kind
+            {
+                self.0.lock().unwrap().push((completed_calls, failed_calls));
+            }
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn fifty_individual_calls_close_without_a_fifty_first_call_and_report_three_milestones() {
+    let mut script = (0..50)
+        .map(|i| tool_response(vec![call(&format!("call-{i}"), "echo", json!({}))]))
+        .collect::<Vec<_>>();
+    script.push(final_response("已收尾，未核实部分保留。"));
+    let provider = RecordingProvider::scripted(script);
+    let tool = Arc::new(TestTool::new(
+        "echo",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    ));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![tool],
+        LlmHostConfig {
+            max_tool_rounds: 0,
+            max_tool_calls: 50,
+            tool_progress_reports: true,
+            final_answer_on_round_limit: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let events = ProgressRecorder::default();
+    let out = host.run_turn_with_events(turn(), &events).await.unwrap();
+    assert_eq!(out.diagnostics.started_tools, 50);
+    assert_eq!(out.diagnostics.tool_results.len(), 50);
+    assert_eq!(*events.0.lock().unwrap(), [(1, 0), (15, 0), (35, 0)]);
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 51);
+    assert!(requests.last().unwrap().tools.is_empty());
+    for request in requests.iter() {
+        request.validate().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn oversized_batches_never_partially_execute_and_failures_consume_the_budget() {
+    for first in [0, 49] {
+        let mut script = vec![];
+        if first > 0 {
+            script.push(tool_response(
+                (0..first)
+                    .map(|i| call(&format!("first-{i}"), "echo", json!({})))
+                    .collect(),
+            ));
+        }
+        script.push(tool_response(
+            (0..(51 - first))
+                .map(|i| call(&format!("over-{i}"), "echo", json!({})))
+                .collect(),
+        ));
+        script.push(final_response("未执行超额批次。"));
+        // 下一轮预算独立。
+        script.push(tool_response(vec![call("fresh", "echo", json!({}))]));
+        script.push(final_response("下一轮"));
+        let provider = RecordingProvider::scripted(script);
+        let tool = Arc::new(TestTool::new(
+            "echo",
+            Some(ToolConcurrency::ParallelSafe),
+            ToolMode::Error,
+        ));
+        let (host, _, _) = make_host(
+            provider.clone(),
+            vec![tool],
+            LlmHostConfig {
+                max_tool_rounds: 0,
+                final_answer_on_round_limit: true,
+                tool_progress_reports: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let events = ProgressRecorder::default();
+        let out = host.run_turn_with_events(turn(), &events).await.unwrap();
+        assert_eq!(out.diagnostics.started_tools, first);
+        assert_eq!(out.diagnostics.calls.len(), first);
+        assert!(
+            out.diagnostics
+                .tool_results
+                .iter()
+                .all(|r| matches!(r.output, eve_llm_api::ToolOutput::Failure { .. }))
+        );
+        assert_eq!(
+            host.run_turn(turn())
+                .await
+                .unwrap()
+                .diagnostics
+                .started_tools,
+            1
+        );
+        assert_eq!(
+            *events.0.lock().unwrap(),
+            if first == 0 { vec![] } else { vec![(49, 49)] }
+        );
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests[if first == 0 { 1 } else { 2 }].tools.is_empty());
+        for request in requests.iter() {
+            request.validate().unwrap();
+        }
+    }
+}
+
 fn service_id(name: &str) -> ServiceId {
     ServiceId::new(format!("llm-test.tool.{name}")).expect("valid test service")
 }
