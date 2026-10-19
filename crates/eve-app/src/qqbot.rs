@@ -2,7 +2,7 @@ use crate::{
     AppError, AppFailure, MessageJudgeMode, core_bootstrap, finish_core, qq_agenda, qq_budget,
     qq_clarify, qq_cognition, qq_completion, qq_interest, qq_learning, qq_learning_commands,
     qq_memory, qq_memory_observer, qq_outreach, qq_plan, qq_practice, qq_pursuit, qq_reminder,
-    qq_research, qq_semantic, qq_skill, qq_summary, qq_tools, segment_commands,
+    qq_research, qq_semantic, qq_skill, qq_summary, qq_tasks, qq_tools, segment_commands,
 };
 use eve_budget_api::{AutonomyBudget, BUDGET_PLUGIN_ID, BudgetPolicy};
 use eve_budget_plugin::BudgetPlugin;
@@ -80,7 +80,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-mindustry-json-rules 目录] [--practice-python 程序] [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--markdown] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-mindustry-json-rules 目录] [--practice-python 程序] [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--background-tasks] [--subagents] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--markdown] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -119,6 +119,8 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --clarify 需同时开启受控研究或实践运行环境；学习目标在当前版本卡住时（实践尝试用尽仍未验证、运行环境做不了，或只开启研究时没有找到可引用的资料），写一个具体问题，在用户下次私聊时先判断时机，合适才随回复附带，不主动私聊；每个目标版本至多问一次，同一用户默认 24 小时内至多送达一个问题，之后的下一轮私聊记为回复，由兴趣观察照常处理。/clarify 查看，/clarify off|on 关闭或恢复。
 --agenda-context 需同时 --interest-learning；用户私聊时，把 Eve 为这位用户的兴趣在后台做到哪一步（研究、实践、请求澄清，按记录整理）作为低优先级数据交给对话，用户问起时据实回答；只读记录，不改变后台行为。
 --reminders 开启私聊提醒：用户自然地说“半小时后提醒我喝水”或“明早 9 点提醒我交作业”，模型调用提醒工具记下并如实回复，想取消时直接说；到时先主动私聊一次，发不出去时随用户下一条私聊的回复附带，到期 7 天仍未送达不再投递。没有命令；只在私聊中成立。--reminder-utc-offset 设置本地时区（默认 +08:00）。
+--background-tasks 让 Eve 在对话中把需要多步、较长时间的事派发到后台：执行器可用对话里的工具（不含派发与子代理），按步数预算（工具调用次数，默认 50，runtime.tasks 可调）独立完成，结束后私聊通知派发它的用户，发不出去时随下一条私聊回复附带；用户可以让 Eve 查看或取消任务。重启时执行中的任务记为中断，不自动重跑。
+--subagents 让 Eve 在一轮回复中把可以独立完成的子任务委托给子代理并等它交回结果；子代理同样按步数预算执行，须在 runtime.tasks.subagent_timeout_ms（默认 3 分钟）内完成，不能再委托或派发。
 --goal-completion 需同时 --plans；待办的计划各步都被证据满足后，随用户下一次私聊的回复问一句这件事算不算完成，每份计划至多问一次；用户明确说完成了，模型调用确认工具，宿主核对计划仍对应当前版本后把待办标为已完成，并记下依据的计划与确认来源。没有命令；只在私聊中成立。
 --learning-stop 需同时 --interest-learning；兴趣学习目标的研究与实践次数都用完、也没有在问你或等你回复时，后台把它标为已取消并记下原因（目标的停止条件“学习预算耗尽”），兴趣本身保留；不开启时目标一直等待。无论是否开启，/interests 与议程上下文都会说明每个学习目标接下来会做什么、在等什么。
 --autonomy-budget 需同时 --interest-learning；兴趣观察、受控研究、实践草稿、技能、工具锻造、主动交流、请求澄清与情景语义摘要的后台模型请求在每个窗口（--autonomy-budget-window-hours 默认 24 小时，按 UTC 整点对齐）合计至多该次数；每次请求前先保存计数，重启不清零、失败不退还，余额不够一项工作时后台不开始新工作，重置后继续；回复用户消息、/plan propose、反思、偏好提炼与语义索引不计入。/budget 查看用量与重置时间。
@@ -186,6 +188,10 @@ pub struct QqBotOptions {
     pub agenda_context: bool,
     /// 私聊提醒：模型按用户自然的说法调用提醒工具，到时私聊提醒。
     pub reminders: bool,
+    /// 模型可以把多步任务派发到后台执行，结束后私聊通知。
+    pub background_tasks: bool,
+    /// 模型可以把子任务委托给子代理并在本轮拿回结果。
+    pub subagents: bool,
     /// 计划各步都被证据满足后，随用户下一次私聊的回复问一句待办是否完成；用户确认后标为完成。需要计划入口。
     pub goal_completion: bool,
     /// 兴趣学习目标的研究与实践次数都用完、再无可做时，后台把它标为已取消并记下原因。需要兴趣学习。
@@ -243,6 +249,8 @@ impl Default for QqBotOptions {
             clarify: false,
             agenda_context: false,
             reminders: false,
+            background_tasks: false,
+            subagents: false,
             goal_completion: false,
             learning_stop: false,
             reminder_utc_offset_minutes: None,
@@ -332,6 +340,14 @@ impl QqBotOptions {
             }
             if arg == "--reminders" {
                 options.reminders = true;
+                continue;
+            }
+            if arg == "--background-tasks" {
+                options.background_tasks = true;
+                continue;
+            }
+            if arg == "--subagents" {
+                options.subagents = true;
                 continue;
             }
             if arg == "--goal-completion" {
@@ -792,6 +808,7 @@ async fn run_qqbot_composed(
     let mut semantic_background: Option<qq_semantic::Background> = None;
     let mut semantic_queries: Option<Arc<qq_semantic::QueryRecallEmbeddings>> = None;
     let mut summary_background: Option<qq_summary::Background> = None;
+    let mut task_background: Option<qq_tasks::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
     let mut panel: Option<eve_web_panel::LocalPanel> = None;
     let page_permit = eve_web_panel_api::PageWritePermit::default();
@@ -1086,6 +1103,19 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        // 后台任务账本同样先于通道加载；损坏时拒绝启动并保留原字节，执行中的任务记为中断，发送中的通知记为结果未知。
+        let tasks = if options.background_tasks {
+            let plugin = eve_task_plugin::TaskPlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel
+                .start(&PluginId::new(eve_task_api::TASK_PLUGIN_ID)?)
+                .await?;
+            Some(controller)
+        } else {
+            None
+        };
+        let task_late = Arc::new(qq_tasks::Late::default());
         // 完成确认提问账本同样先于通道加载；损坏时拒绝启动并保留原字节，发送中的提问记为结果未知。
         let completion = if options.goal_completion {
             let plugin = CompletionPlugin::new()?;
@@ -1226,6 +1256,32 @@ async fn run_qqbot_composed(
             }
             None => context,
         };
+        // 后台任务：模型可以派发、查看与取消；对话里能看到这位用户最近的任务与结果。
+        let context: Arc<dyn ContextAssembler> = match &tasks {
+            Some(tasks) => {
+                let admin: Arc<dyn eve_task_api::TaskAdmin> = Arc::new(tasks.clone());
+                bootstrap.tools.push(Arc::new(qq_tasks::DispatchTool {
+                    tasks: admin.clone(),
+                    late: task_late.clone(),
+                }));
+                bootstrap.tools.push(Arc::new(qq_tasks::ListTool {
+                    tasks: admin.clone(),
+                }));
+                bootstrap.tools.push(Arc::new(qq_tasks::CancelTool {
+                    tasks: admin.clone(),
+                }));
+                Arc::new(qq_tasks::TaskContext {
+                    wrapped: context,
+                    tasks: admin,
+                })
+            }
+            None => context,
+        };
+        if options.subagents {
+            bootstrap.tools.push(Arc::new(qq_tasks::SubagentTool {
+                late: task_late.clone(),
+            }));
+        }
         // 宿主实际保存了什么、单次回复上限多少，作为数据交给对话，避免模型对用户说错或长文被截断。
         let context: Arc<dyn ContextAssembler> = Arc::new(crate::qq_people::Context {
             wrapped: context,
@@ -1392,6 +1448,21 @@ async fn run_qqbot_composed(
         bootstrap.host_config.max_tool_calls = 50;
         bootstrap.host_config.tool_progress_reports = true;
         crate::developer::install(&mut bootstrap, &options.state_directory)?;
+        // 子代理在工具执行期内等待结果；按配置上限放宽这一个工具的期限，实际期限由工具按配置控制。
+        if options.subagents {
+            bootstrap.host_config.tool_timeout_overrides.insert(
+                qq_tasks::SUBAGENT_TOOL.into(),
+                std::time::Duration::from_millis(qq_tasks::MAX_SUBAGENT_TIMEOUT_MS + 10_000),
+            );
+        }
+        // 执行器与对话共用工具服务和宿主设置；在核心装配之后建立。
+        let worker_tools: Vec<String> = bootstrap
+            .tools
+            .iter()
+            .map(|tool| tool.definition().name)
+            .collect();
+        let worker_config = bootstrap.host_config.clone();
+        let worker_permissions = permissions.clone();
         let tool_definitions: Vec<_> = std::iter::once(crate::services::echo_definition())
             .chain(bootstrap.tools.iter().map(|tool| tool.definition()))
             .collect();
@@ -1534,6 +1605,28 @@ async fn run_qqbot_composed(
             )))
         };
         let budgeted = |category: &str| budget_gate.wrap(observed(category)?, category);
+        // 后台任务与子代理共用执行器：用途 task 单独记健康与输出上限，不计入自主运行预算。
+        if tasks.is_some() || options.subagents {
+            let _ = task_late
+                .config
+                .set(qq_tasks::config_service(registry.as_ref())?);
+            let worker = qq_tasks::Worker::install(
+                &kernel,
+                registry.clone(),
+                worker_permissions.clone(),
+                &worker_tools,
+                worker_config.clone(),
+                observed(qq_tasks::MODEL_USE)?,
+            )
+            .await?;
+            let _ = task_late.worker.set(worker);
+        }
+        if let Some(tasks) = &tasks {
+            task_background = Some(qq_tasks::Background::start(
+                Arc::new(tasks.clone()),
+                task_late.clone(),
+            ));
+        }
         let InterestComponents {
             summarizer,
             observer: interest_observer,
@@ -1924,6 +2017,15 @@ async fn run_qqbot_composed(
                 }),
             ));
         }
+        // 后台任务的结束通知同样是用户要的，紧随提醒投递。
+        if let Some(tasks) = &tasks {
+            sources.push((
+                qq_tasks::ID_PREFIX,
+                Arc::new(qq_tasks::ChannelAdapter {
+                    tasks: Arc::new(tasks.clone()),
+                }),
+            ));
+        }
         // 待办完成确认只随回复附带，不主动私聊。
         if let (Some(completion), Some(plans)) = (&completion, &completion_plans) {
             sources.push((
@@ -1964,6 +2066,7 @@ async fn run_qqbot_composed(
         if !sources.is_empty() {
             // 主动私聊开启时，通道空闲后每 2 秒询问一次；是否发送由宿主策略决定。请求澄清不主动私聊。
             let push = (reminders.is_some()
+                || tasks.is_some()
                 || outreach.is_some() && outreach_policy.proactive_after_ms.is_some())
             .then(|| std::time::Duration::from_secs(2));
             let adapter: Arc<dyn QqOutreach> = if sources.len() == 1 {
@@ -2135,6 +2238,9 @@ async fn run_qqbot_composed(
         if let Some(summary) = &summary_background {
             summary.activate();
         }
+        if let Some(tasks) = &task_background {
+            tasks.activate();
+        }
         wait_channel(
             handle.status.clone(),
             background.as_ref().map(qq_cognition::Background::finished),
@@ -2190,6 +2296,12 @@ async fn run_qqbot_composed(
                     (
                         summary.finished(),
                         "语义摘要后台已结束；QQ 通道停止准入并保留状态",
+                    )
+                }))
+                .chain(task_background.as_ref().map(|tasks| {
+                    (
+                        tasks.finished(),
+                        "后台任务执行已结束；QQ 通道停止准入并保留状态",
                     )
                 }))
                 .collect(),
@@ -2258,6 +2370,9 @@ async fn run_qqbot_composed(
     if let Some(summary) = &summary_background {
         summary.request_stop();
     }
+    if let Some(tasks) = &task_background {
+        tasks.request_stop();
+    }
     if let Some(queries) = semantic_queries
         && let Err(error) = queries.close().await
     {
@@ -2265,6 +2380,12 @@ async fn run_qqbot_composed(
     }
     if let Some(summary) = summary_background
         && let Err(error) = summary.stop().await
+    {
+        secondary.push(error);
+    }
+    // 后台任务的执行器会调用其他能力的工具；先停下执行中的任务（留在执行中，下次启动记为中断）。
+    if let Some(tasks) = task_background
+        && let Err(error) = tasks.stop().await
     {
         secondary.push(error);
     }
@@ -2681,6 +2802,14 @@ mod recall_options_tests {
                 .unwrap()
                 .learning_stop
         );
+    }
+
+    #[test]
+    fn background_tasks_and_subagents_are_explicit() {
+        let options = parse(&[]).unwrap();
+        assert!(!options.background_tasks && !options.subagents);
+        let options = parse(&["--background-tasks", "--subagents"]).unwrap();
+        assert!(options.background_tasks && options.subagents);
     }
 
     #[test]

@@ -183,6 +183,7 @@ enum ToolMode {
         release: Arc<Notify>,
     },
     WaitForDrop(Arc<AtomicBool>),
+    RecordScope(Arc<Mutex<Vec<Option<eve_llm_api::ContextScope>>>>),
 }
 
 struct NeverFuture {
@@ -281,6 +282,12 @@ impl Tool for TestTool {
                 starts.lock().expect("starts lock").push(call.id);
                 Box::pin(NeverFuture { dropped })
             }
+            ToolMode::RecordScope(seen) => Box::pin(async move {
+                seen.lock()
+                    .expect("scope lock")
+                    .push(context.scope().cloned());
+                Ok(json!({"id": call.id}))
+            }),
             ToolMode::Echo | ToolMode::Error => Box::pin(async move {
                 starts.lock().expect("starts lock").push(call.id.clone());
                 let current = active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1204,4 +1211,198 @@ async fn dropping_run_turn_drops_in_flight_tool_future() {
     kernel
         .unregister(&owner_id())
         .expect("unregister after canceled turn cleanup");
+}
+
+#[tokio::test]
+async fn per_tool_timeout_overrides_only_extend_the_named_tool() {
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![
+            call("patient-call", "patient", json!({})),
+            call("hasty-call", "hasty", json!({})),
+        ]),
+        final_response("已处理"),
+    ]);
+    let mut patient = TestTool::new(
+        "patient",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    );
+    patient.delay = Duration::from_millis(60);
+    let mut hasty = TestTool::new("hasty", Some(ToolConcurrency::ParallelSafe), ToolMode::Echo);
+    hasty.delay = Duration::from_millis(60);
+    let config = LlmHostConfig {
+        tool_timeout: Duration::from_millis(10),
+        tool_timeout_overrides: [("patient".to_string(), Duration::from_secs(5))].into(),
+        tool_cancellation_grace: Duration::from_millis(5),
+        max_tool_rounds: 0,
+        ..LlmHostConfig::default()
+    };
+    let (host, _, _) = make_host(provider, vec![Arc::new(patient), Arc::new(hasty)], config).await;
+    let output = host.run_turn(turn()).await.expect("turn succeeds");
+    let results = &output.diagnostics.tool_results;
+    assert!(matches!(
+        results[0].output,
+        eve_llm_api::ToolOutput::Success { .. }
+    ));
+    assert!(matches!(
+        results[1].output,
+        eve_llm_api::ToolOutput::Failure {
+            code: ToolFailureCode::TimedOut,
+            ..
+        }
+    ));
+    let invalid = LlmHostConfig {
+        tool_timeout_overrides: [("patient".to_string(), Duration::ZERO)].into(),
+        ..LlmHostConfig::default()
+    };
+    assert!(invalid.validate().is_err());
+}
+
+#[tokio::test]
+async fn a_per_run_tool_call_limit_closes_with_a_tool_free_answer_and_leaves_the_host_unchanged() {
+    let mut script = (0..4)
+        .map(|i| tool_response(vec![call(&format!("step-{i}"), "echo", json!({}))]))
+        .collect::<Vec<_>>();
+    script.insert(3, final_response("三步后收尾"));
+    let provider = RecordingProvider::scripted(script);
+    let tool = Arc::new(TestTool::new(
+        "echo",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    ));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![tool],
+        LlmHostConfig {
+            max_tool_rounds: 0,
+            max_tool_calls: 50,
+            final_answer_on_round_limit: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(host.with_tool_call_limit(0).is_err());
+    let limited = host.with_tool_call_limit(3).unwrap();
+    let out = limited.run_turn(turn()).await.unwrap();
+    assert_eq!(out.text, "三步后收尾");
+    assert_eq!(out.diagnostics.started_tools, 3);
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[3].tools.is_empty(), "用尽后收尾请求不提供工具");
+    }
+    // 原宿主仍按 50 次上限运行：同一脚本剩下的一次工具调用照常执行。
+    let provider_rest = RecordingProvider::scripted(vec![
+        tool_response(vec![call("again", "echo", json!({}))]),
+        final_response("原上限"),
+    ]);
+    let tool = Arc::new(TestTool::new(
+        "echo",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    ));
+    let (fresh, _, _) = make_host(
+        provider_rest,
+        vec![tool],
+        LlmHostConfig {
+            max_tool_rounds: 0,
+            final_answer_on_round_limit: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        fresh
+            .run_turn(turn())
+            .await
+            .unwrap()
+            .diagnostics
+            .started_tools,
+        1
+    );
+}
+
+struct CancelOnNotify(Arc<Notify>);
+impl eve_llm_api::TurnEventSink for CancelOnNotify {
+    fn emit(&self, _: eve_llm_api::TurnEvent) -> LlmFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn closed(&self) -> LlmFuture<'_, ()> {
+        let notify = self.0.clone();
+        Box::pin(async move {
+            notify.notified().await;
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn scoped_turns_bind_the_given_scope_and_stop_when_the_sink_closes() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("scoped", "who", json!({}))]),
+        final_response("完成"),
+    ]);
+    let tool = Arc::new(TestTool::new(
+        "who",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::RecordScope(seen.clone()),
+    ));
+    let (host, _, _) = make_host(
+        provider,
+        vec![tool],
+        LlmHostConfig {
+            max_tool_rounds: 0,
+            ..Default::default()
+        },
+    )
+    .await;
+    let scope = eve_llm_api::ContextScope {
+        session_id: "origin-session".into(),
+        user_id: "owner".into(),
+    };
+    let never = CancelOnNotify(Arc::new(Notify::new()));
+    let out = host
+        .run_scoped_turn_with_events(turn(), Some(scope.clone()), &never)
+        .await
+        .unwrap();
+    assert_eq!(out.text, "完成");
+    assert_eq!(*seen.lock().unwrap(), vec![Some(scope)]);
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("wait", "slow", json!({}))]),
+        final_response("不应到达"),
+    ]);
+    let tool = Arc::new(TestTool::new(
+        "slow",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::WaitForCancellation(cancelled.clone()),
+    ));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![tool],
+        LlmHostConfig {
+            max_tool_rounds: 0,
+            tool_timeout: Duration::from_secs(30),
+            ..Default::default()
+        },
+    )
+    .await;
+    let close = Arc::new(Notify::new());
+    let sink = CancelOnNotify(close.clone());
+    let closer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        close.notify_waiters();
+    });
+    let failure = tokio::time::timeout(
+        Duration::from_secs(5),
+        host.run_scoped_turn_with_events(turn(), None, &sink),
+    )
+    .await
+    .expect("closing the sink ends the turn")
+    .unwrap_err();
+    closer.await.unwrap();
+    assert_eq!(failure.error, LlmError::Cancelled);
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
 }
