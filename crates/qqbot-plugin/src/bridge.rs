@@ -935,6 +935,7 @@ pub(crate) async fn run(
                     segment_frame(&ledger, index, 0)
                 };
                 write(&mut stdin, frame).await?;
+                timing(timing_diagnostics, "reply_written", None);
                 deadline = tokio::time::Instant::now() + Duration::from_secs(35);
                 delivering = Some(Delivery { reply, pauses, index: 0, pause_until: None, appendix });
             }
@@ -1232,6 +1233,7 @@ pub(crate) async fn run(
                             let message = &reply.message;
                             status.send_modify(|s| { if ok { s.sent += 1; } else { s.failed += 1; } });
                             if !ok { warn(&ctx, "delivery_failed_no_retry"); }
+                            if ok { timing(timing_diagnostics, "delivery_confirmed", None); }
                             if ok && let Some(interaction) = &reply.interaction
                                 && let Some(observation) = &observation
                                 && let Err(error) = interaction.observe(observation.observer.as_ref(), &config.app_id, message, &reply.text) {
