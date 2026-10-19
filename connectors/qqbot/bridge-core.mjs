@@ -128,7 +128,7 @@ export function createBridge(bot, emit, limit = 128) {
   }
   async function segment(frame, item) {
     const { index, count } = frame;
-    if (!Number.isInteger(count) || count < 2 || count > MAX_SEGMENTS ||
+    if (!Number.isInteger(count) || count < 2 || count + (item.progress ?? 0) > MAX_SEGMENTS ||
         !Number.isInteger(index) || index < 0 || index >= count) {
       warn("invalid_command"); return;
     }
@@ -152,6 +152,30 @@ export function createBridge(bot, emit, limit = 128) {
       item.sending = false;
       item.next = index + 1;
       if (!ok || item.next === count || item.finished) pending.delete(frame.id);
+    }
+  }
+  // Progress consumes the original passive window, but never completes its reply.
+  async function progress(frame, item) {
+    const index = item.progress ?? 0;
+    if (item.sending || item.next !== undefined || frame.index !== index || index >= 3) {
+      warn("invalid_progress"); return;
+    }
+    if (!validText(frame.text) || Buffer.byteLength(frame.text) > 1024) {
+      warn("invalid_progress");
+      send({ type: "delivery", id: frame.id, progress: true, index, ok: false });
+      return;
+    }
+    item.progress = index + 1; // Failed/unknown attempts also consume quota; never retry.
+    item.sending = true;
+    try {
+      const result = await sendText(item.target, frame.text);
+      send({ type: "delivery", id: frame.id, progress: true, index, ok: true,
+        ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
+    } catch {
+      send({ type: "delivery", id: frame.id, progress: true, index, ok: false });
+    } finally {
+      item.sending = false;
+      if (item.finished) pending.delete(frame.id);
     }
   }
   // A proactive private message: no msg_id, so the platform applies its own quota and
@@ -195,6 +219,7 @@ export function createBridge(bot, emit, limit = 128) {
         return;
       }
       if (frame.type === "segment") { await segment(frame, item); return; }
+      if (frame.type === "progress") { await progress(frame, item); return; }
       if (frame.type !== "reply") { warn("invalid_command"); return; }
       if (item.sending || item.next !== undefined) { warn("duplicate_reply"); return; }
       // Text Rust accepted but QQ cannot carry (e.g. only U+FEFF) fails this reply

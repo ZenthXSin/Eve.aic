@@ -1383,6 +1383,8 @@ async fn run_qqbot_composed(
         }
         // 工具批次用尽时不让本轮失败：不再提供工具，模型依据已有结果作答并说明未核实部分。
         bootstrap.host_config.final_answer_on_round_limit = true;
+        bootstrap.host_config.max_tool_calls = 50;
+        bootstrap.host_config.tool_progress_reports = true;
         crate::developer::install(&mut bootstrap, &options.state_directory)?;
         let tool_definitions: Vec<_> = std::iter::once(crate::services::echo_definition())
             .chain(bootstrap.tools.iter().map(|tool| tool.definition()))

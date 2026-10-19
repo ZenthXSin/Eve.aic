@@ -5,7 +5,7 @@ use crate::{
         OUTREACH_PLANNER, QQ_OUTREACH_JUDGE_TIMEOUT, QQ_OUTREACH_MAX_REPLY_PARTS, QqOutreach,
         QqOutreachMoment, QqOutreachResult, valid_text as valid_outreach_text,
     },
-    state::{Ledger, Message, Part, PartState, ReceiptState, Segments, valid_message_id},
+    state::{Ledger, Message, Part, PartState, Progress, ReceiptState, Segments, valid_message_id},
 };
 use eve_control_api::{
     CommitState, ControlEvent, ControlEventSink, ControlFuture, ControlInput, ControlPhase,
@@ -30,7 +30,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, ChildStdout, Command},
-    sync::watch,
+    sync::{mpsc, watch},
 };
 
 fn failure(code: &str) -> PluginError {
@@ -51,6 +51,38 @@ fn timing(enabled: bool, phase: &str, turn: Option<u64>) {
             json!({"phase":phase,"turn":turn,"at_ms":at})
         );
     }
+}
+fn progress_text(kind: &TurnEventKind) -> Option<String> {
+    let TurnEventKind::ToolProgress {
+        completed_calls,
+        failed_calls,
+        tool_names,
+    } = kind
+    else {
+        return None;
+    };
+    let mut activities = std::collections::BTreeSet::new();
+    for name in tool_names {
+        activities.insert(match name.as_str() {
+            "read_file" | "list_files" | "search_files" | "github_api" => "源码与文件核对",
+            "search_reference" | "read_reference" | "search_knowledge" | "search_memory" => {
+                "资料检索"
+            }
+            "write_file" | "apply_patch" => "文件修改",
+            "run_command" => "命令执行",
+            "prepare_self_upgrade" | "apply_self_upgrade" | "self_upgrade_status" => "升级检查",
+            _ => "工具处理",
+        });
+    }
+    Some(format!(
+        "{}已返回结果，累计收到 {completed_calls} 次工具回执{}。正在继续核对与整理。",
+        activities.into_iter().collect::<Vec<_>>().join("、"),
+        if *failed_calls == 0 {
+            String::new()
+        } else {
+            format!("（其中 {failed_calls} 次未成功）")
+        }
+    ))
 }
 async fn write(stdin: &mut ChildStdin, value: Value) -> PluginResult<()> {
     let mut bytes = serde_json::to_vec(&value).map_err(|_| failure("QQBot 命令编码失败"))?;
@@ -168,6 +200,7 @@ struct ChannelEvents {
     stop: watch::Receiver<bool>,
     closed: watch::Receiver<bool>,
     timing_diagnostics: bool,
+    progress: mpsc::Sender<ControlEvent>,
 }
 impl ChannelEvents {
     fn is_closed(&self) -> bool {
@@ -199,6 +232,11 @@ impl ControlEventSink for ChannelEvents {
             if self.is_closed() {
                 Err(LlmError::Cancelled)
             } else {
+                if matches!(event.event.kind, TurnEventKind::ToolProgress { .. }) {
+                    self.progress
+                        .try_send(event)
+                        .map_err(|_| LlmError::Cancelled)?;
+                }
                 Ok(())
             }
         })
@@ -517,11 +555,13 @@ pub(crate) async fn run(
         }
     }
     let (closed, receiver) = watch::channel(false);
+    let (progress_tx, mut progress_rx) = mpsc::channel(64);
     let sink = Arc::new(ChannelEvents {
         signal: signal.clone(),
         stop: stop.clone(),
         closed: receiver,
         timing_diagnostics,
+        progress: progress_tx,
     });
     let mut command = Command::new(&config.node_program);
     command
@@ -571,6 +611,8 @@ pub(crate) async fn run(
     let mut routing: Vec<Routing> = Vec::new();
     let mut replies: VecDeque<Reply> = VecDeque::new();
     let mut delivering: Option<Delivery> = None;
+    let mut progress_delivery: Option<(String, usize)> = None;
+    let mut progress_queue = VecDeque::new();
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     // 正在主动私聊的邀请；一次只发送一条，期间不开始新的回复投递。
     let mut pushing: Option<String> = None;
@@ -581,6 +623,12 @@ pub(crate) async fn run(
     let result: PluginResult<()> = async {
         loop {
             if sink.is_closed() { break Ok(()); }
+            while progress_queue.len() < 64 {
+                match progress_rx.try_recv() {
+                    Ok(event) => progress_queue.push_back(event),
+                    Err(_) => break,
+                }
+            }
             // 同会话输出与任务准入等候路由收尾；独立会话可继续处理。
             // 显式命令不等待已撤销的自然判断，路由任务仍由 MessageService 收尾。
             let command_index = commands.iter().position(|command| command.superseded ||
@@ -710,7 +758,39 @@ pub(crate) async fn run(
                 }
                 continue;
             }
-            if delivering.is_none() && pushing.is_none() && judging.is_none()
+            if delivering.is_none() && pushing.is_none() && progress_delivery.is_none()
+                && progress_queue.front().is_some_and(|event: &ControlEvent|
+                    active.iter().any(|a| a.key == event.key)
+                    || !routing.iter().any(|r| r.target.session == event.key.session))
+                && let Some(event) = progress_queue.pop_front() {
+                // 只使用当前代绑定的原始平台路由；取消、插入控制和旧代事件不补发。
+                let message = active.iter().find(|a| a.key == event.key).map(|a| a.message.clone());
+                if let Some(message) = message
+                    && !pending_control(&message, &routing, &commands)
+                    && control.accepts(&event)
+                    && control.snapshot(&event.key.session).is_ok_and(|s| s.is_some_and(|s| !s.cancel_requested))
+                    && let Some(text) = progress_text(&event.event.kind) {
+                    let index = ledger.find(&config.app_id, &message.id).expect("active receipt");
+                    let entry = &mut ledger.entries[index];
+                    if entry.state == ReceiptState::Processing && entry.progress.len() < 3 {
+                        let part = entry.progress.len();
+                        entry.progress.push(Progress { text: text.clone(), state: PartState::Sending });
+                        ledger.save(&ctx)?;
+                        // 同步落盘后再次核验；写出后未知结果不会自动补发。
+                        if control.accepts(&event) && control.snapshot(&event.key.session).is_ok_and(|s| s.is_some_and(|s| !s.cancel_requested)) {
+                            write(&mut stdin, json!({"type":"progress","version":1,"id":message.id,"index":part,"text":text})).await?;
+                            progress_delivery = Some((message.id.clone(), part));
+                            deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+                        } else {
+                            ledger.entries[index].progress[part].state = PartState::Failed;
+                            ledger.save(&ctx)?;
+                        }
+                    }
+                }
+                continue;
+            }
+            if delivering.is_none() && pushing.is_none() && judging.is_none() && progress_delivery.is_none()
+                && progress_queue.is_empty() && progress_rx.is_empty()
                 && let Some(index) = replies.iter().position(|reply| !pending_control(&reply.message, &routing, &commands)) {
                 let reply = replies.remove(index).expect("queued reply");
                 if !reply.guard.accepts(control.as_ref()) {
@@ -757,8 +837,12 @@ pub(crate) async fn run(
                                 }
                             },
                         };
+                        let progress_count = ledger.entries[ledger.find(&config.app_id, &reply.message.id).expect("reply receipt")].progress.len();
+                        let mut policy = segmentation.policy;
+                        policy.max_segments = policy.max_segments.min(crate::QQ_MAX_SEGMENTS - progress_count);
+                        policy.defaults.max_segments = policy.defaults.max_segments.min(policy.max_segments);
                         match eve_segment_api::plan_with_preference(
-                            segmentation.planner.as_ref(), &reply.text, &segmentation.policy, &preference) {
+                            segmentation.planner.as_ref(), &reply.text, &policy, &preference) {
                             Ok((plan, warning)) => {
                                 if warning.is_some() { warn(&ctx, "segment_plan_fallback"); }
                                 Some(plan)
@@ -799,6 +883,7 @@ pub(crate) async fn run(
                 if let Some(hook) = &outreach
                     && reply.invite == Some(true)
                     && invitable(&reply)
+                    && ledger.entries[index].progress.len() + plan.as_ref().map_or(1, |plan| plan.segments.len()) < crate::QQ_MAX_SEGMENTS
                     && plan.as_ref().map_or(1, |plan| plan.segments.len()) <= QQ_OUTREACH_MAX_REPLY_PARTS {
                     match hook.inner.attach(&reply.message.session_key(&config.app_id)?, &reply.message.id) {
                         Ok(Some(invitation)) => {
@@ -927,7 +1012,7 @@ pub(crate) async fn run(
                 continue;
             }
             // 主动私聊：通道空闲时定期询问宿主；路由只取自已确认的私聊回执。
-            let push_ready = push_interval.is_some() && pushing.is_none() && delivering.is_none()
+            let push_ready = push_interval.is_some() && pushing.is_none() && delivering.is_none() && progress_delivery.is_none()
                 && judging.is_none() && replies.is_empty() && status.borrow().ready;
             if push_ready && let (Some(hook), Some(interval)) = (&outreach, push_interval)
                 && tokio::time::Instant::now() >= next_push {
@@ -955,10 +1040,11 @@ pub(crate) async fn run(
                 biased;
                 _ = signal.cancelled() => break Ok(()),
                 _ = stop.changed() => break Ok(()),
-                _ = tokio::time::sleep_until(deadline), if !status.borrow().ready || delivering.as_ref().is_some_and(Delivery::awaiting) || pushing.is_some() => {
+                _ = tokio::time::sleep_until(deadline), if !status.borrow().ready || delivering.as_ref().is_some_and(Delivery::awaiting) || pushing.is_some() || progress_delivery.is_some() => {
                     break Err(failure("QQBot ready 或 delivery 等待超时"));
                 }
                 _ = tokio::time::sleep_until(next_push), if push_ready => {}
+                Some(event) = progress_rx.recv(), if progress_queue.len() < 64 => { progress_queue.push_back(event); }
                 invite = judged(&mut judging), if judging.is_some() => {
                     let (mut reply, _) = judging.take().expect("judging reply");
                     reply.invite = Some(invite);
@@ -1054,7 +1140,7 @@ pub(crate) async fn run(
                 }
                 frame = frames.next() => {
                     let Some(frame) = frame? else {
-                        if !active.is_empty() || !routing.is_empty() || delivering.is_some() || pushing.is_some() || judging.is_some() || !queue.is_empty()
+                        if !active.is_empty() || !routing.is_empty() || delivering.is_some() || pushing.is_some() || progress_delivery.is_some() || judging.is_some() || !queue.is_empty()
                             || !commands.is_empty() || !replies.is_empty() || !status.borrow().ready {
                             break Err(failure("QQBot 在未完成交互时断开；保留状态"));
                         }
@@ -1080,6 +1166,18 @@ pub(crate) async fn run(
                             warn(&ctx, code);
                         }
                         Some("fatal") => break Err(failure("QQBot SDK 启动或连接失败")),
+                        Some("delivery") if frame.get("progress").and_then(Value::as_bool) == Some(true) => {
+                            let Some((id, part)) = progress_delivery.as_ref() else { warn(&ctx, "unexpected_progress_delivery"); continue; };
+                            if frame.get("id").and_then(Value::as_str) != Some(id.as_str()) || frame.get("index").and_then(Value::as_u64) != Some(*part as u64) {
+                                warn(&ctx, "progress_delivery_mismatch"); continue;
+                            }
+                            let Some(ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
+                            let index = ledger.find(&config.app_id, id).expect("progress receipt");
+                            ledger.entries[index].progress[*part].state = if ok { PartState::Sent } else { PartState::Failed };
+                            ledger.save(&ctx)?;
+                            if !ok { warn(&ctx, "progress_failed_no_retry"); }
+                            progress_delivery = None;
+                        }
                         Some("delivery") if frame.get("push").and_then(Value::as_bool) == Some(true) => {
                             let (Some(hook), Some(current)) = (&outreach, pushing.as_deref()) else { warn(&ctx, "unexpected_delivery"); continue; };
                             if frame.get("id").and_then(Value::as_str) != Some(current) { warn(&ctx, "delivery_id_mismatch"); continue; }
