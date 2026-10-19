@@ -15,7 +15,9 @@ use std::{fmt, sync::Arc};
 
 pub const MEMORY_PLUGIN_ID: &str = "eve.memory";
 pub const MEMORY_FORMAT_VERSION: u32 = 1;
-pub const MAX_EVIDENCE: usize = 256;
+/// 全局有界证据容量；仍受 4 MiB 字节上限约束，不自动清理原记录。
+pub const MAX_EVIDENCE: usize = 4096;
+pub const MAX_SCOPES: usize = 256;
 pub const MAX_PREFERENCES: usize = 256;
 /// 所有作用域的偏好历史版本总数；原始证据与历史永不自动淘汰。
 pub const MAX_HISTORY: usize = 256;

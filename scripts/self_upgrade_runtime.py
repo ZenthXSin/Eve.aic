@@ -54,7 +54,16 @@ def atomic(path, value):
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
-    os.replace(temporary, path)
+    # Windows 上目标文件正被其他进程读取时替换会短暂报 PermissionError；同 read_json 只对此重试。
+    for attempt in range(20):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            if os.name != 'nt' or attempt == 19:
+                temporary.unlink(missing_ok=True)
+                raise
+            time.sleep(0.05)
 
 def sha(value):
     return isinstance(value, str) and len(value) == 64 and all(c in '0123456789abcdef' for c in value)
@@ -128,6 +137,20 @@ def delivery_gate(state_path, request):
     receipts = document('eve.channel.qqbot', 'receipts.v1')
     if sessions['format_version'] != 1 or receipts['version'] not in (1, 2, 3):
         raise ValueError('unknown_ledger_version')
+    for receipt in receipts['entries']:
+        progress = receipt.get('progress', [])
+        if not isinstance(progress, list) or len(progress) > 3:
+            raise ValueError('invalid_progress_ledger')
+        if progress and receipts['version'] != 3:
+            raise ValueError('invalid_progress_ledger')
+        for part in progress:
+            if (not isinstance(part, dict) or set(part) != {'text', 'state'}
+                    or not isinstance(part['text'], str) or not part['text'].strip()
+                    or len(part['text'].encode()) > 1024
+                    or part['state'] not in ('Sending', 'Sent', 'Failed')):
+                raise ValueError('invalid_progress_ledger')
+            if part['state'] == 'Sending':
+                return False
     session = sessions['sessions'].get(request['session_id'])
     if not session or session['key']['user_id'] != request['requested_by']:
         raise ValueError('request_scope_mismatch')

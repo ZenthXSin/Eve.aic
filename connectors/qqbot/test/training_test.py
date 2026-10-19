@@ -135,10 +135,18 @@ class Reports(unittest.TestCase):
                                            "eve.session": {"sessions.v1": list(json.dumps(sessions).encode())}}}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
-            path.write_text(json.dumps(state))
-            report = training.collect(path)
-        self.assertEqual((report["counts"]["model_sent"], report["counts"]["failed"]), (1, 1))
-        self.assertEqual(report["counts"]["paragraphs"], 2)
+            for version in (2, 3):
+                with self.subTest(version=version):
+                    receipts['version'] = version
+                    if version == 3:
+                        for receipt in receipts['entries']:
+                            receipt['progress'] = [{'text':'进展不属于最终答复？','state':'Sent'}]
+                    state['entries']['eve.channel.qqbot']['receipts.v1'] = list(json.dumps(receipts).encode())
+                    path.write_text(json.dumps(state))
+                    report = training.collect(path)
+                    self.assertEqual((report["counts"]["model_sent"], report["counts"]["failed"]), (1, 1))
+                    self.assertEqual(report["counts"]["paragraphs"], 2)
+                    self.assertEqual(report['evidence'][0]['reply'],reply)
 
     def test_sent_failure_notice_does_not_count_as_training_or_experience_acceptance(self):
         message = {"id": "failed", "scope": "c2c", "target_id": "user-1", "user_id": "user-1", "text": "执行检查"}

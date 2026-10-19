@@ -467,7 +467,7 @@ fn validate_limits(document: &Document) -> MemoryResult<()> {
         .iter()
         .map(|record| record.operations.len())
         .sum();
-    if document.scopes.len() > MAX_EVIDENCE
+    if document.scopes.len() > MAX_SCOPES
         || evidence > MAX_EVIDENCE
         || preferences > MAX_PREFERENCES
         || history > MAX_HISTORY
