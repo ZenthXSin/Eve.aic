@@ -33,8 +33,16 @@ def unique_object(pairs):
 def read_json(path, limit=MAX_JSON):
     if path.is_symlink() or not path.is_file() or path.stat().st_size > limit:
         raise ValueError('invalid_json_file')
-    with path.open(encoding='utf8') as stream:
-        return json.load(stream, object_pairs_hook=unique_object)
+    # Windows 上另一进程用 os.replace 原子替换同一文件的瞬间，打开会短暂报 PermissionError；
+    # 只对这一种错误稍等重试，其他错误照常抛出。
+    for attempt in range(20):
+        try:
+            with path.open(encoding='utf8') as stream:
+                return json.load(stream, object_pairs_hook=unique_object)
+        except PermissionError:
+            if os.name != 'nt' or attempt == 19:
+                raise
+            time.sleep(0.05)
 
 def atomic(path, value):
     with tempfile.NamedTemporaryFile(mode='w', encoding='utf8', dir=path.parent, delete=False) as stream:
@@ -118,7 +126,7 @@ def delivery_gate(state_path, request):
         return json.loads(bytes(entries[owner][key]), object_pairs_hook=unique_object)
     sessions = document('eve.session', 'sessions.v1')
     receipts = document('eve.channel.qqbot', 'receipts.v1')
-    if sessions['format_version'] != 1 or receipts['version'] not in (1, 2):
+    if sessions['format_version'] != 1 or receipts['version'] not in (1, 2, 3):
         raise ValueError('unknown_ledger_version')
     session = sessions['sessions'].get(request['session_id'])
     if not session or session['key']['user_id'] != request['requested_by']:
