@@ -1046,9 +1046,21 @@ async fn run(
                 Some(joined) = joins.join_next() => {
                     let (id, outcome) = joined.map_err(|_| "后台任务执行异常")?;
                     running.remove(&id);
-                    match tasks.finish(&id, outcome.end, outcome.usage, now_ms()) {
+                    let mut result = tasks.finish(&id, outcome.end, outcome.usage, now_ms());
+                    // 结局本身不合规（例如用量记录异常）：只让这个任务失败，不停止后台。
+                    if result == Err(TaskError::InvalidInput) {
+                        result = tasks.finish(
+                            &id,
+                            TaskEnd::Failed {
+                                reason: "执行结果无法保存".into(),
+                            },
+                            TaskUsage::default(),
+                            now_ms(),
+                        );
+                    }
+                    match result {
                         Ok(_) => {}
-                        // 执行结束时取消请求已不在（不会发生）或任务不再执行中：保留账本原样。
+                        // 任务已不在执行中：保留账本原样。
                         Err(TaskError::InvalidTransition) => {}
                         Err(error) => return Err(error.into()),
                     }
