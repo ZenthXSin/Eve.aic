@@ -82,8 +82,8 @@ def collect(state_path):
     entries = state["entries"]
     receipts = json.loads(bytes(entries.get("eve.channel.qqbot", {}).get("receipts.v1", b'{"version":1,"entries":[]}')))
     sessions = json.loads(bytes(entries.get("eve.session", {}).get("sessions.v1", b'{"format_version":1,"sessions":{}}')))
-    # 回执格式 2 只增加分段片段状态；整体 state 与完整 reply 的含义不变。
-    if receipts.get("version") not in (1, 2) or sessions.get("format_version") != 1:
+    # 格式 2 增加分段、3 增加工具进展；均只按最终 state / reply 统计训练证据。
+    if receipts.get("version") not in (1, 2, 3) or sessions.get("format_version") != 1:
         raise ValueError("evidence_version")
     excluded, prior_turns = set(), {}
     baseline_path = state_path.parent / "round-baseline.v1.json"
