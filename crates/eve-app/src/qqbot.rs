@@ -1283,7 +1283,11 @@ async fn run_qqbot_composed(
                         memory,
                         lexical.clone(),
                         index.clone(),
-                        embeddings.clone(),
+                        Arc::new(qq_semantic::QueryEmbeddings {
+                            inner: embeddings.clone(),
+                            registry: registry.clone(),
+                            timing: crate::models::timing_enabled(),
+                        }),
                     )),
                     lexical,
                     context,

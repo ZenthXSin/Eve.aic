@@ -77,7 +77,8 @@ class RecallAcceptance(unittest.TestCase):
             self, id, text, expected=expected, contains=contains, **route)
 
     def run_eve(self, script, memory=True, cognition=False, recall=False,
-                app="1904159860", checkpoints=None, send_fail=False, success=True, extra=(), env_extra=None):
+                app="1904159860", checkpoints=None, send_fail=False, success=True, extra=(), env_extra=None,
+                panel=False):
         """使用既有替身协议，并为独立召回 opt-in 添加真实命令行参数。"""
         self.runs += 1
         self.run_release = threading.Event()
@@ -92,6 +93,8 @@ class RecallAcceptance(unittest.TestCase):
             EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
             EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
         env.update(env_extra or {})
+        if panel:
+            env['EVE_WEB_TOKEN'] = memory_harness.PANEL_TOKEN
         command = [str(memory_harness.BINARY), "--state-dir", str(self.work / "state"),
             "--agent", str(memory_harness.ROOT / "AGENT.md"), "--bridge-script",
             str(memory_harness.FAKE), "--bridge-arg", str(scenario)]
@@ -102,6 +105,8 @@ class RecallAcceptance(unittest.TestCase):
         if recall:
             command.append("--memory-recall")
         command.extend(extra)
+        if panel:
+            command.extend(['--web-listen', '127.0.0.1:0'])
 
         def inspect():
             for name, callback in (checkpoints or {}).items():
@@ -114,17 +119,23 @@ class RecallAcceptance(unittest.TestCase):
                     self.gate(name + "-continue").touch()
 
         inspector = threading.Thread(target=inspect, daemon=True)
-        child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.panel_stderr = self.work / f'panel-stderr-{self.runs}'
+        sink = self.panel_stderr.open('w')
+        child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+                                 stderr=sink if panel else subprocess.PIPE, text=True)
         inspector.start()
         try:
             stdout, stderr = child.communicate(timeout=30)
-            self.last_stderr = stderr
         finally:
             if child.poll() is None:
                 child.kill()
                 child.communicate()
             self.run_release.set()
             inspector.join(timeout=2)
+            sink.close()
+        if panel:
+            stderr = self.panel_stderr.read_text()
+        self.last_stderr = stderr
         self.events = [json.loads(line) for line in events_path.read_text().splitlines()] if events_path.exists() else []
         self.assertFalse(inspector.is_alive(), "snapshot inspector did not stop")
         self.assertFalse(error_path.exists(), error_path.read_text() if error_path.exists() else "")

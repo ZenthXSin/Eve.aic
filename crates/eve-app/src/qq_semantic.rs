@@ -4,17 +4,20 @@
 //! 延后注入。宿主在通道开始收消息前读取配置并注入，配置无效时拒绝启动。
 use crate::{AppError, config::OPENAI_NAMESPACE};
 use eve_config_api::{
-    ConfigService, MODELS_NAMESPACE, MODELS_SCHEMA_VERSION, ModelRole, ModelRolesConfig,
-    SemanticOptions,
+    CONFIG_SERVICE_ID, ConfigService, ConfigServiceHandle, MODELS_NAMESPACE, MODELS_SCHEMA_VERSION,
+    ModelRole, ModelRolesConfig, SemanticOptions,
 };
 use eve_llm_openai::OpenAiEmbeddings;
-use eve_plugin_api::{PluginError, PluginResult};
+use eve_plugin_api::{PluginError, PluginResult, ServiceId, ServiceRegistry};
 use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput};
 use eve_semantic_api::{EmbedFuture, EmbeddingError, EmbeddingProfile, EmbeddingProvider};
 use eve_semantic_plugin::{IndexError, IndexStepError, Indexer, MAX_ENTRIES};
 use std::{
-    sync::{Arc, Mutex, OnceLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{sync::watch, task::JoinHandle};
 
@@ -55,6 +58,101 @@ impl EmbeddingProvider for DeferredEmbeddings {
             Some(provider) => provider.embed(inputs),
             None => Box::pin(async { Err(EmbeddingError::Provider) }),
         }
+    }
+}
+
+/// 只限制在线召回查询的向量请求；后台建索引继续使用原提供者与模型超时。
+/// 每次查询读取配置，面板保存后下一条消息生效。取消超时的只读请求，不重试、不写索引。
+pub(crate) struct QueryEmbeddings {
+    pub(crate) inner: Arc<dyn EmbeddingProvider>,
+    pub(crate) registry: Arc<dyn ServiceRegistry>,
+    pub(crate) timing: bool,
+}
+impl QueryEmbeddings {
+    fn budget(&self) -> Result<Duration, EmbeddingError> {
+        let unavailable = || EmbeddingError::Provider;
+        let entry = self
+            .registry
+            .get(&ServiceId::new(CONFIG_SERVICE_ID).map_err(|_| unavailable())?)
+            .map_err(|_| unavailable())?
+            .ok_or_else(unavailable)?;
+        let settings = entry
+            .value
+            .downcast::<ConfigServiceHandle>()
+            .map_err(|_| unavailable())?;
+        let snapshot = settings
+            .0
+            .snapshot(OPENAI_NAMESPACE, 1)
+            .map_err(|_| unavailable())?;
+        let millis: u64 = snapshot
+            .get("semantic_query_timeout_ms")
+            .map_err(|_| unavailable())?;
+        if !(1..=30_000).contains(&millis) {
+            return Err(EmbeddingError::InvalidInput);
+        }
+        Ok(Duration::from_millis(millis))
+    }
+}
+impl EmbeddingProvider for QueryEmbeddings {
+    fn profile(&self) -> &EmbeddingProfile {
+        self.inner.profile()
+    }
+    fn embed<'a>(&'a self, inputs: &'a [String]) -> EmbedFuture<'a> {
+        Box::pin(async move {
+            let budget = self.budget()?;
+            let mut trace = QueryTiming::new(self.timing, budget);
+            let result = tokio::time::timeout(budget, self.inner.embed(inputs))
+                .await
+                .unwrap_or(Err(EmbeddingError::Timeout));
+            trace.finish(match &result {
+                Ok(_) => "embedding_ready",
+                Err(EmbeddingError::Timeout) => "embedding_timeout",
+                Err(_) => "embedding_failed",
+            });
+            result
+        })
+    }
+}
+
+static QUERY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+struct QueryTiming {
+    started: Option<Instant>,
+    query: u64,
+    budget_ms: u128,
+}
+impl QueryTiming {
+    fn new(enabled: bool, budget: Duration) -> Self {
+        let trace = Self {
+            started: enabled.then(Instant::now),
+            query: if enabled {
+                QUERY_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1
+            } else {
+                0
+            },
+            budget_ms: budget.as_millis(),
+        };
+        trace.emit("embedding_begin");
+        trace
+    }
+    fn emit(&self, phase: &str) {
+        if let Some(started) = self.started {
+            eprintln!(
+                "EVE_RECALL_TIMING {}",
+                serde_json::json!({
+                    "query": self.query, "phase": phase, "at_ms": now_ms(),
+                    "elapsed_ms": started.elapsed().as_millis(), "budget_ms": self.budget_ms,
+                })
+            );
+        }
+    }
+    fn finish(&mut self, phase: &str) {
+        self.emit(phase);
+        self.started = None;
+    }
+}
+impl Drop for QueryTiming {
+    fn drop(&mut self) {
+        self.emit("embedding_cancelled");
     }
 }
 
