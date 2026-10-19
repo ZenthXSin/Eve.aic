@@ -574,7 +574,12 @@ fn archive_step(
             .map(|(i, _)| i)
             .collect();
         completed.sort_by_key(|&i| record.snapshot.evidence[i].revision);
-        completed.truncate(completed.len().saturating_sub(policy.keep_recent));
+        let keep = if pressure {
+            policy.pressure_keep_recent
+        } else {
+            policy.keep_recent
+        };
+        completed.truncate(completed.len().saturating_sub(keep));
         // 分块修订段按序号递增，读取时可按页提前结束；更早的残留只留在热层。
         let floor = record.archive.last().map_or(0, ChunkRecord::last_revision);
         let eligible: Vec<usize> = completed

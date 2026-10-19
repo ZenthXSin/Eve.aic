@@ -667,3 +667,124 @@ async fn concurrent_imports_across_scopes_archive_consistently() {
     }
     stop(rig).await;
 }
+
+/// 只用本地会话快照构造第 `number` 次完成交互，不经会话插件；用于大量作用域。
+fn local(
+    scope: &MemoryScope,
+    session: &mut SessionSnapshot,
+    number: usize,
+) -> CompletedInteraction {
+    let (user, reply) = texts(scope, number);
+    session.turns.push(SessionTurn {
+        id: number as u64,
+        input: user.clone(),
+        status: SessionTurnStatus::Completed {
+            messages: vec![
+                ChatMessage::text(ChatRole::User, &user),
+                ChatMessage::text(ChatRole::Assistant, &reply),
+            ],
+        },
+    });
+    session.revision += 2;
+    CompletedInteraction {
+        evidence_id: format!("{}-e-{number}", scope.session_id),
+        message_id: format!("{}-m-{number}", scope.session_id),
+        at_ms: 1000 + number as u64,
+        snapshot: session.clone(),
+        turn_id: number as u64,
+    }
+}
+
+fn empty_session(scope: &MemoryScope) -> SessionSnapshot {
+    SessionSnapshot {
+        key: key(scope),
+        revision: 0,
+        turns: vec![],
+    }
+}
+
+#[tokio::test]
+async fn pressure_keeps_only_the_latest_per_scope_so_many_scopes_cannot_pin_the_hot_layer() {
+    let directory = tempfile::tempdir().unwrap();
+    let archive = Arc::new(FileEvidenceArchive::open(directory.path()).unwrap());
+    // 证据都很新：只有压力才会归档。平时每个作用域保留 4 条，10 个作用域就要 40 条，
+    // 超过压力线 20；压力下每个作用域只保留最近 1 条，热层才能回落。
+    let policy = ArchivePolicy {
+        trigger_evidence: 6,
+        pressure_evidence: 20,
+        keep_recent: 4,
+        pressure_keep_recent: 1,
+        min_age_ms: u64::MAX / 2,
+        min_chunk: 2,
+        max_chunk_evidence: 64,
+        max_chunk_bytes: 64 * 1024,
+        ..ArchivePolicy::default()
+    };
+    let rig = start(None, Some((archive, policy))).await.unwrap();
+    let scopes: Vec<_> = (0..10).map(|i| scope(&format!("p{i:02}"))).collect();
+    let mut sessions: Vec<_> = scopes.iter().map(empty_session).collect();
+    for number in 1..=6 {
+        for (scope, session) in scopes.iter().zip(sessions.iter_mut()) {
+            commit(&rig, scope, local(scope, session, number)).unwrap();
+            let hot = rig.admin.archive_status().unwrap().hot_evidence;
+            assert!(hot <= 20, "压力下热层应回落到压力线以内：{hot}");
+        }
+    }
+    let status = rig.admin.archive_status().unwrap();
+    assert_eq!(status.hot_evidence as u64 + status.archived_evidence, 60);
+    assert!(status.archived_evidence > 0 && status.last_error.is_none());
+    for scope in &scopes {
+        let snapshot = rig.admin.reader(scope.clone()).unwrap().snapshot().unwrap();
+        // 每个作用域的最新一条始终留在热层。
+        assert_eq!(snapshot.evidence.last().unwrap().revision, 6);
+        assert_complete(&rig.admin, scope, 6);
+    }
+    stop(rig).await;
+}
+
+#[tokio::test]
+async fn full_scope_capacity_refuses_new_scopes_without_writing_and_keeps_existing_ones() {
+    let state_dir = tempfile::tempdir().unwrap();
+    let state = RecordingStore::open(state_dir.path());
+    let rig = start(Some(state.clone()), None).await.unwrap();
+    let scopes: Vec<_> = (0..MAX_SCOPES)
+        .map(|i| scope(&format!("g{i:04}")))
+        .collect();
+    let mut sessions: Vec<_> = scopes.iter().map(empty_session).collect();
+    for (scope, session) in scopes.iter().zip(sessions.iter_mut()) {
+        commit(&rig, scope, local(scope, session, 1)).unwrap();
+    }
+    assert_eq!(rig.admin.scopes().unwrap().len(), MAX_SCOPES);
+    let writes = state.writes();
+    let newcomer = scope("newcomer");
+    let mut session = empty_session(&newcomer);
+    assert_eq!(
+        commit(&rig, &newcomer, local(&newcomer, &mut session, 1)),
+        Err(MemoryError::LimitReached)
+    );
+    assert_eq!(state.writes(), writes, "容量满时不写状态");
+    assert_eq!(rig.admin.scopes().unwrap().len(), MAX_SCOPES);
+    let snapshot = rig
+        .admin
+        .reader(newcomer.clone())
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    assert_eq!((snapshot.revision, snapshot.evidence.len()), (0, 0));
+    // 已有作用域照常采集。
+    commit(&rig, &scopes[7], local(&scopes[7], &mut sessions[7], 2)).unwrap();
+    assert_eq!(state.writes(), writes + 1);
+    stop(rig).await;
+    let rig = start(Some(state.clone()), None).await.unwrap();
+    assert_eq!(rig.admin.scopes().unwrap().len(), MAX_SCOPES);
+    assert_eq!(
+        rig.admin
+            .reader(scopes[7].clone())
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .revision,
+        2
+    );
+    stop(rig).await;
+}

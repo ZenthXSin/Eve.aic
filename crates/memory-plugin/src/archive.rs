@@ -19,6 +19,8 @@ pub(crate) const MAX_CHUNK_FILE_BYTES: u64 = 2 * 1024 * 1024;
 ///
 /// 只归档未被任何偏好版本引用、且不在作用域最近 `keep_recent` 条之内的完成交互；
 /// 未达到 `pressure_*` 时还要求记录早于 `min_age_ms`，给学习候选（7 天有效）留出确认时间。
+/// 达到 `pressure_*` 时每个作用域只保留最近 `pressure_keep_recent` 条，避免作用域多时
+/// 各自的近期保留量之和就超过热层硬上限。
 #[derive(Clone, Debug)]
 pub struct ArchivePolicy {
     pub trigger_evidence: usize,
@@ -26,6 +28,7 @@ pub struct ArchivePolicy {
     pub pressure_evidence: usize,
     pub pressure_bytes: usize,
     pub keep_recent: usize,
+    pub pressure_keep_recent: usize,
     pub min_age_ms: u64,
     pub min_chunk: usize,
     pub max_chunk_evidence: usize,
@@ -40,6 +43,7 @@ impl Default for ArchivePolicy {
             pressure_evidence: MAX_EVIDENCE - 256,
             pressure_bytes: 3 * 1024 * 1024,
             keep_recent: 8,
+            pressure_keep_recent: 1,
             min_age_ms: 8 * 24 * 60 * 60 * 1000,
             min_chunk: 16,
             max_chunk_evidence: 256,
@@ -55,6 +59,7 @@ impl ArchivePolicy {
             || self.pressure_evidence > MAX_EVIDENCE
             || self.trigger_bytes > self.pressure_bytes
             || self.pressure_bytes > MAX_STATE_BYTES
+            || self.pressure_keep_recent > self.keep_recent
             || self.min_chunk == 0
             || self.min_chunk > self.max_chunk_evidence
             || self.max_chunk_evidence > 4096

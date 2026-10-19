@@ -79,6 +79,8 @@ pub struct QqBotStatus {
     pub completed: u64,
     pub sent: u64,
     pub failed: u64,
+    /// 已送达但被交互观察者确定拒绝采集的交流数（如交互记忆容量已满）。
+    pub interactions_not_saved: u64,
 }
 #[derive(Clone)]
 pub struct QqBotStatusHandle {

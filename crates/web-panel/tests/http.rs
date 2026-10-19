@@ -111,6 +111,7 @@ impl PanelService for Service {
                 completed: 1,
                 sent: 1,
                 failed: 0,
+                interactions_not_saved: 0,
             },
         })
     }

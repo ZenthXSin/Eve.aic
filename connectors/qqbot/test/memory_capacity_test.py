@@ -128,4 +128,52 @@ class MemoryCapacityAcceptance(memory_test.MemoryAcceptance):
         self.assertEqual(self.only_snapshot()['archived_evidence'], 256)
 
 
+    def test_full_scope_capacity_keeps_serving_and_counts_unsaved_interactions(self):
+        self.run_eve([*self.send(self.message('seed-interaction', '已有交流来源')),
+                      *self.checkpoint('seeded')], checkpoints={'seeded': lambda: self.wait_until(
+                          lambda: len(self.interactions()) == 1, 'seed interaction not imported')})
+        # 用真实导入的作用域复制出 1024 个作用域（上限），模拟群里已有大量成员。
+        state = json.loads(self.state_path.read_text())
+        memory = json.loads(bytes(state['entries']['eve.memory']['memory.v1']))
+        record = memory['scopes'][0]
+        for index in range(1, 1024):
+            clone = copy.deepcopy(record)
+            clone['snapshot']['scope']['session_id'] = f'qq:synthetic-group-{index}'
+            clone['snapshot']['scope']['user_id'] = f'qq:synthetic-member-{index}'
+            clone['snapshot']['evidence'][0]['id'] = f'synthetic-{index}'
+            memory['scopes'].append(clone)
+        state['entries']['eve.memory']['memory.v1'] = list(json.dumps(memory).encode())
+        self.state_path.write_text(json.dumps(state, separators=(',', ':')))
+        before = self.memory()
+        seen = {}
+
+        def refused():
+            self.assertEqual(self.memory(), before, 'full capacity must not write memory')
+            seen['status'] = self.panel('/api/status', method='GET')
+
+        def imported():
+            self.wait_until(lambda: self.only_original()['revision'] == 2, 'existing scope not imported')
+
+        summary = self.run_eve([
+            *self.send(self.message('new-member', '新成员第一次说话', user='user-new')),
+            *self.checkpoint('refused'),
+            *self.send(self.message('old-member', '已有成员继续交流')),
+            *self.checkpoint('imported')], checkpoints={'refused': refused, 'imported': imported}, panel=True)
+        self.assertEqual(summary['sent'], 2)
+        self.assertEqual(summary['interactions_not_saved'], 1)
+        status, body = seen['status']
+        self.assertEqual(status, 200)
+        self.assertEqual(body['qq']['interactions_not_saved'], 1)
+        self.assertEqual(len(self.snapshots()), 1024)
+        self.assertIn('interaction_not_saved', self.panel_stderr.read_text())
+
+        # 重启后容量仍满：新成员仍只跳过采集，已有记录不变，实例正常运行。
+        summary = self.run_eve(self.send(self.message('new-member-again', '重启后新成员再说话', user='user-new')))
+        self.assertEqual((summary['sent'], summary['interactions_not_saved']), (1, 1))
+        self.assertEqual(len(self.snapshots()), 1024)
+        self.assertEqual(self.only_original()['revision'], 2)
+
+    def only_original(self):
+        return next(s for s in self.snapshots() if not s['scope']['session_id'].startswith('qq:synthetic-'))
+
 if __name__ == '__main__': unittest.main()
