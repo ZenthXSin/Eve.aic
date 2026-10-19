@@ -142,6 +142,25 @@ impl LocalDeveloper {
         }
         Ok(())
     }
+    fn authorize_operation(
+        &self,
+        operation: &DeveloperOperation,
+        context: &ToolExecutionContext,
+    ) -> Result<(), ToolExecutionError> {
+        if matches!(operation, DeveloperOperation::Github(_))
+            && self.config.github
+            && self.config.github_all_users
+        {
+            if context.is_cancel_requested() {
+                return Err(ToolExecutionError::Cancelled("开发操作已取消".into()));
+            }
+            if context.scope().is_none_or(|s| s.user_id.trim().is_empty()) {
+                return Err(failed("GitHub 工具需要宿主绑定的用户身份"));
+            }
+            return Ok(());
+        }
+        self.authorize(context)
+    }
     fn path(&self, text: &str, new: bool) -> Result<PathBuf, ToolExecutionError> {
         let relative = Path::new(text);
         if relative.is_absolute()
@@ -557,10 +576,11 @@ impl LocalDeveloper {
             ));
         }
         if a.method != "GET"
-            && (!self
-                .config
-                .github_write_repositories
-                .contains(&a.repository)
+            && ((!self.config.github_all_repositories
+                && !self
+                    .config
+                    .github_write_repositories
+                    .contains(&a.repository))
                 || self.token.is_none())
         {
             return Err(failed("此仓库的 GitHub 写权限未配置或缺少凭据"));
@@ -808,9 +828,9 @@ impl DeveloperBackend for LocalDeveloper {
         context: ToolExecutionContext,
     ) -> ToolFuture<'_> {
         Box::pin(async move {
-            self.authorize(&context)?;
+            self.authorize_operation(&operation, &context)?;
             let _serial = tokio::select! {lock=self.serial.lock()=>lock,_=cancelled(&context)=>return Err(ToolExecutionError::Cancelled("等待中的开发操作已取消".into()))};
-            self.authorize(&context)?;
+            self.authorize_operation(&operation, &context)?;
             let kind = match &operation {
                 DeveloperOperation::List(_) => "list",
                 DeveloperOperation::Read(_) => "read",

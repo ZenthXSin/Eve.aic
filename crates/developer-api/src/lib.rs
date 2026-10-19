@@ -22,6 +22,12 @@ pub struct DeveloperConfig {
     pub commands: bool,
     #[serde(default)]
     pub github: bool,
+    /// 向所有具有宿主绑定身份的聊天用户开放 GitHub 工具；不开放文件/命令/升级工具。
+    #[serde(default)]
+    pub github_all_users: bool,
+    /// GitHub 写入不再使用宿主仓库白名单，仍受 token 的实际授权约束。
+    #[serde(default)]
+    pub github_all_repositories: bool,
     #[serde(default)]
     pub github_write_repositories: BTreeSet<String>,
     #[serde(default = "token_env")]

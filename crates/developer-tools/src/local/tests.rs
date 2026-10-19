@@ -13,6 +13,8 @@ fn config(root: &Path) -> DeveloperConfig {
         operators: BTreeSet::from(["owner".into()]),
         commands: true,
         github: true,
+        github_all_users: false,
+        github_all_repositories: false,
         github_write_repositories: BTreeSet::from(["test/repo".into()]),
         github_token_env: "EVE_GITHUB_TOKEN".into(),
         command_timeout_ms: 10_000,
@@ -150,6 +152,109 @@ async fn identity_paths_and_corrupt_journal_are_rejected_without_cleanup() {
         bytes
     );
 }
+#[tokio::test]
+async fn public_github_allows_guest_write_without_granting_local_tools() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut settings = config(root.path());
+    settings.github_all_users = true;
+    settings.github_all_repositories = true;
+    let mut backend = LocalDeveloper::new(
+        settings.clone(),
+        ledger.path().into(),
+        Some("SYNTHETIC_GITHUB_TOKEN".into()),
+    )
+    .unwrap();
+    backend.api = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let write = GithubArguments {
+        method: "PATCH".into(),
+        repository: "foreign/repo".into(),
+        resource: "issues/1".into(),
+        query: BTreeMap::new(),
+        body: Some(json!({"title":"updated"})),
+    };
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = vec![0; 8192];
+        let n = socket.read(&mut request).await.unwrap();
+        let request = String::from_utf8_lossy(&request[..n]);
+        assert!(request.starts_with("PATCH /repos/foreign/repo/issues/1 HTTP/1.1"));
+        assert!(
+            request
+                .to_lowercase()
+                .contains("authorization: bearer synthetic_github_token")
+        );
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .await
+            .unwrap();
+    });
+    let result = backend
+        .execute(DeveloperOperation::Github(write.clone()), context("guest"))
+        .await
+        .unwrap();
+    assert_eq!(result["success"], true);
+    server.await.unwrap();
+    for operation in [
+        DeveloperOperation::Read(file("README.md")),
+        DeveloperOperation::PrepareUpgrade,
+        DeveloperOperation::UpgradeStatus,
+        DeveloperOperation::Command(CommandArguments {
+            program: "must-not-run".into(),
+            args: vec![],
+            cwd: ".".into(),
+            timeout_ms: None,
+        }),
+    ] {
+        assert!(backend.execute(operation, context("guest")).await.is_err());
+    }
+    assert!(
+        backend
+            .execute(
+                DeveloperOperation::Github(write.clone()),
+                ToolExecutionContext::new()
+            )
+            .await
+            .is_err()
+    );
+    settings.github_all_repositories = false;
+    let restricted = LocalDeveloper::new(
+        settings.clone(),
+        ledger.path().into(),
+        Some("SYNTHETIC_GITHUB_TOKEN".into()),
+    )
+    .unwrap();
+    assert!(
+        restricted
+            .execute(DeveloperOperation::Github(write.clone()), context("guest"))
+            .await
+            .is_err()
+    );
+    settings.github_all_users = false;
+    settings.github_all_repositories = true;
+    let owners = LocalDeveloper::new(
+        settings.clone(),
+        ledger.path().into(),
+        Some("SYNTHETIC_GITHUB_TOKEN".into()),
+    )
+    .unwrap();
+    assert!(
+        owners
+            .execute(DeveloperOperation::Github(write.clone()), context("guest"))
+            .await
+            .is_err()
+    );
+    settings.github_all_users = true;
+    let no_token = LocalDeveloper::new(settings, ledger.path().into(), None).unwrap();
+    assert!(
+        no_token
+            .execute(DeveloperOperation::Github(write), context("guest"))
+            .await
+            .is_err()
+    );
+}
+
 #[tokio::test]
 async fn github_actual_http_binds_host_token_decodes_source_and_redacts_result() {
     let root = tempfile::tempdir().unwrap();
