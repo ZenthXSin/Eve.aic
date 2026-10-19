@@ -1,6 +1,6 @@
 //! 组合 QQ 已送达凭据与公开 Session/Memory 服务，不补采历史回执。
 use crate::qq_memory;
-use eve_memory_api::{CompletedInteraction, MemoryAdmin};
+use eve_memory_api::{CompletedInteraction, MemoryAdmin, MemoryError};
 use eve_plugin_api::{PluginError, PluginResult};
 use eve_qqbot_plugin::{QqInteraction, QqInteractionObserver};
 use eve_session_api::SessionService;
@@ -17,6 +17,12 @@ pub(crate) struct Observer {
 
 fn failure() -> PluginError {
     PluginError::State("交互记忆保存无法确认；QQ Sent 已保留，不自动重试。".into())
+}
+
+/// 容量满是写入前的确定拒绝：没有写入任何内容，原记录完整保留，因此只跳过本次采集，
+/// 不像提交结果不确定那样停止实例。
+fn refused() -> PluginError {
+    PluginError::Task("交互记忆容量已满；本次交流未写入记忆，原记录保留".into())
 }
 
 impl QqInteractionObserver for Observer {
@@ -70,7 +76,10 @@ impl QqInteractionObserver for Observer {
                     turn_id: interaction.turn_id(),
                 },
             )
-            .map_err(|_| failure())?;
+            .map_err(|error| match error {
+                MemoryError::LimitReached => refused(),
+                _ => failure(),
+            })?;
         if saved.scope != scope {
             return Err(failure());
         }

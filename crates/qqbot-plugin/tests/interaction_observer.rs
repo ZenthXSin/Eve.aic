@@ -96,6 +96,7 @@ impl QqInteractionObserver for Observer {
         match self.broken {
             1 => Err(PluginError::State("observer private detail".into())),
             2 => panic!("observer panic"),
+            3 => Err(PluginError::Task("observer refused detail".into())),
             _ => Ok(()),
         }
     }
@@ -489,6 +490,46 @@ async fn observer_failure_preserves_sent_closes_and_never_retries() {
         assert!(!h.closed().await.terminal_error);
         assert_eq!(observer.seen.lock().unwrap().len(), 1);
     }
+}
+
+#[tokio::test]
+async fn definite_observer_refusal_is_counted_and_the_channel_keeps_serving() {
+    let store = Arc::new(ReceiptStore::default());
+    let observer = Arc::new(Observer {
+        store: store.clone(),
+        broken: 3,
+        ..Observer::default()
+    });
+    let mut h = Harness::open(
+        store.clone(),
+        Some(observer.clone()),
+        json!({"messages": [message("m1", "第一问"), message("m2", "第二问")]}),
+        false,
+        false,
+    )
+    .await;
+    let status = h.closed().await;
+    assert!(!status.terminal_error);
+    assert_eq!((status.sent, status.failed), (2, 0));
+    assert_eq!(status.interactions_not_saved, 2);
+    assert_eq!(observer.seen.lock().unwrap().len(), 2);
+    for entry in store.receipts()["entries"].as_array().unwrap() {
+        assert_eq!(entry["state"], "Sent");
+    }
+    let logs = h.logger.snapshot().unwrap();
+    let refusals = logs
+        .records
+        .iter()
+        .filter(|r| r.entry.message == "interaction_not_saved")
+        .count();
+    assert_eq!(refusals, 2);
+    assert!(!format!("{logs:?}").contains("observer refused detail"));
+    assert!(
+        !logs
+            .records
+            .iter()
+            .any(|r| r.entry.message == "interaction_observer_failed_no_retry")
+    );
 }
 
 #[tokio::test]
