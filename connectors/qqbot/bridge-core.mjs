@@ -48,8 +48,12 @@ export function optionsFromEnv(env) {
   const appId = env.QQBOT_APP_ID || "1904159860";
   if (!validId(appId) || !env.QQBOT_APP_SECRET?.trim()) throw new Error("credentials_missing");
   if (!["", "true", "false"].includes(env.QQBOT_SANDBOX || "")) throw new Error("sandbox_invalid");
+  // Markdown needs a separately reviewed permission; without it QQ rejects every
+  // send with 40034090, so it stays opt-in and an invalid value fails closed.
+  if (!["", "true", "false"].includes(env.QQBOT_MARKDOWN || "")) throw new Error("markdown_invalid");
   return {
     appId, appSecret: env.QQBOT_APP_SECRET, intents: 1 << 25,
+    markdownSupport: env.QQBOT_MARKDOWN === "true",
     baseUrl: env.QQBOT_SANDBOX === "true" ? "https://sandbox.api.sgroup.qq.com" : "https://api.sgroup.qq.com",
     tokenBaseUrl: "https://bots.qq.com",
     logger: { info() {}, warn() {}, error() {}, debug() {} },

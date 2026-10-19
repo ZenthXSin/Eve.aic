@@ -67,6 +67,8 @@ pub struct QqBotConfig {
     pub app_id: String,
     pub app_secret: String,
     pub sandbox: bool,
+    /// 机器人是否拥有 Markdown 权限；无权限时平台拒绝所有发送，故默认关闭。
+    pub markdown: bool,
 }
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct QqBotStatus {

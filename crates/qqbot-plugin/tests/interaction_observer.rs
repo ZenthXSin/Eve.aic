@@ -240,6 +240,7 @@ impl Harness {
             app_id: "app".into(),
             app_secret: "test-app-secret".into(),
             sandbox: true,
+            markdown: false,
         })
         .unwrap()
         .with_training()
@@ -311,6 +312,7 @@ fn session_dependency_is_explicit_and_added_once() {
             app_id: "app".into(),
             app_secret: "test-app-secret".into(),
             sandbox: true,
+            markdown: false,
         })
         .unwrap()
     };

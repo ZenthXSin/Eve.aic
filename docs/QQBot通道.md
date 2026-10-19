@@ -65,6 +65,16 @@ QQ 也默认记录参与者称呼：平台提供昵称时接收，或用“我�
 
 Learning 批次先保存 `Running` 和输入，再发起请求；恢复将残留 `Running` 记为 `Interrupted`，不自动继续。确认只用一次 Memory CAS 保存真实命令与偏好，Learning 候选保持不变；新查询核对首版来源与当前偏好状态，避免跨插件接受状态双写。新增 `eve.learning/learning.v1`，不改变原 `memory.v1`；文件和 PostgreSQL 都按各插件独立提交，损坏或提交无法确认时停止并保留状态。全局容量、输入和输出边界及恢复说明见[偏好提炼](./偏好提炼.md)。
 
+## Markdown 消息
+
+追加 `--markdown` 后，被动回复、分段片段与主动私聊改用 `markdown` 字段、`msg_type=2` 发送，而不是 `content`、`msg_type=0`。默认关闭。
+
+Markdown 需要机器人通过平台单独审核；未审核的机器人开启后，QQ 服务端会以 `40034090` 拒绝全部发送，因此宿主只在显式开启时把 `QQBOT_MARKDOWN=true` 传给桥接，非法值拒绝启动，缺省即为纯文本。发送失败按原有回执记为 `Failed`，不重试、不改回纯文本重发。
+
+```sh
+./target/debug/eve-qqbot --state-dir .eve-qqbot --markdown
+```
+
 ## 分段投递
 
 追加 `--segmented` 后，已完成的模型回复按自然段分成至多 3 条消息，段间停顿至多 2.5 秒；命令确认整条发送。默认关闭，未开启时协议与回执格式不变。
