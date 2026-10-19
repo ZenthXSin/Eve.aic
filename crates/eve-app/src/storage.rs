@@ -74,6 +74,12 @@ fn read_private_file(path: &std::path::Path) -> Result<Vec<u8>, AppError> {
     Ok(bytes)
 }
 
+/// 交互记忆归档分块目录；无论文件或 PostgreSQL 状态后端，分块都放在状态目录内，
+/// 备份与迁移必须连同此目录一起进行。
+pub(crate) fn memory_archive_directory(state_directory: &std::path::Path) -> std::path::PathBuf {
+    state_directory.join("memory-archive")
+}
+
 pub(crate) fn open_state_store(
     directory_path: &Path,
     database_config: Option<&Path>,

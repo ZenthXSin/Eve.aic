@@ -91,6 +91,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 assistant_text: "旧助手未核实的自述，不进入摘要输入".into(),
             },
         }],
+        archived_evidence: 0,
     };
     let model = extractor(r#"{"points":[{"text":"用户对 Mindustry 模组创作感兴趣，希望了解入门方法","quotes":[{"evidence_id":"public-e1","text":"我喜欢 Mindustry 的模组，但不知道怎么创作"}]}]}"#.into());
     let mut calls = 0;

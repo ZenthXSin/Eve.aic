@@ -401,6 +401,43 @@ async fn consumed_sources_cannot_be_removed_rewritten_aliased_or_rewound() {
 }
 
 #[tokio::test]
+async fn consumed_sources_moved_to_the_memory_archive_are_not_a_conflict() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = RecordingStore::open(directory.path());
+    let (kernel, admin) = open(store.clone()).await;
+    let source = memory(scope("s", "u"), 3);
+    let first = reserve(&admin, &source, 100);
+    admin
+        .finish(&first, 150, LearningOutcome::Completed(vec![]))
+        .unwrap();
+    // 记忆把已提炼的第 1 条移入归档，同时导入了第 4 条。
+    let mut archived = memory(source.scope.clone(), 4);
+    archived.evidence.remove(0);
+    archived.archived_evidence = 1;
+    let next = reserve(&admin, &archived, 200);
+    assert_eq!(
+        next.evidence
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["e-4"]
+    );
+    // 归档不能掩盖热层里同 ID 的不同内容。
+    let mut rewritten = memory(source.scope.clone(), 5);
+    rewritten.archived_evidence = 1;
+    let EvidenceSource::CompletedInteraction { user_text, .. } = &mut rewritten.evidence[1].source
+    else {
+        unreachable!()
+    };
+    *user_text = "不能覆盖旧来源".into();
+    assert_eq!(
+        admin.reserve(&rewritten, 300, "v2", &options()),
+        Err(LearningError::Conflict)
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
 async fn candidate_validation_rejects_foreign_references_and_never_partially_finishes() {
     let directory = tempfile::tempdir().unwrap();
     let store = RecordingStore::open(directory.path());

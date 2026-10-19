@@ -173,12 +173,27 @@ impl StoredSummaries {
                 .flat_map(|p| p.quotes.iter().map(|q| &q.evidence_id))
                 .collect();
             let new_ids: Vec<_> = new.iter().map(|s| s.evidence_id.clone()).collect();
-            let sources = snapshot
+            let mut sources: Vec<SummarySource> = snapshot
                 .evidence
                 .iter()
                 .filter(|e| referenced.contains(&e.id) || new_ids.contains(&e.id))
                 .filter_map(user_source)
                 .collect();
+            // 旧观点引用的来源已移入记忆归档时，沿用此前批次保存的逐字副本。
+            for id in &referenced {
+                if sources.iter().any(|s| &&s.evidence_id == id) {
+                    continue;
+                }
+                let copy = jobs
+                    .iter()
+                    .rev()
+                    .flat_map(|j| j.batch.sources.iter())
+                    .find(|s| &&s.evidence_id == id)
+                    .filter(|s| archived_source(snapshot, s))
+                    .ok_or(MemoryError::Conflict)?;
+                sources.push(copy.clone());
+            }
+            sources.sort_by_key(|s| s.revision);
             let batch = SummaryBatch {
                 sequence: inner.document.jobs.len() as u64 + 1,
                 scope: snapshot.scope.clone(),

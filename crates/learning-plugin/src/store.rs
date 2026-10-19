@@ -220,7 +220,10 @@ impl StoredLearning {
                 return Err(LearningError::Conflict);
             }
             for evidence in &record.job.batch.evidence {
-                if !memory.evidence.iter().any(|value| value == evidence) {
+                // 已提炼批次的来源可能已移入记忆归档；热层同 ID 不同内容仍是冲突。
+                if !memory.evidence.iter().any(|value| value == evidence)
+                    && !memory.may_be_archived(evidence)
+                {
                     return Err(LearningError::Conflict);
                 }
                 consumed.insert(evidence.id.as_str());
@@ -580,7 +583,9 @@ fn validate_memory(memory: &MemorySnapshot) -> LearningResult<()> {
         .validate()
         .map_err(|_| LearningError::InvalidInput)?;
     if memory.evidence.len() > eve_memory_api::MAX_EVIDENCE
-        || memory.revision > (eve_memory_api::MAX_EVIDENCE + eve_memory_api::MAX_HISTORY) as u64
+        || memory.revision
+            > (eve_memory_api::MAX_EVIDENCE + eve_memory_api::MAX_HISTORY) as u64
+                + memory.archived_evidence
     {
         return Err(LearningError::InvalidInput);
     }
@@ -608,7 +613,6 @@ fn validate_batch(batch: &LearningBatch, memory_revision: u64) -> LearningResult
         .map_err(|_| LearningError::InvalidInput)?;
     validate_id(&batch.extractor_version).map_err(|_| LearningError::InvalidInput)?;
     if memory_revision == 0
-        || memory_revision > (eve_memory_api::MAX_EVIDENCE + eve_memory_api::MAX_HISTORY) as u64
         || batch.evidence.is_empty()
         || batch.evidence.len() > MAX_BATCH_EVIDENCE
         || batch.id != batch_id(&batch.scope, &batch.extractor_version, &batch.evidence)?

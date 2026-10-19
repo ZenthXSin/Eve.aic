@@ -17,10 +17,14 @@ pub const MEMORY_CLI_HELP: &str = "Eve 本地记忆只读入口
   --channel 通道 --session 会话 --user 用户 show --id 偏好ID [--page 1] [--page-size 20]
   --channel 通道 --session 会话 --user 用户 evidence --id 证据ID
   --channel 通道 --session 会话 --user 用户 recall --query 关键词 [--limit 5]
+  --channel 通道 --session 会话 --user 用户 archived [--after 修订] [--limit 20]
   scopes [--page 1] [--page-size 20]
-list/show/evidence/recall 可加 --include-content，显式显示至多 512 UTF-8 字节的正文预览。
+  archive-status
+list/show/evidence/recall/archived 可加 --include-content，显式显示至多 512 UTF-8 字节的正文预览。
 默认只输出标识、来源、计数和有效状态，不输出正文。页大小为 1 至 50。
-recall 为本地词法召回，查询上限 1024 UTF-8 字节，最多 1 至 8 项；分数不代表事实可信度。
+recall 为本地词法召回，只查热层，查询上限 1024 UTF-8 字节，最多 1 至 8 项；分数不代表事实可信度。
+archived 按修订升序逐页读出已移入归档分块的完成交互，每页 1 至 64 条，逐块核对摘要；
+用上一页的 next_after 继续。archive-status 显示热层容量、分块数和未被引用的分块，不读正文。
 作用域三个字段必须完整提供；scopes 只供可信本地管理员枚举已有作用域。
 命令不调用模型，不修改记忆，不初始化新状态目录；使用现有后端排他锁。
 PostgreSQL 只接受已绑定的状态目录与匹配配置；不会自动迁移或清空损坏状态。
@@ -35,7 +39,9 @@ enum MemoryCommand {
     Show { id: String },
     Evidence { id: String },
     Recall { request: MemoryRecallRequest },
+    Archived { after: u64, limit: usize },
     Scopes,
+    ArchiveStatus,
 }
 
 impl MemoryCommand {
@@ -46,7 +52,9 @@ impl MemoryCommand {
             Self::Show { .. } => "show",
             Self::Evidence { .. } => "evidence",
             Self::Recall { .. } => "recall",
+            Self::Archived { .. } => "archived",
             Self::Scopes => "scopes",
+            Self::ArchiveStatus => "archive-status",
         }
     }
 }
@@ -78,7 +86,18 @@ impl MemoryCliOptions {
             let arg = arg
                 .into_string()
                 .map_err(|_| "记忆命令参数必须为 UTF-8。")?;
-            if ["status", "list", "show", "evidence", "recall", "scopes"].contains(&arg.as_str()) {
+            if [
+                "status",
+                "list",
+                "show",
+                "evidence",
+                "recall",
+                "archived",
+                "scopes",
+                "archive-status",
+            ]
+            .contains(&arg.as_str())
+            {
                 if command.replace(arg).is_some() {
                     return Err("只能指定一个记忆命令。".into());
                 }
@@ -101,6 +120,7 @@ impl MemoryCliOptions {
                 "--page-size",
                 "--query",
                 "--limit",
+                "--after",
             ]
             .contains(&arg.as_str())
             {
@@ -144,6 +164,20 @@ impl MemoryCliOptions {
                 }
             }
             "scopes" => MemoryCommand::Scopes,
+            "archive-status" => MemoryCommand::ArchiveStatus,
+            "archived" => {
+                let after = match fields.remove("--after") {
+                    None => 0,
+                    Some(value) if value.bytes().all(|b| b.is_ascii_digit()) => value
+                        .parse::<u64>()
+                        .map_err(|_| "--after 必须是非负整数修订。")?,
+                    Some(_) => return Err("--after 必须是非负整数修订。".into()),
+                };
+                let limit = positive_number(fields.remove("--limit"), view::PAGE_SIZE)?;
+                eve_memory_api::validate_archive_page_limit(limit)
+                    .map_err(|_| "archived 每页 1 至 64 条。")?;
+                MemoryCommand::Archived { after, limit }
+            }
             "recall" => {
                 let query = fields.remove("--query").ok_or("recall 缺少 --query。")?;
                 if !query.chars().any(char::is_alphanumeric) {
@@ -156,7 +190,10 @@ impl MemoryCliOptions {
             }
             _ => unreachable!(),
         };
-        let scope = if matches!(command, MemoryCommand::Scopes) {
+        let scope = if matches!(
+            command,
+            MemoryCommand::Scopes | MemoryCommand::ArchiveStatus
+        ) {
             None
         } else {
             let scope = MemoryScope {
@@ -188,7 +225,11 @@ impl MemoryCliOptions {
             (1, view::PAGE_SIZE)
         };
         if !fields.is_empty()
-            || (include_content && matches!(command, MemoryCommand::Status | MemoryCommand::Scopes))
+            || (include_content
+                && matches!(
+                    command,
+                    MemoryCommand::Status | MemoryCommand::Scopes | MemoryCommand::ArchiveStatus
+                ))
         {
             return Err("当前记忆命令不接受所给参数。".into());
         }
@@ -231,7 +272,12 @@ pub async fn run_memory_cli(options: MemoryCliOptions) -> Result<Value, AppError
         ..KernelServices::default()
     });
     let result = async {
-        let plugin = MemoryPlugin::new()?;
+        // 只读打开：目录不存在时视为没有分块，不创建目录、不新建分块。
+        let archive = eve_memory_plugin::FileEvidenceArchive::open_read_only(
+            crate::storage::memory_archive_directory(&options.state_directory),
+        );
+        let plugin = MemoryPlugin::new()?
+            .with_archive(Arc::new(archive), eve_memory_plugin::ArchivePolicy::default())?;
         let admin = plugin.controller();
         kernel.register(Box::new(plugin))?;
         kernel.start(&PluginId::new(MEMORY_PLUGIN_ID)?).await?;
@@ -243,10 +289,15 @@ pub async fn run_memory_cli(options: MemoryCliOptions) -> Result<Value, AppError
         });
         let data = if matches!(options.command, MemoryCommand::Scopes) {
             view::scopes(admin.scopes()?, options.page, options.page_size)?
+        } else if matches!(options.command, MemoryCommand::ArchiveStatus) {
+            json!({ "archive": admin.archive_status()? })
         } else {
             let scope = options.scope.as_ref().ok_or("记忆作用域缺失。")?;
             report["scope"] = serde_json::to_value(scope)?;
-            if let MemoryCommand::Recall { request } = &options.command {
+            if let MemoryCommand::Archived { after, limit } = &options.command {
+                let page = admin.reader(scope.clone())?.archived(*after, *limit)?;
+                view::archived(page, *after, *limit, options.include_content)
+            } else if let MemoryCommand::Recall { request } = &options.command {
                 let recall = LexicalMemoryRecall::new(Arc::new(admin)).reader(scope.clone())?;
                 let response = recall.recall(request)?;
                 response.validate_for(scope, request)?;
@@ -288,7 +339,10 @@ pub async fn run_memory_cli(options: MemoryCliOptions) -> Result<Value, AppError
                 MemoryCommand::Evidence { id } => {
                     view::evidence(&snapshot, id, options.include_content)?
                 }
-                MemoryCommand::Scopes | MemoryCommand::Recall { .. } => unreachable!(),
+                MemoryCommand::Scopes
+                | MemoryCommand::ArchiveStatus
+                | MemoryCommand::Archived { .. }
+                | MemoryCommand::Recall { .. } => unreachable!(),
                 }
             }
         };

@@ -45,6 +45,7 @@ fn input() -> (PreferenceCandidate, LearningBatch, MemorySnapshot) {
         revision: 2,
         evidence,
         preferences: vec![],
+        archived_evidence: 0,
     };
     (candidate, batch, memory)
 }

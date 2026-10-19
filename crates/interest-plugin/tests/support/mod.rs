@@ -93,6 +93,7 @@ pub fn memory(scope: MemoryScope, texts: &[&str]) -> MemorySnapshot {
             .map(|(index, text)| evidence(index as u64 + 1, text))
             .collect(),
         preferences: vec![],
+        archived_evidence: 0,
     }
 }
 

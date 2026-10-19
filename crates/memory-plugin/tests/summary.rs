@@ -78,6 +78,7 @@ fn snapshot(n: u64) -> MemorySnapshot {
                 },
             })
             .collect(),
+        archived_evidence: 0,
     }
 }
 fn options() -> SummaryOptions {
@@ -197,6 +198,21 @@ async fn restart_preserves_completed_summary_and_interrupts_without_replaying_co
         effective_points(&jobs[0], &snapshot(2)).unwrap(),
         vec![point("e-1")]
     );
+    // 来源移入记忆归档后，观点仍有效；热层同 ID 的不同内容仍是冲突。
+    let mut archived = snapshot(2);
+    archived.evidence.remove(0);
+    archived.archived_evidence = 1;
+    assert_eq!(
+        effective_points(&jobs[0], &archived).unwrap(),
+        vec![point("e-1")]
+    );
+    let mut rewritten = snapshot(2);
+    rewritten.archived_evidence = 1;
+    rewritten.evidence[0].at_ms += 1;
+    assert_eq!(
+        effective_points(&jobs[0], &rewritten),
+        Err(MemoryError::Conflict)
+    );
     let writes = store.writes.load(Ordering::SeqCst);
     assert!(
         restored
@@ -205,17 +221,22 @@ async fn restart_preserves_completed_summary_and_interrupts_without_replaying_co
             .is_none()
     );
     assert_eq!(writes, store.writes.load(Ordering::SeqCst));
+    // 下一批次继承旧观点：被引用的第 1 条已归档，逐字副本取自旧批次。
+    let mut third = snapshot(3);
+    third.evidence.remove(0);
+    third.archived_evidence = 1;
     let next = restored
-        .reserve(&snapshot(3), 101, "v1", options())
+        .reserve(&third, 101, "v1", options())
         .unwrap()
         .unwrap();
     assert_eq!(next.previous, vec![point("e-1")]);
+    assert_eq!(next.sources[0].evidence_id, "e-1");
     restored
         .finish(&next, 102, Err(SummaryFailure::Provider))
         .unwrap();
     assert!(
         restored
-            .reserve(&snapshot(3), 103, "v1", options())
+            .reserve(&third, 103, "v1", options())
             .unwrap()
             .is_none()
     );

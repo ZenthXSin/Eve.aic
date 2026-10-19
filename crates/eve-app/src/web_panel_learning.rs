@@ -324,6 +324,7 @@ mod tests {
                     status: PreferenceStatus::Confirmed,
                 }],
             }],
+            archived_evidence: 0,
         };
         let learning = Arc::new(Learning {
             snapshot: LearningSnapshot {

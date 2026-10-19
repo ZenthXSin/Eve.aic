@@ -31,6 +31,7 @@ fn source() -> MemorySnapshot {
             })
             .collect(),
         preferences: vec![],
+        archived_evidence: 0,
     }
 }
 

@@ -57,6 +57,7 @@ fn fixture(text: &str) -> Fixture {
         revision: 12,
         evidence,
         preferences: vec![],
+        archived_evidence: 0,
     };
     Fixture {
         candidate,

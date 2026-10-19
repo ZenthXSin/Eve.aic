@@ -101,11 +101,11 @@ pub fn effective_points(
     validate_batch(&job.batch)?;
     validate_summary_points(&job.batch, &job.points)?;
     for source in &job.batch.sources {
-        if !snapshot
+        let hot = snapshot
             .evidence
             .iter()
-            .any(|e| user_source(e).as_ref() == Some(source))
-        {
+            .any(|e| user_source(e).as_ref() == Some(source));
+        if !hot && !archived_source(snapshot, source) {
             return Err(MemoryError::Conflict);
         }
     }
@@ -129,4 +129,15 @@ pub fn effective_points(
         })
         .cloned()
         .collect())
+}
+
+/// 不在热层的摘要来源是否可能已移入记忆归档；热层同 ID 或同修订的不同内容仍是冲突。
+pub(crate) fn archived_source(snapshot: &MemorySnapshot, source: &SummarySource) -> bool {
+    snapshot.archived_evidence > 0
+        && source.revision > 0
+        && source.revision <= snapshot.revision
+        && !snapshot
+            .evidence
+            .iter()
+            .any(|e| e.id == source.evidence_id || e.revision == source.revision)
 }

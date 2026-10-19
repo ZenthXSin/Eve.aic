@@ -82,3 +82,12 @@ pub fn complete_session(
         .unwrap();
     sessions.snapshot(key).unwrap().unwrap()
 }
+
+/// 直接读取文件状态中某个插件键的原始字节文本，核对实际写出的格式。
+#[allow(dead_code)]
+pub fn raw_state(directory: &Path, namespace: &str, key: &str) -> String {
+    let text = std::fs::read_to_string(directory.join("state.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let bytes: Vec<u8> = serde_json::from_value(value["entries"][namespace][key].clone()).unwrap();
+    String::from_utf8(bytes).unwrap()
+}

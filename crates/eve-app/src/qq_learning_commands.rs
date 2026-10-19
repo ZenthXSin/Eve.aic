@@ -1550,6 +1550,7 @@ mod tests {
             revision: 0,
             evidence: vec![],
             preferences: vec![],
+            archived_evidence: 0,
         };
         let selected = candidates(&learning, &scope).unwrap();
         let reply = list(&selected, &memory, &[], 1, 3).unwrap();

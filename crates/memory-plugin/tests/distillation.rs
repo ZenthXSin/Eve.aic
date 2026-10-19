@@ -24,6 +24,7 @@ fn snapshot() -> MemorySnapshot {
                 },
             })
             .collect(),
+        archived_evidence: 0,
     }
 }
 

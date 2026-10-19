@@ -1,4 +1,6 @@
 //! 带来源的交互记忆与明确偏好契约；身份绑定、明确意图判断和投递确认由可信宿主负责。
+mod archive;
+pub use archive::*;
 mod continuity;
 mod distillation;
 pub use continuity::*;
@@ -15,7 +17,8 @@ use std::{fmt, sync::Arc};
 
 pub const MEMORY_PLUGIN_ID: &str = "eve.memory";
 pub const MEMORY_FORMAT_VERSION: u32 = 1;
-/// 全局有界证据容量；仍受 4 MiB 字节上限约束，不自动清理原记录。
+/// 热层全局证据容量；仍受 4 MiB 字节上限约束。装配归档存储后，较早的完成交互
+/// 移入不可变分块而不是被清理；未装配时满即拒绝新增。
 pub const MAX_EVIDENCE: usize = 4096;
 pub const MAX_SCOPES: usize = 256;
 pub const MAX_PREFERENCES: usize = 256;
@@ -23,6 +26,7 @@ pub const MAX_PREFERENCES: usize = 256;
 pub const MAX_HISTORY: usize = 256;
 pub const MAX_TEXT_BYTES: usize = 32_768;
 pub const MAX_PREFERENCE_BYTES: usize = 4096;
+/// 热层文档的序列化字节上限；归档分块不计入。
 pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
 pub type MemoryResult<T> = Result<T, MemoryError>;
 
@@ -120,8 +124,31 @@ pub struct MemorySnapshot {
     pub scope: MemoryScope,
     /// 只属于本作用域；别的用户变更不会改变此修订。
     pub revision: u64,
+    /// 热层证据：近期完成交互、全部偏好命令及仍被偏好引用的证据。
     pub evidence: Vec<InteractionEvidence>,
     pub preferences: Vec<Preference>,
+    /// 已移入归档分块的完成交互数；它们的修订仍计入 `revision`，
+    /// 原文经 `MemoryService::archived` 按修订顺序读取。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub archived_evidence: u64,
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+impl MemorySnapshot {
+    /// 不在热层的证据是否可能已归档：修订有效、热层没有同 ID 或同修订的不同记录。
+    /// 只用于消费者核对自己保存的旧来源副本；原文核对须经 `MemoryService::archived`。
+    pub fn may_be_archived(&self, evidence: &InteractionEvidence) -> bool {
+        self.archived_evidence > 0
+            && evidence.revision > 0
+            && evidence.revision <= self.revision
+            && matches!(evidence.source, EvidenceSource::CompletedInteraction { .. })
+            && !self
+                .evidence
+                .iter()
+                .any(|hot| hot.id == evidence.id || hot.revision == evidence.revision)
+    }
 }
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PreferenceEvidence {
@@ -151,6 +178,12 @@ pub struct PreferenceChange {
 /// 已绑定作用域的读取能力；调用方不能自行提供其他用户身份。
 pub trait MemoryService: Send + Sync {
     fn snapshot(&self) -> MemoryResult<MemorySnapshot>;
+    /// 按修订升序读取本作用域修订大于 `after_revision` 的归档证据，最多 `limit` 条。
+    /// 分块缺失、校验失败或不属于本作用域时返回 `CorruptState`，不跳过。
+    fn archived(&self, after_revision: u64, limit: usize) -> MemoryResult<ArchivedEvidencePage> {
+        let _ = (after_revision, limit);
+        Err(MemoryError::Unavailable)
+    }
 }
 #[derive(Clone)]
 pub struct MemoryServiceHandle(pub Arc<dyn MemoryService>);
@@ -163,6 +196,10 @@ pub trait MemoryAdmin: Send + Sync {
         Err(MemoryError::Unavailable)
     }
     fn reader(&self, scope: MemoryScope) -> MemoryResult<Arc<dyn MemoryService>>;
+    /// 热层容量与归档状态；默认实现明确不支持。
+    fn archive_status(&self) -> MemoryResult<MemoryArchiveStatus> {
+        Err(MemoryError::Unavailable)
+    }
     /// 相同来源重导入先于 CAS 判断，零写入、零修订；时间变化不算新来源。
     /// 不同正文占用同一 ID，或其他 ID 占用已有 message_id/完成轮次，均拒绝。
     /// 后续 Session 新增轮次不影响重放；首次来源快照修订保持原值。
@@ -256,5 +293,6 @@ redacted_debug!(
     SummaryQuote,
     SummaryPoint,
     SummaryBatch,
-    SummaryJob
+    SummaryJob,
+    ArchivedEvidencePage
 );

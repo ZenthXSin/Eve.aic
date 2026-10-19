@@ -154,7 +154,7 @@ pub(crate) fn validate_snapshot(
     if &snapshot.scope != scope
         || snapshot.evidence.len() > MAX_EVIDENCE
         || snapshot.preferences.len() > MAX_PREFERENCES
-        || snapshot.revision > (MAX_EVIDENCE + MAX_HISTORY) as u64
+        || snapshot.revision > (MAX_EVIDENCE + MAX_HISTORY) as u64 + snapshot.archived_evidence
     {
         return Err(MemoryError::CorruptState);
     }
@@ -246,7 +246,8 @@ pub(crate) fn validate_snapshot(
             return Err(MemoryError::CorruptState);
         }
     }
-    if snapshot.revision != (completed_count + history_count) as u64
+    // 已归档的完成交互仍占用修订；原文只在归档读取时逐项核对。
+    if snapshot.revision != (completed_count + history_count) as u64 + snapshot.archived_evidence
         || snapshot.evidence.iter().any(|evidence| {
             matches!(evidence.source, EvidenceSource::UserStatement { .. })
                 && !referenced_evidence.contains(evidence.id.as_str())
