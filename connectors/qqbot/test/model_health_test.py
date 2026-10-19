@@ -97,9 +97,9 @@ class ModelHealthAcceptance(interest_test.InterestAcceptance):
 
         self.run_eve([
             *self.send(self.message("payment", PAYMENT, contains=[
-                "模型服务拒绝请求（HTTP 402）", "需要检查额度或单次输出预算", "尚未启动工具调用", "没有自动重试"])),
+                "模型服务拒绝请求（HTTP 402）", "需要检查额度或单次输出预算", "尚未启动工具调用", "不再自动重试"])),
             *self.send(self.message("truncated", TRUNCATED, contains=[
-                "模型回复达到单次输出上限，未完整生成", "没有自动重试"])),
+                "模型回复达到单次输出上限，未完整生成", "不再自动重试"])),
             *self.checkpoint("failing"),
             *self.send(self.message("recovered", RECOVERED)),
             *self.checkpoint("recovered"),

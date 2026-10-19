@@ -93,8 +93,9 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
             return tool_response([("run_command", {"program": sys.executable, "args": ["-c",
                 "from pathlib import Path; p=Path('once.txt'); p.write_text(p.read_text()+'x' if p.exists() else 'x'); print('ACTUAL_COMMAND_RECEIPT')"]})])
         self.callback = first
-        self.enabled(self.send(self.message("failed-command", "执行一次本地检查", contains=["HTTP 503", "已启动 1 次", "本轮已停止", "没有自动重试"])))
+        self.enabled(self.send(self.message("failed-command", "执行一次本地检查", contains=["HTTP 503", "已启动 1 次", "本轮已停止", "不再自动重试"])))
         self.assertEqual((self.source / "once.txt").read_text(), "x")
+        self.assertEqual(len(self.kind('chat')),5)  # 一次工具请求 + 后续模型最多四次尝试。
         failed = self.turn("执行一次本地检查")["status"]
         self.assertEqual(failed["state"], "Failed")
         evidence = failed["failure"]["evidence"]

@@ -400,7 +400,7 @@ fn failed_turn_notice(report: &ControlReport) -> String {
         ),
         None => "工具执行情况尚未确认，不能保证没有副作用。".into(),
     };
-    format!("{reason}。{effects}本轮已停止，没有自动重试；继续前需要核对现有结果。")
+    format!("{reason}。{effects}本轮已停止，不再自动重试；继续前需要核对现有结果。")
 }
 /// 只用固定类别与状态码说明，不转述供应商错误正文。
 fn failure_reason(failure: ProviderFailure) -> String {
