@@ -1,5 +1,7 @@
 //! 带来源的交互记忆与明确偏好契约；身份绑定、明确意图判断和投递确认由可信宿主负责。
+mod continuity;
 mod distillation;
+pub use continuity::*;
 mod recall;
 mod summary;
 pub use distillation::*;

@@ -1,5 +1,7 @@
 //! 有界交互证据与明确偏好；宿主保留管理能力，不发布通用管理服务。
 mod context;
+mod continuity;
+pub use continuity::{MemoryContinuity, MemoryContinuityContext};
 mod distillation;
 pub use distillation::ExtractiveConversationDistiller;
 mod recall;

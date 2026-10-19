@@ -494,6 +494,14 @@ pub(crate) async fn run(
         participant_observer,
         timing_diagnostics,
     } = services;
+    // 只从已验证的持久回执重建路由身份索引，不重放消息、写记忆或触发工具。
+    for entry in ledger
+        .entries
+        .iter()
+        .filter(|entry| entry.app_id == config.app_id)
+    {
+        conversations.record_message(&config.app_id, &entry.message)?;
+    }
     // 仅本地学习已验证回执中的用户表达；不提交旧任务、不调用模型或重发消息。
     if let Some(training) = &training {
         for entry in &ledger.entries {
@@ -1164,6 +1172,7 @@ pub(crate) async fn run(
                             } else {
                                 status.send_modify(|s| s.received += 1);
                                 timing(timing_diagnostics, "message_received", None);
+                                conversations.record_message(&config.app_id, &message)?;
                                 if let Some(observer) = &participant_observer {
                                     let session = message.session_key(&config.app_id)?;
                                     if let Err(error) = observer.observe(&session, &message.conversation_key(&config.app_id)?, &message.text, sender_name.as_deref()) {

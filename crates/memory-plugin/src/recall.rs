@@ -146,7 +146,10 @@ impl MemoryRecallService for ScopedLexicalRecall {
 
 // 此验证器不接触存储实现。公开快照没有操作日志，故不能重放每次 CAS；
 // 这里严格核查公开字段能表达的来源、修订、历史、容量及作用域不变量。
-fn validate_snapshot(snapshot: &MemorySnapshot, scope: &MemoryScope) -> MemoryResult<()> {
+pub(crate) fn validate_snapshot(
+    snapshot: &MemorySnapshot,
+    scope: &MemoryScope,
+) -> MemoryResult<()> {
     snapshot.scope.validate()?;
     if &snapshot.scope != scope
         || snapshot.evidence.len() > MAX_EVIDENCE

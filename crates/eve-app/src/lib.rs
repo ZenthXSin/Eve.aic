@@ -27,6 +27,7 @@ mod qq_interest;
 mod qq_learning;
 mod qq_learning_commands;
 mod qq_memory;
+mod qq_memory_continuity;
 mod qq_memory_observer;
 mod qq_message_judge;
 mod qq_outreach;
@@ -347,6 +348,7 @@ pub(crate) async fn install_core_with_pages(
         config::dialogue_schema(),
         config::history_schema(),
         qq_people::schema(),
+        qq_memory_continuity::schema(),
         qq_message_judge::provider_schema(),
         model_roles_schema(),
         eve_message_api::message_schema(),
