@@ -20,7 +20,9 @@ pub const MEMORY_FORMAT_VERSION: u32 = 1;
 /// 热层全局证据容量；仍受 4 MiB 字节上限约束。装配归档存储后，较早的完成交互
 /// 移入不可变分块而不是被清理；未装配时满即拒绝新增。
 pub const MAX_EVIDENCE: usize = 4096;
-pub const MAX_SCOPES: usize = 256;
+/// 可信作用域（通道 + 会话 + 用户）总数。群聊每位成员各占一个作用域；满后新作用域的
+/// 交流不写入记忆（返回 `LimitReached`，原记录不变），已有作用域照常采集。
+pub const MAX_SCOPES: usize = 1024;
 pub const MAX_PREFERENCES: usize = 256;
 /// 所有作用域的偏好历史版本总数；原始证据与历史永不自动淘汰。
 pub const MAX_HISTORY: usize = 256;

@@ -1237,8 +1237,13 @@ pub(crate) async fn run(
                             if ok && let Some(interaction) = &reply.interaction
                                 && let Some(observation) = &observation
                                 && let Err(error) = interaction.observe(observation.observer.as_ref(), &config.app_id, message, &reply.text) {
-                                warn(&ctx, "interaction_observer_failed_no_retry");
-                                return Err(error);
+                                if !matches!(error, PluginError::Task(_)) {
+                                    warn(&ctx, "interaction_observer_failed_no_retry");
+                                    return Err(error);
+                                }
+                                // 确定拒绝（如记忆容量已满）不影响已送达的回复，计数后继续服务。
+                                warn(&ctx, "interaction_not_saved");
+                                status.send_modify(|s| s.interactions_not_saved += 1);
                             }
                             delivering = None;
                         }
