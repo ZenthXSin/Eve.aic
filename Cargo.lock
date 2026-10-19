@@ -352,6 +352,8 @@ dependencies = [
  "eve-skill-api",
  "eve-skill-plugin",
  "eve-state-postgres",
+ "eve-task-api",
+ "eve-task-plugin",
  "eve-toolforge-api",
  "eve-toolforge-plugin",
  "eve-training-api",
@@ -1139,6 +1141,28 @@ dependencies = [
  "postgres",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "eve-task-api"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eve-task-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-kernel",
+ "eve-plugin-api",
+ "eve-task-api",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

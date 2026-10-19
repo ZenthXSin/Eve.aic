@@ -31,6 +31,8 @@ members = [
     "crates/clarify-plugin",
     "crates/reminder-api",
     "crates/reminder-plugin",
+    "crates/task-api",
+    "crates/task-plugin",
     "crates/completion-api",
     "crates/completion-plugin",
     "crates/pursuit-api",

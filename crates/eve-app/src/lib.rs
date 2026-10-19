@@ -40,6 +40,7 @@ mod qq_research;
 mod qq_semantic;
 mod qq_skill;
 mod qq_summary;
+mod qq_tasks;
 mod qq_tools;
 mod qqbot;
 mod segment_advice;
@@ -349,6 +350,7 @@ pub(crate) async fn install_core_with_pages(
         config::history_schema(),
         qq_people::schema(),
         qq_memory_continuity::schema(),
+        qq_tasks::schema(),
         qq_message_judge::provider_schema(),
         model_roles_schema(),
         eve_message_api::message_schema(),
