@@ -73,6 +73,8 @@ pub(crate) fn openai_schema() -> ConfigSchema {
     };
     let mut semantic_base = string("", "EVE_OPENAI_SEMANTIC_BASE_URL");
     semantic_base.restart_required = true;
+    let mut semantic_background = ConfigField::new(ConfigKind::Boolean, Some(json!(true)));
+    semantic_background.environment = Some("EVE_SEMANTIC_QUERY_BACKGROUND".into());
     ConfigSchema {
         namespace: OPENAI_NAMESPACE.into(),
         version: 1,
@@ -82,6 +84,7 @@ pub(crate) fn openai_schema() -> ConfigSchema {
                 string("https://ai.xn--rhqr8xvr4ahqsgka.com", "EVE_OPENAI_BASE_URL"),
             ),
             ("semantic_base_url".into(), semantic_base),
+            ("semantic_query_background".into(), semantic_background),
             (
                 "semantic_query_timeout_ms".into(),
                 integer(1500, 30_000, "EVE_SEMANTIC_QUERY_TIMEOUT_MS"),
