@@ -59,6 +59,17 @@ export function optionsFromEnv(env) {
     logger: { info() {}, warn() {}, error() {}, debug() {} },
   };
 }
+// 群里回谁就标出谁：被动回复正文前加官方提及标签；私聊没有可 @ 的对象。
+// 提及是路由信息，不写回执正文，Rust 保存的仍是模型原话。
+const atUser = id => `<qqbot-at-user id="${id}" /> `;
+function mentionSender(item, text, index = 0) {
+  // 只有第一段带提及；模型自己写了提及时不重复追加。
+  if (index !== 0 || !item.mention) return text;
+  if (text.includes("<qqbot-at-user")) return text;
+  const prefix = atUser(item.mention);
+  // 加前缀不得让正文超出平台上限；超了就退回不带提及的原正文。
+  return Buffer.byteLength(text) <= 32768 - Buffer.byteLength(prefix) ? prefix + text : text;
+}
 export function createBridge(bot, emit, limit = 128) {
   const pending = new Map();
   const pushing = new Set();
@@ -79,6 +90,18 @@ export function createBridge(bot, emit, limit = 128) {
     activeSends++;
     try { return await bot.sendText(target, text); }
     finally { activeSends--; }
+  }
+  // 文件走同一条被动配额与并发上限；路径已由 Rust 侧解析并校验，这里只做形状检查。
+  async function sendFile(target, localPath, name, caption) {
+    if (activeSends >= limit) {
+      warn("outbound_limit");
+      throw new Error("outbound_limit");
+    }
+    activeSends++;
+    try {
+      return await bot.sendFile(target, { localPath },
+        { ...(name ? { fileName: name } : {}), ...(caption ? { content: caption } : {}) });
+    } finally { activeSends--; }
   }
   const stop = () => {
     if (closed) return;
@@ -117,7 +140,11 @@ export function createBridge(bot, emit, limit = 128) {
     if (Buffer.byteLength(JSON.stringify({ version: 1, ...frame })) > MAX_FRAME) {
       warn("frame_limit"); return;
     }
-    pending.set(msg.messageId, { target: { ...target }, sending: false });
+    // 群聊记下发送者，被动回复时 @ 回他；私聊没有可 @ 的对象。
+    pending.set(msg.messageId, {
+      target: { ...target }, sending: false,
+      ...(msg.kind === "group" && validId(msg.senderId) ? { mention: msg.senderId } : {}),
+    });
     send(frame);
   });
   // One part at a time, strictly in order; a failed or final part ends the reply.
@@ -139,7 +166,7 @@ export function createBridge(bot, emit, limit = 128) {
     item.count = count;
     let ok = false;
     try {
-      const result = await sendText(item.target, frame.text);
+      const result = await sendText(item.target, mentionSender(item, frame.text, index));
       ok = true;
       send({ type: "delivery", id: frame.id, index, ok: true,
         ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
@@ -178,6 +205,43 @@ export function createBridge(bot, emit, limit = 128) {
       if (item.finished) pending.delete(frame.id);
     }
   }
+  // 文件走主动投递：目标由 Rust 从已确认的回执推出，路径由宿主在绑定目录内解析好，
+  // 这里只校验形状。失败不重试，回执如实交回宿主账本。
+  async function pushFile(frame) {
+    if (!validMessageId(frame.id) || !validId(frame.target_id) ||
+        !["c2c", "group"].includes(frame.scope)) {
+      warn("invalid_command");
+      if (validMessageId(frame.id)) send({ type: "delivery", id: frame.id, push: true, file: true, ok: false });
+      return;
+    }
+    const key = `file:${frame.id}`;
+    if (pushing.has(key)) { warn("duplicate_reply"); return; }
+    const path = frame.path;
+    const name = frame.name;
+    const caption = frame.caption ?? "";
+    if (typeof path !== "string" || !path || path.length > 4096 || /[\p{Cc}]/u.test(path) ||
+        (name !== undefined && (typeof name !== "string" || !name || name.length > 255 ||
+          /[\p{Cc}\\/]/u.test(name))) ||
+        (caption !== "" && (!validText(caption) || Buffer.byteLength(caption) > 1024))) {
+      warn("invalid_file");
+      send({ type: "delivery", id: frame.id, push: true, file: true, ok: false });
+      return;
+    }
+    pushing.add(key);
+    try {
+      const result = await sendFile({ scope: frame.scope, targetId: frame.target_id }, path, name, caption);
+      const id = result?.message?.id ?? result?.upload?.id;
+      send({ type: "delivery", id: frame.id, push: true, file: true, ok: true,
+        ...(validMessageId(id) ? { message_id: id } : {}) });
+    } catch (err) {
+      const diagnostic = {};
+      if (Number.isInteger(err?.statusCode)) diagnostic.http_status = err.statusCode;
+      if (Number.isInteger(err?.code)) diagnostic.biz_code = err.code;
+      send({ type: "delivery", id: frame.id, push: true, file: true, ok: false, ...diagnostic });
+    } finally {
+      pushing.delete(key);
+    }
+  }
   // A proactive private message: no msg_id, so the platform applies its own quota and
   // the user's opt-out; refusals come back as a failed receipt and are never retried here.
   async function push(frame) {
@@ -211,6 +275,7 @@ export function createBridge(bot, emit, limit = 128) {
       if (frame.type === "stop") { stop(); return; }
       if (closed) return;
       if (frame.type === "push") { await push(frame); return; }
+      if (frame.type === "file") { await pushFile(frame); return; }
       const item = pending.get(frame.id);
       if (!item) { warn("unknown_reply"); return; }
       if (frame.type === "finish") {
@@ -227,7 +292,7 @@ export function createBridge(bot, emit, limit = 128) {
       if (!validText(frame.text)) { reject(frame.id); return; }
       item.sending = true;
       try {
-        const result = await sendText(item.target, frame.text);
+        const result = await sendText(item.target, mentionSender(item, frame.text));
         send({ type: "delivery", id: frame.id, ok: true,
           ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
       } catch (err) {

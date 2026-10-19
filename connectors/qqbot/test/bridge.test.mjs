@@ -2,8 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Readable, PassThrough } from "node:stream";
 import { createBridge, consume, optionsFromEnv, MAX_FRAME, MAX_MESSAGE_ID_BYTES, MAX_PUSH_BYTES, MAX_SEGMENTS } from "../bridge-core.mjs";
-function fixture({ fail = false, limit = 128, appId = "1904159860", hold = null } = {}) {
-  const frames = [], sent = [], handlers = new Map();
+function fixture({ fail = false, limit = 128, appId = "1904159860", hold = null, fileFail = false } = {}) {
+  const frames = [], sent = [], files = [], handlers = new Map();
   const bot = {
     appId,
     on: (event, handler) => handlers.set(event, handler),
@@ -14,6 +14,12 @@ function fixture({ fail = false, limit = 128, appId = "1904159860", hold = null 
       if (typeof fail === "function" ? fail(sent.length) : fail) throw new Error("sensitive secret and message");
       return { id: "out-1" };
     },
+    async sendFile(target, source, opts) {
+      files.push({ target, source, opts });
+      if (fileFail) throw new Error("sensitive secret and message");
+      return { upload: { file_uuid: "uuid-1", file_info: "info-1", ttl: 60 },
+        message: { id: "file-msg-1" } };
+    },
   };
   const bridge = createBridge(bot, f => frames.push(f), limit);
   const message = (kind = "c2c", id = "in-1") => handlers.get("message")({}, {
@@ -22,7 +28,7 @@ function fixture({ fail = false, limit = 128, appId = "1904159860", hold = null 
     groupOpenid: "group-1",
     replyTarget: { scope: kind, targetId: kind === "group" ? "group-1" : "user-1", msgId: id },
   });
-  return { bridge, frames, sent, message, handlers };
+  return { bridge, frames, sent, files, message, handlers };
 }
 function deferred() {
   let resolve;
@@ -270,7 +276,24 @@ test("群聊接纳官方 @ 事件，拒绝普通群消息与机器人消息", as
   f.handlers.get("message")({}, { ...incoming, rawEventType: "GROUP_AT_MESSAGE_CREATE" });
   assert.equal(f.frames.filter(x => x.type === "message").length, 1);
   await f.bridge.command({ type: "reply", version: 1, id: "group-at-1", text: "你喜欢怎样的称呼？" });
-  assert.deepEqual(f.sent, [{ target: incoming.replyTarget, text: "你喜欢怎样的称呼？" }]);
+  assert.deepEqual(f.sent, [{ target: incoming.replyTarget,
+    text: '<qqbot-at-user id="user-1" /> 你喜欢怎样的称呼？' }]);
+});
+test("群回复首段 @ 发送者：私聊不加、模型自写提及不重复、超限时退回原文", async () => {
+  const f = fixture(); f.message("group");
+  await f.bridge.command({ type: "reply", version: 1, id: "in-1", text: "答复" });
+  assert.equal(f.sent.at(-1).text, '<qqbot-at-user id="user-1" /> 答复');
+  const own = fixture(); own.message("group");
+  await own.bridge.command({ type: "reply", version: 1, id: "in-1", text: '<qqbot-at-user id="user-9" /> 你' });
+  assert.equal(own.sent.at(-1).text, '<qqbot-at-user id="user-9" /> 你');
+  const c2c = fixture(); c2c.message();
+  await c2c.bridge.command({ type: "reply", version: 1, id: "in-1", text: "答复" });
+  assert.equal(c2c.sent.at(-1).text, "答复");
+  const long = fixture(); long.message("group");
+  const text = "长".repeat(10920) + "。" + "x".repeat(0);
+  assert.ok(Buffer.byteLength(text) <= 32768);
+  await long.bridge.command({ type: "reply", version: 1, id: "in-1", text });
+  assert.equal(long.sent.at(-1).text, text);
 });
 
 test("普通群事件携带服务端自身提及时可原路回复，不依赖 AppID 等于 openid", async () => {
@@ -284,7 +307,7 @@ test("普通群事件携带服务端自身提及时可原路回复，不依赖 A
   f.handlers.get("message")({}, incoming);
   assert.equal(f.frames.find(x => x.type === "message").text, incoming.content);
   await f.bridge.command({ type: "reply", version: 1, id: incoming.messageId, text: "答复" });
-  assert.deepEqual(f.sent, [{ target: incoming.replyTarget, text: "答复" }]);
+  assert.deepEqual(f.sent, [{ target: incoming.replyTarget, text: '<qqbot-at-user id="user-1" /> 答复' }]);
 });
 
 test("普通群事件识别当前 AppID 的两种 @ 标记，拒绝其他提及、伪标记与未知事件", () => {
@@ -358,7 +381,10 @@ for (const scope of ["c2c", "group"]) test(scope + " 分段按序回复原目标
   await f.bridge.command(segment(1, 3));
   await f.bridge.command(segment(2, 3));
   const target = { scope, targetId: scope === "group" ? "group-1" : "user-1", msgId: "in-1" };
-  assert.deepEqual(f.sent, [0, 1, 2].map(i => ({ target, text: `第${i + 1}段` })));
+  // 只有首段带 @发送者，后续分段保持原正文。
+  const expected = [0, 1, 2].map(i => ({ target, text: (i === 0 && scope === "group"
+    ? '<qqbot-at-user id="user-1" /> ' : "") + `第${i + 1}段` }));
+  assert.deepEqual(f.sent, expected);
   assert.deepEqual(f.frames.filter(x => x.type === "delivery").map(x => [x.index, x.ok]), [[0, true], [1, true], [2, true]]);
   await f.bridge.command(segment(2, 3));
   await f.bridge.command({ type: "reply", version: 1, id: "in-1", text: "再次答复" });
@@ -443,6 +469,50 @@ test("主动私聊被平台拒绝时回失败回执与错误码，不重试、�
   assert.equal(delivery.ok, false);
   assert.ok(!JSON.stringify(f.frames).includes("sensitive"));
   assert.ok(!JSON.stringify(f.frames).includes("要不要"));
+});
+
+test("文件按宿主给出的目标上传，回真实回执且不消耗被动片段", async () => {
+  const f = fixture(); f.message();
+  await f.bridge.command({ type: "file", version: 1, id: "file-1", scope: "c2c", target_id: "user-1",
+    path: "/srv/outbox/report.txt", name: "报告.txt", caption: "这是结果" });
+  assert.deepEqual(f.files[0], {
+    target: { scope: "c2c", targetId: "user-1" },
+    source: { localPath: "/srv/outbox/report.txt" },
+    opts: { fileName: "报告.txt", content: "这是结果" } });
+  assert.deepEqual(f.frames.at(-1), { version: 1, type: "delivery", id: "file-1", push: true,
+    file: true, ok: true, message_id: "file-msg-1" });
+  // 原消息的被动回复不受影响。
+  await f.bridge.command({ type: "reply", version: 1, id: "in-1", text: "文件已发出" });
+  assert.equal(f.frames.at(-1).ok, true);
+  const group = fixture();
+  await group.bridge.command({ type: "file", version: 1, id: "file-2", scope: "group",
+    target_id: "group-1", path: "/srv/a.txt" });
+  assert.deepEqual(group.files[0].target, { scope: "group", targetId: "group-1" });
+  assert.deepEqual(group.files[0].opts, {});
+});
+
+test("文件参数或目标不合规时不请求 SDK，明确回失败", async () => {
+  for (const bad of [
+    { path: "" }, { path: "rel/report.txt\n" }, { path: "/x".repeat(2049) }, { path: 42 },
+    { path: "/a", name: "../../etc/passwd" }, { path: "/a", name: "x\n" }, { path: "/a", name: "" },
+    { path: "/a", caption: " " }, { path: "/a", caption: "长".repeat(400) },
+    { path: "/a", target_id: "../x" }, { path: "/a", scope: "private" },
+  ]) {
+    const f = fixture();
+    await f.bridge.command({ type: "file", version: 1, id: "file-1", scope: "c2c",
+      target_id: "user-1", ...bad });
+    assert.equal(f.files.length, 0, JSON.stringify(bad));
+    assert.deepEqual(f.frames.filter(x => x.type === "delivery"),
+      [{ version: 1, type: "delivery", id: "file-1", push: true, file: true, ok: false }]);  }
+});
+
+test("文件上传失败不重试、不泄漏异常", async () => {
+  const f = fixture({ fileFail: true });
+  await f.bridge.command({ type: "file", version: 1, id: "file-1", scope: "c2c",
+    target_id: "user-1", path: "/srv/a.txt" });
+  assert.equal(f.files.length, 1);
+  assert.deepEqual(f.frames.at(-1), { version: 1, type: "delivery", id: "file-1", push: true, file: true, ok: false });
+  assert.ok(!JSON.stringify(f.frames).includes("sensitive"));
 });
 
 test("纯图片和图文保留本条图片引用，不抓取、不混入引用图、不改变路由", async () => {

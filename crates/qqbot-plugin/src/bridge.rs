@@ -1,5 +1,6 @@
 use crate::{
     QqBotConfig, QqBotStatus, QqCommandHandler, QqCommandInput, Segmentation, commands,
+    files::{QqFileDelivery, QqFileResult, valid_caption, valid_name, valid_path},
     observer::{CompletedInteraction, Observation},
     outreach::{
         OUTREACH_PLANNER, QQ_OUTREACH_JUDGE_TIMEOUT, QQ_OUTREACH_MAX_REPLY_PARTS, QqOutreach,
@@ -148,6 +149,8 @@ pub(crate) struct Services {
     pub segmentation: Option<Arc<Segmentation>>,
     pub natural_message_judgement: bool,
     pub outreach: Option<Arc<OutreachHook>>,
+    pub files: Option<Arc<dyn QqFileDelivery>>,
+    pub file_poll: Option<Duration>,
     pub conversations: crate::QqConversations,
     pub participant_observer: Option<Arc<dyn crate::QqParticipantObserver>>,
     pub timing_diagnostics: bool,
@@ -194,6 +197,79 @@ fn c2c_route(ledger: &Ledger, app: &str, user_id: &str) -> PluginResult<Option<S
         }
     }
     Ok(None)
+}
+/// 文件投递的路由只取自本通道已确认的回执：宿主给会话，通道自己找平台目标。
+fn route_for(
+    ledger: &Ledger,
+    app: &str,
+    session: &SessionKey,
+) -> PluginResult<Option<(String, String)>> {
+    for entry in ledger.entries.iter().rev() {
+        if entry.app_id == app
+            && entry.state == ReceiptState::Sent
+            && entry.message.session_key(app)? == *session
+        {
+            return Ok(Some((
+                entry.message.scope.clone(),
+                entry.message.target_id.clone(),
+            )));
+        }
+    }
+    Ok(None)
+}
+fn file_result(frame: &Value, ok: bool) -> QqFileResult {
+    if ok {
+        QqFileResult::Sent {
+            platform_message_id: frame
+                .get("message_id")
+                .and_then(Value::as_str)
+                .filter(|id| valid_message_id(id))
+                .map(str::to_string),
+        }
+    } else {
+        QqFileResult::Failed {
+            http_status: frame
+                .get("http_status")
+                .and_then(Value::as_u64)
+                .and_then(|status| u16::try_from(status).ok()),
+            biz_code: frame.get("biz_code").and_then(Value::as_i64),
+        }
+    }
+}
+/// 回执写入宿主失败只记录警告；宿主自行在重启时核对未结束的尝试。
+fn report_file(
+    files: &Arc<dyn QqFileDelivery>,
+    ctx: &PluginContext,
+    id: &str,
+    result: QqFileResult,
+) {
+    if files.delivered(id, result).is_err() {
+        warn(ctx, "file_receipt_unrecorded");
+    }
+}
+/// 只有参数与路由都成立才写出；否则宿主收到 NotSent，绝不替它编一个目标。
+fn usable_file_frame(
+    request: &crate::QqFileMessage,
+    route: Option<&(String, String)>,
+) -> Option<Value> {
+    let (scope, target) = route?;
+    if !valid_message_id(&request.id)
+        || !valid_path(&request.path)
+        || request
+            .name
+            .as_deref()
+            .is_some_and(|name| !valid_name(name))
+        || request
+            .caption
+            .as_deref()
+            .is_some_and(|caption| !valid_caption(caption))
+    {
+        return None;
+    }
+    Some(
+        json!({"type":"file","version":1,"id":request.id,"scope":scope,
+        "target_id":target,"path":request.path,"name":request.name,"caption":request.caption}),
+    )
 }
 struct ChannelEvents {
     signal: Arc<dyn TaskSignal>,
@@ -528,6 +604,8 @@ pub(crate) async fn run(
         segmentation,
         natural_message_judgement,
         outreach,
+        files,
+        file_poll,
         conversations,
         participant_observer,
         timing_diagnostics,
@@ -620,6 +698,10 @@ pub(crate) async fn run(
     let mut judging: Option<Judging> = None;
     let push_interval = outreach.as_ref().and_then(|hook| hook.push_interval);
     let mut next_push = tokio::time::Instant::now();
+    // 一次只上传一个文件；期间不开始新的文字投递，避免两条并发抢同一条路由。
+    let file_interval = if files.is_some() { file_poll } else { None };
+    let mut next_file = tokio::time::Instant::now();
+    let mut sending_file: Option<String> = None;
     let result: PluginResult<()> = async {
         loop {
             if sink.is_closed() { break Ok(()); }
@@ -1036,15 +1118,43 @@ pub(crate) async fn run(
                 }
                 continue;
             }
+            // 文件投递：通道空闲时定期询问宿主；路由只取自已确认的回执。
+            let file_ready = file_interval.is_some() && sending_file.is_none() && pushing.is_none()
+                && delivering.is_none() && progress_delivery.is_none() && judging.is_none()
+                && replies.is_empty() && routing.is_empty() && commands.is_empty()
+                && status.borrow().ready;
+            if file_ready && let (Some(delivery), Some(interval)) = (&files, file_interval)
+                && tokio::time::Instant::now() >= next_file {
+                next_file = tokio::time::Instant::now() + interval;
+                match delivery.next_file() {
+                    Ok(Some(request)) => {
+                        // 参数不合规时不写出，仍如实回报结果；宿主据此记账。
+                        let route = route_for(&ledger, &config.app_id, &request.session)?;
+                        let frame = usable_file_frame(&request, route.as_ref());
+                        match frame {
+                            Some(frame) => {
+                                write(&mut stdin, frame).await?;
+                                deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+                                sending_file = Some(request.id);
+                            }
+                            None => report_file(delivery, &ctx, &request.id, QqFileResult::NotSent),
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => warn(&ctx, "file_delivery_unavailable"),
+                }
+                continue;
+            }
             let eligible: Vec<bool> = active.iter().map(|a| !pending_control(&a.message, &routing, &commands)).collect();
             tokio::select! {
                 biased;
                 _ = signal.cancelled() => break Ok(()),
                 _ = stop.changed() => break Ok(()),
-                _ = tokio::time::sleep_until(deadline), if !status.borrow().ready || delivering.as_ref().is_some_and(Delivery::awaiting) || pushing.is_some() || progress_delivery.is_some() => {
+                _ = tokio::time::sleep_until(deadline), if !status.borrow().ready || delivering.as_ref().is_some_and(Delivery::awaiting) || pushing.is_some() || progress_delivery.is_some() || sending_file.is_some() => {
                     break Err(failure("QQBot ready 或 delivery 等待超时"));
                 }
                 _ = tokio::time::sleep_until(next_push), if push_ready => {}
+                _ = tokio::time::sleep_until(next_file), if file_ready => {}
                 Some(event) = progress_rx.recv(), if progress_queue.len() < 64 => { progress_queue.push_back(event); }
                 invite = judged(&mut judging), if judging.is_some() => {
                     let (mut reply, _) = judging.take().expect("judging reply");
@@ -1178,6 +1288,14 @@ pub(crate) async fn run(
                             ledger.save(&ctx)?;
                             if !ok { warn(&ctx, "progress_failed_no_retry"); }
                             progress_delivery = None;
+                        }
+                        Some("delivery") if frame.get("file").and_then(Value::as_bool) == Some(true) => {
+                            let (Some(delivery), Some(current)) = (&files, sending_file.as_deref()) else { warn(&ctx, "unexpected_file_delivery"); continue; };
+                            if frame.get("id").and_then(Value::as_str) != Some(current) { warn(&ctx, "delivery_id_mismatch"); continue; }
+                            let Some(ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
+                            if !ok { warn(&ctx, "file_delivery_failed_no_retry"); }
+                            report_file(delivery, &ctx, current, file_result(&frame, ok));
+                            sending_file = None;
                         }
                         Some("delivery") if frame.get("push").and_then(Value::as_bool) == Some(true) => {
                             let (Some(hook), Some(current)) = (&outreach, pushing.as_deref()) else { warn(&ctx, "unexpected_delivery"); continue; };
