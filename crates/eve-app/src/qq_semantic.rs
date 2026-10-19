@@ -11,7 +11,7 @@ use eve_llm_openai::OpenAiEmbeddings;
 use eve_plugin_api::{PluginError, PluginResult, ServiceId, ServiceRegistry};
 use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput};
 use eve_semantic_api::{EmbedFuture, EmbeddingError, EmbeddingProfile, EmbeddingProvider};
-use eve_semantic_plugin::{IndexError, IndexStepError, Indexer, MAX_ENTRIES};
+use eve_semantic_plugin::{BackgroundEmbeddings, IndexError, IndexStepError, Indexer, MAX_ENTRIES};
 use std::{
     sync::{
         Arc, Mutex, OnceLock,
@@ -61,15 +61,15 @@ impl EmbeddingProvider for DeferredEmbeddings {
     }
 }
 
-/// 只限制在线召回查询的向量请求；后台建索引继续使用原提供者与模型超时。
-/// 每次查询读取配置，面板保存后下一条消息生效。取消超时的只读请求，不重试、不写索引。
-pub(crate) struct QueryEmbeddings {
-    pub(crate) inner: Arc<dyn EmbeddingProvider>,
-    pub(crate) registry: Arc<dyn ServiceRegistry>,
-    pub(crate) timing: bool,
+/// 查询计时与可选的前台等待上限。后台查询、后台建索引沿用原模型超时。
+struct QueryEmbeddings {
+    inner: Arc<dyn EmbeddingProvider>,
+    registry: Arc<dyn ServiceRegistry>,
+    timing: bool,
+    use_query_budget: bool,
 }
 impl QueryEmbeddings {
-    fn budget(&self) -> Result<Duration, EmbeddingError> {
+    fn settings(&self) -> Result<eve_config_api::ConfigSnapshot, EmbeddingError> {
         let unavailable = || EmbeddingError::Provider;
         let entry = self
             .registry
@@ -80,17 +80,72 @@ impl QueryEmbeddings {
             .value
             .downcast::<ConfigServiceHandle>()
             .map_err(|_| unavailable())?;
-        let snapshot = settings
+        settings
             .0
             .snapshot(OPENAI_NAMESPACE, 1)
-            .map_err(|_| unavailable())?;
+            .map_err(|_| unavailable())
+    }
+    fn budget(&self) -> Result<Duration, EmbeddingError> {
+        let snapshot = self.settings()?;
         let millis: u64 = snapshot
             .get("semantic_query_timeout_ms")
-            .map_err(|_| unavailable())?;
+            .map_err(|_| EmbeddingError::Provider)?;
         if !(1..=30_000).contains(&millis) {
             return Err(EmbeddingError::InvalidInput);
         }
         Ok(Duration::from_millis(millis))
+    }
+}
+
+/// 宿主组合层热选择：默认后台精确查询缓存，显式关闭时沿用有限等待模式。
+pub(crate) struct QueryRecallEmbeddings {
+    foreground: Arc<QueryEmbeddings>,
+    background: BackgroundEmbeddings,
+}
+impl QueryRecallEmbeddings {
+    pub(crate) fn new(
+        inner: Arc<dyn EmbeddingProvider>,
+        registry: Arc<dyn ServiceRegistry>,
+        timing: bool,
+    ) -> Self {
+        let foreground = Arc::new(QueryEmbeddings {
+            inner: inner.clone(),
+            registry: registry.clone(),
+            timing,
+            use_query_budget: true,
+        });
+        let background = BackgroundEmbeddings::new(Arc::new(QueryEmbeddings {
+            inner,
+            registry,
+            timing,
+            use_query_budget: false,
+        }));
+        Self {
+            foreground,
+            background,
+        }
+    }
+    pub(crate) async fn close(&self) -> Result<(), EmbeddingError> {
+        self.background.close().await
+    }
+}
+impl EmbeddingProvider for QueryRecallEmbeddings {
+    fn profile(&self) -> &EmbeddingProfile {
+        self.foreground.profile()
+    }
+    fn embed<'a>(&'a self, inputs: &'a [String]) -> EmbedFuture<'a> {
+        Box::pin(async move {
+            let background: bool = self
+                .foreground
+                .settings()?
+                .get("semantic_query_background")
+                .map_err(|_| EmbeddingError::Provider)?;
+            if background {
+                self.background.embed(inputs).await
+            } else {
+                self.foreground.embed(inputs).await
+            }
+        })
     }
 }
 impl EmbeddingProvider for QueryEmbeddings {
@@ -99,11 +154,15 @@ impl EmbeddingProvider for QueryEmbeddings {
     }
     fn embed<'a>(&'a self, inputs: &'a [String]) -> EmbedFuture<'a> {
         Box::pin(async move {
-            let budget = self.budget()?;
+            let budget = self.use_query_budget.then(|| self.budget()).transpose()?;
             let mut trace = QueryTiming::new(self.timing, budget);
-            let result = tokio::time::timeout(budget, self.inner.embed(inputs))
-                .await
-                .unwrap_or(Err(EmbeddingError::Timeout));
+            let request = self.inner.embed(inputs);
+            let result = match budget {
+                Some(budget) => tokio::time::timeout(budget, request)
+                    .await
+                    .unwrap_or(Err(EmbeddingError::Timeout)),
+                None => request.await,
+            };
             trace.finish(match &result {
                 Ok(_) => "embedding_ready",
                 Err(EmbeddingError::Timeout) => "embedding_timeout",
@@ -118,10 +177,10 @@ static QUERY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 struct QueryTiming {
     started: Option<Instant>,
     query: u64,
-    budget_ms: u128,
+    budget_ms: Option<u128>,
 }
 impl QueryTiming {
-    fn new(enabled: bool, budget: Duration) -> Self {
+    fn new(enabled: bool, budget: Option<Duration>) -> Self {
         let trace = Self {
             started: enabled.then(Instant::now),
             query: if enabled {
@@ -129,7 +188,7 @@ impl QueryTiming {
             } else {
                 0
             },
-            budget_ms: budget.as_millis(),
+            budget_ms: budget.map(|value| value.as_millis()),
         };
         trace.emit("embedding_begin");
         trace

@@ -18,6 +18,7 @@ import recall_test
 HISTORY = "以后回答尽量简短一些"
 PARAPHRASE = "别写长篇大论"
 SEMANTIC_ENV = {"EVE_MODELS_SEMANTIC_ENABLED": "true", "EVE_MODELS_SEMANTIC_PROVIDER": "openai",
+                "EVE_SEMANTIC_QUERY_BACKGROUND": "false",  # 本文件显式验收当轮完整混合召回。
                 "EVE_MODELS_SEMANTIC_MODEL": "concept-embed", "EVE_MODELS_SEMANTIC_DIMENSIONS": "4"}
 CONCEPTS = [["简短", "简洁", "精简", "长篇", "啰嗦"], ["辣", "川菜", "吃"], ["Mindustry", "模组", "游戏"]]
 

@@ -113,5 +113,58 @@ class RequestTimingAcceptance(semantic.SemanticAcceptance):
         self.assertNotIn(query, self.last_stderr)
         self.assertTrue(self.index()['entries'], 'existing index must be preserved')
 
+    def test_background_query_does_not_delay_primary_and_exact_cached_vectors_keep_scope_isolation(self):
+        self.seed_interaction('source', semantic.HISTORY)
+        query = semantic.PARAPHRASE
+        entered, release = threading.Event(), threading.Event()
+        before = len(self.requests)
+        started = []
+
+        def block_query(body):
+            if body['input'] == [query]:
+                started.append(time.monotonic())
+                entered.set()
+                if not release.wait(5): raise AssertionError('background query gate was not released')
+
+        def enable_background():
+            self.indexed(2)()
+            code, page = self.panel('/api/plugin-pages/read', {'plugin_id': 'eve.config', 'page_id': 'provider.openai'})
+            self.assertEqual(code, 200)
+            field = next(field for field in page['fields'] if field['id'] == 'semantic_query_background')
+            self.assertIs(field['value'], False)
+            self.assertFalse(field['restart_required'])
+            code, saved = self.panel('/api/plugin-pages/save', {'plugin_id': 'eve.config', 'page_id': 'provider.openai',
+                'instance': page['instance'], 'expected_revision': page['revision'], 'values': {'semantic_query_background': True}})
+            self.assertEqual(code, 200)
+            self.assertEqual(saved['restart_required'], [])
+
+        def primary_while_embedding_blocked():
+            try:
+                self.assertTrue(entered.wait(3))
+                self.wait_until(lambda: len(self.requests) == before + 1, 'background query blocked the primary')
+                self.assertLess(time.monotonic() - started[0], 2)
+                self.assertFalse(release.is_set())
+                self.assertEqual(self.recall_data(self.requests[-1]), [], 'cold paraphrase must not invent semantic hits')
+                self.assertFalse(release.wait(.2))
+                self.assertNotIn('"phase":"embedding_timeout"', self.panel_stderr.read_text(),
+                                 'background request must outlive the foreground wait budget')
+            finally:
+                release.set()
+            self.wait_until(lambda: '"phase":"embedding_ready"' in self.panel_stderr.read_text(), 'background query did not finish')
+
+        self.before_embedding = block_query
+        self.semantic_run([*self.checkpoint('enable'), *self.send(self.message('cold', query)),
+                           *self.checkpoint('warm'), *self.send(self.message('cached', query)),
+                           *self.send(self.message('foreign', query, user='user-2'))],
+                          panel=True, env={'EVE_TRACE_DIALOGUE_TIMING': '1', 'EVE_SEMANTIC_QUERY_TIMEOUT_MS': '50'},
+                          checkpoints={'enable': enable_background, 'warm': primary_while_embedding_blocked})
+        self.assertEqual(len(self.requests), before + 3)
+        [data] = self.recall_data(self.requests[-2])
+        self.assertEqual(data['retrieval'], 'hybrid')
+        self.assertTrue(any(semantic.HISTORY in hit['excerpt'] for hit in data['hits']))
+        self.assertEqual(self.recall_data(self.requests[-1]), [], 'cached vectors cannot leak another user memory')
+        self.assertEqual(sum(body['input'] == [query] for body in self.embeddings), 1)
+        self.assertNotIn(query, self.last_stderr)
+
 
 if __name__ == '__main__': unittest.main()

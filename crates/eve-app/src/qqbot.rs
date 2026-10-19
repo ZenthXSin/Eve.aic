@@ -790,6 +790,7 @@ async fn run_qqbot_composed(
     let mut pursuit_background: Option<qq_pursuit::Background> = None;
     let mut plan_background: Option<qq_plan::Background> = None;
     let mut semantic_background: Option<qq_semantic::Background> = None;
+    let mut semantic_queries: Option<Arc<qq_semantic::QueryRecallEmbeddings>> = None;
     let mut summary_background: Option<qq_summary::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
     let mut panel: Option<eve_web_panel::LocalPanel> = None;
@@ -1267,7 +1268,13 @@ async fn run_qqbot_composed(
             let index = plugin.index();
             kernel.register(Box::new(plugin))?;
             kernel.start(&PluginId::new(SEMANTIC_PLUGIN_ID)?).await?;
-            Some((index, Arc::new(qq_semantic::DeferredEmbeddings::new())))
+            let embeddings = Arc::new(qq_semantic::DeferredEmbeddings::new());
+            semantic_queries = Some(Arc::new(qq_semantic::QueryRecallEmbeddings::new(
+                embeddings.clone(),
+                registry.clone(),
+                crate::models::timing_enabled(),
+            )));
+            Some((index, embeddings))
         } else {
             None
         };
@@ -1277,17 +1284,13 @@ async fn run_qqbot_composed(
                 Arc::new(LexicalMemoryRecall::new(memory.clone()));
             match &semantic {
                 // 词项与语义混合召回；向量模型在核心装配后注入，通道收消息前完成。
-                Some((index, embeddings)) => Arc::new(MemoryRecallContext::with_async_recall(
+                Some((index, _)) => Arc::new(MemoryRecallContext::with_async_recall(
                     "qq",
                     Arc::new(HybridRecall::new(
                         memory,
                         lexical.clone(),
                         index.clone(),
-                        Arc::new(qq_semantic::QueryEmbeddings {
-                            inner: embeddings.clone(),
-                            registry: registry.clone(),
-                            timing: crate::models::timing_enabled(),
-                        }),
+                        semantic_queries.clone().ok_or("语义查询服务缺失")?,
                     )),
                     lexical,
                     context,
@@ -2227,6 +2230,11 @@ async fn run_qqbot_composed(
     }
     if let Some(summary) = &summary_background {
         summary.request_stop();
+    }
+    if let Some(queries) = semantic_queries
+        && let Err(error) = queries.close().await
+    {
+        secondary.push(error.into());
     }
     if let Some(summary) = summary_background
         && let Err(error) = summary.stop().await

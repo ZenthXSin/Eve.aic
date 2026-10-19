@@ -289,6 +289,47 @@ async fn corrected_text_is_reindexed_revoked_items_leave_and_lexical_hits_fuse_f
     assert_eq!(world.index.entries().unwrap().len(), before - 1);
 }
 
+#[tokio::test]
+async fn cached_query_vectors_recheck_current_memory_and_do_not_resurrect_revoked_preferences() {
+    let world = World::new().await;
+    world.confirm("brief", "以后回答尽量简短");
+    let embedder = Concepts::new("concepts-v1");
+    world.indexer(embedder.clone()).step(1_000).await.unwrap();
+    let queries = Arc::new(BackgroundEmbeddings::new(embedder.clone()));
+    let memory = Arc::new(world.memory.clone());
+    let hybrid = HybridRecall::new(
+        memory.clone(),
+        Arc::new(LexicalMemoryRecall::new(memory)),
+        world.index.clone(),
+        queries.clone(),
+    );
+    let reader = hybrid.reader(scope()).unwrap();
+    let query = request("别写长篇大论");
+    assert!(matches!(
+        reader.recall(&query).await,
+        Err(MemoryError::Unavailable)
+    ));
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            tokio::task::yield_now().await;
+            if let Ok(response) = reader.recall(&query).await {
+                break response;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(response.hits.len(), 1);
+    let calls = embedder.calls.load(Ordering::SeqCst);
+    world.change(PreferenceAction::Revoke { id: "brief".into() });
+    // 故意不重建持久索引：查询向量缓存也不能复活已撤销来源。
+    let updated = reader.recall(&query).await.unwrap();
+    assert!(updated.revision > response.revision);
+    assert!(updated.hits.is_empty());
+    assert_eq!(embedder.calls.load(Ordering::SeqCst), calls);
+    queries.close().await.unwrap();
+}
+
 #[derive(Default)]
 struct Base;
 impl ContextAssembler for Base {

@@ -1,11 +1,13 @@
 //! 语义记忆召回：持久向量索引、后台建索引，以及词项与语义融合的混合召回。
 //! 向量模型通过 `eve-semantic-api` 的公开契约替换；索引只保存范围摘要、条目键、正文摘要与量化向量。
+mod background_embeddings;
 mod indexer;
 mod items;
 mod recall;
 mod store;
 mod strict_json;
 
+pub use background_embeddings::BackgroundEmbeddings;
 use eve_plugin_api::{
     Cleanup, Plugin, PluginContext, PluginError, PluginFuture, PluginManifest, PluginResult,
     cleanup,

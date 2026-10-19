@@ -25,7 +25,11 @@ QQBOT_SANDBOX=true ./target/debug/eve-qqbot --state-dir .eve-qqbot
 
 语义召回默认沿用主模型的端点和凭据。若对话与向量模型分属不同服务，可在面板“插件页面 → 主模型连接”设置 `provider.openai.semantic_base_url`（环境变量 `EVE_OPENAI_SEMANTIC_BASE_URL`），并把 `runtime.models.semantic_credential_ref` 设为 `env:EVE_SEMANTIC_API_KEY`，由宿主环境提供独立密钥 `EVE_SEMANTIC_API_KEY`。端点为空表示沿用主模型；凭据引用为空或 `env:EVE_OPENAI_API_KEY` 时沿用主模型密钥。独立凭据缺失、引用不受支持或端点无效时在连接 QQ 前拒绝启动，不静默换用别的凭据。语义提供者在启动时捕获，修改后须重启；端点字段在面板标注需重启。配置只保存端点及凭据引用，不保存密钥；重启保留原记忆、索引和失败记录，不重放旧消息或工具操作。
 
-在线语义查询会先于主对话请求执行，因此使用独立的短等待预算：面板“主模型连接”的 `semantic_query_timeout_ms` 默认 1500 毫秒、范围 1 至 30000，环境变量 `EVE_SEMANTIC_QUERY_TIMEOUT_MS`。保存后下一次查询生效，无需重启。超时取消本地等待，改用同一可信作用域的词项召回，有命中时明确标记 `lexical_fallback`；不会自动重试或把迟到结果补入本轮。后台建索引继续使用原向量模型超时，已有记忆、索引和历史保留。该预算只限制在线查询的向量等待，不承诺整轮回复时间，也不代表远端一定取消计费。
+在线语义查询默认不挡住主对话请求：面板“主模型连接”的 `semantic_query_background` 默认 `true`（环境变量 `EVE_SEMANTIC_QUERY_BACKGROUND`）。查询向量未就绪时，登记一次后台计算，当前轮立即使用同一可信作用域的词项召回，有命中时标记 `lexical_fallback`；不等远端返回，也不把迟到结果补进已发出的请求。后台查询沿用语义模型原超时。已有精确查询向量就绪时再做本轮混合召回；只复用模型、维度和规范化查询完全相同的向量，每次仍读取最新记忆、检查当前作用域与来源，不缓存记忆命中或把上一句的向量套给不同问题。冷查询可能因此缺少只靠语义才能找到的记忆。
+
+若需要当轮等待完整语义召回，可在同页关闭 `semantic_query_background`，此时 `semantic_query_timeout_ms` 限制前台等待，默认 1500 毫秒、范围 1 至 30000，环境变量 `EVE_SEMANTIC_QUERY_TIMEOUT_MS`。超时沿用词项回退。两个字段保存后下一次查询生效，无需重启；前台预算不截断后台查询。后台建索引保持原行为。预算不承诺整轮回复时间，本地取消不代表远端一定取消计费。
+
+查询缓存仅在内存中，最多 64 项、4 个在途请求；重复查询不重复提交，成功向量保留 5 分钟，失败冷却 30 秒，冷却后也只在新查询触发时重算。满载时当前轮直接使用词项检索。关停取消并等待本宿主持有的后台查询任务退出；不保存/重放查询队列，重启后为空缓存。已有持久记忆、索引和历史保持原恢复语义，状态损坏仍拒绝启动。
 
 手机可在 [GitHub Actions Secrets](https://github.com/ZenthXSin/Eve.aic/settings/secrets/actions) 添加 `QQBOT_APP_SECRET`；已有模型 Secret 继续使用。代码合入 main 后，在 [QQBot 首次真实交互](https://github.com/ZenthXSin/Eve.aic/actions/workflows/qqbot-interaction.yml) 点击 Run workflow，默认沙箱与 300 秒窗口；日志出现窗口启动后，向测试机器人私聊或在测试群 @ 发送文字。至少一次接收、模型完成和 QQ 成功发送且没有失败，报告才判定通过。超时退出不等于成功交互。
 
