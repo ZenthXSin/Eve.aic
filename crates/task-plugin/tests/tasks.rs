@@ -8,6 +8,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+type Mutation = Box<dyn Fn(&mut Value)>;
+
 struct Store {
     inner: FileStateStore,
     fail: AtomicBool,
@@ -358,7 +360,7 @@ async fn corrupt_unknown_or_inconsistent_ledgers_refuse_to_open_and_keep_bytes()
         .unwrap();
     kernel.stop_all().await.unwrap();
     let good: Value = serde_json::from_slice(&world.raw().unwrap()).unwrap();
-    let mutations: Vec<Box<dyn Fn(&mut Value)>> = vec![
+    let mutations: Vec<Mutation> = vec![
         Box::new(|v| v["format_version"] = 2.into()),
         Box::new(|v| v["tasks"][0]["id"] = "task-forged".into()),
         Box::new(|v| v["tasks"][0]["result"] = Value::Null),
