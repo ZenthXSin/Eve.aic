@@ -67,11 +67,13 @@ async fn file_recovery_sends_paired_history_and_final_answer_phase_with_stable_p
     assert_eq!(first_request["tools"], recovered_request["tools"]);
     let original = first_request["input"].as_array().unwrap();
     let recovered = recovered_request["input"].as_array().unwrap();
-    assert_eq!(
-        &original[..original.len() - 2],
-        &recovered[..original.len() - 2]
-    );
-    let n = original.len() - 1;
+    let prefix_len = recovered
+        .iter()
+        .position(|message| message["role"] == "user")
+        .unwrap();
+    assert_eq!(&original[..prefix_len], &recovered[..prefix_len]);
+    assert_eq!(recovered[prefix_len], original[original.len() - 1]);
+    let n = prefix_len + 1;
     assert_eq!(
         &tool_request["input"].as_array().unwrap()[original.len()..],
         &recovered[n..n + 4]
@@ -89,8 +91,8 @@ async fn file_recovery_sends_paired_history_and_final_answer_phase_with_stable_p
     assert_eq!(recovered[n + 4]["role"], "assistant");
     assert_eq!(recovered[n + 4]["phase"], "final_answer");
     assert_eq!(recovered[n + 4]["content"], "第一轮完成");
-    assert_eq!(recovered[n + 5], original[original.len() - 2]);
-    assert_eq!(recovered[n + 6]["content"], "第二轮");
+    assert_eq!(recovered[recovered.len() - 2], original[original.len() - 2]);
+    assert_eq!(recovered[recovered.len() - 1]["content"], "第二轮");
     assert!(server.requests.try_recv().is_err());
     second_rig.stop().await;
 }

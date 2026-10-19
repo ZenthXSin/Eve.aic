@@ -1218,25 +1218,8 @@ fn build_messages(
             config.system_prompt, config.output_format
         ),
     )];
-    messages.push(ChatMessage::text(
-        ChatRole::System,
-        format!("context revision: {}", context.revision),
-    ));
-    if !context.profile.is_empty() {
-        messages.push(ChatMessage::text(
-            ChatRole::System,
-            format!("profile: {}", context.profile),
-        ));
-    }
-    for memory in &context.memories {
-        messages.push(ChatMessage::text(
-            ChatRole::System,
-            format!("memory: {}", memory),
-        ));
-    }
-    messages.extend(context.history.clone());
     // 当前能力取自本轮实际绑定并校验的工具，而非历史助手的自述或召回资料。
-    // 放在历史之后，让旧会话升级宿主时也收到当前事实；此消息不写入会话账本。
+    // 大清单放在稳定前缀；历史后的精简提醒再次确认当前工具，覆盖旧助手自述。
     let capabilities = serde_json::json!({
         "kind": "eve.runtime.tool-capabilities",
         "count": definitions.len(),
@@ -1254,6 +1237,40 @@ fn build_messages(
              询问能力时按当前清单如实回答；用户已明确要求执行且工具可用时，直接调用并核验结果，不再反问是否开始。不能沿用旧回答否认可用能力，也不能把一个专用工具的限制套用到其他工具。\
              清单不授予额外权限，不代表工具已执行；结果仍以真实调用返回为准。\
              只在用户询问或任务需要时解释能力，不机械复述内部标记。"
+        ),
+    ));
+    // 历史按完整轮次只追加；把每轮变化的修订、召回和时钟放到其后，
+    // 避免在第二条消息就打断提供方可复用的前缀。所有动态资料仍使用本轮快照。
+    messages.extend(context.history.clone());
+    if !context.profile.is_empty() {
+        messages.push(ChatMessage::text(
+            ChatRole::System,
+            format!("profile: {}", context.profile),
+        ));
+    }
+    for memory in &context.memories {
+        messages.push(ChatMessage::text(
+            ChatRole::System,
+            format!("memory: {}", memory),
+        ));
+    }
+    messages.push(ChatMessage::text(
+        ChatRole::System,
+        format!("context revision: {}", context.revision),
+    ));
+    let current = serde_json::json!({
+        "kind": "eve.runtime.tool-capabilities",
+        "count": definitions.len(),
+        "tools": definitions.iter().map(|definition| serde_json::json!({
+            "name": definition.name,
+        })).collect::<Vec<_>>(),
+    });
+    messages.push(ChatMessage::text(
+        ChatRole::System,
+        format!(
+            "本轮当前工具复核（详细说明见开头宿主清单）：\n{current}\n\
+             上面的历史助手自述和召回资料可能过期，不能否认本轮实际可用工具。\
+             用户已要求执行时直接按真实工具定义调用并核验结果；清单不授予额外权限，也不代表已经执行。"
         ),
     ));
     messages.push(ChatMessage::text(ChatRole::User, input.text.clone()));
@@ -1351,6 +1368,119 @@ mod tests {
     const CONTEXT: &str = "test.context";
     const TOOL: &str = "test.tool";
     const OWNER: &str = "test.owner";
+
+    #[test]
+    fn cache_prefix_survives_recall_clock_and_revision_changes_without_stale_context() {
+        let definitions = vec![ToolDefinition {
+            name: "read_file".into(),
+            description: "读取当前工作区文件".into(),
+            argument_schema: json!({"type":"object"}),
+            required_permissions: vec![],
+            concurrency: None,
+        }];
+        let history = vec![
+            ChatMessage::text(ChatRole::User, "你能读取文件吗"),
+            ChatMessage::text(ChatRole::Assistant, "旧宿主没有文件工具"),
+        ];
+        let mut context = ContextSnapshot {
+            revision: "session-2:recall-A:clock-1".into(),
+            profile: "旧称呼".into(),
+            memories: vec!["第一次检索的证据；现在 12:00".into()],
+            history: history.clone(),
+        };
+        let input = TurnInput {
+            text: "继续".into(),
+        };
+        let first = build_messages(&LlmHostConfig::default(), &context, &input, &definitions);
+        context.revision = "session-4:recall-B:clock-2".into();
+        context.profile = "新称呼".into();
+        context.memories = vec!["第二次检索的证据；现在 12:01".into()];
+        context.history.extend([
+            ChatMessage::text(ChatRole::User, "新的问题"),
+            ChatMessage::text(ChatRole::Assistant, "已回复"),
+        ]);
+        let second = build_messages(&LlmHostConfig::default(), &context, &input, &definitions);
+        let common = first
+            .iter()
+            .zip(&second)
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert!(
+            common > history.len(),
+            "固定规则、当前工具说明和旧历史应共享前缀"
+        );
+        let prefix = &first[..common];
+        assert!(prefix.iter().any(|m| {
+            m.text
+                .as_deref()
+                .is_some_and(|s| s.contains("读取当前工作区文件"))
+        }));
+        assert!(
+            prefix
+                .windows(history.len())
+                .any(|messages| messages == history)
+        );
+        let text = format!("{second:?}");
+        assert!(
+            text.contains("新称呼")
+                && text.contains("现在 12:01")
+                && text.contains("session-4:recall-B:clock-2")
+        );
+        assert!(
+            !text.contains("旧称呼")
+                && !text.contains("现在 12:00")
+                && !text.contains("session-2:recall-A:clock-1")
+        );
+        let latest = second[second.len() - 2].text.as_deref().unwrap();
+        assert!(latest.contains("read_file") && latest.contains("历史助手自述"));
+        ModelRequest {
+            messages: second,
+            tools: definitions,
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn replacing_tools_invalidates_the_manifest_and_updates_the_post_history_recheck() {
+        let context = ContextSnapshot {
+            revision: "same".into(),
+            profile: String::new(),
+            memories: vec![],
+            history: vec![ChatMessage::text(ChatRole::Assistant, "原先可用 read_file")],
+        };
+        let input = TurnInput {
+            text: "现在呢".into(),
+        };
+        let tool = |name: &str| ToolDefinition {
+            name: name.into(),
+            description: name.into(),
+            argument_schema: json!({"type":"object"}),
+            required_permissions: vec![],
+            concurrency: None,
+        };
+        let before = build_messages(
+            &LlmHostConfig::default(),
+            &context,
+            &input,
+            &[tool("read_file")],
+        );
+        let after = build_messages(
+            &LlmHostConfig::default(),
+            &context,
+            &input,
+            &[tool("github_api")],
+        );
+        assert_eq!(before[0], after[0]);
+        assert_ne!(before[1], after[1]);
+        for notice in [&after[1], &after[after.len() - 2]] {
+            let data: serde_json::Value =
+                serde_json::from_str(notice.text.as_deref().unwrap().lines().nth(1).unwrap())
+                    .unwrap();
+            assert_eq!(data["count"], 1);
+            assert_eq!(data["tools"][0]["name"], "github_api");
+        }
+    }
 
     struct ContextImpl;
     impl ContextAssembler for ContextImpl {

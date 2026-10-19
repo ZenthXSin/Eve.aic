@@ -35,19 +35,26 @@ impl LlmProvider for RecoveryProvider {
             } else {
                 "继续会话"
             };
-            let tail_len = history_len + 2 + if round == 1 { 2 } else { 0 };
-            let prefix_len = request
+            let current_index = request
                 .messages
                 .len()
-                .checked_sub(tail_len)
+                .checked_sub(1 + if round == 1 { 2 } else { 0 })
                 .ok_or_else(|| LlmError::Protocol("恢复后请求消息缺失".into()))?;
+            let prefix_len = request
+                .messages
+                .iter()
+                .position(|m| m.role != ChatRole::System)
+                .ok_or_else(|| LlmError::Protocol("恢复后请求缺少对话".into()))?;
             if request.messages[..prefix_len]
                 .iter()
                 .any(|m| m.role != ChatRole::System)
                 || request.messages[prefix_len..prefix_len + history_len] != self.history
-                || request.messages[prefix_len + history_len].role != ChatRole::System
-                || request.messages[prefix_len + history_len + 1]
-                    != ChatMessage::text(ChatRole::User, current)
+                || request.messages[prefix_len + history_len..current_index]
+                    .iter()
+                    .any(|m| m.role != ChatRole::System)
+                || current_index == 0
+                || request.messages[current_index - 1].role != ChatRole::System
+                || request.messages[current_index] != ChatMessage::text(ChatRole::User, current)
                 || request.tools.len() != 1
                 || request.tools[0].name != "receipt"
             {

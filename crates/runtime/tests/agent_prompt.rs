@@ -59,16 +59,16 @@ async fn file_snapshot_survives_edit_and_reassembly_restores_history_without_too
         assert_eq!(requests[0].tools, requests[1].tools);
         assert_eq!(requests[0].tools[0].name, "receipt");
         assert_eq!(
-            requests[0].messages[1].text.as_deref(),
-            Some("context revision: fixed-1")
-        );
-        assert_eq!(
             requests[0].messages[2].text.as_deref(),
             Some("profile: 用户档案")
         );
         assert_eq!(
             requests[0].messages[3].text.as_deref(),
             Some("memory: 使用中文")
+        );
+        assert_eq!(
+            requests[0].messages[4].text.as_deref(),
+            Some("context revision: fixed-1")
         );
         assert_eq!(requests[0].messages.last().unwrap().role, ChatRole::User);
         assert!(!format!("{requests:?}").contains("DEVELOPER_ONLY"));

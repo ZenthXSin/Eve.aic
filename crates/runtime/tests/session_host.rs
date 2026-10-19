@@ -320,16 +320,20 @@ async fn two_turns_replay_complete_tool_history_without_executing_old_calls() {
         [first.output.transcript.clone(), second.output.transcript].concat()
     );
     let requests = provider.requests.lock().unwrap().clone();
-    // 固定上下文位于历史之前；本轮能力事实在恢复后的历史之后重新生成。
-    let prefix_len = requests[0].messages.len() - 2;
+    // 固定规则与完整工具说明位于历史之前；动态上下文和精简能力复核在历史后。
+    let prefix_len = requests[2]
+        .messages
+        .iter()
+        .position(|message| message.role != ChatRole::System)
+        .unwrap();
     assert_eq!(
         &requests[0].messages[..prefix_len],
         &requests[2].messages[..prefix_len]
     );
     assert_eq!(requests[0].tools, requests[2].tools);
     assert_eq!(
-        requests[0].messages[prefix_len],
-        requests[2].messages[prefix_len + first.output.transcript.len()]
+        requests[0].messages[requests[0].messages.len() - 2],
+        requests[2].messages[requests[2].messages.len() - 2]
     );
     assert_eq!(
         &requests[2].messages[prefix_len..prefix_len + 4],
