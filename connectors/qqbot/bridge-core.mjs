@@ -36,13 +36,46 @@ function userText(msg, appId) {
 }
 // Only the envelope's own attachments belong to this message. msg_elements can
 // contain quoted images; never treat those as freshly uploaded pictures.
+const FILE_TYPES = new Set(["text/plain", "application/pdf", "application/zip",
+  "application/json", "application/octet-stream"]);
+function allowedType(type) {
+  return /^image\/[a-z0-9.+-]{1,64}$/i.test(type) || FILE_TYPES.has(type.toLowerCase());
+}
+function attachment(raw) {
+  if (!raw || typeof raw.content_type !== "string" || !allowedType(raw.content_type)) return null;
+  if (typeof raw.url !== "string" || raw.url.length > 4096 ||
+      !/^https:\/\/[^/\s]+\//.test(raw.url) || /[\p{Cc}]/u.test(raw.url)) return null;
+  const out = { content_type: raw.content_type.toLowerCase(), url: raw.url };
+  if (typeof raw.filename === "string" && raw.filename.trim() === raw.filename &&
+      raw.filename && raw.filename.length <= 255 && !/[\p{Cc}\/\\]/u.test(raw.filename)) {
+    out.filename = raw.filename;
+  }
+  return out;
+}
 function imageAttachments(msg) {
   if (!Array.isArray(msg.attachments)) return [];
-  return msg.attachments.filter(a => a && typeof a.content_type === "string" &&
-    /^image\/[a-z0-9.+-]{1,64}$/i.test(a.content_type) &&
-    typeof a.url === "string" && a.url.length <= 4096 &&
-    /^https:\/\/[^/\s]+\//.test(a.url) && !/[\p{Cc}]/u.test(a.url))
-    .slice(0, 4).map(a => ({ content_type: a.content_type.toLowerCase(), url: a.url }));
+  return msg.attachments.map(attachment).filter(Boolean).slice(0, 4);
+}
+// 被引用消息的文字与附件单独抽出，不和本条新发的附件混在一起。
+function quotedMessage(msg) {
+  const elements = msg.msg_elements ?? msg.msgElements;
+  if (!Array.isArray(elements)) return null;
+  const texts = [];
+  const attachments = [];
+  for (const element of elements) {
+    if (!element || typeof element !== "object") continue;
+    if (typeof element.content === "string" && element.content.trim() &&
+        Buffer.byteLength(element.content) <= 1024 && !/[\p{Cc}]/u.test(element.content)) {
+      texts.push(element.content.trim());
+    }
+    for (const raw of Array.isArray(element.attachments) ? element.attachments : []) {
+      const item = attachment(raw);
+      if (item && attachments.length < 4) attachments.push(item);
+    }
+  }
+  if (!texts.length && !attachments.length) return null;
+  return { ...(texts.length ? { text: texts.join("\n").slice(0, 1024) } : {}),
+    ...(attachments.length ? { attachments } : {}) };
 }
 export function optionsFromEnv(env) {
   const appId = env.QQBOT_APP_ID || "1904159860";
@@ -97,6 +130,7 @@ export function createBridge(bot, emit, limit = 128) {
     }
     const target = msg.replyTarget;
     const attachments = imageAttachments(msg);
+    const quoted = quotedMessage(msg);
     if (!validMessageId(msg.messageId) || !validId(msg.senderId) || !target ||
         target.scope !== msg.kind || target.msgId !== msg.messageId ||
         !validId(target.targetId) || (typeof msg.content !== "string" || Buffer.byteLength(msg.content) > 32768) ||
@@ -112,7 +146,8 @@ export function createBridge(bot, emit, limit = 128) {
     const validName = senderName && Buffer.byteLength(senderName) <= 128 && [...senderName].length <= 48 && !/[\p{Cc}]/u.test(senderName);
     const frame = { type: "message", id: msg.messageId, scope: msg.kind,
       target_id: target.targetId, user_id: msg.senderId,
-      text, ...(attachments.length ? { attachments } : {}), ...(validName ? { sender_name: senderName } : {}) };
+      text, ...(attachments.length ? { attachments } : {}),
+      ...(quoted ? { quoted } : {}), ...(validName ? { sender_name: senderName } : {}) };
     // JSON escaping can expand a legal body beyond the Rust wire-frame limit.
     if (Buffer.byteLength(JSON.stringify({ version: 1, ...frame })) > MAX_FRAME) {
       warn("frame_limit"); return;

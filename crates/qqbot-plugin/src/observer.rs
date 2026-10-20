@@ -187,6 +187,7 @@ mod tests {
     fn fixture() -> (Message, ControlReport, SessionSnapshot) {
         let message = Message {
             attachments: vec![],
+            quoted: None,
             id: "opaque+/平台消息=".into(),
             scope: "c2c".into(),
             target_id: "alice".into(),

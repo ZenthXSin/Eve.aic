@@ -1291,10 +1291,10 @@ pub(crate) async fn run(
                             if let Some(object) = payload.as_object_mut() {
                                 object.remove("type"); object.remove("version");
                                 object.remove("sender_name");
-                                if object.keys().any(|key| !["id", "scope", "target_id", "user_id", "text", "attachments"].contains(&key.as_str())) {
+                                if object.keys().any(|key| !["id", "scope", "target_id", "user_id", "text", "attachments", "quoted"].contains(&key.as_str())) {
                                     warn(&ctx, "ignored_message_fields");
                                 }
-                                object.retain(|key, _| ["id", "scope", "target_id", "user_id", "text", "attachments"].contains(&key.as_str()));
+                                object.retain(|key, _| ["id", "scope", "target_id", "user_id", "text", "attachments", "quoted"].contains(&key.as_str()));
                             }
                             let Ok(mut message) = serde_json::from_value::<Message>(payload) else { warn(&ctx, "invalid_message"); continue; };
                             if !message.valid() { warn(&ctx, "invalid_route_or_text"); continue; }

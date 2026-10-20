@@ -462,17 +462,39 @@ test("纯图片和图文保留本条图片引用，不抓取、不混入引用�
     attachments: [{ content_type: "image/png", url: "https://media.example.invalid/image.png", filename: "untrusted-name" }] };
   f.handlers.get("message")({}, message);
   assert.equal(f.frames[0].text, "");
-  assert.deepEqual(f.frames[0].attachments, [{ content_type: "image/png", url: "https://media.example.invalid/image.png" }]);
+  assert.deepEqual(f.frames[0].attachments, [{ content_type: "image/png", url: "https://media.example.invalid/image.png", filename: "untrusted-name" }]);
   await f.bridge.command({type: "reply", version: 1, id: "image-1", text: "图片已收到，尚未解析。"});
   assert.equal(f.sent.length, 1);
   assert.equal(f.sent[0].target.targetId, "user-1");
   f.handlers.get("message")({}, {...message, messageId: "text-image", content: "看看这张图", replyTarget: {...message.replyTarget, msgId: "text-image"}});
   assert.equal(f.frames.find(x => x.id === "text-image").text, "看看这张图");
-  f.handlers.get("message")({}, {...message, messageId: "quoted", attachments: [],
-    msgElements: [{attachments: message.attachments}], replyTarget: {...message.replyTarget, msgId: "quoted"}});
-  assert.ok(!f.frames.some(x => x.type === "message" && x.id === "quoted"));
+  f.handlers.get("message")({}, {...message, messageId: "quoted", content: "看这个", attachments: [],
+    msgElements: [{content: "被引用的正文", attachments: message.attachments}], replyTarget: {...message.replyTarget, msgId: "quoted"}});
+  const quoted = f.frames.find(x => x.type === "message" && x.id === "quoted");
+  assert.equal(quoted.text, "看这个");
+  assert.equal(quoted.attachments, undefined);
+  assert.deepEqual(quoted.quoted, { text: "被引用的正文", attachments: [{ content_type: "image/png", url: "https://media.example.invalid/image.png", filename: "untrusted-name" }] });
   f.handlers.get("message")({}, {...message, messageId: "unsafe", attachments: [{content_type:"image/png",url:"file:///private"}], replyTarget: {...message.replyTarget, msgId: "unsafe"}});
   assert.ok(!f.frames.some(x => x.type === "message" && x.id === "unsafe"));
+});
+
+test("非图片文件按白名单转发，文件名不合规时丢掉文件名保留附件", () => {
+  const f = fixture();
+  const base = { kind: "c2c", senderId: "user-1", content: "文件", replyTarget: { scope: "c2c", targetId: "user-1" } };
+  f.handlers.get("message")({}, { ...base, messageId: "file-1",
+    replyTarget: { ...base.replyTarget, msgId: "file-1" },
+    attachments: [{ content_type: "application/pdf", url: "https://media.example.invalid/a.pdf", filename: "报告.pdf" }] });
+  assert.deepEqual(f.frames[0].attachments, [{ content_type: "application/pdf", url: "https://media.example.invalid/a.pdf", filename: "报告.pdf" }]);
+  for (const [index, filename] of ["a/b.pdf", "x\ny", "../x", "x".repeat(256)].entries()) {
+    const id = `file-${index + 2}`;
+    f.handlers.get("message")({}, { ...base, messageId: id, replyTarget: { ...base.replyTarget, msgId: id },
+      attachments: [{ content_type: "text/plain", url: "https://media.example.invalid/n.txt", filename }] });
+    assert.deepEqual(f.frames.find(x => x.id === id).attachments, [{ content_type: "text/plain", url: "https://media.example.invalid/n.txt" }]);
+  }
+  f.handlers.get("message")({}, { ...base, messageId: "file-bad", replyTarget: { ...base.replyTarget, msgId: "file-bad" },
+    attachments: [{ content_type: "application/x-msdownload", url: "https://media.example.invalid/a.exe" }] });
+  const bad = f.frames.find(x => x.id === "file-bad");
+  assert.equal(bad.attachments, undefined);
 });
 
 test("群图片只接收艾特当前机器人的消息", () => {
