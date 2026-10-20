@@ -86,6 +86,26 @@ def fix_git_paths():
                 path.write_text(new, encoding='utf8')
 
 
+def configure_rust(config, env):
+    tools = ROOT / 'payload/workspace/eve-restored/workspace/tools'
+    bundled = tools / 'cargo/bin/cargo'
+    if bundled.is_file():
+        config['cargo_program'] = str(bundled)
+        env['CARGO_HOME'] = str(tools / 'cargo')
+        env['RUSTUP_HOME'] = str(tools / 'rustup')
+        cargo_bin = str(bundled.parent)
+    else:
+        # 运行版不携带构建缓存和 Rust；沿用新电脑安装的工具链及其配置。
+        for key in ('CARGO_HOME', 'RUSTUP_HOME'):
+            env.pop(key, None)
+            if key in os.environ:
+                env[key] = os.environ[key]
+        config['cargo_program'] = shutil.which('cargo', path=os.environ.get('PATH')) or 'cargo'
+        config['cargo_arguments'] = [x for x in config.get('cargo_arguments', []) if not x.startswith('+')]
+        cargo_bin = ''
+    env['PATH'] = os.pathsep.join(x for x in [str(ROOT / 'runtime/bin'), cargo_bin, os.environ.get('PATH', '/usr/bin:/bin')] if x)
+
+
 def prepare():
     if platform.system() != 'Linux' or platform.machine() != 'x86_64':
         raise RuntimeError('本包运行器需要 Linux x86_64；其他架构请从随包源码重新构建')
@@ -93,16 +113,31 @@ def prepare():
         raise RuntimeError('请以普通用户运行，不要使用 sudo 或 root 启动满权限 Eve')
     RUN.mkdir(exist_ok=True, mode=0o700)
     spec = load(ROOT / 'handoff.json')
+    expected = spec.get('stable_binary_sha256')
+    if expected:
+        with (ROOT / spec['binary']).open('rb') as stream:
+            if hashlib.file_digest(stream, 'sha256').hexdigest() != expected:
+                raise RuntimeError('Eve 程序 SHA-256 与交付版本不符；请核对更新文件，未启动')
     exported = ROOT / 'payload/workspace/eve-migration/private'
     config = mapped(load(exported / 'developer-features.json'))
-    config['live_upgrade'] = str(RUN / 'upgrade-control')
-    config['cargo_program'] = str(ROOT / 'payload/workspace/eve-restored/workspace/tools/cargo/bin/cargo')
+    if spec.get('profile') == 'hosted':
+        config.update(self_upgrade=False, github=False, github_write_repositories=[])
+    if config.get('self_upgrade'):
+        config['live_upgrade'] = str(RUN / 'upgrade-control')
+    else:
+        config.pop('live_upgrade', None)
+    if spec.get('profile') == 'hosted':
+        config['workspace'] = str(ROOT / 'data/workspace')
+        config['storage_directory'] = str(ROOT / 'data/developer-state')
+        Path(config['workspace']).mkdir(parents=True, exist_ok=True, mode=0o700)
     config['cargo_arguments'] = [x for x in config.get('cargo_arguments', []) if '/opt/codex/' not in x]
-    save(RUN / 'developer.json', config)
     env = dict(os.environ)
     # 导出文件仅含 Eve 配置；不重用云会话的代理、CA、PATH 或平台认证。
     env.update({k: mapped(v) for k, v in load(exported / 'features-environment.json').items()
                 if k.startswith(('EVE_', 'QQBOT_')) or k in ('CARGO_HOME', 'RUSTUP_HOME', 'CARGO_TARGET_DIR', 'CARGO_INCREMENTAL', 'CARGO_PROFILE_DEV_DEBUG', 'CARGO_PROFILE_TEST_DEBUG')})
+    if spec.get('profile') == 'hosted':
+        for key in ('EVE_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'):
+            env.pop(key, None)
     env['EVE_DEVELOPER_CONFIG'] = str(RUN / 'developer.json')
     env['EVE_RUNTIME_LOADER'] = str(ROOT / 'runtime/lib/ld-linux-x86-64.so.2')
     env['EVE_RUNTIME_LIBRARY_PATH'] = str(ROOT / 'runtime/lib')
@@ -110,12 +145,17 @@ def prepare():
     env['JAVA_HOME'] = str(ROOT / 'runtime/java')
     env['GIT_EXEC_PATH'] = str(ROOT / 'runtime/git-core')
     env['GIT_TEMPLATE_DIR'] = str(ROOT / 'runtime/git-templates')
-    tools = ROOT / 'payload/workspace/eve-restored/workspace/tools'
-    env['CARGO_HOME'] = str(tools / 'cargo')
-    env['RUSTUP_HOME'] = str(tools / 'rustup')
-    env['PATH'] = os.pathsep.join([str(ROOT / 'runtime/bin'), str(tools / 'cargo/bin'), os.environ.get('PATH', '/usr/bin:/bin')])
+    configure_rust(config, env)
+    save(RUN / 'developer.json', config)
     command = mapped(load(exported / 'features-command.json'))
     command[0] = str(ROOT / spec['binary'])
+    for flag, relative in spec.get('resources', {}).items():
+        command[command.index(flag) + 1] = str(ROOT / relative)
+    for index, value in enumerate(command):
+        if index and command[index - 1] == '--reference':
+            name = value.split('=', 1)[0]
+            if name in spec.get('references', {}):
+                command[index] = name + '=' + str(ROOT / spec['references'][name])
     for flag, name in [('--node', 'node'), ('--practice-python', 'python3'), ('--practice-java', 'java')]:
         if flag in command:
             command[command.index(flag) + 1] = str(ROOT / 'runtime/bin' / name)
@@ -157,7 +197,7 @@ def readiness(command, env):
 def doctor(command, env):
     results = []
     for name, args in [('Python', ['python3', '--version']), ('Node', ['node', '--version']),
-                       ('Java', ['java', '-version']), ('Git', ['git', '--version']), ('Cargo', ['cargo', '--version'])]:
+                       ('Java', ['java', '-version']), ('Git', ['git', '--version'])]:
         try:
             r = subprocess.run(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=25)
             text = r.stdout.decode(errors='replace').splitlines()
@@ -169,6 +209,11 @@ def doctor(command, env):
     results.append(('Eve', r.returncode == 0, '运行器加载检查'))
     for name, ok, text in results:
         print(f'{name}: {"通过" if ok else "失败"} — {text}')
+    try:
+        cargo = subprocess.run(['cargo', '--version'], env=env, capture_output=True, text=True, timeout=25)
+        print('Rust 构建工具（可选）:', cargo.stdout.strip() if cargo.returncode == 0 else '不可用；运行 Eve 不需要，自编译升级需要安装 Rust')
+    except (OSError, subprocess.TimeoutExpired):
+        print('Rust 构建工具（可选）: 未安装；运行 Eve 不需要，自编译升级需要安装 Rust')
     print('宿主 C 编译器:', shutil.which('cc') or '未安装（运行不需要，自编译升级需要 build-essential 或对应工具链）')
     print('可用磁盘 GiB:', round(shutil.disk_usage(ROOT).free / 2**30, 1))
     print('范围：以上只验证本机运行依赖，未连接 QQ 或请求模型。')
@@ -214,7 +259,7 @@ def main():
         if sock.connect_ex(address(command)) == 0:
             raise RuntimeError('本机面板端口已被占用；拒绝重复启动，请先停止其他 Eve 实例')
     argv = [str(ROOT / 'runtime/bin/python3'), str(ROOT / spec['supervisor']),
-            '--directory', config['live_upgrade'], '--candidates', str(Path(config['storage_directory']) / 'candidates'), '--', *command]
+            '--directory', str(RUN / 'upgrade-control'), '--candidates', str(Path(config['storage_directory']) / 'candidates'), '--', *command]
     with (RUN / 'eve.log').open('ab') as log:
         process = subprocess.Popen(argv, env=env, cwd=Path(config['workspace']), stdin=subprocess.DEVNULL,
                                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
