@@ -65,6 +65,10 @@ impl IndexEntry {
     fn identity(&self) -> (&str, u32, &str, &str) {
         (&self.model, self.dimensions, &self.scope, &self.item)
     }
+    /// 字段与向量完整、维度一致。
+    pub(crate) fn check(&self) -> Result<(), IndexError> {
+        self.validate()
+    }
     fn validate(&self) -> Result<(), IndexError> {
         let profile = EmbeddingProfile {
             model: self.model.clone(),

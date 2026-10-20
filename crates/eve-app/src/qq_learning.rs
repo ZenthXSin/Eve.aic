@@ -143,7 +143,8 @@ async fn run(
                 if scope.channel != "qq" {
                     continue;
                 }
-                let snapshot = memory.reader(scope.clone())?.snapshot()?;
+                // 读完整记忆：归档前还没提炼的交流同样会被提炼。
+                let snapshot = memory.reader(scope.clone())?.complete_snapshot()?;
                 if snapshot.scope != scope {
                     return Err("提炼来源作用域不匹配".into());
                 }

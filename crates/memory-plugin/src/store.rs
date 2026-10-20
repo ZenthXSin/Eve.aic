@@ -8,13 +8,44 @@ use eve_plugin_api::{PluginContext, PluginError, PluginResult};
 use eve_session_api::SessionTurnStatus;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
-    sync::{Mutex, MutexGuard},
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
-/// 格式 1：全部证据都在热层。格式 2：出现过归档后写入，含分块索引；
-/// 旧版程序读取格式 2 时按未知版本拒绝启动，不会误判为空或清空。
+/// 格式 1：全部证据都在热层。格式 2：出现过归档后写入，含分块索引，分块都未压缩。
+/// 格式 3：至少一个分块经无损压缩保存。旧版程序读取更高格式时按未知版本拒绝启动，
+/// 不会误判为空或清空；没有压缩分块的文档仍写格式 1 或 2，与旧版本逐字节相同。
 const ARCHIVED_FORMAT_VERSION: u32 = 2;
+const COMPRESSED_FORMAT_VERSION: u32 = 3;
+/// 解开后缓存在内存中的分块证据总条数上限；按最近使用淘汰，只影响读取速度。
+const DECODED_CACHE_EVIDENCE: usize = 16_384;
+
+fn format_for(document: &Document) -> u32 {
+    if document.next_chunk == 0 {
+        MEMORY_FORMAT_VERSION
+    } else if document
+        .scopes
+        .iter()
+        .flat_map(|record| &record.archive)
+        .any(|chunk| chunk.compressed)
+    {
+        COMPRESSED_FORMAT_VERSION
+    } else {
+        ARCHIVED_FORMAT_VERSION
+    }
+}
+
+type DecodedKey = (String, MemoryScope);
+/// 解开的证据与最近一次使用的序号。
+type DecodedEntry = (Arc<Vec<InteractionEvidence>>, u64);
+
+/// 已核对并解开的分块；分块不可变，按名称与作用域缓存。
+#[derive(Default)]
+struct DecodedChunks {
+    entries: BTreeMap<DecodedKey, DecodedEntry>,
+    tick: u64,
+    total: usize,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -230,6 +261,7 @@ struct Inner {
 }
 pub(super) struct StoredMemory {
     inner: Mutex<Inner>,
+    decoded: Mutex<DecodedChunks>,
 }
 impl StoredMemory {
     pub(super) fn open(
@@ -260,10 +292,10 @@ impl StoredMemory {
                 let document: Document =
                     serde_json::from_value(value).map_err(|_| MemoryError::CorruptState)?;
                 match document.format_version {
-                    MEMORY_FORMAT_VERSION if document.next_chunk == 0 => {}
-                    ARCHIVED_FORMAT_VERSION if document.next_chunk > 0 => {}
-                    MEMORY_FORMAT_VERSION | ARCHIVED_FORMAT_VERSION => {
-                        return Err(MemoryError::CorruptState);
+                    MEMORY_FORMAT_VERSION | ARCHIVED_FORMAT_VERSION | COMPRESSED_FORMAT_VERSION => {
+                        if document.format_version != format_for(&document) {
+                            return Err(MemoryError::CorruptState);
+                        }
                     }
                     _ => return Err(MemoryError::UnsupportedVersion),
                 }
@@ -299,7 +331,93 @@ impl StoredMemory {
                 archive_blocked: false,
                 hot_bytes,
             }),
+            decoded: Mutex::new(DecodedChunks::default()),
         })
+    }
+    /// 读取并核对一个分块；核对通过的结果按最近使用缓存。
+    fn load(
+        &self,
+        store: &dyn EvidenceArchiveStore,
+        scope: &MemoryScope,
+        chunk: &ChunkRecord,
+    ) -> MemoryResult<Arc<Vec<InteractionEvidence>>> {
+        let key = (chunk.name(), scope.clone());
+        if let Ok(mut cache) = self.decoded.lock() {
+            cache.tick += 1;
+            let tick = cache.tick;
+            if let Some((loaded, used)) = cache.entries.get_mut(&key) {
+                *used = tick;
+                return Ok(loaded.clone());
+            }
+        }
+        let loaded = match load_chunk(store, scope, chunk) {
+            Ok(loaded) => Arc::new(loaded),
+            Err(error) => {
+                self.block_archive(&error);
+                return Err(error);
+            }
+        };
+        if let Ok(mut cache) = self.decoded.lock() {
+            cache.total += loaded.len();
+            let tick = cache.tick;
+            cache.entries.insert(key, (loaded.clone(), tick));
+            while cache.total > DECODED_CACHE_EVIDENCE && cache.entries.len() > 1 {
+                let oldest = cache
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, (_, used))| *used)
+                    .map(|(key, _)| key.clone());
+                if let Some((evicted, _)) = oldest.and_then(|key| cache.entries.remove(&key)) {
+                    cache.total -= evicted.len();
+                }
+            }
+        }
+        Ok(loaded)
+    }
+    /// 本作用域的完整记忆：热层与全部归档分块按修订升序合并，`archived_evidence` 为 0。
+    /// 热层与分块索引在同一把锁下取得，读取中途发生的归档不会重复或漏掉证据。
+    pub(super) fn complete_snapshot(&self, scope: &MemoryScope) -> MemoryResult<MemorySnapshot> {
+        let (mut snapshot, chunks, store) = {
+            let inner = self.lock()?;
+            let Some(record) = inner
+                .document
+                .scopes
+                .iter()
+                .find(|value| value.snapshot.scope == *scope)
+            else {
+                return Ok(ScopeRecord::empty(scope.clone()).snapshot);
+            };
+            if record.archive.is_empty() {
+                return Ok(record.snapshot.clone());
+            }
+            let store = inner
+                .archive
+                .as_ref()
+                .ok_or(MemoryError::Unavailable)?
+                .store
+                .clone();
+            (record.snapshot.clone(), record.archive.clone(), store)
+        };
+        let mut archived = Vec::with_capacity(snapshot.archived_evidence as usize);
+        for chunk in &chunks {
+            archived.extend(self.load(store.as_ref(), scope, chunk)?.iter().cloned());
+        }
+        if archived.len() as u64 != snapshot.archived_evidence {
+            return Err(MemoryError::CorruptState);
+        }
+        archived.append(&mut snapshot.evidence);
+        archived.sort_by_key(|item| item.revision);
+        let ids: BTreeSet<&str> = archived.iter().map(|item| item.id.as_str()).collect();
+        if ids.len() != archived.len()
+            || archived
+                .windows(2)
+                .any(|pair| pair[0].revision == pair[1].revision)
+        {
+            return Err(MemoryError::CorruptState);
+        }
+        snapshot.evidence = archived;
+        snapshot.archived_evidence = 0;
+        Ok(snapshot)
     }
     fn lock(&self) -> MemoryResult<MutexGuard<'_, Inner>> {
         let inner = self.inner.lock().map_err(|_| MemoryError::Unavailable)?;
@@ -367,15 +485,9 @@ impl StoredMemory {
         // 读分块时不持锁，避免慢存储阻塞写入；分块不可变，索引只追加。
         let mut evidence = Vec::new();
         for chunk in &chunks {
-            let loaded = match load_chunk(store.as_ref(), scope, chunk) {
-                Ok(loaded) => loaded,
-                Err(error) => {
-                    self.block_archive(&error);
-                    return Err(error);
-                }
-            };
-            for item in loaded.into_iter().filter(|item| item.revision > after) {
-                evidence.push(item);
+            let loaded = self.load(store.as_ref(), scope, chunk)?;
+            for item in loaded.iter().filter(|item| item.revision > after) {
+                evidence.push(item.clone());
                 if evidence.len() == limit {
                     let next_after = evidence.last().map(|item| item.revision);
                     return Ok(ArchivedEvidencePage {
@@ -622,7 +734,8 @@ fn archive_step(
         chosen.push(entry.clone());
     }
     let sequence = next.next_chunk;
-    let (chunk, bytes) = encode_chunk(sequence, &record.snapshot.scope, chosen)?;
+    // 新分块一律无损压缩；原文一字不改，解开后逐项核对。
+    let (chunk, bytes) = encode_chunk(sequence, &record.snapshot.scope, chosen, true)?;
     let name = chunk.name();
     config.store.put(&name, &bytes)?;
     let record = &mut next.scopes[scope_index];
@@ -643,7 +756,7 @@ fn archive_step(
     record.snapshot.archived_evidence += chunk.count;
     record.archive.push(chunk);
     next.next_chunk = sequence + 1;
-    next.format_version = ARCHIVED_FORMAT_VERSION;
+    next.format_version = format_for(next);
     Ok(Some(name))
 }
 

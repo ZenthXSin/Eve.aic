@@ -2,7 +2,8 @@
 //! 只读绑定范围内的现行偏好与已导入交互；未建索引或正文已变的条目只参与词项召回。
 use crate::{
     SemanticIndex,
-    items::{content_hash, items, prefix, scope_key, source_key},
+    items::{Layout, content_hash, embed_input, layout, prefix, scope_key, source_key},
+    segments::{SegmentKey, content_key, profile_key},
 };
 use eve_memory_api::*;
 use eve_semantic_api::{EmbeddingProvider, MAX_EMBED_INPUT_BYTES, cosine};
@@ -72,15 +73,17 @@ impl AsyncMemoryRecallService for HybridReader {
             let query = vectors.pop().ok_or(MemoryError::Unavailable)?;
             // 词项结果与语义候选须来自同一记忆修订；并发写入时重读，仍不一致则报错。
             for _ in 0..3 {
-                let snapshot = self.memory.snapshot()?;
+                let layout = layout(self.memory.as_ref(), self.index.segments().is_some())?;
                 let lexical = self.lexical.recall(&MemoryRecallRequest {
                     query: request.query.clone(),
                     limit: MAX_RECALL_RESULTS,
                 })?;
-                if lexical.revision != snapshot.revision || snapshot.scope != self.scope {
+                if lexical.revision != layout.snapshot.revision
+                    || layout.snapshot.scope != self.scope
+                {
                     continue;
                 }
-                return self.fuse(request, &query, snapshot, lexical);
+                return self.fuse(request, &query, layout, lexical);
             }
             Err(MemoryError::StaleRevision)
         })
@@ -92,12 +95,12 @@ impl HybridReader {
         &self,
         request: &MemoryRecallRequest,
         query: &[f32],
-        snapshot: MemorySnapshot,
+        layout: Layout,
         lexical: MemoryRecallResponse,
     ) -> MemoryResult<MemoryRecallResponse> {
         let profile = self.embedder.profile();
         let scope = scope_key(&self.scope);
-        let entries: BTreeMap<String, _> = self
+        let mut entries: BTreeMap<String, _> = self
             .index
             .entries()
             .map_err(|_| MemoryError::Unavailable)?
@@ -105,8 +108,37 @@ impl HybridReader {
             .filter(|entry| entry.belongs_to(profile) && entry.scope == scope)
             .map(|entry| (entry.item.clone(), entry))
             .collect();
+        // 归档段的向量在独立的分段文件里；按当前内容摘要找到对应分段，逐字节核对后读入。
+        let mut all_items = layout.ledger;
+        if let Some(segments) = self.index.segments() {
+            let mut keys = Vec::new();
+            for block in &layout.blocks {
+                let pairs: Vec<(String, String)> = block
+                    .items
+                    .iter()
+                    .filter_map(|item| Some((item.key.clone(), content_hash(&embed_input(item)?))))
+                    .collect();
+                keys.push(SegmentKey {
+                    profile: profile_key(profile),
+                    scope: scope.clone(),
+                    first_revision: block.first_revision,
+                    last_revision: block.last_revision,
+                    content: content_key(&pairs),
+                });
+            }
+            for segment in segments
+                .load(profile, &scope, &keys)
+                .map_err(|_| MemoryError::CorruptState)?
+            {
+                for entry in segment.iter() {
+                    entries.insert(entry.item.clone(), entry.clone());
+                }
+            }
+        }
+        all_items.extend(layout.blocks.into_iter().flat_map(|block| block.items));
+        let snapshot = layout.snapshot;
         let mut semantic = Vec::new();
-        for item in items(&snapshot)? {
+        for item in all_items {
             let input = prefix(&item.text, MAX_EMBED_INPUT_BYTES).trim();
             let Some(entry) = entries
                 .get(&item.key)

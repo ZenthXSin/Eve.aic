@@ -319,7 +319,8 @@ impl Tool for DialogueTool {
                         .ok_or_else(unavailable)?
                         .reader(scope.clone())
                         .map_err(|_| unavailable())?;
-                    let snapshot = reader.snapshot().map_err(|_| unavailable())?;
+                    // 在完整记忆中查找，包括已经压缩归档的旧原文。
+                    let snapshot = reader.complete_snapshot().map_err(|_| unavailable())?;
                     let query = call.arguments["query"]
                         .as_str()
                         .unwrap_or_default()

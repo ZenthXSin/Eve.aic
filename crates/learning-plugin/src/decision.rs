@@ -234,7 +234,7 @@ fn validate_inputs(
         || memory.revision == 0
         || batch.evidence.is_empty()
         || batch.evidence.len() > MAX_BATCH_EVIDENCE
-        || memory.evidence.len() > eve_memory_api::MAX_EVIDENCE
+        || memory.evidence.len() as u64 > memory.revision
         || memory.preferences.len() > eve_memory_api::MAX_PREFERENCES
     {
         return Err(LearningError::InvalidInput);

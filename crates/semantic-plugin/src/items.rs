@@ -132,3 +132,92 @@ pub(crate) fn prefix(text: &str, limit: usize) -> &str {
     }
     &text[..end]
 }
+
+/// 送去建索引的正文：至多 2048 字节的完整字符前缀；空或含 NUL 的条目不建索引。
+pub(crate) fn embed_input(item: &Item) -> Option<String> {
+    let input = prefix(&item.text, eve_semantic_api::MAX_EMBED_INPUT_BYTES)
+        .trim()
+        .to_string();
+    (!input.is_empty() && !input.contains('\0')).then_some(input)
+}
+
+/// 一段已归档证据：修订区间与其中的可召回条目。
+pub(crate) struct Block {
+    pub first_revision: u64,
+    pub last_revision: u64,
+    pub items: Vec<Item>,
+}
+
+/// 一个作用域的可召回条目在索引里的布局。
+pub(crate) struct Layout {
+    /// 热层快照（修订与范围；召回结果以它为准）。
+    pub snapshot: MemorySnapshot,
+    /// 进 `index.v1` 的条目：现行偏好、热层证据与尚未凑满一段的归档证据。
+    pub ledger: Vec<Item>,
+    /// 凑满一段的归档证据，各自写成不可变的向量分段。
+    pub blocks: Vec<Block>,
+}
+
+/// 读出作用域的完整可召回条目并分成热层与归档段；`with_segments` 为假时只看热层。
+/// 热层与归档分两次读取，中途发生归档时条数对不上，重读至多三次。
+pub(crate) fn layout(
+    reader: &dyn eve_memory_api::MemoryService,
+    with_segments: bool,
+) -> MemoryResult<Layout> {
+    for _ in 0..3 {
+        let snapshot = reader.snapshot()?;
+        if !with_segments || snapshot.archived_evidence == 0 {
+            return Ok(Layout {
+                ledger: items(&snapshot)?,
+                snapshot,
+                blocks: vec![],
+            });
+        }
+        let mut pages = Vec::new();
+        let mut after = 0;
+        loop {
+            let page = reader.archived(after, crate::segments::SEGMENT_EVIDENCE)?;
+            let next = page.next_after;
+            if !page.evidence.is_empty() {
+                pages.push(page.evidence);
+            }
+            match next {
+                Some(next) => after = next,
+                None => break,
+            }
+        }
+        let total: usize = pages.iter().map(Vec::len).sum();
+        if total as u64 != snapshot.archived_evidence {
+            continue;
+        }
+        let mut ledger_snapshot = snapshot.clone();
+        let mut blocks = Vec::new();
+        for page in pages {
+            if page.len() == crate::segments::SEGMENT_EVIDENCE {
+                let first_revision = page.first().map_or(0, |item| item.revision);
+                let last_revision = page.last().map_or(0, |item| item.revision);
+                let block = MemorySnapshot {
+                    scope: snapshot.scope.clone(),
+                    revision: snapshot.revision,
+                    evidence: page,
+                    preferences: vec![],
+                    archived_evidence: 0,
+                };
+                blocks.push(Block {
+                    first_revision,
+                    last_revision,
+                    items: items(&block)?,
+                });
+            } else {
+                ledger_snapshot.evidence.extend(page);
+            }
+        }
+        ledger_snapshot.evidence.sort_by_key(|item| item.revision);
+        return Ok(Layout {
+            ledger: items(&ledger_snapshot)?,
+            snapshot,
+            blocks,
+        });
+    }
+    Err(MemoryError::StaleRevision)
+}

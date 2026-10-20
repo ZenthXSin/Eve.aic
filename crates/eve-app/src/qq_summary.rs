@@ -68,7 +68,7 @@ impl ContextAssembler for SummaryContext {
             let snapshot = self
                 .memory
                 .reader(scope.clone())
-                .and_then(|r| r.snapshot())
+                .and_then(|r| r.complete_snapshot())
                 .map_err(|_| unavailable())?;
             let jobs = self.summaries.jobs(&scope).map_err(|_| unavailable())?;
             if snapshot.scope != scope || jobs.iter().any(|j| j.batch.scope != scope) {
@@ -213,7 +213,8 @@ async fn run(
                 if scope.channel != "qq" {
                     continue;
                 }
-                let snapshot = memory.reader(scope.clone())?.snapshot()?;
+                // 读完整记忆：归档前还没归纳的交流同样会被归纳。
+                let snapshot = memory.reader(scope.clone())?.complete_snapshot()?;
                 if snapshot.scope != scope {
                     return Err("摘要来源作用域不匹配".into());
                 }
