@@ -21,6 +21,12 @@ pub use outreach::{
     QqOutreachPush, QqOutreachResult,
 };
 pub use participants::QqParticipantObserver;
+pub use state::{ImageAttachment, Message};
+
+/// 收到带附件的消息时通知宿主；只传已校验的消息，不做下载。
+pub trait QqAttachmentObserver: Send + Sync {
+    fn observe(&self, session: &SessionKey, message: &Message);
+}
 
 use eve_control_api::{CONTROL_PLUGIN_ID, CONTROL_SERVICE_ID, ControlServiceHandle};
 use eve_message_api::{MessageServiceHandle, ROUTER_PLUGIN_ID, ROUTER_SERVICE_ID};
@@ -110,6 +116,7 @@ pub struct QqBotPlugin {
     outreach: Option<Arc<bridge::OutreachHook>>,
     files: Option<Arc<dyn QqFileDelivery>>,
     file_poll: Option<Duration>,
+    attachment_observer: Option<Arc<dyn QqAttachmentObserver>>,
     conversations: QqConversations,
     participant_observer: Option<Arc<dyn QqParticipantObserver>>,
     timing_diagnostics: bool,
@@ -142,6 +149,7 @@ impl QqBotPlugin {
             outreach: None,
             files: None,
             file_poll: None,
+            attachment_observer: None,
             conversations: QqConversations::default(),
             participant_observer: None,
             timing_diagnostics: false,
@@ -244,6 +252,12 @@ impl QqBotPlugin {
         Ok(self)
     }
 
+    /// 收到带附件的消息时回调宿主；未接线时只把附件说明写进对话文本。
+    pub fn with_attachment_observer(mut self, observer: Arc<dyn QqAttachmentObserver>) -> Self {
+        self.attachment_observer = Some(observer);
+        self
+    }
+
     /// 添加宿主命令扩展；默认不安装，原有消息控制行为不变。
     pub fn with_command_handler(mut self, handler: Arc<dyn QqCommandHandler>) -> Self {
         self.command_handler = Some(handler);
@@ -329,6 +343,7 @@ impl Plugin for QqBotPlugin {
             let outreach = self.outreach.clone();
             let files = self.files.clone();
             let file_poll = self.file_poll;
+            let attachment_observer = self.attachment_observer.clone();
             let conversations = self.conversations.clone();
             let participant_observer = self.participant_observer.clone();
             let timing_diagnostics = self.timing_diagnostics;
@@ -349,6 +364,7 @@ impl Plugin for QqBotPlugin {
                     let segmentation = segmentation.clone();
                     let outreach = outreach.clone();
                     let files = files.clone();
+                    let attachment_observer = attachment_observer.clone();
                     let conversations = conversations.clone();
                     let participant_observer = participant_observer.clone();
                     let status = status.clone();
@@ -372,6 +388,7 @@ impl Plugin for QqBotPlugin {
                                 outreach,
                                 files,
                                 file_poll,
+                                attachment_observer,
                                 conversations,
                                 participant_observer,
                                 timing_diagnostics,

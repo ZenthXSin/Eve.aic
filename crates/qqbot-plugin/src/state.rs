@@ -32,7 +32,7 @@ const FILE_TYPES: [&str; 5] = [
 ];
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ImageAttachment {
+pub struct ImageAttachment {
     pub content_type: String,
     pub url: String,
     /// 展示名；旧账本没有该字段，缺失时按没有文件名处理。
@@ -79,7 +79,7 @@ impl ImageAttachment {
 /// 被引用消息的文字与附件，和本条新发的附件分开保存。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct QuotedMessage {
+pub struct QuotedMessage {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -96,7 +96,7 @@ impl QuotedMessage {
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Message {
+pub struct Message {
     pub id: String,
     pub scope: String,
     pub target_id: String,
@@ -135,8 +135,14 @@ impl Message {
                 "收到 {files} 个文件附件，只保存了文件名、类型和链接，未下载内容。"
             ));
         }
-        note.push_str("按用户文字处理任务，涉及附件内容时如实说明当前限制。");
+        note.push_str(
+            "需要看文件内容时调用 read_attachment，index 从 1 起，只下载本条已记录的附件；             图片没有视觉解析，下载也只能看到类型和大小。",
+        );
         format!("{text}\n\n{note}")
+    }
+    /// 本条消息第 `index` 个附件（从 1 起）；越界返回 None。
+    pub fn attachment(&self, index: usize) -> Option<&ImageAttachment> {
+        index.checked_sub(1).and_then(|i| self.attachments.get(i))
     }
     pub fn valid(&self) -> bool {
         [&self.target_id, &self.user_id]

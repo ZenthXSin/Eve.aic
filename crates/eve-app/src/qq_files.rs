@@ -10,8 +10,8 @@ use eve_llm_api::{
 };
 use eve_plugin_api::PluginError;
 use eve_qqbot_plugin::{
-    QQ_FILE_CAPTION_MAX_BYTES, QQ_FILE_NAME_MAX_BYTES, QqFileDelivery, QqFileMessage, QqFileResult,
-    valid_caption, valid_name,
+    ImageAttachment, Message, QQ_FILE_CAPTION_MAX_BYTES, QQ_FILE_NAME_MAX_BYTES, QqFileDelivery,
+    QqFileMessage, QqFileResult, valid_caption, valid_name,
 };
 use eve_session_api::SessionKey;
 use serde::{Deserialize, Serialize};
@@ -267,6 +267,63 @@ impl QqFileDelivery for Outbox {
     }
 }
 
+/// 最近收到的附件，按会话保存，供模型按序号下载。只保留有限条，超出时丢掉最早的。
+pub(crate) struct AttachmentInbox {
+    inner: Mutex<std::collections::VecDeque<(String, Message)>>,
+}
+
+impl AttachmentInbox {
+    const MAX: usize = 64;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    pub(crate) fn record(&self, session_id: &str, message: Message) {
+        if message.attachments.is_empty() {
+            return;
+        }
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner.retain(|(session, saved)| !(session == session_id && saved.id == message.id));
+        inner.push_back((session_id.to_owned(), message));
+        while inner.len() > Self::MAX {
+            inner.pop_front();
+        }
+    }
+
+    fn attachment(
+        &self,
+        session_id: &str,
+        index: usize,
+    ) -> Result<ImageAttachment, ToolExecutionError> {
+        let inner = self.inner.lock().map_err(|_| failed("附件记录锁不可用"))?;
+        let message = inner
+            .iter()
+            .rev()
+            .find(|(session, message)| session == session_id && !message.attachments.is_empty())
+            .map(|(_, message)| message);
+        let Some(message) = message else {
+            return Err(failed("这个会话还没有收到附件"));
+        };
+        message.attachment(index).cloned().ok_or_else(|| {
+            failed(format!(
+                "最近一条带附件的消息只有 {} 个附件，index 从 1 起",
+                message.attachments.len()
+            ))
+        })
+    }
+}
+
+impl eve_qqbot_plugin::QqAttachmentObserver for AttachmentInbox {
+    fn observe(&self, session: &eve_session_api::SessionKey, message: &Message) {
+        self.record(&session.session_id, message.clone());
+    }
+}
+
 /// 模型可见的发送工具：只接受文件名，路径由宿主在发件目录里解析。
 pub(crate) struct SendFileTool {
     outbox: std::sync::Arc<Outbox>,
@@ -354,6 +411,91 @@ impl Tool for SendFileTool {
     }
 }
 
+pub(crate) struct ReadAttachmentTool {
+    inbox: std::sync::Arc<AttachmentInbox>,
+}
+
+impl ReadAttachmentTool {
+    pub(crate) fn new(inbox: std::sync::Arc<AttachmentInbox>) -> Self {
+        Self { inbox }
+    }
+    const MAX_BYTES: u64 = 1024 * 1024;
+    const TEXT_LIMIT: usize = 16 * 1024;
+}
+
+impl Tool for ReadAttachmentTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "read_attachment".into(),
+            description: "下载当前会话最近一条带附件消息里的第 index 个附件（从 1 起），只取本条已记录的链接。                文本类附件返回开头内容，其他类型只返回类型、文件名和大小。图片没有视觉解析，不能据此声称看见了图片内容。".into(),
+            argument_schema: json!({"type":"object","properties":{"index":{"type":"integer","minimum":1,"maximum":4}},"required":["index"],"additionalProperties":false}),
+            required_permissions: vec![],
+            concurrency: Some(ToolConcurrency::Serial { scope: "eve.qqbot.attachments".into() }),
+        }
+    }
+
+    fn validate_arguments(&self, value: &Value) -> Result<(), ToolValidationError> {
+        let index = value.get("index").and_then(Value::as_u64);
+        if value.as_object().is_some_and(|o| o.len() == 1) && matches!(index, Some(1..=4)) {
+            Ok(())
+        } else {
+            Err(ToolValidationError {
+                message: "index 必须是 1 到 4 的整数".into(),
+            })
+        }
+    }
+
+    fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
+        Box::pin(async move {
+            let scope = context
+                .scope()
+                .ok_or_else(|| failed("只有带用户身份的对话里才能读取附件"))?;
+            let index = call.arguments["index"]
+                .as_u64()
+                .ok_or_else(|| failed("缺少 index"))? as usize;
+            let attachment = self.inbox.attachment(&scope.session_id, index)?;
+            let response = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .build()
+                .map_err(|_| failed("下载客户端不可用"))?
+                .get(&attachment.url)
+                .send()
+                .await
+                .map_err(|_| failed("附件下载失败，链接可能已过期"))?;
+            if !response.status().is_success() {
+                return Err(failed(format!(
+                    "附件下载被拒绝（HTTP {}）",
+                    response.status().as_u16()
+                )));
+            }
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|_| failed("附件内容读取失败"))?;
+            if bytes.len() as u64 > Self::MAX_BYTES {
+                return Err(failed(format!(
+                    "附件超过 {} 字节，没有读取",
+                    Self::MAX_BYTES
+                )));
+            }
+            let mut result = json!({"content_type": attachment.content_type, "bytes": bytes.len(), "filename": attachment.filename});
+            if attachment.content_type.starts_with("text/")
+                || attachment.content_type == "application/json"
+            {
+                let text = String::from_utf8_lossy(&bytes);
+                let truncated = text.len() > Self::TEXT_LIMIT;
+                result["text"] = json!(text.chars().take(Self::TEXT_LIMIT).collect::<String>());
+                result["truncated"] = json!(truncated);
+            } else {
+                result["note"] = json!(
+                    "非文本附件只记录了类型和大小，没有解析内容；图片也不能据此声称已经看见。"
+                );
+            }
+            Ok(result)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,5 +550,40 @@ mod tests {
             )
             .expect("delivered");
         assert_eq!(outbox.result_of("file-1"), Some(State::Sent));
+    }
+
+    fn sample_message(id: &str, url: &str) -> Message {
+        Message {
+            id: id.into(),
+            scope: "c2c".into(),
+            target_id: "user-1".into(),
+            user_id: "user-1".into(),
+            text: "看这个".into(),
+            attachments: vec![ImageAttachment {
+                content_type: "text/plain".into(),
+                url: url.into(),
+                filename: Some("note.txt".into()),
+            }],
+            quoted: None,
+        }
+    }
+
+    #[test]
+    fn inbox_keeps_the_latest_message_and_rejects_a_bad_index() {
+        let inbox = AttachmentInbox::new();
+        assert!(inbox.attachment("qq:s", 1).is_err());
+        inbox.record("qq:s", sample_message("m1", "https://media.example/a.txt"));
+        inbox.record(
+            "qq:other",
+            sample_message("m2", "https://media.example/other.txt"),
+        );
+        inbox.record(
+            "qq:s",
+            sample_message("m3", "https://media.example/latest.txt"),
+        );
+        let found = inbox.attachment("qq:s", 1).expect("latest");
+        assert_eq!(found.url, "https://media.example/latest.txt");
+        assert!(inbox.attachment("qq:s", 2).is_err());
+        assert!(inbox.attachment("qq:nobody", 1).is_err());
     }
 }

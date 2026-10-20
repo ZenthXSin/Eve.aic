@@ -1,6 +1,6 @@
 use crate::{
-    QqBotConfig, QqBotStatus, QqCommandHandler, QqCommandInput, QqFileDelivery, QqFileResult,
-    Segmentation, commands,
+    QqAttachmentObserver, QqBotConfig, QqBotStatus, QqCommandHandler, QqCommandInput,
+    QqFileDelivery, QqFileResult, Segmentation, commands,
     files::valid_path,
     observer::{CompletedInteraction, Observation},
     outreach::{
@@ -152,6 +152,7 @@ pub(crate) struct Services {
     pub outreach: Option<Arc<OutreachHook>>,
     pub files: Option<Arc<dyn QqFileDelivery>>,
     pub file_poll: Option<Duration>,
+    pub attachment_observer: Option<Arc<dyn QqAttachmentObserver>>,
     pub conversations: crate::QqConversations,
     pub participant_observer: Option<Arc<dyn crate::QqParticipantObserver>>,
     pub timing_diagnostics: bool,
@@ -592,6 +593,7 @@ pub(crate) async fn run(
         outreach,
         files,
         file_poll,
+        attachment_observer,
         conversations,
         participant_observer,
         timing_diagnostics,
@@ -1401,6 +1403,7 @@ pub(crate) async fn run(
                                 status.send_modify(|s| s.received += 1);
                                 timing(timing_diagnostics, "message_received", None);
                                 conversations.record_message(&config.app_id, &message)?;
+                                if let Some(observer) = &attachment_observer { observer.observe(&message.session_key(&config.app_id)?, &message); }
                                 if private_text.is_none() && let Some(observer) = &participant_observer {
                                     let session = message.session_key(&config.app_id)?;
                                     if let Err(error) = observer.observe(&session, &message.conversation_key(&config.app_id)?, &message.text, sender_name.as_deref()) {

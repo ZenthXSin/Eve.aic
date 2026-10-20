@@ -364,6 +364,7 @@ dependencies = [
  "eve-web-panel",
  "eve-web-panel-api",
  "postgres",
+ "reqwest",
  "ring",
  "serde",
  "serde_json",
