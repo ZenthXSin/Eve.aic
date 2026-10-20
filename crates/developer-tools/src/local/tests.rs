@@ -11,6 +11,7 @@ fn config(root: &Path) -> DeveloperConfig {
         workspace: root.into(),
         storage_directory: None,
         operators: BTreeSet::from(["owner".into()]),
+        ordinary_access: false,
         commands: true,
         github: true,
         github_write_repositories: BTreeSet::from(["test/repo".into()]),

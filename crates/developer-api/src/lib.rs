@@ -18,6 +18,9 @@ pub struct DeveloperConfig {
     #[serde(default)]
     pub storage_directory: Option<PathBuf>,
     pub operators: BTreeSet<String>,
+    /// 普通用户可读源码、修改非敏感文件和创建 Issue/PR；敏感操作仍需管理员。
+    #[serde(default = "ordinary_access")]
+    pub ordinary_access: bool,
     #[serde(default)]
     pub commands: bool,
     #[serde(default)]
@@ -43,6 +46,14 @@ pub struct DeveloperConfig {
 }
 fn token_env() -> String {
     "EVE_GITHUB_TOKEN".into()
+}
+fn ordinary_access() -> bool {
+    true
+}
+
+/// 宿主提供的平台身份授权；模型参数、昵称及自称不能实现此绑定。
+pub trait DeveloperAuthorization: Send + Sync {
+    fn is_operator(&self, scope: &eve_llm_api::ContextScope) -> bool;
 }
 fn timeout() -> u64 {
     600_000

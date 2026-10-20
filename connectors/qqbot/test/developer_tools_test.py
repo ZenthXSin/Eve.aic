@@ -24,7 +24,7 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         identity = json.dumps(["1904159860", "c2c", "user-1", "user-1"], separators=(",", ":")).encode()
         principal = "qq:" + hashlib.sha256(identity).hexdigest()
         self.developer_config.write_text(json.dumps({"workspace": str(self.source.resolve()),
-            "operators": [principal], "commands": True, "github": True,
+            "operators": [principal], "ordinary_access": False, "commands": True, "github": True,
             "self_upgrade": True, "max_tool_rounds": 4}), encoding="utf8")
 
     def receipt(self, message_id):
