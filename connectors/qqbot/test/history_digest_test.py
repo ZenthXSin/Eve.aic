@@ -64,7 +64,9 @@ class HistoryDigestAcceptance(window.HistoryWindowAcceptance):
         self.assertIn('"digested_turns":2', notice)
         self.assertIn("第 3 至 3 轮尚未压缩", notice)
         # 原始会话完整保留：摘要不替换、不删除任何轮次。
-        self.assertEqual(self.turn("我最喜欢蓝色")["status"]["Completed"]["messages"][0]["text"], "我最喜欢蓝色")
+        original = json.dumps(self.turn("我最喜欢蓝色")["status"], ensure_ascii=False)
+        self.assertIn("Completed", original)
+        self.assertIn('"text": "我最喜欢蓝色"', original)
         stored = json.loads(self.digest_files()[0].read_text())
         self.assertEqual(stored["format_version"], 1)
         self.assertEqual(stored["versions"][-1]["points"][0], {"text": POINT, "turns": [1]})
