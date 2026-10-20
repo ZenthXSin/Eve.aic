@@ -180,6 +180,65 @@ while True:time.sleep(.05)
         self.assertIn('synthetic.candidate',runtime.read_json(self.state/'state.json')['entries'])
         self.assertEqual(next((self.queue/'backups').glob('*/state.json')).read_bytes(),before)
 
+    def add_receipt(self, state='Processing', progress=None):
+        path=self.state/'state.json';doc=runtime.read_json(path)
+        ledger=json.loads(bytes(doc['entries']['eve.channel.qqbot']['receipts.v1']))
+        receipt={'app_id':'app','state':state,'message':{'id':f'historical-message-{len(ledger["entries"])}','scope':'c2c',
+            'target_id':'other','user_id':'other','text':'旧的未决消息'}}
+        if state in ('Sent','ReplyPending'):receipt['reply']='旧的回复记录'
+        if progress is not None:
+            ledger['version']=3;receipt['progress']=progress
+        ledger['entries'].append(receipt)
+        doc['entries']['eve.channel.qqbot']['receipts.v1']=list(json.dumps(ledger).encode())
+        runtime.atomic(path,doc)
+        return doc,ledger
+
+    def test_inherited_unknown_receipts_do_not_block_and_are_preserved_byte_for_byte(self):
+        self.add_receipt('Processing')
+        self.add_receipt('ReplyPending')
+        self.add_receipt('Sent',[{'text':'旧的发送结果未知','state':'Sending'}])
+        before=(self.state/'state.json').read_bytes()
+        self.launch();request=self.candidate('new')
+        runtime.atomic(self.queue/'request.json',request)
+        self.wait(lambda d:d['result']=='applied')
+        self.assertEqual(self.events.read_text().splitlines(),['old','new'])
+        self.assertEqual((self.state/'state.json').read_bytes(),before)
+
+    def test_new_inflight_receipt_still_blocks_after_startup(self):
+        self.launch();doc,ledger=self.add_receipt()
+        runtime.atomic(self.queue/'request.json',self.candidate('new'))
+        self.wait(lambda d:d['phase']=='waiting')
+        time.sleep(.2)
+        self.assertEqual(self.events.read_text().splitlines(),['old'])
+        ledger['entries'][-1]['state']='Failed'
+        doc['entries']['eve.channel.qqbot']['receipts.v1']=list(json.dumps(ledger).encode())
+        runtime.atomic(self.state/'state.json',doc)
+        self.wait(lambda d:d['result']=='applied')
+
+    def test_changed_inherited_receipt_is_no_longer_exempt(self):
+        doc,ledger=self.add_receipt();self.launch()
+        ledger['entries'][-1]['message']['text']='当前进程修改后的消息'
+        doc['entries']['eve.channel.qqbot']['receipts.v1']=list(json.dumps(ledger).encode())
+        runtime.atomic(self.state/'state.json',doc)
+        runtime.atomic(self.queue/'request.json',self.candidate('new'))
+        self.wait(lambda d:d['phase']=='waiting');time.sleep(.2)
+        self.assertEqual(self.events.read_text().splitlines(),['old'])
+        ledger['entries'][-1]['state']='Failed'
+        doc['entries']['eve.channel.qqbot']['receipts.v1']=list(json.dumps(ledger).encode())
+        runtime.atomic(self.state/'state.json',doc)
+        self.wait(lambda d:d['result']=='applied')
+
+    def test_inherited_unknown_cannot_satisfy_request_delivery_or_hide_corruption(self):
+        self.write_state('Completed','Processing');path=self.state/'state.json'
+        inherited=runtime.inherited_receipts(path)
+        request={'session_id':self.session,'requested_by':self.session,'turn_id':1}
+        self.assertFalse(runtime.delivery_gate(path,request,inherited))
+        self.write_state('Completed','Sent')
+        doc,ledger=self.add_receipt('Sent',[{'text':'坏记录','state':'invalid'}])
+        token=runtime.receipt_fingerprint(ledger['entries'][-1])
+        with self.assertRaisesRegex(ValueError,'invalid_progress_ledger'):
+            runtime.delivery_gate(path,request,frozenset([token]))
+
     def test_tampered_candidate_never_stops_original_process(self):
         self.launch();request=self.candidate('new')
         (Path(request['candidate_directory'])/'resources/AGENT.md').write_text('changed')
