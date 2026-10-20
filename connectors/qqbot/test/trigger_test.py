@@ -98,7 +98,7 @@ class TriggerAcceptance(reminder_test.ReminderAcceptance):
                 child.terminate()
                 child.wait(timeout=5)
                 self.wait_sent()
-            self.run_eve([*self.send(self.message("create", "设置唤醒", expected="已设置")),
+            self.run_eve([*self.send(self.message("create", "设置唤醒", expected="已设置", user="user-2")),
                           *self.checkpoint("exit")], developer=True, checkpoints={"exit": stop_process})
         finally:
             if child.poll() is None:
