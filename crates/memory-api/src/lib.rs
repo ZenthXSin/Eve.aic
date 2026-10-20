@@ -20,7 +20,9 @@ pub const MEMORY_FORMAT_VERSION: u32 = 1;
 /// 热层全局证据容量；仍受 4 MiB 字节上限约束。装配归档存储后，较早的完成交互
 /// 移入不可变分块而不是被清理；未装配时满即拒绝新增。
 pub const MAX_EVIDENCE: usize = 4096;
-pub const MAX_SCOPES: usize = 256;
+/// 可信作用域（通道 + 会话 + 用户）总数。群聊每位成员各占一个作用域；满后新作用域的
+/// 交流不写入记忆（返回 `LimitReached`，原记录不变），已有作用域照常采集。
+pub const MAX_SCOPES: usize = 1024;
 pub const MAX_PREFERENCES: usize = 256;
 /// 所有作用域的偏好历史版本总数；原始证据与历史永不自动淘汰。
 pub const MAX_HISTORY: usize = 256;
@@ -183,6 +185,42 @@ pub trait MemoryService: Send + Sync {
     fn archived(&self, after_revision: u64, limit: usize) -> MemoryResult<ArchivedEvidencePage> {
         let _ = (after_revision, limit);
         Err(MemoryError::Unavailable)
+    }
+    /// 本作用域的完整记忆：热层与全部归档证据按修订升序合并，`archived_evidence` 为 0。
+    /// 归档只是存储形式，回看历史的消费者（召回、摘要、提炼、观察）读这个视图，不会漏掉旧原文。
+    /// 分块缺失或校验失败时返回 `CorruptState`，不跳过。
+    ///
+    /// 默认实现先读快照再逐页读归档，两次读取之间发生归档时可能报告不一致；
+    /// 存储实现应在同一次读取中取得热层与分块索引。
+    fn complete_snapshot(&self) -> MemoryResult<MemorySnapshot> {
+        let mut snapshot = self.snapshot()?;
+        if snapshot.archived_evidence == 0 {
+            return Ok(snapshot);
+        }
+        let mut archived = Vec::new();
+        let mut after = 0;
+        loop {
+            let page = self.archived(after, MAX_ARCHIVE_PAGE)?;
+            archived.extend(page.evidence);
+            match page.next_after {
+                Some(next) => after = next,
+                None => break,
+            }
+        }
+        if archived.len() as u64 != snapshot.archived_evidence {
+            return Err(MemoryError::CorruptState);
+        }
+        archived.append(&mut snapshot.evidence);
+        archived.sort_by_key(|item| item.revision);
+        if archived
+            .windows(2)
+            .any(|pair| pair[0].revision == pair[1].revision || pair[0].id == pair[1].id)
+        {
+            return Err(MemoryError::CorruptState);
+        }
+        snapshot.evidence = archived;
+        snapshot.archived_evidence = 0;
+        Ok(snapshot)
     }
 }
 #[derive(Clone)]

@@ -146,6 +146,7 @@ impl PanelService for QqPanel {
             completed,
             sent,
             failed,
+            interactions_not_saved,
         } = *self.channel.status.borrow();
         Ok(PanelStatus {
             started_at_unix_ms: self.started_at_unix_ms,
@@ -157,6 +158,7 @@ impl PanelService for QqPanel {
                 completed,
                 sent,
                 failed,
+                interactions_not_saved,
             },
         })
     }

@@ -303,9 +303,14 @@ async fn restart_keeps_archive_and_missing_or_tampered_chunks_are_never_skipped(
         (before, chunks)
     };
     drop(state);
-    // 格式 2 由新程序写出；旧格式读取器遇到它按未知版本拒绝。
+    // 新分块都经无损压缩，文档写格式 3；旧读取器遇到它按未知版本拒绝。
     let raw = support::raw_state(state_dir.path(), MEMORY_PLUGIN_ID, MEMORY_STATE_KEY);
-    assert!(raw.contains("\"format_version\":2"), "{raw}");
+    assert!(raw.contains("\"format_version\":3"), "{raw}");
+    assert!(raw.contains("\"compressed\":true"), "{raw}");
+    assert!(
+        chunks.iter().all(|name| name.ends_with(".json.zz")),
+        "{chunks:?}"
+    );
 
     let state = RecordingStore::open(state_dir.path());
     let rig = start(
@@ -666,4 +671,285 @@ async fn concurrent_imports_across_scopes_archive_consistently() {
         assert_complete(&rig.admin, owner, 15);
     }
     stop(rig).await;
+}
+
+/// 只用本地会话快照构造第 `number` 次完成交互，不经会话插件；用于大量作用域。
+fn local(
+    scope: &MemoryScope,
+    session: &mut SessionSnapshot,
+    number: usize,
+) -> CompletedInteraction {
+    let (user, reply) = texts(scope, number);
+    session.turns.push(SessionTurn {
+        id: number as u64,
+        input: user.clone(),
+        status: SessionTurnStatus::Completed {
+            messages: vec![
+                ChatMessage::text(ChatRole::User, &user),
+                ChatMessage::text(ChatRole::Assistant, &reply),
+            ],
+        },
+    });
+    session.revision += 2;
+    CompletedInteraction {
+        evidence_id: format!("{}-e-{number}", scope.session_id),
+        message_id: format!("{}-m-{number}", scope.session_id),
+        at_ms: 1000 + number as u64,
+        snapshot: session.clone(),
+        turn_id: number as u64,
+    }
+}
+
+fn empty_session(scope: &MemoryScope) -> SessionSnapshot {
+    SessionSnapshot {
+        key: key(scope),
+        revision: 0,
+        turns: vec![],
+    }
+}
+
+#[tokio::test]
+async fn pressure_keeps_only_the_latest_per_scope_so_many_scopes_cannot_pin_the_hot_layer() {
+    let directory = tempfile::tempdir().unwrap();
+    let archive = Arc::new(FileEvidenceArchive::open(directory.path()).unwrap());
+    // 证据都很新：只有压力才会归档。平时每个作用域保留 4 条，10 个作用域就要 40 条，
+    // 超过压力线 20；压力下每个作用域只保留最近 1 条，热层才能回落。
+    let policy = ArchivePolicy {
+        trigger_evidence: 6,
+        pressure_evidence: 20,
+        keep_recent: 4,
+        pressure_keep_recent: 1,
+        min_age_ms: u64::MAX / 2,
+        min_chunk: 2,
+        max_chunk_evidence: 64,
+        max_chunk_bytes: 64 * 1024,
+        ..ArchivePolicy::default()
+    };
+    let rig = start(None, Some((archive, policy))).await.unwrap();
+    let scopes: Vec<_> = (0..10).map(|i| scope(&format!("p{i:02}"))).collect();
+    let mut sessions: Vec<_> = scopes.iter().map(empty_session).collect();
+    for number in 1..=6 {
+        for (scope, session) in scopes.iter().zip(sessions.iter_mut()) {
+            commit(&rig, scope, local(scope, session, number)).unwrap();
+            let hot = rig.admin.archive_status().unwrap().hot_evidence;
+            assert!(hot <= 20, "压力下热层应回落到压力线以内：{hot}");
+        }
+    }
+    let status = rig.admin.archive_status().unwrap();
+    assert_eq!(status.hot_evidence as u64 + status.archived_evidence, 60);
+    assert!(status.archived_evidence > 0 && status.last_error.is_none());
+    for scope in &scopes {
+        let snapshot = rig.admin.reader(scope.clone()).unwrap().snapshot().unwrap();
+        // 每个作用域的最新一条始终留在热层。
+        assert_eq!(snapshot.evidence.last().unwrap().revision, 6);
+        assert_complete(&rig.admin, scope, 6);
+    }
+    stop(rig).await;
+}
+
+#[tokio::test]
+async fn full_scope_capacity_refuses_new_scopes_without_writing_and_keeps_existing_ones() {
+    let state_dir = tempfile::tempdir().unwrap();
+    let state = RecordingStore::open(state_dir.path());
+    let rig = start(Some(state.clone()), None).await.unwrap();
+    let scopes: Vec<_> = (0..MAX_SCOPES)
+        .map(|i| scope(&format!("g{i:04}")))
+        .collect();
+    let mut sessions: Vec<_> = scopes.iter().map(empty_session).collect();
+    for (scope, session) in scopes.iter().zip(sessions.iter_mut()) {
+        commit(&rig, scope, local(scope, session, 1)).unwrap();
+    }
+    assert_eq!(rig.admin.scopes().unwrap().len(), MAX_SCOPES);
+    let writes = state.writes();
+    let newcomer = scope("newcomer");
+    let mut session = empty_session(&newcomer);
+    assert_eq!(
+        commit(&rig, &newcomer, local(&newcomer, &mut session, 1)),
+        Err(MemoryError::LimitReached)
+    );
+    assert_eq!(state.writes(), writes, "容量满时不写状态");
+    assert_eq!(rig.admin.scopes().unwrap().len(), MAX_SCOPES);
+    let snapshot = rig
+        .admin
+        .reader(newcomer.clone())
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    assert_eq!((snapshot.revision, snapshot.evidence.len()), (0, 0));
+    // 已有作用域照常采集。
+    commit(&rig, &scopes[7], local(&scopes[7], &mut sessions[7], 2)).unwrap();
+    assert_eq!(state.writes(), writes + 1);
+    stop(rig).await;
+    let rig = start(Some(state.clone()), None).await.unwrap();
+    assert_eq!(rig.admin.scopes().unwrap().len(), MAX_SCOPES);
+    assert_eq!(
+        rig.admin
+            .reader(scopes[7].clone())
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .revision,
+        2
+    );
+    stop(rig).await;
+}
+
+/// 把状态目录里本插件的热层文档读成 JSON，或写回。
+fn read_document(directory: &Path) -> serde_json::Value {
+    serde_json::from_str(&support::raw_state(
+        directory,
+        MEMORY_PLUGIN_ID,
+        MEMORY_STATE_KEY,
+    ))
+    .unwrap()
+}
+fn write_document(directory: &Path, document: &serde_json::Value) {
+    let path = directory.join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    state["entries"][MEMORY_PLUGIN_ID][MEMORY_STATE_KEY] =
+        serde_json::to_value(serde_json::to_vec(document).unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+}
+fn sha256(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn compressed_archives_stay_part_of_memory_and_old_plain_chunks_still_read() {
+    use std::io::Read;
+    let state_dir = tempfile::tempdir().unwrap();
+    let archive_dir = tempfile::tempdir().unwrap();
+    let owner = scope("whole");
+    let state = RecordingStore::open(state_dir.path());
+    let rig = start(
+        Some(state.clone()),
+        Some((flaky(archive_dir.path()), small_policy())),
+    )
+    .await
+    .unwrap();
+    for number in 1..=12 {
+        import(&rig, &owner, number).unwrap();
+    }
+    let reader = rig.admin.reader(owner.clone()).unwrap();
+    let hot = reader.snapshot().unwrap();
+    assert!(hot.archived_evidence >= 4);
+    // 完整记忆：热层与归档按修订合并，一条不少、原文不变，看起来与从未归档一样。
+    let complete = reader.complete_snapshot().unwrap();
+    assert_eq!(complete.archived_evidence, 0);
+    assert_eq!(complete.revision, hot.revision);
+    assert_eq!(
+        complete
+            .evidence
+            .iter()
+            .map(|e| e.revision)
+            .collect::<Vec<_>>(),
+        (1..=12).collect::<Vec<u64>>()
+    );
+    for (index, item) in complete.evidence.iter().enumerate() {
+        assert_eq!(completed_texts(item), texts(&owner, index + 1));
+    }
+    // 召回能找到已经归档的旧原文。
+    let archived = complete
+        .evidence
+        .iter()
+        .find(|e| !hot.evidence.iter().any(|h| h.id == e.id))
+        .unwrap();
+    let recall = LexicalMemoryRecall::new(Arc::new(rig.admin.clone()))
+        .reader(owner.clone())
+        .unwrap()
+        .recall(&MemoryRecallRequest {
+            query: completed_texts(archived).0,
+            limit: 8,
+        })
+        .unwrap();
+    assert!(recall.hits.iter().any(|hit| matches!(
+        &hit.source,
+        MemoryRecallSource::CompletedInteraction { evidence_id, .. } if evidence_id == &archived.id
+    )));
+    stop(rig).await;
+    drop(state);
+
+    // 压缩是无损的，且比原 JSON 小。
+    let document = read_document(state_dir.path());
+    let mut raw_total = 0;
+    let mut stored_total = 0;
+    for chunk in document["scopes"][0]["archive"].as_array().unwrap() {
+        assert_eq!(chunk["compressed"], true);
+        let name = format!(
+            "evidence-{:010}-{}.json.zz",
+            chunk["sequence"].as_u64().unwrap(),
+            chunk["sha256"].as_str().unwrap()
+        );
+        let stored = std::fs::read(archive_dir.path().join(name)).unwrap();
+        let mut raw = Vec::new();
+        flate2::read::ZlibDecoder::new(stored.as_slice())
+            .read_to_end(&mut raw)
+            .unwrap();
+        raw_total += raw.len();
+        stored_total += stored.len();
+    }
+    assert!(stored_total < raw_total, "{stored_total} >= {raw_total}");
+
+    // 模拟 #222 时期的状态：分块都是未压缩 JSON、文档格式 2。重启后照常完整可读。
+    let mut document = read_document(state_dir.path());
+    for chunk in document["scopes"][0]["archive"].as_array_mut().unwrap() {
+        let old_name = format!(
+            "evidence-{:010}-{}.json.zz",
+            chunk["sequence"].as_u64().unwrap(),
+            chunk["sha256"].as_str().unwrap()
+        );
+        let stored = std::fs::read(archive_dir.path().join(&old_name)).unwrap();
+        let mut plain = Vec::new();
+        flate2::read::ZlibDecoder::new(stored.as_slice())
+            .read_to_end(&mut plain)
+            .unwrap();
+        let sha = sha256(&plain);
+        std::fs::write(
+            archive_dir.path().join(format!(
+                "evidence-{:010}-{sha}.json",
+                chunk["sequence"].as_u64().unwrap()
+            )),
+            &plain,
+        )
+        .unwrap();
+        std::fs::remove_file(archive_dir.path().join(old_name)).unwrap();
+        let object = chunk.as_object_mut().unwrap();
+        object.remove("compressed");
+        object.insert("sha256".into(), sha.into());
+        object.insert("bytes".into(), plain.len().into());
+    }
+    document["format_version"] = 2.into();
+    write_document(state_dir.path(), &document);
+    let state = RecordingStore::open(state_dir.path());
+    let rig = start(
+        Some(state.clone()),
+        Some((flaky(archive_dir.path()), small_policy())),
+    )
+    .await
+    .unwrap();
+    let reader = rig.admin.reader(owner.clone()).unwrap();
+    assert!(reader.complete_snapshot().unwrap() == complete);
+    // 之后新归档的分块照常压缩；新旧分块合起来仍是完整记忆。
+    for number in 13..=20 {
+        import(&rig, &owner, number).unwrap();
+    }
+    assert_complete(&rig.admin, &owner, 20);
+    let complete = reader.complete_snapshot().unwrap();
+    assert_eq!(complete.evidence.len(), 20);
+    stop(rig).await;
+    drop(state);
+    let document = read_document(state_dir.path());
+    assert_eq!(document["format_version"], 3);
+    let archive = document["scopes"][0]["archive"].as_array().unwrap();
+    assert!(
+        archive
+            .iter()
+            .any(|chunk| chunk.get("compressed").is_none())
+    );
+    assert!(archive.iter().any(|chunk| chunk["compressed"] == true));
 }

@@ -31,6 +31,8 @@ pub struct ChannelStatus {
     pub completed: u64,
     pub sent: u64,
     pub failed: u64,
+    /// 已送达但未写入交互记忆的交流数（如记忆容量已满）；回复本身不受影响。
+    pub interactions_not_saved: u64,
 }
 /// 运行就绪状态：分别说明通道、工具、模型与视觉，不合成一个笼统的“全功能就绪”。
 /// 模型状态来自本进程实际请求的结局，重启后清零；没有请求时为尚未验证。

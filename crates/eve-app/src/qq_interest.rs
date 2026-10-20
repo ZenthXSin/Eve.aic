@@ -176,7 +176,8 @@ async fn run(
                 if !gate.admits(qq_budget::INTEREST_UNITS)? {
                     break;
                 }
-                let snapshot = memory.reader(scope.clone())?.snapshot()?;
+                // 读完整记忆：归档前还没观察的交流同样会被观察。
+                let snapshot = memory.reader(scope.clone())?.complete_snapshot()?;
                 if snapshot.scope != scope {
                     return Err("兴趣观察来源作用域不匹配".into());
                 }

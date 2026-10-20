@@ -318,7 +318,9 @@
     const failed = Boolean(qq.terminal_error);
     $("channel-state").textContent = failed ? "通道异常" : qq.closed ? "通道已关闭" : qq.ready ? "已就绪" : "正在连接";
     $("channel-dot").className = `status-dot${failed ? " bad" : qq.closed || !qq.ready ? " neutral" : ""}`;
-    $("channel-detail").textContent = failed ? "通道报告终态错误，请检查本地服务。" : qq.closed ? "当前通道不再接收消息。" : qq.ready ? "已连接 QQ 消息通道。" : "等待通道完成连接。";
+    const unsaved = Number.isSafeInteger(qq.interactions_not_saved) && qq.interactions_not_saved > 0
+      ? ` 另有 ${count(qq.interactions_not_saved)} 次已送达交流因记忆容量已满未写入记忆。` : "";
+    $("channel-detail").textContent = (failed ? "通道报告终态错误，请检查本地服务。" : qq.closed ? "当前通道不再接收消息。" : qq.ready ? "已连接 QQ 消息通道。" : "等待通道完成连接。") + unsaved;
     for (const name of ["received", "completed", "sent", "failed"]) $(`metric-${name}`).textContent = count(qq[name]);
     const time = new Date(body.started_at_unix_ms);
     $("started-at").textContent = Number.isFinite(body.started_at_unix_ms) && !Number.isNaN(time.getTime()) ? `启动于 ${time.toLocaleString("zh-CN", { hour12: false })}` : "启动时间未知";

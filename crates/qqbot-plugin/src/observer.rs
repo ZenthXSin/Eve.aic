@@ -56,7 +56,8 @@ impl QqInteraction<'_> {
 /// 由宿主显式接线的同步、有限本地操作；不得发起模型、网络或嵌套通道任务。
 ///
 /// 仅普通消息成功投递后调用，不包括命令、训练发起轮、控制替代轮、工具内部消息或失败轮。
-/// Err/panic 后通道保留 Sent，记录警告并关闭，绝不自动再调。
+/// `PluginError::Task` 表示确定拒绝且未写入任何内容（如容量已满）：通道计数后继续服务。
+/// 其他 Err/panic 后通道保留 Sent，记录警告并关闭。两种情况都绝不自动再调。
 /// 首版不在重启时补采；观察持久化与 QQ 回执不构成跨服务事务。
 pub trait QqInteractionObserver: Send + Sync {
     fn observe(&self, interaction: &QqInteraction<'_>) -> PluginResult<()>;
@@ -148,7 +149,11 @@ impl CompletedInteraction {
         };
         catch_unwind(AssertUnwindSafe(|| observer.observe(&interaction)))
             .map_err(|_| PluginError::State("QQBot 交互观察者异常".into()))?
-            .map_err(|_| PluginError::State("QQBot 交互观察失败；Sent 已保留且未重试".into()))
+            .map_err(|error| match error {
+                // 观察者确定未写入任何内容的拒绝（如容量已满）原样传出，由桥记录后继续。
+                PluginError::Task(reason) => PluginError::Task(reason),
+                _ => PluginError::State("QQBot 交互观察失败；Sent 已保留且未重试".into()),
+            })
     }
 }
 

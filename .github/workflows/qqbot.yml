@@ -93,6 +93,7 @@ jobs:
           python3 connectors/qqbot/test/memory_continuity_test.py
           python3 connectors/qqbot/test/tool_progress_test.py
           python3 connectors/qqbot/test/history_window_test.py
+          python3 connectors/qqbot/test/history_digest_test.py
           python3 connectors/qqbot/test/plan_test.py
           python3 connectors/qqbot/test/semantic_test.py
           python3 connectors/qqbot/test/budget_test.py
@@ -100,6 +101,7 @@ jobs:
           python3 connectors/qqbot/test/clarify_test.py
           python3 connectors/qqbot/test/agenda_test.py
           python3 connectors/qqbot/test/reminder_test.py
+          python3 connectors/qqbot/test/background_task_test.py
           python3 connectors/qqbot/test/completion_test.py
           python3 connectors/qqbot/test/pursuit_test.py
           python3 connectors/qqbot/test/outreach_test.py

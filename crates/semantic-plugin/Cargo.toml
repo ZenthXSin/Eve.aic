@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+flate2.workspace = true
 eve-semantic-api = { path = "../semantic-api" }
 eve-memory-api = { path = "../memory-api" }
 eve-plugin-api = { path = "../plugin-api" }

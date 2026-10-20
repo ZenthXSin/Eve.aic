@@ -63,7 +63,7 @@ class MemoryCapacityAcceptance(memory_test.MemoryAcceptance):
             item['source']['message_id'] = f'synthetic-old-message-{index}'
             item['source']['turn_id'] = 1000 + index
             item['source']['session_revision'] = (1000 + index) * 2
-            item['source']['user_text'] = f'旧交流原文 {index}'
+            item['source']['user_text'] = f'旧交流原文 {index}' + (' 独角兽口令' if index == 5 else '')
             evidence.append(item)
         snapshot.update(revision=total, evidence=evidence)
         state['entries']['eve.memory']['memory.v1'] = list(json.dumps(memory).encode())
@@ -91,7 +91,8 @@ class MemoryCapacityAcceptance(memory_test.MemoryAcceptance):
         self.run_eve([*self.send(self.message('after-capacity', '归档后仍应正常交流')),
                       *self.checkpoint('imported')], checkpoints={'imported': imported})
         memory = self.memory()
-        self.assertEqual(memory['format_version'], 2)
+        # 新分块都经无损压缩，文档写格式 3。
+        self.assertEqual(memory['format_version'], 3)
         current = self.only_snapshot()
         archived_count = current['archived_evidence']
         self.assertEqual(archived_count, 256)
@@ -101,7 +102,9 @@ class MemoryCapacityAcceptance(memory_test.MemoryAcceptance):
         self.assertEqual(len(moved), archived_count)
         # 偏好命令与首条真实交流仍在热层；被移出的都是旧的完成交互。
         self.assertTrue(all(item['source']['kind'] == 'CompletedInteraction' for item in moved))
-        self.assertEqual(len(list((self.work / 'state/memory-archive').iterdir())), 1)
+        [chunk_file] = list((self.work / 'state/memory-archive').iterdir())
+        self.assertTrue(chunk_file.name.endswith('.json.zz'))
+        self.assertIn('synthetic-old-5', [item['id'] for item in moved], '带口令的旧原文已归档')
 
         scope = current['scope']
         scope_args = ['--channel', scope['channel'], '--session', scope['session_id'], '--user', scope['user_id']]
@@ -126,6 +129,56 @@ class MemoryCapacityAcceptance(memory_test.MemoryAcceptance):
                       *self.checkpoint('imported-again')], checkpoints={'imported-again': lambda: self.wait_until(
                           lambda: self.only_snapshot()['revision'] == 1102, 'second interaction not imported')})
         self.assertEqual(self.only_snapshot()['archived_evidence'], 256)
+        # 归档只是压缩存储：/recall 仍能找到已归档的旧原文。
+        self.run_eve(self.send(self.message('recall-archived', '/recall 独角兽口令', contains='独角兽口令')))
 
+
+    def test_full_scope_capacity_keeps_serving_and_counts_unsaved_interactions(self):
+        self.run_eve([*self.send(self.message('seed-interaction', '已有交流来源')),
+                      *self.checkpoint('seeded')], checkpoints={'seeded': lambda: self.wait_until(
+                          lambda: len(self.interactions()) == 1, 'seed interaction not imported')})
+        # 用真实导入的作用域复制出 1024 个作用域（上限），模拟群里已有大量成员。
+        state = json.loads(self.state_path.read_text())
+        memory = json.loads(bytes(state['entries']['eve.memory']['memory.v1']))
+        record = memory['scopes'][0]
+        for index in range(1, 1024):
+            clone = copy.deepcopy(record)
+            clone['snapshot']['scope']['session_id'] = f'qq:synthetic-group-{index}'
+            clone['snapshot']['scope']['user_id'] = f'qq:synthetic-member-{index}'
+            clone['snapshot']['evidence'][0]['id'] = f'synthetic-{index}'
+            memory['scopes'].append(clone)
+        state['entries']['eve.memory']['memory.v1'] = list(json.dumps(memory).encode())
+        self.state_path.write_text(json.dumps(state, separators=(',', ':')))
+        before = self.memory()
+        seen = {}
+
+        def refused():
+            self.assertEqual(self.memory(), before, 'full capacity must not write memory')
+            seen['status'] = self.panel('/api/status', method='GET')
+
+        def imported():
+            self.wait_until(lambda: self.only_original()['revision'] == 2, 'existing scope not imported')
+
+        summary = self.run_eve([
+            *self.send(self.message('new-member', '新成员第一次说话', user='user-new')),
+            *self.checkpoint('refused'),
+            *self.send(self.message('old-member', '已有成员继续交流')),
+            *self.checkpoint('imported')], checkpoints={'refused': refused, 'imported': imported}, panel=True)
+        self.assertEqual(summary['sent'], 2)
+        self.assertEqual(summary['interactions_not_saved'], 1)
+        status, body = seen['status']
+        self.assertEqual(status, 200)
+        self.assertEqual(body['qq']['interactions_not_saved'], 1)
+        self.assertEqual(len(self.snapshots()), 1024)
+        self.assertIn('interaction_not_saved', self.panel_stderr.read_text())
+
+        # 重启后容量仍满：新成员仍只跳过采集，已有记录不变，实例正常运行。
+        summary = self.run_eve(self.send(self.message('new-member-again', '重启后新成员再说话', user='user-new')))
+        self.assertEqual((summary['sent'], summary['interactions_not_saved']), (1, 1))
+        self.assertEqual(len(self.snapshots()), 1024)
+        self.assertEqual(self.only_original()['revision'], 2)
+
+    def only_original(self):
+        return next(s for s in self.snapshots() if not s['scope']['session_id'].startswith('qq:synthetic-'))
 
 if __name__ == '__main__': unittest.main()

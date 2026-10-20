@@ -14,7 +14,7 @@ use eve_plugin_api::{
     Permission, PermissionChecker, PluginError, PluginId, PluginManifest, PluginState,
     RuntimeInspector, ServiceId, ServiceRegistry,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,6 +38,8 @@ pub struct LlmHostConfig {
     pub output_format: String,
     pub provider_timeout: Duration,
     pub tool_timeout: Duration,
+    /// 按工具名覆盖单次执行期限（例如需要等待子代理的工具）；其余工具使用 `tool_timeout`。
+    pub tool_timeout_overrides: BTreeMap<String, Duration>,
     pub tool_cancellation_grace: Duration,
     pub max_parallel_tool_calls: usize,
     /// 0 表示不限制工具批次数；正数为本轮显式上限。取消、预算及超时仍独立生效。
@@ -65,6 +67,7 @@ impl Default for LlmHostConfig {
             output_format: "plain text".into(),
             provider_timeout: Duration::from_secs(30),
             tool_timeout: Duration::from_secs(10),
+            tool_timeout_overrides: BTreeMap::new(),
             tool_cancellation_grace: Duration::from_millis(100),
             max_parallel_tool_calls: 10,
             max_tool_rounds: 1,
@@ -88,6 +91,7 @@ impl std::fmt::Debug for LlmHostConfig {
             .field("output_format", &self.output_format)
             .field("provider_timeout", &self.provider_timeout)
             .field("tool_timeout", &self.tool_timeout)
+            .field("tool_timeout_overrides", &self.tool_timeout_overrides)
             .field("tool_cancellation_grace", &self.tool_cancellation_grace)
             .field("max_parallel_tool_calls", &self.max_parallel_tool_calls)
             .field("max_tool_rounds", &self.max_tool_rounds)
@@ -143,6 +147,7 @@ impl LlmHostConfig {
             || self.max_stream_text_bytes == 0
             || self.provider_timeout.is_zero()
             || self.tool_timeout.is_zero()
+            || self.tool_timeout_overrides.values().any(Duration::is_zero)
             || self.tool_cancellation_grace.is_zero()
             || self.max_parallel_tool_calls == 0
             || self.max_tool_calls == 0
@@ -432,6 +437,7 @@ pub struct LlmHost {
     provider: Arc<dyn LlmProvider>,
     model_resolver: Option<Arc<dyn LlmModelResolver>>,
     history_resolver: Option<Arc<dyn eve_llm_api::HistoryWindowResolver>>,
+    history_digests: Option<Arc<dyn eve_llm_api::HistoryDigests>>,
     history_window: Option<eve_llm_api::HistoryWindow>,
     execution_budget: Option<Arc<eve_llm_api::TurnBudget>>,
     pub(crate) registry: Arc<dyn ServiceRegistry>,
@@ -483,6 +489,7 @@ impl LlmHost {
             provider,
             model_resolver: None,
             history_resolver: None,
+            history_digests: None,
             history_window: None,
             execution_budget: None,
             registry,
@@ -511,10 +518,44 @@ impl LlmHost {
         self
     }
 
+    /// 显式启用历史摘要：窗口省略的较早轮次以摘要提供，而不是直接省略。
+    pub fn with_history_digests(mut self, digests: Arc<dyn eve_llm_api::HistoryDigests>) -> Self {
+        self.history_digests = Some(digests);
+        self
+    }
+
     /// 每次认知尝试独立预算；克隆继续共享工具槽位和串行队列。
     pub fn with_execution_budget(mut self, budget: Arc<eve_llm_api::TurnBudget>) -> Self {
         self.execution_budget = Some(budget);
         self
+    }
+
+    /// 本次执行的工具调用总数上限（如后台任务的步数预算）；用尽后按 `final_answer_on_round_limit` 收尾。
+    /// 克隆继续共享工具槽位和串行队列。
+    pub fn with_tool_call_limit(&self, limit: usize) -> Result<Self, LlmError> {
+        let mut host = self.clone();
+        host.config.max_tool_calls = limit;
+        host.config.validate()?;
+        Ok(host)
+    }
+
+    /// 不经会话服务执行一轮：上下文与工具按给定的可信范围装配，不读取或保存会话历史。
+    /// 用于宿主内部的后台任务与子代理；`sink.closed()` 完成即取消。
+    pub async fn run_scoped_turn_with_events(
+        &self,
+        input: TurnInput,
+        scope: Option<eve_llm_api::ContextScope>,
+        sink: &dyn TurnEventSink,
+    ) -> Result<TurnOutput, TurnFailure> {
+        let admission = Arc::new(self.kernel.acquire_runtime_admission().await);
+        let events = self.event_delivery(sink, None);
+        match self.for_turn() {
+            Ok(host) => {
+                host.run_turn_inner(input, None, scope, admission, Some(&events))
+                    .await
+            }
+            Err(error) => Err(fail(error, TurnDiagnostics::default())),
+        }
     }
 
     pub(crate) fn for_turn(&self) -> Result<Self, LlmError> {
@@ -627,7 +668,12 @@ impl LlmHost {
             }
         }
         if let Some(window) = self.history_window
-            && let Err(error) = crate::history::apply(&mut prepared.context, window)
+            && let Err(error) = crate::history::apply(
+                &mut prepared.context,
+                window,
+                self.history_digests.as_deref(),
+                scope.as_ref(),
+            )
         {
             return Err(fail(error, diagnostics));
         }
@@ -1082,7 +1128,12 @@ impl LlmHost {
                 started: started.clone(),
                 active: active.clone(),
                 peak: peak.clone(),
-                timeout: self.config.tool_timeout,
+                timeout: self
+                    .config
+                    .tool_timeout_overrides
+                    .get(&prepared_call.call.name)
+                    .copied()
+                    .unwrap_or(self.config.tool_timeout),
                 grace: self.config.tool_cancellation_grace,
             };
             tasks.tasks.push(ToolTask {

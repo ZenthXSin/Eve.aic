@@ -22,6 +22,7 @@ mod qq_cognition;
 mod qq_completion;
 mod qq_conversation;
 mod qq_help;
+mod qq_history_digest;
 mod qq_host_facts;
 mod qq_interest;
 mod qq_learning;
@@ -40,6 +41,7 @@ mod qq_research;
 mod qq_semantic;
 mod qq_skill;
 mod qq_summary;
+mod qq_tasks;
 mod qq_tools;
 mod qqbot;
 mod segment_advice;
@@ -294,6 +296,8 @@ pub(crate) struct CoreBootstrap {
     tools: Vec<Arc<dyn eve_llm_api::Tool>>,
     /// 记录对话模型每次请求的结局；只观察，不改变请求。
     health: Option<Arc<dyn eve_llm_api::ModelHealthObserver>>,
+    /// 历史窗口省略较早轮次时提供的摘要；不装配时照常省略并提示。
+    history_digests: Option<Arc<dyn eve_llm_api::HistoryDigests>>,
 }
 
 pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstrap, AppError> {
@@ -308,6 +312,7 @@ pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstr
         context: None,
         tools: vec![],
         health: None,
+        history_digests: None,
     })
 }
 
@@ -347,8 +352,10 @@ pub(crate) async fn install_core_with_pages(
         config::memory_summary_schema(),
         config::dialogue_schema(),
         config::history_schema(),
+        qq_history_digest::schema(),
         qq_people::schema(),
         qq_memory_continuity::schema(),
+        qq_tasks::schema(),
         qq_message_judge::provider_schema(),
         model_roles_schema(),
         eve_message_api::message_schema(),
@@ -395,6 +402,7 @@ async fn install_core_with_config(
         context,
         tools,
         health,
+        history_digests,
     } = bootstrap;
     let mut bindings = Vec::with_capacity(tools.len() + 1);
     for tool in &tools {
@@ -472,6 +480,10 @@ async fn install_core_with_config(
     )?
     .with_model_resolver(resolver)
     .with_history_resolver(Arc::new(history::ConfiguredHistory(settings.0.clone())));
+    let host = match history_digests {
+        Some(digests) => host.with_history_digests(digests),
+        None => host,
+    };
     let host = Arc::new(SessionLlmHost::new(host, SessionBinding::builtin()).with_logger(logger));
     kernel.register(Box::new(ControlPlugin::new(
         Arc::new(SessionControlRunner::new(host)),
