@@ -63,6 +63,14 @@ def fix_git_paths():
     for directory, dirs, files in os.walk(base):
         dirs[:] = [d for d in dirs if d not in ('node_modules', 'target', 'objects', 'incremental', 'deps', 'memory-archive')]
         parent = Path(directory)
+        for name in [*dirs, *files]:
+            link = parent / name
+            if link.is_symlink():
+                old = os.readlink(link)
+                new = mapped(old)
+                if old != new:
+                    link.unlink()
+                    link.symlink_to(new)
         paths = []
         if '.git' in files:
             paths.append(parent / '.git')
