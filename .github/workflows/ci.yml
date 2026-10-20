@@ -56,6 +56,8 @@ jobs:
             Write-Output "::error title=实时升级进程验收失败::$details"
             exit $result
           }
+      - name: 验证 Linux 分卷校验与进程身份绑定
+        run: python -X utf8 scripts/test-linux-handoff.py
       - name: 检查所有构建目标
         run: cargo check --workspace --all-targets --locked
       - name: 检查 Clippy 警告

@@ -201,11 +201,26 @@ def delivery_gate(state_path, request, inherited=frozenset()):
     return bool(matching and matching['state'] == 'Sent' and matching.get('reply') == reply) and all(t['status']['state'] != 'Pending'
                         for s in sessions['sessions'].values() for t in s['turns'])
 
+def execution_command(command):
+    """Linux 便携包可选的私有动态加载器；逻辑命令和候选摘要保持原样。"""
+    loader = os.environ.get('EVE_RUNTIME_LOADER')
+    libraries = os.environ.get('EVE_RUNTIME_LIBRARY_PATH')
+    if os.name == 'nt' or (loader is None and libraries is None):
+        return command
+    if (not loader or not libraries or not Path(loader).is_absolute()
+            or not Path(loader).is_file()
+            or any(not p or not Path(p).is_absolute() or not Path(p).is_dir()
+                   for p in libraries.split(os.pathsep))):
+        raise ValueError('portable_runtime_loader_invalid')
+    with Path(command[0]).open('rb') as stream:
+        elf = stream.read(4) == b'\x7fELF'
+    return [loader, '--library-path', libraries, *command] if elf else command
+
 class Child:
     def __init__(self, command):
         self.ready = threading.Event()
         options = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {}
-        self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stderr=subprocess.PIPE, **options)
+        self.process = subprocess.Popen(execution_command(command), stdin=subprocess.DEVNULL, stderr=subprocess.PIPE, **options)
         def copy():
             for chunk in iter(lambda: self.process.stderr.readline(65536), b''):
                 if b'EVE_QQBOT_READY' in chunk:
@@ -296,7 +311,7 @@ class Supervisor:
 
     def candidate_command(self, request):
         binary, resources, manifest = validate_candidate(request, self.options.candidates)
-        subprocess.run([str(binary), '--help'], check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(execution_command([str(binary), '--help']), check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         bridge = resources / 'connectors/qqbot'
         modules = bridge / 'node_modules'
         original_bridge = Path(argument(self.command, '--bridge-script'))
