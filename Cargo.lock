@@ -1077,6 +1077,7 @@ dependencies = [
  "eve-semantic-api",
  "eve-session-api",
  "eve-session-plugin",
+ "flate2",
  "ring",
  "serde",
  "serde_json",
