@@ -445,6 +445,16 @@ test("主动私聊被平台拒绝时回失败回执与错误码，不重试、�
   assert.ok(!JSON.stringify(f.frames).includes("要不要"));
 });
 
+test("原群唤醒使用宿主给定的群路由，未知范围拒绝发送", async () => {
+  const f = fixture();
+  await f.bridge.command({type:"push",version:1,id:"wake-group",scope:"group",target_id:"group-1",text:"已完成"});
+  assert.deepEqual(f.sent[0].target, {scope:"group",targetId:"group-1"});
+  assert.equal(f.frames.at(-1).ok, true);
+  await f.bridge.command({type:"push",version:1,id:"wake-invalid",scope:"unknown",target_id:"group-1",text:"禁止"});
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.frames.at(-1).ok, false);
+});
+
 test("纯图片和图文保留本条图片引用，不抓取、不混入引用图、不改变路由", async () => {
   const f = fixture();
   const message = { kind: "c2c", messageId: "image-1", senderId: "user-1", content: "",

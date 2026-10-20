@@ -708,6 +708,7 @@ impl QqOutreach for ChannelAdapter {
             )
             .map_err(plugin_error)?;
         Ok(claimed.text.map(|text| QqOutreachPush {
+            session: None,
             user_id: claimed.owner,
             message: QqOutreachMessage {
                 id: claimed.id,

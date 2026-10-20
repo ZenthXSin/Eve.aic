@@ -27,6 +27,8 @@ name = "eve-memory"
 path = "src/bin/memory.rs"
 
 [dependencies]
+eve-trigger-api = { path = "../trigger-api" }
+eve-trigger-plugin = { path = "../trigger-plugin" }
 eve-people-api = { path = "../people-api" }
 eve-people-plugin = { path = "../people-plugin" }
 eve-developer-api = { path = "../developer-api" }

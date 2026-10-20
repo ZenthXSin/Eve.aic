@@ -195,6 +195,24 @@ fn c2c_route(ledger: &Ledger, app: &str, user_id: &str) -> PluginResult<Option<S
     }
     Ok(None)
 }
+fn session_route(
+    ledger: &Ledger,
+    app: &str,
+    session: &SessionKey,
+) -> PluginResult<Option<(String, String)>> {
+    for entry in ledger.entries.iter().rev() {
+        if entry.app_id == app
+            && entry.state == ReceiptState::Sent
+            && entry.message.session_key(app)? == *session
+        {
+            return Ok(Some((
+                entry.message.scope.clone(),
+                entry.message.target_id.clone(),
+            )));
+        }
+    }
+    Ok(None)
+}
 struct ChannelEvents {
     signal: Arc<dyn TaskSignal>,
     stop: watch::Receiver<bool>,
@@ -969,6 +987,10 @@ pub(crate) async fn run(
                 delivery.pause_until = None;
             }
             let next_ordinary = queue.iter().position(|queued| {
+                if conversations.wakeup_claimed() { return false; }
+                let Ok(session) = queued.message.session_key(&config.app_id) else { return false; };
+                if control.snapshot(&session).ok().flatten().is_some_and(|s| s.phase != eve_control_api::ControlPhase::Finished) { return false; }
+
                 if !natural_message_judgement {
                     return routing.is_empty() && commands.is_empty() && active.is_empty()
                         && delivering.is_none() && replies.is_empty() && judging.is_none();
@@ -1003,6 +1025,9 @@ pub(crate) async fn run(
                         controlled_sessions.insert(key.session.session_id.clone(), key.session.clone());
                         let wait = control.wait(&key); active.push(Active { message, key, ordinary: queued.ordinary, wait });
                     }
+                    Err(eve_control_api::ControlError::Busy) => {
+                        queue.push_front(Queued { message, saved: true, ordinary: queued.ordinary });
+                    }
                     Err(_) => {
                         mark_failed(&mut ledger, &ctx, &config.app_id, &message.id)?;
                         status.send_modify(|s| s.failed += 1);
@@ -1020,11 +1045,15 @@ pub(crate) async fn run(
                 next_push = tokio::time::Instant::now() + interval;
                 match hook.inner.next_push() {
                     Ok(Some(push)) => {
-                        let target = c2c_route(&ledger, &config.app_id, &push.user_id)?;
+                        let target = match &push.session {
+                            Some(session) if session.user_id == push.user_id => session_route(&ledger, &config.app_id, session)?,
+                            Some(_) => None,
+                            None => c2c_route(&ledger, &config.app_id, &push.user_id)?.map(|target| ("c2c".to_string(), target)),
+                        };
                         match target.filter(|_| valid_message_id(&push.message.id) && valid_outreach_text(&push.message.text)) {
-                            Some(target) => {
+                            Some((scope, target)) => {
                                 write(&mut stdin, json!({"type":"push","version":1,"id":push.message.id,
-                                    "target_id":target,"text":push.message.text})).await?;
+                                    "scope":scope,"target_id":target,"text":push.message.text})).await?;
                                 deadline = tokio::time::Instant::now() + Duration::from_secs(35);
                                 pushing = Some(push.message.id);
                             }
@@ -1036,6 +1065,8 @@ pub(crate) async fn run(
                 }
                 continue;
             }
+            conversations.set_idle(active.is_empty() && queue.is_empty() && routing.is_empty() && commands.is_empty()
+                && replies.is_empty() && delivering.is_none() && pushing.is_none() && judging.is_none() && status.borrow().ready);
             let eligible: Vec<bool> = active.iter().map(|a| !pending_control(&a.message, &routing, &commands)).collect();
             tokio::select! {
                 biased;
@@ -1045,6 +1076,7 @@ pub(crate) async fn run(
                     break Err(failure("QQBot ready 或 delivery 等待超时"));
                 }
                 _ = tokio::time::sleep_until(next_push), if push_ready => {}
+                _ = tokio::time::sleep(Duration::from_millis(100)), if !queue.is_empty() => {}
                 Some(event) = progress_rx.recv(), if progress_queue.len() < 64 => { progress_queue.push_back(event); }
                 invite = judged(&mut judging), if judging.is_some() => {
                     let (mut reply, _) = judging.take().expect("judging reply");
@@ -1140,6 +1172,7 @@ pub(crate) async fn run(
                     }
                 }
                 frame = frames.next() => {
+                    conversations.set_idle(false);
                     let Some(frame) = frame? else {
                         if !active.is_empty() || !routing.is_empty() || delivering.is_some() || pushing.is_some() || progress_delivery.is_some() || judging.is_some() || !queue.is_empty()
                             || !commands.is_empty() || !replies.is_empty() || !status.borrow().ready {
