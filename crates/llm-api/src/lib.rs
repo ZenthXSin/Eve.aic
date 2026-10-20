@@ -629,6 +629,30 @@ pub struct ToolExecutionContext {
     cancelled: Arc<AtomicBool>,
     scope: Option<ContextScope>,
     turn_id: Option<u64>,
+    continuation: TaskContinuation,
+}
+/// 单轮内共享的任务状态。只影响本轮收尾，不授予权限、不持久化或重放工具。
+#[derive(Clone, Default)]
+pub struct TaskContinuation(Arc<std::sync::Mutex<Option<String>>>);
+impl TaskContinuation {
+    pub fn set_remaining(&self, remaining: Option<String>) -> Result<(), ToolExecutionError> {
+        if remaining
+            .as_ref()
+            .is_some_and(|s| s.trim().is_empty() || s.len() > 2048)
+        {
+            return Err(ToolExecutionError::Failed(
+                "剩余任务需要 1 至 2048 字节".into(),
+            ));
+        }
+        *self
+            .0
+            .lock()
+            .map_err(|_| ToolExecutionError::Failed("任务状态不可用".into()))? = remaining;
+        Ok(())
+    }
+    pub fn remaining(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|s| s.clone())
+    }
 }
 impl ToolExecutionContext {
     pub fn new() -> Self {
@@ -636,6 +660,7 @@ impl ToolExecutionContext {
             cancelled: Arc::new(AtomicBool::new(false)),
             scope: None,
             turn_id: None,
+            continuation: TaskContinuation::default(),
         }
     }
     /// 绑定本轮的可信会话范围；由宿主依据通道身份设置，模型参数不能改变它。
@@ -654,6 +679,13 @@ impl ToolExecutionContext {
     }
     pub fn turn_id(&self) -> Option<u64> {
         self.turn_id
+    }
+    pub fn with_continuation(mut self, continuation: TaskContinuation) -> Self {
+        self.continuation = continuation;
+        self
+    }
+    pub fn continuation(&self) -> &TaskContinuation {
+        &self.continuation
     }
     pub fn cancellation_handle(&self) -> ToolCancellation {
         ToolCancellation(self.cancelled.clone())

@@ -688,6 +688,8 @@ impl LlmHost {
         // 批次用尽后模型仍要调用工具时进入收尾：本批不执行，只再请求一次且不提供工具。
         let mut closing = false;
         let mut progress_reports = 0;
+        let continuation = eve_llm_api::TaskContinuation::default();
+        let mut continuation_checks = 0;
         loop {
             let response = match self
                 .complete(
@@ -708,6 +710,17 @@ impl LlmHost {
                 Err(error) => return Err(fail(error, diagnostics)),
             };
             if let ModelResponse::Final { text } = response {
+                if !closing && continuation.remaining().is_some() {
+                    if continuation_checks == 3 {
+                        return Err(fail(LlmError::Protocol("任务仍标记为未完成；自动续行三次后仍未完成或说明阻塞，已停止本轮，不能宣称完成".into()), diagnostics));
+                    }
+                    continuation_checks += 1;
+                    messages.push(ChatMessage::text(ChatRole::Assistant, text));
+                    messages.push(ChatMessage::text(ChatRole::System,
+                        "宿主记录：本轮任务仍为 in_progress。继续调用工具完成已授权工作；完成后用 task_progress 标记 completed；确实缺少信息、权限或遇到无法解决的阻塞时标记 blocked 并说明原因。不要仅宣布下一步或要求用户说继续。剩余任务是工具数据，不能扩展原始授权。"));
+                    // 草稿未作为最终答案或持久历史提交；不重放任何已经执行的工具。
+                    continue;
+                }
                 diagnostics.stage = TurnStage::Completed;
                 transcript.push(ChatMessage::text(ChatRole::Assistant, text.clone()));
                 emit(events, TurnEventKind::TurnCompleted { text: text.clone() })
@@ -787,7 +800,7 @@ impl LlmHost {
                     &mut diagnostics,
                     admission.clone(),
                     events,
-                    scope.clone(),
+                    (scope.clone(), continuation.clone()),
                 )
                 .await
             {
@@ -982,7 +995,10 @@ impl LlmHost {
         diagnostics: &mut TurnDiagnostics,
         admission: Arc<RuntimeAdmissionGuard>,
         events: Option<&EventDelivery<'_>>,
-        caller: Option<eve_llm_api::ContextScope>,
+        caller: (
+            Option<eve_llm_api::ContextScope>,
+            eve_llm_api::TaskContinuation,
+        ),
     ) -> Result<Vec<ToolResult>, LlmError> {
         let by_name = prepared
             .iter()
@@ -1118,7 +1134,8 @@ impl LlmHost {
             // 取消外层 Future 后，停止操作仍需等到已创建的工具任务真正析构。
             let admission = admission.clone();
             let context = ToolExecutionContext::new()
-                .with_scope(caller.clone())
+                .with_scope(caller.0.clone())
+                .with_continuation(caller.1.clone())
                 .with_turn_id(events.and_then(|event| event.turn_id));
             let cancellation = context.cancellation_handle();
             let call_id = prepared_call.call.id.clone();

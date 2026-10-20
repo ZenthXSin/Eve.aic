@@ -80,7 +80,8 @@ use eve_training_plugin::{TrainingContext, TrainingPlugin};
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
-pub const QQBOT_HELP: &str = "--triggers 开启原会话条件唤醒工具（时间、文件、后台任务、消息匹配、Linux 进程）。
+pub const QQBOT_HELP: &str = "--sleep 开启可取消的短暂等待与本轮任务状态工具。
+--triggers 开启原会话条件唤醒工具（时间、文件、后台任务、消息匹配、Linux 进程）。
 Eve 官方 QQBot 通道
 用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-mindustry-json-rules 目录] [--practice-python 程序] [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--background-tasks] [--subagents] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--markdown] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
@@ -195,6 +196,7 @@ pub struct QqBotOptions {
     /// 模型可以把子任务委托给子代理并在本轮拿回结果。
     pub subagents: bool,
     pub triggers: bool,
+    pub sleep: bool,
     /// 计划各步都被证据满足后，随用户下一次私聊的回复问一句待办是否完成；用户确认后标为完成。需要计划入口。
     pub goal_completion: bool,
     /// 兴趣学习目标的研究与实践次数都用完、再无可做时，后台把它标为已取消并记下原因。需要兴趣学习。
@@ -255,6 +257,7 @@ impl Default for QqBotOptions {
             background_tasks: false,
             subagents: false,
             triggers: false,
+            sleep: false,
             goal_completion: false,
             learning_stop: false,
             reminder_utc_offset_minutes: None,
@@ -277,6 +280,10 @@ impl QqBotOptions {
         while let Some(arg) = args.next() {
             if arg == "--help" || arg == "-h" {
                 return Ok(None);
+            }
+            if arg == "--sleep" {
+                options.sleep = true;
+                continue;
             }
             if arg == "--triggers" {
                 options.triggers = true;
@@ -1495,6 +1502,20 @@ async fn run_qqbot_composed(
                 .tools
                 .extend(eve_reference_plugin::tools(Arc::new(library)));
         }
+        if options.sleep {
+            bootstrap
+                .tools
+                .push(Arc::new(eve_dialogue_tools::SleepTool));
+            bootstrap
+                .tools
+                .push(Arc::new(eve_dialogue_tools::TaskProgressTool));
+            bootstrap
+                .host_config
+                .tool_timeout_overrides
+                .insert("sleep".into(), std::time::Duration::from_secs(305));
+        }
+        // QQ 多步工具任务默认可连续执行；单次调用总数、取消与超时仍独立约束。
+        bootstrap.host_config.max_tool_rounds = 0;
         if let Some(rounds) = options.max_tool_rounds {
             bootstrap.host_config.max_tool_rounds = rounds;
         }
