@@ -186,6 +186,42 @@ pub trait MemoryService: Send + Sync {
         let _ = (after_revision, limit);
         Err(MemoryError::Unavailable)
     }
+    /// 本作用域的完整记忆：热层与全部归档证据按修订升序合并，`archived_evidence` 为 0。
+    /// 归档只是存储形式，回看历史的消费者（召回、摘要、提炼、观察）读这个视图，不会漏掉旧原文。
+    /// 分块缺失或校验失败时返回 `CorruptState`，不跳过。
+    ///
+    /// 默认实现先读快照再逐页读归档，两次读取之间发生归档时可能报告不一致；
+    /// 存储实现应在同一次读取中取得热层与分块索引。
+    fn complete_snapshot(&self) -> MemoryResult<MemorySnapshot> {
+        let mut snapshot = self.snapshot()?;
+        if snapshot.archived_evidence == 0 {
+            return Ok(snapshot);
+        }
+        let mut archived = Vec::new();
+        let mut after = 0;
+        loop {
+            let page = self.archived(after, MAX_ARCHIVE_PAGE)?;
+            archived.extend(page.evidence);
+            match page.next_after {
+                Some(next) => after = next,
+                None => break,
+            }
+        }
+        if archived.len() as u64 != snapshot.archived_evidence {
+            return Err(MemoryError::CorruptState);
+        }
+        archived.append(&mut snapshot.evidence);
+        archived.sort_by_key(|item| item.revision);
+        if archived
+            .windows(2)
+            .any(|pair| pair[0].revision == pair[1].revision || pair[0].id == pair[1].id)
+        {
+            return Err(MemoryError::CorruptState);
+        }
+        snapshot.evidence = archived;
+        snapshot.archived_evidence = 0;
+        Ok(snapshot)
+    }
 }
 #[derive(Clone)]
 pub struct MemoryServiceHandle(pub Arc<dyn MemoryService>);

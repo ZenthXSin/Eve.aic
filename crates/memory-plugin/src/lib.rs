@@ -87,6 +87,9 @@ impl MemoryService for ScopedReader {
     fn archived(&self, after_revision: u64, limit: usize) -> MemoryResult<ArchivedEvidencePage> {
         self.stored.archived(&self.scope, after_revision, limit)
     }
+    fn complete_snapshot(&self) -> MemoryResult<MemorySnapshot> {
+        self.stored.complete_snapshot(&self.scope)
+    }
 }
 
 pub struct MemoryPlugin {

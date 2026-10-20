@@ -5,7 +5,7 @@ use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -14,6 +14,8 @@ use std::{
 const CHUNK_FORMAT_VERSION: u32 = 1;
 /// 单个分块文件的硬上限；超过视为损坏。
 pub(crate) const MAX_CHUNK_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// 压缩分块解开后的上限；超过视为损坏，防止解压膨胀。
+const MAX_DECODED_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 
 /// 何时把热层较早的完成交互移入分块。默认值面向长期运行的 QQ 实例。
 ///
@@ -89,11 +91,17 @@ pub(crate) struct ChunkRecord {
     pub revisions: Vec<[u64; 2]>,
     pub first_turn: u64,
     pub last_turn: u64,
+    /// 文件内容是无损压缩（zlib）后的分块 JSON；旧分块为未压缩 JSON，照常读取。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub compressed: bool,
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl ChunkRecord {
     pub fn name(&self) -> String {
-        chunk_name(self.sequence, &self.sha256)
+        chunk_name(self.sequence, &self.sha256, self.compressed)
     }
     pub fn contains_revision(&self, revision: u64) -> bool {
         self.revisions
@@ -137,8 +145,9 @@ struct ChunkFile {
     evidence: Vec<InteractionEvidence>,
 }
 
-pub(crate) fn chunk_name(sequence: u64, sha256: &str) -> String {
-    format!("evidence-{sequence:010}-{sha256}.json")
+pub(crate) fn chunk_name(sequence: u64, sha256: &str, compressed: bool) -> String {
+    let suffix = if compressed { ".json.zz" } else { ".json" };
+    format!("evidence-{sequence:010}-{sha256}{suffix}")
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -156,15 +165,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// 编码一组按修订升序的完成交互；返回索引记录与文件内容。
-pub(crate) fn encode_chunk(
-    sequence: u64,
-    scope: &MemoryScope,
-    evidence: Vec<InteractionEvidence>,
-) -> MemoryResult<(ChunkRecord, Vec<u8>)> {
+/// 分块内证据的修订段、条数与轮次范围；证据须按修订升序、全是完成交互。
+fn metadata(evidence: &[InteractionEvidence]) -> MemoryResult<(u64, Vec<[u64; 2]>, u64, u64)> {
     let mut revisions: Vec<[u64; 2]> = Vec::new();
     let (mut first_turn, mut last_turn) = (u64::MAX, 0);
-    for item in &evidence {
+    for item in evidence {
         let EvidenceSource::CompletedInteraction { turn_id, .. } = item.source else {
             return Err(MemoryError::InvalidInput);
         };
@@ -176,14 +181,35 @@ pub(crate) fn encode_chunk(
             _ => revisions.push([item.revision, item.revision]),
         }
     }
-    let count = evidence.len() as u64;
-    let bytes = serde_json::to_vec(&ChunkFile {
+    Ok((evidence.len() as u64, revisions, first_turn, last_turn))
+}
+
+/// 编码一组按修订升序的完成交互；返回索引记录与文件内容。
+/// `compress` 为真时文件内容是 zlib 无损压缩后的 JSON，原文一字不改。
+pub(crate) fn encode_chunk(
+    sequence: u64,
+    scope: &MemoryScope,
+    evidence: Vec<InteractionEvidence>,
+    compress: bool,
+) -> MemoryResult<(ChunkRecord, Vec<u8>)> {
+    let (count, revisions, first_turn, last_turn) = metadata(&evidence)?;
+    let json = serde_json::to_vec(&ChunkFile {
         format_version: CHUNK_FORMAT_VERSION,
         sequence,
         scope: scope.clone(),
         evidence,
     })
     .map_err(|_| MemoryError::InvalidInput)?;
+    let bytes = if compress {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(&json)
+            .map_err(|_| MemoryError::InvalidInput)?;
+        encoder.finish().map_err(|_| MemoryError::InvalidInput)?
+    } else {
+        json
+    };
     let record = ChunkRecord {
         sequence,
         sha256: sha256_hex(&bytes),
@@ -192,6 +218,7 @@ pub(crate) fn encode_chunk(
         revisions,
         first_turn,
         last_turn,
+        compressed: compress,
     };
     record.validate().map_err(|_| MemoryError::InvalidInput)?;
     Ok((record, bytes))
@@ -213,6 +240,19 @@ pub(crate) fn load_chunk(
     if bytes.len() as u64 != record.bytes || sha256_hex(&bytes) != record.sha256 {
         return Err(MemoryError::CorruptState);
     }
+    let bytes = if record.compressed {
+        let mut decoded = Vec::new();
+        flate2::read::ZlibDecoder::new(bytes.as_slice())
+            .take(MAX_DECODED_CHUNK_BYTES + 1)
+            .read_to_end(&mut decoded)
+            .map_err(|_| MemoryError::CorruptState)?;
+        if decoded.len() as u64 > MAX_DECODED_CHUNK_BYTES {
+            return Err(MemoryError::CorruptState);
+        }
+        decoded
+    } else {
+        bytes
+    };
     let value = strict_json::from_slice(&bytes).map_err(|_| MemoryError::CorruptState)?;
     let file: ChunkFile = serde_json::from_value(value).map_err(|_| MemoryError::CorruptState)?;
     if file.format_version != CHUNK_FORMAT_VERSION
@@ -221,9 +261,17 @@ pub(crate) fn load_chunk(
     {
         return Err(MemoryError::CorruptState);
     }
-    let (rebuilt, _) = encode_chunk(record.sequence, scope, file.evidence.clone())
-        .map_err(|_| MemoryError::CorruptState)?;
-    if rebuilt != *record {
+    // 字节已按 SHA-256 核对；再按解开的原文重算索引字段，不依赖压缩器逐字节一致。
+    let (count, revisions, first_turn, last_turn) =
+        metadata(&file.evidence).map_err(|_| MemoryError::CorruptState)?;
+    if (count, &revisions, first_turn, last_turn)
+        != (
+            record.count,
+            &record.revisions,
+            record.first_turn,
+            record.last_turn,
+        )
+    {
         return Err(MemoryError::CorruptState);
     }
     for item in &file.evidence {
@@ -276,10 +324,10 @@ impl FileEvidenceArchive {
 }
 
 fn valid_name(name: &str) -> bool {
-    let Some(rest) = name
-        .strip_prefix("evidence-")
-        .and_then(|rest| rest.strip_suffix(".json"))
-    else {
+    let Some(rest) = name.strip_prefix("evidence-").and_then(|rest| {
+        rest.strip_suffix(".json.zz")
+            .or_else(|| rest.strip_suffix(".json"))
+    }) else {
         return false;
     };
     let Some((sequence, sha)) = rest.split_once('-') else {
@@ -363,4 +411,83 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn sync_directory(_: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{collections::BTreeMap, sync::Mutex};
+
+    #[derive(Default)]
+    struct Memory(Mutex<BTreeMap<String, Vec<u8>>>);
+    impl EvidenceArchiveStore for Memory {
+        fn put(&self, name: &str, bytes: &[u8]) -> MemoryResult<()> {
+            self.0.lock().unwrap().insert(name.into(), bytes.to_vec());
+            Ok(())
+        }
+        fn get(&self, name: &str) -> MemoryResult<Option<Vec<u8>>> {
+            Ok(self.0.lock().unwrap().get(name).cloned())
+        }
+        fn list(&self) -> MemoryResult<Vec<String>> {
+            Ok(self.0.lock().unwrap().keys().cloned().collect())
+        }
+    }
+
+    fn scope() -> MemoryScope {
+        MemoryScope {
+            channel: "qq".into(),
+            session_id: "s".into(),
+            user_id: "u".into(),
+        }
+    }
+
+    fn evidence(revision: u64) -> InteractionEvidence {
+        InteractionEvidence {
+            id: format!("e-{revision}"),
+            revision,
+            at_ms: 1,
+            source: EvidenceSource::CompletedInteraction {
+                message_id: format!("m-{revision}"),
+                session_revision: revision * 2,
+                turn_id: revision,
+                user_text: format!("第 {revision} 次提问，{}", "重复的原文".repeat(20)),
+                assistant_text: "好的。".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn compressed_and_plain_chunks_round_trip_losslessly() {
+        let store = Memory::default();
+        let items: Vec<_> = (1..=5).map(evidence).collect();
+        for compress in [false, true] {
+            let (record, bytes) = encode_chunk(7, &scope(), items.clone(), compress).unwrap();
+            assert_eq!(record.compressed, compress);
+            assert_eq!(record.name().ends_with(".json.zz"), compress);
+            store.put(&record.name(), &bytes).unwrap();
+            assert!(load_chunk(&store, &scope(), &record).unwrap() == items);
+        }
+        let (plain, _) = encode_chunk(7, &scope(), items.clone(), false).unwrap();
+        let (packed, _) = encode_chunk(7, &scope(), items, true).unwrap();
+        assert!(packed.bytes < plain.bytes, "压缩后更小");
+    }
+
+    #[test]
+    fn oversized_decompression_is_corrupt_not_trusted() {
+        let store = Memory::default();
+        let (mut record, _) = encode_chunk(1, &scope(), vec![evidence(1)], true).unwrap();
+        // 解开后超过上限的数据（例如解压膨胀）一律视为损坏。
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder
+            .write_all(&vec![b' '; MAX_DECODED_CHUNK_BYTES as usize + 1])
+            .unwrap();
+        let bomb = encoder.finish().unwrap();
+        record.sha256 = sha256_hex(&bomb);
+        record.bytes = bomb.len() as u64;
+        store.put(&record.name(), &bomb).unwrap();
+        assert!(matches!(
+            load_chunk(&store, &scope(), &record),
+            Err(MemoryError::CorruptState)
+        ));
+    }
 }

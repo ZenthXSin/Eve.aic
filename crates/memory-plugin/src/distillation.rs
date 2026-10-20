@@ -22,7 +22,7 @@ impl ConversationDistiller for ExtractiveConversationDistiller {
     ) -> MemoryResult<ConversationDigest> {
         options.validate()?;
         snapshot.scope.validate()?;
-        if snapshot.evidence.len() > MAX_EVIDENCE
+        if snapshot.evidence.len() as u64 > snapshot.revision
             || expression_evidence_ids.len() > options.max_expression_examples
         {
             return Err(MemoryError::InvalidInput);
