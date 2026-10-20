@@ -33,6 +33,7 @@ members = [
     "crates/reminder-plugin",
     "crates/task-api",
     "crates/task-plugin",
+    "crates/history-digest",
     "crates/completion-api",
     "crates/completion-plugin",
     "crates/pursuit-api",
