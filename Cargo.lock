@@ -293,6 +293,7 @@ dependencies = [
  "eve-developer-tools",
  "eve-dialogue-tools",
  "eve-file-observer",
+ "eve-history-digest",
  "eve-interest-api",
  "eve-interest-plugin",
  "eve-jev",
@@ -584,6 +585,18 @@ dependencies = [
  "ring",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "eve-history-digest"
+version = "0.1.0"
+dependencies = [
+ "eve-llm-api",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -437,6 +437,7 @@ pub struct LlmHost {
     provider: Arc<dyn LlmProvider>,
     model_resolver: Option<Arc<dyn LlmModelResolver>>,
     history_resolver: Option<Arc<dyn eve_llm_api::HistoryWindowResolver>>,
+    history_digests: Option<Arc<dyn eve_llm_api::HistoryDigests>>,
     history_window: Option<eve_llm_api::HistoryWindow>,
     execution_budget: Option<Arc<eve_llm_api::TurnBudget>>,
     pub(crate) registry: Arc<dyn ServiceRegistry>,
@@ -488,6 +489,7 @@ impl LlmHost {
             provider,
             model_resolver: None,
             history_resolver: None,
+            history_digests: None,
             history_window: None,
             execution_budget: None,
             registry,
@@ -513,6 +515,12 @@ impl LlmHost {
         resolver: Arc<dyn eve_llm_api::HistoryWindowResolver>,
     ) -> Self {
         self.history_resolver = Some(resolver);
+        self
+    }
+
+    /// 显式启用历史摘要：窗口省略的较早轮次以摘要提供，而不是直接省略。
+    pub fn with_history_digests(mut self, digests: Arc<dyn eve_llm_api::HistoryDigests>) -> Self {
+        self.history_digests = Some(digests);
         self
     }
 
@@ -660,7 +668,12 @@ impl LlmHost {
             }
         }
         if let Some(window) = self.history_window
-            && let Err(error) = crate::history::apply(&mut prepared.context, window)
+            && let Err(error) = crate::history::apply(
+                &mut prepared.context,
+                window,
+                self.history_digests.as_deref(),
+                scope.as_ref(),
+            )
         {
             return Err(fail(error, diagnostics));
         }

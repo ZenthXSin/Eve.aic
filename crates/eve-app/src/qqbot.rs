@@ -808,6 +808,7 @@ async fn run_qqbot_composed(
     let mut semantic_background: Option<qq_semantic::Background> = None;
     let mut semantic_queries: Option<Arc<qq_semantic::QueryRecallEmbeddings>> = None;
     let mut summary_background: Option<qq_summary::Background> = None;
+    let mut digest_background: Option<crate::qq_history_digest::Background> = None;
     let mut task_background: Option<qq_tasks::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
     let mut panel: Option<eve_web_panel::LocalPanel> = None;
@@ -898,6 +899,15 @@ async fn run_qqbot_composed(
         let model_health = Arc::new(eve_model_health::HealthBook::new());
         model_health.register("dialogue");
         bootstrap.health = Some(model_health.clone());
+        // 历史窗口省略较早轮次时用摘要代替；摘要是派生数据，原始会话历史完整保留。
+        let digest_policy = Arc::new(crate::qq_history_digest::Policy::default());
+        let history_digests = Arc::new(eve_history_digest::HistoryDigestService::new(
+            eve_history_digest::DigestStore::open(options.state_directory.join("history-digest"))?,
+            Box::new(crate::qq_history_digest::SharedPolicy(
+                digest_policy.clone(),
+            )),
+        ));
+        bootstrap.history_digests = Some(history_digests.clone());
         let people_plugin = eve_people_plugin::PeoplePlugin::new()?;
         let people: Arc<dyn eve_people_api::PeopleDirectory> = Arc::new(people_plugin.controller());
         kernel.register(Box::new(people_plugin))?;
@@ -1605,6 +1615,17 @@ async fn run_qqbot_composed(
             )))
         };
         let budgeted = |category: &str| budget_gate.wrap(observed(category)?, category);
+        // 历史摘要服务于对话本身，与主对话一样不计入自主运行预算；用途 digest 单独记健康与输出上限。
+        let _ = digest_policy
+            .settings
+            .set(qq_tasks::config_service(registry.as_ref())?);
+        digest_background = Some(crate::qq_history_digest::Background::start(
+            history_digests.clone(),
+            Arc::new(eve_history_digest::ModelHistoryDigester::new(observed(
+                crate::qq_history_digest::MODEL_USE,
+            )?)),
+            digest_policy.clone(),
+        ));
         // 后台任务与子代理共用执行器：用途 task 单独记健康与输出上限，不计入自主运行预算。
         if tasks.is_some() || options.subagents {
             let _ = task_late
@@ -2238,6 +2259,9 @@ async fn run_qqbot_composed(
         if let Some(summary) = &summary_background {
             summary.activate();
         }
+        if let Some(digests) = &digest_background {
+            digests.activate();
+        }
         if let Some(tasks) = &task_background {
             tasks.activate();
         }
@@ -2296,6 +2320,12 @@ async fn run_qqbot_composed(
                     (
                         summary.finished(),
                         "语义摘要后台已结束；QQ 通道停止准入并保留状态",
+                    )
+                }))
+                .chain(digest_background.as_ref().map(|digests| {
+                    (
+                        digests.finished(),
+                        "历史摘要后台已结束；QQ 通道停止准入并保留状态",
                     )
                 }))
                 .chain(task_background.as_ref().map(|tasks| {
@@ -2370,6 +2400,9 @@ async fn run_qqbot_composed(
     if let Some(summary) = &summary_background {
         summary.request_stop();
     }
+    if let Some(digests) = &digest_background {
+        digests.request_stop();
+    }
     if let Some(tasks) = &task_background {
         tasks.request_stop();
     }
@@ -2380,6 +2413,11 @@ async fn run_qqbot_composed(
     }
     if let Some(summary) = summary_background
         && let Err(error) = summary.stop().await
+    {
+        secondary.push(error);
+    }
+    if let Some(digests) = digest_background
+        && let Err(error) = digests.stop().await
     {
         secondary.push(error);
     }
