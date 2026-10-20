@@ -113,6 +113,18 @@ export function createBridge(bot, emit, limit = 128) {
     try { return await bot.sendText(target, text); }
     finally { activeSends--; }
   }
+  // 文件走同一条并发上限；路径已由 Rust 侧解析并校验，这里只做形状检查。
+  async function sendFile(target, localPath, name, caption) {
+    if (activeSends >= limit) {
+      warn("outbound_limit");
+      throw new Error("outbound_limit");
+    }
+    activeSends++;
+    try {
+      return await bot.sendFile(target, { localPath },
+        { ...(name ? { fileName: name } : {}), ...(caption ? { content: caption } : {}) });
+    } finally { activeSends--; }
+  }
   const stop = () => {
     if (closed) return;
     closed = true;
@@ -213,6 +225,43 @@ export function createBridge(bot, emit, limit = 128) {
       if (item.finished) pending.delete(frame.id);
     }
   }
+  // 文件走主动投递：目标由 Rust 从已确认的回执推出，路径由宿主解析好，这里只校验形状。
+  // 失败不重试，回执如实交回宿主账本。
+  async function pushFile(frame) {
+    if (!validMessageId(frame.id) || !validId(frame.target_id) ||
+        !["c2c", "group"].includes(frame.scope)) {
+      warn("invalid_command");
+      if (validMessageId(frame.id)) send({ type: "delivery", id: frame.id, push: true, file: true, ok: false });
+      return;
+    }
+    const key = `file:${frame.id}`;
+    if (pushing.has(key)) { warn("duplicate_reply"); return; }
+    const path = frame.path;
+    const name = frame.name;
+    const caption = frame.caption ?? "";
+    if (typeof path !== "string" || !path || path.length > 4096 || /[\p{Cc}]/u.test(path) ||
+        (name !== undefined && name !== null && (typeof name !== "string" || !name || name.length > 255 ||
+          /[\p{Cc}\/]/u.test(name))) ||
+        (caption !== "" && (!validText(caption) || Buffer.byteLength(caption) > 1024))) {
+      warn("invalid_file");
+      send({ type: "delivery", id: frame.id, push: true, file: true, ok: false });
+      return;
+    }
+    pushing.add(key);
+    try {
+      const result = await sendFile({ scope: frame.scope, targetId: frame.target_id }, path, name, caption);
+      const id = result?.message?.id ?? result?.upload?.id;
+      send({ type: "delivery", id: frame.id, push: true, file: true, ok: true,
+        ...(validMessageId(id) ? { message_id: id } : {}) });
+    } catch (err) {
+      const diagnostic = {};
+      if (Number.isInteger(err?.statusCode)) diagnostic.http_status = err.statusCode;
+      if (Number.isInteger(err?.code)) diagnostic.biz_code = err.code;
+      send({ type: "delivery", id: frame.id, push: true, file: true, ok: false, ...diagnostic });
+    } finally {
+      pushing.delete(key);
+    }
+  }
   // A proactive private message: no msg_id, so the platform applies its own quota and
   // the user's opt-out; refusals come back as a failed receipt and are never retried here.
   async function push(frame) {
@@ -248,6 +297,7 @@ export function createBridge(bot, emit, limit = 128) {
       if (frame.type === "stop") { stop(); return; }
       if (closed) return;
       if (frame.type === "push") { await push(frame); return; }
+      if (frame.type === "file") { await pushFile(frame); return; }
       const item = pending.get(frame.id);
       if (!item) { warn("unknown_reply"); return; }
       if (frame.type === "finish") {
