@@ -34,6 +34,17 @@ function userText(msg, appId) {
   }
   return text;
 }
+function rawMessage(msg) {
+  const source = msg.raw && typeof msg.raw === "object" ? msg.raw : msg;
+  const keep = ["id", "content", "timestamp", "message_type", "attachments", "msg_elements",
+    "message_scene", "mentions"];
+  const out = {};
+  for (const key of keep) if (source[key] !== undefined) out[key] = source[key];
+  let text;
+  try { text = JSON.stringify(out); } catch { return null; }
+  if (Buffer.byteLength(text) > 24576) return { truncated: true, bytes: Buffer.byteLength(text) };
+  return out;
+}
 // Only the envelope's own attachments belong to this message. msg_elements can
 // contain quoted images; never treat those as freshly uploaded pictures.
 const FILE_TYPES = new Set(["text/plain", "application/pdf", "application/zip",
@@ -188,6 +199,9 @@ export function createBridge(bot, emit, limit = 128) {
       target_id: target.targetId, user_id: msg.senderId,
       text, ...(attachments.length ? { attachments } : {}),
       ...(quoted ? { quoted } : {}), ...(validName ? { sender_name: senderName } : {}) };
+    // 调试用的原始事件，和规范化帧分开；只保留有界的结构字段，不进回执。
+    const raw = rawMessage(msg);
+    if (raw) frame.raw = raw;
     // JSON escaping can expand a legal body beyond the Rust wire-frame limit.
     if (Buffer.byteLength(JSON.stringify({ version: 1, ...frame })) > MAX_FRAME) {
       warn("frame_limit"); return;

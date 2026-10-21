@@ -1499,6 +1499,11 @@ async fn run_qqbot_composed(
         bootstrap
             .tools
             .push(Arc::new(crate::qq_files::ReadAttachmentTool::new(inbox)));
+        let raw = Arc::new(crate::qq_files::RawInbox::new());
+        plugin = plugin.with_raw_observer(raw.clone());
+        bootstrap
+            .tools
+            .push(Arc::new(crate::qq_files::ReadRawMessageTool::new(raw)));
         // 参考资料启动时一次读入内存，之后只读；目录无效或超过上限时拒绝启动，不静默缺项。
         if !options.references.is_empty() {
             let specs: Vec<_> = options

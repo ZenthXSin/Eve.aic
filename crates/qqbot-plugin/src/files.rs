@@ -6,6 +6,18 @@
 use eve_plugin_api::PluginResult;
 use eve_session_api::SessionKey;
 
+/// 当前会话最近一条消息的原始平台事件，仅供调试；不进回执、不当成附件事实。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QqRawMessage {
+    pub bytes: usize,
+    pub truncated: bool,
+    pub json: String,
+}
+
+pub trait QqRawMessageObserver: Send + Sync {
+    fn record(&self, session: &SessionKey, raw: QqRawMessage);
+}
+
 /// 文件名上限（UTF-8 字节）。
 pub const QQ_FILE_NAME_MAX_BYTES: usize = 255;
 /// 说明文字上限，与一次进展消息同量级。

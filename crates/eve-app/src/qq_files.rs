@@ -11,7 +11,7 @@ use eve_llm_api::{
 use eve_plugin_api::PluginError;
 use eve_qqbot_plugin::{
     ImageAttachment, Message, QQ_FILE_CAPTION_MAX_BYTES, QQ_FILE_NAME_MAX_BYTES, QqFileDelivery,
-    QqFileMessage, QqFileResult, valid_caption, valid_name,
+    QqFileMessage, QqFileResult, QqRawMessage, QqRawMessageObserver, valid_caption, valid_name,
 };
 use eve_session_api::SessionKey;
 use serde::{Deserialize, Serialize};
@@ -256,6 +256,78 @@ impl QqFileDelivery for Outbox {
         };
         drop(inner);
         self.save().map_err(|_| state("文件队列保存失败"))
+    }
+}
+
+/// 当前会话最近一条消息的原始平台事件，只留一条，供调试工具读取。
+pub(crate) struct RawInbox {
+    inner: Mutex<Option<(String, QqRawMessage)>>,
+}
+
+impl RawInbox {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    fn current(&self, session_id: &str) -> Result<QqRawMessage, ToolExecutionError> {
+        let inner = self.inner.lock().map_err(|_| failed("原始消息锁不可用"))?;
+        inner
+            .as_ref()
+            .filter(|(session, _)| session == session_id)
+            .map(|(_, raw)| raw.clone())
+            .ok_or_else(|| failed("这个会话还没有收到可查看的原始消息"))
+    }
+}
+
+impl QqRawMessageObserver for RawInbox {
+    fn record(&self, session: &SessionKey, raw: QqRawMessage) {
+        if let Ok(mut inner) = self.inner.lock() {
+            *inner = Some((session.session_id.clone(), raw));
+        }
+    }
+}
+
+pub(crate) struct ReadRawMessageTool {
+    inbox: std::sync::Arc<RawInbox>,
+}
+
+impl ReadRawMessageTool {
+    pub(crate) fn new(inbox: std::sync::Arc<RawInbox>) -> Self {
+        Self { inbox }
+    }
+}
+
+impl Tool for ReadRawMessageTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "read_raw_message".into(),
+            description: "读取当前会话最近一条 QQ 消息的原始平台事件，用于核对附件和引用实际长什么样。只读，不下载、不发送。返回有界 JSON；过大时只给字节数和截断标记。".into(),
+            argument_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+            required_permissions: vec![],
+            concurrency: Some(ToolConcurrency::Serial { scope: "eve.qqbot.raw".into() }),
+        }
+    }
+
+    fn validate_arguments(&self, value: &Value) -> Result<(), ToolValidationError> {
+        if value.as_object().is_some_and(|object| object.is_empty()) {
+            Ok(())
+        } else {
+            Err(ToolValidationError {
+                message: "这个工具不接受参数".into(),
+            })
+        }
+    }
+
+    fn execute(&self, _call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
+        Box::pin(async move {
+            let scope = context
+                .scope()
+                .ok_or_else(|| failed("只有带用户身份的对话里才能读取原始消息"))?;
+            let raw = self.inbox.current(&scope.session_id)?;
+            Ok(json!({"bytes": raw.bytes, "truncated": raw.truncated, "raw": raw.json}))
+        })
     }
 }
 
