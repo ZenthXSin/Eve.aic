@@ -112,6 +112,9 @@ class InterestAcceptance(unittest.TestCase):
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(encoded)))
                 self.end_headers()
+                if status == 200 and hasattr(outer, "write_provider_response"):
+                    outer.write_provider_response(self, body, encoded)
+                    return
                 self.wfile.write(encoded)
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

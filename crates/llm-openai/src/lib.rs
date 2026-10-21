@@ -9,6 +9,7 @@ use reqwest::{Client, Url, header::HeaderValue, redirect::Policy};
 use std::time::Duration;
 
 pub use embeddings::OpenAiEmbeddings;
+pub use timeouts::StreamTimeoutPolicy;
 
 mod chat;
 mod chat_stream;
@@ -16,6 +17,7 @@ mod embeddings;
 mod retry;
 mod stream;
 mod strict_json;
+mod timeouts;
 mod timing;
 mod wire;
 
@@ -96,6 +98,7 @@ pub struct OpenAiProvider {
     timing_diagnostics: bool,
     transient_retries: bool,
     streamed_completions: bool,
+    stream_timeouts: Option<StreamTimeoutPolicy>,
 }
 
 impl OpenAiProvider {
@@ -148,8 +151,7 @@ impl OpenAiProvider {
         authorization.set_sensitive(true);
         let mut builder = Client::builder()
             .redirect(Policy::none())
-            .retry(reqwest::retry::never())
-            .timeout(config.request_timeout);
+            .retry(reqwest::retry::never());
         // 本地 HTTP 验收不经代理，生产 HTTPS 沿用 reqwest 的代理配置。
         if loopback {
             builder = builder.no_proxy();
@@ -165,6 +167,7 @@ impl OpenAiProvider {
             timing_diagnostics: false,
             transient_retries: false,
             streamed_completions: false,
+            stream_timeouts: None,
         })
     }
 
@@ -186,6 +189,25 @@ impl OpenAiProvider {
     pub fn with_streamed_completions(mut self) -> Self {
         self.streamed_completions = true;
         self
+    }
+
+    /// 显式装配流式分阶段期限；非流式请求仍沿用 OpenAiConfig.request_timeout。
+    pub fn with_stream_timeout_policy(
+        mut self,
+        policy: StreamTimeoutPolicy,
+    ) -> Result<Self, LlmError> {
+        policy.validate()?;
+        self.stream_timeouts = Some(policy);
+        Ok(self)
+    }
+
+    fn total_timeout(&self, streaming: bool) -> Duration {
+        if streaming {
+            self.stream_timeouts.map(|p| p.total)
+        } else {
+            None
+        }
+        .unwrap_or(self.config.request_timeout)
     }
 
     async fn request(
@@ -235,7 +257,11 @@ impl OpenAiProvider {
         if self.transient_retries && complete {
             return self.request_retried(&body, sink).await;
         }
-        self.request_once(&body, sink, &mut None).await
+        let total = self.total_timeout(sink.is_some());
+        let started = std::time::Instant::now();
+        tokio::time::timeout(total, self.request_once(&body, sink, &mut None))
+            .await
+            .map_err(|_| timeouts::expired("total", total, started, None))?
     }
 
     async fn request_once(
@@ -245,14 +271,27 @@ impl OpenAiProvider {
         retry_after: &mut Option<Duration>,
     ) -> Result<ModelResponse, LlmError> {
         let mut timing = timing::RequestTiming::start(self.timing_diagnostics);
-        let mut response = self
+        let started = std::time::Instant::now();
+        let policy = sink.and(self.stream_timeouts);
+        let first_deadline = tokio::time::Instant::now()
+            + policy.map_or(self.config.request_timeout, |p| p.first_response);
+        let sending = self
             .client
             .post(self.endpoint.clone())
             .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
             .json(body)
-            .send()
-            .await
-            .map_err(transport_error)?;
+            .timeout(self.total_timeout(sink.is_some()))
+            .send();
+        let mut response = if let Some(policy) = policy {
+            tokio::time::timeout_at(first_deadline, sending)
+                .await
+                .map_err(|_| {
+                    timeouts::expired("first_response", policy.first_response, started, Some(0))
+                })?
+        } else {
+            sending.await
+        }
+        .map_err(transport_error)?;
         let status = response.status();
         if let Some(timing) = &timing {
             timing.record("headers", Some(status.as_u16()));
@@ -298,7 +337,42 @@ impl OpenAiProvider {
             let mut state = stream::ResponseStream::default();
             let mut chat_state = chat_stream::ChatStream::default();
             let mut received = 0;
-            while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+            let mut chunk_deadline = first_deadline;
+            loop {
+                let next = if let Some(policy) = policy {
+                    tokio::time::timeout_at(chunk_deadline, response.chunk())
+                        .await
+                        .map_err(|_| {
+                            let (phase, limit) = if received == 0 {
+                                ("first_response", policy.first_response)
+                            } else {
+                                ("stream_idle", policy.idle)
+                            };
+                            timeouts::expired(phase, limit, started, Some(received))
+                        })?
+                } else {
+                    response.chunk().await
+                };
+                let Some(chunk) = next.map_err(|error| {
+                    if error.is_timeout() {
+                        timeouts::expired(
+                            "total",
+                            self.total_timeout(true),
+                            started,
+                            Some(received),
+                        )
+                    } else {
+                        transport_error(error)
+                    }
+                })?
+                else {
+                    break;
+                };
+                if !chunk.is_empty()
+                    && let Some(policy) = policy
+                {
+                    chunk_deadline = tokio::time::Instant::now() + policy.idle;
+                }
                 if received == 0
                     && !chunk.is_empty()
                     && let Some(timing) = &timing
@@ -381,14 +455,7 @@ impl LlmProvider for OpenAiProvider {
         request: ModelRequest,
         sink: &'a dyn ModelTextSink,
     ) -> LlmFuture<'a, ModelResponse> {
-        Box::pin(async move {
-            tokio::time::timeout(
-                self.config.request_timeout,
-                self.request(request, Some(sink), false),
-            )
-            .await
-            .map_err(|_| LlmError::ProviderTimeout)?
-        })
+        Box::pin(self.request(request, Some(sink), false))
     }
 }
 
