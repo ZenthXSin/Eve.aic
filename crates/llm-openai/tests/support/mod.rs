@@ -15,6 +15,8 @@ pub struct Reply {
     pub chunked: bool,
     pub body_delay: Duration,
     pub declared_length: Option<usize>,
+    pub header_delay: Duration,
+    pub delayed_chunks: Vec<(Duration, Vec<u8>)>,
 }
 impl Reply {
     pub fn json(value: Value) -> Self {
@@ -25,6 +27,8 @@ impl Reply {
             chunked: false,
             body_delay: Duration::ZERO,
             declared_length: None,
+            header_delay: Duration::ZERO,
+            delayed_chunks: vec![],
         }
     }
 }
@@ -111,17 +115,22 @@ impl Server {
                         headers.push_str(&format!("{key}: {value}\r\n"));
                     }
                     headers.push_str("\r\n");
+                    if !reply.header_delay.is_zero() { tokio::time::sleep(reply.header_delay).await; }
                     if socket.write_all(headers.as_bytes()).await.is_err() {
                         return;
                     }
                     tokio::time::sleep(reply.body_delay).await;
                     if reply.chunked {
-                        for chunk in reply.body.chunks(7) {
+                        let chunks = if reply.delayed_chunks.is_empty() {
+                            reply.body.chunks(7).map(|c| (Duration::ZERO, c.to_vec())).collect()
+                        } else { reply.delayed_chunks };
+                        for (delay, chunk) in chunks {
+                            if !delay.is_zero() { tokio::time::sleep(delay).await; }
                             let framed = format!("{:x}\r\n", chunk.len());
                             if socket.write_all(framed.as_bytes()).await.is_err() {
                                 return;
                             }
-                            if socket.write_all(chunk).await.is_err() {
+                            if socket.write_all(&chunk).await.is_err() {
                                 return;
                             }
                             if socket.write_all(b"\r\n").await.is_err() {
