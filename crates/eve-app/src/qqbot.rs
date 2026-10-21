@@ -1503,22 +1503,24 @@ async fn run_qqbot_composed(
             .push(Arc::new(crate::qq_files::ReadAttachmentTool::new(
                 inbox.clone(),
             )));
-        let vision_settings = registry
+        if let Some(entry) = registry
             .get(&ServiceId::new(CONFIG_SERVICE_ID)?)
             .map_err(|error| format!("识图配置服务不可用：{error}"))?
-            .ok_or("识图配置服务缺失")?
-            .value
-            .downcast::<ConfigServiceHandle>()
-            .map_err(|_| "识图配置服务类型错误")?
-            .0
-            .clone();
-        bootstrap
-            .tools
-            .push(Arc::new(crate::qq_files::DescribeImageTool::new(
-                inbox,
-                vision_settings,
-                bootstrap.api_key.clone(),
-            )));
+        {
+            let vision_settings = entry
+                .value
+                .downcast::<ConfigServiceHandle>()
+                .map_err(|_| "识图配置服务类型错误")?
+                .0
+                .clone();
+            bootstrap
+                .tools
+                .push(Arc::new(crate::qq_files::DescribeImageTool::new(
+                    inbox,
+                    vision_settings,
+                    bootstrap.api_key.clone(),
+                )));
+        }
         let raw = Arc::new(crate::qq_files::RawInbox::new());
         plugin = plugin.with_raw_observer(raw.clone());
         bootstrap
