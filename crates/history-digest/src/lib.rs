@@ -14,7 +14,11 @@ use eve_llm_api::{
 };
 use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 /// 一次摘要至多的要点数。
 pub const MAX_POINTS: usize = 12;
@@ -126,6 +130,9 @@ pub struct DigestTurn {
 pub struct DigestTool {
     pub name: String,
     pub result: Option<String>,
+    /// 主动压缩保留参数中的路径、标识等关键执行事实；仅为数据，不重新执行。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 /// 一次增量摘要请求：上次摘要（覆盖前 `previous_turns` 轮）加上紧随其后的若干新轮次。
@@ -174,6 +181,7 @@ pub struct HistoryDigestService {
     store: DigestStore,
     policy: Box<dyn DigestPolicy>,
     pending: Mutex<BTreeMap<(String, String), PendingDigest>>,
+    compactor: OnceLock<Arc<dyn HistoryDigester>>,
 }
 
 impl HistoryDigestService {
@@ -182,11 +190,19 @@ impl HistoryDigestService {
             store,
             policy,
             pending: Mutex::new(BTreeMap::new()),
+            compactor: OnceLock::new(),
         }
     }
 
     pub fn store(&self) -> &DigestStore {
         &self.store
+    }
+
+    /// 组合层在模型配置就绪后装配；主动压缩与后台摘要共用已验证的模型实现。
+    pub fn install_compactor(&self, digester: Arc<dyn HistoryDigester>) -> Result<(), LlmError> {
+        self.compactor
+            .set(digester)
+            .map_err(|_| LlmError::Configuration("主动压缩器已经装配".into()))
     }
 
     /// 取出一个待生成作用域；没有时为 None。
@@ -231,6 +247,104 @@ impl HistoryDigestService {
 }
 
 impl HistoryDigests for HistoryDigestService {
+    fn cached(
+        &self,
+        scope: Option<&ContextScope>,
+        history: &[ChatMessage],
+    ) -> Result<Option<HistoryDigest>, LlmError> {
+        if self.policy.options()?.is_none() {
+            return Ok(None);
+        }
+        scope
+            .map(|scope| {
+                self.best(scope, history)
+                    .map(|best| {
+                        best.map(|version| HistoryDigest {
+                            covered_turns: version.covered_turns,
+                            text: render(&version.points),
+                        })
+                    })
+                    .map_err(|error| LlmError::Context(error.to_string()))
+            })
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn compact<'a>(
+        &'a self,
+        scope: Option<&'a ContextScope>,
+        messages: &'a [ChatMessage],
+    ) -> LlmFuture<'a, Option<HistoryDigest>> {
+        Box::pin(async move {
+            let Some(mut options) = self.policy.options()? else {
+                return Ok(None);
+            };
+            options.min_uncovered_turns = 1;
+            let digester = self
+                .compactor
+                .get()
+                .ok_or_else(|| LlmError::Configuration("主动压缩模型尚未装配".into()))?;
+            let scope = scope.cloned();
+            let mut pending = PendingDigest {
+                scope: scope.clone().unwrap_or(ContextScope {
+                    session_id: "ephemeral-compaction".into(),
+                    user_id: "ephemeral-compaction".into(),
+                }),
+                omitted: messages.to_vec(),
+                base: match &scope {
+                    Some(scope) => self
+                        .best(scope, messages)
+                        .map_err(|e| LlmError::Context(e.to_string()))?,
+                    None => None,
+                },
+            };
+            let total = history_turns(messages).len();
+            while pending.base.as_ref().map_or(0, |v| v.covered_turns) < total {
+                let request = plan_active(&pending, options)
+                    .ok_or_else(|| LlmError::Context("上下文压缩没有向前推进".into()))?;
+                let covered = request.covered_turns();
+                let points = digester
+                    .digest(request)
+                    .await
+                    .map_err(|error| match error {
+                        LlmError::ProviderTimeout => LlmError::Context(
+                            "上下文压缩模型响应超时；已保存的摘要进度保留，不是主对话模型请求超时"
+                                .into(),
+                        ),
+                        error if error.provider_failure().is_some() => LlmError::Context(
+                            "上下文压缩模型请求失败；已保存的摘要进度保留，后续对话请求未发出"
+                                .into(),
+                        ),
+                        error => error,
+                    })?;
+                validate_points(&points, covered).map_err(|e| LlmError::Protocol(e.to_string()))?;
+                let version = DigestVersion {
+                    covered_turns: covered,
+                    fingerprint: fingerprint(messages, covered)
+                        .ok_or_else(|| LlmError::Context("上下文压缩原文指纹无法计算".into()))?,
+                    points,
+                    generator: digester.version().into(),
+                    // 同毫秒完成的多批摘要也必须递增，否则保留两版时可能淘汰刚生成的一版。
+                    created_at_ms: store::now_ms().max(
+                        pending
+                            .base
+                            .as_ref()
+                            .map_or(1, |v| v.created_at_ms.saturating_add(1)),
+                    ),
+                };
+                if let Some(scope) = &scope {
+                    self.store
+                        .put(scope, version.clone())
+                        .map_err(|e| LlmError::Context(e.to_string()))?;
+                }
+                pending.base = Some(version);
+            }
+            Ok(pending.base.map(|v| HistoryDigest {
+                covered_turns: v.covered_turns,
+                text: render(&v.points),
+            }))
+        })
+    }
     fn digest(
         &self,
         scope: Option<&ContextScope>,
@@ -274,6 +388,22 @@ fn clip(text: &str, limit: usize) -> (String, bool) {
 
 /// 把一轮原文整理成摘要器输入。
 pub fn digest_turn(number: usize, messages: &[ChatMessage]) -> DigestTurn {
+    digest_turn_limits(
+        number,
+        messages,
+        MAX_TURN_TEXT_CHARS,
+        MAX_TOOL_RESULT_CHARS,
+        false,
+    )
+}
+
+fn digest_turn_limits(
+    number: usize,
+    messages: &[ChatMessage],
+    text_limit: usize,
+    tool_limit: usize,
+    arguments: bool,
+) -> DigestTurn {
     let mut truncated = false;
     let mut text = |value: &str, limit| {
         let (value, cut) = clip(value, limit);
@@ -290,18 +420,17 @@ pub fn digest_turn(number: usize, messages: &[ChatMessage]) -> DigestTurn {
     let mut names = BTreeMap::new();
     for message in messages {
         match message.role {
-            ChatRole::User => {
-                turn.user = text(message.text.as_deref().unwrap_or(""), MAX_TURN_TEXT_CHARS)
-            }
+            ChatRole::User => turn.user = text(message.text.as_deref().unwrap_or(""), text_limit),
             ChatRole::Assistant => {
                 if let Some(value) = message.text.as_deref().filter(|v| !v.trim().is_empty()) {
-                    turn.assistant.push(text(value, MAX_TURN_TEXT_CHARS));
+                    turn.assistant.push(text(value, text_limit));
                 }
                 for call in &message.tool_calls {
                     names.insert(call.id.clone(), turn.tools.len());
                     turn.tools.push(DigestTool {
                         name: call.name.clone(),
                         result: None,
+                        arguments: arguments.then(|| text(&call.arguments.to_string(), tool_limit)),
                     });
                 }
             }
@@ -309,7 +438,7 @@ pub fn digest_turn(number: usize, messages: &[ChatMessage]) -> DigestTurn {
                 for result in &message.tool_results {
                     if let Some(&index) = names.get(&result.call_id) {
                         let output = serde_json::to_string(&result.output).unwrap_or_default();
-                        turn.tools[index].result = Some(text(&output, MAX_TOOL_RESULT_CHARS));
+                        turn.tools[index].result = Some(text(&output, tool_limit));
                     }
                 }
             }
@@ -322,6 +451,18 @@ pub fn digest_turn(number: usize, messages: &[ChatMessage]) -> DigestTurn {
 
 /// 根据待生成项构造下一次增量请求；没有可摘要的新轮次时为 None。
 pub fn plan(pending: &PendingDigest, options: DigestOptions) -> Option<DigestRequest> {
+    plan_inner(pending, options, false)
+}
+
+fn plan_active(pending: &PendingDigest, options: DigestOptions) -> Option<DigestRequest> {
+    plan_inner(pending, options, true)
+}
+
+fn plan_inner(
+    pending: &PendingDigest,
+    options: DigestOptions,
+    active: bool,
+) -> Option<DigestRequest> {
     let groups = history_turns(&pending.omitted);
     let (previous_turns, previous) = match &pending.base {
         Some(base) => (base.covered_turns, base.points.clone()),
@@ -334,7 +475,23 @@ pub fn plan(pending: &PendingDigest, options: DigestOptions) -> Option<DigestReq
     };
     let mut bytes = 0usize;
     for (index, messages) in groups.iter().enumerate().skip(previous_turns) {
-        let turn = digest_turn(index + 1, messages);
+        let turn = if active {
+            let mut text_limit = 8192;
+            let mut tool_limit = 2048;
+            loop {
+                let turn = digest_turn_limits(index + 1, messages, text_limit, tool_limit, true);
+                if serde_json::to_vec(&turn).ok()?.len() <= options.max_input_bytes {
+                    break turn;
+                }
+                if text_limit <= 128 && tool_limit <= 64 {
+                    return None;
+                }
+                text_limit = (text_limit / 2).max(128);
+                tool_limit = (tool_limit / 2).max(64);
+            }
+        } else {
+            digest_turn(index + 1, messages)
+        };
         let size = serde_json::to_vec(&turn).map_or(usize::MAX, |encoded| encoded.len());
         if !request.turns.is_empty() && size > options.max_input_bytes.saturating_sub(bytes) {
             break;

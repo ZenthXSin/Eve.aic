@@ -12,7 +12,8 @@ pub use commands::{QqCommandHandler, QqCommandInput};
 pub use conversations::{QqConversationIdentity, QqConversations, QqWakeupLease};
 pub use files::{
     QQ_FILE_CAPTION_MAX_BYTES, QQ_FILE_NAME_MAX_BYTES, QQ_FILE_PATH_MAX_BYTES, QqFileDelivery,
-    QqFileMessage, QqFileResult, valid_caption, valid_name, valid_path,
+    QqFileMessage, QqFileResult, QqRawMessage, QqRawMessageObserver, valid_caption, valid_name,
+    valid_path,
 };
 pub use observer::{QqInteraction, QqInteractionObserver, QqInteractionSource};
 pub use outreach::{
@@ -117,6 +118,7 @@ pub struct QqBotPlugin {
     files: Option<Arc<dyn QqFileDelivery>>,
     file_poll: Option<Duration>,
     attachment_observer: Option<Arc<dyn QqAttachmentObserver>>,
+    raw_observer: Option<Arc<dyn QqRawMessageObserver>>,
     conversations: QqConversations,
     participant_observer: Option<Arc<dyn QqParticipantObserver>>,
     timing_diagnostics: bool,
@@ -150,6 +152,7 @@ impl QqBotPlugin {
             files: None,
             file_poll: None,
             attachment_observer: None,
+            raw_observer: None,
             conversations: QqConversations::default(),
             participant_observer: None,
             timing_diagnostics: false,
@@ -258,6 +261,12 @@ impl QqBotPlugin {
         self
     }
 
+    /// 收到消息时把原始平台事件交给宿主，仅供调试；未接线时丢弃。
+    pub fn with_raw_observer(mut self, observer: Arc<dyn QqRawMessageObserver>) -> Self {
+        self.raw_observer = Some(observer);
+        self
+    }
+
     /// 添加宿主命令扩展；默认不安装，原有消息控制行为不变。
     pub fn with_command_handler(mut self, handler: Arc<dyn QqCommandHandler>) -> Self {
         self.command_handler = Some(handler);
@@ -344,6 +353,7 @@ impl Plugin for QqBotPlugin {
             let files = self.files.clone();
             let file_poll = self.file_poll;
             let attachment_observer = self.attachment_observer.clone();
+            let raw_observer = self.raw_observer.clone();
             let conversations = self.conversations.clone();
             let participant_observer = self.participant_observer.clone();
             let timing_diagnostics = self.timing_diagnostics;
@@ -365,6 +375,7 @@ impl Plugin for QqBotPlugin {
                     let outreach = outreach.clone();
                     let files = files.clone();
                     let attachment_observer = attachment_observer.clone();
+                    let raw_observer = raw_observer.clone();
                     let conversations = conversations.clone();
                     let participant_observer = participant_observer.clone();
                     let status = status.clone();
@@ -389,6 +400,7 @@ impl Plugin for QqBotPlugin {
                                 files,
                                 file_poll,
                                 attachment_observer,
+                                raw_observer,
                                 conversations,
                                 participant_observer,
                                 timing_diagnostics,

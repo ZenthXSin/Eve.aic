@@ -439,6 +439,7 @@ pub struct LlmHost {
     history_resolver: Option<Arc<dyn eve_llm_api::HistoryWindowResolver>>,
     history_digests: Option<Arc<dyn eve_llm_api::HistoryDigests>>,
     history_window: Option<eve_llm_api::HistoryWindow>,
+    compaction_policy: Option<eve_llm_api::ContextCompactionPolicy>,
     execution_budget: Option<Arc<eve_llm_api::TurnBudget>>,
     pub(crate) registry: Arc<dyn ServiceRegistry>,
     pub(crate) kernel: Kernel,
@@ -491,6 +492,7 @@ impl LlmHost {
             history_resolver: None,
             history_digests: None,
             history_window: None,
+            compaction_policy: None,
             execution_budget: None,
             registry,
             kernel,
@@ -565,6 +567,12 @@ impl LlmHost {
                 .map_err(|_| LlmError::Backend("历史窗口解析回调发生异常".into()))??;
             window.validate()?;
             host.history_window = Some(window);
+            let policy = catch_unwind(AssertUnwindSafe(|| resolver.compaction()))
+                .map_err(|_| LlmError::Backend("压缩配置回调发生异常".into()))??;
+            if let Some(policy) = policy {
+                policy.validate()?;
+            }
+            host.compaction_policy = policy;
         }
         host.history_resolver = None;
         if let Some(resolver) = &self.model_resolver {
@@ -667,7 +675,16 @@ impl LlmHost {
                 return Err(fail(error, diagnostics));
             }
         }
-        if let Some(window) = self.history_window
+        let mut compaction = match (self.compaction_policy, self.history_digests.as_deref()) {
+            (Some(_), Some(service)) => Some(crate::compaction::State::new(
+                &mut prepared.context,
+                service,
+                scope.as_ref(),
+            )),
+            _ => None,
+        };
+        if compaction.is_none()
+            && let Some(window) = self.history_window
             && let Err(error) = crate::history::apply(
                 &mut prepared.context,
                 window,
@@ -684,6 +701,9 @@ impl LlmHost {
             .map(|tool| tool.definition.clone())
             .collect::<Vec<_>>();
         let mut messages = build_messages(&self.config, &prepared.context, &input, &definitions);
+        if let Some(compaction) = &compaction {
+            compaction.inject(&mut messages);
+        }
         let mut seen_calls = HashSet::new();
         // 批次用尽后模型仍要调用工具时进入收尾：本批不执行，只再请求一次且不提供工具。
         let mut closing = false;
@@ -691,6 +711,20 @@ impl LlmHost {
         let continuation = eve_llm_api::TaskContinuation::default();
         let mut continuation_checks = 0;
         loop {
+            if let (Some(state), Some(policy), Some(service)) = (
+                compaction.as_mut(),
+                self.compaction_policy,
+                self.history_digests.as_deref(),
+            ) {
+                let result = tokio::select! { biased;
+                    _ = wait_closed(events) => Err(LlmError::Cancelled),
+                    _ = tokio::time::sleep(Duration::from_secs(600)) => Err(LlmError::Context("上下文压缩超过总期限；已经保存的摘要进度与工具回执保留，压缩后的下一次对话请求未发出".into())),
+                    result = contain_panic(state.compact(&mut messages, &definitions, policy, service, scope.as_ref())) => result,
+                };
+                if let Err(error) = result {
+                    return Err(fail(error, diagnostics));
+                }
+            }
             let response = match self
                 .complete(
                     ModelRequest {

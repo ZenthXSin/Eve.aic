@@ -15,8 +15,8 @@ mod history;
 pub use budget::{BudgetUsage, ExecutionLimits, TurnBudget};
 pub use failure::{ModelHealthObserver, ModelOutcome, ProviderFailure, ProviderFailureKind};
 pub use history::{
-    HistoryDigest, HistoryDigests, HistoryWindow, HistoryWindowResolver, MAX_HISTORY_DIGEST_BYTES,
-    history_turns,
+    ContextCompactionPolicy, HistoryDigest, HistoryDigests, HistoryWindow, HistoryWindowResolver,
+    MAX_HISTORY_DIGEST_BYTES, history_turns,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

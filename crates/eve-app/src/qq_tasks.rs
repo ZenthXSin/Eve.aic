@@ -246,7 +246,11 @@ impl Worker {
         tool_names: &[String],
         mut host_config: LlmHostConfig,
         resolver: Arc<dyn LlmModelResolver>,
+        digests: Arc<dyn eve_llm_api::HistoryDigests>,
     ) -> Result<Arc<Self>, AppError> {
+        let history = Arc::new(crate::history::ConfiguredHistory(config_service(
+            registry.as_ref(),
+        )?));
         kernel.register(Box::new(ContextPlugin(PluginManifest::new(
             CONTEXT_ID,
             env!("CARGO_PKG_VERSION"),
@@ -295,7 +299,9 @@ impl Worker {
             bindings,
             host_config,
         )?
-        .with_model_resolver(resolver);
+        .with_model_resolver(resolver)
+        .with_history_resolver(history)
+        .with_history_digests(digests);
         Ok(Arc::new(Self { host }))
     }
 

@@ -1499,6 +1499,11 @@ async fn run_qqbot_composed(
         bootstrap
             .tools
             .push(Arc::new(crate::qq_files::ReadAttachmentTool::new(inbox)));
+        let raw = Arc::new(crate::qq_files::RawInbox::new());
+        plugin = plugin.with_raw_observer(raw.clone());
+        bootstrap
+            .tools
+            .push(Arc::new(crate::qq_files::ReadRawMessageTool::new(raw)));
         // 参考资料启动时一次读入内存，之后只读；目录无效或超过上限时拒绝启动，不静默缺项。
         if !options.references.is_empty() {
             let specs: Vec<_> = options
@@ -1738,11 +1743,13 @@ async fn run_qqbot_composed(
         let _ = digest_policy
             .settings
             .set(qq_tasks::config_service(registry.as_ref())?);
+        let active_digester = Arc::new(eve_history_digest::ModelHistoryDigester::new(observed(
+            crate::qq_history_digest::MODEL_USE,
+        )?));
+        history_digests.install_compactor(active_digester.clone())?;
         digest_background = Some(crate::qq_history_digest::Background::start(
             history_digests.clone(),
-            Arc::new(eve_history_digest::ModelHistoryDigester::new(observed(
-                crate::qq_history_digest::MODEL_USE,
-            )?)),
+            active_digester,
             digest_policy.clone(),
         ));
         // 后台任务与子代理共用执行器：用途 task 单独记健康与输出上限，不计入自主运行预算。
@@ -1757,6 +1764,7 @@ async fn run_qqbot_composed(
                 &worker_tools,
                 worker_config.clone(),
                 observed(qq_tasks::MODEL_USE)?,
+                history_digests.clone(),
             )
             .await?;
             let _ = task_late.worker.set(worker);

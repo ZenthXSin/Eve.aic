@@ -153,6 +153,7 @@ pub(crate) struct Services {
     pub files: Option<Arc<dyn QqFileDelivery>>,
     pub file_poll: Option<Duration>,
     pub attachment_observer: Option<Arc<dyn QqAttachmentObserver>>,
+    pub raw_observer: Option<Arc<dyn crate::QqRawMessageObserver>>,
     pub conversations: crate::QqConversations,
     pub participant_observer: Option<Arc<dyn crate::QqParticipantObserver>>,
     pub timing_diagnostics: bool,
@@ -443,6 +444,10 @@ fn failed_turn_notice(report: &ControlReport) -> String {
         _ => None,
     };
     let reason = match error {
+        Some(LlmError::Context(reason)) if reason.starts_with("上下文压缩") => {
+            "上下文压缩未能完成，已保存的摘要进度与原始记录仍保留；压缩后的下一次对话请求未发出"
+                .into()
+        }
         Some(error) if error.provider_failure().is_some() => {
             failure_reason(error.provider_failure().expect("checked failure"))
         }
@@ -594,6 +599,7 @@ pub(crate) async fn run(
         files,
         file_poll,
         attachment_observer,
+        raw_observer,
         conversations,
         participant_observer,
         timing_diagnostics,
@@ -1377,6 +1383,7 @@ pub(crate) async fn run(
                                 }
                                 object.retain(|key, _| ["id", "scope", "target_id", "user_id", "text", "attachments", "quoted"].contains(&key.as_str()));
                             }
+                            let raw_debug = frame.get("raw").cloned().filter(|value| !value.is_null());
                             let Ok(mut message) = serde_json::from_value::<Message>(payload) else { warn(&ctx, "invalid_message"); continue; };
                             if !message.valid() { warn(&ctx, "invalid_route_or_text"); continue; }
                             // 绑定密钥只保留在命令处理器的临时内存；回执、观察器、训练与模型只能看到脱敏正文。
@@ -1401,6 +1408,13 @@ pub(crate) async fn run(
                                 timing(timing_diagnostics, "message_received", None);
                                 conversations.record_message(&config.app_id, &message)?;
                                 if let Some(observer) = &attachment_observer { observer.observe(&message.session_key(&config.app_id)?, &message); }
+                                if let (Some(observer), Some(raw)) = (&raw_observer, raw_debug.as_ref()) {
+                                    let text = raw.to_string();
+                                    let bounded = if text.len() > 24_576 { text[..24_576].to_string() } else { text.clone() };
+                                    observer.record(&message.session_key(&config.app_id)?, crate::QqRawMessage {
+                                        bytes: text.len(), truncated: text.len() > 24_576, json: bounded,
+                                    });
+                                }
                                 if private_text.is_none() && let Some(observer) = &participant_observer {
                                     let session = message.session_key(&config.app_id)?;
                                     if let Err(error) = observer.observe(&session, &message.conversation_key(&config.app_id)?, &message.text, sender_name.as_deref()) {
