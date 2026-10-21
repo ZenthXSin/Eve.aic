@@ -130,5 +130,6 @@ pub trait TriggerAdmin: Send + Sync {
     fn ready(&self, id: &str, evidence: Vec<String>) -> Result<()>;
     fn transition(&self, id: &str, from: Status, to: Status, result: Option<String>) -> Result<()>;
     fn cancel(&self, owner: &SessionKey, id: &str) -> Result<()>;
+    /// Pending → Failed 表示发送前被策略拒绝；不会伪造 Sending 或覆盖 Unknown。
     fn delivery(&self, id: &str, from: Delivery, to: Delivery) -> Result<()>;
 }

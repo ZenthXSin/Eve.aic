@@ -1547,13 +1547,23 @@ async fn run_qqbot_composed(
             .map(|b| serde_json::from_slice::<eve_developer_api::DeveloperConfig>(&b))
             .transpose()?
             .map_or_else(std::collections::BTreeSet::new, |c| c.operators);
-        let qq_admin =
-            crate::qq_admin::Admin::open(&options.state_directory, conversations.clone(), legacy)?;
+        let qq_admin = crate::qq_admin::Admin::open(
+            &options.state_directory,
+            conversations.clone(),
+            legacy,
+            registry.clone(),
+        )?;
         crate::developer::install_with_authorization(
             &mut bootstrap,
             &options.state_directory,
             Some(qq_admin.clone()),
         )?;
+        for tool in &mut bootstrap.tools {
+            *tool = Arc::new(crate::qq_access::GuardedTool {
+                inner: tool.clone(),
+                admin: qq_admin.clone(),
+            });
+        }
         bootstrap.context = Some(Arc::new(crate::qq_admin::AccessContext {
             inner: bootstrap.context.take().ok_or("对话上下文缺失")?,
             admin: qq_admin.clone(),
@@ -1767,6 +1777,7 @@ async fn run_qqbot_composed(
                 history_digests.clone(),
             )
             .await?;
+            worker.authorize_with(qq_admin.clone());
             let _ = task_late.worker.set(worker);
         }
         if let Some(tasks) = &tasks {
@@ -2136,25 +2147,28 @@ async fn run_qqbot_composed(
                 None => segment_commands::QqCommands::new(store, QQ_SEGMENT_POLICY),
             },
         );
-        let mut plugin = plugin.with_command_handler(Arc::new(CommandHandlers(vec![
-            qq_admin,
-            Arc::new(crate::qq_people::Commands(people)),
-            help_commands,
-            commands,
-            memory_commands,
-            learning_commands,
-            interest_commands,
-            research_commands,
-            practice_commands,
-            skill_commands,
-            tool_commands,
-            plan_commands,
-            semantic_commands,
-            budget_gate.commands(),
-            outreach_commands,
-            clarify_commands,
-            segment_commands,
-        ])));
+        let mut plugin = plugin.with_command_handler(Arc::new(crate::qq_access::GuardedCommands {
+            admin: qq_admin.clone(),
+            inner: Arc::new(CommandHandlers(vec![
+                qq_admin.clone(),
+                Arc::new(crate::qq_people::Commands(people)),
+                help_commands,
+                commands,
+                memory_commands,
+                learning_commands,
+                interest_commands,
+                research_commands,
+                practice_commands,
+                skill_commands,
+                tool_commands,
+                plan_commands,
+                semantic_commands,
+                budget_gate.commands(),
+                outreach_commands,
+                clarify_commands,
+                segment_commands,
+            ])),
+        }));
         // 邀请与请求澄清共用通道的投递点：邀请优先判断，投递结果按 ID 前缀交回各自账本。
         let mut sources: Vec<(&'static str, Arc<dyn QqOutreach>)> = Vec::new();
         // 提醒是用户自己要的，最先投递。
@@ -2215,7 +2229,10 @@ async fn run_qqbot_composed(
         if let Some(admin) = &trigger_admin {
             sources.push((
                 "wake-",
-                Arc::new(qq_triggers::ChannelAdapter(admin.clone())),
+                Arc::new(qq_triggers::ChannelAdapter(
+                    admin.clone(),
+                    trigger_observations.clone().ok_or("条件观察服务缺失")?,
+                )),
             ));
         }
         if !sources.is_empty() {
@@ -2230,7 +2247,13 @@ async fn run_qqbot_composed(
             } else {
                 Arc::new(qq_clarify::Combined(sources))
             };
-            plugin = plugin.with_outreach(adapter, push)?;
+            plugin = plugin.with_outreach(
+                Arc::new(crate::qq_access::GuardedOutreach {
+                    inner: adapter,
+                    admin: qq_admin.clone(),
+                }),
+                push,
+            )?;
         }
         if let Some(store) = segment_preferences {
             plugin = plugin.with_segment_preferences(store, QQ_SEGMENT_POLICY)?;

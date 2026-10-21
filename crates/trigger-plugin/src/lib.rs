@@ -223,7 +223,7 @@ impl TriggerAdmin for TriggerController {
             if t.delivery != Some(from)
                 || !matches!(
                     (from, to),
-                    (Delivery::Pending, Delivery::Sending)
+                    (Delivery::Pending, Delivery::Sending | Delivery::Failed)
                         | (
                             Delivery::Sending,
                             Delivery::Sent | Delivery::Failed | Delivery::Unknown

@@ -33,7 +33,7 @@ class AdminAcceptance(ExecutionAcceptance):
         self.assertNotIn("wrong-key", state)
         self.run_eve([*self.send(self.message("restart", "/admin", expected="当前平台身份：管理员。", **g2))])
 
-    def test_default_ordinary_access_and_sensitive_command_requires_binding(self):
+    def test_workspace_and_commands_require_binding(self):
         (self.work / "hello.txt").write_text("public source")
         def respond(body):
             results = self.results(body)
@@ -43,16 +43,16 @@ class AdminAcceptance(ExecutionAcceptance):
                     return calls(("read", "read_file", {"path": "hello.txt"}))
                 return calls(("cmd", "run_command", {"program": "echo", "args": ["admin-ok"]}))
             if self.text(body) == "普通读取":
-                self.assertEqual(results[-1]["content"], "public source")
-                return text_response("读取成功")
+                self.assertIn("授权", json.dumps(results[-1], ensure_ascii=False))
+                return text_response("读取需要管理员")
             if admin:
                 self.assertTrue(results[-1]["success"])
                 return text_response("管理员操作成功")
-            self.assertIn("操作者", json.dumps(results[-1], ensure_ascii=False))
+            self.assertIn("授权", json.dumps(results[-1], ensure_ascii=False))
             return text_response("需要管理员")
         self.callback = respond
         self.run_eve([
-            *self.send(self.message("read", "普通读取", expected="读取成功")),
+            *self.send(self.message("read", "普通读取", expected="读取需要管理员")),
             *self.send(self.message("denied", "执行命令", expected="需要管理员")),
             *self.send(self.message("bind", "/bind isolated-test-bind-key", contains="绑定成功")),
             *self.send(self.message("allowed", "执行命令", expected="管理员操作成功")),
