@@ -24,8 +24,6 @@ use std::{
 };
 
 pub(crate) const SEND_TOOL: &str = "send_file";
-/// 单个文件的大小上限；平台侧另有自己的限制，这里只挡住明显不该发的文件。
-pub(crate) const MAX_FILE_BYTES: u64 = 30 * 1024 * 1024;
 /// 等待队列与结果记录的上限，超过时拒绝新请求而不是悄悄丢弃。
 const MAX_ENTRIES: usize = 200;
 const FORMAT_VERSION: u32 = 1;
@@ -160,12 +158,6 @@ impl Outbox {
             .map_err(|_| failed("发件目录里没有这个文件；请先确认文件名"))?;
         if !metadata.file_type().is_file() {
             return Err(failed("只能发送普通文件，不能发送目录或链接"));
-        }
-        if metadata.len() > MAX_FILE_BYTES {
-            return Err(failed(format!(
-                "文件超过 {} 字节上限，不能发送",
-                MAX_FILE_BYTES
-            )));
         }
         let canonical = path
             .canonicalize()
@@ -341,7 +333,7 @@ impl Tool for SendFileTool {
             name: SEND_TOOL.into(),
             description: format!(
                 "把发件目录里的一个文件发到当前会话。只能报文件名（不能带路径），宿主在固定目录里查找；\
-                 文件不存在、不是普通文件或超过 {MAX_FILE_BYTES} 字节时失败。name 是文件名（至多 {QQ_FILE_NAME_MAX_BYTES} 字节），\
+                 文件不存在或不是普通文件时失败，文件大小不设上限。name 是文件名（至多 {QQ_FILE_NAME_MAX_BYTES} 字节），\
                  caption 是可选的简短说明（至多 {QQ_FILE_CAPTION_MAX_BYTES} 字节）。没有排上队就不要说已经发出：\
                  只有真的上传成功后，文件才会到用户那里。"
             ),
