@@ -105,8 +105,11 @@ class InterestAcceptance(unittest.TestCase):
                 if status == 200 and hasattr(outer, "provider_response"):
                     response = outer.provider_response(body, kind, response)
                 encoded = json.dumps(response).encode()
+                content_type = "application/json"
+                if status == 200 and hasattr(outer, "encode_provider_response"):
+                    content_type, encoded = outer.encode_provider_response(body, response)
                 self.send_response(status)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(encoded)))
                 self.end_headers()
                 self.wfile.write(encoded)

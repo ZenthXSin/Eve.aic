@@ -517,12 +517,22 @@ test("纯图片和图文保留本条图片引用，不抓取、不混入引用�
   assert.equal(f.sent[0].target.targetId, "user-1");
   f.handlers.get("message")({}, {...message, messageId: "text-image", content: "看看这张图", replyTarget: {...message.replyTarget, msgId: "text-image"}});
   assert.equal(f.frames.find(x => x.id === "text-image").text, "看看这张图");
-  f.handlers.get("message")({}, {...message, messageId: "quoted", content: "看这个", attachments: [],
+  f.handlers.get("message")({}, {...message, messageId: "quoted", content: "看这个", attachments: [], msgType: 103,
     msgElements: [{content: "被引用的正文", attachments: message.attachments}], replyTarget: {...message.replyTarget, msgId: "quoted"}});
   const quoted = f.frames.find(x => x.type === "message" && x.id === "quoted");
   assert.equal(quoted.text, "看这个");
   assert.equal(quoted.attachments, undefined);
   assert.deepEqual(quoted.quoted, { text: "被引用的正文", attachments: [{ content_type: "image/png", url: "https://media.example.invalid/image.png", filename: "untrusted-name" }] });
+  f.handlers.get("message")({}, {...message, messageId: "quoted-file", content: "看看", attachments: [], msgType: 103,
+    message_scene: {source: "default", ext: ["ref_msg_idx=quoted-index", "msg_idx=current-index"]},
+    msg_elements: [{content: "", message_type: 103, msg_idx: "quoted-index",
+      attachments: [{content_type: "file", filename: "termitemodDesktop.jar", url: "https://grouptalk.c2c.qq.com/file.jar"}]},
+      {content: "看看", msg_idx: "current-index"}],
+    replyTarget: {...message.replyTarget, msgId: "quoted-file"}});
+  const quotedFile = f.frames.find(x => x.type === "message" && x.id === "quoted-file");
+  assert.equal(quotedFile.text, "看看");
+  assert.equal(quotedFile.attachments, undefined);
+  assert.deepEqual(quotedFile.quoted, { attachments: [{ content_type: "file", url: "https://grouptalk.c2c.qq.com/file.jar", filename: "termitemodDesktop.jar" }] });
   f.handlers.get("message")({}, {...message, messageId: "unsafe", attachments: [{content_type:"image/png",url:"file:///private"}], replyTarget: {...message.replyTarget, msgId: "unsafe"}});
   assert.ok(!f.frames.some(x => x.type === "message" && x.id === "unsafe"));
 });

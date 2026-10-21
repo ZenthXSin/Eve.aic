@@ -48,7 +48,7 @@ function rawMessage(msg) {
 // Only the envelope's own attachments belong to this message. msg_elements can
 // contain quoted images; never treat those as freshly uploaded pictures.
 const FILE_TYPES = new Set(["text/plain", "application/pdf", "application/zip",
-  "application/json", "application/octet-stream"]);
+  "application/json", "application/octet-stream", "file"]);
 function allowedType(type) {
   return /^image\/[a-z0-9.+-]{1,64}$/i.test(type) || FILE_TYPES.has(type.toLowerCase());
 }
@@ -79,11 +79,11 @@ function ownAttachments(msg) {
     }
   };
   for (const raw of Array.isArray(msg.attachments) ? msg.attachments : []) push(raw);
-  const elements = msg.msg_elements ?? msg.msgElements;
-  const quoted = Number(msg.msgType) === 103;
+  const elements = field(msg, "msg_elements", "msgElements");
+  const quoted = Number(field(msg, "msg_type", "msgType")) === 103;
   if (!found.length && Array.isArray(elements)) {
     const own = elements.filter((element, index) => element && typeof element === "object" &&
-      element.msg_idx == null && !(quoted && index === 0));
+      field(element, "msg_idx", "msgIdx") == null && !(quoted && index === 0));
     const current = (typeof msg.content === "string" ? msg.content : "").trim();
     const textual = own.filter(element => typeof element.content === "string" && element.content.trim());
     const selected = textual.length
@@ -96,25 +96,36 @@ function ownAttachments(msg) {
   return found;
 }
 // 被引用消息的文字与附件单独抽出，不和本条新发的附件混在一起。
+function field(object, snake, camel) {
+  return object?.[snake] ?? object?.[camel];
+}
 function quotedMessage(msg) {
-  const elements = msg.msg_elements ?? msg.msgElements;
+  const elements = field(msg, "msg_elements", "msgElements");
   if (!Array.isArray(elements)) return null;
+  const scene = field(msg, "message_scene", "messageScene") ?? {};
+  const ext = field(scene, "ext", "ext");
+  const refs = new Set();
+  for (const item of Array.isArray(ext) ? ext : []) {
+    const match = typeof item === "string" && item.match(/^ref_msg_idx=(.+)$/);
+    if (match) refs.add(match[1]);
+  }
+  const quoted = Number(field(msg, "msg_type", "msgType")) === 103;
+  const selected = elements.filter((element, index) => element && typeof element === "object" &&
+    (refs.size ? refs.has(field(element, "msg_idx", "msgIdx")) : quoted && index === 0));
   const texts = [];
   const attachments = [];
-  for (const element of elements) {
-    if (!element || typeof element !== "object") continue;
-    if (typeof element.content === "string" && element.content.trim() &&
-        Buffer.byteLength(element.content) <= 1024 && !/[\p{Cc}]/u.test(element.content)) {
-      texts.push(element.content.trim());
-    }
+  for (const element of selected) {
+    const content = element.content;
+    if (typeof content === "string" && content.trim() &&
+        Buffer.byteLength(content) <= 1024 && !/[\p{Cc}]/u.test(content)) texts.push(content.trim());
     for (const raw of Array.isArray(element.attachments) ? element.attachments : []) {
       const item = attachment(raw);
       if (item && attachments.length < 4) attachments.push(item);
     }
   }
   if (!texts.length && !attachments.length) return null;
-  return { ...(texts.length ? { text: texts.join("\n").slice(0, 1024) } : {}),
-    ...(attachments.length ? { attachments } : {}) };
+  const text = texts.join("\n").slice(0, 1024);
+  return { ...(text ? { text } : {}), ...(attachments.length ? { attachments } : {}) };
 }
 export function optionsFromEnv(env) {
   const appId = env.QQBOT_APP_ID || "1904159860";

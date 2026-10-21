@@ -23,12 +23,13 @@ pub(crate) fn valid_message_id(v: &str) -> bool {
         && !v.chars().any(char::is_control)
 }
 /// 通道只保存用户本次发送的附件引用；不会下载，也不等同于视觉解析结果。
-const FILE_TYPES: [&str; 5] = [
+const FILE_TYPES: [&str; 6] = [
     "text/plain",
     "application/pdf",
     "application/zip",
     "application/json",
     "application/octet-stream",
+    "file",
 ];
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
