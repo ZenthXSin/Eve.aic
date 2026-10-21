@@ -82,6 +82,7 @@ fn spec(title: &str) -> TaskSpec {
         title: title.into(),
         instructions: format!("{title}：读取资料并给出结论"),
         max_steps: DEFAULT_STEPS,
+        context: None,
     }
 }
 
@@ -361,7 +362,7 @@ async fn corrupt_unknown_or_inconsistent_ledgers_refuse_to_open_and_keep_bytes()
     kernel.stop_all().await.unwrap();
     let good: Value = serde_json::from_slice(&world.raw().unwrap()).unwrap();
     let mutations: Vec<Mutation> = vec![
-        Box::new(|v| v["format_version"] = 2.into()),
+        Box::new(|v| v["format_version"] = 999.into()),
         Box::new(|v| v["tasks"][0]["id"] = "task-forged".into()),
         Box::new(|v| v["tasks"][0]["result"] = Value::Null),
         Box::new(|v| v["tasks"][0]["usage"]["tool_calls"] = 9_999.into()),
@@ -382,8 +383,8 @@ async fn corrupt_unknown_or_inconsistent_ledgers_refuse_to_open_and_keep_bytes()
     let text = String::from_utf8(duplicate.clone()).unwrap();
     duplicate = text
         .replacen(
-            "\"format_version\":1",
-            "\"format_version\":1,\"format_version\":1",
+            "\"format_version\":2",
+            "\"format_version\":2,\"format_version\":2",
             1,
         )
         .into_bytes();

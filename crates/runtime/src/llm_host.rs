@@ -834,7 +834,11 @@ impl LlmHost {
                     &mut diagnostics,
                     admission.clone(),
                     events,
-                    (scope.clone(), continuation.clone()),
+                    (
+                        scope.clone(),
+                        continuation.clone(),
+                        Arc::new(messages.clone()),
+                    ),
                 )
                 .await
             {
@@ -1032,6 +1036,7 @@ impl LlmHost {
         caller: (
             Option<eve_llm_api::ContextScope>,
             eve_llm_api::TaskContinuation,
+            Arc<Vec<ChatMessage>>,
         ),
     ) -> Result<Vec<ToolResult>, LlmError> {
         let by_name = prepared
@@ -1170,6 +1175,7 @@ impl LlmHost {
             let context = ToolExecutionContext::new()
                 .with_scope(caller.0.clone())
                 .with_continuation(caller.1.clone())
+                .with_conversation(caller.2.clone())
                 .with_turn_id(events.and_then(|event| event.turn_id));
             let cancellation = context.cancellation_handle();
             let call_id = prepared_call.call.id.clone();

@@ -630,6 +630,7 @@ pub struct ToolExecutionContext {
     scope: Option<ContextScope>,
     turn_id: Option<u64>,
     continuation: TaskContinuation,
+    conversation: Option<Arc<Vec<ChatMessage>>>,
 }
 /// 单轮内共享的任务状态。只影响本轮收尾，不授予权限、不持久化或重放工具。
 #[derive(Clone, Default)]
@@ -661,6 +662,7 @@ impl ToolExecutionContext {
             scope: None,
             turn_id: None,
             continuation: TaskContinuation::default(),
+            conversation: None,
         }
     }
     /// 绑定本轮的可信会话范围；由宿主依据通道身份设置，模型参数不能改变它。
@@ -686,6 +688,15 @@ impl ToolExecutionContext {
     }
     pub fn continuation(&self) -> &TaskContinuation {
         &self.continuation
+    }
+    /// 宿主冻结的当前模型上下文（已应用历史窗口/压缩，不包含正在执行的工具批次）。
+    /// 仅供显式委派时传递数据；不改变接收者的权限、工具或系统指令。
+    pub fn with_conversation(mut self, messages: Arc<Vec<ChatMessage>>) -> Self {
+        self.conversation = Some(messages);
+        self
+    }
+    pub fn conversation(&self) -> Option<&[ChatMessage]> {
+        self.conversation.as_deref().map(Vec::as_slice)
     }
     pub fn cancellation_handle(&self) -> ToolCancellation {
         ToolCancellation(self.cancelled.clone())

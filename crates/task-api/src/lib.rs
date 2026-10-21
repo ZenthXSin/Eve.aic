@@ -17,6 +17,8 @@ pub const MAX_CREATED_PER_OWNER_PER_DAY: usize = 20;
 pub const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_TITLE_BYTES: usize = 120;
 pub const MAX_INSTRUCTIONS_BYTES: usize = 8192;
+/// 单次显式委派的完整上下文快照上限；超限拒绝，绝不静默截断。
+pub const MAX_CONTEXT_BYTES: usize = 2 * 1024 * 1024;
 /// 保存的最终结果与失败原因上限；更长的在保存前截断并注明。
 pub const MAX_RESULT_BYTES: usize = 16_384;
 pub const MAX_FAILURE_BYTES: usize = 512;
@@ -50,6 +52,39 @@ pub struct TaskSpec {
     pub instructions: String,
     /// 步数预算：至多调用多少次工具。
     pub max_steps: u32,
+    /// 可信宿主捕获的会话快照；模型只能决定是否携带，不能指定正文或身份。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<DelegatedContext>,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegatedContext {
+    pub owner: TaskOwner,
+    /// ChatMessage 数组的 JSON；作为历史数据提供，不能提升为接收者系统指令。
+    pub messages_json: String,
+}
+impl fmt::Debug for DelegatedContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DelegatedContext")
+            .field("bytes", &self.messages_json.len())
+            .finish_non_exhaustive()
+    }
+}
+pub fn validate_delegated_context(context: &DelegatedContext) -> TaskResult<()> {
+    validate_owner(&context.owner)?;
+    if context.messages_json.is_empty() || context.messages_json.len() > MAX_CONTEXT_BYTES {
+        return Err(TaskError::InvalidInput);
+    }
+    let messages: serde_json::Value =
+        serde_json::from_str(&context.messages_json).map_err(|_| TaskError::InvalidInput)?;
+    if !messages
+        .as_array()
+        .is_some_and(|messages| !messages.is_empty())
+    {
+        return Err(TaskError::InvalidInput);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -369,6 +404,9 @@ pub fn validate_spec(spec: &TaskSpec) -> TaskResult<()> {
         return Err(TaskError::InvalidInput);
     }
     validate_text(&spec.instructions, MAX_INSTRUCTIONS_BYTES)?;
+    if let Some(context) = &spec.context {
+        validate_delegated_context(context)?;
+    }
     if !(MIN_STEPS..=MAX_STEPS).contains(&spec.max_steps) {
         return Err(TaskError::InvalidInput);
     }
@@ -451,6 +489,7 @@ mod tests {
             title: "整理资料".into(),
             instructions: "读取文件并总结".into(),
             max_steps: steps,
+            context: None,
         }
     }
 
