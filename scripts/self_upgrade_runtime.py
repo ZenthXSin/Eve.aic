@@ -15,6 +15,7 @@ import time
 
 VERSION = 1
 MAX_JSON = 1024 * 1024
+RECOVERY_STOP = 78
 
 def digest(path):
     if not path.is_file() or path.is_symlink() or path.stat().st_size > 2 * 1024 * 1024 * 1024:
@@ -216,10 +217,34 @@ def execution_command(command):
         elf = stream.read(4) == b'\x7fELF'
     return [loader, '--library-path', libraries, *command] if elf else command
 
+def command_resources(command):
+    paths = set()
+    for flag in ['--agent', '--bridge-script', '--practice-mindustry-server',
+                 '--practice-mindustry-json-rules', '--research-corpus']:
+        if flag not in command:
+            continue
+        path = Path(argument(command, flag))
+        if path.is_dir():
+            paths.update(p for p in path.rglob('*') if p.is_file())
+        else:
+            paths.add(path)
+        if flag == '--bridge-script':
+            paths.update(p for p in [path.parent / name for name in
+                         ['bridge-core.mjs', 'package.json', 'package-lock.json']] if p.exists())
+    return paths
+
+def snapshot_command(command, candidate_request=None):
+    return dict(format_version=1, command=command, binary_sha256=digest(Path(command[0])),
+                resources={str(p): digest(p) for p in sorted(command_resources(command))},
+                candidate_request=candidate_request)
+
 class Child:
     def __init__(self, command):
         self.ready = threading.Event()
         options = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {}
+        if sys.platform.startswith('linux'):
+            # 独立进程组但继承监督器会话；内层可关闭桥接，外层仍可收拢整场会话。
+            options['process_group'] = 0
         self.process = subprocess.Popen(execution_command(command), stdin=subprocess.DEVNULL, stderr=subprocess.PIPE, **options)
         def copy():
             for chunk in iter(lambda: self.process.stderr.readline(65536), b''):
@@ -230,10 +255,35 @@ class Child:
         self.thread = threading.Thread(target=copy, daemon=True)
         self.thread.start()
 
+    def close_group(self, timeout):
+        if not sys.platform.startswith('linux'):
+            return
+        def remaining():
+            result = []
+            for path in Path('/proc').glob('[0-9]*'):
+                try:
+                    fields = (path / 'stat').read_text().rsplit(') ', 1)[1].split()
+                    if fields[0] != 'Z' and int(fields[2]) == self.process.pid and int(fields[3]) == os.getsid(0):
+                        result.append(int(path.name))
+                except (OSError, ValueError, IndexError):
+                    pass
+            return result
+        for sig, grace in [(signal.SIGTERM, timeout), (signal.SIGKILL, 5)]:
+            if not remaining():
+                return
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.process.pid, sig)
+            deadline = time.monotonic() + grace
+            while remaining() and time.monotonic() < deadline:
+                time.sleep(0.05)
+        if remaining():
+            raise ValueError('runtime_process_group_not_closed')
+
     def stop(self, timeout):
         if self.process.poll() is None:
             self.process.send_signal(signal.CTRL_BREAK_EVENT if os.name == 'nt' else signal.SIGINT)
             self.process.wait(timeout=timeout)
+        self.close_group(timeout)
         self.thread.join(timeout=1)
         return self.process.returncode
 
@@ -270,17 +320,31 @@ class Supervisor:
                 self.archive_request(self.root / name, 'interrupted_no_replay')
                 self.status['result'] = 'interrupted_no_replay'
         pointer = self.root / 'active-command.json'
+        active_request = None
         if pointer.exists():
             stored = read_json(pointer)
             if set(stored) != {'command', 'binary_sha256', 'candidate_request'} or digest(Path(stored['command'][0])) != stored['binary_sha256']:
                 raise ValueError('active_command_changed')
             binary, resources, _ = validate_candidate(stored['candidate_request'], self.options.candidates)
+            if (self.root / 'quarantine' / (stored['candidate_request']['candidate_sha256'] + '.json')).exists():
+                raise ValueError('active_candidate_quarantined')
             if stored['command'][0] != str(binary) or argument(stored['command'], '--agent') != str(resources / 'AGENT.md'):
                 raise ValueError('active_command_resources_changed')
             if argument(stored['command'], '--state-dir') != argument(self.command, '--state-dir'):
                 raise ValueError('state_directory_changed')
             self.command = stored['command']
+            active_request = stored['candidate_request']
             self.status['active_sha256'] = stored['binary_sha256']
+        self.active_descriptor = snapshot_command(self.command, active_request)
+        recovery = self.root / 'recovery.json'
+        self.recovery = read_json(recovery) if recovery.exists() else dict(format_version=1, crashes=[], result=None)
+        if (set(self.recovery) != {'format_version', 'crashes', 'result'}
+                or self.recovery['format_version'] != 1 or not isinstance(self.recovery['crashes'], list)
+                or any(not isinstance(c, dict) or set(c) != {'at_ms', 'exit_code', 'binary_sha256'}
+                       or type(c['at_ms']) is not int or type(c['exit_code']) is not int
+                       or not sha(c['binary_sha256']) for c in self.recovery['crashes'])):
+            raise ValueError('invalid_recovery_history')
+        self.rollback_used = False
         self.finished = threading.Event()
         def heartbeat():
             while not self.finished.is_set():
@@ -310,6 +374,8 @@ class Supervisor:
             time.sleep(0.05)
 
     def candidate_command(self, request):
+        if (self.root / 'quarantine' / (request['candidate_sha256'] + '.json')).exists():
+            raise ValueError('candidate_quarantined')
         binary, resources, manifest = validate_candidate(request, self.options.candidates)
         subprocess.run(execution_command([str(binary), '--help']), check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         bridge = resources / 'connectors/qqbot'
@@ -344,6 +410,8 @@ class Supervisor:
         if read_json(self.root / 'request.json') != request or manifest['candidate_sha256'] != request['candidate_sha256']:
             raise ValueError('request_changed')
         validate_candidate(request, self.options.candidates)
+        self.validate_descriptor(self.active_descriptor)
+        atomic(self.root / 'previous-command.json', self.active_descriptor)
         pending = self.root / 'request.json'
         processing = self.root / 'processing.json'
         pending.rename(processing)
@@ -359,14 +427,96 @@ class Supervisor:
             # 状态指针只在候选真正连通后提交；不恢复旧状态快照。
             atomic(self.root / 'active-command.json', dict(command=command, binary_sha256=manifest['binary_sha256'], candidate_request=request))
             self.command = command
+            self.active_descriptor = snapshot_command(command, request)
+            self.rollback_used = False
             self.publish(phase='running', active_sha256=manifest['binary_sha256'], result='applied')
         except (ValueError, OSError, subprocess.SubprocessError):
             self.child.stop(self.options.stop_timeout)
             if self.stopping: raise ValueError('shutdown_during_upgrade')
+            self.validate_descriptor(self.active_descriptor)
             self.child = Child(old_command)
             self.wait_ready(self.child)
             self.publish(phase='running', result='rolled_back_binary_state_preserved')
         self.archive_request(processing, self.status['result'])
+
+    def validate_descriptor(self, descriptor):
+        if (not isinstance(descriptor, dict)
+                or set(descriptor) != {'format_version', 'command', 'binary_sha256', 'resources', 'candidate_request'}
+                or descriptor['format_version'] != 1
+                or not isinstance(descriptor['command'], list) or not descriptor['command']
+                or len(descriptor['command']) > 512
+                or any(not isinstance(s, str) or '\0' in s for s in descriptor['command'])):
+            raise ValueError('invalid_previous_command')
+        command = descriptor['command']
+        if (not Path(command[0]).is_absolute()
+                or Path(argument(command, '--state-dir')) != self.state.parent
+                or snapshot_command(command, descriptor['candidate_request']) != descriptor):
+            raise ValueError('previous_command_changed')
+        if descriptor['candidate_request'] is not None:
+            binary, resources, _ = validate_candidate(descriptor['candidate_request'], self.options.candidates)
+            if str(binary) != command[0] or argument(command, '--agent') != str(resources / 'AGENT.md'):
+                raise ValueError('previous_candidate_changed')
+
+    def recover(self):
+        """有限恢复；仅重启程序，绝不还原状态、重放旧请求或重试未知投递。"""
+        if self.stopping:
+            return
+        if self.child.process.poll() is None:
+            raise ValueError('old_process_still_running')
+        self.child.close_group(self.options.stop_timeout)
+        self.child.thread.join(timeout=1)
+        now = int(time.time() * 1000)
+        crashes = [c for c in self.recovery['crashes']
+                   if now - c['at_ms'] <= self.options.restart_window_seconds * 1000]
+        crashes.append(dict(at_ms=now, exit_code=self.child.process.returncode,
+                            binary_sha256=self.status['active_sha256']))
+        self.recovery.update(crashes=crashes, result='recovering')
+        atomic(self.root / 'recovery.json', self.recovery)
+        if len(crashes) > self.options.restart_limit:
+            self.recovery['result'] = 'restart_limit_exhausted'
+            atomic(self.root / 'recovery.json', self.recovery)
+            raise ValueError('restart_limit_exhausted')
+        if not self.state.is_file():
+            raise ValueError('runtime_state_missing')
+        # 必须在旧进程真正退出后重新捕获，保留中断轮次与未知回执的真实字节。
+        self.inherited_receipts = inherited_receipts(self.state)
+        pending = self.root / 'request.json'
+        if pending.exists():
+            self.archive_request(pending, 'runtime_interrupted_no_replay')
+        previous = self.root / 'previous-command.json'
+        candidate = self.active_descriptor['candidate_request']
+        result = 'runtime_restarted_state_preserved'
+        if candidate is not None and previous.exists() and not self.rollback_used:
+            descriptor = read_json(previous)
+            self.validate_descriptor(descriptor)
+            if descriptor != self.active_descriptor:
+                quarantine = self.root / 'quarantine'
+                quarantine.mkdir(exist_ok=True)
+                atomic(quarantine / (candidate['candidate_sha256'] + '.json'),
+                       dict(format_version=1, candidate_sha256=candidate['candidate_sha256'],
+                            failed_at_ms=now, exit_code=self.child.process.returncode))
+                pointer = self.root / 'active-command.json'
+                if pointer.exists():
+                    self.archive_request(pointer, 'runtime_failed_active_command')
+                if descriptor['candidate_request'] is not None:
+                    atomic(pointer, {k: descriptor[k] for k in ['command', 'binary_sha256', 'candidate_request']})
+                self.active_descriptor = descriptor
+                self.command = descriptor['command']
+                self.rollback_used = True
+                result = 'runtime_rolled_back_binary_state_preserved'
+        self.validate_descriptor(self.active_descriptor)
+        self.publish(phase='recovering', result=result, error='active_process_exited',
+                     active_sha256=self.active_descriptor['binary_sha256'])
+        until = time.monotonic() + min(60, self.options.restart_delay * 2 ** (len(crashes) - 1))
+        while not self.stopping and time.monotonic() < until:
+            time.sleep(0.05)
+        if self.stopping:
+            return
+        self.child = Child(self.command)
+        self.wait_ready(self.child)
+        self.recovery['result'] = result
+        atomic(self.root / 'recovery.json', self.recovery)
+        self.publish(phase='running', result=result, error=None)
 
     def run(self):
         def stop(_signum, _frame): self.stopping = True
@@ -385,7 +535,10 @@ class Supervisor:
             gate = False
             while not self.stopping:
                 if self.child.process.poll() is not None:
-                    raise ValueError('active_process_exited')
+                    self.recover()
+                    prepared = waiting_since = quiet_since = state_stamp = None
+                    gate = False
+                    continue
                 pending = self.root / 'request.json'
                 if pending.exists():
                     try:
@@ -428,6 +581,13 @@ class Supervisor:
                         state_stamp = None
                 time.sleep(0.1)
             return self.child.stop(self.options.stop_timeout)
+        except Exception as error:
+            code = str(error) if type(error) is ValueError and str(error).replace('_', '').isalnum() else type(error).__name__
+            with contextlib.suppress(Exception):
+                self.recovery['result'] = code[:100]
+                atomic(self.root / 'recovery.json', self.recovery)
+                self.publish(result='stopped_state_preserved', error=code[:100])
+            raise
         finally:
             self.finished.set()
             if self.child and self.child.process.poll() is None:
@@ -435,6 +595,8 @@ class Supervisor:
                 if self.child.process.poll() is None:
                     self.child.process.kill()
                     self.child.process.wait()
+            if self.child:
+                self.child.close_group(self.options.stop_timeout)
             self.publish(phase='stopped')
             self.lock.close()
 
@@ -447,16 +609,21 @@ def main():
     parser.add_argument('--drain-timeout', type=float, default=300)
     parser.add_argument('--quiet-seconds', type=float, default=1)
     parser.add_argument('--health-seconds', type=float, default=2)
+    parser.add_argument('--restart-limit', type=int, default=3)
+    parser.add_argument('--restart-window-seconds', type=float, default=600)
+    parser.add_argument('--restart-delay', type=float, default=1)
     parser.add_argument('command', nargs=argparse.REMAINDER)
     options = parser.parse_args()
     if any(not 0 < v <= 600 for v in [options.ready_timeout, options.stop_timeout, options.drain_timeout, options.quiet_seconds, options.health_seconds]):
         parser.error('期限必须大于 0 且不超过 600 秒')
+    if not 0 <= options.restart_limit <= 10 or not 0 < options.restart_window_seconds <= 86400 or not 0 < options.restart_delay <= 60:
+        parser.error('恢复次数为 0 至 10，窗口为 0 至 86400 秒，退避为 0 至 60 秒；期限必须大于零')
     try:
         return Supervisor(options).run()
     except Exception as error:
         # 不输出子进程参数、原文、状态正文或凭据。
         print('EVE_SELF_UPGRADE_STOPPED ' + type(error).__name__, file=sys.stderr, flush=True)
-        return 1
+        return RECOVERY_STOP
 
 if __name__ == '__main__':
     raise SystemExit(main())
