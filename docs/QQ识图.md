@@ -13,7 +13,7 @@ QQ 消息里的图片默认只保存引用，模型只知道“收到了图片�
 | `max_image_bytes` | `EVE_VISION_MAX_IMAGE_BYTES` | 8388608 | 65536–8388608 |
 | `timeout_ms` | `EVE_VISION_TIMEOUT_MS` | 20000 | 1000–60000，单张下载期限 |
 
-使用主对话模型线路，Responses 协议以 `input_image`、Chat Completions 协议以 `image_url` 发送 data URL。默认关闭：文本模型收到图像通常会拒绝整个请求，本轮按模型失败处理并如实告知，此时关闭 `runtime.vision` 即可回到文字说明。
+启动就绪行 `EVE_READINESS` 的 `vision` 字段按启动时配置报告 `enabled_unverified` 或 `not_configured`；前者只表示已开启，模型能否处理图像要看实际回答。使用主对话模型线路，Responses 协议以 `input_image`、Chat Completions 协议以 `image_url` 发送 data URL。默认关闭：文本模型收到图像通常会拒绝整个请求，本轮按模型失败处理并如实告知，此时关闭 `runtime.vision` 即可回到文字说明。
 
 ## 附上哪些图片
 

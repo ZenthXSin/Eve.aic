@@ -96,6 +96,16 @@ impl QqTurnImages {
     }
 }
 
+impl QqTurnImages {
+    /// 启动就绪说明：配置开启时为 `enabled_unverified`（是否真的支持图像要看模型实际回答），否则为 `not_configured`。
+    pub(crate) fn readiness(&self) -> &'static str {
+        match self.options() {
+            Ok(Some(_)) => "enabled_unverified",
+            _ => "not_configured",
+        }
+    }
+}
+
 /// 只跟随 HTTPS 重定向，至多 5 跳。
 fn client(timeout: Duration) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()

@@ -2518,7 +2518,7 @@ async fn run_qqbot_composed(
                 "channel": "connected",
                 "tools_registered": tools_registered,
                 "model": "unverified",
-                "vision": "not_configured",
+                "vision": vision.readiness(),
             })
             .to_string(),
         )
