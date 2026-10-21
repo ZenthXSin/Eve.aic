@@ -1,0 +1,62 @@
+"""真实 QQ 宿主的 150k 主动压缩；仅本地 HTTP 与隔离桥接，不连接 QQ。"""
+import json
+import unittest
+
+import history_digest_test as digest
+from dialogue_tools_test import text_response, tool_response
+
+
+class ContextCompactionAcceptance(digest.HistoryDigestAcceptance):
+    for _name in dir(digest.HistoryDigestAcceptance):
+        if _name.startswith("test_"):
+            locals()[_name] = None
+    del _name
+
+    def test_150k_tool_context_is_summarized_then_continues_and_saved_history_reuses_after_restart(self):
+        content = "中文结果" * 2700
+        (self.source / "README.md").write_text(content, encoding="utf8")
+        self.dialogue_calls = 0
+
+        def respond(body):
+            if body["messages"][0]["content"].startswith(digest.DIGEST_PROMPT):
+                request = json.loads(body["messages"][1]["content"])
+                covered = request["previous_turns"] + len(request["turns"])
+                return text_response(json.dumps({"points": [{"text": "八次文件读取已经完成，接着核验并交付", "turns": [covered]}]}, ensure_ascii=False))
+            self.dialogue_calls += 1
+            if self.dialogue_calls == 1:
+                return tool_response([("read_file", {"path": "README.md"})] * 8)
+            self.assertTrue(any("宿主上下文压缩摘要" in (m.get("content") or "") for m in body["messages"]))
+            self.assertFalse(any(m.get("tool_calls") or m["role"] == "tool" for m in body["messages"]))
+            return text_response("全部完成")
+
+        self.callback = respond
+        env = {"EVE_CONTEXT_COMPACT_AT_TOKENS": "150000", "EVE_CONTEXT_COMPACT_TO_TOKENS": "100000"}
+        features = ["--background-tasks", "--subagents"]
+        def reject_invalid_target():
+            status, page = self.panel("/api/plugin-pages/read", {"plugin_id": "eve.config", "page_id": "runtime.history"})
+            self.assertEqual(status, 200)
+            status, result = self.panel("/api/plugin-pages/save", {"plugin_id": "eve.config", "page_id": "runtime.history",
+                "instance": page["instance"], "expected_revision": page["revision"], "values": {"compact_to_tokens": 150000}})
+            self.assertEqual(status, 400, result)
+        self.run_window([*self.send(self.message("tools", "读取八次并核验完成", expected="全部完成")),
+                         *self.send(self.message("later", "接着检查", expected="全部完成")),
+                         *self.checkpoint("invalid")], panel=True, env_extra=env, extra=features, checkpoints={"invalid":reject_invalid_target})
+        events = [json.loads(line.split(" ", 1)[1]) for line in self.panel_stderr.read_text(encoding="utf8").splitlines()
+                  if line.startswith("EVE_CONTEXT_COMPACTION ")]
+        self.assertTrue(events)
+        self.assertTrue(all(e["estimated_before"] >= 150000 and e["estimated_after"] < 100000 for e in events))
+        completed = self.turn("读取八次并核验完成")
+        messages = completed["status"]["messages"]
+        self.assertEqual(sum(len(m.get("tool_calls", [])) for m in messages), 8)
+        self.assertEqual(sum(len(m.get("tool_results", [])) for m in messages), 8)
+        self.assertIn(content, json.dumps(completed, ensure_ascii=False))
+        self.assertTrue(self.digest_files())
+        previous = json.dumps(completed, sort_keys=True)
+        requests_before = len(self.digest_requests())
+        self.run_window([*self.send(self.message("restart", "重启后接着", expected="全部完成"))], env_extra=env, extra=features)
+        self.assertEqual(len(self.digest_requests()), requests_before)
+        self.assertEqual(json.dumps(self.turn("读取八次并核验完成"), sort_keys=True), previous)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

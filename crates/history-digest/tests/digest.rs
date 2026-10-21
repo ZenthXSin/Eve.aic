@@ -59,6 +59,104 @@ fn history(turns: usize) -> Vec<ChatMessage> {
         .collect()
 }
 
+#[tokio::test]
+async fn active_compaction_covers_all_batches_persists_reuses_and_never_enqueues_background_work() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = service(
+        directory.path(),
+        Some(DigestOptions {
+            min_uncovered_turns: 64,
+            max_input_bytes: 1,
+        }),
+    );
+    let seen: Seen = Arc::default();
+    service
+        .install_compactor(Arc::new(Scripted {
+            seen: seen.clone(),
+            reply: |r| {
+                Ok(vec![DigestPoint {
+                    text: "已做过的工作与下一步".into(),
+                    turns: vec![r.covered_turns()],
+                }])
+            },
+        }))
+        .unwrap();
+    let original = history(3);
+    assert!(service.cached(Some(&scope()), &original).unwrap().is_none());
+    let result = service
+        .compact(Some(&scope()), &original)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.covered_turns, 3);
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    assert_eq!(service.pending_count(), 0);
+    let restored = HistoryDigestService::new(
+        DigestStore::open(directory.path()).unwrap(),
+        Box::new(Fixed(Some(OPTIONS))),
+    );
+    assert_eq!(
+        restored.cached(Some(&scope()), &original).unwrap(),
+        Some(result)
+    );
+    let mut changed = original.clone();
+    changed[0].text = Some("原文变化".into());
+    assert!(restored.cached(Some(&scope()), &changed).unwrap().is_none());
+    let calls = seen.lock().unwrap().len();
+    service.compact(Some(&scope()), &original).await.unwrap();
+    assert_eq!(seen.lock().unwrap().len(), calls);
+    service.compact(None, &history(1)).await.unwrap();
+    assert_eq!(
+        service
+            .store()
+            .versions(&scope())
+            .unwrap()
+            .last()
+            .unwrap()
+            .covered_turns,
+        3
+    );
+}
+
+#[tokio::test]
+async fn active_compaction_preserves_corrupt_files_and_rejects_invalid_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = service(directory.path(), Some(OPTIONS));
+    service
+        .install_compactor(Arc::new(Scripted {
+            seen: Arc::default(),
+            reply: |_| Ok(vec![]),
+        }))
+        .unwrap();
+    assert!(service.compact(Some(&scope()), &history(2)).await.is_err());
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    service
+        .store()
+        .put(
+            &scope(),
+            DigestVersion {
+                covered_turns: 1,
+                fingerprint: fingerprint(&history(2), 1).unwrap(),
+                points: vec![DigestPoint {
+                    text: "已保存".into(),
+                    turns: vec![1],
+                }],
+                generator: "test".into(),
+                created_at_ms: 1,
+            },
+        )
+        .unwrap();
+    let path = std::fs::read_dir(directory.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(&path, b"corrupt").unwrap();
+    assert!(service.compact(Some(&scope()), &history(2)).await.is_err());
+    assert_eq!(std::fs::read(path).unwrap(), b"corrupt");
+}
+
 fn service(directory: &std::path::Path, options: Option<DigestOptions>) -> HistoryDigestService {
     HistoryDigestService::new(
         DigestStore::open(directory).unwrap(),
