@@ -1165,6 +1165,7 @@ dependencies = [
 name = "eve-task-api"
 version = "0.1.0"
 dependencies = [
+ "eve-llm-api",
  "ring",
  "serde",
  "serde_json",
@@ -1175,6 +1176,7 @@ name = "eve-task-plugin"
 version = "0.1.0"
 dependencies = [
  "eve-kernel",
+ "eve-llm-api",
  "eve-plugin-api",
  "eve-task-api",
  "serde",

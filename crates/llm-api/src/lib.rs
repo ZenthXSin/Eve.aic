@@ -12,12 +12,14 @@ use eve_plugin_api::{Permission, PluginId, ServiceId};
 mod budget;
 mod failure;
 mod history;
+mod journal;
 pub use budget::{BudgetUsage, ExecutionLimits, TurnBudget};
 pub use failure::{ModelHealthObserver, ModelOutcome, ProviderFailure, ProviderFailureKind};
 pub use history::{
     ContextCompactionPolicy, HistoryDigest, HistoryDigests, HistoryWindow, HistoryWindowResolver,
     MAX_HISTORY_DIGEST_BYTES, history_turns,
 };
+pub use journal::{MAX_CHECKPOINT_BYTES, TurnCheckpoint, TurnJournal};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;

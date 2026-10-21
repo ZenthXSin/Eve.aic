@@ -2,7 +2,7 @@
 //! 也可以把一件子任务委托给子代理并当场拿回结果。
 //!
 //! 两者共用同一个执行器：独立的模型宿主，可用对话里的全部工具，但不含派发、查看、取消和子代理工具，
-//! 因此不会层层派生。执行器看不到对话，只按派发时写下的说明做事；步数（工具调用次数）预算用尽后
+//! 因此不会层层派生。默认只提供任务说明，显式共享时附带冻结上下文数据；步数（工具调用次数）预算用尽后
 //! 不再提供工具，由模型依据已有结果收尾。后台任务的结果私聊通知派发它的用户；子代理的结果作为
 //! 工具结果直接回到当前这一轮。
 use crate::{AppError, services};
@@ -198,6 +198,57 @@ pub(crate) fn config_service(
 pub(crate) struct WorkerRun {
     pub(crate) end: TaskEnd,
     pub(crate) usage: TaskUsage,
+    retryable: bool,
+}
+
+struct WorkerRequest {
+    instructions: String,
+    scope: Option<ContextScope>,
+    steps: u32,
+    timeout: Duration,
+    stop: watch::Receiver<bool>,
+    journal: Option<Arc<dyn eve_llm_api::TurnJournal>>,
+}
+
+struct TaskJournal {
+    tasks: Arc<dyn TaskAdmin>,
+    id: String,
+    deadline_at_ms: u64,
+}
+impl eve_llm_api::TurnJournal for TaskJournal {
+    fn load(&self) -> Result<Option<eve_llm_api::TurnCheckpoint>, LlmError> {
+        let snapshot = self
+            .tasks
+            .snapshot()
+            .map_err(|_| LlmError::Context("执行日志不可用；未自动回退".into()))?;
+        let task = snapshot
+            .tasks
+            .iter()
+            .find(|task| task.id == self.id)
+            .ok_or_else(|| LlmError::Context("执行日志缺少任务；未自动回退".into()))?;
+        Ok(task
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.checkpoint.clone()))
+    }
+    fn save(&self, checkpoint: &eve_llm_api::TurnCheckpoint) -> Result<(), LlmError> {
+        self.tasks
+            .checkpoint(&self.id, checkpoint.clone(), self.deadline_at_ms, now_ms())
+            .map(|_| ())
+            .map_err(|_| LlmError::Context("执行检查点未确认保存；停止执行，保留原记录".into()))
+    }
+}
+
+fn retryable_model_failure(error: &LlmError) -> bool {
+    error == &LlmError::ProviderTimeout
+        || error.provider_failure().is_some_and(|failure| {
+            matches!(
+                failure.kind,
+                eve_llm_api::ProviderFailureKind::Network
+                    | eve_llm_api::ProviderFailureKind::ServerError
+                    | eve_llm_api::ProviderFailureKind::RateLimited
+            )
+        })
 }
 
 /// 执行器：独立的模型宿主，可用对话工具中除编排工具以外的全部。
@@ -234,6 +285,12 @@ fn failure_reason(error: &LlmError) -> String {
         LlmError::ProviderTimeout => "模型请求超时".into(),
         LlmError::RoundLimit => "步数用尽后模型仍要求调用工具".into(),
         LlmError::Configuration(_) => "执行器配置无效".into(),
+        LlmError::Context(message) if message.starts_with("工具结果可能含未确认") => {
+            "工具结果含未确认副作用；已保存回执，停止自动恢复，需核对现有结果".into()
+        }
+        LlmError::Context(message) if message.starts_with("执行检查点") => {
+            "执行检查点无法确认保存或超出容量；已停止，原记录保留".into()
+        }
         LlmError::Context(_) => "执行器上下文不可用".into(),
         _ => "模型或工具不可用".into(),
     }
@@ -325,6 +382,26 @@ impl Worker {
         timeout: Duration,
         stop: watch::Receiver<bool>,
     ) -> WorkerRun {
+        self.run_request(WorkerRequest {
+            instructions,
+            scope,
+            steps,
+            timeout,
+            stop,
+            journal: None,
+        })
+        .await
+    }
+
+    async fn run_request(&self, request: WorkerRequest) -> WorkerRun {
+        let WorkerRequest {
+            instructions,
+            scope,
+            steps,
+            timeout,
+            stop,
+            journal,
+        } = request;
         if !scope
             .as_ref()
             .is_some_and(|s| self.authorization.get().is_some_and(|a| a.is_operator(s)))
@@ -334,6 +411,7 @@ impl Worker {
                     reason: "后台任务执行前授权已失效；未请求模型、未执行工具".into(),
                 },
                 usage: TaskUsage::default(),
+                retryable: false,
             };
         }
         let host = match self.host.with_tool_call_limit(steps as usize) {
@@ -344,8 +422,14 @@ impl Worker {
                         reason: "步数预算无效".into(),
                     },
                     usage: TaskUsage::default(),
+                    retryable: false,
                 };
             }
+        };
+        let host = if let Some(journal) = journal {
+            host.with_turn_journal(journal)
+        } else {
+            host
         };
         let sink = StopSignal(stop.clone());
         let run = host.run_scoped_turn_with_events(TurnInput { text: instructions }, scope, &sink);
@@ -361,8 +445,10 @@ impl Worker {
                     TaskEnd::Completed { result: text }
                 },
                 usage: usage_of(diagnostics.provider_requests, diagnostics.calls.len()),
+                retryable: false,
             },
             Ok(Err(TurnFailure { error, diagnostics })) => WorkerRun {
+                retryable: retryable_model_failure(&error),
                 end: if error == LlmError::Cancelled && *stop.borrow() {
                     TaskEnd::Cancelled
                 } else {
@@ -378,6 +464,7 @@ impl Worker {
                     reason: format!("超过 {} 秒仍未完成", timeout.as_secs()),
                 },
                 usage: TaskUsage::default(),
+                retryable: false,
             },
         }
     }
@@ -522,6 +609,14 @@ fn status_text(task: &Task) -> &'static str {
     match task.status {
         TaskStatus::Queued => "排队中",
         TaskStatus::Running if task.cancel_requested => "正在取消",
+        TaskStatus::Running
+            if task
+                .execution
+                .as_ref()
+                .is_some_and(|e| e.resume_at_ms.is_some()) =>
+        {
+            "等待自动恢复"
+        }
         TaskStatus::Running => "执行中",
         TaskStatus::Completed => "已完成",
         TaskStatus::Failed => "失败",
@@ -537,7 +632,9 @@ fn view(task: &Task, result_bytes: usize) -> Value {
         "status": status_text(task),
         "max_steps": task.spec.max_steps,
         "include_context": task.spec.context.is_some(),
-        "steps_used": task.usage.map(|usage| usage.tool_calls),
+        "steps_used": task.usage.map(|usage| usage.tool_calls).or_else(|| task.execution.as_ref().and_then(|e| e.checkpoint.as_ref()).map(|c| c.used_tool_calls as u32)),
+        "auto_recoveries": task.execution.as_ref().map_or(0, |e| e.recoveries),
+        "waiting_to_resume": task.execution.as_ref().is_some_and(|e| e.resume_at_ms.is_some()) && task.status == TaskStatus::Running,
         "minutes_since_dispatch": now_ms().saturating_sub(task.created_at_ms) / 60_000,
         "result": task.result.as_deref().map(|text| bounded(text, result_bytes)),
         "failure": task.failure,
@@ -995,6 +1092,9 @@ fn notice_text(task: &Task) -> String {
             "后台任务「{title}」没有完成：{}",
             task.failure.as_deref().unwrap_or("原因未知")
         ),
+        _ if task.execution.is_some() => format!(
+            "后台任务「{title}」已中断，无法安全自动接续（可能有未确认的工具结果、恢复次数或总期限已用尽）；已有记录保留，请先核对现有操作，未自动重跑。"
+        ),
         _ => format!("后台任务「{title}」因 Eve 重启中断了，没有完成；需要的话可以让我重新派发。"),
     };
     bounded(&text, QQ_OUTREACH_MAX_BYTES)
@@ -1159,14 +1259,30 @@ async fn run(
             for task in snapshot.running().filter(|task| task.cancel_requested) {
                 if let Some(stop) = running.get(&task.id) {
                     let _ = stop.send(true);
+                } else {
+                    tasks.finish(&task.id, TaskEnd::Cancelled, TaskUsage::default(), now_ms())?;
                 }
             }
             let settings = current(config.as_ref())?;
-            for task in snapshot.queued() {
+            let mut candidates = snapshot.queued();
+            candidates.extend(snapshot.running().filter(|task| {
+                !running.contains_key(&task.id)
+                    && !task.cancel_requested
+                    && task
+                        .execution
+                        .as_ref()
+                        .and_then(|e| e.resume_at_ms)
+                        .is_some_and(|at| at <= now_ms())
+            }));
+            for task in candidates {
                 if running.len() >= settings.max_running {
                     break;
                 }
-                let started = match tasks.start(&task.id, now_ms()) {
+                let started = match if task.status == TaskStatus::Running {
+                    Ok(task.clone())
+                } else {
+                    tasks.start(&task.id, now_ms())
+                } {
                     Ok(started) => started,
                     // 刚被取消或已开始：跳过。
                     Err(TaskError::InvalidTransition) => continue,
@@ -1188,13 +1304,38 @@ async fn run(
                     &started.owner,
                 );
                 let steps = started.spec.max_steps;
-                let timeout = settings.task_timeout;
+                let deadline_at_ms = started
+                    .execution
+                    .as_ref()
+                    .and_then(|e| e.deadline_at_ms)
+                    .unwrap_or_else(|| {
+                        started
+                            .started_at_ms
+                            .unwrap_or_else(now_ms)
+                            .saturating_add(settings.task_timeout.as_millis() as u64)
+                    });
+                let timeout = Duration::from_millis(deadline_at_ms.saturating_sub(now_ms()));
+                let journal: Option<Arc<dyn eve_llm_api::TurnJournal>> =
+                    started.execution.as_ref().map(|_| {
+                        Arc::new(TaskJournal {
+                            tasks: tasks.clone(),
+                            id: started.id.clone(),
+                            deadline_at_ms,
+                        }) as Arc<dyn eve_llm_api::TurnJournal>
+                    });
                 let id = started.id.clone();
                 joins.spawn(async move {
                     let run = match text {
                         Ok(text) => {
                             worker
-                                .run(text, Some(scope), steps, timeout, stop_signal)
+                                .run_request(WorkerRequest {
+                                    instructions: text,
+                                    scope: Some(scope),
+                                    steps,
+                                    timeout,
+                                    stop: stop_signal,
+                                    journal,
+                                })
                                 .await
                         }
                         Err(_) => WorkerRun {
@@ -1202,6 +1343,7 @@ async fn run(
                                 reason: "委派上下文无效；未请求模型、未执行工具".into(),
                             },
                             usage: TaskUsage::default(),
+                            retryable: false,
                         },
                     };
                     (id, run)
@@ -1211,6 +1353,13 @@ async fn run(
                 Some(joined) = joins.join_next() => {
                     let (id, outcome) = joined.map_err(|_| "后台任务执行异常")?;
                     running.remove(&id);
+                    if outcome.retryable {
+                        match tasks.retry(&id, now_ms()) {
+                            Ok(_) => continue,
+                            Err(TaskError::InvalidTransition) => {},
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
                     let mut result = tasks.finish(&id, outcome.end, outcome.usage, now_ms());
                     // 结局本身不合规（例如用量记录异常）：只让这个任务失败，不停止后台。
                     if result == Err(TaskError::InvalidInput) {
@@ -1236,7 +1385,7 @@ async fn run(
         }
     }
     .await;
-    // 关闭时停下执行中的任务；它们留在“执行中”，下次启动记为已中断，不自动重跑。
+    // 关闭时停下执行中的任务；下次启动只在已持久化的安全边界接续，不重放未知工具。
     for stop in running.values() {
         let _ = stop.send(true);
     }
@@ -1276,6 +1425,7 @@ mod tests {
                 attempts: vec![],
                 closed_at_ms: None,
             }),
+            execution: None,
         }
     }
 

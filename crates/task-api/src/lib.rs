@@ -1,7 +1,7 @@
 //! 后台任务契约：Eve 在对话中把一件需要多步完成的事派发到后台，由执行器在步数预算内独立完成，
 //! 结束后私聊通知派发它的用户。
 //!
-//! 创建、开始、结束与每次通知尝试都先持久化。执行中进程退出时记为“已中断”，不自动重跑；
+//! 创建、开始、结束与每次通知尝试都先持久化。执行中进程退出时在持久化的安全边界接续，未知工具结果不自动重放；
 //! 发送通知时进程退出记为结果未知，不重发。
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -31,6 +31,18 @@ pub const DELIVERY_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// 每条通知至多投递尝试次数（其中至多一次主动私聊）。
 pub const MAX_ATTEMPTS: usize = 6;
 pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_AUTO_RECOVERIES: u32 = 3;
+
+/// 新任务默认开启安全接续；旧任务没有检查点，保持旧的中断语义。
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskExecution {
+    pub checkpoint: Option<eve_llm_api::TurnCheckpoint>,
+    pub recoveries: u32,
+    pub resume_at_ms: Option<u64>,
+    /// 首次执行固定总期限；重试和重启不能重置。
+    pub deadline_at_ms: Option<u64>,
+}
 
 pub type TaskResult<T> = Result<T, TaskError>;
 
@@ -48,7 +60,7 @@ pub struct TaskOwner {
 pub struct TaskSpec {
     /// 简短标题，用于列表与通知。
     pub title: String,
-    /// 交给执行器的完整说明；执行器看不到对话，须写清楚背景与要交付什么。
+    /// 交给执行器的完整说明；无论是否携带上下文，均须写清任务边界与交付物。
     pub instructions: String,
     /// 步数预算：至多调用多少次工具。
     pub max_steps: u32,
@@ -76,15 +88,17 @@ pub fn validate_delegated_context(context: &DelegatedContext) -> TaskResult<()> 
     if context.messages_json.is_empty() || context.messages_json.len() > MAX_CONTEXT_BYTES {
         return Err(TaskError::InvalidInput);
     }
-    let messages: serde_json::Value =
+    let messages: Vec<eve_llm_api::ChatMessage> =
         serde_json::from_str(&context.messages_json).map_err(|_| TaskError::InvalidInput)?;
-    if !messages
-        .as_array()
-        .is_some_and(|messages| !messages.is_empty())
-    {
+    if messages.is_empty() {
         return Err(TaskError::InvalidInput);
     }
-    Ok(())
+    eve_llm_api::ModelRequest {
+        messages,
+        tools: vec![],
+    }
+    .validate()
+    .map_err(|_| TaskError::InvalidInput)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -97,7 +111,7 @@ pub enum TaskStatus {
     Failed,
     /// 用户取消。
     Cancelled,
-    /// 执行中进程退出；不自动重跑。
+    /// 无法安全接续的执行中任务；保留记录，不自动重放。
     Interrupted,
 }
 impl TaskStatus {
@@ -201,7 +215,7 @@ impl Notice {
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Task {
     pub id: String,
@@ -219,6 +233,8 @@ pub struct Task {
     pub result: Option<String>,
     pub failure: Option<String>,
     pub notice: Option<Notice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<TaskExecution>,
 }
 impl Task {
     /// 已结束且通知（如有）已了结；容量满时可以腾出。
@@ -240,7 +256,7 @@ impl Task {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct TaskSnapshot {
     pub tasks: Vec<Task>,
 }
@@ -329,6 +345,16 @@ pub trait TaskAdmin: Send + Sync {
     ) -> TaskResult<Task>;
     /// 排队 → 执行中；保存后执行器才开始。
     fn start(&self, id: &str, now_ms: u64) -> TaskResult<Task>;
+    /// 工具前/后及模型请求前的持久检查点；保存失败不得继续执行。
+    fn checkpoint(
+        &self,
+        id: &str,
+        checkpoint: eve_llm_api::TurnCheckpoint,
+        deadline_at_ms: u64,
+        now_ms: u64,
+    ) -> TaskResult<Task>;
+    /// 安全边界上安排有限次自动恢复；不清空回执、不补充步数、不新建任务。
+    fn retry(&self, id: &str, now_ms: u64) -> TaskResult<Task>;
     /// 执行中 → 结束，保存结果与用量；完成与失败生成一条等待投递的通知。
     fn finish(&self, id: &str, end: TaskEnd, usage: TaskUsage, now_ms: u64) -> TaskResult<Task>;
     /// 用户取消自己的任务：排队中的直接取消；执行中的记下取消请求，由执行器停止后结束。
