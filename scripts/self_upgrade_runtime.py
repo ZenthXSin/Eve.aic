@@ -125,8 +125,30 @@ def validate_candidate(request, candidates):
         raise ValueError('candidate_identity_changed')
     return binary, directory / 'resources', manifest
 
-def delivery_gate(state_path, request):
-    """只在确切申请轮次 Completed、同条 QQ 回执 Sent 且全部会话空闲后交接。"""
+def receipt_fingerprint(receipt):
+    """完整记录摘要；历史记录只要变化，就重新视作本次运行的在途记录。"""
+    return hashlib.sha256(json.dumps(receipt, ensure_ascii=False, sort_keys=True,
+                                     separators=(',', ':')).encode()).hexdigest()
+
+def inherited_receipts(state_path):
+    """启动子进程前捕获历史未决回执；仅供门禁比较，不改写、不重放。"""
+    if not state_path.exists():
+        return frozenset()
+    state = read_json(state_path, 64 * 1024 * 1024)
+    if state.get('version') != 1:
+        raise ValueError('unknown_state_version')
+    raw = state['entries'].get('eve.channel.qqbot', {}).get('receipts.v1')
+    if raw is None:
+        return frozenset()
+    receipts = json.loads(bytes(raw), object_pairs_hook=unique_object)
+    if receipts['version'] not in (1, 2, 3):
+        raise ValueError('unknown_ledger_version')
+    return frozenset(receipt_fingerprint(r) for r in receipts['entries']
+                     if r['state'] in ('Processing', 'ReplyPending')
+                     or any(p.get('state') == 'Sending' for p in r.get('progress', [])))
+
+def delivery_gate(state_path, request, inherited=frozenset()):
+    """确切申请轮次已完成送达且本次运行空闲；不将历史未知回执当成当前任务。"""
     state = read_json(state_path, 64 * 1024 * 1024)
     if state['version'] != 1:
         raise ValueError('unknown_state_version')
@@ -149,7 +171,7 @@ def delivery_gate(state_path, request):
                     or len(part['text'].encode()) > 1024
                     or part['state'] not in ('Sending', 'Sent', 'Failed')):
                 raise ValueError('invalid_progress_ledger')
-            if part['state'] == 'Sending':
+            if part['state'] == 'Sending' and receipt_fingerprint(receipt) not in inherited:
                 return False
     session = sessions['sessions'].get(request['session_id'])
     if not session or session['key']['user_id'] != request['requested_by']:
@@ -165,6 +187,9 @@ def delivery_gate(state_path, request):
     reply = turn['status']['messages'][-1].get('text')
     matching = None
     for receipt in receipts['entries']:
+        # 当前进程启动前已存在且完全未变化的未知记录：既不阻塞空闲，也不能证明本次请求已送达。
+        if receipt_fingerprint(receipt) in inherited:
+            continue
         msg = receipt['message']
         identity = json.dumps([receipt['app_id'], msg['scope'], msg['target_id'], msg['user_id']],
                               ensure_ascii=False, separators=(',', ':')).encode()
@@ -217,6 +242,9 @@ class Supervisor:
             raise ValueError('file_state_supervisor_requires_file_backend')
         self.state = Path(argument(self.command, '--state-dir')) / 'state.json'
         if not self.state.is_absolute(): raise ValueError('state_directory_must_be_absolute')
+        self.inherited_receipts = inherited_receipts(self.state)
+        if self.inherited_receipts:
+            print(f'EVE_UPGRADE_RECOVERY inherited_unknown_receipts={len(self.inherited_receipts)} preserved_no_replay', file=sys.stderr, flush=True)
         self.stopping = False
         self.child = None
         self.status_lock = threading.RLock()
@@ -359,13 +387,13 @@ class Supervisor:
                         stat = self.state.stat()
                         stamp = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
                         if state_stamp != stamp:
-                            gate = delivery_gate(self.state, request)
+                            gate = delivery_gate(self.state, request, self.inherited_receipts)
                             state_stamp = stamp
                         if gate:
                             quiet_since = quiet_since or time.monotonic()
                             if time.monotonic() - quiet_since >= self.options.quiet_seconds:
                                 if prepared[0] != request: raise ValueError('request_changed')
-                                if not delivery_gate(self.state, request):
+                                if not delivery_gate(self.state, request, self.inherited_receipts):
                                     quiet_since = None
                                     continue
                                 self.switch(*prepared)
