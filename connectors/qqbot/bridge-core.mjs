@@ -6,6 +6,19 @@ export const MAX_MESSAGE_ID_BYTES = 253;
 export const MAX_SEGMENTS = 5;
 // Proactive invitations are short host-composed texts; Rust enforces the same bound.
 export const MAX_PUSH_BYTES = 2048;
+// Leave a margin before QQ's five-minute passive reply window expires.
+export const PASSIVE_REPLY_WINDOW_MS = 240000;
+const passiveLimit = scope => scope === "c2c" ? 4 : MAX_SEGMENTS;
+function diagnostic(err) {
+  const out = {};
+  const status = err?.httpStatus ?? err?.statusCode;
+  const code = err?.bizCode ?? err?.code;
+  if (Number.isInteger(status) && status >= 100 && status <= 599) out.http_status = status;
+  if (Number.isSafeInteger(code)) out.biz_code = code;
+  out.failure_kind = out.http_status ? "http" :
+    ["AbortError", "TimeoutError"].includes(err?.name) ? "timeout" : "transport_unknown";
+  return out;
+}
 const validId = v => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v);
 const validMessageId = v => typeof v === "string" && v.trim() === v && v.length > 0 &&
   Buffer.byteLength(v) <= MAX_MESSAGE_ID_BYTES && !/[\p{Cc}]/u.test(v);
@@ -142,7 +155,7 @@ export function optionsFromEnv(env) {
     logger: { info() {}, warn() {}, error() {}, debug() {} },
   };
 }
-export function createBridge(bot, emit, limit = 128) {
+export function createBridge(bot, emit, limit = 128, now = () => performance.now()) {
   const pending = new Map();
   const pushing = new Set();
   const warned = new Set();
@@ -217,7 +230,7 @@ export function createBridge(bot, emit, limit = 128) {
     if (Buffer.byteLength(JSON.stringify({ version: 1, ...frame })) > MAX_FRAME) {
       warn("frame_limit"); return;
     }
-    pending.set(msg.messageId, { target: { ...target }, sending: false });
+    pending.set(msg.messageId, { target: { ...target }, sending: false, receivedAt: now() });
     send(frame);
   });
   // One part at a time, strictly in order; a failed or final part ends the reply.
@@ -226,9 +239,46 @@ export function createBridge(bot, emit, limit = 128) {
     pending.delete(id);
     send({ type: "delivery", id, ...(index === undefined ? {} : { index }), ok: false });
   }
+  // A late final answer uses the original conversation's proactive route once.
+  // Never replay an ambiguous failed send or change its destination.
+  async function finalText(item, text) {
+    const elapsed = Math.max(0, Math.floor(now() - item.receivedAt));
+    item.proactive ||= elapsed >= PASSIVE_REPLY_WINDOW_MS;
+    const target = item.proactive
+      ? { scope: item.target.scope, targetId: item.target.targetId } : item.target;
+    const meta = { delivery_mode: item.proactive ? "proactive" : "passive", elapsed_ms: elapsed };
+    try {
+      const result = await sendText(target, text);
+      return { ok: true, ...meta,
+        ...(validMessageId(result?.id) ? { message_id: result.id } : {}) };
+    } catch (err) {
+      const error = diagnostic(err);
+      let notice_status = "not_attempted";
+      let notice_diagnostic = {};
+      // Only a definitive platform rejection permits a separate short notice.
+      // Unknown network outcomes, auth errors and rate limits are never retried.
+      if (!closed && [400, 404, 413, 422].includes(error.http_status) &&
+          Number.isSafeInteger(error.biz_code) && !item.noticeAttempted) {
+        item.noticeAttempted = true;
+        let timer;
+        try {
+          const attempt = sendText({ scope: item.target.scope, targetId: item.target.targetId },
+            "本轮回复已保存，但 QQ 正文投递失败。发送 /last-reply 取回，不会重新执行任务。")
+            .then(() => ({ state: "sent" }), error => ({ state: "failed", error }));
+          const result = await Promise.race([attempt, new Promise(resolve => {
+            timer = setTimeout(() => resolve({ state: "unknown" }), 3000);
+          })]);
+          notice_status = result.state;
+          if (result.error) notice_diagnostic = Object.fromEntries(Object.entries(diagnostic(result.error))
+            .map(([key, value]) => ["notice_" + key, value]));
+        } finally { clearTimeout(timer); }
+      }
+      return { ok: false, ...meta, ...error, notice_status, ...notice_diagnostic };
+    }
+  }
   async function segment(frame, item) {
     const { index, count } = frame;
-    if (!Number.isInteger(count) || count < 2 || count + (item.progress ?? 0) > MAX_SEGMENTS ||
+    if (!Number.isInteger(count) || count < 2 || count + (item.progress ?? 0) > passiveLimit(item.target.scope) ||
         !Number.isInteger(index) || index < 0 || index >= count) {
       warn("invalid_command"); return;
     }
@@ -239,15 +289,9 @@ export function createBridge(bot, emit, limit = 128) {
     item.count = count;
     let ok = false;
     try {
-      const result = await sendText(item.target, frame.text);
-      ok = true;
-      send({ type: "delivery", id: frame.id, index, ok: true,
-        ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
-    } catch (err) {
-      const diagnostic = {};
-      if (Number.isInteger(err?.statusCode)) diagnostic.http_status = err.statusCode;
-      if (Number.isInteger(err?.code)) diagnostic.biz_code = err.code;
-      send({ type: "delivery", id: frame.id, index, ok: false, ...diagnostic });
+      const result = await finalText(item, frame.text);
+      ok = result.ok;
+      send({ type: "delivery", id: frame.id, index, ...result });
     } finally {
       item.sending = false;
       item.next = index + 1;
@@ -268,11 +312,16 @@ export function createBridge(bot, emit, limit = 128) {
     item.progress = index + 1; // Failed/unknown attempts also consume quota; never retry.
     item.sending = true;
     try {
+      if (now() - item.receivedAt >= PASSIVE_REPLY_WINDOW_MS) {
+        send({ type: "delivery", id: frame.id, progress: true, index, ok: false,
+          failure_kind: "passive_window_elapsed" });
+        return;
+      }
       const result = await sendText(item.target, frame.text);
       send({ type: "delivery", id: frame.id, progress: true, index, ok: true,
         ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
-    } catch {
-      send({ type: "delivery", id: frame.id, progress: true, index, ok: false });
+    } catch (err) {
+      send({ type: "delivery", id: frame.id, progress: true, index, ok: false, ...diagnostic(err) });
     } finally {
       item.sending = false;
       if (item.finished) pending.delete(frame.id);
@@ -307,10 +356,7 @@ export function createBridge(bot, emit, limit = 128) {
       send({ type: "delivery", id: frame.id, push: true, file: true, ok: true,
         ...(validMessageId(id) ? { message_id: id } : {}) });
     } catch (err) {
-      const diagnostic = {};
-      if (Number.isInteger(err?.statusCode)) diagnostic.http_status = err.statusCode;
-      if (Number.isInteger(err?.code)) diagnostic.biz_code = err.code;
-      send({ type: "delivery", id: frame.id, push: true, file: true, ok: false, ...diagnostic });
+      send({ type: "delivery", id: frame.id, push: true, file: true, ok: false, ...diagnostic(err) });
     } finally {
       pushing.delete(key);
     }
@@ -333,10 +379,7 @@ export function createBridge(bot, emit, limit = 128) {
       send({ type: "delivery", id: frame.id, push: true, ok: true,
         ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
     } catch (err) {
-      const diagnostic = {};
-      if (Number.isInteger(err?.statusCode)) diagnostic.http_status = err.statusCode;
-      if (Number.isInteger(err?.code)) diagnostic.biz_code = err.code;
-      send({ type: "delivery", id: frame.id, push: true, ok: false, ...diagnostic });
+      send({ type: "delivery", id: frame.id, push: true, ok: false, ...diagnostic(err) });
     } finally {
       pushing.delete(frame.id);
     }
@@ -367,14 +410,8 @@ export function createBridge(bot, emit, limit = 128) {
       if (!validText(frame.text)) { reject(frame.id); return; }
       item.sending = true;
       try {
-        const result = await sendText(item.target, frame.text);
-        send({ type: "delivery", id: frame.id, ok: true,
-          ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
-      } catch (err) {
-        const diagnostic = {};
-        if (Number.isInteger(err?.statusCode)) diagnostic.http_status = err.statusCode;
-        if (Number.isInteger(err?.code)) diagnostic.biz_code = err.code;
-        send({ type: "delivery", id: frame.id, ok: false, ...diagnostic });
+        const result = await finalText(item, frame.text);
+        send({ type: "delivery", id: frame.id, ...result });
       } finally {
         pending.delete(frame.id);
       }

@@ -43,6 +43,58 @@ fn warn(ctx: &PluginContext, code: &str) {
         let _ = ctx.log(entry);
     }
 }
+fn delivery_log(ctx: &PluginContext, code: &str, frame: &Value) {
+    let level = if frame.get("ok").and_then(Value::as_bool) == Some(true) {
+        LogLevel::Info
+    } else {
+        LogLevel::Warn
+    };
+    if let Ok(mut entry) = LogEntry::new(level, "eve.qqbot", code) {
+        for name in [
+            "http_status",
+            "biz_code",
+            "elapsed_ms",
+            "notice_http_status",
+            "notice_biz_code",
+        ] {
+            if let Some(value) = frame.get(name).and_then(Value::as_i64) {
+                entry = entry.with_field(name, value.to_string());
+            }
+        }
+        for name in [
+            "failure_kind",
+            "delivery_mode",
+            "notice_status",
+            "notice_failure_kind",
+        ] {
+            if let Some(value) = frame.get(name).and_then(Value::as_str)
+                && [
+                    "http",
+                    "timeout",
+                    "transport_unknown",
+                    "passive_window_elapsed",
+                    "passive",
+                    "proactive",
+                    "sent",
+                    "failed",
+                    "unknown",
+                    "not_attempted",
+                ]
+                .contains(&value)
+            {
+                entry = entry.with_field(name, value);
+            }
+        }
+        let _ = ctx.log(entry);
+    }
+}
+fn passive_limit(message: &Message) -> usize {
+    if message.scope == "c2c" {
+        4
+    } else {
+        crate::QQ_MAX_SEGMENTS
+    }
+}
 fn timing(enabled: bool, phase: &str, turn: Option<u64>) {
     if enabled {
         let at = std::time::SystemTime::now()
@@ -783,6 +835,16 @@ pub(crate) async fn run(
                     finish(&mut stdin, &message.id).await?;
                     continue;
                 }
+                if !command.natural && message.text.trim() == "/last-reply" {
+                    let text = ledger.entries.iter().rev().find(|entry|
+                        entry.app_id == config.app_id && same_session(&entry.message, &message)
+                        && entry.message.text.trim() != "/last-reply"
+                        && entry.state == ReceiptState::Failed && entry.reply.is_some())
+                        .and_then(|entry| entry.reply.clone())
+                        .unwrap_or_else(|| "当前会话没有可取回的失败回复。".into());
+                    replies.push_back(Reply { message, text, guard: ReplyGuard::Command, interaction: None, invite: None });
+                    continue;
+                }
                 if !command.natural && let Some(handler) = &command_handler {
                     let session = message.session_key(&config.app_id)?;
                     match commands::dispatch(handler.as_ref(), QqCommandInput {
@@ -940,7 +1002,7 @@ pub(crate) async fn run(
                         };
                         let progress_count = ledger.entries[ledger.find(&config.app_id, &reply.message.id).expect("reply receipt")].progress.len();
                         let mut policy = segmentation.policy;
-                        policy.max_segments = policy.max_segments.min(crate::QQ_MAX_SEGMENTS - progress_count);
+                        policy.max_segments = policy.max_segments.min(passive_limit(&reply.message) - progress_count);
                         policy.defaults.max_segments = policy.defaults.max_segments.min(policy.max_segments);
                         match eve_segment_api::plan_with_preference(
                             segmentation.planner.as_ref(), &reply.text, &policy, &preference) {
@@ -984,7 +1046,7 @@ pub(crate) async fn run(
                 if let Some(hook) = &outreach
                     && reply.invite == Some(true)
                     && invitable(&reply)
-                    && ledger.entries[index].progress.len() + plan.as_ref().map_or(1, |plan| plan.segments.len()) < crate::QQ_MAX_SEGMENTS
+                    && ledger.entries[index].progress.len() + plan.as_ref().map_or(1, |plan| plan.segments.len()) < passive_limit(&reply.message)
                     && plan.as_ref().map_or(1, |plan| plan.segments.len()) <= QQ_OUTREACH_MAX_REPLY_PARTS {
                     match hook.inner.attach(&reply.message.session_key(&config.app_id)?, &reply.message.id) {
                         Ok(Some(invitation)) => {
@@ -1293,14 +1355,14 @@ pub(crate) async fn run(
                             let index = ledger.find(&config.app_id, id).expect("progress receipt");
                             ledger.entries[index].progress[*part].state = if ok { PartState::Sent } else { PartState::Failed };
                             ledger.save(&ctx)?;
-                            if !ok { warn(&ctx, "progress_failed_no_retry"); }
+                            if !ok { delivery_log(&ctx, "progress_failed_no_retry", &frame); }
                             progress_delivery = None;
                         }
                         Some("delivery") if frame.get("file").and_then(Value::as_bool) == Some(true) => {
                             let (Some(files), Some(current)) = (&files, sending_file.as_deref()) else { warn(&ctx, "unexpected_delivery"); continue; };
                             if frame.get("id").and_then(Value::as_str) != Some(current) { warn(&ctx, "delivery_id_mismatch"); continue; }
                             let Some(ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
-                            if !ok { warn(&ctx, "file_delivery_failed_no_retry"); }
+                            if !ok { delivery_log(&ctx, "file_delivery_failed_no_retry", &frame); }
                             report_file(files, &ctx, current, file_result(&frame, ok));
                             sending_file = None;
                         }
@@ -1308,7 +1370,7 @@ pub(crate) async fn run(
                             let (Some(hook), Some(current)) = (&outreach, pushing.as_deref()) else { warn(&ctx, "unexpected_delivery"); continue; };
                             if frame.get("id").and_then(Value::as_str) != Some(current) { warn(&ctx, "delivery_id_mismatch"); continue; }
                             let Some(ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
-                            if !ok { warn(&ctx, "outreach_push_failed_no_retry"); }
+                            if !ok { delivery_log(&ctx, "outreach_push_failed_no_retry", &frame); }
                             report(hook, &ctx, current, outreach_result(&frame, ok));
                             pushing = None;
                         }
@@ -1357,7 +1419,10 @@ pub(crate) async fn run(
                             let reply = &delivery.reply;
                             let message = &reply.message;
                             status.send_modify(|s| { if ok { s.sent += 1; } else { s.failed += 1; } });
-                            if !ok { warn(&ctx, "delivery_failed_no_retry"); }
+                            if !ok { delivery_log(&ctx, "delivery_failed_no_retry", &frame); }
+                            else if frame.get("delivery_mode").and_then(Value::as_str) == Some("proactive") {
+                                delivery_log(&ctx, "late_reply_proactive_sent", &frame);
+                            }
                             if ok { timing(timing_diagnostics, "delivery_confirmed", None); }
                             if ok && let Some(interaction) = &reply.interaction
                                 && let Some(observation) = &observation
