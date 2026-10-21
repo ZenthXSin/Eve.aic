@@ -67,10 +67,18 @@ class BackgroundRecoveryAcceptance(context.DelegationContextAcceptance):
         return task
 
     def wait_finished(self, status="Completed"):
-        # 等待完成通知的真实桥接回执，避免仅看到业务 Completed 就关闭仍在投递的通道。
-        self.wait_for(lambda: any(t["status"] == status and (status != "Completed"
-                      or (t.get("notice") or {}).get("status") == "Delivered") for t in self.tasks()),
-                      "task or its completion notice did not settle", 45)
+        # 等待通知的真实桥接回执，避免仅看到业务终态就关闭仍在投递的通道；失败与中断同样会通知用户。
+        def settled(task):
+            notice = task.get("notice")
+            if status == "Completed":
+                return (notice or {}).get("status") == "Delivered"
+            if notice is None or notice["status"] in ("Delivered", "Expired", "Unknown"):
+                return True
+            # 失败或中断的通知可能主动推送未发出而保持 Pending 等下次机会；只需等到没有进行中的投递尝试。
+            attempts = notice.get("attempts") or []
+            return notice["status"] == "Pending" and bool(attempts) and attempts[-1].get("finished_at_ms") is not None
+        self.wait_for(lambda: any(t["status"] == status and settled(t) for t in self.tasks()),
+                      "task or its notice did not settle", 45)
 
     def test_restart_resumes_saved_receipts_without_replaying_or_resetting_budget(self):
         before = self.seed_and_interrupt()

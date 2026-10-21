@@ -207,8 +207,10 @@ class InterestAcceptance(unittest.TestCase):
         events_path = self.work / f"events-{self.runs}.jsonl"
         error_path = self.work / f"error-{self.runs}.txt"
         scenario = self.work / f"scenario-{self.runs}.json"
+        # 桥接等待上限跟随本次进程期限，长退避用例不会先被桥接的默认 15 秒截断。
         scenario.write_text(json.dumps({"script": script, "events_file": str(events_path),
-                                       "error_file": str(error_path)}), encoding="utf8")
+                                       "error_file": str(error_path),
+                                       "wait_timeout_ms": max(15000, (timeout - 5) * 1000)}), encoding="utf8")
         env = {key: os.environ[key] for key in ("PATH", "SystemRoot", "TEMP", "TMP") if key in os.environ}
         env.update(QQBOT_APP_SECRET="test-app-secret", QQBOT_APP_ID="1904159860",
                    EVE_OPENAI_API_KEY="test-model-secret",
