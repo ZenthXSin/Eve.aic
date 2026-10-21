@@ -12,12 +12,16 @@ use eve_plugin_api::{Permission, PluginId, ServiceId};
 mod budget;
 mod failure;
 mod history;
+mod image;
 mod journal;
 pub use budget::{BudgetUsage, ExecutionLimits, TurnBudget};
 pub use failure::{ModelHealthObserver, ModelOutcome, ProviderFailure, ProviderFailureKind};
 pub use history::{
     CONTEXT_COMPACTION_TIMEOUT, ContextCompactionPolicy, HistoryDigest, HistoryDigests,
     HistoryWindow, HistoryWindowResolver, MAX_HISTORY_DIGEST_BYTES, history_turns,
+};
+pub use image::{
+    ImageInput, MAX_IMAGE_BYTES, MAX_TURN_IMAGES, TurnImageSource, TurnImages, sniff_image,
 };
 pub use journal::{MAX_CHECKPOINT_BYTES, TurnCheckpoint, TurnJournal};
 use serde::{Deserialize, Serialize};
@@ -49,6 +53,9 @@ pub struct ChatMessage {
     pub text: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub tool_results: Vec<ToolResult>,
+    /// 本轮用户消息附带的图像；从不序列化，持久历史中始终为空。
+    #[serde(skip)]
+    pub images: Vec<ImageInput>,
 }
 
 impl ChatMessage {
@@ -58,6 +65,7 @@ impl ChatMessage {
             text: Some(text.into()),
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -68,6 +76,7 @@ impl ChatMessage {
             text: None,
             tool_calls: calls,
             tool_results: Vec::new(),
+            images: Vec::new(),
         })
     }
 
@@ -83,10 +92,24 @@ impl ChatMessage {
             text: None,
             tool_calls: Vec::new(),
             tool_results: results,
+            images: Vec::new(),
         })
     }
 
+    /// 给用户消息附上本轮图像；图像只在内存中随请求传递。
+    pub fn with_images(mut self, images: Vec<ImageInput>) -> Self {
+        self.images = images;
+        self
+    }
+
     fn validate(&self) -> Result<(), LlmError> {
+        if self.images.len() > MAX_TURN_IMAGES
+            || (!self.images.is_empty() && self.role != ChatRole::User)
+        {
+            return Err(LlmError::Protocol(
+                "only a user message can carry images, at most MAX_TURN_IMAGES".into(),
+            ));
+        }
         match &self.role {
             ChatRole::System | ChatRole::User => {
                 if !has_non_empty_text(self.text.as_deref()) {
@@ -883,6 +906,7 @@ mod tests {
             text: Some("also explain this".into()),
             tool_calls: vec![call("demo")],
             tool_results: vec![],
+            images: vec![],
         };
 
         assert!(request(vec![assistant]).validate().is_err());
@@ -901,6 +925,7 @@ mod tests {
                 text: None,
                 tool_calls: vec![],
                 tool_results: vec![],
+                images: vec![],
             }])
             .validate()
             .is_err()

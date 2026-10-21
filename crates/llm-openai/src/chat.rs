@@ -18,7 +18,16 @@ pub(crate) fn encode_request(model: &str, request: ModelRequest) -> Result<Value
                 ChatRole::Assistant => "assistant",
                 ChatRole::Tool => unreachable!("validated tool message has no text"),
             };
-            messages.push(json!({"role":role,"content":text}));
+            let content = if message.images.is_empty() {
+                json!(text)
+            } else {
+                let mut parts = vec![json!({"type":"text","text":text})];
+                parts.extend(message.images.iter().map(|image| {
+                    json!({"type":"image_url","image_url":{"url":crate::wire::data_url(image)}})
+                }));
+                json!(parts)
+            };
+            messages.push(json!({"role":role,"content":content}));
         } else if message.role == ChatRole::Assistant {
             let mut calls = Vec::new();
             for call in message.tool_calls {
@@ -366,5 +375,23 @@ mod tests {
                 Err(LlmError::Protocol(_))
             ));
         }
+    }
+
+    #[test]
+    fn user_images_become_image_url_parts() {
+        let image = eve_llm_api::ImageInput::new(vec![0xff, 0xd8, 0xff, 0xe0]).unwrap();
+        let body = encode_request(
+            "m",
+            ModelRequest {
+                messages: vec![ChatMessage::text(ChatRole::User, "看看").with_images(vec![image])],
+                tools: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([{"type":"text","text":"看看"},
+                {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,/9j/4A=="}}])
+        );
     }
 }
