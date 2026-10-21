@@ -117,8 +117,11 @@ impl CompletedInteraction {
         let SessionTurnStatus::Completed { messages } = &turn.status else {
             return Err(invalid());
         };
-        if turn.input != message.text
-            || messages.first().and_then(|first| first.text.as_deref()) != Some(&message.text)
+        // 入站轮次包含通道生成的引用/附件说明，必须和提交时的同一规范化输入核对。
+        // 观察者接口仍提供原始用户正文，不改变其来源契约。
+        let input = message.turn_text();
+        if turn.input != input
+            || messages.first().and_then(|first| first.text.as_deref()) != Some(input.as_str())
             || messages.last().and_then(|last| last.text.as_deref()) != Some(text)
         {
             return Err(invalid());
@@ -279,6 +282,61 @@ mod tests {
             let mut changed = snapshot.clone();
             alter(&mut changed);
             assert!(capture(&report, Some(changed)).is_err());
+        }
+    }
+
+    #[test]
+    fn quoted_and_attachment_inputs_use_the_exact_submitted_text() {
+        use crate::state::{ImageAttachment, QuotedMessage};
+        for quoted in [false, true] {
+            for attached in [false, true] {
+                let (mut message, mut report, mut snapshot) = fixture();
+                if quoted {
+                    message.quoted = Some(QuotedMessage {
+                        text: "被引用的原消息".into(),
+                        attachments: vec![],
+                    });
+                }
+                if attached {
+                    message.attachments.push(ImageAttachment {
+                        content_type: "application/pdf".into(),
+                        url: "https://example.invalid/document.pdf".into(),
+                        filename: Some("资料.pdf".into()),
+                    });
+                }
+                let input = message.turn_text();
+                snapshot.turns[0].input = input.clone();
+                let SessionTurnStatus::Completed { messages } = &mut snapshot.turns[0].status
+                else {
+                    unreachable!()
+                };
+                messages[0].text = Some(input);
+                report.run.transcript = Some(messages.clone());
+                let captured = CompletedInteraction::capture(
+                    "app",
+                    &message,
+                    &report.key,
+                    &report,
+                    &Snapshot(Some(snapshot.clone())),
+                )
+                .unwrap();
+                assert!(captured.is_some());
+                // 只有消息规范化结果相等才接受，不能用一份自洽但被篡改的会话冒充。
+                snapshot.turns[0].input.push_str("篡改说明");
+                if let SessionTurnStatus::Completed { messages } = &mut snapshot.turns[0].status {
+                    messages[0].text.as_mut().unwrap().push_str("篡改说明");
+                }
+                assert!(
+                    CompletedInteraction::capture(
+                        "app",
+                        &message,
+                        &report.key,
+                        &report,
+                        &Snapshot(Some(snapshot)),
+                    )
+                    .is_err()
+                );
+            }
         }
     }
 
