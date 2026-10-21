@@ -123,6 +123,9 @@ class HandoffTests(unittest.TestCase):
             eve.save(Path(directory) / 'process.json', {'pid': os.getpid(), 'identity': current})
             self.assertEqual(eve.running()['pid'], os.getpid())
 
+    # 恢复脚本只支持 Linux x86_64（restore.main 拒绝其他平台），解压依赖系统 GNU tar；
+    # Windows 自带的 bsdtar 读不出 UTF-8 中文文件名，不属于支持范围。
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'restore only supports Linux tar')
     def test_split_compressed_archive_can_be_streamed_without_a_second_archive_copy(self):
         if not __import__('shutil').which('zstd'):
             self.skipTest('zstd unavailable')
