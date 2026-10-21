@@ -22,6 +22,127 @@ use tokio::sync::Notify;
 const OWNER: &str = "llm-test-owner";
 const CONTEXT: &str = "llm-test.context";
 
+#[derive(Default)]
+struct MemoryJournal {
+    frame: Mutex<Option<eve_llm_api::TurnCheckpoint>>,
+    fail_before_tools: AtomicBool,
+}
+impl eve_llm_api::TurnJournal for MemoryJournal {
+    fn load(&self) -> Result<Option<eve_llm_api::TurnCheckpoint>, LlmError> {
+        Ok(self.frame.lock().unwrap().clone())
+    }
+    fn save(&self, frame: &eve_llm_api::TurnCheckpoint) -> Result<(), LlmError> {
+        if !frame.pending_calls.is_empty() && self.fail_before_tools.load(Ordering::SeqCst) {
+            return Err(LlmError::Context("检查点写入失败".into()));
+        }
+        *self.frame.lock().unwrap() = Some(frame.clone());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_failure_before_a_tool_batch_starts_no_tools() {
+    let provider =
+        RecordingProvider::scripted(vec![tool_response(vec![call("once", "echo", json!({}))])]);
+    let tool = Arc::new(TestTool::new(
+        "echo",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    ));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![tool.clone()],
+        LlmHostConfig::default(),
+    )
+    .await;
+    let journal = Arc::new(MemoryJournal::default());
+    journal.fail_before_tools.store(true, Ordering::SeqCst);
+    let host = host.with_turn_journal(journal.clone());
+    let result = host
+        .run_scoped_turn_with_events(
+            turn(),
+            Some(eve_llm_api::ContextScope {
+                session_id: "s".into(),
+                user_id: "u".into(),
+            }),
+            &ProgressRecorder::default(),
+        )
+        .await;
+    assert!(matches!(result.unwrap_err().error, LlmError::Context(_)));
+    assert!(tool.starts.lock().unwrap().is_empty());
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    let frame = journal.frame.lock().unwrap();
+    assert_eq!(frame.as_ref().unwrap().used_tool_calls, 0);
+    assert!(frame.as_ref().unwrap().resumable());
+}
+
+#[tokio::test]
+async fn checkpoint_resume_keeps_receipts_and_closes_an_already_exhausted_budget() {
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("once", "echo", json!({}))]),
+        Err(LlmError::ProviderTimeout),
+        final_response("接续完成"),
+    ]);
+    let tool = Arc::new(TestTool::new(
+        "echo",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    ));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![tool.clone()],
+        LlmHostConfig {
+            max_tool_calls: 1,
+            max_tool_rounds: 0,
+            final_answer_on_round_limit: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let journal = Arc::new(MemoryJournal::default());
+    let host = host.with_turn_journal(journal.clone());
+    let scope = Some(eve_llm_api::ContextScope {
+        session_id: "s".into(),
+        user_id: "u".into(),
+    });
+    let sink = ProgressRecorder::default();
+    let failure = host
+        .run_scoped_turn_with_events(turn(), scope.clone(), &sink)
+        .await
+        .unwrap_err();
+    assert_eq!(failure.error, LlmError::ProviderTimeout);
+    assert_eq!(failure.diagnostics.calls.len(), 1);
+    let output = host
+        .run_scoped_turn_with_events(turn(), scope, &sink)
+        .await
+        .unwrap();
+    assert_eq!(output.text, "接续完成");
+    assert_eq!(output.diagnostics.calls.len(), 1);
+    assert_eq!(output.diagnostics.provider_requests, 3);
+    assert_eq!(*tool.starts.lock().unwrap(), ["once"]);
+    assert!(
+        provider
+            .requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .tools
+            .is_empty()
+    );
+    assert_eq!(
+        journal
+            .frame
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .result
+            .as_deref(),
+        Some("接续完成")
+    );
+}
+
 fn owner_id() -> PluginId {
     PluginId::new(OWNER).expect("valid test owner")
 }

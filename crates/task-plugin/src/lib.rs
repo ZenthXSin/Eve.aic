@@ -40,6 +40,19 @@ impl TaskAdmin for TaskController {
     fn start(&self, id: &str, now_ms: u64) -> TaskResult<Task> {
         self.service()?.start(id, now_ms)
     }
+    fn checkpoint(
+        &self,
+        id: &str,
+        checkpoint: eve_llm_api::TurnCheckpoint,
+        deadline_at_ms: u64,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        self.service()?
+            .checkpoint(id, checkpoint, deadline_at_ms, now_ms)
+    }
+    fn retry(&self, id: &str, now_ms: u64) -> TaskResult<Task> {
+        self.service()?.retry(id, now_ms)
+    }
     fn finish(&self, id: &str, end: TaskEnd, usage: TaskUsage, now_ms: u64) -> TaskResult<Task> {
         self.service()?.finish(id, end, usage, now_ms)
     }
