@@ -17,6 +17,7 @@ tokio.workspace = true
 flate2.workspace = true
 
 [dev-dependencies]
+eve-dialogue-tools = { path = "../dialogue-tools" }
 eve-kernel = { path = "../kernel" }
 eve-session-plugin = { path = "../session-plugin" }
 eve-training-api = { path = "../training-api" }

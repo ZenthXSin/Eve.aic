@@ -1483,9 +1483,11 @@ async fn run_qqbot_composed(
                 Arc::new(ForgedChecks::new(Arc::new(v))) as Arc<dyn eve_practice_api::DraftCheck>
             })),
             workspace_root: options.state_directory.join("dialogue-practice-work"),
+            owner_check: None,
         }
         .tools();
-        bootstrap.tools.extend(dialogue_tools);
+        let (dialogue_registered, preference_services) = dialogue_tools;
+        bootstrap.tools.extend(dialogue_registered);
         // 文件发送默认开启：发件目录固定在状态目录下，模型只能报文件名，路径由宿主解析。
         let outbox = Arc::new(crate::qq_files::Outbox::open(
             options.state_directory.join("qq-outbox"),
@@ -1498,7 +1500,25 @@ async fn run_qqbot_composed(
         plugin = plugin.with_attachment_observer(inbox.clone());
         bootstrap
             .tools
-            .push(Arc::new(crate::qq_files::ReadAttachmentTool::new(inbox)));
+            .push(Arc::new(crate::qq_files::ReadAttachmentTool::new(
+                inbox.clone(),
+            )));
+        let vision_settings = registry
+            .get(&ServiceId::new(CONFIG_SERVICE_ID)?)
+            .map_err(|error| format!("识图配置服务不可用：{error}"))?
+            .ok_or("识图配置服务缺失")?
+            .value
+            .downcast::<ConfigServiceHandle>()
+            .map_err(|_| "识图配置服务类型错误")?
+            .0
+            .clone();
+        bootstrap
+            .tools
+            .push(Arc::new(crate::qq_files::DescribeImageTool::new(
+                inbox,
+                vision_settings,
+                bootstrap.api_key.clone(),
+            )));
         let raw = Arc::new(crate::qq_files::RawInbox::new());
         plugin = plugin.with_raw_observer(raw.clone());
         bootstrap
@@ -1558,6 +1578,18 @@ async fn run_qqbot_composed(
             &options.state_directory,
             Some(qq_admin.clone()),
         )?;
+        if let Some(services) = preference_services {
+            let mut services = (*services).clone();
+            let admin = qq_admin.clone();
+            services.owner_check = Some(Arc::new(eve_dialogue_tools::OwnerCheck(
+                move |scope: &eve_llm_api::ContextScope| admin.is_owner(scope),
+            )));
+            bootstrap
+                .tools
+                .push(Arc::new(eve_dialogue_tools::SavePreferenceTool {
+                    services: Arc::new(services),
+                }));
+        }
         for tool in &mut bootstrap.tools {
             *tool = Arc::new(crate::qq_access::GuardedTool {
                 inner: tool.clone(),
