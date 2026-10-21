@@ -19,7 +19,7 @@ MAX_RESEARCH_SOURCES = 8
 # 全功能体验：已合入 main 的 QQ 能力一次开启；语义召回需要独立 embedding 角色，控制面板只监听本机，均不在此列。
 FULL_PROFILE = ["--training", "--cognition", "--memory", "--self-learning", "--memory-recall", "--interest-learning",
                 "--skill-learning", "--tool-forging", "--plans", "--outreach", "--outreach-proactive-after-ms", "1800000",
-                "--clarify", "--agenda-context", "--reminders", "--background-tasks", "--subagents", "--triggers",
+                "--clarify", "--agenda-context", "--reminders", "--background-tasks", "--subagents", "--triggers", "--sleep",
                 "--goal-completion", "--learning-stop",
                 "--autonomy-budget", "200", "--segmented", "--message-judge", "primary",
                 # 查参考资料需要“搜索→读取→作答”多轮工具调用。
