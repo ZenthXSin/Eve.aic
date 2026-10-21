@@ -945,7 +945,7 @@ async fn run_qqbot_composed(
         .with_timing_diagnostics(crate::models::timing_enabled());
         // 会话是私聊还是群聊由通道登记；只在私聊中成立的能力据此判断。
         let conversations = plugin.conversations();
-        let plugin = if options.segmented {
+        let mut plugin = if options.segmented {
             plugin.with_segmenter(Arc::new(ParagraphPlanner::default()), QQ_SEGMENT_LIMITS)?
         } else {
             plugin
@@ -1486,6 +1486,19 @@ async fn run_qqbot_composed(
         }
         .tools();
         bootstrap.tools.extend(dialogue_tools);
+        // 文件发送默认开启：发件目录固定在状态目录下，模型只能报文件名，路径由宿主解析。
+        let outbox = Arc::new(crate::qq_files::Outbox::open(
+            options.state_directory.join("qq-outbox"),
+        )?);
+        plugin = plugin.with_files(outbox.clone(), std::time::Duration::from_secs(2))?;
+        bootstrap
+            .tools
+            .push(Arc::new(crate::qq_files::SendFileTool::new(outbox)));
+        let inbox = Arc::new(crate::qq_files::AttachmentInbox::new());
+        plugin = plugin.with_attachment_observer(inbox.clone());
+        bootstrap
+            .tools
+            .push(Arc::new(crate::qq_files::ReadAttachmentTool::new(inbox)));
         // 参考资料启动时一次读入内存，之后只读；目录无效或超过上限时拒绝启动，不静默缺项。
         if !options.references.is_empty() {
             let specs: Vec<_> = options

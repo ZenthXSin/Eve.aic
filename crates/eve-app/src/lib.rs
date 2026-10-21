@@ -22,6 +22,7 @@ mod qq_clarify;
 mod qq_cognition;
 mod qq_completion;
 mod qq_conversation;
+mod qq_files;
 mod qq_help;
 mod qq_history_digest;
 mod qq_host_facts;

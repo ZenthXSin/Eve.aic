@@ -408,13 +408,17 @@ impl Late {
             if context.is_cancel_requested() {
                 return Err(ToolExecutionError::Cancelled("本轮已取消".into()));
             }
-            if self
-                .subagent_slots
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                    (n < limit).then_some(n + 1)
-                })
-                .is_ok()
-            {
+            let admitted = {
+                // 1.89 里 try_update 还是 unstable；fetch_update 只是改名，语义相同。
+                #[allow(deprecated)]
+                let result =
+                    self.subagent_slots
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                            (n < limit).then_some(n + 1)
+                        });
+                result.is_ok()
+            };
+            if admitted {
                 return Ok(SubagentSlot(&self.subagent_slots));
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

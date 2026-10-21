@@ -2,8 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Readable, PassThrough } from "node:stream";
 import { createBridge, consume, optionsFromEnv, MAX_FRAME, MAX_MESSAGE_ID_BYTES, MAX_PUSH_BYTES, MAX_SEGMENTS } from "../bridge-core.mjs";
-function fixture({ fail = false, limit = 128, appId = "1904159860", hold = null } = {}) {
-  const frames = [], sent = [], handlers = new Map();
+function fixture({ fail = false, limit = 128, appId = "1904159860", hold = null, fileFail = false } = {}) {
+  const frames = [], sent = [], files = [], handlers = new Map();
   const bot = {
     appId,
     on: (event, handler) => handlers.set(event, handler),
@@ -14,6 +14,11 @@ function fixture({ fail = false, limit = 128, appId = "1904159860", hold = null 
       if (typeof fail === "function" ? fail(sent.length) : fail) throw new Error("sensitive secret and message");
       return { id: "out-1" };
     },
+    async sendFile(target, source, opts) {
+      files.push({ target, source, opts });
+      if (fileFail) throw new Error("sensitive secret and message");
+      return { upload: { file_uuid: "uuid-1", file_info: "info-1", ttl: 60 }, message: { id: "file-msg-1" } };
+    },
   };
   const bridge = createBridge(bot, f => frames.push(f), limit);
   const message = (kind = "c2c", id = "in-1") => handlers.get("message")({}, {
@@ -22,7 +27,7 @@ function fixture({ fail = false, limit = 128, appId = "1904159860", hold = null 
     groupOpenid: "group-1",
     replyTarget: { scope: kind, targetId: kind === "group" ? "group-1" : "user-1", msgId: id },
   });
-  return { bridge, frames, sent, message, handlers };
+  return { bridge, frames, sent, files, message, handlers };
 }
 function deferred() {
   let resolve;
@@ -455,6 +460,50 @@ test("原群唤醒使用宿主给定的群路由，未知范围拒绝发送", as
   assert.equal(f.frames.at(-1).ok, false);
 });
 
+test("文件按宿主给出的目标上传，回真实回执且不消耗被动片段", async () => {
+  const f = fixture(); f.message();
+  await f.bridge.command({ type: "file", version: 1, id: "file-1", scope: "c2c", target_id: "user-1",
+    path: "/srv/outbox/report.txt", name: "报告.txt", caption: "这是结果" });
+  assert.deepEqual(f.files[0], {
+    target: { scope: "c2c", targetId: "user-1" },
+    source: { localPath: "/srv/outbox/report.txt" },
+    opts: { fileName: "报告.txt", content: "这是结果" } });
+  assert.deepEqual(f.frames.at(-1), { version: 1, type: "delivery", id: "file-1", push: true,
+    file: true, ok: true, message_id: "file-msg-1" });
+  await f.bridge.command({ type: "reply", version: 1, id: "in-1", text: "文件已发出" });
+  assert.equal(f.frames.at(-1).ok, true);
+  const group = fixture();
+  await group.bridge.command({ type: "file", version: 1, id: "file-2", scope: "group",
+    target_id: "group-1", path: "/srv/a.txt" });
+  assert.deepEqual(group.files[0].target, { scope: "group", targetId: "group-1" });
+  assert.deepEqual(group.files[0].opts, {});
+});
+
+test("文件参数或目标不合规时不请求 SDK，明确回失败", async () => {
+  for (const bad of [
+    { path: "" }, { path: "rel/report.txt\n" }, { path: "/x".repeat(2049) }, { path: 42 },
+    { path: "/a", name: "../../etc/passwd" }, { path: "/a", name: "x\n" }, { path: "/a", name: "" },
+    { path: "/a", caption: " " }, { path: "/a", caption: "长".repeat(400) },
+    { path: "/a", target_id: "../x" }, { path: "/a", scope: "private" },
+  ]) {
+    const f = fixture();
+    await f.bridge.command({ type: "file", version: 1, id: "file-1", scope: "c2c",
+      target_id: "user-1", ...bad });
+    assert.equal(f.files.length, 0, JSON.stringify(bad));
+    assert.deepEqual(f.frames.filter(x => x.type === "delivery"),
+      [{ version: 1, type: "delivery", id: "file-1", push: true, file: true, ok: false }]);
+  }
+});
+
+test("文件上传失败不重试、不泄漏异常", async () => {
+  const f = fixture({ fileFail: true });
+  await f.bridge.command({ type: "file", version: 1, id: "file-1", scope: "c2c",
+    target_id: "user-1", path: "/srv/a.txt" });
+  assert.equal(f.files.length, 1);
+  assert.deepEqual(f.frames.at(-1), { version: 1, type: "delivery", id: "file-1", push: true, file: true, ok: false });
+  assert.ok(!JSON.stringify(f.frames).includes("sensitive"));
+});
+
 test("纯图片和图文保留本条图片引用，不抓取、不混入引用图、不改变路由", async () => {
   const f = fixture();
   const message = { kind: "c2c", messageId: "image-1", senderId: "user-1", content: "",
@@ -462,17 +511,39 @@ test("纯图片和图文保留本条图片引用，不抓取、不混入引用�
     attachments: [{ content_type: "image/png", url: "https://media.example.invalid/image.png", filename: "untrusted-name" }] };
   f.handlers.get("message")({}, message);
   assert.equal(f.frames[0].text, "");
-  assert.deepEqual(f.frames[0].attachments, [{ content_type: "image/png", url: "https://media.example.invalid/image.png" }]);
+  assert.deepEqual(f.frames[0].attachments, [{ content_type: "image/png", url: "https://media.example.invalid/image.png", filename: "untrusted-name" }]);
   await f.bridge.command({type: "reply", version: 1, id: "image-1", text: "图片已收到，尚未解析。"});
   assert.equal(f.sent.length, 1);
   assert.equal(f.sent[0].target.targetId, "user-1");
   f.handlers.get("message")({}, {...message, messageId: "text-image", content: "看看这张图", replyTarget: {...message.replyTarget, msgId: "text-image"}});
   assert.equal(f.frames.find(x => x.id === "text-image").text, "看看这张图");
-  f.handlers.get("message")({}, {...message, messageId: "quoted", attachments: [],
-    msgElements: [{attachments: message.attachments}], replyTarget: {...message.replyTarget, msgId: "quoted"}});
-  assert.ok(!f.frames.some(x => x.type === "message" && x.id === "quoted"));
+  f.handlers.get("message")({}, {...message, messageId: "quoted", content: "看这个", attachments: [],
+    msgElements: [{content: "被引用的正文", attachments: message.attachments}], replyTarget: {...message.replyTarget, msgId: "quoted"}});
+  const quoted = f.frames.find(x => x.type === "message" && x.id === "quoted");
+  assert.equal(quoted.text, "看这个");
+  assert.equal(quoted.attachments, undefined);
+  assert.deepEqual(quoted.quoted, { text: "被引用的正文", attachments: [{ content_type: "image/png", url: "https://media.example.invalid/image.png", filename: "untrusted-name" }] });
   f.handlers.get("message")({}, {...message, messageId: "unsafe", attachments: [{content_type:"image/png",url:"file:///private"}], replyTarget: {...message.replyTarget, msgId: "unsafe"}});
   assert.ok(!f.frames.some(x => x.type === "message" && x.id === "unsafe"));
+});
+
+test("非图片文件按白名单转发，文件名不合规时丢掉文件名保留附件", () => {
+  const f = fixture();
+  const base = { kind: "c2c", senderId: "user-1", content: "文件", replyTarget: { scope: "c2c", targetId: "user-1" } };
+  f.handlers.get("message")({}, { ...base, messageId: "file-1",
+    replyTarget: { ...base.replyTarget, msgId: "file-1" },
+    attachments: [{ content_type: "application/pdf", url: "https://media.example.invalid/a.pdf", filename: "报告.pdf" }] });
+  assert.deepEqual(f.frames[0].attachments, [{ content_type: "application/pdf", url: "https://media.example.invalid/a.pdf", filename: "报告.pdf" }]);
+  for (const [index, filename] of ["a/b.pdf", "x\ny", "../x", "x".repeat(256)].entries()) {
+    const id = `file-${index + 2}`;
+    f.handlers.get("message")({}, { ...base, messageId: id, replyTarget: { ...base.replyTarget, msgId: id },
+      attachments: [{ content_type: "text/plain", url: "https://media.example.invalid/n.txt", filename }] });
+    assert.deepEqual(f.frames.find(x => x.id === id).attachments, [{ content_type: "text/plain", url: "https://media.example.invalid/n.txt" }]);
+  }
+  f.handlers.get("message")({}, { ...base, messageId: "file-bad", replyTarget: { ...base.replyTarget, msgId: "file-bad" },
+    attachments: [{ content_type: "application/x-msdownload", url: "https://media.example.invalid/a.exe" }] });
+  const bad = f.frames.find(x => x.id === "file-bad");
+  assert.equal(bad.attachments, undefined);
 });
 
 test("群图片只接收艾特当前机器人的消息", () => {

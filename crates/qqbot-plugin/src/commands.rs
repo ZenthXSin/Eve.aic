@@ -101,6 +101,7 @@ mod tests {
         let handler = Capture::default();
         let message = Message {
             attachments: vec![],
+            quoted: None,
             id: "ROBOT1.0_.opaque!".into(),
             scope: "group".into(),
             target_id: "group-1".into(),

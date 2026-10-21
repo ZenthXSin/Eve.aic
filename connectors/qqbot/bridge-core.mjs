@@ -36,13 +36,74 @@ function userText(msg, appId) {
 }
 // Only the envelope's own attachments belong to this message. msg_elements can
 // contain quoted images; never treat those as freshly uploaded pictures.
-function imageAttachments(msg) {
-  if (!Array.isArray(msg.attachments)) return [];
-  return msg.attachments.filter(a => a && typeof a.content_type === "string" &&
-    /^image\/[a-z0-9.+-]{1,64}$/i.test(a.content_type) &&
-    typeof a.url === "string" && a.url.length <= 4096 &&
-    /^https:\/\/[^/\s]+\//.test(a.url) && !/[\p{Cc}]/u.test(a.url))
-    .slice(0, 4).map(a => ({ content_type: a.content_type.toLowerCase(), url: a.url }));
+const FILE_TYPES = new Set(["text/plain", "application/pdf", "application/zip",
+  "application/json", "application/octet-stream"]);
+function allowedType(type) {
+  return /^image\/[a-z0-9.+-]{1,64}$/i.test(type) || FILE_TYPES.has(type.toLowerCase());
+}
+function attachment(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const type = typeof raw.content_type === "string" && raw.content_type
+    ? raw.content_type
+    : typeof raw.contentType === "string" && raw.contentType ? raw.contentType : "application/octet-stream";
+  if (!allowedType(type)) return null;
+  const url = typeof raw.url === "string" ? raw.url : "";
+  if (url && (url.length > 4096 || !/^https:\/\/[^/\s]+\//.test(url) || /[\p{Cc}]/u.test(url))) return null;
+  const out = { content_type: type.toLowerCase() };
+  if (url) out.url = url;
+  const name = raw.filename ?? raw.file_name ?? raw.fileName;
+  if (typeof name === "string" && name.trim() === name && name && name.length <= 255 &&
+      !/[\p{Cc}\/\\]/u.test(name)) out.filename = name;
+  return out;
+}
+// 本条自己的附件。信封上没有时，文件经常只出现在 msg_elements 里，
+// 引用消息的元素带 msg_idx，不并进本条。
+function ownAttachments(msg) {
+  const found = [];
+  const push = raw => {
+    const item = attachment(raw);
+    if (item && found.length < 4 && !found.some(saved =>
+        saved.content_type === item.content_type && saved.url === item.url && saved.filename === item.filename)) {
+      found.push(item);
+    }
+  };
+  for (const raw of Array.isArray(msg.attachments) ? msg.attachments : []) push(raw);
+  const elements = msg.msg_elements ?? msg.msgElements;
+  const quoted = Number(msg.msgType) === 103;
+  if (!found.length && Array.isArray(elements)) {
+    const own = elements.filter((element, index) => element && typeof element === "object" &&
+      element.msg_idx == null && !(quoted && index === 0));
+    const current = (typeof msg.content === "string" ? msg.content : "").trim();
+    const textual = own.filter(element => typeof element.content === "string" && element.content.trim());
+    const selected = textual.length
+      ? textual.filter(element => !current || element.content.trim() === current)
+      : (own.length === 1 ? own : []);
+    for (const element of selected) {
+      for (const raw of Array.isArray(element.attachments) ? element.attachments : []) push(raw);
+    }
+  }
+  return found;
+}
+// 被引用消息的文字与附件单独抽出，不和本条新发的附件混在一起。
+function quotedMessage(msg) {
+  const elements = msg.msg_elements ?? msg.msgElements;
+  if (!Array.isArray(elements)) return null;
+  const texts = [];
+  const attachments = [];
+  for (const element of elements) {
+    if (!element || typeof element !== "object") continue;
+    if (typeof element.content === "string" && element.content.trim() &&
+        Buffer.byteLength(element.content) <= 1024 && !/[\p{Cc}]/u.test(element.content)) {
+      texts.push(element.content.trim());
+    }
+    for (const raw of Array.isArray(element.attachments) ? element.attachments : []) {
+      const item = attachment(raw);
+      if (item && attachments.length < 4) attachments.push(item);
+    }
+  }
+  if (!texts.length && !attachments.length) return null;
+  return { ...(texts.length ? { text: texts.join("\n").slice(0, 1024) } : {}),
+    ...(attachments.length ? { attachments } : {}) };
 }
 export function optionsFromEnv(env) {
   const appId = env.QQBOT_APP_ID || "1904159860";
@@ -80,6 +141,18 @@ export function createBridge(bot, emit, limit = 128) {
     try { return await bot.sendText(target, text); }
     finally { activeSends--; }
   }
+  // 文件走同一条并发上限；路径已由 Rust 侧解析并校验，这里只做形状检查。
+  async function sendFile(target, localPath, name, caption) {
+    if (activeSends >= limit) {
+      warn("outbound_limit");
+      throw new Error("outbound_limit");
+    }
+    activeSends++;
+    try {
+      return await bot.sendFile(target, { localPath },
+        { ...(name ? { fileName: name } : {}), ...(caption ? { content: caption } : {}) });
+    } finally { activeSends--; }
+  }
   const stop = () => {
     if (closed) return;
     closed = true;
@@ -96,7 +169,8 @@ export function createBridge(bot, emit, limit = 128) {
       warn("unsupported_message"); return;
     }
     const target = msg.replyTarget;
-    const attachments = imageAttachments(msg);
+    const attachments = ownAttachments(msg);
+    const quoted = quotedMessage(msg);
     if (!validMessageId(msg.messageId) || !validId(msg.senderId) || !target ||
         target.scope !== msg.kind || target.msgId !== msg.messageId ||
         !validId(target.targetId) || (typeof msg.content !== "string" || Buffer.byteLength(msg.content) > 32768) ||
@@ -112,7 +186,8 @@ export function createBridge(bot, emit, limit = 128) {
     const validName = senderName && Buffer.byteLength(senderName) <= 128 && [...senderName].length <= 48 && !/[\p{Cc}]/u.test(senderName);
     const frame = { type: "message", id: msg.messageId, scope: msg.kind,
       target_id: target.targetId, user_id: msg.senderId,
-      text, ...(attachments.length ? { attachments } : {}), ...(validName ? { sender_name: senderName } : {}) };
+      text, ...(attachments.length ? { attachments } : {}),
+      ...(quoted ? { quoted } : {}), ...(validName ? { sender_name: senderName } : {}) };
     // JSON escaping can expand a legal body beyond the Rust wire-frame limit.
     if (Buffer.byteLength(JSON.stringify({ version: 1, ...frame })) > MAX_FRAME) {
       warn("frame_limit"); return;
@@ -178,6 +253,43 @@ export function createBridge(bot, emit, limit = 128) {
       if (item.finished) pending.delete(frame.id);
     }
   }
+  // 文件走主动投递：目标由 Rust 从已确认的回执推出，路径由宿主解析好，这里只校验形状。
+  // 失败不重试，回执如实交回宿主账本。
+  async function pushFile(frame) {
+    if (!validMessageId(frame.id) || !validId(frame.target_id) ||
+        !["c2c", "group"].includes(frame.scope)) {
+      warn("invalid_command");
+      if (validMessageId(frame.id)) send({ type: "delivery", id: frame.id, push: true, file: true, ok: false });
+      return;
+    }
+    const key = `file:${frame.id}`;
+    if (pushing.has(key)) { warn("duplicate_reply"); return; }
+    const path = frame.path;
+    const name = frame.name;
+    const caption = frame.caption ?? "";
+    if (typeof path !== "string" || !path || path.length > 4096 || /[\p{Cc}]/u.test(path) ||
+        (name !== undefined && name !== null && (typeof name !== "string" || !name || name.length > 255 ||
+          /[\p{Cc}\/]/u.test(name))) ||
+        (caption !== "" && (!validText(caption) || Buffer.byteLength(caption) > 1024))) {
+      warn("invalid_file");
+      send({ type: "delivery", id: frame.id, push: true, file: true, ok: false });
+      return;
+    }
+    pushing.add(key);
+    try {
+      const result = await sendFile({ scope: frame.scope, targetId: frame.target_id }, path, name, caption);
+      const id = result?.message?.id ?? result?.upload?.id;
+      send({ type: "delivery", id: frame.id, push: true, file: true, ok: true,
+        ...(validMessageId(id) ? { message_id: id } : {}) });
+    } catch (err) {
+      const diagnostic = {};
+      if (Number.isInteger(err?.statusCode)) diagnostic.http_status = err.statusCode;
+      if (Number.isInteger(err?.code)) diagnostic.biz_code = err.code;
+      send({ type: "delivery", id: frame.id, push: true, file: true, ok: false, ...diagnostic });
+    } finally {
+      pushing.delete(key);
+    }
+  }
   // A proactive private message: no msg_id, so the platform applies its own quota and
   // the user's opt-out; refusals come back as a failed receipt and are never retried here.
   async function push(frame) {
@@ -213,6 +325,7 @@ export function createBridge(bot, emit, limit = 128) {
       if (frame.type === "stop") { stop(); return; }
       if (closed) return;
       if (frame.type === "push") { await push(frame); return; }
+      if (frame.type === "file") { await pushFile(frame); return; }
       const item = pending.get(frame.id);
       if (!item) { warn("unknown_reply"); return; }
       if (frame.type === "finish") {
