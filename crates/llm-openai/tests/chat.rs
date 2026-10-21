@@ -1,9 +1,6 @@
 #[allow(dead_code)]
 mod support;
-use eve_llm_api::{
-    ChatMessage, ChatRole, LlmError, LlmFuture, LlmProvider, ModelRequest, ModelResponse,
-    ModelTextSink,
-};
+use eve_llm_api::{ChatMessage, ChatRole, LlmError, LlmProvider, ModelRequest, ModelResponse};
 use eve_llm_openai::{OpenAiConfig, OpenAiProtocol, OpenAiProvider};
 use serde_json::json;
 use std::time::Duration;
@@ -202,19 +199,9 @@ async fn chat_deadline_and_cancellation_allow_subsequent_calls() {
     server.next().await;
 }
 #[tokio::test]
-async fn chat_stream_and_invalid_input_fail_before_http() {
-    struct Sink;
-    impl ModelTextSink for Sink {
-        fn text_delta(&self, _: String) -> LlmFuture<'_, ()> {
-            Box::pin(async { Ok(()) })
-        }
-    }
+async fn invalid_input_fails_before_http() {
     let mut server = Server::start(vec![]).await;
     let provider = OpenAiProvider::new(config(&server.url), "fixture-key").unwrap();
-    assert!(matches!(
-        provider.stream(request(), &Sink).await,
-        Err(LlmError::Unsupported(_))
-    ));
     assert!(matches!(
         provider
             .complete(ModelRequest {

@@ -57,3 +57,11 @@ EVE_LLM_RESPONSE_MODE=stream cargo run -p eve-runtime --example openai_responses
 ```
 
 宿主另外提供 EVE_OPENAI_API_KEY、模型及可选 endpoint。文件中既有 response_mode 优先于环境。本切片没有重新调用真实 API；本地 SSE 通过不等于特定代理或模型兼容性已验证。
+
+## Grok / Chat Completions 的模型流式接收
+
+宿主启动时设置 `EVE_OPENAI_STREAM_COMPLETIONS=true`（也接受 `1`）可让主模型及其用途通过 SSE 接收，`complete` / `complete_json` 仍返回完整响应。默认关闭；`false` / `0` 关闭，其他值报配置错误。该开关独立于 `runtime.llm.response_mode`，QQ 保持 `complete`：完整回复保存成功后才投递，沿用原有回执、防重复和上下文压缩机制。旧版本忽略此环境变量，可继续使用完整 JSON 响应，无需回退持久化配置。
+
+Chat SSE 支持 UTF-8 分片、文本、按 index 交错的函数名称与参数分片，以及 usage 附加帧。内部 reasoning 字段丢弃，工具说明草稿不投递。完整 `stop` / `tool_calls` 终态才交给原有响应校验；参数 JSON 重复键、调用 ID 冲突、截断、过滤、错误帧、提前 `[DONE]` / EOF 均失败。正常终态立即返回，无需等待连接关闭。为避免把工具前说明误作文本，Chat 的公开 `stream` 文本接收器也只在正常文本终态收到合并后的文本；Responses 保留逐片文本事件。
+
+总响应字节预算和请求总期限仍生效，流式接收不会无限延长期限。对话完整响应可沿用原有最多三次有界瞬时错误重试，全部发生在返回模型结果之前，不执行未完成的工具调用；显式 `stream` 接收器不自动重试。流式接收只能避免等待整个 JSON 响应，并不能保证上游模型一定及时响应。

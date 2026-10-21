@@ -23,6 +23,7 @@ struct CapturedModel {
     /// 用途配置的单次输出上限；None 表示沿用主模型。
     use_limit: Option<u32>,
     natural_style: bool,
+    streamed_completions: bool,
 }
 struct CachedModel {
     captured: CapturedModel,
@@ -173,6 +174,16 @@ fn capture(
             role_revision,
             use_limit,
             natural_style,
+            streamed_completions: match std::env::var("EVE_OPENAI_STREAM_COMPLETIONS") {
+                Err(std::env::VarError::NotPresent) => false,
+                Ok(value) if matches!(value.as_str(), "1" | "true") => true,
+                Ok(value) if matches!(value.as_str(), "0" | "false") => false,
+                _ => {
+                    return Err(LlmError::Configuration(
+                        "EVE_OPENAI_STREAM_COMPLETIONS 必须为 true/false 或 1/0".into(),
+                    ));
+                }
+            },
         });
     }
     Err(LlmError::Configuration(
@@ -197,6 +208,9 @@ impl LlmModelResolver for CoreModelResolver {
         }
         let provider_timeout = config.request_timeout;
         let mut provider = OpenAiProvider::new(config, &self.api_key)?;
+        if captured.streamed_completions {
+            provider = provider.with_streamed_completions();
+        }
         if self.use_name.as_deref() == Some("dialogue") {
             provider = provider.with_transient_retries();
         }

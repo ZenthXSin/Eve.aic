@@ -11,6 +11,7 @@ use std::time::Duration;
 pub use embeddings::OpenAiEmbeddings;
 
 mod chat;
+mod chat_stream;
 mod embeddings;
 mod retry;
 mod stream;
@@ -94,6 +95,7 @@ pub struct OpenAiProvider {
     client: Client,
     timing_diagnostics: bool,
     transient_retries: bool,
+    streamed_completions: bool,
 }
 
 impl OpenAiProvider {
@@ -162,6 +164,7 @@ impl OpenAiProvider {
             client,
             timing_diagnostics: false,
             transient_retries: false,
+            streamed_completions: false,
         })
     }
 
@@ -178,17 +181,25 @@ impl OpenAiProvider {
         self
     }
 
+    /// complete/complete_json 在网络上接收 SSE，仍只返回经完整校验的最终响应。
+    /// 不改变宿主事件或通道投递方式；失败时不提交文本和工具片段。
+    pub fn with_streamed_completions(mut self) -> Self {
+        self.streamed_completions = true;
+        self
+    }
+
     async fn request(
         &self,
         request: ModelRequest,
         sink: Option<&dyn ModelTextSink>,
         json_output: bool,
     ) -> Result<ModelResponse, LlmError> {
-        if sink.is_some() && self.config.protocol == OpenAiProtocol::ChatCompletions {
-            return Err(LlmError::Unsupported(
-                "Chat Completions 流式尚未接入".into(),
-            ));
-        }
+        let complete = sink.is_none();
+        let discard = DiscardText;
+        let sink = sink.or_else(|| {
+            self.streamed_completions
+                .then_some(&discard as &dyn ModelTextSink)
+        });
         let mut body = match self.config.protocol {
             OpenAiProtocol::Responses => wire::encode_request(&self.config.model, request)?,
             OpenAiProtocol::ChatCompletions => chat::encode_request(&self.config.model, request)?,
@@ -221,8 +232,8 @@ impl OpenAiProvider {
             };
             body[field] = serde_json::json!(limit);
         }
-        if self.transient_retries && sink.is_none() {
-            return self.request_retried(&body).await;
+        if self.transient_retries && complete {
+            return self.request_retried(&body, sink).await;
         }
         self.request_once(&body, sink, &mut None).await
     }
@@ -280,20 +291,42 @@ impl OpenAiProvider {
                 })
             {
                 return Err(LlmError::Protocol(
-                    "Responses 流必须使用 text/event-stream".into(),
+                    "模型流必须使用 text/event-stream".into(),
                 ));
             }
             let mut parser = stream::Sse::new();
             let mut state = stream::ResponseStream::default();
+            let mut chat_state = chat_stream::ChatStream::default();
             let mut received = 0;
             while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+                if received == 0
+                    && !chunk.is_empty()
+                    && let Some(timing) = &timing
+                {
+                    timing.record("first_stream_chunk", None);
+                }
                 if chunk.len() > self.config.max_response_bytes - received {
                     return Err(failed(ProviderFailureKind::ResponseTooLarge));
                 }
                 received += chunk.len();
                 for byte in chunk {
                     if let Some((name, data)) = parser.byte(byte)? {
-                        match state.event(&name, &data)? {
+                        let update = match self.config.protocol {
+                            OpenAiProtocol::Responses => state.event(&name, &data)?,
+                            OpenAiProtocol::ChatCompletions => {
+                                match chat_state.event(&name, &data)? {
+                                    None => stream::Update::None,
+                                    Some(response) => {
+                                        // Chat 工具说明可能先于 tool_calls；终态前不把草稿当作最终文本。
+                                        if let ModelResponse::Final { text } = &response {
+                                            sink.text_delta(text.clone()).await?;
+                                        }
+                                        stream::Update::Completed(response)
+                                    }
+                                }
+                            }
+                        };
+                        match update {
                             stream::Update::None => {}
                             stream::Update::Text(text) => sink.text_delta(text).await?,
                             // 正常终态立即关闭本地流，不等 EOF，不重连、不重复执行。
@@ -307,7 +340,7 @@ impl OpenAiProvider {
                     }
                 }
             }
-            return Err(LlmError::Protocol("Responses 流在正常终态前结束".into()));
+            return Err(LlmError::Protocol("模型流在正常终态前结束".into()));
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
@@ -326,6 +359,13 @@ impl OpenAiProvider {
             timing.finish();
         }
         decoded
+    }
+}
+
+struct DiscardText;
+impl ModelTextSink for DiscardText {
+    fn text_delta(&self, _: String) -> LlmFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
     }
 }
 
