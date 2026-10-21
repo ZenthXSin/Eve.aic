@@ -18,6 +18,13 @@ impl eve_config_api::ConfigValidator for CoreConfigValidator {
             ConfigError, LLM_NAMESPACE, LlmRuntimeConfig, MODELS_NAMESPACE, ModelRolesConfig,
         };
         let invalid = || ConfigError::InvalidValue("宿主配置".into());
+        if let Some(history) = snapshots.get(crate::history::NAMESPACE) {
+            let trigger: usize = history.get("compact_at_tokens")?;
+            let target: usize = history.get("compact_to_tokens")?;
+            if trigger != 0 && target >= trigger {
+                return Err(ConfigError::InvalidValue("压缩目标必须小于触发阈值".into()));
+            }
+        }
         if let Some(people) = snapshots.get(crate::qq_people::NAMESPACE) {
             crate::qq_people::settings(people)
                 .map_err(|_| ConfigError::InvalidValue(crate::qq_people::NAMESPACE.into()))?;
@@ -165,6 +172,14 @@ pub(crate) fn history_schema() -> ConfigSchema {
         namespace: crate::history::NAMESPACE.into(),
         version: 1,
         fields: BTreeMap::from([
+            (
+                "compact_at_tokens".into(),
+                field(150000, 0, 1000000, "EVE_CONTEXT_COMPACT_AT_TOKENS"),
+            ),
+            (
+                "compact_to_tokens".into(),
+                field(100000, 1000, 999999, "EVE_CONTEXT_COMPACT_TO_TOKENS"),
+            ),
             (
                 "max_turns".into(),
                 field(16, 1, 256, "EVE_HISTORY_MAX_TURNS"),
