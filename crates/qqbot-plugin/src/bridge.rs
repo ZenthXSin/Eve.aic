@@ -305,6 +305,7 @@ struct Active {
 }
 struct CommandMessage {
     message: Message,
+    private_text: Option<String>,
     target: Option<GenerationKey>,
     natural: bool,
     superseded: bool,
@@ -730,10 +731,14 @@ pub(crate) async fn run(
                 if !command.natural && let Some(handler) = &command_handler {
                     let session = message.session_key(&config.app_id)?;
                     match commands::dispatch(handler.as_ref(), QqCommandInput {
-                        message_id: &message.id, session: &session, text: &message.text,
+                        message_id: &message.id, session: &session, text: command.private_text.as_deref().unwrap_or(&message.text),
                     }) {
                         Ok(Some(text)) => {
                             replies.push_back(Reply { message, text, guard: ReplyGuard::Command, interaction: None, invite: None });
+                            continue;
+                        }
+                        Ok(None) if command.private_text.is_some() => {
+                            replies.push_back(Reply { message, text: "管理员绑定未启用。".into(), guard: ReplyGuard::Command, interaction: None, invite: None });
                             continue;
                         }
                         Ok(None) => {}
@@ -1291,8 +1296,11 @@ pub(crate) async fn run(
                                 }
                                 object.retain(|key, _| ["id", "scope", "target_id", "user_id", "text", "attachments"].contains(&key.as_str()));
                             }
-                            let Ok(message) = serde_json::from_value::<Message>(payload) else { warn(&ctx, "invalid_message"); continue; };
+                            let Ok(mut message) = serde_json::from_value::<Message>(payload) else { warn(&ctx, "invalid_message"); continue; };
                             if !message.valid() { warn(&ctx, "invalid_route_or_text"); continue; }
+                            // 绑定密钥只保留在命令处理器的临时内存；回执、观察器、训练与模型只能看到脱敏正文。
+                            let private_text = (message.text.split_whitespace().next() == Some("/bind"))
+                                .then(|| std::mem::replace(&mut message.text, "/bind [已隐藏]".into()));
                             let live = queue.iter().any(|m| m.message.id == message.id)
                                 || commands.iter().any(|c| c.message.id == message.id)
                                 || active.iter().any(|a| a.message.id == message.id)
@@ -1311,7 +1319,7 @@ pub(crate) async fn run(
                                 status.send_modify(|s| s.received += 1);
                                 timing(timing_diagnostics, "message_received", None);
                                 conversations.record_message(&config.app_id, &message)?;
-                                if let Some(observer) = &participant_observer {
+                                if private_text.is_none() && let Some(observer) = &participant_observer {
                                     let session = message.session_key(&config.app_id)?;
                                     if let Err(error) = observer.observe(&session, &message.conversation_key(&config.app_id)?, &message.text, sender_name.as_deref()) {
                                         if matches!(error, PluginError::State(_)) { return Err(error); }
@@ -1334,7 +1342,7 @@ pub(crate) async fn run(
                                             }
                                         }
                                     }
-                                    commands.push_back(CommandMessage { message, target, natural: false, superseded: false, saved: false });
+                                    commands.push_back(CommandMessage { message, private_text, target, natural: false, superseded: false, saved: false });
                                 } else {
                                     // 按普通输入准入时的持久开关采集，不能延后到模型执行。
                                     // 启停/重置可先于排队任务执行；旧输入必须已有去重凭据。
@@ -1359,7 +1367,7 @@ pub(crate) async fn run(
                                             finish(&mut stdin, &message.id).await?;
                                             continue;
                                         }
-                                        commands.push_back(CommandMessage { message, target, natural: true, superseded: false, saved: true });
+                                        commands.push_back(CommandMessage { message, private_text: None, target, natural: true, superseded: false, saved: true });
                                     } else {
                                         let ordinary = message.attachments.is_empty();
                                         queue.push_back(Queued { message, saved: false, ordinary });

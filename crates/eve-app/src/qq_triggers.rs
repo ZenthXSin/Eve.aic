@@ -1,6 +1,7 @@
 //! 原会话条件唤醒：有限的本地观察、持久准入、原会话 Control 与真实平台回执。
 use crate::AppError;
 use eve_control_api::{ControlInput, ControlPhase, ControlService, DiscardControlEvents};
+use eve_llm_api::ContextScope;
 use eve_llm_api::{
     Tool, ToolCall, ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolExecutionError,
     ToolFuture, ToolValidationError,
@@ -53,6 +54,8 @@ pub(crate) struct Observations {
     pub(crate) tasks: Option<Arc<dyn TaskAdmin>>,
     workspace: Option<PathBuf>,
     operators: BTreeSet<String>,
+    authorization: Option<Arc<dyn eve_developer_api::DeveloperAuthorization>>,
+    ordinary_access: bool,
     processes: bool,
 }
 impl Observations {
@@ -79,11 +82,29 @@ impl Observations {
             operators: config
                 .as_ref()
                 .map_or_else(BTreeSet::new, |c| c.operators.clone()),
+            ordinary_access: config.as_ref().is_some_and(|c| c.ordinary_access),
+            authorization: None,
             processes: config.is_some_and(|c| c.commands),
         })
     }
+    pub(crate) fn with_authorization(
+        mut self,
+        authorization: Arc<dyn eve_developer_api::DeveloperAuthorization>,
+    ) -> Self {
+        self.authorization = Some(authorization);
+        self
+    }
+    fn authorized(&self, owner: &SessionKey) -> bool {
+        self.operators.contains(&owner.user_id)
+            || self.authorization.as_ref().is_some_and(|a| {
+                a.is_operator(&ContextScope {
+                    session_id: owner.session_id.clone(),
+                    user_id: owner.user_id.clone(),
+                })
+            })
+    }
     fn file(&self, owner: &SessionKey, path: &str) -> Result<String, ToolExecutionError> {
-        if !self.operators.contains(&owner.user_id) {
+        if !self.ordinary_access && !self.authorized(owner) {
             return Err(failed("文件触发仅限已授权开发操作者"));
         }
         let root = self
@@ -130,7 +151,7 @@ impl Observations {
             .collect())
     }
     fn process(&self, owner: &SessionKey, pid: u32) -> Result<String, ToolExecutionError> {
-        if !self.processes || !self.operators.contains(&owner.user_id) {
+        if !self.processes || (!self.ordinary_access && !self.authorized(owner)) {
             return Err(failed("进程观察仅限已启用命令的开发操作者"));
         }
         if !cfg!(target_os = "linux") {
@@ -703,6 +724,8 @@ mod tests {
             tasks: None,
             workspace: Some(directory.path().into()),
             operators: BTreeSet::from(["u".into()]),
+            ordinary_access: false,
+            authorization: None,
             processes: true,
         };
         (kernel, Arc::new(observations), directory)

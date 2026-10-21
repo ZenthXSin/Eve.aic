@@ -24,6 +24,25 @@ const MAX_SEARCH_FILES: usize = 20_000;
 const MAX_SEARCH_LINE: usize = 240;
 /// 搜索跳过的目录名：版本库、工具账本与构建产物，不属于源码阅读范围。
 const SKIPPED_NAMES: [&str; 3] = [".git", ".eve-developer", "target"];
+fn sensitive_path(path: &str) -> bool {
+    Path::new(path).components().any(|c| match c {
+        Component::Normal(s) => {
+            let s = s.to_string_lossy().to_ascii_lowercase();
+            s.starts_with('.')
+                || matches!(
+                    s.as_str(),
+                    "agent.md" | "agents.md" | "cargo.toml" | "cargo.lock"
+                )
+                || s.contains("secret")
+                || s.contains("credential")
+                || s.contains("config")
+                || s.ends_with(".pem")
+                || s.ends_with(".key")
+        }
+        Component::CurDir => false,
+        _ => true,
+    })
+}
 fn failed(message: impl Into<String>) -> ToolExecutionError {
     ToolExecutionError::Failed(message.into())
 }
@@ -70,6 +89,7 @@ pub struct LocalDeveloper {
     serial: Mutex<()>,
     /// 只由测试构造替换；生产始终为 https://api.github.com/。
     api: Url,
+    authorization: Option<std::sync::Arc<dyn DeveloperAuthorization>>,
 }
 impl LocalDeveloper {
     pub fn new(
@@ -128,16 +148,27 @@ impl LocalDeveloper {
             next: AtomicU64::new(next),
             serial: Mutex::new(()),
             api: Url::parse("https://api.github.com/").expect("static URL"),
+            authorization: None,
         })
+    }
+    pub fn with_authorization(
+        mut self,
+        authorization: std::sync::Arc<dyn DeveloperAuthorization>,
+    ) -> Self {
+        self.authorization = Some(authorization);
+        self
     }
     fn authorize(&self, context: &ToolExecutionContext) -> Result<(), ToolExecutionError> {
         if context.is_cancel_requested() {
             return Err(ToolExecutionError::Cancelled("开发操作已取消".into()));
         }
-        if context
-            .scope()
-            .is_none_or(|s| !self.config.operators.contains(&s.user_id))
-        {
+        if context.scope().is_none_or(|s| {
+            !self.config.operators.contains(&s.user_id)
+                && !self
+                    .authorization
+                    .as_ref()
+                    .is_some_and(|a| a.is_operator(s))
+        }) {
             return Err(failed("此开发工具仅供宿主配置的操作者使用"));
         }
         Ok(())
@@ -159,7 +190,32 @@ impl LocalDeveloper {
             }
             return Ok(());
         }
-        self.authorize(context)
+        if context.is_cancel_requested() {
+            return Err(ToolExecutionError::Cancelled("操作已取消".into()));
+        }
+        let ordinary = match operation {
+            DeveloperOperation::List(a) | DeveloperOperation::Read(a) => !sensitive_path(&a.path),
+            DeveloperOperation::Search(a) => !sensitive_path(&a.path),
+            DeveloperOperation::Write(a) => !sensitive_path(&a.path),
+            DeveloperOperation::Edit(a) => !sensitive_path(&a.path),
+            DeveloperOperation::Github(a) => {
+                a.method == "GET"
+                    || (a.method == "POST"
+                        && (a.resource == "issues" || a.resource == "pulls" || {
+                            let p: Vec<_> = a.resource.split('/').collect();
+                            p.len() == 3
+                                && p[0] == "issues"
+                                && p[1].parse::<u64>().is_ok()
+                                && p[2] == "comments"
+                        }))
+            }
+            _ => false,
+        };
+        if self.config.ordinary_access && ordinary && context.scope().is_some() {
+            Ok(())
+        } else {
+            self.authorize(context)
+        }
     }
     fn path(&self, text: &str, new: bool) -> Result<PathBuf, ToolExecutionError> {
         let relative = Path::new(text);
@@ -242,7 +298,9 @@ impl LocalDeveloper {
         tmp.write_all(content)
             .and_then(|_| tmp.as_file().sync_all())
             .map_err(|_| failed("文件写入失败，原文件保留"))?;
-        self.authorize(context)?;
+        if context.is_cancel_requested() {
+            return Err(ToolExecutionError::Cancelled("文件提交已取消".into()));
+        }
         // 防止在写临时文件期间被外部编辑覆盖。
         let current = fs::read(path).ok().map(|b| hash(&b));
         if current.as_deref().unwrap_or("") != expected {
@@ -258,7 +316,7 @@ impl LocalDeveloper {
         Ok(())
     }
     /// 在工作区目录中按字面文本搜索 UTF-8 文件，按目录广度优先、名称排序输出；不跟随符号链接。
-    fn search(&self, a: SearchArguments) -> Result<Value, ToolExecutionError> {
+    fn search(&self, a: SearchArguments, sensitive: bool) -> Result<Value, ToolExecutionError> {
         let start = self.path(&a.path, false)?;
         if !fs::metadata(&start)
             .map_err(|_| failed("目录不可读取"))?
@@ -297,6 +355,9 @@ impl LocalDeveloper {
                 } else {
                     format!("{prefix}/{name}")
                 };
+                if !sensitive && sensitive_path(&relative) {
+                    continue;
+                }
                 if kind.is_dir() {
                     queue.push_back((entry.path(), relative));
                     continue;
@@ -425,7 +486,7 @@ impl LocalDeveloper {
                     json!({"success":true,"path":a.path,"sha256":hash(updated.as_bytes()),"bytes":updated.len()}),
                 )
             }
-            DeveloperOperation::Search(a) => self.search(a),
+            DeveloperOperation::Search(a) => self.search(a, self.authorize(context).is_ok()),
             DeveloperOperation::Command(a) => {
                 if !self.config.commands {
                     return Err(failed("命令执行未启用"));

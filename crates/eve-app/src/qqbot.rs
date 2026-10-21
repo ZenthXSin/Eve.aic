@@ -1523,7 +1523,23 @@ async fn run_qqbot_composed(
         bootstrap.host_config.final_answer_on_round_limit = true;
         bootstrap.host_config.max_tool_calls = 50;
         bootstrap.host_config.tool_progress_reports = true;
-        crate::developer::install(&mut bootstrap, &options.state_directory)?;
+        let legacy = std::env::var_os("EVE_DEVELOPER_CONFIG")
+            .map(std::fs::read)
+            .transpose()?
+            .map(|b| serde_json::from_slice::<eve_developer_api::DeveloperConfig>(&b))
+            .transpose()?
+            .map_or_else(std::collections::BTreeSet::new, |c| c.operators);
+        let qq_admin =
+            crate::qq_admin::Admin::open(&options.state_directory, conversations.clone(), legacy)?;
+        crate::developer::install_with_authorization(
+            &mut bootstrap,
+            &options.state_directory,
+            Some(qq_admin.clone()),
+        )?;
+        bootstrap.context = Some(Arc::new(crate::qq_admin::AccessContext {
+            inner: bootstrap.context.take().ok_or("对话上下文缺失")?,
+            admin: qq_admin.clone(),
+        }));
         // 子代理在工具执行期内等待结果；按配置上限放宽这一个工具的期限，实际期限由工具按配置控制。
         if options.subagents {
             bootstrap.host_config.tool_timeout_overrides.insert(
@@ -1569,12 +1585,15 @@ async fn run_qqbot_composed(
                 .value
                 .downcast::<eve_session_api::SessionServiceHandle>()
                 .map_err(|_| "条件唤醒会话服务类型错误")?;
-            let observations = Arc::new(qq_triggers::Observations::new(
-                sessions.0.clone(),
-                tasks
-                    .clone()
-                    .map(|t| Arc::new(t) as Arc<dyn eve_task_api::TaskAdmin>),
-            )?);
+            let observations = Arc::new(
+                qq_triggers::Observations::new(
+                    sessions.0.clone(),
+                    tasks
+                        .clone()
+                        .map(|t| Arc::new(t) as Arc<dyn eve_task_api::TaskAdmin>),
+                )?
+                .with_authorization(qq_admin.clone()),
+            );
             let _ = late.set(observations.clone());
             trigger_background = Some(qq_triggers::Background::start(
                 admin.clone(),
@@ -2097,6 +2116,7 @@ async fn run_qqbot_composed(
             },
         );
         let mut plugin = plugin.with_command_handler(Arc::new(CommandHandlers(vec![
+            qq_admin,
             Arc::new(crate::qq_people::Commands(people)),
             help_commands,
             commands,
