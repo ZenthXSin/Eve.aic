@@ -1541,12 +1541,16 @@ async fn run_qqbot_composed(
         bootstrap.host_config.final_answer_on_round_limit = true;
         bootstrap.host_config.max_tool_calls = 50;
         bootstrap.host_config.tool_progress_reports = true;
-        let legacy = std::env::var_os("EVE_DEVELOPER_CONFIG")
+        let developer_settings = std::env::var_os("EVE_DEVELOPER_CONFIG")
             .map(std::fs::read)
             .transpose()?
             .map(|b| serde_json::from_slice::<eve_developer_api::DeveloperConfig>(&b))
-            .transpose()?
-            .map_or_else(std::collections::BTreeSet::new, |c| c.operators);
+            .transpose()?;
+        let public_github = developer_settings
+            .as_ref()
+            .is_some_and(|c| c.github_all_users);
+        let legacy =
+            developer_settings.map_or_else(std::collections::BTreeSet::new, |c| c.operators);
         let qq_admin = crate::qq_admin::Admin::open(
             &options.state_directory,
             conversations.clone(),
@@ -1562,6 +1566,7 @@ async fn run_qqbot_composed(
             *tool = Arc::new(crate::qq_access::GuardedTool {
                 inner: tool.clone(),
                 admin: qq_admin.clone(),
+                public_github,
             });
         }
         bootstrap.context = Some(Arc::new(crate::qq_admin::AccessContext {

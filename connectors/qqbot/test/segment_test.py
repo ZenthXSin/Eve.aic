@@ -5,6 +5,7 @@
 """
 import hashlib
 import json
+from fixture_auth import bootstrap_test_admin
 import os
 import pathlib
 import signal
@@ -122,6 +123,7 @@ class SegmentAcceptance(unittest.TestCase):
         env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret",
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
                    EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
+        bootstrap_test_admin(self.work / "state", env)
         command = [str(BINARY), "--state-dir", str(self.work / "state"), "--agent", str(ROOT / "AGENT.md"),
                    "--bridge-script", str(FAKE), "--bridge-arg", str(scenario)]
         if segmented:

@@ -5,6 +5,7 @@
 确定性替身只证明宿主契约与恢复语义，不代表真实模型的观察质量。
 """
 import json
+from fixture_auth import bootstrap_test_admin
 import contextlib
 import os
 import pathlib
@@ -214,6 +215,7 @@ class InterestAcceptance(unittest.TestCase):
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
                    EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
         env.update(env_extra or {})
+        bootstrap_test_admin(self.work / "state", env)
         command = [str(BINARY), "--state-dir", str(self.work / "state"),
                    "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
                    "--bridge-arg", str(scenario), "--cognition-max-executions", str(max_executions)]

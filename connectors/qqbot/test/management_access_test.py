@@ -53,6 +53,26 @@ class ManagementAccessAcceptance(developer.DeveloperAcceptance):
         self.assertEqual(self.documents().get("eve.trigger", {}).get("triggers.v1", {}).get("triggers", []), [])
         self.assertEqual(self.chat_rounds, 2)
 
+    def test_public_github_requires_host_opt_in_and_keeps_other_management_blocked(self):
+        config = json.loads(self.developer_config.read_text())
+        config.update(github=True, github_all_users=True, github_all_repositories=False,
+                      github_write_repositories=[])
+        self.developer_config.write_text(json.dumps(config))
+        def respond(body):
+            if not self.results(body):
+                return tool_response([
+                    ("github_api", {"method":"POST", "repository":"test/repo", "resource":"issues", "body":{"title":"test"}}),
+                    ("write_file", {"path":"ordinary.txt", "content":"forbidden", "expected_sha256":""})])
+            github, write = self.results(body)
+            self.assertNotIn("主人或管理员", json.dumps(github, ensure_ascii=False))
+            self.assertFalse(github.get("success", False))
+            self.assertIn("授权", json.dumps(write, ensure_ascii=False))
+            return text_response("公开 GitHub 仍受仓库检查，其他管理操作未开放")
+        self.callback = respond
+        self.enabled(self.send(self.message("public-github", "查看公开配置", user="user-2",
+                      expected="公开 GitHub 仍受仓库检查，其他管理操作未开放")))
+        self.assertFalse((self.source / "ordinary.txt").exists())
+
     def test_admin_identity_files_are_owner_only_and_host_binding_grants_owner(self):
         protected = self.source / "AGENT.md"
         protected.write_text("original identity")

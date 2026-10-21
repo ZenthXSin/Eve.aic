@@ -2,7 +2,7 @@
 
 用户在对话里请 Eve 去做一件需要多步的事：聊天模型调用 dispatch_background_task 派发，账本保存后才回复；
 后台执行器看不到对话，只按派发说明调用工具，步数（工具调用次数）用尽后不再提供工具、由模型收尾；结束后
-私聊通知派发它的用户。用户可以让 Eve 查看或取消；重启时执行中的任务记为中断，不自动重跑。子代理在同一轮里
+私聊通知派发它的用户。用户可以让 Eve 查看或取消；重启时没有检查点的旧任务记为中断，不自动重跑；新任务的自动接续由 background_recovery_test 覆盖。子代理在同一轮里
 做完一件子任务并把结果交回。
 
 模型替身按请求里的工具定义与上下文确定性地作答，只证明宿主契约，不代表真实模型的理解能力。
@@ -200,7 +200,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.assertIsNone(task["result"])
         self.assertEqual(self.pushes(), [])
 
-    def test_a_restart_while_running_interrupts_without_rerunning_and_tells_the_owner(self):
+    def test_a_legacy_task_without_checkpoint_interrupts_without_rerunning_and_tells_the_owner(self):
         dispatch = self.dispatch()
 
         def respond(body):
@@ -215,6 +215,12 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
                          lambda t: t["status"] == "Running" and len(self.worker_requests()) == 1,
                          "task did not start")}, stop_at=stop)
         self.release.set()
+        # 模拟升级前没有执行检查点的历史任务；不能对未知旧操作自动重放。
+        state = json.loads(self.state_path.read_text())
+        ledger = json.loads(bytes(state["entries"]["eve.task"]["tasks.v1"]))
+        ledger["tasks"][0].pop("execution", None)
+        state["entries"]["eve.task"]["tasks.v1"] = list(json.dumps(ledger).encode())
+        self.state_path.write_text(json.dumps(state))
         self.callback = self.chat
         self.run_eve([*self.checkpoint("delivered"), *self.checkpoint("quiet")],
                      checkpoints={"delivered": lambda: self.wait_task(

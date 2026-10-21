@@ -57,11 +57,14 @@ fn owner_file(path: &str, write: bool) -> bool {
 pub(crate) struct GuardedTool {
     pub inner: Arc<dyn Tool>,
     pub admin: Arc<Admin>,
+    /// 仅由宿主开发配置赋值；后端仍检查仓库与凭据。
+    pub public_github: bool,
 }
 impl Tool for GuardedTool {
     fn definition(&self) -> ToolDefinition {
         let mut definition = self.inner.definition();
-        if !public_tool(&definition.name) {
+        if !(public_tool(&definition.name) || self.public_github && definition.name == "github_api")
+        {
             definition.description.push_str(
                 " 此管理能力需要主人或管理员授权；普通用户不可调用，也不可通过后台或子代理代办。",
             );
@@ -82,7 +85,11 @@ impl Tool for GuardedTool {
             let owner = self.admin.is_owner(scope);
             let administrator = self.admin.is_operator(scope);
             let name = self.inner.definition().name;
-            if !owner && !administrator && !public_tool(&name) {
+            if !(owner
+                || administrator
+                || public_tool(&name)
+                || self.public_github && name == "github_api")
+            {
                 return Err(ToolExecutionError::Failed("此操作需要主人或管理员授权；普通用户不能创建后台任务、定时主动消息、改动工作区或执行管理操作".into()));
             }
             if !owner

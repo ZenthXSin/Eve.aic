@@ -372,6 +372,9 @@ class Supervisor:
             if self.stopping or child.process.poll() is not None:
                 raise ValueError('candidate_not_stable')
             time.sleep(0.05)
+        # 调度暂停可能跨过整个稳定窗口；提交指针前仍须核对进程尚存。
+        if self.stopping or child.process.poll() is not None:
+            raise ValueError('candidate_not_stable')
 
     def candidate_command(self, request):
         if (self.root / 'quarantine' / (request['candidate_sha256'] + '.json')).exists():

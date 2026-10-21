@@ -4,6 +4,7 @@
 快照检查通过桥接 touch/wait_file 握手，避免用固定延时猜测提交时序。
 """
 import json
+from fixture_auth import bootstrap_test_admin
 import os
 import pathlib
 import signal
@@ -208,6 +209,7 @@ class MemoryAcceptance(unittest.TestCase):
             EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
             EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
         env.update(env_extra or {})
+        bootstrap_test_admin(self.work / "state", env, app)
         command = [str(BINARY), "--state-dir", str(self.work / "state"),
             "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
             "--bridge-arg", str(scenario)]
