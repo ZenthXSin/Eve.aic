@@ -77,7 +77,7 @@ function ownAttachments(msg) {
     const textual = own.filter(element => typeof element.content === "string" && element.content.trim());
     const selected = textual.length
       ? textual.filter(element => !current || element.content.trim() === current)
-      : (own.length === 1 ? own : []);
+      : own;
     for (const element of selected) {
       for (const raw of Array.isArray(element.attachments) ? element.attachments : []) push(raw);
     }
