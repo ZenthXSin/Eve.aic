@@ -52,7 +52,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         super().tearDown()
 
     def run_eve(self, script, tasks=True, subagents=True, **options):
-        more = (["--background-tasks"] if tasks else []) + (["--subagents"] if subagents else [])
+        more = ["--max-tool-rounds", "4"] + (["--background-tasks"] if tasks else []) + (["--subagents"] if subagents else [])
         return reminder_test.base().run_eve(self, script, interest=False, research=False, practice=False,
                                             more=more, **options)
 
@@ -254,6 +254,43 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.run_eve(self.send(self.message("ask", "帮我确认一下 echo 能不能用", expected="子代理查过了：echo 可用。")))
         self.assertEqual(len(self.worker_requests()), 2)
         self.assertEqual(self.tasks(), [], "子代理不进入后台任务账本")
+
+    def test_ten_subagents_execute_concurrently_in_one_tool_batch(self):
+        condition = threading.Condition()
+        entered = []
+        def respond(body):
+            if self.is_worker(body):
+                with condition:
+                    entered.append(self.text(body))
+                    condition.notify_all()
+                    self.assertTrue(condition.wait_for(lambda: len(entered) == 10, timeout=12),
+                                    "ten subagents did not overlap")
+                return text_response("checked " + self.text(body))
+            results = self.results(body)
+            if not results:
+                return calls(*[(f"parallel-{i}", "run_subagent", {"task": f"check-{i}"}) for i in range(10)])
+            self.assertEqual(len(results), 10)
+            self.assertTrue(all(result["completed"] for result in results))
+            return text_response("十个子代理全部完成")
+        self.callback = respond
+        self.run_eve(self.send(self.message("parallel", "并行核对十项", expected="十个子代理全部完成")))
+        self.assertEqual(len(entered), 10)
+
+    def test_subagents_can_run_serially_with_the_previous_result_as_input(self):
+        def respond(body):
+            if self.is_worker(body):
+                return text_response("first-result" if self.text(body) == "first" else "second-result")
+            results = self.results(body)
+            if not results:
+                return calls(("serial-1", "run_subagent", {"task": "first"}))
+            if len(results) == 1:
+                self.assertEqual(results[0]["result"], "first-result")
+                return calls(("serial-2", "run_subagent", {"task": "use first-result"}))
+            self.assertEqual(results[1]["result"], "second-result")
+            return text_response("串行完成")
+        self.callback = respond
+        self.run_eve(self.send(self.message("serial", "依次核对", expected="串行完成")))
+        self.assertEqual([self.text(r) for r in self.worker_requests()], ["first", "use first-result"])
 
     def test_both_are_off_by_default(self):
         def respond(body):

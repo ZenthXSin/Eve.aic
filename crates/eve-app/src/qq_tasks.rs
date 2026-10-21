@@ -118,6 +118,10 @@ pub(crate) fn schema() -> ConfigSchema {
             ),
             ("max_running".into(), field(2, 1, 8, "EVE_TASK_MAX_RUNNING")),
             (
+                "subagent_concurrency".into(),
+                field(10, 1, 10, "EVE_SUBAGENT_CONCURRENCY"),
+            ),
+            (
                 "task_timeout_ms".into(),
                 field(1_800_000, 10_000, 7_200_000, "EVE_TASK_TIMEOUT_MS"),
             ),
@@ -142,6 +146,7 @@ pub(crate) struct Settings {
     pub(crate) max_running: usize,
     pub(crate) task_timeout: Duration,
     pub(crate) subagent_timeout: Duration,
+    pub(crate) subagent_concurrency: usize,
 }
 
 pub(crate) fn settings(snapshot: &ConfigSnapshot) -> Result<Settings, String> {
@@ -152,6 +157,7 @@ pub(crate) fn settings(snapshot: &ConfigSnapshot) -> Result<Settings, String> {
             max_running: snapshot.get("max_running")?,
             task_timeout: Duration::from_millis(snapshot.get("task_timeout_ms")?),
             subagent_timeout: Duration::from_millis(snapshot.get("subagent_timeout_ms")?),
+            subagent_concurrency: snapshot.get("subagent_concurrency")?,
         })
     };
     let value = read().map_err(|_| "后台任务配置无法读取".to_string())?;
@@ -376,8 +382,38 @@ impl Plugin for ContextPlugin {
 pub(crate) struct Late {
     pub(crate) worker: OnceLock<Arc<Worker>>,
     pub(crate) config: OnceLock<Arc<dyn ConfigService>>,
+    subagent_slots: std::sync::atomic::AtomicUsize,
+}
+struct SubagentSlot<'a>(&'a std::sync::atomic::AtomicUsize);
+impl Drop for SubagentSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 impl Late {
+    async fn acquire_subagent(
+        &self,
+        limit: usize,
+        context: &ToolExecutionContext,
+    ) -> Result<SubagentSlot<'_>, ToolExecutionError> {
+        use std::sync::atomic::Ordering;
+        loop {
+            if context.is_cancel_requested() {
+                return Err(ToolExecutionError::Cancelled("本轮已取消".into()));
+            }
+            if self
+                .subagent_slots
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    (n < limit).then_some(n + 1)
+                })
+                .is_ok()
+            {
+                return Ok(SubagentSlot(&self.subagent_slots));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     fn settings(&self) -> Result<Settings, ToolExecutionError> {
         let config = self
             .config
@@ -735,6 +771,10 @@ impl Tool for SubagentTool {
                 .get()
                 .cloned()
                 .ok_or_else(|| failed("子代理执行器尚未就绪"))?;
+            let _slot = self
+                .late
+                .acquire_subagent(settings.subagent_concurrency, &context)
+                .await?;
             // 本轮取消时子代理一并停下。
             let (stop, stopped) = watch::channel(false);
             let running = worker.run(
@@ -1153,6 +1193,7 @@ mod tests {
             max_running: 2,
             task_timeout: Duration::from_secs(60),
             subagent_timeout: Duration::from_secs(60),
+            subagent_concurrency: 10,
         };
         assert_eq!(resolve_steps(&json!({}), &settings).unwrap(), 50);
         assert_eq!(
@@ -1160,5 +1201,35 @@ mod tests {
             80
         );
         assert!(resolve_steps(&json!({"max_steps": 121}), &settings).is_err());
+    }
+    #[tokio::test]
+    async fn ten_subagents_can_enter_and_the_eleventh_waits_until_a_slot_is_released() {
+        let late = Late::default();
+        let context = ToolExecutionContext::new();
+        let mut slots = vec![];
+        for _ in 0..10 {
+            slots.push(late.acquire_subagent(10, &context).await.unwrap());
+        }
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(75),
+                late.acquire_subagent(10, &context)
+            )
+            .await
+            .is_err()
+        );
+        slots.pop();
+        let _eleventh = tokio::time::timeout(
+            Duration::from_millis(75),
+            late.acquire_subagent(10, &context),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        context.cancellation_handle().cancel();
+        assert!(matches!(
+            late.acquire_subagent(10, &context).await,
+            Err(ToolExecutionError::Cancelled(_))
+        ));
     }
 }
