@@ -718,7 +718,7 @@ impl LlmHost {
             ) {
                 let result = tokio::select! { biased;
                     _ = wait_closed(events) => Err(LlmError::Cancelled),
-                    _ = tokio::time::sleep(Duration::from_secs(180)) => Err(LlmError::ProviderTimeout),
+                    _ = tokio::time::sleep(Duration::from_secs(600)) => Err(LlmError::Context("上下文压缩超过总期限；已经保存的摘要进度与工具回执保留，压缩后的下一次对话请求未发出".into())),
                     result = contain_panic(state.compact(&mut messages, &definitions, policy, service, scope.as_ref())) => result,
                 };
                 if let Err(error) = result {

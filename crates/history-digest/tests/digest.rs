@@ -66,7 +66,7 @@ async fn active_compaction_covers_all_batches_persists_reuses_and_never_enqueues
         directory.path(),
         Some(DigestOptions {
             min_uncovered_turns: 64,
-            max_input_bytes: 1,
+            max_input_bytes: 4096,
         }),
     );
     let seen: Seen = Arc::default();
@@ -81,7 +81,10 @@ async fn active_compaction_covers_all_batches_persists_reuses_and_never_enqueues
             },
         }))
         .unwrap();
-    let original = history(3);
+    let mut original = history(3);
+    for message in &mut original {
+        message.text = message.text.as_ref().map(|t| t.repeat(5000));
+    }
     assert!(service.cached(Some(&scope()), &original).unwrap().is_none());
     let result = service
         .compact(Some(&scope()), &original)
@@ -116,6 +119,36 @@ async fn active_compaction_covers_all_batches_persists_reuses_and_never_enqueues
             .covered_turns,
         3
     );
+}
+
+#[tokio::test]
+async fn active_timeout_is_identified_as_compaction_and_oversized_turn_is_bounded() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = service(
+        directory.path(),
+        Some(DigestOptions {
+            min_uncovered_turns: 1,
+            max_input_bytes: 4096,
+        }),
+    );
+    let seen: Seen = Arc::default();
+    service
+        .install_compactor(Arc::new(Scripted {
+            seen: seen.clone(),
+            reply: |_| Err(LlmError::ProviderTimeout),
+        }))
+        .unwrap();
+    let original = vec![
+        ChatMessage::text(ChatRole::User, "很长的用户要求".repeat(10000)),
+        ChatMessage::text(ChatRole::Assistant, "很长的旧回答".repeat(10000)),
+    ];
+    assert!(
+        matches!(service.compact(Some(&scope()),&original).await,Err(LlmError::Context(reason)) if reason.starts_with("上下文压缩"))
+    );
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(serde_json::to_vec(&seen[0].turns[0]).unwrap().len() <= 4096);
+    assert!(seen[0].turns[0].truncated);
 }
 
 #[tokio::test]

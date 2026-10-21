@@ -12,6 +12,17 @@ class ContextCompactionAcceptance(digest.HistoryDigestAcceptance):
             locals()[_name] = None
     del _name
 
+    def test_digest_timeout_is_not_reported_as_main_dialogue_timeout_and_tools_are_not_replayed(self):
+        (self.source / "README.md").write_text("中文结果" * 2700, encoding="utf8")
+        self.callback = lambda body: tool_response([("read_file", {"path": "README.md"})] * 8)
+        self.response_gates[("chat", 2)] = "keep-summary-blocked"
+        self.run_window([*self.send(self.message("timeout", "读取后接续", contains=["上下文压缩未能完成", "已启动 8 次工具调用"]))],
+                        env_extra={"EVE_CONTEXT_COMPACT_AT_TOKENS":"150000", "EVE_CONTEXT_COMPACT_TO_TOKENS":"100000",
+                                   "EVE_MODELS_PRIMARY_TIMEOUT_MS":"1000", "EVE_OPENAI_TIMEOUT_SECONDS":"1"})
+        self.assertEqual(self.turn("读取后接续")["status"]["failure"]["started_tools"], 8)
+        self.assertEqual(len(self.requests), 2)
+        self.assertIn("对话历史压缩器", self.requests[1]["body"]["messages"][0]["content"])
+
     def test_150k_tool_context_is_summarized_then_continues_and_saved_history_reuses_after_restart(self):
         content = "中文结果" * 2700
         (self.source / "README.md").write_text(content, encoding="utf8")

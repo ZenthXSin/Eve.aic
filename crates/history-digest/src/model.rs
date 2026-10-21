@@ -52,7 +52,7 @@ impl HistoryDigester for ModelHistoryDigester {
                 selection
                     .provider_timeout
                     .saturating_add(Duration::from_secs(1))
-                    .min(Duration::from_secs(60)),
+                    .min(Duration::from_secs(180)),
                 selection.provider.complete(request),
             )
             .await

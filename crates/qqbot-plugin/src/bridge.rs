@@ -444,6 +444,10 @@ fn failed_turn_notice(report: &ControlReport) -> String {
         _ => None,
     };
     let reason = match error {
+        Some(LlmError::Context(reason)) if reason.starts_with("上下文压缩") => {
+            "上下文压缩未能完成，已保存的摘要进度与原始记录仍保留；压缩后的下一次对话请求未发出"
+                .into()
+        }
         Some(error) if error.provider_failure().is_some() => {
             failure_reason(error.provider_failure().expect("checked failure"))
         }

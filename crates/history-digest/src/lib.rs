@@ -303,7 +303,20 @@ impl HistoryDigests for HistoryDigestService {
                 let request = plan_active(&pending, options)
                     .ok_or_else(|| LlmError::Context("上下文压缩没有向前推进".into()))?;
                 let covered = request.covered_turns();
-                let points = digester.digest(request).await?;
+                let points = digester
+                    .digest(request)
+                    .await
+                    .map_err(|error| match error {
+                        LlmError::ProviderTimeout => LlmError::Context(
+                            "上下文压缩模型响应超时；已保存的摘要进度保留，不是主对话模型请求超时"
+                                .into(),
+                        ),
+                        error if error.provider_failure().is_some() => LlmError::Context(
+                            "上下文压缩模型请求失败；已保存的摘要进度保留，后续对话请求未发出"
+                                .into(),
+                        ),
+                        error => error,
+                    })?;
                 validate_points(&points, covered).map_err(|e| LlmError::Protocol(e.to_string()))?;
                 let version = DigestVersion {
                     covered_turns: covered,
@@ -463,7 +476,19 @@ fn plan_inner(
     let mut bytes = 0usize;
     for (index, messages) in groups.iter().enumerate().skip(previous_turns) {
         let turn = if active {
-            digest_turn_limits(index + 1, messages, 8192, 2048, true)
+            let mut text_limit = 8192;
+            let mut tool_limit = 2048;
+            loop {
+                let turn = digest_turn_limits(index + 1, messages, text_limit, tool_limit, true);
+                if serde_json::to_vec(&turn).ok()?.len() <= options.max_input_bytes {
+                    break turn;
+                }
+                if text_limit <= 128 && tool_limit <= 64 {
+                    return None;
+                }
+                text_limit = (text_limit / 2).max(128);
+                tool_limit = (tool_limit / 2).max(64);
+            }
         } else {
             digest_turn(index + 1, messages)
         };
