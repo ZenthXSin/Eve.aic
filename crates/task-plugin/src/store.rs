@@ -10,7 +10,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,18 +50,25 @@ impl StoredTasks {
                     return Err(TaskError::CorruptState);
                 }
                 let value = strict_json::from_slice(&bytes).map_err(|_| TaskError::CorruptState)?;
-                if value.get("format_version").and_then(|value| value.as_u64())
-                    != Some(u64::from(FORMAT_VERSION))
-                {
+                if !matches!(
+                    value.get("format_version").and_then(|value| value.as_u64()),
+                    Some(1 | 2)
+                ) {
                     return Err(if value.get("format_version").is_some() {
                         TaskError::UnsupportedVersion
                     } else {
                         TaskError::CorruptState
                     });
                 }
-                let ledger: Ledger =
+                let mut ledger: Ledger =
                     serde_json::from_value(value).map_err(|_| TaskError::CorruptState)?;
+                if ledger.format_version == 1
+                    && ledger.tasks.iter().any(|task| task.spec.context.is_some())
+                {
+                    return Err(TaskError::CorruptState);
+                }
                 validate_ledger(&ledger)?;
+                ledger.format_version = FORMAT_VERSION;
                 ledger
             }
         };
@@ -134,6 +141,13 @@ impl StoredTasks {
         validate_owner(owner)?;
         validate_id(source)?;
         validate_spec(&spec)?;
+        if spec
+            .context
+            .as_ref()
+            .is_some_and(|context| &context.owner != owner)
+        {
+            return Err(TaskError::InvalidInput);
+        }
         if now_ms == 0 {
             return Err(TaskError::InvalidInput);
         }
@@ -490,6 +504,14 @@ fn validate_task(task: &Task) -> TaskResult<()> {
     validate_owner(&task.owner)?;
     validate_id(&task.source)?;
     validate_spec(&task.spec)?;
+    if task
+        .spec
+        .context
+        .as_ref()
+        .is_some_and(|context| context.owner != task.owner)
+    {
+        return Err(TaskError::CorruptState);
+    }
     let invalid = Err(TaskError::CorruptState);
     if task.id != task_id(&task.owner.user_id, &task.source) || task.created_at_ms == 0 {
         return invalid;
