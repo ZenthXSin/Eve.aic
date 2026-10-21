@@ -210,6 +210,8 @@ class MessageJudgeAcceptance(unittest.TestCase):
         if inspect:
             env["EVE_WEB_TOKEN"] = PANEL_TOKEN
             command.extend(["--web-listen", "127.0.0.1:0"])
+        from fixture_auth import bootstrap_test_admin
+        bootstrap_test_admin(self.work / "state", env)
         child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             if inspect:
@@ -380,7 +382,7 @@ class MessageJudgeAcceptance(unittest.TestCase):
         self.run_eve([
             {"send": self.message("owner", "群内原始任务", scope="group")}, self.wait_request("task"),
             {"send": others},
-            {"send": self.message("barrier", "/continue", NO_CURRENT, scope="group", user="user-3")},
+            {"send": self.message("barrier", "/continue", "此管理操作需要主人或管理员授权。普通聊天和只读查询仍可使用。", scope="group", user="user-3")},
             self.wait_command("barrier"), self.open_gate("release-owner"), self.wait_receipt("owner"),
             *[self.wait_receipt(message["id"]) for message in others]])
         self.assertEqual(self.counts(), (4, 0, 0))

@@ -14,13 +14,13 @@ import threading
 import unittest
 
 import reminder_test
-from dialogue_tools_test import text_response
+from dialogue_tools_test import PLATFORM_TOOLS, text_response
 from memory_test import BINARY, ROOT
 
 WORKER = "你在为 Eve 独立完成一项委托的任务"
 TASKS = '{"kind":"eve.background_tasks"'
 ORCHESTRATION = {"dispatch_background_task", "list_background_tasks", "cancel_background_task", "run_subagent"}
-CHAT_TOOLS = {"echo"} | ORCHESTRATION
+CHAT_TOOLS = PLATFORM_TOOLS | {"echo"} | ORCHESTRATION
 ASK = "帮我在后台把日志整理一下"
 DISPATCHED = "好，已经在后台处理，做完私聊你。"
 INSTRUCTIONS = "读取三份日志，统计错误条数，给出结论。"
@@ -101,7 +101,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.assertEqual(roles.count("user"), 1, "执行器看不到对话")
         if not body.get("tools"):
             return text_response(RESULT)
-        self.assertEqual(self.definitions(body), {"echo"}, "执行器没有派发与子代理工具")
+        self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo"}, "执行器没有派发与子代理工具")
         done = len(self.results(body))
         return calls((f"step-{done}", "echo", {"text": f"第 {done + 1} 步"}))
 
@@ -242,7 +242,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
                 self.assertEqual([m["role"] for m in body["messages"]].count("user"), 1, "子代理看不到对话")
                 if not body.get("tools"):
                     return text_response("echo 可用。")
-                self.assertEqual(self.definitions(body), {"echo"})
+                self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo"})
                 if not self.results(body):
                     return calls(("probe", "echo", {"text": "ping"}))
                 [echoed] = self.results(body)
@@ -253,7 +253,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
             if not results:
                 return calls(("delegate", "run_subagent", {"task": task, "max_steps": 2}))
             [result] = results
-            self.assertEqual(result, {"completed": True, "result": "echo 可用。",
+            self.assertEqual(result, {"completed": True, "result": "echo 可用。", "include_context": False,
                                       "usage": {"steps_used": 1, "max_steps": 2, "model_requests": 2}})
             return text_response("子代理查过了：echo 可用。")
         self.callback = respond
@@ -300,7 +300,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
 
     def test_both_are_off_by_default(self):
         def respond(body):
-            self.assertEqual(self.definitions(body), {"echo"})
+            self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo"})
             self.assertIsNone(self.context(body))
             return text_response("我现在不能派发后台任务。")
         self.callback = respond

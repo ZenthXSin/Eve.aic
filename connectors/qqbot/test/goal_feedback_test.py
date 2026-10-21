@@ -193,6 +193,9 @@ class GoalFeedbackAcceptance(unittest.TestCase):
             environment["EVE_WEB_TOKEN"] = PANEL_TOKEN
             command.extend(["--web-listen", "127.0.0.1:0"])
         with open(stderr_file, "w") as stderr_sink:
+            from fixture_auth import bootstrap_test_admin
+            bootstrap_test_admin(self.work / "state", environment, app,
+                                 users=getattr(self, "fixture_admin_users", ("user-1", "user-2")))
             child = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE,
                                      stderr=stderr_sink if panel is not None else subprocess.PIPE, text=True)
             if panel is not None:
@@ -378,6 +381,8 @@ class GoalFeedbackAcceptance(unittest.TestCase):
             self.assertEqual(self.cognition()["goals"][child_id], child)
 
     def test_feedback_rejects_cross_user_group_and_app_without_model_requests(self):
+        # 两个可信管理员之间仍须隔离待办所有者；普通用户拒绝由权限专用用例覆盖。
+        self.fixture_admin_users = ("user-1", "user-2")
         self.run_eve([*self.add(scope="group"), self.wait_child()], budget=1)
         parent_id = self.bindings["before"]["id"]
         revision = self.bindings["before"]["revision"]

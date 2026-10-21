@@ -209,7 +209,8 @@ class MemoryAcceptance(unittest.TestCase):
             EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
             EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
         env.update(env_extra or {})
-        bootstrap_test_admin(self.work / "state", env, app)
+        bootstrap_test_admin(self.work / "state", env, app,
+                             users=getattr(self, "fixture_admin_users", ("user-1", "user-2")))
         command = [str(BINARY), "--state-dir", str(self.work / "state"),
             "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
             "--bridge-arg", str(scenario)]
@@ -419,6 +420,8 @@ class MemoryAcceptance(unittest.TestCase):
         self.assertEqual(len(self.requests), 1)
 
     def test_private_user_group_and_application_boundaries(self):
+        # 管理员身份也不能跨用户改写偏好；普通用户拒绝由权限专用用例覆盖。
+        self.fixture_admin_users = ("user-1", "user-2")
         id = self.remember(scope="group")
         before = self.memory()
         routes = [{"scope": "group", "user": "user-2"},

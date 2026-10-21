@@ -182,7 +182,21 @@ impl QqCommandHandler for GuardedCommands {
         let head = words.next().unwrap_or_default();
         let query = matches!(
             head,
-            "/admin" | "/bind" | "/help" | "/status" | "/name" | "/cancel"
+            "/admin"
+                | "/bind"
+                | "/help"
+                | "/status"
+                | "/name"
+                | "/cancel"
+                | "/mind"
+                | "/memories"
+                | "/recall"
+                | "/knowledge"
+                | "/practice"
+                | "/plans"
+                | "/memory-candidates"
+                | "/memory-decision"
+                | "/gaps"
         ) || words.clone().next().is_none()
             && matches!(
                 head,
