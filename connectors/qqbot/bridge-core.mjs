@@ -42,19 +42,47 @@ function allowedType(type) {
   return /^image\/[a-z0-9.+-]{1,64}$/i.test(type) || FILE_TYPES.has(type.toLowerCase());
 }
 function attachment(raw) {
-  if (!raw || typeof raw.content_type !== "string" || !allowedType(raw.content_type)) return null;
-  if (typeof raw.url !== "string" || raw.url.length > 4096 ||
-      !/^https:\/\/[^/\s]+\//.test(raw.url) || /[\p{Cc}]/u.test(raw.url)) return null;
-  const out = { content_type: raw.content_type.toLowerCase(), url: raw.url };
-  if (typeof raw.filename === "string" && raw.filename.trim() === raw.filename &&
-      raw.filename && raw.filename.length <= 255 && !/[\p{Cc}\/\\]/u.test(raw.filename)) {
-    out.filename = raw.filename;
-  }
+  if (!raw || typeof raw !== "object") return null;
+  const type = typeof raw.content_type === "string" && raw.content_type
+    ? raw.content_type
+    : typeof raw.contentType === "string" && raw.contentType ? raw.contentType : "application/octet-stream";
+  if (!allowedType(type)) return null;
+  const url = typeof raw.url === "string" ? raw.url : "";
+  if (url && (url.length > 4096 || !/^https:\/\/[^/\s]+\//.test(url) || /[\p{Cc}]/u.test(url))) return null;
+  const out = { content_type: type.toLowerCase() };
+  if (url) out.url = url;
+  const name = raw.filename ?? raw.file_name ?? raw.fileName;
+  if (typeof name === "string" && name.trim() === name && name && name.length <= 255 &&
+      !/[\p{Cc}\/\\]/u.test(name)) out.filename = name;
   return out;
 }
-function imageAttachments(msg) {
-  if (!Array.isArray(msg.attachments)) return [];
-  return msg.attachments.map(attachment).filter(Boolean).slice(0, 4);
+// 本条自己的附件。信封上没有时，文件经常只出现在 msg_elements 里，
+// 引用消息的元素带 msg_idx，不并进本条。
+function ownAttachments(msg) {
+  const found = [];
+  const push = raw => {
+    const item = attachment(raw);
+    if (item && found.length < 4 && !found.some(saved =>
+        saved.content_type === item.content_type && saved.url === item.url && saved.filename === item.filename)) {
+      found.push(item);
+    }
+  };
+  for (const raw of Array.isArray(msg.attachments) ? msg.attachments : []) push(raw);
+  const elements = msg.msg_elements ?? msg.msgElements;
+  const quoted = Number(msg.msgType) === 103;
+  if (!found.length && Array.isArray(elements)) {
+    const own = elements.filter((element, index) => element && typeof element === "object" &&
+      element.msg_idx == null && !(quoted && index === 0));
+    const current = (typeof msg.content === "string" ? msg.content : "").trim();
+    const textual = own.filter(element => typeof element.content === "string" && element.content.trim());
+    const selected = textual.length
+      ? textual.filter(element => !current || element.content.trim() === current)
+      : (own.length === 1 ? own : []);
+    for (const element of selected) {
+      for (const raw of Array.isArray(element.attachments) ? element.attachments : []) push(raw);
+    }
+  }
+  return found;
 }
 // 被引用消息的文字与附件单独抽出，不和本条新发的附件混在一起。
 function quotedMessage(msg) {
@@ -141,7 +169,7 @@ export function createBridge(bot, emit, limit = 128) {
       warn("unsupported_message"); return;
     }
     const target = msg.replyTarget;
-    const attachments = imageAttachments(msg);
+    const attachments = ownAttachments(msg);
     const quoted = quotedMessage(msg);
     if (!validMessageId(msg.messageId) || !validId(msg.senderId) || !target ||
         target.scope !== msg.kind || target.msgId !== msg.messageId ||

@@ -54,11 +54,12 @@ impl ImageAttachment {
     }
     fn valid(&self) -> bool {
         self.type_allowed()
-            && self.url.starts_with("https://")
             && self.url.len() <= 4096
-            && self.url[8..]
-                .split_once('/')
-                .is_some_and(|(host, _)| !host.is_empty())
+            && (self.url.is_empty()
+                || (self.url.starts_with("https://")
+                    && self.url[8..]
+                        .split_once('/')
+                        .is_some_and(|(host, _)| !host.is_empty())))
             && !self
                 .url
                 .chars()
@@ -131,8 +132,19 @@ impl Message {
             note.push_str(&format!("收到 {images} 个图片附件，已保存引用，尚未获取像素或进行视觉解析。不能声称已经看见或推测图片内容。"));
         }
         if files > 0 {
+            let names: Vec<&str> = self
+                .attachments
+                .iter()
+                .filter(|item| !item.is_image())
+                .filter_map(|item| item.filename.as_deref())
+                .collect();
             note.push_str(&format!(
-                "收到 {files} 个文件附件，只保存了文件名、类型和链接，未下载内容。"
+                "收到 {files} 个文件附件，只保存了类型{}，未下载内容。",
+                if names.is_empty() {
+                    String::new()
+                } else {
+                    format!("（{}）", names.join("、"))
+                }
             ));
         }
         note.push_str(
