@@ -1092,10 +1092,33 @@ pub(crate) async fn run(
                 continue;
             }
             // 主动私聊：通道空闲时定期询问宿主；路由只取自已确认的私聊回执。
-            let push_ready = push_interval.is_some() && pushing.is_none() && sending_file.is_none() && delivering.is_none() && progress_delivery.is_none()
+            let channel_idle = pushing.is_none() && sending_file.is_none() && delivering.is_none() && progress_delivery.is_none()
                 && judging.is_none() && replies.is_empty() && status.borrow().ready;
-            let file_ready = file_poll.is_some() && files.is_some() && sending_file.is_none() && pushing.is_none()
-                && delivering.is_none() && progress_delivery.is_none() && judging.is_none() && replies.is_empty() && status.borrow().ready;
+            let push_ready = push_interval.is_some() && channel_idle;
+            let file_ready = file_poll.is_some() && files.is_some() && channel_idle;
+            // 待发文件优先于主动私聊：用户要的文件不该排在定期邀请后面。
+            if file_ready && let Some(files) = &files {
+                match files.next_file() {
+                    Ok(Some(file)) => {
+                        let route = route_for(&ledger, &config.app_id, &file.session)?;
+                        let name_ok = file.name.as_deref().is_none_or(crate::files::valid_name);
+                        let caption_ok = file.caption.as_deref().is_none_or(crate::files::valid_caption);
+                        match route.filter(|_| valid_message_id(&file.id) && valid_path(&file.path) && name_ok && caption_ok) {
+                            Some((scope, target)) => {
+                                write(&mut stdin, json!({"type":"file","version":1,"id":file.id,
+                                    "scope":scope,"target_id":target,"path":file.path,
+                                    "name":file.name,"caption":file.caption})).await?;
+                                deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+                                sending_file = Some(file.id);
+                            }
+                            None => report_file(files, &ctx, &file.id, QqFileResult::NotSent),
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(_) => warn(&ctx, "file_delivery_unavailable"),
+                }
+            }
             if push_ready && let (Some(hook), Some(interval)) = (&outreach, push_interval)
                 && tokio::time::Instant::now() >= next_push {
                 next_push = tokio::time::Instant::now() + interval;
@@ -1118,31 +1141,6 @@ pub(crate) async fn run(
                     }
                     Ok(None) => {}
                     Err(_) => warn(&ctx, "outreach_unavailable"),
-                }
-                continue;
-            }
-            // 文件投递：通道空闲时询问宿主；路由只取自该会话已确认的回执，路径已由宿主校验。
-            if file_ready && let (Some(files), Some(interval)) = (&files, file_poll)
-                && tokio::time::Instant::now() >= next_push {
-                next_push = tokio::time::Instant::now() + interval;
-                match files.next_file() {
-                    Ok(Some(file)) => {
-                        let route = route_for(&ledger, &config.app_id, &file.session)?;
-                        let name_ok = file.name.as_deref().is_none_or(crate::files::valid_name);
-                        let caption_ok = file.caption.as_deref().is_none_or(crate::files::valid_caption);
-                        match route.filter(|_| valid_message_id(&file.id) && valid_path(&file.path) && name_ok && caption_ok) {
-                            Some((scope, target)) => {
-                                write(&mut stdin, json!({"type":"file","version":1,"id":file.id,
-                                    "scope":scope,"target_id":target,"path":file.path,
-                                    "name":file.name,"caption":file.caption})).await?;
-                                deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-                                sending_file = Some(file.id);
-                            }
-                            None => report_file(files, &ctx, &file.id, QqFileResult::NotSent),
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(_) => warn(&ctx, "file_delivery_unavailable"),
                 }
                 continue;
             }
