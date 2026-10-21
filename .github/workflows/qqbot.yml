@@ -108,6 +108,7 @@ jobs:
           python3 connectors/qqbot/test/delegation_context_test.py
           python3 connectors/qqbot/test/background_recovery_test.py
           python3 connectors/qqbot/test/management_access_test.py
+          python3 connectors/qqbot/test/model_switch_test.py
           python3 connectors/qqbot/test/model_streaming_test.py
           python3 connectors/qqbot/test/model_timeout_test.py
           python3 connectors/qqbot/test/delivery_recovery_test.py
