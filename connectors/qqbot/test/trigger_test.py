@@ -1,5 +1,6 @@
 """真实 Rust QQ 宿主验收：条件满足后在原会话自动执行，不伪造用户输入或训练样本。"""
 import json
+import hashlib
 import subprocess
 import threading
 import unittest
@@ -16,10 +17,11 @@ class TriggerAcceptance(reminder_test.ReminderAcceptance):
             locals()[_name] = None
     del _name
 
-    def run_eve(self, script, developer=False, tasks=False, **options):
+    def run_eve(self, script, developer=True, tasks=False, **options):
         if developer:
             config = self.work / "developer.json"
-            config.write_text(json.dumps({"workspace": str(self.work), "operators": [reminder_test.identity("user-1")], "commands": True}))
+            group="qq:"+hashlib.sha256(json.dumps(["1904159860","group","group-1","user-1"],separators=(",",":")).encode()).hexdigest()
+            config.write_text(json.dumps({"workspace": str(self.work), "operators": [reminder_test.identity("user-1"),group], "commands": True}))
             options["env_extra"] = {"EVE_DEVELOPER_CONFIG": str(config)}
         flags = ["--triggers", "--max-tool-rounds", "5"] + (["--background-tasks"] if tasks else [])
         return reminder_test.base().run_eve(self, script, interest=False, research=False,

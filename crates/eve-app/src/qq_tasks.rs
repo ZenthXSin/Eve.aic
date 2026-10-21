@@ -203,6 +203,7 @@ pub(crate) struct WorkerRun {
 /// 执行器：独立的模型宿主，可用对话工具中除编排工具以外的全部。
 pub(crate) struct Worker {
     host: LlmHost,
+    authorization: OnceLock<Arc<dyn eve_developer_api::DeveloperAuthorization>>,
 }
 
 /// `closed()` 在取消信号变为真时完成；不转发任何事件。
@@ -302,7 +303,17 @@ impl Worker {
         .with_model_resolver(resolver)
         .with_history_resolver(history)
         .with_history_digests(digests);
-        Ok(Arc::new(Self { host }))
+        Ok(Arc::new(Self {
+            host,
+            authorization: OnceLock::new(),
+        }))
+    }
+
+    pub(crate) fn authorize_with(
+        &self,
+        authorization: Arc<dyn eve_developer_api::DeveloperAuthorization>,
+    ) {
+        let _ = self.authorization.set(authorization);
     }
 
     /// 在给定的可信范围内执行一次；`stop` 变为真或超过期限即取消。
@@ -314,6 +325,17 @@ impl Worker {
         timeout: Duration,
         stop: watch::Receiver<bool>,
     ) -> WorkerRun {
+        if !scope
+            .as_ref()
+            .is_some_and(|s| self.authorization.get().is_some_and(|a| a.is_operator(s)))
+        {
+            return WorkerRun {
+                end: TaskEnd::Failed {
+                    reason: "后台任务执行前授权已失效；未请求模型、未执行工具".into(),
+                },
+                usage: TaskUsage::default(),
+            };
+        }
         let host = match self.host.with_tool_call_limit(steps as usize) {
             Ok(host) => host,
             Err(_) => {

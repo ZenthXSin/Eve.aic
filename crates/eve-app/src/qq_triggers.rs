@@ -41,6 +41,13 @@ fn plugin_error(e: impl ToString) -> PluginError {
 fn invalid(s: &str) -> ToolValidationError {
     ToolValidationError { message: s.into() }
 }
+fn reject_pending_delivery(admin: &dyn TriggerAdmin, id: &str) -> eve_trigger_api::Result<()> {
+    match admin.delivery(id, Delivery::Pending, Delivery::Failed) {
+        // 后台和通道可能同时读到 Pending；保留另一方已记录的结局，不覆盖未知发送。
+        Ok(()) | Err(eve_trigger_api::TriggerError::Transition) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
 fn owner(c: &ToolExecutionContext) -> Result<SessionKey, ToolExecutionError> {
     if c.is_cancel_requested() {
         return Err(ToolExecutionError::Cancelled("本轮已取消".into()));
@@ -55,7 +62,6 @@ pub(crate) struct Observations {
     workspace: Option<PathBuf>,
     operators: BTreeSet<String>,
     authorization: Option<Arc<dyn eve_developer_api::DeveloperAuthorization>>,
-    ordinary_access: bool,
     processes: bool,
 }
 impl Observations {
@@ -82,7 +88,6 @@ impl Observations {
             operators: config
                 .as_ref()
                 .map_or_else(BTreeSet::new, |c| c.operators.clone()),
-            ordinary_access: config.as_ref().is_some_and(|c| c.ordinary_access),
             authorization: None,
             processes: config.is_some_and(|c| c.commands),
         })
@@ -104,7 +109,7 @@ impl Observations {
             })
     }
     fn file(&self, owner: &SessionKey, path: &str) -> Result<String, ToolExecutionError> {
-        if !self.ordinary_access && !self.authorized(owner) {
+        if !self.authorized(owner) {
             return Err(failed("文件触发仅限已授权开发操作者"));
         }
         let root = self
@@ -151,7 +156,7 @@ impl Observations {
             .collect())
     }
     fn process(&self, owner: &SessionKey, pid: u32) -> Result<String, ToolExecutionError> {
-        if !self.processes || (!self.ordinary_access && !self.authorized(owner)) {
+        if !self.processes || !self.authorized(owner) {
             return Err(failed("进程观察仅限已启用命令的开发操作者"));
         }
         if !cfg!(target_os = "linux") {
@@ -375,6 +380,9 @@ impl Tool for Tools {
                     Ok(json!({"cancelled":true}))
                 }
                 _ => {
+                    if !observations.authorized(&owner) {
+                        return Err(failed("创建条件触发器需要主人或管理员授权"));
+                    }
                     let now = now_ms();
                     let a = &call.arguments;
                     let mut conditions = vec![];
@@ -546,7 +554,18 @@ async fn run(
             if *stop.borrow() {
                 return Ok(());
             }
+            if t.status == Status::Completed
+                && t.delivery == Some(Delivery::Pending)
+                && !observations.authorized(&t.owner)
+            {
+                reject_pending_delivery(admin.as_ref(), &t.id)?;
+                continue;
+            }
             if !matches!(t.status, Status::Armed | Status::Ready) {
+                continue;
+            }
+            if !observations.authorized(&t.owner) {
+                admin.cancel(&t.owner, &t.id)?;
                 continue;
             }
             if now_ms() >= t.spec.expires_at_ms {
@@ -648,7 +667,10 @@ async fn run(
     }
 }
 
-pub(crate) struct ChannelAdapter(pub(crate) Arc<dyn TriggerAdmin>);
+pub(crate) struct ChannelAdapter(
+    pub(crate) Arc<dyn TriggerAdmin>,
+    pub(crate) Arc<std::sync::OnceLock<Arc<Observations>>>,
+);
 impl QqOutreach for ChannelAdapter {
     fn due(&self, _: &SessionKey) -> PluginResult<bool> {
         Ok(false)
@@ -660,13 +682,26 @@ impl QqOutreach for ChannelAdapter {
         Ok(None)
     }
     fn next_push(&self) -> PluginResult<Option<QqOutreachPush>> {
-        let Some(t) = self
+        let observations = self
+            .1
+            .get()
+            .ok_or_else(|| plugin_error("条件观察服务未就绪"))?;
+        let mut selected = None;
+        for t in self
             .0
             .snapshot()
             .map_err(plugin_error)?
             .into_iter()
-            .find(|t| t.status == Status::Completed && t.delivery == Some(Delivery::Pending))
-        else {
+            .filter(|t| t.status == Status::Completed && t.delivery == Some(Delivery::Pending))
+        {
+            if !observations.authorized(&t.owner) {
+                reject_pending_delivery(self.0.as_ref(), &t.id).map_err(plugin_error)?;
+                continue;
+            }
+            selected = Some(t);
+            break;
+        }
+        let Some(t) = selected else {
             return Ok(None);
         };
         self.0
@@ -724,7 +759,6 @@ mod tests {
             tasks: None,
             workspace: Some(directory.path().into()),
             operators: BTreeSet::from(["u".into()]),
-            ordinary_access: false,
             authorization: None,
             processes: true,
         };

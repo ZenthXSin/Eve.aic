@@ -18,7 +18,7 @@ pub struct DeveloperConfig {
     #[serde(default)]
     pub storage_directory: Option<PathBuf>,
     pub operators: BTreeSet<String>,
-    /// 普通用户可读源码、修改非敏感文件和创建 Issue/PR；敏感操作仍需管理员。
+    /// 显式开放开发后端的普通访问；QQ 宿主仍独立执行主人/管理员管理策略。
     #[serde(default = "ordinary_access")]
     pub ordinary_access: bool,
     #[serde(default)]
@@ -54,7 +54,7 @@ fn token_env() -> String {
     "EVE_GITHUB_TOKEN".into()
 }
 fn ordinary_access() -> bool {
-    true
+    false
 }
 
 /// 宿主提供的平台身份授权；模型参数、昵称及自称不能实现此绑定。
