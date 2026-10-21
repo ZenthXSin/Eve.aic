@@ -716,6 +716,9 @@ impl LlmHost {
         // 批次用尽后模型仍要调用工具时进入收尾：本批不执行，只再请求一次且不提供工具。
         let mut closing = false;
         let mut progress_reports = 0;
+        let mut compaction_announced = false;
+        // 为压缩状态提示预留一次进展投递，仍为 C2C 的最终正文保留第 4 个名额。
+        let progress_report_limit = if compaction.is_some() { 2 } else { 3 };
         let continuation = eve_llm_api::TaskContinuation::default();
         let mut continuation_checks = 0;
         let mut checkpoint = if let Some(journal) = &self.journal {
@@ -820,9 +823,22 @@ impl LlmHost {
                 self.compaction_policy,
                 self.history_digests.as_deref(),
             ) {
+                if !compaction_announced
+                    && crate::compaction::estimate(&ModelRequest {
+                        messages: messages.clone(),
+                        tools: definitions.clone(),
+                    })
+                    .map_err(|error| fail(error, diagnostics.clone()))?
+                        >= policy.trigger_tokens
+                {
+                    emit(events, TurnEventKind::ContextCompactionStarted)
+                        .await
+                        .map_err(|error| fail(error, diagnostics.clone()))?;
+                    compaction_announced = true;
+                }
                 let result = tokio::select! { biased;
                     _ = wait_closed(events) => Err(LlmError::Cancelled),
-                    _ = tokio::time::sleep(Duration::from_secs(600)) => Err(LlmError::Context("上下文压缩超过总期限；已经保存的摘要进度与工具回执保留，压缩后的下一次对话请求未发出".into())),
+                    _ = tokio::time::sleep(eve_llm_api::CONTEXT_COMPACTION_TIMEOUT) => Err(LlmError::Context("上下文压缩超过 5 分钟总期限；已经保存的摘要进度与工具回执保留，压缩后的下一次对话请求未发出".into())),
                     result = contain_panic(state.compact(&mut messages, &definitions, policy, service, scope.as_ref())) => result,
                 };
                 if let Err(error) = result {
@@ -1011,7 +1027,7 @@ impl LlmHost {
                     .map_err(|error| fail(error, diagnostics.clone()))?;
             }
             if self.config.tool_progress_reports
-                && progress_reports < 3
+                && progress_reports < progress_report_limit
                 && diagnostics.calls.len() >= [1, 15, 35][progress_reports]
             {
                 emit(

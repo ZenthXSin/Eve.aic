@@ -179,13 +179,20 @@ fn capture(
                 ));
             }
         };
-        let stream_timeouts = if streamed_completions && use_name == Some("dialogue") {
-            let config = config::provider_config(&provider, primary.as_ref())
-                .map_err(|e| LlmError::Configuration(e.to_string()))?;
-            Some(stream_timeout_policy(config.request_timeout)?)
-        } else {
-            None
-        };
+        let stream_timeouts =
+            if streamed_completions && matches!(use_name, Some("dialogue" | "digest")) {
+                let config = config::provider_config(&provider, primary.as_ref())
+                    .map_err(|e| LlmError::Configuration(e.to_string()))?;
+                let mut policy = stream_timeout_policy(config.request_timeout)?;
+                if use_name == Some("digest") {
+                    policy.total = policy.total.min(eve_llm_api::CONTEXT_COMPACTION_TIMEOUT);
+                    policy.first_response = policy.first_response.min(policy.total);
+                    policy.idle = policy.idle.min(policy.total);
+                }
+                Some(policy)
+            } else {
+                None
+            };
         return Ok(CapturedModel {
             provider,
             primary,
@@ -256,6 +263,7 @@ impl LlmModelResolver for CoreModelResolver {
                         "first_response_ms":policy.first_response.as_millis(),
                         "idle_ms":policy.idle.as_millis(),"total_ms":policy.total.as_millis(),
                         "host_timeout_ms":provider_timeout.as_millis(),
+                        "use_name":self.use_name,
                     })
                 );
             }
@@ -267,7 +275,7 @@ impl LlmModelResolver for CoreModelResolver {
         if self.use_name.as_deref() == Some("dialogue") {
             provider = provider.with_transient_retries();
         }
-        if self.use_name.as_deref() == Some("dialogue") && timing_enabled() {
+        if matches!(self.use_name.as_deref(), Some("dialogue" | "digest")) && timing_enabled() {
             provider = provider.with_timing_diagnostics();
         }
         let provider: Arc<dyn eve_llm_api::LlmProvider> = Arc::new(provider);

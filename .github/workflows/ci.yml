@@ -93,6 +93,8 @@ jobs:
           $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
           python -X utf8 connectors/qqbot/test/context_compaction_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -X utf8 connectors/qqbot/test/compaction_stream_test.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证交互记忆三次独立进程恢复
         run: |
           $memoryDirectory = Join-Path $env:RUNNER_TEMP "eve-memory-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"

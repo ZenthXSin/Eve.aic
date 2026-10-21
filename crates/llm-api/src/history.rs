@@ -1,5 +1,8 @@
 use crate::{ChatMessage, ChatRole, ContextScope, LlmError, LlmFuture};
 
+/// 主动上下文压缩的整次期限，包含所有分批摘要请求。
+pub const CONTEXT_COMPACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// 输入上下文的估算 token 阈值；不代表模型厂商的精确分词结果。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContextCompactionPolicy {

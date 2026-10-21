@@ -107,6 +107,9 @@ fn timing(enabled: bool, phase: &str, turn: Option<u64>) {
     }
 }
 fn progress_text(kind: &TurnEventKind) -> Option<String> {
+    if matches!(kind, TurnEventKind::ContextCompactionStarted) {
+        return Some("正在进行上下文压缩，请稍等".into());
+    }
     let TurnEventKind::ToolProgress {
         completed_calls,
         failed_calls,
@@ -334,6 +337,7 @@ impl ControlEventSink for ChannelEvents {
         Box::pin(async move {
             let stage = match &event.event.kind {
                 TurnEventKind::ProviderStarted { .. } => Some("provider_begin"),
+                TurnEventKind::ContextCompactionStarted => Some("context_compaction_begin"),
                 TurnEventKind::ResponseCompleted { .. } => Some("provider_completed"),
                 TurnEventKind::ToolBatchStarted { .. } => Some("tools_begin"),
                 TurnEventKind::ToolResult { .. } => Some("tool_result"),
@@ -347,7 +351,10 @@ impl ControlEventSink for ChannelEvents {
             if self.is_closed() {
                 Err(LlmError::Cancelled)
             } else {
-                if matches!(event.event.kind, TurnEventKind::ToolProgress { .. }) {
+                if matches!(
+                    event.event.kind,
+                    TurnEventKind::ToolProgress { .. } | TurnEventKind::ContextCompactionStarted
+                ) {
                     self.progress
                         .try_send(event)
                         .map_err(|_| LlmError::Cancelled)?;

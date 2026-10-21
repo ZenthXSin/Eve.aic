@@ -52,7 +52,7 @@ impl HistoryDigester for ModelHistoryDigester {
                 selection
                     .provider_timeout
                     .saturating_add(Duration::from_secs(1))
-                    .min(Duration::from_secs(180)),
+                    .min(eve_llm_api::CONTEXT_COMPACTION_TIMEOUT + Duration::from_secs(1)),
                 selection.provider.complete(request),
             )
             .await
