@@ -830,6 +830,29 @@ pub(crate) async fn run(
                 }
                 continue;
             }
+            // 待发文件不等通道空闲：QQ 主动消息随时可发，和当前轮的回复互不占用配额。
+            if sending_file.is_none() && file_poll.is_some() && let Some(files) = &files {
+                match files.next_file() {
+                    Ok(Some(file)) => {
+                        let route = route_for(&ledger, &config.app_id, &file.session)?;
+                        let name_ok = file.name.as_deref().is_none_or(crate::files::valid_name);
+                        let caption_ok = file.caption.as_deref().is_none_or(crate::files::valid_caption);
+                        match route.filter(|_| valid_message_id(&file.id) && valid_path(&file.path) && name_ok && caption_ok) {
+                            Some((scope, target)) => {
+                                write(&mut stdin, json!({"type":"file","version":1,"id":file.id,
+                                    "scope":scope,"target_id":target,"path":file.path,
+                                    "name":file.name,"caption":file.caption})).await?;
+                                deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+                                sending_file = Some(file.id);
+                            }
+                            None => report_file(files, &ctx, &file.id, QqFileResult::NotSent),
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(_) => warn(&ctx, "file_delivery_unavailable"),
+                }
+            }
             if delivering.is_none() && pushing.is_none() && sending_file.is_none() && progress_delivery.is_none()
                 && progress_queue.front().is_some_and(|event: &ControlEvent|
                     active.iter().any(|a| a.key == event.key)
@@ -1095,30 +1118,6 @@ pub(crate) async fn run(
             let channel_idle = pushing.is_none() && sending_file.is_none() && delivering.is_none() && progress_delivery.is_none()
                 && judging.is_none() && replies.is_empty() && status.borrow().ready;
             let push_ready = push_interval.is_some() && channel_idle;
-            let file_ready = file_poll.is_some() && files.is_some() && channel_idle;
-            // 待发文件优先于主动私聊：用户要的文件不该排在定期邀请后面。
-            if file_ready && let Some(files) = &files {
-                match files.next_file() {
-                    Ok(Some(file)) => {
-                        let route = route_for(&ledger, &config.app_id, &file.session)?;
-                        let name_ok = file.name.as_deref().is_none_or(crate::files::valid_name);
-                        let caption_ok = file.caption.as_deref().is_none_or(crate::files::valid_caption);
-                        match route.filter(|_| valid_message_id(&file.id) && valid_path(&file.path) && name_ok && caption_ok) {
-                            Some((scope, target)) => {
-                                write(&mut stdin, json!({"type":"file","version":1,"id":file.id,
-                                    "scope":scope,"target_id":target,"path":file.path,
-                                    "name":file.name,"caption":file.caption})).await?;
-                                deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-                                sending_file = Some(file.id);
-                            }
-                            None => report_file(files, &ctx, &file.id, QqFileResult::NotSent),
-                        }
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(_) => warn(&ctx, "file_delivery_unavailable"),
-                }
-            }
             if push_ready && let (Some(hook), Some(interval)) = (&outreach, push_interval)
                 && tokio::time::Instant::now() >= next_push {
                 next_push = tokio::time::Instant::now() + interval;
