@@ -5,7 +5,7 @@ import importlib.util
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
 import sys
@@ -69,7 +69,7 @@ class HandoffTests(unittest.TestCase):
                 restore.verify(root, bundle)
 
     def test_path_mapping_preserves_the_installation_path_with_spaces(self):
-        with patch.object(eve, 'ROOT', Path('/tmp/Eve local')):
+        with patch.object(eve, 'ROOT', PurePosixPath('/tmp/Eve local')):
             value = eve.mapped({'workspace': '/workspace/Eve.aic', 'operator': 'qq:owner',
                                 'args': ['--reference', 'src=/workspace/source']})
             self.assertEqual(value['workspace'], '/tmp/Eve local/payload/workspace/Eve.aic')
