@@ -209,7 +209,7 @@ impl Tool for DeveloperTool {
             ),
             Kind::Github => (
                 "github_api",
-                "调用 GitHub REST 仓库 API。例：repository=Anuken/Mindustry，resource=contents/core/src/mindustry/world/blocks/defense/MendProjector.java，query={ref:master}。resource 为空读仓库信息，文件路径放 contents/ 后；不要重复 repos/owner/repo 前缀，也不要把路径放 query。支持 git/trees|blobs|refs、branches/commits、issues/pulls、Actions、releases、statuses/check-runs；搜索用 search/code|issues|commits|repositories，query.q 指定条件。token 由宿主添加，不能自报凭据或 URL；仅配置操作者可用，写入仅限配置仓库。单次参数或 HTTP 失败不表示工具不存在，按真实回执修正参数或报告限制。",
+                "调用 GitHub REST 仓库 API。例：repository=Anuken/Mindustry，resource=contents/core/src/mindustry/world/blocks/defense/MendProjector.java，query={ref:master}。resource 为空读仓库信息，文件路径放 contents/ 后；不要重复 repos/owner/repo 前缀，也不要把路径放 query。支持 git/trees|blobs|refs、branches/commits、issues/pulls、Actions、releases、statuses/check-runs；搜索用 search/code|issues|commits|repositories，query.q 指定条件。token 由宿主添加，不能自报凭据或 URL；可用用户与仓库写范围由宿主配置；公开模式允许所有聊天用户调用，并可向 token 实际授权的仓库写入。单次参数或 HTTP 失败不表示工具不存在，按真实回执修正参数或报告限制。",
                 object(
                     json!({"method":{"type":"string","enum":["GET","POST","PATCH","PUT","DELETE"]},"repository":{"type":"string","description":"owner/repo，例如 Anuken/Mindustry"},"resource":{"type":"string","description":"仓库内 REST 相对资源，例如 contents/README.md；空串读取仓库信息"},"query":{"type":"object","description":"查询参数，例如 ref=master、per_page=10 或搜索 q；文件路径放 resource","additionalProperties":{"type":"string"}},"body":{"type":"object"}}),
                     &["method", "repository"],
