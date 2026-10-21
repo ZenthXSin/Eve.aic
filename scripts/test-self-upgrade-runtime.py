@@ -278,4 +278,18 @@ while True:time.sleep(.05)
         self.assertEqual(self.events.read_text().splitlines(),['old','new','new'])
         self.assertFalse((self.queue/'request.json').exists())
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux ELF loader')
+    def test_explicit_linux_loader_keeps_candidate_digest_and_active_pointer(self):
+        loader=Path('/lib64/ld-linux-x86-64.so.2')
+        if not loader.is_file():self.skipTest('GNU Linux loader unavailable')
+        self.env['EVE_RUNTIME_LOADER']=str(loader)
+        self.env['EVE_RUNTIME_LIBRARY_PATH']=str(Path(sys.prefix)/'lib')
+        self.launch();request=self.candidate('new')
+        before=runtime.digest(Path(request['candidate_directory'])/'eve-qqbot')
+        runtime.atomic(self.queue/'request.json',request)
+        self.wait(lambda d:d['result']=='applied')
+        pointer=runtime.read_json(self.queue/'active-command.json')
+        self.assertEqual(pointer['binary_sha256'],before)
+        self.assertEqual(pointer['command'][0],str(Path(request['candidate_directory'])/'eve-qqbot'))
+
 if __name__=='__main__':unittest.main()
