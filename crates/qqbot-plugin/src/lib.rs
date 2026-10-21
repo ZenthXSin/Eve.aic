@@ -2,13 +2,19 @@
 mod bridge;
 mod commands;
 mod conversations;
+mod files;
 mod observer;
 mod outreach;
 mod participants;
 mod state;
 
 pub use commands::{QqCommandHandler, QqCommandInput};
-pub use conversations::{QqConversationIdentity, QqConversations};
+pub use conversations::{QqConversationIdentity, QqConversations, QqWakeupLease};
+pub use files::{
+    QQ_FILE_CAPTION_MAX_BYTES, QQ_FILE_NAME_MAX_BYTES, QQ_FILE_PATH_MAX_BYTES, QqFileDelivery,
+    QqFileMessage, QqFileResult, QqRawMessage, QqRawMessageObserver, valid_caption, valid_name,
+    valid_path,
+};
 pub use observer::{QqInteraction, QqInteractionObserver, QqInteractionSource};
 pub use outreach::{
     QQ_OUTREACH_JUDGE_TIMEOUT, QQ_OUTREACH_MAX_BYTES, QQ_OUTREACH_MAX_REPLY_PARTS,
@@ -16,6 +22,12 @@ pub use outreach::{
     QqOutreachPush, QqOutreachResult,
 };
 pub use participants::QqParticipantObserver;
+pub use state::{ImageAttachment, Message};
+
+/// 收到带附件的消息时通知宿主；只传已校验的消息，不做下载。
+pub trait QqAttachmentObserver: Send + Sync {
+    fn observe(&self, session: &SessionKey, message: &Message);
+}
 
 use eve_control_api::{CONTROL_PLUGIN_ID, CONTROL_SERVICE_ID, ControlServiceHandle};
 use eve_message_api::{MessageServiceHandle, ROUTER_PLUGIN_ID, ROUTER_SERVICE_ID};
@@ -103,6 +115,10 @@ pub struct QqBotPlugin {
     segmentation: Option<Arc<Segmentation>>,
     natural_message_judgement: bool,
     outreach: Option<Arc<bridge::OutreachHook>>,
+    files: Option<Arc<dyn QqFileDelivery>>,
+    file_poll: Option<Duration>,
+    attachment_observer: Option<Arc<dyn QqAttachmentObserver>>,
+    raw_observer: Option<Arc<dyn QqRawMessageObserver>>,
     conversations: QqConversations,
     participant_observer: Option<Arc<dyn QqParticipantObserver>>,
     timing_diagnostics: bool,
@@ -133,6 +149,10 @@ impl QqBotPlugin {
             segmentation: None,
             natural_message_judgement: false,
             outreach: None,
+            files: None,
+            file_poll: None,
+            attachment_observer: None,
+            raw_observer: None,
             conversations: QqConversations::default(),
             participant_observer: None,
             timing_diagnostics: false,
@@ -220,6 +240,33 @@ impl QqBotPlugin {
         Ok(self)
     }
 
+    /// 接入宿主的文件投递：通道空闲时按 `poll_interval` 询问宿主是否有待发文件，
+    /// 用该会话已确认的平台路由上传并回报结果。未接线时不发送任何文件。
+    pub fn with_files(
+        mut self,
+        files: Arc<dyn QqFileDelivery>,
+        poll_interval: Duration,
+    ) -> PluginResult<Self> {
+        if poll_interval.is_zero() {
+            return Err(PluginError::State("QQBot 文件投递间隔无效".into()));
+        }
+        self.files = Some(files);
+        self.file_poll = Some(poll_interval);
+        Ok(self)
+    }
+
+    /// 收到带附件的消息时回调宿主；未接线时只把附件说明写进对话文本。
+    pub fn with_attachment_observer(mut self, observer: Arc<dyn QqAttachmentObserver>) -> Self {
+        self.attachment_observer = Some(observer);
+        self
+    }
+
+    /// 收到消息时把原始平台事件交给宿主，仅供调试；未接线时丢弃。
+    pub fn with_raw_observer(mut self, observer: Arc<dyn QqRawMessageObserver>) -> Self {
+        self.raw_observer = Some(observer);
+        self
+    }
+
     /// 添加宿主命令扩展；默认不安装，原有消息控制行为不变。
     pub fn with_command_handler(mut self, handler: Arc<dyn QqCommandHandler>) -> Self {
         self.command_handler = Some(handler);
@@ -303,6 +350,10 @@ impl Plugin for QqBotPlugin {
             let segmentation = self.segmentation.clone();
             let natural_message_judgement = self.natural_message_judgement;
             let outreach = self.outreach.clone();
+            let files = self.files.clone();
+            let file_poll = self.file_poll;
+            let attachment_observer = self.attachment_observer.clone();
+            let raw_observer = self.raw_observer.clone();
             let conversations = self.conversations.clone();
             let participant_observer = self.participant_observer.clone();
             let timing_diagnostics = self.timing_diagnostics;
@@ -322,6 +373,9 @@ impl Plugin for QqBotPlugin {
                     let observation = observation.clone();
                     let segmentation = segmentation.clone();
                     let outreach = outreach.clone();
+                    let files = files.clone();
+                    let attachment_observer = attachment_observer.clone();
+                    let raw_observer = raw_observer.clone();
                     let conversations = conversations.clone();
                     let participant_observer = participant_observer.clone();
                     let status = status.clone();
@@ -343,6 +397,10 @@ impl Plugin for QqBotPlugin {
                                 segmentation,
                                 natural_message_judgement,
                                 outreach,
+                                files,
+                                file_poll,
+                                attachment_observer,
+                                raw_observer,
                                 conversations,
                                 participant_observer,
                                 timing_diagnostics,

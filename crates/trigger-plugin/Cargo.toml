@@ -1,0 +1,18 @@
+[package]
+name = "eve-trigger-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-trigger-api = { path = "../trigger-api" }
+eve-session-api = { path = "../session-api" }
+eve-plugin-api = { path = "../plugin-api" }
+serde.workspace = true
+serde_json.workspace = true
+ring.workspace = true
+
+[dev-dependencies]
+eve-kernel = { path = "../kernel" }
+tokio.workspace = true

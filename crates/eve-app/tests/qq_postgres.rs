@@ -134,6 +134,27 @@ fn command(entry: Entry, root: &Path, url: &str, database: Option<&Path>) -> Com
         .env("EVE_OPENAI_TIMEOUT_SECONDS", "5")
         .env("EVE_LLM_RESPONSE_MODE", "complete");
     if matches!(entry, Entry::Qq) {
+        // 测试中的管理命令使用宿主可信绑定；生产默认权限与普通用户负例不变。
+        let bindings = root.join("state/admin-bindings.json");
+        if !bindings.exists() {
+            let subjects: Vec<String> = ["sql-user", "sql-learning-user"]
+                .iter()
+                .map(|user| {
+                    let subject = serde_json::to_vec(&json!(["1904159860", "c2c", user])).unwrap();
+                    ring::digest::digest(&ring::digest::SHA256, &subject)
+                        .as_ref()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect()
+                })
+                .collect();
+            std::fs::create_dir_all(bindings.parent().unwrap()).unwrap();
+            std::fs::write(
+                bindings,
+                serde_json::to_vec(&json!({"version":1,"subjects":subjects})).unwrap(),
+            )
+            .unwrap();
+        }
         let bridge = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../connectors/qqbot/test/fake-bridge.mjs");
         command

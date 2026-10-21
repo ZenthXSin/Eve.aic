@@ -20,7 +20,7 @@ impl QqCommandHandler for Help {
         }
         if words.as_slice() == ["/help", "identity"] {
             return Ok(Some(format!(
-                "本会话宿主绑定的操作者标识：{}\n开发工具 operators 可填写这个标识；其他群/会话使用各自独立标识。",
+                "本会话宿主绑定的操作者标识：{}\n开发工具 operators 可填写这个标识；旧 operators 使用各自独立的会话标识。/admin 查看当前管理员状态；/bind 密钥 可绑定平台身份，群聊身份跨群有效，私聊与群聊分别绑定。",
                 input.session.user_id
             )));
         }
@@ -46,7 +46,7 @@ impl QqCommandHandler for Help {
                 text.push_str(&format!("\n{}：{description}", definition.name));
             }
         } else {
-            text.push_str("\n/name 名字、/name：设置或查看自己的称呼\n/train start|stop|status：主动提问训练\n/self-learning status：自主学习状态\n/segment on|off|reset：分段输出\n/remember 内容、/memories、/recall 关键词：记忆\n/interests：兴趣；/knowledge 兴趣ID：资料\n/practice 兴趣ID：实践证据\n/skills、/tools：已固化技能和检查规则，列表可为空\n/goals、/mind、/plans：目标与计划\n/budget：后台自主运行预算\n/clarify、/clarify off|on：卡住时的提问\n/outreach、/outreach off|on：主动跟进\n/cancel：取消当前任务\n/help tools：实际聊天工具说明\n\n命令对应能力未装配时会明确提示。工具调用以真实结果为准；检查规则不等于任意代码插件。");
+            text.push_str("\n/admin：查看宿主确认的管理员状态\n/bind 密钥：绑定管理员（私聊与群聊分别绑定）\n/name 名字、/name：设置或查看自己的称呼\n/train start|stop|status：主动提问训练\n/self-learning status：自主学习状态\n/segment on|off|reset：分段输出\n/remember 内容、/memories、/recall 关键词：记忆\n/interests：兴趣；/knowledge 兴趣ID：资料\n/practice 兴趣ID：实践证据\n/skills、/tools：已固化技能和检查规则，列表可为空\n/goals、/mind、/plans：目标与计划\n/budget：后台自主运行预算\n/clarify、/clarify off|on：卡住时的提问\n/outreach、/outreach off|on：主动跟进\n/last-reply：取回当前会话发送失败的回复，不重新执行任务\n/cancel：取消当前任务\n/help tools：实际聊天工具说明\n\n命令对应能力未装配时会明确提示。工具调用以真实结果为准；检查规则不等于任意代码插件。");
         }
         Ok(Some(text))
     }

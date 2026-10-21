@@ -22,15 +22,26 @@ pub(crate) fn valid_message_id(v: &str) -> bool {
         && v.trim() == v
         && !v.chars().any(char::is_control)
 }
-/// 通道只保存用户本次发送的图片引用；不会下载，也不等同于视觉解析结果。
+/// 通道只保存用户本次发送的附件引用；不会下载，也不等同于视觉解析结果。
+const FILE_TYPES: [&str; 6] = [
+    "text/plain",
+    "application/pdf",
+    "application/zip",
+    "application/json",
+    "application/octet-stream",
+    "file",
+];
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ImageAttachment {
+pub struct ImageAttachment {
     pub content_type: String,
     pub url: String,
+    /// 展示名；旧账本没有该字段，缺失时按没有文件名处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
 }
 impl ImageAttachment {
-    fn valid(&self) -> bool {
+    fn type_allowed(&self) -> bool {
         self.content_type
             .strip_prefix("image/")
             .is_some_and(|subtype| {
@@ -40,20 +51,54 @@ impl ImageAttachment {
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
             })
-            && self.url.starts_with("https://")
+            || FILE_TYPES.contains(&self.content_type.as_str())
+    }
+    fn valid(&self) -> bool {
+        self.type_allowed()
             && self.url.len() <= 4096
-            && self.url[8..]
-                .split_once('/')
-                .is_some_and(|(host, _)| !host.is_empty())
+            && (self.url.is_empty()
+                || (self.url.starts_with("https://")
+                    && self.url[8..]
+                        .split_once('/')
+                        .is_some_and(|(host, _)| !host.is_empty())))
             && !self
                 .url
                 .chars()
                 .any(|c| c.is_control() || c.is_whitespace())
+            && self.filename.as_ref().is_none_or(|name| {
+                !name.is_empty()
+                    && name.len() <= 255
+                    && name.trim() == name
+                    && !name
+                        .chars()
+                        .any(|c| c == '/' || c == '\\' || c.is_control())
+            })
+    }
+    fn is_image(&self) -> bool {
+        self.content_type.starts_with("image/")
+    }
+}
+/// 被引用消息的文字与附件，和本条新发的附件分开保存。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuotedMessage {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ImageAttachment>,
+}
+impl QuotedMessage {
+    fn valid(&self) -> bool {
+        (!self.text.trim().is_empty() || !self.attachments.is_empty())
+            && self.text.len() <= 1024
+            && !self.text.chars().any(char::is_control)
+            && self.attachments.len() <= 4
+            && self.attachments.iter().all(ImageAttachment::valid)
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Message {
+pub struct Message {
     pub id: String,
     pub scope: String,
     pub target_id: String,
@@ -61,17 +106,56 @@ pub(crate) struct Message {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ImageAttachment>,
+    /// 用户引用的上一条消息；旧账本没有该字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted: Option<QuotedMessage>,
 }
 impl Message {
     pub fn turn_text(&self) -> String {
-        if self.attachments.is_empty() {
-            return self.text.clone();
+        let mut text = self.text.clone();
+        if let Some(quoted) = &self.quoted {
+            let mut line = String::from("【引用的消息】");
+            if !quoted.text.is_empty() {
+                line.push_str(&quoted.text);
+            }
+            if !quoted.attachments.is_empty() {
+                line.push_str(&format!("（含 {} 个附件引用）", quoted.attachments.len()));
+            }
+            text = format!("{line}\n\n{text}");
         }
-        format!(
-            "{}\n\n【通道附件信息】收到 {} 个图片附件，已保存引用，尚未获取像素或进行视觉解析。不能声称已经看见或推测图片内容；按用户文字处理任务，涉及图片内容时如实说明当前限制。",
-            self.text,
-            self.attachments.len()
-        )
+        if self.attachments.is_empty() {
+            return text;
+        }
+        let images = self.attachments.iter().filter(|a| a.is_image()).count();
+        let files = self.attachments.len() - images;
+        let mut note = String::from("【通道附件信息】");
+        if images > 0 {
+            note.push_str(&format!("收到 {images} 个图片附件，已保存引用，尚未获取像素或进行视觉解析。不能声称已经看见或推测图片内容。"));
+        }
+        if files > 0 {
+            let names: Vec<&str> = self
+                .attachments
+                .iter()
+                .filter(|item| !item.is_image())
+                .filter_map(|item| item.filename.as_deref())
+                .collect();
+            note.push_str(&format!(
+                "收到 {files} 个文件附件，只保存了类型{}，未下载内容。",
+                if names.is_empty() {
+                    String::new()
+                } else {
+                    format!("（{}）", names.join("、"))
+                }
+            ));
+        }
+        note.push_str(
+            "需要看文件内容时调用 read_attachment，index 从 1 起，只下载本条已记录的附件；             图片没有视觉解析，下载也只能看到类型和大小。",
+        );
+        format!("{text}\n\n{note}")
+    }
+    /// 本条消息第 `index` 个附件（从 1 起）；越界返回 None。
+    pub fn attachment(&self, index: usize) -> Option<&ImageAttachment> {
+        index.checked_sub(1).and_then(|i| self.attachments.get(i))
     }
     pub fn valid(&self) -> bool {
         [&self.target_id, &self.user_id]
@@ -84,6 +168,7 @@ impl Message {
             && self.text.len() <= 32768
             && self.attachments.len() <= 4
             && self.attachments.iter().all(ImageAttachment::valid)
+            && self.quoted.as_ref().is_none_or(QuotedMessage::valid)
     }
     /// 首版临时会话映射；未来统一认知时只替换此策略并迁移旧历史。
     pub fn session_key(&self, app_id: &str) -> PluginResult<SessionKey> {
@@ -335,6 +420,7 @@ mod tests {
             app_id: "1904159860".into(),
             message: Message {
                 attachments: vec![],
+                quoted: None,
                 id: "msg-1".into(),
                 scope: "c2c".into(),
                 target_id: "user-1".into(),

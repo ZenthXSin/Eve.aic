@@ -27,6 +27,9 @@ name = "eve-memory"
 path = "src/bin/memory.rs"
 
 [dependencies]
+tempfile.workspace = true
+eve-trigger-api = { path = "../trigger-api" }
+eve-trigger-plugin = { path = "../trigger-plugin" }
 eve-people-api = { path = "../people-api" }
 eve-people-plugin = { path = "../people-plugin" }
 eve-developer-api = { path = "../developer-api" }
@@ -103,6 +106,7 @@ eve-state-postgres = { path = "../state-postgres" }
 eve-training-api = { path = "../training-api" }
 eve-training-plugin = { path = "../training-plugin" }
 serde.workspace = true
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-native-roots", "json"] }
 serde_json.workspace = true
 ring.workspace = true
 tokio = { workspace = true, features = ["signal"] }

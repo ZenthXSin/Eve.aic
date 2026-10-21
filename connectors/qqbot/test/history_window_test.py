@@ -15,7 +15,7 @@ class HistoryWindowAcceptance(developer.DeveloperAcceptance):
     del _name
 
     def run_window(self, script, **options):
-        env = {"EVE_HISTORY_MAX_TURNS": "2", "EVE_DEVELOPER_CONFIG": str(self.developer_config),
+        env = {"EVE_HISTORY_MAX_TURNS": "2", "EVE_CONTEXT_COMPACT_AT_TOKENS": "0", "EVE_DEVELOPER_CONFIG": str(self.developer_config),
                **options.pop("env_extra", {})}
         interest.InterestAcceptance.run_eve(self, script, interest=False, memory=True, env_extra=env, **options)
 

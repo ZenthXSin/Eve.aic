@@ -82,6 +82,7 @@ fn spec(title: &str) -> TaskSpec {
         title: title.into(),
         instructions: format!("{title}：读取资料并给出结论"),
         max_steps: DEFAULT_STEPS,
+        context: None,
     }
 }
 
@@ -95,6 +96,141 @@ fn usage(calls: u32) -> TaskUsage {
 fn sent() -> DeliveryResult {
     DeliveryResult::Sent {
         platform_message_id: Some("out-1".into()),
+    }
+}
+
+fn checkpoint(user: &str) -> eve_llm_api::TurnCheckpoint {
+    let owner = owner(user);
+    eve_llm_api::TurnCheckpoint {
+        version: 1,
+        scope: eve_llm_api::ContextScope {
+            session_id: owner.session_id,
+            user_id: owner.user_id,
+        },
+        messages: vec![eve_llm_api::ChatMessage::text(
+            eve_llm_api::ChatRole::User,
+            "执行任务",
+        )],
+        pending_calls: vec![],
+        used_tool_calls: 0,
+        provider_requests: 1,
+        tool_batches: 0,
+        remaining: Some("核验剩余步骤".into()),
+        continuation_checks: 0,
+        closing: false,
+        result: None,
+    }
+}
+
+#[tokio::test]
+async fn checkpoints_resume_with_a_bounded_retry_count_and_preserve_the_deadline() {
+    let world = World::new();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let task = tasks
+        .create(&owner("alice"), spec("检查点"), "resume", 10)
+        .unwrap();
+    tasks.start(&task.id, 20).unwrap();
+    tasks
+        .checkpoint(&task.id, checkpoint("alice"), u64::MAX, 30)
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let saved = tasks.snapshot().unwrap().get(&task.id).unwrap().clone();
+    assert_eq!(saved.status, TaskStatus::Running);
+    let execution = saved.execution.unwrap();
+    assert_eq!(execution.recoveries, 1);
+    assert!(execution.resume_at_ms.is_some());
+    assert_eq!(execution.deadline_at_ms, Some(u64::MAX));
+    assert_eq!(execution.checkpoint, Some(checkpoint("alice")));
+    let mut frame = checkpoint("alice");
+    for expected in 2..=MAX_AUTO_RECOVERIES {
+        frame.provider_requests += 1;
+        tasks
+            .checkpoint(&task.id, frame.clone(), u64::MAX, 40)
+            .unwrap();
+        assert_eq!(
+            tasks
+                .retry(&task.id, 50)
+                .unwrap()
+                .execution
+                .unwrap()
+                .recoveries,
+            expected
+        );
+    }
+    frame.provider_requests += 1;
+    tasks.checkpoint(&task.id, frame, u64::MAX, 60).unwrap();
+    let before = world.raw();
+    assert_eq!(tasks.retry(&task.id, 70), Err(TaskError::InvalidTransition));
+    assert_eq!(world.raw(), before);
+    kernel.stop_all().await.unwrap();
+    let (kernel, tasks) = world.open().await.unwrap();
+    assert_eq!(
+        tasks.snapshot().unwrap().get(&task.id).unwrap().status,
+        TaskStatus::Interrupted
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_saved_final_result_is_settled_after_restart_without_a_second_execution() {
+    let world = World::new();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let task = tasks
+        .create(&owner("alice"), spec("最终结果"), "final", 10)
+        .unwrap();
+    tasks.start(&task.id, 20).unwrap();
+    let mut frame = checkpoint("alice");
+    frame.remaining = None;
+    frame.result = Some("已经完成且验证".into());
+    tasks.checkpoint(&task.id, frame, u64::MAX, 30).unwrap();
+    kernel.stop_all().await.unwrap();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let saved = tasks.snapshot().unwrap().get(&task.id).unwrap().clone();
+    assert_eq!(saved.status, TaskStatus::Completed);
+    assert_eq!(saved.result.as_deref(), Some("已经完成且验证"));
+    assert_eq!(saved.usage, Some(usage(0))); // 一个模型请求，没有工具。
+    assert!(saved.notice_pending());
+    assert_eq!(saved.execution.unwrap().recoveries, 0);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_or_cross_scope_checkpoints_never_replace_the_saved_bytes() {
+    let world = World::new();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let task = tasks
+        .create(&owner("alice"), spec("校验"), "strict", 10)
+        .unwrap();
+    tasks.start(&task.id, 20).unwrap();
+    let before = world.raw();
+    assert_eq!(
+        tasks.checkpoint(&task.id, checkpoint("bob"), u64::MAX, 30),
+        Err(TaskError::InvalidInput)
+    );
+    let mut bad = checkpoint("alice");
+    bad.version = 999;
+    assert_eq!(
+        tasks.checkpoint(&task.id, bad, u64::MAX, 30),
+        Err(TaskError::InvalidInput)
+    );
+    assert_eq!(world.raw(), before);
+    tasks
+        .checkpoint(&task.id, checkpoint("alice"), u64::MAX, 30)
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    let good: Value = serde_json::from_slice(&world.raw().unwrap()).unwrap();
+    for mutate in [0, 1, 2] {
+        let mut bad = good.clone();
+        match mutate {
+            0 => bad["tasks"][0]["execution"]["checkpoint"]["scope"]["user_id"] = "bob".into(),
+            1 => bad["tasks"][0]["execution"]["checkpoint"]["version"] = 999.into(),
+            _ => bad["tasks"][0]["execution"]["checkpoint"]["used_tool_calls"] = 51.into(),
+        }
+        let bytes = serde_json::to_vec(&bad).unwrap();
+        world.write(bytes.clone());
+        assert!(world.open().await.is_err());
+        assert_eq!(world.raw(), Some(bytes));
     }
 }
 
@@ -283,6 +419,30 @@ async fn running_cancellation_is_requested_then_confirmed_by_the_executor() {
 }
 
 #[tokio::test]
+async fn cancellation_wins_over_an_error_arriving_at_the_same_time() {
+    let world = World::new();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let task = tasks
+        .create(&owner("alice"), spec("取消竞态"), "cancel-race", 10)
+        .unwrap();
+    tasks.start(&task.id, 20).unwrap();
+    tasks.cancel("alice", &task.id, 30).unwrap();
+    let saved = tasks
+        .finish(
+            &task.id,
+            TaskEnd::Failed {
+                reason: "模型已返回错误".into(),
+            },
+            usage(0),
+            40,
+        )
+        .unwrap();
+    assert_eq!(saved.status, TaskStatus::Cancelled);
+    assert!(saved.notice.is_none());
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
 async fn restart_interrupts_running_tasks_and_marks_in_flight_notices_unknown() {
     let world = World::new();
     let (kernel, tasks) = world.open().await.unwrap();
@@ -309,6 +469,10 @@ async fn restart_interrupts_running_tasks_and_marks_in_flight_notices_unknown() 
         .unwrap();
     let queued = tasks.create(&owner("bob"), spec("排队"), "q", 10).unwrap();
     kernel.stop_all().await.unwrap();
+    // 迁移前的任务没有执行日志，继续保留“不猜测、不自动重跑”的旧语义。
+    let mut old: Value = serde_json::from_slice(&world.raw().unwrap()).unwrap();
+    old["tasks"][0].as_object_mut().unwrap().remove("execution");
+    world.write(serde_json::to_vec(&old).unwrap());
 
     let (kernel, tasks) = world.open().await.unwrap();
     let snapshot = tasks.snapshot().unwrap();
@@ -361,7 +525,7 @@ async fn corrupt_unknown_or_inconsistent_ledgers_refuse_to_open_and_keep_bytes()
     kernel.stop_all().await.unwrap();
     let good: Value = serde_json::from_slice(&world.raw().unwrap()).unwrap();
     let mutations: Vec<Mutation> = vec![
-        Box::new(|v| v["format_version"] = 2.into()),
+        Box::new(|v| v["format_version"] = 999.into()),
         Box::new(|v| v["tasks"][0]["id"] = "task-forged".into()),
         Box::new(|v| v["tasks"][0]["result"] = Value::Null),
         Box::new(|v| v["tasks"][0]["usage"]["tool_calls"] = 9_999.into()),
@@ -382,8 +546,8 @@ async fn corrupt_unknown_or_inconsistent_ledgers_refuse_to_open_and_keep_bytes()
     let text = String::from_utf8(duplicate.clone()).unwrap();
     duplicate = text
         .replacen(
-            "\"format_version\":1",
-            "\"format_version\":1,\"format_version\":1",
+            "\"format_version\":2",
+            "\"format_version\":2,\"format_version\":2",
             1,
         )
         .into_bytes();

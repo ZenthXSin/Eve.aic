@@ -1,5 +1,7 @@
 use crate::{
-    QqBotConfig, QqBotStatus, QqCommandHandler, QqCommandInput, Segmentation, commands,
+    QqAttachmentObserver, QqBotConfig, QqBotStatus, QqCommandHandler, QqCommandInput,
+    QqFileDelivery, QqFileResult, Segmentation, commands,
+    files::valid_path,
     observer::{CompletedInteraction, Observation},
     outreach::{
         OUTREACH_PLANNER, QQ_OUTREACH_JUDGE_TIMEOUT, QQ_OUTREACH_MAX_REPLY_PARTS, QqOutreach,
@@ -41,6 +43,58 @@ fn warn(ctx: &PluginContext, code: &str) {
         let _ = ctx.log(entry);
     }
 }
+fn delivery_log(ctx: &PluginContext, code: &str, frame: &Value) {
+    let level = if frame.get("ok").and_then(Value::as_bool) == Some(true) {
+        LogLevel::Info
+    } else {
+        LogLevel::Warn
+    };
+    if let Ok(mut entry) = LogEntry::new(level, "eve.qqbot", code) {
+        for name in [
+            "http_status",
+            "biz_code",
+            "elapsed_ms",
+            "notice_http_status",
+            "notice_biz_code",
+        ] {
+            if let Some(value) = frame.get(name).and_then(Value::as_i64) {
+                entry = entry.with_field(name, value.to_string());
+            }
+        }
+        for name in [
+            "failure_kind",
+            "delivery_mode",
+            "notice_status",
+            "notice_failure_kind",
+        ] {
+            if let Some(value) = frame.get(name).and_then(Value::as_str)
+                && [
+                    "http",
+                    "timeout",
+                    "transport_unknown",
+                    "passive_window_elapsed",
+                    "passive",
+                    "proactive",
+                    "sent",
+                    "failed",
+                    "unknown",
+                    "not_attempted",
+                ]
+                .contains(&value)
+            {
+                entry = entry.with_field(name, value);
+            }
+        }
+        let _ = ctx.log(entry);
+    }
+}
+fn passive_limit(message: &Message) -> usize {
+    if message.scope == "c2c" {
+        4
+    } else {
+        crate::QQ_MAX_SEGMENTS
+    }
+}
 fn timing(enabled: bool, phase: &str, turn: Option<u64>) {
     if enabled {
         let at = std::time::SystemTime::now()
@@ -53,6 +107,9 @@ fn timing(enabled: bool, phase: &str, turn: Option<u64>) {
     }
 }
 fn progress_text(kind: &TurnEventKind) -> Option<String> {
+    if matches!(kind, TurnEventKind::ContextCompactionStarted) {
+        return Some("正在进行上下文压缩，请稍等".into());
+    }
     let TurnEventKind::ToolProgress {
         completed_calls,
         failed_calls,
@@ -148,6 +205,10 @@ pub(crate) struct Services {
     pub segmentation: Option<Arc<Segmentation>>,
     pub natural_message_judgement: bool,
     pub outreach: Option<Arc<OutreachHook>>,
+    pub files: Option<Arc<dyn QqFileDelivery>>,
+    pub file_poll: Option<Duration>,
+    pub attachment_observer: Option<Arc<dyn QqAttachmentObserver>>,
+    pub raw_observer: Option<Arc<dyn crate::QqRawMessageObserver>>,
     pub conversations: crate::QqConversations,
     pub participant_observer: Option<Arc<dyn crate::QqParticipantObserver>>,
     pub timing_diagnostics: bool,
@@ -195,6 +256,63 @@ fn c2c_route(ledger: &Ledger, app: &str, user_id: &str) -> PluginResult<Option<S
     }
     Ok(None)
 }
+fn session_route(
+    ledger: &Ledger,
+    app: &str,
+    session: &SessionKey,
+) -> PluginResult<Option<(String, String)>> {
+    for entry in ledger.entries.iter().rev() {
+        if entry.app_id == app
+            && entry.state == ReceiptState::Sent
+            && entry.message.session_key(app)? == *session
+        {
+            return Ok(Some((
+                entry.message.scope.clone(),
+                entry.message.target_id.clone(),
+            )));
+        }
+    }
+    Ok(None)
+}
+/// 文件投递的路由只取自本通道已确认的回执：宿主给会话，通道自己找平台目标。
+fn route_for(
+    ledger: &Ledger,
+    app: &str,
+    session: &SessionKey,
+) -> PluginResult<Option<(String, String)>> {
+    session_route(ledger, app, session)
+}
+/// 回执写入宿主失败只记录警告；宿主自行在重启时核对未结束的尝试。
+fn report_file(
+    files: &Arc<dyn QqFileDelivery>,
+    ctx: &PluginContext,
+    id: &str,
+    result: QqFileResult,
+) {
+    if files.delivered(id, result).is_err() {
+        warn(ctx, "file_receipt_unrecorded");
+    }
+}
+/// 平台回执转成宿主结果；不合规的消息编号按没有编号处理。
+fn file_result(frame: &Value, ok: bool) -> QqFileResult {
+    if ok {
+        QqFileResult::Sent {
+            platform_message_id: frame
+                .get("message_id")
+                .and_then(Value::as_str)
+                .filter(|id| valid_message_id(id))
+                .map(str::to_string),
+        }
+    } else {
+        QqFileResult::Failed {
+            http_status: frame
+                .get("http_status")
+                .and_then(Value::as_u64)
+                .and_then(|status| u16::try_from(status).ok()),
+            biz_code: frame.get("biz_code").and_then(Value::as_i64),
+        }
+    }
+}
 struct ChannelEvents {
     signal: Arc<dyn TaskSignal>,
     stop: watch::Receiver<bool>,
@@ -219,6 +337,7 @@ impl ControlEventSink for ChannelEvents {
         Box::pin(async move {
             let stage = match &event.event.kind {
                 TurnEventKind::ProviderStarted { .. } => Some("provider_begin"),
+                TurnEventKind::ContextCompactionStarted => Some("context_compaction_begin"),
                 TurnEventKind::ResponseCompleted { .. } => Some("provider_completed"),
                 TurnEventKind::ToolBatchStarted { .. } => Some("tools_begin"),
                 TurnEventKind::ToolResult { .. } => Some("tool_result"),
@@ -232,7 +351,10 @@ impl ControlEventSink for ChannelEvents {
             if self.is_closed() {
                 Err(LlmError::Cancelled)
             } else {
-                if matches!(event.event.kind, TurnEventKind::ToolProgress { .. }) {
+                if matches!(
+                    event.event.kind,
+                    TurnEventKind::ToolProgress { .. } | TurnEventKind::ContextCompactionStarted
+                ) {
                     self.progress
                         .try_send(event)
                         .map_err(|_| LlmError::Cancelled)?;
@@ -287,6 +409,7 @@ struct Active {
 }
 struct CommandMessage {
     message: Message,
+    private_text: Option<String>,
     target: Option<GenerationKey>,
     natural: bool,
     superseded: bool,
@@ -380,6 +503,10 @@ fn failed_turn_notice(report: &ControlReport) -> String {
         _ => None,
     };
     let reason = match error {
+        Some(LlmError::Context(reason)) if reason.starts_with("上下文压缩") => {
+            "上下文压缩未能完成，已保存的摘要进度与原始记录仍保留；压缩后的下一次对话请求未发出"
+                .into()
+        }
         Some(error) if error.provider_failure().is_some() => {
             failure_reason(error.provider_failure().expect("checked failure"))
         }
@@ -528,6 +655,10 @@ pub(crate) async fn run(
         segmentation,
         natural_message_judgement,
         outreach,
+        files,
+        file_poll,
+        attachment_observer,
+        raw_observer,
         conversations,
         participant_observer,
         timing_diagnostics,
@@ -616,6 +747,8 @@ pub(crate) async fn run(
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     // 正在主动私聊的邀请；一次只发送一条，期间不开始新的回复投递。
     let mut pushing: Option<String> = None;
+    // 正在上传的文件；一次只发一个，期间不开始新的回复投递。
+    let mut sending_file: Option<String> = None;
     // 正在等宿主判断时机的回复；判断结束后回到队首照常投递。
     let mut judging: Option<Judging> = None;
     let push_interval = outreach.as_ref().and_then(|hook| hook.push_interval);
@@ -709,13 +842,27 @@ pub(crate) async fn run(
                     finish(&mut stdin, &message.id).await?;
                     continue;
                 }
+                if !command.natural && message.text.trim() == "/last-reply" {
+                    let text = ledger.entries.iter().rev().find(|entry|
+                        entry.app_id == config.app_id && same_session(&entry.message, &message)
+                        && entry.message.text.trim() != "/last-reply"
+                        && entry.state == ReceiptState::Failed && entry.reply.is_some())
+                        .and_then(|entry| entry.reply.clone())
+                        .unwrap_or_else(|| "当前会话没有可取回的失败回复。".into());
+                    replies.push_back(Reply { message, text, guard: ReplyGuard::Command, interaction: None, invite: None });
+                    continue;
+                }
                 if !command.natural && let Some(handler) = &command_handler {
                     let session = message.session_key(&config.app_id)?;
                     match commands::dispatch(handler.as_ref(), QqCommandInput {
-                        message_id: &message.id, session: &session, text: &message.text,
+                        message_id: &message.id, session: &session, text: command.private_text.as_deref().unwrap_or(&message.text),
                     }) {
                         Ok(Some(text)) => {
                             replies.push_back(Reply { message, text, guard: ReplyGuard::Command, interaction: None, invite: None });
+                            continue;
+                        }
+                        Ok(None) if command.private_text.is_some() => {
+                            replies.push_back(Reply { message, text: "管理员绑定未启用。".into(), guard: ReplyGuard::Command, interaction: None, invite: None });
                             continue;
                         }
                         Ok(None) => {}
@@ -758,7 +905,30 @@ pub(crate) async fn run(
                 }
                 continue;
             }
-            if delivering.is_none() && pushing.is_none() && progress_delivery.is_none()
+            // 待发文件不等通道空闲：QQ 主动消息随时可发，和当前轮的回复互不占用配额。
+            if sending_file.is_none() && file_poll.is_some() && let Some(files) = &files {
+                match files.next_file() {
+                    Ok(Some(file)) => {
+                        let route = route_for(&ledger, &config.app_id, &file.session)?;
+                        let name_ok = file.name.as_deref().is_none_or(crate::files::valid_name);
+                        let caption_ok = file.caption.as_deref().is_none_or(crate::files::valid_caption);
+                        match route.filter(|_| valid_message_id(&file.id) && valid_path(&file.path) && name_ok && caption_ok) {
+                            Some((scope, target)) => {
+                                write(&mut stdin, json!({"type":"file","version":1,"id":file.id,
+                                    "scope":scope,"target_id":target,"path":file.path,
+                                    "name":file.name,"caption":file.caption})).await?;
+                                deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+                                sending_file = Some(file.id);
+                            }
+                            None => report_file(files, &ctx, &file.id, QqFileResult::NotSent),
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(_) => warn(&ctx, "file_delivery_unavailable"),
+                }
+            }
+            if delivering.is_none() && pushing.is_none() && sending_file.is_none() && progress_delivery.is_none()
                 && progress_queue.front().is_some_and(|event: &ControlEvent|
                     active.iter().any(|a| a.key == event.key)
                     || !routing.iter().any(|r| r.target.session == event.key.session))
@@ -789,7 +959,7 @@ pub(crate) async fn run(
                 }
                 continue;
             }
-            if delivering.is_none() && pushing.is_none() && judging.is_none() && progress_delivery.is_none()
+            if delivering.is_none() && pushing.is_none() && sending_file.is_none() && judging.is_none() && progress_delivery.is_none()
                 && progress_queue.is_empty() && progress_rx.is_empty()
                 && let Some(index) = replies.iter().position(|reply| !pending_control(&reply.message, &routing, &commands)) {
                 let reply = replies.remove(index).expect("queued reply");
@@ -839,7 +1009,7 @@ pub(crate) async fn run(
                         };
                         let progress_count = ledger.entries[ledger.find(&config.app_id, &reply.message.id).expect("reply receipt")].progress.len();
                         let mut policy = segmentation.policy;
-                        policy.max_segments = policy.max_segments.min(crate::QQ_MAX_SEGMENTS - progress_count);
+                        policy.max_segments = policy.max_segments.min(passive_limit(&reply.message) - progress_count);
                         policy.defaults.max_segments = policy.defaults.max_segments.min(policy.max_segments);
                         match eve_segment_api::plan_with_preference(
                             segmentation.planner.as_ref(), &reply.text, &policy, &preference) {
@@ -883,7 +1053,7 @@ pub(crate) async fn run(
                 if let Some(hook) = &outreach
                     && reply.invite == Some(true)
                     && invitable(&reply)
-                    && ledger.entries[index].progress.len() + plan.as_ref().map_or(1, |plan| plan.segments.len()) < crate::QQ_MAX_SEGMENTS
+                    && ledger.entries[index].progress.len() + plan.as_ref().map_or(1, |plan| plan.segments.len()) < passive_limit(&reply.message)
                     && plan.as_ref().map_or(1, |plan| plan.segments.len()) <= QQ_OUTREACH_MAX_REPLY_PARTS {
                     match hook.inner.attach(&reply.message.session_key(&config.app_id)?, &reply.message.id) {
                         Ok(Some(invitation)) => {
@@ -969,6 +1139,10 @@ pub(crate) async fn run(
                 delivery.pause_until = None;
             }
             let next_ordinary = queue.iter().position(|queued| {
+                if conversations.wakeup_claimed() { return false; }
+                let Ok(session) = queued.message.session_key(&config.app_id) else { return false; };
+                if control.snapshot(&session).ok().flatten().is_some_and(|s| s.phase != eve_control_api::ControlPhase::Finished) { return false; }
+
                 if !natural_message_judgement {
                     return routing.is_empty() && commands.is_empty() && active.is_empty()
                         && delivering.is_none() && replies.is_empty() && judging.is_none();
@@ -1003,6 +1177,9 @@ pub(crate) async fn run(
                         controlled_sessions.insert(key.session.session_id.clone(), key.session.clone());
                         let wait = control.wait(&key); active.push(Active { message, key, ordinary: queued.ordinary, wait });
                     }
+                    Err(eve_control_api::ControlError::Busy) => {
+                        queue.push_front(Queued { message, saved: true, ordinary: queued.ordinary });
+                    }
                     Err(_) => {
                         mark_failed(&mut ledger, &ctx, &config.app_id, &message.id)?;
                         status.send_modify(|s| s.failed += 1);
@@ -1013,18 +1190,23 @@ pub(crate) async fn run(
                 continue;
             }
             // 主动私聊：通道空闲时定期询问宿主；路由只取自已确认的私聊回执。
-            let push_ready = push_interval.is_some() && pushing.is_none() && delivering.is_none() && progress_delivery.is_none()
+            let channel_idle = pushing.is_none() && sending_file.is_none() && delivering.is_none() && progress_delivery.is_none()
                 && judging.is_none() && replies.is_empty() && status.borrow().ready;
+            let push_ready = push_interval.is_some() && channel_idle;
             if push_ready && let (Some(hook), Some(interval)) = (&outreach, push_interval)
                 && tokio::time::Instant::now() >= next_push {
                 next_push = tokio::time::Instant::now() + interval;
                 match hook.inner.next_push() {
                     Ok(Some(push)) => {
-                        let target = c2c_route(&ledger, &config.app_id, &push.user_id)?;
+                        let target = match &push.session {
+                            Some(session) if session.user_id == push.user_id => session_route(&ledger, &config.app_id, session)?,
+                            Some(_) => None,
+                            None => c2c_route(&ledger, &config.app_id, &push.user_id)?.map(|target| ("c2c".to_string(), target)),
+                        };
                         match target.filter(|_| valid_message_id(&push.message.id) && valid_outreach_text(&push.message.text)) {
-                            Some(target) => {
+                            Some((scope, target)) => {
                                 write(&mut stdin, json!({"type":"push","version":1,"id":push.message.id,
-                                    "target_id":target,"text":push.message.text})).await?;
+                                    "scope":scope,"target_id":target,"text":push.message.text})).await?;
                                 deadline = tokio::time::Instant::now() + Duration::from_secs(35);
                                 pushing = Some(push.message.id);
                             }
@@ -1036,15 +1218,18 @@ pub(crate) async fn run(
                 }
                 continue;
             }
+            conversations.set_idle(active.is_empty() && queue.is_empty() && routing.is_empty() && commands.is_empty()
+                && replies.is_empty() && delivering.is_none() && pushing.is_none() && sending_file.is_none() && judging.is_none() && status.borrow().ready);
             let eligible: Vec<bool> = active.iter().map(|a| !pending_control(&a.message, &routing, &commands)).collect();
             tokio::select! {
                 biased;
                 _ = signal.cancelled() => break Ok(()),
                 _ = stop.changed() => break Ok(()),
-                _ = tokio::time::sleep_until(deadline), if !status.borrow().ready || delivering.as_ref().is_some_and(Delivery::awaiting) || pushing.is_some() || progress_delivery.is_some() => {
+                _ = tokio::time::sleep_until(deadline), if !status.borrow().ready || delivering.as_ref().is_some_and(Delivery::awaiting) || pushing.is_some() || sending_file.is_some() || progress_delivery.is_some() => {
                     break Err(failure("QQBot ready 或 delivery 等待超时"));
                 }
                 _ = tokio::time::sleep_until(next_push), if push_ready => {}
+                _ = tokio::time::sleep(Duration::from_millis(100)), if !queue.is_empty() => {}
                 Some(event) = progress_rx.recv(), if progress_queue.len() < 64 => { progress_queue.push_back(event); }
                 invite = judged(&mut judging), if judging.is_some() => {
                     let (mut reply, _) = judging.take().expect("judging reply");
@@ -1140,6 +1325,7 @@ pub(crate) async fn run(
                     }
                 }
                 frame = frames.next() => {
+                    conversations.set_idle(false);
                     let Some(frame) = frame? else {
                         if !active.is_empty() || !routing.is_empty() || delivering.is_some() || pushing.is_some() || progress_delivery.is_some() || judging.is_some() || !queue.is_empty()
                             || !commands.is_empty() || !replies.is_empty() || !status.borrow().ready {
@@ -1176,14 +1362,22 @@ pub(crate) async fn run(
                             let index = ledger.find(&config.app_id, id).expect("progress receipt");
                             ledger.entries[index].progress[*part].state = if ok { PartState::Sent } else { PartState::Failed };
                             ledger.save(&ctx)?;
-                            if !ok { warn(&ctx, "progress_failed_no_retry"); }
+                            if !ok { delivery_log(&ctx, "progress_failed_no_retry", &frame); }
                             progress_delivery = None;
+                        }
+                        Some("delivery") if frame.get("file").and_then(Value::as_bool) == Some(true) => {
+                            let (Some(files), Some(current)) = (&files, sending_file.as_deref()) else { warn(&ctx, "unexpected_delivery"); continue; };
+                            if frame.get("id").and_then(Value::as_str) != Some(current) { warn(&ctx, "delivery_id_mismatch"); continue; }
+                            let Some(ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
+                            if !ok { delivery_log(&ctx, "file_delivery_failed_no_retry", &frame); }
+                            report_file(files, &ctx, current, file_result(&frame, ok));
+                            sending_file = None;
                         }
                         Some("delivery") if frame.get("push").and_then(Value::as_bool) == Some(true) => {
                             let (Some(hook), Some(current)) = (&outreach, pushing.as_deref()) else { warn(&ctx, "unexpected_delivery"); continue; };
                             if frame.get("id").and_then(Value::as_str) != Some(current) { warn(&ctx, "delivery_id_mismatch"); continue; }
                             let Some(ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
-                            if !ok { warn(&ctx, "outreach_push_failed_no_retry"); }
+                            if !ok { delivery_log(&ctx, "outreach_push_failed_no_retry", &frame); }
                             report(hook, &ctx, current, outreach_result(&frame, ok));
                             pushing = None;
                         }
@@ -1232,7 +1426,10 @@ pub(crate) async fn run(
                             let reply = &delivery.reply;
                             let message = &reply.message;
                             status.send_modify(|s| { if ok { s.sent += 1; } else { s.failed += 1; } });
-                            if !ok { warn(&ctx, "delivery_failed_no_retry"); }
+                            if !ok { delivery_log(&ctx, "delivery_failed_no_retry", &frame); }
+                            else if frame.get("delivery_mode").and_then(Value::as_str) == Some("proactive") {
+                                delivery_log(&ctx, "late_reply_proactive_sent", &frame);
+                            }
                             if ok { timing(timing_diagnostics, "delivery_confirmed", None); }
                             if ok && let Some(interaction) = &reply.interaction
                                 && let Some(observation) = &observation
@@ -1253,13 +1450,17 @@ pub(crate) async fn run(
                             if let Some(object) = payload.as_object_mut() {
                                 object.remove("type"); object.remove("version");
                                 object.remove("sender_name");
-                                if object.keys().any(|key| !["id", "scope", "target_id", "user_id", "text", "attachments"].contains(&key.as_str())) {
+                                if object.keys().any(|key| !["id", "scope", "target_id", "user_id", "text", "attachments", "quoted"].contains(&key.as_str())) {
                                     warn(&ctx, "ignored_message_fields");
                                 }
-                                object.retain(|key, _| ["id", "scope", "target_id", "user_id", "text", "attachments"].contains(&key.as_str()));
+                                object.retain(|key, _| ["id", "scope", "target_id", "user_id", "text", "attachments", "quoted"].contains(&key.as_str()));
                             }
-                            let Ok(message) = serde_json::from_value::<Message>(payload) else { warn(&ctx, "invalid_message"); continue; };
+                            let raw_debug = frame.get("raw").cloned().filter(|value| !value.is_null());
+                            let Ok(mut message) = serde_json::from_value::<Message>(payload) else { warn(&ctx, "invalid_message"); continue; };
                             if !message.valid() { warn(&ctx, "invalid_route_or_text"); continue; }
+                            // 绑定密钥只保留在命令处理器的临时内存；回执、观察器、训练与模型只能看到脱敏正文。
+                            let private_text = (message.text.split_whitespace().next() == Some("/bind"))
+                                .then(|| std::mem::replace(&mut message.text, "/bind [已隐藏]".into()));
                             let live = queue.iter().any(|m| m.message.id == message.id)
                                 || commands.iter().any(|c| c.message.id == message.id)
                                 || active.iter().any(|a| a.message.id == message.id)
@@ -1278,7 +1479,15 @@ pub(crate) async fn run(
                                 status.send_modify(|s| s.received += 1);
                                 timing(timing_diagnostics, "message_received", None);
                                 conversations.record_message(&config.app_id, &message)?;
-                                if let Some(observer) = &participant_observer {
+                                if let Some(observer) = &attachment_observer { observer.observe(&message.session_key(&config.app_id)?, &message); }
+                                if let (Some(observer), Some(raw)) = (&raw_observer, raw_debug.as_ref()) {
+                                    let text = raw.to_string();
+                                    let bounded = if text.len() > 24_576 { text[..24_576].to_string() } else { text.clone() };
+                                    observer.record(&message.session_key(&config.app_id)?, crate::QqRawMessage {
+                                        bytes: text.len(), truncated: text.len() > 24_576, json: bounded,
+                                    });
+                                }
+                                if private_text.is_none() && let Some(observer) = &participant_observer {
                                     let session = message.session_key(&config.app_id)?;
                                     if let Err(error) = observer.observe(&session, &message.conversation_key(&config.app_id)?, &message.text, sender_name.as_deref()) {
                                         if matches!(error, PluginError::State(_)) { return Err(error); }
@@ -1301,7 +1510,7 @@ pub(crate) async fn run(
                                             }
                                         }
                                     }
-                                    commands.push_back(CommandMessage { message, target, natural: false, superseded: false, saved: false });
+                                    commands.push_back(CommandMessage { message, private_text, target, natural: false, superseded: false, saved: false });
                                 } else {
                                     // 按普通输入准入时的持久开关采集，不能延后到模型执行。
                                     // 启停/重置可先于排队任务执行；旧输入必须已有去重凭据。
@@ -1326,7 +1535,7 @@ pub(crate) async fn run(
                                             finish(&mut stdin, &message.id).await?;
                                             continue;
                                         }
-                                        commands.push_back(CommandMessage { message, target, natural: true, superseded: false, saved: true });
+                                        commands.push_back(CommandMessage { message, private_text: None, target, natural: true, superseded: false, saved: true });
                                     } else {
                                         let ordinary = message.attachments.is_empty();
                                         queue.push_back(Queued { message, saved: false, ordinary });

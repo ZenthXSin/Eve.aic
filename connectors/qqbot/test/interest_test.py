@@ -5,6 +5,7 @@
 确定性替身只证明宿主契约与恢复语义，不代表真实模型的观察质量。
 """
 import json
+from fixture_auth import bootstrap_test_admin
 import contextlib
 import os
 import pathlib
@@ -105,10 +106,16 @@ class InterestAcceptance(unittest.TestCase):
                 if status == 200 and hasattr(outer, "provider_response"):
                     response = outer.provider_response(body, kind, response)
                 encoded = json.dumps(response).encode()
+                content_type = "application/json"
+                if status == 200 and hasattr(outer, "encode_provider_response"):
+                    content_type, encoded = outer.encode_provider_response(body, response)
                 self.send_response(status)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(encoded)))
                 self.end_headers()
+                if status == 200 and hasattr(outer, "write_provider_response"):
+                    outer.write_provider_response(self, body, encoded)
+                    return
                 self.wfile.write(encoded)
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -208,6 +215,7 @@ class InterestAcceptance(unittest.TestCase):
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
                    EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
         env.update(env_extra or {})
+        bootstrap_test_admin(self.work / "state", env)
         command = [str(BINARY), "--state-dir", str(self.work / "state"),
                    "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
                    "--bridge-arg", str(scenario), "--cognition-max-executions", str(max_executions)]

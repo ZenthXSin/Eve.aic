@@ -46,13 +46,16 @@ class UpgradeRuntimeTests(unittest.TestCase):
         self.events = self.root / 'events'
         self.initial = self.root / 'initial'; self.initial.mkdir()
         self.helper = self.root / 'child.py'
-        self.helper.write_text('''import json,signal,sys,time
+        self.helper.write_text('''import json,os,signal,subprocess,sys,time
 from pathlib import Path
 if '--help' in sys.argv: raise SystemExit(0)
 agent=Path(sys.argv[sys.argv.index('--agent')+1]);tag=agent.read_text()
 state=Path(sys.argv[sys.argv.index('--state-dir')+1])/'state.json'
 events=Path(sys.argv[sys.argv.index('--events')+1])
 with events.open('a') as f:f.write(tag+'\\n')
+if '--spawn-child' in sys.argv:
+ worker=subprocess.Popen([sys.executable,'-c','import time;time.sleep(120)'])
+ with (state.parent/'workers').open('a') as f:f.write(str(worker.pid)+'\\n')
 signal.signal(signal.SIGINT,lambda *_:sys.exit(0))
 if hasattr(signal,'SIGBREAK'):signal.signal(signal.SIGBREAK,lambda *_:sys.exit(0))
 if tag=='fail':
@@ -60,7 +63,16 @@ if tag=='fail':
  state.write_text(json.dumps(data));raise SystemExit(2)
 print('EVE_QQBOT_READY',file=sys.stderr,flush=True)
 if tag=='ready-fail':time.sleep(.02);raise SystemExit(3)
-while True:time.sleep(.05)
+launched=time.monotonic()
+while True:
+ trigger=state.parent/(tag+'.crash')
+ if trigger.exists():
+  trigger.unlink()
+  data=json.loads(state.read_text());data['entries']['synthetic.latest']={'marker':[7]}
+  state.write_text(json.dumps(data));raise SystemExit(7)
+ if (state.parent/'always-crash').exists() and time.monotonic()-launched>.25:raise SystemExit(7)
+ if (state.parent/'corrupt-crash').exists():state.write_text('corrupt');raise SystemExit(7)
+ time.sleep(.02)
 ''', encoding='utf8')
         self.old = self.root / ('old.exe' if os.name == 'nt' else 'old')
         self.old.write_bytes(Path(sys.executable).read_bytes())
@@ -117,12 +129,12 @@ while True:time.sleep(.05)
         save()
         with self.assertRaisesRegex(ValueError,'invalid_progress_ledger'):runtime.delivery_gate(path,request)
 
-    def candidate(self,tag):
+    def candidate(self,tag,same_binary=False):
         resources={}
         for p in self.initial.rglob('*'):
             if p.is_file():resources[p.relative_to(self.initial).as_posix()]=hashlib.sha256((tag if p.name=='AGENT.md' else p.read_text()).encode()).hexdigest()
         # 尾部附加数据不改变原生解释器执行，却使二进制摘要可区分。
-        binary=Path(sys.executable).read_bytes()+tag.encode()
+        binary=Path(sys.executable).read_bytes()+(b'' if same_binary else tag.encode())
         binary_sha=hashlib.sha256(binary).hexdigest()
         source={'head':'0'*40,'diff':'0'*64,'untracked':'0'*64}
         identity={'source':source,'binary_sha256':binary_sha,'resources':resources}
@@ -143,7 +155,8 @@ while True:time.sleep(.05)
         self.log=(self.root/'supervisor.log').open('ab')
         self.process=subprocess.Popen([sys.executable,str(SCRIPT),'--directory',str(self.queue),
             '--candidates',str(self.candidates),'--ready-timeout','3','--stop-timeout','3',
-            '--drain-timeout','5','--quiet-seconds','.1','--health-seconds','.1','--',*self.command],env=self.env,
+            '--drain-timeout','5','--quiet-seconds','.1','--health-seconds','.1',
+            '--restart-delay','.05','--restart-window-seconds','10','--',*self.command],env=self.env,
             stdout=self.log,stderr=self.log,
             **({'creationflags':subprocess.CREATE_NEW_PROCESS_GROUP} if os.name=='nt' else {}))
         self.wait(lambda d:d['phase']=='running')
@@ -179,6 +192,65 @@ while True:time.sleep(.05)
         self.assertEqual(self.events.read_text().splitlines(),['old','fail','old'])
         self.assertIn('synthetic.candidate',runtime.read_json(self.state/'state.json')['entries'])
         self.assertEqual(next((self.queue/'backups').glob('*/state.json')).read_bytes(),before)
+
+    def add_receipt(self, state='Processing', progress=None):
+        path=self.state/'state.json';doc=runtime.read_json(path)
+        ledger=json.loads(bytes(doc['entries']['eve.channel.qqbot']['receipts.v1']))
+        receipt={'app_id':'app','state':state,'message':{'id':f'historical-message-{len(ledger["entries"])}','scope':'c2c',
+            'target_id':'other','user_id':'other','text':'旧的未决消息'}}
+        if state in ('Sent','ReplyPending'):receipt['reply']='旧的回复记录'
+        if progress is not None:
+            ledger['version']=3;receipt['progress']=progress
+        ledger['entries'].append(receipt)
+        doc['entries']['eve.channel.qqbot']['receipts.v1']=list(json.dumps(ledger).encode())
+        runtime.atomic(path,doc)
+        return doc,ledger
+
+    def test_inherited_unknown_receipts_do_not_block_and_are_preserved_byte_for_byte(self):
+        self.add_receipt('Processing')
+        self.add_receipt('ReplyPending')
+        self.add_receipt('Sent',[{'text':'旧的发送结果未知','state':'Sending'}])
+        before=(self.state/'state.json').read_bytes()
+        self.launch();request=self.candidate('new')
+        runtime.atomic(self.queue/'request.json',request)
+        self.wait(lambda d:d['result']=='applied')
+        self.assertEqual(self.events.read_text().splitlines(),['old','new'])
+        self.assertEqual((self.state/'state.json').read_bytes(),before)
+
+    def test_new_inflight_receipt_still_blocks_after_startup(self):
+        self.launch();doc,ledger=self.add_receipt()
+        runtime.atomic(self.queue/'request.json',self.candidate('new'))
+        self.wait(lambda d:d['phase']=='waiting')
+        time.sleep(.2)
+        self.assertEqual(self.events.read_text().splitlines(),['old'])
+        ledger['entries'][-1]['state']='Failed'
+        doc['entries']['eve.channel.qqbot']['receipts.v1']=list(json.dumps(ledger).encode())
+        runtime.atomic(self.state/'state.json',doc)
+        self.wait(lambda d:d['result']=='applied')
+
+    def test_changed_inherited_receipt_is_no_longer_exempt(self):
+        doc,ledger=self.add_receipt();self.launch()
+        ledger['entries'][-1]['message']['text']='当前进程修改后的消息'
+        doc['entries']['eve.channel.qqbot']['receipts.v1']=list(json.dumps(ledger).encode())
+        runtime.atomic(self.state/'state.json',doc)
+        runtime.atomic(self.queue/'request.json',self.candidate('new'))
+        self.wait(lambda d:d['phase']=='waiting');time.sleep(.2)
+        self.assertEqual(self.events.read_text().splitlines(),['old'])
+        ledger['entries'][-1]['state']='Failed'
+        doc['entries']['eve.channel.qqbot']['receipts.v1']=list(json.dumps(ledger).encode())
+        runtime.atomic(self.state/'state.json',doc)
+        self.wait(lambda d:d['result']=='applied')
+
+    def test_inherited_unknown_cannot_satisfy_request_delivery_or_hide_corruption(self):
+        self.write_state('Completed','Processing');path=self.state/'state.json'
+        inherited=runtime.inherited_receipts(path)
+        request={'session_id':self.session,'requested_by':self.session,'turn_id':1}
+        self.assertFalse(runtime.delivery_gate(path,request,inherited))
+        self.write_state('Completed','Sent')
+        doc,ledger=self.add_receipt('Sent',[{'text':'坏记录','state':'invalid'}])
+        token=runtime.receipt_fingerprint(ledger['entries'][-1])
+        with self.assertRaisesRegex(ValueError,'invalid_progress_ledger'):
+            runtime.delivery_gate(path,request,frozenset([token]))
 
     def test_tampered_candidate_never_stops_original_process(self):
         self.launch();request=self.candidate('new')
@@ -218,5 +290,87 @@ while True:time.sleep(.05)
         self.log.close();self.launch()
         self.assertEqual(self.events.read_text().splitlines(),['old','new','new'])
         self.assertFalse((self.queue/'request.json').exists())
+
+    def test_runtime_crash_restarts_once_and_preserves_new_state(self):
+        self.launch()
+        (self.state/'old.crash').touch()
+        self.wait(lambda d:d['result']=='runtime_restarted_state_preserved' and d['phase']=='running')
+        self.assertEqual(self.events.read_text().splitlines(), ['old','old'])
+        self.assertIn('synthetic.latest', runtime.read_json(self.state/'state.json')['entries'])
+        self.assertEqual(len(runtime.read_json(self.queue/'recovery.json')['crashes']), 1)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux 子进程组清理')
+    def test_crashed_runtime_closes_orphan_bridge_before_restart(self):
+        self.command.append('--spawn-child')
+        self.launch()
+        old_worker=int((self.state/'workers').read_text().splitlines()[0])
+        (self.state/'old.crash').touch()
+        self.wait(lambda d:d['result']=='runtime_restarted_state_preserved' and d['phase']=='running')
+        stat=Path(f'/proc/{old_worker}/stat')
+        self.assertTrue(not stat.exists() or stat.read_text().rsplit(') ',1)[1].split()[0]=='Z')
+        self.assertEqual(len((self.state/'workers').read_text().splitlines()),2)
+
+    def test_runtime_crash_after_committed_upgrade_rolls_back_and_quarantines(self):
+        self.launch();request=self.candidate('late-fail')
+        runtime.atomic(self.queue/'request.json',request)
+        self.wait(lambda d:d['result']=='applied')
+        (self.state/'late-fail.crash').touch()
+        self.wait(lambda d:d['result']=='runtime_rolled_back_binary_state_preserved' and d['phase']=='running')
+        self.assertEqual(self.events.read_text().splitlines(), ['old','late-fail','old'])
+        self.assertIn('synthetic.latest', runtime.read_json(self.state/'state.json')['entries'])
+        self.assertFalse((self.queue/'active-command.json').exists())
+        self.assertTrue((self.queue/'quarantine'/ (request['candidate_sha256']+'.json')).is_file())
+        runtime.atomic(self.queue/'request.json',request)
+        self.wait(lambda d:d['result']=='rejected' and d['error']=='candidate_quarantined')
+        self.assertEqual(self.events.read_text().splitlines(), ['old','late-fail','old'])
+
+    def test_crash_budget_is_bounded_and_manual_stop_never_restarts(self):
+        self.launch();(self.state/'always-crash').touch()
+        self.assertEqual(self.process.wait(timeout=10), runtime.RECOVERY_STOP)
+        self.assertLessEqual(len(self.events.read_text().splitlines()), 4)
+        self.assertEqual(runtime.read_json(self.queue/'recovery.json')['result'], 'restart_limit_exhausted')
+
+    def test_corrupt_state_after_crash_stops_without_clearing_or_restarting(self):
+        self.launch();(self.state/'corrupt-crash').touch()
+        self.assertEqual(self.process.wait(timeout=10), runtime.RECOVERY_STOP)
+        self.assertEqual((self.state/'state.json').read_bytes(), b'corrupt')
+        self.assertEqual(self.events.read_text().splitlines(), ['old'])
+
+    def test_changed_previous_resources_cannot_be_used_for_runtime_rollback(self):
+        self.launch();request=self.candidate('late-fail');runtime.atomic(self.queue/'request.json',request)
+        self.wait(lambda d:d['result']=='applied')
+        (self.initial/'AGENT.md').write_text('changed')
+        (self.state/'late-fail.crash').touch()
+        self.assertEqual(self.process.wait(timeout=10), runtime.RECOVERY_STOP)
+        self.assertEqual(self.events.read_text().splitlines(), ['old','late-fail'])
+
+    def test_resource_only_upgrade_can_roll_back_after_committed_crash(self):
+        self.launch();request=self.candidate('resource-fail',same_binary=True)
+        runtime.atomic(self.queue/'request.json',request)
+        self.wait(lambda d:d['result']=='applied')
+        (self.state/'resource-fail.crash').touch()
+        self.wait(lambda d:d['result']=='runtime_rolled_back_binary_state_preserved' and d['phase']=='running')
+        self.assertEqual(self.events.read_text().splitlines(), ['old','resource-fail','old'])
+        self.assertTrue((self.queue/'quarantine'/(request['candidate_sha256']+'.json')).is_file())
+
+    def test_explicit_supervisor_stop_does_not_restart_child(self):
+        self.launch()
+        self.process.send_signal(signal.CTRL_BREAK_EVENT if os.name=='nt' else signal.SIGTERM)
+        self.assertEqual(self.process.wait(timeout=10), 0)
+        self.assertEqual(self.events.read_text().splitlines(), ['old'])
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux ELF loader')
+    def test_explicit_linux_loader_keeps_candidate_digest_and_active_pointer(self):
+        loader=Path('/lib64/ld-linux-x86-64.so.2')
+        if not loader.is_file():self.skipTest('GNU Linux loader unavailable')
+        self.env['EVE_RUNTIME_LOADER']=str(loader)
+        self.env['EVE_RUNTIME_LIBRARY_PATH']=str(Path(sys.prefix)/'lib')
+        self.launch();request=self.candidate('new')
+        before=runtime.digest(Path(request['candidate_directory'])/'eve-qqbot')
+        runtime.atomic(self.queue/'request.json',request)
+        self.wait(lambda d:d['result']=='applied')
+        pointer=runtime.read_json(self.queue/'active-command.json')
+        self.assertEqual(pointer['binary_sha256'],before)
+        self.assertEqual(pointer['command'][0],str(Path(request['candidate_directory'])/'eve-qqbot'))
 
 if __name__=='__main__':unittest.main()

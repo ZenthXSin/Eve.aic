@@ -16,6 +16,8 @@ struct Inner {
     sources: HashMap<String, QqInteractionSource>,
     identities: HashMap<String, QqConversationIdentity>,
     order: VecDeque<String>,
+    idle: bool,
+    wakeup_claimed: bool,
 }
 
 /// 仅由已校验的平台路由构造；不会改变已有 SessionKey 或根据昵称合并身份。
@@ -32,7 +34,33 @@ pub struct QqConversationIdentity {
 pub struct QqConversations {
     inner: Arc<Mutex<Inner>>,
 }
+pub struct QqWakeupLease(QqConversations);
+impl Drop for QqWakeupLease {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.0.inner.lock() {
+            inner.wakeup_claimed = false;
+        }
+    }
+}
 impl QqConversations {
+    pub(crate) fn set_idle(&self, idle: bool) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.idle = idle;
+        }
+    }
+    pub(crate) fn wakeup_claimed(&self) -> bool {
+        self.inner.lock().map_or(true, |inner| inner.wakeup_claimed)
+    }
+    /// Reserve the idle channel before submitting a host wakeup. Incoming messages queue until release.
+    pub fn try_claim_wakeup(&self) -> Option<QqWakeupLease> {
+        let mut inner = self.inner.lock().ok()?;
+        if !inner.idle || inner.wakeup_claimed {
+            return None;
+        }
+        inner.wakeup_claimed = true;
+        Some(QqWakeupLease(self.clone()))
+    }
+
     pub fn identity(&self, session: &SessionKey) -> PluginResult<Option<QqConversationIdentity>> {
         let inner = self
             .inner

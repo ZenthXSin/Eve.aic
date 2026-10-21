@@ -41,6 +41,8 @@ pub type QqOutreachFuture = Pin<Box<dyn Future<Output = PluginResult<bool>> + Se
 /// 主动私聊：会话的用户标识（与 `SessionKey::user_id` 相同）及邀请。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QqOutreachPush {
+    /// Some binds delivery to this exact original conversation, including group scope.
+    pub session: Option<SessionKey>,
     pub user_id: String,
     pub message: QqOutreachMessage,
 }

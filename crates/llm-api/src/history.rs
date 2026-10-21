@@ -1,4 +1,25 @@
-use crate::{ChatMessage, ChatRole, ContextScope, LlmError};
+use crate::{ChatMessage, ChatRole, ContextScope, LlmError, LlmFuture};
+
+/// 主动上下文压缩的整次期限，包含所有分批摘要请求。
+pub const CONTEXT_COMPACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// 输入上下文的估算 token 阈值；不代表模型厂商的精确分词结果。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextCompactionPolicy {
+    pub trigger_tokens: usize,
+    pub target_tokens: usize,
+}
+
+impl ContextCompactionPolicy {
+    pub fn validate(self) -> Result<(), LlmError> {
+        if self.target_tokens == 0 || self.target_tokens >= self.trigger_tokens {
+            return Err(LlmError::Configuration(
+                "压缩目标必须大于零且小于触发阈值".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// 单次请求的历史窗口；字节数按各完整轮次的 JSON UTF-8 长度累计，不是模型 token 数。
 /// 不限制当前用户输入、系统资料、工具定义或本轮新产生的工具结果，不修改持久历史。
@@ -22,6 +43,9 @@ impl HistoryWindow {
 /// 每轮开始前读取一次；同一轮的多次模型调用使用同一快照。
 pub trait HistoryWindowResolver: Send + Sync {
     fn resolve(&self) -> Result<HistoryWindow, LlmError>;
+    fn compaction(&self) -> Result<Option<ContextCompactionPolicy>, LlmError> {
+        Ok(None)
+    }
 }
 
 /// 单个历史摘要正文的上限（UTF-8 字节）。
@@ -46,6 +70,25 @@ pub trait HistoryDigests: Send + Sync {
         scope: Option<&ContextScope>,
         omitted: &[ChatMessage],
     ) -> Result<Option<HistoryDigest>, LlmError>;
+
+    /// 只读、指纹匹配的已存摘要；不得因此登记后台压缩。
+    fn cached(
+        &self,
+        _scope: Option<&ContextScope>,
+        _history: &[ChatMessage],
+    ) -> Result<Option<HistoryDigest>, LlmError> {
+        Ok(None)
+    }
+
+    /// 主动压缩，必须完整覆盖所给轮次才可替换原文。None 作用域只生成临时摘要，不写入历史存储。
+    /// 宿主负责取消和总期限；实现不能重放工具。
+    fn compact<'a>(
+        &'a self,
+        scope: Option<&'a ContextScope>,
+        messages: &'a [ChatMessage],
+    ) -> LlmFuture<'a, Option<HistoryDigest>> {
+        Box::pin(async move { self.digest(scope, messages) })
+    }
 }
 
 /// 把历史按完整轮次分组：每组从一条用户消息开始，包含其后的助手回复与工具往返。

@@ -5,6 +5,7 @@
 """
 import hashlib
 import json
+from fixture_auth import bootstrap_test_admin
 import os
 import pathlib
 import signal
@@ -122,6 +123,8 @@ class SegmentAcceptance(unittest.TestCase):
         env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret",
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
                    EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
+        bootstrap_test_admin(self.work / "state", env,
+                             users=getattr(self, "fixture_admin_users", ("user-1", "user-2")))
         command = [str(BINARY), "--state-dir", str(self.work / "state"), "--agent", str(ROOT / "AGENT.md"),
                    "--bridge-script", str(FAKE), "--bridge-arg", str(scenario)]
         if segmented:
@@ -465,6 +468,7 @@ class SegmentAcceptance(unittest.TestCase):
         self.assertFalse(self.requests)
 
     def test_foreign_sources_disabled_memory_and_unsupported_feedback_do_not_write(self):
+        self.fixture_admin_users = ("user-1", "user-2", "other")
         self.run_eve([{"send": self.advice_command("no-memory", "/segment suggestions", "需要同时启用")},
                       self.wait_receipt("no-memory", "Sent")])
         source = self.remember_rhythm("回复最多两段。")

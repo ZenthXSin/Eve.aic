@@ -222,6 +222,8 @@ class LearningAcceptance(unittest.TestCase):
 
         inspector = threading.Thread(target=inspect, daemon=True)
         sink = open(self.panel_stderr, "w")
+        from fixture_auth import bootstrap_test_admin
+        bootstrap_test_admin(self.work / "state", env, app)
         child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                                  stderr=sink if panel else subprocess.PIPE, text=True)
         inspector.start()

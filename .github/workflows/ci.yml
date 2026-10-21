@@ -56,6 +56,10 @@ jobs:
             Write-Output "::error title=实时升级进程验收失败::$details"
             exit $result
           }
+      - name: 验证 Linux 外层守护、孤儿清理与两层崩溃恢复
+        run: python -X utf8 scripts/test-service-guard.py
+      - name: 验证 Linux 分卷校验与进程身份绑定
+        run: python -X utf8 scripts/test-linux-handoff.py
       - name: 检查所有构建目标
         run: cargo check --workspace --all-targets --locked
       - name: 检查 Clippy 警告
@@ -69,6 +73,11 @@ jobs:
           $qqBinary = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
           python -X utf8 scripts/test-web-plugins.py $qqBinary
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 验证引用和附件消息的记忆采集及重启不重放
+        run: |
+          $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
+          python -X utf8 connectors/qqbot/test/memory_test.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证浏览器中的插件配置、冲突、启停与窄屏
         if: runner.os == 'Linux'
         run: |
@@ -78,6 +87,13 @@ jobs:
           $env:EVE_PLAYWRIGHT_MODULE = Join-Path $browserDirectory "node_modules/playwright-core/index.mjs"
           $env:EVE_TEST_BROWSER = (Get-Command google-chrome -ErrorAction Stop).Source
           python -X utf8 scripts/test-web-plugins.py target/debug/eve-qqbot --browser
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 验证 150k 上下文主动压缩与重启复用
+        run: |
+          $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
+          python -X utf8 connectors/qqbot/test/context_compaction_test.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -X utf8 connectors/qqbot/test/compaction_stream_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证交互记忆三次独立进程恢复
         run: |

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 mod cognition_executor;
 pub use cognition_executor::{BudgetedSessionRunner, ControlGoalExecutor};
+mod compaction;
 mod control_runner;
 mod history;
 mod llm_host;

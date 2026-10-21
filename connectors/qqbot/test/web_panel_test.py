@@ -62,6 +62,8 @@ class WebPanelAcceptance(unittest.TestCase):
                    EVE_LLM_RESPONSE_MODE="complete", EVE_WEB_TOKEN=token)
         command = [str(support.BINARY), "--state-dir", str(self.work / "state"), "--agent", str(support.ROOT / "AGENT.md"),
                    "--bridge-script", str(BRIDGE), "--bridge-arg", str(scenario), "--web-listen", "127.0.0.1:0"]
+        from fixture_auth import bootstrap_test_admin
+        bootstrap_test_admin(self.work / "state", env)
         child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         lines = []
         ready = queue.Queue()

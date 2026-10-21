@@ -18,10 +18,19 @@ pub struct DeveloperConfig {
     #[serde(default)]
     pub storage_directory: Option<PathBuf>,
     pub operators: BTreeSet<String>,
+    /// 显式开放开发后端的普通访问；QQ 宿主仍独立执行主人/管理员管理策略。
+    #[serde(default = "ordinary_access")]
+    pub ordinary_access: bool,
     #[serde(default)]
     pub commands: bool,
     #[serde(default)]
     pub github: bool,
+    /// 向所有具有宿主绑定身份的聊天用户开放 GitHub 工具；不开放文件/命令/升级工具。
+    #[serde(default)]
+    pub github_all_users: bool,
+    /// GitHub 写入不再使用宿主仓库白名单，仍受 token 的实际授权约束。
+    #[serde(default)]
+    pub github_all_repositories: bool,
     #[serde(default)]
     pub github_write_repositories: BTreeSet<String>,
     #[serde(default = "token_env")]
@@ -43,6 +52,14 @@ pub struct DeveloperConfig {
 }
 fn token_env() -> String {
     "EVE_GITHUB_TOKEN".into()
+}
+fn ordinary_access() -> bool {
+    false
+}
+
+/// 宿主提供的平台身份授权；模型参数、昵称及自称不能实现此绑定。
+pub trait DeveloperAuthorization: Send + Sync {
+    fn is_operator(&self, scope: &eve_llm_api::ContextScope) -> bool;
 }
 fn timeout() -> u64 {
     600_000

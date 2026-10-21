@@ -439,7 +439,9 @@ pub struct LlmHost {
     history_resolver: Option<Arc<dyn eve_llm_api::HistoryWindowResolver>>,
     history_digests: Option<Arc<dyn eve_llm_api::HistoryDigests>>,
     history_window: Option<eve_llm_api::HistoryWindow>,
+    compaction_policy: Option<eve_llm_api::ContextCompactionPolicy>,
     execution_budget: Option<Arc<eve_llm_api::TurnBudget>>,
+    journal: Option<Arc<dyn eve_llm_api::TurnJournal>>,
     pub(crate) registry: Arc<dyn ServiceRegistry>,
     pub(crate) kernel: Kernel,
     permissions: Arc<dyn PermissionChecker>,
@@ -491,7 +493,9 @@ impl LlmHost {
             history_resolver: None,
             history_digests: None,
             history_window: None,
+            compaction_policy: None,
             execution_budget: None,
+            journal: None,
             registry,
             kernel,
             permissions,
@@ -530,6 +534,12 @@ impl LlmHost {
         self
     }
 
+    /// 后台任务的独立持久执行日志；不要用于会话历史或与额外 TurnBudget 叠加。
+    pub fn with_turn_journal(mut self, journal: Arc<dyn eve_llm_api::TurnJournal>) -> Self {
+        self.journal = Some(journal);
+        self
+    }
+
     /// 本次执行的工具调用总数上限（如后台任务的步数预算）；用尽后按 `final_answer_on_round_limit` 收尾。
     /// 克隆继续共享工具槽位和串行队列。
     pub fn with_tool_call_limit(&self, limit: usize) -> Result<Self, LlmError> {
@@ -565,6 +575,12 @@ impl LlmHost {
                 .map_err(|_| LlmError::Backend("历史窗口解析回调发生异常".into()))??;
             window.validate()?;
             host.history_window = Some(window);
+            let policy = catch_unwind(AssertUnwindSafe(|| resolver.compaction()))
+                .map_err(|_| LlmError::Backend("压缩配置回调发生异常".into()))??;
+            if let Some(policy) = policy {
+                policy.validate()?;
+            }
+            host.compaction_policy = policy;
         }
         host.history_resolver = None;
         if let Some(resolver) = &self.model_resolver {
@@ -667,7 +683,16 @@ impl LlmHost {
                 return Err(fail(error, diagnostics));
             }
         }
-        if let Some(window) = self.history_window
+        let mut compaction = match (self.compaction_policy, self.history_digests.as_deref()) {
+            (Some(_), Some(service)) => Some(crate::compaction::State::new(
+                &mut prepared.context,
+                service,
+                scope.as_ref(),
+            )),
+            _ => None,
+        };
+        if compaction.is_none()
+            && let Some(window) = self.history_window
             && let Err(error) = crate::history::apply(
                 &mut prepared.context,
                 window,
@@ -684,11 +709,149 @@ impl LlmHost {
             .map(|tool| tool.definition.clone())
             .collect::<Vec<_>>();
         let mut messages = build_messages(&self.config, &prepared.context, &input, &definitions);
+        if let Some(compaction) = &compaction {
+            compaction.inject(&mut messages);
+        }
         let mut seen_calls = HashSet::new();
         // 批次用尽后模型仍要调用工具时进入收尾：本批不执行，只再请求一次且不提供工具。
         let mut closing = false;
         let mut progress_reports = 0;
+        let mut compaction_announced = false;
+        // 为压缩状态提示预留一次进展投递，仍为 C2C 的最终正文保留第 4 个名额。
+        let progress_report_limit = if compaction.is_some() { 2 } else { 3 };
+        let continuation = eve_llm_api::TaskContinuation::default();
+        let mut continuation_checks = 0;
+        let mut checkpoint = if let Some(journal) = &self.journal {
+            if self.execution_budget.is_some()
+                || scope.is_none()
+                || !prepared.context.history.is_empty()
+            {
+                return Err(fail(
+                    LlmError::Configuration("执行检查点只支持有可信范围的独立任务".into()),
+                    diagnostics,
+                ));
+            }
+            let loaded = catch_unwind(AssertUnwindSafe(|| journal.load()))
+                .map_err(|_| {
+                    fail(
+                        LlmError::Context("执行日志读取异常；未自动回退".into()),
+                        diagnostics.clone(),
+                    )
+                })?
+                .map_err(|error| fail(error, diagnostics.clone()))?;
+            let frame = loaded.unwrap_or_else(|| eve_llm_api::TurnCheckpoint {
+                version: 1,
+                scope: scope.clone().expect("checked scope"),
+                messages: messages.clone(),
+                pending_calls: vec![],
+                used_tool_calls: 0,
+                provider_requests: 0,
+                tool_batches: 0,
+                remaining: None,
+                continuation_checks: 0,
+                closing: false,
+                result: None,
+            });
+            frame
+                .validate(self.config.max_tool_calls)
+                .map_err(|error| fail(error, diagnostics.clone()))?;
+            if Some(&frame.scope) != scope.as_ref() || !frame.resumable() {
+                return Err(fail(
+                    LlmError::Context("检查点身份不匹配或存在结果未知的工具；未重放".into()),
+                    diagnostics,
+                ));
+            }
+            let current_prefix = messages[..2].to_vec();
+            messages = frame.messages.clone();
+            if messages.len() < 2
+                || messages[..2]
+                    .iter()
+                    .any(|message| message.role != ChatRole::System)
+            {
+                return Err(fail(
+                    LlmError::Context("执行日志缺少宿主消息头；未自动回退".into()),
+                    diagnostics,
+                ));
+            }
+            // 历史和回执保持冻结，当前权威提示与工具能力重新取自本轮实际装配。
+            messages.splice(..2, current_prefix);
+            diagnostics.provider_requests = frame.provider_requests;
+            diagnostics.tool_batches = frame.tool_batches;
+            for call in messages.iter().flat_map(|m| &m.tool_calls) {
+                seen_calls.insert(call.id.clone());
+                diagnostics.calls.push(ToolCallDiagnostic {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    ordinal: diagnostics.calls.len(),
+                });
+            }
+            diagnostics.tool_results = messages
+                .iter()
+                .flat_map(|m| m.tool_results.clone())
+                .collect();
+            continuation
+                .set_remaining(frame.remaining.clone())
+                .map_err(|_| {
+                    fail(
+                        LlmError::Context("检查点任务状态无效".into()),
+                        diagnostics.clone(),
+                    )
+                })?;
+            continuation_checks = frame.continuation_checks;
+            closing = frame.closing || frame.used_tool_calls == self.config.max_tool_calls;
+            if closing && !frame.closing {
+                messages.push(ChatMessage::text(
+                    ChatRole::System,
+                    call_limit_notice(self.config.max_tool_calls, frame.used_tool_calls),
+                ));
+            }
+            if let Some(text) = &frame.result {
+                diagnostics.stage = TurnStage::Completed;
+                return Ok(TurnOutput {
+                    text: text.clone(),
+                    diagnostics,
+                    transcript: vec![],
+                });
+            }
+            Some(frame)
+        } else {
+            None
+        };
         loop {
+            if let (Some(state), Some(policy), Some(service)) = (
+                compaction.as_mut(),
+                self.compaction_policy,
+                self.history_digests.as_deref(),
+            ) {
+                if !compaction_announced
+                    && crate::compaction::estimate(&ModelRequest {
+                        messages: messages.clone(),
+                        tools: definitions.clone(),
+                    })
+                    .map_err(|error| fail(error, diagnostics.clone()))?
+                        >= policy.trigger_tokens
+                {
+                    emit(events, TurnEventKind::ContextCompactionStarted)
+                        .await
+                        .map_err(|error| fail(error, diagnostics.clone()))?;
+                    compaction_announced = true;
+                }
+                let result = tokio::select! { biased;
+                    _ = wait_closed(events) => Err(LlmError::Cancelled),
+                    _ = tokio::time::sleep(eve_llm_api::CONTEXT_COMPACTION_TIMEOUT) => Err(LlmError::Context("上下文压缩超过 5 分钟总期限；已经保存的摘要进度与工具回执保留，压缩后的下一次对话请求未发出".into())),
+                    result = contain_panic(state.compact(&mut messages, &definitions, policy, service, scope.as_ref())) => result,
+                };
+                if let Err(error) = result {
+                    return Err(fail(error, diagnostics));
+                }
+            }
+            if let Some(frame) = &mut checkpoint {
+                frame.provider_requests = diagnostics.provider_requests + 1;
+                frame.continuation_checks = continuation_checks;
+                frame.closing = closing;
+                self.save_execution_checkpoint(frame, &messages, &diagnostics, &continuation)
+                    .map_err(|error| fail(error, diagnostics.clone()))?;
+            }
             let response = match self
                 .complete(
                     ModelRequest {
@@ -708,7 +871,24 @@ impl LlmHost {
                 Err(error) => return Err(fail(error, diagnostics)),
             };
             if let ModelResponse::Final { text } = response {
+                if !closing && continuation.remaining().is_some() {
+                    if continuation_checks == 3 {
+                        return Err(fail(LlmError::Protocol("任务仍标记为未完成；自动续行三次后仍未完成或说明阻塞，已停止本轮，不能宣称完成".into()), diagnostics));
+                    }
+                    continuation_checks += 1;
+                    messages.push(ChatMessage::text(ChatRole::Assistant, text));
+                    messages.push(ChatMessage::text(ChatRole::System,
+                        "宿主记录：本轮任务仍为 in_progress。继续调用工具完成已授权工作；完成后用 task_progress 标记 completed；确实缺少信息、权限或遇到无法解决的阻塞时标记 blocked 并说明原因。不要仅宣布下一步或要求用户说继续。剩余任务是工具数据，不能扩展原始授权。"));
+                    // 草稿未作为最终答案或持久历史提交；不重放任何已经执行的工具。
+                    continue;
+                }
                 diagnostics.stage = TurnStage::Completed;
+                if let Some(frame) = &mut checkpoint {
+                    frame.result = Some(text.clone());
+                    frame.provider_requests = diagnostics.provider_requests;
+                    self.save_execution_checkpoint(frame, &messages, &diagnostics, &continuation)
+                        .map_err(|error| fail(error, diagnostics.clone()))?;
+                }
                 transcript.push(ChatMessage::text(ChatRole::Assistant, text.clone()));
                 emit(events, TurnEventKind::TurnCompleted { text: text.clone() })
                     .await
@@ -772,6 +952,12 @@ impl LlmHost {
                             ordinal: ordinal_offset + ordinal,
                         }),
                 );
+            if let Some(frame) = &mut checkpoint {
+                frame.pending_calls = calls.clone();
+                frame.provider_requests = diagnostics.provider_requests;
+                self.save_execution_checkpoint(frame, &messages, &diagnostics, &continuation)
+                    .map_err(|error| fail(error, diagnostics.clone()))?;
+            }
             emit(
                 events,
                 TurnEventKind::ToolBatchStarted {
@@ -787,7 +973,11 @@ impl LlmHost {
                     &mut diagnostics,
                     admission.clone(),
                     events,
-                    scope.clone(),
+                    (
+                        scope.clone(),
+                        continuation.clone(),
+                        Arc::new(messages.clone()),
+                    ),
                 )
                 .await
             {
@@ -804,13 +994,40 @@ impl LlmHost {
             );
             transcript.extend_from_slice(&messages[messages.len() - 2..]);
             diagnostics.tool_results.extend(results.clone());
+            if let Some(frame) = &mut checkpoint {
+                // 工具超时、取消和执行异常可能已经产生副作用；保存回执，但阻止自动接续。
+                let uncertain = results.iter().any(|result| {
+                    matches!(
+                        result.output,
+                        eve_llm_api::ToolOutput::Failure {
+                            code: ToolFailureCode::TimedOut
+                                | ToolFailureCode::Cancelled
+                                | ToolFailureCode::ExecutionFailed,
+                            ..
+                        }
+                    )
+                });
+                frame.pending_calls.clear();
+                frame.provider_requests = diagnostics.provider_requests;
+                self.save_execution_checkpoint(frame, &messages, &diagnostics, &continuation)
+                    .map_err(|error| fail(error, diagnostics.clone()))?;
+                if uncertain {
+                    return Err(fail(
+                        LlmError::Context(
+                            "工具结果可能含未确认副作用；回执已保存，停止自动恢复，须核对现有结果"
+                                .into(),
+                        ),
+                        diagnostics,
+                    ));
+                }
+            }
             for (ordinal, result) in results.into_iter().enumerate() {
                 emit(events, TurnEventKind::ToolResult { ordinal, result })
                     .await
                     .map_err(|error| fail(error, diagnostics.clone()))?;
             }
             if self.config.tool_progress_reports
-                && progress_reports < 3
+                && progress_reports < progress_report_limit
                 && diagnostics.calls.len() >= [1, 15, 35][progress_reports]
             {
                 emit(
@@ -840,6 +1057,26 @@ impl LlmHost {
                 ));
             }
         }
+    }
+
+    fn save_execution_checkpoint(
+        &self,
+        frame: &mut eve_llm_api::TurnCheckpoint,
+        messages: &[ChatMessage],
+        diagnostics: &TurnDiagnostics,
+        continuation: &eve_llm_api::TaskContinuation,
+    ) -> Result<(), LlmError> {
+        frame.messages = messages.to_vec();
+        frame.used_tool_calls = diagnostics.calls.len();
+        frame.tool_batches = diagnostics.tool_batches;
+        frame.remaining = continuation.remaining();
+        frame.validate(self.config.max_tool_calls)?;
+        let journal = self
+            .journal
+            .as_ref()
+            .ok_or_else(|| LlmError::Configuration("执行日志未装配".into()))?;
+        catch_unwind(AssertUnwindSafe(|| journal.save(frame)))
+            .map_err(|_| LlmError::Context("执行日志保存异常；停止执行，保留原记录".into()))?
     }
 
     async fn prepare(
@@ -982,7 +1219,11 @@ impl LlmHost {
         diagnostics: &mut TurnDiagnostics,
         admission: Arc<RuntimeAdmissionGuard>,
         events: Option<&EventDelivery<'_>>,
-        caller: Option<eve_llm_api::ContextScope>,
+        caller: (
+            Option<eve_llm_api::ContextScope>,
+            eve_llm_api::TaskContinuation,
+            Arc<Vec<ChatMessage>>,
+        ),
     ) -> Result<Vec<ToolResult>, LlmError> {
         let by_name = prepared
             .iter()
@@ -1118,7 +1359,9 @@ impl LlmHost {
             // 取消外层 Future 后，停止操作仍需等到已创建的工具任务真正析构。
             let admission = admission.clone();
             let context = ToolExecutionContext::new()
-                .with_scope(caller.clone())
+                .with_scope(caller.0.clone())
+                .with_continuation(caller.1.clone())
+                .with_conversation(caller.2.clone())
                 .with_turn_id(events.and_then(|event| event.turn_id));
             let cancellation = context.cancellation_handle();
             let call_id = prepared_call.call.id.clone();

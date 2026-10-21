@@ -2,7 +2,7 @@
 
 用户在对话里请 Eve 去做一件需要多步的事：聊天模型调用 dispatch_background_task 派发，账本保存后才回复；
 后台执行器看不到对话，只按派发说明调用工具，步数（工具调用次数）用尽后不再提供工具、由模型收尾；结束后
-私聊通知派发它的用户。用户可以让 Eve 查看或取消；重启时执行中的任务记为中断，不自动重跑。子代理在同一轮里
+私聊通知派发它的用户。用户可以让 Eve 查看或取消；重启时没有检查点的旧任务记为中断，不自动重跑；新任务的自动接续由 background_recovery_test 覆盖。子代理在同一轮里
 做完一件子任务并把结果交回。
 
 模型替身按请求里的工具定义与上下文确定性地作答，只证明宿主契约，不代表真实模型的理解能力。
@@ -14,13 +14,13 @@ import threading
 import unittest
 
 import reminder_test
-from dialogue_tools_test import text_response
+from dialogue_tools_test import PLATFORM_TOOLS, text_response
 from memory_test import BINARY, ROOT
 
 WORKER = "你在为 Eve 独立完成一项委托的任务"
 TASKS = '{"kind":"eve.background_tasks"'
 ORCHESTRATION = {"dispatch_background_task", "list_background_tasks", "cancel_background_task", "run_subagent"}
-CHAT_TOOLS = {"echo"} | ORCHESTRATION
+CHAT_TOOLS = PLATFORM_TOOLS | {"echo"} | ORCHESTRATION
 ASK = "帮我在后台把日志整理一下"
 DISPATCHED = "好，已经在后台处理，做完私聊你。"
 INSTRUCTIONS = "读取三份日志，统计错误条数，给出结论。"
@@ -52,7 +52,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         super().tearDown()
 
     def run_eve(self, script, tasks=True, subagents=True, **options):
-        more = (["--background-tasks"] if tasks else []) + (["--subagents"] if subagents else [])
+        more = ["--max-tool-rounds", "4"] + (["--background-tasks"] if tasks else []) + (["--subagents"] if subagents else [])
         return reminder_test.base().run_eve(self, script, interest=False, research=False, practice=False,
                                             more=more, **options)
 
@@ -101,7 +101,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.assertEqual(roles.count("user"), 1, "执行器看不到对话")
         if not body.get("tools"):
             return text_response(RESULT)
-        self.assertEqual(self.definitions(body), {"echo"}, "执行器没有派发与子代理工具")
+        self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo"}, "执行器没有派发与子代理工具")
         done = len(self.results(body))
         return calls((f"step-{done}", "echo", {"text": f"第 {done + 1} 步"}))
 
@@ -200,7 +200,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.assertIsNone(task["result"])
         self.assertEqual(self.pushes(), [])
 
-    def test_a_restart_while_running_interrupts_without_rerunning_and_tells_the_owner(self):
+    def test_a_legacy_task_without_checkpoint_interrupts_without_rerunning_and_tells_the_owner(self):
         dispatch = self.dispatch()
 
         def respond(body):
@@ -215,6 +215,12 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
                          lambda t: t["status"] == "Running" and len(self.worker_requests()) == 1,
                          "task did not start")}, stop_at=stop)
         self.release.set()
+        # 模拟升级前没有执行检查点的历史任务；不能对未知旧操作自动重放。
+        state = json.loads(self.state_path.read_text())
+        ledger = json.loads(bytes(state["entries"]["eve.task"]["tasks.v1"]))
+        ledger["tasks"][0].pop("execution", None)
+        state["entries"]["eve.task"]["tasks.v1"] = list(json.dumps(ledger).encode())
+        self.state_path.write_text(json.dumps(state))
         self.callback = self.chat
         self.run_eve([*self.checkpoint("delivered"), *self.checkpoint("quiet")],
                      checkpoints={"delivered": lambda: self.wait_task(
@@ -236,7 +242,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
                 self.assertEqual([m["role"] for m in body["messages"]].count("user"), 1, "子代理看不到对话")
                 if not body.get("tools"):
                     return text_response("echo 可用。")
-                self.assertEqual(self.definitions(body), {"echo"})
+                self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo"})
                 if not self.results(body):
                     return calls(("probe", "echo", {"text": "ping"}))
                 [echoed] = self.results(body)
@@ -247,7 +253,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
             if not results:
                 return calls(("delegate", "run_subagent", {"task": task, "max_steps": 2}))
             [result] = results
-            self.assertEqual(result, {"completed": True, "result": "echo 可用。",
+            self.assertEqual(result, {"completed": True, "result": "echo 可用。", "include_context": False,
                                       "usage": {"steps_used": 1, "max_steps": 2, "model_requests": 2}})
             return text_response("子代理查过了：echo 可用。")
         self.callback = respond
@@ -255,9 +261,46 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.assertEqual(len(self.worker_requests()), 2)
         self.assertEqual(self.tasks(), [], "子代理不进入后台任务账本")
 
+    def test_ten_subagents_execute_concurrently_in_one_tool_batch(self):
+        condition = threading.Condition()
+        entered = []
+        def respond(body):
+            if self.is_worker(body):
+                with condition:
+                    entered.append(self.text(body))
+                    condition.notify_all()
+                    self.assertTrue(condition.wait_for(lambda: len(entered) == 10, timeout=12),
+                                    "ten subagents did not overlap")
+                return text_response("checked " + self.text(body))
+            results = self.results(body)
+            if not results:
+                return calls(*[(f"parallel-{i}", "run_subagent", {"task": f"check-{i}"}) for i in range(10)])
+            self.assertEqual(len(results), 10)
+            self.assertTrue(all(result["completed"] for result in results))
+            return text_response("十个子代理全部完成")
+        self.callback = respond
+        self.run_eve(self.send(self.message("parallel", "并行核对十项", expected="十个子代理全部完成")))
+        self.assertEqual(len(entered), 10)
+
+    def test_subagents_can_run_serially_with_the_previous_result_as_input(self):
+        def respond(body):
+            if self.is_worker(body):
+                return text_response("first-result" if self.text(body) == "first" else "second-result")
+            results = self.results(body)
+            if not results:
+                return calls(("serial-1", "run_subagent", {"task": "first"}))
+            if len(results) == 1:
+                self.assertEqual(results[0]["result"], "first-result")
+                return calls(("serial-2", "run_subagent", {"task": "use first-result"}))
+            self.assertEqual(results[1]["result"], "second-result")
+            return text_response("串行完成")
+        self.callback = respond
+        self.run_eve(self.send(self.message("serial", "依次核对", expected="串行完成")))
+        self.assertEqual([self.text(r) for r in self.worker_requests()], ["first", "use first-result"])
+
     def test_both_are_off_by_default(self):
         def respond(body):
-            self.assertEqual(self.definitions(body), {"echo"})
+            self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo"})
             self.assertIsNone(self.context(body))
             return text_response("我现在不能派发后台任务。")
         self.callback = respond

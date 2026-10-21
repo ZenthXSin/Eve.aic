@@ -1,6 +1,6 @@
 //! 只重复尚未交给宿主的完整模型请求；请求体、工具回执及总期限保持不变。
 use crate::OpenAiProvider;
-use eve_llm_api::{LlmError, ModelResponse, ProviderFailureKind};
+use eve_llm_api::{LlmError, ModelResponse, ModelTextSink, ProviderFailureKind};
 use std::time::Duration;
 use tokio::time::{Instant, sleep, timeout_at};
 
@@ -16,12 +16,15 @@ impl OpenAiProvider {
     pub(crate) async fn request_retried(
         &self,
         body: &serde_json::Value,
+        sink: Option<&dyn ModelTextSink>,
     ) -> Result<ModelResponse, LlmError> {
-        let deadline = Instant::now() + self.config.request_timeout;
+        let total = self.total_timeout(sink.is_some());
+        let started = std::time::Instant::now();
+        let deadline = Instant::now() + total;
         timeout_at(deadline, async {
             for attempt in 0..=3 {
                 let mut retry_after = None;
-                let result = self.request_once(body, None, &mut retry_after).await;
+                let result = self.request_once(body, sink, &mut retry_after).await;
                 let Err(error) = &result else { return result };
                 if attempt == 3 || !transient(error) {
                     return result;
@@ -42,6 +45,6 @@ impl OpenAiProvider {
             unreachable!("bounded attempts return their last result")
         })
         .await
-        .map_err(|_| LlmError::ProviderTimeout)?
+        .map_err(|_| crate::timeouts::expired("total", total, started, None))?
     }
 }

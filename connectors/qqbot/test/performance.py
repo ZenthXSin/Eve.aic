@@ -135,6 +135,8 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes):
         EVE_LLM_RESPONSE_MODE="complete",
         # 测的是对话链路并逐一核对请求数；历史摘要是后台请求，次数取决于时机，单独由 history_digest_test 验收。
         EVE_HISTORY_DIGEST_ENABLED="false",
+        # 本基准逐轮验证 16 轮窗口；主动压缩另有 150k 专项验收。
+        EVE_CONTEXT_COMPACT_AT_TOKENS="0",
     )
     command = [str(binary), "--state-dir", str(directory / "state"),
                "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(HERE / "performance-bridge.mjs"),

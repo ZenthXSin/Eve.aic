@@ -4,6 +4,13 @@ use eve_developer_api::DeveloperConfig;
 use std::{path::Path, sync::Arc, time::Duration};
 
 pub(crate) fn install(bootstrap: &mut CoreBootstrap, state: &Path) -> Result<(), AppError> {
+    install_with_authorization(bootstrap, state, None)
+}
+pub(crate) fn install_with_authorization(
+    bootstrap: &mut CoreBootstrap,
+    state: &Path,
+    authorization: Option<Arc<dyn eve_developer_api::DeveloperAuthorization>>,
+) -> Result<(), AppError> {
     let Some(path) = std::env::var_os("EVE_DEVELOPER_CONFIG") else {
         return Ok(());
     };
@@ -24,11 +31,11 @@ pub(crate) fn install(bootstrap: &mut CoreBootstrap, state: &Path) -> Result<(),
         .storage_directory
         .clone()
         .unwrap_or_else(|| state.join("developer-tools"));
-    let backend = Arc::new(eve_developer_tools::LocalDeveloper::new(
-        config.clone(),
-        storage,
-        token,
-    )?);
+    let mut backend = eve_developer_tools::LocalDeveloper::new(config.clone(), storage, token)?;
+    if let Some(authorization) = authorization {
+        backend = backend.with_authorization(authorization);
+    }
+    let backend = Arc::new(backend);
     bootstrap.host_config.max_tool_rounds = config.max_tool_rounds;
     // 期限只在显式启用开发工具时扩大，普通对话和旧配置保持原值。
     bootstrap.host_config.tool_timeout = Duration::from_millis(config.command_timeout_ms + 30_000);

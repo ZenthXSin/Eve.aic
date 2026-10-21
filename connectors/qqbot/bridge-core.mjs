@@ -6,6 +6,19 @@ export const MAX_MESSAGE_ID_BYTES = 253;
 export const MAX_SEGMENTS = 5;
 // Proactive invitations are short host-composed texts; Rust enforces the same bound.
 export const MAX_PUSH_BYTES = 2048;
+// Leave a margin before QQ's five-minute passive reply window expires.
+export const PASSIVE_REPLY_WINDOW_MS = 240000;
+const passiveLimit = scope => scope === "c2c" ? 4 : MAX_SEGMENTS;
+function diagnostic(err) {
+  const out = {};
+  const status = err?.httpStatus ?? err?.statusCode;
+  const code = err?.bizCode ?? err?.code;
+  if (Number.isInteger(status) && status >= 100 && status <= 599) out.http_status = status;
+  if (Number.isSafeInteger(code)) out.biz_code = code;
+  out.failure_kind = out.http_status ? "http" :
+    ["AbortError", "TimeoutError"].includes(err?.name) ? "timeout" : "transport_unknown";
+  return out;
+}
 const validId = v => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v);
 const validMessageId = v => typeof v === "string" && v.trim() === v && v.length > 0 &&
   Buffer.byteLength(v) <= MAX_MESSAGE_ID_BYTES && !/[\p{Cc}]/u.test(v);
@@ -34,15 +47,98 @@ function userText(msg, appId) {
   }
   return text;
 }
+function rawMessage(msg) {
+  const source = msg.raw && typeof msg.raw === "object" ? msg.raw : msg;
+  const keep = ["id", "content", "timestamp", "message_type", "attachments", "msg_elements",
+    "message_scene", "mentions"];
+  const out = {};
+  for (const key of keep) if (source[key] !== undefined) out[key] = source[key];
+  let text;
+  try { text = JSON.stringify(out); } catch { return null; }
+  if (Buffer.byteLength(text) > 24576) return { truncated: true, bytes: Buffer.byteLength(text) };
+  return out;
+}
 // Only the envelope's own attachments belong to this message. msg_elements can
 // contain quoted images; never treat those as freshly uploaded pictures.
-function imageAttachments(msg) {
-  if (!Array.isArray(msg.attachments)) return [];
-  return msg.attachments.filter(a => a && typeof a.content_type === "string" &&
-    /^image\/[a-z0-9.+-]{1,64}$/i.test(a.content_type) &&
-    typeof a.url === "string" && a.url.length <= 4096 &&
-    /^https:\/\/[^/\s]+\//.test(a.url) && !/[\p{Cc}]/u.test(a.url))
-    .slice(0, 4).map(a => ({ content_type: a.content_type.toLowerCase(), url: a.url }));
+const FILE_TYPES = new Set(["text/plain", "application/pdf", "application/zip",
+  "application/json", "application/octet-stream", "file"]);
+function allowedType(type) {
+  return /^image\/[a-z0-9.+-]{1,64}$/i.test(type) || FILE_TYPES.has(type.toLowerCase());
+}
+function attachment(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const type = typeof raw.content_type === "string" && raw.content_type
+    ? raw.content_type
+    : typeof raw.contentType === "string" && raw.contentType ? raw.contentType : "application/octet-stream";
+  if (!allowedType(type)) return null;
+  const url = typeof raw.url === "string" ? raw.url : "";
+  if (url && (url.length > 4096 || !/^https:\/\/[^/\s]+\//.test(url) || /[\p{Cc}]/u.test(url))) return null;
+  const out = { content_type: type.toLowerCase() };
+  if (url) out.url = url;
+  const name = raw.filename ?? raw.file_name ?? raw.fileName;
+  if (typeof name === "string" && name.trim() === name && name && name.length <= 255 &&
+      !/[\p{Cc}\/\\]/u.test(name)) out.filename = name;
+  return out;
+}
+// 本条自己的附件。信封上没有时，文件经常只出现在 msg_elements 里，
+// 引用消息的元素带 msg_idx，不并进本条。
+function ownAttachments(msg) {
+  const found = [];
+  const push = raw => {
+    const item = attachment(raw);
+    if (item && found.length < 4 && !found.some(saved =>
+        saved.content_type === item.content_type && saved.url === item.url && saved.filename === item.filename)) {
+      found.push(item);
+    }
+  };
+  for (const raw of Array.isArray(msg.attachments) ? msg.attachments : []) push(raw);
+  const elements = field(msg, "msg_elements", "msgElements");
+  const quoted = Number(field(msg, "msg_type", "msgType")) === 103;
+  if (!found.length && Array.isArray(elements)) {
+    const own = elements.filter((element, index) => element && typeof element === "object" &&
+      field(element, "msg_idx", "msgIdx") == null && !(quoted && index === 0));
+    const current = (typeof msg.content === "string" ? msg.content : "").trim();
+    const textual = own.filter(element => typeof element.content === "string" && element.content.trim());
+    const selected = textual.length
+      ? textual.filter(element => !current || element.content.trim() === current)
+      : own;
+    for (const element of selected) {
+      for (const raw of Array.isArray(element.attachments) ? element.attachments : []) push(raw);
+    }
+  }
+  return found;
+}
+// 被引用消息的文字与附件单独抽出，不和本条新发的附件混在一起。
+function field(object, snake, camel) {
+  return object?.[snake] ?? object?.[camel];
+}
+function quotedMessage(msg) {
+  const elements = field(msg, "msg_elements", "msgElements");
+  if (!Array.isArray(elements)) return null;
+  const scene = field(msg, "message_scene", "messageScene") ?? {};
+  const ext = field(scene, "ext", "ext");
+  const refs = new Set();
+  for (const item of Array.isArray(ext) ? ext : []) {
+    const match = typeof item === "string" && item.match(/^ref_msg_idx=(.+)$/);
+    if (match) refs.add(match[1]);
+  }
+  const quoted = Number(field(msg, "msg_type", "msgType")) === 103;
+  const selected = elements.filter((element, index) => element && typeof element === "object" &&
+    (refs.size ? refs.has(field(element, "msg_idx", "msgIdx")) : quoted && index === 0));
+  const texts = [];
+  const attachments = [];
+  for (const element of selected) {
+    const content = element.content;
+    if (typeof content === "string" && content.trim() &&
+        Buffer.byteLength(content) <= 1024 && !/[\p{Cc}]/u.test(content)) texts.push(content.trim());
+    for (const raw of Array.isArray(element.attachments) ? element.attachments : []) {
+      const item = attachment(raw);
+      if (item && attachments.length < 4) attachments.push(item);
+    }
+  }
+  if (!texts.length && !attachments.length) return null;
+  const text = texts.join("\n").slice(0, 1024);
+  return { ...(text ? { text } : {}), ...(attachments.length ? { attachments } : {}) };
 }
 export function optionsFromEnv(env) {
   const appId = env.QQBOT_APP_ID || "1904159860";
@@ -59,7 +155,7 @@ export function optionsFromEnv(env) {
     logger: { info() {}, warn() {}, error() {}, debug() {} },
   };
 }
-export function createBridge(bot, emit, limit = 128) {
+export function createBridge(bot, emit, limit = 128, now = () => performance.now()) {
   const pending = new Map();
   const pushing = new Set();
   const warned = new Set();
@@ -80,6 +176,18 @@ export function createBridge(bot, emit, limit = 128) {
     try { return await bot.sendText(target, text); }
     finally { activeSends--; }
   }
+  // 文件走同一条并发上限；路径已由 Rust 侧解析并校验，这里只做形状检查。
+  async function sendFile(target, localPath, name, caption) {
+    if (activeSends >= limit) {
+      warn("outbound_limit");
+      throw new Error("outbound_limit");
+    }
+    activeSends++;
+    try {
+      return await bot.sendFile(target, { localPath },
+        { ...(name ? { fileName: name } : {}), ...(caption ? { content: caption } : {}) });
+    } finally { activeSends--; }
+  }
   const stop = () => {
     if (closed) return;
     closed = true;
@@ -96,7 +204,8 @@ export function createBridge(bot, emit, limit = 128) {
       warn("unsupported_message"); return;
     }
     const target = msg.replyTarget;
-    const attachments = imageAttachments(msg);
+    const attachments = ownAttachments(msg);
+    const quoted = quotedMessage(msg);
     if (!validMessageId(msg.messageId) || !validId(msg.senderId) || !target ||
         target.scope !== msg.kind || target.msgId !== msg.messageId ||
         !validId(target.targetId) || (typeof msg.content !== "string" || Buffer.byteLength(msg.content) > 32768) ||
@@ -112,12 +221,16 @@ export function createBridge(bot, emit, limit = 128) {
     const validName = senderName && Buffer.byteLength(senderName) <= 128 && [...senderName].length <= 48 && !/[\p{Cc}]/u.test(senderName);
     const frame = { type: "message", id: msg.messageId, scope: msg.kind,
       target_id: target.targetId, user_id: msg.senderId,
-      text, ...(attachments.length ? { attachments } : {}), ...(validName ? { sender_name: senderName } : {}) };
+      text, ...(attachments.length ? { attachments } : {}),
+      ...(quoted ? { quoted } : {}), ...(validName ? { sender_name: senderName } : {}) };
+    // 调试用的原始事件，和规范化帧分开；只保留有界的结构字段，不进回执。
+    const raw = rawMessage(msg);
+    if (raw) frame.raw = raw;
     // JSON escaping can expand a legal body beyond the Rust wire-frame limit.
     if (Buffer.byteLength(JSON.stringify({ version: 1, ...frame })) > MAX_FRAME) {
       warn("frame_limit"); return;
     }
-    pending.set(msg.messageId, { target: { ...target }, sending: false });
+    pending.set(msg.messageId, { target: { ...target }, sending: false, receivedAt: now() });
     send(frame);
   });
   // One part at a time, strictly in order; a failed or final part ends the reply.
@@ -126,9 +239,46 @@ export function createBridge(bot, emit, limit = 128) {
     pending.delete(id);
     send({ type: "delivery", id, ...(index === undefined ? {} : { index }), ok: false });
   }
+  // A late final answer uses the original conversation's proactive route once.
+  // Never replay an ambiguous failed send or change its destination.
+  async function finalText(item, text) {
+    const elapsed = Math.max(0, Math.floor(now() - item.receivedAt));
+    item.proactive ||= elapsed >= PASSIVE_REPLY_WINDOW_MS;
+    const target = item.proactive
+      ? { scope: item.target.scope, targetId: item.target.targetId } : item.target;
+    const meta = { delivery_mode: item.proactive ? "proactive" : "passive", elapsed_ms: elapsed };
+    try {
+      const result = await sendText(target, text);
+      return { ok: true, ...meta,
+        ...(validMessageId(result?.id) ? { message_id: result.id } : {}) };
+    } catch (err) {
+      const error = diagnostic(err);
+      let notice_status = "not_attempted";
+      let notice_diagnostic = {};
+      // Only a definitive platform rejection permits a separate short notice.
+      // Unknown network outcomes, auth errors and rate limits are never retried.
+      if (!closed && [400, 404, 413, 422].includes(error.http_status) &&
+          Number.isSafeInteger(error.biz_code) && !item.noticeAttempted) {
+        item.noticeAttempted = true;
+        let timer;
+        try {
+          const attempt = sendText({ scope: item.target.scope, targetId: item.target.targetId },
+            "本轮回复已保存，但 QQ 正文投递失败。发送 /last-reply 取回，不会重新执行任务。")
+            .then(() => ({ state: "sent" }), error => ({ state: "failed", error }));
+          const result = await Promise.race([attempt, new Promise(resolve => {
+            timer = setTimeout(() => resolve({ state: "unknown" }), 3000);
+          })]);
+          notice_status = result.state;
+          if (result.error) notice_diagnostic = Object.fromEntries(Object.entries(diagnostic(result.error))
+            .map(([key, value]) => ["notice_" + key, value]));
+        } finally { clearTimeout(timer); }
+      }
+      return { ok: false, ...meta, ...error, notice_status, ...notice_diagnostic };
+    }
+  }
   async function segment(frame, item) {
     const { index, count } = frame;
-    if (!Number.isInteger(count) || count < 2 || count + (item.progress ?? 0) > MAX_SEGMENTS ||
+    if (!Number.isInteger(count) || count < 2 || count + (item.progress ?? 0) > passiveLimit(item.target.scope) ||
         !Number.isInteger(index) || index < 0 || index >= count) {
       warn("invalid_command"); return;
     }
@@ -139,15 +289,9 @@ export function createBridge(bot, emit, limit = 128) {
     item.count = count;
     let ok = false;
     try {
-      const result = await sendText(item.target, frame.text);
-      ok = true;
-      send({ type: "delivery", id: frame.id, index, ok: true,
-        ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
-    } catch (err) {
-      const diagnostic = {};
-      if (Number.isInteger(err?.statusCode)) diagnostic.http_status = err.statusCode;
-      if (Number.isInteger(err?.code)) diagnostic.biz_code = err.code;
-      send({ type: "delivery", id: frame.id, index, ok: false, ...diagnostic });
+      const result = await finalText(item, frame.text);
+      ok = result.ok;
+      send({ type: "delivery", id: frame.id, index, ...result });
     } finally {
       item.sending = false;
       item.next = index + 1;
@@ -168,14 +312,53 @@ export function createBridge(bot, emit, limit = 128) {
     item.progress = index + 1; // Failed/unknown attempts also consume quota; never retry.
     item.sending = true;
     try {
+      if (now() - item.receivedAt >= PASSIVE_REPLY_WINDOW_MS) {
+        send({ type: "delivery", id: frame.id, progress: true, index, ok: false,
+          failure_kind: "passive_window_elapsed" });
+        return;
+      }
       const result = await sendText(item.target, frame.text);
       send({ type: "delivery", id: frame.id, progress: true, index, ok: true,
         ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
-    } catch {
-      send({ type: "delivery", id: frame.id, progress: true, index, ok: false });
+    } catch (err) {
+      send({ type: "delivery", id: frame.id, progress: true, index, ok: false, ...diagnostic(err) });
     } finally {
       item.sending = false;
       if (item.finished) pending.delete(frame.id);
+    }
+  }
+  // 文件走主动投递：目标由 Rust 从已确认的回执推出，路径由宿主解析好，这里只校验形状。
+  // 失败不重试，回执如实交回宿主账本。
+  async function pushFile(frame) {
+    if (!validMessageId(frame.id) || !validId(frame.target_id) ||
+        !["c2c", "group"].includes(frame.scope)) {
+      warn("invalid_command");
+      if (validMessageId(frame.id)) send({ type: "delivery", id: frame.id, push: true, file: true, ok: false });
+      return;
+    }
+    const key = `file:${frame.id}`;
+    if (pushing.has(key)) { warn("duplicate_reply"); return; }
+    const path = frame.path;
+    const name = frame.name;
+    const caption = frame.caption ?? "";
+    if (typeof path !== "string" || !path || path.length > 4096 || /[\p{Cc}]/u.test(path) ||
+        (name !== undefined && name !== null && (typeof name !== "string" || !name || name.length > 255 ||
+          /[\p{Cc}\/]/u.test(name))) ||
+        (caption !== "" && (!validText(caption) || Buffer.byteLength(caption) > 1024))) {
+      warn("invalid_file");
+      send({ type: "delivery", id: frame.id, push: true, file: true, ok: false });
+      return;
+    }
+    pushing.add(key);
+    try {
+      const result = await sendFile({ scope: frame.scope, targetId: frame.target_id }, path, name, caption);
+      const id = result?.message?.id ?? result?.upload?.id;
+      send({ type: "delivery", id: frame.id, push: true, file: true, ok: true,
+        ...(validMessageId(id) ? { message_id: id } : {}) });
+    } catch (err) {
+      send({ type: "delivery", id: frame.id, push: true, file: true, ok: false, ...diagnostic(err) });
+    } finally {
+      pushing.delete(key);
     }
   }
   // A proactive private message: no msg_id, so the platform applies its own quota and
@@ -190,14 +373,13 @@ export function createBridge(bot, emit, limit = 128) {
     }
     pushing.add(frame.id);
     try {
-      const result = await sendText({ scope: "c2c", targetId: frame.target_id }, frame.text);
+      const scope = frame.scope ?? "c2c";
+      if (!["c2c", "group"].includes(scope)) throw new Error("invalid_scope");
+      const result = await sendText({ scope, targetId: frame.target_id }, frame.text);
       send({ type: "delivery", id: frame.id, push: true, ok: true,
         ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
     } catch (err) {
-      const diagnostic = {};
-      if (Number.isInteger(err?.statusCode)) diagnostic.http_status = err.statusCode;
-      if (Number.isInteger(err?.code)) diagnostic.biz_code = err.code;
-      send({ type: "delivery", id: frame.id, push: true, ok: false, ...diagnostic });
+      send({ type: "delivery", id: frame.id, push: true, ok: false, ...diagnostic(err) });
     } finally {
       pushing.delete(frame.id);
     }
@@ -211,6 +393,7 @@ export function createBridge(bot, emit, limit = 128) {
       if (frame.type === "stop") { stop(); return; }
       if (closed) return;
       if (frame.type === "push") { await push(frame); return; }
+      if (frame.type === "file") { await pushFile(frame); return; }
       const item = pending.get(frame.id);
       if (!item) { warn("unknown_reply"); return; }
       if (frame.type === "finish") {
@@ -227,14 +410,8 @@ export function createBridge(bot, emit, limit = 128) {
       if (!validText(frame.text)) { reject(frame.id); return; }
       item.sending = true;
       try {
-        const result = await sendText(item.target, frame.text);
-        send({ type: "delivery", id: frame.id, ok: true,
-          ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
-      } catch (err) {
-        const diagnostic = {};
-        if (Number.isInteger(err?.statusCode)) diagnostic.http_status = err.statusCode;
-        if (Number.isInteger(err?.code)) diagnostic.biz_code = err.code;
-        send({ type: "delivery", id: frame.id, ok: false, ...diagnostic });
+        const result = await finalText(item, frame.text);
+        send({ type: "delivery", id: frame.id, ...result });
       } finally {
         pending.delete(frame.id);
       }

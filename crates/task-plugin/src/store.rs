@@ -1,4 +1,4 @@
-//! 后台任务账本：创建、开始、结束与通知尝试都先持久化。重启时执行中的任务记为已中断（不重跑），
+//! 后台任务账本：创建、开始、结束与通知尝试都先持久化。重启时仅从安全检查点接续，未知工具结果不重放；
 //! 发送中的通知记为结果未知（不重发）。
 use crate::strict_json;
 use eve_plugin_api::{PluginContext, PluginError, PluginResult};
@@ -10,7 +10,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,18 +50,28 @@ impl StoredTasks {
                     return Err(TaskError::CorruptState);
                 }
                 let value = strict_json::from_slice(&bytes).map_err(|_| TaskError::CorruptState)?;
-                if value.get("format_version").and_then(|value| value.as_u64())
-                    != Some(u64::from(FORMAT_VERSION))
-                {
+                if !matches!(
+                    value.get("format_version").and_then(|value| value.as_u64()),
+                    Some(1 | 2)
+                ) {
                     return Err(if value.get("format_version").is_some() {
                         TaskError::UnsupportedVersion
                     } else {
                         TaskError::CorruptState
                     });
                 }
-                let ledger: Ledger =
+                let mut ledger: Ledger =
                     serde_json::from_value(value).map_err(|_| TaskError::CorruptState)?;
+                if ledger.format_version == 1
+                    && ledger
+                        .tasks
+                        .iter()
+                        .any(|task| task.spec.context.is_some() || task.execution.is_some())
+                {
+                    return Err(TaskError::CorruptState);
+                }
                 validate_ledger(&ledger)?;
+                ledger.format_version = FORMAT_VERSION;
                 ledger
             }
         };
@@ -69,6 +79,32 @@ impl StoredTasks {
         let now = now_ms();
         for task in &mut ledger.tasks {
             if task.status == TaskStatus::Running {
+                if !task.cancel_requested
+                    && let Some(execution) = &mut task.execution
+                {
+                    // 最终结果已经持久化，只有任务结局尚未提交：直接了结，不请求模型或重放工具。
+                    if let Some(checkpoint) = &execution.checkpoint
+                        && let Some(result) = &checkpoint.result
+                    {
+                        task.status = TaskStatus::Completed;
+                        task.result = Some(bounded(result, MAX_RESULT_BYTES));
+                        task.usage = Some(checkpoint_usage(checkpoint));
+                        task.finished_at_ms = Some(now.max(last_time(task)));
+                        task.notice = Some(Notice {
+                            status: NoticeStatus::Pending,
+                            attempts: vec![],
+                            closed_at_ms: None,
+                        });
+                        changed = true;
+                        continue;
+                    }
+                    // 在模型边界崩溃可接续；待执行工具批次或异常工具回执不可自动重放。
+                    if can_retry(execution, now) {
+                        schedule_retry(execution, now);
+                        changed = true;
+                        continue;
+                    }
+                }
                 // 执行中进程退出：不知道做到了哪一步，不自动重跑。已请求取消的按取消结束。
                 let at = now.max(last_time(task));
                 task.finished_at_ms = Some(at);
@@ -134,6 +170,13 @@ impl StoredTasks {
         validate_owner(owner)?;
         validate_id(source)?;
         validate_spec(&spec)?;
+        if spec
+            .context
+            .as_ref()
+            .is_some_and(|context| &context.owner != owner)
+        {
+            return Err(TaskError::InvalidInput);
+        }
         if now_ms == 0 {
             return Err(TaskError::InvalidInput);
         }
@@ -183,6 +226,7 @@ impl StoredTasks {
             result: None,
             failure: None,
             notice: None,
+            execution: Some(TaskExecution::default()),
         };
         next.tasks.push(task.clone());
         persist(&mut inner, next)?;
@@ -196,6 +240,7 @@ impl StoredTasks {
             }
             task.status = TaskStatus::Running;
             task.started_at_ms = Some(now_ms.max(last_time(task)));
+            task.execution.get_or_insert_with(TaskExecution::default);
             Ok(())
         })
     }
@@ -204,7 +249,7 @@ impl StoredTasks {
         &self,
         id: &str,
         end: TaskEnd,
-        usage: TaskUsage,
+        mut usage: TaskUsage,
         now_ms: u64,
     ) -> TaskResult<Task> {
         self.update(id, now_ms, |task| {
@@ -214,11 +259,22 @@ impl StoredTasks {
             if usage.tool_calls > task.spec.max_steps {
                 return Err(TaskError::InvalidInput);
             }
+            if let Some(checkpoint) = task.execution.as_ref().and_then(|e| e.checkpoint.as_ref()) {
+                let saved = checkpoint_usage(checkpoint);
+                usage.tool_calls = usage.tool_calls.max(saved.tool_calls);
+                usage.model_requests = usage.model_requests.max(saved.model_requests);
+            }
             let notice = Some(Notice {
                 status: NoticeStatus::Pending,
                 attempts: vec![],
                 closed_at_ms: None,
             });
+            // 取消与模型失败/最终答复并发到达时，以已持久化的取消请求为准。
+            let end = if task.cancel_requested {
+                TaskEnd::Cancelled
+            } else {
+                end
+            };
             match end {
                 TaskEnd::Completed { result } => {
                     if result.trim().is_empty() {
@@ -245,6 +301,65 @@ impl StoredTasks {
             }
             task.usage = Some(usage);
             task.finished_at_ms = Some(now_ms.max(last_time(task)));
+            Ok(())
+        })
+    }
+
+    pub(super) fn checkpoint(
+        &self,
+        id: &str,
+        checkpoint: eve_llm_api::TurnCheckpoint,
+        deadline_at_ms: u64,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        self.update(id, now_ms, |task| {
+            if task.status != TaskStatus::Running || task.cancel_requested {
+                return Err(TaskError::InvalidTransition);
+            }
+            checkpoint
+                .validate(task.spec.max_steps as usize)
+                .map_err(|_| TaskError::InvalidInput)?;
+            if checkpoint.scope.session_id != task.owner.session_id
+                || checkpoint.scope.user_id != task.owner.user_id
+                || deadline_at_ms <= now_ms
+            {
+                return Err(TaskError::InvalidInput);
+            }
+            let execution = task
+                .execution
+                .as_mut()
+                .ok_or(TaskError::InvalidTransition)?;
+            if execution
+                .deadline_at_ms
+                .is_some_and(|deadline| deadline != deadline_at_ms)
+                || execution.checkpoint.as_ref().is_some_and(|old| {
+                    checkpoint.used_tool_calls < old.used_tool_calls
+                        || checkpoint.provider_requests < old.provider_requests
+                        || old.result.is_some()
+                })
+            {
+                return Err(TaskError::InvalidInput);
+            }
+            execution.deadline_at_ms = Some(deadline_at_ms);
+            execution.resume_at_ms = None;
+            execution.checkpoint = Some(checkpoint);
+            Ok(())
+        })
+    }
+
+    pub(super) fn retry(&self, id: &str, now_ms: u64) -> TaskResult<Task> {
+        self.update(id, now_ms, |task| {
+            if task.status != TaskStatus::Running || task.cancel_requested {
+                return Err(TaskError::InvalidTransition);
+            }
+            let execution = task
+                .execution
+                .as_mut()
+                .ok_or(TaskError::InvalidTransition)?;
+            if !can_retry(execution, now_ms) || execution.resume_at_ms.is_some() {
+                return Err(TaskError::InvalidTransition);
+            }
+            schedule_retry(execution, now_ms);
             Ok(())
         })
     }
@@ -393,6 +508,29 @@ impl StoredTasks {
     }
 }
 
+fn checkpoint_usage(checkpoint: &eve_llm_api::TurnCheckpoint) -> TaskUsage {
+    TaskUsage {
+        tool_calls: checkpoint.used_tool_calls as u32,
+        model_requests: checkpoint.provider_requests as u32,
+    }
+}
+
+fn can_retry(execution: &TaskExecution, now_ms: u64) -> bool {
+    execution.recoveries < MAX_AUTO_RECOVERIES
+        && execution
+            .deadline_at_ms
+            .is_none_or(|deadline| now_ms.saturating_add(10_000) < deadline)
+        && execution
+            .checkpoint
+            .as_ref()
+            .is_none_or(|checkpoint| checkpoint.resumable() && checkpoint.result.is_none())
+}
+
+fn schedule_retry(execution: &mut TaskExecution, now_ms: u64) {
+    execution.recoveries += 1;
+    execution.resume_at_ms = Some(now_ms.saturating_add(1000_u64 << execution.recoveries));
+}
+
 /// 任务上最近一次已记录的时间；之后的记录不能更早。
 fn last_time(task: &Task) -> u64 {
     let notice = task.notice.iter().flat_map(|notice| {
@@ -490,6 +628,44 @@ fn validate_task(task: &Task) -> TaskResult<()> {
     validate_owner(&task.owner)?;
     validate_id(&task.source)?;
     validate_spec(&task.spec)?;
+    if task
+        .spec
+        .context
+        .as_ref()
+        .is_some_and(|context| context.owner != task.owner)
+    {
+        return Err(TaskError::CorruptState);
+    }
+    if let Some(execution) = &task.execution {
+        if execution.recoveries > MAX_AUTO_RECOVERIES
+            || execution.resume_at_ms == Some(0)
+            || (execution.resume_at_ms.is_some() && execution.recoveries == 0)
+            || execution.deadline_at_ms.is_some_and(|deadline| {
+                deadline <= task.started_at_ms.unwrap_or(task.created_at_ms)
+            })
+            || execution.checkpoint.is_some() != execution.deadline_at_ms.is_some()
+            || (task.status == TaskStatus::Queued
+                && (execution.checkpoint.is_some()
+                    || execution.recoveries != 0
+                    || execution.resume_at_ms.is_some()))
+        {
+            return Err(TaskError::CorruptState);
+        }
+        if let Some(checkpoint) = &execution.checkpoint {
+            checkpoint
+                .validate(task.spec.max_steps as usize)
+                .map_err(|_| TaskError::CorruptState)?;
+            if checkpoint.scope.session_id != task.owner.session_id
+                || checkpoint.scope.user_id != task.owner.user_id
+                || task.usage.is_some_and(|usage| {
+                    usage.tool_calls < checkpoint.used_tool_calls as u32
+                        || usage.model_requests < checkpoint.provider_requests as u32
+                })
+            {
+                return Err(TaskError::CorruptState);
+            }
+        }
+    }
     let invalid = Err(TaskError::CorruptState);
     if task.id != task_id(&task.owner.user_id, &task.source) || task.created_at_ms == 0 {
         return invalid;

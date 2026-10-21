@@ -386,7 +386,8 @@ impl TurnEventSink for GenerationSink {
                 }
                 state.turn_id = event.turn_id.or(state.turn_id);
                 state.phase = match &event.kind {
-                    TurnEventKind::ProviderStarted { .. }
+                    TurnEventKind::ContextCompactionStarted
+                    | TurnEventKind::ProviderStarted { .. }
                     | TurnEventKind::TextDelta { .. }
                     | TurnEventKind::ResponseCompleted { .. } => ControlPhase::Generating,
                     TurnEventKind::ToolBatchStarted { .. }

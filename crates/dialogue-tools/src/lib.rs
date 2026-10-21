@@ -1,4 +1,5 @@
 //! 对话工具的实现层。只依赖公开契约；身份由本轮宿主范围绑定，不接受模型自报 owner。
+mod execution;
 mod practice;
 use eve_budget_api::AutonomyBudget;
 use eve_cognition_api::{CognitionAdmin, ReadAccess, Visibility};
@@ -11,6 +12,7 @@ use eve_plan_api::PlanJournal;
 use eve_practice_api::{DraftCheck, PracticeAdmin, PracticeRunner};
 use eve_skill_api::SkillAdmin;
 use eve_toolforge_api::ToolAdmin;
+pub use execution::{SleepTool, TaskProgressTool};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{

@@ -31,7 +31,8 @@ const checkReply = (cmd, message) => {
     }
   } else if (cmd.text !== message.expected) throw new Error("wrong_reply_text");
 };
-const deliver = id => send({ type: "delivery", id, ok: !scenario.send_fail, message_id: "out-" + id });
+const deliver = (id, message = {}) => send({ type: "delivery", id, ok: !(scenario.send_fail || message.fail_delivery), message_id: "out-" + id,
+  ...(message.delivery_diagnostic ?? {}) });
 const deliverSegment = (id, index, ok = true) => send({ type: "delivery", id, index, ok, message_id: `out-${id}-${index}` });
 const checkSegment = (cmd, message) => {
   if (message.accept_any) return;
@@ -150,13 +151,14 @@ if (scenario.script) {
       if (!message) throw new Error("wrong_reply_id");
       if (cmd.type === "progress") {
         commands.push(cmd);
-        if (!message.hold_progress) send({ type: "delivery", id: cmd.id, progress: true, index: cmd.index, ok: !message.fail_progress });
+        if (!message.hold_progress) send({ type: "delivery", id: cmd.id, progress: true, index: cmd.index, ok: !message.fail_progress,
+          ...(message.progress_diagnostic ?? {}) });
         continue;
       }
       if (cmd.type === "reply") {
         if (message.expected_segments && !message.accept_any) throw new Error("expected_segments_got_reply");
         checkReply(cmd, message);
-        if (!message.hold_delivery) deliver(cmd.id);
+        if (!message.hold_delivery) deliver(cmd.id, message);
       } else if (cmd.type === "segment") {
         checkSegment(cmd, message);
         if (!(message.hold_segments ?? []).includes(cmd.index)) {

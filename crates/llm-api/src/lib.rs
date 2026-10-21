@@ -12,12 +12,14 @@ use eve_plugin_api::{Permission, PluginId, ServiceId};
 mod budget;
 mod failure;
 mod history;
+mod journal;
 pub use budget::{BudgetUsage, ExecutionLimits, TurnBudget};
 pub use failure::{ModelHealthObserver, ModelOutcome, ProviderFailure, ProviderFailureKind};
 pub use history::{
-    HistoryDigest, HistoryDigests, HistoryWindow, HistoryWindowResolver, MAX_HISTORY_DIGEST_BYTES,
-    history_turns,
+    CONTEXT_COMPACTION_TIMEOUT, ContextCompactionPolicy, HistoryDigest, HistoryDigests,
+    HistoryWindow, HistoryWindowResolver, MAX_HISTORY_DIGEST_BYTES, history_turns,
 };
+pub use journal::{MAX_CHECKPOINT_BYTES, TurnCheckpoint, TurnJournal};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -539,6 +541,8 @@ pub struct TurnEvent {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TurnEventKind {
+    /// 每轮至多一次；只表示开始压缩，不表示摘要或任务已完成。
+    ContextCompactionStarted,
     ProviderStarted {
         request: usize,
     },
@@ -629,6 +633,31 @@ pub struct ToolExecutionContext {
     cancelled: Arc<AtomicBool>,
     scope: Option<ContextScope>,
     turn_id: Option<u64>,
+    continuation: TaskContinuation,
+    conversation: Option<Arc<Vec<ChatMessage>>>,
+}
+/// 单轮内共享的任务状态。只影响本轮收尾，不授予权限、不持久化或重放工具。
+#[derive(Clone, Default)]
+pub struct TaskContinuation(Arc<std::sync::Mutex<Option<String>>>);
+impl TaskContinuation {
+    pub fn set_remaining(&self, remaining: Option<String>) -> Result<(), ToolExecutionError> {
+        if remaining
+            .as_ref()
+            .is_some_and(|s| s.trim().is_empty() || s.len() > 2048)
+        {
+            return Err(ToolExecutionError::Failed(
+                "剩余任务需要 1 至 2048 字节".into(),
+            ));
+        }
+        *self
+            .0
+            .lock()
+            .map_err(|_| ToolExecutionError::Failed("任务状态不可用".into()))? = remaining;
+        Ok(())
+    }
+    pub fn remaining(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|s| s.clone())
+    }
 }
 impl ToolExecutionContext {
     pub fn new() -> Self {
@@ -636,6 +665,8 @@ impl ToolExecutionContext {
             cancelled: Arc::new(AtomicBool::new(false)),
             scope: None,
             turn_id: None,
+            continuation: TaskContinuation::default(),
+            conversation: None,
         }
     }
     /// 绑定本轮的可信会话范围；由宿主依据通道身份设置，模型参数不能改变它。
@@ -654,6 +685,22 @@ impl ToolExecutionContext {
     }
     pub fn turn_id(&self) -> Option<u64> {
         self.turn_id
+    }
+    pub fn with_continuation(mut self, continuation: TaskContinuation) -> Self {
+        self.continuation = continuation;
+        self
+    }
+    pub fn continuation(&self) -> &TaskContinuation {
+        &self.continuation
+    }
+    /// 宿主冻结的当前模型上下文（已应用历史窗口/压缩，不包含正在执行的工具批次）。
+    /// 仅供显式委派时传递数据；不改变接收者的权限、工具或系统指令。
+    pub fn with_conversation(mut self, messages: Arc<Vec<ChatMessage>>) -> Self {
+        self.conversation = Some(messages);
+        self
+    }
+    pub fn conversation(&self) -> Option<&[ChatMessage]> {
+        self.conversation.as_deref().map(Vec::as_slice)
     }
     pub fn cancellation_handle(&self) -> ToolCancellation {
         ToolCancellation(self.cancelled.clone())

@@ -4,6 +4,7 @@
 快照检查通过桥接 touch/wait_file 握手，避免用固定延时猜测提交时序。
 """
 import json
+from fixture_auth import bootstrap_test_admin
 import os
 import pathlib
 import signal
@@ -208,6 +209,8 @@ class MemoryAcceptance(unittest.TestCase):
             EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
             EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
         env.update(env_extra or {})
+        bootstrap_test_admin(self.work / "state", env, app,
+                             users=getattr(self, "fixture_admin_users", ("user-1", "user-2")))
         command = [str(BINARY), "--state-dir", str(self.work / "state"),
             "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
             "--bridge-arg", str(scenario)]
@@ -417,6 +420,8 @@ class MemoryAcceptance(unittest.TestCase):
         self.assertEqual(len(self.requests), 1)
 
     def test_private_user_group_and_application_boundaries(self):
+        # 管理员身份也不能跨用户改写偏好；普通用户拒绝由权限专用用例覆盖。
+        self.fixture_admin_users = ("user-1", "user-2")
         id = self.remember(scope="group")
         before = self.memory()
         routes = [{"scope": "group", "user": "user-2"},
@@ -476,6 +481,41 @@ class MemoryAcceptance(unittest.TestCase):
         self.run_eve(self.duplicate("delivered", "重复消息不得重放或重复观察"))
         self.assertEqual(self.memory(), before)
         self.assertEqual(len(self.requests), 1)
+
+    def test_quoted_messages_and_files_complete_with_memory_and_remain_live(self):
+        script = []
+        messages = []
+        for quoted, attached in [(False, False), (True, False), (False, True), (True, True)]:
+            message = self.message(f"normalized-{int(quoted)}-{int(attached)}", "请检查这条消息")
+            message["accept_any"] = True
+            if quoted:
+                message["quoted"] = {"text": "这是之前的消息", "attachments": []}
+            if attached:
+                message["attachments"] = [{"content_type": "application/pdf",
+                                            "url": "https://example.invalid/file.pdf",
+                                            "filename": "资料.pdf"}]
+            messages.append(message)
+            script.extend(self.send(message))
+        summary = self.run_eve(script)
+        self.assertEqual(summary["sent"], 4)
+        self.assertEqual(summary["interactions_not_saved"], 0)
+        self.assertEqual(len(self.requests), 4)
+        evidence = {item["source"]["message_id"]: item["source"] for item in self.interactions()}
+        # 现有通道策略不采集带附件的交互，引用文字仍是可采集的普通消息。
+        self.assertEqual(len(evidence), 2)
+        turns = [turn for session in self.documents()["eve.session"]["sessions.v1"]["sessions"].values()
+                 for turn in session["turns"]]
+        for message, turn in zip(messages, turns):
+            self.assertEqual(self.receipt(message["id"])["state"], "Sent")
+            self.assertEqual(turn["status"]["state"], "Completed")
+            if not message.get("attachments"):
+                self.assertEqual(evidence[message["id"]]["user_text"], turn["input"])
+            else:
+                self.assertNotIn(message["id"], evidence)
+            self.assertEqual(turn["status"]["messages"][0]["text"], turn["input"])
+        before = self.memory()
+        self.run_eve(self.duplicate(messages[-1]["id"], "重复投递不能重放"))
+        self.assertEqual(self.memory(), before)
 
     def test_failed_delivery_and_unacknowledged_reply_are_not_imported_on_restart(self):
         self.run_eve([{"send": self.message("failed", "完成但投递失败")}, self.wait_reply("failed"),

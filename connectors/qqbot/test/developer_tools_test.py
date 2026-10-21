@@ -24,7 +24,7 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         identity = json.dumps(["1904159860", "c2c", "user-1", "user-1"], separators=(",", ":")).encode()
         principal = "qq:" + hashlib.sha256(identity).hexdigest()
         self.developer_config.write_text(json.dumps({"workspace": str(self.source.resolve()),
-            "operators": [principal], "commands": True, "github": True,
+            "operators": [principal], "ordinary_access": False, "commands": True, "github": True,
             "self_upgrade": True, "max_tool_rounds": 4}), encoding="utf8")
 
     def receipt(self, message_id):
@@ -45,7 +45,7 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         config = json.loads(self.developer_config.read_text())
         config["storage_directory"] = str(self.work / "developer-data")
         self.developer_config.write_text(json.dumps(config))
-        names = {"echo", "search_memory", "list_files", "read_file", "write_file", "edit_file",
+        names = {"echo", "search_memory", "send_file", "read_attachment", "read_raw_message", "list_files", "read_file", "write_file", "edit_file",
                  "search_files", "run_command", "github_api", "prepare_self_upgrade"}
         def respond(body):
             self.assertEqual(self.definitions(body), names)
@@ -70,7 +70,7 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
             self.assertIn("验证通过", results[-1]["stdout"])
             return text_response("实际读写和命令已完成")
         self.callback = respond
-        self.enabled([*self.send(self.message("help", "/help tools", contains=["10 个", "github_api", "run_command", "edit_file", "search_files"])),
+        self.enabled([*self.send(self.message("help", "/help tools", contains=["13 个", "github_api", "run_command", "edit_file", "search_files"])),
                       *self.send(self.message("edit", "修改源码并执行验证", expected="实际读写和命令已完成"))])
         self.assertEqual(self.chat_rounds, 5)
         journal = self.work / "developer-data/operations.jsonl"
@@ -150,7 +150,7 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
                     ("github_api", {"method": "GET", "repository": "test/repo"})])
             self.assertEqual(len(self.results(body)), 3)
             for result in self.results(body):
-                self.assertIn("仅供宿主配置的操作者", json.dumps(result, ensure_ascii=False))
+                self.assertIn("授权", json.dumps(result, ensure_ascii=False))
             return text_response("未执行越权操作")
         self.callback = respond
         self.enabled(self.send(self.message("foreign", "使用宿主工具", user="user-2", expected="未执行越权操作")))
@@ -185,7 +185,7 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
                     ("github_api", {"method": "GET", "repository": "test/repo", "url": "http://other.invalid", "token": "model-cannot-authorize"}),
                     ("prepare_self_upgrade", {})])
             results = self.results(body)
-            self.assertIn("路径", json.dumps(results[0], ensure_ascii=False))
+            self.assertIn("仅限主人", json.dumps(results[0], ensure_ascii=False))
             self.assertIn("参数", json.dumps(results[1], ensure_ascii=False))
             self.assertIn("不是 Eve 源码仓库", json.dumps(results[2], ensure_ascii=False))
             return text_response("升级尚未准备，运行版本未变化")

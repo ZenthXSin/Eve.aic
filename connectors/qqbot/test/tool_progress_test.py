@@ -20,6 +20,10 @@ class ToolProgressAcceptance(dialogue.DialogueToolsAcceptance):
         options.setdefault('memory', False)
         options.setdefault('more', ['--max-tool-rounds', '64'])
         options.setdefault('timeout', 60)
+        env = dict(options.pop('env_extra', None) or {})
+        # 三个工具里程碑单独验收；启用压缩时预留一次压缩提示，由 context_compaction_test 覆盖。
+        env.setdefault('EVE_CONTEXT_COMPACT_AT_TOKENS', '0')
+        options['env_extra'] = env
         result = super().run_eve(script, **options)
         path = self.work / f'events-{self.runs}.jsonl'
         self.events = [json.loads(line) for line in path.read_text().splitlines()]
@@ -52,7 +56,7 @@ class ToolProgressAcceptance(dialogue.DialogueToolsAcceptance):
         self.assertEqual([p['state'] for p in self.receipt('fifty')['progress']], ['Sent'] * 3)
         finals = [e for e in self.events if e.get('id') == 'fifty' and e.get('type') in ['reply','segment']]
         self.assertTrue(finals)
-        self.assertLessEqual(len(finals) + len(self.progress('fifty')), 5)
+        self.assertLessEqual(len(finals) + len(self.progress('fifty')), 4)
         self.assertEqual(len(self.progress('fresh')), 1)
         before = self.receipt('fifty')
         self.callback = lambda _: dialogue.text_response('重启正常')
@@ -115,10 +119,12 @@ class ToolProgressAcceptance(dialogue.DialogueToolsAcceptance):
         self.response_gates[('chat', 2)] = 'never-release'
         self.callback = lambda body: dialogue.text_response('新任务完成') if self.results(body) else self.calls(1)
         old = self.message('retired', '旧任务等待') | {'expected_type':'finish'}
-        self.run_eve([{'send':old}, {'wait_command':{'id':'retired','type':'progress'}},
+        self.run_eve([*self.send(self.message('bind-progress', '/bind progress-acceptance-key', contains='管理员')),
+                      {'send':old}, {'wait_command':{'id':'retired','type':'progress'}},
                       {'wait_file':str(self.arrived('chat', 2))},
                       *self.send(self.message('replace', '/new 新任务', expected='新任务完成')),
-                      {'wait_command':{'id':'retired','type':'finish'}}])
+                      {'wait_command':{'id':'retired','type':'finish'}}],
+                     env_extra={'EVE_ADMIN_BIND_KEY': 'progress-acceptance-key'})
         self.assertEqual(len(self.progress('retired')), 1)
         self.assertEqual(len(self.progress('replace')), 1)
         self.assertEqual(self.receipt('retired')['state'], 'Failed')

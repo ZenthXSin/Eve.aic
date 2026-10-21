@@ -5,7 +5,7 @@ use eve_config_api::{
     ModelProfile, ModelRolesConfig,
 };
 use eve_llm_api::{LlmError, LlmModelResolver, ModelSelection};
-use eve_llm_openai::OpenAiProvider;
+use eve_llm_openai::{OpenAiProvider, StreamTimeoutPolicy};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -23,6 +23,8 @@ struct CapturedModel {
     /// 用途配置的单次输出上限；None 表示沿用主模型。
     use_limit: Option<u32>,
     natural_style: bool,
+    streamed_completions: bool,
+    stream_timeouts: Option<StreamTimeoutPolicy>,
 }
 struct CachedModel {
     captured: CapturedModel,
@@ -167,17 +169,65 @@ fn capture(
         } else {
             false
         };
+        let streamed_completions = match std::env::var("EVE_OPENAI_STREAM_COMPLETIONS") {
+            Err(std::env::VarError::NotPresent) => false,
+            Ok(value) if matches!(value.as_str(), "1" | "true") => true,
+            Ok(value) if matches!(value.as_str(), "0" | "false") => false,
+            _ => {
+                return Err(LlmError::Configuration(
+                    "EVE_OPENAI_STREAM_COMPLETIONS 必须为 true/false 或 1/0".into(),
+                ));
+            }
+        };
+        let stream_timeouts =
+            if streamed_completions && matches!(use_name, Some("dialogue" | "digest")) {
+                let config = config::provider_config(&provider, primary.as_ref())
+                    .map_err(|e| LlmError::Configuration(e.to_string()))?;
+                let mut policy = stream_timeout_policy(config.request_timeout)?;
+                if use_name == Some("digest") {
+                    policy.total = policy.total.min(eve_llm_api::CONTEXT_COMPACTION_TIMEOUT);
+                    policy.first_response = policy.first_response.min(policy.total);
+                    policy.idle = policy.idle.min(policy.total);
+                }
+                Some(policy)
+            } else {
+                None
+            };
         return Ok(CapturedModel {
             provider,
             primary,
             role_revision,
             use_limit,
             natural_style,
+            streamed_completions,
+            stream_timeouts,
         });
     }
     Err(LlmError::Configuration(
         "模型配置持续变化，请在配置稳定后开启新轮。".into(),
     ))
+}
+fn stream_timeout_policy(first: Duration) -> Result<StreamTimeoutPolicy, LlmError> {
+    let duration = |name: &str, default: Duration| match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Ok(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|v| (1..=600_000).contains(v))
+            .map(Duration::from_millis)
+            .ok_or_else(|| LlmError::Configuration(format!("{name} 必须为 1 至 600000 毫秒"))),
+        Err(_) => Err(LlmError::Configuration(format!("{name} 必须为有效毫秒数"))),
+    };
+    let policy = StreamTimeoutPolicy {
+        first_response: duration("EVE_MODEL_FIRST_RESPONSE_TIMEOUT_MS", first)?,
+        idle: duration("EVE_MODEL_STREAM_IDLE_TIMEOUT_MS", first)?,
+        total: duration(
+            "EVE_MODEL_STREAM_TOTAL_TIMEOUT_MS",
+            Duration::from_secs(600),
+        )?,
+    };
+    policy.validate()?;
+    Ok(policy)
 }
 impl LlmModelResolver for CoreModelResolver {
     fn resolve(&self) -> Result<ModelSelection, LlmError> {
@@ -195,12 +245,37 @@ impl LlmModelResolver for CoreModelResolver {
         if let Some(cap) = self.timeout_cap {
             config.request_timeout = config.request_timeout.min(cap);
         }
-        let provider_timeout = config.request_timeout;
+        let mut stream_timeouts = captured.stream_timeouts;
+        if let (Some(policy), Some(cap)) = (&mut stream_timeouts, self.timeout_cap) {
+            policy.total = policy.total.min(cap);
+            policy.first_response = policy.first_response.min(policy.total);
+            policy.idle = policy.idle.min(policy.total);
+        }
+        // 留给适配器先返回分阶段诊断；外层只作为略晚的安全期限。
+        let provider_timeout =
+            stream_timeouts.map_or(config.request_timeout, |p| p.total + Duration::from_secs(1));
         let mut provider = OpenAiProvider::new(config, &self.api_key)?;
+        if let Some(policy) = stream_timeouts {
+            if timing_enabled() {
+                eprintln!(
+                    "EVE_MODEL_STREAM_TIMEOUTS {}",
+                    serde_json::json!({
+                        "first_response_ms":policy.first_response.as_millis(),
+                        "idle_ms":policy.idle.as_millis(),"total_ms":policy.total.as_millis(),
+                        "host_timeout_ms":provider_timeout.as_millis(),
+                        "use_name":self.use_name,
+                    })
+                );
+            }
+            provider = provider.with_stream_timeout_policy(policy)?;
+        }
+        if captured.streamed_completions {
+            provider = provider.with_streamed_completions();
+        }
         if self.use_name.as_deref() == Some("dialogue") {
             provider = provider.with_transient_retries();
         }
-        if self.use_name.as_deref() == Some("dialogue") && timing_enabled() {
+        if matches!(self.use_name.as_deref(), Some("dialogue" | "digest")) && timing_enabled() {
             provider = provider.with_timing_diagnostics();
         }
         let provider: Arc<dyn eve_llm_api::LlmProvider> = Arc::new(provider);

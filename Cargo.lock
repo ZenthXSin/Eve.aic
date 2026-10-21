@@ -359,9 +359,12 @@ dependencies = [
  "eve-toolforge-plugin",
  "eve-training-api",
  "eve-training-plugin",
+ "eve-trigger-api",
+ "eve-trigger-plugin",
  "eve-web-panel",
  "eve-web-panel-api",
  "postgres",
+ "reqwest",
  "ring",
  "serde",
  "serde_json",
@@ -1162,6 +1165,7 @@ dependencies = [
 name = "eve-task-api"
 version = "0.1.0"
 dependencies = [
+ "eve-llm-api",
  "ring",
  "serde",
  "serde_json",
@@ -1172,6 +1176,7 @@ name = "eve-task-plugin"
 version = "0.1.0"
 dependencies = [
  "eve-kernel",
+ "eve-llm-api",
  "eve-plugin-api",
  "eve-task-api",
  "serde",
@@ -1222,6 +1227,28 @@ dependencies = [
  "eve-llm-api",
  "eve-plugin-api",
  "eve-training-api",
+ "ring",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "eve-trigger-api"
+version = "0.1.0"
+dependencies = [
+ "eve-session-api",
+ "serde",
+]
+
+[[package]]
+name = "eve-trigger-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-kernel",
+ "eve-plugin-api",
+ "eve-session-api",
+ "eve-trigger-api",
  "ring",
  "serde",
  "serde_json",
