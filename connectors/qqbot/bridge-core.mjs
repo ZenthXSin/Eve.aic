@@ -190,7 +190,9 @@ export function createBridge(bot, emit, limit = 128) {
     }
     pushing.add(frame.id);
     try {
-      const result = await sendText({ scope: "c2c", targetId: frame.target_id }, frame.text);
+      const scope = frame.scope ?? "c2c";
+      if (!["c2c", "group"].includes(scope)) throw new Error("invalid_scope");
+      const result = await sendText({ scope, targetId: frame.target_id }, frame.text);
       send({ type: "delivery", id: frame.id, push: true, ok: true,
         ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
     } catch (err) {

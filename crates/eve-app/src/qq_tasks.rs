@@ -49,8 +49,15 @@ pub(crate) const LIST_TOOL: &str = "list_background_tasks";
 pub(crate) const CANCEL_TOOL: &str = "cancel_background_task";
 pub(crate) const SUBAGENT_TOOL: &str = "run_subagent";
 /// 执行器不提供的工具：避免后台任务或子代理再派发、再委托。
-pub(crate) const ORCHESTRATION_TOOLS: [&str; 4] =
-    [DISPATCH_TOOL, LIST_TOOL, CANCEL_TOOL, SUBAGENT_TOOL];
+pub(crate) const ORCHESTRATION_TOOLS: [&str; 7] = [
+    DISPATCH_TOOL,
+    LIST_TOOL,
+    CANCEL_TOOL,
+    SUBAGENT_TOOL,
+    "set_wakeup_trigger",
+    "list_wakeup_triggers",
+    "cancel_wakeup_trigger",
+];
 /// 本模块分配的通知 ID 前缀与任务 ID 相同；与其他投递来源共用通道时据此分流结果。
 pub(crate) const ID_PREFIX: &str = "task-";
 pub(crate) const NAMESPACE: &str = "runtime.tasks";
@@ -950,6 +957,7 @@ impl QqOutreach for ChannelAdapter {
             .claim(&task.id, DeliveryChannel::Proactive, now)
             .map_err(plugin_error)?;
         Ok(Some(QqOutreachPush {
+            session: None,
             user_id: claimed.owner.user_id.clone(),
             message: QqOutreachMessage {
                 id: claimed.id.clone(),

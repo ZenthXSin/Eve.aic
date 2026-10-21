@@ -442,6 +442,7 @@ impl QqOutreach for ChannelAdapter {
             .claim(&reminder.id, DeliveryChannel::Proactive, now)
             .map_err(plugin_error)?;
         Ok(Some(QqOutreachPush {
+            session: None,
             user_id: claimed.owner.clone(),
             message: QqOutreachMessage {
                 id: claimed.id,
