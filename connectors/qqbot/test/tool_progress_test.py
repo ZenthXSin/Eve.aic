@@ -20,6 +20,10 @@ class ToolProgressAcceptance(dialogue.DialogueToolsAcceptance):
         options.setdefault('memory', False)
         options.setdefault('more', ['--max-tool-rounds', '64'])
         options.setdefault('timeout', 60)
+        env = dict(options.pop('env_extra', None) or {})
+        # 三个工具里程碑单独验收；启用压缩时预留一次压缩提示，由 context_compaction_test 覆盖。
+        env.setdefault('EVE_CONTEXT_COMPACT_AT_TOKENS', '0')
+        options['env_extra'] = env
         result = super().run_eve(script, **options)
         path = self.work / f'events-{self.runs}.jsonl'
         self.events = [json.loads(line) for line in path.read_text().splitlines()]

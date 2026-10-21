@@ -72,6 +72,7 @@ struct Recorder {
 }
 fn stage(kind: &TurnEventKind) -> &'static str {
     match kind {
+        TurnEventKind::ContextCompactionStarted => "context_compaction",
         TurnEventKind::ProviderStarted { .. } => "request",
         TurnEventKind::TextDelta { .. } => "delta",
         TurnEventKind::ResponseCompleted { .. } => "response",
