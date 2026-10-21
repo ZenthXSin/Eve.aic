@@ -346,7 +346,13 @@ impl AttachmentInbox {
     }
 
     pub(crate) fn record(&self, session_id: &str, message: Message) {
-        if message.attachments.is_empty() {
+        // 只引用了带图消息的也要记下，视觉输入会附上被引用的图片。
+        if message.attachments.is_empty()
+            && message
+                .quoted
+                .as_ref()
+                .is_none_or(|quoted| quoted.attachments.is_empty())
+        {
             return;
         }
         let Ok(mut inner) = self.inner.lock() else {
@@ -357,6 +363,16 @@ impl AttachmentInbox {
         while inner.len() > Self::MAX {
             inner.pop_front();
         }
+    }
+
+    /// 本会话中原文与本轮输入一致的最近一条带附件消息。
+    pub(crate) fn turn_message(&self, session_id: &str, turn_text: &str) -> Option<Message> {
+        let inner = self.inner.lock().ok()?;
+        inner
+            .iter()
+            .rev()
+            .find(|(session, message)| session == session_id && message.turn_text() == turn_text)
+            .map(|(_, message)| message.clone())
     }
 
     fn attachment(

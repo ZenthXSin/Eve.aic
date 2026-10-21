@@ -15,7 +15,16 @@ pub(crate) fn encode_request(model: &str, request: ModelRequest) -> Result<Value
                 ChatRole::Assistant => "assistant",
                 ChatRole::Tool => unreachable!("validated tool message has no text"),
             };
-            let mut item = json!({"role": role, "content": text});
+            let content = if message.images.is_empty() {
+                json!(text)
+            } else {
+                let mut parts = vec![json!({"type": "input_text", "text": text})];
+                parts.extend(message.images.iter().map(|image| {
+                    json!({"type": "input_image", "image_url": data_url(image), "detail": "auto"})
+                }));
+                json!(parts)
+            };
+            let mut item = json!({"role": role, "content": content});
             // Eve 的 assistant 文本历史只有已完成回复，等价于 final_answer。
             if role == "assistant" {
                 item["phase"] = json!("final_answer");
@@ -58,6 +67,16 @@ pub(crate) fn encode_request(model: &str, request: ModelRequest) -> Result<Value
         "model": model, "input": input, "tools": tools,
         "parallel_tool_calls": true, "store": false, "stream": false
     }))
+}
+
+/// 图像以 data URL 内联；像素只出现在本次请求体中。
+pub(crate) fn data_url(image: &eve_llm_api::ImageInput) -> String {
+    use base64::Engine as _;
+    format!(
+        "data:{};base64,{}",
+        image.media_type(),
+        base64::engine::general_purpose::STANDARD.encode(image.data())
+    )
 }
 
 pub(crate) fn validate_function_name(name: &str) -> Result<(), LlmError> {
@@ -442,5 +461,32 @@ mod tests {
                 Err(LlmError::Unsupported(_))
             ));
         }
+    }
+
+    #[test]
+    fn user_images_become_input_image_parts_only_on_that_message() {
+        let image = eve_llm_api::ImageInput::new(b"\x89PNG\r\n\x1a\nabc".to_vec()).unwrap();
+        let body = encode_request(
+            "m",
+            ModelRequest {
+                messages: vec![
+                    ChatMessage::text(ChatRole::System, "s"),
+                    ChatMessage::text(ChatRole::User, "图里是什么").with_images(vec![image]),
+                ],
+                tools: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(body["input"][0]["content"], "s");
+        let parts = &body["input"][1]["content"];
+        assert_eq!(
+            parts[0],
+            json!({"type": "input_text", "text": "图里是什么"})
+        );
+        assert_eq!(parts[1]["type"], "input_image");
+        assert_eq!(
+            parts[1]["image_url"],
+            "data:image/png;base64,iVBORw0KGgphYmM="
+        );
     }
 }

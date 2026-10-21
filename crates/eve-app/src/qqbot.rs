@@ -1496,6 +1496,9 @@ async fn run_qqbot_composed(
             .push(Arc::new(crate::qq_files::SendFileTool::new(outbox)));
         let inbox = Arc::new(crate::qq_files::AttachmentInbox::new());
         plugin = plugin.with_attachment_observer(inbox.clone());
+        // 视觉输入：runtime.vision 开启时把本轮图片作为图像交给模型，像素不写入任何账本。
+        let vision = Arc::new(crate::qq_vision::QqTurnImages::new(inbox.clone()));
+        bootstrap.image_source = Some(vision.clone());
         bootstrap
             .tools
             .push(Arc::new(crate::qq_files::ReadAttachmentTool::new(inbox)));
@@ -1755,6 +1758,9 @@ async fn run_qqbot_composed(
         };
         let budgeted = |category: &str| budget_gate.wrap(observed(category)?, category);
         // 历史摘要服务于对话本身，与主对话一样不计入自主运行预算；用途 digest 单独记健康与输出上限。
+        let _ = vision
+            .settings
+            .set(qq_tasks::config_service(registry.as_ref())?);
         let _ = digest_policy
             .settings
             .set(qq_tasks::config_service(registry.as_ref())?);
@@ -2512,7 +2518,7 @@ async fn run_qqbot_composed(
                 "channel": "connected",
                 "tools_registered": tools_registered,
                 "model": "unverified",
-                "vision": "not_configured",
+                "vision": vision.readiness(),
             })
             .to_string(),
         )

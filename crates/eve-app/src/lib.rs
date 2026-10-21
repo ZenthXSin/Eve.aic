@@ -47,6 +47,7 @@ mod qq_summary;
 mod qq_tasks;
 mod qq_tools;
 mod qq_triggers;
+mod qq_vision;
 mod qqbot;
 mod segment_advice;
 mod segment_commands;
@@ -302,6 +303,8 @@ pub(crate) struct CoreBootstrap {
     health: Option<Arc<dyn eve_llm_api::ModelHealthObserver>>,
     /// 历史窗口省略较早轮次时提供的摘要；不装配时照常省略并提示。
     history_digests: Option<Arc<dyn eve_llm_api::HistoryDigests>>,
+    /// 本轮用户消息的图像来源；不装配时只发文字。
+    image_source: Option<Arc<dyn eve_llm_api::TurnImageSource>>,
 }
 
 pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstrap, AppError> {
@@ -317,6 +320,7 @@ pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstr
         tools: vec![],
         health: None,
         history_digests: None,
+        image_source: None,
     })
 }
 
@@ -357,6 +361,7 @@ pub(crate) async fn install_core_with_pages(
         config::dialogue_schema(),
         config::history_schema(),
         qq_history_digest::schema(),
+        qq_vision::schema(),
         qq_people::schema(),
         qq_memory_continuity::schema(),
         qq_tasks::schema(),
@@ -407,6 +412,7 @@ async fn install_core_with_config(
         tools,
         health,
         history_digests,
+        image_source,
     } = bootstrap;
     let mut bindings = Vec::with_capacity(tools.len() + 1);
     for tool in &tools {
@@ -486,6 +492,10 @@ async fn install_core_with_config(
     .with_history_resolver(Arc::new(history::ConfiguredHistory(settings.0.clone())));
     let host = match history_digests {
         Some(digests) => host.with_history_digests(digests),
+        None => host,
+    };
+    let host = match image_source {
+        Some(source) => host.with_image_source(source),
         None => host,
     };
     let host = Arc::new(SessionLlmHost::new(host, SessionBinding::builtin()).with_logger(logger));

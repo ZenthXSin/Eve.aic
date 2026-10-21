@@ -739,6 +739,7 @@ dependencies = [
 name = "eve-llm-openai"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "eve-llm-api",
  "eve-semantic-api",
  "reqwest",

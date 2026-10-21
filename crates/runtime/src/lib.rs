@@ -15,6 +15,7 @@ pub use cognition_executor::{BudgetedSessionRunner, ControlGoalExecutor};
 mod compaction;
 mod control_runner;
 mod history;
+mod images;
 mod llm_host;
 mod relation_judge;
 mod session_host;

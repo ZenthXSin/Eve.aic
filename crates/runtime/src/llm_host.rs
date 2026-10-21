@@ -442,6 +442,7 @@ pub struct LlmHost {
     compaction_policy: Option<eve_llm_api::ContextCompactionPolicy>,
     execution_budget: Option<Arc<eve_llm_api::TurnBudget>>,
     journal: Option<Arc<dyn eve_llm_api::TurnJournal>>,
+    image_source: Option<Arc<dyn eve_llm_api::TurnImageSource>>,
     pub(crate) registry: Arc<dyn ServiceRegistry>,
     pub(crate) kernel: Kernel,
     permissions: Arc<dyn PermissionChecker>,
@@ -496,6 +497,7 @@ impl LlmHost {
             compaction_policy: None,
             execution_budget: None,
             journal: None,
+            image_source: None,
             registry,
             kernel,
             permissions,
@@ -525,6 +527,12 @@ impl LlmHost {
     /// 显式启用历史摘要：窗口省略的较早轮次以摘要提供，而不是直接省略。
     pub fn with_history_digests(mut self, digests: Arc<dyn eve_llm_api::HistoryDigests>) -> Self {
         self.history_digests = Some(digests);
+        self
+    }
+
+    /// 显式启用图像输入：每轮由来源准备本条用户消息的图像，只随本轮请求传递，不写入历史。
+    pub fn with_image_source(mut self, source: Arc<dyn eve_llm_api::TurnImageSource>) -> Self {
+        self.image_source = Some(source);
         self
     }
 
@@ -709,6 +717,16 @@ impl LlmHost {
             .map(|tool| tool.definition.clone())
             .collect::<Vec<_>>();
         let mut messages = build_messages(&self.config, &prepared.context, &input, &definitions);
+        // 检查点会持久化请求消息，带检查点的独立任务不附图像。
+        if let Some(source) = self.image_source.as_deref()
+            && self.journal.is_none()
+        {
+            let prepared_images = tokio::select! { biased;
+                _ = wait_closed(events) => return Err(fail(LlmError::Cancelled, diagnostics)),
+                result = contain_panic(source.images(scope.as_ref(), &input)) => result,
+            };
+            crate::images::attach(&mut messages, prepared_images);
+        }
         if let Some(compaction) = &compaction {
             compaction.inject(&mut messages);
         }
