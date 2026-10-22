@@ -1612,7 +1612,7 @@ async fn run_qqbot_composed(
                 .map_or_else(Vec::new, |policy| policy.seeds().to_vec()),
             runner: practice.is_some().then(|| skill_runner.clone()),
         }));
-        let control = crate::install_core_with_pages(
+        let (control, model_settings_admin) = crate::install_core_with_pages_and_admin(
             &kernel,
             registry.clone(),
             permissions,
@@ -2176,6 +2176,11 @@ async fn run_qqbot_composed(
             admin: qq_admin.clone(),
             inner: Arc::new(CommandHandlers(vec![
                 qq_admin.clone(),
+                Arc::new(crate::qq_model::Commands {
+                    settings: qq_tasks::config_service(registry.as_ref())?,
+                    admin: Arc::new(model_settings_admin),
+                    authorization: qq_admin.clone(),
+                }),
                 Arc::new(crate::qq_people::Commands(people)),
                 help_commands,
                 commands,

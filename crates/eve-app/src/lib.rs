@@ -35,6 +35,7 @@ mod qq_memory;
 mod qq_memory_continuity;
 mod qq_memory_observer;
 mod qq_message_judge;
+mod qq_model;
 mod qq_outreach;
 mod qq_people;
 mod qq_plan;
@@ -354,6 +355,34 @@ pub(crate) async fn install_core_with_pages(
     bootstrap: CoreBootstrap,
     page_permit: Option<eve_web_panel_api::PageWritePermit>,
 ) -> Result<Arc<dyn eve_control_api::ControlService>, AppError> {
+    Ok(install_core_with_pages_and_admin(
+        kernel,
+        registry,
+        permissions,
+        logger,
+        state_directory,
+        bootstrap,
+        page_permit,
+    )
+    .await?
+    .0)
+}
+
+pub(crate) async fn install_core_with_pages_and_admin(
+    kernel: &Kernel,
+    registry: Arc<dyn eve_plugin_api::ServiceRegistry>,
+    permissions: Arc<dyn eve_plugin_api::PermissionChecker>,
+    logger: Arc<dyn eve_plugin_api::Logger>,
+    state_directory: &std::path::Path,
+    bootstrap: CoreBootstrap,
+    page_permit: Option<eve_web_panel_api::PageWritePermit>,
+) -> Result<
+    (
+        Arc<dyn eve_control_api::ControlService>,
+        eve_config_plugin::ConfigController,
+    ),
+    AppError,
+> {
     let mut schemas = vec![
         runtime_llm_schema(),
         config::openai_schema(),
@@ -390,7 +419,8 @@ pub(crate) async fn install_core_with_pages(
     if let Some(permit) = page_permit {
         config_plugin = config_plugin.with_web_pages(permit);
     }
-    install_core_with_config(
+    let controller = config_plugin.controller();
+    let control = install_core_with_config(
         kernel,
         registry,
         permissions,
@@ -398,7 +428,8 @@ pub(crate) async fn install_core_with_pages(
         bootstrap,
         config_plugin,
     )
-    .await
+    .await?;
+    Ok((control, controller))
 }
 
 async fn install_core_with_config(
