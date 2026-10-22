@@ -1259,6 +1259,7 @@ pub(crate) async fn run(
                 timing(timing_diagnostics, "admission_begin", None);
                 let queued = queue.remove(index).expect("queued ordinary message");
                 let merge = debounce_window.is_some() && mergeable(&queued);
+                let mut saved = queued.saved;
                 let mut message = queued.message;
                 // 回执保存每条消息的原话；合并后的文本只用于本轮会话输入。
                 let mut merged_text = None;
@@ -1280,19 +1281,17 @@ pub(crate) async fn run(
                             cursor += 1;
                         }
                     }
+                    if batch.len() > 1 {
+                        if !ledger.insert_merged(&ctx, &config.app_id, &batch)? {
+                            return Err(PluginError::State("QQBot 回执容量不足，连发合并未提交".into()));
+                        }
+                        saved = true;
+                    }
                     let last = batch.pop().expect("batch keeps the latest message");
                     let mut texts: Vec<String> = Vec::new();
                     for earlier in batch {
                         texts.push(earlier.text.clone());
                         let id = earlier.id.clone();
-                        if ledger.insert(&ctx, &config.app_id, earlier)? {
-                            let entry = ledger.find(&config.app_id, &id).expect("merged receipt");
-                            ledger.entries[entry].state = ReceiptState::Merged;
-                            ledger.entries[entry].merged_into = Some(last.id.clone());
-                            ledger.save(&ctx)?;
-                        } else {
-                            warn(&ctx, "receipt_limit");
-                        }
                         finish(&mut stdin, &id).await?;
                     }
                     message = last;
@@ -1301,7 +1300,7 @@ pub(crate) async fn run(
                         merged_text = Some(texts.join("\n"));
                     }
                 }
-                if !queued.saved && !ledger.insert(&ctx, &config.app_id, message.clone())? {
+                if !saved && !ledger.insert(&ctx, &config.app_id, message.clone())? {
                     warn(&ctx, "receipt_limit");
                     finish(&mut stdin, &message.id).await?;
                     continue;

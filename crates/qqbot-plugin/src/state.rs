@@ -307,7 +307,7 @@ impl Ledger {
             return Err(corrupt());
         }
         let mut identities = std::collections::BTreeSet::new();
-        for entry in &ledger.entries {
+        for (index, entry) in ledger.entries.iter().enumerate() {
             if !valid_id(&entry.app_id)
                 || !entry.message.valid()
                 || !identities.insert((&entry.app_id, &entry.message.id))
@@ -338,10 +338,15 @@ impl Ledger {
                         || !entry.progress.is_empty()))
                 || entry.merged_into.as_ref().is_some_and(|into| {
                     into == &entry.message.id
-                        || !ledger
-                            .entries
-                            .iter()
-                            .any(|e| e.app_id == entry.app_id && &e.message.id == into)
+                        || !ledger.entries.iter().enumerate().any(|(target_index, e)| {
+                            target_index > index
+                                && e.app_id == entry.app_id
+                                && &e.message.id == into
+                                && e.state != ReceiptState::Merged
+                                && e.message.scope == entry.message.scope
+                                && e.message.target_id == entry.message.target_id
+                                && e.message.user_id == entry.message.user_id
+                        })
                 })
             {
                 return Err(corrupt());
@@ -368,6 +373,75 @@ impl Ledger {
         self.entries
             .iter()
             .position(|r| r.app_id == app && r.message.id == id)
+    }
+
+    /// 整组一次提交：任意持久快照中，Merged 都必须已经有同组的目标回执。
+    pub fn insert_merged(
+        &mut self,
+        ctx: &PluginContext,
+        app: &str,
+        messages: &[Message],
+    ) -> PluginResult<bool> {
+        self.insert_merged_with(app, messages, |bytes| ctx.state_set(STATE_KEY, bytes))
+    }
+
+    fn insert_merged_with(
+        &mut self,
+        app: &str,
+        messages: &[Message],
+        persist: impl FnOnce(Vec<u8>) -> PluginResult<()>,
+    ) -> PluginResult<bool> {
+        let Some(target) = messages.last() else {
+            return Err(corrupt());
+        };
+        let mut ids = std::collections::BTreeSet::new();
+        if messages.len() < 2
+            || !valid_id(app)
+            || messages.iter().any(|message| {
+                !message.valid()
+                    || !ids.insert(&message.id)
+                    || self.find(app, &message.id).is_some()
+                    || message.scope != target.scope
+                    || message.target_id != target.target_id
+                    || message.user_id != target.user_id
+            })
+        {
+            return Err(corrupt());
+        }
+        if messages.len() > MAX_RECORDS.saturating_sub(self.entries.len()) {
+            return Ok(false);
+        }
+        let old_len = self.entries.len();
+        let old_version = self.version;
+        for (index, message) in messages.iter().enumerate() {
+            let merged = index + 1 < messages.len();
+            self.entries.push(Receipt {
+                app_id: app.into(),
+                message: message.clone(),
+                state: if merged {
+                    ReceiptState::Merged
+                } else {
+                    ReceiptState::Processing
+                },
+                reply: None,
+                segments: None,
+                progress: vec![],
+                merged_into: merged.then(|| target.id.clone()),
+            });
+        }
+        let result = (|| {
+            let bytes = self.encode()?;
+            if bytes.len() + 6 * 32768 + 64 + SEGMENT_RESERVE > MAX_BYTES {
+                return Ok(false);
+            }
+            persist(bytes)?;
+            Ok(true)
+        })();
+        if !matches!(result, Ok(true)) {
+            self.entries.truncate(old_len);
+            self.version = old_version;
+        }
+        result
     }
     pub fn insert(
         &mut self,
@@ -593,6 +667,37 @@ mod tests {
             broken(&mut copy);
             let encoded = serde_json::to_vec(&copy).unwrap();
             assert!(Ledger::decode(&encoded).is_err());
+        }
+    }
+
+    #[test]
+    fn merged_batch_is_one_readable_commit_and_write_failure_keeps_the_old_ledger() {
+        for fail in [false, true] {
+            let mut ledger = Ledger::default();
+            let before = ledger.encode().unwrap();
+            let first = receipt(ReceiptState::Processing, None).message;
+            let mut last = first.clone();
+            last.id = "msg-2".into();
+            let mut writes = 0;
+            let result = ledger.insert_merged_with("app", &[first, last], |bytes| {
+                writes += 1;
+                let saved = Ledger::decode(&bytes).unwrap();
+                assert_eq!(saved.entries[0].state, ReceiptState::Merged);
+                assert_eq!(saved.entries[1].state, ReceiptState::Processing);
+                if fail {
+                    Err(PluginError::State("synthetic write failure".into()))
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(writes, 1);
+            if fail {
+                assert!(result.is_err());
+                assert_eq!(ledger.encode().unwrap(), before);
+            } else {
+                assert!(result.unwrap());
+                Ledger::decode(&ledger.encode().unwrap()).unwrap();
+            }
         }
     }
 }
