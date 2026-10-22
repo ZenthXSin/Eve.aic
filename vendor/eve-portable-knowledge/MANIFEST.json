@@ -612,8 +612,8 @@
   },
   {
    "path": "concepts/mindustry-version-numbering.md",
-   "sha256": "197c73d96b20694977ecc93976af1148737f01e7c7882ec012165118a0649ece",
-   "bytes": 1363
+   "sha256": "f3ea06fd90aecc07d58aa541ec2afd10db4296b71c6bdc20c48a536a6c8906aa",
+   "bytes": 3247
   },
   {
    "path": "concepts/mindustry-wave-spawner.md",
@@ -687,8 +687,8 @@
   },
   {
    "path": "mindustry/java-mod-structure.md",
-   "sha256": "61c4252393d14f9d2767e827450b38d79b8bbdc189dd5dc9c45e91e41f49a599",
-   "bytes": 3512
+   "sha256": "1a467871561471ef80237528750b93520238adc124f6ee950fd561846f9bc302",
+   "bytes": 3722
   },
   {
    "path": "mindustry/key-classes.md",

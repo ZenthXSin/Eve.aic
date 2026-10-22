@@ -82,10 +82,13 @@ Gradle 构建文件，负责：
   "author": "you",
   "version": "1.0",
   "main": "mymod.MyMod",
-  "minGameVersion": 146,
+  "minGameVersion": 154,
   "description": "A Mindustry Java mod."
 }
 ```
+
+> 版本说明：`minGameVersion` 是构建号，160.7 里 Java mod 的兼容下限是 154
+> （`Vars.java:55`），普通内容 mod 是 136（`Vars.java:53`）。低于下限会被判为过时而不加载。
 
 ## 4. 最小主类
 
