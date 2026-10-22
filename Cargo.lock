@@ -580,6 +580,7 @@ dependencies = [
  "eve-practice-api",
  "eve-skill-api",
  "eve-toolforge-api",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
@@ -761,6 +762,7 @@ dependencies = [
 name = "eve-memory-plugin"
 version = "0.1.0"
 dependencies = [
+ "eve-dialogue-tools",
  "eve-kernel",
  "eve-llm-api",
  "eve-memory-api",

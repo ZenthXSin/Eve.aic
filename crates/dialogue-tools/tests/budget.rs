@@ -64,7 +64,7 @@ fn tool(broken: bool) -> (Arc<dyn Tool>, Arc<AtomicUsize>) {
         })),
         ..Services::default()
     };
-    let mut tools = services.tools();
+    let (mut tools, _) = services.tools();
     assert_eq!(tools.len(), 1);
     (tools.remove(0), reserves)
 }
@@ -81,6 +81,7 @@ async fn budget_tool_is_registered_only_when_assembled_and_reads_without_reservi
     assert!(
         Services::default()
             .tools()
+            .0
             .iter()
             .all(|t| t.definition().name != "show_budget")
     );

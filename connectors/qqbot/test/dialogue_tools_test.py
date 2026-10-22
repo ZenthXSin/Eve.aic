@@ -10,7 +10,7 @@ import practice_test
 
 PLATFORM_TOOLS = {"send_file", "read_attachment", "read_raw_message"}
 
-ALL_TOOLS = PLATFORM_TOOLS | {"echo", "use_skill", "search_memory", "list_interests", "list_goals",
+ALL_TOOLS = PLATFORM_TOOLS | {"echo", "use_skill", "search_memory", "save_preference", "list_interests", "list_goals",
              "list_knowledge", "list_practice", "list_skills", "list_forged_tools",
              "list_plans", "list_outreach", "read_source", "check_practice_draft", "run_practice"}
 
