@@ -58,6 +58,9 @@ jobs:
           }
       - name: 验证 Linux 外层守护、孤儿清理与两层崩溃恢复
         run: python -X utf8 scripts/test-service-guard.py
+      - name: 验证 Linux 服务启动、停止和重复启动保护
+        if: runner.os == 'Linux'
+        run: python -X utf8 scripts/test-eve-service.py
       - name: 验证 Linux 分卷校验与进程身份绑定
         run: python -X utf8 scripts/test-linux-handoff.py
       - name: 检查所有构建目标
