@@ -30,6 +30,8 @@ class StickerAcceptance(vision.VisionAcceptance):
     def respond(self, body):
         system = "\n".join(str(m.get("content", "")) for m in body["messages"] if m["role"] == "system")
         if REVIEW_MARK in system:
+            self.assertEqual(body.get("response_format"), {"type": "json_object"})
+            self.assertIn('"sticker"', body["messages"][-1]["content"][0]["text"])
             [(_, data)] = vision.images_in(body)
             secret = vision.secret_of(data)
             self.reviews.append(secret)
@@ -80,6 +82,17 @@ class StickerAcceptance(vision.VisionAcceptance):
         blobs = self.work / "state" / "stickers" / "blobs"
         self.assertFalse((blobs / f"{rejected['sha256']}.png").exists(), "不是表情包的图片字节已删除")
         self.assertTrue((blobs / f"{stickers['猫猫点头表示认同']['sha256']}.png").exists())
+
+        def status(body):
+            if not self.results(body):
+                return tool_response([("send_sticker", {"action":"status"})])
+            [saved] = self.results(body)
+            self.assertTrue(saved["collect_enabled"] and saved["send_enabled"])
+            self.assertEqual((saved["approved"], saved["pending"], saved["rejected"]), (1, 0, 1))
+            return text_response("库状态已核实")
+        self.chat = status
+        self.stickers(self.send(self.message("status", "看看表情库", expected="库状态已核实")))
+        self.assertNotIn("sticker", self.receipt("status"), "查询状态不能发送图片")
 
         def chat(body):
             results = self.results(body)
