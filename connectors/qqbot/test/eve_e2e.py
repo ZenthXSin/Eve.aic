@@ -208,7 +208,7 @@ class Acceptance(unittest.TestCase):
                       self.message("el-task", "详细解释这个任务", scope="group")], training=True)
         self.assertEqual(len(self.requests), before + 1)
         self.assertTrue(any(m["role"] == "system" and "当前可信会话" in m.get("content", "") for m in self.requests[-1]["messages"]))
-        self.run_eve([self.message("el-reset", "/train reset", "已重置本会话的表达统计，原始聊天记录保留；旧消息不会再次计入，可继续从新消息学习。", scope="group")], training=True)
+        self.run_eve([self.message("el-reset", "/train reset", "已重置本会话的表达统计和学到的说法，原始聊天记录保留；旧消息不会再次计入，可继续从新消息学习。", scope="group")], training=True)
         self.run_eve(training=True)
         self.assertFalse(any(r["active"] for r in self.documents()["eve.training"]["expression.v1"]["rows"]))
         self.assertEqual(len(self.requests), before + 1)
@@ -258,7 +258,7 @@ class Acceptance(unittest.TestCase):
             {"send": self.message("reset-busy", "当前任务")}, self.wait_request(1),
             {"send": self.message("reset-queued", "重置前已收到的输入")},
             {"send": self.message("reset-command", "/train reset",
-                "已重置本会话的表达统计，原始聊天记录保留；旧消息不会再次计入，可继续从新消息学习。")},
+                "已重置本会话的表达统计和学到的说法，原始聊天记录保留；旧消息不会再次计入，可继续从新消息学习。")},
             self.wait_command("reset-command"), self.open_gate("reset-release"),
             self.wait_command("reset-busy"), self.wait_command("reset-queued")])
         before = self.documents()["eve.training"]["expression.v1"]
