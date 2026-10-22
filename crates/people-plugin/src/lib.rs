@@ -345,8 +345,7 @@ fn valid_document(document: &Document) -> bool {
     let mut ids = BTreeSet::new();
     let mut impression_ids = BTreeSet::new();
     let extended = document.version == 2;
-    (document.version == 1 || extended)
-        && (extended || document.next == 0)
+    (extended || (document.version == 1 && document.next == 0))
         && document.people.len() <= MAX_PEOPLE
         && !document.people.iter().any(|p| {
             !valid_identity(&p.scope.conversation)
