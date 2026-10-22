@@ -26,6 +26,28 @@ pub const MAX_FAILURE_BYTES: usize = 512;
 pub const MIN_STEPS: u32 = 1;
 pub const MAX_STEPS: u32 = 500;
 pub const DEFAULT_STEPS: u32 = 50;
+/// 宿主自动失败恢复及其经用户批准的接续任务使用此来源前缀。
+pub const FAILURE_RECOVERY_SOURCE_PREFIX: &str = "failure:";
+
+/// 到达收尾阶段且未明确完成/阻塞时，恢复任务需要用户追加预算；未知副作用不能走预算批准。
+pub fn recovery_needs_step_approval(checkpoint: &eve_llm_api::TurnCheckpoint) -> bool {
+    if !checkpoint.closing || !checkpoint.resumable() {
+        return false;
+    }
+    if checkpoint.remaining.is_some() {
+        return true;
+    }
+    let progress = checkpoint
+        .messages
+        .iter()
+        .rev()
+        .flat_map(|m| m.tool_calls.iter().rev())
+        .find(|call| call.name == "task_progress");
+    let concluded = progress.is_some_and(|call| checkpoint.messages.iter().flat_map(|m| &m.tool_results)
+        .any(|result| result.call_id == call.id && matches!(&result.output, eve_llm_api::ToolOutput::Success(value)
+            if matches!(value.get("status").and_then(serde_json::Value::as_str), Some("completed" | "blocked")))));
+    !concluded
+}
 /// 结束后多久仍未送达就不再通知。
 pub const DELIVERY_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// 每条通知至多投递尝试次数（其中至多一次主动私聊）。
@@ -237,6 +259,14 @@ pub struct Task {
     pub execution: Option<TaskExecution>,
 }
 impl Task {
+    pub fn needs_step_approval(&self) -> bool {
+        self.source.starts_with(FAILURE_RECOVERY_SOURCE_PREFIX)
+            && self
+                .execution
+                .as_ref()
+                .and_then(|e| e.checkpoint.as_ref())
+                .is_some_and(recovery_needs_step_approval)
+    }
     /// 已结束且通知（如有）已了结；容量满时可以腾出。
     pub fn settled_at(&self) -> Option<u64> {
         if !self.status.finished() {

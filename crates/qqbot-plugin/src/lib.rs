@@ -47,6 +47,12 @@ pub trait QqAttachmentObserver: Send + Sync {
     fn observe(&self, session: &SessionKey, message: &Message);
 }
 
+/// 已结束的失败轮次交给宿主处理；只允许有界的本地持久化，不能运行模型或工具。
+/// 返回的说明代替默认的“不会自动重试”；只有确认任务保存后才能宣称已派发。
+pub trait QqFailureRecovery: Send + Sync {
+    fn recover(&self, report: &eve_control_api::ControlReport) -> PluginResult<Option<String>>;
+}
+
 use eve_control_api::{CONTROL_PLUGIN_ID, CONTROL_SERVICE_ID, ControlServiceHandle};
 use eve_message_api::{MessageServiceHandle, ROUTER_PLUGIN_ID, ROUTER_SERVICE_ID};
 use eve_plugin_api::{
@@ -143,6 +149,7 @@ pub struct QqBotPlugin {
     slow_progress: Option<Arc<dyn QqSlowProgress>>,
     debounce: Option<Arc<dyn QqDebounce>>,
     stickers: Option<Arc<dyn QqStickers>>,
+    failure_recovery: Option<Arc<dyn QqFailureRecovery>>,
 }
 pub(crate) struct Segmentation {
     pub planner: Arc<dyn SegmentPlanner>,
@@ -180,11 +187,16 @@ impl QqBotPlugin {
             slow_progress: None,
             debounce: None,
             stickers: None,
+            failure_recovery: None,
         })
     }
     /// 通道已提交过轮次的会话是私聊还是群聊；只读，供只在私聊中成立的宿主能力判断。
     pub fn conversations(&self) -> QqConversations {
         self.conversations.clone()
+    }
+    pub fn with_failure_recovery(mut self, recovery: Arc<dyn QqFailureRecovery>) -> Self {
+        self.failure_recovery = Some(recovery);
+        self
     }
     pub fn with_participant_observer(mut self, observer: Arc<dyn QqParticipantObserver>) -> Self {
         self.participant_observer = Some(observer);
@@ -400,6 +412,7 @@ impl Plugin for QqBotPlugin {
             let slow_progress = self.slow_progress.clone();
             let debounce = self.debounce.clone();
             let stickers = self.stickers.clone();
+            let failure_recovery = self.failure_recovery.clone();
             let task_ctx = ctx.clone();
             ctx.spawn_task(TaskSpec::new(
                 "QQBot JSONL 通道",
@@ -424,6 +437,7 @@ impl Plugin for QqBotPlugin {
                     let slow_progress = slow_progress.clone();
                     let debounce = debounce.clone();
                     let stickers = stickers.clone();
+                    let failure_recovery = failure_recovery.clone();
                     let status = status.clone();
                     let ledger = ledger.clone();
                     Box::pin(async move {
@@ -453,6 +467,7 @@ impl Plugin for QqBotPlugin {
                                 slow_progress,
                                 debounce,
                                 stickers,
+                                failure_recovery,
                             },
                             ledger,
                             signal,

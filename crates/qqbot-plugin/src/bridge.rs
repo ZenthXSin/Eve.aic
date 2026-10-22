@@ -273,6 +273,7 @@ pub(crate) struct Services {
     pub slow_progress: Option<Arc<dyn crate::QqSlowProgress>>,
     pub debounce: Option<Arc<dyn crate::QqDebounce>>,
     pub stickers: Option<Arc<dyn crate::QqStickers>>,
+    pub failure_recovery: Option<Arc<dyn crate::QqFailureRecovery>>,
 }
 /// 宿主接线的主动交流；`push_interval` 为空时不主动私聊。
 pub(crate) struct OutreachHook {
@@ -579,7 +580,7 @@ impl ReplyGuard {
     }
 }
 /// 宿主故障通知不依赖再次调用模型，不进入成功交互观察或训练证据。
-fn failed_turn_notice(report: &ControlReport) -> String {
+fn failed_turn_notice(report: &ControlReport, recovery: Option<&str>) -> String {
     let error = match report.run.failure.as_ref() {
         Some(RunFailure::Execution(error)) => Some(error),
         Some(RunFailure::FailureRecord { execution, .. }) => Some(execution),
@@ -626,7 +627,8 @@ fn failed_turn_notice(report: &ControlReport) -> String {
         ),
         None => "工具执行情况尚未确认，不能保证没有副作用。".into(),
     };
-    format!("{reason}。{effects}本轮已停止，不再自动重试；继续前需要核对现有结果。")
+    let next = recovery.unwrap_or("本轮已停止，不再自动重试；继续前需要核对现有结果。");
+    format!("{reason}。{effects}{next}")
 }
 /// 只用固定类别与状态码说明，不转述供应商错误正文。
 fn failure_reason(failure: ProviderFailure) -> String {
@@ -767,6 +769,7 @@ pub(crate) async fn run(
         slow_progress,
         debounce,
         stickers,
+        failure_recovery,
     } = services;
     // 只从已验证的持久回执重建路由身份索引，不重放消息、写记忆或触发工具。
     for entry in ledger
@@ -1544,8 +1547,17 @@ pub(crate) async fn run(
                     } else if !report.cancel_requested {
                         status.send_modify(|s| s.failed += 1);
                         warn(&ctx, "turn_failed");
+                        let recovery = failure_recovery.as_ref().and_then(|handler| {
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.recover(&report))) {
+                                Ok(Ok(notice)) => notice,
+                                _ => {
+                                    warn(&ctx, "failure_recovery_unconfirmed");
+                                    Some("后台恢复任务未能确认保存；原记录保留，请核对现有结果。".into())
+                                }
+                            }
+                        });
                         replies.push_back(Reply { message: current.message,
-                            text: failed_turn_notice(&report), guard: ReplyGuard::Current(report.key),
+                            text: failed_turn_notice(&report, recovery.as_deref()), guard: ReplyGuard::Current(report.key),
                             interaction: None, invite: None });
                     } else {
                         mark_failed(&mut ledger, &ctx, &config.app_id, &current.message.id)?;
@@ -1907,7 +1919,7 @@ mod tests {
                     failure: Some(failure),
                 },
             };
-            let notice = failed_turn_notice(&report);
+            let notice = failed_turn_notice(&report, None);
             assert!(notice.starts_with(expected), "{notice}");
             assert!(!notice.contains("private"));
             assert!(!notice.contains("本轮执行或状态保存未能完成"));

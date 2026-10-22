@@ -111,14 +111,14 @@ impl Tool for SendStickerTool {
             description: format!(
                 "在这条回复的文字后面跟一张表情包，像聊天时顺手发个表情。mood 只能是：{}。\
                  只在气氛合适的闲聊里偶尔用，正式回答、认真讨论或用户不喜欢时不要用；一轮至多一张。\
-                 表情包是从聊天里收集并审看过的；没有对应心情的表情包时返回 chosen=false，正常回复即可。\
+                 宿主会自动查看用户直接附带、至多 512 KiB 的图片，由当前主模型审看，合适的表情包自动保存，不需要额外收藏工具；引用图片不收。\
+                 action=status 可查询实际收集/发送开关与库存，不发送图片，此时无需 mood。默认 action=send，需要 mood；没有对应心情时返回 chosen=false。\
                  正文里不要描述或预告这张表情包。",
                 MOODS.join("、")
             ),
             argument_schema: json!({
                 "type": "object",
-                "properties": {"mood": {"type": "string", "enum": MOODS}},
-                "required": ["mood"],
+                "properties": {"mood": {"type": "string", "enum": MOODS}, "action":{"type":"string","enum":["send","status"]}},
                 "additionalProperties": false
             }),
             required_permissions: vec![],
@@ -133,8 +133,18 @@ impl Tool for SendStickerTool {
             message: message.into(),
         };
         let object = value.as_object().ok_or_else(|| invalid("参数必须是对象"))?;
-        if object.keys().any(|key| key != "mood") {
-            return Err(invalid("参数只能包含 mood"));
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "mood" | "action"))
+        {
+            return Err(invalid("参数只能包含 mood 和 action"));
+        }
+        if let Some(action) = object.get("action") {
+            match action.as_str() {
+                Some("status") if !object.contains_key("mood") => return Ok(()),
+                Some("send") => {}
+                _ => return Err(invalid("action 只能是 send 或 status；status 不携带 mood")),
+            }
         }
         match object.get("mood").and_then(Value::as_str) {
             Some(mood) if valid_mood(mood) => Ok(()),
@@ -147,6 +157,19 @@ impl Tool for SendStickerTool {
             let scope = context.scope().ok_or_else(|| {
                 ToolExecutionError::Failed("只有带用户身份的对话里才能发表情包".into())
             })?;
+            if call.arguments.get("action").and_then(Value::as_str) == Some("status") {
+                let rows = self
+                    .0
+                    .library
+                    .list()
+                    .map_err(|_| ToolExecutionError::Failed("表情包库不可用，未修改".into()))?;
+                return Ok(
+                    json!({"chosen":false,"collect_enabled":self.0.enabled("collect"),"send_enabled":self.0.enabled("send"),
+                    "approved":rows.iter().filter(|s| s.state == eve_sticker_api::StickerState::Approved).count(),
+                    "pending":rows.iter().filter(|s| s.state == eve_sticker_api::StickerState::Pending).count(),
+                    "rejected":rows.iter().filter(|s| s.state == eve_sticker_api::StickerState::Rejected).count()}),
+                );
+            }
             if !self.0.enabled("send") {
                 return Ok(json!({"chosen": false, "reason": "表情包发送已关闭"}));
             }
