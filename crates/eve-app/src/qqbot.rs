@@ -1498,6 +1498,9 @@ async fn run_qqbot_composed(
             .push(Arc::new(crate::qq_files::SendFileTool::new(outbox)));
         let inbox = Arc::new(crate::qq_files::AttachmentInbox::new());
         plugin = plugin.with_attachment_observer(inbox.clone());
+        // 慢步骤进度：某一步超过 runtime.progress.slow_after_ms 仍未结束时补发一条真实进度。
+        let slow_progress = Arc::new(crate::qq_progress::SlowProgress::default());
+        plugin = plugin.with_slow_progress(slow_progress.clone());
         bootstrap
             .tools
             .push(Arc::new(crate::qq_files::ReadAttachmentTool::new(
@@ -1784,6 +1787,9 @@ async fn run_qqbot_composed(
         };
         let budgeted = |category: &str| budget_gate.wrap(observed(category)?, category);
         // 历史摘要服务于对话本身，与主对话一样不计入自主运行预算；用途 digest 单独记健康与输出上限。
+        let _ = slow_progress
+            .settings
+            .set(qq_tasks::config_service(registry.as_ref())?);
         let _ = digest_policy
             .settings
             .set(qq_tasks::config_service(registry.as_ref())?);
