@@ -86,8 +86,18 @@ impl StoredTasks {
                     if let Some(checkpoint) = &execution.checkpoint
                         && let Some(result) = &checkpoint.result
                     {
-                        task.status = TaskStatus::Completed;
-                        task.result = Some(bounded(result, MAX_RESULT_BYTES));
+                        if task.source.starts_with(FAILURE_RECOVERY_SOURCE_PREFIX)
+                            && recovery_needs_step_approval(checkpoint)
+                        {
+                            task.status = TaskStatus::Failed;
+                            task.failure = Some(
+                                "本次步数预算不足；已有进度保留，等待原会话明确同意追加步数。"
+                                    .into(),
+                            );
+                        } else {
+                            task.status = TaskStatus::Completed;
+                            task.result = Some(bounded(result, MAX_RESULT_BYTES));
+                        }
                         task.usage = Some(checkpoint_usage(checkpoint));
                         task.finished_at_ms = Some(now.max(last_time(task)));
                         task.notice = Some(Notice {
