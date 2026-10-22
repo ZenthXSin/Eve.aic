@@ -35,6 +35,29 @@ use tokio::{
     sync::{mpsc, watch},
 };
 
+/// /train words 的回复：按学到次数列出编号、词语或场合、含义与原话摘录。
+fn phrase_list(phrases: &[eve_training_api::LearnedPhrase]) -> String {
+    if phrases.is_empty() {
+        return "本会话还没有学到说法；训练开启后，每攒够一批你的原话会学习一次。".into();
+    }
+    let mut text = format!("本会话从你的原话里学到 {} 条说法：", phrases.len());
+    for p in phrases.iter().take(20) {
+        let kind = match p.kind {
+            eve_training_api::PhraseKind::Term => "词语",
+            eve_training_api::PhraseKind::Expression => "表达",
+        };
+        text.push_str(&format!(
+            "\n{} {kind}「{}」：{}（原话：“{}”，学到 {} 次）",
+            p.id, p.text, p.meaning, p.example, p.uses
+        ));
+    }
+    if phrases.len() > 20 {
+        text.push_str("\n……其余按次数较少未列出。");
+    }
+    text.push_str("\n不需要的用 /train forget 编号 删除。");
+    text
+}
+
 fn failure(code: &str) -> PluginError {
     PluginError::Task(code.into())
 }
@@ -907,15 +930,17 @@ pub(crate) async fn run(
                         queue.push_front(Queued { message, saved: true, ordinary: false, received: tokio::time::Instant::now() });
                         continue;
                     }
-                    let text = match action {
+                    let text = match &action {
                         TrainingCommand::Stop => "已结束当前会话的主动提问训练，已完成记录保留；普通聊天仍可继续。".into(),
                         TrainingCommand::Status => if training.enabled(&scope)? { "当前会话：主动提问训练已开启。" } else { "当前会话：主动提问训练已关闭。" }.into(),
                         TrainingCommand::Stats => match training.expression_snapshot(&scope)? {
                             Some(s) => format!("本会话已学习 {} 条有效用户表达：字数中位数 {}，短消息 {}%，单段消息 {}%。{}当前要求始终优先；这是本地表达统计。", s.samples, s.median_chars, s.short_percent, s.single_paragraph_percent, if s.samples < 8 { "不足 8 条，暂不采用本会话统计。" } else { "" }),
                             None => "本会话暂无有效表达样本；训练开启后会从普通交流中学习。".into(),
                         },
-                        TrainingCommand::Reset => { training.reset_expression(&scope)?; "已重置本会话的表达统计，原始聊天记录保留；旧消息不会再次计入，可继续从新消息学习。".into() },
-                        TrainingCommand::Help => "训练命令：/train start 开始；/train stop 停止采集和主动训练；/train status 查看开关；/train stats 查看表达统计；/train reset 重置本会话统计。".into(),
+                        TrainingCommand::Reset => { training.reset_expression(&scope)?; "已重置本会话的表达统计和学到的说法，原始聊天记录保留；旧消息不会再次计入，可继续从新消息学习。".into() },
+                        TrainingCommand::Words => phrase_list(&training.phrases(&scope)?),
+                        TrainingCommand::Forget(id) => if training.forget_phrase(&scope, id)? { format!("已删除说法 {id}，之后不再参考。") } else { format!("本会话没有说法 {id}；用 /train words 查看编号。") },
+                        TrainingCommand::Help => "训练命令：/train start 开始；/train stop 停止采集和主动训练；/train status 查看开关；/train stats 查看表达统计；/train words 查看学到的说法；/train forget 编号 删除一条说法；/train reset 重置本会话统计和说法。".into(),
                         TrainingCommand::Start => unreachable!(),
                     };
                     replies.push_back(Reply { message, text, guard: ReplyGuard::NoTask, interaction: None, invite: None });

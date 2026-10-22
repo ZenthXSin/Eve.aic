@@ -88,6 +88,7 @@ jobs:
           python3 connectors/qqbot/test/live_upgrade_test.py
           python3 connectors/qqbot/test/transport_test.py
           python3 connectors/qqbot/test/people_test.py
+          python3 connectors/qqbot/test/phrases_test.py
           python3 connectors/qqbot/test/model_health_test.py
           python3 connectors/qqbot/test/model_retry_test.py
           python3 connectors/qqbot/test/request_timing_test.py
