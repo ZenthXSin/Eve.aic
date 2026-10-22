@@ -23,6 +23,10 @@ name = "eve-message-evaluate"
 path = "src/bin/message-evaluate.rs"
 
 [[bin]]
+name = "eve-chime"
+path = "src/bin/chime.rs"
+
+[[bin]]
 name = "eve-memory"
 path = "src/bin/memory.rs"
 
@@ -30,6 +34,8 @@ path = "src/bin/memory.rs"
 tempfile.workspace = true
 eve-trigger-api = { path = "../trigger-api" }
 eve-trigger-plugin = { path = "../trigger-plugin" }
+eve-chime-api = { path = "../chime-api" }
+eve-chime-plugin = { path = "../chime-plugin" }
 eve-people-api = { path = "../people-api" }
 eve-people-plugin = { path = "../people-plugin" }
 eve-developer-api = { path = "../developer-api" }

@@ -1,0 +1,19 @@
+[package]
+name = "eve-chime-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-chime-api = { path = "../chime-api" }
+eve-control-api = { path = "../control-api" }
+eve-llm-api = { path = "../llm-api" }
+eve-segment-api = { path = "../segment-api" }
+eve-session-api = { path = "../session-api" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+eve-segment-plugin = { path = "../segment-plugin" }
