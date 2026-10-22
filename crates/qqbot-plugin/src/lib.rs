@@ -24,6 +24,12 @@ pub use outreach::{
 pub use participants::QqParticipantObserver;
 pub use state::{ImageAttachment, Message};
 
+/// 慢步骤进度的时间阈值：本轮某一步（等待模型或一批工具）持续超过它仍未结束时，
+/// 通道补发一条说明当前步骤与已进行时长的进度。返回 None 表示关闭；每次检查时读取，可热修改。
+pub trait QqSlowProgress: Send + Sync {
+    fn after(&self) -> Option<std::time::Duration>;
+}
+
 /// 收到带附件的消息时通知宿主；只传已校验的消息，不做下载。
 pub trait QqAttachmentObserver: Send + Sync {
     fn observe(&self, session: &SessionKey, message: &Message);
@@ -122,6 +128,7 @@ pub struct QqBotPlugin {
     conversations: QqConversations,
     participant_observer: Option<Arc<dyn QqParticipantObserver>>,
     timing_diagnostics: bool,
+    slow_progress: Option<Arc<dyn QqSlowProgress>>,
 }
 pub(crate) struct Segmentation {
     pub planner: Arc<dyn SegmentPlanner>,
@@ -156,6 +163,7 @@ impl QqBotPlugin {
             conversations: QqConversations::default(),
             participant_observer: None,
             timing_diagnostics: false,
+            slow_progress: None,
         })
     }
     /// 通道已提交过轮次的会话是私聊还是群聊；只读，供只在私聊中成立的宿主能力判断。
@@ -253,6 +261,12 @@ impl QqBotPlugin {
         self.files = Some(files);
         self.file_poll = Some(poll_interval);
         Ok(self)
+    }
+
+    /// 开启慢步骤进度；与工具里程碑进度共用每轮至多 3 条进度和被动回复配额。未接线时不发。
+    pub fn with_slow_progress(mut self, policy: Arc<dyn QqSlowProgress>) -> Self {
+        self.slow_progress = Some(policy);
+        self
     }
 
     /// 收到带附件的消息时回调宿主；未接线时只把附件说明写进对话文本。
@@ -357,6 +371,7 @@ impl Plugin for QqBotPlugin {
             let conversations = self.conversations.clone();
             let participant_observer = self.participant_observer.clone();
             let timing_diagnostics = self.timing_diagnostics;
+            let slow_progress = self.slow_progress.clone();
             let task_ctx = ctx.clone();
             ctx.spawn_task(TaskSpec::new(
                 "QQBot JSONL 通道",
@@ -378,6 +393,7 @@ impl Plugin for QqBotPlugin {
                     let raw_observer = raw_observer.clone();
                     let conversations = conversations.clone();
                     let participant_observer = participant_observer.clone();
+                    let slow_progress = slow_progress.clone();
                     let status = status.clone();
                     let ledger = ledger.clone();
                     Box::pin(async move {
@@ -404,6 +420,7 @@ impl Plugin for QqBotPlugin {
                                 conversations,
                                 participant_observer,
                                 timing_diagnostics,
+                                slow_progress,
                             },
                             ledger,
                             signal,
