@@ -132,7 +132,9 @@ fn command(entry: Entry, root: &Path, url: &str, database: Option<&Path>) -> Com
         .env("EVE_OPENAI_BASE_URL", url)
         .env("EVE_OPENAI_REASONING_EFFORT", "none")
         .env("EVE_OPENAI_TIMEOUT_SECONDS", "5")
-        .env("EVE_LLM_RESPONSE_MODE", "complete");
+        .env("EVE_LLM_RESPONSE_MODE", "complete")
+        // 回执分段断言针对自然段规划；按句分条由 segment_test 覆盖。
+        .env("EVE_CHAT_SENTENCE_SPLIT", "false");
     if matches!(entry, Entry::Qq) {
         // 测试中的管理命令使用宿主可信绑定；生产默认权限与普通用户负例不变。
         let bindings = root.join("state/admin-bindings.json");
