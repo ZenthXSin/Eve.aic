@@ -315,9 +315,14 @@ impl HistoryDigests for HistoryDigestService {
                             "上下文压缩模型请求失败；已保存的摘要进度保留，后续对话请求未发出"
                                 .into(),
                         ),
+                        LlmError::Protocol(_) | LlmError::Unsupported(_) => LlmError::Context(
+                            "上下文压缩摘要格式或要点未通过校验；已保存的摘要进度与原始记录保留，后续对话请求未发出".into(),
+                        ),
                         error => error,
                     })?;
-                validate_points(&points, covered).map_err(|e| LlmError::Protocol(e.to_string()))?;
+                validate_points(&points, covered).map_err(|_| LlmError::Context(
+                    "上下文压缩摘要要点未通过校验；已保存的摘要进度与原始记录保留，后续对话请求未发出".into(),
+                ))?;
                 let version = DigestVersion {
                     covered_turns: covered,
                     fingerprint: fingerprint(messages, covered)

@@ -2,6 +2,7 @@
 import json
 import time
 import unittest
+from collections import Counter
 
 import context_compaction_test as compact
 import history_digest_test as digest
@@ -34,12 +35,18 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def exercise(self, stall):
+    def exercise(self, stall, invalid=0):
         self.stall = stall
+        self.remaining_invalid_digests = invalid
+        failed = stall or invalid >= 2
         self.dialogue_calls = 0
         (self.source / "README.md").write_text("中文结果" * 700, encoding="utf8")
         def respond(body):
             if body["messages"][0]["content"].startswith(digest.DIGEST_PROMPT):
+                self.assertEqual(body.get("response_format"), {"type": "json_object"})
+                if self.remaining_invalid_digests:
+                    self.remaining_invalid_digests -= 1
+                    return text_response("我会继续帮你核验文件。")
                 request = json.loads(body["messages"][1]["content"])
                 covered = request["previous_turns"] + len(request["turns"])
                 return text_response(json.dumps({"points":[{"text":"35 次文件核验已执行，保留当前目标并交付结果", "turns":[covered]}]}, ensure_ascii=False))
@@ -52,7 +59,7 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
             self.assertTrue(any("宿主上下文压缩摘要" in (m.get("content") or "") for m in body["messages"]))
             return text_response("压缩后已继续并完成核验")
         self.callback = respond
-        expected = {"contains":["上下文压缩未能完成", "已启动 35 次工具调用"]} if stall else {"expected":"压缩后已继续并完成核验"}
+        expected = {"contains":["上下文压缩未能完成", "已启动 35 次工具调用"]} if failed else {"expected":"压缩后已继续并完成核验"}
         self.run_window(self.send(self.message("compact", "核验文件后继续完成", **expected)), panel=True,
             env_extra={"EVE_CONTEXT_COMPACT_AT_TOKENS":"150000", "EVE_CONTEXT_COMPACT_TO_TOKENS":"100000",
                        "EVE_OPENAI_STREAM_COMPLETIONS":"true", "EVE_OPENAI_TIMEOUT_SECONDS":"1", "EVE_TRACE_DIALOGUE_TIMING":"true",
@@ -66,7 +73,7 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
         self.assertTrue(all(r["stream"] for r in self.digest_requests()))
         self.assertEqual(receipt["state"], "Sent")
         status = self.turn("核验文件后继续完成")["status"]
-        if stall:
+        if failed:
             self.assertEqual(status["failure"]["code"], "Context")
             self.assertEqual(status["failure"]["started_tools"], 35)
         else:
@@ -74,13 +81,25 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
             self.assertEqual(sum(len(m.get("tool_calls", [])) for m in status["messages"]), 35)
         log = self.panel_stderr.read_text()
         self.assertIn('"use_name":"digest"', log)
-        self.assertEqual(self.dialogue_calls, 3 if stall else 4)
+        self.assertEqual(self.dialogue_calls, 3 if failed else 4)
+        if invalid:
+            batches = Counter(r["messages"][1]["content"] for r in self.digest_requests())
+            self.assertEqual(list(batches.values()).count(2), 1, "只有无效摘要所在批次纠错一次")
+            self.assertLessEqual(max(batches.values()), 2, "同一批摘要不无限重试")
+            if failed:
+                self.assertEqual(len(self.digest_requests()), 2)
 
     def test_healthy_digest_stream_outlives_old_total_timeout_and_notifies_once(self):
         self.exercise(False)
 
     def test_stalled_digest_keeps_evidence_and_sends_no_partial_result(self):
         self.exercise(True)
+
+    def test_plain_chat_digest_is_repaired_without_repeating_tools(self):
+        self.exercise(False, invalid=1)
+
+    def test_invalid_digest_after_one_repair_reports_compaction_and_preserves_tools(self):
+        self.exercise(False, invalid=2)
 
 
 if __name__ == "__main__":
