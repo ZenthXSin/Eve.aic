@@ -14,6 +14,7 @@ import threading
 import time
 import traceback
 import unittest
+from fixture_auth import bootstrap_test_admin
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
