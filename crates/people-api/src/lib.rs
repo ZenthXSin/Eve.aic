@@ -1,5 +1,5 @@
 //! 人名称呼目录：标签与宿主身份分离，不提供任何授权能力。
-use eve_plugin_api::PluginResult;
+use eve_plugin_api::{PluginFuture, PluginResult};
 use serde::{Deserialize, Serialize};
 
 pub const PEOPLE_PLUGIN_ID: &str = "eve.people";
@@ -37,12 +37,69 @@ pub struct PersonName {
     pub value: String,
     pub source: NameSource,
 }
+/// 每人至多保存的印象条数。
+pub const MAX_IMPRESSIONS: usize = 12;
+/// 每人至多缓冲的待学原话；攒够 `IMPRESSION_BATCH` 条成批。
+pub const MAX_IMPRESSION_PENDING: usize = 8;
+pub const IMPRESSION_BATCH: usize = 4;
+/// 学习器单批至多返回的印象条数。
+pub const MAX_IMPRESSION_DRAFTS: usize = 3;
+/// 印象正文与原话摘录的字符上限。
+pub const MAX_IMPRESSION_CHARS: usize = 60;
+
+/// 这个人自己说过的事；`quote` 是其原话中的原样摘录，用作来源。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Impression {
+    pub id: String,
+    pub text: String,
+    pub quote: String,
+    pub updated_at_ms: u64,
+}
+
+/// 学习器候选；`replaces` 指向因本批原话而过时的旧印象。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImpressionDraft {
+    pub text: String,
+    pub quote: String,
+    #[serde(default)]
+    pub replaces: Option<String>,
+}
+
+/// 一批待学习的原话及此人现有印象。取出即从缓冲移除，失败或中断不重试。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImpressionBatch {
+    pub id: String,
+    pub participant: String,
+    pub messages: Vec<String>,
+    pub known: Vec<Impression>,
+}
+
+/// 可替换的印象学习器；只看本批原话与现有印象，不调用工具。
+pub trait ImpressionLearner: Send + Sync {
+    fn learn(&self, batch: ImpressionBatch) -> PluginFuture<'_, Vec<ImpressionDraft>>;
+}
+
+pub fn valid_impression_text(value: &str) -> bool {
+    let count = value.chars().count();
+    (1..=MAX_IMPRESSION_CHARS).contains(&count)
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Person {
     pub scope: PersonScope,
     pub name: Option<PersonName>,
     pub revision: u64,
+    /// 只来自此人自己的话；视图只给当前发言者本人的印象。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub impressions: Vec<Impression>,
+    /// 待学原话，只在持久状态中出现，任何视图都不包含。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<String>,
 }
 #[derive(Clone, Serialize)]
 pub struct PeopleView {
@@ -53,5 +110,28 @@ pub struct PeopleView {
 /// 仅可信宿主调用写入；模型只收到当前会话的有界只读视图。
 pub trait PeopleDirectory: Send + Sync {
     fn observe(&self, scope: PersonScope, name: Option<PersonName>) -> PluginResult<()>;
+    /// 当前发言者本人带印象，其他人只有称呼；待学原话不出现在视图中。
     fn view(&self, participant: &str) -> PluginResult<Option<PeopleView>>;
+    /// 缓冲此人一条可能谈及自己的原话；未开启印象学习时忽略。须先 observe 过此人。
+    fn note(&self, _participant: &str, _text: &str) -> PluginResult<()> {
+        Ok(())
+    }
+    fn take_impression_batch(&self) -> PluginResult<Option<ImpressionBatch>> {
+        Ok(None)
+    }
+    /// 核对并保存，返回新增或替换的条数；任一候选不合格时整批拒绝。
+    fn finish_impression_batch(
+        &self,
+        _batch: &ImpressionBatch,
+        _drafts: Vec<ImpressionDraft>,
+        _now_ms: u64,
+    ) -> PluginResult<usize> {
+        Ok(0)
+    }
+    fn impressions(&self, _participant: &str) -> PluginResult<Vec<Impression>> {
+        Ok(vec![])
+    }
+    fn forget_impression(&self, _participant: &str, _id: &str) -> PluginResult<bool> {
+        Ok(false)
+    }
 }

@@ -21,6 +21,7 @@ mod qq_admin;
 mod qq_agenda;
 mod qq_budget;
 mod qq_chat_style;
+mod qq_chat_timing;
 mod qq_clarify;
 mod qq_cognition;
 mod qq_completion;
@@ -29,6 +30,7 @@ mod qq_files;
 mod qq_help;
 mod qq_history_digest;
 mod qq_host_facts;
+mod qq_impressions;
 mod qq_interest;
 mod qq_learning;
 mod qq_learning_commands;
@@ -39,6 +41,7 @@ mod qq_message_judge;
 mod qq_model;
 mod qq_outreach;
 mod qq_people;
+mod qq_phrases;
 mod qq_plan;
 mod qq_practice;
 mod qq_progress;
@@ -394,9 +397,11 @@ pub(crate) async fn install_core_with_pages_and_admin(
         config::dialogue_schema(),
         config::history_schema(),
         qq_history_digest::schema(),
+        qq_phrases::schema(),
         qq_vision::schema(),
         qq_progress::schema(),
         qq_chat_style::schema(),
+        qq_chat_timing::schema(),
         chime::schema(),
         qq_people::schema(),
         qq_memory_continuity::schema(),

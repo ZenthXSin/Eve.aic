@@ -4,10 +4,12 @@
 //! 投递队列先写盘再交给通道；通道回执写回同一条记录。进程在写出前后退出时，记录停在
 //! `Sending`，重启后记为结果未知，绝不自动重发。
 use crate::AppError;
+use eve_config_api::ConfigService;
 use eve_llm_api::{
     Tool, ToolCall, ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolExecutionError,
     ToolFuture, ToolValidationError,
 };
+use eve_llm_openai::OpenAiProvider;
 use eve_plugin_api::PluginError;
 use eve_qqbot_plugin::{
     ImageAttachment, Message, QQ_FILE_CAPTION_MAX_BYTES, QQ_FILE_NAME_MAX_BYTES, QqFileDelivery,
@@ -491,6 +493,204 @@ impl Tool for SendFileTool {
     }
 }
 
+/// 用主模型看当前会话最近一条带附件消息里的图片。模型、端点和凭据都来自同一份主模型配置。
+pub(crate) struct DescribeImageTool {
+    inbox: std::sync::Arc<AttachmentInbox>,
+    settings: std::sync::Arc<dyn ConfigService>,
+    api_key: String,
+}
+
+impl DescribeImageTool {
+    pub(crate) fn new(
+        inbox: std::sync::Arc<AttachmentInbox>,
+        settings: std::sync::Arc<dyn ConfigService>,
+        api_key: String,
+    ) -> Self {
+        Self {
+            inbox,
+            settings,
+            api_key,
+        }
+    }
+    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+    const QUESTION_LIMIT: usize = 500;
+}
+
+fn vision_prompt(question: Option<&str>) -> String {
+    match question.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(question) => question.to_owned(),
+        None => eve_llm_openai::DEFAULT_VISION_PROMPT.to_owned(),
+    }
+}
+
+impl Tool for DescribeImageTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "describe_image".into(),
+            description: "用主模型描述当前会话最近一条带附件消息里的第 index 个图片附件（从 1 起，默认 1）。只解析本条已记录的图片，下载后以 data URL 发给与主模型相同的模型、端点和协议。question 可选，最多 500 字；缺省只做客观描述。返回的是模型描述，不是像素级事实，不能据此声称宿主看见了图片。非图片、越界或下载失败会返回错误，不会假装成功。".into(),
+            argument_schema: json!({
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "minimum": 1, "maximum": 4},
+                    "question": {"type": "string", "maxLength": 500}
+                },
+                "additionalProperties": false
+            }),
+            required_permissions: vec![],
+            concurrency: Some(ToolConcurrency::Serial { scope: "eve.qqbot.attachments".into() }),
+        }
+    }
+
+    fn validate_arguments(&self, value: &Value) -> Result<(), ToolValidationError> {
+        let invalid = |message: &str| ToolValidationError {
+            message: message.into(),
+        };
+        let object = value.as_object().ok_or_else(|| invalid("参数必须是对象"))?;
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "index" | "question"))
+        {
+            return Err(invalid("参数只能包含 index 与 question"));
+        }
+        if object
+            .get("index")
+            .is_some_and(|index| !matches!(index.as_u64(), Some(1..=4)))
+        {
+            return Err(invalid("index 必须是 1 到 4 的整数"));
+        }
+        if let Some(question) = object.get("question") {
+            let Some(text) = question.as_str() else {
+                return Err(invalid("question 必须是字符串"));
+            };
+            if text.chars().count() > DescribeImageTool::QUESTION_LIMIT
+                || text.chars().any(char::is_control)
+            {
+                return Err(invalid("question 必须是不超过 500 字的纯文本"));
+            }
+        }
+        Ok(())
+    }
+
+    fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
+        Box::pin(async move {
+            let scope = context
+                .scope()
+                .ok_or_else(|| failed("只有带用户身份的对话里才能识图"))?;
+            let index = call
+                .arguments
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or(1) as usize;
+            let question = call.arguments.get("question").and_then(Value::as_str);
+            let attachment = self.inbox.attachment(&scope.session_id, index)?;
+            if !attachment.content_type.starts_with("image/") {
+                return Err(failed(format!(
+                    "第 {index} 个附件不是图片（{}），没有发给模型",
+                    attachment.content_type
+                )));
+            }
+            if !(attachment.url.starts_with("https://")
+                && attachment.url.len() <= 4096
+                && !attachment
+                    .url
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace()))
+            {
+                return Err(failed("图片链接不合法，没有下载"));
+            }
+            let response = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(20))
+                .build()
+                .map_err(|_| failed("下载客户端不可用"))?
+                .get(&attachment.url)
+                .send()
+                .await
+                .map_err(|_| failed("图片下载失败，链接可能已过期"))?;
+            if !response.status().is_success() {
+                return Err(failed(format!(
+                    "图片下载被拒绝（HTTP {}）",
+                    response.status().as_u16()
+                )));
+            }
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .map(str::trim)
+                .filter(|value| value.starts_with("image/"))
+                .unwrap_or(attachment.content_type.as_str())
+                .to_owned();
+            if !content_type.starts_with("image/") {
+                return Err(failed(format!(
+                    "下载结果不是图片（{content_type}），没有发给模型"
+                )));
+            }
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|_| failed("图片内容读取失败"))?;
+            if bytes.is_empty() {
+                return Err(failed("图片内容为空，没有发给模型"));
+            }
+            if bytes.len() as u64 > Self::MAX_BYTES {
+                return Err(failed(format!(
+                    "图片超过 {} 字节，没有发给模型",
+                    Self::MAX_BYTES
+                )));
+            }
+            let snapshot = self
+                .settings
+                .snapshot(crate::config::OPENAI_NAMESPACE, 1)
+                .map_err(|error| failed(format!("主模型配置不可用：{error}")))?;
+            let role = crate::config::configured_role(&snapshot)
+                .map_err(|error| failed(format!("主模型配置不可用：{error}")))?;
+            let primary = match role {
+                Some(role) => {
+                    let models = self
+                        .settings
+                        .snapshot(
+                            eve_config_api::MODELS_NAMESPACE,
+                            eve_config_api::MODELS_SCHEMA_VERSION,
+                        )
+                        .map_err(|error| failed(format!("主模型配置不可用：{error}")))?;
+                    let roles = eve_config_api::ModelRolesConfig::try_from(&models)
+                        .map_err(|error| failed(format!("主模型配置不可用：{error}")))?;
+                    Some(
+                        roles
+                            .require(role)
+                            .map_err(|error| failed(format!("主模型配置不可用：{error}")))?
+                            .clone(),
+                    )
+                }
+                None => None,
+            };
+            let config = crate::config::provider_config(&snapshot, primary.as_ref())
+                .map_err(|error| failed(format!("主模型配置不可用：{error}")))?;
+            let model = config.model.clone();
+            let protocol = match config.protocol {
+                eve_llm_openai::OpenAiProtocol::ChatCompletions => "chat",
+                eve_llm_openai::OpenAiProtocol::Responses => "responses",
+            };
+            let provider = OpenAiProvider::new(config, &self.api_key)
+                .map_err(|error| failed(format!("主模型不可用：{error}")))?;
+            let description = provider
+                .describe_image(&vision_prompt(question), &content_type, &bytes)
+                .await
+                .map_err(|error| failed(format!("识图请求失败：{error}")))?;
+            Ok(json!({
+                "description": description,
+                "model": model,
+                "protocol": protocol,
+                "content_type": content_type,
+                "bytes": bytes.len(),
+                "note": "这是主模型对图片的文字描述，不是像素级事实，宿主并没有看见图片。"
+            }))
+        })
+    }
+}
+
 pub(crate) struct ReadAttachmentTool {
     inbox: std::sync::Arc<AttachmentInbox>,
 }
@@ -579,6 +779,95 @@ impl Tool for ReadAttachmentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn call(arguments: Value) -> ToolCall {
+        ToolCall {
+            id: "describe".into(),
+            name: "describe_image".into(),
+            arguments,
+        }
+    }
+
+    fn scope(session: &str) -> ToolExecutionContext {
+        ToolExecutionContext::new().with_scope(Some(eve_llm_api::ContextScope {
+            session_id: session.into(),
+            user_id: "user".into(),
+        }))
+    }
+
+    fn image_message(url: &str, content_type: &str) -> Message {
+        Message {
+            id: "m1".into(),
+            scope: "c2c".into(),
+            target_id: "user".into(),
+            user_id: "user".into(),
+            text: "看图".into(),
+            attachments: vec![ImageAttachment {
+                content_type: content_type.into(),
+                url: url.into(),
+                filename: None,
+            }],
+            quoted: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn describe_image_rejects_non_image_out_of_range_and_illegal_url_without_download() {
+        let inbox = std::sync::Arc::new(AttachmentInbox::new());
+        inbox.record(
+            "session",
+            image_message("https://files.example/a.png", "application/pdf"),
+        );
+        let tool = DescribeImageTool::new(inbox.clone(), unavailable_settings(), "test-key".into());
+        let error = tool
+            .execute(call(json!({"index": 1})), scope("session"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("不是图片"), "{error}");
+
+        let error = tool
+            .execute(call(json!({"index": 2})), scope("session"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("只有 1 个附件"), "{error}");
+
+        inbox.record(
+            "session",
+            image_message("http://files.example/a.png", "image/png"),
+        );
+        let error = tool
+            .execute(call(json!({"question": "这是什么"})), scope("session"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("链接不合法"), "{error}");
+    }
+
+    struct UnavailableSettings;
+    impl eve_config_api::ConfigService for UnavailableSettings {
+        fn begin_request(
+            &self,
+            _: &str,
+            _: u32,
+        ) -> eve_config_api::ConfigResult<eve_config_api::ConfigRequest> {
+            unreachable!("拒绝路径不应读取主模型配置")
+        }
+        fn read_request(
+            &self,
+            _: &eve_config_api::ConfigRequest,
+        ) -> eve_config_api::ConfigResult<eve_config_api::ConfigSnapshot> {
+            unreachable!("拒绝路径不应读取主模型配置")
+        }
+        fn snapshot(
+            &self,
+            _: &str,
+            _: u32,
+        ) -> eve_config_api::ConfigResult<eve_config_api::ConfigSnapshot> {
+            unreachable!("拒绝路径不应读取主模型配置")
+        }
+    }
+    fn unavailable_settings() -> std::sync::Arc<dyn eve_config_api::ConfigService> {
+        std::sync::Arc::new(UnavailableSettings)
+    }
 
     fn outbox() -> (tempfile::TempDir, Outbox) {
         let directory = tempfile::tempdir().expect("temp dir");

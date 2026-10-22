@@ -151,6 +151,44 @@ while True:
         return dict(format_version=1,candidate_sha256=key,candidate_directory=str(directory),
             session_id=self.session,requested_by=self.session,turn_id=1)
 
+    def merged_state(self):
+        path=self.state/'state.json';state=runtime.read_json(path)
+        ledger=json.loads(bytes(state['entries']['eve.channel.qqbot']['receipts.v1']))
+        target=ledger['entries'][0];target['message']['id']='last'
+        first=json.loads(json.dumps(target));first['message'].update(id='first',text='前一句')
+        first.update(state='Merged',merged_into='last',reply=None)
+        ledger.update(version=4,entries=[first,target])
+        sessions=json.loads(bytes(state['entries']['eve.session']['sessions.v1']))
+        sessions['sessions'][self.session]['turns'][0]['input']='前一句\n升级'
+        state['entries']['eve.session']['sessions.v1']=list(json.dumps(sessions).encode())
+        state['entries']['eve.channel.qqbot']['receipts.v1']=list(json.dumps(ledger).encode())
+        runtime.atomic(path,state)
+        return state,ledger
+
+    def test_format_four_merges_match_the_actual_turn_and_bad_links_are_preserved(self):
+        path=self.state/'state.json';state,ledger=self.merged_state()
+        request={'session_id':self.session,'requested_by':self.session,'turn_id':1}
+        self.assertTrue(runtime.delivery_gate(path,request))
+        self.assertEqual(runtime.inherited_receipts(path),frozenset())
+        ledger['entries'][1]['progress']=[{'text':'执行中','state':'Sending'}]
+        state['entries']['eve.channel.qqbot']['receipts.v1']=list(json.dumps(ledger).encode())
+        runtime.atomic(path,state);self.assertFalse(runtime.delivery_gate(path,request))
+        ledger['entries'][1]['progress'][0]['state']='Sent'
+        ledger['entries'][0]['merged_into']='missing'
+        state['entries']['eve.channel.qqbot']['receipts.v1']=list(json.dumps(ledger).encode())
+        runtime.atomic(path,state);before=path.read_bytes()
+        with self.assertRaisesRegex(ValueError,'invalid_merged_receipt'):runtime.delivery_gate(path,request)
+        with self.assertRaisesRegex(ValueError,'invalid_merged_receipt'):runtime.inherited_receipts(path)
+        self.assertEqual(path.read_bytes(),before)
+
+    def test_real_supervisor_accepts_format_four_and_switches_after_combined_turn_delivery(self):
+        self.merged_state();before=(self.state/'state.json').read_bytes()
+        self.launch();request=self.candidate('new')
+        runtime.atomic(self.queue/'request.json',request)
+        self.wait(lambda d:d['result']=='applied')
+        self.assertEqual(self.events.read_text().splitlines(),['old','new'])
+        self.assertEqual((self.state/'state.json').read_bytes(),before)
+
     def launch(self):
         self.log=(self.root/'supervisor.log').open('ab')
         self.process=subprocess.Popen([sys.executable,str(SCRIPT),'--directory',str(self.queue),

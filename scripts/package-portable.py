@@ -121,7 +121,7 @@ def package(target, binary_directory, output_directory):
                 "target": target, "platform_label": label, "rust_version": "1.89.0", "static_crt": windows,
                 "node_version": NODE_VERSION, "node_archive_sha256": pinned_digest,
                 "credentials_included": False, "user_data_included": False, "files_sha256": files,
-                "updater_protocol": 1, "state_schema_generation": 1}
+                "updater_protocol": 1, "state_schema_generation": 2}
     (bundle / "build-info.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     if windows:
         archive = pathlib.Path(shutil.make_archive(str(output_directory / name), "zip", root_dir=output_directory, base_dir=name))

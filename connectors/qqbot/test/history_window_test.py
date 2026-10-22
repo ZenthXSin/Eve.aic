@@ -27,6 +27,11 @@ class HistoryWindowAcceptance(developer.DeveloperAcceptance):
         self.assertEqual(status, 200, saved)
         self.assertEqual(saved["restart_required"], [])
 
+    def chat_request(self, text):
+        # 后台历史摘要请求可能晚于本轮对话到达，按本轮输入取对话请求。
+        return next(r["body"]["messages"] for r in reversed(self.requests)
+                    if r["body"]["messages"][-1].get("content") == text)
+
     def http_status(self, kind, number):
         return 503 if self.requests[-1]["body"]["messages"][-1]["content"] == "失败请求" else None
 
@@ -51,13 +56,13 @@ class HistoryWindowAcceptance(developer.DeveloperAcceptance):
         self.assertTrue(any(m["role"] == "tool" for m in continuing["messages"]))
         self.assertTrue(any("宿主失败记录" in (m.get("content") or "") for m in continuing["messages"]))
         self.assertTrue(any("eve.runtime.history-window" in (m.get("content") or "") for m in continuing["messages"]))
-        last = self.requests[-1]["body"]["messages"]
+        last = self.chat_request("再继续")
         self.assertEqual([m["content"] for m in last if m["role"] == "user"], ["继续", "再继续"])
         before = self.turn("工具轮")
         self.run_window([*self.send(self.message("restart", "重启后")), *self.checkpoint("expand"),
                          *self.send(self.message("restored", "恢复查看"))], panel=True,
                         checkpoints={"expand": lambda: self.save_window(max_turns=16)})
-        restored = self.requests[-1]["body"]["messages"]
+        restored = self.chat_request("恢复查看")
         self.assertIn("旧请求", [m["content"] for m in restored if m["role"] == "user"])
         self.assertEqual(self.turn("工具轮"), before)
         self.assertEqual(sum(len(m.get("tool_calls", [])) for m in restored), 1)
