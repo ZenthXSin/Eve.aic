@@ -492,6 +492,7 @@ class SegmentAcceptance(unittest.TestCase):
         self.assertFalse(self.requests)
 
     def test_foreign_sources_disabled_memory_and_unsupported_feedback_do_not_write(self):
+        self.fixture_admin_users = ("user-1", "user-2", "other")
         self.run_eve([{"send": self.advice_command("no-memory", "/segment suggestions", "需要同时启用")},
                       self.wait_receipt("no-memory", "Sent")])
         source = self.remember_rhythm("回复最多两段。")
