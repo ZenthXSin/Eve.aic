@@ -273,6 +273,16 @@ pub(crate) struct Receipt {
     /// 状态为 Merged 时，统一回复的那条消息 ID。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merged_into: Option<String>,
+    /// 正文发完后附带发出的表情包；失败或中断不重发。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sticker: Option<StickerPart>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StickerPart {
+    /// 宿主表情包库里的本地只读路径。
+    pub path: String,
+    pub state: PartState,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -280,7 +290,8 @@ pub(crate) struct Progress {
     pub text: String,
     pub state: PartState,
 }
-/// 格式 1 不含片段，2 包含分段，3 包含途中进展，4 包含合并的连发消息。旧版本拒绝读取而不是忽略投递记录。
+/// 格式 1 不含片段，2 包含分段，3 包含途中进展，4 包含合并的连发消息，5 包含附带的表情包。
+/// 旧版本拒绝读取而不是忽略投递记录。
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Ledger {
@@ -329,8 +340,20 @@ impl Ledger {
                             PartState::Sending | PartState::Sent | PartState::Failed
                         )
                 })
-                || entry.progress.len() + entry.segments.as_ref().map_or(1, |s| s.parts.len())
+                || entry.progress.len()
+                    + entry.segments.as_ref().map_or(1, |s| s.parts.len())
+                    + usize::from(entry.sticker.is_some())
                     > crate::QQ_MAX_SEGMENTS
+                || entry.sticker.as_ref().is_some_and(|sticker| {
+                    sticker.path.is_empty()
+                        || sticker.path.len() > 4096
+                        || sticker.path.chars().any(char::is_control)
+                        || !matches!(entry.state, ReceiptState::ReplyPending | ReceiptState::Sent | ReceiptState::Failed)
+                        // 正文没有发完时表情包只能还在等待；正文失败时表情包从未写出。
+                        || (entry.state == ReceiptState::ReplyPending && sticker.state != PartState::Pending)
+                        || (entry.state == ReceiptState::Failed
+                            && !matches!(sticker.state, PartState::Pending | PartState::Skipped))
+                })
                 || (entry.state == ReceiptState::Merged) != entry.merged_into.is_some()
                 || (entry.state == ReceiptState::Merged
                     && (entry.reply.is_some()
@@ -355,7 +378,9 @@ impl Ledger {
         Ok(ledger)
     }
     fn format(&self) -> u8 {
-        if self.entries.iter().any(|e| e.merged_into.is_some()) {
+        if self.entries.iter().any(|e| e.sticker.is_some()) {
+            5
+        } else if self.entries.iter().any(|e| e.merged_into.is_some()) {
             4
         } else if self.entries.iter().any(|e| !e.progress.is_empty()) {
             3
@@ -427,6 +452,7 @@ impl Ledger {
                 segments: None,
                 progress: vec![],
                 merged_into: merged.then(|| target.id.clone()),
+                sticker: None,
             });
         }
         let result = (|| {
@@ -460,6 +486,7 @@ impl Ledger {
             segments: None,
             progress: vec![],
             merged_into: None,
+            sticker: None,
         });
         let bytes = self.encode()?;
         // 预留最大回复转义后的大小与片段记录。
@@ -538,6 +565,7 @@ mod tests {
                     .collect(),
             }),
             merged_into: None,
+            sticker: None,
         }
     }
     fn round_trip(entry: Receipt) -> PluginResult<Ledger> {
@@ -546,6 +574,48 @@ mod tests {
             entries: vec![entry],
         };
         Ledger::decode(&ledger.encode()?)
+    }
+
+    #[test]
+    fn stickers_bump_the_format_and_follow_the_text_delivery_state() {
+        let with = |state, sticker| {
+            let mut entry = receipt(state, None);
+            entry.sticker = Some(StickerPart {
+                path: "/state/stickers/blobs/a.png".into(),
+                state: sticker,
+            });
+            round_trip(entry)
+        };
+        assert_eq!(with(ReceiptState::Sent, Sent).unwrap().version, 5);
+        for (state, sticker) in [
+            (ReceiptState::ReplyPending, Pending),
+            (ReceiptState::Sent, Pending),
+            (ReceiptState::Sent, Sending),
+            (ReceiptState::Sent, Failed),
+            (ReceiptState::Failed, Pending),
+            (ReceiptState::Failed, Skipped),
+        ] {
+            assert!(
+                with(state, sticker).is_ok(),
+                "{state:?} {sticker:?} must reload"
+            );
+        }
+        for (state, sticker) in [
+            (ReceiptState::ReplyPending, Sending),
+            (ReceiptState::Failed, Sent),
+            (ReceiptState::Processing, Pending),
+        ] {
+            assert!(
+                with(state, sticker).is_err(),
+                "{state:?} {sticker:?} must be rejected"
+            );
+        }
+        let mut entry = receipt(ReceiptState::Sent, None);
+        entry.sticker = Some(StickerPart {
+            path: String::new(),
+            state: Sent,
+        });
+        assert!(round_trip(entry).is_err());
     }
 
     #[test]

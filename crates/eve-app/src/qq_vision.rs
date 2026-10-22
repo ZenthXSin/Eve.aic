@@ -69,6 +69,8 @@ struct Options {
 pub(crate) struct QqTurnImages {
     pub(crate) inbox: Arc<AttachmentInbox>,
     pub(crate) settings: OnceLock<Arc<dyn ConfigService>>,
+    /// 直接附带的图片下载成功后交给表情包收集；引用消息里的图片不收。
+    pub(crate) stickers: Option<Arc<crate::qq_stickers::Stickers>>,
 }
 
 impl QqTurnImages {
@@ -76,6 +78,7 @@ impl QqTurnImages {
         Self {
             inbox,
             settings: OnceLock::new(),
+            stickers: None,
         }
     }
 
@@ -185,6 +188,7 @@ impl TurnImageSource for QqTurnImages {
                 .enumerate()
                 .map(|(index, a)| (format!("第 {} 张图片", index + 1), a))
                 .collect();
+            let direct = candidates.len();
             if let Some(quoted) = &message.quoted {
                 candidates.extend(
                     quoted
@@ -213,6 +217,11 @@ impl TurnImageSource for QqTurnImages {
                 };
                 match result {
                     Ok(image) => {
+                        if position < direct
+                            && let Some(stickers) = &self.stickers
+                        {
+                            stickers.offer(&image);
+                        }
                         prepared.images.push(image);
                         attached.push(label.clone());
                     }

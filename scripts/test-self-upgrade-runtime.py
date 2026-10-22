@@ -165,6 +165,22 @@ while True:
         runtime.atomic(path,state)
         return state,ledger
 
+    def test_format_five_stickers_hold_the_gate_until_sent_and_bad_shapes_are_rejected(self):
+        path=self.state/'state.json';state,ledger=self.merged_state()
+        request={'session_id':self.session,'requested_by':self.session,'turn_id':1}
+        def save():
+            state['entries']['eve.channel.qqbot']['receipts.v1']=list(json.dumps(ledger).encode())
+            runtime.atomic(path,state)
+        ledger['version']=5;ledger['entries'][1]['sticker']={'path':'/state/stickers/blobs/a.png','state':'Pending'}
+        save();self.assertFalse(runtime.delivery_gate(path,request),'表情包未发完时不算空闲')
+        ledger['entries'][1]['sticker']['state']='Sent'
+        save();self.assertTrue(runtime.delivery_gate(path,request))
+        ledger['entries'][1]['sticker']['state']='Sending';save()
+        self.assertEqual(len(runtime.inherited_receipts(path)),1,'重启前在途的表情包只作历史记录')
+        self.assertTrue(runtime.delivery_gate(path,request,runtime.inherited_receipts(path)) is False)
+        ledger['entries'][1]['sticker']={'path':'','state':'Sent'};save()
+        with self.assertRaisesRegex(ValueError,'invalid_sticker_ledger'):runtime.delivery_gate(path,request)
+
     def test_format_four_merges_match_the_actual_turn_and_bad_links_are_preserved(self):
         path=self.state/'state.json';state,ledger=self.merged_state()
         request={'session_id':self.session,'requested_by':self.session,'turn_id':1}

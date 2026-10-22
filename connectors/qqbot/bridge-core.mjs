@@ -188,6 +188,16 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         { ...(name ? { fileName: name } : {}), ...(caption ? { content: caption } : {}) });
     } finally { activeSends--; }
   }
+  // 表情包作为原消息的被动回复图片发出，同样计入并发上限。
+  async function sendImage(target, localPath) {
+    if (activeSends >= limit) {
+      warn("outbound_limit");
+      throw new Error("outbound_limit");
+    }
+    activeSends++;
+    try { return await bot.sendImage(target, { localPath }); }
+    finally { activeSends--; }
+  }
   const stop = () => {
     if (closed) return;
     closed = true;
@@ -295,7 +305,37 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     } finally {
       item.sending = false;
       item.next = index + 1;
-      if (!ok || item.next === count || item.finished) pending.delete(frame.id);
+      // 最后一段之后还有表情包时保留本条，供随后的 sticker 帧使用同一个被动目标。
+      if (ok && item.next === count && frame.sticker_follows === true && !item.finished) item.awaitSticker = true;
+      else if (!ok || item.next === count || item.finished) pending.delete(frame.id);
+    }
+  }
+  // 正文发完后的一张表情包：只走原消息的被动窗口，过期或失败都不重试、不改走主动消息。
+  async function sticker(frame, item) {
+    if (!item.awaitSticker || item.sending) { warn("invalid_sticker"); return; }
+    const path = frame.path;
+    item.awaitSticker = false;
+    if (typeof path !== "string" || !path || path.length > 4096 || /[\p{Cc}]/u.test(path)) {
+      warn("invalid_sticker");
+      pending.delete(frame.id);
+      send({ type: "delivery", id: frame.id, sticker: true, ok: false });
+      return;
+    }
+    item.sending = true;
+    try {
+      if (now() - item.receivedAt >= PASSIVE_REPLY_WINDOW_MS) {
+        send({ type: "delivery", id: frame.id, sticker: true, ok: false, failure_kind: "passive_window_elapsed" });
+        return;
+      }
+      const result = await sendImage(item.target, path);
+      const id = result?.message?.id ?? result?.upload?.id;
+      send({ type: "delivery", id: frame.id, sticker: true, ok: true,
+        ...(validMessageId(id) ? { message_id: id } : {}) });
+    } catch (err) {
+      send({ type: "delivery", id: frame.id, sticker: true, ok: false, ...diagnostic(err) });
+    } finally {
+      item.sending = false;
+      pending.delete(frame.id);
     }
   }
   // Progress consumes the original passive window, but never completes its reply.
@@ -403,17 +443,22 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       }
       if (frame.type === "segment") { await segment(frame, item); return; }
       if (frame.type === "progress") { await progress(frame, item); return; }
+      if (frame.type === "sticker") { await sticker(frame, item); return; }
       if (frame.type !== "reply") { warn("invalid_command"); return; }
       if (item.sending || item.next !== undefined) { warn("duplicate_reply"); return; }
       // Text Rust accepted but QQ cannot carry (e.g. only U+FEFF) fails this reply
       // explicitly instead of leaving Rust waiting for a receipt that never comes.
       if (!validText(frame.text)) { reject(frame.id); return; }
       item.sending = true;
+      let ok = false;
       try {
         const result = await finalText(item, frame.text);
+        ok = result.ok;
         send({ type: "delivery", id: frame.id, ...result });
       } finally {
-        pending.delete(frame.id);
+        item.sending = false;
+        if (ok && frame.sticker_follows === true && !item.finished) item.awaitSticker = true;
+        else pending.delete(frame.id);
       }
     },
   };

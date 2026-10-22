@@ -155,6 +155,14 @@ if (scenario.script) {
           ...(message.progress_diagnostic ?? {}) });
         continue;
       }
+      if (cmd.type === "sticker") {
+        // 表情包只能跟在正文之后，路径必须是宿主表情包库里实际存在的文件。
+        if (typeof cmd.path !== "string" || !fs.existsSync(cmd.path)) throw new Error("invalid_sticker_path");
+        if (message.expected_sticker === false) throw new Error("unexpected_sticker");
+        commands.push(cmd);
+        send({ type: "delivery", id: cmd.id, sticker: true, ok: !message.fail_sticker, message_id: "sticker-" + cmd.id });
+        continue;
+      }
       if (cmd.type === "reply") {
         if (message.expected_segments && !message.accept_any) throw new Error("expected_segments_got_reply");
         checkReply(cmd, message);
