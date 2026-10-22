@@ -1504,6 +1504,9 @@ async fn run_qqbot_composed(
         // 慢步骤进度：某一步超过 runtime.progress.slow_after_ms 仍未结束时补发一条真实进度。
         let slow_progress = Arc::new(crate::qq_progress::SlowProgress::default());
         plugin = plugin.with_slow_progress(slow_progress.clone());
+        // 连发合并：同一人连发的纯文字在 runtime.chat_timing.debounce_ms 内到达的合成一轮回复。
+        let chat_timing = Arc::new(crate::qq_chat_timing::ChatTiming::default());
+        plugin = plugin.with_debounce(chat_timing.clone());
         // 视觉输入：runtime.vision 开启时把本轮图片作为图像交给模型，像素不写入任何账本。
         let vision = Arc::new(crate::qq_vision::QqTurnImages::new(inbox.clone()));
         bootstrap.image_source = Some(vision.clone());
@@ -1767,6 +1770,9 @@ async fn run_qqbot_composed(
         let budgeted = |category: &str| budget_gate.wrap(observed(category)?, category);
         // 历史摘要服务于对话本身，与主对话一样不计入自主运行预算；用途 digest 单独记健康与输出上限。
         let _ = chat_style
+            .settings
+            .set(qq_tasks::config_service(registry.as_ref())?);
+        let _ = chat_timing
             .settings
             .set(qq_tasks::config_service(registry.as_ref())?);
         let _ = slow_progress

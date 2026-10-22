@@ -245,6 +245,7 @@ pub(crate) struct Services {
     pub participant_observer: Option<Arc<dyn crate::QqParticipantObserver>>,
     pub timing_diagnostics: bool,
     pub slow_progress: Option<Arc<dyn crate::QqSlowProgress>>,
+    pub debounce: Option<Arc<dyn crate::QqDebounce>>,
 }
 /// 宿主接线的主动交流；`push_interval` 为空时不主动私聊。
 pub(crate) struct OutreachHook {
@@ -456,6 +457,15 @@ struct Queued {
     message: Message,
     saved: bool,
     ordinary: bool,
+    received: tokio::time::Instant,
+}
+/// 连发合并的上限：最多几条、从第一条起最多等多久、合并后正文最多多少字节。
+const MAX_MERGED: usize = 5;
+const MAX_MERGE_HOLD: Duration = Duration::from_secs(6);
+const MAX_MERGED_BYTES: usize = 8192;
+/// 能合并的只有尚未落盘的纯文字普通消息；附件、引用和恢复的条目各自成一轮。
+fn mergeable(queued: &Queued) -> bool {
+    queued.ordinary && !queued.saved && queued.message.quoted.is_none()
 }
 struct Routing {
     message: Message,
@@ -716,6 +726,7 @@ pub(crate) async fn run(
         participant_observer,
         timing_diagnostics,
         slow_progress,
+        debounce,
     } = services;
     // 只从已验证的持久回执重建路由身份索引，不重放消息、写记忆或触发工具。
     for entry in ledger
@@ -893,7 +904,7 @@ pub(crate) async fn run(
                     }
                     if action == TrainingCommand::Start {
                         // 保留 /train start 原文进入 Session；上下文提供提问策略。
-                        queue.push_front(Queued { message, saved: true, ordinary: false });
+                        queue.push_front(Queued { message, saved: true, ordinary: false, received: tokio::time::Instant::now() });
                         continue;
                     }
                     let text = match action {
@@ -1211,9 +1222,25 @@ pub(crate) async fn run(
                 deadline = tokio::time::Instant::now() + Duration::from_secs(35);
                 delivery.pause_until = None;
             }
+            let debounce_window = debounce.as_ref().and_then(|policy| policy.window());
             let next_ordinary = queue.iter().position(|queued| {
                 if conversations.wakeup_claimed() { return false; }
                 let Ok(session) = queued.message.session_key(&config.app_id) else { return false; };
+                // 同会话按到达顺序准入：前面的消息还在等待时，后面的不能越过它。
+                if queue.iter().take_while(|q| !std::ptr::eq(*q, queued))
+                    .any(|q| q.message.session_key(&config.app_id).is_ok_and(|k| k == session)) {
+                    return false;
+                }
+                // 等对方把连发的话说完：同会话最后一条仍在窗口内时暂不准入，最多等 MAX_MERGE_HOLD。
+                if let Some(window) = debounce_window && mergeable(queued) {
+                    let run: Vec<&Queued> = queue.iter()
+                        .filter(|q| mergeable(q) && q.message.session_key(&config.app_id).is_ok_and(|k| k == session))
+                        .collect();
+                    let latest = run.iter().map(|q| q.received).max().unwrap_or(queued.received);
+                    if latest.elapsed() < window && queued.received.elapsed() < MAX_MERGE_HOLD && run.len() < MAX_MERGED {
+                        return false;
+                    }
+                }
                 if control.snapshot(&session).ok().flatten().is_some_and(|s| s.phase != eve_control_api::ControlPhase::Finished) { return false; }
 
                 if !natural_message_judgement {
@@ -1231,11 +1258,56 @@ pub(crate) async fn run(
             if let Some(index) = next_ordinary {
                 timing(timing_diagnostics, "admission_begin", None);
                 let queued = queue.remove(index).expect("queued ordinary message");
-                let message = queued.message;
+                let merge = debounce_window.is_some() && mergeable(&queued);
+                let mut message = queued.message;
+                // 回执保存每条消息的原话；合并后的文本只用于本轮会话输入。
+                let mut merged_text = None;
+                if merge {
+                    // 同会话紧随其后的纯文字并入本轮：回复挂在最后一条上，前面的记为 Merged，不单独回复。
+                    let session = message.session_key(&config.app_id)?;
+                    let mut batch = vec![message];
+                    let mut bytes = batch[0].text.len();
+                    let mut cursor = index;
+                    while cursor < queue.len() && batch.len() < MAX_MERGED {
+                        let candidate = &queue[cursor];
+                        if candidate.message.session_key(&config.app_id).is_ok_and(|k| k == session) {
+                            if !mergeable(candidate) || bytes + 1 + candidate.message.text.len() > MAX_MERGED_BYTES {
+                                break;
+                            }
+                            bytes += 1 + candidate.message.text.len();
+                            batch.push(queue.remove(cursor).expect("merged message").message);
+                        } else {
+                            cursor += 1;
+                        }
+                    }
+                    let last = batch.pop().expect("batch keeps the latest message");
+                    let mut texts: Vec<String> = Vec::new();
+                    for earlier in batch {
+                        texts.push(earlier.text.clone());
+                        let id = earlier.id.clone();
+                        if ledger.insert(&ctx, &config.app_id, earlier)? {
+                            let entry = ledger.find(&config.app_id, &id).expect("merged receipt");
+                            ledger.entries[entry].state = ReceiptState::Merged;
+                            ledger.entries[entry].merged_into = Some(last.id.clone());
+                            ledger.save(&ctx)?;
+                        } else {
+                            warn(&ctx, "receipt_limit");
+                        }
+                        finish(&mut stdin, &id).await?;
+                    }
+                    message = last;
+                    if !texts.is_empty() {
+                        texts.push(message.text.clone());
+                        merged_text = Some(texts.join("\n"));
+                    }
+                }
                 if !queued.saved && !ledger.insert(&ctx, &config.app_id, message.clone())? {
                     warn(&ctx, "receipt_limit");
                     finish(&mut stdin, &message.id).await?;
                     continue;
+                }
+                if let Some(text) = merged_text {
+                    message.text = text;
                 }
                 let key = message.session_key(&config.app_id)?;
                 // 先登记会话类型，本轮工具执行时即可读取。
@@ -1251,7 +1323,7 @@ pub(crate) async fn run(
                         let wait = control.wait(&key); active.push(Active { message, key, ordinary: queued.ordinary, wait });
                     }
                     Err(eve_control_api::ControlError::Busy) => {
-                        queue.push_front(Queued { message, saved: true, ordinary: queued.ordinary });
+                        queue.push_front(Queued { message, saved: true, ordinary: queued.ordinary, received: queued.received });
                     }
                     Err(_) => {
                         mark_failed(&mut ledger, &ctx, &config.app_id, &message.id)?;
@@ -1621,7 +1693,7 @@ pub(crate) async fn run(
                                         commands.push_back(CommandMessage { message, private_text: None, target, natural: true, superseded: false, saved: true });
                                     } else {
                                         let ordinary = message.attachments.is_empty();
-                                        queue.push_back(Queued { message, saved: false, ordinary });
+                                        queue.push_back(Queued { message, saved: false, ordinary, received: tokio::time::Instant::now() });
                                     }
                                 }
                             }

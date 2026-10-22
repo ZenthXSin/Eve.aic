@@ -198,6 +198,8 @@ pub(crate) enum ReceiptState {
     ReplyPending,
     Sent,
     Failed,
+    /// 连发的消息并入同一会话稍后的一条，由那一条统一回复；本条不单独回复。
+    Merged,
 }
 /// 单个片段的投递状态。Sending 在写出前保存；重启后表示是否送达不确定，不会补发。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -253,6 +255,7 @@ impl Segments {
                 !rest.is_empty() && tail(PartState::Sending, PartState::Pending)
             }
             ReceiptState::Failed => !rest.is_empty() && tail(PartState::Failed, PartState::Skipped),
+            ReceiptState::Merged => false,
         }
     }
 }
@@ -267,6 +270,9 @@ pub(crate) struct Receipt {
     pub segments: Option<Segments>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub progress: Vec<Progress>,
+    /// 状态为 Merged 时，统一回复的那条消息 ID。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_into: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -274,7 +280,7 @@ pub(crate) struct Progress {
     pub text: String,
     pub state: PartState,
 }
-/// 格式 1 不含片段，2 包含分段，3 包含途中进展。旧版本拒绝读取而不是忽略投递记录。
+/// 格式 1 不含片段，2 包含分段，3 包含途中进展，4 包含合并的连发消息。旧版本拒绝读取而不是忽略投递记录。
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Ledger {
@@ -325,6 +331,18 @@ impl Ledger {
                 })
                 || entry.progress.len() + entry.segments.as_ref().map_or(1, |s| s.parts.len())
                     > crate::QQ_MAX_SEGMENTS
+                || (entry.state == ReceiptState::Merged) != entry.merged_into.is_some()
+                || (entry.state == ReceiptState::Merged
+                    && (entry.reply.is_some()
+                        || entry.segments.is_some()
+                        || !entry.progress.is_empty()))
+                || entry.merged_into.as_ref().is_some_and(|into| {
+                    into == &entry.message.id
+                        || !ledger
+                            .entries
+                            .iter()
+                            .any(|e| e.app_id == entry.app_id && &e.message.id == into)
+                })
             {
                 return Err(corrupt());
             }
@@ -332,7 +350,9 @@ impl Ledger {
         Ok(ledger)
     }
     fn format(&self) -> u8 {
-        if self.entries.iter().any(|e| !e.progress.is_empty()) {
+        if self.entries.iter().any(|e| e.merged_into.is_some()) {
+            4
+        } else if self.entries.iter().any(|e| !e.progress.is_empty()) {
             3
         } else if self.entries.iter().any(|e| e.segments.is_some()) {
             2
@@ -365,6 +385,7 @@ impl Ledger {
             reply: None,
             segments: None,
             progress: vec![],
+            merged_into: None,
         });
         let bytes = self.encode()?;
         // 预留最大回复转义后的大小与片段记录。
@@ -442,6 +463,7 @@ mod tests {
                     })
                     .collect(),
             }),
+            merged_into: None,
         }
     }
     fn round_trip(entry: Receipt) -> PluginResult<Ledger> {
@@ -544,6 +566,33 @@ mod tests {
             let part = &mut entry.segments.as_mut().unwrap().parts[0];
             (part.start, part.end) = (start, end);
             assert!(round_trip(entry).is_err(), "{start}..{end}");
+        }
+    }
+
+    #[test]
+    fn merged_receipts_need_a_live_target_and_bump_the_format() {
+        let mut target = receipt(ReceiptState::Sent, None);
+        target.message.id = "msg-2".into();
+        let mut merged = receipt(ReceiptState::Merged, None);
+        merged.reply = None;
+        merged.merged_into = Some("msg-2".into());
+        let mut ledger = Ledger {
+            version: 0,
+            entries: vec![merged, target],
+        };
+        let bytes = ledger.encode().unwrap();
+        let decoded = Ledger::decode(&bytes).unwrap();
+        assert_eq!(decoded.version, 4);
+        for broken in [
+            |l: &mut Ledger| l.entries[0].merged_into = Some("missing".into()),
+            |l: &mut Ledger| l.entries[0].merged_into = None,
+            |l: &mut Ledger| l.entries[0].reply = Some("回复".into()),
+            |l: &mut Ledger| l.entries[1].merged_into = Some("msg-1".into()),
+        ] {
+            let mut copy = Ledger::decode(&bytes).unwrap();
+            broken(&mut copy);
+            let encoded = serde_json::to_vec(&copy).unwrap();
+            assert!(Ledger::decode(&encoded).is_err());
         }
     }
 }
