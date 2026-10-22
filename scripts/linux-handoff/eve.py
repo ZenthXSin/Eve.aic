@@ -148,15 +148,20 @@ def prepare():
     configure_rust(config, env)
     save(RUN / 'developer.json', config)
     command = mapped(load(exported / 'features-command.json'))
+    # 已从宿主移除的 JSON 预检参数（连同参数值）不再传给新版本。
+    for flag in ('--practice-mindustry-json-rules', '--practice-python'):
+        while flag in command:
+            del command[command.index(flag):command.index(flag) + 2]
     command[0] = str(ROOT / spec['binary'])
     for flag, relative in spec.get('resources', {}).items():
-        command[command.index(flag) + 1] = str(ROOT / relative)
+        if flag in command:
+            command[command.index(flag) + 1] = str(ROOT / relative)
     for index, value in enumerate(command):
         if index and command[index - 1] == '--reference':
             name = value.split('=', 1)[0]
             if name in spec.get('references', {}):
                 command[index] = name + '=' + str(ROOT / spec['references'][name])
-    for flag, name in [('--node', 'node'), ('--practice-python', 'python3'), ('--practice-java', 'java')]:
+    for flag, name in [('--node', 'node'), ('--practice-java', 'java')]:
         if flag in command:
             command[command.index(flag) + 1] = str(ROOT / 'runtime/bin' / name)
     # 迁移路径改写仅作用于配置/版本库元数据；持久会话与原始证据不改写。

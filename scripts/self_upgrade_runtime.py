@@ -73,6 +73,17 @@ def argument(command, name):
     index = command.index(name)
     return command[index + 1]
 
+# 已从宿主移除的启动参数（连同参数值）；旧部署的启动命令带着它们时，候选版本启动前去掉。
+REMOVED_FLAGS = ['--practice-mindustry-json-rules', '--practice-python']
+
+def without_removed_flags(command):
+    result = list(command)
+    for flag in REMOVED_FLAGS:
+        while flag in result:
+            index = result.index(flag)
+            del result[index:index + 2]
+    return result
+
 def replace_argument(command, name, value):
     result = list(command)
     result[result.index(name) + 1] = str(value)
@@ -266,8 +277,7 @@ def execution_command(command):
 
 def command_resources(command):
     paths = set()
-    for flag in ['--agent', '--bridge-script', '--practice-mindustry-server',
-                 '--practice-mindustry-json-rules', '--research-corpus']:
+    for flag in ['--agent', '--bridge-script', '--practice-mindustry-server', '--research-corpus']:
         if flag not in command:
             continue
         path = Path(argument(command, flag))
@@ -439,15 +449,13 @@ class Supervisor:
             else:
                 subprocess.run(['npm', 'ci', '--ignore-scripts', '--no-audit', '--no-fund'], cwd=bridge,
                                check=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        result = [str(binary), *self.command[1:]]
+        result = [str(binary), *without_removed_flags(self.command[1:])]
         replacements = [('--agent', resources / 'AGENT.md')]
         if bundled_bridge: replacements.append(('--bridge-script', bridge / 'bridge.mjs'))
         for flag, value in replacements:
             result = replace_argument(result, flag, value)
-        for flag, relative in [('--practice-mindustry-json-rules', 'vendor/eve-portable-mindustry-json-validator'),
-                               ('--research-corpus', 'vendor/eve-portable-knowledge')]:
-            if flag in result:
-                result = replace_argument(result, flag, resources / relative)
+        if '--research-corpus' in result:
+            result = replace_argument(result, '--research-corpus', resources / 'vendor/eve-portable-knowledge')
         for index, value in enumerate(result[:-1]):
             if value == '--reference' and result[index+1].startswith('eve-portable='):
                 result[index+1] = 'eve-portable=' + str(resources / 'vendor/eve-portable-knowledge')

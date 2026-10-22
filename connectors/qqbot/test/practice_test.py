@@ -11,7 +11,6 @@
 import json
 import os
 import pathlib
-import shutil
 import subprocess
 import sys
 import time
@@ -23,7 +22,6 @@ from memory_test import BINARY, ROOT
 from research_test import WOODWORK
 
 FAKE_SERVER = pathlib.Path(__file__).with_name("fake_mindustry.py")
-RULES = ROOT / "vendor" / "eve-portable-mindustry-json-validator"
 REAL_JAR = os.environ.get("EVE_MINDUSTRY_SERVER_JAR")
 DISABLED = "实践验证未启用。"
 MANIFEST = 'name: "eve-sample"\ndisplayName: "Eve Sample"\nauthor: "Eve"\nversion: "1.0"\nminGameVersion: 146\n'
@@ -255,51 +253,6 @@ class PracticeAcceptance(unittest.TestCase):
         self.run_eve(self.checkpoint("quiet"), checkpoints={"quiet": self.quiet}, research=False)
         self.assertEqual(len(self.kind("draft")), 5, "失败的实践不重试")
         self.assertEqual(len(self.launches()), 3)
-
-    def test_inherited_json_rules_stop_a_bad_draft_before_the_runtime_and_the_fix_is_verified(self):
-        # 第一次把方块尺寸写成 9：继承来的规则在实际运行前报错，这次不启动服务端；草稿器看到 [预检] 问题后改正。
-        def drafted(request):
-            previous = request.get("previous")
-            blocked = previous and any(issue.startswith("[预检] JSON 预检错误") for issue in previous["issues"])
-            draft = mod("Wall")
-            if not blocked:
-                draft["files"][1]["content"] = wall("Wall").replace("size: 1", "size: 9")
-            return draft
-
-        self.draft = drafted
-        rules = ["--practice-mindustry-json-rules", str(RULES), "--practice-python", sys.executable]
-        self.inspect_run(lambda: self.wait_for(self.practiced, "precheck practice did not finish", 20),
-                         prefix=self.send(self.message("casual", MINDUSTRY)), research=False,
-                         max_executions=4, more=rules)
-        [run] = self.practice_runs()
-        self.assertEqual(run["status"], "Verified")
-        self.assertEqual([attempt["outcome"] for attempt in run["attempts"]], ["rejected", "verified"])
-        rejected = run["attempts"][0]
-        self.assertEqual(len(rejected["issues"]), 1, "缺 name 的警告不拦下草稿，只交给真实运行")
-        self.assertTrue(rejected["issues"][0].startswith("[预检] JSON 预检错误"))
-        self.assertIn("Blocks cannot be larger than 6", rejected["issues"][0])
-        self.assertIsNone(rejected["evidence"])
-        self.assertEqual(len(self.launches()), 1, "预检拦下的草稿不启动服务端")
-        self.assertEqual(len(self.kind("draft")), 2)
-
-    def test_tampered_or_unrunnable_json_rules_refuse_startup(self):
-        env = {key: os.environ[key] for key in ("PATH", "SystemRoot", "TEMP", "TMP") if key in os.environ}
-        env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret")
-        tampered = self.work / "tampered-rules"
-        shutil.copytree(RULES, tampered)
-        with open(tampered / "vendor.py", "a", encoding="utf8") as file:
-            file.write("\n# changed\n")
-        base_args = ["--interest-learning", "--practice-mindustry-server", str(self.jar),
-                     "--practice-java", sys.executable, "--practice-java-arg", str(FAKE_SERVER)]
-        for extra, expected in ((["--practice-mindustry-json-rules", str(tampered)], "摘要与固定版本不符"),
-                                (["--practice-mindustry-json-rules", str(RULES),
-                                  "--practice-python", str(self.work / "missing-python")], "无法启动 JSON 预检解释器")):
-            result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
-                                     "--agent", str(ROOT / "AGENT.md"), *base_args, *extra],
-                                    env=env, capture_output=True, text=True, timeout=60)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn(expected, result.stderr)
-        self.assertEqual(self.launches(), [])
 
     def test_interrupted_runtime_is_interrupted_after_restart_without_replay(self):
         self.hold = self.gate("never-released")

@@ -50,10 +50,7 @@ use eve_plan_plugin::{ModelPlanProposer, PlanPlugin};
 use eve_plugin_api::{PluginId, PluginResult, ServiceId};
 use eve_practice_api::{PRACTICE_PLUGIN_ID, PracticeAdmin, PracticeDrafter, PracticeRunner};
 use eve_practice_browser::BrowserRunner;
-use eve_practice_mindustry::{
-    JsonDraftCheck, JsonPrecheck, MindustryJsonRules, MindustryServerRunner, PythonCommand,
-    RuntimeCommand,
-};
+use eve_practice_mindustry::{MindustryServerRunner, RuntimeCommand};
 use eve_practice_plugin::{ModelPracticeDrafter, PracticePlugin, Practitioner};
 use eve_qqbot_plugin::{
     DEFAULT_QQBOT_APP_ID, QQ_SEGMENT_LIMITS, QQ_SEGMENT_POLICY, QQBOT_PLUGIN_ID,
@@ -83,7 +80,7 @@ use tokio::sync::watch;
 pub const QQBOT_HELP: &str = "--sleep 开启可取消的短暂等待与本轮任务状态工具。
 --triggers 开启原会话条件唤醒工具（时间、文件、后台任务、消息匹配、Linux 进程）。
 Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-mindustry-json-rules 目录] [--practice-python 程序] [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--stickers] [--background-tasks] [--no-error-recovery] [--subagents] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--markdown] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--stickers] [--background-tasks] [--no-error-recovery] [--subagents] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--markdown] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -109,7 +106,6 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --reference 名称=目录 装配回复时可查的只读参考资料（至多 8 份，启动时读入内存，目录无效或超过上限拒绝启动）；模型用 search_reference 搜索、read_reference 按行读取并引用“资料名/路径:行号”。目录是 git 检出时记录其提交。--max-tool-rounds 设定单轮回复至多的工具批次（默认 1）；用尽时不让本轮失败，而是不再提供工具，让模型依据已有结果作答并说明未核实的部分。
 /knowledge 兴趣ID 查看研究到的资料：来源原文附网址、抓取时间、版本与逐字引用，未验证推测单独标注；研究不重试、中断不重放。
 --practice-mindustry-server 需同时 --interest-learning；为等待中的学习目标制作只含数据文件的最小 Mindustry 模组，用操作者提供的无头服务端 jar 在全新目录中实际加载并探测内容属性（--practice-java 默认 java），每个目标修订至多一次、每次至多三次尝试，只有实际加载且全部探测通过才记为已验证。
---practice-mindustry-json-rules 需同时 --practice-mindustry-server；用继承自 eve-portable 的 Mindustry JSON 校验规则（目录内 vendor.py 与 eve_modcheck.py，启动时核对摘要并实跑一次，不符或解释器不可用则拒绝启动）在每次实际运行前先查草稿的清单与内容文件，问题以 [预检] 记入尝试、草稿器据此修正、该次不运行；运行中解释器失败时如实记录警告并照常实际运行。--practice-python 指定解释器（默认 python3，Windows 为 python）。
 --practice-browser 需同时 --interest-learning，与 --practice-mindustry-server 二选一；为等待中的学习目标制作只含 HTML 与 CSS 的静态网页，用操作者提供的无头 Chromium 在全新目录中实际打开并探测元素的计算样式与文字（不能含脚本或外部资源，不访问网络），其余规则同上。
 /practice 兴趣ID 查看实践记录：每次尝试的产物文件、运行版本、加载状态、警告与探测期望/实际值；中断不重放。
 --skill-learning 需同时指定实践运行环境（--practice-mindustry-server 或 --practice-browser）；把实际验证通过的实践提炼为参数化技能，宿主核对能逐字还原原产物，再用与原值不同的参数在同一运行环境中实际运行通过后自动启用；后续任务的第一次尝试可选用已启用的技能，调用结果以实际运行证据为准。
@@ -174,10 +170,6 @@ pub struct QqBotOptions {
     /// 启动运行环境的程序；未显式提供时为 java。
     pub practice_java: Option<OsString>,
     pub practice_java_args: Vec<OsString>,
-    /// 继承自 eve-portable 的 Mindustry JSON 校验规则目录；设置后实践在实际运行前先预检。
-    pub practice_json_rules: Option<PathBuf>,
-    /// 运行 JSON 预检的解释器；未显式提供时 Windows 为 python，其他平台为 python3。
-    pub practice_python: Option<OsString>,
     /// 把已验证的实践固化为技能并在后续任务中复用；需要实践验证。
     pub skill_learning: bool,
     /// 把反复出现的问题锻造成运行前检查工具；需要实践验证。
@@ -248,8 +240,6 @@ impl Default for QqBotOptions {
             practice_browser: None,
             practice_java: None,
             practice_java_args: Vec::new(),
-            practice_json_rules: None,
-            practice_python: None,
             skill_learning: false,
             tool_forging: false,
             plans: false,
@@ -405,10 +395,6 @@ impl QqBotOptions {
                 }
                 Some("--practice-java") => options.practice_java = Some(value),
                 Some("--practice-java-arg") => options.practice_java_args.push(value),
-                Some("--practice-mindustry-json-rules") => {
-                    options.practice_json_rules = Some(value.into());
-                }
-                Some("--practice-python") => options.practice_python = Some(value),
                 Some("--research-corpus") => options.research_corpus = Some(value.into()),
                 Some("--reference") => {
                     let (name, directory) = value
@@ -549,14 +535,6 @@ impl QqBotOptions {
             && (options.practice_java.is_some() || !options.practice_java_args.is_empty())
         {
             return Err("--practice-java 需要同时指定 --practice-mindustry-server".into());
-        }
-        if options.practice_json_rules.is_some() && options.practice_server_jar.is_none() {
-            return Err(
-                "--practice-mindustry-json-rules 需要同时指定 --practice-mindustry-server".into(),
-            );
-        }
-        if options.practice_python.is_some() && options.practice_json_rules.is_none() {
-            return Err("--practice-python 需要同时指定 --practice-mindustry-json-rules".into());
         }
         if options.practice_server_jar.is_some() && !options.interest_learning {
             return Err("--practice-mindustry-server 需要同时开启 --interest-learning".into());
@@ -1090,40 +1068,6 @@ async fn run_qqbot_composed(
         } else {
             None
         };
-        // 继承来的 JSON 预检：启动时核对规则摘要并实跑一次最小清单，不符或解释器不可用就拒绝启动。
-        let json_check: Option<Arc<dyn eve_practice_api::DraftCheck>> =
-            match &options.practice_json_rules {
-                Some(directory) => {
-                    let rules = MindustryJsonRules::open(directory)
-                        .map_err(|error| format!("Mindustry JSON 预检规则无效：{error}"))?;
-                    let mut python = PythonCommand::default();
-                    if let Some(program) = &options.practice_python {
-                        python.program = program.clone();
-                    }
-                    let precheck = JsonPrecheck::new(rules, python);
-                    precheck
-                        .probe()
-                        .await
-                        .map_err(|error| format!("Mindustry JSON 预检无法运行：{error}"))?;
-                    Some(Arc::new(JsonDraftCheck::new(
-                        precheck,
-                        Arc::new(|reason: &str| {
-                            eprintln!("JSON 预检本次不可用，照常实际运行：{reason}");
-                        }),
-                    )))
-                }
-                None => None,
-            };
-        // 运行前检查按固定顺序组合：先继承来的 JSON 预检，再锻造的检查；两者都不改写对方的结论。
-        let draft_check = |forged: Option<Arc<dyn eve_practice_api::DraftCheck>>| {
-            let checks: Vec<_> = json_check.iter().cloned().chain(forged).collect();
-            match checks.len() {
-                0 => None,
-                1 => checks.into_iter().next(),
-                _ => Some(Arc::new(eve_practice_api::DraftChecks(checks))
-                    as Arc<dyn eve_practice_api::DraftCheck>),
-            }
-        };
         // 计划账本同样先于通道加载；损坏时拒绝启动并保留原字节，遗留执行中的步骤封存为中断。
         let plans = if options.plans {
             let plugin = PlanPlugin::new("eve")?;
@@ -1504,9 +1448,9 @@ async fn run_qqbot_composed(
             budget: budget_gate.budget(),
             source: research_policy.clone().zip(dialogue_fetcher.clone()),
             runner: practice.is_some().then(|| skill_runner.clone()),
-            draft_check: draft_check(tools.clone().map(|v| {
+            draft_check: tools.clone().map(|v| {
                 Arc::new(ForgedChecks::new(Arc::new(v))) as Arc<dyn eve_practice_api::DraftCheck>
-            })),
+            }),
             workspace_root: options.state_directory.join("dialogue-practice-work"),
             owner_check: None,
         }
@@ -2176,7 +2120,7 @@ async fn run_qqbot_composed(
                 }
                 None => None,
             };
-            if let Some(check) = draft_check(forged_check) {
+            if let Some(check) = forged_check {
                 practitioner = practitioner.with_check(check);
             }
             let practitioner = Arc::new(practitioner);
@@ -3093,48 +3037,6 @@ mod recall_options_tests {
         );
         assert_eq!(options.practice_java, Some(OsString::from("python3")));
         assert_eq!(options.practice_java_args, [OsString::from("fake.py")]);
-    }
-
-    #[test]
-    fn json_precheck_is_explicit_and_only_for_the_mindustry_runtime() {
-        let default = parse(&[]).unwrap();
-        assert!(default.practice_json_rules.is_none() && default.practice_python.is_none());
-        for (args, expected) in [
-            (
-                vec![
-                    "--interest-learning",
-                    "--practice-browser",
-                    "chrome",
-                    "--practice-mindustry-json-rules",
-                    "rules",
-                ],
-                "--practice-mindustry-server",
-            ),
-            (
-                vec![
-                    "--interest-learning",
-                    "--practice-mindustry-server",
-                    "server.jar",
-                    "--practice-python",
-                    "python3",
-                ],
-                "--practice-mindustry-json-rules",
-            ),
-        ] {
-            assert!(parse(&args).unwrap_err().to_string().contains(expected));
-        }
-        let options = parse(&[
-            "--interest-learning",
-            "--practice-mindustry-server",
-            "server.jar",
-            "--practice-mindustry-json-rules",
-            "rules",
-            "--practice-python",
-            "py",
-        ])
-        .unwrap();
-        assert_eq!(options.practice_json_rules, Some(PathBuf::from("rules")));
-        assert_eq!(options.practice_python, Some(OsString::from("py")));
     }
 
     #[test]
