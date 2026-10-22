@@ -80,7 +80,9 @@ def main():
             env.update({"QQBOT_APP_ID": "100000000", "QQBOT_APP_SECRET": "test-app-secret",
                         "QQBOT_SANDBOX": "false", "EVE_OPENAI_API_KEY": "test-model-secret",
                         "EVE_OPENAI_BASE_URL": f"http://127.0.0.1:{server.server_port}",
-                        "EVE_OPENAI_MODEL": "initial-model", "EVE_OPENAI_PROTOCOL": "chat", "EVE_WEB_TOKEN": TOKEN})
+                        "EVE_OPENAI_MODEL": "initial-model", "EVE_OPENAI_PROTOCOL": "chat", "EVE_WEB_TOKEN": TOKEN,
+                        # 本脚本验证自然段分条；按句分条由 segment_test 覆盖。
+                        "EVE_CHAT_SENTENCE_SPLIT": "false"})
 
             def launch(scenario_path):
                 child = subprocess.Popen([str(binary), "--state-dir", str(state), "--self-learning",

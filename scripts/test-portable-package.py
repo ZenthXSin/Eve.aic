@@ -18,6 +18,9 @@ import urllib.request
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# 发行包验收检查自然段分条；按句分条由 segment_test 覆盖。启动器继承该环境变量。
+os.environ["EVE_CHAT_SENTENCE_SPLIT"] = "false"
+
 
 def require(condition, message):
     if not condition:
