@@ -1,6 +1,7 @@
 // 更新定义：只处理公开稳定发行、平台选择与文件清单，不做网络或文件写入。
 export const REPOSITORY = 'ZenthXSin/Eve.aic';
 export const PROTOCOL = 1;
+export const STATE_SCHEMA_GENERATION = 2;
 export const MAX_ARCHIVE_BYTES = 160 * 1024 * 1024;
 export const MAX_UNPACKED_BYTES = 512 * 1024 * 1024;
 export const MAX_FILES = 12000;
@@ -29,7 +30,7 @@ export function safeRelative(value) {
 }
 export function currentManifest(value) {
   if (!value || value.format_version !== 1 || typeof value.platform_label !== 'string' || !Object.hasOwn(TARGETS, value.platform_label) || TARGETS[value.platform_label] !== value.target || !stableVersion(value.version)) throw new Error('当前运行包没有有效稳定发行信息。');
-  if (value.updater_protocol !== PROTOCOL || value.state_schema_generation !== 1) throw new Error('运行包更新协议不兼容。');
+  if (value.updater_protocol !== PROTOCOL || value.state_schema_generation !== STATE_SCHEMA_GENERATION) throw new Error('运行包更新协议不兼容。');
   return value;
 }
 export function updatePlan(release, current) {

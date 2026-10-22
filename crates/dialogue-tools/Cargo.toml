@@ -20,6 +20,7 @@ eve-budget-api = { path = "../budget-api" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+ring.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

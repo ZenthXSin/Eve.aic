@@ -12,7 +12,7 @@ eve-training-api = { path = "../training-api" }
 serde.workspace = true
 serde_json.workspace = true
 ring = "0.17"
+tokio.workspace = true
 
 [dev-dependencies]
 eve-kernel = { path = "../kernel" }
-tokio.workspace = true

@@ -207,7 +207,9 @@ class MemoryAcceptance(unittest.TestCase):
         env.update(QQBOT_APP_SECRET="test-app-secret", QQBOT_APP_ID=app,
             EVE_OPENAI_API_KEY="test-model-secret",
             EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
-            EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
+            EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete",
+                   # 逐条等待回复的场景不涉及连发；合并窗口由 debounce_test 显式开启。
+                   EVE_DEBOUNCE_MS="0")
         env.update(env_extra or {})
         bootstrap_test_admin(self.work / "state", env, app,
                              users=getattr(self, "fixture_admin_users", ("user-1", "user-2")))

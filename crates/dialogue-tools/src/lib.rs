@@ -1,6 +1,7 @@
 //! 对话工具的实现层。只依赖公开契约；身份由本轮宿主范围绑定，不接受模型自报 owner。
 mod execution;
 mod practice;
+mod preference;
 use eve_budget_api::AutonomyBudget;
 use eve_cognition_api::{CognitionAdmin, ReadAccess, Visibility};
 use eve_interest_api::InterestAdmin;
@@ -13,6 +14,7 @@ use eve_practice_api::{DraftCheck, PracticeAdmin, PracticeRunner};
 use eve_skill_api::SkillAdmin;
 use eve_toolforge_api::ToolAdmin;
 pub use execution::{SleepTool, TaskProgressTool};
+pub use preference::{OwnerCheck, PreferenceOwnerCheck, SavePreferenceTool};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -40,6 +42,8 @@ pub struct Services {
     pub runner: Option<Arc<OnceLock<Arc<dyn PracticeRunner>>>>,
     pub draft_check: Option<Arc<dyn DraftCheck>>,
     pub workspace_root: PathBuf,
+    /// 宿主判定当前操作者是否为主人。None 表示没有全局档。
+    pub owner_check: Option<Arc<dyn PreferenceOwnerCheck>>,
 }
 
 #[derive(Clone, Copy)]
@@ -61,7 +65,7 @@ enum Kind {
 
 impl Services {
     /// 只注册已装配的能力；通用目录和对话模型得到的都是窄 Tool 接口。
-    pub fn tools(self) -> Vec<Arc<dyn Tool>> {
+    pub fn tools(self) -> (Vec<Arc<dyn Tool>>, Option<Arc<Services>>) {
         let kinds = [
             (Kind::Memory, self.memory.is_some()),
             (Kind::Interests, self.interests.is_some()),
@@ -83,8 +87,9 @@ impl Services {
                 self.runner.is_some() && self.practice.is_some() && self.cognition.is_some(),
             ),
         ];
+        let save_preference = self.memory.is_some();
         let services = Arc::new(self);
-        kinds
+        let tools: Vec<Arc<dyn Tool>> = kinds
             .into_iter()
             .filter(|(_, enabled)| *enabled)
             .map(|(kind, _)| {
@@ -93,7 +98,8 @@ impl Services {
                     kind,
                 }) as Arc<dyn Tool>
             })
-            .collect()
+            .collect();
+        (tools, save_preference.then_some(services))
     }
 }
 
