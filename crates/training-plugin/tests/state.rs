@@ -59,7 +59,7 @@ async fn reset_rejects_inflight_learning_without_affecting_another_user() {
     for user in [&one, &two] {
         for index in 0..PHRASE_BATCH {
             modes
-                .observe_expression(
+                .observe_user_message(
                     user,
                     &format!("m{index}"),
                     &format!("这游戏yyds{index}，确实确实"),
