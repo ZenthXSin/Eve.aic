@@ -11,7 +11,7 @@ const MAX_BYTES: usize = 1_048_576;
 const MAX_ROWS: usize = 4096;
 const MAX_SCOPES: usize = 256;
 
-fn hash(bytes: &[u8]) -> String {
+pub(crate) fn hash(bytes: &[u8]) -> String {
     digest(&SHA256, bytes)
         .as_ref()
         .iter()
@@ -38,6 +38,12 @@ struct Row {
     casual: bool,
     active: bool,
 }
+/// 新记录的有效样本带回筛选后的正文，供说法学习缓冲；停用时不带正文。
+pub(crate) enum Observed {
+    Unchanged,
+    Recorded(Option<String>),
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Expressions {
@@ -96,7 +102,7 @@ impl Expressions {
         id: &str,
         text: &str,
         enabled: bool,
-    ) -> PluginResult<bool> {
+    ) -> PluginResult<Observed> {
         if id.is_empty()
             || id.len() > 256
             || id.trim() != id
@@ -109,7 +115,7 @@ impl Expressions {
         let body = hash(text.as_bytes());
         if let Some(row) = self.rows.iter().find(|r| r.scope == *scope && r.id == id) {
             return if row.body == body {
-                Ok(false)
+                Ok(Observed::Unchanged)
             } else {
                 Err(error("表达训练消息 ID 冲突；保留状态"))
             };
@@ -138,7 +144,7 @@ impl Expressions {
                 .lines()
                 .any(|line| line.trim_start().starts_with('>'))
         {
-            return Ok(false);
+            return Ok(Observed::Unchanged);
         }
         let scopes: BTreeSet<_> = self
             .rows
@@ -180,7 +186,7 @@ impl Expressions {
                     .any(|w| content.contains(w)),
             active: enabled,
         });
-        Ok(true)
+        Ok(Observed::Recorded(enabled.then(|| content.to_owned())))
     }
     pub(crate) fn reset(&mut self, scope: &ContextScope) -> bool {
         let mut changed = false;

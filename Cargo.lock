@@ -1218,6 +1218,7 @@ version = "0.1.0"
 dependencies = [
  "eve-llm-api",
  "eve-plugin-api",
+ "serde",
 ]
 
 [[package]]
