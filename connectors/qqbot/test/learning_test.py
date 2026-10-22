@@ -187,7 +187,9 @@ class LearningAcceptance(unittest.TestCase):
         env.update(QQBOT_APP_SECRET="test-app-secret", QQBOT_APP_ID=app,
                    EVE_OPENAI_API_KEY="test-model-secret",
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
-                   EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
+                   EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete",
+                   # 分段节奏偏好按自然段规划验收；按句分条见 segment_test。
+                   EVE_CHAT_SENTENCE_SPLIT="false")
         command = [str(BINARY), "--state-dir", str(self.work / "state"),
                    "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
                    "--bridge-arg", str(scenario)]
