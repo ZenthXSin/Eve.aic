@@ -266,6 +266,8 @@ impl TrainingService for StoredModes {
             .as_ref()
             .ok_or_else(|| error("训练服务已停止"))?;
         let ctx = ctx.clone();
+        // 已取出的原话已从盘上移除；重置后也拒绝迟到的模型结果，避免恢复已删除的说法。
+        inner.inflight.retain(|_, owner| owner != scope);
         let mut phrases = inner.phrases.clone();
         if phrases.reset(scope) {
             ctx.state_set(phrases::KEY, phrases.bytes()?)?;

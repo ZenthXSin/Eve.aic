@@ -42,6 +42,60 @@ fn service(registry: &Arc<dyn ServiceRegistry>) -> Arc<dyn TrainingService> {
 }
 
 #[tokio::test]
+async fn reset_rejects_inflight_learning_without_affecting_another_user() {
+    let backends = KernelServices::default();
+    let registry = backends.registry.clone();
+    let kernel = Kernel::with_services(backends);
+    kernel
+        .register(Box::new(
+            TrainingPlugin::new(true).unwrap().with_phrase_learning(),
+        ))
+        .unwrap();
+    let id = PluginId::new(TRAINING_PLUGIN_ID).unwrap();
+    kernel.start(&id).await.unwrap();
+    let modes = service(&registry);
+    let one = scope("group-1", "user-1");
+    let two = scope("group-1", "user-2");
+    for user in [&one, &two] {
+        for index in 0..PHRASE_BATCH {
+            modes
+                .observe_expression(
+                    user,
+                    &format!("m{index}"),
+                    &format!("这游戏yyds{index}，确实确实"),
+                )
+                .unwrap();
+        }
+    }
+    let first = modes.take_phrase_batch(1).unwrap().unwrap();
+    let second = modes.take_phrase_batch(2).unwrap().unwrap();
+    assert_eq!(first.scope, one);
+    assert_eq!(second.scope, two);
+    modes.reset_expression(&one).unwrap();
+    let drafts = vec![PhraseDraft {
+        kind: PhraseKind::Term,
+        text: "yyds".into(),
+        meaning: "永远的神".into(),
+        example: "这游戏yyds".into(),
+    }];
+    assert!(
+        modes
+            .finish_phrase_batch(&first, drafts.clone(), 3)
+            .is_err()
+    );
+    assert_eq!(modes.finish_phrase_batch(&second, drafts, 4).unwrap(), 1);
+    assert!(modes.phrases(&one).unwrap().is_empty());
+    assert_eq!(modes.phrases(&two).unwrap().len(), 1);
+    kernel.stop(&id).await.unwrap();
+    kernel.start(&id).await.unwrap();
+    let restored = service(&registry);
+    assert!(restored.phrases(&one).unwrap().is_empty());
+    assert_eq!(restored.phrases(&two).unwrap().len(), 1);
+    assert!(restored.take_phrase_batch(5).unwrap().is_none());
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
 async fn storage_failure_preserves_mode_and_stopped_handles_fail() {
     let state = Arc::new(FallibleState {
         storage: MemoryStateStore::default(),
