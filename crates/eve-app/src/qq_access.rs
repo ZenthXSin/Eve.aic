@@ -201,6 +201,7 @@ impl QqCommandHandler for GuardedCommands {
             && matches!(
                 head,
                 "/budget"
+                    | "/model"
                     | "/memories"
                     | "/recall"
                     | "/interests"
