@@ -142,12 +142,19 @@ def inherited_receipts(state_path):
     if raw is None:
         return frozenset()
     receipts = json.loads(bytes(raw), object_pairs_hook=unique_object)
-    if receipts['version'] not in (1, 2, 3, 4):
+    if receipts['version'] not in (1, 2, 3, 4, 5):
         raise ValueError('unknown_ledger_version')
     validate_merged_receipts(receipts)
     return frozenset(receipt_fingerprint(r) for r in receipts['entries']
                      if r['state'] in ('Processing', 'ReplyPending')
-                     or any(p.get('state') == 'Sending' for p in r.get('progress', [])))
+                     or any(p.get('state') == 'Sending' for p in r.get('progress', []))
+                     or sticker_in_flight(r))
+
+def sticker_in_flight(receipt):
+    """格式 5 正文发完后附带的表情包：待发或发送中都算在途投递。"""
+    sticker = receipt.get('sticker')
+    return isinstance(sticker, dict) and sticker.get('state') in ('Pending', 'Sending') \
+        and receipt['state'] == 'Sent'
 
 def delivery_gate(state_path, request, inherited=frozenset()):
     """确切申请轮次已完成送达且本次运行空闲；不将历史未知回执当成当前任务。"""
@@ -159,15 +166,23 @@ def delivery_gate(state_path, request, inherited=frozenset()):
         return json.loads(bytes(entries[owner][key]), object_pairs_hook=unique_object)
     sessions = document('eve.session', 'sessions.v1')
     receipts = document('eve.channel.qqbot', 'receipts.v1')
-    if sessions['format_version'] != 1 or receipts['version'] not in (1, 2, 3, 4):
+    if sessions['format_version'] != 1 or receipts['version'] not in (1, 2, 3, 4, 5):
         raise ValueError('unknown_ledger_version')
     validate_merged_receipts(receipts)
     for receipt in receipts['entries']:
         progress = receipt.get('progress', [])
         if not isinstance(progress, list) or len(progress) > 3:
             raise ValueError('invalid_progress_ledger')
-        if progress and receipts['version'] not in (3, 4):
+        if progress and receipts['version'] not in (3, 4, 5):
             raise ValueError('invalid_progress_ledger')
+        sticker = receipt.get('sticker')
+        if sticker is not None and (receipts['version'] != 5 or not isinstance(sticker, dict)
+                                    or set(sticker) != {'path', 'state'}
+                                    or not isinstance(sticker['path'], str) or not sticker['path']
+                                    or sticker['state'] not in ('Pending', 'Sending', 'Sent', 'Failed', 'Skipped')):
+            raise ValueError('invalid_sticker_ledger')
+        if sticker_in_flight(receipt) and receipt_fingerprint(receipt) not in inherited:
+            return False
         for part in progress:
             if (not isinstance(part, dict) or set(part) != {'text', 'state'}
                     or not isinstance(part['text'], str) or not part['text'].strip()
@@ -199,7 +214,7 @@ def delivery_gate(state_path, request, inherited=frozenset()):
         scope = 'qq:' + hashlib.sha256(identity).hexdigest()
         merged_text = '\n'.join([r['message']['text'] for r in receipts['entries']
             if r.get('merged_into') == msg.get('id') and r['app_id'] == receipt['app_id']]
-            + [msg['text']]) if receipts['version'] == 4 else msg['text']
+            + [msg['text']]) if receipts['version'] in (4, 5) else msg['text']
         if receipt['state'] != 'Merged' and scope == request['session_id'] and merged_text == turn['input']:
             matching = receipt
         if receipt['state'] in ('Processing', 'ReplyPending'):
@@ -208,8 +223,8 @@ def delivery_gate(state_path, request, inherited=frozenset()):
                         for s in sessions['sessions'].values() for t in s['turns'])
 
 def validate_merged_receipts(receipts):
-    """格式 4 的合并关系只关联同身份、顺序在后的非合并目标；不得隐藏未决投递。"""
-    if receipts['version'] != 4:
+    """格式 4 起的合并关系只关联同身份、顺序在后的非合并目标；不得隐藏未决投递。"""
+    if receipts['version'] not in (4, 5):
         return
     lookup = {}
     for index, entry in enumerate(receipts['entries']):

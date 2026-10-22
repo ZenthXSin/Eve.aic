@@ -2,8 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Readable, PassThrough } from "node:stream";
 import { createBridge, consume, optionsFromEnv, MAX_FRAME, MAX_MESSAGE_ID_BYTES, MAX_PUSH_BYTES, MAX_SEGMENTS, PASSIVE_REPLY_WINDOW_MS } from "../bridge-core.mjs";
-function fixture({ fail = false, error = null, now, limit = 128, appId = "1904159860", hold = null, fileFail = false } = {}) {
-  const frames = [], sent = [], files = [], handlers = new Map();
+function fixture({ fail = false, error = null, now, limit = 128, appId = "1904159860", hold = null, fileFail = false, imageFail = false } = {}) {
+  const frames = [], sent = [], files = [], images = [], handlers = new Map();
   const bot = {
     appId,
     on: (event, handler) => handlers.set(event, handler),
@@ -13,6 +13,11 @@ function fixture({ fail = false, error = null, now, limit = 128, appId = "190415
       if (hold) await (typeof hold === "function" ? hold(target, text) : hold);
       if (typeof fail === "function" ? fail(sent.length) : fail) throw error ?? new Error("sensitive secret and message");
       return { id: "out-1" };
+    },
+    async sendImage(target, source) {
+      images.push({ target, source });
+      if (imageFail) throw new Error("sensitive secret and message");
+      return { upload: { file_uuid: "uuid-2", file_info: "info-2", ttl: 60 }, message: { id: "image-msg-1" } };
     },
     async sendFile(target, source, opts) {
       files.push({ target, source, opts });
@@ -27,7 +32,7 @@ function fixture({ fail = false, error = null, now, limit = 128, appId = "190415
     groupOpenid: "group-1",
     replyTarget: { scope: kind, targetId: kind === "group" ? "group-1" : "user-1", msgId: id },
   });
-  return { bridge, frames, sent, files, message, handlers };
+  return { bridge, frames, sent, files, images, message, handlers };
 }
 function deferred() {
   let resolve;
@@ -702,4 +707,36 @@ test("失败提醒没有回执时有界返回未知，不重发也不把正文�
     assert.equal(f.frames.at(-1).notice_status, "unknown");
     assert.equal(f.frames.at(-1).ok, false);
   } finally { held.resolve(); }
+});
+
+test("表情包只跟在正文之后走原消息的被动目标，失败、过期或未预告都不发送也不重试", async () => {
+  let clock = 0;
+  const f = fixture({ now: () => clock }); f.message("group");
+  // 没有预告的 sticker 帧不发送。
+  await f.bridge.command({ version: 1, type: "sticker", id: "in-1", path: "/tmp/s.png" });
+  assert.equal(f.images.length, 0);
+  for (let index = 0; index < 2; index++) {
+    await f.bridge.command({ version: 1, type: "segment", id: "in-1", index, count: 2, text: `第 ${index} 段`,
+      ...(index === 1 ? { sticker_follows: true } : {}) });
+  }
+  await f.bridge.command({ version: 1, type: "sticker", id: "in-1", path: "/tmp/s.png" });
+  assert.deepEqual(f.images, [{ target: { scope: "group", targetId: "group-1", msgId: "in-1" }, source: { localPath: "/tmp/s.png" } }]);
+  assert.deepEqual(f.frames.at(-1), { type: "delivery", version: 1, id: "in-1", sticker: true, ok: true, message_id: "image-msg-1" });
+  await f.bridge.command({ version: 1, type: "sticker", id: "in-1", path: "/tmp/s.png" });
+  assert.equal(f.images.length, 1, "同一条回复只发一次");
+
+  const late = fixture({ now: () => clock }); late.message("c2c", "in-2");
+  await late.bridge.command({ version: 1, type: "reply", id: "in-2", text: "正文", sticker_follows: true });
+  clock = PASSIVE_REPLY_WINDOW_MS;
+  await late.bridge.command({ version: 1, type: "sticker", id: "in-2", path: "/tmp/s.png" });
+  assert.equal(late.images.length, 0);
+  assert.equal(late.frames.at(-1).failure_kind, "passive_window_elapsed");
+
+  const failing = fixture({ imageFail: true }); failing.message("c2c", "in-3");
+  await failing.bridge.command({ version: 1, type: "reply", id: "in-3", text: "正文", sticker_follows: true });
+  await failing.bridge.command({ version: 1, type: "sticker", id: "in-3", path: "/tmp/s.png" });
+  assert.equal(failing.frames.at(-1).ok, false);
+  assert.ok(!JSON.stringify(failing.frames.at(-1)).includes("secret"));
+  await failing.bridge.command({ version: 1, type: "sticker", id: "in-3", path: "/tmp/s.png" });
+  assert.equal(failing.images.length, 1);
 });

@@ -83,7 +83,7 @@ use tokio::sync::watch;
 pub const QQBOT_HELP: &str = "--sleep 开启可取消的短暂等待与本轮任务状态工具。
 --triggers 开启原会话条件唤醒工具（时间、文件、后台任务、消息匹配、Linux 进程）。
 Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-mindustry-json-rules 目录] [--practice-python 程序] [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--background-tasks] [--subagents] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--markdown] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-mindustry-json-rules 目录] [--practice-python 程序] [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--stickers] [--background-tasks] [--subagents] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--markdown] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -121,6 +121,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --plans 需同时开启受控研究或实践运行环境；/goal 保存的待办可以请模型建议多步计划（/plan propose 待办ID，每个待办版本至多一次、只建议不执行），确认后（/plan confirm 待办ID）由后台按依赖推进：计划只能使用已开启的受控研究与实践验证，步骤效果按研究与实践账本中的证据判定；/plans [待办ID] 查看进度与证据，/plan withdraw 待办ID 撤销。计划完成不改变待办状态。
 --clarify 需同时开启受控研究或实践运行环境；学习目标在当前版本卡住时（实践尝试用尽仍未验证、运行环境做不了，或只开启研究时没有找到可引用的资料），写一个具体问题，在用户下次私聊时先判断时机，合适才随回复附带，不主动私聊；每个目标版本至多问一次，同一用户默认 24 小时内至多送达一个问题，之后的下一轮私聊记为回复，由兴趣观察照常处理。/clarify 查看，/clarify off|on 关闭或恢复。
 --agenda-context 需同时 --interest-learning；用户私聊时，把 Eve 为这位用户的兴趣在后台做到哪一步（研究、实践、请求澄清，按记录整理）作为低优先级数据交给对话，用户问起时据实回答；只读记录，不改变后台行为。
+--stickers 开启表情包：开启识图时，从用户直接发来的图片里收集候选，经视觉模型审看为表情包后收下（其余删除）；对话中模型可用 send_sticker 按心情挑一张，跟在回复文字后面作为图片发出。runtime.stickers 可分别关闭收集与发送。
 --reminders 开启私聊提醒：用户自然地说“半小时后提醒我喝水”或“明早 9 点提醒我交作业”，模型调用提醒工具记下并如实回复，想取消时直接说；到时先主动私聊一次，发不出去时随用户下一条私聊的回复附带，到期 7 天仍未送达不再投递。没有命令；只在私聊中成立。--reminder-utc-offset 设置本地时区（默认 +08:00）。
 --background-tasks 让 Eve 在对话中把需要多步、较长时间的事派发到后台：执行器可用对话里的工具（不含派发与子代理），按步数预算（工具调用次数，默认 50，runtime.tasks 可调）独立完成，结束后私聊通知派发它的用户，发不出去时随下一条私聊回复附带；用户可以让 Eve 查看或取消任务。重启时执行中的任务记为中断，不自动重跑。
 --subagents 让 Eve 在一轮回复中把可以独立完成的子任务委托给子代理并等它交回结果；子代理同样按步数预算执行，须在 runtime.tasks.subagent_timeout_ms（默认 3 分钟）内完成，不能再委托或派发。
@@ -191,6 +192,7 @@ pub struct QqBotOptions {
     pub agenda_context: bool,
     /// 私聊提醒：模型按用户自然的说法调用提醒工具，到时私聊提醒。
     pub reminders: bool,
+    pub stickers: bool,
     /// 模型可以把多步任务派发到后台执行，结束后私聊通知。
     pub background_tasks: bool,
     /// 模型可以把子任务委托给子代理并在本轮拿回结果。
@@ -254,6 +256,7 @@ impl Default for QqBotOptions {
             clarify: false,
             agenda_context: false,
             reminders: false,
+            stickers: false,
             background_tasks: false,
             subagents: false,
             triggers: false,
@@ -351,6 +354,10 @@ impl QqBotOptions {
             }
             if arg == "--agenda-context" {
                 options.agenda_context = true;
+                continue;
+            }
+            if arg == "--stickers" {
+                options.stickers = true;
                 continue;
             }
             if arg == "--reminders" {
@@ -824,6 +831,7 @@ async fn run_qqbot_composed(
     let mut semantic_queries: Option<Arc<qq_semantic::QueryRecallEmbeddings>> = None;
     let mut summary_background: Option<qq_summary::Background> = None;
     let mut digest_background: Option<crate::qq_history_digest::Background> = None;
+    let mut sticker_background: Option<crate::qq_stickers::Background> = None;
     let mut impression_background: Option<crate::qq_impressions::Background> = None;
     let mut phrase_background: Option<crate::qq_phrases::Background> = None;
     let mut task_background: Option<qq_tasks::Background> = None;
@@ -1516,7 +1524,29 @@ async fn run_qqbot_composed(
         let chat_timing = Arc::new(crate::qq_chat_timing::ChatTiming::default());
         plugin = plugin.with_debounce(chat_timing.clone());
         // 视觉输入：runtime.vision 开启时把本轮图片作为图像交给模型，像素不写入任何账本。
-        let vision = Arc::new(crate::qq_vision::QqTurnImages::new(inbox.clone()));
+        // 表情包：从本轮直接附带的图片里收集候选，审看后由 send_sticker 挑选，随回复正文之后发出。
+        // 库损坏时拒绝启动并保留原文件；不开启时不打开库、不注册工具。
+        let stickers = if options.stickers {
+            let stickers = Arc::new(crate::qq_stickers::Stickers::new(Arc::new(
+                eve_sticker_plugin::FileStickerLibrary::open(
+                    options.state_directory.join("stickers"),
+                )
+                .map_err(|error| format!("表情包库无法打开：{error}"))?,
+            )));
+            plugin = plugin.with_stickers(stickers.clone());
+            bootstrap
+                .tools
+                .push(Arc::new(crate::qq_stickers::SendStickerTool(
+                    stickers.clone(),
+                )));
+            Some(stickers)
+        } else {
+            None
+        };
+        let vision = Arc::new(crate::qq_vision::QqTurnImages {
+            stickers: stickers.clone(),
+            ..crate::qq_vision::QqTurnImages::new(inbox.clone())
+        });
         bootstrap.image_source = Some(vision.clone());
         bootstrap
             .tools
@@ -1821,6 +1851,11 @@ async fn run_qqbot_composed(
         let _ = vision
             .settings
             .set(qq_tasks::config_service(registry.as_ref())?);
+        if let Some(stickers) = &stickers {
+            let _ = stickers
+                .settings
+                .set(qq_tasks::config_service(registry.as_ref())?);
+        }
         let _ = digest_policy
             .settings
             .set(qq_tasks::config_service(registry.as_ref())?);
@@ -1833,6 +1868,15 @@ async fn run_qqbot_composed(
             active_digester,
             digest_policy.clone(),
         ));
+        // 表情包审看：用途 sticker 单独记健康与输出上限；模型需要支持视觉输入。
+        if let Some(stickers) = &stickers {
+            sticker_background = Some(crate::qq_stickers::Background::start(
+                stickers.clone(),
+                Arc::new(eve_sticker_plugin::ModelStickerReviewer::new(observed(
+                    crate::qq_stickers::MODEL_USE,
+                )?)),
+            ));
+        }
         // 人物印象：此人谈及自己的原话攒够一批后学习一次；用途 impression 单独记健康与输出上限。
         let _ = impression_policy
             .settings
@@ -2521,6 +2565,9 @@ async fn run_qqbot_composed(
         if let Some(impressions) = &impression_background {
             impressions.activate();
         }
+        if let Some(stickers) = &sticker_background {
+            stickers.activate();
+        }
         if let Some(phrases) = &phrase_background {
             phrases.activate();
         }
@@ -2597,6 +2644,12 @@ async fn run_qqbot_composed(
                     (
                         impressions.finished(),
                         "印象学习后台已结束；QQ 通道停止准入并保留状态",
+                    )
+                }))
+                .chain(sticker_background.as_ref().map(|stickers| {
+                    (
+                        stickers.finished(),
+                        "表情包审看后台已结束；QQ 通道停止准入并保留状态",
                     )
                 }))
                 .chain(phrase_background.as_ref().map(|phrases| {
@@ -2689,6 +2742,9 @@ async fn run_qqbot_composed(
     if let Some(impressions) = &impression_background {
         impressions.request_stop();
     }
+    if let Some(stickers) = &sticker_background {
+        stickers.request_stop();
+    }
     if let Some(phrases) = &phrase_background {
         phrases.request_stop();
     }
@@ -2720,6 +2776,11 @@ async fn run_qqbot_composed(
     }
     if let Some(impressions) = impression_background
         && let Err(error) = impressions.stop().await
+    {
+        secondary.push(error);
+    }
+    if let Some(stickers) = sticker_background
+        && let Err(error) = stickers.stop().await
     {
         secondary.push(error);
     }

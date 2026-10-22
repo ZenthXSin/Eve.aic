@@ -2,6 +2,8 @@
 members = [
     "crates/trigger-api",
     "crates/trigger-plugin",
+    "crates/sticker-api",
+    "crates/sticker-plugin",
     "crates/chime-api",
     "crates/chime-plugin",
     "crates/people-api",

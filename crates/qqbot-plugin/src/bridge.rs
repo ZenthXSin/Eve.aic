@@ -7,7 +7,10 @@ use crate::{
         OUTREACH_PLANNER, QQ_OUTREACH_JUDGE_TIMEOUT, QQ_OUTREACH_MAX_REPLY_PARTS, QqOutreach,
         QqOutreachMoment, QqOutreachResult, valid_text as valid_outreach_text,
     },
-    state::{Ledger, Message, Part, PartState, Progress, ReceiptState, Segments, valid_message_id},
+    state::{
+        Ledger, Message, Part, PartState, Progress, ReceiptState, Segments, StickerPart,
+        valid_message_id,
+    },
 };
 use eve_control_api::{
     CommitState, ControlEvent, ControlEventSink, ControlFuture, ControlInput, ControlPhase,
@@ -269,6 +272,7 @@ pub(crate) struct Services {
     pub timing_diagnostics: bool,
     pub slow_progress: Option<Arc<dyn crate::QqSlowProgress>>,
     pub debounce: Option<Arc<dyn crate::QqDebounce>>,
+    pub stickers: Option<Arc<dyn crate::QqStickers>>,
 }
 /// 宿主接线的主动交流；`push_interval` 为空时不主动私聊。
 pub(crate) struct OutreachHook {
@@ -530,21 +534,30 @@ struct Delivery {
     pause_until: Option<tokio::time::Instant>,
     /// 随这条被动回复附带的邀请及其片段序号。
     appendix: Option<(String, usize)>,
+    /// 正文发完后等待发表情包的时刻；`sticker_sending` 表示已写出、等回执。
+    sticker_at: Option<tokio::time::Instant>,
+    sticker_sending: bool,
 }
+/// 正文发完到发表情包之间的停顿。
+const STICKER_PAUSE: Duration = Duration::from_millis(800);
 impl Delivery {
     fn segmented(&self) -> bool {
         !self.pauses.is_empty()
     }
     fn awaiting(&self) -> bool {
-        self.pause_until.is_none()
+        self.pause_until.is_none() && self.sticker_at.is_none()
     }
 }
 fn segment_frame(ledger: &Ledger, index: usize, part: usize) -> Value {
     let entry = &ledger.entries[index];
     let reply = entry.reply.as_deref().expect("segmented receipt has reply");
     let parts = &entry.segments.as_ref().expect("segmented receipt").parts;
-    json!({"type":"segment","version":1,"id":entry.message.id,"index":part,
-        "count":parts.len(),"text":&reply[parts[part].start..parts[part].end]})
+    let mut frame = json!({"type":"segment","version":1,"id":entry.message.id,"index":part,
+        "count":parts.len(),"text":&reply[parts[part].start..parts[part].end]});
+    if entry.sticker.is_some() && part + 1 == parts.len() {
+        frame["sticker_follows"] = json!(true);
+    }
+    frame
 }
 enum ReplyGuard {
     // 控制消息的确认仍可用于已取消/阻塞代，但不能用于已被替换的代。
@@ -700,6 +713,9 @@ fn mark_failed(ledger: &mut Ledger, ctx: &PluginContext, app: &str, id: &str) ->
     if let Some(segments) = ledger.entries[index].segments.as_mut() {
         segments.skip_rest();
     }
+    if let Some(sticker) = ledger.entries[index].sticker.as_mut() {
+        sticker.state = PartState::Skipped;
+    }
     ledger.save(ctx)
 }
 async fn finish(stdin: &mut ChildStdin, id: &str) -> PluginResult<()> {
@@ -750,6 +766,7 @@ pub(crate) async fn run(
         timing_diagnostics,
         slow_progress,
         debounce,
+        stickers,
     } = services;
     // 只从已验证的持久回执重建路由身份索引，不重放消息、写记忆或触发工具。
     for entry in ledger
@@ -1191,6 +1208,20 @@ pub(crate) async fn run(
                         Err(_) => warn(&ctx, "outreach_unavailable"),
                     }
                 }
+                // 本轮选好的表情包作为正文之后的图片发出；带邀请时不附带，也要清掉本轮的选择。
+                if let Some(stickers) = &stickers
+                    && matches!(reply.guard, ReplyGuard::Completed(_))
+                    && let Some(path) = stickers.take(&reply.message.session_key(&config.app_id)?) {
+                    let parts = ledger.entries[index].segments.as_ref().map_or(1, |s| s.parts.len());
+                    let path = path.to_string_lossy().into_owned();
+                    if appendix.is_none()
+                        && ledger.entries[index].progress.len() + parts < passive_limit(&reply.message)
+                        && !path.is_empty() && path.len() <= 4096 && !path.chars().any(char::is_control) {
+                        ledger.entries[index].sticker = Some(StickerPart { path, state: PartState::Pending });
+                    } else {
+                        warn(&ctx, "sticker_not_attached");
+                    }
+                }
                 if let Err(error) = ledger.save(&ctx) {
                     if let (Some(hook), Some((id, _))) = (&outreach, &appendix) {
                         report(hook, &ctx, id, QqOutreachResult::NotSent);
@@ -1209,14 +1240,18 @@ pub(crate) async fn run(
                 }
                 let frame = if pauses.is_empty() {
                     let text = single.map_or(reply.text.as_str(), |s| &reply.text[s.start..s.end]);
-                    json!({"type":"reply","version":1,"id":reply.message.id,"text":text})
+                    let mut frame = json!({"type":"reply","version":1,"id":reply.message.id,"text":text});
+                    if ledger.entries[index].sticker.is_some() {
+                        frame["sticker_follows"] = json!(true);
+                    }
+                    frame
                 } else {
                     segment_frame(&ledger, index, 0)
                 };
                 write(&mut stdin, frame).await?;
                 timing(timing_diagnostics, "reply_written", None);
                 deadline = tokio::time::Instant::now() + Duration::from_secs(35);
-                delivering = Some(Delivery { reply, pauses, index: 0, pause_until: None, appendix });
+                delivering = Some(Delivery { reply, pauses, index: 0, pause_until: None, appendix, sticker_at: None, sticker_sending: false });
             }
             // 段间停顿结束后写下一段；路由或命令尚未收尾时先等待，取消或新代可在此关闭剩余片段。
             if let Some(delivery) = delivering.as_mut()
@@ -1246,6 +1281,20 @@ pub(crate) async fn run(
                 write(&mut stdin, segment_frame(&ledger, index, part)).await?;
                 deadline = tokio::time::Instant::now() + Duration::from_secs(35);
                 delivery.pause_until = None;
+            }
+            // 正文发完、停顿结束后发表情包；写出前先记为发送中，中断后不重发。
+            if let Some(delivery) = delivering.as_mut()
+                && delivery.sticker_at.is_some_and(|at| at <= tokio::time::Instant::now()) {
+                let id = delivery.reply.message.id.clone();
+                let index = ledger.find(&config.app_id, &id).expect("inserted receipt");
+                delivery.sticker_at = None;
+                delivery.sticker_sending = true;
+                let sticker = ledger.entries[index].sticker.as_mut().expect("receipt with sticker");
+                sticker.state = PartState::Sending;
+                let path = sticker.path.clone();
+                ledger.save(&ctx)?;
+                write(&mut stdin, json!({"type":"sticker","version":1,"id":id,"path":path})).await?;
+                deadline = tokio::time::Instant::now() + Duration::from_secs(35);
             }
             let debounce_window = debounce.as_ref().and_then(|policy| policy.window());
             let next_ordinary = queue.iter().position(|queued| {
@@ -1416,7 +1465,7 @@ pub(crate) async fn run(
                     replies.push_front(reply);
                 }
                 // 停顿结束时唤醒：每次循环先处理一条待路由命令，命令清空后才写下一段。
-                _ = tokio::time::sleep_until(delivering.as_ref().and_then(|d| d.pause_until).unwrap_or(deadline)),
+                _ = tokio::time::sleep_until(delivering.as_ref().and_then(|d| d.pause_until.or(d.sticker_at)).unwrap_or(deadline)),
                     if delivering.as_ref().is_some_and(|d| !d.awaiting() && !pending_control(&d.reply.message, &routing, &commands)) => {}
                 (index, report) = routed(&mut routing), if !routing.is_empty() => {
                     timing(timing_diagnostics, "routing_completed", None);
@@ -1560,8 +1609,21 @@ pub(crate) async fn run(
                             report(hook, &ctx, current, outreach_result(&frame, ok));
                             pushing = None;
                         }
+                        Some("delivery") if frame.get("sticker").and_then(Value::as_bool) == Some(true) => {
+                            let Some(delivery) = delivering.as_ref().filter(|d| d.sticker_sending) else { warn(&ctx, "unexpected_delivery"); continue; };
+                            if frame.get("id").and_then(Value::as_str) != Some(delivery.reply.message.id.as_str()) {
+                                warn(&ctx, "delivery_id_mismatch"); continue;
+                            }
+                            let Some(ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
+                            let index = ledger.find(&config.app_id, &delivery.reply.message.id).expect("inserted receipt");
+                            ledger.entries[index].sticker.as_mut().expect("receipt with sticker").state =
+                                if ok { PartState::Sent } else { PartState::Failed };
+                            ledger.save(&ctx)?;
+                            if !ok { delivery_log(&ctx, "sticker_failed_no_retry", &frame); }
+                            delivering = None;
+                        }
                         Some("delivery") => {
-                            let Some(delivery) = delivering.as_mut().filter(|d| d.awaiting()) else { warn(&ctx, "unexpected_delivery"); continue; };
+                            let Some(delivery) = delivering.as_mut().filter(|d| d.awaiting() && !d.sticker_sending) else { warn(&ctx, "unexpected_delivery"); continue; };
                             let message = &delivery.reply.message;
                             if frame.get("id").and_then(Value::as_str) != Some(message.id.as_str()) {
                                 warn(&ctx, "delivery_id_mismatch"); continue;
@@ -1620,6 +1682,16 @@ pub(crate) async fn run(
                                 // 确定拒绝（如记忆容量已满）不影响已送达的回复，计数后继续服务。
                                 warn(&ctx, "interaction_not_saved");
                                 status.send_modify(|s| s.interactions_not_saved += 1);
+                            }
+                            // 正文送达后停顿一下再发表情包；正文失败时表情包不再发。
+                            if let Some(sticker) = ledger.entries[index].sticker.as_mut()
+                                && sticker.state == PartState::Pending {
+                                if ok {
+                                    delivery.sticker_at = Some(tokio::time::Instant::now() + STICKER_PAUSE);
+                                    continue;
+                                }
+                                sticker.state = PartState::Skipped;
+                                ledger.save(&ctx)?;
                             }
                             delivering = None;
                         }

@@ -50,6 +50,7 @@ mod qq_reminder;
 mod qq_research;
 mod qq_semantic;
 mod qq_skill;
+mod qq_stickers;
 mod qq_summary;
 mod qq_tasks;
 mod qq_tools;
@@ -401,6 +402,7 @@ pub(crate) async fn install_core_with_pages_and_admin(
         qq_vision::schema(),
         qq_progress::schema(),
         qq_chat_style::schema(),
+        qq_stickers::schema(),
         qq_chat_timing::schema(),
         chime::schema(),
         qq_people::schema(),

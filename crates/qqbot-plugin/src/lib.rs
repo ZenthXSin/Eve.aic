@@ -36,6 +36,12 @@ pub trait QqDebounce: Send + Sync {
     fn window(&self) -> Option<std::time::Duration>;
 }
 
+/// 本条回复要附带的表情包：宿主在本轮对话里选好，通道在回复正文发完后作为图片发出。
+pub trait QqStickers: Send + Sync {
+    /// 取出并清除这个会话本轮选好的表情包本地路径；没有时为 None。
+    fn take(&self, session: &SessionKey) -> Option<std::path::PathBuf>;
+}
+
 /// 收到带附件的消息时通知宿主；只传已校验的消息，不做下载。
 pub trait QqAttachmentObserver: Send + Sync {
     fn observe(&self, session: &SessionKey, message: &Message);
@@ -136,6 +142,7 @@ pub struct QqBotPlugin {
     timing_diagnostics: bool,
     slow_progress: Option<Arc<dyn QqSlowProgress>>,
     debounce: Option<Arc<dyn QqDebounce>>,
+    stickers: Option<Arc<dyn QqStickers>>,
 }
 pub(crate) struct Segmentation {
     pub planner: Arc<dyn SegmentPlanner>,
@@ -172,6 +179,7 @@ impl QqBotPlugin {
             timing_diagnostics: false,
             slow_progress: None,
             debounce: None,
+            stickers: None,
         })
     }
     /// 通道已提交过轮次的会话是私聊还是群聊；只读，供只在私聊中成立的宿主能力判断。
@@ -278,6 +286,10 @@ impl QqBotPlugin {
     }
 
     /// 开启连发合并；未接线时每条消息各自成一轮。
+    pub fn with_stickers(mut self, stickers: Arc<dyn QqStickers>) -> Self {
+        self.stickers = Some(stickers);
+        self
+    }
     pub fn with_debounce(mut self, policy: Arc<dyn QqDebounce>) -> Self {
         self.debounce = Some(policy);
         self
@@ -387,6 +399,7 @@ impl Plugin for QqBotPlugin {
             let timing_diagnostics = self.timing_diagnostics;
             let slow_progress = self.slow_progress.clone();
             let debounce = self.debounce.clone();
+            let stickers = self.stickers.clone();
             let task_ctx = ctx.clone();
             ctx.spawn_task(TaskSpec::new(
                 "QQBot JSONL 通道",
@@ -410,6 +423,7 @@ impl Plugin for QqBotPlugin {
                     let participant_observer = participant_observer.clone();
                     let slow_progress = slow_progress.clone();
                     let debounce = debounce.clone();
+                    let stickers = stickers.clone();
                     let status = status.clone();
                     let ledger = ledger.clone();
                     Box::pin(async move {
@@ -438,6 +452,7 @@ impl Plugin for QqBotPlugin {
                                 timing_diagnostics,
                                 slow_progress,
                                 debounce,
+                                stickers,
                             },
                             ledger,
                             signal,
