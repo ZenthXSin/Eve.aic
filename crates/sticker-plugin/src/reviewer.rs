@@ -47,14 +47,20 @@ pub(crate) fn parse(text: &str) -> Result<StickerReview, LlmError> {
 impl StickerReviewer for ModelStickerReviewer {
     fn review(&self, image: ImageInput) -> LlmFuture<'_, StickerReview> {
         Box::pin(async move {
-            let mut user = ChatMessage::text(ChatRole::User, "判断这张图片。");
+            let mut user = ChatMessage::text(
+                ChatRole::User,
+                format!(
+                    "{}\n现在审看所附图片，只返回上述 JSON 对象。",
+                    system_prompt()
+                ),
+            );
             user.images = vec![image];
             let request = ModelRequest {
                 messages: vec![ChatMessage::text(ChatRole::System, system_prompt()), user],
                 tools: vec![],
             };
             let selection = self.resolver.resolve()?;
-            let response = selection.provider.complete(request).await?;
+            let response = selection.provider.complete_json(request).await?;
             let ModelResponse::Final { text } = response else {
                 return Err(invalid());
             };
