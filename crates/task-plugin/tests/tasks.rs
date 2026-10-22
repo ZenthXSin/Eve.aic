@@ -196,6 +196,29 @@ async fn a_saved_final_result_is_settled_after_restart_without_a_second_executio
 }
 
 #[tokio::test]
+async fn unfinished_recovery_result_still_requires_budget_approval_after_restart() {
+    let world = World::new();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let task = tasks
+        .create(&owner("alice"), spec("等待预算"), "failure:budget", 10)
+        .unwrap();
+    tasks.start(&task.id, 20).unwrap();
+    let mut frame = checkpoint("alice");
+    frame.closing = true;
+    frame.result = Some("已有进度，尚未完成".into());
+    tasks.checkpoint(&task.id, frame, u64::MAX, 30).unwrap();
+    kernel.stop_all().await.unwrap();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let saved = tasks.snapshot().unwrap().get(&task.id).unwrap().clone();
+    assert_eq!(saved.status, TaskStatus::Failed);
+    assert!(saved.result.is_none());
+    assert!(saved.needs_step_approval());
+    assert!(saved.notice_pending());
+    assert_eq!(saved.execution.unwrap().recoveries, 0);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
 async fn invalid_or_cross_scope_checkpoints_never_replace_the_saved_bytes() {
     let world = World::new();
     let (kernel, tasks) = world.open().await.unwrap();

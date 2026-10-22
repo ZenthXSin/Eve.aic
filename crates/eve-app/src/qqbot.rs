@@ -83,7 +83,7 @@ use tokio::sync::watch;
 pub const QQBOT_HELP: &str = "--sleep 开启可取消的短暂等待与本轮任务状态工具。
 --triggers 开启原会话条件唤醒工具（时间、文件、后台任务、消息匹配、Linux 进程）。
 Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-mindustry-json-rules 目录] [--practice-python 程序] [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--stickers] [--background-tasks] [--subagents] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--markdown] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-mindustry-json-rules 目录] [--practice-python 程序] [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--stickers] [--background-tasks] [--no-error-recovery] [--subagents] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--markdown] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -195,6 +195,7 @@ pub struct QqBotOptions {
     pub stickers: bool,
     /// 模型可以把多步任务派发到后台执行，结束后私聊通知。
     pub background_tasks: bool,
+    pub disable_error_recovery: bool,
     /// 模型可以把子任务委托给子代理并在本轮拿回结果。
     pub subagents: bool,
     pub triggers: bool,
@@ -258,6 +259,7 @@ impl Default for QqBotOptions {
             reminders: false,
             stickers: false,
             background_tasks: false,
+            disable_error_recovery: false,
             subagents: false,
             triggers: false,
             sleep: false,
@@ -366,6 +368,10 @@ impl QqBotOptions {
             }
             if arg == "--background-tasks" {
                 options.background_tasks = true;
+                continue;
+            }
+            if arg == "--no-error-recovery" {
+                options.disable_error_recovery = true;
                 continue;
             }
             if arg == "--subagents" {
@@ -1917,12 +1923,32 @@ async fn run_qqbot_composed(
             worker.authorize_with(qq_admin.clone());
             let _ = task_late.worker.set(worker);
         }
-        if let Some(tasks) = &tasks {
+        let failure_recovery = if let Some(tasks) = &tasks {
+            let recovery = Arc::new(crate::qq_failure_recovery::Recovery {
+                tasks: Arc::new(tasks.clone()),
+                sessions: registry
+                    .get(&ServiceId::new(SESSION_SERVICE_ID)?)?
+                    .ok_or("失败恢复所需会话服务缺失")?
+                    .value
+                    .downcast::<SessionServiceHandle>()
+                    .map_err(|_| "失败恢复会话服务类型错误")?
+                    .0
+                    .clone(),
+                settings: qq_tasks::config_service(registry.as_ref())?,
+                authorization: qq_admin.clone(),
+                digests: history_digests.clone(),
+            });
+            if !options.disable_error_recovery {
+                plugin = plugin.with_failure_recovery(recovery.clone());
+            }
             task_background = Some(qq_tasks::Background::start(
                 Arc::new(tasks.clone()),
                 task_late.clone(),
             ));
-        }
+            Some(recovery)
+        } else {
+            None
+        };
         let InterestComponents {
             summarizer,
             observer: interest_observer,
@@ -2294,6 +2320,7 @@ async fn run_qqbot_composed(
                     authorization: qq_admin.clone(),
                 }),
                 Arc::new(crate::qq_people::Commands(people)),
+                Arc::new(crate::qq_failure_recovery::Commands(failure_recovery)),
                 help_commands,
                 commands,
                 memory_commands,
