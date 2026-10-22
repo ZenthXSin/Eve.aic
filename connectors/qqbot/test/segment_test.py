@@ -112,7 +112,8 @@ class SegmentAcceptance(unittest.TestCase):
     def wait_receipt(self, id, state):
         return {"wait_receipt": {"path": str(self.state_path), "id": id, "state": state}}
 
-    def run_eve(self, script, segmented=True, memory=False, training=False, terminate_at=None, success=True):
+    def run_eve(self, script, segmented=True, memory=False, training=False, terminate_at=None, success=True,
+                sentence_split=False):
         self.runs += 1
         events_path = self.work / f"events-{self.runs}.jsonl"
         error_path = self.work / f"error-{self.runs}.txt"
@@ -122,7 +123,9 @@ class SegmentAcceptance(unittest.TestCase):
         env = {key: os.environ[key] for key in ("PATH", "SystemRoot", "TEMP", "TMP") if key in os.environ}
         env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret",
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
-                   EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
+                   EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete",
+                   # 本文件的既有用例验收自然段规划；按句分条单独验收。
+                   EVE_CHAT_SENTENCE_SPLIT="true" if sentence_split else "false")
         bootstrap_test_admin(self.work / "state", env,
                              users=getattr(self, "fixture_admin_users", ("user-1", "user-2")))
         command = [str(BINARY), "--state-dir", str(self.work / "state"), "--agent", str(ROOT / "AGENT.md"),
@@ -200,6 +203,27 @@ class SegmentAcceptance(unittest.TestCase):
         self.assertEqual(len(evidence), 1)
         self.assertEqual(evidence[0]["source"]["assistant_text"], TEXT)
         self.assertEqual(len(self.requests), 1)
+
+    def test_casual_reply_is_split_by_sentence_with_typing_pauses_and_memory_keeps_full_reply(self):
+        parts = ["哈哈，我也觉得。", "他说“今天不去了！明天再说。”", "你怎么看？"]
+        text = "".join(parts)
+        self.run_eve([{"send": self.message("chat", text=text, segments=parts)}, self.wait_receipt("chat", "Sent")],
+                     memory=True, sentence_split=True)
+        segments = self.sent("segment")
+        self.assertEqual([event["text"] for event in segments], parts)
+        for index in (1, 2):
+            pause = min(2500, 300 + 90 * len(parts[index]))
+            self.assertGreaterEqual(segments[index]["at"] - segments[index - 1]["at"], pause - 50)
+        receipt = self.receipt("chat")
+        self.assertEqual((receipt["reply"], receipt["segments"]["planner"]), (text, "chat-v1"))
+        self.assertEqual(self.interactions()[0]["source"]["assistant_text"], text)
+
+    def test_structured_reply_keeps_paragraph_planning_when_sentence_split_is_on(self):
+        parts = ["步骤如下：\n1. 先安装。\n2. 再运行。", "有问题再来找我。"]
+        text = "\n\n".join(parts)
+        self.run_eve([{"send": self.message("list", text=text, segments=parts)}, self.wait_receipt("list", "Sent")],
+                     sentence_split=True)
+        self.assertEqual(self.receipt("list")["segments"]["planner"], "paragraph-v3")
 
     def test_short_replies_and_commands_stay_whole(self):
         short = self.message("short", text="好的，收到。", segments=None)
