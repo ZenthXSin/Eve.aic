@@ -11,7 +11,7 @@ import { unpack } from '../packaging/common/update-archive.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 const base = { format_version: 1, version: 'v1.0.0', platform_label: 'linux-x64', target: TARGETS['linux-x64'],
-  source_commit: 'a'.repeat(40), source_tree: 'b'.repeat(40), updater_protocol: 1, state_schema_generation: 1,
+  source_commit: 'a'.repeat(40), source_tree: 'b'.repeat(40), updater_protocol: 1, state_schema_generation: 2,
   credentials_included: false, user_data_included: false };
 function tree(version = 'v1.1.0', label = 'linux-x64') {
   const extension = label.startsWith('windows-') ? '.exe' : '';
@@ -130,7 +130,7 @@ test('拒绝 tar 符号链接和 ZIP 特殊文件', () => {
 test('清单拒绝用户数据、大小写冲突和状态代际不兼容', () => {
   const { manifest, files } = tree(), plan = { version: manifest.version, target: manifest.target, label: manifest.platform_label };
   for (const mutated of [
-    { ...manifest, state_schema_generation: 2 }, { ...manifest, updater_protocol: 2 },
+    { ...manifest, state_schema_generation: 1 }, { ...manifest, state_schema_generation: 3 }, { ...manifest, updater_protocol: 2 },
     { ...manifest, source_commit: ['a'.repeat(40)] },
     { ...manifest, files_sha256: { ...manifest.files_sha256, 'config.json': digest('private') } },
     { ...manifest, files_sha256: { ...manifest.files_sha256, 'agent.md': digest('collision') } },

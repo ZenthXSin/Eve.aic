@@ -10,6 +10,7 @@ use std::time::Duration;
 
 pub use embeddings::OpenAiEmbeddings;
 pub use timeouts::StreamTimeoutPolicy;
+pub use vision::DEFAULT_VISION_PROMPT;
 
 mod chat;
 mod chat_stream;
@@ -19,6 +20,7 @@ mod stream;
 mod strict_json;
 mod timeouts;
 mod timing;
+mod vision;
 mod wire;
 
 /// 显式选择线协议；不根据模型名猜测，也不在失败时切换协议。
@@ -189,6 +191,60 @@ impl OpenAiProvider {
     pub fn with_streamed_completions(mut self) -> Self {
         self.streamed_completions = true;
         self
+    }
+
+    /// 用同一份主模型配置发一次识图请求。图片只以 data URL 放进本次请求体，不进入对话历史。
+    pub async fn describe_image(
+        &self,
+        prompt: &str,
+        media_type: &str,
+        image: &[u8],
+    ) -> Result<String, LlmError> {
+        let body = vision::encode_vision_request(
+            &self.config.model,
+            self.config.protocol,
+            prompt,
+            media_type,
+            image,
+            self.config.reasoning_effort.as_deref(),
+            self.config.max_output_tokens,
+        )?;
+        let response = self
+            .client
+            .post(self.endpoint.clone())
+            .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
+            .json(&body)
+            .timeout(self.config.request_timeout)
+            .send()
+            .await
+            .map_err(transport_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(LlmError::ProviderFailed(
+                ProviderFailure::http(status.as_u16())
+                    .unwrap_or(ProviderFailure::new(ProviderFailureKind::UnexpectedStatus)),
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|n| n > self.config.max_response_bytes as u64)
+        {
+            return Err(failed(ProviderFailureKind::ResponseTooLarge));
+        }
+        let bytes = response.bytes().await.map_err(transport_error)?;
+        if bytes.len() > self.config.max_response_bytes {
+            return Err(failed(ProviderFailureKind::ResponseTooLarge));
+        }
+        let decoded = match self.config.protocol {
+            OpenAiProtocol::Responses => wire::decode_response(&bytes)?,
+            OpenAiProtocol::ChatCompletions => chat::decode_response(&bytes)?,
+        };
+        match decoded {
+            ModelResponse::Final { text } => Ok(text),
+            ModelResponse::ToolCalls { .. } => {
+                Err(LlmError::Protocol("识图回复不能是工具调用".into()))
+            }
+        }
     }
 
     /// 显式装配流式分阶段期限；非流式请求仍沿用 OpenAiConfig.request_timeout。

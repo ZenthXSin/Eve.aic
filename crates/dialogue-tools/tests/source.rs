@@ -54,7 +54,7 @@ fn tool(foreign: bool) -> (Arc<dyn Tool>, Arc<AtomicUsize>) {
         )),
         ..Services::default()
     };
-    (services.tools().remove(0), calls)
+    (services.tools().0.remove(0), calls)
 }
 fn call(arguments: Value) -> ToolCall {
     ToolCall {
@@ -65,7 +65,7 @@ fn call(arguments: Value) -> ToolCall {
 }
 #[tokio::test]
 async fn scope_extra_identity_and_out_of_policy_urls_never_fetch() {
-    assert!(Services::default().tools().is_empty());
+    assert!(Services::default().tools().0.is_empty());
     let (tool, calls) = tool(false);
     assert!(
         tool.execute(

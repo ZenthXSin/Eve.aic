@@ -35,6 +35,29 @@ use tokio::{
     sync::{mpsc, watch},
 };
 
+/// /train words 的回复：按学到次数列出编号、词语或场合、含义与原话摘录。
+fn phrase_list(phrases: &[eve_training_api::LearnedPhrase]) -> String {
+    if phrases.is_empty() {
+        return "本会话还没有学到说法；训练开启后，每攒够一批你的原话会学习一次。".into();
+    }
+    let mut text = format!("本会话从你的原话里学到 {} 条说法：", phrases.len());
+    for p in phrases.iter().take(20) {
+        let kind = match p.kind {
+            eve_training_api::PhraseKind::Term => "词语",
+            eve_training_api::PhraseKind::Expression => "表达",
+        };
+        text.push_str(&format!(
+            "\n{} {kind}「{}」：{}（原话：“{}”，学到 {} 次）",
+            p.id, p.text, p.meaning, p.example, p.uses
+        ));
+    }
+    if phrases.len() > 20 {
+        text.push_str("\n……其余按次数较少未列出。");
+    }
+    text.push_str("\n不需要的用 /train forget 编号 删除。");
+    text
+}
+
 fn failure(code: &str) -> PluginError {
     PluginError::Task(code.into())
 }
@@ -245,6 +268,7 @@ pub(crate) struct Services {
     pub participant_observer: Option<Arc<dyn crate::QqParticipantObserver>>,
     pub timing_diagnostics: bool,
     pub slow_progress: Option<Arc<dyn crate::QqSlowProgress>>,
+    pub debounce: Option<Arc<dyn crate::QqDebounce>>,
 }
 /// 宿主接线的主动交流；`push_interval` 为空时不主动私聊。
 pub(crate) struct OutreachHook {
@@ -456,6 +480,15 @@ struct Queued {
     message: Message,
     saved: bool,
     ordinary: bool,
+    received: tokio::time::Instant,
+}
+/// 连发合并的上限：最多几条、从第一条起最多等多久、合并后正文最多多少字节。
+const MAX_MERGED: usize = 5;
+const MAX_MERGE_HOLD: Duration = Duration::from_secs(6);
+const MAX_MERGED_BYTES: usize = 8192;
+/// 能合并的只有尚未落盘的纯文字普通消息；附件、引用和恢复的条目各自成一轮。
+fn mergeable(queued: &Queued) -> bool {
+    queued.ordinary && !queued.saved && queued.message.quoted.is_none()
 }
 struct Routing {
     message: Message,
@@ -716,6 +749,7 @@ pub(crate) async fn run(
         participant_observer,
         timing_diagnostics,
         slow_progress,
+        debounce,
     } = services;
     // 只从已验证的持久回执重建路由身份索引，不重放消息、写记忆或触发工具。
     for entry in ledger
@@ -893,18 +927,20 @@ pub(crate) async fn run(
                     }
                     if action == TrainingCommand::Start {
                         // 保留 /train start 原文进入 Session；上下文提供提问策略。
-                        queue.push_front(Queued { message, saved: true, ordinary: false });
+                        queue.push_front(Queued { message, saved: true, ordinary: false, received: tokio::time::Instant::now() });
                         continue;
                     }
-                    let text = match action {
+                    let text = match &action {
                         TrainingCommand::Stop => "已结束当前会话的主动提问训练，已完成记录保留；普通聊天仍可继续。".into(),
                         TrainingCommand::Status => if training.enabled(&scope)? { "当前会话：主动提问训练已开启。" } else { "当前会话：主动提问训练已关闭。" }.into(),
                         TrainingCommand::Stats => match training.expression_snapshot(&scope)? {
                             Some(s) => format!("本会话已学习 {} 条有效用户表达：字数中位数 {}，短消息 {}%，单段消息 {}%。{}当前要求始终优先；这是本地表达统计。", s.samples, s.median_chars, s.short_percent, s.single_paragraph_percent, if s.samples < 8 { "不足 8 条，暂不采用本会话统计。" } else { "" }),
                             None => "本会话暂无有效表达样本；训练开启后会从普通交流中学习。".into(),
                         },
-                        TrainingCommand::Reset => { training.reset_expression(&scope)?; "已重置本会话的表达统计，原始聊天记录保留；旧消息不会再次计入，可继续从新消息学习。".into() },
-                        TrainingCommand::Help => "训练命令：/train start 开始；/train stop 停止采集和主动训练；/train status 查看开关；/train stats 查看表达统计；/train reset 重置本会话统计。".into(),
+                        TrainingCommand::Reset => { training.reset_expression(&scope)?; "已重置本会话的表达统计和学到的说法，原始聊天记录保留；旧消息不会再次计入，可继续从新消息学习。".into() },
+                        TrainingCommand::Words => phrase_list(&training.phrases(&scope)?),
+                        TrainingCommand::Forget(id) => if training.forget_phrase(&scope, id)? { format!("已删除说法 {id}，之后不再参考。") } else { format!("本会话没有说法 {id}；用 /train words 查看编号。") },
+                        TrainingCommand::Help => "训练命令：/train start 开始；/train stop 停止采集和主动训练；/train status 查看开关；/train stats 查看表达统计；/train words 查看学到的说法；/train forget 编号 删除一条说法；/train reset 重置本会话统计和说法。".into(),
                         TrainingCommand::Start => unreachable!(),
                     };
                     replies.push_back(Reply { message, text, guard: ReplyGuard::NoTask, interaction: None, invite: None });
@@ -1211,9 +1247,25 @@ pub(crate) async fn run(
                 deadline = tokio::time::Instant::now() + Duration::from_secs(35);
                 delivery.pause_until = None;
             }
+            let debounce_window = debounce.as_ref().and_then(|policy| policy.window());
             let next_ordinary = queue.iter().position(|queued| {
                 if conversations.wakeup_claimed() { return false; }
                 let Ok(session) = queued.message.session_key(&config.app_id) else { return false; };
+                // 同会话按到达顺序准入：前面的消息还在等待时，后面的不能越过它。
+                if queue.iter().take_while(|q| !std::ptr::eq(*q, queued))
+                    .any(|q| q.message.session_key(&config.app_id).is_ok_and(|k| k == session)) {
+                    return false;
+                }
+                // 等对方把连发的话说完：同会话最后一条仍在窗口内时暂不准入，最多等 MAX_MERGE_HOLD。
+                if let Some(window) = debounce_window && mergeable(queued) {
+                    let run: Vec<&Queued> = queue.iter()
+                        .filter(|q| mergeable(q) && q.message.session_key(&config.app_id).is_ok_and(|k| k == session))
+                        .collect();
+                    let latest = run.iter().map(|q| q.received).max().unwrap_or(queued.received);
+                    if latest.elapsed() < window && queued.received.elapsed() < MAX_MERGE_HOLD && run.len() < MAX_MERGED {
+                        return false;
+                    }
+                }
                 if control.snapshot(&session).ok().flatten().is_some_and(|s| s.phase != eve_control_api::ControlPhase::Finished) { return false; }
 
                 if !natural_message_judgement {
@@ -1231,11 +1283,55 @@ pub(crate) async fn run(
             if let Some(index) = next_ordinary {
                 timing(timing_diagnostics, "admission_begin", None);
                 let queued = queue.remove(index).expect("queued ordinary message");
-                let message = queued.message;
-                if !queued.saved && !ledger.insert(&ctx, &config.app_id, message.clone())? {
+                let merge = debounce_window.is_some() && mergeable(&queued);
+                let mut saved = queued.saved;
+                let mut message = queued.message;
+                // 回执保存每条消息的原话；合并后的文本只用于本轮会话输入。
+                let mut merged_text = None;
+                if merge {
+                    // 同会话紧随其后的纯文字并入本轮：回复挂在最后一条上，前面的记为 Merged，不单独回复。
+                    let session = message.session_key(&config.app_id)?;
+                    let mut batch = vec![message];
+                    let mut bytes = batch[0].text.len();
+                    let mut cursor = index;
+                    while cursor < queue.len() && batch.len() < MAX_MERGED {
+                        let candidate = &queue[cursor];
+                        if candidate.message.session_key(&config.app_id).is_ok_and(|k| k == session) {
+                            if !mergeable(candidate) || bytes + 1 + candidate.message.text.len() > MAX_MERGED_BYTES {
+                                break;
+                            }
+                            bytes += 1 + candidate.message.text.len();
+                            batch.push(queue.remove(cursor).expect("merged message").message);
+                        } else {
+                            cursor += 1;
+                        }
+                    }
+                    if batch.len() > 1 {
+                        if !ledger.insert_merged(&ctx, &config.app_id, &batch)? {
+                            return Err(PluginError::State("QQBot 回执容量不足，连发合并未提交".into()));
+                        }
+                        saved = true;
+                    }
+                    let last = batch.pop().expect("batch keeps the latest message");
+                    let mut texts: Vec<String> = Vec::new();
+                    for earlier in batch {
+                        texts.push(earlier.text.clone());
+                        let id = earlier.id.clone();
+                        finish(&mut stdin, &id).await?;
+                    }
+                    message = last;
+                    if !texts.is_empty() {
+                        texts.push(message.text.clone());
+                        merged_text = Some(texts.join("\n"));
+                    }
+                }
+                if !saved && !ledger.insert(&ctx, &config.app_id, message.clone())? {
                     warn(&ctx, "receipt_limit");
                     finish(&mut stdin, &message.id).await?;
                     continue;
+                }
+                if let Some(text) = merged_text {
+                    message.text = text;
                 }
                 let key = message.session_key(&config.app_id)?;
                 // 先登记会话类型，本轮工具执行时即可读取。
@@ -1251,7 +1347,7 @@ pub(crate) async fn run(
                         let wait = control.wait(&key); active.push(Active { message, key, ordinary: queued.ordinary, wait });
                     }
                     Err(eve_control_api::ControlError::Busy) => {
-                        queue.push_front(Queued { message, saved: true, ordinary: queued.ordinary });
+                        queue.push_front(Queued { message, saved: true, ordinary: queued.ordinary, received: queued.received });
                     }
                     Err(_) => {
                         mark_failed(&mut ledger, &ctx, &config.app_id, &message.id)?;
@@ -1621,7 +1717,7 @@ pub(crate) async fn run(
                                         commands.push_back(CommandMessage { message, private_text: None, target, natural: true, superseded: false, saved: true });
                                     } else {
                                         let ordinary = message.attachments.is_empty();
-                                        queue.push_back(Queued { message, saved: false, ordinary });
+                                        queue.push_back(Queued { message, saved: false, ordinary, received: tokio::time::Instant::now() });
                                     }
                                 }
                             }

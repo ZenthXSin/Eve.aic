@@ -824,6 +824,7 @@ async fn run_qqbot_composed(
     let mut semantic_queries: Option<Arc<qq_semantic::QueryRecallEmbeddings>> = None;
     let mut summary_background: Option<qq_summary::Background> = None;
     let mut digest_background: Option<crate::qq_history_digest::Background> = None;
+    let mut phrase_background: Option<crate::qq_phrases::Background> = None;
     let mut task_background: Option<qq_tasks::Background> = None;
     let mut trigger_background: Option<qq_triggers::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
@@ -917,6 +918,7 @@ async fn run_qqbot_composed(
         bootstrap.health = Some(model_health.clone());
         // 历史窗口省略较早轮次时用摘要代替；摘要是派生数据，原始会话历史完整保留。
         let digest_policy = Arc::new(crate::qq_history_digest::Policy::default());
+        let phrase_policy = Arc::new(crate::qq_phrases::Policy::default());
         let history_digests = Arc::new(eve_history_digest::HistoryDigestService::new(
             eve_history_digest::DigestStore::open(options.state_directory.join("history-digest"))?,
             Box::new(crate::qq_history_digest::SharedPolicy(
@@ -956,7 +958,9 @@ async fn run_qqbot_composed(
             plugin
         };
 
-        kernel.register(Box::new(TrainingPlugin::new(options.training)?))?;
+        kernel.register(Box::new(
+            TrainingPlugin::new(options.training)?.with_phrase_learning(),
+        ))?;
         kernel.start(&PluginId::new(TRAINING_PLUGIN_ID)?).await?;
         // 分段设置先于模型与通道加载；损坏或版本不兼容时在这里拒绝启动并保留原字节。
         let segment_preferences: Option<Arc<dyn SegmentPreferences>> = if options.segmented {
@@ -1488,9 +1492,11 @@ async fn run_qqbot_composed(
                 Arc::new(ForgedChecks::new(Arc::new(v))) as Arc<dyn eve_practice_api::DraftCheck>
             })),
             workspace_root: options.state_directory.join("dialogue-practice-work"),
+            owner_check: None,
         }
         .tools();
-        bootstrap.tools.extend(dialogue_tools);
+        let (dialogue_registered, preference_services) = dialogue_tools;
+        bootstrap.tools.extend(dialogue_registered);
         // 文件发送默认开启：发件目录固定在状态目录下，模型只能报文件名，路径由宿主解析。
         let outbox = Arc::new(crate::qq_files::Outbox::open(
             options.state_directory.join("qq-outbox"),
@@ -1504,12 +1510,35 @@ async fn run_qqbot_composed(
         // 慢步骤进度：某一步超过 runtime.progress.slow_after_ms 仍未结束时补发一条真实进度。
         let slow_progress = Arc::new(crate::qq_progress::SlowProgress::default());
         plugin = plugin.with_slow_progress(slow_progress.clone());
+        // 连发合并：同一人连发的纯文字在 runtime.chat_timing.debounce_ms 内到达的合成一轮回复。
+        let chat_timing = Arc::new(crate::qq_chat_timing::ChatTiming::default());
+        plugin = plugin.with_debounce(chat_timing.clone());
         // 视觉输入：runtime.vision 开启时把本轮图片作为图像交给模型，像素不写入任何账本。
         let vision = Arc::new(crate::qq_vision::QqTurnImages::new(inbox.clone()));
         bootstrap.image_source = Some(vision.clone());
         bootstrap
             .tools
-            .push(Arc::new(crate::qq_files::ReadAttachmentTool::new(inbox)));
+            .push(Arc::new(crate::qq_files::ReadAttachmentTool::new(
+                inbox.clone(),
+            )));
+        if let Some(entry) = registry
+            .get(&ServiceId::new(CONFIG_SERVICE_ID)?)
+            .map_err(|error| format!("识图配置服务不可用：{error}"))?
+        {
+            let vision_settings = entry
+                .value
+                .downcast::<ConfigServiceHandle>()
+                .map_err(|_| "识图配置服务类型错误")?
+                .0
+                .clone();
+            bootstrap
+                .tools
+                .push(Arc::new(crate::qq_files::DescribeImageTool::new(
+                    inbox,
+                    vision_settings,
+                    bootstrap.api_key.clone(),
+                )));
+        }
         let raw = Arc::new(crate::qq_files::RawInbox::new());
         plugin = plugin.with_raw_observer(raw.clone());
         bootstrap
@@ -1573,6 +1602,18 @@ async fn run_qqbot_composed(
             &options.state_directory,
             Some(qq_admin.clone()),
         )?;
+        if let Some(services) = preference_services {
+            let mut services = (*services).clone();
+            let admin = qq_admin.clone();
+            services.owner_check = Some(Arc::new(eve_dialogue_tools::OwnerCheck(
+                move |scope: &eve_llm_api::ContextScope| admin.is_owner(scope),
+            )));
+            bootstrap
+                .tools
+                .push(Arc::new(eve_dialogue_tools::SavePreferenceTool {
+                    services: Arc::new(services),
+                }));
+        }
         for tool in &mut bootstrap.tools {
             *tool = Arc::new(crate::qq_access::GuardedTool {
                 inner: tool.clone(),
@@ -1769,6 +1810,9 @@ async fn run_qqbot_composed(
         let _ = chat_style
             .settings
             .set(qq_tasks::config_service(registry.as_ref())?);
+        let _ = chat_timing
+            .settings
+            .set(qq_tasks::config_service(registry.as_ref())?);
         let _ = slow_progress
             .settings
             .set(qq_tasks::config_service(registry.as_ref())?);
@@ -1786,6 +1830,17 @@ async fn run_qqbot_composed(
             history_digests.clone(),
             active_digester,
             digest_policy.clone(),
+        ));
+        // 说法学习：训练中的会话攒够一批原话后学习一次；用途 phrase 单独记健康与输出上限。
+        let _ = phrase_policy
+            .settings
+            .set(qq_tasks::config_service(registry.as_ref())?);
+        phrase_background = Some(crate::qq_phrases::Background::start(
+            training.0.clone(),
+            Arc::new(eve_training_plugin::ModelPhraseLearner::new(observed(
+                crate::qq_phrases::MODEL_USE,
+            )?)),
+            phrase_policy.clone(),
         ));
         // 后台任务与子代理共用执行器：用途 task 单独记健康与输出上限，不计入自主运行预算。
         if tasks.is_some() || options.subagents {
@@ -2450,6 +2505,9 @@ async fn run_qqbot_composed(
         if let Some(digests) = &digest_background {
             digests.activate();
         }
+        if let Some(phrases) = &phrase_background {
+            phrases.activate();
+        }
         if let Some(tasks) = &task_background {
             tasks.activate();
         }
@@ -2517,6 +2575,12 @@ async fn run_qqbot_composed(
                     (
                         digests.finished(),
                         "历史摘要后台已结束；QQ 通道停止准入并保留状态",
+                    )
+                }))
+                .chain(phrase_background.as_ref().map(|phrases| {
+                    (
+                        phrases.finished(),
+                        "说法学习后台已结束；QQ 通道停止准入并保留状态",
                     )
                 }))
                 .chain(trigger_background.as_ref().map(|triggers| {
@@ -2600,6 +2664,9 @@ async fn run_qqbot_composed(
     if let Some(digests) = &digest_background {
         digests.request_stop();
     }
+    if let Some(phrases) = &phrase_background {
+        phrases.request_stop();
+    }
     if let Some(triggers) = &trigger_background {
         triggers.request_stop();
     }
@@ -2623,6 +2690,11 @@ async fn run_qqbot_composed(
     }
     if let Some(digests) = digest_background
         && let Err(error) = digests.stop().await
+    {
+        secondary.push(error);
+    }
+    if let Some(phrases) = phrase_background
+        && let Err(error) = phrases.stop().await
     {
         secondary.push(error);
     }

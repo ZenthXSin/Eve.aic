@@ -142,8 +142,9 @@ def inherited_receipts(state_path):
     if raw is None:
         return frozenset()
     receipts = json.loads(bytes(raw), object_pairs_hook=unique_object)
-    if receipts['version'] not in (1, 2, 3):
+    if receipts['version'] not in (1, 2, 3, 4):
         raise ValueError('unknown_ledger_version')
+    validate_merged_receipts(receipts)
     return frozenset(receipt_fingerprint(r) for r in receipts['entries']
                      if r['state'] in ('Processing', 'ReplyPending')
                      or any(p.get('state') == 'Sending' for p in r.get('progress', [])))
@@ -158,13 +159,14 @@ def delivery_gate(state_path, request, inherited=frozenset()):
         return json.loads(bytes(entries[owner][key]), object_pairs_hook=unique_object)
     sessions = document('eve.session', 'sessions.v1')
     receipts = document('eve.channel.qqbot', 'receipts.v1')
-    if sessions['format_version'] != 1 or receipts['version'] not in (1, 2, 3):
+    if sessions['format_version'] != 1 or receipts['version'] not in (1, 2, 3, 4):
         raise ValueError('unknown_ledger_version')
+    validate_merged_receipts(receipts)
     for receipt in receipts['entries']:
         progress = receipt.get('progress', [])
         if not isinstance(progress, list) or len(progress) > 3:
             raise ValueError('invalid_progress_ledger')
-        if progress and receipts['version'] != 3:
+        if progress and receipts['version'] not in (3, 4):
             raise ValueError('invalid_progress_ledger')
         for part in progress:
             if (not isinstance(part, dict) or set(part) != {'text', 'state'}
@@ -195,12 +197,42 @@ def delivery_gate(state_path, request, inherited=frozenset()):
         identity = json.dumps([receipt['app_id'], msg['scope'], msg['target_id'], msg['user_id']],
                               ensure_ascii=False, separators=(',', ':')).encode()
         scope = 'qq:' + hashlib.sha256(identity).hexdigest()
-        if scope == request['session_id'] and msg['text'] == turn['input']:
+        merged_text = '\n'.join([r['message']['text'] for r in receipts['entries']
+            if r.get('merged_into') == msg.get('id') and r['app_id'] == receipt['app_id']]
+            + [msg['text']]) if receipts['version'] == 4 else msg['text']
+        if receipt['state'] != 'Merged' and scope == request['session_id'] and merged_text == turn['input']:
             matching = receipt
         if receipt['state'] in ('Processing', 'ReplyPending'):
             return False
     return bool(matching and matching['state'] == 'Sent' and matching.get('reply') == reply) and all(t['status']['state'] != 'Pending'
                         for s in sessions['sessions'].values() for t in s['turns'])
+
+def validate_merged_receipts(receipts):
+    """格式 4 的合并关系只关联同身份、顺序在后的非合并目标；不得隐藏未决投递。"""
+    if receipts['version'] != 4:
+        return
+    lookup = {}
+    for index, entry in enumerate(receipts['entries']):
+        message = entry['message']
+        identity = (entry['app_id'], message.get('id'))
+        if not isinstance(identity[1], str) or not identity[1] or identity in lookup:
+            raise ValueError('invalid_merged_receipt')
+        lookup[identity] = (index, entry)
+    for index, entry in enumerate(receipts['entries']):
+        into = entry.get('merged_into')
+        if entry['state'] != 'Merged':
+            if into is not None:
+                raise ValueError('invalid_merged_receipt')
+            continue
+        if not isinstance(into, str):
+            raise ValueError('invalid_merged_receipt')
+        target = lookup.get((entry['app_id'], into))
+        if (not target or target[0] <= index or target[1]['state'] == 'Merged'
+                or any(entry['message'][key] != target[1]['message'][key]
+                       for key in ('scope', 'target_id', 'user_id'))
+                or entry.get('reply') is not None or entry.get('segments') is not None
+                or entry.get('progress')):
+            raise ValueError('invalid_merged_receipt')
 
 def execution_command(command):
     """Linux 便携包可选的私有动态加载器；逻辑命令和候选摘要保持原样。"""

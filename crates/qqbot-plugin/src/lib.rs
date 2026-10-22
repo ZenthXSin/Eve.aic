@@ -30,6 +30,12 @@ pub trait QqSlowProgress: Send + Sync {
     fn after(&self) -> Option<std::time::Duration>;
 }
 
+/// 连发消息的等待窗口：同一会话里同一人连发的纯文字，在窗口内到达的合成一轮回复。
+/// 返回 None 表示关闭；每次准入时读取，可热修改。
+pub trait QqDebounce: Send + Sync {
+    fn window(&self) -> Option<std::time::Duration>;
+}
+
 /// 收到带附件的消息时通知宿主；只传已校验的消息，不做下载。
 pub trait QqAttachmentObserver: Send + Sync {
     fn observe(&self, session: &SessionKey, message: &Message);
@@ -129,6 +135,7 @@ pub struct QqBotPlugin {
     participant_observer: Option<Arc<dyn QqParticipantObserver>>,
     timing_diagnostics: bool,
     slow_progress: Option<Arc<dyn QqSlowProgress>>,
+    debounce: Option<Arc<dyn QqDebounce>>,
 }
 pub(crate) struct Segmentation {
     pub planner: Arc<dyn SegmentPlanner>,
@@ -164,6 +171,7 @@ impl QqBotPlugin {
             participant_observer: None,
             timing_diagnostics: false,
             slow_progress: None,
+            debounce: None,
         })
     }
     /// 通道已提交过轮次的会话是私聊还是群聊；只读，供只在私聊中成立的宿主能力判断。
@@ -266,6 +274,12 @@ impl QqBotPlugin {
     /// 开启慢步骤进度；与工具里程碑进度共用每轮至多 3 条进度和被动回复配额。未接线时不发。
     pub fn with_slow_progress(mut self, policy: Arc<dyn QqSlowProgress>) -> Self {
         self.slow_progress = Some(policy);
+        self
+    }
+
+    /// 开启连发合并；未接线时每条消息各自成一轮。
+    pub fn with_debounce(mut self, policy: Arc<dyn QqDebounce>) -> Self {
+        self.debounce = Some(policy);
         self
     }
 
@@ -372,6 +386,7 @@ impl Plugin for QqBotPlugin {
             let participant_observer = self.participant_observer.clone();
             let timing_diagnostics = self.timing_diagnostics;
             let slow_progress = self.slow_progress.clone();
+            let debounce = self.debounce.clone();
             let task_ctx = ctx.clone();
             ctx.spawn_task(TaskSpec::new(
                 "QQBot JSONL 通道",
@@ -394,6 +409,7 @@ impl Plugin for QqBotPlugin {
                     let conversations = conversations.clone();
                     let participant_observer = participant_observer.clone();
                     let slow_progress = slow_progress.clone();
+                    let debounce = debounce.clone();
                     let status = status.clone();
                     let ledger = ledger.clone();
                     Box::pin(async move {
@@ -421,6 +437,7 @@ impl Plugin for QqBotPlugin {
                                 participant_observer,
                                 timing_diagnostics,
                                 slow_progress,
+                                debounce,
                             },
                             ledger,
                             signal,
