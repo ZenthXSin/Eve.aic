@@ -15,7 +15,7 @@ on:
         type: string
         default: ""
       practice:
-        description: 实践运行环境（mindustry 为真实 Mindustry v160.7 服务端加 JSON 预检；browser 为无头 Chrome 网页）
+        description: 实践运行环境（mindustry 为真实 Mindustry v160.7 服务端；browser 为无头 Chrome 网页）
         type: choice
         options: [mindustry, browser]
         default: mindustry
@@ -169,7 +169,7 @@ jobs:
           EVE_LLM_RESPONSE_MODE: complete
         run: |
           if [ "$PRACTICE" = mindustry ]; then
-            practice=(--practice-mindustry-server "$RUNNER_TEMP/server-release.jar" --practice-mindustry-json-rules vendor/eve-portable-mindustry-json-validator)
+            practice=(--practice-mindustry-server "$RUNNER_TEMP/server-release.jar")
           else
             practice=(--practice-browser "$(command -v google-chrome)")
           fi

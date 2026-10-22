@@ -14,7 +14,7 @@
 | `sandbox` | 关闭 | 打开后连接 QQ 沙箱，测试用户和群须在开放平台的沙箱范围内 |
 | `seconds` | 21300 | 60 至 21300；从网关就绪开始计时 |
 | `continue_run_id` | 空 | 接着某次已结束的全功能体验运行的状态继续；留空则全新开始 |
-| `practice` | `mindustry` | 实践运行环境：`mindustry` 用校验过摘要的 Mindustry v160.7 无头服务端，并先跑继承的 JSON 预检；`browser` 用无头 Chrome 做网页实践 |
+| `practice` | `mindustry` | 实践运行环境：`mindustry` 用校验过摘要的 Mindustry v160.7 无头服务端；`browser` 用无头 Chrome 做网页实践 |
 | `reasoning_effort` | `high` | 主模型推理强度：high、medium、low，none 为关闭 |
 | `research_sources` | 继承资料的 `mindustry/`、`mod-making-guide/` 与 Mindustry 模组 Wiki | 受控研究入口，空格分隔，至多 8 个；可写 https 地址或 `eve-corpus://eve-portable/` 下的资料目录；留空则不做受控研究 |
 

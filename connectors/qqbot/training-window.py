@@ -31,14 +31,14 @@ SCOPES = {"training": "主动提问、用户表达统计与交流证据采集；
 
 
 def host_command(binary, state_dir, profile="training", browser=None, research_sources=(),
-                 mindustry_jar=None, json_rules=None, corpus=None, references=()):
+                 mindustry_jar=None, corpus=None, references=()):
     if profile == "training":
-        if browser or research_sources or mindustry_jar or json_rules or corpus or references:
+        if browser or research_sources or mindustry_jar or corpus or references:
             raise ValueError("training_profile_extra")
         extra = ["--training"]
     elif profile == "full":
-        # 实践运行环境二选一：Mindustry 无头服务端（可加继承来的 JSON 预检）或无头浏览器。
-        if bool(browser) == bool(mindustry_jar) or (json_rules and not mindustry_jar):
+        # 实践运行环境二选一：Mindustry 无头服务端或无头浏览器。
+        if bool(browser) == bool(mindustry_jar):
             raise ValueError("full_profile_runtime")
         if len(research_sources) > MAX_RESEARCH_SOURCES or len(set(research_sources)) != len(research_sources):
             raise ValueError("full_profile_research_sources")
@@ -48,8 +48,6 @@ def host_command(binary, state_dir, profile="training", browser=None, research_s
         extra = list(FULL_PROFILE)
         if mindustry_jar:
             extra += ["--practice-mindustry-server", str(mindustry_jar)]
-            if json_rules:
-                extra += ["--practice-mindustry-json-rules", str(json_rules)]
         else:
             extra += ["--practice-browser", str(browser)]
         if corpus:
@@ -321,7 +319,6 @@ def main():
     parser.add_argument("--profile", choices=sorted(SUMMARY_TITLES), default="training")
     parser.add_argument("--practice-browser", type=Path, help="全功能体验的无头 Chromium/Chrome 程序")
     parser.add_argument("--practice-mindustry-server", type=Path, help="全功能体验的 Mindustry 无头服务端 jar")
-    parser.add_argument("--practice-mindustry-json-rules", type=Path, help="继承来的 Mindustry JSON 预检规则目录")
     parser.add_argument("--research-corpus", type=Path, help="随仓库提供的本地资料目录")
     parser.add_argument("--research-source", action="append", default=[], help="全功能体验的受控研究入口页，可重复至多 8 个")
     parser.add_argument("--reference", action="append", default=[], help="全功能体验回复时可查的参考资料，名称=目录，可重复至多 8 个")
@@ -372,7 +369,7 @@ def main():
             raise ValueError("missing_root")
         password()  # 启动前确认能保存训练结果。
         command = host_command(args.binary, args.root / "state", args.profile, args.practice_browser, args.research_source,
-                               args.practice_mindustry_server, args.practice_mindustry_json_rules, args.research_corpus,
+                               args.practice_mindustry_server, args.research_corpus,
                                args.reference)
         run_window(args.root, args.seconds, args.binary, args.seed_state, command)
         safe = finish(args.root, args.output, args.profile)

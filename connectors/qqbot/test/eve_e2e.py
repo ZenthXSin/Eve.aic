@@ -376,10 +376,9 @@ class Acceptance(unittest.TestCase):
         browser = ["--practice-browser", BROWSER, "--research-source", "https://example.com/docs/"]
         jar = self.work / "server-release.jar"
         jar.write_bytes(b"PK")  # 宿主启动只核对 jar 非空；本测试不触发实际实践运行。
-        # 续接窗口换成默认的 Mindustry 实践、继承的 JSON 预检规则与本地资料，宿主须照常就绪并读回原状态；
-        # 与 qqbot-full.yml 一样用仓库相对路径传规则与资料目录。
+        # 续接窗口换成默认的 Mindustry 实践与本地资料，宿主须照常就绪并读回原状态；
+        # 与 qqbot-full.yml 一样用仓库相对路径传资料目录。
         mindustry = ["--practice-mindustry-server", str(jar),
-                     "--practice-mindustry-json-rules", "vendor/eve-portable-mindustry-json-validator",
                      "--research-corpus", "vendor/eve-portable-knowledge",
                      "--research-source", "eve-corpus://eve-portable/mindustry/",
                      "--reference", "eve-portable=vendor/eve-portable-knowledge"]

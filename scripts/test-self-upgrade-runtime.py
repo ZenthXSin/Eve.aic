@@ -26,6 +26,13 @@ class DigestTests(unittest.TestCase):
             with path.open('ab') as stream:stream.truncate(2*1024*1024*1024+1)
             with self.assertRaises(ValueError):runtime.digest(path)
 
+    def test_removed_json_precheck_flags_are_dropped_with_their_values(self):
+        old=['eve','--interest-learning','--practice-mindustry-server','s.jar','--practice-mindustry-json-rules','rules',
+             '--practice-python','py','--research-corpus','corpus']
+        self.assertEqual(runtime.without_removed_flags(old),
+                         ['eve','--interest-learning','--practice-mindustry-server','s.jar','--research-corpus','corpus'])
+        self.assertEqual(runtime.without_removed_flags(['eve','--training']),['eve','--training'])
+
 class UpgradeRuntimeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
