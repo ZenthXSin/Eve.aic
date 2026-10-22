@@ -38,6 +38,7 @@ mod qq_outreach;
 mod qq_people;
 mod qq_plan;
 mod qq_practice;
+mod qq_progress;
 mod qq_pursuit;
 mod qq_reminder;
 mod qq_research;
@@ -362,6 +363,7 @@ pub(crate) async fn install_core_with_pages(
         config::history_schema(),
         qq_history_digest::schema(),
         qq_vision::schema(),
+        qq_progress::schema(),
         qq_people::schema(),
         qq_memory_continuity::schema(),
         qq_tasks::schema(),

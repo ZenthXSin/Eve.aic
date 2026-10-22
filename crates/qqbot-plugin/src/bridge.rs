@@ -106,6 +106,50 @@ fn timing(enabled: bool, phase: &str, turn: Option<u64>) {
         );
     }
 }
+/// 工具名归为固定的活动类别，不暴露参数。
+fn activities<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    let mut activities = std::collections::BTreeSet::new();
+    for name in names {
+        activities.insert(match name {
+            "read_file" | "list_files" | "search_files" | "github_api" => "源码与文件核对",
+            "search_reference" | "read_reference" | "search_knowledge" | "search_memory" => {
+                "资料检索"
+            }
+            "write_file" | "apply_patch" => "文件修改",
+            "run_command" => "命令执行",
+            "prepare_self_upgrade" | "apply_self_upgrade" | "self_upgrade_status" => "升级检查",
+            _ => "工具处理",
+        });
+    }
+    activities.into_iter().collect::<Vec<_>>().join("、")
+}
+/// 本轮当前步骤：由运行时真实事件开始，超过阈值仍未结束时补发一条进度。
+struct SlowStep {
+    event: ControlEvent,
+    label: String,
+    since: tokio::time::Instant,
+    reported: bool,
+}
+fn slow_text(step: &SlowStep) -> String {
+    format!(
+        "{}这一步已进行约 {} 秒，仍在进行中；完成后会继续回复。",
+        step.label,
+        step.since.elapsed().as_secs()
+    )
+}
+/// 按真实事件更新当前步骤；返回 None 表示该事件不影响步骤记录。
+fn slow_label(kind: &TurnEventKind) -> Option<Option<String>> {
+    match kind {
+        TurnEventKind::ProviderStarted { .. } => Some(Some("生成回复".into())),
+        TurnEventKind::ToolBatchStarted { calls } => Some(Some(activities(
+            calls.iter().map(|call| call.name.as_str()),
+        ))),
+        TurnEventKind::ResponseCompleted { .. }
+        | TurnEventKind::TurnCompleted { .. }
+        | TurnEventKind::Failed { .. } => Some(None),
+        _ => None,
+    }
+}
 fn progress_text(kind: &TurnEventKind) -> Option<String> {
     if matches!(kind, TurnEventKind::ContextCompactionStarted) {
         return Some("正在进行上下文压缩，请稍等".into());
@@ -118,22 +162,10 @@ fn progress_text(kind: &TurnEventKind) -> Option<String> {
     else {
         return None;
     };
-    let mut activities = std::collections::BTreeSet::new();
-    for name in tool_names {
-        activities.insert(match name.as_str() {
-            "read_file" | "list_files" | "search_files" | "github_api" => "源码与文件核对",
-            "search_reference" | "read_reference" | "search_knowledge" | "search_memory" => {
-                "资料检索"
-            }
-            "write_file" | "apply_patch" => "文件修改",
-            "run_command" => "命令执行",
-            "prepare_self_upgrade" | "apply_self_upgrade" | "self_upgrade_status" => "升级检查",
-            _ => "工具处理",
-        });
-    }
+    let activities = activities(tool_names.iter().map(String::as_str));
     Some(format!(
         "{}已返回结果，累计收到 {completed_calls} 次工具回执{}。正在继续核对与整理。",
-        activities.into_iter().collect::<Vec<_>>().join("、"),
+        activities,
         if *failed_calls == 0 {
             String::new()
         } else {
@@ -212,6 +244,7 @@ pub(crate) struct Services {
     pub conversations: crate::QqConversations,
     pub participant_observer: Option<Arc<dyn crate::QqParticipantObserver>>,
     pub timing_diagnostics: bool,
+    pub slow_progress: Option<Arc<dyn crate::QqSlowProgress>>,
 }
 /// 宿主接线的主动交流；`push_interval` 为空时不主动私聊。
 pub(crate) struct OutreachHook {
@@ -319,6 +352,8 @@ struct ChannelEvents {
     closed: watch::Receiver<bool>,
     timing_diagnostics: bool,
     progress: mpsc::Sender<ControlEvent>,
+    /// 慢步骤记录只是提示依据，队列满时丢弃，不影响本轮。
+    steps: mpsc::Sender<ControlEvent>,
 }
 impl ChannelEvents {
     fn is_closed(&self) -> bool {
@@ -358,6 +393,8 @@ impl ControlEventSink for ChannelEvents {
                     self.progress
                         .try_send(event)
                         .map_err(|_| LlmError::Cancelled)?;
+                } else if slow_label(&event.event.kind).is_some() {
+                    let _ = self.steps.try_send(event);
                 }
                 Ok(())
             }
@@ -662,6 +699,7 @@ pub(crate) async fn run(
         conversations,
         participant_observer,
         timing_diagnostics,
+        slow_progress,
     } = services;
     // 只从已验证的持久回执重建路由身份索引，不重放消息、写记忆或触发工具。
     for entry in ledger
@@ -687,12 +725,14 @@ pub(crate) async fn run(
     }
     let (closed, receiver) = watch::channel(false);
     let (progress_tx, mut progress_rx) = mpsc::channel(64);
+    let (steps_tx, mut steps_rx) = mpsc::channel::<ControlEvent>(256);
     let sink = Arc::new(ChannelEvents {
         signal: signal.clone(),
         stop: stop.clone(),
         closed: receiver,
         timing_diagnostics,
         progress: progress_tx,
+        steps: steps_tx,
     });
     let mut command = Command::new(&config.node_program);
     command
@@ -743,7 +783,9 @@ pub(crate) async fn run(
     let mut replies: VecDeque<Reply> = VecDeque::new();
     let mut delivering: Option<Delivery> = None;
     let mut progress_delivery: Option<(String, usize)> = None;
-    let mut progress_queue = VecDeque::new();
+    let mut progress_queue: VecDeque<(ControlEvent, Option<String>)> = VecDeque::new();
+    // 按原始消息 ID 记录的当前步骤；只用于慢步骤进度，不持久化。
+    let mut slow_steps: BTreeMap<String, SlowStep> = BTreeMap::new();
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     // 正在主动私聊的邀请；一次只发送一条，期间不开始新的回复投递。
     let mut pushing: Option<String> = None;
@@ -758,9 +800,24 @@ pub(crate) async fn run(
             if sink.is_closed() { break Ok(()); }
             while progress_queue.len() < 64 {
                 match progress_rx.try_recv() {
-                    Ok(event) => progress_queue.push_back(event),
+                    Ok(event) => progress_queue.push_back((event, None)),
                     Err(_) => break,
                 }
+            }
+            while let Ok(event) = steps_rx.try_recv() {
+                let Some(id) = active.iter().find(|a| a.key == event.key).map(|a| a.message.id.clone()) else { continue };
+                match slow_label(&event.event.kind).flatten() {
+                    Some(label) => { slow_steps.insert(id, SlowStep { event, label, since: tokio::time::Instant::now(), reported: false }); }
+                    None => { slow_steps.remove(&id); }
+                }
+            }
+            slow_steps.retain(|id, step| active.iter().any(|a| &a.message.id == id && a.key == step.event.key));
+            let slow_after = slow_progress.as_ref().and_then(|policy| policy.after());
+            // 慢步骤：同一步只提示一次；与里程碑进度共用每轮至多 3 条和被动回复配额。
+            if let Some(after) = slow_after && progress_queue.is_empty() && progress_delivery.is_none()
+                && let Some((_, step)) = slow_steps.iter_mut().find(|(_, step)| !step.reported && step.since.elapsed() >= after) {
+                step.reported = true;
+                progress_queue.push_back((step.event.clone(), Some(slow_text(step))));
             }
             // 同会话输出与任务准入等候路由收尾；独立会话可继续处理。
             // 显式命令不等待已撤销的自然判断，路由任务仍由 MessageService 收尾。
@@ -929,17 +986,17 @@ pub(crate) async fn run(
                 }
             }
             if delivering.is_none() && pushing.is_none() && sending_file.is_none() && progress_delivery.is_none()
-                && progress_queue.front().is_some_and(|event: &ControlEvent|
+                && progress_queue.front().is_some_and(|(event, _): &(ControlEvent, Option<String>)|
                     active.iter().any(|a| a.key == event.key)
                     || !routing.iter().any(|r| r.target.session == event.key.session))
-                && let Some(event) = progress_queue.pop_front() {
+                && let Some((event, text)) = progress_queue.pop_front() {
                 // 只使用当前代绑定的原始平台路由；取消、插入控制和旧代事件不补发。
                 let message = active.iter().find(|a| a.key == event.key).map(|a| a.message.clone());
                 if let Some(message) = message
                     && !pending_control(&message, &routing, &commands)
                     && control.accepts(&event)
                     && control.snapshot(&event.key.session).is_ok_and(|s| s.is_some_and(|s| !s.cancel_requested))
-                    && let Some(text) = progress_text(&event.event.kind) {
+                    && let Some(text) = text.or_else(|| progress_text(&event.event.kind)) {
                     let index = ledger.find(&config.app_id, &message.id).expect("active receipt");
                     let entry = &mut ledger.entries[index];
                     if entry.state == ReceiptState::Processing && entry.progress.len() < 3 {
@@ -1230,7 +1287,17 @@ pub(crate) async fn run(
                 }
                 _ = tokio::time::sleep_until(next_push), if push_ready => {}
                 _ = tokio::time::sleep(Duration::from_millis(100)), if !queue.is_empty() => {}
-                Some(event) = progress_rx.recv(), if progress_queue.len() < 64 => { progress_queue.push_back(event); }
+                Some(event) = progress_rx.recv(), if progress_queue.len() < 64 => { progress_queue.push_back((event, None)); }
+                Some(event) = steps_rx.recv() => {
+                    if let Some(id) = active.iter().find(|a| a.key == event.key).map(|a| a.message.id.clone()) {
+                        match slow_label(&event.event.kind).flatten() {
+                            Some(label) => { slow_steps.insert(id, SlowStep { event, label, since: tokio::time::Instant::now(), reported: false }); }
+                            None => { slow_steps.remove(&id); }
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(slow_steps.values().filter(|step| !step.reported).map(|step| step.since + slow_after.unwrap_or_default()).min().unwrap_or(deadline)),
+                    if slow_after.is_some() && progress_delivery.is_none() && slow_steps.values().any(|step| !step.reported) => {}
                 invite = judged(&mut judging), if judging.is_some() => {
                     let (mut reply, _) = judging.take().expect("judging reply");
                     reply.invite = Some(invite);
