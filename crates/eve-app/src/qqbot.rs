@@ -824,6 +824,7 @@ async fn run_qqbot_composed(
     let mut semantic_queries: Option<Arc<qq_semantic::QueryRecallEmbeddings>> = None;
     let mut summary_background: Option<qq_summary::Background> = None;
     let mut digest_background: Option<crate::qq_history_digest::Background> = None;
+    let mut impression_background: Option<crate::qq_impressions::Background> = None;
     let mut task_background: Option<qq_tasks::Background> = None;
     let mut trigger_background: Option<qq_triggers::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
@@ -917,6 +918,7 @@ async fn run_qqbot_composed(
         bootstrap.health = Some(model_health.clone());
         // 历史窗口省略较早轮次时用摘要代替；摘要是派生数据，原始会话历史完整保留。
         let digest_policy = Arc::new(crate::qq_history_digest::Policy::default());
+        let impression_policy = Arc::new(crate::qq_impressions::Policy::default());
         let history_digests = Arc::new(eve_history_digest::HistoryDigestService::new(
             eve_history_digest::DigestStore::open(options.state_directory.join("history-digest"))?,
             Box::new(crate::qq_history_digest::SharedPolicy(
@@ -924,7 +926,7 @@ async fn run_qqbot_composed(
             )),
         ));
         bootstrap.history_digests = Some(history_digests.clone());
-        let people_plugin = eve_people_plugin::PeoplePlugin::new()?;
+        let people_plugin = eve_people_plugin::PeoplePlugin::new()?.with_impression_learning();
         let people: Arc<dyn eve_people_api::PeopleDirectory> = Arc::new(people_plugin.controller());
         kernel.register(Box::new(people_plugin))?;
         kernel
@@ -1787,6 +1789,17 @@ async fn run_qqbot_composed(
             active_digester,
             digest_policy.clone(),
         ));
+        // 人物印象：此人谈及自己的原话攒够一批后学习一次；用途 impression 单独记健康与输出上限。
+        let _ = impression_policy
+            .settings
+            .set(qq_tasks::config_service(registry.as_ref())?);
+        impression_background = Some(crate::qq_impressions::Background::start(
+            people.clone(),
+            Arc::new(eve_people_plugin::ModelImpressionLearner::new(observed(
+                crate::qq_impressions::MODEL_USE,
+            )?)),
+            impression_policy.clone(),
+        ));
         // 后台任务与子代理共用执行器：用途 task 单独记健康与输出上限，不计入自主运行预算。
         if tasks.is_some() || options.subagents {
             let _ = task_late
@@ -2450,6 +2463,9 @@ async fn run_qqbot_composed(
         if let Some(digests) = &digest_background {
             digests.activate();
         }
+        if let Some(impressions) = &impression_background {
+            impressions.activate();
+        }
         if let Some(tasks) = &task_background {
             tasks.activate();
         }
@@ -2517,6 +2533,12 @@ async fn run_qqbot_composed(
                     (
                         digests.finished(),
                         "历史摘要后台已结束；QQ 通道停止准入并保留状态",
+                    )
+                }))
+                .chain(impression_background.as_ref().map(|impressions| {
+                    (
+                        impressions.finished(),
+                        "印象学习后台已结束；QQ 通道停止准入并保留状态",
                     )
                 }))
                 .chain(trigger_background.as_ref().map(|triggers| {
@@ -2600,6 +2622,9 @@ async fn run_qqbot_composed(
     if let Some(digests) = &digest_background {
         digests.request_stop();
     }
+    if let Some(impressions) = &impression_background {
+        impressions.request_stop();
+    }
     if let Some(triggers) = &trigger_background {
         triggers.request_stop();
     }
@@ -2623,6 +2648,11 @@ async fn run_qqbot_composed(
     }
     if let Some(digests) = digest_background
         && let Err(error) = digests.stop().await
+    {
+        secondary.push(error);
+    }
+    if let Some(impressions) = impression_background
+        && let Err(error) = impressions.stop().await
     {
         secondary.push(error);
     }

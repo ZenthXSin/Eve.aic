@@ -860,6 +860,7 @@ name = "eve-people-plugin"
 version = "0.1.0"
 dependencies = [
  "eve-kernel",
+ "eve-llm-api",
  "eve-people-api",
  "eve-plugin-api",
  "serde",

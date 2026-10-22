@@ -28,6 +28,7 @@ mod qq_files;
 mod qq_help;
 mod qq_history_digest;
 mod qq_host_facts;
+mod qq_impressions;
 mod qq_interest;
 mod qq_learning;
 mod qq_learning_commands;

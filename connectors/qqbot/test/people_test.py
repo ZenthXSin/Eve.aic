@@ -58,6 +58,92 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
         self.assertEqual(self.documents()["eve.people"]["people.v1"], before)
         self.assertFalse(expected)
 
+    def classify(self, decoded, latest):
+        if isinstance(decoded, dict) and set(decoded) == {"messages", "known"}:
+            return "impression"
+        return super().classify(decoded, latest)
+
+    def reply(self, kind, decoded, latest):
+        if kind == "impression":
+            return json.dumps(self.impression_reply(decoded), ensure_ascii=False)
+        return super().reply(kind, decoded, latest)
+
+    def people_state(self):
+        return self.documents()["eve.people"]["people.v1"]
+
+    def wait_learned(self, count):
+        def done():
+            people = self.people_state()["people"]
+            return sum(len(p.get("impressions", [])) for p in people) == count
+        self.wait_until(done, "印象没有保存")
+
+    def test_impressions_come_only_from_own_words_reach_only_the_speaker_and_can_be_forgotten(self):
+        talk = ["我最近在学Rust", "我养了一只橘猫", "今天好累啊我", "我下周要去成都出差"]
+        batches = []
+        def impressions(batch):
+            batches.append(batch)
+            if len(batches) == 1:
+                self.assertEqual(batch, {"messages": talk, "known": []})
+                return {"impressions": [{"text": "在学 Rust", "quote": "我最近在学Rust", "replaces": None},
+                                        {"text": "养了一只橘猫", "quote": "我养了一只橘猫", "replaces": None}]}
+            self.assertEqual([k["text"] for k in batch["known"]], ["在学 Rust", "养了一只橘猫"])
+            old = batch["known"][0]["id"]
+            return {"impressions": [{"text": "改学 Go 了", "quote": "我不学Rust了改学Go", "replaces": old}]}
+        self.impression_reply = impressions
+        seen = {}
+        def respond(body):
+            data = self.facts(body)
+            seen[body["messages"][-1]["content"]] = data["people"]
+            return text_response("好")
+        self.callback = respond
+        say = lambda mid, text, user="user-1": self.send(self.message(mid, text, user=user, scope="group",
+                                                                      target="group-1", expected="好"))
+        self.enabled([*[step for i, text in enumerate(talk) for step in say(f"t{i}", text)],
+                      *self.checkpoint("learned"),
+                      *say("ask", "你还记得我在学什么吗"),
+                      *say("other", "大家好呀", user="user-2"),
+                      *self.send(self.message("list", "/impressions", user="user-1", scope="group", target="group-1",
+                                              contains=["在学 Rust", "养了一只橘猫", "我最近在学Rust"]))],
+                     checkpoints={"learned": lambda: self.wait_learned(2)})
+        self.assertEqual(len(self.kind("impression")), 1)
+        self.assertEqual([i["text"] for i in seen["你还记得我在学什么吗"]["current"]["impressions"]],
+                         ["在学 Rust", "养了一只橘猫"])
+        self.assertNotIn("pending", seen["你还记得我在学什么吗"]["current"])
+        other = seen["大家好呀"]
+        self.assertNotIn("impressions", other["current"])
+        self.assertTrue(all("impressions" not in p for p in other["others"]), "别人的印象不进入他人的对话")
+        self.assertEqual(self.people_state()["version"], 2)
+        # 重启后不重放已取出的批次；新的原话更新旧印象。
+        later = ["我不学Rust了改学Go", "我觉得Go挺好上手", "我周末打算写个小工具", "我还在纠结用什么框架"]
+        self.enabled([*[step for i, text in enumerate(later) for step in say(f"l{i}", text)],
+                      *self.checkpoint("updated")],
+                     checkpoints={"updated": lambda: self.wait_until(
+                         lambda: any(i["text"] == "改学 Go 了" for p in self.people_state()["people"]
+                                     for i in p.get("impressions", [])), "印象没有更新")})
+        self.assertEqual(len(self.kind("impression")), 2)
+        mine = next(p for p in self.people_state()["people"] if p.get("impressions"))["impressions"]
+        self.assertEqual([i["text"] for i in mine], ["改学 Go 了", "养了一只橘猫"])
+        self.enabled([*self.send(self.message("forget-other", f"/impressions forget {mine[1]['id']}", user="user-2",
+                                              scope="group", target="group-1", contains="没有你的印象")),
+                      *self.send(self.message("forget", f"/impressions forget {mine[1]['id']}", user="user-1",
+                                              scope="group", target="group-1", contains="已删除"))])
+        mine = next(p for p in self.people_state()["people"] if p.get("impressions"))["impressions"]
+        self.assertEqual([i["text"] for i in mine], ["改学 Go 了"])
+
+    def test_unverifiable_impressions_are_rejected_and_disabled_learning_sends_nothing(self):
+        talk = ["我是做前端的", "我喜欢爬山", "我最近睡得很晚", "我想换个工作"]
+        self.impression_reply = lambda batch: {"impressions": [{"text": "是医生", "quote": "我是医生", "replaces": None}]}
+        say = lambda mid, text: self.send(self.message(mid, text, expected="完成"))
+        self.enabled([*[step for i, text in enumerate(talk) for step in say(f"t{i}", text)],
+                      *self.checkpoint("asked")],
+                     checkpoints={"asked": lambda: self.wait_until(lambda: self.kind("impression"), "没有学习请求")})
+        self.wait_until(lambda: not any(p.get("pending") for p in self.people_state()["people"]), "批次未取出")
+        self.assertFalse(any(p.get("impressions") for p in self.people_state()["people"]))
+        self.enabled([*[step for i, text in enumerate(talk) for step in say(f"off{i}", text)]],
+                     env_extra={"EVE_PEOPLE_IMPRESSIONS": "false"})
+        self.assertEqual(len(self.kind("impression")), 1)
+        self.assertEqual(len(next(p for p in self.people_state()["people"])["pending"]), 4, "关闭学习时原话留在有界缓冲")
+
     def test_name_command_changes_only_self_without_model_or_other_memory(self):
         self.enabled([*self.send(self.message("name", "/name 你猜", contains="当前称呼：你猜")),
                       *self.send(self.message("query", "/name", contains="当前称呼：你猜")),
