@@ -2,6 +2,7 @@
 import json
 import time
 import unittest
+from collections import Counter
 
 import context_compaction_test as compact
 import history_digest_test as digest
@@ -82,7 +83,11 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
         self.assertIn('"use_name":"digest"', log)
         self.assertEqual(self.dialogue_calls, 3 if failed else 4)
         if invalid:
-            self.assertEqual(len(self.digest_requests()), 2, "摘要纠错只有一次，不重放业务工具")
+            batches = Counter(r["messages"][1]["content"] for r in self.digest_requests())
+            self.assertEqual(list(batches.values()).count(2), 1, "只有无效摘要所在批次纠错一次")
+            self.assertLessEqual(max(batches.values()), 2, "同一批摘要不无限重试")
+            if failed:
+                self.assertEqual(len(self.digest_requests()), 2)
 
     def test_healthy_digest_stream_outlives_old_total_timeout_and_notifies_once(self):
         self.exercise(False)
