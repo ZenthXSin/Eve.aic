@@ -549,18 +549,34 @@ fn failed_turn_notice(report: &ControlReport) -> String {
         Some(RunFailure::FailureRecord { execution, .. }) => Some(execution),
         _ => None,
     };
-    let reason = match error {
-        Some(LlmError::Context(reason)) if reason.starts_with("上下文压缩") => {
+    let persistence = match report.run.failure.as_ref() {
+        Some(RunFailure::Commit(_)) => Some("本轮已执行，但结果未能提交保存"),
+        Some(RunFailure::FailureRecord { .. }) => Some("本轮失败记录未能保存"),
+        Some(RunFailure::Session(eve_session_api::SessionError::Storage)) => {
+            Some("会话状态读取或保存失败")
+        }
+        _ => None,
+    };
+    let reason = match (persistence, error) {
+        (Some(reason), _) => format!("{reason}，请检查存储空间和写入权限"),
+        (_, Some(LlmError::Protocol(reason))) if reason == "不同工具批次不能复用调用 ID" => {
+            "模型工具调用标识被重复使用，重复批次未执行".into()
+        }
+        (_, Some(LlmError::Protocol(reason))) if reason.starts_with("任务仍标记为未完成；") => {
+            "任务仍未完成，自动续行三次后仍未完成或说明阻塞，已停止本轮".into()
+        }
+        (_, Some(LlmError::Protocol(_))) => "模型回复格式或工具调用未通过协议检查".into(),
+        (_, Some(LlmError::Context(reason))) if reason.starts_with("上下文压缩") => {
             "上下文压缩未能完成，已保存的摘要进度与原始记录仍保留；压缩后的下一次对话请求未发出"
                 .into()
         }
-        Some(error) if error.provider_failure().is_some() => {
+        (_, Some(error)) if error.provider_failure().is_some() => {
             failure_reason(error.provider_failure().expect("checked failure"))
         }
-        Some(LlmError::ProviderTimeout) => "模型服务响应超时".into(),
-        Some(LlmError::Provider(_)) => "模型服务未能完成回复".into(),
-        Some(LlmError::RoundLimit) => "本轮达到工具调用次数上限".into(),
-        Some(LlmError::HistoryWindowExceeded) => {
+        (_, Some(LlmError::ProviderTimeout)) => "模型服务响应超时".into(),
+        (_, Some(LlmError::Provider(_))) => "模型服务未能完成回复".into(),
+        (_, Some(LlmError::RoundLimit)) => "本轮达到工具调用次数上限".into(),
+        (_, Some(LlmError::HistoryWindowExceeded)) => {
             "最近一轮历史超过上下文窗口，原记录仍保留；请在面板 runtime.history 调大 max_bytes"
                 .into()
         }
@@ -1750,6 +1766,59 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     use super::preempts_natural;
+
+    #[test]
+    fn storage_and_protocol_failures_have_distinct_private_notices() {
+        use super::{ControlReport, LlmError, RunFailure, failed_turn_notice};
+        use eve_control_api::{CommitState, GenerationKey, RunReport};
+        use eve_session_api::{SessionError, SessionKey};
+        for (failure, expected) in [
+            (
+                RunFailure::Execution(LlmError::Protocol("private response body".into())),
+                "模型回复格式或工具调用未通过协议检查",
+            ),
+            (
+                RunFailure::Commit(SessionError::Storage),
+                "本轮已执行，但结果未能提交保存",
+            ),
+            (
+                RunFailure::FailureRecord {
+                    storage: SessionError::Storage,
+                    execution: LlmError::Provider("private provider detail".into()),
+                },
+                "本轮失败记录未能保存",
+            ),
+            (
+                RunFailure::Session(SessionError::Storage),
+                "会话状态读取或保存失败",
+            ),
+        ] {
+            let report = ControlReport {
+                key: GenerationKey {
+                    session: SessionKey::new("s", "u").unwrap(),
+                    task_id: "t".into(),
+                    controller_epoch: [0; 16],
+                    generation: 1,
+                },
+                cancel_requested: false,
+                run: RunReport {
+                    turn_id: Some(1),
+                    commit: CommitState::Pending,
+                    text: None,
+                    transcript: None,
+                    started_tools: Some(1),
+                    tool_results: vec![],
+                    failure: Some(failure),
+                },
+            };
+            let notice = failed_turn_notice(&report);
+            assert!(notice.starts_with(expected), "{notice}");
+            assert!(!notice.contains("private"));
+            assert!(!notice.contains("本轮执行或状态保存未能完成"));
+            assert!(notice.contains("已启动 1 次工具调用"));
+            assert!(notice.contains("不再自动重试"));
+        }
+    }
 
     #[test]
     fn failure_notices_name_the_fixed_kind_and_status_only() {

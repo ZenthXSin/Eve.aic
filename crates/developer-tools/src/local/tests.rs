@@ -911,6 +911,17 @@ async fn upgrade_runs_real_rust_checks_and_builds_an_immutable_candidate_without
     assert_eq!(result["prepared"], true);
     assert_eq!(result["applied"], false);
     assert_eq!(result["checks"].as_array().unwrap().len(), 4);
+    // 完整检查复用 release；自升级不能再生成第二套 debug 依赖与测试产物。
+    assert_eq!(
+        fs::read_dir(root.path().join("target/debug"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read(root.path().join("target/debug/eve-qqbot")).unwrap(),
+        b"stale debug output"
+    );
     let candidate = PathBuf::from(result["candidate_path"].as_str().unwrap());
     assert_eq!(
         hash(&fs::read(&candidate).unwrap()),

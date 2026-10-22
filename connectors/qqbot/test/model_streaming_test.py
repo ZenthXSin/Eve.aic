@@ -76,6 +76,20 @@ class ModelStreamingAcceptance(developer.DeveloperAcceptance):
         self.assertEqual(self.chat_rounds, 1)
         self.assertEqual(len(self.interactions()), 0)
 
+    def test_reused_tool_id_reports_protocol_failure_and_never_replays_the_command(self):
+        self.callback = lambda body: tool_response([("run_command", {
+            "program": sys.executable, "args": ["-c",
+            "from pathlib import Path; p=Path('once.txt'); p.write_text(p.read_text()+'x' if p.exists() else 'x')"]})])
+        self.enabled(self.send(self.message("duplicate-id", "验证重复标识", contains=[
+            "工具调用标识被重复使用", "重复批次未执行", "已启动 1 次", "本轮已停止"])))
+        self.assertEqual((self.source / "once.txt").read_text(), "x")
+        self.assertEqual(self.chat_rounds, 2)
+        self.assertEqual(self.turn("验证重复标识")["status"]["failure"]["code"], "Protocol")
+        self.assertEqual(len(self.interactions()), 0)
+        self.callback = lambda body: text_response("未重复执行")
+        self.enabled(self.send(self.message("after-duplicate", "核对已有结果", expected="未重复执行")))
+        self.assertEqual((self.source / "once.txt").read_text(), "x")
+
     def test_interruption_after_execution_keeps_receipt_and_restart_does_not_replay(self):
         def respond(body):
             if not self.results(body):

@@ -9,6 +9,8 @@ mod preference;
 pub use preference::*;
 mod advice;
 pub use advice::*;
+mod chat;
+pub use chat::*;
 
 pub const PARAGRAPH_PLANNER: &str = "paragraph-v3";
 

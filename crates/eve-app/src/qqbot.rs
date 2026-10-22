@@ -64,7 +64,7 @@ use eve_reminder_api::{REMINDER_PLUGIN_ID, ReminderAdmin};
 use eve_reminder_plugin::ReminderPlugin;
 use eve_segment_api::SegmentPreferences;
 use eve_segment_plugin::{
-    ParagraphPlanner, RuleSegmentAdvisor, SEGMENT_PREFERENCES_PLUGIN_ID, SegmentPreferencePlugin,
+    RuleSegmentAdvisor, SEGMENT_PREFERENCES_PLUGIN_ID, SegmentPreferencePlugin,
 };
 use eve_semantic_plugin::{HybridRecall, Indexer, SEMANTIC_PLUGIN_ID, SemanticPlugin};
 use eve_session_api::{SESSION_SERVICE_ID, SessionServiceHandle};
@@ -945,8 +945,13 @@ async fn run_qqbot_composed(
         .with_timing_diagnostics(crate::models::timing_enabled());
         // 会话是私聊还是群聊由通道登记；只在私聊中成立的能力据此判断。
         let conversations = plugin.conversations();
+        // 分段开启时，短的闲聊回复按句拆成几条短消息；runtime.chat_style 可热关闭。
+        let chat_style = Arc::new(crate::qq_chat_style::ChatStyle::default());
         let mut plugin = if options.segmented {
-            plugin.with_segmenter(Arc::new(ParagraphPlanner::default()), QQ_SEGMENT_LIMITS)?
+            plugin.with_segmenter(
+                Arc::new(eve_segment_plugin::ChatPlanner::new(chat_style.clone())),
+                QQ_SEGMENT_LIMITS,
+            )?
         } else {
             plugin
         };
@@ -1610,7 +1615,7 @@ async fn run_qqbot_composed(
                 .map_or_else(Vec::new, |policy| policy.seeds().to_vec()),
             runner: practice.is_some().then(|| skill_runner.clone()),
         }));
-        let control = crate::install_core_with_pages(
+        let (control, model_settings_admin) = crate::install_core_with_pages_and_admin(
             &kernel,
             registry.clone(),
             permissions,
@@ -1764,6 +1769,9 @@ async fn run_qqbot_composed(
         };
         let budgeted = |category: &str| budget_gate.wrap(observed(category)?, category);
         // 历史摘要服务于对话本身，与主对话一样不计入自主运行预算；用途 digest 单独记健康与输出上限。
+        let _ = chat_style
+            .settings
+            .set(qq_tasks::config_service(registry.as_ref())?);
         let _ = chat_timing
             .settings
             .set(qq_tasks::config_service(registry.as_ref())?);
@@ -2174,6 +2182,11 @@ async fn run_qqbot_composed(
             admin: qq_admin.clone(),
             inner: Arc::new(CommandHandlers(vec![
                 qq_admin.clone(),
+                Arc::new(crate::qq_model::Commands {
+                    settings: qq_tasks::config_service(registry.as_ref())?,
+                    admin: Arc::new(model_settings_admin),
+                    authorization: qq_admin.clone(),
+                }),
                 Arc::new(crate::qq_people::Commands(people)),
                 help_commands,
                 commands,
