@@ -305,7 +305,9 @@ class ReminderAcceptance(unittest.TestCase):
         self.callback = self.chat
         self.run_eve([{"push_mode": {"hold": True}}, *self.checkpoint("sending"), {"touch": str(stop)},
                       {"wait_file": str(self.gate("never-released"))}],
-                     checkpoints={"sending": lambda: self.wait_status("Delivering")}, stop_at=stop)
+                     # 宿主先保存 Delivering 再写推送帧：两者都出现后才停，否则停在中间时替身记不到这次推送。
+                     checkpoints={"sending": lambda: (self.wait_status("Delivering"), self.wait_for(
+                         lambda: self.pushes(), "push frame did not reach the bridge", 15))}, stop_at=stop)
         self.run_eve([*self.send(self.message("chat", CHAT, expected=HERE)), *self.checkpoint("quiet")],
                      checkpoints={"quiet": lambda: (self.quiet(), self.quiet(), self.quiet(), self.quiet())})
         [unknown] = self.reminders()
