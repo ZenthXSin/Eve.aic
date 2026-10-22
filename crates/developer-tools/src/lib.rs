@@ -217,7 +217,7 @@ impl Tool for DeveloperTool {
             ),
             Kind::Upgrade => (
                 "prepare_self_upgrade",
-                "实际执行格式、Clippy、工作区测试与构建，冻结候选可执行文件、运行资源及摘要。准备成功尚未切换；宿主装配 apply_self_upgrade 时可提交实时切换，否则走 PR/发行更新。",
+                "实际执行格式、Clippy、完整工作区测试与构建；Clippy、测试及构建共用 release 产物，避免生成两套缓存。冻结候选可执行文件、运行资源及摘要。准备成功尚未切换；宿主装配 apply_self_upgrade 时可提交实时切换，否则走 PR/发行更新。",
                 object(json!({}), &[]),
             ),
             Kind::ApplyUpgrade => (

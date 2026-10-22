@@ -731,6 +731,7 @@ impl LocalDeveloper {
             vec!["fmt", "--all", "--", "--check"],
             vec![
                 "clippy",
+                "--release",
                 "--workspace",
                 "--all-targets",
                 "--locked",
@@ -738,7 +739,7 @@ impl LocalDeveloper {
                 "-D",
                 "warnings",
             ],
-            vec!["test", "--workspace", "--locked"],
+            vec!["test", "--release", "--workspace", "--locked"],
             vec!["build", "-p", "eve-app", "--bins", "--release", "--locked"],
         ] {
             let args = self
