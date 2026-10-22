@@ -19,6 +19,7 @@ mod qq_access;
 mod qq_admin;
 mod qq_agenda;
 mod qq_budget;
+mod qq_chat_style;
 mod qq_clarify;
 mod qq_cognition;
 mod qq_completion;
@@ -364,6 +365,7 @@ pub(crate) async fn install_core_with_pages(
         qq_history_digest::schema(),
         qq_vision::schema(),
         qq_progress::schema(),
+        qq_chat_style::schema(),
         qq_people::schema(),
         qq_memory_continuity::schema(),
         qq_tasks::schema(),
