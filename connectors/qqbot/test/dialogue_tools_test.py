@@ -95,7 +95,7 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
             self.assertIn("URL 不在", json.dumps(results[-1], ensure_ascii=False))
             return text_response("工具已实际调用")
         self.callback = respond
-        self.full([*self.send(self.message("help", "/help", contains=["17 个", "read_source", "run_practice"])),
+        self.full([*self.send(self.message("help", "/help", contains=["18 个", "read_source", "run_practice"])),
                    *self.send(self.message("tools", "调用工具测试", expected="工具已实际调用"))])
         self.assertEqual(self.chat_rounds, 2)
         self.assertEqual(len(self.kind("chat")), 2)
@@ -105,7 +105,7 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
         marker = "CURRENT_USER_MARKER"
         foreign = "OTHER_USER_MARKER"
         def respond(body):
-            self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo", "search_memory"})
+            self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo", "search_memory", "save_preference"})
             results = self.results(body)
             if not results:
                 return tool_response([("search_memory", {"query": "MARKER"})])
@@ -115,7 +115,7 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
         self.callback = respond
         self.run_eve([*self.send(self.message("own", "/remember " + marker, contains="偏好已保存")),
                       *self.send(self.message("foreign", "/remember " + foreign, user="user-2", contains="偏好已保存")),
-                      *self.send(self.message("help", "/help", contains="5 个")),
+                      *self.send(self.message("help", "/help", contains="6 个")),
                       *self.send(self.message("query", "查看记忆", expected="只读取当前会话"))],
                      interest=False, memory=True, research=False, practice=False)
         self.assertEqual(self.chat_rounds, 2)
@@ -124,7 +124,7 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
         old_reply = "只有一个 echo 工具，不联网也不读写文件。"
 
         def old(body):
-            self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo", "search_memory"})
+            self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo", "search_memory", "save_preference"})
             self.current_capabilities(body)
             return text_response(old_reply)
 
@@ -143,27 +143,27 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
             if not self.results(body):
                 return tool_response([("list_interests", {}), ("list_goals", {})])
             self.assertEqual(len(self.results(body)), 2)
-            return text_response("当前可调用 17 个工具，刚才已核对兴趣与目标。")
+            return text_response("当前可调用 18 个工具，刚才已核对兴趣与目标。")
 
         self.callback = upgraded
-        self.full([*self.send(self.message("help-upgraded", "/help", contains="17 个")),
+        self.full([*self.send(self.message("help-upgraded", "/help", contains="18 个")),
                    *self.send(self.message("upgraded", "你现在有什么工具呢", expected=
-                                          "当前可调用 17 个工具，刚才已核对兴趣与目标。"))],
+                                          "当前可调用 18 个工具，刚才已核对兴趣与目标。"))],
                   more=["--self-learning", "--memory-recall", "--training", "--skill-learning",
                         "--tool-forging", "--plans", "--outreach"])
         self.assertEqual(len(self.kind("chat")), 3)
         self.assertEqual(self.practice_runs(), [])
 
         def reduced(body):
-            self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo", "search_memory"})
+            self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo", "search_memory", "save_preference"})
             self.current_capabilities(body)
-            self.assertTrue(any(m["role"] == "assistant" and "17 个工具" in
+            self.assertTrue(any(m["role"] == "assistant" and "18 个工具" in
                                 (m.get("content") or "") for m in body["messages"]))
-            return text_response("当前只装配了 5 个工具，原历史仍保留。")
+            return text_response("当前只装配了 6 个工具，原历史仍保留。")
 
         self.callback = reduced
         self.run_eve(self.send(self.message("reduced", "你现在有什么工具呢", expected=
-                                           "当前只装配了 5 个工具，原历史仍保留。")),
+                                           "当前只装配了 6 个工具，原历史仍保留。")),
                      interest=False, memory=True, research=False, practice=False)
         self.assertEqual(len(self.kind("chat")), 4)
 
