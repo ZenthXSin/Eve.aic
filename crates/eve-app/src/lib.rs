@@ -1,5 +1,6 @@
 //! Eve 的最小可运行组合入口：固定身份、一个主模型、会话历史与插件工具。
 //! 输入与受管轮次并发，任务仍串行；不包含额外模型或 Web 控制面。
+mod chime;
 mod cognition;
 mod cognition_action;
 mod cognition_action_admission;
@@ -71,6 +72,7 @@ mod web_panel_plugins;
 #[path = "../../llm-openai/tests/support/mod.rs"]
 mod http_support;
 
+pub use chime::{CHIME_HELP, ChimeOptions, ChimeSummary, run_chime};
 pub use cognition::{
     COGNITION_HELP, CognitionOptions, run_cognition, run_cognition_with_planner_factory,
 };
@@ -400,6 +402,7 @@ pub(crate) async fn install_core_with_pages_and_admin(
         qq_progress::schema(),
         qq_chat_style::schema(),
         qq_chat_timing::schema(),
+        chime::schema(),
         qq_people::schema(),
         qq_memory_continuity::schema(),
         qq_tasks::schema(),

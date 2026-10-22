@@ -292,6 +292,8 @@ dependencies = [
  "eve-artifact-file",
  "eve-budget-api",
  "eve-budget-plugin",
+ "eve-chime-api",
+ "eve-chime-plugin",
  "eve-clarify-api",
  "eve-clarify-plugin",
  "eve-cognition-api",
@@ -400,6 +402,29 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "eve-chime-api"
+version = "0.1.0"
+dependencies = [
+ "eve-llm-api",
+ "serde",
+]
+
+[[package]]
+name = "eve-chime-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-chime-api",
+ "eve-control-api",
+ "eve-llm-api",
+ "eve-segment-api",
+ "eve-segment-plugin",
+ "eve-session-api",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

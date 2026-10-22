@@ -76,6 +76,13 @@ jobs:
           $qqBinary = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
           python -X utf8 scripts/test-web-plugins.py $qqBinary
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 验证群聊插话的判断与完整回复链路
+        run: |
+          cargo build -p eve-app --bin eve-chime --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $chimeBinary = if ($IsWindows) { "target/debug/eve-chime.exe" } else { "target/debug/eve-chime" }
+          python -X utf8 scripts/test-chime.py $chimeBinary
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证引用和附件消息的记忆采集及重启不重放
         run: |
           $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
