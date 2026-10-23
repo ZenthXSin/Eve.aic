@@ -1,4 +1,5 @@
 """Release Eve + production QQ bridge performance; all inputs and peers are local."""
+from request_messages import conversation_messages
 import argparse
 import json
 import math
@@ -75,7 +76,7 @@ class LocalProvider:
                     messages = body["messages"]
                     outer.requests.append({
                         "at": time.perf_counter(),
-                        "user_count": sum(message["role"] == "user" for message in messages),
+                        "user_count": sum(message["role"] == "user" for message in conversation_messages(messages)),
                         "tool": messages[-1]["role"] == "tool",
                     })
                     latest = messages[-1]
