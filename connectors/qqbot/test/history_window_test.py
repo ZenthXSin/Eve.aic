@@ -1,4 +1,5 @@
 """实际 QQ 宿主的历史窗口、热配置、失败接续和持久恢复；只连接本地替身。"""
+from request_messages import conversation_messages
 import json
 import unittest
 
@@ -51,19 +52,19 @@ class HistoryWindowAcceptance(developer.DeveloperAcceptance):
             *self.send(self.message("smaller", "再继续"))], panel=True,
             checkpoints={"shrink": lambda: self.save_window(max_turns=1)})
         continuing = next(r["body"] for r in self.requests if r["body"]["messages"][-1]["content"] == "继续")
-        users = [m["content"] for m in continuing["messages"] if m["role"] == "user"]
+        users = [m["content"] for m in conversation_messages(continuing["messages"]) if m["role"] == "user"]
         self.assertEqual(users, ["工具轮", "失败请求", "继续"])
         self.assertTrue(any(m["role"] == "tool" for m in continuing["messages"]))
         self.assertTrue(any("宿主失败记录" in (m.get("content") or "") for m in continuing["messages"]))
         self.assertTrue(any("eve.runtime.history-window" in (m.get("content") or "") for m in continuing["messages"]))
         last = self.chat_request("再继续")
-        self.assertEqual([m["content"] for m in last if m["role"] == "user"], ["继续", "再继续"])
+        self.assertEqual([m["content"] for m in conversation_messages(last) if m["role"] == "user"], ["继续", "再继续"])
         before = self.turn("工具轮")
         self.run_window([*self.send(self.message("restart", "重启后")), *self.checkpoint("expand"),
                          *self.send(self.message("restored", "恢复查看"))], panel=True,
                         checkpoints={"expand": lambda: self.save_window(max_turns=16)})
         restored = self.chat_request("恢复查看")
-        self.assertIn("旧请求", [m["content"] for m in restored if m["role"] == "user"])
+        self.assertIn("旧请求", [m["content"] for m in conversation_messages(restored) if m["role"] == "user"])
         self.assertEqual(self.turn("工具轮"), before)
         self.assertEqual(sum(len(m.get("tool_calls", [])) for m in restored), 1)
         self.assertEqual(len([t for s in self.documents()["eve.session"]["sessions.v1"]["sessions"].values() for t in s["turns"]]), 7)

@@ -1,4 +1,5 @@
 """用相同合成快照、输入与模型响应比较运行器；不连接真实 QQ 或模型站点。"""
+from request_messages import conversation_messages
 import argparse
 import hashlib
 import json
@@ -66,7 +67,7 @@ def run(binary, payload_mib, samples):
         for index, request in enumerate(requests):
             assert request['reasoning_effort'] == 'medium'
             assert request['max_tokens'] == 8192
-            assert sum(m['role'] == 'user' for m in request['messages']) == index + 1
+            assert sum(m['role'] == 'user' for m in conversation_messages(request['messages'])) == index + 1
             names = [t['function']['name'] for t in request['tools']]
             assert 'echo' in names
             assert request['tools'] == requests[0]['tools']

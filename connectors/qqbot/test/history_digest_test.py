@@ -1,4 +1,5 @@
 """实际 QQ 宿主的历史摘要：超出窗口的较早轮次压缩成有来源的摘要，重启后沿用，可热关闭；只连接本地替身。"""
+from request_messages import conversation_messages
 import json
 import unittest
 
@@ -57,7 +58,7 @@ class HistoryDigestAcceptance(window.HistoryWindowAcceptance):
         self.assertEqual(request["turns"][0]["user"], "我最喜欢蓝色")
         self.assertEqual(first.get("tools", []), [])
         sixth = self.dialogue("第六轮")
-        users = [m["content"] for m in sixth["messages"] if m["role"] == "user"]
+        users = [m["content"] for m in conversation_messages(sixth["messages"]) if m["role"] == "user"]
         self.assertEqual(users, ["第四轮", "第五轮", "第六轮"])
         notice = next(m["content"] for m in sixth["messages"] if "eve.runtime.history-window" in (m.get("content") or ""))
         self.assertIn(f"{POINT}（第 1 轮）", notice)
