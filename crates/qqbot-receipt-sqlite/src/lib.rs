@@ -17,7 +17,9 @@ impl SqliteReceiptArchive {
         {
             return Err(unavailable());
         }
-        let exists = path.exists();
+        // 打开连接就会建出 0 字节文件；首次建表提交前中断会留下它。空文件里没有任何记录，
+        // 按未初始化处理；已有内容的库照常核对，损坏或身份不符仍拒绝启动。
+        let exists = path.metadata().is_ok_and(|m| m.len() > 0);
         let connection = Connection::open(path).map_err(|_| unavailable())?;
         connection
             .busy_timeout(Duration::from_secs(2))
@@ -165,6 +167,14 @@ mod tests {
         let db = SqliteReceiptArchive::open(&path).unwrap();
         assert_eq!(db.identity().unwrap(), (id, 1));
         assert_eq!(db.get("app", "one").unwrap(), Some(b"original".to_vec()));
+    }
+    #[test]
+    fn empty_file_left_before_first_commit_is_initialized() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("receipts.sqlite3");
+        std::fs::write(&path, b"").unwrap();
+        let db = SqliteReceiptArchive::open(&path).unwrap();
+        assert_eq!(db.identity().unwrap().1, 0);
     }
     #[test]
     fn corrupt_database_is_not_recreated() {

@@ -30,8 +30,22 @@ function isGroupAt(msg, appId) {
   return validId(appId) && typeof msg.content === "string" &&
     new RegExp(`<@!?${appId}>`).test(msg.content);
 }
+// QQ 表情在正文里是 <faceType=..,faceId="..",ext="base64(JSON)"> 或旧式 [<face,id=..>]；
+// 转成模型读得懂的【表情：名字】，名字取自 ext 的 text，解不出时只标出这是表情。
+function faceLabel(name) {
+  const clean = typeof name === "string" ? name.replace(/^\[|\]$/g, "").trim() : "";
+  return clean && clean.length <= 32 && !/[\p{Cc}【】]/u.test(clean) ? `【表情：${clean}】` : "【表情】";
+}
+export function readableFaces(text) {
+  return text
+    .replace(/<faceType=\d+,faceId="[^"]{0,64}",ext="([A-Za-z0-9+/=]{0,1024})">/g, (_m, ext) => {
+      try { return faceLabel(JSON.parse(Buffer.from(ext, "base64").toString("utf8")).text); }
+      catch { return faceLabel(""); }
+    })
+    .replace(/\[<face,id=\d{1,6}\/?>\]/g, faceLabel(""));
+}
 function userText(msg, appId) {
-  let text = typeof msg.content === "string" ? msg.content.trim() : "";
+  let text = typeof msg.content === "string" ? readableFaces(msg.content).trim() : "";
   if (msg.kind !== "group") return text;
   const own = new Set(validId(appId) ? [appId] : []);
   for (const mention of Array.isArray(msg.mentions) ? msg.mentions : []) {
@@ -128,7 +142,7 @@ function quotedMessage(msg) {
   const texts = [];
   const attachments = [];
   for (const element of selected) {
-    const content = element.content;
+    const content = typeof element.content === "string" ? readableFaces(element.content) : element.content;
     if (typeof content === "string" && content.trim() &&
         Buffer.byteLength(content) <= 1024 && !/[\p{Cc}]/u.test(content)) texts.push(content.trim());
     for (const raw of Array.isArray(element.attachments) ? element.attachments : []) {
