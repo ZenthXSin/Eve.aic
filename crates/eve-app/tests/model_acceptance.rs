@@ -90,6 +90,8 @@ fn user_texts(request: &Value) -> Vec<&str> {
         .iter()
         .filter(|m| m["role"] == "user")
         .map(|m| m["content"].as_str().unwrap())
+        // 当前请求中的临时宿主提示不是持久化用户轮次。
+        .filter(|text| !text.starts_with(include_str!("../src/dialogue-style-guard.txt").trim()))
         .collect()
 }
 #[tokio::test]
@@ -327,6 +329,8 @@ fn chat_user_texts(request: &Value) -> Vec<&str> {
         .iter()
         .filter(|m| m["role"] == "user")
         .map(|m| m["content"].as_str().unwrap())
+        // 当前请求中的临时宿主提示不是持久化用户轮次。
+        .filter(|text| !text.starts_with(include_str!("../src/dialogue-style-guard.txt").trim()))
         .collect()
 }
 #[tokio::test]
