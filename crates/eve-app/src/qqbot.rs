@@ -78,6 +78,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
 pub const QQBOT_HELP: &str = "--group-chat 接入全量群消息观察、说法学习与现有插话引擎；群回复首段艾特原发送者。需要平台提供 GROUP_MESSAGE_CREATE。
+与 --message-judge jev 同时启用时，Jev 判断群话题关联；含混消息持久积攒，由独立主动回复和经验整理处理，不即时主模型兜底。
 --sleep 开启可取消的短暂等待与本轮任务状态工具。
 --triggers 开启原会话条件唤醒工具（时间、文件、后台任务、消息匹配、Linux 进程）。
 Eve 官方 QQBot 通道
@@ -827,6 +828,7 @@ async fn run_qqbot_composed(
     let mut phrase_background: Option<crate::qq_phrases::Background> = None;
     let mut task_background: Option<qq_tasks::Background> = None;
     let mut group_background: Option<crate::qq_group::Background> = None;
+    let mut group_jev = None;
     let mut trigger_background: Option<qq_triggers::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
     let mut panel: Option<eve_web_panel::LocalPanel> = None;
@@ -1859,10 +1861,30 @@ async fn run_qqbot_composed(
                 .policy
                 .settings
                 .set(qq_tasks::config_service(registry.as_ref())?);
+            let relations = if options.message_judge == MessageJudgeMode::Jev {
+                let judge = crate::qq_message_judge::group_judge(qq_tasks::config_service(
+                    registry.as_ref(),
+                )?)?;
+                group_jev = Some(judge.clone());
+                let store = Arc::new(eve_relation_experience_sqlite::SqliteGroupRelations::open(
+                    &options.state_directory.join("jev-group-experience.sqlite3"),
+                )?);
+                Some(Arc::new(eve_chime_plugin::GroupRelationPipeline::new(
+                    store,
+                    group.store.clone(),
+                    judge,
+                    Arc::new(eve_chime_plugin::ModelGroupRelationReviewer::new(budgeted(
+                        "group_relation_learning",
+                    )?)),
+                )))
+            } else {
+                None
+            };
             group_background = Some(crate::qq_group::Background::start(
                 group.clone(),
                 control.clone(),
                 budgeted(crate::chime::MODEL_USE)?,
+                relations,
             )?);
         }
         // 历史摘要服务于对话本身，与主对话一样不计入自主运行预算；用途 digest 单独记健康与输出上限。
@@ -2472,8 +2494,14 @@ async fn run_qqbot_composed(
             .value
             .downcast::<ConfigServiceHandle>()
             .map_err(|_| "消息判断配置服务类型错误")?;
-        let mut relation =
-            crate::qq_message_judge::relation_plugin(options.message_judge, settings.0.clone())?;
+        let mut relation = match group_jev {
+            Some(judge) => {
+                crate::qq_message_judge::relation_plugin_shared(settings.0.clone(), judge)?
+            }
+            None => {
+                crate::qq_message_judge::relation_plugin(options.message_judge, settings.0.clone())?
+            }
+        };
         if options.message_judge != crate::qq_message_judge::MessageJudgeMode::Off {
             let experience = eve_relation_experience_sqlite::SqliteRelationExperience::open(
                 &options.state_directory.join("jev-experience.sqlite3"),

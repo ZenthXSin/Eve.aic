@@ -49,12 +49,33 @@ pub(crate) fn schema() -> ConfigSchema {
     enabled.environment = Some("EVE_CHIME_ENABLED".into());
     let mut judge = ConfigField::new(ConfigKind::String, Some(json!("model")));
     judge.environment = Some("EVE_CHIME_JUDGE".into());
+    let mut learning = ConfigField::new(ConfigKind::Boolean, Some(json!(true)));
+    learning.environment = Some("EVE_GROUP_RELATION_LEARNING_ENABLED".into());
     ConfigSchema {
         namespace: NAMESPACE.into(),
         version: 1,
         fields: BTreeMap::from([
             ("enabled".into(), enabled),
             ("judge".into(), judge),
+            ("relation_learning_enabled".into(), learning),
+            (
+                "relation_active_interval_ms".into(),
+                integer(
+                    15_000,
+                    1000,
+                    3_600_000,
+                    "EVE_GROUP_RELATION_ACTIVE_INTERVAL_MS",
+                ),
+            ),
+            (
+                "relation_review_interval_ms".into(),
+                integer(
+                    60_000,
+                    1000,
+                    3_600_000,
+                    "EVE_GROUP_RELATION_REVIEW_INTERVAL_MS",
+                ),
+            ),
             (
                 "cooldown_ms".into(),
                 integer(60_000, 0, 86_400_000, "EVE_CHIME_COOLDOWN_MS"),
@@ -85,6 +106,24 @@ pub(crate) struct Policy {
     pub(crate) settings: OnceLock<Arc<dyn ConfigService>>,
 }
 impl Policy {
+    pub(crate) fn relation_learning_enabled(&self) -> bool {
+        self.settings
+            .get()
+            .and_then(|s| s.snapshot(NAMESPACE, 1).ok())
+            .and_then(|s| s.get("relation_learning_enabled").ok())
+            .unwrap_or(false)
+    }
+    pub(crate) fn interval(&self, name: &str, default: u64) -> Duration {
+        Duration::from_millis(
+            self.settings
+                .get()
+                .and_then(|s| s.snapshot(NAMESPACE, 1).ok())
+                .and_then(|s| s.get::<i64>(name).ok())
+                .and_then(|n| u64::try_from(n).ok())
+                .filter(|n| (1000..=3_600_000).contains(n))
+                .unwrap_or(default),
+        )
+    }
     fn judge(&self) -> Option<String> {
         self.settings
             .get()?

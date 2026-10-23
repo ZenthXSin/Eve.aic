@@ -2,6 +2,8 @@
 //! 说什么，再通过渠道提供的出口发出去。契约不绑定任何聊天平台。
 use eve_llm_api::LlmFuture;
 use serde::{Deserialize, Serialize};
+mod relation;
+pub use relation::*;
 
 /// 单条群消息正文的字符上限；更长的只记作观察，不进入判断或回复。
 pub const MAX_MESSAGE_CHARS: usize = 2000;
@@ -169,6 +171,10 @@ pub trait ChimeService: Send + Sync {
 pub trait GroupObservationStore: Send + Sync {
     fn append(&self, message: &GroupMessage) -> Result<bool, String>;
     fn recent(&self, conversation: &str, limit: usize) -> Result<Vec<GroupMessage>, String>;
+    fn message(&self, conversation: &str, id: &str) -> Result<Option<GroupMessage>, String>;
+    /// Eve 已确认送达的完整问答，不按最近窗口截断。
+    fn exchanges(&self, conversation: &str) -> Result<Vec<GroupExchange>, String>;
+    fn link_reply(&self, conversation: &str, source: &str, reply: &str) -> Result<(), String>;
     fn queue(&self, id: &str, reply: &ChimeReply, speaker: &str) -> Result<(), String>;
     fn claim(&self) -> Result<Option<GroupOutbound>, String>;
     fn finish(&self, id: &str, sent: bool) -> Result<(), String>;

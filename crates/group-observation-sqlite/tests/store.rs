@@ -95,3 +95,38 @@ fn missing_database_and_unknown_version_do_not_silently_rebuild() {
     assert!(SqliteGroupObservations::open(&path).is_err());
     assert!(!path.exists());
 }
+
+#[test]
+fn full_participation_survives_window_and_restart_and_rejects_cross_group_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("group.db");
+    let store = SqliteGroupObservations::open(&path).unwrap();
+    let source = message("g1");
+    store.append(&source).unwrap();
+    let mut own = source.clone();
+    own.id = "eve-reply".into();
+    own.speaker = "eve".into();
+    own.from_me = true;
+    own.text = "完整的原始回复".repeat(300);
+    own.at_ms = 2;
+    store.append(&own).unwrap();
+    store.link_reply("g1", &source.id, &own.id).unwrap();
+    for n in 0..120 {
+        let mut m = source.clone();
+        m.id = format!("noise-{n}");
+        store.append(&m).unwrap();
+    }
+    assert!(
+        store
+            .recent("g1", 100)
+            .unwrap()
+            .iter()
+            .all(|m| m.id != source.id)
+    );
+    assert_eq!(store.exchanges("g1").unwrap()[0].reply.text, own.text);
+    assert!(store.link_reply("g2", &source.id, &own.id).is_err());
+    drop(store);
+    let store = SqliteGroupObservations::open(&path).unwrap();
+    assert_eq!(store.exchanges("g1").unwrap()[0].source, source);
+    assert!(store.exchanges("g2").unwrap().is_empty());
+}

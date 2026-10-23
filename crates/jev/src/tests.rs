@@ -41,7 +41,7 @@ fn output(label: &str) -> Value {
         "intent":{"type":"choice","choice":label,"confidence":0.99,"probabilities":probabilities},
         "whole_message":{"type":"noul","noul":0.98}}})
 }
-async fn server(
+pub(super) async fn server(
     status: u16,
     body: Vec<u8>,
     extra: &str,
@@ -99,7 +99,7 @@ async fn server(
     });
     (url, receiver, task)
 }
-fn judge(base_url: String) -> JevRelationJudge {
+pub(super) fn judge(base_url: String) -> JevRelationJudge {
     JevRelationJudge::new(
         JevConfig {
             base_url,

@@ -1,5 +1,7 @@
 //! 群消息原话与主动发送账本；重启不重放、不补发，异常保留原记录。
-use eve_chime_api::{ChimeReply, GroupMessage, GroupObservationStore, GroupOutbound};
+use eve_chime_api::{
+    ChimeReply, GroupExchange, GroupMessage, GroupObservationStore, GroupOutbound,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
     path::Path,
@@ -49,13 +51,20 @@ impl SqliteGroupObservations {
         let check: String = db
             .query_row("PRAGMA quick_check", [], |r| r.get(0))
             .map_err(|_| BROKEN)?;
-        if versions != [1] || check != "ok" {
+        if (versions != [1] && versions != [2]) || check != "ok" {
             return Err(BROKEN.into());
         }
         db.prepare("SELECT seq,conversation,id,payload FROM observations LIMIT 0")
             .map_err(|_| BROKEN)?;
         db.prepare("SELECT seq,id,conversation,reply_to,payload,status FROM outbound LIMIT 0")
             .map_err(|_| BROKEN)?;
+        if versions == [1] {
+            db.execute_batch("BEGIN IMMEDIATE; CREATE TABLE exchanges(seq INTEGER PRIMARY KEY AUTOINCREMENT,conversation TEXT NOT NULL,source TEXT NOT NULL,reply TEXT NOT NULL,UNIQUE(conversation,reply)); UPDATE metadata SET version=2; COMMIT;").map_err(|_|BROKEN)?;
+        }
+        db.prepare("SELECT seq,conversation,source,reply FROM exchanges LIMIT 0")
+            .map_err(|_| BROKEN)?;
+        // 普通回复保存正文后、关联提交前中断的，可由宿主稳定 ID 恢复；不推断缺失原话。
+        db.execute("INSERT OR IGNORE INTO exchanges(conversation,source,reply) SELECT a.conversation,a.id,b.id FROM observations a JOIN observations b ON b.conversation=a.conversation AND b.id='sent-'||substr(a.id,4) WHERE a.id LIKE 'qg-%' AND json_extract(a.payload,'$.from_me')=0 AND json_extract(b.payload,'$.from_me')=1",[]).map_err(|_|BROKEN)?;
         db.pragma_update(None, "journal_mode", "DELETE")
             .map_err(|_| BROKEN)?;
         db.pragma_update(None, "synchronous", "FULL")
@@ -148,6 +157,73 @@ impl GroupObservationStore for SqliteGroupObservations {
   let mut q=db.prepare("SELECT payload FROM observations WHERE conversation=?1 ORDER BY seq DESC LIMIT ?2").map_err(|_|BROKEN)?;
   let mut values:Vec<GroupMessage>=q.query_map(params![conversation,limit.min(100)],|r|r.get::<_,String>(0)).map_err(|_|BROKEN)?.map(|r|serde_json::from_str(&r.map_err(|_|BROKEN)?).map_err(|_|BROKEN.to_string())).collect::<Result<_,_>>()?;values.reverse();Ok(values)})
     }
+    fn exchanges(&self, conversation: &str) -> Result<Vec<GroupExchange>, String> {
+        self.run(|db| {
+            let mut q = db.prepare("SELECT a.payload,b.payload FROM exchanges x JOIN observations a ON a.conversation=x.conversation AND a.id=x.source JOIN observations b ON b.conversation=x.conversation AND b.id=x.reply WHERE x.conversation=?1 ORDER BY x.seq").map_err(|_|BROKEN)?;
+            let rows = q.query_map([conversation], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(|_|BROKEN)?;
+            rows.map(|row| {
+                let (source,reply)=row.map_err(|_|BROKEN)?;
+                let exchange=GroupExchange {source:serde_json::from_str(&source).map_err(|_|BROKEN)?,reply:serde_json::from_str(&reply).map_err(|_|BROKEN)?};
+                if !exchange.valid(conversation) { return Err(BROKEN.into()); }
+                Ok(exchange)
+            }).collect()
+        })
+    }
+    fn message(&self, conversation: &str, id: &str) -> Result<Option<GroupMessage>, String> {
+        self.run(|db| {
+            let raw: Option<String> = db
+                .query_row(
+                    "SELECT payload FROM observations WHERE conversation=?1 AND id=?2",
+                    params![conversation, id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|_| BROKEN)?;
+            raw.map(|v| serde_json::from_str(&v).map_err(|_| BROKEN.into()))
+                .transpose()
+        })
+    }
+    fn link_reply(&self, conversation: &str, source: &str, reply: &str) -> Result<(), String> {
+        self.run(|db| {
+            let tx = db.transaction().map_err(|_| BROKEN)?;
+            let get = |id: &str| -> Result<GroupMessage, String> {
+                let raw: String = tx
+                    .query_row(
+                        "SELECT payload FROM observations WHERE conversation=?1 AND id=?2",
+                        params![conversation, id],
+                        |r| r.get(0),
+                    )
+                    .map_err(|_| BROKEN)?;
+                serde_json::from_str(&raw).map_err(|_| BROKEN.into())
+            };
+            if !(GroupExchange {
+                source: get(source)?,
+                reply: get(reply)?,
+            })
+            .valid(conversation)
+            {
+                return Err("问答关联来源无效".into());
+            }
+            let old: Option<String> = tx
+                .query_row(
+                    "SELECT source FROM exchanges WHERE conversation=?1 AND reply=?2",
+                    params![conversation, reply],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|_| BROKEN)?;
+            if old.as_ref().is_some_and(|v| v != source) {
+                return Err("问答关联冲突；保留原记录".into());
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO exchanges(conversation,source,reply) VALUES(?1,?2,?3)",
+                params![conversation, source, reply],
+            )
+            .map_err(|_| BROKEN)?;
+            tx.commit().map_err(|_| BROKEN)?;
+            Ok(())
+        })
+    }
     fn queue(&self, id: &str, reply: &ChimeReply, speaker: &str) -> Result<(), String> {
         if id.len() > 256
             || !id.starts_with("chime-")
@@ -202,7 +278,51 @@ impl GroupObservationStore for SqliteGroupObservations {
     }
     fn finish(&self, id: &str, sent: bool) -> Result<(), String> {
         self.run(|db| {
-            if db
+            let tx = db.transaction().map_err(|_| BROKEN)?;
+            if sent {
+                let raw: String = tx
+                    .query_row(
+                        "SELECT payload FROM outbound WHERE id=?1 AND status='sending'",
+                        [id],
+                        |r| r.get(0),
+                    )
+                    .map_err(|_| "群回复结局无效；原记录保留")?;
+                let outbound = outbound(raw)?;
+                let original: String = tx
+                    .query_row(
+                        "SELECT payload FROM observations WHERE conversation=?1 AND id=?2",
+                        params![outbound.reply.conversation, outbound.reply.reply_to],
+                        |r| r.get(0),
+                    )
+                    .map_err(|_| BROKEN)?;
+                let original: GroupMessage = serde_json::from_str(&original).map_err(|_| BROKEN)?;
+                let own = GroupMessage {
+                    id: format!("{id}:reply"),
+                    conversation: outbound.reply.conversation.clone(),
+                    speaker: "eve-chime".into(),
+                    speaker_name: Some("Eve".into()),
+                    text: outbound.reply.text,
+                    mentions_me: false,
+                    replies_to_me: false,
+                    from_me: true,
+                    at_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(1, |v| v.as_millis() as u64)
+                        .max(original.at_ms.saturating_add(1)),
+                };
+                let payload = serde_json::to_string(&own).map_err(|_| BROKEN)?;
+                tx.execute(
+                    "INSERT INTO observations(conversation,id,payload) VALUES(?1,?2,?3)",
+                    params![own.conversation, own.id, payload],
+                )
+                .map_err(|_| BROKEN)?;
+                tx.execute(
+                    "INSERT INTO exchanges(conversation,source,reply) VALUES(?1,?2,?3)",
+                    params![own.conversation, outbound.reply.reply_to, own.id],
+                )
+                .map_err(|_| BROKEN)?;
+            }
+            if tx
                 .execute(
                     "UPDATE outbound SET status=?2 WHERE id=?1 AND status='sending'",
                     params![id, if sent { "sent" } else { "failed" }],
@@ -212,6 +332,7 @@ impl GroupObservationStore for SqliteGroupObservations {
             {
                 return Err("群回复结局无效；原记录保留".into());
             }
+            tx.commit().map_err(|_| BROKEN)?;
             Ok(())
         })
     }
