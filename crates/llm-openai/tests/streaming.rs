@@ -60,6 +60,7 @@ async fn unicode_chunked_text_and_multiple_calls_match_complete_protocol() {
     let first = server.next().await.body;
     assert_eq!(first["stream"], true);
     assert_eq!(first["store"], false);
+    assert_eq!(first["tool_choice"], "none");
     let calls = p.stream(request(), &Sink::default()).await.unwrap();
     server.next().await;
     assert_eq!(calls, p.complete(request()).await.unwrap());

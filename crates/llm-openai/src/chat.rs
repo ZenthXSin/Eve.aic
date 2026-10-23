@@ -60,6 +60,9 @@ pub(crate) fn encode_request(model: &str, request: ModelRequest) -> Result<Value
                 "description":tool.description,"parameters":tool.argument_schema}}));
         }
         body["tools"] = json!(tools);
+    } else {
+        // 省略 tools 不足以约束从历史调用继续生成函数的兼容服务。
+        body["tool_choice"] = json!("none");
     }
     Ok(body)
 }

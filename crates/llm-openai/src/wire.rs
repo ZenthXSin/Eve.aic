@@ -63,10 +63,14 @@ pub(crate) fn encode_request(model: &str, request: ModelRequest) -> Result<Value
             "parameters": tool.argument_schema, "strict": false
         }));
     }
-    Ok(json!({
+    let mut body = json!({
         "model": model, "input": input, "tools": tools,
         "parallel_tool_calls": true, "store": false, "stream": false
-    }))
+    });
+    if body["tools"].as_array().is_some_and(Vec::is_empty) {
+        body["tool_choice"] = json!("none");
+    }
+    Ok(body)
 }
 
 /// 图像以 data URL 内联；像素只出现在本次请求体中。

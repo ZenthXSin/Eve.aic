@@ -33,6 +33,7 @@ async fn responses_json_completion_uses_text_format_without_changing_ordinary_ch
     let body = server.next().await.body;
     assert_eq!(body["text"]["format"], json!({"type":"json_object"}));
     assert!(body.get("response_format").is_none());
+    assert_eq!(body["tool_choice"], "none");
     provider.complete(request()).await.unwrap();
     assert!(server.next().await.body.get("text").is_none());
 }

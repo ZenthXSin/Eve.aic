@@ -38,6 +38,14 @@ impl QqFailureRecovery for Recovery {
         {
             return Ok(None);
         }
+        // 配额用尽不是可绕过的执行错误。宿主已经尝试无工具收尾与只读汇报，
+        // 不再自动创建另一个 50 步任务，也不拿全量历史大小要求用户重述原任务。
+        if matches!(
+            &report.run.failure,
+            Some(RunFailure::Execution(LlmError::RoundLimit))
+        ) {
+            return Ok(Some("模型未能完成只读进度汇报；原任务和完整工具回执已保留，未自动追加执行。继续执行需要你明确批准追加步数".into()));
+        }
         let scope = ContextScope {
             session_id: report.key.session.session_id.clone(),
             user_id: report.key.session.user_id.clone(),

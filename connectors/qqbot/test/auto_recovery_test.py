@@ -17,10 +17,11 @@ class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
 
     def run_recovery(self, script, **options):
         more = ["--background-tasks", "--sleep"] + options.pop("more", [])
+        environment = {"EVE_DEVELOPER_CONFIG":str(self.developer_config),
+                       "EVE_TASK_AUTO_RECOVER_FAILURES":"true"}
+        environment.update(options.pop("env_extra", {}))
         return self.run_eve(script, interest=False, memory=True, research=False, practice=False,
-            more=more, env_extra={
-                "EVE_DEVELOPER_CONFIG":str(self.developer_config),
-                "EVE_TASK_AUTO_RECOVER_FAILURES":"true"}, **options)
+            more=more, env_extra=environment, **options)
 
     def wait_finished(self, status="Completed"):
         self.wait_for(lambda: any(t["status"] == status and (t.get("notice") or {}).get("status") == "Delivered" for t in self.tasks()), "恢复任务或通知未完成", 30)
@@ -96,6 +97,61 @@ class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
         self.callback=lambda body: calls(("uncertain","run_command",{"program":sys.executable,"args":["-c","import time; time.sleep(2)"],"timeout_ms":50})) if not self.results(body) else {"choices":[]}
         self.run_recovery(self.send(self.message("unsafe","超时命令",contains=["存在未确认的工具副作用", "未自动派发"])))
         self.assertFalse(self.tasks())
+
+    def test_fifty_calls_report_progress_with_large_context_and_no_replay_after_restart(self):
+        self.closing_requests = 0
+        def respond(body):
+            self.assertFalse(self.is_worker(body), "用尽额度不自动再开 50 步后台任务")
+            if not body.get("tools"):
+                self.assertEqual(body.get("tool_choice"), "none")
+                self.closing_requests += 1
+                if self.closing_requests == 1:
+                    return calls(("over-budget", "run_command", {"program":sys.executable,"args":["-c", "raise RuntimeError('不得执行')"]}))
+                self.assertTrue(body["messages"][0]["content"].startswith("你是 Eve，现在只向原会话用户汇报"))
+                self.assertTrue(all(m["role"] in ("system", "user") for m in body["messages"]))
+                report_data = self.text(body)  # 正式对话 Provider 仍会注入表达约束。
+                data = json.loads(report_data)
+                self.assertEqual(data["kind"], "eve.read_only_progress_report")
+                self.assertEqual(data["remaining"], "部署尚未执行")
+                self.assertGreater(len(report_data.encode()), 2 * 1024 * 1024)
+                results = [r for m in data["execution_record"] for r in m["tool_results"]]
+                self.assertEqual(len(results), 50)
+                self.assertIn("SAVED_COMMAND_RECEIPT", json.dumps(results))
+                self.assertNotIn("over-budget", json.dumps(data))
+                return text_response("已完成文件写入和 48 项核验，部署尚未执行，需要批准追加步数")
+            return calls(
+                ("pending", "task_progress", {"status":"in_progress","remaining":"部署尚未执行"}),
+                ("write-once", "run_command", {"program":sys.executable,"args":["-c",
+                    "from pathlib import Path; p=Path('once.txt'); p.write_text(p.read_text()+'x' if p.exists() else 'x'); print('SAVED_COMMAND_RECEIPT')"]}),
+                *[(f"echo-{i}", "echo", {"text":"RECEIPT_START" + "x" * 32000 + f"RECEIPT_END_{i}"}) for i in range(48)])
+        self.callback = respond
+        self.run_recovery(self.send(self.message("limit-report", "完成原任务并部署", contains=["已完成文件写入", "部署尚未执行", "批准追加步数"])),
+            env_extra={"EVE_CONTEXT_COMPACT_AT_TOKENS":"0"})
+        self.assertEqual(self.closing_requests, 2)
+        self.assertFalse(self.tasks())
+        turn = self.turn("完成原任务并部署")
+        self.assertEqual(turn["status"]["state"], "Completed")
+        self.assertEqual((self.source / "once.txt").read_text(), "x")
+        self.callback = lambda body: text_response("原有进度仍保留")
+        self.run_recovery(self.send(self.message("after-restart", "核对原有进度", expected="原有进度仍保留")),
+            env_extra={"EVE_CONTEXT_COMPACT_AT_TOKENS":"0", "EVE_HISTORY_MAX_BYTES":"8388608"})
+        self.assertEqual(self.turn("完成原任务并部署"), turn)
+        self.assertFalse(self.tasks())
+        self.assertEqual((self.source / "once.txt").read_text(), "x")
+
+    def test_a_provider_that_refuses_reporting_cannot_create_another_budget(self):
+        def respond(body):
+            self.assertFalse(self.is_worker(body))
+            if not self.results(body):
+                return calls(*[(f"echo-{i}", "echo", {"text":str(i)}) for i in range(50)])
+            return calls(("never-run", "echo", {"text":"不得执行"}))
+        self.callback = respond
+        self.run_recovery(self.send(self.message("no-report", "故障收尾", contains=["模型未能完成只读进度汇报", "未自动追加执行"])))
+        self.assertFalse(self.tasks())
+        failure = self.turn("故障收尾")["status"]["failure"]
+        self.assertEqual((failure["code"], failure["started_tools"]), ("RoundLimit", 50))
+        self.assertEqual(len(failure["evidence"]["tool_results"]), 50)
+        self.assertEqual(self.chat_rounds, 3, "两次只读收尾失败后停止，不无限请求模型")
 
     def test_compatible_fallback_disables_new_handoffs_without_dropping_task_support(self):
         self.callback=lambda body: {"choices":[]}

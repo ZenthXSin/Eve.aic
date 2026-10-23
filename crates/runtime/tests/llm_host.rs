@@ -919,6 +919,7 @@ async fn exhausted_rounds_close_with_a_tool_free_answer_when_configured() {
         tool_response(vec![call("second", "echo", json!({}))]),
         tool_response(vec![call("third", "echo", json!({}))]),
         tool_response(vec![call("fourth", "echo", json!({}))]),
+        tool_response(vec![call("report-still-calls", "echo", json!({}))]),
     ]);
     let (host, _, _) = make_host(stubborn, vec![tool()], config).await;
     let failure = host
@@ -927,6 +928,71 @@ async fn exhausted_rounds_close_with_a_tool_free_answer_when_configured() {
         .expect_err("round limit expected");
     assert_eq!(failure.error, LlmError::RoundLimit);
     assert_eq!(failure.diagnostics.started_tools, 2);
+}
+
+#[tokio::test]
+async fn exhausted_fifty_calls_report_complete_large_evidence_without_replaying_tools() {
+    let payload = "RECEIPT_BEGIN".to_owned() + &"x".repeat(2 * 1024 * 1024) + "RECEIPT_END";
+    let mut batch = (0..50)
+        .map(|i| call(&format!("step-{i}"), "echo", json!({"step":i})))
+        .collect::<Vec<_>>();
+    batch[0].arguments = json!({"receipt":payload});
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(batch),
+        tool_response(vec![call("must-not-run", "echo", json!({}))]),
+        final_response("已核验 50 项，剩余部署未完成，需要批准追加步数"),
+    ]);
+    let tool = Arc::new(TestTool::new(
+        "echo",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    ));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![tool.clone()],
+        LlmHostConfig {
+            max_tool_rounds: 0,
+            max_tool_calls: 50,
+            final_answer_on_round_limit: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let out = host.run_turn(turn()).await.unwrap();
+    assert!(out.text.contains("剩余部署未完成"));
+    assert_eq!(out.diagnostics.started_tools, 50);
+    assert_eq!(out.diagnostics.tool_results.len(), 50);
+    assert_eq!(out.diagnostics.provider_requests, 3);
+    assert_eq!(tool.starts.lock().unwrap().len(), 50);
+    assert!(
+        out.diagnostics.tool_results[0].output
+            == eve_llm_api::ToolOutput::Success(
+                json!({"id":"step-0","arguments":{"receipt":payload}})
+            )
+    );
+    let requests = provider.requests.lock().unwrap();
+    assert!(requests[1].tools.is_empty());
+    let report = &requests[2];
+    report.validate().unwrap();
+    assert!(report.tools.is_empty());
+    assert_eq!(report.messages.len(), 2);
+    let evidence: Value =
+        serde_json::from_str(report.messages[1].text.as_deref().unwrap()).unwrap();
+    assert_eq!(evidence["kind"], "eve.read_only_progress_report");
+    let record: Vec<eve_llm_api::ChatMessage> =
+        serde_json::from_value(evidence["execution_record"].clone()).unwrap();
+    assert!(
+        record == requests[1].messages,
+        "汇报保留全部输入、历史和已执行回执，不截断"
+    );
+    assert!(report.messages[1].text.as_ref().unwrap().len() > 2 * 1024 * 1024);
+    assert!(
+        !report.messages[1]
+            .text
+            .as_ref()
+            .unwrap()
+            .contains("must-not-run")
+    );
 }
 
 #[tokio::test]

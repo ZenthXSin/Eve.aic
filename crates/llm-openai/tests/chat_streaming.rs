@@ -91,6 +91,7 @@ async fn streamed_complete_and_json_keep_final_contract_and_reasoning_private() 
     let body = server.next().await.body;
     assert_eq!(body["stream"], true);
     assert_eq!(body["response_format"], json!({"type":"json_object"}));
+    assert_eq!(body["tool_choice"], "none");
 }
 #[tokio::test]
 async fn fragmented_interleaved_tools_preserve_order_and_never_publish_drafts() {
