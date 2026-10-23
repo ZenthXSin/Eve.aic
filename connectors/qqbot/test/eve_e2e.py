@@ -31,6 +31,7 @@ class Acceptance(unittest.TestCase):
         self.requests = []
         self.request_documents = []
         self.provider_steps = {}
+        self.empty_interest_updates = False
         self.server_errors = []
         self.request_lock = threading.Lock()
         self.runs = 0
@@ -74,6 +75,11 @@ class Acceptance(unittest.TestCase):
                     outer.release.wait(timeout=20)
                 if "text" in step:
                     message = {"role": "assistant", "content": step["text"]}
+                elif outer.empty_interest_updates and any(
+                        m.get("role") == "system" and "你是受限的兴趣观察器" in m.get("content", "")
+                        for m in messages):
+                    # 全功能启动验收只验证观察与持久化，不派生研究/实践或访问外网。
+                    message = {"role": "assistant", "content": '{"updates":[]}'}
                 elif latest["role"] == "tool":
                     text = json.loads(latest["content"])["echo"]
                     message = {"role": "assistant", "content": text, "reasoning_content": "auxiliary"}
@@ -365,6 +371,7 @@ class Acceptance(unittest.TestCase):
 
     @unittest.skipUnless(BROWSER, "需要 EVE_TEST_BROWSER 或 PATH 中的 google-chrome（全功能体验开启网页实践）")
     def test_full_experience_window_starts_every_capability_and_continues_from_encrypted_state(self):
+        self.empty_interest_updates = True
         launcher = self.work / "launch-eve"
         scenario = self.work / "full-scenario.json"
         launcher.write_text("#!/usr/bin/env python3\nimport os, sys\nos.execv(" + repr(str(BINARY)) + ", [" + repr(str(BINARY)) + ", *sys.argv[1:], '--bridge-script', " + repr(str(FAKE)) + ", '--bridge-arg', " + repr(str(scenario)) + "])\n")
@@ -396,6 +403,31 @@ class Acceptance(unittest.TestCase):
                 ready = subprocess.run(["python3", str(script), "--profile", "full", "--wait-ready", "--root", str(root),
                                         "--output", str(output)], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
                 self.assertEqual(ready.returncode, 0, ready.stdout + ready.stderr)
+                if seed is None:
+                    # 网关 ready / 收到 reply 不等于 250ms 轮询的兴趣后台已消费送达证据。
+                    # 首窗口以真实完成批次和预算扣账为关闭条件；续接窗口沿用该账本，
+                    # 不要求它绕过默认 5 分钟观察冷却再次发起请求。
+                    deadline = time.monotonic() + 10
+                    observed_statuses, interest_charged = [], False
+                    while child.poll() is None and time.monotonic() < deadline:
+                        state_path = root / "state/state.json"
+                        if state_path.exists():
+                            entries = json.loads(state_path.read_bytes())["entries"]
+                            interest_bytes = entries.get("eve.interest", {}).get("interests.v1")
+                            jobs = json.loads(bytes(interest_bytes))["jobs"] if interest_bytes else []
+                            observed_statuses = [record["job"]["status"] for record in jobs
+                                if any(evidence["source"].get("message_id") == message["id"]
+                                    for evidence in record["job"]["batch"]["evidence"])]
+                            budget_bytes = entries.get("eve.budget", {}).get("usage.v1")
+                            budget = json.loads(bytes(budget_bytes)) if budget_bytes else {}
+                            interest_charged = any(window.get("by_category", {}).get("interest", 0) > 0
+                                for window in [budget.get("current", {}), *budget.get("history", [])])
+                            if "Completed" in observed_statuses and interest_charged:
+                                break
+                        time.sleep(0.02)
+                    self.assertIn("Completed", observed_statuses,
+                        f"首窗口兴趣观察未完成：statuses={observed_statuses}, child_returncode={child.poll()}")
+                    self.assertTrue(interest_charged, "首窗口兴趣观察已完成但未持久化自主预算扣账")
                 self.gate(gate).touch()
                 stdout, stderr = child.communicate(timeout=60)
                 self.assertEqual(child.returncode, 0, stdout + stderr)
