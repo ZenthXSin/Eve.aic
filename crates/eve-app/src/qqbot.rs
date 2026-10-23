@@ -2410,8 +2410,15 @@ async fn run_qqbot_composed(
             .value
             .downcast::<ConfigServiceHandle>()
             .map_err(|_| "消息判断配置服务类型错误")?;
-        let relation =
+        let mut relation =
             crate::qq_message_judge::relation_plugin(options.message_judge, settings.0.clone())?;
+        if options.message_judge != crate::qq_message_judge::MessageJudgeMode::Off {
+            let experience = eve_relation_experience_sqlite::SqliteRelationExperience::open(
+                &options.state_directory.join("jev-experience.sqlite3"),
+            )
+            .map_err(|_| "Jev 经验数据库不可用；保留原文件，不自动清空或重建")?;
+            relation = relation.with_experience(Arc::new(experience));
+        }
         // 只有开启本机面板时才记录实时判断；记录只在内存中，重启后清空。
         let judgments = panel_config
             .as_ref()

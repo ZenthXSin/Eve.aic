@@ -420,3 +420,26 @@ async fn diagnostics_distinguish_preflight_rejection_capacity_timeout_and_drop()
         "本地两次实际准入以外不应重试或发送额外请求"
     );
 }
+
+#[test]
+fn private_plain_answer_needs_current_question_but_not_a_platform_quote() {
+    let mut i = input();
+    let raw = serde_json::to_vec(&output("answer")).unwrap();
+    assert!(decision(&raw, &i).is_err());
+    i.clarification = Some(ClarificationContext {
+        question_id: "current".into(),
+        source_text: "这个也要改".into(),
+        prompt: "改哪里".into(),
+    });
+    i.message.reply_to = None;
+    assert_eq!(
+        decision(&raw, &i).unwrap().parts[0].intent,
+        MessageIntent::Answer
+    );
+    assert_eq!(
+        request(&i, "jev-test").unwrap()["state"]["clarification"]["answer_allowed"],
+        true
+    );
+    i.message.reply_to = Some("different".into());
+    assert!(decision(&raw, &i).is_err());
+}

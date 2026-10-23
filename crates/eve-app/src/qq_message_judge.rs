@@ -7,8 +7,8 @@ use eve_config_api::{
 use eve_jev::{JevConfig, JevConfigurationError, JevRelationJudge};
 use eve_llm_api::LlmModelResolver;
 use eve_message_api::{
-    DiscardRelationObservations, RelationError, RelationFuture, RelationInput, RelationJudge,
-    RelationObservation, RelationObserver, observe_relation,
+    DiscardRelationObservations, RelationError, RelationExample, RelationFuture, RelationInput,
+    RelationJudge, RelationObservation, RelationObserver, observe_relation,
 };
 use eve_message_plugin::RelationPlugin;
 use eve_runtime::LlmRelationJudge;
@@ -190,10 +190,20 @@ impl RelationJudge for JevRoleJudge {
         input: RelationInput,
         observer: Arc<dyn RelationObserver>,
     ) -> RelationFuture<'_> {
+        self.judge_with_examples(input, vec![], observer)
+    }
+    fn judge_with_examples(
+        &self,
+        input: RelationInput,
+        examples: Vec<RelationExample>,
+        observer: Arc<dyn RelationObserver>,
+    ) -> RelationFuture<'_> {
         Box::pin(async move {
             observe_relation(observer.as_ref(), RelationObservation::Supported);
             let selected = self.resolve().map_err(|_| RelationError::Unavailable)?;
-            selected.judge_observed(input, observer).await
+            selected
+                .judge_with_examples(input, examples, observer)
+                .await
         })
     }
 }

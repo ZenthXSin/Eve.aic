@@ -1,0 +1,16 @@
+[package]
+name = "eve-relation-experience-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-message-api = { path = "../message-api" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+eve-control-api = { path = "../control-api" }
+eve-session-api = { path = "../session-api" }

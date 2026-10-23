@@ -344,6 +344,7 @@ dependencies = [
  "eve-qqbot-receipt-sqlite",
  "eve-reference-api",
  "eve-reference-plugin",
+ "eve-relation-experience-sqlite",
  "eve-reminder-api",
  "eve-reminder-plugin",
  "eve-runtime",
@@ -1047,6 +1048,18 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "eve-relation-experience-sqlite"
+version = "0.1.0"
+dependencies = [
+ "eve-control-api",
+ "eve-message-api",
+ "eve-session-api",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

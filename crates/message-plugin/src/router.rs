@@ -326,7 +326,8 @@ impl Inner {
                 .get(&m.target.session.session_id)
                 .filter(|q| {
                     q.target == m.target
-                        && (classification_reply || Some(&q.id) == m.reply_to.as_ref())
+                        && (classification_reply
+                            || m.reply_to.as_ref().is_none_or(|id| id == &q.id))
                 })
                 .cloned();
             if question.is_none() {
@@ -632,12 +633,10 @@ fn clarify(
         ClarifyReason::SideEffects => {
             "刚才已有工具执行，重新运行可能重复操作。要继续处理新要求，请发“新任务：……”或 /new 内容；已发生的操作不会自动撤销。"
         }
-        ClarifyReason::MissingQuestion => "请引用当前任务最近一次澄清问题，或明确说明新要求。",
+        ClarifyReason::MissingQuestion => "当前没有能对应上的待答问题，请直接说明要补充或修改什么",
         ClarifyReason::Unsupported => "尚未支持任务暂停恢复；请明确继续、取消或开始新任务。",
         ClarifyReason::TooLarge => "组合后的请求过长；请提供精简的新要求。",
-        _ => {
-            "你这条是在补充刚才的要求，还是想换个任务？可以直接回“这是补充，继续原任务”或“这是新任务”；也可以说“纠正：……”并说明改哪里。不需要特殊格式。"
-        }
+        _ => "这句话是想调整刚才任务里的哪一处，还是另做一件事",
     };
     RouteOutcome::Clarify {
         reason,

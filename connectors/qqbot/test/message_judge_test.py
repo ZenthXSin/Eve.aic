@@ -26,7 +26,7 @@ CANCELLED = support.CANCELLED
 NO_CURRENT = support.NO_CURRENT
 SIDE_EFFECTS = support.SIDE_EFFECTS
 BRIDGE = ROOT / "connectors/qqbot/test/message-judge-bridge.mjs"
-CLARIFY = "你这条是在补充刚才的要求，还是想换个任务？可以直接回“这是补充，继续原任务”或“这是新任务”；也可以说“纠正：……”并说明改哪里。不需要特殊格式。"
+CLARIFY = "这句话是想调整刚才任务里的哪一处，还是另做一件事"
 UNCHANGED = "当前任务保持不变。"
 PANEL_TOKEN = "synthetic-judge-panel-token-1234567890abcdef"
 LABELS = ("supplement", "correction", "answer", "new_task", "cancel", "continue",
@@ -86,15 +86,17 @@ class MessageJudgeAcceptance(unittest.TestCase):
                     assert body["stream"] is False
                     assert body["max_tokens"] == 256
                     messages = body["messages"]
-                    judge = (len(messages) == 2 and messages[0]["role"] == "system"
+                    judge = (len(messages) == 3 and messages[0]["role"] == "system"
                              and messages[0]["content"].startswith("判断最新消息与当前任务的关系。"))
                     kind = "primary" if judge else "task"
                     if judge:
                         assert not body.get("tools")
+                        assert body["response_format"] == {"type":"json_object"}
+                        assert messages[-2]["role"] == "user"
                 if kind != "task":
                     state = body["state"] if kind == "jev" else json.loads(body["messages"][-1]["content"])
                     assert set(state) == {"message", "task_text", "phase", "cancel_requested",
-                                          "started_tools", "clarification"}
+                                          "started_tools", "clarification"} | ({"examples"} if "examples" in state else set())
                     # Routing identifiers and complete task history remain in the host.
                     assert isinstance(state["message"], str)
                     assert isinstance(state["task_text"], str)
@@ -275,6 +277,43 @@ class MessageJudgeAcceptance(unittest.TestCase):
 
     def counts(self):
         return tuple(len(self.calls[kind]) for kind in ("task", "primary", "jev"))
+
+    def test_plain_private_answer_uses_current_question_without_a_platform_quote(self):
+        self.steps[("task", 1)] = {"wait": "never-release-old", "text": "旧回复不应发送"}
+        self.steps[("primary", 1)] = {"intent": "ambiguous", "confidence": 0}
+        self.steps[("primary", 2)] = {"intent": "answer"}
+        self.steps[("task", 2)] = {"text": "补好了"}
+        self.run_eve([
+            {"send": self.message("base", "生成那份报告", expected_type="finish")}, self.wait_request("task"),
+            {"send": self.message("unclear", "还要那个", CLARIFY)}, self.wait_command("unclear"),
+            {"send": self.message("plain-answer", "补在刚才那份报告里", "补好了", expected_type="reply")},
+            self.wait_command("base", "finish"), self.wait_receipt("plain-answer")], mode="primary")
+        state = json.loads(self.calls["primary"][1]["body"]["messages"][-1]["content"])
+        self.assertTrue(state["clarification"]["answer_allowed"])
+        self.assertFalse(state["clarification"]["reply_matches"])
+        current = self.calls["task"][1]["body"]["messages"][-1]["content"]
+        self.assertIn("补在刚才那份报告里", current)
+        self.assertIn("还要那个", current)
+
+    def test_primary_case_is_saved_and_recalled_to_jev_after_restart(self):
+        self.revision_scenario(jev_step={"confidence": 0.1})
+        import sqlite3
+        path = self.work / "state/jev-experience.sqlite3"
+        with sqlite3.connect(path) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM examples").fetchone()[0], 1)
+        text = "把页数改为两页，保留预算"
+        self.steps[("task", 3)] = {"wait": "never-release-next", "text": "旧回复不应发送"}
+        self.steps[("task", 4)] = {"text": "第二次完成"}
+        self.run_eve([
+            {"send": self.message("base-next", "原始任务", expected_type="finish")}, self.wait_request("task", 3),
+            {"send": self.message("revision-next", text, "第二次完成", expected_type="reply")},
+            self.wait_command("base-next", "finish"), self.wait_receipt("revision-next")], mode="jev")
+        examples = self.calls["jev"][1]["body"]["state"]["examples"]
+        self.assertEqual(len(examples), 1)
+        self.assertEqual(examples[0]["source"], "primary_model")
+        self.assertEqual(examples[0]["parts"][0]["intent"], "correction")
+        self.assertNotIn("user-1", json.dumps(examples))
+        self.assertEqual(len(self.calls["primary"]), 1)
 
     def test_default_queues_ordinary_messages_without_any_judgement(self):
         self.steps[("task", 1)] = {"wait": "release-base"}

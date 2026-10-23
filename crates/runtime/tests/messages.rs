@@ -398,7 +398,9 @@ async fn clarification_answer_requires_latest_same_generation_question() {
         reason(&route(&s, message(&old, "q1", "我不确定要怎么改")).await),
         ClarifyReason::LowConfidence
     );
-    let missing = route(&s, message(&old, "q2", "/answer 两页")).await;
+    let mut missing_input = message(&old, "q2", "/answer 两页");
+    missing_input.reply_to = Some("not-a-current-question".into());
+    let missing = route(&s, missing_input).await;
     assert_eq!(reason(&missing), ClarifyReason::MissingQuestion);
     let mut wrong = message(&old, "q3", "/answer 两页");
     wrong.reply_to = Some("q1".into());
@@ -406,8 +408,7 @@ async fn clarification_answer_requires_latest_same_generation_question() {
         reason(&route(&s, wrong).await),
         ClarifyReason::MissingQuestion
     );
-    let mut answer = message(&old, "answer", "/answer 两页");
-    answer.reply_to = Some("q3".into());
+    let answer = message(&old, "answer", "/answer 两页");
     let RouteOutcome::Replaced { generation, .. } = route(&s, answer).await.outcome else {
         panic!("答复未应用");
     };

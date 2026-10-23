@@ -417,3 +417,73 @@ async fn sink_closure_while_waiting_for_the_session_gate_stops_the_message() {
     assert!(control.submissions.lock().unwrap().is_empty());
     router.0.close().await.unwrap();
 }
+
+struct AnswerJudge;
+impl RelationJudge for AnswerJudge {
+    fn judge(&self, input: RelationInput) -> RelationFuture<'_> {
+        Box::pin(async move {
+            if input.clarification.is_none() {
+                return RulesJudge.judge(input).await;
+            }
+            Ok(RelationDecision {
+                target: input.message.target.clone(),
+                message_id: input.message.message_id.clone(),
+                parts: vec![IntentPart {
+                    intent: MessageIntent::Answer,
+                    confidence: 95,
+                    span: Some(TextSpan {
+                        start: 0,
+                        end: input.message.text.len(),
+                    }),
+                }],
+                explanation: "回答当前未决问题".into(),
+            })
+        })
+    }
+}
+#[tokio::test]
+async fn plain_private_answer_binds_current_question_but_conflicting_quote_does_not() {
+    for conflicting in [false, true] {
+        let control = Control::new(None);
+        let router = router(control.clone(), Arc::new(AnswerJudge));
+        let ticket = router
+            .submit(
+                message(&control, "这个也要改"),
+                Arc::new(DiscardControlEvents),
+            )
+            .unwrap();
+        assert!(matches!(
+            bounded(router.wait(&ticket)).await.unwrap().outcome,
+            RouteOutcome::Clarify { .. }
+        ));
+        let mut reply = message(&control, "就在刚才那份报告里补上预算");
+        reply.message_id = "plain-private-answer".into();
+        if conflicting {
+            reply.reply_to = Some("different-question".into());
+        }
+        let ticket = router
+            .submit(reply, Arc::new(DiscardControlEvents))
+            .unwrap();
+        let report = bounded(router.wait(&ticket)).await.unwrap();
+        if conflicting {
+            assert!(matches!(
+                report.outcome,
+                RouteOutcome::Clarify {
+                    reason: ClarifyReason::MissingQuestion,
+                    ..
+                }
+            ));
+            assert_eq!(control.cancellations.load(Ordering::SeqCst), 0);
+        } else {
+            assert!(matches!(report.outcome, RouteOutcome::Replaced { .. }));
+            let submitted = control.submissions.lock().unwrap();
+            assert!(
+                submitted[0]
+                    .session
+                    .text
+                    .contains("就在刚才那份报告里补上预算")
+            );
+            assert!(submitted[0].session.text.contains("这个也要改"));
+        }
+    }
+}
