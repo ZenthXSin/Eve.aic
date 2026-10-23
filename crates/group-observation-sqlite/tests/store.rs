@@ -130,3 +130,36 @@ fn full_participation_survives_window_and_restart_and_rejects_cross_group_links(
     assert_eq!(store.exchanges("g1").unwrap()[0].source, source);
     assert!(store.exchanges("g2").unwrap().is_empty());
 }
+
+#[test]
+fn legacy_confirmed_pushes_recover_complete_questions_and_answers_but_not_unknown_sends() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("legacy.db");
+    let store = SqliteGroupObservations::open(&path).unwrap();
+    store.append(&message("g1")).unwrap();
+    store.append(&message("g2")).unwrap();
+    store
+        .queue("chime-confirmed", &reply("g1"), "user-1")
+        .unwrap();
+    store.claim().unwrap().unwrap();
+    store.finish("chime-confirmed", true).unwrap();
+    store
+        .queue("chime-unknown", &reply("g2"), "user-1")
+        .unwrap();
+    store.claim().unwrap().unwrap();
+    drop(store);
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("DROP TABLE exchanges; DELETE FROM observations WHERE id='chime-confirmed:reply'; UPDATE metadata SET version=1;").unwrap();
+    }
+    let store = SqliteGroupObservations::open(&path).unwrap();
+    let recovered = store.exchanges("g1").unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].source, message("g1"));
+    assert_eq!(recovered[0].reply.text, reply("g1").text);
+    assert!(store.exchanges("g2").unwrap().is_empty());
+    assert!(store.claim().unwrap().is_none());
+    drop(store);
+    let store = SqliteGroupObservations::open(&path).unwrap();
+    assert_eq!(store.exchanges("g1").unwrap().len(), 1);
+}
