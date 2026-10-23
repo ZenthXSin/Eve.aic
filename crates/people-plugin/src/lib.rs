@@ -24,19 +24,25 @@ fn is_zero(value: &u64) -> bool {
 struct Document {
     version: u8,
     people: Vec<Person>,
-    /// 印象与批次编号计数；只在格式 2 出现。
+    /// 印象与批次编号计数；只在格式 2、3 出现。
     #[serde(default, skip_serializing_if = "is_zero")]
     next: u64,
 }
 impl Document {
-    /// 没有印象或待学原话时仍写格式 1，旧程序照常读取。
+    /// 没有印象或待学原话时仍写格式 1，有来访记录时写格式 3；只在用到时升级，旧程序照常读取旧格式。
     fn bytes(&mut self) -> PluginResult<Vec<u8>> {
         let extended = self.next > 0
             || self
                 .people
                 .iter()
                 .any(|p| !p.impressions.is_empty() || !p.pending.is_empty());
-        self.version = if extended { 2 } else { 1 };
+        self.version = if self.people.iter().any(|p| p.presence.is_some()) {
+            3
+        } else if extended {
+            2
+        } else {
+            1
+        };
         let bytes = serde_json::to_vec(self).map_err(|_| unavailable())?;
         if bytes.len() > MAX_STATE_BYTES {
             return Err(PluginError::Task("人名目录容量已满；原记录保留".into()));
@@ -120,6 +126,7 @@ impl PeopleDirectory for PeopleController {
                     revision: 1,
                     impressions: vec![],
                     pending: vec![],
+                    presence: None,
                 });
             }
         }
@@ -151,6 +158,7 @@ impl PeopleDirectory for PeopleController {
             .map(|p| Person {
                 impressions: vec![],
                 pending: vec![],
+                presence: None,
                 ..p.clone()
             })
             .collect();
@@ -164,6 +172,41 @@ impl PeopleDirectory for PeopleController {
             others,
             truncated,
         }))
+    }
+    fn visit(&self, participant: &str, scene: Scene, now_ms: u64) -> PluginResult<()> {
+        if !valid_identity(participant) {
+            return Err(unavailable());
+        }
+        let mut inner = self.inner.lock().map_err(|_| unavailable())?;
+        let loaded = inner.as_ref().ok_or_else(unavailable)?;
+        let mut document = loaded.document.clone();
+        let Some(person) = document
+            .people
+            .iter_mut()
+            .find(|p| p.scope.participant == participant)
+        else {
+            return Err(unavailable());
+        };
+        person.presence = Some(match person.presence.take() {
+            None => Presence {
+                scene,
+                first_seen_ms: now_ms,
+                last_seen_ms: now_ms,
+                previous_seen_ms: None,
+                messages: 1,
+            },
+            // 场景随身份固定；不一致说明数据有误，保留原记录。
+            Some(old) if old.scene != scene => return Err(unavailable()),
+            // 时钟倒退时只计数，不让时间往回走。
+            Some(old) => Presence {
+                scene,
+                first_seen_ms: old.first_seen_ms,
+                last_seen_ms: old.last_seen_ms.max(now_ms),
+                previous_seen_ms: Some(old.last_seen_ms),
+                messages: old.messages.checked_add(1).ok_or_else(unavailable)?,
+            },
+        });
+        Self::commit(&mut inner, document)
     }
     fn note(&self, participant: &str, text: &str) -> PluginResult<()> {
         let text = text.trim();
@@ -344,8 +387,10 @@ impl PeoplePlugin {
 fn valid_document(document: &Document) -> bool {
     let mut ids = BTreeSet::new();
     let mut impression_ids = BTreeSet::new();
-    let extended = document.version == 2;
+    let extended = matches!(document.version, 2 | 3);
+    let visits = document.version == 3;
     (extended || (document.version == 1 && document.next == 0))
+        && (!visits || document.people.iter().any(|p| p.presence.is_some()))
         && document.people.len() <= MAX_PEOPLE
         && !document.people.iter().any(|p| {
             !valid_identity(&p.scope.conversation)
@@ -354,6 +399,7 @@ fn valid_document(document: &Document) -> bool {
                 || !ids.insert(p.scope.participant.clone())
                 || p.name.as_ref().is_some_and(|n| !valid_name(&n.value))
                 || (!extended && (!p.impressions.is_empty() || !p.pending.is_empty()))
+                || p.presence.as_ref().is_some_and(|v| !visits || !v.valid())
                 || p.impressions.len() > MAX_IMPRESSIONS
                 || p.pending.len() > MAX_IMPRESSION_PENDING
                 || p.pending

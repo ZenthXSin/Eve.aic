@@ -1627,6 +1627,12 @@ async fn run_qqbot_composed(
             inner: bootstrap.context.take().ok_or("对话上下文缺失")?,
             admin: qq_admin.clone(),
         }));
+        // 每轮身份卡：场景、称呼来源、角色与来访情况，全部由宿主依据可信来源判定。
+        bootstrap.context = Some(Arc::new(crate::qq_identity::IdentityContext {
+            inner: bootstrap.context.take().ok_or("对话上下文缺失")?,
+            people: people.clone(),
+            admin: qq_admin.clone(),
+        }));
         // 子代理在工具执行期内等待结果；按配置上限放宽这一个工具的期限，实际期限由工具按配置控制。
         if options.subagents {
             bootstrap.host_config.tool_timeout_overrides.insert(

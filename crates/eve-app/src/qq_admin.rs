@@ -76,6 +76,21 @@ impl Admin {
         let key = SessionKey::new(&scope.session_id, &scope.user_id).ok()?;
         self.conversations.identity(&key).ok()??.subject.into()
     }
+    /// 是否已在 runtime.people 绑定主人账号；读取失败按未绑定处理。
+    pub(crate) fn owner_bound(&self) -> bool {
+        (|| {
+            let id = eve_plugin_api::ServiceId::new(eve_config_api::CONFIG_SERVICE_ID).ok()?;
+            let service = self.registry.get(&id).ok()??;
+            let config = service
+                .value
+                .downcast::<eve_config_api::ConfigServiceHandle>()
+                .ok()?;
+            let snapshot = config.0.snapshot(crate::qq_people::NAMESPACE, 1).ok()?;
+            let (_, owners) = crate::qq_people::settings(&snapshot).ok()?;
+            Some(!owners.is_empty())
+        })()
+        .unwrap_or(false)
+    }
     pub(crate) fn is_owner(&self, scope: &ContextScope) -> bool {
         let result = (|| {
             let id = eve_plugin_api::ServiceId::new(eve_config_api::CONFIG_SERVICE_ID).ok()?;

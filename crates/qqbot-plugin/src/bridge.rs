@@ -1781,7 +1781,7 @@ pub(crate) async fn run(
                                 }
                                 if private_text.is_none() && let Some(observer) = &participant_observer {
                                     let session = message.session_key(&config.app_id)?;
-                                    if let Err(error) = observer.observe(&session, &message.conversation_key(&config.app_id)?, &message.text, sender_name.as_deref()) {
+                                    if let Err(error) = observer.observe(&session, &message.conversation_key(&config.app_id)?, message.scope == "c2c", &message.text, sender_name.as_deref()) {
                                         if matches!(error, PluginError::State(_)) { return Err(error); }
                                         warn(&ctx, "participant_metadata_not_saved");
                                     }

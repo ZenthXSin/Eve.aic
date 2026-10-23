@@ -88,6 +88,35 @@ pub fn valid_impression_text(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
+/// 来访场景；同一参与者的身份摘要已包含私聊/群，场景不会变。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scene {
+    Private,
+    Group,
+}
+/// 宿主按每条收到的消息记录的来访情况；只来自平台事件，不来自对话文字。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Presence {
+    pub scene: Scene,
+    pub first_seen_ms: u64,
+    pub last_seen_ms: u64,
+    /// 本条之前最近一次来访；第一次来时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_seen_ms: Option<u64>,
+    pub messages: u64,
+}
+impl Presence {
+    pub fn valid(&self) -> bool {
+        self.messages > 0
+            && self.first_seen_ms <= self.last_seen_ms
+            && self.previous_seen_ms.is_none_or(|p| {
+                self.messages > 1 && self.first_seen_ms <= p && p <= self.last_seen_ms
+            })
+            && (self.messages == 1) == self.previous_seen_ms.is_none()
+    }
+}
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Person {
@@ -100,6 +129,9 @@ pub struct Person {
     /// 待学原话，只在持久状态中出现，任何视图都不包含。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending: Vec<String>,
+    /// 来访情况；视图只给当前发言者本人。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence: Option<Presence>,
 }
 #[derive(Clone, Serialize)]
 pub struct PeopleView {
@@ -114,6 +146,10 @@ pub trait PeopleDirectory: Send + Sync {
     fn view(&self, participant: &str) -> PluginResult<Option<PeopleView>>;
     /// 缓冲此人一条可能谈及自己的原话；未开启印象学习时忽略。须先 observe 过此人。
     fn note(&self, _participant: &str, _text: &str) -> PluginResult<()> {
+        Ok(())
+    }
+    /// 记一次来访：须先 observe 过此人。时间倒退时不改写已有记录。不实现时不记录。
+    fn visit(&self, _participant: &str, _scene: Scene, _now_ms: u64) -> PluginResult<()> {
         Ok(())
     }
     fn take_impression_batch(&self) -> PluginResult<Option<ImpressionBatch>> {
