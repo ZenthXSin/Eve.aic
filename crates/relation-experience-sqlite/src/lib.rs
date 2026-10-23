@@ -137,7 +137,7 @@ impl RelationExperienceStore for SqliteRelationExperience {
                 let task_overlap = task.intersection(&grams(&example.task_text)).count().min(20);
                 ranked.push((score,task_overlap,sequence,example));
             }
-            ranked.sort_by(|a,b|(b.0,b.1,b.2).cmp(&(a.0,a.1,a.2)));
+            ranked.sort_by_key(|row| std::cmp::Reverse((row.0,row.1,row.2)));
             Ok(ranked.into_iter().take(MAX_RELATION_EXAMPLES).map(|r|r.3).collect())
         })())
     }
