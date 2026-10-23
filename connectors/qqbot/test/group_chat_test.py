@@ -4,6 +4,11 @@
 """
 import json
 import sqlite3
+import os
+import signal
+import subprocess
+import time
+from pathlib import Path
 import unittest
 import reminder_test
 from dialogue_tools_test import text_response
@@ -100,5 +105,70 @@ class GroupChatAcceptance(reminder_test.ReminderAcceptance):
         self.assertEqual(self.kind('chime'),[])
         self.assertEqual(self.pushes(),[])
         self.assertEqual(len(self.rows('observations')),2)
+
+    def test_production_node_entry_keeps_group_flags_after_environment_cleanup(self):
+        # 启动真正的 Rust -> bridge.mjs -> SDK 导入链，只替换 SDK 网络层。
+        root=self.work/'production-bridge'
+        root.mkdir()
+        source=Path(__file__).resolve().parents[1]
+        for name in ['bridge.mjs','bridge-core.mjs']:
+            (root/name).write_bytes((source/name).read_bytes())
+        sdk=root/'node_modules/@tencent-connect/qqbot-nodejs'
+        sdk.mkdir(parents=True)
+        (sdk/'package.json').write_text(json.dumps({'type':'module','exports':'./index.mjs'}))
+        record=self.work/'sdk-sends.jsonl'
+        sdk_code=r'''import fs from "node:fs";
+const record=RECORD_PATH;
+export class QQBot {
+  constructor(options) {
+    if (process.env.EVE_OPENAI_API_KEY) throw new Error("model_credentials_leaked");
+    if (process.env.QQBOT_GROUP_OBSERVE!=="true" || process.env.QQBOT_GROUP_MENTION!=="true") throw new Error("group_flags_missing_after_cleanup");
+    this.appId=options.appId;this.handlers=new Map();this.count=0;
+  }
+  on(name,handler){this.handlers.set(name,handler);}
+  message(id,speaker,content,event){this.handlers.get("message")({}, {kind:"group",messageId:id,senderId:speaker,content,rawEventType:event,groupOpenid:"wire-group",replyTarget:{scope:"group",targetId:"wire-group",msgId:id}});}
+  start(){
+    this.handlers.get("ready")();
+    this.message("wire-unmentioned","wire-member-1","Eve，这个思路你怎么看","GROUP_MESSAGE_CREATE");
+    return new Promise(resolve=>{this.resolve=resolve;});
+  }
+  async sendText(target,text){
+    fs.appendFileSync(record,JSON.stringify({target,text})+"\n");
+    this.count++;
+    if (this.count===1) setTimeout(()=>this.message("wire-mentioned","wire-member-2","你好","GROUP_AT_MESSAGE_CREATE"),20);
+    return {id:"sdk-sent-"+this.count};
+  }
+  stop(){this.resolve?.();}
+}
+'''
+        (sdk/'index.mjs').write_text(sdk_code.replace('RECORD_PATH',json.dumps(str(record))))
+        self.runs+=1
+        env={key:os.environ[key] for key in ('PATH','SystemRoot','SYSTEMROOT','TEMP','TMP') if key in os.environ}
+        env.update(QQBOT_APP_SECRET='test-app-secret',QQBOT_APP_ID='1904159860',EVE_OPENAI_API_KEY='test-model-secret',
+                   EVE_OPENAI_BASE_URL=f'http://127.0.0.1:{self.server.server_port}',EVE_OPENAI_PROTOCOL='chat',EVE_LLM_RESPONSE_MODE='complete',EVE_DEBOUNCE_MS='0')
+        child=subprocess.Popen([str(reminder_test.BINARY),'--group-chat','--training','--state-dir',str(self.work/'state'),
+            '--agent',str(source.parents[1]/'AGENT.md'),'--bridge-script',str(root/'bridge.mjs')],env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        try:
+            self.wait_for(lambda:child.poll() is not None or (record.exists() and len(record.read_text().splitlines())>=2),'生产 Node 链路没有发送两条回复',20)
+            if child.poll() is not None:
+                stdout,stderr=child.communicate(timeout=5)
+                self.fail('生产桥接提前退出：'+stderr)
+            self.wait_outbound()
+            self.wait_for(lambda:any(e['message']['id']=='wire-mentioned' and e['state']=='Sent' for e in self.documents().get('eve.channel.qqbot',{}).get('receipts.v1',{}).get('entries',[])),'普通群回复回执未保存',10)
+            child.send_signal(signal.SIGTERM)
+            stdout,stderr=child.communicate(timeout=15)
+            self.assertEqual(child.returncode,0,stderr)
+            sends=[json.loads(line) for line in record.read_text().splitlines()]
+            self.assertEqual(len(sends),2)
+            self.assertTrue(sends[0]['text'].startswith('<@wire-member-1> '),sends)
+            self.assertEqual(sends[0]['target'],{'scope':'group','targetId':'wire-group'})
+            self.assertTrue(sends[1]['text'].startswith('<@wire-member-2> '),sends)
+            self.assertEqual(sends[1]['target']['msgId'],'wire-mentioned')
+            self.assertTrue(any(not json.loads(row['payload'])['mentions_me'] and not json.loads(row['payload'])['from_me'] for row in self.rows('observations')))
+            for secret in ['test-app-secret','test-model-secret']:
+                self.assertNotIn(secret,stdout+stderr)
+        finally:
+            if child.poll() is None:
+                child.kill();child.communicate(timeout=5)
 
 if __name__=='__main__': unittest.main()

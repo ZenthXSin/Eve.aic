@@ -822,6 +822,11 @@ pub(crate) async fn run(
         steps: steps_tx,
     });
     let mut command = Command::new(&config.node_program);
+    command
+        .arg(&config.bridge_script)
+        .args(&config.bridge_args)
+        .env_clear();
+    // 先清理继承环境，再写入宿主确定的功能开关，避免开关被 env_clear 清除。
     command.env(
         "QQBOT_GROUP_OBSERVE",
         if group_observer.is_some() {
@@ -838,10 +843,7 @@ pub(crate) async fn run(
             "false"
         },
     );
-    command
-        .arg(&config.bridge_script)
-        .args(&config.bridge_args)
-        .env_clear();
+
     for name in ["PATH", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP"] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
