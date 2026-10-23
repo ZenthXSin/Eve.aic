@@ -18,7 +18,6 @@ use eve_plugin_api::{PluginError, PluginResult};
 use eve_practice_api::{NoteTally, PracticeAdmin, note_tallies};
 use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput};
 use std::{
-    cmp::Reverse,
     collections::BTreeMap,
     fmt::Write,
     sync::Arc,
@@ -48,6 +47,7 @@ pub(crate) struct Background {
     task: JoinHandle<Result<(), AppError>>,
 }
 impl Background {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         knowledge: Arc<dyn KnowledgeAdmin>,
         cognition: Arc<dyn CognitionAdmin>,
@@ -55,6 +55,7 @@ impl Background {
         policy: SourcePolicy,
         plans: Option<Arc<dyn PlanJournal>>,
         gate: qq_budget::Gate,
+        learning_progress: bool,
     ) -> Self {
         let (active, activated) = watch::channel(false);
         let (stop, stopped) = watch::channel(false);
@@ -62,7 +63,15 @@ impl Background {
         let task = tokio::spawn(async move {
             // Sender 在 panic 时也释放；宿主随后关闭通道，不假装后台仍正常。
             let result = run(
-                knowledge, cognition, researcher, policy, plans, gate, activated, stopped,
+                knowledge,
+                cognition,
+                researcher,
+                policy,
+                plans,
+                gate,
+                learning_progress,
+                activated,
+                stopped,
             )
             .await;
             let _ = finished_sender.send(true);
@@ -131,6 +140,7 @@ async fn run(
     policy: SourcePolicy,
     plans: Option<Arc<dyn PlanJournal>>,
     gate: qq_budget::Gate,
+    learning_progress: bool,
     mut active: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
 ) -> Result<(), AppError> {
@@ -170,12 +180,54 @@ async fn run(
                         .map(|owner| (goal, owner))
                 })
                 .collect();
-            goals.sort_by_key(|(goal, _)| (Reverse(goal.priority), goal.id.clone()));
+            // 暂停状态损坏时停止准入，不把损坏记录当作首次运行。
+            let mut paused = std::collections::BTreeSet::new();
+            for (goal, _) in &goals {
+                if learning_progress
+                    && crate::qq_pursuit::learning_goal(goal).is_some()
+                    && eve_pursuit_plugin::progress_record(&snapshot.state, &goal.id)
+                        .map_err(|error| format!("长期目标进展不可读：{error}"))?
+                        .is_some_and(|record| record.paused)
+                {
+                    paused.insert(goal.id.clone());
+                }
+            }
+            goals.retain(|(goal, _)| !paused.contains(&goal.id));
+            let service_history = knowledge.snapshot()?;
+            goals.sort_by_key(|(goal, _)| {
+                let managed = learning_progress && crate::qq_pursuit::learning_goal(goal).is_some();
+                let last = if managed {
+                    service_history
+                        .runs_for(&goal.id)
+                        .map(|run| run.started_at_ms)
+                        .max()
+                } else {
+                    None
+                };
+                (
+                    managed,
+                    eve_pursuit_plugin::fair_order_key(last, goal.priority, &goal.id),
+                )
+            });
             for (goal, owner) in goals {
                 if *stopped.borrow() {
                     return Ok(());
                 }
-                let run = match knowledge.begin(topic(goal, owner), &policy, &version, now_ms()?) {
+                let began = {
+                    let _admission = eve_pursuit_plugin::progress_admission_guard()
+                        .map_err(|error| error.to_string())?;
+                    let current = cognition.snapshot().map_err(|error| error.to_string())?;
+                    if current.state.goals.get(&goal.id) != Some(goal)
+                        || (learning_progress
+                            && crate::qq_pursuit::learning_goal(goal).is_some()
+                            && !eve_pursuit_plugin::progress_admitted(&current.state, &goal.id)
+                                .map_err(|error| error.to_string())?)
+                    {
+                        continue;
+                    }
+                    knowledge.begin(topic(goal, owner), &policy, &version, now_ms()?)
+                };
+                let run = match began {
                     Ok(Some(run)) => run,
                     Ok(None) => continue,
                     // 容量满保留原记录：停止新研究，已有知识仍可查看。
