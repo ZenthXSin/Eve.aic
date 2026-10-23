@@ -1,4 +1,6 @@
 //! 有界交互证据与明确偏好；宿主保留管理能力，不发布通用管理服务。
+mod unified;
+pub use unified::{UnifiedMemoryController, UnifiedMemoryPlugin};
 mod archive;
 pub use archive::{ArchivePolicy, FileEvidenceArchive};
 mod context;

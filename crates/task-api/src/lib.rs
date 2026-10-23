@@ -4,9 +4,11 @@
 //! 创建、开始、结束与每次通知尝试都先持久化。执行中进程退出时在持久化的安全边界接续，未知工具结果不自动重放；
 //! 发送通知时进程退出记为结果未知，不重发。
 mod profiles;
+mod strategy;
 pub use profiles::*;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+pub use strategy::*;
 
 pub const TASK_PLUGIN_ID: &str = "eve.task";
 pub const TASK_STATE_KEY: &str = "tasks.v1";
@@ -367,6 +369,14 @@ impl TaskSnapshot {
 /// 仅可信宿主持有；不发布给模型或不受信插件。
 pub trait TaskAdmin: Send + Sync {
     fn snapshot(&self) -> TaskResult<TaskSnapshot>;
+    /// 可选的宿主策略装配：在首次执行前固定选择；普通任务默认不使用策略。
+    fn strategy_guidance(&self, _task: &Task) -> TaskResult<Option<TaskStrategyGuidance>> {
+        Ok(None)
+    }
+    /// 只结算已保存的任务结果；不执行任务、不重放工具。
+    fn reconcile_strategies(&self) -> TaskResult<()> {
+        Ok(())
+    }
     /// 保存一条排队任务。同一用户、同一来源只创建一条：重复执行时返回原记录。
     fn create(
         &self,

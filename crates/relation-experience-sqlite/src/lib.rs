@@ -1,5 +1,7 @@
 //! 单宿主的 Jev 分类经验库。范围键只留在本机，示例不是事实、指令或授权。
 use eve_message_api::*;
+mod group;
+pub use group::SqliteGroupRelations;
 use rusqlite::{Connection, params};
 use std::{
     collections::BTreeSet,

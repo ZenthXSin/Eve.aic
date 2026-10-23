@@ -238,6 +238,9 @@ struct FakeDrafter {
     calls: AtomicU64,
 }
 impl PracticeDrafter for FakeDrafter {
+    fn supports_guidance(&self) -> bool {
+        true
+    }
     fn version(&self) -> &str {
         "fake-drafter:v1"
     }
@@ -1052,4 +1055,39 @@ async fn corrupt_or_inconsistent_ledgers_are_refused_and_preserved() {
         assert!(open(world.store.clone()).await.is_err());
         assert_eq!(world.store.raw().unwrap(), bytes, "原字节保留");
     }
+}
+
+#[tokio::test]
+async fn strategy_guidance_bypasses_skill_choice_and_uses_the_actual_drafter() {
+    let world = World::new().await;
+    world.practice("source", vec![item("lamp", "7")]).await;
+    world.consolidate(Ok(proposal(None, 900, "7"))).await;
+    let drafter = world.skill_drafter();
+    assert!(drafter.supports_guidance());
+    let before = world.selector.requests.lock().unwrap().len();
+    world
+        .drafter
+        .replies
+        .lock()
+        .unwrap()
+        .push_back(item("torch", "8"));
+    let request = DraftRequest {
+        run_id: eve_practice_api::run_id("independent", 1),
+        drafter_version: drafter.version().into(),
+        attempt: 1,
+        task: task("independent"),
+        runner: profile(),
+        previous: None,
+        guidance: Some(PracticeGuidance {
+            version: 1,
+            source_run: eve_practice_api::run_id("source", 1),
+            source_sha256: "a".repeat(64),
+            previous_issues: vec!["previous warning".into()],
+            corrected_example: item("lamp", "7"),
+        }),
+    };
+    let draft = drafter.draft(request).await.unwrap();
+    assert!(same_artifact(&draft, &item("torch", "8")));
+    assert_eq!(world.selector.requests.lock().unwrap().len(), before);
+    world.host.kernel.stop_all().await.unwrap();
 }

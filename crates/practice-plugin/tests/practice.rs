@@ -140,6 +140,9 @@ struct FakeDrafter {
     store: Arc<Store>,
 }
 impl PracticeDrafter for FakeDrafter {
+    fn supports_guidance(&self) -> bool {
+        true
+    }
     fn version(&self) -> &str {
         "fake-drafter:v1"
     }
@@ -571,3 +574,6 @@ async fn unconfirmed_commits_close_the_handle_and_corrupt_state_is_refused_witho
         assert_eq!(store.raw().unwrap(), bytes, "损坏状态保留原字节");
     }
 }
+
+#[path = "support/strategy_cases.rs"]
+mod strategy_cases;
