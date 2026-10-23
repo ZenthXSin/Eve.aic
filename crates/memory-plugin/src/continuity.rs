@@ -70,6 +70,10 @@ impl MemoryContinuityReader for Reader {
                 return Err(MemoryError::InvalidInput);
             }
         }
+        let admitted: BTreeSet<_> = grants
+            .iter()
+            .map(|grant| (grant.scope.clone(), grant.interactions))
+            .collect();
         let source_limit_reached = grants.len() > MAX_CONTINUITY_SOURCES;
         for grant in grants.into_iter().take(MAX_CONTINUITY_SOURCES) {
             let snapshot = self
@@ -140,13 +144,36 @@ impl MemoryContinuityReader for Reader {
                 .preferences
                 .retain(|p| selected.contains(&(source, p.id.clone())));
         }
-        let mut remaining = MAX_CONTINUITY_HITS;
-        for source in &mut sources {
-            if source.hits.len() > remaining {
-                truncated = true;
-                source.hits.truncate(remaining);
-            }
-            remaining -= source.hits.len();
+        // 同一词法实现的分数可比较；先全局排序再限额，防止前一个来源耗尽名额。
+        let mut ranked: Vec<_> = sources
+            .iter()
+            .enumerate()
+            .flat_map(|(source, value)| {
+                value
+                    .hits
+                    .iter()
+                    .enumerate()
+                    .map(move |(hit, value)| (value.score, source, hit))
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        truncated |= ranked.len() > MAX_CONTINUITY_HITS;
+        let selected_hits: BTreeSet<_> = ranked
+            .into_iter()
+            .take(MAX_CONTINUITY_HITS)
+            .map(|(_, source, hit)| (source, hit))
+            .collect();
+        for (source, value) in sources.iter_mut().enumerate() {
+            let mut index = 0;
+            value.hits.retain(|_| {
+                let keep = selected_hits.contains(&(source, index));
+                index += 1;
+                keep
+            });
         }
         sources.retain(|s| !s.preferences.is_empty() || !s.hits.is_empty());
         let mut view = MemoryContinuityView {
@@ -169,6 +196,17 @@ impl MemoryContinuityReader for Reader {
             if source.hits.is_empty() && source.preferences.is_empty() {
                 view.sources.pop();
             }
+        }
+        // 组装期间撤销或缩小授权时不给调用方返回旧许可下读取的资料。
+        let current: BTreeSet<_> = self
+            .service
+            .policy
+            .grants(&self.target, &candidates)?
+            .into_iter()
+            .map(|grant| (grant.scope, grant.interactions))
+            .collect();
+        if admitted != current {
+            return Err(MemoryError::StaleRevision);
         }
         view.validate_for(&self.target, query)?;
         Ok(view)

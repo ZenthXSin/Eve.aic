@@ -72,6 +72,7 @@ pub(crate) fn identity_groups(snapshot: &ConfigSnapshot) -> Result<Vec<BTreeSet<
 pub(crate) struct Policy {
     pub(crate) registry: Arc<dyn ServiceRegistry>,
     pub(crate) conversations: QqConversations,
+    pub(crate) unified: Option<Arc<dyn UnifiedMemoryAdmin>>,
 }
 impl MemoryContinuityPolicy for Policy {
     fn grants(
@@ -168,6 +169,15 @@ impl MemoryContinuityPolicy for Policy {
                 scope: source.clone(),
                 interactions,
             });
+        }
+        // 跨通道需要独立、定向、可撤销授权；同一 QQ 内仍由上面的实时隐私配置决定。
+        if let Some(unified) = &self.unified {
+            let cross_channel: Vec<_> = candidates
+                .iter()
+                .filter(|source| source.channel != target.channel)
+                .cloned()
+                .collect();
+            grants.extend(unified.grants(target, &cross_channel)?);
         }
         Ok(grants)
     }

@@ -2,6 +2,7 @@
 mod file_observation;
 mod goal_feedback;
 mod strict_json;
+mod world_model;
 use eve_cognition_api::*;
 use eve_plugin_api::{
     Cleanup, Plugin, PluginContext, PluginError, PluginFuture, PluginId, PluginManifest,
@@ -10,6 +11,9 @@ use eve_plugin_api::{
 pub use file_observation::UserGoalFileObservation;
 pub use goal_feedback::UserGoalFeedback;
 use std::sync::{Arc, Mutex, MutexGuard};
+pub use world_model::{
+    WorldModelController, WorldModelPlugin, capability_estimates, evaluate_world_receipt,
+};
 
 pub const COGNITION_STATE_KEY: &str = "cognition.v1";
 
