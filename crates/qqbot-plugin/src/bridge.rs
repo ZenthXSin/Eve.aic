@@ -807,7 +807,15 @@ pub(crate) async fn run(
                 session_id: session.session_id,
                 user_id: session.user_id,
             };
-            training.observe_user_message(&scope, &entry.message.id, &entry.message.text)?;
+            if training
+                .observe_user_message(&scope, &entry.message.id, &entry.message.text)
+                .is_err()
+            {
+                // 与在线观察一致：学习容量或单条来源冲突不能阻止通道启动。
+                // 原表达状态和平台回执保留，不重放工具或发送；错误不能冒充已学习。
+                warn(&ctx, "expression_history_observation_failed");
+                break;
+            }
         }
     }
     let (closed, receiver) = watch::channel(false);
