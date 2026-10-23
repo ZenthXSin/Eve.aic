@@ -56,8 +56,8 @@ class GroupRelationAcceptance(group_chat_test.GroupChatAcceptance):
                  EVE_MODELS_JEV_TIMEOUT_MS='10000',EVE_CHIME_COOLDOWN_MS='0',
                  EVE_GROUP_RELATION_ACTIVE_INTERVAL_MS='3000',EVE_GROUP_RELATION_REVIEW_INTERVAL_MS='1000')
         env.update(options.pop('env_extra',{}))
-        return reminder_test.base().run_eve(self,script,interest=False,research=False,practice=False,
-            more=['--group-chat','--training','--message-judge','jev'],env_extra=env,panel=True,timeout=45,**options)
+        return reminder_test.base().run_eve(self,script,interest=True,research=False,practice=False,
+            more=['--group-chat','--training','--message-judge','jev','--autonomy-budget','100'],env_extra=env,panel=True,timeout=45,**options)
 
     def classify(self,decoded,latest):
         if isinstance(decoded,dict) and {'input','subsequent'} <= set(decoded): return 'group_review'

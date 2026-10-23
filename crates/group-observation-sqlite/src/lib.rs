@@ -29,7 +29,7 @@ impl SqliteGroupObservations {
         if marker.exists() && !exists {
             return Err("群消息数据库缺失；保留现场，请恢复原数据库".into());
         }
-        let db = Connection::open(path).map_err(|_| BROKEN)?;
+        let mut db = Connection::open(path).map_err(|_| BROKEN)?;
         db.busy_timeout(Duration::from_millis(100))
             .map_err(|_| BROKEN)?;
         if !exists {
@@ -69,6 +69,7 @@ impl SqliteGroupObservations {
             .map_err(|_| BROKEN)?;
         db.pragma_update(None, "synchronous", "FULL")
             .map_err(|_| BROKEN)?;
+        recover_confirmed(&mut db)?;
         // 上次进程未确认的发送不重试，窗口只供读取，不主动重放旧消息。
         db.execute(
             "UPDATE outbound SET status='unknown' WHERE status IN ('queued','sending')",
@@ -111,6 +112,86 @@ impl SqliteGroupObservations {
         }
         result
     }
+}
+/// 旧格式已经有成功投递正文和原消息，只补齐可验证问答，不推断未知发送结果。
+fn recover_confirmed(db: &mut Connection) -> Result<(), String> {
+    let tx = db.transaction().map_err(|_| BROKEN)?;
+    let rows: Vec<(String, String, String, String)> = {
+        let mut query=tx.prepare("SELECT o.id,o.conversation,o.reply_to,o.payload FROM outbound o WHERE o.status='sent' AND NOT EXISTS(SELECT 1 FROM exchanges x WHERE x.conversation=o.conversation AND x.reply=o.id||':reply')").map_err(|_|BROKEN)?;
+        query
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map_err(|_| BROKEN)?
+            .collect::<Result<_, _>>()
+            .map_err(|_| BROKEN)?
+    };
+    for (id, conversation, source, payload) in rows {
+        let outbound = outbound(payload)?;
+        if outbound.id != id
+            || outbound.reply.conversation != conversation
+            || outbound.reply.reply_to != source
+        {
+            return Err(BROKEN.into());
+        }
+        let original: String = tx
+            .query_row(
+                "SELECT payload FROM observations WHERE conversation=?1 AND id=?2",
+                params![conversation, source],
+                |r| r.get(0),
+            )
+            .map_err(|_| BROKEN)?;
+        let original: GroupMessage = serde_json::from_str(&original).map_err(|_| BROKEN)?;
+        if !original.valid() || original.from_me || original.conversation != conversation {
+            return Err(BROKEN.into());
+        }
+        let reply_id = format!("{id}:reply");
+        let saved: Option<String> = tx
+            .query_row(
+                "SELECT payload FROM observations WHERE conversation=?1 AND id=?2",
+                params![conversation, reply_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|_| BROKEN)?;
+        if let Some(saved) = saved {
+            let saved: GroupMessage = serde_json::from_str(&saved).map_err(|_| BROKEN)?;
+            if !saved.valid()
+                || !saved.from_me
+                || saved.text != outbound.reply.text
+                || saved.conversation != conversation
+            {
+                return Err(BROKEN.into());
+            }
+        } else {
+            // 这是恢复时观察到的已确认旧回复，记录恢复时刻，不编造原平台发送时间。
+            let reply = GroupMessage {
+                id: reply_id.clone(),
+                conversation: conversation.clone(),
+                speaker: "eve-chime".into(),
+                speaker_name: Some("Eve".into()),
+                text: outbound.reply.text,
+                mentions_me: false,
+                replies_to_me: false,
+                from_me: true,
+                at_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(1, |v| v.as_millis() as u64)
+                    .max(original.at_ms.saturating_add(1)),
+            };
+            let payload = serde_json::to_string(&reply).map_err(|_| BROKEN)?;
+            tx.execute(
+                "INSERT INTO observations(conversation,id,payload) VALUES(?1,?2,?3)",
+                params![conversation, reply_id, payload],
+            )
+            .map_err(|_| BROKEN)?;
+        }
+        tx.execute(
+            "INSERT INTO exchanges(conversation,source,reply) VALUES(?1,?2,?3)",
+            params![conversation, source, reply_id],
+        )
+        .map_err(|_| BROKEN)?;
+    }
+    tx.commit().map_err(|_| BROKEN)?;
+    Ok(())
 }
 fn outbound(raw: String) -> Result<GroupOutbound, String> {
     let value: GroupOutbound = serde_json::from_str(&raw).map_err(|_| BROKEN)?;

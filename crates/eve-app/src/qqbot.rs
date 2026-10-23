@@ -1873,9 +1873,9 @@ async fn run_qqbot_composed(
                     store,
                     group.store.clone(),
                     judge,
-                    Arc::new(eve_chime_plugin::ModelGroupRelationReviewer::new(budgeted(
-                        "group_relation_learning",
-                    )?)),
+                    Arc::new(eve_chime_plugin::ModelGroupRelationReviewer::new(
+                        budget_gate.wrap(observed("group_relation_learning")?, "group-relation")?,
+                    )),
                 )))
             } else {
                 None
