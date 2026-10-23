@@ -53,6 +53,9 @@ class SummaryAcceptance(digest.ConversationDigestAcceptance):
                     job = outer.jobs()[-1]
                     assert job["status"] == "Running" and job["batch"] == batch
                     assert not body.get("tools")
+                    assert body.get("response_format") == {"type":"json_object"}
+                    assert body["messages"][-2]["role"] == "user"
+                    assert "待归纳的数据" in body["messages"][-2]["content"]
                     assert all("assistant_text" not in source for source in batch["sources"])
                     source = next(s for s in batch["sources"] if s["evidence_id"] in batch["consumed_ids"])
                     points = [*batch["previous"], {"text": "用户提到：" + source["user_text"],

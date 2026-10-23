@@ -1,4 +1,5 @@
 """Actual Eve process + production plugin + fake Node/loopback Chat HTTP."""
+from request_messages import conversation_messages
 import hashlib
 import json
 from fixture_auth import bootstrap_test_admin
@@ -447,7 +448,7 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(len(self.documents()["eve.session"]["sessions.v1"]["sessions"]), 3)
         for request, expected in zip(self.requests, ["one", "two", "three"]):
             messages = request["messages"]
-            self.assertEqual([m["content"] for m in messages if m["role"] == "user"], [expected])
+            self.assertEqual([m["content"] for m in conversation_messages(messages) if m["role"] == "user"], [expected])
             self.assertFalse(any(m["role"] in ("assistant", "tool") for m in messages))
 
     def test_long_group_message_ids_reply_restore_and_deduplicate(self):
@@ -497,7 +498,7 @@ class Acceptance(unittest.TestCase):
         after = self.run_eve([self.message("in-wait", "wait"), self.message("in-fresh", "fresh")])
         self.assertEqual((after["received"], after["sent"]), (1, 1))
         self.assertEqual(len(self.requests), 2)
-        self.assertEqual([m["content"] for m in self.requests[-1]["messages"] if m["role"] == "user"], ["fresh"])
+        self.assertEqual([m["content"] for m in conversation_messages(self.requests[-1]["messages"]) if m["role"] == "user"], ["fresh"])
 
     def test_processing_receipt_does_not_reexecute_after_restart(self):
         self.run_eve([self.message("in-1", "one")])
@@ -588,7 +589,7 @@ class Acceptance(unittest.TestCase):
         self.run_eve([original, cancel, self.message("after-restart-control", "/cancel", NO_CURRENT),
             self.message("fresh", "fresh")])
         self.assertEqual(len(self.requests), 2)
-        self.assertEqual([m["content"] for m in self.requests[-1]["messages"] if m["role"] == "user"], ["fresh"])
+        self.assertEqual([m["content"] for m in conversation_messages(self.requests[-1]["messages"]) if m["role"] == "user"], ["fresh"])
         self.assertEqual(self.replies(), [("after-restart-control", NO_CURRENT), ("fresh", "fresh")])
 
     def revision_scenario(self, command, expected_changes):
@@ -610,7 +611,7 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(len(before_response), 2)
         self.assert_cancelled(before_response[0])
         self.assertEqual(before_response[1]["status"]["state"], "Pending")
-        self.assertEqual([m["role"] for m in self.requests[1]["messages"] if m["role"] != "system"], ["user"])
+        self.assertEqual([m["role"] for m in conversation_messages(self.requests[1]["messages"]) if m["role"] != "system"], ["user"])
         self.run_eve([original, revision, self.message("recall", "recall:revised-result", "revised-result")])
         self.assertEqual(len(self.requests), 3)
         self.assertEqual(self.replies(), [("recall", "revised-result")])
@@ -640,7 +641,7 @@ class Acceptance(unittest.TestCase):
         turns = self.sessions()[0]["turns"]
         self.assert_cancelled(turns[0], tools=1)
         self.assertEqual(turns[1]["input"], "fresh")
-        self.assertEqual([m["role"] for m in self.requests[2]["messages"] if m["role"] != "system"], ["user"])
+        self.assertEqual([m["role"] for m in conversation_messages(self.requests[2]["messages"]) if m["role"] != "system"], ["user"])
 
     def test_completed_tool_correction_keeps_history_and_never_reexecutes(self):
         self.run_eve([self.message("done-tool", "echo:tool-marker", "tool-marker"),
@@ -703,7 +704,7 @@ class Acceptance(unittest.TestCase):
             os.kill(int((self.work / "child.pid").read_text()), 0)
         self.run_eve([original, revision, self.message("stop-fresh", "fresh")])
         self.assertEqual(len(self.requests), 3)
-        self.assertEqual([m["content"] for m in self.requests[-1]["messages"] if m["role"] == "user"], ["fresh"])
+        self.assertEqual([m["content"] for m in conversation_messages(self.requests[-1]["messages"]) if m["role"] == "user"], ["fresh"])
 
     def test_pause_resume_and_answer_clarify_without_cancelling(self):
         self.provider_steps[1] = {"wait": "release-kept", "text": "kept-result"}

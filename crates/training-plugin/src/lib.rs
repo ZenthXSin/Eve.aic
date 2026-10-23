@@ -362,7 +362,9 @@ impl ContextAssembler for TrainingContext {
     }
 }
 
-/// 每轮至多附带的词语与表达方式条数。
+/// 已按会话筛选的说法视图标记，仅供上下文适配器识别数据。
+pub const PHRASE_CONTEXT_MARKER: &str = "eve.learned-language-v1";
+// 每轮至多附带的词语与表达方式条数。
 const CONTEXT_TERMS: usize = 8;
 const CONTEXT_EXPRESSIONS: usize = 4;
 
@@ -398,6 +400,11 @@ fn phrase_context(phrases: &[LearnedPhrase], input: &str) -> Option<(String, Str
             }
         });
     }
+    // 可替换模型适配器可读取同一份已按会话筛选的数据；不用从自然语言猜测权限或来源。
+    text.push_str(&format!("\n{PHRASE_CONTEXT_MARKER}\n{}",serde_json::json!({
+        "kind":PHRASE_CONTEXT_MARKER,
+        "phrases":chosen.iter().map(|p|serde_json::json!({"kind":p.kind,"text":p.text,"meaning":p.meaning,"example":p.example})).collect::<Vec<_>>()
+    })));
     let ids = chosen
         .iter()
         .map(|p| format!("{}.{}.{}", p.id, p.uses, p.updated_at_ms))

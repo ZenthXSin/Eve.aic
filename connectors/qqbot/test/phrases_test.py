@@ -40,6 +40,14 @@ class PhraseAcceptance(developer.DeveloperAcceptance):
             return json.dumps(self.learned, ensure_ascii=False)
         return super().reply(kind, decoded, latest)
 
+    def provider_response(self, body, kind, fallback):
+        if kind == "phrase":
+            self.assertEqual(body.get("response_format"), {"type":"json_object"})
+            self.assertFalse(body.get("tools"))
+            self.assertEqual(body["messages"][-2]["role"],"user")
+            self.assertIn("待分析的用户原话",body["messages"][-2]["content"])
+        return super().provider_response(body,kind,fallback)
+
     def phrase_state(self):
         return self.documents().get("eve.training", {}).get("phrases.v1")
 
@@ -61,7 +69,9 @@ class PhraseAcceptance(developer.DeveloperAcceptance):
         def learned():
             self.wait_for(lambda: len((self.phrase_state() or {}).get("learned", [])) == 2, "说法没有保存")
         seen = []
+        styles = []
         def respond(body):
+            styles.append(body["messages"][-3]["content"])
             seen.append("\n".join(str(m.get("content", "")) for m in body["messages"] if m["role"] == "system"))
             return dialogue.text_response("好的")
         self.callback = respond
@@ -74,6 +84,9 @@ class PhraseAcceptance(developer.DeveloperAcceptance):
         self.assertEqual([p["text"] for p in state["pending"]], ["这首歌yyds"], "取出成批后原话移出缓冲，之后的新原话重新攒批")
         self.assertIn("词语「yyds」：永远的神", seen[-1])
         self.assertIn("表示赞同时", seen[-1])
+        self.assertIn("eve.current-expression-style-v1",styles[-1])
+        self.assertIn("yyds",styles[-1])
+        self.assertIn("表示赞同时",styles[-1])
         term = next(s["phrase"] for s in state["learned"] if s["phrase"]["kind"] == "term")
         self.chat(self.send(self.message("forget", f"/train forget {term['id']}", contains="已删除")))
         self.assertEqual([s["phrase"]["text"] for s in self.phrase_state()["learned"]], ["表示赞同时"])
