@@ -11,6 +11,7 @@ pub struct Practitioner {
     drafter: Arc<dyn PracticeDrafter>,
     runner: Arc<dyn PracticeRunner>,
     check: Option<Arc<dyn DraftCheck>>,
+    strategy: Option<Arc<dyn PracticeStrategy>>,
 }
 
 impl Practitioner {
@@ -24,6 +25,7 @@ impl Practitioner {
             drafter,
             runner,
             check: None,
+            strategy: None,
         }
     }
 
@@ -31,6 +33,14 @@ impl Practitioner {
     pub fn with_check(mut self, check: Arc<dyn DraftCheck>) -> Self {
         self.check = Some(check);
         self
+    }
+
+    pub fn with_strategy(mut self, strategy: Arc<dyn PracticeStrategy>) -> PracticeResult<Self> {
+        if !self.drafter.supports_guidance() {
+            return Err(PracticeError::InvalidInput);
+        }
+        self.strategy = Some(strategy);
+        Ok(self)
     }
 
     pub fn drafter_version(&self) -> &str {
@@ -82,6 +92,10 @@ impl Practitioner {
                         task: run.task.clone(),
                         runner: run.runner.clone(),
                         previous,
+                        guidance: match &self.strategy {
+                            Some(strategy) => strategy.select(&run)?,
+                            None => None,
+                        },
                     };
                     let result = match self.drafter.draft(request).await {
                         Ok(draft) => Ok(draft),

@@ -13,8 +13,8 @@ use eve_plan_api::PlanJournal;
 use eve_plugin_api::{PluginError, PluginResult};
 use eve_practice_api::{
     AttemptOutcome, MAX_BRIEF_BYTES, MAX_NOTE_BYTES, MAX_NOTES, NoteTally, PracticeAdmin,
-    PracticeAttempt, PracticeError, PracticeFailure, PracticeRun, PracticeStatus, PracticeTask,
-    RunExit, TaskNote, note_tallies,
+    PracticeAttempt, PracticeError, PracticeFailure, PracticeRun, PracticeStatus, PracticeStrategy,
+    PracticeTask, RunExit, TaskNote, note_tallies,
 };
 use eve_practice_plugin::Practitioner;
 use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput};
@@ -71,6 +71,7 @@ pub(crate) struct Services {
     pub(crate) practitioner: Arc<Practitioner>,
     pub(crate) workspace_root: PathBuf,
     pub(crate) skills: Option<Skills>,
+    pub(crate) strategy: Option<Arc<dyn PracticeStrategy>>,
     pub(crate) forging: Option<Forging>,
     /// 开启计划入口时，计划步骤请求实践的用户待办也会实践。
     pub(crate) plans: Option<Arc<dyn PlanJournal>>,
@@ -275,6 +276,7 @@ async fn run(
         practitioner,
         workspace_root,
         skills,
+        strategy,
         forging,
         plans,
         gate,
@@ -297,6 +299,9 @@ async fn run(
     // 上次进程退出前选定技能的调用，依据实践账本核对结果；不重放。
     if let Some(skills) = &skills {
         eve_skill_plugin::settle(&*skills.admin, &practice.snapshot()?, now_ms()?)?;
+    }
+    if let Some(strategy) = &strategy {
+        strategy.reconcile(&practice.snapshot()?)?;
     }
     let mut practicing = true;
     let mut distilling = skills.is_some();
@@ -384,6 +389,9 @@ async fn run(
                     &mut stopped,
                 )
                 .await?;
+                if let Some(strategy) = &strategy {
+                    strategy.reconcile(&practice.snapshot()?)?;
+                }
                 if let Some(skills) = &skills {
                     eve_skill_plugin::settle(&*skills.admin, &practice.snapshot()?, now_ms()?)?;
                 }

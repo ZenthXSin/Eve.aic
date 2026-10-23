@@ -79,6 +79,7 @@ jobs:
           python3 connectors/qqbot/test/interest_test.py
           python3 connectors/qqbot/test/research_test.py
           python3 connectors/qqbot/test/practice_test.py
+          python3 connectors/qqbot/test/strategy_test.py
           python3 connectors/qqbot/test/skill_test.py
           python3 connectors/qqbot/first-goal-acceptance.py --help
           python3 connectors/qqbot/test/toolforge_test.py
