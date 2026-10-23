@@ -441,6 +441,8 @@ pub struct LlmHost {
     history_window: Option<eve_llm_api::HistoryWindow>,
     compaction_policy: Option<eve_llm_api::ContextCompactionPolicy>,
     execution_budget: Option<Arc<eve_llm_api::TurnBudget>>,
+    shared_steps: Option<eve_llm_api::SharedToolSteps>,
+    run_deadline: Option<std::time::Instant>,
     journal: Option<Arc<dyn eve_llm_api::TurnJournal>>,
     image_source: Option<Arc<dyn eve_llm_api::TurnImageSource>>,
     pub(crate) registry: Arc<dyn ServiceRegistry>,
@@ -496,6 +498,8 @@ impl LlmHost {
             history_window: None,
             compaction_policy: None,
             execution_budget: None,
+            shared_steps: None,
+            run_deadline: None,
             journal: None,
             image_source: None,
             registry,
@@ -542,6 +546,30 @@ impl LlmHost {
         self
     }
 
+    pub fn with_shared_steps(mut self, steps: eve_llm_api::SharedToolSteps) -> Self {
+        self.shared_steps = Some(steps);
+        self
+    }
+    pub fn with_run_deadline(mut self, deadline: std::time::Instant) -> Self {
+        self.run_deadline = Some(self.run_deadline.map_or(deadline, |old| old.min(deadline)));
+        self
+    }
+    /// 只能收窄已装配的工具；权限、串行队列及模型选择继续来自父宿主。
+    pub fn with_tool_subset(&self, names: &[String], output_rules: &str) -> Self {
+        let mut host = self.clone();
+        host.bindings.retain(|b| names.contains(&b.name));
+        host.config
+            .tool_timeout_overrides
+            .retain(|name, _| names.contains(name));
+        host.config.output_format = output_rules.into();
+        host
+    }
+    /// 子代理使用独立槽位池，避免后台父工具等子代理、子代理又等父工具槽位。
+    /// 调用方应共享这个叶子宿主，串行队列仍与原宿主共享。
+    pub fn with_independent_tool_slots(mut self) -> Self {
+        self.tool_slots = Arc::new(Semaphore::new(self.config.max_parallel_tool_calls));
+        self
+    }
     /// 后台任务的独立持久执行日志；不要用于会话历史或与额外 TurnBudget 叠加。
     pub fn with_turn_journal(mut self, journal: Arc<dyn eve_llm_api::TurnJournal>) -> Self {
         self.journal = Some(journal);
@@ -578,6 +606,11 @@ impl LlmHost {
 
     pub(crate) fn for_turn(&self) -> Result<Self, LlmError> {
         let mut host = self.clone();
+        if host.shared_steps.is_none() {
+            host.shared_steps = Some(eve_llm_api::SharedToolSteps::new(
+                host.config.max_tool_calls,
+            )?);
+        }
         if let Some(resolver) = &self.history_resolver {
             let window = catch_unwind(AssertUnwindSafe(|| resolver.resolve()))
                 .map_err(|_| LlmError::Backend("历史窗口解析回调发生异常".into()))??;
@@ -763,6 +796,8 @@ impl LlmHost {
                 messages: messages.clone(),
                 pending_calls: vec![],
                 used_tool_calls: 0,
+                delegated_tool_calls: 0,
+                delegated_model_requests: 0,
                 provider_requests: 0,
                 tool_batches: 0,
                 remaining: None,
@@ -816,11 +851,20 @@ impl LlmHost {
                     )
                 })?;
             continuation_checks = frame.continuation_checks;
-            closing = frame.closing || frame.used_tool_calls == self.config.max_tool_calls;
+            if let Some(steps) = &self.shared_steps {
+                steps
+                    .restore(eve_llm_api::SharedStepUsage {
+                        tool_calls: frame.used_tool_calls + frame.delegated_tool_calls,
+                        model_requests: frame.provider_requests + frame.delegated_model_requests,
+                    })
+                    .map_err(|e| fail(e, diagnostics.clone()))?;
+            }
+            closing = frame.closing
+                || frame.used_tool_calls + frame.delegated_tool_calls == self.config.max_tool_calls;
             if closing && !frame.closing {
                 messages.push(ChatMessage::text(
                     ChatRole::System,
-                    call_limit_notice(self.config.max_tool_calls, frame.used_tool_calls),
+                    self.step_limit_notice(frame.used_tool_calls),
                 ));
             }
             if let Some(text) = &frame.result {
@@ -937,7 +981,7 @@ impl LlmHost {
                 messages.push(ChatMessage::text(
                     ChatRole::System,
                     if calls_exhausted {
-                        call_limit_notice(self.config.max_tool_calls, diagnostics.calls.len())
+                        self.step_limit_notice(diagnostics.calls.len())
                     } else {
                         round_limit_notice(self.config.max_tool_rounds)
                     },
@@ -949,6 +993,18 @@ impl LlmHost {
                     LlmError::Protocol("不同工具批次不能复用调用 ID".into()),
                     diagnostics,
                 ));
+            }
+            if let Some(steps) = &self.shared_steps
+                && !steps
+                    .reserve(calls.len())
+                    .map_err(|e| fail(e, diagnostics.clone()))?
+            {
+                if !self.config.final_answer_on_round_limit {
+                    return Err(fail(LlmError::RoundLimit, diagnostics));
+                }
+                closing = true;
+                messages.push(ChatMessage::text(ChatRole::System,"主任务与全部子代理的共享工具步数已用尽，本批未执行。只依据已有回执收尾，明确未完成内容；不得宣称未做的工作已完成。"));
+                continue;
             }
             if let Some(budget) = &self.execution_budget {
                 budget
@@ -1065,15 +1121,30 @@ impl LlmHost {
                 progress_reports += 1;
             }
             // 恰好耗尽后直接收尾，不额外请求一个注定不能执行的工具批次。
-            if diagnostics.calls.len() == self.config.max_tool_calls
+            if (diagnostics.calls.len() == self.config.max_tool_calls
+                || self
+                    .shared_steps
+                    .as_ref()
+                    .is_some_and(|s| s.remaining().is_ok_and(|n| n == 0)))
                 && self.config.final_answer_on_round_limit
             {
                 closing = true;
                 messages.push(ChatMessage::text(
                     ChatRole::System,
-                    call_limit_notice(self.config.max_tool_calls, diagnostics.calls.len()),
+                    self.step_limit_notice(diagnostics.calls.len()),
                 ));
             }
+        }
+    }
+
+    fn step_limit_notice(&self, local_used: usize) -> String {
+        if self.shared_steps.as_ref().is_some_and(|s| {
+            s.remaining().is_ok_and(|n| n == 0)
+                && s.usage().is_ok_and(|u| u.tool_calls > local_used)
+        }) {
+            "主任务与全部子代理的共享工具步数已用尽；只依据已有回执收尾，明确未完成内容，不再调用工具。".into()
+        } else {
+            call_limit_notice(self.config.max_tool_calls, local_used)
         }
     }
 
@@ -1086,6 +1157,20 @@ impl LlmHost {
     ) -> Result<(), LlmError> {
         frame.messages = messages.to_vec();
         frame.used_tool_calls = diagnostics.calls.len();
+        if let Some(steps) = &self.shared_steps {
+            let usage = steps.usage()?;
+            frame.delegated_tool_calls = usage
+                .tool_calls
+                .checked_sub(frame.used_tool_calls)
+                .ok_or_else(|| LlmError::Context("共享工具计数低于本执行器记录".into()))?;
+            frame.delegated_model_requests = usage
+                .model_requests
+                .checked_sub(diagnostics.provider_requests)
+                .ok_or_else(|| LlmError::Context("共享模型计数低于本执行器记录".into()))?;
+        }
+        if frame.delegated_tool_calls > 0 || frame.delegated_model_requests > 0 {
+            frame.version = 2;
+        }
         frame.tool_batches = diagnostics.tool_batches;
         frame.remaining = continuation.remaining();
         frame.validate(self.config.max_tool_calls)?;
@@ -1155,6 +1240,9 @@ impl LlmHost {
         request.validate()?;
         if let Some(budget) = &self.execution_budget {
             budget.reserve_model_request()?;
+        }
+        if let Some(steps) = &self.shared_steps {
+            steps.record_model_request()?;
         }
         let request_number = diagnostics.provider_requests + 1;
         emit(
@@ -1380,7 +1468,23 @@ impl LlmHost {
                 .with_scope(caller.0.clone())
                 .with_continuation(caller.1.clone())
                 .with_conversation(caller.2.clone())
-                .with_turn_id(events.and_then(|event| event.turn_id));
+                .with_turn_id(events.and_then(|event| event.turn_id))
+                .with_deadline(self.run_deadline);
+            let context = match &self.shared_steps {
+                Some(steps) => context.with_shared_steps(steps.clone()),
+                None => context,
+            };
+            let timeout = self
+                .config
+                .tool_timeout_overrides
+                .get(&prepared_call.call.name)
+                .copied()
+                .unwrap_or(self.config.tool_timeout);
+            let local_deadline = std::time::Instant::now() + timeout;
+            let deadline = context
+                .deadline()
+                .map_or(local_deadline, |parent| parent.min(local_deadline));
+            let context = context.with_deadline(Some(deadline));
             let cancellation = context.cancellation_handle();
             let call_id = prepared_call.call.id.clone();
             let run_config = ToolRunConfig {

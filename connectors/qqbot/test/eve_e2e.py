@@ -709,7 +709,7 @@ class Acceptance(unittest.TestCase):
         self.provider_steps[1] = {"wait": "release-kept", "text": "kept-result"}
         controls = [self.message("pause", "/pause", UNSUPPORTED, expected_type="reply"),
             self.message("resume", "/resume", UNSUPPORTED, expected_type="reply"),
-            self.message("answer", "/answer detail", "请引用当前任务最近一次澄清问题，或明确说明新要求。", expected_type="reply")]
+            self.message("answer", "/answer detail", "当前没有能对应上的待答问题，请直接说明要补充或修改什么", expected_type="reply")]
         self.run_eve(script=[{"send": self.message("kept", "kept", "kept-result", expected_type="reply")},
             self.wait_request(1), *[step for message in controls for step in (
                 {"send": message}, self.wait_command(message["id"]))],

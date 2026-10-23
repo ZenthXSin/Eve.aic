@@ -359,6 +359,7 @@ dependencies = [
  "eve-state-postgres",
  "eve-sticker-api",
  "eve-sticker-plugin",
+ "eve-subagent-profile-sqlite",
  "eve-task-api",
  "eve-task-plugin",
  "eve-toolforge-api",
@@ -1230,6 +1231,17 @@ dependencies = [
  "eve-sticker-api",
  "ring",
  "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "eve-subagent-profile-sqlite"
+version = "0.1.0"
+dependencies = [
+ "eve-llm-api",
+ "eve-task-api",
+ "rusqlite",
  "serde_json",
  "tempfile",
 ]

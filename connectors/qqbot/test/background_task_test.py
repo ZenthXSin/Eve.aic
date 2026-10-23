@@ -20,7 +20,7 @@ from memory_test import BINARY, ROOT
 WORKER = "你在为 Eve 独立完成一项委托的任务"
 TASKS = '{"kind":"eve.background_tasks"'
 ORCHESTRATION = {"dispatch_background_task", "list_background_tasks", "cancel_background_task", "run_subagent"}
-CHAT_TOOLS = PLATFORM_TOOLS | {"echo"} | ORCHESTRATION
+CHAT_TOOLS = PLATFORM_TOOLS | {"echo"} | ORCHESTRATION | {"create_subagent","list_subagents","delete_subagent"}
 ASK = "帮我在后台把日志整理一下"
 DISPATCHED = "好，已经在后台处理，做完私聊你。"
 INSTRUCTIONS = "读取三份日志，统计错误条数，给出结论。"
@@ -52,6 +52,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         super().tearDown()
 
     def run_eve(self, script, tasks=True, subagents=True, **options):
+        self.worker_subagents = subagents
         more = ["--max-tool-rounds", "4"] + (["--background-tasks"] if tasks else []) + (["--subagents"] if subagents else [])
         return reminder_test.base().run_eve(self, script, interest=False, research=False, practice=False,
                                             more=more, **options)
@@ -101,7 +102,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.assertEqual(roles.count("user"), 1, "执行器看不到对话")
         if not body.get("tools"):
             return text_response(RESULT)
-        self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo"}, "执行器没有派发与子代理工具")
+        self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo"} | ({"run_subagent"} if self.worker_subagents else set()), "后台执行者可以委派叶子子代理，但不能再派发后台任务")
         done = len(self.results(body))
         return calls((f"step-{done}", "echo", {"text": f"第 {done + 1} 步"}))
 
@@ -254,7 +255,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
                 return calls(("delegate", "run_subagent", {"task": task, "max_steps": 2}))
             [result] = results
             self.assertEqual(result, {"completed": True, "result": "echo 可用。", "include_context": False,
-                                      "usage": {"steps_used": 1, "max_steps": 2, "model_requests": 2}})
+                                      "usage": {"steps_used": 1, "max_steps": 2, "model_requests": 2, "shared_steps_used": 2,"shared_steps_remaining":48,"agent_id":"general"}})
             return text_response("子代理查过了：echo 可用。")
         self.callback = respond
         self.run_eve(self.send(self.message("ask", "帮我确认一下 echo 能不能用", expected="子代理查过了：echo 可用。")))

@@ -3,6 +3,8 @@
 //!
 //! 创建、开始、结束与每次通知尝试都先持久化。执行中进程退出时在持久化的安全边界接续，未知工具结果不自动重放；
 //! 发送通知时进程退出记为结果未知，不重发。
+mod profiles;
+pub use profiles::*;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 

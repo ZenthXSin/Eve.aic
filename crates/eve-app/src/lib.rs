@@ -52,6 +52,7 @@ mod qq_research;
 mod qq_semantic;
 mod qq_skill;
 mod qq_stickers;
+mod qq_subagents;
 mod qq_summary;
 mod qq_tasks;
 mod qq_tools;

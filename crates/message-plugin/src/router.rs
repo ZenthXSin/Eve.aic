@@ -136,8 +136,16 @@ impl MessageService for Router {
                 && let RouteOutcome::Clarify {
                     question_id,
                     prompt,
+                    reason,
                     ..
                 } = &report.outcome
+                && matches!(
+                    reason,
+                    ClarifyReason::LowConfidence
+                        | ClarifyReason::Conflict
+                        | ClarifyReason::Ambiguous
+                        | ClarifyReason::Judge(_)
+                )
                 && let Ok(mut book) = inner.book.lock()
                 && book.active
                 && book

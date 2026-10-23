@@ -1145,6 +1145,12 @@ async fn run_qqbot_composed(
             None
         };
         let task_late = Arc::new(qq_tasks::Late::default());
+        if options.subagents {
+            let profiles = eve_subagent_profile_sqlite::SqliteSubagentProfiles::open(
+                &options.state_directory.join("subagent-profiles.sqlite3"),
+            )?;
+            let _ = task_late.profiles.set(Arc::new(profiles));
+        }
         // 完成确认提问账本同样先于通道加载；损坏时拒绝启动并保留原字节，发送中的提问记为结果未知。
         let completion = if options.goal_completion {
             let plugin = CompletionPlugin::new()?;
@@ -1310,6 +1316,14 @@ async fn run_qqbot_composed(
             bootstrap.tools.push(Arc::new(qq_tasks::SubagentTool {
                 late: task_late.clone(),
             }));
+            for kind in 0..3 {
+                bootstrap
+                    .tools
+                    .push(Arc::new(crate::qq_subagents::ProfileTool {
+                        late: task_late.clone(),
+                        kind,
+                    }));
+            }
         }
         if let (Some(admin), Some(observations)) = (&trigger_admin, &trigger_observations) {
             for operation in [
