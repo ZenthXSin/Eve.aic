@@ -2148,6 +2148,7 @@ async fn run_qqbot_composed(
                 policy,
                 plan_journal.clone(),
                 budget_gate.clone(),
+                options.learning_stop,
             ));
             qq_research::Commands::enabled(
                 Arc::new(interests.clone()),
@@ -2201,7 +2202,6 @@ async fn run_qqbot_composed(
                         Some(distiller) => distiller,
                         None => Arc::new(ModelSkillDistiller::new(budgeted(qq_budget::SKILL)?)),
                     };
-                options.learning_stop,
                     // 后续任务的第一次尝试先经一次有记录的技能选择；其余照常草稿。
                     drafter = Arc::new(SkillAwareDrafter::new(
                         admin.clone(),
@@ -2267,6 +2267,7 @@ async fn run_qqbot_composed(
                 forging,
                 plans: plan_journal.clone(),
                 gate: budget_gate.clone(),
+                learning_progress: options.learning_stop,
             }));
             qq_practice::Commands::enabled(Arc::new(interests.clone()), Arc::new(practice.clone()))
         } else {
@@ -2320,7 +2321,6 @@ async fn run_qqbot_composed(
                 gate: budget_gate.clone(),
             }));
             qq_outreach::Commands::enabled(Arc::new(outreach.clone()), Arc::new(practice.clone()))
-                learning_progress: options.learning_stop,
         } else {
             qq_outreach::Commands::disabled()
         };
