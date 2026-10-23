@@ -196,6 +196,10 @@ pub struct QqBotOptions {
     pub stickers: bool,
     /// 模型可以把多步任务派发到后台执行，结束后私聊通知。
     pub background_tasks: bool,
+    /// 通用任务策略由可信 Rust 宿主提供评价条件和运行环境指纹，默认不装配。
+    pub task_strategy_policy: Option<Arc<dyn eve_task_api::TaskStrategyPolicy>>,
+    /// 可信宿主接收持久化认知管理句柄；不暴露给聊天或模型工具。
+    pub cognitive_services: Option<Arc<dyn crate::CognitiveServices>>,
     pub disable_error_recovery: bool,
     /// 模型可以把子任务委托给子代理并在本轮拿回结果。
     pub subagents: bool,
@@ -260,6 +264,8 @@ impl Default for QqBotOptions {
             reminders: false,
             stickers: false,
             background_tasks: false,
+            task_strategy_policy: None,
+            cognitive_services: None,
             disable_error_recovery: false,
             subagents: false,
             triggers: false,
@@ -1048,6 +1054,20 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        let unified_memory = if memory.is_some() {
+            let plugin = eve_memory_plugin::UnifiedMemoryPlugin::new()?;
+            let controller = Arc::new(plugin.controller());
+            kernel.register(Box::new(plugin))?;
+            kernel
+                .start(&PluginId::new(eve_memory_api::UNIFIED_MEMORY_PLUGIN_ID)?)
+                .await?;
+            if let Some(host) = &options.cognitive_services {
+                host.memory_ready(controller.clone())?;
+            }
+            Some(controller)
+        } else {
+            None
+        };
         let memory_continuity: Option<Arc<dyn eve_memory_api::MemoryContinuityFactory>> =
             memory.as_ref().map(|memory| {
                 Arc::new(eve_memory_plugin::MemoryContinuity::new(
@@ -1055,6 +1075,9 @@ async fn run_qqbot_composed(
                     Arc::new(crate::qq_memory_continuity::Policy {
                         registry: registry.clone(),
                         conversations: conversations.clone(),
+                        unified: unified_memory
+                            .clone()
+                            .map(|c| c as Arc<dyn eve_memory_api::UnifiedMemoryAdmin>),
                     }),
                 )) as Arc<dyn eve_memory_api::MemoryContinuityFactory>
             });
@@ -1168,8 +1191,38 @@ async fn run_qqbot_composed(
             None
         };
         // 后台任务账本同样先于通道加载；损坏时拒绝启动并保留原字节，执行中的任务记为中断，发送中的通知记为结果未知。
+        let task_strategies = if let Some(policy) = options.task_strategy_policy.clone() {
+            if !options.background_tasks {
+                return Err("通用任务策略需要开启后台任务".into());
+            }
+            let plugin = eve_task_plugin::TaskStrategyPlugin::new(policy)?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel
+                .start(&PluginId::new(eve_task_api::TASK_STRATEGY_PLUGIN_ID)?)
+                .await?;
+            let world_plugin = eve_cognition_plugin::WorldModelPlugin::new("eve")?;
+            let world = Arc::new(world_plugin.controller());
+            kernel.register(Box::new(world_plugin))?;
+            kernel
+                .start(&PluginId::new(eve_cognition_api::WORLD_MODEL_PLUGIN_ID)?)
+                .await?;
+            if let Some(host) = &options.cognitive_services {
+                host.world_ready(world.clone())?;
+            }
+            Some(Arc::new(crate::task_cognition::TaskCognition {
+                strategies: Arc::new(controller),
+                world,
+            })
+                as Arc<dyn eve_task_api::TaskStrategyLearning>)
+        } else {
+            None
+        };
         let tasks = if options.background_tasks {
-            let plugin = eve_task_plugin::TaskPlugin::new()?;
+            let mut plugin = eve_task_plugin::TaskPlugin::new()?;
+            if let Some(strategies) = task_strategies {
+                plugin = plugin.with_strategy_learning(strategies);
+            }
             let controller = plugin.controller();
             kernel.register(Box::new(plugin))?;
             kernel
