@@ -1,11 +1,16 @@
+use crate::{QqArchivedReceipt, QqReceiptArchive};
 use eve_plugin_api::{PluginContext, PluginError, PluginResult};
 use eve_session_api::SessionKey;
 use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 const STATE_KEY: &str = "receipts.v1";
-pub(crate) const MAX_BYTES: usize = 1_048_576;
-const MAX_RECORDS: usize = 4096;
+// 保留全部去重与投递证据；容量不足不能淘汰旧回执后重新执行。
+pub(crate) const MAX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RECORDS: usize = 65_536;
+const ARCHIVE_TRIGGER: usize = 10 * 1024 * 1024;
+const HOT_TARGET: usize = 1024 * 1024;
 // ControlInput.task_id adds "qq:" to the platform message ID (256-byte limit).
 const MAX_MESSAGE_ID_BYTES: usize = 253;
 // 至多 8 个片段的范围与状态及规划器标识序列化后的上限。
@@ -292,11 +297,23 @@ pub(crate) struct Progress {
 }
 /// 格式 1 不含片段，2 包含分段，3 包含途中进展，4 包含合并的连发消息，5 包含附带的表情包。
 /// 旧版本拒绝读取而不是忽略投递记录。
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveBinding {
+    identity: String,
+    records: u64,
+}
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Ledger {
     pub version: u8,
     pub entries: Vec<Receipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    archive: Option<ArchiveBinding>,
+    #[serde(skip)]
+    backend: Option<Arc<dyn QqReceiptArchive>>,
+    #[serde(skip)]
+    encoded_bytes: usize,
 }
 impl Ledger {
     pub fn load(ctx: &PluginContext) -> PluginResult<Self> {
@@ -304,6 +321,7 @@ impl Ledger {
             None => Ok(Self {
                 version: 1,
                 entries: Vec::new(),
+                ..Self::default()
             }),
             Some(bytes) => Self::decode(&bytes),
         }
@@ -313,8 +331,15 @@ impl Ledger {
         if bytes.len() > MAX_BYTES {
             return Err(corrupt());
         }
-        let ledger: Self = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
-        if ledger.version != ledger.format() || ledger.entries.len() > MAX_RECORDS {
+        let mut ledger: Self = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
+        if ledger.version != ledger.format()
+            || ledger.entries.len() > MAX_RECORDS
+            || ledger.archive.as_ref().is_some_and(|a| {
+                a.identity.len() != 32
+                    || !a.identity.bytes().all(|b| b.is_ascii_hexdigit())
+                    || a.records == 0
+            })
+        {
             return Err(corrupt());
         }
         let mut identities = std::collections::BTreeSet::new();
@@ -375,10 +400,13 @@ impl Ledger {
                 return Err(corrupt());
             }
         }
+        ledger.encoded_bytes = bytes.len();
         Ok(ledger)
     }
     fn format(&self) -> u8 {
-        if self.entries.iter().any(|e| e.sticker.is_some()) {
+        if self.archive.is_some() {
+            6
+        } else if self.entries.iter().any(|e| e.sticker.is_some()) {
             5
         } else if self.entries.iter().any(|e| e.merged_into.is_some()) {
             4
@@ -392,12 +420,207 @@ impl Ledger {
     }
     fn encode(&mut self) -> PluginResult<Vec<u8>> {
         self.version = self.format();
-        serde_json::to_vec(self).map_err(|_| corrupt())
+        let bytes = serde_json::to_vec(self).map_err(|_| corrupt())?;
+        self.encoded_bytes = bytes.len();
+        Ok(bytes)
     }
     pub fn find(&self, app: &str, id: &str) -> Option<usize> {
         self.entries
             .iter()
             .position(|r| r.app_id == app && r.message.id == id)
+    }
+
+    pub fn attach_archive(
+        &mut self,
+        backend: Option<Arc<dyn QqReceiptArchive>>,
+    ) -> PluginResult<()> {
+        if let Some(binding) = &self.archive {
+            let (id, count) = backend.as_ref().ok_or_else(corrupt)?.identity()?;
+            if id != binding.identity || count < binding.records {
+                return Err(corrupt());
+            }
+        }
+        self.backend = backend;
+        Ok(())
+    }
+
+    pub fn contains(&self, app: &str, id: &str) -> PluginResult<bool> {
+        if self.find(app, id).is_some() {
+            return Ok(true);
+        }
+        match &self.backend {
+            Some(db) => Ok(db.get(app, id)?.is_some()),
+            None => Ok(false),
+        }
+    }
+
+    pub fn archived(&self, app: &str, id: &str) -> PluginResult<Option<Receipt>> {
+        self.backend
+            .as_ref()
+            .map(|db| db.get(app, id))
+            .transpose()?
+            .flatten()
+            .map(|bytes| decode_archived(&bytes))
+            .transpose()
+            .and_then(|entry| {
+                if entry
+                    .as_ref()
+                    .is_some_and(|e| e.app_id != app || e.message.id != id)
+                {
+                    Err(corrupt())
+                } else {
+                    Ok(entry)
+                }
+            })
+    }
+
+    pub fn last_failed(&self, app: &str, message: &Message) -> PluginResult<Option<String>> {
+        let session = message.session_key(app)?;
+        if let Some(entry) = self.entries.iter().rev().find(|entry| {
+            entry.app_id == app
+                && entry.message.session_key(app).ok().as_ref() == Some(&session)
+                && entry.message.text.trim() != "/last-reply"
+                && entry.state == ReceiptState::Failed
+                && entry.reply.is_some()
+        }) {
+            return Ok(entry.reply.clone());
+        }
+        let bytes = self
+            .backend
+            .as_ref()
+            .map(|db| db.latest_failed(app, &session.session_id))
+            .transpose()?
+            .flatten();
+        let entry = bytes.map(|b| decode_archived(&b)).transpose()?;
+        if entry.as_ref().is_some_and(|e| {
+            e.app_id != app
+                || e.message.session_key(app).ok().as_ref() != Some(&session)
+                || e.state != ReceiptState::Failed
+                || e.reply.is_none()
+                || e.message.text.trim() == "/last-reply"
+        }) {
+            return Err(corrupt());
+        }
+        Ok(entry.and_then(|e| e.reply))
+    }
+
+    /// 仅在循环边界归档；提交数据库后才缩小活跃账本，失败恢复内存且保留两边原数据。
+    pub fn archive_if_needed(&mut self, ctx: &PluginContext) -> PluginResult<()> {
+        if self.encoded_bytes <= ARCHIVE_TRIGGER {
+            return Ok(());
+        }
+        self.archive_with(|bytes| ctx.state_set(STATE_KEY, bytes))
+    }
+    fn archive_with(
+        &mut self,
+        persist: impl FnOnce(Vec<u8>) -> PluginResult<()>,
+    ) -> PluginResult<()> {
+        if self.encode()?.len() <= ARCHIVE_TRIGGER {
+            return Ok(());
+        }
+        let Some(db) = self.backend.clone() else {
+            return Ok(());
+        };
+        let mut keep = vec![false; self.entries.len()];
+        let mut latest = std::collections::BTreeSet::new();
+        let mut confirmed = std::collections::BTreeSet::new();
+        let mut bytes = 256usize;
+        for (i, e) in self.entries.iter().enumerate().rev() {
+            let identity = (
+                &e.app_id,
+                &e.message.scope,
+                &e.message.target_id,
+                &e.message.user_id,
+            );
+            let latest_session = latest.insert(identity);
+            let latest_confirmed = e.state == ReceiptState::Sent && confirmed.insert(identity);
+            let pinned = matches!(
+                e.state,
+                ReceiptState::Processing | ReceiptState::ReplyPending
+            ) || e.progress.iter().any(|p| p.state == PartState::Sending)
+                || e.sticker
+                    .as_ref()
+                    .is_some_and(|s| matches!(s.state, PartState::Pending | PartState::Sending))
+                || latest_session
+                || latest_confirmed;
+            let size = serde_json::to_vec(e).map_err(|_| corrupt())?.len() + 1;
+            let recent = bytes + size <= HOT_TARGET;
+            bytes += size;
+            if pinned || recent {
+                keep[i] = true;
+            }
+        }
+        // 合并组整体留热区或整体归档；不能留下指向冷区的 Merged 引用。
+        for (i, e) in self.entries.iter().enumerate() {
+            if let Some(target) = &e.merged_into {
+                let j = self.find(&e.app_id, target).ok_or_else(corrupt)?;
+                if keep[i] || keep[j] {
+                    keep[i] = true;
+                    keep[j] = true;
+                }
+            }
+        }
+        // 同组另一条可能刚刚把目标钉住，再统一保留其所有成员。
+        for (i, e) in self.entries.iter().enumerate() {
+            if let Some(target) = &e.merged_into
+                && keep[self.find(&e.app_id, target).ok_or_else(corrupt)?]
+            {
+                keep[i] = true;
+            }
+        }
+        let records: Vec<_> = self
+            .entries
+            .iter()
+            .zip(&keep)
+            .filter(|(_, keep)| !**keep)
+            .map(|(e, _)| {
+                Ok(QqArchivedReceipt {
+                    app_id: e.app_id.clone(),
+                    message_id: e.message.id.clone(),
+                    session_id: e.message.session_key(&e.app_id)?.session_id,
+                    failed_reply: e.state == ReceiptState::Failed
+                        && e.reply.is_some()
+                        && e.message.text.trim() != "/last-reply",
+                    payload: serde_json::to_vec(e).map_err(|_| corrupt())?,
+                })
+            })
+            .collect::<PluginResult<_>>()?;
+        if records.is_empty() {
+            return Ok(());
+        }
+        let count = db.store(&records)?;
+        let (id, confirmed_count) = db.identity()?;
+        if count != confirmed_count {
+            return Err(corrupt());
+        }
+        let old_binding = self.archive.clone();
+        let old_version = self.version;
+        let old_bytes = self.encoded_bytes;
+        // 通过字节还原避免更改原记录；失败可完整还原旧内存快照。
+        let retained = self
+            .entries
+            .iter()
+            .zip(&keep)
+            .filter(|(_, k)| **k)
+            .map(|(e, _)| {
+                serde_json::to_vec(e)
+                    .and_then(|b| serde_json::from_slice(&b))
+                    .map_err(|_| corrupt())
+            })
+            .collect::<PluginResult<_>>()?;
+        let previous = std::mem::replace(&mut self.entries, retained);
+        self.archive = Some(ArchiveBinding {
+            identity: id,
+            records: count,
+        });
+        let result = self.encode().and_then(persist);
+        if result.is_err() {
+            self.entries = previous;
+            self.archive = old_binding;
+            self.version = old_version;
+            self.encoded_bytes = old_bytes;
+        }
+        result
     }
 
     /// 整组一次提交：任意持久快照中，Merged 都必须已经有同组的目标回执。
@@ -507,6 +730,34 @@ impl Ledger {
         ctx.state_set(STATE_KEY, bytes)
     }
 }
+pub(crate) fn decode_archived(bytes: &[u8]) -> PluginResult<Receipt> {
+    if bytes.len() > 512 * 1024 {
+        return Err(corrupt());
+    }
+    let entry: Receipt = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
+    if entry.state == ReceiptState::Merged {
+        if !valid_id(&entry.app_id)
+            || !entry.message.valid()
+            || entry.reply.is_some()
+            || entry.segments.is_some()
+            || !entry.progress.is_empty()
+            || entry.sticker.is_some()
+            || entry
+                .merged_into
+                .as_ref()
+                .is_none_or(|id| !valid_message_id(id) || id == &entry.message.id)
+        {
+            return Err(corrupt());
+        }
+    } else {
+        let mut single = Ledger {
+            entries: vec![serde_json::from_slice(bytes).map_err(|_| corrupt())?],
+            ..Ledger::default()
+        };
+        Ledger::decode(&single.encode()?)?;
+    }
+    Ok(entry)
+}
 fn valid_segments(segments: &Segments, reply: Option<&str>, state: ReceiptState) -> bool {
     let Some(reply) = reply else {
         return false;
@@ -572,6 +823,7 @@ mod tests {
         let mut ledger = Ledger {
             version: 0,
             entries: vec![entry],
+            ..Ledger::default()
         };
         Ledger::decode(&ledger.encode()?)
     }
@@ -691,6 +943,7 @@ mod tests {
         let mut v1_with_parts = Ledger {
             version: 0,
             entries: vec![receipt(ReceiptState::Sent, Some(&[Sent, Sent, Sent]))],
+            ..Ledger::default()
         };
         let mut bytes: serde_json::Value =
             serde_json::from_slice(&v1_with_parts.encode().unwrap()).unwrap();
@@ -699,6 +952,7 @@ mod tests {
         let mut v2_without = Ledger {
             version: 0,
             entries: vec![receipt(ReceiptState::Sent, None)],
+            ..Ledger::default()
         };
         let mut bytes: serde_json::Value =
             serde_json::from_slice(&v2_without.encode().unwrap()).unwrap();
@@ -723,6 +977,7 @@ mod tests {
         let mut ledger = Ledger {
             version: 0,
             entries: vec![merged, target],
+            ..Ledger::default()
         };
         let bytes = ledger.encode().unwrap();
         let decoded = Ledger::decode(&bytes).unwrap();
@@ -769,5 +1024,118 @@ mod tests {
                 Ledger::decode(&ledger.encode().unwrap()).unwrap();
             }
         }
+    }
+    #[derive(Default)]
+    struct ArchiveMemory {
+        rows: std::sync::Mutex<std::collections::BTreeMap<(String, String), Vec<u8>>>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+    impl QqReceiptArchive for ArchiveMemory {
+        fn identity(&self) -> PluginResult<(String, u64)> {
+            Ok(("a".repeat(32), self.rows.lock().unwrap().len() as u64))
+        }
+        fn store(&self, records: &[QqArchivedReceipt]) -> PluginResult<u64> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(corrupt());
+            }
+            let mut rows = self.rows.lock().unwrap();
+            for r in records {
+                let key = (r.app_id.clone(), r.message_id.clone());
+                if rows.get(&key).is_some_and(|b| b != &r.payload) {
+                    return Err(corrupt());
+                }
+                rows.insert(key, r.payload.clone());
+            }
+            Ok(rows.len() as u64)
+        }
+        fn get(&self, app: &str, id: &str) -> PluginResult<Option<Vec<u8>>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&(app.into(), id.into()))
+                .cloned())
+        }
+        fn latest_failed(&self, _app: &str, _session: &str) -> PluginResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+    }
+    #[test]
+    fn archive_commits_before_hot_shrink_and_retry_preserves_unknown_receipts() {
+        let db = Arc::new(ArchiveMemory::default());
+        let mut ledger = Ledger::default();
+        for i in 0..350 {
+            let mut entry = receipt(ReceiptState::Sent, None);
+            entry.message.id = format!("message-{i}");
+            entry.reply = Some("x".repeat(32768));
+            ledger.entries.push(entry);
+        }
+        ledger.entries[0].state = ReceiptState::Processing;
+        ledger.entries[0].reply = None;
+        ledger.entries[1].state = ReceiptState::ReplyPending;
+        ledger.entries[2].sticker = Some(StickerPart {
+            path: "/archive/a.png".into(),
+            state: Sending,
+        });
+        ledger.entries[3].state = ReceiptState::Merged;
+        ledger.entries[3].reply = None;
+        ledger.entries[3].merged_into = Some("message-4".into());
+        let before = ledger.encode().unwrap();
+        Ledger::decode(&before).unwrap();
+        ledger.attach_archive(Some(db.clone())).unwrap();
+        db.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            ledger
+                .archive_with(|_| panic!("database failed before hot write"))
+                .is_err()
+        );
+        assert_eq!(ledger.encode().unwrap(), before);
+        db.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(ledger.archive_with(|_| Err(corrupt())).is_err());
+        assert_eq!(ledger.encode().unwrap(), before);
+        let committed = db.identity().unwrap().1;
+        assert!(committed > 300);
+        let mut hot = None;
+        ledger
+            .archive_with(|bytes| {
+                hot = Some(bytes);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            db.identity().unwrap().1,
+            committed,
+            "重复批次不添加行或修改冷记录"
+        );
+        let mut restored = Ledger::decode(hot.as_ref().unwrap()).unwrap();
+        assert_eq!(restored.version, 6);
+        assert!(hot.unwrap().len() < HOT_TARGET + 100_000);
+        assert!(restored.attach_archive(None).is_err());
+        restored.attach_archive(Some(db.clone())).unwrap();
+        for i in 0..350 {
+            assert!(
+                restored
+                    .contains("1904159860", &format!("message-{i}"))
+                    .unwrap()
+            );
+        }
+        for i in 0..3 {
+            assert!(
+                restored
+                    .find("1904159860", &format!("message-{i}"))
+                    .is_some()
+            );
+        }
+        assert!(restored.find("1904159860", "message-4").is_none());
+        let cold = restored
+            .archived("1904159860", "message-3")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cold.merged_into.as_deref(), Some("message-4"));
+        db.rows.lock().unwrap().clear();
+        assert!(
+            restored.attach_archive(Some(db)).is_err(),
+            "旧数据库缺行时拒绝恢复"
+        );
     }
 }

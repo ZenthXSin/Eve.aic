@@ -1,4 +1,5 @@
 //! 官方 QQBot 通道实现；只通过公开 Control/Message/Session 与插件 Context 协作。
+mod archive;
 mod bridge;
 mod commands;
 mod conversations;
@@ -8,6 +9,7 @@ mod outreach;
 mod participants;
 mod state;
 
+pub use archive::{QqArchivedReceipt, QqReceiptArchive, read_archived_receipt};
 pub use commands::{QqCommandHandler, QqCommandInput};
 pub use conversations::{QqConversationIdentity, QqConversations, QqWakeupLease};
 pub use files::{
@@ -117,6 +119,8 @@ pub struct QqBotStatus {
     pub failed: u64,
     /// 已送达但被交互观察者确定拒绝采集的交流数（如交互记忆容量已满）。
     pub interactions_not_saved: u64,
+    /// 回执容量不足时拒绝的新请求数；不进入模型、工具或管理命令。
+    pub capacity_rejected: u64,
 }
 #[derive(Clone)]
 pub struct QqBotStatusHandle {
@@ -150,6 +154,7 @@ pub struct QqBotPlugin {
     debounce: Option<Arc<dyn QqDebounce>>,
     stickers: Option<Arc<dyn QqStickers>>,
     failure_recovery: Option<Arc<dyn QqFailureRecovery>>,
+    receipt_archive: Option<Arc<dyn QqReceiptArchive>>,
 }
 pub(crate) struct Segmentation {
     pub planner: Arc<dyn SegmentPlanner>,
@@ -188,6 +193,7 @@ impl QqBotPlugin {
             debounce: None,
             stickers: None,
             failure_recovery: None,
+            receipt_archive: None,
         })
     }
     /// 通道已提交过轮次的会话是私聊还是群聊；只读，供只在私聊中成立的宿主能力判断。
@@ -348,13 +354,20 @@ impl QqBotPlugin {
         Ok(self)
     }
 }
+impl QqBotPlugin {
+    pub fn with_receipt_archive(mut self, archive: Arc<dyn QqReceiptArchive>) -> Self {
+        self.receipt_archive = Some(archive);
+        self
+    }
+}
 impl Plugin for QqBotPlugin {
     fn manifest(&self) -> &PluginManifest {
         &self.manifest
     }
     fn start(&mut self, ctx: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         Box::pin(async move {
-            let ledger = state::Ledger::load(&ctx)?;
+            let mut ledger = state::Ledger::load(&ctx)?;
+            ledger.attach_archive(self.receipt_archive.clone())?;
             let observation = if let Some(observer) = &self.observer {
                 Some(Arc::new(observer::Observation {
                     observer: observer.clone(),

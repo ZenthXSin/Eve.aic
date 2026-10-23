@@ -31,6 +31,7 @@ name = "eve-memory"
 path = "src/bin/memory.rs"
 
 [dependencies]
+eve-qqbot-receipt-sqlite = { path = "../qqbot-receipt-sqlite" }
 tempfile.workspace = true
 eve-trigger-api = { path = "../trigger-api" }
 eve-trigger-plugin = { path = "../trigger-plugin" }

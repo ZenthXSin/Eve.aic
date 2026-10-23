@@ -18,6 +18,16 @@ spec = importlib.util.spec_from_file_location('upgrade_runtime', SCRIPT)
 runtime = importlib.util.module_from_spec(spec); spec.loader.exec_module(runtime)
 
 class DigestTests(unittest.TestCase):
+    def test_state_reader_accepts_extended_receipt_storage_size(self):
+        self.assertGreaterEqual(runtime.MAX_STATE_JSON, 256 * 1024 * 1024)
+        # 使用空白模拟较大的宿主文档，旧 64 MiB 门禁会拒绝。
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'extended-state.json'
+            with path.open('wb') as file:
+                file.write(b'{"version":1,"entries":{}}')
+                file.write(b' ' * (64 * 1024 * 1024))
+            self.assertEqual(runtime.inherited_receipts(path), frozenset())
+
     def test_large_cargo_debug_binary_is_hashed_without_the_old_256_mib_rejection(self):
         with tempfile.TemporaryDirectory(prefix='eve-upgrade-digest-') as directory:
             path=Path(directory)/'debug-binary'
@@ -187,6 +197,24 @@ while True:
         self.assertTrue(runtime.delivery_gate(path,request,runtime.inherited_receipts(path)) is False)
         ledger['entries'][1]['sticker']={'path':'','state':'Sent'};save()
         with self.assertRaisesRegex(ValueError,'invalid_sticker_ledger'):runtime.delivery_gate(path,request)
+
+    def test_format_six_requires_matching_archive_and_keeps_merge_sticker_gates(self):
+        import sqlite3
+        path=self.state/'state.json';state,ledger=self.merged_state()
+        ledger['version']=6;ledger['archive']={'identity':'a'*32,'records':1}
+        ledger['entries'][1]['sticker']={'path':'/state/stickers/blobs/a.png','state':'Sent'}
+        state['entries']['eve.channel.qqbot']['receipts.v1']=list(json.dumps(ledger).encode())
+        runtime.atomic(path,state)
+        request={'session_id':self.session,'requested_by':self.session,'turn_id':1}
+        with self.assertRaisesRegex(ValueError,'receipt_archive_missing'):runtime.delivery_gate(path,request)
+        db=sqlite3.connect(self.state/'qq-receipts.sqlite3')
+        db.executescript('CREATE TABLE metadata(version INTEGER,identity TEXT); CREATE TABLE receipts(payload BLOB);')
+        db.execute('INSERT INTO metadata VALUES (1,?)',('b'*32,));db.execute('INSERT INTO receipts VALUES (?)',(b'cold',));db.commit()
+        with self.assertRaisesRegex(ValueError,'receipt_archive_mismatch'):runtime.inherited_receipts(path)
+        db.execute('UPDATE metadata SET identity=?',('a'*32,));db.commit()
+        self.assertTrue(runtime.delivery_gate(path,request))
+        db.execute('DELETE FROM receipts');db.commit();db.close()
+        with self.assertRaisesRegex(ValueError,'receipt_archive_mismatch'):runtime.delivery_gate(path,request)
 
     def test_format_four_merges_match_the_actual_turn_and_bad_links_are_preserved(self):
         path=self.state/'state.json';state,ledger=self.merged_state()

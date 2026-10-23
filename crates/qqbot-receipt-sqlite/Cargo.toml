@@ -1,0 +1,15 @@
+[package]
+name = "eve-qqbot-receipt-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-plugin-api = { path = "../plugin-api" }
+eve-qqbot-plugin = { path = "../qqbot-plugin" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+ring.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

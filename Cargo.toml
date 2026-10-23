@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/qqbot-receipt-sqlite",
     "crates/trigger-api",
     "crates/trigger-plugin",
     "crates/sticker-api",

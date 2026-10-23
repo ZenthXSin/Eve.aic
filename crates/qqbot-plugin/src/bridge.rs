@@ -199,6 +199,21 @@ fn progress_text(kind: &TurnEventKind) -> Option<String> {
         }
     ))
 }
+// 无法保存新业务回执时只发送拒绝通知：不运行原请求，失败不重试，不宣称回复已保存。
+async fn capacity_notice(
+    ctx: &PluginContext,
+    status: &watch::Sender<QqBotStatus>,
+    stdin: &mut ChildStdin,
+    id: &str,
+) -> PluginResult<()> {
+    warn(ctx, "receipt_limit");
+    status.send_modify(|s| {
+        s.failed += 1;
+        s.capacity_rejected += 1;
+    });
+    write(stdin, json!({"type":"capacity","version":1,"id":id})).await
+}
+
 async fn write(stdin: &mut ChildStdin, value: Value) -> PluginResult<()> {
     let mut bytes = serde_json::to_vec(&value).map_err(|_| failure("QQBot 命令编码失败"))?;
     bytes.push(b'\n');
@@ -868,6 +883,7 @@ pub(crate) async fn run(
     let result: PluginResult<()> = async {
         loop {
             if sink.is_closed() { break Ok(()); }
+            ledger.archive_if_needed(&ctx)?;
             while progress_queue.len() < 64 {
                 match progress_rx.try_recv() {
                     Ok(event) => progress_queue.push_back((event, None)),
@@ -906,8 +922,7 @@ pub(crate) async fn run(
                 }
                 if let Some(training) = &training && let Some(action) = TrainingCommand::parse(&message.text) {
                     if !ledger.insert(&ctx, &config.app_id, message.clone())? {
-                        warn(&ctx, "receipt_limit");
-                        finish(&mut stdin, &message.id).await?;
+                        capacity_notice(&ctx, &status, &mut stdin, &message.id).await?;
                         continue;
                     }
                     let session = message.session_key(&config.app_id)?;
@@ -967,16 +982,22 @@ pub(crate) async fn run(
                     continue;
                 }
                 if !command.saved && !ledger.insert(&ctx, &config.app_id, message.clone())? {
-                    warn(&ctx, "receipt_limit");
-                    finish(&mut stdin, &message.id).await?;
+                    capacity_notice(&ctx, &status, &mut stdin, &message.id).await?;
+                    continue;
+                }
+                if !command.natural && let Some(id) = message.text.trim().strip_prefix("/receipt ") {
+                    let session = message.session_key(&config.app_id)?;
+                    let entry = if let Some(i) = ledger.find(&config.app_id,id) { Some(&ledger.entries[i]) } else { None };
+                    let cold = if entry.is_none() { ledger.archived(&config.app_id,id)? } else { None };
+                    let text = match entry.or(cold.as_ref()).filter(|e| e.message.session_key(&config.app_id).ok().as_ref() == Some(&session)) {
+                        Some(e) => format!("{}", json!({"message_id":e.message.id,"input":e.message.text.chars().take(2048).collect::<String>(),"state":e.state,"reply":e.reply.as_ref().map(|r| r.chars().take(2048).collect::<String>()),"note":"正文各最多展示 2048 字；完整冷回执可用 read_raw_message(message_id,offset) 分页读取"})),
+                        None => "本会话没有这条回执。".into(),
+                    };
+                    replies.push_back(Reply { message, text, guard: ReplyGuard::Command, interaction: None, invite: None });
                     continue;
                 }
                 if !command.natural && message.text.trim() == "/last-reply" {
-                    let text = ledger.entries.iter().rev().find(|entry|
-                        entry.app_id == config.app_id && same_session(&entry.message, &message)
-                        && entry.message.text.trim() != "/last-reply"
-                        && entry.state == ReceiptState::Failed && entry.reply.is_some())
-                        .and_then(|entry| entry.reply.clone())
+                    let text = ledger.last_failed(&config.app_id, &message)?
                         .unwrap_or_else(|| "当前会话没有可取回的失败回复。".into());
                     replies.push_back(Reply { message, text, guard: ReplyGuard::Command, interaction: None, invite: None });
                     continue;
@@ -1360,7 +1381,10 @@ pub(crate) async fn run(
                     }
                     if batch.len() > 1 {
                         if !ledger.insert_merged(&ctx, &config.app_id, &batch)? {
-                            return Err(PluginError::State("QQBot 回执容量不足，连发合并未提交".into()));
+                            for message in &batch {
+                                capacity_notice(&ctx, &status, &mut stdin, &message.id).await?;
+                            }
+                            continue;
                         }
                         saved = true;
                     }
@@ -1378,8 +1402,7 @@ pub(crate) async fn run(
                     }
                 }
                 if !saved && !ledger.insert(&ctx, &config.app_id, message.clone())? {
-                    warn(&ctx, "receipt_limit");
-                    finish(&mut stdin, &message.id).await?;
+                    capacity_notice(&ctx, &status, &mut stdin, &message.id).await?;
                     continue;
                 }
                 if let Some(text) = merged_text {
@@ -1593,6 +1616,12 @@ pub(crate) async fn run(
                             warn(&ctx, code);
                         }
                         Some("fatal") => break Err(failure("QQBot SDK 启动或连接失败")),
+                        Some("delivery") if frame.get("capacity_notice").and_then(Value::as_bool) == Some(true) => {
+                            // 拒绝通知没有执行模型、工具或管理命令，也不冒充已保存的业务回执。
+                            if frame.get("ok").and_then(Value::as_bool) != Some(true) {
+                                delivery_log(&ctx, "capacity_notice_failed_no_retry", &frame);
+                            }
+                        }
                         Some("delivery") if frame.get("progress").and_then(Value::as_bool) == Some(true) => {
                             let Some((id, part)) = progress_delivery.as_ref() else { warn(&ctx, "unexpected_progress_delivery"); continue; };
                             if frame.get("id").and_then(Value::as_str) != Some(id.as_str()) || frame.get("index").and_then(Value::as_u64) != Some(*part as u64) {
@@ -1732,7 +1761,7 @@ pub(crate) async fn run(
                                 || judging.as_ref().is_some_and(|(r, _)| r.message.id == message.id)
                                 || delivering.as_ref().is_some_and(|d| d.reply.message.id == message.id);
                             if live { warn(&ctx, "duplicate_pending"); continue; }
-                            let duplicate = ledger.find(&config.app_id, &message.id).is_some();
+                            let duplicate = ledger.contains(&config.app_id, &message.id)?;
                             let pending = queue.len() + commands.len() + active.len() + replies.len()
                                 + routing.len() + usize::from(delivering.is_some()) + usize::from(judging.is_some());
                             if duplicate || pending >= MAX_PENDING {
@@ -1794,8 +1823,7 @@ pub(crate) async fn run(
                                     if target.is_some() {
                                         // 捕获代际时即持久化；即使仍在等同会话的判断，重启也不能把旧控制文字当新任务。
                                         if !ledger.insert(&ctx, &config.app_id, message.clone())? {
-                                            warn(&ctx, "receipt_limit");
-                                            finish(&mut stdin, &message.id).await?;
+                                            capacity_notice(&ctx, &status, &mut stdin, &message.id).await?;
                                             continue;
                                         }
                                         commands.push_back(CommandMessage { message, private_text: None, target, natural: true, superseded: false, saved: true });

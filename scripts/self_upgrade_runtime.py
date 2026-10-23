@@ -15,6 +15,8 @@ import time
 
 VERSION = 1
 MAX_JSON = 1024 * 1024
+# 文件状态用 JSON 整数数组保存插件字节；16 MiB 回执可膨胀为约 64 MiB。
+MAX_STATE_JSON = 256 * 1024 * 1024
 RECOVERY_STOP = 78
 
 def digest(path):
@@ -142,19 +144,41 @@ def receipt_fingerprint(receipt):
     return hashlib.sha256(json.dumps(receipt, ensure_ascii=False, sort_keys=True,
                                      separators=(',', ':')).encode()).hexdigest()
 
+def validate_receipt_archive(state_path, receipts):
+    if receipts['version'] != 6:
+        if 'archive' in receipts:
+            raise ValueError('unexpected_receipt_archive_binding')
+        return
+    import sqlite3
+    binding = receipts.get('archive')
+    if not isinstance(binding, dict) or set(binding) != {'identity', 'records'} or not isinstance(binding['identity'], str) or len(binding['identity']) != 32 or type(binding['records']) is not int or binding['records'] <= 0:
+        raise ValueError('invalid_receipt_archive_binding')
+    database = state_path.parent / 'qq-receipts.sqlite3'
+    if not database.is_file() or database.is_symlink():
+        raise ValueError('receipt_archive_missing')
+    connection = sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=2)
+    try:
+        identity = connection.execute('SELECT version,identity FROM metadata').fetchall()
+        count = connection.execute('SELECT count(*) FROM receipts').fetchone()[0]
+        if identity != [(1,binding['identity'])] or count < binding['records']:
+            raise ValueError('receipt_archive_mismatch')
+    finally:
+        connection.close()
+
 def inherited_receipts(state_path):
     """启动子进程前捕获历史未决回执；仅供门禁比较，不改写、不重放。"""
     if not state_path.exists():
         return frozenset()
-    state = read_json(state_path, 64 * 1024 * 1024)
+    state = read_json(state_path, MAX_STATE_JSON)
     if state.get('version') != 1:
         raise ValueError('unknown_state_version')
     raw = state['entries'].get('eve.channel.qqbot', {}).get('receipts.v1')
     if raw is None:
         return frozenset()
     receipts = json.loads(bytes(raw), object_pairs_hook=unique_object)
-    if receipts['version'] not in (1, 2, 3, 4, 5):
+    if receipts['version'] not in (1, 2, 3, 4, 5, 6):
         raise ValueError('unknown_ledger_version')
+    validate_receipt_archive(state_path, receipts)
     validate_merged_receipts(receipts)
     return frozenset(receipt_fingerprint(r) for r in receipts['entries']
                      if r['state'] in ('Processing', 'ReplyPending')
@@ -169,7 +193,7 @@ def sticker_in_flight(receipt):
 
 def delivery_gate(state_path, request, inherited=frozenset()):
     """确切申请轮次已完成送达且本次运行空闲；不将历史未知回执当成当前任务。"""
-    state = read_json(state_path, 64 * 1024 * 1024)
+    state = read_json(state_path, MAX_STATE_JSON)
     if state['version'] != 1:
         raise ValueError('unknown_state_version')
     entries = state['entries']
@@ -177,17 +201,18 @@ def delivery_gate(state_path, request, inherited=frozenset()):
         return json.loads(bytes(entries[owner][key]), object_pairs_hook=unique_object)
     sessions = document('eve.session', 'sessions.v1')
     receipts = document('eve.channel.qqbot', 'receipts.v1')
-    if sessions['format_version'] != 1 or receipts['version'] not in (1, 2, 3, 4, 5):
+    if sessions['format_version'] != 1 or receipts['version'] not in (1, 2, 3, 4, 5, 6):
         raise ValueError('unknown_ledger_version')
+    validate_receipt_archive(state_path, receipts)
     validate_merged_receipts(receipts)
     for receipt in receipts['entries']:
         progress = receipt.get('progress', [])
         if not isinstance(progress, list) or len(progress) > 3:
             raise ValueError('invalid_progress_ledger')
-        if progress and receipts['version'] not in (3, 4, 5):
+        if progress and receipts['version'] not in (3, 4, 5, 6):
             raise ValueError('invalid_progress_ledger')
         sticker = receipt.get('sticker')
-        if sticker is not None and (receipts['version'] != 5 or not isinstance(sticker, dict)
+        if sticker is not None and (receipts['version'] not in (5, 6) or not isinstance(sticker, dict)
                                     or set(sticker) != {'path', 'state'}
                                     or not isinstance(sticker['path'], str) or not sticker['path']
                                     or sticker['state'] not in ('Pending', 'Sending', 'Sent', 'Failed', 'Skipped')):
@@ -225,7 +250,7 @@ def delivery_gate(state_path, request, inherited=frozenset()):
         scope = 'qq:' + hashlib.sha256(identity).hexdigest()
         merged_text = '\n'.join([r['message']['text'] for r in receipts['entries']
             if r.get('merged_into') == msg.get('id') and r['app_id'] == receipt['app_id']]
-            + [msg['text']]) if receipts['version'] in (4, 5) else msg['text']
+            + [msg['text']]) if receipts['version'] in (4, 5, 6) else msg['text']
         if receipt['state'] != 'Merged' and scope == request['session_id'] and merged_text == turn['input']:
             matching = receipt
         if receipt['state'] in ('Processing', 'ReplyPending'):
@@ -235,7 +260,7 @@ def delivery_gate(state_path, request, inherited=frozenset()):
 
 def validate_merged_receipts(receipts):
     """格式 4 起的合并关系只关联同身份、顺序在后的非合并目标；不得隐藏未决投递。"""
-    if receipts['version'] not in (4, 5):
+    if receipts['version'] not in (4, 5, 6):
         return
     lookup = {}
     for index, entry in enumerate(receipts['entries']):

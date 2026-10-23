@@ -163,7 +163,10 @@ if (scenario.script) {
         send({ type: "delivery", id: cmd.id, sticker: true, ok: !message.fail_sticker, message_id: "sticker-" + cmd.id });
         continue;
       }
-      if (cmd.type === "reply") {
+      if (cmd.type === "capacity") {
+        if (message.expected_type !== "capacity") throw new Error("unexpected_capacity_rejection");
+        send({ type: "delivery", id: cmd.id, capacity_notice: true, ok: !message.fail_delivery });
+      } else if (cmd.type === "reply") {
         if (message.expected_segments && !message.accept_any) throw new Error("expected_segments_got_reply");
         checkReply(cmd, message);
         if (!message.hold_delivery) deliver(cmd.id, message);
