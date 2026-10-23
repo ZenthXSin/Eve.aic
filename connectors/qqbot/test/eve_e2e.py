@@ -21,7 +21,7 @@ FAKE = ROOT / "connectors/qqbot/test/fake-bridge.mjs"
 BROWSER = os.environ.get("EVE_TEST_BROWSER") or shutil.which("google-chrome")
 CANCELLED = "已取消当前任务；已完成的工具操作不会撤销。"
 NO_CURRENT = "当前会话没有可控制的任务，请先发送普通文字开始任务。"
-SIDE_EFFECTS = "刚才已有工具执行，重新运行可能重复操作。要继续处理新要求，请发“新任务：……”或 /new 内容；已发生的操作不会自动撤销。"
+SIDE_EFFECTS = "有工具操作的结果尚未确认，补充要求已保留。请先核对现有结果，再决定后续处理；不会自动重跑或撤销已发生的操作。"
 UNSUPPORTED = "尚未支持任务暂停恢复；请明确继续、取消或开始新任务。"
 
 class Acceptance(unittest.TestCase):
@@ -626,32 +626,38 @@ class Acceptance(unittest.TestCase):
             {"kind": "correction", "text": "corrected-request"},
             {"kind": "supplement", "text": "added-condition"}])
 
-    def test_executed_tool_clarifies_without_replay_until_explicit_new_task(self):
+    def test_executed_tool_correction_continues_from_receipts_without_replay(self):
         self.provider_steps[2] = {"wait": "never-release-tool", "text": "old-tool-result"}
+        self.provider_steps[3] = {"text": "增量修订完成"}
         original = self.message("tool-original", "echo:tool-marker", expected_type="finish")
-        correction = self.message("tool-correction", "/correct changed", SIDE_EFFECTS, expected_type="reply")
+        correction = self.message("tool-correction", "/correct changed", "增量修订完成", expected_type="reply")
         fresh = self.message("tool-new", "/new fresh", "fresh", expected_type="reply")
         self.run_eve(script=[{"send": original}, self.wait_request(2), {"send": correction},
             self.wait_command("tool-original", "finish"), self.wait_command("tool-correction"),
             {"send": fresh}, self.wait_command("tool-new")])
-        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(len(self.requests), 4)
         self.assertEqual(self.requests[1]["messages"][-1]["role"], "tool")
         self.assertEqual(json.loads(self.requests[1]["messages"][-1]["content"]), {"echo": "tool-marker"})
-        self.assertEqual(self.replies(), [("tool-correction", SIDE_EFFECTS), ("tool-new", "fresh")])
+        self.assertEqual(self.replies(), [("tool-correction", "增量修订完成"), ("tool-new", "fresh")])
         turns = self.sessions()[0]["turns"]
         self.assert_cancelled(turns[0], tools=1)
-        self.assertEqual(turns[1]["input"], "fresh")
-        self.assertEqual([m["role"] for m in conversation_messages(self.requests[2]["messages"]) if m["role"] != "system"], ["user"])
+        continuation=json.loads(turns[1]["input"])
+        self.assertEqual(continuation["request_kind"],"continuation")
+        self.assertEqual(continuation["confirmed_progress"]["tool_results"][0]["output"]["Success"],{"echo":"tool-marker"})
+        self.assertEqual(turns[2]["input"], "fresh")
+        self.assertFalse(any(m.get("tool_calls") for m in turns[1]["status"]["messages"]))
 
     def test_completed_tool_correction_keeps_history_and_never_reexecutes(self):
+        self.provider_steps[3] = {"text": "已按新要求调整"}
         self.run_eve([self.message("done-tool", "echo:tool-marker", "tool-marker"),
-            self.message("done-correct", "/correct changed", SIDE_EFFECTS),
+            self.message("done-correct", "/correct changed", "已按新要求调整"),
             self.message("done-new", "/new recall:tool-marker", "tool-marker")])
-        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(len(self.requests), 4)
         self.assertEqual(self.replies(), [("done-tool", "tool-marker"),
-            ("done-correct", SIDE_EFFECTS), ("done-new", "tool-marker")])
+            ("done-correct", "已按新要求调整"), ("done-new", "tool-marker")])
         self.assertEqual([turn["status"]["state"] for turn in self.sessions()[0]["turns"]],
-            ["Completed", "Completed"])
+            ["Completed", "Completed", "Completed"])
+        self.assertFalse(any(m.get("tool_calls") for m in self.sessions()[0]["turns"][1]["status"]["messages"]))
 
     def test_control_cannot_cancel_another_user_or_group_inflight(self):
         self.provider_steps[1] = {"wait": "release-isolated", "text": "owner-result"}
