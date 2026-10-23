@@ -46,10 +46,30 @@ class ConversationDigestAcceptance(memory.MemoryAcceptance):
             self.assertEqual(bool(policies), index != 1)
             self.assertIn("eve.runtime.tool-capabilities", messages[-2]["content"])
             if policies:
-                self.assertEqual(policies, [len(messages) - 3])
+                self.assertEqual(policies, [len(messages) - 4])
+                self.assertEqual(messages[-3]["role"],"user")
+                self.assertTrue(messages[-3]["content"].startswith("宿主表达方式"))
         for session in self.documents()["eve.session"]["sessions.v1"]["sessions"].values():
             for turn in session["turns"]:
                 self.assertNotIn("本轮自然接话约束", json.dumps(turn["status"], ensure_ascii=False))
+                self.assertNotIn("宿主表达方式", json.dumps(turn["status"], ensure_ascii=False))
+                self.assertNotIn("宿主表达方式",turn["input"])
+
+    def test_short_user_messages_are_valid_style_examples_without_copying_old_assistants(self):
+        self.run_eve([
+            *self.send(self.message("brief1","行")),
+            *self.send(self.message("brief2","试试")),
+            *self.send(self.message("view","看看")),
+            *self.send(self.message("other","另一会话",user="other-user")),
+        ],training=True)
+        request=next(r for r in self.requests if r["body"]["messages"][-1]["content"] == "看看")
+        [view]=self.data(request)
+        self.assertEqual([e["user"]["text"] for e in view["expression_examples"]],["行","试试"])
+        guard=request["body"]["messages"][-3]["content"]
+        self.assertIn("eve.current-expression-style-v1",guard)
+        self.assertIn("试试",guard)
+        foreign=next(r for r in self.requests if r["body"]["messages"][-1]["content"] == "另一会话")
+        self.assertEqual(self.data(foreign),[])
 
     def test_scoped_sources_training_reset_pause_and_restart_keep_the_original_memory(self):
         self.run_eve([

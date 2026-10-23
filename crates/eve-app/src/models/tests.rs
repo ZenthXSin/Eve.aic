@@ -189,6 +189,13 @@ fn user_texts<'a>(body: &'a Value, protocol: &str) -> Vec<&'a str> {
     messages
         .iter()
         .filter(|m| m["role"] == "user")
+        // 这里只核对持久化的真实用户轮次；模型输入还包含不落盘的固定宿主表达提示。
+        .filter(|m| {
+            !m["content"]
+                .as_str()
+                .unwrap()
+                .starts_with(include_str!("../dialogue-style-guard.txt").trim())
+        })
         .map(|m| m["content"].as_str().unwrap())
         .collect()
 }

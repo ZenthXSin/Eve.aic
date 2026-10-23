@@ -99,6 +99,8 @@ fn user_texts(request: &Value) -> Vec<&str> {
         .iter()
         .filter(|m| m["role"] == "user")
         .map(|m| m["content"].as_str().unwrap())
+        // 宿主表达提示仅存在于当前请求，不属于持久化的用户会话。
+        .filter(|text| !text.starts_with(include_str!("../src/dialogue-style-guard.txt").trim()))
         .collect()
 }
 #[tokio::test]
