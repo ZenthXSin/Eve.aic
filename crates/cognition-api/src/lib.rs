@@ -1,10 +1,12 @@
 //! 统一认知状态的公开契约；不包含存储、调度、模型或执行权限实现。
 mod file_observation;
 mod goal_feedback;
+mod world_model;
 pub use file_observation::*;
 pub use goal_feedback::*;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt, sync::Arc};
+pub use world_model::*;
 
 pub const COGNITION_PLUGIN_ID: &str = "eve.cognition";
 pub const COGNITION_READ_SERVICE_ID: &str = "eve.cognition.public.v1";

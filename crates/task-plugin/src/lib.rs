@@ -1,6 +1,13 @@
 //! 后台任务账本。
 mod store;
+mod strategy;
+mod strategy_policy;
 mod strict_json;
+pub use strategy::{
+    TaskStrategyController, TaskStrategyPlugin, evaluate_task_effect, extract_task_strategy,
+    task_strategy_views,
+};
+pub use strategy_policy::PairedTaskStrategyPolicy;
 
 use eve_plugin_api::{
     Cleanup, Plugin, PluginContext, PluginError, PluginFuture, PluginManifest, PluginResult,
@@ -14,6 +21,7 @@ use store::StoredTasks;
 #[derive(Clone, Default)]
 pub struct TaskController {
     active: Arc<Mutex<Option<Arc<StoredTasks>>>>,
+    strategies: Option<Arc<dyn TaskStrategyLearning>>,
 }
 impl TaskController {
     fn service(&self) -> TaskResult<Arc<StoredTasks>> {
@@ -27,6 +35,17 @@ impl TaskController {
 impl TaskAdmin for TaskController {
     fn snapshot(&self) -> TaskResult<TaskSnapshot> {
         self.service()?.snapshot()
+    }
+    fn strategy_guidance(&self, task: &Task) -> TaskResult<Option<TaskStrategyGuidance>> {
+        self.strategies
+            .as_ref()
+            .map_or(Ok(None), |strategies| strategies.prepare(task))
+    }
+    fn reconcile_strategies(&self) -> TaskResult<()> {
+        if let Some(strategies) = &self.strategies {
+            strategies.reconcile(&self.snapshot()?)?;
+        }
+        Ok(())
     }
     fn create(
         &self,
@@ -75,6 +94,11 @@ pub struct TaskPlugin {
     controller: TaskController,
 }
 impl TaskPlugin {
+    /// 只有可信宿主装配评价策略；未装配时保持原有执行路径。
+    pub fn with_strategy_learning(mut self, strategies: Arc<dyn TaskStrategyLearning>) -> Self {
+        self.controller.strategies = Some(strategies);
+        self
+    }
     pub fn new() -> PluginResult<Self> {
         Ok(Self {
             manifest: PluginManifest::new(TASK_PLUGIN_ID, env!("CARGO_PKG_VERSION"))?,

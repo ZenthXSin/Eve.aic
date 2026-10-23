@@ -48,10 +48,13 @@ use eve_outreach_plugin::{
 use eve_plan_api::{PLAN_PLUGIN_ID, PlanJournal, PlanProposer};
 use eve_plan_plugin::{ModelPlanProposer, PlanPlugin};
 use eve_plugin_api::{PluginId, PluginResult, ServiceId};
-use eve_practice_api::{PRACTICE_PLUGIN_ID, PracticeAdmin, PracticeDrafter, PracticeRunner};
+use eve_practice_api::{
+    PRACTICE_PLUGIN_ID, PracticeAdmin, PracticeDrafter, PracticeRunner, PracticeStrategy,
+    STRATEGY_PLUGIN_ID,
+};
 use eve_practice_browser::BrowserRunner;
 use eve_practice_mindustry::{MindustryServerRunner, RuntimeCommand};
-use eve_practice_plugin::{ModelPracticeDrafter, PracticePlugin, Practitioner};
+use eve_practice_plugin::{ModelPracticeDrafter, PracticePlugin, Practitioner, StrategyPlugin};
 use eve_qqbot_plugin::{
     DEFAULT_QQBOT_APP_ID, QQ_SEGMENT_LIMITS, QQ_SEGMENT_POLICY, QQBOT_PLUGIN_ID,
     QQBOT_STATUS_SERVICE_ID, QqBotConfig, QqBotPlugin, QqBotStatus, QqBotStatusHandle,
@@ -82,7 +85,7 @@ pub const QQBOT_HELP: &str = "--group-chat 接入全量群消息观察、说法�
 --sleep 开启可取消的短暂等待与本轮任务状态工具。
 --triggers 开启原会话条件唤醒工具（时间、文件、后台任务、消息匹配、Linux 进程）。
 Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--stickers] [--background-tasks] [--no-error-recovery] [--subagents] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--markdown] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--strategy-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--stickers] [--background-tasks] [--no-error-recovery] [--subagents] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--markdown] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -125,6 +128,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --subagents 让 Eve 在一轮回复中把可以独立完成的子任务委托给子代理并等它交回结果；子代理同样按步数预算执行，须在 runtime.tasks.subagent_timeout_ms（默认 3 分钟）内完成，不能再委托或派发。
 --goal-completion 需同时 --plans；待办的计划各步都被证据满足后，随用户下一次私聊的回复问一句这件事算不算完成，每份计划至多问一次；用户明确说完成了，模型调用确认工具，宿主核对计划仍对应当前版本后把待办标为已完成，并记下依据的计划与确认来源。没有命令；只在私聊中成立。
 --learning-stop 需同时 --interest-learning；兴趣学习目标的研究与实践次数都用完、也没有在问你或等你回复时，后台把它标为已取消并记下原因（目标的停止条件“学习预算耗尽”），兴趣本身保留；不开启时目标一直等待。无论是否开启，/interests 与议程上下文都会说明每个学习目标接下来会做什么、在等什么。
+--strategy-learning 需同时指定实践运行环境；从真实失败修正记录形成方法候选，经后续不同目标验证后自动启用，效果退化时回退；不新增模型请求或尝试次数。
 --autonomy-budget 需同时 --interest-learning；兴趣观察、受控研究、实践草稿、技能、工具锻造、主动交流、请求澄清与情景语义摘要的后台模型请求在每个窗口（--autonomy-budget-window-hours 默认 24 小时，按 UTC 整点对齐）合计至多该次数；每次请求前先保存计数，重启不清零、失败不退还，余额不够一项工作时后台不开始新工作，重置后继续；回复用户消息、/plan propose、反思、偏好提炼与语义索引不计入。/budget 查看用量与重置时间。
 /tools 列出锻造的工具；/tool 工具ID 查看版本、回放验证与调用；/tool disable|rollback 工具ID、/tool enable 工具ID 版本 停用、回退或启用某个已验证版本。
 EVE_DEVELOPER_CONFIG 指定独立开发工具 JSON：源码工作区、操作者、命令/GitHub/升级开关与 token 环境引用；未配置时不注册。命令以宿主权限执行，仅供明确操作者；不是 QQ 测试环境开关。/help tools 查看实际已装配能力。
@@ -175,6 +179,8 @@ pub struct QqBotOptions {
     pub practice_java_args: Vec<OsString>,
     /// 把已验证的实践固化为技能并在后续任务中复用；需要实践验证。
     pub skill_learning: bool,
+    /// 从实践修正实例中学习、验证和回退方法策略。
+    pub strategy_learning: bool,
     /// 把反复出现的问题锻造成运行前检查工具；需要实践验证。
     pub tool_forging: bool,
     /// 用户待办的多步计划入口；需要受控研究或实践验证作为计划能力。
@@ -190,6 +196,10 @@ pub struct QqBotOptions {
     pub stickers: bool,
     /// 模型可以把多步任务派发到后台执行，结束后私聊通知。
     pub background_tasks: bool,
+    /// 通用任务策略由可信 Rust 宿主提供评价条件和运行环境指纹，默认不装配。
+    pub task_strategy_policy: Option<Arc<dyn eve_task_api::TaskStrategyPolicy>>,
+    /// 可信宿主接收持久化认知管理句柄；不暴露给聊天或模型工具。
+    pub cognitive_services: Option<Arc<dyn crate::CognitiveServices>>,
     pub disable_error_recovery: bool,
     /// 模型可以把子任务委托给子代理并在本轮拿回结果。
     pub subagents: bool,
@@ -245,6 +255,7 @@ impl Default for QqBotOptions {
             practice_java: None,
             practice_java_args: Vec::new(),
             skill_learning: false,
+            strategy_learning: false,
             tool_forging: false,
             plans: false,
             outreach: false,
@@ -253,6 +264,8 @@ impl Default for QqBotOptions {
             reminders: false,
             stickers: false,
             background_tasks: false,
+            task_strategy_policy: None,
+            cognitive_services: None,
             disable_error_recovery: false,
             subagents: false,
             triggers: false,
@@ -330,6 +343,10 @@ impl QqBotOptions {
             }
             if arg == "--interest-learning" {
                 options.interest_learning = true;
+                continue;
+            }
+            if arg == "--strategy-learning" {
+                options.strategy_learning = true;
                 continue;
             }
             if arg == "--skill-learning" {
@@ -556,6 +573,9 @@ impl QqBotOptions {
             );
         }
         let runtime = options.practice_server_jar.is_some() || options.practice_browser.is_some();
+        if options.strategy_learning && !runtime {
+            return Err("--strategy-learning 需要同时指定实践运行环境".into());
+        }
         if options.skill_learning && !runtime {
             return Err("--skill-learning 需要同时指定实践运行环境（--practice-mindustry-server 或 --practice-browser）".into());
         }
@@ -883,6 +903,9 @@ async fn run_qqbot_composed(
         if practice_enabled && !options.interest_learning {
             return Err("实践验证需要同时开启 --interest-learning".into());
         }
+        if options.strategy_learning && !practice_enabled {
+            return Err("策略学习需要同时开启实践验证".into());
+        }
         if options.skill_learning && !practice_enabled {
             return Err("技能固化需要同时开启实践验证".into());
         }
@@ -1031,6 +1054,20 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        let unified_memory = if memory.is_some() {
+            let plugin = eve_memory_plugin::UnifiedMemoryPlugin::new()?;
+            let controller = Arc::new(plugin.controller());
+            kernel.register(Box::new(plugin))?;
+            kernel
+                .start(&PluginId::new(eve_memory_api::UNIFIED_MEMORY_PLUGIN_ID)?)
+                .await?;
+            if let Some(host) = &options.cognitive_services {
+                host.memory_ready(controller.clone())?;
+            }
+            Some(controller)
+        } else {
+            None
+        };
         let memory_continuity: Option<Arc<dyn eve_memory_api::MemoryContinuityFactory>> =
             memory.as_ref().map(|memory| {
                 Arc::new(eve_memory_plugin::MemoryContinuity::new(
@@ -1038,6 +1075,9 @@ async fn run_qqbot_composed(
                     Arc::new(crate::qq_memory_continuity::Policy {
                         registry: registry.clone(),
                         conversations: conversations.clone(),
+                        unified: unified_memory
+                            .clone()
+                            .map(|c| c as Arc<dyn eve_memory_api::UnifiedMemoryAdmin>),
                     }),
                 )) as Arc<dyn eve_memory_api::MemoryContinuityFactory>
             });
@@ -1087,6 +1127,16 @@ async fn run_qqbot_composed(
             kernel.register(Box::new(plugin))?;
             kernel.start(&PluginId::new(PRACTICE_PLUGIN_ID)?).await?;
             Some(controller)
+        } else {
+            None
+        };
+        let strategies: Option<Arc<dyn PracticeStrategy>> = if options.strategy_learning {
+            let plugin = StrategyPlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(STRATEGY_PLUGIN_ID)?).await?;
+            controller.reconcile(&practice.as_ref().ok_or("策略缺少实践账本")?.snapshot()?)?;
+            Some(Arc::new(controller))
         } else {
             None
         };
@@ -1141,8 +1191,38 @@ async fn run_qqbot_composed(
             None
         };
         // 后台任务账本同样先于通道加载；损坏时拒绝启动并保留原字节，执行中的任务记为中断，发送中的通知记为结果未知。
+        let task_strategies = if let Some(policy) = options.task_strategy_policy.clone() {
+            if !options.background_tasks {
+                return Err("通用任务策略需要开启后台任务".into());
+            }
+            let plugin = eve_task_plugin::TaskStrategyPlugin::new(policy)?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel
+                .start(&PluginId::new(eve_task_api::TASK_STRATEGY_PLUGIN_ID)?)
+                .await?;
+            let world_plugin = eve_cognition_plugin::WorldModelPlugin::new("eve")?;
+            let world = Arc::new(world_plugin.controller());
+            kernel.register(Box::new(world_plugin))?;
+            kernel
+                .start(&PluginId::new(eve_cognition_api::WORLD_MODEL_PLUGIN_ID)?)
+                .await?;
+            if let Some(host) = &options.cognitive_services {
+                host.world_ready(world.clone())?;
+            }
+            Some(Arc::new(crate::task_cognition::TaskCognition {
+                strategies: Arc::new(controller),
+                world,
+            })
+                as Arc<dyn eve_task_api::TaskStrategyLearning>)
+        } else {
+            None
+        };
         let tasks = if options.background_tasks {
-            let plugin = eve_task_plugin::TaskPlugin::new()?;
+            let mut plugin = eve_task_plugin::TaskPlugin::new()?;
+            if let Some(strategies) = task_strategies {
+                plugin = plugin.with_strategy_learning(strategies);
+            }
             let controller = plugin.controller();
             kernel.register(Box::new(plugin))?;
             kernel
@@ -2121,6 +2201,7 @@ async fn run_qqbot_composed(
                 policy,
                 plan_journal.clone(),
                 budget_gate.clone(),
+                options.learning_stop,
             ));
             qq_research::Commands::enabled(
                 Arc::new(interests.clone()),
@@ -2198,6 +2279,9 @@ async fn run_qqbot_composed(
             };
             let mut practitioner =
                 Practitioner::new(Arc::new(practice.clone()), drafter, runner.clone());
+            if let Some(strategy) = &strategies {
+                practitioner = practitioner.with_strategy(strategy.clone())?;
+            }
             let mut forged_check: Option<Arc<dyn eve_practice_api::DraftCheck>> = None;
             let forging = match &tools {
                 Some(tools) => {
@@ -2232,9 +2316,11 @@ async fn run_qqbot_composed(
                 practitioner,
                 workspace_root: options.state_directory.join("practice-work"),
                 skills: skill_parts,
+                strategy: strategies.clone(),
                 forging,
                 plans: plan_journal.clone(),
                 gate: budget_gate.clone(),
+                learning_progress: options.learning_stop,
             }));
             qq_practice::Commands::enabled(Arc::new(interests.clone()), Arc::new(practice.clone()))
         } else {
