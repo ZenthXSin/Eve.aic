@@ -15,6 +15,13 @@ use std::{
     sync::Arc,
 };
 pub(crate) const NAMESPACE: &str = "runtime.people";
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|v| u64::try_from(v.as_millis()).ok())
+        .unwrap_or(0)
+}
 pub(crate) fn schema() -> ConfigSchema {
     ConfigSchema {
         namespace: NAMESPACE.into(),
@@ -97,6 +104,7 @@ impl QqParticipantObserver for Observer {
         &self,
         session: &SessionKey,
         conversation: &str,
+        private: bool,
         text: &str,
         sender_name: Option<&str>,
     ) -> PluginResult<()> {
@@ -118,6 +126,13 @@ impl QqParticipantObserver for Observer {
             },
             name,
         )?;
+        // 每条收到的消息记一次来访，供身份卡给出场景、首次来访与上次来访。
+        let scene = if private {
+            Scene::Private
+        } else {
+            Scene::Group
+        };
+        self.0.visit(&session.user_id, scene, now_ms())?;
         if about_self(text) {
             self.0.note(&session.user_id, text)?;
         }

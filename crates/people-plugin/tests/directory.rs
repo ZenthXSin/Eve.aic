@@ -143,6 +143,7 @@ async fn failed_writes_close_handles_and_reopen_actual_state_without_replay() {
 #[tokio::test]
 async fn corrupt_and_unknown_documents_are_not_replaced() {
     for data in [
+        r#"{"version":4,"people":[]}"#,
         r#"{"version":3,"people":[]}"#,
         r#"{"version":1,"version":1,"people":[]}"#,
         r#"{"version":1,"people":[],"extra":true}"#,
@@ -176,6 +177,7 @@ async fn capacity_keeps_existing_records_and_group_views_are_bounded() {
             revision: 1,
             impressions: vec![],
             pending: vec![],
+            presence: None,
         })
         .collect();
     state
@@ -301,4 +303,125 @@ async fn impressions_need_verbatim_quotes_stay_with_the_speaker_and_keep_format_
         corrupt.get(&plugin_id(), "people.v1").unwrap().unwrap(),
         bytes
     );
+}
+
+#[tokio::test]
+async fn visits_count_messages_keep_the_previous_visit_and_upgrade_only_when_used() {
+    let state = Arc::new(MemoryStateStore::default());
+    let (kernel, people) = start(state.clone()).await;
+    people
+        .observe(scope(1, 11), name("小明", NameSource::Platform))
+        .unwrap();
+    let version = |state: &MemoryStateStore| {
+        let bytes = state.get(&plugin_id(), "people.v1").unwrap().unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["version"].clone()
+    };
+    assert_eq!(version(&state), 1, "没有来访记录时仍写格式 1");
+    assert!(
+        people.visit(&id(99), Scene::Private, 1).is_err(),
+        "未见过的人不记"
+    );
+    people.visit(&id(11), Scene::Group, 1_000).unwrap();
+    let first = people
+        .view(&id(11))
+        .unwrap()
+        .unwrap()
+        .current
+        .presence
+        .unwrap();
+    assert_eq!((first.messages, first.previous_seen_ms), (1, None));
+    people.visit(&id(11), Scene::Group, 5_000).unwrap();
+    // 时钟倒退只计数，时间不往回走。
+    people.visit(&id(11), Scene::Group, 3_000).unwrap();
+    assert!(
+        people.visit(&id(11), Scene::Private, 6_000).is_err(),
+        "场景随身份固定"
+    );
+    let seen = people
+        .view(&id(11))
+        .unwrap()
+        .unwrap()
+        .current
+        .presence
+        .unwrap();
+    assert_eq!(
+        (
+            seen.first_seen_ms,
+            seen.last_seen_ms,
+            seen.previous_seen_ms,
+            seen.messages
+        ),
+        (1_000, 5_000, Some(5_000), 3)
+    );
+    assert_eq!(version(&state), 3);
+    people
+        .observe(scope(1, 12), name("阿白", NameSource::Declared))
+        .unwrap();
+    people.visit(&id(12), Scene::Group, 2_000).unwrap();
+    let view = people.view(&id(11)).unwrap().unwrap();
+    assert!(
+        view.others.iter().all(|p| p.presence.is_none()),
+        "别人的来访情况不给看"
+    );
+    kernel.stop(&plugin_id()).await.unwrap();
+    let (_kernel, people) = start(state.clone()).await;
+    assert_eq!(
+        people
+            .view(&id(11))
+            .unwrap()
+            .unwrap()
+            .current
+            .presence
+            .unwrap()
+            .messages,
+        3
+    );
+}
+#[tokio::test]
+async fn invalid_visit_records_refuse_to_start_and_keep_the_bytes() {
+    for presence in [
+        serde_json::json!({"scene":"private","first_seen_ms":5,"last_seen_ms":1,"messages":1}),
+        serde_json::json!({"scene":"private","first_seen_ms":1,"last_seen_ms":2,"messages":2}),
+        serde_json::json!({"scene":"private","first_seen_ms":1,"last_seen_ms":2,"previous_seen_ms":1,"messages":1}),
+    ] {
+        let state = Arc::new(MemoryStateStore::default());
+        let bytes = serde_json::to_vec(&serde_json::json!({"version":3,"people":[{
+            "scope":{"conversation":id(1),"participant":id(11)},"name":null,"revision":1,"presence":presence}]}))
+        .unwrap();
+        state
+            .set(&plugin_id(), "people.v1".into(), bytes.clone())
+            .unwrap();
+        let kernel = Kernel::with_services(KernelServices {
+            state: state.clone(),
+            ..KernelServices::default()
+        });
+        kernel
+            .register(Box::new(PeoplePlugin::new().unwrap()))
+            .unwrap();
+        assert!(kernel.start(&plugin_id()).await.is_err());
+        assert_eq!(
+            state.get(&plugin_id(), "people.v1").unwrap().unwrap(),
+            bytes
+        );
+    }
+    // 格式 2 不能带来访记录。
+    let state = Arc::new(MemoryStateStore::default());
+    state
+        .set(
+            &plugin_id(),
+            "people.v1".into(),
+            serde_json::to_vec(&serde_json::json!({"version":2,"people":[{
+        "scope":{"conversation":id(1),"participant":id(11)},"name":null,"revision":1,
+        "presence":{"scene":"private","first_seen_ms":1,"last_seen_ms":1,"messages":1}}],"next":0}))
+            .unwrap(),
+        )
+        .unwrap();
+    let kernel = Kernel::with_services(KernelServices {
+        state,
+        ..KernelServices::default()
+    });
+    kernel
+        .register(Box::new(PeoplePlugin::new().unwrap()))
+        .unwrap();
+    assert!(kernel.start(&plugin_id()).await.is_err());
 }

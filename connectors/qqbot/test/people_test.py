@@ -23,6 +23,22 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
                 return json.JSONDecoder().raw_decode(text.split(marker, 1)[1])[0]
         self.fail("missing trusted people profile")
 
+    def identity(self, body):
+        marker = "当前发言者身份卡"
+        for message in body["messages"]:
+            text = message.get("content", "")
+            if message["role"] == "system" and isinstance(text, str) and marker in text:
+                return json.loads(text.split("\n", 1)[1])
+        self.fail("missing identity card")
+
+    def authorization(self, body):
+        for message in body["messages"]:
+            text = message.get("content", "")
+            if message["role"] == "system" and isinstance(text, str) and '"eve.host.authorization"' in text:
+                data = json.loads(text.removeprefix("memory: "))
+                return "owner" if data["owner"] else "administrator" if data["administrator"] else "member"
+        self.fail("missing authorization")
+
     def enabled(self, script, **options):
         self.run_eve(script, interest=False, memory=True, research=False, practice=False, **options)
 
@@ -37,6 +53,10 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
             self.assertEqual((view["current"]["name"] or {}).get("value"), current)
             self.assertEqual((view["current"]["name"] or {}).get("source"), source)
             self.assertEqual(sorted(p["name"]["value"] for p in view["others"]), sorted(others))
+            self.assertTrue(all("presence" not in p for p in view["others"]), "别人的来访情况不给看")
+            card = self.identity(body)
+            self.assertEqual((card["scene"], card["role"]), ("group", self.authorization(body)))
+            self.assertEqual((card["name"], card["name_source"]), (current, source))
             return text_response("人名资料已核对")
         self.callback = respond
         def send_name(mid, text, user, group="group-1", platform=None):
@@ -52,10 +72,18 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
                       *send_name("correction", "我叫小明", "user-1"),
                       *send_name("platform-change", "再看看称呼", "user-1", platform="别用的新昵称"),
                       *send_name("same-as-owner", "我叫zxs", "user-3")])
-        before = self.documents()["eve.people"]["people.v1"]
+        def names():
+            return {p["scope"]["participant"]: (p.get("name"), p["revision"]) for p in self.people_state()["people"]}
+        def visits():
+            return {p["scope"]["participant"]: p["presence"]["messages"] for p in self.people_state()["people"]}
+        before, counted = names(), visits()
+        self.assertEqual(self.people_state()["version"], 3)
+        self.assertEqual(sorted(counted.values()), [1, 1, 1, 3], "每条消息记一次来访，群与身份分开计数")
         expected.append(("小明", ["阿白", "zxs"], "declared"))
         self.enabled(send_name("after-restart", "你还记得大家吗", "user-1"))
-        self.assertEqual(self.documents()["eve.people"]["people.v1"], before)
+        self.assertEqual(names(), before, "重启后称呼不变")
+        after = visits()
+        self.assertEqual(sum(after.values()), sum(counted.values()) + 1, "重启后接着计数")
         self.assertFalse(expected)
 
     def classify(self, decoded, latest):
@@ -112,7 +140,7 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
         other = seen["大家好呀"]
         self.assertNotIn("impressions", other["current"])
         self.assertTrue(all("impressions" not in p for p in other["others"]), "别人的印象不进入他人的对话")
-        self.assertEqual(self.people_state()["version"], 2)
+        self.assertEqual(self.people_state()["version"], 3, "有来访记录时为格式 3，印象照常保存")
         # 重启后不重放已取出的批次；新的原话更新旧印象。
         later = ["我不学Rust了改学Go", "我觉得Go挺好上手", "我周末打算写个小工具", "我还在纠结用什么框架"]
         self.enabled([*[step for i, text in enumerate(later) for step in say(f"l{i}", text)],
@@ -155,10 +183,16 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
         identity = json.dumps(["1904159860", "c2c", "user-1", "user-1"], separators=(",", ":")).encode()
         owner = "qq:" + hashlib.sha256(identity).hexdigest()
         checks = [None, True, False]
+        roles = [(False, "这是第一次来"), (True, "刚刚"), (True, "这是第一次来")]
         def respond(body):
             data = self.facts(body)
             self.assertEqual(data["owner_name"], "zxs")
             self.assertIs(data["current_is_owner"], checks.pop(0))
+            card = self.identity(body)
+            self.assertEqual((card["owner_bound"], card["last_visit"]), roles.pop(0))
+            self.assertEqual(card["role"], self.authorization(body), "角色与宿主授权一致，不看自称")
+            self.assertEqual(card["role"] == "owner", data["current_is_owner"] is True, "只有绑定的主人账号才是主人")
+            self.assertEqual(card["scene"], "private")
             return text_response("主人绑定已核对")
         self.callback = respond
         def bind():
@@ -174,6 +208,7 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
                       *self.send(self.message("impostor", "我叫zxs", user="user-2", expected="主人绑定已核对"))],
                      panel=True, checkpoints={"bind": bind})
         self.assertFalse(checks)
+        self.assertFalse(roles)
 
 if __name__ == "__main__":
     unittest.main()
