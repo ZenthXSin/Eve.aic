@@ -69,6 +69,7 @@ pub(crate) fn learning_goal(goal: &Goal) -> Option<&str> {
 pub(crate) enum Next {
     Judged(Verdict),
     Stopped(StopRecord),
+    Paused,
 }
 
 /// 交给对话的形式：判断原样给出；已停止的写成 `{"verdict":"stopped","reason":…}`。
@@ -76,6 +77,10 @@ pub(crate) enum Next {
 #[serde(untagged)]
 pub(crate) enum NextView {
     Judged(Verdict),
+    Paused {
+        verdict: &'static str,
+        reason: &'static str,
+    },
     Stopped {
         verdict: &'static str,
         reason: eve_pursuit_api::StopReason,
@@ -84,6 +89,10 @@ pub(crate) enum NextView {
 impl From<&Next> for NextView {
     fn from(next: &Next) -> Self {
         match next {
+            Next::Paused => Self::Paused {
+                verdict: "paused",
+                reason: "no_progress",
+            },
             Next::Judged(verdict) => Self::Judged(*verdict),
             Next::Stopped(record) => Self::Stopped {
                 verdict: "stopped",
@@ -97,6 +106,7 @@ impl From<&Next> for NextView {
 pub(crate) fn describe(next: &Next) -> &'static str {
     use eve_pursuit_api::{Step, StopReason, WaitReason};
     match next {
+        Next::Paused => "长期没有新进展，已暂停；有新资料且剩余次数足够时继续",
         Next::Judged(Verdict::Continue { step, started }) => match (step, started) {
             (Step::Research, false) => "准备查资料",
             (Step::Research, true) => "正在查资料",
@@ -208,9 +218,17 @@ impl Pursuit {
                 continue;
             }
             let next = match goal.status {
-                GoalStatus::Waiting => self
-                    .evaluate(&ledgers, goal, interest)
-                    .map(|evaluation| Next::Judged(evaluation.verdict)),
+                GoalStatus::Waiting => {
+                    if eve_pursuit_plugin::progress_record(&ledgers.cognition.state, &goal.id)
+                        .map_err(|error| error.to_string())?
+                        .is_some_and(|record| record.paused)
+                    {
+                        Some(Next::Paused)
+                    } else {
+                        self.evaluate(&ledgers, goal, interest)
+                            .map(|evaluation| Next::Judged(evaluation.verdict))
+                    }
+                }
                 GoalStatus::Cancelled => {
                     stop_record(&ledgers.cognition.state, &goal.id).map(Next::Stopped)
                 }
@@ -482,6 +500,7 @@ fn settle(pursuit: &Pursuit) -> Result<(), AppError> {
     let Some(admin) = pursuit.admin() else {
         return Ok(());
     };
+    settle_progress(pursuit)?;
     for evaluation in pursuit.stops()? {
         let Verdict::Stop { reason } = evaluation.verdict else {
             continue;
@@ -510,6 +529,145 @@ fn settle(pursuit: &Pursuit) -> Result<(), AppError> {
                 | StopOutcome::Deferred,
             ) => {}
             Err(error) => return Err(format!("学习目标停止无法写入认知状态：{error}").into()),
+        }
+    }
+    Ok(())
+}
+
+/// 只对兴趣学习目标维护停滞检查点；进程重启不刷新时间，也不清零研究/实践或全局预算。
+fn settle_progress(pursuit: &Pursuit) -> Result<(), AppError> {
+    let _admission =
+        eve_pursuit_plugin::progress_admission_guard().map_err(|error| error.to_string())?;
+    let Some(ledgers) = pursuit.ledgers()? else {
+        return Ok(());
+    };
+    let Some(admin) = pursuit.admin() else {
+        return Ok(());
+    };
+    let mut interests = BTreeMap::new();
+    for goal in ledgers.cognition.state.goals.values() {
+        let Some(owner) = learning_goal(goal) else {
+            continue;
+        };
+        if goal.status != GoalStatus::Waiting {
+            continue;
+        }
+        if !interests.contains_key(owner) {
+            interests.insert(
+                owner.to_string(),
+                pursuit.interests.snapshot(&scope(owner))?,
+            );
+        }
+        let Some(interest) = interests.get(owner).and_then(|snapshot| {
+            snapshot
+                .interests
+                .iter()
+                .find(|interest| interest.id == goal.source.reference)
+        }) else {
+            continue;
+        };
+        if interest.status != InterestStatus::Active || interest.scope.user_id != owner {
+            continue;
+        }
+        let current = facts(&ledgers, goal, interest);
+        let verdict = pursuit.policy.evaluate(&current);
+        let research_activity = ledgers
+            .knowledge
+            .as_ref()
+            .into_iter()
+            .flat_map(|snapshot| {
+                snapshot.runs_for(&goal.id).filter(move |run| {
+                    run.status == RunStatus::Completed
+                        && snapshot.entries_for(&goal.id).any(|entry| {
+                            entry.run_id == run.id && entry.status == KnowledgeStatus::SourceQuoted
+                        })
+                })
+            })
+            .filter_map(|run| run.finished_at_ms)
+            .max()
+            .unwrap_or(0);
+        let practice_activity = ledgers
+            .practice
+            .as_ref()
+            .into_iter()
+            .flat_map(|snapshot| snapshot.runs_for(&goal.id))
+            .filter(|run| run.status == PracticeStatus::Verified)
+            .filter_map(|run| run.finished_at_ms)
+            .max()
+            .unwrap_or(0);
+        let capabilities = [current.research.as_ref(), current.practice.as_ref()];
+        let can_resume = synced_interest_revision(goal, interest) == Some(interest.revision)
+            && goal
+                .expires_at_ms
+                .is_none_or(|expires| expires > ledgers.now_ms)
+            && ledgers.knowledge.as_ref().is_none_or(|snapshot| {
+                snapshot
+                    .runs_for(&goal.id)
+                    .all(|run| !matches!(run.status, RunStatus::Running | RunStatus::Interrupted))
+            })
+            && ledgers.practice.as_ref().is_none_or(|snapshot| {
+                snapshot.runs_for(&goal.id).all(|run| {
+                    !matches!(
+                        run.status,
+                        PracticeStatus::Running | PracticeStatus::Interrupted
+                    )
+                })
+            })
+            && capabilities
+                .iter()
+                .flatten()
+                .any(|capability| !capability.spent() && !capability.ledger_full)
+            && capabilities.iter().flatten().all(|capability| {
+                !matches!(
+                    capability.current,
+                    Some(Outcome::Running | Outcome::Interrupted)
+                )
+            })
+            && !matches!(
+                current.clarify,
+                Exchange::Preparing | Exchange::AwaitingReply
+            )
+            && !matches!(
+                current.outreach,
+                Exchange::Preparing | Exchange::AwaitingReply
+            )
+            && current.open_follow_ups == 0;
+        let outcome = eve_pursuit_plugin::reconcile_progress(
+            &**admin,
+            &eve_pursuit_api::ProgressFacts {
+                goal_id: goal.id.clone(),
+                goal_revision: goal.revision,
+                evidence_revision: interest.statements.len() as u64,
+                last_activity_at_ms: research_activity.max(practice_activity).max(
+                    interest
+                        .statements
+                        .iter()
+                        .map(|statement| statement.observed_at_ms)
+                        .max()
+                        .unwrap_or(interest.created_at_ms),
+                ),
+                waiting_for_new_input: matches!(
+                    verdict,
+                    Verdict::Wait {
+                        reason: eve_pursuit_api::WaitReason::NewInput
+                    }
+                ),
+                can_resume,
+                now_ms: ledgers.now_ms,
+            },
+            eve_pursuit_api::DEFAULT_STALL_MS,
+        )
+        .map_err(|error| format!("长期目标进展无法保存：{error}"))?;
+        if outcome == eve_pursuit_api::ProgressOutcome::Deferred
+            && admin
+                .snapshot()
+                .map_err(|error| error.to_string())?
+                .state
+                .events
+                .len()
+                >= eve_cognition_api::MAX_RECORDS
+        {
+            return Err("长期目标事件容量已满；已关闭新目标准入，需要归档后恢复".into());
         }
     }
     Ok(())
