@@ -28,6 +28,7 @@ mod qq_completion;
 mod qq_conversation;
 mod qq_failure_recovery;
 mod qq_files;
+mod qq_group;
 mod qq_help;
 mod qq_history_digest;
 mod qq_host_facts;
@@ -52,6 +53,7 @@ mod qq_research;
 mod qq_semantic;
 mod qq_skill;
 mod qq_stickers;
+mod qq_subagents;
 mod qq_summary;
 mod qq_tasks;
 mod qq_tools;
@@ -61,6 +63,8 @@ mod qqbot;
 mod segment_advice;
 mod segment_commands;
 mod services;
+mod task_cognition;
+pub use task_cognition::CognitiveServices;
 mod storage;
 mod web_panel;
 mod web_panel_autonomy;
@@ -304,6 +308,7 @@ pub async fn run_console(
 }
 
 pub(crate) struct CoreBootstrap {
+    tool_scope_policy: Option<Arc<dyn eve_llm_api::ToolScopePolicy>>,
     host_config: LlmHostConfig,
     api_key: String,
     context: Option<Arc<dyn eve_llm_api::ContextAssembler>>,
@@ -324,6 +329,7 @@ pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstr
     let api_key =
         std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "宿主缺少 EVE_OPENAI_API_KEY。")?;
     Ok(CoreBootstrap {
+        tool_scope_policy: None,
         host_config,
         api_key,
         context: None,
@@ -452,6 +458,7 @@ async fn install_core_with_config(
     config_plugin: ConfigPlugin,
 ) -> Result<Arc<dyn eve_control_api::ControlService>, AppError> {
     let CoreBootstrap {
+        tool_scope_policy,
         host_config,
         api_key,
         context,
@@ -536,6 +543,11 @@ async fn install_core_with_config(
     )?
     .with_model_resolver(resolver)
     .with_history_resolver(Arc::new(history::ConfiguredHistory(settings.0.clone())));
+    let host = if let Some(policy) = tool_scope_policy {
+        host.with_tool_scope_policy(policy)
+    } else {
+        host
+    };
     let host = match history_digests {
         Some(digests) => host.with_history_digests(digests),
         None => host,

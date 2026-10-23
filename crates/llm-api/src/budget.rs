@@ -92,3 +92,126 @@ impl TurnBudget {
         Ok(())
     }
 }
+
+/// 同一主任务与全部子代理共享的工具步数；与模型请求预算独立，不跨任务共用。
+#[derive(Clone, Debug)]
+pub struct SharedToolSteps(std::sync::Arc<SharedStepsInner>);
+#[derive(Debug)]
+struct SharedStepsInner {
+    limit: usize,
+    usage: Mutex<SharedStepUsage>,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SharedStepUsage {
+    pub tool_calls: usize,
+    pub model_requests: usize,
+}
+impl SharedToolSteps {
+    pub fn new(limit: usize) -> Result<Self, LlmError> {
+        if limit == 0 {
+            return Err(LlmError::Configuration("共享步数上限不能为零".into()));
+        }
+        Ok(Self(std::sync::Arc::new(SharedStepsInner {
+            limit,
+            usage: Mutex::new(SharedStepUsage::default()),
+        })))
+    }
+    pub fn limit(&self) -> usize {
+        self.0.limit
+    }
+    pub fn usage(&self) -> Result<SharedStepUsage, LlmError> {
+        self.0
+            .usage
+            .lock()
+            .map(|u| *u)
+            .map_err(|_| LlmError::Backend("共享步数不可用".into()))
+    }
+    pub fn remaining(&self) -> Result<usize, LlmError> {
+        Ok(self.limit().saturating_sub(self.usage()?.tool_calls))
+    }
+    /// 整批准入，失败不扣减；调用失败、拒绝或取消不返还已准入步数。
+    pub fn reserve(&self, count: usize) -> Result<bool, LlmError> {
+        let mut usage = self
+            .0
+            .usage
+            .lock()
+            .map_err(|_| LlmError::Backend("共享步数不可用".into()))?;
+        let Some(next) = usage
+            .tool_calls
+            .checked_add(count)
+            .filter(|n| *n <= self.limit())
+        else {
+            return Ok(false);
+        };
+        usage.tool_calls = next;
+        Ok(true)
+    }
+    pub fn record_model_request(&self) -> Result<(), LlmError> {
+        let mut usage = self
+            .0
+            .usage
+            .lock()
+            .map_err(|_| LlmError::Backend("共享步数不可用".into()))?;
+        usage.model_requests = usage
+            .model_requests
+            .checked_add(1)
+            .ok_or_else(|| LlmError::Backend("共享模型计数溢出".into()))?;
+        Ok(())
+    }
+    /// 仅在独立后台任务恢复、尚未准入新调用时恢复已持久化计数。
+    pub fn restore(&self, prior: SharedStepUsage) -> Result<(), LlmError> {
+        let mut usage = self
+            .0
+            .usage
+            .lock()
+            .map_err(|_| LlmError::Backend("共享步数不可用".into()))?;
+        if *usage != SharedStepUsage::default() || prior.tool_calls > self.limit() {
+            return Err(LlmError::Context("共享步数恢复无效；未重置预算".into()));
+        }
+        *usage = prior;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod shared_tests {
+    use super::*;
+    #[test]
+    fn parallel_children_and_parent_cannot_overspend_the_same_pool() {
+        let pool = SharedToolSteps::new(50).unwrap();
+        assert!(pool.reserve(10).unwrap());
+        let threads: Vec<_> = (0..20)
+            .map(|_| {
+                let child = pool.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..10 {
+                        let _ = child.reserve(1).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(pool.usage().unwrap().tool_calls, 50);
+        assert_eq!(pool.remaining().unwrap(), 0);
+        assert!(!pool.reserve(1).unwrap());
+        assert_eq!(SharedToolSteps::new(50).unwrap().remaining().unwrap(), 50);
+    }
+    #[test]
+    fn restored_children_are_charged_and_failed_batch_is_not_partially_admitted() {
+        let pool = SharedToolSteps::new(10).unwrap();
+        pool.restore(SharedStepUsage {
+            tool_calls: 7,
+            model_requests: 4,
+        })
+        .unwrap();
+        assert!(!pool.reserve(4).unwrap());
+        assert_eq!(pool.remaining().unwrap(), 3);
+        assert!(pool.reserve(2).unwrap());
+        assert!(pool.restore(SharedStepUsage::default()).is_err());
+        assert_eq!(pool.remaining().unwrap(), 1);
+        pool.record_model_request().unwrap();
+        assert_eq!(pool.usage().unwrap().model_requests, 5);
+    }
+}

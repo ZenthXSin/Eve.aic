@@ -398,7 +398,11 @@ async fn clarification_answer_requires_latest_same_generation_question() {
         reason(&route(&s, message(&old, "q1", "我不确定要怎么改")).await),
         ClarifyReason::LowConfidence
     );
-    let mut missing_input = message(&old, "q2", "/answer 两页");
+    assert_eq!(
+        reason(&route(&s, message(&old, "q2", "还想调个地方")).await),
+        ClarifyReason::LowConfidence
+    );
+    let mut missing_input = message(&old, "missing", "/answer 两页");
     missing_input.reply_to = Some("not-a-current-question".into());
     let missing = route(&s, missing_input).await;
     assert_eq!(reason(&missing), ClarifyReason::MissingQuestion);
@@ -416,8 +420,8 @@ async fn clarification_answer_requires_latest_same_generation_question() {
     {
         let inputs = judge.inputs.lock().unwrap();
         let context = inputs.last().unwrap().clarification.as_ref().unwrap();
-        assert_eq!(context.question_id, "q3");
-        assert_eq!(context.source_text, "/answer 两页");
+        assert_eq!(context.question_id, "q2");
+        assert_eq!(context.source_text, "还想调个地方");
         assert!(!context.prompt.is_empty());
     }
     let revision: serde_json::Value = serde_json::from_str(
@@ -428,7 +432,7 @@ async fn clarification_answer_requires_latest_same_generation_question() {
             .input_text,
     )
     .unwrap();
-    assert_eq!(revision["clarification_source"], "/answer 两页");
+    assert_eq!(revision["clarification_source"], "还想调个地方");
     assert_eq!(revision["changes"][0]["kind"], "answer");
     assert!(matches!(
         route(&s, message(&old, "late", "/cancel")).await.outcome,

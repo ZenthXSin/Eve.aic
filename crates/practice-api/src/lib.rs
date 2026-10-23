@@ -5,6 +5,7 @@
 //! 都不算验证；只有运行器给出的实际加载与探测结果才能把一次尝试记为已验证。
 //! 账本、草稿器与运行器均可替换，宿主负责绑定目标、可见范围与工作目录。
 use ring::digest::{Context, SHA256};
+mod strategy;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -13,6 +14,7 @@ use std::{
     path::Path,
     pin::Pin,
 };
+pub use strategy::*;
 
 pub const PRACTICE_PLUGIN_ID: &str = "eve.practice";
 pub const PRACTICE_STATE_KEY: &str = "practice.v1";
@@ -400,11 +402,18 @@ pub struct DraftRequest {
     pub task: PracticeTask,
     pub runner: RunnerProfile,
     pub previous: Option<PreviousAttempt>,
+    /// 宿主选取的历史修正实例；只供借鉴方法，不改变当前任务或运行器约束。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<PracticeGuidance>,
 }
 
 /// 可替换草稿器；至多一次模型请求、零工具，输出须通过 `validate_draft`。
 pub trait PracticeDrafter: Send + Sync {
     fn version(&self) -> &str;
+    /// 显式声明会消费 guidance，防止把忽略建议的运行误记为策略验证。
+    fn supports_guidance(&self) -> bool {
+        false
+    }
     fn draft(&self, request: DraftRequest) -> PracticeFuture<'_, PracticeDraft>;
 }
 

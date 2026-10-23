@@ -428,18 +428,42 @@ class MessageJudgeAcceptance(unittest.TestCase):
         self.assertEqual(len(self.sessions()), 4)
         self.assertTrue(all(s["turns"][0]["status"]["state"] == "Completed" for s in self.sessions()))
 
-    def test_revision_after_tool_start_clarifies_without_replaying_tool(self):
+    def test_revision_after_tool_success_continues_from_receipt_without_replaying_tool(self):
         self.steps[("task", 2)] = {"wait": "never-release-tool"}
+        self.steps[("task", 3)] = {"text": "已按更正处理增量"}
         self.run_eve([
             {"send": self.message("tool", "echo:side-effect-marker", expected_type="finish")},
             self.wait_request("task", 2),
-            {"send": self.message("revision", "改成另一个值", SIDE_EFFECTS)},
-            self.wait_command("tool", "finish"), self.wait_receipt("revision"),
-            {"send": self.message("fresh", "/new 新任务", "新任务")}, self.wait_receipt("fresh")])
+            {"send": self.message("revision", "改成另一个值", "已按更正处理增量")},
+            self.wait_command("tool", "finish"), self.wait_receipt("revision")])
         self.assertEqual(self.counts(), (3, 0, 1))
         self.assertEqual(self.calls["task"][1]["body"]["messages"][-1]["role"], "tool")
         self.assert_cancelled(self.sessions()[0]["turns"][0], tools=1)
         self.assertEqual(len(self.sessions()[0]["turns"]), 2)
+        prompt=json.loads(self.calls["task"][2]["body"]["messages"][-1]["content"])
+        self.assertEqual(prompt["request_kind"],"continuation")
+        self.assertEqual(prompt["changes"][0]["kind"],"correction")
+        self.assertFalse(any(m.get("tool_calls") for m in self.sessions()[0]["turns"][1]["status"]["messages"]))
+
+    def test_natural_supplement_after_tool_success_continues_with_receipt_without_replaying(self):
+        self.steps[("task", 2)] = {"wait": "never-release-old-answer"}
+        self.steps[("task", 3)] = {"text": "已保留刚才结果，并补上说明"}
+        self.steps[("jev", 1)] = {"intent": "supplement"}
+        self.run_eve([
+            {"send": self.message("tool", "echo:side-effect-marker", expected_type="finish")},
+            self.wait_request("task", 2),
+            {"send": self.message("supplement", "顺便加一份说明", "已保留刚才结果，并补上说明")},
+            self.wait_command("tool", "finish"), self.wait_receipt("supplement")])
+        self.assertEqual(self.counts(), (3, 0, 1))
+        prompt=json.loads(self.calls["task"][2]["body"]["messages"][-1]["content"])
+        self.assertEqual(prompt["request_kind"],"continuation")
+        self.assertEqual(prompt["changes"],[{"kind":"supplement","text":"顺便加一份说明"}])
+        self.assertEqual(prompt["confirmed_progress"]["started_tools"],1)
+        self.assertEqual(prompt["confirmed_progress"]["tool_results"][0]["output"]["Success"],{"echo":"side-effect-marker"})
+        turns=self.sessions()[0]["turns"]
+        self.assert_cancelled(turns[0],tools=1)
+        self.assertEqual(turns[1]["status"]["state"],"Completed")
+        self.assertEqual(sum(len(m.get("tool_calls",[])) for m in turns[1]["status"]["messages"]),0)
 
     def test_explicit_cancel_supersedes_pending_natural_judgement(self):
         self.steps[("task", 1)] = {"wait": "never-release-old"}

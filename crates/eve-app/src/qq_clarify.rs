@@ -578,6 +578,15 @@ impl QqOutreach for ChannelAdapter {
 /// 投递结果按 ID 前缀交回分配它的来源。
 pub(crate) struct Combined(pub(crate) Vec<(&'static str, Arc<dyn QqOutreach>)>);
 impl QqOutreach for Combined {
+    fn group_chime(
+        &self,
+        id: &str,
+    ) -> PluginResult<Option<eve_qqbot_plugin::QqGroupChimeDelivery>> {
+        match self.0.iter().find(|(prefix, _)| id.starts_with(prefix)) {
+            Some((_, source)) => source.group_chime(id),
+            None => Ok(None),
+        }
+    }
     fn due(&self, session: &SessionKey) -> PluginResult<bool> {
         for (_, source) in &self.0 {
             if source.due(session)? {
