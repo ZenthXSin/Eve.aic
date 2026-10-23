@@ -8,6 +8,16 @@ const browser = await chromium.launch({ executablePath: process.env.EVE_TEST_BRO
 try {
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
   const errors = [];
+  // 页面上可能还留着上一次的“已保存修订 N”，只认这次保存后出现的新修订号；保存进行中面板会拒绝切换页面。
+  const status = () => page.evaluate(() => document.querySelector("#plugin-page-detail [role=status]")?.textContent ?? "");
+  const save = async () => {
+    const before = await status();
+    await page.getByRole("button", { name: "保存修改", exact: true }).click();
+    await page.waitForFunction(previous => {
+      const text = document.querySelector("#plugin-page-detail [role=status]")?.textContent ?? "";
+      return /已保存修订 \d+/.test(text) && text !== previous;
+    }, before);
+  };
   page.on("pageerror", error => errors.push(error.message));
   await page.goto(url);
   await page.locator("#access-token").fill(token);
@@ -19,19 +29,16 @@ try {
   assert.equal(await interest.isChecked(), false);
   await interest.check();
   await page.getByLabel("观察间隔（毫秒）", { exact: true }).fill("1000");
-  await page.getByRole("button", { name: "保存修改", exact: true }).click();
-  await page.getByText(/已保存修订/).waitFor();
+  await save();
   assert.equal(await interest.isChecked(), true);
   assert.equal(await page.getByLabel("观察间隔（毫秒）", { exact: true }).inputValue(), "1000");
   assert.ok(!(await page.locator("#plugin-page-detail").textContent()).includes("修改需重启"));
   await interest.uncheck();
-  await page.getByRole("button", { name: "保存修改", exact: true }).click();
-  await page.getByText(/已保存修订/).waitFor();
+  await save();
   await page.getByRole("button", { name: "主模型连接", exact: true }).click();
   const input = page.getByLabel("model", { exact: true });
   await input.fill("browser-model");
-  await page.getByRole("button", { name: "保存修改", exact: true }).click();
-  await page.getByText(/已保存修订/).waitFor();
+  await save();
   assert.equal(await input.inputValue(), "browser-model");
   await input.fill("unsaved-draft");
   await page.waitForTimeout(3300);
@@ -48,8 +55,7 @@ try {
   await page.getByRole("button", { name: "重新读取（放弃编辑）", exact: true }).click();
   await page.waitForFunction(() => document.querySelector("#plugin-field-2")?.value === "concurrent-model");
   await input.fill("initial-model");
-  await page.getByRole("button", { name: "保存修改", exact: true }).click();
-  await page.getByText(/已保存修订/).waitFor();
+  await save();
   await page.getByRole("button", { name: "插件管理", exact: true }).click();
   const plugin = page.locator("#plugins-list article").filter({ has: page.getByRole("heading", { name: "eve.segment.preferences", exact: true }) });
   await plugin.getByRole("button", { name: "停止插件" }).click();
