@@ -86,6 +86,7 @@ pub const QQBOT_HELP: &str = "--group-chat 接入全量群消息观察、说法�
 --triggers 开启原会话条件唤醒工具（时间、文件、后台任务、消息匹配、Linux 进程）。
 Eve 官方 QQBot 通道
 用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--strategy-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--stickers] [--background-tasks] [--no-error-recovery] [--subagents] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--markdown] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+--task-strategy-catalog 文件 接入可信固定验收目录；需 --background-tasks。目录可为空，未匹配任务照常执行但不学习；策略与世界预测不自动创建试验任务。
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -198,6 +199,8 @@ pub struct QqBotOptions {
     pub background_tasks: bool,
     /// 通用任务策略由可信 Rust 宿主提供评价条件和运行环境指纹，默认不装配。
     pub task_strategy_policy: Option<Arc<dyn eve_task_api::TaskStrategyPolicy>>,
+    /// 可信宿主提供的固定验收目录，与Rust策略注入互斥。
+    pub task_strategy_catalog: Option<PathBuf>,
     /// 可信宿主接收持久化认知管理句柄；不暴露给聊天或模型工具。
     pub cognitive_services: Option<Arc<dyn crate::CognitiveServices>>,
     pub disable_error_recovery: bool,
@@ -265,6 +268,7 @@ impl Default for QqBotOptions {
             stickers: false,
             background_tasks: false,
             task_strategy_policy: None,
+            task_strategy_catalog: None,
             cognitive_services: None,
             disable_error_recovery: false,
             subagents: false,
@@ -408,6 +412,9 @@ impl QqBotOptions {
             match arg.to_str() {
                 Some("--state-dir") => options.state_directory = value.into(),
                 Some("--database-config") => options.database_config = Some(value.into()),
+                Some("--task-strategy-catalog") => {
+                    options.task_strategy_catalog = Some(value.into())
+                }
                 Some("--agent") => options.agent_path = value.into(),
                 Some("--node") => options.node_program = value,
                 Some("--bridge-script") => options.bridge_script = value.into(),
@@ -536,6 +543,9 @@ impl QqBotOptions {
                 }
                 _ => return Err("未知 QQBot 参数；使用 --help".into()),
             }
+        }
+        if options.task_strategy_catalog.is_some() && !options.background_tasks {
+            return Err("--task-strategy-catalog 需要同时开启 --background-tasks".into());
         }
         if options.self_learning {
             options.memory = true;
@@ -809,6 +819,14 @@ async fn run_qqbot_composed(
     }
     if options.memory_recall && !memory_available {
         return Err("--memory-recall 需要同时开启 --memory".into());
+    }
+    if options.task_strategy_catalog.is_some() && options.task_strategy_policy.is_some() {
+        return Err("固定验收目录与Rust策略注入不能同时使用".into());
+    }
+    if (options.task_strategy_catalog.is_some() || options.task_strategy_policy.is_some())
+        && !options.background_tasks
+    {
+        return Err("通用任务策略需要开启后台任务".into());
     }
     options.learning_options.validate()?;
     options.interest_options.validate()?;
@@ -1191,7 +1209,42 @@ async fn run_qqbot_composed(
             None
         };
         // 后台任务账本同样先于通道加载；损坏时拒绝启动并保留原字节，执行中的任务记为中断，发送中的通知记为结果未知。
-        let task_strategies = if let Some(policy) = options.task_strategy_policy.clone() {
+        let task_late = Arc::new(qq_tasks::Late::default());
+        let task_runtime_manifest = Arc::new(std::sync::OnceLock::new());
+        let task_policy = if let Some(path) = &options.task_strategy_catalog {
+            let profiles = if options.subagents {
+                let late = task_late.clone();
+                Some(Arc::new(move |owner: &eve_task_api::TaskOwner| -> eve_task_api::TaskResult<serde_json::Value> {
+                    let profiles = late.profiles.get().ok_or(eve_task_api::TaskError::Unavailable)?;
+                    let scope = eve_llm_api::ContextScope { session_id: owner.session_id.clone(), user_id: owner.user_id.clone() };
+                    let revision_before = profiles.revision().map_err(|_| eve_task_api::TaskError::Unavailable)?;
+                    let mut all = Vec::new();
+                    let mut after: Option<String> = None;
+                    loop {
+                        let rows = profiles.list(&scope, after.as_deref()).map_err(|_| eve_task_api::TaskError::Unavailable)?;
+                        if rows.is_empty() { break; }
+                        let next = rows.last().ok_or(eve_task_api::TaskError::Unavailable)?.id.clone();
+                        if after.as_ref().is_some_and(|previous| previous == &next) || all.len() + rows.len() > 1024 {
+                            return Err(eve_task_api::TaskError::LimitReached);
+                        }
+                        after = Some(next);
+                        all.extend(rows);
+                    }
+                    let revision_after = profiles.revision().map_err(|_| eve_task_api::TaskError::Unavailable)?;
+                    if revision_before != revision_after { return Err(eve_task_api::TaskError::Unavailable); }
+                    Ok(serde_json::json!({"revision": revision_after, "profiles": all}))
+                }) as Arc<crate::task_strategy_catalog::ProfilesReader>)
+            } else { None };
+            let executable = std::fs::read(std::env::current_exe()?)?;
+            let executable_sha256 = ring::digest::digest(&ring::digest::SHA256, &executable).as_ref().iter().map(|b| format!("{b:02x}")).collect();
+            Some(crate::task_strategy_catalog::load(path, registry.clone(), crate::task_strategy_catalog::RuntimeInputs {
+                agent_path: options.agent_path.clone(),
+                developer_config: std::env::var_os("EVE_DEVELOPER_CONFIG").map(PathBuf::from),
+                admin_bindings: options.state_directory.join("admin-bindings.json"),
+                runtime_manifest: task_runtime_manifest.clone(), profiles, executable_sha256,
+            })?)
+        } else { options.task_strategy_policy.clone() };
+        let task_strategies = if let Some(policy) = task_policy {
             if !options.background_tasks {
                 return Err("通用任务策略需要开启后台任务".into());
             }
@@ -1249,7 +1302,6 @@ async fn run_qqbot_composed(
         } else {
             None
         };
-        let task_late = Arc::new(qq_tasks::Late::default());
         if options.subagents {
             let profiles = eve_subagent_profile_sqlite::SqliteSubagentProfiles::open(
                 &options.state_directory.join("subagent-profiles.sqlite3"),
@@ -1779,6 +1831,19 @@ async fn run_qqbot_composed(
         let tool_definitions: Vec<_> = std::iter::once(crate::services::echo_definition())
             .chain(bootstrap.tools.iter().map(|tool| tool.definition()))
             .collect();
+        task_runtime_manifest.set(serde_json::json!({
+            "tools": &tool_definitions,
+            "worker_tools": &worker_tools,
+            "environment_sha256": eve_task_api::task_strategy_digest(&std::env::vars().filter(|(key, _)| key.starts_with("EVE_") || key.starts_with("QQBOT_")).collect::<std::collections::BTreeMap<_, _>>()),
+            "system_prompt": &worker_config.system_prompt,
+            "output_format": &worker_config.output_format,
+            "max_tool_calls": worker_config.max_tool_calls,
+            "max_tool_rounds": worker_config.max_tool_rounds,
+            "max_parallel_tool_calls": worker_config.max_parallel_tool_calls,
+            "subagents": options.subagents,
+            "sleep": options.sleep,
+            "triggers": options.triggers,
+        })).map_err(|_| "任务运行指纹已重复装配")?;
         let tools_registered = tool_definitions.len();
         let help_commands = crate::qq_help::Help::handler(tool_definitions.clone());
         bootstrap.context = Some(Arc::new(eve_dialogue_tools::CapabilitiesContext {
@@ -3339,6 +3404,23 @@ mod recall_options_tests {
         assert!(error.contains("--memory-recall"));
         let options = parse(&["--memory", "--memory-recall", "--semantic-recall"]).unwrap();
         assert!(options.semantic_recall && options.memory_recall);
+    }
+
+    #[test]
+    fn task_strategy_catalog_requires_background_and_preserves_path() {
+        assert!(parse(&["--task-strategy-catalog", "catalog.json"]).is_err());
+        let options = parse(&[
+            "--background-tasks",
+            "--task-strategy-catalog",
+            "catalog.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            options.task_strategy_catalog,
+            Some(PathBuf::from("catalog.json"))
+        );
+        assert!(options.task_strategy_policy.is_none());
+        assert!(parse(&[]).unwrap().task_strategy_catalog.is_none());
     }
 
     #[test]

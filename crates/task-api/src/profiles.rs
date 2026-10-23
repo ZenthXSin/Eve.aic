@@ -77,6 +77,11 @@ impl fmt::Display for SubagentProfileError {
 }
 impl std::error::Error for SubagentProfileError {}
 pub trait SubagentProfiles: Send + Sync {
+    /// 宿主级持久创建水位，用于与实际作用域配置共同计算运行环境指纹。
+    /// 删除本身由列表变化识别，删除再创建必须提高水位；不能支持该保证的后端应报错。
+    fn revision(&self) -> Result<u64, SubagentProfileError> {
+        Err(SubagentProfileError::Storage)
+    }
     fn create(
         &self,
         scope: &ContextScope,
