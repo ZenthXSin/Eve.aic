@@ -34,7 +34,8 @@ fn valid_scope(scope: &ContextScope) -> Result<(), Error> {
     }
 }
 fn row(sequence: u64, payload: String) -> Result<SubagentProfile, Error> {
-    if payload.len() > 16384 {
+    // JSON 转义可能让合法的 8 KiB 角色说明膨胀至六倍，工具名称另占空间。
+    if payload.len() > 128 * 1024 {
         return Err(Error::CorruptState);
     }
     let profile: SubagentProfileDraft =

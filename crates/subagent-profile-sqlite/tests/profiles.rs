@@ -94,3 +94,18 @@ fn pagination_does_not_hide_or_drop_older_roles() {
     assert_eq!(second.len(), 6);
     assert_ne!(first[0].id, second[0].id);
 }
+#[test]
+fn escaped_valid_instructions_survive_save_and_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("profiles.sqlite3");
+    let store = SqliteSubagentProfiles::open(&path).unwrap();
+    let mut d = draft();
+    d.instructions = format!("说明{}", "\u{1}".repeat(8186));
+    d.validate().unwrap();
+    let saved = store.create(&scope(), d).unwrap();
+    drop(store);
+    let store = SqliteSubagentProfiles::open(&path).unwrap();
+    assert_eq!(store.get(&scope(), &saved.id).unwrap(), saved);
+    assert!(store.create(&scope(), draft()).is_err());
+    assert_eq!(store.list(&scope(), None).unwrap().len(), 1);
+}
