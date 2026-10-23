@@ -344,6 +344,8 @@ impl StoredTasks {
                 .is_some_and(|deadline| deadline != deadline_at_ms)
                 || execution.checkpoint.as_ref().is_some_and(|old| {
                     checkpoint.used_tool_calls < old.used_tool_calls
+                        || checkpoint.delegated_tool_calls < old.delegated_tool_calls
+                        || checkpoint.delegated_model_requests < old.delegated_model_requests
                         || checkpoint.provider_requests < old.provider_requests
                         || old.result.is_some()
                 })
@@ -520,8 +522,8 @@ impl StoredTasks {
 
 fn checkpoint_usage(checkpoint: &eve_llm_api::TurnCheckpoint) -> TaskUsage {
     TaskUsage {
-        tool_calls: checkpoint.used_tool_calls as u32,
-        model_requests: checkpoint.provider_requests as u32,
+        tool_calls: (checkpoint.used_tool_calls + checkpoint.delegated_tool_calls) as u32,
+        model_requests: (checkpoint.provider_requests + checkpoint.delegated_model_requests) as u32,
     }
 }
 
@@ -668,8 +670,11 @@ fn validate_task(task: &Task) -> TaskResult<()> {
             if checkpoint.scope.session_id != task.owner.session_id
                 || checkpoint.scope.user_id != task.owner.user_id
                 || task.usage.is_some_and(|usage| {
-                    usage.tool_calls < checkpoint.used_tool_calls as u32
-                        || usage.model_requests < checkpoint.provider_requests as u32
+                    usage.tool_calls
+                        < (checkpoint.used_tool_calls + checkpoint.delegated_tool_calls) as u32
+                        || usage.model_requests
+                            < (checkpoint.provider_requests + checkpoint.delegated_model_requests)
+                                as u32
                 })
             {
                 return Err(TaskError::CorruptState);

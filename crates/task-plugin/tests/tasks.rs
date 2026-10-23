@@ -113,6 +113,8 @@ fn checkpoint(user: &str) -> eve_llm_api::TurnCheckpoint {
         )],
         pending_calls: vec![],
         used_tool_calls: 0,
+        delegated_tool_calls: 0,
+        delegated_model_requests: 0,
         provider_requests: 1,
         tool_batches: 0,
         remaining: Some("核验剩余步骤".into()),

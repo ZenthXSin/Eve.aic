@@ -60,7 +60,8 @@ class PursuitAcceptance(agenda_test.AgendaAcceptance):
 
     def stop_events(self):
         return [event for event in self.cognition()["state"]["events"]
-                if event["source"]["channel"] == "eve.pursuit"]
+                if event["source"]["channel"] == "eve.pursuit"
+                and json.loads(event["summary"]).get("schema") == "pursuit-stop:v1"]
 
     def test_spent_learning_budget_is_reported_then_stopped_once_with_the_reason(self):
         # 第一版：研究与实践各一次，之后能做的都做了，等用户提到新的想法。

@@ -47,6 +47,7 @@ pub struct RelationPlugin {
     manifest: PluginManifest,
     source: JudgeSource,
     decorator: Option<JudgeDecorator>,
+    experience: Option<Arc<dyn RelationExperienceStore>>,
 }
 enum JudgeSource {
     Direct(Arc<dyn RelationJudge>),
@@ -61,7 +62,12 @@ impl RelationPlugin {
             manifest: PluginManifest::new(RELATION_PLUGIN_ID, env!("CARGO_PKG_VERSION"))?,
             source: JudgeSource::Direct(judge),
             decorator: None,
+            experience: None,
         })
+    }
+    pub fn with_experience(mut self, store: Arc<dyn RelationExperienceStore>) -> Self {
+        self.experience = Some(store);
+        self
     }
     pub fn with_judge_decorator(mut self, decorator: JudgeDecorator) -> Self {
         self.decorator = Some(decorator);
@@ -97,6 +103,7 @@ impl Plugin for RelationPlugin {
             },
         };
         let decorator = self.decorator.clone();
+        let experience = self.experience.clone();
         Box::pin(async move {
             let judge: Arc<dyn RelationJudge> = match source {
                 JudgeSource::Direct(judge) => judge,
@@ -108,7 +115,9 @@ impl Plugin for RelationPlugin {
                         .ok_or_else(|| PluginError::State("缺少消息配置服务".into()))?
                         .0
                         .clone();
-                    Arc::new(FallbackJudge::new(config, primary, fallback))
+                    Arc::new(
+                        FallbackJudge::new(config, primary, fallback).with_experience(experience),
+                    )
                 }
             };
             let judge = match decorator {

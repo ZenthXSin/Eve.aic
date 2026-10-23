@@ -71,9 +71,9 @@ async fn binds_locally_and_maps_unique_original_utf8_text() {
     assert_eq!(requests.len(), 1);
     requests[0].validate().unwrap();
     assert!(requests[0].tools.is_empty());
-    assert_eq!(requests[0].messages.len(), 2);
+    assert_eq!(requests[0].messages.len(), 3);
     assert_eq!(requests[0].messages[0].role, ChatRole::System);
-    let state = requests[0].messages[1].text.as_ref().unwrap();
+    let state = requests[0].messages.last().unwrap().text.as_ref().unwrap();
     for id in [
         "private-message-id",
         "private-session-id",
@@ -105,7 +105,7 @@ async fn sends_clarification_content_and_match_boolean_without_question_id() {
     });
     judge.judge(input).await.unwrap();
     let requests = provider.requests.lock().unwrap();
-    let text = requests[0].messages[1].text.as_ref().unwrap();
+    let text = requests[0].messages.last().unwrap().text.as_ref().unwrap();
     assert!(!text.contains("private-question-id"));
     let state: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(state["clarification"]["reply_matches"], true);

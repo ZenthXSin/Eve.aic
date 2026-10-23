@@ -207,6 +207,10 @@ impl ContextAssembler for Context {
             let Some(scope) = scope else {
                 return Ok(context);
             };
+            if scope.user_id == crate::qq_group::USER {
+                context.profile.push_str("\n当前是群聊观察生成的接话，不代表任何个人身份，不读取个人印象或私聊资料，也没有管理员或工具权限。\n");
+                return Ok(context);
+            }
             let unavailable = || LlmError::Context("人名称呼与主人资料不可用；保留原记录".into());
             let entry = self
                 .registry

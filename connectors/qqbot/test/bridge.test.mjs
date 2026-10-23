@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Readable, PassThrough } from "node:stream";
 import { createBridge, consume, optionsFromEnv, readableFaces, MAX_FRAME, MAX_MESSAGE_ID_BYTES, MAX_PUSH_BYTES, MAX_SEGMENTS, PASSIVE_REPLY_WINDOW_MS } from "../bridge-core.mjs";
-function fixture({ fail = false, error = null, now, limit = 128, appId = "1904159860", hold = null, fileFail = false, imageFail = false } = {}) {
+function fixture({ group = {}, fail = false, error = null, now, limit = 128, appId = "1904159860", hold = null, fileFail = false, imageFail = false } = {}) {
   const frames = [], sent = [], files = [], images = [], handlers = new Map();
   const bot = {
     appId,
@@ -25,7 +25,7 @@ function fixture({ fail = false, error = null, now, limit = 128, appId = "190415
       return { upload: { file_uuid: "uuid-1", file_info: "info-1", ttl: 60 }, message: { id: "file-msg-1" } };
     },
   };
-  const bridge = createBridge(bot, f => frames.push(f), limit, now);
+  const bridge = createBridge(bot, f => frames.push(f), limit, now, group);
   const message = (kind = "c2c", id = "in-1") => handlers.get("message")({}, {
     kind, messageId: id, senderId: "user-1", content: "你好",
     rawEventType: kind === "group" ? "GROUP_AT_MESSAGE_CREATE" : "C2C_MESSAGE_CREATE",
@@ -779,4 +779,38 @@ test("只发一个表情的消息带着可读标签交给 Eve，不再是编码�
     replyTarget: { scope: "c2c", targetId: "user-1", msgId: "face-1" } });
   const frame = f.frames.find(x => x.type === "message");
   assert.equal(frame.text, "【表情：呲牙】");
+});
+
+test("全量群消息只进入观察，艾特消息同时保留普通任务入口", () => {
+  const f=fixture({group:{observe:true,mention:true}});
+  const msg={kind:"group",messageId:"full-1",senderId:"member-1",content:"今天这个方法挺好",rawEventType:"GROUP_MESSAGE_CREATE",groupOpenid:"group-1",replyTarget:{scope:"group",targetId:"group-1",msgId:"full-1"}};
+  f.handlers.get("message")({},msg);
+  assert.equal(f.frames.filter(x=>x.type==="group_observation").length,1);
+  assert.equal(f.frames.filter(x=>x.type==="message").length,0);
+  assert.equal(f.frames[0].message.user_id,"member-1");
+  f.handlers.get("message")({}, {...msg,messageId:"at-1",rawEventType:"GROUP_AT_MESSAGE_CREATE",replyTarget:{...msg.replyTarget,msgId:"at-1"}});
+  assert.equal(f.frames.filter(x=>x.type==="group_observation").length,2);
+  assert.equal(f.frames.filter(x=>x.type==="message").length,1);
+  assert.equal(f.sent.length,0);
+  f.handlers.get("message")({}, {...msg,senderIsBot:true});
+  assert.equal(f.frames.filter(x=>x.type==="group_observation").length,2);
+});
+test("群回复首段只艾特平台原发送者，私聊不增加艾特", async () => {
+  const f=fixture({group:{observe:true,mention:true}}); f.message("group","g-at");
+  await f.bridge.command({type:"segment",version:1,id:"g-at",index:0,count:2,text:"知道了"});
+  await f.bridge.command({type:"segment",version:1,id:"g-at",index:1,count:2,text:"我继续看看"});
+  assert.deepEqual(f.sent.map(x=>x.text),["<@user-1> 知道了","我继续看看"]);
+  f.message("c2c","private-no-at");
+  await f.bridge.command({type:"reply",version:1,id:"private-no-at",text:"好的"});
+  assert.equal(f.sent.at(-1).text,"好的");
+});
+test("主动群插话复用发送接口，分条并只在首段艾特来源发送者", async () => {
+  const f=fixture({group:{observe:true,mention:true}});
+  await f.bridge.command({version:1,type:"push",id:"chime-first",scope:"group",target_id:"group-1",mention_user_id:"member-2",text:"这个思路可行\n可以试试",parts:[["这个思路可行",0],["可以试试",0]]});
+  assert.deepEqual(f.sent.map(x=>x.text),["<@member-2> 这个思路可行","可以试试"]);
+  assert.ok(f.sent.every(x=>x.target.scope==="group"&&!x.target.msgId));
+  assert.equal(f.frames.at(-1).ok,true);
+  await f.bridge.command({version:1,type:"push",id:"bad-route",scope:"c2c",target_id:"member-2",mention_user_id:"member-2",text:"测试"});
+  assert.equal(f.frames.at(-1).ok,false);
+  assert.equal(f.sent.length,2);
 });

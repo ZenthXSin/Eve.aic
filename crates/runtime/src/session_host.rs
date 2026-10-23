@@ -184,7 +184,13 @@ impl SessionLlmHost {
             _ = closed => return Err(SessionRunError::NotStarted(LlmError::Cancelled)),
             admission = self.host.kernel.acquire_runtime_admission() => Arc::new(admission),
         };
-        let host = self.host.for_turn().map_err(SessionRunError::NotStarted)?;
+        let host = self
+            .host
+            .for_turn(Some(&eve_llm_api::ContextScope {
+                session_id: input.key.session_id.clone(),
+                user_id: input.key.user_id.clone(),
+            }))
+            .map_err(SessionRunError::NotStarted)?;
         let text = input.text.clone();
         let beginning = self
             .service()

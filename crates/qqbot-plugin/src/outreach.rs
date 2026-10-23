@@ -67,7 +67,20 @@ pub enum QqOutreachResult {
 /// `attach` 与 `next_push` 返回邀请即表示宿主已持久化这次投递尝试；之后通道一定以
 /// `delivered` 回报结果，进程在写出前后退出时由宿主自行核对，通道不会补发。
 /// 返回 Err 时通道记录警告并照常投递原回复。
+/// 仅由宿主群聊插话组件创建的发送资料；不授予工具权限。
+#[derive(Clone, Debug)]
+pub struct QqGroupChimeDelivery {
+    pub session: SessionKey,
+    pub speaker_id: String,
+    pub parts: Vec<(String, u64)>,
+}
+
 pub trait QqOutreach: Send + Sync {
+    /// 只接受与本组件已领取的插话账本匹配的 ID；默认来源不能扩大群聊发送范围。
+    fn group_chime(&self, _id: &str) -> PluginResult<Option<QqGroupChimeDelivery>> {
+        Ok(None)
+    }
+
     /// 普通私聊回复即将投递时调用：此刻是否有一条可以为这个会话判断时机的邀请。
     fn due(&self, session: &SessionKey) -> PluginResult<bool>;
     /// 判断这次回复后是否适合附带邀请；宿主先持久化判断再发起至多一次模型请求。

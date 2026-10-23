@@ -1,4 +1,6 @@
 //! 消息关系与动作报告定义层，不包含判断模型、执行器或磁盘实现。
+mod experience;
+pub use experience::*;
 mod diagnostics;
 pub use diagnostics::*;
 use eve_config_api::{ConfigError, ConfigField, ConfigKind, ConfigSchema, ConfigSnapshot};
@@ -152,6 +154,15 @@ pub enum RelationError {
     Panicked,
 }
 pub trait RelationJudge: Send + Sync {
+    /// 示例仅是当前范围的历史分类数据；旧实现可忽略，最终决定仍绑定当前输入。
+    fn judge_with_examples(
+        &self,
+        input: RelationInput,
+        _examples: Vec<RelationExample>,
+        observer: Arc<dyn RelationObserver>,
+    ) -> RelationFuture<'_> {
+        self.judge_observed(input, observer)
+    }
     fn judge(&self, input: RelationInput) -> RelationFuture<'_>;
 
     /// 兼容旧实现，但明确标记不可观测；不能把缺失诊断解释为零调用。
@@ -260,27 +271,32 @@ pub fn message_schema() -> ConfigSchema {
         ("max_input_bytes", 65536, 1, 1048576),
         ("max_tracked_messages", 256, 1, 65536),
     ];
+    let mut fields: BTreeMap<_, _> = specs
+        .into_iter()
+        .map(|(name, default, min, max)| {
+            let mut field = ConfigField::new(
+                ConfigKind::Integer {
+                    minimum: Some(min),
+                    maximum: Some(max),
+                },
+                Some(default.into()),
+            );
+            field.environment = Some(format!("EVE_MESSAGE_{}", name.to_ascii_uppercase()));
+            (name.into(), field)
+        })
+        .collect();
+    let mut experience = ConfigField::new(ConfigKind::Boolean, Some(true.into()));
+    experience.environment = Some("EVE_MESSAGE_EXPERIENCE_ENABLED".into());
+    fields.insert("experience_enabled".into(), experience);
     ConfigSchema {
         namespace: MESSAGE_NAMESPACE.into(),
         version: 1,
-        fields: specs
-            .into_iter()
-            .map(|(name, default, min, max)| {
-                let mut field = ConfigField::new(
-                    ConfigKind::Integer {
-                        minimum: Some(min),
-                        maximum: Some(max),
-                    },
-                    Some(default.into()),
-                );
-                field.environment = Some(format!("EVE_MESSAGE_{}", name.to_ascii_uppercase()));
-                (name.into(), field)
-            })
-            .collect::<BTreeMap<_, _>>(),
+        fields,
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MessageConfig {
+    pub experience_enabled: bool,
     pub confidence_threshold: u8,
     pub judge_timeout_ms: u64,
     pub max_input_bytes: usize,
@@ -301,6 +317,7 @@ impl TryFrom<&ConfigSnapshot> for MessageConfig {
             )?;
         }
         Ok(Self {
+            experience_enabled: s.get("experience_enabled")?,
             confidence_threshold: s.get("confidence_threshold")?,
             judge_timeout_ms: s.get("judge_timeout_ms")?,
             max_input_bytes: s.get("max_input_bytes")?,

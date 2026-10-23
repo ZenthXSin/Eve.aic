@@ -417,3 +417,175 @@ async fn sink_closure_while_waiting_for_the_session_gate_stops_the_message() {
     assert!(control.submissions.lock().unwrap().is_empty());
     router.0.close().await.unwrap();
 }
+
+struct AnswerJudge;
+impl RelationJudge for AnswerJudge {
+    fn judge(&self, input: RelationInput) -> RelationFuture<'_> {
+        Box::pin(async move {
+            if input.clarification.is_none() {
+                return RulesJudge.judge(input).await;
+            }
+            Ok(RelationDecision {
+                target: input.message.target.clone(),
+                message_id: input.message.message_id.clone(),
+                parts: vec![IntentPart {
+                    intent: MessageIntent::Answer,
+                    confidence: 95,
+                    span: Some(TextSpan {
+                        start: 0,
+                        end: input.message.text.len(),
+                    }),
+                }],
+                explanation: "回答当前未决问题".into(),
+            })
+        })
+    }
+}
+#[tokio::test]
+async fn plain_private_answer_binds_current_question_but_conflicting_quote_does_not() {
+    for conflicting in [false, true] {
+        let control = Control::new(None);
+        let router = router(control.clone(), Arc::new(AnswerJudge));
+        let ticket = router
+            .submit(
+                message(&control, "这个也要改"),
+                Arc::new(DiscardControlEvents),
+            )
+            .unwrap();
+        assert!(matches!(
+            bounded(router.wait(&ticket)).await.unwrap().outcome,
+            RouteOutcome::Clarify { .. }
+        ));
+        let mut reply = message(&control, "就在刚才那份报告里补上预算");
+        reply.message_id = "plain-private-answer".into();
+        if conflicting {
+            reply.reply_to = Some("different-question".into());
+        }
+        let ticket = router
+            .submit(reply, Arc::new(DiscardControlEvents))
+            .unwrap();
+        let report = bounded(router.wait(&ticket)).await.unwrap();
+        if conflicting {
+            assert!(matches!(
+                report.outcome,
+                RouteOutcome::Clarify {
+                    reason: ClarifyReason::MissingQuestion,
+                    ..
+                }
+            ));
+            assert_eq!(control.cancellations.load(Ordering::SeqCst), 0);
+        } else {
+            assert!(matches!(report.outcome, RouteOutcome::Replaced { .. }));
+            let submitted = control.submissions.lock().unwrap();
+            assert!(
+                submitted[0]
+                    .session
+                    .text
+                    .contains("就在刚才那份报告里补上预算")
+            );
+            assert!(submitted[0].session.text.contains("这个也要改"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn supplement_after_confirmed_tool_keeps_progress_instead_of_forcing_new_task() {
+    let control = Control::new(None);
+    {
+        let mut state = control.state.lock().unwrap();
+        Control::complete(&mut state);
+        let run = &mut state.report.as_mut().unwrap().run;
+        run.started_tools = Some(1);
+        run.tool_results = vec![
+            eve_llm_api::ToolResult::success(
+                "saved-file",
+                json!({"path":"result.txt","written":true}),
+            )
+            .unwrap(),
+        ];
+    }
+    let router = router(control.clone(), Arc::new(RulesJudge));
+    let ticket = router
+        .submit(
+            message(&control, "/add 再写一份说明，保留刚才的文件"),
+            ClosingSink::new(),
+        )
+        .unwrap();
+    let routed = bounded(router.wait(&ticket)).await.unwrap();
+    assert!(matches!(routed.outcome, RouteOutcome::Replaced { .. }));
+    let inputs = control.submissions.lock().unwrap().clone();
+    assert_eq!(inputs.len(), 1);
+    let body: serde_json::Value = serde_json::from_str(&inputs[0].session.text).unwrap();
+    assert_eq!(body["request_kind"], "continuation");
+    assert_eq!(body["confirmed_progress"]["started_tools"], 1);
+    assert_eq!(
+        body["confirmed_progress"]["tool_results"][0]["output"]["Success"]["path"],
+        "result.txt"
+    );
+    assert!(body["policy"].as_str().unwrap().contains("不要重复执行"));
+    router.0.close().await.unwrap();
+}
+#[test]
+fn unconfirmed_missing_duplicate_failed_or_unknown_tool_results_cannot_continue_automatically() {
+    let control = Control::new(None);
+    let mut state = control.state.lock().unwrap();
+    Control::complete(&mut state);
+    let mut run = state.report.as_ref().unwrap().run.clone();
+    run.started_tools = Some(1);
+    assert!(!confirmed_progress(&run));
+    run.tool_results = vec![eve_llm_api::ToolResult::success("one", json!({"ok":true})).unwrap()];
+    assert!(confirmed_progress(&run));
+    run.started_tools = None;
+    assert!(!confirmed_progress(&run));
+    run.started_tools = Some(2);
+    assert!(!confirmed_progress(&run));
+    run.tool_results.push(run.tool_results[0].clone());
+    assert!(!confirmed_progress(&run));
+    run.started_tools = Some(1);
+    run.tool_results = vec![
+        eve_llm_api::ToolResult::failure(
+            "one",
+            eve_llm_api::ToolFailureCode::Cancelled,
+            "中断，结果未知",
+        )
+        .unwrap(),
+    ];
+    assert!(!confirmed_progress(&run));
+}
+
+#[tokio::test]
+async fn supplement_with_unconfirmed_tool_result_keeps_report_and_requests_verification() {
+    let control = Control::new(None);
+    {
+        let mut state = control.state.lock().unwrap();
+        Control::complete(&mut state);
+        let run = &mut state.report.as_mut().unwrap().run;
+        run.started_tools = Some(1);
+        run.tool_results = vec![
+            eve_llm_api::ToolResult::failure(
+                "unknown-result",
+                eve_llm_api::ToolFailureCode::Cancelled,
+                "工具中断，结果尚未确认",
+            )
+            .unwrap(),
+        ];
+    }
+    let router = router(control.clone(), Arc::new(RulesJudge));
+    let ticket = router
+        .submit(message(&control, "/add 补上一份说明"), ClosingSink::new())
+        .unwrap();
+    let routed = bounded(router.wait(&ticket)).await.unwrap();
+    let RouteOutcome::Clarify {
+        reason: ClarifyReason::SideEffects,
+        prior: Some(prior),
+        prompt,
+        ..
+    } = routed.outcome
+    else {
+        panic!("未知结果必须保留核对提示");
+    };
+    assert_eq!(prior.run.tool_results.len(), 1);
+    assert!(prompt.contains("结果尚未确认"));
+    assert!(control.submissions.lock().unwrap().is_empty());
+    router.0.close().await.unwrap();
+}

@@ -266,3 +266,9 @@ pub fn stop_record(state: &CognitiveState, goal_id: &str) -> Option<StopRecord> 
         })
         .next_back()
 }
+
+mod progress;
+pub use progress::{
+    fair_order_key, progress_admission_guard, progress_admitted, progress_record,
+    reconcile_progress,
+};
