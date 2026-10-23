@@ -1,0 +1,12 @@
+[package]
+name = "eve-group-observation-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+eve-chime-api = { path = "../chime-api" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde_json.workspace = true
+[dev-dependencies]
+tempfile.workspace = true

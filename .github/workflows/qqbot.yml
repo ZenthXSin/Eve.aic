@@ -113,6 +113,7 @@ jobs:
           python3 connectors/qqbot/test/background_task_test.py
           python3 connectors/qqbot/test/delegation_context_test.py
           python3 connectors/qqbot/test/subagent_profiles_test.py
+          python3 connectors/qqbot/test/group_chat_test.py
           python3 connectors/qqbot/test/background_recovery_test.py
           python3 connectors/qqbot/test/auto_recovery_test.py
           python3 connectors/qqbot/test/management_access_test.py

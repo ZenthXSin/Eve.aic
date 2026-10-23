@@ -77,7 +77,8 @@ use eve_training_plugin::{TrainingContext, TrainingPlugin};
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
-pub const QQBOT_HELP: &str = "--sleep 开启可取消的短暂等待与本轮任务状态工具。
+pub const QQBOT_HELP: &str = "--group-chat 接入全量群消息观察、说法学习与现有插话引擎；群回复首段艾特原发送者。需要平台提供 GROUP_MESSAGE_CREATE。
+--sleep 开启可取消的短暂等待与本轮任务状态工具。
 --triggers 开启原会话条件唤醒工具（时间、文件、后台任务、消息匹配、Linux 进程）。
 Eve 官方 QQBot 通道
 用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--stickers] [--background-tasks] [--no-error-recovery] [--subagents] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--markdown] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
@@ -138,6 +139,7 @@ Ctrl+C 或 SIGTERM 取消在途轮次、等待保存并停止桥接子进程。"
 /// 密钥只在创建插件时从环境读取，不包含在启动参数和 Debug 中。
 #[derive(Clone, Debug)]
 pub struct QqBotOptions {
+    pub group_chat: bool,
     pub state_directory: PathBuf,
     pub database_config: Option<PathBuf>,
     pub agent_path: PathBuf,
@@ -216,6 +218,7 @@ pub struct QqBotOptions {
 impl Default for QqBotOptions {
     fn default() -> Self {
         Self {
+            group_chat: false,
             state_directory: ".eve".into(),
             database_config: None,
             agent_path: "AGENT.md".into(),
@@ -282,6 +285,10 @@ impl QqBotOptions {
             }
             if arg == "--triggers" {
                 options.triggers = true;
+                continue;
+            }
+            if arg == "--group-chat" {
+                options.group_chat = true;
                 continue;
             }
             if arg == "--training" {
@@ -819,6 +826,7 @@ async fn run_qqbot_composed(
     let mut impression_background: Option<crate::qq_impressions::Background> = None;
     let mut phrase_background: Option<crate::qq_phrases::Background> = None;
     let mut task_background: Option<qq_tasks::Background> = None;
+    let mut group_background: Option<crate::qq_group::Background> = None;
     let mut trigger_background: Option<qq_triggers::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
     let mut panel: Option<eve_web_panel::LocalPanel> = None;
@@ -991,6 +999,21 @@ async fn run_qqbot_composed(
             .value
             .downcast::<TrainingServiceHandle>()
             .map_err(|_| "训练服务类型错误")?;
+        let group = if options.group_chat {
+            bootstrap.tool_scope_policy = Some(Arc::new(crate::qq_group::ToolPolicy));
+            let store = Arc::new(eve_group_observation_sqlite::SqliteGroupObservations::open(
+                &options.state_directory.join("group-observations.sqlite3"),
+            )?);
+            let group = crate::qq_group::Group::new(
+                std::env::var("QQBOT_APP_ID").unwrap_or_else(|_| DEFAULT_QQBOT_APP_ID.into()),
+                store,
+                training.0.clone(),
+            );
+            plugin = plugin.with_group_observer(group.clone());
+            Some(group)
+        } else {
+            None
+        };
         let memory: Option<Arc<dyn MemoryAdmin>> = if options.memory {
             let archive = eve_memory_plugin::FileEvidenceArchive::open(
                 crate::storage::memory_archive_directory(&options.state_directory),
@@ -1390,6 +1413,15 @@ async fn run_qqbot_composed(
                 })
             }
             None => context,
+        };
+        let context: Arc<dyn ContextAssembler> = if let Some(group) = &group {
+            Arc::new(crate::qq_group::Context {
+                wrapped: context,
+                group: group.clone(),
+                conversations: conversations.clone(),
+            })
+        } else {
+            context
         };
         // 语义索引账本同样先于通道加载；损坏时拒绝启动并保留原字节。
         let semantic = if options.semantic_recall {
@@ -1822,6 +1854,17 @@ async fn run_qqbot_composed(
             )))
         };
         let budgeted = |category: &str| budget_gate.wrap(observed(category)?, category);
+        if let Some(group) = &group {
+            let _ = group
+                .policy
+                .settings
+                .set(qq_tasks::config_service(registry.as_ref())?);
+            group_background = Some(crate::qq_group::Background::start(
+                group.clone(),
+                control.clone(),
+                budgeted(crate::chime::MODEL_USE)?,
+            )?);
+        }
         // 历史摘要服务于对话本身，与主对话一样不计入自主运行预算；用途 digest 单独记健康与输出上限。
         let _ = chat_style
             .settings
@@ -2318,6 +2361,9 @@ async fn run_qqbot_composed(
         }));
         // 邀请与请求澄清共用通道的投递点：邀请优先判断，投递结果按 ID 前缀交回各自账本。
         let mut sources: Vec<(&'static str, Arc<dyn QqOutreach>)> = Vec::new();
+        if let Some(group) = &group {
+            sources.push((crate::qq_group::PREFIX, group.clone()));
+        }
         // 提醒是用户自己要的，最先投递。
         if let Some(reminders) = &reminders {
             sources.push((
@@ -2384,7 +2430,8 @@ async fn run_qqbot_composed(
         }
         if !sources.is_empty() {
             // 主动私聊开启时，通道空闲后每 2 秒询问一次；是否发送由宿主策略决定。请求澄清不主动私聊。
-            let push = (trigger_admin.is_some()
+            let push = (group.is_some()
+                || trigger_admin.is_some()
                 || reminders.is_some()
                 || tasks.is_some()
                 || outreach.is_some() && outreach_policy.proactive_after_ms.is_some())
@@ -2580,6 +2627,9 @@ async fn run_qqbot_composed(
         if let Some(stickers) = &sticker_background {
             stickers.activate();
         }
+        if let Some(group) = &group_background {
+            group.activate();
+        }
         if let Some(phrases) = &phrase_background {
             phrases.activate();
         }
@@ -2662,6 +2712,12 @@ async fn run_qqbot_composed(
                     (
                         stickers.finished(),
                         "表情包审看后台已结束；QQ 通道停止准入并保留状态",
+                    )
+                }))
+                .chain(group_background.as_ref().map(|group| {
+                    (
+                        group.finished(),
+                        "群聊观察后台已结束；QQ 通道停止准入并保留状态",
                     )
                 }))
                 .chain(phrase_background.as_ref().map(|phrases| {
@@ -2754,6 +2810,9 @@ async fn run_qqbot_composed(
     if let Some(impressions) = &impression_background {
         impressions.request_stop();
     }
+    if let Some(group) = &group_background {
+        group.request_stop();
+    }
     if let Some(stickers) = &sticker_background {
         stickers.request_stop();
     }
@@ -2793,6 +2852,11 @@ async fn run_qqbot_composed(
     }
     if let Some(stickers) = sticker_background
         && let Err(error) = stickers.stop().await
+    {
+        secondary.push(error);
+    }
+    if let Some(group) = group_background
+        && let Err(error) = group.stop().await
     {
         secondary.push(error);
     }

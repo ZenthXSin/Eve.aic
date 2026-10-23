@@ -116,9 +116,9 @@ impl ChimeSettingsSource for Policy {
 }
 
 /// 每次判断时按热配置选择：`model` 请模型判断，`quiet` 只在被叫到时接话；其他值按 `quiet`。
-struct SwitchJudge {
-    policy: Arc<Policy>,
-    model: Arc<dyn ChimeJudge>,
+pub(crate) struct SwitchJudge {
+    pub(crate) policy: Arc<Policy>,
+    pub(crate) model: Arc<dyn ChimeJudge>,
 }
 impl ChimeJudge for SwitchJudge {
     fn judge(&self, context: ChimeContext) -> LlmFuture<'_, ChimeVerdict> {
@@ -138,7 +138,7 @@ impl ChimeOutlet for EchoOutlet {
     }
 }
 
-struct AlwaysSentences;
+pub(crate) struct AlwaysSentences;
 impl eve_segment_plugin::ChatSplitting for AlwaysSentences {
     fn sentences(&self) -> bool {
         true

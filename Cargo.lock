@@ -310,6 +310,7 @@ dependencies = [
  "eve-developer-tools",
  "eve-dialogue-tools",
  "eve-file-observer",
+ "eve-group-observation-sqlite",
  "eve-history-digest",
  "eve-interest-api",
  "eve-interest-plugin",
@@ -632,6 +633,16 @@ dependencies = [
  "eve-cognition-api",
  "libc",
  "ring",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "eve-group-observation-sqlite"
+version = "0.1.0"
+dependencies = [
+ "eve-chime-api",
+ "rusqlite",
  "serde_json",
  "tempfile",
 ]

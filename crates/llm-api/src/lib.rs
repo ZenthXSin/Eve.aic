@@ -1025,3 +1025,8 @@ mod http_failure_status_tests {
         assert_eq!(LlmError::Provider("secret".into()).provider_failure(), None);
     }
 }
+
+/// 宿主为可信调用范围决定是否装配工具；拒绝时隐藏并禁止执行所有工具。
+pub trait ToolScopePolicy: Send + Sync {
+    fn tools_allowed(&self, scope: &ContextScope) -> bool;
+}

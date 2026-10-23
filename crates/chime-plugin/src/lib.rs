@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 mod judges;
-pub use judges::{ModelChimeJudge, QuietJudge};
+pub use judges::{CHIME_FORMAT_GUARD, ModelChimeJudge, QuietJudge};
 
 const HOUR_MS: u64 = 3_600_000;
 /// 每个群保留的最近决定条数。
@@ -61,6 +61,18 @@ pub struct ChimeEngine {
 }
 
 /// 生成与发送期间占住本群；提前返回或被丢弃时也会释放。
+struct GenerationGuard<'a> {
+    control: &'a dyn ControlService,
+    key: eve_control_api::GenerationKey,
+    complete: bool,
+}
+impl Drop for GenerationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            let _ = self.control.cancel(&self.key);
+        }
+    }
+}
 struct Busy<'a> {
     engine: &'a ChimeEngine,
     conversation: String,
@@ -94,6 +106,26 @@ impl ChimeEngine {
             persona: persona.into(),
             session_user: session_user.into(),
             state: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// 渠道已确认送达的普通群回复也计入窗口和插话冷却，不重新执行或发送。
+    pub fn record_outgoing(&self, message: GroupMessage) {
+        if !message.valid() || !message.from_me {
+            return;
+        }
+        let Some(settings) = self.settings.settings() else {
+            return;
+        };
+        if let Ok(mut state) = self.state.lock()
+            && let Some(c) = state.get_mut(&message.conversation)
+        {
+            c.last_reply_ms = Some(message.at_ms);
+            c.replies.push_back(message.at_ms);
+            c.window.push_back(message);
+            while c.window.len() > settings.window_messages.max(1) {
+                c.window.pop_front();
+            }
         }
     }
 
@@ -150,11 +182,17 @@ impl ChimeEngine {
                 Arc::new(DiscardControlEvents),
             )
             .map_err(|e| e.to_string())?;
+        let mut guard = GenerationGuard {
+            control: self.control.as_ref(),
+            key: generation.clone(),
+            complete: false,
+        };
         let report = self
             .control
             .wait(&generation)
             .await
             .map_err(|e| e.to_string())?;
+        guard.complete = true;
         match (report.run.commit, report.run.text, report.run.failure) {
             (CommitState::Completed, Some(text), None) if !text.trim().is_empty() => Ok(text),
             (_, _, Some(RunFailure::Execution(error) | RunFailure::Delivery(error))) => {
@@ -188,6 +226,24 @@ impl ChimeEngine {
     }
 
     async fn handle(&self, message: GroupMessage, outlet: &dyn ChimeOutlet) -> ChimeOutcome {
+        self.handle_mode(message, outlet, true).await
+    }
+
+    /// 记录由渠道普通任务链路处理的消息，不触发第二轮判断或回复。
+    pub async fn observe_only(
+        &self,
+        message: GroupMessage,
+        outlet: &dyn ChimeOutlet,
+    ) -> ChimeOutcome {
+        self.handle_mode(message, outlet, false).await
+    }
+
+    async fn handle_mode(
+        &self,
+        message: GroupMessage,
+        outlet: &dyn ChimeOutlet,
+        respond: bool,
+    ) -> ChimeOutcome {
         let decide = |reply, reason, detail: String| ChimeDecision {
             message_id: message.id.clone(),
             conversation: message.conversation.clone(),
@@ -232,6 +288,10 @@ impl ChimeEngine {
             c.window.push_back(stored);
             while c.window.len() > window {
                 c.window.pop_front();
+            }
+            if !respond {
+                drop(state);
+                return silent(decide(false, ChimeReason::Observed, String::new()));
             }
             while c
                 .replies

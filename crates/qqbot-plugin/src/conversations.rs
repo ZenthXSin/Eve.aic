@@ -13,6 +13,7 @@ const MAX_SESSIONS: usize = 4096;
 
 #[derive(Default)]
 struct Inner {
+    group_routes: HashMap<String, String>,
     sources: HashMap<String, QqInteractionSource>,
     identities: HashMap<String, QqConversationIdentity>,
     order: VecDeque<String>,
@@ -73,12 +74,35 @@ impl QqConversations {
             .cloned())
     }
 
+    pub(crate) fn group_route(&self, conversation: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .ok()?
+            .group_routes
+            .get(conversation)
+            .cloned()
+    }
+
     pub(crate) fn record_message(
         &self,
         app: &str,
         message: &crate::state::Message,
     ) -> PluginResult<()> {
         let session = message.session_key(app)?;
+        if message.scope == "group" {
+            let conversation = message.conversation_key(app)?;
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| PluginError::State("QQ 群路由目录不可用".into()))?;
+            if inner.group_routes.len() < MAX_SESSIONS
+                || inner.group_routes.contains_key(&conversation)
+            {
+                inner
+                    .group_routes
+                    .insert(conversation, message.target_id.clone());
+            }
+        }
         self.record(&session, &message.scope);
         // 群与私聊的 OpenID 属于不同命名空间，绝不仅凭字符串相同自动关联。
         let subject = serde_json::to_vec(&(app, &message.scope, &message.user_id))
