@@ -2361,9 +2361,6 @@ async fn run_qqbot_composed(
         }));
         // 邀请与请求澄清共用通道的投递点：邀请优先判断，投递结果按 ID 前缀交回各自账本。
         let mut sources: Vec<(&'static str, Arc<dyn QqOutreach>)> = Vec::new();
-        if let Some(group) = &group {
-            sources.push((crate::qq_group::PREFIX, group.clone()));
-        }
         // 提醒是用户自己要的，最先投递。
         if let Some(reminders) = &reminders {
             sources.push((
@@ -2427,6 +2424,10 @@ async fn run_qqbot_composed(
                     trigger_observations.clone().ok_or("条件观察服务缺失")?,
                 )),
             ));
+        }
+        // 群插话最后投递，优先保障提醒、后台任务结果与已请求的条件通知。
+        if let Some(group) = &group {
+            sources.push((crate::qq_group::PREFIX, group.clone()));
         }
         if !sources.is_empty() {
             // 主动私聊开启时，通道空闲后每 2 秒询问一次；是否发送由宿主策略决定。请求澄清不主动私聊。
