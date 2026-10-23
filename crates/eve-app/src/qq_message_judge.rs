@@ -63,6 +63,29 @@ pub(crate) fn relation_plugin(
     })
 }
 
+pub(crate) fn group_judge(settings: Arc<dyn ConfigService>) -> Result<Arc<JevRoleJudge>, AppError> {
+    let key = std::env::var(JEV_KEY).map_err(|_| "群话题判断需要宿主 EVE_JEV_API_KEY")?;
+    let judge = Arc::new(JevRoleJudge::new(settings, key));
+    judge.resolve()?;
+    Ok(judge)
+}
+
+/// 群关系和在途任务共用同一 Jev 客户端、热配置与并发槽。
+pub(crate) fn relation_plugin_shared(
+    settings: Arc<dyn ConfigService>,
+    judge: Arc<JevRoleJudge>,
+) -> Result<RelationPlugin, AppError> {
+    let resolver = Arc::new(CoreModelResolver::new(
+        settings,
+        std::env::var(PRIMARY_KEY).map_err(|_| "消息判断需要宿主主模型凭据")?,
+    ));
+    resolver.resolve()?;
+    Ok(RelationPlugin::with_fallback(
+        Some(judge),
+        Arc::new(LlmRelationJudge::with_resolver(resolver)),
+    )?)
+}
+
 fn relation_plugin_with_key_reader(
     mode: MessageJudgeMode,
     settings: Arc<dyn ConfigService>,
@@ -103,10 +126,24 @@ struct CachedJev {
 }
 
 /// 只保存宿主启动时读取的独立 Jev 凭据；不实现 Debug，不解析任意凭据引用。
-struct JevRoleJudge {
+pub(crate) struct JevRoleJudge {
     settings: Arc<dyn ConfigService>,
     api_key: String,
     cached: Mutex<Option<CachedJev>>,
+}
+
+impl eve_chime_api::GroupRelationJudge for JevRoleJudge {
+    fn classify(
+        &self,
+        input: eve_chime_api::GroupRelationInput,
+    ) -> eve_llm_api::LlmFuture<'_, eve_chime_api::GroupRelationDecision> {
+        Box::pin(async move {
+            let judge = self
+                .resolve()
+                .map_err(|_| eve_llm_api::LlmError::Context("Jev 群关系配置不可用".into()))?;
+            judge.classify(input).await
+        })
+    }
 }
 
 impl JevRoleJudge {

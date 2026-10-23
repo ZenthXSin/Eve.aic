@@ -441,6 +441,7 @@ pub struct LlmHost {
     history_window: Option<eve_llm_api::HistoryWindow>,
     compaction_policy: Option<eve_llm_api::ContextCompactionPolicy>,
     execution_budget: Option<Arc<eve_llm_api::TurnBudget>>,
+    tool_scope_policy: Option<Arc<dyn eve_llm_api::ToolScopePolicy>>,
     shared_steps: Option<eve_llm_api::SharedToolSteps>,
     run_deadline: Option<std::time::Instant>,
     journal: Option<Arc<dyn eve_llm_api::TurnJournal>>,
@@ -498,6 +499,7 @@ impl LlmHost {
             history_window: None,
             compaction_policy: None,
             execution_budget: None,
+            tool_scope_policy: None,
             shared_steps: None,
             run_deadline: None,
             journal: None,
@@ -543,6 +545,11 @@ impl LlmHost {
     /// 每次认知尝试独立预算；克隆继续共享工具槽位和串行队列。
     pub fn with_execution_budget(mut self, budget: Arc<eve_llm_api::TurnBudget>) -> Self {
         self.execution_budget = Some(budget);
+        self
+    }
+
+    pub fn with_tool_scope_policy(mut self, policy: Arc<dyn eve_llm_api::ToolScopePolicy>) -> Self {
+        self.tool_scope_policy = Some(policy);
         self
     }
 
@@ -595,7 +602,7 @@ impl LlmHost {
     ) -> Result<TurnOutput, TurnFailure> {
         let admission = Arc::new(self.kernel.acquire_runtime_admission().await);
         let events = self.event_delivery(sink, None);
-        match self.for_turn() {
+        match self.for_turn(scope.as_ref()) {
             Ok(host) => {
                 host.run_turn_inner(input, None, scope, admission, Some(&events))
                     .await
@@ -604,8 +611,21 @@ impl LlmHost {
         }
     }
 
-    pub(crate) fn for_turn(&self) -> Result<Self, LlmError> {
+    pub(crate) fn for_turn(
+        &self,
+        scope: Option<&eve_llm_api::ContextScope>,
+    ) -> Result<Self, LlmError> {
         let mut host = self.clone();
+        if let (Some(policy), Some(scope)) = (&self.tool_scope_policy, scope) {
+            let allowed = catch_unwind(AssertUnwindSafe(|| policy.tools_allowed(scope)))
+                .map_err(|_| LlmError::Configuration("工具范围策略异常；未执行工具".into()))?;
+            if !allowed {
+                host = host.with_tool_subset(
+                    &[],
+                    "当前受信范围仅允许生成文字回复，不提供工具；不得声称执行任何外部操作",
+                );
+            }
+        }
         if host.shared_steps.is_none() {
             host.shared_steps = Some(eve_llm_api::SharedToolSteps::new(
                 host.config.max_tool_calls,
@@ -637,7 +657,7 @@ impl LlmHost {
 
     pub async fn run_turn(&self, input: TurnInput) -> Result<TurnOutput, TurnFailure> {
         let admission = Arc::new(self.kernel.acquire_runtime_admission().await);
-        self.for_turn()
+        self.for_turn(None)
             .map_err(|error| fail(error, TurnDiagnostics::default()))?
             .run_turn_inner(input, None, None, admission, None)
             .await
@@ -650,7 +670,7 @@ impl LlmHost {
     ) -> Result<TurnOutput, TurnFailure> {
         let admission = Arc::new(self.kernel.acquire_runtime_admission().await);
         let events = self.event_delivery(sink, None);
-        let result = match self.for_turn() {
+        let result = match self.for_turn(None) {
             Ok(host) => {
                 host.run_turn_inner(input, None, None, admission.clone(), Some(&events))
                     .await

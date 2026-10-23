@@ -48,10 +48,13 @@ use eve_outreach_plugin::{
 use eve_plan_api::{PLAN_PLUGIN_ID, PlanJournal, PlanProposer};
 use eve_plan_plugin::{ModelPlanProposer, PlanPlugin};
 use eve_plugin_api::{PluginId, PluginResult, ServiceId};
-use eve_practice_api::{PRACTICE_PLUGIN_ID, PracticeAdmin, PracticeDrafter, PracticeRunner};
+use eve_practice_api::{
+    PRACTICE_PLUGIN_ID, PracticeAdmin, PracticeDrafter, PracticeRunner, PracticeStrategy,
+    STRATEGY_PLUGIN_ID,
+};
 use eve_practice_browser::BrowserRunner;
 use eve_practice_mindustry::{MindustryServerRunner, RuntimeCommand};
-use eve_practice_plugin::{ModelPracticeDrafter, PracticePlugin, Practitioner};
+use eve_practice_plugin::{ModelPracticeDrafter, PracticePlugin, Practitioner, StrategyPlugin};
 use eve_qqbot_plugin::{
     DEFAULT_QQBOT_APP_ID, QQ_SEGMENT_LIMITS, QQ_SEGMENT_POLICY, QQBOT_PLUGIN_ID,
     QQBOT_STATUS_SERVICE_ID, QqBotConfig, QqBotPlugin, QqBotStatus, QqBotStatusHandle,
@@ -77,10 +80,12 @@ use eve_training_plugin::{TrainingContext, TrainingPlugin};
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use tokio::sync::watch;
 
-pub const QQBOT_HELP: &str = "--sleep 开启可取消的短暂等待与本轮任务状态工具。
+pub const QQBOT_HELP: &str = "--group-chat 接入全量群消息观察、说法学习与现有插话引擎；群回复首段艾特原发送者。需要平台提供 GROUP_MESSAGE_CREATE。
+与 --message-judge jev 同时启用时，Jev 判断群话题关联；含混消息持久积攒，由独立主动回复和经验整理处理，不即时主模型兜底。
+--sleep 开启可取消的短暂等待与本轮任务状态工具。
 --triggers 开启原会话条件唤醒工具（时间、文件、后台任务、消息匹配、Linux 进程）。
 Eve 官方 QQBot 通道
-用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--stickers] [--background-tasks] [--no-error-recovery] [--subagents] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--markdown] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
+用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--strategy-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--stickers] [--background-tasks] [--no-error-recovery] [--subagents] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--markdown] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --database-config 显式选择本地 PostgreSQL；默认文件状态，已有状态目录不自动迁移。
 AppID 默认 1904159860；可通过 QQBOT_APP_ID 覆盖。
 必填环境：QQBOT_APP_SECRET、EVE_OPENAI_API_KEY；QQBOT_SANDBOX=true 使用测试环境。
@@ -123,6 +128,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --subagents 让 Eve 在一轮回复中把可以独立完成的子任务委托给子代理并等它交回结果；子代理同样按步数预算执行，须在 runtime.tasks.subagent_timeout_ms（默认 3 分钟）内完成，不能再委托或派发。
 --goal-completion 需同时 --plans；待办的计划各步都被证据满足后，随用户下一次私聊的回复问一句这件事算不算完成，每份计划至多问一次；用户明确说完成了，模型调用确认工具，宿主核对计划仍对应当前版本后把待办标为已完成，并记下依据的计划与确认来源。没有命令；只在私聊中成立。
 --learning-stop 需同时 --interest-learning；兴趣学习目标的研究与实践次数都用完、也没有在问你或等你回复时，后台把它标为已取消并记下原因（目标的停止条件“学习预算耗尽”），兴趣本身保留；不开启时目标一直等待。无论是否开启，/interests 与议程上下文都会说明每个学习目标接下来会做什么、在等什么。
+--strategy-learning 需同时指定实践运行环境；从真实失败修正记录形成方法候选，经后续不同目标验证后自动启用，效果退化时回退；不新增模型请求或尝试次数。
 --autonomy-budget 需同时 --interest-learning；兴趣观察、受控研究、实践草稿、技能、工具锻造、主动交流、请求澄清与情景语义摘要的后台模型请求在每个窗口（--autonomy-budget-window-hours 默认 24 小时，按 UTC 整点对齐）合计至多该次数；每次请求前先保存计数，重启不清零、失败不退还，余额不够一项工作时后台不开始新工作，重置后继续；回复用户消息、/plan propose、反思、偏好提炼与语义索引不计入。/budget 查看用量与重置时间。
 /tools 列出锻造的工具；/tool 工具ID 查看版本、回放验证与调用；/tool disable|rollback 工具ID、/tool enable 工具ID 版本 停用、回退或启用某个已验证版本。
 EVE_DEVELOPER_CONFIG 指定独立开发工具 JSON：源码工作区、操作者、命令/GitHub/升级开关与 token 环境引用；未配置时不注册。命令以宿主权限执行，仅供明确操作者；不是 QQ 测试环境开关。/help tools 查看实际已装配能力。
@@ -138,6 +144,7 @@ Ctrl+C 或 SIGTERM 取消在途轮次、等待保存并停止桥接子进程。"
 /// 密钥只在创建插件时从环境读取，不包含在启动参数和 Debug 中。
 #[derive(Clone, Debug)]
 pub struct QqBotOptions {
+    pub group_chat: bool,
     pub state_directory: PathBuf,
     pub database_config: Option<PathBuf>,
     pub agent_path: PathBuf,
@@ -172,6 +179,8 @@ pub struct QqBotOptions {
     pub practice_java_args: Vec<OsString>,
     /// 把已验证的实践固化为技能并在后续任务中复用；需要实践验证。
     pub skill_learning: bool,
+    /// 从实践修正实例中学习、验证和回退方法策略。
+    pub strategy_learning: bool,
     /// 把反复出现的问题锻造成运行前检查工具；需要实践验证。
     pub tool_forging: bool,
     /// 用户待办的多步计划入口；需要受控研究或实践验证作为计划能力。
@@ -187,6 +196,10 @@ pub struct QqBotOptions {
     pub stickers: bool,
     /// 模型可以把多步任务派发到后台执行，结束后私聊通知。
     pub background_tasks: bool,
+    /// 通用任务策略由可信 Rust 宿主提供评价条件和运行环境指纹，默认不装配。
+    pub task_strategy_policy: Option<Arc<dyn eve_task_api::TaskStrategyPolicy>>,
+    /// 可信宿主接收持久化认知管理句柄；不暴露给聊天或模型工具。
+    pub cognitive_services: Option<Arc<dyn crate::CognitiveServices>>,
     pub disable_error_recovery: bool,
     /// 模型可以把子任务委托给子代理并在本轮拿回结果。
     pub subagents: bool,
@@ -216,6 +229,7 @@ pub struct QqBotOptions {
 impl Default for QqBotOptions {
     fn default() -> Self {
         Self {
+            group_chat: false,
             state_directory: ".eve".into(),
             database_config: None,
             agent_path: "AGENT.md".into(),
@@ -241,6 +255,7 @@ impl Default for QqBotOptions {
             practice_java: None,
             practice_java_args: Vec::new(),
             skill_learning: false,
+            strategy_learning: false,
             tool_forging: false,
             plans: false,
             outreach: false,
@@ -249,6 +264,8 @@ impl Default for QqBotOptions {
             reminders: false,
             stickers: false,
             background_tasks: false,
+            task_strategy_policy: None,
+            cognitive_services: None,
             disable_error_recovery: false,
             subagents: false,
             triggers: false,
@@ -282,6 +299,10 @@ impl QqBotOptions {
             }
             if arg == "--triggers" {
                 options.triggers = true;
+                continue;
+            }
+            if arg == "--group-chat" {
+                options.group_chat = true;
                 continue;
             }
             if arg == "--training" {
@@ -322,6 +343,10 @@ impl QqBotOptions {
             }
             if arg == "--interest-learning" {
                 options.interest_learning = true;
+                continue;
+            }
+            if arg == "--strategy-learning" {
+                options.strategy_learning = true;
                 continue;
             }
             if arg == "--skill-learning" {
@@ -548,6 +573,9 @@ impl QqBotOptions {
             );
         }
         let runtime = options.practice_server_jar.is_some() || options.practice_browser.is_some();
+        if options.strategy_learning && !runtime {
+            return Err("--strategy-learning 需要同时指定实践运行环境".into());
+        }
         if options.skill_learning && !runtime {
             return Err("--skill-learning 需要同时指定实践运行环境（--practice-mindustry-server 或 --practice-browser）".into());
         }
@@ -819,6 +847,8 @@ async fn run_qqbot_composed(
     let mut impression_background: Option<crate::qq_impressions::Background> = None;
     let mut phrase_background: Option<crate::qq_phrases::Background> = None;
     let mut task_background: Option<qq_tasks::Background> = None;
+    let mut group_background: Option<crate::qq_group::Background> = None;
+    let mut group_jev = None;
     let mut trigger_background: Option<qq_triggers::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
     let mut panel: Option<eve_web_panel::LocalPanel> = None;
@@ -872,6 +902,9 @@ async fn run_qqbot_composed(
             || interest_components.runner.is_some();
         if practice_enabled && !options.interest_learning {
             return Err("实践验证需要同时开启 --interest-learning".into());
+        }
+        if options.strategy_learning && !practice_enabled {
+            return Err("策略学习需要同时开启实践验证".into());
         }
         if options.skill_learning && !practice_enabled {
             return Err("技能固化需要同时开启实践验证".into());
@@ -991,6 +1024,21 @@ async fn run_qqbot_composed(
             .value
             .downcast::<TrainingServiceHandle>()
             .map_err(|_| "训练服务类型错误")?;
+        let group = if options.group_chat {
+            bootstrap.tool_scope_policy = Some(Arc::new(crate::qq_group::ToolPolicy));
+            let store = Arc::new(eve_group_observation_sqlite::SqliteGroupObservations::open(
+                &options.state_directory.join("group-observations.sqlite3"),
+            )?);
+            let group = crate::qq_group::Group::new(
+                std::env::var("QQBOT_APP_ID").unwrap_or_else(|_| DEFAULT_QQBOT_APP_ID.into()),
+                store,
+                training.0.clone(),
+            );
+            plugin = plugin.with_group_observer(group.clone());
+            Some(group)
+        } else {
+            None
+        };
         let memory: Option<Arc<dyn MemoryAdmin>> = if options.memory {
             let archive = eve_memory_plugin::FileEvidenceArchive::open(
                 crate::storage::memory_archive_directory(&options.state_directory),
@@ -1006,6 +1054,20 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        let unified_memory = if memory.is_some() {
+            let plugin = eve_memory_plugin::UnifiedMemoryPlugin::new()?;
+            let controller = Arc::new(plugin.controller());
+            kernel.register(Box::new(plugin))?;
+            kernel
+                .start(&PluginId::new(eve_memory_api::UNIFIED_MEMORY_PLUGIN_ID)?)
+                .await?;
+            if let Some(host) = &options.cognitive_services {
+                host.memory_ready(controller.clone())?;
+            }
+            Some(controller)
+        } else {
+            None
+        };
         let memory_continuity: Option<Arc<dyn eve_memory_api::MemoryContinuityFactory>> =
             memory.as_ref().map(|memory| {
                 Arc::new(eve_memory_plugin::MemoryContinuity::new(
@@ -1013,6 +1075,9 @@ async fn run_qqbot_composed(
                     Arc::new(crate::qq_memory_continuity::Policy {
                         registry: registry.clone(),
                         conversations: conversations.clone(),
+                        unified: unified_memory
+                            .clone()
+                            .map(|c| c as Arc<dyn eve_memory_api::UnifiedMemoryAdmin>),
                     }),
                 )) as Arc<dyn eve_memory_api::MemoryContinuityFactory>
             });
@@ -1062,6 +1127,16 @@ async fn run_qqbot_composed(
             kernel.register(Box::new(plugin))?;
             kernel.start(&PluginId::new(PRACTICE_PLUGIN_ID)?).await?;
             Some(controller)
+        } else {
+            None
+        };
+        let strategies: Option<Arc<dyn PracticeStrategy>> = if options.strategy_learning {
+            let plugin = StrategyPlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(STRATEGY_PLUGIN_ID)?).await?;
+            controller.reconcile(&practice.as_ref().ok_or("策略缺少实践账本")?.snapshot()?)?;
+            Some(Arc::new(controller))
         } else {
             None
         };
@@ -1116,8 +1191,38 @@ async fn run_qqbot_composed(
             None
         };
         // 后台任务账本同样先于通道加载；损坏时拒绝启动并保留原字节，执行中的任务记为中断，发送中的通知记为结果未知。
+        let task_strategies = if let Some(policy) = options.task_strategy_policy.clone() {
+            if !options.background_tasks {
+                return Err("通用任务策略需要开启后台任务".into());
+            }
+            let plugin = eve_task_plugin::TaskStrategyPlugin::new(policy)?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel
+                .start(&PluginId::new(eve_task_api::TASK_STRATEGY_PLUGIN_ID)?)
+                .await?;
+            let world_plugin = eve_cognition_plugin::WorldModelPlugin::new("eve")?;
+            let world = Arc::new(world_plugin.controller());
+            kernel.register(Box::new(world_plugin))?;
+            kernel
+                .start(&PluginId::new(eve_cognition_api::WORLD_MODEL_PLUGIN_ID)?)
+                .await?;
+            if let Some(host) = &options.cognitive_services {
+                host.world_ready(world.clone())?;
+            }
+            Some(Arc::new(crate::task_cognition::TaskCognition {
+                strategies: Arc::new(controller),
+                world,
+            })
+                as Arc<dyn eve_task_api::TaskStrategyLearning>)
+        } else {
+            None
+        };
         let tasks = if options.background_tasks {
-            let plugin = eve_task_plugin::TaskPlugin::new()?;
+            let mut plugin = eve_task_plugin::TaskPlugin::new()?;
+            if let Some(strategies) = task_strategies {
+                plugin = plugin.with_strategy_learning(strategies);
+            }
             let controller = plugin.controller();
             kernel.register(Box::new(plugin))?;
             kernel
@@ -1390,6 +1495,15 @@ async fn run_qqbot_composed(
                 })
             }
             None => context,
+        };
+        let context: Arc<dyn ContextAssembler> = if let Some(group) = &group {
+            Arc::new(crate::qq_group::Context {
+                wrapped: context,
+                group: group.clone(),
+                conversations: conversations.clone(),
+            })
+        } else {
+            context
         };
         // 语义索引账本同样先于通道加载；损坏时拒绝启动并保留原字节。
         let semantic = if options.semantic_recall {
@@ -1822,6 +1936,37 @@ async fn run_qqbot_composed(
             )))
         };
         let budgeted = |category: &str| budget_gate.wrap(observed(category)?, category);
+        if let Some(group) = &group {
+            let _ = group
+                .policy
+                .settings
+                .set(qq_tasks::config_service(registry.as_ref())?);
+            let relations = if options.message_judge == MessageJudgeMode::Jev {
+                let judge = crate::qq_message_judge::group_judge(qq_tasks::config_service(
+                    registry.as_ref(),
+                )?)?;
+                group_jev = Some(judge.clone());
+                let store = Arc::new(eve_relation_experience_sqlite::SqliteGroupRelations::open(
+                    &options.state_directory.join("jev-group-experience.sqlite3"),
+                )?);
+                Some(Arc::new(eve_chime_plugin::GroupRelationPipeline::new(
+                    store,
+                    group.store.clone(),
+                    judge,
+                    Arc::new(eve_chime_plugin::ModelGroupRelationReviewer::new(
+                        budget_gate.wrap(observed("group_relation_learning")?, "group-relation")?,
+                    )),
+                )))
+            } else {
+                None
+            };
+            group_background = Some(crate::qq_group::Background::start(
+                group.clone(),
+                control.clone(),
+                budgeted(crate::chime::MODEL_USE)?,
+                relations,
+            )?);
+        }
         // 历史摘要服务于对话本身，与主对话一样不计入自主运行预算；用途 digest 单独记健康与输出上限。
         let _ = chat_style
             .settings
@@ -2056,6 +2201,7 @@ async fn run_qqbot_composed(
                 policy,
                 plan_journal.clone(),
                 budget_gate.clone(),
+                options.learning_stop,
             ));
             qq_research::Commands::enabled(
                 Arc::new(interests.clone()),
@@ -2133,6 +2279,9 @@ async fn run_qqbot_composed(
             };
             let mut practitioner =
                 Practitioner::new(Arc::new(practice.clone()), drafter, runner.clone());
+            if let Some(strategy) = &strategies {
+                practitioner = practitioner.with_strategy(strategy.clone())?;
+            }
             let mut forged_check: Option<Arc<dyn eve_practice_api::DraftCheck>> = None;
             let forging = match &tools {
                 Some(tools) => {
@@ -2167,9 +2316,11 @@ async fn run_qqbot_composed(
                 practitioner,
                 workspace_root: options.state_directory.join("practice-work"),
                 skills: skill_parts,
+                strategy: strategies.clone(),
                 forging,
                 plans: plan_journal.clone(),
                 gate: budget_gate.clone(),
+                learning_progress: options.learning_stop,
             }));
             qq_practice::Commands::enabled(Arc::new(interests.clone()), Arc::new(practice.clone()))
         } else {
@@ -2382,9 +2533,14 @@ async fn run_qqbot_composed(
                 )),
             ));
         }
+        // 群插话最后投递，优先保障提醒、后台任务结果与已请求的条件通知。
+        if let Some(group) = &group {
+            sources.push((crate::qq_group::PREFIX, group.clone()));
+        }
         if !sources.is_empty() {
             // 主动私聊开启时，通道空闲后每 2 秒询问一次；是否发送由宿主策略决定。请求澄清不主动私聊。
-            let push = (trigger_admin.is_some()
+            let push = (group.is_some()
+                || trigger_admin.is_some()
                 || reminders.is_some()
                 || tasks.is_some()
                 || outreach.is_some() && outreach_policy.proactive_after_ms.is_some())
@@ -2424,8 +2580,14 @@ async fn run_qqbot_composed(
             .value
             .downcast::<ConfigServiceHandle>()
             .map_err(|_| "消息判断配置服务类型错误")?;
-        let mut relation =
-            crate::qq_message_judge::relation_plugin(options.message_judge, settings.0.clone())?;
+        let mut relation = match group_jev {
+            Some(judge) => {
+                crate::qq_message_judge::relation_plugin_shared(settings.0.clone(), judge)?
+            }
+            None => {
+                crate::qq_message_judge::relation_plugin(options.message_judge, settings.0.clone())?
+            }
+        };
         if options.message_judge != crate::qq_message_judge::MessageJudgeMode::Off {
             let experience = eve_relation_experience_sqlite::SqliteRelationExperience::open(
                 &options.state_directory.join("jev-experience.sqlite3"),
@@ -2580,6 +2742,9 @@ async fn run_qqbot_composed(
         if let Some(stickers) = &sticker_background {
             stickers.activate();
         }
+        if let Some(group) = &group_background {
+            group.activate();
+        }
         if let Some(phrases) = &phrase_background {
             phrases.activate();
         }
@@ -2662,6 +2827,12 @@ async fn run_qqbot_composed(
                     (
                         stickers.finished(),
                         "表情包审看后台已结束；QQ 通道停止准入并保留状态",
+                    )
+                }))
+                .chain(group_background.as_ref().map(|group| {
+                    (
+                        group.finished(),
+                        "群聊观察后台已结束；QQ 通道停止准入并保留状态",
                     )
                 }))
                 .chain(phrase_background.as_ref().map(|phrases| {
@@ -2754,6 +2925,9 @@ async fn run_qqbot_composed(
     if let Some(impressions) = &impression_background {
         impressions.request_stop();
     }
+    if let Some(group) = &group_background {
+        group.request_stop();
+    }
     if let Some(stickers) = &sticker_background {
         stickers.request_stop();
     }
@@ -2793,6 +2967,11 @@ async fn run_qqbot_composed(
     }
     if let Some(stickers) = sticker_background
         && let Err(error) = stickers.stop().await
+    {
+        secondary.push(error);
+    }
+    if let Some(group) = group_background
+        && let Err(error) = group.stop().await
     {
         secondary.push(error);
     }
