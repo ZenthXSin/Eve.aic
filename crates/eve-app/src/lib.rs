@@ -63,6 +63,8 @@ mod qqbot;
 mod segment_advice;
 mod segment_commands;
 mod services;
+mod task_cognition;
+pub use task_cognition::CognitiveServices;
 mod storage;
 mod web_panel;
 mod web_panel_autonomy;

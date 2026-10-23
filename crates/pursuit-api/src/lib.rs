@@ -161,3 +161,6 @@ pub struct StopRecord {
     /// 总是 false：停止来自规则判断，不是用户指令。
     pub user_instruction: bool,
 }
+
+mod progress;
+pub use progress::*;
