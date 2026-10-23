@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Readable, PassThrough } from "node:stream";
-import { createBridge, consume, optionsFromEnv, MAX_FRAME, MAX_MESSAGE_ID_BYTES, MAX_PUSH_BYTES, MAX_SEGMENTS, PASSIVE_REPLY_WINDOW_MS } from "../bridge-core.mjs";
+import { createBridge, consume, optionsFromEnv, readableFaces, MAX_FRAME, MAX_MESSAGE_ID_BYTES, MAX_PUSH_BYTES, MAX_SEGMENTS, PASSIVE_REPLY_WINDOW_MS } from "../bridge-core.mjs";
 function fixture({ fail = false, error = null, now, limit = 128, appId = "1904159860", hold = null, fileFail = false, imageFail = false } = {}) {
   const frames = [], sent = [], files = [], images = [], handlers = new Map();
   const bot = {
@@ -757,4 +757,26 @@ test("容量拒绝只通知原会话，不重试、不声称回复已保存", as
     assert.equal(delivery.capacity_notice, true);
     assert.equal(delivery.ok, !fail);
   }
+});
+
+test("QQ 表情标签转成可读的【表情：名字】，解不出名字时只标出表情", () => {
+  const ext = name => Buffer.from(JSON.stringify({ text: name })).toString("base64");
+  assert.equal(readableFaces(`<faceType=1,faceId="13",ext="${ext("[呲牙]")}">`), "【表情：呲牙】");
+  assert.equal(readableFaces(`好的<faceType=1,faceId="76",ext="${ext("赞")}">谢谢`), "好的【表情：赞】谢谢");
+  assert.equal(readableFaces(`<faceType=1,faceId="1",ext="!!">`), "<faceType=1,faceId=\"1\",ext=\"!!\">", "不是 base64 的标签不改");
+  assert.equal(readableFaces(`<faceType=1,faceId="1",ext="${Buffer.from("x").toString("base64")}">`), "【表情】");
+  assert.equal(readableFaces(`<faceType=1,faceId="1",ext="${ext("a".repeat(40))}">`), "【表情】", "过长的名字不转述");
+  assert.equal(readableFaces(`<faceType=1,faceId="1",ext="${ext("坏】名字")}">`), "【表情】");
+  assert.equal(readableFaces("[<face,id=13/>]哈"), "【表情】哈");
+  assert.equal(readableFaces("普通文字 <b>"), "普通文字 <b>");
+});
+
+test("只发一个表情的消息带着可读标签交给 Eve，不再是编码串", () => {
+  const f = fixture();
+  const ext = Buffer.from(JSON.stringify({ text: "[呲牙]" })).toString("base64");
+  f.handlers.get("message")({}, { kind: "c2c", messageId: "face-1", senderId: "user-1",
+    content: `<faceType=1,faceId="13",ext="${ext}">`, rawEventType: "C2C_MESSAGE_CREATE",
+    replyTarget: { scope: "c2c", targetId: "user-1", msgId: "face-1" } });
+  const frame = f.frames.find(x => x.type === "message");
+  assert.equal(frame.text, "【表情：呲牙】");
 });
