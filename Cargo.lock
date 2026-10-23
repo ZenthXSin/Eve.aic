@@ -310,6 +310,7 @@ dependencies = [
  "eve-developer-tools",
  "eve-dialogue-tools",
  "eve-file-observer",
+ "eve-group-observation-sqlite",
  "eve-history-digest",
  "eve-interest-api",
  "eve-interest-plugin",
@@ -344,6 +345,7 @@ dependencies = [
  "eve-qqbot-receipt-sqlite",
  "eve-reference-api",
  "eve-reference-plugin",
+ "eve-relation-experience-sqlite",
  "eve-reminder-api",
  "eve-reminder-plugin",
  "eve-runtime",
@@ -358,6 +360,7 @@ dependencies = [
  "eve-state-postgres",
  "eve-sticker-api",
  "eve-sticker-plugin",
+ "eve-subagent-profile-sqlite",
  "eve-task-api",
  "eve-task-plugin",
  "eve-toolforge-api",
@@ -422,12 +425,15 @@ version = "0.1.0"
 dependencies = [
  "eve-chime-api",
  "eve-control-api",
+ "eve-group-observation-sqlite",
  "eve-llm-api",
+ "eve-relation-experience-sqlite",
  "eve-segment-api",
  "eve-segment-plugin",
  "eve-session-api",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -635,6 +641,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-group-observation-sqlite"
+version = "0.1.0"
+dependencies = [
+ "eve-chime-api",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "eve-history-digest"
 version = "0.1.0"
 dependencies = [
@@ -682,7 +698,9 @@ dependencies = [
 name = "eve-jev"
 version = "0.1.0"
 dependencies = [
+ "eve-chime-api",
  "eve-control-api",
+ "eve-llm-api",
  "eve-message-api",
  "eve-message-diagnostics",
  "eve-session-api",
@@ -1050,6 +1068,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-relation-experience-sqlite"
+version = "0.1.0"
+dependencies = [
+ "eve-chime-api",
+ "eve-control-api",
+ "eve-message-api",
+ "eve-session-api",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "eve-reminder-api"
 version = "0.1.0"
 dependencies = [
@@ -1217,6 +1249,17 @@ dependencies = [
  "eve-sticker-api",
  "ring",
  "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "eve-subagent-profile-sqlite"
+version = "0.1.0"
+dependencies = [
+ "eve-llm-api",
+ "eve-task-api",
+ "rusqlite",
  "serde_json",
  "tempfile",
 ]

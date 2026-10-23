@@ -82,6 +82,11 @@ impl Tool for GuardedTool {
             let scope = context
                 .scope()
                 .ok_or_else(|| ToolExecutionError::Failed("管理工具需要可信平台身份".into()))?;
+            if scope.user_id == crate::qq_group::USER {
+                return Err(ToolExecutionError::Failed(
+                    "群聊观察只允许生成聊天回复，不执行工具或代办管理任务".into(),
+                ));
+            }
             let owner = self.admin.is_owner(scope);
             let administrator = self.admin.is_operator(scope);
             let name = self.inner.definition().name;
@@ -132,6 +137,13 @@ impl GuardedOutreach {
     }
 }
 impl QqOutreach for GuardedOutreach {
+    fn group_chime(
+        &self,
+        id: &str,
+    ) -> PluginResult<Option<eve_qqbot_plugin::QqGroupChimeDelivery>> {
+        self.inner.group_chime(id)
+    }
+
     fn due(&self, session: &eve_session_api::SessionKey) -> PluginResult<bool> {
         if !self.allowed(session) {
             return Ok(false);
@@ -159,11 +171,16 @@ impl QqOutreach for GuardedOutreach {
             return Ok(None);
         };
         let fallback = eve_session_api::SessionKey::new(&push.user_id, &push.user_id).ok();
-        if !push
-            .session
-            .as_ref()
-            .or(fallback.as_ref())
-            .is_some_and(|s| self.allowed(s))
+        let group = self.inner.group_chime(&push.message.id)?;
+        let group_allowed = group.as_ref().is_some_and(|meta| {
+            meta.session.user_id == "eve-chime" && push.session.as_ref() == Some(&meta.session)
+        });
+        if !group_allowed
+            && !push
+                .session
+                .as_ref()
+                .or(fallback.as_ref())
+                .is_some_and(|s| self.allowed(s))
         {
             self.inner
                 .delivered(&push.message.id, QqOutreachResult::NotSent)?;

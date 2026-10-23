@@ -2,6 +2,8 @@
 //! 说什么，再通过渠道提供的出口发出去。契约不绑定任何聊天平台。
 use eve_llm_api::LlmFuture;
 use serde::{Deserialize, Serialize};
+mod relation;
+pub use relation::*;
 
 /// 单条群消息正文的字符上限；更长的只记作观察，不进入判断或回复。
 pub const MAX_MESSAGE_CHARS: usize = 2000;
@@ -77,6 +79,8 @@ pub trait ChimeJudge: Send + Sync {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChimeReason {
+    /// 仅记录上下文，由渠道已有对话链路回复。
+    Observed,
     /// 被 @、被回复或被叫到名字，必须接话。
     Addressed,
     /// 判断器认为值得插话。
@@ -107,7 +111,7 @@ pub struct ChimeDecision {
 }
 
 /// 要发出的一条回复：按分段规划切成几条，`pause_before_ms` 是发每条前的停顿。
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChimeReply {
     pub conversation: String,
     pub reply_to: String,
@@ -115,7 +119,7 @@ pub struct ChimeReply {
     pub parts: Vec<ChimePart>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChimePart {
     pub text: String,
     pub pause_before_ms: u64,
@@ -161,4 +165,25 @@ pub trait ChimeService: Send + Sync {
     ) -> LlmFuture<'a, ChimeOutcome>;
     /// 本群最近的决定，新的在后，供诊断查看。
     fn recent_decisions(&self, conversation: &str) -> Vec<ChimeDecision>;
+}
+
+/// 可信渠道观察记录与主动投递账本；保存原话不表示任务完成或管理员授权。
+pub trait GroupObservationStore: Send + Sync {
+    fn append(&self, message: &GroupMessage) -> Result<bool, String>;
+    fn recent(&self, conversation: &str, limit: usize) -> Result<Vec<GroupMessage>, String>;
+    fn message(&self, conversation: &str, id: &str) -> Result<Option<GroupMessage>, String>;
+    /// Eve 已确认送达的完整问答，不按最近窗口截断。
+    fn exchanges(&self, conversation: &str) -> Result<Vec<GroupExchange>, String>;
+    fn link_reply(&self, conversation: &str, source: &str, reply: &str) -> Result<(), String>;
+    fn queue(&self, id: &str, reply: &ChimeReply, speaker: &str) -> Result<(), String>;
+    fn claim(&self) -> Result<Option<GroupOutbound>, String>;
+    fn finish(&self, id: &str, sent: bool) -> Result<(), String>;
+    fn abandon(&self, id: &str) -> Result<(), String>;
+    fn outbound(&self, id: &str) -> Result<Option<GroupOutbound>, String>;
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GroupOutbound {
+    pub id: String,
+    pub reply: ChimeReply,
+    pub speaker: String,
 }

@@ -1,4 +1,5 @@
 """Actual Eve process + production plugin + fake Node/loopback Chat HTTP."""
+from request_messages import conversation_messages
 import hashlib
 import json
 from fixture_auth import bootstrap_test_admin
@@ -20,7 +21,7 @@ FAKE = ROOT / "connectors/qqbot/test/fake-bridge.mjs"
 BROWSER = os.environ.get("EVE_TEST_BROWSER") or shutil.which("google-chrome")
 CANCELLED = "已取消当前任务；已完成的工具操作不会撤销。"
 NO_CURRENT = "当前会话没有可控制的任务，请先发送普通文字开始任务。"
-SIDE_EFFECTS = "刚才已有工具执行，重新运行可能重复操作。要继续处理新要求，请发“新任务：……”或 /new 内容；已发生的操作不会自动撤销。"
+SIDE_EFFECTS = "有工具操作的结果尚未确认，补充要求已保留。请先核对现有结果，再决定后续处理；不会自动重跑或撤销已发生的操作。"
 UNSUPPORTED = "尚未支持任务暂停恢复；请明确继续、取消或开始新任务。"
 
 class Acceptance(unittest.TestCase):
@@ -30,6 +31,7 @@ class Acceptance(unittest.TestCase):
         self.requests = []
         self.request_documents = []
         self.provider_steps = {}
+        self.empty_interest_updates = False
         self.server_errors = []
         self.request_lock = threading.Lock()
         self.runs = 0
@@ -73,6 +75,11 @@ class Acceptance(unittest.TestCase):
                     outer.release.wait(timeout=20)
                 if "text" in step:
                     message = {"role": "assistant", "content": step["text"]}
+                elif outer.empty_interest_updates and any(
+                        m.get("role") == "system" and "你是受限的兴趣观察器" in m.get("content", "")
+                        for m in messages):
+                    # 全功能启动验收只验证观察与持久化，不派生研究/实践或访问外网。
+                    message = {"role": "assistant", "content": '{"updates":[]}'}
                 elif latest["role"] == "tool":
                     text = json.loads(latest["content"])["echo"]
                     message = {"role": "assistant", "content": text, "reasoning_content": "auxiliary"}
@@ -364,6 +371,7 @@ class Acceptance(unittest.TestCase):
 
     @unittest.skipUnless(BROWSER, "需要 EVE_TEST_BROWSER 或 PATH 中的 google-chrome（全功能体验开启网页实践）")
     def test_full_experience_window_starts_every_capability_and_continues_from_encrypted_state(self):
+        self.empty_interest_updates = True
         launcher = self.work / "launch-eve"
         scenario = self.work / "full-scenario.json"
         launcher.write_text("#!/usr/bin/env python3\nimport os, sys\nos.execv(" + repr(str(BINARY)) + ", [" + repr(str(BINARY)) + ", *sys.argv[1:], '--bridge-script', " + repr(str(FAKE)) + ", '--bridge-arg', " + repr(str(scenario)) + "])\n")
@@ -395,6 +403,31 @@ class Acceptance(unittest.TestCase):
                 ready = subprocess.run(["python3", str(script), "--profile", "full", "--wait-ready", "--root", str(root),
                                         "--output", str(output)], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
                 self.assertEqual(ready.returncode, 0, ready.stdout + ready.stderr)
+                if seed is None:
+                    # 网关 ready / 收到 reply 不等于 250ms 轮询的兴趣后台已消费送达证据。
+                    # 首窗口以真实完成批次和预算扣账为关闭条件；续接窗口沿用该账本，
+                    # 不要求它绕过默认 5 分钟观察冷却再次发起请求。
+                    deadline = time.monotonic() + 10
+                    observed_statuses, interest_charged = [], False
+                    while child.poll() is None and time.monotonic() < deadline:
+                        state_path = root / "state/state.json"
+                        if state_path.exists():
+                            entries = json.loads(state_path.read_bytes())["entries"]
+                            interest_bytes = entries.get("eve.interest", {}).get("interests.v1")
+                            jobs = json.loads(bytes(interest_bytes))["jobs"] if interest_bytes else []
+                            observed_statuses = [record["job"]["status"] for record in jobs
+                                if any(evidence["source"].get("message_id") == message["id"]
+                                    for evidence in record["job"]["batch"]["evidence"])]
+                            budget_bytes = entries.get("eve.budget", {}).get("usage.v1")
+                            budget = json.loads(bytes(budget_bytes)) if budget_bytes else {}
+                            interest_charged = any(window.get("by_category", {}).get("interest", 0) > 0
+                                for window in [budget.get("current", {}), *budget.get("history", [])])
+                            if "Completed" in observed_statuses and interest_charged:
+                                break
+                        time.sleep(0.02)
+                    self.assertIn("Completed", observed_statuses,
+                        f"首窗口兴趣观察未完成：statuses={observed_statuses}, child_returncode={child.poll()}")
+                    self.assertTrue(interest_charged, "首窗口兴趣观察已完成但未持久化自主预算扣账")
                 self.gate(gate).touch()
                 stdout, stderr = child.communicate(timeout=60)
                 self.assertEqual(child.returncode, 0, stdout + stderr)
@@ -447,7 +480,7 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(len(self.documents()["eve.session"]["sessions.v1"]["sessions"]), 3)
         for request, expected in zip(self.requests, ["one", "two", "three"]):
             messages = request["messages"]
-            self.assertEqual([m["content"] for m in messages if m["role"] == "user"], [expected])
+            self.assertEqual([m["content"] for m in conversation_messages(messages) if m["role"] == "user"], [expected])
             self.assertFalse(any(m["role"] in ("assistant", "tool") for m in messages))
 
     def test_long_group_message_ids_reply_restore_and_deduplicate(self):
@@ -497,7 +530,7 @@ class Acceptance(unittest.TestCase):
         after = self.run_eve([self.message("in-wait", "wait"), self.message("in-fresh", "fresh")])
         self.assertEqual((after["received"], after["sent"]), (1, 1))
         self.assertEqual(len(self.requests), 2)
-        self.assertEqual([m["content"] for m in self.requests[-1]["messages"] if m["role"] == "user"], ["fresh"])
+        self.assertEqual([m["content"] for m in conversation_messages(self.requests[-1]["messages"]) if m["role"] == "user"], ["fresh"])
 
     def test_processing_receipt_does_not_reexecute_after_restart(self):
         self.run_eve([self.message("in-1", "one")])
@@ -588,7 +621,7 @@ class Acceptance(unittest.TestCase):
         self.run_eve([original, cancel, self.message("after-restart-control", "/cancel", NO_CURRENT),
             self.message("fresh", "fresh")])
         self.assertEqual(len(self.requests), 2)
-        self.assertEqual([m["content"] for m in self.requests[-1]["messages"] if m["role"] == "user"], ["fresh"])
+        self.assertEqual([m["content"] for m in conversation_messages(self.requests[-1]["messages"]) if m["role"] == "user"], ["fresh"])
         self.assertEqual(self.replies(), [("after-restart-control", NO_CURRENT), ("fresh", "fresh")])
 
     def revision_scenario(self, command, expected_changes):
@@ -610,7 +643,7 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(len(before_response), 2)
         self.assert_cancelled(before_response[0])
         self.assertEqual(before_response[1]["status"]["state"], "Pending")
-        self.assertEqual([m["role"] for m in self.requests[1]["messages"] if m["role"] != "system"], ["user"])
+        self.assertEqual([m["role"] for m in conversation_messages(self.requests[1]["messages"]) if m["role"] != "system"], ["user"])
         self.run_eve([original, revision, self.message("recall", "recall:revised-result", "revised-result")])
         self.assertEqual(len(self.requests), 3)
         self.assertEqual(self.replies(), [("recall", "revised-result")])
@@ -625,32 +658,38 @@ class Acceptance(unittest.TestCase):
             {"kind": "correction", "text": "corrected-request"},
             {"kind": "supplement", "text": "added-condition"}])
 
-    def test_executed_tool_clarifies_without_replay_until_explicit_new_task(self):
+    def test_executed_tool_correction_continues_from_receipts_without_replay(self):
         self.provider_steps[2] = {"wait": "never-release-tool", "text": "old-tool-result"}
+        self.provider_steps[3] = {"text": "增量修订完成"}
         original = self.message("tool-original", "echo:tool-marker", expected_type="finish")
-        correction = self.message("tool-correction", "/correct changed", SIDE_EFFECTS, expected_type="reply")
+        correction = self.message("tool-correction", "/correct changed", "增量修订完成", expected_type="reply")
         fresh = self.message("tool-new", "/new fresh", "fresh", expected_type="reply")
         self.run_eve(script=[{"send": original}, self.wait_request(2), {"send": correction},
             self.wait_command("tool-original", "finish"), self.wait_command("tool-correction"),
             {"send": fresh}, self.wait_command("tool-new")])
-        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(len(self.requests), 4)
         self.assertEqual(self.requests[1]["messages"][-1]["role"], "tool")
         self.assertEqual(json.loads(self.requests[1]["messages"][-1]["content"]), {"echo": "tool-marker"})
-        self.assertEqual(self.replies(), [("tool-correction", SIDE_EFFECTS), ("tool-new", "fresh")])
+        self.assertEqual(self.replies(), [("tool-correction", "增量修订完成"), ("tool-new", "fresh")])
         turns = self.sessions()[0]["turns"]
         self.assert_cancelled(turns[0], tools=1)
-        self.assertEqual(turns[1]["input"], "fresh")
-        self.assertEqual([m["role"] for m in self.requests[2]["messages"] if m["role"] != "system"], ["user"])
+        continuation=json.loads(turns[1]["input"])
+        self.assertEqual(continuation["request_kind"],"continuation")
+        self.assertEqual(continuation["confirmed_progress"]["tool_results"][0]["output"]["Success"],{"echo":"tool-marker"})
+        self.assertEqual(turns[2]["input"], "fresh")
+        self.assertFalse(any(m.get("tool_calls") for m in turns[1]["status"]["messages"]))
 
     def test_completed_tool_correction_keeps_history_and_never_reexecutes(self):
+        self.provider_steps[3] = {"text": "已按新要求调整"}
         self.run_eve([self.message("done-tool", "echo:tool-marker", "tool-marker"),
-            self.message("done-correct", "/correct changed", SIDE_EFFECTS),
+            self.message("done-correct", "/correct changed", "已按新要求调整"),
             self.message("done-new", "/new recall:tool-marker", "tool-marker")])
-        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(len(self.requests), 4)
         self.assertEqual(self.replies(), [("done-tool", "tool-marker"),
-            ("done-correct", SIDE_EFFECTS), ("done-new", "tool-marker")])
+            ("done-correct", "已按新要求调整"), ("done-new", "tool-marker")])
         self.assertEqual([turn["status"]["state"] for turn in self.sessions()[0]["turns"]],
-            ["Completed", "Completed"])
+            ["Completed", "Completed", "Completed"])
+        self.assertFalse(any(m.get("tool_calls") for m in self.sessions()[0]["turns"][1]["status"]["messages"]))
 
     def test_control_cannot_cancel_another_user_or_group_inflight(self):
         self.provider_steps[1] = {"wait": "release-isolated", "text": "owner-result"}
@@ -703,13 +742,13 @@ class Acceptance(unittest.TestCase):
             os.kill(int((self.work / "child.pid").read_text()), 0)
         self.run_eve([original, revision, self.message("stop-fresh", "fresh")])
         self.assertEqual(len(self.requests), 3)
-        self.assertEqual([m["content"] for m in self.requests[-1]["messages"] if m["role"] == "user"], ["fresh"])
+        self.assertEqual([m["content"] for m in conversation_messages(self.requests[-1]["messages"]) if m["role"] == "user"], ["fresh"])
 
     def test_pause_resume_and_answer_clarify_without_cancelling(self):
         self.provider_steps[1] = {"wait": "release-kept", "text": "kept-result"}
         controls = [self.message("pause", "/pause", UNSUPPORTED, expected_type="reply"),
             self.message("resume", "/resume", UNSUPPORTED, expected_type="reply"),
-            self.message("answer", "/answer detail", "请引用当前任务最近一次澄清问题，或明确说明新要求。", expected_type="reply")]
+            self.message("answer", "/answer detail", "当前没有能对应上的待答问题，请直接说明要补充或修改什么", expected_type="reply")]
         self.run_eve(script=[{"send": self.message("kept", "kept", "kept-result", expected_type="reply")},
             self.wait_request(1), *[step for message in controls for step in (
                 {"send": message}, self.wait_command(message["id"]))],

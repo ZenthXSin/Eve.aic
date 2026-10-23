@@ -1,0 +1,13 @@
+[package]
+name = "eve-subagent-profile-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+eve-task-api = { path = "../task-api" }
+eve-llm-api = { path = "../llm-api" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde_json.workspace = true
+[dev-dependencies]
+tempfile.workspace = true

@@ -2,7 +2,9 @@
 mod drafter;
 mod practitioner;
 mod store;
+mod strategy;
 mod strict_json;
+pub use strategy::{StrategyController, StrategyPlugin, strategy_views};
 
 pub use drafter::{DRAFTER_VERSION, ModelPracticeDrafter};
 use eve_plugin_api::{

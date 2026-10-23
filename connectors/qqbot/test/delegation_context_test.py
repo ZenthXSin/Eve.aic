@@ -29,7 +29,8 @@ class DelegationContextAcceptance(developer.DeveloperAcceptance):
 
     def check_worker(self, body, include):
         names = self.definitions(body)
-        self.assertFalse(names & {"dispatch_background_task", "run_subagent", "set_wakeup_trigger"})
+        leaf="你是 Eve 的子代理" in body["messages"][0]["content"]
+        self.assertFalse(names & ({"dispatch_background_task", "set_wakeup_trigger", "create_subagent"} | ({"run_subagent"} if leaf else set())))
         text = self.text(body)
         self.assertEqual("eve.delegated_context" in text, include)
         if include:

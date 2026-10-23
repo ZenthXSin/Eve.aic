@@ -431,3 +431,27 @@ async fn failures_and_busy_groups_stay_silent_without_counting_as_replies() {
 fn engine_with(control: Arc<FakeControl>, judge: Arc<FakeJudge>) -> ChimeEngine {
     engine(control, judge, settings())
 }
+
+#[tokio::test]
+async fn channel_owned_messages_enter_the_window_without_duplicate_replies() {
+    let control = FakeControl::new("好");
+    let judge = FakeJudge::new(false, 100);
+    let engine = engine(control.clone(), judge.clone(), settings());
+    let outlet = Outlet::default();
+    let seen = engine
+        .observe_only(
+            GroupMessage {
+                mentions_me: true,
+                ..message("normal-at", "管理员原任务", 1)
+            },
+            &outlet,
+        )
+        .await;
+    assert_eq!(seen.decision.reason, ChimeReason::Observed);
+    assert!(!seen.decision.reply);
+    let result = engine
+        .observe(message("later", "接着聊", 2), &outlet)
+        .await
+        .unwrap();
+    assert_eq!(result.decision.reason, ChimeReason::Declined);
+}

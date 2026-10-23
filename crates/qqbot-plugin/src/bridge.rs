@@ -283,6 +283,7 @@ pub(crate) struct Services {
     pub attachment_observer: Option<Arc<dyn QqAttachmentObserver>>,
     pub raw_observer: Option<Arc<dyn crate::QqRawMessageObserver>>,
     pub conversations: crate::QqConversations,
+    pub group_observer: Option<Arc<dyn crate::QqGroupObserver>>,
     pub participant_observer: Option<Arc<dyn crate::QqParticipantObserver>>,
     pub timing_diagnostics: bool,
     pub slow_progress: Option<Arc<dyn crate::QqSlowProgress>>,
@@ -780,6 +781,7 @@ pub(crate) async fn run(
         raw_observer,
         conversations,
         participant_observer,
+        group_observer,
         timing_diagnostics,
         slow_progress,
         debounce,
@@ -824,6 +826,24 @@ pub(crate) async fn run(
         .arg(&config.bridge_script)
         .args(&config.bridge_args)
         .env_clear();
+    // 先清理继承环境，再写入宿主确定的功能开关，避免开关被 env_clear 清除。
+    command.env(
+        "QQBOT_GROUP_OBSERVE",
+        if group_observer.is_some() {
+            "true"
+        } else {
+            "false"
+        },
+    );
+    command.env(
+        "QQBOT_GROUP_MENTION",
+        if group_observer.is_some() {
+            "true"
+        } else {
+            "false"
+        },
+    );
+
     for name in ["PATH", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP"] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
@@ -1442,15 +1462,25 @@ pub(crate) async fn run(
                 next_push = tokio::time::Instant::now() + interval;
                 match hook.inner.next_push() {
                     Ok(Some(push)) => {
-                        let target = match &push.session {
+                        let group = hook.inner.group_chime(&push.message.id)?;
+                        let target = if let Some(meta) = &group {
+                            if push.session.as_ref() == Some(&meta.session) && meta.session.user_id == "eve-chime" {
+                                conversations.group_route(&meta.session.session_id).map(|route| ("group".to_string(),route))
+                            } else { None }
+                        } else { match &push.session {
                             Some(session) if session.user_id == push.user_id => session_route(&ledger, &config.app_id, session)?,
                             Some(_) => None,
                             None => c2c_route(&ledger, &config.app_id, &push.user_id)?.map(|target| ("c2c".to_string(), target)),
-                        };
+                        }};
                         match target.filter(|_| valid_message_id(&push.message.id) && valid_outreach_text(&push.message.text)) {
                             Some((scope, target)) => {
-                                write(&mut stdin, json!({"type":"push","version":1,"id":push.message.id,
-                                    "scope":scope,"target_id":target,"text":push.message.text})).await?;
+                                let mut frame=json!({"type":"push","version":1,"id":push.message.id,
+                                    "scope":scope,"target_id":target,"text":push.message.text});
+                                if let Some(meta)=group {
+                                    frame["mention_user_id"]=json!(meta.speaker_id);
+                                    frame["parts"]=json!(meta.parts);
+                                }
+                                write(&mut stdin, frame).await?;
                                 deadline = tokio::time::Instant::now() + Duration::from_secs(35);
                                 pushing = Some(push.message.id);
                             }
@@ -1713,6 +1743,7 @@ pub(crate) async fn run(
                                 delivery_log(&ctx, "late_reply_proactive_sent", &frame);
                             }
                             if ok { timing(timing_diagnostics, "delivery_confirmed", None); }
+                            if ok && let Some(observer)=&group_observer && observer.replied(message,&reply.text).is_err() { warn(&ctx,"group_reply_observation_failed"); }
                             if ok && let Some(interaction) = &reply.interaction
                                 && let Some(observation) = &observation
                                 && let Err(error) = interaction.observe(observation.observer.as_ref(), &config.app_id, message, &reply.text) {
@@ -1735,6 +1766,20 @@ pub(crate) async fn run(
                                 ledger.save(&ctx)?;
                             }
                             delivering = None;
+                        }
+                        Some("group_observation") => {
+                            let Some(observer) = &group_observer else { continue; };
+                            let Ok(message) = serde_json::from_value::<Message>(frame["message"].clone()) else {
+                                warn(&ctx, "invalid_group_observation"); continue;
+                            };
+                            if !message.valid() || message.scope != "group" || message.text.trim_start().starts_with('/') {
+                                continue;
+                            }
+                            conversations.record_message(&config.app_id, &message)?;
+                            let at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |v| v.as_millis() as u64);
+                            if observer.observe(&message, frame["sender_name"].as_str(), frame["mentions_me"].as_bool().unwrap_or(false), at_ms).is_err() {
+                                warn(&ctx,"group_observation_failed");
+                            }
                         }
                         Some("message") => {
                             let mut payload = frame.clone();

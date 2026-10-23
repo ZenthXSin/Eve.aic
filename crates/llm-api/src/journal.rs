@@ -15,6 +15,11 @@ pub struct TurnCheckpoint {
     /// 先记下待执行批次，再开始工具；非空时只能人工核对，不能自动重放。
     pub pending_calls: Vec<ToolCall>,
     pub used_tool_calls: usize,
+    /// 子代理准入计数，不包含在本执行器的消息调用列表里。
+    #[serde(default, skip_serializing_if = "zero")]
+    pub delegated_tool_calls: usize,
+    #[serde(default, skip_serializing_if = "zero")]
+    pub delegated_model_requests: usize,
     pub provider_requests: usize,
     pub tool_batches: usize,
     pub remaining: Option<String>,
@@ -22,6 +27,9 @@ pub struct TurnCheckpoint {
     pub closing: bool,
     /// 先持久化模型最终结果再提交任务结局，重启可以直接了结，不再次请求模型。
     pub result: Option<String>,
+}
+fn zero(value: &usize) -> bool {
+    *value == 0
 }
 impl std::fmt::Debug for TurnCheckpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -49,12 +57,18 @@ impl TurnCheckpoint {
     }
     pub fn validate(&self, max_tool_calls: usize) -> Result<(), LlmError> {
         let invalid = || LlmError::Context("执行检查点无效；保留原记录，不自动重放".into());
-        if self.version != 1
+        if !matches!(self.version, 1 | 2)
+            || (self.version == 1
+                && (self.delegated_tool_calls != 0 || self.delegated_model_requests != 0))
             || self.messages.is_empty()
             || self.scope.session_id.is_empty()
             || self.scope.user_id.is_empty()
             || self.continuation_checks > 3
-            || self.used_tool_calls > max_tool_calls
+            || self
+                .used_tool_calls
+                .checked_add(self.delegated_tool_calls)
+                .is_none_or(|n| n > max_tool_calls)
+            || self.delegated_model_requests > max_tool_calls.saturating_mul(2).saturating_add(16)
             || self.provider_requests > max_tool_calls.saturating_add(16)
             || self.tool_batches > self.used_tool_calls
             || self

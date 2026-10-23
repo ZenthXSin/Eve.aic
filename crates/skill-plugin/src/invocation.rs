@@ -117,13 +117,17 @@ impl PracticeDrafter for SkillAwareDrafter {
         &self.version
     }
 
+    fn supports_guidance(&self) -> bool {
+        self.inner.supports_guidance()
+    }
+
     fn draft(&self, request: DraftRequest) -> PracticeFuture<'_, PracticeDraft> {
         Box::pin(async move {
             if request.drafter_version != self.version {
                 return Err(PracticeError::InvalidInput);
             }
             // 只有第一次尝试可以使用技能；修正仍由草稿器依据实际证据完成。
-            if request.attempt == 1 && request.previous.is_none() {
+            if request.attempt == 1 && request.previous.is_none() && request.guidance.is_none() {
                 match self.skill_draft(&request).await {
                     Ok(Some(draft)) => return Ok(draft),
                     Ok(None) => {}
