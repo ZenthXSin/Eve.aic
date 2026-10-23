@@ -170,16 +170,12 @@ fn validate(s: &UnifiedMemorySnapshot) -> MemoryResult<()> {
     Ok(())
 }
 fn metrics(relevant: usize, retrieved: usize, expected: usize) -> (u32, u32) {
-    let precision = if retrieved == 0 {
-        if expected == 0 { 10000 } else { 0 }
-    } else {
-        relevant * 10000 / retrieved
-    };
-    let recall = if expected == 0 {
-        if retrieved == 0 { 10000 } else { 0 }
-    } else {
-        relevant * 10000 / expected
-    };
+    let precision = (relevant * 10000)
+        .checked_div(retrieved)
+        .unwrap_or(if expected == 0 { 10000 } else { 0 });
+    let recall = (relevant * 10000)
+        .checked_div(expected)
+        .unwrap_or(if retrieved == 0 { 10000 } else { 0 });
     (precision as u32, recall as u32)
 }
 impl Stored {
