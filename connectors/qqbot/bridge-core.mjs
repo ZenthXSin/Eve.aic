@@ -169,7 +169,7 @@ export function optionsFromEnv(env) {
     logger: { info() {}, warn() {}, error() {}, debug() {} },
   };
 }
-export function createBridge(bot, emit, limit = 128, now = () => performance.now()) {
+export function createBridge(bot, emit, limit = 128, now = () => performance.now(), group = {}) {
   const pending = new Map();
   const pushing = new Set();
   const warned = new Set();
@@ -181,7 +181,12 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
   };
   // Share one bound across passive replies, segments and proactive messages.
   // Admission failure happens before the SDK call and is never queued/retried.
-  async function sendText(target, text) {
+  async function sendText(target, text, mention) {
+    if (mention !== undefined) {
+      if (target.scope !== "group" || !validId(mention)) throw new Error("invalid_mention");
+      text = `<@${mention}> ${text}`;
+      if (Buffer.byteLength(text) > 32768) throw new Error("reply_limit");
+    }
     if (activeSends >= limit) {
       warn("outbound_limit");
       throw new Error("outbound_limit");
@@ -224,7 +229,8 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
   bot.on("message", (_ctx, msg) => {
     if (closed) return;
     if (!["c2c", "group"].includes(msg.kind) || msg.senderIsBot ||
-        (msg.kind === "group" && !isGroupAt(msg, bot.appId))) {
+        (msg.kind === "group" && !isGroupAt(msg, bot.appId) &&
+          !(group.observe && msg.rawEventType === "GROUP_MESSAGE_CREATE"))) {
       warn("unsupported_message"); return;
     }
     const target = msg.replyTarget;
@@ -254,7 +260,16 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     if (Buffer.byteLength(JSON.stringify({ version: 1, ...frame })) > MAX_FRAME) {
       warn("frame_limit"); return;
     }
-    pending.set(msg.messageId, { target: { ...target }, sending: false, receivedAt: now() });
+    if (msg.kind === "group" && group.observe) {
+      const message = { id:frame.id, scope:frame.scope,target_id:frame.target_id,user_id:frame.user_id,text:frame.text,
+        ...(frame.attachments ? {attachments:frame.attachments}:{}), ...(frame.quoted ? {quoted:frame.quoted}:{}) };
+      const observation={version:1,type:"group_observation",message,mentions_me:isGroupAt(msg,bot.appId),
+        ...(validName?{sender_name:senderName}:{})};
+      if (Buffer.byteLength(JSON.stringify(observation)) <= MAX_FRAME) emit(observation);
+      else { warn("frame_limit"); return; }
+      if (!isGroupAt(msg,bot.appId)) return;
+    }
+    pending.set(msg.messageId, { target: { ...target }, senderId:msg.senderId, sending: false, receivedAt: now() });
     send(frame);
   });
   // One part at a time, strictly in order; a failed or final part ends the reply.
@@ -272,7 +287,9 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       ? { scope: item.target.scope, targetId: item.target.targetId } : item.target;
     const meta = { delivery_mode: item.proactive ? "proactive" : "passive", elapsed_ms: elapsed };
     try {
-      const result = await sendText(target, text);
+      const mention=group.mention && target.scope === "group" && !item.mentioned ? item.senderId : undefined;
+      const result = await sendText(target, text, mention);
+      item.mentioned = true;
       return { ok: true, ...meta,
         ...(validMessageId(result?.id) ? { message_id: result.id } : {}) };
     } catch (err) {
@@ -429,7 +446,19 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     try {
       const scope = frame.scope ?? "c2c";
       if (!["c2c", "group"].includes(scope)) throw new Error("invalid_scope");
-      const result = await sendText({ scope, targetId: frame.target_id }, frame.text);
+      const mention=frame.mention_user_id;
+      if (mention !== undefined && (scope !== "group" || !validId(mention))) throw new Error("invalid_mention");
+      const parts=frame.parts ?? [[frame.text,0]];
+      if (!Array.isArray(parts) || parts.length < 1 || parts.length > 3 || parts.some(p=>
+        !Array.isArray(p)||p.length!==2||!validText(p[0])||!Number.isInteger(p[1])||p[1]<0||p[1]>2500) ||
+        parts.map(p=>p[0].replace(/\s/gu,"")).join("") !== frame.text.replace(/\s/gu,"")) throw new Error("invalid_parts");
+      let result;
+      for (let index=0;index<parts.length;index++) {
+        if (closed) throw new Error("closed");
+        if (parts[index][1]) await new Promise(resolve=>setTimeout(resolve,parts[index][1]));
+        if (closed) throw new Error("closed");
+        result = await sendText({ scope, targetId: frame.target_id }, parts[index][0],index===0?mention:undefined);
+      }
       send({ type: "delivery", id: frame.id, push: true, ok: true,
         ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
     } catch (err) {

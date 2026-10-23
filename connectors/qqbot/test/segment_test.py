@@ -219,6 +219,30 @@ class SegmentAcceptance(unittest.TestCase):
         self.assertEqual((receipt["reply"], receipt["segments"]["planner"]), (text, "chat-v1"))
         self.assertEqual(self.interactions()[0]["source"]["assistant_text"], text)
 
+    def test_two_short_complete_sentences_are_delivered_separately_and_not_replayed(self):
+        parts = ["嗯，那就好。", "歇会儿吧。"]
+        text = "\n\n".join(parts)
+        self.run_eve([{"send": self.message("short-chat", text=text, segments=parts)},
+                      self.wait_receipt("short-chat", "Sent")], memory=True, sentence_split=True)
+        self.assertEqual([event["text"] for event in self.sent("segment")], parts)
+        self.assertFalse(self.sent("reply"))
+        receipt = self.receipt("short-chat")
+        self.assertEqual((receipt["reply"], receipt["segments"]["planner"]), (text, "chat-v1"))
+        self.assertEqual(self.part_states("short-chat"), ["Sent", "Sent"])
+        self.assertEqual(self.interactions()[0]["source"]["assistant_text"], text)
+        self.run_eve([], memory=True, sentence_split=True)
+        self.assertFalse(self.sent("segment"))
+        self.assertEqual(self.receipt("short-chat"), receipt)
+
+    def test_short_chat_without_terminal_periods_keeps_the_line_break_boundary(self):
+        parts = ["嗯，那就好", "歇会儿吧"]
+        text = "\n".join(parts)
+        self.run_eve([{"send": self.message("no-periods", text=text, segments=parts)},
+                      self.wait_receipt("no-periods", "Sent")], memory=True, sentence_split=True)
+        self.assertEqual([event["text"] for event in self.sent("segment")], parts)
+        self.assertEqual(self.receipt("no-periods")["reply"], text)
+        self.assertEqual(self.interactions()[0]["source"]["assistant_text"], text)
+
     def test_structured_reply_keeps_paragraph_planning_when_sentence_split_is_on(self):
         parts = ["步骤如下：\n1. 先安装。\n2. 再运行。", "有问题再来找我。"]
         text = "\n\n".join(parts)

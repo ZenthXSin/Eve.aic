@@ -368,7 +368,7 @@ fn validate_ledger(ledger: &Ledger) -> PracticeResult<()> {
     Ok(())
 }
 
-fn validate_run(run: &PracticeRun) -> PracticeResult<()> {
+pub(super) fn validate_run(run: &PracticeRun) -> PracticeResult<()> {
     let invalid = || PracticeError::InvalidInput;
     run.task.validate()?;
     run.runner.validate()?;

@@ -13,8 +13,8 @@ use eve_plan_api::PlanJournal;
 use eve_plugin_api::{PluginError, PluginResult};
 use eve_practice_api::{
     AttemptOutcome, MAX_BRIEF_BYTES, MAX_NOTE_BYTES, MAX_NOTES, NoteTally, PracticeAdmin,
-    PracticeAttempt, PracticeError, PracticeFailure, PracticeRun, PracticeStatus, PracticeTask,
-    RunExit, TaskNote, note_tallies,
+    PracticeAttempt, PracticeError, PracticeFailure, PracticeRun, PracticeStatus, PracticeStrategy,
+    PracticeTask, RunExit, TaskNote, note_tallies,
 };
 use eve_practice_plugin::Practitioner;
 use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput};
@@ -71,11 +71,13 @@ pub(crate) struct Services {
     pub(crate) practitioner: Arc<Practitioner>,
     pub(crate) workspace_root: PathBuf,
     pub(crate) skills: Option<Skills>,
+    pub(crate) strategy: Option<Arc<dyn PracticeStrategy>>,
     pub(crate) forging: Option<Forging>,
     /// 开启计划入口时，计划步骤请求实践的用户待办也会实践。
     pub(crate) plans: Option<Arc<dyn PlanJournal>>,
     /// 自主运行预算：余额不够一项工作时不开始。
     pub(crate) gate: qq_budget::Gate,
+    pub(crate) learning_progress: bool,
 }
 
 pub(crate) struct Background {
@@ -275,9 +277,11 @@ async fn run(
         practitioner,
         workspace_root,
         skills,
+        strategy,
         forging,
         plans,
         gate,
+        learning_progress,
     } = services;
     loop {
         if *active.borrow() {
@@ -297,6 +301,9 @@ async fn run(
     // 上次进程退出前选定技能的调用，依据实践账本核对结果；不重放。
     if let Some(skills) = &skills {
         eve_skill_plugin::settle(&*skills.admin, &practice.snapshot()?, now_ms()?)?;
+    }
+    if let Some(strategy) = &strategy {
+        strategy.reconcile(&practice.snapshot()?)?;
     }
     let mut practicing = true;
     let mut distilling = skills.is_some();
@@ -347,7 +354,35 @@ async fn run(
                         .map(|eligible| (goal, eligible))
                 })
                 .collect();
-            goals.sort_by_key(|(goal, _)| (Reverse(goal.priority), goal.id.clone()));
+            // 暂停状态损坏时停止准入，不把损坏记录当作首次运行。
+            let mut paused = std::collections::BTreeSet::new();
+            for (goal, _) in &goals {
+                if learning_progress
+                    && crate::qq_pursuit::learning_goal(goal).is_some()
+                    && eve_pursuit_plugin::progress_record(&snapshot.state, &goal.id)
+                        .map_err(|error| format!("长期目标进展不可读：{error}"))?
+                        .is_some_and(|record| record.paused)
+                {
+                    paused.insert(goal.id.clone());
+                }
+            }
+            goals.retain(|(goal, _)| !paused.contains(&goal.id));
+            let service_history = practice.snapshot()?;
+            goals.sort_by_key(|(goal, _)| {
+                let managed = learning_progress && crate::qq_pursuit::learning_goal(goal).is_some();
+                let last = if managed {
+                    service_history
+                        .runs_for(&goal.id)
+                        .map(|run| run.started_at_ms)
+                        .max()
+                } else {
+                    None
+                };
+                (
+                    managed,
+                    eve_pursuit_plugin::fair_order_key(last, goal.priority, &goal.id),
+                )
+            });
             // 实践佐证是从实践记录派生的数据，每轮重新计算，不单独保存。
             let tallies = if knowledge.is_some() && !goals.is_empty() {
                 note_tallies(&practice.snapshot()?.runs)
@@ -361,12 +396,26 @@ async fn run(
                 let Some(task) = task(goal, &eligible, knowledge.as_ref(), &tallies)? else {
                     continue;
                 };
-                let run = match practice.begin(
-                    task,
-                    practitioner.runner(),
-                    practitioner.drafter_version(),
-                    now_ms()?,
-                ) {
+                let began = {
+                    let _admission = eve_pursuit_plugin::progress_admission_guard()
+                        .map_err(|error| error.to_string())?;
+                    let current = cognition.snapshot().map_err(|error| error.to_string())?;
+                    if current.state.goals.get(&goal.id) != Some(goal)
+                        || (learning_progress
+                            && crate::qq_pursuit::learning_goal(goal).is_some()
+                            && !eve_pursuit_plugin::progress_admitted(&current.state, &goal.id)
+                                .map_err(|error| error.to_string())?)
+                    {
+                        continue;
+                    }
+                    practice.begin(
+                        task,
+                        practitioner.runner(),
+                        practitioner.drafter_version(),
+                        now_ms()?,
+                    )
+                };
+                let run = match began {
                     Ok(Some(run)) => run,
                     Ok(None) => continue,
                     // 容量满保留原记录：停止新实践，已有记录仍可查看。
@@ -384,6 +433,9 @@ async fn run(
                     &mut stopped,
                 )
                 .await?;
+                if let Some(strategy) = &strategy {
+                    strategy.reconcile(&practice.snapshot()?)?;
+                }
                 if let Some(skills) = &skills {
                     eve_skill_plugin::settle(&*skills.admin, &practice.snapshot()?, now_ms()?)?;
                 }

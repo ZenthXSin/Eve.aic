@@ -16,6 +16,7 @@ pub struct FallbackJudge {
     config: Arc<dyn ConfigService>,
     primary: Option<Arc<dyn RelationJudge>>,
     fallback: Arc<dyn RelationJudge>,
+    experience: Option<Arc<dyn RelationExperienceStore>>,
 }
 
 impl FallbackJudge {
@@ -28,7 +29,52 @@ impl FallbackJudge {
             config,
             primary,
             fallback,
+            experience: None,
         }
+    }
+    pub fn with_experience(mut self, store: Option<Arc<dyn RelationExperienceStore>>) -> Self {
+        self.experience = store;
+        self
+    }
+    fn confirmation(&self, input: &RelationInput, decision: &RelationDecision) {
+        let Some(store) = &self.experience else {
+            return;
+        };
+        let Ok(snapshot) = self.config.snapshot(MESSAGE_NAMESPACE, 1) else {
+            return;
+        };
+        if !MessageConfig::try_from(&snapshot).is_ok_and(|c| c.experience_enabled) {
+            return;
+        }
+        let Some(intent) = crate::rules::classification_reply(&input.message.text) else {
+            return;
+        };
+        let Some(question) = &input.clarification else {
+            return;
+        };
+        if !matches!(
+            intent,
+            MessageIntent::Supplement | MessageIntent::Correction | MessageIntent::NewTask
+        ) {
+            return;
+        }
+        let mut source = input.clone();
+        source.message.text = question.source_text.clone();
+        let mut learned = decision.clone();
+        learned.parts = vec![IntentPart {
+            intent,
+            confidence: 100,
+            span: Some(TextSpan {
+                start: 0,
+                end: source.message.text.len(),
+            }),
+        }];
+        learned.explanation = "用户明确指定当前未决原话与任务的关系".into();
+        let _ = store.remember(
+            &source,
+            &learned,
+            RelationExperienceSource::UserClarification,
+        );
     }
 }
 
@@ -57,6 +103,7 @@ impl RelationJudge for FallbackJudge {
                     .lines()
                     .any(|line| line.trim_start().starts_with('/'))
             {
+                self.confirmation(&input, &rule);
                 return Ok(rule);
             }
             let request = self
@@ -68,6 +115,14 @@ impl RelationJudge for FallbackJudge {
             let started = Instant::now();
             let budget = Duration::from_millis(initial.judge_timeout_ms);
             let deadline = started + budget;
+            let examples = if initial.experience_enabled {
+                self.experience
+                    .as_ref()
+                    .and_then(|s| s.recall(&input).ok())
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            };
             if let Some(primary) = &self.primary {
                 let guard =
                     RelationObservationGuard::stage(observer.clone(), RelationStage::Auxiliary);
@@ -75,7 +130,7 @@ impl RelationJudge for FallbackJudge {
                     started + budget / 2,
                     contain(async {
                         primary
-                            .judge_observed(input.clone(), observer.clone())
+                            .judge_with_examples(input.clone(), examples.clone(), observer.clone())
                             .await
                     }),
                 )
@@ -122,7 +177,11 @@ impl RelationJudge for FallbackJudge {
             let guard = RelationObservationGuard::stage(observer.clone(), RelationStage::Primary);
             let result = timeout_at(
                 deadline,
-                contain(async { self.fallback.judge_observed(input.clone(), observer).await }),
+                contain(async {
+                    self.fallback
+                        .judge_with_examples(input.clone(), examples, observer)
+                        .await
+                }),
             )
             .await;
             let result = result
@@ -136,6 +195,16 @@ impl RelationJudge for FallbackJudge {
                 Ok(_) => RelationOutcome::Completed,
                 Err(error) => (*error).into(),
             });
+            if let Ok(decision) = &result
+                && initial.experience_enabled
+                && decision
+                    .parts
+                    .iter()
+                    .all(|p| p.confidence >= initial.confidence_threshold)
+                && let Some(store) = &self.experience
+            {
+                let _ = store.remember(&input, decision, RelationExperienceSource::PrimaryModel);
+            }
             result
         })
     }

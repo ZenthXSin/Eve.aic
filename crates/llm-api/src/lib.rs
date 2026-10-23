@@ -14,7 +14,7 @@ mod failure;
 mod history;
 mod image;
 mod journal;
-pub use budget::{BudgetUsage, ExecutionLimits, TurnBudget};
+pub use budget::{BudgetUsage, ExecutionLimits, SharedStepUsage, SharedToolSteps, TurnBudget};
 pub use failure::{ModelHealthObserver, ModelOutcome, ProviderFailure, ProviderFailureKind};
 pub use history::{
     CONTEXT_COMPACTION_TIMEOUT, ContextCompactionPolicy, HistoryDigest, HistoryDigests,
@@ -658,6 +658,8 @@ pub struct ToolExecutionContext {
     turn_id: Option<u64>,
     continuation: TaskContinuation,
     conversation: Option<Arc<Vec<ChatMessage>>>,
+    shared_steps: Option<SharedToolSteps>,
+    deadline: Option<std::time::Instant>,
 }
 /// 单轮内共享的任务状态。只影响本轮收尾，不授予权限、不持久化或重放工具。
 #[derive(Clone, Default)]
@@ -690,6 +692,8 @@ impl ToolExecutionContext {
             turn_id: None,
             continuation: TaskContinuation::default(),
             conversation: None,
+            shared_steps: None,
+            deadline: None,
         }
     }
     /// 绑定本轮的可信会话范围；由宿主依据通道身份设置，模型参数不能改变它。
@@ -724,6 +728,20 @@ impl ToolExecutionContext {
     }
     pub fn conversation(&self) -> Option<&[ChatMessage]> {
         self.conversation.as_deref().map(Vec::as_slice)
+    }
+    pub fn with_shared_steps(mut self, steps: SharedToolSteps) -> Self {
+        self.shared_steps = Some(steps);
+        self
+    }
+    pub fn shared_steps(&self) -> Option<&SharedToolSteps> {
+        self.shared_steps.as_ref()
+    }
+    pub fn with_deadline(mut self, deadline: Option<std::time::Instant>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        self.deadline
     }
     pub fn cancellation_handle(&self) -> ToolCancellation {
         ToolCancellation(self.cancelled.clone())
@@ -1006,4 +1024,9 @@ mod http_failure_status_tests {
         assert_eq!(truncated.to_string(), "provider failure: Truncated");
         assert_eq!(LlmError::Provider("secret".into()).provider_failure(), None);
     }
+}
+
+/// 宿主为可信调用范围决定是否装配工具；拒绝时隐藏并禁止执行所有工具。
+pub trait ToolScopePolicy: Send + Sync {
+    fn tools_allowed(&self, scope: &ContextScope) -> bool;
 }

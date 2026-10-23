@@ -11,10 +11,10 @@ pub const CHAT_PLANNER: &str = "chat-v1";
 
 /// 按句拆分的闲聊回复上限（非空白字符数）；更长的回复按自然段处理。
 pub const MAX_CHAT_CHARS: usize = 240;
-/// 整条少于该字数时不拆。
-pub const MIN_SPLIT_CHARS: usize = 12;
 /// 少于该字数的句子并入相邻句，避免“嗯。”单独成条。
 const MIN_PIECE_CHARS: usize = 4;
+/// 至少能组成两条完整短句；与单条合并门槛一致，避免拦下 8–11 字的回复。
+pub const MIN_SPLIT_CHARS: usize = MIN_PIECE_CHARS * 2;
 
 const TERMINATORS: &[char] = &['。', '！', '？', '!', '?', '…', '～', '~'];
 const CLOSERS: &[char] = &['”', '’', '」', '』', '）', ')', '】', '》', '"', '\''];
@@ -241,6 +241,25 @@ mod tests {
         );
         // 小数与网址里的点不断开。
         assert_eq!(texts(&planner, "版本是 3.14 吧"), ["版本是 3.14 吧"]);
+    }
+
+    #[test]
+    fn two_complete_short_sentences_split_even_below_twelve_chars() {
+        let planner = ChatPlanner::new(Arc::new(On(true)));
+        for text in [
+            "嗯，那就好。\n\n歇会儿吧。",
+            "嗯，那就好。\n歇会儿吧。",
+            "嗯，那就好。\r\n歇会儿吧。",
+            "嗯，那就好。歇会儿吧。",
+        ] {
+            assert_eq!(texts(&planner, text), ["嗯，那就好。", "歇会儿吧。"]);
+        }
+        assert_eq!(
+            texts(&planner, "明天见。早点睡。"),
+            ["明天见。", "早点睡。"]
+        );
+        assert_eq!(texts(&planner, "嗯。\n好好休息。"), ["嗯。\n好好休息。"]);
+        assert_eq!(texts(&planner, "嗯。\n好。"), ["嗯。\n好。"]);
     }
 
     #[test]

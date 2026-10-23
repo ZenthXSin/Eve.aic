@@ -20,8 +20,8 @@ pub use files::{
 pub use observer::{QqInteraction, QqInteractionObserver, QqInteractionSource};
 pub use outreach::{
     QQ_OUTREACH_JUDGE_TIMEOUT, QQ_OUTREACH_MAX_BYTES, QQ_OUTREACH_MAX_REPLY_PARTS,
-    QQ_OUTREACH_PAUSE_MS, QqOutreach, QqOutreachFuture, QqOutreachMessage, QqOutreachMoment,
-    QqOutreachPush, QqOutreachResult,
+    QQ_OUTREACH_PAUSE_MS, QqGroupChimeDelivery, QqOutreach, QqOutreachFuture, QqOutreachMessage,
+    QqOutreachMoment, QqOutreachPush, QqOutreachResult,
 };
 pub use participants::QqParticipantObserver;
 pub use state::{ImageAttachment, Message};
@@ -45,6 +45,20 @@ pub trait QqStickers: Send + Sync {
 }
 
 /// 收到带附件的消息时通知宿主；只传已校验的消息，不做下载。
+/// 已校验的全量群消息观察；同步回调只做本地记录和有界排队，不执行模型或工具。
+pub trait QqGroupObserver: Send + Sync {
+    fn replied(&self, _message: &Message, _text: &str) -> PluginResult<()> {
+        Ok(())
+    }
+    fn observe(
+        &self,
+        message: &Message,
+        sender_name: Option<&str>,
+        mentions_me: bool,
+        at_ms: u64,
+    ) -> PluginResult<()>;
+}
+
 pub trait QqAttachmentObserver: Send + Sync {
     fn observe(&self, session: &SessionKey, message: &Message);
 }
@@ -155,6 +169,7 @@ pub struct QqBotPlugin {
     stickers: Option<Arc<dyn QqStickers>>,
     failure_recovery: Option<Arc<dyn QqFailureRecovery>>,
     receipt_archive: Option<Arc<dyn QqReceiptArchive>>,
+    group_observer: Option<Arc<dyn QqGroupObserver>>,
 }
 pub(crate) struct Segmentation {
     pub planner: Arc<dyn SegmentPlanner>,
@@ -194,6 +209,7 @@ impl QqBotPlugin {
             stickers: None,
             failure_recovery: None,
             receipt_archive: None,
+            group_observer: None,
         })
     }
     /// 通道已提交过轮次的会话是私聊还是群聊；只读，供只在私聊中成立的宿主能力判断。
@@ -355,6 +371,10 @@ impl QqBotPlugin {
     }
 }
 impl QqBotPlugin {
+    pub fn with_group_observer(mut self, observer: Arc<dyn QqGroupObserver>) -> Self {
+        self.group_observer = Some(observer);
+        self
+    }
     pub fn with_receipt_archive(mut self, archive: Arc<dyn QqReceiptArchive>) -> Self {
         self.receipt_archive = Some(archive);
         self
@@ -421,6 +441,7 @@ impl Plugin for QqBotPlugin {
             let raw_observer = self.raw_observer.clone();
             let conversations = self.conversations.clone();
             let participant_observer = self.participant_observer.clone();
+            let group_observer = self.group_observer.clone();
             let timing_diagnostics = self.timing_diagnostics;
             let slow_progress = self.slow_progress.clone();
             let debounce = self.debounce.clone();
@@ -447,6 +468,7 @@ impl Plugin for QqBotPlugin {
                     let raw_observer = raw_observer.clone();
                     let conversations = conversations.clone();
                     let participant_observer = participant_observer.clone();
+                    let group_observer = group_observer.clone();
                     let slow_progress = slow_progress.clone();
                     let debounce = debounce.clone();
                     let stickers = stickers.clone();
@@ -476,6 +498,7 @@ impl Plugin for QqBotPlugin {
                                 raw_observer,
                                 conversations,
                                 participant_observer,
+                                group_observer,
                                 timing_diagnostics,
                                 slow_progress,
                                 debounce,

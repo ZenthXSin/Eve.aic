@@ -35,11 +35,16 @@ impl LlmProvider for Provider {
         Box::pin(async move {
             request.validate()?;
             self.judgments.fetch_add(1, Ordering::SeqCst);
-            if !request.tools.is_empty() || request.messages.len() != 2 {
+            if !request.tools.is_empty()
+                || request.messages.len() != 3
+                || request.messages[0].role != ChatRole::System
+                || request.messages[1].role != ChatRole::User
+                || request.messages[2].role != ChatRole::User
+            {
                 return Err(LlmError::Protocol("判断请求不应包含工具或完整历史".into()));
             }
             let state: serde_json::Value = serde_json::from_str(
-                request.messages[1]
+                request.messages[2]
                     .text
                     .as_deref()
                     .ok_or_else(|| LlmError::Protocol("判断输入缺失".into()))?,

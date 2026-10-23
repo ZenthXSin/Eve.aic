@@ -69,6 +69,7 @@ impl Harness {
             permissions,
             logger,
             CoreBootstrap {
+                tool_scope_policy: None,
                 host_config: LlmHostConfig::default(),
                 api_key: "resolver-test-key".into(),
                 context: None,
