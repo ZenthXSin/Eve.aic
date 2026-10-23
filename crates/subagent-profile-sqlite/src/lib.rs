@@ -3,7 +3,7 @@ use eve_llm_api::ContextScope;
 use eve_task_api::{
     SubagentProfile, SubagentProfileDraft, SubagentProfileError as Error, SubagentProfiles,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::{
     path::Path,
     sync::{
@@ -114,6 +114,18 @@ impl SqliteSubagentProfiles {
     }
 }
 impl SubagentProfiles for SqliteSubagentProfiles {
+    fn revision(&self) -> Result<u64, Error> {
+        self.run(|db| {
+            db.query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name='profiles'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()
+            .map(|sequence| sequence.unwrap_or(0))
+            .map_err(|_| Error::Storage)
+        })
+    }
     fn create(
         &self,
         scope: &ContextScope,
@@ -122,13 +134,34 @@ impl SubagentProfiles for SqliteSubagentProfiles {
         valid_scope(scope)?;
         draft.validate()?;
         let payload = serde_json::to_string(&draft).map_err(|_| Error::InvalidInput)?;
-        self.run(|db|{
-   let tx=db.transaction().map_err(|_|Error::Storage)?;
-   tx.execute("INSERT OR IGNORE INTO profiles(session_id,user_id,name,payload) VALUES(?1,?2,?3,?4)",params![scope.session_id,scope.user_id,draft.name,payload]).map_err(|_|Error::Storage)?;
-   let (seq,actual):(u64,String)=tx.query_row("SELECT seq,payload FROM profiles WHERE session_id=?1 AND user_id=?2 AND name=?3",params![scope.session_id,scope.user_id,draft.name],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|Error::Storage)?;
-   if actual!=payload {return Err(Error::Conflict);}
-   let result=row(seq,actual)?;tx.commit().map_err(|_|Error::Storage)?;Ok(result)
-  })
+        self.run(|db| {
+            // INSERT OR IGNORE 在重复请求上也会推进 AUTOINCREMENT；先在写事务中
+            // 检查已有配置，保证幂等重送不造成虚假的运行环境版本变化。
+            let tx = db
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|_| Error::Storage)?;
+            let existing: Option<(u64, String)> = tx.query_row(
+                "SELECT seq,payload FROM profiles WHERE session_id=?1 AND user_id=?2 AND name=?3",
+                params![scope.session_id, scope.user_id, draft.name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ).optional().map_err(|_| Error::Storage)?;
+            if let Some((sequence, actual)) = existing {
+                if actual != payload {
+                    return Err(Error::Conflict);
+                }
+                return row(sequence, actual);
+            }
+            tx.execute(
+                "INSERT INTO profiles(session_id,user_id,name,payload) VALUES(?1,?2,?3,?4)",
+                params![scope.session_id, scope.user_id, draft.name, payload],
+            )
+            .map_err(|_| Error::Storage)?;
+            let sequence =
+                u64::try_from(tx.last_insert_rowid()).map_err(|_| Error::CorruptState)?;
+            let result = row(sequence, payload)?;
+            tx.commit().map_err(|_| Error::Storage)?;
+            Ok(result)
+        })
     }
     fn get(&self, scope: &ContextScope, name: &str) -> Result<SubagentProfile, Error> {
         valid_scope(scope)?;

@@ -65,6 +65,7 @@ mod segment_advice;
 mod segment_commands;
 mod services;
 mod task_cognition;
+mod task_strategy_catalog;
 pub use task_cognition::CognitiveServices;
 mod storage;
 mod web_panel;
