@@ -111,6 +111,7 @@ async fn real_http_uses_chat_envelope_authentication_and_optional_chat_parameter
     assert_eq!(captured.body["model"], "deepseek-v4.1-flash");
     assert_eq!(captured.body["messages"][0]["content"], "你好");
     assert_eq!(captured.body["stream"], false);
+    assert_eq!(captured.body["tool_choice"], "none");
     for field in [
         "input",
         "tools",
