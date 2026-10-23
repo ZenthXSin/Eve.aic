@@ -740,3 +740,21 @@ test("表情包只跟在正文之后走原消息的被动目标，失败、过�
   await failing.bridge.command({ version: 1, type: "sticker", id: "in-3", path: "/tmp/s.png" });
   assert.equal(failing.images.length, 1);
 });
+
+
+test("容量拒绝只通知原会话，不重试、不声称回复已保存", async () => {
+  for (const fail of [false, true]) {
+    const f = fixture({ fail, error: { response: { status: 400, data: { code: 40034090 } } } });
+    f.message("group");
+    await f.bridge.command({ version: 1, type: "capacity", id: "in-1" });
+    await f.bridge.command({ version: 1, type: "capacity", id: "in-1" });
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.sent[0].target.targetId, "group-1");
+    assert.equal(f.sent[0].target.msgId, "in-1");
+    assert.match(f.sent[0].text, /本条请求尚未执行/);
+    assert.ok(!f.sent[0].text.includes("/last-reply"));
+    const [delivery] = f.frames.filter(f => f.type === "delivery");
+    assert.equal(delivery.capacity_notice, true);
+    assert.equal(delivery.ok, !fail);
+  }
+});

@@ -441,6 +441,20 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         else item.finished = true;
         return;
       }
+      if (frame.type === "capacity") {
+        if (item.sending || item.next !== undefined) { warn("duplicate_reply"); return; }
+        item.sending = true;
+        try {
+          await sendText(item.target, "消息回执存储已满，本条请求尚未执行。请联系管理员处理容量；历史记录已保留。");
+          send({ type: "delivery", id: frame.id, capacity_notice: true, ok: true });
+        } catch (err) {
+          send({ type: "delivery", id: frame.id, capacity_notice: true, ok: false, ...diagnostic(err) });
+        } finally {
+          item.sending = false;
+          pending.delete(frame.id);
+        }
+        return;
+      }
       if (frame.type === "segment") { await segment(frame, item); return; }
       if (frame.type === "progress") { await progress(frame, item); return; }
       if (frame.type === "sticker") { await sticker(frame, item); return; }

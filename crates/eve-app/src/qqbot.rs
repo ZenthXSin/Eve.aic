@@ -948,6 +948,22 @@ async fn run_qqbot_composed(
         kernel
             .start(&PluginId::new(eve_people_api::PEOPLE_PLUGIN_ID)?)
             .await?;
+        let archive_path = options.state_directory.join("qq-receipts.sqlite3");
+        let previous_receipts = backends.state.get(
+            &PluginId::new(eve_qqbot_plugin::QQBOT_PLUGIN_ID)?,
+            "receipts.v1",
+        )?;
+        let bound_archive = previous_receipts
+            .as_deref()
+            .map(serde_json::from_slice::<serde_json::Value>)
+            .transpose()?
+            .is_some_and(|v| v.get("archive").is_some_and(|a| !a.is_null()));
+        if bound_archive && !archive_path.is_file() {
+            return Err("QQ 回执归档数据库缺失；保留现场，请恢复原数据库。".into());
+        }
+        let receipt_archive: Arc<dyn eve_qqbot_plugin::QqReceiptArchive> = Arc::new(
+            eve_qqbot_receipt_sqlite::SqliteReceiptArchive::open(&archive_path)?,
+        );
         let plugin = QqBotPlugin::new(QqBotConfig {
             node_program: options.node_program,
             bridge_script: options.bridge_script,
@@ -957,6 +973,7 @@ async fn run_qqbot_composed(
             sandbox,
             markdown: options.markdown,
         })?
+        .with_receipt_archive(receipt_archive.clone())
         .with_training()?
         .with_participant_observer(Arc::new(crate::qq_people::Observer(people.clone())))
         .with_natural_message_judgement(options.message_judge != MessageJudgeMode::Off)
@@ -1579,9 +1596,12 @@ async fn run_qqbot_composed(
         }
         let raw = Arc::new(crate::qq_files::RawInbox::new());
         plugin = plugin.with_raw_observer(raw.clone());
-        bootstrap
-            .tools
-            .push(Arc::new(crate::qq_files::ReadRawMessageTool::new(raw)));
+        bootstrap.tools.push(Arc::new(
+            crate::qq_files::ReadRawMessageTool::new(raw).with_archive(
+                receipt_archive,
+                std::env::var("QQBOT_APP_ID").unwrap_or_else(|_| DEFAULT_QQBOT_APP_ID.into()),
+            ),
+        ));
         // 参考资料启动时一次读入内存，之后只读；目录无效或超过上限时拒绝启动，不静默缺项。
         if !options.references.is_empty() {
             let specs: Vec<_> = options
