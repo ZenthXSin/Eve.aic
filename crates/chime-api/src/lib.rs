@@ -3,8 +3,10 @@
 use eve_llm_api::LlmFuture;
 use serde::{Deserialize, Serialize};
 mod digest;
+mod recall;
 mod relation;
 pub use digest::*;
+pub use recall::*;
 pub use relation::*;
 
 /// 单条群消息正文的字符上限；更长的只记作观察，不进入判断或回复。

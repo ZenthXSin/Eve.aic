@@ -128,7 +128,7 @@ fn parse(
     Ok(decision)
 }
 impl JevRelationJudge {
-    async fn group_request(&self, body: Value) -> Result<Vec<u8>, LlmError> {
+    pub(crate) async fn group_request(&self, body: Value) -> Result<Vec<u8>, LlmError> {
         let mut response = self
             .client
             .post(self.endpoint.clone())

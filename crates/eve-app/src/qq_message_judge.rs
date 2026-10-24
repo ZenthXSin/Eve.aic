@@ -146,6 +146,20 @@ impl eve_chime_api::GroupRelationJudge for JevRoleJudge {
     }
 }
 
+impl eve_chime_api::GroupRecallSelector for JevRoleJudge {
+    fn select(
+        &self,
+        input: eve_chime_api::GroupRecallInput,
+    ) -> eve_llm_api::LlmFuture<'_, Vec<String>> {
+        Box::pin(async move {
+            let judge = self
+                .resolve()
+                .map_err(|_| eve_llm_api::LlmError::Context("Jev 原话挑选配置不可用".into()))?;
+            judge.select(input).await
+        })
+    }
+}
+
 impl JevRoleJudge {
     fn new(settings: Arc<dyn ConfigService>, api_key: String) -> Self {
         Self {
