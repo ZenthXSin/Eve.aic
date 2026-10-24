@@ -9,6 +9,8 @@ use std::{
 };
 mod learner;
 pub use learner::ModelImpressionLearner;
+mod profile;
+pub use profile::ModelProfileConsolidator;
 
 const KEY: &str = "people.v1";
 /// 待学原话的字符上限；更长的不缓冲。
@@ -29,14 +31,17 @@ struct Document {
     next: u64,
 }
 impl Document {
-    /// 没有印象或待学原话时仍写格式 1，有来访记录时写格式 3；只在用到时升级，旧程序照常读取旧格式。
+    /// 没有印象或待学原话时仍写格式 1，有来访记录时写格式 3，有画像时写格式 4；
+    /// 只在用到时升级，旧程序照常读取旧格式。
     fn bytes(&mut self) -> PluginResult<Vec<u8>> {
         let extended = self.next > 0
             || self
                 .people
                 .iter()
                 .any(|p| !p.impressions.is_empty() || !p.pending.is_empty());
-        self.version = if self.people.iter().any(|p| p.presence.is_some()) {
+        self.version = if self.people.iter().any(|p| p.profile.is_some()) {
+            4
+        } else if self.people.iter().any(|p| p.presence.is_some()) {
             3
         } else if extended {
             2
@@ -127,6 +132,7 @@ impl PeopleDirectory for PeopleController {
                     impressions: vec![],
                     pending: vec![],
                     presence: None,
+                    profile: None,
                 });
             }
         }
@@ -159,6 +165,7 @@ impl PeopleDirectory for PeopleController {
                 impressions: vec![],
                 pending: vec![],
                 presence: None,
+                profile: None,
                 ..p.clone()
             })
             .collect();
@@ -167,6 +174,7 @@ impl PeopleDirectory for PeopleController {
         Ok(Some(PeopleView {
             current: Person {
                 pending: vec![],
+                profile: None,
                 ..current.clone()
             },
             others,
@@ -360,6 +368,8 @@ impl PeopleDirectory for PeopleController {
         if person.impressions.len() == before {
             return Ok(false);
         }
+        // 画像可能含有这条印象整合出的说法，一并删除，待依据变化后重新整理。
+        person.profile = None;
         Self::commit(&mut inner, document)?;
         Ok(true)
     }
@@ -368,52 +378,20 @@ impl PeopleDirectory for PeopleController {
         participant: &str,
         links: &dyn PersonLinks,
     ) -> PluginResult<LinkedImpressions> {
-        if !valid_identity(participant) {
-            return Err(unavailable());
-        }
-        // 先复制候选再释放锁：宿主判断身份时会读取配置与路由，不在持锁时调用。
-        let (own, candidates) = {
-            let inner = self.inner.lock().map_err(|_| unavailable())?;
-            let loaded = inner.as_ref().ok_or_else(unavailable)?;
-            let people = &loaded.document.people;
-            let Some(current) = people.iter().find(|p| p.scope.participant == participant) else {
-                return Ok(LinkedImpressions::default());
-            };
-            let own: BTreeSet<String> =
-                current.impressions.iter().map(|i| i.text.clone()).collect();
-            let candidates: BTreeMap<String, (Option<Scene>, Vec<Impression>)> = people
-                .iter()
-                .filter(|p| p.scope.participant != participant && !p.impressions.is_empty())
-                .map(|p| {
-                    (
-                        p.scope.participant.clone(),
-                        (p.presence.as_ref().map(|v| v.scene), p.impressions.clone()),
-                    )
-                })
-                .collect();
-            (own, candidates)
-        };
-        if candidates.is_empty() {
+        let Some(found) = self.linked_sources(participant, links)? else {
             return Ok(LinkedImpressions::default());
-        }
-        let ids: Vec<String> = candidates.keys().cloned().collect();
-        let linked: BTreeSet<String> = links.linked(participant, &ids)?.into_iter().collect();
-        if linked.iter().any(|id| !candidates.contains_key(id)) {
-            return Err(PluginError::Task("跨会话印象授权返回了未知来源".into()));
-        }
-        let mut seen = own;
-        let mut items = Vec::new();
-        for id in &linked {
-            let (scene, impressions) = &candidates[id];
-            for impression in impressions {
-                items.push(LinkedImpression {
-                    text: impression.text.clone(),
-                    quote: impression.quote.clone(),
-                    updated_at_ms: impression.updated_at_ms,
-                    scene: *scene,
-                });
-            }
-        }
+        };
+        let mut seen: BTreeSet<String> = found.own.iter().map(|i| i.text.clone()).collect();
+        let mut items: Vec<LinkedImpression> = found
+            .linked
+            .into_iter()
+            .map(|(scene, impression)| LinkedImpression {
+                text: impression.text,
+                quote: impression.quote,
+                updated_at_ms: impression.updated_at_ms,
+                scene,
+            })
+            .collect();
         // 新的在前；同一说法在多处出现只留最新一条，也不重复本会话已有的印象。
         items.sort_by(|a, b| {
             b.updated_at_ms
@@ -425,11 +403,181 @@ impl PeopleDirectory for PeopleController {
         items.truncate(MAX_LINKED_IMPRESSIONS);
         Ok(LinkedImpressions {
             items,
-            sources: linked.len(),
+            sources: found.sources,
             truncated,
         })
     }
+    fn profile_request(
+        &self,
+        participant: &str,
+        links: &dyn PersonLinks,
+    ) -> PluginResult<Option<ProfileRequest>> {
+        let Some(found) = self.linked_sources(participant, links)? else {
+            return Ok(None);
+        };
+        let mut items: Vec<(u64, ProfileSource)> = found
+            .own
+            .into_iter()
+            .map(|i| (i.updated_at_ms, i, true, found.scene))
+            .chain(
+                found
+                    .linked
+                    .into_iter()
+                    .map(|(scene, i)| (i.updated_at_ms, i, false, scene)),
+            )
+            .map(|(at, i, here, scene)| {
+                (
+                    at,
+                    ProfileSource {
+                        text: i.text,
+                        quote: i.quote,
+                        here,
+                        scene,
+                    },
+                )
+            })
+            .collect();
+        // 本会话的说法排在同一时刻的他处说法之前，去重时优先保留。
+        items.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.here.cmp(&a.1.here))
+                .then_with(|| a.1.text.cmp(&b.1.text))
+        });
+        let mut seen = BTreeSet::new();
+        items.retain(|(_, item)| seen.insert(item.text.clone()));
+        items.truncate(MAX_PROFILE_SOURCES);
+        if items.len() < PROFILE_MIN_ITEMS {
+            return Ok(None);
+        }
+        let sources: Vec<ProfileSource> = items.into_iter().map(|(_, item)| item).collect();
+        let bytes = serde_json::to_vec(&sources).map_err(|_| unavailable())?;
+        let mut fingerprint = String::from("sha256:");
+        for byte in ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref() {
+            use std::fmt::Write;
+            write!(&mut fingerprint, "{byte:02x}").map_err(|_| unavailable())?;
+        }
+        Ok(Some(ProfileRequest {
+            participant: participant.into(),
+            fingerprint,
+            sources,
+        }))
+    }
+    fn profile(&self, participant: &str) -> PluginResult<Option<PersonProfile>> {
+        let inner = self.inner.lock().map_err(|_| unavailable())?;
+        let loaded = inner.as_ref().ok_or_else(unavailable)?;
+        Ok(loaded
+            .document
+            .people
+            .iter()
+            .find(|p| p.scope.participant == participant)
+            .and_then(|p| p.profile.clone()))
+    }
+    fn save_profile(
+        &self,
+        request: &ProfileRequest,
+        facts: Vec<ProfileFact>,
+        now_ms: u64,
+    ) -> PluginResult<()> {
+        if !valid_fingerprint(&request.fingerprint)
+            || request.sources.len() > MAX_PROFILE_SOURCES
+            || !valid_facts(&facts, request.sources.len())
+        {
+            return Err(PluginError::Task("画像整理结果不合格；未保存".into()));
+        }
+        let scenes = facts
+            .iter()
+            .map(|fact| {
+                fact.from
+                    .iter()
+                    .map(|&i| request.sources[i].scene)
+                    .collect()
+            })
+            .collect();
+        let mut inner = self.inner.lock().map_err(|_| unavailable())?;
+        let loaded = inner.as_ref().ok_or_else(unavailable)?;
+        let mut document = loaded.document.clone();
+        let person = document
+            .people
+            .iter_mut()
+            .find(|p| p.scope.participant == request.participant)
+            .ok_or_else(unavailable)?;
+        person.profile = Some(PersonProfile {
+            fingerprint: request.fingerprint.clone(),
+            facts,
+            scenes,
+            updated_at_ms: now_ms,
+        });
+        Self::commit(&mut inner, document)
+    }
 }
+
+/// 当前发言者本会话的印象与经授权的他处印象，尚未去重或截断。
+struct LinkedSources {
+    own: Vec<Impression>,
+    scene: Option<Scene>,
+    linked: Vec<(Option<Scene>, Impression)>,
+    sources: usize,
+}
+impl PeopleController {
+    /// 没见过此人时为空。先复制候选再释放锁：宿主判断身份时会读取配置与路由，不在持锁时调用。
+    fn linked_sources(
+        &self,
+        participant: &str,
+        links: &dyn PersonLinks,
+    ) -> PluginResult<Option<LinkedSources>> {
+        if !valid_identity(participant) {
+            return Err(unavailable());
+        }
+        let (own, scene, candidates) = {
+            let inner = self.inner.lock().map_err(|_| unavailable())?;
+            let loaded = inner.as_ref().ok_or_else(unavailable)?;
+            let people = &loaded.document.people;
+            let Some(current) = people.iter().find(|p| p.scope.participant == participant) else {
+                return Ok(None);
+            };
+            let candidates: BTreeMap<String, (Option<Scene>, Vec<Impression>)> = people
+                .iter()
+                .filter(|p| p.scope.participant != participant && !p.impressions.is_empty())
+                .map(|p| {
+                    (
+                        p.scope.participant.clone(),
+                        (p.presence.as_ref().map(|v| v.scene), p.impressions.clone()),
+                    )
+                })
+                .collect();
+            (
+                current.impressions.clone(),
+                current.presence.as_ref().map(|v| v.scene),
+                candidates,
+            )
+        };
+        if candidates.is_empty() {
+            return Ok(Some(LinkedSources {
+                own,
+                scene,
+                linked: vec![],
+                sources: 0,
+            }));
+        }
+        let ids: Vec<String> = candidates.keys().cloned().collect();
+        let linked: BTreeSet<String> = links.linked(participant, &ids)?.into_iter().collect();
+        if linked.iter().any(|id| !candidates.contains_key(id)) {
+            return Err(PluginError::Task("跨会话印象授权返回了未知来源".into()));
+        }
+        let mut items = Vec::new();
+        for id in &linked {
+            let (scene, impressions) = &candidates[id];
+            items.extend(impressions.iter().cloned().map(|i| (*scene, i)));
+        }
+        Ok(Some(LinkedSources {
+            own,
+            scene,
+            linked: items,
+            sources: linked.len(),
+        }))
+    }
+}
+
 pub struct PeoplePlugin {
     manifest: PluginManifest,
     controller: PeopleController,
@@ -450,13 +598,40 @@ impl PeoplePlugin {
         self.controller.clone()
     }
 }
+fn valid_fingerprint(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+fn valid_facts(facts: &[ProfileFact], sources: usize) -> bool {
+    facts.len() <= MAX_PROFILE_FACTS
+        && facts.iter().all(|fact| {
+            let unique: BTreeSet<_> = fact.from.iter().collect();
+            valid_impression_text(&fact.text)
+                && !fact.from.is_empty()
+                && unique.len() == fact.from.len()
+                && fact.from.iter().all(|&i| i < sources)
+        })
+}
+fn valid_profile(profile: &PersonProfile) -> bool {
+    valid_fingerprint(&profile.fingerprint)
+        && valid_facts(&profile.facts, MAX_PROFILE_SOURCES)
+        && profile.scenes.len() == profile.facts.len()
+        && profile
+            .scenes
+            .iter()
+            .zip(&profile.facts)
+            .all(|(scenes, fact)| scenes.len() == fact.from.len())
+}
 fn valid_document(document: &Document) -> bool {
     let mut ids = BTreeSet::new();
     let mut impression_ids = BTreeSet::new();
-    let extended = matches!(document.version, 2 | 3);
-    let visits = document.version == 3;
+    let extended = matches!(document.version, 2..=4);
+    let visits = matches!(document.version, 3 | 4);
+    let profiles = document.version == 4;
     (extended || (document.version == 1 && document.next == 0))
-        && (!visits || document.people.iter().any(|p| p.presence.is_some()))
+        && (document.version != 3 || document.people.iter().any(|p| p.presence.is_some()))
+        && (!profiles || document.people.iter().any(|p| p.profile.is_some()))
         && document.people.len() <= MAX_PEOPLE
         && !document.people.iter().any(|p| {
             !valid_identity(&p.scope.conversation)
@@ -466,6 +641,9 @@ fn valid_document(document: &Document) -> bool {
                 || p.name.as_ref().is_some_and(|n| !valid_name(&n.value))
                 || (!extended && (!p.impressions.is_empty() || !p.pending.is_empty()))
                 || p.presence.as_ref().is_some_and(|v| !visits || !v.valid())
+                || p.profile
+                    .as_ref()
+                    .is_some_and(|v| !profiles || !valid_profile(v))
                 || p.impressions.len() > MAX_IMPRESSIONS
                 || p.pending.len() > MAX_IMPRESSION_PENDING
                 || p.pending
