@@ -178,6 +178,7 @@ async fn capacity_keeps_existing_records_and_group_views_are_bounded() {
             impressions: vec![],
             pending: vec![],
             presence: None,
+            profile: None,
         })
         .collect();
     state
@@ -554,5 +555,152 @@ async fn linked_impressions_follow_host_links_dedupe_and_stay_bounded() {
             .unwrap(),
         LinkedImpressions::default(),
         "没见过的人没有可合并的印象"
+    );
+}
+
+fn fact(text: &str, from: &[usize]) -> ProfileFact {
+    ProfileFact {
+        text: text.into(),
+        from: from.to_vec(),
+    }
+}
+#[tokio::test]
+async fn profiles_need_enough_sources_verified_citations_and_expire_with_their_sources() {
+    let state = Arc::new(MemoryStateStore::default());
+    let (kernel, people) = start_learning(state.clone()).await;
+    for (conversation, user, scene) in [(1, 2, Scene::Group), (5, 4, Scene::Private)] {
+        people.observe(scope(conversation, user), None).unwrap();
+        people.visit(&id(user), scene, 1).unwrap();
+    }
+    teach(
+        &people,
+        2,
+        &[("在学 Rust", "我最近在学Rust"), ("养猫", "我养猫")],
+        10,
+    );
+    let both = || Links(Ok(vec![id(4)]));
+    assert_eq!(
+        people.profile_request(&id(2), &both()).unwrap(),
+        None,
+        "依据不够不整理"
+    );
+    teach(
+        &people,
+        4,
+        &[
+            ("是护士", "我是护士"),
+            ("上夜班", "我上夜班"),
+            ("养猫", "我也养猫"),
+        ],
+        20,
+    );
+    assert_eq!(
+        people.profile_request(&id(2), &Links(Ok(vec![]))).unwrap(),
+        None,
+        "未授权的他处印象不计入"
+    );
+    assert_eq!(
+        people.profile_request(&id(2), &both()).unwrap(),
+        None,
+        "相同说法只算一条"
+    );
+    teach(
+        &people,
+        2,
+        &[("住北京", "我住北京"), ("喜欢爬山", "我喜欢爬山")],
+        30,
+    );
+    let request = people.profile_request(&id(2), &both()).unwrap().unwrap();
+    let texts: Vec<_> = request
+        .sources
+        .iter()
+        .map(|s| (s.text.as_str(), s.here))
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            ("住北京", true),
+            ("喜欢爬山", true),
+            ("上夜班", false),
+            ("养猫", false),
+            ("是护士", false),
+            ("在学 Rust", true)
+        ],
+        "新的在前，相同说法只留一条"
+    );
+    assert_eq!(request.sources.len(), PROFILE_MIN_ITEMS);
+    assert!(
+        request.sources.iter().any(|s| s.text == "养猫"),
+        "重复的说法保留一条"
+    );
+    assert_eq!(
+        people.profile_request(&id(2), &both()).unwrap().unwrap(),
+        request,
+        "依据不变指纹不变"
+    );
+
+    for bad in [
+        vec![fact("护士", &[])],
+        vec![fact("护士", &[6])],
+        vec![fact("护士", &[1, 1])],
+        vec![fact("", &[1])],
+        (0..=MAX_PROFILE_FACTS)
+            .map(|_| fact("护士", &[0]))
+            .collect(),
+    ] {
+        assert!(people.save_profile(&request, bad, 40).is_err());
+    }
+    assert!(
+        people.profile(&id(2)).unwrap().is_none(),
+        "不合格的结果整体拒绝"
+    );
+    let private = request
+        .sources
+        .iter()
+        .position(|s| s.text == "是护士")
+        .unwrap();
+    let here = request
+        .sources
+        .iter()
+        .position(|s| s.text == "住北京")
+        .unwrap();
+    people
+        .save_profile(&request, vec![fact("护士，住北京", &[private, here])], 40)
+        .unwrap();
+    let saved = people.profile(&id(2)).unwrap().unwrap();
+    assert_eq!(saved.fingerprint, request.fingerprint);
+    assert_eq!(
+        saved.scenes,
+        [vec![Some(Scene::Private), Some(Scene::Group)]]
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&state.get(&plugin_id(), "people.v1").unwrap().unwrap()).unwrap();
+    assert_eq!(document["version"], 4, "有画像时为格式 4");
+    let view = serde_json::to_value(people.view(&id(2)).unwrap().unwrap()).unwrap();
+    assert!(view["current"].get("profile").is_none(), "视图不直接带画像");
+
+    teach(&people, 4, &[("改上白班", "我改上白班了")], 50);
+    let changed = people.profile_request(&id(2), &both()).unwrap().unwrap();
+    assert_ne!(
+        changed.fingerprint, request.fingerprint,
+        "依据变化后旧画像失效"
+    );
+    assert!(
+        people.profile(&id(2)).unwrap().is_some(),
+        "旧画像保留到重新整理，但指纹不再匹配"
+    );
+
+    drop(kernel);
+    let (_kernel, people) = start_learning(state.clone()).await;
+    assert_eq!(
+        people.profile(&id(2)).unwrap().unwrap(),
+        saved,
+        "重启后保留"
+    );
+    let own = people.impressions(&id(2)).unwrap();
+    assert!(people.forget_impression(&id(2), &own[0].id).unwrap());
+    assert!(
+        people.profile(&id(2)).unwrap().is_none(),
+        "删除印象时一并删除画像"
     );
 }

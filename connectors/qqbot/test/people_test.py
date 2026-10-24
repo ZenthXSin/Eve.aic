@@ -91,11 +91,15 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
     def classify(self, decoded, latest):
         if isinstance(decoded, dict) and set(decoded) == {"messages", "known"}:
             return "impression"
+        if isinstance(decoded, dict) and set(decoded) == {"sources"}:
+            return "profile"
         return super().classify(decoded, latest)
 
     def reply(self, kind, decoded, latest):
         if kind == "impression":
             return json.dumps(self.impression_reply(decoded), ensure_ascii=False)
+        if kind == "profile":
+            return json.dumps(self.profile_reply(decoded), ensure_ascii=False)
         return super().reply(kind, decoded, latest)
 
     def people_state(self):
@@ -219,6 +223,59 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
         mine = [p for p in self.people_state()["people"] if p.get("impressions")]
         self.assertEqual(sorted(i["text"] for p in mine for i in p["impressions"]), ["在学 Rust", "是护士"])
         self.assertEqual(len(mine), 2, "只读合并，不搬迁或复制印象")
+
+    def test_enough_impressions_across_sessions_become_a_cited_profile_that_expires_with_its_sources(self):
+        first = ["我最近在学Rust", "我养了一只橘猫", "我住北京", "今天好累啊我"]
+        second = ["我其实是护士", "我上夜班", "我喜欢爬山", "我先去忙了"]
+        learned = {tuple(first): [("在学 Rust", "我最近在学Rust"), ("养了一只橘猫", "我养了一只橘猫"), ("住北京", "我住北京")],
+                   tuple(second): [("是护士", "我其实是护士"), ("上夜班", "我上夜班"), ("喜欢爬山", "我喜欢爬山")]}
+        self.impression_reply = lambda batch: {"impressions": [
+            {"text": text, "quote": quote, "replaces": None} for text, quote in learned[tuple(batch["messages"])]]}
+        consolidations = []
+        def profile(request):
+            consolidations.append(request)
+            texts = [s["text"] for s in request["sources"]]
+            self.assertEqual(sorted(texts), sorted(t for items in learned.values() for t, _ in items))
+            self.assertTrue(all("quote" in s and "here" in s for s in request["sources"]))
+            return {"facts": [{"text": "在学 Rust 的护士，上夜班",
+                               "from": [texts.index("在学 Rust"), texts.index("是护士"), texts.index("上夜班")]}]}
+        self.profile_reply = profile
+        seen = {}
+        def respond(body):
+            seen[body["messages"][-1]["content"]] = self.facts(body)
+            return text_response("好")
+        self.callback = respond
+        def say(mid, text, target):
+            return self.send(self.message(mid, text, user="user-1", scope="group", target=target, expected="好"))
+        def has_profile():
+            return any(p.get("profile") for p in self.people_state()["people"])
+        self.enabled([*[step for i, text in enumerate(first) for step in say(f"a{i}", text, "group-1")],
+                      *self.checkpoint("first"),
+                      *[step for i, text in enumerate(second) for step in say(f"b{i}", text, "group-2")],
+                      *self.checkpoint("second"),
+                      *say("before", "整理之前", "group-2"),
+                      *self.checkpoint("profiled"),
+                      *say("after", "整理之后", "group-2")],
+                     checkpoints={"first": lambda: self.wait_learned(3), "second": lambda: self.wait_learned(6),
+                                  "profiled": lambda: self.wait_until(has_profile, "画像没有保存")})
+        before = seen["整理之前"]
+        self.assertNotIn("profile", before)
+        self.assertEqual(len(before["linked_impressions"]["items"]), 3, "整理前照常给逐条印象")
+        after = seen["整理之后"]
+        self.assertEqual(after["profile"]["facts"],
+                         [{"text": "在学 Rust 的护士，上夜班", "scenes": ["group", "group", "group"]}])
+        self.assertNotIn("linked_impressions", after, "画像代替逐条印象")
+        self.assertNotIn("impressions", after["people"]["current"])
+        self.assertEqual(len(consolidations), 1, "依据不变不重复整理")
+        self.assertEqual(self.people_state()["version"], 4)
+        # 删除一条依据：画像随之删除，下一轮退回逐条印象。
+        mine = next(p for p in self.people_state()["people"] if p.get("profile"))
+        self.enabled([*self.send(self.message("forget", f"/impressions forget {mine['impressions'][0]['id']}",
+                                              user="user-1", scope="group", target="group-2", contains="已删除")),
+                      *say("forgotten", "删掉以后", "group-2")])
+        self.assertNotIn("profile", seen["删掉以后"])
+        self.assertIn("linked_impressions", seen["删掉以后"])
+        self.assertFalse(has_profile())
 
     def test_unverifiable_impressions_are_rejected_and_disabled_learning_sends_nothing(self):
         talk = ["我是做前端的", "我喜欢爬山", "我最近睡得很晚", "我想换个工作"]

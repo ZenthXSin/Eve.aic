@@ -10,6 +10,7 @@ eve-llm-api = { path = "../llm-api" }
 eve-people-api = { path = "../people-api" }
 eve-plugin-api = { path = "../plugin-api" }
 serde.workspace = true
+ring.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
