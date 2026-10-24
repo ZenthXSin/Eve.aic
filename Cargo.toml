@@ -39,6 +39,8 @@ members = [
     "crates/budget-plugin",
     "crates/clarify-api",
     "crates/clarify-plugin",
+    "crates/commitment-api",
+    "crates/commitment-plugin",
     "crates/reminder-api",
     "crates/reminder-plugin",
     "crates/task-api",

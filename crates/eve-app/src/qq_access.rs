@@ -59,6 +59,8 @@ fn public_tool(name: &str) -> bool {
             | "cancel_background_task"
             | "cancel_wakeup_trigger"
             | "cancel_reminder"
+            | "note_commitment"
+            | "settle_commitment"
     )
 }
 fn owner_file(path: &str, write: bool) -> bool {
