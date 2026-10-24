@@ -35,7 +35,9 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
         for message in body["messages"]:
             text = message.get("content", "")
             if message["role"] == "system" and isinstance(text, str) and '"eve.host.authorization"' in text:
-                data = json.loads(text.removeprefix("memory: "))
+                # 授权是固定资料，并入第二条系统消息，独占一行。
+                [line] = [line for line in text.splitlines() if '"eve.host.authorization"' in line]
+                data = json.loads(line)
                 return "owner" if data["owner"] else "administrator" if data["administrator"] else "member"
         self.fail("missing authorization")
 
