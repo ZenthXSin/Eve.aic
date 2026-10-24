@@ -347,6 +347,7 @@ impl ContextAssembler for Base {
                 profile: "profile".into(),
                 memories: vec![],
                 history: vec![ChatMessage::text(ChatRole::User, "earlier")],
+                pinned: vec![],
             })
         })
     }

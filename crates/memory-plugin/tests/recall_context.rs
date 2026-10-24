@@ -28,6 +28,7 @@ fn base() -> ContextSnapshot {
         revision: "base-5".into(),
         profile: "base profile".into(),
         memories: vec!["base memory".into()],
+        pinned: vec![],
         history: vec![
             ChatMessage::text(ChatRole::User, "last user"),
             ChatMessage::text(ChatRole::Assistant, "last answer"),

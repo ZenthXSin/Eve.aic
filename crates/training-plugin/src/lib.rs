@@ -341,13 +341,15 @@ impl ContextAssembler for TrainingContext {
                 .as_ref()
                 .map(|s| format!("{base_revision}:{}", s.revision))
                 .unwrap_or_else(|| base_revision.into());
-            let mut memories = if enabled {
+            // 训练开关提示只随 /train 切换变化，放进可缓存的固定资料；学到的说法随时更新，留在每轮资料里。
+            let pinned = if enabled {
                 vec![PROMPT.trim().into()]
             } else if scoped {
                 vec![PROMPT_OFF.into()]
             } else {
                 vec![]
             };
+            let mut memories = vec![];
             if let Some((text, ids)) = phrases {
                 revision = format!("{revision}:phrases:{}", expression::hash(ids.as_bytes()));
                 memories.push(text);
@@ -357,6 +359,7 @@ impl ContextAssembler for TrainingContext {
                 profile,
                 memories,
                 history: vec![],
+                pinned,
             })
         })
     }

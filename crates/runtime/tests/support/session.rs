@@ -193,6 +193,7 @@ impl ContextAssembler for Context {
                 profile: "用户档案".into(),
                 memories: vec!["使用中文".into()],
                 history,
+                pinned: vec![],
             })
         })
     }

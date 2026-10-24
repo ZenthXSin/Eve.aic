@@ -625,12 +625,16 @@ pub struct TurnInput {
     pub text: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ContextSnapshot {
     pub revision: String,
     pub profile: String,
     pub memories: Vec<String>,
     pub history: Vec<ChatMessage>,
+    /// 在一次进程内几乎不变的宿主资料（宿主事实、授权说明等）。放在历史之前、紧跟工具清单，
+    /// 与历史一起成为可缓存的前缀；它变化时，该会话的前缀缓存会整体失效一次。
+    /// 每轮变化的资料必须放在 `memories`。
+    pub pinned: Vec<String>,
 }
 
 /// 由会话宿主传入的可信作用域；不从用户文字或模型输出解析。
