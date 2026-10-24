@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub const SUBAGENT_FORBIDDEN_TOOLS: &[&str] = &[
+    "clear_context",
+    "clear_all_contexts",
     "send_message",
     "dispatch_background_task",
     "list_background_tasks",

@@ -118,6 +118,112 @@ async fn isolates_owners_sessions_and_inflight_turns() {
 }
 
 #[tokio::test]
+async fn context_reset_isolated_persistent_and_covers_inflight_without_deleting_records() {
+    let state = Arc::new(MemoryStateStore::default());
+    let (kernel, _, sessions) = open(state.clone()).await;
+    let a = sessions
+        .begin(input("group:user-a", "a", "旧上下文甲"))
+        .unwrap();
+    sessions.complete(&a.lease, simple("旧上下文甲")).unwrap();
+    let b = sessions
+        .begin(input("group:user-b", "b", "旧上下文乙"))
+        .unwrap();
+    sessions.complete(&b.lease, simple("旧上下文乙")).unwrap();
+    let raw = state.get(&id(), SESSION_STATE_KEY).unwrap();
+    assert_eq!(
+        sessions.reset_context(Some(&key("group:user-a", "b"))),
+        Err(SessionError::OwnerMismatch)
+    );
+    assert_eq!(
+        sessions
+            .reset_context(Some(&key("group:user-a", "a")))
+            .unwrap(),
+        1
+    );
+    assert_eq!(state.get(&id(), SESSION_STATE_KEY).unwrap(), raw);
+    let next_a = sessions
+        .begin(input("group:user-a", "a", "新上下文甲"))
+        .unwrap();
+    assert!(next_a.history.is_empty());
+    let next_b = sessions
+        .begin(input("group:user-b", "b", "新上下文乙"))
+        .unwrap();
+    assert_eq!(next_b.history, simple("旧上下文乙"));
+    assert_eq!(sessions.reset_context(None).unwrap(), 2);
+    sessions
+        .complete(&next_a.lease, simple("新上下文甲"))
+        .unwrap();
+    sessions
+        .complete(&next_b.lease, simple("新上下文乙"))
+        .unwrap();
+    let raw_after = state.get(&id(), SESSION_STATE_KEY).unwrap();
+    kernel.stop_all().await.unwrap();
+    let (kernel, _, restored) = open(state.clone()).await;
+    for (session, user) in [("group:user-a", "a"), ("group:user-b", "b")] {
+        assert_eq!(
+            restored
+                .snapshot(&key(session, user))
+                .unwrap()
+                .unwrap()
+                .turns
+                .len(),
+            2
+        );
+        assert!(
+            restored
+                .begin(input(session, user, "干净重启"))
+                .unwrap()
+                .history
+                .is_empty()
+        );
+    }
+    assert!(raw_after.is_some());
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn reset_storage_failure_disables_stale_context_and_corrupt_boundary_is_not_rebuilt() {
+    let state = Arc::new(FaultStore::default());
+    let (kernel, _, sessions) = open(state.clone()).await;
+    let first = sessions.begin(input("s", "u", "保留原文")).unwrap();
+    sessions.complete(&first.lease, simple("保留原文")).unwrap();
+    let raw = state.get(&id(), SESSION_STATE_KEY).unwrap();
+    state.fail.store(true, Ordering::SeqCst);
+    assert_eq!(sessions.reset_context(None), Err(SessionError::Storage));
+    assert_eq!(
+        sessions.begin(input("s", "u", "不能使用旧边界")),
+        Err(SessionError::Unavailable)
+    );
+    assert_eq!(state.get(&id(), SESSION_STATE_KEY).unwrap(), raw);
+    state.fail.store(false, Ordering::SeqCst);
+    kernel.stop_all().await.unwrap();
+    let bad = br#"{"format_version":1,"boundaries":{"s":{"key":{"session_id":"s","user_id":"other"},"through":1}}}"#.to_vec();
+    state
+        .set(
+            &id(),
+            eve_session_plugin::CONTEXT_RESETS_STATE_KEY.into(),
+            bad.clone(),
+        )
+        .unwrap();
+    let backends = KernelServices {
+        state: state.clone(),
+        ..KernelServices::default()
+    };
+    let kernel = Kernel::with_services(backends);
+    kernel
+        .register(Box::new(SessionPlugin::new().unwrap()))
+        .unwrap();
+    assert!(kernel.start(&id()).await.is_err());
+    assert_eq!(
+        state
+            .get(&id(), eve_session_plugin::CONTEXT_RESETS_STATE_KEY)
+            .unwrap(),
+        Some(bad)
+    );
+    assert_eq!(state.get(&id(), SESSION_STATE_KEY).unwrap(), raw);
+}
+
+#[tokio::test]
 async fn preserves_complete_tool_batches_and_structured_failures() {
     let (kernel, _, sessions) = open(Arc::new(MemoryStateStore::default())).await;
     let started = sessions.begin(input("s", "u", "工具问题")).unwrap();

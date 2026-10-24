@@ -269,6 +269,12 @@ impl fmt::Display for SessionError {
 impl std::error::Error for SessionError {}
 
 pub trait SessionService: Send + Sync {
+    /// 重置后续轮次使用的历史边界，不删除原始轮次或改变已在执行的请求。
+    /// Some 仅限该完整会话身份；None 为全局。调用者负责全局管理员授权。
+    /// 返回设置边界的会话数；不支持此能力的实现拒绝操作。
+    fn reset_context(&self, _key: Option<&SessionKey>) -> SessionResult<usize> {
+        Err(SessionError::Unavailable)
+    }
     /// 分页列出本服务已有历史的完整可信身份，不返回正文或诊断，也不创建或重放轮次。
     /// 按 session_id 升序，after 是独占游标，可不对应已有会话；Some 游标须非空、
     /// UTF-8 字节数不超过 256 且无控制字符，允许空格。limit 必须为 1..=100。
