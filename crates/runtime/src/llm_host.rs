@@ -1146,7 +1146,7 @@ impl LlmHost {
             }
             if self.config.tool_progress_reports
                 && progress_reports < progress_report_limit
-                && diagnostics.calls.len() >= [1, 15, 35][progress_reports]
+                && diagnostics.calls.len() >= [1, 30, 70][progress_reports]
             {
                 emit(
                     events,
