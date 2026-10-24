@@ -263,3 +263,54 @@ async fn transport_failures_and_truncated_bodies_are_sanitized() {
     );
     server.next().await;
 }
+
+#[tokio::test]
+async fn lists_model_ids_from_the_same_service_with_bounds_and_filters() {
+    let mut server = Server::start(vec![Reply::json(json!({"object":"list","data":[
+        {"id":"vision-a"},{"id":"vision-a"},{"id":"bad id"},{"id":""},{"object":"model"},
+        {"id":"text-b"},{"id":"vision-c"}
+    ]}))])
+    .await;
+    let provider = OpenAiProvider::new(config(&server.url), "fake-key").unwrap();
+    assert!(provider.models_url().as_str().ends_with("/v1/models"));
+    assert_eq!(
+        provider.list_models(2).await.unwrap(),
+        ["vision-a", "text-b"]
+    );
+    let captured = server.next().await;
+    assert!(captured.headers.starts_with("GET /v1/models "));
+    assert!(
+        captured
+            .headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer fake-key")
+    );
+    let chat = OpenAiProvider::new(
+        OpenAiConfig {
+            responses_url: "https://example.com/api/v3/chat/completions".into(),
+            ..OpenAiConfig::chat("m")
+        },
+        "fake-key",
+    )
+    .unwrap();
+    assert_eq!(
+        chat.models_url().as_str(),
+        "https://example.com/api/v3/models"
+    );
+}
+
+#[tokio::test]
+async fn model_list_failures_are_reported_not_guessed() {
+    let mut missing = Reply::json(json!({"error":"no"}));
+    missing.status = 404;
+    let server = Server::start(vec![missing, Reply::json(json!({"models":[]}))]).await;
+    let provider = OpenAiProvider::new(config(&server.url), "fake-key").unwrap();
+    assert!(matches!(
+        provider.list_models(10).await,
+        Err(LlmError::ProviderFailed(_))
+    ));
+    assert!(matches!(
+        provider.list_models(10).await,
+        Err(LlmError::Protocol(_))
+    ));
+}

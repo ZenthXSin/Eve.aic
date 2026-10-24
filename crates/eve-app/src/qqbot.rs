@@ -1717,24 +1717,12 @@ async fn run_qqbot_composed(
             .push(Arc::new(crate::qq_files::ReadAttachmentTool::new(
                 inbox.clone(),
             )));
-        if let Some(entry) = registry
-            .get(&ServiceId::new(CONFIG_SERVICE_ID)?)
-            .map_err(|error| format!("识图配置服务不可用：{error}"))?
-        {
-            let vision_settings = entry
-                .value
-                .downcast::<ConfigServiceHandle>()
-                .map_err(|_| "识图配置服务类型错误")?
-                .0
-                .clone();
-            bootstrap
-                .tools
-                .push(Arc::new(crate::qq_files::DescribeImageTool::new(
-                    inbox,
-                    vision_settings,
-                    bootstrap.api_key.clone(),
-                )));
-        }
+        // 识图工具总是注册；配置服务在核心安装后注入，与本轮视觉输入一致。
+        let describe_image = Arc::new(crate::qq_files::DescribeImageTool::new(
+            inbox,
+            bootstrap.api_key.clone(),
+        ));
+        bootstrap.tools.push(describe_image.clone());
         let raw = Arc::new(crate::qq_files::RawInbox::new());
         plugin = plugin.with_raw_observer(raw.clone());
         bootstrap.tools.push(Arc::new(
@@ -2072,6 +2060,9 @@ async fn run_qqbot_composed(
             .settings
             .set(qq_tasks::config_service(registry.as_ref())?);
         let _ = vision
+            .settings
+            .set(qq_tasks::config_service(registry.as_ref())?);
+        let _ = describe_image
             .settings
             .set(qq_tasks::config_service(registry.as_ref())?);
         if let Some(stickers) = &stickers {

@@ -247,6 +247,72 @@ impl OpenAiProvider {
         }
     }
 
+    /// 同一服务、同一凭据的 `/models` 地址：把端点末尾的协议路径换成 `/models`。
+    pub fn models_url(&self) -> Url {
+        let mut url = self.endpoint.clone();
+        let path = url.path().trim_end_matches('/');
+        let base = path
+            .strip_suffix("/chat/completions")
+            .or_else(|| path.strip_suffix("/responses"))
+            .unwrap_or(path)
+            .to_owned();
+        url.set_path(&format!("{base}/models"));
+        url
+    }
+
+    /// 读取服务公开的模型标识（OpenAI 兼容的 `GET /models`），至多 `limit` 个，按服务返回顺序。
+    /// 只读取标识，不推断模型能力；服务不提供列表时如实返回错误。
+    pub async fn list_models(&self, limit: usize) -> Result<Vec<String>, LlmError> {
+        let response = self
+            .client
+            .get(self.models_url())
+            .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
+            .timeout(self.config.request_timeout)
+            .send()
+            .await
+            .map_err(transport_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(LlmError::ProviderFailed(
+                ProviderFailure::http(status.as_u16())
+                    .unwrap_or(ProviderFailure::new(ProviderFailureKind::UnexpectedStatus)),
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|n| n > self.config.max_response_bytes as u64)
+        {
+            return Err(failed(ProviderFailureKind::ResponseTooLarge));
+        }
+        let bytes = response.bytes().await.map_err(transport_error)?;
+        if bytes.len() > self.config.max_response_bytes {
+            return Err(failed(ProviderFailureKind::ResponseTooLarge));
+        }
+        let body: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|_| LlmError::Protocol("模型列表不是 JSON".into()))?;
+        let entries = body
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| LlmError::Protocol("模型列表缺少 data 数组".into()))?;
+        let mut models = Vec::new();
+        for id in entries
+            .iter()
+            .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
+        {
+            if models.len() == limit {
+                break;
+            }
+            if !id.is_empty()
+                && id.len() <= 200
+                && !id.chars().any(|c| c.is_control() || c.is_whitespace())
+                && !models.iter().any(|known| known == id)
+            {
+                models.push(id.to_owned());
+            }
+        }
+        Ok(models)
+    }
+
     /// 显式装配流式分阶段期限；非流式请求仍沿用 OpenAiConfig.request_timeout。
     pub fn with_stream_timeout_policy(
         mut self,
