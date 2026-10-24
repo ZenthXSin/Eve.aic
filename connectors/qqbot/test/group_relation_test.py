@@ -21,9 +21,13 @@ class GroupRelationAcceptance(group_chat_test.GroupChatAcceptance):
         super().setUp()
         self.jev_requests=[]
         self.recall_requests=[]
+        self.recall_arrivals=[]
         self.recall_score=lambda candidate:0.1
         self.classification=lambda state:('uncertain','none',0.4,False)
         self.jev_status=200
+        # 关系判断应答前的延迟（秒）与进行中的时间段，用于复现名额被判断占用的情形。
+        self.relation_delay=0
+        self.relation_spans=[]
         self.bad_evidence=False
         self.active_reply=False
         outer=self
@@ -39,12 +43,16 @@ class GroupRelationAcceptance(group_chat_test.GroupChatAcceptance):
                         # 原话挑选：每条候选一个 noul 问题。
                         assert set(body['questions'])=={c['candidate'] for c in body['state']['candidates']}
                         outer.recall_requests.append(body)
+                        outer.recall_arrivals.append(time.monotonic())
                         answer={'answers':{c['candidate']:{'type':'noul','noul':outer.recall_score(c)} for c in body['state']['candidates']}}
                         data=json.dumps(answer).encode()
                         self.send_response(outer.jev_status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
                         return
                     assert set(body['questions'])=={'relation','topic','needs_reply'}
                     outer.jev_requests.append(body)
+                    started=time.monotonic()
+                    if outer.relation_delay: time.sleep(outer.relation_delay)
+                    outer.relation_spans.append((started,time.monotonic()))
                     kind,topic,confidence,needs=outer.classification(body['state'])
                     def choice(name,selected):
                         return {'type':'choice','choice':selected,'confidence':confidence,'probabilities':{key:1.0 if key==selected else 0.0 for key in body['questions'][name]['criteria']}}
