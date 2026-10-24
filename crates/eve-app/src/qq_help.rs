@@ -40,7 +40,7 @@ impl QqCommandHandler for Help {
             self.definitions.len()
         );
         if words.len() == 2 {
-            text.push_str("每轮最多 50 次工具调用；有工具结果时途中汇报 1–3 次，达到上限后依据已有结果收尾。\n");
+            text.push_str("每轮最多 100 次工具调用；有工具结果时途中汇报 1–3 次，达到上限后依据已有结果收尾。\n");
             for definition in &self.definitions {
                 let description: String = definition.description.chars().take(52).collect();
                 text.push_str(&format!("\n{}：{description}", definition.name));

@@ -125,7 +125,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --agenda-context 需同时 --interest-learning；用户私聊时，把 Eve 为这位用户的兴趣在后台做到哪一步（研究、实践、请求澄清，按记录整理）作为低优先级数据交给对话，用户问起时据实回答；只读记录，不改变后台行为。
 --stickers 开启表情包：开启识图时，从用户直接发来的图片里收集候选，经视觉模型审看为表情包后收下（其余删除）；对话中模型可用 send_sticker 按心情挑一张，跟在回复文字后面作为图片发出。runtime.stickers 可分别关闭收集与发送。
 --reminders 开启私聊提醒：用户自然地说“半小时后提醒我喝水”或“明早 9 点提醒我交作业”，模型调用提醒工具记下并如实回复，想取消时直接说；到时先主动私聊一次，发不出去时随用户下一条私聊的回复附带，到期 7 天仍未送达不再投递。没有命令；只在私聊中成立。--reminder-utc-offset 设置本地时区（默认 +08:00）。
---background-tasks 让 Eve 在对话中把需要多步、较长时间的事派发到后台：执行器可用对话里的工具（不含派发与子代理），按步数预算（工具调用次数，默认 50，runtime.tasks 可调）独立完成，结束后私聊通知派发它的用户，发不出去时随下一条私聊回复附带；用户可以让 Eve 查看或取消任务。重启时执行中的任务记为中断，不自动重跑。
+--background-tasks 让 Eve 在对话中把需要多步、较长时间的事派发到后台：执行器可用对话里的工具（不含派发与子代理），按步数预算（工具调用次数，默认 100，runtime.tasks 可调）独立完成，结束后私聊通知派发它的用户，发不出去时随下一条私聊回复附带；用户可以让 Eve 查看或取消任务。重启时执行中的任务记为中断，不自动重跑。
 --subagents 让 Eve 在一轮回复中把可以独立完成的子任务委托给子代理并等它交回结果；子代理同样按步数预算执行，须在 runtime.tasks.subagent_timeout_ms（默认 3 分钟）内完成，不能再委托或派发。
 --goal-completion 需同时 --plans；待办的计划各步都被证据满足后，随用户下一次私聊的回复问一句这件事算不算完成，每份计划至多问一次；用户明确说完成了，模型调用确认工具，宿主核对计划仍对应当前版本后把待办标为已完成，并记下依据的计划与确认来源。没有命令；只在私聊中成立。
 --learning-stop 需同时 --interest-learning；兴趣学习目标的研究与实践次数都用完、也没有在问你或等你回复时，后台把它标为已取消并记下原因（目标的停止条件“学习预算耗尽”），兴趣本身保留；不开启时目标一直等待。无论是否开启，/interests 与议程上下文都会说明每个学习目标接下来会做什么、在等什么。
@@ -1749,7 +1749,7 @@ async fn run_qqbot_composed(
         }
         // 工具批次用尽时不让本轮失败：不再提供工具，模型依据已有结果作答并说明未核实部分。
         bootstrap.host_config.final_answer_on_round_limit = true;
-        bootstrap.host_config.max_tool_calls = 50;
+        bootstrap.host_config.max_tool_calls = 100;
         bootstrap.host_config.tool_progress_reports = true;
         let developer_settings = std::env::var_os("EVE_DEVELOPER_CONFIG")
             .map(std::fs::read)

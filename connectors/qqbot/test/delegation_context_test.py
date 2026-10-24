@@ -76,7 +76,7 @@ class DelegationContextAcceptance(developer.DeveloperAcceptance):
         if tool == "dispatch_background_task":
             [task] = self.tasks()
             self.assertEqual("context" in task["spec"], include)
-            self.assertEqual(task["spec"]["max_steps"], 50)
+            self.assertEqual(task["spec"]["max_steps"], 100)
 
     def test_subagent_context_is_opt_in_and_scope_isolated(self):
         self.exercise("run_subagent", True)
