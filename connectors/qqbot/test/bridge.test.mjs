@@ -283,6 +283,41 @@ test("群聊接纳官方 @ 事件，拒绝普通群消息与机器人消息", as
   assert.deepEqual(f.sent, [{ target: incoming.replyTarget, text: "你喜欢怎样的称呼？" }]);
 });
 
+test("eve 名字前缀大小写均走普通回复，观察不伪造 @ 且重复事件只交付一次", async () => {
+  for (const observe of [false, true]) {
+    for (const content of ["eve在不在", "Eve", "EVE 你好", "eVe，请帮忙", "  EvE在吗", "evening"]) {
+      const f = fixture({ group: { observe } });
+      const incoming = { kind: "group", messageId: "name-wake", senderId: "member-1", content,
+        rawEventType: "GROUP_MESSAGE_CREATE", groupOpenid: "group-1",
+        replyTarget: { scope: "group", targetId: "group-1", msgId: "name-wake" } };
+      f.handlers.get("message")({}, incoming);
+      f.handlers.get("message")({}, incoming);
+      const messages = f.frames.filter(x => x.type === "message");
+      assert.equal(messages.length, 1);
+      assert.equal(messages[0].text, content.trim());
+      assert.equal(messages[0].user_id, "member-1");
+      const observations = f.frames.filter(x => x.type === "group_observation");
+      assert.equal(observations.length, Number(observe));
+      if (observe) assert.equal(observations[0].mentions_me, false);
+      await f.bridge.command({ version: 1, type: "reply", id: "name-wake", text: "在" });
+      assert.deepEqual(f.sent, [{ target: incoming.replyTarget, text: "在" }]);
+    }
+  }
+  for (const change of [
+    { content: "请问 eve 在吗" }, { content: "\"eve在不在\"" },
+    { content: "ｅｖｅ在吗" }, { content: "e ve在吗" },
+    { content: "eve在不在", senderIsBot: true },
+    { content: "eve在不在", rawEventType: "UNKNOWN" },
+    { content: "eve在不在", groupOpenid: "wrong-group" },
+  ]) {
+    const f = fixture();
+    f.handlers.get("message")({}, { kind: "group", messageId: "no-wake", senderId: "member-1",
+      rawEventType: "GROUP_MESSAGE_CREATE", groupOpenid: "group-1",
+      replyTarget: { scope: "group", targetId: "group-1", msgId: "no-wake" }, ...change });
+    assert.equal(f.frames.filter(x => x.type === "message").length, 0);
+  }
+});
+
 test("普通群事件携带服务端自身提及时可原路回复，不依赖 AppID 等于 openid", async () => {
   const f = fixture();
   const incoming = {
