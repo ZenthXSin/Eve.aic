@@ -88,6 +88,7 @@ impl State {
         policy: ContextCompactionPolicy,
         service: &dyn HistoryDigests,
         scope: Option<&ContextScope>,
+        fallback_trigger: Option<usize>,
     ) -> Result<(), LlmError> {
         let before = estimate(&ModelRequest {
             messages: messages.clone(),
@@ -194,7 +195,8 @@ impl State {
             messages: messages.clone(),
             tools: tools.to_vec(),
         })?;
-        if after >= policy.trigger_tokens {
+        // 闲聊预算只是更早压缩；固定提示或当前输入本身超过它时，退回主阈值继续，不让本轮失败。
+        if after >= policy.trigger_tokens && fallback_trigger.is_none_or(|limit| after >= limit) {
             return Err(LlmError::Context(
                 "系统提示、当前输入或工具定义本身已达上下文阈值，无法安全压缩；原记录保留".into(),
             ));
@@ -279,7 +281,7 @@ mod tests {
             );
             let before = messages.clone();
             state
-                .compact(&mut messages, &[], policy, &service, None)
+                .compact(&mut messages, &[], policy, &service, None, None)
                 .await
                 .unwrap();
             assert_eq!(
@@ -331,6 +333,7 @@ mod tests {
                         target_tokens: 100000
                     },
                     &service,
+                    None,
                     None
                 )
                 .await

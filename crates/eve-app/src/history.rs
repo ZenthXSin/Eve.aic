@@ -39,6 +39,26 @@ impl HistoryWindowResolver for ConfiguredHistory {
         policy.validate()?;
         Ok(Some(policy))
     }
+    fn casual_compaction(&self) -> Result<Option<ContextCompactionPolicy>, LlmError> {
+        let read = || -> Result<_, eve_config_api::ConfigError> {
+            let snapshot = self.0.snapshot(NAMESPACE, 1)?;
+            Ok((
+                snapshot.get::<usize>("casual_compact_at_tokens")?,
+                snapshot.get::<usize>("casual_compact_to_tokens")?,
+            ))
+        };
+        let (trigger_tokens, target_tokens) =
+            read().map_err(|_| LlmError::Configuration("闲聊上下文预算配置无法读取".into()))?;
+        if trigger_tokens == 0 {
+            return Ok(None);
+        }
+        let policy = ContextCompactionPolicy {
+            trigger_tokens,
+            target_tokens,
+        };
+        policy.validate()?;
+        Ok(Some(policy))
+    }
     fn resolve(&self) -> Result<HistoryWindow, LlmError> {
         let snapshot = self
             .0
