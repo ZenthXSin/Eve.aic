@@ -159,7 +159,8 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
             self.assertIn("超过宿主上限 200", json.dumps(results, ensure_ascii=False))
             return text_response("步数太多，没有派发。")
         self.callback = respond
-        self.run_eve(self.send(self.message("ask", ASK, expected="步数太多，没有派发。")))
+        self.run_eve(self.send(self.message("ask", ASK, expected="步数太多，没有派发。")),
+                     env_extra={"EVE_TASK_MAX_STEPS":"200"})
         self.assertEqual(self.tasks(), [])
 
     def held_worker(self, body):
@@ -310,7 +311,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.assertNotIn("eve.task", self.documents())
         env = {key: os.environ[key] for key in ("PATH", "SystemRoot", "TEMP", "TMP") if key in os.environ}
         env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret",
-                   EVE_TASK_DEFAULT_STEPS="300")
+                   EVE_TASK_DEFAULT_STEPS="300", EVE_TASK_MAX_STEPS="200")
         result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
                                  "--agent", str(ROOT / "AGENT.md"), "--background-tasks"],
                                 env=env, capture_output=True, text=True, timeout=60)

@@ -28,7 +28,7 @@ pub const MAX_RESULT_BYTES: usize = 16_384;
 pub const MAX_FAILURE_BYTES: usize = 512;
 /// 每个任务的步数（工具调用次数）上限的取值范围；默认值由宿主配置。
 pub const MIN_STEPS: u32 = 1;
-pub const MAX_STEPS: u32 = 500;
+pub const MAX_STEPS: u32 = 5000;
 pub const DEFAULT_STEPS: u32 = 50;
 /// 宿主自动失败恢复及其经用户批准的接续任务使用此来源前缀。
 pub const FAILURE_RECOVERY_SOURCE_PREFIX: &str = "failure:";
@@ -465,7 +465,7 @@ pub fn validate_owner(owner: &TaskOwner) -> TaskResult<()> {
     validate_id(&owner.user_id)
 }
 
-/// 标题单行、非空、至多 120 字节；说明非空、至多 8192 字节；步数在 1 至 500 之间。
+/// 标题单行、非空、至多 120 字节；说明非空、至多 8192 字节；步数在 1 至 5000 之间。
 pub fn validate_spec(spec: &TaskSpec) -> TaskResult<()> {
     validate_text(&spec.title, MAX_TITLE_BYTES)?;
     if spec.title.contains('\n') {

@@ -811,7 +811,7 @@ impl LlmHost {
                     )
                 })?
                 .map_err(|error| fail(error, diagnostics.clone()))?;
-            let frame = loaded.unwrap_or_else(|| eve_llm_api::TurnCheckpoint {
+            let mut frame = loaded.unwrap_or_else(|| eve_llm_api::TurnCheckpoint {
                 version: 1,
                 scope: scope.clone().expect("checked scope"),
                 messages: messages.clone(),
@@ -888,6 +888,7 @@ impl LlmHost {
                     self.step_limit_notice(frame.used_tool_calls),
                 ));
             }
+            frame.messages = messages.clone();
             if let Some(text) = &frame.result {
                 diagnostics.stage = TurnStage::Completed;
                 return Ok(TurnOutput {
@@ -931,8 +932,14 @@ impl LlmHost {
             if let Some(frame) = &mut checkpoint {
                 frame.provider_requests = diagnostics.provider_requests + 1;
                 frame.continuation_checks = continuation_checks;
+                if closing && !frame.closing {
+                    frame.messages.push(ChatMessage::text(
+                        ChatRole::System,
+                        self.step_limit_notice(diagnostics.calls.len()),
+                    ));
+                }
                 frame.closing = closing;
-                self.save_execution_checkpoint(frame, &messages, &diagnostics, &continuation)
+                self.save_execution_checkpoint(frame, &diagnostics, &continuation)
                     .map_err(|error| fail(error, diagnostics.clone()))?;
             }
             let response = match self
@@ -974,7 +981,7 @@ impl LlmHost {
                 if let Some(frame) = &mut checkpoint {
                     frame.result = Some(text.clone());
                     frame.provider_requests = diagnostics.provider_requests;
-                    self.save_execution_checkpoint(frame, &messages, &diagnostics, &continuation)
+                    self.save_execution_checkpoint(frame, &diagnostics, &continuation)
                         .map_err(|error| fail(error, diagnostics.clone()))?;
                 }
                 transcript.push(ChatMessage::text(ChatRole::Assistant, text.clone()));
@@ -1061,7 +1068,7 @@ impl LlmHost {
             if let Some(frame) = &mut checkpoint {
                 frame.pending_calls = calls.clone();
                 frame.provider_requests = diagnostics.provider_requests;
-                self.save_execution_checkpoint(frame, &messages, &diagnostics, &continuation)
+                self.save_execution_checkpoint(frame, &diagnostics, &continuation)
                     .map_err(|error| fail(error, diagnostics.clone()))?;
             }
             emit(
@@ -1101,6 +1108,11 @@ impl LlmHost {
             transcript.extend_from_slice(&messages[messages.len() - 2..]);
             diagnostics.tool_results.extend(results.clone());
             if let Some(frame) = &mut checkpoint {
+                // 模型请求副本可能已压缩；恢复日志始终追加真实完整调用与回执，
+                // 不能用摘要覆盖旧批次，否则总步数与消息中的调用数不再一致。
+                frame
+                    .messages
+                    .extend_from_slice(&messages[messages.len() - 2..]);
                 // 工具超时、取消和执行异常可能已经产生副作用；保存回执，但阻止自动接续。
                 let uncertain = results.iter().any(|result| {
                     matches!(
@@ -1115,7 +1127,7 @@ impl LlmHost {
                 });
                 frame.pending_calls.clear();
                 frame.provider_requests = diagnostics.provider_requests;
-                self.save_execution_checkpoint(frame, &messages, &diagnostics, &continuation)
+                self.save_execution_checkpoint(frame, &diagnostics, &continuation)
                     .map_err(|error| fail(error, diagnostics.clone()))?;
                 if uncertain {
                     return Err(fail(
@@ -1183,11 +1195,9 @@ impl LlmHost {
     fn save_execution_checkpoint(
         &self,
         frame: &mut eve_llm_api::TurnCheckpoint,
-        messages: &[ChatMessage],
         diagnostics: &TurnDiagnostics,
         continuation: &eve_llm_api::TaskContinuation,
     ) -> Result<(), LlmError> {
-        frame.messages = messages.to_vec();
         frame.used_tool_calls = diagnostics.calls.len();
         if let Some(steps) = &self.shared_steps {
             let usage = steps.usage()?;
@@ -1691,10 +1701,10 @@ async fn run_tool(
         result = &mut future => match result {
             Ok(value) => ToolResult::success(call.id, value),
             Err(error) => {
-                let code = if matches!(error, eve_llm_api::ToolExecutionError::Cancelled(_)) {
-                    ToolFailureCode::Cancelled
-                } else {
-                    ToolFailureCode::ExecutionFailed
+                let code = match &error {
+                    eve_llm_api::ToolExecutionError::Rejected(_) => ToolFailureCode::InvalidArguments,
+                    eve_llm_api::ToolExecutionError::Cancelled(_) => ToolFailureCode::Cancelled,
+                    eve_llm_api::ToolExecutionError::Failed(_) => ToolFailureCode::ExecutionFailed,
                 };
                 ToolResult::failure(call.id, code, error.to_string())
             }

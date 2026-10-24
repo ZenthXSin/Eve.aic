@@ -116,7 +116,7 @@ pub(crate) fn schema() -> ConfigSchema {
             (
                 "max_steps".into(),
                 field(
-                    200,
+                    u64::from(MAX_STEPS),
                     i64::from(MIN_STEPS),
                     i64::from(MAX_STEPS),
                     "EVE_TASK_MAX_STEPS",
@@ -236,7 +236,15 @@ impl eve_llm_api::TurnJournal for TaskJournal {
         self.tasks
             .checkpoint(&self.id, checkpoint.clone(), self.deadline_at_ms, now_ms())
             .map(|_| ())
-            .map_err(|_| LlmError::Context("执行检查点未确认保存；停止执行，保留原记录".into()))
+            .map_err(|error| {
+                LlmError::Context(match error {
+                    TaskError::LimitReached => {
+                        "执行检查点账本容量不足；停止执行，完整旧记录保留".into()
+                    }
+                    TaskError::Storage => "执行检查点存储读写失败；停止执行，完整旧记录保留".into(),
+                    _ => "执行检查点未确认保存；停止执行，保留原记录".into(),
+                })
+            })
     }
 }
 
@@ -287,14 +295,30 @@ fn failure_reason(error: &LlmError) -> String {
         LlmError::Cancelled => "已取消".into(),
         LlmError::ProviderTimeout => "模型请求超时".into(),
         LlmError::RoundLimit => "步数用尽后模型仍要求调用工具".into(),
+        LlmError::Protocol(_) => "模型回复或工具调用协议不合规；已保存工具回执，未重放操作".into(),
+        LlmError::Unsupported(_) => "模型响应使用了执行器尚不支持的协议内容".into(),
         LlmError::Configuration(_) => "执行器配置无效".into(),
         LlmError::Context(message) if message.starts_with("工具结果可能含未确认") => {
             "工具结果含未确认副作用；已保存回执，停止自动恢复，需核对现有结果".into()
         }
-        LlmError::Context(message) if message.starts_with("执行检查点") => {
-            "执行检查点无法确认保存或超出容量；已停止，原记录保留".into()
-        }
+        LlmError::Context(message) if message.starts_with("执行检查点") => message.clone(),
         LlmError::Context(_) => "执行器上下文不可用".into(),
+        _ if error.provider_failure().is_some() => {
+            let failure = error.provider_failure().expect("checked failure");
+            let reason = match failure.kind {
+                eve_llm_api::ProviderFailureKind::Network => "模型服务网络请求失败",
+                eve_llm_api::ProviderFailureKind::ServerError => "模型服务内部错误",
+                eve_llm_api::ProviderFailureKind::RateLimited => "模型服务限流",
+                eve_llm_api::ProviderFailureKind::Unauthorized => "模型服务凭据或权限被拒绝",
+                eve_llm_api::ProviderFailureKind::PaymentRequired => "模型服务额度不足",
+                eve_llm_api::ProviderFailureKind::Truncated => "模型回复被输出长度上限截断",
+                _ => "模型服务未能完成回复",
+            };
+            match failure.http_status {
+                Some(status) => format!("{reason}（HTTP {status}）"),
+                None => reason.into(),
+            }
+        }
         _ => "模型或工具不可用".into(),
     }
 }
@@ -777,7 +801,7 @@ fn validate_steps(object: &serde_json::Map<String, Value>) -> Result<(), ToolVal
         {
             Ok(())
         }
-        Some(_) => Err(invalid("max_steps 须为 1 至 500 的整数")),
+        Some(_) => Err(invalid("max_steps 须为 1 至 5000 的整数")),
     }
 }
 
@@ -1677,9 +1701,9 @@ mod tests {
         };
         let defaults = settings(&snapshot(&values)).unwrap();
         assert_eq!(defaults.default_steps, 50);
-        assert_eq!(defaults.max_steps, 200);
+        assert_eq!(defaults.max_steps, 5000);
         assert_eq!(defaults.subagent_timeout, Duration::from_secs(180));
-        values.insert("default_steps".into(), json!(300));
+        values.insert("default_steps".into(), json!(5001));
         assert!(settings(&snapshot(&values)).is_err());
     }
 
