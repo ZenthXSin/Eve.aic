@@ -301,9 +301,10 @@ impl SessionLlmHost {
 }
 fn failure_code(error: &LlmError) -> SessionFailureCode {
     match error {
-        LlmError::Configuration(_) | LlmError::Context(_) | LlmError::HistoryWindowExceeded => {
-            SessionFailureCode::Context
-        }
+        LlmError::Configuration(_)
+        | LlmError::Context(_)
+        | LlmError::ContextCompactionFailed(_)
+        | LlmError::HistoryWindowExceeded => SessionFailureCode::Context,
         LlmError::Provider(_) | LlmError::ProviderFailed(_) => SessionFailureCode::Provider,
         LlmError::ProviderTimeout => SessionFailureCode::ProviderTimeout,
         LlmError::Protocol(_) => SessionFailureCode::Protocol,

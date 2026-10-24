@@ -626,6 +626,12 @@ fn failed_turn_notice(report: &ControlReport, recovery: Option<&str>) -> String 
             "任务仍未完成，自动续行三次后仍未完成或说明阻塞，已停止本轮".into()
         }
         (_, Some(LlmError::Protocol(_))) => "模型回复格式或工具调用未通过协议检查".into(),
+        (_, Some(LlmError::ContextCompactionFailed(failure))) => {
+            format!(
+                "上下文压缩失败：{}；原始记录与摘要进度保留",
+                failure_reason(*failure)
+            )
+        }
         (_, Some(LlmError::Context(reason))) if reason.starts_with("上下文压缩") => {
             "上下文压缩未能完成，已保存的摘要进度与原始记录仍保留；压缩后的下一次对话请求未发出"
                 .into()
@@ -650,7 +656,19 @@ fn failed_turn_notice(report: &ControlReport, recovery: Option<&str>) -> String 
         ),
         None => "工具执行情况尚未确认，不能保证没有副作用。".into(),
     };
-    let next = recovery.unwrap_or("本轮已停止，不再自动重试；继续前需要核对现有结果。");
+    let no_tools = if report.run.started_tools == Some(0) && persistence.is_none() {
+        match error.and_then(LlmError::provider_failure).map(|f| f.kind) {
+            Some(eve_llm_api::ProviderFailureKind::Unauthorized) => {
+                Some("请检查模型服务的密钥或分组权限，修复后可继续。")
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let next = recovery
+        .or(no_tools)
+        .unwrap_or("本轮已停止，不再自动重试；继续前需要核对现有结果。");
     format!("{reason}。{effects}{next}")
 }
 /// 只用固定类别与状态码说明，不转述供应商错误正文。
@@ -2037,6 +2055,12 @@ mod tests {
         use eve_session_api::{SessionError, SessionKey};
         for (failure, expected) in [
             (
+                RunFailure::Execution(LlmError::ContextCompactionFailed(
+                    eve_llm_api::ProviderFailure::http(403).unwrap(),
+                )),
+                "上下文压缩失败：模型服务拒绝了凭据或权限（HTTP 403）",
+            ),
+            (
                 RunFailure::Execution(LlmError::Protocol("private response body".into())),
                 "模型回复格式或工具调用未通过协议检查",
             ),
@@ -2078,6 +2102,24 @@ mod tests {
             assert!(notice.starts_with(expected), "{notice}");
             assert!(!notice.contains("private"));
             assert!(!notice.contains("本轮执行或状态保存未能完成"));
+            if matches!(
+                report.run.failure,
+                Some(RunFailure::Execution(LlmError::ContextCompactionFailed(_)))
+            ) {
+                assert!(notice.contains("核对现有结果"));
+                let mut clean = report.clone();
+                clean.run.started_tools = Some(0);
+                let notice = failed_turn_notice(&clean, None);
+                assert!(notice.contains("分组权限"));
+                assert!(!notice.contains("核对现有结果"));
+                clean.run.failure = Some(RunFailure::FailureRecord {
+                    storage: SessionError::Storage,
+                    execution: LlmError::ContextCompactionFailed(
+                        eve_llm_api::ProviderFailure::http(403).unwrap(),
+                    ),
+                });
+                assert!(failed_turn_notice(&clean, None).contains("核对现有结果"));
+            }
             assert!(notice.contains("已启动 1 次工具调用"));
             assert!(notice.contains("不再自动重试"));
         }

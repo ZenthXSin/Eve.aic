@@ -81,6 +81,86 @@ impl State {
         }
     }
 
+    /// 软目标容纳不了固定开销时提前使用既有主预算，避免每轮归纳几十个 token。
+    pub(crate) fn select_policy(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        preferred: ContextCompactionPolicy,
+        main: Option<ContextCompactionPolicy>,
+    ) -> Result<ContextCompactionPolicy, LlmError> {
+        let Some(main) = main.filter(|main| *main != preferred) else {
+            return Ok(preferred);
+        };
+        if main.trigger_tokens <= preferred.trigger_tokens {
+            return Ok(main);
+        }
+        let minimum = self.minimum_size(messages, tools)?;
+        Ok(if minimum >= preferred.target_tokens {
+            main
+        } else {
+            preferred
+        })
+    }
+
+    fn minimum_size(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<usize, LlmError> {
+        let end = 2 + self.remaining;
+        let mut fixed = Vec::new();
+        let mut index = 0;
+        while index < messages.len() {
+            if (2..end).contains(&index) {
+                index += 1;
+            } else if index >= end
+                && !messages[index].tool_calls.is_empty()
+                && messages
+                    .get(index + 1)
+                    .is_some_and(|m| m.role == ChatRole::Tool)
+            {
+                index += 2;
+            } else {
+                fixed.push(messages[index].clone());
+                index += 1;
+            }
+        }
+        estimate(&ModelRequest {
+            messages: fixed,
+            tools: tools.to_vec(),
+        })
+    }
+
+    pub(crate) fn adaptive_policy(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        limit: usize,
+    ) -> Result<ContextCompactionPolicy, LlmError> {
+        let floor = self.minimum_size(messages, tools)?;
+        let reserve = (limit.saturating_sub(floor) / 4).min(8192);
+        let trigger_tokens = limit - reserve;
+        let target_tokens = if floor >= trigger_tokens {
+            trigger_tokens - 1
+        } else {
+            floor + (trigger_tokens - floor) / 2
+        };
+        Ok(ContextCompactionPolicy {
+            trigger_tokens,
+            target_tokens,
+        })
+    }
+
+    pub(crate) fn has_work(&self, messages: &[ChatMessage]) -> bool {
+        self.remaining > 0
+            || messages
+                .get(2 + self.remaining..)
+                .unwrap_or_default()
+                .windows(2)
+                .any(|pair| !pair[0].tool_calls.is_empty() && pair[1].role == ChatRole::Tool)
+    }
+
     pub(crate) async fn compact(
         &mut self,
         messages: &mut Vec<ChatMessage>,
@@ -138,7 +218,7 @@ impl State {
             tools: tools.to_vec(),
         })?;
         if now > policy.target_tokens {
-            let user = messages
+            messages
                 .iter()
                 .rposition(|m| m.role == ChatRole::User)
                 .ok_or_else(|| LlmError::Context("压缩请求缺少当前用户输入".into()))?;
@@ -150,7 +230,8 @@ impl State {
                     .saturating_sub(MAX_HISTORY_DIGEST_BYTES),
             );
             // 每个已完成工具批次作为原子单元压缩；调用与结果一起移除，诊断和 transcript 不变。
-            let mut index = user + 1;
+            // 轮内引导可能位于已完成工具之后；保留所有 User 原文，扫描整段本轮工具。
+            let mut index = 2 + self.remaining;
             while index + 1 < messages.len() && need > 0 {
                 if !messages[index].tool_calls.is_empty()
                     && messages[index + 1].role == ChatRole::Tool
@@ -215,6 +296,65 @@ mod tests {
     use eve_llm_api::LlmFuture;
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct Digests(AtomicUsize);
+
+    #[tokio::test]
+    async fn completed_tools_before_a_steering_message_can_be_compacted_without_removing_users() {
+        use eve_llm_api::{ToolCall, ToolOutput, ToolResult};
+        let service = Digests(AtomicUsize::new(0));
+        let mut context = ContextSnapshot {
+            revision: "test".into(),
+            profile: String::new(),
+            memories: vec![],
+            history: vec![],
+            pinned: vec![],
+        };
+        let mut state = State::new(&mut context, &service, None);
+        let mut messages = vec![
+            ChatMessage::text(ChatRole::System, "policy"),
+            ChatMessage::text(ChatRole::System, "facts"),
+            ChatMessage::text(ChatRole::User, "原任务"),
+            ChatMessage::assistant_tool_calls(vec![ToolCall {
+                id: "once".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({}),
+            }])
+            .unwrap(),
+            ChatMessage::tool_results(vec![ToolResult {
+                call_id: "once".into(),
+                output: ToolOutput::Success(serde_json::json!("中".repeat(100000))),
+            }])
+            .unwrap(),
+            ChatMessage::text(ChatRole::User, "补充：保留已做结果"),
+        ];
+        let original = messages.clone();
+        let policy = state.adaptive_policy(&messages, &[], 200000).unwrap();
+        assert!(state.has_work(&messages));
+        state
+            .compact(&mut messages, &[], policy, &service, None, Some(200000))
+            .await
+            .unwrap();
+        assert_eq!(service.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.role == ChatRole::User)
+                .map(|m| m.text.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["原任务", "补充：保留已做结果"]
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|m| m.tool_calls.is_empty() && m.tool_results.is_empty())
+        );
+        assert_eq!(original[3].tool_calls[0].id, "once");
+        ModelRequest {
+            messages,
+            tools: vec![],
+        }
+        .validate()
+        .unwrap();
+    }
     impl HistoryDigests for Digests {
         fn digest(
             &self,

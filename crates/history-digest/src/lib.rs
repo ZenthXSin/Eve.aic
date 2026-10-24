@@ -311,10 +311,8 @@ impl HistoryDigests for HistoryDigestService {
                             "上下文压缩模型响应超时；已保存的摘要进度保留，不是主对话模型请求超时"
                                 .into(),
                         ),
-                        error if error.provider_failure().is_some() => LlmError::Context(
-                            "上下文压缩模型请求失败；已保存的摘要进度保留，后续对话请求未发出"
-                                .into(),
-                        ),
+                        error if error.provider_failure().is_some() =>
+                            LlmError::ContextCompactionFailed(error.provider_failure().expect("checked failure")),
                         LlmError::Protocol(_) | LlmError::Unsupported(_) => LlmError::Context(
                             "上下文压缩摘要格式或要点未通过校验；已保存的摘要进度与原始记录保留，后续对话请求未发出".into(),
                         ),

@@ -107,6 +107,7 @@ impl ModelOutcome {
             },
             // 上下文、工具轮次与宿主后端的失败不是模型请求的结局。
             LlmError::Context(_)
+            | LlmError::ContextCompactionFailed(_)
             | LlmError::HistoryWindowExceeded
             | LlmError::RoundLimit
             | LlmError::Backend(_) => return None,

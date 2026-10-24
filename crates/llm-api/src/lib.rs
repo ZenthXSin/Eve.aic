@@ -447,6 +447,8 @@ pub enum LlmError {
     HistoryWindowExceeded,
     Configuration(String),
     Context(String),
+    /// 压缩阶段的模型失败；只保留固定类别与 HTTP 状态，不能误归因为主对话请求失败。
+    ContextCompactionFailed(ProviderFailure),
     Provider(String),
     /// Provider 给出的有限失败类别与状态码；不含供应商错误正文。
     ProviderFailed(ProviderFailure),
@@ -469,6 +471,14 @@ impl fmt::Display for LlmError {
             Self::Cancelled => f.write_str("turn cancelled"),
             Self::Configuration(s) => write!(f, "configuration error: {s}"),
             Self::Context(s) => write!(f, "context error: {s}"),
+            Self::ContextCompactionFailed(failure) => match failure.http_status {
+                Some(status) => write!(
+                    f,
+                    "context compaction provider failure: {:?} (HTTP {status})",
+                    failure.kind
+                ),
+                None => write!(f, "context compaction provider failure: {:?}", failure.kind),
+            },
             Self::Provider(s) => write!(f, "provider error: {s}"),
             Self::ProviderFailed(failure) => match failure.http_status {
                 Some(status) => write!(f, "provider failure: {:?} (HTTP {status})", failure.kind),
@@ -484,7 +494,7 @@ impl LlmError {
     /// 只提取本地 HTTP 适配器的固定状态码，不把供应商错误正文带入记录或回复。
     pub fn provider_http_status(&self) -> Option<u16> {
         let message = match self {
-            Self::ProviderFailed(failure) => {
+            Self::ProviderFailed(failure) | Self::ContextCompactionFailed(failure) => {
                 return failure
                     .http_status
                     .filter(|status| (100..=599).contains(status));
@@ -507,7 +517,9 @@ impl LlmError {
     /// Provider 给出的失败类别；旧格式的固定 HTTP 文本按状态码分类，其余返回 None。
     pub fn provider_failure(&self) -> Option<ProviderFailure> {
         match self {
-            Self::ProviderFailed(failure) => Some(*failure),
+            Self::ProviderFailed(failure) | Self::ContextCompactionFailed(failure) => {
+                Some(*failure)
+            }
             _ => ProviderFailure::http(self.provider_http_status()?),
         }
     }

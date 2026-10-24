@@ -442,6 +442,7 @@ pub struct LlmHost {
     compaction_policy: Option<eve_llm_api::ContextCompactionPolicy>,
     /// 本轮尚未调用工具时使用的较小阈值；见 `HistoryWindowResolver::casual_compaction`。
     casual_compaction_policy: Option<eve_llm_api::ContextCompactionPolicy>,
+    adaptive_limit: Option<usize>,
     execution_budget: Option<Arc<eve_llm_api::TurnBudget>>,
     tool_scope_policy: Option<Arc<dyn eve_llm_api::ToolScopePolicy>>,
     shared_steps: Option<eve_llm_api::SharedToolSteps>,
@@ -502,6 +503,7 @@ impl LlmHost {
             history_window: None,
             compaction_policy: None,
             casual_compaction_policy: None,
+            adaptive_limit: None,
             execution_budget: None,
             tool_scope_policy: None,
             shared_steps: None,
@@ -646,13 +648,32 @@ impl LlmHost {
                 .map_err(|_| LlmError::Backend("历史窗口解析回调发生异常".into()))??;
             window.validate()?;
             host.history_window = Some(window);
-            let policy = catch_unwind(AssertUnwindSafe(|| resolver.compaction()))
-                .map_err(|_| LlmError::Backend("压缩配置回调发生异常".into()))??;
+            let adaptive_limit = catch_unwind(AssertUnwindSafe(|| resolver.adaptive_limit()))
+                .map_err(|_| LlmError::Backend("上下文上限回调发生异常".into()))??;
+            if adaptive_limit.is_some_and(|limit| limit < 10000) {
+                return Err(LlmError::Configuration(
+                    "自适应上下文上限至少为 10000".into(),
+                ));
+            }
+            host.adaptive_limit = adaptive_limit;
+            let policy = if let Some(limit) = adaptive_limit {
+                Some(eve_llm_api::ContextCompactionPolicy {
+                    trigger_tokens: limit - (limit / 10).min(8192),
+                    target_tokens: limit / 2,
+                })
+            } else {
+                catch_unwind(AssertUnwindSafe(|| resolver.compaction()))
+                    .map_err(|_| LlmError::Backend("压缩配置回调发生异常".into()))??
+            };
             if let Some(policy) = policy {
                 policy.validate()?;
             }
-            let casual = catch_unwind(AssertUnwindSafe(|| resolver.casual_compaction()))
-                .map_err(|_| LlmError::Backend("压缩配置回调发生异常".into()))??;
+            let casual = if adaptive_limit.is_some() {
+                None
+            } else {
+                catch_unwind(AssertUnwindSafe(|| resolver.casual_compaction()))
+                    .map_err(|_| LlmError::Backend("压缩配置回调发生异常".into()))??
+            };
             if let Some(casual) = casual {
                 casual.validate()?;
             }
@@ -952,11 +973,19 @@ impl LlmHost {
             if let (Some(state), Some(policy), Some(service)) =
                 (compaction.as_mut(), policy, self.history_digests.as_deref())
             {
-                let fallback = self
-                    .compaction_policy
-                    .filter(|full| *full != policy)
-                    .map(|full| full.trigger_tokens);
+                let policy = if let Some(limit) = self.adaptive_limit {
+                    state.adaptive_policy(&messages, &definitions, limit)
+                } else {
+                    state.select_policy(&messages, &definitions, policy, self.compaction_policy)
+                }
+                .map_err(|error| fail(error, diagnostics.clone()))?;
+                let fallback = self.adaptive_limit.or_else(|| {
+                    self.compaction_policy
+                        .filter(|full| *full != policy)
+                        .map(|full| full.trigger_tokens)
+                });
                 if !compaction_announced
+                    && state.has_work(&messages)
                     && crate::compaction::estimate(&ModelRequest {
                         messages: messages.clone(),
                         tools: definitions.clone(),
@@ -977,6 +1006,19 @@ impl LlmHost {
                 if let Err(error) = result {
                     return Err(fail(error, diagnostics));
                 }
+            }
+            if self.adaptive_limit.is_some_and(|limit| {
+                compaction.is_none()
+                    && crate::compaction::estimate(&ModelRequest {
+                        messages: messages.clone(),
+                        tools: definitions.clone(),
+                    })
+                    .map_or(true, |size| size >= limit)
+            }) {
+                return Err(fail(
+                    LlmError::Context("上下文达到上限且没有可用摘要器；原始记录保留".into()),
+                    diagnostics,
+                ));
             }
             if let Some(frame) = &mut checkpoint {
                 frame.provider_requests = diagnostics.provider_requests + 1;
