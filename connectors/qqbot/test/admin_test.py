@@ -41,14 +41,21 @@ class AdminAcceptance(ExecutionAcceptance):
             if not results:
                 if self.text(body) == "普通读取":
                     return calls(("read", "read_file", {"path": "hello.txt"}))
-                return calls(("cmd", "run_command", {"program": "echo", "args": ["admin-ok"]}))
+                if admin:
+                    return calls(("cmd", "run_command", {"program": "echo", "args": ["admin-ok"]}))
+                return calls(("cmd", "run_command", {"program": "cat", "args": ["hello.txt"]}))
+            # 普通成员的文件与命令工具只在自己的隔离项目里生效（见普通成员工具权限），
+            # 看不到宿主工作区；绑定管理员后才在宿主工作区执行。
+            result = json.dumps(results[-1], ensure_ascii=False)
             if self.text(body) == "普通读取":
-                self.assertIn("授权", json.dumps(results[-1], ensure_ascii=False))
+                self.assertIn("error", results[-1])
+                self.assertNotIn("public source", result)
                 return text_response("读取需要管理员")
             if admin:
                 self.assertTrue(results[-1]["success"])
+                self.assertIn("admin-ok", result)
                 return text_response("管理员操作成功")
-            self.assertIn("授权", json.dumps(results[-1], ensure_ascii=False))
+            self.assertNotIn("public source", result)
             return text_response("需要管理员")
         self.callback = respond
         self.run_eve([
