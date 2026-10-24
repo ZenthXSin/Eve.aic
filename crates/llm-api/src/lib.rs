@@ -14,6 +14,7 @@ mod failure;
 mod history;
 mod image;
 mod journal;
+mod usage;
 pub use budget::{BudgetUsage, ExecutionLimits, SharedStepUsage, SharedToolSteps, TurnBudget};
 pub use failure::{ModelHealthObserver, ModelOutcome, ProviderFailure, ProviderFailureKind};
 pub use history::{
@@ -33,6 +34,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+pub use usage::{ModelUsage, ModelUsageObserver, PrefixReuse};
 
 pub type LlmFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, LlmError>> + Send + 'a>>;
 pub type ToolFuture<'a> =

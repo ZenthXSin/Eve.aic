@@ -204,6 +204,22 @@ impl PanelService for QqPanel {
                             .max_output_tokens_source
                             .map(|source| source.as_str().into()),
                     }),
+                cache: eve_web_panel_api::CacheView {
+                    recent_reported_ratio: health.cache.recent_reported_ratio(),
+                    reported_requests: health.cache.reported_requests,
+                    unreported_requests: health.cache.unreported_requests,
+                    input_tokens: health.cache.input_tokens,
+                    cached_tokens: health.cache.cached_tokens,
+                    recent_local_ratio: health.cache.recent_local_ratio(),
+                    local_requests: health.cache.local_requests,
+                    last_break: health.cache.last_break.and_then(|reuse| {
+                        Some(eve_web_panel_api::PrefixBreakView {
+                            first_changed_message: reuse.first_changed_message?,
+                            messages: reuse.messages,
+                            tools_changed: reuse.tools_changed,
+                        })
+                    }),
+                },
                 role,
             })
             .collect();

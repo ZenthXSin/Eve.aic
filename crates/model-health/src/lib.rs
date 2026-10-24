@@ -6,10 +6,13 @@
 //! 包装层只观察结局，不改变请求、不重试、不切换模型。
 use eve_llm_api::{
     LlmError, LlmFuture, LlmModelResolver, LlmProvider, ModelHealthObserver, ModelOutcome,
-    ModelRequest, ModelResponse, ModelSelection, ModelTextSink,
+    ModelRequest, ModelResponse, ModelSelection, ModelTextSink, ModelUsage, ModelUsageObserver,
+    PrefixReuse,
 };
+mod prefix;
+pub use prefix::{PREFIX_MEMORY, PrefixProbe, estimate_tokens};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -30,6 +33,56 @@ pub struct RoleHealth {
     pub last_failure: Option<(ModelOutcome, u64)>,
     /// 最近一次结局是否成功；没有任何结局时为 None。按记录顺序，不依赖时钟。
     pub last_succeeded: Option<bool>,
+    /// 输入用量与前缀缓存统计。
+    pub cache: CacheStats,
+}
+
+/// 计入“最近”比例的请求数。
+pub const RECENT_REQUESTS: usize = 32;
+
+/// 一个用途的提示缓存统计：提供方报告的命中，与宿主本地估算的可复用前缀。
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CacheStats {
+    /// 响应里报告了缓存命中数的请求。
+    pub reported_requests: u64,
+    /// 成功但没有报告缓存命中数的请求。
+    pub unreported_requests: u64,
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+    /// 最近报告的 (输入, 命中)，至多 RECENT_REQUESTS 个。
+    pub recent_reported: VecDeque<(u64, u64)>,
+    pub local_requests: u64,
+    pub local_estimated_tokens: u64,
+    pub local_reused_tokens: u64,
+    /// 最近本地估算的 (总量, 可复用)，至多 RECENT_REQUESTS 个。
+    pub recent_local: VecDeque<(u64, u64)>,
+    /// 最近一次前缀没能完全复用的请求。
+    pub last_break: Option<PrefixReuse>,
+}
+
+fn push_recent(queue: &mut VecDeque<(u64, u64)>, value: (u64, u64)) {
+    queue.push_back(value);
+    if queue.len() > RECENT_REQUESTS {
+        queue.pop_front();
+    }
+}
+
+impl CacheStats {
+    /// 最近窗口的提供方命中率（万分比）；没有报告时为 None。
+    pub fn recent_reported_ratio(&self) -> Option<u32> {
+        ratio(&self.recent_reported)
+    }
+    /// 最近窗口的本地可复用比例（万分比）。
+    pub fn recent_local_ratio(&self) -> Option<u32> {
+        ratio(&self.recent_local)
+    }
+}
+
+fn ratio(queue: &VecDeque<(u64, u64)>) -> Option<u32> {
+    let (total, hit) = queue
+        .iter()
+        .fold((0u64, 0u64), |(t, h), (a, b)| (t + a, h + b));
+    (total > 0).then(|| (hit.min(total) as u128 * 10_000 / total as u128) as u32)
 }
 
 /// 进程内的健康记录；先登记的用途在没有请求前也会出现在快照中。
@@ -89,6 +142,53 @@ impl ModelHealthObserver for HealthBook {
                 health.last_failure = Some((failure, at_ms));
             }
         }
+    }
+}
+
+impl HealthBook {
+    fn with_role(&self, role: &str, update: impl FnOnce(&mut CacheStats)) {
+        let Ok(mut roles) = self.roles.lock() else {
+            return;
+        };
+        if !roles.contains_key(role) && roles.len() >= MAX_ROLES {
+            return;
+        }
+        update(&mut roles.entry(role.to_string()).or_default().cache);
+    }
+}
+
+impl ModelUsageObserver for HealthBook {
+    fn reported(&self, role: &str, usage: ModelUsage) {
+        self.with_role(role, |cache| {
+            match (usage.input_tokens, usage.cached_input_tokens) {
+                (Some(input), Some(cached)) => {
+                    cache.reported_requests = cache.reported_requests.saturating_add(1);
+                    cache.input_tokens = cache.input_tokens.saturating_add(input);
+                    cache.cached_tokens = cache.cached_tokens.saturating_add(cached.min(input));
+                    push_recent(&mut cache.recent_reported, (input, cached.min(input)));
+                }
+                _ => cache.unreported_requests = cache.unreported_requests.saturating_add(1),
+            }
+        });
+    }
+
+    fn prefix(&self, role: &str, reuse: PrefixReuse) {
+        self.with_role(role, |cache| {
+            cache.local_requests = cache.local_requests.saturating_add(1);
+            cache.local_estimated_tokens = cache
+                .local_estimated_tokens
+                .saturating_add(reuse.estimated_tokens);
+            cache.local_reused_tokens = cache
+                .local_reused_tokens
+                .saturating_add(reuse.reused_tokens);
+            push_recent(
+                &mut cache.recent_local,
+                (reuse.estimated_tokens, reuse.reused_tokens),
+            );
+            if reuse.first_changed_message.is_some() {
+                cache.last_break = Some(reuse);
+            }
+        });
     }
 }
 

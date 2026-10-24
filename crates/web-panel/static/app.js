@@ -383,6 +383,16 @@
       if (role.state === "unverified") parts.push("本进程还没有这项用途的请求");
       const limit = role.output_limit;
       parts.push(limit ? limitText(limit.max_output_tokens, limit.key, limit.source) : "单次输出上限无法读取");
+      const cache = role.cache;
+      if (cache && (cache.reported_requests > 0 || cache.local_requests > 0)) {
+        const percent = (value) => `${(value / 100).toFixed(1)}%`;
+        parts.push(Number.isInteger(cache.recent_reported_ratio)
+          ? `缓存命中（最近）：${percent(cache.recent_reported_ratio)}`
+          : "缓存命中：服务未报告");
+        if (Number.isInteger(cache.recent_local_ratio)) parts.push(`可复用前缀（本地估算）：${percent(cache.recent_local_ratio)}`);
+        const broken = cache.last_break;
+        if (broken) parts.push(broken.tools_changed ? "最近一次前缀断点：工具定义变化" : `最近一次前缀断点：第 ${count(broken.first_changed_message + 1)}/${count(broken.messages)} 条消息`);
+      }
       row.append(node("strong", "", text(roleLabels[role.role], role.role)), node("span", `badge ${style}`.trim(), label), node("span", "role-detail", parts.join(" · ")));
       list.append(row);
     }

@@ -16,9 +16,15 @@ pub(crate) struct ChatStream {
     id: Option<String>,
     text: Option<String>,
     calls: BTreeMap<u64, Call>,
+    usage: Option<eve_llm_api::ModelUsage>,
 }
 
 impl ChatStream {
+    /// 终态之前任一分块携带的用量；服务不发送时为 None。
+    pub(crate) fn usage(&self) -> Option<eve_llm_api::ModelUsage> {
+        self.usage
+    }
+
     pub(crate) fn event(
         &mut self,
         name: &str,
@@ -46,6 +52,9 @@ impl ChatStream {
             .get("choices")
             .and_then(Value::as_array)
             .ok_or_else(protocol)?;
+        if let Some(usage) = value.get("usage").and_then(crate::usage::from_usage) {
+            self.usage = Some(usage);
+        }
         if choices.is_empty() && value.get("usage").is_some_and(Value::is_object) {
             return Ok(None);
         }

@@ -94,6 +94,28 @@ pub struct ModelRoleHealth {
     pub last_failure: Option<ModelFailureView>,
     /// 该用途的单次输出上限；配置读取失败时为空。
     pub output_limit: Option<OutputLimitView>,
+    /// 提示缓存统计；本进程还没有请求时各项为零。
+    pub cache: CacheView,
+}
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CacheView {
+    /// 最近请求中提供方报告的缓存命中比例（万分比）；服务不报告时为空。
+    pub recent_reported_ratio: Option<u32>,
+    pub reported_requests: u64,
+    pub unreported_requests: u64,
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+    /// 最近请求中本地估算可复用的前缀比例（万分比）。
+    pub recent_local_ratio: Option<u32>,
+    pub local_requests: u64,
+    /// 最近一次前缀没能完全复用的位置：消息下标、总消息数与工具是否变化。
+    pub last_break: Option<PrefixBreakView>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct PrefixBreakView {
+    pub first_changed_message: usize,
+    pub messages: usize,
+    pub tools_changed: bool,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelFailureView {

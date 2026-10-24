@@ -11,6 +11,15 @@ use std::{
     time::Duration,
 };
 
+/// 进程内的用量观察者（模型健康记录）；宿主启动时设置一次，之后解析出的 Provider 都会记录
+/// 提供方报告的缓存命中与本地前缀复用。未设置时不记录。
+static USAGE: std::sync::OnceLock<Arc<dyn eve_llm_api::ModelUsageObserver>> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn observe_usage(observer: Arc<dyn eve_llm_api::ModelUsageObserver>) {
+    let _ = USAGE.set(observer);
+}
+
 pub(crate) fn timing_enabled() -> bool {
     std::env::var("EVE_TRACE_DIALOGUE_TIMING").is_ok_and(|v| matches!(v.as_str(), "1" | "true"))
 }
@@ -278,7 +287,16 @@ impl LlmModelResolver for CoreModelResolver {
         if matches!(self.use_name.as_deref(), Some("dialogue" | "digest")) && timing_enabled() {
             provider = provider.with_timing_diagnostics();
         }
-        let provider: Arc<dyn eve_llm_api::LlmProvider> = Arc::new(provider);
+        let role = self.use_name.as_deref().unwrap_or("dialogue");
+        let usage = USAGE.get().cloned();
+        if let Some(observer) = &usage {
+            provider = provider.with_usage_observer(observer.clone(), role);
+        }
+        let mut provider: Arc<dyn eve_llm_api::LlmProvider> = Arc::new(provider);
+        // 探针紧贴实际发出的请求（在接话约束等改写之后），只测量不修改。
+        if let Some(observer) = usage {
+            provider = Arc::new(eve_model_health::PrefixProbe::new(provider, role, observer));
+        }
         let selected = ModelSelection {
             provider_timeout,
             provider: if captured.natural_style {

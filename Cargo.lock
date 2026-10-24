@@ -867,6 +867,8 @@ name = "eve-model-health"
 version = "0.1.0"
 dependencies = [
  "eve-llm-api",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
