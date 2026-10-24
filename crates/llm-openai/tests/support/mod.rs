@@ -83,7 +83,7 @@ impl Server {
                                     .strip_prefix("content-length:")
                                     .map(|s| s.trim().parse().unwrap())
                             })
-                            .unwrap();
+                            .unwrap_or(0);
                         while bytes.len() < header_end + len {
                             let mut chunk = [0; 4096];
                             let count = socket.read(&mut chunk).await.unwrap();
@@ -92,8 +92,12 @@ impl Server {
                         }
                         Captured {
                             headers,
-                            body: serde_json::from_slice(&bytes[header_end..header_end + len])
-                                .unwrap(),
+                            body: if len == 0 {
+                                Value::Null
+                            } else {
+                                serde_json::from_slice(&bytes[header_end..header_end + len])
+                                    .unwrap()
+                            },
                         }
                     })
                     .await

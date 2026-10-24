@@ -73,6 +73,19 @@ class InterestAcceptance(unittest.TestCase):
                     outer.errors.append(traceback.format_exc())
                     self.send_error(500)
 
+            def do_GET(self):
+                # OpenAI 兼容的模型列表；只有测试设置了 model_list 才提供。
+                models = getattr(outer, "model_list", None)
+                if self.path != "/v1/models" or models is None:
+                    self.send_error(404)
+                    return
+                encoded = json.dumps({"object": "list", "data": [{"id": m} for m in models]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
             def respond(self):
                 assert self.path == "/v1/chat/completions"
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -99,6 +112,8 @@ class InterestAcceptance(unittest.TestCase):
                 status = 503 if failing else 200
                 if hasattr(outer, "http_status"):
                     status = outer.http_status(kind, number) or status
+                if hasattr(outer, "status_for_body"):
+                    status = outer.status_for_body(body) or status
                 text = outer.reply(kind, decoded, latest)
                 response = ({"error": {"message": "local provider unavailable", "type": "test_error"}}
                             if status != 200 else {"choices": [{"index": 0, "finish_reason": "stop",

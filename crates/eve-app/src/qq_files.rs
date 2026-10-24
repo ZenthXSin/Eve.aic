@@ -559,24 +559,47 @@ impl Tool for SendFileTool {
 /// 用主模型看当前会话最近一条带附件消息里的图片。模型、端点和凭据都来自同一份主模型配置。
 pub(crate) struct DescribeImageTool {
     inbox: std::sync::Arc<AttachmentInbox>,
-    settings: std::sync::Arc<dyn ConfigService>,
+    /// 配置服务在核心安装后才可用，由组合层随后注入；之前调用如实报告未就绪。
+    pub(crate) settings: std::sync::OnceLock<std::sync::Arc<dyn ConfigService>>,
     api_key: String,
+    /// 本进程里最近一次看图成功的模型，按端点区分；只在内存里，重启后重新从主模型试起。
+    learned: std::sync::Mutex<Option<(String, String)>>,
 }
 
 impl DescribeImageTool {
-    pub(crate) fn new(
-        inbox: std::sync::Arc<AttachmentInbox>,
-        settings: std::sync::Arc<dyn ConfigService>,
-        api_key: String,
-    ) -> Self {
+    pub(crate) fn new(inbox: std::sync::Arc<AttachmentInbox>, api_key: String) -> Self {
         Self {
             inbox,
-            settings,
+            settings: std::sync::OnceLock::new(),
             api_key,
+            learned: std::sync::Mutex::new(None),
         }
     }
     const MAX_BYTES: u64 = 8 * 1024 * 1024;
     const QUESTION_LIMIT: usize = 500;
+    const MODEL_LIMIT: usize = 200;
+    /// 失败时列给模型挑选的候选数。
+    const CANDIDATES: usize = 60;
+}
+
+fn valid_model_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= DescribeImageTool::MODEL_LIMIT
+        && !name.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+/// 名称里带常见视觉标记的模型排在前面，其余保持服务返回的顺序；只是排序提示，不代表能力。
+fn rank_candidates(mut models: Vec<String>, tried: &str) -> Vec<String> {
+    const HINTS: [&str; 10] = [
+        "vision", "vl", "4o", "omni", "gemini", "claude", "4v", "image", "gpt-4.1", "gpt-5",
+    ];
+    models.retain(|model| model != tried);
+    models.sort_by_key(|model| {
+        let lower = model.to_ascii_lowercase();
+        !HINTS.iter().any(|hint| lower.contains(hint))
+    });
+    models.truncate(DescribeImageTool::CANDIDATES);
+    models
 }
 
 fn vision_prompt(question: Option<&str>) -> String {
@@ -590,12 +613,13 @@ impl Tool for DescribeImageTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "describe_image".into(),
-            description: "用主模型描述当前会话最近一条带附件消息里的第 index 个图片附件（从 1 起，默认 1）。只解析本条已记录的图片，下载后以 data URL 发给与主模型相同的模型、端点和协议。question 可选，最多 500 字；缺省只做客观描述。返回的是模型描述，不是像素级事实，不能据此声称宿主看见了图片。非图片、越界或下载失败会返回错误，不会假装成功。".into(),
+            description: "看当前会话最近一条带附件消息里的第 index 个图片附件（从 1 起，默认 1），表情包、截图都可以。用户发图而你看不到时，先调用它自己看，不要干等对方解释。下载后以 data URL 发给与主模型相同的端点和协议；model 可选，缺省用本进程最近看图成功的模型，没有则用主模型。所选模型看不了图时返回 seen=false 和同一服务里的候选模型（名称带视觉标记的在前），可以换 model 再试；都不行就如实告诉用户没看到。question 可选，最多 500 字；缺省只做客观描述。返回的是模型描述，不是像素级事实。非图片、越界或下载失败会返回错误，不会假装成功。".into(),
             argument_schema: json!({
                 "type": "object",
                 "properties": {
                     "index": {"type": "integer", "minimum": 1, "maximum": 4},
-                    "question": {"type": "string", "maxLength": 500}
+                    "question": {"type": "string", "maxLength": 500},
+                    "model": {"type": "string", "maxLength": 200}
                 },
                 "additionalProperties": false
             }),
@@ -611,9 +635,14 @@ impl Tool for DescribeImageTool {
         let object = value.as_object().ok_or_else(|| invalid("参数必须是对象"))?;
         if object
             .keys()
-            .any(|key| !matches!(key.as_str(), "index" | "question"))
+            .any(|key| !matches!(key.as_str(), "index" | "question" | "model"))
         {
-            return Err(invalid("参数只能包含 index 与 question"));
+            return Err(invalid("参数只能包含 index、question 与 model"));
+        }
+        if let Some(model) = object.get("model")
+            && !model.as_str().is_some_and(valid_model_name)
+        {
+            return Err(invalid("model 必须是不超过 200 字节、不含空白的模型名"));
         }
         if object
             .get("index")
@@ -703,16 +732,18 @@ impl Tool for DescribeImageTool {
                     Self::MAX_BYTES
                 )));
             }
-            let snapshot = self
+            let settings = self
                 .settings
+                .get()
+                .ok_or_else(|| failed("识图配置尚未就绪"))?;
+            let snapshot = settings
                 .snapshot(crate::config::OPENAI_NAMESPACE, 1)
                 .map_err(|error| failed(format!("主模型配置不可用：{error}")))?;
             let role = crate::config::configured_role(&snapshot)
                 .map_err(|error| failed(format!("主模型配置不可用：{error}")))?;
             let primary = match role {
                 Some(role) => {
-                    let models = self
-                        .settings
+                    let models = settings
                         .snapshot(
                             eve_config_api::MODELS_NAMESPACE,
                             eve_config_api::MODELS_SCHEMA_VERSION,
@@ -729,27 +760,68 @@ impl Tool for DescribeImageTool {
                 }
                 None => None,
             };
-            let config = crate::config::provider_config(&snapshot, primary.as_ref())
+            let mut config = crate::config::provider_config(&snapshot, primary.as_ref())
                 .map_err(|error| failed(format!("主模型配置不可用：{error}")))?;
-            let model = config.model.clone();
+            let primary_model = config.model.clone();
+            let endpoint = config.responses_url.clone();
+            let learned = self
+                .learned
+                .lock()
+                .ok()
+                .and_then(|learned| learned.clone())
+                .filter(|(known, _)| *known == endpoint)
+                .map(|(_, model)| model);
+            let requested = call.arguments.get("model").and_then(Value::as_str);
+            let model = requested
+                .map(str::to_owned)
+                .or(learned)
+                .unwrap_or_else(|| primary_model.clone());
+            config.model = model.clone();
             let protocol = match config.protocol {
                 eve_llm_openai::OpenAiProtocol::ChatCompletions => "chat",
                 eve_llm_openai::OpenAiProtocol::Responses => "responses",
             };
             let provider = OpenAiProvider::new(config, &self.api_key)
-                .map_err(|error| failed(format!("主模型不可用：{error}")))?;
-            let description = provider
+                .map_err(|error| failed(format!("识图模型不可用：{error}")))?;
+            match provider
                 .describe_image(&vision_prompt(question), &content_type, &bytes)
                 .await
-                .map_err(|error| failed(format!("识图请求失败：{error}")))?;
-            Ok(json!({
-                "description": description,
-                "model": model,
-                "protocol": protocol,
-                "content_type": content_type,
-                "bytes": bytes.len(),
-                "note": "这是主模型对图片的文字描述，不是像素级事实，宿主并没有看见图片。"
-            }))
+            {
+                Ok(description) => {
+                    if let Ok(mut learned) = self.learned.lock() {
+                        *learned = Some((endpoint, model.clone()));
+                    }
+                    Ok(json!({
+                        "seen": true,
+                        "description": description,
+                        "model": model,
+                        "primary_model": primary_model,
+                        "protocol": protocol,
+                        "content_type": content_type,
+                        "bytes": bytes.len(),
+                        "note": if model == primary_model {
+                            "这是主模型对图片的文字描述，不是像素级事实，宿主并没有看见图片。"
+                        } else {
+                            "这是同一服务里另一个模型对图片的文字描述，不是像素级事实。本进程之后看图默认先用这个模型；要长期使用，可以告诉主人在 runtime.vision 或模型配置里设定。"
+                        }
+                    }))
+                }
+                // 图片本身已校验，失败归因于所选模型或服务；列出同一服务的候选，交给模型自己换着试。
+                Err(error) => {
+                    let candidates = match provider.list_models(500).await {
+                        Ok(models) => json!(rank_candidates(models, &model)),
+                        Err(list_error) => json!(format!("模型列表不可用：{list_error}")),
+                    };
+                    Ok(json!({
+                        "seen": false,
+                        "model": model,
+                        "primary_model": primary_model,
+                        "error": error.to_string(),
+                        "candidates": candidates,
+                        "next": "这个模型没能看图。可以从 candidates 里挑一个（名称带 vision、vl 等标记的更可能支持图像）用 model 参数再试；都不行就如实告诉用户没看到，不要猜图片内容。"
+                    }))
+                }
+            }
         })
     }
 }
@@ -881,7 +953,8 @@ mod tests {
             "session",
             image_message("https://files.example/a.png", "application/pdf"),
         );
-        let tool = DescribeImageTool::new(inbox.clone(), unavailable_settings(), "test-key".into());
+        let tool = DescribeImageTool::new(inbox.clone(), "test-key".into());
+        let _ = tool.settings.set(unavailable_settings());
         let error = tool
             .execute(call(json!({"index": 1})), scope("session"))
             .await
@@ -903,6 +976,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("链接不合法"), "{error}");
+    }
+
+    #[test]
+    fn describe_image_validates_model_and_ranks_vision_candidates_first() {
+        let tool = DescribeImageTool::new(
+            std::sync::Arc::new(AttachmentInbox::new()),
+            "test-key".into(),
+        );
+        assert!(
+            tool.validate_arguments(&json!({"model": "qwen-vl-max"}))
+                .is_ok()
+        );
+        for bad in [
+            json!({"model": ""}),
+            json!({"model": "a b"}),
+            json!({"model": 3}),
+            json!({"model": "x".repeat(201)}),
+            json!({"other": 1}),
+        ] {
+            assert!(tool.validate_arguments(&bad).is_err(), "{bad}");
+        }
+        let ranked = rank_candidates(
+            [
+                "text-only",
+                "deepseek-chat",
+                "qwen-vl-max",
+                "gpt-4o",
+                "text-only",
+            ]
+            .map(String::from)
+            .to_vec(),
+            "text-only",
+        );
+        assert_eq!(ranked, ["qwen-vl-max", "gpt-4o", "deepseek-chat"]);
+        let many = rank_candidates((0..100).map(|i| format!("m{i}")).collect(), "none");
+        assert_eq!(many.len(), DescribeImageTool::CANDIDATES);
     }
 
     struct UnavailableSettings;

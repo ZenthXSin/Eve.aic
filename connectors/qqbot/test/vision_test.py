@@ -15,7 +15,7 @@ import unittest
 import zlib
 
 import developer_tools_test as developer
-from dialogue_tools_test import text_response
+from dialogue_tools_test import text_response, tool_response
 
 
 def png(secret, padding=0):
@@ -190,6 +190,51 @@ class VisionAcceptance(developer.DeveloperAcceptance):
         self.assertEqual(len(self.fetches), fetched)
         users = [m["content"] for m in body["messages"] if m["role"] == "user"]
         self.assertTrue(any("记住这张" in u and "收到 1 个图片附件" in u for u in users))
+
+
+    def test_sticker_without_vision_is_looked_at_by_trying_another_model_on_the_same_service(self):
+        """未开启视觉、主模型看不了图：Eve 自己调用 describe_image，拿到同一服务的候选后换模型看懂；
+        本进程之后的图片直接用看图成功的模型。"""
+        self.files = {"/cat.png": ("image/png", png("猫猫探头")), "/dog.png": ("image/png", png("狗狗点头"))}
+        self.model_list = ["text-only-mini", "deepseek-chat", "qwen-vl-max", "deepseek-chat"]
+        describes = []
+
+        def status_for_body(body):
+            if images_in(body):
+                describes.append(body["model"])
+                return 400 if body["model"] != "qwen-vl-max" else None
+            return None
+        self.status_for_body = status_for_body
+
+        def call(arguments, suffix):
+            response = tool_response([("describe_image", arguments)])
+            response["choices"][0]["message"]["tool_calls"][0]["id"] += suffix
+            return response
+
+        def respond(body):
+            found = images_in(body)
+            if found:
+                return text_response("图里是" + secret_of(found[0][1]))
+            results = self.results(body)
+            if not results:
+                return call({}, f"-{self.chat_rounds}")
+            last = results[-1]
+            if not last["seen"]:
+                self.assertEqual(last["candidates"][0], "qwen-vl-max")
+                self.assertNotIn(last["model"], last["candidates"])
+                return call({"model": last["candidates"][0]}, f"-{self.chat_rounds}")
+            return text_response("看到了 " + last["description"])
+        self.callback = respond
+        self.vision([
+            *self.send(self.image_message("sticker", "", ["/cat.png"], "看到了 图里是猫猫探头")),
+            *self.send(self.image_message("again", "这个呢", ["/dog.png"], "看到了 图里是狗狗点头"))],
+            enabled=False)
+        primary = next(r["body"]["model"] for r in self.requests if r["kind"] == "chat")
+        self.assertEqual(describes, [primary, "qwen-vl-max", "qwen-vl-max"])
+        bodies = [r["body"] for r in self.requests if r["kind"] == "chat" and not images_in(r["body"])]
+        self.assertIn("有识图工具就先自己调用去看", bodies[0]["messages"][-1]["content"])
+        stored = self.stored_text()
+        self.assertNotIn("base64", stored)
 
 
 if __name__ == "__main__":
