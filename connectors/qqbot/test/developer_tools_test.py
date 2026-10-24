@@ -142,20 +142,26 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         expression = self.documents().get("eve.training", {}).get("expression.v1", {"scopes": []})
         self.assertEqual(expression["scopes"], [])
 
-    def test_other_qq_user_cannot_use_files_commands_or_github(self):
+    def test_other_qq_user_has_project_tools_but_cannot_read_host_or_use_private_github(self):
         def respond(body):
             if not self.results(body):
                 return tool_response([("read_file", {"path": "README.md"}),
-                    ("run_command", {"program": sys.executable, "args": ["-c", "open('forbidden','w').write('bad')"]}),
+                    ("run_command", {"program": "sh", "args": ["-c", "printf member-project > project-output"]}),
                     ("github_api", {"method": "GET", "repository": "test/repo"})])
             self.assertEqual(len(self.results(body)), 3)
-            for result in self.results(body):
-                self.assertIn("授权", json.dumps(result, ensure_ascii=False))
+            read, command, github = self.results(body)
+            self.assertIn('error', read)
+            self.assertNotIn('真实源码测试', json.dumps(read, ensure_ascii=False))
+            if sys.platform == 'linux' and pathlib.Path('/usr/bin/bwrap').is_file():
+                self.assertTrue(command['success'],command)
+            else:
+                self.assertIn('error',command)
+            self.assertIn('授权',json.dumps(github,ensure_ascii=False))
             return text_response("未执行越权操作")
         self.callback = respond
         self.enabled(self.send(self.message("foreign", "使用宿主工具", user="user-2", expected="未执行越权操作")))
-        self.assertFalse((self.source / "forbidden").exists())
-        self.assertFalse((self.work / "state/developer-tools/operations.jsonl").exists())
+        self.assertFalse((self.source / "project-output").exists())
+        self.assertTrue((self.work / "state/developer-tools/operations.jsonl").exists())
 
     def test_explicit_unlimited_runs_forty_batches_and_restart_never_replays_them(self):
         config = json.loads(self.developer_config.read_text())
