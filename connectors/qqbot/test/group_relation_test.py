@@ -100,12 +100,12 @@ class GroupRelationAcceptance(group_chat_test.GroupChatAcceptance):
 
     def test_full_answered_context_survives_restart_and_related_followup_uses_it(self):
         self.classification=lambda state:('eve_question','none',0.99,True) if not state['exchanges'] else ('related','t0',0.99,True)
-        self.run_eve([self.observation('original','Eve，Mindustry 传送带怎么接',mentioned=True),
-            *self.send(self.message('original','Eve，Mindustry 传送带怎么接',expected='这个思路可以试试',scope='group')),
+        self.run_eve([self.observation('original','请问 Eve，Mindustry 传送带怎么接',mentioned=True),
+            *self.send(self.message('original','请问 Eve，Mindustry 传送带怎么接',expected='这个思路可以试试',scope='group')),
             *self.checkpoint('saved')],checkpoints={'saved':lambda:self.wait_judgments(1)})
         self.run_eve([self.observation('followup','那逻辑处理器呢',user='another-member'),*self.checkpoint('sent')],checkpoints={'sent':self.wait_outbound})
         latest=self.jev_requests[-1]['state']
-        self.assertEqual(latest['exchanges'][0]['question']['text'],'Eve，Mindustry 传送带怎么接')
+        self.assertEqual(latest['exchanges'][0]['question']['text'],'请问 Eve，Mindustry 传送带怎么接')
         self.assertEqual(latest['exchanges'][0]['eve_reply'],'这个思路可以试试')
         self.assertEqual(len(self.kind('chime')),0,'明确关系不再请求主模型插话判断')
         prompt='\n'.join(m.get('content','') for m in self.kind('chat')[-1]['body']['messages'])

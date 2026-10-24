@@ -41,6 +41,11 @@ fn hash(parts: &[&str]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect()
 }
+fn name_wakeup(text: &str) -> bool {
+    text.trim_start()
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("eve"))
+}
 struct Event {
     message: GroupMessage,
     ordinary: bool,
@@ -192,13 +197,17 @@ impl QqGroupObserver for Group {
             eprintln!("EVE_GROUP expression_learning_unavailable");
         }
         // 后台排队或容量耗尽之前先保存待判断状态。
-        if let Some(relations) = self.relations.get() {
+        if !name_wakeup(&message.text)
+            && let Some(relations) = self.relations.get()
+        {
             relations.store.stage(&event).map_err(failed)?;
         }
         self.sender
             .try_send(Event {
                 message: event,
-                ordinary: mentions_me || message.text.trim().is_empty(),
+                ordinary: mentions_me
+                    || name_wakeup(&message.text)
+                    || message.text.trim().is_empty(),
             })
             .map_err(|error| {
                 let event = error.into_inner();
@@ -569,6 +578,11 @@ impl Background {
                     group: group.clone(),
                     speaker: event.message.speaker.clone(),
                 };
+                // 名字前缀已由桥接送入普通对话；这里仅保留群观察，不能再判断或补答。
+                if event.ordinary && name_wakeup(&event.message.text) {
+                    let _ = engine.observe_only(event.message, &outlet).await;
+                    continue;
+                }
                 if jobs.len() >= 8 {
                     if let Some(relations) = &relations {
                         let _ = relations.store.record(
