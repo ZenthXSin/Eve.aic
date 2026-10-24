@@ -363,6 +363,72 @@ impl PeopleDirectory for PeopleController {
         Self::commit(&mut inner, document)?;
         Ok(true)
     }
+    fn linked_impressions(
+        &self,
+        participant: &str,
+        links: &dyn PersonLinks,
+    ) -> PluginResult<LinkedImpressions> {
+        if !valid_identity(participant) {
+            return Err(unavailable());
+        }
+        // 先复制候选再释放锁：宿主判断身份时会读取配置与路由，不在持锁时调用。
+        let (own, candidates) = {
+            let inner = self.inner.lock().map_err(|_| unavailable())?;
+            let loaded = inner.as_ref().ok_or_else(unavailable)?;
+            let people = &loaded.document.people;
+            let Some(current) = people.iter().find(|p| p.scope.participant == participant) else {
+                return Ok(LinkedImpressions::default());
+            };
+            let own: BTreeSet<String> =
+                current.impressions.iter().map(|i| i.text.clone()).collect();
+            let candidates: BTreeMap<String, (Option<Scene>, Vec<Impression>)> = people
+                .iter()
+                .filter(|p| p.scope.participant != participant && !p.impressions.is_empty())
+                .map(|p| {
+                    (
+                        p.scope.participant.clone(),
+                        (p.presence.as_ref().map(|v| v.scene), p.impressions.clone()),
+                    )
+                })
+                .collect();
+            (own, candidates)
+        };
+        if candidates.is_empty() {
+            return Ok(LinkedImpressions::default());
+        }
+        let ids: Vec<String> = candidates.keys().cloned().collect();
+        let linked: BTreeSet<String> = links.linked(participant, &ids)?.into_iter().collect();
+        if linked.iter().any(|id| !candidates.contains_key(id)) {
+            return Err(PluginError::Task("跨会话印象授权返回了未知来源".into()));
+        }
+        let mut seen = own;
+        let mut items = Vec::new();
+        for id in &linked {
+            let (scene, impressions) = &candidates[id];
+            for impression in impressions {
+                items.push(LinkedImpression {
+                    text: impression.text.clone(),
+                    quote: impression.quote.clone(),
+                    updated_at_ms: impression.updated_at_ms,
+                    scene: *scene,
+                });
+            }
+        }
+        // 新的在前；同一说法在多处出现只留最新一条，也不重复本会话已有的印象。
+        items.sort_by(|a, b| {
+            b.updated_at_ms
+                .cmp(&a.updated_at_ms)
+                .then_with(|| a.text.cmp(&b.text))
+        });
+        items.retain(|item| seen.insert(item.text.clone()));
+        let truncated = items.len() > MAX_LINKED_IMPRESSIONS;
+        items.truncate(MAX_LINKED_IMPRESSIONS);
+        Ok(LinkedImpressions {
+            items,
+            sources: linked.len(),
+            truncated,
+        })
+    }
 }
 pub struct PeoplePlugin {
     manifest: PluginManifest,

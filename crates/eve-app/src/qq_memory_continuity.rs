@@ -182,3 +182,29 @@ impl MemoryContinuityPolicy for Policy {
         Ok(grants)
     }
 }
+
+/// 人物印象沿用同一套跨会话授权：QQ 参与者摘要同时是该会话记忆作用域的 session_id 与 user_id。
+/// 授权里的“只读偏好”与“含经历”两档对印象不作区分：只要来源可见，就可读取其中此人自述的事。
+pub(crate) struct PersonLinks(pub(crate) Policy);
+impl eve_people_api::PersonLinks for PersonLinks {
+    fn linked(
+        &self,
+        current: &str,
+        candidates: &[String],
+    ) -> eve_plugin_api::PluginResult<Vec<String>> {
+        let scope = |id: &str| MemoryScope {
+            channel: "qq".into(),
+            session_id: id.into(),
+            user_id: id.into(),
+        };
+        let candidates: Vec<_> = candidates.iter().map(|id| scope(id)).collect();
+        let grants = self
+            .0
+            .grants(&scope(current), &candidates)
+            .map_err(|error| eve_plugin_api::PluginError::Task(error.to_string()))?;
+        Ok(grants
+            .into_iter()
+            .map(|grant| grant.scope.user_id)
+            .collect())
+    }
+}

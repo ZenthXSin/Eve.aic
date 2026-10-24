@@ -81,6 +81,34 @@ pub trait ImpressionLearner: Send + Sync {
     fn learn(&self, batch: ImpressionBatch) -> PluginFuture<'_, Vec<ImpressionDraft>>;
 }
 
+/// 跨会话合并时至多带上的他处印象条数。
+pub const MAX_LINKED_IMPRESSIONS: usize = 8;
+
+/// 同一个人在其他会话里说过的事；`scene` 是来源会话的场景，旧记录没有来访信息时为空。
+/// 只读，删除须回到来源会话。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LinkedImpression {
+    pub text: String,
+    pub quote: String,
+    pub updated_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scene: Option<Scene>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct LinkedImpressions {
+    pub items: Vec<LinkedImpression>,
+    /// 经授权的来源参与者数（其印象可能都与本会话重复）。
+    pub sources: usize,
+    pub truncated: bool,
+}
+
+/// 由可信宿主决定其他参与者中哪些与当前发言者是同一个人、且在当前会话可见。
+/// 只能依据已校验的平台身份与明确绑定，不依据昵称、自称或对话文字；返回值必须是 `candidates` 的子集。
+pub trait PersonLinks: Send + Sync {
+    fn linked(&self, current: &str, candidates: &[String]) -> PluginResult<Vec<String>>;
+}
+
 pub fn valid_impression_text(value: &str) -> bool {
     let count = value.chars().count();
     (1..=MAX_IMPRESSION_CHARS).contains(&count)
@@ -169,5 +197,14 @@ pub trait PeopleDirectory: Send + Sync {
     }
     fn forget_impression(&self, _participant: &str, _id: &str) -> PluginResult<bool> {
         Ok(false)
+    }
+    /// 只读：当前发言者在其他会话中、经 `links` 授权的印象。去掉与本会话印象相同的，
+    /// 按更新时间从新到旧至多 `MAX_LINKED_IMPRESSIONS` 条。不实现时为空。
+    fn linked_impressions(
+        &self,
+        _participant: &str,
+        _links: &dyn PersonLinks,
+    ) -> PluginResult<LinkedImpressions> {
+        Ok(LinkedImpressions::default())
     }
 }

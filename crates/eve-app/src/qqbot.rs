@@ -1531,6 +1531,14 @@ async fn run_qqbot_composed(
             wrapped: context,
             people: people.clone(),
             registry: registry.clone(),
+            // 候选都是 QQ 参与者，不涉及跨通道授权。
+            links: Arc::new(crate::qq_memory_continuity::PersonLinks(
+                crate::qq_memory_continuity::Policy {
+                    registry: registry.clone(),
+                    conversations: conversations.clone(),
+                    unified: None,
+                },
+            )),
         });
         let context: Arc<dyn ContextAssembler> = Arc::new(crate::qq_host_facts::HostFactsContext {
             wrapped: context,
