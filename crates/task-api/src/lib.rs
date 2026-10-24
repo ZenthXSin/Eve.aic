@@ -29,7 +29,7 @@ pub const MAX_FAILURE_BYTES: usize = 512;
 /// 每个任务的步数（工具调用次数）上限的取值范围；默认值由宿主配置。
 pub const MIN_STEPS: u32 = 1;
 pub const MAX_STEPS: u32 = 5000;
-pub const DEFAULT_STEPS: u32 = 50;
+pub const DEFAULT_STEPS: u32 = 100;
 /// 宿主自动失败恢复及其经用户批准的接续任务使用此来源前缀。
 pub const FAILURE_RECOVERY_SOURCE_PREFIX: &str = "failure:";
 

@@ -166,8 +166,8 @@ impl eve_llm_api::TurnEventSink for ProgressRecorder {
 }
 
 #[tokio::test]
-async fn fifty_individual_calls_close_without_a_fifty_first_call_and_report_three_milestones() {
-    let mut script = (0..50)
+async fn hundred_individual_calls_close_without_a_hundred_first_call_and_report_three_milestones() {
+    let mut script = (0..100)
         .map(|i| tool_response(vec![call(&format!("call-{i}"), "echo", json!({}))]))
         .collect::<Vec<_>>();
     script.push(final_response("已收尾，未核实部分保留。"));
@@ -182,7 +182,7 @@ async fn fifty_individual_calls_close_without_a_fifty_first_call_and_report_thre
         vec![tool],
         LlmHostConfig {
             max_tool_rounds: 0,
-            max_tool_calls: 50,
+            max_tool_calls: 100,
             tool_progress_reports: true,
             final_answer_on_round_limit: true,
             ..Default::default()
@@ -191,11 +191,11 @@ async fn fifty_individual_calls_close_without_a_fifty_first_call_and_report_thre
     .await;
     let events = ProgressRecorder::default();
     let out = host.run_turn_with_events(turn(), &events).await.unwrap();
-    assert_eq!(out.diagnostics.started_tools, 50);
-    assert_eq!(out.diagnostics.tool_results.len(), 50);
-    assert_eq!(*events.0.lock().unwrap(), [(1, 0), (15, 0), (35, 0)]);
+    assert_eq!(out.diagnostics.started_tools, 100);
+    assert_eq!(out.diagnostics.tool_results.len(), 100);
+    assert_eq!(*events.0.lock().unwrap(), [(1, 0), (30, 0), (70, 0)]);
     let requests = provider.requests.lock().unwrap();
-    assert_eq!(requests.len(), 51);
+    assert_eq!(requests.len(), 101);
     assert!(requests.last().unwrap().tools.is_empty());
     for request in requests.iter() {
         request.validate().unwrap();
