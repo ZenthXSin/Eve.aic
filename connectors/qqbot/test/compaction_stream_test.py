@@ -35,7 +35,7 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def exercise(self, stall, invalid=0):
+    def exercise(self, stall, invalid=0, milestones=False):
         self.stall = stall
         self.remaining_invalid_digests = invalid
         failed = stall or invalid >= 2
@@ -62,12 +62,14 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
         expected = {"contains":["上下文压缩未能完成", "已启动 35 次工具调用"]} if failed else {"expected":"压缩后已继续并完成核验"}
         self.run_window(self.send(self.message("compact", "核验文件后继续完成", **expected)), panel=True,
             env_extra={"EVE_CONTEXT_COMPACT_AT_TOKENS":"150000", "EVE_CONTEXT_COMPACT_TO_TOKENS":"100000",
+                       "EVE_PROGRESS_TOOL_MILESTONES":str(milestones).lower(),
                        "EVE_OPENAI_STREAM_COMPLETIONS":"true", "EVE_OPENAI_TIMEOUT_SECONDS":"1", "EVE_TRACE_DIALOGUE_TIMING":"true",
                        "EVE_MODELS_PRIMARY_TIMEOUT_MS":"1000", "EVE_MODEL_FIRST_RESPONSE_TIMEOUT_MS":"350",
                        "EVE_MODEL_STREAM_IDLE_TIMEOUT_MS":"350", "EVE_MODEL_STREAM_TOTAL_TIMEOUT_MS":"3000"})
         receipt = self.receipt("compact")
         self.assertEqual([p["text"] for p in receipt["progress"]].count(NOTICE), 1)
-        self.assertEqual(len(receipt["progress"]), 3, "两个工具里程碑加一次压缩提示，为最终回复保留名额")
+        self.assertEqual(len(receipt["progress"]), 3 if milestones else 1,
+                         "默认只保留压缩通知；显式开启时两个工具里程碑与压缩共用配额")
         self.assertTrue(all(p["state"] == "Sent" for p in receipt["progress"]))
         self.assertTrue(self.digest_requests())
         self.assertTrue(all(r["stream"] for r in self.digest_requests()))
@@ -91,6 +93,9 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
 
     def test_healthy_digest_stream_outlives_old_total_timeout_and_notifies_once(self):
         self.exercise(False)
+
+    def test_opt_in_milestones_still_share_quota_with_compaction(self):
+        self.exercise(False, milestones=True)
 
     def test_stalled_digest_keeps_evidence_and_sends_no_partial_result(self):
         self.exercise(True)
