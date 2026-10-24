@@ -72,7 +72,7 @@ class SubagentProfilesAcceptance(developer.DeveloperAcceptance):
         self.enabled(self.send(self.message('read-only','用核验子代理审阅',expected='只读核验结束')))
         self.assertFalse((self.source/'must-not-exist.txt').exists())
 
-    def test_ten_parallel_children_share_eves_fifty_steps(self):
+    def test_ten_parallel_children_share_eves_hundred_steps(self):
         entered = []
         condition = threading.Condition()
         used = []
@@ -83,18 +83,18 @@ class SubagentProfilesAcceptance(developer.DeveloperAcceptance):
                     with condition:
                         entered.append(self.text(body));condition.notify_all()
                         self.assertTrue(condition.wait_for(lambda:len(entered)==10,timeout=12))
-                    return calls(*[(f'echo-{i}','echo',{'text':str(i)}) for i in range(5)])
+                    return calls(*[(f'echo-{i}','echo',{'text':str(i)}) for i in range(10)])
                 return text_response('依据已有回执收尾')
             if not results:
                 return calls(*[(f'agent-{i}','run_subagent',{'task':f'并行核验{i}'}) for i in range(10)])
             used.extend(r['usage']['steps_used'] for r in results)
-            self.assertTrue(all(r['usage']['shared_steps_used']<=50 for r in results))
+            self.assertTrue(all(r['usage']['shared_steps_used']<=100 for r in results))
             self.assertFalse(body.get('tools'),'共享预算耗尽后 Eve 也不能获得新工具')
             return text_response('共享步数已用尽')
         self.callback = respond
         self.enabled(self.send(self.message('shared','并行核验十项',expected='共享步数已用尽')))
         self.assertEqual(len(entered),10)
-        self.assertEqual(sum(used),40,'主代理十次委派与子代理四十次工具调用共五十步')
+        self.assertEqual(sum(used),90,'主代理十次委派与子代理九十次工具调用共一百步')
 
     def test_background_worker_can_delegate_and_checkpoints_include_child_steps(self):
         def respond(body):
