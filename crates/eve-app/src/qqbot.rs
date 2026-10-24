@@ -1809,6 +1809,14 @@ async fn run_qqbot_composed(
             legacy,
             registry.clone(),
         )?;
+        for all in [false, true] {
+            bootstrap.tools.push(Arc::new(crate::qq_context_reset::ResetTool {
+                all,
+                registry: registry.clone(),
+                conversations: conversations.clone(),
+                authorization: qq_admin.clone(),
+            }));
+        }
         crate::developer::install_with_authorization(
             &mut bootstrap,
             &options.state_directory,
