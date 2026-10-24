@@ -256,7 +256,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
                 return calls(("delegate", "run_subagent", {"task": task, "max_steps": 2}))
             [result] = results
             self.assertEqual(result, {"completed": True, "result": "echo 可用。", "include_context": False,
-                                      "usage": {"steps_used": 1, "max_steps": 2, "model_requests": 2, "shared_steps_used": 2,"shared_steps_remaining":48,"agent_id":"general"}})
+                                      "usage": {"steps_used": 1, "max_steps": 2, "model_requests": 2, "shared_steps_used": 2,"shared_steps_remaining":98,"agent_id":"general"}})
             return text_response("子代理查过了：echo 可用。")
         self.callback = respond
         self.run_eve(self.send(self.message("ask", "帮我确认一下 echo 能不能用", expected="子代理查过了：echo 可用。")))
