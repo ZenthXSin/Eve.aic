@@ -3,6 +3,7 @@
 模型与 QQ 都是本地替身；真实平台的全量事件权限及主动发送配额另行观察。
 """
 import json
+from contextlib import closing
 import sqlite3
 import os
 import signal
@@ -45,7 +46,7 @@ class GroupChatAcceptance(reminder_test.ReminderAcceptance):
     def rows(self, table):
         path=self.work/'state/group-observations.sqlite3'
         if not path.exists(): return []
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db:
             db.row_factory=sqlite3.Row
             return [dict(row) for row in db.execute('SELECT * FROM '+table+' ORDER BY seq')]
 
@@ -61,6 +62,8 @@ class GroupChatAcceptance(reminder_test.ReminderAcceptance):
         self.assertEqual(push['text'],'这个思路可以试试')
         self.assertEqual(push['parts'][0][0],push['text'])
         self.assertEqual(len(self.kind('chat')),1)
+        self.assertFalse(self.kind('chat')[0]['body'].get('tools', []))
+        self.assertFalse(any('eve.identity.v1' in m.get('content','') for m in self.kind('chat')[0]['body']['messages']))
         self.assertTrue(any('群聊插话' in m.get('content','') for m in self.kind('chat')[0]['body']['messages']))
         self.assertEqual(len(self.rows('observations')),2)
         before=len(self.requests)
@@ -102,10 +105,14 @@ class GroupChatAcceptance(reminder_test.ReminderAcceptance):
     def test_mentioned_group_message_is_observed_but_original_task_is_answered_once(self):
         self.run_eve([self.observation('at-once','看看这个问题',mentioned=True),*self.send(self.message('at-once','看看这个问题',expected='这个思路可以试试',scope='group')),*self.checkpoint('quiet')],checkpoints={'quiet':self.quiet})
         self.assertEqual(len(self.kind('chat')),1)
+        context='\n'.join(m.get('content','') for m in self.kind('chat')[0]['body']['messages'])
+        self.assertIn('eve.identity.v1',context)
+        self.assertIn('"scene":"group"',context)
         self.assertEqual(self.kind('chime'),[])
         self.assertEqual(self.pushes(),[])
         self.assertEqual(len(self.rows('observations')),2)
 
+    @unittest.skipIf(os.name == 'nt', '真实 SIGTERM 收尾由 Ubuntu 验收')
     def test_production_node_entry_keeps_group_flags_after_environment_cleanup(self):
         # 启动真正的 Rust -> bridge.mjs -> SDK 导入链，只替换 SDK 网络层。
         root=self.work/'production-bridge'
