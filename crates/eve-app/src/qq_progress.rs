@@ -15,13 +15,18 @@ pub(crate) fn schema() -> ConfigSchema {
             minimum: Some(0),
             maximum: Some(600_000),
         },
-        Some(json!(30_000)),
+        Some(json!(60_000)),
     );
     field.environment = Some("EVE_PROGRESS_SLOW_AFTER_MS".into());
+    let mut milestones = ConfigField::new(ConfigKind::Boolean, Some(json!(false)));
+    milestones.environment = Some("EVE_PROGRESS_TOOL_MILESTONES".into());
     ConfigSchema {
         namespace: NAMESPACE.into(),
         version: 1,
-        fields: BTreeMap::from([("slow_after_ms".into(), field)]),
+        fields: BTreeMap::from([
+            ("slow_after_ms".into(), field),
+            ("tool_milestones".into(), milestones),
+        ]),
     }
 }
 
@@ -32,6 +37,14 @@ pub(crate) struct SlowProgress {
 }
 
 impl eve_qqbot_plugin::QqSlowProgress for SlowProgress {
+    fn tool_milestones(&self) -> bool {
+        self.settings
+            .get()
+            .and_then(|settings| settings.snapshot(NAMESPACE, 1).ok())
+            .and_then(|snapshot| snapshot.get("tool_milestones").ok())
+            .unwrap_or(false)
+    }
+
     fn after(&self) -> Option<Duration> {
         let snapshot = self.settings.get()?.snapshot(NAMESPACE, 1).ok()?;
         let millis: u64 = snapshot.get("slow_after_ms").ok()?;

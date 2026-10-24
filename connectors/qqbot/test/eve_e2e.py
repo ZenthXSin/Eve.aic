@@ -144,7 +144,7 @@ class Acceptance(unittest.TestCase):
             "pid_file": str(self.work / "child.pid"), "events_file": str(events),
             "error_file": str(bridge_error)}), encoding="utf8")
         env = {k: os.environ[k] for k in ("PATH", "SystemRoot", "TEMP", "TMP") if k in os.environ}
-        env.update(QQBOT_APP_SECRET="test-app-secret", QQBOT_APP_ID=app,
+        env.update(EVE_QQ_LIVE_INTERACTION="false", QQBOT_APP_SECRET="test-app-secret", QQBOT_APP_ID=app,
             EVE_OPENAI_API_KEY="test-model-secret",
             EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
             EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")

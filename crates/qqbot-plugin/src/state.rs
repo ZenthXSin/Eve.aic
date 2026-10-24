@@ -295,7 +295,8 @@ pub(crate) struct Progress {
     pub text: String,
     pub state: PartState,
 }
-/// 格式 1 不含片段，2 包含分段，3 包含途中进展，4 包含合并的连发消息，5 包含附带的表情包。
+/// 格式 1 不含片段，2 包含分段，3 包含途中进展，4 包含合并的连发消息，5 包含附带的表情包，
+/// 6 绑定归档库，7 允许后到的轮内引导并入较早的原轮回执。
 /// 旧版本拒绝读取而不是忽略投递记录。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -387,7 +388,7 @@ impl Ledger {
                 || entry.merged_into.as_ref().is_some_and(|into| {
                     into == &entry.message.id
                         || !ledger.entries.iter().enumerate().any(|(target_index, e)| {
-                            target_index > index
+                            target_index != index
                                 && e.app_id == entry.app_id
                                 && &e.message.id == into
                                 && e.state != ReceiptState::Merged
@@ -404,7 +405,15 @@ impl Ledger {
         Ok(ledger)
     }
     fn format(&self) -> u8 {
-        if self.archive.is_some() {
+        if self.entries.iter().enumerate().any(|(index, e)| {
+            e.merged_into.as_ref().is_some_and(|id| {
+                self.entries[..index]
+                    .iter()
+                    .any(|target| target.app_id == e.app_id && &target.message.id == id)
+            })
+        }) {
+            7
+        } else if self.archive.is_some() {
             6
         } else if self.entries.iter().any(|e| e.sticker.is_some()) {
             5
@@ -428,6 +437,19 @@ impl Ledger {
         self.entries
             .iter()
             .position(|r| r.app_id == app && r.message.id == id)
+    }
+
+    pub fn steer(
+        &mut self,
+        ctx: &PluginContext,
+        app: &str,
+        id: &str,
+        target: &str,
+    ) -> PluginResult<()> {
+        let index = self.find(app, id).ok_or_else(corrupt)?;
+        self.entries[index].state = ReceiptState::Merged;
+        self.entries[index].merged_into = Some(target.into());
+        self.save(ctx)
     }
 
     pub fn attach_archive(
@@ -982,6 +1004,12 @@ mod tests {
         let bytes = ledger.encode().unwrap();
         let decoded = Ledger::decode(&bytes).unwrap();
         assert_eq!(decoded.version, 4);
+        let mut reversed = Ledger::decode(&bytes).unwrap();
+        reversed.entries.reverse();
+        let backwards = reversed.encode().unwrap();
+        assert_eq!(Ledger::decode(&backwards).unwrap().version, 7);
+        reversed.version = 4;
+        assert!(Ledger::decode(&serde_json::to_vec(&reversed).unwrap()).is_err());
         for broken in [
             |l: &mut Ledger| l.entries[0].merged_into = Some("missing".into()),
             |l: &mut Ledger| l.entries[0].merged_into = None,

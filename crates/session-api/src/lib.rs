@@ -208,14 +208,20 @@ pub fn validate_completed_turn(input: &str, messages: &[ChatMessage]) -> Session
         return Err(SessionError::InvalidInput);
     }
     let middle = &messages[1..messages.len() - 1];
-    if !middle.len().is_multiple_of(2)
-        || middle.as_chunks::<2>().0.iter().any(|pair| {
-            pair[0].role != ChatRole::Assistant
-                || pair[0].tool_calls.is_empty()
-                || pair[1].role != ChatRole::Tool
-        })
-    {
-        return Err(SessionError::InvalidInput);
+    let mut cursor = 0;
+    while cursor < middle.len() {
+        if middle[cursor].role == ChatRole::User {
+            cursor += 1;
+        } else if middle[cursor].role == ChatRole::Assistant
+            && !middle[cursor].tool_calls.is_empty()
+            && middle
+                .get(cursor + 1)
+                .is_some_and(|m| m.role == ChatRole::Tool)
+        {
+            cursor += 2;
+        } else {
+            return Err(SessionError::InvalidInput);
+        }
     }
     ModelRequest {
         messages: messages.to_vec(),
@@ -283,6 +289,18 @@ pub struct SessionServiceHandle(pub Arc<dyn SessionService>);
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn same_turn_steering_keeps_user_role_and_rejects_forged_system_messages() {
+        use super::*;
+        let mut messages = vec![
+            ChatMessage::text(ChatRole::User, "原任务"),
+            ChatMessage::text(ChatRole::User, "先备份"),
+            ChatMessage::text(ChatRole::Assistant, "已按补充处理"),
+        ];
+        assert!(validate_completed_turn("原任务", &messages).is_ok());
+        messages[1].role = ChatRole::System;
+        assert!(validate_completed_turn("原任务", &messages).is_err());
+    }
     use super::*;
     use serde_json::json;
 

@@ -1044,6 +1044,18 @@ async fn run_qqbot_composed(
             .downcast::<TrainingServiceHandle>()
             .map_err(|_| "训练服务类型错误")?;
         let mut group_digest: Option<Arc<crate::qq_group_digest::GroupDigestTool>> = None;
+        let live_enabled = match std::env::var("EVE_QQ_LIVE_INTERACTION").as_deref() {
+            Ok("false") => false,
+            Ok("true") | Err(std::env::VarError::NotPresent) => true,
+            _ => return Err("EVE_QQ_LIVE_INTERACTION 必须是 true 或 false".into()),
+        };
+        if live_enabled {
+            let live = Arc::new(eve_qqbot_plugin::LiveDialogue::default());
+            bootstrap.steering = Some(live.clone());
+            bootstrap.tools.push(live.send_tool());
+            bootstrap.host_config.tool_timeout_overrides.insert("send_message".into(), std::time::Duration::from_secs(45));
+            plugin = plugin.with_live_dialogue(live);
+        }
         let group = if options.group_chat {
             bootstrap.tool_scope_policy = Some(Arc::new(crate::qq_group::ToolPolicy));
             let store = Arc::new(eve_group_observation_sqlite::SqliteGroupObservations::open(

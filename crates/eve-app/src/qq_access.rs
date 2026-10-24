@@ -21,6 +21,7 @@ fn public_tool(name: &str) -> bool {
     matches!(
         name,
         "echo"
+            | "send_message"
             | "search_reference"
             | "read_reference"
             | "read_source"

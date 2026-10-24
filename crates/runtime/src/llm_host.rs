@@ -448,6 +448,7 @@ pub struct LlmHost {
     run_deadline: Option<std::time::Instant>,
     journal: Option<Arc<dyn eve_llm_api::TurnJournal>>,
     image_source: Option<Arc<dyn eve_llm_api::TurnImageSource>>,
+    steering: Option<Arc<dyn eve_llm_api::TurnSteeringSource>>,
     pub(crate) registry: Arc<dyn ServiceRegistry>,
     pub(crate) kernel: Kernel,
     permissions: Arc<dyn PermissionChecker>,
@@ -507,6 +508,7 @@ impl LlmHost {
             run_deadline: None,
             journal: None,
             image_source: None,
+            steering: None,
             registry,
             kernel,
             permissions,
@@ -542,6 +544,11 @@ impl LlmHost {
     /// 显式启用图像输入：每轮由来源准备本条用户消息的图像，只随本轮请求传递，不写入历史。
     pub fn with_image_source(mut self, source: Arc<dyn eve_llm_api::TurnImageSource>) -> Self {
         self.image_source = Some(source);
+        self
+    }
+
+    pub fn with_steering(mut self, source: Arc<dyn eve_llm_api::TurnSteeringSource>) -> Self {
+        self.steering = Some(source);
         self
     }
 
@@ -721,6 +728,18 @@ impl LlmHost {
         events: Option<&EventDelivery<'_>>,
     ) -> Result<TurnOutput, TurnFailure> {
         let mut diagnostics = TurnDiagnostics::default();
+        let steering = match (
+            &self.steering,
+            scope.as_ref(),
+            events.and_then(|e| e.turn_id),
+        ) {
+            (Some(source), Some(scope), Some(turn_id)) => Some(
+                source
+                    .open(scope, turn_id)
+                    .map_err(|error| fail(error, diagnostics.clone()))?,
+            ),
+            _ => None,
+        };
         let context_started = std::time::Instant::now();
         let trace_context = |stage: &str| {
             if self.config.timing_diagnostics {
@@ -914,6 +933,16 @@ impl LlmHost {
             None
         };
         loop {
+            if let Some(steering) = &steering {
+                for text in steering
+                    .take(false)
+                    .map_err(|error| fail(error, diagnostics.clone()))?
+                {
+                    let message = ChatMessage::text(ChatRole::User, text);
+                    messages.push(message.clone());
+                    transcript.push(message);
+                }
+            }
             // 本轮还没有任何工具调用（含恢复的旧调用）时按闲聊阈值压缩；一旦开始做事改用主阈值。
             let policy = if diagnostics.calls.is_empty() {
                 self.casual_compaction_policy.or(self.compaction_policy)
@@ -985,6 +1014,23 @@ impl LlmHost {
                 Ok(value) => value,
                 Err(error) => return Err(fail(error, diagnostics)),
             };
+            if let Some(steering) = &steering {
+                let extra = steering
+                    .take(
+                        matches!(response, ModelResponse::Final { .. })
+                            && (closing || continuation.remaining().is_none()),
+                    )
+                    .map_err(|error| fail(error, diagnostics.clone()))?;
+                if !extra.is_empty() {
+                    for text in extra {
+                        let message = ChatMessage::text(ChatRole::User, text);
+                        messages.push(message.clone());
+                        transcript.push(message);
+                    }
+                    // 尚未开始的旧工具批次不执行；已完成的工具回执仍保留，不重放。
+                    continue;
+                }
+            }
             if let ModelResponse::Final { text } = response {
                 if !closing && continuation.remaining().is_some() {
                     if continuation_checks == 3 {

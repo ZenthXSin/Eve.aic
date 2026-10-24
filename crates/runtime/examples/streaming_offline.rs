@@ -19,6 +19,7 @@ impl TurnEventSink for Events {
     fn emit(&self, event: TurnEvent) -> LlmFuture<'_, ()> {
         Box::pin(async move {
             let kind = match event.kind {
+                TurnEventKind::AssistantMessage { .. } => "assistant_message",
                 TurnEventKind::ContextCompactionStarted => "context_compaction",
                 TurnEventKind::ProviderStarted { .. } => "request",
                 TurnEventKind::TextDelta { .. } => "delta",
