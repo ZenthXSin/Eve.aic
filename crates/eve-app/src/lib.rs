@@ -24,6 +24,7 @@ mod qq_chat_style;
 mod qq_chat_timing;
 mod qq_clarify;
 mod qq_cognition;
+mod qq_commitments;
 mod qq_completion;
 mod qq_conversation;
 mod qq_failure_recovery;

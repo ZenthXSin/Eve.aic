@@ -1228,6 +1228,18 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        // 约定账本随交互记忆启用，同样先于通道加载；损坏时拒绝启动并保留原字节。
+        let commitments = if options.memory {
+            let plugin = eve_commitment_plugin::CommitmentPlugin::new()?;
+            let controller = plugin.controller();
+            kernel.register(Box::new(plugin))?;
+            kernel
+                .start(&PluginId::new(eve_commitment_api::COMMITMENT_PLUGIN_ID)?)
+                .await?;
+            Some(controller)
+        } else {
+            None
+        };
         // 提醒账本同样先于通道加载；损坏时拒绝启动并保留原字节，发送中的提醒记为结果未知。
         let reminders = if options.reminders {
             let plugin = ReminderPlugin::new()?;
@@ -1449,6 +1461,32 @@ async fn run_qqbot_composed(
                 pursuit: pursuit.clone(),
             }),
             _ => context,
+        };
+        // 约定：Eve 答应别人、之后要做的事用工具记下；同一个人在其他会话里也看得到未完成的约定。
+        let context: Arc<dyn ContextAssembler> = match &commitments {
+            Some(commitments) => {
+                let owners = crate::qq_commitments::Owners {
+                    ledger: Arc::new(commitments.clone()),
+                    links: Arc::new(crate::qq_memory_continuity::PersonLinks(
+                        crate::qq_memory_continuity::Policy {
+                            registry: registry.clone(),
+                            conversations: conversations.clone(),
+                            unified: None,
+                        },
+                    )),
+                };
+                bootstrap
+                    .tools
+                    .push(Arc::new(crate::qq_commitments::NoteCommitmentTool(owners.clone())));
+                bootstrap
+                    .tools
+                    .push(Arc::new(crate::qq_commitments::SettleCommitmentTool(owners.clone())));
+                Arc::new(crate::qq_commitments::CommitmentContext {
+                    wrapped: context,
+                    owners,
+                })
+            }
+            None => context,
         };
         // 私聊提醒：模型按用户自然的说法调用提醒工具；私聊时交给对话当前本地时间与等待中的提醒。
         let reminder_time = qq_reminder::LocalTime {

@@ -300,6 +300,8 @@ dependencies = [
  "eve-cognition-loop-api",
  "eve-cognition-loop-plugin",
  "eve-cognition-plugin",
+ "eve-commitment-api",
+ "eve-commitment-plugin",
  "eve-completion-api",
  "eve-completion-plugin",
  "eve-config-api",
@@ -507,6 +509,25 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "eve-commitment-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "eve-commitment-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-commitment-api",
+ "eve-kernel",
+ "eve-plugin-api",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
