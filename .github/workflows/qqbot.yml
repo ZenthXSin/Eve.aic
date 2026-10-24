@@ -99,6 +99,7 @@ jobs:
           python3 connectors/qqbot/test/admission_benchmark.py --binary target/debug/eve-qqbot --payload-mib 1 --samples 2
           python3 connectors/qqbot/test/memory_continuity_test.py
           python3 connectors/qqbot/test/commitment_test.py
+          python3 connectors/qqbot/test/memory_eval.py
           python3 connectors/qqbot/test/tool_progress_test.py
           python3 connectors/qqbot/test/slow_progress_test.py
           python3 connectors/qqbot/test/history_window_test.py
