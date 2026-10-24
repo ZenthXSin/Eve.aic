@@ -36,6 +36,11 @@ class GroupRecallAcceptance(group_relation_test.GroupRelationAcceptance):
             return text_response('没翻到前面的地址')
         self.callback = respond
 
+    def stored(self, count):
+        # 群观察由后台异步写入；等这些原话真正入库后再发出艾特，避免慢机器上候选为空。
+        return lambda: self.wait_for(lambda: len(self.rows('observations')) >= count,
+                                     '群消息没有及时写入观察库', 20)
+
     def ask(self, id, text):
         return [self.observation(id, text, mentioned=True),
                 *self.send(self.message(id, text, contains=['地址'], scope='group'))]
@@ -44,8 +49,8 @@ class GroupRecallAcceptance(group_relation_test.GroupRelationAcceptance):
         self.recall_score = lambda c: 0.95 if '服务器地址' in c['text'] else 0.1
         old = [self.observation('addr', '服务器地址是 mdt.example.com 记一下')]
         filler = [self.observation(f'chat-{i}', f'闲聊第{i}句') for i in range(8)]
-        self.run_eve([*old, *filler, *self.checkpoint('quiet-1'), *self.ask('ask-1', '刚才那个服务器地址是多少')],
-                     checkpoints={'quiet-1': self.quiet})
+        self.run_eve([*old, *filler, *self.checkpoint('stored-1'), *self.ask('ask-1', '刚才那个服务器地址是多少')],
+                     checkpoints={'stored-1': self.stored(9)})
         [request] = self.recall_requests
         state = request['state']
         self.assertEqual(state['current']['text'], '刚才那个服务器地址是多少')
@@ -62,8 +67,8 @@ class GroupRecallAcceptance(group_relation_test.GroupRelationAcceptance):
     def test_jev_failure_keeps_recent_messages_only(self):
         self.jev_status = 503
         filler = [self.observation(f'chat-{i}', f'闲聊第{i}句') for i in range(8)]
-        self.run_eve([*filler, *self.checkpoint('quiet-1'), *self.ask('ask-1', '地址发一下')],
-                     checkpoints={'quiet-1': self.quiet})
+        self.run_eve([*filler, *self.checkpoint('stored-1'), *self.ask('ask-1', '地址发一下')],
+                     checkpoints={'stored-1': self.stored(8)})
         self.assertEqual(len(self.recall_requests), 1)
         [context] = self.contexts
         self.assertEqual(len(context['group_messages']), 5)
