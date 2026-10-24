@@ -874,7 +874,7 @@ impl Tool for DispatchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: DISPATCH_TOOL.into(),
-            description: "把需要多步、较长时间才能完成的事派发到后台执行，不必让用户等在对话里；完成后 Eve 会私聊通知用户结果。后台执行者能用你在对话里的工具，可调用 run_subagent 分工（不含再次派发、查看、取消后台任务），默认不携带对话；include_context=true 时携带派发前当前完整模型上下文的冻结快照（含已压缩摘要，不读取已移出窗口的原文），只作为历史数据，不扩展工具与权限。instructions 要写清任务、授权边界与交付物。title 是给用户看的简短标题。max_steps 是它至多调用工具的次数，不填用宿主默认值（初始 50），超过宿主上限会被拒绝。派发成功后告诉用户已在后台处理、做完会私聊通知；没有成功就不要这样说。".into(),
+            description: "把需要多步、较长时间才能完成的事派发到后台执行，不必让用户等在对话里；完成后 Eve 会私聊通知用户结果。后台执行者能用你在对话里的工具，可调用 run_subagent 分工（不含再次派发、查看、取消后台任务），默认不携带对话；include_context=true 时携带派发前当前完整模型上下文的冻结快照（含已压缩摘要，不读取已移出窗口的原文），只作为历史数据，不扩展工具与权限。instructions 要写清任务、授权边界与交付物。title 是给用户看的简短标题。max_steps 是它至多调用工具的次数，不填用宿主默认值（初始 100），超过宿主上限会被拒绝。派发成功后告诉用户已在后台处理、做完会私聊通知；没有成功就不要这样说。".into(),
             argument_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1279,7 +1279,7 @@ fn notice_text(task: &Task) -> String {
             .unwrap_or("仍有工作未完成");
         return bounded(
             &format!(
-                "后台恢复任务 {} 的 {} 步预算已用尽，原任务尚未完成。\n已保存进度，剩余：{}\n如需继续，请在本会话回复 /tasks approve {}，同意追加最多 50 步；未同意不会继续。",
+                "后台恢复任务 {} 的 {} 步预算已用尽，原任务尚未完成。\n已保存进度，剩余：{}\n如需继续，请在本会话回复 /tasks approve {}，同意追加最多 100 步；未同意不会继续。",
                 task.id,
                 task.spec.max_steps,
                 bounded(remaining, 900),
@@ -1602,7 +1602,7 @@ async fn run(
                             || task.needs_step_approval();
                         if exhausted && !task.cancel_requested {
                             end = TaskEnd::Failed { reason: format!(
-                                "本次 {} 步预算不足，原任务尚未完成；已保存现有进度和工具回执。请在原会话明确同意追加 50 步后再继续，未经同意不会扩大预算。", task.spec.max_steps
+                                "本次 {} 步预算不足，原任务尚未完成；已保存现有进度和工具回执。请在原会话明确同意追加 100 步后再继续，未经同意不会扩大预算。", task.spec.max_steps
                             ) };
                         }
                     }
@@ -1700,7 +1700,7 @@ mod tests {
             values: values.clone(),
         };
         let defaults = settings(&snapshot(&values)).unwrap();
-        assert_eq!(defaults.default_steps, 50);
+        assert_eq!(defaults.default_steps, 100);
         assert_eq!(defaults.max_steps, 5000);
         assert_eq!(defaults.subagent_timeout, Duration::from_secs(180));
         values.insert("default_steps".into(), json!(5001));

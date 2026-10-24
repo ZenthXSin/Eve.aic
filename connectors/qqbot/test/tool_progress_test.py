@@ -1,4 +1,4 @@
-"""真实宿主的 50 次调用上限、途中回执、配额、取消与独立进程恢复。"""
+"""真实宿主的 100 次调用上限、途中回执、配额、取消与独立进程恢复。"""
 import json
 import unittest
 
@@ -38,20 +38,20 @@ class ToolProgressAcceptance(dialogue.DialogueToolsAcceptance):
     def progress(self, id):
         return [e for e in self.events if e.get('type') == 'progress' and e.get('id') == id]
 
-    def test_fifty_calls_three_reports_final_segments_and_fresh_turn_budget(self):
+    def test_hundred_calls_three_reports_final_segments_and_fresh_turn_budget(self):
         def respond(body):
             if not body.get('tools'):
-                self.assertEqual(len(self.results(body)), 50)
+                self.assertEqual(len(self.results(body)), 100)
                 return dialogue.text_response('第一段结果。\n\n第二段结果。\n\n尚未核实的部分仍未完成。')
-            if self.chat_rounds > 51:
+            if self.chat_rounds > 101:
                 return dialogue.text_response('下一轮正常') if self.results(body) else self.calls(1)
             return self.calls(1)
         self.callback = respond
         message = self.message('fifty', '连续合成调用') | {'accept_any': True}
         self.run_eve([{'send':message}, self.wait_receipt('fifty'),
                       *self.send(self.message('fresh', '新的测试', expected='下一轮正常'))],
-                     more=['--max-tool-rounds','64','--segmented'])
-        self.assertEqual(self.chat_rounds, 53)
+                     more=['--segmented'])
+        self.assertEqual(self.chat_rounds, 103)
         self.assertEqual(len(self.progress('fifty')), 3)
         self.assertEqual([p['state'] for p in self.receipt('fifty')['progress']], ['Sent'] * 3)
         finals = [e for e in self.events if e.get('id') == 'fifty' and e.get('type') in ['reply','segment']]
@@ -66,7 +66,7 @@ class ToolProgressAcceptance(dialogue.DialogueToolsAcceptance):
 
     def test_oversized_parallel_batch_is_not_executed(self):
         def respond(body):
-            if body.get('tools'): return self.calls(51)
+            if body.get('tools'): return self.calls(101)
             self.assertEqual(self.results(body), [])
             return dialogue.text_response('超额批次未执行')
         self.callback = respond

@@ -15,7 +15,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 pub(crate) const SOURCE_PREFIX: &str = eve_task_api::FAILURE_RECOVERY_SOURCE_PREFIX;
-pub(crate) const STEPS: u32 = 50;
+pub(crate) const STEPS: u32 = 100;
 
 pub(crate) struct Recovery {
     pub(crate) tasks: Arc<dyn TaskAdmin>,
@@ -39,7 +39,7 @@ impl QqFailureRecovery for Recovery {
             return Ok(None);
         }
         // 配额用尽不是可绕过的执行错误。宿主已经尝试无工具收尾与只读汇报，
-        // 不再自动创建另一个 50 步任务，也不拿全量历史大小要求用户重述原任务。
+        // 不再自动创建另一个 100 步任务，也不拿全量历史大小要求用户重述原任务。
         if matches!(
             &report.run.failure,
             Some(RunFailure::Execution(LlmError::RoundLimit))
@@ -178,7 +178,7 @@ impl eve_qqbot_plugin::QqCommandHandler for Commands {
         }
         let (Some("approve"), Some(id), None) = (words.next(), words.next(), words.next()) else {
             return Ok(Some(
-                "用法：/tasks approve 任务ID；同意为该恢复任务追加最多 50 步。".into(),
+                "用法：/tasks approve 任务ID；同意为该恢复任务追加最多 100 步。".into(),
             ));
         };
         let Some(recovery) = &self.0 else {
@@ -212,7 +212,7 @@ impl eve_qqbot_plugin::QqCommandHandler for Commands {
             return Ok(Some("存在未确认工具结果，不能自动接续。".into()));
         }
         let mut messages = checkpoint.messages.clone();
-        messages.push(ChatMessage::text(ChatRole::User, format!("上一阶段已经停止，剩余工作：{}。原会话用户现通过 /tasks approve 明确同意追加最多 50 步。此前所有调用和回执均为历史，不重放已有操作。", checkpoint.remaining.as_deref().unwrap_or_default())));
+        messages.push(ChatMessage::text(ChatRole::User, format!("上一阶段已经停止，剩余工作：{}。原会话用户现通过 /tasks approve 明确同意追加最多 100 步。此前所有调用和回执均为历史，不重放已有操作。", checkpoint.remaining.as_deref().unwrap_or_default())));
         let messages_json = serde_json::to_string(&messages)
             .map_err(|_| PluginError::State("接续上下文无法编码".into()))?;
         if messages_json.len() > MAX_CONTEXT_BYTES {
