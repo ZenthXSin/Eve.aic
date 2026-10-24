@@ -13,8 +13,10 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+mod digest;
 mod judges;
 mod relation;
+pub use digest::ModelGroupDigester;
 pub use judges::{CHIME_FORMAT_GUARD, ModelChimeJudge, QuietJudge};
 pub use relation::{GroupRelationPipeline, ModelGroupRelationReviewer};
 

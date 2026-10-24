@@ -1,7 +1,9 @@
 //! 群消息原话与主动发送账本；重启不重放、不补发，异常保留原记录。
 use eve_chime_api::{
-    ChimeReply, GroupExchange, GroupMessage, GroupObservationStore, GroupOutbound,
+    ChimeReply, GroupExchange, GroupMessage, GroupObservationStore, GroupOutbound, ObservedMessage,
 };
+mod digests;
+pub use digests::SqliteGroupDigests;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
     path::Path,
@@ -237,6 +239,36 @@ impl GroupObservationStore for SqliteGroupObservations {
         self.run(|db|{
   let mut q=db.prepare("SELECT payload FROM observations WHERE conversation=?1 ORDER BY seq DESC LIMIT ?2").map_err(|_|BROKEN)?;
   let mut values:Vec<GroupMessage>=q.query_map(params![conversation,limit.min(100)],|r|r.get::<_,String>(0)).map_err(|_|BROKEN)?.map(|r|serde_json::from_str(&r.map_err(|_|BROKEN)?).map_err(|_|BROKEN.to_string())).collect::<Result<_,_>>()?;values.reverse();Ok(values)})
+    }
+    fn after(
+        &self,
+        conversation: &str,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<ObservedMessage>, String> {
+        self.run(|db| {
+            let mut q = db
+                .prepare("SELECT seq,payload FROM observations WHERE conversation=?1 AND seq>?2 ORDER BY seq LIMIT ?3")
+                .map_err(|_| BROKEN)?;
+            let rows = q
+                .query_map(
+                    params![conversation, after_seq as i64, limit.min(1000) as i64],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                )
+                .map_err(|_| BROKEN)?;
+            rows.map(|row| {
+                let (seq, payload) = row.map_err(|_| BROKEN)?;
+                let message: GroupMessage = serde_json::from_str(&payload).map_err(|_| BROKEN)?;
+                if seq <= 0 || message.conversation != conversation {
+                    return Err(BROKEN.to_string());
+                }
+                Ok(ObservedMessage {
+                    seq: seq as u64,
+                    message,
+                })
+            })
+            .collect()
+        })
     }
     fn exchanges(&self, conversation: &str) -> Result<Vec<GroupExchange>, String> {
         self.run(|db| {

@@ -1042,11 +1042,28 @@ async fn run_qqbot_composed(
             .value
             .downcast::<TrainingServiceHandle>()
             .map_err(|_| "训练服务类型错误")?;
+        let mut group_digest: Option<Arc<crate::qq_group_digest::GroupDigestTool>> = None;
         let group = if options.group_chat {
             bootstrap.tool_scope_policy = Some(Arc::new(crate::qq_group::ToolPolicy));
             let store = Arc::new(eve_group_observation_sqlite::SqliteGroupObservations::open(
                 &options.state_directory.join("group-observations.sqlite3"),
             )?);
+            // 群消息摘要单独成库；整理按需在对话工具里进行，不常驻后台。
+            let digests = Arc::new(eve_group_observation_sqlite::SqliteGroupDigests::open(
+                &options.state_directory.join("group-digests.sqlite3"),
+            )?);
+            let tool = Arc::new(crate::qq_group_digest::GroupDigestTool::new(
+                store.clone(),
+                digests,
+                conversations.clone(),
+                "Eve".into(),
+            ));
+            bootstrap.tools.push(tool.clone());
+            bootstrap.host_config.tool_timeout_overrides.insert(
+                crate::qq_group_digest::TOOL_NAME.into(),
+                std::time::Duration::from_secs(180),
+            );
+            group_digest = Some(tool);
             let group = crate::qq_group::Group::new(
                 std::env::var("QQBOT_APP_ID").unwrap_or_else(|_| DEFAULT_QQBOT_APP_ID.into()),
                 store,
@@ -1999,6 +2016,12 @@ async fn run_qqbot_composed(
             )))
         };
         let budgeted = |category: &str| budget_gate.wrap(observed(category)?, category);
+        // 群消息整理由对话中的工具按需触发，与主对话一样不计入自主运行预算；用途单独记健康。
+        if let Some(tool) = &group_digest {
+            let _ = tool.digester.set(Arc::new(eve_chime_plugin::ModelGroupDigester::new(
+                observed(crate::qq_group_digest::MODEL_USE)?,
+            )));
+        }
         if let Some(group) = &group {
             let _ = group
                 .policy

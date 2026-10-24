@@ -2,8 +2,10 @@
 //! 说什么，再通过渠道提供的出口发出去。契约不绑定任何聊天平台。
 use eve_llm_api::LlmFuture;
 use serde::{Deserialize, Serialize};
+mod digest;
 mod recall;
 mod relation;
+pub use digest::*;
 pub use recall::*;
 pub use relation::*;
 
@@ -182,6 +184,16 @@ pub trait GroupObservationStore: Send + Sync {
     fn finish(&self, id: &str, sent: bool) -> Result<(), String>;
     fn abandon(&self, id: &str) -> Result<(), String>;
     fn outbound(&self, id: &str) -> Result<Option<GroupOutbound>, String>;
+    /// 序号大于 `after_seq` 的消息，按序号升序，至多 `limit` 条；用于按需增量整理。
+    /// 不支持增量读取的实现如实返回错误。
+    fn after(
+        &self,
+        _conversation: &str,
+        _after_seq: u64,
+        _limit: usize,
+    ) -> Result<Vec<ObservedMessage>, String> {
+        Err("群观察存储不支持增量读取".into())
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GroupOutbound {
