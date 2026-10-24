@@ -80,6 +80,10 @@ pub(crate) struct Outbox {
     files: PathBuf,
     ledger: PathBuf,
     inner: Mutex<Inner>,
+    pub(crate) member_access: std::sync::OnceLock<(
+        Option<PathBuf>,
+        std::sync::Arc<dyn eve_developer_api::DeveloperAuthorization>,
+    )>,
 }
 
 impl Outbox {
@@ -117,6 +121,7 @@ impl Outbox {
             files,
             ledger,
             inner: Mutex::new(Inner { ledger: value }),
+            member_access: std::sync::OnceLock::new(),
         };
         if changed {
             outbox.save()?;
@@ -488,7 +493,7 @@ impl Tool for SendFileTool {
                 "把发件目录里的一个文件发到当前会话。只能报文件名（不能带路径），宿主在固定目录里查找；\
                  文件不存在或不是普通文件时失败，文件大小不设上限。name 是文件名（至多 {QQ_FILE_NAME_MAX_BYTES} 字节），\
                  caption 是可选的简短说明（至多 {QQ_FILE_CAPTION_MAX_BYTES} 字节）。没有排上队就不要说已经发出：\
-                 只有真的上传成功后，文件才会到用户那里。"
+                 只有真的上传成功后，文件才会到用户那里。普通成员先将产物放到自己的项目 exports/ 下；工具只发送该目录文件，不能读取宿主发件目录或其他成员产物。"
             ),
             argument_schema: json!({
                 "type": "object",
@@ -539,13 +544,31 @@ impl Tool for SendFileTool {
             let name = call.arguments["name"]
                 .as_str()
                 .ok_or_else(|| failed("缺少文件名"))?;
-            let path = self.outbox.resolve(name)?;
+            let member_root = self
+                .outbox
+                .member_access
+                .get()
+                .and_then(|(root, auth)| (!auth.is_operator(scope)).then_some((root, auth)));
+            let (path, output_name) = if let Some((root, auth)) = member_root {
+                if !auth.allows_workspace_development(scope) {
+                    return Err(failed("缺少真实成员开发身份"));
+                }
+                let root = root
+                    .as_ref()
+                    .ok_or_else(|| failed("宿主尚未配置成员项目工作区"))?;
+                (
+                    crate::qq_member_files::snapshot(root, scope, name, &self.outbox.files)?,
+                    Some(name.to_owned()),
+                )
+            } else {
+                (self.outbox.resolve(name)?, None)
+            };
             let caption = call
                 .arguments
                 .get("caption")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let id = self.outbox.enqueue(&session, path, None, caption)?;
+            let id = self.outbox.enqueue(&session, path, output_name, caption)?;
             let _ = self.outbox.result_of(&id);
             Ok(json!({
                 "queued": true,

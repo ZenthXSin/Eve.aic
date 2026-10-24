@@ -138,6 +138,12 @@ if (scenario.script) {
       const cmd = JSON.parse(line);
       record({ direction: "out", ...cmd, ...(cmd.type === "segment" ? { at: Date.now() } : {}) });
       if (cmd.type === "stop") { stopped = true; return; }
+      if (cmd.type === "file") {
+        if (typeof cmd.path !== "string" || !fs.statSync(cmd.path).isFile()) throw new Error("invalid_file_path");
+        commands.push(cmd);
+        send({type:"delivery",id:cmd.id,push:true,file:true,ok:true,message_id:"file-"+cmd.id});
+        continue;
+      }
       if (cmd.type === "push") {
         if (!/^[A-Za-z0-9_-]{1,128}$/.test(cmd.target_id ?? "") || typeof cmd.text !== "string") throw new Error("invalid_push");
         commands.push(cmd);

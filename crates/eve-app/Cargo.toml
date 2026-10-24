@@ -31,6 +31,7 @@ name = "eve-memory"
 path = "src/bin/memory.rs"
 
 [dependencies]
+libc = "0.2"
 eve-group-observation-sqlite = { path = "../group-observation-sqlite" }
 eve-subagent-profile-sqlite = { path = "../subagent-profile-sqlite" }
 eve-relation-experience-sqlite = { path = "../relation-experience-sqlite" }

@@ -16,6 +16,7 @@ class GroupDigestAcceptance(group_chat_test.GroupChatAcceptance):
 
     def setUp(self):
         super().setUp()
+        self.fixture_admin_users = ()  # 当前群整理对真实普通成员开放。
         self.batches = []
         self.calls = 0
 
