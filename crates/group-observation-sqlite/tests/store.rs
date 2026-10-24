@@ -186,3 +186,50 @@ fn observations_are_read_incrementally_by_sequence_within_one_group() {
     assert_eq!(rest[0].message.id, "m2");
     assert!(store.after("g1", all[2].seq, 10).unwrap().is_empty());
 }
+
+#[test]
+fn raw_search_pages_all_saved_messages_without_crossing_groups_or_rewriting() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("group.db");
+    let store = SqliteGroupObservations::open(&path).unwrap();
+    for i in 0..125 {
+        let mut m = message("g1");
+        m.id = format!("m{i}");
+        m.text = format!("服务器地址 MDT.example.com {i} 100%_");
+        store.append(&m).unwrap();
+    }
+    let mut foreign = message("g2");
+    foreign.text = "服务器地址 SECRET".into();
+    store.append(&foreign).unwrap();
+    let first = store.search("g1", "服务器地址", None, 2).unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|m| m.message.id.as_str())
+            .collect::<Vec<_>>(),
+        ["m124", "m123"]
+    );
+    let next = store
+        .search("g1", "mdt.EXAMPLE", Some(first[1].seq), 2)
+        .unwrap();
+    assert_eq!(next[0].message.id, "m122");
+    assert_eq!(next[1].message.id, "m121");
+    assert!(store.search("g1", "SECRET", None, 20).unwrap().is_empty());
+    assert_eq!(store.search("g1", "100%_", None, 2).unwrap().len(), 2);
+    assert!(
+        store
+            .search("g1", "' OR 1=1 --", None, 2)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(store.search("g1", "", Some(1), 2).unwrap().is_empty());
+    assert!(store.search("g1", "", Some(u64::MAX), 2).is_err());
+    let oldest = store.search("g1", "服务器地址", Some(2), 2).unwrap();
+    assert_eq!(oldest[0].message.id, "m0");
+    drop(store);
+    let store = SqliteGroupObservations::open(&path).unwrap();
+    assert_eq!(
+        store.search("g1", "服务器地址", Some(2), 2).unwrap()[0],
+        oldest[0]
+    );
+}

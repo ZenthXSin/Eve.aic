@@ -28,6 +28,7 @@ fn public_tool(name: &str) -> bool {
             | "describe_image"
             | "read_raw_message"
             | "group_digest"
+            | "recall_group_messages"
             | "send_sticker"
             | "show_budget"
             | "sleep"

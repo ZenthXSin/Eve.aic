@@ -1,12 +1,12 @@
-"""实际 QQ 宿主进程：Eve 在群里被叫到时，附最近 5 条原话，并由 Jev 从更早的全量群消息里挑出相关原话。
+"""真实 QQ 宿主进程：最近 20 条直接注入，当前群原话按需召回。
 
-Jev、主模型与 QQ 都是本地替身；挑选质量需用真实 Jev 另行评估。
+Jev、主模型和 QQ 均为本地替身，不向真实群发测试消息。
 """
 import json
 import unittest
 
 import group_relation_test
-from dialogue_tools_test import text_response
+from dialogue_tools_test import text_response, tool_response
 
 
 def group_context(body):
@@ -25,71 +25,103 @@ class GroupRecallAcceptance(group_relation_test.GroupRelationAcceptance):
     def setUp(self):
         super().setUp()
         self.contexts = []
-
-        def respond(body):
-            context = group_context(body)
-            if context is not None:
-                self.contexts.append(context)
-            related = (context or {}).get('related_earlier', [])
-            if any('mdt.example.com' in m['text'] for m in related):
-                return text_response('地址是 mdt.example.com')
-            return text_response('没翻到前面的地址')
-        self.callback = respond
+        self.callback = lambda body: text_response('收到')
 
     def stored(self, count):
-        # 群观察由后台异步写入；等这些原话真正入库后再发出艾特，避免慢机器上候选为空。
         return lambda: self.wait_for(lambda: len(self.rows('observations')) >= count,
                                      '群消息没有及时写入观察库', 20)
 
-    def ask(self, id, text):
-        return [self.observation(id, text, mentioned=True),
-                *self.send(self.message(id, text, contains=['地址'], scope='group'))]
+    def ask(self, id, text, expected='收到', **options):
+        user = options.pop('user', 'member-lookup')
+        return [self.observation(id, text, user=user, mentioned=True),
+                *self.send(self.message(id, text, expected=expected, scope='group', user=user, **options))]
 
-    def test_mentioned_turn_gets_recent_five_and_jev_selected_earlier_messages(self):
-        self.recall_score = lambda c: 0.95 if '服务器地址' in c['text'] else 0.1
-        old = [self.observation('addr', '服务器地址是 mdt.example.com 记一下')]
-        filler = [self.observation(f'chat-{i}', f'闲聊第{i}句') for i in range(8)]
-        self.run_eve([*old, *filler, *self.checkpoint('stored-1'), *self.ask('ask-1', '刚才那个服务器地址是多少')],
-                     checkpoints={'stored-1': self.stored(9)})
-        [request] = self.recall_requests
-        state = request['state']
-        self.assertEqual(state['current']['text'], '刚才那个服务器地址是多少')
-        self.assertEqual(len(state['recent']), 5)
-        candidates = [c['text'] for c in state['candidates']]
-        self.assertIn('服务器地址是 mdt.example.com 记一下', candidates)
-        self.assertNotIn('刚才那个服务器地址是多少', candidates)
-        self.assertFalse(set(candidates) & {m['text'] for m in state['recent']})
+    def test_exact_last_twenty_are_injected_without_jev_even_when_long(self):
+        def respond(body):
+            self.contexts.append(group_context(body))
+            return text_response('收到')
+        self.callback = respond
+        long = '群消息长正文' * 110
+        old = [self.observation(f'chat-{i}', f'第{i}句 ' + long, user=f'member-{i}') for i in range(25)]
+        self.run_eve([*old, *self.checkpoint('stored'), *self.ask('ask', 'eve看看最近消息')],
+                     checkpoints={'stored': self.stored(25)})
         [context] = self.contexts
-        self.assertEqual(len(context['group_messages']), 5)
-        self.assertEqual([m['text'] for m in context['related_earlier']], ['服务器地址是 mdt.example.com 记一下'])
-        self.assertIn('地址是 mdt.example.com', json.dumps(self.receipt('ask-1'), ensure_ascii=False))
-
-    def test_recall_waits_for_the_slot_held_by_relation_judging(self):
-        # 群关系判断与挑选共用 Jev 名额（默认 1）。判断慢时挑选应排队等名额，而不是直接放弃。
-        self.relation_delay = 1.2
-        self.recall_score = lambda c: 0.95 if '服务器地址' in c['text'] else 0.1
-        old = [self.observation('addr', '服务器地址是 mdt.example.com 记一下')]
-        filler = [self.observation(f'chat-{i}', f'闲聊第{i}句') for i in range(8)]
-        self.run_eve([*old, *filler, *self.checkpoint('stored-1'), *self.ask('ask-1', '刚才那个服务器地址是多少')],
-                     checkpoints={'stored-1': self.stored(9)})
-        self.assertEqual(len(self.recall_arrivals), 1, '挑选没有排队等名额，被直接跳过')
-        [arrival] = self.recall_arrivals
-        # 挑选开始时名额正被关系判断占用，判断结束后挑选才到达 Jev。
-        self.assertTrue(any(start < arrival and end - 0.05 <= arrival for start, end in self.relation_spans),
-                        self.relation_spans)
-        [context] = self.contexts
-        self.assertEqual([m['text'] for m in context['related_earlier']], ['服务器地址是 mdt.example.com 记一下'])
-
-    def test_jev_failure_keeps_recent_messages_only(self):
-        self.jev_status = 503
-        filler = [self.observation(f'chat-{i}', f'闲聊第{i}句') for i in range(8)]
-        self.run_eve([*filler, *self.checkpoint('stored-1'), *self.ask('ask-1', '地址发一下')],
-                     checkpoints={'stored-1': self.stored(8)})
-        self.assertEqual(len(self.recall_requests), 1)
-        [context] = self.contexts
-        self.assertEqual(len(context['group_messages']), 5)
+        messages = context['group_messages']
+        self.assertEqual(len(messages), 20)
+        self.assertEqual([m['text'].split()[0] for m in messages[:-1]], [f'第{i}句' for i in range(6, 25)])
+        self.assertTrue(all(m['truncated'] for m in messages[:-1]))
+        self.assertEqual(messages[-1]['text'], 'eve看看最近消息')
+        self.assertIn('at_ms', messages[0])
         self.assertNotIn('related_earlier', context)
-        self.assertIn('没翻到前面的地址', json.dumps(self.receipt('ask-1'), ensure_ascii=False))
+        self.assertEqual(self.recall_requests, [], '回答前不能再调用 Jev 挑原话')
+
+    def test_jev_failure_does_not_remove_recent_context_and_private_has_none(self):
+        self.jev_status = 503
+        def respond(body):
+            self.contexts.append(group_context(body))
+            return text_response('收到')
+        self.callback = respond
+        self.run_eve([self.observation('context', '服务器地址 mdt.example.com'),
+                      *self.checkpoint('stored'), *self.ask('ask', 'eve刚才的地址'),
+                      *self.send(self.message('private', '你好', expected='收到'))],
+                     checkpoints={'stored': self.stored(1)})
+        self.assertIn('服务器地址 mdt.example.com', json.dumps(self.contexts[0], ensure_ascii=False))
+        self.assertIsNone(self.contexts[1])
+        self.assertEqual(self.recall_requests, [])
+
+    def test_member_recalls_beyond_recent_hundred_and_pages_across_restart(self):
+        old = [self.observation('addr', '服务器地址 mdt.example.com')]
+        old += [self.observation(f'chat-{i}', f'闲聊第{i}句') for i in range(105)]
+        old += [self.observation('foreign', '服务器地址 FOREIGN_SECRET', target='group-2')]
+        self.run_eve([*old, *self.checkpoint('stored')], checkpoints={'stored': self.stored(107)})
+        captured = []
+        def respond(body):
+            result = self.results(body)
+            if not result:
+                context = group_context(body)
+                self.assertNotIn('mdt.example.com', json.dumps(context))
+                return tool_response([('recall_group_messages', {'query': '服务器地址 ', 'limit': 1})])
+            captured.append(result[-1])
+            self.assertEqual([m['text'] for m in result[-1]['messages']], ['服务器地址 mdt.example.com'])
+            self.assertFalse(result[-1]['has_more'])
+            self.assertNotIn('FOREIGN_SECRET', json.dumps(body))
+            return text_response('地址 mdt.example.com')
+        self.callback = respond
+        self.run_eve(self.ask('ask', 'eve查更早的服务器地址', expected='地址 mdt.example.com'))
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(self.recall_requests, [])
+        pages = []
+        def page(body):
+            results = self.results(body)
+            if not results:
+                return tool_response([('recall_group_messages', {'query': '闲聊第', 'limit': 2})])
+            if len(results) == 1:
+                first = results[0]
+                self.assertTrue(first['has_more'])
+                response = tool_response([('recall_group_messages', {'query': '闲聊第', 'limit': 2,
+                                          'before_seq': first['next_before_seq']})])
+                response['choices'][0]['message']['tool_calls'][0]['id'] += '-page2'
+                return response
+            pages.extend(results)
+            return text_response('翻页完成')
+        self.callback = page
+        self.run_eve(self.ask('pages', 'eve往前翻', expected='翻页完成'))
+        self.assertEqual([[m['text'] for m in p['messages']] for p in pages],
+                         [['闲聊第104句', '闲聊第103句'], ['闲聊第102句', '闲聊第101句']])
+        self.assertEqual(self.recall_requests, [])
+
+    def test_private_and_foreign_scope_arguments_cannot_read_group(self):
+        def respond(body):
+            results = self.results(body)
+            if not results:
+                return tool_response([('recall_group_messages', {})])
+            self.assertIn('当前不是群聊', json.dumps(results, ensure_ascii=False))
+            self.assertNotIn('GROUP_SECRET', json.dumps(results))
+            return text_response('私聊不能读群')
+        self.callback = respond
+        self.run_eve([self.observation('secret', 'GROUP_SECRET'), *self.checkpoint('stored'),
+                      *self.send(self.message('private', '查看群记录', expected='私聊不能读群'))],
+                     checkpoints={'stored': self.stored(1)})
 
 
 if __name__ == '__main__':

@@ -240,6 +240,46 @@ impl GroupObservationStore for SqliteGroupObservations {
   let mut q=db.prepare("SELECT payload FROM observations WHERE conversation=?1 ORDER BY seq DESC LIMIT ?2").map_err(|_|BROKEN)?;
   let mut values:Vec<GroupMessage>=q.query_map(params![conversation,limit.min(100)],|r|r.get::<_,String>(0)).map_err(|_|BROKEN)?.map(|r|serde_json::from_str(&r.map_err(|_|BROKEN)?).map_err(|_|BROKEN.to_string())).collect::<Result<_,_>>()?;values.reverse();Ok(values)})
     }
+    fn search(
+        &self,
+        conversation: &str,
+        query: &str,
+        before_seq: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<ObservedMessage>, String> {
+        let before = before_seq
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| BROKEN)?;
+        self.run(|db| {
+            let mut statement = db
+                .prepare(
+                    "SELECT seq,payload FROM observations WHERE conversation=?1 \
+                 AND (?2 IS NULL OR seq<?2) \
+                 AND (?3='' OR instr(lower(json_extract(payload,'$.text')),lower(?3))>0) \
+                 ORDER BY seq DESC LIMIT ?4",
+                )
+                .map_err(|_| BROKEN)?;
+            let rows = statement
+                .query_map(
+                    params![conversation, before, query, limit.min(100) as i64],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(|_| BROKEN)?;
+            rows.map(|row| {
+                let (seq, payload) = row.map_err(|_| BROKEN)?;
+                let message: GroupMessage = serde_json::from_str(&payload).map_err(|_| BROKEN)?;
+                if seq <= 0 || message.conversation != conversation {
+                    return Err(BROKEN.to_string());
+                }
+                Ok(ObservedMessage {
+                    seq: seq as u64,
+                    message,
+                })
+            })
+            .collect()
+        })
+    }
     fn after(
         &self,
         conversation: &str,

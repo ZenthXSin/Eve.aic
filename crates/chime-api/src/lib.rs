@@ -176,6 +176,17 @@ pub trait GroupObservationStore: Send + Sync {
     fn append(&self, message: &GroupMessage) -> Result<bool, String>;
     fn recent(&self, conversation: &str, limit: usize) -> Result<Vec<GroupMessage>, String>;
     fn message(&self, conversation: &str, id: &str) -> Result<Option<GroupMessage>, String>;
+    /// 当前群的原话关键词检索，按序号降序；before_seq 是排他的向前翻页游标。
+    /// 空关键词表示直接向前翻页；不支持的实现明确报错，不请求模型补造结果。
+    fn search(
+        &self,
+        _conversation: &str,
+        _query: &str,
+        _before_seq: Option<u64>,
+        _limit: usize,
+    ) -> Result<Vec<ObservedMessage>, String> {
+        Err("群观察存储不支持原话检索".into())
+    }
     /// Eve 已确认送达的完整问答，不按最近窗口截断。
     fn exchanges(&self, conversation: &str) -> Result<Vec<GroupExchange>, String>;
     fn link_reply(&self, conversation: &str, source: &str, reply: &str) -> Result<(), String>;
