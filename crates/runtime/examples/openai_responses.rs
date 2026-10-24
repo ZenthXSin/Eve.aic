@@ -83,6 +83,7 @@ impl ContextAssembler for ExampleContext {
                 profile: String::new(),
                 memories: vec![],
                 history: vec![],
+                pinned: vec![],
             })
         })
     }

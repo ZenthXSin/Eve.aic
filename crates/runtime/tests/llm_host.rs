@@ -287,6 +287,7 @@ impl ContextAssembler for CountingContext {
                 profile: "测试用户".into(),
                 memories: vec!["长期记忆".into()],
                 history: vec![],
+                pinned: vec![],
             })
         })
     }

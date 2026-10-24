@@ -128,7 +128,7 @@ async fn storage_failure_preserves_mode_and_stopped_handles_fail() {
             })
             .await
             .unwrap()
-            .memories
+            .pinned
             .is_empty()
     );
     assert!(
@@ -141,7 +141,7 @@ async fn storage_failure_preserves_mode_and_stopped_handles_fail() {
             )
             .await
             .unwrap()
-            .memories
+            .pinned
             .is_empty()
     );
     kernel.stop(&id).await.unwrap();

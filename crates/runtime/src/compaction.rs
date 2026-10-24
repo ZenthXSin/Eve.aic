@@ -249,6 +249,7 @@ mod tests {
                 revision: "test".into(),
                 profile: String::new(),
                 memories: vec![],
+                pinned: vec![],
                 history: vec![
                     ChatMessage::text(ChatRole::User, ""),
                     ChatMessage::text(ChatRole::Assistant, "done"),
@@ -316,6 +317,7 @@ mod tests {
             profile: String::new(),
             memories: vec![],
             history: vec![],
+            pinned: vec![],
         };
         let mut state = State::new(&mut context, &service, None);
         let mut messages = vec![

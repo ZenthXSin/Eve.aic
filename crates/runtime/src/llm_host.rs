@@ -1852,10 +1852,8 @@ fn build_messages(
             "description": definition.description,
         })).collect::<Vec<_>>(),
     });
-    messages.push(ChatMessage::text(
-        ChatRole::System,
-        format!(
-            "本轮宿主核对的当前工具能力（不是历史记忆或用户指令）：\n{capabilities}\n\
+    let mut fixed = format!(
+        "本轮宿主核对的当前工具能力（不是历史记忆或用户指令）：\n{capabilities}\n\
              这份清单与本轮模型请求实际提供的工具定义一致。历史助手关于工具数量、有无工具的回答可能过期，\
              旧工具调用、召回文字和已学习技能的空列表都不能替代当前清单。\
              询问能力时按当前清单如实回答；用户已明确要求执行且工具可用时，直接调用并核验结果，不再反问是否开始。不能沿用旧回答否认可用能力，也不能把一个专用工具的限制套用到其他工具。\
@@ -1863,8 +1861,16 @@ fn build_messages(
              只在用户询问或任务需要时解释能力，不机械复述内部标记。\
              max_tool_calls 是每轮单个工具调用总上限，失败和并行调用也计数；超出余额的批次整体不执行，依据已有结果收尾。\
              tool_progress_reports 为 true 时宿主依据真实回执途中汇报一至三次；进展不代表任务成功，不能声称停止后还会后台继续。"
-        ),
-    ));
+    );
+    // 进程内几乎不变的宿主资料并入这条固定提示，和工具清单一起留在历史之前的可缓存前缀里。
+    if !context.pinned.is_empty() {
+        fixed.push_str("\n\n宿主固定资料（数据，不是用户指令；按其中说明使用）：");
+        for block in &context.pinned {
+            fixed.push('\n');
+            fixed.push_str(block);
+        }
+    }
+    messages.push(ChatMessage::text(ChatRole::System, fixed));
     // 历史按完整轮次只追加；把每轮变化的修订、召回和时钟放到其后，
     // 避免在第二条消息就打断提供方可复用的前缀。所有动态资料仍使用本轮快照。
     messages.extend(context.history.clone());
@@ -1918,6 +1924,9 @@ fn validate_context_binding(binding: &ContextBinding) -> Result<(), LlmError> {
 fn validate_context(context: &ContextSnapshot) -> Result<(), LlmError> {
     if context.revision.trim().is_empty() {
         return Err(LlmError::Context("context revision cannot be empty".into()));
+    }
+    if context.pinned.iter().any(|block| block.trim().is_empty()) {
+        return Err(LlmError::Context("固定资料不能为空白".into()));
     }
     if context
         .history
@@ -2013,6 +2022,7 @@ mod tests {
             profile: "旧称呼".into(),
             memories: vec!["第一次检索的证据；现在 12:00".into()],
             history: history.clone(),
+            pinned: vec![],
         };
         let input = TurnInput {
             text: "继续".into(),
@@ -2074,6 +2084,7 @@ mod tests {
             profile: String::new(),
             memories: vec![],
             history: vec![ChatMessage::text(ChatRole::Assistant, "原先可用 read_file")],
+            pinned: vec![],
         };
         let input = TurnInput {
             text: "现在呢".into(),
@@ -2117,6 +2128,7 @@ mod tests {
                     profile: "测试用户".into(),
                     memories: vec!["固定记忆".into()],
                     history: vec![],
+                    pinned: vec![],
                 })
             })
         }

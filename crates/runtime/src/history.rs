@@ -98,6 +98,7 @@ mod tests {
             revision: "history-test".into(),
             profile: String::new(),
             memories: vec![],
+            pinned: vec![],
             history: vec![
                 ChatMessage::text(ChatRole::User, "旧输入"),
                 ChatMessage::text(ChatRole::Assistant, "旧回答".repeat(50)),

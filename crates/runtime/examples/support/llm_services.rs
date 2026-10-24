@@ -20,6 +20,7 @@ impl ContextAssembler for ExampleContext {
                 profile: "示例用户".into(),
                 memories: vec!["偏好中文回答".into()],
                 history: vec![],
+                pinned: vec![],
             })
         })
     }

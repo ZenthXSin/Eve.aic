@@ -71,7 +71,8 @@ impl ContextAssembler for HostFactsContext {
                 },
                 "reply_max_output_tokens": limit,
             });
-            context.memories.push(format!("{NOTICE}{data}"));
+            // 只随配置变化，放进可缓存的固定资料。
+            context.pinned.push(format!("{NOTICE}{data}"));
             context.revision = format!(
                 "{}:eve-host-facts-1:{}:{}:{}",
                 context.revision,

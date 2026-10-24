@@ -397,6 +397,7 @@ impl ContextAssembler for ReflectionContext {
                 profile: String::new(),
                 memories: vec![],
                 history: vec![],
+                pinned: vec![],
             })
         })
     }

@@ -37,6 +37,7 @@ fn base() -> ContextSnapshot {
         revision: "base-7".into(),
         profile: "宿主配置的资料".into(),
         memories: vec!["原装配器提供的记忆".into()],
+        pinned: vec![],
         history: vec![
             ChatMessage::text(ChatRole::User, "上一条用户原文"),
             ChatMessage::text(ChatRole::Assistant, "上一条回复"),
@@ -353,7 +354,8 @@ async fn training_context_is_preserved_and_no_scope_does_not_read_memory() {
         .await
         .unwrap();
     assert!(!before.profile.is_empty());
-    assert!(!before.memories.is_empty());
+    // 训练开关提示属于固定资料；记忆层原样保留，不并入每轮资料。
+    assert!(!before.pinned.is_empty());
     let context = MemoryContext::new("qq", Arc::new(admin.clone()), wrapped).unwrap();
     assert_eq!(
         context
@@ -369,6 +371,7 @@ async fn training_context_is_preserved_and_no_scope_does_not_read_memory() {
         .unwrap();
     assert_eq!(after.profile, before.profile);
     assert_eq!(after.history, before.history);
+    assert_eq!(after.pinned, before.pinned);
     assert_eq!(after.memories[..before.memories.len()], before.memories);
     assert_eq!(
         after.revision,
