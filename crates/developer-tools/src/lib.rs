@@ -252,7 +252,15 @@ impl Tool for DeveloperTool {
             let operation = self
                 .operation(&call.arguments)
                 .map_err(|_| ToolExecutionError::Failed("开发工具参数无效".into()))?;
-            self.backend.execute(operation, context).await
+            match self.backend.execute(operation, context).await {
+                Err(ToolExecutionError::Failed(message))
+                    if matches!(self.kind, Kind::List | Kind::Read | Kind::Search) =>
+                {
+                    // 这些操作只有只读语义；输入或读取失败不意味着工作区已经修改。
+                    Err(ToolExecutionError::Rejected(message))
+                }
+                result => result,
+            }
         })
     }
 }

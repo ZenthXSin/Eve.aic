@@ -159,7 +159,8 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
             self.assertIn("超过宿主上限 200", json.dumps(results, ensure_ascii=False))
             return text_response("步数太多，没有派发。")
         self.callback = respond
-        self.run_eve(self.send(self.message("ask", ASK, expected="步数太多，没有派发。")))
+        self.run_eve(self.send(self.message("ask", ASK, expected="步数太多，没有派发。")),
+                     env_extra={"EVE_TASK_MAX_STEPS":"200"})
         self.assertEqual(self.tasks(), [])
 
     def held_worker(self, body):
