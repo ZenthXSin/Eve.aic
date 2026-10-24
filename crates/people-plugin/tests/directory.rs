@@ -425,3 +425,134 @@ async fn invalid_visit_records_refuse_to_start_and_keep_the_bytes() {
         .unwrap();
     assert!(kernel.start(&plugin_id()).await.is_err());
 }
+
+struct Links(Result<Vec<String>, ()>);
+impl PersonLinks for Links {
+    fn linked(&self, current: &str, candidates: &[String]) -> PluginResult<Vec<String>> {
+        assert_eq!(current, id(2));
+        assert!(!candidates.contains(&id(2)), "候选不含本人当前会话");
+        self.0
+            .clone()
+            .map_err(|_| PluginError::Task("身份目录不可用".into()))
+    }
+}
+/// 给某人学会若干条印象；每条原话都出现在本批里。
+fn teach(people: &PeopleController, user: usize, items: &[(&str, &str)], now: u64) {
+    let mut notes: Vec<&str> = items.iter().map(|(_, quote)| *quote).collect();
+    let fillers = ["我今天有点忙", "我先去吃饭", "我回来了", "我在路上"];
+    notes.extend(fillers.iter().take(IMPRESSION_BATCH - notes.len()));
+    for text in notes {
+        people.note(&id(user), text).unwrap();
+    }
+    let batch = people.take_impression_batch().unwrap().unwrap();
+    assert_eq!(batch.participant, id(user));
+    let drafts = items
+        .iter()
+        .map(|(text, quote)| draft(text, quote, None))
+        .collect();
+    people.finish_impression_batch(&batch, drafts, now).unwrap();
+}
+#[tokio::test]
+async fn linked_impressions_follow_host_links_dedupe_and_stay_bounded() {
+    let state = Arc::new(MemoryStateStore::default());
+    let (_kernel, people) = start_learning(state.clone()).await;
+    for (conversation, user, scene) in [
+        (1, 2, Scene::Group),
+        (5, 4, Scene::Group),
+        (7, 6, Scene::Private),
+        (9, 8, Scene::Group),
+    ] {
+        people.observe(scope(conversation, user), None).unwrap();
+        people.visit(&id(user), scene, 1).unwrap();
+    }
+    teach(&people, 2, &[("养猫", "我养猫")], 10);
+    teach(
+        &people,
+        4,
+        &[
+            ("养猫", "我也养猫"),
+            ("在学 Rust", "我在学Rust"),
+            ("住北京", "我住北京"),
+        ],
+        20,
+    );
+    teach(
+        &people,
+        6,
+        &[
+            ("是护士", "我是护士"),
+            ("早睡", "我一般十点睡"),
+            ("怕冷", "我很怕冷"),
+        ],
+        30,
+    );
+    teach(
+        &people,
+        8,
+        &[
+            ("会弹琴", "我会弹琴"),
+            ("喜欢爬山", "我喜欢爬山"),
+            ("住上海", "我住上海"),
+        ],
+        40,
+    );
+
+    let none = people
+        .linked_impressions(&id(2), &Links(Ok(vec![])))
+        .unwrap();
+    assert_eq!(none, LinkedImpressions::default(), "未授权的来源一律不读");
+
+    let group = people
+        .linked_impressions(&id(2), &Links(Ok(vec![id(4)])))
+        .unwrap();
+    let texts: Vec<_> = group.items.iter().map(|i| i.text.as_str()).collect();
+    assert_eq!(texts, ["住北京", "在学 Rust"], "本会话已有的说法不重复");
+    assert!(
+        group
+            .items
+            .iter()
+            .all(|i| i.scene == Some(Scene::Group) && i.updated_at_ms == 20)
+    );
+    assert_eq!((group.sources, group.truncated), (1, false));
+    assert_eq!(
+        people.impressions(&id(2)).unwrap().len(),
+        1,
+        "只读，不迁移印象"
+    );
+
+    let all_links = || Links(Ok(vec![id(4), id(6), id(8)]));
+    let all = people.linked_impressions(&id(2), &all_links()).unwrap();
+    assert_eq!(all.items.len(), MAX_LINKED_IMPRESSIONS, "去重后刚好到上限");
+    assert_eq!((all.sources, all.truncated), (3, false));
+    assert!(
+        all.items
+            .iter()
+            .any(|i| i.text == "是护士" && i.scene == Some(Scene::Private))
+    );
+    teach(&people, 8, &[("会做饭", "我会做饭")], 50);
+    let all = people.linked_impressions(&id(2), &all_links()).unwrap();
+    assert_eq!(all.items.len(), MAX_LINKED_IMPRESSIONS);
+    assert!(all.truncated);
+    assert_eq!(all.items[0].text, "会做饭", "新的在前");
+    let view = serde_json::to_value(&all.items[0]).unwrap();
+    assert_eq!(view["scene"], "group");
+
+    assert!(
+        people.linked_impressions(&id(2), &Links(Err(()))).is_err(),
+        "身份判断失败不当作没有"
+    );
+    let stranger = format!("qq:{:064x}", 99);
+    assert!(
+        people
+            .linked_impressions(&id(2), &Links(Ok(vec![stranger])))
+            .is_err(),
+        "宿主返回未知来源时拒绝"
+    );
+    assert_eq!(
+        people
+            .linked_impressions(&format!("qq:{:064x}", 77), &Links(Ok(vec![id(4)])))
+            .unwrap(),
+        LinkedImpressions::default(),
+        "没见过的人没有可合并的印象"
+    );
+}

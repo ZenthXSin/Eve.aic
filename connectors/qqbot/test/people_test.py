@@ -160,6 +160,66 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
         mine = next(p for p in self.people_state()["people"] if p.get("impressions"))["impressions"]
         self.assertEqual([i["text"] for i in mine], ["改学 Go 了"])
 
+    def save(self, namespace, **values):
+        code, page = self.panel("/api/plugin-pages/read", {"plugin_id": "eve.config", "page_id": namespace})
+        self.assertEqual(code, 200)
+        code, saved = self.panel("/api/plugin-pages/save", {"plugin_id": "eve.config", "page_id": namespace,
+                                 "instance": page["instance"], "expected_revision": page["revision"],
+                                 "values": values})
+        self.assertEqual(code, 200)
+
+    def test_impressions_follow_the_same_person_across_sessions_with_memory_visibility(self):
+        group_talk = ["我最近在学Rust", "我养了一只橘猫", "今天好累啊我", "我下周要去成都出差"]
+        private_talk = ["我其实是护士", "我上夜班", "我有点累", "我先睡了"]
+        def impressions(batch):
+            if batch["messages"] == group_talk:
+                return {"impressions": [{"text": "在学 Rust", "quote": "我最近在学Rust", "replaces": None}]}
+            self.assertEqual(batch["messages"], private_talk)
+            return {"impressions": [{"text": "是护士", "quote": "我其实是护士", "replaces": None}]}
+        self.impression_reply = impressions
+        seen = {}
+        def respond(body):
+            seen[body["messages"][-1]["content"]] = self.facts(body)
+            return text_response("好")
+        self.callback = respond
+        def say(mid, text, user="user-1", scope="group", target="group-1"):
+            return self.send(self.message(mid, text, user=user, scope=scope, target=target, expected="好"))
+        route = lambda scope, target: "qq:" + hashlib.sha256(json.dumps(
+            ["1904159860", scope, target, "user-1"], separators=(",", ":")).encode()).hexdigest()
+        bound = " ".join([route("c2c", "user-1"), route("group", "group-1"), route("group", "group-2")])
+        self.enabled([*[step for i, text in enumerate(group_talk) for step in say(f"g{i}", text)],
+                      *self.checkpoint("group-learned"),
+                      *say("other-group", "又见面了", target="group-2"),
+                      *say("someone-else", "大家好", user="user-2", target="group-2"),
+                      *[step for i, text in enumerate(private_talk)
+                        for step in say(f"p{i}", text, scope="c2c", target=None)],
+                      *self.checkpoint("private-learned"),
+                      *say("private-unbound", "私聊问一下", scope="c2c", target=None),
+                      *self.checkpoint("bind"),
+                      *say("private-bound", "绑定后私聊", scope="c2c", target=None),
+                      *say("group-bound", "绑定后在群里", target="group-2"),
+                      *self.checkpoint("disable"),
+                      *say("group-disabled", "关掉以后", target="group-2")],
+                     checkpoints={"group-learned": lambda: self.wait_learned(1),
+                                  "private-learned": lambda: self.wait_learned(2),
+                                  "bind": lambda: self.save("runtime.people", owner_principals=bound),
+                                  "disable": lambda: self.save("runtime.memory_continuity", enabled=False)},
+                     panel=True)
+        linked = lambda text: [(i["text"], i.get("scene")) for i in
+                               seen[text].get("linked_impressions", {}).get("items", [])]
+        # 同一平台账号在另一个群：读到前一个群里自述的事，但印象仍留在原会话。
+        self.assertEqual(linked("又见面了"), [("在学 Rust", "group")])
+        self.assertNotIn("impressions", seen["又见面了"]["people"]["current"])
+        self.assertEqual(linked("大家好"), [], "别人读不到")
+        # 群与私聊的平台标识属于不同命名空间，没有明确绑定前不关联。
+        self.assertEqual(linked("私聊问一下"), [])
+        self.assertEqual(linked("绑定后私聊"), [("在学 Rust", "group")], "私聊可读同一人在群里说的")
+        self.assertEqual(linked("绑定后在群里"), [("在学 Rust", "group")], "私聊里说的默认不进群")
+        self.assertEqual(linked("关掉以后"), [], "关闭跨会话记忆后同时停止合并印象")
+        mine = [p for p in self.people_state()["people"] if p.get("impressions")]
+        self.assertEqual(sorted(i["text"] for p in mine for i in p["impressions"]), ["在学 Rust", "是护士"])
+        self.assertEqual(len(mine), 2, "只读合并，不搬迁或复制印象")
+
     def test_unverifiable_impressions_are_rejected_and_disabled_learning_sends_nothing(self):
         talk = ["我是做前端的", "我喜欢爬山", "我最近睡得很晚", "我想换个工作"]
         self.impression_reply = lambda batch: {"impressions": [{"text": "是医生", "quote": "我是医生", "replaces": None}]}
