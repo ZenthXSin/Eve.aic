@@ -232,7 +232,9 @@ class InterestAcceptance(unittest.TestCase):
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
                    EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete",
                    # 逐条等待回复的场景不涉及连发；合并窗口由 debounce_test 显式开启。
-                   EVE_DEBOUNCE_MS="0")
+                   EVE_DEBOUNCE_MS="0",
+                   # 主动短消息会多注册 send_message 工具；由 live_dialogue_test 显式开启。
+                   EVE_QQ_LIVE_INTERACTION="false")
         env.update(env_extra or {})
         bootstrap_test_admin(self.work / "state", env)
         command = [str(BINARY), "--state-dir", str(self.work / "state"),
