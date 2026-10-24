@@ -135,7 +135,7 @@ impl Message {
         let files = self.attachments.len() - images;
         let mut note = String::from("【通道附件信息】");
         if images > 0 {
-            note.push_str(&format!("收到 {images} 个图片附件，已保存引用，尚未获取像素或进行视觉解析。不能声称已经看见或推测图片内容。"));
+            note.push_str(&format!("收到 {images} 个图片附件，已保存引用，尚未获取像素或进行视觉解析。不能声称已经看见或推测图片内容；想知道内容时，有识图工具就先自己调用去看，不要干等对方解释。"));
         }
         if files > 0 {
             let names: Vec<&str> = self
