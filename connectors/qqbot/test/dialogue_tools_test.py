@@ -8,7 +8,8 @@ import unittest
 
 import practice_test
 
-PLATFORM_TOOLS = {"send_file", "read_attachment", "describe_image", "read_raw_message"}
+CONTEXT_TOOLS = {"clear_context", "clear_all_contexts"}
+PLATFORM_TOOLS = CONTEXT_TOOLS | {"send_file", "read_attachment", "describe_image", "read_raw_message"}
 
 # 开启交互记忆时注册的工具：记忆检索、保存偏好与约定。
 MEMORY_TOOLS = {"search_memory", "save_preference", "note_commitment", "settle_commitment"}
@@ -98,7 +99,7 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
             self.assertIn("URL 不在", json.dumps(results[-1], ensure_ascii=False))
             return text_response("工具已实际调用")
         self.callback = respond
-        self.full([*self.send(self.message("help", "/help", contains=["21 个", "read_source", "run_practice"])),
+        self.full([*self.send(self.message("help", "/help", contains=["23 个", "read_source", "run_practice"])),
                    *self.send(self.message("tools", "调用工具测试", expected="工具已实际调用"))])
         self.assertEqual(self.chat_rounds, 2)
         self.assertEqual(len(self.kind("chat")), 2)
@@ -118,7 +119,7 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
         self.callback = respond
         self.run_eve([*self.send(self.message("own", "/remember " + marker, contains="偏好已保存")),
                       *self.send(self.message("foreign", "/remember " + foreign, user="user-2", contains="偏好已保存")),
-                      *self.send(self.message("help", "/help", contains="9 个")),
+                      *self.send(self.message("help", "/help", contains="11 个")),
                       *self.send(self.message("query", "查看记忆", expected="只读取当前会话"))],
                      interest=False, memory=True, research=False, practice=False)
         self.assertEqual(self.chat_rounds, 2)
@@ -146,12 +147,12 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
             if not self.results(body):
                 return tool_response([("list_interests", {}), ("list_goals", {})])
             self.assertEqual(len(self.results(body)), 2)
-            return text_response("当前可调用 21 个工具，刚才已核对兴趣与目标。")
+            return text_response("当前可调用 23 个工具，刚才已核对兴趣与目标。")
 
         self.callback = upgraded
-        self.full([*self.send(self.message("help-upgraded", "/help", contains="21 个")),
+        self.full([*self.send(self.message("help-upgraded", "/help", contains="23 个")),
                    *self.send(self.message("upgraded", "你现在有什么工具呢", expected=
-                                          "当前可调用 21 个工具，刚才已核对兴趣与目标。"))],
+                                          "当前可调用 23 个工具，刚才已核对兴趣与目标。"))],
                   more=["--self-learning", "--memory-recall", "--training", "--skill-learning",
                         "--tool-forging", "--plans", "--outreach"])
         self.assertEqual(len(self.kind("chat")), 3)
@@ -160,13 +161,13 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
         def reduced(body):
             self.assertEqual(self.definitions(body), PLATFORM_TOOLS | MEMORY_TOOLS | {"echo"})
             self.current_capabilities(body)
-            self.assertTrue(any(m["role"] == "assistant" and "21 个工具" in
+            self.assertTrue(any(m["role"] == "assistant" and "23 个工具" in
                                 (m.get("content") or "") for m in body["messages"]))
-            return text_response("当前只装配了 7 个工具，原历史仍保留。")
+            return text_response("当前只装配了 11 个工具，原历史仍保留。")
 
         self.callback = reduced
         self.run_eve(self.send(self.message("reduced", "你现在有什么工具呢", expected=
-                                           "当前只装配了 7 个工具，原历史仍保留。")),
+                                           "当前只装配了 11 个工具，原历史仍保留。")),
                      interest=False, memory=True, research=False, practice=False)
         self.assertEqual(len(self.kind("chat")), 4)
 

@@ -15,8 +15,8 @@ use std::{
 
 /// 失败输入仍可解释后续“进展如何”“换个方式再来”，但宿主告知未完成，工具调用绝不重放。
 /// 取消轮不回放；确认没有启动工具的失败轮也回放输入，否则下一轮“分几次写吧”之类的接续会失去所指。
-fn history_with_failures(snapshot: &SessionSnapshot) -> Vec<ChatMessage> {
-    snapshot.turns.iter().flat_map(|turn| match &turn.status {
+fn history_with_failures(snapshot: &SessionSnapshot, through: u64) -> Vec<ChatMessage> {
+    snapshot.turns.iter().filter(|turn| turn.id > through).flat_map(|turn| match &turn.status {
             SessionTurnStatus::Completed { messages } => messages.clone(),
             SessionTurnStatus::Failed { failure } if failure.code != SessionFailureCode::Cancelled => {
                 let evidence = failure.evidence.as_ref();
@@ -42,6 +42,28 @@ fn history_with_failures(snapshot: &SessionSnapshot) -> Vec<ChatMessage> {
 
 pub const SESSION_STATE_KEY: &str = "sessions.v1";
 const FORMAT_VERSION: u32 = 1;
+pub const CONTEXT_RESETS_STATE_KEY: &str = "context-resets.v1";
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextBoundary {
+    key: SessionKey,
+    through: u64,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextResets {
+    format_version: u32,
+    boundaries: BTreeMap<String, ContextBoundary>,
+}
+impl Default for ContextResets {
+    fn default() -> Self {
+        Self {
+            format_version: 1,
+            boundaries: BTreeMap::new(),
+        }
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +81,7 @@ impl Default for Document {
 }
 struct Inner {
     document: Document,
+    resets: ContextResets,
     active: bool,
 }
 struct StoredSessions {
@@ -80,6 +103,34 @@ impl StoredSessions {
         };
         if document.format_version != FORMAT_VERSION {
             return Err(SessionError::UnsupportedVersion);
+        }
+        let resets: ContextResets = match context
+            .state_get(CONTEXT_RESETS_STATE_KEY)
+            .map_err(|_| SessionError::Storage)?
+        {
+            None => ContextResets::default(),
+            Some(bytes) => serde_json::from_value(
+                strict_json::from_slice(&bytes).map_err(|_| SessionError::CorruptState)?,
+            )
+            .map_err(|_| SessionError::CorruptState)?,
+        };
+        if resets.format_version != 1 {
+            return Err(SessionError::UnsupportedVersion);
+        }
+        for (id, boundary) in &resets.boundaries {
+            let snapshot = document
+                .sessions
+                .get(id)
+                .ok_or(SessionError::CorruptState)?;
+            if boundary.key != snapshot.key
+                || boundary.through == 0
+                || snapshot
+                    .turns
+                    .last()
+                    .is_none_or(|turn| boundary.through > turn.id)
+            {
+                return Err(SessionError::CorruptState);
+            }
         }
         let mut recovered = false;
         for (id, snapshot) in &mut document.sessions {
@@ -110,6 +161,7 @@ impl StoredSessions {
             context,
             inner: Mutex::new(Inner {
                 document,
+                resets,
                 active: true,
             }),
         })
@@ -166,6 +218,48 @@ impl StoredSessions {
     }
 }
 impl SessionService for StoredSessions {
+    fn reset_context(&self, key: Option<&SessionKey>) -> SessionResult<usize> {
+        let mut inner = self.lock()?;
+        if let Some(key) = key {
+            key.validate()?;
+            if inner
+                .document
+                .sessions
+                .get(&key.session_id)
+                .is_some_and(|s| s.key != *key)
+            {
+                return Err(SessionError::OwnerMismatch);
+            }
+        }
+        let mut next = inner.resets.clone();
+        let mut affected = 0;
+        for (id, snapshot) in &inner.document.sessions {
+            if key.is_none_or(|key| key == &snapshot.key)
+                && let Some(last) = snapshot.turns.last()
+            {
+                next.boundaries.insert(
+                    id.clone(),
+                    ContextBoundary {
+                        key: snapshot.key.clone(),
+                        through: last.id,
+                    },
+                );
+                affected += 1;
+            }
+        }
+        let bytes = serde_json::to_vec(&next).map_err(|_| SessionError::CorruptState)?;
+        if self
+            .context
+            .state_set(CONTEXT_RESETS_STATE_KEY, bytes)
+            .is_err()
+        {
+            // 写入结果可能不确定，停止旧句柄，不能继续携带可能已清空的上下文。
+            inner.active = false;
+            return Err(SessionError::Storage);
+        }
+        inner.resets = next;
+        Ok(affected)
+    }
     fn list_keys(&self, after: Option<&str>, limit: usize) -> SessionResult<Vec<SessionKey>> {
         let inner = self.lock()?;
         if !(1..=100).contains(&limit)
@@ -199,6 +293,11 @@ impl SessionService for StoredSessions {
             return Err(SessionError::InvalidInput);
         }
         let mut inner = self.lock()?;
+        let through = inner
+            .resets
+            .boundaries
+            .get(&input.key.session_id)
+            .map_or(0, |b| b.through);
         let mut next = inner.document.clone();
         let snapshot = next
             .sessions
@@ -236,7 +335,7 @@ impl SessionService for StoredSessions {
                 turn_id: id,
             },
             revision: snapshot.revision,
-            history: history_with_failures(snapshot),
+            history: history_with_failures(snapshot, through),
         };
         self.save(&mut inner, next)?;
         Ok(result)

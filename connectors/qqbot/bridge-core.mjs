@@ -30,6 +30,12 @@ function isGroupAt(msg, appId) {
   return validId(appId) && typeof msg.content === "string" &&
     new RegExp(`<@!?${appId}>`).test(msg.content);
 }
+// 名字前缀是明确呼叫，走普通会话；不冒充平台 @，也不交给插话判断。
+function isGroupNameWake(msg) {
+  return msg.kind === "group" &&
+    ["GROUP_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE"].includes(msg.rawEventType) &&
+    typeof msg.content === "string" && /^eve/i.test(msg.content.trimStart());
+}
 // QQ 表情在正文里是 <faceType=..,faceId="..",ext="base64(JSON)"> 或旧式 [<face,id=..>]；
 // 转成模型读得懂的【表情：名字】，名字取自 ext 的 text，解不出时只标出这是表情。
 function faceLabel(name) {
@@ -229,7 +235,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
   bot.on("message", (_ctx, msg) => {
     if (closed) return;
     if (!["c2c", "group"].includes(msg.kind) || msg.senderIsBot ||
-        (msg.kind === "group" && !isGroupAt(msg, bot.appId) &&
+        (msg.kind === "group" && !isGroupAt(msg, bot.appId) && !isGroupNameWake(msg) &&
           !(group.observe && msg.rawEventType === "GROUP_MESSAGE_CREATE"))) {
       warn("unsupported_message"); return;
     }
@@ -267,7 +273,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         ...(validName?{sender_name:senderName}:{})};
       if (Buffer.byteLength(JSON.stringify(observation)) <= MAX_FRAME) emit(observation);
       else { warn("frame_limit"); return; }
-      if (!isGroupAt(msg,bot.appId)) return;
+      if (!isGroupAt(msg,bot.appId) && !isGroupNameWake(msg)) return;
     }
     pending.set(msg.messageId, { target: { ...target }, senderId:msg.senderId, sending: false, receivedAt: now() });
     send(frame);
