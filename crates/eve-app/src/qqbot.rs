@@ -1062,6 +1062,9 @@ async fn run_qqbot_composed(
             let store = Arc::new(eve_group_observation_sqlite::SqliteGroupObservations::open(
                 &options.state_directory.join("group-observations.sqlite3"),
             )?);
+            bootstrap.tools.push(Arc::new(crate::qq_group_recall::RecallTool::new(
+                store.clone(), conversations.clone(),
+            )));
             // 群消息摘要单独成库；整理按需在对话工具里进行，不常驻后台。
             let digests = Arc::new(eve_group_observation_sqlite::SqliteGroupDigests::open(
                 &options.state_directory.join("group-digests.sqlite3"),
@@ -1626,15 +1629,11 @@ async fn run_qqbot_composed(
             }
             None => context,
         };
-        // Jev 原话挑选器在 Jev 群判断装配后注入；未开启 Jev 时群上下文只附最近原话。
-        let group_recall: Arc<std::sync::OnceLock<Arc<dyn eve_chime_api::GroupRecallSelector>>> =
-            Arc::default();
         let context: Arc<dyn ContextAssembler> = if let Some(group) = &group {
             Arc::new(crate::qq_group::Context {
                 wrapped: context,
                 group: group.clone(),
                 conversations: conversations.clone(),
-                recall: group_recall.clone(),
             })
         } else {
             context
@@ -2103,7 +2102,6 @@ async fn run_qqbot_composed(
                     registry.as_ref(),
                 )?)?;
                 group_jev = Some(judge.clone());
-                let _ = group_recall.set(judge.clone());
                 let store = Arc::new(eve_relation_experience_sqlite::SqliteGroupRelations::open(
                     &options.state_directory.join("jev-group-experience.sqlite3"),
                 )?);
