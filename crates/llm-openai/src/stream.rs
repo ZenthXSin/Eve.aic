@@ -97,6 +97,7 @@ pub(crate) struct ResponseStream {
     response_id: Option<String>,
     sequence: Option<u64>,
     items: Vec<Item>,
+    usage: Option<eve_llm_api::ModelUsage>,
 }
 pub(crate) enum Update {
     None,
@@ -104,6 +105,11 @@ pub(crate) enum Update {
     Completed(ModelResponse),
 }
 impl ResponseStream {
+    /// response.completed 中报告的用量。
+    pub(crate) fn usage(&self) -> Option<eve_llm_api::ModelUsage> {
+        self.usage
+    }
+
     pub fn event(&mut self, name: &str, data: &str) -> Result<Update, LlmError> {
         let event: Value =
             crate::strict_json::from_slice(data.as_bytes()).map_err(|_| invalid())?;
@@ -330,6 +336,7 @@ impl ResponseStream {
                 let completed = crate::wire::decode_response(
                     &serde_json::to_vec(response).map_err(|_| invalid())?,
                 )?;
+                self.usage = response.get("usage").and_then(crate::usage::from_usage);
                 return Ok(Update::Completed(completed));
             }
             _ => return Err(unsupported()),
