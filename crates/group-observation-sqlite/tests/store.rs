@@ -163,3 +163,26 @@ fn legacy_confirmed_pushes_recover_complete_questions_and_answers_but_not_unknow
     let store = SqliteGroupObservations::open(&path).unwrap();
     assert_eq!(store.exchanges("g1").unwrap().len(), 1);
 }
+
+#[test]
+fn observations_are_read_incrementally_by_sequence_within_one_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteGroupObservations::open(&dir.path().join("group.db")).unwrap();
+    for (index, group) in ["g1", "g2", "g1", "g1"].into_iter().enumerate() {
+        let mut m = message(group);
+        m.id = format!("m{index}");
+        store.append(&m).unwrap();
+    }
+    let all = store.after("g1", 0, 10).unwrap();
+    assert_eq!(
+        all.iter()
+            .map(|o| o.message.id.as_str())
+            .collect::<Vec<_>>(),
+        ["m0", "m2", "m3"]
+    );
+    assert!(all.windows(2).all(|w| w[0].seq < w[1].seq));
+    let rest = store.after("g1", all[0].seq, 1).unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].message.id, "m2");
+    assert!(store.after("g1", all[2].seq, 10).unwrap().is_empty());
+}
