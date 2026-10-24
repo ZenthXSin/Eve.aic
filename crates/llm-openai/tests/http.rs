@@ -314,3 +314,36 @@ async fn model_list_failures_are_reported_not_guessed() {
         Err(LlmError::Protocol(_))
     ));
 }
+
+#[derive(Default)]
+struct Usages(std::sync::Mutex<Vec<(String, eve_llm_api::ModelUsage)>>);
+impl eve_llm_api::ModelUsageObserver for Usages {
+    fn reported(&self, role: &str, usage: eve_llm_api::ModelUsage) {
+        self.0.lock().unwrap().push((role.into(), usage));
+    }
+}
+
+#[tokio::test]
+async fn reports_provider_usage_and_cache_hits_to_the_observer() {
+    let mut with_usage = final_response("好");
+    with_usage["usage"] = json!({"input_tokens":1200,"output_tokens":5,"input_tokens_details":{"cached_tokens":1024}});
+    let server = Server::start(vec![
+        Reply::json(with_usage),
+        Reply::json(final_response("再来")),
+    ])
+    .await;
+    let usages = std::sync::Arc::new(Usages::default());
+    let provider = OpenAiProvider::new(config(&server.url), "fake-key")
+        .unwrap()
+        .with_usage_observer(usages.clone(), "dialogue");
+    provider.complete(request()).await.unwrap();
+    provider.complete(request()).await.unwrap();
+    let seen = usages.0.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].0, "dialogue");
+    assert_eq!(
+        (seen[0].1.input_tokens, seen[0].1.cached_input_tokens),
+        (Some(1200), Some(1024))
+    );
+    assert!(seen[1].1.is_empty(), "未报告的用量如实为空");
+}
