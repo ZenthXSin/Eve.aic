@@ -133,7 +133,7 @@ pub(crate) fn openai_schema() -> ConfigSchema {
 /// 按用途的单次输出上限；0 表示沿用主模型的上限。随每次模型解析读取，保存后下一次请求生效。
 pub(crate) const MODEL_USES_NAMESPACE: &str = "runtime.model_uses";
 /// 用途名与健康记录、自主预算类别一致。
-pub(crate) const MODEL_USES: [&str; 19] = [
+pub(crate) const MODEL_USES: [&str; 20] = [
     "dialogue",
     "plan",
     "interest",
@@ -152,6 +152,7 @@ pub(crate) const MODEL_USES: [&str; 19] = [
     "impression",
     "chime",
     "group_relation_learning",
+    "group_digest",
     "sticker",
 ];
 /// 单次输出上限与 provider.openai.max_output_tokens 的上限一致。
