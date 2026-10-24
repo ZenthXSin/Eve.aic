@@ -76,6 +76,11 @@ impl ContextAssembler for IdentityContext {
             let Some(scope) = scope else {
                 return Ok(snapshot);
             };
+            // 群观察使用宿主内部会话身份，不是人名目录中的平台参与者。
+            // 沿用群上下文的说明和工具限制，不查询或推定某个人的身份卡。
+            if scope.user_id == crate::qq_group::USER {
+                return Ok(snapshot);
+            }
             let view = self
                 .people
                 .view(&scope.user_id)

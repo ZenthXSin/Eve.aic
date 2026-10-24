@@ -85,6 +85,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证引用和附件消息的记忆采集及重启不重放
         run: |
+          python -X utf8 connectors/qqbot/test/snapshot_reader_test.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
           python -X utf8 connectors/qqbot/test/memory_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

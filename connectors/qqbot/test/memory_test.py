@@ -100,9 +100,19 @@ class MemoryAcceptance(unittest.TestCase):
         self.directory.cleanup()
 
     def documents(self):
-        if not self.state_path.exists():
-            return {}
-        document = json.loads(self.state_path.read_text())
+        # Windows 在原子替换快照时可能短暂拒绝打开。只重试读取权限竞争，
+        # 不重跑模型/工具，不把持续失败或损坏数据当作空状态。
+        for attempt in range(11):
+            try:
+                text = self.state_path.read_text(encoding="utf-8")
+                break
+            except FileNotFoundError:
+                return {}
+            except PermissionError:
+                if attempt == 10:
+                    raise
+                time.sleep(0.01)
+        document = json.loads(text)
         return {owner: {key: json.loads(bytes(value)) for key, value in entries.items()}
                 for owner, entries in document["entries"].items()}
 
