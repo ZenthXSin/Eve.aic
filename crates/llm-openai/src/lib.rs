@@ -20,6 +20,7 @@ mod stream;
 mod strict_json;
 mod timeouts;
 mod timing;
+mod usage;
 mod vision;
 mod wire;
 
@@ -101,6 +102,7 @@ pub struct OpenAiProvider {
     transient_retries: bool,
     streamed_completions: bool,
     stream_timeouts: Option<StreamTimeoutPolicy>,
+    usage: Option<(std::sync::Arc<dyn eve_llm_api::ModelUsageObserver>, String)>,
 }
 
 impl OpenAiProvider {
@@ -170,7 +172,24 @@ impl OpenAiProvider {
             transient_retries: false,
             streamed_completions: false,
             stream_timeouts: None,
+            usage: None,
         })
+    }
+
+    /// 每次成功的对话请求后，把响应中报告的输入用量与缓存命中交给观察者；不改变请求。
+    pub fn with_usage_observer(
+        mut self,
+        observer: std::sync::Arc<dyn eve_llm_api::ModelUsageObserver>,
+        role: impl Into<String>,
+    ) -> Self {
+        self.usage = Some((observer, role.into()));
+        self
+    }
+
+    fn report_usage(&self, usage: Option<eve_llm_api::ModelUsage>) {
+        if let Some((observer, role)) = &self.usage {
+            observer.reported(role, usage.unwrap_or_default());
+        }
     }
 
     /// 只记录本地 HTTP 发起/响应头/解码时间，不保证远端已经接收，不输出正文或凭据。
@@ -530,6 +549,10 @@ impl OpenAiProvider {
                                 if let Some(timing) = &mut timing {
                                     timing.finish();
                                 }
+                                self.report_usage(match self.config.protocol {
+                                    OpenAiProtocol::Responses => state.usage(),
+                                    OpenAiProtocol::ChatCompletions => chat_state.usage(),
+                                });
                                 return Ok(response);
                             }
                         }
@@ -549,10 +572,11 @@ impl OpenAiProvider {
             OpenAiProtocol::Responses => wire::decode_response(&bytes),
             OpenAiProtocol::ChatCompletions => chat::decode_response(&bytes),
         };
-        if decoded.is_ok()
-            && let Some(timing) = &mut timing
-        {
-            timing.finish();
+        if decoded.is_ok() {
+            if let Some(timing) = &mut timing {
+                timing.finish();
+            }
+            self.report_usage(usage::from_body(&bytes));
         }
         decoded
     }

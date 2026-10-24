@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 eve-llm-api = { path = "../llm-api" }
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

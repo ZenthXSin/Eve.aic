@@ -64,6 +64,22 @@ class GroupRecallAcceptance(group_relation_test.GroupRelationAcceptance):
         self.assertEqual([m['text'] for m in context['related_earlier']], ['服务器地址是 mdt.example.com 记一下'])
         self.assertIn('地址是 mdt.example.com', json.dumps(self.receipt('ask-1'), ensure_ascii=False))
 
+    def test_recall_waits_for_the_slot_held_by_relation_judging(self):
+        # 群关系判断与挑选共用 Jev 名额（默认 1）。判断慢时挑选应排队等名额，而不是直接放弃。
+        self.relation_delay = 1.2
+        self.recall_score = lambda c: 0.95 if '服务器地址' in c['text'] else 0.1
+        old = [self.observation('addr', '服务器地址是 mdt.example.com 记一下')]
+        filler = [self.observation(f'chat-{i}', f'闲聊第{i}句') for i in range(8)]
+        self.run_eve([*old, *filler, *self.checkpoint('stored-1'), *self.ask('ask-1', '刚才那个服务器地址是多少')],
+                     checkpoints={'stored-1': self.stored(9)})
+        self.assertEqual(len(self.recall_arrivals), 1, '挑选没有排队等名额，被直接跳过')
+        [arrival] = self.recall_arrivals
+        # 挑选开始时名额正被关系判断占用，判断结束后挑选才到达 Jev。
+        self.assertTrue(any(start < arrival and end - 0.05 <= arrival for start, end in self.relation_spans),
+                        self.relation_spans)
+        [context] = self.contexts
+        self.assertEqual([m['text'] for m in context['related_earlier']], ['服务器地址是 mdt.example.com 记一下'])
+
     def test_jev_failure_keeps_recent_messages_only(self):
         self.jev_status = 503
         filler = [self.observation(f'chat-{i}', f'闲聊第{i}句') for i in range(8)]

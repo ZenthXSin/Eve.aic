@@ -440,6 +440,8 @@ pub struct LlmHost {
     history_digests: Option<Arc<dyn eve_llm_api::HistoryDigests>>,
     history_window: Option<eve_llm_api::HistoryWindow>,
     compaction_policy: Option<eve_llm_api::ContextCompactionPolicy>,
+    /// 本轮尚未调用工具时使用的较小阈值；见 `HistoryWindowResolver::casual_compaction`。
+    casual_compaction_policy: Option<eve_llm_api::ContextCompactionPolicy>,
     execution_budget: Option<Arc<eve_llm_api::TurnBudget>>,
     tool_scope_policy: Option<Arc<dyn eve_llm_api::ToolScopePolicy>>,
     shared_steps: Option<eve_llm_api::SharedToolSteps>,
@@ -499,6 +501,7 @@ impl LlmHost {
             history_digests: None,
             history_window: None,
             compaction_policy: None,
+            casual_compaction_policy: None,
             execution_budget: None,
             tool_scope_policy: None,
             shared_steps: None,
@@ -648,7 +651,16 @@ impl LlmHost {
             if let Some(policy) = policy {
                 policy.validate()?;
             }
+            let casual = catch_unwind(AssertUnwindSafe(|| resolver.casual_compaction()))
+                .map_err(|_| LlmError::Backend("压缩配置回调发生异常".into()))??;
+            if let Some(casual) = casual {
+                casual.validate()?;
+            }
             host.compaction_policy = policy;
+            // 闲聊阈值只在比主阈值更小时生效；主动压缩关闭时也不生效。
+            host.casual_compaction_policy = casual.filter(|casual| {
+                policy.is_some_and(|policy| casual.trigger_tokens < policy.trigger_tokens)
+            });
         }
         host.history_resolver = None;
         if let Some(resolver) = &self.model_resolver {
@@ -931,11 +943,19 @@ impl LlmHost {
                     transcript.push(message);
                 }
             }
-            if let (Some(state), Some(policy), Some(service)) = (
-                compaction.as_mut(),
-                self.compaction_policy,
-                self.history_digests.as_deref(),
-            ) {
+            // 本轮还没有任何工具调用（含恢复的旧调用）时按闲聊阈值压缩；一旦开始做事改用主阈值。
+            let policy = if diagnostics.calls.is_empty() {
+                self.casual_compaction_policy.or(self.compaction_policy)
+            } else {
+                self.compaction_policy
+            };
+            if let (Some(state), Some(policy), Some(service)) =
+                (compaction.as_mut(), policy, self.history_digests.as_deref())
+            {
+                let fallback = self
+                    .compaction_policy
+                    .filter(|full| *full != policy)
+                    .map(|full| full.trigger_tokens);
                 if !compaction_announced
                     && crate::compaction::estimate(&ModelRequest {
                         messages: messages.clone(),
@@ -952,7 +972,7 @@ impl LlmHost {
                 let result = tokio::select! { biased;
                     _ = wait_closed(events) => Err(LlmError::Cancelled),
                     _ = tokio::time::sleep(eve_llm_api::CONTEXT_COMPACTION_TIMEOUT) => Err(LlmError::Context("上下文压缩超过 5 分钟总期限；已经保存的摘要进度与工具回执保留，压缩后的下一次对话请求未发出".into())),
-                    result = contain_panic(state.compact(&mut messages, &definitions, policy, service, scope.as_ref())) => result,
+                    result = contain_panic(state.compact(&mut messages, &definitions, policy, service, scope.as_ref(), fallback)) => result,
                 };
                 if let Err(error) = result {
                     return Err(fail(error, diagnostics));

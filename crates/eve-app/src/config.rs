@@ -24,6 +24,13 @@ impl eve_config_api::ConfigValidator for CoreConfigValidator {
             if trigger != 0 && target >= trigger {
                 return Err(ConfigError::InvalidValue("压缩目标必须小于触发阈值".into()));
             }
+            let casual: usize = history.get("casual_compact_at_tokens")?;
+            let casual_target: usize = history.get("casual_compact_to_tokens")?;
+            if casual != 0 && casual_target >= casual {
+                return Err(ConfigError::InvalidValue(
+                    "闲聊压缩目标必须小于其触发阈值".into(),
+                ));
+            }
         }
         if let Some(people) = snapshots.get(crate::qq_people::NAMESPACE) {
             crate::qq_people::settings(people)
@@ -185,6 +192,14 @@ pub(crate) fn history_schema() -> ConfigSchema {
             (
                 "compact_to_tokens".into(),
                 field(100000, 1000, 999999, "EVE_CONTEXT_COMPACT_TO_TOKENS"),
+            ),
+            (
+                "casual_compact_at_tokens".into(),
+                field(60000, 0, 1000000, "EVE_CONTEXT_CASUAL_COMPACT_AT_TOKENS"),
+            ),
+            (
+                "casual_compact_to_tokens".into(),
+                field(40000, 1000, 999999, "EVE_CONTEXT_CASUAL_COMPACT_TO_TOKENS"),
             ),
             (
                 "max_turns".into(),

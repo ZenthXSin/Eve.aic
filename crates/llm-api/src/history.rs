@@ -46,6 +46,11 @@ pub trait HistoryWindowResolver: Send + Sync {
     fn compaction(&self) -> Result<Option<ContextCompactionPolicy>, LlmError> {
         Ok(None)
     }
+    /// 本轮尚未调用工具时（闲聊）使用的较小压缩阈值；只在主动压缩开启、且触发阈值
+    /// 小于 `compaction` 的阈值时生效。本轮一旦调用工具，改用 `compaction`。
+    fn casual_compaction(&self) -> Result<Option<ContextCompactionPolicy>, LlmError> {
+        Ok(None)
+    }
 }
 
 /// 单个历史摘要正文的上限（UTF-8 字节）。
