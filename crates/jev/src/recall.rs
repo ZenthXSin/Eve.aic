@@ -7,6 +7,9 @@ use eve_llm_api::{LlmError, LlmFuture};
 const THRESHOLD: f64 = 0.8;
 /// 交给 Jev 的 Eve 问答至多条数；超长时先丢更早的问答，再丢更早的候选。
 const EXCHANGES: usize = 3;
+/// 等待并发名额的上限。群关系判断与挑选共用名额，群里消息多时判断几乎一直在进行；
+/// 立即放弃会让挑选频繁被跳过，所以短暂排队，超时才放弃。
+const SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn error() -> LlmError {
     LlmError::Provider("Jev 群聊原话挑选不可用；只附最近原话".into())
@@ -85,7 +88,10 @@ impl GroupRecallSelector for JevRelationJudge {
             if !input.valid() {
                 return Err(error());
             }
-            let _slot = self.slots.try_acquire().map_err(|_| error())?;
+            let _slot = tokio::time::timeout(SLOT_WAIT, self.slots.acquire())
+                .await
+                .map_err(|_| error())?
+                .map_err(|_| error())?;
             let mut input = input;
             let mut exchanges: Vec<GroupExchange> = input
                 .exchanges
