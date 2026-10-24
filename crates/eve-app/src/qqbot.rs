@@ -1743,7 +1743,7 @@ async fn run_qqbot_composed(
         plugin = plugin.with_files(outbox.clone(), std::time::Duration::from_secs(2))?;
         bootstrap
             .tools
-            .push(Arc::new(crate::qq_files::SendFileTool::new(outbox)));
+            .push(Arc::new(crate::qq_files::SendFileTool::new(outbox.clone())));
         let inbox = Arc::new(crate::qq_files::AttachmentInbox::new());
         plugin = plugin.with_attachment_observer(inbox.clone());
         // 慢步骤进度：某一步超过 runtime.progress.slow_after_ms 仍未结束时补发一条真实进度。
@@ -1842,13 +1842,14 @@ async fn run_qqbot_composed(
             .as_ref()
             .is_some_and(|c| c.github_all_users);
         let legacy =
-            developer_settings.map_or_else(std::collections::BTreeSet::new, |c| c.operators);
+            developer_settings.as_ref().map_or_else(std::collections::BTreeSet::new, |c| c.operators.clone());
         let qq_admin = crate::qq_admin::Admin::open(
             &options.state_directory,
             conversations.clone(),
             legacy,
             registry.clone(),
         )?;
+        let _ = outbox.member_access.set((developer_settings.as_ref().map(|c| c.workspace.clone()), qq_admin.clone()));
         for all in [false, true] {
             bootstrap.tools.push(Arc::new(crate::qq_context_reset::ResetTool {
                 all,
@@ -1857,10 +1858,11 @@ async fn run_qqbot_composed(
                 authorization: qq_admin.clone(),
             }));
         }
-        crate::developer::install_with_authorization(
+        crate::developer::install_with_member_runtime(
             &mut bootstrap,
             &options.state_directory,
             Some(qq_admin.clone()),
+            Some(crate::developer::member_runtime(options.practice_java.as_deref(), options.practice_server_jar.as_deref())),
         )?;
         if let Some(services) = preference_services {
             let mut services = (*services).clone();

@@ -23,6 +23,25 @@ fn public_tool(name: &str) -> bool {
         "echo"
             | "send_message"
             | "clear_context"
+            | "save_preference"
+            | "read_attachment"
+            | "describe_image"
+            | "read_raw_message"
+            | "group_digest"
+            | "send_sticker"
+            | "show_budget"
+            | "sleep"
+            | "task_progress"
+            | "list_files"
+            | "read_file"
+            | "search_files"
+            | "write_file"
+            | "edit_file"
+            | "run_command"
+            | "send_file"
+            | "check_practice_draft"
+            | "run_practice"
+            | "use_skill"
             | "search_reference"
             | "read_reference"
             | "read_source"
@@ -67,6 +86,17 @@ pub(crate) struct GuardedTool {
 impl Tool for GuardedTool {
     fn definition(&self) -> ToolDefinition {
         let mut definition = self.inner.definition();
+        if matches!(
+            definition.name.as_str(),
+            "list_files"
+                | "read_file"
+                | "search_files"
+                | "write_file"
+                | "edit_file"
+                | "run_command"
+        ) {
+            definition.description.push_str(" 普通成员在自己当前会话的独立项目工作区执行，不需要管理员逐项授权。相对路径以此项目根目录为准；run_command 中工作区是 /work，HOME 是 /work/.home，Java 在 PATH，Mindustry 无头服务端只读位于 /opt/eve/mindustry-server.jar（宿主已配置时）。可编写模组、编译、导入并运行验证，交付文件放 exports/ 再调用 send_file。编译通过不能冒充已通过游戏运行验证；无图形客户端时如实区分无头验证与客户端验证。");
+        }
         if !(public_tool(&definition.name) || self.public_github && definition.name == "github_api")
         {
             definition.description.push_str(
@@ -99,9 +129,10 @@ impl Tool for GuardedTool {
                 || public_tool(&name)
                 || self.public_github && name == "github_api")
             {
-                return Err(ToolExecutionError::Failed("此操作需要主人或管理员授权；普通用户不能创建后台任务、定时主动消息、改动工作区或执行管理操作".into()));
+                return Err(ToolExecutionError::Failed("此操作需要主人或管理员授权；普通成员的项目开发权限不包括宿主部署、全局管理、后台派发或定时主动消息".into()));
             }
             if !owner
+                && administrator
                 && matches!(
                     name.as_str(),
                     "read_file" | "write_file" | "edit_file" | "list_files" | "search_files"
@@ -262,7 +293,6 @@ mod tests {
             "set_wakeup_trigger",
             "dispatch_background_task",
             "run_subagent",
-            "write_file",
             "set_reminder",
             "github_api",
             "new_management_tool",

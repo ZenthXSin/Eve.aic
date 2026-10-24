@@ -40,6 +40,7 @@ mod qq_impressions;
 mod qq_interest;
 mod qq_learning;
 mod qq_learning_commands;
+mod qq_member_files;
 mod qq_memory;
 mod qq_memory_continuity;
 mod qq_memory_observer;

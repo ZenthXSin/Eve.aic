@@ -161,7 +161,7 @@ impl Tool for DeveloperTool {
         let (name, description, schema) = match self.kind {
             Kind::List => (
                 "list_files",
-                "列出宿主指定源码工作区的目录。仅指定操作者可用；返回真实路径类型，不跟随目录链接。",
+                "列出当前授权工作区的目录；返回真实路径类型，不跟随目录链接。普通成员的独立项目与管理员宿主工作区由宿主身份策略决定。",
                 object(
                     json!({"path":{"type":"string","description":"工作区相对目录，根目录为 ."}}),
                     &["path"],
@@ -201,7 +201,7 @@ impl Tool for DeveloperTool {
             ),
             Kind::Command => (
                 "run_command",
-                "以受信操作者的宿主权限实际执行程序和参数，cwd 为源码工作区相对目录，返回退出码/输出/截断。需要 shell 时显式运行 sh -c 或 powershell -Command；没有进程隔离，取消会终止命令进程组。",
+                "在当前身份获准的执行环境中运行程序和参数，cwd 为工作区相对目录，返回退出码/输出/截断。需要 shell 时显式运行 sh -c 或 powershell -Command。管理员使用宿主环境；普通成员仅在宿主提供的独立项目隔离环境运行。取消会终止命令进程组。",
                 object(
                     json!({"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"maximum":600000}}),
                     &["program"],

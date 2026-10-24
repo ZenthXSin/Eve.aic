@@ -42,6 +42,67 @@ fn file(path: &str) -> FileArguments {
 }
 
 #[tokio::test]
+async fn explicit_member_policy_isolates_project_and_does_not_grant_upgrade_or_shared_root() {
+    struct Members;
+    impl DeveloperAuthorization for Members {
+        fn is_operator(&self, _: &ContextScope) -> bool {
+            false
+        }
+        fn allows_workspace_development(&self, _: &ContextScope) -> bool {
+            true
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let mut a = file("mod.hjson");
+    a.content = Some("name: member".into());
+    a.expected_sha256 = Some("".into());
+    let without_runtime = LocalDeveloper::new(config(root.path()), ledger.path().into(), None)
+        .unwrap()
+        .with_authorization(Arc::new(Members));
+    assert!(
+        without_runtime
+            .execute(DeveloperOperation::Write(a.clone()), context("a"))
+            .await
+            .is_err()
+    );
+    let backend = without_runtime.with_member_runtime(MemberRuntime::default());
+    backend
+        .execute(DeveloperOperation::Write(a), context("a"))
+        .await
+        .unwrap();
+    assert!(!root.path().join("mod.hjson").exists());
+    assert!(
+        backend
+            .execute(DeveloperOperation::Read(file("mod.hjson")), context("b"))
+            .await
+            .is_err()
+    );
+    assert!(
+        backend
+            .execute(DeveloperOperation::Read(file("../mod.hjson")), context("a"))
+            .await
+            .is_err()
+    );
+    assert!(
+        backend
+            .execute(DeveloperOperation::PrepareUpgrade, context("a"))
+            .await
+            .is_err()
+    );
+    let scope = ContextScope {
+        session_id: "test-session".into(),
+        user_id: "a".into(),
+    };
+    let project = member_workspace(root.path(), &scope);
+    assert_eq!(
+        std::fs::read_to_string(project.join("mod.hjson")).unwrap(),
+        "name: member"
+    );
+    assert!(project.join("exports").is_dir());
+}
+
+#[tokio::test]
 async fn actual_file_roundtrip_cas_paging_and_restart_never_replays() {
     let root = tempfile::tempdir().unwrap();
     let ledger = tempfile::tempdir().unwrap();

@@ -226,8 +226,8 @@ class VisionAcceptance(developer.DeveloperAcceptance):
             return text_response("看到了 " + last["description"])
         self.callback = respond
         self.vision([
-            *self.send(self.image_message("sticker", "", ["/cat.png"], "看到了 图里是猫猫探头")),
-            *self.send(self.image_message("again", "这个呢", ["/dog.png"], "看到了 图里是狗狗点头"))],
+            *self.send(self.image_message("sticker", "", ["/cat.png"], "看到了 图里是猫猫探头", user="user-2")),
+            *self.send(self.image_message("again", "这个呢", ["/dog.png"], "看到了 图里是狗狗点头", user="user-2"))],
             enabled=False)
         primary = next(r["body"]["model"] for r in self.requests if r["kind"] == "chat")
         self.assertEqual(describes, [primary, "qwen-vl-max", "qwen-vl-max"])

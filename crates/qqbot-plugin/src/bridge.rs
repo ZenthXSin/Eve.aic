@@ -359,13 +359,28 @@ fn session_route(
     }
     Ok(None)
 }
-/// 文件投递的路由只取自本通道已确认的回执：宿主给会话，通道自己找平台目标。
+/// 文件可在用户首轮任务中交付，路由取自已校验并持久接收的消息，不能要求正文先送达。
+/// 主动跟进继续使用 session_route 的 Sent 条件，不扩大到未确认的发送。
 fn route_for(
     ledger: &Ledger,
     app: &str,
     session: &SessionKey,
 ) -> PluginResult<Option<(String, String)>> {
-    session_route(ledger, app, session)
+    for entry in ledger.entries.iter().rev() {
+        if entry.app_id == app
+            && matches!(
+                entry.state,
+                ReceiptState::Processing | ReceiptState::ReplyPending | ReceiptState::Sent
+            )
+            && entry.message.session_key(app)? == *session
+        {
+            return Ok(Some((
+                entry.message.scope.clone(),
+                entry.message.target_id.clone(),
+            )));
+        }
+    }
+    Ok(None)
 }
 /// 回执写入宿主失败只记录警告；宿主自行在重启时核对未结束的尝试。
 fn report_file(

@@ -12,6 +12,7 @@
 /.eve-cognition/
 /.eve-model-check-*/
 /.eve-qqbot/
+/.eve-members/
 /connectors/qqbot/node_modules/
 /dist/
 /packaging/windows/config.json

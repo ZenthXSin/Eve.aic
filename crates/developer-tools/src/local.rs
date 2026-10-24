@@ -17,6 +17,7 @@ use tokio::{
     sync::Mutex,
 };
 mod live_upgrade;
+mod member;
 
 const MAX_FILE: usize = 8 * 1024 * 1024;
 const MAX_OUTPUT: usize = 32 * 1024;
@@ -90,6 +91,8 @@ pub struct LocalDeveloper {
     /// 只由测试构造替换；生产始终为 https://api.github.com/。
     api: Url,
     authorization: Option<std::sync::Arc<dyn DeveloperAuthorization>>,
+    member_runtime: Option<MemberRuntime>,
+    isolated: bool,
 }
 impl LocalDeveloper {
     pub fn new(
@@ -149,6 +152,8 @@ impl LocalDeveloper {
             serial: Mutex::new(()),
             api: Url::parse("https://api.github.com/").expect("static URL"),
             authorization: None,
+            member_runtime: None,
+            isolated: false,
         })
     }
     pub fn with_authorization(
@@ -156,6 +161,10 @@ impl LocalDeveloper {
         authorization: std::sync::Arc<dyn DeveloperAuthorization>,
     ) -> Self {
         self.authorization = Some(authorization);
+        self
+    }
+    pub fn with_member_runtime(mut self, runtime: MemberRuntime) -> Self {
+        self.member_runtime = Some(runtime);
         self
     }
     fn authorize(&self, context: &ToolExecutionContext) -> Result<(), ToolExecutionError> {
@@ -178,6 +187,9 @@ impl LocalDeveloper {
         operation: &DeveloperOperation,
         context: &ToolExecutionContext,
     ) -> Result<(), ToolExecutionError> {
+        if self.member_operation(operation, context) {
+            return Ok(());
+        }
         if matches!(operation, DeveloperOperation::Github(_))
             && self.config.github
             && self.config.github_all_users
@@ -486,7 +498,9 @@ impl LocalDeveloper {
                     json!({"success":true,"path":a.path,"sha256":hash(updated.as_bytes()),"bytes":updated.len()}),
                 )
             }
-            DeveloperOperation::Search(a) => self.search(a, self.authorize(context).is_ok()),
+            DeveloperOperation::Search(a) => {
+                self.search(a, self.isolated || self.authorize(context).is_ok())
+            }
             DeveloperOperation::Command(a) => {
                 if !self.config.commands {
                     return Err(failed("命令执行未启用"));
@@ -516,15 +530,21 @@ impl LocalDeveloper {
         if !cwd.is_dir() {
             return Err(failed("命令 cwd 必须是目录"));
         }
-        let mut command = Command::new(&a.program);
+        let mut command = if self.isolated {
+            self.member_command(&a, &cwd)?
+        } else {
+            Command::new(&a.program)
+        };
         command
-            .args(&a.args)
             .current_dir(cwd)
             .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if !self.isolated {
+            command.args(&a.args);
+        }
         // 保留正常构建/代理/CA；不把 QQ、模型、Web 和 GitHub 密钥复制给命令。
         for name in [
             "PATH",
@@ -554,9 +574,14 @@ impl LocalDeveloper {
             "NODE_EXTRA_CA_CERTS",
             "GIT_SSL_CAINFO",
         ] {
-            if let Some(value) = std::env::var_os(name) {
+            if !self.isolated
+                && let Some(value) = std::env::var_os(name)
+            {
                 command.env(name, value);
             }
+        }
+        if self.isolated {
+            self.member_environment(&mut command);
         }
         #[cfg(unix)]
         command.process_group(0);
@@ -907,7 +932,13 @@ impl DeveloperBackend for LocalDeveloper {
             };
             let id = self.next.fetch_add(1, Ordering::SeqCst);
             self.record(id, kind, "started", None)?;
-            let result = tokio::select! {result=self.execute_inner(operation,&context)=>result,_=cancelled(&context)=>Err(ToolExecutionError::Cancelled("开发操作已取消；不能假定没有副作用".into()))};
+            let member = if self.member_operation(&operation, &context) {
+                Some(self.member_backend(&context)?)
+            } else {
+                None
+            };
+            let backend = member.as_ref().unwrap_or(self);
+            let result = tokio::select! {result=backend.execute_inner(operation,&context)=>result,_=cancelled(&context)=>Err(ToolExecutionError::Cancelled("开发操作已取消；不能假定没有副作用".into()))};
             self.record(
                 id,
                 kind,

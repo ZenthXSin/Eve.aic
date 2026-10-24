@@ -18,7 +18,7 @@ pub struct DeveloperConfig {
     #[serde(default)]
     pub storage_directory: Option<PathBuf>,
     pub operators: BTreeSet<String>,
-    /// 显式开放开发后端的普通访问；QQ 宿主仍独立执行主人/管理员管理策略。
+    /// 旧后端普通访问开关；QQ 成员项目另由宿主身份策略隔离，不开放宿主管理能力。
     #[serde(default = "ordinary_access")]
     pub ordinary_access: bool,
     #[serde(default)]
@@ -60,6 +60,22 @@ fn ordinary_access() -> bool {
 /// 宿主提供的平台身份授权；模型参数、昵称及自称不能实现此绑定。
 pub trait DeveloperAuthorization: Send + Sync {
     fn is_operator(&self, scope: &eve_llm_api::ContextScope) -> bool;
+    /// 宿主核对的真实成员可在独立项目目录开发；不授予宿主或升级权限。
+    fn allows_workspace_development(&self, _scope: &eve_llm_api::ContextScope) -> bool {
+        false
+    }
+}
+
+/// 可信宿主选择的只读运行资源，不能由模型指定挂载路径。
+#[derive(Clone, Debug, Default)]
+pub struct MemberRuntime {
+    pub java_home: Option<PathBuf>,
+    pub mindustry_server: Option<PathBuf>,
+}
+pub fn member_workspace(root: &std::path::Path, scope: &eve_llm_api::ContextScope) -> PathBuf {
+    let hash = ring::digest::digest(&ring::digest::SHA256, scope.user_id.as_bytes());
+    let name: String = hash.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    root.join(".eve-members").join(name)
 }
 fn timeout() -> u64 {
     600_000
