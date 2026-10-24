@@ -964,6 +964,7 @@ async fn run_qqbot_composed(
         // 历史窗口省略较早轮次时用摘要代替；摘要是派生数据，原始会话历史完整保留。
         let digest_policy = Arc::new(crate::qq_history_digest::Policy::default());
         let impression_policy = Arc::new(crate::qq_impressions::Policy::default());
+        let profile_queue = Arc::new(crate::qq_impressions::ProfileQueue::default());
         let phrase_policy = Arc::new(crate::qq_phrases::Policy::default());
         let history_digests = Arc::new(eve_history_digest::HistoryDigestService::new(
             eve_history_digest::DigestStore::open(options.state_directory.join("history-digest"))?,
@@ -1569,6 +1570,7 @@ async fn run_qqbot_composed(
             wrapped: context,
             people: people.clone(),
             registry: registry.clone(),
+            profiles: profile_queue.clone(),
             // 候选都是 QQ 参与者，不涉及跨通道授权。
             links: Arc::new(crate::qq_memory_continuity::PersonLinks(
                 crate::qq_memory_continuity::Policy {
@@ -2173,6 +2175,12 @@ async fn run_qqbot_composed(
                 crate::qq_impressions::MODEL_USE,
             )?)),
             impression_policy.clone(),
+            crate::qq_impressions::Profiles {
+                consolidator: Arc::new(eve_people_plugin::ModelProfileConsolidator::new(observed(
+                    crate::qq_impressions::MODEL_USE,
+                )?)),
+                queue: profile_queue.clone(),
+            },
         ));
         // 说法学习：训练中的会话攒够一批原话后学习一次；用途 phrase 单独记健康与输出上限。
         let _ = phrase_policy

@@ -934,6 +934,7 @@ dependencies = [
  "eve-llm-api",
  "eve-people-api",
  "eve-plugin-api",
+ "ring",
  "serde",
  "serde_json",
  "tokio",

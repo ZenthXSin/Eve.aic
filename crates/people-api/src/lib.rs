@@ -109,6 +109,57 @@ pub trait PersonLinks: Send + Sync {
     fn linked(&self, current: &str, candidates: &[String]) -> PluginResult<Vec<String>>;
 }
 
+/// 本会话与授权他处的印象合计达到这个条数，才值得整理成画像。
+pub const PROFILE_MIN_ITEMS: usize = 6;
+/// 交给整理器的印象至多条数，取最新的。
+pub const MAX_PROFILE_SOURCES: usize = 24;
+/// 画像至多条数；每条正文同样受 `MAX_IMPRESSION_CHARS` 限制。
+pub const MAX_PROFILE_FACTS: usize = 6;
+
+/// 整理画像的一条依据：本会话（`here`）或经授权他处的印象。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileSource {
+    pub text: String,
+    pub quote: String,
+    pub here: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<Scene>,
+}
+
+/// 一次画像整理的输入。`fingerprint` 概括全部依据；依据有任何变化（新增、删除、
+/// 绑定或可见范围改变）都会得到不同的指纹，旧画像随之失效。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileRequest {
+    pub participant: String,
+    pub fingerprint: String,
+    pub sources: Vec<ProfileSource>,
+}
+
+/// 画像的一条：把若干印象整合后的说法；`from` 是所依据的 `sources` 下标，至少一个。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileFact {
+    pub text: String,
+    pub from: Vec<usize>,
+}
+
+/// 已保存的画像；只在 `fingerprint` 与当前依据一致时可用。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonProfile {
+    pub fingerprint: String,
+    pub facts: Vec<ProfileFact>,
+    /// 与 facts 一一对应的依据场景，供对话区分本会话与他处；不含原话。
+    pub scenes: Vec<Vec<Option<Scene>>>,
+    pub updated_at_ms: u64,
+}
+
+/// 可替换的画像整理器：只看所给依据，不调用工具，不引入依据之外的事。
+pub trait ProfileConsolidator: Send + Sync {
+    fn consolidate(&self, request: ProfileRequest) -> PluginFuture<'_, Vec<ProfileFact>>;
+}
+
 pub fn valid_impression_text(value: &str) -> bool {
     let count = value.chars().count();
     (1..=MAX_IMPRESSION_CHARS).contains(&count)
@@ -160,6 +211,9 @@ pub struct Person {
     /// 来访情况；视图只给当前发言者本人。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence: Option<Presence>,
+    /// 整理后的画像，只在持久状态中出现；视图不包含，由宿主核对指纹后另行交给对话。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<PersonProfile>,
 }
 #[derive(Clone, Serialize)]
 pub struct PeopleView {
@@ -206,5 +260,27 @@ pub trait PeopleDirectory: Send + Sync {
         _links: &dyn PersonLinks,
     ) -> PluginResult<LinkedImpressions> {
         Ok(LinkedImpressions::default())
+    }
+    /// 当前发言者的画像整理依据：本会话印象加经 `links` 授权的他处印象，取最新的至多
+    /// `MAX_PROFILE_SOURCES` 条；不足 `PROFILE_MIN_ITEMS` 条时为空。不实现时为空。
+    fn profile_request(
+        &self,
+        _participant: &str,
+        _links: &dyn PersonLinks,
+    ) -> PluginResult<Option<ProfileRequest>> {
+        Ok(None)
+    }
+    /// 已保存的画像，不论是否过期；调用方须核对指纹。
+    fn profile(&self, _participant: &str) -> PluginResult<Option<PersonProfile>> {
+        Ok(None)
+    }
+    /// 核对并保存整理结果；条数、正文或依据下标不合格时整体拒绝。
+    fn save_profile(
+        &self,
+        _request: &ProfileRequest,
+        _facts: Vec<ProfileFact>,
+        _now_ms: u64,
+    ) -> PluginResult<()> {
+        Ok(())
     }
 }
