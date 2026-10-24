@@ -19,6 +19,24 @@ pub(crate) fn window(snapshot: &ConfigSnapshot) -> Result<HistoryWindow, LlmErro
 }
 
 impl HistoryWindowResolver for ConfiguredHistory {
+    fn adaptive_limit(&self) -> Result<Option<usize>, LlmError> {
+        let snapshot = self
+            .0
+            .snapshot(NAMESPACE, 1)
+            .map_err(|_| LlmError::Configuration("自适应上下文配置无法读取".into()))?;
+        let limit: usize = snapshot
+            .get("adaptive_limit_tokens")
+            .map_err(|_| LlmError::Configuration("自适应上下文上限无法读取".into()))?;
+        if limit == 0 {
+            return Ok(None);
+        }
+        if limit < 10000 {
+            return Err(LlmError::Configuration(
+                "自适应上下文上限至少为 10000".into(),
+            ));
+        }
+        Ok(Some(limit))
+    }
     fn compaction(&self) -> Result<Option<ContextCompactionPolicy>, LlmError> {
         let read = || -> Result<_, eve_config_api::ConfigError> {
             let snapshot = self.0.snapshot(NAMESPACE, 1)?;

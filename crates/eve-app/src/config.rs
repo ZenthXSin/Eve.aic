@@ -19,14 +19,20 @@ impl eve_config_api::ConfigValidator for CoreConfigValidator {
         };
         let invalid = || ConfigError::InvalidValue("宿主配置".into());
         if let Some(history) = snapshots.get(crate::history::NAMESPACE) {
+            let adaptive: usize = history.get("adaptive_limit_tokens")?;
+            if adaptive != 0 && adaptive < 10000 {
+                return Err(ConfigError::InvalidValue(
+                    "自适应上下文上限至少为 10000".into(),
+                ));
+            }
             let trigger: usize = history.get("compact_at_tokens")?;
             let target: usize = history.get("compact_to_tokens")?;
-            if trigger != 0 && target >= trigger {
+            if adaptive == 0 && trigger != 0 && target >= trigger {
                 return Err(ConfigError::InvalidValue("压缩目标必须小于触发阈值".into()));
             }
             let casual: usize = history.get("casual_compact_at_tokens")?;
             let casual_target: usize = history.get("casual_compact_to_tokens")?;
-            if casual != 0 && casual_target >= casual {
+            if adaptive == 0 && casual != 0 && casual_target >= casual {
                 return Err(ConfigError::InvalidValue(
                     "闲聊压缩目标必须小于其触发阈值".into(),
                 ));
@@ -185,6 +191,10 @@ pub(crate) fn history_schema() -> ConfigSchema {
         namespace: crate::history::NAMESPACE.into(),
         version: 1,
         fields: BTreeMap::from([
+            (
+                "adaptive_limit_tokens".into(),
+                field(200000, 0, 1000000, "EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS"),
+            ),
             (
                 "compact_at_tokens".into(),
                 field(150000, 0, 1000000, "EVE_CONTEXT_COMPACT_AT_TOKENS"),

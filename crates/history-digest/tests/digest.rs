@@ -198,6 +198,67 @@ fn service(directory: &std::path::Path, options: Option<DigestOptions>) -> Histo
 }
 
 #[tokio::test]
+async fn active_provider_denial_keeps_http_cause_and_saved_prefix() {
+    let directory = tempfile::tempdir().unwrap();
+    let service = service(directory.path(), Some(OPTIONS));
+    let original = history(2);
+    service
+        .store()
+        .put(
+            &scope(),
+            DigestVersion {
+                covered_turns: 1,
+                fingerprint: fingerprint(&original, 1).unwrap(),
+                points: vec![DigestPoint {
+                    text: "已保存的摘要".into(),
+                    turns: vec![1],
+                }],
+                generator: "test".into(),
+                created_at_ms: 1,
+            },
+        )
+        .unwrap();
+    let path = std::fs::read_dir(directory.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let saved = std::fs::read(&path).unwrap();
+    service
+        .install_compactor(Arc::new(Scripted {
+            seen: Arc::default(),
+            reply: |_| {
+                Err(LlmError::ProviderFailed(
+                    eve_llm_api::ProviderFailure::http(403).unwrap(),
+                ))
+            },
+        }))
+        .unwrap();
+    let error = service
+        .compact(Some(&scope()), &original)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        LlmError::ContextCompactionFailed(eve_llm_api::ProviderFailure::http(403).unwrap())
+    );
+    assert_eq!(error.provider_http_status(), Some(403));
+    assert_eq!(eve_llm_api::ModelOutcome::from_error(&error), None);
+    assert_eq!(std::fs::read(path).unwrap(), saved);
+    assert_eq!(
+        service
+            .store()
+            .versions(&scope())
+            .unwrap()
+            .last()
+            .unwrap()
+            .covered_turns,
+        1
+    );
+}
+
+#[tokio::test]
 async fn incremental_digest_covers_prefix_and_is_reused_only_while_original_matches() {
     let directory = tempfile::tempdir().unwrap();
     let service = service(directory.path(), Some(OPTIONS));

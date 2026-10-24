@@ -12,6 +12,38 @@ class ContextCompactionAcceptance(digest.HistoryDigestAcceptance):
             locals()[_name] = None
     del _name
 
+    def test_provider_403_before_tools_preserves_history_and_recovers_after_access_is_fixed(self):
+        (self.source / "README.md").write_text("中文结果" * 2700, encoding="utf8")
+        self.dialogue_calls = 0
+        def respond(body):
+            if body["messages"][0]["content"].startswith(digest.DIGEST_PROMPT):
+                request = json.loads(body["messages"][1]["content"])
+                covered = request["previous_turns"] + len(request["turns"])
+                return text_response(json.dumps({"points":[{"text":"八次文件读取已完成，等待继续核验", "turns":[covered]}]}, ensure_ascii=False))
+            self.dialogue_calls += 1
+            if self.dialogue_calls == 1:
+                return tool_response([("read_file", {"path":"README.md"})] * 8)
+            return text_response("核验完成")
+        self.callback = respond
+        self.run_window(self.send(self.message("seed", "保存原始核验", expected="核验完成")),
+            env_extra={"EVE_CONTEXT_COMPACT_AT_TOKENS":"0", "EVE_CONTEXT_CASUAL_COMPACT_AT_TOKENS":"0"})
+        before = json.dumps(self.turn("保存原始核验"), sort_keys=True)
+        self.status_for_body = lambda body: 403 if body['messages'][0]['content'].startswith(digest.DIGEST_PROMPT) else None
+        env = {"EVE_CONTEXT_COMPACT_AT_TOKENS":"150000", "EVE_CONTEXT_COMPACT_TO_TOKENS":"100000"}
+        self.run_window(self.send(self.message("denied", "继续核验", contains=["上下文压缩失败", "HTTP 403", "分组权限", "尚未启动工具调用"])), env_extra=env)
+        notice = self.receipt("denied")['reply']
+        self.assertNotIn("继续前需要核对现有结果", notice)
+        failure = self.turn("继续核验")['status']['failure']
+        self.assertEqual((failure['code'], failure['started_tools']), ('Context', 0))
+        self.assertEqual(failure['evidence']['provider_http_status'], 403)
+        self.assertEqual(failure['evidence']['provider_failure'], 'unauthorized')
+        self.assertEqual(json.dumps(self.turn("保存原始核验"), sort_keys=True), before)
+        self.assertEqual(self.dialogue_calls, 2, '403 不应调用主对话或重跑工具')
+        self.status_for_body = lambda body: None
+        self.run_window(self.send(self.message("recovered", "权限已恢复，继续", expected="核验完成")), env_extra=env)
+        self.assertEqual(self.turn("权限已恢复，继续")['status']['state'], 'Completed')
+        self.assertEqual(json.dumps(self.turn("保存原始核验"), sort_keys=True), before)
+
     def test_digest_timeout_is_not_reported_as_main_dialogue_timeout_and_tools_are_not_replayed(self):
         (self.source / "README.md").write_text("中文结果" * 2700, encoding="utf8")
         self.callback = lambda body: tool_response([("read_file", {"path": "README.md"})] * 8)

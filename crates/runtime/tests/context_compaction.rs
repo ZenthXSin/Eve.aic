@@ -201,6 +201,80 @@ fn casual_host(rig: &Rig, provider: Arc<Provider>, digests: Arc<Digests>) -> Ses
     SessionLlmHost::new(host, SessionBinding::builtin())
 }
 
+struct Adaptive;
+impl HistoryWindowResolver for Adaptive {
+    fn resolve(&self) -> Result<HistoryWindow, LlmError> {
+        Policy.resolve()
+    }
+    fn adaptive_limit(&self) -> Result<Option<usize>, LlmError> {
+        Ok(Some(200000))
+    }
+    fn compaction(&self) -> Result<Option<ContextCompactionPolicy>, LlmError> {
+        panic!("adaptive mode must not read legacy thresholds")
+    }
+    fn casual_compaction(&self) -> Result<Option<ContextCompactionPolicy>, LlmError> {
+        panic!("adaptive mode must not read casual thresholds")
+    }
+}
+
+#[derive(Default)]
+struct Notices(AtomicUsize);
+impl TurnEventSink for Notices {
+    fn emit(&self, event: TurnEvent) -> LlmFuture<'_, ()> {
+        if matches!(event.kind, TurnEventKind::ContextCompactionStarted) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn adaptive_context_grows_past_old_soft_budget_without_compressing_each_short_message() {
+    let provider = Provider::new(vec![
+        Step::new(final_response("在")),
+        Step::new(final_response("嗯")),
+        Step::new(final_response("好")),
+    ]);
+    let rig = Rig::new(
+        provider.clone(),
+        Arc::new(FaultStore::default()),
+        LlmHostConfig::default(),
+    )
+    .await;
+    let digests = Arc::new(Digests::default());
+    let config = LlmHostConfig {
+        system_prompt: "固定资料".repeat(9000),
+        ..LlmHostConfig::default()
+    };
+    let host = LlmHost::new(
+        provider.clone(),
+        rig.registry.clone(),
+        rig.kernel.clone(),
+        rig.permissions.clone(),
+        ContextBinding {
+            service_id: ServiceId::new(CONTEXT).unwrap(),
+            expected_owner: id(OWNER),
+        },
+        vec![],
+        config,
+    )
+    .unwrap()
+    .with_history_resolver(Arc::new(Adaptive))
+    .with_history_digests(digests.clone());
+    let host = SessionLlmHost::new(host, SessionBinding::builtin());
+    let notices = Notices::default();
+    for text in ["在吗", "嗯", "好"] {
+        host.run_turn_with_events(input("s", text), &notices)
+            .await
+            .unwrap();
+    }
+    assert_eq!(notices.0.load(Ordering::SeqCst), 0);
+    assert_eq!(digests.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.requests.lock().unwrap().len(), 3);
+    assert_eq!(rig.snapshot("s").turns.len(), 3);
+    rig.stop().await;
+}
+
 #[tokio::test]
 async fn casual_turns_compact_at_the_smaller_budget_while_tool_work_keeps_the_main_one() {
     let provider = Provider::new(vec![

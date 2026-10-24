@@ -43,6 +43,10 @@ impl HistoryWindow {
 /// 每轮开始前读取一次；同一轮的多次模型调用使用同一快照。
 pub trait HistoryWindowResolver: Send + Sync {
     fn resolve(&self) -> Result<HistoryWindow, LlmError>;
+    /// 自适应上下文只设总上限；None 继续使用旧的固定阈值。
+    fn adaptive_limit(&self) -> Result<Option<usize>, LlmError> {
+        Ok(None)
+    }
     fn compaction(&self) -> Result<Option<ContextCompactionPolicy>, LlmError> {
         Ok(None)
     }

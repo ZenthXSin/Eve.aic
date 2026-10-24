@@ -227,7 +227,7 @@ class InterestAcceptance(unittest.TestCase):
                                        "error_file": str(error_path),
                                        "wait_timeout_ms": max(15000, (timeout - 5) * 1000)}), encoding="utf8")
         env = {key: os.environ[key] for key in ("PATH", "SystemRoot", "TEMP", "TMP") if key in os.environ}
-        env.update(QQBOT_APP_SECRET="test-app-secret", QQBOT_APP_ID="1904159860",
+        env.update(EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS="0", QQBOT_APP_SECRET="test-app-secret", QQBOT_APP_ID="1904159860",
                    EVE_OPENAI_API_KEY="test-model-secret",
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
                    EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete",
