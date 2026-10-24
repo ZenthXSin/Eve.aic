@@ -89,6 +89,9 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
                 self.assertEqual(len(turns),1)
                 self.assertEqual(turns[0]['status']['state'],'Completed')
                 self.assertEqual(self.receipt('apply-once')['state'],'Sent')
+                # 监督器先发布 applied，随后才把升级请求归档到 history；等归档完成再核对数量。
+                self.wait_until(lambda:(queue/'history').is_dir() and any((queue/'history').glob('*.json')),
+                    'upgrade request was not archived',timeout=10)
                 self.assertEqual(len(list((queue/'history').glob('*.json'))),1)
                 child.send_signal(signal.SIGINT)
                 self.assertEqual(child.wait(timeout=15),0)
