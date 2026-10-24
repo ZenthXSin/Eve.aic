@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 HERE = pathlib.Path(__file__).resolve().parent
-HISTORY_TURNS = 16  # 核心入口默认的完整历史窗口；完整持久账本在每轮末独立核对。
+HISTORY_TURNS = 16  # 本基准显式选用兼容历史窗口；完整持久账本在每轮末独立核对。
 
 
 def require(condition, diagnostic):
@@ -138,7 +138,8 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes):
         EVE_DEBOUNCE_MS="0",
         # 测的是对话链路并逐一核对请求数；历史摘要是后台请求，次数取决于时机，单独由 history_digest_test 验收。
         EVE_HISTORY_DIGEST_ENABLED="false",
-        # 本基准逐轮验证 16 轮窗口；主动压缩另有 150k 专项验收。
+        # 本基准逐轮验证兼容模式的 16 轮窗口；200k 自适应上下文由 adaptive_context_test 验收。
+        EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS="0",
         EVE_CONTEXT_COMPACT_AT_TOKENS="0",
     )
     command = [str(binary), "--state-dir", str(directory / "state"),
