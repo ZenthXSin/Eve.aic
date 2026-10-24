@@ -162,3 +162,92 @@ async fn compression_failure_does_not_replay_or_discard_started_tool_results() {
     );
     rig.stop().await;
 }
+
+struct Casual;
+impl HistoryWindowResolver for Casual {
+    fn resolve(&self) -> Result<HistoryWindow, LlmError> {
+        Policy.resolve()
+    }
+    fn compaction(&self) -> Result<Option<ContextCompactionPolicy>, LlmError> {
+        Policy.compaction()
+    }
+    fn casual_compaction(&self) -> Result<Option<ContextCompactionPolicy>, LlmError> {
+        Ok(Some(ContextCompactionPolicy {
+            trigger_tokens: 6000,
+            target_tokens: 4000,
+        }))
+    }
+}
+fn casual_host(rig: &Rig, provider: Arc<Provider>, digests: Arc<Digests>) -> SessionLlmHost {
+    let host = LlmHost::new(
+        provider,
+        rig.registry.clone(),
+        rig.kernel.clone(),
+        rig.permissions.clone(),
+        ContextBinding {
+            service_id: ServiceId::new(CONTEXT).unwrap(),
+            expected_owner: id(OWNER),
+        },
+        vec![ToolBinding {
+            name: "receipt".into(),
+            service_id: ServiceId::new(TOOL).unwrap(),
+            expected_owner: id(OWNER),
+        }],
+        LlmHostConfig::default(),
+    )
+    .unwrap()
+    .with_history_resolver(Arc::new(Casual))
+    .with_history_digests(digests);
+    SessionLlmHost::new(host, SessionBinding::builtin())
+}
+
+#[tokio::test]
+async fn casual_turns_compact_at_the_smaller_budget_while_tool_work_keeps_the_main_one() {
+    let provider = Provider::new(vec![
+        Step::new(final_response("记下了")),
+        Step::new(final_response("好的")),
+        Step::new(Ok(ModelResponse::ToolCalls {
+            calls: vec![ToolCall {
+                id: "medium".into(),
+                name: "receipt".into(),
+                arguments: serde_json::json!({"text":"中".repeat(20000)}),
+            }],
+        })),
+        Step::new(final_response("完成")),
+    ]);
+    let rig = Rig::new(
+        provider.clone(),
+        Arc::new(FaultStore::default()),
+        LlmHostConfig::default(),
+    )
+    .await;
+    let digests = Arc::new(Digests::default());
+    let session = casual_host(&rig, provider.clone(), digests.clone());
+    // 第一轮闲聊带一大段文字；当前输入本身超过闲聊预算时退回主阈值，不让本轮失败。
+    let long = "中".repeat(4000);
+    session.run_turn(input("s", &long)).await.unwrap();
+    assert_eq!(digests.calls.load(Ordering::SeqCst), 0);
+    // 第二轮闲聊：历史已超过闲聊预算，先压缩再请求。
+    session.run_turn(input("s", "在吗")).await.unwrap();
+    assert_eq!(digests.calls.load(Ordering::SeqCst), 1);
+    let requests = provider.requests.lock().unwrap().clone();
+    assert!(requests[1].messages.iter().any(|m| {
+        m.text
+            .as_deref()
+            .is_some_and(|s| s.contains("宿主上下文压缩摘要"))
+    }));
+    assert!(
+        !requests[1]
+            .messages
+            .iter()
+            .any(|m| m.text.as_deref() == Some(long.as_str()))
+    );
+    // 第三轮开始调用工具：回执远超闲聊预算，但仍低于主阈值，不再压缩。
+    session.run_turn(input("s", "执行任务")).await.unwrap();
+    // 首个请求尚未调用工具，仍按闲聊预算压缩；工具回执之后按主阈值，不再压缩。
+    assert_eq!(digests.calls.load(Ordering::SeqCst), 2);
+    let requests = provider.requests.lock().unwrap().clone();
+    let last = requests.last().unwrap();
+    assert!(last.messages.iter().any(|m| !m.tool_results.is_empty()));
+    rig.stop().await;
+}
