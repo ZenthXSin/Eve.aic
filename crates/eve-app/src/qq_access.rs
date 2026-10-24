@@ -22,6 +22,7 @@ fn public_tool(name: &str) -> bool {
         name,
         "echo"
             | "send_message"
+            | "clear_context"
             | "search_reference"
             | "read_reference"
             | "read_source"
