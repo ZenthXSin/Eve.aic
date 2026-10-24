@@ -19,13 +19,16 @@ use eve_control_api::{
 use eve_llm_api::{
     LlmError, LlmFuture, ProviderFailure, ProviderFailureKind, TurnEvent, TurnEventKind,
 };
-use eve_message_api::{IncomingMessage, MessageFuture, MessageService, RouteOutcome, RouteReport};
+use eve_message_api::{
+    ClarifyReason, IncomingMessage, MessageFuture, MessageIntent, MessageService, RouteOutcome,
+    RouteReport,
+};
 use eve_plugin_api::{LogEntry, LogLevel, PluginContext, PluginError, PluginResult, TaskSignal};
 use eve_session_api::{SessionInput, SessionKey};
 use eve_training_api::{TrainingCommand, TrainingService};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     future::poll_fn,
     process::Stdio,
     sync::Arc,
@@ -177,6 +180,9 @@ fn slow_label(kind: &TurnEventKind) -> Option<Option<String>> {
     }
 }
 fn progress_text(kind: &TurnEventKind) -> Option<String> {
+    if let TurnEventKind::AssistantMessage { text } = kind {
+        return Some(text.clone());
+    }
     if matches!(kind, TurnEventKind::ContextCompactionStarted) {
         return Some("正在进行上下文压缩，请稍等".into());
     }
@@ -270,6 +276,7 @@ const NO_TASK: &str = "当前会话没有可控制的任务，请先发送普通
 const BLOCKED: &str = "任务提交状态未确认，当前会话已阻塞；请检查保存状态，不能自动重试。";
 
 pub(crate) struct Services {
+    pub live: Option<Arc<crate::LiveDialogue>>,
     pub control: Arc<dyn ControlService>,
     pub messages: Arc<dyn MessageService>,
     pub command_handler: Option<Arc<dyn QqCommandHandler>>,
@@ -767,6 +774,7 @@ pub(crate) async fn run(
     mut stop: watch::Receiver<bool>,
 ) -> PluginResult<()> {
     let Services {
+        live: live_dialogue,
         control,
         messages,
         command_handler,
@@ -897,8 +905,10 @@ pub(crate) async fn run(
     let mut delivering: Option<Delivery> = None;
     let mut progress_delivery: Option<(String, usize)> = None;
     let mut progress_queue: VecDeque<(ControlEvent, Option<String>)> = VecDeque::new();
+    let mut live_waiting: BTreeMap<String, crate::live::LiveSend> = BTreeMap::new();
     // 按原始消息 ID 记录的当前步骤；只用于慢步骤进度，不持久化。
     let mut slow_steps: BTreeMap<String, SlowStep> = BTreeMap::new();
+    let mut slow_reported = BTreeSet::new();
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     // 正在主动私聊的邀请；一次只发送一条，期间不开始新的回复投递。
     let mut pushing: Option<String> = None;
@@ -912,6 +922,9 @@ pub(crate) async fn run(
         loop {
             if sink.is_closed() { break Ok(()); }
             ledger.archive_if_needed(&ctx)?;
+            let abandoned: Vec<_> = live_waiting.iter().filter(|(id, send)| send.cancelled()
+                || !active.iter().any(|a| &a.message.id == *id)).map(|(id, _)| id.clone()).collect();
+            for id in abandoned { if let Some(send) = live_waiting.remove(&id) { send.complete(false); } }
             while progress_queue.len() < 64 {
                 match progress_rx.try_recv() {
                     Ok(event) => progress_queue.push_back((event, None)),
@@ -921,16 +934,30 @@ pub(crate) async fn run(
             while let Ok(event) = steps_rx.try_recv() {
                 let Some(id) = active.iter().find(|a| a.key == event.key).map(|a| a.message.id.clone()) else { continue };
                 match slow_label(&event.event.kind).flatten() {
-                    Some(label) => { slow_steps.insert(id, SlowStep { event, label, since: tokio::time::Instant::now(), reported: false }); }
+                    Some(label) => { let reported = slow_reported.contains(&id); slow_steps.insert(id, SlowStep { event, label, since: tokio::time::Instant::now(), reported }); }
                     None => { slow_steps.remove(&id); }
                 }
             }
             slow_steps.retain(|id, step| active.iter().any(|a| &a.message.id == id && a.key == step.event.key));
+            slow_reported.retain(|id| active.iter().any(|a| &a.message.id == id));
             let slow_after = slow_progress.as_ref().and_then(|policy| policy.after());
+            if progress_delivery.is_none() && progress_queue.is_empty()
+                && let Some(outgoing) = live_dialogue.as_ref().and_then(|live| live.next()) {
+                let current = active.iter().find(|a| a.key.session.session_id == outgoing.scope.session_id
+                    && a.key.session.user_id == outgoing.scope.user_id
+                    && control.snapshot(&a.key.session).is_ok_and(|s| s.is_some_and(|s| s.turn_id == Some(outgoing.turn_id) && !s.cancel_requested)));
+                if let Some(current) = current.filter(|_| !outgoing.cancelled()) {
+                    let event = ControlEvent { key: current.key.clone(), event: TurnEvent {
+                        turn_id: Some(outgoing.turn_id), kind: TurnEventKind::AssistantMessage { text: outgoing.text.clone() } } };
+                    live_waiting.insert(current.message.id.clone(), outgoing);
+                    progress_queue.push_front((event, None));
+                } else { outgoing.complete(false); }
+            }
             // 慢步骤：同一步只提示一次；与里程碑进度共用每轮至多 3 条和被动回复配额。
             if let Some(after) = slow_after && progress_queue.is_empty() && progress_delivery.is_none()
-                && let Some((_, step)) = slow_steps.iter_mut().find(|(_, step)| !step.reported && step.since.elapsed() >= after) {
+                && let Some((id, step)) = slow_steps.iter_mut().find(|(_, step)| !step.reported && step.since.elapsed() >= after) {
                 step.reported = true;
+                slow_reported.insert(id.clone());
                 progress_queue.push_back((step.event.clone(), Some(slow_text(step))));
             }
             // 同会话输出与任务准入等候路由收尾；独立会话可继续处理。
@@ -1117,6 +1144,8 @@ pub(crate) async fn run(
                     && !pending_control(&message, &routing, &commands)
                     && control.accepts(&event)
                     && control.snapshot(&event.key.session).is_ok_and(|s| s.is_some_and(|s| !s.cancel_requested))
+                    && (!matches!(event.event.kind, TurnEventKind::ToolProgress { .. })
+                        || slow_progress.as_ref().is_some_and(|policy| policy.tool_milestones()))
                     && let Some(text) = text.or_else(|| progress_text(&event.event.kind)) {
                     let index = ledger.find(&config.app_id, &message.id).expect("active receipt");
                     let entry = &mut ledger.entries[index];
@@ -1135,6 +1164,8 @@ pub(crate) async fn run(
                         }
                     }
                 }
+                if progress_delivery.is_none() && let Some(current) = active.iter().find(|a| a.key == event.key)
+                    && let Some(outgoing) = live_waiting.remove(&current.message.id) { outgoing.complete(false); }
                 continue;
             }
             if delivering.is_none() && pushing.is_none() && sending_file.is_none() && judging.is_none() && progress_delivery.is_none()
@@ -1512,11 +1543,12 @@ pub(crate) async fn run(
                 }
                 _ = tokio::time::sleep_until(next_push), if push_ready => {}
                 _ = tokio::time::sleep(Duration::from_millis(100)), if !queue.is_empty() => {}
+                _ = tokio::time::sleep(Duration::from_millis(50)), if live_dialogue.is_some() => {}
                 Some(event) = progress_rx.recv(), if progress_queue.len() < 64 => { progress_queue.push_back((event, None)); }
                 Some(event) = steps_rx.recv() => {
                     if let Some(id) = active.iter().find(|a| a.key == event.key).map(|a| a.message.id.clone()) {
                         match slow_label(&event.event.kind).flatten() {
-                            Some(label) => { slow_steps.insert(id, SlowStep { event, label, since: tokio::time::Instant::now(), reported: false }); }
+                            Some(label) => { let reported = slow_reported.contains(&id); slow_steps.insert(id, SlowStep { event, label, since: tokio::time::Instant::now(), reported }); }
                             None => { slow_steps.remove(&id); }
                         }
                     }
@@ -1555,6 +1587,21 @@ pub(crate) async fn run(
                         && !matches!(report.outcome, RouteOutcome::Replaced { .. }) {
                         mark_failed(&mut ledger, &ctx, &config.app_id, &route.message.id)?;
                         finish(&mut stdin, &route.message.id).await?;
+                        continue;
+                    }
+                    // 自然判断期间原轮已成功结束：含混文字与闲聊交回正常对话，
+                    // 不再让针对旧任务的分类提示截断后续消息。显式命令、失败和未知结果仍走原路径。
+                    let conversational = matches!(report.outcome,
+                        RouteOutcome::Clarify { reason: ClarifyReason::LowConfidence | ClarifyReason::Conflict
+                            | ClarifyReason::Ambiguous | ClarifyReason::MissingQuestion | ClarifyReason::Judge(_), .. })
+                        || (matches!(report.outcome, RouteOutcome::Unchanged)
+                            && report.decision.as_ref().is_some_and(|d| d.parts.iter().all(|p| p.intent == MessageIntent::Unrelated)));
+                    if route.cancelled.is_some() && conversational
+                        && control.snapshot(&route.target.session).is_ok_and(|snapshot| snapshot.is_some_and(|s|
+                            s.key == route.target && s.phase == ControlPhase::Finished && !s.cancel_requested
+                            && s.report.is_some_and(|r| r.run.commit == CommitState::Completed && r.run.failure.is_none()))) {
+                        let ordinary = route.message.attachments.is_empty();
+                        queue.push_back(Queued { message: route.message, saved: true, ordinary, received: tokio::time::Instant::now() });
                         continue;
                     }
                     let text = match report.outcome {
@@ -1670,6 +1717,7 @@ pub(crate) async fn run(
                             ledger.entries[index].progress[*part].state = if ok { PartState::Sent } else { PartState::Failed };
                             ledger.save(&ctx)?;
                             if !ok { delivery_log(&ctx, "progress_failed_no_retry", &frame); }
+                            if let Some(outgoing) = live_waiting.remove(id) { outgoing.complete(ok); }
                             progress_delivery = None;
                         }
                         Some("delivery") if frame.get("file").and_then(Value::as_bool) == Some(true) => {
@@ -1865,6 +1913,32 @@ pub(crate) async fn run(
                                         if training.observe_user_message(&scope, &message.id, &message.text).is_err() {
                                             warn(&ctx, "expression_learning_failed");
                                         }
+                                    }
+                                    if let Some(live) = &live_dialogue {
+                                        let session = message.session_key(&config.app_id)?;
+                                        let mut saved = false;
+                                        let current = active.iter().find(|a| a.key.session == session)
+                                            .map(|a| (a.key.clone(), a.message.id.clone()));
+                                        if let Some((current_key, parent_id)) = current
+                                            && let Some(snapshot) = control.snapshot(&session).map_err(|_| failure("QQBot 任务快照不可用"))?
+                                            && !snapshot.cancel_requested && snapshot.key == current_key
+                                            && let Some(turn_id) = snapshot.turn_id {
+                                            let scope = eve_llm_api::ContextScope { session_id: session.session_id, user_id: session.user_id };
+                                            if !ledger.insert(&ctx, &config.app_id, message.clone())? {
+                                                capacity_notice(&ctx, &status, &mut stdin, &message.id).await?;
+                                                continue;
+                                            }
+                                            saved = true;
+                                            if live.steer(&scope, turn_id, message.turn_text(), || {
+                                                ledger.steer(&ctx, &config.app_id, &message.id, &parent_id)
+                                            })? {
+                                                finish(&mut stdin, &message.id).await?;
+                                                continue;
+                                            }
+                                        }
+                                        let ordinary = message.attachments.is_empty();
+                                        queue.push_back(Queued { message, saved, ordinary, received: tokio::time::Instant::now() });
+                                        continue;
                                     }
                                     let target = if natural_message_judgement {
                                         control.snapshot(&message.session_key(&config.app_id)?)

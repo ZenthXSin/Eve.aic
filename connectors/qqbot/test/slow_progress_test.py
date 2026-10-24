@@ -66,6 +66,19 @@ class SlowProgressAcceptance(developer.DeveloperAcceptance):
         self.assertEqual(self.progress('off'), [])
         self.assertNotIn('progress', self.receipt('off'))
 
+    def test_multiple_slow_steps_notify_only_once_per_turn(self):
+        def respond(body):
+            if len(self.results(body)) < 2:
+                response = dialogue.tool_response([('run_command', {'program': sys.executable,
+                    'args': ['-c', 'import time; time.sleep(1.6)']})])
+                response['choices'][0]['message']['tool_calls'][0]['id'] += str(len(self.results(body)))
+                return response
+            return dialogue.text_response('两步完成')
+        self.callback = respond
+        self.run_slow(self.send(self.message('twice', '跑两步', expected='两步完成')))
+        self.assertEqual(len(self.progress('twice')), 1)
+        self.assertEqual(self.receipt('twice')['state'], 'Sent')
+
     def test_cancel_before_threshold_suppresses_the_pending_slow_progress(self):
         self.response_gates[('chat', 1)] = 'never-release'
         self.callback = lambda body: dialogue.text_response('不应送达')

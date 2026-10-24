@@ -134,6 +134,9 @@ class MessageJudgeAcceptance(unittest.TestCase):
                     self.send_chat({"role": "assistant", "content": text})
                     return
                 latest = body["messages"][-1]
+                if "message" in step:
+                    self.send_chat(step["message"], reason="tool_calls")
+                    return
                 if "text" in step:
                     reply = step["text"]
                 elif latest["role"] == "tool":
@@ -190,7 +193,7 @@ class MessageJudgeAcceptance(unittest.TestCase):
         scenario.write_text(json.dumps({"script": script, "events_file": str(events), "error_file": str(error)}),
                             encoding="utf8")
         env = {key: os.environ[key] for key in ("PATH", "SystemRoot", "TEMP", "TMP") if key in os.environ}
-        env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret",
+        env.update(EVE_QQ_LIVE_INTERACTION="false", QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret",
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
                    EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete",
                    EVE_OPENAI_MODEL_ROLE="primary", EVE_MODELS_PRIMARY_ENABLED="true",
@@ -404,6 +407,20 @@ class MessageJudgeAcceptance(unittest.TestCase):
 
     def test_both_judges_fail_clarifies_without_cancelling_current_task(self):
         self.clarification_scenario({"invalid": True}, {"invalid": True})
+
+    def test_late_ambiguous_judgment_after_success_passes_followup_to_dialogue(self):
+        self.steps[("task", 1)] = {"wait": "release-base", "text": "照片看清了"}
+        self.steps[("task", 2)] = {"text": "去修电脑啊"}
+        self.steps[("primary", 1)] = {"wait": "release-judge", "intent": "ambiguous"}
+        self.run_eve([
+            {"send": self.message("base", "看看照片", "照片看清了")}, self.wait_request("task"),
+            {"send": self.message("followup", "去给朋友修电脑", "去修电脑啊")}, self.wait_request("primary"),
+            self.open_gate("release-base"),
+            {"wait_turn": {"path": str(self.work / "state/state.json"), "input": "看看照片", "state": "Completed"}},
+            self.open_gate("release-judge"), self.wait_receipt("base"), self.wait_receipt("followup")], mode="primary")
+        self.assertEqual(self.counts(), (2, 1, 0))
+        self.assertEqual(self.replies(), [("base", "照片看清了"), ("followup", "去修电脑啊")])
+        self.assertEqual(self.sessions()[0]['turns'][-1]['input'], '去给朋友修电脑')
 
     def test_two_slow_judges_share_one_deadline_then_clarify(self):
         self.clarification_scenario({"wait": "never-release-primary"}, {"wait": "never-release-jev"},

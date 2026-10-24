@@ -386,6 +386,7 @@ impl TurnEventSink for GenerationSink {
                 }
                 state.turn_id = event.turn_id.or(state.turn_id);
                 state.phase = match &event.kind {
+                    TurnEventKind::AssistantMessage { .. } => state.phase,
                     TurnEventKind::ContextCompactionStarted
                     | TurnEventKind::ProviderStarted { .. }
                     | TurnEventKind::TextDelta { .. }

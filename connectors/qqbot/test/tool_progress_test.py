@@ -14,6 +14,7 @@ class ToolProgressAcceptance(dialogue.DialogueToolsAcceptance):
     turn = memory_test.MemoryAcceptance.turn
 
     def run_eve(self, script, **options):
+        milestones = options.pop('milestones', True)
         options.setdefault('interest', False)
         options.setdefault('research', False)
         options.setdefault('practice', False)
@@ -23,6 +24,8 @@ class ToolProgressAcceptance(dialogue.DialogueToolsAcceptance):
         env = dict(options.pop('env_extra', None) or {})
         # 三个工具里程碑单独验收；启用压缩时预留一次压缩提示，由 context_compaction_test 覆盖。
         env.setdefault('EVE_CONTEXT_COMPACT_AT_TOKENS', '0')
+        if milestones is not None:
+            env.setdefault('EVE_PROGRESS_TOOL_MILESTONES', str(milestones).lower())
         options['env_extra'] = env
         result = super().run_eve(script, **options)
         path = self.work / f'events-{self.runs}.jsonl'
@@ -37,6 +40,13 @@ class ToolProgressAcceptance(dialogue.DialogueToolsAcceptance):
 
     def progress(self, id):
         return [e for e in self.events if e.get('type') == 'progress' and e.get('id') == id]
+
+    def test_default_fast_tool_turn_sends_only_the_answer(self):
+        self.callback = lambda body: dialogue.text_response('看清了') if self.results(body) else self.calls(1)
+        self.run_eve(self.send(self.message('quiet', '看一下', expected='看清了')), milestones=None)
+        self.assertEqual(self.progress('quiet'), [])
+        self.assertNotIn('progress', self.receipt('quiet'))
+        self.assertEqual(self.receipt('quiet')['state'], 'Sent')
 
     def test_hundred_calls_three_reports_final_segments_and_fresh_turn_budget(self):
         def respond(body):

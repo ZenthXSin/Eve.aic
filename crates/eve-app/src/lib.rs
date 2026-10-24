@@ -323,6 +323,7 @@ pub(crate) struct CoreBootstrap {
     history_digests: Option<Arc<dyn eve_llm_api::HistoryDigests>>,
     /// 本轮用户消息的图像来源；不装配时只发文字。
     image_source: Option<Arc<dyn eve_llm_api::TurnImageSource>>,
+    steering: Option<Arc<dyn eve_llm_api::TurnSteeringSource>>,
 }
 
 pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstrap, AppError> {
@@ -340,6 +341,7 @@ pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstr
         health: None,
         history_digests: None,
         image_source: None,
+        steering: None,
     })
 }
 
@@ -469,6 +471,7 @@ async fn install_core_with_config(
         health,
         history_digests,
         image_source,
+        steering,
     } = bootstrap;
     let mut bindings = Vec::with_capacity(tools.len() + 1);
     for tool in &tools {
@@ -557,6 +560,10 @@ async fn install_core_with_config(
     };
     let host = match image_source {
         Some(source) => host.with_image_source(source),
+        None => host,
+    };
+    let host = match steering {
+        Some(source) => host.with_steering(source),
         None => host,
     };
     let host = Arc::new(SessionLlmHost::new(host, SessionBinding::builtin()).with_logger(logger));

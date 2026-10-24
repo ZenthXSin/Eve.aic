@@ -14,6 +14,7 @@ mod failure;
 mod history;
 mod image;
 mod journal;
+mod steering;
 pub use budget::{BudgetUsage, ExecutionLimits, SharedStepUsage, SharedToolSteps, TurnBudget};
 pub use failure::{ModelHealthObserver, ModelOutcome, ProviderFailure, ProviderFailureKind};
 pub use history::{
@@ -33,6 +34,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+pub use steering::{TurnSteering, TurnSteeringSource};
 
 pub type LlmFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, LlmError>> + Send + 'a>>;
 pub type ToolFuture<'a> =
@@ -564,6 +566,10 @@ pub struct TurnEvent {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TurnEventKind {
+    /// 模型通过发送工具生成的中途消息，不是最终交付。
+    AssistantMessage {
+        text: String,
+    },
     /// 每轮至多一次；只表示开始压缩，不表示摘要或任务已完成。
     ContextCompactionStarted,
     ProviderStarted {

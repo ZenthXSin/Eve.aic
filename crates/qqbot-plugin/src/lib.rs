@@ -4,6 +4,8 @@ mod bridge;
 mod commands;
 mod conversations;
 mod files;
+mod live;
+pub use live::LiveDialogue;
 mod observer;
 mod outreach;
 mod participants;
@@ -30,6 +32,10 @@ pub use state::{ImageAttachment, Message};
 /// 通道补发一条说明当前步骤与已进行时长的进度。返回 None 表示关闭；每次检查时读取，可热修改。
 pub trait QqSlowProgress: Send + Sync {
     fn after(&self) -> Option<std::time::Duration>;
+    /// 是否投递工具计数里程碑；默认关闭，压缩与慢步骤提示独立控制。
+    fn tool_milestones(&self) -> bool {
+        false
+    }
 }
 
 /// 连发消息的等待窗口：同一会话里同一人连发的纯文字，在窗口内到达的合成一轮回复。
@@ -170,6 +176,7 @@ pub struct QqBotPlugin {
     failure_recovery: Option<Arc<dyn QqFailureRecovery>>,
     receipt_archive: Option<Arc<dyn QqReceiptArchive>>,
     group_observer: Option<Arc<dyn QqGroupObserver>>,
+    live: Option<Arc<LiveDialogue>>,
 }
 pub(crate) struct Segmentation {
     pub planner: Arc<dyn SegmentPlanner>,
@@ -210,11 +217,16 @@ impl QqBotPlugin {
             failure_recovery: None,
             receipt_archive: None,
             group_observer: None,
+            live: None,
         })
     }
     /// 通道已提交过轮次的会话是私聊还是群聊；只读，供只在私聊中成立的宿主能力判断。
     pub fn conversations(&self) -> QqConversations {
         self.conversations.clone()
+    }
+    pub fn with_live_dialogue(mut self, live: Arc<LiveDialogue>) -> Self {
+        self.live = Some(live);
+        self
     }
     pub fn with_failure_recovery(mut self, recovery: Arc<dyn QqFailureRecovery>) -> Self {
         self.failure_recovery = Some(recovery);
@@ -447,6 +459,7 @@ impl Plugin for QqBotPlugin {
             let debounce = self.debounce.clone();
             let stickers = self.stickers.clone();
             let failure_recovery = self.failure_recovery.clone();
+            let live = self.live.clone();
             let task_ctx = ctx.clone();
             ctx.spawn_task(TaskSpec::new(
                 "QQBot JSONL 通道",
@@ -473,6 +486,7 @@ impl Plugin for QqBotPlugin {
                     let debounce = debounce.clone();
                     let stickers = stickers.clone();
                     let failure_recovery = failure_recovery.clone();
+                    let live = live.clone();
                     let status = status.clone();
                     let ledger = ledger.clone();
                     Box::pin(async move {
@@ -504,6 +518,7 @@ impl Plugin for QqBotPlugin {
                                 debounce,
                                 stickers,
                                 failure_recovery,
+                                live,
                             },
                             ledger,
                             signal,
