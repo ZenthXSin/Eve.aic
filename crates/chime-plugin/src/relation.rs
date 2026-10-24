@@ -163,15 +163,32 @@ struct ReviewData<'a> {
     input: ReviewInput<'a>,
     subsequent: &'a [crate::GroupMessage],
 }
+#[derive(serde::Serialize)]
+struct FutureFirstReviewData<'a> {
+    subsequent: &'a [crate::GroupMessage],
+    input: ReviewInput<'a>,
+}
 fn review_data(review: &GroupRelationReview) -> Result<String, serde_json::Error> {
-    serde_json::to_string(&ReviewData {
-        input: ReviewInput {
-            exchanges: &review.input.exchanges,
-            examples: &review.input.examples,
-            message: &review.input.message,
-        },
-        subsequent: &review.subsequent,
-    })
+    let input = ReviewInput {
+        exchanges: &review.input.exchanges,
+        examples: &review.input.examples,
+        message: &review.input.message,
+    };
+    // 积压消息到达时可能没有前置问答，长材料实际在 subsequent 中。
+    // 选较大的上下文块先发送，避免小的变化消息挡住另一大块稳定材料。
+    if serde_json::to_vec(&review.subsequent)?.len()
+        > serde_json::to_vec(&review.input.exchanges)?.len()
+    {
+        serde_json::to_string(&FutureFirstReviewData {
+            subsequent: &review.subsequent,
+            input,
+        })
+    } else {
+        serde_json::to_string(&ReviewData {
+            input,
+            subsequent: &review.subsequent,
+        })
+    }
 }
 
 pub struct ModelGroupRelationReviewer {
@@ -308,6 +325,43 @@ mod tests {
             .count();
         assert!(prefix > 12000, "变动消息不能挡在完整历史之前");
         assert!(before.starts_with("{\"input\":{\"exchanges\":"));
+    }
+    #[test]
+    fn backlog_without_prior_exchanges_reuses_large_subsequent_evidence() {
+        let mut review = GroupRelationReview {
+            input: GroupRelationInput {
+                message: message("old-a", "积压消息一", 1, false),
+                exchanges: vec![],
+                examples: vec![],
+            },
+            subsequent: vec![message(
+                "later-history",
+                &"后续证据".repeat(1000),
+                10,
+                false,
+            )],
+        };
+        let before = review_data(&review).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&before).unwrap(),
+            serde_json::to_value(&review).unwrap()
+        );
+        review.input.message = message("old-b", "积压消息二", 2, false);
+        review
+            .subsequent
+            .push(message("latest-proof", "新增后续证据", 11, false));
+        let after = review_data(&review).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&after).unwrap(),
+            serde_json::to_value(&review).unwrap()
+        );
+        assert!(before.starts_with("{\"subsequent\":"));
+        let prefix = before
+            .bytes()
+            .zip(after.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert!(prefix > 12000, "积压目标变化不能遮挡后续证据的公共前缀");
     }
     #[tokio::test]
     async fn uncertainty_only_accumulates_then_separate_review_learns_from_later_dialogue() {
