@@ -311,7 +311,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.assertNotIn("eve.task", self.documents())
         env = {key: os.environ[key] for key in ("PATH", "SystemRoot", "TEMP", "TMP") if key in os.environ}
         env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret",
-                   EVE_TASK_DEFAULT_STEPS="300")
+                   EVE_TASK_DEFAULT_STEPS="300", EVE_TASK_MAX_STEPS="200")
         result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
                                  "--agent", str(ROOT / "AGENT.md"), "--background-tasks"],
                                 env=env, capture_output=True, text=True, timeout=60)
