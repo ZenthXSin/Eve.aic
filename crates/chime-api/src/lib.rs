@@ -2,7 +2,9 @@
 //! 说什么，再通过渠道提供的出口发出去。契约不绑定任何聊天平台。
 use eve_llm_api::LlmFuture;
 use serde::{Deserialize, Serialize};
+mod recall;
 mod relation;
+pub use recall::*;
 pub use relation::*;
 
 /// 单条群消息正文的字符上限；更长的只记作观察，不进入判断或回复。

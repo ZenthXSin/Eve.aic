@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 mod group;
+mod recall;
 
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 pub const DEFAULT_MODEL: &str = "jev-latest";

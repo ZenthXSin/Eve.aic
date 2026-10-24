@@ -20,6 +20,8 @@ class GroupRelationAcceptance(group_chat_test.GroupChatAcceptance):
     def setUp(self):
         super().setUp()
         self.jev_requests=[]
+        self.recall_requests=[]
+        self.recall_score=lambda candidate:0.1
         self.classification=lambda state:('uncertain','none',0.4,False)
         self.jev_status=200
         self.bad_evidence=False
@@ -32,8 +34,16 @@ class GroupRelationAcceptance(group_chat_test.GroupChatAcceptance):
                     assert self.path=='/v1/systemone'
                     assert self.headers['Authorization']=='Bearer group-jev-test-secret'
                     body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-                    assert set(body['questions'])=={'relation','topic','needs_reply'}
                     assert body['model']=='group-jev-test-model'
+                    if 'candidates' in body['state']:
+                        # 原话挑选：每条候选一个 noul 问题。
+                        assert set(body['questions'])=={c['candidate'] for c in body['state']['candidates']}
+                        outer.recall_requests.append(body)
+                        answer={'answers':{c['candidate']:{'type':'noul','noul':outer.recall_score(c)} for c in body['state']['candidates']}}
+                        data=json.dumps(answer).encode()
+                        self.send_response(outer.jev_status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+                        return
+                    assert set(body['questions'])=={'relation','topic','needs_reply'}
                     outer.jev_requests.append(body)
                     kind,topic,confidence,needs=outer.classification(body['state'])
                     def choice(name,selected):
