@@ -1,13 +1,16 @@
-//! 人物印象的后台学习：此人谈及自己的原话攒够一批后学习一次。
+//! 人物印象的后台学习：此人谈及自己的原话攒够一批后学习一次；同一循环里整理跨会话画像。
 //!
-//! 取出即移出缓冲，失败、超时或中断不重试；结局写到标准错误的 `EVE_IMPRESSIONS` 行，不含原话。
-//! 热配置 `runtime.people.impressions` 只控制是否发起学习请求。
+//! 取出即移出缓冲，失败、超时或中断不重试；结局写到标准错误的 `EVE_IMPRESSIONS` 与
+//! `EVE_PROFILES` 行，不含原话。热配置 `runtime.people.impressions` 同时控制两者是否发起模型请求。
 use crate::AppError;
 use eve_config_api::ConfigService;
-use eve_people_api::{ImpressionBatch, ImpressionLearner, PeopleDirectory};
+use eve_people_api::{
+    ImpressionBatch, ImpressionLearner, PeopleDirectory, ProfileConsolidator, ProfileRequest,
+};
 use serde_json::json;
 use std::{
-    sync::{Arc, OnceLock},
+    collections::{BTreeMap, VecDeque},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{sync::watch, task::JoinHandle};
@@ -49,6 +52,58 @@ fn report(outcome: &str, batch: Option<&ImpressionBatch>, detail: serde_json::Va
     );
 }
 
+/// 至多排队的画像请求；满了丢弃最早的，依据再变化时会重新排上。
+const MAX_PENDING_PROFILES: usize = 16;
+/// 记住至多这么多人的已尝试指纹；超出时清空，至多多整理一次。
+const MAX_ATTEMPTED_PROFILES: usize = 1024;
+
+/// 待整理的画像请求，只在内存中。同一人只留最新一份；某份依据取出整理过（不论成败）就不再重试，
+/// 依据变化得到新指纹后才再整理。重启后清空，下次对话时按需重新排队。
+#[derive(Default)]
+pub(crate) struct ProfileQueue {
+    inner: Mutex<(VecDeque<ProfileRequest>, BTreeMap<String, String>)>,
+}
+impl ProfileQueue {
+    pub(crate) fn offer(&self, request: ProfileRequest) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let (pending, attempted) = &mut *inner;
+        if attempted.get(&request.participant) == Some(&request.fingerprint) {
+            return;
+        }
+        pending.retain(|r| r.participant != request.participant);
+        if pending.len() == MAX_PENDING_PROFILES {
+            pending.pop_front();
+        }
+        pending.push_back(request);
+    }
+    fn take(&self) -> Option<ProfileRequest> {
+        let mut inner = self.inner.lock().ok()?;
+        let (pending, attempted) = &mut *inner;
+        let request = pending.pop_front()?;
+        if attempted.len() == MAX_ATTEMPTED_PROFILES {
+            attempted.clear();
+        }
+        attempted.insert(request.participant.clone(), request.fingerprint.clone());
+        Some(request)
+    }
+}
+
+fn report_profile(outcome: &str, request: &ProfileRequest, detail: serde_json::Value) {
+    eprintln!(
+        "EVE_PROFILES {}",
+        json!({"outcome": outcome, "participant": request.participant,
+            "sources": request.sources.len(), "at_ms": now_ms(), "detail": detail})
+    );
+}
+
+/// 画像整理器与队列；不配置时只学印象。
+pub(crate) struct Profiles {
+    pub(crate) consolidator: Arc<dyn ProfileConsolidator>,
+    pub(crate) queue: Arc<ProfileQueue>,
+}
+
 pub(crate) struct Background {
     active: watch::Sender<bool>,
     stop: watch::Sender<bool>,
@@ -60,12 +115,13 @@ impl Background {
         people: Arc<dyn PeopleDirectory>,
         learner: Arc<dyn ImpressionLearner>,
         policy: Arc<Policy>,
+        profiles: Profiles,
     ) -> Self {
         let (active, activated) = watch::channel(false);
         let (stop, stopped) = watch::channel(false);
         let (finished_sender, finished) = watch::channel(false);
         let task = tokio::spawn(async move {
-            run(people, learner, policy, activated, stopped).await;
+            run(people, learner, policy, profiles, activated, stopped).await;
             let _ = finished_sender.send(true);
         });
         Self {
@@ -104,6 +160,7 @@ async fn run(
     people: Arc<dyn PeopleDirectory>,
     learner: Arc<dyn ImpressionLearner>,
     policy: Arc<Policy>,
+    profiles: Profiles,
     mut active: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
 ) {
@@ -163,6 +220,42 @@ async fn run(
                 Ok(None) => {}
                 Err(error) => {
                     report("unavailable", None, json!({"error": error.to_string()}));
+                    pause = PROVIDER_COOLDOWN;
+                }
+            }
+        }
+        if pause == POLL
+            && policy.learning()
+            && let Some(request) = profiles.queue.take()
+        {
+            let consolidation = profiles.consolidator.consolidate(request.clone());
+            tokio::pin!(consolidation);
+            let result = tokio::select! {
+                biased;
+                _ = stop_requested(&mut stopped) => {
+                    report_profile("cancelled", &request, json!({}));
+                    return;
+                }
+                result = tokio::time::timeout(LEARN_TIMEOUT, &mut consolidation) => result,
+            };
+            match result {
+                Ok(Ok(facts)) => {
+                    let proposed = facts.len();
+                    match people.save_profile(&request, facts, now_ms()) {
+                        Ok(()) => report_profile("saved", &request, json!({"facts": proposed})),
+                        Err(error) => report_profile(
+                            "rejected",
+                            &request,
+                            json!({"facts": proposed, "error": error.to_string()}),
+                        ),
+                    }
+                }
+                failed => {
+                    let error = match failed {
+                        Ok(Err(error)) => error.to_string(),
+                        _ => "timeout".into(),
+                    };
+                    report_profile("failed", &request, json!({"error": error}));
                     pause = PROVIDER_COOLDOWN;
                 }
             }

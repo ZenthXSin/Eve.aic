@@ -117,6 +117,7 @@ mod tests {
                 impressions: vec![],
                 pending: vec![],
                 presence,
+                profile: None,
             },
             others: vec![],
             truncated: false,
