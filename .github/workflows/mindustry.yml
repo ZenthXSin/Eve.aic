@@ -23,6 +23,8 @@ on:
       - "crates/developer-api/**"
       - "crates/developer-tools/**"
       - ".github/workflows/mindustry.yml"
+      - "vendor/mindustry-mod-validator/**"
+      - "scripts/mod_validator_acceptance.py"
       - "Cargo.toml"
       - "Cargo.lock"
   push:
@@ -47,6 +49,8 @@ on:
       - "crates/developer-api/**"
       - "crates/developer-tools/**"
       - ".github/workflows/mindustry.yml"
+      - "vendor/mindustry-mod-validator/**"
+      - "scripts/mod_validator_acceptance.py"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -104,3 +108,26 @@ jobs:
         env:
           EVE_MINDUSTRY_SERVER_JAR: ${{ runner.temp }}/server-release.jar
         run: python3 connectors/qqbot/test/dialogue_tools_test.py DialogueToolsAcceptance.test_direct_practice_persists_real_evidence_and_restarts_without_replay
+  validator:
+    name: 继承的模组验证器（从源码构建）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GRADLE_VERSION: "9.3.1"
+      GRADLE_SHA256: b266d5ff6b90eada6dc3b20cb090e3731302e553a27c5d3e4df1f0d76beaff06
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: 下载并校验 Gradle
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/gradle.zip" \
+            "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
+          echo "${GRADLE_SHA256}  $RUNNER_TEMP/gradle.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+          java -version
+      - name: 构建验证器
+        working-directory: vendor/mindustry-mod-validator
+        run: '"$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin/gradle" --no-daemon fatJar'
+      - name: 用示例模组验收
+        run: python3 scripts/mod_validator_acceptance.py vendor/mindustry-mod-validator/build/libs/mindustry-mod-validator-1.0.0-all.jar
