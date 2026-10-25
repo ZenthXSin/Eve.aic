@@ -33,7 +33,7 @@ class TrainingCapacityAcceptance(developer.DeveloperAcceptance):
         full = json.dumps(state, separators=(",", ":")).encode()
         self.assertLessEqual(len(full), 1048576)
         self.assertGreater(len(full) + row_bytes + 1, 1048576)
-        document["entries"]["eve.training"]["expression.v1"] = list(full)
+        document["entries"].setdefault("eve.training", {})["expression.v1"] = list(full)
         self.state_path.write_text(json.dumps(document, separators=(",", ":")))
         self.enabled(self.send(self.message("new", "满额后依然可以回复", expected="仍可回复")))
         self.assertEqual(self.turn("旧回执需要恢复"), old_turn)
