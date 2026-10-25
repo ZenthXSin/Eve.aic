@@ -115,12 +115,17 @@ jobs:
     env:
       GRADLE_VERSION: "9.3.1"
       GRADLE_SHA256: b266d5ff6b90eada6dc3b20cb090e3731302e553a27c5d3e4df1f0d76beaff06
+      MINDUSTRY_VERSION: v160.7
+      MINDUSTRY_SHA256: f7b899a4038b95b14a824d5f8993984f79d73baa3254c385b6538327f9c0befd
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: 下载并校验 Gradle
+      - name: 下载并校验 Gradle 与 Mindustry 服务端
         run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/server-release.jar" \
+            "https://github.com/Anuken/Mindustry/releases/download/${MINDUSTRY_VERSION}/server-release.jar"
+          echo "${MINDUSTRY_SHA256}  $RUNNER_TEMP/server-release.jar" | sha256sum -c -
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/gradle.zip" \
             "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
           echo "${GRADLE_SHA256}  $RUNNER_TEMP/gradle.zip" | sha256sum -c -
@@ -128,6 +133,6 @@ jobs:
           java -version
       - name: 构建验证器
         working-directory: vendor/mindustry-mod-validator
-        run: '"$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin/gradle" --no-daemon fatJar'
+        run: '"$RUNNER_TEMP/gradle-${GRADLE_VERSION}/bin/gradle" --no-daemon fatJar -PmindustryServerJar="$RUNNER_TEMP/server-release.jar"'
       - name: 用示例模组验收
         run: python3 scripts/mod_validator_acceptance.py vendor/mindustry-mod-validator/build/libs/mindustry-mod-validator-1.0.0-all.jar

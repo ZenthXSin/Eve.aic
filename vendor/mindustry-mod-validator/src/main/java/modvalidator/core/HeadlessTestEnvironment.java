@@ -42,7 +42,7 @@ public class HeadlessTestEnvironment {
     private final RenderPipelineMonitor renderMonitor = new RenderPipelineMonitor();
 
     // The Mindustry major version this validator targets (matches build.gradle mindustryVersion)
-private static final int VALIDATOR_MINDUSTRY_MAJOR = 159;
+private static final int VALIDATOR_MINDUSTRY_MAJOR = 160;
 
 private static void debugLog(String msg){
         System.err.println(msg);

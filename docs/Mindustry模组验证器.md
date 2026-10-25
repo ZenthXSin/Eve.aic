@@ -5,16 +5,18 @@
 ## 来源与许可
 
 - 来源：https://gitee.com/zenthxsin/eve-portable 的 `project/mindustry-mod-validator/`，固定版本 `e7e43b4db4de38775a8d28f59dd4ec69e5e1686e`。
-- 逐字节副本，不手工修改；去掉了旧包附带的预编译 jar（来源无法核对）和与示例目录重复的 zip。
+- 去掉了旧包附带的预编译 jar（来源无法核对）和与示例目录重复的 zip。除下面两处外与旧包逐字节相同：
+  - `build.gradle`：JitPack 上 Mindustry v159.5 依赖的 Arc 构件已无法获取（CI 与本地均返回 404），改为只依赖官方发布的 Mindustry v160.7 服务端 jar（与实践运行器同一版本、同一摘要），它已包含 core、server、Arc、Rhino、LZ4 与 JLine。
+  - `HeadlessTestEnvironment.java`：目标主版本常量由 159 改为 160，与所用服务端一致。
 - 旧包整体为 AGPL-3.0（随副本提供 `LICENSE`），项目 README 声明 MIT；`src/main/resources/` 下的地图、基地蓝图和图标来自 Mindustry，属 GPL-3.0。这个目录不属于本仓库的 MIT 许可范围。
 
 ## 构建与使用
 
-需要 JDK 17 及以上和 Gradle 9.3.1（CI 下载官方发行包并校验 SHA-256）。依赖从 Maven Central 和 JitPack 获取，基于 Mindustry v159.5。
+需要 JDK 17 及以上、Gradle 9.3.1 和 Mindustry v160.7 的 `server-release.jar`（CI 下载两者的官方发行包并校验 SHA-256）。
 
 ```sh
 cd vendor/mindustry-mod-validator
-gradle --no-daemon fatJar
+gradle --no-daemon fatJar -PmindustryServerJar=<server-release.jar 路径>
 java -jar build/libs/mindustry-mod-validator-1.0.0-all.jar <模组目录或 zip> --json --output 报告.json
 ```
 
@@ -32,7 +34,7 @@ CI 工作流“Mindustry 真实运行验收”中的“继承的模组验证器�
 
 Eve 的实践运行器（`eve-practice-mindustry`）用固定版本 v160.7 的官方服务端加载纯数据模组，并按探测项核对内容属性。验证器补上运行器没有的动态测试，但两者有几点不同：
 
-- 验证器基于 v159.5，`minGameVersion` 高于 159 的模组只给出版本不匹配警告，结论以 v160.7 服务端为准。
+- 两者使用同一个 v160.7 服务端 jar；运行器启动完整服务端并按探测项核对属性，验证器只初始化内容与世界，做放置、生成与更新帧测试。
 - 验证器会加载模组中的脚本，它不是沙箱。只对已经通过实践运行器结构检查的纯数据草稿使用，或在隔离环境中运行。
 - 验证器只把测试数据写在 `java.io.tmpdir/modvalidator-test-data`，每次启动先整体删除该目录；不保存任何状态，也没有需要恢复的数据。
 

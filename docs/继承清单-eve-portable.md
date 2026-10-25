@@ -12,7 +12,7 @@
 | Mindustry 资料 228 篇（含长期记忆技术节选） | `knowledge/mindustry/`、`knowledge/mod-making-guide/`、`knowledge/mod-making/`、`knowledge/concepts/`（Mindustry/Arc/JSON 主题）、`knowledge/analysis/` 与 `knowledge/entities/` 中的 Mindustry 与模组技术记录、`memory/MEMORY.md` 技术小节 | `vendor/eve-portable-knowledge/`，经 `--research-corpus` 与 `eve-corpus://` 入口进入受控研究 | AGPL-3.0（副本自带 `LICENSE`） | `knowledge-plugin` 资料源单元测试；`research_test.py` 真实进程选文、逐字引用、不访问网络 |
 | 执行规则中与当前身份一致的部分 | `rules/RULE.md`：冲突取舍顺序、回复不写出内部判断、能验证就实际验证、Mindustry 结论要有出处 | `AGENT.md`“沿用旧 Eve 的做法”一节 | 改写而非复制，MIT | QQ 进程测试使用根目录 AGENT.md 装配 |
 | 语言风格中与当前身份一致的部分 | `language-style/LANGUAGE_STYLE.md`：先说结论、短句、偶尔轻语气词；代码问题先给可行性与关键几行 | 同上 | 同上 | 同上 |
-| Mindustry 模组验证器（无头版） | `project/mindustry-mod-validator/`：Java/Gradle 独立项目，在无头 Mindustry v159.5 中导入模组、创建并初始化内容，再放置方块、生成单位、跑更新帧，输出文本或 JSON 报告 | `vendor/mindustry-mod-validator/`，逐字节副本（不含预编译 jar 与重复的 zip 示例），见[模组验证器](./Mindustry模组验证器.md) | 旧包 AGPL-3.0（副本自带 `LICENSE`）；项目 README 声明 MIT；`src/main/resources/` 中的地图、基地蓝图与图标来自 Mindustry（GPL-3.0） | CI `Mindustry 真实运行验收 / 继承的模组验证器`：从源码构建，示例模组正确的通过、写错的失败并指出出错内容 |
+| Mindustry 模组验证器（无头版） | `project/mindustry-mod-validator/`：Java/Gradle 独立项目，在无头 Mindustry 中导入模组、创建并初始化内容，再放置方块、生成单位、跑更新帧，输出文本或 JSON 报告 | `vendor/mindustry-mod-validator/`，不含预编译 jar 与重复的 zip 示例；构建改为依赖官方 v160.7 服务端 jar（JitPack 上的旧依赖已无法获取），见[模组验证器](./Mindustry模组验证器.md) | 旧包 AGPL-3.0（副本自带 `LICENSE`）；项目 README 声明 MIT；`src/main/resources/` 中的地图、基地蓝图与图标来自 Mindustry（GPL-3.0） | CI `Mindustry 真实运行验收 / 继承的模组验证器`：从源码构建，示例模组正确的通过、写错的失败并指出出错内容 |
 
 ## 未继承（及原因）
 

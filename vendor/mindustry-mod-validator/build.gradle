@@ -13,39 +13,18 @@ java {
 
 repositories {
     mavenCentral()
-    maven { url 'https://jitpack.io' }
 }
 
-// Mindustry v159.5 (v159.6 JitPack build failed, keep v159.5 until fixed)
-def mindustryVersion = 'v159.5'
-// Arc commit hash updated to v159.6's archash (d72b19223f, compatible with v159.5)
-def arcVersion = 'd72b19223f'
-// Rhino version used by this Mindustry build
-def rhinoVersion = 'e74ac129d2bff72c1deb536d7d99a0dbb7046d2e'
+// Eve.aic：JitPack 上 Mindustry v159.5 依赖的 Arc 构件已无法获取，改为以官方发布、校验过摘要的
+// Mindustry 服务端 jar（含 core、server、Arc、Rhino、LZ4、JLine）作为唯一依赖：
+//   gradle fatJar -PmindustryServerJar=/path/to/server-release.jar
+def mindustryServerJar = findProperty('mindustryServerJar')
+if(mindustryServerJar == null){
+    throw new GradleException('需要 -PmindustryServerJar=<Mindustry server-release.jar 路径>')
+}
 
 dependencies {
-    // Mindustry core (contains all game content logic)
-    implementation "com.github.Anuken.Mindustry:core:${mindustryVersion}"
-    // Mindustry server (contains ServerLauncher and headless support)
-    implementation "com.github.Anuken.Mindustry:server:${mindustryVersion}"
-
-    // Arc framework modules
-    implementation "com.github.Anuken.Arc:arc-core:${arcVersion}"
-    implementation "com.github.Anuken.Arc:flabel:${arcVersion}"
-    implementation "com.github.Anuken.Arc:freetype:${arcVersion}"
-    implementation "com.github.Anuken.Arc:g3d:${arcVersion}"
-    implementation "com.github.Anuken.Arc:fx:${arcVersion}"
-    implementation "com.github.Anuken.Arc:arcnet:${arcVersion}"
-    implementation "com.github.Anuken.Arc:backend-headless:${arcVersion}"
-
-    // Rhino (JS engine for Mindustry JS mods)
-    implementation "com.github.Anuken:rhino:${rhinoVersion}"
-
-    // LZ4 compression
-    implementation "at.yawk.lz4:lz4-java:1.10.2"
-
-    // JLine for console input
-    implementation 'org.jline:jline:4.0.0'
+    implementation files(mindustryServerJar)
 
     // Testing
     testImplementation 'org.junit.jupiter:junit-jupiter:5.10.1'
