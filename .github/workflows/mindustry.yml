@@ -7,6 +7,9 @@ on:
       - "crates/practice-api/**"
       - "crates/practice-plugin/**"
       - "crates/practice-mindustry/**"
+      - "crates/provision-api/**"
+      - "crates/provision-plugin/**"
+      - "connectors/qqbot/test/provision_test.py"
       - "crates/skill-api/**"
       - "crates/skill-plugin/**"
       - "crates/outreach-api/**"
@@ -33,6 +36,9 @@ on:
       - "crates/practice-api/**"
       - "crates/practice-plugin/**"
       - "crates/practice-mindustry/**"
+      - "crates/provision-api/**"
+      - "crates/provision-plugin/**"
+      - "connectors/qqbot/test/provision_test.py"
       - "crates/skill-api/**"
       - "crates/skill-plugin/**"
       - "crates/outreach-api/**"
@@ -89,6 +95,10 @@ jobs:
         run: |
           cargo +1.89.0 build -p eve-app --bin eve-qqbot --locked
           python3 connectors/qqbot/test/practice_test.py PracticeAcceptance.test_real_runtime_verifies_the_drafted_mod
+      - name: 实际 Eve QQBot 进程自己取得并用真实服务端验证运行条件
+        env:
+          EVE_MINDUSTRY_SERVER_JAR: ${{ runner.temp }}/server-release.jar
+        run: python3 connectors/qqbot/test/provision_test.py ProvisionAcceptance.test_real_server_is_acquired_and_verified
       - name: 实际 Eve QQBot 进程用真实服务端验证技能与后续调用
         env:
           EVE_MINDUSTRY_SERVER_JAR: ${{ runner.temp }}/server-release.jar

@@ -86,6 +86,8 @@ eve-clarify-api = { path = "../clarify-api" }
 eve-clarify-plugin = { path = "../clarify-plugin" }
 eve-commitment-api = { path = "../commitment-api" }
 eve-commitment-plugin = { path = "../commitment-plugin" }
+eve-provision-api = { path = "../provision-api" }
+eve-provision-plugin = { path = "../provision-plugin" }
 eve-reminder-api = { path = "../reminder-api" }
 eve-reminder-plugin = { path = "../reminder-plugin" }
 eve-task-api = { path = "../task-api" }

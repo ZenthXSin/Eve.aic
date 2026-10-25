@@ -36,6 +36,7 @@ fn page_descriptor(namespace: &str) -> eve_web_panel_api::PageDescriptor {
             "provider.jev" => "Jev 连接",
             "runtime.people" => "人名称呼与主人",
             "runtime.memory_continuity" => "跨会话个人记忆",
+            "runtime.provision" => "条件自备",
             "runtime.commitments" => "约定",
             "runtime.models" => "模型角色与 Jev",
             "runtime.messages" => "消息路由设置",
