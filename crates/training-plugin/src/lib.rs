@@ -53,6 +53,7 @@ impl Inner {
 }
 struct StoredModes {
     inner: Mutex<Inner>,
+    expression_store: Option<Arc<dyn ExpressionStore>>,
     default_enabled: bool,
     phrase_learning: bool,
 }
@@ -113,6 +114,14 @@ impl TrainingService for StoredModes {
         Ok(())
     }
     fn observe_user_message(&self, scope: &ContextScope, id: &str, text: &str) -> PluginResult<()> {
+        if id.is_empty()
+            || id.len() > 256
+            || id.trim() != id
+            || id.chars().any(char::is_control)
+            || text.len() > 32768
+        {
+            return Err(error("表达训练输入无效"));
+        }
         if !valid(scope) {
             return Err(error("训练会话作用域无效"));
         }
@@ -122,12 +131,30 @@ impl TrainingService for StoredModes {
             .as_ref()
             .ok_or_else(|| error("训练服务已停止"))?;
         let enabled = inner.enabled(scope, self.default_enabled);
-        let mut next = inner.expressions.clone();
-        let Observed::Recorded(sample) = next.observe(scope, id, text, enabled)? else {
-            return Ok(());
+        let sample = if let Some(store) = &self.expression_store {
+            if let Some(previous) = store.get(scope, &expression::hash(id.as_bytes()))? {
+                if previous.body != expression::hash(text.as_bytes()) {
+                    return Err(error("表达训练消息 ID 冲突；保留状态"));
+                }
+                return Ok(());
+            }
+            let mut observation = Expressions::load(None)?;
+            let Observed::Recorded(sample) = observation.observe(scope, id, text, enabled)? else {
+                return Ok(());
+            };
+            if !store.insert(&observation.rows[0])? {
+                return Ok(());
+            }
+            sample
+        } else {
+            let mut next = inner.expressions.clone();
+            let Observed::Recorded(sample) = next.observe(scope, id, text, enabled)? else {
+                return Ok(());
+            };
+            ctx.state_set(expression::KEY, next.bytes()?)?;
+            inner.expressions = next;
+            sample
         };
-        ctx.state_set(expression::KEY, next.bytes()?)?;
-        inner.expressions = next;
         // 统计已保存；原话缓冲另存。容量已满时只是不再缓冲新原话，已有状态保留。
         if let (true, Some(sample)) = (self.phrase_learning, sample) {
             let mut phrases = inner.phrases.clone();
@@ -231,14 +258,20 @@ impl TrainingService for StoredModes {
         if inner.context.is_none() {
             return Err(error("训练服务已停止"));
         }
-        Ok(inner.expressions.snapshot(Some(scope)))
+        match &self.expression_store {
+            Some(store) => store.snapshot(Some(scope)),
+            None => Ok(inner.expressions.snapshot(Some(scope))),
+        }
     }
     fn expression_baseline(&self) -> PluginResult<Option<ExpressionSnapshot>> {
         let inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
         if inner.context.is_none() {
             return Err(error("训练服务已停止"));
         }
-        Ok(inner.expressions.snapshot(None))
+        match &self.expression_store {
+            Some(store) => store.snapshot(None),
+            None => Ok(inner.expressions.snapshot(None)),
+        }
     }
     fn is_expression_source(
         &self,
@@ -253,8 +286,15 @@ impl TrainingService for StoredModes {
         if inner.context.is_none() {
             return Err(error("训练服务已停止"));
         }
-        Ok(inner.enabled(scope, self.default_enabled)
-            && inner.expressions.contains(scope, id, text))
+        if !inner.enabled(scope, self.default_enabled) {
+            return Ok(false);
+        }
+        match &self.expression_store {
+            Some(store) => Ok(store
+                .get(scope, &expression::hash(id.as_bytes()))?
+                .is_some_and(|row| row.active && row.body == expression::hash(text.as_bytes()))),
+            None => Ok(inner.expressions.contains(scope, id, text)),
+        }
     }
     fn reset_expression(&self, scope: &ContextScope) -> PluginResult<()> {
         if !valid(scope) {
@@ -272,6 +312,10 @@ impl TrainingService for StoredModes {
         if phrases.reset(scope) {
             ctx.state_set(phrases::KEY, phrases.bytes()?)?;
             inner.phrases = phrases;
+        }
+        if let Some(store) = &self.expression_store {
+            store.reset(scope)?;
+            return Ok(());
         }
         let mut next = inner.expressions.clone();
         if next.reset(scope) {
@@ -418,6 +462,7 @@ fn phrase_context(phrases: &[LearnedPhrase], input: &str) -> Option<(String, Str
 
 pub struct TrainingPlugin {
     manifest: PluginManifest,
+    expression_store: Option<Arc<dyn ExpressionStore>>,
     default_enabled: bool,
     phrase_learning: bool,
 }
@@ -426,8 +471,13 @@ impl TrainingPlugin {
         Ok(Self {
             manifest: PluginManifest::new(TRAINING_PLUGIN_ID, "0.1.0")?,
             default_enabled,
+            expression_store: None,
             phrase_learning: false,
         })
+    }
+    pub fn with_expression_store(mut self, store: Arc<dyn ExpressionStore>) -> Self {
+        self.expression_store = Some(store);
+        self
     }
     /// 开启后，训练中的会话缓冲用户原话，供宿主装配的说法学习器成批学习。
     pub fn with_phrase_learning(mut self) -> Self {
@@ -465,11 +515,17 @@ impl Plugin for TrainingPlugin {
                     snapshot
                 }
             };
+            let expressions = Expressions::load(context.state_get(expression::KEY)?)?;
+            let phrases = Phrases::load(context.state_get(phrases::KEY)?)?;
+            if let Some(store) = &self.expression_store {
+                store.import_legacy(&expressions.rows)?;
+            }
             let modes = Arc::new(StoredModes {
+                expression_store: self.expression_store.clone(),
                 inner: Mutex::new(Inner {
                     snapshot,
-                    expressions: Expressions::load(context.state_get(expression::KEY)?)?,
-                    phrases: Phrases::load(context.state_get(phrases::KEY)?)?,
+                    expressions,
+                    phrases,
                     inflight: BTreeMap::new(),
                     context: Some(context.clone()),
                 }),

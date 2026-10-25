@@ -25,19 +25,7 @@ fn valid_hash(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Row {
-    scope: ContextScope,
-    id: String,
-    body: String,
-    chars: usize,
-    paragraphs: usize,
-    question: bool,
-    formal: bool,
-    casual: bool,
-    active: bool,
-}
+type Row = eve_training_api::ExpressionRecord;
 /// 新记录的有效样本带回筛选后的正文，供说法学习缓冲；停用时不带正文。
 pub(crate) enum Observed {
     Unchanged,
@@ -48,7 +36,7 @@ pub(crate) enum Observed {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Expressions {
     version: u8,
-    rows: Vec<Row>,
+    pub(crate) rows: Vec<Row>,
 }
 impl Expressions {
     pub(crate) fn load(bytes: Option<Vec<u8>>) -> PluginResult<Self> {
