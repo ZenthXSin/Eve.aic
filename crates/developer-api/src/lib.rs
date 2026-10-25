@@ -157,6 +157,12 @@ pub struct EditArguments {
     pub new_string: String,
     pub expected_sha256: String,
 }
+/// 多文件补丁（格式见 `eve-apply-patch`）：一次新增、删除、移动或修改多个文件，全部算好后才提交。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchArguments {
+    pub patch: String,
+}
 /// 字面文本搜索；path 为工作区相对目录，默认根目录。
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -272,6 +278,7 @@ pub enum DeveloperOperation {
     Read(FileArguments),
     Write(FileArguments),
     Edit(EditArguments),
+    Patch(PatchArguments),
     Search(SearchArguments),
     Command(CommandArguments),
     Github(GithubArguments),

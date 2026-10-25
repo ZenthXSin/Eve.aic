@@ -22,6 +22,7 @@ impl LocalDeveloper {
                     | DeveloperOperation::Search(_)
                     | DeveloperOperation::Write(_)
                     | DeveloperOperation::Edit(_)
+                    | DeveloperOperation::Patch(_)
                     | DeveloperOperation::Command(_)
             )
             && !context.is_cancel_requested()

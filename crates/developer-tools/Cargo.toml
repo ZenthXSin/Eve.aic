@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+eve-apply-patch = { path = "../apply-patch" }
 eve-developer-api = { path = "../developer-api" }
 eve-llm-api = { path = "../llm-api" }
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-native-roots", "json"] }

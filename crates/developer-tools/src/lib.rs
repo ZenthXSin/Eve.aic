@@ -12,6 +12,7 @@ enum Kind {
     Read,
     Write,
     Edit,
+    Patch,
     Search,
     Command,
     Github,
@@ -25,6 +26,7 @@ pub fn tools(config: &DeveloperConfig, backend: Arc<dyn DeveloperBackend>) -> Ve
         (Kind::Read, true),
         (Kind::Write, true),
         (Kind::Edit, true),
+        (Kind::Patch, true),
         (Kind::Search, true),
         (Kind::Command, config.commands),
         (Kind::Github, config.github),
@@ -96,6 +98,15 @@ impl DeveloperTool {
                     return Err(bad());
                 }
                 Ok(DeveloperOperation::Edit(a))
+            }
+            Kind::Patch => {
+                let a: PatchArguments =
+                    serde_json::from_value(arguments.clone()).map_err(|_| bad())?;
+                if a.patch.trim().is_empty() || a.patch.len() > 512 * 1024 || a.patch.contains('\0')
+                {
+                    return Err(bad());
+                }
+                Ok(DeveloperOperation::Patch(a))
             }
             Kind::Search => {
                 let a: SearchArguments =
@@ -182,6 +193,11 @@ impl Tool for DeveloperTool {
                     json!({"path":{"type":"string"},"content":{"type":"string"},"expected_sha256":{"type":"string"}}),
                     &["path", "content", "expected_sha256"],
                 ),
+            ),
+            Kind::Patch => (
+                "apply_patch",
+                "用一个补丁同时新增、删除、移动或修改多个 UTF-8 文件，适合跨文件的改动。格式：以 *** Begin Patch 开头、*** End Patch 结尾；*** Add File: 路径 后每行以 + 开头（父目录须已存在，文件须不存在）；*** Delete File: 路径；*** Update File: 路径（可接 *** Move to: 新路径），其后的修改段可用 @@ 某一行 定位，段内行以空格（上下文）、-（删除）、+（新增）开头，在文件末尾的段加 *** End of File。上下文写 3 行左右即可，不需要行号。全部文件算好才提交，任何一处找不到原文或路径无效都整体不改；提交中途失败会恢复已写的文件。返回每个文件的操作与新的 SHA256。",
+                object(json!({"patch":{"type":"string"}}), &["patch"]),
             ),
             Kind::Edit => (
                 "edit_file",
