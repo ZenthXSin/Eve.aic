@@ -53,8 +53,8 @@ pub type KnowledgeResult<T> = Result<T, KnowledgeError>;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type KnowledgeFuture<'a, T> = BoxFuture<'a, KnowledgeResult<T>>;
 
-/// 操作者显式配置的入口页面。允许访问的范围是每个入口页面同源下的同一目录及其子路径；
-/// 模型只能从这些范围内已发现的链接中选择，不能引入新的主机。
+/// 页面访问策略：显式入口可约束同源目录；开放网页模式允许任意 HTTP/HTTPS 站点。
+/// QQ 的网页读取默认使用开放模式，本地资料仍按显式入口隔离。
 #[derive(Clone, Eq, PartialEq)]
 pub struct SourcePolicy {
     seeds: Vec<String>,

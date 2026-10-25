@@ -105,6 +105,20 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
         self.assertEqual(len(self.kind("chat")), 2)
         self.assertEqual(self.research_runs(), [], "只读抓取没有冒充已固化知识")
 
+    def test_web_reading_works_without_configuring_research_sources(self):
+        def respond(body):
+            results = self.results(body)
+            if not results:
+                self.assertIn("read_source", self.definitions(body))
+                return tool_response([("read_source", {"url": self.seed + "#unregistered"})])
+            self.assertEqual(results[0]["source_kind"], "external_data")
+            self.assertIn("Mindustry", results[0]["text"])
+            return text_response("页面已读取")
+        self.callback = respond
+        self.run_eve(self.send(self.message("web", "查看这个页面", expected="页面已读取")),
+                     interest=False, memory=True, research=False, practice=False)
+        self.assertEqual(self.chat_rounds, 2)
+
     def test_missing_capabilities_are_absent_and_memory_is_scope_bound(self):
         marker = "CURRENT_USER_MARKER"
         foreign = "OTHER_USER_MARKER"
