@@ -97,6 +97,38 @@ fn redirect(location: String) -> Route {
 }
 
 #[tokio::test]
+async fn unrestricted_fetch_follows_cross_site_redirect_and_reads_json_with_fragment() {
+    let destination = site(BTreeMap::from([(
+        "/api/value",
+        Route {
+            status: "200 OK",
+            headers: vec!["Content-Type: application/json".into()],
+            body: br#"{"value":"actual-source-content"}"#.to_vec(),
+        },
+    )]))
+    .await;
+    let final_url = format!("{}/api/value", destination.base);
+    let origin = site(BTreeMap::from([(
+        "/start",
+        redirect(format!("{final_url}#value")),
+    )]))
+    .await;
+    let policy = SourcePolicy::unrestricted_web();
+    let page = HttpSourceFetcher::new()
+        .unwrap()
+        .fetch(&policy, &format!("{}/start#section", origin.base))
+        .await
+        .unwrap();
+    assert_eq!(page.final_url, final_url);
+    assert!(page.text.contains("actual-source-content"));
+    assert_eq!(page.content_type, "application/json");
+    assert_eq!(origin.requests.lock().unwrap().len(), 1);
+    assert_eq!(destination.requests.lock().unwrap().len(), 1);
+    assert!(origin.requests.lock().unwrap()[0].starts_with("GET /start "));
+    assert!(destination.requests.lock().unwrap()[0].starts_with("GET /api/value "));
+}
+
+#[tokio::test]
 async fn fetches_allowed_pages_follows_in_scope_redirects_and_keeps_only_in_scope_links() {
     let index = r#"<html><head><title>Mod docs</title><script>fetch("/steal")</script></head>
         <body><h1>Modding</h1><p>Start here.</p>

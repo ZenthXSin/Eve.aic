@@ -129,3 +129,29 @@ async fn fetched_contract_is_checked_and_utf8_preview_is_explicit() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn open_web_tool_reads_a_host_outside_every_research_seed() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let services = Services {
+        source: Some((
+            SourcePolicy::unrestricted_web(),
+            Arc::new(Fetcher {
+                calls: calls.clone(),
+                foreign: false,
+            }),
+        )),
+        ..Services::default()
+    };
+    let tool = services.tools().0.remove(0);
+    assert!(tool.definition().description.contains("不设站点白名单"));
+    let result = tool
+        .execute(
+            call(json!({"url":"https://another.example/arbitrary/page"})),
+            context(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["url"], "https://another.example/arbitrary/page");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}

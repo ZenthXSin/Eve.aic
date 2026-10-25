@@ -9,7 +9,7 @@ import unittest
 import practice_test
 
 CONTEXT_TOOLS = {"clear_context", "clear_all_contexts"}
-PLATFORM_TOOLS = CONTEXT_TOOLS | {"send_file", "read_attachment", "describe_image", "read_raw_message", "acquire_condition"}
+PLATFORM_TOOLS = CONTEXT_TOOLS | {"send_file", "read_attachment", "describe_image", "read_raw_message", "acquire_condition", "read_source"}
 
 # 开启交互记忆时注册的工具：记忆检索、保存偏好与约定。
 MEMORY_TOOLS = {"search_memory", "save_preference", "note_commitment", "settle_commitment"}
@@ -90,13 +90,13 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
                 return tool_response([*[(name, {}) for name in (
                     "list_interests", "list_goals", "list_skills", "list_forged_tools")],
                     ("read_source", {"url": self.seed}),
-                    ("read_source", {"url": "https://example.invalid/private"})])
+                    ("read_source", {"url": self.seed.replace("index.html", "missing-page")})])
             self.assertEqual(len(results), 6)
             self.assertTrue(all(r["items"] == [] for r in results[:4]))
             self.assertEqual(results[4]["source_kind"], "external_data")
             self.assertIn("Mindustry", results[4]["text"])
             self.assertFalse(results[4]["persisted_knowledge"])
-            self.assertIn("URL 不在", json.dumps(results[-1], ensure_ascii=False))
+            self.assertIn("页面读取失败", json.dumps(results[-1], ensure_ascii=False))
             return text_response("工具已实际调用")
         self.callback = respond
         self.full([*self.send(self.message("help", "/help", contains=["24 个", "read_source", "run_practice"])),
@@ -104,6 +104,20 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
         self.assertEqual(self.chat_rounds, 2)
         self.assertEqual(len(self.kind("chat")), 2)
         self.assertEqual(self.research_runs(), [], "只读抓取没有冒充已固化知识")
+
+    def test_web_reading_works_without_configuring_research_sources(self):
+        def respond(body):
+            results = self.results(body)
+            if not results:
+                self.assertIn("read_source", self.definitions(body))
+                return tool_response([("read_source", {"url": self.seed + "#unregistered"})])
+            self.assertEqual(results[0]["source_kind"], "external_data")
+            self.assertIn("Mindustry", results[0]["text"])
+            return text_response("页面已读取")
+        self.callback = respond
+        self.run_eve(self.send(self.message("web", "查看这个页面", expected="页面已读取")),
+                     interest=False, memory=True, research=False, practice=False)
+        self.assertEqual(self.chat_rounds, 2)
 
     def test_missing_capabilities_are_absent_and_memory_is_scope_bound(self):
         marker = "CURRENT_USER_MARKER"
@@ -119,7 +133,7 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
         self.callback = respond
         self.run_eve([*self.send(self.message("own", "/remember " + marker, contains="偏好已保存")),
                       *self.send(self.message("foreign", "/remember " + foreign, user="user-2", contains="偏好已保存")),
-                      *self.send(self.message("help", "/help", contains="12 个")),
+                      *self.send(self.message("help", "/help", contains="13 个")),
                       *self.send(self.message("query", "查看记忆", expected="只读取当前会话"))],
                      interest=False, memory=True, research=False, practice=False)
         self.assertEqual(self.chat_rounds, 2)

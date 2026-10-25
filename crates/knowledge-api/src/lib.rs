@@ -53,11 +53,12 @@ pub type KnowledgeResult<T> = Result<T, KnowledgeError>;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type KnowledgeFuture<'a, T> = BoxFuture<'a, KnowledgeResult<T>>;
 
-/// 操作者显式配置的入口页面。允许访问的范围是每个入口页面同源下的同一目录及其子路径；
-/// 模型只能从这些范围内已发现的链接中选择，不能引入新的主机。
+/// 页面访问策略：显式入口可约束同源目录；开放网页模式允许任意 HTTP/HTTPS 站点。
+/// QQ 的网页读取默认使用开放模式，本地资料仍按显式入口隔离。
 #[derive(Clone, Eq, PartialEq)]
 pub struct SourcePolicy {
     seeds: Vec<String>,
+    unrestricted_web: bool,
 }
 impl SourcePolicy {
     /// 规范化并校验入口页面；不发起任何网络请求。
@@ -74,12 +75,40 @@ impl SourcePolicy {
             }
             normalized.push(text);
         }
-        Ok(Self { seeds: normalized })
+        Ok(Self {
+            seeds: normalized,
+            unrestricted_web: false,
+        })
+    }
+    /// 任意 HTTP/HTTPS 站点均可读取；本地资料仍沿用显式入口范围。
+    pub fn unrestricted_web() -> Self {
+        Self {
+            seeds: vec![],
+            unrestricted_web: true,
+        }
+    }
+    pub fn with_unrestricted_web(mut self) -> Self {
+        self.unrestricted_web = true;
+        self
+    }
+    pub fn web_is_unrestricted(&self) -> bool {
+        self.unrestricted_web
     }
     pub fn seeds(&self) -> &[String] {
         &self.seeds
     }
     pub fn allows(&self, url: &str) -> bool {
+        if self.unrestricted_web
+            && url.len() <= MAX_URL_BYTES
+            && !url.chars().any(char::is_whitespace)
+            && let Ok(parsed) = Url::parse(url)
+            && matches!(parsed.scheme(), "http" | "https")
+            && parsed.host_str().is_some_and(|host| !host.is_empty())
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+        {
+            return true;
+        }
         url_allowed(&self.seeds, url)
     }
 }
@@ -854,6 +883,33 @@ redacted!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrestricted_web_has_no_host_directory_or_port_whitelist() {
+        let policy = SourcePolicy::unrestricted_web();
+        for url in [
+            "https://learn-mindustry-mod.github.io/java/5-draw-and-animate/5-7-bloom.html",
+            "http://127.0.0.1:8123/arbitrary/path#fragment",
+            "https://other.example/api/data.json",
+            "http://[::1]:8765/test",
+        ] {
+            assert!(policy.allows(url), "{url}");
+        }
+        for url in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "https://",
+            "https://a.example/a b",
+        ] {
+            assert!(!policy.allows(url), "{url}");
+        }
+        let policy = SourcePolicy::new(&["eve-corpus://book/part/".into()])
+            .unwrap()
+            .with_unrestricted_web();
+        assert!(policy.allows("https://any.example/outside"));
+        assert!(policy.allows("eve-corpus://book/part/page.md"));
+        assert!(!policy.allows("eve-corpus://other/part/page.md"));
+    }
 
     fn policy() -> SourcePolicy {
         SourcePolicy::new(&["https://docs.example/wiki/modding/index.html".into()]).unwrap()
