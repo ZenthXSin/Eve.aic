@@ -80,6 +80,47 @@ class CommitmentAcceptance(people_test.PeopleAcceptance):
         self.assertIsNone(seen["私聊一下"])
         self.assertEqual(len(self.ledger()["commitments"]), 1, "了结后不重复记下")
 
+    def test_hot_switches_limit_commitments_to_operators_or_turn_them_off(self):
+        results, seen = {}, {}
+
+        def respond(body):
+            messages = body["messages"]
+            current = max(i for i, m in enumerate(messages) if m["role"] == "user")
+            text = messages[current]["content"]
+            done = [json.loads(m["content"]) for m in messages[current + 1:] if m["role"] == "tool"]
+            if done:
+                results[text] = done[0]
+                return text_response("好")
+            seen[text] = commitments(body)
+            if text.startswith("记一下"):
+                return tool_response([("note_commitment", {"text": text})])
+            return text_response("好")
+        self.callback = respond
+        # 测试框架默认把 user-1、user-2 绑定为管理员；user-3 是普通成员。
+        def say(mid, text, user):
+            return self.send(self.message(mid, text, user=user, scope="group", target="group-1", expected="好"))
+        self.enabled([*say("before", "记一下帮他看地图", "user-3"),
+                      *say("seen-before", "在吗", "user-3"),
+                      *self.checkpoint("operators"),
+                      *say("member", "记一下帮他做模组", "user-3"),
+                      *say("member-hidden", "还在吗", "user-3"),
+                      *say("owner", "记一下帮主人看日志", "user-1"),
+                      *self.checkpoint("off"),
+                      *say("off", "记一下帮主人改配置", "user-1"),
+                      *say("owner-hidden", "在不在", "user-1")],
+                     checkpoints={"operators": lambda: self.save("runtime.commitments", members=False),
+                                  "off": lambda: self.save("runtime.commitments", enabled=False)},
+                     panel=True)
+        self.assertTrue(results["记一下帮他看地图"]["saved"], "默认对普通成员开放")
+        self.assertIsNotNone(seen["在吗"])
+        self.assertIn("只对主人和管理员开放", json.dumps(results["记一下帮他做模组"], ensure_ascii=False))
+        self.assertIsNone(seen["还在吗"], "无权时上下文不给出约定")
+        self.assertTrue(results["记一下帮主人看日志"]["saved"], "管理员仍可使用")
+        self.assertIn("已在设置中关闭", json.dumps(results["记一下帮主人改配置"], ensure_ascii=False))
+        self.assertIsNone(seen["在不在"], "关闭后上下文不给出约定")
+        texts = sorted(c["text"] for c in self.ledger()["commitments"])
+        self.assertEqual(texts, ["记一下帮主人看日志", "记一下帮他看地图"], "拒绝时不写账本，已记下的不删除")
+
 
 if __name__ == "__main__":
     unittest.main()
