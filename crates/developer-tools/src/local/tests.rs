@@ -1114,11 +1114,11 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
     );
 }
 
-/// 命令策略：禁止的不执行，需确认的没有明确同意时不执行，同意后照常执行。
-#[cfg(unix)]
 /// 测试用策略：脚本含 forbidden 为禁止，含 careful 为需确认。
-struct Policy;
-impl eve_developer_api::CommandPolicy for Policy {
+#[cfg(unix)]
+struct ScriptPolicy;
+#[cfg(unix)]
+impl eve_developer_api::CommandPolicy for ScriptPolicy {
     fn evaluate(&self, program: &str, args: &[String]) -> eve_developer_api::CommandEvaluation {
         use eve_developer_api::{CommandDecision, CommandEvaluation, CommandRuleMatch};
         let script = args.get(1).cloned().unwrap_or_default();
@@ -1142,13 +1142,15 @@ impl eve_developer_api::CommandPolicy for Policy {
         }
     }
 }
+/// 命令策略：禁止的不执行，需确认的没有明确同意时不执行，同意后照常执行。
+#[cfg(unix)]
 #[tokio::test]
 async fn command_policy_blocks_or_requires_confirmation_before_anything_runs() {
     let root = tempfile::tempdir().unwrap();
     let ledger = tempfile::tempdir().unwrap();
     let backend = LocalDeveloper::new(config(root.path()), ledger.path().into(), None)
         .unwrap()
-        .with_command_policy(Arc::new(Policy));
+        .with_command_policy(Arc::new(ScriptPolicy));
     let command = |marker: &str, confirmed| {
         DeveloperOperation::Command(CommandArguments {
             owner_confirmed: confirmed,
@@ -1185,6 +1187,7 @@ async fn command_policy_blocks_or_requires_confirmation_before_anything_runs() {
     assert!(root.path().join("plain").exists());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn action_reviewer_decides_prompt_commands_from_user_words_and_fails_closed() {
     use eve_llm_api::{ChatMessage, ChatRole};
@@ -1213,7 +1216,7 @@ async fn action_reviewer_decides_prompt_commands_from_user_words_and_fails_close
     let with = |reviewer: Arc<Reviewer>| {
         LocalDeveloper::new(config(root.path()), ledger.path().into(), None)
             .unwrap()
-            .with_command_policy(Arc::new(Policy))
+            .with_command_policy(Arc::new(ScriptPolicy))
             .with_action_reviewer(reviewer)
     };
     let command = |marker: &str| {
