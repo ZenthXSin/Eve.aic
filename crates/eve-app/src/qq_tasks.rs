@@ -484,7 +484,8 @@ impl Worker {
         };
         let host = host
             .with_shared_steps(steps_pool.clone())
-            .with_run_deadline(std::time::Instant::now() + timeout);
+            .with_run_deadline(std::time::Instant::now() + timeout)
+            .delegated();
         let usage = |requests, calls| {
             if child {
                 usage_of(requests, calls)

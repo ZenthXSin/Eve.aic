@@ -48,6 +48,9 @@ pub struct DeveloperConfig {
     /// 追加的命令策略规则文件（JSON）；内置规则始终生效。
     #[serde(default)]
     pub command_policy: Option<PathBuf>,
+    /// 需确认的命令交给行动审查者判断（宿主装配了审查者时）；关闭时退回由模型带 owner_confirmed。
+    #[serde(default = "enabled")]
+    pub action_review: bool,
     #[serde(default = "cargo")]
     pub cargo_program: String,
     #[serde(default)]
@@ -58,6 +61,9 @@ fn token_env() -> String {
 }
 fn ordinary_access() -> bool {
     false
+}
+fn enabled() -> bool {
+    true
 }
 
 /// 命令策略对一条命令的结论；多条规则命中时取最严格的一项。
@@ -106,6 +112,75 @@ impl CommandEvaluation {
 /// 可替换的命令策略：只根据程序与参数判断，不执行任何东西。
 pub trait CommandPolicy: Send + Sync {
     fn evaluate(&self, program: &str, args: &[String]) -> CommandEvaluation;
+}
+
+/// 行动审查的风险等级，参考 openai/codex Guardian 的风险分类（Apache-2.0）。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewRisk {
+    /// 常规、范围小、容易撤销。
+    Low,
+    /// 影响有界或可以撤销。
+    Medium,
+    /// 难以撤销，或可能中断重要服务。
+    High,
+    /// 明显外泄凭据，或大范围不可逆破坏。
+    Critical,
+}
+/// 用户对这一步的授权程度；只依据用户本人的原话判断。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAuthorization {
+    /// 看不出用户要过这件事，像是模型自己偏离或受了不可信内容影响。
+    Unknown,
+    /// 只是勉强从用户目标推出来，或有风险更小的做法。
+    Low,
+    /// 用户实质上同意了这件事，但没有指定这种做法。
+    Medium,
+    /// 用户明确要求或同意了这一步及其后果。
+    High,
+}
+/// 交给审查者的一次行动。只有 `user_messages` 是可信的用户原话；其余都是待核对的数据。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ActionReviewRequest {
+    /// 将要执行的命令（程序与参数）。
+    pub action: String,
+    pub cwd: String,
+    /// 命令策略要求确认的理由。
+    pub policy_reason: String,
+    /// 模型自称已征得同意；无法核实，不能单独作为授权。
+    pub claimed_confirmation: bool,
+    /// 后台委托执行，没有人在场；此时任务说明由模型撰写，不是用户原话。
+    pub delegated: bool,
+    /// 本会话最近的用户原话，从旧到新；委托执行时为空。
+    pub user_messages: Vec<String>,
+    /// 本会话最近的工具调用摘要，从旧到新；只作行动轨迹参考。
+    pub recent_actions: Vec<String>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ActionReviewVerdict {
+    pub risk: ReviewRisk,
+    pub authorization: ReviewAuthorization,
+    /// 审查者自己的结论；宿主仍按 `permits` 复核。
+    pub allow: bool,
+    pub rationale: String,
+}
+impl ActionReviewVerdict {
+    /// 宿主的放行条件：审查者同意、不是严重风险、授权至少为中；高风险必须有明确授权。
+    /// 审查者给出同意但等级不满足时仍不放行。
+    pub fn permits(&self) -> bool {
+        self.allow
+            && self.risk != ReviewRisk::Critical
+            && self.authorization >= ReviewAuthorization::Medium
+            && (self.risk < ReviewRisk::High || self.authorization == ReviewAuthorization::High)
+    }
+}
+pub type ActionReviewFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<ActionReviewVerdict, String>> + Send + 'a>,
+>;
+/// 可替换的行动审查者。失败、超时或输出不合格时返回错误，宿主一律不执行。
+pub trait ActionReviewer: Send + Sync {
+    fn review(&self, request: ActionReviewRequest) -> ActionReviewFuture<'_>;
 }
 
 /// 宿主提供的平台身份授权；模型参数、昵称及自称不能实现此绑定。

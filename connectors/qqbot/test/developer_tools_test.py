@@ -27,6 +27,49 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
             "operators": [principal], "ordinary_access": False, "commands": True, "github": True,
             "self_upgrade": True, "max_tool_rounds": 4}), encoding="utf8")
 
+    def classify(self, decoded, latest):
+        if isinstance(decoded, dict) and {"action", "policy_reason", "user_messages"} <= set(decoded):
+            return "review"
+        return super().classify(decoded, latest)
+
+    def reply(self, kind, decoded, latest):
+        if kind == "review":
+            return json.dumps(self.review_reply(decoded), ensure_ascii=False)
+        return super().reply(kind, decoded, latest)
+
+    def test_prompt_commands_are_reviewed_against_user_words_and_denials_do_not_run(self):
+        for name in ["old-a", "old-b"]:
+            (self.source / name).mkdir()
+            (self.source / name / "keep.txt").write_text("x", encoding="utf8")
+        reviews = []
+        def review(request):
+            reviews.append(request)
+            if "old-a" in request["action"]:
+                return {"risk": "medium", "authorization": "high", "outcome": "allow", "rationale": "用户明确要求删除 old-a"}
+            return {"risk": "medium", "authorization": "unknown", "outcome": "deny", "rationale": "用户没有要求删除 old-b"}
+        self.review_reply = review
+        def respond(body):
+            user = [m["content"] for m in body["messages"] if m["role"] == "user"][-1]
+            target = "old-b" if "old-b" in user else "old-a"
+            results = self.results(body)
+            if not results:
+                return {"choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                    "role": "assistant", "content": None, "tool_calls": [
+                        {"id": f"call-rm-{target}", "type": "function", "function": {
+                            "name": "run_command", "arguments": json.dumps({"program": "rm", "args": ["-r", target]})}}]}}]}
+            outcome = json.dumps(results[-1], ensure_ascii=False)
+            return text_response("已删除" if results[-1].get("success") else
+                                 "没有删除，行动审查未放行" if "行动审查未放行" in outcome else "失败：" + outcome)
+        self.callback = respond
+        self.enabled([*self.send(self.message("rm-a", "old-a 目录不要了，帮我删掉", expected="已删除")),
+                      *self.send(self.message("rm-b", "old-b 里有什么", expected="没有删除，行动审查未放行"))])
+        self.assertFalse((self.source / "old-a").exists(), "审查放行后实际执行")
+        self.assertTrue((self.source / "old-b" / "keep.txt").exists(), "审查未放行时没有执行")
+        self.assertEqual(len(reviews), 2)
+        self.assertIn("old-a 目录不要了，帮我删掉", reviews[0]["user_messages"][-1])
+        self.assertFalse(reviews[0]["delegated"])
+        self.assertIn("递归删除", reviews[0]["policy_reason"])
+
     def receipt(self, message_id):
         return next(r for r in self.documents()["eve.channel.qqbot"]["receipts.v1"]["entries"] if r["message"]["id"] == message_id)
 
