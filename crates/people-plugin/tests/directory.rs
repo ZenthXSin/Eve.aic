@@ -212,6 +212,7 @@ fn draft(text: &str, quote: &str, replaces: Option<&str>) -> ImpressionDraft {
         text: text.into(),
         quote: quote.into(),
         replaces: replaces.map(Into::into),
+        reaffirms: None,
     }
 }
 #[tokio::test]
@@ -703,4 +704,223 @@ async fn profiles_need_enough_sources_verified_citations_and_expire_with_their_s
         people.profile(&id(2)).unwrap().is_none(),
         "删除印象时一并删除画像"
     );
+}
+
+/// 让某人说几句原话并取出这一批，学习结果由调用方给出。
+fn batch_of(people: &PeopleController, user: usize, quotes: &[&str]) -> ImpressionBatch {
+    let fillers = ["我今天有点忙", "我先去吃饭", "我回来了", "我在路上"];
+    let notes = quotes
+        .iter()
+        .chain(fillers.iter())
+        .take(IMPRESSION_BATCH.max(quotes.len()));
+    for text in notes {
+        people.note(&id(user), text).unwrap();
+    }
+    let batch = people.take_impression_batch().unwrap().unwrap();
+    assert_eq!(batch.participant, id(user));
+    batch
+}
+fn reaffirm(text: &str, quote: &str, target: &str) -> ImpressionDraft {
+    ImpressionDraft {
+        reaffirms: Some(target.into()),
+        ..draft(text, quote, None)
+    }
+}
+#[tokio::test]
+async fn reaffirmed_impressions_are_counted_ranked_first_and_kept_when_full() {
+    let state = Arc::new(MemoryStateStore::default());
+    let (kernel, people) = start_learning(state.clone()).await;
+    for (conversation, user) in [(1, 2), (5, 4)] {
+        people.observe(scope(conversation, user), None).unwrap();
+        people.visit(&id(user), Scene::Group, 1).unwrap();
+    }
+    teach(&people, 2, &[("养猫", "我养猫")], 5);
+    let rounds: [[(&str, &str); 3]; 4] = [
+        [
+            ("会弹琴", "我会弹琴"),
+            ("住上海", "我住上海"),
+            ("怕冷", "我很怕冷"),
+        ],
+        [
+            ("在学 Rust", "我在学Rust"),
+            ("早睡", "我一般十点睡"),
+            ("喜欢爬山", "我喜欢爬山"),
+        ],
+        [
+            ("是护士", "我是护士"),
+            ("养狗", "我养狗"),
+            ("会做饭", "我会做饭"),
+        ],
+        [
+            ("爱喝茶", "我爱喝茶"),
+            ("玩原神", "我玩原神"),
+            ("住北京", "我住北京"),
+        ],
+    ];
+    for (round, items) in rounds.iter().enumerate() {
+        teach(&people, 4, items, 10 * (round as u64 + 1));
+    }
+    let list = people.impressions(&id(4)).unwrap();
+    assert_eq!(list.len(), MAX_IMPRESSIONS);
+    let piano = list.iter().find(|i| i.text == "会弹琴").unwrap().id.clone();
+    let tea = list.iter().find(|i| i.text == "爱喝茶").unwrap().id.clone();
+    let saved = |state: &MemoryStateStore| -> serde_json::Value {
+        serde_json::from_slice(&state.get(&plugin_id(), "people.v1").unwrap().unwrap()).unwrap()
+    };
+    let links = || Links(Ok(vec![id(4)]));
+    let before = people.linked_impressions(&id(2), &links()).unwrap();
+    assert!(before.truncated);
+    assert!(
+        !before.items.iter().any(|i| i.text == "会弹琴"),
+        "未再次说到时只按时间选，最早的不在其中"
+    );
+    let profile = people.profile_request(&id(2), &links()).unwrap().unwrap();
+
+    // 不合格的再次说到整批拒绝：未知编号、同一条两次、与替换同时填写。
+    let batch = batch_of(&people, 4, &["我还在弹琴"]);
+    let both = ImpressionDraft {
+        replaces: Some(piano.clone()),
+        ..reaffirm("会弹琴", "我还在弹琴", &piano)
+    };
+    assert!(
+        people
+            .finish_impression_batch(&batch, vec![both], 50)
+            .is_err()
+    );
+    for drafts in [
+        vec![reaffirm("会弹琴", "我还在弹琴", "i999")],
+        vec![
+            reaffirm("会弹琴", "我还在弹琴", &piano),
+            reaffirm("会弹琴", "我还在弹琴", &piano),
+        ],
+    ] {
+        let batch = batch_of(&people, 4, &["我还在弹琴"]);
+        assert!(people.finish_impression_batch(&batch, drafts, 50).is_err());
+    }
+    assert_eq!(saved(&state)["version"], 3, "没有再次说到时不升级格式");
+
+    let batch = batch_of(&people, 4, &["我还在弹琴"]);
+    assert_eq!(
+        people
+            .finish_impression_batch(&batch, vec![reaffirm("会弹琴", "我还在弹琴", &piano)], 50)
+            .unwrap(),
+        1
+    );
+    let piano_now = people
+        .impressions(&id(4))
+        .unwrap()
+        .into_iter()
+        .find(|i| i.id == piano)
+        .unwrap();
+    assert_eq!(
+        (
+            piano_now.reaffirmed,
+            piano_now.reaffirmed_at_ms,
+            piano_now.quote.as_str()
+        ),
+        (1, Some(50), "我会弹琴"),
+        "只计次，正文与原始摘录不变"
+    );
+    assert_eq!(saved(&state)["version"], 5);
+
+    let after = people.linked_impressions(&id(2), &links()).unwrap();
+    let chosen = after.items.iter().find(|i| i.text == "会弹琴").unwrap();
+    assert_eq!(chosen.reaffirmed, 1, "常被说到的优先选入");
+    assert!(
+        after
+            .items
+            .windows(2)
+            .all(|w| w[0].updated_at_ms >= w[1].updated_at_ms),
+        "选出后仍按时间排列"
+    );
+    let view = serde_json::to_value(chosen).unwrap();
+    assert_eq!(view["reaffirmed"], 1);
+    assert_eq!(
+        people
+            .profile_request(&id(2), &links())
+            .unwrap()
+            .unwrap()
+            .fingerprint,
+        profile.fingerprint,
+        "依据集合没变时画像指纹不变"
+    );
+
+    // 满了：最早记下、从没再说到的一条让位；再次说到过的保留。
+    let batch = batch_of(&people, 4, &["我在学日语"]);
+    assert_eq!(
+        people
+            .finish_impression_batch(&batch, vec![draft("在学日语", "我在学日语", None)], 60)
+            .unwrap(),
+        1
+    );
+    let texts: Vec<String> = people
+        .impressions(&id(4))
+        .unwrap()
+        .into_iter()
+        .map(|i| i.text)
+        .collect();
+    assert_eq!(texts.len(), MAX_IMPRESSIONS);
+    assert!(texts.contains(&"在学日语".to_string()));
+    assert!(texts.contains(&"会弹琴".to_string()), "再次说到过的不让位");
+    assert!(
+        !texts.contains(&"住上海".to_string()),
+        "最早且没再说到的让位"
+    );
+    assert!(texts.contains(&"怕冷".to_string()), "一次只让出一条");
+
+    // 重启后按磁盘恢复计数。
+    drop(kernel);
+    let (_kernel, people) = start_learning(state.clone()).await;
+    let restored = people.impressions(&id(4)).unwrap();
+    assert_eq!(
+        restored.iter().find(|i| i.id == piano).unwrap().reaffirmed,
+        1
+    );
+    assert!(restored.iter().any(|i| i.id == tea));
+}
+
+#[tokio::test]
+async fn reaffirm_fields_must_match_format_five() {
+    let impression = |reaffirmed: u64, at: Option<u64>| {
+        serde_json::json!({"id":"i1","text":"养猫","quote":"我养猫","updated_at_ms":10,
+            "reaffirmed":reaffirmed,"reaffirmed_at_ms":at})
+    };
+    let document = |version: u8, impression: serde_json::Value| {
+        serde_json::json!({"version":version,"next":1,"people":[{
+            "scope":{"conversation":id(1),"participant":id(2)},"name":null,"revision":1,
+            "impressions":[impression]}]})
+    };
+    for (version, item, ok) in [
+        (5, impression(1, Some(20)), true),
+        (2, impression(1, Some(20)), false),
+        (4, impression(1, Some(20)), false),
+        (5, impression(0, None), false),
+        (5, impression(1, None), false),
+        (5, impression(1, Some(5)), false),
+    ] {
+        let state = Arc::new(MemoryStateStore::default());
+        let bytes = serde_json::to_vec(&document(version, item)).unwrap();
+        state
+            .set(&plugin_id(), "people.v1".into(), bytes.clone())
+            .unwrap();
+        let kernel = Kernel::with_services(KernelServices {
+            state: state.clone(),
+            ..KernelServices::default()
+        });
+        kernel
+            .register(Box::new(PeoplePlugin::new().unwrap()))
+            .unwrap();
+        assert_eq!(
+            kernel.start(&plugin_id()).await.is_ok(),
+            ok,
+            "格式 {version}"
+        );
+        if !ok {
+            assert_eq!(
+                state.get(&plugin_id(), "people.v1").unwrap().unwrap(),
+                bytes,
+                "拒绝启动并保留原字节"
+            );
+        }
+    }
 }

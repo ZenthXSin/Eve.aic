@@ -183,7 +183,11 @@ fn impressions(people: &dyn PeopleDirectory, user: &str, text: &str) -> PluginRe
     }
     let mut reply = format!("我从你说过的话里记下了 {} 条印象：", list.len());
     for i in &list {
-        reply.push_str(&format!("\n{} {}（你说过：“{}”）", i.id, i.text, i.quote));
+        reply.push_str(&format!("\n{} {}（你说过：“{}”", i.id, i.text, i.quote));
+        if i.reaffirmed > 0 {
+            reply.push_str(&format!("，之后又提到 {} 次", i.reaffirmed));
+        }
+        reply.push('）');
     }
     reply.push_str("\n不对或不想让我记着的，用 /impressions forget 编号 删除。");
     Ok(reply)

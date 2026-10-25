@@ -26,20 +26,26 @@ fn is_zero(value: &u64) -> bool {
 struct Document {
     version: u8,
     people: Vec<Person>,
-    /// 印象与批次编号计数；只在格式 2、3 出现。
+    /// 印象与批次编号计数；只在格式 2 及以上出现。
     #[serde(default, skip_serializing_if = "is_zero")]
     next: u64,
 }
 impl Document {
-    /// 没有印象或待学原话时仍写格式 1，有来访记录时写格式 3，有画像时写格式 4；
-    /// 只在用到时升级，旧程序照常读取旧格式。
+    /// 没有印象或待学原话时仍写格式 1，有来访记录时写格式 3，有画像时写格式 4，
+    /// 有再次说到的印象时写格式 5；只在用到时升级，旧程序照常读取旧格式。
     fn bytes(&mut self) -> PluginResult<Vec<u8>> {
         let extended = self.next > 0
             || self
                 .people
                 .iter()
                 .any(|p| !p.impressions.is_empty() || !p.pending.is_empty());
-        self.version = if self.people.iter().any(|p| p.profile.is_some()) {
+        self.version = if self
+            .people
+            .iter()
+            .any(|p| p.impressions.iter().any(|i| i.reaffirmed > 0))
+        {
+            5
+        } else if self.people.iter().any(|p| p.profile.is_some()) {
             4
         } else if self.people.iter().any(|p| p.presence.is_some()) {
             3
@@ -299,26 +305,43 @@ impl PeopleDirectory for PeopleController {
             .iter()
             .map(|i| i.id.clone())
             .collect();
-        let mut replaced = BTreeSet::new();
+        // 本批涉及的旧印象：被替换或再次说到的，各自只能出现一次，也不会被腾位置。
+        let mut touched = BTreeSet::new();
         if drafts.len() > MAX_IMPRESSION_DRAFTS
             || drafts.iter().any(|d| {
                 !valid_impression_text(&d.text)
                     || !valid_impression_text(&d.quote)
                     || !batch.messages.iter().any(|m| m.contains(&d.quote))
+                    || (d.replaces.is_some() && d.reaffirms.is_some())
                     || d.replaces
-                        .as_ref()
-                        .is_some_and(|id| !current.contains(id) || !replaced.insert(id.clone()))
+                        .iter()
+                        .chain(&d.reaffirms)
+                        .any(|id| !current.contains(id) || !touched.insert(id.clone()))
             })
         {
             return Err(PluginError::Task("印象学习结果不合格；本批不保存".into()));
         }
         let mut changed = 0;
         for draft in drafts {
+            if let Some(old) = draft.reaffirms {
+                // 再次说到：只计次，正文与原始摘录不变。
+                let slot = document.people[index]
+                    .impressions
+                    .iter_mut()
+                    .find(|i| i.id == old)
+                    .ok_or_else(unavailable)?;
+                slot.reaffirmed = slot.reaffirmed.saturating_add(1);
+                slot.reaffirmed_at_ms = Some(now_ms.max(slot.updated_at_ms));
+                changed += 1;
+                continue;
+            }
             let impression = Impression {
                 id: document.id('i')?,
                 text: draft.text,
                 quote: draft.quote,
                 updated_at_ms: now_ms,
+                reaffirmed: 0,
+                reaffirmed_at_ms: None,
             };
             let person = &mut document.people[index];
             if let Some(old) = draft.replaces {
@@ -330,8 +353,21 @@ impl PeopleDirectory for PeopleController {
                 *slot = impression;
             } else if person.impressions.len() < MAX_IMPRESSIONS {
                 person.impressions.push(impression);
+            } else if let Some(slot) = person
+                .impressions
+                .iter_mut()
+                .filter(|i| i.reaffirmed == 0 && !touched.contains(&i.id))
+                .min_by(|a, b| {
+                    a.updated_at_ms
+                        .cmp(&b.updated_at_ms)
+                        .then_with(|| a.id.cmp(&b.id))
+                })
+            {
+                // 满了：让位给新印象的是最早记下、此后从没再说到的一条；
+                // 再次说到过的都保留，全都说到过时不再新增。
+                touched.insert(impression.id.clone());
+                *slot = impression;
             } else {
-                // 满了只保留现有印象；用户可删除旧的腾出位置。
                 continue;
             }
             changed += 1;
@@ -382,25 +418,40 @@ impl PeopleDirectory for PeopleController {
             return Ok(LinkedImpressions::default());
         };
         let mut seen: BTreeSet<String> = found.own.iter().map(|i| i.text.clone()).collect();
-        let mut items: Vec<LinkedImpression> = found
+        let mut items: Vec<(u64, LinkedImpression)> = found
             .linked
             .into_iter()
-            .map(|(scene, impression)| LinkedImpression {
-                text: impression.text,
-                quote: impression.quote,
-                updated_at_ms: impression.updated_at_ms,
-                scene,
+            .map(|(scene, impression)| {
+                (
+                    impression.last_active_ms(),
+                    LinkedImpression {
+                        text: impression.text,
+                        quote: impression.quote,
+                        updated_at_ms: impression.updated_at_ms,
+                        reaffirmed: impression.reaffirmed,
+                        scene,
+                    },
+                )
             })
             .collect();
-        // 新的在前；同一说法在多处出现只留最新一条，也不重复本会话已有的印象。
+        // 常被再次说到的优先，其次是最近活动的；同一说法在多处出现只留排在前面的一条，
+        // 也不重复本会话已有的印象。选出后按更新时间从新到旧排列。
+        items.sort_by(|(a_active, a), (b_active, b)| {
+            b.reaffirmed
+                .cmp(&a.reaffirmed)
+                .then_with(|| b_active.cmp(a_active))
+                .then_with(|| b.updated_at_ms.cmp(&a.updated_at_ms))
+                .then_with(|| a.text.cmp(&b.text))
+        });
+        items.retain(|(_, item)| seen.insert(item.text.clone()));
+        let truncated = items.len() > MAX_LINKED_IMPRESSIONS;
+        items.truncate(MAX_LINKED_IMPRESSIONS);
+        let mut items: Vec<LinkedImpression> = items.into_iter().map(|(_, item)| item).collect();
         items.sort_by(|a, b| {
             b.updated_at_ms
                 .cmp(&a.updated_at_ms)
                 .then_with(|| a.text.cmp(&b.text))
         });
-        items.retain(|item| seen.insert(item.text.clone()));
-        let truncated = items.len() > MAX_LINKED_IMPRESSIONS;
-        items.truncate(MAX_LINKED_IMPRESSIONS);
         Ok(LinkedImpressions {
             items,
             sources: found.sources,
@@ -415,19 +466,17 @@ impl PeopleDirectory for PeopleController {
         let Some(found) = self.linked_sources(participant, links)? else {
             return Ok(None);
         };
-        let mut items: Vec<(u64, ProfileSource)> = found
+        // (再次说到的次数, 最近活动, 更新时间, 依据)
+        let mut items: Vec<(u64, u64, u64, ProfileSource)> = found
             .own
             .into_iter()
-            .map(|i| (i.updated_at_ms, i, true, found.scene))
-            .chain(
-                found
-                    .linked
-                    .into_iter()
-                    .map(|(scene, i)| (i.updated_at_ms, i, false, scene)),
-            )
-            .map(|(at, i, here, scene)| {
+            .map(|i| (i, true, found.scene))
+            .chain(found.linked.into_iter().map(|(scene, i)| (i, false, scene)))
+            .map(|(i, here, scene)| {
                 (
-                    at,
+                    i.reaffirmed,
+                    i.last_active_ms(),
+                    i.updated_at_ms,
                     ProfileSource {
                         text: i.text,
                         quote: i.quote,
@@ -437,15 +486,27 @@ impl PeopleDirectory for PeopleController {
                 )
             })
             .collect();
-        // 本会话的说法排在同一时刻的他处说法之前，去重时优先保留。
+        // 常被再次说到的优先，其次是最近活动的；本会话的说法排在同等的他处说法之前，
+        // 去重时优先保留。选出后按更新时间排列，再次说到只改变排名、不改变已选依据的顺序，
+        // 画像指纹只在依据集合变化时才变。
         items.sort_by(|a, b| {
             b.0.cmp(&a.0)
-                .then_with(|| b.1.here.cmp(&a.1.here))
-                .then_with(|| a.1.text.cmp(&b.1.text))
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| b.3.here.cmp(&a.3.here))
+                .then_with(|| a.3.text.cmp(&b.3.text))
         });
         let mut seen = BTreeSet::new();
-        items.retain(|(_, item)| seen.insert(item.text.clone()));
+        items.retain(|item| seen.insert(item.3.text.clone()));
         items.truncate(MAX_PROFILE_SOURCES);
+        items.sort_by(|a, b| {
+            b.2.cmp(&a.2)
+                .then_with(|| b.3.here.cmp(&a.3.here))
+                .then_with(|| a.3.text.cmp(&b.3.text))
+        });
+        let items: Vec<(u64, ProfileSource)> = items
+            .into_iter()
+            .map(|(_, _, at, item)| (at, item))
+            .collect();
         if items.len() < PROFILE_MIN_ITEMS {
             return Ok(None);
         }
@@ -626,12 +687,18 @@ fn valid_profile(profile: &PersonProfile) -> bool {
 fn valid_document(document: &Document) -> bool {
     let mut ids = BTreeSet::new();
     let mut impression_ids = BTreeSet::new();
-    let extended = matches!(document.version, 2..=4);
-    let visits = matches!(document.version, 3 | 4);
-    let profiles = document.version == 4;
+    let extended = matches!(document.version, 2..=5);
+    let visits = matches!(document.version, 3..=5);
+    let profiles = matches!(document.version, 4 | 5);
+    let reaffirmed = document.version == 5;
     (extended || (document.version == 1 && document.next == 0))
         && (document.version != 3 || document.people.iter().any(|p| p.presence.is_some()))
-        && (!profiles || document.people.iter().any(|p| p.profile.is_some()))
+        && (document.version != 4 || document.people.iter().any(|p| p.profile.is_some()))
+        && (!reaffirmed
+            || document
+                .people
+                .iter()
+                .any(|p| p.impressions.iter().any(|i| i.reaffirmed > 0)))
         && document.people.len() <= MAX_PEOPLE
         && !document.people.iter().any(|p| {
             !valid_identity(&p.scope.conversation)
@@ -654,6 +721,9 @@ fn valid_document(document: &Document) -> bool {
                         || !valid_impression_text(&i.quote)
                         || !numbered(&i.id, 'i', document.next)
                         || !impression_ids.insert(i.id.clone())
+                        || (i.reaffirmed > 0 && !reaffirmed)
+                        || (i.reaffirmed > 0) != i.reaffirmed_at_ms.is_some()
+                        || i.reaffirmed_at_ms.is_some_and(|at| at < i.updated_at_ms)
                 })
         })
 }

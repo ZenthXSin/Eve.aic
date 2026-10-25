@@ -121,8 +121,9 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
                 return {"impressions": [{"text": "在学 Rust", "quote": "我最近在学Rust", "replaces": None},
                                         {"text": "养了一只橘猫", "quote": "我养了一只橘猫", "replaces": None}]}
             self.assertEqual([k["text"] for k in batch["known"]], ["在学 Rust", "养了一只橘猫"])
-            old = batch["known"][0]["id"]
-            return {"impressions": [{"text": "改学 Go 了", "quote": "我不学Rust了改学Go", "replaces": old}]}
+            old, cat = batch["known"][0]["id"], batch["known"][1]["id"]
+            return {"impressions": [{"text": "改学 Go 了", "quote": "我不学Rust了改学Go", "replaces": old},
+                                    {"text": "养了一只橘猫", "quote": "我家橘猫又胖了", "replaces": None, "reaffirms": cat}]}
         self.impression_reply = impressions
         seen = {}
         def respond(body):
@@ -148,7 +149,7 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
         self.assertTrue(all("impressions" not in p for p in other["others"]), "别人的印象不进入他人的对话")
         self.assertEqual(self.people_state()["version"], 3, "有来访记录时为格式 3，印象照常保存")
         # 重启后不重放已取出的批次；新的原话更新旧印象。
-        later = ["我不学Rust了改学Go", "我觉得Go挺好上手", "我周末打算写个小工具", "我还在纠结用什么框架"]
+        later = ["我不学Rust了改学Go", "我觉得Go挺好上手", "我周末打算写个小工具", "我家橘猫又胖了"]
         self.enabled([*[step for i, text in enumerate(later) for step in say(f"l{i}", text)],
                       *self.checkpoint("updated")],
                      checkpoints={"updated": lambda: self.wait_until(
@@ -157,6 +158,11 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
         self.assertEqual(len(self.kind("impression")), 2)
         mine = next(p for p in self.people_state()["people"] if p.get("impressions"))["impressions"]
         self.assertEqual([i["text"] for i in mine], ["改学 Go 了", "养了一只橘猫"])
+        self.assertEqual(mine[1]["reaffirmed"], 1, "又说到同一件事只计次，不重复新增")
+        self.assertEqual(mine[1]["quote"], "我养了一只橘猫")
+        self.assertEqual(self.people_state()["version"], 5)
+        self.enabled([*self.send(self.message("list-again", "/impressions", user="user-1", scope="group",
+                                              target="group-1", contains=["之后又提到 1 次"]))])
         self.enabled([*self.send(self.message("forget-other", f"/impressions forget {mine[1]['id']}", user="user-2",
                                               scope="group", target="group-1", contains="没有你的印象")),
                       *self.send(self.message("forget", f"/impressions forget {mine[1]['id']}", user="user-1",
