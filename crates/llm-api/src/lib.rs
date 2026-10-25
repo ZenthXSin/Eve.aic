@@ -684,6 +684,7 @@ pub struct ToolExecutionContext {
     conversation: Option<Arc<Vec<ChatMessage>>>,
     shared_steps: Option<SharedToolSteps>,
     deadline: Option<std::time::Instant>,
+    delegated: bool,
 }
 /// 单轮内共享的任务状态。只影响本轮收尾，不授予权限、不持久化或重放工具。
 #[derive(Clone, Default)]
@@ -718,6 +719,7 @@ impl ToolExecutionContext {
             conversation: None,
             shared_steps: None,
             deadline: None,
+            delegated: false,
         }
     }
     /// 绑定本轮的可信会话范围；由宿主依据通道身份设置，模型参数不能改变它。
@@ -756,6 +758,15 @@ impl ToolExecutionContext {
     pub fn with_shared_steps(mut self, steps: SharedToolSteps) -> Self {
         self.shared_steps = Some(steps);
         self
+    }
+    /// 由宿主标记的委托执行（后台任务、子代理）：没有人在场，用户角色的消息是派发时由模型写的
+    /// 任务说明，不是用户原话。模型参数不能设置它。
+    pub fn with_delegated(mut self, delegated: bool) -> Self {
+        self.delegated = delegated;
+        self
+    }
+    pub fn is_delegated(&self) -> bool {
+        self.delegated
     }
     pub fn shared_steps(&self) -> Option<&SharedToolSteps> {
         self.shared_steps.as_ref()

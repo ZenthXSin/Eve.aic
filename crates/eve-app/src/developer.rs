@@ -1,7 +1,17 @@
 //! 组合层只读取宿主配置与凭据引用。没有配置就不注册开发工具。
 use crate::{AppError, CoreBootstrap};
-use eve_developer_api::DeveloperConfig;
-use std::{path::Path, sync::Arc, time::Duration};
+use eve_developer_api::{ActionReviewFuture, ActionReviewRequest, ActionReviewer, DeveloperConfig};
+use eve_llm_api::{LlmError, LlmModelResolver, ModelSelection};
+use eve_plugin_api::ServiceRegistry;
+use serde_json::json;
+use std::{
+    path::Path,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
+
+/// 行动审查的模型用途，单独记健康与输出上限。
+pub(crate) const REVIEW_USE: &str = "review";
 
 pub(crate) fn install(bootstrap: &mut CoreBootstrap, state: &Path) -> Result<(), AppError> {
     install_with_authorization(bootstrap, state, None)
@@ -11,13 +21,14 @@ pub(crate) fn install_with_authorization(
     state: &Path,
     authorization: Option<Arc<dyn eve_developer_api::DeveloperAuthorization>>,
 ) -> Result<(), AppError> {
-    install_with_member_runtime(bootstrap, state, authorization, None)
+    install_with_member_runtime(bootstrap, state, authorization, None, None)
 }
 pub(crate) fn install_with_member_runtime(
     bootstrap: &mut CoreBootstrap,
     state: &Path,
     authorization: Option<Arc<dyn eve_developer_api::DeveloperAuthorization>>,
     member_runtime: Option<eve_developer_api::MemberRuntime>,
+    reviewer: Option<Arc<dyn ActionReviewer>>,
 ) -> Result<(), AppError> {
     let Some(path) = std::env::var_os("EVE_DEVELOPER_CONFIG") else {
         return Ok(());
@@ -54,6 +65,10 @@ pub(crate) fn install_with_member_runtime(
         policy = policy.merged(extra);
     }
     backend = backend.with_command_policy(Arc::new(policy));
+    // 需确认的命令交给审查者；配置关闭或宿主没有审查者时，仍由模型带 owner_confirmed。
+    if let Some(reviewer) = reviewer.filter(|_| config.action_review) {
+        backend = backend.with_action_reviewer(reviewer);
+    }
     let backend = Arc::new(backend);
     bootstrap.host_config.max_tool_rounds = config.max_tool_rounds;
     // 期限只在显式启用开发工具时扩大，普通对话和旧配置保持原值。
@@ -87,4 +102,66 @@ pub(crate) fn member_runtime(
             .and_then(|p| p.parent()?.parent().map(Path::to_path_buf)),
         mindustry_server: jar.and_then(|p| p.canonicalize().ok()),
     }
+}
+
+/// 首次审查时才从已启动的配置服务取模型；之后沿用同一解析器，热配置照常生效。
+struct RegistryResolver {
+    registry: Arc<dyn ServiceRegistry>,
+    key: String,
+    resolver: OnceLock<crate::models::CoreModelResolver>,
+}
+impl LlmModelResolver for RegistryResolver {
+    fn resolve(&self) -> Result<ModelSelection, LlmError> {
+        if self.resolver.get().is_none() {
+            let settings = crate::qq_tasks::config_service(self.registry.as_ref())
+                .map_err(|e| LlmError::Configuration(e.to_string()))?;
+            let _ = self.resolver.set(
+                crate::models::CoreModelResolver::new(settings, self.key.clone())
+                    .with_use(REVIEW_USE),
+            );
+        }
+        self.resolver
+            .get()
+            .ok_or_else(|| LlmError::Configuration("审查模型不可用".into()))?
+            .resolve()
+    }
+}
+/// 每次审查的结局写入标准错误的 `EVE_ACTION_REVIEW` 行，不含命令与原话。
+struct Reported(eve_action_review::ModelActionReviewer);
+impl ActionReviewer for Reported {
+    fn review(&self, request: ActionReviewRequest) -> ActionReviewFuture<'_> {
+        Box::pin(async move {
+            let delegated = request.delegated;
+            let result = self.0.review(request).await;
+            let line = match &result {
+                Ok(v) => json!({"outcome": if v.permits() { "allowed" } else { "denied" },
+                    "risk": v.risk, "authorization": v.authorization, "delegated": delegated}),
+                Err(e) => json!({"outcome": "failed", "error": e, "delegated": delegated}),
+            };
+            eprintln!("EVE_ACTION_REVIEW {line}");
+            result
+        })
+    }
+}
+/// QQ 宿主的行动审查者；没有模型凭据时不装配，开发工具退回由模型带 owner_confirmed。
+pub(crate) fn action_reviewer(
+    registry: Arc<dyn ServiceRegistry>,
+    health: Arc<eve_model_health::HealthBook>,
+) -> Option<Arc<dyn ActionReviewer>> {
+    let key = std::env::var("EVE_OPENAI_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())?;
+    health.register(REVIEW_USE);
+    let resolver = eve_model_health::ObservedResolver::new(
+        Arc::new(RegistryResolver {
+            registry,
+            key,
+            resolver: OnceLock::new(),
+        }),
+        REVIEW_USE,
+        health,
+    );
+    Some(Arc::new(Reported(
+        eve_action_review::ModelActionReviewer::new(Arc::new(resolver)),
+    )))
 }
