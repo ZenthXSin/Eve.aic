@@ -169,6 +169,8 @@ class GitBuilder:
         request = dict(format_version=1, candidate_sha256=key, candidate_directory=str(directory),
                        session_id='host:auto-update', requested_by='host:auto-update', turn_id=1)
         if not directory.exists():
+            if shutil.disk_usage(self.candidates).free < binary.stat().st_size + total + 128 * 1024**2:
+                raise ValueError('auto_update_insufficient_space_for_candidate')
             with tempfile.TemporaryDirectory(dir=self.candidates) as temporary:
                 stage = Path(temporary)
                 shutil.copy2(binary, stage / binary.name); (stage / binary.name).chmod(0o700)
@@ -238,6 +240,11 @@ class SourceUpdater:
                     self.quiet = None; self.publish(phase='waiting', result='waiting_for_idle'); return
                 self.quiet = self.quiet or time.monotonic()
                 if time.monotonic() - self.quiet < supervisor.options.quiet_seconds: return
+                # 快照及运行时下一次原子状态提交都需要空间；不能先停旧进程再发现放不下备份。
+                state_bytes = sum(p.stat().st_size for p in supervisor.state.parent.rglob('*')
+                                  if p.is_file() and not p.is_symlink())
+                if shutil.disk_usage(self.control).free < state_bytes * 2 + 256 * 1024**2:
+                    raise ValueError('auto_update_insufficient_space_for_backup')
                 request = self.pending['request']
                 path = self.control / 'auto-request.json'
                 runtime.atomic(path, request)
