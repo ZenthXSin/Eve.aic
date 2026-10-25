@@ -93,6 +93,7 @@ pub struct LocalDeveloper {
     authorization: Option<std::sync::Arc<dyn DeveloperAuthorization>>,
     member_runtime: Option<MemberRuntime>,
     isolated: bool,
+    command_policy: Option<std::sync::Arc<dyn eve_developer_api::CommandPolicy>>,
 }
 impl LocalDeveloper {
     pub fn new(
@@ -154,6 +155,7 @@ impl LocalDeveloper {
             authorization: None,
             member_runtime: None,
             isolated: false,
+            command_policy: None,
         })
     }
     pub fn with_authorization(
@@ -161,6 +163,14 @@ impl LocalDeveloper {
         authorization: std::sync::Arc<dyn DeveloperAuthorization>,
     ) -> Self {
         self.authorization = Some(authorization);
+        self
+    }
+    /// 模型请求的 run_command 先经命令策略判断；宿主自己发起的构建命令不经过它。
+    pub fn with_command_policy(
+        mut self,
+        policy: std::sync::Arc<dyn eve_developer_api::CommandPolicy>,
+    ) -> Self {
+        self.command_policy = Some(policy);
         self
     }
     pub fn with_member_runtime(mut self, runtime: MemberRuntime) -> Self {
@@ -505,6 +515,24 @@ impl LocalDeveloper {
                 if !self.config.commands {
                     return Err(failed("命令执行未启用"));
                 }
+                if let Some(policy) = &self.command_policy {
+                    let evaluation = policy.evaluate(&a.program, &a.args);
+                    match evaluation.decision {
+                        Some(eve_developer_api::CommandDecision::Forbidden) => {
+                            return Err(failed(format!(
+                                "命令被策略禁止：{}。不要换一种写法绕过；需要时请主人自己执行",
+                                evaluation.reason()
+                            )));
+                        }
+                        Some(eve_developer_api::CommandDecision::Prompt) if !a.owner_confirmed => {
+                            return Err(failed(format!(
+                                "这条命令需要主人或管理员明确同意：{}。先在对话里说明要执行什么、影响哪些文件或分支，得到明确同意后再带 owner_confirmed: true 调用；不要自行认定已同意",
+                                evaluation.reason()
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
                 self.command(a, context).await
             }
             DeveloperOperation::Github(a) => self.github(a).await,
@@ -790,6 +818,7 @@ impl LocalDeveloper {
             let result = self
                 .command(
                     CommandArguments {
+                        owner_confirmed: false,
                         program: self.config.cargo_program.clone(),
                         args,
                         cwd: ".".into(),
@@ -817,6 +846,7 @@ impl LocalDeveloper {
         let metadata = self
             .command_limited(
                 CommandArguments {
+                    owner_confirmed: false,
                     program: self.config.cargo_program.clone(),
                     args: self
                         .config
@@ -877,6 +907,7 @@ impl LocalDeveloper {
             let result = self
                 .command(
                     CommandArguments {
+                        owner_confirmed: false,
                         program: "git".into(),
                         args: args.into_iter().map(str::to_string).collect(),
                         cwd: ".".into(),

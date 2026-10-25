@@ -22,6 +22,7 @@ fn config(root: &Path) -> DeveloperConfig {
         max_tool_rounds: 8,
         self_upgrade: false,
         live_upgrade: None,
+        command_policy: None,
         cargo_program: "cargo".into(),
         cargo_arguments: vec![],
     }
@@ -263,6 +264,7 @@ async fn public_github_allows_guest_write_without_granting_local_tools() {
         DeveloperOperation::PrepareUpgrade,
         DeveloperOperation::UpgradeStatus,
         DeveloperOperation::Command(CommandArguments {
+            owner_confirmed: false,
             program: "must-not-run".into(),
             args: vec![],
             cwd: ".".into(),
@@ -832,6 +834,7 @@ async fn real_command_status_output_limits_cancellation_and_timeout_kill_descend
     .unwrap();
     let command = |script: &str, limit| {
         DeveloperOperation::Command(CommandArguments {
+            owner_confirmed: false,
             program: "sh".into(),
             args: vec!["-c".into(), script.into()],
             cwd: ".".into(),
@@ -1108,4 +1111,74 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
             .await
             .is_err()
     );
+}
+
+/// 命令策略：禁止的不执行，需确认的没有明确同意时不执行，同意后照常执行。
+#[cfg(unix)]
+#[tokio::test]
+async fn command_policy_blocks_or_requires_confirmation_before_anything_runs() {
+    struct Policy;
+    impl eve_developer_api::CommandPolicy for Policy {
+        fn evaluate(&self, program: &str, args: &[String]) -> eve_developer_api::CommandEvaluation {
+            use eve_developer_api::{CommandDecision, CommandEvaluation, CommandRuleMatch};
+            let script = args.get(1).cloned().unwrap_or_default();
+            let decision = if script.contains("forbidden") {
+                Some(CommandDecision::Forbidden)
+            } else if script.contains("careful") {
+                Some(CommandDecision::Prompt)
+            } else {
+                None
+            };
+            CommandEvaluation {
+                decision,
+                matches: decision
+                    .map(|decision| CommandRuleMatch {
+                        matched_prefix: vec![program.into()],
+                        decision,
+                        justification: Some("测试规则".into()),
+                    })
+                    .into_iter()
+                    .collect(),
+            }
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let backend = LocalDeveloper::new(config(root.path()), ledger.path().into(), None)
+        .unwrap()
+        .with_command_policy(Arc::new(Policy));
+    let command = |marker: &str, confirmed| {
+        DeveloperOperation::Command(CommandArguments {
+            owner_confirmed: confirmed,
+            program: "sh".into(),
+            args: vec!["-c".into(), format!("touch {marker}")],
+            cwd: ".".into(),
+            timeout_ms: None,
+        })
+    };
+    let error = backend
+        .execute(command("forbidden", true), context("owner"))
+        .await
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("禁止"), "{error:?}");
+    let error = backend
+        .execute(command("careful", false), context("owner"))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:?}").contains("owner_confirmed"),
+        "{error:?}"
+    );
+    assert!(!root.path().join("forbidden").exists() && !root.path().join("careful").exists());
+    let out = backend
+        .execute(command("careful", true), context("owner"))
+        .await
+        .unwrap();
+    assert_eq!(out["success"], true);
+    assert!(root.path().join("careful").exists());
+    backend
+        .execute(command("plain", false), context("owner"))
+        .await
+        .unwrap();
+    assert!(root.path().join("plain").exists());
 }
