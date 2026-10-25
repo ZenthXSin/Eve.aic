@@ -568,8 +568,9 @@ impl QqBotOptions {
         research_policy(&options)?;
         if options.practice_server_jar.is_none()
             && (options.practice_java.is_some() || !options.practice_java_args.is_empty())
+            && !options.interest_learning
         {
-            return Err("--practice-java 需要同时指定 --practice-mindustry-server".into());
+            return Err("--practice-java 需要同时指定 --practice-mindustry-server，或开启 --interest-learning 由 Eve 自备服务端".into());
         }
         if options.practice_server_jar.is_some() && !options.interest_learning {
             return Err("--practice-mindustry-server 需要同时开启 --interest-learning".into());
@@ -915,6 +916,45 @@ async fn run_qqbot_composed(
         options.interest_options.validate()?;
         let research_policy = research_policy(&options)?;
         let research_corpus = research_corpus(&options)?;
+        // 条件自备：账本先于实践装配读取；损坏时拒绝启动并保留原字节。
+        // 没有指定实践运行环境时，使用此前自己取得并验证过的服务端；仍缺少时记为需要，提示主人与管理员的对话。
+        let provision_plugin = eve_provision_plugin::ProvisionPlugin::new(
+            options.state_directory.join(crate::qq_provision::DIRECTORY),
+            crate::qq_provision::conditions(eve_practice_mindustry::RuntimeCommand {
+                program: options.practice_java.clone().unwrap_or_else(|| "java".into()),
+                prefix_args: options.practice_java_args.clone(),
+            }),
+        )?;
+        let provider = provision_plugin.controller();
+        kernel.register(Box::new(provision_plugin))?;
+        kernel
+            .start(&PluginId::new(eve_provision_api::PROVISION_PLUGIN_ID)?)
+            .await?;
+        let mut needed_conditions = std::collections::BTreeMap::new();
+        if options.interest_learning
+            && options.practice_server_jar.is_none()
+            && options.practice_browser.is_none()
+            && interest_components.runner.is_none()
+        {
+            match eve_provision_api::ConditionProvider::ready_path(
+                &provider,
+                crate::qq_provision::MINDUSTRY_SERVER,
+            )? {
+                Some(path) => options.practice_server_jar = Some(path),
+                None => {
+                    needed_conditions.insert(
+                        crate::qq_provision::MINDUSTRY_SERVER.to_string(),
+                        "实践验证：在真实 Mindustry 中加载并核对自己做的内容模组".to_string(),
+                    );
+                }
+            }
+        }
+        let provision = Arc::new(crate::qq_provision::Provision {
+            provider: Arc::new(provider),
+            registry: registry.clone(),
+            admin: std::sync::OnceLock::new(),
+            needed: needed_conditions,
+        });
         let practice_enabled = options.practice_server_jar.is_some()
             || options.practice_browser.is_some()
             || interest_components.runner.is_some();
@@ -1466,6 +1506,14 @@ async fn run_qqbot_composed(
             }),
             _ => context,
         };
+        // 条件自备：管理工具取得并验证运行条件；需要而缺少时只在主人与管理员的对话里提示。
+        bootstrap
+            .tools
+            .push(Arc::new(crate::qq_provision::AcquireConditionTool(provision.clone())));
+        let context: Arc<dyn ContextAssembler> = Arc::new(crate::qq_provision::ProvisionContext {
+            wrapped: context,
+            provision: provision.clone(),
+        });
         // 约定：Eve 答应别人、之后要做的事用工具记下；同一个人在其他会话里也看得到未完成的约定。
         let context: Arc<dyn ContextAssembler> = match &commitments {
             Some(commitments) => {
@@ -1849,6 +1897,7 @@ async fn run_qqbot_composed(
             registry.clone(),
         )?;
         let _ = outbox.member_access.set((developer_settings.as_ref().map(|c| c.workspace.clone()), qq_admin.clone()));
+        let _ = provision.admin.set(qq_admin.clone());
         for all in [false, true] {
             bootstrap.tools.push(Arc::new(crate::qq_context_reset::ResetTool {
                 all,
@@ -3396,8 +3445,8 @@ mod recall_options_tests {
             .to_string();
         assert!(error.contains("--interest-learning"));
         for orphan in [
-            vec!["--interest-learning", "--practice-java", "java"],
-            vec!["--interest-learning", "--practice-java-arg", "-Dx=y"],
+            vec!["--practice-java", "java"],
+            vec!["--practice-java-arg", "-Dx=y"],
         ] {
             assert!(
                 parse(&orphan)
@@ -3406,6 +3455,10 @@ mod recall_options_tests {
                     .contains("--practice-mindustry-server")
             );
         }
+        // 开启自主学习时可以只指定启动程序，服务端由 Eve 自备。
+        let provisioned = parse(&["--interest-learning", "--practice-java", "java"]).unwrap();
+        assert!(provisioned.practice_server_jar.is_none());
+        assert_eq!(provisioned.practice_java, Some(OsString::from("java")));
         let options = parse(&[
             "--interest-learning",
             "--practice-mindustry-server",

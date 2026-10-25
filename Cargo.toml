@@ -40,6 +40,8 @@ members = [
     "crates/clarify-api",
     "crates/clarify-plugin",
     "crates/commitment-api",
+    "crates/provision-api",
+    "crates/provision-plugin",
     "crates/commitment-plugin",
     "crates/reminder-api",
     "crates/reminder-plugin",

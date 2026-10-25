@@ -285,7 +285,8 @@ class PracticeAcceptance(unittest.TestCase):
         not_jar = self.work / "not-a-jar.jar"
         not_jar.write_text("#!/bin/sh\n", encoding="utf8")
         for extra, expected in ((["--practice-mindustry-server", str(self.jar)], "--interest-learning"),
-                                (["--interest-learning", "--practice-java", "java"], "--practice-mindustry-server"),
+                                # 开启自主学习时可以只指定启动程序（服务端由 Eve 自备），不开启时仍拒绝。
+                                (["--practice-java", "java"], "--practice-mindustry-server"),
                                 (["--interest-learning", "--practice-mindustry-server", str(not_jar)], "实践运行环境无效")):
             result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
                                      "--agent", str(ROOT / "AGENT.md"), *extra],

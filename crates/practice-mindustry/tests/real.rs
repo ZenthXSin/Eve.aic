@@ -125,3 +125,19 @@ async fn real_server_verifies_a_data_only_mod_and_rejects_silent_fallbacks() {
     );
     assert!(!evidence.verified(&broken));
 }
+
+#[tokio::test]
+#[ignore = "需要显式提供真实 Mindustry 服务端 jar"]
+async fn self_check_accepts_a_real_server_and_rejects_a_non_server_jar() {
+    let workspace = tempfile::tempdir().unwrap();
+    let evidence = runner().self_check(workspace.path()).await.unwrap();
+    assert!(evidence.contains("sha256:"), "{evidence}");
+
+    // 能通过 jar 头检查但不是服务端的文件：自检必须失败，不能当作可用的运行环境。
+    let fake = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(fake.path(), b"PK\x03\x04not a server").unwrap();
+    let fake_runner =
+        MindustryServerRunner::new(RuntimeCommand::default(), fake.path().to_path_buf()).unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    assert!(fake_runner.self_check(workspace.path()).await.is_err());
+}

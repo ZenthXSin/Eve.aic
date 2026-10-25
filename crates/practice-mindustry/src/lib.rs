@@ -119,6 +119,45 @@ impl MindustryServerRunner {
         })
     }
 
+    /// 用一个最小的纯数据模组实际启动一次：服务端正常加载、模组启用且探测值一致才算可用。
+    /// 用于确认取得的服务端 jar 真能作为实践运行环境；返回运行环境版本与 jar 摘要。
+    pub async fn self_check(&self, workspace: &Path) -> Result<String, String> {
+        let draft = PracticeDraft {
+            applicable: true,
+            files: vec![
+                eve_practice_api::ArtifactFile {
+                    path: "mod.hjson".into(),
+                    content: "name: \"eve-self-check\"\ndisplayName: \"Eve Self Check\"\nauthor: \"Eve\"\nversion: \"1.0\"\nminGameVersion: 146\n".into(),
+                },
+                eve_practice_api::ArtifactFile {
+                    path: "content/blocks/check-wall.hjson".into(),
+                    content: "type: Wall\nhealth: 321\nsize: 1\nrequirements: [ copper/6 ]\ncategory: defense\n".into(),
+                },
+            ],
+            probes: vec![eve_practice_api::Probe {
+                subject: "eve-self-check-check-wall".into(),
+                property: "health".into(),
+                expected: "321".into(),
+            }],
+            rationale: "运行环境自检".into(),
+            notes_used: vec![],
+        };
+        let evidence = self.execute(&draft, workspace).await;
+        if evidence.verified(&draft) {
+            Ok(format!(
+                "{}；{}",
+                evidence.runtime_version, self.profile.runtime
+            ))
+        } else {
+            Err(format!(
+                "exit={:?} loaded={} {}",
+                evidence.exit,
+                evidence.loaded,
+                prefix(&evidence.log_excerpt, 400)
+            ))
+        }
+    }
+
     async fn execute(&self, draft: &PracticeDraft, workspace: &Path) -> RunEvidence {
         let started = Instant::now();
         let files: Vec<(&str, &str)> = draft

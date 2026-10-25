@@ -53,6 +53,7 @@ mod qq_phrases;
 mod qq_plan;
 mod qq_practice;
 mod qq_progress;
+mod qq_provision;
 mod qq_pursuit;
 mod qq_reminder;
 mod qq_research;
@@ -423,6 +424,7 @@ pub(crate) async fn install_core_with_pages_and_admin(
         chime::schema(),
         qq_people::schema(),
         qq_memory_continuity::schema(),
+        qq_provision::schema(),
         qq_tasks::schema(),
         qq_message_judge::provider_schema(),
         model_roles_schema(),
