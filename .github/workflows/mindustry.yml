@@ -99,6 +99,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap
+          # Ubuntu 24.04 默认用 AppArmor 限制非特权用户命名空间，bubblewrap 无法建立成员沙箱。
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --unshare-all --ro-bind / / --dev /dev --proc /proc true
           python3 connectors/qqbot/test/member_development_test.py
       - name: 实际 Eve QQBot 进程用真实服务端走完整行为链（阶段之间独立重启）
         env:
