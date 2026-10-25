@@ -38,6 +38,7 @@ fn public_tool(name: &str) -> bool {
             | "search_files"
             | "write_file"
             | "edit_file"
+            | "apply_patch"
             | "run_command"
             | "send_file"
             | "check_practice_draft"
@@ -78,6 +79,10 @@ fn owner_file(path: &str, write: bool) -> bool {
         _ => false,
     })
 }
+/// 补丁里的任一路径（含移动目标）属于主人专用文件，或补丁无法解析而无法核对时为真。
+fn patch_touches_owner_file(patch: &str) -> bool {
+    eve_apply_patch::paths(patch).is_none_or(|paths| paths.iter().any(|p| owner_file(p, true)))
+}
 pub(crate) struct GuardedTool {
     pub inner: Arc<dyn Tool>,
     pub admin: Arc<Admin>,
@@ -94,6 +99,7 @@ impl Tool for GuardedTool {
                 | "search_files"
                 | "write_file"
                 | "edit_file"
+                | "apply_patch"
                 | "run_command"
         ) {
             definition.description.push_str(" 普通成员在自己当前会话的独立项目工作区执行，不需要管理员逐项授权。相对路径以此项目根目录为准；run_command 中工作区是 /work，HOME 是 /work/.home，Java 在 PATH，Mindustry 无头服务端只读位于 /opt/eve/mindustry-server.jar（宿主已配置时）。可编写模组、编译、导入并运行验证，交付文件放 exports/ 再调用 send_file。编译通过不能冒充已通过游戏运行验证；无图形客户端时如实区分无头验证与客户端验证。");
@@ -131,6 +137,20 @@ impl Tool for GuardedTool {
                 || self.public_github && name == "github_api")
             {
                 return Err(ToolExecutionError::Failed("此操作需要主人或管理员授权；普通成员的项目开发权限不包括宿主部署、全局管理、后台派发或定时主动消息".into()));
+            }
+            // 管理员不能借补丁改动身份规则文件与私密凭据；补丁里的每个路径都要核对。
+            if !owner
+                && administrator
+                && name == "apply_patch"
+                && call
+                    .arguments
+                    .get("patch")
+                    .and_then(Value::as_str)
+                    .is_some_and(patch_touches_owner_file)
+            {
+                return Err(ToolExecutionError::Failed(
+                    "身份规则文件及私密凭据仅限主人操作".into(),
+                ));
             }
             if !owner
                 && administrator
@@ -312,5 +332,16 @@ mod tests {
         }
         assert!(!owner_file("src/config.rs", true));
         assert!(!owner_file("AGENT.md", false));
+        let patch = |body: &str| format!("*** Begin Patch\n{body}\n*** End Patch");
+        assert!(!patch_touches_owner_file(&patch(
+            "*** Add File: src/a.rs\n+x"
+        )));
+        assert!(patch_touches_owner_file(&patch(
+            "*** Add File: src/a.rs\n+x\n*** Delete File: AGENT.md"
+        )));
+        assert!(patch_touches_owner_file(&patch(
+            "*** Update File: src/a.rs\n*** Move to: private/a.rs\n@@\n-x\n+y"
+        )));
+        assert!(patch_touches_owner_file("无法解析"));
     }
 }

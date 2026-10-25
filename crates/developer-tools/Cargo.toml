@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+eve-apply-patch = { path = "../apply-patch" }
 shlex = "1"
 eve-developer-api = { path = "../developer-api" }
 eve-llm-api = { path = "../llm-api" }

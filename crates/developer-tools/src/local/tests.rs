@@ -503,7 +503,7 @@ async fn tools_reject_identity_urls_and_extra_arguments_and_only_register_enable
     c.github = false;
     let backend = Arc::new(LocalDeveloper::new(c.clone(), ledger.path().into(), None).unwrap());
     let tools = crate::tools(&c, backend);
-    assert_eq!(tools.len(), 5);
+    assert_eq!(tools.len(), 6);
     let read = tools
         .iter()
         .find(|t| t.definition().name == "read_file")
@@ -1111,6 +1111,93 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
             .execute(DeveloperOperation::UpgradeStatus, context("owner"))
             .await
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn patch_adds_updates_moves_and_deletes_atomically_inside_the_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let backend = LocalDeveloper::new(config(root.path()), ledger.path().into(), None).unwrap();
+    std::fs::write(root.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    std::fs::write(root.path().join("old.txt"), "x\n").unwrap();
+    std::fs::write(root.path().join("gone.txt"), "bye\n").unwrap();
+    std::fs::create_dir(root.path().join("new")).unwrap();
+    let patch = |text: &str| DeveloperOperation::Patch(PatchArguments { patch: text.into() });
+    let refused = |result: Result<Value, ToolExecutionError>| match result {
+        Err(ToolExecutionError::Failed(message)) => message,
+        Err(_) => panic!("拒绝类型不符"),
+        Ok(_) => panic!("应当拒绝却成功"),
+    };
+
+    let result = backend
+        .execute(
+            patch(
+                "*** Begin Patch\n*** Add File: new/b.txt\n+hello\n*** Update File: a.txt\n@@\n one\n-two\n+2\n three\n*** Update File: old.txt\n*** Move to: moved.txt\n@@\n-x\n+y\n*** Delete File: gone.txt\n*** End Patch",
+            ),
+            context("owner"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["success"], true);
+    assert_eq!(result["files"].as_array().unwrap().len(), 5, "{result}");
+    let read = |p: &str| std::fs::read_to_string(root.path().join(p)).unwrap();
+    assert_eq!(read("new/b.txt"), "hello\n");
+    assert_eq!(read("a.txt"), "one\n2\nthree\n");
+    assert_eq!(read("moved.txt"), "y\n");
+    assert!(!root.path().join("old.txt").exists());
+    assert!(!root.path().join("gone.txt").exists());
+
+    // 后一段对不上时整个补丁不生效，前一段的改动也不留下。
+    let mismatch = refused(
+        backend
+            .execute(
+                patch("*** Begin Patch\n*** Update File: a.txt\n@@\n-one\n+1\n*** Update File: moved.txt\n@@\n-nothing here\n+z\n*** End Patch"),
+                context("owner"),
+            )
+            .await,
+    );
+    assert!(!mismatch.is_empty());
+    assert_eq!(read("a.txt"), "one\n2\nthree\n");
+    assert_eq!(read("moved.txt"), "y\n");
+
+    let exists = refused(
+        backend
+            .execute(
+                patch("*** Begin Patch\n*** Add File: a.txt\n+clobber\n*** End Patch"),
+                context("owner"),
+            )
+            .await,
+    );
+    assert!(!exists.is_empty());
+    assert_eq!(read("a.txt"), "one\n2\nthree\n");
+
+    for escape in ["../outside.txt", "/etc/passwd"] {
+        refused(
+            backend
+                .execute(
+                    patch(&format!(
+                        "*** Begin Patch\n*** Add File: {escape}\n+x\n*** End Patch"
+                    )),
+                    context("owner"),
+                )
+                .await,
+        );
+    }
+    assert!(!root.path().parent().unwrap().join("outside.txt").exists());
+    let no_parent = refused(
+        backend
+            .execute(
+                patch("*** Begin Patch\n*** Add File: missing/c.txt\n+x\n*** End Patch"),
+                context("owner"),
+            )
+            .await,
+    );
+    assert!(no_parent.contains("父目录"), "{no_parent}");
+    refused(
+        backend
+            .execute(patch("not a patch"), context("owner"))
+            .await,
     );
 }
 

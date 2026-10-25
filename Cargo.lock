@@ -301,6 +301,7 @@ dependencies = [
  "eve-action-plugin",
  "eve-action-review",
  "eve-agent-prompt",
+ "eve-apply-patch",
  "eve-artifact-file",
  "eve-budget-api",
  "eve-budget-plugin",
@@ -399,6 +400,10 @@ dependencies = [
  "tempfile",
  "tokio",
 ]
+
+[[package]]
+name = "eve-apply-patch"
+version = "0.1.0"
 
 [[package]]
 name = "eve-artifact-file"
@@ -639,6 +644,7 @@ dependencies = [
 name = "eve-developer-tools"
 version = "0.1.0"
 dependencies = [
+ "eve-apply-patch",
  "eve-developer-api",
  "eve-llm-api",
  "reqwest",
