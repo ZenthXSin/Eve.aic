@@ -243,6 +243,21 @@ class SegmentAcceptance(unittest.TestCase):
         self.assertEqual(self.receipt("no-periods")["reply"], text)
         self.assertEqual(self.interactions()[0]["source"]["assistant_text"], text)
 
+    def test_explicit_short_lines_are_separate_bubbles_and_restart_does_not_resend(self):
+        parts = ["陪你喔", "这话爱听"]
+        text = "\n\n".join(parts)
+        self.run_eve([{"send":self.message("tiny-lines",text=text,segments=parts)},
+                      self.wait_receipt("tiny-lines","Sent")],memory=True,sentence_split=True)
+        self.assertEqual([event["text"] for event in self.sent("segment")],parts)
+        self.assertFalse(self.sent("reply"))
+        receipt=self.receipt("tiny-lines")
+        self.assertEqual(receipt["reply"],text)
+        self.assertEqual(self.part_states("tiny-lines"),["Sent","Sent"])
+        self.assertEqual(self.interactions()[0]["source"]["assistant_text"],text)
+        self.run_eve([],memory=True,sentence_split=True)
+        self.assertFalse(self.sent("segment"))
+        self.assertEqual(self.receipt("tiny-lines"),receipt)
+
     def test_structured_reply_keeps_paragraph_planning_when_sentence_split_is_on(self):
         parts = ["步骤如下：\n1. 先安装。\n2. 再运行。", "有问题再来找我。"]
         text = "\n\n".join(parts)

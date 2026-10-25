@@ -45,6 +45,9 @@ pub struct DeveloperConfig {
     /// 独立监督器的可信请求目录；未配置时只准备候选，不注册实时切换工具。
     #[serde(default)]
     pub live_upgrade: Option<PathBuf>,
+    /// 追加的命令策略规则文件（JSON）；内置规则始终生效。
+    #[serde(default)]
+    pub command_policy: Option<PathBuf>,
     #[serde(default = "cargo")]
     pub cargo_program: String,
     #[serde(default)]
@@ -55,6 +58,54 @@ fn token_env() -> String {
 }
 fn ordinary_access() -> bool {
     false
+}
+
+/// 命令策略对一条命令的结论；多条规则命中时取最严格的一项。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandDecision {
+    Allow,
+    /// 需要主人或管理员在对话里明确同意后再执行。
+    Prompt,
+    Forbidden,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CommandRuleMatch {
+    /// 命中的命令前缀（脚本中的某一段命令时为该段的前缀）。
+    pub matched_prefix: Vec<String>,
+    pub decision: CommandDecision,
+    pub justification: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct CommandEvaluation {
+    /// 没有规则命中时为 None。
+    pub decision: Option<CommandDecision>,
+    pub matches: Vec<CommandRuleMatch>,
+}
+impl CommandEvaluation {
+    /// 命中规则里最严格结论的理由，供拒绝或确认提示使用。
+    pub fn reason(&self) -> String {
+        let decision = self.decision;
+        self.matches
+            .iter()
+            .filter(|m| Some(m.decision) == decision)
+            .map(|m| {
+                let prefix = m.matched_prefix.join(" ");
+                match &m.justification {
+                    Some(why) => format!("{prefix}（{why}）"),
+                    None => prefix,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("；")
+    }
+}
+
+/// 可替换的命令策略：只根据程序与参数判断，不执行任何东西。
+pub trait CommandPolicy: Send + Sync {
+    fn evaluate(&self, program: &str, args: &[String]) -> CommandEvaluation;
 }
 
 /// 宿主提供的平台身份授权；模型参数、昵称及自称不能实现此绑定。
@@ -186,6 +237,9 @@ pub struct CommandArguments {
     pub cwd: String,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// 命令策略要求确认的命令：主人或管理员已在对话里明确同意时才可置为 true。
+    #[serde(default)]
+    pub owner_confirmed: bool,
 }
 fn dot() -> String {
     ".".into()

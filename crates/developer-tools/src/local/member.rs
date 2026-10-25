@@ -84,6 +84,7 @@ impl LocalDeveloper {
             authorization: self.authorization.clone(),
             member_runtime: self.member_runtime.clone(),
             isolated: true,
+            command_policy: self.command_policy.clone(),
         })
     }
     pub(super) fn member_command(

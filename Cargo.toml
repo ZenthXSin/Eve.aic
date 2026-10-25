@@ -42,6 +42,7 @@ members = [
     "crates/commitment-api",
     "crates/provision-api",
     "crates/apply-patch",
+    "crates/command-policy",
     "crates/provision-plugin",
     "crates/commitment-plugin",
     "crates/reminder-api",
