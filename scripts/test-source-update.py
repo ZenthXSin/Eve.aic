@@ -12,6 +12,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import source_update as update
 
@@ -139,6 +140,15 @@ print('fixture check passed')
         self.ticks(lambda: self.updater.status.get('phase') == 'disabled')
         self.assertIsNone(self.updater.pending)
         self.assertEqual(self.fixture.events.read_text().splitlines(), ['old'])
+
+    def test_no_backup_space_keeps_old_process_online_before_any_switch_request(self):
+        self.supervisor_start()
+        self.ticks(lambda: self.updater.pending is not None)
+        with patch.object(update.shutil, 'disk_usage', return_value=SimpleNamespace(free=1)):
+            self.ticks(lambda: self.updater.status.get('error') == 'auto_update_insufficient_space_for_backup')
+        self.assertEqual(self.fixture.events.read_text().splitlines(), ['old'])
+        self.assertIsNone(self.supervisor.child.process.poll())
+        self.assertFalse((self.fixture.queue / 'auto-request.json').exists())
 
     def test_failed_candidate_returns_to_old_binary_and_preserves_candidate_state(self):
         (self.remote / 'AGENT.md').write_text('fail')
