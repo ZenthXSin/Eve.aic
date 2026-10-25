@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 
+from build_resources import BuildPlanner
 import self_upgrade_runtime as runtime
 
 EMPTY = hashlib.sha256(b'').hexdigest()
@@ -26,7 +27,7 @@ def configuration(path):
     if not isinstance(value, dict) or set(value) - allowed or value.get('version') != 1:
         raise ValueError('invalid_auto_update_configuration')
     result = dict(enabled=True, repository='ZenthXSin/Eve.aic', branch='main', interval_seconds=3600,
-                  cargo_program='cargo', cargo_arguments=[], jobs=2, timeout_seconds=600,
+                  cargo_program='cargo', cargo_arguments=[], jobs='auto', timeout_seconds=600,
                   minimum_free_bytes=1024**3)
     result.update({k: v for k, v in value.items() if k != 'version'})
     if (type(result['enabled']) is not bool
@@ -34,7 +35,7 @@ def configuration(path):
             or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_./-]*', result['branch'])
             or '..' in result['branch'] or result['branch'].endswith(('/', '.'))
             or type(result['interval_seconds']) is not int or not 60 <= result['interval_seconds'] <= 604800
-            or type(result['jobs']) is not int or not 1 <= result['jobs'] <= 16
+            or not (result['jobs'] == 'auto' or type(result['jobs']) is int and 1 <= result['jobs'] <= 256)
             or type(result['timeout_seconds']) is not int or not 30 <= result['timeout_seconds'] <= 3600
             or type(result['minimum_free_bytes']) is not int or result['minimum_free_bytes'] < 256 * 1024**2
             or not isinstance(result['cargo_program'], str) or not result['cargo_program']
@@ -56,28 +57,39 @@ def build_environment(settings):
              'SSL_CERT_DIR', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE', 'NODE_EXTRA_CA_CERTS'}
     env = {k: v for k, v in os.environ.items() if k in names}
     env.update(CARGO_INCREMENTAL='0', CARGO_PROFILE_RELEASE_DEBUG='0',
-               CARGO_BUILD_JOBS=str(settings['jobs']), GIT_TERMINAL_PROMPT='0')
+               CARGO_BUILD_JOBS=str(1 if settings['jobs'] == 'auto' else settings['jobs']), GIT_TERMINAL_PROMPT='0')
     return env
 
 
 class GitBuilder:
     """可替换的源码取得与候选准备实现；测试只在代码注入本地 Git 源，不开放配置 URL。"""
-    def __init__(self, settings, candidates, stopped, publish, remote=None):
+    def __init__(self, settings, candidates, stopped, publish, remote=None, planner=None):
         self.settings, self.candidates = settings, Path(candidates).resolve()
         self.root = Path(settings['data_directory'])
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.stopped, self.publish = stopped, publish
         self.remote = remote or 'https://github.com/' + settings['repository'] + '.git'
         self.env = build_environment(settings)
+        self.planner = planner or BuildPlanner()
 
-    def command(self, args, cwd, logfile, seconds=None):
+    def command(self, args, cwd, logfile, seconds=None, plan=None, stdout_file=None):
         self.root.mkdir(parents=True, exist_ok=True)
         if self.stopped.is_set():
             raise ValueError('auto_update_cancelled')
-        with logfile.open('wb') as output:
-            child = subprocess.Popen(args, cwd=cwd, env=self.env, stdin=subprocess.DEVNULL,
-                                     stdout=output, stderr=subprocess.STDOUT,
-                                     start_new_session=(os.name != 'nt'))
+        with contextlib.ExitStack() as stack:
+            output = stack.enter_context(logfile.open('wb'))
+            stdout = stack.enter_context(stdout_file.open('wb')) if stdout_file else output
+            if plan:
+                output.write(('BUILD_RESOURCES ' + json.dumps(plan, sort_keys=True) + '\n').encode()); output.flush()
+            env = dict(self.env)
+            if plan: env.update(CARGO_BUILD_JOBS=str(plan['jobs']), RUST_TEST_THREADS=str(plan['jobs']))
+            flags = subprocess.BELOW_NORMAL_PRIORITY_CLASS if os.name == 'nt' and plan else 0
+            child = subprocess.Popen(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                     stdout=stdout, stderr=output if stdout_file else subprocess.STDOUT,
+                                     creationflags=flags, start_new_session=(os.name != 'nt'))
+            if plan and hasattr(os, 'setpriority'):
+                with contextlib.suppress(OSError): os.setpriority(os.PRIO_PROCESS, child.pid, 10)
+            next_probe = time.monotonic() + 1
             deadline = time.monotonic() + (seconds or self.settings['timeout_seconds'])
             try:
                 while child.poll() is None:
@@ -87,12 +99,18 @@ class GitBuilder:
                         raise ValueError('auto_update_command_timeout')
                     if shutil.disk_usage(self.root).free < 128 * 1024**2:
                         raise ValueError('auto_update_disk_pressure')
+                    if plan and time.monotonic() >= next_probe:
+                        next_probe = time.monotonic() + 1
+                        if self.planner.critical(): raise ValueError('auto_update_resources_busy')
                 if child.returncode:
                     raise ValueError('auto_update_check_failed')
             finally:
                 if child.poll() is None:
                     if os.name == 'nt':
-                        child.terminate()
+                        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                            subprocess.run(['taskkill', '/PID', str(child.pid), '/T', '/F'],
+                                           env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                        if child.poll() is None: child.terminate()
                     else:
                         with contextlib.suppress(ProcessLookupError): os.killpg(child.pid, signal.SIGTERM)
                     try:
@@ -136,16 +154,42 @@ class GitBuilder:
         self.publish(phase='verifying', target_head=head)
         target = self.root / 'target'
         cargo = [self.settings['cargo_program'], *self.settings['cargo_arguments']]
-        checks = []
-        commands = [
-            ['fmt', '--all', '--', '--check'],
-            ['clippy', '--release', '--workspace', '--all-targets', '--locked', '--target-dir', str(target), '--', '-D', 'warnings'],
-            ['test', '--release', '--workspace', '--locked', '--target-dir', str(target)],
-            ['build', '-p', 'eve-app', '--bins', '--release', '--locked', '--target-dir', str(target)],
+        metadata = logs / (head + '-metadata.json')
+        self.command(cargo + ['metadata', '--format-version', '1', '--no-deps', '--locked'],
+                     source, logs / (head + '-metadata.log'), stdout_file=metadata)
+        try:
+            packages = runtime.read_json(metadata, 16 * 1024**2)['packages']
+            app = [p for p in packages if p['name'] == 'eve-app']
+            binaries = sorted(t['name'] for p in app for t in p['targets'] if t['kind'] == ['bin'])
+            if (len(app) != 1 or not 1 <= len(binaries) <= 32 or len(set(binaries)) != len(binaries)
+                    or 'eve-qqbot' not in binaries or any(not re.fullmatch('[A-Za-z0-9_-]+', b) for b in binaries)):
+                raise ValueError()
+        except (KeyError, TypeError, ValueError):
+            raise ValueError('auto_update_invalid_build_metadata') from None
+        common = ['--release', '--locked', '--target-dir', str(target)]
+        stages = [
+            (1, 'format', ['fmt', '--all', '--', '--check']),
+            (2, 'libraries', ['build', '--workspace', '--lib', *common]),
+            (2, 'clippy', ['clippy', '--workspace', '--all-targets', *common, '--', '-D', 'warnings']),
+            (3, 'test_compile', ['test', '--workspace', '--no-run', *common]),
+            (3, 'tests', ['test', '--workspace', *common]),
+            *[(4, 'binary', ['build', '-p', 'eve-app', '--bin', binary, *common]) for binary in binaries],
         ]
-        for index, arguments in enumerate(commands):
-            self.publish(phase='verifying', target_head=head, check=index + 1)
-            checks.append(self.command(cargo + arguments, source, logs / (head + '-' + str(index + 1) + '.log')))
+        groups = [[], [], [], []]
+        for index, (check, stage, arguments) in enumerate(stages):
+            plan = self.planner.choose(stage, self.settings['jobs'])
+            self.publish(phase='verifying', target_head=head, check=check, stage=stage,
+                         stage_index=index + 1, stage_count=len(stages), effective_jobs=plan['jobs'],
+                         resources=plan, binary=arguments[arguments.index('--bin') + 1] if '--bin' in arguments else None)
+            if not plan['jobs']: raise ValueError('auto_update_resources_busy')
+            groups[check - 1].append(self.command(cargo + arguments, source,
+                logs / (head + '-' + str(check) + '-' + str(index + 1) + '-' + stage + '.log'), plan=plan))
+        checks = []
+        for group in groups:
+            output = '\n'.join(r['stdout'] for r in group)
+            checks.append(dict(success=True, exit_code=0, stdout=output[-16384:], stderr='',
+                stdout_truncated=len(output) > 16384 or any(r['stdout_truncated'] for r in group), stderr_truncated=False,
+                steps=[dict(success=r['success'], exit_code=r['exit_code']) for r in group]))
         if self.git(['rev-parse', 'HEAD'], source, git_log) != head or self.git(['status', '--porcelain', '--untracked-files=all'], source, git_log):
             raise ValueError('auto_update_source_changed_during_validation')
         return self.freeze(source, head, target / 'release' / ('eve-qqbot.exe' if os.name == 'nt' else 'eve-qqbot'), checks, git_log)
@@ -271,6 +315,7 @@ class SourceUpdater:
                 if 'request' in result:
                     self.pending = dict(result, base_head=base_head, configuration=signature); self.quiet = None
                     self.publish(phase='waiting', prepared_head=result['head']); return
+                if result.get('result') == 'deferred': self.next_check = min(self.next_check, time.monotonic() + 60)
                 self.publish(phase='idle', **result, **({} if 'result' in result else {'result': 'up_to_date' if result.get('up_to_date') else 'previous_failure'})); return
             force = self.control / 'check-updates.json'
             forced = force.exists()
@@ -282,7 +327,7 @@ class SourceUpdater:
                 force.unlink()
             base = self.active(supervisor)
             self.next_check = time.monotonic() + self.settings['interval_seconds']
-            self.publish(phase='checking', enabled=True, current_head=base, error=None, check=0)
+            self.publish(phase='checking', enabled=True, current_head=base, error=None, check=0, stage=None, stage_index=0, stage_count=None, effective_jobs=None, resources=None, binary=None)
             settings = dict(self.settings)
             if self.stopped.is_set(): self.stopped = threading.Event()
             def work():
@@ -291,7 +336,7 @@ class SourceUpdater:
                     result = builder.prepare(base, forced, self.status.get('failed_head'))
                 except Exception as error:
                     code = str(error) if type(error) is ValueError and str(error).replace('_', '').isalnum() else type(error).__name__
-                    result = {'result': 'failed', 'error': code[:100], 'failed_head': self.status.get('target_head')}
+                    result = {'result': 'deferred' if code == 'auto_update_resources_busy' else 'failed', 'error': code[:100], 'failed_head': None if code == 'auto_update_resources_busy' else self.status.get('target_head')}
                 self.results.put((result, base, signature))
             self.thread = threading.Thread(target=work, daemon=True); self.thread.start()
         except Exception as error:
