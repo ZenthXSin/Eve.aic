@@ -179,3 +179,84 @@ fn missing_or_non_jar_runtime_is_refused_before_any_run() {
         assert!(MindustryServerRunner::new(RuntimeCommand::default(), path).is_err());
     }
 }
+
+fn fake_validator() -> (eve_practice_mindustry::ModValidator, tempfile::TempDir) {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../connectors/qqbot/test/fake_mod_validator.py")
+        .canonicalize()
+        .unwrap();
+    let jar = tempfile::tempdir().unwrap();
+    let path = jar.path().join("mod-validator.jar");
+    std::fs::write(&path, b"PK\x03\x04fake validator").unwrap();
+    let validator = eve_practice_mindustry::ModValidator::new(
+        RuntimeCommand {
+            program: python().into(),
+            prefix_args: vec![script.into()],
+        },
+        path,
+    )
+    .unwrap();
+    (validator, jar)
+}
+
+#[tokio::test]
+async fn validator_stage_turns_runtime_crashes_into_warnings_after_a_successful_load() {
+    let record_dir = tempfile::tempdir().unwrap();
+    let (runner, _jar) = runner(&record_dir.path().join("launches.jsonl"));
+    let (validator, _validator_jar) = fake_validator();
+    let validator_sha = validator.sha256().to_string();
+    let runner = runner.with_validator(validator);
+    assert!(
+        runner
+            .profile()
+            .runtime
+            .ends_with(&format!("mod validator sha256:{validator_sha}")),
+        "运行环境标识包含验证器摘要"
+    );
+    let probes = [("exists", "true"), ("class", "Wall")];
+    let good = draft(
+        "type: Wall\nhealth: 520\nrequirements: [ copper/6 ]\ncategory: defense\n",
+        &probes,
+    );
+    let workspace = tempfile::tempdir().unwrap();
+    let evidence = runner.run(&good, workspace.path()).await;
+    evidence.validate(&good).unwrap();
+    assert!(evidence.verified(&good), "{}", evidence.log_excerpt);
+    assert!(evidence.log_excerpt.contains("mod validator errors=0"));
+
+    let crashing = draft(
+        "# crashOnUpdate\ntype: Wall\nhealth: 520\nrequirements: [ copper/6 ]\ncategory: defense\n",
+        &probes,
+    );
+    let workspace = tempfile::tempdir().unwrap();
+    let evidence = runner.run(&crashing, workspace.path()).await;
+    evidence.validate(&crashing).unwrap();
+    assert!(evidence.loaded && evidence.probes.iter().all(|p| p.passed));
+    assert_eq!(
+        evidence.warnings,
+        ["验证器 block-test：方块 'sample-wall' 更新时崩溃: NullPointerException"]
+    );
+    assert!(
+        !evidence.verified(&crashing),
+        "服务端加载通过但运行时崩溃，不算已验证"
+    );
+}
+
+#[tokio::test]
+async fn validator_without_a_report_is_an_error_not_a_pass() {
+    let (validator, _jar) = fake_validator();
+    let module = tempfile::tempdir().unwrap();
+    std::fs::write(module.path().join("FATAL"), b"").unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let error = validator
+        .check(module.path(), scratch.path())
+        .await
+        .unwrap_err();
+    assert!(error.contains("未给出报告"), "{error}");
+    let not_jar = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(not_jar.path(), b"#!/bin/sh").unwrap();
+    assert!(
+        eve_practice_mindustry::ModValidator::new(RuntimeCommand::default(), not_jar.path().into())
+            .is_err()
+    );
+}

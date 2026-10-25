@@ -2,6 +2,9 @@
 //! 查询加载状态与内容属性，采集版本、警告和日志。只接受纯数据文件；
 //! 探测查询由运行器按受限标识构造，不执行草稿或模型提供的代码。
 mod layout;
+mod validator;
+
+pub use validator::ModValidator;
 
 use eve_practice_api::{
     BoxFuture, MAX_ISSUE_BYTES, MAX_ISSUES, MAX_LOG_EXCERPT_BYTES, PracticeDraft, PracticeRunner,
@@ -76,6 +79,7 @@ pub struct MindustryServerRunner {
     profile: RunnerProfile,
     command: RuntimeCommand,
     server_jar: PathBuf,
+    validator: Option<ModValidator>,
 }
 
 impl MindustryServerRunner {
@@ -116,6 +120,7 @@ impl MindustryServerRunner {
             profile,
             command,
             server_jar,
+            validator: None,
         })
     }
 
@@ -156,6 +161,18 @@ impl MindustryServerRunner {
                 prefix(&evidence.log_excerpt, 400)
             ))
         }
+    }
+
+    /// 服务端确认加载后，再用模组验证器做放置、生成与更新帧测试；它报告的错误计入警告。
+    /// 运行环境标识随之包含验证器的摘要，加与不加验证器的结果不会混为同一运行环境。
+    pub fn with_validator(mut self, validator: ModValidator) -> Self {
+        self.profile.runtime = format!(
+            "{}; mod validator sha256:{}",
+            self.profile.runtime,
+            validator.sha256()
+        );
+        self.validator = Some(validator);
+        self
     }
 
     async fn execute(&self, draft: &PracticeDraft, workspace: &Path) -> RunEvidence {
@@ -277,7 +294,40 @@ impl MindustryServerRunner {
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
-        capture.evidence(exit, draft, &layout, &workspace_text, started)
+        let mut evidence = capture.evidence(exit, draft, &layout, &workspace_text, started);
+        if let Some(validator) = &self.validator
+            && evidence.exit == RunExit::Completed
+            && evidence.loaded
+        {
+            let scratch = workspace.join("eve-mod-validator");
+            let found = match std::fs::create_dir_all(&scratch) {
+                Ok(()) => validator
+                    .check(&root, &scratch)
+                    .await
+                    .unwrap_or_else(|reason| vec![reason]),
+                Err(_) => vec!["无法创建模组验证器目录".into()],
+            };
+            let line = format!("mod validator errors={}", found.len());
+            if evidence.log_excerpt.len() + line.len() < MAX_LOG_EXCERPT_BYTES {
+                evidence.log_excerpt.push_str(&line);
+                evidence.log_excerpt.push('\n');
+            }
+            for issue in found {
+                if evidence.warnings.len() >= MAX_ISSUES {
+                    break;
+                }
+                let cleaned: String = issue
+                    .replace(&workspace_text, "<workspace>")
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect();
+                let issue = prefix(cleaned.trim(), MAX_ISSUE_BYTES).trim().to_string();
+                if !issue.is_empty() {
+                    evidence.warnings.push(issue);
+                }
+            }
+        }
+        evidence
     }
 }
 

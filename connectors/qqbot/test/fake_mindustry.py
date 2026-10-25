@@ -32,6 +32,11 @@ def parse(text):
 
 def main():
     args = sys.argv[1:]
+    # 验证器与服务端共用宿主的 Java 启动命令；按 jar 文件名把调用交给验证器替身。
+    if "-jar" in args and pathlib.Path(args[args.index("-jar") + 1]).name == "mod-validator.jar":
+        import fake_mod_validator
+        fake_mod_validator.main()
+        return
     record = hold = None
     while args and args[0] in ("--record", "--hold"):
         flag, value, args = args[0], args[1], args[2:]
