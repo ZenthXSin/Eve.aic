@@ -1,7 +1,7 @@
 //! QQ 全量群观察的组合：复用插话引擎、说法学习和已有主动投递。
 use crate::{AppError, chime};
 use eve_chime_api::*;
-use eve_chime_plugin::{ChimeEngine, GroupRelationPipeline, ModelChimeJudge};
+use eve_chime_plugin::{ChimeEngine, ChimeSettingsSource, GroupRelationPipeline, ModelChimeJudge};
 use eve_llm_api::{
     ContextAssembler, ContextScope, ContextSnapshot, LlmError, LlmFuture, TurnInput,
 };
@@ -197,7 +197,8 @@ impl QqGroupObserver for Group {
             eprintln!("EVE_GROUP expression_learning_unavailable");
         }
         // 后台排队或容量耗尽之前先保存待判断状态。
-        if !name_wakeup(&message.text)
+        if self.policy.settings().is_some_and(|s| s.enabled)
+            && !name_wakeup(&message.text)
             && let Some(relations) = self.relations.get()
         {
             relations.store.stage(&event).map_err(failed)?;
@@ -304,7 +305,6 @@ impl QqOutreach for Group {
         Ok(None)
     }
     fn next_push(&self) -> PluginResult<Option<QqOutreachPush>> {
-        use eve_chime_plugin::ChimeSettingsSource;
         if !self.policy.settings().is_some_and(|s| s.enabled) {
             return Ok(None);
         }
@@ -465,7 +465,7 @@ impl Background {
                     },
                     _=reviews.join_next(), if !reviews.is_empty()=>{continue;},
                     _=proactive.tick(), if relations.is_some()=>{
-                        if jobs.len()<8 {
+                        if jobs.len()<8 && group.policy.settings().is_some_and(|s| s.enabled) {
                             match relations.as_ref().expect("关系系统已开启").store.claim_active() {
                                 Ok(Some(message))=>{
                                     let outlet=Outlet{group:group.clone(),speaker:message.speaker.clone()};
@@ -478,7 +478,7 @@ impl Background {
                         continue;
                     },
                     _=learning.tick(), if relations.is_some()=>{
-                        if reviews.is_empty() && group.policy.relation_learning_enabled() {
+                        if reviews.is_empty() && group.policy.settings().is_some_and(|s| s.enabled) && group.policy.relation_learning_enabled() {
                             let relations=relations.clone().expect("关系系统已开启");
                             reviews.spawn(async move {match relations.review_pending().await {Ok(n)=>{if n>0 {eprintln!("EVE_GROUP relation_experiences_learned={n}");}},Err(_)=>eprintln!("EVE_GROUP relation_review_unavailable")}});
                         }
@@ -493,6 +493,10 @@ impl Background {
                 };
                 // 名字前缀已由桥接送入普通对话；这里仅保留群观察，不能再判断或补答。
                 if event.ordinary && name_wakeup(&event.message.text) {
+                    let _ = engine.observe_only(event.message, &outlet).await;
+                    continue;
+                }
+                if !group.policy.settings().is_some_and(|s| s.enabled) {
                     let _ = engine.observe_only(event.message, &outlet).await;
                     continue;
                 }

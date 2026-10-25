@@ -849,3 +849,19 @@ test("主动群插话复用发送接口，分条并只在首段艾特来源发�
   assert.equal(f.frames.at(-1).ok,false);
   assert.equal(f.sent.length,2);
 });
+
+test("仅前缀模式保留群观察，普通艾特不唤醒，大小写前缀与私聊照常", () => {
+  const f=fixture({group:{observe:true,mention:true,prefixOnly:true}});
+  const send=(id,text,type="GROUP_MESSAGE_CREATE")=>f.handlers.get("message")({}, {
+    kind:"group",messageId:id,senderId:"member-1",content:text,rawEventType:type,
+    groupOpenid:"group-1",replyTarget:{scope:"group",targetId:"group-1",msgId:id}});
+  send("ambient","大家好");
+  send("at-only","<@1904159860> 帮我看看","GROUP_AT_MESSAGE_CREATE");
+  send("middle","你觉得 eve 怎么样");
+  send("prefix","  eVe 在不在");
+  send("at-prefix","<@1904159860> EVE帮忙","GROUP_AT_MESSAGE_CREATE");
+  f.message("c2c","private");
+  assert.equal(f.frames.filter(x=>x.type==="group_observation").length,5);
+  assert.deepEqual(f.frames.filter(x=>x.type==="message").map(x=>x.id),["prefix","at-prefix","private"]);
+  assert.equal(f.sent.length,0);
+});

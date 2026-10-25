@@ -275,6 +275,8 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       else { warn("frame_limit"); return; }
       if (!isGroupAt(msg,bot.appId) && !isGroupNameWake(msg)) return;
     }
+    // 仅前缀模式仍记录群原话；艾特、引用和附件本身都不能绕过前缀唤醒。
+    if (msg.kind === "group" && group.prefixOnly && !/^eve/i.test(text.trimStart())) return;
     pending.set(msg.messageId, { target: { ...target }, senderId:msg.senderId, sending: false, receivedAt: now() });
     send(frame);
   });

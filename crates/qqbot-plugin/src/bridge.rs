@@ -893,7 +893,14 @@ pub(crate) async fn run(
         },
     );
 
-    for name in ["PATH", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP"] {
+    for name in [
+        "PATH",
+        "SystemRoot",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "QQBOT_GROUP_PREFIX_ONLY",
+    ] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
