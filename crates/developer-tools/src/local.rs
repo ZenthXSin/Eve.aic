@@ -94,6 +94,66 @@ pub struct LocalDeveloper {
     member_runtime: Option<MemberRuntime>,
     isolated: bool,
     command_policy: Option<std::sync::Arc<dyn eve_developer_api::CommandPolicy>>,
+    action_reviewer: Option<std::sync::Arc<dyn ActionReviewer>>,
+}
+/// 交给审查者的用户原话与行动轨迹条数及单条字符上限。
+const REVIEW_USER_MESSAGES: usize = 6;
+const REVIEW_RECENT_ACTIONS: usize = 8;
+const REVIEW_MESSAGE_CHARS: usize = 2000;
+const REVIEW_ACTION_CHARS: usize = 300;
+fn clip(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
+    }
+}
+/// 从本轮上下文取审查依据。宿主标记的委托执行没有人在场，用户角色的消息是派发时
+/// 由模型写的任务说明，不作为用户原话交给审查者。
+fn review_request(
+    a: &CommandArguments,
+    reason: String,
+    context: &ToolExecutionContext,
+) -> ActionReviewRequest {
+    let delegated = context.is_delegated();
+    let messages = context.conversation().unwrap_or_default();
+    let user_messages = if delegated {
+        vec![]
+    } else {
+        let mut texts: Vec<String> = messages
+            .iter()
+            .rev()
+            .filter(|m| m.role == eve_llm_api::ChatRole::User)
+            .filter_map(|m| m.text.as_deref())
+            .filter(|t| !t.trim().is_empty())
+            .take(REVIEW_USER_MESSAGES)
+            .map(|t| clip(t, REVIEW_MESSAGE_CHARS))
+            .collect();
+        texts.reverse();
+        texts
+    };
+    let mut recent_actions: Vec<String> = messages
+        .iter()
+        .rev()
+        .flat_map(|m| m.tool_calls.iter().rev())
+        .take(REVIEW_RECENT_ACTIONS)
+        .map(|c| clip(&format!("{} {}", c.name, c.arguments), REVIEW_ACTION_CHARS))
+        .collect();
+    recent_actions.reverse();
+    let mut action = vec![a.program.clone()];
+    action.extend(a.args.iter().cloned());
+    ActionReviewRequest {
+        action: clip(
+            &shlex::try_join(action.iter().map(String::as_str))
+                .unwrap_or_else(|_| action.join(" ")),
+            REVIEW_MESSAGE_CHARS,
+        ),
+        cwd: a.cwd.clone(),
+        policy_reason: reason,
+        claimed_confirmation: a.owner_confirmed,
+        delegated,
+        user_messages,
+        recent_actions,
+    }
 }
 impl LocalDeveloper {
     pub fn new(
@@ -156,6 +216,7 @@ impl LocalDeveloper {
             member_runtime: None,
             isolated: false,
             command_policy: None,
+            action_reviewer: None,
         })
     }
     pub fn with_authorization(
@@ -171,6 +232,11 @@ impl LocalDeveloper {
         policy: std::sync::Arc<dyn eve_developer_api::CommandPolicy>,
     ) -> Self {
         self.command_policy = Some(policy);
+        self
+    }
+    /// 策略要求确认的命令交给审查者按用户原话判断；不配置时由模型带 owner_confirmed。
+    pub fn with_action_reviewer(mut self, reviewer: std::sync::Arc<dyn ActionReviewer>) -> Self {
+        self.action_reviewer = Some(reviewer);
         self
     }
     pub fn with_member_runtime(mut self, runtime: MemberRuntime) -> Self {
@@ -715,11 +781,36 @@ impl LocalDeveloper {
                                 evaluation.reason()
                             )));
                         }
-                        Some(eve_developer_api::CommandDecision::Prompt) if !a.owner_confirmed => {
-                            return Err(failed(format!(
-                                "这条命令需要主人或管理员明确同意：{}。先在对话里说明要执行什么、影响哪些文件或分支，得到明确同意后再带 owner_confirmed: true 调用；不要自行认定已同意",
-                                evaluation.reason()
-                            )));
+                        Some(eve_developer_api::CommandDecision::Prompt) => {
+                            match &self.action_reviewer {
+                                Some(reviewer) => {
+                                    let request = review_request(&a, evaluation.reason(), context);
+                                    let delegated = request.delegated;
+                                    let verdict = reviewer.review(request).await.map_err(|e| {
+                                        failed(format!("行动审查没有完成（{e}），命令未执行"))
+                                    })?;
+                                    if !verdict.permits() {
+                                        return Err(failed(format!(
+                                            "行动审查未放行，命令未执行：风险 {:?}，用户授权 {:?}。{}{}",
+                                            verdict.risk,
+                                            verdict.authorization,
+                                            verdict.rationale,
+                                            if delegated {
+                                                "。后台执行没有人在场，需要时在结果里说明，请用户在对话里明确要求后再做"
+                                            } else {
+                                                "。先在对话里说明要执行什么、影响哪些文件或分支，得到用户明确同意后再试"
+                                            }
+                                        )));
+                                    }
+                                }
+                                None if !a.owner_confirmed => {
+                                    return Err(failed(format!(
+                                        "这条命令需要主人或管理员明确同意：{}。先在对话里说明要执行什么、影响哪些文件或分支，得到明确同意后再带 owner_confirmed: true 调用；不要自行认定已同意",
+                                        evaluation.reason()
+                                    )));
+                                }
+                                None => {}
+                            }
                         }
                         _ => {}
                     }

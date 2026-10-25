@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/action-review",
     "crates/group-observation-sqlite",
     "crates/subagent-profile-sqlite",
     "crates/relation-experience-sqlite",

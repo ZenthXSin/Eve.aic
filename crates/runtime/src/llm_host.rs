@@ -446,6 +446,7 @@ pub struct LlmHost {
     execution_budget: Option<Arc<eve_llm_api::TurnBudget>>,
     tool_scope_policy: Option<Arc<dyn eve_llm_api::ToolScopePolicy>>,
     shared_steps: Option<eve_llm_api::SharedToolSteps>,
+    delegated: bool,
     run_deadline: Option<std::time::Instant>,
     journal: Option<Arc<dyn eve_llm_api::TurnJournal>>,
     image_source: Option<Arc<dyn eve_llm_api::TurnImageSource>>,
@@ -507,6 +508,7 @@ impl LlmHost {
             execution_budget: None,
             tool_scope_policy: None,
             shared_steps: None,
+            delegated: false,
             run_deadline: None,
             journal: None,
             image_source: None,
@@ -567,6 +569,11 @@ impl LlmHost {
 
     pub fn with_shared_steps(mut self, steps: eve_llm_api::SharedToolSteps) -> Self {
         self.shared_steps = Some(steps);
+        self
+    }
+    /// 标记委托执行（后台任务、子代理）；工具从执行上下文得知没有人在场。
+    pub fn delegated(mut self) -> Self {
+        self.delegated = true;
         self
     }
     pub fn with_run_deadline(mut self, deadline: std::time::Instant) -> Self {
@@ -1619,7 +1626,8 @@ impl LlmHost {
                 .with_continuation(caller.1.clone())
                 .with_conversation(caller.2.clone())
                 .with_turn_id(events.and_then(|event| event.turn_id))
-                .with_deadline(self.run_deadline);
+                .with_deadline(self.run_deadline)
+                .with_delegated(self.delegated);
             let context = match &self.shared_steps {
                 Some(steps) => context.with_shared_steps(steps.clone()),
                 None => context,

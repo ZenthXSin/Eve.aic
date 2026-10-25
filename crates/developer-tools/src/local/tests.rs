@@ -25,6 +25,7 @@ fn config(root: &Path) -> DeveloperConfig {
         command_policy: None,
         cargo_program: "cargo".into(),
         cargo_arguments: vec![],
+        action_review: true,
     }
 }
 fn context(user: &str) -> ToolExecutionContext {
@@ -1200,40 +1201,43 @@ async fn patch_adds_updates_moves_and_deletes_atomically_inside_the_workspace() 
     );
 }
 
+/// 测试用策略：脚本含 forbidden 为禁止，含 careful 为需确认。
+#[cfg(unix)]
+struct ScriptPolicy;
+#[cfg(unix)]
+impl eve_developer_api::CommandPolicy for ScriptPolicy {
+    fn evaluate(&self, program: &str, args: &[String]) -> eve_developer_api::CommandEvaluation {
+        use eve_developer_api::{CommandDecision, CommandEvaluation, CommandRuleMatch};
+        let script = args.get(1).cloned().unwrap_or_default();
+        let decision = if script.contains("forbidden") {
+            Some(CommandDecision::Forbidden)
+        } else if script.contains("careful") {
+            Some(CommandDecision::Prompt)
+        } else {
+            None
+        };
+        CommandEvaluation {
+            decision,
+            matches: decision
+                .map(|decision| CommandRuleMatch {
+                    matched_prefix: vec![program.into()],
+                    decision,
+                    justification: Some("测试规则".into()),
+                })
+                .into_iter()
+                .collect(),
+        }
+    }
+}
 /// 命令策略：禁止的不执行，需确认的没有明确同意时不执行，同意后照常执行。
 #[cfg(unix)]
 #[tokio::test]
 async fn command_policy_blocks_or_requires_confirmation_before_anything_runs() {
-    struct Policy;
-    impl eve_developer_api::CommandPolicy for Policy {
-        fn evaluate(&self, program: &str, args: &[String]) -> eve_developer_api::CommandEvaluation {
-            use eve_developer_api::{CommandDecision, CommandEvaluation, CommandRuleMatch};
-            let script = args.get(1).cloned().unwrap_or_default();
-            let decision = if script.contains("forbidden") {
-                Some(CommandDecision::Forbidden)
-            } else if script.contains("careful") {
-                Some(CommandDecision::Prompt)
-            } else {
-                None
-            };
-            CommandEvaluation {
-                decision,
-                matches: decision
-                    .map(|decision| CommandRuleMatch {
-                        matched_prefix: vec![program.into()],
-                        decision,
-                        justification: Some("测试规则".into()),
-                    })
-                    .into_iter()
-                    .collect(),
-            }
-        }
-    }
     let root = tempfile::tempdir().unwrap();
     let ledger = tempfile::tempdir().unwrap();
     let backend = LocalDeveloper::new(config(root.path()), ledger.path().into(), None)
         .unwrap()
-        .with_command_policy(Arc::new(Policy));
+        .with_command_policy(Arc::new(ScriptPolicy));
     let command = |marker: &str, confirmed| {
         DeveloperOperation::Command(CommandArguments {
             owner_confirmed: confirmed,
@@ -1268,4 +1272,131 @@ async fn command_policy_blocks_or_requires_confirmation_before_anything_runs() {
         .await
         .unwrap();
     assert!(root.path().join("plain").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn action_reviewer_decides_prompt_commands_from_user_words_and_fails_closed() {
+    use eve_llm_api::{ChatMessage, ChatRole};
+    use std::sync::Mutex;
+    struct Reviewer {
+        verdict: Result<ActionReviewVerdict, String>,
+        seen: Mutex<Vec<ActionReviewRequest>>,
+    }
+    impl ActionReviewer for Reviewer {
+        fn review(&self, request: ActionReviewRequest) -> ActionReviewFuture<'_> {
+            self.seen.lock().unwrap().push(request);
+            let verdict = self.verdict.clone();
+            Box::pin(async move { verdict })
+        }
+    }
+    let verdict = |risk, authorization, allow| {
+        Ok(ActionReviewVerdict {
+            risk,
+            authorization,
+            allow,
+            rationale: "测试理由".into(),
+        })
+    };
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let with = |reviewer: Arc<Reviewer>| {
+        LocalDeveloper::new(config(root.path()), ledger.path().into(), None)
+            .unwrap()
+            .with_command_policy(Arc::new(ScriptPolicy))
+            .with_action_reviewer(reviewer)
+    };
+    let command = |marker: &str| {
+        DeveloperOperation::Command(CommandArguments {
+            owner_confirmed: false,
+            program: "sh".into(),
+            args: vec!["-c".into(), format!("touch {marker}")],
+            cwd: ".".into(),
+            timeout_ms: None,
+        })
+    };
+    let conversation = Arc::new(vec![
+        ChatMessage::text(ChatRole::System, "系统提示不交给审查者"),
+        ChatMessage::text(ChatRole::User, "把 careful 文件建出来"),
+        ChatMessage::text(ChatRole::Assistant, "好"),
+    ]);
+    let talking = || context("owner").with_conversation(conversation.clone());
+
+    // 审查放行：不需要模型自带 owner_confirmed。
+    let allow = Arc::new(Reviewer {
+        verdict: verdict(ReviewRisk::Medium, ReviewAuthorization::High, true),
+        seen: Mutex::new(vec![]),
+    });
+    let out = with(allow.clone())
+        .execute(command("careful-allowed"), talking())
+        .await
+        .unwrap();
+    assert_eq!(out["success"], true);
+    assert!(root.path().join("careful-allowed").exists());
+    let seen = allow.seen.lock().unwrap().pop().unwrap();
+    assert_eq!(
+        seen.user_messages,
+        ["把 careful 文件建出来"],
+        "只交用户原话"
+    );
+    assert!(!seen.delegated && !seen.claimed_confirmation);
+    assert!(
+        seen.action.contains("touch careful-allowed"),
+        "{}",
+        seen.action
+    );
+    assert_eq!(seen.policy_reason, "sh（测试规则）");
+
+    // 审查者同意但等级不够、审查者拒绝、审查失败：都不执行。
+    for (name, reviewer_verdict) in [
+        (
+            "careful-high-risk",
+            verdict(ReviewRisk::High, ReviewAuthorization::Medium, true),
+        ),
+        (
+            "careful-denied",
+            verdict(ReviewRisk::Low, ReviewAuthorization::High, false),
+        ),
+        ("careful-failed", Err("审查超时".into())),
+    ] {
+        let reviewer = Arc::new(Reviewer {
+            verdict: reviewer_verdict,
+            seen: Mutex::new(vec![]),
+        });
+        let error = with(reviewer)
+            .execute(command(name), talking())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("命令未执行"), "{error:?}");
+        assert!(!root.path().join(name).exists(), "{name}");
+    }
+
+    // 后台委托执行：没有人在场，用户角色消息不作为原话交给审查者。
+    let delegated = Arc::new(Reviewer {
+        verdict: verdict(ReviewRisk::Medium, ReviewAuthorization::Low, false),
+        seen: Mutex::new(vec![]),
+    });
+    let error = with(delegated.clone())
+        .execute(command("careful-delegated"), talking().with_delegated(true))
+        .await
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("没有人在场"), "{error:?}");
+    let seen = delegated.seen.lock().unwrap().pop().unwrap();
+    assert!(seen.delegated && seen.user_messages.is_empty());
+
+    // 不需要确认的命令不经过审查；禁止的命令也不交给审查者放行。
+    let untouched = Arc::new(Reviewer {
+        verdict: verdict(ReviewRisk::Low, ReviewAuthorization::High, true),
+        seen: Mutex::new(vec![]),
+    });
+    let backend = with(untouched.clone());
+    backend.execute(command("plain"), talking()).await.unwrap();
+    assert!(
+        backend
+            .execute(command("forbidden"), talking())
+            .await
+            .is_err()
+    );
+    assert!(untouched.seen.lock().unwrap().is_empty());
+    assert!(!root.path().join("forbidden").exists());
 }

@@ -89,6 +89,7 @@ eve-commitment-plugin = { path = "../commitment-plugin" }
 eve-provision-api = { path = "../provision-api" }
 eve-apply-patch = { path = "../apply-patch" }
 eve-command-policy = { path = "../command-policy" }
+eve-action-review = { path = "../action-review" }
 eve-provision-plugin = { path = "../provision-plugin" }
 eve-reminder-api = { path = "../reminder-api" }
 eve-reminder-plugin = { path = "../reminder-plugin" }

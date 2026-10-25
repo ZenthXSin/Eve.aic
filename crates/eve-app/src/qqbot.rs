@@ -1941,6 +1941,7 @@ async fn run_qqbot_composed(
             &options.state_directory,
             Some(qq_admin.clone()),
             Some(crate::developer::member_runtime(options.practice_java.as_deref(), options.practice_server_jar.as_deref())),
+            crate::developer::action_reviewer(registry.clone(), model_health.clone()),
         )?;
         if let Some(services) = preference_services {
             let mut services = (*services).clone();
