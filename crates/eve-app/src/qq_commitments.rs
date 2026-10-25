@@ -3,22 +3,32 @@
 //!
 //! 记下与了结都先写入约定账本才算数；对话里只交给当前发言者本人的约定，作为数据而不是指令。
 //! 账本读取失败时标出 `unavailable`，本轮照常回复，不当作没有约定。
+//!
+//! 热配置 `runtime.commitments` 在每次调用工具与组装上下文时读取：`enabled` 关闭后工具明确拒绝、
+//! 上下文不再给出约定；`members` 关闭后只有主人与管理员可以记下、了结和看到约定。已记下的约定不删除。
 use eve_commitment_api::{
     Commitment, CommitmentError, CommitmentLedger, CommitmentStatus, MAX_TEXT_BYTES,
 };
+use eve_config_api::{
+    CONFIG_SERVICE_ID, ConfigField, ConfigKind, ConfigSchema, ConfigServiceHandle,
+};
+use eve_developer_api::DeveloperAuthorization;
 use eve_llm_api::{
     ContextAssembler, ContextScope, ContextSnapshot, LlmFuture, Tool, ToolCall, ToolConcurrency,
     ToolDefinition, ToolExecutionContext, ToolExecutionError, ToolFuture, ToolValidationError,
     TurnInput,
 };
 use eve_people_api::PersonLinks;
+use eve_plugin_api::{ServiceId, ServiceRegistry};
 use ring::digest::{SHA256, digest};
 use serde_json::{Value, json};
 use std::{
-    sync::Arc,
+    collections::BTreeMap,
+    sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+pub(crate) const NAMESPACE: &str = "runtime.commitments";
 pub(crate) const NOTE_TOOL: &str = "note_commitment";
 pub(crate) const SETTLE_TOOL: &str = "settle_commitment";
 /// 交给对话的未完成约定与最近了结的约定条数上限。
@@ -64,13 +74,82 @@ fn call_source(call_id: &str) -> String {
     format!("tool:{hex}")
 }
 
+pub(crate) fn schema() -> ConfigSchema {
+    let flag = |env: &str| {
+        let mut field = ConfigField::new(ConfigKind::Boolean, Some(json!(true)));
+        field.environment = Some(env.into());
+        field
+    };
+    ConfigSchema {
+        namespace: NAMESPACE.into(),
+        version: 1,
+        fields: BTreeMap::from([
+            ("enabled".into(), flag("EVE_COMMITMENTS_ENABLED")),
+            ("members".into(), flag("EVE_COMMITMENTS_MEMBERS")),
+        ]),
+    }
+}
+
+/// 当前发言者能否使用约定。
+#[derive(Debug, Eq, PartialEq)]
+enum Access {
+    Allowed,
+    Disabled,
+    OperatorsOnly,
+}
+
+/// 按热配置与可信管理员身份决定是否可用；管理员判断在宿主装配后期才建立，之前一律视为普通成员。
+pub(crate) struct Gate {
+    pub(crate) registry: Arc<dyn ServiceRegistry>,
+    pub(crate) admin: OnceLock<Arc<dyn DeveloperAuthorization>>,
+}
+impl Gate {
+    fn access(&self, scope: &ContextScope) -> Result<Access, String> {
+        let unavailable = || "约定设置不可读取".to_string();
+        let service = self
+            .registry
+            .get(&ServiceId::new(CONFIG_SERVICE_ID).map_err(|_| unavailable())?)
+            .map_err(|_| unavailable())?
+            .ok_or_else(unavailable)?;
+        let config = service
+            .value
+            .downcast::<ConfigServiceHandle>()
+            .map_err(|_| unavailable())?
+            .0
+            .snapshot(NAMESPACE, 1)
+            .map_err(|_| unavailable())?;
+        let flag = |name| config.get::<bool>(name).map_err(|_| unavailable());
+        if !flag("enabled")? {
+            return Ok(Access::Disabled);
+        }
+        if flag("members")? || self.admin.get().is_some_and(|a| a.is_operator(scope)) {
+            return Ok(Access::Allowed);
+        }
+        Ok(Access::OperatorsOnly)
+    }
+}
+
 /// 宿主为当前发言者决定的约定参与者：本人加经授权、确认为同一个人的其他会话参与者。
 #[derive(Clone)]
 pub(crate) struct Owners {
     pub(crate) ledger: Arc<dyn CommitmentLedger>,
     pub(crate) links: Arc<dyn PersonLinks>,
+    pub(crate) gate: Arc<Gate>,
 }
 impl Owners {
+    /// 工具入口的检查：关闭或无权时明确拒绝，不静默成功。
+    fn check(&self, context: &ToolExecutionContext) -> Result<(), ToolExecutionError> {
+        let scope = context
+            .scope()
+            .ok_or_else(|| failed("约定只能在与具体某个人的对话里记下"))?;
+        match self.gate.access(scope).map_err(failed)? {
+            Access::Allowed => Ok(()),
+            Access::Disabled => Err(failed("约定功能已在设置中关闭；不要说已经记下或了结")),
+            Access::OperatorsOnly => {
+                Err(failed("约定目前只对主人和管理员开放；不要说已经记下或了结"))
+            }
+        }
+    }
     fn resolve(&self, current: &str) -> Result<Vec<String>, String> {
         let candidates: Vec<String> = self
             .ledger
@@ -143,6 +222,7 @@ impl Tool for NoteCommitmentTool {
 
     fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
         Box::pin(async move {
+            self.0.check(&context)?;
             let owner = participant(&context)?;
             let text = call.arguments["text"].as_str().unwrap_or_default();
             let commitment = self
@@ -214,6 +294,7 @@ impl Tool for SettleCommitmentTool {
 
     fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
         Box::pin(async move {
+            self.0.check(&context)?;
             let current = participant(&context)?;
             let owners = self.0.resolve(&current).map_err(failed)?;
             let status = match call.arguments["outcome"].as_str() {
@@ -292,7 +373,13 @@ impl ContextAssembler for CommitmentContext {
             let Some(scope) = scope.filter(|s| s.user_id != crate::qq_group::USER) else {
                 return Ok(context);
             };
-            let data = match self.data(&scope.user_id) {
+            // 关闭或无权时不给出约定；读取设置失败时与读取账本失败一样标出 unavailable。
+            let data = match self.owners.gate.access(&scope) {
+                Ok(Access::Allowed) => self.data(&scope.user_id),
+                Ok(_) => return Ok(context),
+                Err(error) => Err(error),
+            };
+            let data = match data {
                 Ok(None) => return Ok(context),
                 Ok(Some(data)) => data,
                 Err(_) => json!({"kind": "eve.commitments.v1", "unavailable": true}),

@@ -1,0 +1,6 @@
+{
+  "type": "Wall",
+  "name": "Test Wall",
+  "health": 500,
+  "size": 1
+}

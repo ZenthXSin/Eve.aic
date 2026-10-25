@@ -425,6 +425,7 @@ pub(crate) async fn install_core_with_pages_and_admin(
         qq_people::schema(),
         qq_memory_continuity::schema(),
         qq_provision::schema(),
+        qq_commitments::schema(),
         qq_tasks::schema(),
         qq_message_judge::provider_schema(),
         model_roles_schema(),

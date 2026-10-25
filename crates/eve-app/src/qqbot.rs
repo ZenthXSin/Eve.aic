@@ -1515,9 +1515,14 @@ async fn run_qqbot_composed(
             provision: provision.clone(),
         });
         // 约定：Eve 答应别人、之后要做的事用工具记下；同一个人在其他会话里也看得到未完成的约定。
+        let commitment_gate = Arc::new(crate::qq_commitments::Gate {
+            registry: registry.clone(),
+            admin: std::sync::OnceLock::new(),
+        });
         let context: Arc<dyn ContextAssembler> = match &commitments {
             Some(commitments) => {
                 let owners = crate::qq_commitments::Owners {
+                    gate: commitment_gate.clone(),
                     ledger: Arc::new(commitments.clone()),
                     links: Arc::new(crate::qq_memory_continuity::PersonLinks(
                         crate::qq_memory_continuity::Policy {
@@ -1898,6 +1903,8 @@ async fn run_qqbot_composed(
         )?;
         let _ = outbox.member_access.set((developer_settings.as_ref().map(|c| c.workspace.clone()), qq_admin.clone()));
         let _ = provision.admin.set(qq_admin.clone());
+        // 约定的“仅管理员”开关用同一个可信管理员判断。
+        let _ = commitment_gate.admin.set(qq_admin.clone());
         for all in [false, true] {
             bootstrap.tools.push(Arc::new(crate::qq_context_reset::ResetTool {
                 all,

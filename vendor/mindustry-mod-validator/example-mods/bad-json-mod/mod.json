@@ -1,0 +1,6 @@
+{
+  "name": "Bad JSON Mod",
+  "version": "1.0.0",
+  "author": "mod-validator",
+  "description": "A mod with intentional errors for testing error detection"
+}

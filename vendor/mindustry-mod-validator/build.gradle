@@ -1,0 +1,89 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'com.github.modvalidator'
+version = '1.0.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+repositories {
+    mavenCentral()
+}
+
+// Eve.aic：JitPack 上 Mindustry v159.5 依赖的 Arc 构件已无法获取，改为以官方发布、校验过摘要的
+// Mindustry 服务端 jar（含 core、server、Arc、Rhino、LZ4、JLine）作为唯一依赖：
+//   gradle fatJar -PmindustryServerJar=/path/to/server-release.jar
+def mindustryServerJar = findProperty('mindustryServerJar')
+if(mindustryServerJar == null){
+    throw new GradleException('需要 -PmindustryServerJar=<Mindustry server-release.jar 路径>')
+}
+
+dependencies {
+    implementation files(mindustryServerJar)
+
+    // Testing
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.1'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+application {
+    mainClass = 'modvalidator.ModValidatorCli'
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events "passed", "skipped", "failed"
+        exceptionFormat = 'full'
+    }
+    // Headless tests need a display-free environment
+    jvmArgs = [
+        '-Djava.awt.headless=true',
+        '--add-opens=java.base/sun.reflect.annotation=ALL-UNNAMED'
+    ]
+}
+
+tasks.withType(JavaCompile){
+    options.encoding = 'UTF-8'
+    options.compilerArgs += ['--release', '17']
+    options.forkOptions.jvmArgs += [
+        '--add-opens=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED',
+        '--add-opens=jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED'
+    ]
+}
+
+// CLI task: gradle validateMod -PmodPath=/path/to/mod
+task validateMod(type: JavaExec){
+    group = 'mod-validator'
+    description = 'Validate a Mindustry mod dynamically. Usage: gradle validateMod -PmodPath=/path/to/mod'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'modvalidator.ModValidatorCli'
+    if(project.hasProperty('modPath')){
+        args project.property('modPath')
+    }
+    jvmArgs = ['-Djava.awt.headless=true']
+}
+
+// Fat jar for distribution
+task fatJar(type: Jar){
+    group = 'build'
+    description = 'Build a fat jar with all dependencies'
+    archiveClassifier = 'all'
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+    // Resources (version.properties, icons, scripts, baseparts) are in src/main/resources/
+    // and automatically included by the jar task. Fi.read() falls back to classpath
+    // via Fi.class.getResourceAsStream("/" + path) when internal files are not on disk.
+    exclude('META-INF/**')
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes 'Main-Class': 'modvalidator.ModValidatorCli'
+    }
+    with jar
+}
