@@ -70,7 +70,8 @@ impl ConditionVerifier for MindustryServerCheck {
     }
 }
 
-/// 用两个最小模组实际跑一次验证器：正确的必须没有错误，写错类型的必须报告错误，才算能用来把关。
+/// 用两个最小模组实际跑一次验证器：正确的必须没有错误，缺少必填字段的必须报告错误，才算能用来把关。
+/// （写错类型时游戏只给警告并退回默认类型，不能用来检验验证器。）
 struct ModValidatorCheck {
     java: RuntimeCommand,
 }
@@ -99,7 +100,7 @@ impl ConditionVerifier for ModValidatorCheck {
             .map_err(io)?;
             let broken = Self::sample(
                 root.path(),
-                "type: EveNoSuchBlockType\nhealth: 321\nsize: 1\nrequirements: [ copper/6 ]\ncategory: defense\n",
+                "type: PowerTurret\nrange: 100\nrequirements: [ copper/6 ]\ncategory: turret\n",
             )
             .map_err(io)?;
             let scratch = tempfile::tempdir().map_err(|_| "无法创建自检目录".to_string())?;
@@ -110,7 +111,7 @@ impl ConditionVerifier for ModValidatorCheck {
             let scratch = tempfile::tempdir().map_err(|_| "无法创建自检目录".to_string())?;
             let issues = validator.check(&broken, scratch.path()).await?;
             if issues.is_empty() {
-                return Err("写错类型的模组没有被报告".into());
+                return Err("缺少必填字段的模组没有被报告".into());
             }
             Ok(format!(
                 "正确模组通过，错误模组报告 {} 项；mod validator sha256:{}",
@@ -134,7 +135,7 @@ pub(crate) fn conditions(java: RuntimeCommand) -> Vec<(ConditionSpec, Arc<dyn Co
     ), (
         ConditionSpec {
             id: MOD_VALIDATOR.into(),
-            description: "继承自 eve-portable 的 Mindustry 模组验证器 jar，用于实践验证时在服务端加载之后再放置方块、生成单位、跑更新帧，找出运行时崩溃。没有现成的下载地址：源码在 Eve 仓库的 vendor/mindustry-mod-validator，用 JDK 17+ 与 Gradle 9 执行 gradle --no-daemon fatJar -PmindustryServerJar=<Mindustry 服务端 jar>，得到 build/libs/mindustry-mod-validator-1.0.0-all.jar 后以 path 取得。验证方式：正确的最小模组必须没有错误、写错类型的必须被报告。".into(),
+            description: "继承自 eve-portable 的 Mindustry 模组验证器 jar，用于实践验证时在服务端加载之后再放置方块、生成单位、跑更新帧，找出运行时崩溃。没有现成的下载地址：源码在 Eve 仓库的 vendor/mindustry-mod-validator，用 JDK 17+ 与 Gradle 9 执行 gradle --no-daemon fatJar -PmindustryServerJar=<Mindustry 服务端 jar>，得到 build/libs/mindustry-mod-validator-1.0.0-all.jar 后以 path 取得。验证方式：正确的最小模组必须没有错误、缺少必填字段的必须被报告。".into(),
             file_name: "mod-validator.jar".into(),
             max_bytes: 256 * 1024 * 1024,
         },

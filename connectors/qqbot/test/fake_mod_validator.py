@@ -2,7 +2,8 @@
 
 只用于离线验收调用协议与证据处理，不代表真实游戏行为；真实验证器由 CI 从源码构建后验证。
 用法与真实验证器相同：python3 fake_mod_validator.py <JVM 参数...> -jar <jar> <模组目录> --json --output <报告>
-方块的 type 不是已知类型时报告内容解析错误；内容文件里出现 `crashOnUpdate` 时报告方块更新崩溃；
+与真实游戏一致：未知类型只是警告；PowerTurret 缺少 shootType 时报告内容加载错误；
+内容文件里出现 `crashOnUpdate` 时报告方块更新崩溃；
 模组目录里有 `FATAL` 文件时按环境初始化失败退出。
 """
 import json
@@ -26,9 +27,12 @@ def main():
     for path in sorted(mod.glob("content/*/*")):
         text = path.read_text(encoding="utf8")
         declared = re.search(r"^type:\s*(\S+)", text, re.M)
-        if path.parent.name == "blocks" and declared and declared.group(1) not in BLOCK_TYPES:
+        if path.parent.name == "blocks" and declared and declared.group(1) not in BLOCK_TYPES | {"PowerTurret"}:
+            issues.append({"severity": "WARN", "category": "runtime-log",
+                           "message": f"No type '{declared.group(1)}' found", "detail": None})
+        if declared and declared.group(1) == "PowerTurret" and "shootType" not in text:
             issues.append({"severity": "ERROR", "category": "content-parse",
-                           "message": f"{path.name}: 未知类型 {declared.group(1)}", "detail": None})
+                           "message": f"{path.name}: 'shootType' in PowerTurret is missing!", "detail": None})
         if "crashOnUpdate" in text:
             name = path.stem
             # 真实验证器的报告不转义字符串里的制表符。

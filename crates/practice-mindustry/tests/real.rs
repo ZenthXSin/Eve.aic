@@ -162,7 +162,7 @@ async fn real_validator_passes_a_good_mod_and_catches_a_broken_one() {
     .unwrap();
     std::fs::write(
         broken.path().join("content/blocks/bad-wall.hjson"),
-        "type: EveNoSuchBlockType\nhealth: 10\nrequirements: [ copper/6 ]\ncategory: defense\n",
+        "type: PowerTurret\nrange: 100\nrequirements: [ copper/6 ]\ncategory: turret\n",
     )
     .unwrap();
     let scratch = tempfile::tempdir().unwrap();
@@ -171,7 +171,7 @@ async fn real_validator_passes_a_good_mod_and_catches_a_broken_one() {
         .await
         .unwrap();
     println!("{issues:?}");
-    assert!(!issues.is_empty(), "写错类型的模组必须被报告");
+    assert!(!issues.is_empty(), "缺少必填字段的模组必须被报告");
 
     let runner = runner().with_validator(
         eve_practice_mindustry::ModValidator::new(RuntimeCommand::default(), PathBuf::from(jar))

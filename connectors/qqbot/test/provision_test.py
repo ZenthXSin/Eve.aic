@@ -151,7 +151,7 @@ class ProvisionAcceptance(dialogue_tools_test.DialogueToolsAcceptance):
         self.assertEqual(item["condition"], "mindustry-mod-validator")
         self.assertIn("vendor/mindustry-mod-validator", item["description"], "说明怎样自己构建")
 
-        # 验证器没有下载地址：Eve 在本机构建出文件后用 path 取得；宿主用正确与写错的最小模组实际跑一次。
+        # 验证器没有下载地址：Eve 在本机构建出文件后用 path 取得；宿主用正确与缺少必填字段的最小模组实际跑一次。
         built = self.work / "build" / "mindustry-mod-validator-1.0.0-all.jar"
         built.parent.mkdir()
         built.write_bytes(b"PK\x03\x04fake validator built by eve")
