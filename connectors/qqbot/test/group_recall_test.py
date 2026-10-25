@@ -13,7 +13,10 @@ def group_context(body):
     for message in body['messages']:
         content = message.get('content')
         if isinstance(content, str) and '当前群的真实消息观察摘录' in content:
-            return json.loads(content[content.index('{"group_messages"'):])
+            start = content.find('{"current_message"')
+            if start < 0:
+                start = content.index('{"group_messages"')
+            return json.loads(content[start:])
     return None
 
 
@@ -51,6 +54,11 @@ class GroupRecallAcceptance(group_relation_test.GroupRelationAcceptance):
         self.assertEqual([m['text'].split()[0] for m in messages[:-1]], [f'第{i}句' for i in range(6, 25)])
         self.assertTrue(all(m['truncated'] for m in messages[:-1]))
         self.assertEqual(messages[-1]['text'], 'eve看看最近消息')
+        self.assertTrue(messages[-1]['current'])
+        self.assertTrue(context['current_message']['text'], '当前消息锚点为空')
+        self.assertEqual(context['current_message']['text'], 'eve看看最近消息')
+        self.assertIn('mentions_me', messages[-1])
+        self.assertIn('replies_to_me', messages[-1])
         self.assertIn('at_ms', messages[0])
         self.assertNotIn('related_earlier', context)
         self.assertEqual(self.recall_requests, [], '回答前不能再调用 Jev 挑原话')
