@@ -381,6 +381,7 @@ dependencies = [
  "postgres",
  "reqwest",
  "ring",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
