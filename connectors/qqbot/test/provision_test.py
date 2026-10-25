@@ -142,11 +142,41 @@ class ProvisionAcceptance(dialogue_tools_test.DialogueToolsAcceptance):
         launches = [json.loads(line) for line in self.record.read_text(encoding="utf8").splitlines()]
         self.assertEqual(len(launches), 1, "只为验证启动一次")
 
-        # 重启：没有指定服务端，自动使用自己取得并验证过的版本，实践工具出现。
+        # 重启：没有指定服务端，自动使用自己取得并验证过的版本，实践工具出现；
+        # 实践启用后还缺少做动态测试的模组验证器，同样提示。
         self.start(self.say("restart", "重启了吗"))
-        _, tools = seen["重启了吗"]
+        missing, tools = seen["重启了吗"]
         self.assertIn("run_practice", tools)
-        self.assertIsNone(seen["重启了吗"][0])
+        [item] = missing["missing"]
+        self.assertEqual(item["condition"], "mindustry-mod-validator")
+        self.assertIn("vendor/mindustry-mod-validator", item["description"], "说明怎样自己构建")
+
+        # 验证器没有下载地址：Eve 在本机构建出文件后用 path 取得；宿主用正确与写错的最小模组实际跑一次。
+        built = self.work / "build" / "mindustry-mod-validator-1.0.0-all.jar"
+        built.parent.mkdir()
+        built.write_bytes(b"PK\x03\x04fake validator built by eve")
+
+        def build(body):
+            messages = body["messages"]
+            text = messages[max(i for i, m in enumerate(messages) if m["role"] == "user")]["content"]
+            results = self.results(body)
+            if not results:
+                seen[text] = (conditions(body), self.definitions(body))
+            if text == "验证器也准备一下" and not results:
+                return self.tools([("acquire_condition", {
+                    "condition": "mindustry-mod-validator", "path": str(built), "reason": "实践需要动态测试"})])
+            if text == "验证器也准备一下":
+                self.assertTrue(results[0]["ready"], results)
+                self.assertIn("错误模组报告", results[0]["evidence"])
+                return text_response("验证器也好了")
+            return text_response("好")
+        self.callback = build
+        self.start(self.say("validator", "验证器也准备一下", expected="验证器也好了"))
+        validator = self.ledger()["conditions"]["mindustry-mod-validator"]["ready"]
+        self.assertEqual(validator["source"], {"local_file": str(built)})
+
+        self.start(self.say("restart-again", "再重启"))
+        self.assertIsNone(seen["再重启"][0], "条件都已具备，不再提示")
 
     def test_switch_off_rejects_acquisition_and_hides_the_hint(self):
         seen = {}

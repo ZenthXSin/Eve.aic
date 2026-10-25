@@ -141,3 +141,49 @@ async fn self_check_accepts_a_real_server_and_rejects_a_non_server_jar() {
     let workspace = tempfile::tempdir().unwrap();
     assert!(fake_runner.self_check(workspace.path()).await.is_err());
 }
+
+/// 需要同时提供 EVE_MOD_VALIDATOR_JAR（CI 从 vendor 源码构建）；未提供时跳过。
+#[tokio::test]
+#[ignore = "需要真实 Mindustry 服务端 jar 与从源码构建的模组验证器"]
+async fn real_validator_passes_a_good_mod_and_catches_a_broken_one() {
+    let Some(jar) = std::env::var_os("EVE_MOD_VALIDATOR_JAR") else {
+        eprintln!("未设置 EVE_MOD_VALIDATOR_JAR，跳过");
+        return;
+    };
+    let validator =
+        eve_practice_mindustry::ModValidator::new(RuntimeCommand::default(), PathBuf::from(&jar))
+            .unwrap();
+    let broken = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(broken.path().join("content/blocks")).unwrap();
+    std::fs::write(
+        broken.path().join("mod.hjson"),
+        "name: \"eve-broken\"\ndisplayName: \"Eve Broken\"\nauthor: \"Eve\"\nversion: \"1.0\"\nminGameVersion: 146\n",
+    )
+    .unwrap();
+    std::fs::write(
+        broken.path().join("content/blocks/bad-wall.hjson"),
+        "type: EveNoSuchBlockType\nhealth: 10\nrequirements: [ copper/6 ]\ncategory: defense\n",
+    )
+    .unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let issues = validator
+        .check(broken.path(), scratch.path())
+        .await
+        .unwrap();
+    println!("{issues:?}");
+    assert!(!issues.is_empty(), "写错类型的模组必须被报告");
+
+    let runner = runner().with_validator(
+        eve_practice_mindustry::ModValidator::new(RuntimeCommand::default(), PathBuf::from(jar))
+            .unwrap(),
+    );
+    let good = draft(
+        "type: Wall\nhealth: 520\nsize: 1\nrequirements: [ copper/6 ]\ncategory: defense\n",
+        &[("exists", "true"), ("health", "520")],
+    );
+    let workspace = tempfile::tempdir().unwrap();
+    let evidence = runner.run(&good, workspace.path()).await;
+    println!("{}", evidence.log_excerpt);
+    assert!(evidence.log_excerpt.contains("mod validator errors=0"));
+    assert!(evidence.verified(&good), "{:?}", evidence.warnings);
+}

@@ -949,6 +949,27 @@ async fn run_qqbot_composed(
                 }
             }
         }
+        // 实践使用 Mindustry 服务端时，再用自己取得的模组验证器做动态测试；缺少时同样提示。
+        let mut practice_validator = None;
+        if options.interest_learning
+            && options.practice_server_jar.is_some()
+            && options.practice_browser.is_none()
+            && interest_components.runner.is_none()
+        {
+            match eve_provision_api::ConditionProvider::ready_path(
+                &provider,
+                crate::qq_provision::MOD_VALIDATOR,
+            )? {
+                Some(path) => practice_validator = Some(path),
+                None => {
+                    needed_conditions.insert(
+                        crate::qq_provision::MOD_VALIDATOR.to_string(),
+                        "实践验证的动态测试：服务端加载后放置方块、生成单位、跑更新帧，找出运行时崩溃"
+                            .to_string(),
+                    );
+                }
+            }
+        }
         let provision = Arc::new(crate::qq_provision::Provision {
             provider: Arc::new(provider),
             registry: registry.clone(),
@@ -2443,22 +2464,31 @@ async fn run_qqbot_composed(
                     BrowserRunner::new(browser.clone())
                         .map_err(|error| format!("实践运行环境无效：{error}"))?,
                 ),
-                (None, None) => Arc::new(
-                    MindustryServerRunner::new(
-                        RuntimeCommand {
-                            program: options
-                                .practice_java
-                                .clone()
-                                .unwrap_or_else(|| "java".into()),
-                            prefix_args: options.practice_java_args.clone(),
-                        },
+                (None, None) => {
+                    let java = RuntimeCommand {
+                        program: options
+                            .practice_java
+                            .clone()
+                            .unwrap_or_else(|| "java".into()),
+                        prefix_args: options.practice_java_args.clone(),
+                    };
+                    let runner = MindustryServerRunner::new(
+                        java.clone(),
                         options
                             .practice_server_jar
                             .clone()
                             .ok_or("实践验证缺少运行环境")?,
                     )
-                    .map_err(|error| format!("实践运行环境无效：{error}"))?,
-                ),
+                    .map_err(|error| format!("实践运行环境无效：{error}"))?;
+                    let runner = match &practice_validator {
+                        Some(jar) => runner.with_validator(
+                            eve_practice_mindustry::ModValidator::new(java, jar.clone())
+                                .map_err(|error| format!("模组验证器无效：{error}"))?,
+                        ),
+                        None => runner,
+                    };
+                    Arc::new(runner)
+                }
             };
             let _ = skill_runner.set(runner.clone());
             let mut drafter: Arc<dyn PracticeDrafter> = match practice_drafter {
