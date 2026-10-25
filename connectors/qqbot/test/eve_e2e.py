@@ -8,6 +8,7 @@ import pathlib
 import shutil
 import subprocess
 import signal
+import sqlite3
 import tempfile
 import threading
 import time
@@ -191,6 +192,14 @@ class Acceptance(unittest.TestCase):
         return {owner: {key: json.loads(bytes(value)) for key, value in entries.items()}
             for owner, entries in state["entries"].items()}
 
+    def expression_state(self):
+        with sqlite3.connect(self.work / "state/training-expressions.sqlite3") as db:
+            db.row_factory = sqlite3.Row
+            records = [dict(row) for row in db.execute("SELECT session_id,user_id,id,body,chars,paragraphs,question,formal,casual,active FROM expressions ORDER BY seq")]
+        for row in records:
+            row["scope"] = {"session_id": row.pop("session_id"), "user_id": row.pop("user_id")}
+        return {"version": 1, "rows": records}
+
     def has_training(self, request):
         return any(m["role"] == "system" and "当前会话允许从交互中学习表达" in m.get("content", "") for m in request["messages"])
 
@@ -200,16 +209,18 @@ class Acceptance(unittest.TestCase):
         state_path = self.work / "state/state.json"
         saved = json.loads(state_path.read_text())
         saved["entries"].pop("eve.training", None)
+        for name in ("training-expressions.sqlite3", "training-expressions.required"):
+            (self.work / "state" / name).unlink()
         state_path.write_text(json.dumps(saved))
         before = len(self.requests)
         self.run_eve(training=True)
         self.assertEqual(len(self.requests), before)
         self.assertEqual(self.replies(), [])
-        learned = self.documents()["eve.training"]["expression.v1"]
+        learned = self.expression_state()
         self.assertEqual(len(learned["rows"]), 8)
         self.assertNotIn("今天不错", json.dumps(learned, ensure_ascii=False))
         self.run_eve(training=True)
-        self.assertEqual(self.documents()["eve.training"]["expression.v1"], learned)
+        self.assertEqual(self.expression_state(), learned)
         self.run_eve([self.message("el-stats", "/train stats", "本会话已学习 8 条有效用户表达：字数中位数 4，短消息 100%，单段消息 100%。当前要求始终优先；这是本地表达统计。", scope="group"),
                       self.message("el-other", "/train stats", "本会话暂无有效表达样本；训练开启后会从普通交流中学习。", scope="group", user="user-2"),
                       self.message("el-task", "详细解释这个任务", scope="group")], training=True)
@@ -217,7 +228,7 @@ class Acceptance(unittest.TestCase):
         self.assertTrue(any(m["role"] == "system" and "当前可信会话" in m.get("content", "") for m in self.requests[-1]["messages"]))
         self.run_eve([self.message("el-reset", "/train reset", "已重置本会话的表达统计和学到的说法，原始聊天记录保留；旧消息不会再次计入，可继续从新消息学习。", scope="group")], training=True)
         self.run_eve(training=True)
-        self.assertFalse(any(r["active"] for r in self.documents()["eve.training"]["expression.v1"]["rows"]))
+        self.assertFalse(any(r["active"] for r in self.expression_state()["rows"]))
         self.assertEqual(len(self.requests), before + 1)
         self.assertEqual(len(self.sessions()[0]["turns"]), 9)
 
@@ -249,11 +260,11 @@ class Acceptance(unittest.TestCase):
             self.wait_command("queue-off", "finish"), self.open_gate("queue-release"),
             self.wait_command("queue-busy"), self.wait_command("queue-start")])
         self.assertEqual(len(self.requests), 2)
-        before = self.documents()["eve.training"]["expression.v1"]
+        before = self.expression_state()
         self.run_eve(training=True)
         self.assertEqual(len(self.requests), 2)
         self.assertEqual(self.replies(), [])
-        after = self.documents()["eve.training"]["expression.v1"]
+        after = self.expression_state()
         row = next(r for r in after["rows"] if r["id"] == hashlib.sha256(b"queue-off").hexdigest())
         self.assertFalse(row["active"], "停用期间排队输入不得在开启后补学")
         self.assertEqual((row["chars"], row["paragraphs"]), (0, 0))
@@ -268,14 +279,14 @@ class Acceptance(unittest.TestCase):
                 "已重置本会话的表达统计和学到的说法，原始聊天记录保留；旧消息不会再次计入，可继续从新消息学习。")},
             self.wait_command("reset-command"), self.open_gate("reset-release"),
             self.wait_command("reset-busy"), self.wait_command("reset-queued")])
-        before = self.documents()["eve.training"]["expression.v1"]
+        before = self.expression_state()
         self.assertEqual(len(before["rows"]), 2)
         self.assertFalse(any(r["active"] for r in before["rows"]), "重置前已准入队列应包含在重置范围")
         self.run_eve(training=True)
-        self.assertEqual(self.documents()["eve.training"]["expression.v1"], before)
+        self.assertEqual(self.expression_state(), before)
         self.assertEqual(len(self.requests), 2)
         self.run_eve([self.message("reset-new", "重置后新输入")], training=True)
-        rows = self.documents()["eve.training"]["expression.v1"]["rows"]
+        rows = self.expression_state()["rows"]
         self.assertEqual([r["id"] for r in rows if r["active"]], [hashlib.sha256(b"reset-new").hexdigest()])
         self.assertEqual(len(self.requests), 3)
 

@@ -7,6 +7,54 @@ use std::sync::Arc;
 pub const TRAINING_PLUGIN_ID: &str = "eve.training";
 pub const TRAINING_SERVICE_ID: &str = "eve.training.mode";
 
+/// 不含原文的去重与表达统计记录；active=false 保留去重凭据，重置不重新学习旧输入。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpressionRecord {
+    pub scope: ContextScope,
+    pub id: String,
+    pub body: String,
+    pub chars: usize,
+    pub paragraphs: usize,
+    pub question: bool,
+    pub formal: bool,
+    pub casual: bool,
+    pub active: bool,
+}
+impl ExpressionRecord {
+    pub fn valid(&self) -> bool {
+        let identifier = |v: &str| {
+            !v.is_empty() && v.len() <= 256 && v.trim() == v && !v.chars().any(char::is_control)
+        };
+        let hash = |v: &str| {
+            v.len() == 64
+                && v.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        identifier(&self.scope.session_id)
+            && identifier(&self.scope.user_id)
+            && hash(&self.id)
+            && hash(&self.body)
+            && ((1..=512).contains(&self.chars) && (1..=self.chars).contains(&self.paragraphs)
+                || !self.active
+                    && self.chars == 0
+                    && self.paragraphs == 0
+                    && !self.question
+                    && !self.formal
+                    && !self.casual)
+    }
+}
+
+/// 可替换的表达统计持久存储；导入必须幂等且不得复活已重置记录，写入成功后才能缓冲学习样本。
+pub trait ExpressionStore: Send + Sync {
+    fn import_legacy(&self, rows: &[ExpressionRecord]) -> PluginResult<()>;
+    fn get(&self, scope: &ContextScope, id: &str) -> PluginResult<Option<ExpressionRecord>>;
+    /// 新插入返回 true；相同记录返回 false，ID 内容冲突必须拒绝。
+    fn insert(&self, row: &ExpressionRecord) -> PluginResult<bool>;
+    fn snapshot(&self, scope: Option<&ContextScope>) -> PluginResult<Option<ExpressionSnapshot>>;
+    fn reset(&self, scope: &ContextScope) -> PluginResult<()>;
+}
+
 /// 用户原文的表达统计，不包含正文、身份、观点或已确认的长期偏好。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExpressionSnapshot {

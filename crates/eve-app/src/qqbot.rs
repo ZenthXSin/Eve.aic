@@ -1063,7 +1063,11 @@ async fn run_qqbot_composed(
         };
 
         kernel.register(Box::new(
-            TrainingPlugin::new(options.training)?.with_phrase_learning(),
+            TrainingPlugin::new(options.training)?.with_phrase_learning().with_expression_store(
+                Arc::new(eve_training_sqlite::SqliteExpressions::open(
+                    &options.state_directory.join("training-expressions.sqlite3"),
+                )?),
+            ),
         ))?;
         kernel.start(&PluginId::new(TRAINING_PLUGIN_ID)?).await?;
         // 分段设置先于模型与通道加载；损坏或版本不兼容时在这里拒绝启动并保留原字节。
