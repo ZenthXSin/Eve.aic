@@ -15,6 +15,7 @@ impl LocalDeveloper {
         let listing = self
             .command_limited(
                 CommandArguments {
+                    owner_confirmed: false,
                     program: "git".into(),
                     args: [
                         "ls-files",

@@ -11,9 +11,9 @@ pub const CHAT_PLANNER: &str = "chat-v1";
 
 /// 按句拆分的闲聊回复上限（非空白字符数）；更长的回复按自然段处理。
 pub const MAX_CHAT_CHARS: usize = 240;
-/// 少于该字数的句子并入相邻句，避免“嗯。”单独成条。
+/// 自动识别的句子少于该字数时并入同行相邻句；明确换行的短消息保留。
 const MIN_PIECE_CHARS: usize = 4;
-/// 至少能组成两条完整短句；与单条合并门槛一致，避免拦下 8–11 字的回复。
+/// 无明确换行时，至少能组成两条完整短句才自动按标点拆分。
 pub const MIN_SPLIT_CHARS: usize = MIN_PIECE_CHARS * 2;
 
 const TERMINATORS: &[char] = &['。', '！', '？', '!', '?', '…', '～', '~'];
@@ -90,7 +90,7 @@ fn sentences(text: &str) -> Vec<Range<usize>> {
         let ascii_period = c == '.'
             && chars.peek().is_none_or(|(_, next)| next.is_whitespace())
             && !text[..index].ends_with(|p: char| p.is_ascii_digit());
-        let boundary = c == '\n' || (open.is_empty() && (TERMINATORS.contains(&c) || ascii_period));
+        let boundary = open.is_empty() && (c == '\n' || TERMINATORS.contains(&c) || ascii_period);
         if !boundary {
             continue;
         }
@@ -128,21 +128,35 @@ impl SegmentPlanner for ChatPlanner {
         if !self.splitting.sentences() || !casual(text) {
             return self.paragraph.plan(request);
         }
-        if visible(text) < MIN_SPLIT_CHARS {
+        let mut units = sentences(text);
+        let line_break =
+            |left: &Range<usize>, right: &Range<usize>| text[left.end..right.start].contains('\n');
+        if visible(text) < MIN_SPLIT_CHARS
+            && !units.windows(2).any(|pair| line_break(&pair[0], &pair[1]))
+        {
             return SegmentPlan::single(CHAT_PLANNER, text);
         }
-        let mut units = sentences(text);
         let mut counts: Vec<usize> = units.iter().map(|u| visible(&text[u.clone()])).collect();
         // 过短或只有标点、表情的句子并入前一句（首句并入后一句）。
         let mut index = 0;
         while index < units.len() && units.len() > 1 {
-            let short =
-                counts[index] < MIN_PIECE_CHARS || !has_content(&text[units[index].clone()]);
+            let content_free = !has_content(&text[units[index].clone()]);
+            let short = counts[index] < MIN_PIECE_CHARS || content_free;
             if !short {
                 index += 1;
                 continue;
             }
-            let target = if index == 0 { 1 } else { index - 1 };
+            // 只有按标点自动切出的短句会合并；显式换行有独立内容时不跨行吞回去。
+            let before = index
+                .checked_sub(1)
+                .filter(|&i| content_free || !line_break(&units[i], &units[index]));
+            let after = (index + 1 < units.len())
+                .then_some(index + 1)
+                .filter(|&i| content_free || !line_break(&units[index], &units[i]));
+            let Some(target) = before.or(after) else {
+                index += 1;
+                continue;
+            };
             let (left, right) = (target.min(index), target.max(index));
             units[left].end = units[right].end;
             counts[left] += counts[right];
@@ -258,8 +272,41 @@ mod tests {
             texts(&planner, "明天见。早点睡。"),
             ["明天见。", "早点睡。"]
         );
-        assert_eq!(texts(&planner, "嗯。\n好好休息。"), ["嗯。\n好好休息。"]);
-        assert_eq!(texts(&planner, "嗯。\n好。"), ["嗯。\n好。"]);
+        assert_eq!(texts(&planner, "嗯。\n好好休息。"), ["嗯。", "好好休息。"]);
+        assert_eq!(texts(&planner, "嗯。\n好。"), ["嗯。", "好。"]);
+    }
+
+    #[test]
+    fn explicit_lines_preserve_short_casual_messages_without_changing_text() {
+        let planner = ChatPlanner::new(Arc::new(On(true)));
+        for separator in ["\n", "\n\n", "\r\n"] {
+            assert_eq!(
+                texts(&planner, &format!("陪你喔{separator}这话爱听")),
+                ["陪你喔", "这话爱听"]
+            );
+            assert_eq!(
+                texts(&planner, &format!("在{separator}你说")),
+                ["在", "你说"]
+            );
+        }
+        assert_eq!(
+            texts(&planner, "先说第一句。\n嗯。好好休息吧。"),
+            ["先说第一句。", "嗯。好好休息吧。"]
+        );
+        assert_eq!(
+            texts(&planner, "嗯。陪你喔\n这话爱听"),
+            ["嗯。陪你喔", "这话爱听"]
+        );
+        assert_eq!(
+            texts(&planner, "陪你喔\n……\n这话爱听"),
+            ["陪你喔\n……", "这话爱听"]
+        );
+        assert_eq!(
+            texts(&planner, "他说“陪你喔\n这话爱听”\n我笑了"),
+            ["他说“陪你喔\n这话爱听”", "我笑了"]
+        );
+        assert_eq!(texts(&planner, "陪你喔这话爱听"), ["陪你喔这话爱听"]);
+        assert_eq!(texts(&planner, "嗯。好的。"), ["嗯。好的。"]);
     }
 
     #[test]

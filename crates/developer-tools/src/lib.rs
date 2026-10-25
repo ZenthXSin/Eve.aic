@@ -201,9 +201,9 @@ impl Tool for DeveloperTool {
             ),
             Kind::Command => (
                 "run_command",
-                "在当前身份获准的执行环境中运行程序和参数，cwd 为工作区相对目录，返回退出码/输出/截断。需要 shell 时显式运行 sh -c 或 powershell -Command。管理员使用宿主环境；普通成员仅在宿主提供的独立项目隔离环境运行。取消会终止命令进程组。",
+                "在当前身份获准的执行环境中运行程序和参数，cwd 为工作区相对目录，返回退出码/输出/截断。需要 shell 时显式运行 sh -c 或 powershell -Command。管理员使用宿主环境；普通成员仅在宿主提供的独立项目隔离环境运行。取消会终止命令进程组。命令先经命令策略判断：停机、格式化、删除系统目录等被禁止；改写远端历史、丢弃修改、递归删除等需要主人或管理员在对话里明确同意后，再带 owner_confirmed: true 调用。",
                 object(
-                    json!({"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"maximum":600000}}),
+                    json!({"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"maximum":600000},"owner_confirmed":{"type":"boolean","description":"仅当主人或管理员已在对话里明确同意这条需确认的命令时为 true"}}),
                     &["program"],
                 ),
             ),

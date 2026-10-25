@@ -46,6 +46,14 @@ pub(crate) fn install_with_member_runtime(
     if let Some(runtime) = member_runtime {
         backend = backend.with_member_runtime(runtime);
     }
+    // 命令策略：内置规则始终生效，配置的规则文件追加在后；规则或例子有误时拒绝启动。
+    let mut policy = eve_command_policy::PrefixRulePolicy::builtin();
+    if let Some(path) = &config.command_policy {
+        let text = std::fs::read_to_string(path).map_err(|_| "命令策略规则文件无法读取")?;
+        let extra = eve_command_policy::PrefixRulePolicy::from_json(&text)?;
+        policy = policy.merged(extra);
+    }
+    backend = backend.with_command_policy(Arc::new(policy));
     let backend = Arc::new(backend);
     bootstrap.host_config.max_tool_rounds = config.max_tool_rounds;
     // 期限只在显式启用开发工具时扩大，普通对话和旧配置保持原值。
