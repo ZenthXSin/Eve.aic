@@ -142,6 +142,9 @@ class Service:
                    '--stop-timeout', '110', '--', sys.executable, self.data['supervisor_script'],
                    '--directory', self.data['control_directory'], '--candidates', str(candidates),
                    '--stop-timeout', '90', '--ready-timeout', '60', '--drain-timeout', '600', '--', *active['command']]
+        if self.data.get('auto_update_config'):
+            separator = command.index('--', command.index(self.data['supervisor_script']))
+            command[separator:separator] = ['--auto-update-config', self.data['auto_update_config']]
         log_path = self.directory / ('eve-' + stamp + '.log')
         with log_path.open('ab') as log:
             process = subprocess.Popen(command, cwd=config['workspace'], env=env, stdin=subprocess.DEVNULL,
