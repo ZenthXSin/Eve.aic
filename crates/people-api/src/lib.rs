@@ -48,6 +48,8 @@ pub const MAX_IMPRESSION_DRAFTS: usize = 3;
 pub const MAX_IMPRESSION_CHARS: usize = 60;
 
 /// 这个人自己说过的事；`quote` 是其原话中的原样摘录，用作来源。
+/// `reaffirmed` 是此后又在原话里说到同一件事的次数，`reaffirmed_at_ms` 是最近一次；
+/// 次数越多越说明这件事稳定、常被提起，选入上下文与容量满时都优先保留。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Impression {
@@ -55,9 +57,24 @@ pub struct Impression {
     pub text: String,
     pub quote: String,
     pub updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reaffirmed: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reaffirmed_at_ms: Option<u64>,
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+impl Impression {
+    /// 最近一次被学到或再次说到的时间。
+    pub fn last_active_ms(&self) -> u64 {
+        self.reaffirmed_at_ms
+            .map_or(self.updated_at_ms, |at| at.max(self.updated_at_ms))
+    }
 }
 
-/// 学习器候选；`replaces` 指向因本批原话而过时的旧印象。
+/// 学习器候选；`replaces` 指向因本批原话而过时的旧印象，`reaffirms` 指向本批原话
+/// 又说到、内容没有变化的已有印象（只计次，不改原印象）。两者至多填一个。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImpressionDraft {
@@ -65,6 +82,8 @@ pub struct ImpressionDraft {
     pub quote: String,
     #[serde(default)]
     pub replaces: Option<String>,
+    #[serde(default)]
+    pub reaffirms: Option<String>,
 }
 
 /// 一批待学习的原话及此人现有印象。取出即从缓冲移除，失败或中断不重试。
@@ -91,6 +110,8 @@ pub struct LinkedImpression {
     pub text: String,
     pub quote: String,
     pub updated_at_ms: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub reaffirmed: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scene: Option<Scene>,
 }
@@ -111,7 +132,7 @@ pub trait PersonLinks: Send + Sync {
 
 /// 本会话与授权他处的印象合计达到这个条数，才值得整理成画像。
 pub const PROFILE_MIN_ITEMS: usize = 6;
-/// 交给整理器的印象至多条数，取最新的。
+/// 交给整理器的印象至多条数。
 pub const MAX_PROFILE_SOURCES: usize = 24;
 /// 画像至多条数；每条正文同样受 `MAX_IMPRESSION_CHARS` 限制。
 pub const MAX_PROFILE_FACTS: usize = 6;
@@ -253,7 +274,8 @@ pub trait PeopleDirectory: Send + Sync {
         Ok(false)
     }
     /// 只读：当前发言者在其他会话中、经 `links` 授权的印象。去掉与本会话印象相同的，
-    /// 按更新时间从新到旧至多 `MAX_LINKED_IMPRESSIONS` 条。不实现时为空。
+    /// 先按再次说到的次数、再按最近活动时间选出至多 `MAX_LINKED_IMPRESSIONS` 条，
+    /// 结果按更新时间从新到旧排列。不实现时为空。
     fn linked_impressions(
         &self,
         _participant: &str,
@@ -261,8 +283,9 @@ pub trait PeopleDirectory: Send + Sync {
     ) -> PluginResult<LinkedImpressions> {
         Ok(LinkedImpressions::default())
     }
-    /// 当前发言者的画像整理依据：本会话印象加经 `links` 授权的他处印象，取最新的至多
-    /// `MAX_PROFILE_SOURCES` 条；不足 `PROFILE_MIN_ITEMS` 条时为空。不实现时为空。
+    /// 当前发言者的画像整理依据：本会话印象加经 `links` 授权的他处印象，先按再次说到的
+    /// 次数、再按最近活动时间选出至多 `MAX_PROFILE_SOURCES` 条，按更新时间从新到旧排列；
+    /// 不足 `PROFILE_MIN_ITEMS` 条时为空。不实现时为空。
     fn profile_request(
         &self,
         _participant: &str,
