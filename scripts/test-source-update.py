@@ -141,6 +141,37 @@ print('fixture check passed')
         self.assertIsNone(self.updater.pending)
         self.assertEqual(self.fixture.events.read_text().splitlines(), ['old'])
 
+    def test_reenable_checks_immediately_instead_of_waiting_for_previous_interval(self):
+        self.supervisor_start()
+        self.ticks(lambda: self.updater.pending is not None)
+        runtime.atomic(self.config, dict(self.settings, enabled=False))
+        self.ticks(lambda: self.updater.status.get('phase') == 'disabled')
+        self.updater.next_check = time.monotonic() + 3600
+        runtime.atomic(self.config, dict(self.settings, enabled=True))
+        self.ticks(lambda: self.updater.status.get('result') == 'applied')
+        self.assertTrue(self.updater.status['enabled'])
+        self.assertEqual(self.fixture.events.read_text().splitlines(), ['old', 'new'])
+
+    def test_reenable_discards_cancelled_build_result_and_restarts_verification(self):
+        self.supervisor_start()
+        factory = self.updater.builder_factory
+        started = threading.Event()
+        class CancelledBuild:
+            def __init__(self, settings, candidates, stopped, publish): self.stopped = stopped
+            def prepare(self, *args):
+                started.set()
+                self.stopped.wait(5)
+                raise ValueError('auto_update_cancelled')
+        self.updater.builder_factory = CancelledBuild
+        self.ticks(started.is_set)
+        runtime.atomic(self.config, dict(self.settings, enabled=False))
+        self.ticks(lambda: self.updater.status.get('phase') == 'disabled')
+        self.updater.builder_factory = factory
+        runtime.atomic(self.config, dict(self.settings, enabled=True))
+        self.ticks(lambda: self.updater.status.get('result') == 'applied')
+        self.assertIsNone(self.updater.status.get('failed_head'))
+        self.assertEqual(self.fixture.events.read_text().splitlines(), ['old', 'new'])
+
     def test_no_backup_space_keeps_old_process_online_before_any_switch_request(self):
         self.supervisor_start()
         self.ticks(lambda: self.updater.pending is not None)
