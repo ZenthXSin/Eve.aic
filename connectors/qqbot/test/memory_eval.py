@@ -217,7 +217,7 @@ class RealModelEvaluation(people_test.PeopleAcceptance):
         return {e["id"]: e.get("text", "") for e in events if e.get("direction") == "out" and e.get("type") == "reply"}
 
     def test_real_model_uses_cross_session_memory_and_reports_cache_hits(self):
-        group_talk = ["我最近在学Rust，周末想写个小工具", "我养了一只橘猫", "今天好累啊我", "我下周要去成都出差"]
+        group_talk = ["我最近在学Rust，周末想写个小工具", "我养了一只橘猫", "今天突然想吃火锅", "我下周要去成都出差"]
         steady = ["今天天气怎么样", "你平时喜欢干嘛", "推荐个电影吧", "有点无聊", "说个冷笑话", "好吧那我去忙了"]
 
         def say(mid, text, user="user-1", target="group-1"):
@@ -253,6 +253,8 @@ class RealModelEvaluation(people_test.PeopleAcceptance):
             "model": REAL_MODEL,
             "commitment_tool_used": any("地图" in c["text"] for c in commitments),
             "impression_learned": "Rust" in people or "rust" in people.lower(),
+            # 只说过一次“今天突然想吃火锅”，不应被整理成长期喜好。
+            "one_off_not_generalized": not any(w in people for w in ("喜欢火锅", "爱吃火锅", "喜欢吃火锅")),
             "recalls_learning_in_other_group": "rust" in replies.get("recall", "").lower(),
             "recalls_promise_in_other_group": "地图" in replies.get("promised", ""),
             "no_leak_to_other_person": "rust" not in replies.get("other", "").lower(),
