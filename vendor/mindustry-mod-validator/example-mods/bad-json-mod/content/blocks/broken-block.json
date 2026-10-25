@@ -1,0 +1,6 @@
+{
+  "type": "NonExistentBlockType",
+  "name": "broken-block",
+  "health": -100,
+  "size": 999
+}

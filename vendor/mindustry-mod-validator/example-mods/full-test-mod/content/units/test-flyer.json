@@ -1,0 +1,9 @@
+{
+  "type": "flying",
+  "name": "test-flyer",
+  "health": 300,
+  "speed": 2.5,
+  "flying": true,
+  "hitSize": 6,
+  "weapons": []
+}

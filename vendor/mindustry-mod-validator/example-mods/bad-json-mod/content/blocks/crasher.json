@@ -1,0 +1,10 @@
+{
+  "type": "GenericCrafter",
+  "name": "crasher",
+  "health": 100,
+  "size": 1,
+  "consume": {
+    "power": -1
+  },
+  "outputItems": ["copper"]
+}

@@ -1,0 +1,17 @@
+{
+  "type": "Drill",
+  "name": "test-drill",
+  "health": 200,
+  "size": 2,
+  "tier": 2,
+  "drillTime": 300,
+  "rotateSpeed": 2.0,
+  "liquidBoostIntensity": 1.0,
+  "consume": {
+    "liquid": {
+      "liquid": "water",
+      "amount": 0.05,
+      "booster": true
+    }
+  }
+}
