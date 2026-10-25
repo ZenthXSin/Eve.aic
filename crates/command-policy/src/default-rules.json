@@ -1,0 +1,100 @@
+{
+  "rules": [
+    {
+      "pattern": [["shutdown", "reboot", "poweroff", "halt"]],
+      "decision": "forbidden",
+      "justification": "会让 Eve 所在的机器停机或重启；需要时请主人自己操作",
+      "match": [["shutdown", "-h", "now"], "reboot"],
+      "not_match": ["shutdownd"]
+    },
+    {
+      "pattern": [["mkfs", "mkfs.ext4", "mkfs.xfs", "mkfs.vfat", "fdisk", "parted", "wipefs"]],
+      "decision": "forbidden",
+      "justification": "会格式化或改写磁盘分区，无法恢复",
+      "match": [["mkfs.ext4", "/dev/sdb1"], "fdisk -l"]
+    },
+    {
+      "pattern": ["rm", ["-rf", "-fr", "-r", "-R", "--recursive"], ["/", "/*", "~", "~/", "$HOME", "/home", "/root", "/etc", "/usr", "/var"]],
+      "decision": "forbidden",
+      "justification": "递归删除系统或家目录；只删除工作区里明确的文件或目录",
+      "match": ["rm -rf /", "rm -r ~", ["rm", "-fr", "/etc"]],
+      "not_match": ["rm -rf build", "rm -rf ./target"]
+    },
+    {
+      "pattern": ["chmod", ["-R", "--recursive"], ["777", "a+rwx", "o+w"]],
+      "decision": "prompt",
+      "justification": "递归放开所有人的读写权限",
+      "match": ["chmod -R 777 data"],
+      "not_match": ["chmod -R 755 data"]
+    },
+    {
+      "pattern": ["rm", ["-rf", "-fr", "-r", "-R", "--recursive"]],
+      "decision": "prompt",
+      "justification": "递归删除，确认目标后再执行",
+      "match": ["rm -rf build", "rm -r old-dir"],
+      "not_match": ["rm file.txt", "rmdir empty"]
+    },
+    {
+      "pattern": ["git", "push", ["--force", "-f", "--force-with-lease", "--mirror", "--delete", "-d"]],
+      "decision": "prompt",
+      "justification": "会改写或删除远端历史",
+      "match": ["git push --force", "git push -f", "git push --delete origin old"],
+      "not_match": ["git push origin main", "git push -u origin codex/x"]
+    },
+    {
+      "pattern": ["git", "reset", "--hard"],
+      "decision": "prompt",
+      "justification": "会丢弃未提交的修改",
+      "match": ["git reset --hard", "git reset --hard origin/main"],
+      "not_match": ["git reset --soft HEAD~1", "git reset file.txt"]
+    },
+    {
+      "pattern": ["git", "clean", ["-f", "-fd", "-df", "-fdx", "-fxd", "-xdf", "-dfx", "-ffdx"]],
+      "decision": "prompt",
+      "justification": "会删除未跟踪的文件",
+      "match": ["git clean -fdx", "git clean -f"],
+      "not_match": ["git clean -n"]
+    },
+    {
+      "pattern": ["git", ["checkout", "restore"], ["--", "."]],
+      "decision": "prompt",
+      "justification": "会丢弃工作区里全部未提交的修改",
+      "match": ["git checkout -- .", "git restore ."],
+      "not_match": ["git checkout main", "git restore src/lib.rs"]
+    },
+    {
+      "pattern": ["git", "branch", ["-D", "--delete"]],
+      "decision": "prompt",
+      "justification": "会删除分支，可能丢失未推送的提交",
+      "match": ["git branch -D old"],
+      "not_match": ["git branch -a"]
+    },
+    {
+      "pattern": [["dd"]],
+      "decision": "prompt",
+      "justification": "直接读写块设备或大文件，参数写错会覆盖数据",
+      "match": ["dd if=a of=b"]
+    },
+    {
+      "pattern": ["kill", "-9", ["1", "-1"]],
+      "decision": "forbidden",
+      "justification": "会结束系统初始进程或全部进程",
+      "match": ["kill -9 1", "kill -9 -1"],
+      "not_match": ["kill -9 4321"]
+    },
+    {
+      "pattern": ["systemctl", ["stop", "disable", "mask", "kill"]],
+      "decision": "prompt",
+      "justification": "会停止或禁用系统服务，可能包括 Eve 自己",
+      "match": ["systemctl stop eve", "systemctl disable nginx"],
+      "not_match": ["systemctl status eve"]
+    },
+    {
+      "pattern": [["crontab"], "-r"],
+      "decision": "prompt",
+      "justification": "会删除全部定时任务",
+      "match": ["crontab -r"],
+      "not_match": ["crontab -l"]
+    }
+  ]
+}
