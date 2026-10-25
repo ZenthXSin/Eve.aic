@@ -1668,10 +1668,24 @@ async fn sql_qq_and_console_preserve_history_training_and_receipts_without_repla
         document(&saved, "eve.training", "modes.v1")["modes"][0]["enabled"],
         false
     );
-    let expressions = document(&saved, "eve.training", "expression.v1");
-    let learned = expressions["rows"].as_array().unwrap();
-    assert_eq!(learned.len(), 2);
-    assert_eq!(learned.iter().filter(|r| r["active"] == true).count(), 1);
+    // QQ 运行版的表达统计在状态目录的独立 SQLite 中，不进入 PostgreSQL 插件状态。
+    assert!(
+        !saved
+            .iter()
+            .any(|(n, k, _)| n == b"eve.training" && k == b"expression.v1")
+    );
+    let (learned, active): (i64, i64) = rusqlite::Connection::open_with_flags(
+        root.path().join("state/training-expressions.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row(
+        "SELECT count(*), coalesce(sum(active),0) FROM expressions",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap();
+    assert_eq!((learned, active), (2, 1));
     assert_eq!(
         document(&saved, "eve.session", "sessions.v1")["sessions"]
             .as_object()
