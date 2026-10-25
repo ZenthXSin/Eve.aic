@@ -131,5 +131,6 @@ tokio = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
 postgres = "0.19.14"
+rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["net", "io-util"] }
