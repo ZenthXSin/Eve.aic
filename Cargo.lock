@@ -371,6 +371,7 @@ dependencies = [
  "eve-toolforge-plugin",
  "eve-training-api",
  "eve-training-plugin",
+ "eve-training-sqlite",
  "eve-trigger-api",
  "eve-trigger-plugin",
  "eve-web-panel",
@@ -1384,6 +1385,22 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "eve-training-sqlite"
+version = "0.1.0"
+dependencies = [
+ "eve-kernel",
+ "eve-llm-api",
+ "eve-plugin-api",
+ "eve-training-api",
+ "eve-training-plugin",
+ "ring",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

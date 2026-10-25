@@ -86,6 +86,7 @@ members = [
     "crates/qqbot-plugin",
     "crates/training-api",
     "crates/training-plugin",
+    "crates/training-sqlite",
     "crates/memory-api",
     "crates/memory-plugin",
     "crates/segment-api",
