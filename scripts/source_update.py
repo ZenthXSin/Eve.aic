@@ -231,6 +231,12 @@ class SourceUpdater:
                     self.thread.join(); self.thread = None; self.results.get_nowait()
                 if self.status.get('phase') != 'disabled': self.publish(phase='disabled', enabled=False)
                 return
+            if self.status.get('enabled') is False:
+                if self.thread:
+                    if self.thread.is_alive(): return
+                    self.thread.join(); self.thread = None; self.results.get_nowait()
+                self.next_check = 0
+                self.publish(phase='idle', enabled=True)
             if self.pending:
                 if self.pending['configuration'] != signature:
                     self.pending = None; self.next_check = 0; self.publish(phase='idle', result='configuration_changed'); return
