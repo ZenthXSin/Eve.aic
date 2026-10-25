@@ -145,7 +145,7 @@ def receipt_fingerprint(receipt):
                                      separators=(',', ':')).encode()).hexdigest()
 
 def validate_receipt_archive(state_path, receipts):
-    if receipts['version'] != 6:
+    if receipts['version'] != 6 and not (receipts['version'] == 7 and 'archive' in receipts):
         if 'archive' in receipts:
             raise ValueError('unexpected_receipt_archive_binding')
         return
@@ -176,7 +176,7 @@ def inherited_receipts(state_path):
     if raw is None:
         return frozenset()
     receipts = json.loads(bytes(raw), object_pairs_hook=unique_object)
-    if receipts['version'] not in (1, 2, 3, 4, 5, 6):
+    if receipts['version'] not in (1, 2, 3, 4, 5, 6, 7):
         raise ValueError('unknown_ledger_version')
     validate_receipt_archive(state_path, receipts)
     validate_merged_receipts(receipts)
@@ -191,8 +191,8 @@ def sticker_in_flight(receipt):
     return isinstance(sticker, dict) and sticker.get('state') in ('Pending', 'Sending') \
         and receipt['state'] == 'Sent'
 
-def delivery_gate(state_path, request, inherited=frozenset()):
-    """确切申请轮次已完成送达且本次运行空闲；不将历史未知回执当成当前任务。"""
+def delivery_documents(state_path, inherited=frozenset()):
+    """共用的回执格式、归档、分段及进展校验；不修改任何状态。"""
     state = read_json(state_path, MAX_STATE_JSON)
     if state['version'] != 1:
         raise ValueError('unknown_state_version')
@@ -201,24 +201,25 @@ def delivery_gate(state_path, request, inherited=frozenset()):
         return json.loads(bytes(entries[owner][key]), object_pairs_hook=unique_object)
     sessions = document('eve.session', 'sessions.v1')
     receipts = document('eve.channel.qqbot', 'receipts.v1')
-    if sessions['format_version'] != 1 or receipts['version'] not in (1, 2, 3, 4, 5, 6):
+    if sessions['format_version'] != 1 or receipts['version'] not in (1, 2, 3, 4, 5, 6, 7):
         raise ValueError('unknown_ledger_version')
     validate_receipt_archive(state_path, receipts)
     validate_merged_receipts(receipts)
+    settled = True
     for receipt in receipts['entries']:
         progress = receipt.get('progress', [])
         if not isinstance(progress, list) or len(progress) > 3:
             raise ValueError('invalid_progress_ledger')
-        if progress and receipts['version'] not in (3, 4, 5, 6):
+        if progress and receipts['version'] not in (3, 4, 5, 6, 7):
             raise ValueError('invalid_progress_ledger')
         sticker = receipt.get('sticker')
-        if sticker is not None and (receipts['version'] not in (5, 6) or not isinstance(sticker, dict)
+        if sticker is not None and (receipts['version'] not in (5, 6, 7) or not isinstance(sticker, dict)
                                     or set(sticker) != {'path', 'state'}
                                     or not isinstance(sticker['path'], str) or not sticker['path']
                                     or sticker['state'] not in ('Pending', 'Sending', 'Sent', 'Failed', 'Skipped')):
             raise ValueError('invalid_sticker_ledger')
         if sticker_in_flight(receipt) and receipt_fingerprint(receipt) not in inherited:
-            return False
+            settled = False
         for part in progress:
             if (not isinstance(part, dict) or set(part) != {'text', 'state'}
                     or not isinstance(part['text'], str) or not part['text'].strip()
@@ -226,7 +227,53 @@ def delivery_gate(state_path, request, inherited=frozenset()):
                     or part['state'] not in ('Sending', 'Sent', 'Failed')):
                 raise ValueError('invalid_progress_ledger')
             if part['state'] == 'Sending' and receipt_fingerprint(receipt) not in inherited:
+                settled = False
+    return sessions, receipts, settled
+
+def runtime_idle_gate(state_path, inherited=frozenset()):
+    """宿主自动更新只在当前运行的对话、任务、唤醒和文件投递全部空闲时切换。"""
+    sessions, receipts, settled = delivery_documents(state_path, inherited)
+    if not settled or any(t['status']['state'] == 'Pending'
+            for session in sessions['sessions'].values() for t in session['turns']):
+        return False
+    if any(receipt_fingerprint(r) not in inherited and r['state'] in ('Processing', 'ReplyPending')
+            for r in receipts['entries']):
+        return False
+    state = read_json(state_path, MAX_STATE_JSON)
+    for owner, key, field, busy in [
+        ('eve.task', 'tasks.v1', 'tasks', ('Queued', 'Running')),
+        ('eve.trigger', 'triggers.v1', 'triggers', ('Ready', 'Running', 'Firing', 'Executing')),
+        ('eve.reminder', 'reminders.v1', 'reminders', ('Delivering',)),
+        ('eve.outreach', 'outreach.v1', 'invitations', ('Composing', 'Delivering')),
+    ]:
+        raw = state['entries'].get(owner, {}).get(key)
+        if raw:
+            ledger = json.loads(bytes(raw), object_pairs_hook=unique_object)
+            if any(isinstance(row['status'], str) and row['status'] in busy
+                   or row.get('delivery') == 'Sending'
+                   or (row.get('notice') or {}).get('status') == 'Delivering'
+                   for row in ledger[field]):
                 return False
+    group = state_path.parent / 'group-observations.sqlite3'
+    if group.exists():
+        import sqlite3
+        with contextlib.closing(sqlite3.connect(group.as_uri() + '?mode=ro', uri=True, timeout=1)) as db:
+            if db.execute("SELECT 1 FROM outbound WHERE status IN ('queued','sending') LIMIT 1").fetchone():
+                return False
+    files = state_path.parent / 'qq-outbox' / 'ledger.json'
+    if files.exists():
+        ledger = read_json(files)
+        if ledger['format_version'] != 1:
+            raise ValueError('unknown_file_ledger_version')
+        if any(row['state'] in ('Pending', 'Sending') for row in ledger['records']):
+            return False
+    return True
+
+def delivery_gate(state_path, request, inherited=frozenset()):
+    """确切申请轮次已完成送达且本次运行空闲；不将历史未知回执当成当前任务。"""
+    sessions, receipts, settled = delivery_documents(state_path, inherited)
+    if not settled:
+        return False
     session = sessions['sessions'].get(request['session_id'])
     if not session or session['key']['user_id'] != request['requested_by']:
         raise ValueError('request_scope_mismatch')
@@ -250,7 +297,7 @@ def delivery_gate(state_path, request, inherited=frozenset()):
         scope = 'qq:' + hashlib.sha256(identity).hexdigest()
         merged_text = '\n'.join([r['message']['text'] for r in receipts['entries']
             if r.get('merged_into') == msg.get('id') and r['app_id'] == receipt['app_id']]
-            + [msg['text']]) if receipts['version'] in (4, 5, 6) else msg['text']
+            + [msg['text']]) if receipts['version'] in (4, 5, 6, 7) else msg['text']
         if receipt['state'] != 'Merged' and scope == request['session_id'] and merged_text == turn['input']:
             matching = receipt
         if receipt['state'] in ('Processing', 'ReplyPending'):
@@ -260,7 +307,7 @@ def delivery_gate(state_path, request, inherited=frozenset()):
 
 def validate_merged_receipts(receipts):
     """格式 4 起的合并关系只关联同身份、顺序在后的非合并目标；不得隐藏未决投递。"""
-    if receipts['version'] not in (4, 5, 6):
+    if receipts['version'] not in (4, 5, 6, 7):
         return
     lookup = {}
     for index, entry in enumerate(receipts['entries']):
@@ -278,7 +325,7 @@ def validate_merged_receipts(receipts):
         if not isinstance(into, str):
             raise ValueError('invalid_merged_receipt')
         target = lookup.get((entry['app_id'], into))
-        if (not target or target[0] <= index or target[1]['state'] == 'Merged'
+        if (not target or (receipts['version'] != 7 and target[0] <= index) or target[0] == index or target[1]['state'] == 'Merged'
                 or any(entry['message'][key] != target[1]['message'][key]
                        for key in ('scope', 'target_id', 'user_id'))
                 or entry.get('reply') is not None or entry.get('segments') is not None
@@ -397,7 +444,7 @@ class Supervisor:
         self.status_lock = threading.RLock()
         self.status = dict(format_version=VERSION, pid=os.getpid(), heartbeat_ms=0, phase='starting',
                            active_sha256=digest(Path(self.command[0])), candidate_sha256=None, result=None, error=None)
-        for name in ['request.json', 'processing.json']:
+        for name in ['request.json', 'processing.json', 'auto-request.json']:
             if (self.root / name).exists():
                 self.archive_request(self.root / name, 'interrupted_no_replay')
                 self.status['result'] = 'interrupted_no_replay'
@@ -433,6 +480,11 @@ class Supervisor:
                 self.publish()
                 self.finished.wait(1)
         self.heart = threading.Thread(target=heartbeat, daemon=True)
+        self.updater = None
+        if getattr(options, 'auto_update_config', None):
+            from source_update import SourceUpdater
+            self.updater = SourceUpdater(options.auto_update_config, self.root, options.candidates)
+
 
     def publish(self, **changes):
         with self.status_lock:
@@ -487,15 +539,16 @@ class Supervisor:
         validate_candidate(request, self.options.candidates)
         return result, manifest
 
-    def switch(self, request, command, manifest):
+    def switch(self, request, command, manifest, request_path=None):
         if self.stopping: raise ValueError('shutdown_requested')
         # 再次核对磁盘上的请求、资源与执行文件，不能切换一份预检之后发生变化的候选。
-        if read_json(self.root / 'request.json') != request or manifest['candidate_sha256'] != request['candidate_sha256']:
+        request_path = request_path or self.root / 'request.json'
+        if read_json(request_path) != request or manifest['candidate_sha256'] != request['candidate_sha256']:
             raise ValueError('request_changed')
         validate_candidate(request, self.options.candidates)
         self.validate_descriptor(self.active_descriptor)
         atomic(self.root / 'previous-command.json', self.active_descriptor)
-        pending = self.root / 'request.json'
+        pending = request_path
         processing = self.root / 'processing.json'
         pending.rename(processing)
         self.publish(phase='switching', candidate_sha256=request['candidate_sha256'], result=None, error=None)
@@ -622,6 +675,8 @@ class Supervisor:
                     prepared = waiting_since = quiet_since = state_stamp = None
                     gate = False
                     continue
+                if self.updater and not (self.root / 'request.json').exists() and prepared is None:
+                    self.updater.tick(self)
                 pending = self.root / 'request.json'
                 if pending.exists():
                     try:
@@ -673,6 +728,8 @@ class Supervisor:
             raise
         finally:
             self.finished.set()
+            if self.updater:
+                self.updater.stop()
             if self.child and self.child.process.poll() is None:
                 with contextlib.suppress(subprocess.TimeoutExpired): self.child.stop(self.options.stop_timeout)
                 if self.child.process.poll() is None:
@@ -687,6 +744,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--directory', type=Path, required=True)
     parser.add_argument('--candidates', type=Path, required=True)
+    parser.add_argument('--auto-update-config', type=Path)
     parser.add_argument('--ready-timeout', type=float, default=60)
     parser.add_argument('--stop-timeout', type=float, default=90)
     parser.add_argument('--drain-timeout', type=float, default=300)

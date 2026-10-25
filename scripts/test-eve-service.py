@@ -102,6 +102,17 @@ print('EVE_QQBOT_READY',file=sys.stderr,flush=True)''')
         self.assertEqual(len(list((self.guard_dir / 'history').glob('*previous-boot.json'))), 1)
         self.assertTrue(Path(f'/proc/{os.getpid()}').exists())
 
+    def test_source_updater_configuration_survives_service_start(self):
+        config = self.private / 'auto-update.json'
+        self.runtime.atomic(config, {'version': 1, 'enabled': False,
+                                    'data_directory': str(self.root / 'source-updates')})
+        self.service.data['auto_update_config'] = str(config)
+        self.runtime.atomic(self.record, self.service.data)
+        self.assertTrue(self.service.start()['qq_connected'])
+        status = self.runtime.read_json(self.fixture.queue / 'auto-update.json')
+        self.assertFalse(status['enabled'])
+        self.assertEqual(self.runtime.read_json(self.record)['auto_update_config'], str(config))
+
     def test_blocked_recovery_and_corrupt_settings_are_preserved(self):
         self.runtime.atomic(self.guard_dir / 'guard.json', {
             'phase': 'blocked', 'identity': ['previous-boot', '1']})
