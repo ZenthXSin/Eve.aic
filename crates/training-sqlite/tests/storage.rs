@@ -138,7 +138,7 @@ async fn full_legacy_json_is_preserved_while_new_samples_keep_learning() {
     let mut legacy: Vec<_> = (0..2709).map(|n| row(n, "one")).collect();
     // Long valid scope IDs reproduce the production 1 MiB byte limit.
     for r in &mut legacy {
-        r.scope.session_id = "g".repeat(140);
+        r.scope.session_id = "g".repeat(105);
     }
     let bytes = serde_json::to_vec(&serde_json::json!({"version":1,"rows":legacy})).unwrap();
     assert!(bytes.len() > 1_000_000 && bytes.len() < 1_048_576);
