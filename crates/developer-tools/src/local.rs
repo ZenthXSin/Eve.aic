@@ -286,6 +286,8 @@ impl LocalDeveloper {
             DeveloperOperation::Search(a) => !sensitive_path(&a.path),
             DeveloperOperation::Write(a) => !sensitive_path(&a.path),
             DeveloperOperation::Edit(a) => !sensitive_path(&a.path),
+            DeveloperOperation::Patch(a) => eve_apply_patch::paths(&a.patch)
+                .is_some_and(|paths| paths.iter().all(|p| !sensitive_path(p))),
             DeveloperOperation::Github(a) => {
                 a.method == "GET"
                     || (a.method == "POST"
@@ -402,6 +404,194 @@ impl LocalDeveloper {
                 .map_err(|_| failed("文件原子替换失败，保留待核对状态"))?;
         }
         Ok(())
+    }
+    /// 多文件补丁：先在内存里算出每个文件的新内容并核对路径，全部成功才开始提交；
+    /// 提交时先写（新建与修改），再删除（删除与移动的原文件）。中途失败时按记录恢复已经改动的文件。
+    fn patch(
+        &self,
+        text: &str,
+        context: &ToolExecutionContext,
+    ) -> Result<Value, ToolExecutionError> {
+        enum Step {
+            Write {
+                path: PathBuf,
+                rel: String,
+                content: Vec<u8>,
+                before: Option<Vec<u8>>,
+                action: &'static str,
+            },
+            Delete {
+                path: PathBuf,
+                rel: String,
+                before: Vec<u8>,
+            },
+        }
+        let hunks = eve_apply_patch::parse(text).map_err(failed)?;
+        if hunks.len() > 64 {
+            return Err(failed("一个补丁至多操作 64 个文件"));
+        }
+        let read_text = |path: &Path| -> Result<(Vec<u8>, String), ToolExecutionError> {
+            let metadata = fs::metadata(path).map_err(|_| failed("文件不可读取"))?;
+            if !metadata.is_file() {
+                return Err(failed("补丁只操作普通文件，不打开目录、设备或管道"));
+            }
+            if metadata.len() > MAX_FILE as u64 {
+                return Err(failed("文件超过 8 MiB；请用命令处理"));
+            }
+            let bytes = fs::read(path).map_err(|_| failed("文件不可读取"))?;
+            let text =
+                String::from_utf8(bytes.clone()).map_err(|_| failed("文件不是 UTF-8 文本"))?;
+            Ok((bytes, text))
+        };
+        let absent = |path: &Path, rel: &str| -> Result<(), ToolExecutionError> {
+            match fs::symlink_metadata(path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(failed(format!(
+                    "{rel} 已存在；修改已有文件请用 *** Update File"
+                ))),
+            }
+        };
+        let mut steps = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for hunk in hunks {
+            let mut claim = |rel: &str| {
+                if seen.insert(rel.to_string()) {
+                    Ok(())
+                } else {
+                    Err(failed(format!("同一个补丁里 {rel} 出现了不止一次")))
+                }
+            };
+            match hunk {
+                eve_apply_patch::Hunk::Add {
+                    path: rel,
+                    contents,
+                } => {
+                    claim(&rel)?;
+                    let path = self.path(&rel, true)?;
+                    absent(&path, &rel)?;
+                    steps.push(Step::Write {
+                        path,
+                        rel,
+                        content: contents.into_bytes(),
+                        before: None,
+                        action: "add",
+                    });
+                }
+                eve_apply_patch::Hunk::Delete { path: rel } => {
+                    claim(&rel)?;
+                    let path = self.path(&rel, false)?;
+                    let (before, _) = read_text(&path)?;
+                    steps.push(Step::Delete { path, rel, before });
+                }
+                eve_apply_patch::Hunk::Update {
+                    path: rel,
+                    move_to,
+                    chunks,
+                } => {
+                    claim(&rel)?;
+                    let path = self.path(&rel, false)?;
+                    let (before, original) = read_text(&path)?;
+                    let updated = eve_apply_patch::apply_update(&original, &chunks)
+                        .map_err(|e| failed(format!("{rel}：{e}；补丁未应用")))?;
+                    match move_to {
+                        Some(target) => {
+                            claim(&target)?;
+                            let destination = self.path(&target, true)?;
+                            absent(&destination, &target)?;
+                            steps.push(Step::Write {
+                                path: destination,
+                                rel: target,
+                                content: updated.into_bytes(),
+                                before: None,
+                                action: "move",
+                            });
+                            steps.push(Step::Delete { path, rel, before });
+                        }
+                        None => steps.push(Step::Write {
+                            path,
+                            rel,
+                            content: updated.into_bytes(),
+                            before: Some(before),
+                            action: "update",
+                        }),
+                    }
+                }
+            }
+        }
+        if context.is_cancel_requested() {
+            return Err(ToolExecutionError::Cancelled("补丁已取消，未修改".into()));
+        }
+        steps.sort_by_key(|step| matches!(step, Step::Delete { .. }));
+        let mut done: Vec<&Step> = Vec::new();
+        let mut results = Vec::new();
+        let mut failure = None;
+        for step in &steps {
+            let outcome = match step {
+                Step::Write {
+                    path,
+                    rel,
+                    content,
+                    before,
+                    action,
+                } => {
+                    let expected = before.as_deref().map(hash).unwrap_or_default();
+                    self.replace_file(path, &expected, content, context).map(|()| {
+                        json!({"path": rel, "action": action, "sha256": hash(content), "bytes": content.len()})
+                    })
+                }
+                Step::Delete { path, rel, before } => {
+                    let current = fs::read(path).ok().map(|b| hash(&b));
+                    if current.as_deref() != Some(hash(before).as_str()) {
+                        Err(failed(format!("{rel} 在提交前变化，未删除")))
+                    } else {
+                        fs::remove_file(path)
+                            .map(|()| json!({"path": rel, "action": "delete"}))
+                            .map_err(|_| failed(format!("{rel} 无法删除")))
+                    }
+                }
+            };
+            match outcome {
+                Ok(result) => {
+                    results.push(result);
+                    done.push(step);
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        let Some(error) = failure else {
+            return Ok(json!({"success": true, "files": results}));
+        };
+        // 按相反顺序恢复已经提交的改动；恢复本身失败时如实列出，便于人工核对。
+        let mut unrestored = Vec::new();
+        for step in done.into_iter().rev() {
+            let restored = match step {
+                Step::Write {
+                    path, before: None, ..
+                } => fs::remove_file(path).is_ok(),
+                Step::Write {
+                    path,
+                    before: Some(before),
+                    ..
+                } => fs::write(path, before).is_ok(),
+                Step::Delete { path, before, .. } => fs::write(path, before).is_ok(),
+            };
+            if !restored {
+                unrestored.push(match step {
+                    Step::Write { rel, .. } | Step::Delete { rel, .. } => rel.clone(),
+                });
+            }
+        }
+        if unrestored.is_empty() {
+            Err(error)
+        } else {
+            Err(failed(format!(
+                "补丁提交中途失败（{error:?}），以下文件未能恢复，需要人工核对：{}",
+                unrestored.join("、")
+            )))
+        }
     }
     /// 在工作区目录中按字面文本搜索 UTF-8 文件，按目录广度优先、名称排序输出；不跟随符号链接。
     fn search(&self, a: SearchArguments, sensitive: bool) -> Result<Value, ToolExecutionError> {
@@ -574,6 +764,7 @@ impl LocalDeveloper {
                     json!({"success":true,"path":a.path,"sha256":hash(updated.as_bytes()),"bytes":updated.len()}),
                 )
             }
+            DeveloperOperation::Patch(a) => self.patch(&a.patch, context),
             DeveloperOperation::Search(a) => {
                 self.search(a, self.isolated || self.authorize(context).is_ok())
             }
@@ -1045,6 +1236,7 @@ impl DeveloperBackend for LocalDeveloper {
                 DeveloperOperation::Read(_) => "read",
                 DeveloperOperation::Write(_) => "write",
                 DeveloperOperation::Edit(_) => "edit",
+                DeveloperOperation::Patch(_) => "patch",
                 DeveloperOperation::Search(_) => "search",
                 DeveloperOperation::Command(_) => "command",
                 DeveloperOperation::Github(_) => "github",
