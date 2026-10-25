@@ -77,6 +77,23 @@ class GroupRelationAcceptance(group_chat_test.GroupChatAcceptance):
         return reminder_test.base().run_eve(self,script,interest=True,research=False,practice=False,
             more=['--group-chat','--training','--message-judge','jev','--autonomy-budget','100'],env_extra=env,panel=True,timeout=45,**options)
 
+    def test_disabled_group_keeps_raw_history_without_jev_or_proactive_model(self):
+        def settled():
+            self.wait_for(lambda:len(self.rows('observations')) >= 3,'关闭后未保存群原话',10)
+            self.assertFalse(self.run_release.wait(3.2))
+        self.run_eve([self.observation('off-ambient','这个思路，Eve你怎么看'),
+                      self.observation('off-at','帮我看看',mentioned=True),
+                      self.observation('off-prefix','EVE 在不在'),
+                      *self.send(self.message('off-prefix','EVE 在不在',expected='这个思路可以试试',scope='group')),
+                      *self.checkpoint('settled')],
+                     env_extra={'EVE_CHIME_ENABLED':'false'},checkpoints={'settled':settled})
+        self.assertEqual(self.jev_requests,[])
+        self.assertEqual(self.kind('chime'),[])
+        self.assertEqual(self.kind('group_review'),[])
+        self.assertEqual(len(self.kind('chat')),1)
+        self.assertEqual(self.relation_rows('judgments'),[])
+        self.assertEqual(self.pushes(),[])
+
     def classify(self,decoded,latest):
         if isinstance(decoded,dict) and {'input','subsequent'} <= set(decoded): return 'group_review'
         return super().classify(decoded,latest)
