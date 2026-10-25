@@ -58,6 +58,7 @@ pub type KnowledgeFuture<'a, T> = BoxFuture<'a, KnowledgeResult<T>>;
 #[derive(Clone, Eq, PartialEq)]
 pub struct SourcePolicy {
     seeds: Vec<String>,
+    unrestricted_web: bool,
 }
 impl SourcePolicy {
     /// 规范化并校验入口页面；不发起任何网络请求。
@@ -74,12 +75,40 @@ impl SourcePolicy {
             }
             normalized.push(text);
         }
-        Ok(Self { seeds: normalized })
+        Ok(Self {
+            seeds: normalized,
+            unrestricted_web: false,
+        })
+    }
+    /// 任意 HTTP/HTTPS 站点均可读取；本地资料仍沿用显式入口范围。
+    pub fn unrestricted_web() -> Self {
+        Self {
+            seeds: vec![],
+            unrestricted_web: true,
+        }
+    }
+    pub fn with_unrestricted_web(mut self) -> Self {
+        self.unrestricted_web = true;
+        self
+    }
+    pub fn web_is_unrestricted(&self) -> bool {
+        self.unrestricted_web
     }
     pub fn seeds(&self) -> &[String] {
         &self.seeds
     }
     pub fn allows(&self, url: &str) -> bool {
+        if self.unrestricted_web
+            && url.len() <= MAX_URL_BYTES
+            && !url.chars().any(char::is_whitespace)
+            && let Ok(parsed) = Url::parse(url)
+            && matches!(parsed.scheme(), "http" | "https")
+            && parsed.host_str().is_some_and(|host| !host.is_empty())
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+        {
+            return true;
+        }
         url_allowed(&self.seeds, url)
     }
 }
@@ -854,6 +883,33 @@ redacted!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrestricted_web_has_no_host_directory_or_port_whitelist() {
+        let policy = SourcePolicy::unrestricted_web();
+        for url in [
+            "https://learn-mindustry-mod.github.io/java/5-draw-and-animate/5-7-bloom.html",
+            "http://127.0.0.1:8123/arbitrary/path#fragment",
+            "https://other.example/api/data.json",
+            "http://[::1]:8765/test",
+        ] {
+            assert!(policy.allows(url), "{url}");
+        }
+        for url in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "https://",
+            "https://a.example/a b",
+        ] {
+            assert!(!policy.allows(url), "{url}");
+        }
+        let policy = SourcePolicy::new(&["eve-corpus://book/part/".into()])
+            .unwrap()
+            .with_unrestricted_web();
+        assert!(policy.allows("https://any.example/outside"));
+        assert!(policy.allows("eve-corpus://book/part/page.md"));
+        assert!(!policy.allows("eve-corpus://other/part/page.md"));
+    }
 
     fn policy() -> SourcePolicy {
         SourcePolicy::new(&["https://docs.example/wiki/modding/index.html".into()]).unwrap()

@@ -70,7 +70,7 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
             self.assertIn("验证通过", results[-1]["stdout"])
             return text_response("实际读写和命令已完成")
         self.callback = respond
-        self.enabled([*self.send(self.message("help", "/help tools", contains=["20 个", "github_api", "run_command", "edit_file", "search_files"])),
+        self.enabled([*self.send(self.message("help", "/help tools", contains=["21 个", "github_api", "run_command", "edit_file", "search_files"])),
                       *self.send(self.message("edit", "修改源码并执行验证", expected="实际读写和命令已完成"))])
         self.assertEqual(self.chat_rounds, 5)
         journal = self.work / "developer-data/operations.jsonl"

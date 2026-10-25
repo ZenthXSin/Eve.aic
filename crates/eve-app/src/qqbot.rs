@@ -666,7 +666,7 @@ fn research_policy(options: &QqBotOptions) -> Result<Option<SourcePolicy>, AppEr
     }
     Ok(Some(SourcePolicy::new(&options.research_sources).map_err(
         |_| "研究入口页面无效：至多 8 个互不重复、不含用户信息与片段的 http/https 或 eve-corpus:// URL",
-    )?))
+    )?.with_unrestricted_web()))
 }
 
 /// 打开本地资料并核对清单摘要；每个 eve-corpus:// 入口都必须指向这份资料。
@@ -1749,14 +1749,12 @@ async fn run_qqbot_composed(
                 None => web,
             }
         };
-        let dialogue_fetcher: Option<Arc<dyn SourceFetcher>> = if research_policy.is_some() {
-            Some(routed(match interest_components.fetcher.clone() {
+        let dialogue_fetcher: Option<Arc<dyn SourceFetcher>> = Some(routed(
+            match interest_components.fetcher.clone() {
                 Some(fetcher) => fetcher,
                 None => Arc::new(HttpSourceFetcher::new()?),
-            }))
-        } else {
-            None
-        };
+            },
+        ));
         let dialogue_tools = eve_dialogue_tools::Services {
             memory: memory.clone(),
             memory_continuity: memory_continuity.clone(),
@@ -1777,7 +1775,7 @@ async fn run_qqbot_composed(
                 .clone()
                 .map(|v| Arc::new(v) as Arc<dyn OutreachAdmin>),
             budget: budget_gate.budget(),
-            source: research_policy.clone().zip(dialogue_fetcher.clone()),
+            source: Some((research_policy.clone().unwrap_or_else(SourcePolicy::unrestricted_web), dialogue_fetcher.clone().ok_or("网页读取器缺失")?)),
             runner: practice.is_some().then(|| skill_runner.clone()),
             draft_check: tools.clone().map(|v| {
                 Arc::new(ForgedChecks::new(Arc::new(v))) as Arc<dyn eve_practice_api::DraftCheck>

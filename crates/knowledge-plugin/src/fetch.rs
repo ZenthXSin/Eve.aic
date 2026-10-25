@@ -12,12 +12,13 @@ use std::{collections::BTreeSet, time::Duration};
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const ACCEPT: &str = "text/html, application/xhtml+xml, text/plain, text/markdown;q=0.9";
-const SUPPORTED: [&str; 4] = [
-    "text/html",
-    "application/xhtml+xml",
-    "text/plain",
-    "text/markdown",
-];
+fn readable(content_type: &str) -> bool {
+    content_type.starts_with("text/")
+        || matches!(
+            content_type,
+            "application/xhtml+xml" | "application/json" | "application/xml"
+        )
+}
 
 pub struct HttpSourceFetcher {
     client: reqwest::Client,
@@ -43,6 +44,7 @@ impl HttpSourceFetcher {
             return Err(FetchFailure::NotAllowed);
         }
         let mut current = Url::parse(url).map_err(|_| FetchFailure::NotAllowed)?;
+        current.set_fragment(None);
         let mut redirects = 0;
         let response = loop {
             let response = self
@@ -69,7 +71,7 @@ impl HttpSourceFetcher {
                 .join(location)
                 .map_err(|_| FetchFailure::NotAllowed)?;
             next.set_fragment(None);
-            // 重定向目标同样须在允许范围内；不能借跳转离开操作者配置的站点目录。
+            // 逐跳核对调用方的来源策略；开放网页模式允许跨站，受限宿主仍按其策略处理。
             if !policy.allows(next.as_str()) {
                 return Err(FetchFailure::NotAllowed);
             }
@@ -84,7 +86,7 @@ impl HttpSourceFetcher {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next())
             .map(|value| value.trim().to_ascii_lowercase())
-            .filter(|value| SUPPORTED.contains(&value.as_str()))
+            .filter(|value| readable(value))
             .ok_or(FetchFailure::UnsupportedType)?;
         if response
             .content_length()
