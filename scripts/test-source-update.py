@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,10 +16,16 @@ import unittest
 from unittest.mock import patch
 
 import source_update as update
+from build_resources import BuildPlanner, Resources, GIB
 
 spec = importlib.util.spec_from_file_location('update_fixture', Path(__file__).with_name('test-self-upgrade-runtime.py'))
 fixture = importlib.util.module_from_spec(spec); spec.loader.exec_module(fixture)
 runtime = fixture.runtime
+
+
+class Probe:
+    available = 12 * GIB
+    def snapshot(self): return Resources(4, 16 * GIB, self.available, 0)
 
 
 class SourceUpdateTests(unittest.TestCase):
@@ -37,23 +44,30 @@ class SourceUpdateTests(unittest.TestCase):
         self.git('add', '.'); self.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'first')
         self.head = self.git('rev-parse', 'HEAD')
         cargo = self.root / 'cargo.py'
-        cargo.write_text('''import sys,os
+        cargo.write_text('''import sys,os,json
 from pathlib import Path
-marker=Path(__file__).parent/'fail-check'
-if marker.exists():raise SystemExit(3)
-if sys.argv[1]=='build':
+root=Path(__file__).parent
+with (root/'cargo-calls.jsonl').open('a') as f:
+ f.write(json.dumps({'args':sys.argv[1:],'jobs':os.environ.get('CARGO_BUILD_JOBS'),'threads':os.environ.get('RUST_TEST_THREADS')})+'\\n')
+if (root/'fail-check').exists():raise SystemExit(3)
+if sys.argv[1]=='metadata':
+ print(json.dumps({'packages':[{'name':'eve-app','targets':[{'name':name,'kind':['bin']} for name in ['eve-qqbot','eve-helper']]}]}))
+ raise SystemExit(0)
+if sys.argv[1]=='build' and '--bin' in sys.argv:
  target=Path(sys.argv[sys.argv.index('--target-dir')+1])/'release'
  target.mkdir(parents=True,exist_ok=True)
- binary=target/('eve-qqbot.exe' if os.name=='nt' else 'eve-qqbot')
+ name=sys.argv[sys.argv.index('--bin')+1]
+ binary=target/(name+'.exe' if os.name=='nt' else name)
  binary.write_bytes(Path(sys.executable).read_bytes()+b'new');binary.chmod(0o700)
 print('fixture check passed')
 ''')
+        self.probe = Probe()
         self.config = self.root / 'auto-update-config.json'
         self.settings = dict(version=1, data_directory=str(self.root / 'update'), cargo_program=sys.executable,
                              cargo_arguments=[str(cargo)], minimum_free_bytes=256*1024**2)
         runtime.atomic(self.config, self.settings)
         self.updater = update.SourceUpdater(self.config, self.fixture.queue, self.fixture.candidates,
-            builder_factory=lambda *args: update.GitBuilder(*args, remote=str(self.remote)))
+            builder_factory=lambda *args: update.GitBuilder(*args, remote=str(self.remote), planner=BuildPlanner(self.probe)))
         self.supervisor = None
 
     def git(self, *args):
@@ -69,7 +83,7 @@ print('fixture check passed')
     def prepare(self, active=None):
         settings = update.configuration(self.config)
         return update.GitBuilder(settings, self.fixture.candidates, threading.Event(), lambda **_: None,
-                                 remote=str(self.remote)).prepare(active)
+                                 remote=str(self.remote), planner=BuildPlanner(self.probe)).prepare(active)
 
     def supervisor_start(self):
         options = SimpleNamespace(directory=self.fixture.queue, candidates=self.fixture.candidates,
@@ -105,6 +119,75 @@ print('fixture check passed')
         self.ticks(lambda: self.updater.status.get('up_to_date'))
         self.assertEqual(self.fixture.events.read_text().splitlines(), ['old', 'new'])
         self.assertEqual(runtime.read_json(self.fixture.queue / 'supervisor.json')['active_sha256'], supervisor.status['active_sha256'])
+
+    def test_stages_recompute_jobs_and_children_receive_actual_limits_in_order(self):
+        observed = []
+        probe = self.probe
+        class ChangingPlanner(BuildPlanner):
+            def choose(inner, stage, maximum='auto'):
+                probe.available = (12 if stage in ('format', 'libraries', 'clippy') else 6) * GIB
+                plan = super().choose(stage, maximum); observed.append(plan)
+                return plan
+        settings = update.configuration(self.config)
+        result = update.GitBuilder(settings,self.fixture.candidates,threading.Event(),lambda **_:None,
+            remote=str(self.remote),planner=ChangingPlanner(probe)).prepare(None)
+        calls = [json.loads(line) for line in (self.root/'cargo-calls.jsonl').read_text().splitlines()]
+        stages = calls[1:]
+        self.assertEqual([p['stage'] for p in observed],['format','libraries','clippy','test_compile','tests','binary','binary'])
+        self.assertEqual([int(c['jobs']) for c in stages],[3,3,3,2,2,2,2])
+        self.assertTrue(all(c['jobs']==c['threads'] for c in stages))
+        self.assertIn('--lib', stages[1]['args'])
+        self.assertIn('--no-run', stages[3]['args'])
+        self.assertNotIn('--no-run', stages[4]['args'])
+        self.assertEqual([c['args'][c['args'].index('--bin')+1] for c in stages[5:]],['eve-helper','eve-qqbot'])
+        _,_,manifest=runtime.validate_candidate(result['request'],self.fixture.candidates)
+        self.assertEqual([len(c['steps']) for c in manifest['checks']],[1,2,2,2])
+
+    def test_memory_pressure_defers_without_marking_revision_failed_then_resumes(self):
+        self.probe.available = 128 * 1024**2
+        self.supervisor_start()
+        self.ticks(lambda:self.updater.status.get('result')=='deferred')
+        self.assertEqual(self.updater.status['error'],'auto_update_resources_busy')
+        self.assertIsNone(self.updater.status.get('failed_head'))
+        self.assertLessEqual(self.updater.next_check,time.monotonic()+60)
+        self.assertEqual(list(self.fixture.candidates.iterdir()),[])
+        self.assertEqual(self.fixture.events.read_text().splitlines(),['old'])
+        calls=[json.loads(line) for line in (self.root/'cargo-calls.jsonl').read_text().splitlines()]
+        self.assertEqual([c['args'][0] for c in calls],['metadata'])
+        self.probe.available=12*GIB; self.updater.next_check=0
+        self.ticks(lambda:self.updater.status.get('result')=='applied')
+        self.assertEqual(self.fixture.events.read_text().splitlines(),['old','new'])
+
+    def test_critical_memory_stops_only_owned_build_subprocess(self):
+        settings=update.configuration(self.config)
+        planner=BuildPlanner(self.probe)
+        builder=update.GitBuilder(settings,self.fixture.candidates,threading.Event(),lambda **_:None,planner=planner)
+        children=[]; popen=subprocess.Popen
+        def capture(*args,**kwargs):
+            child=popen(*args,**kwargs);children.append(child);return child
+        with patch.object(update.subprocess,'Popen',side_effect=capture),patch.object(planner,'critical',return_value=True):
+            with self.assertRaisesRegex(ValueError,'auto_update_resources_busy'):
+                builder.command([sys.executable,'-c','import time; time.sleep(30)'],self.root,self.root/'pressure.log',plan=planner.choose('libraries'))
+        self.assertIsNotNone(children[0].poll())
+
+    @unittest.skipUnless(os.environ.get('EVE_TEST_REAL_CARGO'), '显式启用小型真实 Rust 工作区验收')
+    def test_real_rust_workspace_builds_libraries_tests_and_binaries_in_stages(self):
+        cargo=os.environ['EVE_TEST_REAL_CARGO']
+        args=['+'+os.environ['EVE_TEST_REAL_TOOLCHAIN']] if os.environ.get('EVE_TEST_REAL_TOOLCHAIN') else []
+        (self.remote/'Cargo.toml').write_text('[workspace]\n[package]\nname="eve-app"\nversion="0.0.1"\nedition="2021"\n[[bin]]\nname="eve-qqbot"\npath="src/main.rs"\n[[bin]]\nname="eve-helper"\npath="src/helper.rs"\n')
+        (self.remote/'Cargo.lock').write_text('version = 3\n[[package]]\nname = "eve-app"\nversion = "0.0.1"\n')
+        src=self.remote/'src';src.mkdir()
+        (src/'lib.rs').write_text('pub fn answer() -> u32 { 42 }\n#[cfg(test)] mod tests { #[test] fn answer_matches() { assert_eq!(super::answer(),42); } }\n')
+        (src/'main.rs').write_text('fn main() { println!("{}",eve_app::answer()); }\n')
+        (src/'helper.rs').write_text('fn main() { println!("helper {}",eve_app::answer()); }\n')
+        subprocess.run([cargo,*args,'fmt','--all'],cwd=self.remote,check=True,capture_output=True)
+        self.git('add','.');self.git('-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-m','real Rust workspace')
+        runtime.atomic(self.config,dict(self.settings,cargo_program=cargo,cargo_arguments=args))
+        prepared=self.prepare()
+        binary,_,manifest=runtime.validate_candidate(prepared['request'],self.fixture.candidates)
+        self.assertEqual(subprocess.check_output([str(binary)]).decode().strip(),'42')
+        self.assertEqual([len(c['steps']) for c in manifest['checks']],[1,2,2,2])
+        self.assertIn('1 passed',manifest['checks'][2]['stdout'])
 
     def test_check_failure_does_not_publish_candidate_or_touch_old_instance(self):
         (self.root / 'fail-check').touch()
