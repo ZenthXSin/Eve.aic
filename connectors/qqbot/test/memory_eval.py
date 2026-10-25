@@ -7,11 +7,18 @@
 
 模型替身确定性地应答与调用工具，指标只衡量宿主组装上下文的行为，不代表真实模型的理解质量。
 报告写到 EVE_MEMORY_EVAL_REPORT 指定的文件（默认不写），并在标准输出打印一行 EVE_MEMORY_EVAL。
+
+真实模型模式（`RealModelEvaluation`）：设置 EVE_MEMORY_EVAL_BASE_URL（OpenAI 兼容服务，如
+https://api.openai.com/v1）、EVE_MEMORY_EVAL_API_KEY 与 EVE_MEMORY_EVAL_MODEL 后运行，本地替身把每个请求
+原样转发给该服务，记录服务商报告的缓存命中 token，并检查模型是否用上跨会话资料与约定工具。
+结果打印为一行 EVE_MEMORY_EVAL_REAL；会消耗模型额度，CI 不运行。
 """
 import json
 import os
 import statistics
+import time
 import unittest
+import urllib.request
 
 import commitment_test
 import people_test
@@ -159,6 +166,109 @@ class MemoryEvaluation(people_test.PeopleAcceptance):
                 json.dump(report, f, ensure_ascii=False, indent=2)
         self.assertEqual(correct, len(results), [r for r in results if r["expected"] != r["actual"]])
         self.assertGreaterEqual(report["prefix_reuse"]["steady_mean"], MIN_STEADY_PREFIX_REUSE)
+
+
+REAL_BASE = os.environ.get("EVE_MEMORY_EVAL_BASE_URL", "").rstrip("/")
+REAL_KEY = os.environ.get("EVE_MEMORY_EVAL_API_KEY")
+REAL_MODEL = os.environ.get("EVE_MEMORY_EVAL_MODEL")
+
+
+def cached_tokens(usage):
+    """服务商报告的命中缓存的输入 token；OpenAI 与兼容实现的两种常见字段。"""
+    details = usage.get("prompt_tokens_details") or {}
+    return details.get("cached_tokens") or usage.get("prompt_cache_hit_tokens") or 0
+
+
+@unittest.skipUnless(REAL_BASE and REAL_KEY and REAL_MODEL,
+                     "真实模型模式需要 EVE_MEMORY_EVAL_BASE_URL、EVE_MEMORY_EVAL_API_KEY、EVE_MEMORY_EVAL_MODEL")
+class RealModelEvaluation(people_test.PeopleAcceptance):
+    for _name in dir(people_test.PeopleAcceptance):
+        if _name.startswith("test_"):
+            locals()[_name] = None
+    del _name
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+        # 替身自己的应答在转发前就会生成，随后被真实服务的应答替换。
+        self.impression_reply = lambda batch: {"impressions": []}
+        self.profile_reply = lambda request: {"facts": []}
+
+    def provider_response(self, body, kind, fallback):
+        # 每个请求（对话、印象整理等）都原样交给真实服务，只替换模型名。
+        forwarded = dict(body, model=REAL_MODEL)
+        request = urllib.request.Request(
+            REAL_BASE + "/chat/completions", data=json.dumps(forwarded).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {REAL_KEY}"})
+        started = time.monotonic()
+        with urllib.request.urlopen(request, timeout=180) as response:
+            answer = json.loads(response.read())
+        messages = body["messages"]
+        current = max((i for i, m in enumerate(messages) if m["role"] == "user"), default=-1)
+        self.calls.append({"kind": kind, "text": messages[current]["content"] if current >= 0 else "",
+                           "after_tool": any(m["role"] == "tool" for m in messages[current + 1:]),
+                           "usage": answer.get("usage") or {}, "seconds": round(time.monotonic() - started, 2)})
+        return answer
+
+    def replies(self):
+        events = []
+        for path in sorted(self.work.glob("events-*.jsonl")):
+            events += [json.loads(line) for line in path.read_text(encoding="utf8").splitlines()]
+        return {e["id"]: e.get("text", "") for e in events if e.get("direction") == "out" and e.get("type") == "reply"}
+
+    def test_real_model_uses_cross_session_memory_and_reports_cache_hits(self):
+        group_talk = ["我最近在学Rust，周末想写个小工具", "我养了一只橘猫", "今天好累啊我", "我下周要去成都出差"]
+        steady = ["今天天气怎么样", "你平时喜欢干嘛", "推荐个电影吧", "有点无聊", "说个冷笑话", "好吧那我去忙了"]
+
+        def say(mid, text, user="user-1", target="group-1"):
+            return self.send({**self.message(mid, text, user=user, scope="group", target=target), "accept_any": True})
+
+        def learned():
+            # 真实模型可能不整理出印象；最多等一分钟，不因此失败。
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                people = self.people_state()["people"]
+                if any(p.get("impressions") for p in people):
+                    return
+                time.sleep(1)
+        self.enabled([*[s for i, t in enumerate(group_talk) for s in say(f"a{i}", t)],
+                      *say("promise", "下次帮我看看我做的 Mindustry 地图吧"),
+                      *self.checkpoint("learned"),
+                      *say("recall", "你还记得我在学什么吗？", target="group-2"),
+                      *say("promised", "你之前答应过我什么事来着？", target="group-2"),
+                      *say("other", "群里有人在学什么吗？", user="user-2", target="group-3"),
+                      *[s for i, t in enumerate(steady) for s in say(f"s{i}", t)]],
+                     checkpoints={"learned": learned}, timeout=900,
+                     env_extra={"EVE_OPENAI_MODEL": REAL_MODEL})
+        replies = self.replies()
+        people = json.dumps(self.people_state(), ensure_ascii=False)
+        commitments = commitment_test.CommitmentAcceptance.ledger(self)["commitments"]
+        chat = [c for c in self.calls if c["kind"] == "chat"]
+        steady_calls = [c for c in chat if c["text"] in steady and not c["after_tool"]]
+
+        def ratio(calls):
+            prompt = sum(c["usage"].get("prompt_tokens", 0) for c in calls)
+            return round(sum(cached_tokens(c["usage"]) for c in calls) / prompt, 4) if prompt else None
+        report = {
+            "model": REAL_MODEL,
+            "commitment_tool_used": any("地图" in c["text"] for c in commitments),
+            "impression_learned": "Rust" in people or "rust" in people.lower(),
+            "recalls_learning_in_other_group": "rust" in replies.get("recall", "").lower(),
+            "recalls_promise_in_other_group": "地图" in replies.get("promised", ""),
+            "no_leak_to_other_person": "rust" not in replies.get("other", "").lower(),
+            "cache_hit_ratio": {"steady_chat": ratio(steady_calls), "all_chat": ratio(chat),
+                                "all_requests": ratio(self.calls)},
+            "requests": {"chat": len(chat), "total": len(self.calls),
+                         "mean_seconds": round(statistics.mean(c["seconds"] for c in self.calls), 2)},
+            "replies": {k: replies.get(k, "") for k in ("recall", "promised", "other")},
+        }
+        line = json.dumps(report, ensure_ascii=False)
+        print("EVE_MEMORY_EVAL_REAL " + line)
+        if os.environ.get("EVE_MEMORY_EVAL_REPORT"):
+            with open(os.environ["EVE_MEMORY_EVAL_REPORT"], "w", encoding="utf8") as f:
+                json.dump(report, f, ensure_ascii=False, indent=2)
+        # 只有隐私边界是硬性要求；其余是模型表现，按报告比较。
+        self.assertTrue(report["no_leak_to_other_person"], report["replies"]["other"])
 
 
 if __name__ == "__main__":
