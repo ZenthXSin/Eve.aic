@@ -45,7 +45,7 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         config = json.loads(self.developer_config.read_text())
         config["storage_directory"] = str(self.work / "developer-data")
         self.developer_config.write_text(json.dumps(config))
-        names = {"clear_context", "clear_all_contexts", "echo", "search_memory", "save_preference", "note_commitment", "settle_commitment", "send_file", "read_attachment", "describe_image", "read_raw_message", "acquire_condition", "list_files", "read_file", "write_file", "edit_file",
+        names = {"clear_context", "clear_all_contexts", "echo", "search_memory", "save_preference", "note_commitment", "settle_commitment", "send_file", "read_attachment", "describe_image", "read_raw_message", "acquire_condition", "read_source", "list_files", "read_file", "write_file", "edit_file",
                  "search_files", "run_command", "github_api", "prepare_self_upgrade"}
         def respond(body):
             self.assertEqual(self.definitions(body), names)
