@@ -19,7 +19,7 @@ fn row(index: usize, user: &str) -> ExpressionRecord {
         body: "a".repeat(64),
         chars: index % 512 + 1,
         paragraphs: 1,
-        question: index % 2 == 0,
+        question: index.is_multiple_of(2),
         formal: false,
         casual: true,
         active: true,
