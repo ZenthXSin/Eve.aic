@@ -280,6 +280,10 @@ fn validate_autonomous_drive_transition(
                 AutonomousDriveStatus::Active,
                 AutonomousDriveStatus::Completed,
             )
+            | (
+                AutonomousDriveStatus::Active,
+                AutonomousDriveStatus::Cancelled,
+            )
             | (AutonomousDriveStatus::Waiting, AutonomousDriveStatus::Ready,)
             | (
                 AutonomousDriveStatus::Waiting,
