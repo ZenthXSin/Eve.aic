@@ -16,7 +16,7 @@ async function run(count) {
     stop() {},
     async sendText(target, text) {
       assert.deepEqual(target, targets.get(target.msgId));
-      assert.equal(text, payload);
+      assert.equal(text, (target.scope === "group" ? "<@perf-user> " : "") + payload);
       sent++;
       return { id: "out." + sent + "!" };
     },
