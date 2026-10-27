@@ -15,8 +15,14 @@ function diagnostic(err) {
   const code = err?.bizCode ?? err?.code;
   if (Number.isInteger(status) && status >= 100 && status <= 599) out.http_status = status;
   if (Number.isSafeInteger(code)) out.biz_code = code;
+  // 仅分类标准网络错误码，不记录原始 error、请求体或凭据；未知投递仍不重试。
+  const transport = typeof err?.cause?.code === "string" ? err.cause.code : err?.code;
   out.failure_kind = out.http_status ? "http" :
-    ["AbortError", "TimeoutError"].includes(err?.name) ? "timeout" : "transport_unknown";
+    ["AbortError", "TimeoutError"].includes(err?.name) ||
+      ["ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"].includes(transport) ? "timeout" :
+    ["ENOTFOUND", "EAI_AGAIN"].includes(transport) ? "dns" :
+    ["ECONNRESET", "ECONNREFUSED", "EPIPE", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_SOCKET"].includes(transport) ? "connection" :
+    ["CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "ERR_TLS_CERT_ALTNAME_INVALID"].includes(transport) ? "tls" : "transport_unknown";
   return out;
 }
 const validId = v => typeof v === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v);

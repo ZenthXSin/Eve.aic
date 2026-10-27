@@ -101,6 +101,9 @@ fn delivery_log(ctx: &PluginContext, code: &str, frame: &Value) {
                     "http",
                     "timeout",
                     "transport_unknown",
+                    "dns",
+                    "connection",
+                    "tls",
                     "passive_window_elapsed",
                     "passive",
                     "proactive",
@@ -1882,7 +1885,7 @@ pub(crate) async fn run(
                             let sender_name = payload.get("sender_name").and_then(Value::as_str).map(str::to_owned);
                             if let Some(object) = payload.as_object_mut() {
                                 object.remove("type"); object.remove("version");
-                                object.remove("sender_name");
+                                object.remove("sender_name"); object.remove("raw");
                                 if object.keys().any(|key| !["id", "scope", "target_id", "user_id", "text", "attachments", "quoted"].contains(&key.as_str())) {
                                     warn(&ctx, "ignored_message_fields");
                                 }

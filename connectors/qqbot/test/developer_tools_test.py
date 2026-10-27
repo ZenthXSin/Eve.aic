@@ -37,6 +37,13 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
             return json.dumps(self.review_reply(decoded), ensure_ascii=False)
         return super().reply(kind, decoded, latest)
 
+    def provider_response(self, body, kind, fallback):
+        if kind == "review":
+            self.assertEqual([t["function"]["name"] for t in body["tools"]], ["submit_review"])
+            verdict = json.loads(fallback["choices"][0]["message"]["content"])
+            return tool_response([("submit_review", verdict)])
+        return super().provider_response(body, kind, fallback)
+
     def test_prompt_commands_are_reviewed_against_user_words_and_denials_do_not_run(self):
         for name in ["old-a", "old-b"]:
             (self.source / name).mkdir()
@@ -69,6 +76,33 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         self.assertIn("old-a 目录不要了，帮我删掉", reviews[0]["user_messages"][-1])
         self.assertFalse(reviews[0]["delegated"])
         self.assertIn("递归删除", reviews[0]["policy_reason"])
+
+    def test_plaintext_review_is_rejected_without_executing(self):
+        target = self.source / "retained"
+        target.mkdir()
+        self.review_reply = lambda _: {"risk":"low","authorization":"high","outcome":"allow","rationale":"模拟输出"}
+        normal = self.provider_response
+        self.provider_response = lambda body, kind, fallback: text_response("审核通过，可以执行") if kind == "review" else normal(body, kind, fallback)
+        def respond(body):
+            results = self.results(body)
+            if not results:
+                return tool_response([("run_command", {"program":"rm", "args":["-r","retained"]})])
+            self.assertFalse(results[-1].get("success", False))
+            return text_response("审核失败，目录保留")
+        self.callback = respond
+        def inspect_health():
+            import memory_test
+            status, data = memory_test.MemoryAcceptance.panel(self, "/api/readiness")
+            self.assertEqual(status, 200)
+            role = next(v for v in data["roles"] if v["role"] == "review")
+            self.assertIn("invalid_response", json.dumps(role))
+            self.assertEqual(role["requests"], 1)
+            self.assertEqual(role["failures"], 1)
+        self.run_eve([*self.send(self.message("bad-review","删除 retained 目录",expected="审核失败，目录保留")),
+                      *self.checkpoint("health")], interest=False, memory=True, research=False, practice=False,
+                     env_extra={"EVE_DEVELOPER_CONFIG":str(self.developer_config)}, panel=True,
+                     checkpoints={"health":inspect_health})
+        self.assertTrue(target.exists())
 
     def receipt(self, message_id):
         return next(r for r in self.documents()["eve.channel.qqbot"]["receipts.v1"]["entries"] if r["message"]["id"] == message_id)

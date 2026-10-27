@@ -1,7 +1,10 @@
 //! 组合层只读取宿主配置与凭据引用。
 use crate::{AppError, CoreBootstrap};
 use eve_developer_api::{ActionReviewFuture, ActionReviewRequest, ActionReviewer, DeveloperConfig};
-use eve_llm_api::{LlmError, LlmModelResolver, ModelSelection};
+use eve_llm_api::{
+    LlmError, LlmModelResolver, ModelHealthObserver, ModelOutcome, ModelSelection, ProviderFailure,
+    ProviderFailureKind,
+};
 use eve_plugin_api::ServiceRegistry;
 use serde_json::json;
 use std::{
@@ -183,16 +186,31 @@ impl LlmModelResolver for RegistryResolver {
     }
 }
 /// 每次审查的结局写入标准错误的 `EVE_ACTION_REVIEW` 行，不含命令与原话。
-struct Reported(eve_action_review::ModelActionReviewer);
+struct Reported(
+    eve_action_review::ModelActionReviewer,
+    Arc<eve_model_health::HealthBook>,
+);
 impl ActionReviewer for Reported {
     fn review(&self, request: ActionReviewRequest) -> ActionReviewFuture<'_> {
         Box::pin(async move {
             let delegated = request.delegated;
             let result = self.0.review(request).await;
+            let outcome = match &result {
+                Ok(_) => ModelOutcome::Succeeded,
+                Err(e) if e.contains("超时") => ModelOutcome::TimedOut,
+                Err(e) if e.starts_with("审查输出") || e.starts_with("审查理由") => {
+                    ModelOutcome::InvalidResponse
+                }
+                Err(_) => ModelOutcome::Failed {
+                    failure: ProviderFailure::new(ProviderFailureKind::Other),
+                },
+            };
+            self.1
+                .record(REVIEW_USE, outcome, crate::qq_people::now_ms());
             let line = match &result {
                 Ok(v) => json!({"outcome": if v.permits() { "allowed" } else { "denied" },
                     "risk": v.risk, "authorization": v.authorization, "delegated": delegated}),
-                Err(e) => json!({"outcome": "failed", "error": e, "delegated": delegated}),
+                Err(_) => json!({"outcome": "failed", "error": outcome, "delegated": delegated}),
             };
             eprintln!("EVE_ACTION_REVIEW {line}");
             result
@@ -208,16 +226,13 @@ pub(crate) fn action_reviewer(
         .ok()
         .filter(|key| !key.trim().is_empty())?;
     health.register(REVIEW_USE);
-    let resolver = eve_model_health::ObservedResolver::new(
-        Arc::new(RegistryResolver {
-            registry,
-            key,
-            resolver: OnceLock::new(),
-        }),
-        REVIEW_USE,
-        health,
-    );
+    let resolver = RegistryResolver {
+        registry,
+        key,
+        resolver: OnceLock::new(),
+    };
     Some(Arc::new(Reported(
         eve_action_review::ModelActionReviewer::new(Arc::new(resolver)),
+        health,
     )))
 }
