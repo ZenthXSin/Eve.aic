@@ -9,7 +9,7 @@ use crate::{
     },
     state::{
         Ledger, Message, Part, PartState, Progress, ReceiptState, Segments, StickerPart,
-        valid_message_id,
+        passive_progress, valid_message_id,
     },
 };
 use eve_control_api::{
@@ -161,6 +161,7 @@ struct SlowStep {
     label: String,
     since: tokio::time::Instant,
     reported: bool,
+    next: tokio::time::Instant,
 }
 fn slow_text(step: &SlowStep) -> String {
     format!(
@@ -183,6 +184,12 @@ fn slow_label(kind: &TurnEventKind) -> Option<Option<String>> {
     }
 }
 fn progress_text(kind: &TurnEventKind) -> Option<String> {
+    if let TurnEventKind::ToolBatchStarted { calls } = kind {
+        return Some(format!(
+            "我先进行{}，有结果后继续汇报。",
+            activities(calls.iter().map(|c| c.name.as_str()))
+        ));
+    }
     if let TurnEventKind::AssistantMessage { text } = kind {
         return Some(text.clone());
     }
@@ -190,7 +197,7 @@ fn progress_text(kind: &TurnEventKind) -> Option<String> {
         return Some("正在进行上下文压缩，请稍等".into());
     }
     let TurnEventKind::ToolProgress {
-        completed_calls,
+        completed_calls: _,
         failed_calls,
         tool_names,
     } = kind
@@ -199,12 +206,12 @@ fn progress_text(kind: &TurnEventKind) -> Option<String> {
     };
     let activities = activities(tool_names.iter().map(String::as_str));
     Some(format!(
-        "{}已返回结果，累计收到 {completed_calls} 次工具回执{}。正在继续核对与整理。",
+        "{}已返回结果{}，接下来继续核对剩余事项。",
         activities,
         if *failed_calls == 0 {
             String::new()
         } else {
-            format!("（其中 {failed_calls} 次未成功）")
+            "，有步骤未成功，需要核对原因".into()
         }
     ))
 }
@@ -448,12 +455,13 @@ impl ControlEventSink for ChannelEvents {
             } else {
                 if matches!(
                     event.event.kind,
-                    TurnEventKind::ToolProgress { .. } | TurnEventKind::ContextCompactionStarted
+                    TurnEventKind::ToolProgress { .. }
+                        | TurnEventKind::ContextCompactionStarted
+                        | TurnEventKind::ToolBatchStarted { .. }
                 ) {
-                    self.progress
-                        .try_send(event)
-                        .map_err(|_| LlmError::Cancelled)?;
-                } else if slow_label(&event.event.kind).is_some() {
+                    let _ = self.progress.try_send(event.clone());
+                }
+                if slow_label(&event.event.kind).is_some() {
                     let _ = self.steps.try_send(event);
                 }
                 Ok(())
@@ -498,6 +506,7 @@ impl ControlEventSink for RoutingEvents {
 }
 
 struct Active {
+    started: tokio::time::Instant,
     message: Message,
     key: GenerationKey,
     ordinary: bool,
@@ -936,6 +945,7 @@ pub(crate) async fn run(
     // 按原始消息 ID 记录的当前步骤；只用于慢步骤进度，不持久化。
     let mut slow_steps: BTreeMap<String, SlowStep> = BTreeMap::new();
     let mut slow_reported = BTreeSet::new();
+    let mut last_progress: BTreeMap<String, tokio::time::Instant> = BTreeMap::new();
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     // 正在主动私聊的邀请；一次只发送一条，期间不开始新的回复投递。
     let mut pushing: Option<String> = None;
@@ -961,12 +971,15 @@ pub(crate) async fn run(
             while let Ok(event) = steps_rx.try_recv() {
                 let Some(id) = active.iter().find(|a| a.key == event.key).map(|a| a.message.id.clone()) else { continue };
                 match slow_label(&event.event.kind).flatten() {
-                    Some(label) => { let reported = slow_reported.contains(&id); slow_steps.insert(id, SlowStep { event, label, since: tokio::time::Instant::now(), reported }); }
+                    Some(label) => { let reported = slow_reported.contains(&id); slow_steps.insert(id, SlowStep { event, label, since: tokio::time::Instant::now(), reported, next: tokio::time::Instant::now() }); }
                     None => { slow_steps.remove(&id); }
                 }
             }
             slow_steps.retain(|id, step| active.iter().any(|a| &a.message.id == id && a.key == step.event.key));
             slow_reported.retain(|id| active.iter().any(|a| &a.message.id == id));
+            last_progress.retain(|id, _| active.iter().any(|a| &a.message.id == id));
+            let stages = slow_progress.as_ref().is_some_and(|p| p.stage_updates());
+            let min_interval = slow_progress.as_ref().map_or(Duration::from_secs(15), |p| p.min_interval());
             let slow_after = slow_progress.as_ref().and_then(|policy| policy.after());
             if progress_delivery.is_none() && progress_queue.is_empty()
                 && let Some(outgoing) = live_dialogue.as_ref().and_then(|live| live.next()) {
@@ -982,8 +995,10 @@ pub(crate) async fn run(
             }
             // 慢步骤：同一步只提示一次；与里程碑进度共用每轮至多 3 条和被动回复配额。
             if let Some(after) = slow_after && progress_queue.is_empty() && progress_delivery.is_none()
-                && let Some((id, step)) = slow_steps.iter_mut().find(|(_, step)| !step.reported && step.since.elapsed() >= after) {
+                && let Some((id, step)) = slow_steps.iter_mut().find(|(id, step)| (stages || !step.reported) && step.next.elapsed() >= after
+                    && last_progress.get(*id).is_none_or(|last| last.elapsed() >= after)) {
                 step.reported = true;
+                step.next = tokio::time::Instant::now();
                 slow_reported.insert(id.clone());
                 progress_queue.push_back((step.event.clone(), Some(slow_text(step))));
             }
@@ -1167,23 +1182,44 @@ pub(crate) async fn run(
                     || !routing.iter().any(|r| r.target.session == event.key.session))
                 && let Some((event, text)) = progress_queue.pop_front() {
                 // 只使用当前代绑定的原始平台路由；取消、插入控制和旧代事件不补发。
+                let elapsed = active.iter().find(|a| a.key == event.key).map(|a| a.started.elapsed()).unwrap_or_default();
+                let is_start = text.is_none() && matches!(event.event.kind, TurnEventKind::ToolBatchStarted { .. });
                 let message = active.iter().find(|a| a.key == event.key).map(|a| a.message.clone());
                 if let Some(message) = message
                     && !pending_control(&message, &routing, &commands)
                     && control.accepts(&event)
                     && control.snapshot(&event.key.session).is_ok_and(|s| s.is_some_and(|s| !s.cancel_requested))
+                    && (text.is_some() || !matches!(event.event.kind, TurnEventKind::ToolBatchStarted { .. }) || stages)
                     && (!matches!(event.event.kind, TurnEventKind::ToolProgress { .. })
-                        || slow_progress.as_ref().is_some_and(|policy| policy.tool_milestones()))
+                        || stages || slow_progress.as_ref().is_some_and(|policy| policy.tool_milestones()))
                     && let Some(text) = text.or_else(|| progress_text(&event.event.kind)) {
                     let index = ledger.find(&config.app_id, &message.id).expect("active receipt");
                     let entry = &mut ledger.entries[index];
-                    if entry.state == ReceiptState::Processing && entry.progress.len() < 3 {
+                    let automatic_start = matches!(&event.event.kind, TurnEventKind::ToolBatchStarted { calls }
+                        if !calls.iter().any(|c| c.name == "send_message")
+                            && !calls.iter().all(|c| c.name == "task_progress"));
+                    let skip_start = is_start
+                        && (!automatic_start || !entry.progress.is_empty());
+                    let interval_ok = !stages || entry.progress.is_empty()
+                        || last_progress.get(&message.id).is_none_or(|last| last.elapsed() >= min_interval)
+                        || matches!(event.event.kind, TurnEventKind::ContextCompactionStarted);
+                    let blocked = entry.progress.iter().any(|p| p.state == PartState::Failed);
+                    // 旧模式沿用 1/30/70 步节奏；新模式更密的事件不能抢占压缩通知名额。
+                    let legacy_milestone = stages || match event.event.kind {
+                        TurnEventKind::ToolProgress { completed_calls, .. } =>
+                            completed_calls >= [1, 30, 70].get(entry.progress.len()).copied().unwrap_or(usize::MAX),
+                        _ => true,
+                    };
+                    if entry.state == ReceiptState::Processing && !skip_start && interval_ok && legacy_milestone
+                        && (!stages || !blocked) && entry.progress.len() < if stages {64} else {3} {
                         let part = entry.progress.len();
-                        entry.progress.push(Progress { text: text.clone(), state: PartState::Sending });
+                        let proactive = stages && (passive_progress(entry) >= 2 || elapsed >= Duration::from_secs(230));
+                        entry.progress.push(Progress { text: text.clone(), state: PartState::Sending, proactive });
+                        last_progress.insert(message.id.clone(), tokio::time::Instant::now());
                         ledger.save(&ctx)?;
                         // 同步落盘后再次核验；写出后未知结果不会自动补发。
                         if control.accepts(&event) && control.snapshot(&event.key.session).is_ok_and(|s| s.is_some_and(|s| !s.cancel_requested)) {
-                            write(&mut stdin, json!({"type":"progress","version":1,"id":message.id,"index":part,"text":text})).await?;
+                            write(&mut stdin, json!({"type":"progress","version":1,"id":message.id,"index":part,"text":text,"proactive":proactive})).await?;
                             progress_delivery = Some((message.id.clone(), part));
                             deadline = tokio::time::Instant::now() + Duration::from_secs(35);
                         } else {
@@ -1244,7 +1280,7 @@ pub(crate) async fn run(
                                 }
                             },
                         };
-                        let progress_count = ledger.entries[ledger.find(&config.app_id, &reply.message.id).expect("reply receipt")].progress.len();
+                        let progress_count = passive_progress(&ledger.entries[ledger.find(&config.app_id, &reply.message.id).expect("reply receipt")]);
                         let mut policy = segmentation.policy;
                         policy.max_segments = policy.max_segments.min(passive_limit(&reply.message) - progress_count);
                         policy.defaults.max_segments = policy.defaults.max_segments.min(policy.max_segments);
@@ -1290,7 +1326,7 @@ pub(crate) async fn run(
                 if let Some(hook) = &outreach
                     && reply.invite == Some(true)
                     && invitable(&reply)
-                    && ledger.entries[index].progress.len() + plan.as_ref().map_or(1, |plan| plan.segments.len()) < passive_limit(&reply.message)
+                    && passive_progress(&ledger.entries[index]) + plan.as_ref().map_or(1, |plan| plan.segments.len()) < passive_limit(&reply.message)
                     && plan.as_ref().map_or(1, |plan| plan.segments.len()) <= QQ_OUTREACH_MAX_REPLY_PARTS {
                     match hook.inner.attach(&reply.message.session_key(&config.app_id)?, &reply.message.id) {
                         Ok(Some(invitation)) => {
@@ -1326,7 +1362,7 @@ pub(crate) async fn run(
                     let parts = ledger.entries[index].segments.as_ref().map_or(1, |s| s.parts.len());
                     let path = path.to_string_lossy().into_owned();
                     if appendix.is_none()
-                        && ledger.entries[index].progress.len() + parts < passive_limit(&reply.message)
+                        && passive_progress(&ledger.entries[index]) + parts < passive_limit(&reply.message)
                         && !path.is_empty() && path.len() <= 4096 && !path.chars().any(char::is_control) {
                         ledger.entries[index].sticker = Some(StickerPart { path, state: PartState::Pending });
                     } else {
@@ -1506,7 +1542,7 @@ pub(crate) async fn run(
                     Ok(key) => {
                         timing(timing_diagnostics, "admitted", None);
                         controlled_sessions.insert(key.session.session_id.clone(), key.session.clone());
-                        let wait = control.wait(&key); active.push(Active { message, key, ordinary: queued.ordinary, wait });
+                        let wait = control.wait(&key); active.push(Active { message, key, ordinary: queued.ordinary, started: tokio::time::Instant::now(), wait });
                     }
                     Err(eve_control_api::ControlError::Busy) => {
                         queue.push_front(Queued { message, saved: true, ordinary: queued.ordinary, received: queued.received });
@@ -1579,13 +1615,13 @@ pub(crate) async fn run(
                 Some(event) = steps_rx.recv() => {
                     if let Some(id) = active.iter().find(|a| a.key == event.key).map(|a| a.message.id.clone()) {
                         match slow_label(&event.event.kind).flatten() {
-                            Some(label) => { let reported = slow_reported.contains(&id); slow_steps.insert(id, SlowStep { event, label, since: tokio::time::Instant::now(), reported }); }
+                            Some(label) => { let reported = slow_reported.contains(&id); slow_steps.insert(id, SlowStep { event, label, since: tokio::time::Instant::now(), reported, next: tokio::time::Instant::now() }); }
                             None => { slow_steps.remove(&id); }
                         }
                     }
                 }
-                _ = tokio::time::sleep_until(slow_steps.values().filter(|step| !step.reported).map(|step| step.since + slow_after.unwrap_or_default()).min().unwrap_or(deadline)),
-                    if slow_after.is_some() && progress_delivery.is_none() && slow_steps.values().any(|step| !step.reported) => {}
+                _ = tokio::time::sleep_until(slow_steps.iter().filter(|(_, step)| stages || !step.reported).map(|(id, step)| step.next.max(last_progress.get(id).copied().unwrap_or(step.next)) + slow_after.unwrap_or_default()).min().unwrap_or(deadline)),
+                    if slow_after.is_some() && progress_delivery.is_none() && slow_steps.values().any(|step| stages || !step.reported) => {}
                 invite = judged(&mut judging), if judging.is_some() => {
                     let (mut reply, _) = judging.take().expect("judging reply");
                     reply.invite = Some(invite);
@@ -1646,7 +1682,7 @@ pub(crate) async fn run(
                                 continue;
                             }
                             let wait = control.wait(&generation);
-                            active.push(Active { message: route.message, key: generation, ordinary: false, wait });
+                            active.push(Active { message: route.message, key: generation, ordinary: false, started: tokio::time::Instant::now(), wait });
                             continue;
                         }
                         RouteOutcome::Unchanged => "当前任务保持不变。".into(),

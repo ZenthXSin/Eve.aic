@@ -32,6 +32,13 @@ pub use state::{ImageAttachment, Message};
 /// 通道补发一条说明当前步骤与已进行时长的进度。返回 None 表示关闭；每次检查时读取，可热修改。
 pub trait QqSlowProgress: Send + Sync {
     fn after(&self) -> Option<std::time::Duration>;
+    /// 阶段反馈与长任务主动进度；由宿主配置，不由模型授予发送权限。
+    fn stage_updates(&self) -> bool {
+        false
+    }
+    fn min_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(15)
+    }
     /// 是否投递工具计数里程碑；默认关闭，压缩与慢步骤提示独立控制。
     fn tool_milestones(&self) -> bool {
         false

@@ -15,17 +15,29 @@ pub(crate) fn schema() -> ConfigSchema {
             minimum: Some(0),
             maximum: Some(600_000),
         },
-        Some(json!(60_000)),
+        Some(json!(45_000)),
     );
     field.environment = Some("EVE_PROGRESS_SLOW_AFTER_MS".into());
     let mut milestones = ConfigField::new(ConfigKind::Boolean, Some(json!(false)));
     milestones.environment = Some("EVE_PROGRESS_TOOL_MILESTONES".into());
+    let mut stages = ConfigField::new(ConfigKind::Boolean, Some(json!(true)));
+    stages.environment = Some("EVE_PROGRESS_STAGE_UPDATES".into());
+    let mut interval = ConfigField::new(
+        ConfigKind::Integer {
+            minimum: Some(1000),
+            maximum: Some(600_000),
+        },
+        Some(json!(15_000)),
+    );
+    interval.environment = Some("EVE_PROGRESS_MIN_INTERVAL_MS".into());
     ConfigSchema {
         namespace: NAMESPACE.into(),
         version: 1,
         fields: BTreeMap::from([
             ("slow_after_ms".into(), field),
             ("tool_milestones".into(), milestones),
+            ("stage_updates".into(), stages),
+            ("min_interval_ms".into(), interval),
         ]),
     }
 }
@@ -37,6 +49,23 @@ pub(crate) struct SlowProgress {
 }
 
 impl eve_qqbot_plugin::QqSlowProgress for SlowProgress {
+    fn stage_updates(&self) -> bool {
+        self.settings
+            .get()
+            .and_then(|s| s.snapshot(NAMESPACE, 1).ok())
+            .and_then(|s| s.get("stage_updates").ok())
+            .unwrap_or(false)
+    }
+    fn min_interval(&self) -> Duration {
+        Duration::from_millis(
+            self.settings
+                .get()
+                .and_then(|s| s.snapshot(NAMESPACE, 1).ok())
+                .and_then(|s| s.get::<u64>("min_interval_ms").ok())
+                .unwrap_or(15_000)
+                .max(1000),
+        )
+    }
     fn tool_milestones(&self) -> bool {
         self.settings
             .get()

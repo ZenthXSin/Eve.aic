@@ -14,7 +14,7 @@ const HOT_TARGET: usize = 1024 * 1024;
 // ControlInput.task_id adds "qq:" to the platform message ID (256-byte limit).
 const MAX_MESSAGE_ID_BYTES: usize = 253;
 // 至多 8 个片段的范围与状态及规划器标识序列化后的上限。
-const SEGMENT_RESERVE: usize = 20 * 1024;
+const SEGMENT_RESERVE: usize = 416 * 1024;
 pub(crate) fn valid_id(v: &str) -> bool {
     !v.is_empty()
         && v.len() <= 128
@@ -294,9 +294,14 @@ pub(crate) struct StickerPart {
 pub(crate) struct Progress {
     pub text: String,
     pub state: PartState,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub proactive: bool,
+}
+pub(crate) fn passive_progress(entry: &Receipt) -> usize {
+    entry.progress.iter().filter(|p| !p.proactive).count()
 }
 /// 格式 1 不含片段，2 包含分段，3 包含途中进展，4 包含合并的连发消息，5 包含附带的表情包，
-/// 6 绑定归档库，7 允许后到的轮内引导并入较早的原轮回执。
+/// 6 绑定归档库，7 允许后到的轮内引导并入较早的原轮回执，8 区分主动阶段消息与被动配额。
 /// 旧版本拒绝读取而不是忽略投递记录。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -357,7 +362,8 @@ impl Ledger {
                 || entry.segments.as_ref().is_some_and(|segments| {
                     !valid_segments(segments, entry.reply.as_deref(), entry.state)
                 })
-                || entry.progress.len() > 3
+                || entry.progress.len() > 64
+                || passive_progress(entry) > 3
                 || entry.progress.iter().any(|p| {
                     p.text.trim().is_empty()
                         || p.text.len() > 1024
@@ -366,7 +372,7 @@ impl Ledger {
                             PartState::Sending | PartState::Sent | PartState::Failed
                         )
                 })
-                || entry.progress.len()
+                || passive_progress(entry)
                     + entry.segments.as_ref().map_or(1, |s| s.parts.len())
                     + usize::from(entry.sticker.is_some())
                     > crate::QQ_MAX_SEGMENTS
@@ -405,7 +411,13 @@ impl Ledger {
         Ok(ledger)
     }
     fn format(&self) -> u8 {
-        if self.entries.iter().enumerate().any(|(index, e)| {
+        if self
+            .entries
+            .iter()
+            .any(|e| e.progress.iter().any(|p| p.proactive))
+        {
+            8
+        } else if self.entries.iter().enumerate().any(|(index, e)| {
             e.merged_into.as_ref().is_some_and(|id| {
                 self.entries[..index]
                     .iter()
@@ -925,6 +937,7 @@ mod tests {
             entry.progress.push(Progress {
                 text: "资料检索已返回结果。".into(),
                 state,
+                proactive: false,
             });
             let ledger = round_trip(entry).unwrap();
             assert_eq!(ledger.version, 3);
@@ -937,9 +950,35 @@ mod tests {
             entry.progress.push(Progress {
                 text: "回执".into(),
                 state: Sent,
+                proactive: false,
             });
         }
         assert!(round_trip(entry).is_err(), "进度加分段不得突破 QQ 五次配额");
+    }
+
+    #[test]
+    fn proactive_progress_uses_v8_and_keeps_passive_quota_and_unknown_delivery() {
+        let mut entry = receipt(ReceiptState::Sent, Some(&[Sent, Sent, Sent]));
+        for i in 0..6 {
+            entry.progress.push(Progress {
+                text: "真实阶段".into(),
+                state: if i == 5 { Sending } else { Sent },
+                proactive: i >= 2,
+            });
+        }
+        let mut ledger = round_trip(entry).unwrap();
+        assert_eq!(ledger.version, 8);
+        assert_eq!(passive_progress(&ledger.entries[0]), 2);
+        assert_eq!(ledger.entries[0].progress[5].state, Sending);
+        let mut bytes: serde_json::Value =
+            serde_json::from_slice(&ledger.encode().unwrap()).unwrap();
+        bytes["version"] = 7.into();
+        assert!(Ledger::decode(&serde_json::to_vec(&bytes).unwrap()).is_err());
+        ledger.entries[0].progress[2].proactive = false;
+        assert!(
+            Ledger::decode(&ledger.encode().unwrap()).is_err(),
+            "三条被动进度与三段正文超出平台额度"
+        );
     }
 
     #[test]
