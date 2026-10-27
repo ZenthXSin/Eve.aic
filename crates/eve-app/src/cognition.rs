@@ -244,7 +244,9 @@ impl CognitionOptions {
             "status" => CognitionCommand::Status,
             "drive-submit" => {
                 let id = fields.remove("--id").ok_or("drive-submit 缺少 --id。")?;
-                let text = fields.remove("--text").ok_or("drive-submit 缺少 --text。")?;
+                let text = fields
+                    .remove("--text")
+                    .ok_or("drive-submit 缺少 --text。")?;
                 let priority = fields
                     .remove("--priority")
                     .unwrap_or_else(|| "50".into())
@@ -677,12 +679,15 @@ fn submit_drive(
     report
         .as_object_mut()
         .expect("status 始终返回 JSON 对象")
-        .insert("execution_contract".into(), json!({
-            "verification": "reflection:v1",
-            "max_model_requests": 1,
-            "max_tool_calls": 0,
-            "stop_condition": "single-attempt"
-        }));
+        .insert(
+           "execution_contract".into(),
+           json!({
+               "verification": "reflection:v1",
+               "max_model_requests": 1,
+               "max_tool_calls": 0,
+               "stop_condition": "single-attempt"
+           }),
+       );
     Ok(report)
 }
 
