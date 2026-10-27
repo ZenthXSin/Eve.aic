@@ -151,6 +151,21 @@ impl StoredCognition {
             return Err(CognitionError::StaleRevision);
         }
         state.validate()?;
+        for (id, old) in &inner.snapshot.state.autonomous_drives {
+            let next = state
+                .autonomous_drives
+                .get(id)
+                .ok_or(CognitionError::InvalidTransition)?;
+            validate_autonomous_drive_transition(old, next)?;
+        }
+        for (id, drive) in &state.autonomous_drives {
+            if !inner.snapshot.state.autonomous_drives.contains_key(id)
+                && (!matches!(drive.status, AutonomousDriveStatus::Candidate | AutonomousDriveStatus::Ready)
+                    || drive.attempts != 0)
+            {
+                return Err(CognitionError::InvalidTransition);
+            }
+        }
         if !state.events.starts_with(&inner.snapshot.state.events) {
             return Err(CognitionError::InvalidTransition);
         }
@@ -212,6 +227,46 @@ fn encode(snapshot: &CognitiveSnapshot) -> CognitionResult<Vec<u8>> {
         return Err(CognitionError::LimitReached);
     }
     Ok(bytes)
+}
+fn validate_autonomous_drive_transition(
+    old: &AutonomousDrive,
+    next: &AutonomousDrive,
+) -> CognitionResult<()> {
+    if old.source != next.source
+        || old.visibility != next.visibility
+        || old.description != next.description
+        || old.evidence != next.evidence
+        || old.priority != next.priority
+        || old.budget != next.budget
+        || old.stop_condition != next.stop_condition
+    {
+        return Err(CognitionError::AccessDenied);
+    }
+    if old.status == next.status {
+        return Ok(());
+    }
+    let allowed = matches!(
+        (&old.status, &next.status),
+        (AutonomousDriveStatus::Candidate, AutonomousDriveStatus::Ready)
+            | (AutonomousDriveStatus::Candidate, AutonomousDriveStatus::Waiting)
+            | (AutonomousDriveStatus::Candidate, AutonomousDriveStatus::Blocked)
+            | (AutonomousDriveStatus::Candidate, AutonomousDriveStatus::Cancelled)
+            | (AutonomousDriveStatus::Ready, AutonomousDriveStatus::Active)
+            | (AutonomousDriveStatus::Ready, AutonomousDriveStatus::Waiting)
+            | (AutonomousDriveStatus::Ready, AutonomousDriveStatus::Blocked)
+            | (AutonomousDriveStatus::Ready, AutonomousDriveStatus::Cancelled)
+            | (AutonomousDriveStatus::Active, AutonomousDriveStatus::Waiting)
+            | (AutonomousDriveStatus::Active, AutonomousDriveStatus::Blocked)
+            | (AutonomousDriveStatus::Active, AutonomousDriveStatus::Completed)
+            | (AutonomousDriveStatus::Waiting, AutonomousDriveStatus::Ready)
+            | (AutonomousDriveStatus::Waiting, AutonomousDriveStatus::Blocked)
+            | (AutonomousDriveStatus::Waiting, AutonomousDriveStatus::Cancelled)
+    );
+    if allowed {
+        Ok(())
+    } else {
+        Err(CognitionError::InvalidTransition)
+    }
 }
 fn validate_transition(old: &Goal, next: &Goal) -> CognitionResult<()> {
     if old.source != next.source || old.visibility != next.visibility {
