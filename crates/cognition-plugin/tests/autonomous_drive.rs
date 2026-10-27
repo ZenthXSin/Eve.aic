@@ -31,6 +31,8 @@ fn drive(status: AutonomousDriveStatus) -> AutonomousDrive {
         visibility: Visibility::Internal,
         description: "推进一个可验证的维护步骤".into(),
         evidence: vec![],
+        verification: Some("echo:推进一个可验证的维护步骤".into()),
+        goal_id: None,
         priority: 90,
         budget: ExecutionBudget {
             max_model_requests: 1,
