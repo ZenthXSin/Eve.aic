@@ -205,6 +205,16 @@ async fn interrupted_active_drive_is_unbound_for_retry_after_restart() {
         .goal_id = Some(goal_id.into());
     let bound = admin.replace(ready.revision, state).unwrap();
 
+    let mut forged = bound.state.clone();
+    forged.autonomous_drives
+        .get_mut("self-drive-1")
+        .unwrap()
+        .status = AutonomousDriveStatus::Active;
+    assert_eq!(
+        admin.replace(bound.revision, forged),
+        Err(CognitionError::InvalidTransition)
+    );
+
     let mut state = bound.state.clone();
     state.goals.get_mut(goal_id).unwrap().status = GoalStatus::Executing;
     state.goals.get_mut(goal_id).unwrap().execution = Some(ExecutionAttempt {
