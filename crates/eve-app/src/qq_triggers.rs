@@ -260,7 +260,7 @@ impl Tool for Tools {
     fn definition(&self) -> ToolDefinition {
         let (description, schema) = match self.operation {
             "set_wakeup_trigger" => (
-                "创建一次性条件触发器，条件满足时在当前会话自动唤醒你，读取原会话历史并执行 instructions，结果主动发回原会话。conditions 有 1–8 项，mode=all/any。type=time 使用 after_seconds 或 at_ms；file_changed 使用开发目录内相对 path；task_finished 使用本会话 task_id；message_contains 使用 text（只匹配创建后完成的用户轮次）；process_state 使用 pid 和 running（只观察该进程实例）。文件和进程仅限授权操作者。expires_in_seconds 默认7天、最多90天。检查不调用模型；执行与投递未知时不重放。",
+                "创建一次性条件触发器，成功后持续保存，跨对话和进程重启有效，不需要每轮重新开启；可在已有授权目标内自行设置。条件满足时在当前会话自动唤醒你，读取原会话历史并执行 instructions，结果主动发回原会话。conditions 有 1–8 项，mode=all/any。type=time 使用 after_seconds 或 at_ms；file_changed 使用开发目录内相对 path；task_finished 使用本会话 task_id；message_contains 使用 text（只匹配创建后完成的用户轮次）；process_state 使用 pid 和 running（只观察该进程实例）。文件和进程仅限授权操作者。expires_in_seconds 默认7天、最多90天。检查不调用模型；执行与投递未知时不重放。",
                 json!({"type":"object","properties":{
                 "title":{"type":"string"},"instructions":{"type":"string"},"mode":{"type":"string","enum":["all","any"]},
                 "expires_in_seconds":{"type":"integer","minimum":1,"maximum":7776000},
