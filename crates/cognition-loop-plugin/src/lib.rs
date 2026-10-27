@@ -427,6 +427,14 @@ impl Worker {
             .get_mut(&drive_id)
             .ok_or(LoopError::InvalidInput)?
             .goal_id = Some(goal_id.clone());
+        let caused_by = state
+            .events
+            .iter()
+            .find(|event| {
+                event.source.channel == "cognition.autonomous"
+                    && event.source.reference == drive_id
+            })
+            .map(|event| event.id.clone());
         state.events.push(CognitiveEvent {
             id: format!("autonomous-materialize-{}", snapshot.revision),
             kind: CognitiveEventKind::StateChanged,
@@ -437,7 +445,7 @@ impl Worker {
             },
             visibility: Visibility::Internal,
             goal_id: Some(goal_id),
-            caused_by: Some(drive_id),
+            caused_by,
             at_ms: now_ms,
             summary: "自主驱动已物化为待审核 Goal，等待统一议程准入。".into(),
         });
