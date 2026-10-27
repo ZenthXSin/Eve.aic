@@ -370,10 +370,11 @@ impl ContextAssembler for Context {
             };
             let current_user = scope.user_id.clone();
             let chime = scope.user_id == USER;
-            let conversation = if chime {
-                Some(scope.session_id)
+            let (conversation, current_user) = if chime {
+                (Some(scope.session_id), current_user)
             } else {
-                self.conversations
+                let identity = self
+                    .conversations
                     .identity(
                         &SessionKey::new(scope.session_id, scope.user_id)
                             .map_err(|e| LlmError::Context(e.to_string()))?,
@@ -385,8 +386,11 @@ impl ContextAssembler for Context {
                             v.source,
                             eve_qqbot_plugin::QqInteractionSource::GroupMessage
                         )
-                    })
-                    .map(|v| v.conversation)
+                    });
+                match identity {
+                    Some(identity) => (Some(identity.conversation), identity.user_id),
+                    None => (None, current_user),
+                }
             };
             if let Some(conversation) = conversation {
                 match self.group.store.recent(&conversation, RECENT_MESSAGES) {
