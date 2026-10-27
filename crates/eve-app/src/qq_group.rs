@@ -412,12 +412,10 @@ impl ContextAssembler for Context {
                                 .or_else(|| {
                                     // 通道可能在送入模型前移除唤醒前缀；此时最近一条该成员原话就是本轮锚点。
                                     (current_user != USER).then(|| {
-                                        messages
-                                            .iter()
-                                            .rposition(|message| {
-                                                !message.from_me
-                                                    && message.speaker == current_user.as_str()
-                                            })
+                                        messages.iter().rposition(|message| {
+                                            !message.from_me
+                                                && message.speaker == current_user.as_str()
+                                        })
                                     })?
                                 });
                             let selected: Vec<_> = messages
