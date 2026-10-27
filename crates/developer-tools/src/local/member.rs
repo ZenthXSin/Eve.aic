@@ -98,15 +98,26 @@ impl LocalDeveloper {
                 "成员编译需要 Linux bubblewrap；隔离不可用时不回退宿主命令",
             ));
         }
-        let mut command = Command::new("/usr/bin/bwrap");
-        command.args([
-            "--unshare-all",
-            "--share-net",
-            "--die-with-parent",
-            "--new-session",
-            "--cap-drop",
-            "ALL",
-        ]);
+        let launcher = self
+            .member_runtime
+            .as_ref()
+            .and_then(|r| r.network_launcher.as_ref());
+        let mut command = if let Some(launcher) = launcher {
+            if !launcher.is_absolute() || !launcher.is_file() {
+                return Err(failed("成员网络启动器不可用；不回退宿主网络"));
+            }
+            let mut command = Command::new(launcher);
+            command
+                .arg("/usr/bin/bwrap")
+                .arg("--unshare-all")
+                .arg("--share-net");
+            command
+        } else {
+            let mut command = Command::new("/usr/bin/bwrap");
+            command.arg("--unshare-all");
+            command
+        };
+        command.args(["--die-with-parent", "--new-session", "--cap-drop", "ALL"]);
         for path in [
             "/usr",
             "/bin",
@@ -183,19 +194,8 @@ impl LocalDeveloper {
         {
             command.env("JAVA_HOME", "/opt/eve/jdk");
         }
-        for name in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "NO_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-            "no_proxy",
-            "SSL_CERT_FILE",
-            "NODE_EXTRA_CA_CERTS",
-            "GIT_SSL_CAINFO",
-        ] {
+        // 不继承宿主代理地址或代理凭据；公网出口由宿主网络启动器提供。
+        for name in ["SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "GIT_SSL_CAINFO"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
             }

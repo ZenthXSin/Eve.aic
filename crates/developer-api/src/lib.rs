@@ -197,6 +197,8 @@ pub trait DeveloperAuthorization: Send + Sync {
 pub struct MemberRuntime {
     pub java_home: Option<PathBuf>,
     pub mindustry_server: Option<PathBuf>,
+    /// 宿主部署的受控网络启动器；缺省为完全隔离网络，不共享宿主。
+    pub network_launcher: Option<PathBuf>,
 }
 pub fn member_workspace(root: &std::path::Path, scope: &eve_llm_api::ContextScope) -> PathBuf {
     let hash = ring::digest::digest(&ring::digest::SHA256, scope.user_id.as_bytes());

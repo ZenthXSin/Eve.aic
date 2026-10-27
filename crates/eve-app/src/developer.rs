@@ -160,6 +160,8 @@ pub(crate) fn member_runtime(
             .filter(|p| p.file_name().is_some_and(|n| n == "java"))
             .and_then(|p| p.parent()?.parent().map(Path::to_path_buf)),
         mindustry_server: jar.and_then(|p| p.canonicalize().ok()),
+        network_launcher: std::env::var_os("EVE_MEMBER_NETWORK_LAUNCHER")
+            .map(std::path::PathBuf::from),
     }
 }
 
