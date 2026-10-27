@@ -219,6 +219,11 @@ impl Worker {
             if snapshot.subject_id != self.options.scope.subject_id {
                 return Err(CognitionError::SubjectMismatch.into());
             }
+            let snapshot = match self.review_autonomous_drives(snapshot, time) {
+                Ok(snapshot) => snapshot,
+                Err(LoopError::Cognition(CognitionError::StaleRevision)) => continue,
+                Err(error) => return Err(error),
+            };
             let budget_started = Instant::now();
             let epoch = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -318,6 +323,46 @@ impl Worker {
             result?;
         }
     }
+    fn review_autonomous_drives(
+        &self,
+        snapshot: CognitiveSnapshot,
+        now_ms: u64,
+    ) -> LoopResult<CognitiveSnapshot> {
+        let mut state = snapshot.state.clone();
+        let mut changes = Vec::new();
+        for drive in state.autonomous_drives.values_mut() {
+            if let Some(status) = drive.reviewed_status(now_ms)
+                && status != drive.status
+            {
+                let previous = drive.status.clone();
+                drive.status = status.clone();
+                changes.push((drive.id.clone(), previous, status));
+            }
+        }
+        if changes.is_empty() {
+            return Ok(snapshot);
+        }
+        for (id, previous, status) in changes {
+            state.events.push(CognitiveEvent {
+                id: format!("autonomous-review-{}-{}", snapshot.revision, id),
+                kind: CognitiveEventKind::StateChanged,
+                source: Source {
+                    kind: SourceKind::Internal,
+                    channel: "cognition.autonomous.review".into(),
+                    reference: id,
+                },
+                visibility: Visibility::Internal,
+                goal_id: None,
+                caused_by: None,
+                at_ms: now_ms,
+                summary: format!("自主驱动审核：{previous:?} -> {status:?}"),
+            });
+        }
+        self.admin
+            .replace(snapshot.revision, state)
+            .map_err(LoopError::from)
+    }
+
     async fn execute(
         &self,
         goal: &Goal,
