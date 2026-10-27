@@ -219,11 +219,21 @@ impl Worker {
             if snapshot.subject_id != self.options.scope.subject_id {
                 return Err(CognitionError::SubjectMismatch.into());
             }
-            let budget_started = Instant::now();
             let epoch = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| LoopError::Unavailable)?;
             let time = u64::try_from(epoch.as_millis()).map_err(|_| LoopError::LimitReached)?;
+            let snapshot = match self.review_autonomous_drives(snapshot, time) {
+                Ok(snapshot) => snapshot,
+                Err(LoopError::Cognition(CognitionError::StaleRevision)) => continue,
+                Err(error) => return Err(error),
+            };
+            let snapshot = match self.materialize_autonomous_drives(snapshot, time) {
+                Ok(snapshot) => snapshot,
+                Err(LoopError::Cognition(CognitionError::StaleRevision)) => continue,
+                Err(error) => return Err(error),
+            };
+            let budget_started = Instant::now();
             let submitted = self
                 .running
                 .stats
@@ -290,6 +300,7 @@ impl Worker {
             goal.status = GoalStatus::Executing;
             goal.execution = Some(attempt.clone());
             state.goals.insert(selected.clone(), goal.clone());
+            self.activate_autonomous_drive(&mut state, selected, time)?;
             state.agenda = Some(Agenda {
                 visibility: Visibility::Internal,
                 candidates: ranked
@@ -318,6 +329,155 @@ impl Worker {
             result?;
         }
     }
+    fn review_autonomous_drives(
+        &self,
+        snapshot: CognitiveSnapshot,
+        now_ms: u64,
+    ) -> LoopResult<CognitiveSnapshot> {
+        let mut state = snapshot.state.clone();
+        let mut changes = Vec::new();
+        for drive in state.autonomous_drives.values_mut() {
+            if let Some(status) = drive.reviewed_status(now_ms)
+                && status != drive.status
+            {
+                let previous = drive.status.clone();
+                drive.status = status.clone();
+                changes.push((drive.id.clone(), previous, status));
+            }
+        }
+        if changes.is_empty() {
+            return Ok(snapshot);
+        }
+        for (index, (id, previous, status)) in changes.into_iter().enumerate() {
+            state.events.push(CognitiveEvent {
+                id: format!("autonomous-review-{}-{}", snapshot.revision, index),
+                kind: CognitiveEventKind::StateChanged,
+                source: Source {
+                    kind: SourceKind::Internal,
+                    channel: "cognition.autonomous.review".into(),
+                    reference: id,
+                },
+                visibility: Visibility::Internal,
+                goal_id: None,
+                caused_by: None,
+                at_ms: now_ms,
+                summary: format!("自主驱动审核：{previous:?} -> {status:?}"),
+            });
+        }
+        self.admin
+            .replace(snapshot.revision, state)
+            .map_err(LoopError::from)
+    }
+
+    fn materialize_autonomous_drives(
+        &self,
+        snapshot: CognitiveSnapshot,
+        now_ms: u64,
+    ) -> LoopResult<CognitiveSnapshot> {
+        let mut state = snapshot.state.clone();
+        let mut candidates: Vec<_> = state
+            .autonomous_drives
+            .iter()
+            .filter(|(_, drive)| drive.is_runnable(now_ms) && drive.goal_id.is_none())
+            .map(|(id, drive)| (id.clone(), drive.clone()))
+            .collect();
+        candidates.sort_by(|(left_id, left), (right_id, right)| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        let materialized = candidates
+            .into_iter()
+            .enumerate()
+            .find_map(|(index, (id, drive))| {
+                let verification = drive.verification.clone()?;
+                let goal_id = format!("autonomous.goal.{}.{}", snapshot.revision, index);
+                if state.goals.contains_key(&goal_id) {
+                    return None;
+                }
+                Some((id, goal_id, drive, verification))
+            });
+        let Some((drive_id, goal_id, drive, verification)) = materialized else {
+            return Ok(snapshot);
+        };
+        state.goals.insert(
+            goal_id.clone(),
+            Goal {
+                id: goal_id.clone(),
+                revision: 0,
+                source: drive.source.clone(),
+                visibility: drive.visibility.clone(),
+                description: drive.description.clone(),
+                verification,
+                priority: drive.priority,
+                budget: drive.budget.clone(),
+                stop_condition: drive.stop_condition.clone(),
+                expires_at_ms: drive.valid_until_ms,
+                status: GoalStatus::Ready,
+                wait_reason: None,
+                block_reason: None,
+                execution: None,
+                feedback: None,
+                completion: None,
+            },
+        );
+        state
+            .autonomous_drives
+            .get_mut(&drive_id)
+            .ok_or(LoopError::InvalidInput)?
+            .goal_id = Some(goal_id.clone());
+        let caused_by = state
+            .events
+            .iter()
+            .find(|event| {
+                event.source.channel == "cognition.autonomous" && event.source.reference == drive_id
+            })
+            .map(|event| event.id.clone());
+        state.events.push(CognitiveEvent {
+            id: format!("autonomous-materialize-{}", snapshot.revision),
+            kind: CognitiveEventKind::StateChanged,
+            source: Source {
+                kind: SourceKind::Internal,
+                channel: "cognition.autonomous.materialize".into(),
+                reference: goal_id.clone(),
+            },
+            visibility: Visibility::Internal,
+            goal_id: Some(goal_id),
+            caused_by,
+            at_ms: now_ms,
+            summary: "自主驱动已物化为待审核 Goal，等待统一议程准入。".into(),
+        });
+        self.admin
+            .replace(snapshot.revision, state)
+            .map_err(LoopError::from)
+    }
+
+    fn activate_autonomous_drive(
+        &self,
+        state: &mut CognitiveState,
+        goal_id: &str,
+        now_ms: u64,
+    ) -> LoopResult<()> {
+        let Some(drive) = state
+            .autonomous_drives
+            .values_mut()
+            .find(|drive| drive.goal_id.as_deref() == Some(goal_id))
+        else {
+            return Ok(());
+        };
+        if drive.status != AutonomousDriveStatus::Ready {
+            return Err(CognitionError::InvalidTransition.into());
+        }
+        drive.status = AutonomousDriveStatus::Active;
+        drive.attempts = drive
+            .attempts
+            .checked_add(1)
+            .ok_or(CognitionError::LimitReached)?;
+        drive.last_progress_at_ms = Some(now_ms);
+        Ok(())
+    }
+
     async fn execute(
         &self,
         goal: &Goal,
@@ -568,6 +728,36 @@ impl Worker {
             current.block_reason = reason.clone();
             current.feedback = Some(feedback.clone());
             current.execution.as_mut().expect("执行关联已检查").turn_id = turn_id;
+            if let Some(drive) = state
+                .autonomous_drives
+                .values_mut()
+                .find(|drive| drive.goal_id.as_deref() == Some(goal.id.as_str()))
+            {
+                drive.last_progress_at_ms = Some(feedback.at_ms);
+                match status {
+                    GoalStatus::Completed => {
+                        drive.status = AutonomousDriveStatus::Completed;
+                        drive.cooldown_until_ms = None;
+                    }
+                    GoalStatus::Cancelled => {
+                        drive.status = AutonomousDriveStatus::Cancelled;
+                        drive.cooldown_until_ms = None;
+                    }
+                    GoalStatus::Blocked => {
+                        drive.goal_id = None;
+                        if feedback.commit == ExecutionCommit::NotStarted
+                            && drive.attempts < drive.budget.max_attempts
+                        {
+                            drive.status = AutonomousDriveStatus::Waiting;
+                            drive.cooldown_until_ms = Some(feedback.at_ms.saturating_add(60_000));
+                        } else {
+                            drive.status = AutonomousDriveStatus::Blocked;
+                            drive.cooldown_until_ms = None;
+                        }
+                    }
+                    _ => return Err(LoopError::InvalidInput),
+                }
+            }
             if let Some(agenda) = &mut state.agenda {
                 agenda
                     .candidates

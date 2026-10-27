@@ -1,10 +1,11 @@
-//! 组合层只读取宿主配置与凭据引用。没有配置就不注册开发工具。
+//! 组合层只读取宿主配置与凭据引用。
 use crate::{AppError, CoreBootstrap};
 use eve_developer_api::{ActionReviewFuture, ActionReviewRequest, ActionReviewer, DeveloperConfig};
 use eve_llm_api::{LlmError, LlmModelResolver, ModelSelection};
 use eve_plugin_api::ServiceRegistry;
 use serde_json::json;
 use std::{
+    collections::BTreeSet,
     path::Path,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -12,6 +13,35 @@ use std::{
 
 /// 行动审查的模型用途，单独记健康与输出上限。
 pub(crate) const REVIEW_USE: &str = "review";
+
+/// 真实宿主在没有显式配置时自动装配主人可用的工具；本地 fixture 进程保持
+/// 无工具，避免把测试服务器或测试目录暴露给模型。
+fn direct_tools_enabled() -> bool {
+    if std::env::var("EVE_DIRECT_TOOLS").ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }) {
+        return true;
+    }
+    if std::env::var("EVE_OPENAI_API_KEY")
+        .ok()
+        .is_none_or(|key| key.trim().is_empty())
+    {
+        return false;
+    }
+    let Some(base_url) = std::env::var("EVE_OPENAI_BASE_URL").ok() else {
+        return true;
+    };
+    let normalized = base_url.trim().to_ascii_lowercase();
+    !(normalized.starts_with("http://127.0.0.1")
+        || normalized.starts_with("http://localhost")
+        || normalized.starts_with("http://[::1]")
+        || normalized.starts_with("https://127.0.0.1")
+        || normalized.starts_with("https://localhost")
+        || normalized.starts_with("https://[::1]"))
+}
 
 pub(crate) fn install(bootstrap: &mut CoreBootstrap, state: &Path) -> Result<(), AppError> {
     install_with_authorization(bootstrap, state, None)
@@ -30,15 +60,41 @@ pub(crate) fn install_with_member_runtime(
     member_runtime: Option<eve_developer_api::MemberRuntime>,
     reviewer: Option<Arc<dyn ActionReviewer>>,
 ) -> Result<(), AppError> {
-    let Some(path) = std::env::var_os("EVE_DEVELOPER_CONFIG") else {
+    let config: DeveloperConfig = if let Some(path) = std::env::var_os("EVE_DEVELOPER_CONFIG") {
+        let bytes = std::fs::read(path).map_err(|_| "开发工具配置文件无法读取；保留原文件")?;
+        if bytes.len() > 32 * 1024 {
+            return Err("开发工具配置超过上限".into());
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|_| "开发工具配置无效；不能在配置内填写 token 正文")?
+    } else if direct_tools_enabled() {
+        let workspace =
+            std::env::current_dir().map_err(|_| "无法确定 Eve 工作目录；未装配开发工具")?;
+        // 主人默认会话直接拥有受限开发工具；命令策略和行动审查仍然生效。
+        // 自升级、实时切换和 GitHub 写入保持关闭，凭据只从宿主环境读取。
+        DeveloperConfig {
+            workspace,
+            storage_directory: None,
+            operators: BTreeSet::from(["owner".into()]),
+            ordinary_access: false,
+            commands: true,
+            github: true,
+            github_all_users: false,
+            github_all_repositories: false,
+            github_write_repositories: BTreeSet::new(),
+            github_token_env: "EVE_GITHUB_TOKEN".into(),
+            command_timeout_ms: 120_000,
+            max_tool_rounds: 8,
+            self_upgrade: false,
+            live_upgrade: None,
+            command_policy: None,
+            action_review: true,
+            cargo_program: "cargo".into(),
+            cargo_arguments: Vec::new(),
+        }
+    } else {
         return Ok(());
     };
-    let bytes = std::fs::read(path).map_err(|_| "开发工具配置文件无法读取；保留原文件")?;
-    if bytes.len() > 32 * 1024 {
-        return Err("开发工具配置超过上限".into());
-    }
-    let config: DeveloperConfig = serde_json::from_slice(&bytes)
-        .map_err(|_| "开发工具配置无效；不能在配置内填写 token 正文")?;
     config.validate()?;
     let token = std::env::var(&config.github_token_env).ok();
     if !config.github_write_repositories.is_empty()

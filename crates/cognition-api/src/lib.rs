@@ -1,7 +1,9 @@
 //! 统一认知状态的公开契约；不包含存储、调度、模型或执行权限实现。
+mod autonomous_drive;
 mod file_observation;
 mod goal_feedback;
 mod world_model;
+pub use autonomous_drive::*;
 pub use file_observation::*;
 pub use goal_feedback::*;
 use serde::{Deserialize, Serialize};
@@ -334,16 +336,37 @@ pub struct CognitiveEvent {
 pub struct CognitiveState {
     pub goals: BTreeMap<String, Goal>,
     pub drives: BTreeMap<String, Drive>,
+    /// 持久化的内生驱动候选；旧快照缺失时按空集合恢复。
+    #[serde(default)]
+    pub autonomous_drives: BTreeMap<String, AutonomousDrive>,
     pub agenda: Option<Agenda>,
     pub events: Vec<CognitiveEvent>,
 }
 impl CognitiveState {
+    /// 按确定性优先级返回当前可运行的内生驱动；这里只做候选排序，不授予执行权限。
+    pub fn runnable_autonomous_drives(&self, now_ms: u64) -> Vec<&AutonomousDrive> {
+        let mut drives: Vec<_> = self
+            .autonomous_drives
+            .values()
+            .filter(|drive| drive.is_runnable(now_ms))
+            .collect();
+        drives.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
+        drives
+    }
+
     pub fn validate(&self) -> CognitionResult<()> {
         if self.goals.len() > MAX_RECORDS
             || self.drives.len() > MAX_RECORDS
+            || self.autonomous_drives.len() > MAX_RECORDS
             || self.events.len() > MAX_RECORDS
         {
             return Err(CognitionError::LimitReached);
+        }
+        for (id, drive) in &self.autonomous_drives {
+            drive.validate()?;
+            if id != &drive.id {
+                return Err(CognitionError::InvalidInput);
+            }
         }
         let mut executing = 0;
         for (id, goal) in &self.goals {
@@ -352,6 +375,38 @@ impl CognitiveState {
                 return Err(CognitionError::InvalidInput);
             }
             executing += usize::from(goal.status == GoalStatus::Executing);
+        }
+        for drive in self.autonomous_drives.values() {
+            if let Some(goal_id) = &drive.goal_id {
+                let goal = self
+                    .goals
+                    .get(goal_id)
+                    .ok_or(CognitionError::InvalidInput)?;
+                if goal.source != drive.source
+                    || goal.visibility != drive.visibility
+                    || goal.description != drive.description
+                    || goal.verification != drive.verification.clone().unwrap_or_default()
+                    || goal.priority != drive.priority
+                    || goal.budget != drive.budget
+                    || goal.stop_condition != drive.stop_condition
+                    || goal.expires_at_ms != drive.valid_until_ms
+                {
+                    return Err(CognitionError::AccessDenied);
+                }
+                let lifecycle_matches = match &drive.status {
+                    AutonomousDriveStatus::Ready => goal.status == GoalStatus::Ready,
+                    AutonomousDriveStatus::Active => goal.status == GoalStatus::Executing,
+                    AutonomousDriveStatus::Completed => goal.status == GoalStatus::Completed,
+                    AutonomousDriveStatus::Cancelled => goal.status == GoalStatus::Cancelled,
+                    // Blocked 绑定允许旧快照先通过校验，由启动恢复解除失效绑定。
+                    AutonomousDriveStatus::Candidate
+                    | AutonomousDriveStatus::Waiting
+                    | AutonomousDriveStatus::Blocked => true,
+                };
+                if !lifecycle_matches {
+                    return Err(CognitionError::InvalidTransition);
+                }
+            }
         }
         if executing > 1 {
             return Err(CognitionError::Busy);
@@ -539,6 +594,7 @@ redacted_debug!(
     CompletionConfirmation,
     Goal,
     Drive,
+    AutonomousDrive,
     Agenda,
     CognitiveEvent,
     CognitiveState,

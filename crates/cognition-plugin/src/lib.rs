@@ -99,6 +99,15 @@ impl StoredCognition {
                 recovered = true;
             }
         }
+        for drive in snapshot.state.autonomous_drives.values_mut() {
+            if drive.status == AutonomousDriveStatus::Active {
+                drive.status = AutonomousDriveStatus::Blocked;
+                // 中断的 Goal 已被恢复为 Blocked；解除绑定，避免驱动永久跳过重试。
+                drive.goal_id = None;
+                drive.cooldown_until_ms = None;
+                recovered = true;
+            }
+        }
         if recovered {
             snapshot.revision = snapshot
                 .revision
@@ -151,6 +160,23 @@ impl StoredCognition {
             return Err(CognitionError::StaleRevision);
         }
         state.validate()?;
+        for (id, old) in &inner.snapshot.state.autonomous_drives {
+            let next = state
+                .autonomous_drives
+                .get(id)
+                .ok_or(CognitionError::InvalidTransition)?;
+            validate_autonomous_drive_transition(old, next)?;
+        }
+        for (id, drive) in &state.autonomous_drives {
+            if !inner.snapshot.state.autonomous_drives.contains_key(id)
+                && (!matches!(
+                    drive.status,
+                    AutonomousDriveStatus::Candidate | AutonomousDriveStatus::Ready
+                ) || drive.attempts != 0)
+            {
+                return Err(CognitionError::InvalidTransition);
+            }
+        }
         if !state.events.starts_with(&inner.snapshot.state.events) {
             return Err(CognitionError::InvalidTransition);
         }
@@ -212,6 +238,102 @@ fn encode(snapshot: &CognitiveSnapshot) -> CognitionResult<Vec<u8>> {
         return Err(CognitionError::LimitReached);
     }
     Ok(bytes)
+}
+fn validate_autonomous_drive_transition(
+    old: &AutonomousDrive,
+    next: &AutonomousDrive,
+) -> CognitionResult<()> {
+    if old.source != next.source
+        || old.visibility != next.visibility
+        || old.description != next.description
+        || old.evidence != next.evidence
+        || old.verification != next.verification
+        || old.priority != next.priority
+        || old.budget != next.budget
+        || old.stop_condition != next.stop_condition
+    {
+        return Err(CognitionError::AccessDenied);
+    }
+    if old.status == next.status {
+        let binding_update = old.goal_id != next.goal_id;
+        if binding_update
+            && !(old.status == AutonomousDriveStatus::Ready
+                && old.goal_id.is_none()
+                && next.goal_id.is_some())
+        {
+            return Err(CognitionError::InvalidTransition);
+        }
+        return Ok(());
+    }
+    let binding_update = old.goal_id != next.goal_id;
+    if next.status == AutonomousDriveStatus::Active && next.goal_id.is_none() {
+        return Err(CognitionError::InvalidTransition);
+    }
+    let binding_allowed = match (&old.status, &next.status) {
+        (AutonomousDriveStatus::Ready, AutonomousDriveStatus::Ready) => {
+            old.goal_id.is_none() && next.goal_id.is_some()
+        }
+        (
+            AutonomousDriveStatus::Active,
+            AutonomousDriveStatus::Waiting | AutonomousDriveStatus::Blocked,
+        ) => old.goal_id.is_some() && next.goal_id.is_none(),
+        _ => !binding_update,
+    };
+    if !binding_allowed {
+        return Err(CognitionError::InvalidTransition);
+    }
+    let allowed = matches!(
+        (&old.status, &next.status),
+        (
+            AutonomousDriveStatus::Candidate,
+            AutonomousDriveStatus::Ready,
+        ) | (
+            AutonomousDriveStatus::Candidate,
+            AutonomousDriveStatus::Waiting,
+        ) | (
+            AutonomousDriveStatus::Candidate,
+            AutonomousDriveStatus::Blocked,
+        ) | (
+            AutonomousDriveStatus::Candidate,
+            AutonomousDriveStatus::Cancelled,
+        ) | (AutonomousDriveStatus::Ready, AutonomousDriveStatus::Active,)
+            | (AutonomousDriveStatus::Ready, AutonomousDriveStatus::Waiting,)
+            | (AutonomousDriveStatus::Ready, AutonomousDriveStatus::Blocked,)
+            | (
+                AutonomousDriveStatus::Ready,
+                AutonomousDriveStatus::Cancelled,
+            )
+            | (
+                AutonomousDriveStatus::Active,
+                AutonomousDriveStatus::Waiting,
+            )
+            | (
+                AutonomousDriveStatus::Active,
+                AutonomousDriveStatus::Blocked,
+            )
+            | (
+                AutonomousDriveStatus::Active,
+                AutonomousDriveStatus::Completed,
+            )
+            | (
+                AutonomousDriveStatus::Active,
+                AutonomousDriveStatus::Cancelled,
+            )
+            | (AutonomousDriveStatus::Waiting, AutonomousDriveStatus::Ready,)
+            | (
+                AutonomousDriveStatus::Waiting,
+                AutonomousDriveStatus::Blocked,
+            )
+            | (
+                AutonomousDriveStatus::Waiting,
+                AutonomousDriveStatus::Cancelled,
+            )
+    );
+    if allowed {
+        Ok(())
+    } else {
+        Err(CognitionError::InvalidTransition)
+    }
 }
 fn validate_transition(old: &Goal, next: &Goal) -> CognitionResult<()> {
     if old.source != next.source || old.visibility != next.visibility {
@@ -310,6 +432,9 @@ impl CognitionReader for ScopedReader {
             .drives
             .retain(|_, d| d.visibility.visible_to(&self.access));
         state
+            .autonomous_drives
+            .retain(|_, drive| drive.visibility.visible_to(&self.access));
+        state
             .events
             .retain(|e| e.visibility.visible_to(&self.access));
         if state
@@ -332,6 +457,98 @@ pub struct CognitionController {
     active: Arc<Mutex<Option<Arc<StoredCognition>>>>,
 }
 impl CognitionController {
+    /// 由受信宿主运行固定自动审核；只推进候选生命周期并追加脱敏审计事件。
+    pub fn review_autonomous_drives(
+        &self,
+        expected_revision: u64,
+        now_ms: u64,
+    ) -> CognitionResult<CognitiveSnapshot> {
+        if now_ms == 0 {
+            return Err(CognitionError::InvalidInput);
+        }
+        let mut snapshot = self.snapshot()?;
+        if snapshot.revision != expected_revision {
+            return Err(CognitionError::StaleRevision);
+        }
+        let mut changed = Vec::new();
+        for drive in snapshot.state.autonomous_drives.values_mut() {
+            if let Some(status) = drive.reviewed_status(now_ms)
+                && status != drive.status
+            {
+                let previous = drive.status.clone();
+                drive.status = status.clone();
+                changed.push((drive.id.clone(), previous, status));
+            }
+        }
+        if changed.is_empty() {
+            return Ok(snapshot);
+        }
+        for (index, (id, previous, status)) in changed.into_iter().enumerate() {
+            let event_id = format!("autonomous-review-{expected_revision}-{index}");
+            snapshot.state.events.push(CognitiveEvent {
+                id: event_id,
+                kind: CognitiveEventKind::StateChanged,
+                source: Source {
+                    kind: SourceKind::Internal,
+                    channel: "cognition.autonomous.review".into(),
+                    reference: id,
+                },
+                visibility: Visibility::Internal,
+                goal_id: None,
+                caused_by: None,
+                at_ms: now_ms,
+                summary: format!("自主驱动审核：{previous:?} -> {status:?}"),
+            });
+        }
+        self.replace(expected_revision, snapshot.state)
+    }
+
+    /// 由受信宿主提交一个有来源的自主驱动候选；模型和普通通道不能直接调用。
+    pub fn submit_autonomous_drive(
+        &self,
+        expected_revision: u64,
+        drive: AutonomousDrive,
+        at_ms: u64,
+    ) -> CognitionResult<CognitiveSnapshot> {
+        if at_ms == 0
+            || !matches!(
+                drive.status,
+                AutonomousDriveStatus::Candidate | AutonomousDriveStatus::Ready
+            )
+            || drive.attempts != 0
+            || drive.goal_id.is_some()
+        {
+            return Err(CognitionError::InvalidInput);
+        }
+        drive.validate()?;
+        let mut snapshot = self.snapshot()?;
+        if snapshot.revision != expected_revision
+            || snapshot.state.autonomous_drives.contains_key(&drive.id)
+        {
+            return Err(CognitionError::StaleRevision);
+        }
+        let id = format!("autonomous-drive-{expected_revision}");
+        snapshot
+            .state
+            .autonomous_drives
+            .insert(drive.id.clone(), drive.clone());
+        snapshot.state.events.push(CognitiveEvent {
+            id,
+            kind: CognitiveEventKind::StateChanged,
+            source: Source {
+                kind: SourceKind::Internal,
+                channel: "cognition.autonomous".into(),
+                reference: drive.id.clone(),
+            },
+            visibility: drive.visibility.clone(),
+            goal_id: None,
+            caused_by: None,
+            at_ms,
+            summary: "自主驱动候选已提交，等待议程审核。".into(),
+        });
+        self.replace(expected_revision, snapshot.state)
+    }
+
     fn service(&self) -> CognitionResult<Arc<StoredCognition>> {
         self.active
             .lock()

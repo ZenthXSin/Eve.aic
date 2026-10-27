@@ -49,6 +49,9 @@ pub const COGNITION_HELP: &str = "Eve 本地内生反思入口
   feedback --id ID --revision N --feedback-id ID --text 反馈 [--user owner]
                                           保存用户新事实并使旧草稿过期，不调用模型
   status                                  查看无正文的状态计数
+  drive-submit --id ID --text 目标文字 [--priority N] [--valid-until-ms N]
+                                          提交受信自主驱动候选（只允许无工具反思）
+  drive-show --id ID                      查看自主驱动及绑定 Goal 状态
   agenda                                  只读预览执行议程与等待目标的下一次派生，不调用模型
   show --id ID                            查看目标及草稿，current/stale 标明是否属于当前修订
   export-plan --id ID --revision N --observe-file 路径 --input-sha256 SHA --output 路径 [--user owner]
@@ -116,6 +119,15 @@ enum CognitionCommand {
         max_executions: u16,
         observation: Option<FileObservationOptions>,
     },
+    DriveSubmit {
+        id: String,
+        text: String,
+        priority: u8,
+        valid_until_ms: Option<u64>,
+    },
+    DriveShow {
+        id: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +164,8 @@ impl CognitionOptions {
                 "add",
                 "feedback",
                 "status",
+                "drive-submit",
+                "drive-show",
                 "agenda",
                 "show",
                 "run",
@@ -184,6 +198,8 @@ impl CognitionOptions {
                 "--observe-goal",
                 "--observe-file",
                 "--observe-user",
+                "--priority",
+                "--valid-until-ms",
                 "--input-sha256",
                 "--output",
                 "--steps",
@@ -226,6 +242,41 @@ impl CognitionOptions {
                 CognitionCommand::Add { id, text, user }
             }
             "status" => CognitionCommand::Status,
+            "drive-submit" => {
+                let id = fields.remove("--id").ok_or("drive-submit 缺少 --id。")?;
+                let text = fields
+                    .remove("--text")
+                    .ok_or("drive-submit 缺少 --text。")?;
+                let priority = fields
+                    .remove("--priority")
+                    .unwrap_or_else(|| "50".into())
+                    .parse::<u8>()
+                    .map_err(|_| "自主驱动优先级必须为整数。")?;
+                let valid_until_ms = fields
+                    .remove("--valid-until-ms")
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| "自主驱动过期时间必须为整数。")
+                    })
+                    .transpose()?;
+                validate_id(&id)?;
+                validate_text(&text)?;
+                if priority > 100 || valid_until_ms == Some(0) {
+                    return Err("自主驱动优先级须在 0 至 100，过期时间不能为 0。".into());
+                }
+                CognitionCommand::DriveSubmit {
+                    id,
+                    text,
+                    priority,
+                    valid_until_ms,
+                }
+            }
+            "drive-show" => {
+                let id = fields.remove("--id").ok_or("drive-show 缺少 --id。")?;
+                validate_id(&id)?;
+                CognitionCommand::DriveShow { id }
+            }
             "agenda" => CognitionCommand::Agenda,
             "feedback" => {
                 let goal_id = fields.remove("--id").ok_or("feedback 缺少 --id。")?;
@@ -456,6 +507,15 @@ fn status(command: &str, snapshot: &CognitiveSnapshot) -> Value {
         "ready": count(GoalStatus::Ready), "executing": count(GoalStatus::Executing),
         "completed": count(GoalStatus::Completed), "cancelled": count(GoalStatus::Cancelled),
         "blocked": count(GoalStatus::Blocked)
+    }, "autonomous_drives": {
+        "total": snapshot.state.autonomous_drives.len(),
+        "candidate": snapshot.state.autonomous_drives.values().filter(|drive| drive.status == AutonomousDriveStatus::Candidate).count(),
+        "ready": snapshot.state.autonomous_drives.values().filter(|drive| drive.status == AutonomousDriveStatus::Ready).count(),
+        "active": snapshot.state.autonomous_drives.values().filter(|drive| drive.status == AutonomousDriveStatus::Active).count(),
+        "waiting": snapshot.state.autonomous_drives.values().filter(|drive| drive.status == AutonomousDriveStatus::Waiting).count(),
+        "blocked": snapshot.state.autonomous_drives.values().filter(|drive| drive.status == AutonomousDriveStatus::Blocked).count(),
+        "completed": snapshot.state.autonomous_drives.values().filter(|drive| drive.status == AutonomousDriveStatus::Completed).count(),
+        "cancelled": snapshot.state.autonomous_drives.values().filter(|drive| drive.status == AutonomousDriveStatus::Cancelled).count()
     }})
 }
 
@@ -473,6 +533,14 @@ fn reflection_planner_options(max_derivations: u16) -> EndogenousOptions {
         max_derivations,
         timeout_ms: 30_000,
     }
+}
+
+fn has_runnable_autonomous_drive(snapshot: &CognitiveSnapshot, now_ms: u64) -> bool {
+    snapshot
+        .state
+        .autonomous_drives
+        .values()
+        .any(|drive| drive.is_runnable(now_ms))
 }
 
 fn reflection_execution_agenda(
@@ -577,6 +645,77 @@ fn add(
     let mut report = status("add", &saved);
     report["goal_id"] = json!(id);
     Ok(report)
+}
+
+fn submit_drive(
+    admin: &CognitionController,
+    id: String,
+    text: String,
+    priority: u8,
+    valid_until_ms: Option<u64>,
+) -> Result<Value, AppError> {
+    let snapshot = admin.snapshot()?;
+    let drive = AutonomousDrive {
+        id: id.clone(),
+        source: Source {
+            kind: SourceKind::Inference,
+            channel: "endogenous".into(),
+            reference: id.clone(),
+        },
+        visibility: Visibility::Internal,
+        description: text,
+        evidence: Vec::new(),
+        verification: Some("reflection:v1".into()),
+        goal_id: None,
+        priority,
+        budget: ExecutionBudget {
+            max_model_requests: 1,
+            max_tool_calls: 0,
+            max_attempts: 1,
+            timeout_ms: 30_000,
+        },
+        stop_condition: "single-attempt".into(),
+        status: AutonomousDriveStatus::Ready,
+        attempts: 0,
+        cooldown_until_ms: None,
+        last_progress_at_ms: None,
+        valid_until_ms,
+    };
+    let saved = admin.submit_autonomous_drive(snapshot.revision, drive, now_ms()?)?;
+    let mut report = status("drive-submit", &saved);
+    report["drive_id"] = json!(id);
+    report
+        .as_object_mut()
+        .expect("status 始终返回 JSON 对象")
+        .insert(
+            "execution_contract".into(),
+            json!({
+                "verification": "reflection:v1",
+                "max_model_requests": 1,
+                "max_tool_calls": 0,
+                "stop_condition": "single-attempt"
+            }),
+        );
+    Ok(report)
+}
+
+fn drive_show(admin: &CognitionController, id: &str) -> Result<Value, AppError> {
+    let snapshot = admin.snapshot()?;
+    let drive = snapshot
+        .state
+        .autonomous_drives
+        .get(id)
+        .ok_or("未找到指定自主驱动。")?;
+    Ok(json!({
+        "command": "drive-show",
+        "revision": snapshot.revision,
+        "drive": drive,
+        "bound_goal": drive.goal_id.as_ref().and_then(|goal_id| snapshot.state.goals.get(goal_id)),
+        "events": snapshot.state.events.iter().filter(|event| {
+            event.caused_by.as_deref() == Some(id)
+                || event.source.reference == id
+        }).collect::<Vec<_>>()
+    }))
 }
 
 fn feedback(
@@ -972,9 +1111,13 @@ async fn run_window(
                 }
             }
             if controller.is_none() {
-                let execution =
-                    reflection_execution_agenda(&admin.snapshot()?, max_executions, 0, now_ms()?)?;
-                if execution.blocker.is_none() && !execution.ranked.is_empty() {
+                let snapshot = admin.snapshot()?;
+                let at_ms = now_ms()?;
+                let execution = reflection_execution_agenda(&snapshot, max_executions, 0, at_ms)?;
+                if execution.blocker.is_none()
+                    && (!execution.ranked.is_empty()
+                        || has_runnable_autonomous_drive(&snapshot, at_ms))
+                {
                     controller =
                         Some(start_loop(kernel, backends, options, admin, max_executions).await?);
                 }
@@ -1059,6 +1202,13 @@ pub async fn run_cognition_with_planner_factory(
             CognitionCommand::Add { id, text, user } => add(&admin, id, text, user),
             CognitionCommand::Feedback { input, user } => feedback(&admin, input, user),
             CognitionCommand::Status => Ok(status("status", &admin.snapshot()?)),
+            CognitionCommand::DriveSubmit {
+                id,
+                text,
+                priority,
+                valid_until_ms,
+            } => submit_drive(&admin, id, text, priority, valid_until_ms),
+            CognitionCommand::DriveShow { id } => drive_show(&admin, &id),
             CognitionCommand::Agenda => unreachable!("agenda 在启动认知插件前读取原快照"),
             CognitionCommand::Show { id } => show(&kernel, &backends.registry, &admin, &id).await,
             CognitionCommand::ExportPlan(action_options) => {
