@@ -10,6 +10,12 @@ pub struct AutonomousDrive {
     pub visibility: Visibility,
     pub description: String,
     pub evidence: Vec<Source>,
+    /// 受信宿主绑定的验证契约；没有验证器就不能物化为 Goal。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<String>,
+    /// 已物化 Goal 的 ID；Waiting 重试前会被清空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_id: Option<String>,
     pub priority: u8,
     pub budget: ExecutionBudget,
     pub stop_condition: String,
@@ -27,6 +33,12 @@ impl AutonomousDrive {
         self.visibility.validate()?;
         validate_text(&self.description)?;
         validate_text(&self.stop_condition)?;
+        if let Some(verification) = &self.verification {
+            validate_text(verification)?;
+        }
+        if let Some(goal_id) = &self.goal_id {
+            validate_id(goal_id)?;
+        }
         self.budget.validate()?;
         if self.priority > 100
             || self.evidence.len() > 16
@@ -48,6 +60,7 @@ impl AutonomousDrive {
 
     pub fn is_runnable(&self, now_ms: u64) -> bool {
         matches!(self.status, AutonomousDriveStatus::Ready)
+            && self.verification.is_some()
             && self.attempts < self.budget.max_attempts
             && self.cooldown_until_ms.is_none_or(|until| now_ms >= until)
             && self.valid_until_ms.is_none_or(|until| now_ms < until)
@@ -66,6 +79,9 @@ impl AutonomousDrive {
             return None;
         }
         if self.valid_until_ms.is_some_and(|until| now_ms >= until) {
+            return Some(AutonomousDriveStatus::Blocked);
+        }
+        if self.verification.is_none() {
             return Some(AutonomousDriveStatus::Blocked);
         }
         if self.status == AutonomousDriveStatus::Waiting {
@@ -108,6 +124,8 @@ mod tests {
             visibility: Visibility::Internal,
             description: "推进一个可验证维护步骤".into(),
             evidence: vec![],
+            verification: Some("echo:推进一个可验证维护步骤".into()),
+            goal_id: None,
             priority: 80,
             budget: ExecutionBudget {
                 max_model_requests: 1,
