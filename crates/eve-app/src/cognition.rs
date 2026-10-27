@@ -535,6 +535,14 @@ fn reflection_planner_options(max_derivations: u16) -> EndogenousOptions {
     }
 }
 
+fn has_runnable_autonomous_drive(snapshot: &CognitiveSnapshot, now_ms: u64) -> bool {
+    snapshot
+        .state
+        .autonomous_drives
+        .values()
+        .any(|drive| drive.is_runnable(now_ms))
+}
+
 fn reflection_execution_agenda(
     snapshot: &CognitiveSnapshot,
     max_executions: u16,
@@ -1100,9 +1108,14 @@ async fn run_window(
                 }
             }
             if controller.is_none() {
+                let snapshot = admin.snapshot()?;
+                let at_ms = now_ms()?;
                 let execution =
-                    reflection_execution_agenda(&admin.snapshot()?, max_executions, 0, now_ms()?)?;
-                if execution.blocker.is_none() && !execution.ranked.is_empty() {
+                    reflection_execution_agenda(&snapshot, max_executions, 0, at_ms)?;
+                if execution.blocker.is_none()
+                    && (!execution.ranked.is_empty()
+                        || has_runnable_autonomous_drive(&snapshot, at_ms))
+                {
                     controller =
                         Some(start_loop(kernel, backends, options, admin, max_executions).await?);
                 }
