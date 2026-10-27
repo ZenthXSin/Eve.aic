@@ -47,10 +47,8 @@ impl AutonomousDrive {
     }
 
     pub fn is_runnable(&self, now_ms: u64) -> bool {
-        matches!(
-            self.status,
-            AutonomousDriveStatus::Ready
-        ) && self.attempts < self.budget.max_attempts
+        matches!(self.status, AutonomousDriveStatus::Ready)
+            && self.attempts < self.budget.max_attempts
             && self.cooldown_until_ms.is_none_or(|until| now_ms >= until)
             && self.valid_until_ms.is_none_or(|until| now_ms < until)
     }
