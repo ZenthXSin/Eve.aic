@@ -1,5 +1,5 @@
-//! QQ 宿主的文件发送：模型只能报出文件名，宿主在固定目录里解析成绝对路径并校验，
-//! 再交给通道上传。模型拿不到任意路径，也拿不到目录结构。
+//! QQ 宿主的文件发送：产物由宿主自动快照入库、处理重名，再交给通道上传。
+//! 成员只能交付自己的项目文件；操作者沿用宿主授权的文件访问范围。
 //!
 //! 投递队列先写盘再交给通道；通道回执写回同一条记录。进程在写出前后退出时，记录停在
 //! `Sending`，重启后记为结果未知，绝不自动重发。
@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     sync::Mutex,
 };
@@ -62,7 +62,7 @@ enum State {
     Unknown,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Ledger {
     format_version: u32,
@@ -134,12 +134,17 @@ impl Outbox {
             .inner
             .lock()
             .map_err(|_| AppError::from("文件队列锁不可用"))?;
-        let bytes = serde_json::to_vec(&inner.ledger)?;
+        self.persist(&inner.ledger)
+    }
+
+    fn persist(&self, ledger: &Ledger) -> Result<(), AppError> {
+        let bytes = serde_json::to_vec(ledger)?;
         if bytes.len() > 1024 * 1024 {
             return Err("文件队列记录过大".into());
         }
         let mut staged = tempfile::NamedTempFile::new_in(&self.directory)?;
         staged.write_all(&bytes)?;
+        staged.as_file().sync_all()?;
         staged
             .persist(&self.ledger)
             .map_err(|_| AppError::from("文件队列记录保存失败"))?;
@@ -179,6 +184,58 @@ impl Outbox {
         Ok(canonical)
     }
 
+    /// 固化本次产物；不覆盖已有文件，重复名字自动加序号。
+    fn import(&self, source: &Path, name: &str) -> Result<PathBuf, ToolExecutionError> {
+        if !valid_name(name) || matches!(name, "." | "..") {
+            return Err(failed("交付文件名无效"));
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        if !fs::symlink_metadata(source).is_ok_and(|m| m.is_file()) {
+            return Err(failed("只能交付普通文件，不能发送目录、链接或设备"));
+        }
+        let mut input = options
+            .open(source)
+            .map_err(|_| failed("待交付文件不存在或不能读取"))?;
+        let before = input
+            .metadata()
+            .map_err(|_| failed("无法读取交付文件信息"))?;
+        if !before.is_file() {
+            return Err(failed("只能交付普通文件，不能发送目录、链接或设备"));
+        }
+        let mut staged =
+            tempfile::NamedTempFile::new_in(&self.files).map_err(|_| failed("发件目录不能写入"))?;
+        let copied = std::io::copy(&mut (&mut input).take(before.len()), staged.as_file_mut())
+            .map_err(|_| failed("复制交付文件失败，未排队"))?;
+        let after = input.metadata().map_err(|_| failed("无法核对交付文件"))?;
+        if copied != before.len()
+            || after.len() != before.len()
+            || before.modified().ok() != after.modified().ok()
+        {
+            return Err(failed("复制期间源文件发生变化，未排队；请先完成文件生成"));
+        }
+        staged
+            .as_file()
+            .sync_all()
+            .map_err(|_| failed("交付文件写盘失败，未排队"))?;
+        for number in 0..10000 {
+            let name = unique_name(name, number);
+            match staged.persist_noclobber(self.files.join(&name)) {
+                Ok(_) => return Ok(self.files.join(name)),
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    staged = error.file;
+                }
+                Err(_) => return Err(failed("交付文件入库失败，原文件保留")),
+            }
+        }
+        Err(failed("同名交付文件过多，未覆盖已有文件"))
+    }
+
     /// 写入一条待发记录并返回它的编号；落盘成功才交给通道。
     fn enqueue(
         &self,
@@ -189,11 +246,17 @@ impl Outbox {
     ) -> Result<String, ToolExecutionError> {
         let mut inner = self.inner.lock().map_err(|_| failed("文件队列锁不可用"))?;
         if inner.ledger.records.len() >= MAX_ENTRIES {
-            return Err(failed("待发文件已满，请等前面的文件发完再试"));
+            return Err(failed(
+                "文件队列记录已达上限；历史记录保留，需要归档后才能继续排队",
+            ));
         }
-        let id = format!("file-{}", inner.ledger.next_id);
-        inner.ledger.next_id += 1;
-        inner.ledger.records.push(Record {
+        let mut next = inner.ledger.clone();
+        let id = format!("file-{}", next.next_id);
+        next.next_id = next
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| failed("文件编号已用尽"))?;
+        next.records.push(Record {
             id: id.clone(),
             session_id: session.session_id.clone(),
             user_id: session.user_id.clone(),
@@ -202,9 +265,9 @@ impl Outbox {
             caption,
             state: State::Pending,
         });
-        drop(inner);
-        self.save()
-            .map_err(|_| failed("文件队列保存失败，没有排队"))?;
+        self.persist(&next)
+            .map_err(|_| failed("文件队列保存失败，没有排队；入库文件保留"))?;
+        inner.ledger = next;
         Ok(id)
     }
 
@@ -231,11 +294,12 @@ impl QqFileDelivery for Outbox {
         else {
             return Ok(None);
         };
-        inner.ledger.records[index].state = State::Sending;
-        let record = inner.ledger.records[index].clone();
-        drop(inner);
-        self.save()
+        let mut next = inner.ledger.clone();
+        next.records[index].state = State::Sending;
+        let record = next.records[index].clone();
+        self.persist(&next)
             .map_err(|_| state("文件队列保存失败，未交给通道"))?;
+        inner.ledger = next;
         let session = SessionKey::new(record.session_id.clone(), record.user_id.clone())
             .map_err(|_| state("文件队列里的会话无效"))?;
         Ok(Some(QqFileMessage {
@@ -249,20 +313,17 @@ impl QqFileDelivery for Outbox {
 
     fn delivered(&self, id: &str, result: QqFileResult) -> eve_plugin_api::PluginResult<()> {
         let mut inner = self.inner.lock().map_err(|_| state("文件队列锁不可用"))?;
-        let Some(record) = inner
-            .ledger
-            .records
-            .iter_mut()
-            .find(|record| record.id == id)
-        else {
+        let mut next = inner.ledger.clone();
+        let Some(record) = next.records.iter_mut().find(|record| record.id == id) else {
             return Err(state("文件队列里没有这条记录"));
         };
         record.state = match result {
             QqFileResult::Sent { .. } => State::Sent,
             QqFileResult::Failed { .. } | QqFileResult::NotSent => State::Failed,
         };
-        drop(inner);
-        self.save().map_err(|_| state("文件队列保存失败"))
+        self.persist(&next).map_err(|_| state("文件队列保存失败"))?;
+        inner.ledger = next;
+        Ok(())
     }
 }
 
@@ -474,9 +535,29 @@ impl eve_qqbot_plugin::QqAttachmentObserver for AttachmentInbox {
     }
 }
 
-/// 模型可见的发送工具：只接受文件名，路径由宿主在发件目录里解析。
+/// 模型可见的发送工具：路径经身份校验后自动入库，也兼容旧的文件名参数。
 pub(crate) struct SendFileTool {
     outbox: std::sync::Arc<Outbox>,
+}
+
+fn unique_name(original: &str, number: usize) -> String {
+    if number == 0 {
+        return original.to_owned();
+    }
+    let (stem, extension) = original
+        .rsplit_once('.')
+        .filter(|(s, e)| !s.is_empty() && !e.is_empty() && e.len() <= 80)
+        .map_or((original, String::new()), |(s, e)| (s, format!(".{e}")));
+    let suffix = format!("_{number}{extension}");
+    let maximum = QQ_FILE_NAME_MAX_BYTES.saturating_sub(suffix.len());
+    let mut end = stem.len().min(maximum);
+    while !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &stem[..end])
+}
+fn valid_source(path: &str) -> bool {
+    !path.trim().is_empty() && path.len() <= 4096 && !path.chars().any(char::is_control)
 }
 
 impl SendFileTool {
@@ -490,18 +571,16 @@ impl Tool for SendFileTool {
         ToolDefinition {
             name: SEND_TOOL.into(),
             description: format!(
-                "把发件目录里的一个文件发到当前会话。只能报文件名（不能带路径），宿主在固定目录里查找；\
-                 文件不存在或不是普通文件时失败，文件大小不设上限。name 是文件名（至多 {QQ_FILE_NAME_MAX_BYTES} 字节），\
-                 caption 是可选的简短说明（至多 {QQ_FILE_CAPTION_MAX_BYTES} 字节）。没有排上队就不要说已经发出：\
-                 只有真的上传成功后，文件才会到用户那里。普通成员先将产物放到自己的项目 exports/ 下；工具只发送该目录文件，不能读取宿主发件目录或其他成员产物。"
+                "把现有文件交付到当前会话。path 可为产物路径，宿主自动复制到发件目录并处理重名；name 是可选交付名。只给 name 时兼容发件目录文件名。普通成员只能交付自己项目的文件（相对路径或 /work/ 路径），不能读取宿主或其他成员。排队成功不等于送达；caption 最多 {QQ_FILE_CAPTION_MAX_BYTES} 字节。"
             ),
             argument_schema: json!({
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
+                    "path": {"type": "string"},
                     "caption": {"type": "string"}
                 },
-                "required": ["name"],
+                "anyOf": [{"required":["name"]},{"required":["path"]}],
                 "additionalProperties": false
             }),
             required_permissions: vec![],
@@ -518,15 +597,25 @@ impl Tool for SendFileTool {
         let object = value.as_object().ok_or_else(|| invalid("参数必须是对象"))?;
         if object
             .keys()
-            .any(|key| !matches!(key.as_str(), "name" | "caption"))
+            .any(|key| !matches!(key.as_str(), "name" | "path" | "caption"))
         {
-            return Err(invalid("参数只能包含 name 与 caption"));
+            return Err(invalid("参数只能包含 path、name 与 caption"));
         }
-        object
+        if !object.contains_key("name") && !object.contains_key("path") {
+            return Err(invalid("请提供产物 path 或已有发件文件 name"));
+        }
+        if object
             .get("name")
-            .and_then(Value::as_str)
-            .filter(|name| valid_name(name))
-            .ok_or_else(|| invalid("name 必须是合法文件名，不能包含路径分隔符"))?;
+            .is_some_and(|v| !v.as_str().is_some_and(valid_name))
+        {
+            return Err(invalid("name 必须是合法的交付文件名"));
+        }
+        if object
+            .get("path")
+            .is_some_and(|v| !v.as_str().is_some_and(valid_source))
+        {
+            return Err(invalid("path 必须是有效文件路径"));
+        }
         match object.get("caption") {
             None => Ok(()),
             Some(caption) if caption.as_str().is_some_and(valid_caption) => Ok(()),
@@ -541,15 +630,19 @@ impl Tool for SendFileTool {
                 .ok_or_else(|| failed("只有带用户身份的对话里才能发送文件"))?;
             let session = SessionKey::new(scope.session_id.clone(), scope.user_id.clone())
                 .map_err(|_| failed("当前会话标识无效"))?;
-            let name = call.arguments["name"]
-                .as_str()
-                .ok_or_else(|| failed("缺少文件名"))?;
-            let member_root = self
-                .outbox
-                .member_access
-                .get()
-                .and_then(|(root, auth)| (!auth.is_operator(scope)).then_some((root, auth)));
-            let (path, output_name) = if let Some((root, auth)) = member_root {
+            let source = call.arguments.get("path").and_then(Value::as_str);
+            let requested_name = call.arguments.get("name").and_then(Value::as_str);
+            let input = source
+                .or(requested_name)
+                .ok_or_else(|| failed("缺少产物路径"))?;
+            let name = requested_name
+                .or_else(|| Path::new(input).file_name().and_then(|s| s.to_str()))
+                .filter(|s| valid_name(s))
+                .ok_or_else(|| failed("交付文件名无效"))?
+                .to_owned();
+            let access = self.outbox.member_access.get();
+            let member = access.filter(|(_, auth)| !auth.is_operator(scope));
+            let (source_path, temporary) = if let Some((root, auth)) = member {
                 if !auth.allows_workspace_development(scope) {
                     return Err(failed("缺少真实成员开发身份"));
                 }
@@ -557,22 +650,73 @@ impl Tool for SendFileTool {
                     .as_ref()
                     .ok_or_else(|| failed("宿主尚未配置成员项目工作区"))?;
                 (
-                    crate::qq_member_files::snapshot(root, scope, name, &self.outbox.files)?,
-                    Some(name.to_owned()),
+                    {
+                        let root = root.clone();
+                        let scope = scope.clone();
+                        // name 沿用旧 exports 约定，path 始终相对于成员项目根目录。
+                        let input = if source.is_some() && !Path::new(input).is_absolute() {
+                            Path::new("/work")
+                                .join(input)
+                                .to_string_lossy()
+                                .into_owned()
+                        } else {
+                            input.to_owned()
+                        };
+                        let destination = self.outbox.files.clone();
+                        tokio::task::spawn_blocking(move || {
+                            crate::qq_member_files::snapshot(&root, &scope, &input, &destination)
+                        })
+                        .await
+                        .map_err(|_| failed("成员交付物读取中断"))??
+                    },
+                    true,
+                )
+            } else if let Some(source) = source {
+                let root = access
+                    .and_then(|(root, _)| root.as_ref())
+                    .ok_or_else(|| failed("导入项目文件需要已配置的操作者工作区"))?;
+                let path = Path::new(source);
+                (
+                    if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        root.join(path)
+                    },
+                    false,
                 )
             } else {
-                (self.outbox.resolve(name)?, None)
+                (self.outbox.resolve(input)?, false)
             };
+            let outbox = self.outbox.clone();
+            let output_name = name.clone();
+            let path = tokio::task::spawn_blocking(move || {
+                let result = outbox.import(&source_path, &output_name);
+                if temporary {
+                    let _ = fs::remove_file(&source_path);
+                }
+                result
+            })
+            .await
+            .map_err(|_| failed("文件入库工作中断，未排队"))??;
+            let output_name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_owned)
+                .ok_or_else(|| failed("入库后的文件名无效"))?;
             let caption = call
                 .arguments
                 .get("caption")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let id = self.outbox.enqueue(&session, path, output_name, caption)?;
+            let id = self
+                .outbox
+                .enqueue(&session, path, Some(output_name.clone()), caption)?;
             let _ = self.outbox.result_of(&id);
             Ok(json!({
                 "queued": true,
                 "id": id,
+                "name": output_name,
+                "imported": true,
                 "note": "已排进待发队列，通道会在空闲时上传。现在还没有发出；只有上传成功才算送达。"
             }))
         })
@@ -1114,6 +1258,97 @@ mod tests {
             )
             .expect("delivered");
         assert_eq!(outbox.result_of("file-1"), Some(State::Sent));
+    }
+
+    #[test]
+    fn simultaneous_imports_preserve_sources_and_never_overwrite_names() {
+        let (directory, outbox) = outbox();
+        let source = directory.path().join("source.txt");
+        fs::write(&source, b"artifact").unwrap();
+        fs::write(outbox.files.join("报告_report.txt"), b"previous").unwrap();
+        let mut paths = std::thread::scope(|threads| {
+            let jobs: Vec<_> = (0..8)
+                .map(|_| threads.spawn(|| outbox.import(&source, "报告_report.txt").unwrap()))
+                .collect();
+            jobs.into_iter()
+                .map(|job| job.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        paths.sort();
+        paths.dedup();
+        assert_eq!(paths.len(), 8);
+        for path in paths {
+            assert_eq!(fs::read(path).unwrap(), b"artifact");
+        }
+        assert_eq!(
+            fs::read(outbox.files.join("报告_report.txt")).unwrap(),
+            b"previous"
+        );
+        fs::write(source, b"changed later").unwrap();
+        assert_eq!(
+            fs::read(outbox.files.join("报告_report_1.txt")).unwrap(),
+            b"artifact"
+        );
+        let long = format!("{}.txt", "中".repeat(83));
+        outbox
+            .import(&outbox.files.join("报告_report_1.txt"), &long)
+            .unwrap();
+        let renamed = outbox
+            .import(&outbox.files.join("报告_report_1.txt"), &long)
+            .unwrap();
+        let name = renamed.file_name().unwrap().to_str().unwrap();
+        assert!(name.len() <= QQ_FILE_NAME_MAX_BYTES);
+        assert!(name.ends_with("_1.txt"));
+    }
+
+    #[test]
+    fn persistence_failures_do_not_publish_queue_transitions() {
+        let (directory, outbox) = outbox();
+        fs::write(outbox.files.join("a.txt"), b"x").unwrap();
+        let path = outbox.resolve("a.txt").unwrap();
+        let session = SessionKey::new("qq:s", "qq:u").unwrap();
+        fs::create_dir(&outbox.ledger).unwrap();
+        assert!(outbox.enqueue(&session, path.clone(), None, None).is_err());
+        assert!(outbox.next_file().unwrap().is_none());
+        fs::remove_dir(&outbox.ledger).unwrap();
+        assert_eq!(
+            outbox.enqueue(&session, path, None, None).unwrap(),
+            "file-1"
+        );
+        fs::remove_file(&outbox.ledger).unwrap();
+        fs::create_dir(&outbox.ledger).unwrap();
+        assert!(outbox.next_file().is_err());
+        assert_eq!(outbox.result_of("file-1"), Some(State::Pending));
+        fs::remove_dir(&outbox.ledger).unwrap();
+        outbox.next_file().unwrap().unwrap();
+        fs::remove_file(&outbox.ledger).unwrap();
+        fs::create_dir(&outbox.ledger).unwrap();
+        assert!(outbox.delivered("file-1", QqFileResult::NotSent).is_err());
+        assert_eq!(outbox.result_of("file-1"), Some(State::Sending));
+        fs::remove_dir(&outbox.ledger).unwrap();
+        outbox.save().unwrap();
+        drop(outbox);
+        let reopened = Outbox::open(directory.path().to_path_buf()).unwrap();
+        assert_eq!(reopened.result_of("file-1"), Some(State::Unknown));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_rejects_links_directories_and_fifo_without_blocking() {
+        let (directory, outbox) = outbox();
+        let source = directory.path().join("original");
+        fs::write(&source, b"x").unwrap();
+        let linked = directory.path().join("linked");
+        std::os::unix::fs::symlink(&source, &linked).unwrap();
+        assert!(outbox.import(&linked, "linked.txt").is_err());
+        assert!(outbox.import(directory.path(), "directory.txt").is_err());
+        let fifo = directory.path().join("pipe");
+        let result = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(result.success());
+        assert!(outbox.import(&fifo, "pipe.txt").is_err());
     }
 
     fn sample_message(id: &str, url: &str) -> Message {
