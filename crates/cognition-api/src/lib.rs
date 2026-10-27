@@ -1,7 +1,9 @@
 //! 统一认知状态的公开契约；不包含存储、调度、模型或执行权限实现。
+mod autonomous_drive;
 mod file_observation;
 mod goal_feedback;
 mod world_model;
+pub use autonomous_drive::*;
 pub use file_observation::*;
 pub use goal_feedback::*;
 use serde::{Deserialize, Serialize};
@@ -334,6 +336,9 @@ pub struct CognitiveEvent {
 pub struct CognitiveState {
     pub goals: BTreeMap<String, Goal>,
     pub drives: BTreeMap<String, Drive>,
+    /// 持久化的内生驱动候选；旧快照缺失时按空集合恢复。
+    #[serde(default)]
+    pub autonomous_drives: BTreeMap<String, AutonomousDrive>,
     pub agenda: Option<Agenda>,
     pub events: Vec<CognitiveEvent>,
 }
@@ -341,9 +346,16 @@ impl CognitiveState {
     pub fn validate(&self) -> CognitionResult<()> {
         if self.goals.len() > MAX_RECORDS
             || self.drives.len() > MAX_RECORDS
+            || self.autonomous_drives.len() > MAX_RECORDS
             || self.events.len() > MAX_RECORDS
         {
             return Err(CognitionError::LimitReached);
+        }
+        for (id, drive) in &self.autonomous_drives {
+            drive.validate()?;
+            if id != &drive.id {
+                return Err(CognitionError::InvalidInput);
+            }
         }
         let mut executing = 0;
         for (id, goal) in &self.goals {
@@ -539,6 +551,7 @@ redacted_debug!(
     CompletionConfirmation,
     Goal,
     Drive,
+    AutonomousDrive,
     Agenda,
     CognitiveEvent,
     CognitiveState,
