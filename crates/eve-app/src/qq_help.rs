@@ -1,15 +1,22 @@
 //! 本机命令帮助，列表来自实际对话工具注册，不依赖模型对自身能力的推测。
 use eve_llm_api::ToolDefinition;
 use eve_plugin_api::PluginResult;
-use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput};
+use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput, QqConversations};
 use std::sync::Arc;
 
 pub(crate) struct Help {
     pub(crate) definitions: Vec<ToolDefinition>,
+    pub(crate) conversations: QqConversations,
 }
 impl Help {
-    pub(crate) fn handler(definitions: Vec<ToolDefinition>) -> Arc<dyn QqCommandHandler> {
-        Arc::new(Self { definitions })
+    pub(crate) fn handler(
+        definitions: Vec<ToolDefinition>,
+        conversations: QqConversations,
+    ) -> Arc<dyn QqCommandHandler> {
+        Arc::new(Self {
+            definitions,
+            conversations,
+        })
     }
 }
 impl QqCommandHandler for Help {
@@ -19,8 +26,13 @@ impl QqCommandHandler for Help {
             return Ok(None);
         }
         if words.as_slice() == ["/help", "identity"] {
+            let account = self
+                .conversations
+                .identity(input.session)?
+                .map(|identity| identity.account_id())
+                .unwrap_or_else(|| "平台身份尚未就绪".into());
             return Ok(Some(format!(
-                "本会话宿主绑定的操作者标识：{}\n开发工具 operators 可填写这个标识；旧 operators 使用各自独立的会话标识。/admin 查看当前管理员状态；/bind 密钥 可绑定平台身份，群聊身份跨群有效，私聊与群聊分别绑定。",
+                "平台账号标识：{account}\n本会话宿主绑定的操作者标识：{}\n主人请在受信面板 runtime.people.owner_accounts 绑定平台账号标识，同一群聊账号跨群有效。旧 owner_principals 与 operators 仍按会话标识兼容。/admin 查看角色；/bind 密钥 绑定管理员。群聊与私聊属于不同平台命名空间，须分别核实绑定，不按昵称或相同原始字符串自动关联。",
                 input.session.user_id
             )));
         }

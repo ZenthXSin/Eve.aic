@@ -94,6 +94,11 @@ jobs:
           $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
           python -X utf8 connectors/qqbot/test/memory_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 验证主人跨群账号、撤权与旧身份兼容
+        run: |
+          $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
+          python -X utf8 connectors/qqbot/test/owner_account_test.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证浏览器中的插件配置、冲突、启停与窄屏
         if: runner.os == 'Linux'
         run: |

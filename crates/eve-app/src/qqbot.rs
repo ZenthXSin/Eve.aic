@@ -1651,6 +1651,7 @@ async fn run_qqbot_composed(
             wrapped: context,
             people: people.clone(),
             registry: registry.clone(),
+            conversations: conversations.clone(),
             profiles: profile_queue.clone(),
             // 候选都是 QQ 参与者，不涉及跨通道授权。
             links: Arc::new(crate::qq_memory_continuity::PersonLinks(
@@ -2004,7 +2005,7 @@ async fn run_qqbot_composed(
             "triggers": options.triggers,
         })).map_err(|_| "任务运行指纹已重复装配")?;
         let tools_registered = tool_definitions.len();
-        let help_commands = crate::qq_help::Help::handler(tool_definitions.clone());
+        let help_commands = crate::qq_help::Help::handler(tool_definitions.clone(), conversations.clone());
         bootstrap.context = Some(Arc::new(eve_dialogue_tools::CapabilitiesContext {
             inner: bootstrap.context.take().ok_or("对话上下文缺失")?,
             definitions: tool_definitions,
