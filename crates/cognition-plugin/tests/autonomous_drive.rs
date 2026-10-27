@@ -1,5 +1,5 @@
 use eve_cognition_api::*;
-use eve_cognition_plugin::{COGNITION_STATE_KEY, CognitionController, CognitionPlugin};
+use eve_cognition_plugin::{CognitionController, CognitionPlugin};
 use eve_kernel::{Kernel, KernelServices, backends::MemoryStateStore};
 use eve_plugin_api::{PluginId, ServiceRegistry, StateStore};
 use std::sync::Arc;
@@ -150,7 +150,3 @@ async fn autonomous_drive_review_rejects_stale_revision_without_duplicate_audit(
     kernel.stop_all().await.unwrap();
 }
 
-#[allow(dead_code)]
-fn state_key() -> (&'static str, PluginId) {
-    (COGNITION_STATE_KEY, namespace())
-}
