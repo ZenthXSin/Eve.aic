@@ -676,6 +676,7 @@ pub trait ContextAssembler: Send + Sync {
     }
 }
 
+#[derive(Clone)]
 pub struct ToolExecutionContext {
     cancelled: Arc<AtomicBool>,
     scope: Option<ContextScope>,

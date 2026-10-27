@@ -390,6 +390,7 @@ dependencies = [
  "eve-trigger-plugin",
  "eve-web-panel",
  "eve-web-panel-api",
+ "eve-workflow-tools",
  "libc",
  "postgres",
  "reqwest",
@@ -1482,6 +1483,18 @@ dependencies = [
  "eve-session-api",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "eve-workflow-tools"
+version = "0.1.0"
+dependencies = [
+ "eve-llm-api",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
