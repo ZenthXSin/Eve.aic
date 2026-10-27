@@ -255,7 +255,29 @@ fn validate_autonomous_drive_transition(
         return Err(CognitionError::AccessDenied);
     }
     if old.status == next.status {
+        let binding_update = old.goal_id != next.goal_id;
+        if binding_update
+            && !(old.status == AutonomousDriveStatus::Ready
+                && old.goal_id.is_none()
+                && next.goal_id.is_some())
+        {
+            return Err(CognitionError::InvalidTransition);
+        }
         return Ok(());
+    }
+    let binding_update = old.goal_id != next.goal_id;
+    let binding_allowed = match (&old.status, &next.status) {
+        (AutonomousDriveStatus::Ready, AutonomousDriveStatus::Ready) => {
+            old.goal_id.is_none() && next.goal_id.is_some()
+        }
+        (
+            AutonomousDriveStatus::Active,
+            AutonomousDriveStatus::Waiting | AutonomousDriveStatus::Blocked,
+        ) => old.goal_id.is_some() && next.goal_id.is_none(),
+        _ => !binding_update,
+    };
+    if !binding_allowed {
+        return Err(CognitionError::InvalidTransition);
     }
     let allowed = matches!(
         (&old.status, &next.status),
