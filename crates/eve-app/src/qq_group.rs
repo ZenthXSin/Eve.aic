@@ -394,17 +394,32 @@ impl ContextAssembler for Context {
                         if !messages.is_empty() {
                             // 当前轮历史由会话服务单独保存；群窗口只是跨成员背景。
                             // 明确标出本轮消息，避免模型把窗口里较早的话题接成当前问题。
-                            let current = messages.iter().rposition(|message| {
-                                !message.from_me && message.speaker == current_user.as_str() && {
-                                    let input = current_input.trim();
-                                    let stored = message.text.trim();
-                                    input == stored
-                                        || input.starts_with(stored)
-                                        || input.ends_with(stored)
-                                        || stored.starts_with(input)
-                                        || stored.ends_with(input)
-                                }
-                            });
+                            let current = messages
+                                .iter()
+                                .rposition(|message| {
+                                    !message.from_me
+                                        && message.speaker == current_user.as_str()
+                                        && {
+                                            let input = current_input.trim();
+                                            let stored = message.text.trim();
+                                            input == stored
+                                                || input.starts_with(stored)
+                                                || input.ends_with(stored)
+                                                || stored.starts_with(input)
+                                                || stored.ends_with(input)
+                                        }
+                                })
+                                .or_else(|| {
+                                    // 通道可能在送入模型前移除唤醒前缀；此时最近一条该成员原话就是本轮锚点。
+                                    (current_user != USER).then(|| {
+                                        messages
+                                            .iter()
+                                            .rposition(|message| {
+                                                !message.from_me
+                                                    && message.speaker == current_user.as_str()
+                                            })
+                                    })?
+                                });
                             let selected: Vec<_> = messages
                                 .iter()
                                 .enumerate()
