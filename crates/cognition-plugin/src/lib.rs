@@ -441,8 +441,8 @@ impl CognitionController {
         if changed.is_empty() {
             return Ok(snapshot);
         }
-        for (id, previous, status) in changed {
-            let event_id = format!("autonomous-review-{expected_revision}-{id}");
+        for (index, (id, previous, status)) in changed.into_iter().enumerate() {
+            let event_id = format!("autonomous-review-{expected_revision}-{index}");
             snapshot.state.events.push(CognitiveEvent {
                 id: event_id,
                 kind: CognitiveEventKind::StateChanged,
