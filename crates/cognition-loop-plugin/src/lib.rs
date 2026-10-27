@@ -375,11 +375,12 @@ impl Worker {
         now_ms: u64,
     ) -> LoopResult<CognitiveSnapshot> {
         let mut state = snapshot.state.clone();
-        let materialized = state
-            .autonomous_drives
-            .iter()
-            .enumerate()
-            .find_map(|(index, (id, drive))| {
+        let materialized =
+            state
+                .autonomous_drives
+                .iter()
+                .enumerate()
+                .find_map(|(index, (id, drive))| {
                 if !drive.is_runnable(now_ms) || drive.goal_id.is_some() {
                     return None;
                 }
@@ -734,8 +735,7 @@ impl Worker {
                             && drive.attempts < drive.budget.max_attempts
                         {
                             drive.status = AutonomousDriveStatus::Waiting;
-                            drive.cooldown_until_ms =
-                                Some(feedback.at_ms.saturating_add(60_000));
+                            drive.cooldown_until_ms = Some(feedback.at_ms.saturating_add(60_000));
                         } else {
                             drive.status = AutonomousDriveStatus::Blocked;
                             drive.cooldown_until_ms = None;
