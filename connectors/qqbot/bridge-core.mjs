@@ -191,14 +191,18 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
   const warn = code => {
     if (!warned.has(code)) { warned.add(code); send({ type: "warning", code }); }
   };
+  const replyMention = item => group.mention !== false && item.target.scope === "group" ? item.senderId : undefined;
+  function mentionedText(target, text, mention) {
+    if (mention === undefined || mention === null) return text;
+    if (target.scope !== "group" || !validId(mention)) throw new Error("invalid_mention");
+    const prefix = `<@${mention}>`;
+    return text.startsWith(prefix) ? text : `${prefix} ${text}`.trimEnd();
+  }
   // Share one bound across passive replies, segments and proactive messages.
   // Admission failure happens before the SDK call and is never queued/retried.
   async function sendText(target, text, mention) {
-    if (mention !== undefined) {
-      if (target.scope !== "group" || !validId(mention)) throw new Error("invalid_mention");
-      text = `<@${mention}> ${text}`;
-      if (Buffer.byteLength(text) > 32768) throw new Error("reply_limit");
-    }
+    text = mentionedText(target, text, mention);
+    if (Buffer.byteLength(text) > 32768) throw new Error("reply_limit");
     if (activeSends >= limit) {
       warn("outbound_limit");
       throw new Error("outbound_limit");
@@ -220,13 +224,13 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     } finally { activeSends--; }
   }
   // 表情包作为原消息的被动回复图片发出，同样计入并发上限。
-  async function sendImage(target, localPath) {
+  async function sendImage(target, localPath, mention) {
     if (activeSends >= limit) {
       warn("outbound_limit");
       throw new Error("outbound_limit");
     }
     activeSends++;
-    try { return await bot.sendImage(target, { localPath }); }
+    try { return await bot.sendImage(target, { localPath }, { content: mentionedText(target, "", mention) }); }
     finally { activeSends--; }
   }
   const stop = () => {
@@ -301,9 +305,8 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       ? { scope: item.target.scope, targetId: item.target.targetId } : item.target;
     const meta = { delivery_mode: item.proactive ? "proactive" : "passive", elapsed_ms: elapsed };
     try {
-      const mention=group.mention && target.scope === "group" && !item.mentioned ? item.senderId : undefined;
+      const mention=replyMention(item);
       const result = await sendText(target, text, mention);
-      item.mentioned = true;
       return { ok: true, ...meta,
         ...(validMessageId(result?.id) ? { message_id: result.id } : {}) };
     } catch (err) {
@@ -318,7 +321,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         let timer;
         try {
           const attempt = sendText({ scope: item.target.scope, targetId: item.target.targetId },
-            "本轮回复已保存，但 QQ 正文投递失败。发送 /last-reply 取回，不会重新执行任务。")
+            "本轮回复已保存，但 QQ 正文投递失败。发送 /last-reply 取回，不会重新执行任务。", replyMention(item))
             .then(() => ({ state: "sent" }), error => ({ state: "failed", error }));
           const result = await Promise.race([attempt, new Promise(resolve => {
             timer = setTimeout(() => resolve({ state: "unknown" }), 3000);
@@ -372,7 +375,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         send({ type: "delivery", id: frame.id, sticker: true, ok: false, failure_kind: "passive_window_elapsed" });
         return;
       }
-      const result = await sendImage(item.target, path);
+      const result = await sendImage(item.target, path, replyMention(item));
       const id = result?.message?.id ?? result?.upload?.id;
       send({ type: "delivery", id: frame.id, sticker: true, ok: true,
         ...(validMessageId(id) ? { message_id: id } : {}) });
@@ -402,7 +405,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
           failure_kind: "passive_window_elapsed" });
         return;
       }
-      const result = await sendText(item.target, frame.text);
+      const result = await sendText(item.target, frame.text, replyMention(item));
       send({ type: "delivery", id: frame.id, progress: true, index, ok: true,
         ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
     } catch (err) {
@@ -436,7 +439,9 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     }
     pushing.add(key);
     try {
-      const result = await sendFile({ scope: frame.scope, targetId: frame.target_id }, path, name, caption);
+      const target = { scope: frame.scope, targetId: frame.target_id };
+      const content = mentionedText(target, caption, frame.mention_user_id);
+      const result = await sendFile(target, path, name, content);
       const id = result?.message?.id ?? result?.upload?.id;
       send({ type: "delivery", id: frame.id, push: true, file: true, ok: true,
         ...(validMessageId(id) ? { message_id: id } : {}) });
@@ -471,7 +476,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         if (closed) throw new Error("closed");
         if (parts[index][1]) await new Promise(resolve=>setTimeout(resolve,parts[index][1]));
         if (closed) throw new Error("closed");
-        result = await sendText({ scope, targetId: frame.target_id }, parts[index][0],index===0?mention:undefined);
+        result = await sendText({ scope, targetId: frame.target_id }, parts[index][0], mention);
       }
       send({ type: "delivery", id: frame.id, push: true, ok: true,
         ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
@@ -502,7 +507,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         if (item.sending || item.next !== undefined) { warn("duplicate_reply"); return; }
         item.sending = true;
         try {
-          await sendText(item.target, "消息回执存储已满，本条请求尚未执行。请联系管理员处理容量；历史记录已保留。");
+          await sendText(item.target, "消息回执存储已满，本条请求尚未执行。请联系管理员处理容量；历史记录已保留。", replyMention(item));
           send({ type: "delivery", id: frame.id, capacity_notice: true, ok: true });
         } catch (err) {
           send({ type: "delivery", id: frame.id, capacity_notice: true, ok: false, ...diagnostic(err) });

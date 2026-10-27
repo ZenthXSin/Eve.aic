@@ -14,8 +14,8 @@ function fixture({ group = {}, fail = false, error = null, now, limit = 128, app
       if (typeof fail === "function" ? fail(sent.length) : fail) throw error ?? new Error("sensitive secret and message");
       return { id: "out-1" };
     },
-    async sendImage(target, source) {
-      images.push({ target, source });
+    async sendImage(target, source, opts) {
+      images.push({ target, source, opts });
       if (imageFail) throw new Error("sensitive secret and message");
       return { upload: { file_uuid: "uuid-2", file_info: "info-2", ttl: 60 }, message: { id: "image-msg-1" } };
     },
@@ -280,7 +280,7 @@ test("群聊接纳官方 @ 事件，拒绝普通群消息与机器人消息", as
   f.handlers.get("message")({}, { ...incoming, rawEventType: "GROUP_AT_MESSAGE_CREATE" });
   assert.equal(f.frames.filter(x => x.type === "message").length, 1);
   await f.bridge.command({ type: "reply", version: 1, id: "group-at-1", text: "你喜欢怎样的称呼？" });
-  assert.deepEqual(f.sent, [{ target: incoming.replyTarget, text: "你喜欢怎样的称呼？" }]);
+  assert.deepEqual(f.sent, [{ target: incoming.replyTarget, text: "<@user-1> 你喜欢怎样的称呼？" }]);
 });
 
 test("eve 名字前缀大小写均走普通回复，观察不伪造 @ 且重复事件只交付一次", async () => {
@@ -300,7 +300,7 @@ test("eve 名字前缀大小写均走普通回复，观察不伪造 @ 且重复�
       assert.equal(observations.length, Number(observe));
       if (observe) assert.equal(observations[0].mentions_me, false);
       await f.bridge.command({ version: 1, type: "reply", id: "name-wake", text: "在" });
-      assert.deepEqual(f.sent, [{ target: incoming.replyTarget, text: "在" }]);
+      assert.deepEqual(f.sent, [{ target: incoming.replyTarget, text: "<@member-1> 在" }]);
     }
   }
   for (const change of [
@@ -329,7 +329,7 @@ test("普通群事件携带服务端自身提及时可原路回复，不依赖 A
   f.handlers.get("message")({}, incoming);
   assert.equal(f.frames.find(x => x.type === "message").text, incoming.content);
   await f.bridge.command({ type: "reply", version: 1, id: incoming.messageId, text: "答复" });
-  assert.deepEqual(f.sent, [{ target: incoming.replyTarget, text: "答复" }]);
+  assert.deepEqual(f.sent, [{ target: incoming.replyTarget, text: "<@user-1> 答复" }]);
 });
 
 test("普通群事件识别当前 AppID 的两种 @ 标记，拒绝其他提及、伪标记与未知事件", () => {
@@ -403,7 +403,7 @@ for (const scope of ["c2c", "group"]) test(scope + " 分段按序回复原目标
   await f.bridge.command(segment(1, 3));
   await f.bridge.command(segment(2, 3));
   const target = { scope, targetId: scope === "group" ? "group-1" : "user-1", msgId: "in-1" };
-  assert.deepEqual(f.sent, [0, 1, 2].map(i => ({ target, text: `第${i + 1}段` })));
+  assert.deepEqual(f.sent, [0, 1, 2].map(i => ({ target, text: `${scope === "group" ? "<@user-1> " : ""}第${i + 1}段` })));
   assert.deepEqual(f.frames.filter(x => x.type === "delivery").map(x => [x.index, x.ok]), [[0, true], [1, true], [2, true]]);
   await f.bridge.command(segment(2, 3));
   await f.bridge.command({ type: "reply", version: 1, id: "in-1", text: "再次答复" });
@@ -711,7 +711,7 @@ test("第二段被拒绝只提醒一次，已发送第一段不重发且不再�
   for (const index of [0, 1, 2]) {
     await f.bridge.command({ version: 1, type: "segment", id: "in-1", count: 3, index, text: `原始片段${index}` });
   }
-  assert.deepEqual(f.sent.map(s => s.text).slice(0, 2), ["原始片段0", "原始片段1"]);
+  assert.deepEqual(f.sent.map(s => s.text).slice(0, 2), ["<@user-1> 原始片段0", "<@user-1> 原始片段1"]);
   assert.equal(f.sent.length, 3);
   const receipts = f.frames.filter(x => x.type === "delivery");
   assert.equal(receipts.length, 2);
@@ -755,7 +755,7 @@ test("表情包只跟在正文之后走原消息的被动目标，失败、过�
       ...(index === 1 ? { sticker_follows: true } : {}) });
   }
   await f.bridge.command({ version: 1, type: "sticker", id: "in-1", path: "/tmp/s.png" });
-  assert.deepEqual(f.images, [{ target: { scope: "group", targetId: "group-1", msgId: "in-1" }, source: { localPath: "/tmp/s.png" } }]);
+  assert.deepEqual(f.images, [{ target: { scope: "group", targetId: "group-1", msgId: "in-1" }, source: { localPath: "/tmp/s.png" }, opts: {content: "<@user-1>"} }]);
   assert.deepEqual(f.frames.at(-1), { type: "delivery", version: 1, id: "in-1", sticker: true, ok: true, message_id: "image-msg-1" });
   await f.bridge.command({ version: 1, type: "sticker", id: "in-1", path: "/tmp/s.png" });
   assert.equal(f.images.length, 1, "同一条回复只发一次");
@@ -830,19 +830,19 @@ test("全量群消息只进入观察，艾特消息同时保留普通任务入�
   f.handlers.get("message")({}, {...msg,senderIsBot:true});
   assert.equal(f.frames.filter(x=>x.type==="group_observation").length,2);
 });
-test("群回复首段只艾特平台原发送者，私聊不增加艾特", async () => {
+test("群回复每段艾特平台原发送者，私聊不增加艾特", async () => {
   const f=fixture({group:{observe:true,mention:true}}); f.message("group","g-at");
   await f.bridge.command({type:"segment",version:1,id:"g-at",index:0,count:2,text:"知道了"});
   await f.bridge.command({type:"segment",version:1,id:"g-at",index:1,count:2,text:"我继续看看"});
-  assert.deepEqual(f.sent.map(x=>x.text),["<@user-1> 知道了","我继续看看"]);
+  assert.deepEqual(f.sent.map(x=>x.text),["<@user-1> 知道了","<@user-1> 我继续看看"]);
   f.message("c2c","private-no-at");
   await f.bridge.command({type:"reply",version:1,id:"private-no-at",text:"好的"});
   assert.equal(f.sent.at(-1).text,"好的");
 });
-test("主动群插话复用发送接口，分条并只在首段艾特来源发送者", async () => {
+test("主动群插话复用发送接口，每条均艾特来源发送者", async () => {
   const f=fixture({group:{observe:true,mention:true}});
   await f.bridge.command({version:1,type:"push",id:"chime-first",scope:"group",target_id:"group-1",mention_user_id:"member-2",text:"这个思路可行\n可以试试",parts:[["这个思路可行",0],["可以试试",0]]});
-  assert.deepEqual(f.sent.map(x=>x.text),["<@member-2> 这个思路可行","可以试试"]);
+  assert.deepEqual(f.sent.map(x=>x.text),["<@member-2> 这个思路可行","<@member-2> 可以试试"]);
   assert.ok(f.sent.every(x=>x.target.scope==="group"&&!x.target.msgId));
   assert.equal(f.frames.at(-1).ok,true);
   await f.bridge.command({version:1,type:"push",id:"bad-route",scope:"c2c",target_id:"member-2",mention_user_id:"member-2",text:"测试"});
@@ -877,4 +877,32 @@ test("网络故障按固定类别记录且不重发未知投递", async () => {
     assert.ok(!JSON.stringify(f.frames).includes("private"));
     assert.ok(!JSON.stringify(f.frames).includes("PRIVATE_VALUE"));
   }
+});
+
+test("不同群友的进度、分段、容量及错误通知均艾特原触发者，不能伪造目标", async () => {
+  const f=fixture();
+  for (const [id,user] of [["a","member-a"],["b","member-b"]]) {
+    f.handlers.get("message")({}, {kind:"group",messageId:id,senderId:user,content:"帮忙",rawEventType:"GROUP_AT_MESSAGE_CREATE",groupOpenid:"group-1",replyTarget:{scope:"group",targetId:"group-1",msgId:id}});
+  }
+  await f.bridge.command({version:1,type:"progress",id:"a",index:0,text:"正在核对",mention_user_id:"attacker"});
+  await f.bridge.command({version:1,type:"reply",id:"b",text:"已经处理"});
+  await f.bridge.command({version:1,type:"reply",id:"a",text:"<@member-a> 已核实"});
+  assert.deepEqual(f.sent.map(s=>s.text),["<@member-a> 正在核对","<@member-b> 已经处理","<@member-a> 已核实"]);
+  f.message("group","capacity-at");
+  await f.bridge.command({version:1,type:"capacity",id:"capacity-at"});
+  assert.match(f.sent.at(-1).text,/^<@user-1> /);
+  const fail=fixture({fail:n=>n===1,error:{httpStatus:400,bizCode:40034090}});
+  fail.message("group");
+  await fail.bridge.command({version:1,type:"reply",id:"in-1",text:"已保存的结论"});
+  assert.equal(fail.sent.length,2);
+  assert.ok(fail.sent.every(s=>s.text.startsWith("<@user-1> ")));
+});
+
+test("群文件说明艾特可信发送者，私聊非法艾特不会发送文件", async () => {
+  const f=fixture();
+  await f.bridge.command({version:1,type:"file",id:"file-at",scope:"group",target_id:"group-1",mention_user_id:"member-1",path:"/tmp/report.txt",caption:"报告"});
+  assert.equal(f.files[0].opts.content,"<@member-1> 报告");
+  await f.bridge.command({version:1,type:"file",id:"file-invalid",scope:"c2c",target_id:"user-1",mention_user_id:"member-1",path:"/tmp/report.txt"});
+  assert.equal(f.files.length,1);
+  assert.equal(f.frames.at(-1).ok,false);
 });
