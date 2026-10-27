@@ -713,6 +713,37 @@ impl Worker {
             current.block_reason = reason.clone();
             current.feedback = Some(feedback.clone());
             current.execution.as_mut().expect("执行关联已检查").turn_id = turn_id;
+            if let Some(drive) = state
+                .autonomous_drives
+                .values_mut()
+                .find(|drive| drive.goal_id.as_deref() == Some(goal.id.as_str()))
+            {
+                drive.last_progress_at_ms = Some(feedback.at_ms);
+                match status {
+                    GoalStatus::Completed => {
+                        drive.status = AutonomousDriveStatus::Completed;
+                        drive.cooldown_until_ms = None;
+                    }
+                    GoalStatus::Cancelled => {
+                        drive.status = AutonomousDriveStatus::Cancelled;
+                        drive.cooldown_until_ms = None;
+                    }
+                    GoalStatus::Blocked => {
+                        drive.goal_id = None;
+                        if feedback.commit == ExecutionCommit::NotStarted
+                            && drive.attempts < drive.budget.max_attempts
+                        {
+                            drive.status = AutonomousDriveStatus::Waiting;
+                            drive.cooldown_until_ms =
+                                Some(feedback.at_ms.saturating_add(60_000));
+                        } else {
+                            drive.status = AutonomousDriveStatus::Blocked;
+                            drive.cooldown_until_ms = None;
+                        }
+                    }
+                    _ => return Err(LoopError::InvalidInput),
+                }
+            }
             if let Some(agenda) = &mut state.agenda {
                 agenda
                     .candidates
