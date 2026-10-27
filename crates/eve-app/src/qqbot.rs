@@ -85,6 +85,7 @@ pub const QQBOT_HELP: &str = "--group-chat 接入全量群消息观察、说法�
 --sleep 开启可取消的短暂等待与本轮任务状态工具。
 --triggers 开启原会话条件唤醒工具（时间、文件、后台任务、消息匹配、Linux 进程）。
 --workflow-tools 开启可复用工具流程：模型保存步骤后按当前身份、权限和共享预算调用，定义与回执跨重启保留。
+--health-watch 开启本地健康巡检与 inspect_runtime_health；空闲时检查模型、磁盘和保存异常，只向已绑定主人通知新问题一次，不消耗模型额度。
 Eve 官方 QQBot 通道
 用法：eve-qqbot [--training] [--cognition] [--memory] [--memory-recall] [--semantic-recall] [--memory-learning] [--self-learning] [--interest-learning] [--research-source URL]... [--research-corpus 目录] [--reference 名称=目录]... [--max-tool-rounds 1至64] [--practice-mindustry-server jar] [--practice-java 程序] [--practice-java-arg 参数]... [--practice-browser 程序] [--skill-learning] [--strategy-learning] [--tool-forging] [--plans] [--outreach] [--outreach-cooldown-ms 毫秒] [--outreach-proactive-after-ms 毫秒] [--clarify] [--agenda-context] [--reminders] [--reminder-utc-offset ±HH:MM] [--stickers] [--background-tasks] [--no-error-recovery] [--subagents] [--goal-completion] [--learning-stop] [--autonomy-budget 次数] [--autonomy-budget-window-hours 小时] [--segmented] [--markdown] [--message-judge off|primary|jev] [--web-listen 环回IP:端口] [--learning-cooldown-ms 毫秒] [--interest-cooldown-ms 毫秒] [--cognition-max-executions 1至32] [--state-dir 目录] [--database-config 文件] [--agent 文件] [--node 程序] [--bridge-script 文件] [--bridge-arg 参数]
 --task-strategy-catalog 文件 接入可信固定验收目录；需 --background-tasks。目录可为空，未匹配任务照常执行但不学习；策略与世界预测不自动创建试验任务。
@@ -187,6 +188,8 @@ pub struct QqBotOptions {
     pub tool_forging: bool,
     /// 模型保存、查看和执行自己的可复用工具流程。
     pub workflow_tools: bool,
+    /// 不调用模型的本地运行巡检，异常只通知绑定主人一次。
+    pub health_watch: bool,
     /// 用户待办的多步计划入口；需要受控研究或实践验证作为计划能力。
     pub plans: bool,
     /// 学习目标取得实际验证的进展后择机邀请用户；需要实践验证。
@@ -264,6 +267,7 @@ impl Default for QqBotOptions {
             strategy_learning: false,
             tool_forging: false,
             workflow_tools: false,
+            health_watch: false,
             plans: false,
             outreach: false,
             clarify: false,
@@ -367,6 +371,10 @@ impl QqBotOptions {
             }
             if arg == "--workflow-tools" {
                 options.workflow_tools = true;
+                continue;
+            }
+            if arg == "--health-watch" {
+                options.health_watch = true;
                 continue;
             }
             if arg == "--plans" {
@@ -1969,6 +1977,11 @@ async fn run_qqbot_composed(
             bootstrap.tools.extend(eve_workflow_tools::tools(store.clone()));
             Some(store)
         } else { None };
+        let health_monitor = if options.health_watch {
+            let monitor=crate::qq_health::Monitor::open(options.state_directory.clone(),model_health.clone(),budget_gate.clone(),conversations.clone(),qq_admin.clone())?;
+            bootstrap.tools.push(Arc::new(crate::qq_health::ReadTool(monitor.clone())));
+            Some(monitor)
+        } else {None};
         for tool in &mut bootstrap.tools {
             *tool = Arc::new(crate::qq_access::GuardedTool {
                 inner: tool.clone(),
@@ -2805,6 +2818,9 @@ async fn run_qqbot_composed(
                 )),
             ));
         }
+        if let Some(monitor)=&health_monitor {
+            sources.push(("health-",monitor.clone()));
+        }
         // 群插话最后投递，优先保障提醒、后台任务结果与已请求的条件通知。
         if let Some(group) = &group {
             sources.push((crate::qq_group::PREFIX, group.clone()));
@@ -2812,6 +2828,7 @@ async fn run_qqbot_composed(
         if !sources.is_empty() {
             // 主动私聊开启时，通道空闲后每 2 秒询问一次；是否发送由宿主策略决定。请求澄清不主动私聊。
             let push = (group.is_some()
+                || health_monitor.is_some()
                 || trigger_admin.is_some()
                 || reminders.is_some()
                 || tasks.is_some()
@@ -2894,6 +2911,7 @@ async fn run_qqbot_composed(
             .downcast::<QqBotStatusHandle>()
             .map_err(|_| "QQBot 状态服务类型错误")?;
         channel = Some(handle.clone());
+        if let Some(monitor)=&health_monitor { let _=monitor.source.channel.set(handle.clone()); }
         if let Some(config) = panel_config {
             let sessions = registry
                 .get(&ServiceId::new(SESSION_SERVICE_ID)?)?

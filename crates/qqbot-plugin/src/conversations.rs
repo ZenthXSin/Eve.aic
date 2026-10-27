@@ -89,6 +89,20 @@ impl QqConversations {
             .cloned())
     }
 
+    /// 可信宿主为已有会话选择通知路由；新近登记的会话在前，不接受模型自报路由。
+    pub fn recent_identities(&self) -> PluginResult<Vec<QqConversationIdentity>> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| PluginError::State("QQ 身份目录不可用".into()))?;
+        Ok(inner
+            .order
+            .iter()
+            .rev()
+            .filter_map(|key| inner.identities.get(key).cloned())
+            .collect())
+    }
+
     pub(crate) fn group_route(&self, conversation: &str) -> Option<String> {
         self.inner
             .lock()

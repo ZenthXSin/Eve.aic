@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/health-watch",
     "crates/workflow-tools",
     "crates/action-review",
     "crates/group-observation-sqlite",
