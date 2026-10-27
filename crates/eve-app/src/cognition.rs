@@ -1113,8 +1113,7 @@ async fn run_window(
             if controller.is_none() {
                 let snapshot = admin.snapshot()?;
                 let at_ms = now_ms()?;
-                let execution =
-                    reflection_execution_agenda(&snapshot, max_executions, 0, at_ms)?;
+                let execution = reflection_execution_agenda(&snapshot, max_executions, 0, at_ms)?;
                 if execution.blocker.is_none()
                     && (!execution.ranked.is_empty()
                         || has_runnable_autonomous_drive(&snapshot, at_ms))
