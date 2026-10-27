@@ -397,9 +397,15 @@ impl ContextAssembler for Context {
                             let current = messages.iter().rposition(|message| {
                                 !message.from_me
                                     && message.speaker == current_user.as_str()
-                                    && (current_input == message.text
-                                        || current_input.starts_with(&message.text)
-                                        || message.text.starts_with(&current_input))
+                                    && {
+                                        let input = current_input.trim();
+                                        let stored = message.text.trim();
+                                        input == stored
+                                            || input.starts_with(stored)
+                                            || input.ends_with(stored)
+                                            || stored.starts_with(input)
+                                            || stored.ends_with(input)
+                                    }
                             });
                             let selected: Vec<_> = messages
                                 .iter()
