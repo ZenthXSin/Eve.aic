@@ -31,6 +31,7 @@ name = "eve-memory"
 path = "src/bin/memory.rs"
 
 [dependencies]
+eve-health-watch = { path = "../health-watch" }
 eve-workflow-tools = { path = "../workflow-tools" }
 libc = "0.2"
 eve-group-observation-sqlite = { path = "../group-observation-sqlite" }

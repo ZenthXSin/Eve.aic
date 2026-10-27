@@ -1,0 +1,13 @@
+[package]
+name = "eve-health-watch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+eve-llm-api = { path = "../llm-api" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+

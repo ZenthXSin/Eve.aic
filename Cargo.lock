@@ -327,6 +327,7 @@ dependencies = [
  "eve-dialogue-tools",
  "eve-file-observer",
  "eve-group-observation-sqlite",
+ "eve-health-watch",
  "eve-history-digest",
  "eve-interest-api",
  "eve-interest-plugin",
@@ -704,6 +705,16 @@ version = "0.1.0"
 dependencies = [
  "eve-chime-api",
  "rusqlite",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "eve-health-watch"
+version = "0.1.0"
+dependencies = [
+ "eve-llm-api",
+ "serde",
  "serde_json",
  "tempfile",
 ]

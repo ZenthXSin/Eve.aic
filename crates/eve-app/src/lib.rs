@@ -33,6 +33,7 @@ mod qq_files;
 mod qq_group;
 mod qq_group_digest;
 mod qq_group_recall;
+mod qq_health;
 mod qq_help;
 mod qq_history_digest;
 mod qq_host_facts;
