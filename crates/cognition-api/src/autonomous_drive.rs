@@ -49,7 +49,7 @@ impl AutonomousDrive {
     pub fn is_runnable(&self, now_ms: u64) -> bool {
         matches!(
             self.status,
-            AutonomousDriveStatus::Candidate | AutonomousDriveStatus::Ready
+            AutonomousDriveStatus::Ready
         ) && self.attempts < self.budget.max_attempts
             && self.cooldown_until_ms.is_none_or(|until| now_ms >= until)
             && self.valid_until_ms.is_none_or(|until| now_ms < until)
@@ -69,6 +69,12 @@ impl AutonomousDrive {
         }
         if self.valid_until_ms.is_some_and(|until| now_ms >= until) {
             return Some(AutonomousDriveStatus::Blocked);
+        }
+        if self.status == AutonomousDriveStatus::Waiting {
+            return self
+                .cooldown_until_ms
+                .filter(|until| now_ms >= *until)
+                .map(|_| AutonomousDriveStatus::Ready);
         }
         if self.cooldown_until_ms.is_some_and(|until| now_ms < until) {
             return Some(AutonomousDriveStatus::Waiting);
@@ -124,6 +130,8 @@ mod tests {
     fn runnable_drive_respects_status_budget_cooldown_and_expiry() {
         let mut value = drive();
         assert!(value.validate().is_ok());
+        assert!(!value.is_runnable(1_000));
+        value.status = AutonomousDriveStatus::Ready;
         assert!(value.is_runnable(1_000));
         value.cooldown_until_ms = Some(2_000);
         assert!(!value.is_runnable(1_000));
