@@ -1204,8 +1204,12 @@ pub(crate) async fn run(
                         || last_progress.get(&message.id).is_none_or(|last| last.elapsed() >= min_interval)
                         || matches!(event.event.kind, TurnEventKind::ContextCompactionStarted);
                     let blocked = entry.progress.iter().any(|p| p.state == PartState::Failed);
+                    // 旧模式只有三个被动提示名额；工具里程碑最多用两个，给压缩提示留位。
+                    let progress_limit = if stages {64}
+                        else if matches!(event.event.kind, TurnEventKind::ToolProgress { .. }) {2}
+                        else {3};
                     if entry.state == ReceiptState::Processing && !skip_start && interval_ok
-                        && (!stages || !blocked) && entry.progress.len() < if stages {64} else {3} {
+                        && (!stages || !blocked) && entry.progress.len() < progress_limit {
                         let part = entry.progress.len();
                         let proactive = stages && (passive_progress(entry) >= 2 || elapsed >= Duration::from_secs(230));
                         entry.progress.push(Progress { text: text.clone(), state: PartState::Sending, proactive });
