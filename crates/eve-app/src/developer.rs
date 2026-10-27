@@ -5,6 +5,7 @@ use eve_llm_api::{LlmError, LlmModelResolver, ModelSelection};
 use eve_plugin_api::ServiceRegistry;
 use serde_json::json;
 use std::{
+    collections::BTreeSet,
     path::Path,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -30,15 +31,39 @@ pub(crate) fn install_with_member_runtime(
     member_runtime: Option<eve_developer_api::MemberRuntime>,
     reviewer: Option<Arc<dyn ActionReviewer>>,
 ) -> Result<(), AppError> {
-    let Some(path) = std::env::var_os("EVE_DEVELOPER_CONFIG") else {
-        return Ok(());
+    let config: DeveloperConfig = if let Some(path) = std::env::var_os("EVE_DEVELOPER_CONFIG") {
+        let bytes = std::fs::read(path).map_err(|_| "开发工具配置文件无法读取；保留原文件")?;
+        if bytes.len() > 32 * 1024 {
+            return Err("开发工具配置超过上限".into());
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|_| "开发工具配置无效；不能在配置内填写 token 正文")?
+    } else {
+        let workspace = std::env::current_dir()
+            .map_err(|_| "无法确定 Eve 工作目录；未装配开发工具")?;
+        // 主人默认会话直接拥有受限开发工具；命令策略和行动审查仍然生效。
+        // 自升级、实时切换和 GitHub 写入保持关闭，凭据只从宿主环境读取。
+        DeveloperConfig {
+            workspace,
+            storage_directory: None,
+            operators: BTreeSet::from(["owner".into()]),
+            ordinary_access: false,
+            commands: true,
+            github: true,
+            github_all_users: false,
+            github_all_repositories: false,
+            github_write_repositories: BTreeSet::new(),
+            github_token_env: "EVE_GITHUB_TOKEN".into(),
+            command_timeout_ms: 120_000,
+            max_tool_rounds: 8,
+            self_upgrade: false,
+            live_upgrade: None,
+            command_policy: None,
+            action_review: true,
+            cargo_program: "cargo".into(),
+            cargo_arguments: Vec::new(),
+        }
     };
-    let bytes = std::fs::read(path).map_err(|_| "开发工具配置文件无法读取；保留原文件")?;
-    if bytes.len() > 32 * 1024 {
-        return Err("开发工具配置超过上限".into());
-    }
-    let config: DeveloperConfig = serde_json::from_slice(&bytes)
-        .map_err(|_| "开发工具配置无效；不能在配置内填写 token 正文")?;
     config.validate()?;
     let token = std::env::var(&config.github_token_env).ok();
     if !config.github_write_repositories.is_empty()
