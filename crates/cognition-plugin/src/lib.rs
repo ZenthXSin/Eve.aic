@@ -102,6 +102,8 @@ impl StoredCognition {
         for drive in snapshot.state.autonomous_drives.values_mut() {
             if drive.status == AutonomousDriveStatus::Active {
                 drive.status = AutonomousDriveStatus::Blocked;
+                // 中断的 Goal 已被恢复为 Blocked；解除绑定，避免驱动永久跳过重试。
+                drive.goal_id = None;
                 drive.cooldown_until_ms = None;
                 recovered = true;
             }
