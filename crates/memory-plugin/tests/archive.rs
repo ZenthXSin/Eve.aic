@@ -953,3 +953,77 @@ async fn compressed_archives_stay_part_of_memory_and_old_plain_chunks_still_read
     );
     assert!(archive.iter().any(|chunk| chunk["compressed"] == true));
 }
+
+#[tokio::test]
+async fn archived_evidence_can_confirm_a_preference_and_replay_after_restart_without_copying_it() {
+    let state_dir = tempfile::tempdir().unwrap();
+    let archive_dir = tempfile::tempdir().unwrap();
+    let state = RecordingStore::open(state_dir.path());
+    let archive = Arc::new(FileEvidenceArchive::open(archive_dir.path()).unwrap());
+    let owner = scope("archived-candidate");
+    let rig = start(Some(state.clone()), Some((archive.clone(), small_policy())))
+        .await
+        .unwrap();
+    for n in 1..=12 {
+        import(&rig, &owner, n).unwrap();
+    }
+    let before = rig.admin.reader(owner.clone()).unwrap().snapshot().unwrap();
+    let old = all_archived(&rig.admin, &owner)[0].clone();
+    assert!(!before.evidence.iter().any(|e| e.id == old.id));
+    let change = PreferenceChange {
+        operation_id: "confirm-archived".into(),
+        at_ms: 2000,
+        evidence: PreferenceEvidence::Existing(old.id.clone()),
+        action: PreferenceAction::Confirm {
+            id: "from-archive".into(),
+            text: "回复先给结论".into(),
+        },
+    };
+    let saved = rig
+        .admin
+        .update_preference(&owner, before.revision, change.clone())
+        .unwrap();
+    assert_eq!(saved.evidence, before.evidence);
+    assert_eq!(saved.archived_evidence, before.archived_evidence);
+    assert_eq!(saved.preferences[0].history[0].evidence_id, old.id);
+    let writes = state.writes();
+    assert!(
+        rig.admin
+            .update_preference(&owner, before.revision, change.clone())
+            .unwrap()
+            == saved
+    );
+    assert_eq!(state.writes(), writes);
+    stop(rig).await;
+    let raw = support::raw_state(state_dir.path(), MEMORY_PLUGIN_ID, MEMORY_STATE_KEY);
+    assert!(raw.contains("\"format_version\":4"));
+    let rig = start(Some(state.clone()), Some((archive.clone(), small_policy())))
+        .await
+        .unwrap();
+    assert!(rig.admin.reader(owner.clone()).unwrap().snapshot().unwrap() == saved);
+    let complete = rig
+        .admin
+        .reader(owner.clone())
+        .unwrap()
+        .complete_snapshot()
+        .unwrap();
+    assert_eq!(
+        complete.evidence.iter().filter(|e| e.id == old.id).count(),
+        1
+    );
+    stop(rig).await;
+    // 引用的归档被篡改时不能恢复出一个看似有效的偏好，不写盘、不删除现场。
+    let path = archive_dir.path().join(&archive.list().unwrap()[0]);
+    std::fs::write(&path, b"corrupted").unwrap();
+    let writes = state.writes();
+    assert!(
+        start(Some(state.clone()), Some((archive, small_policy())))
+            .await
+            .is_err()
+    );
+    assert_eq!(state.writes(), writes);
+    assert_eq!(
+        support::raw_state(state_dir.path(), MEMORY_PLUGIN_ID, MEMORY_STATE_KEY),
+        raw
+    );
+}

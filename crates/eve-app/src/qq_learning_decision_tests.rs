@@ -755,3 +755,79 @@ fn decision_command_parser_rejects_extra_input_without_disclosing_candidate_id()
         Some("偏好提炼未启用。")
     );
 }
+
+#[tokio::test]
+async fn archived_candidate_is_confirmed_once_and_restart_rechecks_real_evidence() {
+    use eve_kernel::{Kernel, KernelServices};
+    use eve_memory_plugin::{ArchivePolicy, FileEvidenceArchive, MemoryPlugin};
+    let store = Arc::new(RecordingStore::default());
+    let directory = tempfile::tempdir().unwrap();
+    let open = || {
+        let kernel = Kernel::with_services(KernelServices {
+            state: store.clone(),
+            ..KernelServices::default()
+        });
+        let archive = Arc::new(FileEvidenceArchive::open(directory.path()).unwrap());
+        let policy = ArchivePolicy {
+            trigger_evidence: 2,
+            pressure_evidence: 4,
+            keep_recent: 1,
+            pressure_keep_recent: 1,
+            min_age_ms: 0,
+            min_chunk: 1,
+            ..ArchivePolicy::default()
+        };
+        let plugin = MemoryPlugin::new()
+            .unwrap()
+            .with_archive(archive, policy)
+            .unwrap();
+        let admin = plugin.controller();
+        kernel.register(Box::new(plugin)).unwrap();
+        (kernel, admin)
+    };
+    let (kernel, admin) = open();
+    kernel.start_all().await.unwrap();
+    let session = session();
+    let scope = crate::qq_memory::scope(&session);
+    let learning = Arc::new(FixedLearning::default());
+    let candidate = add_candidate(
+        &learning,
+        &scope,
+        "archived",
+        "每次回复请先说结论",
+        import_pair(&admin, &session, "每次回复请先说结论"),
+    );
+    import_pair(&admin, &session, "本条用于推进归档");
+    let before = snapshot(&admin, &session);
+    assert!(before.archived_evidence >= 2);
+    assert!(
+        !before
+            .evidence
+            .iter()
+            .any(|e| candidate.draft.evidence_ids.contains(&e.id))
+    );
+    auto_confirm(
+        &admin,
+        learning.as_ref(),
+        &EvidenceConfirmationPolicy,
+        &scope,
+        1000,
+    )
+    .unwrap();
+    let saved = snapshot(&admin, &session);
+    assert_eq!(saved.preferences[0].id, preference_id(&candidate.id));
+    assert_eq!(saved.revision, before.revision + 1);
+    kernel.stop_all().await.unwrap();
+    let (kernel, admin) = open();
+    kernel.start_all().await.unwrap();
+    auto_confirm(
+        &admin,
+        learning.as_ref(),
+        &EvidenceConfirmationPolicy,
+        &scope,
+        1001,
+    )
+    .unwrap();
+    assert_eq!(snapshot(&admin, &session), saved);
+    kernel.stop_all().await.unwrap();
+}

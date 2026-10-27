@@ -71,7 +71,7 @@ impl Commands {
         // 后台在此期间保存的新偏好会使手动命令 CAS 失效，不能漏掉关联后重复确认。
         let snapshot = match memory
             .reader(scope.clone())
-            .and_then(|reader| reader.snapshot())
+            .and_then(|reader| reader.complete_snapshot())
         {
             Ok(snapshot) if snapshot.scope == scope => snapshot,
             Ok(_) => return Err(failure()),
@@ -424,7 +424,7 @@ pub(crate) fn auto_confirm(
     for candidate in pending {
         let snapshot = memory
             .reader(scope.clone())
-            .and_then(|r| r.snapshot())
+            .and_then(|r| r.complete_snapshot())
             .map_err(|_| failure())?;
         if snapshot.scope != *scope {
             return Err(failure());
@@ -511,7 +511,11 @@ pub(crate) fn auto_confirm(
         match memory.update_preference(scope, snapshot.revision, change) {
             Ok(saved) if saved.scope == *scope => {
                 let committed_records = learning.decisions(scope).map_err(|_| failure())?;
-                linked_candidate(&saved, candidate, &committed_records)?.ok_or_else(failure)?;
+                let complete = memory
+                    .reader(scope.clone())
+                    .and_then(|r| r.complete_snapshot())
+                    .map_err(|_| failure())?;
+                linked_candidate(&complete, candidate, &committed_records)?.ok_or_else(failure)?;
             }
             // 新一轮扫描重新核对；冲突时不覆盖并发命令，容量满保留候选供查看。
             Err(MemoryError::StaleRevision | MemoryError::LimitReached) => return Ok(()),
