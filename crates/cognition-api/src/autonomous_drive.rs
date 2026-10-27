@@ -62,3 +62,61 @@ pub enum AutonomousDriveStatus {
     Completed,
     Cancelled,
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drive() -> AutonomousDrive {
+        AutonomousDrive {
+            id: "drive-1".into(),
+            source: Source {
+                kind: crate::SourceKind::Environment,
+                channel: "test".into(),
+                reference: "event-1".into(),
+            },
+            visibility: Visibility::Internal,
+            description: "推进一个可验证维护步骤".into(),
+            evidence: vec![],
+            priority: 80,
+            budget: ExecutionBudget {
+                max_model_requests: 1,
+                max_tool_calls: 1,
+                max_attempts: 2,
+                timeout_ms: 1_000,
+            },
+            stop_condition: "receipt".into(),
+            status: AutonomousDriveStatus::Ready,
+            attempts: 0,
+            cooldown_until_ms: None,
+            last_progress_at_ms: None,
+            valid_until_ms: Some(10_000),
+        }
+    }
+
+    #[test]
+    fn runnable_drive_respects_status_budget_cooldown_and_expiry() {
+        let mut value = drive();
+        assert!(value.validate().is_ok());
+        assert!(value.is_runnable(1_000));
+        value.cooldown_until_ms = Some(2_000);
+        assert!(!value.is_runnable(1_000));
+        assert!(value.is_runnable(2_000));
+        value.attempts = value.budget.max_attempts;
+        assert!(!value.is_runnable(2_000));
+        value.attempts = 0;
+        value.status = AutonomousDriveStatus::Blocked;
+        assert!(!value.is_runnable(2_000));
+    }
+
+    #[test]
+    fn invalid_drive_rejects_zero_budget_and_empty_description() {
+        let mut value = drive();
+        value.budget.max_attempts = 0;
+        assert!(value.validate().is_err());
+        let mut value = drive();
+        value.description.clear();
+        assert!(value.validate().is_err());
+    }
+}
