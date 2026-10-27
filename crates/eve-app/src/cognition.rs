@@ -680,14 +680,14 @@ fn submit_drive(
         .as_object_mut()
         .expect("status 始终返回 JSON 对象")
         .insert(
-           "execution_contract".into(),
-           json!({
-               "verification": "reflection:v1",
-               "max_model_requests": 1,
-               "max_tool_calls": 0,
-               "stop_condition": "single-attempt"
-           }),
-       );
+            "execution_contract".into(),
+            json!({
+                "verification": "reflection:v1",
+                "max_model_requests": 1,
+                "max_tool_calls": 0,
+                "stop_condition": "single-attempt"
+            }),
+        );
     Ok(report)
 }
 
