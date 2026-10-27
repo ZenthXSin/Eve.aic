@@ -53,7 +53,7 @@ impl Tool for TaskProgressTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name:"task_progress".into(),
-            description:"多步任务开始时登记 in_progress 并写明剩余步骤；工作完成并验证后标记 completed；缺少权限、信息或无法继续时标记 blocked 并说明原因。未完成时宿主会在模型提前收尾后继续本轮，最多纠正三次；不会增加工具预算。普通聊天不用调用。".into(),
+            description:"多步任务开始时登记 in_progress 并写明剩余步骤；工作完成并验证后标记 completed；缺少权限、信息或无法继续时标记 blocked，说明已做步骤及一个具体问题；未得到答案不能猜测或标记 completed。后台 blocked 会作为等待补充通知一次，不自动重跑。未完成时宿主会在模型提前收尾后继续本轮，最多纠正三次；不会增加工具预算。普通聊天不用调用。".into(),
             argument_schema:json!({"type":"object","properties":{"status":{"type":"string","enum":["in_progress","completed","blocked"]},"remaining":{"type":"string","minLength":1,"maxLength":2048}},"required":["status","remaining"],"additionalProperties":false}),
             required_permissions:vec![], concurrency:Some(ToolConcurrency::Serial{scope:"eve.task-progress".into()}),
         }

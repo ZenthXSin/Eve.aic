@@ -198,6 +198,91 @@ async fn a_saved_final_result_is_settled_after_restart_without_a_second_executio
 }
 
 #[tokio::test]
+async fn blocked_result_survives_restart_and_is_never_reexecuted_or_counted_completed() {
+    use eve_llm_api::{ChatMessage, ToolCall, ToolOutput, ToolResult};
+    use serde_json::json;
+    let world = World::new();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let task = tasks
+        .create(&owner("alice"), spec("待用户选择"), "blocked", 10)
+        .unwrap();
+    tasks.start(&task.id, 20).unwrap();
+    let mut frame = checkpoint("alice");
+    let args = json!({"status":"blocked","remaining":"已经读完配置；部署到哪个环境？"});
+    frame.messages.push(
+        ChatMessage::assistant_tool_calls(vec![ToolCall {
+            id: "question".into(),
+            name: "task_progress".into(),
+            arguments: args.clone(),
+        }])
+        .unwrap(),
+    );
+    frame.messages.push(
+        ChatMessage::tool_results(vec![ToolResult {
+            call_id: "question".into(),
+            output: ToolOutput::Success(args),
+        }])
+        .unwrap(),
+    );
+    frame.used_tool_calls = 1;
+    frame.tool_batches = 1;
+    frame.provider_requests = 2;
+    frame.remaining = None;
+    frame.result = Some("已核对配置，部署到哪个环境？".into());
+    tasks.checkpoint(&task.id, frame, u64::MAX, 30).unwrap();
+    kernel.stop_all().await.unwrap();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let saved = tasks.snapshot().unwrap().get(&task.id).unwrap().clone();
+    assert_eq!(saved.status, TaskStatus::Blocked);
+    assert_eq!(
+        saved.result.as_deref(),
+        Some("已核对配置，部署到哪个环境？")
+    );
+    assert!(saved.notice_pending());
+    assert!(tasks.snapshot().unwrap().queued().is_empty());
+    assert_eq!(saved.execution.unwrap().recoveries, 0);
+    let bytes = world.raw().unwrap();
+    let wire: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(wire["format_version"], 3);
+    kernel.stop_all().await.unwrap();
+    let (kernel, tasks) = world.open().await.unwrap();
+    assert_eq!(
+        tasks.snapshot().unwrap().get(&task.id).unwrap().status,
+        TaskStatus::Blocked
+    );
+    kernel.stop_all().await.unwrap();
+    let mut old = wire;
+    old["format_version"] = json!(2);
+    world.write(serde_json::to_vec(&old).unwrap());
+    assert!(world.open().await.is_err(), "旧格式不能伪装携带新状态");
+}
+
+#[tokio::test]
+async fn explicit_blocked_finish_persists_progress_and_pending_notice() {
+    let world = World::new();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let task = tasks
+        .create(&owner("alice"), spec("等待选择"), "blocked-finish", 10)
+        .unwrap();
+    tasks.start(&task.id, 20).unwrap();
+    let saved = tasks
+        .finish(
+            &task.id,
+            TaskEnd::Blocked {
+                result: "已检查；保留哪份文件？".into(),
+            },
+            usage(1),
+            30,
+        )
+        .unwrap();
+    assert_eq!(saved.status, TaskStatus::Blocked);
+    assert!(saved.notice_pending());
+    assert_eq!(saved.result.as_deref(), Some("已检查；保留哪份文件？"));
+    assert!(saved.failure.is_none());
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
 async fn unfinished_recovery_result_still_requires_budget_approval_after_restart() {
     let world = World::new();
     let (kernel, tasks) = world.open().await.unwrap();
