@@ -865,3 +865,16 @@ test("仅前缀模式保留群观察，普通艾特不唤醒，大小写前缀�
   assert.deepEqual(f.frames.filter(x=>x.type==="message").map(x=>x.id),["prefix","at-prefix","private"]);
   assert.equal(f.sent.length,0);
 });
+
+test("网络故障按固定类别记录且不重发未知投递", async () => {
+  for (const [code, expected] of [["ENOTFOUND","dns"],["ECONNRESET","connection"],["UND_ERR_HEADERS_TIMEOUT","timeout"],["ERR_TLS_CERT_ALTNAME_INVALID","tls"],["PRIVATE_VALUE","transport_unknown"]]) {
+    const error = new TypeError("fetch failed private-token", { cause: Object.assign(new Error("private-body"), {code}) });
+    const f = fixture({ fail: true, error }); f.message();
+    await f.bridge.command({ version: 1, type: "reply", id: "in-1", text: "结果" });
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.frames.at(-1).failure_kind, expected);
+    assert.equal(f.frames.at(-1).notice_status, "not_attempted");
+    assert.ok(!JSON.stringify(f.frames).includes("private"));
+    assert.ok(!JSON.stringify(f.frames).includes("PRIVATE_VALUE"));
+  }
+});

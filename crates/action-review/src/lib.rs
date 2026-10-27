@@ -1,11 +1,13 @@
-//! 默认行动审查者：一次无工具模型请求，输出严格 JSON。判断标准参考 openai/codex 的
+//! 默认行动审查者：一次模型请求，通过唯一的 submit_review 工具提交结论。判断标准参考 openai/codex 的
 //! Guardian 审查策略（Apache-2.0）：分别评估风险与用户授权，只把用户本人的原话当作授权依据，
 //! 缺少依据时从严。宿主再按 `ActionReviewVerdict::permits` 复核，审查失败一律不执行。
 use eve_developer_api::{
     ActionReviewFuture, ActionReviewRequest, ActionReviewVerdict, ActionReviewer,
     ReviewAuthorization, ReviewRisk,
 };
-use eve_llm_api::{ChatMessage, ChatRole, LlmModelResolver, ModelRequest, ModelResponse};
+use eve_llm_api::{
+    ChatMessage, ChatRole, LlmModelResolver, ModelRequest, ModelResponse, ToolDefinition,
+};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -35,7 +37,32 @@ const SYSTEM_PROMPT: &str = r#"你是 Eve 的行动审查者。Eve 准备在宿�
 
 结论：风险为 high 时只有授权为 high 才能放行；授权为 unknown 或 low 时不放行；风险为 critical 一律不放行；缺少关键信息无法判断时从严。
 
-只输出严格 JSON：{"risk":"low|medium|high|critical","authorization":"unknown|low|medium|high","outcome":"allow|deny","rationale":"…"}。rationale 用一两句中文说明依据，不超过 300 字。不得有 Markdown、解释或额外字段。"#;
+必须且只能调用一次 submit_review 提交以下参数：{"risk":"low|medium|high|critical","authorization":"unknown|low|medium|high","outcome":"allow|deny","rationale":"…"}。rationale 用一两句中文说明依据，不超过 300 字。不得输出普通正文、Markdown 或调用其他工具；submit_review 仅提交审核结论，不执行动作。"#;
+
+fn submission_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "submit_review".into(),
+        description: "提交本次行动审核结论；仅返回数据，不执行命令。按系统规则判断风险与用户授权，信息不足拒绝。".into(),
+        argument_schema: serde_json::json!({"type":"object","additionalProperties":false,
+            "properties":{
+                "risk":{"type":"string","enum":["low","medium","high","critical"]},
+                "authorization":{"type":"string","enum":["unknown","low","medium","high"]},
+                "outcome":{"type":"string","enum":["allow","deny"]},
+                "rationale":{"type":"string","minLength":1,"maxLength":300}
+            },"required":["risk","authorization","outcome","rationale"]}),
+        required_permissions: vec![], concurrency: None,
+    }
+}
+fn submitted(response: ModelResponse) -> Result<ActionReviewVerdict, String> {
+    let ModelResponse::ToolCalls { calls } = response else {
+        return Err("审查输出未调用 submit_review".into());
+    };
+    if calls.len() != 1 || calls[0].name != "submit_review" || calls[0].validate().is_err() {
+        return Err("审查输出必须且只能调用一次 submit_review".into());
+    }
+    let text = serde_json::to_string(&calls[0].arguments).map_err(|_| "审查输出无法解析")?;
+    parse(&text)
+}
 
 pub struct ModelActionReviewer {
     resolver: Arc<dyn LlmModelResolver>,
@@ -89,19 +116,16 @@ impl ActionReviewer for ModelActionReviewer {
                     ChatMessage::text(ChatRole::System, SYSTEM_PROMPT),
                     ChatMessage::text(ChatRole::User, input),
                 ],
-                tools: vec![],
+                tools: vec![submission_tool()],
             };
             let response = tokio::time::timeout(
                 selection.provider_timeout,
-                selection.provider.complete_json(request),
+                selection.provider.complete(request),
             )
             .await
             .map_err(|_| "审查超时".to_string())?
             .map_err(|e| e.to_string())?;
-            let ModelResponse::Final { text } = response else {
-                return Err("审查输出不是约定的 JSON".into());
-            };
-            parse(&text)
+            submitted(response)
         })
     }
 }
@@ -120,7 +144,15 @@ mod tests {
         fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
             self.seen.lock().unwrap().push(request);
             let text = self.reply.clone();
-            Box::pin(async move { Ok(ModelResponse::Final { text }) })
+            Box::pin(async move {
+                Ok(ModelResponse::ToolCalls {
+                    calls: vec![eve_llm_api::ToolCall {
+                        id: "review-1".into(),
+                        name: "submit_review".into(),
+                        arguments: serde_json::from_str(&text).unwrap(),
+                    }],
+                })
+            })
         }
     }
     struct Fixed(Arc<Scripted>);
@@ -154,7 +186,8 @@ mod tests {
         let verdict = reviewer.review(request()).await.unwrap();
         assert!(verdict.permits());
         let seen = provider.seen.lock().unwrap();
-        assert!(seen[0].tools.is_empty(), "审查请求不带工具");
+        assert_eq!(seen[0].tools.len(), 1);
+        assert_eq!(seen[0].tools[0].name, "submit_review");
         let input: serde_json::Value =
             serde_json::from_str(seen[0].messages[1].text.as_deref().unwrap()).unwrap();
         assert_eq!(input["action"], "git reset --hard");
@@ -204,6 +237,36 @@ mod tests {
         assert!(
             !verdict(R::Low, A::High, false).permits(),
             "审查者拒绝就不放行"
+        );
+    }
+    #[test]
+    fn prose_wrong_tool_and_multiple_submissions_never_allow_execution() {
+        let args = serde_json::json!({"risk":"low","authorization":"high","outcome":"allow","rationale":"已授权"});
+        let call = eve_llm_api::ToolCall {
+            id: "one".into(),
+            name: "submit_review".into(),
+            arguments: args.clone(),
+        };
+        assert!(
+            submitted(ModelResponse::Final {
+                text: args.to_string()
+            })
+            .is_err()
+        );
+        assert!(submitted(ModelResponse::ToolCalls { calls: vec![] }).is_err());
+        assert!(
+            submitted(ModelResponse::ToolCalls {
+                calls: vec![call.clone(), call.clone()]
+            })
+            .is_err()
+        );
+        let mut wrong = call.clone();
+        wrong.name = "run_command".into();
+        assert!(submitted(ModelResponse::ToolCalls { calls: vec![wrong] }).is_err());
+        assert!(
+            submitted(ModelResponse::ToolCalls { calls: vec![call] })
+                .unwrap()
+                .permits()
         );
     }
 }
