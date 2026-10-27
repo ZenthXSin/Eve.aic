@@ -375,22 +375,29 @@ impl Worker {
         now_ms: u64,
     ) -> LoopResult<CognitiveSnapshot> {
         let mut state = snapshot.state.clone();
-        let materialized =
-            state
-                .autonomous_drives
-                .iter()
-                .enumerate()
-                .find_map(|(index, (id, drive))| {
-                    if !drive.is_runnable(now_ms) || drive.goal_id.is_some() {
-                        return None;
-                    }
-                    let verification = drive.verification.clone()?;
-                    let goal_id = format!("autonomous.goal.{}.{}", snapshot.revision, index);
-                    if state.goals.contains_key(&goal_id) {
-                        return None;
-                    }
-                    Some((id.clone(), goal_id, drive.clone(), verification))
-                });
+        let mut candidates: Vec<_> = state
+            .autonomous_drives
+            .iter()
+            .filter(|(_, drive)| drive.is_runnable(now_ms) && drive.goal_id.is_none())
+            .map(|(id, drive)| (id.clone(), drive.clone()))
+            .collect();
+        candidates.sort_by(|(left_id, left), (right_id, right)| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        let materialized = candidates
+            .into_iter()
+            .enumerate()
+            .find_map(|(index, (id, drive))| {
+                let verification = drive.verification.clone()?;
+                let goal_id = format!("autonomous.goal.{}.{}", snapshot.revision, index);
+                if state.goals.contains_key(&goal_id) {
+                    return None;
+                }
+                Some((id, goal_id, drive, verification))
+            });
         let Some((drive_id, goal_id, drive, verification)) = materialized else {
             return Ok(snapshot);
         };
