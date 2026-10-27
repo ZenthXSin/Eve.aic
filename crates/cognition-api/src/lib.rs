@@ -393,7 +393,7 @@ impl CognitiveState {
                 {
                     return Err(CognitionError::AccessDenied);
                 }
-                let lifecycle_matches = match drive.status {
+                let lifecycle_matches = match &drive.status {
                     AutonomousDriveStatus::Ready => goal.status == GoalStatus::Ready,
                     AutonomousDriveStatus::Active => goal.status == GoalStatus::Executing,
                     AutonomousDriveStatus::Completed => goal.status == GoalStatus::Completed,
