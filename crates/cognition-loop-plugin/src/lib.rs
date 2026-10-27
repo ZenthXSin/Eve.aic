@@ -745,11 +745,11 @@ impl Worker {
                     }
                     GoalStatus::Blocked => {
                         drive.goal_id = None;
-                        let retry_without_side_effects = feedback.commit == ExecutionCommit::NotStarted
+                        let retry_without_side_effects = feedback.commit
+                            == ExecutionCommit::NotStarted
                             || (reason == Some(BlockReason::Invalidated)
                                 && feedback.started_tools == Some(0));
-                        if retry_without_side_effects
-                            && drive.attempts < drive.budget.max_attempts
+                        if retry_without_side_effects && drive.attempts < drive.budget.max_attempts
                         {
                             drive.status = AutonomousDriveStatus::Waiting;
                             drive.cooldown_until_ms = Some(feedback.at_ms.saturating_add(60_000));
