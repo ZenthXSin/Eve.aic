@@ -138,6 +138,7 @@ class GroupRelationAcceptance(group_chat_test.GroupChatAcceptance):
             self.assertEqual(len(self.relation_rows('experiences')),0)
         def learned():
             self.wait_for(lambda:len(self.relation_rows('experiences'))>=1,'独立整理没有写入 Jev 经验',15)
+            self.wait_judgments(3)  # 退出前等本条 Jev 请求提交，避免中途断开模型替身连接。
         self.run_eve([self.observation('uncertain-1','那处理器怎么接'),*self.checkpoint('first'),
             self.observation('uncertain-2','我也在问 Mindustry 的处理器'),*self.checkpoint('immediate'),*self.checkpoint('sent'),
             self.observation('clarify','刚才两句都是在问 Eve 的 Mindustry 逻辑处理器'),*self.checkpoint('learned')],

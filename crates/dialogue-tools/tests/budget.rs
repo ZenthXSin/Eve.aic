@@ -29,6 +29,7 @@ impl AutonomyBudget for Budget {
         };
         let start_ms = policy.window_start(now_ms);
         Ok(BudgetSnapshot {
+            category_limits: BTreeMap::new(),
             policy,
             current: BudgetWindow {
                 start_ms,

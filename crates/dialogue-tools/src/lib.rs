@@ -525,6 +525,7 @@ impl Tool for DialogueTool {
                         "used": snapshot.current.used,
                         "remaining": snapshot.remaining(),
                         "by_category": snapshot.current.by_category,
+                        "category_limits": snapshot.category_limits,
                         "window_started_at_ms": snapshot.current.start_ms,
                         "resets_at_ms": snapshot.resets_at_ms,
                         "resets_in_minutes": snapshot.resets_at_ms.saturating_sub(now).div_ceil(60_000),

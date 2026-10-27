@@ -59,6 +59,27 @@ impl Gate {
                 >= units),
         }
     }
+    /// 分项准入不扣额度；实际请求仍在账本锁内重新核对并扣减。
+    pub(crate) fn admits_category(&self, category: &str, units: u32) -> Result<bool, AppError> {
+        let Some(budget) = &self.budget else {
+            return Ok(true);
+        };
+        let snapshot = budget.snapshot(now_ms()).map_err(|e| e.to_string())?;
+        let category_remaining = snapshot
+            .category_limits
+            .get(category)
+            .map_or(u32::MAX, |limit| {
+                limit.saturating_sub(
+                    snapshot
+                        .current
+                        .by_category
+                        .get(category)
+                        .copied()
+                        .unwrap_or(0),
+                )
+            });
+        Ok(snapshot.remaining() >= units && category_remaining >= units)
+    }
     /// 按用途包装后台模型解析器；未启用预算时原样返回。
     pub(crate) fn wrap(
         &self,
@@ -93,6 +114,8 @@ fn label(category: &str) -> &str {
         FORGE => "工具锻造",
         OUTREACH => "主动交流",
         CLARIFY => "请求澄清",
+        "chime" => "主动接话判断",
+        "group-relation" => "群关系整理",
         "summary" => "情景语义摘要",
         other => other,
     }
@@ -123,6 +146,20 @@ fn describe(snapshot: &BudgetSnapshot) -> String {
             .map(|(category, count)| format!("{} {count}", label(category)))
             .collect();
         reply.push_str(&format!(" 按用途：{}。", parts.join("，")));
+    }
+    if !snapshot.category_limits.is_empty() {
+        let limits: Vec<_> = snapshot
+            .category_limits
+            .iter()
+            .map(|(category, limit)| {
+                let used = current.by_category.get(category).copied().unwrap_or(0);
+                format!("{} {used}/{limit}", label(category))
+            })
+            .collect();
+        reply.push_str(&format!(
+            " 分项用量/上限：{}；分项用尽不占用其他用途余额。",
+            limits.join("，")
+        ));
     }
     if snapshot.remaining() == 0 {
         reply.push_str(
@@ -180,6 +217,7 @@ mod tests {
                 used: 5,
                 by_category: BTreeMap::from([(RESEARCH.into(), 2), (INTEREST.into(), 3)]),
             },
+            category_limits: BTreeMap::new(),
             resets_at_ms: 1_791_417_600_000,
             history: vec![BudgetWindow {
                 start_ms: 1_791_244_800_000,
