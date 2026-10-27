@@ -350,11 +350,7 @@ impl CognitiveState {
             .values()
             .filter(|drive| drive.is_runnable(now_ms))
             .collect();
-        drives.sort_by(|a, b| {
-            b.priority
-                .cmp(&a.priority)
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        drives.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
         drives
     }
 
