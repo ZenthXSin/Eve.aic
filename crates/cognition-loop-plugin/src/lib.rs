@@ -342,9 +342,9 @@ impl Worker {
         if changes.is_empty() {
             return Ok(snapshot);
         }
-        for (id, previous, status) in changes {
+        for (index, (id, previous, status)) in changes.into_iter().enumerate() {
             state.events.push(CognitiveEvent {
-                id: format!("autonomous-review-{}-{}", snapshot.revision, id),
+                id: format!("autonomous-review-{}-{}", snapshot.revision, index),
                 kind: CognitiveEventKind::StateChanged,
                 source: Source {
                     kind: SourceKind::Internal,
