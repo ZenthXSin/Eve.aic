@@ -62,6 +62,7 @@ mod qq_skill;
 mod qq_stickers;
 mod qq_subagents;
 mod qq_summary;
+mod qq_task_diagnostics;
 mod qq_tasks;
 mod qq_tools;
 mod qq_triggers;
