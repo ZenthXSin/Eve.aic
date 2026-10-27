@@ -238,6 +238,7 @@ fn validate_autonomous_drive_transition(
         || old.visibility != next.visibility
         || old.description != next.description
         || old.evidence != next.evidence
+        || old.verification != next.verification
         || old.priority != next.priority
         || old.budget != next.budget
         || old.stop_condition != next.stop_condition
@@ -481,6 +482,7 @@ impl CognitionController {
                 AutonomousDriveStatus::Candidate | AutonomousDriveStatus::Ready
             )
             || drive.attempts != 0
+            || drive.goal_id.is_some()
         {
             return Err(CognitionError::InvalidInput);
         }
