@@ -130,6 +130,7 @@ mod tests {
     fn runnable_drive_respects_status_budget_cooldown_and_expiry() {
         let mut value = drive();
         assert!(value.validate().is_ok());
+        value.status = AutonomousDriveStatus::Candidate;
         assert!(!value.is_runnable(1_000));
         value.status = AutonomousDriveStatus::Ready;
         assert!(value.is_runnable(1_000));
