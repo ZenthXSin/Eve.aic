@@ -671,7 +671,7 @@ fn submit_drive(
         budget: ExecutionBudget {
             max_model_requests: 1,
             max_tool_calls: 0,
-            max_attempts: 1,
+            max_attempts: 3,
             timeout_ms: 30_000,
         },
         stop_condition: "single-attempt".into(),
@@ -693,7 +693,9 @@ fn submit_drive(
                 "verification": "reflection:v1",
                 "max_model_requests": 1,
                 "max_tool_calls": 0,
-                "stop_condition": "single-attempt"
+                "max_attempts": 3,
+                "stop_condition": "single-attempt",
+                "blocked_recovery": "background_wait_60s"
             }),
         );
     Ok(report)
