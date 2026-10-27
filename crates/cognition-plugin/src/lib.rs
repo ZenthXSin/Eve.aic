@@ -99,6 +99,13 @@ impl StoredCognition {
                 recovered = true;
             }
         }
+        for drive in snapshot.state.autonomous_drives.values_mut() {
+            if drive.status == AutonomousDriveStatus::Active {
+                drive.status = AutonomousDriveStatus::Blocked;
+                drive.cooldown_until_ms = None;
+                recovered = true;
+            }
+        }
         if recovered {
             snapshot.revision = snapshot
                 .revision
