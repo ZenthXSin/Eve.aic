@@ -261,37 +261,34 @@ fn validate_autonomous_drive_transition(
         ) | (
             AutonomousDriveStatus::Candidate,
             AutonomousDriveStatus::Cancelled,
-        ) | (
-            AutonomousDriveStatus::Ready,
-            AutonomousDriveStatus::Active,
-        ) | (
-            AutonomousDriveStatus::Ready,
-            AutonomousDriveStatus::Waiting,
-        ) | (
-            AutonomousDriveStatus::Ready,
-            AutonomousDriveStatus::Blocked,
-        ) | (
-            AutonomousDriveStatus::Ready,
-            AutonomousDriveStatus::Cancelled,
-        ) | (
-            AutonomousDriveStatus::Active,
-            AutonomousDriveStatus::Waiting,
-        ) | (
-            AutonomousDriveStatus::Active,
-            AutonomousDriveStatus::Blocked,
-        ) | (
-            AutonomousDriveStatus::Active,
-            AutonomousDriveStatus::Completed,
-        ) | (
-            AutonomousDriveStatus::Waiting,
-            AutonomousDriveStatus::Ready,
-        ) | (
-            AutonomousDriveStatus::Waiting,
-            AutonomousDriveStatus::Blocked,
-        ) | (
-            AutonomousDriveStatus::Waiting,
-            AutonomousDriveStatus::Cancelled,
-    )
+        ) | (AutonomousDriveStatus::Ready, AutonomousDriveStatus::Active,)
+            | (AutonomousDriveStatus::Ready, AutonomousDriveStatus::Waiting,)
+            | (AutonomousDriveStatus::Ready, AutonomousDriveStatus::Blocked,)
+            | (
+                AutonomousDriveStatus::Ready,
+                AutonomousDriveStatus::Cancelled,
+            )
+            | (
+                AutonomousDriveStatus::Active,
+                AutonomousDriveStatus::Waiting,
+            )
+            | (
+                AutonomousDriveStatus::Active,
+                AutonomousDriveStatus::Blocked,
+            )
+            | (
+                AutonomousDriveStatus::Active,
+                AutonomousDriveStatus::Completed,
+            )
+            | (AutonomousDriveStatus::Waiting, AutonomousDriveStatus::Ready,)
+            | (
+                AutonomousDriveStatus::Waiting,
+                AutonomousDriveStatus::Blocked,
+            )
+            | (
+                AutonomousDriveStatus::Waiting,
+                AutonomousDriveStatus::Cancelled,
+            )
     );
     if allowed {
         Ok(())
