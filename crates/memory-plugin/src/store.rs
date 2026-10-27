@@ -17,12 +17,29 @@ use std::{
 /// 不会误判为空或清空；没有压缩分块的文档仍写格式 1 或 2，与旧版本逐字节相同。
 const ARCHIVED_FORMAT_VERSION: u32 = 2;
 const COMPRESSED_FORMAT_VERSION: u32 = 3;
+/// 格式 4：偏好可引用已归档来源；旧程序拒绝读取而不会误写。
+const ARCHIVED_REFERENCES_FORMAT_VERSION: u32 = 4;
 /// 解开后缓存在内存中的分块证据总条数上限；按最近使用淘汰，只影响读取速度。
 const DECODED_CACHE_EVIDENCE: usize = 16_384;
 
 fn format_for(document: &Document) -> u32 {
     if document.next_chunk == 0 {
         MEMORY_FORMAT_VERSION
+    } else if document.scopes.iter().any(|record| {
+        record
+            .snapshot
+            .preferences
+            .iter()
+            .flat_map(|p| &p.history)
+            .any(|v| {
+                !record
+                    .snapshot
+                    .evidence
+                    .iter()
+                    .any(|e| e.id == v.evidence_id)
+            })
+    }) {
+        ARCHIVED_REFERENCES_FORMAT_VERSION
     } else if document
         .scopes
         .iter()
@@ -141,7 +158,12 @@ impl ScopeRecord {
         self.snapshot.revision = revision;
         Ok(true)
     }
-    fn change(&mut self, expected: u64, change: PreferenceChange) -> MemoryResult<bool> {
+    fn change(
+        &mut self,
+        expected: u64,
+        change: PreferenceChange,
+        archived: ArchivedLoader<'_>,
+    ) -> MemoryResult<bool> {
         validate_change(&change)?;
         if let Some(old) = self
             .operations
@@ -163,7 +185,19 @@ impl ScopeRecord {
                     .iter()
                     .any(|evidence| evidence.id == *id)
                 {
-                    return Err(MemoryError::NotFound);
+                    let mut found = false;
+                    for chunk in &self.archive {
+                        if archived(chunk)?
+                            .iter()
+                            .any(|e| e.id == *id && e.revision <= expected)
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        return Err(MemoryError::NotFound);
+                    }
                 }
                 id.clone()
             }
@@ -292,14 +326,18 @@ impl StoredMemory {
                 let document: Document =
                     serde_json::from_value(value).map_err(|_| MemoryError::CorruptState)?;
                 match document.format_version {
-                    MEMORY_FORMAT_VERSION | ARCHIVED_FORMAT_VERSION | COMPRESSED_FORMAT_VERSION => {
+                    MEMORY_FORMAT_VERSION
+                    | ARCHIVED_FORMAT_VERSION
+                    | COMPRESSED_FORMAT_VERSION
+                    | ARCHIVED_REFERENCES_FORMAT_VERSION => {
                         if document.format_version != format_for(&document) {
                             return Err(MemoryError::CorruptState);
                         }
                     }
                     _ => return Err(MemoryError::UnsupportedVersion),
                 }
-                validate_document(&document).map_err(|_| MemoryError::CorruptState)?;
+                validate_document(&document, archive.as_ref())
+                    .map_err(|_| MemoryError::CorruptState)?;
                 (document, bytes.len())
             }
         };
@@ -582,7 +620,9 @@ impl StoredMemory {
         expected: u64,
         change: PreferenceChange,
     ) -> MemoryResult<MemorySnapshot> {
-        self.mutate(scope, |record, _| record.change(expected, change))
+        self.mutate(scope, |record, archived| {
+            record.change(expected, change, archived)
+        })
     }
     fn mutate(
         &self,
@@ -609,6 +649,7 @@ impl StoredMemory {
         if !changed {
             return Ok(next.scopes[index].snapshot.clone());
         }
+        next.format_version = format_for(&next);
         let mut bytes = serde_json::to_vec(&next).map_err(|_| MemoryError::InvalidInput)?;
         let mut archived_name = None;
         if let Some(config) = inner.archive.clone()
@@ -902,7 +943,7 @@ fn validate_limits(document: &Document) -> MemoryResult<()> {
     }
     Ok(())
 }
-fn validate_document(document: &Document) -> MemoryResult<()> {
+fn validate_document(document: &Document, archive: Option<&ArchiveConfig>) -> MemoryResult<()> {
     validate_limits(document)?;
     let mut scopes = BTreeSet::new();
     let mut sequences = BTreeSet::new();
@@ -952,6 +993,19 @@ fn validate_document(document: &Document) -> MemoryResult<()> {
         // 从不可删除的来源与操作逐修订重放，校验任何快照字段、证据引用和历史；
         // 已归档修订只核对占位，原文在读取分块时逐项核对。
         let mut replay = ScopeRecord::empty(record.snapshot.scope.clone());
+        replay.archive = record.archive.clone();
+        let decoded = std::cell::RefCell::new(BTreeMap::<String, Vec<InteractionEvidence>>::new());
+        let loader = |chunk: &ChunkRecord| {
+            let mut cache = decoded.borrow_mut();
+            let name = chunk.name();
+            if let Some(found) = cache.get(&name) {
+                return Ok(found.clone());
+            }
+            let config = archive.ok_or(MemoryError::Unavailable)?;
+            let evidence = load_chunk(config.store.as_ref(), &record.snapshot.scope, chunk)?;
+            cache.insert(name, evidence.clone());
+            Ok(evidence)
+        };
         for revision in 1..=record.snapshot.revision {
             while run.is_some_and(|[_, end]| *end < revision) {
                 run = runs.next();
@@ -964,7 +1018,7 @@ fn validate_document(document: &Document) -> MemoryResult<()> {
                 continue;
             }
             let changed = if let Some(operation) = operations.get(&revision) {
-                replay.change(revision - 1, operation.change.clone())?
+                replay.change(revision - 1, operation.change.clone(), &loader)?
             } else {
                 let evidence = evidence.get(&revision).ok_or(MemoryError::CorruptState)?;
                 if !matches!(evidence.source, EvidenceSource::CompletedInteraction { .. }) {
