@@ -66,6 +66,21 @@ class TriggerAcceptance(reminder_test.ReminderAcceptance):
         self.assertEqual(len([r for r in self.kind("chat") if self.text(r["body"]).startswith(PREFIX)]), before)
         self.assertEqual(len(self.pushes()), 1)
 
+    def test_armed_timer_survives_restart_and_fires_without_another_user_message(self):
+        self.configure({"type":"time","after_seconds":8})
+        self.run_eve(self.send(self.message("create-persistent","设置唤醒",expected="已设置")))
+        [before]=self.triggers()
+        self.assertEqual(before['status'],'Armed')
+        self.assertEqual(self.pushes(),[])
+        # 第二个真实进程没有新用户消息；重建保存的原会话并等待同一计时器到期。
+        self.run_eve(self.checkpoint('sent-after-restart'),checkpoints={'sent-after-restart':self.wait_sent})
+        [after]=self.triggers()
+        self.assertEqual(after['id'],before['id'])
+        self.assertEqual((after['status'],after['delivery']),('Completed','Sent'))
+        self.assertEqual(len(self.pushes()),1)
+        wakes=[r for r in self.kind('chat') if self.text(r['body']).startswith(PREFIX)]
+        self.assertEqual(len(wakes),1)
+
     def test_group_message_match_is_scoped_and_result_returns_to_original_group(self):
         self.configure({"type": "message_contains", "text": "构建完成"})
         route = {"scope": "group", "target": "group-1"}
