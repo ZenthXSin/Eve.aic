@@ -1204,12 +1204,14 @@ pub(crate) async fn run(
                         || last_progress.get(&message.id).is_none_or(|last| last.elapsed() >= min_interval)
                         || matches!(event.event.kind, TurnEventKind::ContextCompactionStarted);
                     let blocked = entry.progress.iter().any(|p| p.state == PartState::Failed);
-                    // 旧模式只有三个被动提示名额；工具里程碑最多用两个，给压缩提示留位。
-                    let progress_limit = if stages {64}
-                        else if matches!(event.event.kind, TurnEventKind::ToolProgress { .. }) {2}
-                        else {3};
-                    if entry.state == ReceiptState::Processing && !skip_start && interval_ok
-                        && (!stages || !blocked) && entry.progress.len() < progress_limit {
+                    // 旧模式沿用 1/30/70 步节奏；新模式更密的事件不能抢占压缩通知名额。
+                    let legacy_milestone = stages || match event.event.kind {
+                        TurnEventKind::ToolProgress { completed_calls, .. } =>
+                            completed_calls >= [1, 30, 70].get(entry.progress.len()).copied().unwrap_or(usize::MAX),
+                        _ => true,
+                    };
+                    if entry.state == ReceiptState::Processing && !skip_start && interval_ok && legacy_milestone
+                        && (!stages || !blocked) && entry.progress.len() < if stages {64} else {3} {
                         let part = entry.progress.len();
                         let proactive = stages && (passive_progress(entry) >= 2 || elapsed >= Duration::from_secs(230));
                         entry.progress.push(Progress { text: text.clone(), state: PartState::Sending, proactive });
