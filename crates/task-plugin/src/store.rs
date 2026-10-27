@@ -52,7 +52,7 @@ impl StoredTasks {
                 let value = strict_json::from_slice(&bytes).map_err(|_| TaskError::CorruptState)?;
                 if !matches!(
                     value.get("format_version").and_then(|value| value.as_u64()),
-                    Some(1 | 2)
+                    Some(1..=3)
                 ) {
                     return Err(if value.get("format_version").is_some() {
                         TaskError::UnsupportedVersion
@@ -67,6 +67,11 @@ impl StoredTasks {
                         .tasks
                         .iter()
                         .any(|task| task.spec.context.is_some() || task.execution.is_some())
+                {
+                    return Err(TaskError::CorruptState);
+                }
+                if ledger.format_version < 3
+                    && ledger.tasks.iter().any(|t| t.status == TaskStatus::Blocked)
                 {
                     return Err(TaskError::CorruptState);
                 }
@@ -94,6 +99,9 @@ impl StoredTasks {
                                 "本次步数预算不足；已有进度保留，等待原会话明确同意追加步数。"
                                     .into(),
                             );
+                        } else if blocked_progress(&checkpoint.messages).is_some() {
+                            task.status = TaskStatus::Blocked;
+                            task.result = Some(bounded(result, MAX_RESULT_BYTES));
                         } else {
                             task.status = TaskStatus::Completed;
                             task.result = Some(bounded(result, MAX_RESULT_BYTES));
@@ -286,6 +294,14 @@ impl StoredTasks {
                 end
             };
             match end {
+                TaskEnd::Blocked { result } => {
+                    if result.trim().is_empty() {
+                        return Err(TaskError::InvalidInput);
+                    }
+                    task.status = TaskStatus::Blocked;
+                    task.result = Some(bounded(&result, MAX_RESULT_BYTES));
+                    task.notice = notice;
+                }
                 TaskEnd::Completed { result } => {
                     if result.trim().is_empty() {
                         return Err(TaskError::InvalidInput);
@@ -596,7 +612,13 @@ fn encode(ledger: &Ledger) -> TaskResult<Vec<u8>> {
     if ledger.tasks.len() > MAX_TASKS {
         return Err(TaskError::LimitReached);
     }
-    let bytes = serde_json::to_vec(ledger).map_err(|_| TaskError::InvalidInput)?;
+    let mut wire = ledger.clone();
+    wire.format_version = if wire.tasks.iter().any(|t| t.status == TaskStatus::Blocked) {
+        3
+    } else {
+        FORMAT_VERSION
+    };
+    let bytes = serde_json::to_vec(&wire).map_err(|_| TaskError::InvalidInput)?;
     // 重启时写入的中断与未知结局比原状态略长；为进行中的任务预留空间，保证能保存。
     let open = ledger
         .tasks
@@ -716,7 +738,9 @@ fn validate_task(task: &Task) -> TaskResult<()> {
             shape == (false, false, false, false, false, false) && !task.cancel_requested
         }
         TaskStatus::Running => shape == (true, false, false, false, false, false),
-        TaskStatus::Completed => shape == (true, true, true, true, false, true),
+        TaskStatus::Completed | TaskStatus::Blocked => {
+            shape == (true, true, true, true, false, true)
+        }
         TaskStatus::Failed => shape == (true, true, true, false, true, true),
         TaskStatus::Interrupted => {
             shape == (true, true, false, false, false, true) && !task.cancel_requested

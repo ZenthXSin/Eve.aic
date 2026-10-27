@@ -102,7 +102,7 @@ impl Tool for GuardedTool {
                 | "apply_patch"
                 | "run_command"
         ) {
-            definition.description.push_str(" 普通成员在自己当前会话的独立项目工作区执行，不需要管理员逐项授权。相对路径以此项目根目录为准；run_command 中工作区是 /work，HOME 是 /work/.home，Java 在 PATH，Mindustry 无头服务端只读位于 /opt/eve/mindustry-server.jar（宿主已配置时）。可编写模组、编译、导入并运行验证，交付文件放 exports/ 再调用 send_file。编译通过不能冒充已通过游戏运行验证；无图形客户端时如实区分无头验证与客户端验证。");
+            definition.description.push_str(" 普通成员在自己当前会话的独立项目工作区执行，不需要管理员逐项授权。相对路径以此项目根目录为准；run_command 中工作区是 /work，HOME 是 /work/.home，Java 在 PATH，Mindustry 无头服务端只读位于 /opt/eve/mindustry-server.jar（宿主已配置时）。可编写模组、编译、导入并运行验证，交付文件可直接把项目内实际路径交给 send_file，宿主自动复制入库并处理重名。编译通过不能冒充已通过游戏运行验证；无图形客户端时如实区分无头验证与客户端验证。");
         }
         if !(public_tool(&definition.name) || self.public_github && definition.name == "github_api")
         {

@@ -52,6 +52,30 @@ pub fn recovery_needs_step_approval(checkpoint: &eve_llm_api::TurnCheckpoint) ->
             if matches!(value.get("status").and_then(serde_json::Value::as_str), Some("completed" | "blocked")))));
     !concluded
 }
+
+/// 只信任最后一次已取得成功回执的任务状态；历史问题不覆盖后来的完成状态。
+pub fn blocked_progress(messages: &[eve_llm_api::ChatMessage]) -> Option<&str> {
+    for call in messages
+        .iter()
+        .rev()
+        .flat_map(|m| m.tool_calls.iter().rev())
+    {
+        if call.name != "task_progress" {
+            continue;
+        }
+        let result = messages
+            .iter()
+            .flat_map(|m| &m.tool_results)
+            .find(|r| r.call_id == call.id)?;
+        if let eve_llm_api::ToolOutput::Success(value) = &result.output {
+            return (value.get("status").and_then(serde_json::Value::as_str) == Some("blocked"))
+                .then(|| value.get("remaining").and_then(serde_json::Value::as_str))
+                .flatten()
+                .filter(|s| !s.trim().is_empty());
+        }
+    }
+    None
+}
 /// 结束后多久仍未送达就不再通知。
 pub const DELIVERY_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// 每条通知至多投递尝试次数（其中至多一次主动私聊）。
@@ -133,6 +157,8 @@ pub enum TaskStatus {
     Running,
     /// 执行器给出了最终结果。
     Completed,
+    /// 本次执行已停止，等待用户补充信息或解除阻塞；不自动接续。
+    Blocked,
     /// 执行失败（模型或工具不可用、超时等），保存原因。
     Failed,
     /// 用户取消。
@@ -158,6 +184,9 @@ pub struct TaskUsage {
 #[derive(Clone, Eq, PartialEq)]
 pub enum TaskEnd {
     Completed {
+        result: String,
+    },
+    Blocked {
         result: String,
     },
     Failed {
@@ -544,6 +573,7 @@ impl fmt::Debug for TaskEnd {
             Self::Completed { .. } => "Completed",
             Self::Failed { .. } => "Failed",
             Self::Cancelled => "Cancelled",
+            Self::Blocked { .. } => "Blocked",
         })
     }
 }
