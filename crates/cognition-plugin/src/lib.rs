@@ -160,8 +160,10 @@ impl StoredCognition {
         }
         for (id, drive) in &state.autonomous_drives {
             if !inner.snapshot.state.autonomous_drives.contains_key(id)
-                && (!matches!(drive.status, AutonomousDriveStatus::Candidate | AutonomousDriveStatus::Ready)
-                    || drive.attempts != 0)
+                && (!matches!(
+                    drive.status,
+                    AutonomousDriveStatus::Candidate | AutonomousDriveStatus::Ready
+                ) || drive.attempts != 0)
             {
                 return Err(CognitionError::InvalidTransition);
             }
@@ -247,20 +249,49 @@ fn validate_autonomous_drive_transition(
     }
     let allowed = matches!(
         (&old.status, &next.status),
-        (AutonomousDriveStatus::Candidate, AutonomousDriveStatus::Ready)
-            | (AutonomousDriveStatus::Candidate, AutonomousDriveStatus::Waiting)
-            | (AutonomousDriveStatus::Candidate, AutonomousDriveStatus::Blocked)
-            | (AutonomousDriveStatus::Candidate, AutonomousDriveStatus::Cancelled)
-            | (AutonomousDriveStatus::Ready, AutonomousDriveStatus::Active)
-            | (AutonomousDriveStatus::Ready, AutonomousDriveStatus::Waiting)
-            | (AutonomousDriveStatus::Ready, AutonomousDriveStatus::Blocked)
-            | (AutonomousDriveStatus::Ready, AutonomousDriveStatus::Cancelled)
-            | (AutonomousDriveStatus::Active, AutonomousDriveStatus::Waiting)
-            | (AutonomousDriveStatus::Active, AutonomousDriveStatus::Blocked)
-            | (AutonomousDriveStatus::Active, AutonomousDriveStatus::Completed)
-            | (AutonomousDriveStatus::Waiting, AutonomousDriveStatus::Ready)
-            | (AutonomousDriveStatus::Waiting, AutonomousDriveStatus::Blocked)
-            | (AutonomousDriveStatus::Waiting, AutonomousDriveStatus::Cancelled)
+        (
+            AutonomousDriveStatus::Candidate,
+            AutonomousDriveStatus::Ready,
+        ) | (
+            AutonomousDriveStatus::Candidate,
+            AutonomousDriveStatus::Waiting,
+        ) | (
+            AutonomousDriveStatus::Candidate,
+            AutonomousDriveStatus::Blocked,
+        ) | (
+            AutonomousDriveStatus::Candidate,
+            AutonomousDriveStatus::Cancelled,
+        ) | (
+            AutonomousDriveStatus::Ready,
+            AutonomousDriveStatus::Active,
+        ) | (
+            AutonomousDriveStatus::Ready,
+            AutonomousDriveStatus::Waiting,
+        ) | (
+            AutonomousDriveStatus::Ready,
+            AutonomousDriveStatus::Blocked,
+        ) | (
+            AutonomousDriveStatus::Ready,
+            AutonomousDriveStatus::Cancelled,
+        ) | (
+            AutonomousDriveStatus::Active,
+            AutonomousDriveStatus::Waiting,
+        ) | (
+            AutonomousDriveStatus::Active,
+            AutonomousDriveStatus::Blocked,
+        ) | (
+            AutonomousDriveStatus::Active,
+            AutonomousDriveStatus::Completed,
+        ) | (
+            AutonomousDriveStatus::Waiting,
+            AutonomousDriveStatus::Ready,
+        ) | (
+            AutonomousDriveStatus::Waiting,
+            AutonomousDriveStatus::Blocked,
+        ) | (
+            AutonomousDriveStatus::Waiting,
+            AutonomousDriveStatus::Cancelled,
+    )
     );
     if allowed {
         Ok(())
@@ -411,7 +442,10 @@ impl CognitionController {
             return Err(CognitionError::StaleRevision);
         }
         let id = format!("autonomous-drive-{expected_revision}");
-        snapshot.state.autonomous_drives.insert(drive.id.clone(), drive.clone());
+        snapshot
+            .state
+            .autonomous_drives
+            .insert(drive.id.clone(), drive.clone());
         snapshot.state.events.push(CognitiveEvent {
             id,
             kind: CognitiveEventKind::StateChanged,
