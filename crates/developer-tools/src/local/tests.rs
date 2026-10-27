@@ -1335,7 +1335,11 @@ async fn action_reviewer_decides_prompt_commands_from_user_words_and_fails_close
     assert_eq!(out["success"], true);
     assert!(root.path().join("careful-allowed").exists());
     let seen = allow.seen.lock().unwrap().pop().unwrap();
-    assert_eq!(seen.user_messages, vec![full_user_quote], "完整保留用户原话");
+    assert_eq!(
+        seen.user_messages,
+        vec![full_user_quote],
+        "完整保留用户原话"
+    );
     assert!(!seen.delegated && !seen.claimed_confirmation);
     assert!(
         seen.action.contains("touch careful-allowed"),
