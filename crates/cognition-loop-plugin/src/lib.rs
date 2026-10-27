@@ -219,16 +219,16 @@ impl Worker {
             if snapshot.subject_id != self.options.scope.subject_id {
                 return Err(CognitionError::SubjectMismatch.into());
             }
+            let epoch = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| LoopError::Unavailable)?;
+            let time = u64::try_from(epoch.as_millis()).map_err(|_| LoopError::LimitReached)?;
             let snapshot = match self.review_autonomous_drives(snapshot, time) {
                 Ok(snapshot) => snapshot,
                 Err(LoopError::Cognition(CognitionError::StaleRevision)) => continue,
                 Err(error) => return Err(error),
             };
             let budget_started = Instant::now();
-            let epoch = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|_| LoopError::Unavailable)?;
-            let time = u64::try_from(epoch.as_millis()).map_err(|_| LoopError::LimitReached)?;
             let submitted = self
                 .running
                 .stats
