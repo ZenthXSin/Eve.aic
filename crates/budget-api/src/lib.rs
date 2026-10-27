@@ -23,6 +23,10 @@ pub enum BudgetError {
     Exhausted {
         resets_at_ms: u64,
     },
+    /// 此用途达到分项上限，其他用途仍可使用总余额。
+    CategoryExhausted {
+        resets_at_ms: u64,
+    },
     InvalidInput,
     Unavailable,
     CorruptState,
@@ -34,6 +38,7 @@ impl fmt::Display for BudgetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Exhausted { .. } => "自主运行预算已用尽",
+            Self::CategoryExhausted { .. } => "此用途的自主运行预算已用尽",
             Self::InvalidInput => "自主运行预算输入无效",
             Self::Unavailable => "自主运行预算不可用",
             Self::CorruptState => "自主运行预算记录损坏；未清空",
@@ -93,6 +98,8 @@ pub struct BudgetSnapshot {
     pub policy: BudgetPolicy,
     /// 当前窗口；时钟回拨到已记录窗口之前时仍沿用已记录的窗口，不重新计数。
     pub current: BudgetWindow,
+    /// 宿主配置的分项上限，仍同时受总上限约束；重启不重置已用计数。
+    pub category_limits: BTreeMap<String, u32>,
     pub resets_at_ms: u64,
     /// 已结束的窗口，新的在前。
     pub history: Vec<BudgetWindow>,

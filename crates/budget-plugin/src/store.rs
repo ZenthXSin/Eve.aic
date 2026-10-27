@@ -3,7 +3,10 @@ use crate::strict_json;
 use eve_budget_api::*;
 use eve_plugin_api::{PluginContext, PluginError, PluginResult};
 use serde::{Deserialize, Serialize};
-use std::sync::{Mutex, MutexGuard};
+use std::{
+    collections::BTreeMap,
+    sync::{Mutex, MutexGuard},
+};
 
 const FORMAT_VERSION: u32 = 1;
 const MAX_STATE_BYTES: usize = 64 * 1024;
@@ -44,6 +47,7 @@ impl Ledger {
         BudgetSnapshot {
             policy: self.policy,
             current: self.current.clone(),
+            category_limits: BTreeMap::new(),
             resets_at_ms: self.current.start_ms.saturating_add(self.policy.window_ms),
             history: self.history.clone(),
         }
@@ -56,11 +60,16 @@ struct Inner {
 }
 pub(crate) struct StoredBudget {
     policy: BudgetPolicy,
+    category_limits: BTreeMap<String, u32>,
     inner: Mutex<Inner>,
 }
 
 impl StoredBudget {
-    pub(crate) fn open(context: PluginContext, policy: BudgetPolicy) -> BudgetResult<Self> {
+    pub(crate) fn open(
+        context: PluginContext,
+        policy: BudgetPolicy,
+        category_limits: BTreeMap<String, u32>,
+    ) -> BudgetResult<Self> {
         policy.validate()?;
         let ledger = match context
             .state_get(BUDGET_STATE_KEY)
@@ -95,6 +104,7 @@ impl StoredBudget {
         };
         Ok(Self {
             policy,
+            category_limits,
             inner: Mutex::new(Inner {
                 ledger,
                 context: Some(context),
@@ -111,7 +121,9 @@ impl StoredBudget {
     }
 
     pub(crate) fn snapshot(&self, now_ms: u64) -> BudgetResult<BudgetSnapshot> {
-        Ok(self.lock()?.ledger.rolled(self.policy, now_ms).snapshot())
+        let mut snapshot = self.lock()?.ledger.rolled(self.policy, now_ms).snapshot();
+        snapshot.category_limits = self.category_limits.clone();
+        Ok(snapshot)
     }
 
     pub(crate) fn reserve(&self, category: &str, count: u32, now_ms: u64) -> BudgetResult<u32> {
@@ -124,6 +136,19 @@ impl StoredBudget {
         let used = next.current.used.checked_add(count);
         if used.is_none_or(|used| used > next.policy.limit) {
             return Err(BudgetError::Exhausted {
+                resets_at_ms: next.snapshot().resets_at_ms,
+            });
+        }
+        if self.category_limits.get(category).is_some_and(|limit| {
+            next.current
+                .by_category
+                .get(category)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(count)
+                .is_none_or(|used| used > *limit)
+        }) {
+            return Err(BudgetError::CategoryExhausted {
                 resets_at_ms: next.snapshot().resets_at_ms,
             });
         }

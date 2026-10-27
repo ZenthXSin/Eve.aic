@@ -375,3 +375,88 @@ async fn corrupt_or_unknown_ledgers_are_refused_and_preserved() {
     assert_eq!(budget.snapshot(T0 + HOUR).unwrap().current.used, 1);
     kernel.stop_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn category_caps_are_atomic_preserve_other_uses_and_survive_restart() {
+    let world = World::new();
+    let open = || {
+        let kernel = Kernel::with_services(KernelServices {
+            state: world.state.clone(),
+            ..KernelServices::default()
+        });
+        let plugin = BudgetPlugin::new(hourly(20))
+            .unwrap()
+            .with_category_limit("group-relation", 5)
+            .unwrap();
+        let budget = plugin.controller();
+        kernel.register(Box::new(plugin)).unwrap();
+        (kernel, budget)
+    };
+    let (kernel, budget) = open();
+    kernel.start_all().await.unwrap();
+    let mut threads = Vec::new();
+    for _ in 0..16 {
+        let budget = budget.clone();
+        threads.push(std::thread::spawn(move || {
+            budget.reserve("group-relation", 1, T0).is_ok()
+        }));
+    }
+    let admitted = threads
+        .into_iter()
+        .map(|t| usize::from(t.join().unwrap()))
+        .sum::<usize>();
+    assert_eq!(admitted, 5);
+    let before = world.raw();
+    assert!(matches!(
+        budget.reserve("group-relation", 1, T0),
+        Err(BudgetError::CategoryExhausted { .. })
+    ));
+    assert_eq!(world.raw(), before);
+    assert_eq!(
+        budget.snapshot(T0).unwrap().category_limits["group-relation"],
+        5
+    );
+    assert_eq!(budget.reserve("chime", 10, T0).unwrap(), 5);
+    kernel.stop_all().await.unwrap();
+    let (kernel, budget) = open();
+    kernel.start_all().await.unwrap();
+    assert!(matches!(
+        budget.reserve("group-relation", 1, T0),
+        Err(BudgetError::CategoryExhausted { .. })
+    ));
+    assert_eq!(budget.reserve("interest", 5, T0).unwrap(), 0);
+    assert!(matches!(
+        budget.reserve("chime", 1, T0),
+        Err(BudgetError::Exhausted { .. })
+    ));
+    assert_eq!(budget.reserve("group-relation", 5, T0 + HOUR).unwrap(), 15);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn applying_a_cap_to_an_old_ledger_keeps_every_charged_request() {
+    let world = World::new();
+    let (kernel, budget) = world.open(hourly(20)).await.unwrap();
+    budget.reserve("group-relation", 12, T0).unwrap();
+    kernel.stop_all().await.unwrap();
+    let original = world.raw();
+    let kernel = Kernel::with_services(KernelServices {
+        state: world.state.clone(),
+        ..KernelServices::default()
+    });
+    let plugin = BudgetPlugin::new(hourly(20))
+        .unwrap()
+        .with_category_limit("group-relation", 5)
+        .unwrap();
+    let budget = plugin.controller();
+    kernel.register(Box::new(plugin)).unwrap();
+    kernel.start_all().await.unwrap();
+    assert!(matches!(
+        budget.reserve("group-relation", 1, T0),
+        Err(BudgetError::CategoryExhausted { .. })
+    ));
+    assert_eq!(world.raw(), original);
+    assert_eq!(budget.snapshot(T0).unwrap().current.used, 12);
+    assert_eq!(budget.reserve("chime", 1, T0).unwrap(), 7);
+    kernel.stop_all().await.unwrap();
+}

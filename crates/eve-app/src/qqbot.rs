@@ -1445,7 +1445,7 @@ async fn run_qqbot_composed(
                 let plugin = BudgetPlugin::new(BudgetPolicy {
                     window_ms: options.autonomy_budget_window_hours.unwrap_or(24) * 3_600_000,
                     limit,
-                })?;
+                })?.with_category_limit("group-relation", (limit / 4).max(1))?;
                 let controller = plugin.controller();
                 kernel.register(Box::new(plugin))?;
                 kernel.start(&PluginId::new(BUDGET_PLUGIN_ID)?).await?;
@@ -2202,6 +2202,7 @@ async fn run_qqbot_composed(
                 control.clone(),
                 budgeted(crate::chime::MODEL_USE)?,
                 relations,
+                budget_gate.clone(),
             )?);
         }
         // 历史摘要服务于对话本身，与主对话一样不计入自主运行预算；用途 digest 单独记健康与输出上限。

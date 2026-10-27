@@ -413,6 +413,7 @@ impl Background {
         control: Arc<dyn eve_control_api::ControlService>,
         resolver: Arc<dyn eve_llm_api::LlmModelResolver>,
         relations: Option<Arc<GroupRelationPipeline>>,
+        budget: crate::qq_budget::Gate,
     ) -> Result<Self, AppError> {
         let mut receiver = group
             .receiver
@@ -478,7 +479,11 @@ impl Background {
                         continue;
                     },
                     _=learning.tick(), if relations.is_some()=>{
-                        if reviews.is_empty() && group.policy.settings().is_some_and(|s| s.enabled) && group.policy.relation_learning_enabled() {
+                        // 额度不足不领取整理任务，保留证据到原预算窗口重置。
+                        let admitted = budget.admits_category("group-relation", 1).unwrap_or_else(|_| {
+                            eprintln!("EVE_GROUP relation_review_budget_unavailable"); false
+                        });
+                        if admitted && reviews.is_empty() && group.policy.settings().is_some_and(|s| s.enabled) && group.policy.relation_learning_enabled() {
                             let relations=relations.clone().expect("关系系统已开启");
                             reviews.spawn(async move {match relations.review_pending().await {Ok(n)=>{if n>0 {eprintln!("EVE_GROUP relation_experiences_learned={n}");}},Err(_)=>eprintln!("EVE_GROUP relation_review_unavailable")}});
                         }
@@ -588,8 +593,24 @@ impl Background {
     }
 }
 fn log_outcome(outcome: &ChimeOutcome) {
+    // 只输出固定错误类别；模型错误可能含原话、URL 或凭据，不能原样写日志。
+    let error_code = if outcome.decision.reason == eve_chime_api::ChimeReason::JudgeFailed {
+        let detail = &outcome.decision.detail;
+        Some(if detail.contains("自主运行预算分项已用尽") {
+            "budget_category_exhausted"
+        } else if detail.contains("自主运行预算已用尽") {
+            "budget_exhausted"
+        } else if detail.contains("自主运行预算不可用") {
+            "budget_unavailable"
+        } else {
+            "judge_error"
+        })
+    } else {
+        None
+    };
+
     eprintln!(
         "EVE_GROUP {}",
-        serde_json::json!({"message_id":outcome.decision.message_id,"conversation":outcome.decision.conversation,"reason":outcome.decision.reason,"delivery":match &outcome.delivery {ChimeDelivery::Silent=>"silent",ChimeDelivery::Sent{..}=>"sent",ChimeDelivery::SendFailed{..}=>"send_failed",ChimeDelivery::NotGenerated{..}=>"not_generated"}})
+        serde_json::json!({"message_id":outcome.decision.message_id,"conversation":outcome.decision.conversation,"reason":outcome.decision.reason,"error_code":error_code,"delivery":match &outcome.delivery {ChimeDelivery::Silent=>"silent",ChimeDelivery::Sent{..}=>"sent",ChimeDelivery::SendFailed{..}=>"send_failed",ChimeDelivery::NotGenerated{..}=>"not_generated"}})
     );
 }

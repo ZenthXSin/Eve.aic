@@ -12,6 +12,7 @@ use eve_plugin_api::{
     cleanup,
 };
 use std::{
+    collections::BTreeMap,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -44,6 +45,7 @@ pub struct BudgetPlugin {
     manifest: PluginManifest,
     policy: BudgetPolicy,
     controller: BudgetController,
+    category_limits: BTreeMap<String, u32>,
 }
 impl BudgetPlugin {
     pub fn new(policy: BudgetPolicy) -> PluginResult<Self> {
@@ -54,7 +56,17 @@ impl BudgetPlugin {
             manifest: PluginManifest::new(BUDGET_PLUGIN_ID, env!("CARGO_PKG_VERSION"))?,
             policy,
             controller: BudgetController::default(),
+            category_limits: BTreeMap::new(),
         })
+    }
+    /// 为高频背景用途设置分项上限，不能放大总额度。
+    pub fn with_category_limit(mut self, category: &str, limit: u32) -> PluginResult<Self> {
+        validate_category(category).map_err(|e| PluginError::State(e.to_string()))?;
+        if limit > self.policy.limit || self.category_limits.len() >= MAX_CATEGORIES {
+            return Err(PluginError::State("自主预算分项上限无效".into()));
+        }
+        self.category_limits.insert(category.into(), limit);
+        Ok(self)
     }
     pub fn controller(&self) -> BudgetController {
         self.controller.clone()
@@ -67,7 +79,7 @@ impl Plugin for BudgetPlugin {
     fn start(&mut self, context: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         Box::pin(async move {
             let stored = Arc::new(
-                StoredBudget::open(context.clone(), self.policy)
+                StoredBudget::open(context.clone(), self.policy, self.category_limits.clone())
                     .map_err(|error| PluginError::State(error.to_string()))?,
             );
             let to_close = stored.clone();
@@ -147,8 +159,21 @@ impl BudgetedProvider {
     fn admit(&self) -> Result<(), LlmError> {
         match self.budget.reserve(&self.category, 1, now_ms()) {
             Ok(_) => Ok(()),
-            Err(BudgetError::Exhausted { .. }) => {
+            Err(BudgetError::Exhausted { resets_at_ms }) => {
+                eprintln!(
+                    "EVE_BUDGET category={} reason=total_exhausted resets_at_ms={resets_at_ms}",
+                    self.category
+                );
                 Err(LlmError::Provider("自主运行预算已用尽；未发出请求".into()))
+            }
+            Err(BudgetError::CategoryExhausted { resets_at_ms }) => {
+                eprintln!(
+                    "EVE_BUDGET category={} reason=category_exhausted resets_at_ms={resets_at_ms}",
+                    self.category
+                );
+                Err(LlmError::Provider(
+                    "自主运行预算分项已用尽；未发出请求".into(),
+                ))
             }
             Err(_) => Err(LlmError::Provider("自主运行预算不可用；未发出请求".into())),
         }
