@@ -711,7 +711,10 @@ fn drive_show(admin: &CognitionController, id: &str) -> Result<Value, AppError> 
         "revision": snapshot.revision,
         "drive": drive,
         "bound_goal": drive.goal_id.as_ref().and_then(|goal_id| snapshot.state.goals.get(goal_id)),
-        "events": snapshot.state.events.iter().filter(|event| event.caused_by.as_deref() == Some(id)).collect::<Vec<_>>()
+        "events": snapshot.state.events.iter().filter(|event| {
+            event.caused_by.as_deref() == Some(id)
+                || event.source.reference == id
+        }).collect::<Vec<_>>()
     }))
 }
 
