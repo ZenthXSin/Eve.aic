@@ -393,6 +393,9 @@ impl CognitionReader for ScopedReader {
             .drives
             .retain(|_, d| d.visibility.visible_to(&self.access));
         state
+            .autonomous_drives
+            .retain(|_, drive| drive.visibility.visible_to(&self.access));
+        state
             .events
             .retain(|e| e.visibility.visible_to(&self.access));
         if state
