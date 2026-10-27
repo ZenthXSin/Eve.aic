@@ -103,6 +103,7 @@ jobs:
           python3 connectors/qqbot/test/memory_eval.py
           python3 connectors/qqbot/test/tool_progress_test.py
           python3 connectors/qqbot/test/slow_progress_test.py
+          python3 connectors/qqbot/test/stage_feedback_test.py
           python3 connectors/qqbot/test/history_window_test.py
           python3 connectors/qqbot/test/history_digest_test.py
           python3 connectors/qqbot/test/debounce_test.py

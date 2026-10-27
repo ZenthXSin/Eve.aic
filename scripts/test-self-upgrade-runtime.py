@@ -146,6 +146,25 @@ while True:
         save()
         with self.assertRaisesRegex(ValueError,'invalid_progress_ledger'):runtime.delivery_gate(path,request)
 
+    def test_proactive_progress_v8_blocks_switch_until_delivery_is_settled(self):
+        self.write_state('Completed','Sent');path=self.state/'state.json'
+        state=runtime.read_json(path)
+        ledger=json.loads(bytes(state['entries']['eve.channel.qqbot']['receipts.v1']))
+        ledger['version']=8
+        ledger['entries'][0]['message']['id']='stage-v8'
+        ledger['entries'][0]['progress']=[{'text':'真实进度','state':'Sent','proactive':True} for _ in range(6)]
+        request={'session_id':self.session,'requested_by':self.session,'turn_id':1}
+        def save():
+            state['entries']['eve.channel.qqbot']['receipts.v1']=list(json.dumps(ledger).encode())
+            runtime.atomic(path,state)
+        save();self.assertTrue(runtime.delivery_gate(path,request))
+        ledger['entries'][0]['progress'][3]['state']='Sending'
+        save();self.assertFalse(runtime.delivery_gate(path,request))
+        ledger['entries'][0]['progress'][3]['state']='Sent'
+        ledger['entries'][0]['progress'][3]['proactive']='true'
+        save()
+        with self.assertRaisesRegex(ValueError,'invalid_progress_ledger'):runtime.delivery_gate(path,request)
+
     def candidate(self,tag,same_binary=False):
         resources={}
         for p in self.initial.rglob('*'):

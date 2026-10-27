@@ -118,8 +118,8 @@ impl Tool for SendMessage {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "send_message".into(),
-            description: "在当前会话立即说一句话，不结束当前轮，也不停止正在推进的任务。用于值得立即告知的真实进展、关键发现、短回应，或需要用户补充的具体问题；用户中途回话会直接加入本轮引导，下一次模型请求可见。不要播报调用次数、工具名或每个琐碎步骤，不反复说正在处理，不把未完成的事说成完成，不重复最终答复。一次至多 500 字，受 QQ 剩余消息配额限制；返回 sent=true 才确认送达。失败或结果未知不得自动重发。只发给当前会话，不接受目标地址。需要答案时可以先推进其他独立工作，不能假定用户已回答。".into(),
-            argument_schema: json!({"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":500}},"required":["text"],"additionalProperties":false}),
+            description: "在当前会话立即说一句话，不结束当前轮，也不停止正在推进的任务。用于值得立即告知的真实进展、关键发现、短回应，或需要用户补充的具体问题；用户中途回话会直接加入本轮引导，下一次模型请求可见。不要播报调用次数、工具名或每个琐碎步骤，不反复说正在处理，不把未完成的事说成完成，不重复最终答复。一次至多 250 字，受 QQ 剩余消息配额限制；返回 sent=true 才确认送达。失败或结果未知不得自动重发。只发给当前会话，不接受目标地址。需要答案时可以先推进其他独立工作，不能假定用户已回答。".into(),
+            argument_schema: json!({"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":250}},"required":["text"],"additionalProperties":false}),
             required_permissions: vec![],
             concurrency: Some(ToolConcurrency::Serial { scope: "eve.qq.live-send".into() }),
         }
@@ -131,14 +131,14 @@ impl Tool for SendMessage {
                 .and_then(Value::as_str)
                 .is_none_or(|text| {
                     text.trim().is_empty()
-                        || text.chars().count() > 500
+                        || text.chars().count() > 250
                         || text
                             .chars()
                             .any(|c| c.is_control() && c != '\n' && c != '\t')
                 })
         {
             return Err(ToolValidationError {
-                message: "只接受非空 text，最多 500 字".into(),
+                message: "只接受非空 text，最多 250 字".into(),
             });
         }
         Ok(())

@@ -906,3 +906,27 @@ test("群文件说明艾特可信发送者，私聊非法艾特不会发送文�
   assert.equal(f.files.length,1);
   assert.equal(f.frames.at(-1).ok,false);
 });
+
+test("长任务主动进度保留原群触发者且不占用最终被动配额", async () => {
+  let time=0; const f=fixture({now:()=>time});f.message("group");
+  for(let index=0;index<6;index++) {
+    time+=15000;
+    await f.bridge.command({version:1,type:"progress",id:"in-1",index,text:`实际阶段 ${index}`,proactive:index>=2});
+  }
+  assert.equal(f.sent.length,6);
+  assert.ok(f.sent.slice(0,2).every(s=>s.target.msgId==="in-1"));
+  assert.ok(f.sent.slice(2).every(s=>s.target.scope==="group" && s.target.targetId==="group-1" && !s.target.msgId && s.text.startsWith("<@user-1>")));
+  for(let index=0;index<3;index++) await f.bridge.command({version:1,type:"segment",id:"in-1",index,count:3,text:`结果 ${index}`});
+  assert.equal(f.sent.length,9);
+});
+
+test("主动进度跨过被动窗口并限制重复与过快发送，结束后不再发送", async () => {
+  let time=0; const f=fixture({now:()=>time});f.message("group");time=PASSIVE_REPLY_WINDOW_MS+1;
+  await f.bridge.command({version:1,type:"progress",id:"in-1",index:0,text:"长命令仍在执行",proactive:true});
+  assert.equal(f.sent.length,1);assert.ok(!f.sent[0].target.msgId);
+  await f.bridge.command({version:1,type:"progress",id:"in-1",index:1,text:"太快",proactive:true});
+  assert.equal(f.sent.length,1);assert.equal(f.frames.at(-1).ok,false);
+  await f.bridge.command({version:1,type:"finish",id:"in-1"});time+=2000;
+  await f.bridge.command({version:1,type:"progress",id:"in-1",index:2,text:"旧任务",proactive:true});
+  assert.equal(f.sent.length,1);
+});

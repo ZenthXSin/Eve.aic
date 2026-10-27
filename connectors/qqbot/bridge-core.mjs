@@ -336,7 +336,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
   }
   async function segment(frame, item) {
     const { index, count } = frame;
-    if (!Number.isInteger(count) || count < 2 || count + (item.progress ?? 0) > passiveLimit(item.target.scope) ||
+    if (!Number.isInteger(count) || count < 2 || count + (item.passiveProgress ?? item.progress ?? 0) > passiveLimit(item.target.scope) ||
         !Number.isInteger(index) || index < 0 || index >= count) {
       warn("invalid_command"); return;
     }
@@ -389,7 +389,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
   // Progress consumes the original passive window, but never completes its reply.
   async function progress(frame, item) {
     const index = item.progress ?? 0;
-    if (item.sending || item.next !== undefined || frame.index !== index || index >= 3) {
+    if (item.sending || item.next !== undefined || frame.index !== index || index >= 64 || (frame.proactive !== true && (item.passiveProgress ?? index) >= 3)) {
       warn("invalid_progress"); return;
     }
     if (!validText(frame.text) || Buffer.byteLength(frame.text) > 1024) {
@@ -397,16 +397,26 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       send({ type: "delivery", id: frame.id, progress: true, index, ok: false });
       return;
     }
+    const proactive = frame.proactive === true;
+    const elapsed = Math.max(0, Math.floor(now() - item.receivedAt));
+    if (proactive && item.lastProgress !== undefined && now() - item.lastProgress < 1000) {
+      send({ type: "delivery", id: frame.id, progress: true, index, ok: false, failure_kind: "progress_rate_limit" });
+      item.progress = index + 1;
+      return;
+    }
     item.progress = index + 1; // Failed/unknown attempts also consume quota; never retry.
+    item.passiveProgress = (item.passiveProgress ?? index) + (proactive ? 0 : 1);
+    item.lastProgress = now();
     item.sending = true;
     try {
-      if (now() - item.receivedAt >= PASSIVE_REPLY_WINDOW_MS) {
+      if (!proactive && elapsed >= PASSIVE_REPLY_WINDOW_MS) {
         send({ type: "delivery", id: frame.id, progress: true, index, ok: false,
           failure_kind: "passive_window_elapsed" });
         return;
       }
-      const result = await sendText(item.target, frame.text, replyMention(item));
-      send({ type: "delivery", id: frame.id, progress: true, index, ok: true,
+      const target = proactive ? {scope: item.target.scope, targetId: item.target.targetId} : item.target;
+      const result = await sendText(target, frame.text, replyMention(item));
+      send({ type: "delivery", id: frame.id, progress: true, index, ok: true, delivery_mode: proactive ? "proactive" : "passive", elapsed_ms: elapsed,
         ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
     } catch (err) {
       send({ type: "delivery", id: frame.id, progress: true, index, ok: false, ...diagnostic(err) });

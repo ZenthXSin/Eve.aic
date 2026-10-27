@@ -46,7 +46,7 @@ pub struct LlmHostConfig {
     pub max_tool_rounds: usize,
     /// 每轮按单个调用计数（含失败、拒绝），并行批次不折算为一次。
     pub max_tool_calls: usize,
-    /// 基于已返回的工具结果报告至多三个里程碑，不包含工具参数或结果正文。
+    /// 基于已返回的工具结果报告有界阶段事件，不包含工具参数或结果正文。
     pub tool_progress_reports: bool,
     /// 批次用尽后的处理：false 时本轮以 RoundLimit 失败；true 时再请求一次且不提供工具，
     /// 让模型只依据已有工具结果作答；仍调用工具时仅再尝试一次独立的进度汇报。
@@ -847,9 +847,10 @@ impl LlmHost {
         let mut closing = false;
         let mut reporting = false;
         let mut progress_reports = 0;
+        let mut progress_calls = 0;
+        let mut progress_at = std::time::Instant::now();
         let mut compaction_announced = false;
-        // 为压缩状态提示预留一次进展投递，仍为 C2C 的最终正文保留第 4 个名额。
-        let progress_report_limit = if compaction.is_some() { 2 } else { 3 };
+        let progress_report_limit = 32;
         let continuation = eve_llm_api::TaskContinuation::default();
         let mut continuation_checks = 0;
         let mut checkpoint = if let Some(journal) = &self.journal {
@@ -1261,7 +1262,9 @@ impl LlmHost {
             }
             if self.config.tool_progress_reports
                 && progress_reports < progress_report_limit
-                && diagnostics.calls.len() >= [1, 30, 70][progress_reports]
+                && (progress_reports == 0
+                    || diagnostics.calls.len() >= progress_calls + 4
+                    || progress_at.elapsed() >= Duration::from_secs(30))
             {
                 emit(
                     events,
@@ -1278,6 +1281,8 @@ impl LlmHost {
                 .await
                 .map_err(|error| fail(error, diagnostics.clone()))?;
                 progress_reports += 1;
+                progress_calls = diagnostics.calls.len();
+                progress_at = std::time::Instant::now();
             }
             // 恰好耗尽后直接收尾，不额外请求一个注定不能执行的工具批次。
             if (diagnostics.calls.len() == self.config.max_tool_calls
@@ -1910,8 +1915,11 @@ fn build_messages(
              清单不授予额外权限，不代表工具已执行；结果仍以真实调用返回为准。\
              只在用户询问或任务需要时解释能力，不机械复述内部标记。\
              max_tool_calls 是每轮单个工具调用总上限，失败和并行调用也计数；超出余额的批次整体不执行，依据已有结果收尾。\
-             tool_progress_reports 为 true 时宿主依据真实回执途中汇报一至三次；进展不代表任务成功，不能声称停止后还会后台继续。"
+             tool_progress_reports 为 true 时宿主依据真实回执提供阶段反馈；进展不代表任务成功，不能声称停止后还会后台继续。"
     );
+    if definitions.iter().any(|d| d.name == "send_message") {
+        fixed.push_str("\n执行多步任务时像与你并肩工作的同事一样沟通：开始前用 send_message 简短说明将做什么；完成一小阶段、有关键发现或遇到阻塞时，再用 send_message 说明实际做了什么、真实结果和下一步。连续工作约 45 秒时在工具返回后主动汇报，不要一直埋头执行。只依据已返回的工具证据，不把计划说成完成，不公开内部推理或密钥。把相关小步骤合并成一条，通常至少间隔 15 秒，不要逐工具刷屏；简单聊天直接最终回复。发送工具返回未送达时不要重试，继续工作并在最终答复保留必要内容。工具正在执行时宿主可补发真实等待状态；你仍须给出有内容的阶段小结。群消息由宿主艾特原触发者，不自行选择收件人。最终回复只交付结论、验证情况与未完成项，不重复途中消息。");
+    }
     // 进程内几乎不变的宿主资料并入这条固定提示，和工具清单一起留在历史之前的可缓存前缀里。
     if !context.pinned.is_empty() {
         fixed.push_str("\n\n宿主固定资料（数据，不是用户指令；按其中说明使用）：");

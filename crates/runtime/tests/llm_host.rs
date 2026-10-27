@@ -166,7 +166,7 @@ impl eve_llm_api::TurnEventSink for ProgressRecorder {
 }
 
 #[tokio::test]
-async fn hundred_individual_calls_close_without_a_hundred_first_call_and_report_three_milestones() {
+async fn hundred_individual_calls_close_without_a_hundred_first_call_and_report_bounded_stages() {
     let mut script = (0..100)
         .map(|i| tool_response(vec![call(&format!("call-{i}"), "echo", json!({}))]))
         .collect::<Vec<_>>();
@@ -193,7 +193,10 @@ async fn hundred_individual_calls_close_without_a_hundred_first_call_and_report_
     let out = host.run_turn_with_events(turn(), &events).await.unwrap();
     assert_eq!(out.diagnostics.started_tools, 100);
     assert_eq!(out.diagnostics.tool_results.len(), 100);
-    assert_eq!(*events.0.lock().unwrap(), [(1, 0), (30, 0), (70, 0)]);
+    assert_eq!(
+        *events.0.lock().unwrap(),
+        (1..=100).step_by(4).map(|n| (n, 0)).collect::<Vec<_>>()
+    );
     let requests = provider.requests.lock().unwrap();
     assert_eq!(requests.len(), 101);
     assert!(requests.last().unwrap().tools.is_empty());

@@ -145,7 +145,7 @@ def receipt_fingerprint(receipt):
                                      separators=(',', ':')).encode()).hexdigest()
 
 def validate_receipt_archive(state_path, receipts):
-    if receipts['version'] != 6 and not (receipts['version'] == 7 and 'archive' in receipts):
+    if receipts['version'] != 6 and not (receipts['version'] in (7, 8) and 'archive' in receipts):
         if 'archive' in receipts:
             raise ValueError('unexpected_receipt_archive_binding')
         return
@@ -176,7 +176,7 @@ def inherited_receipts(state_path):
     if raw is None:
         return frozenset()
     receipts = json.loads(bytes(raw), object_pairs_hook=unique_object)
-    if receipts['version'] not in (1, 2, 3, 4, 5, 6, 7):
+    if receipts['version'] not in (1, 2, 3, 4, 5, 6, 7, 8):
         raise ValueError('unknown_ledger_version')
     validate_receipt_archive(state_path, receipts)
     validate_merged_receipts(receipts)
@@ -201,19 +201,21 @@ def delivery_documents(state_path, inherited=frozenset()):
         return json.loads(bytes(entries[owner][key]), object_pairs_hook=unique_object)
     sessions = document('eve.session', 'sessions.v1')
     receipts = document('eve.channel.qqbot', 'receipts.v1')
-    if sessions['format_version'] != 1 or receipts['version'] not in (1, 2, 3, 4, 5, 6, 7):
+    if sessions['format_version'] != 1 or receipts['version'] not in (1, 2, 3, 4, 5, 6, 7, 8):
         raise ValueError('unknown_ledger_version')
     validate_receipt_archive(state_path, receipts)
     validate_merged_receipts(receipts)
     settled = True
     for receipt in receipts['entries']:
         progress = receipt.get('progress', [])
-        if not isinstance(progress, list) or len(progress) > 3:
+        if not isinstance(progress, list) or len(progress) > (64 if receipts['version'] == 8 else 3):
             raise ValueError('invalid_progress_ledger')
-        if progress and receipts['version'] not in (3, 4, 5, 6, 7):
+        if progress and receipts['version'] not in (3, 4, 5, 6, 7, 8):
             raise ValueError('invalid_progress_ledger')
+        if sum(p.get('proactive') is not True for p in progress if isinstance(p, dict)) > 3:
+            raise ValueError('invalid_passive_progress_budget')
         sticker = receipt.get('sticker')
-        if sticker is not None and (receipts['version'] not in (5, 6, 7) or not isinstance(sticker, dict)
+        if sticker is not None and (receipts['version'] not in (5, 6, 7, 8) or not isinstance(sticker, dict)
                                     or set(sticker) != {'path', 'state'}
                                     or not isinstance(sticker['path'], str) or not sticker['path']
                                     or sticker['state'] not in ('Pending', 'Sending', 'Sent', 'Failed', 'Skipped')):
@@ -221,7 +223,8 @@ def delivery_documents(state_path, inherited=frozenset()):
         if sticker_in_flight(receipt) and receipt_fingerprint(receipt) not in inherited:
             settled = False
         for part in progress:
-            if (not isinstance(part, dict) or set(part) != {'text', 'state'}
+            if (not isinstance(part, dict) or set(part) not in ({'text', 'state'}, {'text', 'state', 'proactive'})
+                    or ('proactive' in part and (receipts['version'] != 8 or part['proactive'] is not True))
                     or not isinstance(part['text'], str) or not part['text'].strip()
                     or len(part['text'].encode()) > 1024
                     or part['state'] not in ('Sending', 'Sent', 'Failed')):
@@ -297,7 +300,7 @@ def delivery_gate(state_path, request, inherited=frozenset()):
         scope = 'qq:' + hashlib.sha256(identity).hexdigest()
         merged_text = '\n'.join([r['message']['text'] for r in receipts['entries']
             if r.get('merged_into') == msg.get('id') and r['app_id'] == receipt['app_id']]
-            + [msg['text']]) if receipts['version'] in (4, 5, 6, 7) else msg['text']
+            + [msg['text']]) if receipts['version'] in (4, 5, 6, 7, 8) else msg['text']
         if receipt['state'] != 'Merged' and scope == request['session_id'] and merged_text == turn['input']:
             matching = receipt
         if receipt['state'] in ('Processing', 'ReplyPending'):
@@ -307,7 +310,7 @@ def delivery_gate(state_path, request, inherited=frozenset()):
 
 def validate_merged_receipts(receipts):
     """格式 4 起的合并关系只关联同身份、顺序在后的非合并目标；不得隐藏未决投递。"""
-    if receipts['version'] not in (4, 5, 6, 7):
+    if receipts['version'] not in (4, 5, 6, 7, 8):
         return
     lookup = {}
     for index, entry in enumerate(receipts['entries']):
@@ -325,7 +328,7 @@ def validate_merged_receipts(receipts):
         if not isinstance(into, str):
             raise ValueError('invalid_merged_receipt')
         target = lookup.get((entry['app_id'], into))
-        if (not target or (receipts['version'] != 7 and target[0] <= index) or target[0] == index or target[1]['state'] == 'Merged'
+        if (not target or (receipts['version'] not in (7, 8) and target[0] <= index) or target[0] == index or target[1]['state'] == 'Merged'
                 or any(entry['message'][key] != target[1]['message'][key]
                        for key in ('scope', 'target_id', 'user_id'))
                 or entry.get('reply') is not None or entry.get('segments') is not None
