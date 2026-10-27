@@ -393,6 +393,19 @@ impl CognitiveState {
                 {
                     return Err(CognitionError::AccessDenied);
                 }
+                let lifecycle_matches = match drive.status {
+                    AutonomousDriveStatus::Ready => goal.status == GoalStatus::Ready,
+                    AutonomousDriveStatus::Active => goal.status == GoalStatus::Executing,
+                    AutonomousDriveStatus::Completed => goal.status == GoalStatus::Completed,
+                    AutonomousDriveStatus::Cancelled => goal.status == GoalStatus::Cancelled,
+                    // Blocked 绑定允许旧快照先通过校验，由启动恢复解除失效绑定。
+                    AutonomousDriveStatus::Candidate
+                    | AutonomousDriveStatus::Waiting
+                    | AutonomousDriveStatus::Blocked => true,
+                };
+                if !lifecycle_matches {
+                    return Err(CognitionError::InvalidTransition);
+                }
             }
         }
         if executing > 1 {
