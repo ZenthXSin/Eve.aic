@@ -39,8 +39,8 @@ pub(crate) fn install_with_member_runtime(
         serde_json::from_slice(&bytes)
             .map_err(|_| "开发工具配置无效；不能在配置内填写 token 正文")?
     } else {
-        let workspace = std::env::current_dir()
-            .map_err(|_| "无法确定 Eve 工作目录；未装配开发工具")?;
+        let workspace =
+            std::env::current_dir().map_err(|_| "无法确定 Eve 工作目录；未装配开发工具")?;
         // 主人默认会话直接拥有受限开发工具；命令策略和行动审查仍然生效。
         // 自升级、实时切换和 GitHub 写入保持关闭，凭据只从宿主环境读取。
         DeveloperConfig {
