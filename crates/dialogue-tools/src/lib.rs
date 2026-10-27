@@ -537,7 +537,9 @@ impl Tool for DialogueTool {
                     let (policy, fetcher) = s.source.as_ref().ok_or_else(unavailable)?;
                     let url = call.arguments["url"].as_str().unwrap_or_default();
                     if !policy.allows(url) {
-                        return Err(failed(if policy.web_is_unrestricted() {
+                        return Err(failed(if policy.web_requires_public_address() {
+                            "URL 不允许访问：网页工具仅支持公网 HTTP/HTTPS 地址或已批准的内置资料"
+                        } else if policy.web_is_unrestricted() {
                             "URL 无效：需要完整 HTTP/HTTPS 地址"
                         } else {
                             "URL 不在宿主批准的来源范围内"
