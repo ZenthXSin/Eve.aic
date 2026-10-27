@@ -59,6 +59,7 @@ pub type KnowledgeFuture<'a, T> = BoxFuture<'a, KnowledgeResult<T>>;
 pub struct SourcePolicy {
     seeds: Vec<String>,
     unrestricted_web: bool,
+    public_web_only: bool,
 }
 impl SourcePolicy {
     /// 规范化并校验入口页面；不发起任何网络请求。
@@ -78,6 +79,7 @@ impl SourcePolicy {
         Ok(Self {
             seeds: normalized,
             unrestricted_web: false,
+            public_web_only: false,
         })
     }
     /// 任意 HTTP/HTTPS 站点均可读取；本地资料仍沿用显式入口范围。
@@ -85,11 +87,20 @@ impl SourcePolicy {
         Self {
             seeds: vec![],
             unrestricted_web: true,
+            public_web_only: false,
         }
     }
     pub fn with_unrestricted_web(mut self) -> Self {
         self.unrestricted_web = true;
         self
+    }
+    /// 用户提供的网页仅访问公网；可信宿主的显式内网研究入口仍可使用原策略。
+    pub fn with_public_web_only(mut self) -> Self {
+        self.public_web_only = true;
+        self
+    }
+    pub fn web_requires_public_address(&self) -> bool {
+        self.public_web_only
     }
     pub fn web_is_unrestricted(&self) -> bool {
         self.unrestricted_web
@@ -98,6 +109,26 @@ impl SourcePolicy {
         &self.seeds
     }
     pub fn allows(&self, url: &str) -> bool {
+        if self.public_web_only
+            && let Ok(parsed) = Url::parse(url)
+            && matches!(parsed.scheme(), "http" | "https")
+        {
+            match parsed.host() {
+                Some(url::Host::Ipv4(ip)) if !public_web_address(ip.into()) => return false,
+                Some(url::Host::Ipv6(ip)) if !public_web_address(ip.into()) => return false,
+                Some(url::Host::Domain(host))
+                    if host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+                        || host
+                            .trim_end_matches('.')
+                            .to_ascii_lowercase()
+                            .ends_with(".localhost") =>
+                {
+                    return false;
+                }
+                None => return false,
+                _ => {}
+            }
+        }
         if self.unrestricted_web
             && url.len() <= MAX_URL_BYTES
             && !url.chars().any(char::is_whitespace)
@@ -110,6 +141,39 @@ impl SourcePolicy {
             return true;
         }
         url_allowed(&self.seeds, url)
+    }
+}
+
+/// 公网网页排除本机、私网、链路本地、组播和保留地址；也核对 IPv4 映射地址。
+pub fn public_web_address(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            !(a == 0
+                || a == 10
+                || a == 127
+                || a >= 224
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 168)
+                || (a == 192 && b == 0 && (c == 0 || c == 2))
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113))
+        }
+        std::net::IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return public_web_address(v4.into());
+            }
+            let s = ip.segments();
+            // 只允许常规全球单播，不接受 NAT64、6to4、Teredo 或文档网段。
+            (s[0] & 0xe000) == 0x2000
+                && s[0] != 0x2002
+                && !(s[0] == 0x2001 && (s[1] <= 0x01ff || s[1] == 0x0db8))
+                && s[0] != 0x3fff
+        }
     }
 }
 
