@@ -1317,11 +1317,9 @@ pub(crate) struct ChannelAdapter {
 impl QqOutreach for ChannelAdapter {
     fn due(&self, session: &SessionKey) -> PluginResult<bool> {
         let snapshot = self.tasks.snapshot().map_err(plugin_error)?;
-        Ok(snapshot.due_passive(&session.user_id, "").is_some_and(|t| {
-            !t.source
-                .starts_with(crate::qq_failure_recovery::SOURCE_PREFIX)
-                || t.owner.session_id == session.session_id
-        }))
+        Ok(snapshot
+            .due_passive(&session.user_id, "")
+            .is_some_and(|t| t.owner.session_id == session.session_id))
     }
 
     fn judge(&self, _moment: QqOutreachMoment) -> QqOutreachFuture {
@@ -1337,11 +1335,7 @@ impl QqOutreach for ChannelAdapter {
         let Some(task) = snapshot.due_passive(&session.user_id, message_id) else {
             return Ok(None);
         };
-        if task
-            .source
-            .starts_with(crate::qq_failure_recovery::SOURCE_PREFIX)
-            && task.owner.session_id != session.session_id
-        {
+        if task.owner.session_id != session.session_id {
             return Ok(None);
         }
         let claimed = self
@@ -1379,13 +1373,10 @@ impl QqOutreach for ChannelAdapter {
             .claim(&task.id, DeliveryChannel::Proactive, now)
             .map_err(plugin_error)?;
         Ok(Some(QqOutreachPush {
-            session: claimed
-                .source
-                .starts_with(crate::qq_failure_recovery::SOURCE_PREFIX)
-                .then(|| SessionKey {
-                    session_id: claimed.owner.session_id.clone(),
-                    user_id: claimed.owner.user_id.clone(),
-                }),
+            session: Some(SessionKey {
+                session_id: claimed.owner.session_id.clone(),
+                user_id: claimed.owner.user_id.clone(),
+            }),
             user_id: claimed.owner.user_id.clone(),
             message: QqOutreachMessage {
                 id: claimed.id.clone(),

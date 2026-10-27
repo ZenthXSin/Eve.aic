@@ -348,27 +348,20 @@ fn session_route(
     ledger: &Ledger,
     app: &str,
     session: &SessionKey,
-) -> PluginResult<Option<(String, String)>> {
+) -> PluginResult<Option<Message>> {
     for entry in ledger.entries.iter().rev() {
         if entry.app_id == app
             && entry.state == ReceiptState::Sent
             && entry.message.session_key(app)? == *session
         {
-            return Ok(Some((
-                entry.message.scope.clone(),
-                entry.message.target_id.clone(),
-            )));
+            return Ok(Some(entry.message.clone()));
         }
     }
     Ok(None)
 }
 /// 文件可在用户首轮任务中交付，路由取自已校验并持久接收的消息，不能要求正文先送达。
 /// 主动跟进继续使用 session_route 的 Sent 条件，不扩大到未确认的发送。
-fn route_for(
-    ledger: &Ledger,
-    app: &str,
-    session: &SessionKey,
-) -> PluginResult<Option<(String, String)>> {
+fn route_for(ledger: &Ledger, app: &str, session: &SessionKey) -> PluginResult<Option<Message>> {
     for entry in ledger.entries.iter().rev() {
         if entry.app_id == app
             && matches!(
@@ -377,10 +370,7 @@ fn route_for(
             )
             && entry.message.session_key(app)? == *session
         {
-            return Ok(Some((
-                entry.message.scope.clone(),
-                entry.message.target_id.clone(),
-            )));
+            return Ok(Some(entry.message.clone()));
         }
     }
     Ok(None)
@@ -887,14 +877,8 @@ pub(crate) async fn run(
             "false"
         },
     );
-    command.env(
-        "QQBOT_GROUP_MENTION",
-        if group_observer.is_some() {
-            "true"
-        } else {
-            "false"
-        },
-    );
+    // 普通群回复同样指向触发者，不依赖全量群观察功能。
+    command.env("QQBOT_GROUP_MENTION", "true");
 
     for name in [
         "PATH",
@@ -1161,9 +1145,10 @@ pub(crate) async fn run(
                         let name_ok = file.name.as_deref().is_none_or(crate::files::valid_name);
                         let caption_ok = file.caption.as_deref().is_none_or(crate::files::valid_caption);
                         match route.filter(|_| valid_message_id(&file.id) && valid_path(&file.path) && name_ok && caption_ok) {
-                            Some((scope, target)) => {
+                            Some(message) => {
                                 write(&mut stdin, json!({"type":"file","version":1,"id":file.id,
-                                    "scope":scope,"target_id":target,"path":file.path,
+                                    "scope":message.scope,"target_id":message.target_id,"path":file.path,
+                                    "mention_user_id": if message.scope == "group" {Some(message.user_id)} else {None},
                                     "name":file.name,"caption":file.caption})).await?;
                                 deadline = tokio::time::Instant::now() + Duration::from_secs(120);
                                 sending_file = Some(file.id);
@@ -1547,19 +1532,22 @@ pub(crate) async fn run(
                         let group = hook.inner.group_chime(&push.message.id)?;
                         let target = if let Some(meta) = &group {
                             if push.session.as_ref() == Some(&meta.session) && meta.session.user_id == "eve-chime" {
-                                conversations.group_route(&meta.session.session_id).map(|route| ("group".to_string(),route))
+                                conversations.group_route(&meta.session.session_id).map(|route| ("group".to_string(),route,Some(meta.speaker_id.clone())))
                             } else { None }
                         } else { match &push.session {
-                            Some(session) if session.user_id == push.user_id => session_route(&ledger, &config.app_id, session)?,
+                            Some(session) if session.user_id == push.user_id => session_route(&ledger, &config.app_id, session)?.map(|m| {
+                                let mention = (m.scope == "group").then_some(m.user_id);
+                                (m.scope, m.target_id, mention)
+                            }),
                             Some(_) => None,
-                            None => c2c_route(&ledger, &config.app_id, &push.user_id)?.map(|target| ("c2c".to_string(), target)),
+                            None => c2c_route(&ledger, &config.app_id, &push.user_id)?.map(|target| ("c2c".to_string(), target, None)),
                         }};
                         match target.filter(|_| valid_message_id(&push.message.id) && valid_outreach_text(&push.message.text)) {
-                            Some((scope, target)) => {
+                            Some((scope, target, mention)) => {
                                 let mut frame=json!({"type":"push","version":1,"id":push.message.id,
                                     "scope":scope,"target_id":target,"text":push.message.text});
+                                if let Some(mention)=mention { frame["mention_user_id"]=json!(mention); }
                                 if let Some(meta)=group {
-                                    frame["mention_user_id"]=json!(meta.speaker_id);
                                     frame["parts"]=json!(meta.parts);
                                 }
                                 write(&mut stdin, frame).await?;

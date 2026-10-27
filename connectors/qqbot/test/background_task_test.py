@@ -106,6 +106,30 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         done = len(self.results(body))
         return calls((f"step-{done}", "echo", {"text": f"第 {done + 1} 步"}))
 
+    def test_group_task_notification_keeps_original_sender_after_other_member_chats(self):
+        dispatch = self.dispatch(max_steps=1)
+        def respond(body):
+            if self.is_worker(body):
+                self.release.wait(15)
+                return text_response(RESULT)
+            if self.text(body) == "其他群友":
+                return text_response("收到其他群友")
+            return dispatch(body)
+        self.callback = respond
+        self.run_eve([*self.send(self.message("ask", ASK, expected=DISPATCHED, scope="group", target="group-1")),
+                      *self.send(self.message("other", "其他群友", expected="收到其他群友", scope="group", target="group-1", user="user-2")),
+                      *self.checkpoint("release"), *self.checkpoint("delivered")],
+                     checkpoints={"release": self.release.set,
+                         "delivered": lambda: self.wait_task(lambda t: (t.get("notice") or {}).get("status") == "Delivered", "group notice missing")})
+        [push] = self.pushes()
+        self.assertEqual((push["scope"], push["target_id"], push["mention_user_id"]),
+                         ("group", "group-1", "user-1"))
+        before = self.tasks()
+        self.callback = lambda body: text_response("重启后正常")
+        self.run_eve(self.send(self.message("after", "重新启动", expected="重启后正常", scope="group", target="group-1")))
+        self.assertEqual(self.tasks(), before)
+        self.assertEqual(len(self.pushes()), 1, "独立进程没有新增投递")
+
     def test_a_dispatched_task_runs_within_its_step_budget_and_notifies_the_owner(self):
         self.callback = self.dispatch(max_steps=3)
         self.run_eve([*self.send(self.message("ask", ASK, expected=DISPATCHED)), *self.checkpoint("delivered"),
