@@ -266,6 +266,9 @@ fn validate_autonomous_drive_transition(
         return Ok(());
     }
     let binding_update = old.goal_id != next.goal_id;
+    if next.status == AutonomousDriveStatus::Active && next.goal_id.is_none() {
+        return Err(CognitionError::InvalidTransition);
+    }
     let binding_allowed = match (&old.status, &next.status) {
         (AutonomousDriveStatus::Ready, AutonomousDriveStatus::Ready) => {
             old.goal_id.is_none() && next.goal_id.is_some()
