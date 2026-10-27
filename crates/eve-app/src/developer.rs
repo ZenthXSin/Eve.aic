@@ -132,6 +132,15 @@ pub(crate) fn install_with_member_runtime(
     bootstrap.host_config.max_tool_rounds = config.max_tool_rounds;
     // 期限只在显式启用开发工具时扩大，普通对话和旧配置保持原值。
     bootstrap.host_config.tool_timeout = Duration::from_millis(config.command_timeout_ms + 30_000);
+    if config.self_upgrade {
+        // 自升级连续执行四次 Cargo 验收、前后源码指纹和元数据查询；
+        // 外层必须容纳整条管线，不能沿用单个命令期限而提前取消正常构建。
+        // 每条命令的期限、用户取消和父任务总期限仍然生效。
+        bootstrap.host_config.tool_timeout_overrides.insert(
+            "prepare_self_upgrade".into(),
+            Duration::from_millis(config.command_timeout_ms * 4 + 240_000),
+        );
+    }
     bootstrap
         .tools
         .extend(eve_developer_tools::tools(&config, backend));
