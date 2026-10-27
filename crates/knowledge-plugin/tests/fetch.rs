@@ -335,3 +335,53 @@ async fn redirects_out_of_scope_size_type_status_and_scope_violations_are_refuse
         1 + MAX_REDIRECTS
     );
 }
+
+#[tokio::test]
+async fn public_web_rejects_loopback_even_when_dns_resolves_it_and_sends_no_request() {
+    let host = site(BTreeMap::from([("/secret", html("host-private-marker"))])).await;
+    let policy = SourcePolicy::unrestricted_web().with_public_web_only();
+    let fetcher = HttpSourceFetcher::new().unwrap();
+    assert!(
+        fetcher
+            .fetch(&policy, &format!("{}/secret", host.base))
+            .await
+            .is_err()
+    );
+    let port = host.base.rsplit(':').next().unwrap();
+    assert!(
+        fetcher
+            .fetch(&policy, &format!("http://localhost:{port}/secret"))
+            .await
+            .is_err()
+    );
+    assert!(host.requests.lock().unwrap().is_empty());
+    for ip in [
+        "0.0.0.0",
+        "127.1.2.3",
+        "10.0.0.1",
+        "100.64.0.1",
+        "169.254.169.254",
+        "172.16.0.1",
+        "192.168.1.1",
+        "198.18.0.1",
+        "224.0.0.1",
+        "::1",
+        "::ffff:127.0.0.1",
+        "fd00::1",
+        "fe80::1",
+        "64:ff9b::7f00:1",
+        "2001:db8::1",
+        "2002:7f00:1::",
+    ] {
+        assert!(
+            !eve_knowledge_api::public_web_address(ip.parse().unwrap()),
+            "{ip}"
+        );
+    }
+    for ip in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+        assert!(
+            eve_knowledge_api::public_web_address(ip.parse().unwrap()),
+            "{ip}"
+        );
+    }
+}

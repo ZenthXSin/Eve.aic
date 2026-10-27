@@ -22,6 +22,29 @@ fn readable(content_type: &str) -> bool {
 
 pub struct HttpSourceFetcher {
     client: reqwest::Client,
+    public_client: reqwest::Client,
+}
+
+/// 校验连接实际使用的 DNS 结果，同一次解析直接交给连接器，避免先检查后重解析。
+struct PublicResolver;
+impl reqwest::dns::Resolve for PublicResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let addresses: Vec<_> = tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
+            if addresses.is_empty()
+                || addresses
+                    .iter()
+                    .any(|a| !eve_knowledge_api::public_web_address(a.ip()))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "网页目标不是公网地址",
+                )
+                .into());
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 impl HttpSourceFetcher {
@@ -32,7 +55,18 @@ impl HttpSourceFetcher {
             .user_agent(concat!("Eve-Research/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|_| KnowledgeError::Unavailable)?;
-        Ok(Self { client })
+        let public_client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .no_proxy()
+            .timeout(FETCH_TIMEOUT)
+            .dns_resolver(std::sync::Arc::new(PublicResolver))
+            .user_agent(concat!("Eve-Research/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|_| KnowledgeError::Unavailable)?;
+        Ok(Self {
+            client,
+            public_client,
+        })
     }
 
     async fn fetch_page(
@@ -47,8 +81,12 @@ impl HttpSourceFetcher {
         current.set_fragment(None);
         let mut redirects = 0;
         let response = loop {
-            let response = self
-                .client
+            let client = if policy.web_requires_public_address() {
+                &self.public_client
+            } else {
+                &self.client
+            };
+            let response = client
                 .get(current.clone())
                 .header(header::ACCEPT, ACCEPT)
                 .send()
@@ -184,4 +222,19 @@ pub(crate) fn prefix(text: &str, limit: usize) -> &str {
         end -= 1;
     }
     &text[..end]
+}
+
+#[cfg(test)]
+mod public_dns_tests {
+    use super::*;
+    use reqwest::dns::Resolve;
+    #[tokio::test]
+    async fn connector_resolver_rejects_localhost_without_opening_a_connection() {
+        assert!(
+            PublicResolver
+                .resolve("localhost".parse().unwrap())
+                .await
+                .is_err()
+        );
+    }
 }

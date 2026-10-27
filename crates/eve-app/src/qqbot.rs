@@ -1801,7 +1801,7 @@ async fn run_qqbot_composed(
                 .clone()
                 .map(|v| Arc::new(v) as Arc<dyn OutreachAdmin>),
             budget: budget_gate.budget(),
-            source: Some((research_policy.clone().unwrap_or_else(SourcePolicy::unrestricted_web), dialogue_fetcher.clone().ok_or("网页读取器缺失")?)),
+            source: Some((research_policy.clone().unwrap_or_else(SourcePolicy::unrestricted_web).with_public_web_only(), dialogue_fetcher.clone().ok_or("网页读取器缺失")?)),
             runner: practice.is_some().then(|| skill_runner.clone()),
             draft_check: tools.clone().map(|v| {
                 Arc::new(ForgedChecks::new(Arc::new(v))) as Arc<dyn eve_practice_api::DraftCheck>

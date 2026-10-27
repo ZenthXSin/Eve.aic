@@ -1,9 +1,10 @@
 """实际 QQ 宿主→OpenAI 工具协议验收，不用模型的能力自述判断接线。
 
-模型和 QQ 使用本地替身；源页面实际由本地 HTTP 读取。可用 EVE_MINDUSTRY_SERVER_JAR
+模型和 QQ 使用本地替身；源页面实际由已批准的内置资料读取。可用 EVE_MINDUSTRY_SERVER_JAR
 让直接 run_practice 实际启动官方 Mindustry；否则用运行器替身验证账本/恢复。
 """
 import json
+import pathlib
 import unittest
 
 import practice_test
@@ -82,6 +83,7 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
         self.run_eve(script, **options)
 
     def test_registered_tools_help_and_actual_source_roundtrip(self):
+        corpus_url = "eve-corpus://eve-portable/mindustry/power-system.md"
         def respond(body):
             self.assertEqual(self.definitions(body), ALL_TOOLS)
             self.capability_names(body)
@@ -89,8 +91,8 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
             if not results:
                 return tool_response([*[(name, {}) for name in (
                     "list_interests", "list_goals", "list_skills", "list_forged_tools")],
-                    ("read_source", {"url": self.seed}),
-                    ("read_source", {"url": self.seed.replace("index.html", "missing-page")})])
+                    ("read_source", {"url": corpus_url}),
+                    ("read_source", {"url": corpus_url.replace("power-system.md", "missing-page.md")})])
             self.assertEqual(len(results), 6)
             self.assertTrue(all(r["items"] == [] for r in results[:4]))
             self.assertEqual(results[4]["source_kind"], "external_data")
@@ -100,22 +102,25 @@ class DialogueToolsAcceptance(practice_test.PracticeAcceptance):
             return text_response("工具已实际调用")
         self.callback = respond
         self.full([*self.send(self.message("help", "/help", contains=["24 个", "read_source", "run_practice"])),
-                   *self.send(self.message("tools", "调用工具测试", expected="工具已实际调用"))])
+                   *self.send(self.message("tools", "调用工具测试", expected="工具已实际调用"))],
+                  more=["--skill-learning","--tool-forging","--plans","--outreach",
+                        "--research-corpus",str(pathlib.Path(__file__).resolve().parents[3]/"vendor/eve-portable-knowledge"),
+                        "--research-source","eve-corpus://eve-portable/mindustry/"])
         self.assertEqual(self.chat_rounds, 2)
         self.assertEqual(len(self.kind("chat")), 2)
         self.assertEqual(self.research_runs(), [], "只读抓取没有冒充已固化知识")
 
-    def test_web_reading_works_without_configuring_research_sources(self):
+    def test_unconfigured_web_tool_is_available_but_rejects_localhost(self):
         def respond(body):
             results = self.results(body)
             if not results:
                 self.assertIn("read_source", self.definitions(body))
                 return tool_response([("read_source", {"url": self.seed + "#unregistered"})])
-            self.assertEqual(results[0]["source_kind"], "external_data")
-            self.assertIn("Mindustry", results[0]["text"])
-            return text_response("页面已读取")
+            self.assertNotIn("text", results[0])
+            self.assertIn("仅支持公网", json.dumps(results[0], ensure_ascii=False))
+            return text_response("内网页面已拒绝")
         self.callback = respond
-        self.run_eve(self.send(self.message("web", "查看这个页面", expected="页面已读取")),
+        self.run_eve(self.send(self.message("web", "查看这个页面", expected="内网页面已拒绝")),
                      interest=False, memory=True, research=False, practice=False)
         self.assertEqual(self.chat_rounds, 2)
 
