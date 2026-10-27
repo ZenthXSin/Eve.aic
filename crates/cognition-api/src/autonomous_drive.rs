@@ -54,6 +54,25 @@ impl AutonomousDrive {
             && self.cooldown_until_ms.is_none_or(|until| now_ms >= until)
             && self.valid_until_ms.is_none_or(|until| now_ms < until)
     }
+
+    /// 返回固定审核器在当前时刻建议的生命周期状态；不执行模型或工具。
+    pub fn reviewed_status(&self, now_ms: u64) -> Option<AutonomousDriveStatus> {
+        if now_ms == 0 || !matches!(
+            self.status,
+            AutonomousDriveStatus::Candidate
+                | AutonomousDriveStatus::Ready
+                | AutonomousDriveStatus::Waiting
+        ) {
+            return None;
+        }
+        if self.valid_until_ms.is_some_and(|until| now_ms >= until) {
+            return Some(AutonomousDriveStatus::Blocked);
+        }
+        if self.cooldown_until_ms.is_some_and(|until| now_ms < until) {
+            return Some(AutonomousDriveStatus::Waiting);
+        }
+        Some(AutonomousDriveStatus::Ready)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -112,6 +131,18 @@ mod tests {
         value.attempts = 0;
         value.status = AutonomousDriveStatus::Blocked;
         assert!(!value.is_runnable(2_000));
+    }
+
+    #[test]
+    fn review_status_applies_expiry_and_cooldown_deterministically() {
+        let mut value = drive();
+        value.status = AutonomousDriveStatus::Candidate;
+        assert_eq!(value.reviewed_status(1_000), Some(AutonomousDriveStatus::Ready));
+        value.cooldown_until_ms = Some(2_000);
+        assert_eq!(value.reviewed_status(1_000), Some(AutonomousDriveStatus::Waiting));
+        value.valid_until_ms = Some(2_000);
+        assert_eq!(value.reviewed_status(2_000), Some(AutonomousDriveStatus::Blocked));
+        assert_eq!(value.reviewed_status(0), None);
     }
 
     #[test]
