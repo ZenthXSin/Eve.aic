@@ -343,6 +343,21 @@ pub struct CognitiveState {
     pub events: Vec<CognitiveEvent>,
 }
 impl CognitiveState {
+    /// 按确定性优先级返回当前可运行的内生驱动；这里只做候选排序，不授予执行权限。
+    pub fn runnable_autonomous_drives(&self, now_ms: u64) -> Vec<&AutonomousDrive> {
+        let mut drives: Vec<_> = self
+            .autonomous_drives
+            .values()
+            .filter(|drive| drive.is_runnable(now_ms))
+            .collect();
+        drives.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        drives
+    }
+
     pub fn validate(&self) -> CognitionResult<()> {
         if self.goals.len() > MAX_RECORDS
             || self.drives.len() > MAX_RECORDS
