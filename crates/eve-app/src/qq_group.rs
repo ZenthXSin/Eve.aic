@@ -395,17 +395,15 @@ impl ContextAssembler for Context {
                             // 当前轮历史由会话服务单独保存；群窗口只是跨成员背景。
                             // 明确标出本轮消息，避免模型把窗口里较早的话题接成当前问题。
                             let current = messages.iter().rposition(|message| {
-                                !message.from_me
-                                    && message.speaker == current_user.as_str()
-                                    && {
-                                        let input = current_input.trim();
-                                        let stored = message.text.trim();
-                                        input == stored
-                                            || input.starts_with(stored)
-                                            || input.ends_with(stored)
-                                            || stored.starts_with(input)
-                                            || stored.ends_with(input)
-                                    }
+                                !message.from_me && message.speaker == current_user.as_str() && {
+                                    let input = current_input.trim();
+                                    let stored = message.text.trim();
+                                    input == stored
+                                        || input.starts_with(stored)
+                                        || input.ends_with(stored)
+                                        || stored.starts_with(input)
+                                        || stored.ends_with(input)
+                                }
                             });
                             let selected: Vec<_> = messages
                                 .iter()
