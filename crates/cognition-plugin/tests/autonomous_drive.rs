@@ -206,7 +206,8 @@ async fn interrupted_active_drive_is_unbound_for_retry_after_restart() {
     let bound = admin.replace(ready.revision, state).unwrap();
 
     let mut forged = bound.state.clone();
-    forged.autonomous_drives
+    forged
+        .autonomous_drives
         .get_mut("self-drive-1")
         .unwrap()
         .status = AutonomousDriveStatus::Active;
