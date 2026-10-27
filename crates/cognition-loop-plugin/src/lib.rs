@@ -431,8 +431,7 @@ impl Worker {
             .events
             .iter()
             .find(|event| {
-                event.source.channel == "cognition.autonomous"
-                    && event.source.reference == drive_id
+                event.source.channel == "cognition.autonomous" && event.source.reference == drive_id
             })
             .map(|event| event.id.clone());
         state.events.push(CognitiveEvent {
