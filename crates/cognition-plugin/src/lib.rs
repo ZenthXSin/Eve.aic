@@ -418,6 +418,52 @@ pub struct CognitionController {
     active: Arc<Mutex<Option<Arc<StoredCognition>>>>,
 }
 impl CognitionController {
+    /// 由受信宿主运行固定自动审核；只推进候选生命周期并追加脱敏审计事件。
+    pub fn review_autonomous_drives(
+        &self,
+        expected_revision: u64,
+        now_ms: u64,
+    ) -> CognitionResult<CognitiveSnapshot> {
+        if now_ms == 0 {
+            return Err(CognitionError::InvalidInput);
+        }
+        let mut snapshot = self.snapshot()?;
+        if snapshot.revision != expected_revision {
+            return Err(CognitionError::StaleRevision);
+        }
+        let mut changed = Vec::new();
+        for drive in snapshot.state.autonomous_drives.values_mut() {
+            if let Some(status) = drive.reviewed_status(now_ms)
+                && status != drive.status
+            {
+                let previous = drive.status.clone();
+                drive.status = status.clone();
+                changed.push((drive.id.clone(), previous, status));
+            }
+        }
+        if changed.is_empty() {
+            return Ok(snapshot);
+        }
+        for (id, previous, status) in changed {
+            let event_id = format!("autonomous-review-{expected_revision}-{id}");
+            snapshot.state.events.push(CognitiveEvent {
+                id: event_id,
+                kind: CognitiveEventKind::StateChanged,
+                source: Source {
+                    kind: SourceKind::Internal,
+                    channel: "cognition.autonomous.review".into(),
+                    reference: id,
+                },
+                visibility: Visibility::Internal,
+                goal_id: None,
+                caused_by: None,
+                at_ms: now_ms,
+                summary: format!("自主驱动审核：{previous:?} -> {status:?}"),
+            });
+        }
+        self.replace(expected_revision, snapshot.state)
+    }
+
     /// 由受信宿主提交一个有来源的自主驱动候选；模型和普通通道不能直接调用。
     pub fn submit_autonomous_drive(
         &self,
