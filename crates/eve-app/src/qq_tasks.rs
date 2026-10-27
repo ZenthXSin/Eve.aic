@@ -299,7 +299,7 @@ fn failure_reason(error: &LlmError) -> String {
         LlmError::Unsupported(_) => "模型响应使用了执行器尚不支持的协议内容".into(),
         LlmError::Configuration(_) => "执行器配置无效".into(),
         LlmError::Context(message) if message.starts_with("工具结果可能含未确认") => {
-            "工具结果含未确认副作用；已保存回执，停止自动恢复，需核对现有结果".into()
+            "工具执行未完成；回执已保存，未知结果不会自动重跑".into()
         }
         LlmError::Context(message) if message.starts_with("执行检查点") => message.clone(),
         LlmError::Context(_) => "执行器上下文不可用".into(),
@@ -496,7 +496,7 @@ impl Worker {
                     .unwrap_or_else(|_| usage_of(requests, calls))
             }
         };
-        let host = if let Some(journal) = journal {
+        let host = if let Some(journal) = journal.clone() {
             host.with_turn_journal(journal)
         } else {
             host
@@ -523,15 +523,24 @@ impl Worker {
                     TaskEnd::Cancelled
                 } else {
                     TaskEnd::Failed {
-                        reason: failure_reason(&error),
+                        reason: crate::qq_task_diagnostics::failure(
+                            &failure_reason(&error),
+                            &diagnostics,
+                        ),
                     }
                 },
                 usage: usage(diagnostics.provider_requests, diagnostics.calls.len()),
             },
-            // 超时丢弃整轮，在途工具随之取消；用量不可得，按 0 记录。
+            // 超时丢弃整轮，在途工具随之取消；已有回执和共享计数仍保留。
             Err(_) => WorkerRun {
                 end: TaskEnd::Failed {
-                    reason: format!("超过 {} 秒仍未完成", timeout.as_secs()),
+                    reason: crate::qq_task_diagnostics::failure_checkpoint(
+                        &format!("超过 {} 秒仍未完成", timeout.as_secs()),
+                        journal
+                            .as_ref()
+                            .and_then(|j| j.load().ok().flatten())
+                            .as_ref(),
+                    ),
                 },
                 usage: usage(0, 0),
                 retryable: false,
@@ -748,6 +757,14 @@ fn status_text(task: &Task) -> &'static str {
 }
 
 fn view(task: &Task, result_bytes: usize) -> Value {
+    let steps = crate::qq_task_diagnostics::task_steps(task);
+    let offset = steps
+        .len()
+        .saturating_sub(if result_bytes == LIST_RESULT_BYTES {
+            12
+        } else {
+            3
+        });
     json!({
         "id": task.id,
         "title": task.spec.title,
@@ -760,6 +777,12 @@ fn view(task: &Task, result_bytes: usize) -> Value {
         "minutes_since_dispatch": now_ms().saturating_sub(task.created_at_ms) / 60_000,
         "result": task.result.as_deref().map(|text| bounded(text, result_bytes)),
         "failure": task.failure,
+        "interruption_reason": (task.status == TaskStatus::Interrupted).then(|| crate::qq_task_diagnostics::interruption(task)),
+        "execution_steps": &steps[offset..],
+        "step_total": steps.len(),
+        "step_offset": offset,
+        "steps_truncated": offset > 0,
+        "remaining": task.execution.as_ref().and_then(|e| e.checkpoint.as_ref()).and_then(|c| c.remaining.as_ref()),
     })
 }
 
@@ -951,10 +974,10 @@ impl Tool for ListTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: LIST_TOOL.into(),
-            description: "查看这位用户派发的后台任务及其状态、用掉的步数和结果。给 task_id 时只看这一个并返回更完整的结果；不给时列出最近 10 个。".into(),
+            description: "查看自己的后台任务、结果、失败原因及已保存的实际步骤。给 task_id 返回该任务最近 12 步；step_offset 可从第 0 步起分页，每页至多 25 步。不给 task_id 列出最近 10 个任务。未确认回执不等于成功，也不能直接重跑。".into(),
             argument_schema: json!({
                 "type": "object",
-                "properties": {"task_id": {"type": "string"}},
+                "properties": {"task_id": {"type": "string"}, "step_offset":{"type":"integer","minimum":0}, "step_limit":{"type":"integer","minimum":1,"maximum":25}},
                 "additionalProperties": false
             }),
             required_permissions: vec![],
@@ -964,17 +987,26 @@ impl Tool for ListTool {
 
     fn validate_arguments(&self, value: &Value) -> Result<(), ToolValidationError> {
         let object = value.as_object().ok_or_else(|| invalid("参数必须是对象"))?;
-        match (object.len(), object.get("task_id")) {
-            (0, None) => Ok(()),
-            (1, Some(id))
-                if id
-                    .as_str()
-                    .is_some_and(|id| eve_task_api::validate_id(id).is_ok()) =>
-            {
-                Ok(())
-            }
-            _ => Err(invalid("参数只能为空或只包含非空的 task_id")),
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "task_id" | "step_offset" | "step_limit"))
+            || object.get("task_id").is_some_and(|id| {
+                id.as_str()
+                    .is_none_or(|id| eve_task_api::validate_id(id).is_err())
+            })
+            || object
+                .get("step_offset")
+                .is_some_and(|n| n.as_u64().is_none_or(|n| n > u64::from(MAX_STEPS)))
+            || object
+                .get("step_limit")
+                .is_some_and(|n| !matches!(n.as_u64(), Some(1..=25)))
+            || (!object.contains_key("task_id") && !object.is_empty())
+        {
+            return Err(invalid(
+                "参数可为空，或提供 task_id 及有效的 step_offset、step_limit",
+            ));
         }
+        Ok(())
     }
 
     fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
@@ -986,7 +1018,31 @@ impl Tool for ListTool {
                     .for_owner(&owner.user_id)
                     .find(|task| task.id == id)
                     .ok_or_else(|| failed("这位用户没有这个后台任务"))?;
-                return Ok(json!({"task": view(task, LIST_RESULT_BYTES)}));
+                let mut detail = view(task, LIST_RESULT_BYTES);
+                if call.arguments.get("step_offset").is_some()
+                    || call.arguments.get("step_limit").is_some()
+                {
+                    let steps = crate::qq_task_diagnostics::task_steps(task);
+                    let offset = call
+                        .arguments
+                        .get("step_offset")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
+                    if offset > steps.len() {
+                        return Err(failed("step_offset 超过已保存的步骤数"));
+                    }
+                    let limit = call
+                        .arguments
+                        .get("step_limit")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(12) as usize;
+                    let end = (offset + limit).min(steps.len());
+                    detail["execution_steps"] = json!(&steps[offset..end]);
+                    detail["step_offset"] = json!(offset);
+                    detail["steps_truncated"] = json!(offset > 0 || end < steps.len());
+                    detail["next_step_offset"] = json!((end < steps.len()).then_some(end));
+                }
+                return Ok(json!({"task": detail}));
             }
             let mut mine: Vec<&Task> = snapshot.for_owner(&owner.user_id).collect();
             mine.sort_by_key(|task| std::cmp::Reverse((task.created_at_ms, task.id.clone())));
@@ -1301,9 +1357,18 @@ fn notice_text(task: &Task) -> String {
             task.failure.as_deref().unwrap_or("原因未知")
         ),
         _ if task.execution.is_some() => format!(
-            "后台任务「{title}」已中断，无法安全自动接续（可能有未确认的工具结果、恢复次数或总期限已用尽）；已有记录保留，请先核对现有操作，未自动重跑。"
+            "后台任务「{title}」已中断：{}。已有记录保留，未自动重跑。",
+            crate::qq_task_diagnostics::interruption(task)
         ),
         _ => format!("后台任务「{title}」因 Eve 重启中断了，没有完成；需要的话可以让我重新派发。"),
+    };
+    let text = if matches!(task.status, TaskStatus::Failed | TaskStatus::Interrupted) {
+        format!(
+            "{text}\n任务编号 {}，可继续查看已做步骤与剩余工作。",
+            task.id
+        )
+    } else {
+        text
     };
     bounded(&text, QQ_OUTREACH_MAX_BYTES)
 }
@@ -1591,7 +1656,7 @@ async fn run(
                     let task = tasks.snapshot()?.tasks.into_iter().find(|task| task.id == id);
                     let mut end = outcome.end;
                     if let Some(task) = task.as_ref().filter(|t| t.source.starts_with(crate::qq_failure_recovery::SOURCE_PREFIX)) {
-                        let exhausted = matches!(&end, TaskEnd::Failed { reason } if reason == "步数用尽后模型仍要求调用工具")
+                        let exhausted = matches!(&end, TaskEnd::Failed { reason } if reason.starts_with("步数用尽后模型仍要求调用工具"))
                             || task.needs_step_approval();
                         if exhausted && !task.cancel_requested {
                             end = TaskEnd::Failed { reason: format!(

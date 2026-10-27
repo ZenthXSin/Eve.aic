@@ -128,6 +128,7 @@ jobs:
           python3 connectors/qqbot/test/group_digest_test.py
           python3 connectors/qqbot/test/group_recall_test.py
           python3 connectors/qqbot/test/background_recovery_test.py
+          python3 connectors/qqbot/test/background_diagnostics_test.py
           python3 connectors/qqbot/test/auto_recovery_test.py
           python3 connectors/qqbot/test/management_access_test.py
           python3 connectors/qqbot/test/member_development_test.py

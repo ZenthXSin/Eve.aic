@@ -257,7 +257,9 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.assertIsNone(task["usage"])
         self.assertEqual(len(self.worker_requests()), 1, "重启后不自动重跑")
         [push] = self.pushes()
-        self.assertEqual(push["text"], "后台任务「整理日志」因 Eve 重启中断了，没有完成；需要的话可以让我重新派发。")
+        self.assertEqual(push["text"].splitlines()[0], "后台任务「整理日志」因 Eve 重启中断了，没有完成；需要的话可以让我重新派发。")
+        self.assertIn(task["id"], push["text"])
+        self.assertIn("查看已做步骤与剩余工作", push["text"])
 
     def test_a_subagent_does_a_subtask_within_the_turn_and_hands_back_its_result(self):
         task = "查一下 echo 是否可用，给出结论。"
