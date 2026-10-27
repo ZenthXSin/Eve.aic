@@ -1315,9 +1315,10 @@ async fn action_reviewer_decides_prompt_commands_from_user_words_and_fails_close
             timeout_ms: None,
         })
     };
+    let full_user_quote = format!("把 careful 文件建出来；{}", "完整授权原话".repeat(1_500));
     let conversation = Arc::new(vec![
         ChatMessage::text(ChatRole::System, "系统提示不交给审查者"),
-        ChatMessage::text(ChatRole::User, "把 careful 文件建出来"),
+        ChatMessage::text(ChatRole::User, full_user_quote.clone()),
         ChatMessage::text(ChatRole::Assistant, "好"),
     ]);
     let talking = || context("owner").with_conversation(conversation.clone());
@@ -1336,8 +1337,8 @@ async fn action_reviewer_decides_prompt_commands_from_user_words_and_fails_close
     let seen = allow.seen.lock().unwrap().pop().unwrap();
     assert_eq!(
         seen.user_messages,
-        ["把 careful 文件建出来"],
-        "只交用户原话"
+        vec![full_user_quote],
+        "完整保留用户原话"
     );
     assert!(!seen.delegated && !seen.claimed_confirmation);
     assert!(

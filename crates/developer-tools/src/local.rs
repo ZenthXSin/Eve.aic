@@ -96,10 +96,11 @@ pub struct LocalDeveloper {
     command_policy: Option<std::sync::Arc<dyn eve_developer_api::CommandPolicy>>,
     action_reviewer: Option<std::sync::Arc<dyn ActionReviewer>>,
 }
-/// 交给审查者的用户原话与行动轨迹条数及单条字符上限。
+/// 交给审查者的用户原话条数与行动轨迹条数；用户原话正文不裁剪，
+/// 工具轨迹与命令摘要仍保持有界。
 const REVIEW_USER_MESSAGES: usize = 6;
 const REVIEW_RECENT_ACTIONS: usize = 8;
-const REVIEW_MESSAGE_CHARS: usize = 2000;
+const REVIEW_COMMAND_CHARS: usize = 2000;
 const REVIEW_ACTION_CHARS: usize = 300;
 fn clip(text: &str, limit: usize) -> String {
     match text.char_indices().nth(limit) {
@@ -126,7 +127,7 @@ fn review_request(
             .filter_map(|m| m.text.as_deref())
             .filter(|t| !t.trim().is_empty())
             .take(REVIEW_USER_MESSAGES)
-            .map(|t| clip(t, REVIEW_MESSAGE_CHARS))
+            .map(ToOwned::to_owned)
             .collect();
         texts.reverse();
         texts
@@ -145,7 +146,7 @@ fn review_request(
         action: clip(
             &shlex::try_join(action.iter().map(String::as_str))
                 .unwrap_or_else(|_| action.join(" ")),
-            REVIEW_MESSAGE_CHARS,
+            REVIEW_COMMAND_CHARS,
         ),
         cwd: a.cwd.clone(),
         policy_reason: reason,
