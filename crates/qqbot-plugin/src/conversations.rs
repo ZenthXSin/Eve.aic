@@ -31,6 +31,21 @@ pub struct QqConversationIdentity {
     pub source: QqInteractionSource,
 }
 
+impl QqConversationIdentity {
+    /// 可信平台账号标识：AppID 与群/私聊命名空间进入摘要，群号不进入。
+    pub fn account_id(&self) -> String {
+        format!("qq-account:{}", self.subject)
+    }
+    pub fn valid_account_id(value: &str) -> bool {
+        value.strip_prefix("qq-account:").is_some_and(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct QqConversations {
     inner: Arc<Mutex<Inner>>,

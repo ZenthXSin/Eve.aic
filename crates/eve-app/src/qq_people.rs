@@ -8,6 +8,7 @@ use eve_llm_api::{
 use eve_people_api::*;
 use eve_plugin_api::{PluginResult, ServiceId, ServiceRegistry};
 use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput, QqParticipantObserver};
+use eve_qqbot_plugin::{QqConversationIdentity, QqConversations};
 use eve_session_api::SessionKey;
 use serde_json::json;
 use std::{
@@ -35,6 +36,10 @@ pub(crate) fn schema() -> ConfigSchema {
                 "owner_principals".into(),
                 ConfigField::new(ConfigKind::String, Some(json!(""))),
             ),
+            (
+                "owner_accounts".into(),
+                ConfigField::new(ConfigKind::String, Some(json!(""))),
+            ),
             ("impressions".into(), {
                 let mut field = ConfigField::new(ConfigKind::Boolean, Some(json!(true)));
                 field.environment = Some("EVE_PEOPLE_IMPRESSIONS".into());
@@ -43,21 +48,64 @@ pub(crate) fn schema() -> ConfigSchema {
         ]),
     }
 }
-pub(crate) fn settings(snapshot: &ConfigSnapshot) -> Result<(String, BTreeSet<String>), ()> {
+/// 身份权限与聊天状态分开：账号摘要跨群稳定，旧会话绑定继续按原范围生效。
+pub(crate) struct OwnerSettings {
+    pub(crate) name: String,
+    principals: BTreeSet<String>,
+    accounts: BTreeSet<String>,
+}
+impl OwnerSettings {
+    pub(crate) fn is_bound(&self) -> bool {
+        !self.principals.is_empty() || !self.accounts.is_empty()
+    }
+    pub(crate) fn matches_identity(&self, identity: &QqConversationIdentity) -> bool {
+        self.principals.contains(&identity.session.user_id)
+            || self.accounts.contains(&identity.account_id())
+    }
+    pub(crate) fn matches(
+        &self,
+        scope: &ContextScope,
+        conversations: &QqConversations,
+    ) -> PluginResult<bool> {
+        if self.principals.contains(&scope.user_id) {
+            return Ok(true);
+        }
+        let key = SessionKey::new(&scope.session_id, &scope.user_id)
+            .map_err(|e| eve_plugin_api::PluginError::State(e.to_string()))?;
+        Ok(conversations
+            .identity(&key)?
+            .is_some_and(|i| self.matches_identity(&i)))
+    }
+}
+pub(crate) fn settings(snapshot: &ConfigSnapshot) -> Result<OwnerSettings, ()> {
     let name: String = snapshot.get("owner_name").map_err(|_| ())?;
     let principals: String = snapshot.get("owner_principals").map_err(|_| ())?;
-    if !valid_name(&name) || principals.len() > 8192 {
+    let accounts: String = snapshot.get("owner_accounts").map_err(|_| ())?;
+    if !valid_name(&name) || principals.len() > 8192 || accounts.len() > 8192 {
         return Err(());
     }
-    let ids: BTreeSet<String> = principals
-        .split(|c: char| c.is_whitespace() || c == ',')
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect();
-    if ids.len() > 32 || ids.iter().any(|v| !valid_identity(v)) {
+    let parse = |raw: &str| -> BTreeSet<String> {
+        raw.split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let principals = parse(&principals);
+    let accounts = parse(&accounts);
+    if principals.len() > 32
+        || principals.iter().any(|v| !valid_identity(v))
+        || accounts.len() > 32
+        || accounts
+            .iter()
+            .any(|v| !QqConversationIdentity::valid_account_id(v))
+    {
         return Err(());
     }
-    Ok((name, ids))
+    Ok(OwnerSettings {
+        name,
+        principals,
+        accounts,
+    })
 }
 fn declaration(text: &str) -> Option<&str> {
     let text = text.trim();
@@ -196,6 +244,7 @@ pub(crate) struct Context {
     pub(crate) wrapped: Arc<dyn ContextAssembler>,
     pub(crate) people: Arc<dyn PeopleDirectory>,
     pub(crate) registry: Arc<dyn ServiceRegistry>,
+    pub(crate) conversations: QqConversations,
     /// 判断其他会话里哪些参与者是同一个人且可见；与跨会话个人记忆共用授权。
     pub(crate) links: Arc<dyn PersonLinks>,
     /// 画像过期或缺失时排队整理；本轮仍用逐条印象。
@@ -229,15 +278,18 @@ impl ContextAssembler for Context {
                 .value
                 .downcast::<ConfigServiceHandle>()
                 .map_err(|_| unavailable())?;
-            let (owner_name, ids) =
-                settings(&config.0.snapshot(NAMESPACE, 1).map_err(|_| unavailable())?)
-                    .map_err(|_| unavailable())?;
+            let owners = settings(&config.0.snapshot(NAMESPACE, 1).map_err(|_| unavailable())?)
+                .map_err(|_| unavailable())?;
             let people = self
                 .people
                 .view(&scope.user_id)
                 .map_err(|_| unavailable())?;
-            let owner_match = (!ids.is_empty()).then(|| ids.contains(&scope.user_id));
-            let mut data = json!({"kind":"eve.people.v1","owner_name":owner_name,"current_is_owner":owner_match,"people":people});
+            let owner_match = owners
+                .is_bound()
+                .then(|| owners.matches(&scope, &self.conversations))
+                .transpose()
+                .map_err(|_| unavailable())?;
+            let mut data = json!({"kind":"eve.people.v1","owner_name":owners.name,"current_is_owner":owner_match,"people":people});
             if people.is_some() {
                 // 画像只在依据指纹与当前一致时使用，代替本会话与他处的逐条印象；
                 // 过期或缺失时排队整理，本轮照常用逐条印象。

@@ -102,18 +102,16 @@ impl MemoryContinuityPolicy for Policy {
         if !flag("enabled")? {
             return Ok(vec![]);
         }
-        let mut groups = identity_groups(&config).map_err(|_| MemoryError::InvalidInput)?;
-        if flag("use_owner_binding")? {
+        let groups = identity_groups(&config).map_err(|_| MemoryError::InvalidInput)?;
+        let owners = if flag("use_owner_binding")? {
             let owner = settings
                 .0
                 .snapshot(crate::qq_people::NAMESPACE, 1)
                 .map_err(|_| unavailable())?;
-            let (_, ids) =
-                crate::qq_people::settings(&owner).map_err(|_| MemoryError::InvalidInput)?;
-            if ids.len() > 1 {
-                groups.push(ids);
-            }
-        }
+            Some(crate::qq_people::settings(&owner).map_err(|_| MemoryError::InvalidInput)?)
+        } else {
+            None
+        };
         let target_key = SessionKey::new(target.session_id.clone(), target.user_id.clone())
             .map_err(|_| unavailable())?;
         let Some(current) = self
@@ -140,6 +138,9 @@ impl MemoryContinuityPolicy for Policy {
                 continue;
             };
             let linked = origin.subject == current.subject
+                || owners.as_ref().is_some_and(|owner| {
+                    owner.matches_identity(&origin) && owner.matches_identity(&current)
+                })
                 || groups.iter().any(|group| {
                     group.contains(&source.user_id) && group.contains(&target.user_id)
                 });
