@@ -53,14 +53,22 @@ async fn autonomous_drive_review_persists_and_reader_scope_holds_after_restart()
     let (kernel, admin, _) = open(store.clone()).await;
     let initial = admin.snapshot().unwrap();
     let submitted = admin
-        .submit_autonomous_drive(initial.revision, drive(AutonomousDriveStatus::Candidate), 1_000)
+        .submit_autonomous_drive(
+            initial.revision,
+            drive(AutonomousDriveStatus::Candidate),
+            1_000,
+        )
         .unwrap();
     assert_eq!(
         submitted.state.autonomous_drives["self-drive-1"].status,
         AutonomousDriveStatus::Candidate
     );
 
-    let public = admin.reader(ReadAccess::Public).unwrap().snapshot().unwrap();
+    let public = admin
+        .reader(ReadAccess::Public)
+        .unwrap()
+        .snapshot()
+        .unwrap();
     assert!(public.state.autonomous_drives.is_empty());
     let internal = admin
         .reader(ReadAccess::Internal)
@@ -77,13 +85,7 @@ async fn autonomous_drive_review_persists_and_reader_scope_holds_after_restart()
         AutonomousDriveStatus::Ready
     );
     assert_eq!(
-        reviewed
-            .state
-            .events
-            .last()
-            .unwrap()
-            .source
-            .channel,
+        reviewed.state.events.last().unwrap().source.channel,
         "cognition.autonomous.review"
     );
     kernel.stop_all().await.unwrap();
@@ -94,22 +96,26 @@ async fn autonomous_drive_review_persists_and_reader_scope_holds_after_restart()
         snapshot.state.autonomous_drives["self-drive-1"].status,
         AutonomousDriveStatus::Ready
     );
-    assert!(recovered
-        .reader(ReadAccess::Public)
-        .unwrap()
-        .snapshot()
-        .unwrap()
-        .state
-        .autonomous_drives
-        .is_empty());
-    assert!(recovered
-        .reader(ReadAccess::Internal)
-        .unwrap()
-        .snapshot()
-        .unwrap()
-        .state
-        .autonomous_drives
-        .contains_key("self-drive-1"));
+    assert!(
+        recovered
+            .reader(ReadAccess::Public)
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .state
+            .autonomous_drives
+            .is_empty()
+    );
+    assert!(
+        recovered
+            .reader(ReadAccess::Internal)
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .state
+            .autonomous_drives
+            .contains_key("self-drive-1")
+    );
     kernel.stop_all().await.unwrap();
 }
 
@@ -118,7 +124,11 @@ async fn autonomous_drive_review_rejects_stale_revision_without_duplicate_audit(
     let (kernel, admin, _) = open(Arc::new(MemoryStateStore::default())).await;
     let initial = admin.snapshot().unwrap();
     let submitted = admin
-        .submit_autonomous_drive(initial.revision, drive(AutonomousDriveStatus::Candidate), 1_000)
+        .submit_autonomous_drive(
+            initial.revision,
+            drive(AutonomousDriveStatus::Candidate),
+            1_000,
+        )
         .unwrap();
     let before = admin.snapshot().unwrap();
     assert_eq!(
@@ -145,4 +155,3 @@ async fn autonomous_drive_review_rejects_stale_revision_without_duplicate_audit(
     );
     kernel.stop_all().await.unwrap();
 }
-
