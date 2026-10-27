@@ -387,6 +387,48 @@ pub struct CognitionController {
     active: Arc<Mutex<Option<Arc<StoredCognition>>>>,
 }
 impl CognitionController {
+    /// 由受信宿主提交一个有来源的自主驱动候选；模型和普通通道不能直接调用。
+    pub fn submit_autonomous_drive(
+        &self,
+        expected_revision: u64,
+        drive: AutonomousDrive,
+        at_ms: u64,
+    ) -> CognitionResult<CognitiveSnapshot> {
+        if at_ms == 0
+            || !matches!(
+                drive.status,
+                AutonomousDriveStatus::Candidate | AutonomousDriveStatus::Ready
+            )
+            || drive.attempts != 0
+        {
+            return Err(CognitionError::InvalidInput);
+        }
+        drive.validate()?;
+        let mut snapshot = self.snapshot()?;
+        if snapshot.revision != expected_revision
+            || snapshot.state.autonomous_drives.contains_key(&drive.id)
+        {
+            return Err(CognitionError::StaleRevision);
+        }
+        let id = format!("autonomous-drive-{expected_revision}");
+        snapshot.state.autonomous_drives.insert(drive.id.clone(), drive.clone());
+        snapshot.state.events.push(CognitiveEvent {
+            id,
+            kind: CognitiveEventKind::StateChanged,
+            source: Source {
+                kind: SourceKind::Internal,
+                channel: "cognition.autonomous".into(),
+                reference: drive.id.clone(),
+            },
+            visibility: drive.visibility.clone(),
+            goal_id: None,
+            caused_by: None,
+            at_ms,
+            summary: "自主驱动候选已提交，等待议程审核。".into(),
+        });
+        self.replace(expected_revision, snapshot.state)
+    }
+
     fn service(&self) -> CognitionResult<Arc<StoredCognition>> {
         self.active
             .lock()
