@@ -31,6 +31,11 @@ impl AutonomousDrive {
         validate_id(&self.id)?;
         self.source.validate()?;
         self.visibility.validate()?;
+        if self.source.kind == crate::SourceKind::Internal
+            && self.visibility != Visibility::Internal
+        {
+            return Err(crate::CognitionError::InvalidInput);
+        }
         validate_text(&self.description)?;
         validate_text(&self.stop_condition)?;
         if let Some(verification) = &self.verification {
