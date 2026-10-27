@@ -381,16 +381,16 @@ impl Worker {
                 .iter()
                 .enumerate()
                 .find_map(|(index, (id, drive))| {
-                if !drive.is_runnable(now_ms) || drive.goal_id.is_some() {
-                    return None;
-                }
-                let verification = drive.verification.clone()?;
-                let goal_id = format!("autonomous.goal.{}.{}", snapshot.revision, index);
-                if state.goals.contains_key(&goal_id) {
-                    return None;
-                }
-                Some((id.clone(), goal_id, drive.clone(), verification))
-            });
+                    if !drive.is_runnable(now_ms) || drive.goal_id.is_some() {
+                        return None;
+                    }
+                    let verification = drive.verification.clone()?;
+                    let goal_id = format!("autonomous.goal.{}.{}", snapshot.revision, index);
+                    if state.goals.contains_key(&goal_id) {
+                        return None;
+                    }
+                    Some((id.clone(), goal_id, drive.clone(), verification))
+                });
         let Some((drive_id, goal_id, drive, verification)) = materialized else {
             return Ok(snapshot);
         };
