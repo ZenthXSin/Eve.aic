@@ -28,7 +28,10 @@ impl AutonomousDrive {
         validate_text(&self.description)?;
         validate_text(&self.stop_condition)?;
         self.budget.validate()?;
-        if self.priority > 100 || self.evidence.len() > 16 || self.attempts > self.budget.max_attempts {
+        if self.priority > 100
+            || self.evidence.len() > 16
+            || self.attempts > self.budget.max_attempts
+        {
             return Err(crate::CognitionError::InvalidInput);
         }
         if self.cooldown_until_ms == Some(0)
@@ -44,8 +47,10 @@ impl AutonomousDrive {
     }
 
     pub fn is_runnable(&self, now_ms: u64) -> bool {
-        matches!(self.status, AutonomousDriveStatus::Candidate | AutonomousDriveStatus::Ready)
-            && self.attempts < self.budget.max_attempts
+        matches!(
+            self.status,
+            AutonomousDriveStatus::Candidate | AutonomousDriveStatus::Ready
+        ) && self.attempts < self.budget.max_attempts
             && self.cooldown_until_ms.is_none_or(|until| now_ms >= until)
             && self.valid_until_ms.is_none_or(|until| now_ms < until)
     }
@@ -62,7 +67,6 @@ pub enum AutonomousDriveStatus {
     Completed,
     Cancelled,
 }
-
 
 #[cfg(test)]
 mod tests {
