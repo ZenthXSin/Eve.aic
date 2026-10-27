@@ -1,12 +1,8 @@
 use eve_cognition_api::*;
 use eve_cognition_plugin::{CognitionController, CognitionPlugin};
 use eve_kernel::{Kernel, KernelServices, backends::MemoryStateStore};
-use eve_plugin_api::{PluginId, ServiceRegistry, StateStore};
+use eve_plugin_api::{ServiceRegistry, StateStore};
 use std::sync::Arc;
-
-fn namespace() -> PluginId {
-    PluginId::new(COGNITION_PLUGIN_ID).unwrap()
-}
 
 async fn open(
     store: Arc<dyn StateStore>,
