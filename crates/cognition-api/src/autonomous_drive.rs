@@ -2,7 +2,7 @@ use crate::{CognitionResult, ExecutionBudget, Source, Visibility, validate_id, v
 use serde::{Deserialize, Serialize};
 
 /// 持久化的内生驱动候选；来源和权限由受信宿主绑定，模型只能提供描述建议。
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutonomousDrive {
     pub id: String,
