@@ -114,6 +114,22 @@ impl DrivePolicy for ReflectionDrivePolicy {
                 continue;
             }
             let Some(parent) = snapshot.state.goals.get(&goal.source.reference) else {
+                let autonomous = snapshot
+                    .state
+                    .autonomous_drives
+                    .values()
+                    .find(|drive| drive.goal_id.as_deref() == Some(goal.id.as_str()));
+                if autonomous.is_some_and(|drive| {
+                    drive.source == goal.source
+                        && drive.visibility == goal.visibility
+                        && matches!(
+                            drive.status,
+                            eve_cognition_api::AutonomousDriveStatus::Ready
+                                | eve_cognition_api::AutonomousDriveStatus::Active
+                        )
+                }) {
+                    admitted.push(goal.clone());
+                }
                 continue;
             };
             if parent.status != GoalStatus::Waiting
