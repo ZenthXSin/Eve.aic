@@ -376,6 +376,25 @@ impl CognitiveState {
             }
             executing += usize::from(goal.status == GoalStatus::Executing);
         }
+        for drive in self.autonomous_drives.values() {
+            if let Some(goal_id) = &drive.goal_id {
+                let goal = self
+                    .goals
+                    .get(goal_id)
+                    .ok_or(CognitionError::InvalidInput)?;
+                if goal.source != drive.source
+                    || goal.visibility != drive.visibility
+                    || goal.description != drive.description
+                    || goal.verification != drive.verification.clone().unwrap_or_default()
+                    || goal.priority != drive.priority
+                    || goal.budget != drive.budget
+                    || goal.stop_condition != drive.stop_condition
+                    || goal.expires_at_ms != drive.valid_until_ms
+                {
+                    return Err(CognitionError::AccessDenied);
+                }
+            }
+        }
         if executing > 1 {
             return Err(CognitionError::Busy);
         }
