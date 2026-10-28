@@ -367,3 +367,68 @@ fn explicit_unknown_delivery_preserves_unknown_without_exchange_or_replay() {
     assert!(reopened.claim().unwrap().is_none());
     assert!(reopened.exchanges("g1").unwrap().is_empty());
 }
+
+fn corrupt_scope_field(route: &str, identity: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("group.db");
+    let store = SqliteGroupObservations::open(&path).unwrap();
+    store.append(&message("g1")).unwrap();
+    if matches!(route, "claim" | "outbound") {
+        store.queue("chime-1", &reply("g1"), "user-1").unwrap();
+        if route == "outbound" {
+            store.claim().unwrap().unwrap();
+        }
+    }
+    let db = rusqlite::Connection::open(&path).unwrap();
+    if matches!(route, "recent" | "message") {
+        db.execute(
+            if identity { "UPDATE observations SET payload=json_set(payload,'$.id','foreign-id')" } else { "UPDATE observations SET payload=json_set(payload,'$.conversation','foreign-private')" },
+            [],
+        )
+        .unwrap();
+    } else {
+        db.execute(if identity { "UPDATE outbound SET payload=json_set(payload,'$.id','chime-foreign')" } else { "UPDATE outbound SET payload=json_set(payload,'$.reply.conversation','foreign-private')" },[]).unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    let rejected = match route {
+        "recent" => store.recent("g1", 10).is_err(),
+        "message" => store.message("g1", "m1").is_err(),
+        "claim" => store.claim().is_err(),
+        _ => store.outbound("chime-1").is_err(),
+    };
+    assert!(
+        rejected,
+        "{route} must reject payload scope differing from the indexed scope"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "{route} must preserve corrupt state"
+    );
+    assert!(
+        store.recent("g1", 10).is_err(),
+        "corrupt store stays closed"
+    );
+}
+
+fn corrupt_scope(route: &str) {
+    for identity in [false, true] {
+        corrupt_scope_field(route, identity);
+    }
+}
+#[test]
+fn corrupt_scope_recent() {
+    corrupt_scope("recent");
+}
+#[test]
+fn corrupt_scope_message() {
+    corrupt_scope("message");
+}
+#[test]
+fn corrupt_scope_claim() {
+    corrupt_scope("claim");
+}
+#[test]
+fn corrupt_scope_outbound() {
+    corrupt_scope("outbound");
+}

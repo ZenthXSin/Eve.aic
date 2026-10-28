@@ -713,6 +713,9 @@ fn submit_wakeup(
         match &result {
             Ok(_) => QqAdmissionResult::Started,
             Err(eve_control_api::ControlError::Busy) => QqAdmissionResult::Retry,
+            Err(
+                eve_control_api::ControlError::Blocked | eve_control_api::ControlError::Unavailable,
+            ) => QqAdmissionResult::Unknown,
             Err(_) => QqAdmissionResult::Rejected,
         },
     )?;
@@ -909,7 +912,12 @@ async fn run(
                     transition(admin.as_ref(), &t.id, Status::Running, Status::Ready, None)?;
                     continue;
                 }
-                Err(_) => {
+                Err(error) => {
+                    let unknown = matches!(
+                        error,
+                        eve_control_api::ControlError::Blocked
+                            | eve_control_api::ControlError::Unavailable
+                    );
                     transition(
                         admin.as_ref(),
                         &t.id,
@@ -918,8 +926,12 @@ async fn run(
                         Some(failure_receipt(
                             &t,
                             "admission",
-                            "not_started",
-                            "会话无法准入，未执行工具",
+                            if unknown { "unknown" } else { "not_started" },
+                            if unknown {
+                                "控制状态无法确认；不自动重放"
+                            } else {
+                                "会话明确拒绝准入，未执行工具"
+                            },
                         )),
                     )?;
                     continue;
@@ -1233,10 +1245,11 @@ mod tests {
             _: ControlInput,
             _: Arc<dyn eve_control_api::ControlEventSink>,
         ) -> eve_control_api::ControlResult<eve_control_api::GenerationKey> {
-            if self.held_task == "busy-submit" {
-                return Err(eve_control_api::ControlError::Busy);
+            match self.held_task.as_str() {
+                "busy-submit" => Err(eve_control_api::ControlError::Busy),
+                "blocked-submit" => Err(eve_control_api::ControlError::Blocked),
+                _ => unreachable!(),
             }
-            unreachable!()
         }
         fn submit_if_current(
             &self,
@@ -1433,5 +1446,47 @@ mod tests {
             .finish_admission(&retried, QqAdmissionResult::Started)
             .unwrap();
         assert_eq!(admin.snapshot().unwrap()[0].runs, 0);
+        let blocked_scope = SessionKey::new("blocked", "u").unwrap();
+        let admission = observations.admission.as_ref().unwrap();
+        let ticket = admission
+            .begin(&blocked_scope, "unknown-submit")
+            .unwrap()
+            .unwrap();
+        let blocked = SimulatedControl {
+            held_task: "blocked-submit".into(),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        assert_eq!(
+            submit_wakeup(
+                &blocked,
+                &observations,
+                &ticket,
+                ControlInput {
+                    session: SessionInput {
+                        key: blocked_scope,
+                        text: "wake".into()
+                    },
+                    task_id: "unknown-submit".into()
+                }
+            )
+            .unwrap(),
+            Err(eve_control_api::ControlError::Blocked)
+        );
+        let saved = admission
+            .0
+            .snapshot_for(&eve_subject_api::SubjectScope {
+                channel: "qq".into(),
+                conversation_id: "blocked".into(),
+                principal_id: "u".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            saved.events[0].status,
+            eve_subject_api::EventStatus::Unknown
+        );
+        assert_eq!(
+            saved.events[0].checkpoint.boundary,
+            eve_subject_api::CheckpointBoundary::EffectPending
+        );
     }
 }

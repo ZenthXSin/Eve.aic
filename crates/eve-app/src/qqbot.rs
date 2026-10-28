@@ -2296,7 +2296,7 @@ async fn run_qqbot_composed(
             };
             group_background = Some(crate::qq_group::Background::start(
                 group.clone(),
-                control.clone(),
+                crate::qq_group_admission::GroupControl::wrap(control.clone(), subject_admission.clone()),
                 budgeted(crate::chime::MODEL_USE)?,
                 relations,
                 budget_gate.clone(),

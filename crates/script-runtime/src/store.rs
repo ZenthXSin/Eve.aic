@@ -34,6 +34,8 @@ pub struct ScriptStore {
     ledger: Mutex<Ledger>,
     poisoned: std::sync::atomic::AtomicBool,
     _lock: File,
+    #[cfg(test)]
+    lock_attempts: std::sync::atomic::AtomicUsize,
 }
 impl ScriptStore {
     /// 独占进程锁；损坏、未知格式、缺失已初始化账本均拒绝打开，不清空。
@@ -75,6 +77,8 @@ impl ScriptStore {
             ledger: Mutex::new(ledger),
             poisoned: std::sync::atomic::AtomicBool::new(false),
             _lock: lock,
+            #[cfg(test)]
+            lock_attempts: std::sync::atomic::AtomicUsize::new(0),
         });
         // 只把崩溃时未完成的调用标成 unknown；从不重新启动它们。
         store.change(|ledger| {
@@ -95,14 +99,28 @@ impl ScriptStore {
         if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
             return Err(fail("账本提交结果未知，须重新打开核对"));
         }
+        #[cfg(test)]
+        self.lock_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let ledger = self.ledger.lock().map_err(fail)?;
+        // 排队期间前一个提交可能失败；持锁后必须再次确认，不能覆盖未知提交。
+        if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(fail("账本提交结果未知，须重新打开核对"));
+        }
         action(&ledger)
     }
     fn change<T>(&self, action: impl FnOnce(&mut Ledger) -> Result<T>) -> Result<T> {
         if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
             return Err(fail("账本提交结果未知，须重新打开核对"));
         }
+        #[cfg(test)]
+        self.lock_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut guard = self.ledger.lock().map_err(fail)?;
+        // 排队期间前一个提交可能失败；持锁后必须再次确认，不能覆盖未知提交。
+        if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(fail("账本提交结果未知，须重新打开核对"));
+        }
         let mut next = guard.clone();
         let output = action(&mut next)?;
         let envelope = Envelope {
@@ -565,4 +583,50 @@ pub(crate) fn strict_json(bytes: &[u8]) -> Result<Value> {
     serde_json::from_slice::<StrictValue>(bytes)
         .map(|value| value.0)
         .map_err(fail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn queued_access_fails_closed_after_an_earlier_commit_poisoned_the_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ScriptStore::open(directory.path()).unwrap();
+        // Force the next atomic replacement to fail without touching external files.
+        std::fs::remove_file(directory.path().join("ledger.json")).unwrap();
+        std::fs::create_dir(directory.path().join("ledger.json")).unwrap();
+        let mut waiting = Vec::new();
+        let failed: Result<()> = store.change(|_| {
+            let initial = store.lock_attempts.load(Ordering::SeqCst);
+            for write in [false, true] {
+                let store = store.clone();
+                waiting.push(std::thread::spawn(move || {
+                    if write {
+                        store.change(|_| Ok(()))
+                    } else {
+                        store.read(|_| Ok(()))
+                    }
+                }));
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while store.lock_attempts.load(Ordering::SeqCst) < initial + 2 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "waiters did not reach lock"
+                );
+                std::thread::yield_now();
+            }
+            Ok(())
+        });
+        assert!(failed.is_err());
+        for waiter in waiting {
+            let error = waiter
+                .join()
+                .unwrap()
+                .expect_err("queued access bypassed poisoned store");
+            assert!(error.to_string().contains("提交结果未知"));
+        }
+    }
 }
