@@ -177,6 +177,16 @@ impl HistoryContextPlanner for Planner {
             };
             let window = self.window()?;
             let groups = history_turns(history);
+            // 最新整轮可能包含刚发生的工具结果，不能因容量不足静默省略后继续执行。
+            // 较老轮次仍按相关性保留或留下档案引用；原持久记录始终不变。
+            if let Some(latest) = groups.last()
+                && serde_json::to_vec(latest)
+                    .map_err(|_| fail("历史轮次编码失败"))?
+                    .len()
+                    > window.max_bytes
+            {
+                return Err(LlmError::HistoryWindowExceeded);
+            }
             let recent = groups.len().saturating_sub(RECENT.min(window.max_turns));
             let query = terms(&input.text);
             let work = self.work(scope, &input.text)?;
@@ -846,6 +856,26 @@ mod tests {
         .unwrap();
         assert_eq!(selected, vec!["h0"]);
     }
+    #[tokio::test]
+    async fn oversized_latest_turn_is_rejected_instead_of_silently_omitted() {
+        let (_kernel, planner, _root, _session) = world().await;
+        let history = vec![
+            ChatMessage::text(ChatRole::User, "原任务"),
+            ChatMessage::text(
+                ChatRole::Assistant,
+                "x".repeat(planner.window().unwrap().max_bytes),
+            ),
+        ];
+        let before = serde_json::to_vec(&history).unwrap();
+        assert!(matches!(
+            planner
+                .plan(Some(&scope("alice")), &input(), &history)
+                .await,
+            Err(LlmError::HistoryWindowExceeded)
+        ));
+        assert_eq!(serde_json::to_vec(&history).unwrap(), before);
+    }
+
     #[tokio::test]
     async fn long_user_originals_are_not_duplicated_into_task_working_set() {
         let (_kernel, planner, _root, _session) = world().await;

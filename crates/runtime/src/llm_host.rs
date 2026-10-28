@@ -866,8 +866,14 @@ impl LlmHost {
                         diagnostics.clone(),
                     )
                 })?;
-                crate::history::apply_plan(&mut prepared.context, window, plan)
-                    .map_err(|error| fail(error, diagnostics.clone()))?;
+                crate::history::apply_plan(
+                    &mut prepared.context,
+                    window,
+                    plan,
+                    self.history_digests.as_deref(),
+                    scope.as_ref(),
+                )
+                .map_err(|error| fail(error, diagnostics.clone()))?;
                 planned_history = true;
             }
         }

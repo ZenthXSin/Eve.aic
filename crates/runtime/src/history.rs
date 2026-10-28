@@ -89,6 +89,8 @@ pub(crate) fn apply_plan(
     context: &mut ContextSnapshot,
     window: HistoryWindow,
     plan: eve_llm_api::HistoryContextPlan,
+    digests: Option<&dyn HistoryDigests>,
+    scope: Option<&ContextScope>,
 ) -> Result<(), LlmError> {
     window.validate()?;
     if plan.retained_turns.len() > window.max_turns
@@ -136,6 +138,19 @@ pub(crate) fn apply_plan(
             tools: vec![],
         }
         .validate()?;
+    }
+    // 后台摘要只接收原历史中连续省略的前缀；中间的空洞不能拼成另一份历史。
+    // 返回摘要不注入选取后的子序列，主动压缩仍使用无持久缓存的临时作用域。
+    if let Some(digests) = digests {
+        let omitted = plan.retained_turns.first().copied().unwrap_or(turns.len());
+        let messages = turns
+            .iter()
+            .take(omitted)
+            .map(|turn| turn.len())
+            .sum::<usize>();
+        if messages > 0 {
+            let _ = digests.digest(scope, &context.history[..messages]);
+        }
     }
     context.history = selected;
     context.memories.push(format!(
@@ -289,6 +304,82 @@ mod plan_tests {
     use super::*;
     use eve_llm_api::{ChatMessage, HistoryContextPlan, MAX_HISTORY_WORKING_SET_BYTES};
     #[test]
+    fn planned_history_maintains_only_original_contiguous_prefix_without_injecting_digest() {
+        struct Digests(std::sync::Mutex<Vec<ChatMessage>>);
+        impl HistoryDigests for Digests {
+            fn digest(
+                &self,
+                scope: Option<&ContextScope>,
+                omitted: &[ChatMessage],
+            ) -> Result<Option<eve_llm_api::HistoryDigest>, LlmError> {
+                assert_eq!(scope.unwrap().session_id, "session");
+                *self.0.lock().unwrap() = omitted.to_vec();
+                Ok(Some(eve_llm_api::HistoryDigest {
+                    covered_turns: 2,
+                    text: "never inject cached original prefix".into(),
+                }))
+            }
+        }
+        let original: Vec<_> = (0..5)
+            .flat_map(|i| {
+                [
+                    ChatMessage::text(ChatRole::User, format!("user{i}")),
+                    ChatMessage::text(ChatRole::Assistant, format!("answer{i}")),
+                ]
+            })
+            .collect();
+        let digests = Digests(Default::default());
+        let mut context = ContextSnapshot {
+            history: original.clone(),
+            ..Default::default()
+        };
+        let scope = ContextScope {
+            session_id: "session".into(),
+            user_id: "owner".into(),
+        };
+        apply_plan(
+            &mut context,
+            HistoryWindow {
+                max_turns: 2,
+                max_bytes: 4096,
+            },
+            HistoryContextPlan {
+                retained_turns: vec![2, 4],
+                working_set: vec![],
+            },
+            Some(&digests),
+            Some(&scope),
+        )
+        .unwrap();
+        assert_eq!(*digests.0.lock().unwrap(), original[..4]);
+        assert_eq!(
+            context.history,
+            [original[4..6].to_vec(), original[8..10].to_vec()].concat()
+        );
+        assert!(!context.memories.join(" ").contains("never inject"));
+        digests.0.lock().unwrap().clear();
+        context.history = original;
+        apply_plan(
+            &mut context,
+            HistoryWindow {
+                max_turns: 2,
+                max_bytes: 4096,
+            },
+            HistoryContextPlan {
+                retained_turns: vec![0, 4],
+                working_set: vec![],
+            },
+            Some(&digests),
+            Some(&scope),
+        )
+        .unwrap();
+        assert!(
+            digests.0.lock().unwrap().is_empty(),
+            "首轮仍被选择时，中间空洞不能作为前缀摘要"
+        );
+    }
+
+    #[test]
     fn working_set_limit_and_whole_history_budget_fail_without_mutating_original() {
         let original = ContextSnapshot {
             revision: "revision".into(),
@@ -310,6 +401,8 @@ mod plan_tests {
                 retained_turns: vec![0],
                 working_set: vec!["x".repeat(MAX_HISTORY_WORKING_SET_BYTES)],
             },
+            None,
+            None,
         )
         .unwrap();
         for (window, plan) in [
@@ -332,7 +425,7 @@ mod plan_tests {
             ),
         ] {
             let mut context = original.clone();
-            assert!(apply_plan(&mut context, window, plan).is_err());
+            assert!(apply_plan(&mut context, window, plan, None, None).is_err());
             assert_eq!(context, original);
         }
     }
