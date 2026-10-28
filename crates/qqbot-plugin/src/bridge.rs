@@ -198,6 +198,32 @@ async fn capacity_notice(
     write(stdin, json!({"type":"capacity","version":1,"id":id})).await
 }
 
+fn observe_raw(
+    observer: &dyn crate::QqRawMessageObserver,
+    session: &SessionKey,
+    raw: &Value,
+    private: bool,
+) {
+    // 绑定原始事件可能在多个嵌套字段重复密钥，整个事件都不得交给调试读取工具。
+    if private {
+        return;
+    }
+    let text = raw.to_string();
+    let mut end = text.len().min(24_576);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let bounded = text[..end].to_string();
+    observer.record(
+        session,
+        crate::QqRawMessage {
+            bytes: text.len(),
+            truncated: text.len() > 24_576,
+            json: bounded,
+        },
+    );
+}
+
 async fn write(stdin: &mut ChildStdin, value: Value) -> PluginResult<()> {
     let mut bytes = serde_json::to_vec(&value).map_err(|_| failure("QQBot 命令编码失败"))?;
     bytes.push(b'\n');
@@ -2025,11 +2051,7 @@ pub(crate) async fn run(
                                 conversations.record_message(&config.app_id, &message)?;
                                 if let Some(observer) = &attachment_observer { observer.observe(&message.session_key(&config.app_id)?, &message); }
                                 if let (Some(observer), Some(raw)) = (&raw_observer, raw_debug.as_ref()) {
-                                    let text = raw.to_string();
-                                    let bounded = if text.len() > 24_576 { text[..24_576].to_string() } else { text.clone() };
-                                    observer.record(&message.session_key(&config.app_id)?, crate::QqRawMessage {
-                                        bytes: text.len(), truncated: text.len() > 24_576, json: bounded,
-                                    });
+                                    observe_raw(observer.as_ref(), &message.session_key(&config.app_id)?, raw, private_text.is_some());
                                 }
                                 if private_text.is_none() && let Some(observer) = &participant_observer {
                                     let session = message.session_key(&config.app_id)?;
@@ -2180,6 +2202,39 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     use super::preempts_natural;
+
+    #[derive(Default)]
+    struct RawCapture(std::sync::Mutex<Vec<crate::QqRawMessage>>);
+    impl crate::QqRawMessageObserver for RawCapture {
+        fn record(&self, _: &eve_session_api::SessionKey, raw: crate::QqRawMessage) {
+            self.0.lock().unwrap().push(raw);
+        }
+    }
+
+    #[test]
+    fn raw_observation_bounds_multibyte_input_without_panicking() {
+        let capture = RawCapture::default();
+        let session = eve_session_api::SessionKey::new("session", "user").unwrap();
+        let raw = serde_json::json!({"content": format!("x{}", "界".repeat(10_000))});
+        let source = raw.to_string();
+        assert!(!source.is_char_boundary(24_576));
+        super::observe_raw(&capture, &session, &raw, false);
+        let rows = capture.0.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].bytes, source.len());
+        assert!(rows[0].truncated);
+        assert!(rows[0].json.len() <= 24_576);
+        assert!(source.starts_with(&rows[0].json));
+    }
+
+    #[test]
+    fn raw_observation_never_exposes_private_bind_payload() {
+        let capture = RawCapture::default();
+        let session = eve_session_api::SessionKey::new("session", "user").unwrap();
+        let raw = serde_json::json!({"content": "/bind secret-token", "nested": {"echo": "secret-token"}});
+        super::observe_raw(&capture, &session, &raw, true);
+        assert!(capture.0.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn missing_message_id_is_unknown_for_files_and_outreach() {
