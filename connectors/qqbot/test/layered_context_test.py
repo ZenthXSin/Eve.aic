@@ -22,6 +22,9 @@ class LayeredContextAcceptance(dialogue_tools_test.DialogueToolsAcceptance):
             if body['messages'][0].get('content', '').startswith('你是对话历史压缩器'):
                 data = json.loads(body['messages'][1]['content'])
                 covered = data['previous_turns'] + len(data['turns'])
+                self.assertFalse(body.get('tools'))
+                self.assertEqual([t['number'] for t in data['turns']],
+                                 list(range(data['previous_turns'] + 1, covered + 1)))
                 digests.append(covered)
                 return text_response(json.dumps({'points': [{'text': '项目步骤已有记录，原文仍以宿主档案为准。', 'turns': [covered]}]}, ensure_ascii=False))
             messages = conversation_messages(body['messages'])
@@ -69,13 +72,18 @@ class LayeredContextAcceptance(dialogue_tools_test.DialogueToolsAcceptance):
             script += self.send(self.message(f'work-{i}', f'WORKSTEP-{i}: 当前项目第{i}步。' + ('独立步骤材料。' * 240), expected='已继续本项目。'))
         script += self.send(self.message('archive-query', '请查原始 ARCHIVE_BLUE_ROOT 档案并核验实际原文。', expected='已核验原始档案。'))
         try:
-            self.run_eve(script, interest=False, research=False, practice=False, timeout=180, env_extra=environment)
+            self.run_eve(script, interest=False, research=False, practice=False, panel=True, timeout=180, env_extra=environment)
         except Exception:
             print('LAYERED_FAILURE_TRACE ' + json.dumps({'queries': trace[-5:], 'provider_errors': self.errors,
                   'events': [v for v in (json.loads(line) for line in (self.work / f'events-{self.runs}.jsonl').read_text().splitlines()) if v.get('direction') == 'out'][-4:]}, ensure_ascii=False), flush=True)
             raise
         self.assertEqual(len(samples), 72)
-        self.assertEqual(digests, [], '分层工作集不能依靠每轮重新压缩才能装下')
+        self.assertFalse(any(line.startswith('EVE_CONTEXT_COMPACTION ')
+                             for line in self.panel_stderr.read_text().splitlines()),
+                         '分层请求不能依靠主动压缩才能装下；后台原前缀维护单独记录')
+        self.assertEqual(digests, sorted(set(digests)), '成功后台摘要的原前缀覆盖必须前进')
+        self.assertTrue(all(0 < covered <= 73 for covered in digests))
+        print('LAYERED_BACKGROUND_DIGESTS ' + json.dumps(digests), flush=True)
         self.assertTrue(references)
         context = next(v for k, v in observed if k == 'recall_context')
         self.assertIn('quartz-73852-ALPHA', context, '相关早期完整轮次应在工具检索前被选回')
