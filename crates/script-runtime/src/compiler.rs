@@ -10,6 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+// 编译器的地址空间上限是每进程的；跨会话也只能同时启动一个编译器，
+// 避免多个各自合法的编译叠加挤占宿主。排队仍服从原调用取消和期限。
+static COMPILE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 const FLAGS: &[&str] = &[
     "--edition=2021",
     "--crate-name=eve_plugin",
@@ -49,6 +53,13 @@ impl crate::Bubblewrap {
         if source.is_empty() || source.len() > MAX_SOURCE_BYTES {
             return Err(reject("Rust源码无效或超限"));
         }
+        let _compile_slot = guarded(
+            async { COMPILE_SLOTS.acquire().await.map_err(fail) },
+            context,
+            deadline,
+        )
+        .await?;
+        check_stop(context, deadline)?;
         let rustc = self
             .rustc
             .as_ref()
@@ -233,6 +244,47 @@ impl crate::Bubblewrap {
 mod tests {
     use super::*;
     use eve_llm_api::SharedToolSteps;
+    #[tokio::test]
+    async fn global_compiler_queue_obeys_cancellation_and_deadline_without_spending_steps() {
+        let _occupied = COMPILE_SLOTS.acquire().await.unwrap();
+        // 只测试准入；即使配置的可执行文件存在，也不得越过已占用的全局编译槽。
+        let mut sandbox =
+            crate::Bubblewrap::new("/usr/bin/true", "/usr/bin/true").with_rustc("/usr/bin/true");
+        sandbox.bwrap = "/usr/bin/true".into();
+        let steps = SharedToolSteps::new(1).unwrap();
+        let context = ToolExecutionContext::new().with_shared_steps(steps.clone());
+        let result = sandbox
+            .prepare_rust(
+                "fn main() {}",
+                &context,
+                Instant::now() + Duration::from_millis(25),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(eve_llm_api::ToolExecutionError::Cancelled(_))
+        ));
+        assert_eq!(steps.remaining().unwrap(), 1);
+        let cancellation = context.cancellation_handle();
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            cancellation.cancel();
+        };
+        let (result, ()) = tokio::join!(
+            sandbox.prepare_rust(
+                "fn main() {}",
+                &context,
+                Instant::now() + Duration::from_secs(1)
+            ),
+            cancel
+        );
+        assert!(matches!(
+            result,
+            Err(eve_llm_api::ToolExecutionError::Cancelled(_))
+        ));
+        assert_eq!(steps.remaining().unwrap(), 1);
+        assert!(sandbox.rust_cache.lock().unwrap().is_empty());
+    }
     #[tokio::test]
     async fn compiled_rust_cache_rejects_modified_artifact_without_recompiling() {
         let output = std::process::Command::new("rustc")

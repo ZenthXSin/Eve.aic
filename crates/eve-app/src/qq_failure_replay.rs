@@ -551,19 +551,24 @@ pub(crate) fn tools(
 mod tests {
     use super::*;
     use eve_kernel::{Kernel, KernelServices, backends::FileStateStore};
+    #[cfg(target_os = "linux")]
     use eve_script_runtime::{Language, ScriptSpec, StateSchema};
+    #[cfg(target_os = "linux")]
     use std::collections::BTreeMap;
+    #[cfg(target_os = "linux")]
     fn scope() -> ContextScope {
         ContextScope {
             session_id: "session".into(),
             user_id: "owner".into(),
         }
     }
+    #[cfg(target_os = "linux")]
     fn context() -> ToolExecutionContext {
         ToolExecutionContext::new()
             .with_scope(Some(scope()))
             .with_shared_steps(eve_llm_api::SharedToolSteps::new(20).unwrap())
     }
+    #[cfg(target_os = "linux")]
     fn spec(source: &str) -> ScriptSpec {
         ScriptSpec {
             name: "replay-demo".into(),
@@ -578,6 +583,7 @@ mod tests {
             initial_state: json!({}),
         }
     }
+    #[cfg(target_os = "linux")]
     fn sandbox() -> Bubblewrap {
         fn executable(name: &str) -> std::path::PathBuf {
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
@@ -599,6 +605,7 @@ mod tests {
         kernel.start_all().await.unwrap();
         (kernel, admin)
     }
+    #[cfg(target_os = "linux")]
     fn args(call_id: &str) -> Args {
         Args {
             action: "capture".into(),
@@ -609,6 +616,7 @@ mod tests {
             candidate: None,
         }
     }
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn real_failure_restart_scope_candidate_and_no_original_activation() {
         let root = tempfile::tempdir().unwrap();
@@ -872,7 +880,11 @@ mod tests {
             .unwrap();
         let service = Arc::new(Service {
             scripts: ScriptStore::open(root.path().join("scripts")).unwrap(),
-            sandbox: sandbox(),
+            // 纯账本与身份负例不执行子进程，不能要求Windows安装Linux bubblewrap。
+            sandbox: Bubblewrap::new(
+                std::env::current_exe().unwrap(),
+                std::env::current_exe().unwrap(),
+            ),
             state: state.clone(),
             tasks,
             lock: Mutex::new(()),

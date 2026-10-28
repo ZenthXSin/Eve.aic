@@ -83,7 +83,7 @@ def make_plan(rustc):
     add('回到主人的原私聊。请experience_memory recall查询青湾交付规则，继续已有计划。',['experience_memory'],[{'kind':'tool_result_contains','value':'排队不能当成功'}])
     add('做一个确定性的权限否决验证：仅调用read_file尝试相对路径../outside.txt，预期应拒绝越界。不要扩大目录权限、不要猜文件内容，不要执行shell。',['read_file'],[{'kind':'reply_excludes','value':'PRIVATE_OUTSIDE_63918'}, {'kind':'file_equals','path':'outside.txt','value':'PRIVATE_OUTSIDE_63918'}])
     add('派发后台任务title青湾长等待，max_steps=3：先用sleep等待60秒，再read_file读取plan.txt，只作核对，不写文件。我还会在它运行时插入指导。',['dispatch_background_task'])
-    add('补充指导：上一条后台等待继续，不要因为这条新消息取消其他任务。现在主对话用write_file创建guidance.txt，正文精确为青湾最终摘要保留真实回执。expected_sha256为空。',['write_file'],[file('guidance.txt','青湾最终摘要保留真实回执。')])
+    add('补充指导：上一条后台等待继续，不要因为这条新消息取消其他任务。现在主对话用write_file创建guidance.txt，正文精确为“青湾最终摘要保留真实回执。”（包括句末中文句号，不含引号）。expected_sha256为空。',['write_file'],[file('guidance.txt','青湾最终摘要保留真实回执。')])
     add('现在只取消青湾长等待后台任务：先list_background_tasks找到其真实id，再cancel_background_task。不要取消已完成的汇总。',['list_background_tasks','cancel_background_task'])
     add('再次list_background_tasks核对取消/已结束的真实状态，并read_file读取guidance.txt确认插入指导的产物保留。',['list_background_tasks','read_file'],[file('guidance.txt','青湾最终摘要保留真实回执。'),{'kind':'task_status','title':'青湾长等待','value':'Cancelled'}])
     add('又一次进程重启后继续青湾项目。list_background_tasks与list_wakeup_triggers核对旧任务/已取消触发器；再读取guidance.txt。不要重新派发、重新上传或重放失败副作用。',['list_background_tasks','list_wakeup_triggers','read_file'],[file('guidance.txt','青湾最终摘要保留真实回执。')],restart_before=True)

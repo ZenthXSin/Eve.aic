@@ -48,7 +48,7 @@ pub struct DeveloperConfig {
     /// 追加的命令策略规则文件（JSON）；内置规则始终生效。
     #[serde(default)]
     pub command_policy: Option<PathBuf>,
-    /// 需确认的命令交给行动审查者判断（宿主装配了审查者时）；关闭时退回由模型带 owner_confirmed。
+    /// 需确认的命令交给宿主装配的行动审查者判断；关闭或未装配时拒绝需审核的命令，owner_confirmed不能代替审核。
     #[serde(default = "enabled")]
     pub action_review: bool,
     #[serde(default = "cargo")]

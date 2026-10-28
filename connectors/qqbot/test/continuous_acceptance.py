@@ -288,7 +288,7 @@ class ContinuousTrial:
             return spec['value'] in json.dumps(record['tool_receipts'], ensure_ascii=False)
         if kind == 'task_status':
             tasks = docs.get('eve.task', {}).get('tasks.v1', {}).get('tasks', [])
-            return any(t.get('title') == spec['title'] and t.get('status') == spec['value'] for t in tasks)
+            return any(t.get('spec', {}).get('title') == spec['title'] and t.get('status') == spec['value'] for t in tasks)
         if kind == 'state_equals':
             value = docs
             for key in spec['path']:

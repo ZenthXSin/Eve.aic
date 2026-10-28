@@ -2,6 +2,7 @@
 import argparse
 import contextlib
 import hashlib
+import http.client
 import json
 import os
 import pathlib
@@ -12,6 +13,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import zipfile
 
@@ -64,24 +66,37 @@ def resource_worker(action, arguments):
     if action == 'download':
         url, destination, *limits = arguments
         maximum = int(limits[0]) if limits else MAX_NODE_ARCHIVE_BYTES
-        with urllib.request.urlopen(url, timeout=30) as response, open(destination, 'wb') as output:
-            expected = response.headers.get('Content-Length')
-            if expected is not None and (int(expected) < 0 or int(expected) > maximum):
-                raise ValueError('node_archive_content_length_limit')
-            print(json.dumps(dict(packaging_stage='download_node', event='headers',
-                                  content_length=int(expected) if expected is not None else None)), flush=True)
-            total, reported = 0, time.monotonic()
-            while chunk := response.read(1024 * 1024):
-                total += len(chunk)
-                if total > maximum:
-                    raise ValueError('node_archive_bytes_limit')
-                output.write(chunk)
-                if time.monotonic() - reported >= 5:
-                    print(json.dumps(dict(packaging_stage='download_node', event='progress', bytes=total)), flush=True)
+        for attempt in range(1, 4):
+            total = 0
+            try:
+                # 重连从头覆盖临时文件；不会把两次响应拼接，也不会延长父进程的120秒总期限。
+                with urllib.request.urlopen(url, timeout=30) as response, open(destination, 'wb') as output:
+                    expected = response.headers.get('Content-Length')
+                    if expected is not None and (int(expected) < 0 or int(expected) > maximum):
+                        raise ValueError('node_archive_content_length_limit')
+                    print(json.dumps(dict(packaging_stage='download_node', event='headers', attempt=attempt,
+                                          content_length=int(expected) if expected is not None else None)), flush=True)
                     reported = time.monotonic()
-            if expected is not None and total != int(expected):
-                raise ValueError('node_archive_incomplete')
-            print(json.dumps(dict(packaging_stage='download_node', event='received', bytes=total)), flush=True)
+                    while chunk := response.read(1024 * 1024):
+                        total += len(chunk)
+                        if total > maximum:
+                            raise ValueError('node_archive_bytes_limit')
+                        output.write(chunk)
+                        if time.monotonic() - reported >= 5:
+                            print(json.dumps(dict(packaging_stage='download_node', event='progress', attempt=attempt, bytes=total)), flush=True)
+                            reported = time.monotonic()
+                    if expected is not None and total != int(expected):
+                        raise http.client.IncompleteRead(b'', int(expected) - total)
+                    print(json.dumps(dict(packaging_stage='download_node', event='received', attempt=attempt, bytes=total)), flush=True)
+                    return
+            except (TimeoutError, ConnectionError, http.client.IncompleteRead, urllib.error.URLError) as error:
+                if isinstance(error, urllib.error.HTTPError) and error.code not in (408, 429, 500, 502, 503, 504):
+                    raise
+                if attempt == 3:
+                    raise
+                print(json.dumps(dict(packaging_stage='download_node', event='retry', attempt=attempt,
+                                      max_attempts=3, bytes=total, error=type(error).__name__)), flush=True)
+                time.sleep(attempt)
     elif action == 'extract':
         archive, directory = map(pathlib.Path, arguments)
         if archive.suffix == '.zip':

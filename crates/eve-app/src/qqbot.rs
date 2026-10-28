@@ -854,6 +854,21 @@ async fn run_qqbot_composed(
         )?,
         ..KernelServices::default()
     };
+    // 必须早于主体恢复/其他插件启动：坏QQ回执不能因旁账本启动写入而改变state.json原字节。
+    if let Some(bytes) = backends.state.get(
+        &PluginId::new(eve_qqbot_plugin::QQBOT_PLUGIN_ID)?,
+        "receipts.v1",
+    )? {
+        eve_qqbot_plugin::validate_receipt_state(&bytes)?;
+    }
+    if options.autonomy_budget.is_some()
+        && let Some(bytes) = backends.state.get(
+            &PluginId::new(BUDGET_PLUGIN_ID)?,
+            eve_budget_api::BUDGET_STATE_KEY,
+        )?
+    {
+        eve_budget_plugin::validate_state(&bytes)?;
+    }
     let registry = backends.registry.clone();
     let permissions = backends.permissions.clone();
     let logger = backends.logger.clone();
@@ -1176,8 +1191,6 @@ async fn run_qqbot_composed(
         let subject_plugin = eve_subject_plugin::SubjectPlugin::new()?;
         let subject: Arc<dyn eve_subject_api::SubjectAdmin> = Arc::new(subject_plugin.controller());
         kernel.register(Box::new(subject_plugin))?;
-        kernel.start(&PluginId::new(eve_subject_api::SUBJECT_PLUGIN_ID)?).await?;
-        subject.abandon_pending_kind("work_admission", qq_tasks::now_ms())?;
         let subject_admission = Arc::new(crate::qq_subject_admission::Admission(subject.clone()));
         plugin = plugin.with_admission(subject_admission.clone());
         let memory: Option<Arc<dyn MemoryAdmin>> = if options.memory {
@@ -2968,6 +2981,9 @@ async fn run_qqbot_composed(
         kernel.register(Box::new(relation))?;
         kernel.register(Box::new(MessageRouterPlugin::builtin()?))?;
         kernel.register(Box::new(plugin))?;
+        // 完成组合配置和各账本读取后才恢复主体，避免错误启动改写其他损坏状态。
+        kernel.start(&PluginId::new(eve_subject_api::SUBJECT_PLUGIN_ID)?).await?;
+        subject.abandon_pending_kind("work_admission", qq_tasks::now_ms())?;
         kernel.start(&PluginId::new(QQBOT_PLUGIN_ID)?).await?;
         let handle = registry
             .get(&ServiceId::new(QQBOT_STATUS_SERVICE_ID)?)?

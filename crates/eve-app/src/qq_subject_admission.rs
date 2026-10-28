@@ -16,6 +16,21 @@ fn scope(key: &SessionKey) -> SubjectScope {
 fn error(e: impl ToString) -> PluginError {
     PluginError::State(e.to_string())
 }
+// 平台消息ID有独立的UTF-8容量契约；主体来源键不能用加前缀后的原文越过256字节。
+// 短来源保留既有持久键，长来源使用完整字节摘要，拒绝截断引起的碰撞。
+fn source_key(source: &str) -> String {
+    if source.len() <= 200 {
+        return source.into();
+    }
+    let hash = ring::digest::digest(&ring::digest::SHA256, source.as_bytes());
+    format!(
+        "source-sha256:{}",
+        hash.as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    )
+}
 impl Admission {
     pub(crate) fn begin_work(
         &self,
@@ -31,7 +46,7 @@ impl Admission {
                 SubjectEventInput {
                     scope: scope(key),
                     source: origin,
-                    dedupe_key: source.into(),
+                    dedupe_key: source_key(source),
                     priority,
                     kind: "work_admission".into(),
                     payload: String::new(),
@@ -153,7 +168,8 @@ impl QqAdmission for Admission {
     fn abandon(&self, key: &SessionKey, source: &str) -> PluginResult<()> {
         let scope = scope(key);
         for event in self.0.snapshot_for(&scope).map_err(error)?.events {
-            if event.input.kind == "work_admission" && event.input.dedupe_key == source {
+            if event.input.kind == "work_admission" && event.input.dedupe_key == source_key(source)
+            {
                 self.0
                     .cancel_queued_event(&scope, &event.id, crate::qq_tasks::now_ms())
                     .map_err(error)?;
@@ -167,7 +183,7 @@ impl QqAdmission for Admission {
                 SubjectEventInput {
                     scope: scope(key),
                     source: EventSource::TaskExecutor,
-                    dedupe_key: format!("outcome:{source}"),
+                    dedupe_key: source_key(&format!("outcome:{source}")),
                     priority: EventPriority::Recovery,
                     kind: "dialogue_lifecycle".into(),
                     payload: if known {
@@ -364,6 +380,28 @@ mod tests {
         assert_eq!(
             admission.0.snapshot_for(&scope(&key("a"))).unwrap().events[0].status,
             EventStatus::Completed
+        );
+    }
+    #[tokio::test]
+    async fn long_utf8_sources_keep_distinct_identity_and_cancel_lookup() {
+        let (_kernel, admission) = open(Arc::new(MemoryStateStore::default())).await;
+        let a = format!("qq:{}a", "群".repeat(170));
+        let b = format!("qq:{}b", "群".repeat(170));
+        assert_ne!(source_key(&a), source_key(&b));
+        assert_eq!(source_key("qq:short"), "qq:short");
+        let ticket = admission.begin(&key("a"), &a).unwrap().unwrap();
+        assert!(admission.begin(&key("b"), &b).unwrap().is_none());
+        admission.abandon(&key("b"), &b).unwrap();
+        admission
+            .finish(&ticket, QqAdmissionResult::Started)
+            .unwrap();
+        admission.completed(&key("a"), &a, true).unwrap();
+        let events = admission.0.snapshot_for(&scope(&key("a"))).unwrap().events;
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| e.input.dedupe_key.len() <= 256));
+        assert_eq!(
+            admission.0.snapshot_for(&scope(&key("b"))).unwrap().events[0].status,
+            EventStatus::Cancelled
         );
     }
 }

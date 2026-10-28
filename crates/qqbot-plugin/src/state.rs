@@ -342,7 +342,7 @@ impl Ledger {
         }
     }
     /// 严格解析；任何不一致都视为损坏，调用方保留原字节。
-    fn decode(bytes: &[u8]) -> PluginResult<Self> {
+    pub(crate) fn decode(bytes: &[u8]) -> PluginResult<Self> {
         if bytes.len() > MAX_BYTES {
             return Err(corrupt());
         }

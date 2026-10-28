@@ -21,6 +21,9 @@ struct Gate {
     calls: AtomicUsize,
     unknown: AtomicBool,
     delay: AtomicBool,
+    pause: AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
     revoke_after_first: AtomicBool,
     identities: Mutex<Vec<ContextScope>>,
     paths: Mutex<Vec<PathBuf>>,
@@ -32,6 +35,9 @@ impl Gate {
             calls: AtomicUsize::new(0),
             unknown: AtomicBool::new(false),
             delay: AtomicBool::new(false),
+            pause: AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
             revoke_after_first: AtomicBool::new(false),
             identities: Mutex::new(vec![]),
             paths: Mutex::new(vec![]),
@@ -62,6 +68,10 @@ impl AuthorizedToolDispatch for Gate {
             if let Some(path) = call.arguments["path"].as_str() {
                 assert!(Path::new(path).is_file());
                 self.paths.lock().unwrap().push(path.into());
+            }
+            if self.pause.load(Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
             }
             if self.delay.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1150,25 +1160,24 @@ fn rust_spec(name: &str, value: i32, delay: u64) -> ScriptSpec {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn rust_candidate_compiles_separately_and_hot_switch_keeps_inflight_version() {
-    let (_root, store, _, runtime) = setup_with_sandbox(rust_sandbox());
+    let (_root, store, gate, runtime) = setup_with_sandbox(rust_sandbox());
+    let mut old_spec = rust_spec("rust-hot", 1, 0);
+    old_spec.tools = vec!["qq.send_file".into()];
+    old_spec.source = r####"use std::io::{self,Write};fn main(){let mut input=String::new();io::stdin().read_line(&mut input).unwrap();println!("{}",r#"{"op":"tool","name":"qq.send_file","arguments":{}}"#);io::stdout().flush().unwrap();input.clear();io::stdin().read_line(&mut input).unwrap();println!("{}",r#"{"op":"return","value":1}"#);}"####.into();
     let old = runtime
-        .publish_candidate(rust_spec("rust-hot", 1, 400), context(1))
+        .publish_candidate(old_spec, context(1))
         .await
         .unwrap();
     store.activate(&owner(), &old.reference, None).unwrap();
-    let new = runtime
-        .publish_candidate(rust_spec("rust-hot", 2, 0), context(1))
-        .await
-        .unwrap();
     let bound_old = runtime.bind(&owner(), &old.reference).unwrap();
-    let old_run = runtime.run(&bound_old, "rust-inflight", json!({}), context(1));
+    gate.pause.store(true, Ordering::SeqCst);
+    let old_run = runtime.run(&bound_old, "rust-inflight", json!({}), context(2));
     let switch = async {
-        loop {
-            if store.receipt(&owner(), "rust-inflight").is_ok() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        gate.entered.notified().await;
+        let new = runtime
+            .publish_candidate(rust_spec("rust-hot", 2, 0), context(1))
+            .await
+            .unwrap();
         store.activate(&owner(), &new.reference, None).unwrap();
         let result = runtime
             .run(
@@ -1183,20 +1192,27 @@ async fn rust_candidate_compiles_separately_and_hot_switch_keeps_inflight_versio
             store.receipt(&owner(), "rust-inflight").unwrap().status,
             ReceiptStatus::Running
         );
-        result
+        gate.pause.store(false, Ordering::SeqCst);
+        gate.release.notify_one();
+        (new.reference, result)
     };
-    let (old_result, new_result) = tokio::join!(old_run, switch);
+    let (old_result, new_result) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(old_run, switch)
+    })
+    .await
+    .expect("真实旧进程门闸/新版本调用必须在期限内完成");
+    let (new_reference, new_result) = new_result;
     assert_eq!(old_result.unwrap().result, Some(json!(1)));
     assert_eq!(new_result.result, Some(json!(2)));
-    assert_eq!(store.selected(&owner(), "rust-hot").unwrap(), new.reference);
+    assert_eq!(store.selected(&owner(), "rust-hot").unwrap(), new_reference);
     assert_eq!(
-        store.state(&owner(), &new.reference).unwrap().value,
+        store.state(&owner(), &new_reference).unwrap().value,
         json!({})
     );
     store.activate(&owner(), &old.reference, None).unwrap();
     assert_eq!(
         runtime
-            .run(&bound_old, "rust-rollback", json!({}), context(1))
+            .run(&bound_old, "rust-rollback", json!({}), context(2))
             .await
             .unwrap()
             .result,

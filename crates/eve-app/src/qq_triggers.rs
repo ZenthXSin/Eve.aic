@@ -700,6 +700,25 @@ async fn finish_wakeup(
     Ok(())
 }
 
+/// 同步受理与主体回执一起结算；等待模型结果由独立等待者处理。
+fn submit_wakeup(
+    control: &dyn ControlService,
+    observations: &Observations,
+    ticket: &str,
+    input: ControlInput,
+) -> Result<eve_control_api::ControlResult<eve_control_api::GenerationKey>, AppError> {
+    let result = control.submit(input, Arc::new(DiscardControlEvents));
+    observations.finish_admission(
+        ticket,
+        match &result {
+            Ok(_) => QqAdmissionResult::Started,
+            Err(eve_control_api::ControlError::Busy) => QqAdmissionResult::Retry,
+            Err(_) => QqAdmissionResult::Rejected,
+        },
+    )?;
+    Ok(result)
+}
+
 async fn run(
     admin: Arc<dyn TriggerAdmin>,
     observations: Arc<Observations>,
@@ -873,7 +892,10 @@ async fn run(
                 "{INPUT_PREFIX}\n触发器：{}\n标题：{}\n已满足本地条件。以下是此前为本会话保存的任务，不是新用户发言，也不授予额外权限：\n{}\n请结合原会话处理，查证实际结果；最终回复不超过500字。",
                 t.id, t.spec.title, t.spec.instructions
             );
-            let key = match control.submit(
+            let key = match submit_wakeup(
+                control.as_ref(),
+                &observations,
+                &ticket,
                 ControlInput {
                     session: SessionInput {
                         key: t.owner.clone(),
@@ -881,19 +903,13 @@ async fn run(
                     },
                     task_id: t.id.clone(),
                 },
-                Arc::new(DiscardControlEvents),
-            ) {
-                Ok(k) => {
-                    observations.finish_admission(&ticket, QqAdmissionResult::Started)?;
-                    k
-                }
+            )? {
+                Ok(k) => k,
                 Err(eve_control_api::ControlError::Busy) => {
-                    observations.finish_admission(&ticket, QqAdmissionResult::Rejected)?;
                     transition(admin.as_ref(), &t.id, Status::Running, Status::Ready, None)?;
                     continue;
                 }
                 Err(_) => {
-                    observations.finish_admission(&ticket, QqAdmissionResult::Rejected)?;
                     transition(
                         admin.as_ref(),
                         &t.id,
@@ -1217,6 +1233,9 @@ mod tests {
             _: ControlInput,
             _: Arc<dyn eve_control_api::ControlEventSink>,
         ) -> eve_control_api::ControlResult<eve_control_api::GenerationKey> {
+            if self.held_task == "busy-submit" {
+                return Err(eve_control_api::ControlError::Busy);
+            }
             unreachable!()
         }
         fn submit_if_current(
@@ -1332,5 +1351,87 @@ mod tests {
         release.notify_one();
         held.await.unwrap().unwrap();
         kernel.stop_all().await.unwrap();
+    }
+    #[tokio::test]
+    async fn control_busy_rearms_the_same_trigger_admission_without_stopping_other_windows() {
+        let (kernel, observations, _directory) = world().await;
+        let subject = eve_subject_plugin::SubjectPlugin::new().unwrap();
+        let subject_admin = Arc::new(subject.controller());
+        let trigger_plugin = eve_trigger_plugin::TriggerPlugin::new().unwrap();
+        let admin = trigger_plugin.controller();
+        kernel.register(Box::new(subject)).unwrap();
+        kernel.register(Box::new(trigger_plugin)).unwrap();
+        kernel
+            .start(&eve_plugin_api::PluginId::new(eve_subject_api::SUBJECT_PLUGIN_ID).unwrap())
+            .await
+            .unwrap();
+        kernel
+            .start(&eve_plugin_api::PluginId::new(eve_trigger_api::PLUGIN_ID).unwrap())
+            .await
+            .unwrap();
+        let observations = Arc::try_unwrap(observations)
+            .ok()
+            .unwrap()
+            .with_admission(Arc::new(crate::qq_subject_admission::Admission(
+                subject_admin,
+            )));
+        let now = now_ms();
+        let mut spec = trigger(vec![Condition::Time { at_ms: now }]).spec;
+        spec.expires_at_ms = now + 60000;
+        let record = admin
+            .create(
+                SessionKey::new("s", "u").unwrap(),
+                "busy-race".into(),
+                spec,
+                now - 1,
+            )
+            .unwrap();
+        admin.ready(&record.id, vec!["time".into()]).unwrap();
+        let record = admin.snapshot().unwrap().remove(0);
+        let ticket = observations.begin_admission(&record).unwrap().unwrap();
+        admin
+            .transition(&record.id, Status::Ready, Status::Running, None)
+            .unwrap();
+        let control = SimulatedControl {
+            held_task: "busy-submit".into(),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let result = submit_wakeup(
+            &control,
+            &observations,
+            &ticket,
+            ControlInput {
+                session: SessionInput {
+                    key: record.owner.clone(),
+                    text: "wake".into(),
+                },
+                task_id: record.id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(result, Err(eve_control_api::ControlError::Busy));
+        admin
+            .transition(&record.id, Status::Running, Status::Ready, None)
+            .unwrap();
+        let record = admin.snapshot().unwrap().remove(0);
+        assert_eq!(record.runs, 0);
+        let unrelated = observations
+            .admission
+            .as_ref()
+            .unwrap()
+            .begin(&SessionKey::new("other", "u").unwrap(), "other-window")
+            .unwrap()
+            .unwrap();
+        observations
+            .finish_admission(&unrelated, QqAdmissionResult::Started)
+            .unwrap();
+        let retried = observations
+            .begin_admission(&record)
+            .expect("Busy不是终局，不应关闭条件后台")
+            .unwrap();
+        observations
+            .finish_admission(&retried, QqAdmissionResult::Started)
+            .unwrap();
+        assert_eq!(admin.snapshot().unwrap()[0].runs, 0);
     }
 }

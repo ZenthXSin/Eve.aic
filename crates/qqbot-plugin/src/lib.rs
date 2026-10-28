@@ -9,6 +9,11 @@ pub use live::LiveDialogue;
 mod admission;
 mod observer;
 pub use admission::{QqAdmission, QqAdmissionResult};
+/// 组合层在启动任何可写服务前核验既有回执；复用正式加载器，绝不修复或重写原字节。
+pub fn validate_receipt_state(bytes: &[u8]) -> eve_plugin_api::PluginResult<()> {
+    state::Ledger::decode(bytes).map(|_| ())
+}
+
 mod outreach;
 mod participants;
 mod progress;

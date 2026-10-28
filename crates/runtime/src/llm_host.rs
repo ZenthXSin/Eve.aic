@@ -1843,24 +1843,61 @@ async fn run_tool(
         timeout,
         grace,
     } = config;
+    let deadline = context.deadline().map_or_else(
+        || std::time::Instant::now() + timeout,
+        |parent| parent.min(std::time::Instant::now() + timeout),
+    );
     let _ticket = ticket;
-    if let Some(ticket) = &_ticket {
-        ticket.wait_turn().await;
+    let cancellation: ToolCancellation = context.cancellation_handle();
+    if context.is_cancel_requested() {
+        return tool_failure(&call, ToolFailureCode::Cancelled, "工具准入已取消；未执行");
     }
-    let permit: OwnedSemaphorePermit = semaphore.acquire_owned().await.expect("semaphore lives");
+    if std::time::Instant::now() >= deadline {
+        return tool_failure(
+            &call,
+            ToolFailureCode::TimedOut,
+            "工具准入期限已耗尽；未执行",
+        );
+    }
+    let acquire = async {
+        if let Some(ticket) = &_ticket {
+            ticket.wait_turn().await;
+        }
+        semaphore.acquire_owned().await.expect("semaphore lives")
+    };
+    let permit: OwnedSemaphorePermit = tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline.into()) => {
+            cancellation.cancel();
+            return tool_failure(&call, ToolFailureCode::TimedOut, "工具排队期限已耗尽；未执行");
+        }
+        _ = tool_cancelled(&context) => return tool_failure(&call, ToolFailureCode::Cancelled, "等待中的工具已取消；未执行"),
+        permit = acquire => permit,
+    };
+    if context.is_cancel_requested() || std::time::Instant::now() >= deadline {
+        return tool_failure(
+            &call,
+            ToolFailureCode::TimedOut,
+            "工具准入已取消或到期；未执行",
+        );
+    }
     let current = active.fetch_add(1, Ordering::SeqCst) + 1;
     started.fetch_add(1, Ordering::SeqCst);
     peak.fetch_max(current, Ordering::SeqCst);
     let _active_guard = ActiveExecutionGuard { active };
-    let cancellation: ToolCancellation = context.cancellation_handle();
+    let stop_context = context.clone();
     let future = tool.execute(call.clone(), context);
     tokio::pin!(future);
     let value = tokio::select! {
         biased;
-        _ = tokio::time::sleep(timeout) => {
+        _ = tokio::time::sleep_until(deadline.into()) => {
             cancellation.cancel();
             let _ = tokio::time::timeout(grace, &mut future).await;
             ToolResult::failure(call.id, ToolFailureCode::TimedOut, "tool execution timed out")
+        }
+        _ = tool_cancelled(&stop_context) => {
+            let _ = tokio::time::timeout(grace, &mut future).await;
+            ToolResult::failure(call.id, ToolFailureCode::Cancelled, "tool execution cancelled")
         }
         result = &mut future => match result {
             Ok(value) => ToolResult::success(call.id, value),
@@ -1876,6 +1913,12 @@ async fn run_tool(
     };
     drop(permit);
     value.expect("call id validated")
+}
+
+async fn tool_cancelled(context: &ToolExecutionContext) {
+    while !context.is_cancel_requested() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 struct ToolRunConfig {
@@ -2218,6 +2261,87 @@ mod tests {
             assert_eq!(data["count"], 1);
             assert_eq!(data["tools"][0]["name"], "github_api");
         }
+    }
+
+    #[tokio::test]
+    async fn expired_tool_deadline_never_polls_side_effecting_tool() {
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let result = run_tool(
+            Arc::new(EchoTool {
+                active: Arc::new(AtomicUsize::new(0)),
+                peak: peak.clone(),
+            }),
+            ToolCall {
+                id: "expired".into(),
+                name: "echo".into(),
+                arguments: json!({"value":1}),
+            },
+            ToolExecutionContext::new()
+                .with_deadline(Some(std::time::Instant::now() - Duration::from_secs(1))),
+            ToolRunConfig {
+                semaphore: Arc::new(Semaphore::new(1)),
+                ticket: None,
+                started: started.clone(),
+                active: Arc::new(AtomicUsize::new(0)),
+                peak: Arc::new(AtomicUsize::new(0)),
+                timeout: Duration::from_secs(1),
+                grace: Duration::from_millis(10),
+            },
+        )
+        .await;
+        assert!(matches!(
+            result.output,
+            ToolOutput::Failure {
+                code: ToolFailureCode::TimedOut,
+                ..
+            }
+        ));
+        assert_eq!(peak.load(Ordering::SeqCst), 0);
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_tool_deadline_expires_without_waiting_for_an_execution_slot() {
+        let slots = Arc::new(Semaphore::new(1));
+        let occupied = slots.clone().acquire_owned().await.unwrap();
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let waiting = run_tool(
+            Arc::new(EchoTool {
+                active: Arc::new(AtomicUsize::new(0)),
+                peak: peak.clone(),
+            }),
+            ToolCall {
+                id: "queued".into(),
+                name: "echo".into(),
+                arguments: json!({"value":1}),
+            },
+            ToolExecutionContext::new()
+                .with_deadline(Some(std::time::Instant::now() + Duration::from_millis(20))),
+            ToolRunConfig {
+                semaphore: slots,
+                ticket: None,
+                started: started.clone(),
+                active: Arc::new(AtomicUsize::new(0)),
+                peak: Arc::new(AtomicUsize::new(0)),
+                timeout: Duration::from_secs(1),
+                grace: Duration::from_millis(10),
+            },
+        );
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("排队期限必须生效");
+        assert!(matches!(
+            result.output,
+            ToolOutput::Failure {
+                code: ToolFailureCode::TimedOut,
+                ..
+            }
+        ));
+        assert_eq!(peak.load(Ordering::SeqCst), 0);
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+        drop(occupied);
     }
 
     struct ContextImpl;

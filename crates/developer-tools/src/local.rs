@@ -44,6 +44,12 @@ fn sensitive_path(path: &str) -> bool {
         _ => true,
     })
 }
+fn stopped(context: &ToolExecutionContext) -> bool {
+    context.is_cancel_requested()
+        || context
+            .deadline()
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+}
 fn failed(message: impl Into<String>) -> ToolExecutionError {
     ToolExecutionError::Failed(message.into())
 }
@@ -274,7 +280,7 @@ impl LocalDeveloper {
         self.command_policy = Some(policy);
         self
     }
-    /// 策略要求确认的命令交给审查者按用户原话判断；不配置时由模型带 owner_confirmed。
+    /// 策略要求确认的命令交给审查者按用户原话判断；不配置时拒绝执行，owner_confirmed不能代替审核。
     pub fn with_action_reviewer(mut self, reviewer: std::sync::Arc<dyn ActionReviewer>) -> Self {
         self.action_reviewer = Some(reviewer);
         self
@@ -284,7 +290,7 @@ impl LocalDeveloper {
         self
     }
     fn authorize(&self, context: &ToolExecutionContext) -> Result<(), ToolExecutionError> {
-        if context.is_cancel_requested() {
+        if stopped(context) {
             return Err(ToolExecutionError::Cancelled("开发操作已取消".into()));
         }
         if context.scope().is_none_or(|s| {
@@ -303,6 +309,9 @@ impl LocalDeveloper {
         operation: &DeveloperOperation,
         context: &ToolExecutionContext,
     ) -> Result<(), ToolExecutionError> {
+        if stopped(context) {
+            return Err(ToolExecutionError::Cancelled("开发操作已取消或到期".into()));
+        }
         if self.member_operation(operation, context) {
             return Ok(());
         }
@@ -310,7 +319,7 @@ impl LocalDeveloper {
             && self.config.github
             && self.config.github_all_users
         {
-            if context.is_cancel_requested() {
+            if stopped(context) {
                 return Err(ToolExecutionError::Cancelled("开发操作已取消".into()));
             }
             if context.scope().is_none_or(|s| s.user_id.trim().is_empty()) {
@@ -318,7 +327,7 @@ impl LocalDeveloper {
             }
             return Ok(());
         }
-        if context.is_cancel_requested() {
+        if stopped(context) {
             return Err(ToolExecutionError::Cancelled("操作已取消".into()));
         }
         let ordinary = match operation {
@@ -452,7 +461,7 @@ impl LocalDeveloper {
         tmp.write_all(content)
             .and_then(|_| tmp.as_file().sync_all())
             .map_err(|_| failed("文件写入失败，原文件保留"))?;
-        if context.is_cancel_requested() {
+        if stopped(context) {
             return Err(ToolExecutionError::Cancelled("文件提交已取消".into()));
         }
         // 防止在写临时文件期间被外部编辑覆盖。
@@ -582,7 +591,7 @@ impl LocalDeveloper {
                 }
             }
         }
-        if context.is_cancel_requested() {
+        if stopped(context) {
             return Err(ToolExecutionError::Cancelled("补丁已取消，未修改".into()));
         }
         steps.sort_by_key(|step| matches!(step, Step::Delete { .. }));
@@ -590,6 +599,12 @@ impl LocalDeveloper {
         let mut results = Vec::new();
         let mut failure = None;
         for step in &steps {
+            if stopped(context) {
+                failure = Some(ToolExecutionError::Cancelled(
+                    "补丁已取消或到期，恢复已提交部分".into(),
+                ));
+                break;
+            }
             let outcome = match step {
                 Step::Write {
                     path,
@@ -971,6 +986,11 @@ impl LocalDeveloper {
         }
         #[cfg(unix)]
         command.process_group(0);
+        if stopped(context) {
+            return Err(ToolExecutionError::Cancelled(
+                "命令准入已取消或到期；未启动".into(),
+            ));
+        }
         let mut child = command
             .spawn()
             .map_err(|_| failed("程序无法启动；检查 program 与构建环境"))?;
@@ -1348,7 +1368,7 @@ impl DeveloperBackend for LocalDeveloper {
 }
 async fn cancelled(context: &ToolExecutionContext) {
     loop {
-        if context.is_cancel_requested() {
+        if stopped(context) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;

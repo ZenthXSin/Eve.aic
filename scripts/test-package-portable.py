@@ -28,6 +28,9 @@ class PackagingResourceTests(unittest.TestCase):
 
             def do_GET(self):
                 outer.requests.append(self.path)
+                if self.path == '/missing':
+                    self.send_error(404)
+                    return
                 self.send_response(200)
                 if self.path == '/slow':
                     self.send_header('Content-Length', '1000')
@@ -44,6 +47,8 @@ class PackagingResourceTests(unittest.TestCase):
                             self.wfile.flush()
                             if outer.stopped.wait(.1):
                                 break
+                    elif self.path == '/retry' and outer.requests.count('/retry') == 1:
+                        self.wfile.write(b'partial')
                     else:
                         self.wfile.write(b'x' * (64 if self.path == '/no-length' else 16))
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -73,6 +78,19 @@ class PackagingResourceTests(unittest.TestCase):
             builder.worker('download', self.url + '/slow', self.root / 'partial', timeout=2, capture_output=True)
         self.assertLess(time.monotonic() - started, 5)
         self.assertIn('/slow', self.requests)
+
+    def test_interrupted_response_retries_from_zero_within_the_same_worker_deadline(self):
+        output = self.root / 'retried'
+        result = builder.worker('download', self.url + '/retry', output, timeout=5, capture_output=True)
+        self.assertEqual(output.read_bytes(), b'x' * 16)
+        self.assertEqual(self.requests.count('/retry'), 2)
+        self.assertIn(b'"event": "retry"', result.stdout)
+        self.assertIn(b'"attempt": 2', result.stdout)
+
+    def test_permanent_http_error_is_not_retried(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            builder.worker('download', self.url + '/missing', self.root / 'missing', timeout=5, capture_output=True)
+        self.assertEqual(self.requests.count('/missing'), 1)
 
     def test_download_rejects_oversized_header_before_writing(self):
         output = self.root / 'oversized'

@@ -231,6 +231,36 @@ impl PrefixRulePolicy {
                 self.evaluate_semantics(&args[position..], matches, depth + 1);
             }
         }
+        if SHELLS.contains(&base) && args.iter().any(|a| a.starts_with('-') && a.contains('c')) {
+            if depth >= 8 {
+                matches.push(CommandRuleMatch {
+                    matched_prefix: vec![base.into()],
+                    decision: CommandDecision::Prompt,
+                    justification: Some("shell嵌套层级过深，执行前审核完整命令".into()),
+                });
+                return;
+            }
+            let commands = shell_script(&command[0], args);
+            if commands.is_none()
+                || args
+                    .iter()
+                    .any(|a| a.contains(['$', '`', '\n', '(', ')', '{', '}', '<', '>']))
+            {
+                matches.push(CommandRuleMatch {
+                    matched_prefix: command.to_vec(),
+                    decision: CommandDecision::Prompt,
+                    justification: Some(
+                        "脚本包含动态展开、重定向或无法静态解析的语法，执行前必须审核完整命令"
+                            .into(),
+                    ),
+                });
+            }
+            if let Some(commands) = commands {
+                for child in commands {
+                    self.evaluate_semantics(&child, matches, depth + 1);
+                }
+            }
+        }
     }
 
     fn evaluate_one(&self, command: &[String], matches: &mut Vec<CommandRuleMatch>) {
@@ -301,33 +331,7 @@ impl CommandPolicy for PrefixRulePolicy {
         let mut matches = Vec::new();
         let mut whole = vec![program.to_string()];
         whole.extend(args.iter().cloned());
-        self.evaluate_one(&whole, &mut matches);
         self.evaluate_semantics(&whole, &mut matches, 0);
-        if let Some(commands) = shell_script(program, args) {
-            for command in commands {
-                self.evaluate_semantics(&command, &mut matches, 0);
-            }
-        }
-        let base = Path::new(program)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(program);
-        if SHELLS.contains(&base) && args.iter().any(|a| a.starts_with('-') && a.contains('c')) {
-            let uncertain = shell_script(program, args).is_none()
-                || args
-                    .iter()
-                    .any(|a| a.contains(['$', '`', '\n', '(', ')', '{', '}', '<', '>']));
-            if uncertain {
-                matches.push(CommandRuleMatch {
-                    matched_prefix: whole.clone(),
-                    decision: CommandDecision::Prompt,
-                    justification: Some(
-                        "脚本包含动态展开、重定向或无法静态解析的语法，执行前必须审核完整命令"
-                            .into(),
-                    ),
-                });
-            }
-        }
         CommandEvaluation {
             decision: matches.iter().map(|m| m.decision).max(),
             matches,
@@ -407,6 +411,42 @@ mod tests {
             Some(CommandDecision::Forbidden)
         );
         assert_eq!(decide(&policy, "git -C repo status"), None);
+    }
+
+    #[test]
+    fn nested_shells_preserve_forbidden_and_dynamic_review_decisions() {
+        let policy = PrefixRulePolicy::builtin();
+        assert_eq!(
+            policy
+                .evaluate("sh", &["-c".into(), "sh -c reboot".into()])
+                .decision,
+            Some(CommandDecision::Forbidden)
+        );
+        assert_eq!(
+            policy
+                .evaluate("bash", &["-lc".into(), "sh -c 'git reset --hard'".into()])
+                .decision,
+            Some(CommandDecision::Prompt)
+        );
+        assert_eq!(
+            policy
+                .evaluate("sh", &["-c".into(), "sh -c 'echo $HOME'".into()])
+                .decision,
+            Some(CommandDecision::Prompt)
+        );
+        let mut nested = "reboot".to_owned();
+        for _ in 0..12 {
+            nested = shlex::try_join(["sh", "-c", &nested]).unwrap();
+        }
+        assert!(
+            policy.evaluate("sh", &["-c".into(), nested]).decision >= Some(CommandDecision::Prompt)
+        );
+        assert_eq!(
+            policy
+                .evaluate("sh", &["-c".into(), "sh -c 'echo hello'".into()])
+                .decision,
+            None
+        );
     }
 
     #[test]

@@ -18,6 +18,11 @@ use std::{
 };
 use store::StoredBudget;
 
+/// 在其他插件恢复写入前严格只读核验已有预算账本。
+pub fn validate_state(bytes: &[u8]) -> BudgetResult<()> {
+    store::validate_state(bytes)
+}
+
 /// 预算句柄只交给可信宿主；不发布到通用服务目录。
 #[derive(Clone, Default)]
 pub struct BudgetController {

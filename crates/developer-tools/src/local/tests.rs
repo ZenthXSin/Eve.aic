@@ -1585,3 +1585,30 @@ async fn review_overflow_and_audit_failure_never_execute_a_command() {
     assert!(format!("{error:?}").contains("审计不可写"));
     assert!(!root.path().join("careful-never").exists());
 }
+
+#[tokio::test]
+async fn expired_context_cannot_write_or_pass_developer_preflight() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let backend = LocalDeveloper::new(config(root.path()), ledger.path().into(), None).unwrap();
+    let mut arguments = file("expired.txt");
+    arguments.content = Some("must not be committed".into());
+    arguments.expected_sha256 = Some(String::new());
+    let expired =
+        context("owner").with_deadline(Some(std::time::Instant::now() - Duration::from_secs(1)));
+    let result = backend
+        .execute(
+            DeveloperOperation::Write(arguments.clone()),
+            expired.clone(),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(ToolExecutionError::Cancelled(_))),
+        "{result:?}"
+    );
+    assert!(!root.path().join("expired.txt").exists());
+    assert!(matches!(
+        backend.preflight(&DeveloperOperation::Write(arguments), &expired),
+        Err(ToolExecutionError::Cancelled(_))
+    ));
+}
