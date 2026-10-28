@@ -62,6 +62,25 @@ fn valid(ledger: &Ledger) -> bool {
                 && (t.status != Status::Completed || t.delivery.is_some())
         })
 }
+
+fn recover(ledger: &mut Ledger) -> bool {
+    let mut changed = ledger.format_version != 2;
+    ledger.format_version = 2;
+    for t in &mut ledger.triggers {
+        if t.status == Status::Running {
+            t.status = Status::Interrupted;
+            t.result = Some(serde_json::json!({"kind":"trigger_failure","stage":"restart","trigger_id":t.id,"execution":"unknown","replay_safe":false,"reason":"执行中进程退出，未自动重放"}).to_string());
+            t.delivery = Some(Delivery::Pending);
+            changed = true;
+        }
+        if t.delivery == Some(Delivery::Sending) {
+            t.delivery = Some(Delivery::Unknown);
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn identifier(owner: &SessionKey, source: &str) -> String {
     let data = serde_json::to_vec(&(&owner.session_id, &owner.user_id, source))
         .expect("strings serialize");
@@ -88,6 +107,18 @@ impl TriggerController {
         let bytes = serde_json::to_vec(&next).map_err(|_| TriggerError::Invalid)?;
         if bytes.len() > MAX_BYTES {
             return Err(TriggerError::Limit);
+        }
+        // 准入前核对真实恢复投影的编码大小，保证未知执行回执始终有空间保存。
+        if next.triggers.iter().any(|t| t.status == Status::Running) {
+            let mut recovered = next.clone();
+            recover(&mut recovered);
+            if serde_json::to_vec(&recovered)
+                .map_err(|_| TriggerError::Invalid)?
+                .len()
+                > MAX_BYTES
+            {
+                return Err(TriggerError::Limit);
+            }
         }
         if inner.context.state_set(STATE_KEY, bytes).is_err() {
             inner.available = false;
@@ -338,22 +369,13 @@ impl Plugin for TriggerPlugin {
             if !valid(&ledger) {
                 return Err(fail());
             }
-            let mut changed = ledger.format_version != 2;
-            ledger.format_version = 2;
-            for t in &mut ledger.triggers {
-                if t.status == Status::Running {
-                    t.status = Status::Interrupted;
-                    t.result = Some(serde_json::json!({"kind":"trigger_failure","stage":"restart","trigger_id":t.id,"execution":"unknown","replay_safe":false,"reason":"执行中进程退出，未自动重放"}).to_string());
-                    t.delivery = Some(Delivery::Pending);
-                    changed = true;
+            if recover(&mut ledger) {
+                let recovered = serde_json::to_vec(&ledger).map_err(|_| fail())?;
+                // 旧账本可能没有预留恢复回执；失败关闭，不能写成下次打不开的超限账本。
+                if !valid(&ledger) || recovered.len() > MAX_BYTES {
+                    return Err(fail());
                 }
-                if t.delivery == Some(Delivery::Sending) {
-                    t.delivery = Some(Delivery::Unknown);
-                    changed = true;
-                }
-            }
-            if changed {
-                context.state_set(STATE_KEY, serde_json::to_vec(&ledger).map_err(|_| fail())?)?;
+                context.state_set(STATE_KEY, recovered)?;
             }
             *self.controller.0.lock().map_err(|_| fail())? = Some(Inner {
                 ledger,

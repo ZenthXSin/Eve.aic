@@ -383,3 +383,92 @@ async fn old_trigger_ledger_migrates_without_losing_armed_conditions() {
     assert_eq!(stored["format_version"], 2);
     kernel.stop_all().await.unwrap();
 }
+
+async fn near_capacity_legacy_state(status: Status) -> (Arc<MemoryStateStore>, String, Vec<u8>) {
+    let state = Arc::new(MemoryStateStore::default());
+    let (kernel, controller) = open(state.clone()).await;
+    let mut triggers = vec![];
+    for i in 0..130 {
+        let mut trigger = controller
+            .create(
+                owner(&format!("capacity-{i}")),
+                format!("source-{i}"),
+                spec(),
+                1000,
+            )
+            .unwrap();
+        if i == 0 {
+            trigger.status = status;
+            trigger.runs = u32::from(status == Status::Running);
+            trigger.evidence = vec!["time".into()];
+        } else {
+            trigger.status = Status::Completed;
+            trigger.runs = 1;
+            trigger.result = Some("x".repeat(32768));
+            trigger.delivery = Some(Delivery::Sent);
+        }
+        triggers.push(trigger);
+    }
+    kernel.stop_all().await.unwrap();
+    let id = triggers[0].id.clone();
+    let encode = |triggers: &Vec<Trigger>| {
+        serde_json::to_vec(&serde_json::json!({"format_version":2,"triggers":triggers})).unwrap()
+    };
+    while encode(&triggers).len() > MAX_BYTES + 32000 {
+        triggers.pop();
+    }
+    let excess = encode(&triggers).len() - (MAX_BYTES - 32);
+    let last = triggers.last_mut().unwrap().result.as_mut().unwrap();
+    last.truncate(last.len() - excess);
+    let original = encode(&triggers);
+    assert_eq!(original.len(), MAX_BYTES - 32);
+    state
+        .set(
+            &PluginId::new(PLUGIN_ID).unwrap(),
+            STATE_KEY.into(),
+            original.clone(),
+        )
+        .unwrap();
+    (state, id, original)
+}
+
+#[tokio::test]
+async fn full_legacy_running_ledger_never_writes_an_oversized_recovery() {
+    let (state, _, original) = near_capacity_legacy_state(Status::Running).await;
+    let kernel = Kernel::with_services(KernelServices {
+        state: state.clone(),
+        ..Default::default()
+    });
+    kernel
+        .register(Box::new(TriggerPlugin::new().unwrap()))
+        .unwrap();
+    assert!(
+        kernel.start_all().await.is_err(),
+        "不能把旧近满账本恢复成下次无法读取的超限状态"
+    );
+    assert_eq!(
+        state
+            .get(&PluginId::new(PLUGIN_ID).unwrap(), STATE_KEY)
+            .unwrap()
+            .unwrap(),
+        original
+    );
+}
+
+#[tokio::test]
+async fn running_admission_reserves_space_for_unknown_restart_receipt() {
+    let (state, id, original) = near_capacity_legacy_state(Status::Ready).await;
+    let (kernel, controller) = open(state.clone()).await;
+    assert_eq!(
+        controller.transition(&id, Status::Ready, Status::Running, None),
+        Err(TriggerError::Limit)
+    );
+    assert_eq!(
+        state
+            .get(&PluginId::new(PLUGIN_ID).unwrap(), STATE_KEY)
+            .unwrap()
+            .unwrap(),
+        original
+    );
+    kernel.stop_all().await.unwrap();
+}
