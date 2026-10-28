@@ -20,7 +20,7 @@ seccomp 拒绝 fork/vfork、非线程 clone、clone3、额外 namespace 和部�
 
 预检不启动隔离器，因此只确认平台、架构、可执行文件配置、声明图、身份和权限；内核是否允许 namespace/seccomp 在实际启动时确认。缺少 bubblewrap、内核拒绝隔离、未知架构、进程启动失败都终止执行，绝不回退普通 exec。原生 exec、Python subprocess 或 Node child_process 不作为宿主沙箱；本后端还直接禁止创建非线程子进程。
 
-可信宿主还可选择 `ContainerSandbox`，用于Windows/macOS上的Linux容器daemon，或Linux本地容器。镜像必须为预装的完整sha256 ID、CLI为可信绝对路径，插件不能控制容器参数。其隔离资源与取消差异、安装依赖和真实验收入口见 [容器后端](../container/README.md)。普通Windows契约测试通过不等于容器执行已验证。
+可信宿主还可选择 `ContainerSandbox`，用于Windows上的Linux容器daemon，或Linux本地容器。镜像必须为预装的完整sha256 ID、CLI为可信绝对路径，插件不能控制容器参数。其隔离资源与取消差异、安装依赖和真实验收入口见 [容器后端](../container/README.md)。普通Windows契约测试通过不等于容器执行已验证。
 
 ## 调用链和 JSON 行协议
 
@@ -45,7 +45,7 @@ seccomp 拒绝 fork/vfork、非线程 clone、clone3、额外 namespace 和部�
 
 ## Rust独立编译与热重载
 
-`language:"rust"` 使用同一版本化JSON行RPC和独立插件进程，不加载Rust动态库，不依赖不稳定Rust ABI，不重启Eve或重新编译整个workspace。可信宿主配置 `EVE_SCRIPT_RUSTC` 为实际toolchain `bin/rustc` 的绝对路径（不是rustup代理）；也可使用 `Bubblewrap::with_rustc`。当前Rust编译仅在Linux bubblewrap实现，容器/Windows/macOS Rust明确失败关闭。
+`language:"rust"` 使用同一版本化JSON行RPC和独立插件进程，不加载Rust动态库，不依赖不稳定Rust ABI，不重启Eve或重新编译整个workspace。可信宿主配置 `EVE_SCRIPT_RUSTC` 为实际toolchain `bin/rustc` 的绝对路径（不是rustup代理）；也可使用 `Bubblewrap::with_rustc`。当前Rust编译仅在Linux bubblewrap实现，容器/Windows Rust明确失败关闭。
 
 `ScriptRuntime::publish_candidate`（自然工具save入口）先隔离编译候选，成功才保存不可变版本。纯存储 `ScriptStore::publish` 仍不启动编译器；直接使用此底层API的可信宿主须自行执行候选预验证。v1只支持单个std-only Rust源文件，不运行Cargo、build.rs、下载依赖或装配第三方proc-macro。编译器路径/目标/编译参数由可信宿主固定，模型只能提交源码。
 

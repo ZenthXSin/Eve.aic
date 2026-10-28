@@ -8,7 +8,6 @@ export const MAX_FILES = 12000;
 export const TARGETS = {
   'windows-x64': 'x86_64-pc-windows-msvc', 'windows-arm64': 'aarch64-pc-windows-msvc',
   'linux-x64': 'x86_64-unknown-linux-gnu', 'linux-arm64': 'aarch64-unknown-linux-gnu',
-  'macos-x64': 'x86_64-apple-darwin', 'macos-arm64': 'aarch64-apple-darwin',
 };
 
 export function stableVersion(value) {

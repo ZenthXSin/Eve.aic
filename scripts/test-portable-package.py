@@ -225,9 +225,8 @@ def main():
             (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
             node = root / ("runtime/node.exe" if os.name == "nt" else "runtime/bin/node")
             if os.name != "nt":
-                script_extension = "command" if sys.platform == "darwin" else "sh"
                 for name in ("Start-Eve", "Start-Console", "Open-Panel"):
-                    require(os.access(root / f"{name}.{script_extension}", os.X_OK), "解压丢失启动脚本执行权限")
+                    require(os.access(root / f"{name}.sh", os.X_OK), "解压丢失启动脚本执行权限")
             validate_launcher([str(node), str(root / "Launch.mjs"), "qq", "--validate-only"], 'bundled_node')
             if manifest["platform_label"] == "windows-x64":
                 validate_launcher(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",

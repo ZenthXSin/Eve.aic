@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -15,6 +16,19 @@ spec.loader.exec_module(builder)
 
 
 class PackagingResourceTests(unittest.TestCase):
+    def test_packaging_targets_are_only_linux_and_windows(self):
+        self.assertEqual(set(builder.TARGETS), {
+            'x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc',
+            'x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu',
+        })
+
+    def test_linux_target_is_refused_on_unsupported_native_host_before_creating_output(self):
+        output = self.root / 'refused-package'
+        with patch.object(builder.sys, 'platform', 'darwin'):
+            with self.assertRaisesRegex(RuntimeError, '相符平台'):
+                builder.package('x86_64-unknown-linux-gnu', self.root, output)
+        self.assertFalse(output.exists())
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='eve-package-resources-')
         self.root = Path(self.temporary.name)

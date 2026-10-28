@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [Windows, macOS]
+        os: [Windows]
     runs-on: [self-hosted, '${{ matrix.os }}', eve-script-sandbox]
     timeout-minutes: 20
     defaults:

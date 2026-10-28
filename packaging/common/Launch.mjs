@@ -100,6 +100,7 @@ function validate(config) {
 }
 
 async function main() {
+  if (!['linux', 'win32'].includes(process.platform)) throw new Error('便携启动器仅支持 Linux 和 Windows。');
   if (!['qq', 'console', 'panel', 'update'].includes(mode)) throw new Error('仅支持 qq / console / panel / update 模式。');
   if (mode === 'update') {
     const updater = createUpdater(root);
@@ -126,7 +127,7 @@ async function main() {
     if (config.web.listen.endsWith(':0')) throw new Error('端口 0 请使用 EVE_WEB_READY 输出的实际地址。');
     console.log(`地址：http://${config.web.listen}\n本机登录令牌：${config.web.token}`);
     const url = `http://${config.web.listen}`;
-    const browser = windows ? 'rundll32.exe' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+    const browser = windows ? 'rundll32.exe' : 'xdg-open';
     const open = spawn(browser, windows ? ['url.dll,FileProtocolHandler', url] : [url], { detached: true, stdio: 'ignore' });
     open.on('error', () => console.log('请手动在浏览器打开上述地址。'));
     open.unref();

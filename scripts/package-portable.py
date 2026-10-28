@@ -24,8 +24,6 @@ TARGETS = {
     "aarch64-pc-windows-msvc": ("windows-arm64", "win-arm64", "zip", "5b44fd410df7b4cd0a1891a05a7b606f8fb7d8786a94997b996a372e82478d7a"),
     "x86_64-unknown-linux-gnu": ("linux-x64", "linux-x64", "tar.xz", "9aa8e9d2298ab68c600bd6fb86a6c13bce11a4eca1ba9b39d79fa021755d7c37"),
     "aarch64-unknown-linux-gnu": ("linux-arm64", "linux-arm64", "tar.xz", "1bf1eb9ee63ffc4e5d324c0b9b62cf4a289f44332dfef9607cea1a0d9596ba6f"),
-    "x86_64-apple-darwin": ("macos-x64", "darwin-x64", "tar.gz", "5ea50c9d6dea3dfa3abb66b2656f7a4e1c8cef23432b558d45fb538c7b5dedce"),
-    "aarch64-apple-darwin": ("macos-arm64", "darwin-arm64", "tar.gz", "5ed4db0fcf1eaf84d91ad12462631d73bf4576c1377e192d222e48026a902640"),
 }
 BINARIES = ("eve", "eve-qqbot", "eve-cognition", "eve-memory", "eve-message-evaluate")
 MAX_NODE_ARCHIVE_BYTES = 128 * 1024 * 1024
@@ -119,7 +117,7 @@ def resource_worker(action, arguments):
 def package(target, binary_directory, output_directory):
     label, node_platform, node_extension, pinned_digest = TARGETS[target]
     windows = label.startswith("windows-")
-    if windows != (os.name == "nt") or label.startswith("macos-") != (os.uname().sysname == "Darwin" if os.name != "nt" else False):
+    if sys.platform != ("win32" if windows else "linux"):
         raise RuntimeError("打包必须使用相符平台的原生运行环境。")
     with stage('source_metadata', platform=label):
         source = checked(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -156,9 +154,8 @@ def package(target, binary_directory, output_directory):
     else:
         for file in ("使用说明.md",):
             shutil.copy2(ROOT / "packaging/posix" / file, bundle)
-        script_extension = "command" if label.startswith("macos-") else "sh"
         for script, mode in (("Start-Eve", "qq"), ("Start-Console", "console"), ("Open-Panel", "panel"), ("Update-Eve", "update")):
-            shell = bundle / f"{script}.{script_extension}"
+            shell = bundle / f"{script}.sh"
             shell.write_text('#!/bin/sh\nEVE_PACKAGE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1\nexec "$EVE_PACKAGE_DIR/runtime/bin/node" "$EVE_PACKAGE_DIR/Launch.mjs" ' + mode + ' "$@"\n', encoding="utf-8")
             shell.chmod(0o755)
     bridge = bundle / "connectors/qqbot"

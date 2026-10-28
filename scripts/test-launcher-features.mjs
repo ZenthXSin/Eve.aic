@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const capabilityFlags = ['--background-tasks', '--subagents', '--triggers', '--sleep', '--workflow-tools', '--health-watch'];
@@ -63,4 +63,18 @@ test('仅验证配置时不启动宿主或默认能力', { skip: process.platfor
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /配置及发行包检查通过/);
   await assert.rejects(fs.stat(path.join(f.root, 'captured.json')), { code: 'ENOENT' });
+});
+test('不支持的平台在读取用户配置或启动宿主前明确拒绝', { skip: process.platform === 'win32' }, async t => {
+  const f = await fixture(t);
+  const original = JSON.stringify(f.config);
+  await fs.writeFile(path.join(f.root, 'config.json'), original);
+  for (const platform of ['darwin', 'freebsd']) {
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e',
+      `Object.defineProperty(process, 'platform', { value: ${JSON.stringify(platform)} }); await import(${JSON.stringify(pathToFileURL(path.join(f.root, 'Launch.mjs')).href)});`],
+    { encoding: 'utf8', timeout: 10000 });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /仅支持 Linux 和 Windows/);
+    assert.equal(await fs.readFile(path.join(f.root, 'config.json'), 'utf8'), original);
+    await assert.rejects(fs.stat(path.join(f.root, 'captured.json')), { code: 'ENOENT' });
+  }
 });

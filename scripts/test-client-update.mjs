@@ -95,7 +95,13 @@ test('稳定版本按数值比较，拒绝预发行、降级、错误平台和�
   assert.throws(() => updatePlan({ ...release, assets: [{ ...release.assets[0], browser_download_url: 'https://example.com/evil' }] }, base));
   assert.throws(() => updatePlan({ ...release, assets: [] }, base));
 });
-test('六个平台均选用对应原生资产', () => {
+test('仅四个Linux和Windows平台可选对应原生资产，历史macOS资产不再选用', () => {
+  assert.deepEqual(Object.keys(TARGETS).sort(), ['linux-arm64', 'linux-x64', 'windows-arm64', 'windows-x64']);
+  for (const [platform_label, target] of [['macos-x64', 'x86_64-apple-darwin'], ['macos-arm64', 'aarch64-apple-darwin']]) {
+    const current = { ...base, platform_label, target };
+    assert.throws(() => currentManifest(current));
+    assert.throws(() => updatePlan(releaseOf(Buffer.from('historical archive'), 'v2.0.0', platform_label), current));
+  }
   for (const platform_label of [undefined, 'unknown', '__proto__', ['linux-x64']]) {
     assert.throws(() => currentManifest({ ...base, platform_label, target: undefined }));
     assert.throws(() => currentManifest({ ...base, platform_label }));
