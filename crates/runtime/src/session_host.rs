@@ -226,6 +226,7 @@ impl SessionLlmHost {
                     session_id: started.lease.key.session_id.clone(),
                     user_id: started.lease.key.user_id.clone(),
                 }),
+                Some(started.lease.turn_id),
                 admission.clone(),
                 events.as_ref(),
             )

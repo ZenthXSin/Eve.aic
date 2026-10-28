@@ -226,6 +226,7 @@ struct PreparedTool {
 }
 
 struct ToolCaller {
+    turn_id: Option<u64>,
     scope: Option<eve_llm_api::ContextScope>,
     continuation: eve_llm_api::TaskContinuation,
     conversation: Arc<Vec<ChatMessage>>,
@@ -450,6 +451,7 @@ pub struct LlmHost {
     model_resolver: Option<Arc<dyn LlmModelResolver>>,
     history_resolver: Option<Arc<dyn eve_llm_api::HistoryWindowResolver>>,
     history_digests: Option<Arc<dyn eve_llm_api::HistoryDigests>>,
+    history_context_planner: Option<Arc<dyn eve_llm_api::HistoryContextPlanner>>,
     history_window: Option<eve_llm_api::HistoryWindow>,
     compaction_policy: Option<eve_llm_api::ContextCompactionPolicy>,
     /// 本轮尚未调用工具时使用的较小阈值；见 `HistoryWindowResolver::casual_compaction`。
@@ -513,6 +515,7 @@ impl LlmHost {
             model_resolver: None,
             history_resolver: None,
             history_digests: None,
+            history_context_planner: None,
             history_window: None,
             compaction_policy: None,
             casual_compaction_policy: None,
@@ -548,6 +551,15 @@ impl LlmHost {
         resolver: Arc<dyn eve_llm_api::HistoryWindowResolver>,
     ) -> Self {
         self.history_resolver = Some(resolver);
+        self
+    }
+
+    /// 分层计划只能筛选原历史与增加非授权工作集；不会修改持久会话或审核原话。
+    pub fn with_history_context_planner(
+        mut self,
+        planner: Arc<dyn eve_llm_api::HistoryContextPlanner>,
+    ) -> Self {
+        self.history_context_planner = Some(planner);
         self
     }
 
@@ -635,7 +647,7 @@ impl LlmHost {
         let events = self.event_delivery(sink, None);
         match self.for_turn(scope.as_ref()) {
             Ok(host) => {
-                host.run_turn_inner(input, None, scope, admission, Some(&events))
+                host.run_turn_inner(input, None, scope, None, admission, Some(&events))
                     .await
             }
             Err(error) => Err(fail(error, TurnDiagnostics::default())),
@@ -718,7 +730,7 @@ impl LlmHost {
         let admission = Arc::new(self.kernel.acquire_runtime_admission().await);
         self.for_turn(None)
             .map_err(|error| fail(error, TurnDiagnostics::default()))?
-            .run_turn_inner(input, None, None, admission, None)
+            .run_turn_inner(input, None, None, None, admission, None)
             .await
     }
 
@@ -731,7 +743,7 @@ impl LlmHost {
         let events = self.event_delivery(sink, None);
         let result = match self.for_turn(None) {
             Ok(host) => {
-                host.run_turn_inner(input, None, None, admission.clone(), Some(&events))
+                host.run_turn_inner(input, None, None, None, admission.clone(), Some(&events))
                     .await
             }
             Err(error) => Err(fail(error, TurnDiagnostics::default())),
@@ -759,20 +771,18 @@ impl LlmHost {
     }
 
     // 会话宿主已持有相同 Kernel 的准入锁，覆盖 Pending 到最终状态提交。
+    // turn_id 来自持久会话租约，不能依赖是否装配事件观察者。
     pub(crate) async fn run_turn_inner(
         &self,
         input: TurnInput,
         history: Option<Vec<ChatMessage>>,
         scope: Option<eve_llm_api::ContextScope>,
+        turn_id: Option<u64>,
         admission: Arc<RuntimeAdmissionGuard>,
         events: Option<&EventDelivery<'_>>,
     ) -> Result<TurnOutput, TurnFailure> {
         let mut diagnostics = TurnDiagnostics::default();
-        let steering = match (
-            &self.steering,
-            scope.as_ref(),
-            events.and_then(|e| e.turn_id),
-        ) {
+        let steering = match (&self.steering, scope.as_ref(), turn_id) {
             (Some(source), Some(scope), Some(turn_id)) => Some(
                 source
                     .open(scope, turn_id)
@@ -788,7 +798,7 @@ impl LlmHost {
                     .map_or(0, |d| d.as_millis());
                 eprintln!(
                     "EVE_CONTEXT_TIMING {}",
-                    serde_json::json!({"phase":stage,"turn":events.and_then(|e| e.turn_id),"at_ms":at,"elapsed_ms":context_started.elapsed().as_millis()})
+                    serde_json::json!({"phase":stage,"turn":turn_id,"at_ms":at,"elapsed_ms":context_started.elapsed().as_millis()})
                 );
             }
         };
@@ -836,7 +846,46 @@ impl LlmHost {
         });
         let old_count = review_user_messages.len().saturating_sub(6);
         Arc::make_mut(&mut review_user_messages).drain(..old_count);
+        let mut planned_history = false;
+        if let Some(planner) = &self.history_context_planner {
+            let deadline = self
+                .run_deadline
+                .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(10))
+                .min(std::time::Instant::now() + Duration::from_secs(10));
+            let plan = tokio::select! { biased;
+                _ = wait_closed(events) => Err(LlmError::Cancelled),
+                _ = tokio::time::sleep_until(deadline.into()) => Err(LlmError::Cancelled),
+                result = contain_panic(async { planner.plan(scope.as_ref(), &input, &prepared.context.history).await }) => result,
+            }.map_err(|error| fail(error, diagnostics.clone()))?;
+            if let Some(plan) = plan {
+                validate_review_originals(&review_user_messages)
+                    .map_err(|error| fail(error, diagnostics.clone()))?;
+                let window = self.history_window.ok_or_else(|| {
+                    fail(
+                        LlmError::Configuration("分层历史计划需要可信历史窗口上限".into()),
+                        diagnostics.clone(),
+                    )
+                })?;
+                crate::history::apply_plan(&mut prepared.context, window, plan)
+                    .map_err(|error| fail(error, diagnostics.clone()))?;
+                planned_history = true;
+            }
+        }
+        // 选择后的子序列不能使用原全历史的 covered_turns；摘要只作本轮临时计算。
+        let compaction_scope = if planned_history {
+            None
+        } else {
+            scope.as_ref()
+        };
         let mut compaction = match (self.compaction_policy, self.history_digests.as_deref()) {
+            (Some(_), Some(service)) if planned_history => {
+                Some(crate::compaction::State::new_with_cache(
+                    &mut prepared.context,
+                    service,
+                    None,
+                    false,
+                ))
+            }
             (Some(_), Some(service)) => Some(crate::compaction::State::new(
                 &mut prepared.context,
                 service,
@@ -844,7 +893,8 @@ impl LlmHost {
             )),
             _ => None,
         };
-        if compaction.is_none()
+        if !planned_history
+            && compaction.is_none()
             && let Some(window) = self.history_window
             && let Err(error) = crate::history::apply(
                 &mut prepared.context,
@@ -1011,6 +1061,10 @@ impl LlmHost {
                         let originals = Arc::make_mut(&mut review_user_messages);
                         originals.push(text.clone());
                         originals.drain(..originals.len().saturating_sub(6));
+                        if planned_history {
+                            validate_review_originals(originals)
+                                .map_err(|error| fail(error, diagnostics.clone()))?;
+                        }
                     }
                     let message = ChatMessage::text(ChatRole::User, text);
                     messages.push(message.clone());
@@ -1054,7 +1108,7 @@ impl LlmHost {
                 let result = tokio::select! { biased;
                     _ = wait_closed(events) => Err(LlmError::Cancelled),
                     _ = tokio::time::sleep(eve_llm_api::CONTEXT_COMPACTION_TIMEOUT) => Err(LlmError::Context("上下文压缩超过 5 分钟总期限；已经保存的摘要进度与工具回执保留，压缩后的下一次对话请求未发出".into())),
-                    result = contain_panic(state.compact(&mut messages, &definitions, policy, service, scope.as_ref(), fallback)) => result,
+                    result = contain_panic(state.compact(&mut messages, &definitions, policy, service, compaction_scope, fallback)) => result,
                 };
                 if let Err(error) = result {
                     return Err(fail(error, diagnostics));
@@ -1122,6 +1176,10 @@ impl LlmHost {
                             let originals = Arc::make_mut(&mut review_user_messages);
                             originals.push(text.clone());
                             originals.drain(..originals.len().saturating_sub(6));
+                            if planned_history {
+                                validate_review_originals(originals)
+                                    .map_err(|error| fail(error, diagnostics.clone()))?;
+                            }
                         }
                         let message = ChatMessage::text(ChatRole::User, text);
                         messages.push(message.clone());
@@ -1253,6 +1311,7 @@ impl LlmHost {
                     admission.clone(),
                     events,
                     ToolCaller {
+                        turn_id,
                         scope: scope.clone(),
                         continuation: continuation.clone(),
                         conversation: Arc::new(messages.clone()),
@@ -1678,7 +1737,7 @@ impl LlmHost {
                 .with_continuation(caller.continuation.clone())
                 .with_conversation(caller.conversation.clone())
                 .with_review_user_messages(caller.review_user_messages.clone())
-                .with_turn_id(events.and_then(|event| event.turn_id))
+                .with_turn_id(caller.turn_id)
                 .with_deadline(self.run_deadline)
                 .with_delegated(self.delegated);
             let context = match &self.shared_steps {
@@ -1971,6 +2030,19 @@ fn progress_report_request(
         ],
         tools: vec![],
     })
+}
+
+fn validate_review_originals(messages: &[String]) -> Result<(), LlmError> {
+    if messages
+        .iter()
+        .try_fold(0usize, |sum, text| sum.checked_add(text.len()))
+        .is_none_or(|bytes| bytes > eve_llm_api::MAX_REVIEW_USER_MESSAGES_BYTES)
+    {
+        return Err(LlmError::Context(
+            "六条审核原话超过上限；未截断、摘要或替换授权上下文".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn build_messages(

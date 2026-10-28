@@ -773,6 +773,7 @@ dependencies = [
  "eve-chime-api",
  "eve-control-api",
  "eve-llm-api",
+ "eve-memory-api",
  "eve-message-api",
  "eve-message-diagnostics",
  "eve-session-api",

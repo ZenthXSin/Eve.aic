@@ -19,8 +19,9 @@ mod usage;
 pub use budget::{BudgetUsage, ExecutionLimits, SharedStepUsage, SharedToolSteps, TurnBudget};
 pub use failure::{ModelHealthObserver, ModelOutcome, ProviderFailure, ProviderFailureKind};
 pub use history::{
-    CONTEXT_COMPACTION_TIMEOUT, ContextCompactionPolicy, HistoryDigest, HistoryDigests,
-    HistoryWindow, HistoryWindowResolver, MAX_HISTORY_DIGEST_BYTES, history_turns,
+    CONTEXT_COMPACTION_TIMEOUT, ContextCompactionPolicy, HistoryContextPlan, HistoryContextPlanner,
+    HistoryDigest, HistoryDigests, HistoryWindow, HistoryWindowResolver, MAX_HISTORY_DIGEST_BYTES,
+    MAX_HISTORY_WORKING_SET_BYTES, MAX_REVIEW_USER_MESSAGES_BYTES, history_turns,
 };
 pub use image::{
     ImageInput, MAX_IMAGE_BYTES, MAX_TURN_IMAGES, TurnImageSource, TurnImages, sniff_image,

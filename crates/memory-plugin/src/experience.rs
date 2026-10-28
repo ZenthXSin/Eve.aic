@@ -44,7 +44,7 @@ fn validate_context(c: &ExperienceReadContext) -> MemoryResult<()> {
 fn validate_version(v: &ExperienceVersion) -> MemoryResult<()> {
     validate_id(&v.operation_id)?;
     validate_text(&v.text, MAX_EXPERIENCE_TEXT_BYTES)?;
-    if v.revision == 0 {
+    if v.revision == 0 || v.expires_at_ms == Some(0) {
         return Err(MemoryError::InvalidInput);
     }
     let (reference, revision) = match &v.source {
@@ -262,10 +262,12 @@ impl ExperienceRecall for ExperienceMemoryController {
                 continue;
             }
             let version = r.history.last().ok_or(MemoryError::CorruptState)?;
-            if matches!(
-                version.status,
-                ExperienceStatus::Revoked | ExperienceStatus::Archived
-            ) {
+            if version.is_expired()
+                || matches!(
+                    version.status,
+                    ExperienceStatus::Revoked | ExperienceStatus::Archived
+                )
+            {
                 continue;
             }
             let indexed = terms(&version.text);

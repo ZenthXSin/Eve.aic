@@ -284,6 +284,7 @@ impl Tool for ExperienceTool {
                 _ => ExperienceStatus::Unverified,
             };
             let version = ExperienceVersion {
+                expires_at_ms: replay.or(prior).and_then(|v| v.expires_at_ms),
                 revision,
                 operation_id,
                 at_ms: if let Some(replay) = replay {
@@ -451,6 +452,7 @@ impl PublicPracticeRecorder {
                 revision: 1,
                 operation_id: format!("publish-{artifact_key}"),
                 at_ms: attempt.finished_at_ms.ok_or(MemoryError::InvalidInput)?,
+                expires_at_ms: None,
                 text: artifact.summary.clone(),
                 source: ExperienceSource::PublicArtifact {
                     reference: format!("practice-log-sha256:{}", evidence.log_sha256),
@@ -639,6 +641,7 @@ mod tests {
         let tool = tools("qq", admin.clone()).unwrap().remove(0);
         for extra in [
             json!({"principal":"owner"}),
+            json!({"expires_at_ms":9999999999999_u64}),
             json!({"visibility":"Subject"}),
             json!({"status":"Verified"}),
             json!({"scope":{"session_id":"victim"}}),
@@ -688,6 +691,7 @@ mod tests {
                     revision: 1,
                     operation_id: "add-personal".into(),
                     at_ms: 1,
+                    expires_at_ms: None,
                     text: "Rust personal experience".into(),
                     source: ExperienceSource::ScopedEvidence {
                         scope: origin.scope.clone(),
@@ -850,3 +854,7 @@ mod public_practice_tests {
         kernel.stop_all().await.unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "subject_memory_host_tests.rs"]
+mod host_tests;

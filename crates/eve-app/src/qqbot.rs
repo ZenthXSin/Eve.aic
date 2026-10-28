@@ -2077,6 +2077,9 @@ async fn run_qqbot_composed(
             );
         }
         // 执行器与对话共用工具服务和宿主设置；在核心装配之后建立。
+        let context_planner = Arc::new(crate::layered_context::Planner::new(registry.clone(), tasks.clone().map(|t| Arc::new(t) as Arc<dyn eve_task_api::TaskAdmin>)));
+        bootstrap.history_context_planner = Some(context_planner.clone());
+        bootstrap.tools.push(Arc::new(crate::layered_context::ReadRecord(context_planner.clone())));
         let worker_tools: Vec<String> = bootstrap
             .tools
             .iter()
@@ -2120,6 +2123,9 @@ async fn run_qqbot_composed(
             options.web_listen.map(|_| page_permit.clone()),
         )
         .await?;
+        if let Some(selector) = crate::qq_message_judge::context_selector(qq_tasks::config_service(registry.as_ref())?) {
+            let _ = context_planner.selector.set(selector);
+        }
         if let (Some(admin), Some(late)) = (&trigger_admin, &trigger_observations) {
             let sessions = registry
                 .get(&ServiceId::new(eve_session_api::SESSION_SERVICE_ID)?)?

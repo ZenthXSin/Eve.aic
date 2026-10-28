@@ -27,6 +27,7 @@ fn local(
         revision,
         operation_id: operation.into(),
         at_ms: revision,
+        expires_at_ms: None,
         text: text.into(),
         source: ExperienceSource::ScopedEvidence {
             scope: c.scope.clone(),
@@ -46,6 +47,7 @@ fn public(
         revision,
         operation_id: operation.into(),
         at_ms: revision,
+        expires_at_ms: None,
         text: text.into(),
         source: ExperienceSource::PublicArtifact {
             reference: format!("public-{operation}"),
@@ -455,6 +457,58 @@ async fn full_version_capacity_reserves_revocation_and_replay_precedes_stale_cas
         c.recall(&context("new", "new"), "Rust", 3)
             .unwrap()
             .is_empty()
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn expiration_filters_recall_and_hits_without_deleting_original_versions() {
+    let store = std::sync::Arc::new(eve_kernel::backends::MemoryStateStore::default());
+    let (kernel, c) = open(KernelServices {
+        state: store.clone(),
+        ..KernelServices::default()
+    })
+    .await;
+    let access = context("window-a", "principal-a");
+    let mut version = local(
+        &access,
+        "expiring",
+        "atlas evidence",
+        1,
+        ExperienceStatus::Unverified,
+    );
+    version.expires_at_ms = Some(2);
+    assert!(!version.is_expired_at(1));
+    assert!(version.is_expired_at(2));
+    c.save_personal(&access, 0, "expiring", version.clone())
+        .unwrap();
+    assert!(c.recall(&access, "atlas", 3).unwrap().is_empty());
+    let forged = ExperienceHit {
+        id: "expiring".into(),
+        visibility: ExperienceVisibility::Principal {
+            principal: "principal-a".into(),
+        },
+        version,
+        score: 1,
+    };
+    assert!(forged.validate_for(&access).is_err());
+    let before = c.snapshot().unwrap();
+    kernel.stop_all().await.unwrap();
+    let (kernel, c) = open(KernelServices {
+        state: store,
+        ..KernelServices::default()
+    })
+    .await;
+    assert!(c.recall(&access, "atlas", 3).unwrap().is_empty());
+    assert!(c.snapshot().unwrap() == before);
+    // 不带新字段的旧数据继续解码为无期限，不能被自动清空。
+    let mut raw = serde_json::to_value(&before.records[0].history[0]).unwrap();
+    raw.as_object_mut().unwrap().remove("expires_at_ms");
+    assert!(
+        serde_json::from_value::<ExperienceVersion>(raw)
+            .unwrap()
+            .expires_at_ms
+            .is_none()
     );
     kernel.stop_all().await.unwrap();
 }

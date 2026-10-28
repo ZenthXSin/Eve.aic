@@ -77,6 +77,7 @@ impl Harness {
                 tools: vec![],
                 health: None,
                 history_digests: None,
+                history_context_planner: None,
                 image_source: None,
             },
             plugin,

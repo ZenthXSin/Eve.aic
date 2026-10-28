@@ -13,7 +13,7 @@ CONTEXT_TOOLS = {"clear_context", "clear_all_contexts"}
 # 默认装配的会话文件回执、隔离脚本版本和主体控制工具；保持逐名精确比对。
 SCRIPT_TOOLS = {"save_script_plugin", "list_script_plugins", "activate_script_plugin", "run_script_plugin"}
 SUBJECT_TOOLS = {"manage_subject_focus", "configure_subject_autonomy"}
-PLATFORM_TOOLS = CONTEXT_TOOLS | SCRIPT_TOOLS | SUBJECT_TOOLS | {"send_file", "query_file_delivery", "read_attachment", "describe_image", "read_raw_message", "acquire_condition", "read_source"}
+PLATFORM_TOOLS = CONTEXT_TOOLS | SCRIPT_TOOLS | SUBJECT_TOOLS | {"send_file", "query_file_delivery", "read_attachment", "describe_image", "read_raw_message", "read_context_record", "acquire_condition", "read_source"}
 
 # 开启交互记忆时注册的工具：记忆检索、保存偏好与约定。
 MEMORY_TOOLS = {"search_memory", "save_preference", "note_commitment", "settle_commitment", "experience_memory"}

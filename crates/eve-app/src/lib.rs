@@ -12,6 +12,7 @@ mod dialogue;
 mod error;
 mod history;
 mod input;
+mod layered_context;
 mod memory_cli;
 mod memory_cli_view;
 mod message_evaluation;
@@ -334,6 +335,7 @@ pub(crate) struct CoreBootstrap {
     health: Option<Arc<dyn eve_llm_api::ModelHealthObserver>>,
     /// 历史窗口省略较早轮次时提供的摘要；不装配时照常省略并提示。
     history_digests: Option<Arc<dyn eve_llm_api::HistoryDigests>>,
+    history_context_planner: Option<Arc<dyn eve_llm_api::HistoryContextPlanner>>,
     /// 本轮用户消息的图像来源；不装配时只发文字。
     image_source: Option<Arc<dyn eve_llm_api::TurnImageSource>>,
     steering: Option<Arc<dyn eve_llm_api::TurnSteeringSource>>,
@@ -353,6 +355,7 @@ pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstr
         tools: vec![],
         health: None,
         history_digests: None,
+        history_context_planner: None,
         image_source: None,
         steering: None,
     })
@@ -485,6 +488,7 @@ async fn install_core_with_config(
         tools,
         health,
         history_digests,
+        history_context_planner,
         image_source,
         steering,
     } = bootstrap;
@@ -568,6 +572,10 @@ async fn install_core_with_config(
         host.with_tool_scope_policy(policy)
     } else {
         host
+    };
+    let host = match history_context_planner {
+        Some(planner) => host.with_history_context_planner(planner),
+        None => host,
     };
     let host = match history_digests {
         Some(digests) => host.with_history_digests(digests),

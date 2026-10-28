@@ -57,6 +57,9 @@ pub struct ExperienceVersion {
     pub revision: u64,
     pub operation_id: String,
     pub at_ms: u64,
+    /// 宿主设定的有效截止时间；旧记录无期限，模型不能续期。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
     pub text: String,
     pub source: ExperienceSource,
     pub status: ExperienceStatus,
@@ -132,6 +135,20 @@ pub trait ExperienceMemoryAdmin: ExperienceRecall {
     ) -> MemoryResult<()>;
 }
 
+impl ExperienceVersion {
+    pub fn is_expired_at(&self, now_ms: u64) -> bool {
+        self.expires_at_ms
+            .is_some_and(|deadline| now_ms >= deadline)
+    }
+    pub fn is_expired(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| u64::try_from(d.as_millis()).ok());
+        now.is_none_or(|now| self.is_expired_at(now))
+    }
+}
+
 impl ExperienceHit {
     /// 组合层校验可替换召回器的范围与状态，拒绝把另一个scope的正文接入模型。
     pub fn validate_for(&self, context: &ExperienceReadContext) -> MemoryResult<()> {
@@ -140,7 +157,8 @@ impl ExperienceHit {
         validate_id(&self.id)?;
         validate_id(&self.version.operation_id)?;
         validate_text(&self.version.text, MAX_EXPERIENCE_TEXT_BYTES)?;
-        if self.score == 0
+        if self.version.is_expired()
+            || self.score == 0
             || self.version.revision == 0
             || matches!(
                 self.version.status,

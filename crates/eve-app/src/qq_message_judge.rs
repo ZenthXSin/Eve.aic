@@ -70,6 +70,33 @@ pub(crate) fn group_judge(settings: Arc<dyn ConfigService>) -> Result<Arc<JevRol
     Ok(judge)
 }
 
+/// 记忆相关性独立装配，不开启群消息自动筛选或主动回复。无凭据/配置错误只用本地回退。
+pub(crate) fn context_selector(
+    settings: Arc<dyn ConfigService>,
+) -> Option<Arc<dyn eve_memory_api::ContextRelevanceSelector>> {
+    let key = std::env::var(JEV_KEY).ok()?;
+    let judge = Arc::new(JevRoleJudge::new(settings, key));
+    judge.resolve().ok()?;
+    Some(judge)
+}
+impl eve_memory_api::ContextRelevanceSelector for JevRoleJudge {
+    fn select<'a>(
+        &'a self,
+        input: eve_memory_api::ContextSelectionInput,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = eve_memory_api::MemoryResult<Vec<String>>> + Send + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let judge = self
+                .resolve()
+                .map_err(|_| eve_memory_api::MemoryError::Unavailable)?;
+            eve_memory_api::ContextRelevanceSelector::select(judge.as_ref(), input).await
+        })
+    }
+}
+
 /// 群关系和在途任务共用同一 Jev 客户端、热配置与并发槽。
 pub(crate) fn relation_plugin_shared(
     settings: Arc<dyn ConfigService>,
