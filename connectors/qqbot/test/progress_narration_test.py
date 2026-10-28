@@ -2,7 +2,9 @@
 import json
 import hashlib
 import sys
+from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import developer_tools_test as developer
 import dialogue_tools_test as dialogue
@@ -93,26 +95,77 @@ class ProgressNarrationAcceptance(developer.DeveloperAcceptance):
         self.assertEqual(self.receipt('question')['state'], 'Sent')
 
     def test_file_queue_receipt_can_be_queried_with_actual_platform_and_session_ids(self):
-        (self.source / 'artifact.txt').write_text('已验证的测试产物')
+        (self.source / 'artifact.txt').write_text('已验证的测试产物', encoding='utf-8')
+        expected = '产物已实际送达，凭据已核对。'
+        platform_frame = self.gate('artifact-platform-frame')
+        observed = []
+        failures = []
+        queries = 0
+
         def respond(body):
+            nonlocal queries
             results = self.results(body)
             if not results:
                 return dialogue.tool_response([('send_file', {'path': 'artifact.txt'})])
-            if results[-1].get('queued'):
-                self.assertFalse(results[-1]['sent'])
-                self.assertIsNone(results[-1]['message_id'])
-                ledger = self.work / 'state/qq-outbox/ledger.json'
-                self.wait_until(lambda: ledger.exists() and any(r['state'] == 'Sent' for r in json.loads(ledger.read_text())['records']), '真实文件回执未落盘')
-                return dialogue.tool_response([('query_file_delivery', {'id': results[-1]['id']})])
             receipt = results[-1]
-            self.assertTrue(receipt['sent'])
-            self.assertTrue(receipt['message_id'].startswith('file-'))
-            self.assertTrue(receipt['session_id'])
-            self.assertFalse(receipt['retry_allowed'])
-            return dialogue.text_response('产物已实际送达，凭据已核对。')
+            observed.append(receipt)
+            if receipt.get('state') == 'Sent':
+                return dialogue.text_response(expected)
+            if receipt.get('state') not in ('Pending', 'Sending'):
+                failures.append({'unexpected_file_result': receipt})
+                return dialogue.text_response(expected)
+            try:
+                # Windows 下读句柄可能阻止宿主原子替换 ledger；等真实桥接事件，
+                # 不在模型 HTTP 回调中并发读取投递账本。
+                self.wait_until(platform_frame.exists, '替身平台未收到文件发送命令')
+            except AssertionError as error:
+                failures.append({'platform_frame': str(error), 'last_result': receipt})
+                return dialogue.text_response(expected)
+            queries += 1
+            if queries > 6 or 'query_file_delivery' not in self.definitions(body):
+                failures.append({'file_query_budget_exhausted': queries, 'last_result': receipt})
+                return dialogue.text_response(expected)
+            response = dialogue.tool_response([('query_file_delivery', {'id': receipt['id']})])
+            # 桥接写出回执不等于宿主已处理回执；Pending/Sending 时有界再次查询。
+            response['choices'][0]['message']['tool_calls'][0]['id'] += str(queries)
+            return response
+
         self.callback = respond
-        self.run_progress(self.send(self.message('artifact', '交付测试产物并核对回执', expected='产物已实际送达，凭据已核对。')),
-                          env_extra={'EVE_PROGRESS_STAGE_UPDATES': 'false', 'EVE_PROGRESS_SLOW_AFTER_MS': '0'})
+        message = self.message('artifact', '交付测试产物并核对回执', expected=expected)
+        script = [{'send': message},
+                  {'wait_command': {'id': 'file-1', 'type': 'file'}},
+                  {'touch': str(platform_frame)}, self.wait_reply('artifact'),
+                  self.wait_receipt('artifact')]
+        read_text = Path.read_text
+        def no_concurrent_ledger_read(path, *args, **kwargs):
+            if path.name == 'ledger.json' and path.parent.name == 'qq-outbox':
+                raise PermissionError('验收通过公开回执查询，不与 Windows 投递账本原子替换竞争')
+            return read_text(path, *args, **kwargs)
+
+        try:
+            # 在所有平台保留 Windows 读取拒绝的回归条件；宿主进程的实际写盘不受影响。
+            with patch.object(Path, 'read_text', no_concurrent_ledger_read):
+                self.run_progress(script, more=['--max-tool-rounds', '8'],
+                                  env_extra={'EVE_PROGRESS_STAGE_UPDATES': 'false', 'EVE_PROGRESS_SLOW_AFTER_MS': '0'})
+        except Exception as error:
+            # HTTP 替身中的断言会变成 503 重试；保留真实工具状态，在主线程报告。
+            self.fail(f'文件投递验收未完成：{error}; failures={failures!r}; observed={observed!r}; http_errors={self.errors!r}')
+        self.assertFalse(failures, repr(failures))
+        self.assertGreaterEqual(len(observed), 2, '至少取得排队结果和一次实际回执查询')
+        queued = observed[0]
+        self.assertTrue(queued['queued'])
+        self.assertFalse(queued['sent'])
+        self.assertIsNone(queued['message_id'])
+        receipt = observed[-1]
+        self.assertEqual(receipt['state'], 'Sent')
+        self.assertTrue(receipt['sent'])
+        self.assertEqual(receipt['message_id'], 'file-' + queued['id'])
+        self.assertEqual(receipt['session_id'], queued['session_id'])
+        self.assertTrue(receipt['session_id'])
+        self.assertFalse(receipt['retry_allowed'])
+        files = [event for event in self.events if event.get('type') == 'file']
+        self.assertEqual(len(files), 1, '查询未再次上传文件')
+        self.assertEqual(files[0]['id'], queued['id'])
         self.assertEqual(self.receipt('artifact')['state'], 'Sent')
 
 
