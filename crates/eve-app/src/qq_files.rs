@@ -38,6 +38,32 @@ fn failed(message: impl Into<String>) -> ToolExecutionError {
     ToolExecutionError::Failed(message.into())
 }
 
+/// 按块核对响应长度；不先读完整个不可信响应再检查大小。
+async fn bounded_attachment_body(
+    mut response: reqwest::Response,
+    maximum: u64,
+) -> Result<Vec<u8>, ToolExecutionError> {
+    let oversized = || failed(format!("附件超过 {maximum} 字节，没有读取"));
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum)
+    {
+        return Err(oversized());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| failed("附件内容读取失败"))?
+    {
+        if chunk.len() as u64 > maximum.saturating_sub(bytes.len() as u64) {
+            return Err(oversized());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
@@ -1076,18 +1102,9 @@ impl Tool for DescribeImageTool {
                     "下载结果不是图片（{content_type}），没有发给模型"
                 )));
             }
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|_| failed("图片内容读取失败"))?;
+            let bytes = bounded_attachment_body(response, Self::MAX_BYTES).await?;
             if bytes.is_empty() {
                 return Err(failed("图片内容为空，没有发给模型"));
-            }
-            if bytes.len() as u64 > Self::MAX_BYTES {
-                return Err(failed(format!(
-                    "图片超过 {} 字节，没有发给模型",
-                    Self::MAX_BYTES
-                )));
             }
             let settings = self
                 .settings
@@ -1240,16 +1257,7 @@ impl Tool for ReadAttachmentTool {
                     response.status().as_u16()
                 )));
             }
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|_| failed("附件内容读取失败"))?;
-            if bytes.len() as u64 > Self::MAX_BYTES {
-                return Err(failed(format!(
-                    "附件超过 {} 字节，没有读取",
-                    Self::MAX_BYTES
-                )));
-            }
+            let bytes = bounded_attachment_body(response, Self::MAX_BYTES).await?;
             let mut result = json!({"content_type": attachment.content_type, "bytes": bytes.len(), "filename": attachment.filename});
             if attachment.content_type.starts_with("text/")
                 || attachment.content_type == "application/json"
@@ -1724,5 +1732,73 @@ mod outbox_restore_validation_tests {
             assert!(Outbox::open(dir.path().to_owned()).is_err());
             assert_eq!(fs::read(dir.path().join("ledger.json")).unwrap(), original);
         }
+    }
+}
+
+#[cfg(test)]
+mod attachment_download_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn streamed(
+        bytes: usize,
+        finish: bool,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream
+                .write_all(format!("{bytes:x}\r\n").as_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&vec![b'x'; bytes]).await.unwrap();
+            stream.write_all(b"\r\n").await.unwrap();
+            if finish {
+                stream.write_all(b"0\r\n\r\n").await.unwrap();
+            } else {
+                let _ = stream.read(&mut request).await;
+            }
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/attachment"))
+            .send()
+            .await
+            .unwrap();
+        (response, server)
+    }
+    #[tokio::test]
+    async fn oversized_unterminated_attachment_is_rejected_without_waiting_for_eof() {
+        let maximum = ReadAttachmentTool::MAX_BYTES;
+        let (response, server) = streamed(maximum as usize + 1, false).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            bounded_attachment_body(response, maximum),
+        )
+        .await;
+        server.abort();
+        let error = result
+            .expect("must stop at byte limit rather than wait for EOF")
+            .unwrap_err();
+        assert!(error.to_string().contains("超过"));
+    }
+    #[tokio::test]
+    async fn attachment_at_exact_limit_is_preserved() {
+        let (response, server) = streamed(1024, true).await;
+        assert_eq!(
+            bounded_attachment_body(response, 1024).await.unwrap(),
+            vec![b'x'; 1024]
+        );
+        server.await.unwrap();
     }
 }
