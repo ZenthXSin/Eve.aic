@@ -1,5 +1,5 @@
 //! 健康巡检组合层：读取宿主统计，不请求模型；按可信主人路由投递一次。
-use crate::{AppError, qq_admin::Admin};
+use crate::AppError;
 use eve_health_watch::{Delivery, Finding, HealthSource, HealthWatch};
 use eve_llm_api::{
     ContextScope, Tool, ToolCall, ToolConcurrency, ToolDefinition, ToolExecutionContext,
@@ -19,6 +19,10 @@ use std::{
 
 fn error(s: impl ToString) -> PluginError {
     PluginError::State(s.to_string())
+}
+/// 主人判断；组合层用同一份平台绑定实现，巡检只读，不改名单。
+pub(crate) trait OwnerCheck: Send + Sync {
+    fn is_owner(&self, scope: &ContextScope) -> bool;
 }
 pub(crate) struct Source {
     pub(crate) health: Arc<eve_model_health::HealthBook>,
@@ -135,7 +139,8 @@ pub(crate) struct Monitor {
     store: HealthWatch,
     pub(crate) source: Source,
     conversations: QqConversations,
-    admin: Arc<Admin>,
+    /// 主人判断；由组合层注入，与群白名单共用同一份绑定。
+    admin: Arc<dyn OwnerCheck>,
     interval_ms: u64,
 }
 impl Monitor {
@@ -144,7 +149,7 @@ impl Monitor {
         health: Arc<eve_model_health::HealthBook>,
         budget: crate::qq_budget::Gate,
         conversations: QqConversations,
-        admin: Arc<Admin>,
+        admin: Arc<dyn OwnerCheck>,
     ) -> Result<Arc<Self>, AppError> {
         let number = |name: &str, default: u64, min: u64, max: u64| -> Result<u64, AppError> {
             match std::env::var(name) {

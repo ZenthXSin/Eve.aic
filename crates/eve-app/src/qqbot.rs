@@ -1945,6 +1945,63 @@ async fn run_qqbot_composed(
         let _ = provision.admin.set(qq_admin.clone());
         // 约定的“仅管理员”开关用同一个可信管理员判断。
         let _ = commitment_gate.admin.set(qq_admin.clone());
+        // 群白名单：默认每个群都禁用；只有主人本人在群里能说话，放行后群友才进入。
+        // 名单对象同时给对话工具，通道与工具共用同一份持久名单。
+        // 重启后群号由通道按已校验的持久回执恢复进会话目录，这里先把群路由交回目录。
+        if let Ok(receipts) = backends.state.get(
+            &PluginId::new(eve_qqbot_plugin::QQBOT_PLUGIN_ID)?,
+            "receipts.v1",
+        ) && let Some(bytes) = receipts
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && let Some(entries) = value.get("entries").and_then(|entries| entries.as_array())
+        {
+            let app = std::env::var("QQBOT_APP_ID").unwrap_or_else(|_| DEFAULT_QQBOT_APP_ID.into());
+            for entry in entries.iter().rev().take(1024) {
+                let Some(record) = entry.get("message") else {
+                    continue;
+                };
+                let (Some(scope), Some(target), Some(user)) = (
+                    record.get("scope").and_then(|v| v.as_str()),
+                    record.get("target_id").and_then(|v| v.as_str()),
+                    record.get("user_id").and_then(|v| v.as_str()),
+                ) else {
+                    continue;
+                };
+                if scope != "group" {
+                    continue;
+                }
+                let message = eve_qqbot_plugin::Message {
+                    id: String::new(),
+                    scope: scope.into(),
+                    target_id: target.into(),
+                    user_id: user.into(),
+                    text: String::new(),
+                    attachments: vec![],
+                    quoted: None,
+                };
+                let (Ok(session), Ok(conversation)) = (
+                    message.session_key(&app),
+                    message.conversation_key(&app),
+                ) else {
+                    continue;
+                };
+                let _ = conversations.record_group_identity(&app, session, target, conversation);
+            }
+        }
+        let group_access = crate::qq_group_access::GroupAccess::new(
+            Arc::new(eve_qqbot_receipt_sqlite::SqliteGroupWhitelist::open(
+                &options.state_directory.join("qq-group-whitelist.sqlite3"),
+            )?),
+            Arc::new(crate::qq_group_access::Owners {
+                admin: qq_admin.clone(),
+                conversations: conversations.clone(),
+            }),
+            conversations.clone(),
+            qq_admin.clone(),
+        );
+        let mut plugin = plugin
+            .with_group_access(group_access.whitelist(), group_access.owners())
+            .with_group_access_service(group_access.clone());
         for all in [false, true] {
             bootstrap.tools.push(Arc::new(crate::qq_context_reset::ResetTool {
                 all,
@@ -1978,10 +2035,15 @@ async fn run_qqbot_composed(
             Some(store)
         } else { None };
         let health_monitor = if options.health_watch {
-            let monitor=crate::qq_health::Monitor::open(options.state_directory.clone(),model_health.clone(),budget_gate.clone(),conversations.clone(),qq_admin.clone())?;
+            let monitor=crate::qq_health::Monitor::open(options.state_directory.clone(),model_health.clone(),budget_gate.clone(),conversations.clone(),group_access.clone())?;
             bootstrap.tools.push(Arc::new(crate::qq_health::ReadTool(monitor.clone())));
             Some(monitor)
         } else {None};
+        // 群白名单工具：默认每个群禁用，只有主人本人在群里能放行或取消放行。
+        bootstrap.tools.push(Arc::new(crate::qq_group_access::AllowTool {
+            access: group_access.clone(),
+            admin: qq_admin.clone(),
+        }));
         for tool in &mut bootstrap.tools {
             *tool = Arc::new(crate::qq_access::GuardedTool {
                 inner: tool.clone(),

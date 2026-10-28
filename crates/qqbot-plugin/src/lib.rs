@@ -76,6 +76,55 @@ pub trait QqAttachmentObserver: Send + Sync {
     fn observe(&self, session: &SessionKey, message: &Message);
 }
 
+/// 主人在某个群里的会话：通道只从已校验的持久回执与在线消息登记，群号来自真实目标。
+#[derive(Clone)]
+pub struct QqOwnerGroup {
+    pub session: SessionKey,
+    pub conversation: String,
+    pub group_id: String,
+}
+
+/// 同步、有界的白名单管理与查询；不发起模型、网络或通道任务。
+///
+/// 工具只按本轮可信会话定位群，参数里不接受群号；权限核对仍由通道按登记的主人账号进行。
+pub trait QqGroupAccess: Send + Sync {
+    /// 登记主人本人在某个群里的会话；只由通道用已校验的群号调用，参数里不接受群号。
+    fn claim_owner_group(
+        &self,
+        session: SessionKey,
+        conversation: String,
+        group_id: String,
+        tick: u64,
+    ) -> PluginResult<()>;
+    /// 当前会话是不是主人本人所在的群聊；两者都不是时返回 None。
+    fn owner_group(&self, session: &SessionKey) -> Option<QqOwnerGroup>;
+    fn contains(&self, group_id: &str) -> PluginResult<bool>;
+    /// 返回 true 表示本次新增。
+    fn add(&self, group_id: &str) -> PluginResult<bool>;
+    /// 返回 true 表示本次删除。
+    fn remove(&self, group_id: &str) -> PluginResult<bool>;
+    fn list(&self) -> PluginResult<Vec<String>>;
+}
+
+/// 群白名单：只有放行的群，群里非主人本人的消息才会进入通道。
+///
+/// 群号一律取自平台消息的真实 target_id，不由模型参数指定；未放行的群在解析帧时
+/// 直接丢弃，不写回执、不记录会话、不进模型。删除与显式添加只能由主人本人在
+/// 当前群里发起。实现只做有界本地读写，不调用模型或网络。
+pub trait QqGroupWhitelist: Send + Sync {
+    fn contains(&self, group_id: &str) -> PluginResult<bool>;
+    /// 返回 true 表示本次新增；已存在返回 false。
+    fn add(&self, group_id: &str, at_ms: u64) -> PluginResult<bool>;
+    /// 返回 true 表示本次删除；原本不在返回 false。
+    fn remove(&self, group_id: &str) -> PluginResult<bool>;
+    fn list(&self) -> PluginResult<Vec<String>>;
+}
+
+/// 主人账号的配置读取：当前群成员是否为主人本人，只看这里登记的账号，不看昵称。
+pub trait QqOwnerDirectory: Send + Sync {
+    fn is_owner(&self, user_id: &str) -> PluginResult<bool>;
+}
+
 /// 已结束的失败轮次交给宿主处理；只允许有界的本地持久化，不能运行模型或工具。
 /// 返回的说明代替默认的“不会自动重试”；只有确认任务保存后才能宣称已派发。
 pub trait QqFailureRecovery: Send + Sync {
@@ -184,6 +233,9 @@ pub struct QqBotPlugin {
     receipt_archive: Option<Arc<dyn QqReceiptArchive>>,
     group_observer: Option<Arc<dyn QqGroupObserver>>,
     live: Option<Arc<LiveDialogue>>,
+    group_whitelist: Option<Arc<dyn QqGroupWhitelist>>,
+    owner_directory: Option<Arc<dyn QqOwnerDirectory>>,
+    group_access: Option<Arc<dyn QqGroupAccess>>,
 }
 pub(crate) struct Segmentation {
     pub planner: Arc<dyn SegmentPlanner>,
@@ -225,6 +277,9 @@ impl QqBotPlugin {
             receipt_archive: None,
             group_observer: None,
             live: None,
+            group_whitelist: None,
+            owner_directory: None,
+            group_access: None,
         })
     }
     /// 通道已提交过轮次的会话是私聊还是群聊；只读，供只在私聊中成立的宿主能力判断。
@@ -398,6 +453,22 @@ impl QqBotPlugin {
         self.receipt_archive = Some(archive);
         self
     }
+    /// 接入群白名单与主人账号目录；两者到齐后，未放行的群消息在解析阶段丢弃。
+    /// 未接线时保持原行为（群消息照常进入）。
+    pub fn with_group_access(
+        mut self,
+        whitelist: Arc<dyn QqGroupWhitelist>,
+        owners: Arc<dyn QqOwnerDirectory>,
+    ) -> Self {
+        self.group_whitelist = Some(whitelist);
+        self.owner_directory = Some(owners);
+        self
+    }
+    /// 供宿主工具使用的群白名单接口；与 `with_group_access` 来自同一份持久名单。
+    pub fn with_group_access_service(mut self, access: Arc<dyn QqGroupAccess>) -> Self {
+        self.group_access = Some(access);
+        self
+    }
 }
 impl Plugin for QqBotPlugin {
     fn manifest(&self) -> &PluginManifest {
@@ -407,6 +478,43 @@ impl Plugin for QqBotPlugin {
         Box::pin(async move {
             let mut ledger = state::Ledger::load(&ctx)?;
             ledger.attach_archive(self.receipt_archive.clone())?;
+            // 群白名单只认主人本人（按登记的账号判断，不看昵称）。进程重启后用已校验的持久
+            // 回执把主人的群会话与群号交回宿主，这样名单管理不必等本人再在群里开口。
+            if let (Some(access), Some(owners)) = (&self.group_access, &self.owner_directory) {
+                let app = std::env::var("QQBOT_APP_ID").unwrap_or_default();
+                let mut restored = 0usize;
+                for entry in ledger
+                    .entries
+                    .iter()
+                    .filter(|e| e.message.scope == "group" && e.app_id == app)
+                    .rev()
+                    .take(1024)
+                {
+                    if restored >= 256 {
+                        break;
+                    }
+                    if !owners.is_owner(&entry.message.user_id).unwrap_or(false) {
+                        continue;
+                    }
+                    let (Ok(session), Ok(conversation)) = (
+                        entry.message.session_key(&entry.app_id),
+                        entry.message.conversation_key(&entry.app_id),
+                    ) else {
+                        continue;
+                    };
+                    if access
+                        .claim_owner_group(
+                            session,
+                            conversation,
+                            entry.message.target_id.clone(),
+                            0,
+                        )
+                        .is_ok()
+                    {
+                        restored += 1;
+                    }
+                }
+            }
             let observation = if let Some(observer) = &self.observer {
                 Some(Arc::new(observer::Observation {
                     observer: observer.clone(),
@@ -467,6 +575,9 @@ impl Plugin for QqBotPlugin {
             let stickers = self.stickers.clone();
             let failure_recovery = self.failure_recovery.clone();
             let live = self.live.clone();
+            let group_whitelist = self.group_whitelist.clone();
+            let owner_directory = self.owner_directory.clone();
+            let group_access = self.group_access.clone();
             let task_ctx = ctx.clone();
             ctx.spawn_task(TaskSpec::new(
                 "QQBot JSONL 通道",
@@ -494,6 +605,9 @@ impl Plugin for QqBotPlugin {
                     let stickers = stickers.clone();
                     let failure_recovery = failure_recovery.clone();
                     let live = live.clone();
+                    let group_whitelist = group_whitelist.clone();
+                    let owner_directory = owner_directory.clone();
+                    let group_access = group_access.clone();
                     let status = status.clone();
                     let ledger = ledger.clone();
                     Box::pin(async move {
@@ -526,6 +640,9 @@ impl Plugin for QqBotPlugin {
                                 stickers,
                                 failure_recovery,
                                 live,
+                                group_whitelist,
+                                owner_directory,
+                                group_access,
                             },
                             ledger,
                             signal,

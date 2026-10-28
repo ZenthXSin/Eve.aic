@@ -31,6 +31,7 @@ mod qq_conversation;
 mod qq_failure_recovery;
 mod qq_files;
 mod qq_group;
+mod qq_group_access;
 mod qq_group_digest;
 mod qq_group_recall;
 mod qq_health;
