@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 HERE = pathlib.Path(__file__).resolve().parent
-HISTORY_TURNS = 16  # 本基准显式选用兼容历史窗口；完整持久账本在每轮末独立核对。
+HISTORY_TURNS = 16  # 分层请求仍受窗口上限约束；完整持久账本在每轮末独立核对。
 
 
 def require(condition, diagnostic):
@@ -84,11 +84,23 @@ class LocalProvider:
                         require(set(facts) == {"user_request", "phase", "activity", "tool_names", "failed_calls",
                                                "waiting_seconds", "previous_messages", "group"}, "invalid_progress_facts")
                         require(not body.get("tools") and isinstance(facts["phase"], str), "invalid_progress_request")
+                    else:
+                        pending = set()
+                        for item in conversation_messages(messages):
+                            if item["role"] == "tool":
+                                require(item["tool_call_id"] in pending, "orphan_tool_result")
+                                pending.remove(item["tool_call_id"])
+                            else:
+                                require(not pending, "missing_tool_result")
+                                pending.update(call["id"] for call in item.get("tool_calls", []))
+                        require(not pending, "missing_tool_result")
                     outer.requests.append({
                         "at": time.perf_counter(),
                         "kind": "progress" if progress else "chat",
                         "phase": facts["phase"] if progress else None,
                         "user_count": sum(message["role"] == "user" for message in conversation_messages(messages)),
+                        "user_texts": [message["content"] for message in conversation_messages(messages)
+                                       if message["role"] == "user"],
                         "tool": messages[-1]["role"] == "tool",
                     })
                     latest = messages[-1]
@@ -152,7 +164,7 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes, p
         EVE_DEBOUNCE_MS="0",
         # 测的是对话链路并逐一核对请求数；历史摘要是后台请求，次数取决于时机，单独由 history_digest_test 验收。
         EVE_HISTORY_DIGEST_ENABLED="false",
-        # 本基准逐轮验证兼容模式的 16 轮窗口；200k 自适应上下文由 adaptive_context_test 验收。
+        # 关闭自适应扩容，验证分层选择仍受 16 轮窗口约束；200k 另有专项验收。
         EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS="0",
         EVE_CONTEXT_COMPACT_AT_TOKENS="0",
         EVE_PROGRESS_STAGE_UPDATES=str(progress_enabled).lower(),
@@ -207,7 +219,19 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes, p
     require(len(progress_requests) == (tool_count if progress_enabled else 0), "wrong_progress_request_count")
     completed = initial_turns
     for request in requests:
-        require(request["user_count"] == min(completed, HISTORY_TURNS) + 1, "wrong_history_window")
+        require(min(completed, 2) + 1 <= request["user_count"] <= min(completed, HISTORY_TURNS) + 1,
+                "wrong_history_window")
+        # 本基准短原文足以装入最新两轮；其它相关轮次可按需选择，原话与次序不变。
+        expected = []
+        for index in range(completed + 1):
+            marker = ("perf." + str(index) + ".").ljust(payload_bytes, "x")
+            expected.append("echo:" + marker if index % 10 == 0 else marker)
+        positions = {value: index for index, value in enumerate(expected)}
+        selected = [positions.get(value, -1) for value in request["user_texts"]]
+        require(all(index >= 0 for index in selected) and selected == sorted(set(selected)),
+                "wrong_history_originals")
+        require(request["user_texts"][-min(completed + 1, 3):] == expected[-min(completed + 1, 3):],
+                "missing_recent_originals")
         if request["tool"]:
             completed += 1
         elif not messages[completed - initial_turns]["text"].startswith("echo:"):
@@ -231,6 +255,7 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes, p
     require(len(session["turns"]) == initial_turns + count and
             all(turn["status"]["state"] == "Completed" for turn in session["turns"]),
             "uncommitted_session")
+    require([turn["input"] for turn in session["turns"]] == expected, "changed_persisted_originals")
     require(peak[0] > 0, "memory_sampling_failed")
     return {
         "messages": count, "latency_ms": latencies, "elapsed_ms": elapsed_ms,
