@@ -111,6 +111,8 @@ impl Outbox {
         if value.format_version != FORMAT_VERSION {
             return Err("文件队列记录版本不支持".into());
         }
+        // 先核对完整账本再恢复 Sending；坏记录不能被旁写，也不能把任意宿主路径交给通道。
+        validate_ledger(&value, &files)?;
         let mut changed = false;
         for record in &mut value.records {
             if record.state == State::Sending
@@ -357,9 +359,69 @@ impl Outbox {
     }
 }
 
+fn validate_ledger(ledger: &Ledger, files: &Path) -> Result<(), AppError> {
+    let invalid = || AppError::from("文件队列记录损坏；保留原文件，未恢复发送");
+    if ledger.next_id == 0
+        || ledger.records.len() > MAX_ENTRIES
+        || !fs::symlink_metadata(files).is_ok_and(|metadata| metadata.is_dir())
+    {
+        return Err(invalid());
+    }
+    let root = files.canonicalize().map_err(|_| invalid())?;
+    let mut ids = std::collections::BTreeSet::new();
+    for record in &ledger.records {
+        let number = record
+            .id
+            .strip_prefix("file-")
+            .and_then(|n| n.parse::<u64>().ok());
+        if number.is_none_or(|n| n == 0 || n >= ledger.next_id || record.id != format!("file-{n}"))
+            || !ids.insert(&record.id)
+            || SessionKey::new(&record.session_id, &record.user_id).is_err()
+            || record.name.as_deref().is_some_and(|name| !valid_name(name))
+            || record
+                .caption
+                .as_deref()
+                .is_some_and(|caption| !valid_caption(caption))
+            || record.platform_message_id.as_ref().is_some_and(|id| {
+                record.state != State::Sent
+                    || id.is_empty()
+                    || id.trim() != id
+                    || id.len() > 253
+                    || id.chars().any(char::is_control)
+            })
+        {
+            return Err(invalid());
+        }
+        let path = Path::new(&record.path);
+        if path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+            || path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| !valid_name(name))
+            || path
+                .parent()
+                .and_then(|parent| parent.canonicalize().ok())
+                .as_ref()
+                != Some(&root)
+        {
+            return Err(invalid());
+        }
+        // 已投递或结果未知的历史项可能已人工移走产物；待发送项必须仍是普通文件。
+        if record.state == State::Pending
+            && !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
 impl QqFileDelivery for Outbox {
     fn next_file(&self) -> eve_plugin_api::PluginResult<Option<QqFileMessage>> {
         let mut inner = self.inner.lock().map_err(|_| state("文件队列锁不可用"))?;
+        validate_ledger(&inner.ledger, &self.files).map_err(|error| state(error.to_string()))?;
         let Some(index) = inner
             .ledger
             .records
@@ -1584,5 +1646,83 @@ mod tests {
         assert_eq!(found.url, "https://media.example/latest.txt");
         assert!(inbox.attachment("qq:s", 2).is_err());
         assert!(inbox.attachment("qq:nobody", 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod outbox_restore_validation_tests {
+    use super::*;
+
+    fn stored(directory: &Path, records: Vec<Value>) -> Vec<u8> {
+        fs::create_dir_all(directory.join("files")).unwrap();
+        let bytes =
+            serde_json::to_vec(&json!({"format_version":1,"next_id":3,"records":records})).unwrap();
+        fs::write(directory.join("ledger.json"), &bytes).unwrap();
+        bytes
+    }
+    fn record(directory: &Path, id: &str) -> Value {
+        json!({"id":id,"session_id":"session","user_id":"user",
+            "path":directory.join("files/artifact.txt"),"name":"artifact.txt",
+            "caption":null,"state":"Sending"})
+    }
+    #[test]
+    fn corrupt_outbox_duplicate_ids_are_rejected_before_recovery_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = stored(
+            dir.path(),
+            vec![record(dir.path(), "file-1"), record(dir.path(), "file-1")],
+        );
+        assert!(
+            Outbox::open(dir.path().to_owned()).is_err(),
+            "duplicate delivery IDs must not recover"
+        );
+        assert_eq!(fs::read(dir.path().join("ledger.json")).unwrap(), original);
+    }
+    #[test]
+    fn corrupt_outbox_external_file_is_never_handed_to_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let mut row = record(dir.path(), "file-1");
+        row["state"] = json!("Pending");
+        row["path"] = json!(outside.path());
+        let original = stored(dir.path(), vec![row]);
+        let opened = Outbox::open(dir.path().to_owned());
+        if let Ok(outbox) = &opened {
+            assert!(
+                outbox.next_file().is_err(),
+                "external host path was admitted to channel"
+            );
+        }
+        assert!(opened.is_err(), "invalid path must fail at restore");
+        assert_eq!(fs::read(dir.path().join("ledger.json")).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queued_file_and_outbox_directory_links_are_rejected_without_queue_writes() {
+        for replace_directory in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            fs::write(outside.path().join("artifact.txt"), b"outside").unwrap();
+            let mut row = record(dir.path(), "file-1");
+            row["state"] = json!("Pending");
+            let original = stored(dir.path(), vec![row]);
+            fs::write(dir.path().join("files/artifact.txt"), b"owned artifact").unwrap();
+            let outbox = Outbox::open(dir.path().to_owned()).unwrap();
+            if replace_directory {
+                fs::rename(dir.path().join("files"), dir.path().join("saved-files")).unwrap();
+                std::os::unix::fs::symlink(outside.path(), dir.path().join("files")).unwrap();
+            } else {
+                fs::remove_file(dir.path().join("files/artifact.txt")).unwrap();
+                std::os::unix::fs::symlink(
+                    outside.path().join("artifact.txt"),
+                    dir.path().join("files/artifact.txt"),
+                )
+                .unwrap();
+            }
+            assert!(outbox.next_file().is_err());
+            assert!(Outbox::open(dir.path().to_owned()).is_err());
+            assert_eq!(fs::read(dir.path().join("ledger.json")).unwrap(), original);
+        }
     }
 }
