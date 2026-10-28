@@ -207,6 +207,27 @@ pub trait MemoryService: Send + Sync {
         let mut after = 0;
         loop {
             let page = self.archived(after, MAX_ARCHIVE_PAGE)?;
+            // 不信任实现返回的游标与计数，避免坏页造成无限读取或无界累计。
+            if page.evidence.len() > MAX_ARCHIVE_PAGE
+                || (archived.len() as u64)
+                    .checked_add(page.evidence.len() as u64)
+                    .is_none_or(|count| count > snapshot.archived_evidence)
+            {
+                return Err(MemoryError::CorruptState);
+            }
+            let mut last = after;
+            for item in &page.evidence {
+                if item.revision <= last || item.revision > snapshot.revision {
+                    return Err(MemoryError::CorruptState);
+                }
+                last = item.revision;
+            }
+            if page
+                .next_after
+                .is_some_and(|next| next != last || next <= after)
+            {
+                return Err(MemoryError::CorruptState);
+            }
             archived.extend(page.evidence);
             match page.next_after {
                 Some(next) => after = next,
@@ -218,9 +239,11 @@ pub trait MemoryService: Send + Sync {
         }
         archived.append(&mut snapshot.evidence);
         archived.sort_by_key(|item| item.revision);
-        if archived
-            .windows(2)
-            .any(|pair| pair[0].revision == pair[1].revision || pair[0].id == pair[1].id)
+        let mut ids = std::collections::HashSet::new();
+        if archived.iter().any(|item| !ids.insert(&item.id))
+            || archived
+                .windows(2)
+                .any(|pair| pair[0].revision == pair[1].revision)
         {
             return Err(MemoryError::CorruptState);
         }
@@ -340,3 +363,97 @@ redacted_debug!(
     SummaryJob,
     ArchivedEvidencePage
 );
+
+#[cfg(test)]
+mod complete_snapshot_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Pages {
+        snapshot: MemorySnapshot,
+        pages: Vec<ArchivedEvidencePage>,
+        calls: AtomicUsize,
+    }
+    impl MemoryService for Pages {
+        fn snapshot(&self) -> MemoryResult<MemorySnapshot> {
+            Ok(self.snapshot.clone())
+        }
+        fn archived(&self, _: u64, _: usize) -> MemoryResult<ArchivedEvidencePage> {
+            self.pages
+                .get(self.calls.fetch_add(1, Ordering::SeqCst))
+                .cloned()
+                .ok_or(MemoryError::Unavailable)
+        }
+    }
+    fn evidence(id: &str, revision: u64) -> InteractionEvidence {
+        InteractionEvidence {
+            id: id.into(),
+            revision,
+            at_ms: 1,
+            source: EvidenceSource::CompletedInteraction {
+                message_id: format!("m-{revision}"),
+                session_revision: revision * 2,
+                turn_id: revision,
+                user_text: "原文".into(),
+                assistant_text: "回复".into(),
+            },
+        }
+    }
+    fn source() -> Pages {
+        Pages {
+            snapshot: MemorySnapshot {
+                scope: MemoryScope {
+                    channel: "test".into(),
+                    session_id: "s".into(),
+                    user_id: "u".into(),
+                },
+                revision: 3,
+                evidence: vec![evidence("c", 3)],
+                preferences: vec![],
+                archived_evidence: 2,
+            },
+            pages: vec![ArchivedEvidencePage {
+                evidence: vec![evidence("a", 1), evidence("b", 2)],
+                next_after: None,
+            }],
+            calls: AtomicUsize::new(0),
+        }
+    }
+    #[test]
+    fn complete_snapshot_rejects_nonadjacent_duplicate_ids() {
+        let mut source = source();
+        source.snapshot.evidence[0].id = "a".into();
+        assert!(matches!(
+            source.complete_snapshot(),
+            Err(MemoryError::CorruptState)
+        ));
+    }
+    #[test]
+    fn complete_snapshot_rejects_nonprogressing_archive_cursor_before_next_read() {
+        let mut source = source();
+        source.pages = vec![
+            ArchivedEvidencePage {
+                evidence: vec![evidence("a", 1)],
+                next_after: Some(0),
+            },
+            ArchivedEvidencePage {
+                evidence: vec![evidence("b", 2)],
+                next_after: None,
+            },
+        ];
+        assert!(matches!(
+            source.complete_snapshot(),
+            Err(MemoryError::CorruptState)
+        ));
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn complete_snapshot_accepts_monotonic_pages_and_preserves_raw_evidence() {
+        let source = source();
+        let snapshot = source.complete_snapshot().unwrap();
+        assert_eq!(
+            snapshot.evidence,
+            vec![evidence("a", 1), evidence("b", 2), evidence("c", 3)]
+        );
+        assert_eq!(snapshot.archived_evidence, 0);
+    }
+}

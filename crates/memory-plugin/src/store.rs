@@ -133,22 +133,17 @@ impl ScopeRecord {
             };
         }
         reject_origin_alias(&self.snapshot.evidence, &evidence.source)?;
-        if let EvidenceSource::CompletedInteraction { turn_id, .. } = evidence.source {
-            // 已归档的同一轮次：相同来源重放视为已保存，其余均为冲突。
-            for chunk in &self.archive {
-                if !(chunk.first_turn..=chunk.last_turn).contains(&turn_id) {
-                    continue;
+        // ID/message_id 是整个原scope的身份；新turn也不能复用旧归档来源。
+        // 不能仅凭turn范围跳过分块，否则新turn可把完整视图写成重复身份。
+        for chunk in &self.archive {
+            for old in archived(chunk)? {
+                if old.id == evidence.id && same_source(&old.source, &evidence.source) {
+                    return Ok(false);
                 }
-                for old in archived(chunk)? {
-                    if old.id == evidence.id && same_source(&old.source, &evidence.source) {
-                        return Ok(false);
-                    }
-                    if old.id == evidence.id
-                        || reject_origin_alias(std::slice::from_ref(&old), &evidence.source)
-                            .is_err()
-                    {
-                        return Err(MemoryError::Conflict);
-                    }
+                if old.id == evidence.id
+                    || reject_origin_alias(std::slice::from_ref(&old), &evidence.source).is_err()
+                {
+                    return Err(MemoryError::Conflict);
                 }
             }
         }
@@ -217,6 +212,14 @@ impl ScopeRecord {
                     }
                 } else {
                     reject_origin_alias(&self.snapshot.evidence, &source)?;
+                    for chunk in &self.archive {
+                        for old in archived(chunk)? {
+                            if old.id == statement.evidence_id {
+                                return Err(MemoryError::Conflict);
+                            }
+                            reject_origin_alias(std::slice::from_ref(&old), &source)?;
+                        }
+                    }
                     self.snapshot.evidence.push(InteractionEvidence {
                         id: statement.evidence_id.clone(),
                         revision,
@@ -952,8 +955,14 @@ fn validate_document(document: &Document, archive: Option<&ArchiveConfig>) -> Me
         let archived = record.snapshot.archived_evidence;
         if !scopes.insert(&record.snapshot.scope)
             || record.snapshot.revision == 0
-            || record.snapshot.revision > (MAX_EVIDENCE + MAX_HISTORY) as u64 + archived
-            || record.archive.iter().map(|chunk| chunk.count).sum::<u64>() != archived
+            || ((MAX_EVIDENCE + MAX_HISTORY) as u64)
+                .checked_add(archived)
+                .is_none_or(|maximum| record.snapshot.revision > maximum)
+            || record
+                .archive
+                .iter()
+                .try_fold(0u64, |sum, chunk| sum.checked_add(chunk.count))
+                != Some(archived)
         {
             return Err(MemoryError::CorruptState);
         }
@@ -1006,15 +1015,22 @@ fn validate_document(document: &Document, archive: Option<&ArchiveConfig>) -> Me
             cache.insert(name, evidence.clone());
             Ok(evidence)
         };
-        for revision in 1..=record.snapshot.revision {
+        let mut revision = 1;
+        while revision <= record.snapshot.revision {
             while run.is_some_and(|[_, end]| *end < revision) {
                 run = runs.next();
             }
-            if run.is_some_and(|[start, _]| *start <= revision) {
-                if operations.contains_key(&revision) || evidence.contains_key(&revision) {
+            if let Some([start, end]) = run
+                && *start <= revision
+            {
+                // 归档只核对已验证的连续修订段，不能对每条旧修订再做一次空重放。
+                if operations.range(revision..=*end).next().is_some()
+                    || evidence.range(revision..=*end).next().is_some()
+                {
                     return Err(MemoryError::CorruptState);
                 }
-                replay.snapshot.revision = revision;
+                replay.snapshot.revision = *end;
+                revision = end.checked_add(1).ok_or(MemoryError::CorruptState)?;
                 continue;
             }
             let changed = if let Some(operation) = operations.get(&revision) {
@@ -1029,6 +1045,7 @@ fn validate_document(document: &Document, archive: Option<&ArchiveConfig>) -> Me
             if !changed {
                 return Err(MemoryError::CorruptState);
             }
+            revision = revision.checked_add(1).ok_or(MemoryError::CorruptState)?;
         }
         replay.snapshot.archived_evidence = archived;
         replay.archive = record.archive.clone();
@@ -1037,4 +1054,35 @@ fn validate_document(document: &Document, archive: Option<&ArchiveConfig>) -> Me
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod corruption_bounds_tests {
+    use super::*;
+    #[test]
+    fn impossible_archive_count_is_rejected_without_integer_panic() {
+        let mut record = ScopeRecord::empty(MemoryScope {
+            channel: "test".into(),
+            session_id: "s".into(),
+            user_id: "u".into(),
+        });
+        record.snapshot.revision = 1;
+        record.snapshot.archived_evidence = u64::MAX;
+        record.archive.push(ChunkRecord {
+            sequence: 0,
+            sha256: "a".repeat(64),
+            bytes: 1,
+            count: u64::MAX,
+            revisions: vec![[1, u64::MAX]],
+            first_turn: 1,
+            last_turn: 1,
+            compressed: false,
+        });
+        let document = Document {
+            format_version: ARCHIVED_FORMAT_VERSION,
+            scopes: vec![record],
+            next_chunk: 1,
+        };
+        assert!(validate_document(&document, None).is_err());
+    }
 }

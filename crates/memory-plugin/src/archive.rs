@@ -112,14 +112,28 @@ impl ChunkRecord {
         self.revisions.last().map_or(0, |run| run[1])
     }
     pub fn validate(&self) -> MemoryResult<()> {
+        // 与归档写入策略的单块条数上限一致；坏索引不能宣称任意多条历史。
+        if self.count == 0
+            || self.count > 4096
+            || self.revisions.is_empty()
+            || self.revisions.len() as u64 > self.count
+        {
+            return Err(MemoryError::CorruptState);
+        }
         let mut total = 0u64;
         let mut previous = 0u64;
         for [start, end] in &self.revisions {
             // 相邻段必须至少隔一个修订，否则应合并为一段。
-            if *start == 0 || start > end || (previous > 0 && *start <= previous + 1) {
+            if *start == 0
+                || start > end
+                || (previous > 0 && previous.checked_add(1).is_none_or(|next| *start <= next))
+            {
                 return Err(MemoryError::CorruptState);
             }
-            total += end - start + 1;
+            total = total
+                .checked_add(end - start + 1)
+                .filter(|total| *total <= self.count)
+                .ok_or(MemoryError::CorruptState)?;
             previous = *end;
         }
         if self.count == 0
@@ -489,5 +503,11 @@ mod tests {
             load_chunk(&store, &scope(), &record),
             Err(MemoryError::CorruptState)
         ));
+    }
+    #[test]
+    fn corrupt_revision_ranges_return_error_without_integer_panic() {
+        let (mut record, _) = encode_chunk(1, &scope(), vec![evidence(1)], true).unwrap();
+        record.revisions = vec![[1, u64::MAX], [1, 1]];
+        assert!(record.validate().is_err());
     }
 }

@@ -346,9 +346,22 @@ async fn restart_keeps_archive_and_missing_or_tampered_chunks_are_never_skipped(
     let status = rig.admin.archive_status().unwrap();
     assert!(status.last_error.is_some());
     let chunks_before = status.chunks;
+    // 旧分块损坏时无法核对来源ID唯一性，拒绝新记忆写入；Session原话和待导入交互保留。
+    let namespace = eve_plugin_api::PluginId::new(MEMORY_PLUGIN_ID).unwrap();
+    let memory_before = state.get(&namespace, MEMORY_STATE_KEY).unwrap();
+    let mut pending = vec![];
     for number in 13..=20 {
-        import(&rig, &owner, number).unwrap();
+        let interaction = prepare(&rig, &owner, number);
+        assert!(matches!(
+            commit(&rig, &owner, interaction.clone()),
+            Err(MemoryError::CorruptState)
+        ));
+        pending.push(interaction);
     }
+    assert_eq!(
+        state.get(&namespace, MEMORY_STATE_KEY).unwrap(),
+        memory_before
+    );
     assert_eq!(rig.admin.archive_status().unwrap().chunks, chunks_before);
     stop(rig).await;
     drop(state);
@@ -384,6 +397,9 @@ async fn restart_keeps_archive_and_missing_or_tampered_chunks_are_never_skipped(
     )
     .await
     .unwrap();
+    for interaction in pending {
+        commit(&rig, &owner, interaction).unwrap();
+    }
     assert_complete(&rig.admin, &owner, 20);
     stop(rig).await;
 }
@@ -1092,22 +1108,103 @@ async fn archived_single_scope_over_hot_byte_limit_still_recalls_old_evidence() 
 
 #[tokio::test]
 async fn archived_identity_aliases_cannot_be_reused_by_a_new_turn() {
-    for alias_message in [false,true] {
-        let directory=tempfile::tempdir().unwrap();
-        let archive=Arc::new(FileEvidenceArchive::open(directory.path()).unwrap());
-        let rig=start(None,Some((archive,small_policy()))).await.unwrap();
-        let scope=scope("archive-alias");
-        for number in 1..=8 { import(&rig,&scope,number).unwrap(); }
-        let archived=all_archived(&rig.admin,&scope);
+    for alias_message in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Arc::new(FileEvidenceArchive::open(directory.path()).unwrap());
+        let rig = start(None, Some((archive, small_policy()))).await.unwrap();
+        let scope = scope("archive-alias");
+        for number in 1..=8 {
+            import(&rig, &scope, number).unwrap();
+        }
+        let archived = all_archived(&rig.admin, &scope);
         assert!(!archived.is_empty());
-        let original=rig.admin.reader(scope.clone()).unwrap().complete_snapshot().unwrap();
-        let mut next=prepare(&rig,&scope,9);
+        let original = rig
+            .admin
+            .reader(scope.clone())
+            .unwrap()
+            .complete_snapshot()
+            .unwrap();
+        let mut next = prepare(&rig, &scope, 9);
         if alias_message {
-            let EvidenceSource::CompletedInteraction{message_id,..}=&archived[0].source else {panic!()};
-            next.message_id=message_id.clone();
-        } else { next.evidence_id=archived[0].id.clone(); }
-        assert!(matches!(commit(&rig,&scope,next),Err(MemoryError::Conflict)),"旧归档身份不得由新轮次复用");
-        assert!(rig.admin.reader(scope).unwrap().complete_snapshot().unwrap()==original);
+            let EvidenceSource::CompletedInteraction { message_id, .. } = &archived[0].source
+            else {
+                panic!()
+            };
+            next.message_id = message_id.clone();
+        } else {
+            next.evidence_id = archived[0].id.clone();
+        }
+        assert!(
+            matches!(commit(&rig, &scope, next), Err(MemoryError::Conflict)),
+            "旧归档身份不得由新轮次复用"
+        );
+        assert!(
+            rig.admin
+                .reader(scope)
+                .unwrap()
+                .complete_snapshot()
+                .unwrap()
+                == original
+        );
+        stop(rig).await;
+    }
+}
+
+#[tokio::test]
+async fn archived_identity_aliases_cannot_be_reused_by_a_statement() {
+    for alias_message in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = Arc::new(FileEvidenceArchive::open(directory.path()).unwrap());
+        let rig = start(None, Some((archive, small_policy()))).await.unwrap();
+        let scope = scope("archive-statement-alias");
+        for number in 1..=8 {
+            import(&rig, &scope, number).unwrap();
+        }
+        let archived = all_archived(&rig.admin, &scope);
+        let original = rig
+            .admin
+            .reader(scope.clone())
+            .unwrap()
+            .complete_snapshot()
+            .unwrap();
+        let EvidenceSource::CompletedInteraction { message_id, .. } = &archived[0].source else {
+            panic!()
+        };
+        let result = rig.admin.update_preference(
+            &scope,
+            original.revision,
+            PreferenceChange {
+                operation_id: "new-statement".into(),
+                at_ms: 100,
+                evidence: PreferenceEvidence::Statement(UserStatement {
+                    evidence_id: if alias_message {
+                        "new-evidence".into()
+                    } else {
+                        archived[0].id.clone()
+                    },
+                    message_id: if alias_message {
+                        message_id.clone()
+                    } else {
+                        "new-message".into()
+                    },
+                    text: "新来源不能改写旧来源".into(),
+                    at_ms: 100,
+                }),
+                action: PreferenceAction::Confirm {
+                    id: "pref".into(),
+                    text: "新偏好".into(),
+                },
+            },
+        );
+        assert!(matches!(result, Err(MemoryError::Conflict)));
+        assert!(
+            rig.admin
+                .reader(scope)
+                .unwrap()
+                .complete_snapshot()
+                .unwrap()
+                == original
+        );
         stop(rig).await;
     }
 }
