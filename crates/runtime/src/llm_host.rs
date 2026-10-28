@@ -143,6 +143,11 @@ impl LlmHostConfig {
         if self.output_format.trim().is_empty() {
             return Err(LlmError::Configuration("输出格式不能为空".into()));
         }
+        if self.max_parallel_tool_calls > Semaphore::MAX_PERMITS {
+            return Err(LlmError::Configuration(
+                "工具并发上限超过执行器支持范围".into(),
+            ));
+        }
         if self.event_timeout.is_zero()
             || self.max_stream_text_bytes == 0
             || self.provider_timeout.is_zero()
@@ -2544,5 +2549,32 @@ mod tests {
                 ..
             }
         ));
+    }
+    #[test]
+    fn oversized_concurrency_is_a_configuration_error_instead_of_a_constructor_panic() {
+        for permits in [Semaphore::MAX_PERMITS + 1, usize::MAX] {
+            let services = KernelServices::default();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                LlmHost::new(
+                    Arc::new(ScriptedProvider {
+                        calls: Mutex::new(vec![]),
+                    }),
+                    services.registry.clone(),
+                    Kernel::new(),
+                    services.permissions,
+                    ContextBinding {
+                        service_id: ServiceId::new(CONTEXT).unwrap(),
+                        expected_owner: PluginId::new("owner").unwrap(),
+                    },
+                    vec![],
+                    LlmHostConfig {
+                        max_parallel_tool_calls: permits,
+                        ..Default::default()
+                    },
+                )
+            }));
+            assert!(result.is_ok(), "invalid concurrency must not panic");
+            assert!(matches!(result.unwrap(), Err(LlmError::Configuration(_))));
+        }
     }
 }
