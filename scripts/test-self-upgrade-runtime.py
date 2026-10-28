@@ -18,6 +18,18 @@ spec = importlib.util.spec_from_file_location('upgrade_runtime', SCRIPT)
 runtime = importlib.util.module_from_spec(spec); spec.loader.exec_module(runtime)
 
 class DigestTests(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'Windows runner 不保证有文件符号链接权限')
+    def test_request_file_symlink_cannot_change_the_manual_request_gate(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            automatic = root / 'auto-request.json'
+            automatic.write_text('{}')
+            (root / 'request.json').symlink_to(automatic)
+            supervisor = SimpleNamespace(stopping=False, root=root)
+            with self.assertRaisesRegex(ValueError, 'invalid_json_file'):
+                runtime.Supervisor.switch(supervisor, {}, [], {})
+
     def test_state_reader_accepts_extended_receipt_storage_size(self):
         self.assertGreaterEqual(runtime.MAX_STATE_JSON, 256 * 1024 * 1024)
         # 使用空白模拟较大的宿主文档，旧 64 MiB 门禁会拒绝。

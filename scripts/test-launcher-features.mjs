@@ -31,11 +31,11 @@ require('node:fs').writeFileSync('captured.json', JSON.stringify({args:process.a
     web: { listen: '127.0.0.1:0', token: 'synthetic-panel-token-12345678901234567890' },
     updates: { enabled: false }, features: { training: false, cognition: false, self_learning: false, memory_recall: false, segmented: false },
   };
-  return { root, config, async launch(value) {
+  return { root, config, async launch(value, extra = []) {
     const next = structuredClone(config);
     if (value !== undefined) next.features.autonomous_tools = value;
     await fs.writeFile(path.join(root, 'config.json'), JSON.stringify(next));
-    return spawnSync(process.execPath, [path.join(root, 'Launch.mjs'), 'qq', '--no-prompt', '--skip-update'], { encoding: 'utf8', timeout: 10000 });
+    return spawnSync(process.execPath, [path.join(root, 'Launch.mjs'), 'qq', '--no-prompt', '--skip-update', ...extra], { encoding: 'utf8', timeout: 10000 });
   } };
 }
 
@@ -57,4 +57,10 @@ test('启动器拒绝非布尔能力开关，宿主尚未启动', { skip: proces
     assert.match(result.stderr, /features\.autonomous_tools 必须为布尔值/);
     await assert.rejects(fs.stat(path.join(f.root, 'captured.json')), { code: 'ENOENT' });
   }
+});
+test('仅验证配置时不启动宿主或默认能力', { skip: process.platform === 'win32' }, async t => {
+  const f = await fixture(t), result = await f.launch(true, ['--validate-only']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /配置及发行包检查通过/);
+  await assert.rejects(fs.stat(path.join(f.root, 'captured.json')), { code: 'ENOENT' });
 });

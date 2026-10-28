@@ -120,6 +120,14 @@ print('fixture check passed')
         self.assertEqual(self.fixture.events.read_text().splitlines(), ['old', 'new'])
         self.assertEqual(runtime.read_json(self.fixture.queue / 'supervisor.json')['active_sha256'], supervisor.status['active_sha256'])
 
+    def test_auto_request_directory_alias_still_uses_the_host_idle_gate(self):
+        # Windows TEMP 可能是 8.3 短名，监督器 resolve 后为长名；用 .. 在所有平台重现目录别名。
+        self.updater.control = self.fixture.queue / '..' / self.fixture.queue.name
+        self.supervisor_start()
+        self.ticks(lambda: self.updater.status.get('result') in ('applied', 'failed'))
+        self.assertEqual(self.updater.status.get('result'), 'applied', json.dumps(self.updater.status))
+        self.assertEqual(self.fixture.events.read_text().splitlines(), ['old', 'new'])
+
     def test_stages_recompute_jobs_and_children_receive_actual_limits_in_order(self):
         observed = []
         probe = self.probe

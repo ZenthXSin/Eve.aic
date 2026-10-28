@@ -27,6 +27,23 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def validate_launcher(command, phase, timeout=20):
+    """分别定位内置 Node 与平台包装器；保留有限期限及失败输出。"""
+    def excerpt(value):
+        return (value.decode(errors='replace') if isinstance(value, bytes) else str(value or ''))[-4000:]
+    started = time.monotonic()
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        print(json.dumps({'launcher_validation_phase': phase, 'elapsed_seconds': round(time.monotonic() - started, 3),
+                          'timeout_seconds': timeout, 'ok': False}), flush=True)
+        raise RuntimeError(f'启动器配置预检超时（{phase}，{timeout} 秒）；stdout={excerpt(error.stdout)!r}；stderr={excerpt(error.stderr)!r}') from error
+    print(json.dumps({'launcher_validation_phase': phase, 'elapsed_seconds': round(time.monotonic() - started, 3),
+                      'exit_code': result.returncode, 'ok': result.returncode == 0}), flush=True)
+    require(result.returncode == 0,
+            f'启动器配置预检失败（{phase}）；stdout={excerpt(result.stdout)!r}；stderr={excerpt(result.stderr)!r}')
+
+
 def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, label, updated=None):
     config_path = root / "config.json"
     before = config_path.read_bytes()
@@ -206,18 +223,15 @@ def main():
             config["qq"]["app_secret"] = "test-app-secret"
             config["web"] = {"listen": "127.0.0.1:0", "token": "synthetic-package-panel-token-12345678901234567890"}
             (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            node = root / ("runtime/node.exe" if os.name == "nt" else "runtime/bin/node")
+            if os.name != "nt":
+                script_extension = "command" if sys.platform == "darwin" else "sh"
+                for name in ("Start-Eve", "Start-Console", "Open-Panel"):
+                    require(os.access(root / f"{name}.{script_extension}", os.X_OK), "解压丢失启动脚本执行权限")
+            validate_launcher([str(node), str(root / "Launch.mjs"), "qq", "--validate-only"], 'bundled_node')
             if manifest["platform_label"] == "windows-x64":
-                validation_command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                                      "-File", str(root / "Launch.ps1"), "-ValidateOnly"]
-            else:
-                node = root / ("runtime/node.exe" if os.name == "nt" else "runtime/bin/node")
-                validation_command = [str(node), str(root / "Launch.mjs"), "qq", "--validate-only"]
-                if os.name != "nt":
-                    script_extension = "command" if sys.platform == "darwin" else "sh"
-                    for name in ("Start-Eve", "Start-Console", "Open-Panel"):
-                        require(os.access(root / f"{name}.{script_extension}", os.X_OK), "解压丢失启动脚本执行权限")
-            validation = subprocess.run(validation_command, capture_output=True, timeout=20)
-            require(validation.returncode == 0, "启动器配置预检失败：" + validation.stderr.decode(errors="replace"))
+                validate_launcher(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                                   "-File", str(root / "Launch.ps1"), "-ValidateOnly"], 'windows_powershell_5_1')
             bridge = work / "离线 桥接.mjs"
             bridge.write_bytes((pathlib.Path(__file__).resolve().parents[1] / "connectors/qqbot/test/fake-bridge.mjs").read_bytes())
             message = {"id": "package-chat", "scope": "c2c", "target_id": "user-1", "user_id": "user-1",

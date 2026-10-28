@@ -1,4 +1,4 @@
-"""真实 QQ 宿主进程：最近 20 条直接注入，当前群原话按需召回。
+"""真实 QQ 宿主进程：本轮可信消息锚定的至多 20 条原话，当前群按需召回。
 
 Jev、主模型和 QQ 均为本地替身，不向真实群发测试消息。
 """
@@ -12,8 +12,11 @@ from dialogue_tools_test import text_response, tool_response
 def group_context(body):
     for message in body['messages']:
         content = message.get('content')
-        if isinstance(content, str) and '当前群的真实消息观察摘录' in content:
-            return json.loads(content[content.index('{"group_messages"'):])
+        # 读取真实锚点契约，避免把中文说明或JSON字段排列当成公开接口。
+        if isinstance(content, str) and '"group_messages"' in content and '"current_turn_message_ids"' in content:
+            data = json.loads(content[content.index('{'):])
+            if {'group_messages', 'current_turn_message_ids', 'cutoff_seq'} <= set(data):
+                return data
     return None
 
 
@@ -51,6 +54,10 @@ class GroupRecallAcceptance(group_relation_test.GroupRelationAcceptance):
         self.assertEqual([m['text'].split()[0] for m in messages[:-1]], [f'第{i}句' for i in range(6, 25)])
         self.assertTrue(all(m['truncated'] for m in messages[:-1]))
         self.assertEqual(messages[-1]['text'], 'eve看看最近消息')
+        self.assertEqual(context['cutoff_seq'], messages[-1]['seq'])
+        self.assertEqual(context['current_turn_message_ids'], [messages[-1]['id']])
+        self.assertEqual([m['id'] for m in messages if m['current_turn']], context['current_turn_message_ids'])
+        self.assertEqual([m['seq'] for m in messages], sorted(m['seq'] for m in messages))
         self.assertIn('at_ms', messages[0])
         self.assertNotIn('related_earlier', context)
         self.assertEqual(self.recall_requests, [], '回答前不能再调用 Jev 挑原话')

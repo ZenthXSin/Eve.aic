@@ -78,7 +78,15 @@ jobs:
             exit $result
           }
       - name: 验证源码自动同步、检查失败与空闲切换
-        run: python -X utf8 scripts/test-source-update.py
+        run: |
+          $output = & python -X utf8 scripts/test-source-update.py 2>&1
+          $result = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($result -ne 0) {
+            $details = ($output -join "`n").Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=源码自动同步验收失败::$details"
+            exit $result
+          }
       - name: 验证资源配额、可用内存与编译阶段并发
         run: python -X utf8 scripts/test-build-resources.py
       - name: 验证 Linux 外层守护、孤儿清理与两层崩溃恢复

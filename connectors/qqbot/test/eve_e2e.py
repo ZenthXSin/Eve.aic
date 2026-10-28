@@ -512,8 +512,11 @@ class Acceptance(unittest.TestCase):
         self.run_eve(script=[
             {"send": self.message("x" * 254, "超长不执行", scope="group")},
             {"send": self.message("界" * 85, "UTF-8 超长不执行", scope="group")},
-            {"send": self.message(valid, "字节边界", scope="group")},
-            self.wait_command(valid)])
+            # 平台回执 ID 独立于入站 ID；默认替身的 out- 前缀会使本边界 ID 超限。
+            {"send": self.message(valid, "字节边界", scope="group") | {
+                "delivery_diagnostic": {"message_id": "out-valid-boundary"}}},
+            {"wait_receipt": {"path": str(self.work / "state/state.json"),
+                              "id": valid, "state": "Sent"}}])
         self.assertEqual(len(self.requests), 1)
         self.assertEqual(self.replies(), [(valid, "字节边界")])
         entries = self.documents()["eve.channel.qqbot"]["receipts.v1"]["entries"]

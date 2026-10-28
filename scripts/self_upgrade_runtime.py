@@ -646,7 +646,12 @@ class Supervisor:
     def switch(self, request, command, manifest, request_path=None):
         if self.stopping: raise ValueError('shutdown_requested')
         # 再次核对磁盘上的请求、资源与执行文件，不能切换一份预检之后发生变化的候选。
-        request_path = request_path or self.root / 'request.json'
+        request_path = Path(request_path or self.root / 'request.json')
+        # Windows TEMP 的 8.3 短名与 resolve 后的长名必须指向同一请求类型。
+        # 只规范化父目录，保留请求文件本身供 read_json 拒绝符号链接。
+        request_path = request_path.parent.resolve() / request_path.name
+        if request_path not in (self.root / 'request.json', self.root / 'auto-request.json'):
+            raise ValueError('request_path_outside_supervisor')
         if read_json(request_path) != request or manifest['candidate_sha256'] != request['candidate_sha256']:
             raise ValueError('request_changed')
         binary, _, checked = validate_candidate(request, self.options.candidates)
