@@ -195,7 +195,21 @@ impl ScriptStore {
         reference: &VersionRef,
         migration: Option<StateMigration>,
     ) -> Result<()> {
+        self.activate_with_receipt(owner, reference, migration, None)
+    }
+    pub(crate) fn activate_with_receipt(
+        &self,
+        owner: &ContextScope,
+        reference: &VersionRef,
+        migration: Option<StateMigration>,
+        receipt: Option<Receipt>,
+    ) -> Result<()> {
         self.change(|ledger| {
+            if let Some(receipt) = &receipt
+                && ledger.receipts.contains_key(&receipt.call_id)
+            {
+                return Err(reject("迁移调用ID已存在"));
+            }
             let version = get_version(ledger, owner, reference)?.clone();
             if !ledger.states.contains_key(&reference.digest) {
                 let previous = ledger
@@ -224,7 +238,15 @@ impl ScriptStore {
                 } else if let Some(previous) = previous {
                     if ledger.receipts.values().any(|r| {
                         r.version == previous
-                            && matches!(r.status, ReceiptStatus::Running | ReceiptStatus::Unknown)
+                            && (r.status == ReceiptStatus::Unknown
+                                || (r.status == ReceiptStatus::Running
+                                    && !(version.spec.state_schema.fields.is_empty()
+                                        && ledger.states.get(&previous.digest).is_some_and(
+                                            |state| {
+                                                state.schema == version.spec.state_schema
+                                                    && state.schema.fields.is_empty()
+                                            },
+                                        ))))
                     }) {
                         return Err(reject("源版本存在运行中或未知调用，不能复制状态"));
                     }
@@ -254,7 +276,43 @@ impl ScriptStore {
             ledger
                 .active
                 .insert(active_key(owner, &reference.script)?, reference.clone());
+            if let Some(receipt) = receipt {
+                ledger.receipts.insert(receipt.call_id.clone(), receipt);
+            }
             Ok(())
+        })
+    }
+    pub(crate) fn migration_source(
+        &self,
+        owner: &ContextScope,
+        target: &VersionRef,
+        from: &VersionRef,
+        revision: u64,
+        call_id: &str,
+    ) -> Result<StateSnapshot> {
+        self.read(|ledger| {
+            get_version(ledger, owner, target)?;
+            get_version(ledger, owner, from)?;
+            if target.script != from.script
+                || ledger.states.contains_key(&target.digest)
+                || ledger.receipts.contains_key(call_id)
+            {
+                return Err(reject("迁移脚本/目标状态/调用ID无效"));
+            }
+            if ledger.receipts.values().any(|r| {
+                r.version == *from
+                    && matches!(r.status, ReceiptStatus::Running | ReceiptStatus::Unknown)
+            }) {
+                return Err(reject("源版本存在运行中或未知调用"));
+            }
+            let state = ledger
+                .states
+                .get(&from.digest)
+                .ok_or_else(|| reject("迁移源没有状态"))?;
+            if state.revision != revision {
+                return Err(reject("迁移源状态已变化"));
+            }
+            Ok(state.clone())
         })
     }
     pub fn state(&self, owner: &ContextScope, reference: &VersionRef) -> Result<StateSnapshot> {

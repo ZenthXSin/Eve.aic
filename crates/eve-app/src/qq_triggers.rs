@@ -8,8 +8,8 @@ use eve_llm_api::{
 };
 use eve_plugin_api::{PluginError, PluginResult};
 use eve_qqbot_plugin::{
-    QqConversations, QqOutreach, QqOutreachFuture, QqOutreachMessage, QqOutreachMoment,
-    QqOutreachPush, QqOutreachResult,
+    QqAdmission, QqAdmissionResult, QqConversations, QqOutreach, QqOutreachFuture,
+    QqOutreachMessage, QqOutreachMoment, QqOutreachPush, QqOutreachResult,
 };
 use eve_session_api::{SessionInput, SessionKey, SessionService, SessionTurnStatus};
 use eve_task_api::TaskAdmin;
@@ -67,6 +67,7 @@ pub(crate) struct Observations {
     operators: BTreeSet<String>,
     authorization: Option<Arc<dyn eve_developer_api::DeveloperAuthorization>>,
     processes: bool,
+    admission: Option<Arc<crate::qq_subject_admission::Admission>>,
 }
 impl Observations {
     pub(crate) fn new(
@@ -93,8 +94,33 @@ impl Observations {
                 .as_ref()
                 .map_or_else(BTreeSet::new, |c| c.operators.clone()),
             authorization: None,
+            admission: None,
             processes: config.is_some_and(|c| c.commands),
         })
+    }
+    pub(crate) fn with_admission(
+        mut self,
+        admission: Arc<crate::qq_subject_admission::Admission>,
+    ) -> Self {
+        self.admission = Some(admission);
+        self
+    }
+    fn begin_admission(&self, t: &Trigger) -> Result<Option<String>, AppError> {
+        match &self.admission {
+            None => Ok(Some(String::new())),
+            Some(admission) => Ok(admission.begin_work(
+                &t.owner,
+                &format!("trigger:{}:{}", t.id, t.runs),
+                eve_subject_api::EventPriority::Recovery,
+                eve_subject_api::EventSource::RecoverySupervisor,
+            )?),
+        }
+    }
+    fn finish_admission(&self, ticket: &str, result: QqAdmissionResult) -> Result<(), AppError> {
+        if let Some(admission) = &self.admission {
+            admission.finish(ticket, result)?;
+        }
+        Ok(())
     }
     pub(crate) fn with_authorization(
         mut self,
@@ -709,6 +735,9 @@ async fn run(
                 }
             }
             if !matches!(t.status, Status::Armed | Status::Ready) {
+                if let Some(admission) = &observations.admission {
+                    admission.abandon(&t.owner, &format!("trigger:{}:{}", t.id, t.runs))?;
+                }
                 continue;
             }
             if !observations.authorized(&t.owner) {
@@ -762,7 +791,11 @@ async fn run(
                 }
             }
             if let Some(id) = &t.spec.resume_task_id {
+                let Some(ticket) = observations.begin_admission(&t)? else {
+                    continue;
+                };
                 if !transition(admin.as_ref(), &t.id, Status::Ready, Status::Running, None)? {
+                    observations.finish_admission(&ticket, QqAdmissionResult::Rejected)?;
                     continue;
                 }
                 t.runs = t.runs.saturating_add(1);
@@ -782,6 +815,14 @@ async fn run(
                         ),
                         now_ms(),
                     );
+                observations.finish_admission(
+                    &ticket,
+                    if resumed.is_ok() {
+                        QqAdmissionResult::Started
+                    } else {
+                        QqAdmissionResult::Rejected
+                    },
+                )?;
                 let did_resume = resumed.is_ok();
                 let (state, result) = match resumed {
                     Ok(task) => (
@@ -820,7 +861,11 @@ async fn run(
             let Some(lease) = conversations.try_claim_wakeup() else {
                 continue;
             };
+            let Some(ticket) = observations.begin_admission(&t)? else {
+                continue;
+            };
             if !transition(admin.as_ref(), &t.id, Status::Ready, Status::Running, None)? {
+                observations.finish_admission(&ticket, QqAdmissionResult::Rejected)?;
                 continue;
             }
             t.runs = t.runs.saturating_add(1);
@@ -838,12 +883,17 @@ async fn run(
                 },
                 Arc::new(DiscardControlEvents),
             ) {
-                Ok(k) => k,
+                Ok(k) => {
+                    observations.finish_admission(&ticket, QqAdmissionResult::Started)?;
+                    k
+                }
                 Err(eve_control_api::ControlError::Busy) => {
+                    observations.finish_admission(&ticket, QqAdmissionResult::Rejected)?;
                     transition(admin.as_ref(), &t.id, Status::Running, Status::Ready, None)?;
                     continue;
                 }
                 Err(_) => {
+                    observations.finish_admission(&ticket, QqAdmissionResult::Rejected)?;
                     transition(
                         admin.as_ref(),
                         &t.id,
@@ -991,6 +1041,7 @@ mod tests {
             workspace: Some(directory.path().into()),
             operators: BTreeSet::from(["u".into()]),
             authorization: None,
+            admission: None,
             processes: true,
         };
         (kernel, Arc::new(observations), directory)

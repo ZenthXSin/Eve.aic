@@ -276,6 +276,7 @@ pub(crate) struct Services {
     pub debounce: Option<Arc<dyn crate::QqDebounce>>,
     pub stickers: Option<Arc<dyn crate::QqStickers>>,
     pub failure_recovery: Option<Arc<dyn crate::QqFailureRecovery>>,
+    pub admission: Option<Arc<dyn crate::QqAdmission>>,
 }
 /// 宿主接线的主动交流；`push_interval` 为空时不主动私聊。
 pub(crate) struct OutreachHook {
@@ -815,6 +816,7 @@ pub(crate) async fn run(
         debounce,
         stickers,
         failure_recovery,
+        admission,
     } = services;
     // 只从已验证的持久回执重建路由身份索引，不重放消息、写记忆或触发工具。
     for entry in ledger
@@ -1037,6 +1039,7 @@ pub(crate) async fn run(
                         let mut retained = VecDeque::new();
                         while let Some(queued) = queue.pop_front() {
                             if queued.message.session_key(&config.app_id)? == session {
+                                if let Some(hook) = &admission { hook.abandon(&session,&format!("qq:{}",queued.message.id))?; }
                                 if queued.saved || ledger.insert(&ctx, &config.app_id, queued.message.clone())? {
                                     mark_failed(&mut ledger, &ctx, &config.app_id, &queued.message.id)?;
                                 }
@@ -1114,7 +1117,7 @@ pub(crate) async fn run(
                         }
                     }
                 }
-                if let Some(target) = command.target {
+                if let Some(target) = command.target.clone() {
                     controlled_sessions.insert(target.session.session_id.clone(), target.session.clone());
                     let incoming = IncomingMessage {
                         message_id: message.id.clone(),
@@ -1128,7 +1131,21 @@ pub(crate) async fn run(
                         Some(cancelled) => Arc::new(RoutingEvents { channel: sink.clone(), cancelled: cancelled.clone() }),
                         None => sink.clone(),
                     };
-                    match messages.submit(incoming, route_sink) {
+                    let admission_ticket = if let Some(hook) = &admission {
+                        match hook.begin_control(&target.session, &format!("control:{}",message.id), message.text.trim()=="/cancel")? {
+                            Some(ticket)=>Some(ticket),
+                            None=>{
+                                commands.push_front(CommandMessage{message,..command});
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                                continue;
+                            }
+                        }
+                    } else { None };
+                    let submitted = messages.submit(incoming, route_sink);
+                    if let (Some(hook),Some(ticket))=(&admission,admission_ticket) {
+                        hook.finish(&ticket,if submitted.is_ok(){crate::QqAdmissionResult::Started}else{crate::QqAdmissionResult::Rejected})?;
+                    }
+                    match submitted {
                         Ok(ticket) => routing.push(Routing { message, target, wait: messages.wait(&ticket), cancelled }),
                         Err(_) => {
                             warn(&ctx, "message_submit_failed");
@@ -1567,10 +1584,28 @@ pub(crate) async fn run(
                 // 先登记会话类型，本轮工具执行时即可读取。
                 conversations.record(&key, &message.scope);
                 conversations.bind_turn_messages(&config.app_id, &turn_messages)?;
+                let admission_ticket = if let Some(hook) = &admission {
+                    match hook.begin(&key, &format!("qq:{}", message.id))? {
+                        Some(ticket) => Some(ticket),
+                        None => {
+                            queue.push_back(Queued { message, saved: true, ordinary: queued.ordinary, received: queued.received });
+                            // 短等待让全局队列更高优先级入口先取得租约，不能持锁等待LLM。
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            continue;
+                        }
+                    }
+                } else { None };
                 let submitted = control.submit(ControlInput {
                     session: SessionInput { key, text: message.turn_text() },
                     task_id: format!("qq:{}", message.id),
                 }, sink.clone());
+                if let (Some(hook), Some(ticket)) = (&admission, admission_ticket) {
+                    hook.finish(&ticket, match &submitted {
+                        Ok(_) => crate::QqAdmissionResult::Started,
+                        Err(eve_control_api::ControlError::Busy) => crate::QqAdmissionResult::Retry,
+                        Err(_) => crate::QqAdmissionResult::Rejected,
+                    })?;
+                }
                 match submitted {
                     Ok(key) => {
                         timing(timing_diagnostics, "admitted", None);
@@ -1743,6 +1778,9 @@ pub(crate) async fn run(
                 (index, report) = completed(&mut active, &eligible), if !active.is_empty() => {
                     let current = active.remove(index);
                     conversations.clear_turn_anchor(&current.key.session, &current.message.id)?;
+                    if let Some(hook) = &admission {
+                        hook.completed(&current.key.session, &format!("qq:{}", current.message.id), report.as_ref().is_ok_and(|r| r.run.commit != CommitState::Unknown))?;
+                    }
                     let report = report.map_err(|_| failure("QQBot 控制任务收尾失败"))?;
                     let guard = ReplyGuard::Completed(ControlEvent { key: report.key.clone(), event: TurnEvent {
                         turn_id: report.run.turn_id, kind: TurnEventKind::SessionSaved,

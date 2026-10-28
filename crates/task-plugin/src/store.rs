@@ -185,6 +185,19 @@ impl StoredTasks {
         source: &str,
         now_ms: u64,
     ) -> TaskResult<Task> {
+        self.create_with_deadline(owner, spec, source, None, now_ms)
+    }
+    pub(super) fn create_with_deadline(
+        &self,
+        owner: &TaskOwner,
+        spec: TaskSpec,
+        source: &str,
+        deadline_at_ms: Option<u64>,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        if deadline_at_ms.is_some_and(|d| d <= now_ms) {
+            return Err(TaskError::InvalidInput);
+        }
         validate_owner(owner)?;
         validate_id(source)?;
         validate_spec(&spec)?;
@@ -202,6 +215,9 @@ impl StoredTasks {
         let mut inner = self.lock()?;
         // 同一次派发重复执行：返回原记录。
         if let Some(existing) = inner.ledger.tasks.iter().find(|task| task.id == id) {
+            if deadline_at_ms.is_some() && &existing.owner != owner {
+                return Err(TaskError::NotFound);
+            }
             return Ok(existing.clone());
         }
         let mine = || {
@@ -244,7 +260,10 @@ impl StoredTasks {
             result: None,
             failure: None,
             notice: None,
-            execution: Some(TaskExecution::default()),
+            execution: Some(TaskExecution {
+                authorization_deadline_at_ms: deadline_at_ms,
+                ..Default::default()
+            }),
         };
         next.tasks.push(task.clone());
         persist(&mut inner, next)?;
@@ -356,8 +375,11 @@ impl StoredTasks {
                 .as_mut()
                 .ok_or(TaskError::InvalidTransition)?;
             if execution
-                .deadline_at_ms
-                .is_some_and(|deadline| deadline != deadline_at_ms)
+                .authorization_deadline_at_ms
+                .is_some_and(|deadline| deadline_at_ms > deadline)
+                || execution
+                    .deadline_at_ms
+                    .is_some_and(|deadline| deadline != deadline_at_ms)
                 || execution.checkpoint.as_ref().is_some_and(|old| {
                     checkpoint.used_tool_calls < old.used_tool_calls
                         || checkpoint.delegated_tool_calls < old.delegated_tool_calls
@@ -746,7 +768,14 @@ fn validate_task(task: &Task) -> TaskResult<()> {
         return Err(TaskError::CorruptState);
     }
     if let Some(execution) = &task.execution {
-        if execution.recoveries > MAX_AUTO_RECOVERIES
+        if execution
+            .authorization_deadline_at_ms
+            .is_some_and(|d| d <= task.created_at_ms)
+            || execution
+                .deadline_at_ms
+                .zip(execution.authorization_deadline_at_ms)
+                .is_some_and(|(d, a)| d > a)
+            || execution.recoveries > MAX_AUTO_RECOVERIES
             || execution.resume_at_ms == Some(0)
             || (execution.resume_at_ms.is_some() && execution.recoveries == 0)
             || execution.deadline_at_ms.is_some_and(|deadline| {

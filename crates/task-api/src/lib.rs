@@ -92,6 +92,9 @@ pub struct TaskExecution {
     pub resume_at_ms: Option<u64>,
     /// 首次执行固定总期限；重试和重启不能重置。
     pub deadline_at_ms: Option<u64>,
+    /// 原自主授权的绝对期限；排队、恢复及重启均不能延长。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_deadline_at_ms: Option<u64>,
 }
 
 pub type TaskResult<T> = Result<T, TaskError>;
@@ -414,6 +417,17 @@ pub trait TaskAdmin: Send + Sync {
         source: &str,
         now_ms: u64,
     ) -> TaskResult<Task>;
+    /// 在同一个持久提交中创建有授权绝对期限的任务。自定义实现默认拒绝，不回退为无期限创建。
+    fn create_bounded(
+        &self,
+        _owner: &TaskOwner,
+        _spec: TaskSpec,
+        _source: &str,
+        _deadline_at_ms: u64,
+        _now_ms: u64,
+    ) -> TaskResult<Task> {
+        Err(TaskError::InvalidTransition)
+    }
     /// 排队 → 执行中；保存后执行器才开始。
     fn start(&self, id: &str, now_ms: u64) -> TaskResult<Task>;
     /// 工具前/后及模型请求前的持久检查点；保存失败不得继续执行。

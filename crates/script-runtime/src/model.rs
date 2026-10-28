@@ -13,6 +13,7 @@ pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 pub enum Language {
     Python,
     Javascript,
+    Rust,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +146,16 @@ pub struct StateMigration {
     pub value: Value,
 }
 
+/// 纯迁移程序：输入为确认状态，只允许输出一条 return 候选状态。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationScript {
+    pub from: VersionRef,
+    pub expected_revision: u64,
+    pub language: Language,
+    pub source: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptStatus {
@@ -166,6 +177,19 @@ pub struct Evidence {
     pub result_digest: Option<String>,
 }
 
+/// 可核对的进程边界诊断，不包含stderr、源码或内部异常猜测。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailureDiagnostic {
+    pub stage: FailureStage,
+    pub exit_code: Option<i32>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureStage {
+    AfterReturn,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Receipt {
@@ -179,6 +203,8 @@ pub struct Receipt {
     pub result: Option<Value>,
     pub evidence: Vec<Evidence>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_diagnostic: Option<FailureDiagnostic>,
 }
 
 #[derive(Clone, Debug, Serialize)]

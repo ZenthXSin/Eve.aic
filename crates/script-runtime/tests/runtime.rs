@@ -874,3 +874,442 @@ async fn production_protocol_example_writes_member_export_and_keeps_pending_deli
         vec!["write_file", "send_file", "query_file_delivery"]
     );
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn migration_script_computes_state_and_commits_audit_surviving_restart() {
+    let (root, store, gate, runtime) = setup_isolated();
+    let mut old = spec("migrate-function", RETURN_ONE);
+    old.state_schema
+        .fields
+        .insert("count".into(), JsonType::Integer);
+    old.initial_state = json!({"count":7});
+    let from = install(&store, old.clone());
+    old.state_schema.version = 2;
+    old.state_schema
+        .fields
+        .insert("label".into(), JsonType::String);
+    old.initial_state = json!({"count":0,"label":""});
+    let to = store.publish(&owner(), old).unwrap().reference;
+    let receipt = runtime.activate_with_script(&to, "migrate-success", MigrationScript {
+        from: from.clone(), expected_revision: 0, language: Language::Python,
+        source: "import json\nx=json.loads(input())\nv=x['state']['value']\nv['count']+=1\nv['label']='converted'\nprint(json.dumps({'op':'return','value':v}))".into(),
+    }, context(1)).await.unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Succeeded);
+    assert_eq!(
+        store.state(&owner(), &to).unwrap().value,
+        json!({"count":8,"label":"converted"})
+    );
+    assert_eq!(
+        store.state(&owner(), &from).unwrap().value,
+        json!({"count":7})
+    );
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
+    drop(runtime);
+    drop(store);
+    let reopened = ScriptStore::open(root.path().join("state")).unwrap();
+    assert_eq!(reopened.selected(&owner(), &to.script).unwrap(), to);
+    assert_eq!(
+        reopened.receipt(&owner(), "migrate-success").unwrap(),
+        receipt
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn migration_script_rejects_side_effects_bad_state_exit_and_deadline() {
+    let (root, store, gate, runtime) = setup_isolated();
+    let from = install(&store, spec("migrate-rejected", RETURN_ONE));
+    let mut next = spec("migrate-rejected", RETURN_ONE);
+    next.state_schema.version = 2;
+    let to = store.publish(&owner(), next).unwrap().reference;
+    let cases = [
+        "print('{\"op\":\"tool\",\"name\":\"qq.send_file\",\"arguments\":{}}')",
+        "print('{\"op\":\"write\",\"path\":\"x\",\"content\":\"x\"}')",
+        "print('{\"op\":\"script\",\"dependency\":\"x\",\"arguments\":{}}')",
+        "print('{\"op\":\"return\",\"value\":{\"extra\":1}}')",
+        "print('{\"op\":\"return\",\"value\":{}}'); raise RuntimeError()",
+        "print('{\"op\":\"return\",\"value\":{}}'); print('extra')",
+        "import time;time.sleep(5)",
+    ];
+    for (index, source) in cases.into_iter().enumerate() {
+        let result = runtime
+            .activate_with_script(
+                &to,
+                &format!("bad-migration-{index}"),
+                MigrationScript {
+                    from: from.clone(),
+                    expected_revision: 0,
+                    language: Language::Python,
+                    source: source.into(),
+                },
+                context(1).with_deadline(Some(Instant::now() + Duration::from_millis(250))),
+            )
+            .await;
+        assert!(result.is_err(), "case {index}");
+        assert_eq!(store.selected(&owner(), &from.script).unwrap(), from);
+        assert!(store.state(&owner(), &to).is_err());
+    }
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        runtime
+            .run(
+                &runtime.bind(&owner(), &from).unwrap(),
+                "still-usable",
+                json!({}),
+                context(1)
+            )
+            .await
+            .unwrap()
+            .status,
+        ReceiptStatus::Succeeded
+    );
+    drop(runtime);
+    drop(store);
+    let reopened = ScriptStore::open(root.path().join("state")).unwrap();
+    assert_eq!(reopened.selected(&owner(), &from.script).unwrap(), from);
+    assert!(reopened.state(&owner(), &to).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn migration_script_cas_rejects_concurrent_source_update() {
+    let (_root, store, _, runtime) = setup_isolated();
+    let from = install(
+        &store,
+        spec(
+            "migrate-cas",
+            "import json\nx=json.loads(input())\nprint(json.dumps({'op':'state','value':{}}),flush=True)\ninput()\nprint(json.dumps({'op':'return','value':1}))",
+        ),
+    );
+    let mut next = spec("migrate-cas", RETURN_ONE);
+    next.state_schema.version = 2;
+    let to = store.publish(&owner(), next).unwrap().reference;
+    let migration = runtime.activate_with_script(&to, "cas-migration", MigrationScript {
+        from: from.clone(), expected_revision: 0, language: Language::Python,
+        source: "import json,time\nx=json.loads(input())\ntime.sleep(0.5)\nprint(json.dumps({'op':'return','value':{}}))".into(),
+    }, context(1));
+    let bound = runtime.bind(&owner(), &from).unwrap();
+    let update = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        runtime
+            .run(&bound, "concurrent-update", json!({}), context(1))
+            .await
+            .unwrap()
+    };
+    let (result, updated) = tokio::join!(migration, update);
+    assert_eq!(updated.status, ReceiptStatus::Succeeded);
+    assert!(result.is_err());
+    assert!(store.state(&owner(), &to).is_err());
+    assert_eq!(store.selected(&owner(), &from.script).unwrap(), from);
+    assert_eq!(store.state(&owner(), &from).unwrap().revision, 1);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn migration_javascript_and_budget_identity_checks() {
+    let (_root, store, _, runtime) = setup_isolated();
+    let from = install(&store, spec("migrate-js", RETURN_ONE));
+    let mut next = spec("migrate-js", RETURN_ONE);
+    next.state_schema.version = 2;
+    let to = store.publish(&owner(), next).unwrap().reference;
+    let migration = MigrationScript { from: from.clone(), expected_revision: 0,
+        language: Language::Javascript, source: "const fs=require('fs'); const x=JSON.parse(fs.readFileSync(0,'utf8')); console.log(JSON.stringify({op:'return',value:x.state.value}));".into() };
+    let exhausted = context(1);
+    assert!(exhausted.shared_steps().unwrap().reserve(1).unwrap());
+    assert!(
+        runtime
+            .activate_with_script(&to, "budget-migration", migration.clone(), exhausted)
+            .await
+            .is_err()
+    );
+    let wrong = context(1).with_scope(Some(ContextScope {
+        session_id: "other".into(),
+        user_id: "other".into(),
+    }));
+    assert!(
+        runtime
+            .activate_with_script(&to, "wrong-migration", migration.clone(), wrong)
+            .await
+            .is_err()
+    );
+    let stale = MigrationScript {
+        expected_revision: 1,
+        ..migration.clone()
+    };
+    assert!(
+        runtime
+            .activate_with_script(&to, "stale-migration", stale, context(1))
+            .await
+            .is_err()
+    );
+    assert!(store.state(&owner(), &to).is_err());
+    runtime
+        .activate_with_script(&to, "js-migration", migration.clone(), context(1))
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .activate_with_script(&to, "duplicate-migration", migration, context(1))
+            .await
+            .is_err()
+    );
+    assert_eq!(store.state(&owner(), &to).unwrap().value, json!({}));
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn migration_execution_fails_closed_without_consuming_budget() {
+    let (_root, store, gate, runtime) = setup();
+    let from = install(&store, spec("migration-platform", RETURN_ONE));
+    let mut next = spec("migration-platform", RETURN_ONE);
+    next.state_schema.version = 2;
+    let to = store.publish(&owner(), next).unwrap().reference;
+    let ctx = context(1);
+    let budget = ctx.shared_steps().unwrap().clone();
+    assert!(
+        runtime
+            .activate_with_script(
+                &to,
+                "unsupported-migration",
+                MigrationScript {
+                    from: from.clone(),
+                    expected_revision: 0,
+                    language: Language::Python,
+                    source: "print('{\"op\":\"return\",\"value\":{}}')".into(),
+                },
+                ctx
+            )
+            .await
+            .is_err()
+    );
+    assert!(budget.reserve(1).unwrap());
+    assert_eq!(store.selected(&owner(), &from.script).unwrap(), from);
+    assert!(store.state(&owner(), &to).is_err());
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
+}
+
+/// 必须由安装了Linux容器daemon的真实宿主显式执行；不以mock或跳过证明跨平台。
+#[tokio::test]
+#[ignore = "requires trusted EVE_TEST_CONTAINER_CLI and EVE_TEST_CONTAINER_IMAGE"]
+async fn container_backend_real_python_javascript_isolation_and_migration() {
+    let executable = std::env::current_exe().unwrap();
+    let container = ContainerSandbox {
+        cli: std::env::var_os("EVE_TEST_CONTAINER_CLI")
+            .expect("trusted container CLI required")
+            .into(),
+        image: std::env::var("EVE_TEST_CONTAINER_IMAGE").expect("immutable local image required"),
+    };
+    let (_root, store, gate, runtime) = setup_with_sandbox(
+        Bubblewrap::new(executable.clone(), executable).with_container(container),
+    );
+    let source = "import json,os,socket\nx=json.loads(input())\nassert os.getuid()!=0\nassert not os.path.exists('/var/run/docker.sock')\nassert not os.path.exists('/workspace')\nassert 'HTTP_PROXY' not in os.environ\ntry:\n open('/work/forbidden','w').write('x')\n raise Exception('writable work')\nexcept OSError: pass\ns=socket.socket();s.settimeout(.1)\ntry:\n s.connect(('1.1.1.1',443));raise Exception('external network')\nexcept OSError: pass\nprint(json.dumps({'op':'return','value':{'isolated':True}}))";
+    let from = install(&store, spec("container-real", source));
+    let receipt = runtime
+        .run(
+            &runtime.bind(&owner(), &from).unwrap(),
+            "container-run",
+            json!({}),
+            context(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Succeeded, "{receipt:?}");
+    let mut next = spec("container-real", source);
+    next.state_schema.version = 2;
+    let to = store.publish(&owner(), next).unwrap().reference;
+    runtime.activate_with_script(&to, "container-migration", MigrationScript { from,
+        expected_revision: 0, language: Language::Javascript,
+        source: "const fs=require('fs');let x=JSON.parse(fs.readFileSync(0,'utf8'));console.log(JSON.stringify({op:'return',value:x.state.value}));".into(),
+    }, context(1)).await.unwrap();
+    assert_eq!(store.selected(&owner(), &to.script).unwrap(), to);
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(target_os = "linux")]
+fn rust_sandbox() -> Bubblewrap {
+    let output = std::process::Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let sysroot = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    sandbox().with_rustc(sysroot.join("bin/rustc"))
+}
+#[cfg(target_os = "linux")]
+fn rust_spec(name: &str, value: i32, delay: u64) -> ScriptSpec {
+    let mut spec = spec(
+        name,
+        &format!(
+            r####"use std::io;fn main(){{let mut input=String::new();io::stdin().read_line(&mut input).unwrap();std::thread::sleep(std::time::Duration::from_millis({delay}));println!("{{}}",r###"{{"op":"return","value":{value}}}"###);}}"####
+        ),
+    );
+    spec.language = Language::Rust;
+    spec
+}
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn rust_candidate_compiles_separately_and_hot_switch_keeps_inflight_version() {
+    let (_root, store, _, runtime) = setup_with_sandbox(rust_sandbox());
+    let old = runtime
+        .publish_candidate(rust_spec("rust-hot", 1, 400), context(1))
+        .await
+        .unwrap();
+    store.activate(&owner(), &old.reference, None).unwrap();
+    let new = runtime
+        .publish_candidate(rust_spec("rust-hot", 2, 0), context(1))
+        .await
+        .unwrap();
+    let bound_old = runtime.bind(&owner(), &old.reference).unwrap();
+    let old_run = runtime.run(&bound_old, "rust-inflight", json!({}), context(1));
+    let switch = async {
+        loop {
+            if store.receipt(&owner(), "rust-inflight").is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        store.activate(&owner(), &new.reference, None).unwrap();
+        let result = runtime
+            .run(
+                &runtime.bind(&owner(), &new.reference).unwrap(),
+                "rust-new",
+                json!({}),
+                context(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.receipt(&owner(), "rust-inflight").unwrap().status,
+            ReceiptStatus::Running
+        );
+        result
+    };
+    let (old_result, new_result) = tokio::join!(old_run, switch);
+    assert_eq!(old_result.unwrap().result, Some(json!(1)));
+    assert_eq!(new_result.result, Some(json!(2)));
+    assert_eq!(store.selected(&owner(), "rust-hot").unwrap(), new.reference);
+    assert_eq!(
+        store.state(&owner(), &new.reference).unwrap().value,
+        json!({})
+    );
+    store.activate(&owner(), &old.reference, None).unwrap();
+    assert_eq!(
+        runtime
+            .run(&bound_old, "rust-rollback", json!({}), context(1))
+            .await
+            .unwrap()
+            .result,
+        Some(json!(1))
+    );
+}
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn rust_bad_compile_and_host_include_cannot_replace_active_version() {
+    let (_root, store, _, runtime) = setup_with_sandbox(rust_sandbox());
+    let old = runtime
+        .publish_candidate(rust_spec("rust-failure", 7, 0), context(1))
+        .await
+        .unwrap();
+    store.activate(&owner(), &old.reference, None).unwrap();
+    let marker = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(marker.path(), "private host marker").unwrap();
+    for source in [
+        "fn main(){ INVALID RUST }".to_owned(),
+        format!(
+            "fn main(){{println!(\"{{}}\",include_str!({:?}));}}",
+            marker.path()
+        ),
+    ] {
+        let mut candidate = rust_spec("rust-failure", 8, 0);
+        candidate.source = source;
+        assert!(
+            runtime
+                .publish_candidate(candidate, context(1))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.selected(&owner(), "rust-failure").unwrap(),
+            old.reference
+        );
+        assert_eq!(store.list(&owner()).unwrap().len(), 1);
+    }
+    assert_eq!(
+        runtime
+            .run(
+                &runtime.bind(&owner(), &old.reference).unwrap(),
+                "rust-survivor",
+                json!({}),
+                context(1)
+            )
+            .await
+            .unwrap()
+            .result,
+        Some(json!(7))
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn rust_migration_and_compile_cancellation_keep_old_confirmed_state() {
+    let (_root, store, _, runtime) = setup_with_sandbox(rust_sandbox());
+    let mut old = rust_spec("rust-state", 1, 0);
+    old.state_schema
+        .fields
+        .insert("count".into(), JsonType::Integer);
+    old.initial_state = json!({"count":7});
+    let from = runtime
+        .publish_candidate(old.clone(), context(1))
+        .await
+        .unwrap()
+        .reference;
+    store.activate(&owner(), &from, None).unwrap();
+    let mut hanging = old.clone();
+    hanging.source =
+        "#![allow(long_running_const_eval)] const N:usize=loop{}; fn main(){println!(\"{}\",N);}"
+            .into();
+    assert!(
+        runtime
+            .publish_candidate(
+                hanging,
+                context(1).with_deadline(Some(Instant::now() + Duration::from_millis(100)))
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(store.selected(&owner(), "rust-state").unwrap(), from);
+    old.state_schema.version = 2;
+    old.state_schema
+        .fields
+        .insert("label".into(), JsonType::String);
+    old.initial_state = json!({"count":0,"label":""});
+    let to = runtime
+        .publish_candidate(old, context(1))
+        .await
+        .unwrap()
+        .reference;
+    let migration_source = r####"use std::io;fn main(){let mut input=String::new();io::stdin().read_line(&mut input).unwrap();assert!(input.contains(r#""count":7"#));println!("{}",r#"{"op":"return","value":{"count":8,"label":"rust"}}"#);}"####;
+    runtime
+        .activate_with_script(
+            &to,
+            "rust-state-migrate",
+            MigrationScript {
+                from: from.clone(),
+                expected_revision: 0,
+                language: Language::Rust,
+                source: migration_source.into(),
+            },
+            context(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.state(&owner(), &to).unwrap().value,
+        json!({"count":8,"label":"rust"})
+    );
+    assert_eq!(
+        store.state(&owner(), &from).unwrap().value,
+        json!({"count":7})
+    );
+}

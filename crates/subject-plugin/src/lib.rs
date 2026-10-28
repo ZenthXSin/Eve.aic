@@ -204,6 +204,15 @@ impl SubjectAdmin for SubjectController {
         now_ms: u64,
         lease_ms: u64,
     ) -> SubjectResult<Option<SubjectEvent>> {
+        self.claim_filtered(worker, &SubjectClaim::Any, now_ms, lease_ms)
+    }
+    fn claim_filtered(
+        &self,
+        worker: &str,
+        filter: &SubjectClaim,
+        now_ms: u64,
+        lease_ms: u64,
+    ) -> SubjectResult<Option<SubjectEvent>> {
         validate_id(worker)?;
         validate_lease_time(now_ms, lease_ms)?;
         self.update(|ledger| {
@@ -225,6 +234,14 @@ impl SubjectAdmin for SubjectController {
             let Some(index) = index else {
                 return Ok(None);
             };
+            let selected = &ledger.events[index];
+            if match filter {
+                SubjectClaim::Any => false,
+                SubjectClaim::Event(id) => &selected.id != id,
+                SubjectClaim::ExceptKinds(kinds) => kinds.contains(&selected.input.kind),
+            } {
+                return Ok(None);
+            }
             ledger.generation = ledger
                 .generation
                 .checked_add(1)
@@ -347,6 +364,80 @@ impl SubjectAdmin for SubjectController {
                 }
             }
             Ok(count)
+        })
+    }
+    fn abandon_pending_kind(&self, kind: &str, now_ms: u64) -> SubjectResult<usize> {
+        validate_id(kind)?;
+        check_time(now_ms)?;
+        self.update(|ledger| {
+            let mut count = 0;
+            for event in &mut ledger.events {
+                if event.input.kind == kind && event.status == EventStatus::Queued {
+                    // 短准入已确认受理但尚未来得及settle时，只结算回执，不取消已执行工作。
+                    event.status = match event.checkpoint.resume_data.as_str() {
+                        "admission_started" => EventStatus::Completed,
+                        "admission_rejected" => EventStatus::Failed,
+                        "" => EventStatus::Cancelled,
+                        _ => EventStatus::Unknown,
+                    };
+                    event.cancel_requested = event.status == EventStatus::Cancelled;
+                    event.updated_at_ms = now_ms.max(event.updated_at_ms);
+                    count += 1;
+                }
+            }
+            Ok(count)
+        })
+    }
+    fn rearm_busy_admission(
+        &self,
+        scope: &SubjectScope,
+        id: &str,
+        now_ms: u64,
+    ) -> SubjectResult<SubjectEvent> {
+        validate_scope(scope)?;
+        validate_id(id)?;
+        check_time(now_ms)?;
+        self.update(|ledger| {
+            let event = ledger
+                .events
+                .iter_mut()
+                .find(|e| &e.input.scope == scope && e.id == id)
+                .ok_or(SubjectError::NotFound)?;
+            if event.status != EventStatus::Failed
+                || event.input.kind != "work_admission"
+                || event.outcome.as_deref() != Some("admission_busy")
+                || event.checkpoint.boundary != CheckpointBoundary::Safe
+                || event.cancel_requested
+            {
+                return Err(SubjectError::InvalidTransition);
+            }
+            event.status = EventStatus::Queued;
+            event.outcome = None;
+            event.updated_at_ms = now_ms.max(event.updated_at_ms);
+            Ok(event.clone())
+        })
+    }
+    fn cancel_queued_event(
+        &self,
+        scope: &SubjectScope,
+        id: &str,
+        now_ms: u64,
+    ) -> SubjectResult<()> {
+        validate_scope(scope)?;
+        validate_id(id)?;
+        check_time(now_ms)?;
+        self.update(|ledger| {
+            let event = ledger
+                .events
+                .iter_mut()
+                .find(|e| &e.input.scope == scope && e.id == id)
+                .ok_or(SubjectError::NotFound)?;
+            if event.status == EventStatus::Queued {
+                event.status = EventStatus::Cancelled;
+                event.cancel_requested = true;
+                event.updated_at_ms = now_ms.max(event.updated_at_ms);
+            }
+            Ok(())
         })
     }
     fn mark_unknown(

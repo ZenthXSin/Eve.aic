@@ -25,6 +25,7 @@ fn public_tool(name: &str) -> bool {
             | "list_script_plugins"
             | "activate_script_plugin"
             | "run_script_plugin"
+            | "manage_failure_reproduction"
             | "send_message"
             | "clear_context"
             | "save_preference"

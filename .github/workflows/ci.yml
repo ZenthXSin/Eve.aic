@@ -17,8 +17,9 @@ jobs:
   stable:
     name: Stable / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # Windows 的完整构建、测试和独立进程示例已接近 15 分钟；保留所有检查并留出运行余量。
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 40 || 15 }}
+    # 保留完整检查。Linux 已在 15 分钟末尾的核心帮助正常输出后被总期限取消，留 5 分钟余量。
+    # Windows 的完整构建与实际进程验收更慢，继续使用原有 40 分钟上限。
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 40 || 20 }}
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +63,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证自动发行的版本与恢复语义
         run: python -X utf8 scripts/test-release-portable.py
+      - name: 验证打包下载总期限、容量和小文件归档
+        run: python -X utf8 scripts/test-package-portable.py
       - name: 验证客户端更新、资产校验与失败恢复
         run: node scripts/test-client-update.mjs
       - name: 验证启动器能力开关与内置脚本运行时

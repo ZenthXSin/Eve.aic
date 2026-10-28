@@ -33,6 +33,7 @@ pub struct SubjectDriver {
     admin: Arc<dyn SubjectAdmin>,
     worker: String,
     lease_ms: u64,
+    filter: SubjectClaim,
 }
 impl SubjectDriver {
     pub fn new(admin: Arc<dyn SubjectAdmin>, worker: impl Into<String>) -> SubjectResult<Self> {
@@ -42,7 +43,12 @@ impl SubjectDriver {
             admin,
             worker,
             lease_ms: MAX_LEASE_MS,
+            filter: SubjectClaim::Any,
         })
+    }
+    pub fn with_filter(mut self, filter: SubjectClaim) -> Self {
+        self.filter = filter;
+        self
     }
     pub fn with_lease_ms(mut self, lease_ms: u64) -> SubjectResult<Self> {
         if !(1..=MAX_LEASE_MS).contains(&lease_ms) {
@@ -58,7 +64,10 @@ impl SubjectDriver {
         now_ms: u64,
         dispatch: impl FnOnce(&SubjectEvent) -> SubjectResult<SubjectDispatch>,
     ) -> SubjectResult<Option<SubjectEvent>> {
-        let Some(event) = self.admin.claim_next(&self.worker, now_ms, self.lease_ms)? else {
+        let Some(event) =
+            self.admin
+                .claim_filtered(&self.worker, &self.filter, now_ms, self.lease_ms)?
+        else {
             return Ok(None);
         };
         let token = &event.lease.as_ref().ok_or(SubjectError::LeaseLost)?.token;

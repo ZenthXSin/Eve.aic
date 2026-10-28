@@ -1177,6 +1177,9 @@ async fn run_qqbot_composed(
         let subject: Arc<dyn eve_subject_api::SubjectAdmin> = Arc::new(subject_plugin.controller());
         kernel.register(Box::new(subject_plugin))?;
         kernel.start(&PluginId::new(eve_subject_api::SUBJECT_PLUGIN_ID)?).await?;
+        subject.abandon_pending_kind("work_admission", qq_tasks::now_ms())?;
+        let subject_admission = Arc::new(crate::qq_subject_admission::Admission(subject.clone()));
+        plugin = plugin.with_admission(subject_admission.clone());
         let memory: Option<Arc<dyn MemoryAdmin>> = if options.memory {
             let archive = eve_memory_plugin::FileEvidenceArchive::open(
                 crate::storage::memory_archive_directory(&options.state_directory),
@@ -1351,6 +1354,7 @@ async fn run_qqbot_composed(
         };
         // 后台任务账本同样先于通道加载；损坏时拒绝启动并保留原字节，执行中的任务记为中断，发送中的通知记为结果未知。
         let task_late = Arc::new(qq_tasks::Late::default());
+        let _ = task_late.admission.set(subject_admission.clone());
         let task_runtime_manifest = Arc::new(std::sync::OnceLock::new());
         let task_policy = if let Some(path) = &options.task_strategy_catalog {
             let profiles = if options.subagents {
@@ -2003,12 +2007,23 @@ async fn run_qqbot_composed(
         bootstrap.tools.push(Arc::new(crate::qq_subject::FocusTool(subject.clone())));
         bootstrap.tools.push(Arc::new(crate::qq_subject::ConfigureTool { subject: subject.clone(), owner: qq_admin.clone(), reviewer: crate::developer::action_reviewer(registry.clone(), model_health.clone()) }));
         bootstrap.tools.push(Arc::new(crate::qq_files::FileDeliveryStatusTool(outbox.clone())));
+        let mut script_sandbox = eve_script_runtime::Bubblewrap::new("/usr/bin/python3", std::env::var_os("EVE_SCRIPT_NODE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/usr/bin/node")));
+        if let Some(rustc) = std::env::var_os("EVE_SCRIPT_RUSTC") { script_sandbox = script_sandbox.with_rustc(PathBuf::from(rustc)); }
+        match (std::env::var_os("EVE_SCRIPT_CONTAINER_CLI"), std::env::var("EVE_SCRIPT_CONTAINER_IMAGE").ok()) {
+            (Some(cli), Some(image)) => script_sandbox = script_sandbox.with_container(eve_script_runtime::ContainerSandbox { cli: cli.into(), image }),
+            (None, None) => {},
+            _ => return Err("容器沙箱需要同时配置 EVE_SCRIPT_CONTAINER_CLI 与 EVE_SCRIPT_CONTAINER_IMAGE".into()),
+        }
         let script_tools = crate::qq_scripts::ScriptTools::open(
             options.state_directory.join("script-plugins"),
-            eve_script_runtime::Bubblewrap::new("/usr/bin/python3", std::env::var_os("EVE_SCRIPT_NODE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/usr/bin/node"))),
+            script_sandbox,
             Arc::new(crate::qq_access::ScriptAuthorizer { admin: qq_admin.clone(), public_github, developer: developer_backend.clone(), outbox: outbox.clone() }),
         )?;
         bootstrap.tools.extend(script_tools.tools());
+        if let Some(tasks) = &tasks {
+            let (store, sandbox) = script_tools.replay_source();
+            bootstrap.tools.extend(crate::qq_failure_replay::tools(store, sandbox, backends.state.clone(), Arc::new(tasks.clone())));
+        }
         bootstrap.context = Some(Arc::new(crate::qq_subject::Context { inner: bootstrap.context.take().ok_or("主体上下文缺失")?, subject: subject.clone() }));
         let workflow_store = if options.workflow_tools {
             let store = eve_workflow_tools::WorkflowStore::open(options.state_directory.join("workflow-tools"))?;
@@ -2106,7 +2121,7 @@ async fn run_qqbot_composed(
                         .clone()
                         .map(|t| Arc::new(t) as Arc<dyn eve_task_api::TaskAdmin>),
                 )?
-                .with_authorization(qq_admin.clone()),
+                .with_authorization(qq_admin.clone()).with_admission(subject_admission.clone()),
             );
             let _ = late.set(observations.clone());
             trigger_background = Some(qq_triggers::Background::start(

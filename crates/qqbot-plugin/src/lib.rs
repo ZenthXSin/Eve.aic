@@ -6,7 +6,9 @@ mod conversations;
 mod files;
 mod live;
 pub use live::LiveDialogue;
+mod admission;
 mod observer;
+pub use admission::{QqAdmission, QqAdmissionResult};
 mod outreach;
 mod participants;
 mod progress;
@@ -184,6 +186,7 @@ pub struct QqBotPlugin {
     debounce: Option<Arc<dyn QqDebounce>>,
     stickers: Option<Arc<dyn QqStickers>>,
     failure_recovery: Option<Arc<dyn QqFailureRecovery>>,
+    admission: Option<Arc<dyn QqAdmission>>,
     receipt_archive: Option<Arc<dyn QqReceiptArchive>>,
     group_observer: Option<Arc<dyn QqGroupObserver>>,
     live: Option<Arc<LiveDialogue>>,
@@ -226,6 +229,7 @@ impl QqBotPlugin {
             debounce: None,
             stickers: None,
             failure_recovery: None,
+            admission: None,
             receipt_archive: None,
             group_observer: None,
             live: None,
@@ -400,6 +404,10 @@ impl QqBotPlugin {
     }
 }
 impl QqBotPlugin {
+    pub fn with_admission(mut self, admission: Arc<dyn QqAdmission>) -> Self {
+        self.admission = Some(admission);
+        self
+    }
     pub fn with_group_observer(mut self, observer: Arc<dyn QqGroupObserver>) -> Self {
         self.group_observer = Some(observer);
         self
@@ -477,6 +485,7 @@ impl Plugin for QqBotPlugin {
             let debounce = self.debounce.clone();
             let stickers = self.stickers.clone();
             let failure_recovery = self.failure_recovery.clone();
+            let admission = self.admission.clone();
             let live = self.live.clone();
             let task_ctx = ctx.clone();
             ctx.spawn_task(TaskSpec::new(
@@ -505,6 +514,7 @@ impl Plugin for QqBotPlugin {
                     let debounce = debounce.clone();
                     let stickers = stickers.clone();
                     let failure_recovery = failure_recovery.clone();
+                    let admission = admission.clone();
                     let live = live.clone();
                     let status = status.clone();
                     let ledger = ledger.clone();
@@ -538,6 +548,7 @@ impl Plugin for QqBotPlugin {
                                 debounce,
                                 stickers,
                                 failure_recovery,
+                                admission,
                                 live,
                             },
                             ledger,

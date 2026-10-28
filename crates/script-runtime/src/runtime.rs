@@ -29,9 +29,9 @@ impl BoundVersion {
 }
 
 pub struct ScriptRuntime {
-    store: Arc<ScriptStore>,
+    pub(crate) store: Arc<ScriptStore>,
     dispatch: Arc<dyn AuthorizedToolDispatch>,
-    sandbox: Bubblewrap,
+    pub(crate) sandbox: Bubblewrap,
     artifacts: PathBuf,
 }
 struct Chain {
@@ -67,6 +67,25 @@ impl ScriptRuntime {
             sandbox,
             artifacts: artifacts.into(),
         }
+    }
+    /// Rust候选先隔离编译再发布；失败不写入版本或更改active。
+    pub async fn publish_candidate(
+        &self,
+        spec: crate::ScriptSpec,
+        context: ToolExecutionContext,
+    ) -> Result<PublishedVersion> {
+        let owner = context.scope().ok_or_else(|| reject("发布缺少可信身份"))?;
+        spec.validate()?;
+        if spec.language == crate::Language::Rust {
+            let deadline = context
+                .deadline()
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
+            self.sandbox
+                .prepare_rust(&spec.source, &context, deadline)
+                .await?;
+            check_stop(&context, deadline)?;
+        }
+        self.store.publish(owner, spec)
     }
     pub fn bind(&self, owner: &ContextScope, reference: &VersionRef) -> Result<BoundVersion> {
         let mut versions = BTreeMap::new();
@@ -132,7 +151,7 @@ impl ScriptRuntime {
                 .collect(),
             tools: tools.into_iter().collect(),
             dry_run: true,
-            sandbox: "bubblewrap-required; namespace availability checked at launch".into(),
+            sandbox: self.sandbox.description().into(),
         })
     }
     pub async fn run(
@@ -207,6 +226,7 @@ impl ScriptRuntime {
                 result: None,
                 evidence: Vec::new(),
                 error: None,
+                failure_diagnostic: None,
             };
             let snapshot = self.store.begin(receipt.clone())?;
             let mut invocation = InvocationGuard {
@@ -297,9 +317,20 @@ impl ScriptRuntime {
     ) -> Result<Value> {
         let mut source = tempfile::NamedTempFile::new().map_err(fail)?;
         std::io::Write::write_all(&mut source, version.spec.source.as_bytes()).map_err(fail)?;
-        let mut child = self
-            .sandbox
-            .spawn(version, source.path(), chain.work.path())?;
+        let compiled = if version.spec.language == crate::Language::Rust {
+            Some(
+                self.sandbox
+                    .prepare_rust(&version.spec.source, context, chain.deadline)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let executable = compiled
+            .as_ref()
+            .map(|compiled| compiled.binary.as_path())
+            .unwrap_or(source.path());
+        let mut child = self.sandbox.spawn(version, executable, chain.work.path())?;
         let mut input = child.stdin.take().ok_or_else(|| fail("子进程缺少 stdin"))?;
         let output = child
             .stdout
@@ -335,6 +366,10 @@ impl ScriptRuntime {
                     )
                     .await?;
                     if !exit.success() {
+                        receipt.failure_diagnostic = Some(crate::FailureDiagnostic {
+                            stage: crate::FailureStage::AfterReturn,
+                            exit_code: exit.code(),
+                        });
                         return Err(fail("进程返回后异常退出"));
                     }
                     return Ok(value);
@@ -473,6 +508,7 @@ impl ScriptRuntime {
                     }
                 }
             };
+            child.sync_work(chain.work.path())?;
             send(
                 &mut input,
                 &json!({"ok":true,"result":response}),
@@ -522,7 +558,7 @@ fn identity(bound: &BoundVersion, context: &ToolExecutionContext) -> Result<()> 
     }
     Ok(())
 }
-fn reserve(context: &ToolExecutionContext) -> Result<()> {
+pub(crate) fn reserve(context: &ToolExecutionContext) -> Result<()> {
     if !context
         .shared_steps()
         .ok_or_else(|| reject("缺少共享预算"))?
@@ -533,7 +569,7 @@ fn reserve(context: &ToolExecutionContext) -> Result<()> {
     }
     Ok(())
 }
-fn check_stop(context: &ToolExecutionContext, deadline: Instant) -> Result<()> {
+pub(crate) fn check_stop(context: &ToolExecutionContext, deadline: Instant) -> Result<()> {
     if context.is_cancel_requested()
         || Instant::now() >= deadline
         || context.deadline().is_some_and(|d| Instant::now() >= d)
@@ -542,7 +578,7 @@ fn check_stop(context: &ToolExecutionContext, deadline: Instant) -> Result<()> {
     }
     Ok(())
 }
-async fn guarded<T>(
+pub(crate) async fn guarded<T>(
     future: impl Future<Output = Result<T>>,
     context: &ToolExecutionContext,
     deadline: Instant,
@@ -552,7 +588,7 @@ async fn guarded<T>(
         tokio::select! { result = &mut future => return result, _ = tokio::time::sleep(Duration::from_millis(10)) => { check_stop(context, deadline)?; } }
     }
 }
-async fn send(
+pub(crate) async fn send(
     input: &mut tokio::process::ChildStdin,
     value: &Value,
     context: &ToolExecutionContext,

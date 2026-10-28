@@ -4,8 +4,8 @@ use eve_llm_api::{
     ToolFuture, ToolValidationError,
 };
 use eve_script_runtime::{
-    AuthorizedToolDispatch, Bubblewrap, CheckedTools, ScriptRuntime, ScriptSpec, ScriptStore,
-    StateMigration, ToolAuthorizer, VersionRef,
+    AuthorizedToolDispatch, Bubblewrap, CheckedTools, MigrationScript, ScriptRuntime, ScriptSpec,
+    ScriptStore, StateMigration, ToolAuthorizer, VersionRef,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -93,6 +93,7 @@ impl AuthorizedToolDispatch for LateDispatch {
 pub struct ScriptTools {
     store: Arc<ScriptStore>,
     runtime: ScriptRuntime,
+    sandbox: Bubblewrap,
     dispatch: Arc<LateDispatch>,
     authorizer: Arc<dyn ToolAuthorizer>,
 }
@@ -107,15 +108,19 @@ impl ScriptTools {
         let runtime = ScriptRuntime::new(
             store.clone(),
             dispatch.clone(),
-            sandbox,
+            sandbox.clone(),
             directory.as_ref().join("artifacts"),
         );
         Ok(Arc::new(Self {
             store,
             runtime,
+            sandbox,
             dispatch,
             authorizer,
         }))
+    }
+    pub(crate) fn replay_source(&self) -> (Arc<ScriptStore>, Bubblewrap) {
+        (self.store.clone(), self.sandbox.clone())
     }
     /// 在可信工具装配完成后仅调用一次。拒绝把脚本管理工具再次作为叶子，避免越权递归。
     pub fn bind_tools(&self, tools: Vec<Arc<dyn Tool>>) -> Result<()> {
@@ -163,6 +168,7 @@ struct List {
 struct Activate {
     version: VersionRef,
     migration: Option<StateMigration>,
+    migration_script: Option<MigrationScript>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -199,7 +205,7 @@ impl Tool for ScriptTool {
     fn definition(&self) -> ToolDefinition {
         let (description, properties, required) = match self.kind {
             0 => (
-                "保存不可变 Python/JavaScript 脚本插件版本，不执行。spec 含 name、language(python/javascript)、source、dependencies(别名到{script,digest})、tools(允许叶子名)、state_schema({version,fields:{字段:string/number/integer/boolean/object/array/null}})、initial_state。进程通过stdin/stdout每行JSON协议调用宿主，不能获取凭据或直接网络。声明工具不授予权限。先使用dry_run预检；保存后需activate初始化状态。",
+                "保存不可变 Python/JavaScript/Rust 脚本插件版本，不运行业务代码；Rust先在可信Linux沙箱独立编译std-only候选，失败不保存，编译扣共享预算。spec 含 name、language(python/javascript/rust)、source、dependencies(别名到{script,digest})、tools(允许叶子名)、state_schema({version,fields:{字段:string/number/integer/boolean/object/array/null}})、initial_state。进程通过stdin/stdout每行JSON协议调用宿主，不能获取凭据或直接网络。声明工具不授予权限。先使用dry_run预检；保存后需activate初始化状态。",
                 json!({"spec":{"type":"object"}}),
                 vec!["spec"],
             ),
@@ -209,8 +215,8 @@ impl Tool for ScriptTool {
                 vec![],
             ),
             2 => (
-                "显式启用或回退不可变脚本版本{script,digest}。每版本保留独立状态；schema变化需migration={from:{script,digest},expected_revision,value}，不执行脚本或重放外部操作。已有目标状态不能覆盖。",
-                json!({"version":{"type":"object"},"migration":{"type":"object"}}),
+                "显式启用或回退不可变脚本版本{script,digest}。每版本保留独立状态；schema变化需migration={from:{script,digest},expected_revision,value}或migration_script={from:{script,digest},expected_revision,language,source}，两者互斥。纯迁移脚本从stdin读取state，只能输出一行{op:return,value:候选状态}，禁止工具/依赖/文件操作；隔离执行成功且源revision未变才原子启用。回退不重放外部操作。已有目标状态不能覆盖。",
+                json!({"version":{"type":"object"},"migration":{"type":"object"},"migration_script":{"type":"object","properties":{"from":{"type":"object"},"expected_revision":{"type":"integer","minimum":0},"language":{"type":"string","enum":["python","javascript","rust"]},"source":{"type":"string"}},"required":["from","expected_revision","language","source"],"additionalProperties":false}}),
                 vec!["version"],
             ),
             _ => (
@@ -243,8 +249,9 @@ impl Tool for ScriptTool {
             match self.kind {
                 0 => {
                     let args: Save = serde_json::from_value(call.arguments).map_err(rejected)?;
+                    let compiled = args.spec.language == eve_script_runtime::Language::Rust;
                     Ok(
-                        json!({"saved":true,"executed":false,"version":self.service.store.publish(owner,args.spec)?}),
+                        json!({"saved":true,"executed":false,"compiled":compiled,"version":self.service.runtime.publish_candidate(args.spec,context).await?}),
                     )
                 }
                 1 => {
@@ -271,6 +278,29 @@ impl Tool for ScriptTool {
                 2 => {
                     let args: Activate =
                         serde_json::from_value(call.arguments).map_err(rejected)?;
+                    if let Some(migration) = args.migration_script {
+                        if args.migration.is_some() {
+                            return Err(rejected("migration与migration_script不能同时提供"));
+                        }
+                        let identity = serde_json::to_vec(&(owner, context.turn_id(), &call.id))
+                            .map_err(rejected)?;
+                        let call_id = format!(
+                            "migration-{}",
+                            ring::digest::digest(&ring::digest::SHA256, &identity)
+                                .as_ref()
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>()
+                        );
+                        let receipt = self
+                            .service
+                            .runtime
+                            .activate_with_script(&args.version, &call_id, migration, context)
+                            .await?;
+                        return Ok(
+                            json!({"activated":args.version,"executed":true,"receipt":receipt}),
+                        );
+                    }
                     self.service
                         .store
                         .activate(owner, &args.version, args.migration)?;
@@ -605,6 +635,139 @@ mod tests {
             .unwrap();
         assert_eq!(listed["versions"][0]["selected"], reference);
         assert_eq!(listed["versions"][0]["state"]["value"], json!({}));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn adapter_pure_migration_schema_and_execution_preserve_old_state_on_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let service = ScriptTools::open(root.path(), isolated_sandbox(), Arc::new(Deny)).unwrap();
+        service.bind_tools(vec![]).unwrap();
+        let tools = service.tools();
+        let ctx = context();
+        let owner = ctx.scope().unwrap();
+        let from = service.store.publish(owner, spec()).unwrap().reference;
+        service.store.activate(owner, &from, None).unwrap();
+        let mut next = spec();
+        next.state_schema.version = 2;
+        let to = service.store.publish(owner, next).unwrap().reference;
+        let migration = json!({"from":from,"expected_revision":0,"language":"python",
+            "source":"import json\nx=json.loads(input())\nprint(json.dumps({'op':'return','value':x['state']['value']}))"});
+        let result = execute(&tools[2], "mutually-exclusive", json!({"version":to,
+            "migration":{"from":from,"expected_revision":0,"value":{}},"migration_script":migration}), ctx.clone()).await;
+        assert!(matches!(result, Err(ToolExecutionError::Rejected(_))));
+        let mut oversized = migration.clone();
+        oversized["source"] = json!("x".repeat(eve_script_runtime::MAX_SOURCE_BYTES + 1));
+        assert!(
+            execute(
+                &tools[2],
+                "oversized",
+                json!({"version":to,"migration_script":oversized}),
+                ctx.clone()
+            )
+            .await
+            .is_err()
+        );
+        let mut forbidden = migration.clone();
+        forbidden["source"] =
+            json!("print('{\"op\":\"tool\",\"name\":\"echo\",\"arguments\":{}}')");
+        assert!(
+            execute(
+                &tools[2],
+                "forbidden",
+                json!({"version":to,"migration_script":forbidden}),
+                ctx.clone()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(service.store.selected(owner, &from.script).unwrap(), from);
+        assert!(service.store.state(owner, &to).is_err());
+        let success = execute(
+            &tools[2],
+            "migrate-real",
+            json!({"version":to,"migration_script":migration}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(success["executed"], true);
+        assert_eq!(success["receipt"]["status"], "succeeded");
+        assert_eq!(service.store.selected(owner, &to.script).unwrap(), to);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn adapter_rust_save_compiles_candidate_and_runs_without_host_rebuild() {
+        let output = std::process::Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let compiler = std::path::PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+            .join("bin/rustc");
+        let root = tempfile::tempdir().unwrap();
+        let service = ScriptTools::open(
+            root.path(),
+            isolated_sandbox().with_rustc(compiler),
+            Arc::new(Deny),
+        )
+        .unwrap();
+        service.bind_tools(vec![]).unwrap();
+        let tools = service.tools();
+        let ctx = context();
+        let mut candidate = spec();
+        candidate.language = Language::Rust;
+        candidate.source = include_str!("../../script-runtime/examples/plugins/hello.rs").into();
+        let saved = execute(
+            &tools[0],
+            "rust-save",
+            json!({"spec":candidate}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved["compiled"], true);
+        assert_eq!(saved["executed"], false);
+        let version = saved["version"]["reference"].clone();
+        execute(
+            &tools[2],
+            "rust-enable",
+            json!({"version":version}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let result = execute(
+            &tools[3],
+            "rust-run",
+            json!({"version":version,"arguments":{}}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["receipt"]["result"]["language"], "rust");
+        candidate.source = "not valid Rust".into();
+        assert!(
+            execute(
+                &tools[0],
+                "rust-bad-save",
+                json!({"spec":candidate}),
+                ctx.clone()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(
+                service
+                    .store
+                    .selected(ctx.scope().unwrap(), "adapter-example")
+                    .unwrap()
+            )
+            .unwrap(),
+            version
+        );
     }
 
     #[cfg(not(target_os = "linux"))]

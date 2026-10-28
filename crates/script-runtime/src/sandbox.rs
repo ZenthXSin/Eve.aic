@@ -12,6 +12,13 @@ pub struct Bubblewrap {
     pub bwrap: PathBuf,
     pub python: PathBuf,
     pub node: PathBuf,
+    pub(crate) container: Option<crate::ContainerSandbox>,
+    pub(crate) rustc: Option<PathBuf>,
+    pub(crate) rust_cache: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::BTreeMap<String, std::sync::Arc<crate::compiler::CompiledRust>>,
+        >,
+    >,
 }
 impl Bubblewrap {
     pub fn new(python: impl Into<PathBuf>, node: impl Into<PathBuf>) -> Self {
@@ -19,9 +26,32 @@ impl Bubblewrap {
             bwrap: "/usr/bin/bwrap".into(),
             python: python.into(),
             node: node.into(),
+            container: None,
+            rustc: None,
+            rust_cache: Default::default(),
+        }
+    }
+    pub fn with_rustc(mut self, rustc: impl Into<PathBuf>) -> Self {
+        self.rustc = Some(rustc.into());
+        self.rust_cache = Default::default();
+        self
+    }
+    /// 只能由可信宿主配置；参数不经过插件/模型输入。
+    pub fn with_container(mut self, container: crate::ContainerSandbox) -> Self {
+        self.container = Some(container);
+        self
+    }
+    pub(crate) fn description(&self) -> &'static str {
+        if self.container.is_some() {
+            "linux-container-required; daemon and immutable image checked at launch"
+        } else {
+            "bubblewrap-required; namespace availability checked at launch"
         }
     }
     pub(crate) fn preflight(&self, language: &Language) -> Result<()> {
+        if let Some(container) = &self.container {
+            return container.preflight(language);
+        }
         if !cfg!(target_os = "linux") {
             return Err(reject("缺少 Linux namespace 隔离，拒绝原生 exec 降级"));
         }
@@ -31,6 +61,10 @@ impl Bubblewrap {
         let executable = match language {
             Language::Python => &self.python,
             Language::Javascript => &self.node,
+            Language::Rust => self
+                .rustc
+                .as_ref()
+                .ok_or_else(|| reject("未配置可信Rust编译器"))?,
         };
         for path in [&self.bwrap, executable] {
             if !path.is_absolute() || !path.is_file() {
@@ -44,7 +78,10 @@ impl Bubblewrap {
         version: &PublishedVersion,
         source: &Path,
         work: &Path,
-    ) -> Result<Child> {
+    ) -> Result<SandboxChild> {
+        if let Some(container) = &self.container {
+            return container.spawn(version, source, work);
+        }
         self.preflight(&version.spec.language)?;
         let mut command = Command::new(&self.bwrap);
         #[cfg(target_os = "linux")]
@@ -140,6 +177,9 @@ impl Bubblewrap {
             .arg("/entry")
             .args(["--chdir", "/work"]);
         match version.spec.language {
+            Language::Rust => {
+                command.args(["--", "/entry"]);
+            }
             Language::Python => {
                 // 解释器来自可信PATH/配置；同时只读挂载其安装前缀的lib，支持非/usr的CI Python。
                 let library = self
@@ -182,6 +222,11 @@ impl Bubblewrap {
         // 子进程只继承 stdin/stdout；bwrap 的 PID namespace 在退出时杀死全部后代。
         command
             .spawn()
+            .map(|child| SandboxChild {
+                child,
+                container: None,
+                staging: None,
+            })
             .map_err(|_| reject("隔离进程启动失败，未降级到宿主 exec"))
     }
 }
@@ -248,4 +293,56 @@ fn syscall_filter() -> Result<tempfile::NamedTempFile> {
     use std::io::{Seek, SeekFrom};
     file.seek(SeekFrom::Start(0)).map_err(reject)?;
     Ok(file)
+}
+
+/// 宿主取消同时清理容器；即使daemon暂不可达，固定容器timeout仍在30秒内终止负载。
+pub(crate) struct SandboxChild {
+    pub(crate) child: Child,
+    pub(crate) container: Option<(PathBuf, String)>,
+    pub(crate) staging: Option<tempfile::TempDir>,
+}
+impl SandboxChild {
+    pub(crate) fn sync_work(&self, work: &Path) -> Result<()> {
+        if let Some(staging) = &self.staging {
+            crate::container::copy_work(work, &staging.path().join("work"))?;
+        }
+        Ok(())
+    }
+}
+impl std::ops::Deref for SandboxChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+impl std::ops::DerefMut for SandboxChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+impl Drop for SandboxChild {
+    fn drop(&mut self) {
+        if let Some((cli, id)) = self.container.take() {
+            // 清理请求不包含用户可控参数；不等待daemon，不阻塞宿主执行器。
+            if let Ok(mut cleanup) = std::process::Command::new(cli)
+                .args(["rm", "--force", &id])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                std::thread::spawn(move || {
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while std::time::Instant::now() < until {
+                        if cleanup.try_wait().is_ok_and(|status| status.is_some()) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    let _ = cleanup.kill();
+                    let _ = cleanup.wait();
+                });
+            }
+        }
+    }
 }

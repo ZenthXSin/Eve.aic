@@ -21,7 +21,8 @@ from memory_test import BINARY, ROOT
 WORKER = "你在为 Eve 独立完成一项委托的任务"
 TASKS = '{"kind":"eve.background_tasks"'
 ORCHESTRATION = {"dispatch_background_task", "list_background_tasks", "cancel_background_task", "run_subagent"}
-CHAT_TOOLS = PLATFORM_TOOLS | {"echo"} | ORCHESTRATION | {"create_subagent","list_subagents","delete_subagent"}
+REPRODUCTION_TOOLS = {"manage_failure_reproduction"}
+CHAT_TOOLS = PLATFORM_TOOLS | {"echo"} | ORCHESTRATION | REPRODUCTION_TOOLS | {"create_subagent","list_subagents","delete_subagent"}
 ASK = "帮我在后台把日志整理一下"
 DISPATCHED = "好，已经在后台处理，做完私聊你。"
 INSTRUCTIONS = "读取三份日志，统计错误条数，给出结论。"
@@ -103,7 +104,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.assertEqual(roles.count("user"), 1, "执行器看不到对话")
         if not body.get("tools"):
             return text_response(RESULT)
-        self.assertEqual(self.definitions(body), (PLATFORM_TOOLS - CONTEXT_TOOLS) | {"echo"} | ({"run_subagent"} if self.worker_subagents else set()), "后台执行者可以委派叶子子代理，但不能再派发后台任务")
+        self.assertEqual(self.definitions(body), (PLATFORM_TOOLS - CONTEXT_TOOLS) | REPRODUCTION_TOOLS | {"echo"} | ({"run_subagent"} if self.worker_subagents else set()), "后台执行者可以委派叶子子代理与隔离复现，但不能再派发后台任务")
         done = len(self.results(body))
         return calls((f"step-{done}", "echo", {"text": f"第 {done + 1} 步"}))
 
@@ -271,7 +272,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
                 self.assertEqual([m["role"] for m in body["messages"]].count("user"), 1, "子代理看不到对话")
                 if not body.get("tools"):
                     return text_response("echo 可用。")
-                self.assertEqual(self.definitions(body), (PLATFORM_TOOLS - CONTEXT_TOOLS) | {"echo"})
+                self.assertEqual(self.definitions(body), (PLATFORM_TOOLS - CONTEXT_TOOLS) | REPRODUCTION_TOOLS | {"echo"})
                 if not self.results(body):
                     return calls(("probe", "echo", {"text": "ping"}))
                 [echoed] = self.results(body)

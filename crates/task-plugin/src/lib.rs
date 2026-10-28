@@ -56,6 +56,17 @@ impl TaskAdmin for TaskController {
     ) -> TaskResult<Task> {
         self.service()?.create(owner, spec, source, now_ms)
     }
+    fn create_bounded(
+        &self,
+        owner: &TaskOwner,
+        spec: TaskSpec,
+        source: &str,
+        deadline_at_ms: u64,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        self.service()?
+            .create_with_deadline(owner, spec, source, Some(deadline_at_ms), now_ms)
+    }
     fn start(&self, id: &str, now_ms: u64) -> TaskResult<Task> {
         self.service()?.start(id, now_ms)
     }

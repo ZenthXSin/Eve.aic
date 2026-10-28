@@ -167,6 +167,15 @@ pub struct SubjectSnapshot {
     pub foci: Vec<SubjectFocus>,
 }
 
+/// 只允许领取全局最高优先级事件；不匹配时返回None，绝不绕过它领取低优先级事件。
+#[derive(Clone, Default)]
+pub enum SubjectClaim {
+    #[default]
+    Any,
+    Event(String),
+    ExceptKinds(Vec<String>),
+}
+
 /// 只交给可信宿主。模型工具须绑定 scope 的包装器，不能直接发布此管理能力。
 pub trait SubjectAdmin: Send + Sync {
     fn enqueue(&self, input: SubjectEventInput, now_ms: u64) -> SubjectResult<SubjectEvent>;
@@ -183,6 +192,18 @@ pub trait SubjectAdmin: Send + Sync {
         now_ms: u64,
         lease_ms: u64,
     ) -> SubjectResult<Option<SubjectEvent>>;
+    fn claim_filtered(
+        &self,
+        worker: &str,
+        filter: &SubjectClaim,
+        now_ms: u64,
+        lease_ms: u64,
+    ) -> SubjectResult<Option<SubjectEvent>> {
+        match filter {
+            SubjectClaim::Any => self.claim_next(worker, now_ms, lease_ms),
+            _ => Err(SubjectError::InvalidInput),
+        }
+    }
     fn checkpoint(
         &self,
         token: &LeaseToken,
@@ -207,6 +228,29 @@ pub trait SubjectAdmin: Send + Sync {
     ) -> SubjectResult<SubjectEvent>;
     /// 只取消这个精确范围的排队事件；运行事件设置合作式取消标记。
     fn cancel_scope(&self, scope: &SubjectScope, now_ms: u64) -> SubjectResult<usize>;
+    /// 可信宿主启动时撤销已丢失本地请求的排队准入；不更改运行或Unknown事件。
+    fn abandon_pending_kind(&self, _kind: &str, _now_ms: u64) -> SubjectResult<usize> {
+        Err(SubjectError::InvalidInput)
+    }
+    /// 只撤销指定精确范围的排队事件，不扩大为整会话取消。
+    /// 仅重排已确认未受理的短准入；不是失败任务或Unknown的重试入口。
+    fn rearm_busy_admission(
+        &self,
+        _scope: &SubjectScope,
+        _id: &str,
+        _now_ms: u64,
+    ) -> SubjectResult<SubjectEvent> {
+        Err(SubjectError::InvalidInput)
+    }
+    fn cancel_queued_event(
+        &self,
+        _scope: &SubjectScope,
+        _id: &str,
+        _now_ms: u64,
+    ) -> SubjectResult<()> {
+        Err(SubjectError::InvalidInput)
+    }
+
     fn snapshot_for(&self, scope: &SubjectScope) -> SubjectResult<SubjectSnapshot>;
     fn upsert_focus(&self, focus: SubjectFocus, now_ms: u64) -> SubjectResult<SubjectFocus>;
     /// 只排入到期关注的检查事件，不产生通知；每个关注至少间隔三十分钟。

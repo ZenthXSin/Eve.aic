@@ -874,3 +874,66 @@ async fn cancelling_a_blocked_task_prevents_future_condition_resume() {
     );
     kernel.stop_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn bounded_create_keeps_original_authorization_deadline_atomically_across_restart() {
+    let world = World::new();
+    let (kernel, admin) = world.open().await.unwrap();
+    let task = admin
+        .create_bounded(&owner("a"), spec("原授权目标"), "bounded", 1000, 10)
+        .unwrap();
+    assert_eq!(
+        task.execution
+            .as_ref()
+            .unwrap()
+            .authorization_deadline_at_ms,
+        Some(1000)
+    );
+    let duplicate = admin
+        .create_bounded(&owner("a"), spec("不能刷新期限"), "bounded", 2000, 20)
+        .unwrap();
+    assert_eq!(
+        duplicate
+            .execution
+            .as_ref()
+            .unwrap()
+            .authorization_deadline_at_ms,
+        Some(1000)
+    );
+    assert!(
+        admin
+            .create_bounded(&owner("a"), spec("已过期"), "expired", 30, 30)
+            .is_err()
+    );
+    let mut foreign = owner("a");
+    foreign.session_id = "other-window".into();
+    assert!(
+        admin
+            .create_bounded(&foreign, spec("不能跨范围"), "bounded", 2000, 20)
+            .is_err()
+    );
+    admin.start(&task.id, 21).unwrap();
+    assert!(
+        admin
+            .checkpoint(&task.id, checkpoint("a"), 2000, 22)
+            .is_err()
+    );
+    admin
+        .checkpoint(&task.id, checkpoint("a"), 1000, 22)
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    drop(kernel);
+    let (_kernel, restored) = world.open().await.unwrap();
+    assert_eq!(
+        restored
+            .snapshot()
+            .unwrap()
+            .get(&task.id)
+            .unwrap()
+            .execution
+            .as_ref()
+            .unwrap()
+            .authorization_deadline_at_ms,
+        Some(1000)
+    );
+}
