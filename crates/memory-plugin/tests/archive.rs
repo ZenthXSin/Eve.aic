@@ -1027,3 +1027,87 @@ async fn archived_evidence_can_confirm_a_preference_and_replay_after_restart_wit
         raw
     );
 }
+
+#[tokio::test]
+async fn archived_single_scope_over_hot_byte_limit_still_recalls_old_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let archive = Arc::new(FileEvidenceArchive::open(directory.path()).unwrap());
+    let rig = start(None, Some((archive, ArchivePolicy::default())))
+        .await
+        .unwrap();
+    let scope = scope("large-single-scope");
+    let mut session = SessionSnapshot {
+        key: key(&scope),
+        revision: 0,
+        turns: vec![],
+    };
+    for number in 1..=80 {
+        let user = format!("unique-original-{number} {}", "x".repeat(30000));
+        let reply = "y".repeat(30000);
+        session.turns.push(SessionTurn {
+            id: number,
+            input: user.clone(),
+            status: SessionTurnStatus::Completed {
+                messages: vec![
+                    ChatMessage::text(ChatRole::User, user),
+                    ChatMessage::text(ChatRole::Assistant, reply),
+                ],
+            },
+        });
+        session.revision += 2;
+        commit(
+            &rig,
+            &scope,
+            CompletedInteraction {
+                evidence_id: format!("e-{number}"),
+                message_id: format!("m-{number}"),
+                at_ms: number,
+                snapshot: session.clone(),
+                turn_id: number,
+            },
+        )
+        .unwrap();
+    }
+    assert!(rig.admin.archive_status().unwrap().chunks > 0);
+    let full = rig
+        .admin
+        .reader(scope.clone())
+        .unwrap()
+        .complete_snapshot()
+        .unwrap();
+    assert!(serde_json::to_vec(&full).unwrap().len() > MAX_STATE_BYTES);
+    let recall = LexicalMemoryRecall::new(Arc::new(rig.admin.clone()))
+        .reader(scope)
+        .unwrap();
+    let result = recall
+        .recall(&MemoryRecallRequest {
+            query: "unique-original-1".into(),
+            limit: 1,
+        })
+        .unwrap();
+    assert_eq!(result.hits.len(), 1);
+    assert!(result.hits[0].excerpt.contains("unique-original-1"));
+    stop(rig).await;
+}
+
+#[tokio::test]
+async fn archived_identity_aliases_cannot_be_reused_by_a_new_turn() {
+    for alias_message in [false,true] {
+        let directory=tempfile::tempdir().unwrap();
+        let archive=Arc::new(FileEvidenceArchive::open(directory.path()).unwrap());
+        let rig=start(None,Some((archive,small_policy()))).await.unwrap();
+        let scope=scope("archive-alias");
+        for number in 1..=8 { import(&rig,&scope,number).unwrap(); }
+        let archived=all_archived(&rig.admin,&scope);
+        assert!(!archived.is_empty());
+        let original=rig.admin.reader(scope.clone()).unwrap().complete_snapshot().unwrap();
+        let mut next=prepare(&rig,&scope,9);
+        if alias_message {
+            let EvidenceSource::CompletedInteraction{message_id,..}=&archived[0].source else {panic!()};
+            next.message_id=message_id.clone();
+        } else { next.evidence_id=archived[0].id.clone(); }
+        assert!(matches!(commit(&rig,&scope,next),Err(MemoryError::Conflict)),"旧归档身份不得由新轮次复用");
+        assert!(rig.admin.reader(scope).unwrap().complete_snapshot().unwrap()==original);
+        stop(rig).await;
+    }
+}
