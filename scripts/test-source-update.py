@@ -189,6 +189,29 @@ print('fixture check passed')
         self.assertEqual([len(c['steps']) for c in manifest['checks']],[1,2,2,2])
         self.assertIn('1 passed',manifest['checks'][2]['stdout'])
 
+    def test_large_log_tail_is_bounded_and_never_uses_read_bytes(self):
+        log=self.root/'large.log'
+        with log.open('wb') as stream:
+            stream.seek(128*1024*1024);stream.write(b'final-line')
+        with patch.object(Path,'read_bytes',side_effect=AssertionError('unbounded read')):
+            tail,truncated=update.log_tail(log)
+        self.assertTrue(truncated)
+        self.assertEqual(len(tail),16384)
+        self.assertTrue(tail.endswith('final-line'))
+
+    def test_repeated_prepare_reuses_immutable_candidate_and_renews_only_lease(self):
+        first=self.prepare();directory=Path(first['request']['candidate_directory'])
+        manifest=(directory/'manifest.json').read_bytes();stamp=(directory/'manifest.json').stat().st_mtime_ns
+        second=self.prepare()
+        self.assertEqual(first['request']['candidate_sha256'],second['request']['candidate_sha256'])
+        self.assertEqual((directory/'manifest.json').read_bytes(),manifest)
+        self.assertEqual((directory/'manifest.json').stat().st_mtime_ns,stamp)
+        self.assertGreaterEqual(second['request']['lease']['created_at_ms'],first['request']['lease']['created_at_ms'])
+        runtime.validate_lease(second['request'],directory,runtime.read_json(directory/'manifest.json'))
+        (directory/'resources/AGENT.md').write_text('tampered')
+        with self.assertRaisesRegex(ValueError,'resource_changed'):self.prepare()
+        self.assertEqual((directory/'resources/AGENT.md').read_text(),'tampered')
+
     def test_check_failure_does_not_publish_candidate_or_touch_old_instance(self):
         (self.root / 'fail-check').touch()
         self.supervisor_start()

@@ -143,6 +143,96 @@ impl PrefixRulePolicy {
         self
     }
 
+    /// 对已知包装器和参数位置做保守归一化；未知动态语法不静默放行。
+    fn evaluate_semantics(
+        &self,
+        command: &[String],
+        matches: &mut Vec<CommandRuleMatch>,
+        depth: usize,
+    ) {
+        if command.is_empty() {
+            return;
+        }
+        self.evaluate_one(command, matches);
+        let base = Path::new(&command[0])
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&command[0]);
+        let args = &command[1..];
+        let mut mark = |reason: &str| {
+            matches.push(CommandRuleMatch {
+                matched_prefix: vec![base.into()],
+                decision: CommandDecision::Prompt,
+                justification: Some(reason.into()),
+            })
+        };
+        if base == "git" {
+            let mut position = 0;
+            while let Some(option) = args.get(position).filter(|a| a.starts_with('-')) {
+                position += if matches!(
+                    option.as_str(),
+                    "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace"
+                ) {
+                    2
+                } else {
+                    1
+                };
+            }
+            if let Some(operation) = args.get(position) {
+                let rest = &args[position + 1..];
+                let dangerous = match operation.as_str() {
+                    "push" => rest.iter().any(|a| {
+                        a == "-f"
+                            || a == "-d"
+                            || a.starts_with("--force")
+                            || a == "--mirror"
+                            || a == "--delete"
+                    }),
+                    "reset" => rest.iter().any(|a| a == "--hard"),
+                    "clean" => rest
+                        .iter()
+                        .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('f')),
+                    "branch" => rest
+                        .iter()
+                        .any(|a| a == "-D" || a == "-d" || a == "--delete"),
+                    "checkout" | "restore" => rest
+                        .iter()
+                        .any(|a| a == "." || a == "--" || a == "--force" || a == "-f"),
+                    _ => false,
+                };
+                if dangerous {
+                    mark("Git 参数会删除或丢弃工作、改写远端历史，执行前审核完整命令");
+                }
+            }
+        }
+        if base == "rm"
+            && args.iter().any(|a| {
+                a == "--recursive"
+                    || (a.starts_with('-')
+                        && !a.starts_with("--")
+                        && (a.contains('r') || a.contains('R')))
+            })
+        {
+            mark("递归删除，必须先审核完整目标与影响范围");
+        }
+        if matches!(
+            base,
+            "env" | "sudo" | "command" | "exec" | "nohup" | "timeout"
+        ) {
+            if depth >= 8 {
+                mark("命令包装层级过深，执行前审核");
+                return;
+            }
+            mark("包装命令可能改变执行身份、环境或目标，执行前审核");
+            if let Some(position) = args
+                .iter()
+                .position(|a| !a.starts_with('-') && !a.contains('='))
+            {
+                self.evaluate_semantics(&args[position..], matches, depth + 1);
+            }
+        }
+    }
+
     fn evaluate_one(&self, command: &[String], matches: &mut Vec<CommandRuleMatch>) {
         let Some(first) = command.first() else {
             return;
@@ -212,8 +302,31 @@ impl CommandPolicy for PrefixRulePolicy {
         let mut whole = vec![program.to_string()];
         whole.extend(args.iter().cloned());
         self.evaluate_one(&whole, &mut matches);
-        for command in shell_script(program, args).unwrap_or_default() {
-            self.evaluate_one(&command, &mut matches);
+        self.evaluate_semantics(&whole, &mut matches, 0);
+        if let Some(commands) = shell_script(program, args) {
+            for command in commands {
+                self.evaluate_semantics(&command, &mut matches, 0);
+            }
+        }
+        let base = Path::new(program)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(program);
+        if SHELLS.contains(&base) && args.iter().any(|a| a.starts_with('-') && a.contains('c')) {
+            let uncertain = shell_script(program, args).is_none()
+                || args
+                    .iter()
+                    .any(|a| a.contains(['$', '`', '\n', '(', ')', '{', '}', '<', '>']));
+            if uncertain {
+                matches.push(CommandRuleMatch {
+                    matched_prefix: whole.clone(),
+                    decision: CommandDecision::Prompt,
+                    justification: Some(
+                        "脚本包含动态展开、重定向或无法静态解析的语法，执行前必须审核完整命令"
+                            .into(),
+                    ),
+                });
+            }
         }
         CommandEvaluation {
             decision: matches.iter().map(|m| m.decision).max(),
@@ -270,6 +383,30 @@ mod tests {
         );
         assert_eq!(decide(&policy, "bash -c 'ls | grep x'"), None);
         assert_eq!(decide(&policy, "sh -c 'echo a;rm -rf ~'"), Some(Forbidden));
+    }
+
+    #[test]
+    fn dynamic_scripts_wrappers_and_reordered_destructive_options_require_review() {
+        let policy = PrefixRulePolicy::builtin();
+        for command in [
+            "git -C repo push origin main --force",
+            "git -c color.ui=never reset HEAD --hard",
+            "rm --force -R build",
+            "sh -c '$(cat command)'",
+            "bash -lc 'echo x > file'",
+            "env X=y git push origin --force",
+            "timeout 5 git reset --hard",
+        ] {
+            assert!(
+                decide(&policy, command) >= Some(CommandDecision::Prompt),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            decide(&policy, "sudo reboot"),
+            Some(CommandDecision::Forbidden)
+        );
+        assert_eq!(decide(&policy, "git -C repo status"), None);
     }
 
     #[test]

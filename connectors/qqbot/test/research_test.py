@@ -4,6 +4,7 @@
 知识保存来源网址、抓取时间、版本与逐字引用，推测单独标注。各阶段先持久化再执行，
 失败与中断不重试、不重放。确定性替身只证明宿主契约与恢复语义，不代表真实模型的研究质量。
 """
+from fixture_auth import configure_fixture_progress
 import json
 import os
 import pathlib
@@ -317,7 +318,7 @@ class ResearchAcceptance(unittest.TestCase):
                                  "不属于本地资料")):
             result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
                                      "--agent", str(ROOT / "AGENT.md"), "--interest-learning", *extra],
-                                    env=env, capture_output=True, text=True, timeout=60)
+                                    env=configure_fixture_progress(env), capture_output=True, text=True, timeout=60)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(expected, result.stderr)
 
@@ -427,7 +428,7 @@ class ResearchAcceptance(unittest.TestCase):
                       ["--interest-learning", "--research-source", "ftp://127.0.0.1/docs/"]):
             result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
                                      "--agent", str(ROOT / "AGENT.md"), *extra],
-                                    env=env, capture_output=True, text=True, timeout=30)
+                                    env=configure_fixture_progress(env), capture_output=True, text=True, timeout=30)
             self.assertNotEqual(result.returncode, 0)
             self.assertTrue("--interest-learning" in result.stderr or "研究入口页面无效" in result.stderr,
                             result.stderr)

@@ -1,7 +1,175 @@
 use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn now_ms() -> Result<u64, ToolExecutionError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| failed("系统时钟无效"))?
+        .as_millis() as u64)
+}
+
+fn file_digest(path: &Path) -> Result<String, ToolExecutionError> {
+    use std::io::Read;
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| failed("candidate_missing：候选文件不存在"))?;
+    if !metadata.is_file() || metadata.len() > 2 * 1024 * 1024 * 1024 {
+        return Err(failed("candidate_changed：候选文件类型或大小改变"));
+    }
+    let mut file = fs::File::open(path).map_err(|_| failed("candidate_missing：候选文件不可读"))?;
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = [0u8; 65536];
+    loop {
+        let size = file
+            .read(&mut buffer)
+            .map_err(|_| failed("candidate_changed：候选读取失败"))?;
+        if size == 0 {
+            break;
+        }
+        context.update(&buffer[..size]);
+    }
+    Ok(context
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
+fn read_manifest(directory: &Path) -> Result<(Vec<u8>, Value), ToolExecutionError> {
+    let path = directory.join("manifest.json");
+    let metadata =
+        fs::symlink_metadata(&path).map_err(|_| failed("candidate_missing：候选清单不存在"))?;
+    if !metadata.is_file() || metadata.len() > LIVE_UPGRADE_MAX_JSON as u64 {
+        return Err(failed("candidate_changed：候选清单类型或大小无效"));
+    }
+    let bytes = fs::read(path).map_err(|_| failed("candidate_missing：候选清单不可读"))?;
+    let manifest =
+        serde_json::from_slice(&bytes).map_err(|_| failed("candidate_changed：候选清单损坏"))?;
+    Ok((bytes, manifest))
+}
+
+fn verify_contents(directory: &Path, manifest: &Value, id: &str) -> Result<(), ToolExecutionError> {
+    if !fs::symlink_metadata(directory)
+        .map_err(|_| failed("candidate_missing：候选不存在"))?
+        .is_dir()
+    {
+        return Err(failed("candidate_changed：候选目录类型无效"));
+    }
+    if manifest["format_version"] != 1
+        || manifest["prepared"] != true
+        || manifest["success"] != true
+        || manifest["candidate_sha256"] != id
+        || manifest["checks"]
+            .as_array()
+            .is_none_or(|checks| checks.len() != 4 || checks.iter().any(|c| c["success"] != true))
+    {
+        return Err(failed("candidate_changed：缺少完整硬性验证证据"));
+    }
+    let binary = directory.join(if cfg!(windows) {
+        "eve-qqbot.exe"
+    } else {
+        "eve-qqbot"
+    });
+    if manifest["candidate_path"] != binary.to_string_lossy().as_ref()
+        || file_digest(&binary)? != manifest["binary_sha256"].as_str().unwrap_or("")
+    {
+        return Err(failed("candidate_changed：候选程序改变"));
+    }
+    let resources = manifest["resources"]
+        .as_object()
+        .ok_or_else(|| failed("candidate_changed：资源清单无效"))?;
+    if resources.len() > 10000
+        || [
+            "AGENT.md",
+            "connectors/qqbot/bridge.mjs",
+            "connectors/qqbot/bridge-core.mjs",
+            "connectors/qqbot/package.json",
+            "connectors/qqbot/package-lock.json",
+        ]
+        .iter()
+        .any(|name| !resources.contains_key(*name))
+    {
+        return Err(failed("candidate_changed：运行资源缺失"));
+    }
+    let mut total = 0u64;
+    for (name, expected) in resources {
+        if !(name == "AGENT.md"
+            || name.starts_with("connectors/qqbot/")
+            || name.starts_with("vendor/"))
+            || name.contains('\\')
+            || name.contains("//")
+            || Path::new(name)
+                .components()
+                .any(|c| !matches!(c, Component::Normal(_)))
+        {
+            return Err(failed("candidate_changed：资源路径无效"));
+        }
+        let mut path = directory.join("resources");
+        for part in Path::new(name).components() {
+            path.push(part);
+            if fs::symlink_metadata(&path)
+                .map_err(|_| failed("candidate_missing：运行资源不存在"))?
+                .file_type()
+                .is_symlink()
+            {
+                return Err(failed("candidate_changed：运行资源不能是链接"));
+            }
+        }
+        total += fs::metadata(&path)
+            .map_err(|_| failed("candidate_missing：资源不存在"))?
+            .len();
+        if total > 64 * 1024 * 1024 || file_digest(&path)? != expected.as_str().unwrap_or("") {
+            return Err(failed("candidate_changed：资源内容改变"));
+        }
+    }
+    if hash(
+        json!({"source":manifest["source"], "binary_sha256":manifest["binary_sha256"],
+        "resources":manifest["resources"]})
+        .to_string()
+        .as_bytes(),
+    ) != id
+    {
+        return Err(failed("candidate_changed：内容地址不一致"));
+    }
+    Ok(())
+}
+
+fn upgrade_plan(manifest: &Value) -> Value {
+    json!({"operation":"switch_binary_preserve_state", "candidate_sha256":manifest["candidate_sha256"],
+        "state_schema_version":1, "validation_policy":"format-clippy-tests-release-build-v1"})
+}
+
 impl LocalDeveloper {
+    pub(super) fn issue_upgrade_lease(
+        &self,
+        directory: &Path,
+        mut manifest: Value,
+    ) -> Result<Value, ToolExecutionError> {
+        let (raw, _) = read_manifest(directory)?;
+        let now = now_ms()?;
+        let lease = UpgradeLease {
+            format_version: 1,
+            candidate_sha256: manifest["candidate_sha256"].as_str().unwrap().into(),
+            manifest_sha256: hash(&raw),
+            plan_sha256: hash(upgrade_plan(&manifest).to_string().as_bytes()),
+            validation_sha256: hash(manifest["checks"].to_string().as_bytes()),
+            state_schema_version: 1,
+            created_at_ms: now,
+            expires_at_ms: now + LIVE_UPGRADE_LEASE_MS,
+        };
+        let leases = self.journal.join("leases");
+        fs::create_dir_all(&leases).map_err(|_| failed("准备租约目录不可创建"))?;
+        let mut file =
+            tempfile::NamedTempFile::new_in(&leases).map_err(|_| failed("准备租约暂存失败"))?;
+        file.write_all(&serde_json::to_vec(&lease).map_err(|_| failed("准备租约编码失败"))?)
+            .and_then(|_| file.as_file().sync_all())
+            .map_err(|_| failed("准备租约保存失败"))?;
+        file.persist(leases.join(format!("{}.json", lease.candidate_sha256)))
+            .map_err(|_| failed("准备租约提交失败"))?;
+        manifest["lease"] = serde_json::to_value(lease).map_err(|_| failed("准备租约编码失败"))?;
+        Ok(manifest)
+    }
+
     pub(super) async fn publish_upgrade(
         &self,
         source: Value,
@@ -71,6 +239,21 @@ impl LocalDeveloper {
         let identity = json!({"source":source,"binary_sha256":digest,"resources":resources});
         let candidate_id = hash(identity.to_string().as_bytes());
         let directory = parent.join(&candidate_id);
+        if !directory.exists()
+            && fs::read_dir(&parent)
+                .map_err(|_| failed("候选目录不可读取"))?
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry.path().is_dir()
+                        && valid_candidate_sha(&entry.file_name().to_string_lossy())
+                })
+                .count()
+                >= 8
+        {
+            return Err(failed(
+                "candidate_storage_limit：最多保留八份候选，请检查并清理未使用的候选",
+            ));
+        }
         let filename = if cfg!(windows) {
             "eve-qqbot.exe"
         } else {
@@ -89,6 +272,9 @@ impl LocalDeveloper {
             "source":source,"candidate_sha256":candidate_id,"binary_sha256":digest,"candidate_path":candidate,
             "resources":resources,"checks":checks,
             "next":"按仓库约定提交分支/PR；已装配监督器时用 apply_self_upgrade 提交切换，并用 self_upgrade_status 核对真实结果。"});
+        if manifest.to_string().len() > LIVE_UPGRADE_MAX_JSON {
+            return Err(failed("候选清单超过上限，未发布候选"));
+        }
         fs::write(stage.path().join("manifest.json"), manifest.to_string())
             .map_err(|_| failed("候选清单保存失败"))?;
         for name in [filename, "manifest.json"] {
@@ -98,31 +284,12 @@ impl LocalDeveloper {
         }
         if directory.exists() {
             // 相同摘要的已发布目录不得覆盖；损坏时保留现场并拒绝。
-            let old: Value = serde_json::from_slice(
-                &fs::read(directory.join("manifest.json"))
-                    .map_err(|_| failed("已有候选不可读取"))?,
-            )
-            .map_err(|_| failed("已有候选损坏"))?;
-            if old["candidate_sha256"] != candidate_id
-                || hash(&fs::read(&candidate).map_err(|_| failed("已有候选损坏"))?) != digest
-            {
-                return Err(failed("已有候选不一致；保留原文件"));
-            }
-            for (name, expected) in &resources {
-                let path = directory.join("resources").join(name);
-                if fs::symlink_metadata(&path)
-                    .map_err(|_| failed("已有资源损坏"))?
-                    .file_type()
-                    .is_symlink()
-                    || hash(&fs::read(&path).map_err(|_| failed("已有资源损坏"))?) != *expected
-                {
-                    return Err(failed("已有候选资源不一致；保留原文件"));
-                }
-            }
-            return Ok(old);
+            let (_, old) = read_manifest(&directory)?;
+            verify_contents(&directory, &old, &candidate_id)?;
+            return self.issue_upgrade_lease(&directory, old);
         }
         fs::rename(stage.path(), &directory).map_err(|_| failed("候选原子发布失败；保留原文件"))?;
-        Ok(manifest)
+        self.issue_upgrade_lease(&directory, manifest)
     }
 
     fn supervisor(&self) -> Result<(PathBuf, UpgradeSupervisor), ToolExecutionError> {
@@ -174,7 +341,6 @@ impl LocalDeveloper {
             return Err(failed("监督器正在切换或需要检查，未提交新请求"));
         }
         let candidate = self.journal.join("candidates").join(&a.candidate_sha256);
-        let path = candidate.join("manifest.json");
         if fs::symlink_metadata(&candidate)
             .map_err(|_| failed("候选不存在"))?
             .file_type()
@@ -182,11 +348,7 @@ impl LocalDeveloper {
         {
             return Err(failed("候选目录不能是链接"));
         }
-        let bytes = fs::read(path).map_err(|_| failed("候选清单不可读取"))?;
-        if bytes.len() > LIVE_UPGRADE_MAX_JSON {
-            return Err(failed("候选清单超过上限"));
-        }
-        let manifest: Value = serde_json::from_slice(&bytes).map_err(|_| failed("候选清单损坏"))?;
+        let (bytes, manifest) = read_manifest(&candidate)?;
         if manifest["format_version"] != 1
             || manifest["prepared"] != true
             || manifest["success"] != true
@@ -196,6 +358,35 @@ impl LocalDeveloper {
             })
         {
             return Err(failed("候选没有完整验证证据，未提交切换"));
+        }
+        verify_contents(&candidate, &manifest, &a.candidate_sha256)?;
+        let lease_path = self
+            .journal
+            .join("leases")
+            .join(format!("{}.json", a.candidate_sha256));
+        let lease_bytes =
+            fs::read(&lease_path).map_err(|_| failed("prepare_lease_missing：请先准备候选"))?;
+        if lease_bytes.len() > LIVE_UPGRADE_MAX_JSON {
+            return Err(failed("prepare_lease_changed：准备租约超过上限"));
+        }
+        let lease: UpgradeLease = serde_json::from_slice(&lease_bytes)
+            .map_err(|_| failed("prepare_lease_changed：准备租约无效"))?;
+        let now = now_ms()?;
+        if lease.format_version != 1
+            || lease.state_schema_version != 1
+            || lease.candidate_sha256 != a.candidate_sha256
+            || lease.manifest_sha256 != hash(&bytes)
+            || lease.plan_sha256 != hash(upgrade_plan(&manifest).to_string().as_bytes())
+            || lease.validation_sha256 != hash(manifest["checks"].to_string().as_bytes())
+            || lease.expires_at_ms <= lease.created_at_ms
+            || lease.expires_at_ms - lease.created_at_ms > LIVE_UPGRADE_LEASE_MS
+        {
+            return Err(failed(
+                "prepare_lease_changed：准备内容、计划、验证或状态格式发生变化",
+            ));
+        }
+        if lease.created_at_ms > now.saturating_add(1000) || lease.expires_at_ms <= now {
+            return Err(failed("prepare_lease_expired：请重新准备候选"));
         }
         if status.result.as_deref() == Some("applied")
             && status.candidate_sha256.as_deref() == Some(a.candidate_sha256.as_str())
@@ -218,6 +409,7 @@ impl LocalDeveloper {
             turn_id: context
                 .turn_id()
                 .ok_or_else(|| failed("升级请求缺少可信持久轮次"))?,
+            lease: Some(lease),
         };
         self.authorize(context)?;
         let target = queue.join("request.json");

@@ -783,6 +783,17 @@ fn view(task: &Task, result_bytes: usize) -> Value {
         "minutes_since_dispatch": now_ms().saturating_sub(task.created_at_ms) / 60_000,
         "result": task.result.as_deref().map(|text| bounded(text, result_bytes)),
         "failure": task.failure,
+        "failure_receipt": matches!(task.status, TaskStatus::Failed | TaskStatus::Interrupted | TaskStatus::Blocked).then(|| {
+            let checkpoint = task.execution.as_ref().and_then(|e| e.checkpoint.as_ref());
+            json!({"kind":"task_failure","task_id":task.id,"status":status_text(task),
+                "checkpoint_present":checkpoint.is_some(),
+                "checkpoint_resumable":checkpoint.is_some_and(|c| c.resumable()),
+                "pending_tool_calls":checkpoint.map_or(0, |c| c.pending_calls.len()),
+                "deadline_at_ms":task.execution.as_ref().and_then(|e| e.deadline_at_ms),
+                "remaining_tool_steps":task.spec.max_steps.saturating_sub(checkpoint.map_or(task.usage.map_or(0, |u| u.tool_calls), |c| (c.used_tool_calls+c.delegated_tool_calls) as u32)),
+                "reproduction":{"mode":"simulation_only","task_id":task.id,
+                    "instruction":"在隔离环境以冻结回执和脚本模型复现；不要重放未知工具或生产发送"}})
+        }),
         "interruption_reason": (task.status == TaskStatus::Interrupted).then(|| crate::qq_task_diagnostics::interruption(task)),
         "execution_steps": &steps[offset..],
         "step_total": steps.len(),
@@ -1070,7 +1081,7 @@ impl Tool for CancelTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: CANCEL_TOOL.into(),
-            description: "用户不再需要某个后台任务时调用：排队中的直接取消；执行中的会尽快停下，已经做了的操作不会撤销。只能取消这位用户自己的任务。".into(),
+            description: "用户不再需要某个后台任务时调用：排队或条件阻塞中的直接取消，之后不再接续；执行中的会尽快停下，已经做了的操作不会撤销。只能取消这位用户自己的任务。".into(),
             argument_schema: json!({
                 "type": "object",
                 "properties": {"task_id": {"type": "string"}},
@@ -1479,6 +1490,7 @@ impl QqOutreach for ChannelAdapter {
                 biz_code,
             },
             QqOutreachResult::NotSent => DeliveryResult::NotSent,
+            QqOutreachResult::Unknown => DeliveryResult::Unknown,
         };
         self.tasks
             .record_delivery(id, result, now_ms())

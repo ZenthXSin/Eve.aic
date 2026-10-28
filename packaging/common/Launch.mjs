@@ -89,6 +89,7 @@ function validate(config) {
   for (const key of ['training', 'cognition', 'self_learning', 'memory_recall', 'segmented']) {
     if (typeof config.features?.[key] !== 'boolean') throw new Error(`features.${key} 必须为布尔值。`);
   }
+  if (config.features.autonomous_tools !== undefined && typeof config.features.autonomous_tools !== 'boolean') throw new Error('features.autonomous_tools 必须为布尔值。');
   if (mode === 'console') return;
   if (!/^[0-9]{1,32}$/.test(config.qq?.app_id) || !validText(config.qq?.app_secret)) throw new Error('QQ AppID 或 Secret 无效。');
   if (typeof config.qq.sandbox !== 'boolean' || typeof config.jev?.enabled !== 'boolean') throw new Error('QQ / Jev 开关必须为布尔值。');
@@ -193,6 +194,9 @@ async function main() {
     Object.assign(env, { QQBOT_APP_ID: config.qq.app_id, QQBOT_APP_SECRET: config.qq.app_secret,
       QQBOT_SANDBOX: String(config.qq.sandbox), EVE_WEB_TOKEN: config.web.token, EVE_JEV_API_KEY: '' });
     args.push('--node', nodePath, '--bridge-script', bridge, '--memory', '--web-listen', config.web.listen);
+    env.EVE_SCRIPT_NODE = nodePath;
+    // 默认装配自然对话能力；主动探索仍需可信主人经审核授予持久预算。
+    if (config.features.autonomous_tools !== false) args.push('--background-tasks', '--subagents', '--triggers', '--sleep', '--workflow-tools', '--health-watch');
     if (options.bridgeArg) args.push('--bridge-arg', options.bridgeArg);
     for (const [key, flag] of [['training', '--training'], ['cognition', '--cognition'], ['self_learning', '--self-learning'], ['memory_recall', '--memory-recall']]) {
       if (config.features[key]) args.push(flag);

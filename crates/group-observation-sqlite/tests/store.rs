@@ -233,3 +233,137 @@ fn raw_search_pages_all_saved_messages_without_crossing_groups_or_rewriting() {
         oldest[0]
     );
 }
+
+#[test]
+fn trusted_ids_anchor_repeated_text_attachment_and_late_messages_by_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteGroupObservations::open(&dir.path().join("group.db")).unwrap();
+    let mut first = message("g1");
+    first.id = "same-text-first".into();
+    first.text = "重复原话".into();
+    first.at_ms = 100;
+    store.append(&first).unwrap();
+    let mut anchor = first.clone();
+    anchor.id = "same-text-current".into();
+    anchor.at_ms = 1; // 平台时间不作为可靠顺序。
+    store.append(&anchor).unwrap();
+    let cutoff = store
+        .window_ending_at("g1", &[anchor.id.clone()], 20)
+        .unwrap()
+        .cutoff_seq;
+    for n in 0..25 {
+        let mut late = first.clone();
+        late.id = format!("late-{n}");
+        late.speaker = format!("member-{n}");
+        late.text = "后发新话题".into();
+        store.append(&late).unwrap();
+    }
+    let frozen = store
+        .window_ending_at("g1", &[anchor.id.clone()], 20)
+        .unwrap();
+    assert_eq!(frozen.cutoff_seq, cutoff);
+    assert_eq!(frozen.messages.len(), 2);
+    assert_eq!(frozen.messages.last().unwrap().message.id, anchor.id);
+    assert!(
+        frozen
+            .messages
+            .iter()
+            .all(|row| !row.message.id.starts_with("late-"))
+    );
+    let mut attachment = first.clone();
+    attachment.id = "pure-attachment-current".into();
+    attachment.text.clear();
+    store.append(&attachment).unwrap();
+    for n in 0..25 {
+        let mut late = first.clone();
+        late.id = format!("post-attachment-{n}");
+        store.append(&late).unwrap();
+    }
+    let frozen = store
+        .window_ending_at("g1", &[attachment.id.clone()], 20)
+        .unwrap();
+    assert_eq!(frozen.messages.last().unwrap().message.id, attachment.id);
+    assert!(frozen.messages.last().unwrap().message.text.is_empty());
+    assert!(
+        frozen
+            .messages
+            .iter()
+            .all(|row| !row.message.id.starts_with("post-attachment"))
+    );
+}
+
+#[test]
+fn merged_batch_keeps_all_anchor_ids_even_when_other_members_fill_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteGroupObservations::open(&dir.path().join("group.db")).unwrap();
+    let mut first = message("g1");
+    first.id = "batch-first".into();
+    store.append(&first).unwrap();
+    for n in 0..30 {
+        let mut other = first.clone();
+        other.id = format!("other-{n}");
+        other.speaker = "other-member".into();
+        store.append(&other).unwrap();
+    }
+    let mut last = first.clone();
+    last.id = "batch-primary".into();
+    store.append(&last).unwrap();
+    let ids = vec![first.id.clone(), last.id.clone()];
+    let frozen = store.window_ending_at("g1", &ids, 20).unwrap();
+    assert_eq!(frozen.messages.len(), 20);
+    assert_eq!(frozen.messages.first().unwrap().message.id, first.id);
+    assert_eq!(frozen.messages.last().unwrap().message.id, last.id);
+    assert!(
+        frozen
+            .messages
+            .iter()
+            .any(|row| row.message.speaker == "other-member")
+    );
+    assert!(store.window_ending_at("g2", &ids, 20).is_err());
+    assert!(
+        store
+            .window_ending_at("g1", &["missing-id".into()], 20)
+            .is_err()
+    );
+    assert!(
+        store
+            .window_ending_at("g1", &[last.id.clone(), first.id.clone()], 20)
+            .is_err()
+    );
+    assert!(
+        store
+            .window_ending_at("g1", &[last.id.clone(), last.id], 20)
+            .is_err()
+    );
+    assert!(store.window_ending_at("g1", &[], 20).is_err());
+}
+
+#[test]
+fn explicit_unknown_delivery_preserves_unknown_without_exchange_or_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("group.db");
+    let store = SqliteGroupObservations::open(&path).unwrap();
+    store.append(&message("g1")).unwrap();
+    store
+        .queue("chime-unknown-send", &reply("g1"), "user-1")
+        .unwrap();
+    store.claim().unwrap().unwrap();
+    store.finish_unknown("chime-unknown-send").unwrap();
+    assert!(store.claim().unwrap().is_none());
+    assert!(store.exchanges("g1").unwrap().is_empty());
+    assert!(store.finish("chime-unknown-send", true).is_err());
+    drop(store);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let status: String = db
+        .query_row(
+            "SELECT status FROM outbound WHERE id='chime-unknown-send'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "unknown");
+    drop(db);
+    let reopened = SqliteGroupObservations::open(&path).unwrap();
+    assert!(reopened.claim().unwrap().is_none());
+    assert!(reopened.exchanges("g1").unwrap().is_empty());
+}

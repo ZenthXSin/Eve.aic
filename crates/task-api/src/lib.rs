@@ -426,9 +426,19 @@ pub trait TaskAdmin: Send + Sync {
     ) -> TaskResult<Task>;
     /// 安全边界上安排有限次自动恢复；不清空回执、不补充步数、不新建任务。
     fn retry(&self, id: &str, now_ms: u64) -> TaskResult<Task>;
+    /// 可信条件已满足后接续同一阻塞任务；保留原预算、期限、回执和任务 ID。
+    fn resume_blocked(
+        &self,
+        _owner: &TaskOwner,
+        _id: &str,
+        _evidence: &str,
+        _now_ms: u64,
+    ) -> TaskResult<Task> {
+        Err(TaskError::InvalidTransition)
+    }
     /// 执行中 → 结束，保存结果与用量；完成与失败生成一条等待投递的通知。
     fn finish(&self, id: &str, end: TaskEnd, usage: TaskUsage, now_ms: u64) -> TaskResult<Task>;
-    /// 用户取消自己的任务：排队中的直接取消；执行中的记下取消请求，由执行器停止后结束。
+    /// 用户取消自己的任务：排队或阻塞中的直接取消；执行中的记下取消请求，由执行器停止后结束。
     fn cancel(&self, user_id: &str, id: &str, now_ms: u64) -> TaskResult<Task>;
     /// 保存一次通知投递尝试并进入发送中；返回后才可发送。主动私聊每条至多一次。
     fn claim(&self, id: &str, channel: DeliveryChannel, now_ms: u64) -> TaskResult<Task>;

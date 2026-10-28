@@ -201,10 +201,6 @@ impl StoredReminders {
         now_ms: u64,
     ) -> ReminderResult<Reminder> {
         validate_result(&result)?;
-        if result == DeliveryResult::Unknown {
-            // 结果未知只由重启核对写入。
-            return Err(ReminderError::InvalidInput);
-        }
         self.update(id, now_ms, |entry| {
             if entry.status != ReminderStatus::Delivering {
                 return Err(ReminderError::InvalidTransition);
@@ -216,9 +212,16 @@ impl StoredReminders {
                 .last_mut()
                 .filter(|attempt| attempt.result.is_none())
                 .ok_or(ReminderError::InvalidTransition)?;
-            attempt.finished_at_ms = Some(at);
+            attempt.finished_at_ms = if result == DeliveryResult::Unknown {
+                None
+            } else {
+                Some(at)
+            };
             attempt.result = Some(result.clone());
             match result {
+                DeliveryResult::Unknown => {
+                    entry.status = ReminderStatus::Unknown;
+                }
                 DeliveryResult::Sent { .. } => {
                     entry.status = ReminderStatus::Delivered;
                     entry.delivered_at_ms = Some(at);

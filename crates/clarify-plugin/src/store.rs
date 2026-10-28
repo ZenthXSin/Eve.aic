@@ -298,10 +298,6 @@ impl StoredClarify {
         result: DeliveryResult,
     ) -> ClarifyResult<Clarification> {
         validate_result(&result)?;
-        if result == DeliveryResult::Unknown {
-            // 结果未知只由重启核对写入。
-            return Err(ClarifyError::InvalidInput);
-        }
         self.update(id, at_ms, |_, entry| {
             if entry.status != ClarifyStatus::Delivering {
                 return Err(ClarifyError::InvalidTransition);
@@ -313,9 +309,16 @@ impl StoredClarify {
                 .last_mut()
                 .filter(|attempt| attempt.result.is_none())
                 .ok_or(ClarifyError::InvalidTransition)?;
-            attempt.finished_at_ms = Some(at);
+            attempt.finished_at_ms = if result == DeliveryResult::Unknown {
+                None
+            } else {
+                Some(at)
+            };
             attempt.result = Some(result.clone());
             match result {
+                DeliveryResult::Unknown => {
+                    entry.status = ClarifyStatus::Unknown;
+                }
                 DeliveryResult::Sent { .. } => {
                     entry.status = ClarifyStatus::Delivered;
                     entry.delivered_at_ms = Some(at);

@@ -1,6 +1,7 @@
 //! 群消息原话与主动发送账本；重启不重放、不补发，异常保留原记录。
 use eve_chime_api::{
-    ChimeReply, GroupExchange, GroupMessage, GroupObservationStore, GroupOutbound, ObservedMessage,
+    ChimeReply, GroupExchange, GroupMessage, GroupObservationStore, GroupObservationWindow,
+    GroupOutbound, ObservedMessage,
 };
 mod digests;
 pub use digests::SqliteGroupDigests;
@@ -239,6 +240,50 @@ impl GroupObservationStore for SqliteGroupObservations {
         self.run(|db|{
   let mut q=db.prepare("SELECT payload FROM observations WHERE conversation=?1 ORDER BY seq DESC LIMIT ?2").map_err(|_|BROKEN)?;
   let mut values:Vec<GroupMessage>=q.query_map(params![conversation,limit.min(100)],|r|r.get::<_,String>(0)).map_err(|_|BROKEN)?.map(|r|serde_json::from_str(&r.map_err(|_|BROKEN)?).map_err(|_|BROKEN.to_string())).collect::<Result<_,_>>()?;values.reverse();Ok(values)})
+    }
+    fn window_ending_at(
+        &self,
+        conversation: &str,
+        anchor_ids: &[String],
+        limit: usize,
+    ) -> Result<GroupObservationWindow, String> {
+        let invalid = || "群轮次锚点无效或缺失；未读取最新消息".to_owned();
+        let unique: std::collections::BTreeSet<_> = anchor_ids.iter().cloned().collect();
+        if anchor_ids.is_empty()
+            || anchor_ids.len() > 32
+            || unique.len() != anchor_ids.len()
+            || !(1..=100).contains(&limit)
+            || anchor_ids.len() > limit
+        {
+            return Err(invalid());
+        }
+        self.run(|db| {
+            let tx = db.transaction().map_err(|_| BROKEN)?;
+            let mut anchors = Vec::new();
+            for id in anchor_ids {
+                let row: Option<(i64,String)> = tx.query_row("SELECT seq,payload FROM observations WHERE conversation=?1 AND id=?2",params![conversation,id],|r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_| BROKEN)?;
+                let (seq,payload) = row.ok_or_else(invalid)?;
+                let message: GroupMessage = serde_json::from_str(&payload).map_err(|_| BROKEN)?;
+                if seq <= 0 || message.conversation != conversation || &message.id != id || !message.valid() { return Err(BROKEN.to_owned()); }
+                if message.from_me || anchors.last().is_some_and(|prior: &ObservedMessage| prior.seq >= seq as u64) { return Err(invalid()); }
+                anchors.push(ObservedMessage { seq: seq as u64, message });
+            }
+            let cutoff = anchors.last().ok_or_else(invalid)?.seq;
+            let mut result = anchors;
+            {
+                let mut query = tx.prepare("SELECT seq,payload FROM observations WHERE conversation=?1 AND seq<=?2 ORDER BY seq DESC LIMIT ?3").map_err(|_| BROKEN)?;
+                let rows = query.query_map(params![conversation,cutoff as i64,limit as i64],|r| Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).map_err(|_| BROKEN)?;
+                for row in rows {
+                    let (seq,payload) = row.map_err(|_| BROKEN)?;
+                    let message: GroupMessage = serde_json::from_str(&payload).map_err(|_| BROKEN)?;
+                    if seq <= 0 || message.conversation != conversation || !message.valid() { return Err(BROKEN.to_owned()); }
+                    if result.len() < limit && !unique.contains(&message.id) { result.push(ObservedMessage { seq: seq as u64, message }); }
+                }
+            }
+            result.sort_by_key(|row| row.seq);
+            tx.commit().map_err(|_| BROKEN)?;
+            Ok(GroupObservationWindow { cutoff_seq: cutoff, anchor_ids: anchor_ids.to_vec(), messages: result })
+        })
     }
     fn search(
         &self,
@@ -486,6 +531,20 @@ impl GroupObservationStore for SqliteGroupObservations {
                 return Err("群回复结局无效；原记录保留".into());
             }
             tx.commit().map_err(|_| BROKEN)?;
+            Ok(())
+        })
+    }
+    fn finish_unknown(&self, id: &str) -> Result<(), String> {
+        self.run(|db| {
+            let changed = db
+                .execute(
+                    "UPDATE outbound SET status='unknown' WHERE id=?1 AND status='sending'",
+                    [id],
+                )
+                .map_err(|_| BROKEN)?;
+            if changed != 1 {
+                return Err("群回复结局无效；原记录保留".into());
+            }
             Ok(())
         })
     }

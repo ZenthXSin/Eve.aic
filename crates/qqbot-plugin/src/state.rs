@@ -203,6 +203,8 @@ pub(crate) enum ReceiptState {
     ReplyPending,
     Sent,
     Failed,
+    /// 平台接受状态或消息编号未知；不自动重发。
+    Unknown,
     /// 连发的消息并入同一会话稍后的一条，由那一条统一回复；本条不单独回复。
     Merged,
 }
@@ -213,6 +215,7 @@ pub(crate) enum PartState {
     Sending,
     Sent,
     Failed,
+    Unknown,
     Skipped,
 }
 /// 片段是完整回复中的字节范围，不复制正文；完整回复仍是唯一的回复事实。
@@ -260,6 +263,9 @@ impl Segments {
                 !rest.is_empty() && tail(PartState::Sending, PartState::Pending)
             }
             ReceiptState::Failed => !rest.is_empty() && tail(PartState::Failed, PartState::Skipped),
+            ReceiptState::Unknown => {
+                !rest.is_empty() && tail(PartState::Unknown, PartState::Skipped)
+            }
             ReceiptState::Merged => false,
         }
     }
@@ -296,6 +302,9 @@ pub(crate) struct Progress {
     pub state: PartState,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub proactive: bool,
+    /// 必要授权或问题独立于普通进度节奏，但仍占实际平台消息额度。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub necessary: bool,
 }
 pub(crate) fn passive_progress(entry: &Receipt) -> usize {
     entry.progress.iter().filter(|p| !p.proactive).count()
@@ -357,7 +366,7 @@ impl Ledger {
                     .reply
                     .as_ref()
                     .is_some_and(|r| r.trim().is_empty() || r.len() > 32768)
-                || (matches!(entry.state, ReceiptState::ReplyPending | ReceiptState::Sent)
+                || (matches!(entry.state, ReceiptState::ReplyPending | ReceiptState::Sent | ReceiptState::Unknown)
                     && entry.reply.is_none())
                 || entry.segments.as_ref().is_some_and(|segments| {
                     !valid_segments(segments, entry.reply.as_deref(), entry.state)
@@ -369,7 +378,7 @@ impl Ledger {
                         || p.text.len() > 1024
                         || !matches!(
                             p.state,
-                            PartState::Sending | PartState::Sent | PartState::Failed
+                            PartState::Sending | PartState::Sent | PartState::Failed | PartState::Unknown
                         )
                 })
                 || passive_progress(entry)
@@ -380,7 +389,7 @@ impl Ledger {
                     sticker.path.is_empty()
                         || sticker.path.len() > 4096
                         || sticker.path.chars().any(char::is_control)
-                        || !matches!(entry.state, ReceiptState::ReplyPending | ReceiptState::Sent | ReceiptState::Failed)
+                        || !matches!(entry.state, ReceiptState::ReplyPending | ReceiptState::Sent | ReceiptState::Failed | ReceiptState::Unknown)
                         // 正文没有发完时表情包只能还在等待；正文失败时表情包从未写出。
                         || (entry.state == ReceiptState::ReplyPending && sticker.state != PartState::Pending)
                         || (entry.state == ReceiptState::Failed
@@ -908,12 +917,13 @@ mod tests {
     fn every_state_the_channel_can_save_reloads() {
         assert_eq!(&REPLY[0..12], "第一段。");
         assert_eq!(&REPLY[28..40], "第三段。");
-        let reachable: [(ReceiptState, &[PartState]); 9] = [
+        let reachable: [(ReceiptState, &[PartState]); 10] = [
             // 首段写出前、段间停顿、末段在途。
             (ReceiptState::ReplyPending, &[Sending, Pending, Pending]),
             (ReceiptState::ReplyPending, &[Sent, Pending, Pending]),
             (ReceiptState::ReplyPending, &[Sent, Sent, Sending]),
             (ReceiptState::Sent, &[Sent, Sent, Sent]),
+            (ReceiptState::Unknown, &[Sent, Unknown, Skipped]),
             // 片段失败、首段写出前旧代失效、段间旧代失效。
             (ReceiptState::Failed, &[Sent, Failed, Skipped]),
             (ReceiptState::Failed, &[Failed, Skipped, Skipped]),
@@ -932,9 +942,10 @@ mod tests {
 
     #[test]
     fn progress_round_trips_without_becoming_a_success_and_preserves_unknown_delivery() {
-        for state in [Sending, Sent, Failed] {
+        for state in [Sending, Sent, Failed, Unknown] {
             let mut entry = receipt(ReceiptState::Processing, None);
             entry.progress.push(Progress {
+                necessary: false,
                 text: "资料检索已返回结果。".into(),
                 state,
                 proactive: false,
@@ -948,6 +959,7 @@ mod tests {
         let mut entry = receipt(ReceiptState::Sent, Some(&[Sent, Sent, Sent]));
         for _ in 0..3 {
             entry.progress.push(Progress {
+                necessary: false,
                 text: "回执".into(),
                 state: Sent,
                 proactive: false,
@@ -957,10 +969,29 @@ mod tests {
     }
 
     #[test]
+    fn necessary_questions_keep_their_own_persisted_kind() {
+        let mut entry = receipt(ReceiptState::Processing, None);
+        entry.progress.push(Progress {
+            text: "需要保留哪个目录？".into(),
+            state: Sent,
+            proactive: false,
+            necessary: true,
+        });
+        let ledger = round_trip(entry).unwrap();
+        assert!(ledger.entries[0].progress[0].necessary);
+        assert_eq!(
+            passive_progress(&ledger.entries[0]),
+            1,
+            "问题仍占实际平台额度"
+        );
+    }
+
+    #[test]
     fn proactive_progress_uses_v8_and_keeps_passive_quota_and_unknown_delivery() {
         let mut entry = receipt(ReceiptState::Sent, Some(&[Sent, Sent, Sent]));
         for i in 0..6 {
             entry.progress.push(Progress {
+                necessary: false,
                 text: "真实阶段".into(),
                 state: if i == 5 { Sending } else { Sent },
                 proactive: i >= 2,

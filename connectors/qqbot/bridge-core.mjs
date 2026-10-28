@@ -208,7 +208,11 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       throw new Error("outbound_limit");
     }
     activeSends++;
-    try { return await bot.sendText(target, text); }
+    try {
+      const result = await bot.sendText(target, text);
+      if (!validMessageId(result?.id)) throw new Error("platform_message_id_unknown");
+      return result;
+    }
     finally { activeSends--; }
   }
   // 文件走同一条并发上限；路径已由 Rust 侧解析并校验，这里只做形状检查。
@@ -219,8 +223,10 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     }
     activeSends++;
     try {
-      return await bot.sendFile(target, { localPath },
+      const result = await bot.sendFile(target, { localPath },
         { ...(name ? { fileName: name } : {}), ...(caption ? { content: caption } : {}) });
+      if (!validMessageId(result?.message?.id)) throw new Error("platform_message_id_unknown");
+      return result;
     } finally { activeSends--; }
   }
   // 表情包作为原消息的被动回复图片发出，同样计入并发上限。
@@ -230,7 +236,11 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       throw new Error("outbound_limit");
     }
     activeSends++;
-    try { return await bot.sendImage(target, { localPath }, { content: mentionedText(target, "", mention) }); }
+    try {
+      const result = await bot.sendImage(target, { localPath }, { content: mentionedText(target, "", mention) });
+      if (!validMessageId(result?.message?.id)) throw new Error("platform_message_id_unknown");
+      return result;
+    }
     finally { activeSends--; }
   }
   const stop = () => {
@@ -322,7 +332,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         try {
           const attempt = sendText({ scope: item.target.scope, targetId: item.target.targetId },
             "本轮回复已保存，但 QQ 正文投递失败。发送 /last-reply 取回，不会重新执行任务。", replyMention(item))
-            .then(() => ({ state: "sent" }), error => ({ state: "failed", error }));
+            .then(() => ({ state: "sent" }), error => ({ state: diagnostic(error).http_status ? "failed" : "unknown", error }));
           const result = await Promise.race([attempt, new Promise(resolve => {
             timer = setTimeout(() => resolve({ state: "unknown" }), 3000);
           })]);
@@ -376,7 +386,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         return;
       }
       const result = await sendImage(item.target, path, replyMention(item));
-      const id = result?.message?.id ?? result?.upload?.id;
+      const id = result?.message?.id;
       send({ type: "delivery", id: frame.id, sticker: true, ok: true,
         ...(validMessageId(id) ? { message_id: id } : {}) });
     } catch (err) {
@@ -452,7 +462,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       const target = { scope: frame.scope, targetId: frame.target_id };
       const content = mentionedText(target, caption, frame.mention_user_id);
       const result = await sendFile(target, path, name, content);
-      const id = result?.message?.id ?? result?.upload?.id;
+      const id = result?.message?.id;
       send({ type: "delivery", id: frame.id, push: true, file: true, ok: true,
         ...(validMessageId(id) ? { message_id: id } : {}) });
     } catch (err) {

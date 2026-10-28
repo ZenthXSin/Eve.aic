@@ -72,6 +72,15 @@ impl TaskAdmin for TaskController {
     fn retry(&self, id: &str, now_ms: u64) -> TaskResult<Task> {
         self.service()?.retry(id, now_ms)
     }
+    fn resume_blocked(
+        &self,
+        owner: &TaskOwner,
+        id: &str,
+        evidence: &str,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        self.service()?.resume_blocked(owner, id, evidence, now_ms)
+    }
     fn finish(&self, id: &str, end: TaskEnd, usage: TaskUsage, now_ms: u64) -> TaskResult<Task> {
         self.service()?.finish(id, end, usage, now_ms)
     }

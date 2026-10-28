@@ -247,6 +247,7 @@ impl QqOutreach for Monitor {
     fn delivered(&self, id: &str, result: QqOutreachResult) -> PluginResult<()> {
         let outcome = match result {
             QqOutreachResult::Sent { .. } => Delivery::Sent,
+            QqOutreachResult::Unknown => Delivery::Unknown,
             _ => Delivery::Failed,
         };
         self.store.delivered(id, outcome).map_err(error)

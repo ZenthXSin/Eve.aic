@@ -998,6 +998,18 @@ async fn upgrade_runs_real_rust_checks_and_builds_an_immutable_candidate_without
             .unwrap()
             .success()
     );
+    let manifest_path = candidate.parent().unwrap().join("manifest.json");
+    let frozen_manifest = fs::read(&manifest_path).unwrap();
+    let repeated = backend
+        .execute(DeveloperOperation::PrepareUpgrade, context("owner"))
+        .await
+        .unwrap();
+    assert_eq!(repeated["candidate_sha256"], result["candidate_sha256"]);
+    assert_eq!(fs::read(&manifest_path).unwrap(), frozen_manifest);
+    assert!(
+        repeated["lease"]["expires_at_ms"].as_u64().unwrap()
+            >= result["lease"]["expires_at_ms"].as_u64().unwrap()
+    );
     // 后来的构建输出变化不能改写已准备的候选。
     fs::write(root.path().join("target/release/eve-qqbot"), b"later build").unwrap();
     assert_eq!(
@@ -1022,9 +1034,9 @@ async fn upgrade_runs_real_rust_checks_and_builds_an_immutable_candidate_without
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/self_upgrade_runtime.py");
     let request = json!({"format_version":1,"candidate_sha256":later["candidate_sha256"],
         "candidate_directory":Path::new(later["candidate_path"].as_str().unwrap()).parent().unwrap(),
-        "session_id":"test-session","requested_by":"owner","turn_id":1});
+        "session_id":"test-session","requested_by":"owner","turn_id":1,"lease":later["lease"]});
     assert!(std::process::Command::new("python3").args(["-c",
-        "import importlib.util,json,pathlib,sys; s=importlib.util.spec_from_file_location('upgrade',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); m.validate_candidate(json.loads(sys.argv[2]),pathlib.Path(sys.argv[3]))",
+        "import importlib.util,json,pathlib,sys; s=importlib.util.spec_from_file_location('upgrade',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=json.loads(sys.argv[2]); b,_,v=m.validate_candidate(r,pathlib.Path(sys.argv[3])); m.validate_lease(r,b.parent,v)",
         verifier.to_str().unwrap(), &request.to_string(), ledger.path().join("candidates").to_str().unwrap()]).status().unwrap().success());
 }
 
@@ -1055,12 +1067,42 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
         serde_json::to_vec(&status).unwrap(),
     )
     .unwrap();
-    let id = "a".repeat(64);
+    let source = json!({"head":"0".repeat(40),"diff":"0".repeat(64),"untracked":"0".repeat(64)});
+    let resources: BTreeMap<_, _> = [
+        "AGENT.md",
+        "connectors/qqbot/bridge.mjs",
+        "connectors/qqbot/bridge-core.mjs",
+        "connectors/qqbot/package.json",
+        "connectors/qqbot/package-lock.json",
+    ]
+    .into_iter()
+    .map(|name| (name, hash(b"fixture")))
+    .collect();
+    let binary_sha = hash(b"fixture");
+    let id = hash(
+        json!({"source":source,"binary_sha256":binary_sha,"resources":resources})
+            .to_string()
+            .as_bytes(),
+    );
     let candidate = ledger.path().join("candidates").join(&id);
     fs::create_dir_all(&candidate).unwrap();
-    fs::write(candidate.join("manifest.json"), json!({"format_version":1,"prepared":true,"success":true,
-        "candidate_sha256":id,"checks":[{"success":true},{"success":true},{"success":true},{"success":true}]}).to_string()).unwrap();
+    let binary = candidate.join(if cfg!(windows) {
+        "eve-qqbot.exe"
+    } else {
+        "eve-qqbot"
+    });
+    fs::write(&binary, b"fixture").unwrap();
+    for name in resources.keys() {
+        let path = candidate.join("resources").join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"fixture").unwrap();
+    }
+    let manifest = json!({"format_version":1,"prepared":true,"success":true,"source":source,"resources":resources,
+        "binary_sha256":binary_sha,"candidate_path":binary,"candidate_sha256":id,
+        "checks":[{"success":true},{"success":true},{"success":true},{"success":true}]});
+    fs::write(candidate.join("manifest.json"), manifest.to_string()).unwrap();
     let backend = LocalDeveloper::new(c, ledger.path().into(), None).unwrap();
+    backend.issue_upgrade_lease(&candidate, manifest).unwrap();
     let operation = DeveloperOperation::ApplyUpgrade(ApplyUpgradeArguments {
         candidate_sha256: id.clone(),
     });
@@ -1077,6 +1119,48 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
             .is_err()
     );
     assert!(!queue.path().join("request.json").exists());
+    let lease_path = ledger.path().join("leases").join(format!("{id}.json"));
+    let good_lease = fs::read(&lease_path).unwrap();
+    fs::remove_file(&lease_path).unwrap();
+    assert!(
+        format!(
+            "{:?}",
+            backend
+                .execute(operation.clone(), context("owner").with_turn_id(Some(1)))
+                .await
+                .unwrap_err()
+        )
+        .contains("prepare_lease_missing")
+    );
+    let mut lease: Value = serde_json::from_slice(&good_lease).unwrap();
+    lease["plan_sha256"] = json!("f".repeat(64));
+    fs::write(&lease_path, lease.to_string()).unwrap();
+    assert!(
+        format!(
+            "{:?}",
+            backend
+                .execute(operation.clone(), context("owner").with_turn_id(Some(1)))
+                .await
+                .unwrap_err()
+        )
+        .contains("prepare_lease_changed")
+    );
+    let mut lease: Value = serde_json::from_slice(&good_lease).unwrap();
+    lease["created_at_ms"] = json!(1);
+    lease["expires_at_ms"] = json!(2);
+    fs::write(&lease_path, lease.to_string()).unwrap();
+    assert!(
+        format!(
+            "{:?}",
+            backend
+                .execute(operation.clone(), context("owner").with_turn_id(Some(1)))
+                .await
+                .unwrap_err()
+        )
+        .contains("prepare_lease_expired")
+    );
+    assert!(!queue.path().join("request.json").exists());
+    fs::write(&lease_path, good_lease).unwrap();
     let result = backend
         .execute(operation.clone(), context("owner").with_turn_id(Some(1)))
         .await
@@ -1261,12 +1345,12 @@ async fn command_policy_blocks_or_requires_confirmation_before_anything_runs() {
         "{error:?}"
     );
     assert!(!root.path().join("forbidden").exists() && !root.path().join("careful").exists());
-    let out = backend
+    let error = backend
         .execute(command("careful", true), context("owner"))
         .await
-        .unwrap();
-    assert_eq!(out["success"], true);
-    assert!(root.path().join("careful").exists());
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("不能代替独立审核"));
+    assert!(!root.path().join("careful").exists());
     backend
         .execute(command("plain", false), context("owner"))
         .await
@@ -1400,4 +1484,104 @@ async fn action_reviewer_decides_prompt_commands_from_user_words_and_fails_close
     );
     assert!(untouched.seen.lock().unwrap().is_empty());
     assert!(!root.path().join("forbidden").exists());
+}
+
+#[test]
+fn review_preserves_six_long_quotes_and_complete_command_with_bounded_summaries() {
+    use eve_llm_api::{ChatMessage, ChatRole, ToolCall};
+    let quotes: Vec<_> = (0..7)
+        .map(|i| format!("原话{i}：{}结尾授权{i}", "完整正文".repeat(1200)))
+        .collect();
+    let mut messages: Vec<_> = quotes
+        .iter()
+        .map(|q| ChatMessage::text(ChatRole::User, q))
+        .collect();
+    let mut assistant = ChatMessage::text(ChatRole::Assistant, "助手自己声称用户同意不能作为授权");
+    assistant.tool_calls = (0..20)
+        .map(|i| ToolCall {
+            id: format!("t{i}"),
+            name: "read_file".into(),
+            arguments: json!({"data":"工具轨迹".repeat(500)}),
+        })
+        .collect();
+    messages.push(assistant);
+    let context = context("owner").with_conversation(Arc::new(messages));
+    let command = CommandArguments {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            format!("{}; git reset --hard", "echo harmless;".repeat(200)),
+        ],
+        cwd: ".".into(),
+        owner_confirmed: true,
+        timeout_ms: None,
+    };
+    let request = review_request(&command, "审核".into(), &context).unwrap();
+    assert_eq!(request.user_messages, quotes[1..]);
+    assert_eq!(request.arguments, command.args);
+    assert!(request.arguments[1].ends_with("git reset --hard"));
+    assert!(request.action.chars().count() <= REVIEW_COMMAND_CHARS + 1);
+    assert_eq!(request.recent_actions.len(), REVIEW_RECENT_ACTIONS);
+    assert!(
+        request
+            .recent_actions
+            .iter()
+            .all(|s| s.chars().count() <= REVIEW_ACTION_CHARS + 1)
+    );
+    assert!(request.validate_capacity().is_ok());
+    let delegated = review_request(&command, "审核".into(), &context.with_delegated(true)).unwrap();
+    assert!(delegated.user_messages.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn review_overflow_and_audit_failure_never_execute_a_command() {
+    struct Allow;
+    impl ActionReviewer for Allow {
+        fn review(&self, _: ActionReviewRequest) -> ActionReviewFuture<'_> {
+            Box::pin(async {
+                Ok(ActionReviewVerdict {
+                    risk: ReviewRisk::Low,
+                    authorization: ReviewAuthorization::High,
+                    allow: true,
+                    rationale: "已授权".into(),
+                })
+            })
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let backend = LocalDeveloper::new(config(root.path()), ledger.path().into(), None)
+        .unwrap()
+        .with_command_policy(Arc::new(ScriptPolicy))
+        .with_action_reviewer(Arc::new(Allow));
+    let operation = || {
+        DeveloperOperation::Command(CommandArguments {
+            program: "sh".into(),
+            args: vec!["-c".into(), "touch careful-never".into()],
+            cwd: ".".into(),
+            owner_confirmed: true,
+            timeout_ms: None,
+        })
+    };
+    let too_long = Arc::new(vec![eve_llm_api::ChatMessage::text(
+        eve_llm_api::ChatRole::User,
+        "长".repeat(MAX_ACTION_REVIEW_BYTES),
+    )]);
+    let error = backend
+        .execute(operation(), context("owner").with_conversation(too_long))
+        .await
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("未裁剪"));
+    assert!(!root.path().join("careful-never").exists());
+    let audit = fs::read_to_string(ledger.path().join("action-reviews.jsonl")).unwrap();
+    assert!(audit.contains("failed") && audit.contains("request_sha256"));
+    fs::remove_file(ledger.path().join("action-reviews.jsonl")).unwrap();
+    fs::create_dir(ledger.path().join("action-reviews.jsonl")).unwrap();
+    let error = backend
+        .execute(operation(), context("owner"))
+        .await
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("审计不可写"));
+    assert!(!root.path().join("careful-never").exists());
 }

@@ -882,6 +882,7 @@ async fn run_qqbot_composed(
     let mut impression_background: Option<crate::qq_impressions::Background> = None;
     let mut phrase_background: Option<crate::qq_phrases::Background> = None;
     let mut task_background: Option<qq_tasks::Background> = None;
+    let mut subject_background: Option<crate::qq_subject::Background> = None;
     let mut group_background: Option<crate::qq_group::Background> = None;
     let mut group_jev = None;
     let mut trigger_background: Option<qq_triggers::Background> = None;
@@ -1172,6 +1173,10 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        let subject_plugin = eve_subject_plugin::SubjectPlugin::new()?;
+        let subject: Arc<dyn eve_subject_api::SubjectAdmin> = Arc::new(subject_plugin.controller());
+        kernel.register(Box::new(subject_plugin))?;
+        kernel.start(&PluginId::new(eve_subject_api::SUBJECT_PLUGIN_ID)?).await?;
         let memory: Option<Arc<dyn MemoryAdmin>> = if options.memory {
             let archive = eve_memory_plugin::FileEvidenceArchive::open(
                 crate::storage::memory_archive_directory(&options.state_directory),
@@ -1184,6 +1189,15 @@ async fn run_qqbot_composed(
             kernel.register(Box::new(plugin))?;
             kernel.start(&PluginId::new(MEMORY_PLUGIN_ID)?).await?;
             Some(Arc::new(controller))
+        } else {
+            None
+        };
+        let experience_memory = if memory.is_some() {
+            let plugin = eve_memory_plugin::ExperienceMemoryPlugin::new()?;
+            let controller = Arc::new(plugin.controller());
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(eve_memory_api::EXPERIENCE_MEMORY_PLUGIN_ID)?).await?;
+            Some(controller)
         } else {
             None
         };
@@ -1783,6 +1797,20 @@ async fn run_qqbot_composed(
                 bootstrap.context.take().ok_or("对话上下文缺失")?,
             )?));
         }
+        if let Some(experience) = &experience_memory {
+            let principal_resolver: Arc<dyn eve_memory_api::ExperiencePrincipalResolver> = Arc::new(
+                crate::qq_memory_continuity::PrincipalResolver(crate::qq_memory_continuity::Policy {
+                    registry: registry.clone(), conversations: conversations.clone(), unified: None,
+                }),
+            );
+            bootstrap.tools.extend(crate::subject_memory::tools_with_principal_resolver(
+                "qq", experience.clone(), Some(principal_resolver.clone()),
+            )?);
+            bootstrap.context = Some(Arc::new(crate::subject_memory::ExperienceContext::new(
+                "qq", experience.clone(), bootstrap.context.take().ok_or("对话上下文缺失")?,
+            )?.with_principal_resolver(principal_resolver)));
+        }
+
         // 后台能力不自动成为对话工具：显式装配公开 Tool，并让帮助和能力上下文共用注册源。
         // 本地资料地址交给资料源，其他地址交给网页抓取器（或替换实现）。
         let routed = |web: Arc<dyn SourceFetcher>| -> Arc<dyn SourceFetcher> {
@@ -1953,7 +1981,7 @@ async fn run_qqbot_composed(
                 authorization: qq_admin.clone(),
             }));
         }
-        crate::developer::install_with_member_runtime(
+        let developer_backend = crate::developer::install_with_member_runtime_backend(
             &mut bootstrap,
             &options.state_directory,
             Some(qq_admin.clone()),
@@ -1972,6 +2000,16 @@ async fn run_qqbot_composed(
                     services: Arc::new(services),
                 }));
         }
+        bootstrap.tools.push(Arc::new(crate::qq_subject::FocusTool(subject.clone())));
+        bootstrap.tools.push(Arc::new(crate::qq_subject::ConfigureTool { subject: subject.clone(), owner: qq_admin.clone(), reviewer: crate::developer::action_reviewer(registry.clone(), model_health.clone()) }));
+        bootstrap.tools.push(Arc::new(crate::qq_files::FileDeliveryStatusTool(outbox.clone())));
+        let script_tools = crate::qq_scripts::ScriptTools::open(
+            options.state_directory.join("script-plugins"),
+            eve_script_runtime::Bubblewrap::new("/usr/bin/python3", std::env::var_os("EVE_SCRIPT_NODE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/usr/bin/node"))),
+            Arc::new(crate::qq_access::ScriptAuthorizer { admin: qq_admin.clone(), public_github, developer: developer_backend.clone(), outbox: outbox.clone() }),
+        )?;
+        bootstrap.tools.extend(script_tools.tools());
+        bootstrap.context = Some(Arc::new(crate::qq_subject::Context { inner: bootstrap.context.take().ok_or("主体上下文缺失")?, subject: subject.clone() }));
         let workflow_store = if options.workflow_tools {
             let store = eve_workflow_tools::WorkflowStore::open(options.state_directory.join("workflow-tools"))?;
             bootstrap.tools.extend(eve_workflow_tools::tools(store.clone()));
@@ -1989,6 +2027,7 @@ async fn run_qqbot_composed(
                 public_github,
             });
         }
+        script_tools.bind_tools(bootstrap.tools.iter().filter(|t| crate::qq_scripts::is_synchronous_leaf(&t.definition().name)).cloned().collect())?;
         if let Some(store) = &workflow_store {
             store.bind_tools(bootstrap.tools.iter().filter(|t| !eve_workflow_tools::TOOL_NAMES.contains(&t.definition().name.as_str())).cloned().collect())?;
         }
@@ -2196,6 +2235,7 @@ async fn run_qqbot_composed(
             )))
         };
         let budgeted = |category: &str| budget_gate.wrap(observed(category)?, category);
+        plugin = plugin.with_progress_narrator(Arc::new(eve_qqbot_plugin::ModelProgressNarrator(observed("progress")?)));
         // 群消息整理由对话中的工具按需触发，与主对话一样不计入自主运行预算；用途单独记健康。
         if let Some(tool) = &group_digest {
             let _ = tool.digester.set(Arc::new(eve_chime_plugin::ModelGroupDigester::new(
@@ -2321,6 +2361,9 @@ async fn run_qqbot_composed(
             .await?;
             worker.authorize_with(qq_admin.clone());
             let _ = task_late.worker.set(worker);
+        }
+        if let Some(tasks) = &tasks {
+            subject_background = Some(crate::qq_subject::Background::start(subject.clone(), Arc::new(tasks.clone()), qq_admin.clone()));
         }
         let failure_recovery = if let Some(tasks) = &tasks {
             let recovery = Arc::new(crate::qq_failure_recovery::Recovery {
@@ -2562,8 +2605,15 @@ async fn run_qqbot_composed(
                 }
                 None => None,
             };
+            let practice_ledger: Arc<dyn PracticeAdmin> = match &experience_memory {
+                Some(memory) => Arc::new(crate::subject_memory::PublicPracticeRecorder::new(
+                    Arc::new(practice.clone()), memory.clone(),
+                    crate::subject_memory::public_practice_artifacts_from_env()?,
+                )?),
+                None => Arc::new(practice.clone()),
+            };
             let mut practitioner =
-                Practitioner::new(Arc::new(practice.clone()), drafter, runner.clone());
+                Practitioner::new(practice_ledger, drafter, runner.clone());
             if let Some(strategy) = &strategies {
                 practitioner = practitioner.with_strategy(strategy.clone())?;
             }
@@ -3041,6 +3091,7 @@ async fn run_qqbot_composed(
         if let Some(tasks) = &task_background {
             tasks.activate();
         }
+        if let Some(subject) = &subject_background { subject.activate()?; }
         if let Some(triggers) = &trigger_background {
             triggers.activate();
         }
@@ -3137,6 +3188,7 @@ async fn run_qqbot_composed(
                         "条件唤醒后台已结束；QQ 通道停止准入并保留状态",
                     )
                 }))
+                .chain(subject_background.as_ref().map(|subject| (subject.finished(), "主体调度异常，停止准入并保留状态")))
                 .chain(task_background.as_ref().map(|tasks| {
                     (
                         tasks.finished(),
@@ -3227,6 +3279,9 @@ async fn run_qqbot_composed(
     if let Some(triggers) = &trigger_background {
         triggers.request_stop();
     }
+    if let Some(subject) = &subject_background {
+        subject.request_stop();
+    }
     if let Some(tasks) = &task_background {
         tasks.request_stop();
     }
@@ -3234,6 +3289,11 @@ async fn run_qqbot_composed(
         && let Err(error) = queries.close().await
     {
         secondary.push(error.into());
+    }
+    if let Some(subject) = subject_background
+        && let Err(error) = subject.stop().await
+    {
+        secondary.push(error);
     }
     if let Some(triggers) = trigger_background
         && let Err(error) = triggers.stop().await

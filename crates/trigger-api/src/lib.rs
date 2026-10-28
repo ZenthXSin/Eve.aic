@@ -41,6 +41,13 @@ pub enum MatchMode {
     All,
     Any,
 }
+/// 有限周期，不补跑错过的周期；仅允许单一时间条件。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Recurrence {
+    pub interval_ms: u64,
+    pub max_runs: u32,
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TriggerSpec {
@@ -49,6 +56,11 @@ pub struct TriggerSpec {
     pub mode: MatchMode,
     pub conditions: Vec<Condition>,
     pub expires_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurrence: Option<Recurrence>,
+    /// 有条件地接续本会话既有阻塞任务，绝不新建或重放未知调用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_task_id: Option<String>,
 }
 impl TriggerSpec {
     pub fn valid(&self) -> bool {
@@ -56,6 +68,13 @@ impl TriggerSpec {
         text(&self.title, 160)
             && text(&self.instructions, MAX_INSTRUCTIONS)
             && self.expires_at_ms > 0
+            && self.resume_task_id.as_ref().is_none_or(|id| text(id, 256))
+            && self.recurrence.as_ref().is_none_or(|r| {
+                (60_000..=90 * 86_400_000).contains(&r.interval_ms)
+                    && (2..=128).contains(&r.max_runs)
+                    && matches!(self.conditions.as_slice(), [Condition::Time { .. }])
+                    && self.resume_task_id.is_none()
+            })
             && !self.conditions.is_empty()
             && self.conditions.len() <= MAX_CONDITIONS
             && self.conditions.iter().all(|c| match c {
@@ -100,6 +119,9 @@ pub struct Trigger {
     pub evidence: Vec<String>,
     pub result: Option<String>,
     pub delivery: Option<Delivery>,
+    /// 已准入次数；旧记录按零读取，下一次准入时递增。
+    #[serde(default)]
+    pub runs: u32,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TriggerError {
@@ -129,7 +151,15 @@ pub trait TriggerAdmin: Send + Sync {
     ) -> Result<Trigger>;
     fn ready(&self, id: &str, evidence: Vec<String>) -> Result<()>;
     fn transition(&self, id: &str, from: Status, to: Status, result: Option<String>) -> Result<()>;
+    /// 仅上轮明确完成且投递已了结时推进，不补跑、不开启未知结果。
+    fn rearm(&self, _id: &str, _now: u64) -> Result<()> {
+        Err(TriggerError::Transition)
+    }
     fn cancel(&self, owner: &SessionKey, id: &str) -> Result<()>;
     /// Pending → Failed 表示发送前被策略拒绝；不会伪造 Sending 或覆盖 Unknown。
     fn delivery(&self, id: &str, from: Delivery, to: Delivery) -> Result<()>;
+    /// 周期回执须同时 CAS 周期代号，防止迟到的上一周期回执覆盖新周期。
+    fn delivery_for_run(&self, _id: &str, _run: u32, _from: Delivery, _to: Delivery) -> Result<()> {
+        Err(TriggerError::Transition)
+    }
 }

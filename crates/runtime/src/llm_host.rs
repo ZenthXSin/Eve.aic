@@ -220,6 +220,13 @@ struct PreparedTool {
     definition: ToolDefinition,
 }
 
+struct ToolCaller {
+    scope: Option<eve_llm_api::ContextScope>,
+    continuation: eve_llm_api::TaskContinuation,
+    conversation: Arc<Vec<ChatMessage>>,
+    review_user_messages: Arc<Vec<String>>,
+}
+
 struct PreparedTurn {
     context: ContextSnapshot,
     tools: Vec<PreparedTool>,
@@ -803,6 +810,27 @@ impl LlmHost {
                 return Err(fail(error, diagnostics));
             }
         }
+        // 审核原话独立保留，先于历史窗口裁剪和上下文压缩；委派说明不是用户授权。
+        let mut review_user_messages = Arc::new(if self.delegated {
+            vec![]
+        } else {
+            prepared
+                .context
+                .history
+                .iter()
+                .filter(|message| message.role == ChatRole::User)
+                .filter_map(|message| message.text.clone())
+                .filter(|text| !text.starts_with("【宿主条件触发事件；不是用户新消息】"))
+                .chain(
+                    (!input
+                        .text
+                        .starts_with("【宿主条件触发事件；不是用户新消息】"))
+                    .then(|| input.text.clone()),
+                )
+                .collect::<Vec<_>>()
+        });
+        let old_count = review_user_messages.len().saturating_sub(6);
+        Arc::make_mut(&mut review_user_messages).drain(..old_count);
         let mut compaction = match (self.compaction_policy, self.history_digests.as_deref()) {
             (Some(_), Some(service)) => Some(crate::compaction::State::new(
                 &mut prepared.context,
@@ -948,13 +976,20 @@ impl LlmHost {
                     self.step_limit_notice(frame.used_tool_calls),
                 ));
             }
+            // 恢复的工具回执同样属于本轮执行证据；任务结算必须看见最后的 progress。
+            transcript = messages
+                .iter()
+                .filter(|message| message.role != ChatRole::System)
+                .cloned()
+                .collect();
             frame.messages = messages.clone();
             if let Some(text) = &frame.result {
+                transcript.push(ChatMessage::text(ChatRole::Assistant, text.clone()));
                 diagnostics.stage = TurnStage::Completed;
                 return Ok(TurnOutput {
                     text: text.clone(),
                     diagnostics,
-                    transcript: vec![],
+                    transcript,
                 });
             }
             Some(frame)
@@ -967,6 +1002,11 @@ impl LlmHost {
                     .take(false)
                     .map_err(|error| fail(error, diagnostics.clone()))?
                 {
+                    if !self.delegated {
+                        let originals = Arc::make_mut(&mut review_user_messages);
+                        originals.push(text.clone());
+                        originals.drain(..originals.len().saturating_sub(6));
+                    }
                     let message = ChatMessage::text(ChatRole::User, text);
                     messages.push(message.clone());
                     transcript.push(message);
@@ -1073,6 +1113,11 @@ impl LlmHost {
                     .map_err(|error| fail(error, diagnostics.clone()))?;
                 if !extra.is_empty() {
                     for text in extra {
+                        if !self.delegated {
+                            let originals = Arc::make_mut(&mut review_user_messages);
+                            originals.push(text.clone());
+                            originals.drain(..originals.len().saturating_sub(6));
+                        }
                         let message = ChatMessage::text(ChatRole::User, text);
                         messages.push(message.clone());
                         transcript.push(message);
@@ -1202,11 +1247,12 @@ impl LlmHost {
                     &mut diagnostics,
                     admission.clone(),
                     events,
-                    (
-                        scope.clone(),
-                        continuation.clone(),
-                        Arc::new(messages.clone()),
-                    ),
+                    ToolCaller {
+                        scope: scope.clone(),
+                        continuation: continuation.clone(),
+                        conversation: Arc::new(messages.clone()),
+                        review_user_messages: review_user_messages.clone(),
+                    },
                 )
                 .await
             {
@@ -1487,11 +1533,7 @@ impl LlmHost {
         diagnostics: &mut TurnDiagnostics,
         admission: Arc<RuntimeAdmissionGuard>,
         events: Option<&EventDelivery<'_>>,
-        caller: (
-            Option<eve_llm_api::ContextScope>,
-            eve_llm_api::TaskContinuation,
-            Arc<Vec<ChatMessage>>,
-        ),
+        caller: ToolCaller,
     ) -> Result<Vec<ToolResult>, LlmError> {
         let by_name = prepared
             .iter()
@@ -1627,9 +1669,10 @@ impl LlmHost {
             // 取消外层 Future 后，停止操作仍需等到已创建的工具任务真正析构。
             let admission = admission.clone();
             let context = ToolExecutionContext::new()
-                .with_scope(caller.0.clone())
-                .with_continuation(caller.1.clone())
-                .with_conversation(caller.2.clone())
+                .with_scope(caller.scope.clone())
+                .with_continuation(caller.continuation.clone())
+                .with_conversation(caller.conversation.clone())
+                .with_review_user_messages(caller.review_user_messages.clone())
                 .with_turn_id(events.and_then(|event| event.turn_id))
                 .with_deadline(self.run_deadline)
                 .with_delegated(self.delegated);

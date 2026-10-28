@@ -1,5 +1,5 @@
 //! 开发能力公开契约。宿主授权、路径及凭据引用不能由模型参数覆盖。
-use eve_llm_api::{ToolExecutionContext, ToolFuture};
+use eve_llm_api::{ToolExecutionContext, ToolExecutionError, ToolFuture};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -143,8 +143,13 @@ pub enum ReviewAuthorization {
 /// 交给审查者的一次行动。只有 `user_messages` 是可信的用户原话；其余都是待核对的数据。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ActionReviewRequest {
-    /// 将要执行的命令（程序与参数）。
+    /// 有界命令摘要；不得据此替代下面完整的程序与参数。
     pub action: String,
+    pub program: String,
+    pub arguments: Vec<String>,
+    /// 宿主绑定的工作区与隔离模式，用于判断实际影响范围。
+    pub workspace: String,
+    pub isolated: bool,
     pub cwd: String,
     /// 命令策略要求确认的理由。
     pub policy_reason: String,
@@ -156,6 +161,22 @@ pub struct ActionReviewRequest {
     pub user_messages: Vec<String>,
     /// 本会话最近的工具调用摘要，从旧到新；只作行动轨迹参考。
     pub recent_actions: Vec<String>,
+}
+/// 完整必要上下文的硬上限。超限拒绝，不能裁剪用户原话或真实命令以求放行。
+pub const MAX_ACTION_REVIEW_BYTES: usize = 256 * 1024;
+impl ActionReviewRequest {
+    pub fn validate_capacity(&self) -> Result<(), String> {
+        let size = serde_json::to_vec(self)
+            .map_err(|_| "审查请求无法序列化".to_string())?
+            .len();
+        if size > MAX_ACTION_REVIEW_BYTES {
+            return Err(format!(
+                "完整行动审查上下文超过 {} 字节上限，未裁剪原话或命令，动作未执行",
+                MAX_ACTION_REVIEW_BYTES
+            ));
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ActionReviewVerdict {
@@ -419,6 +440,14 @@ pub enum DeveloperOperation {
 }
 /// 可替换后端；接收宿主的可信会话身份与取消状态，而非模型自报 owner。
 pub trait DeveloperBackend: Send + Sync {
+    /// 只核验宿主身份与业务范围，不执行动作；不代表危险命令已经过审核。
+    fn preflight(
+        &self,
+        _operation: &DeveloperOperation,
+        _context: &ToolExecutionContext,
+    ) -> Result<(), ToolExecutionError> {
+        Err(ToolExecutionError::Rejected("后端没有提供权限预检".into()))
+    }
     fn execute(
         &self,
         operation: DeveloperOperation,

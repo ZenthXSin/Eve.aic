@@ -307,9 +307,6 @@ impl StoredOutreach {
         result: AttemptResult,
     ) -> OutreachResult<Invitation> {
         validate_result(&result)?;
-        if result == AttemptResult::Unknown {
-            return Err(OutreachError::InvalidInput);
-        }
         self.update(id, at_ms, |_, entry| {
             let attempts = entry.attempts.len();
             let Some(attempt) = entry.attempts.last_mut() else {
@@ -319,9 +316,12 @@ impl StoredOutreach {
                 return Err(OutreachError::Conflict);
             }
             let sent = matches!(result, AttemptResult::Sent { .. });
+            let unknown = result == AttemptResult::Unknown;
             attempt.result = Some(result);
-            attempt.finished_at_ms = Some(at_ms);
-            if sent {
+            attempt.finished_at_ms = if unknown { None } else { Some(at_ms) };
+            if unknown {
+                entry.status = InvitationStatus::Unknown;
+            } else if sent {
                 entry.status = InvitationStatus::Delivered;
                 entry.delivered_at_ms = Some(at_ms);
                 entry.closed_at_ms = Some(at_ms);

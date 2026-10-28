@@ -114,11 +114,21 @@ fn review_request(
     a: &CommandArguments,
     reason: String,
     context: &ToolExecutionContext,
-) -> ActionReviewRequest {
+) -> Result<ActionReviewRequest, ToolExecutionError> {
     let delegated = context.is_delegated();
     let messages = context.conversation().unwrap_or_default();
     let user_messages = if delegated {
         vec![]
+    } else if let Some(originals) = context.review_user_messages() {
+        originals
+            .iter()
+            .rev()
+            .take(REVIEW_USER_MESSAGES)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
     } else {
         let mut texts: Vec<String> = messages
             .iter()
@@ -142,7 +152,11 @@ fn review_request(
     recent_actions.reverse();
     let mut action = vec![a.program.clone()];
     action.extend(a.args.iter().cloned());
-    ActionReviewRequest {
+    let request = ActionReviewRequest {
+        program: a.program.clone(),
+        arguments: a.args.clone(),
+        workspace: String::new(),
+        isolated: false,
         action: clip(
             &shlex::try_join(action.iter().map(String::as_str))
                 .unwrap_or_else(|_| action.join(" ")),
@@ -154,7 +168,8 @@ fn review_request(
         delegated,
         user_messages,
         recent_actions,
-    }
+    };
+    Ok(request)
 }
 impl LocalDeveloper {
     pub fn new(
@@ -191,6 +206,30 @@ impl LocalDeveloper {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 1,
             Err(_) => return Err(failed("开发工具账本无法读取")),
         };
+        match fs::read(journal.join("action-reviews.jsonl")) {
+            Ok(bytes) => {
+                let text = std::str::from_utf8(&bytes)
+                    .map_err(|_| failed("行动审核审计损坏；保留原文件"))?;
+                if !text.is_empty() && !text.ends_with('\n') {
+                    return Err(failed("行动审核审计存在不完整提交；保留原文件"));
+                }
+                for line in text.lines() {
+                    let entry: Value = serde_json::from_str(line)
+                        .map_err(|_| failed("行动审核审计损坏；保留原文件"))?;
+                    if entry["format_version"] != 1
+                        || !entry["request_sha256"].as_str().is_some_and(|s| {
+                            s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+                        })
+                        || !matches!(entry["status"].as_str(), Some("failed" | "reviewed"))
+                        || !entry["allowed"].is_boolean()
+                    {
+                        return Err(failed("行动审核审计版本或记录无效；保留原文件"));
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(failed("行动审核审计无法读取；保留原文件")),
+        }
         let token = token.filter(|v| !v.trim().is_empty());
         if token
             .as_ref()
@@ -259,7 +298,7 @@ impl LocalDeveloper {
         }
         Ok(())
     }
-    fn authorize_operation(
+    pub fn authorize_operation(
         &self,
         operation: &DeveloperOperation,
         context: &ToolExecutionContext,
@@ -375,6 +414,30 @@ impl LocalDeveloper {
         writeln!(file, "{value}")
             .and_then(|_| file.sync_all())
             .map_err(|_| failed("操作账本提交失败；操作结果不确定，不能自动重试"))
+    }
+    /// 独立审核审计只保存请求指纹、等级和结论，不持久化原话、命令参数或模型理由。
+    /// 审计写入失败时拒绝执行，不能带着无记录的批准继续。
+    fn record_review(
+        &self,
+        fingerprint: &str,
+        result: &Result<ActionReviewVerdict, String>,
+    ) -> Result<(), ToolExecutionError> {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(self.journal.join("action-reviews.jsonl"))
+            .map_err(|_| failed("行动审核审计不可写，命令未执行"))?;
+        let value = match result {
+            Ok(v) => {
+                json!({"format_version":1,"request_sha256":fingerprint,"status":"reviewed","risk":v.risk,"authorization":v.authorization,"allowed":v.permits()})
+            }
+            Err(_) => {
+                json!({"format_version":1,"request_sha256":fingerprint,"status":"failed","allowed":false})
+            }
+        };
+        writeln!(file, "{value}")
+            .and_then(|_| file.sync_all())
+            .map_err(|_| failed("行动审核审计提交失败，命令未执行"))
     }
     /// 原子替换或新建文件：expected 为空串表示只新建；提交前再次核对文件仍为 expected。
     fn replace_file(
@@ -785,9 +848,22 @@ impl LocalDeveloper {
                         Some(eve_developer_api::CommandDecision::Prompt) => {
                             match &self.action_reviewer {
                                 Some(reviewer) => {
-                                    let request = review_request(&a, evaluation.reason(), context);
+                                    let mut request =
+                                        review_request(&a, evaluation.reason(), context)?;
+                                    request.workspace = self.root.to_string_lossy().into_owned();
+                                    request.isolated = self.isolated;
                                     let delegated = request.delegated;
-                                    let verdict = reviewer.review(request).await.map_err(|e| {
+                                    let fingerprint = hash(
+                                        serde_json::to_string(&request)
+                                            .map_err(|_| failed("审查请求无法序列化"))?
+                                            .as_bytes(),
+                                    );
+                                    let result = match request.validate_capacity() {
+                                        Ok(()) => reviewer.review(request).await,
+                                        Err(error) => Err(error),
+                                    };
+                                    self.record_review(&fingerprint, &result)?;
+                                    let verdict = result.map_err(|e| {
                                         failed(format!("行动审查没有完成（{e}），命令未执行"))
                                     })?;
                                     if !verdict.permits() {
@@ -804,13 +880,12 @@ impl LocalDeveloper {
                                         )));
                                     }
                                 }
-                                None if !a.owner_confirmed => {
+                                None => {
                                     return Err(failed(format!(
-                                        "这条命令需要主人或管理员明确同意：{}。先在对话里说明要执行什么、影响哪些文件或分支，得到明确同意后再带 owner_confirmed: true 调用；不要自行认定已同意",
+                                        "这条命令需要行动审查，但审查器未配置：{}。命令未执行；owner_confirmed 不能代替独立审核",
                                         evaluation.reason()
                                     )));
                                 }
-                                None => {}
                             }
                         }
                         _ => {}
@@ -1223,6 +1298,13 @@ impl LocalDeveloper {
     }
 }
 impl DeveloperBackend for LocalDeveloper {
+    fn preflight(
+        &self,
+        operation: &DeveloperOperation,
+        context: &ToolExecutionContext,
+    ) -> Result<(), ToolExecutionError> {
+        self.authorize_operation(operation, context)
+    }
     fn execute(
         &self,
         operation: DeveloperOperation,

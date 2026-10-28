@@ -26,6 +26,8 @@ fn spec() -> TriggerSpec {
         mode: MatchMode::All,
         conditions: vec![Condition::Time { at_ms: 2000 }],
         expires_at_ms: 1_000_000,
+        recurrence: None,
+        resume_task_id: None,
     }
 }
 #[tokio::test]
@@ -106,7 +108,7 @@ async fn restart_preserves_waiting_and_never_replays_running_or_sending() {
 async fn invalid_and_duplicate_key_state_is_preserved_and_rejected() {
     for bytes in [
         br#"{"format_version":1,"format_version":1,"triggers":[]}"#.to_vec(),
-        br#"{"format_version":2,"triggers":[]}"#.to_vec(),
+        br#"{"format_version":3,"triggers":[]}"#.to_vec(),
         b"broken".to_vec(),
     ] {
         let state = Arc::new(MemoryStateStore::default());
@@ -201,4 +203,183 @@ async fn lost_commit_confirmation_closes_handle_and_restart_never_replays() {
     next.start_all().await.unwrap();
     assert_eq!(c.snapshot().unwrap()[0].status, Status::Interrupted);
     next.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn recurrence_is_bounded_and_unknown_delivery_never_rearms() {
+    let (k, c) = open(Arc::default()).await;
+    let mut recurring = spec();
+    recurring.recurrence = Some(Recurrence {
+        interval_ms: 60_000,
+        max_runs: 2,
+    });
+    let t = c
+        .create(owner("cycle"), "cycle".into(), recurring, 1000)
+        .unwrap();
+    for run in 1..=2 {
+        c.ready(&t.id, vec!["time".into()]).unwrap();
+        c.transition(&t.id, Status::Ready, Status::Running, None)
+            .unwrap();
+        c.transition(
+            &t.id,
+            Status::Running,
+            Status::Completed,
+            Some("已检查目标".into()),
+        )
+        .unwrap();
+        assert_eq!(c.rearm(&t.id, 3000), Err(TriggerError::Transition));
+        c.delivery_for_run(&t.id, run, Delivery::Pending, Delivery::Sending)
+            .unwrap();
+        assert_eq!(
+            c.delivery_for_run(
+                &t.id,
+                run.saturating_sub(1),
+                Delivery::Sending,
+                Delivery::Sent
+            ),
+            Err(TriggerError::Transition)
+        );
+        c.delivery_for_run(&t.id, run, Delivery::Sending, Delivery::Sent)
+            .unwrap();
+        if run == 1 {
+            c.rearm(&t.id, 3000).unwrap();
+            let restored = c.snapshot().unwrap().remove(0);
+            assert_eq!(
+                restored.spec.conditions,
+                vec![Condition::Time { at_ms: 63_000 }]
+            );
+        } else {
+            assert_eq!(c.rearm(&t.id, 3000), Err(TriggerError::Transition));
+        }
+    }
+    let mut uncertain_spec = spec();
+    uncertain_spec.recurrence = Some(Recurrence {
+        interval_ms: 60_000,
+        max_runs: 2,
+    });
+    let uncertain = c
+        .create(
+            owner("unknown"),
+            "unknown-cycle".into(),
+            uncertain_spec,
+            1000,
+        )
+        .unwrap();
+    c.ready(&uncertain.id, vec!["time".into()]).unwrap();
+    c.transition(&uncertain.id, Status::Ready, Status::Running, None)
+        .unwrap();
+    c.transition(
+        &uncertain.id,
+        Status::Running,
+        Status::Completed,
+        Some("检查完成，发送未确认".into()),
+    )
+    .unwrap();
+    c.delivery(&uncertain.id, Delivery::Pending, Delivery::Sending)
+        .unwrap();
+    c.delivery(&uncertain.id, Delivery::Sending, Delivery::Unknown)
+        .unwrap();
+    assert_eq!(c.rearm(&uncertain.id, 3000), Err(TriggerError::Transition));
+    let mut boundary = spec();
+    boundary.expires_at_ms = 2000;
+    assert_eq!(
+        c.create(owner("boundary"), "equal".into(), boundary, 1000),
+        Err(TriggerError::Invalid)
+    );
+    k.stop_all().await.unwrap();
+}
+
+// 两个真实操作系统进程依次读写 FileStateStore，验证半小时周期跨进程保存。
+#[test]
+fn recurring_schedule_survives_a_real_process_boundary() {
+    let directory = tempfile::tempdir().unwrap();
+    for phase in ["seed", "resume"] {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "recurrence_subprocess_helper", "--nocapture"])
+            .env("EVE_TRIGGER_SIMULATION_STATE", directory.path())
+            .env("EVE_TRIGGER_SIMULATION_PHASE", phase)
+            .status()
+            .unwrap();
+        assert!(status.success(), "模拟子进程失败：{phase}");
+    }
+}
+#[tokio::test]
+async fn recurrence_subprocess_helper() {
+    let Some(path) = std::env::var_os("EVE_TRIGGER_SIMULATION_STATE") else {
+        return;
+    };
+    let state = Arc::new(
+        eve_kernel::backends::FileStateStore::open(std::path::PathBuf::from(path)).unwrap(),
+    );
+    let kernel = Kernel::with_services(KernelServices {
+        state,
+        ..Default::default()
+    });
+    let plugin = TriggerPlugin::new().unwrap();
+    let c = plugin.controller();
+    kernel.register(Box::new(plugin)).unwrap();
+    kernel.start_all().await.unwrap();
+    if std::env::var("EVE_TRIGGER_SIMULATION_PHASE").unwrap() == "seed" {
+        let mut recurring = spec();
+        recurring.expires_at_ms = 7_200_000;
+        recurring.recurrence = Some(Recurrence {
+            interval_ms: 1_800_000,
+            max_runs: 3,
+        });
+        let t = c
+            .create(owner("simulation"), "periodic-goal".into(), recurring, 1000)
+            .unwrap();
+        c.ready(&t.id, vec!["模拟时钟达到2000".into()]).unwrap();
+        c.transition(&t.id, Status::Ready, Status::Running, None)
+            .unwrap();
+        c.transition(
+            &t.id,
+            Status::Running,
+            Status::Completed,
+            Some("模拟检查完成".into()),
+        )
+        .unwrap();
+        c.delivery(&t.id, Delivery::Pending, Delivery::Sending)
+            .unwrap();
+        c.delivery(&t.id, Delivery::Sending, Delivery::Sent)
+            .unwrap();
+        c.rearm(&t.id, 3000).unwrap();
+    } else {
+        let t = c.snapshot().unwrap().remove(0);
+        assert_eq!(t.status, Status::Armed);
+        assert_eq!(t.runs, 1);
+        assert_eq!(
+            t.spec.conditions,
+            vec![Condition::Time { at_ms: 1_803_000 }]
+        );
+        assert_eq!(t.result.as_deref(), Some("模拟检查完成"));
+    }
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn old_trigger_ledger_migrates_without_losing_armed_conditions() {
+    let state = Arc::new(MemoryStateStore::default());
+    let (kernel, controller) = open(state.clone()).await;
+    let trigger = controller
+        .create(owner("legacy"), "legacy-source".into(), spec(), 1000)
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    let namespace = PluginId::new(PLUGIN_ID).unwrap();
+    let mut legacy = serde_json::to_value(&trigger).unwrap();
+    legacy.as_object_mut().unwrap().remove("runs");
+    state
+        .set(
+            &namespace,
+            STATE_KEY.into(),
+            serde_json::to_vec(&serde_json::json!({"format_version":1,"triggers":[legacy]}))
+                .unwrap(),
+        )
+        .unwrap();
+    let (kernel, controller) = open(state.clone()).await;
+    assert_eq!(controller.snapshot().unwrap(), vec![trigger]);
+    let stored: serde_json::Value =
+        serde_json::from_slice(&state.get(&namespace, STATE_KEY).unwrap().unwrap()).unwrap();
+    assert_eq!(stored["format_version"], 2);
+    kernel.stop_all().await.unwrap();
 }

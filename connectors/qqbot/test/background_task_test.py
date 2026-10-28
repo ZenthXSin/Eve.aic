@@ -7,6 +7,7 @@
 
 模型替身按请求里的工具定义与上下文确定性地作答，只证明宿主契约，不代表真实模型的理解能力。
 """
+from fixture_auth import configure_fixture_progress
 import json
 import os
 import subprocess
@@ -340,7 +341,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
                    EVE_TASK_DEFAULT_STEPS="300", EVE_TASK_MAX_STEPS="200")
         result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
                                  "--agent", str(ROOT / "AGENT.md"), "--background-tasks"],
-                                env=env, capture_output=True, text=True, timeout=60)
+                                env=configure_fixture_progress(env), capture_output=True, text=True, timeout=60)
         self.assertNotEqual(result.returncode, 0, "默认步数大于上限时拒绝启动")
         self.assertIn("runtime.tasks", result.stderr)
 

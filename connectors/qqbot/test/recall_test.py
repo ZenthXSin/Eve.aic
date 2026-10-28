@@ -3,6 +3,7 @@
 运行过程只操作临时目录与本测试持有的 Popen，不读取 PID 文件或停止其他服务。
 桥接握手等待已送达交互提交，避免用固定延时推测记忆是否可读。
 """
+from fixture_auth import configure_fixture_progress
 import json
 import os
 import subprocess
@@ -123,7 +124,7 @@ class RecallAcceptance(unittest.TestCase):
         sink = self.panel_stderr.open('w')
         from fixture_auth import bootstrap_test_admin
         bootstrap_test_admin(self.work / "state", env)
-        child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+        child = subprocess.Popen(command, env=configure_fixture_progress(env), stdout=subprocess.PIPE,
                                  stderr=sink if panel else subprocess.PIPE, text=True)
         inspector.start()
         try:

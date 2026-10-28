@@ -466,6 +466,7 @@ impl QqOutreach for ChannelAdapter {
                 http_status,
                 biz_code,
             },
+            QqOutreachResult::Unknown => DeliveryResult::Unknown,
             QqOutreachResult::NotSent => DeliveryResult::NotSent,
         };
         self.reminders

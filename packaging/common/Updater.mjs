@@ -1,5 +1,6 @@
 // 更新实现：公开发行下载、暂存、完整性校验与原子版本指针；用户文件始终留在安装根目录。
 import fs from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -7,6 +8,11 @@ import { REPOSITORY, PROTOCOL, MAX_ARCHIVE_BYTES, currentManifest, updatePlan, v
 import { unpack } from './update-archive.mjs';
 
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+async function fileSha(file) {
+  const digest = createHash('sha256');
+  for await (const chunk of createReadStream(file)) digest.update(chunk);
+  return digest.digest('hex');
+}
 const fresh = () => ({ format_version: 1, active: null, previous: null, pending: null, pending_failed: false, checked_at_ms: 0, outcome: 'idle' });
 export class UpdateBusy extends Error {}
 
@@ -43,7 +49,7 @@ async function atomic(file, value) {
 }
 function reference(value) {
   if (value === null) return null;
-  if (!value || typeof value.slot !== 'string' || value.slot.includes('/') || !/^v\d+\.\d+\.\d+-[a-f0-9]{12}-[a-f0-9-]{36}$/.test(value.slot) ||
+  if (!value || typeof value.slot !== 'string' || value.slot.includes('/') || !/^v\d+\.\d+\.\d+-[a-f0-9]{12}-(?:[a-f0-9-]{36}|[a-f0-9]{64})$/.test(value.slot) ||
       !/^[a-f0-9]{64}$/.test(value.manifest_sha256 ?? '') || typeof value.version !== 'string') throw new Error('更新版本指针损坏；保留原文件。');
   safeRelative(value.slot); return value;
 }
@@ -126,7 +132,7 @@ export function createUpdater(root, { fetchImpl = globalThis.fetch, log = consol
         if (entry.isSymbolicLink()) throw new Error('更新版本不允许链接。');
       }
       const file = path.join(appRoot, name);
-      if (!(await fs.lstat(file)).isFile() || sha(await fs.readFile(file)) !== expected) throw new Error('更新版本文件已损坏。');
+      if (!(await fs.lstat(file)).isFile() || await fileSha(file) !== expected) throw new Error('更新版本文件已损坏。');
     }
     if (help) {
       const extension = current.platform_label.startsWith('windows-') ? '.exe' : '';
@@ -214,16 +220,26 @@ export function createUpdater(root, { fetchImpl = globalThis.fetch, log = consol
         if (!raw) throw new Error('新版缺少发行清单。');
         const manifest = JSON.parse(raw), entries = verifyManifest(manifest, plan, [...files.keys()]);
         for (const [name, expected] of entries) if (sha(files.get(name).bytes) !== expected) throw new Error('新版文件校验未通过。');
-        staging = path.join(store, 'staging-' + randomUUID()); await fs.mkdir(staging);
-        for (const [name, entry] of files) {
-          if (signal?.aborted) throw new Error('更新下载已停止。');
-          const file = path.join(staging, name); await fs.mkdir(path.dirname(file), { recursive: true });
-          const handle = await fs.open(file, 'wx', entry.mode || 0o644);
-          try { await handle.writeFile(entry.bytes); await handle.sync(); } finally { await handle.close(); }
-        }
-        const slot = `${plan.version}-${manifest.source_commit.slice(0, 12)}-${randomUUID()}`;
-        await fs.rename(staging, path.join(versions, slot)); staging = null;
+        const slot = `${plan.version}-${manifest.source_commit.slice(0, 12)}-${sha(raw)}`;
         const pending = { slot, version: plan.version, manifest_sha256: sha(raw) };
+        let existing = false;
+        try { await fs.lstat(path.join(versions, slot)); existing = true; }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+        if (existing) {
+          // 相同内容只复用；损坏目录保留现场，不能用一次重新下载悄悄覆盖。
+          await checkedSlot(pending, current);
+        } else {
+          const retained = (await fs.readdir(versions, { withFileTypes: true })).filter(entry => entry.isDirectory());
+          if (retained.length >= 8) throw new Error('更新版本保留达到八份上限，请先检查并清理未使用的版本。');
+          staging = path.join(store, 'staging-' + randomUUID()); await fs.mkdir(staging);
+          for (const [name, entry] of files) {
+            if (signal?.aborted) throw new Error('更新下载已停止。');
+            const file = path.join(staging, name); await fs.mkdir(path.dirname(file), { recursive: true });
+            const handle = await fs.open(file, 'wx', entry.mode || 0o644);
+            try { await handle.writeFile(entry.bytes); await handle.sync(); } finally { await handle.close(); }
+          }
+          await fs.rename(staging, path.join(versions, slot)); staging = null;
+        }
         await checkedSlot(pending, current, true);
         saved.pending = pending; saved.pending_failed = false; saved.outcome = 'downloaded'; await commit(saved);
         log(`Eve ${plan.version} 已下载并校验，下次启动自动启用。`); return saved;

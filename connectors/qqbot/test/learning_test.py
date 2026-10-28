@@ -3,6 +3,7 @@
 正向时序通过文件门控和真实持久状态确认；短暂观察窗口只验证没有后台重试。
 停止仅操作本测试持有的 Popen，不读取 PID 文件，也不向任意 PID 发信号。
 """
+from fixture_auth import configure_fixture_progress
 import json
 import os
 import pathlib
@@ -226,7 +227,7 @@ class LearningAcceptance(unittest.TestCase):
         sink = open(self.panel_stderr, "w")
         from fixture_auth import bootstrap_test_admin
         bootstrap_test_admin(self.work / "state", env, app)
-        child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+        child = subprocess.Popen(command, env=configure_fixture_progress(env), stdout=subprocess.PIPE,
                                  stderr=sink if panel else subprocess.PIPE, text=True)
         inspector.start()
         try:

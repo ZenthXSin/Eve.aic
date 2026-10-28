@@ -163,13 +163,6 @@ struct SlowStep {
     reported: bool,
     next: tokio::time::Instant,
 }
-fn slow_text(step: &SlowStep) -> String {
-    format!(
-        "{}这一步已进行约 {} 秒，仍在进行中；完成后会继续回复。",
-        step.label,
-        step.since.elapsed().as_secs()
-    )
-}
 /// 按真实事件更新当前步骤；返回 None 表示该事件不影响步骤记录。
 fn slow_label(kind: &TurnEventKind) -> Option<Option<String>> {
     match kind {
@@ -184,36 +177,11 @@ fn slow_label(kind: &TurnEventKind) -> Option<Option<String>> {
     }
 }
 fn progress_text(kind: &TurnEventKind) -> Option<String> {
-    if let TurnEventKind::ToolBatchStarted { calls } = kind {
-        return Some(format!(
-            "我先进行{}，有结果后继续汇报。",
-            activities(calls.iter().map(|c| c.name.as_str()))
-        ));
-    }
     if let TurnEventKind::AssistantMessage { text } = kind {
-        return Some(text.clone());
+        Some(text.clone())
+    } else {
+        None
     }
-    if matches!(kind, TurnEventKind::ContextCompactionStarted) {
-        return Some("正在进行上下文压缩，请稍等".into());
-    }
-    let TurnEventKind::ToolProgress {
-        completed_calls: _,
-        failed_calls,
-        tool_names,
-    } = kind
-    else {
-        return None;
-    };
-    let activities = activities(tool_names.iter().map(String::as_str));
-    Some(format!(
-        "{}已返回结果{}，接下来继续核对剩余事项。",
-        activities,
-        if *failed_calls == 0 {
-            String::new()
-        } else {
-            "，有步骤未成功，需要核对原因".into()
-        }
-    ))
 }
 // 无法保存新业务回执时只发送拒绝通知：不运行原请求，失败不重试，不宣称回复已保存。
 async fn capacity_notice(
@@ -304,6 +272,7 @@ pub(crate) struct Services {
     pub participant_observer: Option<Arc<dyn crate::QqParticipantObserver>>,
     pub timing_diagnostics: bool,
     pub slow_progress: Option<Arc<dyn crate::QqSlowProgress>>,
+    pub progress_narrator: Option<Arc<dyn crate::QqProgressNarrator>>,
     pub debounce: Option<Arc<dyn crate::QqDebounce>>,
     pub stickers: Option<Arc<dyn crate::QqStickers>>,
     pub failure_recovery: Option<Arc<dyn crate::QqFailureRecovery>>,
@@ -319,6 +288,17 @@ fn report(hook: &OutreachHook, ctx: &PluginContext, id: &str, result: QqOutreach
         warn(ctx, "outreach_receipt_unrecorded");
     }
 }
+fn delivery_unknown(frame: &Value) -> bool {
+    (frame.get("ok").and_then(Value::as_bool) == Some(true)
+        && !frame
+            .get("message_id")
+            .and_then(Value::as_str)
+            .is_some_and(valid_message_id))
+        || frame
+            .get("failure_kind")
+            .and_then(Value::as_str)
+            .is_some_and(|v| matches!(v, "transport_unknown" | "timeout" | "connection"))
+}
 fn outreach_result(frame: &Value, ok: bool) -> QqOutreachResult {
     if ok {
         QqOutreachResult::Sent {
@@ -328,6 +308,8 @@ fn outreach_result(frame: &Value, ok: bool) -> QqOutreachResult {
                 .filter(|id| valid_message_id(id))
                 .map(str::to_string),
         }
+    } else if delivery_unknown(frame) {
+        QqOutreachResult::Unknown
     } else {
         QqOutreachResult::Failed {
             http_status: frame
@@ -403,6 +385,8 @@ fn file_result(frame: &Value, ok: bool) -> QqFileResult {
                 .filter(|id| valid_message_id(id))
                 .map(str::to_string),
         }
+    } else if delivery_unknown(frame) {
+        QqFileResult::Unknown
     } else {
         QqFileResult::Failed {
             http_status: frame
@@ -827,6 +811,7 @@ pub(crate) async fn run(
         group_observer,
         timing_diagnostics,
         slow_progress,
+        progress_narrator,
         debounce,
         stickers,
         failure_recovery,
@@ -940,7 +925,9 @@ pub(crate) async fn run(
     let mut replies: VecDeque<Reply> = VecDeque::new();
     let mut delivering: Option<Delivery> = None;
     let mut progress_delivery: Option<(String, usize)> = None;
-    let mut progress_queue: VecDeque<(ControlEvent, Option<String>)> = VecDeque::new();
+    let mut progress_queue: VecDeque<(ControlEvent, Option<String>, Option<u64>)> = VecDeque::new();
+    let (narrated_tx, mut narrated_rx) = mpsc::channel(1);
+    let mut narrating = false;
     let mut live_waiting: BTreeMap<String, crate::live::LiveSend> = BTreeMap::new();
     // 按原始消息 ID 记录的当前步骤；只用于慢步骤进度，不持久化。
     let mut slow_steps: BTreeMap<String, SlowStep> = BTreeMap::new();
@@ -961,10 +948,10 @@ pub(crate) async fn run(
             ledger.archive_if_needed(&ctx)?;
             let abandoned: Vec<_> = live_waiting.iter().filter(|(id, send)| send.cancelled()
                 || !active.iter().any(|a| &a.message.id == *id)).map(|(id, _)| id.clone()).collect();
-            for id in abandoned { if let Some(send) = live_waiting.remove(&id) { send.complete(false); } }
+            for id in abandoned { if let Some(send) = live_waiting.remove(&id) { send.complete(None); } }
             while progress_queue.len() < 64 {
                 match progress_rx.try_recv() {
-                    Ok(event) => progress_queue.push_back((event, None)),
+                    Ok(event) => progress_queue.push_back((event, None, None)),
                     Err(_) => break,
                 }
             }
@@ -990,8 +977,8 @@ pub(crate) async fn run(
                     let event = ControlEvent { key: current.key.clone(), event: TurnEvent {
                         turn_id: Some(outgoing.turn_id), kind: TurnEventKind::AssistantMessage { text: outgoing.text.clone() } } };
                     live_waiting.insert(current.message.id.clone(), outgoing);
-                    progress_queue.push_front((event, None));
-                } else { outgoing.complete(false); }
+                    progress_queue.push_front((event, None, None));
+                } else { outgoing.complete(None); }
             }
             // 慢步骤：同一步只提示一次；与里程碑进度共用每轮至多 3 条和被动回复配额。
             if let Some(after) = slow_after && progress_queue.is_empty() && progress_delivery.is_none()
@@ -1000,7 +987,7 @@ pub(crate) async fn run(
                 step.reported = true;
                 step.next = tokio::time::Instant::now();
                 slow_reported.insert(id.clone());
-                progress_queue.push_back((step.event.clone(), Some(slow_text(step))));
+                progress_queue.push_back((step.event.clone(), None, Some(step.since.elapsed().as_secs())));
             }
             // 同会话输出与任务准入等候路由收尾；独立会话可继续处理。
             // 显式命令不等待已撤销的自然判断，路由任务仍由 MessageService 收尾。
@@ -1033,6 +1020,7 @@ pub(crate) async fn run(
                             let retired = active.iter().position(|a| a.key == snapshot.key);
                             if let Some(index) = retired {
                                 let old = active.remove(index);
+                                conversations.clear_turn_anchor(&old.key.session, &old.message.id)?;
                                 mark_failed(&mut ledger, &ctx, &config.app_id, &old.message.id)?;
                                 finish(&mut stdin, &old.message.id).await?;
                             }
@@ -1177,13 +1165,52 @@ pub(crate) async fn run(
                 }
             }
             if delivering.is_none() && pushing.is_none() && sending_file.is_none() && progress_delivery.is_none()
-                && progress_queue.front().is_some_and(|(event, _): &(ControlEvent, Option<String>)|
+                && !narrating
+                && progress_queue.front().is_some_and(|(event, _, _): &(ControlEvent, Option<String>, Option<u64>)|
                     active.iter().any(|a| a.key == event.key)
                     || !routing.iter().any(|r| r.target.session == event.key.session))
-                && let Some((event, text)) = progress_queue.pop_front() {
+                && let Some((event, text, waiting_seconds)) = progress_queue.pop_front() {
+                if text.is_none() && !matches!(event.event.kind, TurnEventKind::AssistantMessage { .. }) {
+                    if let Some(narrator) = progress_narrator.clone()
+                        && let Some(current) = active.iter().find(|a| a.key == event.key) {
+                        let index = ledger.find(&config.app_id, &current.message.id).expect("progress receipt");
+                        let previous_messages: Vec<_> = ledger.entries[index].progress.iter().map(|p| p.text.clone()).collect();
+                        let ordinary_count = ledger.entries[index].progress.iter().filter(|p| !p.necessary).count();
+                        // 群进度只占开头与中间两个名额，保留结尾；必要问题由模型实时工具单独提出。
+                        let interval_ok = !stages || previous_messages.is_empty() || last_progress.get(&current.message.id).is_none_or(|last| last.elapsed() >= min_interval);
+                        let enabled = waiting_seconds.is_some() || match &event.event.kind {
+                            TurnEventKind::ToolBatchStarted { calls } => stages && !calls.iter().any(|c| c.name == "send_message") && !calls.iter().all(|c| c.name == "task_progress"),
+                            TurnEventKind::ToolProgress { .. } => stages || slow_progress.as_ref().is_some_and(|p| p.tool_milestones()),
+                            _ => true,
+                        };
+                        if enabled && interval_ok && (current.message.scope == "c2c" || ordinary_count < 2) {
+                            let (tool_names, failed_calls) = match &event.event.kind {
+                                TurnEventKind::ToolBatchStarted { calls } => (calls.iter().map(|c| c.name.clone()).collect(), 0),
+                                TurnEventKind::ToolProgress { tool_names, failed_calls, .. } => (tool_names.clone(), *failed_calls),
+                                _ => (vec![], 0),
+                            };
+                            let facts = crate::QqProgressFacts {
+                                user_request: current.message.text.clone(),
+                                activity: slow_steps.get(&current.message.id).map(|s| s.label.clone()),
+                                phase: if matches!(event.event.kind, TurnEventKind::ContextCompactionStarted) { "compaction" } else if waiting_seconds.is_some() { "waiting" } else if ordinary_count == 0 && matches!(event.event.kind, TurnEventKind::ToolBatchStarted { .. }) { "start" } else { "milestone" }.into(),
+                                tool_names, failed_calls, waiting_seconds, previous_messages, group: current.message.scope != "c2c",
+                            };
+                            let tx = narrated_tx.clone();
+                            narrating = true;
+                            tokio::spawn(async move {
+                                let (text, failed) = match tokio::time::timeout(Duration::from_secs(8), narrator.narrate(facts)).await {
+                                    Ok(Ok(text)) => (text, false),
+                                    _ => (None, true),
+                                };
+                                let _ = tx.send((event, text, waiting_seconds, failed)).await;
+                            });
+                        }
+                    }
+                    continue;
+                }
                 // 只使用当前代绑定的原始平台路由；取消、插入控制和旧代事件不补发。
                 let elapsed = active.iter().find(|a| a.key == event.key).map(|a| a.started.elapsed()).unwrap_or_default();
-                let is_start = text.is_none() && matches!(event.event.kind, TurnEventKind::ToolBatchStarted { .. });
+                let is_start = waiting_seconds.is_none() && matches!(event.event.kind, TurnEventKind::ToolBatchStarted { .. });
                 let message = active.iter().find(|a| a.key == event.key).map(|a| a.message.clone());
                 if let Some(message) = message
                     && !pending_control(&message, &routing, &commands)
@@ -1198,23 +1225,26 @@ pub(crate) async fn run(
                     let automatic_start = matches!(&event.event.kind, TurnEventKind::ToolBatchStarted { calls }
                         if !calls.iter().any(|c| c.name == "send_message")
                             && !calls.iter().all(|c| c.name == "task_progress"));
+                    let ordinary_count = entry.progress.iter().filter(|p| !p.necessary).count();
                     let skip_start = is_start
-                        && (!automatic_start || !entry.progress.is_empty());
-                    let interval_ok = !stages || entry.progress.is_empty()
+                        && (!automatic_start || ordinary_count != 0);
+                    let necessary_question = live_waiting.get(&message.id).is_some_and(|send| send.needs_answer);
+                    let interval_ok = necessary_question || !stages || entry.progress.is_empty()
                         || last_progress.get(&message.id).is_none_or(|last| last.elapsed() >= min_interval)
                         || matches!(event.event.kind, TurnEventKind::ContextCompactionStarted);
-                    let blocked = entry.progress.iter().any(|p| p.state == PartState::Failed);
+                    let blocked = entry.progress.iter().any(|p| matches!(p.state, PartState::Failed | PartState::Unknown));
                     // 旧模式沿用 1/30/70 步节奏；新模式更密的事件不能抢占压缩通知名额。
                     let legacy_milestone = stages || match event.event.kind {
                         TurnEventKind::ToolProgress { completed_calls, .. } =>
                             completed_calls >= [1, 30, 70].get(entry.progress.len()).copied().unwrap_or(usize::MAX),
                         _ => true,
                     };
-                    if entry.state == ReceiptState::Processing && !skip_start && interval_ok && legacy_milestone
+                    let scope_budget = message.scope == "c2c" || necessary_question || ordinary_count < 2;
+                    if scope_budget && entry.state == ReceiptState::Processing && !skip_start && interval_ok && legacy_milestone
                         && (!stages || !blocked) && entry.progress.len() < if stages {64} else {3} {
                         let part = entry.progress.len();
-                        let proactive = stages && (passive_progress(entry) >= 2 || elapsed >= Duration::from_secs(230));
-                        entry.progress.push(Progress { text: text.clone(), state: PartState::Sending, proactive });
+                        let proactive = message.scope == "c2c" && stages && (passive_progress(entry) >= 2 || elapsed >= Duration::from_secs(230));
+                        entry.progress.push(Progress { text: text.clone(), state: PartState::Sending, proactive, necessary: necessary_question });
                         last_progress.insert(message.id.clone(), tokio::time::Instant::now());
                         ledger.save(&ctx)?;
                         // 同步落盘后再次核验；写出后未知结果不会自动补发。
@@ -1229,11 +1259,11 @@ pub(crate) async fn run(
                     }
                 }
                 if progress_delivery.is_none() && let Some(current) = active.iter().find(|a| a.key == event.key)
-                    && let Some(outgoing) = live_waiting.remove(&current.message.id) { outgoing.complete(false); }
+                    && let Some(outgoing) = live_waiting.remove(&current.message.id) { outgoing.complete(None); }
                 continue;
             }
             if delivering.is_none() && pushing.is_none() && sending_file.is_none() && judging.is_none() && progress_delivery.is_none()
-                && progress_queue.is_empty() && progress_rx.is_empty()
+                && !narrating && progress_queue.is_empty() && progress_rx.is_empty()
                 && let Some(index) = replies.iter().position(|reply| !pending_control(&reply.message, &routing, &commands)) {
                 let reply = replies.remove(index).expect("queued reply");
                 if !reply.guard.accepts(control.as_ref()) {
@@ -1482,6 +1512,7 @@ pub(crate) async fn run(
                 let merge = debounce_window.is_some() && mergeable(&queued);
                 let mut saved = queued.saved;
                 let mut message = queued.message;
+                let mut turn_messages = vec![message.clone()];
                 // 回执保存每条消息的原话；合并后的文本只用于本轮会话输入。
                 let mut merged_text = None;
                 if merge {
@@ -1511,6 +1542,7 @@ pub(crate) async fn run(
                         }
                         saved = true;
                     }
+                    turn_messages = batch.clone();
                     let last = batch.pop().expect("batch keeps the latest message");
                     let mut texts: Vec<String> = Vec::new();
                     for earlier in batch {
@@ -1534,6 +1566,7 @@ pub(crate) async fn run(
                 let key = message.session_key(&config.app_id)?;
                 // 先登记会话类型，本轮工具执行时即可读取。
                 conversations.record(&key, &message.scope);
+                conversations.bind_turn_messages(&config.app_id, &turn_messages)?;
                 let submitted = control.submit(ControlInput {
                     session: SessionInput { key, text: message.turn_text() },
                     task_id: format!("qq:{}", message.id),
@@ -1548,6 +1581,7 @@ pub(crate) async fn run(
                         queue.push_front(Queued { message, saved: true, ordinary: queued.ordinary, received: queued.received });
                     }
                     Err(_) => {
+                        conversations.clear_turn_anchor(&message.session_key(&config.app_id)?, &message.id)?;
                         mark_failed(&mut ledger, &ctx, &config.app_id, &message.id)?;
                         status.send_modify(|s| s.failed += 1);
                         warn(&ctx, "control_submit_failed");
@@ -1611,7 +1645,12 @@ pub(crate) async fn run(
                 _ = tokio::time::sleep_until(next_push), if push_ready => {}
                 _ = tokio::time::sleep(Duration::from_millis(100)), if !queue.is_empty() => {}
                 _ = tokio::time::sleep(Duration::from_millis(50)), if live_dialogue.is_some() => {}
-                Some(event) = progress_rx.recv(), if progress_queue.len() < 64 => { progress_queue.push_back((event, None)); }
+                Some((event, text, waiting, failed)) = narrated_rx.recv(), if narrating => {
+                    narrating = false;
+                    if failed { warn(&ctx, "progress_narration_unavailable"); }
+                    if let Some(text) = text { progress_queue.push_front((event, Some(text), waiting)); }
+                }
+                Some(event) = progress_rx.recv(), if progress_queue.len() < 64 => { progress_queue.push_back((event, None, None)); }
                 Some(event) = steps_rx.recv() => {
                     if let Some(id) = active.iter().find(|a| a.key == event.key).map(|a| a.message.id.clone()) {
                         match slow_label(&event.event.kind).flatten() {
@@ -1647,6 +1686,7 @@ pub(crate) async fn run(
                         .and_then(|prior| active.iter().position(|a| a.key == prior.key));
                     if let Some(index) = retired {
                         let old = active.remove(index);
+                        conversations.clear_turn_anchor(&old.key.session, &old.message.id)?;
                         mark_failed(&mut ledger, &ctx, &config.app_id, &old.message.id)?;
                         finish(&mut stdin, &old.message.id).await?;
                     }
@@ -1702,6 +1742,7 @@ pub(crate) async fn run(
                 }
                 (index, report) = completed(&mut active, &eligible), if !active.is_empty() => {
                     let current = active.remove(index);
+                    conversations.clear_turn_anchor(&current.key.session, &current.message.id)?;
                     let report = report.map_err(|_| failure("QQBot 控制任务收尾失败"))?;
                     let guard = ReplyGuard::Completed(ControlEvent { key: report.key.clone(), event: TurnEvent {
                         turn_id: report.run.turn_id, kind: TurnEventKind::SessionSaved,
@@ -1779,18 +1820,20 @@ pub(crate) async fn run(
                             if frame.get("id").and_then(Value::as_str) != Some(id.as_str()) || frame.get("index").and_then(Value::as_u64) != Some(*part as u64) {
                                 warn(&ctx, "progress_delivery_mismatch"); continue;
                             }
-                            let Some(ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
+                            let Some(reported_ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
+                            let ok = reported_ok && frame.get("message_id").and_then(Value::as_str).is_some_and(valid_message_id);
                             let index = ledger.find(&config.app_id, id).expect("progress receipt");
-                            ledger.entries[index].progress[*part].state = if ok { PartState::Sent } else { PartState::Failed };
+                            ledger.entries[index].progress[*part].state = if ok { PartState::Sent } else if delivery_unknown(&frame) { PartState::Unknown } else { PartState::Failed };
                             ledger.save(&ctx)?;
                             if !ok { delivery_log(&ctx, "progress_failed_no_retry", &frame); }
-                            if let Some(outgoing) = live_waiting.remove(id) { outgoing.complete(ok); }
+                            if let Some(outgoing) = live_waiting.remove(id) { outgoing.complete(if ok { frame.get("message_id").and_then(Value::as_str).map(str::to_owned) } else { None }); }
                             progress_delivery = None;
                         }
                         Some("delivery") if frame.get("file").and_then(Value::as_bool) == Some(true) => {
                             let (Some(files), Some(current)) = (&files, sending_file.as_deref()) else { warn(&ctx, "unexpected_delivery"); continue; };
                             if frame.get("id").and_then(Value::as_str) != Some(current) { warn(&ctx, "delivery_id_mismatch"); continue; }
-                            let Some(ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
+                            let Some(reported_ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
+                            let ok = reported_ok && frame.get("message_id").and_then(Value::as_str).is_some_and(valid_message_id);
                             if !ok { delivery_log(&ctx, "file_delivery_failed_no_retry", &frame); }
                             report_file(files, &ctx, current, file_result(&frame, ok));
                             sending_file = None;
@@ -1798,7 +1841,8 @@ pub(crate) async fn run(
                         Some("delivery") if frame.get("push").and_then(Value::as_bool) == Some(true) => {
                             let (Some(hook), Some(current)) = (&outreach, pushing.as_deref()) else { warn(&ctx, "unexpected_delivery"); continue; };
                             if frame.get("id").and_then(Value::as_str) != Some(current) { warn(&ctx, "delivery_id_mismatch"); continue; }
-                            let Some(ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
+                            let Some(reported_ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
+                            let ok = reported_ok && frame.get("message_id").and_then(Value::as_str).is_some_and(valid_message_id);
                             if !ok { delivery_log(&ctx, "outreach_push_failed_no_retry", &frame); }
                             report(hook, &ctx, current, outreach_result(&frame, ok));
                             pushing = None;
@@ -1808,10 +1852,11 @@ pub(crate) async fn run(
                             if frame.get("id").and_then(Value::as_str) != Some(delivery.reply.message.id.as_str()) {
                                 warn(&ctx, "delivery_id_mismatch"); continue;
                             }
-                            let Some(ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
+                            let Some(reported_ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
+                            let ok = reported_ok && frame.get("message_id").and_then(Value::as_str).is_some_and(valid_message_id);
                             let index = ledger.find(&config.app_id, &delivery.reply.message.id).expect("inserted receipt");
                             ledger.entries[index].sticker.as_mut().expect("receipt with sticker").state =
-                                if ok { PartState::Sent } else { PartState::Failed };
+                                if ok { PartState::Sent } else if delivery_unknown(&frame) { PartState::Unknown } else { PartState::Failed };
                             ledger.save(&ctx)?;
                             if !ok { delivery_log(&ctx, "sticker_failed_no_retry", &frame); }
                             delivering = None;
@@ -1822,7 +1867,8 @@ pub(crate) async fn run(
                             if frame.get("id").and_then(Value::as_str) != Some(message.id.as_str()) {
                                 warn(&ctx, "delivery_id_mismatch"); continue;
                             }
-                            let Some(ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
+                            let Some(reported_ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
+                            let ok = reported_ok && frame.get("message_id").and_then(Value::as_str).is_some_and(valid_message_id);
                             let index = ledger.find(&config.app_id, &message.id).expect("inserted receipt");
                             if delivery.segmented() {
                                 let part = delivery.index;
@@ -1831,10 +1877,10 @@ pub(crate) async fn run(
                                 }
                                 let segments = ledger.entries[index].segments.as_mut().expect("segmented receipt");
                                 let last = part + 1 == segments.parts.len();
-                                segments.parts[part].state = if ok { PartState::Sent } else { PartState::Failed };
+                                segments.parts[part].state = if ok { PartState::Sent } else if delivery_unknown(&frame) { PartState::Unknown } else { PartState::Failed };
                                 if !ok {
                                     segments.skip_rest();
-                                    ledger.entries[index].state = ReceiptState::Failed;
+                                    ledger.entries[index].state = if delivery_unknown(&frame) { ReceiptState::Unknown } else { ReceiptState::Failed };
                                 } else if last {
                                     ledger.entries[index].state = ReceiptState::Sent;
                                 }
@@ -1855,7 +1901,7 @@ pub(crate) async fn run(
                                     continue;
                                 }
                             } else {
-                                ledger.entries[index].state = if ok { ReceiptState::Sent } else { ReceiptState::Failed };
+                                ledger.entries[index].state = if ok { ReceiptState::Sent } else if delivery_unknown(&frame) { ReceiptState::Unknown } else { ReceiptState::Failed };
                                 ledger.save(&ctx)?;
                             }
                             let reply = &delivery.reply;
@@ -2096,6 +2142,29 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     use super::preempts_natural;
+
+    #[test]
+    fn missing_message_id_is_unknown_for_files_and_outreach() {
+        let missing = serde_json::json!({"ok":true});
+        assert!(super::delivery_unknown(&missing));
+        assert_eq!(
+            super::file_result(&missing, false),
+            crate::QqFileResult::Unknown
+        );
+        assert_eq!(
+            super::outreach_result(&missing, false),
+            crate::QqOutreachResult::Unknown
+        );
+        let explicit = serde_json::json!({"ok":false,"failure_kind":"http","http_status":403});
+        assert!(!super::delivery_unknown(&explicit));
+        assert!(matches!(
+            super::file_result(&explicit, false),
+            crate::QqFileResult::Failed {
+                http_status: Some(403),
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn storage_and_protocol_failures_have_distinct_private_notices() {

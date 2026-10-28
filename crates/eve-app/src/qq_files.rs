@@ -48,6 +48,8 @@ struct Record {
     name: Option<String>,
     caption: Option<String>,
     state: State,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    platform_message_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -111,7 +113,9 @@ impl Outbox {
         }
         let mut changed = false;
         for record in &mut value.records {
-            if record.state == State::Sending {
+            if record.state == State::Sending
+                || (record.state == State::Sent && record.platform_message_id.is_none())
+            {
                 record.state = State::Unknown;
                 changed = true;
             }
@@ -264,6 +268,7 @@ impl Outbox {
             name,
             caption,
             state: State::Pending,
+            platform_message_id: None,
         });
         self.persist(&next)
             .map_err(|_| failed("文件队列保存失败，没有排队；入库文件保留"))?;
@@ -271,7 +276,76 @@ impl Outbox {
         Ok(id)
     }
 
-    /// 最近一条记录的结果，供工具回复用户；没有时返回 None。
+    /// 脚本与直接工具共用只读路径授权，绝不在预检时复制成员文件。
+    pub(crate) fn preflight_send(
+        &self,
+        arguments: &Value,
+        context: &ToolExecutionContext,
+    ) -> Result<(), ToolExecutionError> {
+        let scope = context
+            .scope()
+            .ok_or_else(|| failed("文件发送需要可信会话"))?;
+        let source = arguments.get("path").and_then(Value::as_str);
+        let input = source
+            .or_else(|| arguments.get("name").and_then(Value::as_str))
+            .ok_or_else(|| failed("缺少产物路径"))?;
+        let access = self.member_access.get();
+        if let Some((root, auth)) = access.filter(|(_, auth)| !auth.is_operator(scope)) {
+            if !auth.allows_workspace_development(scope) {
+                return Err(failed("缺少真实成员开发身份"));
+            }
+            let root = root
+                .as_ref()
+                .ok_or_else(|| failed("宿主尚未配置成员项目工作区"))?;
+            let input = if source.is_some() && !Path::new(input).is_absolute() {
+                Path::new("/work")
+                    .join(input)
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                input.to_owned()
+            };
+            crate::qq_member_files::preflight(root, scope, &input)
+        } else {
+            let path = if let Some(source) = source {
+                let root = access
+                    .and_then(|(root, _)| root.as_ref())
+                    .ok_or_else(|| failed("导入项目文件需要已配置的操作者工作区"))?;
+                let path = Path::new(source);
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    root.join(path)
+                }
+            } else {
+                self.resolve(input)?
+            };
+            if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+                return Err(failed("只能交付普通文件，不能发送目录、链接或设备"));
+            }
+            Ok(())
+        }
+    }
+    fn delivery_status(
+        &self,
+        id: &str,
+        context: &ToolExecutionContext,
+    ) -> Result<Value, ToolExecutionError> {
+        let scope = context
+            .scope()
+            .ok_or_else(|| failed("文件回执查询需要可信会话"))?;
+        let inner = self.inner.lock().map_err(|_| failed("文件队列锁不可用"))?;
+        let record = inner
+            .ledger
+            .records
+            .iter()
+            .find(|r| r.id == id && r.session_id == scope.session_id && r.user_id == scope.user_id)
+            .ok_or_else(|| failed("当前会话没有这条文件投递记录"))?;
+        let sent = record.state == State::Sent && record.platform_message_id.is_some();
+        Ok(
+            json!({"id":record.id,"session_id":record.session_id,"message_id":record.platform_message_id,"state":record.state,"sent":sent,"queued":record.state==State::Pending,"retry_allowed":false}),
+        )
+    }
     fn result_of(&self, id: &str) -> Option<State> {
         let inner = self.inner.lock().ok()?;
         inner
@@ -317,8 +391,24 @@ impl QqFileDelivery for Outbox {
         let Some(record) = next.records.iter_mut().find(|record| record.id == id) else {
             return Err(state("文件队列里没有这条记录"));
         };
+        if record.state != State::Sending {
+            return Err(state("文件投递没有在途尝试；保留已有回执"));
+        }
+        record.platform_message_id = match &result {
+            QqFileResult::Sent {
+                platform_message_id,
+            } => platform_message_id.clone().filter(|id| {
+                !id.is_empty()
+                    && id.trim() == id
+                    && id.len() <= 253
+                    && !id.chars().any(char::is_control)
+            }),
+            _ => None,
+        };
         record.state = match result {
-            QqFileResult::Sent { .. } => State::Sent,
+            QqFileResult::Sent { .. } if record.platform_message_id.is_some() => State::Sent,
+            QqFileResult::Sent { .. } => State::Unknown,
+            QqFileResult::Unknown => State::Unknown,
             QqFileResult::Failed { .. } | QqFileResult::NotSent => State::Failed,
         };
         self.persist(&next).map_err(|_| state("文件队列保存失败"))?;
@@ -571,7 +661,7 @@ impl Tool for SendFileTool {
         ToolDefinition {
             name: SEND_TOOL.into(),
             description: format!(
-                "把现有文件交付到当前会话。path 可为产物路径，宿主自动复制到发件目录并处理重名；name 是可选交付名。只给 name 时兼容发件目录文件名。普通成员只能交付自己项目的文件（相对路径或 /work/ 路径），不能读取宿主或其他成员。排队成功不等于送达；caption 最多 {QQ_FILE_CAPTION_MAX_BYTES} 字节。"
+                "把现有文件交付到当前会话。path 可为产物路径，宿主自动复制到发件目录并处理重名；name 是可选交付名。只给 name 时兼容发件目录文件名。普通成员只能交付自己项目的文件（相对路径或 /work/ 路径），不能读取宿主或其他成员。排队成功不等于送达；随后调用 query_file_delivery(id) 查询真实状态，只有 sent=true 且有 message_id/session_id 才确认送达；Unknown 不自动重发。caption 最多 {QQ_FILE_CAPTION_MAX_BYTES} 字节。"
             ),
             argument_schema: json!({
                 "type": "object",
@@ -714,11 +804,49 @@ impl Tool for SendFileTool {
             let _ = self.outbox.result_of(&id);
             Ok(json!({
                 "queued": true,
+                "sent": false,
+                "state": "Pending",
+                "message_id": null,
+                "session_id": session.session_id,
                 "id": id,
                 "name": output_name,
                 "imported": true,
                 "note": "已排进待发队列，通道会在空闲时上传。现在还没有发出；只有上传成功才算送达。"
             }))
+        })
+    }
+}
+
+/// 当前会话的只读投递凭据，不把队列准入当成平台送达。
+pub(crate) struct FileDeliveryStatusTool(pub std::sync::Arc<Outbox>);
+impl Tool for FileDeliveryStatusTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition { name:"query_file_delivery".into(), description:"按 send_file 返回的 id 查询当前会话的真实投递状态及 message_id/session_id。Pending/Sending 仍在等待；Sent 且 message_id 非空才确认送达；Unknown 说明是否送达未知，不得重发。查询不上传、不复制文件，不改变执行循环；可先做独立工作后再查询。".into(), argument_schema:json!({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"],"additionalProperties":false}), required_permissions:vec![], concurrency:None }
+    }
+    fn validate_arguments(&self, arguments: &Value) -> Result<(), ToolValidationError> {
+        if arguments.as_object().is_none_or(|o| o.len() != 1)
+            || arguments
+                .get("id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| {
+                    !id.starts_with("file-") || id.len() > 64 || id.chars().any(char::is_control)
+                })
+        {
+            return Err(ToolValidationError {
+                message: "需要 send_file 返回的文件投递 id".into(),
+            });
+        }
+        Ok(())
+    }
+    fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
+        Box::pin(async move {
+            self.0.delivery_status(
+                call.arguments
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| failed("缺少文件投递 id"))?,
+                &context,
+            )
         })
     }
 }
@@ -1253,11 +1381,83 @@ mod tests {
             .delivered(
                 &taken.id,
                 QqFileResult::Sent {
-                    platform_message_id: None,
+                    platform_message_id: Some("platform-file-1".into()),
                 },
             )
             .expect("delivered");
         assert_eq!(outbox.result_of("file-1"), Some(State::Sent));
+    }
+
+    #[test]
+    fn delivery_status_requires_same_scope_and_persists_actual_platform_id() {
+        let (directory, outbox) = outbox();
+        fs::write(directory.path().join("files/a.txt"), b"x").unwrap();
+        let session = SessionKey::new("qq:s", "qq:u").unwrap();
+        let context = ToolExecutionContext::new().with_scope(Some(eve_llm_api::ContextScope {
+            session_id: session.session_id.clone(),
+            user_id: session.user_id.clone(),
+        }));
+        let id = outbox
+            .enqueue(&session, outbox.resolve("a.txt").unwrap(), None, None)
+            .unwrap();
+        let pending = outbox.delivery_status(&id, &context).unwrap();
+        assert_eq!(pending["state"], "Pending");
+        assert_eq!(pending["sent"], false);
+        assert!(pending["message_id"].is_null());
+        outbox.next_file().unwrap().unwrap();
+        outbox
+            .delivered(
+                &id,
+                QqFileResult::Sent {
+                    platform_message_id: Some("real-platform-id".into()),
+                },
+            )
+            .unwrap();
+        let sent = outbox.delivery_status(&id, &context).unwrap();
+        assert_eq!(sent["sent"], true);
+        assert_eq!(sent["message_id"], "real-platform-id");
+        assert_eq!(sent["session_id"], "qq:s");
+        let foreign = ToolExecutionContext::new().with_scope(Some(eve_llm_api::ContextScope {
+            session_id: "qq:other".into(),
+            user_id: "qq:u".into(),
+        }));
+        assert!(outbox.delivery_status(&id, &foreign).is_err());
+        drop(outbox);
+        let reopened = Outbox::open(directory.path().to_path_buf()).unwrap();
+        assert_eq!(reopened.delivery_status(&id, &context).unwrap(), sent);
+        assert!(reopened.next_file().unwrap().is_none());
+    }
+
+    #[test]
+    fn accepted_without_platform_id_is_unknown_and_legacy_ledger_still_opens() {
+        let (directory, outbox) = outbox();
+        fs::write(directory.path().join("files/a.txt"), b"x").unwrap();
+        let session = SessionKey::new("qq:s", "qq:u").unwrap();
+        let id = outbox
+            .enqueue(&session, outbox.resolve("a.txt").unwrap(), None, None)
+            .unwrap();
+        outbox.next_file().unwrap().unwrap();
+        outbox
+            .delivered(
+                &id,
+                QqFileResult::Sent {
+                    platform_message_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(outbox.result_of(&id), Some(State::Unknown));
+        drop(outbox);
+        let path = directory.path().join("ledger.json");
+        let mut legacy: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        legacy["records"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("platform_message_id");
+        legacy["records"][0]["state"] = json!("Sent");
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let reopened = Outbox::open(directory.path().to_path_buf()).unwrap();
+        assert_eq!(reopened.result_of(&id), Some(State::Unknown));
+        assert!(reopened.next_file().unwrap().is_none());
     }
 
     #[test]

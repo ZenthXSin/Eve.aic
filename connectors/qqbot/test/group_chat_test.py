@@ -2,6 +2,7 @@
 
 模型与 QQ 都是本地替身；真实平台的全量事件权限及主动发送配额另行观察。
 """
+from fixture_auth import configure_fixture_progress
 import json
 from contextlib import closing
 import sqlite3
@@ -154,7 +155,7 @@ export class QQBot {
         env.update(QQBOT_APP_SECRET='test-app-secret',QQBOT_APP_ID='1904159860',EVE_OPENAI_API_KEY='test-model-secret',
                    EVE_OPENAI_BASE_URL=f'http://127.0.0.1:{self.server.server_port}',EVE_OPENAI_PROTOCOL='chat',EVE_LLM_RESPONSE_MODE='complete',EVE_DEBOUNCE_MS='0')
         child=subprocess.Popen([str(reminder_test.BINARY),'--group-chat','--training','--state-dir',str(self.work/'state'),
-            '--agent',str(source.parents[1]/'AGENT.md'),'--bridge-script',str(root/'bridge.mjs')],env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            '--agent',str(source.parents[1]/'AGENT.md'),'--bridge-script',str(root/'bridge.mjs')],env=configure_fixture_progress(env),text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         try:
             self.wait_for(lambda:child.poll() is not None or (record.exists() and len(record.read_text().splitlines())>=2),'生产 Node 链路没有发送两条回复',20)
             if child.poll() is not None:

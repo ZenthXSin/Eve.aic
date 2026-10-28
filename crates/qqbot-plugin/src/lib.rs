@@ -9,11 +9,13 @@ pub use live::LiveDialogue;
 mod observer;
 mod outreach;
 mod participants;
+mod progress;
+pub use progress::{ModelProgressNarrator, QqProgressFacts, QqProgressNarrator};
 mod state;
 
 pub use archive::{QqArchivedReceipt, QqReceiptArchive, read_archived_receipt};
 pub use commands::{QqCommandHandler, QqCommandInput};
-pub use conversations::{QqConversationIdentity, QqConversations, QqWakeupLease};
+pub use conversations::{QqConversationIdentity, QqConversations, QqTurnAnchor, QqWakeupLease};
 pub use files::{
     QQ_FILE_CAPTION_MAX_BYTES, QQ_FILE_NAME_MAX_BYTES, QQ_FILE_PATH_MAX_BYTES, QqFileDelivery,
     QqFileMessage, QqFileResult, QqRawMessage, QqRawMessageObserver, valid_caption, valid_name,
@@ -178,6 +180,7 @@ pub struct QqBotPlugin {
     participant_observer: Option<Arc<dyn QqParticipantObserver>>,
     timing_diagnostics: bool,
     slow_progress: Option<Arc<dyn QqSlowProgress>>,
+    progress_narrator: Option<Arc<dyn QqProgressNarrator>>,
     debounce: Option<Arc<dyn QqDebounce>>,
     stickers: Option<Arc<dyn QqStickers>>,
     failure_recovery: Option<Arc<dyn QqFailureRecovery>>,
@@ -219,6 +222,7 @@ impl QqBotPlugin {
             participant_observer: None,
             timing_diagnostics: false,
             slow_progress: None,
+            progress_narrator: None,
             debounce: None,
             stickers: None,
             failure_recovery: None,
@@ -335,6 +339,12 @@ impl QqBotPlugin {
     /// 开启慢步骤进度；与工具里程碑进度共用每轮至多 3 条进度和被动回复配额。未接线时不发。
     pub fn with_slow_progress(mut self, policy: Arc<dyn QqSlowProgress>) -> Self {
         self.slow_progress = Some(policy);
+        self
+    }
+
+    /// 进度由模型按真实事实自由生成；未接线或生成失败时不发送自动进度。
+    pub fn with_progress_narrator(mut self, narrator: Arc<dyn QqProgressNarrator>) -> Self {
+        self.progress_narrator = Some(narrator);
         self
     }
 
@@ -463,6 +473,7 @@ impl Plugin for QqBotPlugin {
             let group_observer = self.group_observer.clone();
             let timing_diagnostics = self.timing_diagnostics;
             let slow_progress = self.slow_progress.clone();
+            let progress_narrator = self.progress_narrator.clone();
             let debounce = self.debounce.clone();
             let stickers = self.stickers.clone();
             let failure_recovery = self.failure_recovery.clone();
@@ -490,6 +501,7 @@ impl Plugin for QqBotPlugin {
                     let participant_observer = participant_observer.clone();
                     let group_observer = group_observer.clone();
                     let slow_progress = slow_progress.clone();
+                    let progress_narrator = progress_narrator.clone();
                     let debounce = debounce.clone();
                     let stickers = stickers.clone();
                     let failure_recovery = failure_recovery.clone();
@@ -522,6 +534,7 @@ impl Plugin for QqBotPlugin {
                                 group_observer,
                                 timing_diagnostics,
                                 slow_progress,
+                                progress_narrator,
                                 debounce,
                                 stickers,
                                 failure_recovery,

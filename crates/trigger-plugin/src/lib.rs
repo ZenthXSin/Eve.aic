@@ -30,7 +30,7 @@ pub struct TriggerController(Arc<Mutex<Option<Inner>>>);
 fn valid(ledger: &Ledger) -> bool {
     let mut ids = BTreeSet::new();
     let mut sources = BTreeSet::new();
-    ledger.format_version == 1
+    matches!(ledger.format_version, 1 | 2)
         && ledger.triggers.len() <= MAX_TRIGGERS
         && ledger.triggers.iter().all(|t| {
             let expected = identifier(&t.owner, &t.source);
@@ -39,6 +39,11 @@ fn valid(ledger: &Ledger) -> bool {
                 && sources.insert((&t.owner.session_id, &t.owner.user_id, &t.source))
                 && t.owner.validate().is_ok()
                 && t.spec.valid()
+                && (ledger.format_version != 1
+                    || (t.spec.recurrence.is_none()
+                        && t.spec.resume_task_id.is_none()
+                        && t.runs == 0))
+                && t.runs <= t.spec.recurrence.as_ref().map_or(1, |r| r.max_runs)
                 && !t.source.is_empty()
                 && t.source.len() <= 256
                 && t.created_at_ms > 0
@@ -49,7 +54,11 @@ fn valid(ledger: &Ledger) -> bool {
                     .as_ref()
                     .is_none_or(|s| s.len() <= 32768 && !s.trim().is_empty())
                 && (t.status != Status::Completed || t.result.is_some())
-                && (t.delivery.is_none() || t.status == Status::Completed)
+                && (t.delivery.is_none()
+                    || matches!(
+                        t.status,
+                        Status::Completed | Status::Failed | Status::Interrupted
+                    ))
                 && (t.status != Status::Completed || t.delivery.is_some())
         })
 }
@@ -71,6 +80,7 @@ impl TriggerController {
             .filter(|i| i.available)
             .ok_or(TriggerError::Unavailable)?;
         let mut next = inner.ledger.clone();
+        next.format_version = 2;
         let result = f(&mut next)?;
         if !valid(&next) {
             return Err(TriggerError::Invalid);
@@ -85,6 +95,38 @@ impl TriggerController {
         }
         inner.ledger = next;
         Ok(result)
+    }
+}
+impl TriggerController {
+    fn delivery_inner(
+        &self,
+        id: &str,
+        run: Option<u32>,
+        from: Delivery,
+        to: Delivery,
+    ) -> Result<()> {
+        self.change(|l| {
+            let t = l
+                .triggers
+                .iter_mut()
+                .find(|t| t.id == id)
+                .ok_or(TriggerError::NotFound)?;
+            if run.is_some_and(|run| t.runs != run)
+                || t.delivery != Some(from)
+                || !matches!(
+                    (from, to),
+                    (Delivery::Pending, Delivery::Sending | Delivery::Failed)
+                        | (
+                            Delivery::Sending,
+                            Delivery::Sent | Delivery::Failed | Delivery::Unknown
+                        )
+                )
+            {
+                return Err(TriggerError::Transition);
+            }
+            t.delivery = Some(to);
+            Ok(())
+        })
     }
 }
 impl TriggerAdmin for TriggerController {
@@ -109,6 +151,8 @@ impl TriggerAdmin for TriggerController {
             || source.is_empty()
             || source.len() > 256
             || !spec.valid()
+            // 截止瞬间无法保证被扫描观察到，拒绝不可达的同刻时间条件。
+            || spec.conditions.iter().any(|c| matches!(c, Condition::Time { at_ms } if *at_ms >= spec.expires_at_ms))
             || now == 0
             || spec.expires_at_ms <= now
             || spec.expires_at_ms.saturating_sub(now) > 90 * 86_400_000
@@ -149,6 +193,7 @@ impl TriggerAdmin for TriggerController {
                 evidence: vec![],
                 result: None,
                 delivery: None,
+                runs: 0,
             };
             l.triggers.push(t.clone());
             Ok(t)
@@ -193,9 +238,45 @@ impl TriggerAdmin for TriggerController {
             }
             t.status = to;
             t.result = result;
-            if to == Status::Completed {
+            if to == Status::Running {
+                t.runs = t.runs.checked_add(1).ok_or(TriggerError::Limit)?;
+            }
+            // Busy 表示未准入，不消耗周期预算。
+            if from == Status::Running && to == Status::Ready {
+                t.runs = t.runs.saturating_sub(1);
+            }
+            if matches!(to, Status::Completed | Status::Failed | Status::Interrupted)
+                && t.result.is_some()
+            {
                 t.delivery = Some(Delivery::Pending);
             }
+            Ok(())
+        })
+    }
+    fn rearm(&self, id: &str, now: u64) -> Result<()> {
+        self.change(|l| {
+            let t = l
+                .triggers
+                .iter_mut()
+                .find(|t| t.id == id)
+                .ok_or(TriggerError::NotFound)?;
+            let r = t.spec.recurrence.as_ref().ok_or(TriggerError::Transition)?;
+            if t.status != Status::Completed
+                || !matches!(t.delivery, Some(Delivery::Sent | Delivery::Failed))
+                || t.runs >= r.max_runs
+            {
+                return Err(TriggerError::Transition);
+            }
+            let at_ms = now
+                .checked_add(r.interval_ms)
+                .ok_or(TriggerError::Invalid)?;
+            if at_ms >= t.spec.expires_at_ms {
+                return Err(TriggerError::Transition);
+            }
+            t.spec.conditions = vec![Condition::Time { at_ms }];
+            t.status = Status::Armed;
+            t.delivery = None;
+            t.evidence.clear();
             Ok(())
         })
     }
@@ -214,27 +295,10 @@ impl TriggerAdmin for TriggerController {
         })
     }
     fn delivery(&self, id: &str, from: Delivery, to: Delivery) -> Result<()> {
-        self.change(|l| {
-            let t = l
-                .triggers
-                .iter_mut()
-                .find(|t| t.id == id)
-                .ok_or(TriggerError::NotFound)?;
-            if t.delivery != Some(from)
-                || !matches!(
-                    (from, to),
-                    (Delivery::Pending, Delivery::Sending | Delivery::Failed)
-                        | (
-                            Delivery::Sending,
-                            Delivery::Sent | Delivery::Failed | Delivery::Unknown
-                        )
-                )
-            {
-                return Err(TriggerError::Transition);
-            }
-            t.delivery = Some(to);
-            Ok(())
-        })
+        self.delivery_inner(id, None, from, to)
+    }
+    fn delivery_for_run(&self, id: &str, run: u32, from: Delivery, to: Delivery) -> Result<()> {
+        self.delivery_inner(id, Some(run), from, to)
     }
 }
 pub struct TriggerPlugin {
@@ -262,7 +326,7 @@ impl Plugin for TriggerPlugin {
             let bytes = context.state_get(STATE_KEY)?;
             let mut ledger = match bytes {
                 None => Ledger {
-                    format_version: 1,
+                    format_version: 2,
                     triggers: vec![],
                 },
                 Some(bytes) if bytes.len() <= MAX_BYTES => {
@@ -274,10 +338,13 @@ impl Plugin for TriggerPlugin {
             if !valid(&ledger) {
                 return Err(fail());
             }
-            let mut changed = false;
+            let mut changed = ledger.format_version != 2;
+            ledger.format_version = 2;
             for t in &mut ledger.triggers {
                 if t.status == Status::Running {
                     t.status = Status::Interrupted;
+                    t.result = Some(serde_json::json!({"kind":"trigger_failure","stage":"restart","trigger_id":t.id,"execution":"unknown","replay_safe":false,"reason":"执行中进程退出，未自动重放"}).to_string());
+                    t.delivery = Some(Delivery::Pending);
                     changed = true;
                 }
                 if t.delivery == Some(Delivery::Sending) {

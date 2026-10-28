@@ -4,6 +4,7 @@
 最后按工具结果作答；--max-tool-rounds 放宽单轮工具批次，用尽时不再提供工具、让模型收尾作答而不是失败。资料目录无效时在连接 QQ 之前拒绝启动。
 确定性替身只证明宿主契约与工具往返，不代表真实模型会主动查证。
 """
+from fixture_auth import configure_fixture_progress
 import json
 import os
 import subprocess
@@ -166,7 +167,7 @@ class ReferenceAcceptance(unittest.TestCase):
             result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "state"), "--agent",
                                      str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE), "--bridge-arg",
                                      str(scenario), "--reference", reference],
-                                    env=env, capture_output=True, text=True, timeout=30)
+                                    env=configure_fixture_progress(env), capture_output=True, text=True, timeout=30)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(expected, result.stderr)
             self.assertFalse(self.requests, "启动失败前不能请求模型")
