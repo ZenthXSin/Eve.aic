@@ -211,12 +211,16 @@ pub(crate) struct Background {
     task: JoinHandle<()>,
 }
 impl Background {
-    pub(crate) fn start(stickers: Arc<Stickers>, reviewer: Arc<dyn StickerReviewer>) -> Self {
+    pub(crate) fn start(
+        stickers: Arc<Stickers>,
+        reviewer: Arc<dyn StickerReviewer>,
+        budget: crate::qq_budget::Gate,
+    ) -> Self {
         let (active, activated) = watch::channel(false);
         let (stop, stopped) = watch::channel(false);
         let (finished_sender, finished) = watch::channel(false);
         let task = tokio::spawn(async move {
-            run(stickers, reviewer, activated, stopped).await;
+            run(stickers, reviewer, budget, activated, stopped).await;
             let _ = finished_sender.send(true);
         });
         Self {
@@ -261,6 +265,7 @@ fn report(outcome: &str, id: &str, detail: Value) {
 async fn run(
     stickers: Arc<Stickers>,
     reviewer: Arc<dyn StickerReviewer>,
+    budget: crate::qq_budget::Gate,
     mut active: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
 ) {
@@ -276,7 +281,18 @@ async fn run(
     }
     loop {
         let mut pause = POLL;
-        if stickers.enabled("collect") {
+        if stickers.enabled("collect")
+            && match budget.admits_category(MODEL_USE, 1) {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    eprintln!(
+                        "EVE_BACKGROUND_BUDGET {}",
+                        json!({"category": MODEL_USE, "outcome": "unavailable", "error": error.to_string()})
+                    );
+                    return;
+                }
+            }
+        {
             match stickers.library.next_pending() {
                 Ok(Some((id, image))) => {
                     let request = reviewer.review(image);

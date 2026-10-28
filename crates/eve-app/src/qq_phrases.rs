@@ -73,12 +73,13 @@ impl Background {
         training: Arc<dyn TrainingService>,
         learner: Arc<dyn PhraseLearner>,
         policy: Arc<Policy>,
+        budget: crate::qq_budget::Gate,
     ) -> Self {
         let (active, activated) = watch::channel(false);
         let (stop, stopped) = watch::channel(false);
         let (finished_sender, finished) = watch::channel(false);
         let task = tokio::spawn(async move {
-            run(training, learner, policy, activated, stopped).await;
+            run(training, learner, policy, budget, activated, stopped).await;
             let _ = finished_sender.send(true);
         });
         Self {
@@ -117,6 +118,7 @@ async fn run(
     training: Arc<dyn TrainingService>,
     learner: Arc<dyn PhraseLearner>,
     policy: Arc<Policy>,
+    budget: crate::qq_budget::Gate,
     mut active: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
 ) {
@@ -132,7 +134,18 @@ async fn run(
     }
     loop {
         let mut pause = POLL;
-        if policy.learning() {
+        if policy.learning()
+            && match budget.admits_category(MODEL_USE, 1) {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    eprintln!(
+                        "EVE_BACKGROUND_BUDGET {}",
+                        json!({"category": MODEL_USE, "outcome": "unavailable", "error": error.to_string()})
+                    );
+                    return;
+                }
+            }
+        {
             match training.take_phrase_batch(now_ms()) {
                 Ok(Some(batch)) => {
                     let request = learner.learn(batch.clone());

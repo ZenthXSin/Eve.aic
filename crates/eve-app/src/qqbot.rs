@@ -2345,9 +2345,10 @@ async fn run_qqbot_composed(
         if let Some(stickers) = &stickers {
             sticker_background = Some(crate::qq_stickers::Background::start(
                 stickers.clone(),
-                Arc::new(eve_sticker_plugin::ModelStickerReviewer::new(observed(
+                Arc::new(eve_sticker_plugin::ModelStickerReviewer::new(budgeted(
                     crate::qq_stickers::MODEL_USE,
                 )?)),
+                budget_gate.clone(),
             ));
         }
         // 人物印象：此人谈及自己的原话攒够一批后学习一次；用途 impression 单独记健康与输出上限。
@@ -2356,12 +2357,13 @@ async fn run_qqbot_composed(
             .set(qq_tasks::config_service(registry.as_ref())?);
         impression_background = Some(crate::qq_impressions::Background::start(
             people.clone(),
-            Arc::new(eve_people_plugin::ModelImpressionLearner::new(observed(
+            Arc::new(eve_people_plugin::ModelImpressionLearner::new(budgeted(
                 crate::qq_impressions::MODEL_USE,
             )?)),
             impression_policy.clone(),
+            budget_gate.clone(),
             crate::qq_impressions::Profiles {
-                consolidator: Arc::new(eve_people_plugin::ModelProfileConsolidator::new(observed(
+                consolidator: Arc::new(eve_people_plugin::ModelProfileConsolidator::new(budgeted(
                     crate::qq_impressions::MODEL_USE,
                 )?)),
                 queue: profile_queue.clone(),
@@ -2373,10 +2375,11 @@ async fn run_qqbot_composed(
             .set(qq_tasks::config_service(registry.as_ref())?);
         phrase_background = Some(crate::qq_phrases::Background::start(
             training.0.clone(),
-            Arc::new(eve_training_plugin::ModelPhraseLearner::new(observed(
+            Arc::new(eve_training_plugin::ModelPhraseLearner::new(budgeted(
                 crate::qq_phrases::MODEL_USE,
             )?)),
             phrase_policy.clone(),
+            budget_gate.clone(),
         ));
         // 后台任务与子代理共用执行器：用途 task 单独记健康与输出上限，不计入自主运行预算。
         if tasks.is_some() || options.subagents {
