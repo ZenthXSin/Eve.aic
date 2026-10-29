@@ -261,16 +261,18 @@ def delivery_documents(state_path, inherited=frozenset()):
         if sticker is not None and (receipts['version'] not in (5, 6, 7, 8) or not isinstance(sticker, dict)
                                     or set(sticker) != {'path', 'state'}
                                     or not isinstance(sticker['path'], str) or not sticker['path']
-                                    or sticker['state'] not in ('Pending', 'Sending', 'Sent', 'Failed', 'Skipped')):
+                                    or sticker['state'] not in ('Pending', 'Sending', 'Sent', 'Failed', 'Skipped', 'Unknown')):
             raise ValueError('invalid_sticker_ledger')
         if sticker_in_flight(receipt) and receipt_fingerprint(receipt) not in inherited:
             settled = False
         for part in progress:
-            if (not isinstance(part, dict) or set(part) not in ({'text', 'state'}, {'text', 'state', 'proactive'})
+            if (not isinstance(part, dict) or not {'text', 'state'} <= set(part)
+                    or not set(part) <= {'text', 'state', 'proactive', 'necessary'}
+                    or ('necessary' in part and part['necessary'] is not True)
                     or ('proactive' in part and (receipts['version'] != 8 or part['proactive'] is not True))
                     or not isinstance(part['text'], str) or not part['text'].strip()
                     or len(part['text'].encode()) > 1024
-                    or part['state'] not in ('Sending', 'Sent', 'Failed')):
+                    or part['state'] not in ('Sending', 'Sent', 'Failed', 'Unknown')):
                 raise ValueError('invalid_progress_ledger')
             if part['state'] == 'Sending' and receipt_fingerprint(receipt) not in inherited:
                 settled = False
