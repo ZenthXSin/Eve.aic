@@ -33,4 +33,4 @@ class IdleChatAcceptance(OutreachAcceptance):
         self.assertEqual(self.ledger(),before)
         self.assertEqual(len(self.pushes()),1,'重启不得重发')
 
-if __name__=='__main__': unittest.main()
+if __name__=='__main__': unittest.main(defaultTest='IdleChatAcceptance', verbosity=2)
