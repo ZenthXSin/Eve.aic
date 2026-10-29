@@ -145,7 +145,13 @@ def validate_candidate(request, candidates):
             or any(check.get('success') is not True for check in manifest['checks'])):
         raise ValueError('candidate_not_verified')
     binary = directory / ('eve-qqbot.exe' if os.name == 'nt' else 'eve-qqbot')
-    if Path(manifest['candidate_path']) != binary or digest(binary) != manifest['binary_sha256']:
+    declared_binary = Path(manifest['candidate_path'])
+    # /data -> /srv/... 等宿主目录别名可以指向同一个候选；只规范化父目录，
+    # 仍拒绝最终文件符号链接、不同文件名和候选根目录外的文件。
+    if (not declared_binary.is_absolute() or declared_binary.is_symlink()
+            or declared_binary.name != binary.name
+            or declared_binary.parent.resolve() != binary.parent.resolve()
+            or digest(binary) != manifest['binary_sha256']):
         raise ValueError('candidate_binary_changed')
     resources = manifest['resources']
     if not isinstance(resources, dict) or len(resources) > 10000:

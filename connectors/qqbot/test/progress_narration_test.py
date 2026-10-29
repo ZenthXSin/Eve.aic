@@ -32,7 +32,7 @@ class ProgressNarrationAcceptance(developer.DeveloperAcceptance):
             if facts['phase'] == 'start':
                 return dialogue.text_response('先核对这两步的实际结果。')
             if facts['phase'] == 'waiting':
-                return dialogue.text_response('' if facts['group'] else '这一步还在等待结果，我会继续核对。')
+                return dialogue.text_response('NO_PROGRESS' if facts['group'] else '这一步还在等待结果，我会继续核对。')
             return dialogue.text_response('第一步的回执已拿到，继续检查后面的结果。')
         return super().provider_response(body, kind, fallback)
 
@@ -77,6 +77,45 @@ class ProgressNarrationAcceptance(developer.DeveloperAcceptance):
         self.assertTrue(any(not f['group'] for f in self.narrations))
         self.assertEqual(self.receipt('private')['state'], 'Sent')
         self.assertEqual(self.receipt('group')['state'], 'Sent')
+
+    def test_private_ack_does_not_wait_for_a_blocked_progress_model(self):
+        self.response_gates[('progress', 1)] = 'release-progress'
+        def respond(body):
+            if not any(m["role"] == "tool" for m in body["messages"]):
+                return dialogue.tool_response([('run_command', {'program': sys.executable,
+                    'args': ['-c', 'import time; time.sleep(3)']})])
+            return dialogue.text_response('原任务已完成')
+        self.callback = respond
+        self.run_progress([{'send': self.message('running', '执行检查', expected='原任务已完成')},
+                           {'wait_file': str(self.arrived('progress', 1))},
+                           {'send': self.message('followup', '人呢', contains='已把这条消息加入原任务')},
+                           self.wait_receipt('followup'),
+                           {'touch': str(self.gate('release-progress'))}, self.wait_receipt('running')],
+                          env_extra={'EVE_QQ_LIVE_INTERACTION': 'true'})
+        self.assertEqual(self.receipt('followup')['state'], 'Sent')
+        sessions = self.documents()['eve.session']['sessions.v1']['sessions']
+        self.assertEqual(sum(len(s['turns']) for s in sessions.values()), 1)
+
+    def test_invalid_narration_uses_bounded_host_status_and_final_still_arrives(self):
+        original = self.provider_response
+        def broken(body, kind, fallback):
+            if kind == 'progress':
+                return dialogue.text_response('')
+            return original(body, kind, fallback)
+        self.provider_response = broken
+        def respond(body):
+            if not self.results(body):
+                return dialogue.tool_response([('run_command', {'program': sys.executable,
+                    'args': ['-c', 'import time; time.sleep(2.2)']})])
+            return dialogue.text_response('工具执行完成')
+        self.callback = respond
+        self.run_progress(self.send(self.message('fallback', '执行检查', expected='工具执行完成')))
+        texts = [e['text'] for e in self.progress('fallback')]
+        self.assertTrue(texts)
+        self.assertEqual(len(texts), len(set(texts)))
+        self.assertTrue(all(t in ['任务已进入工具执行阶段，完成后会返回结果。',
+                                '任务仍在执行，当前步骤还没有返回结果。'] for t in texts))
+        self.assertEqual(self.receipt('fallback')['state'], 'Sent')
 
     def test_live_question_returns_platform_and_session_ids_and_does_not_end_task(self):
         def respond(body):
