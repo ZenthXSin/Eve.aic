@@ -160,6 +160,31 @@ while True:
         save()
         with self.assertRaisesRegex(ValueError,'invalid_progress_ledger'):runtime.delivery_gate(path,request)
 
+    def test_unknown_and_necessary_progress_remain_readable_without_replay(self):
+        path = self.state / 'state.json'
+        state = runtime.read_json(path)
+        ledger = json.loads(bytes(state['entries']['eve.channel.qqbot']['receipts.v1']))
+        ledger['version'] = 8
+        ledger['entries'][0]['message']['id'] = 'necessary-progress'
+        ledger['entries'][0]['progress'] = [{'text': '必要追问', 'state': 'Unknown',
+                                             'proactive': True, 'necessary': True}]
+        request = {'session_id': self.session, 'requested_by': self.session, 'turn_id': 1}
+        def save():
+            state['entries']['eve.channel.qqbot']['receipts.v1'] = list(json.dumps(ledger).encode())
+            runtime.atomic(path, state)
+        save()
+        before = path.read_bytes()
+        self.assertTrue(runtime.delivery_gate(path, request))
+        self.assertTrue(runtime.runtime_idle_gate(path))
+        self.assertEqual(path.read_bytes(), before)
+        ledger['entries'][0]['progress'][0]['state'] = 'Sending'
+        save()
+        self.assertFalse(runtime.runtime_idle_gate(path))
+        ledger['entries'][0]['progress'][0]['necessary'] = 'true'
+        save()
+        with self.assertRaisesRegex(ValueError, 'invalid_progress_ledger'):
+            runtime.delivery_gate(path, request)
+
     def test_proactive_progress_v8_blocks_switch_until_delivery_is_settled(self):
         self.write_state('Completed','Sent');path=self.state/'state.json'
         state=runtime.read_json(path)
