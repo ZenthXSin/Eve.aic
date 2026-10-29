@@ -27,6 +27,8 @@ pub struct QqConversationIdentity {
     pub session: SessionKey,
     pub app_id: String,
     pub subject: String,
+    /// The platform-verified sender ID; retained for context anchoring.
+    pub user_id: String,
     pub conversation: String,
     pub source: QqInteractionSource,
 }
@@ -142,6 +144,7 @@ impl QqConversations {
             session: session.clone(),
             app_id: app.into(),
             subject,
+            user_id: message.user_id.clone(),
             conversation: message.conversation_key(app)?,
             source: match message.scope.as_str() {
                 "c2c" => QqInteractionSource::DirectMessage,
