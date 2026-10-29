@@ -207,10 +207,10 @@ impl QqGroupAccess for GroupAccess {
     ) -> PluginResult<()> {
         // 群号来自通道校验过的消息；格式再核一次，异常一律不登记。
         if group_id.is_empty()
-            || group_id.len() > 64
+            || group_id.len() > 128
             || !group_id
                 .bytes()
-                .all(|b| b.is_ascii_digit() || b == b'_' || b == b'-')
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         {
             return Ok(());
         }
@@ -444,11 +444,16 @@ mod tests {
         let session = SessionKey::new("qq:a", "qq:a").unwrap();
         assert!(access.owner_group(&session).is_none());
         access
-            .claim_owner_group(session.clone(), "qq:conv".into(), "123456".into(), 1)
+            .claim_owner_group(
+                session.clone(),
+                "qq:conv".into(),
+                "ABCDEF0123456789abcdef0123456789".into(),
+                1,
+            )
             .unwrap();
         assert_eq!(
             access.owner_group(&session).map(|g| g.group_id),
-            Some("123456".into())
+            Some("ABCDEF0123456789abcdef0123456789".into())
         );
         let other = SessionKey::new("qq:a", "qq:b").unwrap();
         assert!(access.owner_group(&other).is_none());
@@ -458,7 +463,7 @@ mod tests {
     fn invalid_group_ids_are_not_claimed() {
         let access = access();
         let session = SessionKey::new("qq:a", "qq:a").unwrap();
-        for bad in ["", "abc", "12 3", "<x>"] {
+        for bad in ["", "abc/", "12 3", "<x>"] {
             access
                 .claim_owner_group(session.clone(), "qq:conv".into(), bad.into(), 1)
                 .unwrap();

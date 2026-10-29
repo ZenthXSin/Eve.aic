@@ -11,13 +11,13 @@ fn unavailable() -> PluginError {
     PluginError::State("QQ 群白名单数据库不可用；保留原库，不重建或清空".into())
 }
 
-/// 群号或用户号只接受平台常见的数字标识；不合法一律拒绝，不写入。
+/// 群标识接受通道支持的 ASCII OpenID（字母、数字、下划线和连字符）；不合法一律拒绝，不写入。
 fn valid_identity(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 64
+        && value.len() <= 128
         && value
             .bytes()
-            .all(|b| b.is_ascii_digit() || b == b'_' || b == b'-')
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 impl SqliteGroupWhitelist {
@@ -164,11 +164,26 @@ mod tests {
     }
 
     #[test]
+    fn platform_openids_round_trip_across_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("whitelist.sqlite3");
+        let db = SqliteGroupWhitelist::open(&path).unwrap();
+        let group = "ABCDEF0123456789abcdef0123456789_-";
+        assert!(QqGroupWhitelist::add(&db, group, 1).unwrap());
+        drop(db);
+        let reopened = SqliteGroupWhitelist::open(&path).unwrap();
+        assert!(QqGroupWhitelist::contains(&reopened, group).unwrap());
+        assert!(QqGroupWhitelist::remove(&reopened, group).unwrap());
+        assert!(!QqGroupWhitelist::contains(&reopened, group).unwrap());
+        assert!(QqGroupWhitelist::add(&reopened, &"a".repeat(129), 2).is_err());
+    }
+
+    #[test]
     fn invalid_identity_is_rejected_without_touching_the_database() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("whitelist.sqlite3");
         let db = SqliteGroupWhitelist::open(&path).unwrap();
-        for bad in ["", "abc", "12 3", "１２３", "<script>"] {
+        for bad in ["", "abc/", "12 3", "１２３", "<script>"] {
             assert!(
                 QqGroupWhitelist::add(&db, bad, 1).is_err(),
                 "{bad} 应被拒绝"
