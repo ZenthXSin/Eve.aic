@@ -48,6 +48,8 @@ pub enum QqFileResult {
         http_status: Option<u16>,
         biz_code: Option<i64>,
     },
+    /// 请求已发出，但缺少可核对的平台消息编号或网络结果未知；不得自动重发。
+    Unknown,
     /// 没有写出：找不到这个会话的已确认路由、参数不合规或通道已关闭。
     NotSent,
 }
@@ -79,7 +81,7 @@ pub fn valid_caption(caption: &str) -> bool {
 pub fn valid_path(path: &str) -> bool {
     !path.is_empty()
         && path.len() <= QQ_FILE_PATH_MAX_BYTES
-        && path.starts_with('/')
+        && (path.starts_with('/') || cfg!(windows) && std::path::Path::new(path).is_absolute())
         && !path
             .chars()
             .any(|c| c.is_control() || c == '\n' || c == '\r')
@@ -113,6 +115,10 @@ mod tests {
     #[test]
     fn paths_must_be_absolute_without_control_characters() {
         assert!(valid_path("/srv/outbox/a.txt"));
+        #[cfg(windows)]
+        assert!(valid_path(r"C:\Users\runner\outbox\a.txt"));
+        #[cfg(not(windows))]
+        assert!(!valid_path(r"C:\Users\runner\outbox\a.txt"));
         assert!(!valid_path("a.txt"));
         assert!(!valid_path("./a.txt"));
         assert!(!valid_path(""));

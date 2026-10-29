@@ -18,6 +18,18 @@ spec = importlib.util.spec_from_file_location('upgrade_runtime', SCRIPT)
 runtime = importlib.util.module_from_spec(spec); spec.loader.exec_module(runtime)
 
 class DigestTests(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'Windows runner 不保证有文件符号链接权限')
+    def test_request_file_symlink_cannot_change_the_manual_request_gate(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            automatic = root / 'auto-request.json'
+            automatic.write_text('{}')
+            (root / 'request.json').symlink_to(automatic)
+            supervisor = SimpleNamespace(stopping=False, root=root)
+            with self.assertRaisesRegex(ValueError, 'invalid_json_file'):
+                runtime.Supervisor.switch(supervisor, {}, [], {})
+
     def test_state_reader_accepts_extended_receipt_storage_size(self):
         self.assertGreaterEqual(runtime.MAX_STATE_JSON, 256 * 1024 * 1024)
         # 使用空白模拟较大的宿主文档，旧 64 MiB 门禁会拒绝。
@@ -75,6 +87,8 @@ if '--spawn-child' in sys.argv:
  with (state.parent/'workers').open('a') as f:f.write(str(worker.pid)+'\\n')
 signal.signal(signal.SIGINT,lambda *_:sys.exit(0))
 if hasattr(signal,'SIGBREAK'):signal.signal(signal.SIGBREAK,lambda *_:sys.exit(0))
+if tag=='never-ready':raise SystemExit(9)
+if tag=='startup-retry' and len(events.read_text().splitlines())<3:raise SystemExit(9)
 if tag=='fail':
  data=json.loads(state.read_text());data['entries']['synthetic.candidate']={'marker':[1]}
  state.write_text(json.dumps(data));raise SystemExit(2)
@@ -185,7 +199,8 @@ while True:
             checks=[{'success':True}]*4)
         runtime.atomic(directory/'manifest.json',manifest)
         return dict(format_version=1,candidate_sha256=key,candidate_directory=str(directory),
-            session_id=self.session,requested_by=self.session,turn_id=1)
+            session_id=self.session,requested_by=self.session,turn_id=1,
+            lease=runtime.prepare_lease(directory, manifest))
 
     def merged_state(self):
         path=self.state/'state.json';state=runtime.read_json(path)
@@ -259,7 +274,7 @@ while True:
         self.assertEqual(self.events.read_text().splitlines(),['old','new'])
         self.assertEqual((self.state/'state.json').read_bytes(),before)
 
-    def launch(self):
+    def launch(self,wait_running=True):
         self.log=(self.root/'supervisor.log').open('ab')
         self.process=subprocess.Popen([sys.executable,str(SCRIPT),'--directory',str(self.queue),
             '--candidates',str(self.candidates),'--ready-timeout','3','--stop-timeout','3',
@@ -267,7 +282,7 @@ while True:
             '--restart-delay','.05','--restart-window-seconds','10','--',*self.command],env=self.env,
             stdout=self.log,stderr=self.log,
             **({'creationflags':subprocess.CREATE_NEW_PROCESS_GROUP} if os.name=='nt' else {}))
-        self.wait(lambda d:d['phase']=='running')
+        if wait_running:self.wait(lambda d:d['phase']=='running')
 
     def wait(self,predicate,timeout=10):
         end=time.monotonic()+timeout
@@ -279,6 +294,123 @@ while True:
             if self.process.poll() is not None:self.fail((self.root/'supervisor.log').read_text(errors='replace'))
             time.sleep(.02)
         self.fail('supervisor timeout: '+(self.root/'supervisor.log').read_text(errors='replace'))
+
+    def test_startup_readiness_failure_retries_with_the_same_bounded_recovery_budget(self):
+        (self.initial/'AGENT.md').write_text('startup-retry')
+        self.launch()
+        self.assertEqual(self.events.read_text().splitlines(),['startup-retry']*3)
+        history=runtime.read_json(self.queue/'recovery.json')
+        self.assertEqual(len(history['crashes']),2)
+        self.assertEqual(history['result'],'runtime_restarted_state_preserved')
+
+    def test_repeated_pre_ready_failures_stop_after_restart_budget_without_clearing_state(self):
+        (self.initial/'AGENT.md').write_text('never-ready')
+        before=(self.state/'state.json').read_bytes()
+        self.launch(wait_running=False)
+        self.assertNotEqual(self.process.wait(timeout=10),0)
+        self.assertEqual(len(self.events.read_text().splitlines()),4)
+        self.assertEqual(runtime.read_json(self.queue/'recovery.json')['result'],'restart_limit_exhausted')
+        self.assertEqual((self.state/'state.json').read_bytes(),before)
+
+    def test_manual_switch_waits_for_task_and_side_file_delivery_without_state_stamp_change(self):
+        self.launch()
+        path=self.state/'state.json';state=runtime.read_json(path)
+        state['entries']['eve.task']={'tasks.v1':list(json.dumps({'tasks':[{'status':'Running'}]}).encode())}
+        runtime.atomic(path,state)
+        request=self.candidate('new');runtime.atomic(self.queue/'request.json',request)
+        self.wait(lambda d:d['phase']=='waiting');time.sleep(.3)
+        self.assertEqual(self.events.read_text().splitlines(),['old'])
+        outbox=self.state/'qq-outbox';outbox.mkdir()
+        runtime.atomic(outbox/'ledger.json',{'format_version':1,'records':[{'state':'Sending'}]})
+        state['entries'].pop('eve.task');runtime.atomic(path,state)
+        time.sleep(.3)
+        self.assertEqual(self.events.read_text().splitlines(),['old'])
+        stamp=path.stat().st_mtime_ns
+        runtime.atomic(outbox/'ledger.json',{'format_version':1,'records':[{'state':'Sent'}]})
+        self.wait(lambda d:d['result']=='applied')
+        self.assertEqual(path.stat().st_mtime_ns,stamp)
+        self.assertEqual(self.events.read_text().splitlines(),['old','new'])
+        self.assertFalse((Path(request['candidate_directory'])/'resources/connectors/qqbot/node_modules').exists())
+
+    def test_incomplete_node_dependency_cache_is_rebuilt_without_modifying_candidate(self):
+        from types import SimpleNamespace
+        request=self.candidate('new')
+        original_modules=self.initial/'connectors/qqbot/node_modules'
+        (original_modules/'complete-module').write_text('trusted-running-runtime')
+        supervisor=SimpleNamespace(root=self.queue,options=SimpleNamespace(candidates=self.candidates),command=self.command)
+        before=(Path(request['candidate_directory'])/'manifest.json').read_bytes()
+        runtime.Supervisor.candidate_command(supervisor,request)
+        cache=self.queue/'runtime-resources'/request['candidate_sha256']
+        marker=cache/'dependencies-ready.json';self.assertTrue(marker.exists())
+        marker.unlink()
+        (cache/'qqbot/node_modules/partial-module').write_text('interrupted-copy')
+        runtime.Supervisor.candidate_command(supervisor,request)
+        self.assertFalse((cache/'qqbot/node_modules/partial-module').exists())
+        self.assertEqual((cache/'qqbot/node_modules/complete-module').read_text(),'trusted-running-runtime')
+        self.assertTrue(marker.exists())
+        self.assertEqual((Path(request['candidate_directory'])/'manifest.json').read_bytes(),before)
+        self.assertFalse((Path(request['candidate_directory'])/'resources/connectors/qqbot/node_modules').exists())
+
+    def test_manual_switch_tracks_group_sqlite_wal_without_main_state_change(self):
+        import sqlite3
+        connection=sqlite3.connect(self.state/'group-observations.sqlite3')
+        try:
+            connection.execute('PRAGMA journal_mode=WAL')
+            connection.execute('CREATE TABLE outbound(status TEXT)')
+            connection.execute("INSERT INTO outbound VALUES ('sending')");connection.commit()
+            self.launch();request=self.candidate('new');runtime.atomic(self.queue/'request.json',request)
+            self.wait(lambda d:d['phase']=='waiting');time.sleep(.3)
+            self.assertEqual(self.events.read_text().splitlines(),['old'])
+            stamp=(self.state/'state.json').stat().st_mtime_ns
+            connection.execute("UPDATE outbound SET status='sent'");connection.commit()
+            self.wait(lambda d:d['result']=='applied')
+            self.assertEqual((self.state/'state.json').stat().st_mtime_ns,stamp)
+            self.assertEqual(self.events.read_text().splitlines(),['old','new'])
+        finally:connection.close()
+
+    def test_malformed_request_is_rejected_with_minimal_evidence_and_old_process_alive(self):
+        self.launch();(self.queue/'request.json').write_text('{corrupt')
+        self.wait(lambda d:d['result']=='rejected')
+        self.assertEqual(self.events.read_text().splitlines(),['old'])
+        self.assertIsNone(runtime.read_json(self.queue/'last-failure.json')['candidate_sha256'])
+
+    def test_lease_missing_changed_expired_are_deterministic_and_do_not_stop_old_process(self):
+        self.launch();request=self.candidate('new')
+        original=json.loads(json.dumps(request))
+        for problem in ('missing','changed','expired'):
+            request=json.loads(json.dumps(original))
+            if problem=='missing':request.pop('lease')
+            elif problem=='changed':request['lease']['validation_sha256']='f'*64
+            else:
+                request['lease']['created_at_ms']-=runtime.LEASE_SECONDS*1000+1
+                request['lease']['expires_at_ms']-=runtime.LEASE_SECONDS*1000+1
+            runtime.atomic(self.queue/'request.json',request)
+            self.wait(lambda d:d['error']=='prepare_lease_'+problem)
+            evidence=runtime.read_json(self.queue/'last-failure.json')
+            self.assertEqual(evidence['error'],'prepare_lease_'+problem)
+            self.assertNotIn('session_id',evidence)
+        self.assertEqual(self.events.read_text().splitlines(),['old'])
+
+    def test_prepare_lease_is_revalidated_after_waiting_for_delivery(self):
+        self.write_state('Pending','Processing');self.launch()
+        request=self.candidate('new')
+        request['lease']['expires_at_ms']=request['lease']['created_at_ms']+500
+        runtime.atomic(self.queue/'request.json',request)
+        self.wait(lambda d:d['phase']=='waiting');time.sleep(.6)
+        self.write_state('Completed','Sent')
+        self.wait(lambda d:d['error']=='prepare_lease_expired')
+        self.assertEqual(self.events.read_text().splitlines(),['old'])
+
+    def test_backup_retention_is_bounded_without_touching_state(self):
+        from types import SimpleNamespace
+        # 使用真实目录，直接验证清理策略，不启动额外监督器。
+        backups=self.queue/'backups';backups.mkdir()
+        for number in range(5):
+            directory=backups/str(number);directory.mkdir();(directory/'state.json').write_text(str(number))
+        before=(self.state/'state.json').read_bytes()
+        runtime.Supervisor.prune_backups(SimpleNamespace(root=self.queue))
+        self.assertEqual(sorted(p.name for p in backups.iterdir()),['3','4'])
+        self.assertEqual((self.state/'state.json').read_bytes(),before)
 
     def test_actual_switch_waits_for_sent_ack_and_keeps_state_and_active_pointer(self):
         self.write_state('Pending','Processing');self.launch();request=self.candidate('new')

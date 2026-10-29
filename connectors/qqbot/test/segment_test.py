@@ -3,6 +3,7 @@
 替身模型原样回复用户正文，因此多段输入会得到同样分段的完整回复。
 停止只针对本测试创建的 Popen；时序通过桥接命令与回执握手，不靠固定延时。
 """
+from fixture_auth import configure_fixture_progress
 import hashlib
 import json
 from fixture_auth import bootstrap_test_admin
@@ -137,7 +138,7 @@ class SegmentAcceptance(unittest.TestCase):
             command.append("--memory")
         if training:
             command.append("--training")
-        child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        child = subprocess.Popen(command, env=configure_fixture_progress(env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             if terminate_at:
                 deadline = time.monotonic() + 15

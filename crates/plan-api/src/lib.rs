@@ -763,7 +763,9 @@ impl Plan {
                                 evidence.capability == step.spec.capability
                                     && step.spec.effect.satisfied_by(evidence)
                             })))
-                    || (!open && !attempt.effect_met && attempt.failure.is_none() && !last)
+                    // 只有明确允许重试的失败后才能存在下一次尝试。
+                    // 中断/取消/绑定变化不能靠改状态标签恢复为可执行历史。
+                    || (!last && !attempt.failure.is_some_and(StepFailure::retryable))
                 {
                     return Err(PlanError::InvalidInput);
                 }
@@ -773,7 +775,10 @@ impl Plan {
             }
             let last = step.attempts.last();
             let consistent = match step.status {
-                StepStatus::Pending => last.is_none_or(|a| a.failure.is_some()),
+                StepStatus::Pending => {
+                    step.attempts.len() < usize::from(step.spec.max_attempts)
+                        && last.is_none_or(|a| a.failure.is_some_and(StepFailure::retryable))
+                }
                 StepStatus::Executing => last.is_some_and(|a| a.finished_at_ms.is_none()),
                 StepStatus::Satisfied => last.is_some_and(|a| a.effect_met),
                 StepStatus::Failed => last.is_some_and(|a| a.failure.is_some()),
@@ -1561,6 +1566,38 @@ mod tests {
             .unwrap();
         assert_eq!(cancelled.status, PlanStatus::Blocked);
         assert_eq!(cancelled.step("check").unwrap().status, StepStatus::Blocked);
+    }
+
+    #[test]
+    fn restored_attempt_history_cannot_retry_terminal_failures() {
+        let mut spec = spec();
+        spec.steps[0].max_attempts = 2;
+        let mut pending = Plan::new(SUBJECT, spec, &capabilities(), 10).unwrap();
+        pending.begin_step("check", 11).unwrap();
+        pending
+            .finish_step(
+                "check",
+                StepOutcome::Failed {
+                    failure: StepFailure::CapabilityFailed,
+                    at_ms: 12,
+                },
+            )
+            .unwrap();
+        pending.validate(SUBJECT).unwrap();
+        let mut running = pending.clone();
+        running.begin_step("check", 13).unwrap();
+        running.validate(SUBJECT).unwrap();
+        for base in [pending, running] {
+            for failure in [
+                StepFailure::Interrupted,
+                StepFailure::Cancelled,
+                StepFailure::BindingChanged,
+            ] {
+                let mut invalid = base.clone();
+                invalid.steps[0].attempts[0].failure = Some(failure);
+                assert_eq!(invalid.validate(SUBJECT), Err(PlanError::InvalidInput));
+            }
+        }
     }
 
     #[test]

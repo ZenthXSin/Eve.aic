@@ -174,7 +174,9 @@ impl GroupAccess {
         if identity.source != eve_qqbot_plugin::QqInteractionSource::GroupMessage {
             return None;
         }
-        self.owners.is_owner(&session.user_id).ok()?;
+        if !self.owners.is_owner(&session.user_id).ok()? {
+            return None;
+        }
         self.group_route(&identity.conversation)
             .map(|group_id| QqOwnerGroup {
                 conversation: identity.conversation.clone(),

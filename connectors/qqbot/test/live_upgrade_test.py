@@ -1,4 +1,5 @@
 """真实 Eve→工具请求→监督器→第二个 Eve 进程，QQ 与模型均使用本地替身。"""
+from fixture_auth import configure_fixture_progress
 import hashlib
 import importlib.util
 import json
@@ -53,6 +54,9 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
         runtime.atomic(candidate/'manifest.json',dict(format_version=1,success=True,prepared=True,applied=False,
             candidate_sha256=candidate_id,candidate_path=str(target),binary_sha256=binary_sha,
             source=source,resources=resources,checks=[{'success':True}]*4))
+        manifest=runtime.read_json(candidate/'manifest.json')
+        (storage/'leases').mkdir()
+        runtime.atomic(storage/'leases'/(candidate_id+'.json'),runtime.prepare_lease(candidate,manifest))
         def respond(body):
             results=self.results(body)
             if not results:return tool_response([('apply_self_upgrade',{'candidate_sha256':candidate_id})])
@@ -76,7 +80,7 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
             '--state-dir',str(self.work/'state'),'--agent',str(ROOT/'AGENT.md'),
             '--bridge-script',str(FAKE),'--bridge-arg',str(scenario),'--memory']
         with (self.work/'stdout').open('w') as out,(self.work/'stderr').open('w') as err:
-            child=subprocess.Popen(command,env=env,stdout=out,stderr=err)
+            child=subprocess.Popen(command,env=configure_fixture_progress(env),stdout=out,stderr=err)
             try:
                 self.wait_until(lambda:(queue/'supervisor.json').exists() and
                     runtime.read_json(queue/'supervisor.json').get('result')=='applied','upgrade never applied',timeout=25)

@@ -4,20 +4,20 @@ import sys
 import time
 import unittest
 
-import developer_tools_test as developer
+import progress_narration_test as progress
 import dialogue_tools_test as dialogue
 import memory_test
 
 
-class SlowProgressAcceptance(developer.DeveloperAcceptance):
-    for name in dir(developer.DeveloperAcceptance):
+class SlowProgressAcceptance(progress.ProgressNarrationAcceptance):
+    for name in dir(progress.ProgressNarrationAcceptance):
         if name.startswith('test_'): locals()[name] = None
     del name
     receipt = memory_test.MemoryAcceptance.receipt
 
     def run_slow(self, script, after_ms='1000', **options):
         env = {'EVE_DEVELOPER_CONFIG': str(self.developer_config), 'EVE_PROGRESS_SLOW_AFTER_MS': after_ms,
-               'EVE_CONTEXT_COMPACT_AT_TOKENS': '0'}
+               'EVE_CONTEXT_COMPACT_AT_TOKENS': '0', 'EVE_PROGRESS_STAGE_UPDATES': 'false'}
         self.run_eve(script, interest=False, memory=False, research=False, practice=False,
                      env_extra=env, timeout=60, **options)
         path = self.work / f'events-{self.runs}.jsonl'
@@ -33,8 +33,8 @@ class SlowProgressAcceptance(developer.DeveloperAcceptance):
         self.callback = respond
         self.run_slow(self.send(self.message('slow', '慢慢想', expected='慢回复完成')))
         [text] = self.progress('slow')
-        self.assertIn('生成回复这一步已进行约', text)
-        self.assertIn('完成后会继续回复', text)
+        self.assertEqual(text, '这一步还在等待结果，我会继续核对。')
+        self.assertTrue(any(f['waiting_seconds'] is not None for f in self.narrations))
         receipt = self.receipt('slow')
         self.assertEqual(receipt['state'], 'Sent')
         self.assertEqual([p['state'] for p in receipt['progress']], ['Sent'])
@@ -50,7 +50,7 @@ class SlowProgressAcceptance(developer.DeveloperAcceptance):
         self.callback = respond
         self.run_slow(self.send(self.message('tool', '跑个慢命令', expected='命令完成')))
         texts = self.progress('tool')
-        self.assertTrue(any('命令执行这一步已进行约' in t for t in texts), texts)
+        self.assertTrue(any(t == '这一步还在等待结果，我会继续核对。' for t in texts), texts)
         self.assertLessEqual(len(texts), 3)
         self.assertTrue(all(p['state'] == 'Sent' for p in self.receipt('tool')['progress']))
 

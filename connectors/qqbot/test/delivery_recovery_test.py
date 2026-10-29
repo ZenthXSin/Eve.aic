@@ -42,14 +42,16 @@ class DeliveryRecoveryAcceptance(ToolProgressAcceptance):
         self.assertEqual(self.chat_rounds, 2)
 
     def test_sdk_diagnostics_are_logged_for_progress_and_final_without_raw_error_content(self):
-        self.callback = lambda body: dialogue.text_response('已保存正文') if self.results(body) else self.calls(1)
+        self.callback = lambda body: dialogue.text_response('已保存正文') if self.results(body) else dialogue.tool_response(
+            [('send_message', {'text': '正在核对当前结果', 'purpose': 'progress'})])
         message = self.message('diagnostic', '执行诊断任务', expected='已保存正文') | {
             'fail_delivery': True, 'fail_progress': True,
             'progress_diagnostic': {'http_status': 429, 'biz_code': 1234, 'failure_kind': 'http'},
             'delivery_diagnostic': {'http_status': 400, 'biz_code': 5678, 'delivery_mode': 'passive',
                                     'notice_status': 'sent', 'secret': 'never-print-private-body'},
         }
-        self.run_eve([{'send': message}, self.wait_receipt('diagnostic', 'Failed')], panel=True)
+        self.run_eve([{'send': message}, self.wait_receipt('diagnostic', 'Failed')], panel=True,
+                     env_extra={'EVE_QQ_LIVE_INTERACTION': 'true'})
         logs = self.panel_stderr.read_text()
         self.assertIn('progress_failed_no_retry', logs)
         self.assertIn('delivery_failed_no_retry', logs)

@@ -399,3 +399,37 @@ async fn corrupt_or_unknown_ledgers_are_refused_and_preserved() {
     assert_eq!(admin.snapshot().unwrap().reminders.len(), 2);
     kernel.stop_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn online_unknown_receipt_is_saved_and_never_retried_after_restart() {
+    let world = World::new();
+    let (kernel, admin) = world.open().await.unwrap();
+    let now = 1_000_000;
+    let reminder = admin
+        .create("user-unknown", "核对回执", now + MINUTE, "m-unknown", now)
+        .unwrap();
+    admin
+        .claim(&reminder.id, DeliveryChannel::Proactive, now + MINUTE)
+        .unwrap();
+    admin
+        .record_delivery(&reminder.id, DeliveryResult::Unknown, now + MINUTE + 1)
+        .unwrap();
+    let snapshot = admin.snapshot().unwrap();
+    assert_eq!(snapshot.reminders[0].status, ReminderStatus::Unknown);
+    assert_eq!(snapshot.reminders[0].attempts[0].finished_at_ms, None);
+    assert!(snapshot.due_proactive(now + 2 * MINUTE).is_none());
+    kernel.stop_all().await.unwrap();
+    let (kernel, admin) = world.open().await.unwrap();
+    assert_eq!(
+        admin.snapshot().unwrap().reminders[0].status,
+        ReminderStatus::Unknown
+    );
+    assert!(
+        admin
+            .snapshot()
+            .unwrap()
+            .due_proactive(now + 2 * MINUTE)
+            .is_none()
+    );
+    kernel.stop_all().await.unwrap();
+}

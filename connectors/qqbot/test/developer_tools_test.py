@@ -1,5 +1,6 @@
 """实际 QQ 宿主验收：连续读写/执行、身份校验、升级候选语义与旧调用零重放。"""
 import json
+import importlib.util
 import hashlib
 import pathlib
 import sys
@@ -122,8 +123,10 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         config = json.loads(self.developer_config.read_text())
         config["storage_directory"] = str(self.work / "developer-data")
         self.developer_config.write_text(json.dumps(config))
-        names = {"clear_context", "clear_all_contexts", "echo", "search_memory", "save_preference", "note_commitment", "settle_commitment", "send_file", "read_attachment", "describe_image", "read_raw_message", "acquire_condition", "read_source", "list_files", "read_file", "write_file", "edit_file",
-                 "search_files", "apply_patch", "run_command", "github_api", "prepare_self_upgrade"}
+        names = {"clear_context", "clear_all_contexts", "echo", "search_memory", "save_preference", "note_commitment", "settle_commitment", "send_file", "read_attachment", "describe_image", "read_raw_message", "read_context_record", "acquire_condition", "read_source", "list_files", "read_file", "write_file", "edit_file",
+                 "search_files", "apply_patch", "run_command", "github_api", "prepare_self_upgrade",
+                 "experience_memory", "manage_subject_focus", "configure_subject_autonomy", "query_file_delivery",
+                 "save_script_plugin", "list_script_plugins", "activate_script_plugin", "run_script_plugin"}
         def respond(body):
             self.assertEqual(self.definitions(body), names)
             self.current_capabilities(body)
@@ -150,7 +153,7 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
             self.assertIn("验证通过", results[-1]["stdout"])
             return text_response("实际读写和命令已完成")
         self.callback = respond
-        self.enabled([*self.send(self.message("help", "/help tools", contains=["22 个", "github_api", "run_command", "edit_file", "search_files"])),
+        self.enabled([*self.send(self.message("help", "/help tools", contains=[f"{len(names)} 个", "github_api", "run_command", "edit_file", "search_files"])),
                       *self.send(self.message("edit", "修改源码并执行验证", expected="实际读写和命令已完成"))])
         self.assertEqual(self.chat_rounds, 5)
         journal = self.work / "developer-data/operations.jsonl"
@@ -223,7 +226,17 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         self.assertEqual(expression["scopes"], [])
 
     def test_other_qq_user_has_project_tools_but_cannot_read_host_or_use_private_github(self):
+        reviews = []
+        def review(request):
+            reviews.append(request)
+            self.assertEqual(request["user_messages"][-1], "使用宿主工具")
+            self.assertFalse(request["delegated"])
+            self.assertIn("project-output", request["action"])
+            return {"risk": "medium", "authorization": "unknown", "outcome": "deny",
+                    "rationale": "用户未明确授权这次 shell 重定向写入"}
+        self.review_reply = review
         def respond(body):
+            self.assertTrue({"read_file", "run_command", "github_api"} <= self.definitions(body))
             if not self.results(body):
                 return tool_response([("read_file", {"path": "README.md"}),
                     ("run_command", {"program": "sh", "args": ["-c", "printf member-project > project-output"]}),
@@ -232,14 +245,17 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
             read, command, github = self.results(body)
             self.assertIn('error', read)
             self.assertNotIn('真实源码测试', json.dumps(read, ensure_ascii=False))
-            if sys.platform == 'linux' and pathlib.Path('/usr/bin/bwrap').is_file():
-                self.assertTrue(command['success'],command)
-            else:
-                self.assertIn('error',command)
+            # shell 重定向须先审核；文件存在不能证明隔离可用，也不能绕过审核执行。
+            self.assertIn('error', command)
+            self.assertIn('行动审查未放行', json.dumps(command, ensure_ascii=False))
+            self.assertNotIn('success', command)
             self.assertIn('授权',json.dumps(github,ensure_ascii=False))
             return text_response("未执行越权操作")
         self.callback = respond
         self.enabled(self.send(self.message("foreign", "使用宿主工具", user="user-2", expected="未执行越权操作")))
+        self.assertEqual(len(reviews), 1)
+        self.assertFalse(any(path.name == "project-output" for path in self.work.rglob("project-output")),
+                         "审核拒绝后宿主和成员项目都不能写出文件")
         self.assertFalse((self.source / "project-output").exists())
         self.assertTrue((self.work / "state/developer-tools/operations.jsonl").exists())
 
@@ -283,11 +299,27 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         queue = self.work / "upgrade-queue"
         queue.mkdir()
         storage = self.work / "live-developer"
-        candidate_id = "a" * 64
+        source={'head':'0'*40,'diff':'0'*64,'untracked':'0'*64}
+        names=['AGENT.md','connectors/qqbot/bridge.mjs','connectors/qqbot/bridge-core.mjs',
+            'connectors/qqbot/package.json','connectors/qqbot/package-lock.json']
+        binary=b'synthetic-verified-artifact'
+        binary_sha=hashlib.sha256(binary).hexdigest()
+        resources={name:hashlib.sha256(binary).hexdigest() for name in names}
+        identity={'source':source,'binary_sha256':binary_sha,'resources':resources}
+        candidate_id=hashlib.sha256(json.dumps(identity,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()
         candidate = storage / "candidates" / candidate_id
         candidate.mkdir(parents=True)
-        (candidate / "manifest.json").write_text(json.dumps({"format_version":1,"prepared":True,"success":True,
-            "candidate_sha256":candidate_id,"checks":[{"success":True}]*4}))
+        target=candidate/('eve-qqbot.exe' if sys.platform=='win32' else 'eve-qqbot');target.write_bytes(binary)
+        for name in names:
+            path=candidate/'resources'/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(binary)
+        manifest={"format_version":1,"prepared":True,"success":True,"candidate_sha256":candidate_id,
+            "source":source,"binary_sha256":binary_sha,"resources":resources,"candidate_path":str(target),
+            "checks":[{"success":True}]*4}
+        (candidate/'manifest.json').write_text(json.dumps(manifest))
+        spec=importlib.util.spec_from_file_location('developer_upgrade_runtime',pathlib.Path(__file__).resolve().parents[3]/'scripts/self_upgrade_runtime.py')
+        runtime=importlib.util.module_from_spec(spec);spec.loader.exec_module(runtime)
+        (storage/'leases').mkdir()
+        runtime.atomic(storage/'leases'/(candidate_id+'.json'),runtime.prepare_lease(candidate,manifest))
         config = json.loads(self.developer_config.read_text())
         config.update(live_upgrade=str(queue),storage_directory=str(storage))
         self.developer_config.write_text(json.dumps(config))

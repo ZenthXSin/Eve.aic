@@ -41,6 +41,11 @@ class PhraseAcceptance(developer.DeveloperAcceptance):
         return super().reply(kind, decoded, latest)
 
     def provider_response(self, body, kind, fallback):
+        if body['messages'][0].get('content', '').startswith('你是对话历史压缩器'):
+            data = json.loads(body['messages'][1]['content'])
+            covered = data['previous_turns'] + len(data['turns'])
+            self.assertFalse(body.get('tools'))
+            return dialogue.text_response(json.dumps({'points': [{'text': '原话与学习结果保存在原始档案。', 'turns': [covered]}]}, ensure_ascii=False))
         if kind == "phrase":
             self.assertEqual(body.get("response_format"), {"type":"json_object"})
             self.assertFalse(body.get("tools"))
@@ -101,6 +106,27 @@ class PhraseAcceptance(developer.DeveloperAcceptance):
         self.assertEqual(self.phrase_state()["learned"], [])
         self.assertEqual(self.phrase_state()["pending"], [])
         self.assertEqual(len(self.kind("phrase")), 1)
+
+    def test_exhausted_global_budget_preserves_pending_phrases_across_restart(self):
+        options = dict(interest=True, memory=True, research=False, practice=False,
+                       more=["--training", "--autonomy-budget", "1", "--autonomy-budget-window-hours", "720"])
+        self.run_eve(self.send(self.message("budget-init", "/budget", contains="剩余 1 次")), **options)
+        state = json.loads(self.state_path.read_text())
+        window = 720 * 3_600_000
+        now = int(time.time() * 1000)
+        ledger = {"format_version": 1, "policy": {"window_ms": window, "limit": 1},
+                  "current": {"start_ms": now - now % window, "used": 1, "by_category": {"interest": 1}},
+                  "history": []}
+        state["entries"].setdefault("eve.budget", {})["usage.v1"] = list(json.dumps(ledger).encode())
+        self.state_path.write_text(json.dumps(state))
+        self.run_eve([*self.words(), *self.checkpoint("quiet")],
+                     checkpoints={"quiet": lambda: time.sleep(1.5)}, **options)
+        self.assertEqual(self.kind("phrase"), [], "耗尽总预算不能发出说法学习请求")
+        self.assertEqual(len(self.phrase_state()["pending"]), len(WORDS), "余额不足不能提前取出并丢弃待学原话")
+        self.run_eve([*self.send(self.message("budget-restored", "/budget", contains="剩余 0 次")),
+                      *self.checkpoint("quiet")], checkpoints={"quiet": lambda: time.sleep(1.5)}, **options)
+        self.assertEqual(self.kind("phrase"), [])
+        self.assertEqual(len(self.phrase_state()["pending"]), len(WORDS))
 
     def test_disabled_learning_or_stopped_training_sends_no_learning_request(self):
         self.chat([*self.words("off")], env={"EVE_PHRASE_LEARNING": "false"})

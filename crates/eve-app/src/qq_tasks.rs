@@ -586,6 +586,7 @@ impl Plugin for ContextPlugin {
 /// 执行器与配置服务在核心装配之后才可用；工具在那之前注册，经这个句柄延后取得。
 #[derive(Default)]
 pub(crate) struct Late {
+    pub(crate) admission: OnceLock<Arc<crate::qq_subject_admission::Admission>>,
     pub(crate) worker: OnceLock<Arc<Worker>>,
     pub(crate) config: OnceLock<Arc<dyn ConfigService>>,
     pub(crate) profiles: OnceLock<Arc<dyn eve_task_api::SubagentProfiles>>,
@@ -783,6 +784,17 @@ fn view(task: &Task, result_bytes: usize) -> Value {
         "minutes_since_dispatch": now_ms().saturating_sub(task.created_at_ms) / 60_000,
         "result": task.result.as_deref().map(|text| bounded(text, result_bytes)),
         "failure": task.failure,
+        "failure_receipt": matches!(task.status, TaskStatus::Failed | TaskStatus::Interrupted | TaskStatus::Blocked).then(|| {
+            let checkpoint = task.execution.as_ref().and_then(|e| e.checkpoint.as_ref());
+            json!({"kind":"task_failure","task_id":task.id,"status":status_text(task),
+                "checkpoint_present":checkpoint.is_some(),
+                "checkpoint_resumable":checkpoint.is_some_and(|c| c.resumable()),
+                "pending_tool_calls":checkpoint.map_or(0, |c| c.pending_calls.len()),
+                "deadline_at_ms":task.execution.as_ref().and_then(|e| e.deadline_at_ms),
+                "remaining_tool_steps":task.spec.max_steps.saturating_sub(checkpoint.map_or(task.usage.map_or(0, |u| u.tool_calls), |c| (c.used_tool_calls+c.delegated_tool_calls) as u32)),
+                "reproduction":{"mode":"simulation_only","task_id":task.id,
+                    "instruction":"在隔离环境以冻结回执和脚本模型复现；不要重放未知工具或生产发送"}})
+        }),
         "interruption_reason": (task.status == TaskStatus::Interrupted).then(|| crate::qq_task_diagnostics::interruption(task)),
         "execution_steps": &steps[offset..],
         "step_total": steps.len(),
@@ -1070,7 +1082,7 @@ impl Tool for CancelTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: CANCEL_TOOL.into(),
-            description: "用户不再需要某个后台任务时调用：排队中的直接取消；执行中的会尽快停下，已经做了的操作不会撤销。只能取消这位用户自己的任务。".into(),
+            description: "用户不再需要某个后台任务时调用：排队或条件阻塞中的直接取消，之后不再接续；执行中的会尽快停下，已经做了的操作不会撤销。只能取消这位用户自己的任务。".into(),
             argument_schema: json!({
                 "type": "object",
                 "properties": {"task_id": {"type": "string"}},
@@ -1479,6 +1491,7 @@ impl QqOutreach for ChannelAdapter {
                 biz_code,
             },
             QqOutreachResult::NotSent => DeliveryResult::NotSent,
+            QqOutreachResult::Unknown => DeliveryResult::Unknown,
         };
         self.tasks
             .record_delivery(id, result, now_ms())
@@ -1550,6 +1563,13 @@ async fn run(
             }
             tasks.reconcile_strategies()?;
             let snapshot = tasks.snapshot()?;
+            if let Some(admission) = late.admission.get() {
+                use eve_qqbot_plugin::QqAdmission;
+                for task in snapshot.tasks.iter().filter(|t| t.status.finished()) {
+                    let key = SessionKey::new(task.owner.session_id.clone(),task.owner.user_id.clone())?;
+                    admission.abandon(&key, &format!("task:{}:{}",task.id,task.execution.as_ref().map_or(0, |e| e.recoveries)))?;
+                }
+            }
             // 用户在执行中取消：停下执行器，由结局写入取消。
             for task in snapshot.running().filter(|task| task.cancel_requested) {
                 if let Some(stop) = running.get(&task.id) {
@@ -1573,11 +1593,27 @@ async fn run(
                 if running.len() >= settings.max_running {
                     break;
                 }
-                let started = match if task.status == TaskStatus::Running {
+                let admission_ticket = if let Some(admission) = late.admission.get() {
+                    let key = SessionKey::new(task.owner.session_id.clone(), task.owner.user_id.clone())?;
+                    let priority = if task.source.starts_with("subject-focus:") { eve_subject_api::EventPriority::Autonomy } else if task.status == TaskStatus::Running { eve_subject_api::EventPriority::Recovery } else { eve_subject_api::EventPriority::User };
+                    let source = format!("task:{}:{}", task.id, task.execution.as_ref().map_or(0, |e| e.recoveries));
+                    match admission.begin_work(&key, &source, priority, match priority { eve_subject_api::EventPriority::User => eve_subject_api::EventSource::UserIngress, eve_subject_api::EventPriority::Autonomy => eve_subject_api::EventSource::AutonomyScheduler, _ => eve_subject_api::EventSource::RecoverySupervisor })? {
+                        Some(ticket) => Some((admission.clone(), ticket)),
+                        None => continue,
+                    }
+                } else { None };
+                let start_result = if task.status == TaskStatus::Running {
                     Ok(task.clone())
-                } else {
-                    tasks.start(&task.id, now_ms())
-                } {
+                } else { tasks.start(&task.id, now_ms()) };
+                if let Some((admission, ticket)) = &admission_ticket {
+                    use eve_qqbot_plugin::QqAdmission;
+                    admission.finish(ticket, match &start_result {
+                        Ok(_) => eve_qqbot_plugin::QqAdmissionResult::Started,
+                        Err(TaskError::InvalidTransition) => eve_qqbot_plugin::QqAdmissionResult::Rejected,
+                        Err(_) => eve_qqbot_plugin::QqAdmissionResult::Unknown,
+                    })?;
+                }
+                let started = match start_result {
                     Ok(started) => started,
                     // 刚被取消或已开始：跳过。
                     Err(TaskError::InvalidTransition) => continue,
@@ -1598,6 +1634,7 @@ async fn run(
                         started.started_at_ms.unwrap_or_else(now_ms)
                             .saturating_add(settings.task_timeout.as_millis() as u64)
                     });
+                let deadline_at_ms = started.execution.as_ref().and_then(|e| e.authorization_deadline_at_ms).map_or(deadline_at_ms, |authorized| deadline_at_ms.min(authorized));
                 // 给执行前预测绑定本次实际期限；执行器首次检查点保存同一值。
                 let mut strategy_task = started.clone();
                 strategy_task.execution.get_or_insert_with(Default::default).deadline_at_ms = Some(deadline_at_ms);

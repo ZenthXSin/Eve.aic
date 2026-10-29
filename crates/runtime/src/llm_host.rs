@@ -143,6 +143,11 @@ impl LlmHostConfig {
         if self.output_format.trim().is_empty() {
             return Err(LlmError::Configuration("输出格式不能为空".into()));
         }
+        if self.max_parallel_tool_calls > Semaphore::MAX_PERMITS {
+            return Err(LlmError::Configuration(
+                "工具并发上限超过执行器支持范围".into(),
+            ));
+        }
         if self.event_timeout.is_zero()
             || self.max_stream_text_bytes == 0
             || self.provider_timeout.is_zero()
@@ -218,6 +223,14 @@ pub struct TurnFailure {
 struct PreparedTool {
     binding: ToolBinding,
     definition: ToolDefinition,
+}
+
+struct ToolCaller {
+    turn_id: Option<u64>,
+    scope: Option<eve_llm_api::ContextScope>,
+    continuation: eve_llm_api::TaskContinuation,
+    conversation: Arc<Vec<ChatMessage>>,
+    review_user_messages: Arc<Vec<String>>,
 }
 
 struct PreparedTurn {
@@ -438,6 +451,7 @@ pub struct LlmHost {
     model_resolver: Option<Arc<dyn LlmModelResolver>>,
     history_resolver: Option<Arc<dyn eve_llm_api::HistoryWindowResolver>>,
     history_digests: Option<Arc<dyn eve_llm_api::HistoryDigests>>,
+    history_context_planner: Option<Arc<dyn eve_llm_api::HistoryContextPlanner>>,
     history_window: Option<eve_llm_api::HistoryWindow>,
     compaction_policy: Option<eve_llm_api::ContextCompactionPolicy>,
     /// 本轮尚未调用工具时使用的较小阈值；见 `HistoryWindowResolver::casual_compaction`。
@@ -501,6 +515,7 @@ impl LlmHost {
             model_resolver: None,
             history_resolver: None,
             history_digests: None,
+            history_context_planner: None,
             history_window: None,
             compaction_policy: None,
             casual_compaction_policy: None,
@@ -536,6 +551,15 @@ impl LlmHost {
         resolver: Arc<dyn eve_llm_api::HistoryWindowResolver>,
     ) -> Self {
         self.history_resolver = Some(resolver);
+        self
+    }
+
+    /// 分层计划只能筛选原历史与增加非授权工作集；不会修改持久会话或审核原话。
+    pub fn with_history_context_planner(
+        mut self,
+        planner: Arc<dyn eve_llm_api::HistoryContextPlanner>,
+    ) -> Self {
+        self.history_context_planner = Some(planner);
         self
     }
 
@@ -623,7 +647,7 @@ impl LlmHost {
         let events = self.event_delivery(sink, None);
         match self.for_turn(scope.as_ref()) {
             Ok(host) => {
-                host.run_turn_inner(input, None, scope, admission, Some(&events))
+                host.run_turn_inner(input, None, scope, None, admission, Some(&events))
                     .await
             }
             Err(error) => Err(fail(error, TurnDiagnostics::default())),
@@ -706,7 +730,7 @@ impl LlmHost {
         let admission = Arc::new(self.kernel.acquire_runtime_admission().await);
         self.for_turn(None)
             .map_err(|error| fail(error, TurnDiagnostics::default()))?
-            .run_turn_inner(input, None, None, admission, None)
+            .run_turn_inner(input, None, None, None, admission, None)
             .await
     }
 
@@ -719,7 +743,7 @@ impl LlmHost {
         let events = self.event_delivery(sink, None);
         let result = match self.for_turn(None) {
             Ok(host) => {
-                host.run_turn_inner(input, None, None, admission.clone(), Some(&events))
+                host.run_turn_inner(input, None, None, None, admission.clone(), Some(&events))
                     .await
             }
             Err(error) => Err(fail(error, TurnDiagnostics::default())),
@@ -747,20 +771,18 @@ impl LlmHost {
     }
 
     // 会话宿主已持有相同 Kernel 的准入锁，覆盖 Pending 到最终状态提交。
+    // turn_id 来自持久会话租约，不能依赖是否装配事件观察者。
     pub(crate) async fn run_turn_inner(
         &self,
         input: TurnInput,
         history: Option<Vec<ChatMessage>>,
         scope: Option<eve_llm_api::ContextScope>,
+        turn_id: Option<u64>,
         admission: Arc<RuntimeAdmissionGuard>,
         events: Option<&EventDelivery<'_>>,
     ) -> Result<TurnOutput, TurnFailure> {
         let mut diagnostics = TurnDiagnostics::default();
-        let steering = match (
-            &self.steering,
-            scope.as_ref(),
-            events.and_then(|e| e.turn_id),
-        ) {
+        let steering = match (&self.steering, scope.as_ref(), turn_id) {
             (Some(source), Some(scope), Some(turn_id)) => Some(
                 source
                     .open(scope, turn_id)
@@ -776,7 +798,7 @@ impl LlmHost {
                     .map_or(0, |d| d.as_millis());
                 eprintln!(
                     "EVE_CONTEXT_TIMING {}",
-                    serde_json::json!({"phase":stage,"turn":events.and_then(|e| e.turn_id),"at_ms":at,"elapsed_ms":context_started.elapsed().as_millis()})
+                    serde_json::json!({"phase":stage,"turn":turn_id,"at_ms":at,"elapsed_ms":context_started.elapsed().as_millis()})
                 );
             }
         };
@@ -803,7 +825,73 @@ impl LlmHost {
                 return Err(fail(error, diagnostics));
             }
         }
+        // 审核原话独立保留，先于历史窗口裁剪和上下文压缩；委派说明不是用户授权。
+        let mut review_user_messages = Arc::new(if self.delegated {
+            vec![]
+        } else {
+            prepared
+                .context
+                .history
+                .iter()
+                .filter(|message| message.role == ChatRole::User)
+                .filter_map(|message| message.text.clone())
+                .filter(|text| !text.starts_with("【宿主条件触发事件；不是用户新消息】"))
+                .chain(
+                    (!input
+                        .text
+                        .starts_with("【宿主条件触发事件；不是用户新消息】"))
+                    .then(|| input.text.clone()),
+                )
+                .collect::<Vec<_>>()
+        });
+        let old_count = review_user_messages.len().saturating_sub(6);
+        Arc::make_mut(&mut review_user_messages).drain(..old_count);
+        let mut planned_history = false;
+        if let Some(planner) = &self.history_context_planner {
+            let deadline = self
+                .run_deadline
+                .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(10))
+                .min(std::time::Instant::now() + Duration::from_secs(10));
+            let plan = tokio::select! { biased;
+                _ = wait_closed(events) => Err(LlmError::Cancelled),
+                _ = tokio::time::sleep_until(deadline.into()) => Err(LlmError::Cancelled),
+                result = contain_panic(async { planner.plan(scope.as_ref(), &input, &prepared.context.history).await }) => result,
+            }.map_err(|error| fail(error, diagnostics.clone()))?;
+            if let Some(plan) = plan {
+                validate_review_originals(&review_user_messages)
+                    .map_err(|error| fail(error, diagnostics.clone()))?;
+                let window = self.history_window.ok_or_else(|| {
+                    fail(
+                        LlmError::Configuration("分层历史计划需要可信历史窗口上限".into()),
+                        diagnostics.clone(),
+                    )
+                })?;
+                crate::history::apply_plan(
+                    &mut prepared.context,
+                    window,
+                    plan,
+                    self.history_digests.as_deref(),
+                    scope.as_ref(),
+                )
+                .map_err(|error| fail(error, diagnostics.clone()))?;
+                planned_history = true;
+            }
+        }
+        // 选择后的子序列不能使用原全历史的 covered_turns；摘要只作本轮临时计算。
+        let compaction_scope = if planned_history {
+            None
+        } else {
+            scope.as_ref()
+        };
         let mut compaction = match (self.compaction_policy, self.history_digests.as_deref()) {
+            (Some(_), Some(service)) if planned_history => {
+                Some(crate::compaction::State::new_with_cache(
+                    &mut prepared.context,
+                    service,
+                    None,
+                    false,
+                ))
+            }
             (Some(_), Some(service)) => Some(crate::compaction::State::new(
                 &mut prepared.context,
                 service,
@@ -811,7 +899,8 @@ impl LlmHost {
             )),
             _ => None,
         };
-        if compaction.is_none()
+        if !planned_history
+            && compaction.is_none()
             && let Some(window) = self.history_window
             && let Err(error) = crate::history::apply(
                 &mut prepared.context,
@@ -948,13 +1037,20 @@ impl LlmHost {
                     self.step_limit_notice(frame.used_tool_calls),
                 ));
             }
+            // 恢复的工具回执同样属于本轮执行证据；任务结算必须看见最后的 progress。
+            transcript = messages
+                .iter()
+                .filter(|message| message.role != ChatRole::System)
+                .cloned()
+                .collect();
             frame.messages = messages.clone();
             if let Some(text) = &frame.result {
+                transcript.push(ChatMessage::text(ChatRole::Assistant, text.clone()));
                 diagnostics.stage = TurnStage::Completed;
                 return Ok(TurnOutput {
                     text: text.clone(),
                     diagnostics,
-                    transcript: vec![],
+                    transcript,
                 });
             }
             Some(frame)
@@ -967,6 +1063,15 @@ impl LlmHost {
                     .take(false)
                     .map_err(|error| fail(error, diagnostics.clone()))?
                 {
+                    if !self.delegated {
+                        let originals = Arc::make_mut(&mut review_user_messages);
+                        originals.push(text.clone());
+                        originals.drain(..originals.len().saturating_sub(6));
+                        if planned_history {
+                            validate_review_originals(originals)
+                                .map_err(|error| fail(error, diagnostics.clone()))?;
+                        }
+                    }
                     let message = ChatMessage::text(ChatRole::User, text);
                     messages.push(message.clone());
                     transcript.push(message);
@@ -1009,7 +1114,7 @@ impl LlmHost {
                 let result = tokio::select! { biased;
                     _ = wait_closed(events) => Err(LlmError::Cancelled),
                     _ = tokio::time::sleep(eve_llm_api::CONTEXT_COMPACTION_TIMEOUT) => Err(LlmError::Context("上下文压缩超过 5 分钟总期限；已经保存的摘要进度与工具回执保留，压缩后的下一次对话请求未发出".into())),
-                    result = contain_panic(state.compact(&mut messages, &definitions, policy, service, scope.as_ref(), fallback)) => result,
+                    result = contain_panic(state.compact(&mut messages, &definitions, policy, service, compaction_scope, fallback)) => result,
                 };
                 if let Err(error) = result {
                     return Err(fail(error, diagnostics));
@@ -1073,6 +1178,15 @@ impl LlmHost {
                     .map_err(|error| fail(error, diagnostics.clone()))?;
                 if !extra.is_empty() {
                     for text in extra {
+                        if !self.delegated {
+                            let originals = Arc::make_mut(&mut review_user_messages);
+                            originals.push(text.clone());
+                            originals.drain(..originals.len().saturating_sub(6));
+                            if planned_history {
+                                validate_review_originals(originals)
+                                    .map_err(|error| fail(error, diagnostics.clone()))?;
+                            }
+                        }
                         let message = ChatMessage::text(ChatRole::User, text);
                         messages.push(message.clone());
                         transcript.push(message);
@@ -1202,11 +1316,13 @@ impl LlmHost {
                     &mut diagnostics,
                     admission.clone(),
                     events,
-                    (
-                        scope.clone(),
-                        continuation.clone(),
-                        Arc::new(messages.clone()),
-                    ),
+                    ToolCaller {
+                        turn_id,
+                        scope: scope.clone(),
+                        continuation: continuation.clone(),
+                        conversation: Arc::new(messages.clone()),
+                        review_user_messages: review_user_messages.clone(),
+                    },
                 )
                 .await
             {
@@ -1487,11 +1603,7 @@ impl LlmHost {
         diagnostics: &mut TurnDiagnostics,
         admission: Arc<RuntimeAdmissionGuard>,
         events: Option<&EventDelivery<'_>>,
-        caller: (
-            Option<eve_llm_api::ContextScope>,
-            eve_llm_api::TaskContinuation,
-            Arc<Vec<ChatMessage>>,
-        ),
+        caller: ToolCaller,
     ) -> Result<Vec<ToolResult>, LlmError> {
         let by_name = prepared
             .iter()
@@ -1627,10 +1739,11 @@ impl LlmHost {
             // 取消外层 Future 后，停止操作仍需等到已创建的工具任务真正析构。
             let admission = admission.clone();
             let context = ToolExecutionContext::new()
-                .with_scope(caller.0.clone())
-                .with_continuation(caller.1.clone())
-                .with_conversation(caller.2.clone())
-                .with_turn_id(events.and_then(|event| event.turn_id))
+                .with_scope(caller.scope.clone())
+                .with_continuation(caller.continuation.clone())
+                .with_conversation(caller.conversation.clone())
+                .with_review_user_messages(caller.review_user_messages.clone())
+                .with_turn_id(caller.turn_id)
                 .with_deadline(self.run_deadline)
                 .with_delegated(self.delegated);
             let context = match &self.shared_steps {
@@ -1800,24 +1913,61 @@ async fn run_tool(
         timeout,
         grace,
     } = config;
+    let deadline = context.deadline().map_or_else(
+        || std::time::Instant::now() + timeout,
+        |parent| parent.min(std::time::Instant::now() + timeout),
+    );
     let _ticket = ticket;
-    if let Some(ticket) = &_ticket {
-        ticket.wait_turn().await;
+    let cancellation: ToolCancellation = context.cancellation_handle();
+    if context.is_cancel_requested() {
+        return tool_failure(&call, ToolFailureCode::Cancelled, "工具准入已取消；未执行");
     }
-    let permit: OwnedSemaphorePermit = semaphore.acquire_owned().await.expect("semaphore lives");
+    if std::time::Instant::now() >= deadline {
+        return tool_failure(
+            &call,
+            ToolFailureCode::TimedOut,
+            "工具准入期限已耗尽；未执行",
+        );
+    }
+    let acquire = async {
+        if let Some(ticket) = &_ticket {
+            ticket.wait_turn().await;
+        }
+        semaphore.acquire_owned().await.expect("semaphore lives")
+    };
+    let permit: OwnedSemaphorePermit = tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline.into()) => {
+            cancellation.cancel();
+            return tool_failure(&call, ToolFailureCode::TimedOut, "工具排队期限已耗尽；未执行");
+        }
+        _ = tool_cancelled(&context) => return tool_failure(&call, ToolFailureCode::Cancelled, "等待中的工具已取消；未执行"),
+        permit = acquire => permit,
+    };
+    if context.is_cancel_requested() || std::time::Instant::now() >= deadline {
+        return tool_failure(
+            &call,
+            ToolFailureCode::TimedOut,
+            "工具准入已取消或到期；未执行",
+        );
+    }
     let current = active.fetch_add(1, Ordering::SeqCst) + 1;
     started.fetch_add(1, Ordering::SeqCst);
     peak.fetch_max(current, Ordering::SeqCst);
     let _active_guard = ActiveExecutionGuard { active };
-    let cancellation: ToolCancellation = context.cancellation_handle();
+    let stop_context = context.clone();
     let future = tool.execute(call.clone(), context);
     tokio::pin!(future);
     let value = tokio::select! {
         biased;
-        _ = tokio::time::sleep(timeout) => {
+        _ = tokio::time::sleep_until(deadline.into()) => {
             cancellation.cancel();
             let _ = tokio::time::timeout(grace, &mut future).await;
             ToolResult::failure(call.id, ToolFailureCode::TimedOut, "tool execution timed out")
+        }
+        _ = tool_cancelled(&stop_context) => {
+            let _ = tokio::time::timeout(grace, &mut future).await;
+            ToolResult::failure(call.id, ToolFailureCode::Cancelled, "tool execution cancelled")
         }
         result = &mut future => match result {
             Ok(value) => ToolResult::success(call.id, value),
@@ -1833,6 +1983,12 @@ async fn run_tool(
     };
     drop(permit);
     value.expect("call id validated")
+}
+
+async fn tool_cancelled(context: &ToolExecutionContext) {
+    while !context.is_cancel_requested() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 struct ToolRunConfig {
@@ -1880,6 +2036,19 @@ fn progress_report_request(
         ],
         tools: vec![],
     })
+}
+
+fn validate_review_originals(messages: &[String]) -> Result<(), LlmError> {
+    if messages
+        .iter()
+        .try_fold(0usize, |sum, text| sum.checked_add(text.len()))
+        .is_none_or(|bytes| bytes > eve_llm_api::MAX_REVIEW_USER_MESSAGES_BYTES)
+    {
+        return Err(LlmError::Context(
+            "六条审核原话超过上限；未截断、摘要或替换授权上下文".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn build_messages(
@@ -2177,6 +2346,87 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn expired_tool_deadline_never_polls_side_effecting_tool() {
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let result = run_tool(
+            Arc::new(EchoTool {
+                active: Arc::new(AtomicUsize::new(0)),
+                peak: peak.clone(),
+            }),
+            ToolCall {
+                id: "expired".into(),
+                name: "echo".into(),
+                arguments: json!({"value":1}),
+            },
+            ToolExecutionContext::new()
+                .with_deadline(Some(std::time::Instant::now() - Duration::from_secs(1))),
+            ToolRunConfig {
+                semaphore: Arc::new(Semaphore::new(1)),
+                ticket: None,
+                started: started.clone(),
+                active: Arc::new(AtomicUsize::new(0)),
+                peak: Arc::new(AtomicUsize::new(0)),
+                timeout: Duration::from_secs(1),
+                grace: Duration::from_millis(10),
+            },
+        )
+        .await;
+        assert!(matches!(
+            result.output,
+            ToolOutput::Failure {
+                code: ToolFailureCode::TimedOut,
+                ..
+            }
+        ));
+        assert_eq!(peak.load(Ordering::SeqCst), 0);
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_tool_deadline_expires_without_waiting_for_an_execution_slot() {
+        let slots = Arc::new(Semaphore::new(1));
+        let occupied = slots.clone().acquire_owned().await.unwrap();
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let waiting = run_tool(
+            Arc::new(EchoTool {
+                active: Arc::new(AtomicUsize::new(0)),
+                peak: peak.clone(),
+            }),
+            ToolCall {
+                id: "queued".into(),
+                name: "echo".into(),
+                arguments: json!({"value":1}),
+            },
+            ToolExecutionContext::new()
+                .with_deadline(Some(std::time::Instant::now() + Duration::from_millis(20))),
+            ToolRunConfig {
+                semaphore: slots,
+                ticket: None,
+                started: started.clone(),
+                active: Arc::new(AtomicUsize::new(0)),
+                peak: Arc::new(AtomicUsize::new(0)),
+                timeout: Duration::from_secs(1),
+                grace: Duration::from_millis(10),
+            },
+        );
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("排队期限必须生效");
+        assert!(matches!(
+            result.output,
+            ToolOutput::Failure {
+                code: ToolFailureCode::TimedOut,
+                ..
+            }
+        ));
+        assert_eq!(peak.load(Ordering::SeqCst), 0);
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+        drop(occupied);
+    }
+
     struct ContextImpl;
     impl ContextAssembler for ContextImpl {
         fn assemble(&self, _input: TurnInput) -> LlmFuture<'_, ContextSnapshot> {
@@ -2377,5 +2627,32 @@ mod tests {
                 ..
             }
         ));
+    }
+    #[test]
+    fn oversized_concurrency_is_a_configuration_error_instead_of_a_constructor_panic() {
+        for permits in [Semaphore::MAX_PERMITS + 1, usize::MAX] {
+            let services = KernelServices::default();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                LlmHost::new(
+                    Arc::new(ScriptedProvider {
+                        calls: Mutex::new(vec![]),
+                    }),
+                    services.registry.clone(),
+                    Kernel::new(),
+                    services.permissions,
+                    ContextBinding {
+                        service_id: ServiceId::new(CONTEXT).unwrap(),
+                        expected_owner: PluginId::new("owner").unwrap(),
+                    },
+                    vec![],
+                    LlmHostConfig {
+                        max_parallel_tool_calls: permits,
+                        ..Default::default()
+                    },
+                )
+            }));
+            assert!(result.is_ok(), "invalid concurrency must not panic");
+            assert!(matches!(result.unwrap(), Err(LlmError::Configuration(_))));
+        }
     }
 }

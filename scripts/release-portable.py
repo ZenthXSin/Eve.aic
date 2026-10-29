@@ -1,4 +1,4 @@
-"""为主线分配发行版本，验证六平台产物，并在完整上传后公开 Release。"""
+"""为主线分配发行版本，验证四平台产物，并在完整上传后公开 Release。"""
 import argparse
 import hashlib
 import json
@@ -11,7 +11,7 @@ import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 TAG = re.compile(r"v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[A-Za-z0-9][A-Za-z0-9.-]*)?")
-LABELS = {"windows-x64", "windows-arm64", "linux-x64", "linux-arm64", "macos-x64", "macos-arm64"}
+LABELS = {"windows-x64", "windows-arm64", "linux-x64", "linux-arm64"}
 CI_NAMES = {"Rust 持续集成", "QQBot 通道离线验收", "PostgreSQL 状态与宿主验收", "自动性能测试"}
 
 
@@ -111,7 +111,7 @@ def verify(folder, tag, source):
         reports[label] = report
         archives.append(archive)
     if set(reports) != LABELS:
-        raise ValueError("六个平台没有全部完成原生验收，不发布部分 Release")
+        raise ValueError("四个平台没有全部完成原生验收，不发布部分 Release")
     archives.sort()
     sums = folder / "SHA256SUMS.txt"
     sums.write_text("".join(f"{digest(file)}  {file.name}\n" for file in archives), encoding="utf-8")
@@ -169,10 +169,10 @@ def publish(client, folder, tag, source, automatic):
         print("同一提交的版本已公开，保留现有文件：" + release["html_url"])
         return release["html_url"]
     notes = (f"# Eve {tag}\n\n"
-             "Windows、Linux、macOS，各提供 x64 与 ARM64 原生运行包。包含运行器、Web 页面、固定 Node 和 QQ 桥接，无需安装 Rust 或 Node。\n\n"
-             "完整解压后使用包内 Start-Eve 启动，填写自己的主模型与 QQ 密钥；Open-Panel 打开本机面板。Windows 使用 ZIP，Linux/macOS 使用 tar.gz。\n\n"
-             "六个平台均通过原生进程、中文空格路径、Web、分段投递和恢复零重放验收。Linux 需 Ubuntu 24.04 或相容 glibc，macOS 需 11+；macOS 包未签名/公证。\n\n"
-             f"源码提交：`{source}`。文件散列见 SHA256SUMS.txt；六平台证据见 release-verification.json。包内不含用户凭据和训练数据。\n")
+             "Windows、Linux，各提供 x64 与 ARM64 原生运行包。包含运行器、Web 页面、固定 Node 和 QQ 桥接，无需安装 Rust 或 Node。\n\n"
+             "完整解压后使用包内 Start-Eve 启动，填写自己的主模型与 QQ 密钥；Open-Panel 打开本机面板。Windows 使用 ZIP，Linux 使用 tar.gz。\n\n"
+             "四个平台均通过原生进程、中文空格路径、Web、分段投递和恢复零重放验收。Linux 需 Ubuntu 24.04 或相容 glibc。\n\n"
+             f"源码提交：`{source}`。文件散列见 SHA256SUMS.txt；四平台证据见 release-verification.json。包内不含用户凭据和训练数据。\n")
     if release is None:
         release = client.api("releases", method="POST", data={"tag_name": tag, "target_commitish": source,
                              "name": f"Eve {tag}", "body": notes, "draft": True, "prerelease": "-" in tag})

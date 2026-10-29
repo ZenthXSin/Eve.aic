@@ -3,11 +3,12 @@ import json
 import unittest
 
 import dialogue_tools_test as dialogue
+import progress_narration_test as progress
 import memory_test
 
 
-class ToolProgressAcceptance(dialogue.DialogueToolsAcceptance):
-    for name in dir(dialogue.DialogueToolsAcceptance):
+class ToolProgressAcceptance(progress.ProgressNarrationAcceptance):
+    for name in dir(progress.ProgressNarrationAcceptance):
         if name.startswith('test_'): locals()[name] = None
     del name
     receipt = memory_test.MemoryAcceptance.receipt
@@ -48,7 +49,7 @@ class ToolProgressAcceptance(dialogue.DialogueToolsAcceptance):
         self.assertNotIn('progress', self.receipt('quiet'))
         self.assertEqual(self.receipt('quiet')['state'], 'Sent')
 
-    def test_hundred_calls_three_reports_final_segments_and_fresh_turn_budget(self):
+    def test_hundred_calls_bounded_model_reports_final_segments_and_fresh_turn_budget(self):
         def respond(body):
             if not body.get('tools'):
                 self.assertEqual(len(self.results(body)), 100)
@@ -62,12 +63,13 @@ class ToolProgressAcceptance(dialogue.DialogueToolsAcceptance):
                       *self.send(self.message('fresh', '新的测试', expected='下一轮正常'))],
                      more=['--segmented'])
         self.assertEqual(self.chat_rounds, 103)
-        self.assertEqual(len(self.progress('fifty')), 3)
-        self.assertEqual([p['state'] for p in self.receipt('fifty')['progress']], ['Sent'] * 3)
+        self.assertGreaterEqual(len(self.progress('fifty')), 1)
+        self.assertLessEqual(len(self.progress('fifty')), 3)
+        self.assertEqual([p['state'] for p in self.receipt('fifty')['progress']], ['Sent'] * len(self.progress('fifty')))
         finals = [e for e in self.events if e.get('id') == 'fifty' and e.get('type') in ['reply','segment']]
         self.assertTrue(finals)
         self.assertLessEqual(len(finals) + len(self.progress('fifty')), 4)
-        self.assertEqual(len(self.progress('fresh')), 1)
+        self.assertLessEqual(len(self.progress('fresh')), 1)
         before = self.receipt('fifty')
         self.callback = lambda _: dialogue.text_response('重启正常')
         self.run_eve(self.send(self.message('restart', '重启后聊天', expected='重启正常')))
@@ -86,7 +88,13 @@ class ToolProgressAcceptance(dialogue.DialogueToolsAcceptance):
         self.assertFalse(any(m['role'] == 'tool' for m in self.requests[-1]['body']['messages']))
 
     def test_failed_progress_is_not_retried_and_does_not_replace_final_receipt(self):
-        self.callback = lambda body: dialogue.text_response('最终完成') if self.results(body) else self.calls(1)
+        def respond(body):
+            if not self.results(body):
+                return self.calls(1)
+            path = self.work / f'events-{self.runs}.jsonl'
+            self.wait_until(lambda: path.exists() and any(json.loads(line).get('type') == 'progress' for line in path.read_text().splitlines()), '模型进度未送达')
+            return dialogue.text_response('最终完成')
+        self.callback = respond
         message = self.message('failure', '进度发送失败', expected='最终完成') | {'fail_progress':True}
         self.run_eve(self.send(message))
         self.assertEqual(len(self.progress('failure')), 1)
@@ -136,7 +144,7 @@ class ToolProgressAcceptance(dialogue.DialogueToolsAcceptance):
                       {'wait_command':{'id':'retired','type':'finish'}}],
                      env_extra={'EVE_ADMIN_BIND_KEY': 'progress-acceptance-key'})
         self.assertEqual(len(self.progress('retired')), 1)
-        self.assertEqual(len(self.progress('replace')), 1)
+        self.assertLessEqual(len(self.progress('replace')), 1)
         self.assertEqual(self.receipt('retired')['state'], 'Failed')
         self.assertEqual(self.receipt('replace')['state'], 'Sent')
 

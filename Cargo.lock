@@ -368,6 +368,7 @@ dependencies = [
  "eve-reminder-api",
  "eve-reminder-plugin",
  "eve-runtime",
+ "eve-script-runtime",
  "eve-segment-api",
  "eve-segment-plugin",
  "eve-semantic-api",
@@ -380,6 +381,8 @@ dependencies = [
  "eve-sticker-api",
  "eve-sticker-plugin",
  "eve-subagent-profile-sqlite",
+ "eve-subject-api",
+ "eve-subject-plugin",
  "eve-task-api",
  "eve-task-plugin",
  "eve-toolforge-api",
@@ -770,6 +773,7 @@ dependencies = [
  "eve-chime-api",
  "eve-control-api",
  "eve-llm-api",
+ "eve-memory-api",
  "eve-message-api",
  "eve-message-diagnostics",
  "eve-session-api",
@@ -1227,6 +1231,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-script-runtime"
+version = "0.1.0"
+dependencies = [
+ "eve-llm-api",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "eve-segment-api"
 version = "0.1.0"
 
@@ -1359,6 +1375,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "eve-subject-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "eve-subject-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-kernel",
+ "eve-plugin-api",
+ "eve-subject-api",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "eve-task-api"
 version = "0.1.0"
 dependencies = [
@@ -1466,6 +1501,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

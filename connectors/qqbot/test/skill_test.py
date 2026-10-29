@@ -8,6 +8,7 @@
 设置 EVE_MINDUSTRY_SERVER_JAR 时，`test_real_runtime_verifies_skill_holdout_and_invocation` 改用真实
 Mindustry 无头服务端；其余用例使用确定性替身，只证明宿主契约与恢复语义，不代表真实模型的提炼质量。
 """
+from fixture_auth import configure_fixture_progress
 import json
 import os
 import pathlib
@@ -316,7 +317,7 @@ class SkillAcceptance(unittest.TestCase):
         env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret")
         result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
                                  "--agent", str(ROOT / "AGENT.md"), "--interest-learning", "--skill-learning"],
-                                env=env, capture_output=True, text=True, timeout=60)
+                                env=configure_fixture_progress(env), capture_output=True, text=True, timeout=60)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--practice-mindustry-server", result.stderr)
 

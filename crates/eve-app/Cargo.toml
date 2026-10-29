@@ -31,6 +31,9 @@ name = "eve-memory"
 path = "src/bin/memory.rs"
 
 [dependencies]
+eve-subject-api = { path = "../subject-api" }
+eve-subject-plugin = { path = "../subject-plugin" }
+eve-script-runtime = { path = "../script-runtime" }
 eve-health-watch = { path = "../health-watch" }
 eve-workflow-tools = { path = "../workflow-tools" }
 libc = "0.2"

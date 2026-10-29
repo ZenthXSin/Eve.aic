@@ -44,6 +44,27 @@ pub fn tools(config: &DeveloperConfig, backend: Arc<dyn DeveloperBackend>) -> Ve
     })
     .collect()
 }
+/// 复用模型工具自身的参数校验与操作映射，供宿主权限预检使用；不执行操作。
+pub fn operation_for_tool(
+    name: &str,
+    arguments: &Value,
+) -> Option<Result<DeveloperOperation, ToolValidationError>> {
+    let kind = match name {
+        "list_files" => Kind::List,
+        "read_file" => Kind::Read,
+        "write_file" => Kind::Write,
+        "edit_file" => Kind::Edit,
+        "apply_patch" => Kind::Patch,
+        "search_files" => Kind::Search,
+        "run_command" => Kind::Command,
+        "github_api" => Kind::Github,
+        "prepare_self_upgrade" => Kind::Upgrade,
+        "apply_self_upgrade" => Kind::ApplyUpgrade,
+        "self_upgrade_status" => Kind::UpgradeStatus,
+        _ => return None,
+    };
+    Some(DeveloperTool::operation(kind, arguments))
+}
 struct DeveloperTool {
     kind: Kind,
     backend: Arc<dyn DeveloperBackend>,
@@ -52,11 +73,11 @@ fn object(properties: Value, required: &[&str]) -> Value {
     json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
 }
 impl DeveloperTool {
-    fn operation(&self, arguments: &Value) -> Result<DeveloperOperation, ToolValidationError> {
+    fn operation(kind: Kind, arguments: &Value) -> Result<DeveloperOperation, ToolValidationError> {
         let bad = || ToolValidationError {
             message: "开发工具参数无效，不能指定身份、凭据或宿主绝对路径".into(),
         };
-        match self.kind {
+        match kind {
             Kind::List | Kind::Read | Kind::Write => {
                 let a: FileArguments =
                     serde_json::from_value(arguments.clone()).map_err(|_| bad())?;
@@ -65,18 +86,18 @@ impl DeveloperTool {
                     || a.path.chars().any(char::is_control)
                     || a.offset > 8 * 1024 * 1024
                     || a.content.as_ref().is_some_and(|s| s.len() > 256 * 1024)
-                    || (matches!(self.kind, Kind::Write) != a.content.is_some())
-                    || (matches!(self.kind, Kind::Write)
+                    || (matches!(kind, Kind::Write) != a.content.is_some())
+                    || (matches!(kind, Kind::Write)
                         && a.expected_sha256.as_ref().is_none_or(|s| {
                             !s.is_empty()
                                 && (s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()))
                         }))
-                    || (!matches!(self.kind, Kind::Write) && a.expected_sha256.is_some())
-                    || (matches!(self.kind, Kind::List | Kind::Write) && a.offset != 0)
+                    || (!matches!(kind, Kind::Write) && a.expected_sha256.is_some())
+                    || (matches!(kind, Kind::List | Kind::Write) && a.offset != 0)
                 {
                     return Err(bad());
                 }
-                Ok(match self.kind {
+                Ok(match kind {
                     Kind::List => DeveloperOperation::List(a),
                     Kind::Read => DeveloperOperation::Read(a),
                     _ => DeveloperOperation::Write(a),
@@ -150,7 +171,7 @@ impl DeveloperTool {
                 if arguments.as_object().is_none_or(|v| !v.is_empty()) {
                     return Err(bad());
                 }
-                Ok(if matches!(self.kind, Kind::Upgrade) {
+                Ok(if matches!(kind, Kind::Upgrade) {
                     DeveloperOperation::PrepareUpgrade
                 } else {
                     DeveloperOperation::UpgradeStatus
@@ -217,7 +238,7 @@ impl Tool for DeveloperTool {
             ),
             Kind::Command => (
                 "run_command",
-                "在当前身份获准的执行环境中运行程序和参数，cwd 为工作区相对目录，返回退出码/输出/截断。需要 shell 时显式运行 sh -c 或 powershell -Command。管理员使用宿主环境；普通成员仅在宿主提供的独立项目隔离环境运行。取消会终止命令进程组。命令先经命令策略判断：停机、格式化、删除系统目录等被禁止；改写远端历史、丢弃修改、递归删除等需要确认：宿主装配了行动审查时，由审查按用户在对话里的原话判断是否放行；否则需要主人或管理员在对话里明确同意后，再带 owner_confirmed: true 调用。",
+                "在当前身份获准的执行环境中运行程序和参数，cwd 为工作区相对目录，返回退出码/输出/截断。需要 shell 时显式运行 sh -c 或 powershell -Command。管理员使用宿主环境；普通成员仅在宿主提供的独立项目隔离环境运行。取消会终止命令进程组。命令先经命令策略判断：停机、格式化、删除系统目录等被禁止；改写远端历史、丢弃修改、递归删除等需要确认：必须由独立行动审查按最近六条完整用户原话判断授权后才执行；审查不可用、上下文超限或审计无法保存时不执行。owner_confirmed 只是自称，不能代替用户原话和审核。",
                 object(
                     json!({"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"maximum":600000},"owner_confirmed":{"type":"boolean","description":"仅当主人或管理员已在对话里明确同意这条需确认的命令时为 true"}}),
                     &["program"],
@@ -261,12 +282,11 @@ impl Tool for DeveloperTool {
         }
     }
     fn validate_arguments(&self, arguments: &Value) -> Result<(), ToolValidationError> {
-        self.operation(arguments).map(|_| ())
+        Self::operation(self.kind, arguments).map(|_| ())
     }
     fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
         Box::pin(async move {
-            let operation = self
-                .operation(&call.arguments)
+            let operation = Self::operation(self.kind, &call.arguments)
                 .map_err(|_| ToolExecutionError::Failed("开发工具参数无效".into()))?;
             match self.backend.execute(operation, context).await {
                 Err(ToolExecutionError::Failed(message))

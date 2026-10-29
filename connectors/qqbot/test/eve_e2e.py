@@ -1,4 +1,5 @@
 """Actual Eve process + production plugin + fake Node/loopback Chat HTTP."""
+from fixture_auth import configure_fixture_progress
 from request_messages import conversation_messages
 import hashlib
 import json
@@ -157,7 +158,7 @@ class Acceptance(unittest.TestCase):
         if training:
             command.append("--training")
         if cancel:
-            child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            child = subprocess.Popen(command, env=configure_fixture_progress(env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             try:
                 if cancel_when:
                     deadline = time.monotonic() + 10
@@ -174,7 +175,7 @@ class Acceptance(unittest.TestCase):
                 self.release.set()
             result = subprocess.CompletedProcess(command, child.returncode, stdout, stderr)
         else:
-            result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=20)
+            result = subprocess.run(command, env=configure_fixture_progress(env), capture_output=True, text=True, timeout=20)
         self.bridge_events = [json.loads(line) for line in events.read_text().splitlines()] if events.exists() else []
         self.assertFalse(bridge_error.exists(), bridge_error.read_text() if bridge_error.exists() else "")
         self.assertFalse(self.server_errors, "\n".join(self.server_errors))
@@ -351,11 +352,11 @@ class Acceptance(unittest.TestCase):
         # 共享既有 HTTP 夹具的持久化准入检查目录。
         (self.work / "state").symlink_to(root / "state", target_is_directory=True)
         child = subprocess.Popen(["python3", str(script), "--root", str(root), "--output", str(output),
-                                  "--seconds", "60", "--binary", str(launcher)], cwd=ROOT, env=env,
+                                  "--seconds", "60", "--binary", str(launcher)], cwd=ROOT, env=configure_fixture_progress(env),
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             ready = subprocess.run(["python3", str(script), "--wait-ready", "--root", str(root), "--output", str(output)],
-                                   cwd=ROOT, env=env, capture_output=True, text=True, timeout=15)
+                                   cwd=ROOT, env=configure_fixture_progress(env), capture_output=True, text=True, timeout=15)
             self.assertEqual(ready.returncode, 0, ready.stdout + ready.stderr)
             checkpoint = json.loads((output / "ready.json").read_text())
             self.assertTrue(checkpoint["ready"])
@@ -371,7 +372,7 @@ class Acceptance(unittest.TestCase):
             self.assertEqual(report["counts"]["question_replies"], 1)
             decrypted = self.work / "decrypted"
             result = subprocess.run(["python3", str(script), "--decrypt", str(output / "training-state.enc"), "--output", str(decrypted)],
-                                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=15)
+                                    cwd=ROOT, env=configure_fixture_progress(env), capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             evidence = json.loads((decrypted / "training-report.json").read_text())["evidence"]
             self.assertEqual(evidence[0]["input"], "/train start")
@@ -408,11 +409,11 @@ class Acceptance(unittest.TestCase):
             root, output = self.work / name, self.work / (name + "-results")
             command = ["python3", str(script), "--profile", "full", *practice, "--root", str(root), "--output", str(output),
                        "--seconds", "60", "--binary", str(launcher)]
-            child = subprocess.Popen(command + (["--seed-state", str(seed)] if seed else []), cwd=ROOT, env=env,
+            child = subprocess.Popen(command + (["--seed-state", str(seed)] if seed else []), cwd=ROOT, env=configure_fixture_progress(env),
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             try:
                 ready = subprocess.run(["python3", str(script), "--profile", "full", "--wait-ready", "--root", str(root),
-                                        "--output", str(output)], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+                                        "--output", str(output)], cwd=ROOT, env=configure_fixture_progress(env), capture_output=True, text=True, timeout=60)
                 self.assertEqual(ready.returncode, 0, ready.stdout + ready.stderr)
                 if seed is None:
                     # 网关 ready / 收到 reply 不等于 250ms 轮询的兴趣后台已消费送达证据。
@@ -454,7 +455,7 @@ class Acceptance(unittest.TestCase):
             self.assertIn("全功能体验", summary["training_scope"])
             restored = self.work / (name + "-restored")
             result = subprocess.run(["python3", str(script), "--decrypt", str(output / "training-state.enc"),
-                                     "--output", str(restored)], cwd=ROOT, env=env, capture_output=True, text=True, timeout=15)
+                                     "--output", str(restored)], cwd=ROOT, env=configure_fixture_progress(env), capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             return root, restored
 
@@ -511,8 +512,11 @@ class Acceptance(unittest.TestCase):
         self.run_eve(script=[
             {"send": self.message("x" * 254, "超长不执行", scope="group")},
             {"send": self.message("界" * 85, "UTF-8 超长不执行", scope="group")},
-            {"send": self.message(valid, "字节边界", scope="group")},
-            self.wait_command(valid)])
+            # 平台回执 ID 独立于入站 ID；默认替身的 out- 前缀会使本边界 ID 超限。
+            {"send": self.message(valid, "字节边界", scope="group") | {
+                "delivery_diagnostic": {"message_id": "out-valid-boundary"}}},
+            {"wait_receipt": {"path": str(self.work / "state/state.json"),
+                              "id": valid, "state": "Sent"}}])
         self.assertEqual(len(self.requests), 1)
         self.assertEqual(self.replies(), [(valid, "字节边界")])
         entries = self.documents()["eve.channel.qqbot"]["receipts.v1"]["entries"]

@@ -3,6 +3,7 @@
 这些场景验证接线、回退和代际边界，不代表 Jev/主模型的真实语义质量。
 进程停止只调用本测试持有的 Popen；不读取 PID 文件，不向进程组发信号。
 """
+from fixture_auth import configure_fixture_progress
 import json
 import os
 import pathlib
@@ -217,7 +218,7 @@ class MessageJudgeAcceptance(unittest.TestCase):
             command.extend(["--web-listen", "127.0.0.1:0"])
         from fixture_auth import bootstrap_test_admin
         bootstrap_test_admin(self.work / "state", env)
-        child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        child = subprocess.Popen(command, env=configure_fixture_progress(env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             if inspect:
                 stdout, stderr = self.inspect_panel(child, inspect)

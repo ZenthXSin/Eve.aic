@@ -4,6 +4,7 @@
 证据留在记忆中，重启不清零，调高上限后从剩余额度继续。回复用户消息不计入。账本损坏时拒绝启动并保留原字节。
 确定性替身只证明宿主契约与恢复语义。
 """
+from fixture_auth import configure_fixture_progress
 import json
 import os
 import subprocess
@@ -172,7 +173,7 @@ class BudgetAcceptance(unittest.TestCase):
         child = subprocess.run(
             [str(BINARY), "--state-dir", str(self.work / "state"), "--agent", str(ROOT / "AGENT.md"),
              "--bridge-script", str(FAKE), "--bridge-arg", str(scenario), "--interest-learning",
-             *self.budget(3)], env=env, capture_output=True, text=True, timeout=30)
+             *self.budget(3)], env=configure_fixture_progress(env), capture_output=True, text=True, timeout=30)
         self.assertNotEqual(child.returncode, 0)
         self.assertIn("自主运行预算记录损坏", child.stderr)
         self.assertNotIn("test-model-secret", child.stdout + child.stderr)

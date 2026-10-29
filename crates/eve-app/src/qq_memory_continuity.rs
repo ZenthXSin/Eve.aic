@@ -209,3 +209,103 @@ impl eve_people_api::PersonLinks for PersonLinks {
             .collect())
     }
 }
+
+/// 经验记忆只接受显式可信绑定；QQ群/私聊openID或显示名称相同不构成跨窗口身份授权。
+/// 群内读取个人经验还须显式开启私聊到群分享；默认只读当前scope和公开经验。
+pub(crate) struct PrincipalResolver(pub(crate) Policy);
+impl ExperiencePrincipalResolver for PrincipalResolver {
+    fn resolve(&self, scope: &MemoryScope) -> MemoryResult<Option<String>> {
+        use ring::digest::{SHA256, digest};
+        scope.validate()?;
+        if scope.channel != "qq" {
+            return Ok(None);
+        }
+        let unavailable = || MemoryError::Unavailable;
+        let service = self
+            .0
+            .registry
+            .get(&ServiceId::new(CONFIG_SERVICE_ID).map_err(|_| unavailable())?)
+            .map_err(|_| unavailable())?
+            .ok_or_else(unavailable)?;
+        let settings = service
+            .value
+            .downcast::<ConfigServiceHandle>()
+            .map_err(|_| unavailable())?;
+        let config = settings
+            .0
+            .snapshot(NAMESPACE, 1)
+            .map_err(|_| unavailable())?;
+        if !config.get::<bool>("enabled").map_err(|_| unavailable())? {
+            return Ok(None);
+        }
+        let key = SessionKey::new(&scope.session_id, &scope.user_id)
+            .map_err(|_| MemoryError::InvalidInput)?;
+        let Some(identity) = self
+            .0
+            .conversations
+            .identity(&key)
+            .map_err(|_| unavailable())?
+        else {
+            return Ok(None);
+        };
+        if identity.source == QqInteractionSource::GroupMessage
+            && !config
+                .get::<bool>("share_private_to_groups")
+                .map_err(|_| unavailable())?
+        {
+            return Ok(None);
+        }
+        let groups = identity_groups(&config).map_err(|_| MemoryError::InvalidInput)?;
+        let label = if config
+            .get::<bool>("use_owner_binding")
+            .map_err(|_| unavailable())?
+        {
+            let owner = settings
+                .0
+                .snapshot(crate::qq_people::NAMESPACE, 1)
+                .map_err(|_| unavailable())?;
+            let bound =
+                crate::qq_people::settings(&owner).map_err(|_| MemoryError::InvalidInput)?;
+            if bound.matches_identity(&identity) {
+                // 绑定对象变化时切换身份域，不能让新主人继承旧主人的个人经验。
+                let canonical = |name| -> MemoryResult<BTreeSet<String>> {
+                    let raw: String = owner.get(name).map_err(|_| unavailable())?;
+                    Ok(raw
+                        .split(|c: char| c.is_whitespace() || c == ',')
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect())
+                };
+                Some(
+                    serde_json::to_string(&(
+                        "owner",
+                        canonical("owner_principals")?,
+                        canonical("owner_accounts")?,
+                    ))
+                    .map_err(|_| MemoryError::InvalidInput)?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let label = label.or_else(|| {
+            groups
+                .iter()
+                .find(|g| g.contains(&scope.user_id))
+                .map(|g| serde_json::to_string(g).expect("身份集合可序列化"))
+        });
+        let Some(label) = label else {
+            return Ok(None);
+        };
+        let encoded =
+            serde_json::to_vec(&(identity.app_id, label)).map_err(|_| MemoryError::InvalidInput)?;
+        let hash: String = digest(&SHA256, &encoded)
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        Ok(Some(format!("qq-bound-principal:{hash}")))
+    }
+}

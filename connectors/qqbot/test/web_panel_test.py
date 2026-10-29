@@ -1,4 +1,5 @@
 """真实 Eve/HTTP 面板与本地模型、QQ 替身；只停止本测试持有的子进程。"""
+from fixture_auth import configure_fixture_progress
 import contextlib
 import http.client
 import json
@@ -64,7 +65,7 @@ class WebPanelAcceptance(unittest.TestCase):
                    "--bridge-script", str(BRIDGE), "--bridge-arg", str(scenario), "--web-listen", "127.0.0.1:0"]
         from fixture_auth import bootstrap_test_admin
         bootstrap_test_admin(self.work / "state", env)
-        child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        child = subprocess.Popen(command, env=configure_fixture_progress(env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         lines = []
         ready = queue.Queue()
         def stderr_reader():

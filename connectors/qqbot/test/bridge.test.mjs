@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Readable, PassThrough } from "node:stream";
 import { createBridge, consume, optionsFromEnv, readableFaces, MAX_FRAME, MAX_MESSAGE_ID_BYTES, MAX_PUSH_BYTES, MAX_SEGMENTS, PASSIVE_REPLY_WINDOW_MS } from "../bridge-core.mjs";
-function fixture({ group = {}, fail = false, error = null, now, limit = 128, appId = "1904159860", hold = null, fileFail = false, imageFail = false } = {}) {
+function fixture({ group = {}, fail = false, error = null, now, limit = 128, appId = "1904159860", hold = null, fileFail = false, imageFail = false, textResult = { id: "out-1" }, fileResult, imageResult } = {}) {
   const frames = [], sent = [], files = [], images = [], handlers = new Map();
   const bot = {
     appId,
@@ -12,17 +12,17 @@ function fixture({ group = {}, fail = false, error = null, now, limit = 128, app
       sent.push({ target, text });
       if (hold) await (typeof hold === "function" ? hold(target, text) : hold);
       if (typeof fail === "function" ? fail(sent.length) : fail) throw error ?? new Error("sensitive secret and message");
-      return { id: "out-1" };
+      return textResult;
     },
     async sendImage(target, source, opts) {
       images.push({ target, source, opts });
       if (imageFail) throw new Error("sensitive secret and message");
-      return { upload: { file_uuid: "uuid-2", file_info: "info-2", ttl: 60 }, message: { id: "image-msg-1" } };
+      return imageResult ?? { upload: { file_uuid: "uuid-2", file_info: "info-2", ttl: 60 }, message: { id: "image-msg-1" } };
     },
     async sendFile(target, source, opts) {
       files.push({ target, source, opts });
       if (fileFail) throw new Error("sensitive secret and message");
-      return { upload: { file_uuid: "uuid-1", file_info: "info-1", ttl: 60 }, message: { id: "file-msg-1" } };
+      return fileResult ?? { upload: { file_uuid: "uuid-1", file_info: "info-1", ttl: 60 }, message: { id: "file-msg-1" } };
     },
   };
   const bridge = createBridge(bot, f => frames.push(f), limit, now, group);
@@ -929,4 +929,22 @@ test("主动进度跨过被动窗口并限制重复与过快发送，结束后�
   await f.bridge.command({version:1,type:"finish",id:"in-1"});time+=2000;
   await f.bridge.command({version:1,type:"progress",id:"in-1",index:2,text:"旧任务",proactive:true});
   assert.equal(f.sent.length,1);
+});
+
+
+test("平台返回接受但缺少消息编号时保持未知，不宣称送达或自动重发", async () => {
+  for (const textResult of [{}, {id:""}, {id:"bad\nid"}]) {
+    const f = fixture({textResult}); f.message();
+    await f.bridge.command({version:1,type:"reply",id:"in-1",text:"结果"});
+    const delivery = f.frames.find(x => x.type === "delivery");
+    assert.equal(delivery.ok, false);
+    assert.equal(delivery.failure_kind, "transport_unknown");
+    assert.equal(f.sent.length, 1);
+    assert.equal(delivery.notice_status, "not_attempted");
+  }
+  const file = fixture({fileResult:{upload:{id:"upload-only"}}});
+  await file.bridge.command({version:1,type:"file",id:"file-unknown",scope:"c2c",target_id:"user-1",path:"/tmp/file.txt"});
+  assert.equal(file.frames.at(-1).ok, false);
+  assert.equal(file.frames.at(-1).failure_kind, "transport_unknown");
+  assert.equal(file.files.length, 1);
 });

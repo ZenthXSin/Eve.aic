@@ -5,7 +5,7 @@ on:
     branches: [main]
     tags: ['v*']
   pull_request:
-    paths: ['packaging/**', 'scripts/package-*.ps1', 'scripts/package-*.py', 'scripts/test-*package.py', 'scripts/test-launcher-signal.py', 'scripts/*client-update*.mjs', 'scripts/client_update_native.py', 'scripts/release-portable.py', 'scripts/test-release-portable.py', '.github/workflows/release.yml']
+    paths: ['packaging/**', 'scripts/package-*.ps1', 'scripts/package-*.py', 'scripts/test-*package.py', 'scripts/test-package-*.py', 'scripts/test-launcher-signal.py', 'scripts/test-launcher-*.mjs', 'scripts/*client-update*.mjs', 'scripts/client_update_native.py', 'scripts/release-portable.py', 'scripts/test-release-portable.py', '.github/workflows/release.yml']
   workflow_dispatch:
 
 permissions:
@@ -31,12 +31,16 @@ jobs:
           persist-credentials: false
       - name: 验证版本选择、失败保护和草稿恢复
         run: python scripts/test-release-portable.py
+      - name: 验证打包下载总期限、容量和小文件归档
+        run: python scripts/test-package-portable.py
       - name: 安装与便携包一致的 Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '22.22.0'
       - name: 验证客户端更新与恢复
         run: node scripts/test-client-update.mjs
+      - name: 验证启动器能力开关与内置脚本运行时
+        run: node --test scripts/test-launcher-features.mjs
       - name: 为主线或标签选择发行版本
         id: version
         env:
@@ -56,8 +60,6 @@ jobs:
           - {label: windows-arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc, os: windows}
           - {label: linux-x64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, os: linux}
           - {label: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, os: linux}
-          - {label: macos-x64, runner: macos-15-intel, target: x86_64-apple-darwin, os: macos}
-          - {label: macos-arm64, runner: macos-15, target: aarch64-apple-darwin, os: macos}
     steps:
       - name: 检出精确源码
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -72,7 +74,6 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.os == 'windows' && '-C target-feature=+crt-static' || '' }}
           CARGO_INCREMENTAL: '0'
-          MACOSX_DEPLOYMENT_TARGET: '11.0'
           EVE_BUILD_TARGET: ${{ matrix.target }}
         shell: bash
         run: cargo build -p eve-app --bins --release --locked --target "$EVE_BUILD_TARGET"
@@ -114,7 +115,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: 下载六个平台的验收产物
+      - name: 下载四个平台的验收产物
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: Eve-*

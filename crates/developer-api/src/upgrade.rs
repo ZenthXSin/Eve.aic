@@ -4,6 +4,21 @@ use std::path::PathBuf;
 
 pub const LIVE_UPGRADE_VERSION: u8 = 1;
 pub const LIVE_UPGRADE_MAX_JSON: usize = 1024 * 1024;
+pub const LIVE_UPGRADE_LEASE_MS: u64 = 24 * 3600 * 1000;
+
+/// 宿主准备阶段签发的内容绑定；模型只能选摘要，不能补写或放宽校验字段。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpgradeLease {
+    pub format_version: u8,
+    pub candidate_sha256: String,
+    pub manifest_sha256: String,
+    pub plan_sha256: String,
+    pub validation_sha256: String,
+    pub state_schema_version: u8,
+    pub created_at_ms: u64,
+    pub expires_at_ms: u64,
+}
 
 pub fn valid_candidate_sha(value: &str) -> bool {
     value.len() == 64
@@ -27,6 +42,8 @@ pub struct UpgradeRequest {
     pub session_id: String,
     pub requested_by: String,
     pub turn_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<UpgradeLease>,
 }
 
 /// Python 监督器定期原子保存；附加状态只作为数据，不能授予权限。

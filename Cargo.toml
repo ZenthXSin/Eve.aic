@@ -1,5 +1,8 @@
 [workspace]
 members = [
+    "crates/script-runtime",
+    "crates/subject-api",
+    "crates/subject-plugin",
     "crates/health-watch",
     "crates/workflow-tools",
     "crates/action-review",

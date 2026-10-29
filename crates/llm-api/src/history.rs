@@ -116,3 +116,28 @@ pub fn history_turns(messages: &[ChatMessage]) -> Vec<&[ChatMessage]> {
         })
         .collect()
 }
+
+/// 工作集只作为非授权资料进入请求；不能替代用户原话、身份或工具权限。
+pub const MAX_HISTORY_WORKING_SET_BYTES: usize = 16 * 1024;
+/// 六条审核原话独立保留，超过此总量时拒绝本轮，不截断授权上下文。
+pub const MAX_REVIEW_USER_MESSAGES_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HistoryContextPlan {
+    /// 原始 history_turns 的零基下标；严格递增、唯一，只选择完整轮次。
+    pub retained_turns: Vec<usize>,
+    /// 宿主核验范围后的工作集；模型摘要不是授权，原话仍由审核通道独立保留。
+    pub working_set: Vec<String>,
+}
+
+/// 可选的分层历史加载器。scope 来自已授权宿主；相关性模型不能授予范围或权限。
+/// None 明确沿用既有上下文路径（例如群观察锚点）；Err 停止本轮。
+/// 实现可在内部对建议模型失败采用确定性退路，不能无声跨范围加载资料。
+pub trait HistoryContextPlanner: Send + Sync {
+    fn plan<'a>(
+        &'a self,
+        scope: Option<&'a ContextScope>,
+        input: &'a crate::TurnInput,
+        history: &'a [ChatMessage],
+    ) -> LlmFuture<'a, Option<HistoryContextPlan>>;
+}

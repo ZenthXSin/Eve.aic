@@ -95,7 +95,13 @@ test('稳定版本按数值比较，拒绝预发行、降级、错误平台和�
   assert.throws(() => updatePlan({ ...release, assets: [{ ...release.assets[0], browser_download_url: 'https://example.com/evil' }] }, base));
   assert.throws(() => updatePlan({ ...release, assets: [] }, base));
 });
-test('六个平台均选用对应原生资产', () => {
+test('仅四个Linux和Windows平台可选对应原生资产，历史macOS资产不再选用', () => {
+  assert.deepEqual(Object.keys(TARGETS).sort(), ['linux-arm64', 'linux-x64', 'windows-arm64', 'windows-x64']);
+  for (const [platform_label, target] of [['macos-x64', 'x86_64-apple-darwin'], ['macos-arm64', 'aarch64-apple-darwin']]) {
+    const current = { ...base, platform_label, target };
+    assert.throws(() => currentManifest(current));
+    assert.throws(() => updatePlan(releaseOf(Buffer.from('historical archive'), 'v2.0.0', platform_label), current));
+  }
   for (const platform_label of [undefined, 'unknown', '__proto__', ['linux-x64']]) {
     assert.throws(() => currentManifest({ ...base, platform_label, target: undefined }));
     assert.throws(() => currentManifest({ ...base, platform_label }));
@@ -151,6 +157,30 @@ test('关闭本次更新不切换已下载版本', async t => {
   const f = await fixture(t); await f.updater.check({ force: true });
   assert.equal((await f.updater.resolveInstalled({ activate: false })).appRoot, f.root);
   assert.equal((await f.updater.status()).pending.version, 'v1.1.0'); await preserved(f);
+});
+test('相同内容重复准备复用不可变目录，损坏候选不能被重新下载覆盖', async t => {
+  const f = await fixture(t); await f.updater.check({ force: true });
+  const first = (await f.updater.status()).pending;
+  const directory = path.join(f.root, '.eve-updates/versions', first.slot);
+  const manifest = await fs.readFile(path.join(directory, 'build-info.json'));
+  const stamp = (await fs.stat(path.join(directory, 'build-info.json'))).mtimeMs;
+  await f.updater.check({ force: true });
+  assert.deepEqual((await f.updater.status()).pending, first);
+  assert.equal((await fs.readdir(path.dirname(directory))).length, 1);
+  assert.equal((await fs.stat(path.join(directory, 'build-info.json'))).mtimeMs, stamp);
+  assert.deepEqual(await fs.readFile(path.join(directory, 'build-info.json')), manifest);
+  await fs.writeFile(path.join(directory, 'eve'), 'tampered');
+  await assert.rejects(f.updater.check({ force: true }), /损坏/);
+  assert.equal(await fs.readFile(path.join(directory, 'eve'), 'utf8'), 'tampered');
+  await preserved(f);
+});
+test('候选保留达到上限时保留原目录并拒绝继续增长', async t => {
+  const f = await fixture(t), versions = path.join(f.root, '.eve-updates/versions');
+  await fs.mkdir(versions, { recursive: true });
+  for (let index = 0; index < 8; index++) await fs.mkdir(path.join(versions, `retained-${index}`));
+  await assert.rejects(f.updater.check({ force: true }), /八份上限/);
+  assert.equal((await fs.readdir(versions)).length, 8);
+  assert.equal((await f.updater.status()).pending, null); await preserved(f);
 });
 test('第二次升级保留上一版本，显式回退恢复原选择', async t => {
   const f = await fixture(t); await f.updater.check({ force: true }); await f.updater.resolveInstalled();

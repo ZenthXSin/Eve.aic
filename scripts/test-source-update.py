@@ -120,6 +120,14 @@ print('fixture check passed')
         self.assertEqual(self.fixture.events.read_text().splitlines(), ['old', 'new'])
         self.assertEqual(runtime.read_json(self.fixture.queue / 'supervisor.json')['active_sha256'], supervisor.status['active_sha256'])
 
+    def test_auto_request_directory_alias_still_uses_the_host_idle_gate(self):
+        # Windows TEMP 可能是 8.3 短名，监督器 resolve 后为长名；用 .. 在所有平台重现目录别名。
+        self.updater.control = self.fixture.queue / '..' / self.fixture.queue.name
+        self.supervisor_start()
+        self.ticks(lambda: self.updater.status.get('result') in ('applied', 'failed'))
+        self.assertEqual(self.updater.status.get('result'), 'applied', json.dumps(self.updater.status))
+        self.assertEqual(self.fixture.events.read_text().splitlines(), ['old', 'new'])
+
     def test_stages_recompute_jobs_and_children_receive_actual_limits_in_order(self):
         observed = []
         probe = self.probe
@@ -188,6 +196,29 @@ print('fixture check passed')
         self.assertEqual(subprocess.check_output([str(binary)]).decode().strip(),'42')
         self.assertEqual([len(c['steps']) for c in manifest['checks']],[1,2,2,2])
         self.assertIn('1 passed',manifest['checks'][2]['stdout'])
+
+    def test_large_log_tail_is_bounded_and_never_uses_read_bytes(self):
+        log=self.root/'large.log'
+        with log.open('wb') as stream:
+            stream.seek(128*1024*1024);stream.write(b'final-line')
+        with patch.object(Path,'read_bytes',side_effect=AssertionError('unbounded read')):
+            tail,truncated=update.log_tail(log)
+        self.assertTrue(truncated)
+        self.assertEqual(len(tail),16384)
+        self.assertTrue(tail.endswith('final-line'))
+
+    def test_repeated_prepare_reuses_immutable_candidate_and_renews_only_lease(self):
+        first=self.prepare();directory=Path(first['request']['candidate_directory'])
+        manifest=(directory/'manifest.json').read_bytes();stamp=(directory/'manifest.json').stat().st_mtime_ns
+        second=self.prepare()
+        self.assertEqual(first['request']['candidate_sha256'],second['request']['candidate_sha256'])
+        self.assertEqual((directory/'manifest.json').read_bytes(),manifest)
+        self.assertEqual((directory/'manifest.json').stat().st_mtime_ns,stamp)
+        self.assertGreaterEqual(second['request']['lease']['created_at_ms'],first['request']['lease']['created_at_ms'])
+        runtime.validate_lease(second['request'],directory,runtime.read_json(directory/'manifest.json'))
+        (directory/'resources/AGENT.md').write_text('tampered')
+        with self.assertRaisesRegex(ValueError,'resource_changed'):self.prepare()
+        self.assertEqual((directory/'resources/AGENT.md').read_text(),'tampered')
 
     def test_check_failure_does_not_publish_candidate_or_touch_old_instance(self):
         (self.root / 'fail-check').touch()

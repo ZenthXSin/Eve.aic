@@ -1,4 +1,5 @@
 """生产 Rust→Node 桥接：明确呼叫绕过耗尽预算、失败 Jev 和插话限流，不重答。"""
+from fixture_auth import configure_fixture_progress
 import json
 import os
 from pathlib import Path
@@ -61,7 +62,7 @@ export class QQBot {
         self.runs += 1
         child = subprocess.Popen([str(reminder_test.BINARY),'--group-chat','--message-judge','jev',
             '--state-dir',str(self.work/'state'),'--agent',str(source.parents[1]/'AGENT.md'),
-            '--bridge-script',str(root/'bridge.mjs')],env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            '--bridge-script',str(root/'bridge.mjs')],env=configure_fixture_progress(env),text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         try:
             self.wait_for(lambda:record.exists() and len(record.read_text().splitlines())==3,'仅前缀或私聊唤醒失败',25)
             self.quiet()
@@ -136,7 +137,7 @@ export class QQBot {
         child = subprocess.Popen([str(reminder_test.BINARY), '--group-chat', '--training', '--interest-learning',
             '--message-judge', 'jev', '--autonomy-budget', '1', '--state-dir', str(self.work / 'state'),
             '--agent', str(source.parents[1] / 'AGENT.md'), '--bridge-script', str(root / 'bridge.mjs')],
-            env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            env=configure_fixture_progress(env), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             self.wait_for(lambda:child.poll() is not None or len(self.kind('chat')) >= 4, '名字呼叫未逐条进入普通会话', 25)
             self.wait_for(lambda:sum(e['state'] == 'Sent' for e in self.documents().get('eve.channel.qqbot', {}).get('receipts.v1', {}).get('entries', [])) == 4,

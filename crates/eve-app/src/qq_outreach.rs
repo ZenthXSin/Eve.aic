@@ -739,6 +739,7 @@ impl QqOutreach for ChannelAdapter {
                 http_status,
                 biz_code,
             },
+            QqOutreachResult::Unknown => AttemptResult::Unknown,
             QqOutreachResult::NotSent => AttemptResult::NotSent,
         };
         self.outreach

@@ -6,14 +6,23 @@ mod conversations;
 mod files;
 mod live;
 pub use live::LiveDialogue;
+mod admission;
 mod observer;
+pub use admission::{QqAdmission, QqAdmissionResult};
+/// 组合层在启动任何可写服务前核验既有回执；复用正式加载器，绝不修复或重写原字节。
+pub fn validate_receipt_state(bytes: &[u8]) -> eve_plugin_api::PluginResult<()> {
+    state::Ledger::decode(bytes).map(|_| ())
+}
+
 mod outreach;
 mod participants;
+mod progress;
+pub use progress::{ModelProgressNarrator, QqProgressFacts, QqProgressNarrator};
 mod state;
 
 pub use archive::{QqArchivedReceipt, QqReceiptArchive, read_archived_receipt};
 pub use commands::{QqCommandHandler, QqCommandInput};
-pub use conversations::{QqConversationIdentity, QqConversations, QqWakeupLease};
+pub use conversations::{QqConversationIdentity, QqConversations, QqTurnAnchor, QqWakeupLease};
 pub use files::{
     QQ_FILE_CAPTION_MAX_BYTES, QQ_FILE_NAME_MAX_BYTES, QQ_FILE_PATH_MAX_BYTES, QqFileDelivery,
     QqFileMessage, QqFileResult, QqRawMessage, QqRawMessageObserver, valid_caption, valid_name,
@@ -227,9 +236,11 @@ pub struct QqBotPlugin {
     participant_observer: Option<Arc<dyn QqParticipantObserver>>,
     timing_diagnostics: bool,
     slow_progress: Option<Arc<dyn QqSlowProgress>>,
+    progress_narrator: Option<Arc<dyn QqProgressNarrator>>,
     debounce: Option<Arc<dyn QqDebounce>>,
     stickers: Option<Arc<dyn QqStickers>>,
     failure_recovery: Option<Arc<dyn QqFailureRecovery>>,
+    admission: Option<Arc<dyn QqAdmission>>,
     receipt_archive: Option<Arc<dyn QqReceiptArchive>>,
     group_observer: Option<Arc<dyn QqGroupObserver>>,
     live: Option<Arc<LiveDialogue>>,
@@ -271,9 +282,11 @@ impl QqBotPlugin {
             participant_observer: None,
             timing_diagnostics: false,
             slow_progress: None,
+            progress_narrator: None,
             debounce: None,
             stickers: None,
             failure_recovery: None,
+            admission: None,
             receipt_archive: None,
             group_observer: None,
             live: None,
@@ -393,6 +406,12 @@ impl QqBotPlugin {
         self
     }
 
+    /// 进度由模型按真实事实自由生成；未接线或生成失败时不发送自动进度。
+    pub fn with_progress_narrator(mut self, narrator: Arc<dyn QqProgressNarrator>) -> Self {
+        self.progress_narrator = Some(narrator);
+        self
+    }
+
     /// 开启连发合并；未接线时每条消息各自成一轮。
     pub fn with_stickers(mut self, stickers: Arc<dyn QqStickers>) -> Self {
         self.stickers = Some(stickers);
@@ -445,6 +464,10 @@ impl QqBotPlugin {
     }
 }
 impl QqBotPlugin {
+    pub fn with_admission(mut self, admission: Arc<dyn QqAdmission>) -> Self {
+        self.admission = Some(admission);
+        self
+    }
     pub fn with_group_observer(mut self, observer: Arc<dyn QqGroupObserver>) -> Self {
         self.group_observer = Some(observer);
         self
@@ -493,15 +516,15 @@ impl Plugin for QqBotPlugin {
                     if restored >= 256 {
                         break;
                     }
-                    if !owners.is_owner(&entry.message.user_id).unwrap_or(false) {
-                        continue;
-                    }
                     let (Ok(session), Ok(conversation)) = (
                         entry.message.session_key(&entry.app_id),
                         entry.message.conversation_key(&entry.app_id),
                     ) else {
                         continue;
                     };
+                    if !owners.is_owner(&session.user_id).unwrap_or(false) {
+                        continue;
+                    }
                     if access
                         .claim_owner_group(
                             session,
@@ -571,9 +594,11 @@ impl Plugin for QqBotPlugin {
             let group_observer = self.group_observer.clone();
             let timing_diagnostics = self.timing_diagnostics;
             let slow_progress = self.slow_progress.clone();
+            let progress_narrator = self.progress_narrator.clone();
             let debounce = self.debounce.clone();
             let stickers = self.stickers.clone();
             let failure_recovery = self.failure_recovery.clone();
+            let admission = self.admission.clone();
             let live = self.live.clone();
             let group_whitelist = self.group_whitelist.clone();
             let owner_directory = self.owner_directory.clone();
@@ -601,9 +626,11 @@ impl Plugin for QqBotPlugin {
                     let participant_observer = participant_observer.clone();
                     let group_observer = group_observer.clone();
                     let slow_progress = slow_progress.clone();
+                    let progress_narrator = progress_narrator.clone();
                     let debounce = debounce.clone();
                     let stickers = stickers.clone();
                     let failure_recovery = failure_recovery.clone();
+                    let admission = admission.clone();
                     let live = live.clone();
                     let group_whitelist = group_whitelist.clone();
                     let owner_directory = owner_directory.clone();
@@ -636,9 +663,11 @@ impl Plugin for QqBotPlugin {
                                 group_observer,
                                 timing_diagnostics,
                                 slow_progress,
+                                progress_narrator,
                                 debounce,
                                 stickers,
                                 failure_recovery,
+                                admission,
                                 live,
                                 group_whitelist,
                                 owner_directory,

@@ -171,11 +171,30 @@ pub trait ChimeService: Send + Sync {
     fn recent_decisions(&self, conversation: &str) -> Vec<ChimeDecision>;
 }
 
+/// 本轮可信消息ID确定的序号窗口。消息按持久插入序号升序，绝不读取cutoff之后的后发消息。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupObservationWindow {
+    pub cutoff_seq: u64,
+    pub anchor_ids: Vec<String>,
+    pub messages: Vec<ObservedMessage>,
+}
+
 /// 可信渠道观察记录与主动投递账本；保存原话不表示任务完成或管理员授权。
 pub trait GroupObservationStore: Send + Sync {
     fn append(&self, message: &GroupMessage) -> Result<bool, String>;
     fn recent(&self, conversation: &str, limit: usize) -> Result<Vec<GroupMessage>, String>;
     fn message(&self, conversation: &str, id: &str) -> Result<Option<GroupMessage>, String>;
+    /// 原子读取截至本轮主消息的最近窗口，必须保留全部合并批次ID。
+    /// 缺失锚点/跨群/不支持的实现明确报错，不回退到全群最新消息，也不猜正文。
+    fn window_ending_at(
+        &self,
+        _conversation: &str,
+        _anchor_ids: &[String],
+        _limit: usize,
+    ) -> Result<GroupObservationWindow, String> {
+        Err("群观察存储不支持可信轮次窗口".into())
+    }
+
     /// 当前群的原话关键词检索，按序号降序；before_seq 是排他的向前翻页游标。
     /// 空关键词表示直接向前翻页；不支持的实现明确报错，不请求模型补造结果。
     fn search(
@@ -193,6 +212,11 @@ pub trait GroupObservationStore: Send + Sync {
     fn queue(&self, id: &str, reply: &ChimeReply, speaker: &str) -> Result<(), String>;
     fn claim(&self) -> Result<Option<GroupOutbound>, String>;
     fn finish(&self, id: &str, sent: bool) -> Result<(), String>;
+    /// 平台未确认实际发送结局；保留unknown，不能写成失败或成功，也不能补发。
+    fn finish_unknown(&self, _id: &str) -> Result<(), String> {
+        Err("群观察存储不支持未知结局".into())
+    }
+
     fn abandon(&self, id: &str) -> Result<(), String>;
     fn outbound(&self, id: &str) -> Result<Option<GroupOutbound>, String>;
     /// 序号大于 `after_seq` 的消息，按序号升序，至多 `limit` 条；用于按需增量整理。

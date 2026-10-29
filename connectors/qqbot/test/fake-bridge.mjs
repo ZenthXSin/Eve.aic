@@ -157,7 +157,7 @@ if (scenario.script) {
       if (!message) throw new Error("wrong_reply_id");
       if (cmd.type === "progress") {
         commands.push(cmd);
-        if (!message.hold_progress) send({ type: "delivery", id: cmd.id, progress: true, index: cmd.index, ok: !message.fail_progress,
+        if (!message.hold_progress) send({ type: "delivery", id: cmd.id, progress: true, index: cmd.index, ok: !message.fail_progress, message_id: "progress-" + cmd.id + "-" + cmd.index,
           ...(message.progress_diagnostic ?? {}) });
         continue;
       }
@@ -211,7 +211,7 @@ for await (const line of lines) {
   if (cmd.type === "stop") break;
   if (cmd.id !== scenario.messages[index]?.id) throw new Error("wrong_reply_id");
   if (cmd.type === "progress") {
-    send({ type: "delivery", id: cmd.id, progress: true, index: cmd.index, ok: true });
+    send({ type: "delivery", id: cmd.id, progress: true, index: cmd.index, ok: true, message_id: "progress-" + cmd.id + "-" + cmd.index });
     continue;
   }
   if (cmd.type === "reply") {

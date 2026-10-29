@@ -17,8 +17,9 @@ jobs:
   stable:
     name: Stable / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # Windows 的完整构建、测试和独立进程示例已接近 15 分钟；保留所有检查并留出运行余量。
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 40 || 15 }}
+    # 保留完整检查。Linux 已在 15 分钟末尾的核心帮助正常输出后被总期限取消，留 5 分钟余量。
+    # Windows 的完整构建与实际进程验收更慢，继续使用原有 40 分钟上限。
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 40 || 20 }}
     strategy:
       fail-fast: false
       matrix:
@@ -42,10 +43,33 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '22.22.0'
+      - name: 准备 Linux 脚本与成员项目的真实隔离环境
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          sudo apt-get install -y bubblewrap python3 nodejs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Ubuntu 24.04 的 AppArmor 默认限制非特权用户命名空间；与成员项目验收保持一致。
+          if (Test-Path "/proc/sys/kernel/apparmor_restrict_unprivileged_userns") {
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          bwrap --unshare-all --ro-bind / / --dev /dev --proc /proc /usr/bin/true
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          /usr/bin/python3 --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          /usr/bin/node --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证自动发行的版本与恢复语义
         run: python -X utf8 scripts/test-release-portable.py
+      - name: 验证打包下载总期限、容量和小文件归档
+        run: python -X utf8 scripts/test-package-portable.py
       - name: 验证客户端更新、资产校验与失败恢复
         run: node scripts/test-client-update.mjs
+      - name: 验证启动器能力开关与内置脚本运行时
+        if: runner.os == 'Linux'
+        run: node --test scripts/test-launcher-features.mjs
       - name: 验证实时升级切换、失败回退与不回放
         run: |
           $output = & python -X utf8 scripts/test-self-upgrade-runtime.py 2>&1
@@ -57,7 +81,15 @@ jobs:
             exit $result
           }
       - name: 验证源码自动同步、检查失败与空闲切换
-        run: python -X utf8 scripts/test-source-update.py
+        run: |
+          $output = & python -X utf8 scripts/test-source-update.py 2>&1
+          $result = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($result -ne 0) {
+            $details = ($output -join "`n").Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=源码自动同步验收失败::$details"
+            exit $result
+          }
       - name: 验证资源配额、可用内存与编译阶段并发
         run: python -X utf8 scripts/test-build-resources.py
       - name: 验证 Linux 外层守护、孤儿清理与两层崩溃恢复
@@ -93,6 +125,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
           python -X utf8 connectors/qqbot/test/memory_test.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 验证模型进度、轮内提问与真实文件投递凭据
+        run: |
+          $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
+          python -X utf8 connectors/qqbot/test/progress_narration_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证主人跨群账号、撤权与旧身份兼容
         run: |

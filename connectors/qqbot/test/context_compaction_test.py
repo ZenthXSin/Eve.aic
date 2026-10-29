@@ -7,6 +7,11 @@ from dialogue_tools_test import text_response, tool_response
 
 
 class ContextCompactionAcceptance(digest.HistoryDigestAcceptance):
+    def run_window(self, script, **options):
+        # 本组验证150k压缩而非64KiB历史窗口拒绝；保留原大回执进入压缩器。
+        env = {"EVE_HISTORY_MAX_BYTES": "1048576", **options.pop("env_extra", {})}
+        return super().run_window(script, env_extra=env, **options)
+
     for _name in dir(digest.HistoryDigestAcceptance):
         if _name.startswith("test_"):
             locals()[_name] = None
@@ -55,7 +60,7 @@ class ContextCompactionAcceptance(digest.HistoryDigestAcceptance):
         self.assertEqual(len(self.requests), 2)
         self.assertIn("对话历史压缩器", self.requests[1]["body"]["messages"][0]["content"])
 
-    def test_150k_tool_context_is_summarized_then_continues_and_saved_history_reuses_after_restart(self):
+    def test_150k_tool_context_is_summarized_then_continues_and_restart_recomputes_selected_history(self):
         content = "中文结果" * 2700
         (self.source / "README.md").write_text(content, encoding="utf8")
         self.dialogue_calls = 0
@@ -93,11 +98,11 @@ class ContextCompactionAcceptance(digest.HistoryDigestAcceptance):
         self.assertEqual(sum(len(m.get("tool_calls", [])) for m in messages), 8)
         self.assertEqual(sum(len(m.get("tool_results", [])) for m in messages), 8)
         self.assertIn(content, json.dumps(completed, ensure_ascii=False))
-        self.assertTrue(self.digest_files())
+        # 分层选择后的索引不能复用全历史covered_turns，持久摘要不作本轮缓存。
         previous = json.dumps(completed, sort_keys=True)
         requests_before = len(self.digest_requests())
         self.run_window([*self.send(self.message("restart", "重启后接着", expected="全部完成"))], env_extra=env, extra=features)
-        self.assertEqual(len(self.digest_requests()), requests_before)
+        self.assertGreater(len(self.digest_requests()), requests_before, "重启后必须针对重新选择的完整原轮次安全重算摘要")
         self.assertEqual(json.dumps(self.turn("读取八次并核验完成"), sort_keys=True), previous)
 
 

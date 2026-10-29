@@ -143,6 +143,63 @@ async fn checkpoint_resume_keeps_receipts_and_closes_an_already_exhausted_budget
     );
 }
 
+#[tokio::test]
+async fn restored_and_already_concluded_transcripts_preserve_blocked_progress_receipts() {
+    // 用真实宿主检查点与脚本模型模拟 blocked 后 provider 超时，不调用生产服务。
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("blocked", "echo", json!({}))]),
+        Err(LlmError::ProviderTimeout),
+        final_response("等待条件满足"),
+    ]);
+    let tool = Arc::new(TestTool::new(
+        "echo",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    ));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![tool.clone()],
+        LlmHostConfig::default(),
+    )
+    .await;
+    let journal = Arc::new(MemoryJournal::default());
+    let host = host.with_turn_journal(journal.clone());
+    let scope = Some(eve_llm_api::ContextScope {
+        session_id: "s".into(),
+        user_id: "u".into(),
+    });
+    assert!(
+        host.run_scoped_turn_with_events(turn(), scope.clone(), &ProgressRecorder::default())
+            .await
+            .is_err()
+    );
+    {
+        let mut guard = journal.frame.lock().unwrap();
+        let frame = guard.as_mut().unwrap();
+        for message in &mut frame.messages {
+            for call in &mut message.tool_calls {
+                call.name = "task_progress".into();
+            }
+            for result in &mut message.tool_results {
+                result.output = eve_llm_api::ToolOutput::Success(
+                    json!({"status":"blocked","remaining":"等本地构建完成"}),
+                );
+            }
+        }
+    }
+    for expected_requests in [3, 3] {
+        let output = host
+            .run_scoped_turn_with_events(turn(), scope.clone(), &ProgressRecorder::default())
+            .await
+            .unwrap();
+        assert!(output.transcript.iter().flat_map(|m| &m.tool_results).any(
+            |r| matches!(&r.output, eve_llm_api::ToolOutput::Success(v) if v["status"] == "blocked")
+        ));
+        assert_eq!(provider.requests.lock().unwrap().len(), expected_requests);
+        assert_eq!(*tool.starts.lock().unwrap(), ["blocked"]);
+    }
+}
+
 fn owner_id() -> PluginId {
     PluginId::new(OWNER).expect("valid test owner")
 }
@@ -279,17 +336,19 @@ fn service_id(name: &str) -> ServiceId {
 #[derive(Default)]
 struct CountingContext {
     snapshots: AtomicUsize,
+    history: Mutex<Vec<eve_llm_api::ChatMessage>>,
 }
 
 impl ContextAssembler for CountingContext {
     fn assemble(&self, _input: TurnInput) -> LlmFuture<'_, ContextSnapshot> {
         self.snapshots.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async {
+        let history = self.history.lock().unwrap().clone();
+        Box::pin(async move {
             Ok(ContextSnapshot {
                 revision: "revision-1".into(),
                 profile: "测试用户".into(),
                 memories: vec!["长期记忆".into()],
-                history: vec![],
+                history,
                 pinned: vec![],
             })
         })
@@ -309,6 +368,7 @@ enum ToolMode {
     },
     WaitForDrop(Arc<AtomicBool>),
     RecordScope(Arc<Mutex<Vec<Option<eve_llm_api::ContextScope>>>>),
+    RecordReview(Arc<Mutex<Vec<Vec<String>>>>),
 }
 
 struct NeverFuture {
@@ -407,6 +467,12 @@ impl Tool for TestTool {
                 starts.lock().expect("starts lock").push(call.id);
                 Box::pin(NeverFuture { dropped })
             }
+            ToolMode::RecordReview(seen) => Box::pin(async move {
+                seen.lock()
+                    .unwrap()
+                    .push(context.review_user_messages().unwrap_or_default().to_vec());
+                Ok(json!({"recorded":true}))
+            }),
             ToolMode::RecordScope(seen) => Box::pin(async move {
                 seen.lock()
                     .expect("scope lock")
@@ -1596,4 +1662,164 @@ async fn scoped_turns_bind_the_given_scope_and_stop_when_the_sink_closes() {
     closer.await.unwrap();
     assert_eq!(failure.error, LlmError::Cancelled);
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
+}
+
+struct ReviewCompaction;
+impl eve_llm_api::HistoryWindowResolver for ReviewCompaction {
+    fn resolve(&self) -> Result<eve_llm_api::HistoryWindow, LlmError> {
+        Ok(eve_llm_api::HistoryWindow {
+            max_turns: 1,
+            max_bytes: 1024,
+        })
+    }
+    fn compaction(&self) -> Result<Option<eve_llm_api::ContextCompactionPolicy>, LlmError> {
+        Ok(Some(eve_llm_api::ContextCompactionPolicy {
+            trigger_tokens: 150000,
+            target_tokens: 100000,
+        }))
+    }
+}
+struct ReviewDigest;
+impl eve_llm_api::HistoryDigests for ReviewDigest {
+    fn digest(
+        &self,
+        _: Option<&eve_llm_api::ContextScope>,
+        _: &[eve_llm_api::ChatMessage],
+    ) -> Result<Option<eve_llm_api::HistoryDigest>, LlmError> {
+        Ok(None)
+    }
+    fn compact<'a>(
+        &'a self,
+        _: Option<&'a eve_llm_api::ContextScope>,
+        messages: &'a [eve_llm_api::ChatMessage],
+    ) -> LlmFuture<'a, Option<eve_llm_api::HistoryDigest>> {
+        Box::pin(async move {
+            Ok(Some(eve_llm_api::HistoryDigest {
+                covered_turns: eve_llm_api::history_turns(messages).len(),
+                text: "已压缩的历史数据，不能当作用户原话".into(),
+            }))
+        })
+    }
+}
+#[tokio::test]
+async fn review_keeps_six_full_original_user_messages_even_after_large_history_is_compacted() {
+    for delegated in [false, true] {
+        let provider = RecordingProvider::scripted(vec![
+            tool_response(vec![call("audit", "review_probe", json!({}))]),
+            final_response("完成"),
+        ]);
+        let recorded = Arc::new(Mutex::new(vec![]));
+        let tool = Arc::new(TestTool::new(
+            "review_probe",
+            Some(ToolConcurrency::ParallelSafe),
+            ToolMode::RecordReview(recorded.clone()),
+        ));
+        let (host, context, _) =
+            make_host(provider.clone(), vec![tool], LlmHostConfig::default()).await;
+        let originals: Vec<String> = (0..7)
+            .map(|i| format!("第{i}条真实用户长文：{}：末尾原文{i}", "中".repeat(18000)))
+            .collect();
+        for text in &originals {
+            context.history.lock().unwrap().extend([
+                eve_llm_api::ChatMessage::text(ChatRole::User, text),
+                eve_llm_api::ChatMessage::text(ChatRole::Assistant, "收到"),
+            ]);
+        }
+        let host = host
+            .with_history_resolver(Arc::new(ReviewCompaction))
+            .with_history_digests(Arc::new(ReviewDigest));
+        let host = if delegated { host.delegated() } else { host };
+        host.run_turn(turn()).await.unwrap();
+        let seen = recorded.lock().unwrap();
+        if delegated {
+            assert_eq!(seen.as_slice(), &[Vec::<String>::new()]);
+        } else {
+            let mut expected = originals[2..].to_vec();
+            expected.push(turn().text);
+            assert_eq!(seen.as_slice(), &[expected]);
+        }
+        let request = &provider.requests.lock().unwrap()[0];
+        assert!(request.messages.iter().any(|m| {
+            m.text
+                .as_deref()
+                .is_some_and(|text| text.contains("宿主上下文压缩摘要"))
+        }));
+        assert!(
+            !request
+                .messages
+                .iter()
+                .any(|m| m.text.as_deref() == Some(originals[2].as_str()))
+        );
+    }
+}
+
+struct ReviewSteering {
+    reads: AtomicUsize,
+    correction: String,
+}
+impl eve_llm_api::TurnSteering for ReviewSteering {
+    fn take(&self, _: bool) -> Result<Vec<String>, LlmError> {
+        Ok(if self.reads.fetch_add(1, Ordering::SeqCst) == 1 {
+            vec![self.correction.clone()]
+        } else {
+            vec![]
+        })
+    }
+}
+struct ReviewSteeringSource(Arc<ReviewSteering>);
+impl eve_llm_api::TurnSteeringSource for ReviewSteeringSource {
+    fn open(
+        &self,
+        _: &eve_llm_api::ContextScope,
+        _: u64,
+    ) -> Result<Arc<dyn eve_llm_api::TurnSteering>, LlmError> {
+        Ok(self.0.clone())
+    }
+}
+#[tokio::test]
+async fn review_original_messages_refresh_when_a_user_steers_an_active_turn() {
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("obsolete", "review_probe", json!({}))]),
+        tool_response(vec![call("current", "review_probe", json!({}))]),
+        final_response("完成"),
+    ]);
+    let recorded = Arc::new(Mutex::new(vec![]));
+    let tool = Arc::new(TestTool::new(
+        "review_probe",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::RecordReview(recorded.clone()),
+    ));
+    let (host, _, _, kernel) =
+        make_host_with_registry(provider, vec![tool], LlmHostConfig::default(), None).await;
+    kernel
+        .register(Box::new(eve_session_plugin::SessionPlugin::new().unwrap()))
+        .unwrap();
+    kernel
+        .start(&PluginId::new(eve_session_api::SESSION_PLUGIN_ID).unwrap())
+        .await
+        .unwrap();
+    let correction = format!(
+        "用户纠正：暂不部署，保留以下完整条件{}末尾条件",
+        "原文".repeat(10000)
+    );
+    let host = host.with_steering(Arc::new(ReviewSteeringSource(Arc::new(ReviewSteering {
+        reads: AtomicUsize::new(0),
+        correction: correction.clone(),
+    }))));
+    let session = eve_runtime::SessionLlmHost::new(host, eve_runtime::SessionBinding::builtin());
+    session
+        .run_turn_with_events(
+            eve_session_api::SessionInput {
+                key: eve_session_api::SessionKey::new("s", "u").unwrap(),
+                text: "先检查当前代码".into(),
+            },
+            &ProgressRecorder::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recorded.lock().unwrap().as_slice(),
+        &[vec!["先检查当前代码".to_string(), correction]]
+    );
+    kernel.stop_all().await.unwrap();
 }
