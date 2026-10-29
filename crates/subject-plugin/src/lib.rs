@@ -1,5 +1,7 @@
 //! 单一主体的有界持久账本；执行能力仍由宿主注入，不直接执行模型或外部副作用。
 mod driver;
+mod opportunity;
+pub use opportunity::{Opportunity, decode_opportunity, encode_opportunity, select_opportunity};
 mod strict_json;
 pub use driver::{SubjectDispatch, SubjectDriver};
 use eve_plugin_api::{
