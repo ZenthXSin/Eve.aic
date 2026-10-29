@@ -136,9 +136,21 @@ def start(upstream: str | None = None, key: str | None = None) -> str:
         UPSTREAM = upstream.rstrip("/")
     if key is not None:
         UPSTREAM_KEY = key
-    from wsgiref.simple_server import make_server
+    from wsgiref.simple_server import WSGIRequestHandler, make_server
 
-    _httpd = make_server("127.0.0.1", PORT, Handler())
+    class QuietHandler(WSGIRequestHandler):
+        def log_message(self, fmt, *args):  # 静默访问日志，开销留给业务
+            pass
+
+    # ThreadingWSGIServer：生图同步等待最长 280s，单线程会堵死并发请求
+    from socketserver import ThreadingMixIn
+    from wsgiref.simple_server import WSGIServer
+
+    class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+        daemon_threads = True
+
+    _httpd = make_server("127.0.0.1", PORT, Handler(), server_class=ThreadingWSGIServer,
+                         handler_class=QuietHandler)
     threading.Thread(target=_httpd.serve_forever, daemon=True).start()
     return "http://127.0.0.1:%d" % PORT
 
