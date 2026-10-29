@@ -142,14 +142,96 @@ async fn repair_shares_the_original_five_minute_deadline() {
 }
 
 #[tokio::test]
-async fn provider_failures_are_not_retried_as_format_repairs() {
+async fn permanent_provider_failure_is_not_retried_as_a_format_repair() {
     let (digest, provider) = fixture(vec![Reply {
         delay: Duration::ZERO,
-        result: Err(LlmError::ProviderTimeout),
+        result: Err(LlmError::ProviderFailed(
+            eve_llm_api::ProviderFailure::http(402).unwrap(),
+        )),
     }]);
+    assert_eq!(
+        digest.digest(request()).await.unwrap_err(),
+        LlmError::ProviderFailed(eve_llm_api::ProviderFailure::http(402).unwrap())
+    );
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn transient_digest_failure_retries_original_input_once_without_tools() {
+    for error in [
+        LlmError::ProviderTimeout,
+        LlmError::ProviderFailed(eve_llm_api::ProviderFailure::http(503).unwrap()),
+        LlmError::Protocol("empty response".into()),
+    ] {
+        let (digest, provider) = fixture(vec![
+            Reply {
+                delay: Duration::from_secs(2),
+                result: Err(error),
+            },
+            text(VALID, 0),
+        ]);
+        assert!(digest.digest(request()).await.is_ok());
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].messages[1], requests[1].messages[1]);
+        assert!(requests.iter().all(|r| r.tools.is_empty()));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn rejected_or_cancelled_digests_are_not_retried() {
+    for error in [
+        LlmError::Cancelled,
+        LlmError::ProviderFailed(eve_llm_api::ProviderFailure::http(400).unwrap()),
+        LlmError::ProviderFailed(eve_llm_api::ProviderFailure::http(401).unwrap()),
+    ] {
+        let (digest, provider) = fixture(vec![Reply {
+            delay: Duration::ZERO,
+            result: Err(error.clone()),
+        }]);
+        assert_eq!(digest.digest(request()).await.unwrap_err(), error);
+        assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_transient_failures_are_bounded_and_keep_the_error() {
+    let (digest, provider) = fixture(vec![
+        Reply {
+            delay: Duration::ZERO,
+            result: Err(LlmError::ProviderTimeout),
+        },
+        Reply {
+            delay: Duration::ZERO,
+            result: Err(LlmError::ProviderTimeout),
+        },
+    ]);
     assert_eq!(
         digest.digest(request()).await.unwrap_err(),
         LlmError::ProviderTimeout
     );
-    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    assert_eq!(provider.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_short_provider_timeout_does_not_consume_the_whole_retry_budget() {
+    struct ShortResolver(Arc<Scripted>);
+    impl LlmModelResolver for ShortResolver {
+        fn resolve(&self) -> Result<ModelSelection, LlmError> {
+            Ok(ModelSelection {
+                provider: self.0.clone(),
+                provider_timeout: Duration::from_secs(2),
+            })
+        }
+    }
+    let (_, provider) = fixture(vec![
+        Reply {
+            delay: Duration::from_secs(2),
+            result: Err(LlmError::ProviderTimeout),
+        },
+        text(VALID, 1),
+    ]);
+    let digest = ModelHistoryDigester::new(Arc::new(ShortResolver(provider.clone())));
+    assert!(digest.digest(request()).await.is_ok());
+    assert_eq!(provider.requests.lock().unwrap().len(), 2);
 }
