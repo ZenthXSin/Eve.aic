@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+eve-memory-api = { path = "../memory-api" }
 eve-chime-api = { path = "../chime-api" }
 eve-llm-api = { path = "../llm-api" }
 eve-message-diagnostics = { path = "../message-diagnostics" }

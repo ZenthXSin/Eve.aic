@@ -4,6 +4,7 @@
 短暂观察窗口只验证没有后台重试。停止只操作本测试持有的 Popen，不向任意 PID 发信号。
 确定性替身只证明宿主契约与恢复语义，不代表真实模型的观察质量。
 """
+from fixture_auth import configure_fixture_progress, is_progress_request, progress_fixture_text
 import json
 from fixture_auth import bootstrap_test_admin
 import contextlib
@@ -50,6 +51,7 @@ class InterestAcceptance(unittest.TestCase):
         self.work = pathlib.Path(self.directory.name)
         self.state_path = self.work / "state/state.json"
         self.requests = []
+        self.progress_requests = []
         self.errors = []
         self.lock = threading.Lock()
         self.runs = 0
@@ -94,12 +96,13 @@ class InterestAcceptance(unittest.TestCase):
                     decoded = json.loads(latest)
                 except (ValueError, TypeError):
                     decoded = None
-                kind = outer.classify(decoded, latest)
+                kind = "progress" if is_progress_request(body) else outer.classify(decoded, latest)
                 release = outer.run_release
                 with outer.lock:
-                    outer.requests.append({"kind": kind, "body": body, "run": outer.runs,
-                                           "state": outer.documents()})
-                    number = sum(request["kind"] == kind for request in outer.requests)
+                    requests = outer.progress_requests if kind == "progress" else outer.requests
+                    requests.append({"kind": kind, "body": body, "run": outer.runs,
+                                     "state": outer.documents()})
+                    number = sum(request["kind"] == kind for request in requests)
                 outer.arrived(kind, number).touch()
                 gate = outer.response_gates.get((kind, number))
                 if gate is not None:
@@ -153,6 +156,8 @@ class InterestAcceptance(unittest.TestCase):
         return "chat"
 
     def reply(self, kind, decoded, latest):
+        if kind == "progress":
+            return progress_fixture_text(decoded)
         if kind == "interest":
             return json.dumps(self.observe(decoded), ensure_ascii=False)
         if kind == "reflection":
@@ -265,7 +270,7 @@ class InterestAcceptance(unittest.TestCase):
 
         inspector = threading.Thread(target=inspect, daemon=True)
         with self.panel_stderr.open("w", encoding="utf8") if panel else contextlib.nullcontext(None) as panel_log:
-            child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=panel_log or subprocess.PIPE, text=True)
+            child = subprocess.Popen(command, env=configure_fixture_progress(env), stdout=subprocess.PIPE, stderr=panel_log or subprocess.PIPE, text=True)
             inspector.start()
             try:
                 if stop_at is not None:
@@ -282,7 +287,7 @@ class InterestAcceptance(unittest.TestCase):
         if panel:
             stderr = self.panel_stderr.read_text(encoding="utf8")
         self.assertFalse(inspector.is_alive(), "state inspector did not stop")
-        self.assertFalse(error_path.exists(), error_path.read_text() if error_path.exists() else "")
+        self.assertFalse(error_path.exists(), (error_path.read_text() + "\n" + stderr[-6000:]) if error_path.exists() else "")
         self.assertFalse(self.errors, "\n".join(self.errors))
         for secret in ("test-model-secret", "test-app-secret"):
             self.assertNotIn(secret, stdout + stderr)

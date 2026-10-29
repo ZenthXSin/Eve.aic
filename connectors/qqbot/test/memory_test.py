@@ -3,6 +3,7 @@
 所有停止操作都使用本测试创建并持有的 Popen；不读取 PID 文件发送信号。
 快照检查通过桥接 touch/wait_file 握手，避免用固定延时猜测提交时序。
 """
+from fixture_auth import configure_fixture_progress, is_progress_request, progress_fixture_text
 import json
 from fixture_auth import bootstrap_test_admin
 import os
@@ -39,6 +40,7 @@ class MemoryAcceptance(unittest.TestCase):
         self.work = pathlib.Path(self.directory.name)
         self.state_path = self.work / "state/state.json"
         self.requests = []
+        self.progress_requests = []
         self.errors = []
         self.lock = threading.Lock()
         self.runs = 0
@@ -64,12 +66,13 @@ class MemoryAcceptance(unittest.TestCase):
                 assert self.path == "/v1/chat/completions"
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 latest = body["messages"][-1]["content"]
-                kind = "reflection" if "unverified_waiting_input" in latest else "chat"
+                kind = "progress" if is_progress_request(body) else "reflection" if "unverified_waiting_input" in latest else "chat"
                 release = outer.run_release
                 with outer.lock:
-                    outer.requests.append({"kind": kind, "body": body, "run": outer.runs,
-                                           "state": outer.documents()})
-                    number = sum(request["kind"] == kind for request in outer.requests)
+                    requests = outer.progress_requests if kind == "progress" else outer.requests
+                    requests.append({"kind": kind, "body": body, "run": outer.runs,
+                                     "state": outer.documents()})
+                    number = sum(request["kind"] == kind for request in requests)
                 outer.arrived(kind, number).touch()
                 gate = outer.response_gates.get((kind, number))
                 if gate is not None:
@@ -78,7 +81,7 @@ class MemoryAcceptance(unittest.TestCase):
                         if release.wait(0.01):
                             return
                         assert time.monotonic() < deadline, "response gate timed out"
-                reply = json.dumps(ARTIFACT, ensure_ascii=False) if kind == "reflection" else latest
+                reply = progress_fixture_text(json.loads(latest)) if kind == "progress" else json.dumps(ARTIFACT, ensure_ascii=False) if kind == "reflection" else latest
                 encoded = json.dumps({"choices": [{"index": 0, "finish_reason": "stop",
                     "message": {"role": "assistant", "content": reply}}]}).encode()
                 self.send_response(200)
@@ -250,7 +253,7 @@ class MemoryAcceptance(unittest.TestCase):
 
         inspector = threading.Thread(target=inspect, daemon=True)
         sink = open(self.panel_stderr, "w")
-        child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+        child = subprocess.Popen(command, env=configure_fixture_progress(env), stdout=subprocess.PIPE,
                                  stderr=sink if panel else subprocess.PIPE, text=True)
         inspector.start()
         try:

@@ -56,7 +56,7 @@ class HistoryWindowAcceptance(developer.DeveloperAcceptance):
         self.assertEqual(users, ["工具轮", "失败请求", "继续"])
         self.assertTrue(any(m["role"] == "tool" for m in continuing["messages"]))
         self.assertTrue(any("宿主失败记录" in (m.get("content") or "") for m in continuing["messages"]))
-        self.assertTrue(any("eve.runtime.history-window" in (m.get("content") or "") for m in continuing["messages"]))
+        self.assertTrue(any("宿主分层上下文数据" in (m.get("content") or "") for m in continuing["messages"]))
         last = self.chat_request("再继续")
         self.assertEqual([m["content"] for m in conversation_messages(last) if m["role"] == "user"], ["继续", "再继续"])
         before = self.turn("工具轮")

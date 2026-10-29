@@ -75,17 +75,17 @@ impl QqReceiptArchive for SqliteReceiptArchive {
     fn identity(&self) -> PluginResult<(String, u64)> {
         let connection = self.0.lock().map_err(|_| unavailable())?;
         let rows: u64 = connection
-            .query_row(
-                "SELECT count(*) FROM metadata WHERE version=1 AND length(identity)=32",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT count(*) FROM metadata", [], |r| r.get(0))
             .map_err(|_| unavailable())?;
         if rows != 1 {
             return Err(unavailable());
         }
         let id = connection
-            .query_row("SELECT identity FROM metadata", [], |r| r.get(0))
+            .query_row(
+                "SELECT identity FROM metadata WHERE version=1 AND length(identity)=32",
+                [],
+                |r| r.get(0),
+            )
             .map_err(|_| unavailable())?;
         let count = connection
             .query_row("SELECT count(*) FROM receipts", [], |r| r.get(0))
@@ -183,5 +183,24 @@ mod tests {
         std::fs::write(&path, b"broken database").unwrap();
         assert!(SqliteReceiptArchive::open(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"broken database");
+    }
+    #[test]
+    fn extra_metadata_rows_are_rejected_without_rewriting_original_database() {
+        for bad_first in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("receipts.sqlite3");
+            let archive = SqliteReceiptArchive::open(&path).unwrap();
+            archive.store(&[record("one", b"original")]).unwrap();
+            drop(archive);
+            let db = Connection::open(&path).unwrap();
+            db.execute("INSERT INTO metadata(rowid,version,identity) VALUES (?1,99,'invalid-future-identity')",[if bad_first {0} else {2}]).unwrap();
+            drop(db);
+            let original = std::fs::read(&path).unwrap();
+            assert!(
+                SqliteReceiptArchive::open(&path).is_err(),
+                "不能仅数匹配的行而接受附加未知身份"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
     }
 }

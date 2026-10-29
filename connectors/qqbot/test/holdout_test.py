@@ -8,6 +8,7 @@ Chromium（`--practice-browser`），在全新目录中实际打开 HTML/CSS 并
 宿主契约在新领域上的行为与真实浏览器的验证结果，不评估真实模型能否做好网页。需要设置
 EVE_TEST_BROWSER 为 Chromium 或 Chrome 程序路径。
 """
+from fixture_auth import configure_fixture_progress
 import json
 import os
 import re
@@ -217,7 +218,7 @@ class HoldoutAcceptance(outreach_test.OutreachAcceptance):
                                  "实践运行环境无效")):
             result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
                                      "--agent", str(ROOT / "AGENT.md"), *extra],
-                                    env=env, capture_output=True, text=True, timeout=60)
+                                    env=configure_fixture_progress(env), capture_output=True, text=True, timeout=60)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(expected, result.stderr)
 

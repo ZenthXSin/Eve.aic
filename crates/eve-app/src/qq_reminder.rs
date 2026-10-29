@@ -78,6 +78,8 @@ impl LocalTime {
         let (hour, minute) = time.trim().split_once(':')?;
         let (hour, minute): (i64, i64) = (hour.parse().ok()?, minute.parse().ok()?);
         if date.next().is_some()
+            // 工具声明 YYYY 年份；先限制范围，避免不可信整数在日历换算中溢出。
+            || !(1..=9999).contains(&year)
             || !(1..=12).contains(&month)
             || day == 0
             || day > days_in_month(year, month)
@@ -466,6 +468,7 @@ impl QqOutreach for ChannelAdapter {
                 http_status,
                 biz_code,
             },
+            QqOutreachResult::Unknown => DeliveryResult::Unknown,
             QqOutreachResult::NotSent => DeliveryResult::NotSent,
         };
         self.reminders
@@ -510,5 +513,16 @@ mod tests {
         };
         assert_eq!(west.offset(), "UTC-05:30");
         assert_eq!(west.parse(&west.format(utc)), Some(utc));
+    }
+
+    #[test]
+    fn oversized_model_year_is_rejected_before_calendar_arithmetic() {
+        let local = LocalTime {
+            offset_minutes: 480,
+        };
+        for year in ["10000", "999999999", "9223372036854775807"] {
+            assert_eq!(local.parse(&format!("{year}-01-01 00:00")), None);
+        }
+        assert!(local.parse("9999-12-31 23:59").is_some());
     }
 }

@@ -854,6 +854,21 @@ async fn run_qqbot_composed(
         )?,
         ..KernelServices::default()
     };
+    // 必须早于主体恢复/其他插件启动：坏QQ回执不能因旁账本启动写入而改变state.json原字节。
+    if let Some(bytes) = backends.state.get(
+        &PluginId::new(eve_qqbot_plugin::QQBOT_PLUGIN_ID)?,
+        "receipts.v1",
+    )? {
+        eve_qqbot_plugin::validate_receipt_state(&bytes)?;
+    }
+    if options.autonomy_budget.is_some()
+        && let Some(bytes) = backends.state.get(
+            &PluginId::new(BUDGET_PLUGIN_ID)?,
+            eve_budget_api::BUDGET_STATE_KEY,
+        )?
+    {
+        eve_budget_plugin::validate_state(&bytes)?;
+    }
     let registry = backends.registry.clone();
     let permissions = backends.permissions.clone();
     let logger = backends.logger.clone();
@@ -882,6 +897,7 @@ async fn run_qqbot_composed(
     let mut impression_background: Option<crate::qq_impressions::Background> = None;
     let mut phrase_background: Option<crate::qq_phrases::Background> = None;
     let mut task_background: Option<qq_tasks::Background> = None;
+    let mut subject_background: Option<crate::qq_subject::Background> = None;
     let mut group_background: Option<crate::qq_group::Background> = None;
     let mut group_jev = None;
     let mut trigger_background: Option<qq_triggers::Background> = None;
@@ -1172,6 +1188,11 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        let subject_plugin = eve_subject_plugin::SubjectPlugin::new()?;
+        let subject: Arc<dyn eve_subject_api::SubjectAdmin> = Arc::new(subject_plugin.controller());
+        kernel.register(Box::new(subject_plugin))?;
+        let subject_admission = Arc::new(crate::qq_subject_admission::Admission(subject.clone()));
+        plugin = plugin.with_admission(subject_admission.clone());
         let memory: Option<Arc<dyn MemoryAdmin>> = if options.memory {
             let archive = eve_memory_plugin::FileEvidenceArchive::open(
                 crate::storage::memory_archive_directory(&options.state_directory),
@@ -1184,6 +1205,15 @@ async fn run_qqbot_composed(
             kernel.register(Box::new(plugin))?;
             kernel.start(&PluginId::new(MEMORY_PLUGIN_ID)?).await?;
             Some(Arc::new(controller))
+        } else {
+            None
+        };
+        let experience_memory = if memory.is_some() {
+            let plugin = eve_memory_plugin::ExperienceMemoryPlugin::new()?;
+            let controller = Arc::new(plugin.controller());
+            kernel.register(Box::new(plugin))?;
+            kernel.start(&PluginId::new(eve_memory_api::EXPERIENCE_MEMORY_PLUGIN_ID)?).await?;
+            Some(controller)
         } else {
             None
         };
@@ -1337,6 +1367,7 @@ async fn run_qqbot_composed(
         };
         // 后台任务账本同样先于通道加载；损坏时拒绝启动并保留原字节，执行中的任务记为中断，发送中的通知记为结果未知。
         let task_late = Arc::new(qq_tasks::Late::default());
+        let _ = task_late.admission.set(subject_admission.clone());
         let task_runtime_manifest = Arc::new(std::sync::OnceLock::new());
         let task_policy = if let Some(path) = &options.task_strategy_catalog {
             let profiles = if options.subagents {
@@ -1783,6 +1814,20 @@ async fn run_qqbot_composed(
                 bootstrap.context.take().ok_or("对话上下文缺失")?,
             )?));
         }
+        if let Some(experience) = &experience_memory {
+            let principal_resolver: Arc<dyn eve_memory_api::ExperiencePrincipalResolver> = Arc::new(
+                crate::qq_memory_continuity::PrincipalResolver(crate::qq_memory_continuity::Policy {
+                    registry: registry.clone(), conversations: conversations.clone(), unified: None,
+                }),
+            );
+            bootstrap.tools.extend(crate::subject_memory::tools_with_principal_resolver(
+                "qq", experience.clone(), Some(principal_resolver.clone()),
+            )?);
+            bootstrap.context = Some(Arc::new(crate::subject_memory::ExperienceContext::new(
+                "qq", experience.clone(), bootstrap.context.take().ok_or("对话上下文缺失")?,
+            )?.with_principal_resolver(principal_resolver)));
+        }
+
         // 后台能力不自动成为对话工具：显式装配公开 Tool，并让帮助和能力上下文共用注册源。
         // 本地资料地址交给资料源，其他地址交给网页抓取器（或替换实现）。
         let routed = |web: Arc<dyn SourceFetcher>| -> Arc<dyn SourceFetcher> {
@@ -1953,7 +1998,7 @@ async fn run_qqbot_composed(
                 authorization: qq_admin.clone(),
             }));
         }
-        crate::developer::install_with_member_runtime(
+        let developer_backend = crate::developer::install_with_member_runtime_backend(
             &mut bootstrap,
             &options.state_directory,
             Some(qq_admin.clone()),
@@ -1972,6 +2017,27 @@ async fn run_qqbot_composed(
                     services: Arc::new(services),
                 }));
         }
+        bootstrap.tools.push(Arc::new(crate::qq_subject::FocusTool(subject.clone())));
+        bootstrap.tools.push(Arc::new(crate::qq_subject::ConfigureTool { subject: subject.clone(), owner: qq_admin.clone(), reviewer: crate::developer::action_reviewer(registry.clone(), model_health.clone()) }));
+        bootstrap.tools.push(Arc::new(crate::qq_files::FileDeliveryStatusTool(outbox.clone())));
+        let mut script_sandbox = eve_script_runtime::Bubblewrap::new("/usr/bin/python3", std::env::var_os("EVE_SCRIPT_NODE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/usr/bin/node")));
+        if let Some(rustc) = std::env::var_os("EVE_SCRIPT_RUSTC") { script_sandbox = script_sandbox.with_rustc(PathBuf::from(rustc)); }
+        match (std::env::var_os("EVE_SCRIPT_CONTAINER_CLI"), std::env::var("EVE_SCRIPT_CONTAINER_IMAGE").ok()) {
+            (Some(cli), Some(image)) => script_sandbox = script_sandbox.with_container(eve_script_runtime::ContainerSandbox { cli: cli.into(), image }),
+            (None, None) => {},
+            _ => return Err("容器沙箱需要同时配置 EVE_SCRIPT_CONTAINER_CLI 与 EVE_SCRIPT_CONTAINER_IMAGE".into()),
+        }
+        let script_tools = crate::qq_scripts::ScriptTools::open(
+            options.state_directory.join("script-plugins"),
+            script_sandbox,
+            Arc::new(crate::qq_access::ScriptAuthorizer { admin: qq_admin.clone(), public_github, developer: developer_backend.clone(), outbox: outbox.clone() }),
+        )?;
+        bootstrap.tools.extend(script_tools.tools());
+        if let Some(tasks) = &tasks {
+            let (store, sandbox) = script_tools.replay_source();
+            bootstrap.tools.extend(crate::qq_failure_replay::tools(store, sandbox, backends.state.clone(), Arc::new(tasks.clone())));
+        }
+        bootstrap.context = Some(Arc::new(crate::qq_subject::Context { inner: bootstrap.context.take().ok_or("主体上下文缺失")?, subject: subject.clone() }));
         let workflow_store = if options.workflow_tools {
             let store = eve_workflow_tools::WorkflowStore::open(options.state_directory.join("workflow-tools"))?;
             bootstrap.tools.extend(eve_workflow_tools::tools(store.clone()));
@@ -1989,6 +2055,7 @@ async fn run_qqbot_composed(
                 public_github,
             });
         }
+        script_tools.bind_tools(bootstrap.tools.iter().filter(|t| crate::qq_scripts::is_synchronous_leaf(&t.definition().name)).cloned().collect())?;
         if let Some(store) = &workflow_store {
             store.bind_tools(bootstrap.tools.iter().filter(|t| !eve_workflow_tools::TOOL_NAMES.contains(&t.definition().name.as_str())).cloned().collect())?;
         }
@@ -2010,6 +2077,9 @@ async fn run_qqbot_composed(
             );
         }
         // 执行器与对话共用工具服务和宿主设置；在核心装配之后建立。
+        let context_planner = Arc::new(crate::layered_context::Planner::new(registry.clone(), tasks.clone().map(|t| Arc::new(t) as Arc<dyn eve_task_api::TaskAdmin>)));
+        bootstrap.history_context_planner = Some(context_planner.clone());
+        bootstrap.tools.push(Arc::new(crate::layered_context::ReadRecord(context_planner.clone())));
         let worker_tools: Vec<String> = bootstrap
             .tools
             .iter()
@@ -2053,6 +2123,9 @@ async fn run_qqbot_composed(
             options.web_listen.map(|_| page_permit.clone()),
         )
         .await?;
+        if let Some(selector) = crate::qq_message_judge::context_selector(qq_tasks::config_service(registry.as_ref())?) {
+            let _ = context_planner.selector.set(selector);
+        }
         if let (Some(admin), Some(late)) = (&trigger_admin, &trigger_observations) {
             let sessions = registry
                 .get(&ServiceId::new(eve_session_api::SESSION_SERVICE_ID)?)?
@@ -2067,7 +2140,7 @@ async fn run_qqbot_composed(
                         .clone()
                         .map(|t| Arc::new(t) as Arc<dyn eve_task_api::TaskAdmin>),
                 )?
-                .with_authorization(qq_admin.clone()),
+                .with_authorization(qq_admin.clone()).with_admission(subject_admission.clone()),
             );
             let _ = late.set(observations.clone());
             trigger_background = Some(qq_triggers::Background::start(
@@ -2196,6 +2269,7 @@ async fn run_qqbot_composed(
             )))
         };
         let budgeted = |category: &str| budget_gate.wrap(observed(category)?, category);
+        plugin = plugin.with_progress_narrator(Arc::new(eve_qqbot_plugin::ModelProgressNarrator(observed("progress")?)));
         // 群消息整理由对话中的工具按需触发，与主对话一样不计入自主运行预算；用途单独记健康。
         if let Some(tool) = &group_digest {
             let _ = tool.digester.set(Arc::new(eve_chime_plugin::ModelGroupDigester::new(
@@ -2228,7 +2302,7 @@ async fn run_qqbot_composed(
             };
             group_background = Some(crate::qq_group::Background::start(
                 group.clone(),
-                control.clone(),
+                crate::qq_group_admission::GroupControl::wrap(control.clone(), subject_admission.clone()),
                 budgeted(crate::chime::MODEL_USE)?,
                 relations,
                 budget_gate.clone(),
@@ -2271,9 +2345,10 @@ async fn run_qqbot_composed(
         if let Some(stickers) = &stickers {
             sticker_background = Some(crate::qq_stickers::Background::start(
                 stickers.clone(),
-                Arc::new(eve_sticker_plugin::ModelStickerReviewer::new(observed(
+                Arc::new(eve_sticker_plugin::ModelStickerReviewer::new(budgeted(
                     crate::qq_stickers::MODEL_USE,
                 )?)),
+                budget_gate.clone(),
             ));
         }
         // 人物印象：此人谈及自己的原话攒够一批后学习一次；用途 impression 单独记健康与输出上限。
@@ -2282,12 +2357,13 @@ async fn run_qqbot_composed(
             .set(qq_tasks::config_service(registry.as_ref())?);
         impression_background = Some(crate::qq_impressions::Background::start(
             people.clone(),
-            Arc::new(eve_people_plugin::ModelImpressionLearner::new(observed(
+            Arc::new(eve_people_plugin::ModelImpressionLearner::new(budgeted(
                 crate::qq_impressions::MODEL_USE,
             )?)),
             impression_policy.clone(),
+            budget_gate.clone(),
             crate::qq_impressions::Profiles {
-                consolidator: Arc::new(eve_people_plugin::ModelProfileConsolidator::new(observed(
+                consolidator: Arc::new(eve_people_plugin::ModelProfileConsolidator::new(budgeted(
                     crate::qq_impressions::MODEL_USE,
                 )?)),
                 queue: profile_queue.clone(),
@@ -2299,10 +2375,11 @@ async fn run_qqbot_composed(
             .set(qq_tasks::config_service(registry.as_ref())?);
         phrase_background = Some(crate::qq_phrases::Background::start(
             training.0.clone(),
-            Arc::new(eve_training_plugin::ModelPhraseLearner::new(observed(
+            Arc::new(eve_training_plugin::ModelPhraseLearner::new(budgeted(
                 crate::qq_phrases::MODEL_USE,
             )?)),
             phrase_policy.clone(),
+            budget_gate.clone(),
         ));
         // 后台任务与子代理共用执行器：用途 task 单独记健康与输出上限，不计入自主运行预算。
         if tasks.is_some() || options.subagents {
@@ -2321,6 +2398,9 @@ async fn run_qqbot_composed(
             .await?;
             worker.authorize_with(qq_admin.clone());
             let _ = task_late.worker.set(worker);
+        }
+        if let Some(tasks) = &tasks {
+            subject_background = Some(crate::qq_subject::Background::start(subject.clone(), Arc::new(tasks.clone()), qq_admin.clone()));
         }
         let failure_recovery = if let Some(tasks) = &tasks {
             let recovery = Arc::new(crate::qq_failure_recovery::Recovery {
@@ -2562,8 +2642,15 @@ async fn run_qqbot_composed(
                 }
                 None => None,
             };
+            let practice_ledger: Arc<dyn PracticeAdmin> = match &experience_memory {
+                Some(memory) => Arc::new(crate::subject_memory::PublicPracticeRecorder::new(
+                    Arc::new(practice.clone()), memory.clone(),
+                    crate::subject_memory::public_practice_artifacts_from_env()?,
+                )?),
+                None => Arc::new(practice.clone()),
+            };
             let mut practitioner =
-                Practitioner::new(Arc::new(practice.clone()), drafter, runner.clone());
+                Practitioner::new(practice_ledger, drafter, runner.clone());
             if let Some(strategy) = &strategies {
                 practitioner = practitioner.with_strategy(strategy.clone())?;
             }
@@ -2903,6 +2990,9 @@ async fn run_qqbot_composed(
         kernel.register(Box::new(relation))?;
         kernel.register(Box::new(MessageRouterPlugin::builtin()?))?;
         kernel.register(Box::new(plugin))?;
+        // 完成组合配置和各账本读取后才恢复主体，避免错误启动改写其他损坏状态。
+        kernel.start(&PluginId::new(eve_subject_api::SUBJECT_PLUGIN_ID)?).await?;
+        subject.abandon_pending_kind("work_admission", qq_tasks::now_ms())?;
         kernel.start(&PluginId::new(QQBOT_PLUGIN_ID)?).await?;
         let handle = registry
             .get(&ServiceId::new(QQBOT_STATUS_SERVICE_ID)?)?
@@ -3041,6 +3131,7 @@ async fn run_qqbot_composed(
         if let Some(tasks) = &task_background {
             tasks.activate();
         }
+        if let Some(subject) = &subject_background { subject.activate()?; }
         if let Some(triggers) = &trigger_background {
             triggers.activate();
         }
@@ -3137,6 +3228,7 @@ async fn run_qqbot_composed(
                         "条件唤醒后台已结束；QQ 通道停止准入并保留状态",
                     )
                 }))
+                .chain(subject_background.as_ref().map(|subject| (subject.finished(), "主体调度异常，停止准入并保留状态")))
                 .chain(task_background.as_ref().map(|tasks| {
                     (
                         tasks.finished(),
@@ -3227,6 +3319,9 @@ async fn run_qqbot_composed(
     if let Some(triggers) = &trigger_background {
         triggers.request_stop();
     }
+    if let Some(subject) = &subject_background {
+        subject.request_stop();
+    }
     if let Some(tasks) = &task_background {
         tasks.request_stop();
     }
@@ -3234,6 +3329,11 @@ async fn run_qqbot_composed(
         && let Err(error) = queries.close().await
     {
         secondary.push(error.into());
+    }
+    if let Some(subject) = subject_background
+        && let Err(error) = subject.stop().await
+    {
+        secondary.push(error);
     }
     if let Some(triggers) = trigger_background
         && let Err(error) = triggers.stop().await

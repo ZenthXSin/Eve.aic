@@ -7,6 +7,7 @@
 模型替身按请求里的工具定义与上下文确定性地调用工具，只证明宿主契约，不代表真实模型的理解能力。
 真等半小时不现实：测试在 Eve 停止时把账本里的时间一起前移，模拟时间流逝，其余字段原样保留。
 """
+from fixture_auth import configure_fixture_progress
 import datetime
 import hashlib
 import json
@@ -332,7 +333,7 @@ class ReminderAcceptance(unittest.TestCase):
                                 (["--reminders", "--reminder-utc-offset", "+15:00"], "-12:00 至 +14:00")):
             result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
                                      "--agent", str(ROOT / "AGENT.md"), *extra],
-                                    env=env, capture_output=True, text=True, timeout=60)
+                                    env=configure_fixture_progress(env), capture_output=True, text=True, timeout=60)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(expected, result.stderr)
 

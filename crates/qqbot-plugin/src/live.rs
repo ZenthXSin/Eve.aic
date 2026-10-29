@@ -31,14 +31,15 @@ pub(crate) struct LiveSend {
     pub scope: ContextScope,
     pub turn_id: u64,
     pub text: String,
-    result: oneshot::Sender<bool>,
+    pub needs_answer: bool,
+    result: oneshot::Sender<Option<String>>,
 }
 impl LiveSend {
     pub fn cancelled(&self) -> bool {
         self.result.is_closed()
     }
-    pub fn complete(self, sent: bool) {
-        let _ = self.result.send(sent);
+    pub fn complete(self, message_id: Option<String>) {
+        let _ = self.result.send(message_id);
     }
 }
 
@@ -118,14 +119,19 @@ impl Tool for SendMessage {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "send_message".into(),
-            description: "在当前会话立即说一句话，不结束当前轮，也不停止正在推进的任务。用于值得立即告知的真实进展、关键发现、短回应，或需要用户补充的具体问题；用户中途回话会直接加入本轮引导，下一次模型请求可见。不要播报调用次数、工具名或每个琐碎步骤，不反复说正在处理，不把未完成的事说成完成，不重复最终答复。一次至多 250 字，受 QQ 剩余消息配额限制；返回 sent=true 才确认送达。失败或结果未知不得自动重发。只发给当前会话，不接受目标地址。需要答案时可以先推进其他独立工作，不能假定用户已回答。".into(),
-            argument_schema: json!({"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":250}},"required":["text"],"additionalProperties":false}),
+            description: "在当前会话立即说一句话，不结束当前轮，也不停止正在推进的任务。多步任务在私聊开始、关键节点、长等待时用自己的话告知真实进展，结尾用最终答复；群聊只发开始、一个中间节点与结尾。必要授权或问题独立使用 purpose=question 或 authorization，不计作普通进度；用户中途回话会直接加入本轮引导，下一次模型请求可见。不要播报调用次数、工具名或每个琐碎步骤，不反复说正在处理，不把未完成的事说成完成，不重复最终答复。一次至多 250 字，受 QQ 剩余消息配额限制；返回 sent=true 且有 message_id、session_id 才确认送达。失败或结果未知不得自动重发。只发给当前会话，不接受目标地址。需要答案时继续推进其他独立工作，不能假定用户已回答；调用本工具不会终止主执行循环。".into(),
+            argument_schema: json!({"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":250},"purpose":{"type":"string","enum":["progress","question","authorization"]}},"required":["text"],"additionalProperties":false}),
             required_permissions: vec![],
             concurrency: Some(ToolConcurrency::Serial { scope: "eve.qq.live-send".into() }),
         }
     }
     fn validate_arguments(&self, value: &Value) -> Result<(), ToolValidationError> {
-        if value.as_object().is_none_or(|v| v.len() != 1)
+        if value
+            .as_object()
+            .is_none_or(|v| v.keys().any(|k| k != "text" && k != "purpose"))
+            || value.get("purpose").is_some_and(|p| {
+                !matches!(p.as_str(), Some("progress" | "question" | "authorization"))
+            })
             || value
                 .get("text")
                 .and_then(Value::as_str)
@@ -160,6 +166,7 @@ impl Tool for SendMessage {
             if !turn.input.lock().map_err(|_| rejected())?.accepting {
                 return Err(rejected());
             }
+            let session_id = scope.session_id.clone();
             let (sender, receiver) = oneshot::channel();
             {
                 let mut queue = self.0.outgoing.lock().map_err(|_| rejected())?;
@@ -174,14 +181,19 @@ impl Tool for SendMessage {
                         .ok_or_else(rejected)?
                         .trim()
                         .into(),
+                    needs_answer: matches!(
+                        call.arguments.get("purpose").and_then(Value::as_str),
+                        Some("question" | "authorization")
+                    ),
                     result: sender,
                 });
             }
-            let sent = receiver
+            let message_id = receiver
                 .await
                 .map_err(|_| ToolExecutionError::Failed("消息投递结果未知，不要重发".into()))?;
+            let sent = message_id.is_some();
             Ok(
-                json!({"sent":sent,"note":if sent {"已送达，继续当前任务；不要在最终答复中重复这句话"} else {"未确认送达或剩余配额不足，不要重发；可在最终答复中说明必要内容"}}),
+                json!({"sent":sent,"message_id":message_id,"session_id":session_id,"delivery_status":if sent {"sent"} else {"unknown"},"note":if sent {"已送达，继续当前任务；不要在最终答复中重复这句话"} else {"未确认送达或剩余配额不足，不要重发；可在最终答复中说明必要内容"}}),
             )
         })
     }
@@ -190,6 +202,55 @@ impl Tool for SendMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn question_send_stays_in_live_turn_and_success_returns_both_bound_ids() {
+        let live = Arc::new(LiveDialogue::default());
+        let scope = ContextScope {
+            session_id: "trusted-session".into(),
+            user_id: "owner".into(),
+        };
+        let turn = live.open(&scope, 7).unwrap();
+        let tool = live.send_tool();
+        let call = ToolCall {
+            id: "send-1".into(),
+            name: "send_message".into(),
+            arguments: json!({"text":"这个目录需要保留吗？", "purpose":"question"}),
+        };
+        tool.validate_arguments(&call.arguments).unwrap();
+        let context = ToolExecutionContext::new()
+            .with_scope(Some(scope.clone()))
+            .with_turn_id(Some(7));
+        let sending = tokio::spawn(async move { tool.execute(call, context).await });
+        let outgoing = loop {
+            if let Some(outgoing) = live.next() {
+                break outgoing;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(outgoing.needs_answer);
+        assert_eq!(outgoing.scope, scope);
+        outgoing.complete(Some("platform-message-7".into()));
+        let result = sending.await.unwrap().unwrap();
+        assert_eq!(result["sent"], true);
+        assert_eq!(result["message_id"], "platform-message-7");
+        assert_eq!(result["session_id"], "trusted-session");
+        assert!(live.steer(&scope, 7, "保留".into(), || Ok(())).unwrap());
+        assert_eq!(turn.take(false).unwrap(), ["保留"]);
+        let foreign = ToolExecutionContext::new()
+            .with_scope(Some(ContextScope {
+                user_id: "stranger".into(),
+                ..scope
+            }))
+            .with_turn_id(Some(7));
+        let tool = live.send_tool();
+        let call = ToolCall {
+            id: "send-2".into(),
+            name: "send_message".into(),
+            arguments: json!({"text":"越权"}),
+        };
+        assert!(tool.execute(call, foreign).await.is_err());
+    }
 
     #[test]
     fn steering_is_isolated_durable_before_visible_and_atomically_sealed() {

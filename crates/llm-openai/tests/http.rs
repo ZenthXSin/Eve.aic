@@ -347,3 +347,39 @@ async fn reports_provider_usage_and_cache_hits_to_the_observer() {
     );
     assert!(seen[1].1.is_empty(), "未报告的用量如实为空");
 }
+
+#[tokio::test]
+async fn auxiliary_requests_reject_chunked_overflow_before_eof() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for vision in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n20\r\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n").await.unwrap();
+            // Hold the stream open: a bounded client rejects this chunk without EOF.
+            std::future::pending::<()>().await;
+        });
+        let mut cfg = config(&url);
+        cfg.max_response_bytes = 16;
+        let provider = OpenAiProvider::new(cfg, "fake-key").unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            if vision {
+                provider
+                    .describe_image("describe", "image/png", b"fixture")
+                    .await
+                    .map(|_| ())
+            } else {
+                provider.list_models(10).await.map(|_| ())
+            }
+        })
+        .await;
+        server.abort();
+        assert!(
+            matches!(&result, Ok(Err(LlmError::ProviderFailed(failure))) if failure.kind == ProviderFailureKind::ResponseTooLarge),
+            "vision={vision}: {result:?}"
+        );
+    }
+}

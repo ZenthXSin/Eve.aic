@@ -115,13 +115,17 @@ impl Background {
         people: Arc<dyn PeopleDirectory>,
         learner: Arc<dyn ImpressionLearner>,
         policy: Arc<Policy>,
+        budget: crate::qq_budget::Gate,
         profiles: Profiles,
     ) -> Self {
         let (active, activated) = watch::channel(false);
         let (stop, stopped) = watch::channel(false);
         let (finished_sender, finished) = watch::channel(false);
         let task = tokio::spawn(async move {
-            run(people, learner, policy, profiles, activated, stopped).await;
+            run(
+                people, learner, policy, budget, profiles, activated, stopped,
+            )
+            .await;
             let _ = finished_sender.send(true);
         });
         Self {
@@ -160,6 +164,7 @@ async fn run(
     people: Arc<dyn PeopleDirectory>,
     learner: Arc<dyn ImpressionLearner>,
     policy: Arc<Policy>,
+    budget: crate::qq_budget::Gate,
     profiles: Profiles,
     mut active: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
@@ -176,7 +181,18 @@ async fn run(
     }
     loop {
         let mut pause = POLL;
-        if policy.learning() {
+        if policy.learning()
+            && match budget.admits_category(MODEL_USE, 1) {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    eprintln!(
+                        "EVE_BACKGROUND_BUDGET {}",
+                        json!({"category": MODEL_USE, "outcome": "unavailable", "error": error.to_string()})
+                    );
+                    return;
+                }
+            }
+        {
             match people.take_impression_batch() {
                 Ok(Some(batch)) => {
                     let request = learner.learn(batch.clone());
@@ -226,6 +242,16 @@ async fn run(
         }
         if pause == POLL
             && policy.learning()
+            && match budget.admits_category(MODEL_USE, 1) {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    eprintln!(
+                        "EVE_BACKGROUND_BUDGET {}",
+                        json!({"category": MODEL_USE, "outcome": "unavailable", "error": error.to_string()})
+                    );
+                    return;
+                }
+            }
             && let Some(request) = profiles.queue.take()
         {
             let consolidation = profiles.consolidator.consolidate(request.clone());

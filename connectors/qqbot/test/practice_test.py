@@ -8,6 +8,7 @@
 无头服务端（需要 PATH 上的 java）；其余用例使用确定性替身，只证明宿主契约与恢复语义，
 不代表真实模型的草稿质量。
 """
+from fixture_auth import configure_fixture_progress
 import json
 import os
 import pathlib
@@ -290,7 +291,7 @@ class PracticeAcceptance(unittest.TestCase):
                                 (["--interest-learning", "--practice-mindustry-server", str(not_jar)], "实践运行环境无效")):
             result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
                                      "--agent", str(ROOT / "AGENT.md"), *extra],
-                                    env=env, capture_output=True, text=True, timeout=60)
+                                    env=configure_fixture_progress(env), capture_output=True, text=True, timeout=60)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(expected, result.stderr)
         self.assertEqual(self.launches(), [])

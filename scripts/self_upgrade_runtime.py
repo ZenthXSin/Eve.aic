@@ -18,6 +18,43 @@ MAX_JSON = 1024 * 1024
 # 文件状态用 JSON 整数数组保存插件字节；16 MiB 回执可膨胀为约 64 MiB。
 MAX_STATE_JSON = 256 * 1024 * 1024
 RECOVERY_STOP = 78
+LEASE_SECONDS = 24 * 3600
+
+def value_digest(value):
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                    separators=(',', ':')).encode()).hexdigest()
+
+def prepare_lease(directory, manifest):
+    """租约独立于不可变候选；重新准备只续租，不覆盖已发布的字节。"""
+    now = int(time.time() * 1000)
+    return dict(format_version=1, candidate_sha256=manifest['candidate_sha256'],
+                manifest_sha256=digest(directory / 'manifest.json'),
+                plan_sha256=value_digest(dict(operation='switch_binary_preserve_state',
+                    candidate_sha256=manifest['candidate_sha256'], state_schema_version=1,
+                    validation_policy='format-clippy-tests-release-build-v1')),
+                validation_sha256=value_digest(manifest['checks']), state_schema_version=1,
+                created_at_ms=now, expires_at_ms=now + LEASE_SECONDS * 1000)
+
+def validate_lease(request, directory, manifest):
+    lease = request.get('lease')
+    if lease is None:
+        raise ValueError('prepare_lease_missing')
+    fields = {'format_version', 'candidate_sha256', 'manifest_sha256', 'plan_sha256',
+              'validation_sha256', 'state_schema_version', 'created_at_ms', 'expires_at_ms'}
+    if (not isinstance(lease, dict) or set(lease) != fields
+            or type(lease['format_version']) is not int or lease['format_version'] != 1
+            or type(lease['state_schema_version']) is not int or lease['state_schema_version'] != 1
+            or any(type(lease[k]) is not int for k in ('created_at_ms', 'expires_at_ms'))
+            or lease['expires_at_ms'] <= lease['created_at_ms']
+            or lease['expires_at_ms'] - lease['created_at_ms'] > LEASE_SECONDS * 1000):
+        raise ValueError('prepare_lease_changed')
+    expected = prepare_lease(directory, manifest)
+    if any(lease[k] != expected[k] for k in fields - {'created_at_ms', 'expires_at_ms'}):
+        raise ValueError('prepare_lease_changed')
+    now = int(time.time() * 1000)
+    if lease['created_at_ms'] > now + 1000 or lease['expires_at_ms'] <= now:
+        raise ValueError('prepare_lease_expired')
+    return lease
 
 def digest(path):
     if not path.is_file() or path.is_symlink() or path.stat().st_size > 2 * 1024 * 1024 * 1024:
@@ -93,7 +130,7 @@ def replace_argument(command, name, value):
 
 def validate_candidate(request, candidates):
     required = {'format_version', 'candidate_sha256', 'candidate_directory', 'session_id', 'requested_by', 'turn_id'}
-    if not isinstance(request, dict) or set(request) != required or type(request['format_version']) is not int or request['format_version'] != VERSION or not sha(request['candidate_sha256']):
+    if not isinstance(request, dict) or set(request) not in (required, required | {'lease'}) or type(request['format_version']) is not int or request['format_version'] != VERSION or not sha(request['candidate_sha256']):
         raise ValueError('invalid_request')
     if type(request['turn_id']) is not int or request['turn_id'] <= 0:
         raise ValueError('invalid_turn')
@@ -308,6 +345,20 @@ def delivery_gate(state_path, request, inherited=frozenset()):
     return bool(matching and matching['state'] == 'Sent' and matching.get('reply') == reply) and all(t['status']['state'] != 'Pending'
                         for s in sessions['sessions'].values() for t in s['turns'])
 
+def drain_stamp(state_path):
+    """侧账本及 SQLite WAL 也参与门禁缓存；大状态未变化时不重复解析。"""
+    paths = [state_path, state_path.parent / 'qq-outbox' / 'ledger.json']
+    paths += [state_path.parent / ('group-observations.sqlite3' + suffix)
+              for suffix in ('', '-wal', '-journal')]
+    stamps = []
+    for path in paths:
+        try:
+            stat = path.stat()
+            stamps.append((stat.st_ino, stat.st_mtime_ns, stat.st_size))
+        except FileNotFoundError:
+            stamps.append(None)
+    return tuple(stamps)
+
 def validate_merged_receipts(receipts):
     """格式 4 起的合并关系只关联同身份、顺序在后的非合并目标；不得隐藏未决投递。"""
     if receipts['version'] not in (4, 5, 6, 7, 8):
@@ -417,6 +468,8 @@ class Child:
             self.process.wait(timeout=timeout)
         self.close_group(timeout)
         self.thread.join(timeout=1)
+        if not self.thread.is_alive():
+            self.process.stderr.close()
         return self.process.returncode
 
 class Supervisor:
@@ -439,6 +492,10 @@ class Supervisor:
             raise ValueError('file_state_supervisor_requires_file_backend')
         self.state = Path(argument(self.command, '--state-dir')) / 'state.json'
         if not self.state.is_absolute(): raise ValueError('state_directory_must_be_absolute')
+        state_root = self.state.parent.resolve()
+        if any(state_root == p.resolve() or state_root in p.resolve().parents
+               or p.resolve() in state_root.parents for p in (self.root, options.candidates)):
+            raise ValueError('state_directory_overlaps_upgrade')
         self.inherited_receipts = inherited_receipts(self.state)
         if self.inherited_receipts:
             print(f'EVE_UPGRADE_RECOVERY inherited_unknown_receipts={len(self.inherited_receipts)} preserved_no_replay', file=sys.stderr, flush=True)
@@ -487,6 +544,7 @@ class Supervisor:
         if getattr(options, 'auto_update_config', None):
             from source_update import SourceUpdater
             self.updater = SourceUpdater(options.auto_update_config, self.root, options.candidates)
+        self.prune_backups()
 
 
     def publish(self, **changes):
@@ -498,6 +556,22 @@ class Supervisor:
         history = self.root / 'history'
         history.mkdir(exist_ok=True)
         path.rename(history / f'{time.time_ns()}-{result}.json')
+
+    def failure_evidence(self, error, request=None):
+        """仅保存错误码、摘要与阶段；不复制会话、密钥、完整日志或状态。"""
+        code = str(error) if type(error) is ValueError and str(error).replace('_', '').isalnum() else type(error).__name__
+        atomic(self.root / 'last-failure.json', dict(format_version=1, at_ms=int(time.time() * 1000),
+               phase=self.status['phase'], error=code[:100], active_sha256=self.status['active_sha256'],
+               candidate_sha256=(request or {}).get('candidate_sha256')))
+
+    def prune_backups(self):
+        # 快照不用于自动还原；只保留最近两份现场，避免每次切换复制永久增长。
+        directory = self.root / 'backups'
+        if directory.exists():
+            backups = sorted((p for p in directory.iterdir() if p.is_dir() and not p.is_symlink()
+                              and p.name.isdecimal()), key=lambda p: int(p.name), reverse=True)
+            for path in backups[2:]:
+                shutil.rmtree(path)
 
     def wait_ready(self, child):
         deadline = time.monotonic() + self.options.ready_timeout
@@ -517,18 +591,44 @@ class Supervisor:
         if (self.root / 'quarantine' / (request['candidate_sha256'] + '.json')).exists():
             raise ValueError('candidate_quarantined')
         binary, resources, manifest = validate_candidate(request, self.options.candidates)
+        validate_lease(request, binary.parent, manifest)
         subprocess.run(execution_command([str(binary), '--help']), check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        bridge = resources / 'connectors/qqbot'
+        frozen_bridge = resources / 'connectors/qqbot'
+        # Node 依赖属于运行缓存，不能 npm ci 改写内容寻址的候选目录。
+        bridge = self.root / 'runtime-resources' / request['candidate_sha256'] / 'qqbot'
+        if not bridge.exists():
+            bridge.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=bridge.parent) as temporary:
+                staged = Path(temporary) / 'qqbot'
+                staged.mkdir()
+                for name in manifest['resources']:
+                    if name.startswith('connectors/qqbot/'):
+                        relative = name.removeprefix('connectors/qqbot/')
+                        target = staged / relative
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(frozen_bridge / relative, target)
+                staged.rename(bridge)
+        for name, expected in manifest['resources'].items():
+            if name.startswith('connectors/qqbot/'):
+                if digest(bridge / name.removeprefix('connectors/qqbot/')) != expected:
+                    raise ValueError('runtime_resource_changed')
         modules = bridge / 'node_modules'
         original_bridge = Path(argument(self.command, '--bridge-script'))
         bundled_bridge = original_bridge.name == 'bridge.mjs' and original_bridge.parent.name == 'qqbot'
-        if bundled_bridge and not modules.exists():
+        ready_marker = bridge.parent / 'dependencies-ready.json'
+        binding = dict(format_version=1, package_lock_sha256=digest(bridge / 'package-lock.json'))
+        complete = ready_marker.exists() and read_json(ready_marker) == binding
+        if bundled_bridge and modules.is_symlink(): raise ValueError('runtime_dependency_symlink')
+        if bundled_bridge and (not modules.exists() or not complete):
+            # npm ci/复制中断留下的目录不能冒充完整安装；仅重建可再生运行缓存。
+            if modules.exists(): shutil.rmtree(modules)
             old_bridge = original_bridge.parent
             if (old_bridge / 'node_modules').exists() and digest(bridge / 'package-lock.json') == digest(old_bridge / 'package-lock.json'):
                 shutil.copytree(old_bridge / 'node_modules', modules, symlinks=True)
             else:
                 subprocess.run(['npm', 'ci', '--ignore-scripts', '--no-audit', '--no-fund'], cwd=bridge,
                                check=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            atomic(ready_marker, binding)
         result = [str(binary), *without_removed_flags(self.command[1:])]
         replacements = [('--agent', resources / 'AGENT.md')]
         if bundled_bridge: replacements.append(('--bridge-script', bridge / 'bridge.mjs'))
@@ -539,16 +639,32 @@ class Supervisor:
         for index, value in enumerate(result[:-1]):
             if value == '--reference' and result[index+1].startswith('eve-portable='):
                 result[index+1] = 'eve-portable=' + str(resources / 'vendor/eve-portable-knowledge')
-        validate_candidate(request, self.options.candidates)
+        binary, _, checked = validate_candidate(request, self.options.candidates)
+        validate_lease(request, binary.parent, checked)
         return result, manifest
 
     def switch(self, request, command, manifest, request_path=None):
         if self.stopping: raise ValueError('shutdown_requested')
         # 再次核对磁盘上的请求、资源与执行文件，不能切换一份预检之后发生变化的候选。
-        request_path = request_path or self.root / 'request.json'
+        request_path = Path(request_path or self.root / 'request.json')
+        # Windows TEMP 的 8.3 短名与 resolve 后的长名必须指向同一请求类型。
+        # 只规范化父目录，保留请求文件本身供 read_json 拒绝符号链接。
+        request_path = request_path.parent.resolve() / request_path.name
+        if request_path not in (self.root / 'request.json', self.root / 'auto-request.json'):
+            raise ValueError('request_path_outside_supervisor')
         if read_json(request_path) != request or manifest['candidate_sha256'] != request['candidate_sha256']:
             raise ValueError('request_changed')
-        validate_candidate(request, self.options.candidates)
+        binary, _, checked = validate_candidate(request, self.options.candidates)
+        validate_lease(request, binary.parent, checked)
+        # 文件投递和群消息数据库可能在 state.json 未变时进入繁忙；不能只缓存主文件戳。
+        if not runtime_idle_gate(self.state, self.inherited_receipts):
+            raise ValueError('runtime_not_idle')
+        if request_path != self.root / 'auto-request.json' and not delivery_gate(self.state, request, self.inherited_receipts):
+            raise ValueError('reply_not_delivered')
+        state_bytes = sum(p.stat().st_size for p in self.state.parent.rglob('*')
+                          if p.is_file() and not p.is_symlink())
+        if shutil.disk_usage(self.root).free < state_bytes * 2 + 256 * 1024**2:
+            raise ValueError('insufficient_space_for_backup')
         self.validate_descriptor(self.active_descriptor)
         atomic(self.root / 'previous-command.json', self.active_descriptor)
         pending = request_path
@@ -558,6 +674,8 @@ class Supervisor:
         old_command = self.command
         if self.child.stop(self.options.stop_timeout) != 0:
             raise ValueError('old_process_did_not_close_cleanly')
+        if not runtime_idle_gate(self.state, self.inherited_receipts):
+            raise ValueError('runtime_drain_incomplete')
         try:
             backup = self.root / 'backups' / str(time.time_ns())
             shutil.copytree(self.state.parent, backup)
@@ -569,7 +687,8 @@ class Supervisor:
             self.active_descriptor = snapshot_command(command, request)
             self.rollback_used = False
             self.publish(phase='running', active_sha256=manifest['binary_sha256'], result='applied')
-        except (ValueError, OSError, subprocess.SubprocessError):
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            self.failure_evidence(error, request)
             self.child.stop(self.options.stop_timeout)
             if self.stopping: raise ValueError('shutdown_during_upgrade')
             self.validate_descriptor(self.active_descriptor)
@@ -577,6 +696,7 @@ class Supervisor:
             self.wait_ready(self.child)
             self.publish(phase='running', result='rolled_back_binary_state_preserved')
         self.archive_request(processing, self.status['result'])
+        self.prune_backups()
 
     def validate_descriptor(self, descriptor):
         if (not isinstance(descriptor, dict)
@@ -602,8 +722,7 @@ class Supervisor:
             return
         if self.child.process.poll() is None:
             raise ValueError('old_process_still_running')
-        self.child.close_group(self.options.stop_timeout)
-        self.child.thread.join(timeout=1)
+        self.child.stop(self.options.stop_timeout)
         now = int(time.time() * 1000)
         crashes = [c for c in self.recovery['crashes']
                    if now - c['at_ms'] <= self.options.restart_window_seconds * 1000]
@@ -652,7 +771,15 @@ class Supervisor:
         if self.stopping:
             return
         self.child = Child(self.command)
-        self.wait_ready(self.child)
+        try:
+            self.wait_ready(self.child)
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            self.failure_evidence(error)
+            self.child.stop(self.options.stop_timeout)
+            if not self.stopping:
+                # 每个未就绪的真实进程同样消耗恢复预算，不能一次失败就绕过 restart_limit。
+                return self.recover()
+            return
         self.recovery['result'] = result
         atomic(self.root / 'recovery.json', self.recovery)
         self.publish(phase='running', result=result, error=None)
@@ -665,7 +792,13 @@ class Supervisor:
         self.heart.start()
         try:
             self.child = Child(self.command)
-            self.wait_ready(self.child)
+            try:
+                self.wait_ready(self.child)
+            except (ValueError, OSError, subprocess.SubprocessError) as error:
+                self.failure_evidence(error)
+                self.child.stop(self.options.stop_timeout)
+                if not self.stopping:
+                    self.recover()
             self.publish(phase='running')
             waiting_since = None
             quiet_since = None
@@ -682,10 +815,13 @@ class Supervisor:
                     self.updater.tick(self)
                 pending = self.root / 'request.json'
                 if pending.exists():
+                    request = None
                     try:
                         request = read_json(pending)
                         if not isinstance(request, dict) or not sha(request.get('candidate_sha256')):
                             raise ValueError('invalid_request')
+                        if prepared is not None and prepared[0] != request:
+                            raise ValueError('request_changed')
                         if prepared is None:
                             self.publish(phase='preparing', candidate_sha256=request.get('candidate_sha256'), result=None, error=None)
                             prepared = (request, *self.candidate_command(request))
@@ -693,16 +829,17 @@ class Supervisor:
                             self.publish(phase='waiting')
                         if time.monotonic() - waiting_since > self.options.drain_timeout:
                             raise ValueError('reply_or_idle_timeout')
-                        stat = self.state.stat()
-                        stamp = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+                        stamp = drain_stamp(self.state)
                         if state_stamp != stamp:
-                            gate = delivery_gate(self.state, request, self.inherited_receipts)
+                            gate = (delivery_gate(self.state, request, self.inherited_receipts)
+                                    and runtime_idle_gate(self.state, self.inherited_receipts))
                             state_stamp = stamp
                         if gate:
                             quiet_since = quiet_since or time.monotonic()
                             if time.monotonic() - quiet_since >= self.options.quiet_seconds:
                                 if prepared[0] != request: raise ValueError('request_changed')
-                                if not delivery_gate(self.state, request, self.inherited_receipts):
+                                if not (delivery_gate(self.state, request, self.inherited_receipts)
+                                        and runtime_idle_gate(self.state, self.inherited_receipts)):
                                     quiet_since = None
                                     continue
                                 self.switch(*prepared)
@@ -711,6 +848,7 @@ class Supervisor:
                         else:
                             quiet_since = None
                     except (ValueError, OSError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as error:
+                        self.failure_evidence(error, request if isinstance(request, dict) else None)
                         # 拒绝候选或不能确认停机时，不宣称回退/应用成功。
                         if pending.exists(): self.archive_request(pending, 'rejected')
                         if (self.root / 'processing.json').exists():
@@ -725,6 +863,7 @@ class Supervisor:
         except Exception as error:
             code = str(error) if type(error) is ValueError and str(error).replace('_', '').isalnum() else type(error).__name__
             with contextlib.suppress(Exception):
+                self.failure_evidence(error)
                 self.recovery['result'] = code[:100]
                 atomic(self.root / 'recovery.json', self.recovery)
                 self.publish(result='stopped_state_preserved', error=code[:100])

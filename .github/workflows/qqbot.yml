@@ -91,7 +91,7 @@ jobs:
           python3 connectors/qqbot/test/vision_test.py
           python3 connectors/qqbot/test/sticker_test.py
           python3 connectors/qqbot/test/live_upgrade_test.py
-          python3 connectors/qqbot/test/self_upgrade_timeout_test.py
+          EVE_TEST_UPGRADE_TOOLCHAIN=1.89.0 python3 connectors/qqbot/test/self_upgrade_timeout_test.py
           python3 connectors/qqbot/test/transport_test.py
           python3 connectors/qqbot/test/people_test.py
           python3 connectors/qqbot/test/phrases_test.py
@@ -108,6 +108,7 @@ jobs:
           python3 connectors/qqbot/test/slow_progress_test.py
           python3 connectors/qqbot/test/stage_feedback_test.py
           python3 connectors/qqbot/test/history_window_test.py
+          python3 connectors/qqbot/test/layered_context_test.py
           python3 connectors/qqbot/test/history_digest_test.py
           python3 connectors/qqbot/test/debounce_test.py
           python3 connectors/qqbot/test/plan_test.py

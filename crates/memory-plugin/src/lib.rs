@@ -1,4 +1,6 @@
 //! 有界交互证据与明确偏好；宿主保留管理能力，不发布通用管理服务。
+mod experience;
+pub use experience::{EXPERIENCE_STATE_KEY, ExperienceMemoryController, ExperienceMemoryPlugin};
 mod unified;
 pub use unified::{UnifiedMemoryController, UnifiedMemoryPlugin};
 mod archive;

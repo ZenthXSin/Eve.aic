@@ -6,6 +6,7 @@ confirm_goal_completion，宿主核对后把待办标为已完成并记下依据
 
 模型替身按请求里的工具定义与上下文确定性地调用工具，只证明宿主契约，不代表真实模型的理解能力。
 """
+from fixture_auth import configure_fixture_progress
 import json
 import os
 import subprocess
@@ -170,7 +171,7 @@ class CompletionAcceptance(plan_test.PlanAcceptance):
         env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret")
         result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
                                  "--agent", str(ROOT / "AGENT.md"), "--goal-completion"],
-                                env=env, capture_output=True, text=True, timeout=60)
+                                env=configure_fixture_progress(env), capture_output=True, text=True, timeout=60)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("需要同时开启 --plans", result.stderr)
 

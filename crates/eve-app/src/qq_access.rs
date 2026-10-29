@@ -21,6 +21,11 @@ fn public_tool(name: &str) -> bool {
     matches!(
         name,
         "echo"
+            | "save_script_plugin"
+            | "list_script_plugins"
+            | "activate_script_plugin"
+            | "run_script_plugin"
+            | "manage_failure_reproduction"
             | "send_message"
             | "clear_context"
             | "save_preference"
@@ -41,6 +46,7 @@ fn public_tool(name: &str) -> bool {
             | "apply_patch"
             | "run_command"
             | "send_file"
+            | "query_file_delivery"
             | "check_practice_draft"
             | "run_practice"
             | "use_skill"
@@ -48,6 +54,8 @@ fn public_tool(name: &str) -> bool {
             | "read_reference"
             | "read_source"
             | "search_memory"
+            | "experience_memory"
+            | "read_context_record"
             | "list_interests"
             | "list_goals"
             | "list_knowledge"
@@ -117,61 +125,102 @@ impl Tool for GuardedTool {
     }
     fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
         Box::pin(async move {
-            if context.is_cancel_requested() {
-                return Err(ToolExecutionError::Cancelled("本轮已取消".into()));
-            }
-            let scope = context
-                .scope()
-                .ok_or_else(|| ToolExecutionError::Failed("管理工具需要可信平台身份".into()))?;
-            if scope.user_id == crate::qq_group::USER {
-                return Err(ToolExecutionError::Failed(
-                    "群聊观察只允许生成聊天回复，不执行工具或代办管理任务".into(),
-                ));
-            }
-            let owner = self.admin.is_owner(scope);
-            let administrator = self.admin.is_operator(scope);
-            let name = self.inner.definition().name;
-            if !(owner
-                || administrator
-                || public_tool(&name)
-                || self.public_github && name == "github_api")
-            {
-                return Err(ToolExecutionError::Failed("此操作需要主人或管理员授权；普通成员的项目开发权限不包括宿主部署、全局管理、后台派发或定时主动消息".into()));
-            }
-            // 管理员不能借补丁改动身份规则文件与私密凭据；补丁里的每个路径都要核对。
-            if !owner
-                && administrator
-                && name == "apply_patch"
-                && call
-                    .arguments
-                    .get("patch")
-                    .and_then(Value::as_str)
-                    .is_some_and(patch_touches_owner_file)
-            {
-                return Err(ToolExecutionError::Failed(
-                    "身份规则文件及私密凭据仅限主人操作".into(),
-                ));
-            }
-            if !owner
-                && administrator
-                && matches!(
-                    name.as_str(),
-                    "read_file" | "write_file" | "edit_file" | "list_files" | "search_files"
-                )
-                && call
-                    .arguments
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .is_some_and(|path| {
-                        owner_file(path, matches!(name.as_str(), "write_file" | "edit_file"))
-                    })
-            {
-                return Err(ToolExecutionError::Failed(
-                    "身份规则文件及私密凭据仅限主人操作".into(),
-                ));
-            }
+            authorize_tool(
+                &self.admin,
+                self.public_github,
+                &self.inner.definition().name,
+                Some(&call.arguments),
+                &context,
+            )?;
             self.inner.execute(call, context).await
         })
+    }
+}
+
+/// 直接工具与脚本叶子共用同一身份/主人文件边界；None只做声明级检查。
+pub(crate) fn authorize_tool(
+    admin: &Admin,
+    public_github: bool,
+    name: &str,
+    arguments: Option<&Value>,
+    context: &ToolExecutionContext,
+) -> Result<(), ToolExecutionError> {
+    if context.is_cancel_requested() {
+        return Err(ToolExecutionError::Cancelled("本轮已取消".into()));
+    }
+    let scope = context
+        .scope()
+        .ok_or_else(|| ToolExecutionError::Failed("管理工具需要可信平台身份".into()))?;
+    if scope.user_id == crate::qq_group::USER {
+        return Err(ToolExecutionError::Failed(
+            "群聊观察只允许生成聊天回复，不执行工具或代办管理任务".into(),
+        ));
+    }
+    let owner = admin.is_owner(scope);
+    let administrator = admin.is_operator(scope);
+    if !(owner || administrator || public_tool(name) || public_github && name == "github_api") {
+        return Err(ToolExecutionError::Failed("此操作需要主人或管理员授权；普通成员的项目开发权限不包括宿主部署、全局管理、后台派发或定时主动消息".into()));
+    }
+    // 管理员不能借补丁改动身份规则文件与私密凭据；补丁里的每个路径都要核对。
+    if !owner
+        && administrator
+        && name == "apply_patch"
+        && arguments
+            .and_then(|args| args.get("patch"))
+            .and_then(Value::as_str)
+            .is_some_and(patch_touches_owner_file)
+    {
+        return Err(ToolExecutionError::Failed(
+            "身份规则文件及私密凭据仅限主人操作".into(),
+        ));
+    }
+    if !owner
+        && administrator
+        && matches!(
+            name,
+            "read_file" | "write_file" | "edit_file" | "list_files" | "search_files"
+        )
+        && arguments
+            .and_then(|args| args.get("path"))
+            .and_then(Value::as_str)
+            .is_some_and(|path| owner_file(path, matches!(name, "write_file" | "edit_file")))
+    {
+        return Err(ToolExecutionError::Failed(
+            "身份规则文件及私密凭据仅限主人操作".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) struct ScriptAuthorizer {
+    pub admin: Arc<Admin>,
+    pub public_github: bool,
+    pub developer: Option<Arc<dyn eve_developer_api::DeveloperBackend>>,
+    pub outbox: Arc<crate::qq_files::Outbox>,
+}
+impl eve_script_runtime::ToolAuthorizer for ScriptAuthorizer {
+    fn authorize(
+        &self,
+        name: &str,
+        arguments: Option<&Value>,
+        context: &ToolExecutionContext,
+    ) -> Result<(), ToolExecutionError> {
+        authorize_tool(&self.admin, self.public_github, name, arguments, context)?;
+        if name == "send_file"
+            && let Some(arguments) = arguments
+        {
+            self.outbox.preflight_send(arguments, context)?;
+        }
+        if let Some(arguments) = arguments
+            && let Some(operation) = eve_developer_tools::operation_for_tool(name, arguments)
+        {
+            let operation = operation.map_err(|e| ToolExecutionError::Rejected(e.message))?;
+            self.developer
+                .as_ref()
+                .ok_or_else(|| ToolExecutionError::Rejected("开发后端未装配".into()))?
+                .preflight(&operation, context)?;
+        }
+        Ok(())
     }
 }
 
@@ -308,6 +357,76 @@ impl QqCommandHandler for GuardedCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn script_preflight_reuses_backend_and_owner_file_rules_without_execution() {
+        use eve_script_runtime::ToolAuthorizer;
+        struct Deny;
+        impl eve_developer_api::DeveloperBackend for Deny {
+            fn preflight(
+                &self,
+                _: &eve_developer_api::DeveloperOperation,
+                _: &ToolExecutionContext,
+            ) -> Result<(), ToolExecutionError> {
+                Err(ToolExecutionError::Rejected("实际开发后端拒绝".into()))
+            }
+            fn execute(
+                &self,
+                _: eve_developer_api::DeveloperOperation,
+                _: ToolExecutionContext,
+            ) -> ToolFuture<'_> {
+                panic!("预检不能执行工具")
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let services = eve_kernel::KernelServices::default();
+        let admin = Admin::open(
+            directory.path(),
+            eve_qqbot_plugin::QqConversations::default(),
+            std::collections::BTreeSet::from(["administrator".into()]),
+            services.registry,
+        )
+        .unwrap();
+        let authorizer = ScriptAuthorizer {
+            admin,
+            public_github: false,
+            developer: Some(Arc::new(Deny)),
+            outbox: Arc::new(
+                crate::qq_files::Outbox::open(directory.path().join("outbox")).unwrap(),
+            ),
+        };
+        let member = ToolExecutionContext::new().with_scope(Some(eve_llm_api::ContextScope {
+            session_id: "s".into(),
+            user_id: "member".into(),
+        }));
+        assert!(
+            authorizer
+                .authorize("save_script_plugin", None, &member)
+                .is_ok()
+        );
+        assert!(authorizer.authorize("run_subagent", None, &member).is_err());
+        let administrator =
+            ToolExecutionContext::new().with_scope(Some(eve_llm_api::ContextScope {
+                session_id: "s".into(),
+                user_id: "administrator".into(),
+            }));
+        let error = authorizer
+            .authorize(
+                "run_command",
+                Some(&serde_json::json!({"program":"true"})),
+                &administrator,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("实际开发后端拒绝"));
+        let error = authorizer
+            .authorize(
+                "read_file",
+                Some(&serde_json::json!({"path":"private/token"})),
+                &administrator,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("仅限主人"));
+    }
+
     #[test]
     fn unknown_tools_and_persistent_side_effects_are_not_public() {
         for name in [

@@ -274,8 +274,8 @@ async fn undelivered_attempts_return_to_pending_proactive_is_tried_once_and_atte
         admin
             .record_delivery(&invitation.id, at, AttemptResult::Unknown)
             .err(),
-        Some(OutreachError::InvalidInput),
-        "结果未知只能由重启核对写入"
+        Some(OutreachError::Conflict),
+        "没有在途投递时不能覆盖已有回执"
     );
     kernel.stop_all().await.unwrap();
 }

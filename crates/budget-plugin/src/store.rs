@@ -54,6 +54,29 @@ impl Ledger {
     }
 }
 
+fn decode(bytes: &[u8]) -> BudgetResult<Ledger> {
+    if bytes.len() > MAX_STATE_BYTES {
+        return Err(BudgetError::CorruptState);
+    }
+    let value = strict_json::from_slice(bytes).map_err(|_| BudgetError::CorruptState)?;
+    if value.get("format_version").and_then(|value| value.as_u64())
+        != Some(u64::from(FORMAT_VERSION))
+    {
+        return Err(if value.get("format_version").is_some() {
+            BudgetError::UnsupportedVersion
+        } else {
+            BudgetError::CorruptState
+        });
+    }
+    let ledger: Ledger = serde_json::from_value(value).map_err(|_| BudgetError::CorruptState)?;
+    validate(&ledger)?;
+    Ok(ledger)
+}
+
+pub(crate) fn validate_state(bytes: &[u8]) -> BudgetResult<()> {
+    decode(bytes).map(|_| ())
+}
+
 struct Inner {
     ledger: Ledger,
     context: Option<PluginContext>,
@@ -81,26 +104,7 @@ impl StoredBudget {
                 current: BudgetWindow::default(),
                 history: vec![],
             },
-            Some(bytes) => {
-                if bytes.len() > MAX_STATE_BYTES {
-                    return Err(BudgetError::CorruptState);
-                }
-                let value =
-                    strict_json::from_slice(&bytes).map_err(|_| BudgetError::CorruptState)?;
-                if value.get("format_version").and_then(|value| value.as_u64())
-                    != Some(u64::from(FORMAT_VERSION))
-                {
-                    return Err(if value.get("format_version").is_some() {
-                        BudgetError::UnsupportedVersion
-                    } else {
-                        BudgetError::CorruptState
-                    });
-                }
-                let ledger: Ledger =
-                    serde_json::from_value(value).map_err(|_| BudgetError::CorruptState)?;
-                validate(&ledger)?;
-                ledger
-            }
+            Some(bytes) => decode(&bytes)?,
         };
         Ok(Self {
             policy,

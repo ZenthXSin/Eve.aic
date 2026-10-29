@@ -1,4 +1,5 @@
 """从旧的大容量证据恢复：新交流继续采集，较早的证据移入归档分块且一条不丢。"""
+from fixture_auth import configure_fixture_progress
 import copy
 import json
 import os
@@ -73,7 +74,7 @@ class MemoryCapacityAcceptance(memory_test.MemoryAcceptance):
     def memory_cli(self, *args):
         env = {key: os.environ[key] for key in ('PATH', 'SystemRoot', 'TEMP', 'TMP') if key in os.environ}
         result = subprocess.run([str(MEMORY_CLI), '--state-dir', str(self.work / 'state'), *args],
-                                env=env, capture_output=True, text=True, timeout=60)
+                                env=configure_fixture_progress(env), capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 

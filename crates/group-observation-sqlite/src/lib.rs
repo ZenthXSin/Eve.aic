@@ -1,6 +1,7 @@
 //! 群消息原话与主动发送账本；重启不重放、不补发，异常保留原记录。
 use eve_chime_api::{
-    ChimeReply, GroupExchange, GroupMessage, GroupObservationStore, GroupOutbound, ObservedMessage,
+    ChimeReply, GroupExchange, GroupMessage, GroupObservationStore, GroupObservationWindow,
+    GroupOutbound, ObservedMessage,
 };
 mod digests;
 pub use digests::SqliteGroupDigests;
@@ -202,6 +203,28 @@ fn outbound(raw: String) -> Result<GroupOutbound, String> {
     }
     Ok(value)
 }
+fn checked_outbound(
+    raw: String,
+    id: &str,
+    conversation: &str,
+    reply_to: &str,
+) -> Result<GroupOutbound, String> {
+    let value = outbound(raw)?;
+    if value.id != id
+        || value.reply.conversation != conversation
+        || value.reply.reply_to != reply_to
+    {
+        return Err(BROKEN.into());
+    }
+    Ok(value)
+}
+fn checked_message(raw: &str, conversation: &str, id: &str) -> Result<GroupMessage, String> {
+    let message: GroupMessage = serde_json::from_str(raw).map_err(|_| BROKEN)?;
+    if !message.valid() || message.conversation != conversation || message.id != id {
+        return Err(BROKEN.into());
+    }
+    Ok(message)
+}
 impl GroupObservationStore for SqliteGroupObservations {
     fn append(&self, m: &GroupMessage) -> Result<bool, String> {
         if !m.valid() || m.text.len() > 32768 {
@@ -236,9 +259,60 @@ impl GroupObservationStore for SqliteGroupObservations {
         })
     }
     fn recent(&self, conversation: &str, limit: usize) -> Result<Vec<GroupMessage>, String> {
-        self.run(|db|{
-  let mut q=db.prepare("SELECT payload FROM observations WHERE conversation=?1 ORDER BY seq DESC LIMIT ?2").map_err(|_|BROKEN)?;
-  let mut values:Vec<GroupMessage>=q.query_map(params![conversation,limit.min(100)],|r|r.get::<_,String>(0)).map_err(|_|BROKEN)?.map(|r|serde_json::from_str(&r.map_err(|_|BROKEN)?).map_err(|_|BROKEN.to_string())).collect::<Result<_,_>>()?;values.reverse();Ok(values)})
+        self.run(|db| {
+            let mut q = db.prepare("SELECT id,payload FROM observations WHERE conversation=?1 ORDER BY seq DESC LIMIT ?2").map_err(|_| BROKEN)?;
+            let rows = q.query_map(params![conversation,limit.min(100)], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(|_| BROKEN)?;
+            let mut values = rows.map(|r| {
+                let (id, raw) = r.map_err(|_| BROKEN)?;
+                checked_message(&raw, conversation, &id)
+            }).collect::<Result<Vec<_>,_>>()?;
+            values.reverse();
+            Ok(values)
+        })
+    }
+    fn window_ending_at(
+        &self,
+        conversation: &str,
+        anchor_ids: &[String],
+        limit: usize,
+    ) -> Result<GroupObservationWindow, String> {
+        let invalid = || "群轮次锚点无效或缺失；未读取最新消息".to_owned();
+        let unique: std::collections::BTreeSet<_> = anchor_ids.iter().cloned().collect();
+        if anchor_ids.is_empty()
+            || anchor_ids.len() > 32
+            || unique.len() != anchor_ids.len()
+            || !(1..=100).contains(&limit)
+            || anchor_ids.len() > limit
+        {
+            return Err(invalid());
+        }
+        self.run(|db| {
+            let tx = db.transaction().map_err(|_| BROKEN)?;
+            let mut anchors = Vec::new();
+            for id in anchor_ids {
+                let row: Option<(i64,String)> = tx.query_row("SELECT seq,payload FROM observations WHERE conversation=?1 AND id=?2",params![conversation,id],|r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_| BROKEN)?;
+                let (seq,payload) = row.ok_or_else(invalid)?;
+                let message: GroupMessage = serde_json::from_str(&payload).map_err(|_| BROKEN)?;
+                if seq <= 0 || message.conversation != conversation || &message.id != id || !message.valid() { return Err(BROKEN.to_owned()); }
+                if message.from_me || anchors.last().is_some_and(|prior: &ObservedMessage| prior.seq >= seq as u64) { return Err(invalid()); }
+                anchors.push(ObservedMessage { seq: seq as u64, message });
+            }
+            let cutoff = anchors.last().ok_or_else(invalid)?.seq;
+            let mut result = anchors;
+            {
+                let mut query = tx.prepare("SELECT seq,payload FROM observations WHERE conversation=?1 AND seq<=?2 ORDER BY seq DESC LIMIT ?3").map_err(|_| BROKEN)?;
+                let rows = query.query_map(params![conversation,cutoff as i64,limit as i64],|r| Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).map_err(|_| BROKEN)?;
+                for row in rows {
+                    let (seq,payload) = row.map_err(|_| BROKEN)?;
+                    let message: GroupMessage = serde_json::from_str(&payload).map_err(|_| BROKEN)?;
+                    if seq <= 0 || message.conversation != conversation || !message.valid() { return Err(BROKEN.to_owned()); }
+                    if result.len() < limit && !unique.contains(&message.id) { result.push(ObservedMessage { seq: seq as u64, message }); }
+                }
+            }
+            result.sort_by_key(|row| row.seq);
+            tx.commit().map_err(|_| BROKEN)?;
+            Ok(GroupObservationWindow { cutoff_seq: cutoff, anchor_ids: anchor_ids.to_vec(), messages: result })
+        })
     }
     fn search(
         &self,
@@ -332,7 +406,7 @@ impl GroupObservationStore for SqliteGroupObservations {
                 )
                 .optional()
                 .map_err(|_| BROKEN)?;
-            raw.map(|v| serde_json::from_str(&v).map_err(|_| BROKEN.into()))
+            raw.map(|v| checked_message(&v, conversation, id))
                 .transpose()
         })
     }
@@ -347,7 +421,7 @@ impl GroupObservationStore for SqliteGroupObservations {
                         |r| r.get(0),
                     )
                     .map_err(|_| BROKEN)?;
-                serde_json::from_str(&raw).map_err(|_| BROKEN.into())
+                checked_message(&raw, conversation, id)
             };
             if !(GroupExchange {
                 source: get(source)?,
@@ -400,7 +474,7 @@ impl GroupObservationStore for SqliteGroupObservations {
         let payload = serde_json::to_string(&value).map_err(|_| BROKEN)?;
         self.run(|db|{let tx=db.transaction().map_err(|_|BROKEN)?;
    let source:Option<String>=tx.query_row("SELECT payload FROM observations WHERE conversation=?1 AND id=?2",params![reply.conversation,reply.reply_to],|r|r.get(0)).optional().map_err(|_|BROKEN)?;
-   let m:GroupMessage=serde_json::from_str(&source.ok_or("群回复没有原始观察来源")?).map_err(|_|BROKEN)?;
+   let m=checked_message(&source.ok_or("群回复没有原始观察来源")?,&reply.conversation,&reply.reply_to)?;
    if m.speaker!=speaker {return Err("群回复发送者与来源不符".into());}
    if tx.query_row("SELECT count(*) FROM outbound WHERE conversation=?1 AND reply_to=?2",params![reply.conversation,reply.reply_to],|r|r.get::<_,u64>(0)).map_err(|_|BROKEN)?!=0{return Err("这条群消息已有投递记录；不重发".into());}
    tx.execute("INSERT INTO outbound(id,conversation,reply_to,payload,status) VALUES(?1,?2,?3,?4,'queued')",params![id,reply.conversation,reply.reply_to,payload]).map_err(|_|BROKEN)?;tx.commit().map_err(|_|BROKEN)?;Ok(())})
@@ -408,18 +482,18 @@ impl GroupObservationStore for SqliteGroupObservations {
     fn claim(&self) -> Result<Option<GroupOutbound>, String> {
         self.run(|db| {
             let tx = db.transaction().map_err(|_| BROKEN)?;
-            let value: Option<(String, String)> = tx
+            let value: Option<(String, String, String, String)> = tx
                 .query_row(
-                    "SELECT id,payload FROM outbound WHERE status='queued' ORDER BY seq LIMIT 1",
+                    "SELECT id,conversation,reply_to,payload FROM outbound WHERE status='queued' ORDER BY seq LIMIT 1",
                     [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .optional()
                 .map_err(|_| BROKEN)?;
-            let Some((id, raw)) = value else {
+            let Some((id, conversation, reply_to, raw)) = value else {
                 return Ok(None);
             };
-            let value = outbound(raw)?;
+            let value = checked_outbound(raw, &id, &conversation, &reply_to)?;
             tx.execute(
                 "UPDATE outbound SET status='sending' WHERE id=?1 AND status='queued'",
                 [id],
@@ -433,14 +507,14 @@ impl GroupObservationStore for SqliteGroupObservations {
         self.run(|db| {
             let tx = db.transaction().map_err(|_| BROKEN)?;
             if sent {
-                let raw: String = tx
+                let (conversation, reply_to, raw): (String, String, String) = tx
                     .query_row(
-                        "SELECT payload FROM outbound WHERE id=?1 AND status='sending'",
+                        "SELECT conversation,reply_to,payload FROM outbound WHERE id=?1 AND status='sending'",
                         [id],
-                        |r| r.get(0),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                     )
                     .map_err(|_| "群回复结局无效；原记录保留")?;
-                let outbound = outbound(raw)?;
+                let outbound = checked_outbound(raw, id, &conversation, &reply_to)?;
                 let original: String = tx
                     .query_row(
                         "SELECT payload FROM observations WHERE conversation=?1 AND id=?2",
@@ -448,7 +522,7 @@ impl GroupObservationStore for SqliteGroupObservations {
                         |r| r.get(0),
                     )
                     .map_err(|_| BROKEN)?;
-                let original: GroupMessage = serde_json::from_str(&original).map_err(|_| BROKEN)?;
+                let original = checked_message(&original, &conversation, &reply_to)?;
                 let own = GroupMessage {
                     id: format!("{id}:reply"),
                     conversation: outbound.reply.conversation.clone(),
@@ -489,19 +563,33 @@ impl GroupObservationStore for SqliteGroupObservations {
             Ok(())
         })
     }
+    fn finish_unknown(&self, id: &str) -> Result<(), String> {
+        self.run(|db| {
+            let changed = db
+                .execute(
+                    "UPDATE outbound SET status='unknown' WHERE id=?1 AND status='sending'",
+                    [id],
+                )
+                .map_err(|_| BROKEN)?;
+            if changed != 1 {
+                return Err("群回复结局无效；原记录保留".into());
+            }
+            Ok(())
+        })
+    }
     fn abandon(&self, id: &str) -> Result<(), String> {
         self.run(|db|{db.execute("UPDATE outbound SET status='unknown' WHERE id=?1 AND status IN ('queued','sending')",[id]).map_err(|_|BROKEN)?;Ok(())})
     }
     fn outbound(&self, id: &str) -> Result<Option<GroupOutbound>, String> {
         self.run(|db| {
             db.query_row(
-                "SELECT payload FROM outbound WHERE id=?1 AND status='sending'",
+                "SELECT conversation,reply_to,payload FROM outbound WHERE id=?1 AND status='sending'",
                 [id],
-                |r| r.get::<_, String>(0),
+                |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)),
             )
             .optional()
             .map_err(|_| BROKEN)?
-            .map(outbound)
+            .map(|(conversation, reply_to, raw)| checked_outbound(raw, id, &conversation, &reply_to))
             .transpose()
         })
     }

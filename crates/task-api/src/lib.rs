@@ -92,6 +92,9 @@ pub struct TaskExecution {
     pub resume_at_ms: Option<u64>,
     /// 首次执行固定总期限；重试和重启不能重置。
     pub deadline_at_ms: Option<u64>,
+    /// 原自主授权的绝对期限；排队、恢复及重启均不能延长。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_deadline_at_ms: Option<u64>,
 }
 
 pub type TaskResult<T> = Result<T, TaskError>;
@@ -414,6 +417,17 @@ pub trait TaskAdmin: Send + Sync {
         source: &str,
         now_ms: u64,
     ) -> TaskResult<Task>;
+    /// 在同一个持久提交中创建有授权绝对期限的任务。自定义实现默认拒绝，不回退为无期限创建。
+    fn create_bounded(
+        &self,
+        _owner: &TaskOwner,
+        _spec: TaskSpec,
+        _source: &str,
+        _deadline_at_ms: u64,
+        _now_ms: u64,
+    ) -> TaskResult<Task> {
+        Err(TaskError::InvalidTransition)
+    }
     /// 排队 → 执行中；保存后执行器才开始。
     fn start(&self, id: &str, now_ms: u64) -> TaskResult<Task>;
     /// 工具前/后及模型请求前的持久检查点；保存失败不得继续执行。
@@ -426,9 +440,19 @@ pub trait TaskAdmin: Send + Sync {
     ) -> TaskResult<Task>;
     /// 安全边界上安排有限次自动恢复；不清空回执、不补充步数、不新建任务。
     fn retry(&self, id: &str, now_ms: u64) -> TaskResult<Task>;
+    /// 可信条件已满足后接续同一阻塞任务；保留原预算、期限、回执和任务 ID。
+    fn resume_blocked(
+        &self,
+        _owner: &TaskOwner,
+        _id: &str,
+        _evidence: &str,
+        _now_ms: u64,
+    ) -> TaskResult<Task> {
+        Err(TaskError::InvalidTransition)
+    }
     /// 执行中 → 结束，保存结果与用量；完成与失败生成一条等待投递的通知。
     fn finish(&self, id: &str, end: TaskEnd, usage: TaskUsage, now_ms: u64) -> TaskResult<Task>;
-    /// 用户取消自己的任务：排队中的直接取消；执行中的记下取消请求，由执行器停止后结束。
+    /// 用户取消自己的任务：排队或阻塞中的直接取消；执行中的记下取消请求，由执行器停止后结束。
     fn cancel(&self, user_id: &str, id: &str, now_ms: u64) -> TaskResult<Task>;
     /// 保存一次通知投递尝试并进入发送中；返回后才可发送。主动私聊每条至多一次。
     fn claim(&self, id: &str, channel: DeliveryChannel, now_ms: u64) -> TaskResult<Task>;

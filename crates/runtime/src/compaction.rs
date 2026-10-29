@@ -53,12 +53,25 @@ impl State {
         service: &dyn HistoryDigests,
         scope: Option<&ContextScope>,
     ) -> Self {
+        Self::new_with_cache(context, service, scope, true)
+    }
+
+    pub(crate) fn new_with_cache(
+        context: &mut ContextSnapshot,
+        service: &dyn HistoryDigests,
+        scope: Option<&ContextScope>,
+        allow_cache: bool,
+    ) -> Self {
         let original = context.history.clone();
-        let cached = service
-            .cached(scope, &original)
-            .ok()
-            .flatten()
-            .filter(|d| valid(d, history_turns(&original).len()));
+        let cached = allow_cache
+            .then(|| {
+                service
+                    .cached(scope, &original)
+                    .ok()
+                    .flatten()
+                    .filter(|d| valid(d, history_turns(&original).len()))
+            })
+            .flatten();
         let covered = cached.as_ref().map_or(0, |d| d.covered_turns);
         let skip = history_turns(&original)
             .iter()

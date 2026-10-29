@@ -249,15 +249,14 @@ pub(crate) fn validate_snapshot(
         }
     }
     // 已归档的完成交互仍占用修订；原文只在归档读取时逐项核对。
+    // complete_snapshot 是热层与已验证分块的完整视图，不受热层文档的 4 MiB 上限限制。
+    // 持久文档/分块仍各自有界；此处按项核对，召回传输另受 MAX_RECALL_RESPONSE_BYTES 限制，
+    // 不再为验证完整视图额外序列化一份可能很大的历史。
     if snapshot.revision != (completed_count + history_count) as u64 + snapshot.archived_evidence
         || snapshot.evidence.iter().any(|evidence| {
             matches!(evidence.source, EvidenceSource::UserStatement { .. })
                 && !referenced_evidence.contains(evidence.id.as_str())
         })
-        || serde_json::to_vec(snapshot)
-            .map_err(|_| MemoryError::CorruptState)?
-            .len()
-            > MAX_STATE_BYTES
     {
         return Err(MemoryError::CorruptState);
     }

@@ -1,0 +1,50 @@
+name: 脚本容器跨平台真实验收
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: '专用runner预装并审核的Linux运行镜像完整sha256 ID'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  container:
+    # 只在管理员管理的专用runner运行；普通hosted Windows没有Linux daemon。
+    # 未配置这些runner时保持等待，不能用普通单元测试替代真实验收。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [Windows]
+    runs-on: [self-hosted, '${{ matrix.os }}', eve-script-sandbox]
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      EVE_TEST_CONTAINER_IMAGE: ${{ inputs.image }}
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      RUST_TEST_THREADS: '2'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: 检查可信容器daemon和本地镜像
+        run: |
+          if ($env:EVE_TEST_CONTAINER_IMAGE -notmatch '^sha256:[0-9a-f]{64}$') { throw '必须配置不可变镜像ID' }
+          $cli = (Get-Command docker -CommandType Application).Source
+          "EVE_TEST_CONTAINER_CLI=$cli" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $platform = & $cli info --format '{{.OSType}}'
+          if ($LASTEXITCODE -ne 0 -or $platform -ne 'linux') { throw '需要已启动的Linux容器daemon' }
+          & $cli image inspect $env:EVE_TEST_CONTAINER_IMAGE --format '{{.Id}}'
+          if ($LASTEXITCODE -ne 0) { throw '审核过的运行镜像未预装；验收不自动拉取' }
+      - name: 真实Python与JavaScript隔离运行及迁移
+        run: |
+          cargo test -p eve-script-runtime --locked container_backend_real -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

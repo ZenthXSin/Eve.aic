@@ -10,6 +10,7 @@
 全部使用确定性替身，只证明宿主契约、投递时机与恢复语义，不代表真实模型的撰写质量，
 也不是正式 QQ 的主动消息验收（平台配额与用户开关只能在正式环境验证）。
 """
+from fixture_auth import configure_fixture_progress
 import json
 import os
 import subprocess
@@ -500,7 +501,7 @@ class OutreachAcceptance(unittest.TestCase):
                                 (["--outreach-proactive-after-ms", "0"], "--outreach")):
             result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
                                      "--agent", str(ROOT / "AGENT.md"), *extra],
-                                    env=env, capture_output=True, text=True, timeout=60)
+                                    env=configure_fixture_progress(env), capture_output=True, text=True, timeout=60)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(expected, result.stderr)
 

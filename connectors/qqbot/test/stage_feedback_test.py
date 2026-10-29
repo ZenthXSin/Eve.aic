@@ -3,12 +3,12 @@ import json
 import sys
 import time
 import unittest
-import developer_tools_test as developer
+import progress_narration_test as progress
 import dialogue_tools_test as dialogue
 import memory_test
 
-class StageFeedbackAcceptance(developer.DeveloperAcceptance):
-    for name in dir(developer.DeveloperAcceptance):
+class StageFeedbackAcceptance(progress.ProgressNarrationAcceptance):
+    for name in dir(progress.ProgressNarrationAcceptance):
         if name.startswith('test_'): locals()[name] = None
     del name
     receipt = memory_test.MemoryAcceptance.receipt
@@ -54,6 +54,38 @@ class StageFeedbackAcceptance(developer.DeveloperAcceptance):
         self.assertEqual(self.receipt('stages'), before)
         self.assertEqual(self.progress('stages'), [])
 
+    def test_group_limits_ordinary_progress_but_authorization_remains_independent(self):
+        def respond(body):
+            results = self.results(body)
+            done = len(results)
+            if done < 3:
+                if done: time.sleep(1.15)
+                response = dialogue.tool_response([('send_message', {'text': ['开始核对现有文件。', '已有一项实际回执。', '这条多余进度应被限制。'][done]})])
+            elif done == 3:
+                self.assertEqual([r['sent'] for r in results], [True, True, False])
+                response = dialogue.tool_response([('send_message', {'text': '下一步会改写共享分支，需要明确授权。', 'purpose': 'authorization'})])
+            else:
+                self.assertTrue(results[-1]['sent'])
+                self.assertTrue(results[-1]['message_id'])
+                self.assertTrue(results[-1]['session_id'])
+                return dialogue.text_response('授权问题已送达，独立核对完成；等待回复后才执行依赖动作。')
+            response['choices'][0]['message']['tool_calls'][0]['id'] += str(done)
+            return response
+        self.callback = respond
+        self.run_stage(self.send(self.message('group-stages', 'eve 分阶段核对并单独询问授权', scope='group', expected='授权问题已送达，独立核对完成；等待回复后才执行依赖动作。')),
+                       env_extra={'EVE_PROGRESS_SLOW_AFTER_MS': '0'})
+        sent = self.progress('group-stages')
+        self.assertEqual(len(sent), 3, '两个普通进度加一个独立授权问题')
+        self.assertTrue(all(not p.get('proactive', False) for p in sent))
+        record = self.receipt('group-stages')
+        self.assertEqual(record['state'], 'Sent')
+        self.assertEqual([p.get('necessary', False) for p in record['progress']], [False, False, True])
+        before = record
+        self.callback = lambda body: dialogue.text_response('重启后继续等待授权，不重发原问题。')
+        self.run_stage(self.send(self.message('group-after', 'eve 重启后核对', scope='group', expected='重启后继续等待授权，不重发原问题。')))
+        self.assertEqual(self.receipt('group-stages'), before)
+        self.assertEqual(self.progress('group-stages'), [])
+
     def test_one_long_command_sends_start_and_repeated_truthful_waiting(self):
         def respond(body):
             if not self.results(body):
@@ -64,9 +96,10 @@ class StageFeedbackAcceptance(developer.DeveloperAcceptance):
         self.callback = respond
         self.run_stage(self.send(self.message('long', '执行长命令', expected='命令返回并已核对')))
         stages = self.progress('long')
-        self.assertTrue(stages[0]['text'].startswith('我先进行命令执行'))
+        self.assertEqual(stages[0]['text'], '先核对这两步的实际结果。')
+        self.assertTrue(any(f['phase'] == 'start' for f in self.narrations))
         self.assertGreaterEqual(len(stages), 4)
-        self.assertTrue(any('仍在进行中' in p['text'] and p['proactive'] for p in stages))
+        self.assertTrue(any(p['text'] == '这一步还在等待结果，我会继续核对。' and p.get('proactive') for p in stages))
         self.assertEqual(self.receipt('long')['state'], 'Sent')
 
     def test_failed_stage_stops_further_progress_but_keeps_work_and_final_reply(self):

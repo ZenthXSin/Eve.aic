@@ -63,6 +63,17 @@ pub(crate) fn install_with_member_runtime(
     member_runtime: Option<eve_developer_api::MemberRuntime>,
     reviewer: Option<Arc<dyn ActionReviewer>>,
 ) -> Result<(), AppError> {
+    install_with_member_runtime_backend(bootstrap, state, authorization, member_runtime, reviewer)
+        .map(|_| ())
+}
+/// 返回实际执行工具使用的同一后端；脚本和直接工具共享身份与业务范围预检。
+pub(crate) fn install_with_member_runtime_backend(
+    bootstrap: &mut CoreBootstrap,
+    state: &Path,
+    authorization: Option<Arc<dyn eve_developer_api::DeveloperAuthorization>>,
+    member_runtime: Option<eve_developer_api::MemberRuntime>,
+    reviewer: Option<Arc<dyn ActionReviewer>>,
+) -> Result<Option<Arc<dyn eve_developer_api::DeveloperBackend>>, AppError> {
     let config: DeveloperConfig = if let Some(path) = std::env::var_os("EVE_DEVELOPER_CONFIG") {
         let bytes = std::fs::read(path).map_err(|_| "开发工具配置文件无法读取；保留原文件")?;
         if bytes.len() > 32 * 1024 {
@@ -96,7 +107,7 @@ pub(crate) fn install_with_member_runtime(
             cargo_arguments: Vec::new(),
         }
     } else {
-        return Ok(());
+        return Ok(None);
     };
     config.validate()?;
     let token = std::env::var(&config.github_token_env).ok();
@@ -143,8 +154,8 @@ pub(crate) fn install_with_member_runtime(
     }
     bootstrap
         .tools
-        .extend(eve_developer_tools::tools(&config, backend));
-    Ok(())
+        .extend(eve_developer_tools::tools(&config, backend.clone()));
+    Ok(Some(backend))
 }
 
 pub(crate) fn member_runtime(

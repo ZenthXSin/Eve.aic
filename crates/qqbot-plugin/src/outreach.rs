@@ -58,6 +58,8 @@ pub enum QqOutreachResult {
         http_status: Option<u16>,
         biz_code: Option<i64>,
     },
+    /// 请求已发出，但缺少可核对的平台消息编号或网络结果未知；不得自动重发。
+    Unknown,
     /// 没有写出：前面的回复片段失败、回复已过期、正文不合规或没有可用的私聊路由。
     NotSent,
 }

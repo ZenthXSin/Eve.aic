@@ -1,7 +1,39 @@
-"""旧业务验收使用的可信测试管理员；不修改生产默认权限或权限负例的显式配置。"""
+"""本地模型与 QQ 验收的公共默认、进度分类和可信测试管理员；不修改生产权限。"""
 import hashlib
 import json
 from pathlib import Path
+
+
+
+def is_progress_request(body):
+    """只识别宿主进度系统提示和完整事实形状，用户正文相似 JSON 不会冒充。"""
+    messages = body.get("messages", [])
+    if len(messages) != 2 or messages[0].get("role") != "system" or messages[1].get("role") != "user":
+        return False
+    if not str(messages[0].get("content", "")).startswith("根据下一条JSON中的真实事件，自由写一句自然的中文任务进展"):
+        return False
+    try:
+        facts = json.loads(messages[1]["content"])
+    except (ValueError, TypeError, KeyError):
+        return False
+    return isinstance(facts, dict) and {"user_request", "phase", "tool_names", "failed_calls", "waiting_seconds", "previous_messages", "group"} <= facts.keys()
+
+
+def progress_fixture_text(facts):
+    if facts.get("phase") == "compaction":
+        return "正在整理已确认的上下文，完成后继续核验。"
+    if facts.get("phase") == "waiting":
+        return "这一步仍在等待结果，拿到后继续核对。"
+    if facts.get("phase") == "start":
+        return "先核对已有资料，再推进当前任务。"
+    return "已收到阶段回执，接下来继续核对结果。"
+
+def configure_fixture_progress(environment):
+    """普通验收关闭阶段、慢等待与工具里程碑；专测在自身环境中显式开启。"""
+    environment.setdefault("EVE_PROGRESS_STAGE_UPDATES", "false")
+    environment.setdefault("EVE_PROGRESS_SLOW_AFTER_MS", "0")
+    environment.setdefault("EVE_PROGRESS_TOOL_MILESTONES", "false")
+    return environment
 
 
 def bootstrap_test_admin(state, environment, app="1904159860", users=("user-1", "user-2")):

@@ -1,4 +1,5 @@
 """真实 Rust 宿主与生产 Node 桥接验收；模型 HTTP 和腾讯 SDK 使用本地替身。"""
+from fixture_auth import configure_fixture_progress
 import json
 import os
 import pathlib
@@ -44,7 +45,7 @@ class TransportAcceptance(memory.MemoryAcceptance):
             child = subprocess.Popen([str(memory.BINARY), "--memory", "--state-dir", str(self.work / "state"),
                 "--agent", str(memory.ROOT / "AGENT.md"), "--bridge-script",
                 str(pathlib.Path(__file__).with_name("transport-bridge.mjs")), "--bridge-arg", str(path)],
-                env=env, stdout=out, stderr=err)
+                env=configure_fixture_progress(env), stdout=out, stderr=err)
         self.children.append(child)
         return child, scenario, stdout, stderr
 

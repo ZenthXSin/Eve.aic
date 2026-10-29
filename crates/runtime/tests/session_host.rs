@@ -830,3 +830,83 @@ async fn unstarted_session_plugin_is_unavailable_without_begin_or_model_request(
     assert!(provider.requests.lock().unwrap().is_empty());
     rig.stop().await;
 }
+
+type ObservedTurnIdentity = (Option<ContextScope>, Option<u64>);
+struct TurnIdentityTool(Arc<std::sync::Mutex<Vec<ObservedTurnIdentity>>>);
+impl Tool for TurnIdentityTool {
+    fn definition(&self) -> ToolDefinition {
+        ReceiptTool {
+            starts: Default::default(),
+        }
+        .definition()
+    }
+    fn validate_arguments(&self, _: &serde_json::Value) -> Result<(), ToolValidationError> {
+        Ok(())
+    }
+    fn execute(&self, _: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((context.scope().cloned(), context.turn_id()));
+        Box::pin(async { Ok(json!({"success":true})) })
+    }
+}
+#[tokio::test]
+async fn durable_tool_turn_identity_does_not_depend_on_an_event_sink() {
+    let steps = (0..3)
+        .flat_map(|index| {
+            [
+                Step::new(Ok(ModelResponse::ToolCalls {
+                    calls: vec![ToolCall {
+                        id: format!("identity-{index}"),
+                        name: "receipt".into(),
+                        arguments: json!({}),
+                    }],
+                })),
+                Step::new(final_response("done")),
+            ]
+        })
+        .collect();
+    let provider = Provider::new(steps);
+    let rig = Rig::new(
+        provider,
+        Arc::new(FaultStore::default()),
+        LlmHostConfig::default(),
+    )
+    .await;
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    rig.kernel.stop(&id(OWNER)).await.unwrap();
+    rig.kernel.unregister(&id(OWNER)).unwrap();
+    rig.kernel
+        .register(Box::new(ServicesPlugin {
+            manifest: PluginManifest::new(OWNER, "0.1.0").unwrap(),
+            context: rig.context.clone(),
+            tool: Arc::new(TurnIdentityTool(observed.clone())),
+        }))
+        .unwrap();
+    rig.kernel.start(&id(OWNER)).await.unwrap();
+    let mut expected = Vec::new();
+    for with_events in [false, true, false] {
+        let output = if with_events {
+            rig.host
+                .run_turn_with_events(input("identity-session", "记录"), &DiscardTurnEvents)
+                .await
+                .unwrap()
+        } else {
+            rig.host
+                .run_turn(input("identity-session", "记录"))
+                .await
+                .unwrap()
+        };
+        expected.push((
+            Some(ContextScope {
+                session_id: "identity-session".into(),
+                user_id: "用户一".into(),
+            }),
+            Some(output.turn_id),
+        ));
+    }
+    assert_eq!(*observed.lock().unwrap(), expected);
+    assert_eq!(rig.snapshot("identity-session").turns.len(), 3);
+    rig.stop().await;
+}

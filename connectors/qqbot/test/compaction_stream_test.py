@@ -9,7 +9,7 @@ import history_digest_test as digest
 from dialogue_tools_test import text_response, tool_response
 import model_streaming_test as streaming
 
-NOTICE = "正在进行上下文压缩，请稍等"
+NOTICE = "这轮资料较多，正在整理已确认的上下文，完成后继续核验。"
 
 
 class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
@@ -19,6 +19,16 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
     del _name
     truncate = False
     encode_provider_response = streaming.ModelStreamingAcceptance.encode_provider_response
+
+    def provider_response(self, body, kind, fallback):
+        try:
+            facts = json.loads(body['messages'][-1]['content'])
+        except (ValueError, TypeError):
+            facts = None
+        if kind == 'progress':
+            self.narrations.append(facts)
+            return text_response(NOTICE if facts['phase'] == 'compaction' else '文件核对已拿到回执，继续验证剩余结果。')
+        return super().provider_response(body, kind, fallback)
 
     def write_provider_response(self, handler, body, encoded):
         compressing = body["messages"][0]["content"].startswith(digest.DIGEST_PROMPT)
@@ -36,6 +46,7 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
             pass
 
     def exercise(self, stall, invalid=0, milestones=False):
+        self.narrations = []
         self.stall = stall
         self.remaining_invalid_digests = invalid
         failed = stall or invalid >= 2
@@ -68,6 +79,8 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
                        "EVE_MODEL_STREAM_IDLE_TIMEOUT_MS":"350", "EVE_MODEL_STREAM_TOTAL_TIMEOUT_MS":"3000"})
         receipt = self.receipt("compact")
         self.assertEqual([p["text"] for p in receipt["progress"]].count(NOTICE), 1)
+        self.assertEqual(sum(f['phase'] == 'compaction' for f in self.narrations), 1,
+                         '压缩进展正文来自真实事件的一次独立模型请求')
         self.assertEqual(len(receipt["progress"]), 3 if milestones else 1,
                          "默认只保留压缩通知；显式开启时两个工具里程碑与压缩共用配额")
         self.assertTrue(all(p["state"] == "Sent" for p in receipt["progress"]))

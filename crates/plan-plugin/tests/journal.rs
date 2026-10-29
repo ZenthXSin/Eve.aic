@@ -645,3 +645,46 @@ async fn version_one_ledgers_are_read_without_rewrite_and_saved_as_current_versi
     );
     kernel.stop_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn interrupted_attempt_cannot_be_restored_as_retryable_pending_work() {
+    let store = Arc::new(MemoryStateStore::default());
+    let mut candidate = spec("goal", "核对输入");
+    candidate.steps[0].max_attempts = 2;
+    let mut plan = Plan::new("eve", candidate, &capabilities(), 10).unwrap();
+    plan.begin_step("first", 11).unwrap();
+    plan.interrupt(12).unwrap();
+    plan.validate("eve").unwrap();
+    // 损坏的状态保留真实 Interrupted 回执，却把状态标签改回可准入。
+    plan.status = PlanStatus::Active;
+    for step in &mut plan.steps {
+        step.status = StepStatus::Pending;
+    }
+    let snapshot = PlanSnapshot {
+        schema_version: PLAN_SCHEMA_VERSION,
+        subject_id: "eve".into(),
+        revision: 3,
+        plans: vec![plan],
+        proposals: vec![],
+    };
+    let bytes = serde_json::to_vec(&snapshot).unwrap();
+    store
+        .set(&plugin_id(), PLAN_STATE_KEY.into(), bytes.clone())
+        .unwrap();
+    let opened = open(store.clone(), "eve").await;
+    if let Ok((kernel, journal)) = &opened {
+        let restored = &journal.snapshot().unwrap().plans[0];
+        assert_eq!(
+            restored.ready_steps(),
+            ["first"],
+            "红例确实恢复了可执行步骤"
+        );
+        kernel.stop_all().await.unwrap();
+    }
+    assert!(opened.is_err(), "未知副作用历史必须拒绝恢复成可重试状态");
+    assert_eq!(
+        stored(store.as_ref()).unwrap(),
+        bytes,
+        "坏数据必须保留原字节"
+    );
+}

@@ -18,6 +18,15 @@ from build_resources import BuildPlanner
 import self_upgrade_runtime as runtime
 
 EMPTY = hashlib.sha256(b'').hexdigest()
+MAX_LOG_BYTES = 32 * 1024 * 1024
+
+def log_tail(path, limit=16384):
+    # 必须先 seek；read_bytes()[-limit:] 会先把完整 Cargo 日志读进内存。
+    with path.open('rb') as stream:
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        stream.seek(max(0, size - limit))
+        return stream.read(limit).decode(errors='replace'), size > limit
 
 
 def configuration(path):
@@ -99,11 +108,15 @@ class GitBuilder:
                         raise ValueError('auto_update_command_timeout')
                     if shutil.disk_usage(self.root).free < 128 * 1024**2:
                         raise ValueError('auto_update_disk_pressure')
+                    if logfile.stat().st_size > MAX_LOG_BYTES:
+                        raise ValueError('auto_update_log_limit')
                     if plan and time.monotonic() >= next_probe:
                         next_probe = time.monotonic() + 1
                         if self.planner.critical(): raise ValueError('auto_update_resources_busy')
                 if child.returncode:
                     raise ValueError('auto_update_check_failed')
+                if logfile.stat().st_size > MAX_LOG_BYTES:
+                    raise ValueError('auto_update_log_limit')
             finally:
                 if child.poll() is None:
                     if os.name == 'nt':
@@ -120,8 +133,9 @@ class GitBuilder:
                         else:
                             with contextlib.suppress(ProcessLookupError): os.killpg(child.pid, signal.SIGKILL)
                         child.wait(timeout=5)
-        return {'success': True, 'exit_code': 0, 'stdout': logfile.read_bytes()[-16384:].decode(errors='replace'),
-                'stderr': '', 'stdout_truncated': logfile.stat().st_size > 16384, 'stderr_truncated': False}
+        tail, truncated = log_tail(logfile)
+        return {'success': True, 'exit_code': 0, 'stdout': tail,
+                'stderr': '', 'stdout_truncated': truncated, 'stderr_truncated': False}
 
     def git(self, args, cwd, log):
         self.command(['git', '-c', 'credential.helper=', '-c', 'core.hooksPath=/dev/null', *args], cwd, log, 120)
@@ -130,6 +144,14 @@ class GitBuilder:
     def prepare(self, active_head, forced=False, failed_head=None):
         source = self.root / 'source'
         logs = self.root / 'logs'; logs.mkdir(exist_ok=True)
+        # 日志仅保留最近两次源码验收；具体失败摘要由状态文件持久保存。
+        revisions = sorted({p.name.split('-')[0] for p in logs.iterdir()
+                            if re.match(r'^[a-f0-9]{40}-', p.name)},
+                           key=lambda revision: max(p.stat().st_mtime_ns for p in logs.glob(revision + '-*')),
+                           reverse=True)
+        for revision in revisions[2:]:
+            for path in logs.glob(revision + '-*'):
+                if path.is_file() and not path.is_symlink(): path.unlink()
         git_log = logs / 'git.log'
         source.mkdir(exist_ok=True)
         if source.is_symlink(): raise ValueError('auto_update_source_symlink')
@@ -213,6 +235,8 @@ class GitBuilder:
         request = dict(format_version=1, candidate_sha256=key, candidate_directory=str(directory),
                        session_id='host:auto-update', requested_by='host:auto-update', turn_id=1)
         if not directory.exists():
+            if sum(p.is_dir() for p in self.candidates.iterdir()) >= 8:
+                raise ValueError('candidate_storage_limit')
             if shutil.disk_usage(self.candidates).free < binary.stat().st_size + total + 128 * 1024**2:
                 raise ValueError('auto_update_insufficient_space_for_candidate')
             with tempfile.TemporaryDirectory(dir=self.candidates) as temporary:
@@ -225,7 +249,8 @@ class GitBuilder:
                     source=source_id, binary_sha256=binary_sha, candidate_sha256=key,
                     candidate_path=str(directory / binary.name), resources=resources, checks=checks))
                 stage.rename(directory)
-        runtime.validate_candidate(request, self.candidates)
+        _, _, manifest = runtime.validate_candidate(request, self.candidates)
+        request['lease'] = runtime.prepare_lease(directory, manifest)
         return {'head': head, 'request': request}
 
 

@@ -19,8 +19,9 @@ mod usage;
 pub use budget::{BudgetUsage, ExecutionLimits, SharedStepUsage, SharedToolSteps, TurnBudget};
 pub use failure::{ModelHealthObserver, ModelOutcome, ProviderFailure, ProviderFailureKind};
 pub use history::{
-    CONTEXT_COMPACTION_TIMEOUT, ContextCompactionPolicy, HistoryDigest, HistoryDigests,
-    HistoryWindow, HistoryWindowResolver, MAX_HISTORY_DIGEST_BYTES, history_turns,
+    CONTEXT_COMPACTION_TIMEOUT, ContextCompactionPolicy, HistoryContextPlan, HistoryContextPlanner,
+    HistoryDigest, HistoryDigests, HistoryWindow, HistoryWindowResolver, MAX_HISTORY_DIGEST_BYTES,
+    MAX_HISTORY_WORKING_SET_BYTES, MAX_REVIEW_USER_MESSAGES_BYTES, history_turns,
 };
 pub use image::{
     ImageInput, MAX_IMAGE_BYTES, MAX_TURN_IMAGES, TurnImageSource, TurnImages, sniff_image,
@@ -683,6 +684,7 @@ pub struct ToolExecutionContext {
     turn_id: Option<u64>,
     continuation: TaskContinuation,
     conversation: Option<Arc<Vec<ChatMessage>>>,
+    review_user_messages: Option<Arc<Vec<String>>>,
     shared_steps: Option<SharedToolSteps>,
     deadline: Option<std::time::Instant>,
     delegated: bool,
@@ -718,6 +720,7 @@ impl ToolExecutionContext {
             turn_id: None,
             continuation: TaskContinuation::default(),
             conversation: None,
+            review_user_messages: None,
             shared_steps: None,
             deadline: None,
             delegated: false,
@@ -755,6 +758,14 @@ impl ToolExecutionContext {
     }
     pub fn conversation(&self) -> Option<&[ChatMessage]> {
         self.conversation.as_deref().map(Vec::as_slice)
+    }
+    /// 宿主从压缩前历史采集的最近六条真实用户正文；不能用摘要、工具结果或模型自报授权替代。
+    pub fn with_review_user_messages(mut self, messages: Arc<Vec<String>>) -> Self {
+        self.review_user_messages = Some(messages);
+        self
+    }
+    pub fn review_user_messages(&self) -> Option<&[String]> {
+        self.review_user_messages.as_deref().map(Vec::as_slice)
     }
     pub fn with_shared_steps(mut self, steps: SharedToolSteps) -> Self {
         self.shared_steps = Some(steps);

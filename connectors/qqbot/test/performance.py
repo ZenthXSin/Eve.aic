@@ -1,4 +1,4 @@
-"""Release Eve + production QQ bridge performance; all inputs and peers are local."""
+"""Eve 与生产 QQ 桥接性能；构建类型显式记录，输入和通信对端均为本地替身。"""
 from request_messages import conversation_messages
 import argparse
 import json
@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 HERE = pathlib.Path(__file__).resolve().parent
-HISTORY_TURNS = 16  # 本基准显式选用兼容历史窗口；完整持久账本在每轮末独立核对。
+HISTORY_TURNS = 16  # 分层请求仍受窗口上限约束；完整持久账本在每轮末独立核对。
 
 
 def require(condition, diagnostic):
@@ -50,6 +50,8 @@ def aggregate(runs):
         report["node_peak_rss_mib"] = max(run["node_peak_rss_mib"] for run in runs)
         report["median_state_bytes"] = statistics.median(run["state_bytes"] for run in runs)
         report["provider_requests"] = sum(run["provider_requests"] for run in runs)
+        report["progress_requests"] = sum(run["progress_requests"] for run in runs)
+        report["total_provider_requests"] = sum(run["total_provider_requests"] for run in runs)
         report["tool_roundtrips"] = sum(run["tool_roundtrips"] for run in runs)
     return {key: round(value, 4) if isinstance(value, float) else value for key, value in report.items()}
 
@@ -74,14 +76,38 @@ class LocalProvider:
                     require(body["model"] == "deepseek-v4.1-flash", "wrong_model")
                     require(body["reasoning_effort"] == "none", "wrong_reasoning")
                     messages = body["messages"]
+                    progress = (len(messages) == 2 and messages[0]["role"] == "system"
+                                and messages[0]["content"].startswith("根据下一条JSON中的真实事件，自由写一句自然的中文任务进展")
+                                and messages[1]["role"] == "user")
+                    facts = json.loads(messages[1]["content"]) if progress else None
+                    if progress:
+                        require(set(facts) == {"user_request", "phase", "activity", "tool_names", "failed_calls",
+                                               "waiting_seconds", "previous_messages", "group"}, "invalid_progress_facts")
+                        require(not body.get("tools") and isinstance(facts["phase"], str), "invalid_progress_request")
+                    else:
+                        pending = set()
+                        for item in conversation_messages(messages):
+                            if item["role"] == "tool":
+                                require(item["tool_call_id"] in pending, "orphan_tool_result")
+                                pending.remove(item["tool_call_id"])
+                            else:
+                                require(not pending, "missing_tool_result")
+                                pending.update(call["id"] for call in item.get("tool_calls", []))
+                        require(not pending, "missing_tool_result")
                     outer.requests.append({
                         "at": time.perf_counter(),
+                        "kind": "progress" if progress else "chat",
+                        "phase": facts["phase"] if progress else None,
                         "user_count": sum(message["role"] == "user" for message in conversation_messages(messages)),
+                        "user_texts": [message["content"] for message in conversation_messages(messages)
+                                       if message["role"] == "user"],
                         "tool": messages[-1]["role"] == "tool",
                     })
                     latest = messages[-1]
                     reason = "stop"
-                    if latest["role"] == "tool":
+                    if progress:
+                        message = {"role": "assistant", "content": "我在核对这一步的结果。"}
+                    elif latest["role"] == "tool":
                         message = {"role": "assistant", "content": json.loads(latest["content"])["echo"]}
                     elif latest["content"].startswith("echo:"):
                         marker = latest["content"][5:]
@@ -115,7 +141,7 @@ class LocalProvider:
         self.thread.join()
 
 
-def run_wave(binary, provider, directory, count, initial_turns, payload_bytes):
+def run_wave(binary, provider, directory, count, initial_turns, payload_bytes, progress_enabled=True):
     phase = "fresh" if initial_turns == 0 else "restored"
     messages = []
     for index in range(initial_turns, initial_turns + count):
@@ -138,9 +164,12 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes):
         EVE_DEBOUNCE_MS="0",
         # 测的是对话链路并逐一核对请求数；历史摘要是后台请求，次数取决于时机，单独由 history_digest_test 验收。
         EVE_HISTORY_DIGEST_ENABLED="false",
-        # 本基准逐轮验证兼容模式的 16 轮窗口；200k 自适应上下文由 adaptive_context_test 验收。
+        # 关闭自适应扩容，验证分层选择仍受 16 轮窗口约束；200k 另有专项验收。
         EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS="0",
         EVE_CONTEXT_COMPACT_AT_TOKENS="0",
+        EVE_PROGRESS_STAGE_UPDATES=str(progress_enabled).lower(),
+        EVE_PROGRESS_SLOW_AFTER_MS="45000" if progress_enabled else "0",
+        EVE_PROGRESS_TOOL_MILESTONES="false",
     )
     command = [str(binary), "--state-dir", str(directory / "state"),
                "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(HERE / "performance-bridge.mjs"),
@@ -181,13 +210,28 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes):
     require(summary["ready"] and summary["closed"] and not summary["terminal_error"], "invalid_lifecycle")
     require((summary["received"], summary["completed"], summary["sent"], summary["failed"]) ==
             (count, count, count, 0), "lost_or_failed_messages")
-    requests = provider.requests[request_start:]
+    all_requests = provider.requests[request_start:]
+    requests = [request for request in all_requests if request["kind"] == "chat"]
+    progress_requests = [request for request in all_requests if request["kind"] == "progress"]
     tool_count = sum(message["text"].startswith("echo:") for message in messages)
     require(not provider.errors and len(requests) == count + tool_count, "wrong_model_request_count")
     require(sum(request["tool"] for request in requests) == tool_count, "wrong_tool_result_count")
+    require(len(progress_requests) == (tool_count if progress_enabled else 0), "wrong_progress_request_count")
     completed = initial_turns
     for request in requests:
-        require(request["user_count"] == min(completed, HISTORY_TURNS) + 1, "wrong_history_window")
+        require(min(completed, 2) + 1 <= request["user_count"] <= min(completed, HISTORY_TURNS) + 1,
+                "wrong_history_window")
+        # 本基准短原文足以装入最新两轮；其它相关轮次可按需选择，原话与次序不变。
+        expected = []
+        for index in range(completed + 1):
+            marker = ("perf." + str(index) + ".").ljust(payload_bytes, "x")
+            expected.append("echo:" + marker if index % 10 == 0 else marker)
+        positions = {value: index for index, value in enumerate(expected)}
+        selected = [positions.get(value, -1) for value in request["user_texts"]]
+        require(all(index >= 0 for index in selected) and selected == sorted(set(selected)),
+                "wrong_history_originals")
+        require(request["user_texts"][-min(completed + 1, 3):] == expected[-min(completed + 1, 3):],
+                "missing_recent_originals")
         if request["tool"]:
             completed += 1
         elif not messages[completed - initial_turns]["text"].startswith("echo:"):
@@ -211,6 +255,7 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes):
     require(len(session["turns"]) == initial_turns + count and
             all(turn["status"]["state"] == "Completed" for turn in session["turns"]),
             "uncommitted_session")
+    require([turn["input"] for turn in session["turns"]] == expected, "changed_persisted_originals")
     require(peak[0] > 0, "memory_sampling_failed")
     return {
         "messages": count, "latency_ms": latencies, "elapsed_ms": elapsed_ms,
@@ -219,6 +264,7 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes):
         "rss_mib": peak[0], "node_peak_rss_mib": metrics["node_peak_rss_mib"],
         "startup_to_first_request_ms": (requests[0]["at"] - started) * 1000,
         "state_bytes": state_path.stat().st_size, "provider_requests": len(requests), "tool_roundtrips": tool_count,
+        "progress_requests": len(progress_requests), "total_provider_requests": len(all_requests),
     }
 
 
@@ -252,7 +298,7 @@ def publish(report, output):
         print("::warning title=性能预算超限::" + warning["case"] + "." + warning["metric"] +
               " = " + str(warning["value"]) + "; budget = " + str(warning["budget"]))
     if os.environ.get("GITHUB_STEP_SUMMARY"):
-        rows = ["## Eve 性能测试", "", "模型与 QQ 为本地替身；预热后测量 Release 版运行时及持久化开销。",
+        rows = ["## Eve 性能测试", "", "模型与 QQ 为本地替身；预热后测量 " + report['build_profile'] + " 版运行时及持久化开销。",
                 "", "| 场景 | 消息数 | 中位吞吐 msg/s | p50 ms | p95 ms | p99 ms | 峰值 RSS MiB |",
                 "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
         for name, case in report.get("metrics", {}).items():
@@ -267,12 +313,14 @@ def publish(report, output):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=pathlib.Path, default=ROOT / "target/release/eve-qqbot")
+    parser.add_argument("--build-profile", choices=("debug", "release"), default="release")
+    parser.add_argument("--progress", choices=("enabled", "disabled"), default="enabled")
     parser.add_argument("--budget", type=pathlib.Path, default=HERE / "performance-budget.json")
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
     report = {"format_version": 1, "functional_ok": False, "performance_status": "failed",
               "provider": "loopback_chat_stub", "provider_tcp_nodelay": True, "qq_transport": "production_bridge_with_sdk_stub",
-              "build_profile": "release", "platform": platform.platform(),
+              "build_profile": args.build_profile, "progress_mode": args.progress, "platform": platform.platform(),
               "python_version": platform.python_version(), "logical_cpus": os.cpu_count(),
               "source_sha": os.environ.get("GITHUB_SHA", "local")}
     provider = None
@@ -290,21 +338,23 @@ def main():
             warmup = work / "warmup"
             warmup.mkdir()
             run_wave(args.binary.resolve(), provider, warmup, budget["eve"]["warmup_messages"], 0,
-                     budget["payload_bytes"])
+                     budget["payload_bytes"], args.progress == "enabled")
             for index in range(budget["eve"]["samples"]):
                 directory = work / ("sample-" + str(index))
                 directory.mkdir()
                 count = budget["eve"]["messages"]
-                fresh.append(run_wave(args.binary.resolve(), provider, directory, count, 0, budget["payload_bytes"]))
-                restored.append(run_wave(args.binary.resolve(), provider, directory, count, count, budget["payload_bytes"]))
+                fresh.append(run_wave(args.binary.resolve(), provider, directory, count, 0, budget["payload_bytes"], args.progress == "enabled"))
+                restored.append(run_wave(args.binary.resolve(), provider, directory, count, count, budget["payload_bytes"], args.progress == "enabled"))
         report["workload"] = budget
         report["metrics"] = {"node_bridge": aggregate(node_report["samples"]),
                              "eve_fresh": aggregate(fresh), "eve_restored": aggregate(restored)}
         report["warnings"] = check_budgets(report["metrics"], budget["budgets"])
         report["functional_ok"] = True
         report["performance_status"] = "warning" if report["warnings"] else "passed"
-    except Exception:
-        report["diagnostic"] = "performance_validation_failed"
+    except Exception as error:
+        # 只记录本脚本定义的诊断码，不把响应正文、命令或凭据写入性能报告。
+        code = str(error)
+        report["diagnostic"] = code if isinstance(error, RuntimeError) and code.isascii() and code.replace('_', '').isalnum() else "performance_validation_failed"
         publish(report, args.output)
         raise SystemExit("性能测试的消息、工具、状态或生命周期校验失败；未通过验收。")
     finally:

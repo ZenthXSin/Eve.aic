@@ -250,10 +250,7 @@ impl OpenAiProvider {
         {
             return Err(failed(ProviderFailureKind::ResponseTooLarge));
         }
-        let bytes = response.bytes().await.map_err(transport_error)?;
-        if bytes.len() > self.config.max_response_bytes {
-            return Err(failed(ProviderFailureKind::ResponseTooLarge));
-        }
+        let bytes = bounded_body(response, self.config.max_response_bytes).await?;
         let decoded = match self.config.protocol {
             OpenAiProtocol::Responses => wire::decode_response(&bytes)?,
             OpenAiProtocol::ChatCompletions => chat::decode_response(&bytes)?,
@@ -303,10 +300,7 @@ impl OpenAiProvider {
         {
             return Err(failed(ProviderFailureKind::ResponseTooLarge));
         }
-        let bytes = response.bytes().await.map_err(transport_error)?;
-        if bytes.len() > self.config.max_response_bytes {
-            return Err(failed(ProviderFailureKind::ResponseTooLarge));
-        }
+        let bytes = bounded_body(response, self.config.max_response_bytes).await?;
         let body: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|_| LlmError::Protocol("模型列表不是 JSON".into()))?;
         let entries = body
@@ -603,6 +597,18 @@ impl LlmProvider for OpenAiProvider {
     ) -> LlmFuture<'a, ModelResponse> {
         Box::pin(self.request(request, Some(sink), false))
     }
+}
+
+/// 检查每个传输块，缺少 Content-Length 时也不等待完整响应再检查上限。
+async fn bounded_body(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, LlmError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+        if chunk.len() > limit - bytes.len() {
+            return Err(failed(ProviderFailureKind::ResponseTooLarge));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 fn transport_error(error: reqwest::Error) -> LlmError {

@@ -1,4 +1,5 @@
 """实际 eve-qqbot 进程的内生反思验收；只使用本地 HTTP 和替身 QQ 桥接。"""
+from fixture_auth import configure_fixture_progress
 import json
 import os
 import pathlib
@@ -171,7 +172,7 @@ class CognitionAcceptance(unittest.TestCase):
             command.append("--training")
         from fixture_auth import bootstrap_test_admin
         bootstrap_test_admin(self.work / "state", env, app)
-        child = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        child = subprocess.Popen(command, env=configure_fixture_progress(env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             if cancel_at:
                 deadline = time.monotonic() + 15

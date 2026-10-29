@@ -10,6 +10,22 @@ pub(crate) fn snapshot(
 ) -> Result<PathBuf, ToolExecutionError> {
     snapshot_inner(root, scope, name, destination)
 }
+/// 与实际快照复用相同目录句柄检查；不复制、不排队，也不写临时文件。
+pub(crate) fn preflight(
+    root: &Path,
+    scope: &ContextScope,
+    name: &str,
+) -> Result<(), ToolExecutionError> {
+    #[cfg(target_os = "linux")]
+    {
+        open_source(root, scope, name).map(|_| ())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (root, scope, name);
+        Err(failed())
+    }
+}
 fn failed() -> ToolExecutionError {
     ToolExecutionError::Failed(
         "交付文件必须是自己项目里的普通文件，不能使用链接或读取其他成员文件".into(),
@@ -22,10 +38,34 @@ fn snapshot_inner(
     name: &str,
     destination: &Path,
 ) -> Result<PathBuf, ToolExecutionError> {
+    use std::io::Read;
+    let mut directory = open_source(root, scope, name)?;
+    let before = directory.metadata().map_err(|_| failed())?;
+    let mut target = tempfile::NamedTempFile::new_in(destination).map_err(|_| failed())?;
+    let copied = std::io::copy(
+        &mut (&mut directory).take(before.len()),
+        target.as_file_mut(),
+    )
+    .map_err(|_| failed())?;
+    let after = directory.metadata().map_err(|_| failed())?;
+    if copied != before.len()
+        || before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+    {
+        return Err(failed());
+    }
+    target.as_file().sync_all().map_err(|_| failed())?;
+    target.keep().map(|(_, path)| path).map_err(|_| failed())
+}
+#[cfg(target_os = "linux")]
+fn open_source(
+    root: &Path,
+    scope: &ContextScope,
+    name: &str,
+) -> Result<std::fs::File, ToolExecutionError> {
     use std::{
         ffi::CString,
         fs::{File, OpenOptions},
-        io::Read,
         os::{
             fd::{AsRawFd, FromRawFd},
             unix::fs::OpenOptionsExt,
@@ -85,25 +125,10 @@ fn snapshot_inner(
         // SAFETY: openat 返回的新 fd 只交给此 File 一次。
         directory = unsafe { File::from_raw_fd(fd) };
     }
-    let before = directory.metadata().map_err(|_| failed())?;
-    if !before.is_file() {
+    if !directory.metadata().map_err(|_| failed())?.is_file() {
         return Err(failed());
     }
-    let mut target = tempfile::NamedTempFile::new_in(destination).map_err(|_| failed())?;
-    let copied = std::io::copy(
-        &mut (&mut directory).take(before.len()),
-        target.as_file_mut(),
-    )
-    .map_err(|_| failed())?;
-    let after = directory.metadata().map_err(|_| failed())?;
-    if copied != before.len()
-        || before.len() != after.len()
-        || before.modified().ok() != after.modified().ok()
-    {
-        return Err(failed());
-    }
-    target.as_file().sync_all().map_err(|_| failed())?;
-    target.keep().map(|(_, path)| path).map_err(|_| failed())
+    Ok(directory)
 }
 #[cfg(not(target_os = "linux"))]
 fn snapshot_inner(

@@ -735,3 +735,205 @@ async fn notices_expire_after_the_window_and_full_ledgers_prune_only_settled_tas
     assert!(snapshot.get(&task.id).is_none(), "最早了结的一条被腾出");
     kernel.stop_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn condition_resume_keeps_the_original_task_checkpoint_budget_and_deadline() {
+    let world = World::new();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let task = tasks
+        .create(&owner("alice"), spec("等待构建"), "condition-resume", 10)
+        .unwrap();
+    tasks.start(&task.id, 20).unwrap();
+    let mut frame = checkpoint("alice");
+    frame.result = Some("构建尚未完成".into());
+    frame.remaining = None;
+    tasks.checkpoint(&task.id, frame.clone(), 1000, 30).unwrap();
+    tasks
+        .finish(
+            &task.id,
+            TaskEnd::Blocked {
+                result: "构建尚未完成".into(),
+            },
+            usage(0),
+            40,
+        )
+        .unwrap();
+    assert_eq!(
+        tasks.resume_blocked(&owner("bob"), &task.id, "构建退出", 50),
+        Err(TaskError::NotFound)
+    );
+    let resumed = tasks
+        .resume_blocked(&owner("alice"), &task.id, "本地构建已退出，只检查日志", 50)
+        .unwrap();
+    assert_eq!(resumed.id, task.id);
+    assert_eq!(resumed.spec.max_steps, task.spec.max_steps);
+    assert_eq!(resumed.status, TaskStatus::Running);
+    let execution = resumed.execution.unwrap();
+    assert_eq!(execution.deadline_at_ms, Some(1000));
+    assert_eq!(execution.resume_at_ms, Some(50));
+    assert_eq!(execution.recoveries, 1);
+    assert_eq!(
+        execution.checkpoint.as_ref().unwrap().used_tool_calls,
+        frame.used_tool_calls
+    );
+    assert_eq!(
+        execution.checkpoint.as_ref().unwrap().provider_requests,
+        frame.provider_requests
+    );
+    assert_eq!(execution.checkpoint.as_ref().unwrap().result, None);
+    assert!(execution.checkpoint.as_ref().unwrap().messages.len() > frame.messages.len());
+    assert_eq!(
+        tasks.resume_blocked(&owner("alice"), &task.id, "重复事件", 60),
+        Err(TaskError::InvalidTransition)
+    );
+    kernel.stop_all().await.unwrap();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let snapshot = tasks.snapshot().unwrap();
+    let restored = snapshot.get(&task.id).unwrap();
+    assert_eq!(restored.id, task.id);
+    assert_eq!(
+        restored.execution.as_ref().unwrap().deadline_at_ms,
+        Some(1000)
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn condition_resume_rejects_unknown_side_effects_and_expired_deadlines() {
+    let world = World::new();
+    let (kernel, tasks) = world.open().await.unwrap();
+    for (source, unknown, now) in [("unknown", true, 50), ("expired", false, 1000)] {
+        let task = tasks
+            .create(&owner("alice"), spec("保留现场"), source, 10)
+            .unwrap();
+        tasks.start(&task.id, 20).unwrap();
+        let mut frame = checkpoint("alice");
+        if unknown {
+            frame.pending_calls.push(eve_llm_api::ToolCall {
+                id: "unknown".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({}),
+            });
+            frame.used_tool_calls = 1;
+            frame.tool_batches = 1;
+        }
+        tasks.checkpoint(&task.id, frame, 1000, 30).unwrap();
+        tasks
+            .finish(
+                &task.id,
+                TaskEnd::Blocked {
+                    result: "等待核对".into(),
+                },
+                usage(0),
+                40,
+            )
+            .unwrap();
+        let before = tasks.snapshot().unwrap().get(&task.id).unwrap().clone();
+        assert_eq!(
+            tasks.resume_blocked(&owner("alice"), &task.id, "条件成立", now),
+            Err(TaskError::InvalidTransition)
+        );
+        assert_eq!(tasks.snapshot().unwrap().get(&task.id).unwrap(), &before);
+    }
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_a_blocked_task_prevents_future_condition_resume() {
+    let world = World::new();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let task = tasks
+        .create(&owner("alice"), spec("等待后撤回"), "cancel-blocked", 10)
+        .unwrap();
+    tasks.start(&task.id, 20).unwrap();
+    let mut frame = checkpoint("alice");
+    frame.remaining = None;
+    frame.result = Some("等待条件".into());
+    tasks.checkpoint(&task.id, frame, u64::MAX, 30).unwrap();
+    tasks
+        .finish(
+            &task.id,
+            TaskEnd::Blocked {
+                result: "等待条件".into(),
+            },
+            usage(0),
+            40,
+        )
+        .unwrap();
+    let cancelled = tasks.cancel("alice", &task.id, 50).unwrap();
+    assert_eq!(cancelled.status, TaskStatus::Cancelled);
+    assert_eq!(
+        tasks.resume_blocked(&owner("alice"), &task.id, "旧条件满足", 60),
+        Err(TaskError::InvalidTransition)
+    );
+    kernel.stop_all().await.unwrap();
+    let (kernel, tasks) = world.open().await.unwrap();
+    assert_eq!(
+        tasks.snapshot().unwrap().get(&task.id).unwrap().status,
+        TaskStatus::Cancelled
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn bounded_create_keeps_original_authorization_deadline_atomically_across_restart() {
+    let world = World::new();
+    let (kernel, admin) = world.open().await.unwrap();
+    let task = admin
+        .create_bounded(&owner("a"), spec("原授权目标"), "bounded", 1000, 10)
+        .unwrap();
+    assert_eq!(
+        task.execution
+            .as_ref()
+            .unwrap()
+            .authorization_deadline_at_ms,
+        Some(1000)
+    );
+    let duplicate = admin
+        .create_bounded(&owner("a"), spec("不能刷新期限"), "bounded", 2000, 20)
+        .unwrap();
+    assert_eq!(
+        duplicate
+            .execution
+            .as_ref()
+            .unwrap()
+            .authorization_deadline_at_ms,
+        Some(1000)
+    );
+    assert!(
+        admin
+            .create_bounded(&owner("a"), spec("已过期"), "expired", 30, 30)
+            .is_err()
+    );
+    let mut foreign = owner("a");
+    foreign.session_id = "other-window".into();
+    assert!(
+        admin
+            .create_bounded(&foreign, spec("不能跨范围"), "bounded", 2000, 20)
+            .is_err()
+    );
+    admin.start(&task.id, 21).unwrap();
+    assert!(
+        admin
+            .checkpoint(&task.id, checkpoint("a"), 2000, 22)
+            .is_err()
+    );
+    admin
+        .checkpoint(&task.id, checkpoint("a"), 1000, 22)
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    drop(kernel);
+    let (_kernel, restored) = world.open().await.unwrap();
+    assert_eq!(
+        restored
+            .snapshot()
+            .unwrap()
+            .get(&task.id)
+            .unwrap()
+            .execution
+            .as_ref()
+            .unwrap()
+            .authorization_deadline_at_ms,
+        Some(1000)
+    );
+}

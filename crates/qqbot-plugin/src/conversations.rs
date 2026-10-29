@@ -16,6 +16,7 @@ struct Inner {
     group_routes: HashMap<String, String>,
     sources: HashMap<String, QqInteractionSource>,
     identities: HashMap<String, QqConversationIdentity>,
+    turn_anchors: HashMap<String, QqTurnAnchor>,
     order: VecDeque<String>,
     idle: bool,
     wakeup_claimed: bool,
@@ -46,6 +47,16 @@ impl QqConversationIdentity {
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         })
     }
+}
+
+/// 当前已准入轮次的可信消息集合；后续收到的消息只更新路由，不改变本轮锚点。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QqTurnAnchor {
+    pub session: SessionKey,
+    pub conversation: String,
+    /// 按本轮合并顺序，最后一条是本轮真实主消息；不是合并文本生成的伪ID。
+    pub message_ids: Vec<String>,
+    pub speaker_id: String,
 }
 
 #[derive(Clone, Default)]
@@ -89,6 +100,91 @@ impl QqConversations {
             .get(&session.session_id)
             .filter(|v| v.session == *session)
             .cloned())
+    }
+
+    /// 仅通道准入时写入；读取不依赖正文相等、附件描述或最新收到的消息。
+    pub fn turn_anchor(&self, session: &SessionKey) -> PluginResult<Option<QqTurnAnchor>> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| PluginError::State("QQ轮次锚点目录不可用".into()))?;
+        Ok(inner
+            .turn_anchors
+            .get(&session.session_id)
+            .filter(|a| a.session == *session)
+            .cloned())
+    }
+    pub(crate) fn bind_turn_messages(
+        &self,
+        app: &str,
+        messages: &[crate::state::Message],
+    ) -> PluginResult<()> {
+        let invalid = || PluginError::Task("QQ轮次消息锚点无效".into());
+        let last = messages.last().ok_or_else(invalid)?;
+        if messages.len() > 32 || messages.iter().any(|m| !m.valid()) {
+            return Err(invalid());
+        }
+        let session = last.session_key(app)?;
+        let conversation = last.conversation_key(app)?;
+        let mut ids = std::collections::BTreeSet::new();
+        for message in messages {
+            if message.session_key(app)? != session
+                || message.conversation_key(app)? != conversation
+                || !ids.insert(message.id.clone())
+            {
+                return Err(invalid());
+            }
+        }
+        let anchor = QqTurnAnchor {
+            session: session.clone(),
+            conversation,
+            message_ids: messages.iter().map(|m| m.id.clone()).collect(),
+            speaker_id: last.user_id.clone(),
+        };
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| PluginError::State("QQ轮次锚点目录不可用".into()))?;
+        if inner.turn_anchors.len() >= MAX_SESSIONS
+            && !inner.turn_anchors.contains_key(&session.session_id)
+        {
+            return Err(PluginError::State("QQ轮次锚点目录已满".into()));
+        }
+        // Busy后重新准入同一主ID时保留原合并批次，不能因合并正文已写回队列而丢掉早期ID。
+        if messages.len() == 1
+            && inner
+                .turn_anchors
+                .get(&session.session_id)
+                .is_some_and(|a| a.session == session && a.message_ids.last() == Some(&last.id))
+        {
+            return Ok(());
+        }
+        inner.turn_anchors.insert(session.session_id, anchor);
+        Ok(())
+    }
+
+    pub(crate) fn clear_turn_anchor(
+        &self,
+        session: &SessionKey,
+        primary_message_id: &str,
+    ) -> PluginResult<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| PluginError::State("QQ轮次锚点目录不可用".into()))?;
+        if inner
+            .turn_anchors
+            .get(&session.session_id)
+            .is_some_and(|a| {
+                a.session == *session
+                    && a.message_ids
+                        .last()
+                        .is_some_and(|id| id == primary_message_id)
+            })
+        {
+            inner.turn_anchors.remove(&session.session_id);
+        }
+        Ok(())
     }
 
     /// 可信宿主为已有会话选择通知路由；新近登记的会话在前，不接受模型自报路由。
@@ -183,6 +279,7 @@ impl QqConversations {
                 if let Some(oldest) = inner.order.pop_front() {
                     inner.sources.remove(&oldest);
                     inner.identities.remove(&oldest);
+                    inner.turn_anchors.remove(&oldest);
                 }
             }
         }
@@ -219,5 +316,94 @@ mod tests {
                 .source(&format!("qq:{}", MAX_SESSIONS - 1))
                 .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod turn_anchor_tests {
+    use super::*;
+    fn message(id: &str, speaker: &str) -> crate::Message {
+        crate::Message {
+            id: id.into(),
+            scope: "group".into(),
+            target_id: "group-1".into(),
+            user_id: speaker.into(),
+            text: "同一句话".into(),
+            attachments: vec![],
+            quoted: None,
+        }
+    }
+    #[test]
+    fn admitted_ids_survive_later_same_text_other_members_and_busy_batch_retry() {
+        let conversations = QqConversations::default();
+        let first = message("first", "member-a");
+        let primary = message("primary", "member-a");
+        conversations.record_message("app", &first).unwrap();
+        conversations.record_message("app", &primary).unwrap();
+        conversations
+            .bind_turn_messages("app", &[first.clone(), primary.clone()])
+            .unwrap();
+        let session = primary.session_key("app").unwrap();
+        for n in 0..25 {
+            conversations
+                .record_message("app", &message(&format!("later-{n}"), "member-a"))
+                .unwrap();
+        }
+        conversations
+            .record_message("app", &message("other-member", "member-b"))
+            .unwrap();
+        let anchor = conversations.turn_anchor(&session).unwrap().unwrap();
+        assert_eq!(anchor.message_ids, vec!["first", "primary"]);
+        conversations
+            .bind_turn_messages("app", std::slice::from_ref(&primary))
+            .unwrap();
+        assert_eq!(
+            conversations
+                .turn_anchor(&session)
+                .unwrap()
+                .unwrap()
+                .message_ids,
+            vec!["first", "primary"]
+        );
+        assert!(
+            conversations
+                .bind_turn_messages("app", &[first, message("wrong-member", "member-b")])
+                .is_err()
+        );
+        assert!(
+            conversations
+                .turn_anchor(&message("x", "member-b").session_key("app").unwrap())
+                .unwrap()
+                .is_none()
+        );
+        conversations
+            .clear_turn_anchor(&session, "later-1")
+            .unwrap();
+        assert!(conversations.turn_anchor(&session).unwrap().is_some());
+        conversations
+            .clear_turn_anchor(&session, "primary")
+            .unwrap();
+        assert!(conversations.turn_anchor(&session).unwrap().is_none());
+    }
+    #[test]
+    fn attachment_only_message_anchors_by_real_id_without_text_guessing() {
+        let conversations = QqConversations::default();
+        let mut attachment = message("attachment-id", "member-a");
+        attachment.text.clear();
+        attachment.attachments.push(crate::ImageAttachment {
+            content_type: "image/png".into(),
+            url: "https://example.org/image.png".into(),
+            filename: None,
+        });
+        assert!(attachment.valid());
+        conversations.record_message("app", &attachment).unwrap();
+        conversations
+            .bind_turn_messages("app", &[attachment.clone()])
+            .unwrap();
+        let anchor = conversations
+            .turn_anchor(&attachment.session_key("app").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(anchor.message_ids, vec!["attachment-id"]);
     }
 }
