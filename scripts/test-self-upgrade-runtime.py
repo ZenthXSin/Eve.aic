@@ -202,6 +202,45 @@ while True:
             session_id=self.session,requested_by=self.session,turn_id=1,
             lease=runtime.prepare_lease(directory, manifest))
 
+    @unittest.skipIf(os.name == 'nt', '需要创建目录符号链接')
+    def test_candidate_parent_alias_accepts_same_file_without_rewriting_manifest(self):
+        request = self.candidate('alias')
+        directory = Path(request['candidate_directory'])
+        alias = self.root / 'data-alias'
+        alias.symlink_to(self.root, target_is_directory=True)
+        manifest = runtime.read_json(directory / 'manifest.json')
+        manifest['candidate_path'] = str(alias / directory.relative_to(self.root) / 'eve-qqbot')
+        runtime.atomic(directory / 'manifest.json', manifest)
+        request['lease'] = runtime.prepare_lease(directory, manifest)
+        before = (directory / 'manifest.json').read_bytes()
+        runtime.validate_candidate(request, self.candidates)
+        self.assertEqual((directory / 'manifest.json').read_bytes(), before)
+        self.launch()
+        runtime.atomic(self.queue / 'request.json', request)
+        self.wait(lambda d: d['result'] == 'applied')
+        self.assertEqual(self.events.read_text().splitlines(), ['old', 'alias'])
+
+    @unittest.skipIf(os.name == 'nt', '需要创建文件符号链接')
+    def test_candidate_alias_does_not_allow_leaf_symlink_or_other_directory(self):
+        request = self.candidate('boundaries')
+        directory = Path(request['candidate_directory'])
+        manifest = runtime.read_json(directory / 'manifest.json')
+        outside = self.root / 'outside'
+        outside.mkdir()
+        leaf = outside / 'eve-qqbot'
+        leaf.write_bytes((directory / 'eve-qqbot').read_bytes())
+        manifest['candidate_path'] = str(leaf)
+        runtime.atomic(directory / 'manifest.json', manifest)
+        with self.assertRaisesRegex(ValueError, 'candidate_binary_changed'):
+            runtime.validate_candidate(request, self.candidates)
+        binary = directory / 'eve-qqbot'
+        binary.unlink()
+        binary.symlink_to(leaf)
+        manifest['candidate_path'] = str(binary)
+        runtime.atomic(directory / 'manifest.json', manifest)
+        with self.assertRaisesRegex(ValueError, 'candidate_binary_changed'):
+            runtime.validate_candidate(request, self.candidates)
+
     def merged_state(self):
         path=self.state/'state.json';state=runtime.read_json(path)
         ledger=json.loads(bytes(state['entries']['eve.channel.qqbot']['receipts.v1']))

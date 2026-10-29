@@ -176,6 +176,16 @@ fn slow_label(kind: &TurnEventKind) -> Option<Option<String>> {
         _ => None,
     }
 }
+fn steering_notice(phase: ControlPhase) -> String {
+    let activity = match phase {
+        ControlPhase::Tools => "当前还在执行工具步骤",
+        ControlPhase::Generating => "当前还在等待模型回复",
+        ControlPhase::Committing => "当前正在保存本轮结果",
+        _ => "原任务还在处理中",
+    };
+    format!("收到，已把这条消息加入原任务。{activity}，还没有结束；不会另开一遍任务。")
+}
+
 fn progress_text(kind: &TurnEventKind) -> Option<String> {
     if let TurnEventKind::AssistantMessage { text } = kind {
         Some(text.clone())
@@ -619,6 +629,8 @@ fn segment_frame(ledger: &Ledger, index: usize, part: usize) -> Value {
 enum ReplyGuard {
     // 控制消息的确认仍可用于已取消/阻塞代，但不能用于已被替换的代。
     Current(GenerationKey),
+    // 追加消息的接收确认与原任务最终结果分开投递。
+    Steering(GenerationKey),
     Completed(ControlEvent),
     NoTask,
     // 宿主命令的已保存结果不属于聊天生成代，但仍绑定原消息和持久回执。
@@ -627,7 +639,7 @@ enum ReplyGuard {
 impl ReplyGuard {
     fn accepts(&self, control: &dyn ControlService) -> bool {
         match self {
-            Self::Current(key) => control
+            Self::Current(key) | Self::Steering(key) => control
                 .snapshot(&key.session)
                 .is_ok_and(|s| s.is_some_and(|s| s.key == *key)),
             Self::Completed(event) => control.accepts(event),
@@ -1374,6 +1386,7 @@ pub(crate) async fn run(
             }
             if delivering.is_none() && pushing.is_none() && sending_file.is_none() && progress_delivery.is_none()
                 && !narrating
+                && !replies.iter().any(|r| matches!(r.guard, ReplyGuard::Steering(_)))
                 && progress_queue.front().is_some_and(|(event, _, _): &(ControlEvent, Option<String>, Option<u64>)|
                     active.iter().any(|a| a.key == event.key)
                     || !routing.iter().any(|r| r.target.session == event.key.session))
@@ -1406,9 +1419,10 @@ pub(crate) async fn run(
                             let tx = narrated_tx.clone();
                             narrating = true;
                             tokio::spawn(async move {
+                                let fallback = facts.failure_notice();
                                 let (text, failed) = match tokio::time::timeout(Duration::from_secs(8), narrator.narrate(facts)).await {
                                     Ok(Ok(text)) => (text, false),
-                                    _ => (None, true),
+                                    _ => (fallback, true),
                                 };
                                 let _ = tx.send((event, text, waiting_seconds, failed)).await;
                             });
@@ -1437,10 +1451,14 @@ pub(crate) async fn run(
                     let skip_start = is_start
                         && (!automatic_start || ordinary_count != 0);
                     let necessary_question = live_waiting.get(&message.id).is_some_and(|send| send.needs_answer);
-                    let interval_ok = necessary_question || !stages || entry.progress.is_empty()
+                    let interval_ok = necessary_question || matches!(event.event.kind, TurnEventKind::AssistantMessage { .. }) || !stages || entry.progress.is_empty()
                         || last_progress.get(&message.id).is_none_or(|last| last.elapsed() >= min_interval)
                         || matches!(event.event.kind, TurnEventKind::ContextCompactionStarted);
-                    let blocked = entry.progress.iter().any(|p| matches!(p.state, PartState::Failed | PartState::Unknown));
+                    // 未知/失败的正文不重发；新的进度只冷却一分钟，不永久禁言整轮。
+                    let duplicate = entry.progress.iter().any(|p| p.text.trim() == text.trim());
+                    let cooling_down = !matches!(event.event.kind, TurnEventKind::AssistantMessage { .. })
+                        && entry.progress.last().is_some_and(|p| matches!(p.state, PartState::Failed | PartState::Unknown))
+                        && last_progress.get(&message.id).is_some_and(|last| last.elapsed() < Duration::from_secs(60));
                     // 旧模式沿用 1/30/70 步节奏；新模式更密的事件不能抢占压缩通知名额。
                     let legacy_milestone = stages || match event.event.kind {
                         TurnEventKind::ToolProgress { completed_calls, .. } =>
@@ -1449,7 +1467,7 @@ pub(crate) async fn run(
                     };
                     let scope_budget = message.scope == "c2c" || necessary_question || ordinary_count < 2;
                     if scope_budget && entry.state == ReceiptState::Processing && !skip_start && interval_ok && legacy_milestone
-                        && (!stages || !blocked) && entry.progress.len() < if stages {64} else {3} {
+                        && !duplicate && !cooling_down && entry.progress.len() < if stages {64} else {3} {
                         let part = entry.progress.len();
                         let proactive = message.scope == "c2c" && stages && (passive_progress(entry) >= 2 || elapsed >= Duration::from_secs(230));
                         entry.progress.push(Progress { text: text.clone(), state: PartState::Sending, proactive, necessary: necessary_question });
@@ -1471,8 +1489,8 @@ pub(crate) async fn run(
                 continue;
             }
             if delivering.is_none() && pushing.is_none() && sending_file.is_none() && judging.is_none() && progress_delivery.is_none()
-                && !narrating && progress_queue.is_empty() && progress_rx.is_empty()
-                && let Some(index) = replies.iter().position(|reply| !pending_control(&reply.message, &routing, &commands)) {
+                && let Some(index) = replies.iter().position(|reply| !pending_control(&reply.message, &routing, &commands)
+                    && (matches!(reply.guard, ReplyGuard::Steering(_)) || (!narrating && progress_queue.is_empty() && progress_rx.is_empty()))) {
                 let reply = replies.remove(index).expect("queued reply");
                 if !reply.guard.accepts(control.as_ref()) {
                     mark_failed(&mut ledger, &ctx, &config.app_id, &reply.message.id)?;
@@ -2318,10 +2336,18 @@ pub(crate) async fn run(
                                                 continue;
                                             }
                                             saved = true;
+                                            let notice = (message.scope == "c2c").then(|| steering_notice(snapshot.phase));
                                             if live.steer(&scope, turn_id, message.turn_text(), || {
-                                                ledger.steer(&ctx, &config.app_id, &message.id, &parent_id)
+                                                match &notice {
+                                                    Some(text) => ledger.acknowledge_steering(&ctx, &config.app_id, &message.id, text),
+                                                    None => ledger.steer(&ctx, &config.app_id, &message.id, &parent_id),
+                                                }
                                             })? {
-                                                finish(&mut stdin, &message.id).await?;
+                                                if let Some(text) = notice {
+                                                    replies.push_front(Reply { message, text, guard: ReplyGuard::Steering(current_key), interaction: None, invite: None });
+                                                } else {
+                                                    finish(&mut stdin, &message.id).await?;
+                                                }
                                                 continue;
                                             }
                                         }
