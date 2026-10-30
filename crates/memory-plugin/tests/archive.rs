@@ -51,6 +51,7 @@ fn small_policy() -> ArchivePolicy {
 struct FlakyArchive {
     inner: FileEvidenceArchive,
     fail_put: AtomicBool,
+    fail_get: AtomicBool,
 }
 
 impl EvidenceArchiveStore for FlakyArchive {
@@ -61,6 +62,9 @@ impl EvidenceArchiveStore for FlakyArchive {
         self.inner.put(name, bytes)
     }
     fn get(&self, name: &str) -> MemoryResult<Option<Vec<u8>>> {
+        if self.fail_get.load(Ordering::SeqCst) {
+            return Err(MemoryError::Storage);
+        }
         self.inner.get(name)
     }
     fn list(&self) -> MemoryResult<Vec<String>> {
@@ -72,6 +76,7 @@ fn flaky(directory: &Path) -> Arc<FlakyArchive> {
     Arc::new(FlakyArchive {
         inner: FileEvidenceArchive::open(directory).unwrap(),
         fail_put: AtomicBool::new(false),
+        fail_get: AtomicBool::new(false),
     })
 }
 
@@ -1207,4 +1212,82 @@ async fn archived_identity_aliases_cannot_be_reused_by_a_statement() {
         );
         stop(rig).await;
     }
+}
+
+#[tokio::test]
+async fn evidence_cursor_pins_revision_across_archival_and_stops_with_service() {
+    let directory = tempfile::tempdir().unwrap();
+    let archive = Arc::new(FileEvidenceArchive::open(directory.path()).unwrap());
+    let rig = start(None, Some((archive, small_policy()))).await.unwrap();
+    let owner = scope("cursor-owner");
+    let foreign = scope("cursor-foreign");
+    for number in 1..=70 {
+        import(&rig, &owner, number).unwrap();
+    }
+    import(&rig, &foreign, 1).unwrap();
+    let reader = rig.admin.reader(owner.clone()).unwrap();
+    let before = reader.complete_snapshot().unwrap();
+    let mut cursor = reader.scan().unwrap();
+    assert_eq!(cursor.summary().scope, owner);
+    assert_eq!(cursor.summary().revision, before.revision);
+    for number in 71..=80 {
+        import(&rig, &owner, number).unwrap();
+    }
+    let mut evidence = vec![];
+    loop {
+        let page = cursor.next_page().unwrap();
+        assert!(page.len() <= MAX_ARCHIVE_PAGE);
+        if page.is_empty() {
+            break;
+        }
+        evidence.extend(page);
+    }
+    assert!(
+        evidence == before.evidence,
+        "分页只返回创建时的完整作用域原文，不混入后来归档或其他会话"
+    );
+    let mut stopped_cursor = reader.scan().unwrap();
+    stop(rig).await;
+    assert!(matches!(
+        stopped_cursor.next_page(),
+        Err(MemoryError::Unavailable)
+    ));
+}
+
+#[tokio::test]
+async fn failed_cursor_cannot_skip_a_block_even_after_storage_recovers() {
+    let directory = tempfile::tempdir().unwrap();
+    let archive = flaky(directory.path());
+    let state_directory = tempfile::tempdir().unwrap();
+    let state = RecordingStore::open(state_directory.path());
+    let rig = start(Some(state.clone()), Some((archive.clone(), small_policy())))
+        .await
+        .unwrap();
+    let owner = scope("cursor-storage-failure");
+    for number in 1..=20 {
+        import(&rig, &owner, number).unwrap();
+    }
+    stop(rig).await;
+    // 重新打开清空解码缓存；恢复验证成功后才注入读取故障。
+    let rig = start(Some(state), Some((archive.clone(), small_policy())))
+        .await
+        .unwrap();
+    let reader = rig.admin.reader(owner).unwrap();
+    let mut cursor = reader.scan().unwrap();
+    archive.fail_get.store(true, Ordering::SeqCst);
+    assert!(matches!(cursor.next_page(), Err(MemoryError::Storage)));
+    archive.fail_get.store(false, Ordering::SeqCst);
+    assert!(matches!(cursor.next_page(), Err(MemoryError::Unavailable)));
+    // 调用方显式重开新视图，才能从头完整读取；原文保持不变。
+    let mut fresh = reader.scan().unwrap();
+    let mut count = 0;
+    loop {
+        let page = fresh.next_page().unwrap();
+        if page.is_empty() {
+            break;
+        }
+        count += page.len();
+    }
+    assert_eq!(count, 20);
+    stop(rig).await;
 }

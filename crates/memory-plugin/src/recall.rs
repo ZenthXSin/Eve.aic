@@ -41,44 +41,38 @@ impl ScopedLexicalRecall {
 
 impl MemoryRecallService for ScopedLexicalRecall {
     fn recall(&self, request: &MemoryRecallRequest) -> MemoryResult<MemoryRecallResponse> {
+        self.read_view(request).map(|(_, response)| response)
+    }
+}
+impl ScopedLexicalRecall {
+    pub(crate) fn read_view(
+        &self,
+        request: &MemoryRecallRequest,
+    ) -> MemoryResult<(MemoryScanSummary, MemoryRecallResponse)> {
         request.validate()?;
-        // 归档只是存储形式：召回在完整记忆中查找，旧原文同样可以被找到。
-        let snapshot = self.memory.complete_snapshot()?;
-        validate_snapshot(&snapshot, &self.scope).map_err(|_| MemoryError::CorruptState)?;
+        // 保持同一修订的扫描视图；逐块核对全部证据，仅保留紧凑来源索引和最高排名候选。
+        let mut cursor = self.memory.scan()?;
+        let summary = cursor.summary().clone();
+        summary
+            .scope
+            .validate()
+            .map_err(|_| MemoryError::CorruptState)?;
+        if summary.scope != self.scope || summary.preferences.len() > MAX_PREFERENCES {
+            return Err(MemoryError::CorruptState);
+        }
         let query = Query::new(&request.query);
+        let mut index = ScanIndex::default();
         let mut candidates = Vec::new();
-        if !query.tokens.is_empty() {
-            let evidence: BTreeMap<_, _> = snapshot
-                .evidence
-                .iter()
-                .map(|entry| (entry.id.as_str(), entry))
-                .collect();
-            for preference in &snapshot.preferences {
-                if preference.status != PreferenceStatus::Confirmed {
-                    continue;
-                }
-                // 完整校验已确保末版及证据存在；仍以可失败读取保持边界明确。
-                let latest = preference.history.last().ok_or(MemoryError::CorruptState)?;
-                let source = evidence
-                    .get(latest.evidence_id.as_str())
-                    .ok_or(MemoryError::CorruptState)?;
-                if let Some(matched) = query.matches(&preference.text) {
-                    candidates.push(Candidate::new(
-                        matched,
-                        &preference.text,
-                        source.revision,
-                        SourceKey::Preference(preference.id.clone()),
-                        MemoryRecallSource::ConfirmedPreference {
-                            preference_id: preference.id.clone(),
-                            preference_revision: preference.revision,
-                            evidence_id: source.id.clone(),
-                            evidence_revision: source.revision,
-                            at_ms: latest.at_ms,
-                        },
-                    ));
-                }
+        loop {
+            let page = cursor.next_page()?;
+            if page.len() > MAX_ARCHIVE_PAGE {
+                return Err(MemoryError::CorruptState);
             }
-            for evidence in &snapshot.evidence {
+            if page.is_empty() {
+                break;
+            }
+            for evidence in page {
+                index.observe(&evidence, &summary)?;
                 let EvidenceSource::CompletedInteraction {
                     message_id,
                     session_revision,
@@ -87,7 +81,6 @@ impl MemoryRecallService for ScopedLexicalRecall {
                     assistant_text,
                 } = &evidence.source
                 else {
-                    // 原始偏好命令与撤销命令不能作为可召回历史回复。
                     continue;
                 };
                 for (field, text) in [
@@ -95,38 +88,61 @@ impl MemoryRecallService for ScopedLexicalRecall {
                     (RecallField::Assistant, assistant_text),
                 ] {
                     if let Some(matched) = query.matches(text) {
-                        candidates.push(Candidate::new(
-                            matched,
-                            text,
-                            evidence.revision,
-                            SourceKey::Interaction(evidence.id.clone(), field),
-                            MemoryRecallSource::CompletedInteraction {
-                                evidence_id: evidence.id.clone(),
-                                evidence_revision: evidence.revision,
-                                message_id: message_id.clone(),
-                                session_revision: *session_revision,
-                                turn_id: *turn_id,
-                                at_ms: evidence.at_ms,
-                                field,
-                            },
-                        ));
+                        keep_candidate(
+                            &mut candidates,
+                            Candidate::new(
+                                matched,
+                                text,
+                                evidence.revision,
+                                SourceKey::Interaction(evidence.id.clone(), field),
+                                MemoryRecallSource::CompletedInteraction {
+                                    evidence_id: evidence.id.clone(),
+                                    evidence_revision: evidence.revision,
+                                    message_id: message_id.clone(),
+                                    session_revision: *session_revision,
+                                    turn_id: *turn_id,
+                                    at_ms: evidence.at_ms,
+                                    field,
+                                },
+                            ),
+                        );
                     }
                 }
             }
         }
-        candidates.sort_by(|left, right| {
-            right
-                .hit
-                .score
-                .cmp(&left.hit.score)
-                .then_with(|| right.evidence_revision.cmp(&left.evidence_revision))
-                .then_with(|| left.key.cmp(&right.key))
-        });
-
+        index.finish(&summary)?;
+        for preference in &summary.preferences {
+            if preference.status != PreferenceStatus::Confirmed {
+                continue;
+            }
+            let latest = preference.history.last().ok_or(MemoryError::CorruptState)?;
+            let source = index
+                .ids
+                .get(&latest.evidence_id)
+                .ok_or(MemoryError::CorruptState)?;
+            if let Some(matched) = query.matches(&preference.text) {
+                keep_candidate(
+                    &mut candidates,
+                    Candidate::new(
+                        matched,
+                        &preference.text,
+                        *source,
+                        SourceKey::Preference(preference.id.clone()),
+                        MemoryRecallSource::ConfirmedPreference {
+                            preference_id: preference.id.clone(),
+                            preference_revision: preference.revision,
+                            evidence_id: latest.evidence_id.clone(),
+                            evidence_revision: *source,
+                            at_ms: latest.at_ms,
+                        },
+                    ),
+                );
+            }
+        }
         let mut response = MemoryRecallResponse {
-            scope: snapshot.scope,
-            revision: snapshot.revision,
-            hits: Vec::new(),
+            scope: summary.scope.clone(),
+            revision: summary.revision,
+            hits: vec![],
         };
         for candidate in candidates {
             if response.hits.len() == request.limit {
@@ -141,7 +157,135 @@ impl MemoryRecallService for ScopedLexicalRecall {
         response
             .validate_for(&self.scope, request)
             .map_err(|_| MemoryError::CorruptState)?;
-        Ok(response)
+        Ok((summary, response))
+    }
+}
+
+fn keep_candidate(candidates: &mut Vec<Candidate>, candidate: Candidate) {
+    candidates.push(candidate);
+    candidates.sort_by(|left, right| {
+        right
+            .hit
+            .score
+            .cmp(&left.hit.score)
+            .then_with(|| right.evidence_revision.cmp(&left.evidence_revision))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    candidates.truncate(MAX_RECALL_RESULTS);
+}
+
+/// 仅保存唯一性与来源引用核验所需元数据，不保留扫描过的原文。
+#[derive(Default)]
+struct ScanIndex {
+    ids: BTreeMap<String, u64>,
+    messages: BTreeSet<String>,
+    turns: BTreeSet<u64>,
+    statements: BTreeSet<String>,
+    last_revision: u64,
+}
+impl ScanIndex {
+    fn observe(
+        &mut self,
+        evidence: &InteractionEvidence,
+        summary: &MemoryScanSummary,
+    ) -> MemoryResult<()> {
+        let invalid = || MemoryError::CorruptState;
+        validate_id(&evidence.id).map_err(|_| invalid())?;
+        if self.ids.len() as u64 >= summary.evidence_count
+            || evidence.revision <= self.last_revision
+            || evidence.revision > summary.revision
+            || self
+                .ids
+                .insert(evidence.id.clone(), evidence.revision)
+                .is_some()
+        {
+            return Err(invalid());
+        }
+        self.last_revision = evidence.revision;
+        let message = match &evidence.source {
+            EvidenceSource::UserStatement { message_id, text } => {
+                validate_text(text, MAX_TEXT_BYTES).map_err(|_| invalid())?;
+                self.statements.insert(evidence.id.clone());
+                message_id
+            }
+            EvidenceSource::CompletedInteraction {
+                message_id,
+                session_revision,
+                turn_id,
+                user_text,
+                assistant_text,
+            } => {
+                validate_text(user_text, MAX_TEXT_BYTES).map_err(|_| invalid())?;
+                validate_text(assistant_text, MAX_TEXT_BYTES).map_err(|_| invalid())?;
+                if *turn_id == 0
+                    || turn_id.checked_mul(2).is_none_or(|n| *session_revision < n)
+                    || !self.turns.insert(*turn_id)
+                {
+                    return Err(invalid());
+                }
+                message_id
+            }
+        };
+        validate_id(message).map_err(|_| invalid())?;
+        if !self.messages.insert(message.clone()) {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+    fn finish(&self, summary: &MemoryScanSummary) -> MemoryResult<()> {
+        if self.ids.len() as u64 != summary.evidence_count {
+            return Err(MemoryError::CorruptState);
+        }
+        let mut preferences = BTreeSet::new();
+        let mut referenced = BTreeSet::new();
+        let mut count = 0usize;
+        for preference in &summary.preferences {
+            validate_id(&preference.id).map_err(|_| MemoryError::CorruptState)?;
+            validate_text(&preference.text, MAX_PREFERENCE_BYTES)
+                .map_err(|_| MemoryError::CorruptState)?;
+            count = count
+                .checked_add(preference.history.len())
+                .ok_or(MemoryError::CorruptState)?;
+            if count > MAX_HISTORY
+                || !preferences.insert(&preference.id)
+                || preference.revision == 0
+                || preference.revision > summary.revision
+                || preference.revision != preference.history.len() as u64
+            {
+                return Err(MemoryError::CorruptState);
+            }
+            for (index, version) in preference.history.iter().enumerate() {
+                validate_id(&version.evidence_id).map_err(|_| MemoryError::CorruptState)?;
+                validate_text(&version.text, MAX_PREFERENCE_BYTES)
+                    .map_err(|_| MemoryError::CorruptState)?;
+                if version.revision != index as u64 + 1
+                    || !self.ids.contains_key(&version.evidence_id)
+                {
+                    return Err(MemoryError::CorruptState);
+                }
+                referenced.insert(&version.evidence_id);
+                if version.status == PreferenceStatus::Revoked
+                    && (index == 0
+                        || index + 1 != preference.history.len()
+                        || version.text != preference.history[index - 1].text)
+                {
+                    return Err(MemoryError::CorruptState);
+                }
+            }
+            let last = preference.history.last().ok_or(MemoryError::CorruptState)?;
+            if last.revision != preference.revision
+                || last.text != preference.text
+                || last.status != preference.status
+            {
+                return Err(MemoryError::CorruptState);
+            }
+        }
+        if summary.revision != (self.turns.len() + count) as u64
+            || self.statements.iter().any(|id| !referenced.contains(id))
+        {
+            return Err(MemoryError::CorruptState);
+        }
+        Ok(())
     }
 }
 

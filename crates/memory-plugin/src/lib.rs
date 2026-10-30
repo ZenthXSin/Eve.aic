@@ -85,6 +85,9 @@ struct ScopedReader {
     scope: MemoryScope,
 }
 impl MemoryService for ScopedReader {
+    fn scan(&self) -> MemoryResult<Box<dyn MemoryEvidenceCursor>> {
+        self.stored.scan(&self.scope)
+    }
     fn snapshot(&self) -> MemoryResult<MemorySnapshot> {
         self.stored.snapshot(&self.scope)
     }
