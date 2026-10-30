@@ -10,7 +10,7 @@ use eve_plugin_api::{PluginContext, PluginError, PluginResult};
 use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt::Write,
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -82,6 +82,69 @@ impl std::ops::DerefMut for WorkingGuard<'_> {
 impl Drop for WorkingGuard<'_> {
     fn drop(&mut self) {
         evict(&mut self.0);
+    }
+}
+type Decoder<T> = Box<dyn FnMut(serde_json::Value) -> LearningResult<Option<T>> + Send>;
+struct ArchiveCursor<T> {
+    service: Arc<StoredLearning>,
+    scope: MemoryScope,
+    store: Option<Arc<dyn LearningArchiveStore>>,
+    refs: VecDeque<archive::RecordRef>,
+    hot: VecDeque<T>,
+    decode: Decoder<T>,
+    failed: bool,
+}
+impl<T> ArchiveCursor<T> {
+    fn check(&self) -> LearningResult<()> {
+        let inner = self
+            .service
+            .inner
+            .lock()
+            .map_err(|_| LearningError::Unavailable)?;
+        if inner.context.is_none() {
+            return Err(LearningError::Unavailable);
+        }
+        Ok(())
+    }
+}
+impl<T: Send> LearningHistoryCursor<T> for ArchiveCursor<T> {
+    fn scope(&self) -> &MemoryScope {
+        &self.scope
+    }
+    fn next_page(&mut self) -> LearningResult<Vec<T>> {
+        if self.failed {
+            return Err(LearningError::Unavailable);
+        }
+        let result = (|| {
+            self.check()?;
+            let mut page = Vec::new();
+            while page.len() < MAX_LEARNING_PAGE {
+                if let Some(item) = self.hot.pop_front() {
+                    page.push(item);
+                    continue;
+                }
+                let Some(reference) = self.refs.pop_front() else {
+                    break;
+                };
+                let value = archive::load_value(
+                    self.store.as_deref().ok_or(LearningError::Unavailable)?,
+                    &reference,
+                )?;
+                if let Some(item) = (self.decode)(value)? {
+                    page.push(item);
+                }
+            }
+            self.check()?;
+            Ok(page)
+        })();
+        if result.is_err() {
+            self.failed = true;
+            self.refs.clear();
+            self.hot.clear();
+            // 不能把损坏页跳过去，或让其他学习操作继续使用已不可信的存储。
+            let _ = self.service.close();
+        }
+        result
     }
 }
 pub(super) struct StoredLearning {
@@ -251,33 +314,104 @@ impl StoredLearning {
         }
         Ok(inner.archive.is_some())
     }
-    pub(super) fn snapshot(&self, scope: &MemoryScope) -> LearningResult<LearningSnapshot> {
-        let inner = self.lock()?;
-        scope.validate().map_err(|_| LearningError::InvalidInput)?;
-        Ok(LearningSnapshot {
-            scope: scope.clone(),
-            jobs: inner
-                .document
-                .jobs
-                .iter()
-                .filter(|record| record.job.batch.scope == *scope)
-                .map(|record| record.job.clone())
-                .collect(),
-        })
-    }
-    pub(super) fn decisions(
-        &self,
+    pub(super) fn scan_jobs(
+        self: &Arc<Self>,
         scope: &MemoryScope,
-    ) -> LearningResult<Vec<LearningDecisionRecord>> {
-        let inner = self.lock()?;
+    ) -> LearningResult<Box<dyn LearningHistoryCursor<LearningJob>>> {
         scope.validate().map_err(|_| LearningError::InvalidInput)?;
-        Ok(inner
-            .decisions
-            .records
-            .iter()
-            .filter(|record| record.scope == *scope)
-            .map(|record| record.record.clone())
-            .collect())
+        let inner = self.inner.lock().map_err(|_| LearningError::Unavailable)?;
+        if inner.context.is_none() {
+            return Err(LearningError::Unavailable);
+        }
+        let target = scope.clone();
+        Ok(Box::new(ArchiveCursor {
+            service: self.clone(),
+            scope: scope.clone(),
+            store: inner.archive.clone(),
+            refs: inner
+                .job_index
+                .as_ref()
+                .map(|i| i.records.clone().into())
+                .unwrap_or_default(),
+            hot: if inner.job_index.is_none() {
+                inner
+                    .document
+                    .jobs
+                    .iter()
+                    .filter(|r| &r.job.batch.scope == scope)
+                    .map(|r| r.job.clone())
+                    .collect()
+            } else {
+                VecDeque::new()
+            },
+            decode: Box::new(move |value| {
+                let record: JobRecord =
+                    serde_json::from_value(value).map_err(|_| LearningError::CorruptState)?;
+                let mut document = Document {
+                    format_version: 1,
+                    jobs: vec![record],
+                };
+                validate_document(&document, true)?;
+                let job = document.jobs.pop().ok_or(LearningError::CorruptState)?.job;
+                Ok(if job.batch.scope == target {
+                    Some(job)
+                } else {
+                    None
+                })
+            }),
+            failed: false,
+        }))
+    }
+    pub(super) fn scan_decisions(
+        self: &Arc<Self>,
+        scope: &MemoryScope,
+    ) -> LearningResult<Box<dyn LearningHistoryCursor<LearningDecisionRecord>>> {
+        scope.validate().map_err(|_| LearningError::InvalidInput)?;
+        let inner = self.inner.lock().map_err(|_| LearningError::Unavailable)?;
+        if inner.context.is_none() {
+            return Err(LearningError::Unavailable);
+        }
+        let target = scope.clone();
+        let mut last = 0u64;
+        Ok(Box::new(ArchiveCursor {
+            service: self.clone(),
+            scope: scope.clone(),
+            store: inner.archive.clone(),
+            refs: inner
+                .decision_index
+                .as_ref()
+                .map(|i| i.records.clone().into())
+                .unwrap_or_default(),
+            hot: if inner.decision_index.is_none() {
+                inner
+                    .decisions
+                    .records
+                    .iter()
+                    .filter(|r| &r.scope == scope)
+                    .map(|r| r.record.clone())
+                    .collect()
+            } else {
+                VecDeque::new()
+            },
+            decode: Box::new(move |value| {
+                let entry: ScopedDecisionRecord =
+                    serde_json::from_value(value).map_err(|_| LearningError::CorruptState)?;
+                entry
+                    .scope
+                    .validate()
+                    .map_err(|_| LearningError::CorruptState)?;
+                entry.record.decision.validate()?;
+                if entry.scope != target {
+                    return Ok(None);
+                }
+                last = last.checked_add(1).ok_or(LearningError::CorruptState)?;
+                if entry.record.sequence != last {
+                    return Err(LearningError::CorruptState);
+                }
+                Ok(Some(entry.record))
+            }),
+            failed: false,
+        }))
     }
     pub(super) fn record_decision(
         &self,

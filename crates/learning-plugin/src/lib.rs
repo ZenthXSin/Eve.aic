@@ -35,6 +35,19 @@ impl LearningController {
     }
 }
 impl LearningAdmin for LearningController {
+    fn scan_jobs(
+        &self,
+        scope: &MemoryScope,
+    ) -> LearningResult<Box<dyn LearningHistoryCursor<LearningJob>>> {
+        self.service()?.scan_jobs(scope)
+    }
+    fn scan_decisions(
+        &self,
+        scope: &MemoryScope,
+    ) -> LearningResult<Box<dyn LearningHistoryCursor<LearningDecisionRecord>>> {
+        self.service()?.scan_decisions(scope)
+    }
+
     fn archived_history(&self) -> LearningResult<bool> {
         self.service()?.archived_history()
     }
@@ -51,10 +64,31 @@ impl LearningAdmin for LearningController {
             .reserve_repair(memory, now_ms, extractor_version)
     }
     fn snapshot(&self, scope: &MemoryScope) -> LearningResult<LearningSnapshot> {
-        self.service()?.snapshot(scope)
+        let mut cursor = self.scan_jobs(scope)?;
+        let mut jobs = Vec::new();
+        loop {
+            let page = cursor.next_page()?;
+            if page.is_empty() {
+                break;
+            }
+            jobs.extend(page);
+        }
+        Ok(LearningSnapshot {
+            scope: scope.clone(),
+            jobs,
+        })
     }
     fn decisions(&self, scope: &MemoryScope) -> LearningResult<Vec<LearningDecisionRecord>> {
-        self.service()?.decisions(scope)
+        let mut cursor = self.scan_decisions(scope)?;
+        let mut records = Vec::new();
+        loop {
+            let page = cursor.next_page()?;
+            if page.is_empty() {
+                break;
+            }
+            records.extend(page);
+        }
+        Ok(records)
     }
     fn record_decision(
         &self,

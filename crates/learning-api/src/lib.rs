@@ -6,11 +6,13 @@ use std::{fmt, future::Future, pin::Pin};
 mod archive;
 mod decisions;
 mod maintenance;
+mod scan;
 pub use archive::{LearningArchiveStore, MAX_ARCHIVE_RECORD_BYTES, MAX_ARCHIVE_RESTORE_BYTES};
 pub use decisions::{
     DecisionReason, LearningDecision, LearningDecisionAction, LearningDecisionRecord,
 };
 pub use maintenance::*;
+pub use scan::{LearningHistoryCursor, MAX_LEARNING_PAGE, SnapshotHistoryCursor};
 
 pub const LEARNING_PLUGIN_ID: &str = "eve.learning";
 pub const LEARNING_STATE_KEY: &str = "learning.v1";
@@ -127,6 +129,29 @@ pub enum LearningOutcome {
 
 /// 仅可信宿主持有。不发布跨作用域管理能力给模型或不受信插件。
 pub trait LearningAdmin: Send + Sync {
+    fn scan_jobs(
+        &self,
+        scope: &MemoryScope,
+    ) -> LearningResult<Box<dyn LearningHistoryCursor<LearningJob>>> {
+        let snapshot = self.snapshot(scope)?;
+        if &snapshot.scope != scope {
+            return Err(LearningError::Conflict);
+        }
+        scan::jobs_scope(scope, &snapshot.jobs)?;
+        Ok(Box::new(SnapshotHistoryCursor::new(
+            scope.clone(),
+            snapshot.jobs,
+        )?))
+    }
+    fn scan_decisions(
+        &self,
+        scope: &MemoryScope,
+    ) -> LearningResult<Box<dyn LearningHistoryCursor<LearningDecisionRecord>>> {
+        Ok(Box::new(SnapshotHistoryCursor::new(
+            scope.clone(),
+            self.decisions(scope)?,
+        )?))
+    }
     /// 是否装配冷历史；宿主不能再用旧热层条数推断其只读视图已损坏或已满。
     fn archived_history(&self) -> LearningResult<bool> {
         Ok(false)

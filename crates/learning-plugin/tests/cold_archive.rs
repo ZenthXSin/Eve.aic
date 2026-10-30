@@ -343,3 +343,86 @@ async fn failed_cold_writes_never_commit_an_index_or_erase_legacy_data() {
         k.stop_all().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn paged_history_pins_versions_scopes_and_does_not_reactivate_after_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let state = Arc::new(MemoryStateStore::default());
+    let cold = Arc::new(FileLearningArchive::open(root.path()).unwrap());
+    let (k, a) = open(state.clone(), Some(cold.clone())).await;
+    let target = scope("paged-person", "u");
+    for n in 1..=20 {
+        complete(&a, &memory(target.clone(), n));
+    }
+    complete(&a, &memory(scope("foreign", "other-user"), 1));
+    let mut jobs = a.scan_jobs(&target).unwrap();
+    assert_eq!(jobs.scope(), &target);
+    let first = jobs.next_page().unwrap();
+    assert_eq!(first.len(), MAX_LEARNING_PAGE);
+    complete(&a, &memory(target.clone(), 21));
+    let tail = jobs.next_page().unwrap();
+    assert_eq!(tail.len(), 4);
+    assert!(tail.iter().all(|j| j.batch.scope == target));
+    assert!(jobs.next_page().unwrap().is_empty());
+    assert_eq!(a.snapshot(&target).unwrap().jobs.len(), 21);
+    let d = decision(&a, &memory(target.clone(), 21));
+    let mut rejected = d.clone();
+    rejected.action = LearningDecisionAction::Reject;
+    rejected.reason = DecisionReason::RevokedConflict;
+    a.record_decision(&target, d.clone(), 120).unwrap();
+    a.record_decision(&target, rejected, 121).unwrap();
+    let mut decisions = a.scan_decisions(&target).unwrap();
+    a.record_decision(&target, d, 122).unwrap();
+    assert_eq!(decisions.next_page().unwrap().len(), 2);
+    assert!(decisions.next_page().unwrap().is_empty());
+    assert_eq!(a.decisions(&target).unwrap().len(), 3);
+    // 创建时的 Running 版本与后来的 Completed 版本不能模糊切换。
+    let pending = memory(scope("pending-page", "u"), 1);
+    let batch = a.reserve(&pending, 100, "v1", &options()).unwrap().unwrap();
+    let mut old = a.scan_jobs(&pending.scope).unwrap();
+    a.finish(&batch, 110, LearningOutcome::Completed(vec![]))
+        .unwrap();
+    assert_eq!(old.next_page().unwrap()[0].status, JobStatus::Running);
+    assert_eq!(
+        a.snapshot(&pending.scope).unwrap().jobs[0].status,
+        JobStatus::Completed
+    );
+    k.stop_all().await.unwrap();
+    assert!(jobs.next_page().is_err());
+    assert!(decisions.next_page().is_err());
+    let (k, _) = open(state, Some(cold)).await;
+    assert!(old.next_page().is_err());
+    k.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_page_never_skips_corrupt_record_even_if_file_is_restored() {
+    let root = tempfile::tempdir().unwrap();
+    let state = Arc::new(MemoryStateStore::default());
+    let cold = Arc::new(FileLearningArchive::open(root.path()).unwrap());
+    let (k, a) = open(state.clone(), Some(cold.clone())).await;
+    let target = scope("paged-damage", "u");
+    for n in 1..=20 {
+        complete(&a, &memory(target.clone(), n));
+    }
+    let before = state.get(&owner(), LEARNING_STATE_KEY).unwrap();
+    let index: Value = serde_json::from_slice(before.as_ref().unwrap()).unwrap();
+    let path = root.path().join(format!(
+        "{}.json",
+        index["records"][17]["hash"].as_str().unwrap()
+    ));
+    let original = std::fs::read(&path).unwrap();
+    let mut cursor = a.scan_jobs(&target).unwrap();
+    assert_eq!(cursor.next_page().unwrap().len(), MAX_LEARNING_PAGE);
+    std::fs::write(&path, b"broken").unwrap();
+    assert!(cursor.next_page().is_err());
+    std::fs::write(&path, original).unwrap();
+    assert!(cursor.next_page().is_err());
+    assert_eq!(a.snapshot(&target), Err(LearningError::Unavailable));
+    assert_eq!(before, state.get(&owner(), LEARNING_STATE_KEY).unwrap());
+    k.stop_all().await.unwrap();
+    let (k, a) = open(state, Some(cold)).await;
+    assert_eq!(a.snapshot(&target).unwrap().jobs.len(), 20);
+    assert!(cursor.next_page().is_err());
+    k.stop_all().await.unwrap();
+}

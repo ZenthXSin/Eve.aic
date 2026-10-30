@@ -110,6 +110,19 @@ pub(crate) struct Index {
     pub kind: String,
     pub records: Vec<RecordRef>,
 }
+pub(crate) fn load_value(
+    store: &dyn LearningArchiveStore,
+    record: &RecordRef,
+) -> LearningResult<serde_json::Value> {
+    if !valid(&record.hash) || record.bytes > MAX_ARCHIVE_RECORD_BYTES {
+        return Err(LearningError::CorruptState);
+    }
+    let bytes = store.get(&record.hash)?;
+    if bytes.len() != record.bytes || key(&bytes) != record.hash {
+        return Err(LearningError::CorruptState);
+    }
+    crate::strict_json::from_slice(&bytes).map_err(|_| LearningError::CorruptState)
+}
 pub(crate) fn freeze<T: Serialize>(
     store: &dyn LearningArchiveStore,
     kind: &str,
