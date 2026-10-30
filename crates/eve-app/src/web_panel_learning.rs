@@ -1,6 +1,6 @@
 //! 偏好提炼批次、候选与学习决策到面板只读契约的投影。
 //! 与 QQ `/memory-decision` 共用候选、决策账本与实际保存的核对函数，结论保持一致。
-use crate::qq_learning_commands::{candidates, linked_candidate, validate_records};
+use crate::qq_learning_commands::{candidates_for, linked_candidate, validate_records};
 use crate::web_panel_memory::MemoryView;
 use eve_learning_api::{
     DecisionReason, JobStatus, LearningAdmin, LearningDecisionAction, LearningFailure,
@@ -56,8 +56,13 @@ pub(crate) fn learning(
         .snapshot(scope)
         .map_err(|_| PanelError::Unavailable)?;
     // 候选或账本校验失败说明状态不一致；明确报告不可用，不显示部分结果。
-    let candidates = candidates(&learning, scope).map_err(|_| PanelError::Unavailable)?;
-    validate_records(&records, &candidates).map_err(|_| PanelError::Unavailable)?;
+    let archived = read
+        .admin
+        .archived_history()
+        .map_err(|_| PanelError::Unavailable)?;
+    let candidates =
+        candidates_for(&learning, scope, archived).map_err(|_| PanelError::Unavailable)?;
+    validate_records(&records, &candidates, archived).map_err(|_| PanelError::Unavailable)?;
     let mut jobs: Vec<_> = learning
         .jobs
         .iter()

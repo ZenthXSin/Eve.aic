@@ -244,6 +244,13 @@ impl StoredLearning {
         }
         Ok(WorkingGuard(inner))
     }
+    pub(super) fn archived_history(&self) -> LearningResult<bool> {
+        let inner = self.inner.lock().map_err(|_| LearningError::Unavailable)?;
+        if inner.context.is_none() {
+            return Err(LearningError::Unavailable);
+        }
+        Ok(inner.archive.is_some())
+    }
     pub(super) fn snapshot(&self, scope: &MemoryScope) -> LearningResult<LearningSnapshot> {
         let inner = self.lock()?;
         scope.validate().map_err(|_| LearningError::InvalidInput)?;

@@ -35,6 +35,9 @@ impl LearningController {
     }
 }
 impl LearningAdmin for LearningController {
+    fn archived_history(&self) -> LearningResult<bool> {
+        self.service()?.archived_history()
+    }
     fn maintenance_receipts(&self, scope: &MemoryScope) -> LearningResult<Vec<MaintenanceReceipt>> {
         self.service()?.maintenance_receipts(scope)
     }

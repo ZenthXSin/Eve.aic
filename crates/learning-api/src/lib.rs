@@ -127,6 +127,10 @@ pub enum LearningOutcome {
 
 /// 仅可信宿主持有。不发布跨作用域管理能力给模型或不受信插件。
 pub trait LearningAdmin: Send + Sync {
+    /// 是否装配冷历史；宿主不能再用旧热层条数推断其只读视图已损坏或已满。
+    fn archived_history(&self) -> LearningResult<bool> {
+        Ok(false)
+    }
     fn maintenance_receipts(
         &self,
         _scope: &MemoryScope,

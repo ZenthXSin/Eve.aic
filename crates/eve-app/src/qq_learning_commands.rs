@@ -85,8 +85,9 @@ impl Commands {
             Ok(snapshot) => snapshot,
             Err(error) => return explain_learning(error),
         };
-        let candidates = candidates(&learning_snapshot, &scope)?;
-        validate_records(&records, &candidates)?;
+        let archived = learning.archived_history().map_err(|_| failure())?;
+        let candidates = candidates_for(&learning_snapshot, &scope, archived)?;
+        validate_records(&records, &candidates, archived)?;
         // 先在当前可信作用域查候选，不能凭跨作用域的偏好 ID 进行确认。
         let selected = if let Command::Accept(id) | Command::Decision(id) = command {
             let Some(candidate) = candidates
@@ -127,9 +128,9 @@ impl Commands {
                         >= eve_memory_api::MAX_HISTORY
                 {
                     "本会话记忆或历史容量已满，保留候选，不自动覆盖历史。"
-                } else if records.len() >= MAX_DECISIONS {
+                } else if !archived && records.len() >= MAX_DECISIONS {
                     "本会话学习决策容量已满，停止新增自动写入，保留全部历史。"
-                } else if learning_snapshot.jobs.len() >= MAX_JOBS {
+                } else if !archived && learning_snapshot.jobs.len() >= MAX_JOBS {
                     "本会话提炼容量已满，不自动删除旧批次。"
                 } else {
                     "每范围至少 3 条新经历触发，按启动配置的冷却间隔执行；自主模式持续运行，不受四批启动额度限制。"
@@ -224,11 +225,40 @@ fn explain_learning(error: LearningError) -> PluginResult<String> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn candidates<'a>(
     snapshot: &'a LearningSnapshot,
     scope: &MemoryScope,
 ) -> PluginResult<Vec<&'a PreferenceCandidate>> {
-    if &snapshot.scope != scope || snapshot.jobs.len() > MAX_JOBS {
+    candidates_for(snapshot, scope, false)
+}
+// 有界计数序列化，核对替换实现返回的视图大小时不再分配一份完整 JSON。
+fn view_budget(value: &impl serde::Serialize) -> PluginResult<()> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("view limit"))?;
+            if self.0 > eve_learning_api::MAX_ARCHIVE_RESTORE_BYTES {
+                return Err(std::io::Error::other("view limit"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Count(0), value).map_err(|_| failure())
+}
+pub(crate) fn candidates_for<'a>(
+    snapshot: &'a LearningSnapshot,
+    scope: &MemoryScope,
+    archived: bool,
+) -> PluginResult<Vec<&'a PreferenceCandidate>> {
+    view_budget(&snapshot.jobs)?;
+    if &snapshot.scope != scope || (!archived && snapshot.jobs.len() > MAX_JOBS) {
         return Err(failure());
     }
     let mut result = Vec::new();
@@ -326,8 +356,10 @@ pub(crate) fn confirmed<'a>(
 pub(crate) fn validate_records(
     records: &[LearningDecisionRecord],
     candidates: &[&PreferenceCandidate],
+    archived: bool,
 ) -> PluginResult<()> {
-    if records.len() > MAX_DECISIONS {
+    view_budget(&records)?;
+    if !archived && records.len() > MAX_DECISIONS {
         return Err(failure());
     }
     for (index, record) in records.iter().enumerate() {
@@ -417,9 +449,10 @@ pub(crate) fn auto_confirm(
     at_ms: u64,
 ) -> PluginResult<()> {
     let jobs = learning.snapshot(scope).map_err(|_| failure())?;
-    let mut pending = candidates(&jobs, scope)?;
+    let archived = learning.archived_history().map_err(|_| failure())?;
+    let mut pending = candidates_for(&jobs, scope, archived)?;
     let records = learning.decisions(scope).map_err(|_| failure())?;
-    validate_records(&records, &pending)?;
+    validate_records(&records, &pending, archived)?;
     pending.reverse(); // 先确认旧证据，新的纠正具有更高来源修订。
     for candidate in pending {
         let snapshot = memory
@@ -1521,6 +1554,33 @@ mod tests {
         assert_eq!(store.writes.load(Ordering::SeqCst), 0);
         assert!(snapshot(&admin, &session).preferences.is_empty());
         kernel.stop_all().await.unwrap();
+    }
+
+    #[test]
+    fn archived_views_cross_old_counts_but_legacy_validation_stays_bounded() {
+        let scope = crate::qq_memory::scope(&session());
+        let history = fixture(scope.clone(), MAX_JOBS + 1);
+        assert!(candidates(&history, &scope).is_err());
+        let selected = candidates_for(&history, &scope, true).unwrap();
+        assert_eq!(selected.len(), MAX_JOBS + 1);
+        let candidate = selected[0];
+        let records: Vec<_> = (1..=MAX_DECISIONS + 1)
+            .map(|sequence| LearningDecisionRecord {
+                sequence: sequence as u64,
+                at_ms: candidate.created_at_ms,
+                decision: eve_learning_api::LearningDecision {
+                    candidate_id: candidate.id.clone(),
+                    batch_id: candidate.batch_id.clone(),
+                    policy_version: "p1".into(),
+                    memory_revision: 1,
+                    evidence_ids: candidate.draft.evidence_ids.clone(),
+                    action: LearningDecisionAction::Reject,
+                    reason: DecisionReason::RevokedConflict,
+                },
+            })
+            .collect();
+        assert!(validate_records(&records, &selected, false).is_err());
+        validate_records(&records, &selected, true).unwrap();
     }
 
     #[test]
