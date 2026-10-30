@@ -1231,6 +1231,13 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        if let (Some(memory), Some(unified)) = (&memory, &unified_memory) {
+            bootstrap.tools.push(Arc::new(crate::qq_memory_sharing::SharingTool {
+                memory: memory.clone(), unified: unified.clone(),
+                identities: Arc::new(crate::qq_memory_continuity::Policy { registry: registry.clone(), conversations: conversations.clone(), unified: Some(unified.clone()) }),
+                reviewer: crate::developer::action_reviewer(registry.clone(), model_health.clone()),
+            }));
+        }
         let memory_continuity: Option<Arc<dyn eve_memory_api::MemoryContinuityFactory>> =
             memory.as_ref().map(|memory| {
                 Arc::new(eve_memory_plugin::MemoryContinuity::new(

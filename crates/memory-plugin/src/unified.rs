@@ -25,13 +25,24 @@ struct Stored {
     inner: Mutex<Inner>,
 }
 
+fn format_for(state: &UnifiedMemorySnapshot) -> u32 {
+    if state
+        .bindings
+        .iter()
+        .any(|b| b.source.channel == b.target.channel)
+    {
+        2
+    } else {
+        1
+    }
+}
 fn validate_binding(b: &UnifiedMemoryBinding) -> MemoryResult<()> {
     for id in [&b.id, &b.principal, &b.authorization_reference] {
         validate_id(id)?;
     }
     b.source.validate()?;
     b.target.validate()?;
-    if b.revision == 0 || b.source.channel == b.target.channel {
+    if b.revision == 0 || b.source == b.target {
         return Err(MemoryError::InvalidInput);
     }
     Ok(())
@@ -203,6 +214,7 @@ impl Stored {
         }
         next.state.revision = revision.checked_add(1).ok_or(MemoryError::LimitReached)?;
         validate(&next.state)?;
+        next.format_version = format_for(&next.state);
         let bytes = serde_json::to_vec(&next).map_err(|_| MemoryError::Storage)?;
         validate_bytes(&next.state, bytes.len())?;
         if context.state_set(STATE_KEY, bytes).is_err() {
@@ -492,13 +504,19 @@ impl Plugin for UnifiedMemoryPlugin {
                     }
                     let value = strict_json::from_slice(&bytes)
                         .map_err(|_| PluginError::State(MemoryError::CorruptState.to_string()))?;
-                    if value.get("format_version").and_then(|v| v.as_u64()) != Some(1) {
+                    if !matches!(
+                        value.get("format_version").and_then(|v| v.as_u64()),
+                        Some(1 | 2)
+                    ) {
                         return Err(PluginError::State(
                             MemoryError::UnsupportedVersion.to_string(),
                         ));
                     }
                     let document: Document = serde_json::from_value(value)
                         .map_err(|_| PluginError::State(MemoryError::CorruptState.to_string()))?;
+                    if document.format_version != format_for(&document.state) {
+                        return Err(PluginError::State(MemoryError::CorruptState.to_string()));
+                    }
                     validate(&document.state)
                         .map_err(|_| PluginError::State(MemoryError::CorruptState.to_string()))?;
                     validate_bytes(&document.state, bytes.len())

@@ -56,6 +56,7 @@ fn public_tool(name: &str) -> bool {
             | "search_memory"
             | "experience_memory"
             | "memory_maintenance"
+            | "manage_memory_sharing"
             | "read_context_record"
             | "list_interests"
             | "list_goals"

@@ -69,6 +69,7 @@ pub(crate) fn identity_groups(snapshot: &ConfigSnapshot) -> Result<Vec<BTreeSet<
     }
     Ok(result)
 }
+#[derive(Clone)]
 pub(crate) struct Policy {
     pub(crate) registry: Arc<dyn ServiceRegistry>,
     pub(crate) conversations: QqConversations,
@@ -171,7 +172,37 @@ impl MemoryContinuityPolicy for Policy {
                 interactions,
             });
         }
-        // 跨通道需要独立、定向、可撤销授权；同一 QQ 内仍由上面的实时隐私配置决定。
+        // 同一 QQ 内的显式例外只对仍被宿主认证为同一人的两个窗口生效。
+        if let Some(unified) = &self.unified {
+            let resolver = PrincipalResolver(self.clone());
+            if let Some(principal) = resolver.sharing_principal(target)? {
+                let state = unified.snapshot()?;
+                for binding in &state.bindings {
+                    if binding.revoked
+                        || binding.target != *target
+                        || binding.source.channel != "qq"
+                        || binding.principal != principal
+                        || !candidates.contains(&binding.source)
+                        || state
+                            .bindings
+                            .iter()
+                            .any(|b| b.id == binding.id && b.revoked)
+                        || resolver.sharing_principal(&binding.source)?.as_ref() != Some(&principal)
+                    {
+                        continue;
+                    }
+                    if let Some(grant) = grants.iter_mut().find(|g| g.scope == binding.source) {
+                        grant.interactions |= binding.interactions;
+                    } else {
+                        grants.push(MemoryScopeGrant {
+                            scope: binding.source.clone(),
+                            interactions: binding.interactions,
+                        });
+                    }
+                }
+            }
+        }
+        // 其他通道仍由可信宿主单独认证并登记定向授权。
         if let Some(unified) = &self.unified {
             let cross_channel: Vec<_> = candidates
                 .iter()
@@ -215,6 +246,19 @@ impl eve_people_api::PersonLinks for PersonLinks {
 pub(crate) struct PrincipalResolver(pub(crate) Policy);
 impl ExperiencePrincipalResolver for PrincipalResolver {
     fn resolve(&self, scope: &MemoryScope) -> MemoryResult<Option<String>> {
+        self.resolve_principal(scope, true)
+    }
+}
+impl PrincipalResolver {
+    /// 只用于用户显式授权前的身份核对，不代表已有读取权限。
+    pub(crate) fn sharing_principal(&self, scope: &MemoryScope) -> MemoryResult<Option<String>> {
+        self.resolve_principal(scope, false)
+    }
+    fn resolve_principal(
+        &self,
+        scope: &MemoryScope,
+        enforce_privacy: bool,
+    ) -> MemoryResult<Option<String>> {
         use ring::digest::{SHA256, digest};
         scope.validate()?;
         if scope.channel != "qq" {
@@ -248,7 +292,8 @@ impl ExperiencePrincipalResolver for PrincipalResolver {
         else {
             return Ok(None);
         };
-        if identity.source == QqInteractionSource::GroupMessage
+        if enforce_privacy
+            && identity.source == QqInteractionSource::GroupMessage
             && !config
                 .get::<bool>("share_private_to_groups")
                 .map_err(|_| unavailable())?
@@ -296,6 +341,8 @@ impl ExperiencePrincipalResolver for PrincipalResolver {
                 .find(|g| g.contains(&scope.user_id))
                 .map(|g| serde_json::to_string(g).expect("身份集合可序列化"))
         });
+        let label =
+            label.or_else(|| (!enforce_privacy).then(|| format!("platform:{}", identity.subject)));
         let Some(label) = label else {
             return Ok(None);
         };

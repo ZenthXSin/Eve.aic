@@ -50,6 +50,7 @@ mod qq_memory;
 mod qq_memory_continuity;
 mod qq_memory_maintenance;
 mod qq_memory_observer;
+mod qq_memory_sharing;
 mod qq_message_judge;
 mod qq_model;
 mod qq_outreach;
