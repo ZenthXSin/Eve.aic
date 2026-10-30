@@ -2,6 +2,8 @@
 //! 主体统一调度，不合并不同会话原文；面向会话的读取只允许完全相同的范围。
 use serde::{Deserialize, Serialize};
 use std::fmt;
+mod opportunity;
+pub use opportunity::OpportunityAssessment;
 
 pub const SUBJECT_PLUGIN_ID: &str = "eve.subject";
 pub const SUBJECT_STATE_KEY: &str = "subject.v1";

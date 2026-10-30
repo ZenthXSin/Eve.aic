@@ -29,6 +29,14 @@ struct Envelope {
     ledger: Ledger,
 }
 
+// 事务候选只序列化借用；不能为Envelope再复制整个版本/回执账本。
+#[derive(Serialize)]
+struct BorrowedEnvelope<'a> {
+    format: u32,
+    checksum: String,
+    ledger: &'a Ledger,
+}
+
 pub struct ScriptStore {
     directory: PathBuf,
     ledger: Mutex<Ledger>,
@@ -123,10 +131,10 @@ impl ScriptStore {
         }
         let mut next = guard.clone();
         let output = action(&mut next)?;
-        let envelope = Envelope {
+        let envelope = BorrowedEnvelope {
             format: 1,
             checksum: digest(&next)?,
-            ledger: next.clone(),
+            ledger: &next,
         };
         let bytes = serde_json::to_vec(&envelope).map_err(fail)?;
         if bytes.len() > 64 * 1024 * 1024 {
