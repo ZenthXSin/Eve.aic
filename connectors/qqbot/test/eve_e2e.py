@@ -60,7 +60,7 @@ class Acceptance(unittest.TestCase):
                     index = len(outer.requests)
                     outer.request_documents.append(outer.documents())
                 assert body["model"] == outer.expected_model
-                assert body["reasoning_effort"] == "none"
+                assert body["reasoning_effort"] == "low"
                 outer.request_arrived(index).touch()
                 messages = body["messages"]
                 latest = messages[-1]

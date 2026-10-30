@@ -360,7 +360,7 @@ async fn chat_defaults_complete_tool_round_trip_and_restore_in_a_new_process() {
     let checked = tokio::task::spawn_blocking(move || {
         model_check::run(&options, MARKER, || {
             let mut c = command(&url);
-            // 验证核心默认模型和协议，空参数在 Chat 下显式使用 none。
+            // 验证核心默认模型和协议，空参数在 Chat 下显式使用 low。
             c.env_remove("EVE_OPENAI_MODEL")
                 .env_remove("EVE_OPENAI_PROTOCOL")
                 .env_remove("EVE_OPENAI_REASONING_EFFORT");
@@ -387,7 +387,7 @@ async fn chat_defaults_complete_tool_round_trip_and_restore_in_a_new_process() {
     assert_eq!(first["model"], "deepseek-v4.1-flash");
     assert_eq!(first["tools"][0]["function"]["name"], "echo");
     assert!(first.get("input").is_none());
-    assert_eq!(first["reasoning_effort"], "none");
+    assert_eq!(first["reasoning_effort"], "low");
     assert_eq!(first["max_tokens"], 2048);
     assert!(chat_user_texts(&first)[0].contains(MARKER));
     let returned = server.next().await.body;
