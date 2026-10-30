@@ -460,6 +460,23 @@ impl Ledger {
             .position(|r| r.app_id == app && r.message.id == id)
     }
 
+    /// 私聊追加消息单独投递宿主确认；确认只表示已接收引导，不是原任务完成。
+    /// 沿用 Processing/ReplyPending 回执，重启不重放追加消息或确认通知。
+    pub fn acknowledge_steering(
+        &mut self,
+        ctx: &PluginContext,
+        app: &str,
+        id: &str,
+        text: &str,
+    ) -> PluginResult<()> {
+        let index = self.find(app, id).ok_or_else(corrupt)?;
+        if self.entries[index].state != ReceiptState::Processing {
+            return Err(corrupt());
+        }
+        self.entries[index].reply = Some(text.into());
+        self.save(ctx)
+    }
+
     pub fn steer(
         &mut self,
         ctx: &PluginContext,

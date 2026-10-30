@@ -703,3 +703,94 @@ async fn corrupt_or_inconsistent_ledgers_are_refused_and_preserved() {
         assert_eq!(store.raw().unwrap(), bytes, "原字节保留");
     }
 }
+
+#[tokio::test]
+async fn idle_chat_has_no_fake_practice_and_restart_never_replays_unknown_delivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Store::open(&dir.path().join("state.json"));
+    let (kernel, admin) = open(state.clone()).await.unwrap();
+    let source = IdleChatSource {
+        session_id: "qq:u".into(),
+        evidence_id: "msg-1".into(),
+        last_active_at_ms: 1,
+    };
+    let facts = vec![Fact {
+        kind: FactKind::IdleContext,
+        text: "距上次真实私聊已 6 小时".into(),
+    }];
+    let i = admin
+        .begin_chat("qq:u", source.clone(), facts.clone(), "composer:v1", 10)
+        .unwrap()
+        .unwrap();
+    assert!(i.milestone.is_none());
+    assert_eq!(i.origin, InvitationOrigin::IdleChat(source.clone()));
+    assert!(
+        admin
+            .begin_chat("qq:u", source.clone(), facts.clone(), "composer:v1", 11)
+            .unwrap()
+            .is_none()
+    );
+    admin
+        .record_composition(&i.id, 12, Ok("最近怎么样？".into()))
+        .unwrap();
+    let policy = OutreachPolicy {
+        cooldown_ms: 0,
+        proactive_after_ms: None,
+    };
+    assert_eq!(
+        admin
+            .snapshot()
+            .unwrap()
+            .due_proactive(13, &policy)
+            .unwrap()
+            .id,
+        i.id
+    );
+    admin.claim(&i.id, 13, DeliveryChannel::Proactive).unwrap();
+    kernel.stop_all().await.unwrap();
+    let (kernel, admin) = open(state).await.unwrap();
+    let snapshot = admin.snapshot().unwrap();
+    assert_eq!(snapshot.invitations[0].status, InvitationStatus::Unknown);
+    assert!(snapshot.due_proactive(100, &policy).is_none());
+    assert!(
+        admin
+            .begin_chat("qq:u", source, facts, "composer:v1", 100)
+            .unwrap()
+            .is_none()
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_goal_invitation_decodes_without_origin_and_idle_identity_is_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Store::open(&dir.path().join("state.json"));
+    let (kernel, admin) = open(state.clone()).await.unwrap();
+    let i = pending(&admin, "u", "goal-1", 1);
+    let json = serde_json::to_value(&i).unwrap();
+    assert!(json.get("origin").is_none());
+    assert_eq!(
+        serde_json::from_value::<Invitation>(json).unwrap().origin,
+        InvitationOrigin::Goal
+    );
+    let source = IdleChatSource {
+        session_id: "s".into(),
+        evidence_id: "m".into(),
+        last_active_at_ms: 99,
+    };
+    assert!(
+        admin
+            .begin_chat(
+                "u",
+                source,
+                vec![Fact {
+                    kind: FactKind::IdleContext,
+                    text: "真实时间".into()
+                }],
+                "composer:v1",
+                10
+            )
+            .is_err()
+    );
+    kernel.stop_all().await.unwrap();
+}

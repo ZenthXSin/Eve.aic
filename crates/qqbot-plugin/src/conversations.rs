@@ -201,13 +201,68 @@ impl QqConversations {
             .collect())
     }
 
-    pub(crate) fn group_route(&self, conversation: &str) -> Option<String> {
+    /// 群会话键到真实群号的反查；只含通道校验过的消息目标。
+    pub fn group_route(&self, conversation: &str) -> Option<String> {
         self.inner
             .lock()
             .ok()?
             .group_routes
             .get(conversation)
             .cloned()
+    }
+
+    /// 直接登记一条已校验的群会话身份：宿主按持久回执恢复路由时用，
+    /// 不重放消息、不写记忆；群号只在通道校验过时才传进来。
+    pub fn record_group_identity(
+        &self,
+        app: &str,
+        session: SessionKey,
+        group_id: &str,
+        user_id: &str,
+        conversation: String,
+    ) -> PluginResult<()> {
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| PluginError::State("QQ 群路由目录不可用".into()))?;
+            if inner.group_routes.len() < MAX_SESSIONS
+                || inner.group_routes.contains_key(&conversation)
+            {
+                inner
+                    .group_routes
+                    .insert(conversation.clone(), group_id.to_string());
+            }
+        }
+        let subject = serde_json::to_vec(&(app, "group", user_id))
+            .map_err(|_| PluginError::State("QQ 身份摘要编码失败".into()))?;
+        let hash = ring::digest::digest(&ring::digest::SHA256, &subject);
+        let subject = hash.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        let identity = QqConversationIdentity {
+            user_id: user_id.into(),
+            session,
+            app_id: app.into(),
+            subject,
+            conversation,
+            source: QqInteractionSource::GroupMessage,
+        };
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| PluginError::State("QQ 身份目录不可用".into()))?;
+        let key = identity.session.session_id.clone();
+        let known = inner.identities.insert(key.clone(), identity).is_some();
+        // 恢复时沿用已有顺序，不让旧群冒到“最近”。
+        if !known && !inner.order.contains(&key) {
+            inner.order.push_back(key);
+        }
+        while inner.order.len() > MAX_SESSIONS {
+            if let Some(oldest) = inner.order.pop_front() {
+                inner.sources.remove(&oldest);
+                inner.identities.remove(&oldest);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn record_message(
@@ -260,7 +315,8 @@ impl QqConversations {
         self.inner.lock().ok()?.sources.get(session_id).copied()
     }
 
-    pub(crate) fn record(&self, session: &SessionKey, scope: &str) {
+    /// 登记会话类型；通道在自己的消息处理里调用，宿主侧只读。
+    pub fn record(&self, session: &SessionKey, scope: &str) {
         let source = match scope {
             "c2c" => QqInteractionSource::DirectMessage,
             "group" => QqInteractionSource::GroupMessage,
@@ -332,6 +388,46 @@ mod turn_anchor_tests {
             attachments: vec![],
             quoted: None,
         }
+    }
+    #[test]
+    fn restored_group_identity_matches_verified_sender_and_live_account() {
+        let conversations = QqConversations::default();
+        let first = message("first", "owner-a");
+        let session = first.session_key("app").unwrap();
+        conversations.record_message("app", &first).unwrap();
+        let live = conversations.identity(&session).unwrap().unwrap();
+        conversations
+            .record_group_identity(
+                "app",
+                session.clone(),
+                &first.target_id,
+                &first.user_id,
+                first.conversation_key("app").unwrap(),
+            )
+            .unwrap();
+        let restored = conversations.identity(&session).unwrap().unwrap();
+        assert_eq!(restored.user_id, "owner-a");
+        assert_eq!(restored.account_id(), live.account_id());
+        let mut second = first.clone();
+        second.target_id = "group-2".into();
+        let other_session = second.session_key("app").unwrap();
+        conversations
+            .record_group_identity(
+                "app",
+                other_session.clone(),
+                &second.target_id,
+                &second.user_id,
+                second.conversation_key("app").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            conversations
+                .identity(&other_session)
+                .unwrap()
+                .unwrap()
+                .account_id(),
+            live.account_id()
+        );
     }
     #[test]
     fn admitted_ids_survive_later_same_text_other_members_and_busy_batch_retry() {

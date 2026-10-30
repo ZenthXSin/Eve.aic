@@ -282,7 +282,12 @@ impl QqOutreach for GuardedOutreach {
         let group_allowed = group.as_ref().is_some_and(|meta| {
             meta.session.user_id == "eve-chime" && push.session.as_ref() == Some(&meta.session)
         });
+        let ordinary = self.inner.ordinary_direct_invitation(&push.message.id)?;
+        let ordinary_allowed = ordinary.as_ref().is_some_and(|session| {
+            push.session.as_ref() == Some(session) && push.user_id == session.user_id
+        });
         if !group_allowed
+            && !ordinary_allowed
             && !push
                 .session
                 .as_ref()
@@ -304,41 +309,48 @@ impl QqCommandHandler for GuardedCommands {
         let text = input.text.trim();
         let mut words = text.split_whitespace();
         let head = words.next().unwrap_or_default();
-        let query = matches!(
-            head,
-            "/admin"
-                | "/bind"
-                | "/help"
-                | "/status"
-                | "/name"
-                | "/cancel"
-                | "/mind"
-                | "/memories"
-                | "/recall"
-                | "/knowledge"
-                | "/practice"
-                | "/plans"
-                | "/memory-candidates"
-                | "/memory-decision"
-                | "/gaps"
-        ) || words.clone().next().is_none()
+        let own_outreach_preference = head == "/outreach"
             && matches!(
+                words.clone().collect::<Vec<_>>().as_slice(),
+                ["off"] | ["on"]
+            );
+        let query = own_outreach_preference
+            || matches!(
                 head,
-                "/budget"
-                    | "/model"
+                "/admin"
+                    | "/bind"
+                    | "/help"
+                    | "/status"
+                    | "/name"
+                    | "/cancel"
+                    | "/mind"
                     | "/memories"
                     | "/recall"
-                    | "/interests"
                     | "/knowledge"
                     | "/practice"
-                    | "/skills"
-                    | "/tools"
-                    | "/goals"
-                    | "/mind"
                     | "/plans"
-                    | "/outreach"
-                    | "/clarify"
+                    | "/memory-candidates"
+                    | "/memory-decision"
+                    | "/gaps"
             )
+            || words.clone().next().is_none()
+                && matches!(
+                    head,
+                    "/budget"
+                        | "/model"
+                        | "/memories"
+                        | "/recall"
+                        | "/interests"
+                        | "/knowledge"
+                        | "/practice"
+                        | "/skills"
+                        | "/tools"
+                        | "/goals"
+                        | "/mind"
+                        | "/plans"
+                        | "/outreach"
+                        | "/clarify"
+                )
             || matches!(
                 head,
                 "/train" | "/self-learning" | "/outreach" | "/clarify" | "/segment" | "/budget"
