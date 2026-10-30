@@ -53,12 +53,16 @@ class ContextCompactionAcceptance(digest.HistoryDigestAcceptance):
         (self.source / "README.md").write_text("中文结果" * 2700, encoding="utf8")
         self.callback = lambda body: tool_response([("read_file", {"path": "README.md"})] * 8)
         self.response_gates[("chat", 2)] = "keep-summary-blocked"
+        self.response_gates[("chat", 3)] = "keep-summary-retry-blocked"
         self.run_window([*self.send(self.message("timeout", "读取后接续", contains=["上下文压缩未能完成", "已启动 8 次工具调用"]))],
                         env_extra={"EVE_CONTEXT_COMPACT_AT_TOKENS":"150000", "EVE_CONTEXT_COMPACT_TO_TOKENS":"100000",
                                    "EVE_MODELS_PRIMARY_TIMEOUT_MS":"1000", "EVE_OPENAI_TIMEOUT_SECONDS":"1"})
         self.assertEqual(self.turn("读取后接续")["status"]["failure"]["started_tools"], 8)
-        self.assertEqual(len(self.requests), 2)
-        self.assertIn("对话历史压缩器", self.requests[1]["body"]["messages"][0]["content"])
+        # 一次主对话、两次有界摘要尝试；没有再次发主对话或重放读工具。
+        self.assertEqual(len(self.requests), 3)
+        for request in self.requests[1:]:
+            self.assertIn("对话历史压缩器", request["body"]["messages"][0]["content"])
+            self.assertEqual(request["body"].get("tools", []), [])
 
     def test_150k_tool_context_is_summarized_then_continues_and_restart_recomputes_selected_history(self):
         content = "中文结果" * 2700

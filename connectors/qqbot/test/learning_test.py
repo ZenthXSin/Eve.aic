@@ -686,7 +686,7 @@ class LearningAcceptance(unittest.TestCase):
         self.assertFalse(any(CANDIDATE in event.get("text", "") for event in self.events))
         self.assertEqual(len(self.learning_requests()), 1)
 
-    def test_provider_empty_invalid_and_tool_results_are_persisted_without_retry(self):
+    def test_provider_and_invalid_outcomes_are_saved_with_bounded_transport_retry_and_no_replay(self):
         original_work = self.work
         for mode, expected in (("provider", {"Failed": "TransientProvider"}), ("empty", "Completed"),
                                ("invalid", {"Failed": "InvalidOutput"}), ("tool", {"Failed": "InvalidOutput"})):
@@ -704,8 +704,12 @@ class LearningAcceptance(unittest.TestCase):
                 self.inspect_run(self.quiet, prefix=self.send(self.message("list-empty", "/memory-candidates", EMPTY)))
                 self.assertEqual(self.learning_bytes(), before)
                 self.assertEqual(self.memory(), memory_before)
-                self.assertEqual(len(self.learning_requests()), requests_before + 1)
-                self.assert_reserved_before_request(self.learning_requests()[-1])
+                # 503 在同一批次内进行至多四次传输；无效正文/工具调用不重试。
+                attempts = self.learning_requests()[requests_before:]
+                self.assertEqual(len(attempts), 4 if mode == "provider" else 1)
+                for attempt in attempts:
+                    self.assertEqual(attempt["body"], attempts[0]["body"])
+                    self.assert_reserved_before_request(attempt)
 
     @unittest.skipUnless(os.name == "posix", "owned child signals use the Unix process interface")
     def test_cancelled_and_abruptly_interrupted_requests_are_consumed_without_restart_replay(self):

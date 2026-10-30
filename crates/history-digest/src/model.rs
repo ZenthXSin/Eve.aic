@@ -1,4 +1,4 @@
-//! 默认摘要器：单次无工具模型请求，输出严格 JSON 要点并引用来源轮次。
+//! 默认摘要器：同一原始历史最多两次无工具摘要尝试，输出严格 JSON 并引用来源。
 use crate::{DigestPoint, DigestRequest, HistoryDigester, MAX_POINTS, validate_points};
 use eve_llm_api::{
     ChatMessage, ChatRole, LlmError, LlmFuture, LlmModelResolver, MAX_HISTORY_DIGEST_BYTES,
