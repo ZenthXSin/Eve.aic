@@ -1,7 +1,9 @@
 //! 维护状态与分层查证入口。身份由宿主绑定；只读，不提供任意路径或跨范围参数。
 use eve_learning_api::*;
 use eve_llm_api::*;
-use eve_memory_api::{EvidenceSource, MemoryAdmin, MemoryScope};
+use eve_memory_api::{
+    EvidenceSource, MemoryAdmin, MemoryEvidenceCursor, MemoryScope, ValidatedMemoryCursor,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, sync::Arc};
@@ -100,15 +102,7 @@ impl Tool for ToolService {
                     json!({"kind":"unverified_reflection_drafts","total_matches":matches.len(),"entries":matches.iter().skip(offset).take(8).collect::<Vec<_>>(),"next_offset":(matches.len()>offset+8).then_some(offset+8)}),
                 );
             }
-            let snapshot = self
-                .memory
-                .reader(s.clone())
-                .and_then(|r| r.complete_snapshot())
-                .map_err(failed)?;
-            if snapshot.scope != s {
-                return Err(failed("记忆范围不匹配"));
-            }
-            if a.action == "source" {
+            let requested_source = if a.action == "source" {
                 let batch = a.batch_id.unwrap();
                 let evidence = a.evidence_id.unwrap();
                 if !receipts
@@ -117,33 +111,59 @@ impl Tool for ToolService {
                 {
                     return Err(failed("当前范围没有该批次来源"));
                 }
-                let original = snapshot
-                    .evidence
-                    .iter()
-                    .find(|e| e.id == evidence)
-                    .ok_or_else(|| failed("原始证据当前不可读，未用摘要冒充原文"))?;
-                return Ok(
-                    json!({"batch_id":batch,"original_evidence":original,"is_authorization":false}),
-                );
-            }
+                Some((batch, evidence))
+            } else {
+                None
+            };
+            let reader = self.memory.reader(s.clone()).map_err(failed)?;
+            let mut cursor =
+                ValidatedMemoryCursor::new(s, reader.scan().map_err(failed)?).map_err(failed)?;
+            let snapshot = cursor.summary().clone();
             let consumed: BTreeSet<_> = receipts
                 .iter()
                 .flat_map(|r| r.evidence_ids.iter())
                 .collect();
-            let pending: Vec<_> = snapshot
-                .evidence
-                .iter()
-                .filter(|e| {
-                    matches!(e.source, EvidenceSource::CompletedInteraction { .. })
-                        && !consumed.contains(&e.id)
-                })
-                .collect();
-            let oversized = pending
-                .iter()
-                .filter(|e| serde_json::to_vec(e).map_or(true, |v| v.len() > MAX_EVIDENCE_BYTES))
-                .count();
+            let mut pending_count = 0usize;
+            let mut oversized = 0usize;
+            let mut oldest_pending_at_ms = None;
+            let mut original = None;
+            loop {
+                let page = cursor.next_page().map_err(failed)?;
+                if page.is_empty() {
+                    break;
+                }
+                for evidence in page {
+                    if matches!(evidence.source, EvidenceSource::CompletedInteraction { .. })
+                        && !consumed.contains(&evidence.id)
+                    {
+                        pending_count += 1;
+                        if serde_json::to_vec(&evidence)
+                            .map_or(true, |v| v.len() > MAX_EVIDENCE_BYTES)
+                        {
+                            oversized += 1;
+                        }
+                        oldest_pending_at_ms = Some(
+                            oldest_pending_at_ms
+                                .map_or(evidence.at_ms, |old: u64| old.min(evidence.at_ms)),
+                        );
+                    }
+                    if requested_source
+                        .as_ref()
+                        .is_some_and(|(_, id)| *id == evidence.id)
+                    {
+                        original = Some(evidence);
+                    }
+                }
+            }
+            if let Some((batch, _)) = requested_source {
+                let original =
+                    original.ok_or_else(|| failed("原始证据当前不可读，未用摘要冒充原文"))?;
+                return Ok(
+                    json!({"batch_id":batch,"original_evidence":original,"is_authorization":false}),
+                );
+            }
             Ok(
-                json!({"enabled":true,"limits":{"batch_ledger_bytes":MAX_STATE_BYTES,"decision_ledger_bytes":MAX_STATE_BYTES,"batches":MAX_JOBS,"decisions":MAX_DECISIONS},"memory_revision":snapshot.revision,"original_evidence_count":snapshot.evidence.len(),"pending_evidence":pending.len(),"oversized_pending":oversized,"oldest_pending_at_ms":pending.iter().map(|e|e.at_ms).min(),"completed_batches":receipts.iter().filter(|r|r.status==JobStatus::Completed).count(),"running_batches":receipts.iter().filter(|r|r.status==JobStatus::Running).count(),"failed_or_interrupted_batches":receipts.iter().filter(|r|matches!(r.status,JobStatus::Failed(_)|JobStatus::Interrupted)).count(),"preference_records":snapshot.preferences.len(),"recent_receipts":receipts.iter().take(8).map(|r|json!({"batch_id":r.batch_id,"extractor_version":r.extractor_version,"source_revision":r.source_revision,"status":r.status,"started_at_ms":r.started_at_ms,"finished_at_ms":r.finished_at_ms,"evidence_count":r.evidence_ids.len(),"previous_attempts":r.previous_attempts,"has_reflection":r.reflection.is_some()})).collect::<Vec<_>>(),"notice":"候选/反思不是已确认偏好；重试最多两次且使用原预算。超长证据保留原文并显示积压，不静默截断。"}),
+                json!({"enabled":true,"limits":{"batch_ledger_bytes":MAX_STATE_BYTES,"decision_ledger_bytes":MAX_STATE_BYTES,"batches":MAX_JOBS,"decisions":MAX_DECISIONS},"memory_revision":snapshot.revision,"original_evidence_count":snapshot.evidence_count,"pending_evidence":pending_count,"oversized_pending":oversized,"oldest_pending_at_ms":oldest_pending_at_ms,"completed_batches":receipts.iter().filter(|r|r.status==JobStatus::Completed).count(),"running_batches":receipts.iter().filter(|r|r.status==JobStatus::Running).count(),"failed_or_interrupted_batches":receipts.iter().filter(|r|matches!(r.status,JobStatus::Failed(_)|JobStatus::Interrupted)).count(),"preference_records":snapshot.preferences.len(),"recent_receipts":receipts.iter().take(8).map(|r|json!({"batch_id":r.batch_id,"extractor_version":r.extractor_version,"source_revision":r.source_revision,"status":r.status,"started_at_ms":r.started_at_ms,"finished_at_ms":r.finished_at_ms,"evidence_count":r.evidence_ids.len(),"previous_attempts":r.previous_attempts,"has_reflection":r.reflection.is_some()})).collect::<Vec<_>>(),"notice":"候选/反思不是已确认偏好；重试最多两次且使用原预算。超长证据保留原文并显示积压，不静默截断。"}),
             )
         })
     }
@@ -193,6 +213,47 @@ mod tests {
     use eve_memory_plugin::MemoryPlugin;
     use eve_session_api::{SessionKey, SessionSnapshot, SessionTurn, SessionTurnStatus};
 
+    // 原生分页是该工具唯一读取路径，避免后续重构无意恢复全量加载。
+    struct ScanOnlyAdmin(Arc<dyn MemoryAdmin>);
+    struct ScanOnlyReader(Arc<dyn eve_memory_api::MemoryService>);
+    impl eve_memory_api::MemoryService for ScanOnlyReader {
+        fn snapshot(&self) -> eve_memory_api::MemoryResult<eve_memory_api::MemorySnapshot> {
+            panic!("maintenance query must use paged scan")
+        }
+        fn complete_snapshot(
+            &self,
+        ) -> eve_memory_api::MemoryResult<eve_memory_api::MemorySnapshot> {
+            panic!("maintenance query must not load all historical text")
+        }
+        fn scan(&self) -> eve_memory_api::MemoryResult<Box<dyn MemoryEvidenceCursor>> {
+            self.0.scan()
+        }
+    }
+    impl MemoryAdmin for ScanOnlyAdmin {
+        fn reader(
+            &self,
+            scope: MemoryScope,
+        ) -> eve_memory_api::MemoryResult<Arc<dyn eve_memory_api::MemoryService>> {
+            Ok(Arc::new(ScanOnlyReader(self.0.reader(scope)?)))
+        }
+        fn import_completed(
+            &self,
+            _: &MemoryScope,
+            _: u64,
+            _: CompletedInteraction,
+        ) -> eve_memory_api::MemoryResult<eve_memory_api::MemorySnapshot> {
+            panic!("read-only maintenance must not import")
+        }
+        fn update_preference(
+            &self,
+            _: &MemoryScope,
+            _: u64,
+            _: eve_memory_api::PreferenceChange,
+        ) -> eve_memory_api::MemoryResult<eve_memory_api::MemorySnapshot> {
+            panic!("read-only maintenance must not change preferences")
+        }
+    }
+
     #[tokio::test]
     async fn real_import_reflection_status_lookup_and_scope_isolation() {
         let kernel = Kernel::new();
@@ -236,7 +297,7 @@ mod tests {
             )
             .unwrap();
         let service = ToolService {
-            memory,
+            memory: Arc::new(ScanOnlyAdmin(memory)),
             learning: Some(learning.clone()),
         };
         let context = ToolExecutionContext::new().with_scope(Some(identity));
