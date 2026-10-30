@@ -187,6 +187,13 @@ class RealModelEvaluation(people_test.PeopleAcceptance):
             locals()[_name] = None
     del _name
 
+    def wait_until(self, predicate, message):
+        # 检查点前包含多轮真实模型请求，不能沿用本地替身的 10 秒期限。
+        deadline = time.monotonic() + 300
+        while not predicate():
+            self.assertLess(time.monotonic(), deadline, message)
+            self.assertFalse(self.run_release.wait(0.05), message)
+
     def setUp(self):
         super().setUp()
         self.calls = []
