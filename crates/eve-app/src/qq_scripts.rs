@@ -162,6 +162,7 @@ struct Save {
 #[serde(deny_unknown_fields)]
 struct List {
     call_id: Option<String>,
+    version: Option<VersionRef>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -189,7 +190,10 @@ impl ScriptTool {
                 args.spec.validate()?;
             }
             1 => {
-                let _: List = serde_json::from_value(args.clone()).map_err(rejected)?;
+                let args: List = serde_json::from_value(args.clone()).map_err(rejected)?;
+                if args.call_id.is_some() && args.version.is_some() {
+                    return Err(rejected("call_id 与 version 不能同时提供"));
+                }
             }
             2 => {
                 let _: Activate = serde_json::from_value(args.clone()).map_err(rejected)?;
@@ -210,8 +214,8 @@ impl Tool for ScriptTool {
                 vec!["spec"],
             ),
             1 => (
-                "列出当前可信会话的脚本版本、启用版本及状态；call_id 查询真实调用回执。unknown 表示结果未知，禁止自动重放。版本保存不代表业务成功或权限已授予。",
-                json!({"call_id":{"type":"string"}}),
+                "无参数时列出当前可信会话的脚本版本摘要、启用版本及状态，不加载全部源码。修改或诊断脚本前传 version={script,digest} 读取该不可变版本完整源码和声明；call_id 查询真实调用回执，不能与 version 同时提供。只能读取当前可信会话自己的版本。unknown 表示结果未知，禁止自动重放。版本保存不代表业务成功或权限已授予。",
+                json!({"call_id":{"type":"string"},"version":{"type":"object","properties":{"script":{"type":"string"},"digest":{"type":"string"}},"required":["script","digest"],"additionalProperties":false}}),
                 vec![],
             ),
             2 => (
@@ -258,6 +262,9 @@ impl Tool for ScriptTool {
                     let args: List = serde_json::from_value(call.arguments).map_err(rejected)?;
                     if let Some(id) = args.call_id {
                         return Ok(json!({"receipt":self.service.store.receipt(owner,&id)?}));
+                    }
+                    if let Some(version) = args.version {
+                        return Ok(json!({"version":self.service.store.version(owner,&version)?}));
                     }
                     let versions = self.service.store.summaries(owner)?;
                     let versions = versions
@@ -410,6 +417,93 @@ mod tests {
         )
         .await
     }
+    #[tokio::test]
+    async fn adapter_reads_exact_cold_version_after_restart_without_cross_scope_access() {
+        let root = tempfile::tempdir().unwrap();
+        let host = service(root.path());
+        let tools = host.tools();
+        let ctx = context();
+        let original = spec();
+        let saved = execute(&tools[0], "save-old", json!({"spec":original}), ctx.clone())
+            .await
+            .unwrap();
+        let reference = saved["version"]["reference"].clone();
+        let mut updated = spec();
+        updated.source.push_str("# new immutable version\n");
+        execute(&tools[0], "save-new", json!({"spec":updated}), ctx.clone())
+            .await
+            .unwrap();
+        drop(tools);
+        drop(host);
+        let host = service(root.path());
+        let tools = host.tools();
+        let before = std::fs::read(root.path().join("state/ledger.json")).unwrap();
+        let listed = execute(&tools[1], "list", json!({}), ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(listed["versions"].as_array().unwrap().len(), 2);
+        assert!(
+            !serde_json::to_string(&listed)
+                .unwrap()
+                .contains("import json")
+        );
+        let read = execute(
+            &tools[1],
+            "read-old",
+            json!({"version":reference}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read["version"], saved["version"]);
+        let other = ToolExecutionContext::new().with_scope(Some(ContextScope {
+            session_id: "another-session".into(),
+            user_id: "test-user".into(),
+        }));
+        assert!(
+            execute(&tools[1], "other", json!({"version":reference}), other)
+                .await
+                .is_err()
+        );
+        assert!(
+            execute(
+                &tools[1],
+                "no-identity",
+                json!({"version":reference}),
+                ToolExecutionContext::new()
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            execute(
+                &tools[1],
+                "ambiguous",
+                json!({"version":reference,"call_id":"call-1"}),
+                ctx.clone()
+            )
+            .await
+            .is_err()
+        );
+        let mut missing = reference.clone();
+        missing["digest"] = json!("0".repeat(64));
+        assert!(
+            execute(
+                &tools[1],
+                "missing",
+                json!({"version":missing}),
+                ctx.clone()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            before,
+            std::fs::read(root.path().join("state/ledger.json")).unwrap()
+        );
+        assert_eq!(ctx.shared_steps().unwrap().remaining().unwrap(), 4);
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn adapter_tools_save_activate_dry_run_run_and_inspect_real_receipt() {
