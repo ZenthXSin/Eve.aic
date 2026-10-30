@@ -281,9 +281,8 @@ impl LlmModelResolver for CoreModelResolver {
         if captured.streamed_completions {
             provider = provider.with_streamed_completions();
         }
-        if self.use_name.as_deref() == Some("dialogue") {
-            provider = provider.with_transient_retries();
-        }
+        // 对话与后台任务执行共用主链路：瞬时错误（超时/429/5xx）按底层有界重试处理。
+        provider = provider.with_transient_retries();
         if matches!(self.use_name.as_deref(), Some("dialogue" | "digest")) && timing_enabled() {
             provider = provider.with_timing_diagnostics();
         }
