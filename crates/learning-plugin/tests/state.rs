@@ -914,10 +914,14 @@ async fn global_job_capacity_preserves_existing_jobs_and_read_only_replays() {
 
 #[tokio::test]
 async fn global_byte_capacity_rejects_new_bytes_without_removing_old_sources() {
-    let store = Arc::new(MemoryStateStore::default());
-    let (kernel, admin) = open(store.clone()).await;
-    let mut reached = false;
+    // 每个种子记录经真实插件准入和完成，再批量装入边界夹具；避免把32 MiB
+    // 账本逐条重写上千次。最后一次超限写入及后续恢复仍走实际存储代码。
+    let mut fixture = json!({"format_version":1,"jobs":[]});
+    let mut bytes_len = serde_json::to_vec(&fixture).unwrap().len();
+    let mut overflow = None;
     for index in 0..MAX_JOBS {
+        let seed_store = Arc::new(MemoryStateStore::default());
+        let (seed_kernel, seed) = open(seed_store.clone()).await;
         let mut source = memory(
             scope(&format!("byte-scope-{index}"), "u"),
             MAX_BATCH_EVIDENCE,
@@ -929,42 +933,66 @@ async fn global_byte_capacity_rejects_new_bytes_without_removing_old_sources() {
             };
             *user_text = "a".repeat(3600);
         }
-        let before = store.get(&owner(), LEARNING_STATE_KEY).unwrap();
-        let batch = match admin.reserve(&source, 100, "v1", &options()) {
-            Ok(Some(batch)) => batch,
-            Err(LearningError::LimitReached) => {
-                assert_eq!(store.get(&owner(), LEARNING_STATE_KEY).unwrap(), before);
-                assert!(admin.snapshot(&source.scope).unwrap().jobs.is_empty());
-                reached = true;
-                break;
-            }
-            other => panic!("unexpected reservation: {other:?}"),
-        };
-        assert_eq!(batch.evidence.len(), MAX_BATCH_EVIDENCE);
-        let before_finish = store.get(&owner(), LEARNING_STATE_KEY).unwrap();
-        let drafts = (0..MAX_CANDIDATES)
+        let batch = reserve(&seed, &source, 100);
+        let drafts: Vec<_> = (0..MAX_CANDIDATES)
             .map(|candidate| CandidateDraft {
                 text: format!("{candidate}{}", "x".repeat(999)),
                 ..draft(&batch)
             })
             .collect();
-        match admin.finish(&batch, 110, LearningOutcome::Completed(drafts)) {
-            Ok(()) => {}
-            Err(LearningError::LimitReached) => {
-                assert_eq!(
-                    store.get(&owner(), LEARNING_STATE_KEY).unwrap(),
-                    before_finish
-                );
-                let job = admin.snapshot(&source.scope).unwrap().jobs.remove(0);
-                assert_eq!(job.status, JobStatus::Running);
-                assert!(job.candidates.is_empty());
-                reached = true;
-                break;
-            }
-            other => panic!("unexpected completion: {other:?}"),
+        seed.finish(&batch, 110, LearningOutcome::Completed(drafts.clone()))
+            .unwrap();
+        let document: Value = serde_json::from_slice(
+            &seed_store
+                .get(&owner(), LEARNING_STATE_KEY)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let record = document["jobs"][0].clone();
+        let addition = serde_json::to_vec(&record).unwrap().len() + usize::from(index > 0);
+        seed_kernel.stop_all().await.unwrap();
+        if bytes_len + addition > MAX_STATE_BYTES {
+            overflow = Some((source, drafts));
+            break;
         }
+        fixture["jobs"].as_array_mut().unwrap().push(record);
+        bytes_len += addition;
     }
-    assert!(reached, "byte budget must be reached before the job limit");
+    let (source, drafts) = overflow.expect("byte budget must be reached before the job limit");
+    let encoded = serde_json::to_vec(&fixture).unwrap();
+    assert_eq!(encoded.len(), bytes_len);
+    assert!(
+        encoded.len() > 4 * 1024 * 1024,
+        "实际验证超过旧4 MiB边界的账本可以恢复"
+    );
+    let store = Arc::new(MemoryStateStore::default());
+    store
+        .set(&owner(), LEARNING_STATE_KEY.into(), encoded.clone())
+        .unwrap();
+    let (kernel, admin) = open(store.clone()).await;
+    match admin.reserve(&source, 100, "extractor-v1", &options()) {
+        Err(LearningError::LimitReached) => {
+            assert_eq!(
+                store.get(&owner(), LEARNING_STATE_KEY).unwrap().unwrap(),
+                encoded
+            );
+            assert!(admin.snapshot(&source.scope).unwrap().jobs.is_empty());
+        }
+        Ok(Some(batch)) => {
+            let before = store.get(&owner(), LEARNING_STATE_KEY).unwrap();
+            assert_eq!(
+                admin.finish(&batch, 110, LearningOutcome::Completed(drafts)),
+                Err(LearningError::LimitReached)
+            );
+            assert_eq!(store.get(&owner(), LEARNING_STATE_KEY).unwrap(), before);
+            assert_eq!(
+                admin.snapshot(&source.scope).unwrap().jobs[0].status,
+                JobStatus::Running
+            );
+        }
+        other => panic!("unexpected boundary admission: {other:?}"),
+    }
     let bytes = store.get(&owner(), LEARNING_STATE_KEY).unwrap().unwrap();
     assert!(bytes.len() <= MAX_STATE_BYTES);
     assert_eq!(

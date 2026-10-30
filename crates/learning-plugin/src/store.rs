@@ -14,7 +14,7 @@ use std::{
 
 const FORMAT_VERSION: u32 = 1;
 const DECISIONS_STATE_KEY: &str = "learning.decisions.v1";
-const MAX_DECISIONS_STATE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DECISIONS_STATE_BYTES: usize = MAX_STATE_BYTES;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

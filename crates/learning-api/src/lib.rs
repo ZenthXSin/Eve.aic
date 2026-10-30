@@ -12,7 +12,7 @@ pub use maintenance::*;
 
 pub const LEARNING_PLUGIN_ID: &str = "eve.learning";
 pub const LEARNING_STATE_KEY: &str = "learning.v1";
-pub const MAX_JOBS: usize = 128;
+pub const MAX_JOBS: usize = 1024;
 pub const MAX_BATCH_EVIDENCE: usize = 8;
 pub const MAX_EVIDENCE_BYTES: usize = 8192;
 pub const MAX_INPUT_BYTES: usize = 32768;
@@ -20,8 +20,9 @@ pub const MAX_OUTPUT_BYTES: usize = 8192;
 pub const MAX_CANDIDATES: usize = 3;
 pub const MAX_CANDIDATE_BYTES: usize = 1024;
 /// 决策历史不自动淘汰；达到容量后须保留已有记录并拒绝新增。
-pub const MAX_DECISIONS: usize = 1024;
-pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_DECISIONS: usize = 8192;
+/// 学习批次账本和决策账本各自的持久化字节上限，不是进程 RSS 上限。
+pub const MAX_STATE_BYTES: usize = 32 * 1024 * 1024;
 pub const CANDIDATE_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 pub type LearningResult<T> = Result<T, LearningError>;
 pub type LearningFuture<'a, T> = Pin<Box<dyn Future<Output = LearningResult<T>> + Send + 'a>>;
