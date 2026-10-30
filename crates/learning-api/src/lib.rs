@@ -3,8 +3,10 @@ use eve_memory_api::{InteractionEvidence, MemoryError, MemoryScope, MemorySnapsh
 use serde::{Deserialize, Serialize};
 use std::{fmt, future::Future, pin::Pin};
 
+mod archive;
 mod decisions;
 mod maintenance;
+pub use archive::{LearningArchiveStore, MAX_ARCHIVE_RECORD_BYTES, MAX_ARCHIVE_RESTORE_BYTES};
 pub use decisions::{
     DecisionReason, LearningDecision, LearningDecisionAction, LearningDecisionRecord,
 };

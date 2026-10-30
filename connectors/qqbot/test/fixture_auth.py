@@ -72,3 +72,22 @@ def bootstrap_fixture_groups(state, scenario):
         connection.execute("CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY, added_at INTEGER NOT NULL)")
         connection.executemany("INSERT OR IGNORE INTO groups VALUES (?, 0)", [(g,) for g in sorted(groups)])
         connection.execute("PRAGMA user_version=1")
+
+
+def expand_learning_archive(documents, directory):
+    """验收读取真实冷文件并校验内容摘要，保持旧夹具的逻辑文档视图。"""
+    learning = documents.get("eve.learning", {})
+    for key, kind, field in [("learning.v1", "jobs", "jobs"), ("learning.decisions.v1", "decisions", "records")]:
+        index = learning.get(key)
+        if not index or index.get("format_version") != 2:
+            continue
+        assert index["kind"] == kind
+        records = []
+        for ref in index["records"]:
+            digest = ref["hash"]
+            assert len(digest) == 64 and all(c in "0123456789abcdef" for c in digest)
+            payload = (Path(directory) / (digest + ".json")).read_bytes()
+            assert len(payload) == ref["bytes"] and hashlib.sha256(payload).hexdigest() == digest
+            records.append(json.loads(payload))
+        learning[key] = {"format_version": 1, field: records}
+    return documents

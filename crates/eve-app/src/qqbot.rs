@@ -1262,7 +1262,7 @@ async fn run_qqbot_composed(
         };
         let context: Arc<dyn ContextAssembler> = Arc::new(TrainingContext(training.0.clone()));
         let learning: Option<Arc<dyn LearningAdmin>> = if options.memory_learning {
-            let plugin = LearningPlugin::new()?;
+            let plugin = LearningPlugin::new()?.with_archive(Arc::new(eve_learning_plugin::FileLearningArchive::open(options.state_directory.join("learning-archive"))?));
             let controller = plugin.controller();
             kernel.register(Box::new(plugin))?;
             kernel.start(&PluginId::new(LEARNING_PLUGIN_ID)?).await?;

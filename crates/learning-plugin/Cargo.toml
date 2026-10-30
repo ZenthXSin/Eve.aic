@@ -14,9 +14,9 @@ serde.workspace = true
 serde_json.workspace = true
 ring.workspace = true
 tokio.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 eve-kernel = { path = "../kernel" }
 eve-memory-plugin = { path = "../memory-plugin" }
 eve-session-api = { path = "../session-api" }
-tempfile.workspace = true

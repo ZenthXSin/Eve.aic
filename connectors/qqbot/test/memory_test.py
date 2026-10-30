@@ -5,7 +5,7 @@
 """
 from fixture_auth import configure_fixture_progress, is_progress_request, progress_fixture_text
 import json
-from fixture_auth import bootstrap_test_admin, bootstrap_fixture_groups
+from fixture_auth import bootstrap_test_admin, bootstrap_fixture_groups, expand_learning_archive
 import os
 import pathlib
 import signal
@@ -116,8 +116,9 @@ class MemoryAcceptance(unittest.TestCase):
                     raise
                 time.sleep(0.01)
         document = json.loads(text)
-        return {owner: {key: json.loads(bytes(value)) for key, value in entries.items()}
-                for owner, entries in document["entries"].items()}
+        documents = {owner: {key: json.loads(bytes(value)) for key, value in entries.items()}
+                     for owner, entries in document["entries"].items()}
+        return expand_learning_archive(documents, self.work / "state" / "learning-archive")
 
     def memory(self):
         return self.documents().get("eve.memory", {}).get("memory.v1")

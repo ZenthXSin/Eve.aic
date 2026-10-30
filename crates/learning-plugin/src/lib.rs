@@ -1,4 +1,6 @@
 //! 低频偏好候选、单次模型提炼与严格恢复。
+mod archive;
+pub use archive::FileLearningArchive;
 mod confirmation;
 mod decision;
 mod extractor;
@@ -82,13 +84,20 @@ impl LearningAdmin for LearningController {
 pub struct LearningPlugin {
     manifest: PluginManifest,
     controller: LearningController,
+    archive: Option<Arc<dyn LearningArchiveStore>>,
 }
 impl LearningPlugin {
     pub fn new() -> PluginResult<Self> {
         Ok(Self {
             manifest: PluginManifest::new(LEARNING_PLUGIN_ID, env!("CARGO_PKG_VERSION"))?,
             controller: LearningController::default(),
+            archive: None,
         })
+    }
+    /// 宿主显式提供不可变冷记录存储；旧二进制不能读取迁移后的格式。
+    pub fn with_archive(mut self, archive: Arc<dyn LearningArchiveStore>) -> Self {
+        self.archive = Some(archive);
+        self
     }
     pub fn controller(&self) -> LearningController {
         self.controller.clone()
@@ -101,7 +110,7 @@ impl Plugin for LearningPlugin {
     fn start(&mut self, context: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         Box::pin(async move {
             let stored = Arc::new(
-                StoredLearning::open(context.clone())
+                StoredLearning::open(context.clone(), self.archive.clone())
                     .map_err(|error| PluginError::State(error.to_string()))?,
             );
             let to_close = stored.clone();
