@@ -2055,6 +2055,8 @@ async fn run_qqbot_composed(
             bootstrap.tools.push(Arc::new(crate::qq_health::ReadTool(monitor.clone())));
             Some(monitor)
         } else {None};
+        let reasoning_settings = Arc::new(std::sync::OnceLock::new());
+        bootstrap.tools.push(Arc::new(crate::qq_model::ReasoningTool(reasoning_settings.clone())));
         for tool in &mut bootstrap.tools {
             *tool = Arc::new(crate::qq_access::GuardedTool {
                 inner: tool.clone(),
@@ -2130,6 +2132,12 @@ async fn run_qqbot_composed(
             options.web_listen.map(|_| page_permit.clone()),
         )
         .await?;
+        let model_commands = Arc::new(crate::qq_model::Commands {
+            settings: qq_tasks::config_service(registry.as_ref())?,
+            admin: Arc::new(model_settings_admin),
+            authorization: qq_admin.clone(),
+        });
+        reasoning_settings.set(model_commands.clone()).map_err(|_| "思考强度配置重复装配")?;
         if let Some(selector) = crate::qq_message_judge::context_selector(qq_tasks::config_service(registry.as_ref())?) {
             let _ = context_planner.selector.set(selector);
         }
@@ -2823,11 +2831,7 @@ async fn run_qqbot_composed(
             admin: qq_admin.clone(),
             inner: Arc::new(CommandHandlers(vec![
                 qq_admin.clone(),
-                Arc::new(crate::qq_model::Commands {
-                    settings: qq_tasks::config_service(registry.as_ref())?,
-                    admin: Arc::new(model_settings_admin),
-                    authorization: qq_admin.clone(),
-                }),
+                model_commands,
                 Arc::new(crate::qq_people::Commands(people)),
                 Arc::new(crate::qq_failure_recovery::Commands(failure_recovery)),
                 help_commands,

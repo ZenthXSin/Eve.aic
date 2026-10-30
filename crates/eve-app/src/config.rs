@@ -126,7 +126,7 @@ pub(crate) fn openai_schema() -> ConfigSchema {
             ("model_role".into(), string("", "EVE_OPENAI_MODEL_ROLE")),
             (
                 "reasoning_effort".into(),
-                string("", "EVE_OPENAI_REASONING_EFFORT"),
+                string("low", "EVE_OPENAI_REASONING_EFFORT"),
             ),
             (
                 "timeout_seconds".into(),
@@ -380,7 +380,7 @@ pub(crate) fn provider_config(
     }
     let effort: String = snapshot.get("reasoning_effort")?;
     config.reasoning_effort = if effort.is_empty() {
-        (protocol == "chat").then(|| "none".into())
+        Some("low".into())
     } else {
         Some(effort)
     };
