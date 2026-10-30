@@ -2806,6 +2806,8 @@ async fn run_qqbot_composed(
                 responder,
                 requests,
                 gate: budget_gate.clone(),
+                conversations: conversations.clone(),
+                settings: qq_tasks::config_service(registry.as_ref())?,
             }));
             qq_outreach::Commands::enabled(Arc::new(outreach.clone()), Arc::new(practice.clone()))
         } else {
@@ -2944,6 +2946,9 @@ async fn run_qqbot_composed(
                     judge,
                     policy: outreach_policy,
                     gate: budget_gate.clone(),
+                    conversations: conversations.clone(),
+                    memory: memory.clone().ok_or("主动交流缺少记忆服务")?,
+                    settings: qq_tasks::config_service(registry.as_ref())?,
                 }),
             ));
         }
@@ -2981,7 +2986,7 @@ async fn run_qqbot_composed(
                 || trigger_admin.is_some()
                 || reminders.is_some()
                 || tasks.is_some()
-                || outreach.is_some() && outreach_policy.proactive_after_ms.is_some())
+                || outreach.is_some())
             .then(|| std::time::Duration::from_secs(2));
             let adapter: Arc<dyn QqOutreach> = if sources.len() == 1 {
                 sources.remove(0).1

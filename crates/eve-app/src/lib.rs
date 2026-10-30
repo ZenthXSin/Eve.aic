@@ -42,6 +42,7 @@ mod qq_help;
 mod qq_history_digest;
 mod qq_host_facts;
 mod qq_identity;
+mod qq_idle_chat;
 mod qq_impressions;
 mod qq_interest;
 mod qq_learning;
@@ -427,6 +428,7 @@ pub(crate) async fn install_core_with_pages_and_admin(
         config::dialogue_schema(),
         config::history_schema(),
         qq_history_digest::schema(),
+        qq_idle_chat::schema(),
         qq_phrases::schema(),
         qq_vision::schema(),
         qq_progress::schema(),

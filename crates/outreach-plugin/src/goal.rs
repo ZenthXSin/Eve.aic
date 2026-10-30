@@ -190,6 +190,7 @@ impl RequestGoalDeriver for RequestGoals {
         let mut requested: Vec<(&Invitation, &ResponseVerdict)> = snapshot
             .invitations
             .iter()
+            .filter(|invitation| invitation.origin.is_goal())
             .filter_map(|invitation| invitation.feedback().map(|verdict| (invitation, verdict)))
             .filter(|(_, verdict)| verdict.kind == ResponseKind::Request)
             .collect();

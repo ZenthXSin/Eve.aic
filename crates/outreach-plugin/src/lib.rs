@@ -48,6 +48,17 @@ impl OutreachAdmin for OutreachController {
         self.service()?
             .begin(owner, goal_id, milestone, facts, composer_version, now_ms)
     }
+    fn begin_chat(
+        &self,
+        owner: &str,
+        source: IdleChatSource,
+        facts: Vec<Fact>,
+        composer_version: &str,
+        now_ms: u64,
+    ) -> OutreachResult<Option<Invitation>> {
+        self.service()?
+            .begin_chat(owner, source, facts, composer_version, now_ms)
+    }
     fn record_composition(
         &self,
         id: &str,
