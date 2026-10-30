@@ -6,7 +6,7 @@
 """
 from fixture_auth import configure_fixture_progress, is_progress_request, progress_fixture_text
 import json
-from fixture_auth import bootstrap_test_admin
+from fixture_auth import bootstrap_test_admin, bootstrap_fixture_groups
 import contextlib
 import os
 import pathlib
@@ -242,6 +242,7 @@ class InterestAcceptance(unittest.TestCase):
                    EVE_QQ_LIVE_INTERACTION="false")
         env.update(env_extra or {})
         bootstrap_test_admin(self.work / "state", env)
+        bootstrap_fixture_groups(self.work / "state", scenario)
         command = [str(BINARY), "--state-dir", str(self.work / "state"),
                    "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
                    "--bridge-arg", str(scenario), "--cognition-max-executions", str(max_executions)]

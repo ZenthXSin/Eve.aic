@@ -193,9 +193,10 @@ class GoalFeedbackAcceptance(unittest.TestCase):
             environment["EVE_WEB_TOKEN"] = PANEL_TOKEN
             command.extend(["--web-listen", "127.0.0.1:0"])
         with open(stderr_file, "w") as stderr_sink:
-            from fixture_auth import bootstrap_test_admin
+            from fixture_auth import bootstrap_test_admin, bootstrap_fixture_groups
             bootstrap_test_admin(self.work / "state", environment, app,
                                  users=getattr(self, "fixture_admin_users", ("user-1", "user-2")))
+            bootstrap_fixture_groups(self.work / "state", scenario)
             child = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE,
                                      stderr=stderr_sink if panel is not None else subprocess.PIPE, text=True)
             if panel is not None:

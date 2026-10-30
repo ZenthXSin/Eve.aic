@@ -6,7 +6,7 @@
 from fixture_auth import configure_fixture_progress
 import hashlib
 import json
-from fixture_auth import bootstrap_test_admin
+from fixture_auth import bootstrap_test_admin, bootstrap_fixture_groups
 import os
 import pathlib
 import signal
@@ -16,7 +16,7 @@ import threading
 import time
 import traceback
 import unittest
-from fixture_auth import bootstrap_test_admin
+from fixture_auth import bootstrap_test_admin, bootstrap_fixture_groups
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -130,6 +130,7 @@ class SegmentAcceptance(unittest.TestCase):
                    EVE_CHAT_SENTENCE_SPLIT="true" if sentence_split else "false")
         bootstrap_test_admin(self.work / "state", env,
                              users=getattr(self, "fixture_admin_users", ("user-1", "user-2")))
+        bootstrap_fixture_groups(self.work / "state", scenario)
         command = [str(BINARY), "--state-dir", str(self.work / "state"), "--agent", str(ROOT / "AGENT.md"),
                    "--bridge-script", str(FAKE), "--bridge-arg", str(scenario)]
         if segmented:

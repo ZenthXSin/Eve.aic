@@ -216,8 +216,9 @@ class MessageJudgeAcceptance(unittest.TestCase):
         if inspect:
             env["EVE_WEB_TOKEN"] = PANEL_TOKEN
             command.extend(["--web-listen", "127.0.0.1:0"])
-        from fixture_auth import bootstrap_test_admin
+        from fixture_auth import bootstrap_test_admin, bootstrap_fixture_groups
         bootstrap_test_admin(self.work / "state", env)
+        bootstrap_fixture_groups(self.work / "state", scenario)
         child = subprocess.Popen(command, env=configure_fixture_progress(env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             if inspect:
