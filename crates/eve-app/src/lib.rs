@@ -48,6 +48,7 @@ mod qq_learning_commands;
 mod qq_member_files;
 mod qq_memory;
 mod qq_memory_continuity;
+mod qq_memory_maintenance;
 mod qq_memory_observer;
 mod qq_message_judge;
 mod qq_model;

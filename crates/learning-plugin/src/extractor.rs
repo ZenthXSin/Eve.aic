@@ -1,13 +1,14 @@
 use eve_learning_api::{
     CandidateDraft, LearningBatch, LearningError, LearningFailure, LearningFuture, LearningResult,
-    MAX_BATCH_EVIDENCE, MAX_EVIDENCE_BYTES, MAX_INPUT_BYTES, MAX_OUTPUT_BYTES, PreferenceExtractor,
+    MAX_BATCH_EVIDENCE, MAX_EVIDENCE_BYTES, MAX_INPUT_BYTES, MAX_OUTPUT_BYTES,
+    MaintenanceExtraction, PreferenceExtractor, ReflectionDraft,
 };
 use eve_llm_api::{ChatMessage, ChatRole, LlmError, LlmModelResolver, ModelRequest, ModelResponse};
 use eve_memory_api::{EvidenceSource, validate_id, validate_text};
 use serde::Deserialize;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-const VERSION: &str = "preference-extractor:v3";
+const VERSION: &str = "preference-extractor:v4";
 const MAX_PROVIDER_TIMEOUT: Duration = Duration::from_secs(30);
 
 // 固定规则与 JSON 结构只增加常量开销；唯一动态消息是完整 LearningBatch JSON。
@@ -17,9 +18,10 @@ const SYSTEM_PROMPT: &str = r#"你是受限的偏好候选提炼器。唯一数�
 每个候选必须忠实于本批次用户原文，使用简洁文本，并列出支撑它的本批次 evidence.id；不得添加不存在或其他作用域的证据。confidence 是 0 到 100 的整数自评，不是事实概率。你只产生候选，确认由可信宿主决定；你不确认偏好，不修改记忆，不调用任何工具，不输出规划或训练内容。
 内容生成偏好包括接话方式、信息选择、结论与依据的顺序、解释和举例方式、情绪回应及追问时机。用户明确要求长期采用某种写法，或反复纠正并给出改写时，提炼适用场景和可复用原则；示例中的具体事实、一次性答案和助手的原句不能成为长期规则。只模仿用户写法的统计不证明用户希望收到同样内容。内容原则与发送节奏分别成候选；当前任务的完整性和明确要求优先。
 用户明确表达的分段和停顿偏好单独成候选，不与称呼或其他业务要求拼在一起。忠实规范为“回复最多N段”“回复不要分段”“回复分段发送”“段间停顿P%”“段间不要停顿”等完整句子；N、P 仅能来自用户明确给出的数字，不得把模糊要求编成数字。用户明确要求段间停顿更短或更长时，可写“段间停顿短一点”或“段间停顿长一点”，不要自行换算比例。“说话更自然”等没有具体节奏要求的反馈保留原意，不转换为分段、停顿或开关。多个明确节奏子句可用中文逗号组合，仍只是一条待确认候选。
-只输出严格 JSON：{"candidates":[{"text":"候选偏好","confidence":80,"evidence_ids":["本批证据ID"]}]}。不得有 Markdown、解释、额外字段或重复键。candidates 最多 3 项，允许为空。每项 text 必须非空且不超过 1024 个 UTF-8 字节；evidence_ids 非空且不重复。完整输出不超过 8192 个 UTF-8 字节。"#;
+可同时记录有来源的反思草稿 reflection：observations（发生了什么）、actions（记录中采取的行动）、outcomes（观察到的结果）、lessons（待验证经验）、next_checks（下一次如何查证）、evidence_ids（本批来源ID）。前五项各为不超过512 UTF-8字节的非空字符串，无依据就明确写“未记录”，不编造内心活动或把助手说成功视为工具验证；没有值得总结的内容时省略reflection。反思不是偏好或授权，不自动修改长期规则。
+只输出严格 JSON：{"candidates":[{"text":"候选偏好","confidence":80,"evidence_ids":["本批证据ID"]}]}。除 candidates 和可选 reflection 外不得有其他字段；不得有 Markdown、解释或重复键。candidates 最多 3 项，允许为空。每项 text 必须非空且不超过 1024 个 UTF-8 字节；evidence_ids 非空且不重复。完整输出不超过 8192 个 UTF-8 字节。"#;
 
-/// 每个已持久化批次至多解析一次模型并发起一次无工具请求；不读取其他服务。
+/// 每次已持久化尝试至多解析一次模型并发起一次无工具请求；不读取其他服务。
 pub struct ModelPreferenceExtractor {
     resolver: Arc<dyn LlmModelResolver>,
 }
@@ -30,12 +32,8 @@ impl ModelPreferenceExtractor {
     }
 }
 
-impl PreferenceExtractor for ModelPreferenceExtractor {
-    fn version(&self) -> &str {
-        VERSION
-    }
-
-    fn extract(&self, batch: LearningBatch) -> LearningFuture<'_, Vec<CandidateDraft>> {
+impl ModelPreferenceExtractor {
+    fn maintain(&self, batch: LearningBatch) -> LearningFuture<'_, MaintenanceExtraction> {
         Box::pin(async move {
             let input = validated_input(&batch)?;
             let request = ModelRequest {
@@ -56,8 +54,22 @@ impl PreferenceExtractor for ModelPreferenceExtractor {
             let ModelResponse::Final { text } = response else {
                 return Err(invalid_output());
             };
-            validated_output(&text, &batch)
+            validated_maintenance(&text, &batch)
         })
+    }
+}
+impl PreferenceExtractor for ModelPreferenceExtractor {
+    fn version(&self) -> &str {
+        VERSION
+    }
+    fn extract(&self, batch: LearningBatch) -> LearningFuture<'_, Vec<CandidateDraft>> {
+        Box::pin(async move { self.maintain(batch).await.map(|value| value.candidates) })
+    }
+    fn extract_maintenance(
+        &self,
+        batch: LearningBatch,
+    ) -> LearningFuture<'_, MaintenanceExtraction> {
+        self.maintain(batch)
     }
 }
 
@@ -65,7 +77,8 @@ fn validated_input(batch: &LearningBatch) -> LearningResult<String> {
     let invalid = || LearningError::InvalidInput;
     batch.scope.validate().map_err(|_| invalid())?;
     validate_id(&batch.id).map_err(|_| invalid())?;
-    if batch.extractor_version != VERSION
+    if usize::from(batch.attempt) > eve_learning_api::MAX_REPAIRS
+        || batch.extractor_version != VERSION
         || batch.evidence.is_empty()
         || batch.evidence.len() > MAX_BATCH_EVIDENCE
     {
@@ -115,16 +128,27 @@ fn validated_input(batch: &LearningBatch) -> LearningResult<String> {
 #[serde(deny_unknown_fields)]
 struct ExtractionOutput {
     candidates: Vec<CandidateDraft>,
+    #[serde(default)]
+    reflection: Option<ReflectionDraft>,
 }
 
-fn validated_output(text: &str, batch: &LearningBatch) -> LearningResult<Vec<CandidateDraft>> {
+fn validated_maintenance(
+    text: &str,
+    batch: &LearningBatch,
+) -> LearningResult<MaintenanceExtraction> {
     if text.len() > MAX_OUTPUT_BYTES {
         return Err(invalid_output());
     }
     // 直接反序列化为具名字段结构，拒绝重复键；不经过会覆盖同名键的 Value。
     let output: ExtractionOutput = serde_json::from_str(text).map_err(|_| invalid_output())?;
     crate::validate_drafts(batch, &output.candidates).map_err(|_| invalid_output())?;
-    Ok(output.candidates)
+    if let Some(reflection) = &output.reflection {
+        reflection.validate(batch).map_err(|_| invalid_output())?;
+    }
+    Ok(MaintenanceExtraction {
+        candidates: output.candidates,
+        reflection: output.reflection,
+    })
 }
 
 fn invalid_output() -> LearningError {
@@ -134,6 +158,16 @@ fn invalid_output() -> LearningError {
 fn provider_error(error: LlmError) -> LearningError {
     LearningError::Extraction(match error {
         LlmError::ProviderTimeout => LearningFailure::Timeout,
+        LlmError::ProviderFailed(failure)
+            if matches!(
+                failure.kind,
+                eve_llm_api::ProviderFailureKind::Network
+                    | eve_llm_api::ProviderFailureKind::ServerError
+                    | eve_llm_api::ProviderFailureKind::RateLimited
+            ) =>
+        {
+            LearningFailure::TransientProvider
+        }
         LlmError::Cancelled => LearningFailure::Cancelled,
         _ => LearningFailure::Provider,
     })

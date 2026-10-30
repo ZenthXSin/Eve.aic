@@ -107,13 +107,14 @@ fn evidence(index: u64) -> InteractionEvidence {
 
 fn batch() -> LearningBatch {
     LearningBatch {
+        attempt: 0,
         id: "learning-batch-01".into(),
         scope: MemoryScope {
             channel: "qq".into(),
             session_id: "app-01-group-02-user-03".into(),
             user_id: "user-03".into(),
         },
-        extractor_version: "preference-extractor:v3".into(),
+        extractor_version: "preference-extractor:v4".into(),
         started_at_ms: 500,
         evidence: vec![evidence(1), evidence(2), evidence(3)],
     }
@@ -476,4 +477,40 @@ async fn caps_long_provider_timeout_at_thirty_seconds() {
     assert!(started.elapsed() >= Duration::from_secs(29));
     assert_single_call(&mock);
     assert_eq!(mock.dropped.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn maintenance_uses_one_request_and_binds_reflection_to_original_evidence() {
+    let input = batch();
+    let text=serde_json::json!({"candidates":[],"reflection":{"observations":"用户要求先给结论","actions":"未记录工具执行","outcomes":"未记录验证结果","lessons":"先给结论是待核对经验","next_checks":"核对后续用户反馈","evidence_ids":[input.evidence[0].id]}}).to_string();
+    let (extractor, mock) = with_text(text.clone());
+    let result = extractor.extract_maintenance(input.clone()).await.unwrap();
+    assert!(result.candidates.is_empty());
+    assert!(result.reflection.is_some());
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    let bad = text.replace(&input.evidence[0].id, "foreign-evidence");
+    let (extractor, mock) = with_text(bad);
+    assert!(extractor.extract_maintenance(input).await.is_err());
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn maintenance_distinguishes_transient_errors_from_auth_and_payment() {
+    for (status, expected) in [
+        (401, LearningFailure::Provider),
+        (402, LearningFailure::Provider),
+        (400, LearningFailure::Provider),
+        (429, LearningFailure::TransientProvider),
+        (503, LearningFailure::TransientProvider),
+    ] {
+        let (extractor, mock) = setup(
+            Reply::Ready(Err(LlmError::ProviderFailed(
+                eve_llm_api::ProviderFailure::http(status).unwrap(),
+            ))),
+            Duration::from_secs(5),
+        );
+        let error = extractor.extract_maintenance(batch()).await.err().unwrap();
+        assert_eq!(error, LearningError::Extraction(expected));
+        assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    }
 }

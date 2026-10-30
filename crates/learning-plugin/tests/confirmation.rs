@@ -23,6 +23,7 @@ fn input() -> (PreferenceCandidate, LearningBatch, MemorySnapshot) {
         })
         .collect();
     let batch = LearningBatch {
+        attempt: 0,
         id: "batch".into(),
         scope: scope.clone(),
         extractor_version: "test-v1".into(),

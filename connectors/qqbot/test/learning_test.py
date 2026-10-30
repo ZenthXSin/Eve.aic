@@ -112,11 +112,17 @@ class LearningAcceptance(unittest.TestCase):
                 if kind == "chat" and outer.chat_response is not None:
                     text = outer.chat_response(body, latest)
                 message = {"role": "assistant", "content": text}
+                if isinstance(text, dict):
+                    message = {"role": "assistant", **text}
+                    if "tool_calls" in text:
+                        finish = "tool_calls"
                 if kind == "learning":
                     mode = outer.learning_response
                     draft = {"text": outer.candidate_text, "confidence": outer.candidate_confidence,
                              "evidence_ids": [item["id"] for item in decoded["evidence"]][:outer.candidate_sources]}
                     result = {"candidates": [] if mode == "empty" else [draft]}
+                    if mode == "journal":
+                        result["reflection"] = {"observations": "用户提出明确的表达偏好", "actions": "已回复用户", "outcomes": "未记录工具验证", "lessons": "先查原文再采用候选", "next_checks": "核对后续反馈", "evidence_ids": [item["id"] for item in decoded["evidence"]]}
                     if mode == "invalid":
                         draft["evidence_ids"] = ["foreign-evidence-must-be-rejected"]
                     if mode == "provider":
@@ -288,6 +294,29 @@ class LearningAcceptance(unittest.TestCase):
     def segment_send(self, message, parts):
         return [{"send": {**message, "expected_segments": parts}}, self.wait_receipt(message["id"])]
 
+    def test_maintenance_journal_real_process_lookup_and_restart(self):
+        self.seed()
+        self.learning_response = "journal"
+        self.inspect_run(lambda: self.wait_jobs(1))
+        records = self.learning()["jobs"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["reflection"]["evidence_ids"], [e["id"] for e in records[0]["job"]["batch"]["evidence"]])
+
+        def generate(body, latest):
+            if body["messages"][-1]["role"] == "tool":
+                result = json.loads(latest)
+                self.assertEqual(result["completed_batches"], 1)
+                self.assertTrue(result["enabled"])
+                return "已核对持久记录，整理完成一批"
+            if latest == "记忆更新了没":
+                return {"content": None, "tool_calls": [{"id": "maintenance-check", "type": "function", "function": {"name": "memory_maintenance", "arguments": json.dumps({"action": "status"})}}]}
+            return latest
+
+        self.chat_response = generate
+        self.run_eve(self.send(self.message("maintenance-status", "记忆更新了没", expected="已核对持久记录，整理完成一批")))
+        self.assertEqual(len(self.learning_requests()), 1, "重启和查询不能重放已提交提炼")
+        self.assertEqual(self.learning()["jobs"][0]["reflection"], records[0]["reflection"])
+
     def test_content_rules_generate_new_topic_reply_and_follow_correction_scope_and_revocation(self):
         self.candidate_text = "解释问题时先给结论，再给依据；信息足够时不追加追问。"
         self.seed(feedback="以后解释问题先给结论再给依据，信息够了不要追问；刚才的天气例子只是改写示范。")
@@ -295,7 +324,7 @@ class LearningAcceptance(unittest.TestCase):
                                                "content rule was not automatically confirmed"), self_learning=True)
         candidate = self.jobs()[0]["candidates"][0]
         source = "learned-" + candidate["id"]
-        self.assertEqual(self.jobs()[0]["batch"]["extractor_version"], "preference-extractor:v3")
+        self.assertEqual(self.jobs()[0]["batch"]["extractor_version"], "preference-extractor:v4")
         self.assertEqual(self.preferences()[0]["text"], self.candidate_text)
         corrected = "解释问题时先给依据，再给结论；信息足够时不追加追问。"
 
@@ -658,7 +687,7 @@ class LearningAcceptance(unittest.TestCase):
 
     def test_provider_empty_invalid_and_tool_results_are_persisted_without_retry(self):
         original_work = self.work
-        for mode, expected in (("provider", {"Failed": "Provider"}), ("empty", "Completed"),
+        for mode, expected in (("provider", {"Failed": "TransientProvider"}), ("empty", "Completed"),
                                ("invalid", {"Failed": "InvalidOutput"}), ("tool", {"Failed": "InvalidOutput"})):
             with self.subTest(mode=mode):
                 self.work = original_work / mode

@@ -70,6 +70,7 @@ pub(crate) fn learning(
                     "failed",
                     Some(match failure {
                         LearningFailure::Provider => "provider",
+                        LearningFailure::TransientProvider => "transient_provider",
                         LearningFailure::InvalidOutput => "invalid_output",
                         LearningFailure::Timeout => "timeout",
                         LearningFailure::Cancelled => "cancelled",
@@ -274,6 +275,7 @@ mod tests {
         };
         LearningJob {
             batch: LearningBatch {
+                attempt: 0,
                 id: format!("batch-{index}"),
                 scope: scope(),
                 extractor_version: "fixture-v1".into(),

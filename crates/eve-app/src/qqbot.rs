@@ -1263,6 +1263,13 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        if let Some(memory) = &memory {
+            bootstrap.tools.push(Arc::new(crate::qq_memory_maintenance::ToolService { memory:memory.clone(), learning:learning.clone() }));
+        }
+        let context: Arc<dyn ContextAssembler> = match &learning {
+            Some(learning) => Arc::new(crate::qq_memory_maintenance::Context { inner:context, learning:learning.clone() }),
+            None => context,
+        };
         // 兴趣账本先于模型与通道加载；损坏或版本不兼容时拒绝启动并保留原字节。
         let interests = if options.interest_learning {
             let plugin = InterestPlugin::new()?;
@@ -2196,7 +2203,7 @@ async fn run_qqbot_composed(
                         "preference",
                         model_health.clone(),
                     ));
-                    Arc::new(ModelPreferenceExtractor::new(resolver))
+                    Arc::new(ModelPreferenceExtractor::new(budget_gate.wrap(resolver, "memory-maintenance")?))
                 }
             };
             learning_background = Some(qq_learning::Background::start(
@@ -2204,6 +2211,7 @@ async fn run_qqbot_composed(
                 learning.clone(),
                 extractor,
                 options.learning_options.clone(),
+                budget_gate.clone(),
                 if options.self_learning {
                     Some(confirmation.unwrap_or_else(|| Arc::new(EvidenceConfirmationPolicy)))
                 } else {

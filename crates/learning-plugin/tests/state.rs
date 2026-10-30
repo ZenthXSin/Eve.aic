@@ -1083,3 +1083,194 @@ async fn global_byte_capacity_rejects_new_bytes_without_removing_old_sources() {
     );
     recovered_kernel.stop_all().await.unwrap();
 }
+
+fn reflection(batch: &LearningBatch) -> ReflectionDraft {
+    ReflectionDraft {
+        observations: "用户反复要求先给结论".into(),
+        actions: "回复中先给结论".into(),
+        outcomes: "未记录后续效果".into(),
+        lessons: "先给结论可能适用，仍需反馈".into(),
+        next_checks: "核对下一次用户反馈".into(),
+        evidence_ids: vec![batch.evidence[0].id.clone()],
+    }
+}
+
+#[tokio::test]
+async fn aged_backlog_and_reflection_commit_survive_real_file_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = RecordingStore::open(directory.path());
+    let (kernel, admin) = open(store.clone()).await;
+    let memory = memory(scope("daily", "alice"), 1);
+    assert!(
+        admin
+            .reserve(&memory, 100, "extractor-v1", &LearningOptions::default())
+            .unwrap()
+            .is_none()
+    );
+    let batch = admin
+        .reserve(
+            &memory,
+            MAINTENANCE_DELAY_MS + 1,
+            "extractor-v1",
+            &LearningOptions::default(),
+        )
+        .unwrap()
+        .unwrap();
+    let note = reflection(&batch);
+    let mut forged = note.clone();
+    forged.evidence_ids = vec!["foreign-evidence".into()];
+    assert!(
+        admin
+            .finish(
+                &batch,
+                MAINTENANCE_DELAY_MS + 2,
+                LearningOutcome::Maintained(MaintenanceExtraction {
+                    candidates: vec![],
+                    reflection: Some(forged)
+                })
+            )
+            .is_err()
+    );
+    assert_eq!(
+        admin.snapshot(&memory.scope).unwrap().jobs[0].status,
+        JobStatus::Running
+    );
+    admin
+        .finish(
+            &batch,
+            MAINTENANCE_DELAY_MS + 2,
+            LearningOutcome::Maintained(MaintenanceExtraction {
+                candidates: vec![],
+                reflection: Some(note.clone()),
+            }),
+        )
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    let (_restored_kernel, restored) = open(store).await;
+    let receipts = restored.maintenance_receipts(&memory.scope).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].reflection, Some(note));
+    assert_eq!(receipts[0].status, JobStatus::Completed);
+    assert!(
+        restored
+            .maintenance_receipts(&scope("other", "alice"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        restored
+            .reserve_repair(&memory, 2 * MAINTENANCE_DELAY_MS, "extractor-v1")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn repair_is_bounded_persistent_and_old_attempt_cannot_finish_new_one() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = RecordingStore::open(directory.path());
+    let (kernel, admin) = open(store.clone()).await;
+    let memory = memory(scope("repair", "alice"), 1);
+    let original = reserve(&admin, &memory, 100);
+    admin
+        .finish(
+            &original,
+            110,
+            LearningOutcome::Failed(LearningFailure::TransientProvider),
+        )
+        .unwrap();
+    assert!(
+        admin
+            .reserve_repair(&memory, 110 + REPAIR_COOLDOWN_MS - 1, "extractor-v1")
+            .unwrap()
+            .is_none()
+    );
+    let first = admin
+        .reserve_repair(&memory, 110 + REPAIR_COOLDOWN_MS, "extractor-v1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.attempt, 1);
+    assert_eq!(first.evidence, original.evidence);
+    assert_eq!(
+        admin.finish(
+            &original,
+            first.started_at_ms,
+            LearningOutcome::Completed(vec![])
+        ),
+        Err(LearningError::Conflict)
+    );
+    kernel.stop_all().await.unwrap();
+    let (_restored_kernel, restored) = open(store.clone()).await;
+    assert_eq!(
+        restored.snapshot(&memory.scope).unwrap().jobs[0].status,
+        JobStatus::Interrupted
+    );
+    let second = restored
+        .reserve_repair(
+            &memory,
+            first.started_at_ms + REPAIR_COOLDOWN_MS,
+            "extractor-v1",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.attempt, 2);
+    restored
+        .finish(
+            &second,
+            second.started_at_ms + 1,
+            LearningOutcome::Failed(LearningFailure::Timeout),
+        )
+        .unwrap();
+    assert!(
+        restored
+            .reserve_repair(&memory, 10 * REPAIR_COOLDOWN_MS, "extractor-v1")
+            .unwrap()
+            .is_none()
+    );
+    let receipt = restored
+        .maintenance_receipts(&memory.scope)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(receipt.previous_attempts.len(), 2);
+    assert_eq!(
+        receipt.previous_attempts[0].status,
+        JobStatus::Failed(LearningFailure::TransientProvider)
+    );
+    assert_eq!(receipt.previous_attempts[1].status, JobStatus::Interrupted);
+}
+
+#[tokio::test]
+async fn cancelled_invalid_output_and_changed_evidence_never_auto_repair() {
+    for reason in [
+        LearningFailure::Cancelled,
+        LearningFailure::InvalidOutput,
+        LearningFailure::Provider,
+        LearningFailure::TransientProvider,
+    ] {
+        let (_kernel, admin) = open(Arc::new(MemoryStateStore::default())).await;
+        let mut memory = memory(scope("s", "u"), 1);
+        let batch = reserve(&admin, &memory, 100);
+        admin
+            .finish(&batch, 101, LearningOutcome::Failed(reason.clone()))
+            .unwrap();
+        if reason == LearningFailure::TransientProvider {
+            if let EvidenceSource::CompletedInteraction { user_text, .. } =
+                &mut memory.evidence[0].source
+            {
+                *user_text = "已篡改".into();
+            }
+            assert_eq!(
+                admin.reserve_repair(&memory, 2 * REPAIR_COOLDOWN_MS, "extractor-v1"),
+                Err(LearningError::Conflict)
+            );
+        } else {
+            assert!(
+                admin
+                    .reserve_repair(&memory, 2 * REPAIR_COOLDOWN_MS, "extractor-v1")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+}

@@ -35,6 +35,7 @@ fn fixture(text: &str) -> Fixture {
     };
     let evidence = vec![completed("new-10", 10, 10), completed("new-11", 11, 11)];
     let batch = LearningBatch {
+        attempt: 0,
         id: "new-batch".into(),
         scope: scope.clone(),
         extractor_version: "fixture-v1".into(),

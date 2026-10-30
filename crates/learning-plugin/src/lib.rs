@@ -33,6 +33,18 @@ impl LearningController {
     }
 }
 impl LearningAdmin for LearningController {
+    fn maintenance_receipts(&self, scope: &MemoryScope) -> LearningResult<Vec<MaintenanceReceipt>> {
+        self.service()?.maintenance_receipts(scope)
+    }
+    fn reserve_repair(
+        &self,
+        memory: &MemorySnapshot,
+        now_ms: u64,
+        extractor_version: &str,
+    ) -> LearningResult<Option<LearningBatch>> {
+        self.service()?
+            .reserve_repair(memory, now_ms, extractor_version)
+    }
     fn snapshot(&self, scope: &MemoryScope) -> LearningResult<LearningSnapshot> {
         self.service()?.snapshot(scope)
     }

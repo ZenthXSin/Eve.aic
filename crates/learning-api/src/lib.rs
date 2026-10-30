@@ -4,9 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::{fmt, future::Future, pin::Pin};
 
 mod decisions;
+mod maintenance;
 pub use decisions::{
     DecisionReason, LearningDecision, LearningDecisionAction, LearningDecisionRecord,
 };
+pub use maintenance::*;
 
 pub const LEARNING_PLUGIN_ID: &str = "eve.learning";
 pub const LEARNING_STATE_KEY: &str = "learning.v1";
@@ -58,6 +60,9 @@ impl LearningOptions {
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LearningBatch {
+    /// 只读模型提炼的尝试代数；旧记录为0，用于拒绝迟到的旧尝试回执。
+    #[serde(default)]
+    pub attempt: u8,
     pub id: String,
     pub scope: MemoryScope,
     pub extractor_version: String,
@@ -86,6 +91,7 @@ pub struct PreferenceCandidate {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LearningFailure {
     Provider,
+    TransientProvider,
     InvalidOutput,
     Timeout,
     Cancelled,
@@ -112,11 +118,27 @@ pub struct LearningSnapshot {
 }
 pub enum LearningOutcome {
     Completed(Vec<CandidateDraft>),
+    Maintained(MaintenanceExtraction),
     Failed(LearningFailure),
 }
 
 /// 仅可信宿主持有。不发布跨作用域管理能力给模型或不受信插件。
 pub trait LearningAdmin: Send + Sync {
+    fn maintenance_receipts(
+        &self,
+        _scope: &MemoryScope,
+    ) -> LearningResult<Vec<MaintenanceReceipt>> {
+        Err(LearningError::Unavailable)
+    }
+    /// 只补做无工具模型提炼；原尝试保留，至多两次，取消/无效输出不补做。
+    fn reserve_repair(
+        &self,
+        _memory: &MemorySnapshot,
+        _now_ms: u64,
+        _extractor_version: &str,
+    ) -> LearningResult<Option<LearningBatch>> {
+        Ok(None)
+    }
     fn snapshot(&self, scope: &MemoryScope) -> LearningResult<LearningSnapshot>;
     /// 只返回当前可信宿主绑定范围的决策，按范围内连续 sequence 排序。
     /// 决策记录是提交前的意图，不证明偏好已经写入记忆。
@@ -136,7 +158,7 @@ pub trait LearningAdmin: Send + Sync {
         Err(LearningError::Unavailable)
     }
     /// 原子保存 Running 与确切消费证据，成功返回后才可进行一次模型调用。
-    /// 仅新增 CompletedInteraction 触发；失败、空候选、重启都不再消费同一证据。
+    /// 仅新增 CompletedInteraction 触发；此入口不重新消费旧证据。只读失败补做使用reserve_repair。
     fn reserve(
         &self,
         memory: &MemorySnapshot,
@@ -155,6 +177,19 @@ pub trait LearningAdmin: Send + Sync {
 pub trait PreferenceExtractor: Send + Sync {
     fn version(&self) -> &str;
     fn extract(&self, batch: LearningBatch) -> LearningFuture<'_, Vec<CandidateDraft>>;
+    fn extract_maintenance(
+        &self,
+        batch: LearningBatch,
+    ) -> LearningFuture<'_, MaintenanceExtraction> {
+        Box::pin(async move {
+            self.extract(batch)
+                .await
+                .map(|candidates| MaintenanceExtraction {
+                    candidates,
+                    reflection: None,
+                })
+        })
+    }
 }
 /// 用户已在宿主启用自主学习时使用的可替换自动确认策略。
 /// 纯判断，不持有写能力；候选、批次和当前记忆均由可信宿主绑定到同一范围。
