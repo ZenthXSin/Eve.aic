@@ -97,6 +97,42 @@ fn document(rows: &[StoredRow], namespace: &str, key: &str) -> Value {
     serde_json::from_slice(&row.2).unwrap()
 }
 
+// SQL 里保存真实索引，验收原始来源时必须同时核对宿主的冷正文。
+fn learning_document(root: &Path, rows: &[StoredRow]) -> Value {
+    let value = document(rows, "eve.learning", "learning.v1");
+    if value["format_version"] != 2 {
+        return value;
+    }
+    assert_eq!(value["kind"], "jobs");
+    let jobs: Vec<Value> = value["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let hash = r["hash"].as_str().unwrap();
+            assert_eq!(hash.len(), 64);
+            assert!(
+                hash.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            );
+            let bytes = std::fs::read(
+                root.join("state/learning-archive")
+                    .join(format!("{hash}.json")),
+            )
+            .unwrap();
+            assert_eq!(bytes.len() as u64, r["bytes"].as_u64().unwrap());
+            let actual: String = ring::digest::digest(&ring::digest::SHA256, &bytes)
+                .as_ref()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(actual, hash);
+            serde_json::from_slice(&bytes).unwrap()
+        })
+        .collect();
+    json!({"format_version":1,"jobs":jobs})
+}
+
 #[derive(Clone, Copy)]
 enum Entry {
     Qq,
@@ -775,7 +811,7 @@ async fn sql_learning_requires_confirmation_and_does_not_replay(
             );
             let batch: Value = serde_json::from_str(input[1]["content"].as_str().unwrap()).unwrap();
             let saved = rows(database);
-            let learning = document(&saved, "eve.learning", "learning.v1");
+            let learning = learning_document(root, &saved);
             let record = learning["jobs"]
                 .as_array()
                 .unwrap()
@@ -818,7 +854,7 @@ async fn sql_learning_requires_confirmation_and_does_not_replay(
             );
         }
         wait_sql(database, |saved| {
-            let learning = document(saved, "eve.learning", "learning.v1");
+            let learning = learning_document(root, saved);
             let jobs = learning["jobs"].as_array().unwrap();
             jobs.len() == 2
                 && jobs
@@ -837,7 +873,7 @@ async fn sql_learning_requires_confirmation_and_does_not_replay(
         document(&extracted, "eve.cognition", "cognition.v1"),
         document(&before, "eve.cognition", "cognition.v1")
     );
-    let learning = document(&extracted, "eve.learning", "learning.v1");
+    let learning = learning_document(root, &extracted);
     let candidate = &learning["jobs"]
         .as_array()
         .unwrap()
@@ -882,7 +918,7 @@ async fn sql_learning_requires_confirmation_and_does_not_replay(
         preference["history"][0]["evidence_id"],
         snapshot["evidence"][3]["id"]
     );
-    assert_eq!(document(&accepted, "eve.learning", "learning.v1"), learning);
+    assert_eq!(learning_document(root, &accepted), learning);
 
     // 空消息重启保持桥接存活两轮扫描：旧批次不重请求，所有 SQL 原始行逐字节不变。
     let ready = root.join("sql-learning-idle-ready");
@@ -938,10 +974,7 @@ async fn sql_learning_requires_confirmation_and_does_not_replay(
         document(&final_rows, "eve.memory", "memory.v1"),
         revoked_memory
     );
-    assert_eq!(
-        document(&final_rows, "eve.learning", "learning.v1"),
-        learning
-    );
+    assert_eq!(learning_document(root, &final_rows), learning);
     assert!(server.requests.try_recv().is_err());
     assert!(!root.join("state/state.json").exists());
     for (_, _, bytes) in &final_rows {
@@ -968,7 +1001,7 @@ async fn sql_autonomous_confirmation_reconciles_completed_jobs_and_preserves_rev
 ) {
     let mut server = Server::start(vec![]).await;
     let before = rows(database);
-    let learning = document(&before, "eve.learning", "learning.v1");
+    let learning = learning_document(root, &before);
     let memory = document(&before, "eve.memory", "memory.v1");
     let old_scope = learning["jobs"]
         .as_array()
@@ -1012,7 +1045,7 @@ async fn sql_autonomous_confirmation_reconciles_completed_jobs_and_preserves_rev
     let (output, ()) = tokio::join!(Process::run(automatic, "", password), inspect);
     successful(output, Entry::Qq);
     let saved = rows(database);
-    assert_eq!(document(&saved, "eve.learning", "learning.v1"), learning);
+    assert_eq!(learning_document(root, &saved), learning);
     let current = document(&saved, "eve.memory", "memory.v1");
     for scope in memory["scopes"].as_array().unwrap() {
         let next = current["scopes"]
