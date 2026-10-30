@@ -259,7 +259,7 @@ impl Tool for ScriptTool {
                     if let Some(id) = args.call_id {
                         return Ok(json!({"receipt":self.service.store.receipt(owner,&id)?}));
                     }
-                    let versions = self.service.store.list(owner)?;
+                    let versions = self.service.store.summaries(owner)?;
                     let versions = versions
                         .iter()
                         .map(|version| -> Result<Value> {
