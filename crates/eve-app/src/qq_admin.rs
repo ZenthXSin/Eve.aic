@@ -29,8 +29,28 @@ pub(crate) struct Admin {
     bindings: Mutex<Bindings>,
     key: Option<Vec<u8>>,
     attempts: Mutex<BTreeMap<String, (Instant, u8)>>,
+    /// 仅测试用：不读配置服务，直接给固定判定的主人身份。
+    stub_owner: Option<bool>,
 }
 impl Admin {
+    /// 只有主人判断的最小实现：测试用一份空的绑定数据，不读配置服务、不接触绑定文件。
+    /// `owner=true` 时直接按主人处理，`owner=false` 时按未绑定处理。
+    #[cfg(test)]
+    pub(crate) fn stub(owner: bool) -> Arc<Self> {
+        Arc::new(Self {
+            registry: Arc::new(eve_kernel::backends::MemoryServiceRegistry::default()),
+            conversations: QqConversations::default(),
+            legacy: BTreeSet::new(),
+            path: PathBuf::new(),
+            bindings: Mutex::new(Bindings {
+                version: 1,
+                subjects: BTreeSet::new(),
+            }),
+            key: None,
+            attempts: Mutex::new(BTreeMap::new()),
+            stub_owner: Some(owner),
+        })
+    }
     pub(crate) fn open(
         state: &std::path::Path,
         conversations: QqConversations,
@@ -70,6 +90,7 @@ impl Admin {
             bindings: Mutex::new(bindings),
             key,
             attempts: Mutex::new(BTreeMap::new()),
+            stub_owner: None,
         }))
     }
     fn subject(&self, scope: &ContextScope) -> Option<String> {
@@ -92,6 +113,9 @@ impl Admin {
         .unwrap_or(false)
     }
     pub(crate) fn is_owner(&self, scope: &ContextScope) -> bool {
+        if let Some(owner) = self.stub_owner {
+            return owner;
+        }
         let result = (|| {
             let id = eve_plugin_api::ServiceId::new(eve_config_api::CONFIG_SERVICE_ID).ok()?;
             let service = self.registry.get(&id).ok()??;

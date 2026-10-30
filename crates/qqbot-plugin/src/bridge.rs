@@ -312,6 +312,11 @@ pub(crate) struct Services {
     pub debounce: Option<Arc<dyn crate::QqDebounce>>,
     pub stickers: Option<Arc<dyn crate::QqStickers>>,
     pub failure_recovery: Option<Arc<dyn crate::QqFailureRecovery>>,
+    /// 群白名单与主人目录；两者都为 Some 时，未放行的群消息在解析阶段丢弃。
+    pub group_whitelist: Option<Arc<dyn crate::QqGroupWhitelist>>,
+    pub owner_directory: Option<Arc<dyn crate::QqOwnerDirectory>>,
+    /// 宿主工具用的群白名单接口；与上面两项共用同一份持久名单。
+    pub group_access: Option<Arc<dyn crate::QqGroupAccess>>,
     pub admission: Option<Arc<dyn crate::QqAdmission>>,
 }
 /// 宿主接线的主动交流；`push_interval` 为空时不主动私聊。
@@ -822,6 +827,137 @@ async fn completed(
     .await
 }
 
+/// 认领主人群时回填给白名单接口的更新顺序号；取本进程唯一值即可，只用于新记录。
+fn claim_tick() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// 主人发起的白名单命令；解析与权限核对都在通道内完成。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AccessCommand {
+    Open,
+    /// 放行主人最近说过话的群；群号由宿主会话目录给出。
+    OpenRecent,
+    Close,
+    List,
+}
+
+/// `/allow` 管理当前群，`/allow list` 列出已放行的群，`/allow all` 放行主人最近的群。
+/// 不接受参数指定群号：群号只能来自会话。
+fn access_command(text: &str) -> Option<(AccessCommand, Option<String>)> {
+    let mut words = text.split_whitespace();
+    if words.next()? != "/allow" {
+        return None;
+    }
+    let argument = words.next();
+    if words.next().is_some() {
+        return None;
+    }
+    match argument {
+        None => Some((AccessCommand::Open, None)),
+        Some("-d") | Some("close") => Some((AccessCommand::Close, None)),
+        Some("all") => Some((AccessCommand::OpenRecent, None)),
+        Some("list") => Some((AccessCommand::List, None)),
+        Some(_) => None,
+    }
+}
+
+/// 放行主人最近说过话的群：群号取自通道校验过的群会话目录，跳过当前群与已放行的群；
+/// 名单读不出来时返回 None，不猜。
+fn admit_recent(
+    conversations: &crate::QqConversations,
+    whitelist: &dyn crate::QqGroupWhitelist,
+    current: Option<&str>,
+    at_ms: u64,
+) -> Option<Vec<String>> {
+    let identities = conversations.recent_identities().ok()?;
+    let mut added = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for identity in identities {
+        if added.len() >= 20 {
+            break;
+        }
+        if identity.source != crate::QqInteractionSource::GroupMessage {
+            continue;
+        }
+        let Some(group) = conversations.group_route(&identity.conversation) else {
+            continue;
+        };
+        if current == Some(group.as_str()) || !seen.insert(group.clone()) {
+            continue;
+        }
+        if whitelist.add(&group, at_ms).ok()? {
+            added.push(group);
+        }
+    }
+    Some(added)
+}
+
+/// 白名单读写失败会如实说明，不假装已经生效。
+fn access_reply(
+    whitelist: &dyn crate::QqGroupWhitelist,
+    command: AccessCommand,
+    requested: Option<String>,
+    group: Option<&str>,
+    recent: Option<Vec<String>>,
+    at_ms: u64,
+) -> String {
+    let listed = |whitelist: &dyn crate::QqGroupWhitelist| match whitelist.list() {
+        Ok(groups) if groups.is_empty() => {
+            "群白名单现在为空：群里只有你本人能跟我说话。".to_string()
+        }
+        Ok(groups) => format!("已放行的群（{} 个）：\n{}", groups.len(), groups.join("\n")),
+        Err(_) => "群白名单读取失败；现有名单未确认".into(),
+    };
+    match command {
+        AccessCommand::List => listed(whitelist),
+        AccessCommand::OpenRecent => match recent {
+            Some(groups) if groups.is_empty() => "没有找到其他主人群会话；白名单没有变化".into(),
+            Some(groups) => format!(
+                "已放行这些群（{} 个）：\n{}",
+                groups.len(),
+                groups.join("\n")
+            ),
+            None => "群白名单读取失败；白名单没有改动".into(),
+        },
+        AccessCommand::Close => {
+            let Some(group) = group else {
+                return "只有群里才有群白名单；私聊不能指定群".into();
+            };
+            match whitelist.remove(group) {
+                Ok(true) => format!("已取消本群放行；之后群里只有你本人能跟我说话。{group}"),
+                Ok(false) => format!("本群本来就没放行，现在也没放行。{group}"),
+                Err(_) => format!("取消放行失败；名单未改动。{group}"),
+            }
+        }
+        AccessCommand::Open if requested.is_none() => {
+            let Some(group) = group else {
+                return "只有群里才有群白名单；要放行其他群，得先登记主人账号再用指定群号的方式放行".into();
+            };
+            match whitelist.add(group, at_ms) {
+                Ok(true) => format!("已放行这个群：群友之后跟我说话都会被回应。{group}"),
+                Ok(false) => format!("这个群之前就放行了。{group}"),
+                Err(_) => format!("放行失败；名单未改动。{group}"),
+            }
+        }
+        AccessCommand::Open => {
+            let group = requested.as_deref().expect("checked above");
+            match whitelist.add(group, at_ms) {
+                Ok(true) => format!("已放行指定的群：群友之后跟我说话都会被回应。{group}"),
+                Ok(false) => format!("指定的群之前就放行了。{group}"),
+                Err(_) => format!("放行失败；名单未改动。{group}"),
+            }
+        }
+    }
+}
+
 pub(crate) async fn run(
     config: Arc<QqBotConfig>,
     ctx: PluginContext,
@@ -854,6 +990,9 @@ pub(crate) async fn run(
         debounce,
         stickers,
         failure_recovery,
+        group_whitelist,
+        owner_directory,
+        group_access,
         admission,
     } = services;
     // 只从已验证的持久回执重建路由身份索引，不重放消息、写记忆或触发工具。
@@ -1125,6 +1264,32 @@ pub(crate) async fn run(
                 if !command.natural && message.text.trim() == "/last-reply" {
                     let text = ledger.last_failed(&config.app_id, &message)?
                         .unwrap_or_else(|| "当前会话没有可取回的失败回复。".into());
+                    replies.push_back(Reply { message, text, guard: ReplyGuard::Command, interaction: None, invite: None });
+                    continue;
+                }
+                // 群白名单只认主人本人：身份来自配置里登记的账号，群号来自这条消息的真实目标。
+                if !command.natural
+                    && let (Some(whitelist), Some((access, requested))) =
+                        (&group_whitelist, access_command(&message.text))
+                {
+                    let session = message.session_key(&config.app_id)?;
+                    let text = match &owner_directory {
+                        Some(owners) if owners.is_owner(&session.user_id).unwrap_or(false) => {
+                            let group = (message.scope == "group").then_some(message.target_id.as_str());
+                            let recent = (access == AccessCommand::OpenRecent)
+                                .then(|| admit_recent(&conversations, whitelist.as_ref(), group, now_ms()))
+                                .flatten();
+                            access_reply(
+                                whitelist.as_ref(),
+                                access,
+                                requested,
+                                group,
+                                recent,
+                                now_ms(),
+                            )
+                        }
+                        _ => "只有主人本人能改群白名单。".into(),
+                    };
                     replies.push_back(Reply { message, text, guard: ReplyGuard::Command, interaction: None, invite: None });
                     continue;
                 }
@@ -2026,6 +2191,12 @@ pub(crate) async fn run(
                             if !message.valid() || message.scope != "group" || message.text.trim_start().starts_with('/') {
                                 continue;
                             }
+                            // 未放行的群不记录会话、不进群聊观察，与普通消息同一判定。
+                            if let Some(whitelist) = &group_whitelist
+                                && !whitelist.contains(&message.target_id).unwrap_or(false)
+                            {
+                                continue;
+                            }
                             conversations.record_message(&config.app_id, &message)?;
                             let at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |v| v.as_millis() as u64);
                             if observer.observe(&message, frame["sender_name"].as_str(), frame["mentions_me"].as_bool().unwrap_or(false), at_ms).is_err() {
@@ -2067,6 +2238,51 @@ pub(crate) async fn run(
                                 status.send_modify(|s| s.received += 1);
                                 timing(timing_diagnostics, "message_received", None);
                                 conversations.record_message(&config.app_id, &message)?;
+                                // 主人本人在群里说过话的会话，供群白名单工具定位群；只来自校验过的消息。
+                                if message.scope == "group"
+                                    && let Some(owners) = &owner_directory
+                                    && owners.is_owner(&message.session_key(&config.app_id)?.user_id).unwrap_or(false)
+                                    && let Some(access) = &group_access
+                                {
+                                    let conversation = message.conversation_key(&config.app_id)?;
+                                    // 同时记进会话目录：白名单工具按会话前缀找群号，重启后也不用等新消息。
+                                    conversations.record_group_identity(
+                                        &config.app_id,
+                                        message.session_key(&config.app_id)?,
+                                        &message.target_id,
+                                        &message.user_id,
+                                        conversation.clone(),
+                                    )?;
+                                    let _ = access.claim_owner_group(
+                                        message.session_key(&config.app_id)?,
+                                        conversation,
+                                        message.target_id.clone(),
+                                        claim_tick(),
+                                    );
+                                }
+                                // 群白名单：主人本人始终放行；其他人的消息只在已放行的群进入。
+                                if message.scope == "group"
+                                    && let (Some(whitelist), Some(owners)) =
+                                        (&group_whitelist, &owner_directory)
+                                {
+                                    let owner = owners.is_owner(&message.session_key(&config.app_id)?.user_id).unwrap_or(false);
+                                    let admitted = whitelist.contains(&message.target_id);
+                                    match admitted {
+                                        Ok(true) => {}
+                                        Ok(false) if owner => {}
+                                        Ok(false) => {
+                                            warn(&ctx, "group_not_whitelisted");
+                                            finish(&mut stdin, &message.id).await?;
+                                            continue;
+                                        }
+                                        // 名单读不出来时不猜测放行，也不进模型；结束回执后继续服务主人。
+                                        Err(_) => {
+                                            warn(&ctx, "group_whitelist_unavailable");
+                                            finish(&mut stdin, &message.id).await?;
+                                            continue;
+                                        }
+                                    }
+                                }
                                 if let Some(observer) = &attachment_observer { observer.observe(&message.session_key(&config.app_id)?, &message); }
                                 if let (Some(observer), Some(raw)) = (&raw_observer, raw_debug.as_ref()) {
                                     observe_raw(observer.as_ref(), &message.session_key(&config.app_id)?, raw, private_text.is_some());
@@ -2283,6 +2499,88 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn access_command_parses_only_exact_forms() {
+        use super::{AccessCommand, access_command};
+        assert_eq!(access_command("/allow"), Some((AccessCommand::Open, None)));
+        assert_eq!(
+            access_command("/allow all"),
+            Some((AccessCommand::OpenRecent, None))
+        );
+        assert_eq!(
+            access_command("/allow -d"),
+            Some((AccessCommand::Close, None))
+        );
+        assert_eq!(
+            access_command("/allow list"),
+            Some((AccessCommand::List, None))
+        );
+        for bad in [
+            "/allow 12 3",
+            "/allow abc",
+            "/allow １２３",
+            "/allow 1 2",
+            "/allow group:987",
+            "/allow 123456",
+            "/allowed",
+            "allow",
+            "/cancel",
+        ] {
+            assert_eq!(access_command(bad), None, "{bad}");
+        }
+    }
+
+    struct MemoryWhitelist(std::sync::Mutex<std::collections::BTreeSet<String>>);
+    impl crate::QqGroupWhitelist for MemoryWhitelist {
+        fn contains(&self, group_id: &str) -> eve_plugin_api::PluginResult<bool> {
+            Ok(self.0.lock().unwrap().contains(group_id))
+        }
+        fn add(&self, group_id: &str, _: u64) -> eve_plugin_api::PluginResult<bool> {
+            Ok(self.0.lock().unwrap().insert(group_id.into()))
+        }
+        fn remove(&self, group_id: &str) -> eve_plugin_api::PluginResult<bool> {
+            Ok(self.0.lock().unwrap().remove(group_id))
+        }
+        fn list(&self) -> eve_plugin_api::PluginResult<Vec<String>> {
+            Ok(self.0.lock().unwrap().iter().cloned().collect())
+        }
+    }
+
+    #[test]
+    fn access_reply_reports_real_effect_and_refuses_private_group_management() {
+        use super::{AccessCommand, access_reply};
+        let whitelist = MemoryWhitelist(Default::default());
+        assert_eq!(
+            access_reply(&whitelist, AccessCommand::Open, None, Some("111"), None, 1),
+            "已放行这个群：群友之后跟我说话都会被回应。111"
+        );
+        assert!(whitelist.0.lock().unwrap().contains("111"));
+        assert!(
+            access_reply(&whitelist, AccessCommand::Open, None, None, None, 1).contains("只有群里")
+        );
+        assert!(!whitelist.0.lock().unwrap().contains(""));
+        assert_eq!(
+            access_reply(&whitelist, AccessCommand::Close, None, Some("111"), None, 1),
+            "已取消本群放行；之后群里只有你本人能跟我说话。111"
+        );
+        assert!(!whitelist.0.lock().unwrap().contains("111"));
+        assert!(
+            access_reply(&whitelist, AccessCommand::List, None, None, None, 1).contains("为空")
+        );
+        assert!(
+            access_reply(
+                &whitelist,
+                AccessCommand::Open,
+                Some("222".into()),
+                None,
+                None,
+                1
+            )
+            .contains("222")
+        );
+        assert!(whitelist.0.lock().unwrap().contains("222"));
     }
 
     #[test]

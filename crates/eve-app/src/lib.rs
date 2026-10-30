@@ -33,6 +33,7 @@ mod qq_failure_recovery;
 mod qq_failure_replay;
 mod qq_files;
 mod qq_group;
+mod qq_group_access;
 mod qq_group_admission;
 mod qq_group_digest;
 mod qq_group_recall;

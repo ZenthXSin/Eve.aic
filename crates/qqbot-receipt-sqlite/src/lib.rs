@@ -5,6 +5,9 @@ use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{path::Path, sync::Mutex, time::Duration};
 
+mod whitelist;
+pub use whitelist::SqliteGroupWhitelist;
+
 pub struct SqliteReceiptArchive(Mutex<Connection>);
 fn unavailable() -> PluginError {
     PluginError::State("QQ 回执归档数据库不可用；保留活跃记录，不重建或清空旧库".into())
