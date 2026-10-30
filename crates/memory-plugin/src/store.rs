@@ -8,7 +8,7 @@ use eve_plugin_api::{PluginContext, PluginError, PluginResult};
 use eve_session_api::SessionTurnStatus;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -19,8 +19,8 @@ const ARCHIVED_FORMAT_VERSION: u32 = 2;
 const COMPRESSED_FORMAT_VERSION: u32 = 3;
 /// 格式 4：偏好可引用已归档来源；旧程序拒绝读取而不会误写。
 const ARCHIVED_REFERENCES_FORMAT_VERSION: u32 = 4;
-/// 解开后缓存在内存中的分块证据总条数上限；按最近使用淘汰，只影响读取速度。
-const DECODED_CACHE_EVIDENCE: usize = 16_384;
+/// 解码缓存的估算堆字节预算（正文、Vec 与标识容量），不按证据条数放大。
+const DECODED_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 fn format_for(document: &Document) -> u32 {
     if document.next_chunk == 0 {
@@ -54,7 +54,7 @@ fn format_for(document: &Document) -> u32 {
 
 type DecodedKey = (String, MemoryScope);
 /// 解开的证据与最近一次使用的序号。
-type DecodedEntry = (Arc<Vec<InteractionEvidence>>, u64);
+type DecodedEntry = (Arc<Vec<InteractionEvidence>>, u64, usize);
 
 /// 已核对并解开的分块；分块不可变，按名称与作用域缓存。
 #[derive(Default)]
@@ -62,6 +62,57 @@ struct DecodedChunks {
     entries: BTreeMap<DecodedKey, DecodedEntry>,
     tick: u64,
     total: usize,
+}
+
+impl DecodedChunks {
+    fn insert(&mut self, key: DecodedKey, loaded: Arc<Vec<InteractionEvidence>>) {
+        let bytes = decoded_bytes(&key, &loaded);
+        // 大块仍可核验并被本次调用使用，但不常驻缓存。
+        if bytes > DECODED_CACHE_BYTES {
+            return;
+        }
+        if let Some((_, _, previous)) = self.entries.remove(&key) {
+            self.total -= previous;
+        }
+        self.total += bytes;
+        self.entries.insert(key, (loaded, self.tick, bytes));
+        while self.total > DECODED_CACHE_BYTES {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, used, _))| *used)
+                .map(|(key, _)| key.clone());
+            if let Some((_, _, bytes)) = oldest.and_then(|key| self.entries.remove(&key)) {
+                self.total -= bytes;
+            }
+        }
+    }
+}
+
+fn decoded_bytes(key: &DecodedKey, loaded: &Vec<InteractionEvidence>) -> usize {
+    let mut bytes = std::mem::size_of::<DecodedKey>()
+        + std::mem::size_of::<DecodedEntry>()
+        + std::mem::size_of::<Vec<InteractionEvidence>>()
+        + loaded.capacity() * std::mem::size_of::<InteractionEvidence>()
+        + key.0.capacity()
+        + key.1.channel.capacity()
+        + key.1.session_id.capacity()
+        + key.1.user_id.capacity();
+    for entry in loaded {
+        bytes += entry.id.capacity();
+        bytes += match &entry.source {
+            EvidenceSource::UserStatement { message_id, text } => {
+                message_id.capacity() + text.capacity()
+            }
+            EvidenceSource::CompletedInteraction {
+                message_id,
+                user_text,
+                assistant_text,
+                ..
+            } => message_id.capacity() + user_text.capacity() + assistant_text.capacity(),
+        };
+    }
+    bytes
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -300,6 +351,79 @@ pub(super) struct StoredMemory {
     inner: Mutex<Inner>,
     decoded: Mutex<DecodedChunks>,
 }
+/// 一次扫描只持有热层、紧凑块索引和当前块正文；并发新增归档不会改变该读取视图。
+struct StoredCursor {
+    stored: Arc<StoredMemory>,
+    store: Option<Arc<dyn EvidenceArchiveStore>>,
+    summary: MemoryScanSummary,
+    hot: VecDeque<InteractionEvidence>,
+    chunks: VecDeque<ChunkRecord>,
+    loaded: Arc<Vec<InteractionEvidence>>,
+    offset: usize,
+    failed: bool,
+}
+impl MemoryEvidenceCursor for StoredCursor {
+    fn summary(&self) -> &MemoryScanSummary {
+        &self.summary
+    }
+    fn next_page(&mut self) -> MemoryResult<Vec<InteractionEvidence>> {
+        if self.failed {
+            return Err(MemoryError::Unavailable);
+        }
+        let result = self.read_page();
+        if result.is_err() {
+            // 本页可能已经消费部分来源，错误后不得继续返回缺失原文的视图。
+            self.failed = true;
+            self.loaded = Arc::new(vec![]);
+            self.hot.clear();
+            self.chunks.clear();
+        }
+        result
+    }
+}
+impl StoredCursor {
+    fn read_page(&mut self) -> MemoryResult<Vec<InteractionEvidence>> {
+        // 已停止的服务句柄不得凭缓存继续读取。
+        drop(self.stored.lock()?);
+        let mut page = Vec::new();
+        while page.len() < MAX_ARCHIVE_PAGE {
+            if self.offset == self.loaded.len() {
+                self.loaded = Arc::new(vec![]);
+                self.offset = 0;
+                if let Some(chunk) = self.chunks.pop_front() {
+                    self.loaded = self.stored.load(
+                        self.store
+                            .as_ref()
+                            .ok_or(MemoryError::Unavailable)?
+                            .as_ref(),
+                        &self.summary.scope,
+                        &chunk,
+                    )?;
+                }
+            }
+            let archived = self.loaded.get(self.offset);
+            let hot = self.hot.front();
+            match (hot, archived) {
+                (None, None) => break,
+                (Some(hot), Some(archived)) if hot.revision == archived.revision => {
+                    return Err(MemoryError::CorruptState);
+                }
+                (Some(hot), Some(archived)) if hot.revision < archived.revision => {
+                    page.push(self.hot.pop_front().ok_or(MemoryError::CorruptState)?);
+                }
+                (Some(_), None) => {
+                    page.push(self.hot.pop_front().ok_or(MemoryError::CorruptState)?)
+                }
+                (_, Some(archived)) => {
+                    page.push(archived.clone());
+                    self.offset += 1;
+                }
+            }
+        }
+        Ok(page)
+    }
+}
+
 impl StoredMemory {
     pub(super) fn open(
         context: PluginContext,
@@ -386,7 +510,7 @@ impl StoredMemory {
         if let Ok(mut cache) = self.decoded.lock() {
             cache.tick += 1;
             let tick = cache.tick;
-            if let Some((loaded, used)) = cache.entries.get_mut(&key) {
+            if let Some((loaded, used, _)) = cache.entries.get_mut(&key) {
                 *used = tick;
                 return Ok(loaded.clone());
             }
@@ -399,21 +523,46 @@ impl StoredMemory {
             }
         };
         if let Ok(mut cache) = self.decoded.lock() {
-            cache.total += loaded.len();
-            let tick = cache.tick;
-            cache.entries.insert(key, (loaded.clone(), tick));
-            while cache.total > DECODED_CACHE_EVIDENCE && cache.entries.len() > 1 {
-                let oldest = cache
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, (_, used))| *used)
-                    .map(|(key, _)| key.clone());
-                if let Some((evicted, _)) = oldest.and_then(|key| cache.entries.remove(&key)) {
-                    cache.total -= evicted.len();
-                }
-            }
+            cache.insert(key, loaded.clone());
         }
         Ok(loaded)
+    }
+    pub(super) fn scan(
+        self: &Arc<Self>,
+        scope: &MemoryScope,
+    ) -> MemoryResult<Box<dyn MemoryEvidenceCursor>> {
+        let inner = self.lock()?;
+        let (mut snapshot, chunks) = inner
+            .document
+            .scopes
+            .iter()
+            .find(|record| record.snapshot.scope == *scope)
+            .map(|record| (record.snapshot.clone(), record.archive.clone()))
+            .unwrap_or_else(|| (ScopeRecord::empty(scope.clone()).snapshot, vec![]));
+        snapshot.evidence.sort_by_key(|item| item.revision);
+        let store = inner.archive.as_ref().map(|a| a.store.clone());
+        if !chunks.is_empty() && store.is_none() {
+            return Err(MemoryError::Unavailable);
+        }
+        let evidence_count = snapshot
+            .archived_evidence
+            .checked_add(snapshot.evidence.len() as u64)
+            .ok_or(MemoryError::CorruptState)?;
+        Ok(Box::new(StoredCursor {
+            stored: self.clone(),
+            store,
+            summary: MemoryScanSummary {
+                scope: snapshot.scope,
+                revision: snapshot.revision,
+                preferences: snapshot.preferences,
+                evidence_count,
+            },
+            hot: snapshot.evidence.into(),
+            chunks: chunks.into(),
+            loaded: Arc::new(vec![]),
+            offset: 0,
+            failed: false,
+        }))
     }
     /// 本作用域的完整记忆：热层与全部归档分块按修订升序合并，`archived_evidence` 为 0。
     /// 热层与分块索引在同一把锁下取得，读取中途发生的归档不会重复或漏掉证据。
@@ -1084,5 +1233,68 @@ mod corruption_bounds_tests {
             next_chunk: 1,
         };
         assert!(validate_document(&document, None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cache_memory_tests {
+    use super::*;
+
+    fn key(name: &str) -> DecodedKey {
+        (
+            name.into(),
+            MemoryScope {
+                channel: "qq".into(),
+                session_id: "s".into(),
+                user_id: "u".into(),
+            },
+        )
+    }
+    fn chunk() -> Arc<Vec<InteractionEvidence>> {
+        Arc::new(
+            (0..64)
+                .map(|n| InteractionEvidence {
+                    id: format!("e-{n}"),
+                    revision: n + 1,
+                    at_ms: n,
+                    source: EvidenceSource::CompletedInteraction {
+                        message_id: format!("m-{n}"),
+                        session_revision: (n + 1) * 2,
+                        turn_id: n + 1,
+                        user_text: "x".repeat(30_000),
+                        assistant_text: "y".repeat(30_000),
+                    },
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn long_evidence_is_evicted_by_bytes_instead_of_entry_count() {
+        let mut cache = DecodedChunks::default();
+        let first = chunk();
+        let weak = Arc::downgrade(&first);
+        cache.insert(key("first"), first);
+        cache.tick = 1;
+        cache.insert(key("second"), chunk());
+        cache.tick = 2;
+        cache.insert(key("third"), chunk());
+        assert!(
+            weak.upgrade().is_none(),
+            "旧解码正文应释放，只留不可变磁盘原文"
+        );
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.total <= DECODED_CACHE_BYTES);
+    }
+
+    #[test]
+    fn concurrent_load_replacement_does_not_double_charge_cache() {
+        let mut cache = DecodedChunks::default();
+        let data = chunk();
+        cache.insert(key("same"), data.clone());
+        let bytes = cache.total;
+        cache.insert(key("same"), data);
+        assert_eq!(cache.total, bytes);
+        assert_eq!(cache.entries.len(), 1);
     }
 }

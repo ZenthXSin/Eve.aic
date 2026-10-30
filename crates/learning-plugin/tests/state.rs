@@ -914,10 +914,14 @@ async fn global_job_capacity_preserves_existing_jobs_and_read_only_replays() {
 
 #[tokio::test]
 async fn global_byte_capacity_rejects_new_bytes_without_removing_old_sources() {
-    let store = Arc::new(MemoryStateStore::default());
-    let (kernel, admin) = open(store.clone()).await;
-    let mut reached = false;
+    // 每个种子记录经真实插件准入和完成，再批量装入边界夹具；避免把32 MiB
+    // 账本逐条重写上千次。最后一次超限写入及后续恢复仍走实际存储代码。
+    let mut fixture = json!({"format_version":1,"jobs":[]});
+    let mut bytes_len = serde_json::to_vec(&fixture).unwrap().len();
+    let mut overflow = None;
     for index in 0..MAX_JOBS {
+        let seed_store = Arc::new(MemoryStateStore::default());
+        let (seed_kernel, seed) = open(seed_store.clone()).await;
         let mut source = memory(
             scope(&format!("byte-scope-{index}"), "u"),
             MAX_BATCH_EVIDENCE,
@@ -929,42 +933,66 @@ async fn global_byte_capacity_rejects_new_bytes_without_removing_old_sources() {
             };
             *user_text = "a".repeat(3600);
         }
-        let before = store.get(&owner(), LEARNING_STATE_KEY).unwrap();
-        let batch = match admin.reserve(&source, 100, "v1", &options()) {
-            Ok(Some(batch)) => batch,
-            Err(LearningError::LimitReached) => {
-                assert_eq!(store.get(&owner(), LEARNING_STATE_KEY).unwrap(), before);
-                assert!(admin.snapshot(&source.scope).unwrap().jobs.is_empty());
-                reached = true;
-                break;
-            }
-            other => panic!("unexpected reservation: {other:?}"),
-        };
-        assert_eq!(batch.evidence.len(), MAX_BATCH_EVIDENCE);
-        let before_finish = store.get(&owner(), LEARNING_STATE_KEY).unwrap();
-        let drafts = (0..MAX_CANDIDATES)
+        let batch = reserve(&seed, &source, 100);
+        let drafts: Vec<_> = (0..MAX_CANDIDATES)
             .map(|candidate| CandidateDraft {
                 text: format!("{candidate}{}", "x".repeat(999)),
                 ..draft(&batch)
             })
             .collect();
-        match admin.finish(&batch, 110, LearningOutcome::Completed(drafts)) {
-            Ok(()) => {}
-            Err(LearningError::LimitReached) => {
-                assert_eq!(
-                    store.get(&owner(), LEARNING_STATE_KEY).unwrap(),
-                    before_finish
-                );
-                let job = admin.snapshot(&source.scope).unwrap().jobs.remove(0);
-                assert_eq!(job.status, JobStatus::Running);
-                assert!(job.candidates.is_empty());
-                reached = true;
-                break;
-            }
-            other => panic!("unexpected completion: {other:?}"),
+        seed.finish(&batch, 110, LearningOutcome::Completed(drafts.clone()))
+            .unwrap();
+        let document: Value = serde_json::from_slice(
+            &seed_store
+                .get(&owner(), LEARNING_STATE_KEY)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let record = document["jobs"][0].clone();
+        let addition = serde_json::to_vec(&record).unwrap().len() + usize::from(index > 0);
+        seed_kernel.stop_all().await.unwrap();
+        if bytes_len + addition > MAX_STATE_BYTES {
+            overflow = Some((source, drafts));
+            break;
         }
+        fixture["jobs"].as_array_mut().unwrap().push(record);
+        bytes_len += addition;
     }
-    assert!(reached, "byte budget must be reached before the job limit");
+    let (source, drafts) = overflow.expect("byte budget must be reached before the job limit");
+    let encoded = serde_json::to_vec(&fixture).unwrap();
+    assert_eq!(encoded.len(), bytes_len);
+    assert!(
+        encoded.len() > 4 * 1024 * 1024,
+        "实际验证超过旧4 MiB边界的账本可以恢复"
+    );
+    let store = Arc::new(MemoryStateStore::default());
+    store
+        .set(&owner(), LEARNING_STATE_KEY.into(), encoded.clone())
+        .unwrap();
+    let (kernel, admin) = open(store.clone()).await;
+    match admin.reserve(&source, 100, "extractor-v1", &options()) {
+        Err(LearningError::LimitReached) => {
+            assert_eq!(
+                store.get(&owner(), LEARNING_STATE_KEY).unwrap().unwrap(),
+                encoded
+            );
+            assert!(admin.snapshot(&source.scope).unwrap().jobs.is_empty());
+        }
+        Ok(Some(batch)) => {
+            let before = store.get(&owner(), LEARNING_STATE_KEY).unwrap();
+            assert_eq!(
+                admin.finish(&batch, 110, LearningOutcome::Completed(drafts)),
+                Err(LearningError::LimitReached)
+            );
+            assert_eq!(store.get(&owner(), LEARNING_STATE_KEY).unwrap(), before);
+            assert_eq!(
+                admin.snapshot(&source.scope).unwrap().jobs[0].status,
+                JobStatus::Running
+            );
+        }
+        other => panic!("unexpected boundary admission: {other:?}"),
+    }
     let bytes = store.get(&owner(), LEARNING_STATE_KEY).unwrap().unwrap();
     assert!(bytes.len() <= MAX_STATE_BYTES);
     assert_eq!(
@@ -1082,4 +1110,195 @@ async fn global_byte_capacity_rejects_new_bytes_without_removing_old_sources() {
         MAX_STATE_BYTES
     );
     recovered_kernel.stop_all().await.unwrap();
+}
+
+fn reflection(batch: &LearningBatch) -> ReflectionDraft {
+    ReflectionDraft {
+        observations: "用户反复要求先给结论".into(),
+        actions: "回复中先给结论".into(),
+        outcomes: "未记录后续效果".into(),
+        lessons: "先给结论可能适用，仍需反馈".into(),
+        next_checks: "核对下一次用户反馈".into(),
+        evidence_ids: vec![batch.evidence[0].id.clone()],
+    }
+}
+
+#[tokio::test]
+async fn aged_backlog_and_reflection_commit_survive_real_file_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = RecordingStore::open(directory.path());
+    let (kernel, admin) = open(store.clone()).await;
+    let memory = memory(scope("daily", "alice"), 1);
+    assert!(
+        admin
+            .reserve(&memory, 100, "extractor-v1", &LearningOptions::default())
+            .unwrap()
+            .is_none()
+    );
+    let batch = admin
+        .reserve(
+            &memory,
+            MAINTENANCE_DELAY_MS + 1,
+            "extractor-v1",
+            &LearningOptions::default(),
+        )
+        .unwrap()
+        .unwrap();
+    let note = reflection(&batch);
+    let mut forged = note.clone();
+    forged.evidence_ids = vec!["foreign-evidence".into()];
+    assert!(
+        admin
+            .finish(
+                &batch,
+                MAINTENANCE_DELAY_MS + 2,
+                LearningOutcome::Maintained(MaintenanceExtraction {
+                    candidates: vec![],
+                    reflection: Some(forged)
+                })
+            )
+            .is_err()
+    );
+    assert_eq!(
+        admin.snapshot(&memory.scope).unwrap().jobs[0].status,
+        JobStatus::Running
+    );
+    admin
+        .finish(
+            &batch,
+            MAINTENANCE_DELAY_MS + 2,
+            LearningOutcome::Maintained(MaintenanceExtraction {
+                candidates: vec![],
+                reflection: Some(note.clone()),
+            }),
+        )
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    let (_restored_kernel, restored) = open(store).await;
+    let receipts = restored.maintenance_receipts(&memory.scope).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].reflection, Some(note));
+    assert_eq!(receipts[0].status, JobStatus::Completed);
+    assert!(
+        restored
+            .maintenance_receipts(&scope("other", "alice"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        restored
+            .reserve_repair(&memory, 2 * MAINTENANCE_DELAY_MS, "extractor-v1")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn repair_is_bounded_persistent_and_old_attempt_cannot_finish_new_one() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = RecordingStore::open(directory.path());
+    let (kernel, admin) = open(store.clone()).await;
+    let memory = memory(scope("repair", "alice"), 1);
+    let original = reserve(&admin, &memory, 100);
+    admin
+        .finish(
+            &original,
+            110,
+            LearningOutcome::Failed(LearningFailure::TransientProvider),
+        )
+        .unwrap();
+    assert!(
+        admin
+            .reserve_repair(&memory, 110 + REPAIR_COOLDOWN_MS - 1, "extractor-v1")
+            .unwrap()
+            .is_none()
+    );
+    let first = admin
+        .reserve_repair(&memory, 110 + REPAIR_COOLDOWN_MS, "extractor-v1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.attempt, 1);
+    assert_eq!(first.evidence, original.evidence);
+    assert_eq!(
+        admin.finish(
+            &original,
+            first.started_at_ms,
+            LearningOutcome::Completed(vec![])
+        ),
+        Err(LearningError::Conflict)
+    );
+    kernel.stop_all().await.unwrap();
+    let (_restored_kernel, restored) = open(store.clone()).await;
+    assert_eq!(
+        restored.snapshot(&memory.scope).unwrap().jobs[0].status,
+        JobStatus::Interrupted
+    );
+    let second = restored
+        .reserve_repair(
+            &memory,
+            first.started_at_ms + REPAIR_COOLDOWN_MS,
+            "extractor-v1",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.attempt, 2);
+    restored
+        .finish(
+            &second,
+            second.started_at_ms + 1,
+            LearningOutcome::Failed(LearningFailure::Timeout),
+        )
+        .unwrap();
+    assert!(
+        restored
+            .reserve_repair(&memory, 10 * REPAIR_COOLDOWN_MS, "extractor-v1")
+            .unwrap()
+            .is_none()
+    );
+    let receipt = restored
+        .maintenance_receipts(&memory.scope)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(receipt.previous_attempts.len(), 2);
+    assert_eq!(
+        receipt.previous_attempts[0].status,
+        JobStatus::Failed(LearningFailure::TransientProvider)
+    );
+    assert_eq!(receipt.previous_attempts[1].status, JobStatus::Interrupted);
+}
+
+#[tokio::test]
+async fn cancelled_invalid_output_and_changed_evidence_never_auto_repair() {
+    for reason in [
+        LearningFailure::Cancelled,
+        LearningFailure::InvalidOutput,
+        LearningFailure::Provider,
+        LearningFailure::TransientProvider,
+    ] {
+        let (_kernel, admin) = open(Arc::new(MemoryStateStore::default())).await;
+        let mut memory = memory(scope("s", "u"), 1);
+        let batch = reserve(&admin, &memory, 100);
+        admin
+            .finish(&batch, 101, LearningOutcome::Failed(reason.clone()))
+            .unwrap();
+        if reason == LearningFailure::TransientProvider {
+            if let EvidenceSource::CompletedInteraction { user_text, .. } =
+                &mut memory.evidence[0].source
+            {
+                *user_text = "已篡改".into();
+            }
+            assert_eq!(
+                admin.reserve_repair(&memory, 2 * REPAIR_COOLDOWN_MS, "extractor-v1"),
+                Err(LearningError::Conflict)
+            );
+        } else {
+            assert!(
+                admin
+                    .reserve_repair(&memory, 2 * REPAIR_COOLDOWN_MS, "extractor-v1")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
 }

@@ -950,6 +950,7 @@ mod tests {
                 let evidence_id = format!("completed-{index}");
                 LearningJob {
                     batch: LearningBatch {
+                        attempt: 0,
                         id: batch_id.clone(),
                         scope: scope.clone(),
                         extractor_version: "fixture-v1".into(),

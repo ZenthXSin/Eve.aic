@@ -1,4 +1,6 @@
 //! 带来源的交互记忆与明确偏好契约；身份绑定、明确意图判断和投递确认由可信宿主负责。
+mod scan;
+pub use scan::*;
 mod context_load;
 pub use context_load::*;
 mod experience;
@@ -186,6 +188,13 @@ pub struct PreferenceChange {
 /// 已绑定作用域的读取能力；调用方不能自行提供其他用户身份。
 pub trait MemoryService: Send + Sync {
     fn snapshot(&self) -> MemoryResult<MemorySnapshot>;
+    /// 一致性逐页证据视图。默认兼容旧实现，先取得完整快照；内置归档实现覆盖为逐块读取。
+    fn scan(&self) -> MemoryResult<Box<dyn MemoryEvidenceCursor>> {
+        Ok(Box::new(scan::SnapshotCursor::new(
+            self.complete_snapshot()?,
+        )?))
+    }
+
     /// 按修订升序读取本作用域修订大于 `after_revision` 的归档证据，最多 `limit` 条。
     /// 分块缺失、校验失败或不属于本作用域时返回 `CorruptState`，不跳过。
     fn archived(&self, after_revision: u64, limit: usize) -> MemoryResult<ArchivedEvidencePage> {

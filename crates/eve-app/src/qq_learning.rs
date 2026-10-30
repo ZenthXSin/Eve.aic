@@ -29,6 +29,7 @@ impl Background {
         learning: Arc<dyn LearningAdmin>,
         extractor: Arc<dyn PreferenceExtractor>,
         options: LearningOptions,
+        gate: crate::qq_budget::Gate,
         confirmation: Option<Arc<dyn AutoConfirmationPolicy>>,
     ) -> Result<Self, AppError> {
         options.validate()?;
@@ -41,7 +42,7 @@ impl Background {
                 memory,
                 learning,
                 extractor,
-                options,
+                (options, gate),
                 confirmation,
                 activated,
                 stopped,
@@ -84,11 +85,12 @@ async fn run(
     memory: Arc<dyn MemoryAdmin>,
     learning: Arc<dyn LearningAdmin>,
     extractor: Arc<dyn PreferenceExtractor>,
-    options: LearningOptions,
+    settings: (LearningOptions, crate::qq_budget::Gate),
     confirmation: Option<Arc<dyn AutoConfirmationPolicy>>,
     mut active: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
 ) -> Result<(), AppError> {
+    let (options, gate) = settings;
     loop {
         if *active.borrow() {
             break;
@@ -128,7 +130,7 @@ async fn run(
                 }
             }
         }
-        if remaining > 0 {
+        if remaining > 0 && gate.admits_category("memory-maintenance", 1)? {
             let mut scopes = memory.scopes()?;
             if scopes.len() > eve_memory_api::MAX_EVIDENCE {
                 return Err("提炼范围超过上限".into());
@@ -143,6 +145,9 @@ async fn run(
                 if scope.channel != "qq" {
                     continue;
                 }
+                if !gate.admits_category("memory-maintenance", 1)? {
+                    break;
+                }
                 // 读完整记忆：归档前还没提炼的交流同样会被提炼。
                 let snapshot = memory.reader(scope.clone())?.complete_snapshot()?;
                 if snapshot.scope != scope {
@@ -152,7 +157,12 @@ async fn run(
                     learning.reserve(&snapshot, now_ms()?, extractor.version(), &options);
                 let batch = match reserved {
                     Ok(Some(batch)) => batch,
-                    Ok(None) => continue,
+                    Ok(None) => {
+                        match learning.reserve_repair(&snapshot, now_ms()?, extractor.version())? {
+                            Some(batch) => batch,
+                            None => continue,
+                        }
+                    }
                     Err(LearningError::LimitReached) => {
                         remaining = 0;
                         break;
@@ -162,20 +172,20 @@ async fn run(
                 remaining -= 1;
                 let began = batch.started_at_ms;
                 let outcome = {
-                    let request = extractor.extract(batch.clone());
+                    let request = extractor.extract_maintenance(batch.clone());
                     tokio::pin!(request);
                     tokio::select! {
                         biased;
                         _ = stop_requested(&mut stopped) => LearningOutcome::Failed(LearningFailure::Cancelled),
                         result = tokio::time::timeout(Duration::from_secs(30), &mut request) => match result {
-                            Ok(Ok(candidates)) => LearningOutcome::Completed(candidates),
+                            Ok(Ok(value)) => LearningOutcome::Maintained(value),
                             Ok(Err(LearningError::Extraction(failure))) => LearningOutcome::Failed(failure),
                             Ok(Err(_)) => LearningOutcome::Failed(LearningFailure::Provider),
                             Err(_) => LearningOutcome::Failed(LearningFailure::Timeout),
                         },
                     }
                 };
-                // 远端请求可能已经发生。取消/超时也消费这批证据，恢复不自动重试。
+                // 当前尝试先持久收尾。只读提炼的补做由独立准入负责，原失败保留且次数受限。
                 learning.finish(&batch, now_ms()?.max(began), outcome)?;
                 if remaining == 0 {
                     break;

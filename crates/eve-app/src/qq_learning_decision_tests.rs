@@ -119,6 +119,7 @@ fn add_candidate(
         .jobs
         .push(LearningJob {
             batch: LearningBatch {
+                attempt: 0,
                 id: batch_id,
                 scope: scope.clone(),
                 extractor_version: "decision-component-fixture-v1".into(),

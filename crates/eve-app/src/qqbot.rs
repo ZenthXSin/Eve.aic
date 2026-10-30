@@ -1231,6 +1231,13 @@ async fn run_qqbot_composed(
         } else {
             None
         };
+        if let (Some(memory), Some(unified)) = (&memory, &unified_memory) {
+            bootstrap.tools.push(Arc::new(crate::qq_memory_sharing::SharingTool {
+                memory: memory.clone(), unified: unified.clone(),
+                identities: Arc::new(crate::qq_memory_continuity::Policy { registry: registry.clone(), conversations: conversations.clone(), unified: Some(unified.clone()) }),
+                reviewer: crate::developer::action_reviewer(registry.clone(), model_health.clone()),
+            }));
+        }
         let memory_continuity: Option<Arc<dyn eve_memory_api::MemoryContinuityFactory>> =
             memory.as_ref().map(|memory| {
                 Arc::new(eve_memory_plugin::MemoryContinuity::new(
@@ -1262,6 +1269,13 @@ async fn run_qqbot_composed(
             Some(Arc::new(controller))
         } else {
             None
+        };
+        if let Some(memory) = &memory {
+            bootstrap.tools.push(Arc::new(crate::qq_memory_maintenance::ToolService { memory:memory.clone(), learning:learning.clone() }));
+        }
+        let context: Arc<dyn ContextAssembler> = match &learning {
+            Some(learning) => Arc::new(crate::qq_memory_maintenance::Context { inner:context, learning:learning.clone() }),
+            None => context,
         };
         // 兴趣账本先于模型与通道加载；损坏或版本不兼容时拒绝启动并保留原字节。
         let interests = if options.interest_learning {
@@ -2048,6 +2062,8 @@ async fn run_qqbot_composed(
             bootstrap.tools.push(Arc::new(crate::qq_health::ReadTool(monitor.clone())));
             Some(monitor)
         } else {None};
+        let reasoning_settings = Arc::new(std::sync::OnceLock::new());
+        bootstrap.tools.push(Arc::new(crate::qq_model::ReasoningTool(reasoning_settings.clone())));
         for tool in &mut bootstrap.tools {
             *tool = Arc::new(crate::qq_access::GuardedTool {
                 inner: tool.clone(),
@@ -2123,6 +2139,12 @@ async fn run_qqbot_composed(
             options.web_listen.map(|_| page_permit.clone()),
         )
         .await?;
+        let model_commands = Arc::new(crate::qq_model::Commands {
+            settings: qq_tasks::config_service(registry.as_ref())?,
+            admin: Arc::new(model_settings_admin),
+            authorization: qq_admin.clone(),
+        });
+        reasoning_settings.set(model_commands.clone()).map_err(|_| "思考强度配置重复装配")?;
         if let Some(selector) = crate::qq_message_judge::context_selector(qq_tasks::config_service(registry.as_ref())?) {
             let _ = context_planner.selector.set(selector);
         }
@@ -2196,7 +2218,7 @@ async fn run_qqbot_composed(
                         "preference",
                         model_health.clone(),
                     ));
-                    Arc::new(ModelPreferenceExtractor::new(resolver))
+                    Arc::new(ModelPreferenceExtractor::new(budget_gate.wrap(resolver, "memory-maintenance")?))
                 }
             };
             learning_background = Some(qq_learning::Background::start(
@@ -2204,6 +2226,7 @@ async fn run_qqbot_composed(
                 learning.clone(),
                 extractor,
                 options.learning_options.clone(),
+                budget_gate.clone(),
                 if options.self_learning {
                     Some(confirmation.unwrap_or_else(|| Arc::new(EvidenceConfirmationPolicy)))
                 } else {
@@ -2815,11 +2838,7 @@ async fn run_qqbot_composed(
             admin: qq_admin.clone(),
             inner: Arc::new(CommandHandlers(vec![
                 qq_admin.clone(),
-                Arc::new(crate::qq_model::Commands {
-                    settings: qq_tasks::config_service(registry.as_ref())?,
-                    admin: Arc::new(model_settings_admin),
-                    authorization: qq_admin.clone(),
-                }),
+                model_commands,
                 Arc::new(crate::qq_people::Commands(people)),
                 Arc::new(crate::qq_failure_recovery::Commands(failure_recovery)),
                 help_commands,

@@ -14,7 +14,7 @@ use std::{
 
 const FORMAT_VERSION: u32 = 1;
 const DECISIONS_STATE_KEY: &str = "learning.decisions.v1";
-const MAX_DECISIONS_STATE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DECISIONS_STATE_BYTES: usize = MAX_STATE_BYTES;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +28,10 @@ struct JobRecord {
     job: LearningJob,
     /// 只保存批次来源的修订，不复制偏好和未消费的原始记忆。
     memory_revision: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    previous_attempts: Vec<MaintenanceAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reflection: Option<ReflectionDraft>,
 }
 /// 决策账本单独保存，旧批次文档的格式和大小预算保持不变。
 #[derive(Clone, Serialize, Deserialize)]
@@ -107,7 +111,7 @@ impl StoredLearning {
                 interrupted = true;
             }
         }
-        // 先保存中断结局再公开实例；从不重试已经消费的输入，也不伪造完成时钟。
+        // 先保存中断结局再公开实例，不伪造完成时钟；补做由独立有界准入负责。
         if interrupted {
             let bytes = encode(&document)?;
             context
@@ -229,7 +233,7 @@ impl StoredLearning {
                 consumed.insert(evidence.id.as_str());
             }
         }
-        if let Some(last) = previous.last() {
+        if let Some(last) = previous.iter().max_by_key(|r| r.job.batch.started_at_ms) {
             let Some(elapsed) = now_ms.checked_sub(last.job.batch.started_at_ms) else {
                 return Ok(None);
             };
@@ -247,6 +251,7 @@ impl StoredLearning {
             .collect();
         available.sort_by_key(|evidence| evidence.revision);
         let mut batch = LearningBatch {
+            attempt: 0,
             // 摘要长度固定；先用等长占位值计算完整输入 JSON 的预算。
             id: format!("learning-batch-{}", "0".repeat(64)),
             scope: memory.scope.clone(),
@@ -274,7 +279,11 @@ impl StoredLearning {
                 break;
             }
         }
-        if batch.evidence.len() < options.min_new_evidence {
+        let aged = batch
+            .evidence
+            .first()
+            .is_some_and(|e| now_ms.saturating_sub(e.at_ms) >= MAINTENANCE_DELAY_MS);
+        if batch.evidence.is_empty() || (batch.evidence.len() < options.min_new_evidence && !aged) {
             return Ok(None);
         }
         if inner.document.jobs.len() >= MAX_JOBS {
@@ -284,6 +293,8 @@ impl StoredLearning {
         let mut next = inner.document.clone();
         next.jobs.push(JobRecord {
             memory_revision: memory.revision,
+            previous_attempts: vec![],
+            reflection: None,
             job: LearningJob {
                 batch: batch.clone(),
                 status: JobStatus::Running,
@@ -301,6 +312,16 @@ impl StoredLearning {
         outcome: LearningOutcome,
     ) -> LearningResult<()> {
         let mut inner = self.lock()?;
+        let (outcome, reflection) = match outcome {
+            LearningOutcome::Maintained(value) => (
+                LearningOutcome::Completed(value.candidates),
+                value.reflection,
+            ),
+            other => (other, None),
+        };
+        if let Some(reflection) = &reflection {
+            reflection.validate(batch)?;
+        }
         let index = inner
             .document
             .jobs
@@ -324,7 +345,7 @@ impl StoredLearning {
                 (JobStatus::Failed(first), LearningOutcome::Failed(second)) => first == second,
                 _ => false,
             };
-            return if replay {
+            return if replay && inner.document.jobs[index].reflection == reflection {
                 Ok(())
             } else {
                 Err(LearningError::Conflict)
@@ -337,9 +358,11 @@ impl StoredLearning {
             return Err(LearningError::InvalidInput);
         }
         let mut next = inner.document.clone();
+        next.jobs[index].reflection = reflection;
         let job = &mut next.jobs[index].job;
         job.finished_at_ms = Some(at_ms);
         match outcome {
+            LearningOutcome::Maintained(_) => unreachable!("normalized above"),
             LearningOutcome::Failed(reason) => job.status = JobStatus::Failed(reason),
             LearningOutcome::Completed(drafts) => {
                 let expires_at_ms = at_ms
@@ -360,6 +383,84 @@ impl StoredLearning {
             }
         }
         persist(&mut inner, next)
+    }
+    pub(super) fn maintenance_receipts(
+        &self,
+        scope: &MemoryScope,
+    ) -> LearningResult<Vec<MaintenanceReceipt>> {
+        scope.validate().map_err(|_| LearningError::InvalidInput)?;
+        let inner = self.lock()?;
+        Ok(inner
+            .document
+            .jobs
+            .iter()
+            .filter(|r| &r.job.batch.scope == scope)
+            .map(|r| MaintenanceReceipt {
+                batch_id: r.job.batch.id.clone(),
+                extractor_version: r.job.batch.extractor_version.clone(),
+                source_revision: r.memory_revision,
+                evidence_ids: r.job.batch.evidence.iter().map(|e| e.id.clone()).collect(),
+                status: r.job.status.clone(),
+                started_at_ms: r.job.batch.started_at_ms,
+                finished_at_ms: r.job.finished_at_ms,
+                previous_attempts: r.previous_attempts.clone(),
+                reflection: r.reflection.clone(),
+            })
+            .collect())
+    }
+    pub(super) fn reserve_repair(
+        &self,
+        memory: &MemorySnapshot,
+        now_ms: u64,
+        extractor_version: &str,
+    ) -> LearningResult<Option<LearningBatch>> {
+        validate_memory(memory)?;
+        let mut inner = self.lock()?;
+        if inner
+            .document
+            .jobs
+            .iter()
+            .any(|r| r.job.batch.scope == memory.scope && r.job.status == JobStatus::Running)
+        {
+            return Ok(None);
+        }
+        let Some(index) = inner.document.jobs.iter().position(|r| {
+            r.job.batch.scope == memory.scope
+                && r.job.batch.extractor_version == extractor_version
+                && retryable(&r.job.status)
+                && r.previous_attempts.len() < MAX_REPAIRS
+                && now_ms
+                    .checked_sub(r.job.finished_at_ms.unwrap_or(r.job.batch.started_at_ms))
+                    .is_some_and(|elapsed| elapsed >= REPAIR_COOLDOWN_MS)
+        }) else {
+            return Ok(None);
+        };
+        let old = &inner.document.jobs[index];
+        if memory.revision < old.memory_revision
+            || old
+                .job
+                .batch
+                .evidence
+                .iter()
+                .any(|e| !memory.evidence.iter().any(|v| v == e))
+        {
+            return Err(LearningError::Conflict);
+        }
+        let mut next = inner.document.clone();
+        let r = &mut next.jobs[index];
+        r.previous_attempts.push(MaintenanceAttempt {
+            started_at_ms: r.job.batch.started_at_ms,
+            finished_at_ms: r.job.finished_at_ms,
+            status: r.job.status.clone(),
+        });
+        r.job.batch.started_at_ms = now_ms;
+        r.job.batch.attempt =
+            u8::try_from(r.previous_attempts.len()).map_err(|_| LearningError::InvalidInput)?;
+        r.job.status = JobStatus::Running;
+        r.job.finished_at_ms = None;
+        let batch = r.job.batch.clone();
+        persist(&mut inner, next)?;
+        Ok(Some(batch))
     }
     pub(super) fn close(&self) -> PluginResult<()> {
         self.inner
@@ -658,12 +759,55 @@ fn validate_document(document: &Document) -> LearningResult<()> {
         let job = &record.job;
         let batch = &job.batch;
         validate_batch(batch, record.memory_revision)?;
+        if record.previous_attempts.len() > MAX_REPAIRS
+            || usize::from(batch.attempt) != record.previous_attempts.len()
+        {
+            return Err(LearningError::CorruptState);
+        }
+        let mut previous_end = 0;
+        for attempt in &record.previous_attempts {
+            if !retryable(&attempt.status)
+                || attempt.started_at_ms < previous_end
+                || attempt
+                    .finished_at_ms
+                    .is_some_and(|end| end < attempt.started_at_ms)
+                || (attempt.status == JobStatus::Interrupted) != attempt.finished_at_ms.is_none()
+            {
+                return Err(LearningError::CorruptState);
+            }
+            previous_end = attempt
+                .finished_at_ms
+                .unwrap_or(attempt.started_at_ms)
+                .checked_add(REPAIR_COOLDOWN_MS)
+                .ok_or(LearningError::CorruptState)?;
+        }
+        if batch.started_at_ms < previous_end {
+            return Err(LearningError::CorruptState);
+        }
+        if let Some(reflection) = &record.reflection {
+            if job.status != JobStatus::Completed {
+                return Err(LearningError::CorruptState);
+            }
+            reflection.validate(batch)?;
+        }
         if !ids.insert(&batch.id) {
             return Err(LearningError::CorruptState);
         }
-        if let Some((started_at_ms, memory_revision)) =
-            previous_by_scope.insert(&batch.scope, (batch.started_at_ms, record.memory_revision))
-            && (batch.started_at_ms < started_at_ms || record.memory_revision < memory_revision)
+        if let Some((started_at_ms, memory_revision)) = previous_by_scope.insert(
+            &batch.scope,
+            (
+                record
+                    .previous_attempts
+                    .first()
+                    .map_or(batch.started_at_ms, |a| a.started_at_ms),
+                record.memory_revision,
+            ),
+        ) && (record
+            .previous_attempts
+            .first()
+            .map_or(batch.started_at_ms, |a| a.started_at_ms)
+            < started_at_ms
+            || record.memory_revision < memory_revision)
         {
             return Err(LearningError::CorruptState);
         }
@@ -714,4 +858,12 @@ fn validate_document(document: &Document) -> LearningResult<()> {
         }
     }
     Ok(())
+}
+
+fn retryable(status: &JobStatus) -> bool {
+    matches!(
+        status,
+        JobStatus::Interrupted
+            | JobStatus::Failed(LearningFailure::TransientProvider | LearningFailure::Timeout)
+    )
 }

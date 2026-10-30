@@ -32,12 +32,6 @@ struct Reader {
     service: MemoryContinuity,
     anchor: Arc<dyn MemoryService>,
 }
-struct Snapshot(MemorySnapshot);
-impl MemoryService for Snapshot {
-    fn snapshot(&self) -> MemoryResult<MemorySnapshot> {
-        Ok(self.0.clone())
-    }
-}
 impl MemoryContinuityReader for Reader {
     fn read(&self, query: &str) -> MemoryResult<MemoryContinuityView> {
         validate_snapshot(&self.anchor.snapshot()?, &self.target)?;
@@ -76,12 +70,17 @@ impl MemoryContinuityReader for Reader {
             .collect();
         let source_limit_reached = grants.len() > MAX_CONTINUITY_SOURCES;
         for grant in grants.into_iter().take(MAX_CONTINUITY_SOURCES) {
-            let snapshot = self
-                .service
-                .memory
-                .reader(grant.scope.clone())?
-                .complete_snapshot()?;
-            validate_snapshot(&snapshot, &grant.scope)?;
+            let reader = self.service.memory.reader(grant.scope.clone())?;
+            let request = MemoryRecallRequest {
+                query: if grant.interactions && !query.trim().is_empty() {
+                    query.into()
+                } else {
+                    "*".into()
+                },
+                limit: MAX_CONTINUITY_HITS,
+            };
+            let (snapshot, recall) =
+                ScopedLexicalRecall::new(grant.scope.clone(), reader)?.read_view(&request)?;
             let mut preferences = Vec::new();
             for preference in snapshot
                 .preferences
@@ -99,12 +98,7 @@ impl MemoryContinuityReader for Reader {
             }
             let revision = snapshot.revision;
             let hits = if grant.interactions && !query.trim().is_empty() {
-                ScopedLexicalRecall::new(grant.scope.clone(), Arc::new(Snapshot(snapshot)))?
-                    .recall(&MemoryRecallRequest {
-                        query: query.into(),
-                        limit: MAX_CONTINUITY_HITS,
-                    })?
-                    .hits
+                recall.hits
             } else {
                 vec![]
             };

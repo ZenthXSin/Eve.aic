@@ -1,3 +1,4 @@
+use crate::cold::{MAX_LEDGER_BYTES, ReceiptIndex, VersionIndex, VersionSummary};
 use crate::{
     PublishedVersion, Receipt, ReceiptStatus, Result, ScriptSpec, StateMigration, StateSnapshot,
     VersionRef, digest, fail, reject,
@@ -16,10 +17,10 @@ use std::{
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Ledger {
-    versions: BTreeMap<String, PublishedVersion>,
+    versions: BTreeMap<String, VersionIndex>,
     active: BTreeMap<String, VersionRef>,
     states: BTreeMap<String, StateSnapshot>,
-    receipts: BTreeMap<String, Receipt>,
+    receipts: BTreeMap<String, ReceiptIndex>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +28,21 @@ struct Envelope {
     format: u32,
     checksum: String,
     ledger: Ledger,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyLedger {
+    versions: BTreeMap<String, PublishedVersion>,
+    active: BTreeMap<String, VersionRef>,
+    states: BTreeMap<String, StateSnapshot>,
+    receipts: BTreeMap<String, Receipt>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyEnvelope {
+    format: u32,
+    checksum: String,
+    ledger: LegacyLedger,
 }
 
 // 事务候选只序列化借用；不能为Envelope再复制整个版本/回执账本。
@@ -62,16 +78,47 @@ impl ScriptStore {
             .map_err(|_| fail("脚本账本锁不可用或已被另一运行器占用"))?;
         let path = directory.join("ledger.json");
         let ledger = if path.exists() {
-            if std::fs::metadata(&path).map_err(fail)?.len() > 64 * 1024 * 1024 {
+            if std::fs::metadata(&path).map_err(fail)?.len() > MAX_LEDGER_BYTES as u64 {
                 return Err(fail("脚本账本超限，未清空"));
             }
             let data = std::fs::read(&path).map_err(fail)?;
-            let envelope: Envelope = serde_json::from_value(strict_json(&data)?).map_err(fail)?;
-            if envelope.format != 1 || envelope.checksum != digest(&envelope.ledger)? {
-                return Err(fail("脚本账本格式或校验错误，未清空"));
-            }
-            validate_ledger(&envelope.ledger)?;
-            envelope.ledger
+            let value = strict_json(&data)?;
+            let ledger = match value.get("format").and_then(Value::as_u64) {
+                Some(1) => {
+                    let envelope: LegacyEnvelope = serde_json::from_value(value).map_err(fail)?;
+                    if envelope.checksum != digest(&envelope.ledger)? {
+                        return Err(fail("旧脚本账本校验错误，未清空"));
+                    }
+                    let old = envelope.ledger;
+                    let mut ledger = Ledger {
+                        active: old.active,
+                        states: old.states,
+                        ..Ledger::default()
+                    };
+                    // 冷记录先持久化，原账本只有在全部验证通过后才原子切换。
+                    for (id, version) in old.versions {
+                        ledger
+                            .versions
+                            .insert(id, VersionIndex::create(&directory, &version)?);
+                    }
+                    for (id, receipt) in old.receipts {
+                        let mut index = ReceiptIndex::hot(receipt)?;
+                        index.freeze(&directory)?;
+                        ledger.receipts.insert(id, index);
+                    }
+                    ledger
+                }
+                Some(2) => {
+                    let envelope: Envelope = serde_json::from_value(value).map_err(fail)?;
+                    if envelope.checksum != digest(&envelope.ledger)? {
+                        return Err(fail("脚本账本校验错误，未清空"));
+                    }
+                    envelope.ledger
+                }
+                _ => return Err(fail("脚本账本格式未知，未清空")),
+            };
+            validate_ledger(&ledger, &directory)?;
+            ledger
         } else {
             let mut marker = String::new();
             lock.read_to_string(&mut marker).map_err(fail)?;
@@ -92,8 +139,10 @@ impl ScriptStore {
         store.change(|ledger| {
             for receipt in ledger.receipts.values_mut() {
                 if receipt.status == ReceiptStatus::Running {
-                    receipt.status = ReceiptStatus::Unknown;
-                    receipt.error = Some("宿主重启中断；须核对外部效果，禁止自动重放".into());
+                    let mut body = receipt.load(&store.directory)?;
+                    body.status = ReceiptStatus::Unknown;
+                    body.error = Some("宿主重启中断；须核对外部效果，禁止自动重放".into());
+                    *receipt = ReceiptIndex::hot(body)?;
                 }
             }
             Ok(())
@@ -131,13 +180,16 @@ impl ScriptStore {
         }
         let mut next = guard.clone();
         let output = action(&mut next)?;
+        for receipt in next.receipts.values_mut() {
+            receipt.freeze(&self.directory)?;
+        }
         let envelope = BorrowedEnvelope {
-            format: 1,
+            format: 2,
             checksum: digest(&next)?,
             ledger: &next,
         };
         let bytes = serde_json::to_vec(&envelope).map_err(fail)?;
-        if bytes.len() > 64 * 1024 * 1024 {
+        if bytes.len() > MAX_LEDGER_BYTES {
             return Err(fail("脚本账本容量已满；保留全部记录"));
         }
         let persist = || -> Result<()> {
@@ -177,14 +229,15 @@ impl ScriptStore {
                 get_version(ledger, owner, dependency)?;
             }
             if let Some(existing) = ledger.versions.get(&version.reference.digest) {
-                return Ok(existing.clone());
+                return existing.load(&self.directory);
             }
             if ledger.versions.len() >= 256 {
                 return Err(reject("版本容量已满，未删除历史版本"));
             }
-            ledger
-                .versions
-                .insert(version.reference.digest.clone(), version.clone());
+            ledger.versions.insert(
+                version.reference.digest.clone(),
+                VersionIndex::create(&self.directory, &version)?,
+            );
             Ok(version)
         })
     }
@@ -193,15 +246,26 @@ impl ScriptStore {
         owner: &ContextScope,
         reference: &VersionRef,
     ) -> Result<PublishedVersion> {
-        self.read(|ledger| get_version(ledger, owner, reference).cloned())
+        self.read(|ledger| get_version(ledger, owner, reference)?.load(&self.directory))
     }
     pub fn list(&self, owner: &ContextScope) -> Result<Vec<PublishedVersion>> {
+        self.read(|ledger| {
+            ledger
+                .versions
+                .values()
+                .filter(|version| &version.owner == owner)
+                .map(|version| version.load(&self.directory))
+                .collect::<Result<Vec<_>>>()
+        })
+    }
+    /// 只读版本元信息；列表不会加载源码。需要全文时显式调用 version。
+    pub fn summaries(&self, owner: &ContextScope) -> Result<Vec<VersionSummary>> {
         self.read(|ledger| {
             Ok(ledger
                 .versions
                 .values()
-                .filter(|version| &version.owner == owner)
-                .cloned()
+                .filter(|v| &v.owner == owner)
+                .map(|v| v.summary.clone())
                 .collect())
         })
     }
@@ -236,7 +300,7 @@ impl ScriptStore {
             {
                 return Err(reject("迁移调用ID已存在"));
             }
-            let version = get_version(ledger, owner, reference)?.clone();
+            let version = get_version(ledger, owner, reference)?.load(&self.directory)?;
             if !ledger.states.contains_key(&reference.digest) {
                 let previous = ledger
                     .active
@@ -303,7 +367,9 @@ impl ScriptStore {
                 .active
                 .insert(active_key(owner, &reference.script)?, reference.clone());
             if let Some(receipt) = receipt {
-                ledger.receipts.insert(receipt.call_id.clone(), receipt);
+                ledger
+                    .receipts
+                    .insert(receipt.call_id.clone(), ReceiptIndex::hot(receipt)?);
             }
             Ok(())
         })
@@ -357,8 +423,8 @@ impl ScriptStore {
                 .receipts
                 .get(call_id)
                 .filter(|r| &r.owner == owner)
-                .cloned()
-                .ok_or_else(|| reject("没有该作用域的回执"))
+                .ok_or_else(|| reject("没有该作用域的回执"))?
+                .load(&self.directory)
         })
     }
     pub(crate) fn begin(&self, receipt: Receipt) -> Result<StateSnapshot> {
@@ -378,7 +444,9 @@ impl ScriptStore {
                 .get(&receipt.version.digest)
                 .cloned()
                 .ok_or_else(|| reject("版本尚未启用过"))?;
-            ledger.receipts.insert(receipt.call_id.clone(), receipt);
+            ledger
+                .receipts
+                .insert(receipt.call_id.clone(), ReceiptIndex::hot(receipt)?);
             Ok(state)
         })
     }
@@ -393,7 +461,7 @@ impl ScriptStore {
             }
             ledger
                 .receipts
-                .insert(receipt.call_id.clone(), receipt.clone());
+                .insert(receipt.call_id.clone(), ReceiptIndex::hot(receipt.clone())?);
             Ok(())
         })
     }
@@ -423,7 +491,7 @@ impl ScriptStore {
             }
             ledger
                 .receipts
-                .insert(receipt.call_id.clone(), receipt.clone());
+                .insert(receipt.call_id.clone(), ReceiptIndex::hot(receipt.clone())?);
             Ok(())
         })
     }
@@ -435,8 +503,10 @@ impl ScriptStore {
                 .filter(|r| &r.owner == owner)
                 .ok_or_else(|| fail("中断回执不存在"))?;
             if receipt.status == ReceiptStatus::Running {
-                receipt.status = ReceiptStatus::Unknown;
-                receipt.error = Some("调用future被宿主中断；须核对效果，禁止自动重放".into());
+                let mut body = receipt.load(&self.directory)?;
+                body.status = ReceiptStatus::Unknown;
+                body.error = Some("调用future被宿主中断；须核对效果，禁止自动重放".into());
+                *receipt = ReceiptIndex::hot(body)?;
             }
             Ok(())
         })
@@ -460,8 +530,10 @@ impl ScriptStore {
             if receipt.status != ReceiptStatus::Unknown {
                 return Err(reject("只有 unknown 可核对"));
             }
-            receipt.status = ReceiptStatus::Failed;
-            receipt.error = Some(format!("已核对，未重放: {evidence}"));
+            let mut body = receipt.load(&self.directory)?;
+            body.status = ReceiptStatus::Failed;
+            body.error = Some(format!("已核对，未重放: {evidence}"));
+            *receipt = ReceiptIndex::hot(body)?;
             Ok(())
         })
     }
@@ -473,15 +545,16 @@ fn get_version<'a>(
     ledger: &'a Ledger,
     owner: &ContextScope,
     reference: &VersionRef,
-) -> Result<&'a PublishedVersion> {
+) -> Result<&'a VersionIndex> {
     ledger
         .versions
         .get(&reference.digest)
         .filter(|v| &v.reference == reference && &v.owner == owner)
         .ok_or_else(|| reject("不可见或未知脚本版本"))
 }
-fn validate_ledger(ledger: &Ledger) -> Result<()> {
-    for (id, version) in &ledger.versions {
+fn validate_ledger(ledger: &Ledger, directory: &Path) -> Result<()> {
+    for (id, index) in &ledger.versions {
+        let version = index.load(directory)?;
         version.spec.validate()?;
         if id != &version.reference.digest
             || version.reference.script != version.spec.name
@@ -507,12 +580,13 @@ fn validate_ledger(ledger: &Ledger) -> Result<()> {
     }
     for (id, state) in &ledger.states {
         let version = ledger.versions.get(id).ok_or_else(|| fail("孤立状态"))?;
-        if state.schema != version.spec.state_schema {
+        if state.schema != version.state_schema {
             return Err(fail("状态 schema 不匹配"));
         }
         state.schema.validate(&state.value)?;
     }
-    for (id, receipt) in &ledger.receipts {
+    for (id, index) in &ledger.receipts {
+        let receipt = index.load(directory)?;
         if id != &receipt.call_id {
             return Err(fail("回执 ID 不匹配"));
         }
@@ -636,5 +710,166 @@ mod tests {
                 .expect_err("queued access bypassed poisoned store");
             assert!(error.to_string().contains("提交结果未知"));
         }
+    }
+    fn fixture_version() -> PublishedVersion {
+        let owner = ContextScope {
+            session_id: "cold-session".into(),
+            user_id: "alice".into(),
+        };
+        let spec = ScriptSpec {
+            name: "cold-script".into(),
+            language: crate::Language::Python,
+            source: format!("# private source {}", "x".repeat(128 * 1024)),
+            dependencies: BTreeMap::new(),
+            tools: vec![],
+            state_schema: crate::StateSchema {
+                version: 1,
+                fields: BTreeMap::new(),
+            },
+            initial_state: serde_json::json!({}),
+        };
+        PublishedVersion {
+            reference: VersionRef {
+                script: spec.name.clone(),
+                digest: digest(&(&owner, &spec)).unwrap(),
+            },
+            owner,
+            spec,
+        }
+    }
+    fn fixture_receipt(version: &PublishedVersion, id: &str, status: ReceiptStatus) -> Receipt {
+        Receipt {
+            call_id: id.into(),
+            parent_call_id: None,
+            root_call_id: id.into(),
+            owner: version.owner.clone(),
+            version: version.reference.clone(),
+            request_digest: "request".into(),
+            status,
+            result: Some(serde_json::json!({"private_result": "y".repeat(32 * 1024)})),
+            evidence: vec![],
+            error: None,
+            failure_diagnostic: None,
+        }
+    }
+    #[test]
+    fn legacy_migration_cools_source_and_terminal_receipts_without_replaying() {
+        let dir = tempfile::tempdir().unwrap();
+        let version = fixture_version();
+        let completed = fixture_receipt(&version, "completed", ReceiptStatus::Succeeded);
+        let running = fixture_receipt(&version, "running", ReceiptStatus::Running);
+        let ledger = LegacyLedger {
+            versions: BTreeMap::from([(version.reference.digest.clone(), version.clone())]),
+            active: BTreeMap::from([(
+                active_key(&version.owner, &version.reference.script).unwrap(),
+                version.reference.clone(),
+            )]),
+            states: BTreeMap::from([(
+                version.reference.digest.clone(),
+                StateSnapshot {
+                    revision: 3,
+                    schema: version.spec.state_schema.clone(),
+                    value: serde_json::json!({}),
+                },
+            )]),
+            receipts: BTreeMap::from([
+                (completed.call_id.clone(), completed.clone()),
+                (running.call_id.clone(), running.clone()),
+            ]),
+        };
+        let old = LegacyEnvelope {
+            format: 1,
+            checksum: digest(&ledger).unwrap(),
+            ledger,
+        };
+        std::fs::write(
+            dir.path().join("ledger.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        let store = ScriptStore::open(dir.path()).unwrap();
+        assert_eq!(
+            store.version(&version.owner, &version.reference).unwrap(),
+            version
+        );
+        assert_eq!(
+            store.receipt(&version.owner, "completed").unwrap(),
+            completed
+        );
+        assert_eq!(
+            store.receipt(&version.owner, "running").unwrap().status,
+            ReceiptStatus::Unknown
+        );
+        assert!(store.begin(completed.clone()).is_err());
+        assert_eq!(
+            store
+                .state(&version.owner, &version.reference)
+                .unwrap()
+                .revision,
+            3
+        );
+        store
+            .read(|ledger| {
+                assert!(ledger.receipts["completed"].hot.is_none());
+                assert!(ledger.receipts["running"].hot.is_some());
+                Ok(())
+            })
+            .unwrap();
+        let saved = std::fs::read_to_string(dir.path().join("ledger.json")).unwrap();
+        assert!(!saved.contains("private source"));
+        let parsed: Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(parsed["format"], 2);
+        assert!(parsed["ledger"]["receipts"]["completed"]["hot"].is_null());
+        drop(store);
+        let store = ScriptStore::open(dir.path()).unwrap();
+        assert_eq!(
+            store.receipt(&version.owner, "completed").unwrap(),
+            completed
+        );
+        assert_eq!(
+            store.receipt(&version.owner, "running").unwrap().status,
+            ReceiptStatus::Unknown
+        );
+        assert!(store.begin(running).is_err());
+        store
+            .acknowledge_unknown(&version.owner, "running", "人工核对未执行，不重放")
+            .unwrap();
+        store
+            .read(|ledger| {
+                assert!(ledger.receipts["running"].hot.is_none());
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[test]
+    fn corrupt_cold_source_is_preserved_and_refused_on_read_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let version = fixture_version();
+        let store = ScriptStore::open(dir.path()).unwrap();
+        store.publish(&version.owner, version.spec.clone()).unwrap();
+        let blob = store
+            .read(|ledger| Ok(ledger.versions[&version.reference.digest].blob.clone()))
+            .unwrap();
+        let path = dir
+            .path()
+            .join("blobs")
+            .join(format!("{}.json", blob.digest));
+        let mut corrupted = std::fs::read(&path).unwrap();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 1;
+        std::fs::write(&path, &corrupted).unwrap();
+        assert!(store.version(&version.owner, &version.reference).is_err());
+        // 清单只读已经校验的身份索引，不复制正文；清单不是执行授权。
+        assert_eq!(store.summaries(&version.owner).unwrap().len(), 1);
+        let foreign = ContextScope {
+            session_id: "elsewhere".into(),
+            user_id: "bob".into(),
+        };
+        assert!(store.summaries(&foreign).unwrap().is_empty());
+        assert!(store.version(&foreign, &version.reference).is_err());
+        assert!(store.publish(&version.owner, version.spec.clone()).is_err());
+        drop(store);
+        assert!(ScriptStore::open(dir.path()).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), corrupted);
     }
 }
