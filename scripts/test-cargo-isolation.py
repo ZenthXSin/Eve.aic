@@ -42,7 +42,7 @@ with tempfile.TemporaryDirectory(prefix='eve-cargo-acceptance-') as directory:
         for arguments in [
             [sys.executable, 'crates/script-runtime/tests/cargo_container.py', '-v'],
             ['cargo', 'test', '-p', 'eve-script-runtime', '--test', 'cargo_api', 'actual_cargo_', '--', '--ignored', '--nocapture', '--test-threads=1'],
-            [sys.executable, 'connectors/qqbot/test/script_runtime_test.py', 'ScriptRepairAcceptance.test_cargo_dependency_plugin_is_saved_executed_and_restored_in_real_host', '-v'],
+            [sys.executable, 'connectors/qqbot/test/script_runtime_test.py', 'ScriptRepairAcceptance.test_cargo_dependency_plugin_is_saved_executed_and_restored_in_real_host', 'ScriptRepairAcceptance.test_cargo_migration_through_qq_tool_keeps_source_state_and_restores_target', '-v'],
         ]:
             subprocess.run(arguments, cwd=ROOT, env=environment, check=True, timeout=180)
     finally:
