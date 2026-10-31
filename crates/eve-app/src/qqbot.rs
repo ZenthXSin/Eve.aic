@@ -102,7 +102,7 @@ jev 需 EVE_JEV_API_KEY 与已启用的 runtime.models Jev 角色；接口 EVE_J
 --memory 开启有来源的交互记忆；/remember 内容、/memories [页码]、/correct-memory ID 内容、/forget ID、/recall 关键词。
 --memory-recall 需同时 --memory；按本轮输入检索当前可信会话的已保存交互与有效偏好，最多 3 条低优先级来源片段，默认关闭。
 --semantic-recall 需同时 --memory-recall，并启用 embedding 语义模型角色（EVE_MODELS_SEMANTIC_ENABLED、_PROVIDER=openai、_MODEL、_DIMENSIONS）；后台为已保存的记忆建立向量索引，召回时把词项排名与向量相似度排名融合，没有共同字词的相近说法也能找到；向量模型不可用时改用词项召回并在资料中标明。/semantic 查看索引进度。
---memory-learning 需同时 --memory；每会话至少 3 条新经历触发首批，后续默认间隔 5 分钟（--learning-cooldown-ms 可调整），单次启动最多 4 次请求。
+--memory-learning 需同时 --memory；每会话至少 3 条新经历触发首批，后续默认间隔 5 分钟（--learning-cooldown-ms 可调整），单次启动最多 15 次成功提炼，失败不消耗成功次数但补做仍有上限。
 --self-learning 开启持续自主学习（同时开启记忆、提炼和分段）；内置策略要求自评至少 80、至少两条真实交互，并复核重复、手动及撤销冲突。
 /self-learning status 查看模式、已关联候选与容量；自动节奏跟随有效偏好，手动设置优先；/segment reset 清除手动设置并恢复跟随学习。
 /memory-candidates [页码] 查看候选；普通提炼模式用 /accept-memory ID 确认，自主模式按策略自动确认。

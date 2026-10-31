@@ -401,7 +401,10 @@ async fn chat_defaults_complete_tool_round_trip_and_restore_in_a_new_process() {
     );
     assert!(first.get("input").is_none());
     assert_eq!(first["reasoning_effort"], "low");
-    assert_eq!(first["max_tokens"], 2048);
+    assert!(
+        first.get("max_tokens").is_none(),
+        "默认不向模型指定输出 token 上限"
+    );
     assert!(chat_user_texts(&first)[0].contains(MARKER));
     let returned = server.next().await.body;
     let output = returned["messages"]
