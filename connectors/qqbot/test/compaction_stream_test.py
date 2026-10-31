@@ -51,7 +51,9 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
         self.remaining_invalid_digests = invalid
         failed = stall or invalid >= 2
         self.dialogue_calls = 0
-        (self.source / "README.md").write_text("中文结果" * 700, encoding="utf8")
+        # 工具目录扩展后仍给前 15 次调用留足余量，35 次后才越过原 150k 阈值。
+        # 不修改生产阈值、重试次数或超时；避免把夹具贴边当作模型服务停滞。
+        (self.source / "README.md").write_text("中文结果" * 500, encoding="utf8")
         def respond(body):
             if body["messages"][0]["content"].startswith(digest.DIGEST_PROMPT):
                 self.assertEqual(body.get("response_format"), {"type": "json_object"})
