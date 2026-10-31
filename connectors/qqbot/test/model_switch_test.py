@@ -51,8 +51,9 @@ class ModelSwitchAcceptance(developer.DeveloperAcceptance):
             self.assertEqual(result['configured']['role'], 'primary')
             self.assertEqual(result['configured']['model'], 'role-a')
             self.assertEqual(result['configured']['max_output_tokens'], 128)
-            self.assertEqual(result['configured']['max_concurrent_requests'], 1)
-            self.assertEqual(result['admission']['limit'], 1)
+            self.assertEqual(result['configured']['max_concurrent_requests'], 5)
+            self.assertEqual(result['admission']['limit'], 5)
+            self.assertEqual(result['configured']['shared_host_limit'], 5)
             self.assertEqual(result['admission']['active'], 0)
             self.assertEqual(result['admission']['waiting'], 0)
             self.assertFalse(result['configuration_written'])
@@ -171,7 +172,7 @@ class ModelSwitchAcceptance(developer.DeveloperAcceptance):
             configuration = self.work / 'state/configuration/config.json'
             before = configuration.read_bytes() if configuration.exists() else None
             seen = admission()
-            self.assertEqual((seen['role'], seen['configured_limit'], seen['observed_limit']), ('primary', 1, 1))
+            self.assertEqual((seen['role'], seen['configured_limit'], seen['observed_limit']), ('primary', 5, 5))
             self.assertEqual((seen['active'], seen['waiting']), (1, 0))
             self.assertEqual(len(self.kind('chat')), 1)
             self.assertEqual(configuration.read_bytes() if configuration.exists() else None, before, '诊断读取不修改配置')

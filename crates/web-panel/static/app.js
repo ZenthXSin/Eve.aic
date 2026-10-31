@@ -728,15 +728,16 @@
     const actions = node("div", "detail-actions");
     let base = null, pending = false, dirty = false, reviewed = null, reconcile = false, nextBefore = null;
     const live = () => token && epoch === requestEpoch && sessionRequest === requestSession && sameSession(selectedSession, key) && card.isConnected;
+    const maxNoteBytes = 16 * 1024 * 1024;
     const bytes = () => new TextEncoder().encode(editor.value).length;
     const validView = (view) => view && sameSession(view.owner, key) && view.owner.channel === "qq" &&
       Number.isSafeInteger(view.revision) && view.revision >= 0 && typeof view.text === "string" &&
-      new TextEncoder().encode(view.text).length <= 16384;
+      new TextEncoder().encode(view.text).length <= maxNoteBytes;
     function sync() {
-      counter.textContent = `正文 ${bytes()} / 16384 UTF-8 字节${base === null ? "" : ` · 当前修订 ${base}`}`;
+      counter.textContent = `正文 ${bytes()} / ${maxNoteBytes} UTF-8 字节${base === null ? "" : ` · 当前修订 ${base}`}`;
       editor.disabled = pending || base === null;
       read.disabled = pending;
-      inspectPreview.disabled = pending || base === null || bytes() > 16384 || reconcile;
+      inspectPreview.disabled = pending || base === null || bytes() > maxNoteBytes || reconcile;
       save.disabled = pending || base === null || reconcile || !reviewed || reviewed.base !== base || reviewed.text !== editor.value;
       versions.disabled = pending || base === null;
       older.disabled = pending || nextBefore === null;
@@ -796,7 +797,7 @@
         const rows = [];
         for (const version of result.versions) {
           if (!Number.isSafeInteger(version.revision) || version.revision <= 0 || version.revision >= previous ||
-            !Number.isSafeInteger(version.text_bytes) || version.text_bytes < 0 || version.text_bytes > 16384 ||
+            !Number.isSafeInteger(version.text_bytes) || version.text_bytes < 0 || version.text_bytes > maxNoteBytes ||
             typeof version.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(version.sha256)) throw new ApiError("版本列表顺序或大小无效");
           previous = version.revision;
           const row = node("div", "detail-actions");
