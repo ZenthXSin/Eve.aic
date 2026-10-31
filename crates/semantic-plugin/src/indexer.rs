@@ -42,8 +42,10 @@ struct Pending {
 
 struct Plan {
     pending: Vec<Pending>,
-    /// 尚未写出向量分段的归档段及其条目。
-    blocks: Vec<(SegmentKey, Vec<Pending>)>,
+    /// 本次最多写一段；未选中段只计数，不保留输入正文。
+    block: Option<(SegmentKey, Vec<Pending>)>,
+    pending_count: usize,
+    block_pending_count: usize,
     stale: Vec<(String, String)>,
     indexed: usize,
 }
@@ -72,7 +74,9 @@ impl Indexer {
         let segments = self.index.segments();
         let mut wanted = BTreeSet::new();
         let mut pending = Vec::new();
-        let mut blocks = Vec::new();
+        let mut block = None;
+        let mut pending_count = 0;
+        let mut block_pending_count = 0;
         let mut indexed = 0;
         for scope in self.memory.scopes().map_err(|_| IndexStepError::Memory)? {
             let reader = self
@@ -91,19 +95,22 @@ impl Indexer {
                 if current.get(&(key.clone(), item.key.clone())) == Some(&hash) {
                     indexed += 1;
                 } else {
-                    pending.push(Pending {
-                        scope: key.clone(),
-                        item: item.key,
-                        content_sha256: hash,
-                        input,
-                    });
+                    pending_count += 1;
+                    if pending.len() < MAX_EMBED_BATCH {
+                        pending.push(Pending {
+                            scope: key.clone(),
+                            item: item.key,
+                            content_sha256: hash,
+                            input,
+                        });
+                    }
                 }
             }
             let Some(segments) = segments else {
                 continue;
             };
-            for block in layout.blocks {
-                let items: Vec<Pending> = block
+            for archived in layout.blocks {
+                let items: Vec<Pending> = archived
                     .items
                     .into_iter()
                     .filter_map(|item| {
@@ -123,8 +130,8 @@ impl Indexer {
                 let segment = SegmentKey {
                     profile: profile_key(profile),
                     scope: key.clone(),
-                    first_revision: block.first_revision,
-                    last_revision: block.last_revision,
+                    first_revision: archived.first_revision,
+                    last_revision: archived.last_revision,
                     content: content_key(&pairs),
                 };
                 if segments
@@ -137,7 +144,10 @@ impl Indexer {
                     for item in &items {
                         wanted.insert((item.scope.clone(), item.item.clone()));
                     }
-                    blocks.push((segment, items));
+                    block_pending_count += items.len();
+                    if block.is_none() {
+                        block = Some((segment, items));
+                    }
                 }
             }
         }
@@ -147,7 +157,9 @@ impl Indexer {
             .collect();
         Ok(Plan {
             pending,
-            blocks,
+            block,
+            pending_count,
+            block_pending_count,
             stale,
             indexed,
         })
@@ -157,12 +169,7 @@ impl Indexer {
         let plan = self.plan()?;
         Ok(IndexStatus {
             indexed: plan.indexed,
-            pending: plan.pending.len()
-                + plan
-                    .blocks
-                    .iter()
-                    .map(|(_, items)| items.len())
-                    .sum::<usize>(),
+            pending: plan.pending_count + plan.block_pending_count,
         })
     }
 
@@ -215,7 +222,7 @@ impl Indexer {
                 .map_err(IndexStepError::Index)?;
             return Ok(written);
         }
-        let Some((segment, items)) = plan.blocks.into_iter().next() else {
+        let Some((segment, items)) = plan.block else {
             return Ok(0);
         };
         let segments = self
@@ -241,3 +248,7 @@ impl Indexer {
         Ok(written)
     }
 }
+
+#[cfg(test)]
+#[path = "indexer_tests.rs"]
+mod tests;
