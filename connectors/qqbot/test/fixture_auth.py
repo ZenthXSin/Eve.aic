@@ -33,6 +33,8 @@ def configure_fixture_progress(environment):
     """普通验收关闭阶段、慢等待与工具里程碑；专测在自身环境中显式开启。"""
     # 通用场景验证业务不重放；传输重试由 model_retry_test 等显式开启验证。
     environment.setdefault("EVE_OPENAI_TRANSIENT_RETRIES", "false")
+    # 账本格式验收单独开启；其余夹具继续检查旧格式的业务字段。
+    environment.setdefault("EVE_SESSION_COLD_ARCHIVE", "false")
     environment.setdefault("EVE_PROGRESS_STAGE_UPDATES", "false")
     environment.setdefault("EVE_PROGRESS_SLOW_AFTER_MS", "0")
     environment.setdefault("EVE_PROGRESS_TOOL_MILESTONES", "false")

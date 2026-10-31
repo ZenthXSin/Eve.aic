@@ -1,6 +1,8 @@
 //! 独立 QQ/终端进程使用同一公开 SQL 后端；仅本机专用测试库与 loopback 模型。
 #[path = "../../llm-openai/tests/support/mod.rs"]
 mod http_support;
+#[path = "support/session_archive.rs"]
+mod session_archive;
 
 use eve_app::{ChatOptions, QqBotOptions};
 use eve_qqbot_plugin::QQBOT_PLUGIN_ID;
@@ -1720,7 +1722,10 @@ async fn sql_qq_and_console_preserve_history_training_and_receipts_without_repla
     .unwrap();
     assert_eq!((learned, active), (2, 1));
     assert_eq!(
-        document(&saved, "eve.session", "sessions.v1")["sessions"]
+        session_archive::expand(
+            document(&saved, "eve.session", "sessions.v1"),
+            &root.path().join("state/session-archive")
+        )["sessions"]
             .as_object()
             .unwrap()
             .values()

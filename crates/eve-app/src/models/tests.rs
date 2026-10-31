@@ -1,5 +1,8 @@
 use super::*;
-use crate::{AppError, CoreBootstrap, config, finish_core, http_support, install_core_with_config};
+use crate::{
+    AppError, CoreBootstrap, CorePlugins, SessionPlugin, config, finish_core, http_support,
+    install_core_with_config,
+};
 use eve_config_api::{
     ApplyMode, CONFIG_SERVICE_ID, ConfigAdmin, ConfigServiceHandle, NamespaceValues,
     model_roles_schema, runtime_llm_schema,
@@ -80,7 +83,10 @@ impl Harness {
                 history_context_planner: None,
                 image_source: None,
             },
-            plugin,
+            CorePlugins {
+                configuration: plugin,
+                sessions: SessionPlugin::new().unwrap(),
+            },
         )
         .await
         .unwrap();

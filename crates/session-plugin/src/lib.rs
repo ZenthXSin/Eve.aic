@@ -1,5 +1,8 @@
 //! 内置会话插件，通过 StateStore 保存版本化历史；不调用模型或依赖文件实现。
+mod archive;
+mod cold;
 mod strict_json;
+pub use archive::FileSessionArchive;
 use eve_llm_api::{ChatMessage, ChatRole};
 use eve_plugin_api::{
     Cleanup, Plugin, PluginContext, PluginError, PluginFuture, PluginManifest, PluginResult,
@@ -448,11 +451,17 @@ impl SessionService for StoredSessions {
 
 pub struct SessionPlugin {
     manifest: PluginManifest,
+    archive: Option<Arc<dyn SessionArchiveStore>>,
 }
 impl SessionPlugin {
+    pub fn with_archive(mut self, archive: Arc<dyn SessionArchiveStore>) -> Self {
+        self.archive = Some(archive);
+        self
+    }
     pub fn new() -> PluginResult<Self> {
         Ok(Self {
             manifest: PluginManifest::new(SESSION_PLUGIN_ID, env!("CARGO_PKG_VERSION"))?,
+            archive: None,
         })
     }
 }
@@ -462,6 +471,19 @@ impl Plugin for SessionPlugin {
     }
     fn start(&mut self, context: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         Box::pin(async move {
+            if let Some(archive) = &self.archive {
+                let service = Arc::new(
+                    cold::ColdSessions::open(context.clone(), archive.clone())
+                        .map_err(|error| PluginError::State(error.to_string()))?,
+                );
+                let to_close = service.clone();
+                context.cleanup(cleanup(move || async move { to_close.close() }))?;
+                context.provide_service(
+                    ServiceId::new(SESSION_SERVICE_ID)?,
+                    SessionServiceHandle(service),
+                )?;
+                return Ok(None);
+            }
             let service = Arc::new(
                 StoredSessions::open(context.clone())
                     .map_err(|error| PluginError::State(error.to_string()))?,

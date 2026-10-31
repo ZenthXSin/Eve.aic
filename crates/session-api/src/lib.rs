@@ -11,6 +11,14 @@ pub const SESSION_PLUGIN_ID: &str = "eve.session";
 pub const SESSION_SERVICE_ID: &str = "eve.session.history";
 pub type SessionResult<T> = Result<T, SessionError>;
 
+/// 不可变的会话轮次正文，键为小写 SHA256。读写错误不能当作正文不存在。
+pub trait SessionArchiveStore: Send + Sync {
+    fn put(&self, key: &str, bytes: &[u8]) -> SessionResult<()>;
+    fn get(&self, key: &str) -> SessionResult<Vec<u8>>;
+}
+/// 单轮冷正文保护，不是进程内存预算。
+pub const MAX_SESSION_ARCHIVE_RECORD_BYTES: usize = 32 * 1024 * 1024;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionKey {
@@ -301,7 +309,7 @@ pub trait SessionService: Send + Sync {
     fn snapshot(&self, key: &SessionKey) -> SessionResult<Option<SessionSnapshot>>;
     /// 成功后输入与 Pending 已提交；同一会话只允许一个在途轮次。
     fn begin(&self, input: SessionInput) -> SessionResult<StartedTurn>;
-    /// 保存完整轮次后才报告完成；失败不改变当前状态。
+    /// 保存完整轮次后才报告完成；提交错误可能已生效，调用者不得自动重放，须重开核对。
     fn complete(&self, lease: &TurnLease, messages: Vec<ChatMessage>) -> SessionResult<()>;
     fn fail(&self, lease: &TurnLease, failure: SessionFailure) -> SessionResult<()>;
 }

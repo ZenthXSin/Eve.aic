@@ -2,7 +2,7 @@
 use eve_kernel::backends::FileStateStore;
 use eve_llm_api::{ChatMessage, ToolOutput};
 use eve_plugin_api::{PluginId, StateStore};
-use eve_session_api::{SESSION_PLUGIN_ID, SessionSnapshot, SessionTurnStatus};
+use eve_session_api::{SESSION_PLUGIN_ID, SessionArchiveStore, SessionSnapshot, SessionTurnStatus};
 use eve_session_plugin::SESSION_STATE_KEY;
 use serde_json::{Value, json};
 use std::{
@@ -128,7 +128,7 @@ fn snapshot(directory: &Path, stage: &'static str) -> Result<SessionSnapshot, Ch
     if !state.join("state.json").is_file() {
         return Err(CheckError::new(stage, "state_missing"));
     }
-    let backend = FileStateStore::open(state).map_err(|_| CheckError::new(stage, "state_open"))?;
+    let backend = FileStateStore::open(&state).map_err(|_| CheckError::new(stage, "state_open"))?;
     let bytes = backend
         .get(
             &PluginId::new(SESSION_PLUGIN_ID).expect("有效内置 ID"),
@@ -136,14 +136,43 @@ fn snapshot(directory: &Path, stage: &'static str) -> Result<SessionSnapshot, Ch
         )
         .map_err(|_| CheckError::new(stage, "state_read"))?
         .ok_or_else(|| CheckError::new(stage, "session_missing"))?;
-    let document: Value =
+    let mut document: Value =
         serde_json::from_slice(&bytes).map_err(|_| CheckError::new(stage, "session_document"))?;
-    if document["format_version"] != 1
+    if document["format_version"] != 1 && document["format_version"] != 2
         || document["sessions"]
             .as_object()
             .is_none_or(|s| s.len() != 1)
     {
         return Err(CheckError::new(stage, "session_document"));
+    }
+    if document["format_version"] == 2 {
+        let directory = state.join("session-archive");
+        if !directory.is_dir() {
+            return Err(CheckError::new(stage, "archive_missing"));
+        }
+        let archive = eve_session_plugin::FileSessionArchive::open(directory)
+            .map_err(|_| CheckError::new(stage, "archive_open"))?;
+        let records = document["sessions"]["default"]["turns"]
+            .as_array()
+            .ok_or_else(|| CheckError::new(stage, "session_document"))?;
+        let turns: Result<Vec<Value>, CheckError> = records
+            .iter()
+            .map(|record| {
+                let hash = record["hash"]
+                    .as_str()
+                    .ok_or_else(|| CheckError::new(stage, "archive_reference"))?;
+                let bytes = archive
+                    .get(hash)
+                    .map_err(|_| CheckError::new(stage, "archive_read"))?;
+                if record["bytes"].as_u64() != Some(bytes.len() as u64) {
+                    return Err(CheckError::new(stage, "archive_length"));
+                }
+                serde_json::from_slice(&bytes)
+                    .map_err(|_| CheckError::new(stage, "archive_document"))
+            })
+            .collect();
+        document["sessions"]["default"]["turns"] =
+            serde_json::to_value(turns?).map_err(|_| CheckError::new(stage, "session_document"))?;
     }
     let snapshot: SessionSnapshot = serde_json::from_value(document["sessions"]["default"].clone())
         .map_err(|_| CheckError::new(stage, "session_document"))?;
