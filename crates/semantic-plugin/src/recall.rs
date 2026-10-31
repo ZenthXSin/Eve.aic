@@ -15,6 +15,30 @@ pub const MIN_SIMILARITY: f32 = 0.35;
 const RRF_K: f64 = 60.0;
 const ELLIPSIS: &str = "…";
 
+// 排序只需元数据及最终片段，不应为全部候选继续保留嵌入输入前缀。
+struct SemanticCandidate {
+    similarity: f32,
+    evidence_revision: u64,
+    key: String,
+    hit: MemoryRecallHit,
+}
+impl SemanticCandidate {
+    fn new(similarity: f32, item: crate::items::Item) -> Self {
+        let (text, truncated) = excerpt(&item.text);
+        Self {
+            similarity,
+            evidence_revision: item.evidence_revision,
+            key: item.key,
+            hit: MemoryRecallHit {
+                score: 0,
+                source: item.source,
+                excerpt: text,
+                excerpt_truncated: truncated,
+            },
+        }
+    }
+}
+
 pub struct HybridRecall {
     memory: Arc<dyn MemoryAdmin>,
     lexical: Arc<dyn MemoryRecallFactory>,
@@ -119,7 +143,7 @@ impl HybridReader {
             let vector = entry.restore().ok_or(MemoryError::CorruptState)?;
             let similarity = cosine(query, &vector);
             if similarity >= MIN_SIMILARITY {
-                semantic.push((similarity, item));
+                semantic.push(SemanticCandidate::new(similarity, item));
             }
             Ok(())
         };
@@ -163,30 +187,20 @@ impl HybridReader {
         }
         semantic.sort_by(|left, right| {
             right
-                .0
-                .total_cmp(&left.0)
-                .then_with(|| right.1.evidence_revision.cmp(&left.1.evidence_revision))
-                .then_with(|| left.1.key.cmp(&right.1.key))
+                .similarity
+                .total_cmp(&left.similarity)
+                .then_with(|| right.evidence_revision.cmp(&left.evidence_revision))
+                .then_with(|| left.key.cmp(&right.key))
         });
         let mut fused: BTreeMap<String, (f64, MemoryRecallHit)> = BTreeMap::new();
         for (rank, hit) in lexical.hits.into_iter().enumerate() {
             let key = source_key(&hit.source);
             fused.insert(key, (1.0 / (RRF_K + rank as f64 + 1.0), hit));
         }
-        for (rank, (_, item)) in semantic.into_iter().enumerate() {
+        for (rank, candidate) in semantic.into_iter().enumerate() {
             let contribution = 1.0 / (RRF_K + rank as f64 + 1.0);
-            let entry = fused.entry(item.key.clone()).or_insert_with(|| {
-                let (excerpt, excerpt_truncated) = excerpt(&item.text);
-                (
-                    0.0,
-                    MemoryRecallHit {
-                        score: 0,
-                        source: item.source.clone(),
-                        excerpt,
-                        excerpt_truncated,
-                    },
-                )
-            });
+            // 词项命中已经选择的原片段优先；同来源只累加贡献，不替换来源或片段。
+            let entry = fused.entry(candidate.key).or_insert((0.0, candidate.hit));
             entry.0 += contribution;
         }
         let mut ranked: Vec<(String, f64, MemoryRecallHit)> = fused
