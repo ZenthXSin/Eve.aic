@@ -178,6 +178,29 @@ impl StoredTasks {
         })
     }
 
+    pub(super) fn summaries_for(&self, owner: &TaskOwner) -> TaskResult<Vec<TaskSummary>> {
+        validate_owner(owner)?;
+        Ok(self
+            .lock()?
+            .ledger
+            .tasks
+            .iter()
+            .filter(|task| task.owner == *owner)
+            .map(TaskSummary::from)
+            .collect())
+    }
+    pub(super) fn get_owned(&self, owner: &TaskOwner, id: &str) -> TaskResult<Option<Task>> {
+        validate_owner(owner)?;
+        validate_id(id)?;
+        Ok(self
+            .lock()?
+            .ledger
+            .tasks
+            .iter()
+            .find(|task| task.id == id && task.owner == *owner)
+            .cloned())
+    }
+
     pub(super) fn create(
         &self,
         owner: &TaskOwner,

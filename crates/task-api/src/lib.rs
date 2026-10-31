@@ -322,6 +322,30 @@ impl Task {
     }
 }
 
+/// 只读任务目录；不携带委派上下文、检查点正文、结果或通知回执。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSummary {
+    pub id: String,
+    pub owner: TaskOwner,
+    pub title: String,
+    pub instructions: String,
+    pub created_at_ms: u64,
+    pub status: TaskStatus,
+}
+impl From<&Task> for TaskSummary {
+    fn from(task: &Task) -> Self {
+        Self {
+            id: task.id.clone(),
+            owner: task.owner.clone(),
+            title: task.spec.title.clone(),
+            instructions: task.spec.instructions.clone(),
+            created_at_ms: task.created_at_ms,
+            status: task.status,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub struct TaskSnapshot {
     pub tasks: Vec<Task>,
@@ -401,6 +425,28 @@ impl TaskSnapshot {
 /// 仅可信宿主持有；不发布给模型或不受信插件。
 pub trait TaskAdmin: Send + Sync {
     fn snapshot(&self) -> TaskResult<TaskSnapshot>;
+    /// owner 必须来自可信宿主；返回同一完整身份的轻量目录，不创建任务或重领预算。
+    fn summaries_for(&self, owner: &TaskOwner) -> TaskResult<Vec<TaskSummary>> {
+        validate_owner(owner)?;
+        Ok(self
+            .snapshot()?
+            .tasks
+            .iter()
+            .filter(|task| task.owner == *owner)
+            .map(TaskSummary::from)
+            .collect())
+    }
+    /// 按可信身份读取一个完整任务；未知 ID 与其他身份的任务均为 None。
+    fn get_owned(&self, owner: &TaskOwner, id: &str) -> TaskResult<Option<Task>> {
+        validate_owner(owner)?;
+        validate_id(id)?;
+        Ok(self
+            .snapshot()?
+            .tasks
+            .into_iter()
+            .find(|task| task.id == id && task.owner == *owner))
+    }
+
     /// 可选的宿主策略装配：在首次执行前固定选择；普通任务默认不使用策略。
     fn strategy_guidance(&self, _task: &Task) -> TaskResult<Option<TaskStrategyGuidance>> {
         Ok(None)

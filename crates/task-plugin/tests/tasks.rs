@@ -937,3 +937,81 @@ async fn bounded_create_keeps_original_authorization_deadline_atomically_across_
         Some(1000)
     );
 }
+
+#[tokio::test]
+async fn scoped_task_directory_omits_heavy_context_and_full_reads_keep_both_identity_fields() {
+    let world = World::new();
+    let (kernel, admin) = world.open().await.unwrap();
+    let alice = owner("alice");
+    let mut heavy = spec("自己的任务");
+    heavy.context = Some(DelegatedContext {
+        owner: alice.clone(),
+        messages_json: serde_json::to_string(&vec![eve_llm_api::ChatMessage::text(
+            eve_llm_api::ChatRole::User,
+            "CONFIDENTIAL_CONTEXT_秘密".repeat(10_000),
+        )])
+        .unwrap(),
+    });
+    let own = admin.create(&alice, heavy, "own", 100).unwrap();
+    let other_session = TaskOwner {
+        session_id: "another-session".into(),
+        ..alice.clone()
+    };
+    let other_user = TaskOwner {
+        user_id: "bob".into(),
+        ..alice.clone()
+    };
+    let foreign = admin
+        .create(&other_session, spec("另一个会话"), "other-session", 101)
+        .unwrap();
+    admin
+        .create(&other_user, spec("另一个用户"), "other-user", 102)
+        .unwrap();
+    let before = world.raw();
+    let summaries = admin.summaries_for(&alice).unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].id, own.id);
+    assert_eq!(summaries[0].instructions, own.spec.instructions);
+    let encoded = serde_json::to_string(&summaries).unwrap();
+    assert!(!encoded.contains("CONFIDENTIAL_CONTEXT"));
+    assert!(encoded.len() < 1024);
+    let body = admin.get_owned(&alice, &own.id).unwrap().unwrap();
+    assert!(body == own);
+    assert!(admin.get_owned(&alice, &foreign.id).unwrap().is_none());
+    assert!(admin.get_owned(&other_session, &own.id).unwrap().is_none());
+    assert!(admin.get_owned(&other_user, &own.id).unwrap().is_none());
+    assert!(admin.get_owned(&alice, "unknown").unwrap().is_none());
+    let invalid = TaskOwner {
+        user_id: String::new(),
+        ..alice.clone()
+    };
+    assert_eq!(admin.summaries_for(&invalid), Err(TaskError::InvalidInput));
+    assert!(matches!(
+        admin.get_owned(&invalid, &own.id),
+        Err(TaskError::InvalidInput)
+    ));
+    assert!(matches!(
+        admin.get_owned(&alice, ""),
+        Err(TaskError::InvalidInput)
+    ));
+    assert_eq!(
+        world.raw(),
+        before,
+        "只读目录、正文与错误不能写状态或新建任务"
+    );
+    let old = admin.clone();
+    kernel.stop_all().await.unwrap();
+    assert_eq!(old.summaries_for(&alice), Err(TaskError::Unavailable));
+    assert!(matches!(
+        old.get_owned(&alice, &own.id),
+        Err(TaskError::Unavailable)
+    ));
+    let (kernel, restored) = world.open().await.unwrap();
+    assert_eq!(restored.summaries_for(&alice).unwrap(), summaries);
+    assert!(restored.get_owned(&alice, &own.id).unwrap().unwrap() == own);
+    assert!(matches!(
+        old.get_owned(&alice, &own.id),
+        Err(TaskError::Unavailable)
+    ));
+    kernel.stop_all().await.unwrap();
+}

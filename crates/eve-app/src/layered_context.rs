@@ -114,24 +114,51 @@ impl Planner {
         )
     }
     fn work(&self, scope: &ContextScope, query: &str) -> Result<Value, LlmError> {
+        let owner = eve_task_api::TaskOwner {
+            session_id: scope.session_id.clone(),
+            user_id: scope.user_id.clone(),
+        };
         let mut tasks = self
             .tasks
             .as_ref()
-            .map(|a| a.snapshot())
+            .map(|admin| admin.summaries_for(&owner))
             .transpose()
             .map_err(|_| fail("工作集任务账本不可用"))?
-            .map_or(vec![], |s| s.tasks);
-        tasks
-            .retain(|t| t.owner.session_id == scope.session_id && t.owner.user_id == scope.user_id);
+            .unwrap_or_default();
+        if tasks.iter().any(|task| task.owner != owner) {
+            return Err(fail("工作集任务目录身份不匹配"));
+        }
         let query = terms(query);
-        tasks.sort_by_key(|t| {
+        tasks.sort_by_key(|task| {
             (
-                t.status.finished(),
-                std::cmp::Reverse(score(&query, &t.spec.instructions)),
-                std::cmp::Reverse(t.created_at_ms),
+                task.status.finished(),
+                std::cmp::Reverse(score(&query, &task.instructions)),
+                std::cmp::Reverse(task.created_at_ms),
             )
         });
-        let records:Vec<_>=tasks.into_iter().filter(|t|!t.status.finished()||score(&query,&t.spec.instructions)>0).take(1).map(|t| {
+        let selected = tasks
+            .into_iter()
+            .find(|task| !task.status.finished() || score(&query, &task.instructions) > 0);
+        let task = selected
+            .map(|selected| {
+                let task = self
+                    .tasks
+                    .as_ref()
+                    .ok_or_else(|| fail("工作集任务账本不可用"))?
+                    .get_owned(&owner, &selected.id)
+                    .map_err(|_| fail("工作集目标任务不可用"))?;
+                if task
+                    .as_ref()
+                    .is_some_and(|task| task.owner != owner || task.id != selected.id)
+                {
+                    return Err(fail("工作集目标任务身份不匹配"));
+                }
+                // 结束任务可能在两次读取之间按既有容量策略腾出；不能伪造旧正文。
+                Ok(task)
+            })
+            .transpose()?
+            .flatten();
+        let records:Vec<_>=task.into_iter().map(|t| {
             let checkpoint=t.execution.as_ref().and_then(|e|e.checkpoint.as_ref());
             let receipts:Vec<_>=checkpoint.into_iter().flat_map(|c|&c.messages).flat_map(|m|&m.tool_results).rev().take(8).map(|r|json!({"call_id":r.call_id,"recorded_output": match &r.output {ToolOutput::Success(_)=>"success_receipt",ToolOutput::Failure{..}=>"failure_receipt"},"reference":format!("task:{}",t.id)})).collect();
             json!({"task_id":t.id,"reference":format!("task:{}",t.id),"goal":t.spec.title,"constraints_and_original_instructions":t.spec.instructions,"status":t.status,"cancel_requested":t.cancel_requested,"next_step":checkpoint.and_then(|c|c.remaining.as_ref()),"pending_unknown_calls":checkpoint.map(|c|c.pending_calls.iter().map(|v|&v.id).collect::<Vec<_>>()).unwrap_or_default(),"recorded_tool_outcomes":receipts,"reported_result":t.result.as_deref().map(|s|excerpt(s,2048)),"failure":t.failure.as_deref().map(|s|excerpt(s,1024)),"authorization_deadline_at_ms":t.execution.as_ref().and_then(|e|e.authorization_deadline_at_ms),"budget_is_original":true,"original_max_steps":t.spec.max_steps,"used_tool_calls":checkpoint.map(|c|c.used_tool_calls),"delegated_tool_calls":checkpoint.map(|c|c.delegated_tool_calls),"provider_requests":checkpoint.map(|c|c.provider_requests),"reported_result_truncated":t.result.as_ref().is_some_and(|s|s.len()>2048),"failure_truncated":t.failure.as_ref().is_some_and(|s|s.len()>1024)})
@@ -459,23 +486,23 @@ impl Tool for ReadRecord {
             }
             let reference = call.arguments["reference"].as_str().unwrap();
             let raw = if let Some(id) = reference.strip_prefix("task:") {
-                let snapshot = self
+                if eve_task_api::validate_id(id).is_err() {
+                    return Err(failed("没有本scope的该记录"));
+                }
+                let owner = eve_task_api::TaskOwner {
+                    session_id: scope.session_id.clone(),
+                    user_id: scope.user_id.clone(),
+                };
+                let task = self
                     .0
                     .tasks
                     .as_ref()
                     .ok_or_else(|| failed("后台任务未开启"))?
-                    .snapshot()
-                    .map_err(|_| failed("任务账本不可用"))?;
-                let task = snapshot
-                    .tasks
-                    .iter()
-                    .find(|t| {
-                        t.id == id
-                            && t.owner.session_id == scope.session_id
-                            && t.owner.user_id == scope.user_id
-                    })
+                    .get_owned(&owner, id)
+                    .map_err(|_| failed("任务账本不可用"))?
+                    .filter(|task| task.id == id && task.owner == owner)
                     .ok_or_else(|| failed("没有本scope的该记录"))?;
-                serde_json::to_string(task).map_err(|_| failed("任务记录无法编码"))?
+                serde_json::to_string(&task).map_err(|_| failed("任务记录无法编码"))?
             } else {
                 let mut selected = None;
                 self.for_each_record(scope, |group| {

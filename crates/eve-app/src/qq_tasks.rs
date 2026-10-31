@@ -213,24 +213,19 @@ struct WorkerRequest {
 
 struct TaskJournal {
     tasks: Arc<dyn TaskAdmin>,
+    owner: TaskOwner,
     id: String,
     deadline_at_ms: u64,
 }
 impl eve_llm_api::TurnJournal for TaskJournal {
     fn load(&self) -> Result<Option<eve_llm_api::TurnCheckpoint>, LlmError> {
-        let snapshot = self
+        let task = self
             .tasks
-            .snapshot()
-            .map_err(|_| LlmError::Context("执行日志不可用；未自动回退".into()))?;
-        let task = snapshot
-            .tasks
-            .iter()
-            .find(|task| task.id == self.id)
+            .get_owned(&self.owner, &self.id)
+            .map_err(|_| LlmError::Context("执行日志不可用；未自动回退".into()))?
+            .filter(|task| task.id == self.id && task.owner == self.owner)
             .ok_or_else(|| LlmError::Context("执行日志缺少任务；未自动回退".into()))?;
-        Ok(task
-            .execution
-            .as_ref()
-            .and_then(|execution| execution.checkpoint.clone()))
+        Ok(task.execution.and_then(|execution| execution.checkpoint))
     }
     fn save(&self, checkpoint: &eve_llm_api::TurnCheckpoint) -> Result<(), LlmError> {
         self.tasks
@@ -1660,6 +1655,7 @@ async fn run(
                     started.execution.as_ref().map(|_| {
                         Arc::new(TaskJournal {
                             tasks: tasks.clone(),
+                            owner: started.owner.clone(),
                             id: started.id.clone(),
                             deadline_at_ms,
                         }) as Arc<dyn eve_llm_api::TurnJournal>
