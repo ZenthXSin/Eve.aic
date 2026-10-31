@@ -17,7 +17,7 @@ use std::{
 
 // 编译器的地址空间上限是每进程的；跨会话也只能同时启动一个编译器，
 // 避免多个各自合法的编译叠加挤占宿主。排队仍服从原调用取消和期限。
-static COMPILE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+pub(crate) static COMPILE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 const MAX_RUST_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RUST_CACHE: usize = 32;

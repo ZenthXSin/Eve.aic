@@ -2110,6 +2110,7 @@ async fn run_qqbot_composed(
             (None, None) => {},
             _ => return Err("容器沙箱需要同时配置 EVE_SCRIPT_CONTAINER_CLI 与 EVE_SCRIPT_CONTAINER_IMAGE".into()),
         }
+        script_sandbox = crate::qq_scripts::configure_cargo(script_sandbox)?;
         let script_tools = crate::qq_scripts::ScriptTools::open(
             options.state_directory.join("script-plugins"),
             script_sandbox,

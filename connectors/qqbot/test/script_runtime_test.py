@@ -229,6 +229,56 @@ print(json.dumps({'op':'return','value':{'forged':forged,'recent':recent,'model'
         self.assertEqual(ledger.read_bytes(), before, '只读恢复和拒绝越界查询不得改写插件账本')
         self.assertEqual(self.errors, [])
 
+    @unittest.skipUnless(os.environ.get('EVE_TEST_CARGO_IMAGE'), '需显式装配可信离线Cargo验收资源')
+    def test_cargo_dependency_plugin_is_saved_executed_and_restored_in_real_host(self):
+        version = None
+        source = r'''use std::io::{self,BufRead};
+fn main(){let mut line=String::new();io::stdin().lock().read_line(&mut line).unwrap();let input:serde_json::Value=serde_json::from_str(&line).unwrap();println!("{}",serde_json::json!({"op":"return","value":{"verified":input["arguments"]["value"]}}));}'''
+        spec = {'name':'cargo-qq', 'language':{'rust_cargo':{
+            'dependencies':{'serde_json':os.environ['EVE_TEST_CARGO_SERDE_JSON']},
+            'bundle_sha256':os.environ['EVE_TEST_CARGO_BUNDLE_SHA256']}},
+            'source':source, 'dependencies':{}, 'tools':[],
+            'state_schema':{'version':1,'fields':{}}, 'initial_state':{}}
+        def respond(body):
+            nonlocal version
+            results=self.results(body)
+            if not results:
+                return self.tools([('list_script_plugins',{})])
+            self.assertNotIn('error',results[-1],results[-1])
+            if len(results)==1:
+                cargo=results[0]['cargo']
+                self.assertTrue(cargo['configured'])
+                self.assertFalse(cargo['availability_verified'])
+                self.assertEqual(cargo['bundle_sha256'],os.environ['EVE_TEST_CARGO_BUNDLE_SHA256'])
+                if version is None:
+                    return self.tools([('save_script_plugin',{'spec':spec})])
+                return self.tools([('run_script_plugin',{'version':version,'arguments':{'value':84}})])
+            if version is None:
+                saved=results[-1]
+                self.assertTrue(saved['saved'],saved)
+                self.assertTrue(saved['compiled'])
+                self.assertFalse(saved['executed'])
+                self.assertEqual(saved['version']['spec']['language'],'rust')
+                version=saved['version']['reference']
+                return self.tools([('activate_script_plugin',{'version':version})])
+            if len(results)==3:
+                return self.tools([('run_script_plugin',{'version':version,'arguments':{'value':42}})])
+            receipt=results[-1]['receipt']
+            self.assertEqual(receipt['status'],'succeeded',receipt)
+            self.assertEqual(receipt['version'],version)
+            self.assertEqual(receipt['result'],{'verified':42 if len(results)==4 else 84})
+            return text_response('已通过离线Cargo插件核验')
+        self.callback=respond
+        configuration={'EVE_DEVELOPER_CONFIG':str(self.developer_config)}
+        for suffix in ('CLI','IMAGE','TOOLCHAIN','VENDOR','BUNDLE_SHA256'):
+            configuration['EVE_SCRIPT_CARGO_'+suffix]=os.environ['EVE_TEST_CARGO_'+suffix]
+        for index in range(2):
+            self.run_eve(self.send(self.message('cargo-'+str(index),'编写并实际运行依赖serde_json的插件' if not index else '重启后运行固定版本',expected='已通过离线Cargo插件核验')),
+                interest=False,memory=True,research=False,practice=False,env_extra=configuration)
+        self.assertEqual(len(self.kind('chat')),8)
+        self.assertEqual(len(self.kind('review')),0)
+        self.assertEqual(self.errors,[])
+
 
 if __name__ == '__main__':
     unittest.main()

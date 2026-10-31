@@ -14,7 +14,7 @@ pub struct ContainerSandbox {
 }
 impl ContainerSandbox {
     pub(crate) fn preflight(&self, language: &Language) -> Result<()> {
-        if *language == Language::Rust {
+        if language.is_rust() {
             return Err(reject("当前容器后端没有可信Rust编译器，拒绝降级"));
         }
         if !self.cli.is_absolute()
@@ -102,7 +102,9 @@ impl ContainerSandbox {
             "30",
         ]);
         match version.spec.language {
-            Language::Rust => return Err(reject("容器Rust编译后端尚未实现，拒绝降级")),
+            Language::Rust | Language::RustCargo(_) => {
+                return Err(reject("容器Rust运行后端尚未实现，拒绝降级"));
+            }
             Language::Python => {
                 command.args(["/usr/bin/python3", "-I", "-B", "-u", "/entry"]);
             }

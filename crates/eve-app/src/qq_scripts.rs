@@ -93,6 +93,44 @@ impl AuthorizedToolDispatch for LateDispatch {
     }
 }
 
+/// Cargo编译资源仅由宿主装配；缺项时拒绝启动，不能降级在宿主运行Cargo。
+pub(crate) fn configure_cargo(sandbox: Bubblewrap) -> std::result::Result<Bubblewrap, String> {
+    let names = [
+        "EVE_SCRIPT_CARGO_CLI",
+        "EVE_SCRIPT_CARGO_IMAGE",
+        "EVE_SCRIPT_CARGO_TOOLCHAIN",
+        "EVE_SCRIPT_CARGO_VENDOR",
+        "EVE_SCRIPT_CARGO_BUNDLE_SHA256",
+    ];
+    let values: Vec<_> = names.iter().map(std::env::var_os).collect();
+    if values.iter().all(Option::is_none) {
+        return Ok(sandbox);
+    }
+    if values.iter().any(Option::is_none) {
+        return Err(
+            "离线Cargo编译器需要同时配置CLI、IMAGE、TOOLCHAIN、VENDOR、BUNDLE_SHA256".into(),
+        );
+    }
+    let string = |index: usize| {
+        values[index]
+            .as_ref()
+            .and_then(|v| v.to_str())
+            .map(str::to_owned)
+            .ok_or_else(|| "Cargo配置必须是有效UTF-8".to_owned())
+    };
+    let compiler =
+        eve_script_runtime::CargoCompiler::new(eve_script_runtime::CargoCompilerConfig {
+            cli: string(0)?.into(),
+            socket: "/var/run/docker.sock".into(),
+            image: string(1)?,
+            toolchain: string(2)?.into(),
+            vendor: string(3)?.into(),
+            bundle_sha256: string(4)?,
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(sandbox.with_cargo(Arc::new(compiler)))
+}
+
 pub struct ScriptTools {
     store: Arc<ScriptStore>,
     runtime: ScriptRuntime,
@@ -214,12 +252,12 @@ impl Tool for ScriptTool {
     fn definition(&self) -> ToolDefinition {
         let (description, properties, required) = match self.kind {
             0 => (
-                "保存不可变 Python/JavaScript/Rust 脚本插件版本，不运行业务代码；Rust先在可信Linux沙箱独立编译std-only候选，失败返回 saved=false、compiled=false 和 compilation 中的退出码/信号/最多8192字节实际诊断（truncated 表明截断），按诊断修复后重新保存，不得把失败当成功；编译扣共享预算。spec 含 name、language(python/javascript/rust)、source、dependencies(别名到{script,digest})、tools(允许叶子名)、state_schema({version,fields:{字段:string/number/integer/boolean/object/array/null}})、initial_state。进程通过stdin/stdout每行JSON协议调用宿主，不能获取凭据或直接网络。声明工具不授予权限。先使用dry_run预检；保存后需activate初始化状态。",
+                "保存不可变 Python/JavaScript/Rust 脚本插件版本，不运行业务代码；Rust先在可信Linux沙箱独立编译候选；标准库使用language=rust。依赖crate时先list_script_plugins查看cargo.configured及bundle_sha256，再传language={rust_cargo:{dependencies:{crate名:精确x.y.z版本},bundle_sha256,build_source:可选构建源码}}，source仍为Rust；只接受可信冻结公共vendor，离线容器编译，产物SHA绑定版本，重建不一致拒绝运行，不自动下载依赖或调用宿主Cargo。保存后的language=rust、source带保护配方头，编辑时应保留或重新提交Cargo设置。，失败返回 saved=false、compiled=false 和 compilation 中的退出码/信号/最多8192字节实际诊断（truncated 表明截断），按诊断修复后重新保存，不得把失败当成功；编译扣共享预算。spec 含 name、language(python/javascript/rust)、source、dependencies(别名到{script,digest})、tools(允许叶子名)、state_schema({version,fields:{字段:string/number/integer/boolean/object/array/null}})、initial_state。进程通过stdin/stdout每行JSON协议调用宿主，不能获取凭据或直接网络。声明工具不授予权限。先使用dry_run预检；保存后需activate初始化状态。",
                 json!({"spec":{"type":"object"}}),
                 vec!["spec"],
             ),
             1 => (
-                "无参数时列出当前可信会话的脚本版本摘要、启用版本及状态，不加载全部源码。修改或诊断脚本前传 version={script,digest} 读取该不可变版本完整源码和声明；call_id 查询真实调用回执，不能与 version 同时提供。只能读取当前可信会话自己的版本。unknown 表示结果未知，禁止自动重放。版本保存不代表业务成功或权限已授予。",
+                "无参数时列出当前可信会话的脚本版本摘要、启用版本、状态和Cargo配置（configured不代表daemon健康或已授权），不加载全部源码。修改或诊断脚本前传 version={script,digest} 读取该不可变版本完整源码和声明；call_id 查询真实调用回执，不能与 version 同时提供。只能读取当前可信会话自己的版本。unknown 表示结果未知，禁止自动重放。版本保存不代表业务成功或权限已授予。",
                 json!({"call_id":{"type":"string"},"version":{"type":"object","properties":{"script":{"type":"string"},"digest":{"type":"string"}},"required":["script","digest"],"additionalProperties":false}}),
                 vec![],
             ),
@@ -258,7 +296,7 @@ impl Tool for ScriptTool {
             match self.kind {
                 0 => {
                     let args: Save = serde_json::from_value(call.arguments).map_err(rejected)?;
-                    let compiled = args.spec.language == eve_script_runtime::Language::Rust;
+                    let compiled = args.spec.language.is_rust();
                     match self
                         .service
                         .runtime
@@ -295,7 +333,9 @@ impl Tool for ScriptTool {
                             Ok(json!({"version":version,"selected":selected,"state":state}))
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    Ok(json!({"versions":versions}))
+                    Ok(
+                        json!({"versions":versions,"cargo":self.service.sandbox.cargo_configuration()}),
+                    )
                 }
                 2 => {
                     let args: Activate =

@@ -23,6 +23,11 @@ impl ScriptRuntime {
         if migration.source.is_empty() || migration.source.len() > MAX_SOURCE_BYTES {
             return Err(reject("迁移源码为空或超限"));
         }
+        if matches!(migration.language, crate::Language::RustCargo(_)) {
+            return Err(reject(
+                "Cargo迁移尚未装配，请使用Python/JS/标准Rust隔离迁移",
+            ));
+        }
         self.sandbox.preflight(&migration.language)?;
         let deadline = context
             .deadline()

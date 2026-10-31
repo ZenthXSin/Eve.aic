@@ -40,6 +40,14 @@ struct Chain {
     root_call_id: String,
     deadline: Instant,
 }
+fn cargo_recipe(spec: &crate::ScriptSpec) -> Result<Option<(crate::CargoSettings, String)>> {
+    match &spec.language {
+        crate::Language::RustCargo(settings) => Ok(Some((settings.clone(), spec.source.clone()))),
+        crate::Language::Rust => Ok(crate::cargo_model::decoded_source(&spec.source)?
+            .map(|(settings, source)| (settings, source.into()))),
+        _ => Ok(None),
+    }
+}
 struct InvocationGuard {
     store: Arc<ScriptStore>,
     owner: ContextScope,
@@ -92,12 +100,58 @@ impl ScriptRuntime {
     /// Rust 候选隔离编译失败时返回实际诊断，不写入版本、不改活动状态。
     pub async fn prepare_candidate(
         &self,
-        spec: crate::ScriptSpec,
+        mut spec: crate::ScriptSpec,
         context: ToolExecutionContext,
     ) -> Result<crate::CandidatePreparation> {
         let owner = context.scope().ok_or_else(|| reject("发布缺少可信身份"))?;
         spec.validate()?;
-        if spec.language == crate::Language::Rust {
+        let cargo = cargo_recipe(&spec)?;
+        if let Some((mut settings, source)) = cargo {
+            let compiler = self
+                .sandbox
+                .cargo
+                .as_ref()
+                .ok_or_else(|| reject("未配置可信离线Cargo编译器"))?;
+            match compiler
+                .compile(&settings.project(&source), context.clone())
+                .await?
+            {
+                crate::CargoCompilation::Ready(artifact) => {
+                    settings.artifact_sha256 = Some(artifact.sha256().into());
+                    spec.source = crate::cargo_model::encoded_source(&settings, &source)?;
+                    spec.language = crate::Language::Rust;
+                }
+                crate::CargoCompilation::Failed(report) => {
+                    let mut diagnostics = format!(
+                        "{} [{}]: {}",
+                        report.code,
+                        report.stage.as_deref().unwrap_or("unknown"),
+                        report.diagnostics
+                    );
+                    let mut end = diagnostics.len().min(8192);
+                    while !diagnostics.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let truncated = report.truncated || end < diagnostics.len();
+                    diagnostics.truncate(end);
+                    return Ok(crate::CandidatePreparation::CompilationFailed(
+                        crate::CompilationFailure {
+                            language: crate::Language::RustCargo(settings),
+                            exit_code: report.exit_code,
+                            signal: None,
+                            diagnostics,
+                            truncated,
+                        },
+                    ));
+                }
+            }
+            check_stop(
+                &context,
+                context
+                    .deadline()
+                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(30)),
+            )?;
+        } else if spec.language == crate::Language::Rust {
             let deadline = context
                 .deadline()
                 .unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
@@ -165,7 +219,10 @@ impl ScriptRuntime {
         }
         let mut tools = BTreeSet::new();
         for version in bound.versions.values() {
-            self.sandbox.preflight(&version.spec.language)?;
+            let language = cargo_recipe(&version.spec)?
+                .map(|(settings, _)| crate::Language::RustCargo(settings))
+                .unwrap_or_else(|| version.spec.language.clone());
+            self.sandbox.preflight(&language)?;
             self.store.state(&bound.owner, &version.reference)?;
             for name in &version.spec.tools {
                 self.dispatch.preflight_tool(name, context)?;
@@ -347,7 +404,35 @@ impl ScriptRuntime {
     ) -> Result<Value> {
         let mut source = tempfile::NamedTempFile::new().map_err(fail)?;
         std::io::Write::write_all(&mut source, version.spec.source.as_bytes()).map_err(fail)?;
-        let compiled = if version.spec.language == crate::Language::Rust {
+        let cargo = cargo_recipe(&version.spec)?;
+        let cargo_artifact = if let Some((settings, source)) = &cargo {
+            let compiler = self
+                .sandbox
+                .cargo
+                .as_ref()
+                .ok_or_else(|| reject("未配置可信离线Cargo编译器"))?;
+            match compiler
+                .compile(&settings.project(source), context.clone())
+                .await?
+            {
+                crate::CargoCompilation::Ready(artifact) => {
+                    if settings.artifact_sha256.as_deref() != Some(artifact.sha256()) {
+                        return Err(reject(
+                            "Cargo重建产物与固定版本摘要不同，未执行、未自动替换",
+                        ));
+                    }
+                    Some(artifact)
+                }
+                crate::CargoCompilation::Failed(_) => {
+                    return Err(reject(
+                        "Cargo固定版本重建失败，未执行；使用候选准备入口查看编译诊断",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let compiled = if cargo.is_none() && version.spec.language == crate::Language::Rust {
             Some(
                 self.sandbox
                     .prepare_rust(&version.spec.source, context, chain.deadline)
@@ -356,10 +441,14 @@ impl ScriptRuntime {
         } else {
             None
         };
-        let executable = compiled
-            .as_ref()
-            .map(|compiled| compiled.binary.as_path())
-            .unwrap_or(source.path());
+        let executable = if let Some(artifact) = &cargo_artifact {
+            artifact.verified_binary()?
+        } else {
+            compiled
+                .as_ref()
+                .map(|compiled| compiled.binary.as_path())
+                .unwrap_or(source.path())
+        };
         let mut child = self.sandbox.spawn(version, executable, chain.work.path())?;
         let mut input = child.stdin.take().ok_or_else(|| fail("子进程缺少 stdin"))?;
         let output = child
