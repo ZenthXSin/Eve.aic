@@ -2,7 +2,7 @@
 //! 已不再可召回的条目（例如撤销的偏好）一并移出。先请求向量，成功后一次提交；请求失败不写入。
 use crate::{
     SemanticIndex,
-    items::{content_hash, embed_input, layout, scope_key},
+    items::{LayoutPart, content_hash, embed_input, scan_layout, scope_key},
     segments::{SegmentError, SegmentKey, content_key, profile_key},
     store::{IndexEntry, IndexError},
 };
@@ -50,6 +50,16 @@ struct Plan {
     indexed: usize,
 }
 
+#[derive(Default)]
+struct ScopePlan {
+    wanted: BTreeSet<(String, String)>,
+    pending: Vec<Pending>,
+    block: Option<(SegmentKey, Vec<Pending>)>,
+    pending_count: usize,
+    block_pending_count: usize,
+    indexed: usize,
+}
+
 impl Indexer {
     pub fn new(
         memory: Arc<dyn MemoryAdmin>,
@@ -83,73 +93,107 @@ impl Indexer {
                 .memory
                 .reader(scope.clone())
                 .map_err(|_| IndexStepError::Memory)?;
-            let layout =
-                layout(reader.as_ref(), segments.is_some()).map_err(|_| IndexStepError::Memory)?;
             let key = scope_key(&scope);
-            for item in layout.ledger {
-                let Some(input) = embed_input(&item) else {
-                    continue;
-                };
-                let hash = content_hash(&input);
-                wanted.insert((key.clone(), item.key.clone()));
-                if current.get(&(key.clone(), item.key.clone())) == Some(&hash) {
-                    indexed += 1;
-                } else {
-                    pending_count += 1;
-                    if pending.len() < MAX_EMBED_BATCH {
-                        pending.push(Pending {
-                            scope: key.clone(),
-                            item: item.key,
-                            content_sha256: hash,
-                            input,
-                        });
+            let available = MAX_EMBED_BATCH.saturating_sub(pending.len());
+            let choose_block = block.is_none();
+            let scanned = scan_layout(
+                reader.as_ref(),
+                segments.is_some(),
+                |actual, _| {
+                    if *actual != scope {
+                        return Err(eve_memory_api::MemoryError::CorruptState);
                     }
-                }
+                    Ok(ScopePlan::default())
+                },
+                |plan, part| {
+                    match part {
+                        LayoutPart::Ledger(ledger) => {
+                            for item in ledger {
+                                let Some(input) = embed_input(&item) else {
+                                    continue;
+                                };
+                                let hash = content_hash(&input);
+                                let identity = (key.clone(), item.key.clone());
+                                let previous = current.get(&identity);
+                                // wanted 只用于核对现有索引的淘汰，不需记住尚不存在的来源。
+                                if previous.is_some() {
+                                    plan.wanted.insert(identity);
+                                }
+                                if previous == Some(&hash) {
+                                    plan.indexed += 1;
+                                } else {
+                                    plan.pending_count += 1;
+                                    if plan.pending.len() < available {
+                                        plan.pending.push(Pending {
+                                            scope: key.clone(),
+                                            item: item.key,
+                                            content_sha256: hash,
+                                            input,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        LayoutPart::Block(archived) => {
+                            let segments =
+                                segments.ok_or(eve_memory_api::MemoryError::CorruptState)?;
+                            let items: Vec<Pending> = archived
+                                .items
+                                .into_iter()
+                                .filter_map(|item| {
+                                    let input = embed_input(&item)?;
+                                    Some(Pending {
+                                        scope: key.clone(),
+                                        content_sha256: content_hash(&input),
+                                        item: item.key,
+                                        input,
+                                    })
+                                })
+                                .collect();
+                            let pairs: Vec<_> = items
+                                .iter()
+                                .map(|item| (item.item.clone(), item.content_sha256.clone()))
+                                .collect();
+                            let segment = SegmentKey {
+                                profile: profile_key(profile),
+                                scope: key.clone(),
+                                first_revision: archived.first_revision,
+                                last_revision: archived.last_revision,
+                                content: content_key(&pairs),
+                            };
+                            if segments
+                                .contains(&segment)
+                                .map_err(|_| eve_memory_api::MemoryError::CorruptState)?
+                            {
+                                plan.indexed += items.len();
+                            } else {
+                                // 未建好的冷段原热索引仍保留，不能在扫描阶段提交淘汰。
+                                for item in &items {
+                                    let identity = (item.scope.clone(), item.item.clone());
+                                    if current.contains_key(&identity) {
+                                        plan.wanted.insert(identity);
+                                    }
+                                }
+                                plan.block_pending_count += items.len();
+                                if choose_block && plan.block.is_none() {
+                                    plan.block = Some((segment, items));
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(|_| IndexStepError::Memory)?
+            .value;
+            wanted.extend(scanned.wanted);
+            pending.extend(scanned.pending);
+            if block.is_none() {
+                block = scanned.block;
             }
-            let Some(segments) = segments else {
-                continue;
-            };
-            for archived in layout.blocks {
-                let items: Vec<Pending> = archived
-                    .items
-                    .into_iter()
-                    .filter_map(|item| {
-                        let input = embed_input(&item)?;
-                        Some(Pending {
-                            scope: key.clone(),
-                            content_sha256: content_hash(&input),
-                            item: item.key,
-                            input,
-                        })
-                    })
-                    .collect();
-                let pairs: Vec<(String, String)> = items
-                    .iter()
-                    .map(|item| (item.item.clone(), item.content_sha256.clone()))
-                    .collect();
-                let segment = SegmentKey {
-                    profile: profile_key(profile),
-                    scope: key.clone(),
-                    first_revision: archived.first_revision,
-                    last_revision: archived.last_revision,
-                    content: content_key(&pairs),
-                };
-                if segments
-                    .contains(&segment)
-                    .map_err(|_| IndexStepError::Memory)?
-                {
-                    indexed += items.len();
-                } else {
-                    // 分段写出之前，这些条目若已在 index.v1 中就继续保留，召回不出现空档。
-                    for item in &items {
-                        wanted.insert((item.scope.clone(), item.item.clone()));
-                    }
-                    block_pending_count += items.len();
-                    if block.is_none() {
-                        block = Some((segment, items));
-                    }
-                }
-            }
+            pending_count += scanned.pending_count;
+            block_pending_count += scanned.block_pending_count;
+            indexed += scanned.indexed;
         }
         let stale = current
             .into_keys()

@@ -166,29 +166,42 @@ pub(crate) struct Layout {
     pub blocks: Vec<Block>,
 }
 
-/// 读出作用域的完整可召回条目并分成热层与归档段；`with_segments` 为假时只看热层。
-/// 热层与归档分两次读取，中途发生归档时条数对不上，重读至多三次。
-pub(crate) fn layout(
+/// 按块扫描；回调只可构建本次候选状态或只读核验，不能提交或发模型请求。
+/// 每次条数不一致都丢弃整个候选，重新创建，只有完整扫描成功才返回。
+pub(crate) enum LayoutPart {
+    Ledger(Vec<Item>),
+    Block(Block),
+}
+pub(crate) struct LayoutScan<T> {
+    pub scope: MemoryScope,
+    pub revision: u64,
+    pub value: T,
+}
+pub(crate) fn scan_layout<T>(
     reader: &dyn eve_memory_api::MemoryService,
     with_segments: bool,
-) -> MemoryResult<Layout> {
+    mut create: impl FnMut(&MemoryScope, u64) -> MemoryResult<T>,
+    mut consume: impl FnMut(&mut T, LayoutPart) -> MemoryResult<()>,
+) -> MemoryResult<LayoutScan<T>> {
     for _ in 0..3 {
         let snapshot = reader.snapshot()?;
-        if !with_segments || snapshot.archived_evidence == 0 {
-            return Ok(Layout {
-                ledger: items(&snapshot)?,
-                scope: snapshot.scope,
-                revision: snapshot.revision,
-                blocks: vec![],
-            });
-        }
         let scope = snapshot.scope.clone();
         let revision = snapshot.revision;
+        let mut value = create(&scope, revision)?;
+        if !with_segments || snapshot.archived_evidence == 0 {
+            let ledger = items(&snapshot)?;
+            drop(snapshot);
+            consume(&mut value, LayoutPart::Ledger(ledger))?;
+            return Ok(LayoutScan {
+                scope,
+                revision,
+                value,
+            });
+        }
         let mut ledger = items(&snapshot)?;
         let archived_count = snapshot.archived_evidence;
         // 热快照正文不参与归档扫描，先释放；每次只保留当前归档页的完整正文。
         drop(snapshot);
-        let mut blocks = Vec::new();
         let mut total = 0u64;
         let mut after = 0;
         loop {
@@ -228,12 +241,16 @@ pub(crate) fn layout(
                     archived_evidence: 0,
                 };
                 let compact = items(&block)?;
+                drop(block);
                 if full {
-                    blocks.push(Block {
-                        first_revision,
-                        last_revision,
-                        items: compact,
-                    });
+                    consume(
+                        &mut value,
+                        LayoutPart::Block(Block {
+                            first_revision,
+                            last_revision,
+                            items: compact,
+                        }),
+                    )?;
                 } else {
                     ledger.extend(compact);
                 }
@@ -251,14 +268,45 @@ pub(crate) fn layout(
             MemoryRecallSource::ConfirmedPreference { .. } => (0, 0),
             MemoryRecallSource::CompletedInteraction { .. } => (1, item.evidence_revision),
         });
-        return Ok(Layout {
-            ledger,
+        consume(&mut value, LayoutPart::Ledger(ledger))?;
+        return Ok(LayoutScan {
             scope,
             revision,
-            blocks,
+            value,
         });
     }
     Err(MemoryError::StaleRevision)
+}
+
+/// 兼容的完整前缀布局；需要全部条目的消费者仍可显式收集。
+pub(crate) fn layout(
+    reader: &dyn eve_memory_api::MemoryService,
+    with_segments: bool,
+) -> MemoryResult<Layout> {
+    let scanned = scan_layout(
+        reader,
+        with_segments,
+        |scope, revision| {
+            Ok(Layout {
+                scope: scope.clone(),
+                revision,
+                ledger: Vec::new(),
+                blocks: Vec::new(),
+            })
+        },
+        |value, part| {
+            match part {
+                LayoutPart::Ledger(items) => value.ledger = items,
+                LayoutPart::Block(block) => value.blocks.push(block),
+            };
+            Ok(())
+        },
+    )?;
+    debug_assert_eq!(
+        (&scanned.scope, scanned.revision),
+        (&scanned.value.scope, scanned.value.revision)
+    );
+    Ok(scanned.value)
 }
 
 #[cfg(test)]
@@ -341,10 +389,14 @@ mod tests {
     }
     impl MemoryService for Paged {
         fn snapshot(&self) -> MemoryResult<MemorySnapshot> {
-            self.snapshots.fetch_add(1, Ordering::SeqCst);
+            let attempt = self.snapshots.fetch_add(1, Ordering::SeqCst);
             Ok(snapshot(
                 vec![evidence(170, "热层原文")],
-                if self.mode == 3 { 130 } else { 129 },
+                if self.mode == 3 || self.mode == 4 && attempt == 0 {
+                    130
+                } else {
+                    129
+                },
             ))
         }
         fn archived(&self, after: u64, limit: usize) -> MemoryResult<ArchivedEvidencePage> {
@@ -440,5 +492,117 @@ mod tests {
             assert!(reader.pages.load(Ordering::SeqCst) <= 9);
             assert!(reader.snapshots.load(Ordering::SeqCst) <= 3);
         }
+    }
+    type ItemIdentity = (String, String, u64);
+    type BlockIdentity = (u64, u64, Vec<ItemIdentity>);
+    #[derive(Default, Debug, Eq, PartialEq)]
+    struct Manifest {
+        ledger: Vec<ItemIdentity>,
+        blocks: Vec<BlockIdentity>,
+    }
+    fn identities(items: Vec<Item>) -> Vec<ItemIdentity> {
+        items
+            .into_iter()
+            .map(|item| (item.key, content_hash(&item.text), item.evidence_revision))
+            .collect()
+    }
+    fn collect_manifest(value: &mut Manifest, part: LayoutPart) -> MemoryResult<()> {
+        match part {
+            LayoutPart::Ledger(items) => value.ledger = identities(items),
+            LayoutPart::Block(block) => value.blocks.push((
+                block.first_revision,
+                block.last_revision,
+                identities(block.items),
+            )),
+        }
+        Ok(())
+    }
+    #[test]
+    fn streamed_blocks_and_final_hot_ledger_match_compatible_layout_exactly() {
+        for segments in [false, true] {
+            let compatible = layout(&reader(0), segments).unwrap();
+            let expected = Manifest {
+                ledger: identities(compatible.ledger),
+                blocks: compatible
+                    .blocks
+                    .into_iter()
+                    .map(|block| {
+                        (
+                            block.first_revision,
+                            block.last_revision,
+                            identities(block.items),
+                        )
+                    })
+                    .collect(),
+            };
+            let scanned = scan_layout(
+                &reader(0),
+                segments,
+                |_, _| Ok(Manifest::default()),
+                collect_manifest,
+            )
+            .unwrap();
+            assert_eq!(scanned.scope, scope());
+            assert_eq!(scanned.revision, 200);
+            assert_eq!(scanned.value, expected);
+        }
+    }
+    #[test]
+    fn count_retry_discards_all_previous_candidate_state_before_delivering_result() {
+        let paged = reader(4);
+        let created = AtomicUsize::new(0);
+        let scanned = scan_layout(
+            &paged,
+            true,
+            |_, _| {
+                created.fetch_add(1, Ordering::SeqCst);
+                Ok(Manifest::default())
+            },
+            collect_manifest,
+        )
+        .unwrap();
+        assert_eq!(created.load(Ordering::SeqCst), 2);
+        assert_eq!(paged.snapshots.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            scanned.value.blocks.len(),
+            2,
+            "the first attempt must not leak duplicate blocks"
+        );
+        assert_eq!(scanned.value.ledger.len(), 4);
+        let good = scan_layout(
+            &reader(0),
+            true,
+            |_, _| Ok(Manifest::default()),
+            collect_manifest,
+        )
+        .unwrap();
+        assert_eq!(scanned.value, good.value);
+    }
+    #[test]
+    fn late_memory_failure_or_consumer_error_never_delivers_partial_state() {
+        for mode in [1, 2, 3] {
+            assert!(matches!(
+                scan_layout(
+                    &reader(mode),
+                    true,
+                    |_, _| Ok(Manifest::default()),
+                    collect_manifest
+                ),
+                Err(MemoryError::CorruptState | MemoryError::StaleRevision)
+            ));
+        }
+        let paged = reader(0);
+        let result = scan_layout(
+            &paged,
+            true,
+            |_, _| Ok(Manifest::default()),
+            |_, _| Err(MemoryError::Unavailable),
+        );
+        assert!(matches!(result, Err(MemoryError::Unavailable)));
+        assert_eq!(
+            paged.pages.load(Ordering::SeqCst),
+            1,
+            "consumer failure cannot silently skip a segment"
+        );
     }
 }
