@@ -54,6 +54,8 @@ class MessageJudgeAcceptance(unittest.TestCase):
         self.lock = threading.Lock()
         self.release = threading.Event()
         self.runs = 0
+        self.relation_model = "test-primary-role"
+        self.relation_max_tokens = 256
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -83,13 +85,13 @@ class MessageJudgeAcceptance(unittest.TestCase):
                 else:
                     assert self.path == "/v1/chat/completions"
                     assert self.headers["Authorization"] == "Bearer test-model-secret"
-                    assert body["model"] == "test-primary-role"
                     assert body["stream"] is False
-                    assert body["max_tokens"] == 256
                     messages = body["messages"]
                     judge = (len(messages) == 3 and messages[0]["role"] == "system"
                              and messages[0]["content"].startswith("判断最新消息与当前任务的关系。"))
                     kind = "primary" if judge else "task"
+                    assert body["model"] == (outer.relation_model if judge else "test-primary-role")
+                    assert body["max_tokens"] == (outer.relation_max_tokens if judge else 256)
                     if judge:
                         assert not body.get("tools")
                         assert body["response_format"] == {"type":"json_object"}
@@ -341,7 +343,7 @@ class MessageJudgeAcceptance(unittest.TestCase):
             self.open_gate("release-base"), self.wait_receipt("base")])
         self.assertEqual(self.counts(), (1, 0, 0))
 
-    def revision_scenario(self, mode="jev", jev_step=None, timeout_ms=2000):
+    def revision_scenario(self, mode="jev", jev_step=None, timeout_ms=2000, environment=None):
         text = "  把页数改为两页，保留预算 📚。\n原文中的‘取消’只是引用。  "
         self.steps[("task", 1)] = {"wait": "never-release-old", "text": "不得发送旧回复"}
         self.steps[("task", 2)] = {"text": "修订完成"}
@@ -351,7 +353,7 @@ class MessageJudgeAcceptance(unittest.TestCase):
         revised = self.message("revision", text, "修订完成", expected_type="reply")
         self.run_eve([{"send": original}, self.wait_request("task"), {"send": revised},
                       self.wait_command("base", "finish"), self.wait_receipt("revision")],
-                     mode=mode, timeout_ms=timeout_ms)
+                     mode=mode, timeout_ms=timeout_ms, environment=environment)
         self.assertEqual(self.replies(), [("revision", "修订完成")])
         replacement = self.calls["task"][1]
         request = json.loads(replacement["body"]["messages"][-1]["content"])
@@ -376,6 +378,23 @@ class MessageJudgeAcceptance(unittest.TestCase):
     def test_primary_mode_resolves_the_primary_role_without_jev(self):
         self.revision_scenario(mode="primary")
         self.assertEqual(self.counts(), (2, 1, 0))
+
+    def test_jev_fallback_routes_auxiliary_while_single_primary_slot_is_occupied(self):
+        self.relation_model = "test-relation-auxiliary"
+        self.relation_max_tokens = 96
+        self.revision_scenario(jev_step={"status": 503}, environment={
+            "EVE_MODELS_PRIMARY_MAX_CONCURRENT_REQUESTS": "1",
+            "EVE_MODELS_AUXILIARY_SMALL_ENABLED": "true",
+            "EVE_MODELS_AUXILIARY_SMALL_PROVIDER": "openai",
+            "EVE_MODELS_AUXILIARY_SMALL_MODEL": self.relation_model,
+            "EVE_MODELS_AUXILIARY_SMALL_MAX_OUTPUT_TOKENS": "128",
+            "EVE_MODELS_AUXILIARY_SMALL_TIMEOUT_MS": "10000",
+            "EVE_MODELS_AUXILIARY_SMALL_MAX_CONCURRENT_REQUESTS": "1",
+            "EVE_MODEL_USE_MESSAGE_RELATION_ROLE": "auxiliary_small",
+            "EVE_MODEL_USE_MESSAGE_RELATION_MAX_OUTPUT_TOKENS": "96",
+        })
+        self.assertEqual(self.counts(), (2, 1, 1))
+        self.assertFalse(self.errors)
 
     def test_low_confidence_jev_falls_back_once(self):
         self.revision_scenario(jev_step={"confidence": 0.4})

@@ -40,6 +40,7 @@ impl Harness {
                 path,
                 vec![
                     config::openai_schema(),
+                    config::model_uses_schema(),
                     provider_schema(),
                     model_roles_schema(),
                     message_schema(),
@@ -654,5 +655,91 @@ async fn inconsistent_revisions_cannot_reuse_previous_jev_client() {
         JEV_SECRET,
         PRIMARY_SECRET,
     );
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn relation_fallback_routes_auxiliary_per_request_without_sending_to_primary_on_invalid_role()
+{
+    let root = tempfile::tempdir().unwrap();
+    let text = "把解释改成中文。";
+    let mut primary = Server::start(vec![primary_reply(text)]).await;
+    let mut auxiliary = Server::start(vec![primary_reply(text)]).await;
+    let mut jev = Server::start(vec![]).await;
+    let h = Harness::start(root.path(), &primary.url, &jev.url).await;
+    let judge = h
+        .install(h.plugin(MessageJudgeMode::Primary).unwrap())
+        .await;
+    assert!(primary.requests.try_recv().is_err());
+    assert_eq!(
+        judge.judge(input(text)).await.unwrap().parts[0].intent,
+        MessageIntent::Correction
+    );
+    assert_request(
+        &primary.next().await,
+        "/v1/responses",
+        "primary-a",
+        PRIMARY_SECRET,
+        JEV_SECRET,
+    );
+    h.update(
+        &[
+            (MODELS_NAMESPACE, "auxiliary_small_enabled", json!(true)),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_provider",
+                json!("openai"),
+            ),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_model",
+                json!("relation-aux"),
+            ),
+            (MODELS_NAMESPACE, "auxiliary_small_timeout_ms", json!(2000)),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_max_output_tokens",
+                json!(128),
+            ),
+            (
+                config::MODEL_USES_NAMESPACE,
+                "message_relation_role",
+                json!("auxiliary_small"),
+            ),
+            (
+                config::MODEL_USES_NAMESPACE,
+                "message_relation_max_output_tokens",
+                json!(77),
+            ),
+            // 此测试显式复用启动凭据的辅助用途绑定；不选择独立端点或任意环境变量。
+            (
+                config::OPENAI_NAMESPACE,
+                "base_url",
+                json!(auxiliary.url.trim_end_matches("/responses")),
+            ),
+        ],
+        ApplyMode::NewRequests,
+    );
+    assert_eq!(
+        judge.judge(input(text)).await.unwrap().parts[0].intent,
+        MessageIntent::Correction
+    );
+    let request = auxiliary.next().await;
+    assert_request(
+        &request,
+        "/v1/responses",
+        "relation-aux",
+        PRIMARY_SECRET,
+        JEV_SECRET,
+    );
+    assert_eq!(request.body["max_output_tokens"], 77);
+    h.update(
+        &[(MODELS_NAMESPACE, "auxiliary_small_enabled", json!(false))],
+        ApplyMode::Immediate,
+    );
+    assert!(judge.judge(input(text)).await.is_err());
+    assert!(primary.requests.try_recv().is_err());
+    assert!(auxiliary.requests.try_recv().is_err());
+    assert!(jev.requests.try_recv().is_err());
     h.stop().await;
 }

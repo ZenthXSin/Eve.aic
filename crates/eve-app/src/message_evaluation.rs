@@ -366,6 +366,7 @@ pub async fn run_message_evaluation(
         if options.mode != MessageJudgeMode::Off {
             schemas.extend([
                 config::openai_schema(),
+                config::model_uses_schema(),
                 qq_message_judge::provider_schema(),
                 model_roles_schema(),
             ]);

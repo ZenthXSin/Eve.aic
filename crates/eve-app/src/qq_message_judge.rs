@@ -102,10 +102,13 @@ pub(crate) fn relation_plugin_shared(
     settings: Arc<dyn ConfigService>,
     judge: Arc<JevRoleJudge>,
 ) -> Result<RelationPlugin, AppError> {
-    let resolver = Arc::new(CoreModelResolver::new(
-        settings,
-        std::env::var(PRIMARY_KEY).map_err(|_| "消息判断需要宿主主模型凭据")?,
-    ));
+    let resolver = Arc::new(
+        CoreModelResolver::new(
+            settings,
+            std::env::var(PRIMARY_KEY).map_err(|_| "消息判断需要宿主主模型凭据")?,
+        )
+        .with_use("message_relation"),
+    );
     resolver.resolve()?;
     Ok(RelationPlugin::with_fallback(
         Some(judge),
@@ -121,14 +124,14 @@ fn relation_plugin_with_key_reader(
     if mode == MessageJudgeMode::Off {
         return Ok(RelationPlugin::rules()?);
     }
-    let resolver = Arc::new(CoreModelResolver::new(
-        settings.clone(),
-        read_key(PRIMARY_KEY)?,
-    ));
-    // 只构造客户端，不发探测请求。运行中每次判断重新解析主模型选择。
+    let resolver = Arc::new(
+        CoreModelResolver::new(settings.clone(), read_key(PRIMARY_KEY)?)
+            .with_use("message_relation"),
+    );
+    // 只构造客户端，不发探测请求。每次判断固定当前用途路由，不绕过角色并发。
     resolver
         .resolve()
-        .map_err(|_| "消息判断主模型配置或宿主凭据无效。")?;
+        .map_err(|_| "消息判断用途配置或宿主凭据无效。")?;
     let fallback = Arc::new(LlmRelationJudge::with_resolver(resolver));
     let primary: Option<Arc<dyn RelationJudge>> = if mode == MessageJudgeMode::Jev {
         let judge = Arc::new(JevRoleJudge::new(settings, read_key(JEV_KEY)?));
