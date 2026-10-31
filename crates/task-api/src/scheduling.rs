@@ -8,6 +8,7 @@ pub struct TaskSchedulingEntry {
     pub owner: TaskOwner,
     pub source: String,
     pub created_at_ms: u64,
+    pub finished_at_ms: Option<u64>,
     pub status: TaskStatus,
     pub cancel_requested: bool,
     pub recoveries: u32,
@@ -20,6 +21,7 @@ impl From<&Task> for TaskSchedulingEntry {
             owner: task.owner.clone(),
             source: task.source.clone(),
             created_at_ms: task.created_at_ms,
+            finished_at_ms: task.finished_at_ms,
             status: task.status,
             cancel_requested: task.cancel_requested,
             recoveries: task
