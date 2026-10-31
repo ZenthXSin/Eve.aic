@@ -87,19 +87,45 @@ class StageFeedbackAcceptance(progress.ProgressNarrationAcceptance):
         self.assertEqual(self.progress('group-stages'), [])
 
     def test_one_long_command_sends_start_and_repeated_truthful_waiting(self):
+        original_narrator = self.provider_response
+        def narrate(body, kind, fallback):
+            if kind == 'progress':
+                facts = json.loads(body['messages'][-1]['content'])
+                if facts['phase'] == 'waiting':
+                    self.assertFalse(body.get('tools'))
+                    self.assertFalse(facts['group'])
+                    self.narrations.append(facts)
+                    return dialogue.text_response(f"这一步已等待{facts['waiting_seconds']}秒，仍在等命令回执。")
+            return original_narrator(body, kind, fallback)
+        self.provider_response = narrate
         def respond(body):
             if not self.results(body):
-                return dialogue.tool_response([('run_command', {'program':sys.executable,
-                    'args':['-c','import time; time.sleep(4.4); print("verified")']})])
+                return dialogue.tool_response([('run_command', {'program': sys.executable,
+                    'args': ['-c', "from pathlib import Path; import time\nwhile not Path('release-waiting').exists(): time.sleep(.01)\nprint('verified')"]})])
             self.assertIn('verified', json.dumps(self.results(body)))
             return dialogue.text_response('命令返回并已核对')
+        def release_after_two_delivered_waits():
+            def delivered():
+                ledger = self.documents().get('eve.channel.qqbot', {}).get('receipts.v1', {})
+                receipt = next((r for r in ledger.get('entries', []) if r['message']['id'] == 'long'), {})
+                return sum(p['state'] == 'Sent' and p['text'].startswith('这一步已等待')
+                           for p in receipt.get('progress', [])) >= 2
+            self.wait_until(delivered, 'two actual waiting messages were not delivered')
+            (self.source / 'release-waiting').touch()
         self.callback = respond
-        self.run_stage(self.send(self.message('long', '执行长命令', expected='命令返回并已核对')))
+        self.run_stage([{'send': self.message('long', '执行长命令', expected='命令返回并已核对')},
+                        *self.checkpoint('waiting-stages'),
+                        {'wait_command': {'id': 'long', 'type': 'reply'}},
+                        self.wait_receipt('long')],
+                       checkpoints={'waiting-stages': release_after_two_delivered_waits})
         stages = self.progress('long')
         self.assertEqual(stages[0]['text'], '先核对这两步的实际结果。')
         self.assertTrue(any(f['phase'] == 'start' for f in self.narrations))
-        self.assertGreaterEqual(len(stages), 4)
-        self.assertTrue(any(p['text'] == '这一步还在等待结果，我会继续核对。' and p.get('proactive') for p in stages))
+        self.assertGreaterEqual(len(stages), 3)
+        waiting = [p for p in stages if p['text'].startswith('这一步已等待')]
+        self.assertGreaterEqual(len(waiting), 2)
+        self.assertEqual(len({p['text'] for p in waiting}), len(waiting), '重复正文仍被宿主拒绝')
+        self.assertTrue(any(p.get('proactive') for p in waiting))
         self.assertEqual(self.receipt('long')['state'], 'Sent')
 
     def test_failed_stage_stops_further_progress_but_keeps_work_and_final_reply(self):

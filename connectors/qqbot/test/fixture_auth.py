@@ -68,6 +68,15 @@ def bootstrap_fixture_groups(state, scenario):
             for child in value:
                 visit(child)
     visit(json.loads(Path(scenario).read_text()))
+    bootstrap_fixture_group_ids(state, groups)
+
+
+def bootstrap_fixture_group_ids(state, groups):
+    """真实 Node 桥接夹具显式声明测试群；拒绝非法标识，不放宽生产白名单。"""
+    groups = set(groups)
+    if any(not isinstance(g, str) or not g.isascii() or not 0 < len(g) <= 128
+           or not all(c.isalnum() or c in "_-" for c in g) for g in groups):
+        raise ValueError("invalid_fixture_group_id")
     if not groups:
         return
     state = Path(state)
