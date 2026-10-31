@@ -8,7 +8,9 @@ import threading
 import time
 import traceback
 import unittest
+from http.client import HTTPConnection, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 import group_chat_test
 import reminder_test
 
@@ -59,6 +61,9 @@ class GroupRelationAcceptance(group_chat_test.GroupChatAcceptance):
                     answer={'answers':{'relation':choice('relation',kind),'topic':choice('topic',topic),'needs_reply':{'type':'noul','noul':0.99 if needs else 0.01}}}
                     data=json.dumps(answer).encode()
                     self.send_response(outer.jev_status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    # 宿主取消可选判断或关闭进程后，响应连接可以正常消失。
+                    pass
                 except Exception: outer.errors.append(traceback.format_exc())
         self.jev_server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
         self.jev_server.daemon_threads=True
@@ -76,6 +81,33 @@ class GroupRelationAcceptance(group_chat_test.GroupChatAcceptance):
         env.update(options.pop('env_extra',{}))
         return reminder_test.base().run_eve(self,script,interest=True,research=False,practice=False,
             more=['--group-chat','--training','--message-judge','jev','--autonomy-budget','100'],env_extra=env,panel=True,timeout=45,**options)
+
+    def fixture_request(self):
+        client=HTTPConnection('127.0.0.1',self.jev_server.server_port,timeout=3)
+        try:
+            client.request('POST','/v1/systemone',body=json.dumps({
+                'model':'group-jev-test-model','state':{'candidates':[{'candidate':'one'}]},
+                'questions':{'one':{}}}),headers={
+                'Content-Type':'application/json','Authorization':'Bearer group-jev-test-secret'})
+            with self.assertRaises((RemoteDisconnected,ConnectionResetError)):
+                client.getresponse()
+        finally:
+            client.close()
+
+    def test_fixture_closed_response_is_not_a_model_error_and_business_errors_still_fail(self):
+        # 定点注入响应写入断连，避免用不确定的 sleep 与 TCP 关闭时序复现。
+        for error in (BrokenPipeError,ConnectionResetError):
+            with self.subTest(error=error.__name__):
+                with patch.object(self.jev_server.RequestHandlerClass,'end_headers',side_effect=error('fixture peer closed')):
+                    self.fixture_request()
+                self.assertEqual(self.errors,[])
+        def business_error(_):
+            raise ValueError('fixture business error must remain visible')
+        self.recall_score=business_error
+        self.fixture_request()
+        self.assertEqual(len(self.errors),1)
+        self.assertIn('fixture business error must remain visible',self.errors[0])
+        self.errors.clear()
 
     def test_disabled_group_keeps_raw_history_without_jev_or_proactive_model(self):
         def settled():
