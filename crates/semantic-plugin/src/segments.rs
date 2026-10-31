@@ -10,11 +10,10 @@ use ring::digest::{Context, SHA256, digest};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
+    fs,
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// 每段覆盖的已归档证据条数；与记忆归档的单页上限一致。
@@ -24,6 +23,7 @@ const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DECODED_BYTES: u64 = 32 * 1024 * 1024;
 /// 解开后缓存的分段数上限；按最近使用淘汰，只影响读取速度。
 const CACHED_SEGMENTS: usize = 256;
+const CACHED_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SegmentError {
@@ -116,10 +116,88 @@ fn valid_name(name: &str) -> bool {
         && hexed(parts[5], 64)
 }
 
-#[derive(Default)]
+struct CachedSegment {
+    entries: Arc<Vec<IndexEntry>>,
+    profile: EmbeddingProfile,
+    key: SegmentKey,
+    used: u64,
+    bytes: usize,
+}
 struct Cache {
-    entries: BTreeMap<String, (Arc<Vec<IndexEntry>>, u64)>,
+    entries: BTreeMap<String, CachedSegment>,
     tick: u64,
+    bytes: usize,
+    budget: usize,
+}
+impl Default for Cache {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            tick: 0,
+            bytes: 0,
+            budget: CACHED_PAYLOAD_BYTES,
+        }
+    }
+}
+impl Cache {
+    fn remove(&mut self, name: &str) {
+        if let Some(entry) = self.entries.remove(name) {
+            self.bytes -= entry.bytes;
+        }
+    }
+    fn insert(
+        &mut self,
+        name: &str,
+        profile: &EmbeddingProfile,
+        key: &SegmentKey,
+        entries: Arc<Vec<IndexEntry>>,
+    ) {
+        let name = name.to_owned();
+        let mut entry = CachedSegment {
+            entries,
+            profile: profile.clone(),
+            key: key.clone(),
+            used: self.tick,
+            bytes: 0,
+        };
+        // 计入 Vec 和字符串的实际 capacity；BTreeMap 节点及外部在途 Arc 不属于载荷预算。
+        entry.bytes = name.capacity()
+            + entry.profile.model.capacity()
+            + entry.key.profile.capacity()
+            + entry.key.scope.capacity()
+            + entry.key.content.capacity()
+            + std::mem::size_of::<Vec<IndexEntry>>()
+            + 2 * std::mem::size_of::<usize>()
+            + entry.entries.capacity() * std::mem::size_of::<IndexEntry>()
+            + entry
+                .entries
+                .iter()
+                .map(|item| {
+                    item.model.capacity()
+                        + item.scope.capacity()
+                        + item.item.capacity()
+                        + item.content_sha256.capacity()
+                        + item.vector.capacity()
+                })
+                .sum::<usize>();
+        self.remove(&name);
+        if entry.bytes > self.budget {
+            return;
+        }
+        self.bytes += entry.bytes;
+        self.entries.insert(name, entry);
+        while self.entries.len() > CACHED_SEGMENTS || self.bytes > self.budget {
+            let Some(name) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(name, _)| name.clone())
+            else {
+                break;
+            };
+            self.remove(&name);
+        }
+    }
 }
 
 /// 目录中的不可变分段文件；先写临时文件并同步，再原子改名。只接受本模块生成的文件名，不提供删除。
@@ -196,26 +274,26 @@ impl SegmentStore {
         key: &SegmentKey,
         profile: &EmbeddingProfile,
     ) -> Result<Arc<Vec<IndexEntry>>, SegmentError> {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.tick += 1;
-            let tick = cache.tick;
-            if let Some((entries, used)) = cache.entries.get_mut(name) {
-                *used = tick;
-                return Ok(entries.clone());
-            }
-        }
         let path = self.directory.join(name);
-        let metadata = fs::symlink_metadata(&path).map_err(|_| SegmentError::Storage)?;
-        if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
-            return Err(SegmentError::CorruptState);
-        }
-        let bytes = fs::read(&path).map_err(|_| SegmentError::Storage)?;
+        let bytes = read_bounded(&path)?;
         let expected = name
             .strip_suffix(".json.zz")
             .and_then(|rest| rest.rsplit('-').next())
             .ok_or(SegmentError::CorruptState)?;
         if hex(digest(&SHA256, &bytes).as_ref()) != expected {
             return Err(SegmentError::CorruptState);
+        }
+        // 缓存只省去解压与反序列化；每次读仍核对文件类型、字节上限与完整 SHA-256。
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.tick = cache.tick.saturating_add(1);
+            let tick = cache.tick;
+            if let Some(entry) = cache.entries.get_mut(name) {
+                if entry.profile != *profile || entry.key != *key {
+                    return Err(SegmentError::CorruptState);
+                }
+                entry.used = tick;
+                return Ok(entry.entries.clone());
+            }
         }
         let mut decoded = Vec::new();
         flate2::read::ZlibDecoder::new(bytes.as_slice())
@@ -248,18 +326,8 @@ impl SegmentStore {
         }
         let entries = Arc::new(file.entries);
         if let Ok(mut cache) = self.cache.lock() {
-            let tick = cache.tick;
-            cache.entries.insert(name.into(), (entries.clone(), tick));
-            while cache.entries.len() > CACHED_SEGMENTS {
-                let oldest = cache
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, (_, used))| *used)
-                    .map(|(name, _)| name.clone());
-                if let Some(name) = oldest {
-                    cache.entries.remove(&name);
-                }
-            }
+            cache.tick = cache.tick.saturating_add(1);
+            cache.insert(name, profile, key, entries.clone());
         }
         Ok(entries)
     }
@@ -293,6 +361,9 @@ impl SegmentStore {
             entries,
         })
         .map_err(|_| SegmentError::InvalidInput)?;
+        if json.len() as u64 > MAX_DECODED_BYTES {
+            return Err(SegmentError::InvalidInput);
+        }
         let mut encoder =
             flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         encoder
@@ -308,38 +379,63 @@ impl SegmentStore {
             hex(digest(&SHA256, &bytes).as_ref())
         );
         let target = self.directory.join(&name);
-        if target.exists() {
-            return if fs::read(&target).map_err(|_| SegmentError::Storage)? == bytes {
-                Ok(())
-            } else {
-                Err(SegmentError::CorruptState)
-            };
+        if target.symlink_metadata().is_ok() {
+            if read_bounded(&target)? != bytes {
+                return Err(SegmentError::CorruptState);
+            }
+        } else {
+            let mut temporary = tempfile::NamedTempFile::new_in(&self.directory)
+                .map_err(|_| SegmentError::Storage)?;
+            temporary
+                .write_all(&bytes)
+                .map_err(|_| SegmentError::Storage)?;
+            temporary
+                .as_file()
+                .sync_all()
+                .map_err(|_| SegmentError::Storage)?;
+            match temporary.persist_noclobber(&target) {
+                Ok(_) => {}
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if read_bounded(&target)? != bytes {
+                        return Err(SegmentError::CorruptState);
+                    }
+                }
+                Err(_) => return Err(SegmentError::Storage),
+            }
         }
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |value| value.as_millis());
-        let temporary = self
-            .directory
-            .join(format!(".{name}.{}-{stamp}.tmp", std::process::id()));
-        let written = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            fs::rename(&temporary, &target)?;
-            sync_directory(&self.directory)
-        })();
-        if written.is_err() {
-            let _ = fs::remove_file(&temporary);
-            return Err(SegmentError::Storage);
-        }
+        // 重复准备也确认正文与目录已同步；Windows FlushFileBuffers 要求写句柄。
+        fs::OpenOptions::new()
+            .read(true)
+            .write(cfg!(windows))
+            .open(&target)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| SegmentError::Storage)?;
+        sync_directory(&self.directory).map_err(|_| SegmentError::Storage)?;
+        // 另一实例刚创建的相同正文也要进入当前目录视图，不能等重启才可召回。
         let mut names = self.names.lock().map_err(|_| SegmentError::Storage)?;
-        names.push(name);
-        names.sort();
+        if !names.contains(&name) {
+            names.push(name);
+            names.sort();
+        }
         Ok(())
     }
+}
+
+fn read_bounded(path: &Path) -> Result<Vec<u8>, SegmentError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| SegmentError::Storage)?;
+    if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+        return Err(SegmentError::CorruptState);
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .map_err(|_| SegmentError::Storage)?
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| SegmentError::Storage)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(SegmentError::CorruptState);
+    }
+    Ok(bytes)
 }
 
 #[cfg(unix)]
@@ -349,4 +445,292 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn sync_directory(_: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn fixture(label: &str, first: u64) -> (EmbeddingProfile, SegmentKey, Vec<IndexEntry>) {
+        let profile = EmbeddingProfile {
+            model: "cache-test".into(),
+            dimensions: 2,
+        };
+        let entry = IndexEntry {
+            model: profile.model.clone(),
+            dimensions: 2,
+            scope: "a".repeat(64),
+            item: format!("int:{label}:user"),
+            content_sha256: "b".repeat(64),
+            scale: 1.0,
+            vector: "7f01".into(),
+            indexed_at_ms: 1,
+        };
+        let key = SegmentKey {
+            profile: profile_key(&profile),
+            scope: entry.scope.clone(),
+            first_revision: first,
+            last_revision: first + 63,
+            content: content_key(&[(entry.item.clone(), entry.content_sha256.clone())]),
+        };
+        (profile, key, vec![entry])
+    }
+    fn load(
+        store: &SegmentStore,
+        profile: &EmbeddingProfile,
+        key: &SegmentKey,
+    ) -> Arc<Vec<IndexEntry>> {
+        store
+            .load(profile, &key.scope, std::slice::from_ref(key))
+            .unwrap()
+            .pop()
+            .unwrap()
+    }
+    #[test]
+    fn byte_eviction_keeps_inflight_values_and_reload_uses_immutable_disk_content() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SegmentStore::open(root.path()).unwrap();
+        let (profile, first, first_entries) = fixture("a", 1);
+        let (_, second, second_entries) = fixture("b", 65);
+        store.put(&profile, &first, first_entries.clone()).unwrap();
+        store.put(&profile, &second, second_entries).unwrap();
+        let pinned = load(&store, &profile, &first);
+        {
+            let mut cache = store.cache.lock().unwrap();
+            assert_eq!(cache.entries.len(), 1);
+            cache.budget = cache.bytes;
+        }
+        let newer = load(&store, &profile, &second);
+        assert_eq!(
+            Arc::strong_count(&pinned),
+            1,
+            "淘汰缓存不能回收在途调用的值"
+        );
+        assert_eq!(pinned.as_ref(), &first_entries);
+        assert!(Arc::ptr_eq(&newer, &load(&store, &profile, &second)));
+        let reloaded = load(&store, &profile, &first);
+        assert_eq!(reloaded.as_ref(), &first_entries);
+        assert!(!Arc::ptr_eq(&pinned, &reloaded));
+        let cache = store.cache.lock().unwrap();
+        assert!(cache.bytes <= cache.budget);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+    #[test]
+    fn oversized_payload_is_readable_without_displacing_existing_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SegmentStore::open(root.path()).unwrap();
+        let (profile, key, entries) = fixture("a", 1);
+        store.put(&profile, &key, entries.clone()).unwrap();
+        store.cache.lock().unwrap().budget = 1;
+        let first = load(&store, &profile, &key);
+        let second = load(&store, &profile, &key);
+        assert_eq!(first.as_ref(), &entries);
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(store.cache.lock().unwrap().entries.is_empty());
+        assert_eq!(store.cache.lock().unwrap().bytes, 0);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+    #[test]
+    fn warm_cache_never_hides_corrupt_or_removed_files_and_idempotent_put_never_overwrites() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SegmentStore::open(root.path()).unwrap();
+        let (profile, key, entries) = fixture("a", 1);
+        store.put(&profile, &key, entries.clone()).unwrap();
+        let pinned = load(&store, &profile, &key);
+        let path = root.path().join(&store.names.lock().unwrap()[0]);
+        fs::write(&path, b"corrupt").unwrap();
+        assert_eq!(
+            store.load(&profile, &key.scope, std::slice::from_ref(&key)),
+            Err(SegmentError::CorruptState)
+        );
+        assert_eq!(
+            store.put(&profile, &key, entries.clone()),
+            Err(SegmentError::CorruptState)
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"corrupt");
+        assert_eq!(pinned.as_ref(), &entries);
+        fs::remove_file(path).unwrap();
+        assert_eq!(
+            store.load(&profile, &key.scope, std::slice::from_ref(&key)),
+            Err(SegmentError::Storage)
+        );
+    }
+    #[test]
+    fn independent_writers_agree_and_existing_file_becomes_visible_without_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let first = Arc::new(SegmentStore::open(root.path()).unwrap());
+        let second = Arc::new(SegmentStore::open(root.path()).unwrap());
+        let (profile, key, entries) = fixture("a", 1);
+        std::thread::scope(|scope| {
+            let one = scope.spawn(|| first.put(&profile, &key, entries.clone()));
+            let two = scope.spawn(|| second.put(&profile, &key, entries.clone()));
+            one.join().unwrap().unwrap();
+            two.join().unwrap().unwrap();
+        });
+        assert_eq!(load(&first, &profile, &key).as_ref(), &entries);
+        assert_eq!(load(&second, &profile, &key).as_ref(), &entries);
+        let later = SegmentStore::open(root.path()).unwrap();
+        later.put(&profile, &key, entries.clone()).unwrap();
+        assert_eq!(load(&later, &profile, &key).as_ref(), &entries);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        assert_eq!(second.names.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn oversized_disk_file_is_rejected_even_with_a_warm_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SegmentStore::open(root.path()).unwrap();
+        let (profile, key, entries) = fixture("a", 1);
+        store.put(&profile, &key, entries).unwrap();
+        let _pinned = load(&store, &profile, &key);
+        let path = root.path().join(&store.names.lock().unwrap()[0]);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 1)
+            .unwrap();
+        assert_eq!(
+            store.load(&profile, &key.scope, std::slice::from_ref(&key)),
+            Err(SegmentError::CorruptState)
+        );
+        assert_eq!(path.metadata().unwrap().len(), MAX_FILE_BYTES + 1);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn warm_cache_never_bypasses_symlink_rejection() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SegmentStore::open(root.path()).unwrap();
+        let (profile, key, entries) = fixture("a", 1);
+        store.put(&profile, &key, entries).unwrap();
+        let _pinned = load(&store, &profile, &key);
+        let path = root.path().join(&store.names.lock().unwrap()[0]);
+        let copy = root.path().join("other");
+        fs::rename(&path, &copy).unwrap();
+        std::os::unix::fs::symlink(copy, path).unwrap();
+        assert_eq!(
+            store.load(&profile, &key.scope, std::slice::from_ref(&key)),
+            Err(SegmentError::CorruptState)
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod profile {
+    use super::*;
+    #[test]
+    #[ignore = "独立子进程测量真实分段缓存，手动运行"]
+    fn semantic_cache_memory_profile() {
+        const GROUPS: usize = 128;
+        fn profile() -> EmbeddingProfile {
+            EmbeddingProfile {
+                model: "cache-profile".into(),
+                dimensions: 4096,
+            }
+        }
+        fn keys() -> Vec<SegmentKey> {
+            let profile = profile();
+            (0..GROUPS)
+                .map(|group| {
+                    let entries = entries(group);
+                    SegmentKey {
+                        profile: profile_key(&profile),
+                        scope: "a".repeat(64),
+                        first_revision: group as u64 * 64 + 1,
+                        last_revision: group as u64 * 64 + 64,
+                        content: content_key(
+                            &entries
+                                .iter()
+                                .map(|entry| (entry.item.clone(), entry.content_sha256.clone()))
+                                .collect::<Vec<_>>(),
+                        ),
+                    }
+                })
+                .collect()
+        }
+        fn entries(group: usize) -> Vec<IndexEntry> {
+            (0..128)
+                .map(|item| IndexEntry {
+                    model: "cache-profile".into(),
+                    dimensions: 4096,
+                    scope: "a".repeat(64),
+                    item: format!("int:{group:04}:{item:04}:user"),
+                    content_sha256: "b".repeat(64),
+                    scale: 1.0,
+                    vector: "7f01".repeat(2048),
+                    indexed_at_ms: 1,
+                })
+                .collect()
+        }
+        if let Some(root) = std::env::var_os("EVE_SEMANTIC_CACHE_PROFILE_ROOT") {
+            let mode = std::env::var("EVE_SEMANTIC_CACHE_PROFILE_MODE").unwrap();
+            let store = SegmentStore::open(root).unwrap();
+            if mode == "legacy" {
+                store.cache.lock().unwrap().budget = usize::MAX;
+            }
+            let keys = keys();
+            let mut count = 0;
+            for _ in 0..2 {
+                for key in &keys {
+                    let loaded = store
+                        .load(&profile(), &key.scope, std::slice::from_ref(key))
+                        .unwrap();
+                    assert_eq!(loaded.len(), 1);
+                    assert_eq!(loaded[0].len(), 128);
+                    for entry in loaded[0].iter() {
+                        assert_eq!(entry.vector, "7f01".repeat(2048));
+                    }
+                    count += loaded[0].len();
+                }
+            }
+            let status = fs::read_to_string("/proc/self/status").unwrap();
+            let kib = |name: &str| -> u64 {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            };
+            let cache = store.cache.lock().unwrap();
+            println!(
+                "SEMANTIC_CACHE_PROFILE {}",
+                serde_json::json!({"mode":mode,"groups":GROUPS,
+                "entries_read":count,"cache_segments":cache.entries.len(),"cache_payload_bytes":cache.bytes,
+                "rss_kib":kib("VmRSS:"),"peak_rss_kib":kib("VmHWM:")})
+            );
+            if mode == "bounded" {
+                assert!(cache.bytes <= CACHED_PAYLOAD_BYTES);
+            }
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let store = SegmentStore::open(root.path()).unwrap();
+        for (group, key) in keys().iter().enumerate() {
+            store.put(&profile(), key, entries(group)).unwrap();
+        }
+        for mode in ["legacy", "bounded"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "segments::profile::semantic_cache_memory_profile",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("EVE_SEMANTIC_CACHE_PROFILE_ROOT", root.path())
+                .env("EVE_SEMANTIC_CACHE_PROFILE_MODE", mode)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(text.contains("SEMANTIC_CACHE_PROFILE"));
+            print!("{text}");
+        }
+    }
 }
