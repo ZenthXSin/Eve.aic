@@ -209,7 +209,7 @@ impl Tool for ScriptTool {
     fn definition(&self) -> ToolDefinition {
         let (description, properties, required) = match self.kind {
             0 => (
-                "保存不可变 Python/JavaScript/Rust 脚本插件版本，不运行业务代码；Rust先在可信Linux沙箱独立编译std-only候选，失败不保存，编译扣共享预算。spec 含 name、language(python/javascript/rust)、source、dependencies(别名到{script,digest})、tools(允许叶子名)、state_schema({version,fields:{字段:string/number/integer/boolean/object/array/null}})、initial_state。进程通过stdin/stdout每行JSON协议调用宿主，不能获取凭据或直接网络。声明工具不授予权限。先使用dry_run预检；保存后需activate初始化状态。",
+                "保存不可变 Python/JavaScript/Rust 脚本插件版本，不运行业务代码；Rust先在可信Linux沙箱独立编译std-only候选，失败返回 saved=false、compiled=false 和 compilation 中的退出码/信号/最多8192字节实际诊断（truncated 表明截断），按诊断修复后重新保存，不得把失败当成功；编译扣共享预算。spec 含 name、language(python/javascript/rust)、source、dependencies(别名到{script,digest})、tools(允许叶子名)、state_schema({version,fields:{字段:string/number/integer/boolean/object/array/null}})、initial_state。进程通过stdin/stdout每行JSON协议调用宿主，不能获取凭据或直接网络。声明工具不授予权限。先使用dry_run预检；保存后需activate初始化状态。",
                 json!({"spec":{"type":"object"}}),
                 vec!["spec"],
             ),
@@ -254,9 +254,19 @@ impl Tool for ScriptTool {
                 0 => {
                     let args: Save = serde_json::from_value(call.arguments).map_err(rejected)?;
                     let compiled = args.spec.language == eve_script_runtime::Language::Rust;
-                    Ok(
-                        json!({"saved":true,"executed":false,"compiled":compiled,"version":self.service.runtime.publish_candidate(args.spec,context).await?}),
-                    )
+                    match self
+                        .service
+                        .runtime
+                        .prepare_candidate(args.spec, context)
+                        .await?
+                    {
+                        eve_script_runtime::CandidatePreparation::Ready(version) => Ok(
+                            json!({"saved":true,"executed":false,"compiled":compiled,"version":version}),
+                        ),
+                        eve_script_runtime::CandidatePreparation::CompilationFailed(report) => Ok(
+                            json!({"success":false,"saved":false,"executed":false,"compiled":false,"phase":"compilation","version":null,"compilation":report}),
+                        ),
+                    }
                 }
                 1 => {
                     let args: List = serde_json::from_value(call.arguments).map_err(rejected)?;
@@ -842,16 +852,30 @@ mod tests {
         .unwrap();
         assert_eq!(result["receipt"]["result"]["language"], "rust");
         candidate.source = "not valid Rust".into();
+        let failed = execute(
+            &tools[0],
+            "rust-bad-save",
+            json!({"spec":candidate}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed["success"], false);
+        assert_eq!(failed["saved"], false);
+        assert_eq!(failed["compiled"], false);
+        assert_eq!(failed["executed"], false);
+        assert_eq!(failed["phase"], "compilation");
+        assert_eq!(failed["version"], Value::Null);
+        assert_eq!(failed["compilation"]["language"], "rust");
+        assert_ne!(failed["compilation"]["exit_code"], 0);
         assert!(
-            execute(
-                &tools[0],
-                "rust-bad-save",
-                json!({"spec":candidate}),
-                ctx.clone()
-            )
-            .await
-            .is_err()
+            failed["compilation"]["diagnostics"]
+                .as_str()
+                .unwrap()
+                .contains("error")
         );
+        assert_eq!(failed["compilation"]["truncated"], false);
+        assert_eq!(service.store.list(ctx.scope().unwrap()).unwrap().len(), 1);
         assert_eq!(
             serde_json::to_value(
                 service

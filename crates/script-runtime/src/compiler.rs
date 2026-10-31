@@ -1,5 +1,5 @@
 use crate::{
-    Language, MAX_SOURCE_BYTES, Result, digest, fail, reject,
+    CompilationFailure, Language, MAX_SOURCE_BYTES, Result, digest, fail, reject,
     runtime::{check_stop, guarded, reserve},
 };
 use eve_llm_api::ToolExecutionContext;
@@ -21,12 +21,15 @@ static COMPILE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new
 
 const MAX_RUST_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RUST_CACHE: usize = 32;
+const MAX_COMPILER_DIAGNOSTIC_BYTES: usize = 8192;
 static CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 
 const FLAGS: &[&str] = &[
     "--edition=2021",
     "--crate-name=eve_plugin",
     "--crate-type=bin",
+    "--color=never",
+    "--error-format=short",
     "-Cdebuginfo=0",
     "-Copt-level=0",
     "-Cpanic=abort",
@@ -102,6 +105,36 @@ impl CompiledRust {
         );
     }
 }
+pub(crate) enum RustPreparation {
+    Ready(Arc<CompiledRust>),
+    CompilationFailed(CompilationFailure),
+}
+async fn read_diagnostics(mut stream: tokio::process::ChildStderr) -> Result<(String, bool)> {
+    use tokio::io::AsyncReadExt;
+    let mut retained = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0u8; 4096];
+    loop {
+        let count = stream.read(&mut buffer).await.map_err(fail)?;
+        if count == 0 {
+            break;
+        }
+        let keep = count.min(MAX_COMPILER_DIAGNOSTIC_BYTES.saturating_sub(retained.len()));
+        retained.extend_from_slice(&buffer[..keep]);
+        truncated |= keep < count;
+        // 达到保留上限仍继续排空管道，避免编译器被自己的 stderr 阻塞。
+    }
+    let mut text = String::from_utf8_lossy(&retained).into_owned();
+    if text.len() > MAX_COMPILER_DIAGNOSTIC_BYTES {
+        let mut end = MAX_COMPILER_DIAGNOSTIC_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        truncated = true;
+    }
+    Ok((text, truncated))
+}
 impl crate::Bubblewrap {
     pub(crate) async fn prepare_rust(
         &self,
@@ -109,6 +142,27 @@ impl crate::Bubblewrap {
         context: &ToolExecutionContext,
         deadline: Instant,
     ) -> Result<Arc<CompiledRust>> {
+        match self.prepare_rust_report(source, context, deadline).await? {
+            RustPreparation::Ready(compiled) => Ok(compiled),
+            RustPreparation::CompilationFailed(report) => Err(reject(format!(
+                "Rust隔离编译失败；旧版本保持可用；退出码 {:?}，信号 {:?}；诊断{}：{}",
+                report.exit_code,
+                report.signal,
+                if report.truncated {
+                    "（已截断）"
+                } else {
+                    ""
+                },
+                report.diagnostics
+            ))),
+        }
+    }
+    pub(crate) async fn prepare_rust_report(
+        &self,
+        source: &str,
+        context: &ToolExecutionContext,
+        deadline: Instant,
+    ) -> Result<RustPreparation> {
         self.preflight(&Language::Rust)?;
         if self.container.is_some() {
             return Err(reject("当前Rust编译只支持可信Linux bubblewrap编译器"));
@@ -149,7 +203,7 @@ impl crate::Bubblewrap {
         if let Some(cached) = self.rust_cache.lock().map_err(fail)?.get(&key).cloned() {
             cached.verify()?;
             cached.touch();
-            return Ok(cached);
+            return Ok(RustPreparation::Ready(cached));
         }
         if !has_cache_room(&*self.rust_cache.lock().map_err(fail)?) {
             return Err(reject("Rust编译缓存均被在途调用持有，请等待调用结束"));
@@ -268,19 +322,41 @@ impl crate::Bubblewrap {
         let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|_| fail("Rust隔离编译启动失败"))?;
         let compile_deadline = deadline.min(Instant::now() + Duration::from_secs(20));
-        let status = guarded(
-            async { child.wait().await.map_err(fail) },
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| fail("编译诊断管道不可用"))?;
+        let (status, (diagnostics, truncated)) = guarded(
+            async {
+                tokio::try_join!(
+                    async { child.wait().await.map_err(fail) },
+                    read_diagnostics(stderr)
+                )
+            },
             context,
             compile_deadline,
         )
         .await?;
         if !status.success() {
-            return Err(reject("Rust隔离编译失败；旧版本保持可用"));
+            #[cfg(unix)]
+            let signal = {
+                use std::os::unix::process::ExitStatusExt;
+                status.signal()
+            };
+            #[cfg(not(unix))]
+            let signal = None;
+            return Ok(RustPreparation::CompilationFailed(CompilationFailure {
+                language: Language::Rust,
+                exit_code: status.code(),
+                signal,
+                diagnostics,
+                truncated,
+            }));
         }
         let binary = output.path().join("plugin");
         let hash = artifact_hash(&binary)?;
@@ -297,7 +373,7 @@ impl crate::Bubblewrap {
         let entry = cache.entry(key).or_insert(compiled).clone();
         entry.verify()?;
         entry.touch();
-        Ok(entry)
+        Ok(RustPreparation::Ready(entry))
     }
 }
 
