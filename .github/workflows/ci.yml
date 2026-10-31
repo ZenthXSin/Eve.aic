@@ -17,9 +17,13 @@ jobs:
   stable:
     name: Stable / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # 保留完整检查。Linux 已在 15 分钟末尾的核心帮助正常输出后被总期限取消，留 5 分钟余量。
+    # 保留完整检查和原期限；统一编译示例，避免 cargo run 改变包特征后重复编译。
     # Windows 的完整构建与实际进程验收更慢，继续使用原有 40 分钟上限。
     timeout-minutes: ${{ matrix.os == 'windows-latest' && 40 || 20 }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     strategy:
       fail-fast: false
       matrix:
@@ -105,17 +109,17 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: 运行测试与文档测试
         run: cargo test --workspace --locked
+      - name: 验证预编译目标的参数与失败传播
+        run: python -X utf8 scripts/test-run-prebuilt.py
+      - name: 统一编译进程验收入口和示例
+        run: cargo build -p eve-app -p eve-runtime -p eve-cognition-plugin --bins --examples --locked
       - name: 验证 Web 插件页、配置恢复与 QQ 插件启停
         run: |
-          cargo build -p eve-app --bin eve-qqbot --locked
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $qqBinary = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
           python -X utf8 scripts/test-web-plugins.py $qqBinary
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证群聊插话的判断与完整回复链路
         run: |
-          cargo build -p eve-app --bin eve-chime --locked
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $chimeBinary = if ($IsWindows) { "target/debug/eve-chime.exe" } else { "target/debug/eve-chime" }
           python -X utf8 scripts/test-chime.py $chimeBinary
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -180,24 +184,24 @@ jobs:
             $before = $bytes
           }
       - name: 验证核心入口帮助
-        run: cargo run -p eve-app --locked -- --help
+        run: python -X utf8 scripts/run-prebuilt.py --bin eve -- --help
       - name: 验证内生反思入口帮助
-        run: cargo run -p eve-app --bin eve-cognition --locked -- --help
+        run: python -X utf8 scripts/run-prebuilt.py --bin eve-cognition -- --help
       - name: 验证主模型多轮验收帮助
-        run: cargo run -p eve-app --example model_acceptance --locked -- --help
+        run: python -X utf8 scripts/run-prebuilt.py --example model_acceptance -- --help
       - name: 运行插件协作验收
-        run: cargo run -p eve-runtime --locked
+        run: python -X utf8 scripts/run-prebuilt.py --bin eve-runtime
       - name: 验证取消生命周期等待后的收尾
-        run: cargo run -p eve-runtime --example lifecycle_operations --locked
+        run: python -X utf8 scripts/run-prebuilt.py --example lifecycle_operations
       - name: 验证集成后的 Mock LLM 工具闭环
-        run: cargo run -p eve-runtime --example llm_tool_loop --locked
+        run: python -X utf8 scripts/run-prebuilt.py --example llm_tool_loop
       - name: 验证 AGENT 文件身份与工具往返
         run: |
           function Invoke-Agent([string] $Path) {
             if ($Path) {
-              $output = @(& cargo run -p eve-runtime --example agent_prompt --locked -- $Path)
+              $output = @(& python -X utf8 scripts/run-prebuilt.py --example agent_prompt -- $Path)
             } else {
-              $output = @(& cargo run -p eve-runtime --example agent_prompt --locked)
+              $output = @(& python -X utf8 scripts/run-prebuilt.py --example agent_prompt)
             }
             if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "Agent 身份示例失败" }
             Write-Host $output[0]
@@ -222,7 +226,7 @@ jobs:
           $cognitionDirectory = Join-Path $env:RUNNER_TEMP "eve-cognition-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           $previousBytes = ""
           for ($attempt = 1; $attempt -le 3; $attempt++) {
-            $output = @(& cargo run -p eve-cognition-plugin --example cognition_state --locked -- $cognitionDirectory)
+            $output = @(& python -X utf8 scripts/run-prebuilt.py --example cognition_state -- $cognitionDirectory)
             if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "认知状态进程验收失败" }
             Write-Host $output[0]
             $report = $output[0] | ConvertFrom-Json -AsHashtable
@@ -253,7 +257,7 @@ jobs:
         run: |
           $env:EVE_LLM_MAX_PARALLEL_TOOL_CALLS = "10"
           $configDirectory = Join-Path $env:RUNNER_TEMP "eve-config-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $firstOutput = @(& cargo run -p eve-runtime --example configuration --locked -- $configDirectory)
+          $firstOutput = @(& python -X utf8 scripts/run-prebuilt.py --example configuration -- $configDirectory)
           if ($LASTEXITCODE -ne 0) { throw "首次配置示例执行失败" }
           $firstOutput | ForEach-Object { Write-Host $_ }
           if ($firstOutput.Count -ne 1 -or $firstOutput[0] -cne "启动并发：10；仅新请求：在途 10 / 新请求 11；立即替换：12；重启恢复：12。") {
@@ -263,7 +267,7 @@ jobs:
           if ($first.format_version -ne 1 -or $first.current.revision -ne 2 -or $first.current.namespaces["runtime.llm"]["values"]["max_parallel_tool_calls"] -ne 12) {
             throw "首次配置文件修订或值不符"
           }
-          $secondOutput = @(& cargo run -p eve-runtime --example configuration --locked -- $configDirectory)
+          $secondOutput = @(& python -X utf8 scripts/run-prebuilt.py --example configuration -- $configDirectory)
           if ($LASTEXITCODE -ne 0) { throw "第二次配置示例执行失败" }
           $secondOutput | ForEach-Object { Write-Host $_ }
           if ($secondOutput.Count -ne 1 -or $secondOutput[0] -cne "启动并发：12；仅新请求：在途 12 / 新请求 13；立即替换：14；重启恢复：14。") {
@@ -277,7 +281,7 @@ jobs:
         run: |
           $modelDirectory = Join-Path $env:RUNNER_TEMP "eve-models-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           for ($attempt = 1; $attempt -le 2; $attempt++) {
-            $output = @(& cargo run -p eve-runtime --example model_roles --locked -- $modelDirectory)
+            $output = @(& python -X utf8 scripts/run-prebuilt.py --example model_roles -- $modelDirectory)
             if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "模型配置进程验收失败" }
             Write-Host $output[0]
             $report = $output[0] | ConvertFrom-Json -AsHashtable
@@ -302,14 +306,14 @@ jobs:
             }
           }
       - name: 验证 OpenAI 本地 HTTP 与插件工具闭环
-        run: cargo run -p eve-runtime --example openai_offline --locked
+        run: python -X utf8 scripts/run-prebuilt.py --example openai_offline
       - name: 验证 Responses SSE、插件工具与会话保存
-        run: cargo run -p eve-runtime --example streaming_offline --locked
+        run: python -X utf8 scripts/run-prebuilt.py --example streaming_offline
       - name: 验证显式取消、代际隔离及独立进程恢复
         run: |
           $controlDirectory = Join-Path $env:RUNNER_TEMP "eve-control-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           for ($attempt = 1; $attempt -le 2; $attempt++) {
-            $output = @(& cargo run -p eve-runtime --example controlled_session --locked -- $controlDirectory)
+            $output = @(& python -X utf8 scripts/run-prebuilt.py --example controlled_session -- $controlDirectory)
             if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "任务控制进程验收失败" }
             Write-Host $output[0]
             $report = $output[0] | ConvertFrom-Json -AsHashtable
@@ -336,7 +340,7 @@ jobs:
           foreach ($example in @("message_relations", "natural_message_relations")) {
             $messageDirectory = Join-Path $env:RUNNER_TEMP "eve-$example-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
             for ($attempt = 1; $attempt -le 2; $attempt++) {
-              $output = @(& cargo run -p eve-runtime --example $example --locked -- $messageDirectory)
+              $output = @(& python -X utf8 scripts/run-prebuilt.py --example $example -- $messageDirectory)
               if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "消息关系进程验收失败" }
               Write-Host $output[0]
               $report = $output[0] | ConvertFrom-Json -AsHashtable
@@ -369,7 +373,7 @@ jobs:
         run: |
           $streamDirectory = Join-Path $env:RUNNER_TEMP "eve-stream-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           function Invoke-Stream([string] $Mode) {
-            $output = @(& cargo run -p eve-runtime --example session_recovery --locked -- $streamDirectory $Mode)
+            $output = @(& python -X utf8 scripts/run-prebuilt.py --example session_recovery -- $streamDirectory $Mode)
             if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "流式进程验收失败" }
             Write-Host $output[0]
             return ($output[0] | ConvertFrom-Json -AsHashtable)
@@ -391,9 +395,9 @@ jobs:
           $sessionDirectory = Join-Path $env:RUNNER_TEMP "eve-session-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           function Invoke-Session([string] $Mode) {
             if ($Mode -eq "pending") {
-              $output = @(& cargo run -p eve-runtime --example session_recovery --locked -- $sessionDirectory --leave-pending)
+              $output = @(& python -X utf8 scripts/run-prebuilt.py --example session_recovery -- $sessionDirectory --leave-pending)
             } else {
-              $output = @(& cargo run -p eve-runtime --example session_recovery --locked -- $sessionDirectory)
+              $output = @(& python -X utf8 scripts/run-prebuilt.py --example session_recovery -- $sessionDirectory)
             }
             if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { throw "会话进程验收失败" }
             Write-Host $output[0]
@@ -416,7 +420,7 @@ jobs:
           $directory = Join-Path $env:RUNNER_TEMP "eve-cognition-loop-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           $reports = @()
           foreach ($mode in @("seed", "run", "run")) {
-            $output = @(& cargo run -p eve-runtime --example cognition_loop --locked -- $directory $mode)
+            $output = @(& python -X utf8 scripts/run-prebuilt.py --example cognition_loop -- $directory $mode)
             if ($LASTEXITCODE -ne 0) { throw "认知循环独立进程失败" }
             $output | ForEach-Object { Write-Host $_ }
             $reports += (($output -join "`n") | ConvertFrom-Json -AsHashtable)
@@ -455,7 +459,7 @@ jobs:
           }
 
           $stateDirectory = Join-Path $env:RUNNER_TEMP "eve-state-recovery-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $firstOutput = @(& cargo run -p eve-runtime --example state_recovery --locked -- $stateDirectory)
+          $firstOutput = @(& python -X utf8 scripts/run-prebuilt.py --example state_recovery -- $stateDirectory)
           if ($LASTEXITCODE -ne 0) { throw "首次状态恢复示例执行失败" }
           $firstOutput | ForEach-Object { Write-Host $_ }
           if ($firstOutput.Count -eq 0 -or $firstOutput[0] -cne "恢复前值：无；写入后值：1。") {
@@ -463,7 +467,7 @@ jobs:
           }
           Assert-SavedCounter $stateDirectory "[49]"
 
-          $secondOutput = @(& cargo run -p eve-runtime --example state_recovery --locked -- $stateDirectory)
+          $secondOutput = @(& python -X utf8 scripts/run-prebuilt.py --example state_recovery -- $stateDirectory)
           if ($LASTEXITCODE -ne 0) { throw "第二次状态恢复示例执行失败" }
           $secondOutput | ForEach-Object { Write-Host $_ }
           if ($secondOutput.Count -eq 0 -or $secondOutput[0] -cne "恢复前值：1；写入后值：2。") {
