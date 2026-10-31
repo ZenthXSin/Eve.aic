@@ -1,5 +1,5 @@
 """生产 Rust→Node 桥接：明确呼叫绕过耗尽预算、失败 Jev 和插话限流，不重答。"""
-from fixture_auth import configure_fixture_progress
+from fixture_auth import configure_fixture_progress, bootstrap_fixture_group_ids
 import json
 import os
 from pathlib import Path
@@ -59,6 +59,7 @@ export class QQBot {
             QQBOT_GROUP_PREFIX_ONLY='true',EVE_CHIME_ENABLED='false',EVE_HISTORY_DIGEST_ENABLED='false',
             EVE_JEV_API_KEY='group-jev-test-secret',EVE_JEV_BASE_URL=f'http://127.0.0.1:{self.jev_server.server_port}',
             EVE_MODELS_JEV_ENABLED='true',EVE_MODELS_JEV_PROVIDER='jev',EVE_MODELS_JEV_MODEL='group-jev-test-model')
+        bootstrap_fixture_group_ids(self.work / 'state', ['prefix-group', 'wake-group'])
         self.runs += 1
         child = subprocess.Popen([str(reminder_test.BINARY),'--group-chat','--message-judge','jev',
             '--state-dir',str(self.work/'state'),'--agent',str(source.parents[1]/'AGENT.md'),
@@ -133,6 +134,7 @@ export class QQBot {
                    EVE_HISTORY_DIGEST_ENABLED='false', EVE_GROUP_RELATION_LEARNING_ENABLED='false',
                    EVE_GROUP_RELATION_ACTIVE_INTERVAL_MS='1000', EVE_CHIME_COOLDOWN_MS='3600000',
                    EVE_CHIME_MAX_REPLIES_PER_HOUR='1')
+        bootstrap_fixture_group_ids(self.work / 'state', ['prefix-group', 'wake-group'])
         self.runs += 1
         child = subprocess.Popen([str(reminder_test.BINARY), '--group-chat', '--training', '--interest-learning',
             '--message-judge', 'jev', '--autonomy-budget', '1', '--state-dir', str(self.work / 'state'),

@@ -78,8 +78,14 @@ while True:time.sleep(.05)
         before = self.wait(ready)
         worker = int((self.root / 'worker').read_text())
         os.kill(before['child_pid'], signal.SIGKILL)
-        self.wait(lambda v: v.get('phase') == 'running' and v.get('child_pid') != before['child_pid']
-                  and len((self.root / 'starts').read_text().splitlines()) == 2)
+        def restarted_ready(value):
+            # running 只表示监督器进程已创建；等待第二个真实 worker 已进入
+            # 守护身份快照，再验证正常停止，避免在 helper 安装信号处理器前杀掉它。
+            current = (self.root / 'worker').read_text()
+            return (value.get('phase') == 'running' and value.get('child_pid') != before['child_pid']
+                    and current != str(worker) and current in value.get('members', {})
+                    and len((self.root / 'starts').read_text().splitlines()) == 2)
+        self.wait(restarted_ready)
         self.assertIsNone(guard.identity(worker))
         self.assertEqual(len((self.root / 'starts').read_text().splitlines()), 2)
         self.process.terminate()

@@ -118,7 +118,7 @@ class MemoryAcceptance(unittest.TestCase):
         document = json.loads(text)
         documents = {owner: {key: json.loads(bytes(value)) for key, value in entries.items()}
                      for owner, entries in document["entries"].items()}
-        return expand_learning_archive(documents, self.work / "state" / "learning-archive")
+        return expand_learning_archive(documents, self.state_path.parent / "learning-archive")
 
     def memory(self):
         return self.documents().get("eve.memory", {}).get("memory.v1")
