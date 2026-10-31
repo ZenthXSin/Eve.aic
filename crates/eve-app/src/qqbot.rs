@@ -1049,6 +1049,14 @@ async fn run_qqbot_composed(
             _ => return Err("QQBOT_SANDBOX 必须为 true 或 false".into()),
         };
         let mut bootstrap = core_bootstrap(&options.agent_path)?;
+        let notes_plugin = eve_context_plugin::ContextPlugin::new(Arc::new(
+            eve_context_plugin::FileContextArchive::open(
+                options.state_directory.join("context-notes-archive"),
+            )?,
+        ))?;
+        let context_notes: Arc<dyn eve_context_api::ContextAdmin> = Arc::new(notes_plugin.controller());
+        kernel.register(Box::new(notes_plugin))?;
+        kernel.start(&PluginId::new(eve_context_api::CONTEXT_PLUGIN_ID)?).await?;
         // 按用途记录本进程实际模型请求的结局，供面板区分“通道已连接”与“模型能完成请求”；只在内存中。
         let model_health = Arc::new(eve_model_health::HealthBook::new());
         model_health.register("dialogue");
@@ -2069,6 +2077,10 @@ async fn run_qqbot_composed(
                 authorization: qq_admin.clone(),
             }));
         }
+        bootstrap.tools.push(Arc::new(crate::context_notes::NotesTool {
+            admin: context_notes.clone(),
+            conversations: conversations.clone(),
+        }));
         let developer_backend = crate::developer::install_with_member_runtime_backend(
             &mut bootstrap,
             &options.state_directory,
@@ -2184,7 +2196,10 @@ async fn run_qqbot_composed(
         let tools_registered = tool_definitions.len();
         let help_commands = crate::qq_help::Help::handler(tool_definitions.clone(), conversations.clone());
         bootstrap.context = Some(Arc::new(eve_dialogue_tools::CapabilitiesContext {
-            inner: bootstrap.context.take().ok_or("对话上下文缺失")?,
+            inner: Arc::new(crate::context_notes::NotesContext {
+                inner: bootstrap.context.take().ok_or("对话上下文缺失")?,
+                admin: context_notes,
+            }),
             definitions: tool_definitions,
             source_seeds: research_policy
                 .as_ref()

@@ -31,6 +31,8 @@ name = "eve-memory"
 path = "src/bin/memory.rs"
 
 [dependencies]
+eve-context-api = { path = "../context-api" }
+eve-context-plugin = { path = "../context-plugin" }
 eve-subject-api = { path = "../subject-api" }
 eve-subject-plugin = { path = "../subject-plugin" }
 eve-script-runtime = { path = "../script-runtime" }

@@ -28,6 +28,7 @@ fn public_tool(name: &str) -> bool {
             | "manage_failure_reproduction"
             | "send_message"
             | "clear_context"
+            | "context_notes"
             | "save_preference"
             | "read_attachment"
             | "describe_image"

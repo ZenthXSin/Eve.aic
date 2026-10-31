@@ -9,7 +9,7 @@ import unittest
 
 import practice_test
 
-CONTEXT_TOOLS = {"clear_context", "clear_all_contexts"}
+CONTEXT_TOOLS = {"clear_context", "clear_all_contexts", "context_notes"}
 # 默认装配的会话文件回执、隔离脚本版本和主体控制工具；保持逐名精确比对。
 SCRIPT_TOOLS = {"save_script_plugin", "list_script_plugins", "activate_script_plugin", "run_script_plugin"}
 SUBJECT_TOOLS = {"manage_subject_focus", "configure_subject_autonomy"}

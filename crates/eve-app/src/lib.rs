@@ -7,6 +7,7 @@ mod cognition_action_admission;
 mod cognition_plan;
 mod config;
 mod console;
+mod context_notes;
 mod developer;
 mod dialogue;
 mod error;
