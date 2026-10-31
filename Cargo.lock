@@ -346,6 +346,7 @@ dependencies = [
  "eve-message-api",
  "eve-message-diagnostics",
  "eve-message-plugin",
+ "eve-model-credentials",
  "eve-model-health",
  "eve-outreach-api",
  "eve-outreach-plugin",
@@ -877,6 +878,7 @@ dependencies = [
  "eve-plugin-api",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
@@ -957,6 +959,13 @@ dependencies = [
  "eve-session-api",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "eve-model-credentials"
+version = "0.1.0"
+dependencies = [
+ "eve-llm-api",
 ]
 
 [[package]]

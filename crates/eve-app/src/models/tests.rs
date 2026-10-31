@@ -445,6 +445,122 @@ async fn cancellation_and_closed_configuration_do_not_reuse_stale_selection() {
     assert!(server.requests.try_recv().is_err());
 }
 
+#[tokio::test]
+async fn explicit_primary_reference_rotates_only_new_selections_and_preserves_inflight_provider() {
+    use eve_llm_api::{ChatMessage, ChatRole, CredentialPurpose, ModelRequest};
+    let root = tempfile::tempdir().unwrap();
+    let mut server = Server::start((0..3).map(|_| final_reply("chat")).collect()).await;
+    let h = Harness::start(root.path(), &server.url, "chat").await;
+    h.update(
+        &[(
+            "runtime.models",
+            "primary_credential_ref",
+            json!(crate::model_credentials::PRIMARY),
+        )],
+        ApplyMode::Immediate,
+    );
+    let bank = Arc::new(eve_model_credentials::CredentialBank::default());
+    bank.bind(
+        CredentialPurpose::Primary,
+        crate::model_credentials::PRIMARY,
+        Some("credential-old".into()),
+    )
+    .unwrap();
+    let resolver = CoreModelResolver::from_credentials(h.settings.clone(), Ok(bank.clone()));
+    let old = resolver.resolve().unwrap();
+    assert!(Arc::ptr_eq(
+        &old.provider,
+        &resolver.resolve().unwrap().provider
+    ));
+    bank.replace(
+        CredentialPurpose::Primary,
+        crate::model_credentials::PRIMARY,
+        1,
+        "credential-new".into(),
+    )
+    .unwrap();
+    let new = resolver.resolve().unwrap();
+    assert!(!Arc::ptr_eq(&old.provider, &new.provider));
+    for (selection, expected) in [
+        (&old, "credential-old"),
+        (&new, "credential-new"),
+        (&old, "credential-old"),
+    ] {
+        selection
+            .provider
+            .complete(ModelRequest {
+                messages: vec![ChatMessage::text(ChatRole::User, "验证凭据快照")],
+                tools: vec![],
+            })
+            .await
+            .unwrap();
+        let request = server.next().await;
+        assert!(
+            request
+                .headers
+                .to_lowercase()
+                .contains(&format!("authorization: bearer {expected}\r\n"))
+        );
+    }
+    h.stop().await;
+}
+
+struct ChangingCredentials {
+    mode: std::sync::atomic::AtomicUsize,
+}
+impl eve_llm_api::ModelCredentials for ChangingCredentials {
+    fn resolve(
+        &self,
+        _: eve_llm_api::CredentialPurpose,
+        reference: &str,
+    ) -> Result<eve_llm_api::CredentialLease, eve_llm_api::CredentialError> {
+        use eve_llm_api::{CredentialError, CredentialLease, CredentialPurpose};
+        match self.mode.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => Err(CredentialError::Unavailable),
+            2 => CredentialLease::new(
+                CredentialPurpose::Jev,
+                reference.into(),
+                1,
+                "wrong-purpose".into(),
+            ),
+            3 => CredentialLease::new(
+                CredentialPurpose::Primary,
+                "other-reference".into(),
+                1,
+                "wrong-reference".into(),
+            ),
+            _ => CredentialLease::new(
+                CredentialPurpose::Primary,
+                reference.into(),
+                1,
+                "synthetic-good".into(),
+            ),
+        }
+    }
+}
+#[tokio::test]
+async fn unavailable_or_mismatched_broker_never_uses_cached_provider() {
+    let root = tempfile::tempdir().unwrap();
+    let mut server = Server::start(vec![]).await;
+    let h = Harness::start(root.path(), &server.url, "chat").await;
+    let credentials = Arc::new(ChangingCredentials {
+        mode: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let resolver = CoreModelResolver::from_credentials(h.settings.clone(), Ok(credentials.clone()));
+    assert!(resolver.resolve().is_ok());
+    for mode in 1..=3 {
+        credentials
+            .mode
+            .store(mode, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            resolver.resolve(),
+            Err(LlmError::Configuration(_))
+        ));
+        assert!(server.requests.try_recv().is_err());
+    }
+    h.stop().await;
+}
+
 struct RacingSettings(std::sync::atomic::AtomicUsize);
 impl ConfigService for RacingSettings {
     fn snapshot(&self, namespace: &str, _: u32) -> eve_config_api::ConfigResult<ConfigSnapshot> {

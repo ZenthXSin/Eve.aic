@@ -73,10 +73,11 @@ impl eve_config_api::ConfigValidator for CoreConfigValidator {
         if let Some(profile) = roles.profile(ModelRole::Jev)
             && (profile.provider != "jev"
                 || profile.max_output_tokens.is_some()
-                || profile
-                    .credential_ref
-                    .as_deref()
-                    .is_some_and(|r| r != "env:EVE_JEV_API_KEY"))
+                || crate::model_credentials::reference(
+                    eve_llm_api::CredentialPurpose::Jev,
+                    profile.credential_ref.as_deref(),
+                )
+                .is_err())
         {
             return Err(invalid());
         }
@@ -347,11 +348,10 @@ pub(crate) fn provider_config(
         if profile.provider != "openai" {
             return Err("主模型角色当前只支持 provider=openai。".into());
         }
-        if profile.credential_ref.is_some() {
-            return Err(
-                "主模型角色的凭据引用尚未接线；当前入口使用宿主 EVE_OPENAI_API_KEY。".into(),
-            );
-        }
+        crate::model_credentials::reference(
+            eve_llm_api::CredentialPurpose::Primary,
+            profile.credential_ref.as_deref(),
+        )?;
         if profile.timeout_ms == 0 || profile.timeout_ms > 600_000 {
             return Err("主模型角色期限必须在 1 至 600000 毫秒之间。".into());
         }
@@ -491,6 +491,8 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(!error.contains("PRIVATE_REFERENCE_VALUE"));
+        primary.credential_ref = Some(crate::model_credentials::PRIMARY.into());
+        assert!(provider_config(&direct, Some(&primary)).is_ok());
         primary.credential_ref = None;
         primary.provider = "unknown".into();
         assert!(provider_config(&direct, Some(&primary)).is_err());
