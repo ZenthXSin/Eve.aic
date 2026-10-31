@@ -63,6 +63,14 @@ jobs:
         run: |
           cargo +1.89.0 fmt --all -- --check
           cargo +1.89.0 check --workspace --all-targets --locked
+      - name: 准备并验证实际脚本隔离环境
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-all --ro-bind / / --dev /dev --proc /proc /usr/bin/true
       - name: 实际 Eve QQBot 进程验收
         run: |
           cargo +1.89.0 build -p eve-app --bin eve-qqbot --bin eve-memory --locked
@@ -88,6 +96,7 @@ jobs:
           python3 connectors/qqbot/test/toolforge_test.py
           python3 connectors/qqbot/test/dialogue_tools_test.py
           python3 connectors/qqbot/test/developer_tools_test.py
+          EVE_TEST_PLUGIN_TOOLCHAIN=1.89.0 python3 connectors/qqbot/test/script_runtime_test.py
           python3 connectors/qqbot/test/file_import_test.py
           python3 connectors/qqbot/test/workflow_tools_test.py
           python3 connectors/qqbot/test/vision_test.py
