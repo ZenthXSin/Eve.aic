@@ -49,13 +49,16 @@ impl MemoryController {
     }
 }
 impl MemoryAdmin for MemoryController {
+    fn revisions(&self, channel: &str) -> MemoryResult<Vec<(MemoryScope, u64)>> {
+        self.service()?.revisions(channel)
+    }
     fn scopes(&self) -> MemoryResult<Vec<MemoryScope>> {
         self.service()?.scopes()
     }
     fn reader(&self, scope: MemoryScope) -> MemoryResult<Arc<dyn MemoryService>> {
         scope.validate()?;
         let stored = self.service()?;
-        stored.snapshot(&scope)?;
+        stored.revision(&scope)?;
         Ok(Arc::new(ScopedReader { stored, scope }))
     }
     fn archive_status(&self) -> MemoryResult<MemoryArchiveStatus> {
@@ -85,6 +88,9 @@ struct ScopedReader {
     scope: MemoryScope,
 }
 impl MemoryService for ScopedReader {
+    fn revision(&self) -> MemoryResult<u64> {
+        self.stored.revision(&self.scope)
+    }
     fn scan(&self) -> MemoryResult<Box<dyn MemoryEvidenceCursor>> {
         self.stored.scan(&self.scope)
     }

@@ -35,6 +35,9 @@ impl LearningController {
     }
 }
 impl LearningAdmin for LearningController {
+    fn change_token(&self, scope: &MemoryScope) -> LearningResult<Option<LearningChangeToken>> {
+        self.service()?.change_token(scope)
+    }
     fn scan_jobs(
         &self,
         scope: &MemoryScope,

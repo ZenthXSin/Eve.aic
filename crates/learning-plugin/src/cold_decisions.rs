@@ -239,6 +239,11 @@ pub(super) fn append(
     if bytes.len() > MAX_DECISIONS_STATE_BYTES {
         return Err(LearningError::LimitReached);
     }
+    let revision = inner
+        .change
+        .revision
+        .checked_add(1)
+        .ok_or(LearningError::LimitReached)?;
     archive.put(&hash, &body)?;
     if inner
         .context
@@ -252,6 +257,8 @@ pub(super) fn append(
         return Err(LearningError::Storage);
     }
     inner.decision_index = Some(next);
+    inner.change.revision = revision;
+    inner.scope_changes.insert(scope.clone(), revision);
     Ok(record)
 }
 

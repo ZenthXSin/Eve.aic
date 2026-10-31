@@ -430,10 +430,12 @@ async fn failed_page_never_skips_corrupt_record_even_if_file_is_restored() {
 struct TracedArchive {
     inner: FileLearningArchive,
     puts: std::sync::atomic::AtomicUsize,
+    gets: std::sync::atomic::AtomicUsize,
     failure: std::sync::atomic::AtomicUsize,
 }
 impl LearningArchiveStore for TracedArchive {
     fn get(&self, key: &str) -> LearningResult<Vec<u8>> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.get(key)
     }
     fn put(&self, key: &str, bytes: &[u8]) -> LearningResult<()> {
@@ -453,6 +455,7 @@ fn traced(directory: &std::path::Path) -> Arc<TracedArchive> {
     Arc::new(TracedArchive {
         inner: FileLearningArchive::open(directory).unwrap(),
         puts: 0.into(),
+        gets: 0.into(),
         failure: 0.into(),
     })
 }
@@ -607,6 +610,96 @@ async fn a_late_corrupt_job_blocks_cold_decision_append_before_any_new_file_or_i
     assert_eq!(
         admin.decisions(&source.scope),
         Err(LearningError::Unavailable)
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn change_token_tracks_durable_changes_and_new_service_identity_without_loading_history() {
+    let root = tempfile::tempdir().unwrap();
+    let state = RecordingStore::open(&root.path().join("state"));
+    let archive = traced(&root.path().join("cold"));
+    let source = memory(scope("tokens", "u"), 1);
+    let (kernel, admin) = open(state.clone(), Some(archive.clone())).await;
+    let initial = admin.change_token(&source.scope).unwrap().unwrap();
+    assert!(admin.snapshot(&source.scope).unwrap().jobs.is_empty());
+    assert_eq!(admin.change_token(&source.scope).unwrap(), Some(initial));
+    let batch = admin
+        .reserve(&source, 100, "v1", &options())
+        .unwrap()
+        .unwrap();
+    let reserved = admin.change_token(&source.scope).unwrap().unwrap();
+    assert_eq!(reserved.instance, initial.instance);
+    assert!(reserved.revision > initial.revision);
+    assert!(
+        admin
+            .reserve(&source, 101, "v1", &options())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(admin.change_token(&source.scope).unwrap(), Some(reserved));
+    admin
+        .finish(
+            &batch,
+            110,
+            LearningOutcome::Completed(vec![CandidateDraft {
+                text: "先给结论".into(),
+                confidence: 80,
+                evidence_ids: vec![batch.evidence[0].id.clone()],
+            }]),
+        )
+        .unwrap();
+    let finished = admin.change_token(&source.scope).unwrap().unwrap();
+    assert!(finished.revision > reserved.revision);
+    let mut decision = decision(&admin, &source);
+    admin
+        .record_decision(&source.scope, decision.clone(), 111)
+        .unwrap();
+    let first = admin.change_token(&source.scope).unwrap().unwrap();
+    assert!(first.revision > finished.revision);
+    admin
+        .record_decision(&source.scope, decision.clone(), 112)
+        .unwrap();
+    assert_eq!(admin.change_token(&source.scope).unwrap(), Some(first));
+    decision.policy_version = "p2".into();
+    admin.record_decision(&source.scope, decision, 113).unwrap();
+    let second = admin.change_token(&source.scope).unwrap().unwrap();
+    assert!(second.revision > first.revision);
+    let other = memory(scope("unrelated-token", "u"), 1);
+    admin
+        .reserve(&other, 200, "v1", &options())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        admin.change_token(&source.scope).unwrap(),
+        Some(second),
+        "另一范围保存不能唤醒本范围重扫"
+    );
+    assert!(admin.change_token(&other.scope).unwrap().unwrap().revision > 0);
+    let reads = archive.gets.load(std::sync::atomic::Ordering::SeqCst);
+    let writes = state.writes();
+    for _ in 0..100 {
+        assert_eq!(admin.change_token(&source.scope).unwrap(), Some(second));
+    }
+    assert_eq!(
+        archive.gets.load(std::sync::atomic::Ordering::SeqCst),
+        reads,
+        "轻量标识不应读取冷正文"
+    );
+    assert_eq!(state.writes(), writes);
+    kernel.stop_all().await.unwrap();
+    assert_eq!(
+        admin.change_token(&source.scope),
+        Err(LearningError::Unavailable)
+    );
+    let (kernel, reopened) = open(state, Some(archive)).await;
+    assert_ne!(
+        reopened
+            .change_token(&source.scope)
+            .unwrap()
+            .unwrap()
+            .instance,
+        second.instance
     );
     kernel.stop_all().await.unwrap();
 }

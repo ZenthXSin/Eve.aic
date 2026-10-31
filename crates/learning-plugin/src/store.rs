@@ -18,6 +18,7 @@ use std::{
 #[path = "cold_decisions.rs"]
 mod cold_decisions;
 
+static INSTANCE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 const FORMAT_VERSION: u32 = 1;
 const DECISIONS_STATE_KEY: &str = "learning.decisions.v1";
 const MAX_DECISIONS_STATE_BYTES: usize = MAX_STATE_BYTES;
@@ -28,7 +29,7 @@ struct Document {
     format_version: u32,
     jobs: Vec<JobRecord>,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JobRecord {
     job: LearningJob,
@@ -46,13 +47,15 @@ struct DecisionsDocument {
     format_version: u32,
     records: Vec<ScopedDecisionRecord>,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScopedDecisionRecord {
     scope: MemoryScope,
     record: LearningDecisionRecord,
 }
 struct Inner {
+    change: LearningChangeToken,
+    scope_changes: BTreeMap<MemoryScope, u64>,
     document: Document,
     decisions: DecisionsDocument,
     context: Option<PluginContext>,
@@ -251,6 +254,17 @@ impl StoredLearning {
         validate_decisions_document(&decisions, &document, decision_index.is_some())
             .map_err(|_| LearningError::CorruptState)?;
         let mut inner = Inner {
+            change: LearningChangeToken {
+                instance: INSTANCE_SEQUENCE
+                    .fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |n| n.checked_add(1),
+                    )
+                    .map_err(|_| LearningError::LimitReached)?,
+                revision: 0,
+            },
+            scope_changes: BTreeMap::new(),
             document,
             decisions,
             context: Some(context),
@@ -274,6 +288,20 @@ impl StoredLearning {
         Ok(Self {
             inner: Mutex::new(inner),
         })
+    }
+    pub(super) fn change_token(
+        &self,
+        scope: &MemoryScope,
+    ) -> LearningResult<Option<LearningChangeToken>> {
+        scope.validate().map_err(|_| LearningError::InvalidInput)?;
+        let inner = self.inner.lock().map_err(|_| LearningError::Unavailable)?;
+        if inner.context.is_none() {
+            return Err(LearningError::Unavailable);
+        }
+        Ok(Some(LearningChangeToken {
+            instance: inner.change.instance,
+            revision: inner.scope_changes.get(scope).copied().unwrap_or(0),
+        }))
     }
     fn lock(&self) -> LearningResult<WorkingGuard<'_>> {
         let mut inner = self.inner.lock().map_err(|_| LearningError::Unavailable)?;
@@ -937,6 +965,11 @@ impl StoredLearning {
 }
 
 fn persist(inner: &mut Inner, next: Document) -> LearningResult<()> {
+    let revision = inner
+        .change
+        .revision
+        .checked_add(1)
+        .ok_or(LearningError::LimitReached)?;
     let (bytes, index) = if let Some(store) = &inner.archive {
         let (bytes, index) = archive::freeze(store.as_ref(), "jobs", &next.jobs)?;
         (bytes, Some(index))
@@ -949,11 +982,34 @@ fn persist(inner: &mut Inner, next: Document) -> LearningResult<()> {
         inner.context = None;
         return Err(LearningError::Storage);
     }
+    for (position, record) in next.jobs.iter().enumerate() {
+        if inner.document.jobs.get(position) != Some(record) {
+            if let Some(old) = inner.document.jobs.get(position) {
+                inner
+                    .scope_changes
+                    .insert(old.job.batch.scope.clone(), revision);
+            }
+            inner
+                .scope_changes
+                .insert(record.job.batch.scope.clone(), revision);
+        }
+    }
+    for old in inner.document.jobs.iter().skip(next.jobs.len()) {
+        inner
+            .scope_changes
+            .insert(old.job.batch.scope.clone(), revision);
+    }
     inner.document = next;
     inner.job_index = index;
+    inner.change.revision = revision;
     Ok(())
 }
 fn persist_decisions(inner: &mut Inner, next: DecisionsDocument) -> LearningResult<()> {
+    let revision = inner
+        .change
+        .revision
+        .checked_add(1)
+        .ok_or(LearningError::LimitReached)?;
     if inner.archive.is_none() && next.records.len() > MAX_DECISIONS {
         return Err(LearningError::LimitReached);
     }
@@ -976,8 +1032,20 @@ fn persist_decisions(inner: &mut Inner, next: DecisionsDocument) -> LearningResu
         inner.context = None;
         return Err(LearningError::Storage);
     }
+    for (position, record) in next.records.iter().enumerate() {
+        if inner.decisions.records.get(position) != Some(record) {
+            if let Some(old) = inner.decisions.records.get(position) {
+                inner.scope_changes.insert(old.scope.clone(), revision);
+            }
+            inner.scope_changes.insert(record.scope.clone(), revision);
+        }
+    }
+    for old in inner.decisions.records.iter().skip(next.records.len()) {
+        inner.scope_changes.insert(old.scope.clone(), revision);
+    }
     inner.decisions = next;
     inner.decision_index = index;
+    inner.change.revision = revision;
     Ok(())
 }
 

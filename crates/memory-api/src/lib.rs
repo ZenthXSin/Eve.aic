@@ -187,6 +187,10 @@ pub struct PreferenceChange {
 
 /// 已绑定作用域的读取能力；调用方不能自行提供其他用户身份。
 pub trait MemoryService: Send + Sync {
+    /// 轻量修订查询，只用于唤醒/调度，不能代替正文和归档完整校验。
+    fn revision(&self) -> MemoryResult<u64> {
+        self.snapshot().map(|s| s.revision)
+    }
     fn snapshot(&self) -> MemoryResult<MemorySnapshot>;
     /// 一致性逐页证据视图。默认兼容旧实现，先取得完整快照；内置归档实现覆盖为逐块读取。
     fn scan(&self) -> MemoryResult<Box<dyn MemoryEvidenceCursor>> {
@@ -270,6 +274,21 @@ pub trait MemoryAdmin: Send + Sync {
     /// 不向通用服务目录或模型暴露此管理能力。
     fn scopes(&self) -> MemoryResult<Vec<MemoryScope>> {
         Err(MemoryError::Unavailable)
+    }
+    /// 给定通道的轻量范围/修订视图，只供后台调度，不证明归档正文已验证；默认兼容旧后端。
+    fn revisions(&self, channel: &str) -> MemoryResult<Vec<(MemoryScope, u64)>> {
+        validate_id(channel)?;
+        let mut scopes = self.scopes()?;
+        scopes.retain(|scope| scope.channel == channel);
+        scopes.sort();
+        scopes.dedup();
+        scopes
+            .into_iter()
+            .map(|scope| {
+                let revision = self.reader(scope.clone())?.revision()?;
+                Ok((scope, revision))
+            })
+            .collect()
     }
     fn reader(&self, scope: MemoryScope) -> MemoryResult<Arc<dyn MemoryService>>;
     /// 热层容量与归档状态；默认实现明确不支持。

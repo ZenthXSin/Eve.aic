@@ -127,8 +127,20 @@ pub enum LearningOutcome {
     Failed(LearningFailure),
 }
 
+/// 仅当前进程中的服务变更标识；不能用于授权、CAS 或跨进程恢复。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LearningChangeToken {
+    pub instance: u64,
+    pub revision: u64,
+}
+
 /// 仅可信宿主持有。不发布跨作用域管理能力给模型或不受信插件。
 pub trait LearningAdmin: Send + Sync {
+    /// 当前范围的无正文变更通知。None 表示旧实现不支持，宿主不能据此跳过完整扫描。
+    /// 标识相同不证明冷文件未损坏，缓存仍须定期完整复核。
+    fn change_token(&self, _scope: &MemoryScope) -> LearningResult<Option<LearningChangeToken>> {
+        Ok(None)
+    }
     fn scan_jobs(
         &self,
         scope: &MemoryScope,
