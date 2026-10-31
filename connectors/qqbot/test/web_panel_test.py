@@ -105,6 +105,70 @@ class WebPanelAcceptance(unittest.TestCase):
     def hold(self, name="end"):
         return {"wait_file": str(self.gate(name))}
 
+    def test_context_notes_preview_cas_history_and_restart_do_not_change_original_records_or_call_model(self):
+        original = '原始用户消息不能被便笺编辑覆盖'
+        note = '<img src=x onerror="window.eveXss=true"> 模组已编译，尚未验证实际运行'
+        changed = '产物读回通过；仍未发布'
+        first = self.message('note-seed', original)
+        next_message = self.message('note-read', '检查下一轮的便笺')
+        script = [{'send':first}, {'wait_command':{'id':'note-seed','type':'reply'}}, self.hold('notes-edit'),
+                  {'send':next_message}, {'wait_command':{'id':'note-read','type':'reply'}}, self.hold('notes-end')]
+        with self.launch(script) as (child, url):
+            def ready():
+                code, sessions = self.api(url,'/api/sessions?limit=25')
+                if code != 200 or not sessions['sessions']:
+                    return None
+                key = sessions['sessions'][0]['key']
+                code, detail = self.api(url,'/api/session',{'key':key,'limit':25})
+                return key if code == 200 and detail['session']['turns'][-1]['status']['state'] == 'Completed' else None
+            key = self.until(ready, child)
+            original_sessions = self.documents()['eve.session']
+            requests_before = len(self.requests)
+            def action(operation, **values):
+                return self.api(url,'/api/context-notes',{'key':key,'action':{'operation':operation,**values}})
+            self.assertEqual(action('inspect')[1]['view']['revision'],0)
+            self.assertNotIn('eve.context-notes',self.documents())
+            code, preview = action('preview',text=note)
+            self.assertEqual(code,200)
+            self.assertFalse(preview['saved'])
+            self.assertIn(note.replace('"','\\"'),preview['preview']['rendered'])
+            self.assertNotIn('eve.context-notes',self.documents())
+            self.assertEqual(action('update',expected_revision=0,text=note)[1]['view']['revision'],1)
+            self.assertEqual(action('update',expected_revision=1,text=changed)[1]['view']['revision'],2)
+            self.assertEqual(action('update',expected_revision=1,text='过时覆盖')[0],409)
+            self.assertEqual(action('inspect')[1]['view']['text'],changed)
+            code, versions = action('versions',limit=1)
+            self.assertEqual(code,200)
+            self.assertEqual([v['revision'] for v in versions['versions']],[2])
+            self.assertEqual(versions['next_before'],2)
+            self.assertEqual(action('versions',before=2,limit=1)[1]['versions'][0]['revision'],1)
+            self.assertEqual(action('read_version',revision=1)[1]['view']['text'],note)
+            self.assertEqual(action('rollback',expected_revision=2,target_revision=1)[1]['view']['revision'],3)
+            self.assertEqual(action('inspect')[1]['view']['text'],note)
+            foreign = {**key,'user_id':'other-user'}
+            self.assertEqual(self.api(url,'/api/context-notes',{'key':foreign,'action':{'operation':'inspect'}})[0],404)
+            self.assertEqual(self.api(url,'/api/context-notes',{'key':key,'channel':'console','action':{'operation':'inspect'}})[0],400)
+            self.assertEqual(self.api(url,'/api/context-notes',{'key':key,'action':{'operation':'inspect'}},token='incorrect-token')[0],401)
+            self.assertEqual(len(self.requests),requests_before,'HTTP 管理操作不请求模型')
+            self.assertEqual(self.documents()['eve.session'],original_sessions,'便笺写入不改写原话或已发生的工具')
+            self.gate('notes-edit').touch()
+            self.until(lambda: len(self.requests) >= requests_before+1,child)
+            self.assertIn('eve-context-note-v1',json.dumps(self.requests[-1],ensure_ascii=False))
+            self.assertIn('模组已编译',json.dumps(self.requests[-1],ensure_ascii=False))
+            self.gate('notes-end').touch()
+        records = self.documents()['eve.context-notes']['index.v1']['records']
+        self.assertEqual(len(records),1)
+        self.assertEqual(len(next(iter(records.values()))['versions']),3)
+        self.assertEqual(len(list((self.work/'state/context-notes-archive').glob('*.json'))),2)
+        restart = self.message('note-restart','重启后继续核对便笺')
+        with self.launch([{'send':restart},{'wait_command':{'id':'note-restart','type':'reply'}},self.hold('notes-restart')]) as (child,url):
+            self.until(lambda: len(self.requests) >= requests_before+2,child)
+            code, current = self.api(url,'/api/context-notes',{'key':key,'action':{'operation':'inspect'}})
+            self.assertEqual(code,200)
+            self.assertEqual((current['view']['revision'],current['view']['text']),(3,note))
+            self.assertIn('模组已编译',json.dumps(self.requests[-1],ensure_ascii=False))
+            self.gate('notes-restart').touch()
+
     def test_panel_reads_cancels_exact_generation_and_recovers_without_replay(self):
         self.provider_steps[1] = {"wait": "old-never"}
         original = self.message("web-active", "待取消的真实模型请求", expected_type="finish")

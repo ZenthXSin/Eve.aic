@@ -2199,7 +2199,7 @@ async fn run_qqbot_composed(
             inner: Arc::new(crate::context_notes::NotesContext {
                 channel: "qq",
                 inner: bootstrap.context.take().ok_or("对话上下文缺失")?,
-                admin: context_notes,
+                admin: context_notes.clone(),
             }),
             definitions: tool_definitions,
             source_seeds: research_policy
@@ -3119,6 +3119,7 @@ async fn run_qqbot_composed(
             let started = eve_web_panel::LocalPanel::bind(
                 config,
                 Arc::new(crate::web_panel::QqPanel {
+                    notes: context_notes,
                     plugins: crate::web_panel_plugins::PanelPlugins::new(
                         runtime_inspector.clone(),
                         Arc::new(kernel.clone()),

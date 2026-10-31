@@ -658,6 +658,7 @@
     if (before !== null) actions.append(button("回到最新", "secondary", () => { void loadSession(session.key); }));
     heading.append(actions);
     $("session-detail").replaceChildren(heading);
+    $("session-detail").append(contextNotesEditor(session.key));
     if (body.control && validKey(body.control.key)) {
       const control = body.control;
       const box = node("div", "session-control");
@@ -694,6 +695,129 @@
       conversation.append(entry);
     }
     $("session-detail").append(conversation);
+  }
+
+  function contextNotesEditor(key) {
+    const requestEpoch = epoch, requestSession = sessionRequest;
+    const card = node("section", "context-notes");
+    card.setAttribute("aria-label", "工作便笺管理");
+    card.append(node("h3", "", "工作便笺"), node("p", "detail-note", "本机操作者可管理所选 QQ 会话的便笺。它是低优先级工作参考，不能改写原话、执行回执或权限。保存和回退在下一轮生效，旧版保留。"));
+    const feedback = node("p", "detail-note", "先读取当前便笺；编辑后预览，再保存");
+    feedback.setAttribute("role", "status");
+    const counter = node("p", "detail-note");
+    const editor = node("textarea", "");
+    editor.rows = 6;
+    editor.setAttribute("aria-label", "工作便笺正文");
+    editor.spellcheck = false;
+    const current = node("pre", "note-current");
+    current.setAttribute("aria-label", "已保存便笺");
+    const preview = node("pre", "note-preview");
+    preview.setAttribute("aria-label", "实际注入预览");
+    const history = node("div", "note-history");
+    const actions = node("div", "detail-actions");
+    let base = null, pending = false, dirty = false, reviewed = null, reconcile = false, nextBefore = null;
+    const live = () => token && epoch === requestEpoch && sessionRequest === requestSession && sameSession(selectedSession, key) && card.isConnected;
+    const bytes = () => new TextEncoder().encode(editor.value).length;
+    const validView = (view) => view && sameSession(view.owner, key) && view.owner.channel === "qq" &&
+      Number.isSafeInteger(view.revision) && view.revision >= 0 && typeof view.text === "string" &&
+      new TextEncoder().encode(view.text).length <= 16384;
+    function sync() {
+      counter.textContent = `正文 ${bytes()} / 16384 UTF-8 字节${base === null ? "" : ` · 当前修订 ${base}`}`;
+      editor.disabled = pending || base === null;
+      read.disabled = pending;
+      inspectPreview.disabled = pending || base === null || bytes() > 16384 || reconcile;
+      save.disabled = pending || base === null || reconcile || !reviewed || reviewed.base !== base || reviewed.text !== editor.value;
+      versions.disabled = pending || base === null;
+      older.disabled = pending || nextBefore === null;
+      for (const button of history.querySelectorAll("button")) button.disabled = pending || reconcile;
+    }
+    async function perform(action, accept) {
+      if (pending || !live()) return;
+      pending = true; sync();
+      try {
+        const result = await api("/api/context-notes", { key, action });
+        if (!live()) return;
+        accept(result);
+      } catch (error) {
+        if (!live() || error.silent) return;
+        if (["update", "rollback"].includes(action.operation)) {
+          reconcile = true; reviewed = null;
+          feedback.textContent = `${errorText(error)} 保存结果须重新读取核对；不会自动重复提交，草稿保留`;
+        } else feedback.textContent = errorText(error);
+      } finally { pending = false; if (live()) sync(); }
+    }
+    function acceptCurrent(result, saved = false) {
+      if (!validView(result.view) || saved && (result.saved !== true || result.effective !== "next_turn")) throw new ApiError("便笺回执格式无效，请重新读取核对");
+      base = result.view.revision;
+      current.textContent = result.view.text || "已保存便笺为空";
+      if (!dirty || saved) { editor.value = result.view.text; dirty = false; }
+      reconcile = false; reviewed = null; preview.textContent = "";
+      if (saved) { history.replaceChildren(); nextBefore = null; }
+      feedback.textContent = saved ? `已保存修订 ${base}，下一轮生效；原始记录与旧版保留` : `已读取修订 ${base}${dirty ? "，未保存的草稿保留，请重新预览" : ""}`;
+    }
+    const read = button("读取当前便笺", "secondary", () => { void perform({ operation: "inspect" }, acceptCurrent); });
+    const inspectPreview = button("预览便笺", "secondary", () => {
+      const candidate = editor.value;
+      void perform({ operation: "preview", text: candidate }, (result) => {
+        const value = result.preview;
+        if (!value || result.saved !== false || typeof value.changed !== "boolean" || !validView(value.proposed) || value.proposed.text !== candidate ||
+          value.proposed.revision !== value.base_revision + (value.changed ? 1 : 0) ||
+          !(value.rendered === null || typeof value.rendered === "string")) throw new ApiError("便笺预览格式无效");
+        if (value.base_revision !== base) { reconcile = true; reviewed = null; throw new ApiError("当前便笺已变化，请重新读取；草稿保留"); }
+        reviewed = { base, text: candidate };
+        preview.textContent = value.rendered ?? "空便笺不注入上下文";
+        feedback.textContent = "这是实际注入文本的预览，尚未保存；核对后可保存";
+      });
+    });
+    const save = button("保存便笺", "primary", () => {
+      if (!reviewed || reviewed.base !== base || reviewed.text !== editor.value || reconcile) return;
+      const expected = base, candidate = editor.value;
+      void perform({ operation: "update", expected_revision: expected, text: candidate }, (result) => {
+        if (!validView(result.view) || result.view.text !== candidate || ![expected, expected + 1].includes(result.view.revision)) throw new ApiError("保存回执与候选不符，请重新读取核对");
+        acceptCurrent(result, true);
+      });
+    });
+    function loadVersions(before = null) {
+      void perform({ operation: "versions", before, limit: 16 }, (result) => {
+        if (!sameSession(result.owner, key) || result.owner.channel !== "qq" || !Array.isArray(result.versions) || result.versions.length > 16 ||
+          !(result.next_before === null || Number.isSafeInteger(result.next_before) && result.next_before > 0)) throw new ApiError("版本列表格式无效");
+        let previous = before ?? Number.MAX_SAFE_INTEGER;
+        const rows = [];
+        for (const version of result.versions) {
+          if (!Number.isSafeInteger(version.revision) || version.revision <= 0 || version.revision >= previous ||
+            !Number.isSafeInteger(version.text_bytes) || version.text_bytes < 0 || version.text_bytes > 16384 ||
+            typeof version.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(version.sha256)) throw new ApiError("版本列表顺序或大小无效");
+          previous = version.revision;
+          const row = node("div", "detail-actions");
+          row.append(node("span", "", `修订 ${version.revision} · ${version.text_bytes} 字节`));
+          row.append(button(`读取修订 ${version.revision}`, "secondary", () => { void perform({ operation: "read_version", revision: version.revision }, (result) => {
+            if (!validView(result.view) || result.view.revision !== version.revision) throw new ApiError("旧版便笺格式无效");
+            editor.value = result.view.text; dirty = true; reviewed = null; preview.textContent = "";
+            feedback.textContent = `修订 ${version.revision} 已读入草稿，尚未保存；当前活动版仍为 ${base}`;
+          }); }));
+          row.append(button(`回退至修订 ${version.revision}`, "secondary", () => {
+            const expected = base;
+            void perform({ operation: "rollback", expected_revision: expected, target_revision: version.revision }, (result) => {
+              if (!validView(result.view) || result.view.version?.sha256 !== version.sha256 || ![expected, expected + 1].includes(result.view.revision)) throw new ApiError("回退回执与目标版本不符，请重新读取核对");
+              acceptCurrent(result, true);
+            });
+          }));
+          rows.push(row);
+        }
+        if (result.next_before !== null && (!rows.length || result.next_before !== previous)) throw new ApiError("版本分页游标无效");
+        if (before === null) history.replaceChildren();
+        history.append(...rows);
+        nextBefore = result.next_before;
+        feedback.textContent = `读取 ${rows.length} 条版本；读取旧版只改草稿，回退会追加新修订`;
+      });
+    }
+    const versions = button("查看便笺版本", "secondary", () => loadVersions());
+    const older = button("更多便笺版本", "secondary", () => loadVersions(nextBefore));
+    editor.addEventListener("input", () => { dirty = true; reviewed = null; preview.textContent = ""; sync(); });
+    actions.append(read, inspectPreview, save, versions, older);
+    card.append(feedback, current, editor, counter, actions, preview, history);
+    sync();
+    return card;
   }
 
   function appendMessage(parent, role, label, content, truncated = false) {

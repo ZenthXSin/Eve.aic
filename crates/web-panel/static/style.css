@@ -130,6 +130,10 @@ input:focus { border-color: var(--accent); background: #fff; }
 .detail-grid dd { margin: 0; font-size: 13px; line-height: 1.65; overflow-wrap: anywhere; }
 .detail-note { padding: 13px 15px; border-radius: 8px; color: #586378; background: #f5f6f9; font-size: 12px; line-height: 1.85; }
 .detail-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 22px; align-items: center; }
+.context-notes { margin: 18px; padding: 16px; border: 1px solid #dfe4ed; border-radius: 10px; }
+.context-notes textarea { box-sizing: border-box; width: 100%; min-height: 140px; padding: 12px; font: inherit; resize: vertical; }
+.context-notes pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow: auto; }
+.context-notes pre:empty { display: none; }
 .confirm-box { background: #fff6f2; border: 1px solid #eed4c8; padding: 16px; border-radius: 8px; margin-top: 20px; }
 .confirm-box p { font-size: 12px; color: #784e3e; line-height: 1.8; }
 .confirm-box .detail-actions { margin-top: 13px; }

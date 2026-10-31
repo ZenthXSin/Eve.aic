@@ -11,7 +11,8 @@ use eve_control_api::GenerationKey;
 use eve_memory_api::MemoryScope;
 use eve_session_api::SessionKey;
 use eve_web_panel_api::{
-    MAX_PAGE_FIELDS, PageSaveRequest, PanelError, PanelService, PluginAction, valid_panel_id,
+    MAX_PAGE_FIELDS, MAX_PANEL_CONTEXT_BODY_BYTES, PageSaveRequest, PanelContextNoteRequest,
+    PanelError, PanelService, PluginAction, valid_panel_id,
 };
 use ring::{
     hmac,
@@ -108,6 +109,10 @@ impl LocalPanel {
             .route("/api/sessions", get(sessions))
             .route("/api/tasks", get(tasks))
             .route("/api/session", post(session))
+            .route(
+                "/api/context-notes",
+                post(context_notes).layer(DefaultBodyLimit::max(MAX_PANEL_CONTEXT_BODY_BYTES)),
+            )
             .route("/api/cancel", post(cancel))
             .route("/api/judgments", get(judgments))
             .route("/api/goals", get(goals))
@@ -308,6 +313,21 @@ async fn save_plugin_page(
         return error(StatusCode::SERVICE_UNAVAILABLE, "stopping");
     }
     match shared.service.save_plugin_page(body) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+async fn context_notes(
+    State(shared): State<Arc<Shared>>,
+    body: Result<Json<PanelContextNoteRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_json");
+    };
+    if body.key.validate().is_err() || body.action.validate().is_err() {
+        return error(StatusCode::BAD_REQUEST, "invalid_input");
+    }
+    match shared.service.context_notes(body) {
         Ok(value) => Json(value).into_response(),
         Err(e) => failure(e),
     }

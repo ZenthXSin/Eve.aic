@@ -1550,6 +1550,7 @@ dependencies = [
 name = "eve-web-panel-api"
 version = "0.1.0"
 dependencies = [
+ "eve-context-api",
  "eve-control-api",
  "eve-memory-api",
  "eve-session-api",

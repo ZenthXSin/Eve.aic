@@ -17,6 +17,7 @@ node connectors/qqbot/test/web_panel_browser.mjs
 # 认知目标页使用同样的环境变量：
 node connectors/qqbot/test/web_panel_cognition_browser.mjs
 node connectors/qqbot/test/web_panel_memory_browser.mjs
+node connectors/qqbot/test/web_panel_notes_browser.mjs
 ```
 
 脚本自己启动真实 Eve 进程、环回模型和 QQ 替身，使用合成令牌与合成正文。验证登录、仅内存令牌、任务取消确认、历史分页、截断标注、正文按纯文本展示、判断诊断（明确命令规则的一次判断、不显示正文或身份）、移动端布局、退出与刷新重新登录；截图保存为 `desktop.png`、`judgments.png`、`mobile-judgments.png` 和 `mobile.png`。不读取实际 QQ/模型凭据，不接触已有状态目录，停止只作用于脚本持有的子进程。
@@ -33,3 +34,5 @@ python3 connectors/qqbot/test/plan_test.py PlanAcceptance.test_panel_page_shows_
 ```
 
 它在目标详情中核对计划、步骤、能力与建议记录按纯文本显示；第一次点击“撤销计划”只出现确认框，返回后不发送请求，再次确认后才撤销，撤销后不再提供按钮；手机宽度不出现横向滚动。截图保存为 `plans.png` 和 `mobile-plans.png`。Python 侧随后核对账本中的计划确为已撤销，且没有开始任何研究或实践。
+
+`web_panel_notes_browser.mjs` 验证本机面板的工作便笺：预览零写入、实际保存、并发编辑后的 CAS 拒绝与草稿保留、旧版回退、下一轮注入、UTF-8 超限、HTML 纯文本、手机布局，以及退出后到达的只读响应不再回填。管理期间不请求模型，全场只用本地替身完成两轮普通聊天；截图为 `context-notes.png`。可用 `EVE_TEST_BROWSER` 指定本机 Chromium/Chrome 可执行文件，复用已有浏览器安装，不要求额外下载。

@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+eve-context-api = { path = "../context-api" }
 eve-control-api = { path = "../control-api" }
 eve-memory-api = { path = "../memory-api" }
 eve-session-api = { path = "../session-api" }

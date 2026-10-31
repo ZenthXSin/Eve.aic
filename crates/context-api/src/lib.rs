@@ -1,6 +1,7 @@
 //! 可编辑的会话工作便笺。它是低优先级派生材料，不是用户原话、授权或原始历史。
 use serde::{Deserialize, Serialize};
 use std::fmt;
+mod reply;
 
 pub const CONTEXT_PLUGIN_ID: &str = "eve.context-notes";
 pub const MAX_NOTE_BYTES: usize = 16 * 1024;
@@ -63,6 +64,22 @@ pub struct ContextVersion {
     pub text_bytes: usize,
     pub change: ContextChange,
 }
+impl ContextVersion {
+    pub fn validate(&self) -> ContextResult<()> {
+        if self.revision == 0
+            || self.text_bytes > MAX_NOTE_BYTES
+            || self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || matches!(self.change, ContextChange::Rollback { target_revision } if target_revision >= self.revision)
+        {
+            return Err(ContextError::CorruptState);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,11 +100,7 @@ impl ContextView {
                 if self.revision > 0
                     && v.revision == self.revision
                     && v.text_bytes == self.text.len()
-                    && v.sha256.len() == 64
-                    && v.sha256
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                    && !matches!(v.change, ContextChange::Rollback { target_revision } if target_revision >= v.revision) =>
+                    && v.validate().is_ok() =>
             {
                 Ok(())
             }
@@ -125,8 +138,122 @@ pub struct ContextPreview {
     pub changed: bool,
 }
 
+/// 由宿主先绑定身份再执行；命令本身不接受 owner、路径、权限或工具调用。
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContextOperation {
+    Inspect {},
+    ReadVersion {
+        revision: u64,
+    },
+    Versions {
+        #[serde(default)]
+        before: Option<u64>,
+        #[serde(default = "default_page")]
+        limit: usize,
+    },
+    Preview {
+        text: String,
+    },
+    Update {
+        expected_revision: u64,
+        text: String,
+    },
+    Rollback {
+        expected_revision: u64,
+        target_revision: u64,
+    },
+}
+fn default_page() -> usize {
+    16
+}
+impl ContextOperation {
+    pub fn validate(&self) -> ContextResult<()> {
+        match self {
+            Self::Preview { text } | Self::Update { text, .. } => validate_note(text),
+            Self::Versions { before, limit }
+                if before == &Some(0) || !(1..=MAX_VERSION_PAGE).contains(limit) =>
+            {
+                Err(ContextError::InvalidInput)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// 保持结构化回执。saved 只在提交成功后为 true，预览不冒充已保存。
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum ContextReply {
+    View {
+        view: ContextView,
+    },
+    Versions {
+        owner: ContextOwner,
+        versions: Vec<ContextVersion>,
+        next_before: Option<u64>,
+    },
+    Preview {
+        preview: ContextPreview,
+        saved: bool,
+    },
+    Saved {
+        view: ContextView,
+        saved: bool,
+        effective: &'static str,
+    },
+}
+
 /// 管理句柄只交给可信宿主；模型不能选择 owner。修改是 CAS，不能静默覆盖并发编辑。
 pub trait ContextAdmin: Send + Sync {
+    /// 工具和管理界面共用相同操作，不重复实现一套写入/回退规则。调用者仍须 validate_for 核对替换后端的回执。
+    fn apply(
+        &self,
+        owner: &ContextOwner,
+        operation: &ContextOperation,
+    ) -> ContextResult<ContextReply> {
+        owner.validate()?;
+        operation.validate()?;
+        Ok(match operation {
+            ContextOperation::Inspect {} => ContextReply::View {
+                view: self.inspect(owner)?,
+            },
+            ContextOperation::ReadVersion { revision } => ContextReply::View {
+                view: self.read_version(owner, *revision)?,
+            },
+            ContextOperation::Versions { before, limit } => {
+                let versions = self.versions(owner, *before, *limit)?;
+                let next_before = (versions.len() == *limit)
+                    .then(|| versions.last().map(|v| v.revision))
+                    .flatten();
+                ContextReply::Versions {
+                    owner: owner.clone(),
+                    versions,
+                    next_before,
+                }
+            }
+            ContextOperation::Preview { text } => ContextReply::Preview {
+                preview: self.preview(owner, text)?,
+                saved: false,
+            },
+            ContextOperation::Update {
+                expected_revision,
+                text,
+            } => ContextReply::Saved {
+                view: self.update(owner, *expected_revision, text)?,
+                saved: true,
+                effective: "next_turn",
+            },
+            ContextOperation::Rollback {
+                expected_revision,
+                target_revision,
+            } => ContextReply::Saved {
+                view: self.rollback(owner, *expected_revision, *target_revision)?,
+                saved: true,
+                effective: "next_turn",
+            },
+        })
+    }
     fn inspect(&self, owner: &ContextOwner) -> ContextResult<ContextView>;
     fn read_version(&self, owner: &ContextOwner, revision: u64) -> ContextResult<ContextView>;
     /// 按修订倒序，before 为独占游标；limit 为 1..=64，不包含虚拟版本 0。
@@ -156,6 +283,7 @@ pub trait ContextAdmin: Send + Sync {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContextError {
     InvalidInput,
+    InvalidReply,
     NotFound,
     StaleRevision,
     LimitReached,
@@ -168,6 +296,7 @@ impl fmt::Display for ContextError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::InvalidInput => "便笺参数无效或正文超过 16 KiB",
+            Self::InvalidReply => "便笺返回结果与请求不符，本次未采用；如涉及写入，须重新读取核对，不能自动重试或声称成功",
             Self::NotFound => "当前身份没有这个便笺版本",
             Self::StaleRevision => "便笺已被其他操作修改，请先重新读取版本",
             Self::LimitReached => "便笺索引达到容量保护，未删除已有版本",

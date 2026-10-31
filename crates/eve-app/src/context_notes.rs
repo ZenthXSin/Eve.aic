@@ -3,7 +3,6 @@ use eve_context_api::*;
 use eve_llm_api::*;
 use eve_qqbot_plugin::QqConversations;
 use eve_session_api::SessionKey;
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -55,50 +54,13 @@ impl ContextAssembler for NotesContext {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
-enum Args {
-    Inspect {},
-    ReadVersion {
-        revision: u64,
-    },
-    Versions {
-        #[serde(default)]
-        before: Option<u64>,
-        #[serde(default = "page_size")]
-        limit: usize,
-    },
-    Preview {
-        text: String,
-    },
-    Update {
-        expected_revision: u64,
-        text: String,
-    },
-    Rollback {
-        expected_revision: u64,
-        target_revision: u64,
-    },
-}
-fn page_size() -> usize {
-    16
-}
+type Args = ContextOperation;
 fn args(value: &Value) -> Result<Args, ToolValidationError> {
     let invalid = || {
         ToolValidationError { message: "便笺参数无效：须指定操作；修改携带当前 expected_revision，正文不超过 16 KiB，不接受其他用户、会话或路径".into() }
     };
     let parsed: Args = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
-    match &parsed {
-        Args::Preview { text } | Args::Update { text, .. } => {
-            validate_note(text).map_err(|_| invalid())?
-        }
-        Args::Versions { before, limit }
-            if before == &Some(0) || !(1..=MAX_VERSION_PAGE).contains(limit) =>
-        {
-            return Err(invalid());
-        }
-        _ => {}
-    }
+    parsed.validate().map_err(|_| invalid())?;
     Ok(parsed)
 }
 pub(crate) struct NotesTool {
@@ -168,37 +130,10 @@ impl Tool for NotesTool {
                 .scope()
                 .ok_or_else(|| ToolExecutionError::Failed("工作便笺需要可信会话身份".into()))?;
             let owner = self.binding.owner(scope)?;
-            let value = match args {
-                Args::Inspect {} => json!({"view":self.admin.inspect(&owner).map_err(failure)?}),
-                Args::ReadVersion { revision } => {
-                    json!({"view":self.admin.read_version(&owner, revision).map_err(failure)?})
-                }
-                Args::Versions { before, limit } => {
-                    let versions = self
-                        .admin
-                        .versions(&owner, before, limit)
-                        .map_err(failure)?;
-                    let next_before = (versions.len() == limit)
-                        .then(|| versions.last().map(|v| v.revision))
-                        .flatten();
-                    json!({"versions":versions,"next_before":next_before})
-                }
-                Args::Preview { text } => {
-                    json!({"preview":self.admin.preview(&owner, &text).map_err(failure)?,"saved":false})
-                }
-                Args::Update {
-                    expected_revision,
-                    text,
-                } => {
-                    json!({"view":self.admin.update(&owner, expected_revision, &text).map_err(failure)?,"saved":true,"effective":"next_turn"})
-                }
-                Args::Rollback {
-                    expected_revision,
-                    target_revision,
-                } => {
-                    json!({"view":self.admin.rollback(&owner, expected_revision, target_revision).map_err(failure)?,"saved":true,"effective":"next_turn"})
-                }
-            };
+            let reply = self.admin.apply(&owner, &args).map_err(failure)?;
+            reply.validate_for(&owner, &args).map_err(failure)?;
+            let value =
+                serde_json::to_value(reply).map_err(|_| failure(ContextError::Unavailable))?;
             Ok(value)
         })
     }
