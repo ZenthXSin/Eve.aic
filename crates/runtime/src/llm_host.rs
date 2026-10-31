@@ -1084,11 +1084,8 @@ impl LlmHost {
                 });
                 if !compaction_announced
                     && state.has_work(&messages)
-                    && crate::compaction::estimate(&ModelRequest {
-                        messages: messages.clone(),
-                        tools: definitions.clone(),
-                    })
-                    .map_err(|error| fail(error, diagnostics.clone()))?
+                    && crate::compaction::estimate_request(&messages, &definitions)
+                        .map_err(|error| fail(error, diagnostics.clone()))?
                         >= policy.trigger_tokens
                 {
                     emit(events, TurnEventKind::ContextCompactionStarted)
@@ -1107,11 +1104,8 @@ impl LlmHost {
             }
             if self.adaptive_limit.is_some_and(|limit| {
                 compaction.is_none()
-                    && crate::compaction::estimate(&ModelRequest {
-                        messages: messages.clone(),
-                        tools: definitions.clone(),
-                    })
-                    .map_or(true, |size| size >= limit)
+                    && crate::compaction::estimate_request(&messages, &definitions)
+                        .map_or(true, |size| size >= limit)
             }) {
                 return Err(fail(
                     LlmError::Context("上下文达到上限且没有可用摘要器；原始记录保留".into()),

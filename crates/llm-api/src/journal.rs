@@ -81,11 +81,7 @@ impl TurnCheckpoint {
         {
             return Err(invalid());
         }
-        ModelRequest {
-            messages: self.messages.clone(),
-            tools: vec![],
-        }
-        .validate()?;
+        ModelRequest::validate_parts(&self.messages, &[])?;
         let mut ids = HashSet::new();
         let mut count = 0;
         for call in self
@@ -110,10 +106,25 @@ impl TurnCheckpoint {
                     + usize::from(!self.pending_calls.is_empty())
             || self.provider_requests < self.tool_batches
             || (self.result.is_some() && self.provider_requests == 0)
-            || serde_json::to_vec(self).map_err(|_| invalid())?.len() > MAX_CHECKPOINT_BYTES
+            || serde_json::to_writer(&mut ByteBudget(MAX_CHECKPOINT_BYTES), self).is_err()
         {
             return Err(invalid());
         }
+        Ok(())
+    }
+}
+
+/// 计数 JSON 实际转义后的 UTF-8 字节；超出既有预算即停止，不构造正文副本。
+struct ByteBudget(usize);
+impl std::io::Write for ByteBudget {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if buffer.len() > self.0 {
+            return Err(std::io::Error::other("执行检查点超过字节预算"));
+        }
+        self.0 -= buffer.len();
+        Ok(buffer.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
 }
@@ -122,4 +133,87 @@ impl TurnCheckpoint {
 pub trait TurnJournal: Send + Sync {
     fn load(&self) -> Result<Option<TurnCheckpoint>, LlmError>;
     fn save(&self, checkpoint: &TurnCheckpoint) -> Result<(), LlmError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ChatRole, ToolResult};
+    use serde_json::json;
+
+    fn checkpoint() -> TurnCheckpoint {
+        TurnCheckpoint {
+            version: 1,
+            scope: ContextScope {
+                session_id: "s".into(),
+                user_id: "u".into(),
+            },
+            messages: vec![ChatMessage::text(ChatRole::User, "x")],
+            pending_calls: vec![],
+            used_tool_calls: 0,
+            delegated_tool_calls: 0,
+            delegated_model_requests: 0,
+            provider_requests: 1,
+            tool_batches: 0,
+            remaining: None,
+            continuation_checks: 0,
+            closing: false,
+            result: None,
+        }
+    }
+    #[test]
+    fn checkpoint_accepts_exact_json_budget_and_rejects_the_next_byte() {
+        let mut checkpoint = checkpoint();
+        let overhead = serde_json::to_vec(&checkpoint).unwrap().len() - 1;
+        checkpoint.messages[0].text = Some("x".repeat(MAX_CHECKPOINT_BYTES - overhead));
+        assert_eq!(
+            serde_json::to_vec(&checkpoint).unwrap().len(),
+            MAX_CHECKPOINT_BYTES
+        );
+        checkpoint.validate(0).unwrap();
+        checkpoint.messages[0].text.as_mut().unwrap().push('x');
+        assert_eq!(
+            serde_json::to_vec(&checkpoint).unwrap().len(),
+            MAX_CHECKPOINT_BYTES + 1
+        );
+        assert!(checkpoint.validate(0).is_err());
+    }
+    #[test]
+    fn checkpoint_counts_escaped_bytes_rather_than_raw_text_length() {
+        let mut checkpoint = checkpoint();
+        let text = "\"\\\n猫".repeat(240_000);
+        assert!(text.len() < MAX_CHECKPOINT_BYTES);
+        checkpoint.messages[0].text = Some(text);
+        assert!(serde_json::to_vec(&checkpoint).unwrap().len() > MAX_CHECKPOINT_BYTES);
+        assert!(checkpoint.validate(0).is_err());
+    }
+    #[test]
+    fn borrowed_protocol_validation_keeps_pending_calls_and_rejects_mismatched_receipts() {
+        let mut checkpoint = checkpoint();
+        let call = ToolCall {
+            id: "call".into(),
+            name: "echo".into(),
+            arguments: json!({"text":"原始参数"}),
+        };
+        checkpoint.pending_calls.push(call.clone());
+        checkpoint.used_tool_calls = 1;
+        checkpoint.tool_batches = 1;
+        checkpoint.validate(1).unwrap();
+        assert!(!checkpoint.resumable());
+        assert!(checkpoint.validate(0).is_err());
+        checkpoint.pending_calls.clear();
+        checkpoint
+            .messages
+            .push(ChatMessage::assistant_tool_calls(vec![call]).unwrap());
+        checkpoint.messages.push(
+            ChatMessage::tool_results(vec![
+                ToolResult::success("foreign", json!("不能错配")).unwrap(),
+            ])
+            .unwrap(),
+        );
+        assert!(matches!(checkpoint.validate(1), Err(LlmError::Protocol(_))));
+        checkpoint.messages.last_mut().unwrap().tool_results[0].call_id = "call".into();
+        checkpoint.validate(1).unwrap();
+        assert!(checkpoint.resumable());
+    }
 }
