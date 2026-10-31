@@ -88,6 +88,73 @@ print(json.dumps({'op':'return','value':{'bad':bad,'good':good,'written':written
         self.assertEqual(len(self.kind('chat')), 5)
         self.assertEqual(len(self.kind('review')), 0)
 
+    def test_readonly_diagnostic_plugin_reads_own_finished_turns_and_model_state_across_restart(self):
+        source = '''import json
+input()
+def rpc(value):
+ print(json.dumps(value),flush=True)
+ return json.loads(input())['result']
+forged=rpc({'op':'check_tool','name':'read_context_record','arguments':{'action':'recent','user_id':'other'}})
+recent=rpc({'op':'tool','name':'read_context_record','arguments':{'action':'recent','limit':1}})
+model=rpc({'op':'tool','name':'inspect_model_runtime','arguments':{'purpose':'dialogue'}})
+print(json.dumps({'op':'return','value':{'forged':forged,'recent':recent,'model':model}}),flush=True)
+'''
+        spec = {'name': 'readonly-diagnostics', 'language': 'python', 'source': source,
+                'dependencies': {}, 'tools': ['read_context_record', 'inspect_model_runtime'],
+                'state_schema': {'version': 1, 'fields': {}}, 'initial_state': {}}
+        version, receipts = None, []
+        def respond(body):
+            nonlocal version
+            current = next(m['content'] for m in reversed(body['messages']) if m['role'] == 'user')
+            if current == '保存前轮证据':
+                return text_response('前轮证据已保存')
+            results = self.results(body)
+            if current == '其他人不能运行这个版本':
+                if not results:
+                    return self.tools([('run_script_plugin', {'version': version, 'arguments': {}})])
+                self.assertIn('error', results[-1])
+                return text_response('没有当前会话的诊断版本')
+            if not results:
+                if version is None:
+                    return self.tools([('save_script_plugin', {'spec': spec})])
+                return self.tools([('run_script_plugin', {'version': version, 'arguments': {}})])
+            if 'receipt' not in results[-1]:
+                self.assertNotIn('error', results[-1], '诊断工具必须在脚本绑定前装配；失败不能循环调用')
+                if len(results) == 1:
+                    version = results[0]['version']['reference']
+                    return self.tools([('activate_script_plugin', {'version': version})])
+                return self.tools([('run_script_plugin', {'version': version, 'arguments': {}})])
+            receipt = results[-1]['receipt']
+            self.assertEqual(receipt['status'], 'succeeded')
+            self.assertEqual([e['target'] for e in receipt['evidence']], ['read_context_record', 'inspect_model_runtime'])
+            value = receipt['result']
+            self.assertFalse(value['forged']['allowed'])
+            self.assertEqual(value['recent']['scope'], 'current_only')
+            [record] = value['recent']['records']
+            self.assertEqual(record['status'], 'Completed', '运行中的本轮不能被当作已结束证据')
+            self.assertEqual(record['turn_id'], len(receipts) + 1)
+            self.assertFalse(record['automatic_replay'])
+            self.assertEqual(value['model']['purpose'], 'dialogue')
+            self.assertFalse(value['model']['configuration_written'])
+            self.assertFalse(value['model']['provider_availability_verified'])
+            receipts.append(receipt)
+            return text_response('诊断读取成功，没有改模型或重放工具')
+        self.callback = respond
+        self.execute_script([
+            *self.send(self.message('prior-evidence', '保存前轮证据', expected='前轮证据已保存')),
+            *self.send(self.message('diagnose', '创建诊断插件读取证据', expected='诊断读取成功，没有改模型或重放工具')),
+        ])
+        self.execute_script(self.send(self.message('diagnose-again', '重启后再运行诊断', expected='诊断读取成功，没有改模型或重放工具')))
+        ledger = self.work / 'state/script-plugins/state/ledger.json'
+        before = ledger.read_bytes()
+        self.execute_script(self.send(self.message('foreign-diagnostics', '其他人不能运行这个版本', user='user-2',
+            expected='没有当前会话的诊断版本')))
+        self.assertEqual(ledger.read_bytes(), before)
+        self.assertEqual(len(receipts), 2)
+        self.assertEqual(len(self.kind('review')), 0)
+        self.assertEqual(self.chat_rounds, 9, '诊断不得增加模型探测请求或编造修复任务')
+        self.assertFalse((self.work / 'state/configuration/config.json').exists())
+
     def test_compile_failure_is_repaired_verified_and_enabled_in_one_turn_then_survives_restart(self):
         spec = {'name': 'repair-example', 'language': 'rust', 'source': 'fn main(){ missing_identifier(); }',
                 'dependencies': {}, 'tools': [], 'state_schema': {'version': 1, 'fields': {}}, 'initial_state': {}}
