@@ -11,6 +11,8 @@ use std::{
 };
 
 const FORMAT_VERSION: u32 = 2;
+const INITIALIZED_KEY: &str = "tasks.initialized.v1";
+const INITIALIZED_VALUE: &[u8] = br#"{"format_version":1,"ledger":"tasks.v1"}"#;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,10 +39,23 @@ fn now_ms() -> u64 {
 
 impl StoredTasks {
     pub(super) fn open(context: PluginContext) -> TaskResult<Self> {
-        let mut ledger = match context
-            .state_get(TASK_STATE_KEY)
-            .map_err(|_| TaskError::Storage)?
+        let initialized = context
+            .state_get(INITIALIZED_KEY)
+            .map_err(|_| TaskError::Storage)?;
+        if initialized
+            .as_deref()
+            .is_some_and(|value| value != INITIALIZED_VALUE)
         {
+            return Err(TaskError::CorruptState);
+        }
+        let stored = context
+            .state_get(TASK_STATE_KEY)
+            .map_err(|_| TaskError::Storage)?;
+        let fresh = stored.is_none();
+        if fresh && initialized.is_some() {
+            return Err(TaskError::CorruptState);
+        }
+        let mut ledger = match stored {
             None => Ledger {
                 format_version: FORMAT_VERSION,
                 tasks: vec![],
@@ -80,6 +95,19 @@ impl StoredTasks {
                 ledger
             }
         };
+        // 首次先保存合法空账本，再封存初始化标记；任一步失败均拒绝启动。
+        // 旧账本完整校验后才补标记，不把损坏状态封成有效，也不清空原文。
+        // 两键不在同一事务：只有空账本而无标记可在下次按旧账本核对补齐。
+        if fresh {
+            context
+                .state_set(TASK_STATE_KEY, encode(&ledger)?)
+                .map_err(|_| TaskError::Storage)?;
+        }
+        if initialized.is_none() {
+            context
+                .state_set(INITIALIZED_KEY, INITIALIZED_VALUE.to_vec())
+                .map_err(|_| TaskError::Storage)?;
+        }
         let mut changed = false;
         let now = now_ms();
         for task in &mut ledger.tasks {
