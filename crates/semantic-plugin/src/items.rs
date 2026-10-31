@@ -156,6 +156,8 @@ pub(crate) struct Block {
 }
 
 /// 一个作用域的可召回条目在索引里的布局。
+// 完整布局只供兼容探针和测试；运行时消费 scan_layout。
+#[allow(dead_code)]
 pub(crate) struct Layout {
     /// 热层身份与修订；不保留另一份完整热正文。
     pub scope: MemoryScope,
@@ -279,6 +281,7 @@ pub(crate) fn scan_layout<T>(
 }
 
 /// 兼容的完整前缀布局；需要全部条目的消费者仍可显式收集。
+#[allow(dead_code)]
 pub(crate) fn layout(
     reader: &dyn eve_memory_api::MemoryService,
     with_segments: bool,
