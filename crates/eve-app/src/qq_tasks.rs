@@ -1484,9 +1484,20 @@ pub(crate) struct ChannelAdapter {
     pub(crate) tasks: Arc<dyn TaskAdmin>,
 }
 
+fn verify_delivery_claim(
+    entry: &eve_task_api::TaskDeliveryEntry,
+    claimed: &Task,
+) -> PluginResult<()> {
+    if !entry.matches(claimed) {
+        return Err(plugin_error(TaskError::CorruptState));
+    }
+    Ok(())
+}
+
 impl QqOutreach for ChannelAdapter {
     fn due(&self, session: &SessionKey) -> PluginResult<bool> {
-        let snapshot = self.tasks.snapshot().map_err(plugin_error)?;
+        let snapshot = self.tasks.delivery_snapshot().map_err(plugin_error)?;
+        snapshot.validate().map_err(plugin_error)?;
         Ok(snapshot
             .due_passive(&session.user_id, "")
             .is_some_and(|t| t.owner.session_id == session.session_id))
@@ -1501,7 +1512,8 @@ impl QqOutreach for ChannelAdapter {
         session: &SessionKey,
         message_id: &str,
     ) -> PluginResult<Option<QqOutreachMessage>> {
-        let snapshot = self.tasks.snapshot().map_err(plugin_error)?;
+        let snapshot = self.tasks.delivery_snapshot().map_err(plugin_error)?;
+        snapshot.validate().map_err(plugin_error)?;
         let Some(task) = snapshot.due_passive(&session.user_id, message_id) else {
             return Ok(None);
         };
@@ -1518,6 +1530,7 @@ impl QqOutreach for ChannelAdapter {
                 now_ms(),
             )
             .map_err(plugin_error)?;
+        verify_delivery_claim(task, &claimed)?;
         Ok(Some(QqOutreachMessage {
             id: claimed.id.clone(),
             text: notice_text(&claimed),
@@ -1526,7 +1539,8 @@ impl QqOutreach for ChannelAdapter {
 
     fn next_push(&self) -> PluginResult<Option<QqOutreachPush>> {
         let now = now_ms();
-        let snapshot = self.tasks.snapshot().map_err(plugin_error)?;
+        let snapshot = self.tasks.delivery_snapshot().map_err(plugin_error)?;
+        snapshot.validate().map_err(plugin_error)?;
         // 结束后过久仍未送达的通知不再投递。
         let overdue: Vec<String> = snapshot.overdue(now).map(|task| task.id.clone()).collect();
         for id in &overdue {
@@ -1542,6 +1556,7 @@ impl QqOutreach for ChannelAdapter {
             .tasks
             .claim(&task.id, DeliveryChannel::Proactive, now)
             .map_err(plugin_error)?;
+        verify_delivery_claim(task, &claimed)?;
         Ok(Some(QqOutreachPush {
             session: Some(SessionKey {
                 session_id: claimed.owner.session_id.clone(),
@@ -1877,6 +1892,24 @@ mod tests {
                 closed_at_ms: None,
             }),
             execution: None,
+        }
+    }
+
+    #[test]
+    fn delivery_claim_checks_full_immutable_binding_before_exposing_notification() {
+        let original = task(TaskStatus::Completed);
+        let entry = eve_task_api::TaskDeliveryEntry::from(&original);
+        assert!(verify_delivery_claim(&entry, &original).is_ok());
+        for variant in 0..5 {
+            let mut claimed = original.clone();
+            match variant {
+                0 => claimed.id = "other".into(),
+                1 => claimed.owner.session_id = "other".into(),
+                2 => claimed.owner.user_id = "other".into(),
+                3 => claimed.source = "other".into(),
+                _ => claimed.created_at_ms += 1,
+            }
+            assert!(verify_delivery_claim(&entry, &claimed).is_err());
         }
     }
 

@@ -3,6 +3,8 @@
 //!
 //! 创建、开始、结束与每次通知尝试都先持久化。执行中进程退出时在持久化的安全边界接续，未知工具结果不自动重放；
 //! 发送通知时进程退出记为结果未知，不重发。
+mod delivery;
+pub use delivery::{TaskDeliveryEntry, TaskDeliverySnapshot, validate_notice};
 mod profiles;
 mod scheduling;
 pub use scheduling::{TaskSchedulingEntry, TaskSchedulingSnapshot};
@@ -378,49 +380,15 @@ impl TaskSnapshot {
     }
     /// 可以主动私聊通知的任务：通知等待中、还没有主动私聊过、这位用户没有正在发送的通知；取最早结束的一条。
     pub fn due_proactive(&self) -> Option<&Task> {
-        self.tasks
-            .iter()
-            .filter(|task| task.notice_pending())
-            .filter(|task| {
-                task.notice
-                    .as_ref()
-                    .is_some_and(|notice| notice.proactive_attempts() == 0)
-            })
-            .filter(|task| !self.sending(&task.owner.user_id))
-            .min_by_key(|task| (task.finished_at_ms, task.id.clone()))
+        delivery::due_proactive(&self.tasks)
     }
     /// 可以随这位用户的私聊回复附带的通知；这条消息没有附带过。
     pub fn due_passive(&self, user_id: &str, message_id: &str) -> Option<&Task> {
-        if self.sending(user_id) {
-            return None;
-        }
-        self.tasks
-            .iter()
-            .filter(|task| task.owner.user_id == user_id && task.notice_pending())
-            .filter(|task| {
-                task.notice
-                    .as_ref()
-                    .is_some_and(|notice| !notice.carried_by(message_id))
-            })
-            .min_by_key(|task| (task.finished_at_ms, task.id.clone()))
+        delivery::due_passive(&self.tasks, user_id, message_id)
     }
     /// 结束后投递窗口已过仍在等待的通知。
     pub fn overdue(&self, now_ms: u64) -> impl Iterator<Item = &Task> {
-        self.tasks.iter().filter(move |task| {
-            task.notice_pending()
-                && task
-                    .finished_at_ms
-                    .is_some_and(|at| now_ms.saturating_sub(at) > DELIVERY_WINDOW_MS)
-        })
-    }
-    fn sending(&self, user_id: &str) -> bool {
-        self.tasks.iter().any(|task| {
-            task.owner.user_id == user_id
-                && task
-                    .notice
-                    .as_ref()
-                    .is_some_and(|notice| notice.status == NoticeStatus::Delivering)
-        })
+        delivery::overdue(&self.tasks, now_ms)
     }
 }
 
@@ -436,6 +404,20 @@ pub trait TaskAdmin: Send + Sync {
                 .tasks
                 .iter()
                 .map(TaskSchedulingEntry::from)
+                .collect(),
+        };
+        directory.validate()?;
+        Ok(directory)
+    }
+    /// 可信宿主的通知目录；不含任务说明、委派上下文、检查点和结果正文。
+    /// 旧实现保留完整快照转换，原生实现直接借用账本元数据。
+    fn delivery_snapshot(&self) -> TaskResult<TaskDeliverySnapshot> {
+        let directory = TaskDeliverySnapshot {
+            tasks: self
+                .snapshot()?
+                .tasks
+                .iter()
+                .map(TaskDeliveryEntry::from)
                 .collect(),
         };
         directory.validate()?;
