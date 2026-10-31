@@ -2139,6 +2139,10 @@ async fn run_qqbot_composed(
             access: group_access.clone(),
             admin: qq_admin.clone(),
         }));
+        // 档案叶子必须在统一守卫与脚本/工作流绑定之前进入完整工具目录。
+        let context_planner = Arc::new(crate::layered_context::Planner::new(registry.clone(), tasks.clone().map(|t| Arc::new(t) as Arc<dyn eve_task_api::TaskAdmin>)));
+        bootstrap.history_context_planner = Some(context_planner.clone());
+        bootstrap.tools.push(Arc::new(crate::layered_context::ReadRecord(context_planner.clone())));
         for tool in &mut bootstrap.tools {
             *tool = Arc::new(crate::qq_access::GuardedTool {
                 inner: tool.clone(),
@@ -2168,9 +2172,6 @@ async fn run_qqbot_composed(
             );
         }
         // 执行器与对话共用工具服务和宿主设置；在核心装配之后建立。
-        let context_planner = Arc::new(crate::layered_context::Planner::new(registry.clone(), tasks.clone().map(|t| Arc::new(t) as Arc<dyn eve_task_api::TaskAdmin>)));
-        bootstrap.history_context_planner = Some(context_planner.clone());
-        bootstrap.tools.push(Arc::new(crate::layered_context::ReadRecord(context_planner.clone())));
         let worker_tools: Vec<String> = bootstrap
             .tools
             .iter()

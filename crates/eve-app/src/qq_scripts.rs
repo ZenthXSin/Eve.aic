@@ -45,6 +45,8 @@ pub fn is_synchronous_leaf(name: &str) -> bool {
             | "read_attachment"
             | "describe_image"
             | "read_raw_message"
+            | "read_context_record"
+            | "inspect_model_runtime"
             | "read_source"
             | "search_reference"
             | "read_reference"
