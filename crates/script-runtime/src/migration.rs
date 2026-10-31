@@ -23,17 +23,24 @@ impl ScriptRuntime {
         if migration.source.is_empty() || migration.source.len() > MAX_SOURCE_BYTES {
             return Err(reject("迁移源码为空或超限"));
         }
-        if matches!(migration.language, crate::Language::RustCargo(_)) {
-            return Err(reject(
-                "Cargo迁移尚未装配，请使用Python/JS/标准Rust隔离迁移",
-            ));
-        }
-        self.sandbox.preflight(&migration.language)?;
         let deadline = context
             .deadline()
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(30))
             .min(Instant::now() + Duration::from_secs(30));
         check_stop(&context, deadline)?;
+        // 先校验配方与隔离配置，再读取可信状态、扣除迁移预算。
+        let mut program = self.store.version(owner, target)?;
+        program.spec.language = migration.language.clone();
+        program.spec.source = migration.source.clone();
+        program.spec.tools.clear();
+        program.spec.dependencies.clear();
+        program.spec.validate()?;
+        let cargo = crate::runtime::cargo_recipe(&program.spec)?;
+        let language = cargo
+            .as_ref()
+            .map(|(settings, _)| crate::Language::RustCargo(settings.clone()))
+            .unwrap_or_else(|| migration.language.clone());
+        self.sandbox.preflight(&language)?;
         let state = self.store.migration_source(
             owner,
             target,
@@ -41,16 +48,44 @@ impl ScriptRuntime {
             migration.expected_revision,
             call_id,
         )?;
-        let mut program = self.store.version(owner, target)?;
-        program.spec.language = migration.language.clone();
-        program.spec.source = migration.source.clone();
-        program.spec.tools.clear();
-        program.spec.dependencies.clear();
         reserve(&context)?;
         let work = tempfile::tempdir().map_err(fail)?;
         let mut source = tempfile::NamedTempFile::new().map_err(fail)?;
         std::io::Write::write_all(&mut source, migration.source.as_bytes()).map_err(fail)?;
-        let compiled = if migration.language == crate::Language::Rust {
+        let cargo_artifact = if let Some((settings, source)) = &cargo {
+            let compiler = self
+                .sandbox
+                .cargo
+                .as_ref()
+                .ok_or_else(|| reject("未配置可信离线Cargo编译器"))?;
+            match compiler
+                .compile(
+                    &settings.project(source),
+                    context.clone().with_deadline(Some(deadline)),
+                )
+                .await?
+            {
+                crate::CargoCompilation::Ready(artifact) => {
+                    if settings
+                        .artifact_sha256
+                        .as_deref()
+                        .is_some_and(|expected| expected != artifact.sha256())
+                    {
+                        return Err(reject("Cargo迁移产物与指定摘要不同，未执行或提交状态"));
+                    }
+                    Some(artifact)
+                }
+                crate::CargoCompilation::Failed(report) => {
+                    return Err(reject(format!(
+                        "Cargo迁移编译失败 [{}]: {}",
+                        report.code, report.diagnostics
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+        let compiled = if cargo.is_none() && migration.language == crate::Language::Rust {
             Some(
                 self.sandbox
                     .prepare_rust(&migration.source, &context, deadline)
@@ -59,10 +94,15 @@ impl ScriptRuntime {
         } else {
             None
         };
-        let executable = compiled
-            .as_ref()
-            .map(|compiled| compiled.binary.as_path())
-            .unwrap_or(source.path());
+        let executable = if let Some(artifact) = &cargo_artifact {
+            artifact.verified_binary()?
+        } else {
+            compiled
+                .as_ref()
+                .map(|compiled| compiled.binary.as_path())
+                .unwrap_or(source.path())
+        };
+        program.spec.language = language;
         let mut child = self.sandbox.spawn(&program, executable, work.path())?;
         let mut input = child.stdin.take().ok_or_else(|| fail("迁移缺少stdin"))?;
         let mut output = BufReader::new(child.stdout.take().ok_or_else(|| fail("迁移缺少stdout"))?);
@@ -112,6 +152,20 @@ impl ScriptRuntime {
         }
         program.spec.state_schema.validate(&value)?;
         check_stop(&context, deadline)?;
+        let mut evidence = vec![Evidence {
+            operation: "state_migration".into(),
+            target: migration.from.digest.clone(),
+            status: ReceiptStatus::Succeeded,
+            result_digest: Some(digest(&value)?),
+        }];
+        if let Some(artifact) = &cargo_artifact {
+            evidence.push(Evidence {
+                operation: "migration_artifact".into(),
+                target: artifact.sha256().into(),
+                status: ReceiptStatus::Succeeded,
+                result_digest: Some(artifact.sha256().into()),
+            });
+        }
         let receipt = Receipt {
             call_id: call_id.into(),
             parent_call_id: None,
@@ -121,12 +175,7 @@ impl ScriptRuntime {
             request_digest: digest(&migration)?,
             status: ReceiptStatus::Succeeded,
             result: Some(json!({"activated":target})),
-            evidence: vec![Evidence {
-                operation: "state_migration".into(),
-                target: migration.from.digest.clone(),
-                status: ReceiptStatus::Succeeded,
-                result_digest: Some(digest(&value)?),
-            }],
+            evidence,
             error: None,
             failure_diagnostic: None,
         };

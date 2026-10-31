@@ -262,8 +262,8 @@ impl Tool for ScriptTool {
                 vec![],
             ),
             2 => (
-                "显式启用或回退不可变脚本版本{script,digest}。每版本保留独立状态；schema变化需migration={from:{script,digest},expected_revision,value}或migration_script={from:{script,digest},expected_revision,language,source}，两者互斥。纯迁移脚本从stdin读取state，只能输出一行{op:return,value:候选状态}，禁止工具/依赖/文件操作；隔离执行成功且源revision未变才原子启用。回退不重放外部操作。已有目标状态不能覆盖。",
-                json!({"version":{"type":"object"},"migration":{"type":"object"},"migration_script":{"type":"object","properties":{"from":{"type":"object"},"expected_revision":{"type":"integer","minimum":0},"language":{"type":"string","enum":["python","javascript","rust"]},"source":{"type":"string"}},"required":["from","expected_revision","language","source"],"additionalProperties":false}}),
+                "显式启用或回退不可变脚本版本{script,digest}。每版本保留独立状态；schema变化需migration={from:{script,digest},expected_revision,value}或migration_script={from:{script,digest},expected_revision,language,source}，两者互斥。纯迁移脚本从stdin读取state，只能输出一行{op:return,value:候选状态}；language也可为{rust_cargo:{dependencies,bundle_sha256,build_source:可选,artifact_sha256:可选}}，使用宿主冻结vendor与原共享预算，提供产物摘要时须完全匹配，回执记录实际产物摘要，禁止工具/依赖/文件操作；隔离执行成功且源revision未变才原子启用。回退不重放外部操作。已有目标状态不能覆盖。",
+                json!({"version":{"type":"object"},"migration":{"type":"object"},"migration_script":{"type":"object","properties":{"from":{"type":"object"},"expected_revision":{"type":"integer","minimum":0},"language":{"oneOf":[{"type":"string","enum":["python","javascript","rust"]},{"type":"object","properties":{"rust_cargo":{"type":"object"}},"required":["rust_cargo"],"additionalProperties":false}]},"source":{"type":"string"}},"required":["from","expected_revision","language","source"],"additionalProperties":false}}),
                 vec!["version"],
             ),
             _ => (

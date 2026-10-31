@@ -318,3 +318,172 @@ fn main(){{let mut line=String::new();io::stdin().lock().read_line(&mut line).un
         "不偷偷替换请求版本"
     );
 }
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[tokio::test]
+#[ignore = "显式配置可信Docker和bubblewrap后运行真实Cargo纯状态迁移"]
+async fn actual_cargo_migration_preserves_failed_candidates_and_commits_only_verified_state() {
+    use eve_script_runtime::*;
+    use serde_json::json;
+    use std::sync::Arc;
+    let root = tempfile::tempdir().unwrap();
+    let store = ScriptStore::open(root.path().join("state")).unwrap();
+    let runtime = ScriptRuntime::new(
+        store.clone(),
+        Arc::new(NoTools),
+        Bubblewrap::new("/usr/bin/python3", "/usr/bin/node").with_cargo(actual_compiler()),
+        root.path().join("artifacts"),
+    );
+    let owner = context().scope().unwrap().clone();
+    let ctx = || context().with_shared_steps(SharedToolSteps::new(20).unwrap());
+    let first = store
+        .publish(
+            &owner,
+            ScriptSpec {
+                name: "cargo_state".into(),
+                language: Language::Python,
+                source: "import json\nx=json.loads(input())\nprint(json.dumps({'op':'return','value':x['state']['value']}))".into(),
+                dependencies: BTreeMap::new(),
+                tools: vec![],
+                state_schema: StateSchema {
+                    version: 1,
+                    fields: BTreeMap::from([("count".into(), JsonType::Integer)]),
+                },
+                initial_state: json!({"count":7}),
+            },
+        )
+        .unwrap();
+    store.activate(&owner, &first.reference, None).unwrap();
+    let mut next = first.spec.clone();
+    next.state_schema = StateSchema {
+        version: 2,
+        fields: BTreeMap::from([
+            ("count".into(), JsonType::Integer),
+            ("label".into(), JsonType::String),
+        ]),
+    };
+    next.initial_state = json!({"count":0,"label":""});
+    let target = store.publish(&owner, next).unwrap();
+    let settings = CargoSettings {
+        dependencies: BTreeMap::from([(
+            "serde_json".into(),
+            std::env::var("EVE_TEST_CARGO_SERDE_JSON").unwrap(),
+        )]),
+        bundle_sha256: std::env::var("EVE_TEST_CARGO_BUNDLE_SHA256").unwrap(),
+        build_source: None,
+        artifact_sha256: None,
+    };
+    let source = r#"use std::io::{self,BufRead};fn main(){let mut line=String::new();io::stdin().lock().read_line(&mut line).unwrap();let input:serde_json::Value=serde_json::from_str(&line).unwrap();assert_eq!(input["mode"],"migration");println!("{}",serde_json::json!({"op":"return","value":{"count":input["state"]["value"]["count"].as_i64().unwrap()*2,"label":"cargo"}}));}"#;
+    let migration = MigrationScript {
+        from: first.reference.clone(),
+        expected_revision: 0,
+        language: Language::RustCargo(settings.clone()),
+        source: source.into(),
+    };
+    let before = std::fs::read(root.path().join("state/ledger.json")).unwrap();
+    let failed = MigrationScript {
+        source: "fn main(){ invalid_rust }".into(),
+        ..migration.clone()
+    };
+    assert!(
+        runtime
+            .activate_with_script(&target.reference, "cargo_bad_compile", failed, ctx())
+            .await
+            .is_err()
+    );
+    let rpc=MigrationScript{source:r#"fn main(){println!("{}",serde_json::json!({"op":"tool","name":"write_file","arguments":{}}));}"#.into(),..migration.clone()};
+    assert!(
+        runtime
+            .activate_with_script(&target.reference, "cargo_forbidden_rpc", rpc, ctx())
+            .await
+            .is_err()
+    );
+    let pinned = MigrationScript {
+        language: Language::RustCargo(CargoSettings {
+            artifact_sha256: Some("0".repeat(64)),
+            ..settings
+        }),
+        ..migration.clone()
+    };
+    assert!(
+        runtime
+            .activate_with_script(&target.reference, "cargo_bad_pin", pinned, ctx())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("state/ledger.json")).unwrap(),
+        before,
+        "失败编译、非return和摘要不符都不提交状态或活动版"
+    );
+    assert_eq!(
+        store.selected(&owner, "cargo_state").unwrap(),
+        first.reference
+    );
+    let budget = ctx();
+    let receipt = runtime
+        .activate_with_script(
+            &target.reference,
+            "cargo_state_ok",
+            migration.clone(),
+            budget.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.status, ReceiptStatus::Succeeded);
+    assert_eq!(budget.shared_steps().unwrap().remaining().unwrap(), 18);
+    assert_eq!(receipt.evidence.len(), 2);
+    assert_eq!(receipt.evidence[1].operation, "migration_artifact");
+    assert_eq!(receipt.evidence[1].target.len(), 64);
+    assert_eq!(
+        store.state(&owner, &target.reference).unwrap().value,
+        json!({"count":14,"label":"cargo"})
+    );
+    assert_eq!(
+        store.state(&owner, &first.reference).unwrap().value,
+        json!({"count":7})
+    );
+    let budget = ctx();
+    assert!(
+        runtime
+            .activate_with_script(
+                &target.reference,
+                "cargo_stale_again",
+                migration,
+                budget.clone()
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        budget.shared_steps().unwrap().remaining().unwrap(),
+        20,
+        "旧状态迁移拒绝发生在编译前"
+    );
+    let bound = runtime.bind(&owner, &target.reference).unwrap();
+    let result = runtime
+        .run(&bound, "cargo_migrated_state_visible", json!({}), ctx())
+        .await
+        .unwrap();
+    assert_eq!(result.status, ReceiptStatus::Succeeded);
+    assert_eq!(result.result, Some(json!({"count":14,"label":"cargo"})));
+    drop(bound);
+    drop(runtime);
+    drop(store);
+    let store = ScriptStore::open(root.path().join("state")).unwrap();
+    assert_eq!(store.receipt(&owner, "cargo_state_ok").unwrap(), receipt);
+    assert_eq!(
+        store.selected(&owner, "cargo_state").unwrap(),
+        target.reference
+    );
+    store.activate(&owner, &first.reference, None).unwrap();
+    assert_eq!(
+        store.state(&owner, &first.reference).unwrap().value,
+        json!({"count":7})
+    );
+    store.activate(&owner, &target.reference, None).unwrap();
+    assert_eq!(
+        store.state(&owner, &target.reference).unwrap().value,
+        json!({"count":14,"label":"cargo"})
+    );
+}

@@ -40,7 +40,9 @@ struct Chain {
     root_call_id: String,
     deadline: Instant,
 }
-fn cargo_recipe(spec: &crate::ScriptSpec) -> Result<Option<(crate::CargoSettings, String)>> {
+pub(crate) fn cargo_recipe(
+    spec: &crate::ScriptSpec,
+) -> Result<Option<(crate::CargoSettings, String)>> {
     match &spec.language {
         crate::Language::RustCargo(settings) => Ok(Some((settings.clone(), spec.source.clone()))),
         crate::Language::Rust => Ok(crate::cargo_model::decoded_source(&spec.source)?

@@ -279,6 +279,58 @@ fn main(){let mut line=String::new();io::stdin().lock().read_line(&mut line).unw
         self.assertEqual(len(self.kind('review')),0)
         self.assertEqual(self.errors,[])
 
+    @unittest.skipUnless(os.environ.get('EVE_TEST_CARGO_IMAGE'), '需显式装配可信离线Cargo验收资源')
+    def test_cargo_migration_through_qq_tool_keeps_source_state_and_restores_target(self):
+        first=target=None
+        source="import json\nx=json.loads(input())\nprint(json.dumps({'op':'return','value':x['state']['value']}))"
+        spec={'name':'cargo-qq-state','language':'python','source':source,'dependencies':{},'tools':[],
+              'state_schema':{'version':1,'fields':{'count':'integer'}},'initial_state':{'count':7}}
+        migrated={**spec,'state_schema':{'version':2,'fields':{'count':'integer','label':'string'}},'initial_state':{'count':0,'label':''}}
+        migration_source=r'''use std::io::{self,BufRead};fn main(){let mut line=String::new();io::stdin().lock().read_line(&mut line).unwrap();let input:serde_json::Value=serde_json::from_str(&line).unwrap();println!("{}",serde_json::json!({"op":"return","value":{"count":input["state"]["value"]["count"].as_i64().unwrap()*2,"label":"cargo"}}));}'''
+        def respond(body):
+            nonlocal first,target
+            results=self.results(body)
+            if not results:
+                if target:
+                    return self.tools([('run_script_plugin',{'version':target,'arguments':{}})])
+                return self.tools([('list_script_plugins',{})])
+            self.assertNotIn('error',results[-1],results[-1])
+            if len(results)==1 and not first:
+                self.assertTrue(results[0]['cargo']['configured'])
+                return self.tools([('save_script_plugin',{'spec':spec})])
+            if len(results)==2:
+                first=results[-1]['version']['reference']
+                return self.tools([('activate_script_plugin',{'version':first})])
+            if len(results)==3:
+                return self.tools([('save_script_plugin',{'spec':migrated})])
+            if len(results)==4:
+                target=results[-1]['version']['reference']
+                return self.tools([('activate_script_plugin',{'version':target,'migration_script':{
+                    'from':first,'expected_revision':0,'language':{'rust_cargo':{
+                        'dependencies':{'serde_json':os.environ['EVE_TEST_CARGO_SERDE_JSON']},
+                        'bundle_sha256':os.environ['EVE_TEST_CARGO_BUNDLE_SHA256']}},'source':migration_source}})])
+            if len(results)==5:
+                receipt=results[-1]['receipt']
+                self.assertEqual(receipt['status'],'succeeded')
+                self.assertEqual(receipt['evidence'][1]['operation'],'migration_artifact')
+                self.assertEqual(len(receipt['evidence'][1]['target']),64)
+                return self.tools([('run_script_plugin',{'version':target,'arguments':{}})])
+            receipt=results[-1]['receipt']
+            self.assertEqual(receipt['status'],'succeeded',receipt)
+            self.assertEqual(receipt['result'],{'count':14,'label':'cargo'})
+            return text_response('迁移后的状态已实际读取')
+        self.callback=respond
+        configuration={'EVE_DEVELOPER_CONFIG':str(self.developer_config)}
+        for suffix in ('CLI','IMAGE','TOOLCHAIN','VENDOR','BUNDLE_SHA256'):
+            configuration['EVE_SCRIPT_CARGO_'+suffix]=os.environ['EVE_TEST_CARGO_'+suffix]
+        self.run_eve(self.send(self.message('cargo-migrate','通过离线Cargo迁移状态，核对实际回执',expected='迁移后的状态已实际读取')),
+            interest=False,memory=True,research=False,practice=False,env_extra=configuration)
+        self.run_eve(self.send(self.message('cargo-migrate-restart','重启后读取已经迁移的固定版本',expected='迁移后的状态已实际读取')),
+            interest=False,memory=True,research=False,practice=False,env_extra={'EVE_DEVELOPER_CONFIG':str(self.developer_config)})
+        self.assertEqual(len(self.kind('chat')),9)
+        self.assertEqual(len(self.kind('review')),0)
+        self.assertEqual(self.errors,[])
+
 
 if __name__ == '__main__':
     unittest.main()
