@@ -1329,3 +1329,125 @@ async fn rust_migration_and_compile_cancellation_keep_old_confirmed_state() {
         json!({"count":7})
     );
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn rust_fifty_version_switches_and_old_handle_recompile_keep_exact_results() {
+    let (_root, store, gate, runtime) = setup_with_sandbox(rust_sandbox());
+    let mut first = None;
+    // 每次调用仍各自使用原预算；测试包含真实隔离编译、执行、激活和回退。
+    tokio::time::timeout(Duration::from_secs(120), async {
+        for value in 0..50 {
+            let candidate = runtime
+                .publish_candidate(rust_spec("rust-cycles", value, 0), context(1))
+                .await
+                .unwrap();
+            store
+                .activate(&owner(), &candidate.reference, None)
+                .unwrap();
+            let bound = runtime.bind(&owner(), &candidate.reference).unwrap();
+            if first.is_none() {
+                first = Some((candidate.reference.clone(), bound.clone()));
+            }
+            let receipt = runtime
+                .run(
+                    &bound,
+                    &format!("rust-cycle-{value}"),
+                    json!({}),
+                    context(1),
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.status, ReceiptStatus::Succeeded);
+            assert_eq!(receipt.result, Some(json!(value)));
+            assert_eq!(
+                store.selected(&owner(), "rust-cycles").unwrap(),
+                candidate.reference
+            );
+        }
+        let (reference, bound) = first.as_ref().unwrap();
+        store.activate(&owner(), reference, None).unwrap();
+        let receipt = runtime
+            .run(bound, "rust-cycle-rollback", json!({}), context(2))
+            .await
+            .unwrap();
+        assert_eq!(receipt.result, Some(json!(0)));
+        assert_eq!(receipt.status, ReceiptStatus::Succeeded);
+        assert_eq!(store.selected(&owner(), "rust-cycles").unwrap(), *reference);
+    })
+    .await
+    .expect("50 次真实 Rust 插件切换应在总测试期限内收尾");
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn rust_compilation_diagnostics_are_bounded_and_failed_candidates_preserve_state() {
+    let (_root, store, gate, runtime) = setup_with_sandbox(rust_sandbox());
+    let old = runtime
+        .publish_candidate(rust_spec("rust-diagnostics", 7, 0), context(1))
+        .await
+        .unwrap();
+    store.activate(&owner(), &old.reference, None).unwrap();
+    let previous = store.state(&owner(), &old.reference).unwrap();
+    for (source, truncated) in [
+        ("fn main(){ missing_identifier(); }".to_owned(), false),
+        (
+            format!("compile_error!({:?}); fn main() {{}}", "诊断".repeat(9000)),
+            true,
+        ),
+    ] {
+        let mut candidate = rust_spec("rust-diagnostics", 8, 0);
+        candidate.source = source;
+        let ctx = context(1);
+        let steps = ctx.shared_steps().unwrap().clone();
+        let report = tokio::time::timeout(
+            Duration::from_secs(30),
+            runtime.prepare_candidate(candidate, ctx),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let CandidatePreparation::CompilationFailed(report) = report else {
+            panic!("失败候选不能保存版本")
+        };
+        assert_eq!(report.language, Language::Rust);
+        assert!(report.exit_code.is_some_and(|code| code != 0));
+        assert_eq!(report.signal, None);
+        assert!(report.diagnostics.contains("error"), "{report:?}");
+        assert!(report.diagnostics.contains("/source.rs:"), "{report:?}");
+        assert!(report.diagnostics.len() <= 8192);
+        assert_eq!(report.truncated, truncated);
+        assert_eq!(steps.remaining().unwrap(), 0);
+        assert_eq!(store.list(&owner()).unwrap().len(), 1);
+        assert_eq!(
+            store.selected(&owner(), "rust-diagnostics").unwrap(),
+            old.reference
+        );
+        assert_eq!(store.state(&owner(), &old.reference).unwrap(), previous);
+    }
+    let CandidatePreparation::Ready(fixed) = runtime
+        .prepare_candidate(rust_spec("rust-diagnostics", 8, 0), context(1))
+        .await
+        .unwrap()
+    else {
+        panic!("修复后的候选应编译通过")
+    };
+    assert_eq!(
+        store.selected(&owner(), "rust-diagnostics").unwrap(),
+        old.reference
+    );
+    store.activate(&owner(), &fixed.reference, None).unwrap();
+    let result = runtime
+        .run(
+            &runtime.bind(&owner(), &fixed.reference).unwrap(),
+            "rust-diagnostic-fixed",
+            json!({}),
+            context(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.status, ReceiptStatus::Succeeded);
+    assert_eq!(result.result, Some(json!(8)));
+    assert_eq!(gate.calls.load(Ordering::SeqCst), 0);
+}

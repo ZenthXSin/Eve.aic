@@ -109,8 +109,12 @@ pub fn effective_points(
             return Err(MemoryError::Conflict);
         }
     }
+    Ok(filter_points(job, &snapshot.preferences))
+}
+
+pub(super) fn filter_points(job: &SummaryJob, preferences: &[Preference]) -> Vec<SummaryPoint> {
     let mut blocked = BTreeSet::new();
-    for preference in &snapshot.preferences {
+    for preference in preferences {
         let current = preference.history.last();
         for version in &preference.history {
             if preference.status == PreferenceStatus::Revoked || Some(version) != current {
@@ -118,8 +122,7 @@ pub fn effective_points(
             }
         }
     }
-    Ok(job
-        .points
+    job.points
         .iter()
         .filter(|point| {
             point
@@ -128,7 +131,7 @@ pub fn effective_points(
                 .all(|q| !blocked.contains(&q.evidence_id))
         })
         .cloned()
-        .collect())
+        .collect()
 }
 
 /// 不在热层的摘要来源是否可能已移入记忆归档；热层同 ID 或同修订的不同内容仍是冲突。

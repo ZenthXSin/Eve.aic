@@ -230,6 +230,147 @@ impl StoredSummaries {
         persist(&mut inner, next)?;
         Ok(Some(batch))
     }
+    pub(super) fn reserve_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn MemoryService,
+        now: u64,
+        version: &str,
+        options: SummaryOptions,
+    ) -> MemoryResult<Option<SummaryBatch>> {
+        options.validate()?;
+        validate_id(version)?;
+        let mut cursor = ValidatedMemoryCursor::new(scope.clone(), reader.scan()?)?;
+        let summary = cursor.summary().clone();
+        let mut inner = self.inner.lock().map_err(|_| MemoryError::Unavailable)?;
+        if inner.context.is_none() {
+            return Err(MemoryError::Unavailable);
+        }
+        let jobs: Vec<_> = inner
+            .document
+            .jobs
+            .iter()
+            .filter(|j| j.batch.scope == *scope)
+            .collect();
+        let cooling = jobs.iter().any(|j| j.status == SummaryStatus::Running)
+            || jobs.last().is_some_and(|j| {
+                now.checked_sub(j.batch.started_at_ms)
+                    .is_none_or(|elapsed| elapsed < options.cooldown_ms)
+            });
+        let consumed: BTreeSet<_> = jobs
+            .iter()
+            .flat_map(|j| j.batch.consumed_ids.iter().map(String::as_str))
+            .collect();
+        let previous_job = jobs
+            .iter()
+            .rev()
+            .find(|j| j.status == SummaryStatus::Completed)
+            .copied();
+        let mut expected = BTreeMap::new();
+        if let Some(job) = previous_job {
+            if job.batch.source_revision > summary.revision {
+                return Err(MemoryError::StaleRevision);
+            }
+            validate_batch(&job.batch)?;
+            validate_summary_points(&job.batch, &job.points)?;
+            for source in &job.batch.sources {
+                expected.insert(source.evidence_id.as_str(), source);
+            }
+        }
+        let mut verified_sources = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut fresh = Vec::new();
+        let mut fresh_count = 0usize;
+        loop {
+            let page = cursor.next_page()?;
+            if page.is_empty() {
+                break;
+            }
+            for evidence in page {
+                let source = user_source(&evidence);
+                if let Some(prior) = expected.get(evidence.id.as_str()) {
+                    if source.as_ref() != Some(*prior) {
+                        return Err(MemoryError::Conflict);
+                    }
+                    seen.insert(evidence.id.clone());
+                    verified_sources.push(source.clone().ok_or(MemoryError::Conflict)?);
+                }
+                if !cooling
+                    && !consumed.contains(evidence.id.as_str())
+                    && let Some(source) = source
+                {
+                    fresh_count = fresh_count.saturating_add(1);
+                    if fresh.len() < options.max_new_evidence {
+                        fresh.push(source);
+                    }
+                }
+            }
+        }
+        if seen.len() != expected.len() {
+            return Err(MemoryError::Conflict);
+        }
+        if cooling || fresh_count < options.min_new_evidence {
+            return Ok(None);
+        }
+        if inner.document.jobs.len() >= MAX_SUMMARY_JOBS {
+            return Err(MemoryError::LimitReached);
+        }
+        let mut previous = previous_job
+            .map(|job| filter_points(job, &summary.preferences))
+            .unwrap_or_default();
+        verified_sources.extend(fresh.iter().cloned());
+        let batch = loop {
+            let referenced: BTreeSet<_> = previous
+                .iter()
+                .flat_map(|p| p.quotes.iter().map(|q| q.evidence_id.as_str()))
+                .collect();
+            let new_ids: Vec<_> = fresh.iter().map(|s| s.evidence_id.clone()).collect();
+            let mut sources: Vec<_> = verified_sources
+                .iter()
+                .filter(|s| {
+                    referenced.contains(s.evidence_id.as_str()) || new_ids.contains(&s.evidence_id)
+                })
+                .cloned()
+                .collect();
+            sources.sort_by_key(|s| s.revision);
+            sources.dedup_by(|a, b| a.evidence_id == b.evidence_id);
+            let batch = SummaryBatch {
+                sequence: inner.document.jobs.len() as u64 + 1,
+                scope: scope.clone(),
+                source_revision: summary.revision,
+                started_at_ms: now,
+                extractor_version: version.into(),
+                consumed_ids: new_ids,
+                sources,
+                previous: previous.clone(),
+            };
+            if serde_json::to_vec(&batch)
+                .map_err(|_| MemoryError::InvalidInput)?
+                .len()
+                <= MAX_SUMMARY_INPUT_BYTES
+            {
+                break batch;
+            }
+            if !previous.is_empty() {
+                previous.remove(0);
+            } else if fresh.len() > 1 {
+                fresh.pop();
+            } else {
+                return Err(MemoryError::LimitReached);
+            }
+        };
+        validate_batch(&batch)?;
+        let mut next = inner.document.clone();
+        next.jobs.push(SummaryJob {
+            batch: batch.clone(),
+            status: SummaryStatus::Running,
+            finished_at_ms: None,
+            points: vec![],
+        });
+        persist(&mut inner, next)?;
+        Ok(Some(batch))
+    }
+
     pub(super) fn finish(
         &self,
         batch: &SummaryBatch,

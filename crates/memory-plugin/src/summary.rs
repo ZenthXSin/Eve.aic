@@ -42,6 +42,17 @@ impl SummaryAdmin for SummaryController {
     ) -> MemoryResult<Option<SummaryBatch>> {
         self.service()?.reserve(snapshot, now, version, options)
     }
+    fn reserve_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn MemoryService,
+        now: u64,
+        version: &str,
+        options: SummaryOptions,
+    ) -> MemoryResult<Option<SummaryBatch>> {
+        self.service()?
+            .reserve_reader(scope, reader, now, version, options)
+    }
     fn finish(
         &self,
         batch: &SummaryBatch,

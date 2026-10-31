@@ -15,6 +15,53 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
+#[path = "cold_decisions.rs"]
+mod cold_decisions;
+#[path = "cold_jobs.rs"]
+mod cold_jobs;
+#[path = "cold_startup.rs"]
+mod cold_startup;
+
+static INSTANCE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+// 仅用 MSRV 已有的 CAS；新版 Rust 弃用 fetch_update，try_update 又不在 MSRV 内。
+fn allocate_instance(sequence: &std::sync::atomic::AtomicU64) -> LearningResult<u64> {
+    use std::sync::atomic::Ordering;
+    let mut current = sequence.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1).ok_or(LearningError::LimitReached)?;
+        match sequence.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(value) => return Ok(value),
+            Err(actual) => current = actual,
+        }
+    }
+}
+#[cfg(test)]
+mod instance_tests {
+    use super::*;
+    #[test]
+    fn concurrent_instances_are_unique_and_exhaustion_never_wraps() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let sequence = AtomicU64::new(1);
+        let values = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..32)
+                .map(|_| scope.spawn(|| allocate_instance(&sequence).unwrap()))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<BTreeSet<_>>()
+        });
+        assert_eq!(values, (1..=32).collect());
+        let sequence = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(allocate_instance(&sequence), Ok(u64::MAX - 1));
+        assert_eq!(
+            allocate_instance(&sequence),
+            Err(LearningError::LimitReached)
+        );
+        assert_eq!(sequence.load(Ordering::Relaxed), u64::MAX);
+    }
+}
+
 const FORMAT_VERSION: u32 = 1;
 const DECISIONS_STATE_KEY: &str = "learning.decisions.v1";
 const MAX_DECISIONS_STATE_BYTES: usize = MAX_STATE_BYTES;
@@ -25,7 +72,7 @@ struct Document {
     format_version: u32,
     jobs: Vec<JobRecord>,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JobRecord {
     job: LearningJob,
@@ -43,13 +90,15 @@ struct DecisionsDocument {
     format_version: u32,
     records: Vec<ScopedDecisionRecord>,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScopedDecisionRecord {
     scope: MemoryScope,
     record: LearningDecisionRecord,
 }
 struct Inner {
+    change: LearningChangeToken,
+    scope_changes: BTreeMap<MemoryScope, u64>,
     document: Document,
     decisions: DecisionsDocument,
     context: Option<PluginContext>,
@@ -178,13 +227,10 @@ impl StoredLearning {
                 {
                     let index: Index =
                         serde_json::from_value(value).map_err(|_| LearningError::CorruptState)?;
-                    let jobs = archive::thaw(
-                        archive
-                            .as_deref()
-                            .ok_or(LearningError::UnsupportedVersion)?,
-                        &index,
-                        "jobs",
-                    )?;
+                    if archive.is_none() {
+                        return Err(LearningError::UnsupportedVersion);
+                    }
+                    let jobs = vec![];
                     job_index = Some(index);
                     Document {
                         format_version: 1,
@@ -223,13 +269,10 @@ impl StoredLearning {
                 {
                     let index: Index =
                         serde_json::from_value(value).map_err(|_| LearningError::CorruptState)?;
-                    let records = archive::thaw(
-                        archive
-                            .as_deref()
-                            .ok_or(LearningError::UnsupportedVersion)?,
-                        &index,
-                        "decisions",
-                    )?;
+                    if archive.is_none() {
+                        return Err(LearningError::UnsupportedVersion);
+                    }
+                    let records = vec![];
                     decision_index = Some(index);
                     DecisionsDocument {
                         format_version: 1,
@@ -245,9 +288,19 @@ impl StoredLearning {
                 }
             }
         };
-        validate_decisions_document(&decisions, &document, decision_index.is_some())
-            .map_err(|_| LearningError::CorruptState)?;
+        if decision_index.is_none() && decisions.records.len() > MAX_DECISIONS {
+            return Err(LearningError::CorruptState);
+        }
+        if job_index.is_none() && decision_index.is_none() {
+            validate_decisions_document(&decisions, &document, false)
+                .map_err(|_| LearningError::CorruptState)?;
+        }
         let mut inner = Inner {
+            change: LearningChangeToken {
+                instance: allocate_instance(&INSTANCE_SEQUENCE)?,
+                revision: 0,
+            },
+            scope_changes: BTreeMap::new(),
             document,
             decisions,
             context: Some(context),
@@ -255,6 +308,13 @@ impl StoredLearning {
             job_index,
             decision_index,
         };
+        if inner.job_index.is_some() || inner.decision_index.is_some() {
+            cold_startup::validate_and_recover(&mut inner)?;
+            evict(&mut inner);
+            return Ok(Self {
+                inner: Mutex::new(inner),
+            });
+        }
         let mut next = inner.document.clone();
         let mut interrupted = false;
         for record in &mut next.jobs {
@@ -271,6 +331,20 @@ impl StoredLearning {
         Ok(Self {
             inner: Mutex::new(inner),
         })
+    }
+    pub(super) fn change_token(
+        &self,
+        scope: &MemoryScope,
+    ) -> LearningResult<Option<LearningChangeToken>> {
+        scope.validate().map_err(|_| LearningError::InvalidInput)?;
+        let inner = self.inner.lock().map_err(|_| LearningError::Unavailable)?;
+        if inner.context.is_none() {
+            return Err(LearningError::Unavailable);
+        }
+        Ok(Some(LearningChangeToken {
+            instance: inner.change.instance,
+            revision: inner.scope_changes.get(scope).copied().unwrap_or(0),
+        }))
     }
     fn lock(&self) -> LearningResult<WorkingGuard<'_>> {
         let mut inner = self.inner.lock().map_err(|_| LearningError::Unavailable)?;
@@ -419,6 +493,18 @@ impl StoredLearning {
         decision: LearningDecision,
         at_ms: u64,
     ) -> LearningResult<LearningDecisionRecord> {
+        {
+            let mut inner = self.inner.lock().map_err(|_| LearningError::Unavailable)?;
+            if inner.context.is_none() {
+                return Err(LearningError::Unavailable);
+            }
+            if inner.archive.is_some()
+                && inner.job_index.is_some()
+                && inner.decision_index.is_some()
+            {
+                return cold_decisions::append(&mut inner, scope, decision, at_ms);
+            }
+        }
         let mut inner = self.lock()?;
         validate_decision_binding(&inner.document, scope, &decision, at_ms)?;
         // 只与该候选最近一次决定比较；A→B→A 必须保留三个历史结局。
@@ -557,83 +643,232 @@ impl StoredLearning {
         persist(&mut inner, next)?;
         Ok(Some(batch))
     }
+    pub(super) fn reserve_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+        extractor_version: &str,
+        options: &LearningOptions,
+    ) -> LearningResult<Option<LearningBatch>> {
+        use eve_memory_api::{MemoryEvidenceCursor, ValidatedMemoryCursor};
+        options.validate()?;
+        validate_id(extractor_version).map_err(|_| LearningError::InvalidInput)?;
+        let mut cursor = ValidatedMemoryCursor::new(scope.clone(), reader.scan()?)?;
+        let revision = cursor.summary().revision;
+        let mut inner = self.lock()?;
+        let previous: Vec<_> = inner
+            .document
+            .jobs
+            .iter()
+            .filter(|r| r.job.batch.scope == *scope)
+            .collect();
+        let mut expected = BTreeMap::new();
+        for record in &previous {
+            if revision < record.memory_revision {
+                return Err(LearningError::Conflict);
+            }
+            for evidence in &record.job.batch.evidence {
+                if expected
+                    .insert(evidence.id.as_str(), evidence)
+                    .is_some_and(|old| old != evidence)
+                {
+                    return Err(LearningError::Conflict);
+                }
+            }
+        }
+        let cooling = previous
+            .iter()
+            .max_by_key(|r| r.job.batch.started_at_ms)
+            .is_some_and(|r| {
+                now_ms
+                    .checked_sub(r.job.batch.started_at_ms)
+                    .is_none_or(|elapsed| elapsed < options.cooldown_ms)
+            });
+        let mut seen = BTreeSet::new();
+        let mut batch = LearningBatch {
+            attempt: 0,
+            id: format!("learning-batch-{}", "0".repeat(64)),
+            scope: scope.clone(),
+            extractor_version: extractor_version.into(),
+            started_at_ms: now_ms,
+            evidence: vec![],
+        };
+        loop {
+            let page = cursor.next_page()?;
+            if page.is_empty() {
+                break;
+            }
+            for evidence in page {
+                if let Some(prior) = expected.get(evidence.id.as_str()) {
+                    if **prior != evidence {
+                        return Err(LearningError::Conflict);
+                    }
+                    seen.insert(evidence.id.clone());
+                    continue;
+                }
+                if cooling
+                    || batch.evidence.len() == options.max_batch_evidence
+                    || !matches!(evidence.source, EvidenceSource::CompletedInteraction { .. })
+                {
+                    continue;
+                }
+                if serde_json::to_vec(&evidence)
+                    .map_err(|_| LearningError::InvalidInput)?
+                    .len()
+                    > MAX_EVIDENCE_BYTES
+                {
+                    continue;
+                }
+                batch.evidence.push(evidence);
+                if serde_json::to_vec(&batch)
+                    .map_err(|_| LearningError::InvalidInput)?
+                    .len()
+                    > MAX_INPUT_BYTES
+                {
+                    batch.evidence.pop();
+                }
+            }
+        }
+        if seen.len() != expected.len() {
+            return Err(LearningError::Conflict);
+        }
+        let aged = batch
+            .evidence
+            .first()
+            .is_some_and(|e| now_ms.saturating_sub(e.at_ms) >= MAINTENANCE_DELAY_MS);
+        if cooling
+            || batch.evidence.is_empty()
+            || (batch.evidence.len() < options.min_new_evidence && !aged)
+        {
+            return Ok(None);
+        }
+        if inner.archive.is_none() && inner.document.jobs.len() >= MAX_JOBS {
+            return Err(LearningError::LimitReached);
+        }
+        batch.id = batch_id(scope, extractor_version, &batch.evidence)?;
+        let mut next = inner.document.clone();
+        next.jobs.push(JobRecord {
+            memory_revision: revision,
+            previous_attempts: vec![],
+            reflection: None,
+            job: LearningJob {
+                batch: batch.clone(),
+                status: JobStatus::Running,
+                finished_at_ms: None,
+                candidates: vec![],
+            },
+        });
+        persist(&mut inner, next)?;
+        Ok(Some(batch))
+    }
+
+    pub(super) fn reserve_repair_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+        extractor_version: &str,
+    ) -> LearningResult<Option<LearningBatch>> {
+        use eve_memory_api::{MemoryEvidenceCursor, ValidatedMemoryCursor};
+        validate_id(extractor_version).map_err(|_| LearningError::InvalidInput)?;
+        let mut cursor = ValidatedMemoryCursor::new(scope.clone(), reader.scan()?)?;
+        let revision = cursor.summary().revision;
+        let mut inner = self.lock()?;
+        let busy = inner
+            .document
+            .jobs
+            .iter()
+            .any(|r| r.job.batch.scope == *scope && r.job.status == JobStatus::Running);
+        let index = (!busy)
+            .then(|| {
+                inner.document.jobs.iter().position(|r| {
+                    r.job.batch.scope == *scope
+                        && r.job.batch.extractor_version == extractor_version
+                        && retryable(&r.job.status)
+                        && r.previous_attempts.len() < MAX_REPAIRS
+                        && now_ms
+                            .checked_sub(r.job.finished_at_ms.unwrap_or(r.job.batch.started_at_ms))
+                            .is_some_and(|elapsed| elapsed >= REPAIR_COOLDOWN_MS)
+                })
+            })
+            .flatten();
+        let mut expected = BTreeMap::new();
+        if let Some(index) = index {
+            let old = &inner.document.jobs[index];
+            if revision < old.memory_revision {
+                return Err(LearningError::Conflict);
+            }
+            for evidence in &old.job.batch.evidence {
+                expected.insert(evidence.id.as_str(), evidence);
+            }
+        }
+        let mut seen = BTreeSet::new();
+        loop {
+            let page = cursor.next_page()?;
+            if page.is_empty() {
+                break;
+            }
+            for evidence in page {
+                if let Some(prior) = expected.get(evidence.id.as_str()) {
+                    if **prior != evidence {
+                        return Err(LearningError::Conflict);
+                    }
+                    seen.insert(evidence.id.clone());
+                }
+            }
+        }
+        if seen.len() != expected.len() {
+            return Err(LearningError::Conflict);
+        }
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        let mut next = inner.document.clone();
+        let record = &mut next.jobs[index];
+        record.previous_attempts.push(MaintenanceAttempt {
+            started_at_ms: record.job.batch.started_at_ms,
+            finished_at_ms: record.job.finished_at_ms,
+            status: record.job.status.clone(),
+        });
+        record.job.batch.started_at_ms = now_ms;
+        record.job.batch.attempt = u8::try_from(record.previous_attempts.len())
+            .map_err(|_| LearningError::InvalidInput)?;
+        record.job.status = JobStatus::Running;
+        record.job.finished_at_ms = None;
+        let batch = record.job.batch.clone();
+        persist(&mut inner, next)?;
+        Ok(Some(batch))
+    }
+
     pub(super) fn finish(
         &self,
         batch: &LearningBatch,
         at_ms: u64,
         outcome: LearningOutcome,
     ) -> LearningResult<()> {
-        let mut inner = self.lock()?;
-        let (outcome, reflection) = match outcome {
-            LearningOutcome::Maintained(value) => (
-                LearningOutcome::Completed(value.candidates),
-                value.reflection,
-            ),
-            other => (other, None),
-        };
-        if let Some(reflection) = &reflection {
-            reflection.validate(batch)?;
+        {
+            let mut inner = self.inner.lock().map_err(|_| LearningError::Unavailable)?;
+            if inner.context.is_none() {
+                return Err(LearningError::Unavailable);
+            }
+            if inner.archive.is_some() && inner.job_index.is_some() {
+                return cold_jobs::finish(&mut inner, batch, at_ms, outcome);
+            }
         }
+        let mut inner = self.lock()?;
         let index = inner
             .document
             .jobs
             .iter()
             .position(|record| record.job.batch.id == batch.id)
             .ok_or(LearningError::Conflict)?;
-        let old = &inner.document.jobs[index].job;
-        if old.batch != *batch {
-            return Err(LearningError::Conflict);
-        }
-        if old.status != JobStatus::Running {
-            let replay = match (&old.status, &outcome) {
-                (JobStatus::Completed, LearningOutcome::Completed(drafts)) => {
-                    old.candidates.len() == drafts.len()
-                        && old
-                            .candidates
-                            .iter()
-                            .zip(drafts)
-                            .all(|(candidate, draft)| candidate.draft == *draft)
-                }
-                (JobStatus::Failed(first), LearningOutcome::Failed(second)) => first == second,
-                _ => false,
-            };
-            return if replay && inner.document.jobs[index].reflection == reflection {
-                Ok(())
-            } else {
-                Err(LearningError::Conflict)
-            };
-        }
-        if let LearningOutcome::Completed(drafts) = &outcome {
-            validate_drafts(batch, drafts)?;
-        }
-        if at_ms < batch.started_at_ms {
-            return Err(LearningError::InvalidInput);
-        }
+        let Some(record) = finish_record(&inner.document.jobs[index], batch, at_ms, outcome)?
+        else {
+            return Ok(());
+        };
         let mut next = inner.document.clone();
-        next.jobs[index].reflection = reflection;
-        let job = &mut next.jobs[index].job;
-        job.finished_at_ms = Some(at_ms);
-        match outcome {
-            LearningOutcome::Maintained(_) => unreachable!("normalized above"),
-            LearningOutcome::Failed(reason) => job.status = JobStatus::Failed(reason),
-            LearningOutcome::Completed(drafts) => {
-                let expires_at_ms = at_ms
-                    .checked_add(CANDIDATE_TTL_MS)
-                    .ok_or(LearningError::InvalidInput)?;
-                job.status = JobStatus::Completed;
-                job.candidates = drafts
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, draft)| PreferenceCandidate {
-                        id: candidate_id(&batch.id, index),
-                        batch_id: batch.id.clone(),
-                        draft,
-                        created_at_ms: at_ms,
-                        expires_at_ms,
-                    })
-                    .collect();
-            }
-        }
+        next.jobs[index] = record;
         persist(&mut inner, next)
     }
     pub(super) fn maintenance_receipts(
@@ -724,6 +959,11 @@ impl StoredLearning {
 }
 
 fn persist(inner: &mut Inner, next: Document) -> LearningResult<()> {
+    let revision = inner
+        .change
+        .revision
+        .checked_add(1)
+        .ok_or(LearningError::LimitReached)?;
     let (bytes, index) = if let Some(store) = &inner.archive {
         let (bytes, index) = archive::freeze(store.as_ref(), "jobs", &next.jobs)?;
         (bytes, Some(index))
@@ -736,11 +976,34 @@ fn persist(inner: &mut Inner, next: Document) -> LearningResult<()> {
         inner.context = None;
         return Err(LearningError::Storage);
     }
+    for (position, record) in next.jobs.iter().enumerate() {
+        if inner.document.jobs.get(position) != Some(record) {
+            if let Some(old) = inner.document.jobs.get(position) {
+                inner
+                    .scope_changes
+                    .insert(old.job.batch.scope.clone(), revision);
+            }
+            inner
+                .scope_changes
+                .insert(record.job.batch.scope.clone(), revision);
+        }
+    }
+    for old in inner.document.jobs.iter().skip(next.jobs.len()) {
+        inner
+            .scope_changes
+            .insert(old.job.batch.scope.clone(), revision);
+    }
     inner.document = next;
     inner.job_index = index;
+    inner.change.revision = revision;
     Ok(())
 }
 fn persist_decisions(inner: &mut Inner, next: DecisionsDocument) -> LearningResult<()> {
+    let revision = inner
+        .change
+        .revision
+        .checked_add(1)
+        .ok_or(LearningError::LimitReached)?;
     if inner.archive.is_none() && next.records.len() > MAX_DECISIONS {
         return Err(LearningError::LimitReached);
     }
@@ -763,8 +1026,20 @@ fn persist_decisions(inner: &mut Inner, next: DecisionsDocument) -> LearningResu
         inner.context = None;
         return Err(LearningError::Storage);
     }
+    for (position, record) in next.records.iter().enumerate() {
+        if inner.decisions.records.get(position) != Some(record) {
+            if let Some(old) = inner.decisions.records.get(position) {
+                inner.scope_changes.insert(old.scope.clone(), revision);
+            }
+            inner.scope_changes.insert(record.scope.clone(), revision);
+        }
+    }
+    for old in inner.decisions.records.iter().skip(next.records.len()) {
+        inner.scope_changes.insert(old.scope.clone(), revision);
+    }
     inner.decisions = next;
     inner.decision_index = index;
+    inner.change.revision = revision;
     Ok(())
 }
 
@@ -1134,4 +1409,77 @@ fn retryable(status: &JobStatus) -> bool {
         JobStatus::Interrupted
             | JobStatus::Failed(LearningFailure::TransientProvider | LearningFailure::Timeout)
     )
+}
+
+fn finish_record(
+    record: &JobRecord,
+    batch: &LearningBatch,
+    at_ms: u64,
+    outcome: LearningOutcome,
+) -> LearningResult<Option<JobRecord>> {
+    let (outcome, reflection) = match outcome {
+        LearningOutcome::Maintained(value) => (
+            LearningOutcome::Completed(value.candidates),
+            value.reflection,
+        ),
+        other => (other, None),
+    };
+    if let Some(reflection) = &reflection {
+        reflection.validate(batch)?;
+    }
+    let old = &record.job;
+    if old.batch != *batch {
+        return Err(LearningError::Conflict);
+    }
+    if old.status != JobStatus::Running {
+        let replay = match (&old.status, &outcome) {
+            (JobStatus::Completed, LearningOutcome::Completed(drafts)) => {
+                old.candidates.len() == drafts.len()
+                    && old
+                        .candidates
+                        .iter()
+                        .zip(drafts)
+                        .all(|(candidate, draft)| candidate.draft == *draft)
+            }
+            (JobStatus::Failed(first), LearningOutcome::Failed(second)) => first == second,
+            _ => false,
+        };
+        return if replay && record.reflection == reflection {
+            Ok(None)
+        } else {
+            Err(LearningError::Conflict)
+        };
+    }
+    if let LearningOutcome::Completed(drafts) = &outcome {
+        validate_drafts(batch, drafts)?;
+    }
+    if at_ms < batch.started_at_ms {
+        return Err(LearningError::InvalidInput);
+    }
+    let mut next = record.clone();
+    next.reflection = reflection;
+    let job = &mut next.job;
+    job.finished_at_ms = Some(at_ms);
+    match outcome {
+        LearningOutcome::Maintained(_) => unreachable!("normalized above"),
+        LearningOutcome::Failed(reason) => job.status = JobStatus::Failed(reason),
+        LearningOutcome::Completed(drafts) => {
+            let expires_at_ms = at_ms
+                .checked_add(CANDIDATE_TTL_MS)
+                .ok_or(LearningError::InvalidInput)?;
+            job.status = JobStatus::Completed;
+            job.candidates = drafts
+                .into_iter()
+                .enumerate()
+                .map(|(index, draft)| PreferenceCandidate {
+                    id: candidate_id(&batch.id, index),
+                    batch_id: batch.id.clone(),
+                    draft,
+                    created_at_ms: at_ms,
+                    expires_at_ms,
+                })
+                .collect();
+        }
+    }
+    Ok(Some(next))
 }

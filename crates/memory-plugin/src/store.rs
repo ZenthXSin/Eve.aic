@@ -625,6 +625,26 @@ impl StoredMemory {
             .map(|record| record.snapshot.scope.clone())
             .collect())
     }
+    pub(super) fn revisions(&self, channel: &str) -> MemoryResult<Vec<(MemoryScope, u64)>> {
+        validate_id(channel)?;
+        Ok(self
+            .lock()?
+            .document
+            .scopes
+            .iter()
+            .filter(|r| r.snapshot.scope.channel == channel)
+            .map(|r| (r.snapshot.scope.clone(), r.snapshot.revision))
+            .collect())
+    }
+    pub(super) fn revision(&self, scope: &MemoryScope) -> MemoryResult<u64> {
+        let inner = self.lock()?;
+        Ok(inner
+            .document
+            .scopes
+            .iter()
+            .find(|r| r.snapshot.scope == *scope)
+            .map_or(0, |r| r.snapshot.revision))
+    }
     pub(super) fn snapshot(&self, scope: &MemoryScope) -> MemoryResult<MemorySnapshot> {
         let inner = self.lock()?;
         Ok(inner

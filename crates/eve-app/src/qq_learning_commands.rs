@@ -6,9 +6,10 @@ use eve_learning_api::{
     preference_id,
 };
 use eve_memory_api::{
-    EvidenceSource, MAX_TEXT_BYTES, MemoryAdmin, MemoryError, MemoryScope, MemorySnapshot,
-    Preference, PreferenceAction, PreferenceChange, PreferenceEvidence, PreferenceStatus,
-    UserStatement, validate_id, validate_text,
+    EvidenceSource, InteractionEvidence, MAX_TEXT_BYTES, MemoryAdmin, MemoryError,
+    MemoryEvidenceCursor, MemoryResult, MemoryScope, MemoryService, MemorySnapshot, Preference,
+    PreferenceAction, PreferenceChange, PreferenceEvidence, PreferenceStatus, UserStatement,
+    ValidatedMemoryCursor, validate_id, validate_text,
 };
 use eve_plugin_api::{PluginError, PluginResult};
 use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput};
@@ -23,6 +24,71 @@ use std::{
 const HELP: &str =
     "用法：/memory-candidates [页码]、/memory-decision 候选ID、/accept-memory 候选ID。";
 const PAGE_SIZE: usize = 5;
+
+/// 命令的局部证据视图，不冒充完整 MemorySnapshot，也不交给可替换确认策略。
+struct PreferenceHistoryView {
+    scope: MemoryScope,
+    revision: u64,
+    preferences: Vec<Preference>,
+    evidence: Vec<InteractionEvidence>,
+}
+
+pub(crate) trait PreferenceEvidenceView {
+    fn preferences(&self) -> &[Preference];
+    fn evidence(&self) -> &[InteractionEvidence];
+}
+impl PreferenceEvidenceView for MemorySnapshot {
+    fn preferences(&self) -> &[Preference] {
+        &self.preferences
+    }
+    fn evidence(&self) -> &[InteractionEvidence] {
+        &self.evidence
+    }
+}
+impl PreferenceEvidenceView for PreferenceHistoryView {
+    fn preferences(&self) -> &[Preference] {
+        &self.preferences
+    }
+    fn evidence(&self) -> &[InteractionEvidence] {
+        &self.evidence
+    }
+}
+
+fn preference_history_view(
+    scope: &MemoryScope,
+    reader: &dyn MemoryService,
+) -> MemoryResult<PreferenceHistoryView> {
+    let mut cursor = ValidatedMemoryCursor::new(scope.clone(), reader.scan()?)?;
+    let summary = cursor.summary();
+    let history_count = summary
+        .preferences
+        .iter()
+        .try_fold(0usize, |count, p| count.checked_add(p.history.len()))
+        .ok_or(MemoryError::CorruptState)?;
+    if history_count > eve_memory_api::MAX_HISTORY {
+        return Err(MemoryError::CorruptState);
+    }
+    let summary = summary.clone();
+    let referenced: BTreeSet<_> = summary
+        .preferences
+        .iter()
+        .flat_map(|p| p.history.iter().map(|v| v.evidence_id.clone()))
+        .collect();
+    let mut evidence = Vec::new();
+    loop {
+        let page = cursor.next_page()?;
+        if page.is_empty() {
+            break;
+        }
+        evidence.extend(page.into_iter().filter(|e| referenced.contains(&e.id)));
+    }
+    Ok(PreferenceHistoryView {
+        scope: summary.scope,
+        revision: summary.revision,
+        preferences: summary.preferences,
+        evidence,
+    })
+}
 
 pub(crate) struct Commands {
     services: Option<(Arc<dyn LearningAdmin>, Arc<dyn MemoryAdmin>)>,
@@ -71,7 +137,7 @@ impl Commands {
         // 后台在此期间保存的新偏好会使手动命令 CAS 失效，不能漏掉关联后重复确认。
         let snapshot = match memory
             .reader(scope.clone())
-            .and_then(|reader| reader.complete_snapshot())
+            .and_then(|reader| preference_history_view(&scope, reader.as_ref()))
         {
             Ok(snapshot) if snapshot.scope == scope => snapshot,
             Ok(_) => return Err(failure()),
@@ -310,12 +376,12 @@ pub(crate) fn candidates_for<'a>(
 
 /// 固定关联键不足以证明已确认，还须验证首版正文与真实用户确认来源。
 pub(crate) fn confirmed<'a>(
-    snapshot: &'a MemorySnapshot,
+    snapshot: &'a impl PreferenceEvidenceView,
     candidate: &PreferenceCandidate,
 ) -> PluginResult<Option<&'a Preference>> {
     let id = preference_id(&candidate.id);
     let mut matches = snapshot
-        .preferences
+        .preferences()
         .iter()
         .filter(|preference| preference.id == id);
     let Some(preference) = matches.next() else {
@@ -336,7 +402,7 @@ pub(crate) fn confirmed<'a>(
         return Err(failure());
     }
     let mut evidence = snapshot
-        .evidence
+        .evidence()
         .iter()
         .filter(|item| item.id == first.evidence_id);
     let source = evidence.next().ok_or_else(failure)?;
@@ -383,7 +449,7 @@ pub(crate) fn validate_records(
 /// 账本只是意图；必须在目标真实历史中找到指定后继版本及原始完成来源。
 /// 遍历所有旧意图，使后来用户更正、撤销仍保留候选曾成功更新的事实。
 pub(crate) fn linked_candidate<'a>(
-    snapshot: &'a MemorySnapshot,
+    snapshot: &'a impl PreferenceEvidenceView,
     candidate: &PreferenceCandidate,
     records: &[LearningDecisionRecord],
 ) -> PluginResult<Option<&'a Preference>> {
@@ -405,7 +471,11 @@ pub(crate) fn linked_candidate<'a>(
         let Some(next_revision) = expected_revision.checked_add(1) else {
             return Err(failure());
         };
-        let Some(preference) = snapshot.preferences.iter().find(|p| p.id == *preference_id) else {
+        let Some(preference) = snapshot
+            .preferences()
+            .iter()
+            .find(|p| p.id == *preference_id)
+        else {
             continue;
         };
         let Some(version) = preference
@@ -422,7 +492,7 @@ pub(crate) fn linked_candidate<'a>(
             continue;
         }
         let source = snapshot
-            .evidence
+            .evidence()
             .iter()
             .find(|e| e.id == version.evidence_id)
             .ok_or_else(failure)?;
@@ -455,10 +525,8 @@ pub(crate) fn auto_confirm(
     validate_records(&records, &pending, archived)?;
     pending.reverse(); // 先确认旧证据，新的纠正具有更高来源修订。
     for candidate in pending {
-        let snapshot = memory
-            .reader(scope.clone())
-            .and_then(|r| r.complete_snapshot())
-            .map_err(|_| failure())?;
+        let reader = memory.reader(scope.clone()).map_err(|_| failure())?;
+        let snapshot = preference_history_view(scope, reader.as_ref()).map_err(|_| failure())?;
         if snapshot.scope != *scope {
             return Err(failure());
         }
@@ -473,30 +541,27 @@ pub(crate) fn auto_confirm(
         if candidate.created_at_ms > at_ms {
             continue;
         }
-        if candidate.draft.evidence_ids.iter().any(|id| {
-            let source = batch.batch.evidence.iter().find(|e| e.id == *id);
-            !snapshot
-                .evidence
-                .iter()
-                .any(|current| Some(current) == source)
-        }) {
-            return Err(failure());
-        }
         let decision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let proposal = policy.decide(candidate, &batch.batch, &snapshot, at_ms)?;
+            let proposal = policy.decide_reader(candidate, &batch.batch, reader.as_ref(), at_ms)?;
             if proposal.policy_version != policy.version() {
                 return Err(LearningError::InvalidInput);
             }
-            eve_learning_plugin::constrain_decision(
+            eve_learning_plugin::constrain_decision_reader(
                 candidate,
                 &batch.batch,
-                &snapshot,
+                reader.as_ref(),
+                snapshot.revision,
                 at_ms,
                 proposal,
             )
         }))
-        .map_err(|_| failure())?
         .map_err(|_| failure())?;
+        let decision = match decision {
+            Ok(decision) => decision,
+            // 多次只读扫描间出现新证据时，不保存旧提议；下一轮重新读取。
+            Err(LearningError::Memory(MemoryError::StaleRevision)) => return Ok(()),
+            Err(_) => return Err(failure()),
+        };
         match learning.record_decision(scope, decision.clone(), at_ms) {
             Ok(record) if record.decision.same_outcome(&decision) => {}
             // 没有可持久审计意图时不得继续写 Memory。
@@ -532,7 +597,7 @@ pub(crate) fn auto_confirm(
             .draft
             .evidence_ids
             .iter()
-            .filter_map(|id| snapshot.evidence.iter().find(|e| e.id == *id))
+            .filter_map(|id| batch.batch.evidence.iter().find(|e| e.id == *id))
             .max_by_key(|e| e.revision)
             .ok_or_else(failure)?;
         let change = PreferenceChange {
@@ -546,7 +611,7 @@ pub(crate) fn auto_confirm(
                 let committed_records = learning.decisions(scope).map_err(|_| failure())?;
                 let complete = memory
                     .reader(scope.clone())
-                    .and_then(|r| r.complete_snapshot())
+                    .and_then(|r| preference_history_view(scope, r.as_ref()))
                     .map_err(|_| failure())?;
                 linked_candidate(&complete, candidate, &committed_records)?.ok_or_else(failure)?;
             }
@@ -583,7 +648,7 @@ fn current_reply(preference: &Preference) -> String {
 
 fn list(
     candidates: &[&PreferenceCandidate],
-    snapshot: &MemorySnapshot,
+    snapshot: &impl PreferenceEvidenceView,
     records: &[LearningDecisionRecord],
     page: usize,
     now_ms: u64,
@@ -615,7 +680,7 @@ fn list(
         reply.push_str(&format!(
             "\n候选 ID：{}\n状态：{}；模型自评：{}%\n首次确认有效期：{}（Unix 毫秒，{}）\n来源证据：{}\n候选正文：\n{}\n确认：/accept-memory {}",
             candidate.id,
-            if preference.is_some_and(|p| p.revision == 1 && snapshot.evidence.iter().any(|e|
+            if preference.is_some_and(|p| p.revision == 1 && snapshot.evidence().iter().any(|e|
                 p.history.first().is_some_and(|h| h.evidence_id == e.id)
                     && matches!(e.source, EvidenceSource::CompletedInteraction { .. }))) {
                 "已自动保存"
@@ -679,7 +744,7 @@ fn reason_text(reason: &DecisionReason) -> &'static str {
 
 fn decision_details(
     candidate: &PreferenceCandidate,
-    snapshot: &MemorySnapshot,
+    snapshot: &impl PreferenceEvidenceView,
     records: &[LearningDecisionRecord],
 ) -> PluginResult<String> {
     let history: Vec<_> = records
@@ -1035,6 +1100,235 @@ mod tests {
             .unwrap()
             .snapshot()
             .unwrap()
+    }
+
+    struct PagedMemory {
+        scope: MemoryScope,
+        failed_at: Option<usize>,
+        reads: Arc<AtomicUsize>,
+    }
+    struct EvidencePages {
+        summary: eve_memory_api::MemoryScanSummary,
+        position: usize,
+        failed_at: Option<usize>,
+        reads: Arc<AtomicUsize>,
+    }
+    impl MemoryEvidenceCursor for EvidencePages {
+        fn summary(&self) -> &eve_memory_api::MemoryScanSummary {
+            &self.summary
+        }
+        fn next_page(&mut self) -> MemoryResult<Vec<InteractionEvidence>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.failed_at.is_some_and(|n| self.position >= n) {
+                return Err(MemoryError::Storage);
+            }
+            let end = (self.position + eve_memory_api::MAX_ARCHIVE_PAGE).min(6000);
+            let result = (self.position..end)
+                .map(|n| InteractionEvidence {
+                    id: format!("completed-{n}"),
+                    revision: if n == 0 { 1 } else { n as u64 + 2 },
+                    at_ms: 1,
+                    source: EvidenceSource::CompletedInteraction {
+                        message_id: format!("source-{n}"),
+                        session_revision: (n as u64 + 1) * 2,
+                        turn_id: n as u64 + 1,
+                        user_text: "先说结论".into(),
+                        assistant_text: "好的".into(),
+                    },
+                })
+                .collect();
+            self.position = end;
+            Ok(result)
+        }
+    }
+    impl MemoryService for PagedMemory {
+        fn snapshot(&self) -> MemoryResult<MemorySnapshot> {
+            panic!("显式偏好命令不得恢复全量聊天正文")
+        }
+        fn complete_snapshot(&self) -> MemoryResult<MemorySnapshot> {
+            panic!("显式偏好命令不得恢复全量聊天正文")
+        }
+        fn scan(&self) -> MemoryResult<Box<dyn MemoryEvidenceCursor>> {
+            let candidate = fixture(self.scope.clone(), 1)
+                .jobs
+                .remove(0)
+                .candidates
+                .remove(0);
+            let text = candidate.draft.text;
+            Ok(Box::new(EvidencePages {
+                summary: eve_memory_api::MemoryScanSummary {
+                    scope: self.scope.clone(),
+                    revision: 6001,
+                    evidence_count: 6000,
+                    preferences: vec![Preference {
+                        id: preference_id("candidate-0"),
+                        text: text.clone(),
+                        revision: 1,
+                        status: PreferenceStatus::Confirmed,
+                        history: vec![eve_memory_api::PreferenceVersion {
+                            revision: 1,
+                            evidence_id: "completed-0".into(),
+                            at_ms: 2,
+                            text,
+                            status: PreferenceStatus::Confirmed,
+                        }],
+                    }],
+                },
+                position: 0,
+                failed_at: self.failed_at,
+                reads: self.reads.clone(),
+            }))
+        }
+    }
+    impl MemoryAdmin for PagedMemory {
+        fn reader(&self, scope: MemoryScope) -> MemoryResult<Arc<dyn MemoryService>> {
+            if scope != self.scope {
+                return Err(MemoryError::InvalidInput);
+            }
+            Ok(Arc::new(Self {
+                scope,
+                failed_at: self.failed_at,
+                reads: self.reads.clone(),
+            }))
+        }
+        fn import_completed(
+            &self,
+            _: &MemoryScope,
+            _: u64,
+            _: CompletedInteraction,
+        ) -> MemoryResult<MemorySnapshot> {
+            panic!("只读候选查询不得写入")
+        }
+        fn update_preference(
+            &self,
+            _: &MemoryScope,
+            _: u64,
+            _: PreferenceChange,
+        ) -> MemoryResult<MemorySnapshot> {
+            panic!("已关联候选重复确认不得写入")
+        }
+    }
+    struct ConfirmationMemory {
+        inner: PagedMemory,
+        writes: AtomicUsize,
+    }
+    impl MemoryAdmin for ConfirmationMemory {
+        fn reader(&self, scope: MemoryScope) -> MemoryResult<Arc<dyn MemoryService>> {
+            self.inner.reader(scope)
+        }
+        fn import_completed(
+            &self,
+            _: &MemoryScope,
+            _: u64,
+            _: CompletedInteraction,
+        ) -> MemoryResult<MemorySnapshot> {
+            panic!("确认不伪造已完成交互")
+        }
+        fn update_preference(
+            &self,
+            scope: &MemoryScope,
+            revision: u64,
+            change: PreferenceChange,
+        ) -> MemoryResult<MemorySnapshot> {
+            assert_eq!(scope, &self.inner.scope);
+            assert_eq!(revision, 6001);
+            assert!(
+                matches!(change.evidence, PreferenceEvidence::Existing(ref id) if id == "completed-1")
+            );
+            assert!(matches!(change.action, PreferenceAction::Confirm { .. }));
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Err(MemoryError::StaleRevision)
+        }
+    }
+    #[test]
+    fn native_confirmation_uses_paged_evidence_and_never_writes_after_a_late_read_error() {
+        let session = session();
+        let scope = crate::qq_memory::scope(&session);
+        for failed_at in [None, Some(5900)] {
+            let memory = ConfirmationMemory {
+                inner: PagedMemory {
+                    scope: scope.clone(),
+                    failed_at,
+                    reads: Arc::new(AtomicUsize::new(0)),
+                },
+                writes: AtomicUsize::new(0),
+            };
+            let learning = learning(&session, 1);
+            let mut snapshots = learning.snapshots.lock().unwrap();
+            let job = &mut snapshots.get_mut(&scope).unwrap().jobs[0];
+            let mut cursor = memory.inner.scan().unwrap();
+            job.batch.evidence = cursor.next_page().unwrap().into_iter().take(2).collect();
+            job.candidates[0].id = "candidate-new".into();
+            job.candidates[0].draft.text = "回复最多3段".into();
+            job.candidates[0].draft.evidence_ids =
+                job.batch.evidence.iter().map(|e| e.id.clone()).collect();
+            drop(snapshots);
+            let result = auto_confirm(
+                &memory,
+                learning.as_ref(),
+                &eve_learning_plugin::EvidenceConfirmationPolicy,
+                &scope,
+                3,
+            );
+            if failed_at.is_some() {
+                assert!(result.is_err());
+                assert_eq!(learning.record_writes.load(Ordering::SeqCst), 0);
+                assert_eq!(memory.writes.load(Ordering::SeqCst), 0);
+            } else {
+                result.unwrap();
+                assert_eq!(learning.record_writes.load(Ordering::SeqCst), 1);
+                assert_eq!(memory.writes.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_preference_queries_scan_all_pages_and_only_retain_referenced_sources() {
+        let session = session();
+        let scope = crate::qq_memory::scope(&session);
+        let memory = Arc::new(PagedMemory {
+            scope: scope.clone(),
+            failed_at: None,
+            reads: Arc::new(AtomicUsize::new(0)),
+        });
+        let view = preference_history_view(&scope, memory.as_ref()).unwrap();
+        assert_eq!(view.revision, 6001);
+        assert_eq!(view.evidence.len(), 1);
+        assert_eq!(view.evidence[0].id, "completed-0");
+        assert!(memory.reads.load(Ordering::SeqCst) > 1);
+        let commands = Commands::new(learning(&session, 1), memory.clone());
+        for (index, text) in [
+            "/memory-candidates",
+            "/memory-decision candidate-0",
+            "/accept-memory candidate-0",
+            "/self-learning",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                run(&commands, &session, &format!("query-{index}"), text)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+    #[test]
+    fn preference_queries_do_not_accept_partial_results_after_late_page_failure_or_scope_mismatch()
+    {
+        let session = session();
+        let scope = crate::qq_memory::scope(&session);
+        let memory = Arc::new(PagedMemory {
+            scope: scope.clone(),
+            failed_at: Some(5900),
+            reads: Arc::new(AtomicUsize::new(0)),
+        });
+        let commands = Commands::new(learning(&session, 1), memory.clone());
+        assert!(run(&commands, &session, "partial", "/accept-memory candidate-0").is_err());
+        assert!(memory.reads.load(Ordering::SeqCst) > 1);
+        let mut wrong = scope.clone();
+        wrong.user_id = "another-user".into();
+        assert!(preference_history_view(&wrong, memory.as_ref()).is_err());
     }
 
     #[test]

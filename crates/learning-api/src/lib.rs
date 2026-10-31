@@ -127,8 +127,20 @@ pub enum LearningOutcome {
     Failed(LearningFailure),
 }
 
+/// 仅当前进程中的服务变更标识；不能用于授权、CAS 或跨进程恢复。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LearningChangeToken {
+    pub instance: u64,
+    pub revision: u64,
+}
+
 /// 仅可信宿主持有。不发布跨作用域管理能力给模型或不受信插件。
 pub trait LearningAdmin: Send + Sync {
+    /// 当前范围的无正文变更通知。None 表示旧实现不支持，宿主不能据此跳过完整扫描。
+    /// 标识相同不证明冷文件未损坏，缓存仍须定期完整复核。
+    fn change_token(&self, _scope: &MemoryScope) -> LearningResult<Option<LearningChangeToken>> {
+        Ok(None)
+    }
     fn scan_jobs(
         &self,
         scope: &MemoryScope,
@@ -171,6 +183,20 @@ pub trait LearningAdmin: Send + Sync {
     ) -> LearningResult<Option<LearningBatch>> {
         Ok(None)
     }
+    /// 从固定版本的完整证据流准入只读补做；内置实现不恢复整份原始记忆。
+    fn reserve_repair_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+        extractor_version: &str,
+    ) -> LearningResult<Option<LearningBatch>> {
+        let snapshot = reader.complete_snapshot()?;
+        if snapshot.scope != *scope {
+            return Err(LearningError::Conflict);
+        }
+        self.reserve_repair(&snapshot, now_ms, extractor_version)
+    }
     fn snapshot(&self, scope: &MemoryScope) -> LearningResult<LearningSnapshot>;
     /// 只返回当前可信宿主绑定范围的决策，按范围内连续 sequence 排序。
     /// 决策记录是提交前的意图，不证明偏好已经写入记忆。
@@ -198,6 +224,21 @@ pub trait LearningAdmin: Send + Sync {
         extractor_version: &str,
         options: &LearningOptions,
     ) -> LearningResult<Option<LearningBatch>>;
+    /// 从绑定作用域的证据流准入新批次，内置实现保留批次正文及校验元数据。
+    fn reserve_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+        extractor_version: &str,
+        options: &LearningOptions,
+    ) -> LearningResult<Option<LearningBatch>> {
+        let snapshot = reader.complete_snapshot()?;
+        if snapshot.scope != *scope {
+            return Err(LearningError::Conflict);
+        }
+        self.reserve(&snapshot, now_ms, extractor_version, options)
+    }
     fn finish(
         &self,
         batch: &LearningBatch,
@@ -230,6 +271,18 @@ pub trait AutoConfirmationPolicy: Send + Sync {
     /// 持久记录决策来源；自定义策略修改判断规则时应使用新的稳定版本。
     fn version(&self) -> &str {
         "legacy-auto-confirm-v1"
+    }
+    /// 只读判断入口。旧策略保持完整快照语义；原生策略可逐页核验后只保留
+    /// 候选批次和偏好历史所需原文。宿主仍独立复核提议并以原修订 CAS 提交。
+    fn decide_reader(
+        &self,
+        candidate: &PreferenceCandidate,
+        batch: &LearningBatch,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+    ) -> LearningResult<LearningDecision> {
+        let memory = reader.complete_snapshot()?;
+        self.decide(candidate, batch, &memory, now_ms)
     }
     fn allows(
         &self,

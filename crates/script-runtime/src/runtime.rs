@@ -68,24 +68,54 @@ impl ScriptRuntime {
             artifacts: artifacts.into(),
         }
     }
-    /// Rust候选先隔离编译再发布；失败不写入版本或更改active。
+    /// 兼容入口；需要结构化编译诊断的宿主使用 prepare_candidate。
     pub async fn publish_candidate(
         &self,
         spec: crate::ScriptSpec,
         context: ToolExecutionContext,
     ) -> Result<PublishedVersion> {
+        match self.prepare_candidate(spec, context).await? {
+            crate::CandidatePreparation::Ready(version) => Ok(*version),
+            crate::CandidatePreparation::CompilationFailed(report) => Err(reject(format!(
+                "Rust隔离编译失败；旧版本保持可用；退出码 {:?}，信号 {:?}；诊断{}：{}",
+                report.exit_code,
+                report.signal,
+                if report.truncated {
+                    "（已截断）"
+                } else {
+                    ""
+                },
+                report.diagnostics
+            ))),
+        }
+    }
+    /// Rust 候选隔离编译失败时返回实际诊断，不写入版本、不改活动状态。
+    pub async fn prepare_candidate(
+        &self,
+        spec: crate::ScriptSpec,
+        context: ToolExecutionContext,
+    ) -> Result<crate::CandidatePreparation> {
         let owner = context.scope().ok_or_else(|| reject("发布缺少可信身份"))?;
         spec.validate()?;
         if spec.language == crate::Language::Rust {
             let deadline = context
                 .deadline()
                 .unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
-            self.sandbox
-                .prepare_rust(&spec.source, &context, deadline)
-                .await?;
+            match self
+                .sandbox
+                .prepare_rust_report(&spec.source, &context, deadline)
+                .await?
+            {
+                crate::compiler::RustPreparation::Ready(_) => {}
+                crate::compiler::RustPreparation::CompilationFailed(report) => {
+                    return Ok(crate::CandidatePreparation::CompilationFailed(report));
+                }
+            }
             check_stop(&context, deadline)?;
         }
-        self.store.publish(owner, spec)
+        Ok(crate::CandidatePreparation::Ready(Box::new(
+            self.store.publish(owner, spec)?,
+        )))
     }
     pub fn bind(&self, owner: &ContextScope, reference: &VersionRef) -> Result<BoundVersion> {
         let mut versions = BTreeMap::new();

@@ -832,3 +832,58 @@ async fn archived_candidate_is_confirmed_once_and_restart_rechecks_real_evidence
     assert_eq!(snapshot(&admin, &session), saved);
     kernel.stop_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn concurrent_new_evidence_during_policy_evaluation_reenters_without_recording_stale_intent()
+{
+    struct ConcurrentEvidence {
+        memory: MemoryController,
+        session: SessionKey,
+    }
+    impl AutoConfirmationPolicy for ConcurrentEvidence {
+        fn allows(
+            &self,
+            _: &PreferenceCandidate,
+            _: &LearningBatch,
+            snapshot: &MemorySnapshot,
+            _: u64,
+        ) -> LearningResult<bool> {
+            // 模拟判断期间另一条已送达对话并发写入；策略提议仍引用读取时的旧版本。
+            import_pair(&self.memory, &self.session, "并发的新经历");
+            assert!(
+                super::tests::snapshot(&self.memory, &self.session).revision > snapshot.revision
+            );
+            Ok(true)
+        }
+    }
+    let (kernel, memory) = memory(Arc::new(RecordingStore::default())).await;
+    let session = session();
+    let scope = crate::qq_memory::scope(&session);
+    let evidence = import_pair(&memory, &session, "回复最多两段");
+    let learning = FixedLearning::default();
+    add_candidate(&learning, &scope, "racing-policy", "回复最多2段", evidence);
+    auto_confirm(
+        &memory,
+        &learning,
+        &ConcurrentEvidence {
+            memory: memory.clone(),
+            session: session.clone(),
+        },
+        &scope,
+        1000,
+    )
+    .unwrap();
+    assert_eq!(learning.record_writes.load(Ordering::SeqCst), 0);
+    assert!(snapshot(&memory, &session).preferences.is_empty());
+    auto_confirm(
+        &memory,
+        &learning,
+        &EvidenceConfirmationPolicy,
+        &scope,
+        1001,
+    )
+    .unwrap();
+    assert_eq!(learning.record_writes.load(Ordering::SeqCst), 1);
+    assert_eq!(snapshot(&memory, &session).preferences.len(), 1);
+    kernel.stop_all().await.unwrap();
+}

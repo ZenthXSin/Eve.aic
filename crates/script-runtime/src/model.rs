@@ -7,6 +7,21 @@ use std::collections::BTreeMap;
 pub type Result<T> = std::result::Result<T, ToolExecutionError>;
 pub const MAX_SOURCE_BYTES: usize = 256 * 1024;
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+/// 仅来自隔离编译器的有界诊断；不是宿主日志，也不证明插件运行成功。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompilationFailure {
+    pub language: Language,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub diagnostics: String,
+    pub truncated: bool,
+}
+#[derive(Clone, Debug)]
+pub enum CandidatePreparation {
+    Ready(Box<PublishedVersion>),
+    CompilationFailed(CompilationFailure),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

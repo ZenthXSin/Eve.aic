@@ -8,7 +8,7 @@ mod store;
 mod strict_json;
 
 pub use confirmation::EvidenceConfirmationPolicy;
-pub use decision::{EVIDENCE_POLICY_VERSION, constrain_decision};
+pub use decision::{EVIDENCE_POLICY_VERSION, constrain_decision, constrain_decision_reader};
 use eve_learning_api::*;
 use eve_memory_api::{MemoryScope, MemorySnapshot};
 use eve_plugin_api::{
@@ -35,6 +35,9 @@ impl LearningController {
     }
 }
 impl LearningAdmin for LearningController {
+    fn change_token(&self, scope: &MemoryScope) -> LearningResult<Option<LearningChangeToken>> {
+        self.service()?.change_token(scope)
+    }
     fn scan_jobs(
         &self,
         scope: &MemoryScope,
@@ -107,6 +110,27 @@ impl LearningAdmin for LearningController {
     ) -> LearningResult<Option<LearningBatch>> {
         self.service()?
             .reserve(memory, now_ms, extractor_version, options)
+    }
+    fn reserve_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+        extractor_version: &str,
+        options: &LearningOptions,
+    ) -> LearningResult<Option<LearningBatch>> {
+        self.service()?
+            .reserve_reader(scope, reader, now_ms, extractor_version, options)
+    }
+    fn reserve_repair_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+        extractor_version: &str,
+    ) -> LearningResult<Option<LearningBatch>> {
+        self.service()?
+            .reserve_repair_reader(scope, reader, now_ms, extractor_version)
     }
     fn finish(
         &self,
