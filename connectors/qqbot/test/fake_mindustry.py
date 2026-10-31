@@ -80,7 +80,12 @@ def main():
     log("I", f"{len(mods)} mods loaded.")
     log("I", "Server loaded. Type 'help' for help.")
     if hold:
+        parent = os.getppid()
         while not os.path.exists(hold):
+            # 强制终止 Eve 的恢复用例会丢失 stdin 的读取机会；替身不能无限
+            # 留在门闸里。只检查自己的真实父进程，不扫描或终止其他进程。
+            if os.getppid() != parent:
+                return 0
             time.sleep(0.05)
     for line in sys.stdin:
         command = line.strip()
