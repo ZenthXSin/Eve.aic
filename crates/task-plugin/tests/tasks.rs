@@ -14,12 +14,20 @@ struct Store {
     inner: FileStateStore,
     fail: AtomicBool,
     fail_after: AtomicBool,
+    hide_ledger: AtomicBool,
+    fail_initialized: AtomicBool,
 }
 impl StateStore for Store {
     fn get(&self, namespace: &PluginId, key: &str) -> PluginResult<Option<Vec<u8>>> {
+        if key == TASK_STATE_KEY && self.hide_ledger.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
         self.inner.get(namespace, key)
     }
     fn set(&self, namespace: &PluginId, key: String, value: Vec<u8>) -> PluginResult<()> {
+        if key == "tasks.initialized.v1" && self.fail_initialized.load(Ordering::SeqCst) {
+            return Err(PluginError::State("private-initialization-detail".into()));
+        }
         if self.fail.load(Ordering::SeqCst) {
             return Err(PluginError::State("private-storage-detail".into()));
         }
@@ -42,6 +50,8 @@ impl World {
             inner: FileStateStore::open(directory.path().join("state")).unwrap(),
             fail: AtomicBool::new(false),
             fail_after: AtomicBool::new(false),
+            hide_ledger: AtomicBool::new(false),
+            fail_initialized: AtomicBool::new(false),
         });
         Self {
             _directory: directory,
@@ -669,6 +679,121 @@ async fn corrupt_unknown_or_inconsistent_ledgers_refuse_to_open_and_keep_bytes()
         .into_bytes();
     world.write(duplicate);
     assert!(world.open().await.is_err());
+}
+
+#[tokio::test]
+async fn initialized_task_ledger_disappearance_is_not_a_fresh_empty_database() {
+    let world = World::new();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let task = tasks
+        .create(&owner("alice"), spec("保留任务"), "kept-source", 10)
+        .unwrap();
+    let original = world.raw().unwrap();
+    kernel.stop_all().await.unwrap();
+    world.state.hide_ledger.store(true, Ordering::SeqCst);
+    assert!(
+        world.open().await.is_err(),
+        "已初始化账本缺失必须拒绝，不能当空状态启动"
+    );
+    world.state.hide_ledger.store(false, Ordering::SeqCst);
+    assert_eq!(world.raw().unwrap(), original, "拒绝启动不能覆盖原始记录");
+    let (kernel, tasks) = world.open().await.unwrap();
+    assert_eq!(tasks.snapshot().unwrap().tasks, vec![task]);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_ledger_is_sealed_only_after_validation_without_changing_queued_records() {
+    let source = World::new();
+    let (kernel, tasks) = source.open().await.unwrap();
+    let task = tasks
+        .create(&owner("alice"), spec("旧账本"), "legacy-source", 10)
+        .unwrap();
+    let original = source.raw().unwrap();
+    kernel.stop_all().await.unwrap();
+    let legacy = World::new();
+    legacy.write(original.clone());
+    let plugin = PluginId::new(TASK_PLUGIN_ID).unwrap();
+    assert!(
+        legacy
+            .state
+            .get(&plugin, "tasks.initialized.v1")
+            .unwrap()
+            .is_none()
+    );
+    let (kernel, tasks) = legacy.open().await.unwrap();
+    assert_eq!(tasks.snapshot().unwrap().tasks, vec![task]);
+    assert_eq!(legacy.raw().unwrap(), original);
+    assert!(
+        legacy
+            .state
+            .get(&plugin, "tasks.initialized.v1")
+            .unwrap()
+            .is_some()
+    );
+    kernel.stop_all().await.unwrap();
+    let corrupt = World::new();
+    corrupt.write(b"not-json-original-evidence".to_vec());
+    assert!(corrupt.open().await.is_err());
+    assert!(
+        corrupt
+            .state
+            .get(&plugin, "tasks.initialized.v1")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(corrupt.raw().unwrap(), b"not-json-original-evidence");
+}
+
+#[tokio::test]
+async fn partial_initialization_and_corrupt_seal_never_clear_or_execute_task_data() {
+    let world = World::new();
+    let plugin = PluginId::new(TASK_PLUGIN_ID).unwrap();
+    world.state.fail_initialized.store(true, Ordering::SeqCst);
+    assert!(
+        world.open().await.is_err(),
+        "标记确认失败不能返回可用控制器"
+    );
+    let empty = world.raw().unwrap();
+    assert!(
+        world
+            .state
+            .get(&plugin, "tasks.initialized.v1")
+            .unwrap()
+            .is_none()
+    );
+    world.state.fail_initialized.store(false, Ordering::SeqCst);
+    let (kernel, tasks) = world.open().await.unwrap();
+    assert!(tasks.snapshot().unwrap().tasks.is_empty());
+    assert_eq!(world.raw().unwrap(), empty, "只补标记，不重写已落盘空账本");
+    let task = tasks
+        .create(&owner("alice"), spec("不可丢弃"), "known-source", 10)
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    let original = world.raw().unwrap();
+    world
+        .state
+        .inner
+        .set(
+            &plugin,
+            "tasks.initialized.v1".into(),
+            b"broken-seal".to_vec(),
+        )
+        .unwrap();
+    assert!(world.open().await.is_err());
+    assert_eq!(world.raw().unwrap(), original);
+    world
+        .state
+        .inner
+        .set(
+            &plugin,
+            "tasks.initialized.v1".into(),
+            br#"{"format_version":1,"ledger":"tasks.v1"}"#.to_vec(),
+        )
+        .unwrap();
+    let (kernel, tasks) = world.open().await.unwrap();
+    assert_eq!(tasks.snapshot().unwrap().tasks, vec![task]);
+    kernel.stop_all().await.unwrap();
 }
 
 #[tokio::test]
