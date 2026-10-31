@@ -38,22 +38,33 @@ struct CapturedModel {
 }
 struct CachedModel {
     captured: CapturedModel,
+    credential_version: u64,
     selected: ModelSelection,
 }
 
 /// 凭据只在宿主启动时提供；缓存至多一份已校验选择，不实现 Debug。
 pub(crate) struct CoreModelResolver {
     settings: Arc<dyn ConfigService>,
-    api_key: String,
+    credentials: Result<Arc<dyn eve_llm_api::ModelCredentials>, eve_llm_api::CredentialError>,
     use_name: Option<String>,
     timeout_cap: Option<Duration>,
     cached: Mutex<Option<CachedModel>>,
 }
 impl CoreModelResolver {
     pub(crate) fn new(settings: Arc<dyn ConfigService>, api_key: String) -> Self {
+        Self::from_credentials(
+            settings,
+            crate::model_credentials::bank(eve_llm_api::CredentialPurpose::Primary, api_key),
+        )
+    }
+
+    pub(crate) fn from_credentials(
+        settings: Arc<dyn ConfigService>,
+        credentials: Result<Arc<dyn eve_llm_api::ModelCredentials>, eve_llm_api::CredentialError>,
+    ) -> Self {
         Self {
             settings,
-            api_key,
+            credentials,
             use_name: None,
             timeout_cap: None,
             cached: Mutex::new(None),
@@ -253,12 +264,26 @@ fn stream_timeout_policy(first: Duration) -> Result<StreamTimeoutPolicy, LlmErro
 impl LlmModelResolver for CoreModelResolver {
     fn resolve(&self) -> Result<ModelSelection, LlmError> {
         let captured = self.capture()?;
+        let credentials = self
+            .credentials
+            .as_ref()
+            .map_err(|error| LlmError::Configuration(error.to_string()))?;
+        let credential = crate::model_credentials::resolve(
+            credentials.as_ref(),
+            eve_llm_api::CredentialPurpose::Primary,
+            captured
+                .primary
+                .as_ref()
+                .and_then(|profile| profile.credential_ref.as_deref()),
+        )
+        .map_err(|error| LlmError::Configuration(error.to_string()))?;
         let mut cached = self
             .cached
             .lock()
             .map_err(|_| LlmError::Backend("模型 Provider 缓存不可用".into()))?;
         if let Some(previous) = cached.as_ref()
             && previous.captured == captured
+            && previous.credential_version == credential.version()
         {
             return Ok(previous.selected.clone());
         }
@@ -275,7 +300,7 @@ impl LlmModelResolver for CoreModelResolver {
         // 留给适配器先返回分阶段诊断；外层只作为略晚的安全期限。
         let provider_timeout =
             stream_timeouts.map_or(config.request_timeout, |p| p.total + Duration::from_secs(1));
-        let mut provider = OpenAiProvider::new(config, &self.api_key)?;
+        let mut provider = OpenAiProvider::new(config, credential.expose())?;
         if let Some(policy) = stream_timeouts {
             if timing_enabled() {
                 eprintln!(
@@ -320,6 +345,7 @@ impl LlmModelResolver for CoreModelResolver {
         };
         *cached = Some(CachedModel {
             captured,
+            credential_version: credential.version(),
             selected: selected.clone(),
         });
         Ok(selected)

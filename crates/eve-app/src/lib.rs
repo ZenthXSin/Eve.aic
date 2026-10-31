@@ -17,6 +17,7 @@ mod layered_context;
 mod memory_cli;
 mod memory_cli_view;
 mod message_evaluation;
+mod model_credentials;
 mod models;
 mod qq_access;
 mod qq_admin;

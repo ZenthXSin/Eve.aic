@@ -1054,6 +1054,54 @@ async fn output_failure_preserves_committed_tool_report_and_allows_reopen() {
 }
 
 #[tokio::test]
+async fn explicit_host_credential_reference_survives_process_restart_without_persisting_secret() {
+    let root = fixture();
+    let mut server = Server::start(vec![
+        Reply::json(final_response("第一轮完成")),
+        Reply::json(final_response("重启后完成")),
+    ])
+    .await;
+    for text in ["第一轮输入\n", "重启后输入\n"] {
+        let mut configured = command(root.path(), &server.url);
+        configured
+            .env("EVE_OPENAI_MODEL_ROLE", "primary")
+            .env("EVE_MODELS_PRIMARY_ENABLED", "true")
+            .env("EVE_MODELS_PRIMARY_PROVIDER", "openai")
+            .env("EVE_MODELS_PRIMARY_MODEL", "explicit-reference-model")
+            .env(
+                "EVE_MODELS_PRIMARY_CREDENTIAL_REF",
+                "env:EVE_OPENAI_API_KEY",
+            );
+        let result = run(configured, text).await;
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let request = server.next().await;
+        assert_eq!(request.body["model"], "explicit-reference-model");
+        assert!(
+            request
+                .headers
+                .to_lowercase()
+                .contains("authorization: bearer fixture-key\r\n")
+        );
+        assert!(!String::from_utf8_lossy(&result.stdout).contains("fixture-key"));
+        assert!(!String::from_utf8_lossy(&result.stderr).contains("fixture-key"));
+    }
+    let state = std::fs::read_to_string(root.path().join("state/state.json")).unwrap();
+    assert!(!state.contains("fixture-key"));
+    assert_eq!(
+        sessions(root.path())["sessions"]["default"]["turns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(server.requests.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn rejected_primary_role_never_calls_model_or_changes_completed_state() {
     let root = fixture();
     let mut server = Server::start(vec![Reply::json(final_response("已保存历史"))]).await;

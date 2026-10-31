@@ -239,13 +239,26 @@ pub(crate) fn configured(
         if profile.provider != "openai" {
             return Err("语义模型角色的提供者须为 openai".into());
         }
-        let key = match profile.credential_ref.as_deref() {
-            None | Some("env:EVE_OPENAI_API_KEY") => api_key,
-            Some("env:EVE_SEMANTIC_API_KEY") => semantic_api_key
-                .filter(|key| !key.trim().is_empty())
-                .ok_or("已选择独立语义凭据，但 EVE_SEMANTIC_API_KEY 为空")?,
-            Some(_) => return Err("语义模型只支持宿主提供的主模型或独立语义凭据引用".into()),
+        let purpose = eve_llm_api::CredentialPurpose::Semantic;
+        let reference =
+            crate::model_credentials::reference(purpose, profile.credential_ref.as_deref())
+                .map_err(|_| "语义模型只支持宿主提供的主模型或独立语义凭据引用")?;
+        let key = match reference {
+            crate::model_credentials::PRIMARY => Some(api_key),
+            crate::model_credentials::SEMANTIC => semantic_api_key,
+            _ => return Err("语义模型凭据绑定不可用".into()),
         };
+        let bank = eve_model_credentials::CredentialBank::default();
+        bank.bind(purpose, reference, key.map(str::to_owned))?;
+        let credential = crate::model_credentials::resolve(&bank, purpose, Some(reference))
+            .map_err(|error| match error {
+                eve_llm_api::CredentialError::Missing
+                    if reference == crate::model_credentials::SEMANTIC =>
+                {
+                    "已选择独立语义凭据，但 EVE_SEMANTIC_API_KEY 为空".to_owned()
+                }
+                _ => error.to_string(),
+            })?;
         let semantic_base: String = provider.get("semantic_base_url")?;
         let base = if semantic_base.is_empty() {
             provider.get("base_url")?
@@ -258,7 +271,7 @@ pub(crate) fn configured(
                 model: profile.model.clone(),
                 dimensions,
             },
-            key,
+            credential.expose(),
             Duration::from_millis(profile.timeout_ms),
         )
         .map_err(|_| "语义模型配置无效：模型、维度、端点或凭据不符合要求".into());

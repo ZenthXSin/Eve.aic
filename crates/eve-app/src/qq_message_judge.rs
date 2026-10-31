@@ -148,6 +148,7 @@ struct CapturedJev {
 }
 
 struct CachedJev {
+    credential_version: u64,
     captured: CapturedJev,
     judge: Arc<JevRelationJudge>,
 }
@@ -155,7 +156,7 @@ struct CachedJev {
 /// 只保存宿主启动时读取的独立 Jev 凭据；不实现 Debug，不解析任意凭据引用。
 pub(crate) struct JevRoleJudge {
     settings: Arc<dyn ConfigService>,
-    api_key: String,
+    credentials: Result<Arc<dyn eve_llm_api::ModelCredentials>, eve_llm_api::CredentialError>,
     cached: Mutex<Option<CachedJev>>,
 }
 
@@ -191,7 +192,10 @@ impl JevRoleJudge {
     fn new(settings: Arc<dyn ConfigService>, api_key: String) -> Self {
         Self {
             settings,
-            api_key,
+            credentials: crate::model_credentials::bank(
+                eve_llm_api::CredentialPurpose::Jev,
+                api_key,
+            ),
             cached: Mutex::new(None),
         }
     }
@@ -216,10 +220,11 @@ impl JevRoleJudge {
                 .map_err(|_| JevConfigurationError)?
                 .clone();
             if profile.provider != "jev"
-                || profile
-                    .credential_ref
-                    .as_deref()
-                    .is_some_and(|reference| reference != "env:EVE_JEV_API_KEY")
+                || crate::model_credentials::reference(
+                    eve_llm_api::CredentialPurpose::Jev,
+                    profile.credential_ref.as_deref(),
+                )
+                .is_err()
                 || profile.max_output_tokens.is_some()
             {
                 return Err(JevConfigurationError);
@@ -235,9 +240,20 @@ impl JevRoleJudge {
 
     fn resolve(&self) -> Result<Arc<JevRelationJudge>, JevConfigurationError> {
         let captured = self.capture()?;
+        let credentials = self
+            .credentials
+            .as_ref()
+            .map_err(|_| JevConfigurationError)?;
+        let credential = crate::model_credentials::resolve(
+            credentials.as_ref(),
+            eve_llm_api::CredentialPurpose::Jev,
+            captured.profile.credential_ref.as_deref(),
+        )
+        .map_err(|_| JevConfigurationError)?;
         let mut cached = self.cached.lock().map_err(|_| JevConfigurationError)?;
         if let Some(previous) = cached.as_ref()
             && previous.captured == captured
+            && previous.credential_version == credential.version()
         {
             return Ok(previous.judge.clone());
         }
@@ -250,9 +266,10 @@ impl JevRoleJudge {
             timeout: Duration::from_millis(captured.profile.timeout_ms),
             max_concurrent_requests: captured.profile.max_concurrent_requests,
         };
-        let judge = Arc::new(JevRelationJudge::new(config, &self.api_key)?);
+        let judge = Arc::new(JevRelationJudge::new(config, credential.expose())?);
         *cached = Some(CachedJev {
             captured,
+            credential_version: credential.version(),
             judge: judge.clone(),
         });
         Ok(judge)

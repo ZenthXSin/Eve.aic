@@ -17,7 +17,8 @@ class ModelSwitchAcceptance(developer.DeveloperAcceptance):
                'EVE_OPENAI_MODEL': 'direct-a', 'EVE_OPENAI_MODEL_ROLE': 'primary' if role else ''}
         if role:
             env.update(EVE_MODELS_PRIMARY_ENABLED='true', EVE_MODELS_PRIMARY_PROVIDER='openai',
-                       EVE_MODELS_PRIMARY_MODEL='role-a', EVE_MODELS_PRIMARY_MAX_OUTPUT_TOKENS='128')
+                       EVE_MODELS_PRIMARY_MODEL='role-a', EVE_MODELS_PRIMARY_MAX_OUTPUT_TOKENS='128',
+                       EVE_MODELS_PRIMARY_CREDENTIAL_REF='env:EVE_OPENAI_API_KEY')
         return self.run_eve(script, interest=False, memory=False, research=False, practice=False,
                             env_extra=env, **options)
 

@@ -10,6 +10,8 @@ pub use prompt::{
 
 use eve_plugin_api::{Permission, PluginId, ServiceId};
 mod budget;
+mod credentials;
+pub use credentials::{CredentialError, CredentialLease, CredentialPurpose, ModelCredentials};
 mod failure;
 mod history;
 mod image;
