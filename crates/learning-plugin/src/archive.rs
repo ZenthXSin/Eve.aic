@@ -68,7 +68,11 @@ impl LearningArchiveStore for FileLearningArchive {
         }
         if target.symlink_metadata().is_ok() {
             self.get(hash)?;
-            File::open(&target)
+            // Windows 的 FlushFileBuffers 要求写句柄；仅同步，绝不改写已验证的正文。
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(cfg!(windows))
+                .open(&target)
                 .and_then(|f| f.sync_all())
                 .map_err(|_| LearningError::Storage)?;
             #[cfg(unix)]

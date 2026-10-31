@@ -4,8 +4,8 @@ use eve_cognition_loop_plugin::ReflectionPlannerFactory;
 use eve_kernel::{Kernel, KernelServices, backends::FileStateStore};
 use eve_learning_api::{
     AutoConfirmationPolicy, CandidateDraft, JobStatus, LEARNING_PLUGIN_ID, LEARNING_STATE_KEY,
-    LearningBatch, LearningFuture, LearningJob, LearningResult, PreferenceCandidate,
-    PreferenceExtractor,
+    LearningArchiveStore, LearningBatch, LearningFuture, LearningJob, LearningResult,
+    PreferenceCandidate, PreferenceExtractor,
 };
 use eve_llm_api::{ChatMessage, ChatRole};
 use eve_memory_api::{
@@ -31,6 +31,8 @@ const SECRET: &str = "qq-learning-component-fixture-secret";
 const BRIDGE: &str = r#"
 import fs from 'node:fs';
 import net from 'node:net';
+import path from 'node:path';
+import crypto from 'node:crypto';
 import readline from 'node:readline';
 const [started, stopped, state, mode] = process.argv.slice(2);
 const probe = net.createServer();
@@ -47,7 +49,15 @@ probe.listen(0, '127.0.0.1', () => {
   if (mode === 'success' || mode === 'automatic') setInterval(() => {
     const entries = JSON.parse(fs.readFileSync(state)).entries;
     const bytes = entries['eve.learning']?.['learning.v1'];
-    if (bytes && JSON.parse(Buffer.from(bytes)).jobs.some(item => item.job.status === 'Completed')) {
+    const document = bytes && JSON.parse(Buffer.from(bytes));
+    const jobs = document?.format_version === 2 ? document.records.map(ref => {
+      if (!/^[0-9a-f]{64}$/.test(ref.hash)) throw new Error('invalid archive reference');
+      const raw = fs.readFileSync(path.join(path.dirname(state), 'learning-archive', ref.hash + '.json'));
+      if (raw.length !== ref.bytes || crypto.createHash('sha256').update(raw).digest('hex') !== ref.hash)
+        throw new Error('archive mismatch');
+      return JSON.parse(raw);
+    }) : document?.jobs;
+    if (jobs && jobs.some(item => item.job.status === 'Completed')) {
       if (mode === 'automatic') {
         const memory = JSON.parse(Buffer.from(entries['eve.memory']['memory.v1']));
         if (!memory.scopes.some(s => s.snapshot.preferences.length)) return;
@@ -184,7 +194,25 @@ fn stored(directory: &Path, owner: &str, key: &str) -> Option<Value> {
         serde_json::from_slice(&std::fs::read(directory.join("state.json")).unwrap()).unwrap();
     let bytes: Vec<u8> =
         serde_json::from_value(state["entries"].get(owner)?.get(key)?.clone()).unwrap();
-    Some(serde_json::from_slice(&bytes).unwrap())
+    let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+    if owner == LEARNING_PLUGIN_ID && key == LEARNING_STATE_KEY && value["format_version"] == 2 {
+        assert_eq!(value["kind"], "jobs");
+        let archive =
+            eve_learning_plugin::FileLearningArchive::open(directory.join("learning-archive"))
+                .unwrap();
+        let jobs: Vec<Value> = value["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| {
+                let bytes = archive.get(record["hash"].as_str().unwrap()).unwrap();
+                assert_eq!(bytes.len() as u64, record["bytes"].as_u64().unwrap());
+                serde_json::from_slice(&bytes).unwrap()
+            })
+            .collect();
+        value = serde_json::json!({"format_version": 1, "jobs": jobs});
+    }
+    Some(value)
 }
 
 async fn seed_memory(directory: &Path) -> MemorySnapshot {
