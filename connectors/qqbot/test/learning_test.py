@@ -182,7 +182,7 @@ class LearningAcceptance(unittest.TestCase):
 
     def run_eve(self, script, learning=True, memory=True, cognition=False, training=False,
                 app="1904159860", checkpoints=None, stop_at=None, abrupt=False, segmented=False, self_learning=False, cooldown_ms=None,
-                panel=False):
+                panel=False, env_extra=None):
         self.runs += 1
         self.run_release = threading.Event()
         events_path = self.work / f"events-{self.runs}.jsonl"
@@ -197,6 +197,7 @@ class LearningAcceptance(unittest.TestCase):
                    EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete",
                    # 分段节奏偏好按自然段规划验收；按句分条见 segment_test。
                    EVE_CHAT_SENTENCE_SPLIT="false")
+        env.update(env_extra or {})
         command = [str(BINARY), "--state-dir", str(self.work / "state"),
                    "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
                    "--bridge-arg", str(scenario)]
@@ -697,7 +698,7 @@ class LearningAcceptance(unittest.TestCase):
                 self.learning_response = mode
                 requests_before = len(self.learning_requests())
                 self.seed()
-                self.inspect_run(lambda: self.wait_jobs(1, expected))
+                self.inspect_run(lambda: self.wait_jobs(1, expected), env_extra={"EVE_OPENAI_TRANSIENT_RETRIES":"true"})
                 self.assertEqual(self.jobs()[0]["candidates"], [])
                 before = self.learning_bytes()
                 memory_before = self.memory()
