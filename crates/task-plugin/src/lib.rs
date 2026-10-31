@@ -96,6 +96,16 @@ impl TaskAdmin for TaskController {
         now_ms: u64,
     ) -> TaskResult<Task> {
         self.service()?
+            .checkpoint(id, checkpoint, Some(deadline_at_ms), now_ms)
+    }
+    fn checkpoint_with_deadline(
+        &self,
+        id: &str,
+        checkpoint: eve_llm_api::TurnCheckpoint,
+        deadline_at_ms: Option<u64>,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        self.service()?
             .checkpoint(id, checkpoint, deadline_at_ms, now_ms)
     }
     fn retry(&self, id: &str, now_ms: u64) -> TaskResult<Task> {

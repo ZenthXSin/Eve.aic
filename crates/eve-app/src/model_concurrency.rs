@@ -8,6 +8,7 @@ struct Scope {
     settings: Weak<dyn ConfigService>,
     primary: Weak<ConcurrencyGate>,
     auxiliary: Weak<ConcurrencyGate>,
+    global: Weak<ConcurrencyGate>,
 }
 static SCOPES: Mutex<Vec<Scope>> = Mutex::new(Vec::new());
 
@@ -38,6 +39,7 @@ pub(crate) fn gate(
     limit: usize,
     revision: u64,
 ) -> Result<Arc<ConcurrencyGate>, LlmError> {
+    let limit = limit.min(5);
     let mut scopes = SCOPES
         .lock()
         .map_err(|_| LlmError::Backend("模型并发目录不可用".into()))?;
@@ -53,6 +55,7 @@ pub(crate) fn gate(
             settings: identity,
             primary: Weak::new(),
             auxiliary: Weak::new(),
+            global: Weak::new(),
         });
         scopes.len() - 1
     };
@@ -71,5 +74,34 @@ pub(crate) fn gate(
     }
     let gate = ConcurrencyGate::new(limit, revision)?;
     *slot = Arc::downgrade(&gate);
+    Ok(gate)
+}
+
+/// 所有主/辅用途共用五个实际请求槽，旧的大额配置仍可读取但不会绕过此上限。
+pub(crate) fn global(settings: &Arc<dyn ConfigService>) -> Result<Arc<ConcurrencyGate>, LlmError> {
+    let mut scopes = SCOPES
+        .lock()
+        .map_err(|_| LlmError::Backend("模型并发目录不可用".into()))?;
+    scopes.retain(|scope| scope.settings.strong_count() != 0);
+    let identity = Arc::downgrade(settings);
+    let index = if let Some(index) = scopes
+        .iter()
+        .position(|scope| scope.settings.ptr_eq(&identity))
+    {
+        index
+    } else {
+        scopes.push(Scope {
+            settings: identity,
+            primary: Weak::new(),
+            auxiliary: Weak::new(),
+            global: Weak::new(),
+        });
+        scopes.len() - 1
+    };
+    if let Some(gate) = scopes[index].global.upgrade() {
+        return Ok(gate);
+    }
+    let gate = ConcurrencyGate::new(5, 0)?;
+    scopes[index].global = Arc::downgrade(&gate);
     Ok(gate)
 }

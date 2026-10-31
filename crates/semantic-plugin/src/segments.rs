@@ -23,7 +23,7 @@ const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DECODED_BYTES: u64 = 32 * 1024 * 1024;
 /// 解开后缓存的分段数上限；按最近使用淘汰，只影响读取速度。
 const CACHED_SEGMENTS: usize = 256;
-const CACHED_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+const CACHED_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SegmentError {

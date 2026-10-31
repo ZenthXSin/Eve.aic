@@ -3,7 +3,7 @@ use crate::{ChatMessage, ContextScope, LlmError, ModelRequest, ToolCall};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-pub const MAX_CHECKPOINT_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_CHECKPOINT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn checkpoint_counts_escaped_bytes_rather_than_raw_text_length() {
         let mut checkpoint = checkpoint();
-        let text = "\"\\\n猫".repeat(240_000);
+        let text = "\"\\\n猫".repeat(MAX_CHECKPOINT_BYTES / 8);
         assert!(text.len() < MAX_CHECKPOINT_BYTES);
         checkpoint.messages[0].text = Some(text);
         assert!(serde_json::to_vec(&checkpoint).unwrap().len() > MAX_CHECKPOINT_BYTES);

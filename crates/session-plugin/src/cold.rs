@@ -2,7 +2,8 @@
 use super::*;
 use crate::archive::{key as hash, valid};
 
-const MAX_INDEX_BYTES: usize = 32 * 1024 * 1024;
+const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LEGACY_INDEX_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
@@ -61,7 +62,7 @@ fn load(
 }
 fn freeze(store: &dyn SessionArchiveStore, turn: &SessionTurn) -> SessionResult<Record> {
     let bytes = serde_json::to_vec(turn).map_err(|_| SessionError::CorruptState)?;
-    if bytes.len() > MAX_SESSION_ARCHIVE_RECORD_BYTES {
+    if bytes.len() > eve_session_api::MAX_SESSION_ARCHIVE_WRITE_BYTES {
         return Err(SessionError::LimitReached);
     }
     let hash = hash(&bytes);
@@ -164,7 +165,7 @@ impl ColdSessions {
                     .and_then(serde_json::Value::as_u64)
                 {
                     Some(2) => {
-                        if bytes.len() > MAX_INDEX_BYTES {
+                        if bytes.len() > MAX_LEGACY_INDEX_BYTES {
                             return Err(SessionError::LimitReached);
                         }
                         serde_json::from_value(value).map_err(|_| SessionError::CorruptState)?

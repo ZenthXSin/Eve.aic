@@ -71,7 +71,7 @@ class ModelHealthAcceptance(interest_test.InterestAcceptance):
             self.assertEqual(model["protocol"], "chat")
             self.assertTrue(model["model"])
             self.assertEqual(model["max_output_tokens_key"], "provider.openai.max_output_tokens")
-            self.assertIsInstance(model["max_output_tokens"], int)
+            self.assertIsNone(model["max_output_tokens"], "默认不额外指定输出 token 上限")
             self.assertNotEqual(model["max_output_tokens"], DIALOGUE_LIMIT)
             self.assertIn(model["max_output_tokens_source"], ("environment", "default"))
             dialogue = self.dialogue(body)

@@ -487,3 +487,62 @@ async fn concurrent_same_revision_allows_one_writer_and_keeps_no_lost_updates() 
     assert_eq!(admin.versions(&owner(), None, 64).unwrap().len(), 1);
     kernel.stop_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn large_notes_are_durable_but_rendering_and_read_pages_are_bounded_and_splices_use_cas() {
+    let world = World::new();
+    let (kernel, admin) = world.open().await.unwrap();
+    let own = owner();
+    let text = "中文内容".repeat(100_000);
+    let view = admin.update(&own, 0, &text).unwrap();
+    assert_eq!(view.text, text);
+    let rendered = view.rendered().unwrap().unwrap();
+    assert!(rendered.len() < MAX_NOTE_PAGE_BYTES * 7);
+    assert!(rendered.contains("\"truncated\":true"));
+    let operation = ContextOperation::ReadRange {
+        revision: 1,
+        offset: 0,
+        limit: MAX_NOTE_PAGE_BYTES,
+    };
+    let reply = admin.apply(&own, &operation).unwrap();
+    reply.validate_for(&own, &operation).unwrap();
+    let ContextReply::Range { page } = reply else {
+        panic!("分页回执")
+    };
+    assert_eq!(page.text, text[..page.text.len()]);
+    assert_eq!(page.next_offset, Some(page.text.len()));
+    assert!(
+        admin
+            .apply(
+                &own,
+                &ContextOperation::ReadRange {
+                    revision: 1,
+                    offset: 1,
+                    limit: 10
+                }
+            )
+            .is_err()
+    );
+    let append = ContextOperation::Splice {
+        expected_revision: 1,
+        start: text.len(),
+        end: text.len(),
+        text: "\n新证据".into(),
+    };
+    admin
+        .apply(&own, &append)
+        .unwrap()
+        .validate_for(&own, &append)
+        .unwrap();
+    assert!(matches!(
+        admin.apply(&own, &append),
+        Err(ContextError::StaleRevision)
+    ));
+    // 固定修订的分页不混入新版本。
+    let old = admin.read_version(&own, 1).unwrap();
+    assert_eq!(old.text, text);
+    kernel.stop_all().await.unwrap();
+    let (kernel, admin) = world.open().await.unwrap();
+    assert_eq!(admin.inspect(&own).unwrap().text, format!("{text}\n新证据"));
+    kernel.stop_all().await.unwrap();
+}

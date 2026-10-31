@@ -41,6 +41,12 @@ impl AutonomyBudget for BudgetController {
     fn snapshot(&self, now_ms: u64) -> BudgetResult<BudgetSnapshot> {
         self.service()?.snapshot(now_ms)
     }
+    fn begin_request(&self, category: &str, now_ms: u64) -> BudgetResult<u64> {
+        self.service()?.begin_request(category, now_ms)
+    }
+    fn settle_request(&self, id: u64, success: bool) -> BudgetResult<()> {
+        self.service()?.settle_request(id, success)
+    }
     fn reserve(&self, category: &str, count: u32, now_ms: u64) -> BudgetResult<u32> {
         self.service()?.reserve(category, count, now_ms)
     }
@@ -161,9 +167,12 @@ struct BudgetedProvider {
     category: String,
 }
 impl BudgetedProvider {
-    fn admit(&self) -> Result<(), LlmError> {
-        match self.budget.reserve(&self.category, 1, now_ms()) {
-            Ok(_) => Ok(()),
+    fn admit(&self) -> Result<RequestGuard, LlmError> {
+        match self.budget.begin_request(&self.category, now_ms()) {
+            Ok(id) => Ok(RequestGuard {
+                budget: self.budget.clone(),
+                id: Some(id),
+            }),
             Err(BudgetError::Exhausted { resets_at_ms }) => {
                 eprintln!(
                     "EVE_BUDGET category={} reason=total_exhausted resets_at_ms={resets_at_ms}",
@@ -187,14 +196,18 @@ impl BudgetedProvider {
 impl LlmProvider for BudgetedProvider {
     fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
         Box::pin(async move {
-            self.admit()?;
-            self.inner.complete(request).await
+            let lease = self.admit()?;
+            let result = self.inner.complete(request).await;
+            lease.finish(result.is_ok())?;
+            result
         })
     }
     fn complete_json(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
         Box::pin(async move {
-            self.admit()?;
-            self.inner.complete_json(request).await
+            let lease = self.admit()?;
+            let result = self.inner.complete_json(request).await;
+            lease.finish(result.is_ok())?;
+            result
         })
     }
     fn stream<'a>(
@@ -203,8 +216,34 @@ impl LlmProvider for BudgetedProvider {
         sink: &'a dyn ModelTextSink,
     ) -> LlmFuture<'a, ModelResponse> {
         Box::pin(async move {
-            self.admit()?;
-            self.inner.stream(request, sink).await
+            let lease = self.admit()?;
+            let result = self.inner.stream(request, sink).await;
+            lease.finish(result.is_ok())?;
+            result
         })
+    }
+}
+
+struct RequestGuard {
+    budget: Arc<dyn AutonomyBudget>,
+    id: Option<u64>,
+}
+impl RequestGuard {
+    fn finish(mut self, success: bool) -> Result<(), LlmError> {
+        let id = self
+            .id
+            .take()
+            .ok_or_else(|| LlmError::Backend("模型预算预留缺失".into()))?;
+        self.budget.settle_request(id, success).map_err(|_| {
+            LlmError::Backend("模型预算结算未确认；停止后续请求，须重新打开核对".into())
+        })
+    }
+}
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            // Future 被取消也释放预留；提交不确定由账本关闭句柄，不能再次发送。
+            let _ = self.budget.settle_request(id, false);
+        }
     }
 }

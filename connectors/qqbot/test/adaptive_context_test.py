@@ -26,7 +26,7 @@ class AdaptiveContextAcceptance(compact.ContextCompactionAcceptance):
         for i in range(13):
             script.extend(self.send(self.message('long-'+str(i), '第'+str(i)+'轮', expected=large_reply)))
         # 这里只测请求副本的主动压缩；后台持久摘要由 history_digest_test 独立验收。
-        env = {'EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS': '200000', 'EVE_HISTORY_DIGEST_ENABLED': 'false'}
+        env = {'EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS': '200000', 'EVE_HISTORY_MAX_BYTES': '65536', 'EVE_HISTORY_DIGEST_ENABLED': 'false'}
         self.run_window(script, panel=True, env_extra=env, timeout=90)
         count = len(self.digest_requests())
         self.assertEqual(count, 0, '按需装载已能容纳时不强制发摘要模型请求')

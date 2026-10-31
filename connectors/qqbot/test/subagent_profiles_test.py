@@ -76,13 +76,22 @@ class SubagentProfilesAcceptance(developer.DeveloperAcceptance):
         entered = []
         condition = threading.Condition()
         used = []
+        active = peak = 0
         def respond(body):
+            nonlocal active, peak
             results = self.results(body)
             if self.leaf(body):
                 if not results and body.get('tools'):
                     with condition:
+                        active += 1
+                        peak = max(peak, active)
                         entered.append(self.text(body));condition.notify_all()
-                        self.assertTrue(condition.wait_for(lambda:len(entered)==10,timeout=12))
+                        # 十个子代理共用五个实际模型槽，按两批请求核验共享步骤。
+                        target = ((len(entered) - 1) // 5 + 1) * 5
+                        try:
+                            self.assertTrue(condition.wait_for(lambda:len(entered)>=target,timeout=12))
+                        finally:
+                            active -= 1
                     return calls(*[(f'echo-{i}','echo',{'text':str(i)}) for i in range(10)])
                 return text_response('依据已有回执收尾')
             if not results:
@@ -94,6 +103,7 @@ class SubagentProfilesAcceptance(developer.DeveloperAcceptance):
         self.callback = respond
         self.enabled(self.send(self.message('shared','并行核验十项',expected='共享步数已用尽')))
         self.assertEqual(len(entered),10)
+        self.assertEqual(peak,5,'模型实际请求合计上限为五，子代理仍有十个槽')
         self.assertEqual(sum(used),90,'主代理十次委派与子代理九十次工具调用共一百步')
 
     def test_background_worker_can_delegate_and_checkpoints_include_child_steps(self):

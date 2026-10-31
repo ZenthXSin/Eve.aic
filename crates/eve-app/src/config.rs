@@ -154,14 +154,14 @@ pub(crate) fn openai_schema() -> ConfigSchema {
                 "timeout_seconds".into(),
                 integer(120, 600, "EVE_OPENAI_TIMEOUT_SECONDS"),
             ),
-            (
-                "max_output_tokens".into(),
-                integer(
-                    2048,
-                    MAX_OUTPUT_TOKENS_LIMIT,
-                    "EVE_OPENAI_MAX_OUTPUT_TOKENS",
-                ),
-            ),
+            ("max_output_tokens".into(), {
+                let mut field = integer(0, MAX_OUTPUT_TOKENS_LIMIT, "EVE_OPENAI_MAX_OUTPUT_TOKENS");
+                field.kind = ConfigKind::Integer {
+                    minimum: Some(0),
+                    maximum: Some(MAX_OUTPUT_TOKENS_LIMIT),
+                };
+                field
+            }),
         ]),
     }
 }
@@ -236,7 +236,7 @@ pub(crate) fn history_schema() -> ConfigSchema {
         fields: BTreeMap::from([
             (
                 "adaptive_limit_tokens".into(),
-                field(200000, 0, 1000000, "EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS"),
+                field(275000, 0, 1000000, "EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS"),
             ),
             (
                 "compact_at_tokens".into(),
@@ -260,7 +260,7 @@ pub(crate) fn history_schema() -> ConfigSchema {
             ),
             (
                 "max_bytes".into(),
-                field(65536, 1024, 8388608, "EVE_HISTORY_MAX_BYTES"),
+                field(16777216, 1024, 16777216, "EVE_HISTORY_MAX_BYTES"),
             ),
         ]),
     }
@@ -440,7 +440,8 @@ pub(crate) fn provider_config_for(
         config.max_output_tokens = profile.max_output_tokens;
     } else {
         config.request_timeout = Duration::from_secs(snapshot.get("timeout_seconds")?);
-        config.max_output_tokens = Some(snapshot.get("max_output_tokens")?);
+        let limit: u32 = snapshot.get("max_output_tokens")?;
+        config.max_output_tokens = (limit != 0).then_some(limit);
     }
     let effort: String = snapshot.get("reasoning_effort")?;
     config.reasoning_effort = if effort.is_empty() {
@@ -645,7 +646,7 @@ mod tests {
         let legacy = provider_config(&direct, None).unwrap();
         assert_eq!(legacy.model, "deepseek-v4.1-flash");
         assert_eq!(legacy.request_timeout, Duration::from_secs(120));
-        assert_eq!(legacy.max_output_tokens, Some(2048));
+        assert_eq!(legacy.max_output_tokens, None);
         let mut primary = profile();
         let selected = provider_config(&direct, Some(&primary)).unwrap();
         assert_eq!(selected.model, "role-model");
