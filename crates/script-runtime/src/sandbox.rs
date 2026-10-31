@@ -14,6 +14,7 @@ pub struct Bubblewrap {
     pub node: PathBuf,
     pub(crate) container: Option<crate::ContainerSandbox>,
     pub(crate) rustc: Option<PathBuf>,
+    pub(crate) cargo: Option<std::sync::Arc<crate::CargoCompiler>>,
     pub(crate) rust_cache: std::sync::Arc<
         std::sync::Mutex<
             std::collections::BTreeMap<String, std::sync::Arc<crate::compiler::CompiledRust>>,
@@ -28,6 +29,7 @@ impl Bubblewrap {
             node: node.into(),
             container: None,
             rustc: None,
+            cargo: None,
             rust_cache: Default::default(),
         }
     }
@@ -35,6 +37,19 @@ impl Bubblewrap {
         self.rustc = Some(rustc.into());
         self.rust_cache = Default::default();
         self
+    }
+    pub fn with_cargo(mut self, compiler: std::sync::Arc<crate::CargoCompiler>) -> Self {
+        self.cargo = Some(compiler);
+        self
+    }
+    /// 只报告可信宿主配置，不访问提供商、不检查daemon健康，也不授予执行权限。
+    pub fn cargo_configuration(&self) -> serde_json::Value {
+        match &self.cargo {
+            Some(compiler) => {
+                serde_json::json!({"configured":true,"bundle_sha256":compiler.bundle_sha256(),"availability_verified":false,"network":false,"exact_dependency_versions_required":true})
+            }
+            None => serde_json::json!({"configured":false,"availability_verified":false}),
+        }
     }
     /// 只能由可信宿主配置；参数不经过插件/模型输入。
     pub fn with_container(mut self, container: crate::ContainerSandbox) -> Self {
@@ -65,6 +80,12 @@ impl Bubblewrap {
                 .rustc
                 .as_ref()
                 .ok_or_else(|| reject("未配置可信Rust编译器"))?,
+            Language::RustCargo(_) => {
+                self.cargo
+                    .as_ref()
+                    .ok_or_else(|| reject("未配置可信离线Cargo编译器"))?;
+                &self.bwrap
+            }
         };
         for path in [&self.bwrap, executable] {
             if !path.is_absolute() || !path.is_file() {
@@ -82,7 +103,13 @@ impl Bubblewrap {
         if let Some(container) = &self.container {
             return container.spawn(version, source, work);
         }
-        self.preflight(&version.spec.language)?;
+        let cargo = if version.spec.language == Language::Rust {
+            crate::cargo_model::decoded_source(&version.spec.source)?
+                .map(|(settings, _)| Language::RustCargo(settings))
+        } else {
+            None
+        };
+        self.preflight(cargo.as_ref().unwrap_or(&version.spec.language))?;
         let mut command = Command::new(&self.bwrap);
         #[cfg(target_os = "linux")]
         let filter = syscall_filter()?;
@@ -177,7 +204,7 @@ impl Bubblewrap {
             .arg("/entry")
             .args(["--chdir", "/work"]);
         match version.spec.language {
-            Language::Rust => {
+            Language::Rust | Language::RustCargo(_) => {
                 command.args(["--", "/entry"]);
             }
             Language::Python => {

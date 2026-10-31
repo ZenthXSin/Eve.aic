@@ -29,6 +29,12 @@ pub enum Language {
     Python,
     Javascript,
     Rust,
+    RustCargo(crate::CargoSettings),
+}
+impl Language {
+    pub fn is_rust(&self) -> bool {
+        matches!(self, Self::Rust | Self::RustCargo(_))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +107,19 @@ pub struct ScriptSpec {
 }
 impl ScriptSpec {
     pub fn validate(&self) -> Result<()> {
+        if self.language == Language::Rust {
+            crate::cargo_model::decoded_source(&self.source)?;
+        }
+        if let Language::RustCargo(settings) = &self.language {
+            settings.project(&self.source).validate()?;
+            if settings
+                .artifact_sha256
+                .as_deref()
+                .is_some_and(|v| !crate::cargo_model::valid_digest(v))
+            {
+                return Err(reject("Cargo产物绑定摘要无效"));
+            }
+        }
         valid_name(&self.name)?;
         if self.source.is_empty()
             || self.source.len() > MAX_SOURCE_BYTES

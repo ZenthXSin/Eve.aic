@@ -225,6 +225,9 @@ impl ScriptStore {
         Ok(output)
     }
     pub fn publish(&self, owner: &ContextScope, spec: ScriptSpec) -> Result<PublishedVersion> {
+        if matches!(spec.language, crate::Language::RustCargo(_)) {
+            return Err(reject("Cargo必须由准备入口验证并规范化后保存"));
+        }
         spec.validate()?;
         let version = PublishedVersion {
             reference: VersionRef {
@@ -566,6 +569,9 @@ fn validate_ledger(ledger: &Ledger, directory: &Path) -> Result<()> {
     for (id, index) in &ledger.versions {
         let version = index.load(directory)?;
         version.spec.validate()?;
+        if matches!(version.spec.language, crate::Language::RustCargo(_)) {
+            return Err(reject("账本含未规范化Cargo版本"));
+        }
         if id != &version.reference.digest
             || version.reference.script != version.spec.name
             || digest(&(&version.owner, &version.spec))? != *id

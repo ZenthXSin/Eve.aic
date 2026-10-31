@@ -1,5 +1,7 @@
 //! 不受信 Python / JavaScript / Rust 插件的显式版本执行器。
 //! 仅在 OS 沙箱可用时启动进程；宿主权限始终由统一派发边界重新检查。
+mod cargo_compiler;
+mod cargo_model;
 mod cold;
 mod compiler;
 mod container;
@@ -10,6 +12,8 @@ mod runtime;
 mod sandbox;
 mod store;
 
+pub use cargo_compiler::{CargoArtifact, CargoCompilation, CargoCompiler};
+pub use cargo_model::{CargoCompilationFailure, CargoCompilerConfig, CargoProject, CargoSettings};
 pub use cold::VersionSummary;
 pub use container::ContainerSandbox;
 pub use dispatch::{AuthorizedToolDispatch, CheckedTools, ToolAuthorizer};
@@ -23,6 +27,13 @@ pub(crate) fn reject(message: impl ToString) -> eve_llm_api::ToolExecutionError 
 }
 pub(crate) fn fail(message: impl ToString) -> eve_llm_api::ToolExecutionError {
     eve_llm_api::ToolExecutionError::Failed(message.to_string())
+}
+pub(crate) fn archive_digest(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 /// 与旧JSON字节摘要兼容；通过固定缓冲写入哈希，不分配整份序列化副本。
 pub(crate) fn digest(value: &impl serde::Serialize) -> Result<String> {
