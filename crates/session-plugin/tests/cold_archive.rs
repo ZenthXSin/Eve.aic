@@ -111,6 +111,126 @@ fn archive(root: &tempfile::TempDir) -> Arc<FaultArchive> {
 }
 
 #[tokio::test]
+async fn cold_and_hot_history_keep_identical_complete_turns_and_failure_meaning_after_restart() {
+    let completed = vec![
+        ChatMessage::text(ChatRole::User, "完整工具轮次"),
+        ChatMessage::assistant_tool_calls(vec![eve_llm_api::ToolCall {
+            id: "original".into(),
+            name: "echo".into(),
+            arguments: json!({"text":"完整参数"}),
+        }])
+        .unwrap(),
+        ChatMessage::tool_results(vec![
+            eve_llm_api::ToolResult::success("original", json!("原始回执".repeat(20_000))).unwrap(),
+        ])
+        .unwrap(),
+        ChatMessage::text(ChatRole::Assistant, "完成了"),
+    ];
+    let mut histories = vec![];
+    for cold in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(FaultState::default());
+        let archive_backend: Option<Arc<dyn SessionArchiveStore>> =
+            cold.then(|| archive(&root) as Arc<dyn SessionArchiveStore>);
+        let (host, registry) = kernel(state.clone(), archive_backend.clone());
+        host.start(&id()).await.unwrap();
+        let sessions = service(registry.as_ref());
+        let started = sessions.begin(input("a", "完整工具轮次")).unwrap();
+        sessions
+            .complete(&started.lease, completed.clone())
+            .unwrap();
+        for (text, code, started_tools, evidence) in [
+            (
+                "未调用工具的截断",
+                SessionFailureCode::Provider,
+                Some(0),
+                Some(SessionFailureEvidence {
+                    provider_http_status: None,
+                    provider_failure: Some(eve_llm_api::ProviderFailureKind::Truncated),
+                    tool_names: vec![],
+                    tool_results: vec![],
+                }),
+            ),
+            (
+                "已有副作用的失败",
+                SessionFailureCode::ProviderTimeout,
+                Some(1),
+                Some(SessionFailureEvidence {
+                    provider_http_status: Some(503),
+                    provider_failure: None,
+                    tool_names: vec!["write_file".into()],
+                    tool_results: vec![
+                        eve_llm_api::ToolResult::success(
+                            "failed-turn-receipt",
+                            json!("失败现场只存档不重放"),
+                        )
+                        .unwrap(),
+                    ],
+                }),
+            ),
+            ("执行数量未知", SessionFailureCode::Backend, None, None),
+            (
+                "已取消的输入不回放",
+                SessionFailureCode::Cancelled,
+                Some(1),
+                None,
+            ),
+        ] {
+            let started = sessions.begin(input("a", text)).unwrap();
+            sessions
+                .fail(
+                    &started.lease,
+                    SessionFailure {
+                        code,
+                        started_tools,
+                        evidence,
+                    },
+                )
+                .unwrap();
+        }
+        let next = sessions.begin(input("a", "检查历史")).unwrap();
+        assert_eq!(&next.history[..completed.len()], completed.as_slice());
+        let encoded = serde_json::to_string(&next.history).unwrap();
+        for expected in [
+            "没有启动工具调用",
+            "回复达到单次输出上限",
+            "已启动 1 次工具调用",
+            "HTTP 503",
+            "执行数量未知",
+        ] {
+            assert!(encoded.contains(expected));
+        }
+        for omitted in [
+            "已取消的输入不回放",
+            "失败现场只存档不重放",
+            "failed-turn-receipt",
+        ] {
+            assert!(!encoded.contains(omitted));
+        }
+        let raw = sessions.snapshot(&key("a")).unwrap().unwrap();
+        assert!(
+            serde_json::to_string(&raw)
+                .unwrap()
+                .contains("失败现场只存档不重放")
+        );
+        let expected = next.history;
+        host.stop_all().await.unwrap();
+        let (host, registry) = kernel(state, archive_backend);
+        host.start(&id()).await.unwrap();
+        assert_eq!(
+            service(registry.as_ref())
+                .begin(input("a", "重启检查"))
+                .unwrap()
+                .history,
+            expected
+        );
+        histories.push(expected);
+        host.stop_all().await.unwrap();
+    }
+    assert_eq!(histories[0], histories[1]);
+}
+
+#[tokio::test]
 async fn migrates_exact_legacy_history_scopes_reset_and_interrupts_only_pending() {
     let root = tempfile::tempdir().unwrap();
     let archive = archive(&root);

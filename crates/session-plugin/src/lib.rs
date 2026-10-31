@@ -19,28 +19,64 @@ use std::{
 /// 失败输入仍可解释后续“进展如何”“换个方式再来”，但宿主告知未完成，工具调用绝不重放。
 /// 取消轮不回放；确认没有启动工具的失败轮也回放输入，否则下一轮“分几次写吧”之类的接续会失去所指。
 fn history_with_failures(snapshot: &SessionSnapshot, through: u64) -> Vec<ChatMessage> {
-    snapshot.turns.iter().filter(|turn| turn.id > through).flat_map(|turn| match &turn.status {
+    snapshot
+        .turns
+        .iter()
+        .filter(|turn| turn.id > through)
+        .flat_map(|turn| match &turn.status {
             SessionTurnStatus::Completed { messages } => messages.clone(),
-            SessionTurnStatus::Failed { failure } if failure.code != SessionFailureCode::Cancelled => {
-                let evidence = failure.evidence.as_ref();
-                let http = evidence.and_then(|e| e.provider_http_status)
-                    .map_or(String::new(), |s| format!("，模型服务 HTTP {s}"));
-                let reason = match evidence.and_then(|e| e.provider_failure) {
-                    Some(eve_llm_api::ProviderFailureKind::Truncated) => "，回复达到单次输出上限、没有生成完".to_string(),
-                    Some(kind) => format!("，类别 {kind:?}"),
-                    None => String::new(),
-                };
-                let note = match failure.started_tools {
-                    Some(0) => format!("【宿主失败记录，非模型回答】本轮未完成：{:?}{http}{reason}；没有启动工具调用，也没有发出回复正文。用户这条请求仍未完成；用户接着补充或要求换个方式时，按这条请求理解，不要声称已经完成。", failure.code),
-                    started => {
-                        let started = started.map_or("执行数量未知".into(), |n| format!("已启动 {n} 次工具调用"));
-                        format!("【宿主失败记录，非模型回答】本轮未完成：{:?}{http}{reason}；{started}。已完成的工具结果保留在失败账本，副作用不会撤销。不得声称尚未开始、任务已经完成或仍在后台继续；先核对实际状态，不能自动重放工具。", failure.code)
-                    }
-                };
-                vec![ChatMessage::text(ChatRole::User, turn.input.clone()), ChatMessage::text(ChatRole::Assistant, note)]
+            SessionTurnStatus::Failed { failure }
+                if failure.code != SessionFailureCode::Cancelled =>
+            {
+                failure_history(turn.input.clone(), failure)
             }
             _ => vec![],
-        }).collect()
+        })
+        .collect()
+}
+
+/// 冷正文已独立解码，直接移交消息所有权，不再复制整轮文本和工具回执。
+fn into_history(turn: SessionTurn) -> Vec<ChatMessage> {
+    match turn.status {
+        SessionTurnStatus::Completed { messages } => messages,
+        SessionTurnStatus::Failed { failure } if failure.code != SessionFailureCode::Cancelled => {
+            failure_history(turn.input, &failure)
+        }
+        _ => vec![],
+    }
+}
+
+fn failure_history(input: String, failure: &SessionFailure) -> Vec<ChatMessage> {
+    let evidence = failure.evidence.as_ref();
+    let http = evidence
+        .and_then(|e| e.provider_http_status)
+        .map_or(String::new(), |s| format!("，模型服务 HTTP {s}"));
+    let reason = match evidence.and_then(|e| e.provider_failure) {
+        Some(eve_llm_api::ProviderFailureKind::Truncated) => {
+            "，回复达到单次输出上限、没有生成完".to_string()
+        }
+        Some(kind) => format!("，类别 {kind:?}"),
+        None => String::new(),
+    };
+    let note = match failure.started_tools {
+        Some(0) => format!(
+            "【宿主失败记录，非模型回答】本轮未完成：{:?}{http}{reason}；没有启动工具调用，也没有发出回复正文。用户这条请求仍未完成；用户接着补充或要求换个方式时，按这条请求理解，不要声称已经完成。",
+            failure.code
+        ),
+        started => {
+            let started = started.map_or("执行数量未知".into(), |n| {
+                format!("已启动 {n} 次工具调用")
+            });
+            format!(
+                "【宿主失败记录，非模型回答】本轮未完成：{:?}{http}{reason}；{started}。已完成的工具结果保留在失败账本，副作用不会撤销。不得声称尚未开始、任务已经完成或仍在后台继续；先核对实际状态，不能自动重放工具。",
+                failure.code
+            )
+        }
+    };
+    vec![
+        ChatMessage::text(ChatRole::User, input),
+        ChatMessage::text(ChatRole::Assistant, note),
+    ]
 }
 
 pub const SESSION_STATE_KEY: &str = "sessions.v1";

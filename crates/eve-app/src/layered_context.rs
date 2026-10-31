@@ -53,6 +53,39 @@ fn excerpt(text: &str, max: usize) -> String {
     }
     text[..n].into()
 }
+
+/// 与完整 join 后截取的前缀相同；只构造候选预算内的文本，不先连接全部正文。
+fn candidate_excerpt(messages: &[ChatMessage], max: usize) -> Option<String> {
+    if !messages
+        .iter()
+        .filter_map(|message| message.text.as_deref())
+        .any(|text| !text.trim().is_empty())
+    {
+        return None;
+    }
+    let mut output = String::new();
+    for (index, text) in messages
+        .iter()
+        .filter_map(|message| message.text.as_deref())
+        .enumerate()
+    {
+        if index > 0 {
+            if output.len() == max {
+                break;
+            }
+            output.push('\n');
+        }
+        let mut end = text.len().min(max.saturating_sub(output.len()));
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.push_str(&text[..end]);
+        if end < text.len() {
+            break;
+        }
+    }
+    Some(output)
+}
 fn terms(text: &str) -> BTreeSet<String> {
     let lower = text.to_lowercase();
     let mut terms: BTreeSet<String> = lower
@@ -257,15 +290,12 @@ impl HistoryContextPlanner for Planner {
             let candidates: Vec<_> = ranked
                 .iter()
                 .filter_map(|(_, i)| {
-                    let text = groups[*i]
-                        .iter()
-                        .filter_map(|m| m.text.as_deref())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    (!text.trim().is_empty()).then(|| ContextCandidate {
-                        id: format!("h{i}"),
-                        text: excerpt(&text, eve_memory_api::MAX_CONTEXT_CANDIDATE_BYTES),
-                    })
+                    candidate_excerpt(groups[*i], eve_memory_api::MAX_CONTEXT_CANDIDATE_BYTES).map(
+                        |text| ContextCandidate {
+                            id: format!("h{i}"),
+                            text,
+                        },
+                    )
                 })
                 .collect();
             let fallback = ranked
@@ -540,6 +570,42 @@ mod tests {
     use super::*;
     use eve_kernel::{Kernel, KernelServices};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[test]
+    fn candidate_prefix_preserves_separators_empty_parts_and_utf8_without_skipping_truncated_text()
+    {
+        let no_text = ChatMessage::assistant_tool_calls(vec![ToolCall {
+            id: "call".into(),
+            name: "echo".into(),
+            arguments: json!({}),
+        }])
+        .unwrap();
+        for parts in [
+            vec!["", "猫", "a"],
+            vec!["abc", "", "尾巴"],
+            vec![" \t", "\n"],
+            vec!["\u{2003}", "x"],
+        ] {
+            let mut messages: Vec<_> = parts
+                .iter()
+                .map(|text| ChatMessage::text(ChatRole::Assistant, *text))
+                .collect();
+            messages.insert(1, no_text.clone());
+            let joined = parts.join("\n");
+            for max in 0..=20 {
+                let expected = (!joined.trim().is_empty()).then(|| excerpt(&joined, max));
+                assert_eq!(candidate_excerpt(&messages, max), expected);
+            }
+        }
+        let huge = vec![
+            ChatMessage::text(ChatRole::User, "q"),
+            ChatMessage::text(ChatRole::Assistant, "猫".repeat(350_000)),
+            ChatMessage::text(ChatRole::Assistant, "cannot-skip-here"),
+        ];
+        assert_eq!(
+            candidate_excerpt(&huge, 4096).unwrap(),
+            format!("q\n{}", "猫".repeat(1364))
+        );
+    }
     #[test]
     fn streamed_history_hash_matches_complete_json_and_still_covers_every_original_byte() {
         let mut value = json!({"history":[{"role":"user","text":"原话\n引号\"和反斜杠\\".repeat(20_000)},
