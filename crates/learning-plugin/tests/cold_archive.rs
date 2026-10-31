@@ -426,3 +426,187 @@ async fn failed_page_never_skips_corrupt_record_even_if_file_is_restored() {
     assert!(cursor.next_page().is_err());
     k.stop_all().await.unwrap();
 }
+
+struct TracedArchive {
+    inner: FileLearningArchive,
+    puts: std::sync::atomic::AtomicUsize,
+    failure: std::sync::atomic::AtomicUsize,
+}
+impl LearningArchiveStore for TracedArchive {
+    fn get(&self, key: &str) -> LearningResult<Vec<u8>> {
+        self.inner.get(key)
+    }
+    fn put(&self, key: &str, bytes: &[u8]) -> LearningResult<()> {
+        use std::sync::atomic::Ordering;
+        self.puts.fetch_add(1, Ordering::SeqCst);
+        match self.failure.load(Ordering::SeqCst) {
+            1 => Err(LearningError::Storage),
+            2 => {
+                self.inner.put(key, bytes)?;
+                Err(LearningError::Storage)
+            }
+            _ => self.inner.put(key, bytes),
+        }
+    }
+}
+fn traced(directory: &std::path::Path) -> Arc<TracedArchive> {
+    Arc::new(TracedArchive {
+        inner: FileLearningArchive::open(directory).unwrap(),
+        puts: 0.into(),
+        failure: 0.into(),
+    })
+}
+#[tokio::test]
+async fn cold_decision_append_writes_one_body_and_preserves_pinned_history_and_replay_identity() {
+    use std::sync::atomic::Ordering;
+    let root = tempfile::tempdir().unwrap();
+    let state = RecordingStore::open(&root.path().join("state"));
+    let archive = traced(&root.path().join("cold"));
+    let source = memory(scope("append", "u"), 1);
+    let (kernel, admin) = open(state.clone(), Some(archive.clone())).await;
+    complete(&admin, &source);
+    let first = decision(&admin, &source);
+    admin
+        .record_decision(&source.scope, first.clone(), 111)
+        .unwrap();
+    let mut pinned = admin.scan_decisions(&source.scope).unwrap();
+    let writes = state.writes();
+    let puts = archive.puts.load(Ordering::SeqCst);
+    let mut changed = first;
+    changed.policy_version = "p2".into();
+    let saved = admin
+        .record_decision(&source.scope, changed.clone(), 112)
+        .unwrap();
+    assert_eq!(saved.sequence, 2);
+    assert_eq!(
+        archive.puts.load(Ordering::SeqCst),
+        puts + 1,
+        "不能为追加一条决策重写/同步全部旧冷文件"
+    );
+    assert_eq!(state.writes(), writes + 1);
+    changed.memory_revision += 10;
+    assert_eq!(
+        admin.record_decision(&source.scope, changed, 120).unwrap(),
+        saved
+    );
+    assert_eq!(archive.puts.load(Ordering::SeqCst), puts + 1);
+    assert_eq!(state.writes(), writes + 1);
+    assert_eq!(pinned.next_page().unwrap().len(), 1);
+    assert!(pinned.next_page().unwrap().is_empty());
+    kernel.stop_all().await.unwrap();
+    let (kernel, admin) = open(state, Some(archive)).await;
+    let records = admin.decisions(&source.scope).unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1], saved);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn cold_decision_index_commit_uncertainty_closes_existing_cursors_and_recovers_actual_bytes()
+{
+    for after in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let state = RecordingStore::open(&root.path().join("state"));
+        let archive = traced(&root.path().join("cold"));
+        let source = memory(scope("uncertain-decision", "u"), 1);
+        let (kernel, admin) = open(state.clone(), Some(archive.clone())).await;
+        complete(&admin, &source);
+        let mut next = decision(&admin, &source);
+        admin
+            .record_decision(&source.scope, next.clone(), 111)
+            .unwrap();
+        let mut old = admin.scan_decisions(&source.scope).unwrap();
+        next.policy_version = "p2".into();
+        state.fail_after(after);
+        state.fail_before(!after);
+        assert_eq!(
+            admin.record_decision(&source.scope, next.clone(), 112),
+            Err(LearningError::Storage)
+        );
+        assert_eq!(old.next_page(), Err(LearningError::Unavailable));
+        assert_eq!(
+            admin.snapshot(&source.scope),
+            Err(LearningError::Unavailable)
+        );
+        kernel.stop_all().await.unwrap();
+        state.fail_after(false);
+        state.fail_before(false);
+        let (kernel, admin) = open(state, Some(archive)).await;
+        let records = admin.decisions(&source.scope).unwrap();
+        assert_eq!(records.len(), if after { 2 } else { 1 });
+        if after {
+            assert!(records[1].decision.same_outcome(&next));
+        }
+        assert_eq!(old.next_page(), Err(LearningError::Unavailable));
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unreferenced_cold_write_failure_preserves_the_old_index_and_usable_history() {
+    use std::sync::atomic::Ordering;
+    for mode in [1, 2] {
+        let root = tempfile::tempdir().unwrap();
+        let state = RecordingStore::open(&root.path().join("state"));
+        let archive = traced(&root.path().join("cold"));
+        let source = memory(scope("cold-put", "u"), 1);
+        let (kernel, admin) = open(state.clone(), Some(archive.clone())).await;
+        complete(&admin, &source);
+        let mut next = decision(&admin, &source);
+        admin
+            .record_decision(&source.scope, next.clone(), 111)
+            .unwrap();
+        let original = state.get(&owner(), DECISIONS).unwrap();
+        let writes = state.writes();
+        next.policy_version = "p2".into();
+        archive.failure.store(mode, Ordering::SeqCst);
+        assert_eq!(
+            admin.record_decision(&source.scope, next, 112),
+            Err(LearningError::Storage)
+        );
+        assert_eq!(state.get(&owner(), DECISIONS).unwrap(), original);
+        assert_eq!(state.writes(), writes);
+        assert_eq!(admin.decisions(&source.scope).unwrap().len(), 1);
+        archive.failure.store(0, Ordering::SeqCst);
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_late_corrupt_job_blocks_cold_decision_append_before_any_new_file_or_index_write() {
+    use std::sync::atomic::Ordering;
+    let root = tempfile::tempdir().unwrap();
+    let state = RecordingStore::open(&root.path().join("state"));
+    let archive = traced(&root.path().join("cold"));
+    let source = memory(scope("target", "u"), 1);
+    let (kernel, admin) = open(state.clone(), Some(archive.clone())).await;
+    complete(&admin, &source);
+    let mut next = decision(&admin, &source);
+    admin
+        .record_decision(&source.scope, next.clone(), 111)
+        .unwrap();
+    complete(&admin, &memory(scope("unrelated-late", "u"), 1));
+    let jobs: Value =
+        serde_json::from_slice(&state.get(&owner(), LEARNING_STATE_KEY).unwrap().unwrap()).unwrap();
+    let path = root.path().join("cold").join(format!(
+        "{}.json",
+        jobs["records"].as_array().unwrap().last().unwrap()["hash"]
+            .as_str()
+            .unwrap()
+    ));
+    std::fs::write(&path, b"damaged").unwrap();
+    let writes = state.writes();
+    let puts = archive.puts.load(Ordering::SeqCst);
+    let before = state.get(&owner(), DECISIONS).unwrap();
+    next.policy_version = "p2".into();
+    assert!(admin.record_decision(&source.scope, next, 112).is_err());
+    assert_eq!(state.writes(), writes);
+    assert_eq!(archive.puts.load(Ordering::SeqCst), puts);
+    assert_eq!(state.get(&owner(), DECISIONS).unwrap(), before);
+    assert_eq!(std::fs::read(&path).unwrap(), b"damaged");
+    assert_eq!(
+        admin.decisions(&source.scope),
+        Err(LearningError::Unavailable)
+    );
+    kernel.stop_all().await.unwrap();
+}

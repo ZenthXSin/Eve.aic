@@ -15,6 +15,9 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
+#[path = "cold_decisions.rs"]
+mod cold_decisions;
+
 const FORMAT_VERSION: u32 = 1;
 const DECISIONS_STATE_KEY: &str = "learning.decisions.v1";
 const MAX_DECISIONS_STATE_BYTES: usize = MAX_STATE_BYTES;
@@ -419,6 +422,18 @@ impl StoredLearning {
         decision: LearningDecision,
         at_ms: u64,
     ) -> LearningResult<LearningDecisionRecord> {
+        {
+            let mut inner = self.inner.lock().map_err(|_| LearningError::Unavailable)?;
+            if inner.context.is_none() {
+                return Err(LearningError::Unavailable);
+            }
+            if inner.archive.is_some()
+                && inner.job_index.is_some()
+                && inner.decision_index.is_some()
+            {
+                return cold_decisions::append(&mut inner, scope, decision, at_ms);
+            }
+        }
         let mut inner = self.lock()?;
         validate_decision_binding(&inner.document, scope, &decision, at_ms)?;
         // 只与该候选最近一次决定比较；A→B→A 必须保留三个历史结局。
