@@ -38,6 +38,56 @@ class ScriptRepairAcceptance(developer.DeveloperAcceptance):
         self.run_eve(script, interest=False, memory=True, research=False, practice=False,
             env_extra={'EVE_DEVELOPER_CONFIG': str(self.developer_config), 'EVE_SCRIPT_RUSTC': self.compiler})
 
+    def test_concrete_parameter_preflight_does_not_write_then_execution_uses_original_authority(self):
+        source = '''import json
+x=json.loads(input())
+def rpc(value):
+ print(json.dumps(value),flush=True)
+ return json.loads(input())['result']
+bad=rpc({'op':'check_tool','name':'write_file','arguments':{'path':'checked.txt','content':'kept'}})
+good_args={'path':'checked.txt','content':'kept','expected_sha256':''}
+good=rpc({'op':'check_tool','name':'write_file','arguments':good_args})
+written=rpc({'op':'tool','name':'write_file','arguments':good_args}) if x['arguments'].get('execute') else None
+print(json.dumps({'op':'return','value':{'bad':bad,'good':good,'written':written}}),flush=True)
+'''
+        spec = {'name': 'checked-write', 'language': 'python', 'source': source,
+                'dependencies': {}, 'tools': ['write_file'],
+                'state_schema': {'version': 1, 'fields': {}}, 'initial_state': {}}
+        version = None
+        def respond(body):
+            nonlocal version
+            results = self.results(body)
+            if not results:
+                return self.tools([('save_script_plugin', {'spec': spec})])
+            if len(results) == 1:
+                version = results[0]['version']['reference']
+                return self.tools([('activate_script_plugin', {'version': version})])
+            if len(results) == 2:
+                return self.tools([('run_script_plugin', {'version': version, 'arguments': {'execute': False}})])
+            receipt = results[-1]['receipt']
+            self.assertEqual(receipt['status'], 'succeeded')
+            value = receipt['result']
+            self.assertEqual(value['bad'], {'allowed': False, 'executed': False,
+                'authorization_reserved': False, 'reason': 'rejected'})
+            self.assertEqual(value['good'], {'allowed': True, 'executed': False,
+                'authorization_reserved': False, 'reason': 'preflight_passed'})
+            if len(results) == 3:
+                self.assertIsNone(value['written'])
+                self.assertEqual(receipt['evidence'], [])
+                self.assertFalse((self.source / 'checked.txt').exists(), '预检不能写入文件')
+                return self.tools([('run_script_plugin', {'version': version, 'arguments': {'execute': True}})])
+            self.assertEqual(len(results), 4)
+            self.assertTrue(value['written']['success'])
+            self.assertEqual([e['operation'] for e in receipt['evidence']], ['tool'])
+            self.assertEqual([e['target'] for e in receipt['evidence']], ['write_file'])
+            self.assertEqual((self.source / 'checked.txt').read_text(), 'kept')
+            return text_response('参数预检没有写文件，实际执行后才保存成功')
+        self.callback = respond
+        self.execute_script(self.send(self.message('check-operation', '先预检写文件，再实际保存',
+            expected='参数预检没有写文件，实际执行后才保存成功')))
+        self.assertEqual(len(self.kind('chat')), 5)
+        self.assertEqual(len(self.kind('review')), 0)
+
     def test_compile_failure_is_repaired_verified_and_enabled_in_one_turn_then_survives_restart(self):
         spec = {'name': 'repair-example', 'language': 'rust', 'source': 'fn main(){ missing_identifier(); }',
                 'dependencies': {}, 'tools': [], 'state_schema': {'version': 1, 'fields': {}}, 'initial_state': {}}

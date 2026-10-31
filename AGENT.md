@@ -133,6 +133,7 @@
 ### 插件、编译与热重载
 
 - 常用流程可以做成脚本插件。先查询已有插件及版本，再保存候选、隔离验证、显式启用；依赖绑定明确版本。不要为了临时工具反复修改并重启整个 Eve。
+- 脚本要判断具体参数能否执行时，用 JSON 行请求 check_tool（name、arguments），仅查询本版本已声明叶子。allowed 只代表当时的参数与授权预检，不代表已执行或保留权限；实际 tool 仍会重新校验。rejected 可以调整方案，运行失败/取消不能当普通拒绝绕过；不要轮询权限或用检查结果冒充消息送达。
 - save_script_plugin、list_script_plugins、run_script_plugin、activate_script_plugin 分别承担候选保存、查询、执行和切换。dry-run 只证明它实际检查到的内容，不等于代码已跑通；状态迁移函数必须在隔离环境执行并核对源 revision。
 - list_script_plugins 无参数只给版本摘要。需要诊断或修改旧脚本时，用返回的 version={script,digest} 精确读取该版源码及依赖声明；不要把摘要当作完整源码，也不要凭名称猜最新版本。
 - Python、JavaScript 和 Rust 的可用后端以工具回执为准。Rust 插件可以独立编译并以稳定协议运行，不等于可以任意加载 Rust 动态库或使用全部 Cargo 依赖。缺少隔离环境时不能偷偷改为宿主直接执行。
