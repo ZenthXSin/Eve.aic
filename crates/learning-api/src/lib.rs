@@ -171,6 +171,20 @@ pub trait LearningAdmin: Send + Sync {
     ) -> LearningResult<Option<LearningBatch>> {
         Ok(None)
     }
+    /// 从固定版本的完整证据流准入只读补做；内置实现不恢复整份原始记忆。
+    fn reserve_repair_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+        extractor_version: &str,
+    ) -> LearningResult<Option<LearningBatch>> {
+        let snapshot = reader.complete_snapshot()?;
+        if snapshot.scope != *scope {
+            return Err(LearningError::Conflict);
+        }
+        self.reserve_repair(&snapshot, now_ms, extractor_version)
+    }
     fn snapshot(&self, scope: &MemoryScope) -> LearningResult<LearningSnapshot>;
     /// 只返回当前可信宿主绑定范围的决策，按范围内连续 sequence 排序。
     /// 决策记录是提交前的意图，不证明偏好已经写入记忆。
@@ -198,6 +212,21 @@ pub trait LearningAdmin: Send + Sync {
         extractor_version: &str,
         options: &LearningOptions,
     ) -> LearningResult<Option<LearningBatch>>;
+    /// 从绑定作用域的证据流准入新批次，内置实现保留批次正文及校验元数据。
+    fn reserve_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+        extractor_version: &str,
+        options: &LearningOptions,
+    ) -> LearningResult<Option<LearningBatch>> {
+        let snapshot = reader.complete_snapshot()?;
+        if snapshot.scope != *scope {
+            return Err(LearningError::Conflict);
+        }
+        self.reserve(&snapshot, now_ms, extractor_version, options)
+    }
     fn finish(
         &self,
         batch: &LearningBatch,

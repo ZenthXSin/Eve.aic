@@ -108,6 +108,27 @@ impl LearningAdmin for LearningController {
         self.service()?
             .reserve(memory, now_ms, extractor_version, options)
     }
+    fn reserve_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+        extractor_version: &str,
+        options: &LearningOptions,
+    ) -> LearningResult<Option<LearningBatch>> {
+        self.service()?
+            .reserve_reader(scope, reader, now_ms, extractor_version, options)
+    }
+    fn reserve_repair_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+        extractor_version: &str,
+    ) -> LearningResult<Option<LearningBatch>> {
+        self.service()?
+            .reserve_repair_reader(scope, reader, now_ms, extractor_version)
+    }
     fn finish(
         &self,
         batch: &LearningBatch,

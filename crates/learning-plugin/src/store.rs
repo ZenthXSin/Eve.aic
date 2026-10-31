@@ -557,6 +557,204 @@ impl StoredLearning {
         persist(&mut inner, next)?;
         Ok(Some(batch))
     }
+    pub(super) fn reserve_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+        extractor_version: &str,
+        options: &LearningOptions,
+    ) -> LearningResult<Option<LearningBatch>> {
+        use eve_memory_api::{MemoryEvidenceCursor, ValidatedMemoryCursor};
+        options.validate()?;
+        validate_id(extractor_version).map_err(|_| LearningError::InvalidInput)?;
+        let mut cursor = ValidatedMemoryCursor::new(scope.clone(), reader.scan()?)?;
+        let revision = cursor.summary().revision;
+        let mut inner = self.lock()?;
+        let previous: Vec<_> = inner
+            .document
+            .jobs
+            .iter()
+            .filter(|r| r.job.batch.scope == *scope)
+            .collect();
+        let mut expected = BTreeMap::new();
+        for record in &previous {
+            if revision < record.memory_revision {
+                return Err(LearningError::Conflict);
+            }
+            for evidence in &record.job.batch.evidence {
+                if expected
+                    .insert(evidence.id.as_str(), evidence)
+                    .is_some_and(|old| old != evidence)
+                {
+                    return Err(LearningError::Conflict);
+                }
+            }
+        }
+        let cooling = previous
+            .iter()
+            .max_by_key(|r| r.job.batch.started_at_ms)
+            .is_some_and(|r| {
+                now_ms
+                    .checked_sub(r.job.batch.started_at_ms)
+                    .is_none_or(|elapsed| elapsed < options.cooldown_ms)
+            });
+        let mut seen = BTreeSet::new();
+        let mut batch = LearningBatch {
+            attempt: 0,
+            id: format!("learning-batch-{}", "0".repeat(64)),
+            scope: scope.clone(),
+            extractor_version: extractor_version.into(),
+            started_at_ms: now_ms,
+            evidence: vec![],
+        };
+        loop {
+            let page = cursor.next_page()?;
+            if page.is_empty() {
+                break;
+            }
+            for evidence in page {
+                if let Some(prior) = expected.get(evidence.id.as_str()) {
+                    if **prior != evidence {
+                        return Err(LearningError::Conflict);
+                    }
+                    seen.insert(evidence.id.clone());
+                    continue;
+                }
+                if cooling
+                    || batch.evidence.len() == options.max_batch_evidence
+                    || !matches!(evidence.source, EvidenceSource::CompletedInteraction { .. })
+                {
+                    continue;
+                }
+                if serde_json::to_vec(&evidence)
+                    .map_err(|_| LearningError::InvalidInput)?
+                    .len()
+                    > MAX_EVIDENCE_BYTES
+                {
+                    continue;
+                }
+                batch.evidence.push(evidence);
+                if serde_json::to_vec(&batch)
+                    .map_err(|_| LearningError::InvalidInput)?
+                    .len()
+                    > MAX_INPUT_BYTES
+                {
+                    batch.evidence.pop();
+                }
+            }
+        }
+        if seen.len() != expected.len() {
+            return Err(LearningError::Conflict);
+        }
+        let aged = batch
+            .evidence
+            .first()
+            .is_some_and(|e| now_ms.saturating_sub(e.at_ms) >= MAINTENANCE_DELAY_MS);
+        if cooling
+            || batch.evidence.is_empty()
+            || (batch.evidence.len() < options.min_new_evidence && !aged)
+        {
+            return Ok(None);
+        }
+        if inner.archive.is_none() && inner.document.jobs.len() >= MAX_JOBS {
+            return Err(LearningError::LimitReached);
+        }
+        batch.id = batch_id(scope, extractor_version, &batch.evidence)?;
+        let mut next = inner.document.clone();
+        next.jobs.push(JobRecord {
+            memory_revision: revision,
+            previous_attempts: vec![],
+            reflection: None,
+            job: LearningJob {
+                batch: batch.clone(),
+                status: JobStatus::Running,
+                finished_at_ms: None,
+                candidates: vec![],
+            },
+        });
+        persist(&mut inner, next)?;
+        Ok(Some(batch))
+    }
+
+    pub(super) fn reserve_repair_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+        extractor_version: &str,
+    ) -> LearningResult<Option<LearningBatch>> {
+        use eve_memory_api::{MemoryEvidenceCursor, ValidatedMemoryCursor};
+        validate_id(extractor_version).map_err(|_| LearningError::InvalidInput)?;
+        let mut cursor = ValidatedMemoryCursor::new(scope.clone(), reader.scan()?)?;
+        let revision = cursor.summary().revision;
+        let mut inner = self.lock()?;
+        let busy = inner
+            .document
+            .jobs
+            .iter()
+            .any(|r| r.job.batch.scope == *scope && r.job.status == JobStatus::Running);
+        let index = (!busy)
+            .then(|| {
+                inner.document.jobs.iter().position(|r| {
+                    r.job.batch.scope == *scope
+                        && r.job.batch.extractor_version == extractor_version
+                        && retryable(&r.job.status)
+                        && r.previous_attempts.len() < MAX_REPAIRS
+                        && now_ms
+                            .checked_sub(r.job.finished_at_ms.unwrap_or(r.job.batch.started_at_ms))
+                            .is_some_and(|elapsed| elapsed >= REPAIR_COOLDOWN_MS)
+                })
+            })
+            .flatten();
+        let mut expected = BTreeMap::new();
+        if let Some(index) = index {
+            let old = &inner.document.jobs[index];
+            if revision < old.memory_revision {
+                return Err(LearningError::Conflict);
+            }
+            for evidence in &old.job.batch.evidence {
+                expected.insert(evidence.id.as_str(), evidence);
+            }
+        }
+        let mut seen = BTreeSet::new();
+        loop {
+            let page = cursor.next_page()?;
+            if page.is_empty() {
+                break;
+            }
+            for evidence in page {
+                if let Some(prior) = expected.get(evidence.id.as_str()) {
+                    if **prior != evidence {
+                        return Err(LearningError::Conflict);
+                    }
+                    seen.insert(evidence.id.clone());
+                }
+            }
+        }
+        if seen.len() != expected.len() {
+            return Err(LearningError::Conflict);
+        }
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        let mut next = inner.document.clone();
+        let record = &mut next.jobs[index];
+        record.previous_attempts.push(MaintenanceAttempt {
+            started_at_ms: record.job.batch.started_at_ms,
+            finished_at_ms: record.job.finished_at_ms,
+            status: record.job.status.clone(),
+        });
+        record.job.batch.started_at_ms = now_ms;
+        record.job.batch.attempt = u8::try_from(record.previous_attempts.len())
+            .map_err(|_| LearningError::InvalidInput)?;
+        record.job.status = JobStatus::Running;
+        record.job.finished_at_ms = None;
+        let batch = record.job.batch.clone();
+        persist(&mut inner, next)?;
+        Ok(Some(batch))
+    }
+
     pub(super) fn finish(
         &self,
         batch: &LearningBatch,

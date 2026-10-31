@@ -148,17 +148,24 @@ async fn run(
                 if !gate.admits_category("memory-maintenance", 1)? {
                     break;
                 }
-                // 读完整记忆：归档前还没提炼的交流同样会被提炼。
-                let snapshot = memory.reader(scope.clone())?.complete_snapshot()?;
-                if snapshot.scope != scope {
-                    return Err("提炼来源作用域不匹配".into());
-                }
-                let reserved =
-                    learning.reserve(&snapshot, now_ms()?, extractor.version(), &options);
+                // 完整校验固定版本来源，保留确切批次，避免恢复整份原始记忆。
+                let reader = memory.reader(scope.clone())?;
+                let reserved = learning.reserve_reader(
+                    &scope,
+                    reader.as_ref(),
+                    now_ms()?,
+                    extractor.version(),
+                    &options,
+                );
                 let batch = match reserved {
                     Ok(Some(batch)) => batch,
                     Ok(None) => {
-                        match learning.reserve_repair(&snapshot, now_ms()?, extractor.version())? {
+                        match learning.reserve_repair_reader(
+                            &scope,
+                            reader.as_ref(),
+                            now_ms()?,
+                            extractor.version(),
+                        )? {
                             Some(batch) => batch,
                             None => continue,
                         }
