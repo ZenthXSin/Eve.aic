@@ -234,6 +234,58 @@ def sticker_in_flight(receipt):
     return isinstance(sticker, dict) and sticker.get('state') in ('Pending', 'Sending') \
         and receipt['state'] == 'Sent'
 
+def session_turns(state_path, session, version):
+    """冷索引逐轮核验，不恢复整本历史，也不修改冷文件。"""
+    if version == 1:
+        yield from session['turns']
+        return
+    if version != 2 or set(session) != {'key', 'revision', 'turns'}:
+        raise ValueError('invalid_session_index')
+    revision = 0
+    records = session['turns']
+    if not isinstance(records, list) or type(session['revision']) is not int:
+        raise ValueError('invalid_session_index')
+    for position, record in enumerate(records, 1):
+        if (not isinstance(record, dict) or set(record) != {'hash', 'bytes'}
+                or not sha(record['hash']) or type(record['bytes']) is not int
+                or not 0 < record['bytes'] <= 32 * 1024 * 1024):
+            raise ValueError('invalid_session_archive_reference')
+        path = state_path.parent / 'session-archive' / (record['hash'] + '.json')
+        if path.is_symlink() or not path.is_file() or path.stat().st_size != record['bytes']:
+            raise ValueError('invalid_session_archive_file')
+        with path.open('rb') as stream:
+            raw = stream.read(record['bytes'] + 1)
+        if len(raw) != record['bytes'] or hashlib.sha256(raw).hexdigest() != record['hash']:
+            raise ValueError('session_archive_digest_mismatch')
+        turn = json.loads(raw, object_pairs_hook=unique_object)
+        if (not isinstance(turn, dict) or set(turn) != {'id', 'input', 'status'}
+                or type(turn['id']) is not int or turn['id'] != position
+                or not isinstance(turn['input'], str) or not turn['input'].strip()
+                or not isinstance(turn['status'], dict)):
+            raise ValueError('invalid_session_archive_turn')
+        status = turn['status']
+        kind = status.get('state')
+        if kind in ('Pending', 'Interrupted'):
+            if set(status) != {'state'} or kind == 'Pending' and position != len(records):
+                raise ValueError('invalid_session_archive_status')
+        elif kind == 'Completed':
+            messages = status.get('messages')
+            if (set(status) != {'state', 'messages'} or not isinstance(messages, list) or len(messages) < 2
+                    or not isinstance(messages[0], dict) or not isinstance(messages[-1], dict)
+                    or messages[0].get('role') != 'User' or messages[0].get('text') != turn['input']
+                    or messages[-1].get('role') != 'Assistant' or not isinstance(messages[-1].get('text'), str)
+                    or messages[-1].get('tool_calls')):
+                raise ValueError('invalid_session_archive_completion')
+        elif kind == 'Failed':
+            if set(status) != {'state', 'failure'} or not isinstance(status['failure'], dict):
+                raise ValueError('invalid_session_archive_failure')
+        else:
+            raise ValueError('unknown_session_archive_status')
+        revision += 1 if kind == 'Pending' else 2
+        yield turn
+    if revision != session['revision']:
+        raise ValueError('session_archive_revision_mismatch')
+
 def delivery_documents(state_path, inherited=frozenset()):
     """共用的回执格式、归档、分段及进展校验；不修改任何状态。"""
     state = read_json(state_path, MAX_STATE_JSON)
@@ -244,8 +296,19 @@ def delivery_documents(state_path, inherited=frozenset()):
         return json.loads(bytes(entries[owner][key]), object_pairs_hook=unique_object)
     sessions = document('eve.session', 'sessions.v1')
     receipts = document('eve.channel.qqbot', 'receipts.v1')
-    if sessions['format_version'] != 1 or receipts['version'] not in (1, 2, 3, 4, 5, 6, 7, 8):
+    if sessions['format_version'] not in (1, 2) or receipts['version'] not in (1, 2, 3, 4, 5, 6, 7, 8):
         raise ValueError('unknown_ledger_version')
+    if sessions['format_version'] == 2:
+        if set(sessions) != {'format_version', 'sessions'} or not isinstance(sessions['sessions'], dict):
+            raise ValueError('invalid_session_index')
+        for identity, session in sessions['sessions'].items():
+            if (not isinstance(session, dict) or not isinstance(session.get('key'), dict)
+                    or set(session['key']) != {'session_id', 'user_id'}
+                    or session['key']['session_id'] != identity
+                    or any(not isinstance(value, str) or not value or len(value.encode()) > 256
+                           or value.strip() != value or any(ord(c) < 32 or ord(c) == 127 for c in value)
+                           for value in session['key'].values())):
+                raise ValueError('invalid_session_index_identity')
     validate_receipt_archive(state_path, receipts)
     validate_merged_receipts(receipts)
     settled = True
@@ -282,7 +345,7 @@ def runtime_idle_gate(state_path, inherited=frozenset()):
     """宿主自动更新只在当前运行的对话、任务、唤醒和文件投递全部空闲时切换。"""
     sessions, receipts, settled = delivery_documents(state_path, inherited)
     if not settled or any(t['status']['state'] == 'Pending'
-            for session in sessions['sessions'].values() for t in session['turns']):
+            for session in sessions['sessions'].values() for t in session_turns(state_path, session, sessions['format_version'])):
         return False
     if any(receipt_fingerprint(r) not in inherited and r['state'] in ('Processing', 'ReplyPending')
             for r in receipts['entries']):
@@ -325,7 +388,10 @@ def delivery_gate(state_path, request, inherited=frozenset()):
     session = sessions['sessions'].get(request['session_id'])
     if not session or session['key']['user_id'] != request['requested_by']:
         raise ValueError('request_scope_mismatch')
-    turn = next((t for t in session['turns'] if t['id'] == request['turn_id']), None)
+    turn = None
+    for candidate in session_turns(state_path, session, sessions['format_version']):
+        if candidate['id'] == request['turn_id']:
+            turn = candidate
     if not turn:
         raise ValueError('request_turn_missing')
     status = turn['status']['state']
@@ -351,7 +417,7 @@ def delivery_gate(state_path, request, inherited=frozenset()):
         if receipt['state'] in ('Processing', 'ReplyPending'):
             return False
     return bool(matching and matching['state'] == 'Sent' and matching.get('reply') == reply) and all(t['status']['state'] != 'Pending'
-                        for s in sessions['sessions'].values() for t in s['turns'])
+                        for s in sessions['sessions'].values() for t in session_turns(state_path, s, sessions['format_version']))
 
 def drain_stamp(state_path):
     """侧账本及 SQLite WAL 也参与门禁缓存；大状态未变化时不重复解析。"""
@@ -813,6 +879,7 @@ class Supervisor:
             prepared = None
             state_stamp = None
             gate = False
+            last_gate_check = 0.0
             while not self.stopping:
                 if self.child.process.poll() is not None:
                     self.recover()
@@ -838,10 +905,14 @@ class Supervisor:
                         if time.monotonic() - waiting_since > self.options.drain_timeout:
                             raise ValueError('reply_or_idle_timeout')
                         stamp = drain_stamp(self.state)
-                        if state_stamp != stamp:
+                        # 文件戳只是缓存提示；粗粒度时间戳或同长度 WAL 更新不能永久卡住门禁。
+                        if state_stamp != stamp or time.monotonic() - last_gate_check >= 1.0:
+                            if state_stamp != stamp:
+                                quiet_since = None
                             gate = (delivery_gate(self.state, request, self.inherited_receipts)
                                     and runtime_idle_gate(self.state, self.inherited_receipts))
                             state_stamp = stamp
+                            last_gate_check = time.monotonic()
                         if gate:
                             quiet_since = quiet_since or time.monotonic()
                             if time.monotonic() - quiet_since >= self.options.quiet_seconds:

@@ -3,6 +3,7 @@
 只使用合成凭据、回环模型与 QQ 替身，停止本脚本创建的进程。
 """
 import hashlib
+import self_upgrade_runtime as runtime
 import json
 import os
 import pathlib
@@ -148,7 +149,8 @@ def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, 
         for secret in (config["qq"]["app_secret"], config["model"]["api_key"], token):
             require(secret not in output, "启动日志泄漏了合成凭据")
         sessions = json.loads(bytes(json.loads(state_file.read_text(encoding="utf-8"))["entries"]["eve.session"]["sessions.v1"]))
-        turns = [turn for session in sessions["sessions"].values() for turn in session["turns"]]
+        turns = [turn for session in sessions["sessions"].values()
+                 for turn in runtime.session_turns(state_file, session, sessions["format_version"])]
         require(len(turns) == 1 and turns[0]["status"]["state"] == "Completed", "完成历史未保存或旧消息被重放")
         receipt = next(item for item in receipts["entries"] if item["message"]["id"] == "package-chat")
         require(len(receipt["segments"]["parts"]) == 2, "回复未分成两条 QQ 消息")
