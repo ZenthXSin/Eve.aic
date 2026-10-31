@@ -1,6 +1,8 @@
 """真实 QQ 宿主：模型快捷切换、权限、在途快照、角色配置与重启恢复。"""
 import json
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import developer_tools_test as developer
 from dialogue_tools_test import text_response, tool_response
@@ -25,6 +27,7 @@ class ModelSwitchAcceptance(developer.DeveloperAcceptance):
                        EVE_MODELS_AUXILIARY_SMALL_PROVIDER='openai',
                        EVE_MODELS_AUXILIARY_SMALL_MODEL='auxiliary-a',
                        EVE_MODELS_AUXILIARY_SMALL_MAX_OUTPUT_TOKENS='96')
+        env.update(options.pop('env_extra', {}))
         return self.run_eve(script, interest=False, memory=False, research=False, practice=False,
                             env_extra=env, **options)
 
@@ -75,6 +78,52 @@ class ModelSwitchAcceptance(developer.DeveloperAcceptance):
         self.assertNotIn('provider.openai', current['namespaces'])
         self.enabled([*self.send(self.message('aux-restored', '重启后辅助路由', expected='角色=auxiliary-b'))], auxiliary=True)
         self.assertEqual(self.stored()['current'], current)
+
+    def test_independent_auxiliary_server_receives_only_its_key_and_restores_conversation(self):
+        received = []
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                received.append({'path': self.path, 'key': self.headers.get('Authorization'), 'body': body})
+                data = json.dumps(text_response('独立=' + body['model'])).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        env = {'EVE_OPENAI_AUXILIARY_BASE_URL': f'http://127.0.0.1:{server.server_address[1]}/v1',
+               'EVE_OPENAI_AUXILIARY_PROTOCOL': 'chat',
+               'EVE_AUXILIARY_API_KEY': 'auxiliary-fixture-key',
+               'EVE_MODELS_AUXILIARY_SMALL_CREDENTIAL_REF': 'env:EVE_AUXILIARY_API_KEY'}
+        try:
+            self.enabled(self.send(self.message('independent-first', '第一次独立模型', expected='独立=auxiliary-a')),
+                         auxiliary=True, env_extra=env)
+            self.enabled(self.send(self.message('independent-restored', '重启后继续独立模型', expected='独立=auxiliary-a')),
+                         auxiliary=True, env_extra=env)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        self.assertEqual(len(received), 2)
+        self.assertTrue(all(r['path'] == '/v1/chat/completions' for r in received))
+        self.assertTrue(all(r['key'] == 'Bearer auxiliary-fixture-key' for r in received))
+        self.assertTrue(all(r['body']['max_tokens'] == 96 for r in received))
+        self.assertTrue(any(m.get('content') == '第一次独立模型' for m in received[1]['body']['messages']))
+        self.assertEqual(self.kind('chat'), [], '主端点不接收独立辅助对话')
+
+    def test_unused_invalid_auxiliary_key_does_not_block_primary_dialogue(self):
+        self.callback = lambda body: text_response('模型=' + body['model'])
+        self.enabled(self.send(self.message('unused-bad-key', '普通对话继续', expected='模型=direct-a')),
+                     env_extra={'EVE_AUXILIARY_API_KEY': 'invalid synthetic key'})
+        self.assertEqual(len(self.kind('chat')), 1)
 
     def test_ordinary_user_and_invalid_arguments_cannot_change_configuration(self):
         self.callback = lambda body: text_response('仍为=' + body['model'])

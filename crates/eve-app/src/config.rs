@@ -127,6 +127,14 @@ pub(crate) fn openai_schema() -> ConfigSchema {
                 string("https://ai.xn--rhqr8xvr4ahqsgka.com", "EVE_OPENAI_BASE_URL"),
             ),
             ("semantic_base_url".into(), semantic_base),
+            (
+                "auxiliary_base_url".into(),
+                string("", "EVE_OPENAI_AUXILIARY_BASE_URL"),
+            ),
+            (
+                "auxiliary_protocol".into(),
+                string("", "EVE_OPENAI_AUXILIARY_PROTOCOL"),
+            ),
             ("semantic_query_background".into(), semantic_background),
             (
                 "semantic_query_timeout_ms".into(),
@@ -401,8 +409,25 @@ pub(crate) fn provider_config_for(
     if model.trim().is_empty() {
         return Err("请配置主模型：EVE_OPENAI_MODEL 或 provider.openai.model。".into());
     }
-    let base_url: String = snapshot.get("base_url")?;
-    let protocol: String = snapshot.get("protocol")?;
+    let mut base_url: String = snapshot.get("base_url")?;
+    if purpose == eve_llm_api::CredentialPurpose::Auxiliary {
+        let independent: String = snapshot.get("auxiliary_base_url")?;
+        if !independent.is_empty() {
+            if primary.and_then(|profile| profile.credential_ref.as_deref())
+                != Some(crate::model_credentials::AUXILIARY)
+            {
+                return Err("独立辅助端点须显式选择宿主辅助凭据引用。".into());
+            }
+            base_url = independent;
+        }
+    }
+    let mut protocol: String = snapshot.get("protocol")?;
+    if purpose == eve_llm_api::CredentialPurpose::Auxiliary {
+        let independent: String = snapshot.get("auxiliary_protocol")?;
+        if !independent.is_empty() {
+            protocol = independent;
+        }
+    }
     let config = match protocol.as_str() {
         "chat" => OpenAiConfig::chat(model),
         "responses" => OpenAiConfig::new(model),
@@ -428,6 +453,66 @@ pub(crate) fn provider_config_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_auxiliary_endpoint_requires_explicit_binding_and_valid_protocol_without_affecting_primary()
+     {
+        use eve_llm_api::CredentialPurpose;
+        let mut provider = snapshot();
+        provider.values.insert(
+            "auxiliary_base_url".into(),
+            json!("http://127.0.0.1:12345/v1"),
+        );
+        provider
+            .values
+            .insert("auxiliary_protocol".into(), json!("chat"));
+        let mut profile = ModelProfile {
+            provider: "openai".into(),
+            model: "auxiliary-synthetic".into(),
+            credential_ref: None,
+            timeout_ms: 1000,
+            max_concurrent_requests: 1,
+            max_output_tokens: Some(32),
+            semantic: None,
+        };
+        assert!(
+            provider_config_for(&provider, Some(&profile), CredentialPurpose::Auxiliary).is_err()
+        );
+        profile.credential_ref = Some(crate::model_credentials::PRIMARY.into());
+        assert!(
+            provider_config_for(&provider, Some(&profile), CredentialPurpose::Auxiliary).is_err()
+        );
+        profile.credential_ref = Some(crate::model_credentials::AUXILIARY.into());
+        assert!(
+            provider_config_for(&provider, Some(&profile), CredentialPurpose::Auxiliary).is_ok()
+        );
+        provider
+            .values
+            .insert("auxiliary_protocol".into(), json!("invalid"));
+        assert!(
+            provider_config_for(&provider, Some(&profile), CredentialPurpose::Auxiliary).is_err()
+        );
+        provider
+            .values
+            .insert("auxiliary_base_url".into(), json!("invalid://synthetic"));
+        provider
+            .values
+            .insert("auxiliary_protocol".into(), json!("chat"));
+        // URI 解析不等同于传输允许；Provider 构造在网络请求前拒绝不支持的 scheme。
+        let invalid_transport =
+            provider_config_for(&provider, Some(&profile), CredentialPurpose::Auxiliary).unwrap();
+        assert!(eve_llm_openai::OpenAiProvider::new(invalid_transport, "synthetic-key").is_err());
+        provider
+            .values
+            .insert("auxiliary_base_url".into(), json!("not a url"));
+        assert!(
+            provider_config_for(&provider, Some(&profile), CredentialPurpose::Auxiliary).is_err()
+        );
+        assert!(
+            provider_config(&provider, None).is_ok(),
+            "未选用的辅助配置不影响主端点"
+        );
+    }
 
     #[test]
     fn purpose_routes_are_validated_before_configuration_publish() {
