@@ -524,11 +524,20 @@ while True:
         self.assertEqual(self.events.read_text().splitlines(),['old'])
 
     def test_prepare_lease_is_revalidated_after_waiting_for_delivery(self):
-        self.write_state('Pending','Processing');self.launch()
+        self.write_state('Pending','Processing')
+        # 等进入真实排空等待后才推进测试时钟；不依赖机器在 500ms 内完成准备。
+        advance = self.root/'advance-clock'
+        wrapper = self.root/'lease-clock-supervisor.py'
+        wrapper.write_text('import sys\nsys.path.insert(0, '+repr(str(SCRIPT.parent))+')\n'
+            'import self_upgrade_runtime as runtime\nfrom pathlib import Path\n'
+            'real_time=runtime.time.time\n'
+            'runtime.time.time=lambda: real_time() + (runtime.LEASE_SECONDS+1 if Path('
+            +repr(str(advance))+').exists() else 0)\nraise SystemExit(runtime.main())\n', encoding='utf8')
+        self.launch(script=wrapper)
         request=self.candidate('new')
-        request['lease']['expires_at_ms']=request['lease']['created_at_ms']+500
         runtime.atomic(self.queue/'request.json',request)
-        self.wait(lambda d:d['phase']=='waiting');time.sleep(.6)
+        self.wait(lambda d:d['phase']=='waiting')
+        advance.touch()
         self.write_state('Completed','Sent')
         self.wait(lambda d:d['error']=='prepare_lease_expired')
         self.assertEqual(self.events.read_text().splitlines(),['old'])
