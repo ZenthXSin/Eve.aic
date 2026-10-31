@@ -84,9 +84,76 @@ struct Inner {
     resets: ContextResets,
     active: bool,
 }
+fn deactivate(inner: &mut Inner) {
+    inner.active = false;
+    // 停止后的句柄只能拒绝访问，原始字节仍在后端；游标不再持有整份旧正文。
+    inner.document.sessions.clear();
+    inner.resets.boundaries.clear();
+}
+struct TurnCursor {
+    inner: Arc<Mutex<Inner>>,
+    summary: SessionHistorySummary,
+    through: usize,
+    next: usize,
+    pending: Option<SessionTurn>,
+    failed: bool,
+}
+impl SessionTurnCursor for TurnCursor {
+    fn summary(&self) -> &SessionHistorySummary {
+        &self.summary
+    }
+    fn next_page(&mut self) -> SessionResult<Vec<SessionTurn>> {
+        if self.failed {
+            return Err(SessionError::Unavailable);
+        }
+        let result = (|| {
+            let inner = self.inner.lock().map_err(|_| SessionError::Unavailable)?;
+            if !inner.active {
+                return Err(SessionError::Unavailable);
+            }
+            let current = inner
+                .document
+                .sessions
+                .get(&self.summary.key.session_id)
+                .ok_or(SessionError::CorruptState)?;
+            if current.key != self.summary.key {
+                return Err(SessionError::OwnerMismatch);
+            }
+            if current.revision < self.summary.revision || current.turns.len() < self.through {
+                return Err(SessionError::CorruptState);
+            }
+            let end = self
+                .next
+                .saturating_add(MAX_SESSION_TURN_PAGE)
+                .min(self.through);
+            let page = (self.next..end)
+                .map(|index| {
+                    // 已终结的前缀不可更改；唯一可变的末尾 Pending 在创建时单独固定。
+                    if index + 1 == self.through
+                        && let Some(pending) = &self.pending
+                    {
+                        pending.clone()
+                    } else {
+                        current.turns[index].clone()
+                    }
+                })
+                .collect();
+            self.next = end;
+            Ok(page)
+        })();
+        if result.is_err() {
+            self.failed = true;
+            self.pending = None;
+            if let Ok(mut inner) = self.inner.lock() {
+                deactivate(&mut inner);
+            }
+        }
+        result
+    }
+}
 struct StoredSessions {
     context: PluginContext,
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
 }
 impl StoredSessions {
     fn open(context: PluginContext) -> SessionResult<Self> {
@@ -159,11 +226,11 @@ impl StoredSessions {
         }
         Ok(Self {
             context,
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 document,
                 resets,
                 active: true,
-            }),
+            })),
         })
     }
     fn lock(&self) -> SessionResult<MutexGuard<'_, Inner>> {
@@ -177,7 +244,7 @@ impl StoredSessions {
         let bytes = serde_json::to_vec(&document).map_err(|_| SessionError::CorruptState)?;
         if self.context.state_set(SESSION_STATE_KEY, bytes).is_err() {
             // 后端可能已提交但确认丢失；旧缓存不能再覆盖实际状态或重用轮次 ID。
-            inner.active = false;
+            deactivate(inner);
             return Err(SessionError::Storage);
         }
         inner.document = document;
@@ -212,14 +279,43 @@ impl StoredSessions {
         self.save(&mut inner, next)
     }
     fn close(&self) -> PluginResult<()> {
-        self.inner
+        let mut inner = self
+            .inner
             .lock()
-            .map_err(|_| PluginError::State("会话锁不可用".into()))?
-            .active = false;
+            .map_err(|_| PluginError::State("会话锁不可用".into()))?;
+        deactivate(&mut inner);
         Ok(())
     }
 }
 impl SessionService for StoredSessions {
+    fn scan_turns(&self, key: &SessionKey) -> SessionResult<Option<Box<dyn SessionTurnCursor>>> {
+        key.validate()?;
+        let inner = self.lock()?;
+        let Some(snapshot) = inner.document.sessions.get(&key.session_id) else {
+            return Ok(None);
+        };
+        if snapshot.key != *key {
+            return Err(SessionError::OwnerMismatch);
+        }
+        Ok(Some(Box::new(TurnCursor {
+            inner: self.inner.clone(),
+            summary: SessionHistorySummary {
+                key: key.clone(),
+                revision: snapshot.revision,
+                turn_count: u64::try_from(snapshot.turns.len())
+                    .map_err(|_| SessionError::LimitReached)?,
+            },
+            through: snapshot.turns.len(),
+            next: 0,
+            pending: snapshot
+                .turns
+                .last()
+                .filter(|t| matches!(t.status, SessionTurnStatus::Pending))
+                .cloned(),
+            failed: false,
+        })))
+    }
+
     fn reset_context(&self, key: Option<&SessionKey>) -> SessionResult<usize> {
         let mut inner = self.lock()?;
         if let Some(key) = key {
@@ -256,7 +352,7 @@ impl SessionService for StoredSessions {
             .is_err()
         {
             // 写入结果可能不确定，停止旧句柄，不能继续携带可能已清空的上下文。
-            inner.active = false;
+            deactivate(&mut inner);
             return Err(SessionError::Storage);
         }
         inner.resets = next;

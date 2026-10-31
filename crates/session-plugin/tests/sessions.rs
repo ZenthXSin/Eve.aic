@@ -712,3 +712,84 @@ async fn recovered_history_keys_are_read_only_and_old_handles_stay_unavailable()
     assert_eq!(state.get(&id(), SESSION_STATE_KEY).unwrap(), saved);
     kernel.stop_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn turn_pages_pin_pending_and_prefix_across_completion_append_reset_and_restart() {
+    let state = Arc::new(MemoryStateStore::default());
+    let (kernel, registry, sessions) = open(state.clone()).await;
+    let own = key("pages", "owner");
+    assert!(sessions.scan_turns(&own).unwrap().is_none());
+    for n in 0..20 {
+        let text = format!("原文{n}");
+        let started = sessions.begin(input("pages", "owner", &text)).unwrap();
+        sessions.complete(&started.lease, simple(&text)).unwrap();
+    }
+    let pending = sessions
+        .begin(input("pages", "owner", "创建游标时在途"))
+        .unwrap();
+    let mut cursor = sessions.scan_turns(&own).unwrap().unwrap();
+    let summary = cursor.summary().clone();
+    assert_eq!(summary.turn_count, 21);
+    assert_eq!(summary.revision, 41);
+    assert!(matches!(
+        sessions.scan_turns(&key("pages", "other")),
+        Err(SessionError::OwnerMismatch)
+    ));
+    let mut observed = cursor.next_page().unwrap();
+    assert_eq!(observed.len(), MAX_SESSION_TURN_PAGE);
+    sessions
+        .complete(&pending.lease, simple("创建游标时在途"))
+        .unwrap();
+    sessions
+        .begin(input("pages", "owner", "游标后新轮次"))
+        .unwrap();
+    sessions.reset_context(Some(&own)).unwrap();
+    observed.extend(cursor.next_page().unwrap());
+    assert!(cursor.next_page().unwrap().is_empty());
+    assert_eq!(observed.len(), 21);
+    assert_eq!(observed.last().unwrap().status, SessionTurnStatus::Pending);
+    SessionSnapshot {
+        key: own.clone(),
+        revision: summary.revision,
+        turns: observed,
+    }
+    .validate()
+    .unwrap();
+    assert_eq!(
+        sessions
+            .scan_turns(&own)
+            .unwrap()
+            .unwrap()
+            .summary()
+            .turn_count,
+        22
+    );
+    let saved = state.get(&id(), SESSION_STATE_KEY).unwrap();
+    kernel.stop(&id()).await.unwrap();
+    assert_eq!(state.get(&id(), SESSION_STATE_KEY).unwrap(), saved);
+    assert!(cursor.next_page().is_err());
+    kernel.start(&id()).await.unwrap();
+    let new = service(&kernel, &registry);
+    assert_eq!(new.snapshot(&own).unwrap().unwrap().turns.len(), 22);
+    assert!(cursor.next_page().is_err());
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn storage_error_also_invalidates_existing_turn_cursors() {
+    let state = Arc::new(FaultStore::default());
+    let (kernel, _, sessions) = open(state.clone()).await;
+    let first = sessions.begin(input("pages", "u", "完成原文")).unwrap();
+    sessions.complete(&first.lease, simple("完成原文")).unwrap();
+    let mut cursor = sessions.scan_turns(&first.lease.key).unwrap().unwrap();
+    let before = state.get(&id(), SESSION_STATE_KEY).unwrap();
+    state.fail.store(true, Ordering::SeqCst);
+    assert_eq!(
+        sessions.begin(input("other", "u", "失败输入")),
+        Err(SessionError::Storage)
+    );
+    assert_eq!(cursor.next_page(), Err(SessionError::Unavailable));
+    assert_eq!(state.get(&id(), SESSION_STATE_KEY).unwrap(), before);
+    state.fail.store(false, Ordering::SeqCst);
+    kernel.stop_all().await.unwrap();
+}

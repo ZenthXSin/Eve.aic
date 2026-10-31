@@ -2,6 +2,10 @@
 use eve_llm_api::{ChatMessage, ChatRole, ModelRequest, ToolResult};
 use serde::{Deserialize, Serialize};
 use std::{fmt, sync::Arc};
+mod scan;
+pub use scan::{
+    MAX_SESSION_TURN_PAGE, SessionHistorySummary, SessionTurnCursor, SnapshotTurnCursor,
+};
 
 pub const SESSION_PLUGIN_ID: &str = "eve.session";
 pub const SESSION_SERVICE_ID: &str = "eve.session.history";
@@ -269,6 +273,17 @@ impl fmt::Display for SessionError {
 impl std::error::Error for SessionError {}
 
 pub trait SessionService: Send + Sync {
+    fn scan_turns(&self, key: &SessionKey) -> SessionResult<Option<Box<dyn SessionTurnCursor>>> {
+        match self.snapshot(key)? {
+            Some(snapshot) => {
+                if snapshot.key != *key {
+                    return Err(SessionError::OwnerMismatch);
+                }
+                Ok(Some(Box::new(SnapshotTurnCursor::new(snapshot)?)))
+            }
+            None => Ok(None),
+        }
+    }
     /// 重置后续轮次使用的历史边界，不删除原始轮次或改变已在执行的请求。
     /// Some 仅限该完整会话身份；None 为全局。调用者负责全局管理员授权。
     /// 返回设置边界的会话数；不支持此能力的实现拒绝操作。

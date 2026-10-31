@@ -2,7 +2,10 @@
 use eve_llm_api::*;
 use eve_memory_api::{ContextCandidate, ContextRelevanceSelector, ContextSelectionInput};
 use eve_plugin_api::{ServiceId, ServiceRegistry};
-use eve_session_api::{SESSION_SERVICE_ID, SessionKey, SessionServiceHandle};
+use eve_session_api::{
+    MAX_SESSION_TURN_PAGE, SESSION_SERVICE_ID, SessionKey, SessionServiceHandle, SessionTurnStatus,
+    validate_completed_turn,
+};
 use eve_task_api::TaskAdmin;
 use serde_json::{Value, json};
 use std::{
@@ -303,7 +306,11 @@ impl HistoryContextPlanner for Planner {
 
 pub(crate) struct ReadRecord(pub(crate) Arc<Planner>);
 impl ReadRecord {
-    fn records(&self, scope: &ContextScope) -> Result<Vec<(String, String)>, ToolExecutionError> {
+    fn for_each_record(
+        &self,
+        scope: &ContextScope,
+        mut visit: impl FnMut(&[ChatMessage]) -> Result<(), ToolExecutionError>,
+    ) -> Result<(), ToolExecutionError> {
         let failed = |s: &str| ToolExecutionError::Failed(s.into());
         let session = self
             .0
@@ -316,20 +323,64 @@ impl ReadRecord {
             .map_err(|_| failed("会话服务类型错误"))?;
         let key = SessionKey::new(&scope.session_id, &scope.user_id)
             .map_err(|_| failed("可信会话无效"))?;
-        let history = session
+        let Some(mut cursor) = session
             .0
-            .snapshot(&key)
+            .scan_turns(&key)
             .map_err(|_| failed("原始会话不可用"))?
-            .map_or(vec![], |s| s.history());
-        history_turns(&history)
-            .into_iter()
-            .map(|g| {
-                Ok((
-                    format!("history:{}", hash(g).map_err(|_| failed("原文引用无效"))?),
-                    serde_json::to_string(g).map_err(|_| failed("原文无法读取"))?,
-                ))
-            })
-            .collect()
+        else {
+            return Ok(());
+        };
+        let summary = cursor.summary().clone();
+        if summary.key != key {
+            return Err(failed("原始会话范围无效"));
+        }
+        let mut count = 0u64;
+        let mut revision = 0u64;
+        loop {
+            let page = cursor.next_page().map_err(|_| failed("原始会话不可用"))?;
+            if cursor.summary() != &summary || page.len() > MAX_SESSION_TURN_PAGE {
+                return Err(failed("原始会话页无效"));
+            }
+            if page.is_empty() {
+                break;
+            }
+            for turn in page {
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| failed("原始会话计数无效"))?;
+                revision = revision
+                    .checked_add(1)
+                    .ok_or_else(|| failed("原始会话修订无效"))?;
+                if turn.id != count || count > summary.turn_count || turn.input.trim().is_empty() {
+                    return Err(failed("原始会话轮次无效"));
+                }
+                if !matches!(turn.status, SessionTurnStatus::Pending) {
+                    revision = revision
+                        .checked_add(1)
+                        .ok_or_else(|| failed("原始会话修订无效"))?;
+                }
+                match turn.status {
+                    SessionTurnStatus::Completed { messages } => {
+                        validate_completed_turn(&turn.input, &messages)
+                            .map_err(|_| failed("原始会话消息无效"))?;
+                        for group in history_turns(&messages) {
+                            visit(group)?;
+                        }
+                    }
+                    SessionTurnStatus::Pending if count != summary.turn_count => {
+                        return Err(failed("原始会话在途轮次无效"));
+                    }
+                    SessionTurnStatus::Failed { failure } => failure
+                        .validate()
+                        .map_err(|_| failed("原始会话失败记录无效"))?,
+                    _ => {}
+                }
+            }
+        }
+        if count != summary.turn_count || revision != summary.revision {
+            return Err(failed("原始会话计数或修订不匹配"));
+        }
+        Ok(())
     }
 }
 impl Tool for ReadRecord {
@@ -381,7 +432,16 @@ impl Tool for ReadRecord {
             let failed = |s: &str| ToolExecutionError::Failed(s.into());
             if call.arguments["action"] == "search" {
                 let query = call.arguments["query"].as_str().unwrap().to_lowercase();
-                let hits:Vec<_>=self.records(scope)?.into_iter().rev().filter(|(_,s)|s.to_lowercase().contains(&query)).take(8).map(|(reference,raw)|json!({"reference":reference,"bytes":raw.len(),"excerpt":excerpt(&raw,256)})).collect();
+                let mut hits = std::collections::VecDeque::new();
+                self.for_each_record(scope, |group| {
+                    let raw = serde_json::to_string(group).map_err(|_| failed("原文无法读取"))?;
+                    if raw.to_lowercase().contains(&query) {
+                        if hits.len() == 8 { hits.pop_front(); }
+                        hits.push_back(json!({"reference":format!("history:{}", digest_bytes(raw.as_bytes())),"bytes":raw.len(),"excerpt":excerpt(&raw,256)}));
+                    }
+                    Ok(())
+                })?;
+                let hits: Vec<_> = hits.into_iter().rev().collect();
                 return Ok(json!({"records":hits,"scope":"current_only"}));
             }
             let reference = call.arguments["reference"].as_str().unwrap();
@@ -404,11 +464,20 @@ impl Tool for ReadRecord {
                     .ok_or_else(|| failed("没有本scope的该记录"))?;
                 serde_json::to_string(task).map_err(|_| failed("任务记录无法编码"))?
             } else {
-                self.records(scope)?
-                    .into_iter()
-                    .find(|(r, _)| r == reference)
-                    .ok_or_else(|| failed("没有本scope的该记录"))?
-                    .1
+                let mut selected = None;
+                self.for_each_record(scope, |group| {
+                    if selected.is_none()
+                        && format!(
+                            "history:{}",
+                            hash(group).map_err(|_| failed("原文引用无效"))?
+                        ) == reference
+                    {
+                        selected =
+                            Some(serde_json::to_string(group).map_err(|_| failed("原文无法读取"))?);
+                    }
+                    Ok(())
+                })?;
+                selected.ok_or_else(|| failed("没有本scope的该记录"))?
             };
             let offset = usize::try_from(call.arguments["offset"].as_u64().unwrap_or(0))
                 .map_err(|_| failed("分页偏移无效"))?;
@@ -902,5 +971,135 @@ mod tests {
             history.iter().filter(|m| m.role == ChatRole::User).count(),
             6
         );
+    }
+    struct LatePageFailure {
+        summary: eve_session_api::SessionHistorySummary,
+        position: usize,
+    }
+    impl eve_session_api::SessionTurnCursor for LatePageFailure {
+        fn summary(&self) -> &eve_session_api::SessionHistorySummary {
+            &self.summary
+        }
+        fn next_page(
+            &mut self,
+        ) -> eve_session_api::SessionResult<Vec<eve_session_api::SessionTurn>> {
+            if self.position != 0 {
+                return Err(eve_session_api::SessionError::Storage);
+            }
+            self.position += 1;
+            Ok(vec![eve_session_api::SessionTurn {
+                id: 1,
+                input: "needle-owned-original".into(),
+                status: SessionTurnStatus::Completed {
+                    messages: vec![
+                        ChatMessage::text(ChatRole::User, "needle-owned-original"),
+                        ChatMessage::text(ChatRole::Assistant, "exact-answer"),
+                    ],
+                },
+            }])
+        }
+    }
+    struct CursorOnlySessions;
+    impl eve_session_api::SessionService for CursorOnlySessions {
+        fn snapshot(
+            &self,
+            _: &SessionKey,
+        ) -> eve_session_api::SessionResult<Option<eve_session_api::SessionSnapshot>> {
+            panic!("archive tool must use pages, not full snapshot")
+        }
+        fn scan_turns(
+            &self,
+            key: &SessionKey,
+        ) -> eve_session_api::SessionResult<Option<Box<dyn eve_session_api::SessionTurnCursor>>>
+        {
+            Ok(Some(Box::new(LatePageFailure {
+                summary: eve_session_api::SessionHistorySummary {
+                    key: key.clone(),
+                    revision: 4,
+                    turn_count: 2,
+                },
+                position: 0,
+            })))
+        }
+        fn begin(
+            &self,
+            _: eve_session_api::SessionInput,
+        ) -> eve_session_api::SessionResult<eve_session_api::StartedTurn> {
+            Err(eve_session_api::SessionError::Unavailable)
+        }
+        fn complete(
+            &self,
+            _: &eve_session_api::TurnLease,
+            _: Vec<ChatMessage>,
+        ) -> eve_session_api::SessionResult<()> {
+            Err(eve_session_api::SessionError::Unavailable)
+        }
+        fn fail(
+            &self,
+            _: &eve_session_api::TurnLease,
+            _: eve_session_api::SessionFailure,
+        ) -> eve_session_api::SessionResult<()> {
+            Err(eve_session_api::SessionError::Unavailable)
+        }
+    }
+    struct CursorOnlyPlugin(eve_plugin_api::PluginManifest);
+    impl eve_plugin_api::Plugin for CursorOnlyPlugin {
+        fn manifest(&self) -> &eve_plugin_api::PluginManifest {
+            &self.0
+        }
+        fn start(
+            &mut self,
+            context: eve_plugin_api::PluginContext,
+        ) -> eve_plugin_api::PluginFuture<'_, Option<eve_plugin_api::Cleanup>> {
+            Box::pin(async move {
+                context.provide_service(
+                    ServiceId::new(SESSION_SERVICE_ID)?,
+                    SessionServiceHandle(Arc::new(CursorOnlySessions)),
+                )?;
+                Ok(None)
+            })
+        }
+    }
+    #[tokio::test]
+    async fn archive_read_checks_later_pages_even_after_finding_a_matching_record() {
+        let (kernel, planner, _root, _old) = world().await;
+        kernel
+            .stop(&eve_plugin_api::PluginId::new(eve_session_api::SESSION_PLUGIN_ID).unwrap())
+            .await
+            .unwrap();
+        kernel
+            .register(Box::new(CursorOnlyPlugin(
+                eve_plugin_api::PluginManifest::new("test.cursor-only", "0.1.0").unwrap(),
+            )))
+            .unwrap();
+        kernel
+            .start(&eve_plugin_api::PluginId::new("test.cursor-only").unwrap())
+            .await
+            .unwrap();
+        let tool = ReadRecord(planner);
+        let original = vec![
+            ChatMessage::text(ChatRole::User, "needle-owned-original"),
+            ChatMessage::text(ChatRole::Assistant, "exact-answer"),
+        ];
+        for arguments in [
+            json!({"action":"search","query":"needle-owned-original"}),
+            json!({"action":"read","reference":format!("history:{}",hash(&original).unwrap())}),
+        ] {
+            let result = tool
+                .execute(
+                    ToolCall {
+                        id: "paged-read".into(),
+                        name: "read_context_record".into(),
+                        arguments,
+                    },
+                    ToolExecutionContext::new().with_scope(Some(scope("alice"))),
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "a matching early page is not proof that the source is intact"
+            );
+        }
+        kernel.stop_all().await.unwrap();
     }
 }
