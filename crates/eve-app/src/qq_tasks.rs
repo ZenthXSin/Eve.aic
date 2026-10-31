@@ -770,18 +770,41 @@ fn view(task: &Task, result_bytes: usize) -> Value {
     view_steps(task, result_bytes, page)
 }
 
+fn checkpoint_charged_steps(checkpoint: &eve_llm_api::TurnCheckpoint) -> u32 {
+    u32::try_from(
+        checkpoint
+            .used_tool_calls
+            .saturating_add(checkpoint.delegated_tool_calls),
+    )
+    .unwrap_or(u32::MAX)
+}
+
+fn task_charged_steps(task: &Task) -> Option<u32> {
+    task.usage
+        .map(|usage| usage.tool_calls)
+        .into_iter()
+        .chain(
+            task.execution
+                .as_ref()
+                .and_then(|execution| execution.checkpoint.as_ref())
+                .map(checkpoint_charged_steps),
+        )
+        .max()
+}
+
 fn view_steps(
     task: &Task,
     result_bytes: usize,
     page: crate::qq_task_diagnostics::StepWindow,
 ) -> Value {
+    let charged_steps = task_charged_steps(task);
     json!({
         "id": task.id,
         "title": task.spec.title,
         "status": status_text(task),
         "max_steps": task.spec.max_steps,
         "include_context": task.spec.context.is_some(),
-        "steps_used": task.usage.map(|usage| usage.tool_calls).or_else(|| task.execution.as_ref().and_then(|e| e.checkpoint.as_ref()).map(|c| c.used_tool_calls as u32)),
+        "steps_used": charged_steps,
         "auto_recoveries": task.execution.as_ref().map_or(0, |e| e.recoveries),
         "waiting_to_resume": task.execution.as_ref().is_some_and(|e| e.resume_at_ms.is_some()) && task.status == TaskStatus::Running,
         "blocked": task.status == TaskStatus::Blocked,
@@ -795,7 +818,7 @@ fn view_steps(
                 "checkpoint_resumable":checkpoint.is_some_and(|c| c.resumable()),
                 "pending_tool_calls":checkpoint.map_or(0, |c| c.pending_calls.len()),
                 "deadline_at_ms":task.execution.as_ref().and_then(|e| e.deadline_at_ms),
-                "remaining_tool_steps":task.spec.max_steps.saturating_sub(checkpoint.map_or(task.usage.map_or(0, |u| u.tool_calls), |c| (c.used_tool_calls+c.delegated_tool_calls) as u32)),
+                "remaining_tool_steps":task.spec.max_steps.saturating_sub(charged_steps.unwrap_or(0)),
                 "reproduction":{"mode":"simulation_only","task_id":task.id,
                     "instruction":"在隔离环境以冻结回执和脚本模型复现；不要重放未知工具或生产发送"}})
         }),
@@ -996,7 +1019,7 @@ impl Tool for ListTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: LIST_TOOL.into(),
-            description: "查看自己的后台任务、结果、失败原因及已保存的实际步骤。给 task_id 返回该任务最近 12 步；step_offset 可从第 0 步起分页，每页至多 25 步。不给 task_id 列出最近 10 个任务。未确认回执不等于成功，也不能直接重跑。".into(),
+            description: "查看自己的后台任务、结果、失败原因及已保存的实际步骤。给 task_id 返回该任务最近 12 步；step_offset 可从第 0 步起分页，每页至多 25 步。不给 task_id 列出最近 10 个任务。steps_used 包含父执行者及全部子代理的共享消耗，step_total 只计当前执行者保存的步骤记录，两者可以不同。未确认回执不等于成功，也不能直接重跑。".into(),
             argument_schema: json!({
                 "type": "object",
                 "properties": {"task_id": {"type": "string"}, "step_offset":{"type":"integer","minimum":0}, "step_limit":{"type":"integer","minimum":1,"maximum":25}},
@@ -1960,6 +1983,58 @@ mod tests {
         assert_eq!(reads, 2);
         let (views, marks) = task_context_cards(&directory, &scope, 100, |_, _| Ok(None)).unwrap();
         assert!(views.is_empty() && marks.is_empty());
+    }
+
+    #[test]
+    fn task_card_shared_usage_includes_children_and_keeps_final_usage_and_remaining_consistent() {
+        let mut task = task(TaskStatus::Failed);
+        task.result = None;
+        let checkpoint = eve_llm_api::TurnCheckpoint {
+            version: 2,
+            scope: ContextScope {
+                session_id: task.owner.session_id.clone(),
+                user_id: task.owner.user_id.clone(),
+            },
+            messages: vec![eve_llm_api::ChatMessage::text(
+                eve_llm_api::ChatRole::User,
+                "原任务",
+            )],
+            pending_calls: vec![ToolCall {
+                id: "child".into(),
+                name: "run_subagent".into(),
+                arguments: json!({"task":"检查"}),
+            }],
+            used_tool_calls: 1,
+            delegated_tool_calls: 3,
+            delegated_model_requests: 2,
+            provider_requests: 1,
+            tool_batches: 1,
+            remaining: None,
+            continuation_checks: 0,
+            closing: false,
+            result: None,
+        };
+        checkpoint.validate(task.spec.max_steps as usize).unwrap();
+        task.execution = Some(eve_task_api::TaskExecution {
+            checkpoint: Some(checkpoint),
+            deadline_at_ms: Some(1000),
+            ..Default::default()
+        });
+        let data = view(&task, PREVIEW_BYTES);
+        assert_eq!(data["steps_used"], 4);
+        assert_eq!(data["step_total"], 1);
+        assert_eq!(data["failure_receipt"]["remaining_tool_steps"], 46);
+        task.usage = Some(TaskUsage {
+            tool_calls: 7,
+            model_requests: 8,
+        });
+        let data = view(&task, PREVIEW_BYTES);
+        assert_eq!(data["steps_used"], 7);
+        assert_eq!(data["failure_receipt"]["remaining_tool_steps"], 43);
+        task.execution = None;
+        assert_eq!(view(&task, PREVIEW_BYTES)["steps_used"], 7);
+        task.usage = None;
+        assert!(view(&task, PREVIEW_BYTES)["steps_used"].is_null());
     }
 
     #[test]
