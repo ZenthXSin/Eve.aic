@@ -1260,7 +1260,7 @@ async fn run_qqbot_composed(
                 )) as Arc<dyn eve_memory_api::MemoryContinuityFactory>
             });
         let summaries: Option<Arc<dyn SummaryAdmin>> = if memory.is_some() {
-            let plugin = ConversationSummaryPlugin::new()?;
+            let plugin = ConversationSummaryPlugin::new()?.with_archive(Arc::new(eve_memory_plugin::FileSummaryArchive::open(options.state_directory.join("summary-archive"))?));
             let controller = plugin.controller();
             kernel.register(Box::new(plugin))?;
             kernel.start(&PluginId::new(SUMMARY_PLUGIN_ID)?).await?;
