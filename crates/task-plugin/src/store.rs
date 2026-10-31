@@ -192,6 +192,20 @@ impl StoredTasks {
         Ok(directory)
     }
 
+    pub(super) fn delivery_snapshot(&self) -> TaskResult<TaskDeliverySnapshot> {
+        let directory = TaskDeliverySnapshot {
+            tasks: self
+                .lock()?
+                .ledger
+                .tasks
+                .iter()
+                .map(TaskDeliveryEntry::from)
+                .collect(),
+        };
+        directory.validate()?;
+        Ok(directory)
+    }
+
     pub(super) fn summaries_for(&self, owner: &TaskOwner) -> TaskResult<Vec<TaskSummary>> {
         validate_owner(owner)?;
         Ok(self
@@ -963,60 +977,6 @@ fn validate_task(task: &Task) -> TaskResult<()> {
     }
     if let Some(notice) = &task.notice {
         validate_notice(notice, finished.unwrap_or(0))?;
-    }
-    Ok(())
-}
-
-fn validate_notice(notice: &Notice, finished: u64) -> TaskResult<()> {
-    let invalid = Err(TaskError::CorruptState);
-    if notice.attempts.len() > MAX_ATTEMPTS || notice.proactive_attempts() > 1 {
-        return invalid;
-    }
-    let mut carried = BTreeSet::new();
-    for (index, attempt) in notice.attempts.iter().enumerate() {
-        validate_channel(&attempt.channel)?;
-        if let Some(result) = &attempt.result {
-            validate_result(result)?;
-        }
-        let last = index + 1 == notice.attempts.len();
-        if let DeliveryChannel::Passive { message_id } = &attempt.channel
-            && !carried.insert(message_id.as_str())
-        {
-            return invalid;
-        }
-        if attempt.started_at_ms < finished
-            || (attempt.result.is_none() && !last)
-            || (!last && matches!(attempt.result, Some(DeliveryResult::Sent { .. })))
-            || (!last && attempt.result == Some(DeliveryResult::Unknown))
-            || attempt
-                .finished_at_ms
-                .is_some_and(|at| at < attempt.started_at_ms)
-            || attempt.finished_at_ms.is_some() != attempt.result.is_some()
-                && attempt.result != Some(DeliveryResult::Unknown)
-        {
-            return invalid;
-        }
-    }
-    let last_result = notice.attempts.last().map(|attempt| &attempt.result);
-    let sent = matches!(last_result, Some(Some(DeliveryResult::Sent { .. })));
-    let open_or_unknown = matches!(
-        last_result,
-        Some(None) | Some(Some(DeliveryResult::Unknown))
-    );
-    let consistent = match notice.status {
-        NoticeStatus::Pending => !sent && !open_or_unknown && notice.closed_at_ms.is_none(),
-        NoticeStatus::Delivering => {
-            matches!(last_result, Some(None)) && notice.closed_at_ms.is_none()
-        }
-        NoticeStatus::Delivered => sent && notice.closed_at_ms.is_some(),
-        NoticeStatus::Unknown => {
-            matches!(last_result, Some(Some(DeliveryResult::Unknown)))
-                && notice.closed_at_ms.is_none()
-        }
-        NoticeStatus::Expired => !sent && !open_or_unknown && notice.closed_at_ms.is_some(),
-    };
-    if !consistent {
-        return invalid;
     }
     Ok(())
 }
