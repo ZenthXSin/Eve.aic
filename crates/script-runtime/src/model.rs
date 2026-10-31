@@ -234,6 +234,10 @@ pub struct Preflight {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Request {
+    CheckTool {
+        name: String,
+        arguments: Value,
+    },
     Tool {
         name: String,
         arguments: Value,

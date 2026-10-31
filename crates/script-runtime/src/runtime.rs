@@ -436,6 +436,28 @@ impl ScriptRuntime {
                     chain.promote.lock().map_err(fail)?.insert(path);
                     json!({"staged":true,"promoted":false})
                 }
+                Request::CheckTool { name, arguments } => {
+                    if !version.spec.tools.contains(&name) {
+                        return Err(reject("脚本未声明该叶子工具"));
+                    }
+                    let arguments = resolve_workspace(arguments, chain.work.path())?;
+                    let call = ToolCall {
+                        id: format!("{}-check-{count}", receipt.call_id),
+                        name,
+                        arguments,
+                    };
+                    // 与实际执行使用同一参数/身份策略；不能把失败或取消当作普通拒绝，
+                    // 更不能把预检成功当作后续执行的权限租约。
+                    let outcome = self.dispatch.preflight_call(&call, context);
+                    check_stop(context, chain.deadline)?;
+                    let allowed = match outcome {
+                        Ok(()) => true,
+                        Err(ToolExecutionError::Rejected(_)) => false,
+                        Err(error) => return Err(error),
+                    };
+                    json!({"allowed":allowed,"executed":false,"authorization_reserved":false,
+                        "reason":if allowed {"preflight_passed"} else {"rejected"}})
+                }
                 Request::Tool { name, arguments } => {
                     if !version.spec.tools.contains(&name) {
                         return Err(reject("脚本未声明该叶子工具"));

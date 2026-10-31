@@ -224,7 +224,7 @@ impl Tool for ScriptTool {
                 vec!["version"],
             ),
             _ => (
-                "按不可变version={script,digest}执行脚本。arguments为JSON；dry_run=true只预检声明图/身份/权限/运行时配置，不建临时文件、不扣预算、不写回执、不启动进程、不调用工具。实际执行需Linux bubblewrap隔离，缺少时拒绝。子脚本与叶子共享宿主身份/权限/原子预算/取消/期限；失败停止、未知禁止重放。回执含版本、状态与证据。",
+                "按不可变version={script,digest}执行脚本。arguments为JSON；dry_run=true只预检声明图/身份/权限/运行时配置，不建临时文件、不扣预算、不写回执、不启动进程、不调用工具。运行中JSON行check_tool{name,arguments}可只读预检已声明叶子的实际参数，返回allowed/executed=false，不保留权限；实际tool重查，取消或预检运行失败停止。实际执行需Linux bubblewrap隔离，缺少时拒绝。子脚本与叶子共享宿主身份/权限/原子预算/取消/期限；失败停止、未知禁止重放。回执含版本、状态与证据。",
                 json!({"version":{"type":"object"},"arguments":{},"dry_run":{"type":"boolean"}}),
                 vec!["version", "arguments"],
             ),

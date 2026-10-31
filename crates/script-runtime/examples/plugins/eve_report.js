@@ -9,6 +9,9 @@ async function receive() {
   return JSON.parse(line.value);
 }
 async function tool(name, arguments_) {
+  process.stdout.write(JSON.stringify({ op: 'check_tool', name, arguments: arguments_ }) + '\n');
+  const permission = await receive();
+  if (!permission.ok || !permission.result.allowed) throw new Error('preflight rejected');
   process.stdout.write(JSON.stringify({ op: 'tool', name, arguments: arguments_ }) + '\n');
   const response = await receive();
   if (!response.ok) throw new Error('host rejected');

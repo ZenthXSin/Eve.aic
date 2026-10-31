@@ -18,9 +18,12 @@ async function rpc(request) {
   const text = `本地模拟报告: ${invocation.arguments.title}\n`;
   await rpc({ op: 'write', path: 'report.txt', content: text });
   // $workspace 由宿主转换为临时文件路径；脚本从不取得宿主凭据。
-  const delivered = await rpc({ op: 'tool', name: 'qq.send_file', arguments: {
+  const arguments_ = {
     path: { $workspace: 'report.txt' }, name: 'report.txt'
-  }});
+  };
+  const permission = await rpc({ op: 'check_tool', name: 'qq.send_file', arguments: arguments_ });
+  if (!permission.allowed) throw new Error('delivery preflight rejected');
+  const delivered = await rpc({ op: 'tool', name: 'qq.send_file', arguments: arguments_ });
   await rpc({ op: 'artifact', path: 'report.txt' });
   await rpc({ op: 'state', value: { count: invocation.state.value.count + 1 } });
   process.stdout.write(JSON.stringify({ op: 'return', value: { delivered, text } }) + '\n');

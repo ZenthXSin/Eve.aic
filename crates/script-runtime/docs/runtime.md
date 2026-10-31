@@ -28,12 +28,15 @@ seccomp 拒绝 fork/vfork、非线程 clone、clone3、额外 namespace 和部�
 
 | 请求 | 内容与行为 |
 | --- | --- |
+| `check_tool` | `name,arguments`，只对当前版本已声明叶子进行实际参数、可信身份及权限预检；不执行叶子 |
 | `tool` | `name,arguments`，通过同一授权派发器调用宿主叶子 |
 | `script` | `dependency,arguments`，只调用声明的不可变子版本 |
 | `state` | `value`，校验后暂存，成功终结时提交 |
 | `write` | `path,content`，通过宿主写单层共享临时文件 |
 | `artifact` | `path`，暂存提升请求，顶层成功后统一提升 |
 | `return` | `value`，须进程正常退出，才算成功 |
+
+`check_tool` 复用实际 `tool` 的参数解析（包括 `$workspace`）、参数校验和宿主只读授权策略，不运行叶子、不扣叶子步骤，也不增加执行证据或保留权限。响应为 `{allowed,executed:false,authorization_reserved:false,reason}`；`reason` 仅为 `preflight_passed` 或 `rejected`，不复制内部策略详情。`Rejected` 的参数/权限拒绝返回 `allowed:false`，脚本可停止或选择已授权替代方案；`Failed`、取消和到期仍终止调用链，不能当作普通拒绝继续。未声明工具、坏协议和非法临时路径也直接拒绝。预检可能检查文件存在及当前权限，但不证明外部服务可用或未来权限仍有效，实际 `tool` 必须重新检查。每次预检计入每进程 128 条 RPC 上限和原调用链期限；脚本进程本身仍按原规则扣一步，不能用预检请求重领预算或无限轮询。
 
 不允许额外请求字段或重复 JSON 键。每行、输入、响应和状态至多1MiB，源文件至多256KiB，单插件至多16个依赖和32个工具；调用深度至多8，每进程128条RPC。每个脚本调用和宿主叶子各原子预留一步，共享宿主 `SharedToolSteps`，失败不退款。RPC的预算随实际调用扣除，不预先假定动态分支。Eve 外层工具调用若已计步，该次 Tool 包装开销与脚本进程步骤分别计费；不会因此扩大预算。
 
@@ -42,6 +45,8 @@ seccomp 拒绝 fork/vfork、非线程 clone、clone3、额外 namespace 和部�
 临时路径引用不会给生产工具增加路径特权。QQ 普通成员的 `send_file` 仍只接受自己项目的文件，不接受任意宿主临时路径。`examples/plugins/eve_report.js` 展示生产工具协议：先通过已授权 `write_file` 写入自己 `exports/`，再经 `send_file` 排队，最后 `query_file_delivery` 查询真实回执；Pending/Sending/Unknown 均不当作送达、不重发。本地 `report.js` 使用单独的模拟 `qq.send_file` 叶子验证临时文件读取与生命周期，不声称生产 QQ 有此路径例外。
 
 `artifact` 不立即产生永久文件。顶层成功时，宿主把已声明文件复制到产物目录的暂存子目录、fsync，然后重命名为 `<root_call_id>/...`。不覆盖已有产物。产物提升与最终账本提交跨文件系统对象，可能在崩溃时留下有文件而回执 unknown 的情况；只能核对现存文件和证据，不能自动重跑生成或交付。中间子脚本成功时自己的状态和回执已持久化，顶层失败不会回滚已知子调用或外部效果。
+
+预检不会调用危险动作的审核模型，也不产生后续审核放行证据；即便 `allowed:true`，真实调用仍可能因人工/模型审核、权限撤回、文件变化或服务失败而拒绝。不得用预检绕过正常执行守卫。
 
 ## Rust独立编译与热重载
 

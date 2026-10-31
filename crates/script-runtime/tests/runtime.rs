@@ -165,6 +165,160 @@ const RETURN_ONE: &str = "import json,sys\nx=json.loads(input())\nprint(json.dum
 const TOOL: &str = "import json,sys\nx=json.loads(input())\nprint(json.dumps({'op':'tool','name':'qq.send_file','arguments':{}}),flush=True)\ny=json.loads(input())\nprint(json.dumps({'op':'return','value':y}),flush=True)\n";
 
 #[cfg(target_os = "linux")]
+struct OperationGate {
+    inner: Arc<Gate>,
+    checks: AtomicUsize,
+}
+#[cfg(target_os = "linux")]
+impl AuthorizedToolDispatch for OperationGate {
+    fn preflight_tool(&self, name: &str, ctx: &ToolExecutionContext) -> Result<()> {
+        self.inner.preflight_tool(name, ctx)
+    }
+    fn preflight_call(&self, call: &ToolCall, ctx: &ToolExecutionContext) -> Result<()> {
+        self.preflight_tool(&call.name, ctx)?;
+        self.checks.fetch_add(1, Ordering::SeqCst);
+        match call.arguments["case"].as_str() {
+            Some("denied") => Err(ToolExecutionError::Rejected("private policy detail".into())),
+            Some("failure") => Err(ToolExecutionError::Failed("private backend detail".into())),
+            Some("cancel") => {
+                ctx.cancellation_handle().cancel();
+                Ok(())
+            }
+            Some("revoke") => {
+                self.inner.allowed.store(false, Ordering::SeqCst);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    fn dispatch(&self, call: ToolCall, ctx: ToolExecutionContext) -> ToolFuture<'_> {
+        self.inner.dispatch(call, ctx)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn concrete_preflight_is_read_only_scoped_bounded_and_never_reserves_authorization() {
+    let (root, store, gate, _) = setup_isolated();
+    let checked = Arc::new(OperationGate {
+        inner: gate.clone(),
+        checks: AtomicUsize::new(0),
+    });
+    let runtime = ScriptRuntime::new(
+        store.clone(),
+        checked.clone(),
+        sandbox(),
+        root.path().join("artifacts"),
+    );
+    let source = r#"import json
+x=json.loads(input())
+for i in range(x['arguments'].get('repeat',1)):
+ print(json.dumps({'op':'check_tool','name':x['arguments'].get('name','qq.send_file'),'arguments':{'case':x['arguments']['case']}}),flush=True)
+ result=json.loads(input())['result']
+if x['arguments'].get('execute',False):
+ print(json.dumps({'op':'tool','name':'qq.send_file','arguments':{}}),flush=True)
+ result=json.loads(input())['result']
+print(json.dumps({'op':'return','value':result}),flush=True)
+"#;
+    let mut candidate = spec("permission-check", source);
+    candidate.tools = vec!["qq.send_file".into()];
+    let reference = install(&store, candidate);
+    let bound = runtime.bind(&owner(), &reference).unwrap();
+    for (id, args, expected, check_count, leaf_count) in [
+        (
+            "allowed",
+            json!({"case":"allowed"}),
+            ReceiptStatus::Succeeded,
+            1,
+            0,
+        ),
+        (
+            "denied",
+            json!({"case":"denied"}),
+            ReceiptStatus::Succeeded,
+            1,
+            0,
+        ),
+        (
+            "failure",
+            json!({"case":"failure"}),
+            ReceiptStatus::Failed,
+            1,
+            0,
+        ),
+        (
+            "cancel",
+            json!({"case":"cancel"}),
+            ReceiptStatus::Cancelled,
+            1,
+            0,
+        ),
+        (
+            "undeclared",
+            json!({"case":"allowed","name":"undeclared"}),
+            ReceiptStatus::Rejected,
+            0,
+            0,
+        ),
+        (
+            "rpc-limit",
+            json!({"case":"allowed","repeat":129}),
+            ReceiptStatus::Rejected,
+            128,
+            0,
+        ),
+        (
+            "execute",
+            json!({"case":"allowed","execute":true}),
+            ReceiptStatus::Succeeded,
+            2,
+            1,
+        ),
+        (
+            "revoked",
+            json!({"case":"revoke","execute":true}),
+            ReceiptStatus::Rejected,
+            1,
+            0,
+        ),
+    ] {
+        let before_checks = checked.checks.load(Ordering::SeqCst);
+        let before_calls = gate.calls.load(Ordering::SeqCst);
+        let ctx = context(2);
+        let receipt = runtime.run(&bound, id, args, ctx.clone()).await.unwrap();
+        assert_eq!(receipt.status, expected, "{id}: {receipt:?}");
+        assert_eq!(
+            checked.checks.load(Ordering::SeqCst) - before_checks,
+            check_count,
+            "{id}"
+        );
+        assert_eq!(
+            gate.calls.load(Ordering::SeqCst) - before_calls,
+            leaf_count,
+            "{id}"
+        );
+        assert_eq!(
+            ctx.shared_steps().unwrap().remaining().unwrap(),
+            1 - leaf_count,
+            "{id}"
+        );
+        assert_eq!(
+            receipt.evidence.len(),
+            leaf_count,
+            "预检不能伪造工具执行证据: {id}"
+        );
+        assert!(!serde_json::to_string(&receipt).unwrap().contains("private"));
+        if matches!(id, "allowed" | "denied") {
+            assert_eq!(
+                receipt.result.unwrap(),
+                json!({"allowed":id=="allowed","executed":false,
+                "authorization_reserved":false,"reason":if id=="allowed" {"preflight_passed"} else {"rejected"}})
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn python_calls_javascript_and_host_delivery_with_shared_identity_budget_and_temp_lifecycle()
 {
