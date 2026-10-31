@@ -204,6 +204,36 @@ fn assert_zero_tools(report: &Value) {
 }
 
 #[tokio::test]
+async fn auxiliary_reflection_route_uses_its_model_and_limit_without_changing_goal_budget() {
+    let root = fixture();
+    let mut server = Server::start(vec![reply()]).await;
+    add(root.path(), &server.url, "aux-parent", PARENT, "owner").await;
+    let mut command = command(root.path(), &server.url);
+    command
+        .args(["run", "--seconds", "30", "--max-executions", "1"])
+        .env("EVE_MODEL_USE_REFLECTION_ROLE", "auxiliary_small")
+        .env("EVE_MODELS_AUXILIARY_SMALL_ENABLED", "true")
+        .env("EVE_MODELS_AUXILIARY_SMALL_PROVIDER", "openai")
+        .env("EVE_MODELS_AUXILIARY_SMALL_MODEL", "reflection-small")
+        .env("EVE_MODELS_AUXILIARY_SMALL_MAX_OUTPUT_TOKENS", "192");
+    let process = Process::start(command);
+    let request = server.next().await;
+    assert_eq!(request.body["model"], "reflection-small");
+    assert_eq!(request.body["max_output_tokens"], 192);
+    assert_eq!(request.body["tools"], json!([]));
+    process
+        .stop_after_saved_goal(root.path(), "aux-parent", "Completed")
+        .await;
+    let report = show(root.path(), &server.url, "aux-parent").await;
+    let child = &report["reflections"][0]["goal"];
+    assert_eq!(child["budget"]["max_model_requests"], 1);
+    assert_eq!(child["budget"]["max_tool_calls"], 0);
+    assert_eq!(child["budget"]["max_attempts"], 1);
+    assert_eq!(child["feedback"]["verification_met"], true);
+    assert!(server.requests.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn add_run_restart_produce_one_durable_reflection_and_keep_parent_waiting() {
     let root = fixture();
     let mut server = Server::start(vec![reply()]).await;

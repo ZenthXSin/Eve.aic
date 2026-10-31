@@ -844,10 +844,9 @@ async fn start_loop(
     if runtime.response_mode != "complete" {
         return Err("内生反思当前要求 complete 模式。".into());
     }
-    let resolver = Arc::new(models::CoreModelResolver::new(
-        settings.clone(),
-        bootstrap.api_key,
-    ));
+    let resolver = Arc::new(
+        models::CoreModelResolver::new(settings.clone(), bootstrap.api_key).with_use("reflection"),
+    );
     let selected = resolver.resolve()?;
     let host = LlmHost::new(selected.provider, backends.registry.clone(), kernel.clone(), backends.permissions.clone(),
         ContextBinding { service_id: ServiceId::new(services::CONTEXT)?, expected_owner: owner }, vec![],
@@ -906,6 +905,7 @@ fn register_config(kernel: &Kernel, state_directory: &std::path::Path) -> Result
         vec![
             runtime_llm_schema(),
             config::openai_schema(),
+            config::model_uses_schema(),
             model_roles_schema(),
         ],
     ))?;
@@ -945,10 +945,9 @@ pub(crate) async fn plan_model_resolver(
     if runtime.response_mode != "complete" {
         return Err("计划建议当前要求 complete 模式。".into());
     }
-    let resolver = Arc::new(models::CoreModelResolver::new(
-        settings.clone(),
-        bootstrap.api_key,
-    ));
+    let resolver = Arc::new(
+        models::CoreModelResolver::new(settings.clone(), bootstrap.api_key).with_use("plan"),
+    );
     // 在保存请求记录之前确认模型配置可用；配置错误不消耗该修订的建议机会。
     resolver.resolve()?;
     Ok(resolver)

@@ -5,6 +5,7 @@ use zeroize::Zeroizing;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CredentialPurpose {
     Primary,
+    Auxiliary,
     Jev,
     Semantic,
 }

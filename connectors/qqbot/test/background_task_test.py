@@ -132,6 +132,24 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.assertEqual(self.tasks(), before)
         self.assertEqual(len(self.pushes()), 1, "独立进程没有新增投递")
 
+    def test_background_auxiliary_route_keeps_dialogue_and_step_budget_independent(self):
+        self.callback = self.dispatch(max_steps=3)
+        self.run_eve([*self.send(self.message("aux-ask", ASK, expected=DISPATCHED)),
+                      *self.checkpoint("delivered")],
+                     env_extra={"EVE_MODEL_USE_TASK_ROLE": "auxiliary_small",
+                                "EVE_MODELS_AUXILIARY_SMALL_ENABLED": "true",
+                                "EVE_MODELS_AUXILIARY_SMALL_PROVIDER": "openai",
+                                "EVE_MODELS_AUXILIARY_SMALL_MODEL": "worker-small"},
+                     checkpoints={"delivered": lambda: self.wait_task(
+                         lambda t: (t.get("notice") or {}).get("status") == "Delivered", "auxiliary notice missing")})
+        [task] = self.tasks()
+        self.assertEqual(task["usage"], {"tool_calls": 3, "model_requests": 4})
+        self.assertEqual(task["status"], "Completed")
+        self.assertEqual([r["model"] for r in self.worker_requests()], ["worker-small"] * 4)
+        self.assertTrue(all(r["body"]["model"] != "worker-small" for r in self.kind("chat")
+                            if not self.is_worker(r["body"])))
+        self.assertEqual(len(self.pushes()), 1)
+
     def test_a_dispatched_task_runs_within_its_step_budget_and_notifies_the_owner(self):
         self.callback = self.dispatch(max_steps=3)
         self.run_eve([*self.send(self.message("ask", ASK, expected=DISPATCHED)), *self.checkpoint("delivered"),
