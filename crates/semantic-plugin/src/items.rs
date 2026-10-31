@@ -9,9 +9,16 @@ use std::collections::BTreeMap;
 pub(crate) struct Item {
     /// 范围内稳定的条目键；偏好更正后键不变、正文摘要改变。
     pub key: String,
+    /// 仅供向量输入与召回片段使用的 UTF-8 前缀；原文仍由 Memory 保存。
     pub text: String,
     pub source: MemoryRecallSource,
     pub evidence_revision: u64,
+}
+
+// 两个消费者都只读取前缀；不能把不参与向量或片段的完整正文留在整个布局中。
+fn item_text(text: &str) -> String {
+    let max = eve_semantic_api::MAX_EMBED_INPUT_BYTES.max(eve_memory_api::MAX_RECALL_EXCERPT_BYTES);
+    prefix(text, max).to_owned()
 }
 
 pub(crate) fn items(snapshot: &MemorySnapshot) -> MemoryResult<Vec<Item>> {
@@ -31,7 +38,7 @@ pub(crate) fn items(snapshot: &MemorySnapshot) -> MemoryResult<Vec<Item>> {
             .ok_or(MemoryError::CorruptState)?;
         items.push(Item {
             key: format!("pref:{}", preference.id),
-            text: preference.text.clone(),
+            text: item_text(&preference.text),
             source: MemoryRecallSource::ConfirmedPreference {
                 preference_id: preference.id.clone(),
                 preference_revision: preference.revision,
@@ -59,7 +66,7 @@ pub(crate) fn items(snapshot: &MemorySnapshot) -> MemoryResult<Vec<Item>> {
         ] {
             items.push(Item {
                 key: source_key_parts(&entry.id, Some(field)),
-                text: text.clone(),
+                text: item_text(text),
                 source: MemoryRecallSource::CompletedInteraction {
                     evidence_id: entry.id.clone(),
                     evidence_revision: entry.revision,
@@ -175,54 +182,263 @@ pub(crate) fn layout(
                 blocks: vec![],
             });
         }
-        let mut pages = Vec::new();
+        let scope = snapshot.scope.clone();
+        let revision = snapshot.revision;
+        let mut ledger = items(&snapshot)?;
+        let archived_count = snapshot.archived_evidence;
+        // 热快照正文不参与归档扫描，先释放；每次只保留当前归档页的完整正文。
+        drop(snapshot);
+        let mut blocks = Vec::new();
+        let mut total = 0u64;
         let mut after = 0;
         loop {
             let page = reader.archived(after, crate::segments::SEGMENT_EVIDENCE)?;
+            if page.evidence.len() > crate::segments::SEGMENT_EVIDENCE {
+                return Err(MemoryError::CorruptState);
+            }
+            let mut last = after;
+            for entry in &page.evidence {
+                if entry.revision <= last || entry.revision > revision {
+                    return Err(MemoryError::CorruptState);
+                }
+                last = entry.revision;
+            }
+            if page
+                .next_after
+                .is_some_and(|next| next != last || next <= after)
+            {
+                return Err(MemoryError::CorruptState);
+            }
+            total = total
+                .checked_add(page.evidence.len() as u64)
+                .ok_or(MemoryError::CorruptState)?;
+            if total > archived_count {
+                break;
+            }
             let next = page.next_after;
             if !page.evidence.is_empty() {
-                pages.push(page.evidence);
+                let full = page.evidence.len() == crate::segments::SEGMENT_EVIDENCE;
+                let first_revision = page.evidence.first().map_or(0, |entry| entry.revision);
+                let last_revision = page.evidence.last().map_or(0, |entry| entry.revision);
+                let block = MemorySnapshot {
+                    scope: scope.clone(),
+                    revision,
+                    evidence: page.evidence,
+                    preferences: vec![],
+                    archived_evidence: 0,
+                };
+                let compact = items(&block)?;
+                if full {
+                    blocks.push(Block {
+                        first_revision,
+                        last_revision,
+                        items: compact,
+                    });
+                } else {
+                    ledger.extend(compact);
+                }
             }
             match next {
                 Some(next) => after = next,
                 None => break,
             }
         }
-        let total: usize = pages.iter().map(Vec::len).sum();
-        if total as u64 != snapshot.archived_evidence {
+        if total != archived_count {
             continue;
         }
-        let scope = snapshot.scope.clone();
-        let revision = snapshot.revision;
-        let mut ledger_snapshot = snapshot;
-        let mut blocks = Vec::new();
-        for page in pages {
-            if page.len() == crate::segments::SEGMENT_EVIDENCE {
-                let first_revision = page.first().map_or(0, |item| item.revision);
-                let last_revision = page.last().map_or(0, |item| item.revision);
-                let block = MemorySnapshot {
-                    scope: scope.clone(),
-                    revision,
-                    evidence: page,
-                    preferences: vec![],
-                    archived_evidence: 0,
-                };
-                blocks.push(Block {
-                    first_revision,
-                    last_revision,
-                    items: items(&block)?,
-                });
-            } else {
-                ledger_snapshot.evidence.extend(page);
-            }
-        }
-        ledger_snapshot.evidence.sort_by_key(|item| item.revision);
+        // 保持旧布局：偏好原顺序在前，其余热条目与不满一段的归档按来源修订排序。
+        ledger.sort_by_key(|item| match item.source {
+            MemoryRecallSource::ConfirmedPreference { .. } => (0, 0),
+            MemoryRecallSource::CompletedInteraction { .. } => (1, item.evidence_revision),
+        });
         return Ok(Layout {
-            ledger: items(&ledger_snapshot)?,
+            ledger,
             scope,
             revision,
             blocks,
         });
     }
     Err(MemoryError::StaleRevision)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eve_memory_api::{ArchivedEvidencePage, InteractionEvidence, MemoryService};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn scope() -> MemoryScope {
+        MemoryScope {
+            channel: "test".into(),
+            session_id: "session".into(),
+            user_id: "user".into(),
+        }
+    }
+    fn evidence(revision: u64, text: &str) -> InteractionEvidence {
+        InteractionEvidence {
+            id: format!("e-{revision}"),
+            revision,
+            at_ms: revision,
+            source: EvidenceSource::CompletedInteraction {
+                message_id: format!("m-{revision}"),
+                session_revision: revision * 2,
+                turn_id: revision,
+                user_text: text.into(),
+                assistant_text: text.into(),
+            },
+        }
+    }
+    fn snapshot(evidence: Vec<InteractionEvidence>, archived_evidence: u64) -> MemorySnapshot {
+        MemorySnapshot {
+            scope: scope(),
+            revision: 200,
+            evidence,
+            preferences: vec![],
+            archived_evidence,
+        }
+    }
+    #[test]
+    fn compact_items_keep_exact_embedding_hash_and_excerpt_for_long_unicode_and_controls() {
+        for text in [
+            "简短正文".to_owned(),
+            "汉字与换行\n".repeat(4000),
+            format!("{}中后文", "a".repeat(2047)),
+            format!("{}\0later", "a".repeat(4096)),
+            " \n".repeat(2000),
+        ] {
+            let source = snapshot(vec![evidence(1, &text)], 0);
+            for item in items(&source).unwrap() {
+                assert!(item.text.len() <= eve_semantic_api::MAX_EMBED_INPUT_BYTES);
+                let original = prefix(&text, eve_semantic_api::MAX_EMBED_INPUT_BYTES).trim();
+                let expected =
+                    (!original.is_empty() && !original.contains('\0')).then(|| original.to_owned());
+                assert_eq!(embed_input(&item), expected);
+                assert_eq!(
+                    content_hash(
+                        prefix(&item.text, eve_semantic_api::MAX_EMBED_INPUT_BYTES).trim()
+                    ),
+                    content_hash(original)
+                );
+                assert_eq!(
+                    prefix(
+                        &item.text,
+                        eve_memory_api::MAX_RECALL_EXCERPT_BYTES - "…".len()
+                    ),
+                    prefix(&text, eve_memory_api::MAX_RECALL_EXCERPT_BYTES - "…".len())
+                );
+                assert_eq!(
+                    item.text.len() > eve_memory_api::MAX_RECALL_EXCERPT_BYTES,
+                    text.len() > eve_memory_api::MAX_RECALL_EXCERPT_BYTES
+                );
+            }
+        }
+    }
+
+    struct Paged {
+        mode: usize,
+        snapshots: AtomicUsize,
+        pages: AtomicUsize,
+    }
+    impl MemoryService for Paged {
+        fn snapshot(&self) -> MemoryResult<MemorySnapshot> {
+            self.snapshots.fetch_add(1, Ordering::SeqCst);
+            Ok(snapshot(
+                vec![evidence(170, "热层原文")],
+                if self.mode == 3 { 130 } else { 129 },
+            ))
+        }
+        fn archived(&self, after: u64, limit: usize) -> MemoryResult<ArchivedEvidencePage> {
+            self.pages.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(limit, crate::segments::SEGMENT_EVIDENCE);
+            if self.mode == 1 && after >= 64 {
+                return Err(MemoryError::CorruptState);
+            }
+            let end = (after + limit as u64).min(129);
+            Ok(ArchivedEvidencePage {
+                evidence: (after + 1..=end)
+                    .map(|revision| evidence(revision, &"旧原文中文".repeat(2000)))
+                    .collect(),
+                next_after: if self.mode == 2 {
+                    Some(after)
+                } else {
+                    (end < 129).then_some(end)
+                },
+            })
+        }
+    }
+    fn reader(mode: usize) -> Paged {
+        Paged {
+            mode,
+            snapshots: AtomicUsize::new(0),
+            pages: AtomicUsize::new(0),
+        }
+    }
+    #[test]
+    fn multiple_pages_keep_segment_keys_order_and_only_required_text_prefixes() {
+        let reader = reader(0);
+        let result = layout(&reader, true).unwrap();
+        assert_eq!(reader.pages.load(Ordering::SeqCst), 3);
+        assert_eq!(result.blocks.len(), 2);
+        assert_eq!(
+            (
+                result.blocks[0].first_revision,
+                result.blocks[0].last_revision
+            ),
+            (1, 64)
+        );
+        assert_eq!(
+            (
+                result.blocks[1].first_revision,
+                result.blocks[1].last_revision
+            ),
+            (65, 128)
+        );
+        assert_eq!(
+            result
+                .ledger
+                .iter()
+                .map(|item| item.evidence_revision)
+                .collect::<Vec<_>>(),
+            [129, 129, 170, 170]
+        );
+        for block in &result.blocks {
+            assert_eq!(block.items.len(), 128);
+            let pairs: Vec<_> = block
+                .items
+                .iter()
+                .map(|item| (item.key.clone(), content_hash(&embed_input(item).unwrap())))
+                .collect();
+            let original = "旧原文中文".repeat(2000);
+            let hash =
+                content_hash(prefix(&original, eve_semantic_api::MAX_EMBED_INPUT_BYTES).trim());
+            let expected: Vec<_> = (block.first_revision..=block.last_revision)
+                .flat_map(|revision| {
+                    ["user", "assistant"]
+                        .map(|field| (format!("int:e-{revision}:{field}"), hash.clone()))
+                })
+                .collect();
+            assert_eq!(
+                crate::segments::content_key(&pairs),
+                crate::segments::content_key(&expected)
+            );
+            assert!(
+                block
+                    .items
+                    .iter()
+                    .all(|item| item.text.len() <= eve_semantic_api::MAX_EMBED_INPUT_BYTES)
+            );
+        }
+    }
+    #[test]
+    fn late_page_errors_bad_cursors_and_repeated_count_mismatch_never_return_partial_layout() {
+        for mode in 1..=3 {
+            let reader = reader(mode);
+            assert!(matches!(
+                layout(&reader, true),
+                Err(MemoryError::CorruptState | MemoryError::StaleRevision)
+            ));
+            assert!(reader.pages.load(Ordering::SeqCst) <= 9);
+            assert!(reader.snapshots.load(Ordering::SeqCst) <= 3);
+        }
+    }
 }
