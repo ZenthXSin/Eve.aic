@@ -18,9 +18,26 @@ const RECENT: usize = 6;
 fn fail(s: &str) -> LlmError {
     LlmError::Context(s.into())
 }
+struct DigestWriter(ring::digest::Context);
+impl std::io::Write for DigestWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 fn hash<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, LlmError> {
-    let bytes = serde_json::to_vec(value).map_err(|_| fail("上下文引用无法编码"))?;
-    Ok(digest_bytes(&bytes))
+    let mut writer = DigestWriter(ring::digest::Context::new(&ring::digest::SHA256));
+    serde_json::to_writer(&mut writer, value).map_err(|_| fail("上下文引用无法编码"))?;
+    Ok(writer
+        .0
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 fn digest_bytes(bytes: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, bytes)
@@ -183,9 +200,8 @@ impl HistoryContextPlanner for Planner {
             // 最新整轮可能包含刚发生的工具结果，不能因容量不足静默省略后继续执行。
             // 较老轮次仍按相关性保留或留下档案引用；原持久记录始终不变。
             if let Some(latest) = groups.last()
-                && serde_json::to_vec(latest)
+                && eve_runtime::serialized_json_size(latest)
                     .map_err(|_| fail("历史轮次编码失败"))?
-                    .len()
                     > window.max_bytes
             {
                 return Err(LlmError::HistoryWindowExceeded);
@@ -235,9 +251,8 @@ impl HistoryContextPlanner for Planner {
             let mut selected = BTreeSet::new();
             let mut bytes = 0usize;
             for i in (groups.len().saturating_sub(2.min(window.max_turns))..groups.len()).rev() {
-                let size = serde_json::to_vec(groups[i])
-                    .map_err(|_| fail("历史轮次编码失败"))?
-                    .len();
+                let size = eve_runtime::serialized_json_size(groups[i])
+                    .map_err(|_| fail("历史轮次编码失败"))?;
                 if bytes.saturating_add(size) <= window.max_bytes {
                     selected.insert(i);
                     bytes += size;
@@ -257,9 +272,8 @@ impl HistoryContextPlanner for Planner {
                         .and_then(|s| s.parse::<usize>().ok())
                         .filter(|i| *i < recent)
                     {
-                        let size = serde_json::to_vec(groups[i])
-                            .map_err(|_| fail("历史轮次编码失败"))?
-                            .len();
+                        let size = eve_runtime::serialized_json_size(groups[i])
+                            .map_err(|_| fail("历史轮次编码失败"))?;
                         if selected.len() < window.max_turns
                             && bytes.saturating_add(size) <= window.max_bytes
                         {
@@ -273,9 +287,8 @@ impl HistoryContextPlanner for Planner {
                 if selected.contains(&i) {
                     continue;
                 }
-                let size = serde_json::to_vec(groups[i])
-                    .map_err(|_| fail("历史轮次编码失败"))?
-                    .len();
+                let size = eve_runtime::serialized_json_size(groups[i])
+                    .map_err(|_| fail("历史轮次编码失败"))?;
                 if selected.len() < window.max_turns
                     && bytes.saturating_add(size) <= window.max_bytes
                 {
@@ -500,6 +513,23 @@ mod tests {
     use super::*;
     use eve_kernel::{Kernel, KernelServices};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[test]
+    fn streamed_history_hash_matches_complete_json_and_still_covers_every_original_byte() {
+        let mut value = json!({"history":[{"role":"user","text":"原话\n引号\"和反斜杠\\".repeat(20_000)},
+            {"role":"assistant","tool_calls":[{"id":"call","arguments":{"汉字":[true,null,1.25]}}]}],"scope":"current"});
+        let expected = digest_bytes(&serde_json::to_vec(&value).unwrap());
+        assert_eq!(hash(&value).unwrap(), expected);
+        let changed = format!("{}尾部变动", value["history"][0]["text"].as_str().unwrap());
+        value["history"][0]["text"] = json!(changed);
+        assert_ne!(hash(&value).unwrap(), expected);
+        struct Reject;
+        impl serde::Serialize for Reject {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("sample"))
+            }
+        }
+        assert!(matches!(hash(&Reject), Err(LlmError::Context(_))));
+    }
     struct Selector {
         calls: AtomicUsize,
         bad: bool,

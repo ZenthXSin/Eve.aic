@@ -177,8 +177,15 @@ pub struct ModelRequest {
 
 impl ModelRequest {
     pub fn validate(&self) -> Result<(), LlmError> {
+        Self::validate_parts(&self.messages, &self.tools)
+    }
+    /// 按同一协议直接核验借用的消息和工具定义，不复制正文或工具回执。
+    pub fn validate_parts(
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<(), LlmError> {
         let mut names = std::collections::HashSet::new();
-        for tool in &self.tools {
+        for tool in tools {
             tool.validate()?;
             if !names.insert(tool.name.clone()) {
                 return Err(LlmError::Protocol(format!(
@@ -188,12 +195,12 @@ impl ModelRequest {
             }
         }
 
-        for (index, message) in self.messages.iter().enumerate() {
+        for (index, message) in messages.iter().enumerate() {
             message.validate()?;
 
             match &message.role {
                 ChatRole::Assistant if !message.tool_calls.is_empty() => {
-                    let Some(next) = self.messages.get(index + 1) else {
+                    let Some(next) = messages.get(index + 1) else {
                         return Err(LlmError::Protocol(
                             "assistant tool call message must be followed by tool results".into(),
                         ));
@@ -207,7 +214,7 @@ impl ModelRequest {
                 ChatRole::Tool => {
                     let Some(previous) = index
                         .checked_sub(1)
-                        .and_then(|previous_index| self.messages.get(previous_index))
+                        .and_then(|previous_index| messages.get(previous_index))
                     else {
                         return Err(LlmError::Protocol(
                             "tool results must follow assistant tool calls".into(),
@@ -870,6 +877,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn borrowed_validation_preserves_complete_pairing_and_definition_checks() {
+        let mut messages = vec![
+            ChatMessage::text(ChatRole::User, "完整原话".repeat(10_000)),
+            ChatMessage::assistant_tool_calls(vec![call("first"), call("second")]).unwrap(),
+            ChatMessage::tool_results(vec![
+                ToolResult::success("first", json!(1)).unwrap(),
+                ToolResult::success("second", json!(2)).unwrap(),
+            ])
+            .unwrap(),
+        ];
+        assert!(ModelRequest::validate_parts(&messages, &[]).is_ok());
+        messages[2].tool_results.swap(0, 1);
+        assert!(matches!(
+            ModelRequest::validate_parts(&messages, &[]),
+            Err(LlmError::Protocol(_))
+        ));
+        assert!(ModelRequest::validate_parts(&messages[..2], &[]).is_err());
+        let tool = ToolDefinition {
+            name: "demo".into(),
+            description: String::new(),
+            argument_schema: json!({"type":"object"}),
+            required_permissions: vec![],
+            concurrency: None,
+        };
+        assert!(ModelRequest::validate_parts(&[], &[tool.clone(), tool]).is_err());
+        assert!(ModelRequest::validate_parts(&[], &[]).is_ok());
+    }
     #[test]
     fn rejects_empty_or_duplicate_call_ids() {
         assert!(

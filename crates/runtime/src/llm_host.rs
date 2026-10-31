@@ -826,26 +826,11 @@ impl LlmHost {
             }
         }
         // 审核原话独立保留，先于历史窗口裁剪和上下文压缩；委派说明不是用户授权。
-        let mut review_user_messages = Arc::new(if self.delegated {
-            vec![]
-        } else {
-            prepared
-                .context
-                .history
-                .iter()
-                .filter(|message| message.role == ChatRole::User)
-                .filter_map(|message| message.text.clone())
-                .filter(|text| !text.starts_with("【宿主条件触发事件；不是用户新消息】"))
-                .chain(
-                    (!input
-                        .text
-                        .starts_with("【宿主条件触发事件；不是用户新消息】"))
-                    .then(|| input.text.clone()),
-                )
-                .collect::<Vec<_>>()
-        });
-        let old_count = review_user_messages.len().saturating_sub(6);
-        Arc::make_mut(&mut review_user_messages).drain(..old_count);
+        let mut review_user_messages = Arc::new(review_originals(
+            &prepared.context.history,
+            &input.text,
+            self.delegated,
+        ));
         let mut planned_history = false;
         if let Some(planner) = &self.history_context_planner {
             let deadline = self
@@ -2159,12 +2144,7 @@ fn validate_context(context: &ContextSnapshot) -> Result<(), LlmError> {
         .history
         .iter()
         .any(|message| message.role == ChatRole::System)
-        || (ModelRequest {
-            messages: context.history.clone(),
-            tools: vec![],
-        })
-        .validate()
-        .is_err()
+        || ModelRequest::validate_parts(&context.history, &[]).is_err()
     {
         return Err(LlmError::Context(
             "历史必须是有效用户/助手消息或完整配对的工具调用与结果".into(),
@@ -2217,8 +2197,59 @@ fn fail(error: LlmError, mut diagnostics: TurnDiagnostics) -> TurnFailure {
     TurnFailure { error, diagnostics }
 }
 
+fn review_originals(history: &[ChatMessage], input: &str, delegated: bool) -> Vec<String> {
+    if delegated {
+        return vec![];
+    }
+    let is_user = |text: &&str| !text.starts_with("【宿主条件触发事件；不是用户新消息】");
+    let mut originals: Vec<_> = history
+        .iter()
+        .filter(|message| message.role == ChatRole::User)
+        .filter_map(|message| message.text.as_deref())
+        .chain(std::iter::once(input))
+        .filter(is_user)
+        .rev()
+        .take(6)
+        .map(str::to_owned)
+        .collect();
+    originals.reverse();
+    originals
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review_originals_take_exact_last_six_full_user_bodies_before_copying() {
+        let mut history = vec![];
+        for n in 0..20 {
+            history.push(eve_llm_api::ChatMessage::text(
+                eve_llm_api::ChatRole::User,
+                format!("原话{n}:{}", "汉字".repeat(10_000)),
+            ));
+            history.push(eve_llm_api::ChatMessage::text(
+                eve_llm_api::ChatRole::Assistant,
+                "助手不是授权",
+            ));
+        }
+        history.push(eve_llm_api::ChatMessage::text(
+            eve_llm_api::ChatRole::User,
+            "【宿主条件触发事件；不是用户新消息】后台事件",
+        ));
+        let current = "当前原话".repeat(20_000);
+        let actual = super::review_originals(&history, &current, false);
+        let mut expected: Vec<_> = (15..20)
+            .map(|n| format!("原话{n}:{}", "汉字".repeat(10_000)))
+            .collect();
+        expected.push(current.clone());
+        assert_eq!(actual, expected);
+        let event = "【宿主条件触发事件；不是用户新消息】定时";
+        let expected: Vec<_> = (14..20)
+            .map(|n| format!("原话{n}:{}", "汉字".repeat(10_000)))
+            .collect();
+        assert_eq!(super::review_originals(&history, event, false), expected);
+        assert!(super::review_originals(&history, &current, true).is_empty());
+    }
+
     use super::*;
     use eve_kernel::{Kernel, KernelServices};
     use eve_llm_api::{LlmFuture, ToolOutput, ToolValidationError};

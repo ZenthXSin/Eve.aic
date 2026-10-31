@@ -31,9 +31,8 @@ pub(crate) fn apply(
     let mut retained = 0;
     let mut bytes = 0usize;
     for &start in starts.iter().rev().take(window.max_turns) {
-        let size = serde_json::to_vec(&context.history[start..first])
-            .map_err(|_| LlmError::Context("历史窗口大小无法计算".into()))?
-            .len();
+        let size = crate::serialized_json_size(&context.history[start..first])
+            .map_err(|_| LlmError::Context("历史窗口大小无法计算".into()))?;
         if size > window.max_bytes.saturating_sub(bytes) {
             if retained == 0 {
                 return Err(LlmError::HistoryWindowExceeded);
@@ -113,9 +112,8 @@ pub(crate) fn apply_plan(
         let turn = turns
             .get(*index)
             .ok_or_else(|| LlmError::Context("历史计划索引越界".into()))?;
-        let turn_bytes = serde_json::to_vec(turn)
-            .map_err(|_| LlmError::Context("历史计划序列化失败".into()))?
-            .len();
+        let turn_bytes = crate::serialized_json_size(turn)
+            .map_err(|_| LlmError::Context("历史计划序列化失败".into()))?;
         bytes = bytes
             .saturating_add(turn_bytes.saturating_sub(2))
             .saturating_add(usize::from(!selected.is_empty()));
@@ -125,19 +123,14 @@ pub(crate) fn apply_plan(
         selected.extend_from_slice(turn);
         previous = Some(*index);
     }
-    if serde_json::to_vec(&selected)
+    if crate::serialized_json_size(&selected)
         .map_err(|_| LlmError::Context("历史计划序列化失败".into()))?
-        .len()
         > window.max_bytes
     {
         return Err(LlmError::HistoryWindowExceeded);
     }
     if !selected.is_empty() {
-        eve_llm_api::ModelRequest {
-            messages: selected.clone(),
-            tools: vec![],
-        }
-        .validate()?;
+        eve_llm_api::ModelRequest::validate_parts(&selected, &[])?;
     }
     // 后台摘要只接收原历史中连续省略的前缀；中间的空洞不能拼成另一份历史。
     // 返回摘要不注入选取后的子序列，主动压缩仍使用无持久缓存的临时作用域。
