@@ -4,7 +4,7 @@ use eve_runtime::TurnDiagnostics;
 use eve_task_api::{Task, bounded};
 use serde_json::{Value, json};
 
-fn safe_detail(text: &str, limit: usize) -> String {
+pub(crate) fn safe_detail(text: &str, limit: usize) -> String {
     let mut text = text.to_owned();
     for (key, value) in std::env::vars_os() {
         let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {

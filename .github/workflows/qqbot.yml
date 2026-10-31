@@ -153,6 +153,7 @@ jobs:
           python3 connectors/qqbot/test/model_switch_test.py
           python3 connectors/qqbot/test/model_streaming_test.py
           python3 connectors/qqbot/test/model_timeout_test.py
+          python3 connectors/qqbot/test/session_diagnostics_test.py
           python3 connectors/qqbot/test/delivery_recovery_test.py
           python3 connectors/qqbot/test/compaction_stream_test.py
           python3 connectors/qqbot/test/adaptive_context_test.py

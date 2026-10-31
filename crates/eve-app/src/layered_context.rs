@@ -374,12 +374,83 @@ impl HistoryContextPlanner for Planner {
     }
 }
 
+fn failure_preview(results: &[ToolResult]) -> Vec<Value> {
+    results.iter().filter_map(|result| match &result.output {
+        ToolOutput::Failure {code,message}=>Some(json!({"call_id":excerpt(&result.call_id,96),"code":code,"message_preview":crate::qq_task_diagnostics::safe_detail(message,320)})),
+        _=>None,
+    }).take(3).collect()
+}
+fn recent_record(turn: &eve_session_api::SessionTurn) -> Result<Value, ToolExecutionError> {
+    let digest =
+        hash(turn).map_err(|_| ToolExecutionError::Failed("原始轮次引用无法编码".into()))?;
+    let mut result = json!({
+        "turn_id":turn.id,"reference":format!("turn:{}:{digest}",turn.id),
+        "input_excerpt":excerpt(&turn.input,192),"input_truncated":turn.input.len()>192,
+        "status":"Interrupted","failure_code":null,"started_tools":null,
+        "provider_http_status":null,"provider_failure":null,"recorded_tool_receipts":null,
+        "tool_names_preview":[],"tool_failure_preview":[],"automatic_replay":false
+    });
+    match &turn.status {
+        SessionTurnStatus::Completed { messages } => {
+            result["status"] = json!("Completed");
+            result["recorded_tool_receipts"] = json!(
+                messages
+                    .iter()
+                    .map(|message| message.tool_results.len())
+                    .sum::<usize>()
+            );
+            result["tool_names_preview"] = json!(
+                messages
+                    .iter()
+                    .flat_map(|message| &message.tool_calls)
+                    .take(6)
+                    .map(|call| excerpt(&call.name, 96))
+                    .collect::<Vec<_>>()
+            );
+            result["tool_failure_preview"] = json!(
+                messages
+                    .iter()
+                    .flat_map(|message| failure_preview(&message.tool_results))
+                    .take(3)
+                    .collect::<Vec<_>>()
+            );
+        }
+        SessionTurnStatus::Failed { failure } => {
+            result["status"] = json!("Failed");
+            result["failure_code"] = json!(failure.code);
+            result["started_tools"] = json!(failure.started_tools);
+            if let Some(evidence) = &failure.evidence {
+                result["provider_http_status"] = json!(evidence.provider_http_status);
+                result["provider_failure"] = json!(evidence.provider_failure);
+                result["recorded_tool_receipts"] = json!(evidence.tool_results.len());
+                result["tool_names_preview"] = json!(
+                    evidence
+                        .tool_names
+                        .iter()
+                        .take(6)
+                        .map(|name| excerpt(name, 96))
+                        .collect::<Vec<_>>()
+                );
+                result["tool_failure_preview"] = json!(failure_preview(&evidence.tool_results));
+            }
+        }
+        SessionTurnStatus::Interrupted => {}
+        SessionTurnStatus::Pending => {
+            return Err(ToolExecutionError::Rejected(
+                "在途轮次不是已结束记录".into(),
+            ));
+        }
+    }
+    Ok(result)
+}
+
 pub(crate) struct ReadRecord(pub(crate) Arc<Planner>);
 impl ReadRecord {
-    fn for_each_record(
+    async fn for_each_turn(
         &self,
         scope: &ContextScope,
-        mut visit: impl FnMut(&[ChatMessage]) -> Result<(), ToolExecutionError>,
+        context: &ToolExecutionContext,
+        mut visit: impl FnMut(&eve_session_api::SessionTurn, u64) -> Result<(), ToolExecutionError>,
     ) -> Result<(), ToolExecutionError> {
         let failed = |s: &str| ToolExecutionError::Failed(s.into());
         let session = self
@@ -407,6 +478,14 @@ impl ReadRecord {
         let mut count = 0u64;
         let mut revision = 0u64;
         loop {
+            tokio::task::yield_now().await;
+            if context.is_cancel_requested()
+                || context.deadline().is_some_and(|at| at <= Instant::now())
+            {
+                return Err(ToolExecutionError::Cancelled(
+                    "读取已停止，未返回部分记录".into(),
+                ));
+            }
             let page = cursor.next_page().map_err(|_| failed("原始会话不可用"))?;
             if cursor.summary() != &summary || page.len() > MAX_SESSION_TURN_PAGE {
                 return Err(failed("原始会话页无效"));
@@ -429,13 +508,10 @@ impl ReadRecord {
                         .checked_add(1)
                         .ok_or_else(|| failed("原始会话修订无效"))?;
                 }
-                match turn.status {
+                match &turn.status {
                     SessionTurnStatus::Completed { messages } => {
-                        validate_completed_turn(&turn.input, &messages)
-                            .map_err(|_| failed("原始会话消息无效"))?;
-                        for group in history_turns(&messages) {
-                            visit(group)?;
-                        }
+                        validate_completed_turn(&turn.input, messages)
+                            .map_err(|_| failed("原始会话消息无效"))?
                     }
                     SessionTurnStatus::Pending if count != summary.turn_count => {
                         return Err(failed("原始会话在途轮次无效"));
@@ -445,6 +521,7 @@ impl ReadRecord {
                         .map_err(|_| failed("原始会话失败记录无效"))?,
                     _ => {}
                 }
+                visit(&turn, summary.turn_count)?;
             }
         }
         if count != summary.turn_count || revision != summary.revision {
@@ -452,29 +529,101 @@ impl ReadRecord {
         }
         Ok(())
     }
+    async fn for_each_record(
+        &self,
+        scope: &ContextScope,
+        context: &ToolExecutionContext,
+        mut visit: impl FnMut(&[ChatMessage]) -> Result<(), ToolExecutionError>,
+    ) -> Result<(), ToolExecutionError> {
+        self.for_each_turn(scope, context, |turn, _| {
+            if let SessionTurnStatus::Completed { messages } = &turn.status {
+                for group in history_turns(messages) {
+                    visit(group)?;
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
+    async fn recent(
+        &self,
+        scope: &ContextScope,
+        context: &ToolExecutionContext,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<Value, ToolExecutionError> {
+        let mut selected = std::collections::VecDeque::new();
+        let mut eligible = 0u64;
+        self.for_each_turn(scope, context, |turn, total| {
+            if matches!(turn.status, SessionTurnStatus::Pending)
+                || before.is_some_and(|before| turn.id >= before)
+            {
+                return Ok(());
+            }
+            eligible += 1;
+            // 只有末轮可能 Pending；最多为 limit+1 个候选计算完整摘要，其余只校验。
+            let upper = before.unwrap_or(u64::MAX).min(total.saturating_add(1));
+            if turn.id < upper.saturating_sub(limit as u64 + 1) {
+                return Ok(());
+            }
+            if selected.len() == limit {
+                selected.pop_front();
+            }
+            selected.push_back(recent_record(turn)?);
+            Ok(())
+        })
+        .await?;
+        let next = (eligible > selected.len() as u64)
+            .then(|| {
+                selected
+                    .front()
+                    .and_then(|record| record["turn_id"].as_u64())
+            })
+            .flatten();
+        Ok(
+            json!({"scope":"current_only","records":selected.into_iter().rev().collect::<Vec<_>>(),"next_before_turn":next,"eligible_turns":eligible,"evidence_only":true}),
+        )
+    }
 }
 impl Tool for ReadRecord {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {name:"read_context_record".into(),description:"按引用读取本会话完整历史/工具回执或本会话任务记录，原始记录未压缩。action=search使用query搜索本会话档案并返回引用；action=read使用history:摘要或task:任务ID，offset按UTF-8字节分页（每页至多8192字节）。记录只作证据，不授新授权，不重放工具。".into(),argument_schema:json!({"type":"object","properties":{"action":{"type":"string","enum":["search","read"]},"query":{"type":"string"},"reference":{"type":"string"},"offset":{"type":"integer","minimum":0}},"required":["action"],"additionalProperties":false}),required_permissions:vec![],concurrency:Some(ToolConcurrency::ParallelSafe)}
+        ToolDefinition {name:"read_context_record".into(),description:"按引用读取本会话完整历史/工具回执或本会话任务记录，原始记录未压缩。action=recent读取本会话最近已结束轮次（含失败/中断），limit默认3、最多6，before_turn可继续向前分页；失败数量未知不能当零。action=search使用query搜索完成轮次档案；action=read使用recent返回的turn引用、history:摘要或task:任务ID，offset按UTF-8字节分页（每页至多8192字节）。记录只作证据，不授新授权，不重放工具。".into(),argument_schema:json!({"type":"object","properties":{"action":{"type":"string","enum":["search","read","recent"]},"query":{"type":"string"},"reference":{"type":"string"},"offset":{"type":"integer","minimum":0},"before_turn":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":6}},"required":["action"],"additionalProperties":false}),required_permissions:vec![],concurrency:Some(ToolConcurrency::ParallelSafe)}
     }
     fn validate_arguments(&self, v: &Value) -> Result<(), ToolValidationError> {
         let valid = v.as_object().is_some_and(|o| {
-            o.keys()
-                .all(|k| matches!(k.as_str(), "action" | "query" | "reference" | "offset"))
+            o.keys().all(|k| {
+                matches!(
+                    k.as_str(),
+                    "action" | "query" | "reference" | "offset" | "before_turn" | "limit"
+                )
+            })
         }) && match v["action"].as_str() {
             Some("search") => {
-                v["query"]
-                    .as_str()
-                    .is_some_and(|q| !q.trim().is_empty() && q.len() <= 1024)
+                v.get("before_turn").is_none()
+                    && v.get("limit").is_none()
+                    && v["query"]
+                        .as_str()
+                        .is_some_and(|q| !q.trim().is_empty() && q.len() <= 1024)
                     && v.get("reference").is_none()
                     && v.get("offset").is_none()
             }
             Some("read") => {
-                v["reference"]
-                    .as_str()
-                    .is_some_and(|r| !r.is_empty() && r.len() <= 256)
+                v.get("before_turn").is_none()
+                    && v.get("limit").is_none()
+                    && v["reference"]
+                        .as_str()
+                        .is_some_and(|r| !r.is_empty() && r.len() <= 256)
                     && v.get("query").is_none()
                     && v.get("offset").is_none_or(|o| o.as_u64().is_some())
+            }
+            Some("recent") => {
+                v.get("query").is_none()
+                    && v.get("reference").is_none()
+                    && v.get("offset").is_none()
+                    && v.get("before_turn")
+                        .is_none_or(|value| value.as_u64().is_some_and(|n| n > 0))
+                    && v.get("limit")
+                        .is_none_or(|value| value.as_u64().is_some_and(|n| (1..=6).contains(&n)))
             }
             _ => false,
         };
@@ -490,8 +639,10 @@ impl Tool for ReadRecord {
         Box::pin(async move {
             self.validate_arguments(&call.arguments)
                 .map_err(|e| ToolExecutionError::Failed(e.message))?;
-            if context.is_cancel_requested() {
-                return Err(ToolExecutionError::Cancelled("本轮已取消".into()));
+            if context.is_cancel_requested()
+                || context.deadline().is_some_and(|at| at <= Instant::now())
+            {
+                return Err(ToolExecutionError::Cancelled("本轮已取消或期限已到".into()));
             }
             let scope = context
                 .scope()
@@ -500,22 +651,64 @@ impl Tool for ReadRecord {
                     ToolExecutionError::Failed("档案读取需要真实个人会话scope".into())
                 })?;
             let failed = |s: &str| ToolExecutionError::Failed(s.into());
+            if call.arguments["action"] == "recent" {
+                return self
+                    .recent(
+                        scope,
+                        &context,
+                        call.arguments["before_turn"].as_u64(),
+                        call.arguments["limit"].as_u64().unwrap_or(3) as usize,
+                    )
+                    .await;
+            }
             if call.arguments["action"] == "search" {
                 let query = call.arguments["query"].as_str().unwrap().to_lowercase();
                 let mut hits = std::collections::VecDeque::new();
-                self.for_each_record(scope, |group| {
+                self.for_each_record(scope, &context, |group| {
                     let raw = serde_json::to_string(group).map_err(|_| failed("原文无法读取"))?;
                     if raw.to_lowercase().contains(&query) {
                         if hits.len() == 8 { hits.pop_front(); }
                         hits.push_back(json!({"reference":format!("history:{}", digest_bytes(raw.as_bytes())),"bytes":raw.len(),"excerpt":excerpt(&raw,256)}));
                     }
                     Ok(())
-                })?;
+                }).await?;
                 let hits: Vec<_> = hits.into_iter().rev().collect();
                 return Ok(json!({"records":hits,"scope":"current_only"}));
             }
             let reference = call.arguments["reference"].as_str().unwrap();
-            let raw = if let Some(id) = reference.strip_prefix("task:") {
+            let offset = usize::try_from(call.arguments["offset"].as_u64().unwrap_or(0))
+                .map_err(|_| failed("分页偏移无效"))?;
+            if let Some(tail) = reference.strip_prefix("turn:") {
+                let (id, digest) = tail
+                    .split_once(':')
+                    .ok_or_else(|| failed("原始轮次引用无效"))?;
+                let id = id
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|id| *id > 0)
+                    .ok_or_else(|| failed("原始轮次引用无效"))?;
+                if digest.len() != 64
+                    || !digest
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return Err(failed("原始轮次引用无效"));
+                }
+                let mut selected = None;
+                self.for_each_turn(scope, &context, |turn, _| {
+                    if turn.id == id && !matches!(turn.status, SessionTurnStatus::Pending) {
+                        let page = crate::record_json_page::page(reference, turn, offset)?;
+                        if page["sha256"] != digest {
+                            return Err(failed("原始轮次引用与正文不符"));
+                        }
+                        selected = Some(page);
+                    }
+                    Ok(())
+                })
+                .await?;
+                return selected.ok_or_else(|| failed("没有本scope的该记录"));
+            }
+            if let Some(id) = reference.strip_prefix("task:") {
                 if eve_task_api::validate_id(id).is_err() {
                     return Err(failed("没有本scope的该记录"));
                 }
@@ -532,35 +725,22 @@ impl Tool for ReadRecord {
                     .map_err(|_| failed("任务账本不可用"))?
                     .filter(|task| task.id == id && task.owner == owner)
                     .ok_or_else(|| failed("没有本scope的该记录"))?;
-                serde_json::to_string(&task).map_err(|_| failed("任务记录无法编码"))?
-            } else {
-                let mut selected = None;
-                self.for_each_record(scope, |group| {
-                    if selected.is_none()
-                        && format!(
-                            "history:{}",
-                            hash(group).map_err(|_| failed("原文引用无效"))?
-                        ) == reference
-                    {
-                        selected =
-                            Some(serde_json::to_string(group).map_err(|_| failed("原文无法读取"))?);
-                    }
-                    Ok(())
-                })?;
-                selected.ok_or_else(|| failed("没有本scope的该记录"))?
-            };
-            let offset = usize::try_from(call.arguments["offset"].as_u64().unwrap_or(0))
-                .map_err(|_| failed("分页偏移无效"))?;
-            if offset > raw.len() || !raw.is_char_boundary(offset) {
-                return Err(failed("分页偏移无效"));
+                return crate::record_json_page::page(reference, &task, offset);
             }
-            let mut end = raw.len().min(offset.saturating_add(8192));
-            while !raw.is_char_boundary(end) {
-                end -= 1;
-            }
-            Ok(
-                json!({"reference":reference,"offset":offset,"next_offset":(end<raw.len()).then_some(end),"total_bytes":raw.len(),"record_json_fragment":&raw[offset..end],"sha256":digest_bytes(raw.as_bytes()),"original_unmodified":true}),
-            )
+            let mut selected = None;
+            self.for_each_record(scope, &context, |group| {
+                if selected.is_none()
+                    && format!(
+                        "history:{}",
+                        hash(group).map_err(|_| failed("原文引用无效"))?
+                    ) == reference
+                {
+                    selected = Some(crate::record_json_page::page(reference, group, offset)?);
+                }
+                Ok(())
+            })
+            .await?;
+            selected.ok_or_else(|| failed("没有本scope的该记录"))
         })
     }
 }
@@ -1205,6 +1385,8 @@ mod tests {
             ChatMessage::text(ChatRole::Assistant, "exact-answer"),
         ];
         for arguments in [
+            json!({"action":"recent","limit":1}),
+            json!({"action":"read","reference":format!("turn:1:{}",hash(&eve_session_api::SessionTurn {id:1,input:"needle-owned-original".into(),status:SessionTurnStatus::Completed {messages:original.clone()}}).unwrap())}),
             json!({"action":"search","query":"needle-owned-original"}),
             json!({"action":"read","reference":format!("history:{}",hash(&original).unwrap())}),
         ] {
@@ -1223,6 +1405,228 @@ mod tests {
                 "a matching early page is not proof that the source is intact"
             );
         }
+        let cancel_context = ToolExecutionContext::new().with_scope(Some(scope("alice")));
+        let cancel = cancel_context.cancellation_handle();
+        let cancelled = tool
+            .for_each_turn(&scope("alice"), &cancel_context, |_, _| {
+                cancel.cancel();
+                Ok(())
+            })
+            .await;
+        assert!(
+            matches!(cancelled, Err(ToolExecutionError::Cancelled(_))),
+            "cancellation between pages must not read the later failing page or return partial data"
+        );
         kernel.stop_all().await.unwrap();
+    }
+    #[tokio::test]
+    async fn recent_finished_turns_include_failure_receipts_but_never_pending_or_other_scope() {
+        let (kernel, planner, _root, session) = world().await;
+        let own = scope("alice");
+        let key = SessionKey::new(&own.session_id, &own.user_id).unwrap();
+        append(session.as_ref(), &own, "先前正常任务", "正常结果");
+        let known = session
+            .begin(eve_session_api::SessionInput {
+                key: key.clone(),
+                text: "已执行写入后模型超时".into(),
+            })
+            .unwrap();
+        session
+            .fail(
+                &known.lease,
+                eve_session_api::SessionFailure {
+                    code: eve_session_api::SessionFailureCode::ProviderTimeout,
+                    started_tools: Some(1),
+                    evidence: Some(eve_session_api::SessionFailureEvidence {
+                        provider_http_status: Some(504),
+                        provider_failure: None,
+                        tool_names: vec!["write_file".into()],
+                        tool_results: vec![
+                            ToolResult::success(
+                                "saved-call",
+                                json!({"saved":true,"result":"原始𝄞回执".repeat(5000)}),
+                            )
+                            .unwrap(),
+                        ],
+                    }),
+                },
+            )
+            .unwrap();
+        let unknown = session
+            .begin(eve_session_api::SessionInput {
+                key: key.clone(),
+                text: "执行数量未知".into(),
+            })
+            .unwrap();
+        session
+            .fail(
+                &unknown.lease,
+                eve_session_api::SessionFailure {
+                    code: eve_session_api::SessionFailureCode::Backend,
+                    started_tools: None,
+                    evidence: None,
+                },
+            )
+            .unwrap();
+        session
+            .begin(eve_session_api::SessionInput {
+                key: key.clone(),
+                text: "现在查询上轮".into(),
+            })
+            .unwrap();
+        let original = session.snapshot(&key).unwrap().unwrap();
+        let tool = ReadRecord(planner);
+        let call = |arguments| ToolCall {
+            id: "diagnostic".into(),
+            name: "read_context_record".into(),
+            arguments,
+        };
+        let context = |scope: ContextScope| ToolExecutionContext::new().with_scope(Some(scope));
+        let expired =
+            context(own.clone()).with_deadline(Some(Instant::now() - Duration::from_secs(1)));
+        assert!(matches!(
+            tool.execute(call(json!({"action":"recent"})), expired)
+                .await,
+            Err(ToolExecutionError::Cancelled(_))
+        ));
+        let pending_reference = format!("turn:4:{}", hash(&original.turns[3]).unwrap());
+        assert!(
+            tool.execute(
+                call(json!({"action":"read","reference":pending_reference})),
+                context(own.clone())
+            )
+            .await
+            .is_err()
+        );
+        let recent = tool
+            .execute(
+                call(json!({"action":"recent","limit":2})),
+                context(own.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recent["records"].as_array().unwrap().len(), 2);
+        assert_eq!(recent["records"][0]["turn_id"], 3);
+        assert!(recent["records"][0]["started_tools"].is_null());
+        assert!(recent["records"][0]["recorded_tool_receipts"].is_null());
+        assert_eq!(recent["records"][1]["failure_code"], "ProviderTimeout");
+        assert_eq!(recent["records"][1]["provider_http_status"], 504);
+        assert_eq!(recent["records"][1]["started_tools"], 1);
+        assert_eq!(recent["records"][1]["recorded_tool_receipts"], 1);
+        assert_eq!(recent["records"][1]["automatic_replay"], false);
+        assert_eq!(recent["next_before_turn"], 2);
+        assert!(!recent.to_string().contains("原始𝄞回执"));
+        let reference = recent["records"][1]["reference"].as_str().unwrap();
+        let mut offset = 0;
+        let mut raw = String::new();
+        loop {
+            let page = tool
+                .execute(
+                    call(json!({"action":"read","reference":reference,"offset":offset})),
+                    context(own.clone()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(page["sha256"], reference.rsplit(':').next().unwrap());
+            raw.push_str(page["record_json_fragment"].as_str().unwrap());
+            match page["next_offset"].as_u64() {
+                Some(next) => {
+                    assert!(next > offset);
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(raw, serde_json::to_string(&original.turns[1]).unwrap());
+        let older = tool
+            .execute(
+                call(json!({"action":"recent","before_turn":2})),
+                context(own.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(older["records"][0]["turn_id"], 1);
+        assert_eq!(older["records"][0]["status"], "Completed");
+        assert!(older["next_before_turn"].is_null());
+        for other in [
+            scope("bob"),
+            ContextScope {
+                session_id: "another-session".into(),
+                user_id: own.user_id.clone(),
+            },
+        ] {
+            assert!(
+                tool.execute(
+                    call(json!({"action":"read","reference":reference})),
+                    context(other)
+                )
+                .await
+                .is_err()
+            );
+        }
+        for arguments in [
+            json!({"action":"recent","limit":0}),
+            json!({"action":"recent","limit":7}),
+            json!({"action":"recent","limit":null}),
+            json!({"action":"recent","before_turn":0}),
+            json!({"action":"recent","query":"x"}),
+            json!({"action":"read","reference":reference,"limit":1}),
+            json!({"action":"recent","user_id":"alice"}),
+        ] {
+            assert!(tool.validate_arguments(&arguments).is_err());
+        }
+        let changed = format!("{}0", &reference[..reference.len() - 1]);
+        let changed = if changed == reference {
+            format!("{}1", &reference[..reference.len() - 1])
+        } else {
+            changed
+        };
+        assert!(
+            tool.execute(
+                call(json!({"action":"read","reference":changed})),
+                context(own.clone())
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(session.snapshot(&key).unwrap().unwrap(), original);
+        kernel.stop_all().await.unwrap();
+        assert!(
+            tool.execute(call(json!({"action":"recent"})), context(own))
+                .await
+                .is_err()
+        );
+    }
+    #[test]
+    fn failure_previews_are_bounded_and_keep_error_code_while_redacting_sensitive_lines() {
+        let results: Vec<_> = (0..10)
+            .map(|index| {
+                ToolResult::failure(
+                    format!("call-{index}"),
+                    ToolFailureCode::ExecutionFailed,
+                    "api_key = synthetic-not-a-live-secret",
+                )
+                .unwrap()
+            })
+            .collect();
+        let preview = failure_preview(&results);
+        assert_eq!(preview.len(), 3);
+        assert_eq!(preview[0]["code"], "ExecutionFailed");
+        assert!(
+            !serde_json::to_string(&preview)
+                .unwrap()
+                .contains("synthetic-not-a-live-secret")
+        );
+        let interrupted = recent_record(&eve_session_api::SessionTurn {
+            id: 1,
+            input: "进程中断".into(),
+            status: SessionTurnStatus::Interrupted,
+        })
+        .unwrap();
+        assert_eq!(interrupted["status"], "Interrupted");
+        assert!(interrupted["failure_code"].is_null());
+        assert!(interrupted["started_tools"].is_null());
+        assert!(interrupted["recorded_tool_receipts"].is_null());
+        assert_eq!(interrupted["automatic_replay"], false);
     }
 }
