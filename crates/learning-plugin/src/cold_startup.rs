@@ -1,34 +1,25 @@
-//! 启动逐条验证两本账；全部通过后只重写实际中断的批次，不恢复整本冷正文。
+//! 启动与收尾逐条核验两本账；不恢复整本冷正文。
 use super::cold_decisions::{Check, index_total};
 use super::*;
 
-pub(super) fn validate_and_recover(inner: &mut Inner) -> LearningResult<()> {
-    let archive = inner
-        .archive
-        .as_ref()
-        .ok_or(LearningError::Unavailable)?
-        .clone();
+pub(super) fn scan(
+    inner: &Inner,
+    mut visit: impl FnMut(usize, &serde_json::Value) -> LearningResult<()>,
+) -> LearningResult<()> {
+    let archive = inner.archive.as_ref().ok_or(LearningError::Unavailable)?;
     let mut check = Check::default();
-    let mut running = Vec::new();
     if let Some(index) = &inner.job_index {
         index_total(index, "jobs")?;
         for (position, reference) in index.records.iter().enumerate() {
             let value = archive::load_value(archive.as_ref(), reference)?;
-            let is_running = value
-                .get("job")
-                .and_then(|job| job.get("status"))
-                .and_then(serde_json::Value::as_str)
-                == Some("Running");
+            visit(position, &value)?;
             check.job(value).map_err(|_| LearningError::CorruptState)?;
-            if is_running {
-                running.push(position);
-            }
         }
     } else {
-        for record in &inner.document.jobs {
-            check
-                .job(serde_json::to_value(record).map_err(|_| LearningError::CorruptState)?)
-                .map_err(|_| LearningError::CorruptState)?;
+        for (position, record) in inner.document.jobs.iter().enumerate() {
+            let value = serde_json::to_value(record).map_err(|_| LearningError::CorruptState)?;
+            visit(position, &value)?;
+            check.job(value).map_err(|_| LearningError::CorruptState)?;
         }
     }
     if let Some(index) = &inner.decision_index {
@@ -48,8 +39,27 @@ pub(super) fn validate_and_recover(inner: &mut Inner) -> LearningResult<()> {
                 .map_err(|_| LearningError::CorruptState)?;
         }
     }
-    // 跨条目身份/候选绑定元数据不再参与恢复，先释放再写冷文件。
-    drop(check);
+    Ok(())
+}
+
+pub(super) fn validate_and_recover(inner: &mut Inner) -> LearningResult<()> {
+    let archive = inner
+        .archive
+        .as_ref()
+        .ok_or(LearningError::Unavailable)?
+        .clone();
+    let mut running = Vec::new();
+    scan(inner, |position, value| {
+        if value
+            .get("job")
+            .and_then(|job| job.get("status"))
+            .and_then(serde_json::Value::as_str)
+            == Some("Running")
+        {
+            running.push(position);
+        }
+        Ok(())
+    })?;
     if let Some(index) = &inner.job_index {
         if running.is_empty() {
             return Ok(());

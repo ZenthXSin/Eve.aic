@@ -977,3 +977,307 @@ async fn streamed_startup_does_not_let_cold_jobs_bypass_legacy_decision_count_li
     assert_eq!(state.writes(), writes);
     assert_eq!(archive.puts.load(Ordering::SeqCst), puts);
 }
+
+async fn finish_fixture(
+    state: Arc<RecordingStore>,
+    archive: Arc<TracedArchive>,
+) -> (Kernel, LearningController, LearningBatch) {
+    let (kernel, admin) = open(state, Some(archive)).await;
+    let source = memory(scope("finish-before", "u"), 1);
+    complete(&admin, &source);
+    admin
+        .record_decision(&source.scope, decision(&admin, &source), 111)
+        .unwrap();
+    let batch = admin
+        .reserve(
+            &memory(scope("finish-target", "u"), 1),
+            200,
+            "v1",
+            &options(),
+        )
+        .unwrap()
+        .unwrap();
+    (kernel, admin, batch)
+}
+fn finish_outcome(batch: &LearningBatch) -> LearningOutcome {
+    LearningOutcome::Completed(vec![CandidateDraft {
+        text: "先给结论".into(),
+        confidence: 80,
+        evidence_ids: vec![batch.evidence[0].id.clone()],
+    }])
+}
+
+#[tokio::test]
+async fn cold_finish_writes_one_body_keeps_pinned_running_view_and_replays_without_writing() {
+    use std::sync::atomic::Ordering;
+    let root = tempfile::tempdir().unwrap();
+    let state = RecordingStore::open(&root.path().join("state"));
+    let archive = traced(&root.path().join("cold"));
+    let (kernel, admin, batch) = finish_fixture(state.clone(), archive.clone()).await;
+    let mut pinned = admin.scan_jobs(&batch.scope).unwrap();
+    let before: Value =
+        serde_json::from_slice(&state.get(&owner(), LEARNING_STATE_KEY).unwrap().unwrap()).unwrap();
+    let decisions = state.get(&owner(), DECISIONS).unwrap();
+    let token = admin.change_token(&batch.scope).unwrap();
+    let other_token = admin.change_token(&scope("finish-before", "u")).unwrap();
+    let puts = archive.puts.load(Ordering::SeqCst);
+    let writes = state.writes();
+    admin.finish(&batch, 210, finish_outcome(&batch)).unwrap();
+    assert_eq!(archive.puts.load(Ordering::SeqCst), puts + 1);
+    assert_eq!(state.writes(), writes + 1);
+    assert_ne!(admin.change_token(&batch.scope).unwrap(), token);
+    assert_eq!(
+        admin.change_token(&scope("finish-before", "u")).unwrap(),
+        other_token
+    );
+    let after: Value =
+        serde_json::from_slice(&state.get(&owner(), LEARNING_STATE_KEY).unwrap().unwrap()).unwrap();
+    assert_eq!(before["records"][0], after["records"][0]);
+    assert_ne!(before["records"][1], after["records"][1]);
+    assert_eq!(state.get(&owner(), DECISIONS).unwrap(), decisions);
+    assert_eq!(pinned.next_page().unwrap()[0].status, JobStatus::Running);
+    let saved = admin.snapshot(&batch.scope).unwrap();
+    assert_eq!(saved.jobs[0].status, JobStatus::Completed);
+    admin.finish(&batch, 999, finish_outcome(&batch)).unwrap();
+    assert_eq!(admin.snapshot(&batch.scope).unwrap(), saved);
+    assert_eq!(archive.puts.load(Ordering::SeqCst), puts + 1);
+    assert_eq!(state.writes(), writes + 1);
+    assert_eq!(
+        admin.finish(
+            &batch,
+            210,
+            LearningOutcome::Failed(LearningFailure::Timeout)
+        ),
+        Err(LearningError::Conflict)
+    );
+    kernel.stop_all().await.unwrap();
+    let (kernel, admin) = open(state, Some(archive)).await;
+    assert_eq!(admin.snapshot(&batch.scope).unwrap(), saved);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn cold_finish_failed_cold_put_preserves_running_and_accepts_the_same_result_after_recovery()
+{
+    use std::sync::atomic::Ordering;
+    for mode in [1, 2] {
+        let root = tempfile::tempdir().unwrap();
+        let state = RecordingStore::open(&root.path().join("state"));
+        let archive = traced(&root.path().join("cold"));
+        let (kernel, admin, batch) = finish_fixture(state.clone(), archive.clone()).await;
+        let before = state.get(&owner(), LEARNING_STATE_KEY).unwrap();
+        let writes = state.writes();
+        archive.failure.store(mode, Ordering::SeqCst);
+        assert_eq!(
+            admin.finish(&batch, 210, finish_outcome(&batch)),
+            Err(LearningError::Storage)
+        );
+        assert_eq!(state.get(&owner(), LEARNING_STATE_KEY).unwrap(), before);
+        assert_eq!(state.writes(), writes);
+        assert_eq!(
+            admin.snapshot(&batch.scope).unwrap().jobs[0].status,
+            JobStatus::Running
+        );
+        archive.failure.store(0, Ordering::SeqCst);
+        admin.finish(&batch, 210, finish_outcome(&batch)).unwrap();
+        assert_eq!(
+            admin.snapshot(&batch.scope).unwrap().jobs[0]
+                .candidates
+                .len(),
+            1
+        );
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cold_finish_index_commit_uncertainty_closes_all_handles_without_replaying_model_results() {
+    for after in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let state = RecordingStore::open(&root.path().join("state"));
+        let archive = traced(&root.path().join("cold"));
+        let (kernel, admin, batch) = finish_fixture(state.clone(), archive.clone()).await;
+        let mut pinned = admin.scan_jobs(&batch.scope).unwrap();
+        state.fail_before(!after);
+        state.fail_after(after);
+        assert_eq!(
+            admin.finish(&batch, 210, finish_outcome(&batch)),
+            Err(LearningError::Storage)
+        );
+        assert!(matches!(
+            pinned.next_page(),
+            Err(LearningError::Unavailable)
+        ));
+        assert_eq!(
+            admin.snapshot(&batch.scope),
+            Err(LearningError::Unavailable)
+        );
+        assert_eq!(
+            admin.finish(&batch, 210, finish_outcome(&batch)),
+            Err(LearningError::Unavailable)
+        );
+        kernel.stop_all().await.unwrap();
+        state.fail_before(false);
+        state.fail_after(false);
+        let (kernel, admin) = open(state, Some(archive)).await;
+        let saved = admin.snapshot(&batch.scope).unwrap();
+        assert_eq!(
+            saved.jobs[0].status,
+            if after {
+                JobStatus::Completed
+            } else {
+                JobStatus::Interrupted
+            }
+        );
+        assert_eq!(saved.jobs[0].candidates.len(), usize::from(after));
+        if after {
+            admin.finish(&batch, 211, finish_outcome(&batch)).unwrap();
+        } else {
+            assert_eq!(
+                admin.finish(&batch, 211, finish_outcome(&batch)),
+                Err(LearningError::Conflict)
+            );
+        }
+        assert!(matches!(
+            pinned.next_page(),
+            Err(LearningError::Unavailable)
+        ));
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cold_finish_late_corrupt_decision_closes_service_before_any_write() {
+    use std::sync::atomic::Ordering;
+    let root = tempfile::tempdir().unwrap();
+    let state = RecordingStore::open(&root.path().join("state"));
+    let archive = traced(&root.path().join("cold"));
+    let (kernel, admin, batch) = finish_fixture(state.clone(), archive.clone()).await;
+    let index: Value =
+        serde_json::from_slice(&state.get(&owner(), DECISIONS).unwrap().unwrap()).unwrap();
+    let path = root.path().join("cold").join(format!(
+        "{}.json",
+        index["records"][0]["hash"].as_str().unwrap()
+    ));
+    std::fs::write(&path, b"damaged").unwrap();
+    let puts = archive.puts.load(Ordering::SeqCst);
+    let writes = state.writes();
+    let before = state.get(&owner(), LEARNING_STATE_KEY).unwrap();
+    assert_eq!(
+        admin.finish(&batch, 210, finish_outcome(&batch)),
+        Err(LearningError::CorruptState)
+    );
+    assert_eq!(archive.puts.load(Ordering::SeqCst), puts);
+    assert_eq!(state.writes(), writes);
+    assert_eq!(state.get(&owner(), LEARNING_STATE_KEY).unwrap(), before);
+    assert_eq!(std::fs::read(&path).unwrap(), b"damaged");
+    assert_eq!(
+        admin.snapshot(&batch.scope),
+        Err(LearningError::Unavailable)
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn cold_finish_preserves_reflection_validation_and_exact_idempotent_receipts() {
+    let root = tempfile::tempdir().unwrap();
+    let state = RecordingStore::open(&root.path().join("state"));
+    let archive = traced(&root.path().join("cold"));
+    let (kernel, admin, batch) = finish_fixture(state.clone(), archive).await;
+    let reflection = ReflectionDraft {
+        observations: "用户反复要求先给结论".into(),
+        actions: "回复中先给结论".into(),
+        outcomes: "未记录后续效果".into(),
+        lessons: "先给结论可能适用，仍需反馈".into(),
+        next_checks: "核对下一次用户反馈".into(),
+        evidence_ids: vec![batch.evidence[0].id.clone()],
+    };
+    let LearningOutcome::Completed(candidates) = finish_outcome(&batch) else {
+        unreachable!()
+    };
+    let outcome = || {
+        LearningOutcome::Maintained(MaintenanceExtraction {
+            candidates: candidates.clone(),
+            reflection: Some(reflection.clone()),
+        })
+    };
+    admin.finish(&batch, 210, outcome()).unwrap();
+    let receipts = admin.maintenance_receipts(&batch.scope).unwrap();
+    assert_eq!(receipts[0].reflection, Some(reflection.clone()));
+    let writes = state.writes();
+    admin.finish(&batch, 999, outcome()).unwrap();
+    assert_eq!(
+        serde_json::to_value(admin.maintenance_receipts(&batch.scope).unwrap()).unwrap(),
+        serde_json::to_value(receipts).unwrap()
+    );
+    let invalid = ReflectionDraft {
+        evidence_ids: vec!["foreign".into()],
+        ..reflection
+    };
+    assert!(
+        admin
+            .finish(
+                &batch,
+                210,
+                LearningOutcome::Maintained(MaintenanceExtraction {
+                    candidates: vec![],
+                    reflection: Some(invalid)
+                })
+            )
+            .is_err()
+    );
+    assert_eq!(state.writes(), writes);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn cold_finish_rejects_stale_input_and_invalid_time_and_keeps_failure_replay_read_only() {
+    let root = tempfile::tempdir().unwrap();
+    let state = RecordingStore::open(&root.path().join("state"));
+    let archive = traced(&root.path().join("cold"));
+    let (kernel, admin, batch) = finish_fixture(state.clone(), archive).await;
+    let writes = state.writes();
+    let mut stale = batch.clone();
+    stale.attempt = 1;
+    assert_eq!(
+        admin.finish(&stale, 210, finish_outcome(&batch)),
+        Err(LearningError::Conflict)
+    );
+    assert_eq!(
+        admin.finish(&batch, 199, finish_outcome(&batch)),
+        Err(LearningError::InvalidInput)
+    );
+    assert_eq!(
+        admin.finish(&batch, u64::MAX, finish_outcome(&batch)),
+        Err(LearningError::InvalidInput)
+    );
+    assert_eq!(state.writes(), writes);
+    admin
+        .finish(
+            &batch,
+            210,
+            LearningOutcome::Failed(LearningFailure::Timeout),
+        )
+        .unwrap();
+    admin
+        .finish(
+            &batch,
+            999,
+            LearningOutcome::Failed(LearningFailure::Timeout),
+        )
+        .unwrap();
+    assert_eq!(state.writes(), writes + 1);
+    assert_eq!(
+        admin.finish(
+            &batch,
+            210,
+            LearningOutcome::Failed(LearningFailure::Cancelled)
+        ),
+        Err(LearningError::Conflict)
+    );
+    assert_eq!(
+        admin.snapshot(&batch.scope).unwrap().jobs[0].finished_at_ms,
+        Some(210)
+    );
+    kernel.stop_all().await.unwrap();
+}

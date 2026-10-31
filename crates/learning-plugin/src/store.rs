@@ -17,6 +17,8 @@ use std::{
 
 #[path = "cold_decisions.rs"]
 mod cold_decisions;
+#[path = "cold_jobs.rs"]
+mod cold_jobs;
 #[path = "cold_startup.rs"]
 mod cold_startup;
 
@@ -812,77 +814,28 @@ impl StoredLearning {
         at_ms: u64,
         outcome: LearningOutcome,
     ) -> LearningResult<()> {
-        let mut inner = self.lock()?;
-        let (outcome, reflection) = match outcome {
-            LearningOutcome::Maintained(value) => (
-                LearningOutcome::Completed(value.candidates),
-                value.reflection,
-            ),
-            other => (other, None),
-        };
-        if let Some(reflection) = &reflection {
-            reflection.validate(batch)?;
+        {
+            let mut inner = self.inner.lock().map_err(|_| LearningError::Unavailable)?;
+            if inner.context.is_none() {
+                return Err(LearningError::Unavailable);
+            }
+            if inner.archive.is_some() && inner.job_index.is_some() {
+                return cold_jobs::finish(&mut inner, batch, at_ms, outcome);
+            }
         }
+        let mut inner = self.lock()?;
         let index = inner
             .document
             .jobs
             .iter()
             .position(|record| record.job.batch.id == batch.id)
             .ok_or(LearningError::Conflict)?;
-        let old = &inner.document.jobs[index].job;
-        if old.batch != *batch {
-            return Err(LearningError::Conflict);
-        }
-        if old.status != JobStatus::Running {
-            let replay = match (&old.status, &outcome) {
-                (JobStatus::Completed, LearningOutcome::Completed(drafts)) => {
-                    old.candidates.len() == drafts.len()
-                        && old
-                            .candidates
-                            .iter()
-                            .zip(drafts)
-                            .all(|(candidate, draft)| candidate.draft == *draft)
-                }
-                (JobStatus::Failed(first), LearningOutcome::Failed(second)) => first == second,
-                _ => false,
-            };
-            return if replay && inner.document.jobs[index].reflection == reflection {
-                Ok(())
-            } else {
-                Err(LearningError::Conflict)
-            };
-        }
-        if let LearningOutcome::Completed(drafts) = &outcome {
-            validate_drafts(batch, drafts)?;
-        }
-        if at_ms < batch.started_at_ms {
-            return Err(LearningError::InvalidInput);
-        }
+        let Some(record) = finish_record(&inner.document.jobs[index], batch, at_ms, outcome)?
+        else {
+            return Ok(());
+        };
         let mut next = inner.document.clone();
-        next.jobs[index].reflection = reflection;
-        let job = &mut next.jobs[index].job;
-        job.finished_at_ms = Some(at_ms);
-        match outcome {
-            LearningOutcome::Maintained(_) => unreachable!("normalized above"),
-            LearningOutcome::Failed(reason) => job.status = JobStatus::Failed(reason),
-            LearningOutcome::Completed(drafts) => {
-                let expires_at_ms = at_ms
-                    .checked_add(CANDIDATE_TTL_MS)
-                    .ok_or(LearningError::InvalidInput)?;
-                job.status = JobStatus::Completed;
-                job.candidates = drafts
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, draft)| PreferenceCandidate {
-                        id: candidate_id(&batch.id, index),
-                        batch_id: batch.id.clone(),
-                        draft,
-                        created_at_ms: at_ms,
-                        expires_at_ms,
-                    })
-                    .collect();
-            }
-        }
+        next.jobs[index] = record;
         persist(&mut inner, next)
     }
     pub(super) fn maintenance_receipts(
@@ -1423,4 +1376,77 @@ fn retryable(status: &JobStatus) -> bool {
         JobStatus::Interrupted
             | JobStatus::Failed(LearningFailure::TransientProvider | LearningFailure::Timeout)
     )
+}
+
+fn finish_record(
+    record: &JobRecord,
+    batch: &LearningBatch,
+    at_ms: u64,
+    outcome: LearningOutcome,
+) -> LearningResult<Option<JobRecord>> {
+    let (outcome, reflection) = match outcome {
+        LearningOutcome::Maintained(value) => (
+            LearningOutcome::Completed(value.candidates),
+            value.reflection,
+        ),
+        other => (other, None),
+    };
+    if let Some(reflection) = &reflection {
+        reflection.validate(batch)?;
+    }
+    let old = &record.job;
+    if old.batch != *batch {
+        return Err(LearningError::Conflict);
+    }
+    if old.status != JobStatus::Running {
+        let replay = match (&old.status, &outcome) {
+            (JobStatus::Completed, LearningOutcome::Completed(drafts)) => {
+                old.candidates.len() == drafts.len()
+                    && old
+                        .candidates
+                        .iter()
+                        .zip(drafts)
+                        .all(|(candidate, draft)| candidate.draft == *draft)
+            }
+            (JobStatus::Failed(first), LearningOutcome::Failed(second)) => first == second,
+            _ => false,
+        };
+        return if replay && record.reflection == reflection {
+            Ok(None)
+        } else {
+            Err(LearningError::Conflict)
+        };
+    }
+    if let LearningOutcome::Completed(drafts) = &outcome {
+        validate_drafts(batch, drafts)?;
+    }
+    if at_ms < batch.started_at_ms {
+        return Err(LearningError::InvalidInput);
+    }
+    let mut next = record.clone();
+    next.reflection = reflection;
+    let job = &mut next.job;
+    job.finished_at_ms = Some(at_ms);
+    match outcome {
+        LearningOutcome::Maintained(_) => unreachable!("normalized above"),
+        LearningOutcome::Failed(reason) => job.status = JobStatus::Failed(reason),
+        LearningOutcome::Completed(drafts) => {
+            let expires_at_ms = at_ms
+                .checked_add(CANDIDATE_TTL_MS)
+                .ok_or(LearningError::InvalidInput)?;
+            job.status = JobStatus::Completed;
+            job.candidates = drafts
+                .into_iter()
+                .enumerate()
+                .map(|(index, draft)| PreferenceCandidate {
+                    id: candidate_id(&batch.id, index),
+                    batch_id: batch.id.clone(),
+                    draft,
+                    created_at_ms: at_ms,
+                    expires_at_ms,
+                })
+                .collect();
+        }
+    }
+    Ok(Some(next))
 }
