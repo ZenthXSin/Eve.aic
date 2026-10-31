@@ -178,6 +178,20 @@ impl StoredTasks {
         })
     }
 
+    pub(super) fn scheduling_snapshot(&self) -> TaskResult<TaskSchedulingSnapshot> {
+        let directory = TaskSchedulingSnapshot {
+            tasks: self
+                .lock()?
+                .ledger
+                .tasks
+                .iter()
+                .map(TaskSchedulingEntry::from)
+                .collect(),
+        };
+        directory.validate()?;
+        Ok(directory)
+    }
+
     pub(super) fn summaries_for(&self, owner: &TaskOwner) -> TaskResult<Vec<TaskSummary>> {
         validate_owner(owner)?;
         Ok(self

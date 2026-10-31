@@ -683,6 +683,10 @@ async fn failed_writes_close_the_instance_instead_of_trusting_the_cache() {
         TaskError::Storage
     );
     assert_eq!(tasks.snapshot().unwrap_err(), TaskError::Unavailable);
+    assert_eq!(
+        tasks.scheduling_snapshot().unwrap_err(),
+        TaskError::Unavailable
+    );
     world.state.fail.store(false, Ordering::SeqCst);
     kernel.stop_all().await.unwrap();
     let (kernel, tasks) = world.open().await.unwrap();
@@ -1102,6 +1106,18 @@ async fn scoped_task_directory_omits_heavy_context_and_full_reads_keep_both_iden
         .unwrap();
     let before = world.raw();
     let summaries = admin.summaries_for(&alice).unwrap();
+    let directory = admin.scheduling_snapshot().unwrap();
+    directory.validate().unwrap();
+    assert_eq!(directory.tasks.len(), 3);
+    let own_entry = directory
+        .tasks
+        .iter()
+        .find(|entry| entry.id == own.id)
+        .unwrap();
+    assert!(own_entry.matches(&own));
+    let encoded_directory = format!("{directory:?}");
+    assert!(!encoded_directory.contains("CONFIDENTIAL_CONTEXT"));
+    assert!(encoded_directory.len() < 4096);
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].id, own.id);
     assert_eq!(summaries[0].instructions, own.spec.instructions);
