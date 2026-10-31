@@ -408,10 +408,10 @@ class OutreachAcceptance(unittest.TestCase):
 
     def test_quiet_holds_the_invitation_until_the_user_turns_outreach_back_on(self):
         self.run_eve([*self.send(self.message("casual", MINDUSTRY)), *self.checkpoint("composed"),
-                      *self.send(self.message("off", "/outreach off", contains="不会再主动提起")),
+                      *self.send(self.message("off", "/outreach off", contains="不再发送学习进展或空闲闲聊邀请")),
                       *self.send(self.message("chat", CHAT)),
                       *self.send(self.message("status", "/outreach", contains=["主动邀请：已关闭", "等待合适的时机"])),
-                      *self.send(self.message("on", "/outreach on", contains="合适的时候告诉你")),
+                      *self.send(self.message("on", "/outreach on", contains="已恢复主动交流")),
                       *self.send_invited("later", LATER),
                       *self.checkpoint("quiet")],
                      checkpoints={"composed": lambda: self.wait_status("Pending"), "quiet": self.quiet},
