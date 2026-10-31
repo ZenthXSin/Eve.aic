@@ -42,6 +42,14 @@ impl SemanticIndex {
     pub fn entries(&self) -> Result<Vec<IndexEntry>, IndexError> {
         self.service()?.entries()
     }
+    /// 只复制指定模型和范围的向量；旧全账本接口仍供管理/建索引兼容使用。
+    pub fn entries_for(
+        &self,
+        profile: &EmbeddingProfile,
+        scope: &str,
+    ) -> Result<Vec<IndexEntry>, IndexError> {
+        self.service()?.entries_for(profile, scope)
+    }
     pub fn apply(
         &self,
         profile: &EmbeddingProfile,

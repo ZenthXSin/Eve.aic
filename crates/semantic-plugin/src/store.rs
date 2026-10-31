@@ -163,6 +163,29 @@ impl StoredIndex {
         Ok(self.lock()?.ledger.entries.clone())
     }
 
+    pub(crate) fn entries_for(
+        &self,
+        profile: &EmbeddingProfile,
+        scope: &str,
+    ) -> Result<Vec<IndexEntry>, IndexError> {
+        profile.validate().map_err(|_| IndexError::InvalidInput)?;
+        if scope.len() != 64
+            || !scope
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(IndexError::InvalidInput);
+        }
+        Ok(self
+            .lock()?
+            .ledger
+            .entries
+            .iter()
+            .filter(|entry| entry.belongs_to(profile) && entry.scope == scope)
+            .cloned()
+            .collect())
+    }
+
     /// 一次提交新增或替换的条目与移除的条目。超出上限时先移出其他模型的旧条目；
     /// 仍超出则不做任何更改，返回 LimitReached。
     pub(crate) fn apply(

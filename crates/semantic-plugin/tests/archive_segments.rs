@@ -103,7 +103,9 @@ fn text(number: usize) -> String {
 }
 
 fn import(world: &World, session: &mut SessionSnapshot, number: usize) {
-    let user = text(number);
+    import_text(world, session, number, text(number));
+}
+fn import_text(world: &World, session: &mut SessionSnapshot, number: usize, user: String) {
     session.turns.push(SessionTurn {
         id: number as u64,
         input: user.clone(),
@@ -241,5 +243,103 @@ async fn archived_originals_are_indexed_in_segments_and_recalled_by_meaning() {
         recall(&world, "想吃辣的").await.unwrap_err(),
         MemoryError::CorruptState
     );
+    world.kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn multiple_cold_segments_keep_exact_ranking_unbuilt_fallback_and_reject_a_late_corrupt_file()
+{
+    let directory = tempfile::tempdir().unwrap();
+    let world = open(directory.path()).await;
+    let mut session = SessionSnapshot {
+        key: SessionKey::new("private-a", "alice").unwrap(),
+        revision: 0,
+        turns: vec![],
+    };
+    for number in 1..=64 {
+        import_text(
+            &world,
+            &mut session,
+            number,
+            if number == 7 {
+                "周末选川菜".into()
+            } else {
+                text(number)
+            },
+        );
+    }
+    let indexer = Indexer::new(
+        Arc::new(world.memory.clone()),
+        world.index.clone(),
+        embedder(),
+    );
+    for _ in 0..20 {
+        if indexer.status().unwrap().pending == 0 {
+            break;
+        }
+        indexer.step(5000).await.unwrap();
+    }
+    assert_eq!(indexer.status().unwrap().pending, 0);
+    assert_eq!(world.index.entries().unwrap().len(), 128);
+    for number in 65..=132 {
+        import_text(
+            &world,
+            &mut session,
+            number,
+            if [71, 130].contains(&number) {
+                "周末选川菜".into()
+            } else {
+                text(number)
+            },
+        );
+    }
+    assert_eq!(
+        world
+            .memory
+            .reader(scope())
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .archived_evidence,
+        128
+    );
+    indexer.step(5001).await.unwrap();
+    assert!(segment_files(directory.path()).is_empty());
+    assert_eq!(
+        recall(&world, "想吃辣的").await.unwrap(),
+        vec!["e-130", "e-7"],
+        "未建分段时沿用热账本里已有的老向量"
+    );
+    for _ in 0..20 {
+        if indexer.status().unwrap().pending == 0 {
+            break;
+        }
+        // 只清理过期热向量的轮次可返回 0，pending 才是是否仍需建段的依据。
+        indexer.step(5002).await.unwrap();
+    }
+    assert_eq!(indexer.status().unwrap().pending, 0);
+    assert_eq!(segment_files(directory.path()).len(), 2);
+    assert_eq!(world.index.entries().unwrap().len(), 8);
+    assert_eq!(
+        recall(&world, "想吃辣的").await.unwrap(),
+        vec!["e-130", "e-71", "e-7"],
+        "同向量按证据修订新到旧排序，冷热共同融合"
+    );
+    world.kernel.stop_all().await.unwrap();
+    drop((world, indexer));
+    let world = open(directory.path()).await;
+    assert_eq!(
+        recall(&world, "想吃辣的").await.unwrap(),
+        vec!["e-130", "e-71", "e-7"]
+    );
+    let files = segment_files(directory.path());
+    let last = files.last().unwrap();
+    std::fs::write(last, b"late-corruption").unwrap();
+    assert_eq!(
+        recall(&world, "想吃辣的").await.unwrap_err(),
+        MemoryError::CorruptState,
+        "不能在第一段成功后返回部分语义结果，缓存也不能掩盖坏文件"
+    );
+    assert_eq!(std::fs::read(last).unwrap(), b"late-corruption");
     world.kernel.stop_all().await.unwrap();
 }
