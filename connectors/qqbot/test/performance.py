@@ -8,6 +8,7 @@ import pathlib
 import platform
 import resource
 import statistics
+import sys
 import subprocess
 import tempfile
 import threading
@@ -16,6 +17,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "scripts"))
+from self_upgrade_runtime import session_turns
 HISTORY_TURNS = 16  # 分层请求仍受窗口上限约束；完整持久账本在每轮末独立核对。
 
 
@@ -248,9 +251,11 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes, p
     require(all(entry["state"] == "Sent" for entry in ledger["entries"]), "uncommitted_delivery")
     by_id = {entry["message"]["id"]: entry["reply"] for entry in ledger["entries"]}
     require(all(by_id[message["id"]] == message["expected"] for message in messages), "wrong_saved_reply")
-    sessions = json.loads(bytes(state["entries"]["eve.session"]["sessions.v1"]))["sessions"]
+    session_document = json.loads(bytes(state["entries"]["eve.session"]["sessions.v1"]))
+    sessions = session_document["sessions"]
     require(len(sessions) == 1, "unexpected_session_split")
     session = next(iter(sessions.values()))
+    session["turns"] = list(session_turns(state_path, session, session_document["format_version"]))
     require(session["revision"] == 2 * (initial_turns + count), "wrong_session_revision")
     require(len(session["turns"]) == initial_turns + count and
             all(turn["status"]["state"] == "Completed" for turn in session["turns"]),
