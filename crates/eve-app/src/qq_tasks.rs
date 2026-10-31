@@ -30,7 +30,8 @@ use eve_session_api::SessionKey;
 use eve_task_api::{
     DEFAULT_STEPS, DelegatedContext, DeliveryChannel, DeliveryResult, MAX_CONTEXT_BYTES,
     MAX_INSTRUCTIONS_BYTES, MAX_STEPS, MAX_TITLE_BYTES, MIN_STEPS, Task, TaskAdmin, TaskEnd,
-    TaskError, TaskOwner, TaskSchedulingEntry, TaskSpec, TaskStatus, TaskUsage, bounded,
+    TaskError, TaskOwner, TaskSchedulingEntry, TaskSchedulingSnapshot, TaskSpec, TaskStatus,
+    TaskUsage, bounded,
 };
 use ring::digest::{Context as Digest, SHA256};
 use serde_json::{Value, json};
@@ -1284,6 +1285,53 @@ pub(crate) struct TaskContext {
     pub(crate) wrapped: Arc<dyn ContextAssembler>,
     pub(crate) tasks: Arc<dyn TaskAdmin>,
 }
+
+/// 先用轻量目录筛选，再逐条读取所选记录并立即形成小卡片，不保留多份完整任务正文。
+fn task_context_cards(
+    directory: &TaskSchedulingSnapshot,
+    scope: &ContextScope,
+    now: u64,
+    mut read: impl FnMut(&TaskOwner, &str) -> eve_task_api::TaskResult<Option<Task>>,
+) -> Result<(Vec<Value>, Vec<String>), LlmError> {
+    let failed = || LlmError::Context("后台任务记录不可用或目录与正文不符；不自动回退".into());
+    directory.validate().map_err(|_| failed())?;
+    let mut recent: Vec<_> = directory
+        .tasks
+        .iter()
+        .filter(|task| {
+            task.owner.user_id == scope.user_id
+                && (!task
+                    .source
+                    .starts_with(crate::qq_failure_recovery::SOURCE_PREFIX)
+                    || task.owner.session_id == scope.session_id)
+                && task
+                    .finished_at_ms
+                    .is_none_or(|at| now.saturating_sub(at) < eve_task_api::DAY_MS)
+        })
+        .collect();
+    recent.sort_by_key(|task| std::cmp::Reverse((task.created_at_ms, &task.id)));
+    recent.truncate(SHOWN_TASKS);
+    let mut views = vec![];
+    let mut marks = vec![];
+    for entry in recent {
+        // 已了结任务可能刚被合法容量回收；不回退为其他身份或缓存正文。
+        let Some(task) = read(&entry.owner, &entry.id).map_err(|_| failed())? else {
+            continue;
+        };
+        if !entry.matches(&task) {
+            return Err(failed());
+        }
+        if task
+            .finished_at_ms
+            .is_some_and(|at| now.saturating_sub(at) >= eve_task_api::DAY_MS)
+        {
+            continue;
+        }
+        views.push(view(&task, PREVIEW_BYTES));
+        marks.push(format!("{}={}", task.id, status_text(&task)));
+    }
+    Ok((views, marks))
+}
 impl ContextAssembler for TaskContext {
     fn assemble(&self, input: TurnInput) -> LlmFuture<'_, ContextSnapshot> {
         self.wrapped.assemble(input)
@@ -1301,37 +1349,19 @@ impl ContextAssembler for TaskContext {
             };
             let snapshot = self
                 .tasks
-                .snapshot()
+                .scheduling_snapshot()
                 .map_err(|_| LlmError::Context("后台任务记录不可用；不自动回退".into()))?;
-            let now = now_ms();
-            // 进行中的，以及一天内结束的。
-            let mut recent: Vec<&Task> = snapshot
-                .for_owner(&scope.user_id)
-                .filter(|task| {
-                    !task
-                        .source
-                        .starts_with(crate::qq_failure_recovery::SOURCE_PREFIX)
-                        || task.owner.session_id == scope.session_id
-                })
-                .filter(|task| {
-                    task.finished_at_ms
-                        .is_none_or(|at| now.saturating_sub(at) < eve_task_api::DAY_MS)
-                })
-                .collect();
-            if recent.is_empty() {
+            let (views, marks) = task_context_cards(&snapshot, &scope, now_ms(), |owner, id| {
+                self.tasks.get_owned(owner, id)
+            })?;
+            if views.is_empty() {
                 return Ok(context);
             }
-            recent.sort_by_key(|task| std::cmp::Reverse((task.created_at_ms, task.id.clone())));
-            recent.truncate(SHOWN_TASKS);
             let data = json!({
                 "kind": "eve.background_tasks",
-                "tasks": recent.iter().map(|task| view(task, PREVIEW_BYTES)).collect::<Vec<_>>(),
+                "tasks": views,
             });
             context.memories.push(format!("{CONTEXT_NOTICE}{data}"));
-            let marks: Vec<String> = recent
-                .iter()
-                .map(|task| format!("{}={}", task.id, status_text(task)))
-                .collect();
             context.revision = format!("{}:eve-tasks-1:{}", context.revision, marks.join(","));
             Ok(context)
         })
@@ -1793,6 +1823,133 @@ mod tests {
             }),
             execution: None,
         }
+    }
+
+    #[test]
+    fn task_cards_read_only_selected_full_identities_and_preserve_existing_scope_rules() {
+        let scope = ContextScope {
+            session_id: "s".into(),
+            user_id: "u".into(),
+        };
+        let mut records: Vec<_> = (0..9)
+            .map(|index| {
+                let mut task = task(TaskStatus::Running);
+                task.id = format!("own-{index}");
+                task.source = format!("tool:{index}");
+                task.created_at_ms = 10 + index;
+                task.started_at_ms = Some(task.created_at_ms + 1);
+                task.finished_at_ms = None;
+                task.notice = None;
+                task.result = None;
+                task.failure = None;
+                task
+            })
+            .collect();
+        let mut shared = records[0].clone();
+        shared.id = "shared-ordinary".into();
+        shared.owner.session_id = "another-session".into();
+        shared.created_at_ms = 104;
+        records.push(shared.clone());
+        let mut foreign = shared.clone();
+        foreign.id = "foreign-user".into();
+        foreign.owner.user_id = "other".into();
+        records.push(foreign);
+        let mut recovery = shared.clone();
+        recovery.id = "foreign-recovery-session".into();
+        recovery.source = format!("{}another", crate::qq_failure_recovery::SOURCE_PREFIX);
+        records.push(recovery);
+        let mut old = shared;
+        old.id = "expired".into();
+        old.status = TaskStatus::Completed;
+        old.finished_at_ms = Some(105);
+        records.push(old);
+        records[0].spec.context = Some(DelegatedContext {
+            owner: records[0].owner.clone(),
+            messages_json: serde_json::to_string(&[eve_llm_api::ChatMessage::text(
+                eve_llm_api::ChatRole::User,
+                "UNSELECTED_BODY_DO_NOT_READ".repeat(20_000),
+            )])
+            .unwrap(),
+        });
+        let directory = TaskSchedulingSnapshot {
+            tasks: records.iter().map(TaskSchedulingEntry::from).collect(),
+        };
+        let mut reads = vec![];
+        let (views, marks) =
+            task_context_cards(&directory, &scope, 2 * eve_task_api::DAY_MS, |owner, id| {
+                let record = records.iter().find(|task| task.id == id).unwrap();
+                assert_eq!(owner, &record.owner);
+                assert_ne!(id, "own-0");
+                reads.push(id.to_owned());
+                Ok(Some(record.clone()))
+            })
+            .unwrap();
+        assert_eq!(
+            reads,
+            ["shared-ordinary", "own-8", "own-7", "own-6", "own-5"]
+        );
+        assert_eq!(
+            views
+                .iter()
+                .map(|view| view["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            reads
+        );
+        assert_eq!(marks.len(), SHOWN_TASKS);
+        assert!(
+            !serde_json::to_string(&views)
+                .unwrap()
+                .contains("UNSELECTED_BODY")
+        );
+    }
+
+    #[test]
+    fn task_cards_reject_substituted_bodies_and_late_read_failure_without_partial_cards() {
+        let scope = ContextScope {
+            session_id: "s".into(),
+            user_id: "u".into(),
+        };
+        let mut first = task(TaskStatus::Running);
+        first.finished_at_ms = None;
+        first.result = None;
+        first.failure = None;
+        first.notice = None;
+        let mut second = first.clone();
+        second.id = "task-2".into();
+        second.created_at_ms += 1;
+        let records = [first, second];
+        let directory = TaskSchedulingSnapshot {
+            tasks: records.iter().map(TaskSchedulingEntry::from).collect(),
+        };
+        for variant in 0..4 {
+            assert!(
+                task_context_cards(&directory, &scope, 100, |_, id| {
+                    let mut record = records.iter().find(|task| task.id == id).unwrap().clone();
+                    match variant {
+                        0 => record.owner.user_id = "other".into(),
+                        1 => record.owner.session_id = "other".into(),
+                        2 => record.source = "substituted".into(),
+                        _ => record.created_at_ms += 1,
+                    }
+                    Ok(Some(record))
+                })
+                .is_err()
+            );
+        }
+        let mut reads = 0;
+        assert!(
+            task_context_cards(&directory, &scope, 100, |_, id| {
+                reads += 1;
+                if reads == 2 {
+                    return Err(TaskError::Storage);
+                }
+                Ok(records.iter().find(|task| task.id == id).cloned())
+            })
+            .is_err()
+        );
+        assert_eq!(reads, 2);
+        let (views, marks) = task_context_cards(&directory, &scope, 100, |_, _| Ok(None)).unwrap();
+        assert!(views.is_empty() && marks.is_empty());
     }
 
     #[test]
