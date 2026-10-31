@@ -12,7 +12,7 @@ use std::{
 
 const FORMAT_VERSION: u32 = 2;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Ledger {
     format_version: u32,
@@ -257,18 +257,20 @@ impl StoredTasks {
         if active >= MAX_ACTIVE_PER_OWNER || recent >= MAX_CREATED_PER_OWNER_PER_DAY {
             return Err(TaskError::LimitReached);
         }
-        let mut next = inner.ledger.clone();
         // 满了时腾出最早了结的一条；进行中与通知未了结的任务从不删除。
-        if next.tasks.len() >= MAX_TASKS {
-            let oldest = next
+        let evict = if inner.ledger.tasks.len() >= MAX_TASKS {
+            let oldest = inner
+                .ledger
                 .tasks
                 .iter()
                 .enumerate()
                 .filter_map(|(index, task)| task.settled_at().map(|at| (at, index)))
                 .min()
                 .ok_or(TaskError::LimitReached)?;
-            next.tasks.remove(oldest.1);
-        }
+            Some(oldest.1)
+        } else {
+            None
+        };
         let task = Task {
             id,
             owner: owner.clone(),
@@ -288,8 +290,21 @@ impl StoredTasks {
                 ..Default::default()
             }),
         };
-        next.tasks.push(task.clone());
-        persist(&mut inner, next)?;
+        let tasks: Vec<_> = inner
+            .ledger
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| Some(*position) != evict)
+            .map(|(_, existing)| existing)
+            .chain(std::iter::once(&task))
+            .collect();
+        let bytes = encode_tasks(&tasks)?;
+        commit_bytes(&mut inner, bytes)?;
+        if let Some(position) = evict {
+            inner.ledger.tasks.remove(position);
+        }
+        inner.ledger.tasks.push(task.clone());
         Ok(task)
     }
 
@@ -633,17 +648,25 @@ impl StoredTasks {
         }
         let mut inner = self.lock()?;
         guard(&inner.ledger)?;
-        let mut next = inner.ledger.clone();
-        let position = next
+        let position = inner
+            .ledger
             .tasks
             .iter()
             .position(|task| task.id == id)
             .ok_or(TaskError::NotFound)?;
-        let mut task = next.tasks[position].clone();
+        let mut task = inner.ledger.tasks[position].clone();
         apply(&mut task)?;
         validate_task(&task).map_err(|_| TaskError::InvalidInput)?;
-        next.tasks[position] = task.clone();
-        persist(&mut inner, next)?;
+        let tasks: Vec<_> = inner
+            .ledger
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(index, existing)| if index == position { &task } else { existing })
+            .collect();
+        let bytes = encode_tasks(&tasks)?;
+        commit_bytes(&mut inner, bytes)?;
+        inner.ledger.tasks[position] = task.clone();
         Ok(task)
     }
 
@@ -716,50 +739,89 @@ fn validate_result(result: &DeliveryResult) -> TaskResult<()> {
     }
 }
 
-fn persist(inner: &mut Inner, next: Ledger) -> TaskResult<()> {
-    let bytes = encode(&next)?;
+fn commit_bytes(inner: &mut Inner, bytes: Vec<u8>) -> TaskResult<()> {
     let context = inner.context.as_ref().ok_or(TaskError::Unavailable)?;
     // 失败也可能已经提交；关闭整个实例，禁止旧缓存继续读取或覆盖后端。
     if context.state_set(TASK_STATE_KEY, bytes).is_err() {
         inner.context = None;
         return Err(TaskError::Storage);
     }
-    inner.ledger = next;
     Ok(())
 }
 
 fn encode(ledger: &Ledger) -> TaskResult<Vec<u8>> {
-    if ledger.tasks.len() > MAX_TASKS {
+    encode_tasks(&ledger.tasks.iter().collect::<Vec<_>>())
+}
+
+#[derive(Serialize)]
+struct BorrowedLedger<'a> {
+    format_version: u32,
+    tasks: &'a [&'a Task],
+}
+
+fn encode_tasks(tasks: &[&Task]) -> TaskResult<Vec<u8>> {
+    if tasks.len() > MAX_TASKS {
         return Err(TaskError::LimitReached);
     }
-    let mut wire = ledger.clone();
-    wire.format_version = if wire.tasks.iter().any(|t| t.status == TaskStatus::Blocked) {
+    let format_version = if tasks.iter().any(|t| t.status == TaskStatus::Blocked) {
         3
     } else {
         FORMAT_VERSION
     };
-    let bytes = serde_json::to_vec(&wire).map_err(|_| TaskError::InvalidInput)?;
     // 重启时写入的中断与未知结局比原状态略长；为进行中的任务预留空间，保证能保存。
-    let open = ledger
-        .tasks
+    let open = tasks
         .iter()
         .filter(|task| !task.status.finished() || task.notice.is_some())
         .count();
     // 进行中的任务结束时还要写入结果；按上限预留。
-    let pending_results = ledger
-        .tasks
-        .iter()
-        .filter(|task| !task.status.finished())
-        .count();
-    if bytes
-        .len()
-        .saturating_add(open * 160)
-        .saturating_add(pending_results * (MAX_RESULT_BYTES * 2))
-        > MAX_STATE_BYTES
+    let pending_results = tasks.iter().filter(|task| !task.status.finished()).count();
+    let reserved = open
+        .saturating_mul(160)
+        .saturating_add(pending_results.saturating_mul(MAX_RESULT_BYTES * 2));
+    let available = MAX_STATE_BYTES
+        .checked_sub(reserved)
+        .ok_or(TaskError::LimitReached)?;
+    let mut writer = LimitedJson {
+        bytes: vec![],
+        available,
+        exceeded: false,
+    };
+    if serde_json::to_writer(
+        &mut writer,
+        &BorrowedLedger {
+            format_version,
+            tasks,
+        },
+    )
+    .is_err()
     {
-        return Err(TaskError::LimitReached);
+        return Err(if writer.exceeded {
+            TaskError::LimitReached
+        } else {
+            TaskError::InvalidInput
+        });
     }
-    Ok(bytes)
+    Ok(writer.bytes)
+}
+
+/// 保留原字节预算和收尾预留；超过可用载荷时停止编码，不先分配整份超额 JSON。
+struct LimitedJson {
+    bytes: Vec<u8>,
+    available: usize,
+    exceeded: bool,
+}
+impl std::io::Write for LimitedJson {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if buffer.len() > self.available.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            return Err(std::io::Error::other("后台任务编码超过保留预算"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// 启动时完整核对；任何不一致都拒绝打开并保留原字节。
