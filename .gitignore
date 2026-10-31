@@ -22,3 +22,5 @@
 /packaging/common/config.json
 /packaging/common/data/
 __pycache__/
+/arc-src/
+/mindustry-src/
