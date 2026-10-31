@@ -12,11 +12,13 @@ pub(crate) fn reference(
     explicit: Option<&str>,
 ) -> Result<&str, CredentialError> {
     let reference = explicit.unwrap_or(match purpose {
-        CredentialPurpose::Primary | CredentialPurpose::Semantic => PRIMARY,
+        CredentialPurpose::Primary | CredentialPurpose::Auxiliary | CredentialPurpose::Semantic => {
+            PRIMARY
+        }
         CredentialPurpose::Jev => JEV,
     });
     match (purpose, reference) {
-        (CredentialPurpose::Primary, PRIMARY)
+        (CredentialPurpose::Primary | CredentialPurpose::Auxiliary, PRIMARY)
         | (CredentialPurpose::Jev, JEV)
         | (CredentialPurpose::Semantic, PRIMARY | SEMANTIC) => Ok(reference),
         _ => Err(CredentialError::UnknownReference),
@@ -30,6 +32,15 @@ pub(crate) fn bank(
     bank.bind(purpose, reference(purpose, None)?, Some(key))?;
     Ok(bank)
 }
+/// 默认 CLI 主/辅角色由宿主显式绑定同一启动密钥，租约用途仍独立核验。
+/// 替换代理可为两个用途注入不同密钥，不按配置引用读取任意环境。
+pub(crate) fn core_bank(key: String) -> Result<Arc<dyn ModelCredentials>, CredentialError> {
+    let bank = Arc::new(CredentialBank::default());
+    bank.bind(CredentialPurpose::Primary, PRIMARY, Some(key.clone()))?;
+    bank.bind(CredentialPurpose::Auxiliary, PRIMARY, Some(key))?;
+    Ok(bank)
+}
+
 pub(crate) fn resolve(
     broker: &dyn ModelCredentials,
     purpose: CredentialPurpose,

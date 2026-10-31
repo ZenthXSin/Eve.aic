@@ -1,8 +1,6 @@
 //! QQ 主模型快捷切换；管理句柄只由组合层授予，不注册给普通插件。
 use crate::{config, models};
-use eve_config_api::{
-    ApplyMode, ConfigAdmin, ConfigError, ConfigService, MODELS_NAMESPACE, NamespaceValues,
-};
+use eve_config_api::{ApplyMode, ConfigAdmin, ConfigError, ConfigService, NamespaceValues};
 use eve_developer_api::DeveloperAuthorization;
 use eve_llm_api::ContextScope;
 use eve_plugin_api::PluginResult;
@@ -22,21 +20,15 @@ pub(crate) struct Commands {
 impl Commands {
     fn switch(&self, model: &str) -> Result<String, ConfigError> {
         let mut document = self.admin.current()?;
-        let provider = self.settings.snapshot(config::OPENAI_NAMESPACE, 1)?;
-        if provider.revision != document.revision {
-            return Err(ConfigError::RevisionConflict {
-                expected: document.revision,
-                found: provider.revision,
-            });
-        }
-        let role = config::configured_role(&provider)
-            .map_err(|_| ConfigError::InvalidValue("主模型选择".into()))?;
-        let (namespace, field) = match role {
-            Some(_) => (MODELS_NAMESPACE, "primary_model"),
-            None => (config::OPENAI_NAMESPACE, "model"),
-        };
         let current = models::summary(self.settings.as_ref(), Some("dialogue"))
             .map_err(|_| ConfigError::Unavailable)?;
+        if current.config_revision != document.revision {
+            return Err(ConfigError::RevisionConflict {
+                expected: document.revision,
+                found: current.config_revision,
+            });
+        }
+        let (namespace, field) = (current.model_namespace, current.model_field);
         if current.model == model {
             return Ok(format!("当前主模型已经是：{model}。配置未改动。"));
         }
@@ -48,7 +40,7 @@ impl Commands {
                 values: BTreeMap::new(),
             })
             .values
-            .insert(field.into(), json!(model));
+            .insert(field, json!(model));
         self.admin.replace(
             document.revision,
             document.namespaces,

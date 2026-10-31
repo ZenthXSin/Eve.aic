@@ -130,6 +130,28 @@ class SummaryAcceptance(digest.ConversationDigestAcceptance):
             panel=True, checkpoints={"enable": enable})
         self.assertTrue(self.views("恢复后继续当前话题"))
 
+    def test_auxiliary_summary_route_is_independent_from_dialogue_and_survives_restart(self):
+        def route():
+            self.save_page("runtime.models", {
+                "auxiliary_small_enabled": True,
+                "auxiliary_small_provider": "openai",
+                "auxiliary_small_model": "summary-small",
+                "auxiliary_small_max_output_tokens": 256,
+            })
+            self.save_page("runtime.model_uses", {"summary_role": "auxiliary_small"})
+        self.run_summary([*self.checkpoint("route"),
+            *self.send(self.message("aux-first", FIRST)), *self.checkpoint("first"),
+            *self.send(self.message("aux-second", SECOND)), *self.checkpoint("second")], panel=True,
+            checkpoints={"route": route, "first": lambda: self.wait_jobs(1),
+                         "second": lambda: self.wait_jobs(2)})
+        self.assertEqual([r["body"]["model"] for r in self.summary_requests()], ["summary-small"] * 2)
+        self.assertTrue(all(r["body"]["max_tokens"] == 256 for r in self.summary_requests()))
+        self.assertTrue(all(r["body"]["model"] != "summary-small" for r in self.requests if r["kind"] == "chat"))
+        self.run_summary([*self.send(self.message("aux-restart", "重启后继续摘要路由测试")),
+            *self.checkpoint("third")], panel=True,
+            checkpoints={"third": lambda: self.wait_jobs(3)})
+        self.assertEqual([r["body"]["model"] for r in self.summary_requests()], ["summary-small"] * 3)
+
     def test_invalid_quotes_duplicate_json_provider_errors_and_tool_output_are_not_replayed(self):
         for mode in ("invalid_quote", "duplicate", "provider", "tool"):
             with self.subTest(mode=mode):

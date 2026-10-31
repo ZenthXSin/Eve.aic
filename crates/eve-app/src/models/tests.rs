@@ -508,6 +508,206 @@ async fn explicit_primary_reference_rotates_only_new_selections_and_preserves_in
 struct ChangingCredentials {
     mode: std::sync::atomic::AtomicUsize,
 }
+
+#[tokio::test]
+async fn auxiliary_use_routes_real_requests_keeps_old_selections_and_isolates_credential_rotation()
+{
+    use eve_llm_api::{ChatMessage, ChatRole, CredentialPurpose, ModelRequest};
+    let root = tempfile::tempdir().unwrap();
+    let mut server = Server::start((0..5).map(|_| final_reply("chat")).collect()).await;
+    let h = Harness::start(root.path(), &server.url, "chat").await;
+    let bank = Arc::new(eve_model_credentials::CredentialBank::default());
+    bank.bind(
+        CredentialPurpose::Primary,
+        crate::model_credentials::PRIMARY,
+        Some("primary-synthetic".into()),
+    )
+    .unwrap();
+    bank.bind(
+        CredentialPurpose::Auxiliary,
+        crate::model_credentials::PRIMARY,
+        Some("auxiliary-synthetic".into()),
+    )
+    .unwrap();
+    let resolver = CoreModelResolver::from_credentials(h.settings.clone(), Ok(bank.clone()))
+        .with_use("summary")
+        .with_timeout_cap(Duration::from_millis(1000));
+    let old_primary = resolver.resolve().unwrap();
+    h.update(
+        &[
+            (MODELS_NAMESPACE, "auxiliary_small_enabled", json!(true)),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_provider",
+                json!("openai"),
+            ),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_model",
+                json!("small-model"),
+            ),
+            (MODELS_NAMESPACE, "auxiliary_small_timeout_ms", json!(1500)),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_max_output_tokens",
+                json!(19),
+            ),
+            (
+                config::MODEL_USES_NAMESPACE,
+                "summary_role",
+                json!("auxiliary_small"),
+            ),
+        ],
+        ApplyMode::Immediate,
+    );
+    let auxiliary = resolver.resolve().unwrap();
+    assert_eq!(auxiliary.provider_timeout, Duration::from_millis(1000));
+    assert!(Arc::ptr_eq(
+        &auxiliary.provider,
+        &resolver.resolve().unwrap().provider
+    ));
+    let shown = summary(h.settings.as_ref(), Some("summary")).unwrap();
+    assert_eq!(shown.model, "small-model");
+    assert_eq!(
+        shown.max_output_tokens_key,
+        "runtime.models.auxiliary_small_max_output_tokens"
+    );
+    assert_eq!(
+        summary(h.settings.as_ref(), Some("dialogue"))
+            .unwrap()
+            .model,
+        "model-a"
+    );
+    bank.replace(
+        CredentialPurpose::Auxiliary,
+        crate::model_credentials::PRIMARY,
+        1,
+        "rotated-auxiliary".into(),
+    )
+    .unwrap();
+    h.update(
+        &[(
+            config::MODEL_USES_NAMESPACE,
+            "summary_max_output_tokens",
+            json!(7),
+        )],
+        ApplyMode::Immediate,
+    );
+    let rotated = resolver.resolve().unwrap();
+    assert!(!Arc::ptr_eq(&auxiliary.provider, &rotated.provider));
+    let primary = CoreModelResolver::from_credentials(h.settings.clone(), Ok(bank))
+        .with_use("dialogue")
+        .resolve()
+        .unwrap();
+    for (selected, model, key, limit) in [
+        (&old_primary, "model-a", "primary-synthetic", 32),
+        (&auxiliary, "small-model", "auxiliary-synthetic", 19),
+        (&rotated, "small-model", "rotated-auxiliary", 7),
+        (&auxiliary, "small-model", "auxiliary-synthetic", 19),
+        (&primary, "model-a", "primary-synthetic", 32),
+    ] {
+        selected
+            .provider
+            .complete(ModelRequest {
+                messages: vec![ChatMessage::text(ChatRole::User, "路由验证")],
+                tools: vec![],
+            })
+            .await
+            .unwrap();
+        let request = server.next().await;
+        assert_eq!(request.body["model"], model);
+        assert_eq!(request.body["max_tokens"], limit);
+        assert!(
+            request
+                .headers
+                .to_lowercase()
+                .contains(&format!("authorization: bearer {key}\r\n"))
+        );
+    }
+    h.stop().await;
+    let reopened = Harness::start(root.path(), &server.url, "chat").await;
+    let shown = summary(reopened.settings.as_ref(), Some("summary")).unwrap();
+    assert_eq!(shown.model, "small-model");
+    assert_eq!(shown.max_output_tokens, Some(7));
+    reopened.stop().await;
+}
+
+#[tokio::test]
+async fn invalid_auxiliary_routes_missing_credentials_and_disabled_role_never_fall_back() {
+    use eve_llm_api::CredentialPurpose;
+    let root = tempfile::tempdir().unwrap();
+    let mut server = Server::start(vec![]).await;
+    let h = Harness::start(root.path(), &server.url, "chat").await;
+    let bank = Arc::new(eve_model_credentials::CredentialBank::default());
+    bank.bind(
+        CredentialPurpose::Primary,
+        crate::model_credentials::PRIMARY,
+        Some("primary-synthetic".into()),
+    )
+    .unwrap();
+    let resolver = CoreModelResolver::from_credentials(h.settings.clone(), Ok(bank.clone()))
+        .with_use("summary");
+    assert!(resolver.resolve().is_ok());
+    h.update(
+        &[(
+            config::MODEL_USES_NAMESPACE,
+            "summary_role",
+            json!("auxiliary_small"),
+        )],
+        ApplyMode::Immediate,
+    );
+    assert!(
+        resolver.resolve().is_err(),
+        "辅助角色关闭不能借用旧主模型缓存"
+    );
+    h.update(
+        &[
+            (MODELS_NAMESPACE, "auxiliary_small_enabled", json!(true)),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_provider",
+                json!("openai"),
+            ),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_model",
+                json!("small-model"),
+            ),
+        ],
+        ApplyMode::Immediate,
+    );
+    assert!(
+        resolver.resolve().is_err(),
+        "未绑定辅助用途不能借主用途租约"
+    );
+    let wrong_purpose = CoreModelResolver::from_credentials(
+        h.settings.clone(),
+        Ok(Arc::new(ChangingCredentials {
+            mode: std::sync::atomic::AtomicUsize::new(0),
+        })),
+    )
+    .with_use("summary");
+    assert!(
+        wrong_purpose.resolve().is_err(),
+        "代理不能把主用途租约交给辅助用途"
+    );
+    bank.bind(
+        CredentialPurpose::Auxiliary,
+        crate::model_credentials::PRIMARY,
+        None,
+    )
+    .unwrap();
+    assert!(resolver.resolve().is_err(), "声明但缺失的密钥不回退");
+    for role in ["jev", "semantic", "PRIMARY", "", "other"] {
+        h.update(
+            &[(config::MODEL_USES_NAMESPACE, "summary_role", json!(role))],
+            ApplyMode::Immediate,
+        );
+        assert!(resolver.resolve().is_err());
+    }
+    assert!(server.requests.try_recv().is_err());
+    h.stop().await;
+}
 impl eve_llm_api::ModelCredentials for ChangingCredentials {
     fn resolve(
         &self,

@@ -70,6 +70,19 @@ impl eve_config_api::ConfigValidator for CoreConfigValidator {
         let role = configured_role(primary).map_err(|_| invalid())?;
         let profile = role.map(|r| roles.require(r)).transpose()?;
         provider_config(primary, profile).map_err(|_| invalid())?;
+        if let Some(uses) = snapshots.get(MODEL_USES_NAMESPACE) {
+            for name in MODEL_USES {
+                let selected = model_use_role(uses, name)?;
+                if selected == ModelRole::AuxiliarySmall {
+                    provider_config_for(
+                        primary,
+                        Some(roles.require(selected)?),
+                        eve_llm_api::CredentialPurpose::Auxiliary,
+                    )
+                    .map_err(|_| invalid())?;
+                }
+            }
+        }
         if let Some(profile) = roles.profile(ModelRole::Jev)
             && (profile.provider != "jev"
                 || profile.max_output_tokens.is_some()
@@ -144,7 +157,7 @@ pub(crate) fn openai_schema() -> ConfigSchema {
         ]),
     }
 }
-/// 按用途的单次输出上限；0 表示沿用主模型的上限。随每次模型解析读取，保存后下一次请求生效。
+/// 按用途选择模型角色与单次输出上限；随每次模型解析读取，保存后下一次请求生效。
 pub(crate) const MODEL_USES_NAMESPACE: &str = "runtime.model_uses";
 /// 用途名与健康记录、自主预算类别一致。
 pub(crate) const MODEL_USES: [&str; 22] = [
@@ -173,6 +186,24 @@ pub(crate) const MODEL_USES: [&str; 22] = [
 ];
 /// 单次输出上限与 provider.openai.max_output_tokens 的上限一致。
 const MAX_OUTPUT_TOKENS_LIMIT: i64 = 16384;
+
+pub(crate) fn use_role_field(name: &str) -> String {
+    format!("{name}_role")
+}
+
+pub(crate) fn model_use_role(
+    snapshot: &ConfigSnapshot,
+    name: &str,
+) -> eve_config_api::ConfigResult<ModelRole> {
+    let role: String = snapshot.get(&use_role_field(name))?;
+    match role.as_str() {
+        "primary" => Ok(ModelRole::Primary),
+        "auxiliary_small" => Ok(ModelRole::AuxiliarySmall),
+        _ => Err(eve_config_api::ConfigError::InvalidValue(use_role_field(
+            name,
+        ))),
+    }
+}
 
 pub(crate) fn use_limit_field(name: &str) -> String {
     format!("{name}_max_output_tokens")
@@ -229,7 +260,7 @@ pub(crate) fn history_schema() -> ConfigSchema {
 pub(crate) fn model_uses_schema() -> ConfigSchema {
     let fields = MODEL_USES
         .into_iter()
-        .map(|name| {
+        .flat_map(|name| {
             let mut field = ConfigField::new(
                 ConfigKind::Integer {
                     minimum: Some(0),
@@ -241,7 +272,9 @@ pub(crate) fn model_uses_schema() -> ConfigSchema {
                 "EVE_MODEL_USE_{}_MAX_OUTPUT_TOKENS",
                 name.to_ascii_uppercase()
             ));
-            (use_limit_field(name), field)
+            let mut role = ConfigField::new(ConfigKind::String, Some(json!("primary")));
+            role.environment = Some(format!("EVE_MODEL_USE_{}_ROLE", name.to_ascii_uppercase()));
+            [(use_limit_field(name), field), (use_role_field(name), role)]
         })
         .collect();
     ConfigSchema {
@@ -344,16 +377,21 @@ pub(crate) fn provider_config(
     snapshot: &ConfigSnapshot,
     primary: Option<&ModelProfile>,
 ) -> Result<OpenAiConfig, AppError> {
+    provider_config_for(snapshot, primary, eve_llm_api::CredentialPurpose::Primary)
+}
+
+pub(crate) fn provider_config_for(
+    snapshot: &ConfigSnapshot,
+    primary: Option<&ModelProfile>,
+    purpose: eve_llm_api::CredentialPurpose,
+) -> Result<OpenAiConfig, AppError> {
     if let Some(profile) = primary {
         if profile.provider != "openai" {
-            return Err("主模型角色当前只支持 provider=openai。".into());
+            return Err("所选对话模型角色当前只支持 provider=openai。".into());
         }
-        crate::model_credentials::reference(
-            eve_llm_api::CredentialPurpose::Primary,
-            profile.credential_ref.as_deref(),
-        )?;
+        crate::model_credentials::reference(purpose, profile.credential_ref.as_deref())?;
         if profile.timeout_ms == 0 || profile.timeout_ms > 600_000 {
-            return Err("主模型角色期限必须在 1 至 600000 毫秒之间。".into());
+            return Err("所选对话模型角色期限必须在 1 至 600000 毫秒之间。".into());
         }
     }
     let model: String = match primary {
@@ -390,6 +428,61 @@ pub(crate) fn provider_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn purpose_routes_are_validated_before_configuration_publish() {
+        use eve_config_api::{ConfigValidator, model_roles_schema, runtime_llm_schema};
+        let mut snapshots: BTreeMap<_, _> = [
+            runtime_llm_schema(),
+            model_roles_schema(),
+            openai_schema(),
+            model_uses_schema(),
+            eve_message_api::message_schema(),
+        ]
+        .into_iter()
+        .map(|schema| {
+            let namespace = schema.namespace;
+            let snapshot = ConfigSnapshot {
+                namespace: namespace.clone(),
+                schema_version: schema.version,
+                revision: 1,
+                values: schema
+                    .fields
+                    .into_iter()
+                    .map(|(key, field)| (key, field.default.unwrap()))
+                    .collect(),
+            };
+            (namespace, snapshot)
+        })
+        .collect();
+        CoreConfigValidator.validate(&snapshots).unwrap();
+        for route in ["unknown", "jev", "semantic", "", "auxiliary_small"] {
+            snapshots
+                .get_mut(MODEL_USES_NAMESPACE)
+                .unwrap()
+                .values
+                .insert("summary_role".into(), json!(route));
+            assert!(CoreConfigValidator.validate(&snapshots).is_err());
+        }
+        let roles = snapshots.get_mut(eve_config_api::MODELS_NAMESPACE).unwrap();
+        for (key, value) in [
+            ("auxiliary_small_enabled", json!(true)),
+            ("auxiliary_small_provider", json!("openai")),
+            ("auxiliary_small_model", json!("synthetic-auxiliary")),
+        ] {
+            roles.values.insert(key.into(), value);
+        }
+        CoreConfigValidator.validate(&snapshots).unwrap();
+        snapshots
+            .get_mut(eve_config_api::MODELS_NAMESPACE)
+            .unwrap()
+            .values
+            .insert(
+                "auxiliary_small_credential_ref".into(),
+                json!("env:UNDECLARED_KEY"),
+            );
+        assert!(CoreConfigValidator.validate(&snapshots).is_err());
+    }
 
     #[test]
     fn core_validator_accepts_supported_restart_settings_and_rejects_stream() {
@@ -535,6 +628,11 @@ mod tests {
             assert_eq!(field.default, Some(json!(0)), "{name} 默认沿用主模型");
             assert!(!field.restart_required, "{name} 保存后下一次请求生效");
         }
-        assert_eq!(schema.fields.len(), MODEL_USES.len());
+        for name in MODEL_USES {
+            let field = &schema.fields[&use_role_field(name)];
+            assert_eq!(field.default, Some(json!("primary")));
+            assert!(!field.restart_required);
+        }
+        assert_eq!(schema.fields.len(), MODEL_USES.len() * 2);
     }
 }

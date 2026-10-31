@@ -2,7 +2,7 @@
 use crate::config;
 use eve_config_api::{
     ConfigService, ConfigSnapshot, ConfigSource, MODELS_NAMESPACE, MODELS_SCHEMA_VERSION,
-    ModelProfile, ModelRolesConfig,
+    ModelProfile, ModelRole, ModelRolesConfig,
 };
 use eve_llm_api::{LlmError, LlmModelResolver, ModelSelection};
 use eve_llm_openai::{OpenAiProvider, StreamTimeoutPolicy};
@@ -27,14 +27,24 @@ pub(crate) fn timing_enabled() -> bool {
 #[derive(PartialEq)]
 struct CapturedModel {
     provider: ConfigSnapshot,
-    primary: Option<ModelProfile>,
+    profile: Option<ModelProfile>,
+    selected_role: Option<ModelRole>,
     role_revision: Option<u64>,
-    /// 用途配置的单次输出上限；None 表示沿用主模型。
+    /// 用途配置的单次输出上限；None 表示沿用所选模型。
     use_limit: Option<u32>,
     natural_style: bool,
     streamed_completions: bool,
     transient_retries: bool,
     stream_timeouts: Option<StreamTimeoutPolicy>,
+}
+impl CapturedModel {
+    fn credential_purpose(&self) -> eve_llm_api::CredentialPurpose {
+        if self.selected_role == Some(ModelRole::AuxiliarySmall) {
+            eve_llm_api::CredentialPurpose::Auxiliary
+        } else {
+            eve_llm_api::CredentialPurpose::Primary
+        }
+    }
 }
 struct CachedModel {
     captured: CapturedModel,
@@ -52,10 +62,7 @@ pub(crate) struct CoreModelResolver {
 }
 impl CoreModelResolver {
     pub(crate) fn new(settings: Arc<dyn ConfigService>, api_key: String) -> Self {
-        Self::from_credentials(
-            settings,
-            crate::model_credentials::bank(eve_llm_api::CredentialPurpose::Primary, api_key),
-        )
+        Self::from_credentials(settings, crate::model_credentials::core_bank(api_key))
     }
 
     pub(crate) fn from_credentials(
@@ -88,8 +95,12 @@ impl CoreModelResolver {
     }
 }
 
-/// 面板显示的当前主模型配置；不含凭据与端点。
+/// 面板显示的用途当前模型配置与编辑目标；不含凭据与端点。
 pub(crate) struct ModelSummary {
+    /// 与展示模型相同的一致性配置修订及实际修改目标。
+    pub(crate) config_revision: u64,
+    pub(crate) model_namespace: &'static str,
+    pub(crate) model_field: String,
     pub(crate) model: String,
     pub(crate) protocol: &'static str,
     pub(crate) max_output_tokens: Option<u32>,
@@ -106,12 +117,25 @@ pub(crate) fn summary(
 ) -> Result<ModelSummary, LlmError> {
     let captured = capture(settings, use_name)?;
     let config = selected_config(&captured)?;
-    let (namespace, field) = match (use_name, captured.use_limit, &captured.primary) {
+    let (namespace, field) = match (use_name, captured.use_limit, &captured.profile) {
         (Some(name), Some(_), _) => (config::MODEL_USES_NAMESPACE, config::use_limit_field(name)),
-        (_, _, Some(_)) => (MODELS_NAMESPACE, "primary_max_output_tokens".into()),
+        (_, _, Some(_)) => (
+            MODELS_NAMESPACE,
+            captured
+                .selected_role
+                .unwrap_or(ModelRole::Primary)
+                .field("max_output_tokens"),
+        ),
         _ => (config::OPENAI_NAMESPACE, "max_output_tokens".into()),
     };
+    let (model_namespace, model_field) = match captured.selected_role {
+        Some(role) => (MODELS_NAMESPACE, role.field("model")),
+        None => (config::OPENAI_NAMESPACE, "model".into()),
+    };
     Ok(ModelSummary {
+        config_revision: captured.provider.revision,
+        model_namespace,
+        model_field,
         model: config.model,
         protocol: match config.protocol {
             eve_llm_openai::OpenAiProtocol::Responses => "responses",
@@ -123,10 +147,14 @@ pub(crate) fn summary(
     })
 }
 
-/// 主模型配置叠加用途上限；用途上限只替换单次输出上限，不改变模型、端点或期限。
+/// 所选对话模型配置叠加用途上限；不改变角色、端点或期限。
 fn selected_config(captured: &CapturedModel) -> Result<eve_llm_openai::OpenAiConfig, LlmError> {
-    let mut config = config::provider_config(&captured.provider, captured.primary.as_ref())
-        .map_err(|error| LlmError::Configuration(error.to_string()))?;
+    let mut config = config::provider_config_for(
+        &captured.provider,
+        captured.profile.as_ref(),
+        captured.credential_purpose(),
+    )
+    .map_err(|error| LlmError::Configuration(error.to_string()))?;
     if let Some(limit) = captured.use_limit {
         config.max_output_tokens = Some(limit);
     }
@@ -142,9 +170,31 @@ fn capture(
         let provider = settings
             .snapshot(config::OPENAI_NAMESPACE, 1)
             .map_err(|error| LlmError::Configuration(error.to_string()))?;
+        let (use_limit, selected_use_role) = match use_name {
+            Some(name) => {
+                let snapshot = settings
+                    .snapshot(config::MODEL_USES_NAMESPACE, 1)
+                    .map_err(|error| LlmError::Configuration(error.to_string()))?;
+                if provider.revision != snapshot.revision {
+                    continue;
+                }
+                let limit: u32 = snapshot
+                    .get(&config::use_limit_field(name))
+                    .map_err(|error| LlmError::Configuration(error.to_string()))?;
+                let role = config::model_use_role(&snapshot, name)
+                    .map_err(|error| LlmError::Configuration(error.to_string()))?;
+                ((limit != 0).then_some(limit), role)
+            }
+            None => (None, ModelRole::Primary),
+        };
         let role = config::configured_role(&provider)
             .map_err(|error| LlmError::Configuration(error.to_string()))?;
-        let (primary, role_revision) = match role {
+        let role = if selected_use_role == ModelRole::AuxiliarySmall {
+            Some(ModelRole::AuxiliarySmall)
+        } else {
+            role
+        };
+        let (profile, role_revision) = match role {
             Some(role) => {
                 let snapshot = settings
                     .snapshot(MODELS_NAMESPACE, MODELS_SCHEMA_VERSION)
@@ -161,21 +211,6 @@ fn capture(
                 (Some(profile), Some(roles.revision()))
             }
             None => (None, None),
-        };
-        let use_limit = match use_name {
-            Some(name) => {
-                let snapshot = settings
-                    .snapshot(config::MODEL_USES_NAMESPACE, 1)
-                    .map_err(|error| LlmError::Configuration(error.to_string()))?;
-                if provider.revision != snapshot.revision {
-                    continue;
-                }
-                let limit: u32 = snapshot
-                    .get(&config::use_limit_field(name))
-                    .map_err(|error| LlmError::Configuration(error.to_string()))?;
-                (limit != 0).then_some(limit)
-            }
-            None => None,
         };
         let natural_style = if use_name == Some("dialogue") {
             let snapshot = settings
@@ -212,7 +247,12 @@ fn capture(
         };
         let stream_timeouts =
             if streamed_completions && matches!(use_name, Some("dialogue" | "digest")) {
-                let config = config::provider_config(&provider, primary.as_ref())
+                let purpose = if role == Some(ModelRole::AuxiliarySmall) {
+                    eve_llm_api::CredentialPurpose::Auxiliary
+                } else {
+                    eve_llm_api::CredentialPurpose::Primary
+                };
+                let config = config::provider_config_for(&provider, profile.as_ref(), purpose)
                     .map_err(|e| LlmError::Configuration(e.to_string()))?;
                 let mut policy = stream_timeout_policy(config.request_timeout)?;
                 if use_name == Some("digest") {
@@ -226,7 +266,8 @@ fn capture(
             };
         return Ok(CapturedModel {
             provider,
-            primary,
+            profile,
+            selected_role: role,
             role_revision,
             use_limit,
             natural_style,
@@ -270,9 +311,9 @@ impl LlmModelResolver for CoreModelResolver {
             .map_err(|error| LlmError::Configuration(error.to_string()))?;
         let credential = crate::model_credentials::resolve(
             credentials.as_ref(),
-            eve_llm_api::CredentialPurpose::Primary,
+            captured.credential_purpose(),
             captured
-                .primary
+                .profile
                 .as_ref()
                 .and_then(|profile| profile.credential_ref.as_deref()),
         )

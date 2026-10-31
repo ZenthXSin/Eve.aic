@@ -12,13 +12,19 @@ class ModelSwitchAcceptance(developer.DeveloperAcceptance):
             locals()[_name] = None
     del _name
 
-    def enabled(self, script, role=False, **options):
+    def enabled(self, script, role=False, auxiliary=False, **options):
         env = {'EVE_DEVELOPER_CONFIG': str(self.developer_config),
                'EVE_OPENAI_MODEL': 'direct-a', 'EVE_OPENAI_MODEL_ROLE': 'primary' if role else ''}
         if role:
             env.update(EVE_MODELS_PRIMARY_ENABLED='true', EVE_MODELS_PRIMARY_PROVIDER='openai',
                        EVE_MODELS_PRIMARY_MODEL='role-a', EVE_MODELS_PRIMARY_MAX_OUTPUT_TOKENS='128',
                        EVE_MODELS_PRIMARY_CREDENTIAL_REF='env:EVE_OPENAI_API_KEY')
+        if auxiliary:
+            env.update(EVE_MODEL_USE_DIALOGUE_ROLE='auxiliary_small',
+                       EVE_MODELS_AUXILIARY_SMALL_ENABLED='true',
+                       EVE_MODELS_AUXILIARY_SMALL_PROVIDER='openai',
+                       EVE_MODELS_AUXILIARY_SMALL_MODEL='auxiliary-a',
+                       EVE_MODELS_AUXILIARY_SMALL_MAX_OUTPUT_TOKENS='96')
         return self.run_eve(script, interest=False, memory=False, research=False, practice=False,
                             env_extra=env, **options)
 
@@ -55,6 +61,20 @@ class ModelSwitchAcceptance(developer.DeveloperAcceptance):
         self.assertNotIn('provider.openai', current['namespaces'])
         self.enabled(self.send(self.message('role-restored', '角色重启测试', expected='角色=role-b')), role=True)
         self.assertEqual(self.chat_rounds, 2)
+
+    def test_auxiliary_dialogue_route_switches_actual_selected_role_and_survives_restart(self):
+        def respond(body):
+            self.assertEqual(body['max_tokens'], 96)
+            return text_response('角色=' + body['model'])
+        self.callback = respond
+        self.enabled([*self.send(self.message('aux-query', '/model', contains='当前主模型：auxiliary-a')),
+                      *self.send(self.message('aux-switch', '/model auxiliary-b', contains='主模型已设为：auxiliary-b')),
+                      *self.send(self.message('aux-chat', '辅助路由测试', expected='角色=auxiliary-b'))], auxiliary=True)
+        current = self.stored()['current']
+        self.assertEqual(current['namespaces']['runtime.models']['values'], {'auxiliary_small_model': 'auxiliary-b'})
+        self.assertNotIn('provider.openai', current['namespaces'])
+        self.enabled([*self.send(self.message('aux-restored', '重启后辅助路由', expected='角色=auxiliary-b'))], auxiliary=True)
+        self.assertEqual(self.stored()['current'], current)
 
     def test_ordinary_user_and_invalid_arguments_cannot_change_configuration(self):
         self.callback = lambda body: text_response('仍为=' + body['model'])
