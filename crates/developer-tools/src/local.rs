@@ -1266,7 +1266,12 @@ impl LocalDeveloper {
         } else {
             "eve-qqbot"
         });
-        let bytes = fs::read(binary).map_err(|_| failed("构建未生成 QQ 可执行文件"))?;
+        let bytes =
+            live_upgrade::read_bounded_scoped(&binary, 2 * 1024 * 1024 * 1024, Some(context))
+                .map_err(|error| match error {
+                    error @ ToolExecutionError::Cancelled(_) => error,
+                    _ => failed("构建程序不可读、类型无效或超过2GiB；没有准备候选"),
+                })?;
         self.publish_upgrade(before, bytes, checks, context).await
     }
     async fn source_fingerprint(

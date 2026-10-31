@@ -8,31 +8,151 @@ fn now_ms() -> Result<u64, ToolExecutionError> {
         .as_millis() as u64)
 }
 
-fn file_digest(path: &Path) -> Result<String, ToolExecutionError> {
+pub(super) fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, ToolExecutionError> {
+    read_bounded_scoped(path, limit, None)
+}
+
+fn read_stream(
+    reader: &mut impl std::io::Read,
+    limit: usize,
+    context: Option<&ToolExecutionContext>,
+) -> Result<Vec<u8>, ToolExecutionError> {
     use std::io::Read;
+    let mut reader = reader.take(
+        limit
+            .checked_add(1)
+            .ok_or_else(|| failed("升级读取上限无效"))? as u64,
+    );
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        if context.is_some_and(stopped) {
+            return Err(ToolExecutionError::Cancelled("升级读取已取消或到期".into()));
+        }
+        let count = match reader.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(failed("升级文件读取失败")),
+        };
+        if count == 0 {
+            break;
+        }
+        let needed = bytes
+            .len()
+            .checked_add(count)
+            .ok_or_else(|| failed("升级文件读取计数无效"))?;
+        if needed > limit {
+            return Err(failed("升级文件在读取期间超过上限"));
+        }
+        if needed > bytes.capacity() {
+            let capacity = bytes.capacity().saturating_mul(2).max(needed).min(limit);
+            bytes
+                .try_reserve_exact(capacity - bytes.len())
+                .map_err(|_| failed("升级文件读取内存不可用"))?;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    if context.is_some_and(stopped) {
+        return Err(ToolExecutionError::Cancelled("升级读取已取消或到期".into()));
+    }
+    Ok(bytes)
+}
+
+pub(super) fn read_bounded_scoped(
+    path: &Path,
+    limit: usize,
+    context: Option<&ToolExecutionContext>,
+) -> Result<Vec<u8>, ToolExecutionError> {
+    if context.is_some_and(stopped) {
+        return Err(ToolExecutionError::Cancelled("升级读取已取消或到期".into()));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| failed("升级文件不存在或不可读取"))?;
+    if !metadata.is_file() || metadata.len() > limit as u64 {
+        return Err(failed("升级文件必须为大小受限的普通文件"));
+    }
+    let mut file = fs::File::open(path).map_err(|_| failed("升级文件不可读取"))?;
+    if !file
+        .metadata()
+        .map_err(|_| failed("升级文件不可核对"))?
+        .is_file()
+    {
+        return Err(failed("升级文件类型已改变"));
+    }
+    read_stream(&mut file, limit, context)
+}
+
+fn digest_stream(
+    reader: &mut impl std::io::Read,
+    limit: u64,
+    context: &ToolExecutionContext,
+) -> Result<(String, u64), ToolExecutionError> {
+    use std::io::Read;
+    let mut reader = reader.take(
+        limit
+            .checked_add(1)
+            .ok_or_else(|| failed("候选摘要上限无效"))?,
+    );
+    let mut size = 0u64;
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = [0u8; 65536];
+    loop {
+        if stopped(context) {
+            return Err(ToolExecutionError::Cancelled("升级校验已取消或到期".into()));
+        }
+        let count = match reader.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(failed("candidate_changed：候选读取失败")),
+        };
+        if count == 0 {
+            break;
+        }
+        size += count as u64;
+        if size > limit {
+            return Err(failed("candidate_changed：候选读取期间超过上限"));
+        }
+        digest.update(&buffer[..count]);
+    }
+    if stopped(context) {
+        return Err(ToolExecutionError::Cancelled("升级校验已取消或到期".into()));
+    }
+    Ok((
+        digest
+            .finish()
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+        size,
+    ))
+}
+
+fn file_digest(
+    path: &Path,
+    limit: u64,
+    context: &ToolExecutionContext,
+) -> Result<String, ToolExecutionError> {
+    if stopped(context) {
+        return Err(ToolExecutionError::Cancelled("升级校验已取消或到期".into()));
+    }
     let metadata =
         fs::symlink_metadata(path).map_err(|_| failed("candidate_missing：候选文件不存在"))?;
-    if !metadata.is_file() || metadata.len() > 2 * 1024 * 1024 * 1024 {
+    if !metadata.is_file() || metadata.len() > limit {
         return Err(failed("candidate_changed：候选文件类型或大小改变"));
     }
     let mut file = fs::File::open(path).map_err(|_| failed("candidate_missing：候选文件不可读"))?;
-    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
-    let mut buffer = [0u8; 65536];
-    loop {
-        let size = file
-            .read(&mut buffer)
-            .map_err(|_| failed("candidate_changed：候选读取失败"))?;
-        if size == 0 {
-            break;
-        }
-        context.update(&buffer[..size]);
+    if !file
+        .metadata()
+        .map_err(|_| failed("candidate_changed：候选不可核对"))?
+        .is_file()
+    {
+        return Err(failed("candidate_changed：候选文件类型改变"));
     }
-    Ok(context
-        .finish()
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    let (hash, size) = digest_stream(&mut file, limit, context)?;
+    if size != metadata.len() {
+        return Err(failed("candidate_changed：候选读取期间大小改变"));
+    }
+    Ok(hash)
 }
 
 fn read_manifest(directory: &Path) -> Result<(Vec<u8>, Value), ToolExecutionError> {
@@ -42,13 +162,19 @@ fn read_manifest(directory: &Path) -> Result<(Vec<u8>, Value), ToolExecutionErro
     if !metadata.is_file() || metadata.len() > LIVE_UPGRADE_MAX_JSON as u64 {
         return Err(failed("candidate_changed：候选清单类型或大小无效"));
     }
-    let bytes = fs::read(path).map_err(|_| failed("candidate_missing：候选清单不可读"))?;
+    let bytes = read_bounded(&path, LIVE_UPGRADE_MAX_JSON)
+        .map_err(|_| failed("candidate_changed：候选清单不可读、类型无效或超过上限"))?;
     let manifest =
         serde_json::from_slice(&bytes).map_err(|_| failed("candidate_changed：候选清单损坏"))?;
     Ok((bytes, manifest))
 }
 
-fn verify_contents(directory: &Path, manifest: &Value, id: &str) -> Result<(), ToolExecutionError> {
+fn verify_contents(
+    directory: &Path,
+    manifest: &Value,
+    id: &str,
+    context: &ToolExecutionContext,
+) -> Result<(), ToolExecutionError> {
     if !fs::symlink_metadata(directory)
         .map_err(|_| failed("candidate_missing：候选不存在"))?
         .is_dir()
@@ -71,7 +197,8 @@ fn verify_contents(directory: &Path, manifest: &Value, id: &str) -> Result<(), T
         "eve-qqbot"
     });
     if manifest["candidate_path"] != binary.to_string_lossy().as_ref()
-        || file_digest(&binary)? != manifest["binary_sha256"].as_str().unwrap_or("")
+        || file_digest(&binary, 2 * 1024 * 1024 * 1024, context)?
+            != manifest["binary_sha256"].as_str().unwrap_or("")
     {
         return Err(failed("candidate_changed：候选程序改变"));
     }
@@ -118,7 +245,9 @@ fn verify_contents(directory: &Path, manifest: &Value, id: &str) -> Result<(), T
         total += fs::metadata(&path)
             .map_err(|_| failed("candidate_missing：资源不存在"))?
             .len();
-        if total > 64 * 1024 * 1024 || file_digest(&path)? != expected.as_str().unwrap_or("") {
+        if total > 64 * 1024 * 1024
+            || file_digest(&path, MAX_FILE as u64, context)? != expected.as_str().unwrap_or("")
+        {
             return Err(failed("candidate_changed：资源内容改变"));
         }
     }
@@ -220,7 +349,16 @@ impl LocalDeveloper {
             {
                 return Err(failed("运行资源类型或大小不支持"));
             }
-            let data = fs::read(&path).map_err(|_| failed("运行资源不可读取"))?;
+            if stopped(context) {
+                return Err(ToolExecutionError::Cancelled("冻结资源已取消或到期".into()));
+            }
+            let data =
+                read_bounded_scoped(&path, MAX_FILE, Some(context)).map_err(
+                    |error| match error {
+                        error @ ToolExecutionError::Cancelled(_) => error,
+                        _ => failed("运行资源不可读、类型无效或超过8MiB"),
+                    },
+                )?;
             total += data.len();
             if total > 64 * 1024 * 1024 {
                 return Err(failed("运行资源超过 64 MiB"));
@@ -285,7 +423,7 @@ impl LocalDeveloper {
         if directory.exists() {
             // 相同摘要的已发布目录不得覆盖；损坏时保留现场并拒绝。
             let (_, old) = read_manifest(&directory)?;
-            verify_contents(&directory, &old, &candidate_id)?;
+            verify_contents(&directory, &old, &candidate_id, context)?;
             return self.issue_upgrade_lease(&directory, old);
         }
         fs::rename(stage.path(), &directory).map_err(|_| failed("候选原子发布失败；保留原文件"))?;
@@ -298,8 +436,8 @@ impl LocalDeveloper {
             .live_upgrade
             .clone()
             .ok_or_else(|| failed("宿主没有启用实时升级监督器"))?;
-        let bytes = fs::read(directory.join("supervisor.json"))
-            .map_err(|_| failed("实时升级监督器不可用"))?;
+        let bytes = read_bounded(&directory.join("supervisor.json"), LIVE_UPGRADE_MAX_JSON)
+            .map_err(|_| failed("实时升级监督器状态不可读、类型无效或超过上限"))?;
         if bytes.len() > LIVE_UPGRADE_MAX_JSON {
             return Err(failed("监督器状态超过上限"));
         }
@@ -359,13 +497,16 @@ impl LocalDeveloper {
         {
             return Err(failed("候选没有完整验证证据，未提交切换"));
         }
-        verify_contents(&candidate, &manifest, &a.candidate_sha256)?;
+        verify_contents(&candidate, &manifest, &a.candidate_sha256, context)?;
         let lease_path = self
             .journal
             .join("leases")
             .join(format!("{}.json", a.candidate_sha256));
-        let lease_bytes =
-            fs::read(&lease_path).map_err(|_| failed("prepare_lease_missing：请先准备候选"))?;
+        if !lease_path.exists() {
+            return Err(failed("prepare_lease_missing：请先准备候选"));
+        }
+        let lease_bytes = read_bounded(&lease_path, LIVE_UPGRADE_MAX_JSON)
+            .map_err(|_| failed("prepare_lease_changed：准备租约不可读、类型无效或超过上限"))?;
         if lease_bytes.len() > LIVE_UPGRADE_MAX_JSON {
             return Err(failed("prepare_lease_changed：准备租约超过上限"));
         }
@@ -415,7 +556,8 @@ impl LocalDeveloper {
         let target = queue.join("request.json");
         if target.exists() {
             let old: UpgradeRequest = serde_json::from_slice(
-                &fs::read(&target).map_err(|_| failed("待处理升级请求不可读取"))?,
+                &read_bounded(&target, LIVE_UPGRADE_MAX_JSON)
+                    .map_err(|_| failed("待处理升级请求不可读、类型无效或超过上限；保留原文件"))?,
             )
             .map_err(|_| failed("待处理升级请求损坏；保留原文件"))?;
             if old.candidate_sha256 != request.candidate_sha256
@@ -437,5 +579,118 @@ impl LocalDeveloper {
             json!({"queued":true,"applied":false,"candidate_sha256":request.candidate_sha256,
             "next":"先结束本轮回复以便送达，不在当前轮轮询等待应用；之后监督器在空闲时切换，后续新轮用 self_upgrade_status 核对真实结果。"}),
         )
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use std::io::{self, Read};
+
+    struct Growing {
+        read: u64,
+    }
+    impl Read for Growing {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            output.fill(b'x');
+            self.read += output.len() as u64;
+            Ok(output.len())
+        }
+    }
+    #[test]
+    fn digest_scan_bounds_a_growing_stream_and_retries_interrupted_reads() {
+        let ctx = ToolExecutionContext::new();
+        let mut growing = Growing { read: 0 };
+        assert!(digest_stream(&mut growing, 7, &ctx).is_err());
+        assert_eq!(growing.read, 8, "不可继续追读不断增长的候选");
+        let mut growing = Growing { read: 0 };
+        assert!(read_stream(&mut growing, 7, None).is_err());
+        assert_eq!(growing.read, 8, "正文缓冲也必须在上限处停止");
+        assert_eq!(
+            read_stream(&mut &b"fixture"[..], 7, Some(&ctx)).unwrap(),
+            b"fixture"
+        );
+        struct Interrupted {
+            first: bool,
+            remaining: &'static [u8],
+        }
+        impl Read for Interrupted {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                if self.first {
+                    self.first = false;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                std::io::Read::read(&mut self.remaining, output)
+            }
+        }
+        let mut source = Interrupted {
+            first: true,
+            remaining: b"fixture",
+        };
+        assert_eq!(
+            digest_stream(&mut source, 7, &ctx).unwrap(),
+            (hash(b"fixture"), 7)
+        );
+        assert_eq!(
+            digest_stream(&mut &b""[..], 0, &ctx).unwrap(),
+            (hash(b""), 0)
+        );
+    }
+    #[test]
+    fn digest_cancellation_before_read_and_at_eof_never_returns_success() {
+        let ctx = ToolExecutionContext::new();
+        ctx.cancellation_handle().cancel();
+        let mut source = Growing { read: 0 };
+        assert!(matches!(
+            digest_stream(&mut source, 7, &ctx),
+            Err(ToolExecutionError::Cancelled(_))
+        ));
+        assert_eq!(source.read, 0);
+        let ctx = ToolExecutionContext::new();
+        struct CancelAtEof(ToolExecutionContext);
+        impl Read for CancelAtEof {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                self.0.cancellation_handle().cancel();
+                Ok(0)
+            }
+        }
+        assert!(matches!(
+            digest_stream(&mut CancelAtEof(ctx.clone()), 7, &ctx),
+            Err(ToolExecutionError::Cancelled(_))
+        ));
+        let ctx = ToolExecutionContext::new();
+        assert!(matches!(
+            read_stream(&mut CancelAtEof(ctx.clone()), 7, Some(&ctx)),
+            Err(ToolExecutionError::Cancelled(_))
+        ));
+        let expired = ToolExecutionContext::new().with_deadline(Some(std::time::Instant::now()));
+        assert!(matches!(
+            digest_stream(&mut &b"fixture"[..], 7, &expired),
+            Err(ToolExecutionError::Cancelled(_))
+        ));
+    }
+    #[test]
+    fn bounded_upgrade_files_reject_oversize_and_preserve_original_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("manifest.json");
+        let original = b"{\"fixed\":true}";
+        fs::write(&path, original).unwrap();
+        assert_eq!(read_bounded(&path, original.len()).unwrap(), original);
+        assert!(read_bounded(&path, original.len() - 1).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            file_digest(&path, original.len() as u64, &ToolExecutionContext::new()).unwrap(),
+            hash(original)
+        );
+        assert!(file_digest(&path, 1, &ToolExecutionContext::new()).is_err());
+        assert!(read_bounded(directory.path(), 100).is_err());
+        #[cfg(unix)]
+        {
+            let link = directory.path().join("link.json");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(read_bounded(&link, 100).is_err());
+            assert!(file_digest(&link, 100, &ToolExecutionContext::new()).is_err());
+            assert_eq!(fs::read(&path).unwrap(), original);
+        }
     }
 }

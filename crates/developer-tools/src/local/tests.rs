@@ -1161,6 +1161,29 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
     );
     assert!(!queue.path().join("request.json").exists());
     fs::write(&lease_path, good_lease).unwrap();
+    for path in [
+        lease_path.clone(),
+        candidate.join("manifest.json"),
+        queue.path().join("supervisor.json"),
+    ] {
+        let original = fs::read(&path).unwrap();
+        fs::write(&path, vec![b'x'; LIVE_UPGRADE_MAX_JSON + 1]).unwrap();
+        assert!(
+            backend
+                .execute(operation.clone(), context("owner").with_turn_id(Some(1)))
+                .await
+                .is_err()
+        );
+        assert!(
+            !queue.path().join("request.json").exists(),
+            "超限状态不得创建升级请求"
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            (LIVE_UPGRADE_MAX_JSON + 1) as u64
+        );
+        fs::write(&path, original).unwrap();
+    }
     let result = backend
         .execute(operation.clone(), context("owner").with_turn_id(Some(1)))
         .await
@@ -1176,6 +1199,24 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
         .await
         .unwrap();
     assert_eq!(fs::read(queue.path().join("request.json")).unwrap(), before);
+    fs::write(
+        queue.path().join("request.json"),
+        vec![b'x'; LIVE_UPGRADE_MAX_JSON + 1],
+    )
+    .unwrap();
+    assert!(
+        backend
+            .execute(operation.clone(), context("owner").with_turn_id(Some(1)))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fs::metadata(queue.path().join("request.json"))
+            .unwrap()
+            .len(),
+        (LIVE_UPGRADE_MAX_JSON + 1) as u64
+    );
+    fs::write(queue.path().join("request.json"), &before).unwrap();
     assert!(
         backend
             .execute(operation, context("owner").with_turn_id(Some(2)))
