@@ -9,6 +9,46 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
+#[test]
+fn idempotent_archive_put_validates_every_byte_and_never_repairs_corrupt_existing_files() {
+    fn hash(bytes: &[u8]) -> String {
+        ring::digest::digest(&ring::digest::SHA256, bytes)
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+    let root = tempfile::tempdir().unwrap();
+    let store = FileSessionArchive::open(root.path()).unwrap();
+    for bytes in [vec![], "多字节原文与回执".repeat(100_000).into_bytes()] {
+        let key = hash(&bytes);
+        store.put(&key, &bytes).unwrap();
+        store.put(&key, &bytes).unwrap();
+        assert_eq!(store.get(&key).unwrap(), bytes);
+        let path = root.path().join(format!("{key}.json"));
+        let corrupt = if bytes.is_empty() {
+            vec![1]
+        } else {
+            let mut b = bytes.clone();
+            let last = b.len() - 1;
+            b[last] ^= 1;
+            b
+        };
+        std::fs::write(&path, &corrupt).unwrap();
+        assert_eq!(store.put(&key, &bytes), Err(SessionError::CorruptState));
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+        std::fs::write(&path, &bytes).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len((MAX_SESSION_ARCHIVE_RECORD_BYTES + 1) as u64)
+            .unwrap();
+        assert_eq!(store.put(&key, &bytes), Err(SessionError::CorruptState));
+        assert_eq!(
+            file.metadata().unwrap().len(),
+            (MAX_SESSION_ARCHIVE_RECORD_BYTES + 1) as u64
+        );
+    }
+}
+
 #[derive(Default)]
 struct FaultState {
     memory: MemoryStateStore,
