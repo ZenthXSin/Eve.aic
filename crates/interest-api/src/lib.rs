@@ -470,6 +470,22 @@ pub trait InterestAdmin: Send + Sync {
         observer_version: &str,
         options: &ObservationOptions,
     ) -> InterestResult<Option<ObservationBatch>>;
+    /// 从绑定的记忆读取器保留新批次。内置实现完整校验逐页来源，只持有本批正文；
+    /// 可替换实现默认沿用完整快照。任何读页错误发生在保留批次和模型调用之前。
+    fn reserve_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+        observer_version: &str,
+        options: &ObservationOptions,
+    ) -> InterestResult<Option<ObservationBatch>> {
+        let snapshot = reader.complete_snapshot()?;
+        if snapshot.scope != *scope {
+            return Err(InterestError::Conflict);
+        }
+        self.reserve(&snapshot, now_ms, observer_version, options)
+    }
     /// 保存观察结局并在同一次提交中应用合规更新；同一结局重放零写入。
     fn finish(
         &self,

@@ -176,13 +176,11 @@ async fn run(
                 if !gate.admits(qq_budget::INTEREST_UNITS)? {
                     break;
                 }
-                // 读完整记忆：归档前还没观察的交流同样会被观察。
-                let snapshot = memory.reader(scope.clone())?.complete_snapshot()?;
-                if snapshot.scope != scope {
-                    return Err("兴趣观察来源作用域不匹配".into());
-                }
-                let batch = match interests.reserve(
-                    &snapshot,
+                // 扫描固定版本的所有来源，但只保留本批正文；坏的后续页不能被跳过。
+                let reader = memory.reader(scope.clone())?;
+                let batch = match interests.reserve_reader(
+                    &scope,
+                    reader.as_ref(),
                     now_ms()?,
                     observer.version(),
                     &current.settings.observation,

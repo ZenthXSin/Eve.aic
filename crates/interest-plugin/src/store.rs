@@ -36,6 +36,30 @@ pub(super) struct StoredInterests {
     inner: Mutex<Inner>,
 }
 
+fn known_interests(document: &Document, scope: &MemoryScope) -> Vec<KnownInterest> {
+    let mut active: Vec<_> = document
+        .interests
+        .iter()
+        .filter(|interest| interest.scope == *scope && interest.status == InterestStatus::Active)
+        .collect();
+    active.sort_by(|left, right| {
+        right
+            .updated_at_ms
+            .cmp(&left.updated_at_ms)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    active.truncate(MAX_KNOWN_INTERESTS);
+    let mut known: Vec<_> = active
+        .into_iter()
+        .map(|interest| KnownInterest {
+            id: interest.id.clone(),
+            topic: interest.topic.clone(),
+        })
+        .collect();
+    known.sort_by(|left, right| left.id.cmp(&right.id));
+    known
+}
+
 impl StoredInterests {
     pub(super) fn open(context: PluginContext) -> InterestResult<Self> {
         let mut document = match context
@@ -185,30 +209,7 @@ impl StoredInterests {
             })
             .collect();
         available.sort_by_key(|evidence| evidence.revision);
-        let mut active: Vec<_> = inner
-            .document
-            .interests
-            .iter()
-            .filter(|interest| {
-                interest.scope == memory.scope && interest.status == InterestStatus::Active
-            })
-            .collect();
-        // 只列出最近更新的活动兴趣；更旧的兴趣仍保存，但本批次不能关联或撤回。
-        active.sort_by(|left, right| {
-            right
-                .updated_at_ms
-                .cmp(&left.updated_at_ms)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        active.truncate(MAX_KNOWN_INTERESTS);
-        let mut known_interests: Vec<_> = active
-            .into_iter()
-            .map(|interest| KnownInterest {
-                id: interest.id.clone(),
-                topic: interest.topic.clone(),
-            })
-            .collect();
-        known_interests.sort_by(|left, right| left.id.cmp(&right.id));
+        let known_interests = known_interests(&inner.document, &memory.scope);
         let mut batch = ObservationBatch {
             // 摘要长度固定；先用等长占位值计算完整输入 JSON 的预算。
             id: format!("interest-batch-{}", "0".repeat(64)),
@@ -249,6 +250,124 @@ impl StoredInterests {
         let mut next = inner.document.clone();
         next.jobs.push(JobRecord {
             memory_revision: memory.revision,
+            job: ObservationJob {
+                batch: batch.clone(),
+                status: JobStatus::Running,
+                finished_at_ms: None,
+                updates: vec![],
+                results: vec![],
+            },
+        });
+        persist(&mut inner, next)?;
+        Ok(Some(batch))
+    }
+
+    pub(super) fn reserve_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+        observer_version: &str,
+        options: &ObservationOptions,
+    ) -> InterestResult<Option<ObservationBatch>> {
+        use eve_memory_api::{MemoryEvidenceCursor, ValidatedMemoryCursor};
+        options.validate()?;
+        validate_id(observer_version).map_err(|_| InterestError::InvalidInput)?;
+        scope.validate().map_err(|_| InterestError::InvalidInput)?;
+        if now_ms == 0 {
+            return Err(InterestError::InvalidInput);
+        }
+        let mut inner = self.lock()?;
+        let mut cursor = ValidatedMemoryCursor::new(scope.clone(), reader.scan()?)?;
+        let revision = cursor.summary().revision;
+        let previous: Vec<_> = inner
+            .document
+            .jobs
+            .iter()
+            .filter(|r| r.job.batch.scope == *scope)
+            .collect();
+        let mut expected = BTreeMap::new();
+        for record in &previous {
+            if revision < record.memory_revision {
+                return Err(InterestError::Conflict);
+            }
+            for evidence in &record.job.batch.evidence {
+                if expected
+                    .insert(evidence.id.as_str(), evidence)
+                    .is_some_and(|old| old != evidence)
+                {
+                    return Err(InterestError::Conflict);
+                }
+            }
+        }
+        let cooling = previous.last().is_some_and(|r| {
+            now_ms
+                .checked_sub(r.job.batch.started_at_ms)
+                .is_none_or(|elapsed| elapsed < options.cooldown_ms)
+        });
+        let mut seen = BTreeSet::new();
+        let known_interests = known_interests(&inner.document, scope);
+        let mut batch = ObservationBatch {
+            // 摘要长度固定；先用等长占位值计算完整输入 JSON 的预算。
+            id: format!("interest-batch-{}", "0".repeat(64)),
+            scope: scope.clone(),
+            observer_version: observer_version.into(),
+            started_at_ms: now_ms,
+            evidence: vec![],
+            known_interests,
+        };
+
+        loop {
+            let page = cursor.next_page()?;
+            if page.is_empty() {
+                break;
+            }
+            for evidence in page {
+                if let Some(prior) = expected.get(evidence.id.as_str()) {
+                    if **prior != evidence {
+                        return Err(InterestError::Conflict);
+                    }
+                    seen.insert(evidence.id.clone());
+                    continue;
+                }
+                if cooling
+                    || batch.evidence.len() == options.max_batch_evidence
+                    || !matches!(evidence.source, EvidenceSource::CompletedInteraction { .. })
+                {
+                    continue;
+                }
+                if serde_json::to_vec(&evidence)
+                    .map_err(|_| InterestError::InvalidInput)?
+                    .len()
+                    > MAX_EVIDENCE_BYTES
+                {
+                    continue;
+                }
+                batch.evidence.push(evidence);
+                if serde_json::to_vec(&batch)
+                    .map_err(|_| InterestError::InvalidInput)?
+                    .len()
+                    > MAX_INPUT_BYTES
+                {
+                    batch.evidence.pop();
+                }
+            }
+        }
+        // 即使批次已满或仍在冷却，也必须核完后续页和所有已消费来源，才允许提交。
+        if seen.len() != expected.len() {
+            return Err(InterestError::Conflict);
+        }
+        if cooling || batch.evidence.len() < options.min_new_evidence {
+            return Ok(None);
+        }
+        if inner.document.jobs.len() >= MAX_JOBS {
+            return Err(InterestError::LimitReached);
+        }
+        batch.id = batch_id(&batch)?;
+        batch.validate()?;
+        let mut next = inner.document.clone();
+        next.jobs.push(JobRecord {
+            memory_revision: revision,
             job: ObservationJob {
                 batch: batch.clone(),
                 status: JobStatus::Running,
