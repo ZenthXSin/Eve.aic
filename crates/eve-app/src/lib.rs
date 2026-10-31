@@ -149,6 +149,7 @@ pub const HELP: &str = "Eve 核心对话入口
 协议默认 chat；EVE_OPENAI_PROTOCOL 可选 chat/responses\n可选：EVE_OPENAI_BASE_URL、EVE_OPENAI_REASONING_EFFORT
 EVE_OPENAI_MODEL_ROLE=primary 显式使用 runtime.models 的主模型角色配置；每轮固定选择。
 一行一轮；/cancel 取消当前轮；/quit 或 Ctrl+C 取消并退出；/help 查看说明。
+工作便笺默认可用：直接要求整理、预览或回退当前工作状态，下一轮自动加载，旧版与原始历史保留。
 EVE_DEVELOPER_CONFIG 可装配文件、命令、GitHub 与自身升级准备工具；仅配置操作者可执行，凭据为宿主环境引用。
 --segmented 保存完整回复后按自然段分至多 3 段显示，段间停顿至多 2.5 秒；/cancel 停止显示剩余片段。
 /segment 查看本会话分段；on、off、reset、parts 2至5、pace 0至200（%）按 --session/--user 保存，从下一条回复生效。
@@ -259,6 +260,28 @@ pub async fn run_console(
     let kernel = Kernel::with_services(backends);
     // 包含注册、启动、装配与对话；任一步失败均走同一停止/日志收尾。
     let result = async {
+        let notes_plugin = eve_context_plugin::ContextPlugin::new(Arc::new(
+            eve_context_plugin::FileContextArchive::open(
+                options.state_directory.join("context-notes-archive"),
+            )?,
+        ))?;
+        let notes: Arc<dyn eve_context_api::ContextAdmin> = Arc::new(notes_plugin.controller());
+        kernel.register(Box::new(notes_plugin))?;
+        kernel
+            .start(&PluginId::new(eve_context_api::CONTEXT_PLUGIN_ID)?)
+            .await?;
+        bootstrap.tools.push(Arc::new(context_notes::NotesTool {
+            admin: notes.clone(),
+            binding: context_notes::NoteBinding::Console(key.clone()),
+        }));
+        bootstrap.context = Some(Arc::new(context_notes::NotesContext {
+            channel: CONSOLE_SEGMENT_CHANNEL,
+            inner: bootstrap
+                .context
+                .take()
+                .unwrap_or_else(services::default_context),
+            admin: notes,
+        }));
         // 分段设置先于模型装配加载；损坏或版本不兼容时拒绝启动并保留原字节。
         let preferences: Option<Arc<dyn eve_segment_api::SegmentPreferences>> = if options.segmented
         {

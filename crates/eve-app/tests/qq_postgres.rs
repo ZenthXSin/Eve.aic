@@ -1659,6 +1659,9 @@ async fn sql_context_notes_use_cold_files_and_restore_through_real_qq_tools() {
         ),
         Reply::json(final_response("已回到空便笺")),
         Reply::json(final_response("空便笺已恢复")),
+        tool("console-note-update", json!({"operation":"update","expected_revision":0,"text":"SQL_CONSOLE_NOTE：终端任务尚待验证"})),
+        Reply::json(final_response("终端便笺已保存")),
+        Reply::json(final_response("终端便笺已恢复")),
     ])
     .await;
     let request_has_note = |body: &Value| {
@@ -1722,17 +1725,58 @@ async fn sql_context_notes_use_cold_files_and_restore_through_real_qq_tools() {
             assert_eq!(output["view"]["text"], if index == 0 { note } else { "" });
         }
     }
+    let console = successful(
+        Process::run(
+            command(Entry::Console, root.path(), &server.url, Some(&database)),
+            "保存终端工作计划\n",
+            &credentials.password,
+        )
+        .await,
+        Entry::Console,
+    );
+    assert!(console.as_str().unwrap().contains("终端便笺已保存"));
+    assert!(!request_has_note(&server.next().await.body));
+    let returned = server.next().await.body;
+    let output = returned["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|v| v["type"] == "function_call_output")
+        .unwrap();
+    let output: Value = serde_json::from_str(output["output"].as_str().unwrap()).unwrap();
+    assert_eq!(output["view"]["owner"]["channel"], "console");
+    assert_eq!(output["view"]["revision"], 1);
+    let console = successful(
+        Process::run(
+            command(Entry::Console, root.path(), &server.url, Some(&database)),
+            "重启后核对终端便笺\n",
+            &credentials.password,
+        )
+        .await,
+        Entry::Console,
+    );
+    assert!(console.as_str().unwrap().contains("终端便笺已恢复"));
+    let restored = server.next().await.body;
+    assert!(request_has_note(&restored));
+    assert!(restored["input"].as_array().unwrap().iter().any(|v| {
+        v["role"] == "system"
+            && v["content"].as_str().is_some_and(|s| {
+                s.contains("SQL_CONSOLE_NOTE：终端任务尚待验证")
+                    && s.contains("\"channel\":\"console\"")
+            })
+    }));
     let saved = rows(&database);
     let index = document(
         &saved,
         eve_context_api::CONTEXT_PLUGIN_ID,
         eve_context_plugin::CONTEXT_INDEX_KEY,
     );
-    let record = index["records"]
-        .as_object()
-        .unwrap()
+    let records = index["records"].as_object().unwrap();
+    assert_eq!(records.len(), 2);
+    let record = records
         .values()
-        .next()
+        .find(|r| r["owner"]["channel"] == "qq")
         .unwrap();
     assert_eq!(record["versions"].as_array().unwrap().len(), 2);
     assert!(!index.to_string().contains(note));

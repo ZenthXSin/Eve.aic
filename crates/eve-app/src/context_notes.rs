@@ -7,14 +7,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-fn owner(scope: &ContextScope) -> ContextOwner {
+fn owner(channel: &str, scope: &ContextScope) -> ContextOwner {
     ContextOwner {
-        channel: "qq".into(),
+        channel: channel.into(),
         session_id: scope.session_id.clone(),
         user_id: scope.user_id.clone(),
     }
 }
 pub(crate) struct NotesContext {
+    pub channel: &'static str,
     pub inner: Arc<dyn ContextAssembler>,
     pub admin: Arc<dyn ContextAdmin>,
 }
@@ -30,7 +31,7 @@ impl ContextAssembler for NotesContext {
         Box::pin(async move {
             let mut context = self.inner.assemble_scoped(input, scope.clone()).await?;
             if let Some(scope) = scope {
-                let owner = owner(&scope);
+                let owner = owner(self.channel, &scope);
                 let note = self
                     .admin
                     .inspect(&owner)
@@ -102,7 +103,37 @@ fn args(value: &Value) -> Result<Args, ToolValidationError> {
 }
 pub(crate) struct NotesTool {
     pub admin: Arc<dyn ContextAdmin>,
-    pub conversations: QqConversations,
+    pub binding: NoteBinding,
+}
+pub(crate) enum NoteBinding {
+    Qq(QqConversations),
+    /// 由终端宿主启动选项绑定，不从本轮模型参数或文本取得。
+    Console(SessionKey),
+}
+impl NoteBinding {
+    fn owner(&self, scope: &ContextScope) -> Result<ContextOwner, ToolExecutionError> {
+        let key = SessionKey::new(&scope.session_id, &scope.user_id)
+            .map_err(|_| failure(ContextError::InvalidInput))?;
+        match self {
+            Self::Qq(conversations) => {
+                if scope.user_id == crate::qq_group::USER
+                    || conversations
+                        .identity(&key)
+                        .map_err(|_| failure(ContextError::Unavailable))?
+                        .is_none()
+                {
+                    return Err(ToolExecutionError::Failed(
+                        "工作便笺仅限真实用户的当前会话".into(),
+                    ));
+                }
+                Ok(owner("qq", scope))
+            }
+            Self::Console(bound) if *bound == key => Ok(owner("console", scope)),
+            Self::Console(_) => Err(ToolExecutionError::Failed(
+                "便笺身份与终端启动时绑定的用户或会话不匹配".into(),
+            )),
+        }
+    }
 }
 fn failure(error: ContextError) -> ToolExecutionError {
     ToolExecutionError::Failed(error.to_string())
@@ -136,20 +167,7 @@ impl Tool for NotesTool {
             let scope = context
                 .scope()
                 .ok_or_else(|| ToolExecutionError::Failed("工作便笺需要可信会话身份".into()))?;
-            let key = SessionKey::new(&scope.session_id, &scope.user_id)
-                .map_err(|_| failure(ContextError::InvalidInput))?;
-            if scope.user_id == crate::qq_group::USER
-                || self
-                    .conversations
-                    .identity(&key)
-                    .map_err(|_| failure(ContextError::Unavailable))?
-                    .is_none()
-            {
-                return Err(ToolExecutionError::Failed(
-                    "工作便笺仅限真实用户的当前会话".into(),
-                ));
-            }
-            let owner = owner(scope);
+            let owner = self.binding.owner(scope)?;
             let value = match args {
                 Args::Inspect {} => json!({"view":self.admin.inspect(&owner).map_err(failure)?}),
                 Args::ReadVersion { revision } => {
@@ -189,6 +207,32 @@ impl Tool for NotesTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn console_binding_requires_both_startup_identity_fields_and_never_uses_qq_channel() {
+        let bound = NoteBinding::Console(SessionKey::new("session", "user").unwrap());
+        let scope = ContextScope {
+            session_id: "session".into(),
+            user_id: "user".into(),
+        };
+        assert_eq!(bound.owner(&scope).unwrap().channel, "console");
+        for scope in [
+            ContextScope {
+                session_id: "other".into(),
+                ..scope.clone()
+            },
+            ContextScope {
+                user_id: "other".into(),
+                ..scope.clone()
+            },
+        ] {
+            assert!(bound.owner(&scope).is_err());
+        }
+        assert!(
+            NoteBinding::Qq(QqConversations::default())
+                .owner(&scope)
+                .is_err()
+        );
+    }
     #[test]
     fn action_arguments_reject_forged_targets_unknown_fields_and_wrong_byte_limits() {
         for value in [

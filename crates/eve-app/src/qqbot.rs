@@ -2079,7 +2079,7 @@ async fn run_qqbot_composed(
         }
         bootstrap.tools.push(Arc::new(crate::context_notes::NotesTool {
             admin: context_notes.clone(),
-            conversations: conversations.clone(),
+            binding: crate::context_notes::NoteBinding::Qq(conversations.clone()),
         }));
         let developer_backend = crate::developer::install_with_member_runtime_backend(
             &mut bootstrap,
@@ -2197,6 +2197,7 @@ async fn run_qqbot_composed(
         let help_commands = crate::qq_help::Help::handler(tool_definitions.clone(), conversations.clone());
         bootstrap.context = Some(Arc::new(eve_dialogue_tools::CapabilitiesContext {
             inner: Arc::new(crate::context_notes::NotesContext {
+                channel: "qq",
                 inner: bootstrap.context.take().ok_or("对话上下文缺失")?,
                 admin: context_notes,
             }),
