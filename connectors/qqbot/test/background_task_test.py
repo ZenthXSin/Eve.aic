@@ -346,13 +346,21 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
     def _exercise_ten_subagents(self, **options):
         condition = threading.Condition()
         entered = []
+        active = peak = 0
         def respond(body):
+            nonlocal active, peak
             if self.is_worker(body):
                 with condition:
+                    active += 1
+                    peak = max(peak, active)
                     entered.append(self.text(body))
                     condition.notify_all()
-                    self.assertTrue(condition.wait_for(lambda: len(entered) == 10, timeout=12),
-                                    "ten subagents did not overlap")
+                    target = ((len(entered) - 1) // 5 + 1) * 5
+                    try:
+                        self.assertTrue(condition.wait_for(lambda: len(entered) >= target, timeout=12),
+                                        "五并发模型槽下的十个子代理未能全部推进")
+                    finally:
+                        active -= 1
                 return text_response("checked " + self.text(body))
             results = self.results(body)
             if not results:
@@ -363,11 +371,12 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.callback = respond
         self.run_eve(self.send(self.message("parallel", "并行核对十项", expected="十个子代理全部完成")), **options)
         self.assertEqual(len(entered), 10)
+        self.assertEqual(peak, 5, "全部子代理共用五个模型请求槽")
 
     def test_ten_subagents_execute_concurrently_in_one_tool_batch(self):
         self._exercise_ten_subagents()
 
-    def test_explicit_primary_model_limit_ten_allows_ten_shared_subagent_requests(self):
+    def test_legacy_primary_limit_ten_is_capped_at_five_and_all_children_complete(self):
         self._exercise_ten_subagents(env_extra={
             'EVE_OPENAI_MODEL_ROLE': 'primary', 'EVE_MODELS_PRIMARY_ENABLED': 'true',
             'EVE_MODELS_PRIMARY_PROVIDER': 'openai', 'EVE_MODELS_PRIMARY_MODEL': 'parallel-primary',
