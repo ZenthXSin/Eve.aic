@@ -113,6 +113,22 @@ pub trait SummaryAdmin: Send + Sync {
         version: &str,
         options: SummaryOptions,
     ) -> MemoryResult<Option<SummaryBatch>>;
+    /// 读取固定版本的完整证据流，内置实现只保留本批来源及仍有效的旧观点来源。
+    /// 兼容实现默认读取完整快照；宿主须先绑定目标作用域。
+    fn reserve_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn crate::MemoryService,
+        now_ms: u64,
+        version: &str,
+        options: SummaryOptions,
+    ) -> MemoryResult<Option<SummaryBatch>> {
+        let snapshot = reader.complete_snapshot()?;
+        if snapshot.scope != *scope {
+            return Err(crate::MemoryError::Conflict);
+        }
+        self.reserve(&snapshot, now_ms, version, options)
+    }
     fn finish(
         &self,
         batch: &SummaryBatch,

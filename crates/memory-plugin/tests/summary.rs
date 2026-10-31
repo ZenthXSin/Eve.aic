@@ -386,3 +386,241 @@ async fn corrupt_unknown_and_duplicate_key_documents_fail_without_clearing_bytes
         kernel.stop_all().await.unwrap();
     }
 }
+
+/// 大历史逐页生成；若消费者退回全量接口，测试立即失败。
+struct PagedReader {
+    summary: MemoryScanSummary,
+    fixed: Option<Vec<InteractionEvidence>>,
+    fail_after: Option<usize>,
+    reads: Arc<AtomicUsize>,
+}
+struct PagedCursor {
+    summary: MemoryScanSummary,
+    fixed: Option<Vec<InteractionEvidence>>,
+    fail_after: Option<usize>,
+    next: usize,
+    reads: Arc<AtomicUsize>,
+}
+fn generated(number: u64) -> InteractionEvidence {
+    InteractionEvidence {
+        id: format!("e-{number}"),
+        revision: number,
+        at_ms: number,
+        source: EvidenceSource::CompletedInteraction {
+            message_id: format!("m-{number}"),
+            turn_id: number,
+            session_revision: number * 2,
+            user_text: format!("第{number}次交流：我喜欢 Mindustry，但不知道怎么创作模组"),
+            assistant_text: "ASSISTANT_CANNOT_BECOME_USER_EVIDENCE".into(),
+        },
+    }
+}
+impl MemoryEvidenceCursor for PagedCursor {
+    fn summary(&self) -> &MemoryScanSummary {
+        &self.summary
+    }
+    fn next_page(&mut self) -> MemoryResult<Vec<InteractionEvidence>> {
+        if self.fail_after.is_some_and(|after| self.next >= after) {
+            return Err(MemoryError::Storage);
+        }
+        let end = (self.next + MAX_ARCHIVE_PAGE).min(self.summary.evidence_count as usize);
+        let page = (self.next..end)
+            .map(|index| {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                self.fixed.as_ref().map_or_else(
+                    || generated(index as u64 + 1),
+                    |records| records[index].clone(),
+                )
+            })
+            .collect();
+        self.next = end;
+        Ok(page)
+    }
+}
+impl MemoryService for PagedReader {
+    fn snapshot(&self) -> MemoryResult<MemorySnapshot> {
+        panic!("summary must not snapshot")
+    }
+    fn complete_snapshot(&self) -> MemoryResult<MemorySnapshot> {
+        panic!("summary must not restore full memory")
+    }
+    fn scan(&self) -> MemoryResult<Box<dyn MemoryEvidenceCursor>> {
+        Ok(Box::new(PagedCursor {
+            summary: self.summary.clone(),
+            fixed: self.fixed.clone(),
+            fail_after: self.fail_after,
+            next: 0,
+            reads: self.reads.clone(),
+        }))
+    }
+}
+fn reader(count: u64) -> PagedReader {
+    PagedReader {
+        summary: MemoryScanSummary {
+            scope: snapshot(0).scope,
+            revision: count,
+            evidence_count: count,
+            preferences: vec![],
+        },
+        fixed: None,
+        fail_after: None,
+        reads: Arc::new(AtomicUsize::new(0)),
+    }
+}
+
+#[tokio::test]
+async fn paged_summary_scans_six_thousand_sources_and_commits_only_the_bounded_batch() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(root.path());
+    let (kernel, admin) = open(store).await;
+    let source = reader(6000);
+    let options = SummaryOptions {
+        max_new_evidence: 8,
+        ..options()
+    };
+    let batch = admin
+        .reserve_reader(&source.summary.scope, &source, 10, "v1", options)
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.reads.load(Ordering::SeqCst), 6000);
+    assert_eq!(batch.sources.len(), 8);
+    assert_eq!(batch.consumed_ids.len(), 8);
+    assert_eq!(batch.source_revision, 6000);
+    assert_eq!(
+        batch.sources[0].user_text,
+        "第1次交流：我喜欢 Mindustry，但不知道怎么创作模组"
+    );
+    assert_eq!(batch.sources[7].evidence_id, "e-8");
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn paged_summary_never_commits_partial_input_or_hides_a_late_page_error() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(root.path());
+    let (kernel, admin) = open(store.clone()).await;
+    let mut source = reader(MAX_ARCHIVE_PAGE as u64 * 2 + 1);
+    source.fail_after = Some(MAX_ARCHIVE_PAGE);
+    let writes = store.writes.load(Ordering::SeqCst);
+    assert_eq!(
+        admin.reserve_reader(&source.summary.scope, &source, 10, "v1", options()),
+        Err(MemoryError::Storage)
+    );
+    assert_eq!(store.writes.load(Ordering::SeqCst), writes);
+    assert!(admin.jobs(&source.summary.scope).unwrap().is_empty());
+    source.fail_after = None;
+    let batch = admin
+        .reserve_reader(&source.summary.scope, &source, 10, "v1", options())
+        .unwrap()
+        .unwrap();
+    let writes = store.writes.load(Ordering::SeqCst);
+    source.fail_after = Some(MAX_ARCHIVE_PAGE);
+    assert_eq!(
+        admin.reserve_reader(&source.summary.scope, &source, 11, "v1", options()),
+        Err(MemoryError::Storage),
+        "even Running must not silently accept a broken view"
+    );
+    assert_eq!(store.writes.load(Ordering::SeqCst), writes);
+    admin.finish(&batch, 12, Ok(vec![point("e-1")])).unwrap();
+    let writes = store.writes.load(Ordering::SeqCst);
+    assert_eq!(
+        admin.reserve_reader(
+            &source.summary.scope,
+            &source,
+            13,
+            "v1",
+            SummaryOptions {
+                cooldown_ms: 1000,
+                ..options()
+            }
+        ),
+        Err(MemoryError::Storage)
+    );
+    assert_eq!(store.writes.load(Ordering::SeqCst), writes);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn paged_and_snapshot_summaries_match_and_reject_changed_previous_quotes() {
+    let left_root = tempfile::tempdir().unwrap();
+    let right_root = tempfile::tempdir().unwrap();
+    let (left, legacy) = open(Store::open(left_root.path())).await;
+    let state = Store::open(right_root.path());
+    let (right, paged) = open(state.clone()).await;
+    for now in [10, 20] {
+        let source = snapshot(if now == 10 { 1 } else { 2 });
+        let paged_source = reader(source.revision);
+        let a = legacy
+            .reserve(&source, now, "v1", options())
+            .unwrap()
+            .unwrap();
+        let b = paged
+            .reserve_reader(&source.scope, &paged_source, now, "v1", options())
+            .unwrap()
+            .unwrap();
+        assert_eq!(a, b);
+        legacy.finish(&a, now + 1, Ok(vec![point("e-1")])).unwrap();
+        paged.finish(&b, now + 1, Ok(vec![point("e-1")])).unwrap();
+    }
+    let mut source = reader(3);
+    let mut altered = snapshot(3).evidence;
+    if let EvidenceSource::CompletedInteraction { user_text, .. } = &mut altered[0].source {
+        *user_text = "来源已被改变".into();
+    }
+    source.fixed = Some(altered);
+    let writes = state.writes.load(Ordering::SeqCst);
+    assert_eq!(
+        paged.reserve_reader(&source.summary.scope, &source, 30, "v1", options()),
+        Err(MemoryError::Conflict)
+    );
+    assert_eq!(state.writes.load(Ordering::SeqCst), writes);
+    left.stop_all().await.unwrap();
+    right.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn paged_summary_respects_revocation_without_reintroducing_the_old_point() {
+    let root = tempfile::tempdir().unwrap();
+    let (kernel, admin) = open(Store::open(root.path())).await;
+    let initial = reader(1);
+    let batch = admin
+        .reserve_reader(&initial.summary.scope, &initial, 10, "v1", options())
+        .unwrap()
+        .unwrap();
+    admin.finish(&batch, 11, Ok(vec![point("e-1")])).unwrap();
+    let mut source = reader(2);
+    source.summary.revision = 4;
+    let mut evidence = snapshot(2).evidence;
+    evidence[1].revision = 3;
+    source.fixed = Some(evidence);
+    source.summary.preferences = vec![Preference {
+        id: "p".into(),
+        text: "旧偏好".into(),
+        status: PreferenceStatus::Revoked,
+        revision: 2,
+        history: vec![
+            PreferenceVersion {
+                revision: 1,
+                evidence_id: "e-1".into(),
+                at_ms: 2,
+                text: "旧偏好".into(),
+                status: PreferenceStatus::Confirmed,
+            },
+            PreferenceVersion {
+                revision: 2,
+                evidence_id: "e-2".into(),
+                at_ms: 4,
+                text: "旧偏好".into(),
+                status: PreferenceStatus::Revoked,
+            },
+        ],
+    }];
+    let batch = admin
+        .reserve_reader(&source.summary.scope, &source, 20, "v1", options())
+        .unwrap()
+        .unwrap();
+    assert!(batch.previous.is_empty());
+    assert_eq!(batch.sources.len(), 1);
+    assert_eq!(batch.sources[0].evidence_id, "e-2");
+    kernel.stop_all().await.unwrap();
+}

@@ -213,21 +213,23 @@ async fn run(
                 if scope.channel != "qq" {
                     continue;
                 }
-                // 读完整记忆：归档前还没归纳的交流同样会被归纳。
-                let snapshot = memory.reader(scope.clone())?.complete_snapshot()?;
-                if snapshot.scope != scope {
-                    return Err("摘要来源作用域不匹配".into());
-                }
-                let batch =
-                    match summaries.reserve(&snapshot, now_ms(), extractor.version(), options) {
-                        Ok(Some(batch)) => batch,
-                        Ok(None) => continue,
-                        Err(MemoryError::LimitReached) => {
-                            full = true;
-                            break;
-                        }
-                        Err(error) => return Err(error.into()),
-                    };
+                // 完整校验原始证据流，仅保留新批次及旧观点需要的来源。
+                let reader = memory.reader(scope.clone())?;
+                let batch = match summaries.reserve_reader(
+                    &scope,
+                    reader.as_ref(),
+                    now_ms(),
+                    extractor.version(),
+                    options,
+                ) {
+                    Ok(Some(batch)) => batch,
+                    Ok(None) => continue,
+                    Err(MemoryError::LimitReached) => {
+                        full = true;
+                        break;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 let result = tokio::select! { biased;
                     _ = stop_requested(&mut stopped) => Err(SummaryFailure::Cancelled),
                     result = extractor.summarize(batch.clone()) => result,
