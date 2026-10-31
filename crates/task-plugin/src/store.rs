@@ -178,6 +178,13 @@ impl StoredTasks {
         })
     }
 
+    pub(super) fn evidence_snapshot(
+        &self,
+        keys: &[TaskEvidenceKey],
+    ) -> TaskResult<TaskEvidenceSnapshot> {
+        TaskEvidenceSnapshot::select(&self.lock()?.ledger.tasks, keys)
+    }
+
     pub(super) fn scheduling_snapshot(&self) -> TaskResult<TaskSchedulingSnapshot> {
         let directory = TaskSchedulingSnapshot {
             tasks: self

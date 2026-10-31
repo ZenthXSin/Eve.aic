@@ -217,6 +217,35 @@ pub struct TaskStrategySnapshot {
     pub versions: Vec<TaskStrategyVersion>,
     pub selections: Vec<TaskStrategySelection>,
 }
+impl TaskStrategySnapshot {
+    /// 来源身份由可信策略账本固定；保留已结算来源以继续核对历史证据。
+    pub fn evidence_keys(&self) -> TaskResult<Vec<crate::TaskEvidenceKey>> {
+        if self
+            .sources
+            .len()
+            .checked_add(self.selections.len())
+            .is_none_or(|count| count > MAX_TASK_STRATEGY_RECORDS)
+        {
+            return Err(TaskError::LimitReached);
+        }
+        let keys: Vec<_> = self
+            .selections
+            .iter()
+            .map(|selected| crate::TaskEvidenceKey {
+                id: selected.task_id.clone(),
+                owner: selected.assignment.scope.owner.clone(),
+            })
+            .chain(self.sources.iter().map(|source| crate::TaskEvidenceKey {
+                id: source.task_id.clone(),
+                owner: source.scope.owner.clone(),
+            }))
+            .collect();
+        Ok(crate::TaskEvidenceSnapshot::keys(&keys)?
+            .into_iter()
+            .map(|(id, owner)| crate::TaskEvidenceKey { id, owner })
+            .collect())
+    }
+}
 /// 只有宿主在首次执行前冻结评价条件的任务，才能成为自动经验来源。
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -279,4 +308,8 @@ pub trait TaskStrategyLearning: Send + Sync {
     fn propose(&self, proposal: TaskStrategyProposal) -> TaskResult<TaskStrategyVersion>;
     fn prepare(&self, task: &Task) -> TaskResult<Option<TaskStrategyGuidance>>;
     fn reconcile(&self, tasks: &TaskSnapshot) -> TaskResult<()>;
+    /// 原生实现按冻结来源读取证据；旧策略仍接收完整快照，不能收到伪装的局部快照。
+    fn reconcile_from(&self, tasks: &dyn crate::TaskAdmin) -> TaskResult<()> {
+        self.reconcile(&tasks.snapshot()?)
+    }
 }
