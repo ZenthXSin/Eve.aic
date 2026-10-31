@@ -13,6 +13,7 @@ type Mutation = Box<dyn Fn(&mut Value)>;
 struct Store {
     inner: FileStateStore,
     fail: AtomicBool,
+    fail_after: AtomicBool,
 }
 impl StateStore for Store {
     fn get(&self, namespace: &PluginId, key: &str) -> PluginResult<Option<Vec<u8>>> {
@@ -22,7 +23,11 @@ impl StateStore for Store {
         if self.fail.load(Ordering::SeqCst) {
             return Err(PluginError::State("private-storage-detail".into()));
         }
-        self.inner.set(namespace, key, value)
+        self.inner.set(namespace, key, value)?;
+        if self.fail_after.load(Ordering::SeqCst) {
+            return Err(PluginError::State("private-after-commit-detail".into()));
+        }
+        Ok(())
     }
 }
 
@@ -36,6 +41,7 @@ impl World {
         let state = Arc::new(Store {
             inner: FileStateStore::open(directory.path().join("state")).unwrap(),
             fail: AtomicBool::new(false),
+            fail_after: AtomicBool::new(false),
         });
         Self {
             _directory: directory,
@@ -685,6 +691,79 @@ async fn failed_writes_close_the_instance_instead_of_trusting_the_cache() {
 }
 
 #[tokio::test]
+async fn lost_create_acknowledgement_reopens_committed_task_without_duplicate_creation() {
+    let world = World::new();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let alice = owner("alice");
+    world.state.fail_after.store(true, Ordering::SeqCst);
+    assert_eq!(
+        tasks
+            .create(&alice, spec("已写入但确认丢失"), "lost-create", 10)
+            .unwrap_err(),
+        TaskError::Storage
+    );
+    assert_eq!(tasks.snapshot().unwrap_err(), TaskError::Unavailable);
+    world.state.fail_after.store(false, Ordering::SeqCst);
+    let committed = world.raw().unwrap();
+    kernel.stop_all().await.unwrap();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let recovered = tasks.snapshot().unwrap().tasks.pop().unwrap();
+    assert_eq!(recovered.status, TaskStatus::Queued);
+    assert!(
+        tasks
+            .create(&alice, spec("不得覆盖原任务"), "lost-create", 20)
+            .unwrap()
+            == recovered
+    );
+    assert_eq!(tasks.snapshot().unwrap().tasks.len(), 1);
+    assert_eq!(world.raw().unwrap(), committed);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn lost_finish_acknowledgement_reopens_completed_result_and_never_rewinds_it() {
+    let world = World::new();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let alice = owner("alice");
+    let task = tasks
+        .create(&alice, spec("确认丢失的结局"), "lost-finish", 10)
+        .unwrap();
+    tasks.start(&task.id, 20).unwrap();
+    world.state.fail_after.store(true, Ordering::SeqCst);
+    assert_eq!(
+        tasks
+            .finish(
+                &task.id,
+                TaskEnd::Completed {
+                    result: "已有真实回执".into()
+                },
+                usage(1),
+                30
+            )
+            .unwrap_err(),
+        TaskError::Storage
+    );
+    assert_eq!(
+        tasks.get_owned(&alice, &task.id).unwrap_err(),
+        TaskError::Unavailable
+    );
+    world.state.fail_after.store(false, Ordering::SeqCst);
+    let committed = world.raw().unwrap();
+    kernel.stop_all().await.unwrap();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let recovered = tasks.get_owned(&alice, &task.id).unwrap().unwrap();
+    assert_eq!(recovered.status, TaskStatus::Completed);
+    assert_eq!(recovered.result.as_deref(), Some("已有真实回执"));
+    assert_eq!(recovered.usage, Some(usage(1)));
+    assert_eq!(
+        tasks.start(&task.id, 40).unwrap_err(),
+        TaskError::InvalidTransition
+    );
+    assert_eq!(world.raw().unwrap(), committed);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
 async fn notices_expire_after_the_window_and_full_ledgers_prune_only_settled_tasks() {
     let world = World::new();
     let (kernel, tasks) = world.open().await.unwrap();
@@ -936,6 +1015,60 @@ async fn bounded_create_keeps_original_authorization_deadline_atomically_across_
             .authorization_deadline_at_ms,
         Some(1000)
     );
+}
+
+#[tokio::test]
+async fn oversized_escaped_context_keeps_committed_tasks_and_handle_usable_after_rejection() {
+    let world = World::new();
+    let (kernel, admin) = world.open().await.unwrap();
+    let large = |owner: &TaskOwner| {
+        let mut task = spec("保留完整上下文");
+        task.context = Some(DelegatedContext {
+            owner: owner.clone(),
+            messages_json: serde_json::to_string(&vec![eve_llm_api::ChatMessage::text(
+                eve_llm_api::ChatRole::User,
+                "\\\"".repeat(300_000),
+            )])
+            .unwrap(),
+        });
+        task
+    };
+    let alice = owner("large-alice");
+    let original = admin
+        .create(&alice, large(&alice), "first-large", 100)
+        .unwrap();
+    let before = world.raw().unwrap();
+    let bob = owner("large-bob");
+    assert!(matches!(
+        admin.create(&bob, large(&bob), "rejected-large", 101),
+        Err(TaskError::LimitReached)
+    ));
+    assert_eq!(world.raw().unwrap(), before);
+    assert!(admin.get_owned(&alice, &original.id).unwrap() == Some(original.clone()));
+    let small = admin
+        .create(&bob, spec("另一个小任务"), "small", 102)
+        .unwrap();
+    admin.start(&small.id, 103).unwrap();
+    admin
+        .finish(
+            &small.id,
+            TaskEnd::Completed {
+                result: "已核对".into(),
+            },
+            usage(0),
+            104,
+        )
+        .unwrap();
+    assert!(admin.get_owned(&alice, &original.id).unwrap() == Some(original.clone()));
+    kernel.stop_all().await.unwrap();
+    let (kernel, restored) = world.open().await.unwrap();
+    assert!(restored.get_owned(&alice, &original.id).unwrap() == Some(original));
+    assert_eq!(
+        restored.get_owned(&bob, &small.id).unwrap().unwrap().status,
+        TaskStatus::Completed
+    );
+    assert_eq!(restored.summaries_for(&bob).unwrap().len(), 1);
+    kernel.stop_all().await.unwrap();
 }
 
 #[tokio::test]
