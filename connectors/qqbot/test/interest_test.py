@@ -510,6 +510,20 @@ class InterestAcceptance(unittest.TestCase):
         self.run_eve(self.checkpoint("quiet"), checkpoints={"quiet": self.quiet})
         self.assertEqual(len(self.kind("interest")), 2, "failed batches consume their evidence")
 
+    def test_explicit_transient_retries_keep_one_observation_batch_and_do_not_replay(self):
+        self.provider_failure = True
+        self.inspect_run(lambda: self.wait_until(lambda: len(self.jobs()) == 1 and self.jobs()[0]["status"] == {"Failed":"Provider"}, "failure was not saved"),
+                         prefix=self.send(self.message("retry-interest", MINDUSTRY)),
+                         env_extra={"EVE_OPENAI_TRANSIENT_RETRIES":"true"})
+        requests=self.kind("interest")
+        self.assertEqual(len(requests),4)
+        self.assertTrue(all(r["body"] == requests[0]["body"] for r in requests))
+        self.assertEqual(len(self.jobs()),1)
+        self.provider_failure=False
+        self.inspect_run(self.quiet, env_extra={"EVE_OPENAI_TRANSIENT_RETRIES":"true"})
+        self.assertEqual(len(self.kind("interest")),4)
+        self.assertEqual(self.interests(),[])
+
     def test_interrupted_observation_is_interrupted_after_restart_without_replay(self):
         self.response_gates = {("interest", 1): "never-released"}
         # 桥接保持在线，直到观察请求已经到达模型替身，再强制结束进程。
