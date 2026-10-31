@@ -2168,10 +2168,7 @@ async fn run_qqbot_composed(
         }));
         // 子代理在工具执行期内等待结果；按配置上限放宽这一个工具的期限，实际期限由工具按配置控制。
         if options.subagents {
-            bootstrap.host_config.tool_timeout_overrides.insert(
-                qq_tasks::SUBAGENT_TOOL.into(),
-                std::time::Duration::from_millis(qq_tasks::MAX_SUBAGENT_TIMEOUT_MS + 10_000),
-            );
+            bootstrap.host_config.step_bounded_tools.insert(qq_tasks::SUBAGENT_TOOL.into());
         }
         // 执行器与对话共用工具服务和宿主设置；在核心装配之后建立。
         let worker_tools: Vec<String> = bootstrap

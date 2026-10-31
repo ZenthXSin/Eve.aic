@@ -28,7 +28,7 @@ pub const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_TITLE_BYTES: usize = 120;
 pub const MAX_INSTRUCTIONS_BYTES: usize = 8192;
 /// 单次显式委派的完整上下文快照上限；超限拒绝，绝不静默截断。
-pub const MAX_CONTEXT_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_CONTEXT_BYTES: usize = 16 * 1024 * 1024;
 /// 保存的最终结果与失败原因上限；更长的在保存前截断并注明。
 pub const MAX_RESULT_BYTES: usize = 16_384;
 pub const MAX_FAILURE_BYTES: usize = 512;
@@ -86,7 +86,7 @@ pub fn blocked_progress(messages: &[eve_llm_api::ChatMessage]) -> Option<&str> {
 pub const DELIVERY_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// 每条通知至多投递尝试次数（其中至多一次主动私聊）。
 pub const MAX_ATTEMPTS: usize = 6;
-pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 /// 内容寻址的不可变任务正文；实现须核对大小/摘要、持久化后确认，不允许覆盖。
 /// 冷正文与索引共同备份；缺失或损坏不能伪装成任务不存在。
 pub trait TaskArchiveStore: Send + Sync {
@@ -502,6 +502,20 @@ pub trait TaskAdmin: Send + Sync {
         deadline_at_ms: u64,
         now_ms: u64,
     ) -> TaskResult<Task>;
+    /// 支持按步骤运行的检查点；None 表示无任务总时长截止，授权期限仍必须保留。
+    /// 未实现此能力的替换后端失败关闭，不能假报已经保存。
+    fn checkpoint_with_deadline(
+        &self,
+        id: &str,
+        checkpoint: eve_llm_api::TurnCheckpoint,
+        deadline_at_ms: Option<u64>,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        match deadline_at_ms {
+            Some(deadline) => self.checkpoint(id, checkpoint, deadline, now_ms),
+            None => Err(TaskError::InvalidTransition),
+        }
+    }
     /// 安全边界上安排有限次自动恢复；不清空回执、不补充步数、不新建任务。
     fn retry(&self, id: &str, now_ms: u64) -> TaskResult<Task>;
     /// 可信条件已满足后接续同一阻塞任务；保留原预算、期限、回执和任务 ID。

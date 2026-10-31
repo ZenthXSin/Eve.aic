@@ -40,6 +40,8 @@ pub struct LlmHostConfig {
     pub tool_timeout: Duration,
     /// 按工具名覆盖单次执行期限（例如需要等待子代理的工具）；其余工具使用 `tool_timeout`。
     pub tool_timeout_overrides: BTreeMap<String, Duration>,
+    /// 宿主明确装配的按步骤执行工具，不另加调用总时长；仍继承父任务截止及取消。
+    pub step_bounded_tools: std::collections::BTreeSet<String>,
     pub tool_cancellation_grace: Duration,
     pub max_parallel_tool_calls: usize,
     /// 0 表示不限制工具批次数；正数为本轮显式上限。取消、预算及超时仍独立生效。
@@ -68,6 +70,7 @@ impl Default for LlmHostConfig {
             provider_timeout: Duration::from_secs(30),
             tool_timeout: Duration::from_secs(10),
             tool_timeout_overrides: BTreeMap::new(),
+            step_bounded_tools: Default::default(),
             tool_cancellation_grace: Duration::from_millis(100),
             max_parallel_tool_calls: 10,
             max_tool_rounds: 1,
@@ -611,6 +614,9 @@ impl LlmHost {
         host.config
             .tool_timeout_overrides
             .retain(|name, _| names.contains(name));
+        host.config
+            .step_bounded_tools
+            .retain(|name| names.contains(name));
         host.config.output_format = output_rules.into();
         host
     }
@@ -839,7 +845,7 @@ impl LlmHost {
                 .min(std::time::Instant::now() + Duration::from_secs(10));
             let plan = tokio::select! { biased;
                 _ = wait_closed(events) => Err(LlmError::Cancelled),
-                _ = tokio::time::sleep_until(deadline.into()) => Err(LlmError::Cancelled),
+                _ = wait_tool_deadline(Some(deadline)) => Err(LlmError::Cancelled),
                 result = contain_panic(async { planner.plan(scope.as_ref(), &input, &prepared.context.history).await }) => result,
             }.map_err(|error| fail(error, diagnostics.clone()))?;
             if let Some(plan) = plan {
@@ -1735,11 +1741,17 @@ impl LlmHost {
                 .get(&prepared_call.call.name)
                 .copied()
                 .unwrap_or(self.config.tool_timeout);
-            let local_deadline = std::time::Instant::now() + timeout;
-            let deadline = context
-                .deadline()
-                .map_or(local_deadline, |parent| parent.min(local_deadline));
-            let context = context.with_deadline(Some(deadline));
+            let timeout = (!self
+                .config
+                .step_bounded_tools
+                .contains(&prepared_call.call.name))
+            .then_some(timeout);
+            let local_deadline = timeout.map(|timeout| std::time::Instant::now() + timeout);
+            let deadline = match (context.deadline(), local_deadline) {
+                (Some(parent), Some(local)) => Some(parent.min(local)),
+                (parent, local) => parent.or(local),
+            };
+            let context = context.with_deadline(deadline);
             let cancellation = context.cancellation_handle();
             let call_id = prepared_call.call.id.clone();
             let run_config = ToolRunConfig {
@@ -1748,12 +1760,7 @@ impl LlmHost {
                 started: started.clone(),
                 active: active.clone(),
                 peak: peak.clone(),
-                timeout: self
-                    .config
-                    .tool_timeout_overrides
-                    .get(&prepared_call.call.name)
-                    .copied()
-                    .unwrap_or(self.config.tool_timeout),
+                timeout,
                 grace: self.config.tool_cancellation_grace,
             };
             tasks.tasks.push(ToolTask {
@@ -1892,16 +1899,17 @@ async fn run_tool(
         timeout,
         grace,
     } = config;
-    let deadline = context.deadline().map_or_else(
-        || std::time::Instant::now() + timeout,
-        |parent| parent.min(std::time::Instant::now() + timeout),
-    );
+    let local_deadline = timeout.map(|timeout| std::time::Instant::now() + timeout);
+    let deadline = match (context.deadline(), local_deadline) {
+        (Some(parent), Some(local)) => Some(parent.min(local)),
+        (parent, local) => parent.or(local),
+    };
     let _ticket = ticket;
     let cancellation: ToolCancellation = context.cancellation_handle();
     if context.is_cancel_requested() {
         return tool_failure(&call, ToolFailureCode::Cancelled, "工具准入已取消；未执行");
     }
-    if std::time::Instant::now() >= deadline {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
         return tool_failure(
             &call,
             ToolFailureCode::TimedOut,
@@ -1916,14 +1924,16 @@ async fn run_tool(
     };
     let permit: OwnedSemaphorePermit = tokio::select! {
         biased;
-        _ = tokio::time::sleep_until(deadline.into()) => {
+        _ = wait_tool_deadline(deadline) => {
             cancellation.cancel();
             return tool_failure(&call, ToolFailureCode::TimedOut, "工具排队期限已耗尽；未执行");
         }
         _ = tool_cancelled(&context) => return tool_failure(&call, ToolFailureCode::Cancelled, "等待中的工具已取消；未执行"),
         permit = acquire => permit,
     };
-    if context.is_cancel_requested() || std::time::Instant::now() >= deadline {
+    if context.is_cancel_requested()
+        || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    {
         return tool_failure(
             &call,
             ToolFailureCode::TimedOut,
@@ -1939,7 +1949,7 @@ async fn run_tool(
     tokio::pin!(future);
     let value = tokio::select! {
         biased;
-        _ = tokio::time::sleep_until(deadline.into()) => {
+        _ = wait_tool_deadline(deadline) => {
             cancellation.cancel();
             let _ = tokio::time::timeout(grace, &mut future).await;
             ToolResult::failure(call.id, ToolFailureCode::TimedOut, "tool execution timed out")
@@ -1964,6 +1974,13 @@ async fn run_tool(
     value.expect("call id validated")
 }
 
+async fn wait_tool_deadline(deadline: Option<std::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 async fn tool_cancelled(context: &ToolExecutionContext) {
     while !context.is_cancel_requested() {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1976,7 +1993,7 @@ struct ToolRunConfig {
     started: Arc<AtomicUsize>,
     active: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
-    timeout: Duration,
+    timeout: Option<Duration>,
     grace: Duration,
 }
 
@@ -1994,7 +2011,7 @@ fn call_limit_notice(limit: usize, used: usize) -> String {
 }
 
 /// 超限收尾仍被模型误作执行任务时，完整记录只作为引用数据交给汇报模式。
-/// 不经过后台任务的 2 MiB 委派入口，不修改原始消息、回执或检查点。
+/// 不经过后台任务的 16 MiB 委派入口，不修改原始消息、回执或检查点。
 fn progress_report_request(
     messages: &[ChatMessage],
     remaining: Option<&str>,
@@ -2393,7 +2410,7 @@ mod tests {
                 started: started.clone(),
                 active: Arc::new(AtomicUsize::new(0)),
                 peak: Arc::new(AtomicUsize::new(0)),
-                timeout: Duration::from_secs(1),
+                timeout: Some(Duration::from_secs(1)),
                 grace: Duration::from_millis(10),
             },
         )
@@ -2433,7 +2450,7 @@ mod tests {
                 started: started.clone(),
                 active: Arc::new(AtomicUsize::new(0)),
                 peak: Arc::new(AtomicUsize::new(0)),
-                timeout: Duration::from_secs(1),
+                timeout: Some(Duration::from_secs(1)),
                 grace: Duration::from_millis(10),
             },
         );

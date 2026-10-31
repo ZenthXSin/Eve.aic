@@ -526,7 +526,17 @@ async fn role_gates_share_configuration_identity_isolate_roles_and_do_not_pin_un
     let same = gate(&first.settings.clone(), ModelRole::AuxiliarySmall, 2, 0).unwrap();
     assert!(Arc::ptr_eq(&a, &same));
     let other_config = gate(&second.settings, ModelRole::AuxiliarySmall, 2, 0).unwrap();
-    let other_role = gate(&first.settings, ModelRole::Primary, 1, 0).unwrap();
+    let other_role = gate(&first.settings, ModelRole::Primary, 5, 0).unwrap();
+    let total = crate::model_concurrency::global(&first.settings).unwrap();
+    let same_total = crate::model_concurrency::global(&first.settings.clone()).unwrap();
+    assert!(Arc::ptr_eq(&total, &same_total));
+    assert_eq!(total.status().unwrap().limit, 5);
+    assert!(!Arc::ptr_eq(
+        &total,
+        &crate::model_concurrency::global(&second.settings).unwrap()
+    ));
+    let capped = gate(&first.settings, ModelRole::Primary, 100, 1).unwrap();
+    assert_eq!(capped.status().unwrap().limit, 5, "旧配置不能绕过宿主上限");
     assert!(!Arc::ptr_eq(&a, &other_config));
     assert!(!Arc::ptr_eq(&a, &other_role));
     assert_eq!(

@@ -65,8 +65,8 @@ class LayeredContextAcceptance(dialogue_tools_test.DialogueToolsAcceptance):
             return text_response('已登记原始档案。')
 
         self.callback = respond
-        # 通用旧夹具把自适应限额置0；本场景恢复产品既有200000默认值，未放大生产预算。
-        environment = {'EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS': '200000'}
+        # 此容量曲线固定使用200k token和64 KiB历史窗口，不依赖可调整的产品默认值。
+        environment = {'EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS': '200000', 'EVE_HISTORY_MAX_BYTES': '65536'}
         script = self.send(self.message('archive-root', original, expected='已登记原始档案。'))
         for i in range(1, 73):
             script += self.send(self.message(f'work-{i}', f'WORKSTEP-{i}: 当前项目第{i}步。' + ('独立步骤材料。' * 240), expected='已继续本项目。'))
