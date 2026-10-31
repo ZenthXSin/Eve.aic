@@ -105,7 +105,7 @@ pub fn effective_points(
             .evidence
             .iter()
             .any(|e| user_source(e).as_ref() == Some(source));
-        if !hot && !archived_source(snapshot, source) {
+        if !hot {
             return Err(MemoryError::Conflict);
         }
     }
@@ -134,13 +134,47 @@ pub(super) fn filter_points(job: &SummaryJob, preferences: &[Preference]) -> Vec
         .collect()
 }
 
-/// 不在热层的摘要来源是否可能已移入记忆归档；热层同 ID 或同修订的不同内容仍是冲突。
-pub(crate) fn archived_source(snapshot: &MemorySnapshot, source: &SummarySource) -> bool {
-    snapshot.archived_evidence > 0
-        && source.revision > 0
-        && source.revision <= snapshot.revision
-        && !snapshot
-            .evidence
-            .iter()
-            .any(|e| e.id == source.evidence_id || e.revision == source.revision)
+/// 精确核对热/冷原始来源；归档数量和旧批次逐字副本都不能代替当前来源。
+pub fn effective_points_reader(
+    job: &SummaryJob,
+    reader: &dyn MemoryService,
+) -> MemoryResult<EffectiveSummary> {
+    validate_batch(&job.batch)?;
+    validate_summary_points(&job.batch, &job.points)?;
+    let mut cursor = ValidatedMemoryCursor::new(job.batch.scope.clone(), reader.scan()?)?;
+    let summary = cursor.summary().clone();
+    if job.batch.source_revision > summary.revision {
+        return Err(MemoryError::StaleRevision);
+    }
+    let mut seen = BTreeSet::new();
+    loop {
+        let page = cursor.next_page()?;
+        if page.is_empty() {
+            break;
+        }
+        for evidence in page {
+            if let Some(source) = job
+                .batch
+                .sources
+                .iter()
+                .find(|source| source.evidence_id == evidence.id)
+            {
+                if user_source(&evidence).as_ref() != Some(source) {
+                    return Err(MemoryError::Conflict);
+                }
+                seen.insert(evidence.id);
+            }
+        }
+    }
+    if seen.len() != job.batch.sources.len() {
+        return Err(MemoryError::Conflict);
+    }
+    Ok(EffectiveSummary {
+        source_revision: summary.revision,
+        points: if job.status == SummaryStatus::Completed {
+            filter_points(job, &summary.preferences)
+        } else {
+            vec![]
+        },
+    })
 }

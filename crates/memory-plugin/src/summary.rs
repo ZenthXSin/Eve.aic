@@ -10,7 +10,7 @@ use eve_plugin_api::{
 pub use model::ModelConversationSummarizer;
 use std::sync::{Arc, Mutex};
 use store::StoredSummaries;
-pub use validation::{effective_points, validate_summary_points};
+pub use validation::{effective_points, effective_points_reader, validate_summary_points};
 
 pub const SUMMARY_STATE_KEY: &str = "summaries.v1";
 #[derive(Clone, Default)]
@@ -32,6 +32,9 @@ impl SummaryAdmin for SummaryController {
     }
     fn jobs(&self, scope: &MemoryScope) -> MemoryResult<Vec<SummaryJob>> {
         self.service()?.jobs(scope)
+    }
+    fn latest_completed(&self, scope: &MemoryScope) -> MemoryResult<Option<SummaryJob>> {
+        self.service()?.latest_completed(scope)
     }
     fn reserve(
         &self,

@@ -95,6 +95,12 @@ pub struct SummaryJob {
     /// 始终是待核对的模型归纳，不确认或更新 Memory.preferences。
     pub points: Vec<SummaryPoint>,
 }
+/// 仅在固定来源流全部核验完成后返回；不代表归纳语义已被事实核实。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectiveSummary {
+    pub source_revision: u64,
+    pub points: Vec<SummaryPoint>,
+}
 pub type SummaryFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<SummaryPoint>, SummaryFailure>> + Send + 'a>>;
 pub trait ConversationSummarizer: Send + Sync {
@@ -106,6 +112,18 @@ pub trait SummaryAdmin: Send + Sync {
     /// 仅返回全局网络失败的时间元数据，供可信宿主在其他作用域准入前冷却。
     fn last_provider_failure_at(&self) -> MemoryResult<Option<u64>>;
     fn jobs(&self, scope: &MemoryScope) -> MemoryResult<Vec<SummaryJob>>;
+    /// 当前范围最近完成的归纳；默认兼容旧后端，原生实现不恢复全部历史任务正文。
+    fn latest_completed(&self, scope: &MemoryScope) -> MemoryResult<Option<SummaryJob>> {
+        scope.validate()?;
+        let jobs = self.jobs(scope)?;
+        if jobs.iter().any(|job| job.batch.scope != *scope) {
+            return Err(crate::MemoryError::Conflict);
+        }
+        Ok(jobs
+            .into_iter()
+            .rev()
+            .find(|job| job.status == SummaryStatus::Completed))
+    }
     fn reserve(
         &self,
         snapshot: &MemorySnapshot,

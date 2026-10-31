@@ -22,6 +22,20 @@ pub(super) struct StoredSummaries {
     inner: Mutex<Inner>,
 }
 impl StoredSummaries {
+    pub(super) fn latest_completed(&self, scope: &MemoryScope) -> MemoryResult<Option<SummaryJob>> {
+        scope.validate()?;
+        let inner = self.inner.lock().map_err(|_| MemoryError::Unavailable)?;
+        if inner.context.is_none() {
+            return Err(MemoryError::Unavailable);
+        }
+        Ok(inner
+            .document
+            .jobs
+            .iter()
+            .rev()
+            .find(|job| job.batch.scope == *scope && job.status == SummaryStatus::Completed)
+            .cloned())
+    }
     pub(super) fn last_provider_failure_at(&self) -> MemoryResult<Option<u64>> {
         let inner = self.inner.lock().map_err(|_| MemoryError::Unavailable)?;
         if inner.context.is_none() {
@@ -179,19 +193,12 @@ impl StoredSummaries {
                 .filter(|e| referenced.contains(&e.id) || new_ids.contains(&e.id))
                 .filter_map(user_source)
                 .collect();
-            // 旧观点引用的来源已移入记忆归档时，沿用此前批次保存的逐字副本。
-            for id in &referenced {
-                if sources.iter().any(|s| &&s.evidence_id == id) {
-                    continue;
-                }
-                let copy = jobs
-                    .iter()
-                    .rev()
-                    .flat_map(|j| j.batch.sources.iter())
-                    .find(|s| &&s.evidence_id == id)
-                    .filter(|s| archived_source(snapshot, s))
-                    .ok_or(MemoryError::Conflict)?;
-                sources.push(copy.clone());
+            // 不完整热快照不能证明归档来源；调用 reserve_reader 才能逐条核对。
+            if referenced
+                .iter()
+                .any(|id| !sources.iter().any(|source| &&source.evidence_id == id))
+            {
+                return Err(MemoryError::Conflict);
             }
             sources.sort_by_key(|s| s.revision);
             let batch = SummaryBatch {
