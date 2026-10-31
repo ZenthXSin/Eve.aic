@@ -492,14 +492,7 @@ impl SessionService for ColdSessions {
                 return Err(SessionError::Busy);
             }
             if turn.id > through {
-                messages.extend(history_with_failures(
-                    &SessionSnapshot {
-                        key: history.key.clone(),
-                        revision: 0,
-                        turns: vec![turn],
-                    },
-                    through,
-                ));
+                messages.extend(into_history(turn));
             }
         }
         let id = (history.turns.len() as u64)
