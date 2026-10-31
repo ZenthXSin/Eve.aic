@@ -465,3 +465,117 @@ async fn another_model_has_its_own_entries_and_corrupt_index_is_refused_and_pres
         assert_eq!(world.raw().unwrap(), case, "拒绝打开时不改写原字节");
     }
 }
+
+#[tokio::test]
+async fn scoped_index_reads_copy_only_the_requested_model_and_scope_and_never_write() {
+    let world = World::new().await;
+    let first = EmbeddingProfile {
+        model: "scoped-one".into(),
+        dimensions: 4,
+    };
+    let second = EmbeddingProfile {
+        model: "scoped-two".into(),
+        dimensions: 4,
+    };
+    let make = |profile: &EmbeddingProfile, scope: &str, item: &str| IndexEntry {
+        model: profile.model.clone(),
+        dimensions: 4,
+        scope: scope.into(),
+        item: item.into(),
+        content_sha256: "c".repeat(64),
+        scale: 1.0,
+        vector: "7f010101".into(),
+        indexed_at_ms: 1,
+    };
+    let own = make(&first, &"a".repeat(64), "int:own:user");
+    world
+        .index
+        .apply(
+            &first,
+            vec![
+                own.clone(),
+                make(&first, &"b".repeat(64), "int:foreign:user"),
+            ],
+            vec![],
+        )
+        .unwrap();
+    let other_model = make(&second, &"a".repeat(64), "int:other:user");
+    world
+        .index
+        .apply(&second, vec![other_model.clone()], vec![])
+        .unwrap();
+    let before = world.raw();
+    assert_eq!(
+        world.index.entries_for(&first, &"a".repeat(64)).unwrap(),
+        vec![own]
+    );
+    assert_eq!(
+        world.index.entries_for(&second, &"a".repeat(64)).unwrap(),
+        vec![other_model]
+    );
+    assert!(
+        world
+            .index
+            .entries_for(&first, &"d".repeat(64))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        world.index.entries_for(&first, "not-a-scope"),
+        Err(IndexError::InvalidInput)
+    );
+    let invalid = EmbeddingProfile {
+        dimensions: 0,
+        ..first.clone()
+    };
+    assert_eq!(
+        world.index.entries_for(&invalid, &"a".repeat(64)),
+        Err(IndexError::InvalidInput)
+    );
+    assert_eq!(world.raw(), before);
+    let old = world.index.clone();
+    world.kernel.stop_all().await.unwrap();
+    assert_eq!(
+        old.entries_for(&first, &"a".repeat(64)),
+        Err(IndexError::Unavailable)
+    );
+}
+
+#[derive(Clone)]
+struct ForeignLexical;
+impl MemoryRecallFactory for ForeignLexical {
+    fn reader(&self, _: MemoryScope) -> MemoryResult<Arc<dyn MemoryRecallService>> {
+        Ok(Arc::new(self.clone()))
+    }
+}
+impl MemoryRecallService for ForeignLexical {
+    fn recall(&self, _: &MemoryRecallRequest) -> MemoryResult<MemoryRecallResponse> {
+        Ok(MemoryRecallResponse {
+            scope: MemoryScope {
+                session_id: "someone-else".into(),
+                ..scope()
+            },
+            revision: 0,
+            hits: vec![],
+        })
+    }
+}
+#[tokio::test]
+async fn hybrid_recall_rejects_a_foreign_lexical_response_before_fusing_even_when_empty() {
+    let world = World::new().await;
+    let hybrid = HybridRecall::new(
+        Arc::new(world.memory.clone()),
+        Arc::new(ForeignLexical),
+        world.index.clone(),
+        Concepts::new("concepts"),
+    );
+    assert!(matches!(
+        hybrid
+            .reader(scope())
+            .unwrap()
+            .recall(&request("hello"))
+            .await,
+        Err(MemoryError::InvalidInput)
+    ));
+    world.kernel.stop_all().await.unwrap();
+}

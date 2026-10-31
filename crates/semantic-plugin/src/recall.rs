@@ -74,13 +74,13 @@ impl AsyncMemoryRecallService for HybridReader {
             // 词项结果与语义候选须来自同一记忆修订；并发写入时重读，仍不一致则报错。
             for _ in 0..3 {
                 let layout = layout(self.memory.as_ref(), self.index.segments().is_some())?;
-                let lexical = self.lexical.recall(&MemoryRecallRequest {
+                let lexical_request = MemoryRecallRequest {
                     query: request.query.clone(),
                     limit: MAX_RECALL_RESULTS,
-                })?;
-                if lexical.revision != layout.snapshot.revision
-                    || layout.snapshot.scope != self.scope
-                {
+                };
+                let lexical = self.lexical.recall(&lexical_request)?;
+                lexical.validate_for(&self.scope, &lexical_request)?;
+                if lexical.revision != layout.revision || layout.scope != self.scope {
                     continue;
                 }
                 return self.fuse(request, &query, layout, lexical);
@@ -100,56 +100,65 @@ impl HybridReader {
     ) -> MemoryResult<MemoryRecallResponse> {
         let profile = self.embedder.profile();
         let scope = scope_key(&self.scope);
-        let mut entries: BTreeMap<String, _> = self
+        let entries: BTreeMap<String, _> = self
             .index
-            .entries()
+            .entries_for(profile, &scope)
             .map_err(|_| MemoryError::Unavailable)?
             .into_iter()
-            .filter(|entry| entry.belongs_to(profile) && entry.scope == scope)
             .map(|entry| (entry.item.clone(), entry))
             .collect();
-        // 归档段的向量在独立的分段文件里；按当前内容摘要找到对应分段，逐字节核对后读入。
-        let mut all_items = layout.ledger;
-        if let Some(segments) = self.index.segments() {
-            let mut keys = Vec::new();
-            for block in &layout.blocks {
-                let pairs: Vec<(String, String)> = block
-                    .items
-                    .iter()
-                    .filter_map(|item| Some((item.key.clone(), content_hash(&embed_input(item)?))))
-                    .collect();
-                keys.push(SegmentKey {
-                    profile: profile_key(profile),
-                    scope: scope.clone(),
-                    first_revision: block.first_revision,
-                    last_revision: block.last_revision,
-                    content: content_key(&pairs),
-                });
-            }
-            for segment in segments
-                .load(profile, &scope, &keys)
-                .map_err(|_| MemoryError::CorruptState)?
-            {
-                for entry in segment.iter() {
-                    entries.insert(entry.item.clone(), entry.clone());
-                }
-            }
-        }
-        all_items.extend(layout.blocks.into_iter().flat_map(|block| block.items));
-        let snapshot = layout.snapshot;
         let mut semantic = Vec::new();
-        for item in all_items {
+        let mut score_item = |item: crate::items::Item,
+                              entry: Option<&crate::store::IndexEntry>|
+         -> MemoryResult<()> {
             let input = prefix(&item.text, MAX_EMBED_INPUT_BYTES).trim();
-            let Some(entry) = entries
-                .get(&item.key)
-                .filter(|entry| entry.content_sha256 == content_hash(input))
+            let Some(entry) = entry.filter(|entry| entry.content_sha256 == content_hash(input))
             else {
-                continue;
+                return Ok(());
             };
             let vector = entry.restore().ok_or(MemoryError::CorruptState)?;
             let similarity = cosine(query, &vector);
             if similarity >= MIN_SIMILARITY {
                 semantic.push((similarity, item));
+            }
+            Ok(())
+        };
+        for item in layout.ledger {
+            let entry = entries.get(&item.key);
+            score_item(item, entry)?;
+        }
+        // 每次只持有当前块的冷向量。优先该段，未建好时沿用热索引里的旧向量。
+        for block in layout.blocks {
+            let loaded = if let Some(segments) = self.index.segments() {
+                let pairs: Vec<_> = block
+                    .items
+                    .iter()
+                    .filter_map(|item| Some((item.key.clone(), content_hash(&embed_input(item)?))))
+                    .collect();
+                let key = SegmentKey {
+                    profile: profile_key(profile),
+                    scope: scope.clone(),
+                    first_revision: block.first_revision,
+                    last_revision: block.last_revision,
+                    content: content_key(&pairs),
+                };
+                segments
+                    .load(profile, &scope, &[key])
+                    .map_err(|_| MemoryError::CorruptState)?
+            } else {
+                vec![]
+            };
+            let segment_entries: BTreeMap<&str, _> = loaded
+                .iter()
+                .flat_map(|segment| segment.iter())
+                .map(|entry| (entry.item.as_str(), entry))
+                .collect();
+            for item in block.items {
+                let entry = segment_entries
+                    .get(item.key.as_str())
+                    .copied()
+                    .or_else(|| entries.get(&item.key));
+                score_item(item, entry)?;
             }
         }
         semantic.sort_by(|left, right| {
@@ -191,8 +200,8 @@ impl HybridReader {
                 .then_with(|| left.0.cmp(&right.0))
         });
         let mut response = MemoryRecallResponse {
-            scope: snapshot.scope,
-            revision: snapshot.revision,
+            scope: layout.scope,
+            revision: layout.revision,
             hits: Vec::new(),
         };
         for (_, score, mut hit) in ranked {

@@ -150,8 +150,9 @@ pub(crate) struct Block {
 
 /// 一个作用域的可召回条目在索引里的布局。
 pub(crate) struct Layout {
-    /// 热层快照（修订与范围；召回结果以它为准）。
-    pub snapshot: MemorySnapshot,
+    /// 热层身份与修订；不保留另一份完整热正文。
+    pub scope: MemoryScope,
+    pub revision: u64,
     /// 进 `index.v1` 的条目：现行偏好、热层证据与尚未凑满一段的归档证据。
     pub ledger: Vec<Item>,
     /// 凑满一段的归档证据，各自写成不可变的向量分段。
@@ -169,7 +170,8 @@ pub(crate) fn layout(
         if !with_segments || snapshot.archived_evidence == 0 {
             return Ok(Layout {
                 ledger: items(&snapshot)?,
-                snapshot,
+                scope: snapshot.scope,
+                revision: snapshot.revision,
                 blocks: vec![],
             });
         }
@@ -190,15 +192,17 @@ pub(crate) fn layout(
         if total as u64 != snapshot.archived_evidence {
             continue;
         }
-        let mut ledger_snapshot = snapshot.clone();
+        let scope = snapshot.scope.clone();
+        let revision = snapshot.revision;
+        let mut ledger_snapshot = snapshot;
         let mut blocks = Vec::new();
         for page in pages {
             if page.len() == crate::segments::SEGMENT_EVIDENCE {
                 let first_revision = page.first().map_or(0, |item| item.revision);
                 let last_revision = page.last().map_or(0, |item| item.revision);
                 let block = MemorySnapshot {
-                    scope: snapshot.scope.clone(),
-                    revision: snapshot.revision,
+                    scope: scope.clone(),
+                    revision,
                     evidence: page,
                     preferences: vec![],
                     archived_evidence: 0,
@@ -215,7 +219,8 @@ pub(crate) fn layout(
         ledger_snapshot.evidence.sort_by_key(|item| item.revision);
         return Ok(Layout {
             ledger: items(&ledger_snapshot)?,
-            snapshot,
+            scope,
+            revision,
             blocks,
         });
     }
