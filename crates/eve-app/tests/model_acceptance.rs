@@ -390,7 +390,15 @@ async fn chat_defaults_complete_tool_round_trip_and_restore_in_a_new_process() {
     );
     let first = initial.body;
     assert_eq!(first["model"], "deepseek-v4.1-flash");
-    assert_eq!(first["tools"][0]["function"]["name"], "echo");
+    assert_eq!(
+        first["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["echo", "context_notes"])
+    );
     assert!(first.get("input").is_none());
     assert_eq!(first["reasoning_effort"], "low");
     assert_eq!(first["max_tokens"], 2048);

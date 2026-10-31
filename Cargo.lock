@@ -320,6 +320,8 @@ dependencies = [
  "eve-completion-plugin",
  "eve-config-api",
  "eve-config-plugin",
+ "eve-context-api",
+ "eve-context-plugin",
  "eve-control-api",
  "eve-control-plugin",
  "eve-developer-api",
@@ -607,6 +609,28 @@ dependencies = [
  "eve-kernel",
  "eve-plugin-api",
  "eve-web-panel-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "eve-context-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "eve-context-plugin"
+version = "0.1.0"
+dependencies = [
+ "eve-context-api",
+ "eve-kernel",
+ "eve-plugin-api",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
@@ -1526,6 +1550,7 @@ dependencies = [
 name = "eve-web-panel-api"
 version = "0.1.0"
 dependencies = [
+ "eve-context-api",
  "eve-control-api",
  "eve-memory-api",
  "eve-session-api",

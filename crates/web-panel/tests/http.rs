@@ -74,6 +74,95 @@ async fn extension_endpoints_require_authentication_and_validate_before_optional
     panel.stop().await.unwrap();
 }
 
+#[tokio::test]
+async fn context_notes_validate_auth_scope_operations_and_utf8_before_optional_backend() {
+    let service = Arc::new(Service::default());
+    let panel = panel(service.clone()).await;
+    let good =
+        json!({"key":{"session_id":"会话","user_id":"用户"},"action":{"operation":"inspect"}});
+    assert_code(
+        client()
+            .post(url(&panel, "/api/context-notes"))
+            .json(&good)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+    )
+    .await;
+    for invalid in [
+        json!({"key":{"session_id":"会话","user_id":"用户"},"action":{"operation":"inspect","user_id":"其他人"}}),
+        json!({"key":{"session_id":"会话","user_id":"用户"},"action":{"operation":"update","text":"没有修订"}}),
+        json!({"key":{"session_id":"会话","user_id":"用户"},"channel":"console","action":{"operation":"inspect"}}),
+    ] {
+        assert_code(
+            client()
+                .post(url(&panel, "/api/context-notes"))
+                .bearer_auth(TOKEN)
+                .json(&invalid)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            "invalid_json",
+        )
+        .await;
+    }
+    for invalid in [
+        json!({"key":{"session_id":"会话","user_id":"bad\n"},"action":{"operation":"inspect"}}),
+        json!({"key":{"session_id":"会话","user_id":"用户"},"action":{"operation":"versions","limit":65}}),
+        json!({"key":{"session_id":"会话","user_id":"用户"},"action":{"operation":"preview","text":"文".repeat(6000)}}),
+    ] {
+        assert_code(
+            client()
+                .post(url(&panel, "/api/context-notes"))
+                .bearer_auth(TOKEN)
+                .json(&invalid)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+        )
+        .await;
+    }
+    for action in [
+        json!({"operation":"inspect"}),
+        json!({"operation":"update","expected_revision":0,"text":"x".repeat(16384)}),
+        json!({"operation":"preview","text":"\n".repeat(16384)}),
+        json!({"operation":"rollback","expected_revision":1,"target_revision":0}),
+    ] {
+        let body = json!({"key":{"session_id":"会话","user_id":"用户"},"action":action});
+        // 全空白正文按契约拒绝；16 KiB 普通正文应通过独立路由的传输预算。
+        let blank = body["action"]["text"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty() && s.trim().is_empty());
+        assert_code(
+            client()
+                .post(url(&panel, "/api/context-notes"))
+                .bearer_auth(TOKEN)
+                .json(&body)
+                .send()
+                .await
+                .unwrap(),
+            if blank {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            },
+            if blank {
+                "invalid_input"
+            } else {
+                "unavailable"
+            },
+        )
+        .await;
+    }
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+    panel.stop().await.unwrap();
+}
+
 fn target() -> GenerationKey {
     GenerationKey {
         session: SessionKey::new("会话-A", "用户-A").unwrap(),

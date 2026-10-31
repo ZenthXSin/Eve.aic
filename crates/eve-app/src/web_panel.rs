@@ -18,6 +18,7 @@ use eve_web_panel_api::*;
 use std::sync::Arc;
 
 pub(crate) struct QqPanel {
+    pub notes: Arc<dyn eve_context_api::ContextAdmin>,
     pub sessions: Arc<dyn SessionService>,
     pub control: Arc<dyn ControlService>,
     pub channel: Arc<QqBotStatusHandle>,
@@ -116,6 +117,59 @@ fn cursor(keys: &[SessionKey], limit: usize) -> Option<String> {
     (keys.len() == limit).then(|| keys.last().expect("nonempty page").session_id.clone())
 }
 impl PanelService for QqPanel {
+    fn context_notes(
+        &self,
+        request: PanelContextNoteRequest,
+    ) -> PanelResult<eve_context_api::ContextReply> {
+        request
+            .key
+            .validate()
+            .map_err(|_| PanelError::InvalidInput)?;
+        request
+            .action
+            .validate()
+            .map_err(|_| PanelError::InvalidInput)?;
+        if request.key.user_id == crate::qq_group::USER {
+            return Err(PanelError::Forbidden);
+        }
+        // 这是命名空间路由，不是 QQ 身份认证；面板权限仍来自专用 Bearer。
+        // 共享 SQL 中可能同时存在终端会话，不能给它创建无人使用的 qq 便笺。
+        let qq_namespace = |id: &str| {
+            id.strip_prefix("qq:").is_some_and(|hash| {
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        };
+        if !qq_namespace(&request.key.session_id) || !qq_namespace(&request.key.user_id) {
+            return Err(PanelError::NotFound);
+        }
+        let cursor = self
+            .sessions
+            .scan_turns(&request.key)
+            .map_err(session_error)?
+            .ok_or(PanelError::NotFound)?;
+        if cursor.summary().key != request.key {
+            return Err(PanelError::NotFound);
+        }
+        let owner = eve_context_api::ContextOwner {
+            channel: "qq".into(),
+            session_id: request.key.session_id,
+            user_id: request.key.user_id,
+        };
+        let convert = |e| match e {
+            eve_context_api::ContextError::InvalidInput => PanelError::InvalidInput,
+            eve_context_api::ContextError::NotFound => PanelError::NotFound,
+            eve_context_api::ContextError::StaleRevision => PanelError::Stale,
+            _ => PanelError::Unavailable,
+        };
+        let reply = self.notes.apply(&owner, &request.action).map_err(convert)?;
+        reply
+            .validate_for(&owner, &request.action)
+            .map_err(convert)?;
+        Ok(reply)
+    }
     fn plugins(&self) -> PanelResult<PluginList> {
         self.plugins.plugins()
     }

@@ -1627,6 +1627,189 @@ fn both_entries_parse_explicit_database_paths_and_keep_file_default() {
 }
 
 #[tokio::test]
+#[ignore = "需要 EVE_POSTGRES_TEST_CONFIG；专用本机测试库，与其他 SQL 验收串行运行"]
+async fn sql_context_notes_use_cold_files_and_restore_through_real_qq_tools() {
+    let database =
+        PathBuf::from(std::env::var_os("EVE_POSTGRES_TEST_CONFIG").expect("需要专用测试连接"));
+    let credentials = credentials(&database);
+    admin(&database, |client| {
+        let active: i64 = client.query_one("SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE datname=current_database() AND application_name='eve-state-postgres'", &[]).unwrap().get(0);
+        assert_eq!(active, 0, "测试库已有运行中的 Eve 后端");
+        client
+            .batch_execute("DROP SCHEMA IF EXISTS eve_state CASCADE")
+            .unwrap();
+    });
+    let root = fixture();
+    let note = "SQL_NOTE：模组已编译，尚未验证实际运行，不声称交付成功";
+    let tool = |id: &str, arguments: Value| {
+        Reply::json(json!({
+            "status":"completed", "error":null,
+            "output":[{"type":"function_call","id":format!("item-{id}"),"call_id":id,"name":"context_notes","arguments":arguments.to_string(),"status":"completed"}]
+        }))
+    };
+    let mut server = Server::start(vec![
+        tool(
+            "note-update",
+            json!({"operation":"update","expected_revision":0,"text":note}),
+        ),
+        Reply::json(final_response("便笺已保存")),
+        tool(
+            "note-rollback",
+            json!({"operation":"rollback","expected_revision":1,"target_revision":0}),
+        ),
+        Reply::json(final_response("已回到空便笺")),
+        Reply::json(final_response("空便笺已恢复")),
+        tool("console-note-update", json!({"operation":"update","expected_revision":0,"text":"SQL_CONSOLE_NOTE：终端任务尚待验证"})),
+        Reply::json(final_response("终端便笺已保存")),
+        Reply::json(final_response("终端便笺已恢复")),
+    ])
+    .await;
+    let request_has_note = |body: &Value| {
+        body["input"].as_array().unwrap().iter().any(|v| {
+            v["role"] == "system"
+                && v["content"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("\"kind\":\"eve-context-note-v1\""))
+        })
+    };
+    for (index, text, expected) in [
+        (0, "整理当前工作进度", "便笺已保存"),
+        (1, "回退工作便笺", "已回到空便笺"),
+        (2, "确认空便笺已恢复", "空便笺已恢复"),
+    ] {
+        scenario(
+            root.path(),
+            vec![message(&format!("sql-note-{index}"), text, expected)],
+        );
+        let mut cmd = command(Entry::Qq, root.path(), &server.url, Some(&database));
+        // 本场景验证便笺工具；独立的摘要/阶段消息已有专项，不共用此固定响应队列。
+        cmd.env("EVE_HISTORY_DIGEST_ENABLED", "false")
+            .env("EVE_PROGRESS_STAGE_UPDATES", "false")
+            .env("EVE_PROGRESS_SLOW_AFTER_MS", "0")
+            .env("EVE_PROGRESS_TOOL_MILESTONES", "false");
+        let result = successful(
+            Process::run(cmd, "", &credentials.password).await,
+            Entry::Qq,
+        );
+        assert_eq!(result["sent"], 1);
+        let request = server.next().await.body;
+        assert_eq!(
+            request_has_note(&request),
+            index == 1,
+            "index={index}; system snippets={:?}",
+            request["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|v| v["role"] == "system")
+                .map(|v| v["content"]
+                    .as_str()
+                    .unwrap_or("non-text")
+                    .chars()
+                    .take(240)
+                    .collect::<String>())
+                .collect::<Vec<_>>()
+        );
+        if index < 2 {
+            let next = server.next().await.body;
+            let output = next["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|v| v["type"] == "function_call_output")
+                .unwrap();
+            let output: Value = serde_json::from_str(output["output"].as_str().unwrap()).unwrap();
+            assert_eq!(output["saved"], true);
+            assert_eq!(output["view"]["revision"], index + 1);
+            assert_eq!(output["view"]["text"], if index == 0 { note } else { "" });
+        }
+    }
+    let console = successful(
+        Process::run(
+            command(Entry::Console, root.path(), &server.url, Some(&database)),
+            "保存终端工作计划\n",
+            &credentials.password,
+        )
+        .await,
+        Entry::Console,
+    );
+    assert!(console.as_str().unwrap().contains("终端便笺已保存"));
+    assert!(!request_has_note(&server.next().await.body));
+    let returned = server.next().await.body;
+    let output = returned["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|v| v["type"] == "function_call_output")
+        .unwrap();
+    let output: Value = serde_json::from_str(output["output"].as_str().unwrap()).unwrap();
+    assert_eq!(output["view"]["owner"]["channel"], "console");
+    assert_eq!(output["view"]["revision"], 1);
+    let console = successful(
+        Process::run(
+            command(Entry::Console, root.path(), &server.url, Some(&database)),
+            "重启后核对终端便笺\n",
+            &credentials.password,
+        )
+        .await,
+        Entry::Console,
+    );
+    assert!(console.as_str().unwrap().contains("终端便笺已恢复"));
+    let restored = server.next().await.body;
+    assert!(request_has_note(&restored));
+    assert!(restored["input"].as_array().unwrap().iter().any(|v| {
+        v["role"] == "system"
+            && v["content"].as_str().is_some_and(|s| {
+                s.contains("SQL_CONSOLE_NOTE：终端任务尚待验证")
+                    && s.contains("\"channel\":\"console\"")
+            })
+    }));
+    let saved = rows(&database);
+    let index = document(
+        &saved,
+        eve_context_api::CONTEXT_PLUGIN_ID,
+        eve_context_plugin::CONTEXT_INDEX_KEY,
+    );
+    let records = index["records"].as_object().unwrap();
+    assert_eq!(records.len(), 2);
+    let record = records
+        .values()
+        .find(|r| r["owner"]["channel"] == "qq")
+        .unwrap();
+    assert_eq!(record["versions"].as_array().unwrap().len(), 2);
+    assert!(!index.to_string().contains(note));
+    let first_hash = record["versions"][0]["sha256"].as_str().unwrap();
+    let body = root
+        .path()
+        .join("state/context-notes-archive")
+        .join(format!("{first_hash}.json"));
+    let bytes = std::fs::read(&body).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap()["text"],
+        note
+    );
+    // 冷文件缺失时启动拒绝；保留 SQL 索引与回执，不连接模型或补做旧工具。
+    std::fs::remove_file(body).unwrap();
+    scenario(root.path(), vec![]);
+    let output = Process::run(
+        command(Entry::Qq, root.path(), &server.url, Some(&database)),
+        "",
+        &credentials.password,
+    )
+    .await;
+    assert!(!output.status.success());
+    assert_eq!(rows(&database), saved);
+    assert!(server.requests.try_recv().is_err());
+    admin(&database, |client| {
+        client
+            .batch_execute("DROP SCHEMA eve_state CASCADE")
+            .unwrap();
+    });
+}
+
+#[tokio::test]
 #[ignore = "需要 EVE_POSTGRES_TEST_CONFIG；与 persistence 和 cognition_postgres 串行运行"]
 async fn sql_qq_and_console_preserve_history_training_and_receipts_without_replay() {
     let database = PathBuf::from(

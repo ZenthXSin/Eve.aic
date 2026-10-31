@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/context-api",
+    "crates/context-plugin",
     "crates/script-runtime",
     "crates/subject-api",
     "crates/subject-plugin",

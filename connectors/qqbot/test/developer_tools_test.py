@@ -123,10 +123,9 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         config = json.loads(self.developer_config.read_text())
         config["storage_directory"] = str(self.work / "developer-data")
         self.developer_config.write_text(json.dumps(config))
-        names = {"clear_context", "clear_all_contexts", "echo", "search_memory", "save_preference", "note_commitment", "settle_commitment", "send_file", "read_attachment", "describe_image", "read_raw_message", "read_context_record", "acquire_condition", "read_source", "list_files", "read_file", "write_file", "edit_file",
-                 "search_files", "apply_patch", "run_command", "github_api", "prepare_self_upgrade",
-                 "experience_memory", "memory_maintenance", "manage_memory_sharing", "set_reasoning_effort", "set_group_whitelist", "manage_subject_focus", "configure_subject_autonomy", "query_file_delivery",
-                 "save_script_plugin", "list_script_plugins", "activate_script_plugin", "run_script_plugin"}
+        names = dialogue.PLATFORM_TOOLS | dialogue.MEMORY_TOOLS | {
+            "echo", "list_files", "read_file", "write_file", "edit_file", "search_files",
+            "apply_patch", "run_command", "github_api", "prepare_self_upgrade"}
         def respond(body):
             self.assertEqual(self.definitions(body), names)
             self.current_capabilities(body)

@@ -8,6 +8,9 @@ pub(crate) const OWNER: &str = "eve.app.services";
 pub(crate) const CONTEXT: &str = "eve.app.context";
 pub(crate) const TOOL: &str = "eve.app.echo";
 struct Context;
+pub(crate) fn default_context() -> Arc<dyn ContextAssembler> {
+    Arc::new(Context)
+}
 impl ContextAssembler for Context {
     fn assemble(&self, _: TurnInput) -> LlmFuture<'_, ContextSnapshot> {
         Box::pin(async {
@@ -78,7 +81,7 @@ impl CoreServices {
         }
         Ok(Self {
             manifest,
-            context: Arc::new(Context),
+            context: default_context(),
             tools: vec![],
         })
     }

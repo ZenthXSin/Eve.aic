@@ -108,6 +108,190 @@ fn user_texts(request: &Value) -> Vec<&str> {
         .filter(|text| !text.starts_with(include_str!("../src/dialogue-style-guard.txt").trim()))
         .collect()
 }
+
+#[tokio::test]
+async fn context_notes_are_natural_tools_with_frozen_turns_restart_rollback_and_local_identity() {
+    let root = fixture();
+    let first = "当前模组已编译，待实际加载；失败时保留原始回执";
+    let second = "产物已经读回，待用户决定是否发布；尚未发布";
+    let tool = |id: &str, args: Value| {
+        Reply::json(json!({"status":"completed","error":null,"output":[
+            {"type":"function_call","call_id":id,"name":"context_notes","arguments":args.to_string()}
+        ]}))
+    };
+    let mut server = Server::start(vec![
+        tool("preview", json!({"operation":"preview","text":first})),
+        Reply::json(final_response("预览已准备")),
+        tool(
+            "update-first",
+            json!({"operation":"update","expected_revision":0,"text":first}),
+        ),
+        Reply::json(final_response("便笺已保存")),
+        tool(
+            "update-second",
+            json!({"operation":"update","expected_revision":1,"text":second}),
+        ),
+        Reply::json(final_response("已更新便笺")),
+        tool("read-old", json!({"operation":"read_version","revision":1})),
+        Reply::json(final_response("旧版完整保留")),
+        tool(
+            "rollback",
+            json!({"operation":"rollback","expected_revision":2,"target_revision":1}),
+        ),
+        Reply::json(final_response("已回退便笺")),
+        Reply::json(final_response("回退版已加载")),
+        tool("other-session", json!({"operation":"inspect"})),
+        Reply::json(final_response("新会话没有便笺")),
+        tool("other-user", json!({"operation":"inspect"})),
+        Reply::json(final_response("另一用户没有便笺")),
+        Reply::json(final_response("原会话便笺仍在")),
+    ])
+    .await;
+    let note = |request: &Value| {
+        let notes: Vec<_> = request["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["role"] == "system")
+            .filter_map(|v| v["content"].as_str())
+            .filter(|s| s.contains("\"kind\":\"eve-context-note-v1\""))
+            .map(|s| {
+                serde_json::from_str::<Value>(s.lines().last().unwrap()).unwrap()["view"].clone()
+            })
+            .collect();
+        assert!(notes.len() <= 1);
+        notes.into_iter().next()
+    };
+    let output = run(
+        command(root.path(), &server.url),
+        "预览当前计划\n保存当前计划\n更新已有成果\n看看最初的计划\n",
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "Eve：预览已准备\nEve：便笺已保存\nEve：已更新便笺\nEve：旧版完整保留\n"
+    );
+    let mut requests = vec![];
+    for _ in 0..8 {
+        requests.push(server.next().await.body);
+    }
+    for request in &requests[..4] {
+        assert!(note(request).is_none(), "本轮仍是开始时冻结的上下文");
+    }
+    for (request, revision, text) in [
+        (&requests[4], 1, first),
+        (&requests[5], 1, first),
+        (&requests[6], 2, second),
+        (&requests[7], 2, second),
+    ] {
+        let view = note(request).unwrap();
+        assert_eq!(view["revision"], revision);
+        assert_eq!(view["text"], text);
+        assert_eq!(view["owner"]["channel"], "console");
+    }
+    let result = |request: &Value| -> Value {
+        serde_json::from_str(
+            request["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|v| v["type"] == "function_call_output")
+                .unwrap()["output"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(result(&requests[1])["saved"], false);
+    assert_eq!(result(&requests[3])["view"]["revision"], 1);
+    assert_eq!(result(&requests[7])["view"]["text"], first);
+    let raw_turn = sessions(root.path())["sessions"]["default"]["turns"][0].clone();
+
+    let output = run(
+        command(root.path(), &server.url),
+        "重启后回退到第一版\n检查自动加载\n",
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rollback = server.next().await.body;
+    let completed = server.next().await.body;
+    let loaded = server.next().await.body;
+    assert_eq!(note(&rollback).unwrap()["revision"], 2);
+    assert_eq!(result(&completed)["view"]["revision"], 3);
+    assert_eq!(note(&loaded).unwrap()["text"], first);
+    assert_eq!(note(&loaded).unwrap()["revision"], 3);
+    for (session, user, reply) in [
+        ("another-session", "owner", "新会话没有便笺"),
+        ("other-user-session", "another-user", "另一用户没有便笺"),
+    ] {
+        let mut cmd = command(root.path(), &server.url);
+        cmd.args(["--session", session, "--user", user]);
+        let output = run(cmd, "我的计划是什么\n").await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("Eve：{reply}\n")
+        );
+        assert!(note(&server.next().await.body).is_none());
+        assert_eq!(result(&server.next().await.body)["view"]["revision"], 0);
+    }
+    let output = run(command(root.path(), &server.url), "回到原会话\n").await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(note(&server.next().await.body).unwrap()["text"], first);
+    assert_eq!(
+        sessions(root.path())["sessions"]["default"]["turns"][0],
+        raw_turn
+    );
+    let state_path = root.path().join("state/state.json");
+    let saved = std::fs::read(&state_path).unwrap();
+    let outer: Value = serde_json::from_slice(&saved).unwrap();
+    let bytes: Vec<u8> =
+        serde_json::from_value(outer["entries"]["eve.context-notes"]["index.v1"].clone()).unwrap();
+    let index: Value = serde_json::from_slice(&bytes).unwrap();
+    let records = index["records"].as_object().unwrap();
+    assert_eq!(records.len(), 1, "只读的其他身份不创建空记录");
+    let versions = records.values().next().unwrap()["versions"]
+        .as_array()
+        .unwrap();
+    assert_eq!(versions.len(), 3);
+    assert_eq!(versions[0]["sha256"], versions[2]["sha256"]);
+    assert_eq!(
+        std::fs::read_dir(root.path().join("state/context-notes-archive"))
+            .unwrap()
+            .count(),
+        2
+    );
+    std::fs::remove_file(
+        root.path()
+            .join("state/context-notes-archive")
+            .join(format!("{}.json", versions[0]["sha256"].as_str().unwrap())),
+    )
+    .unwrap();
+    let output = run(command(root.path(), &server.url), "不要重放旧任务\n").await;
+    assert!(!output.status.success());
+    assert_eq!(std::fs::read(state_path).unwrap(), saved);
+    assert!(server.requests.try_recv().is_err());
+}
+
 #[tokio::test]
 async fn real_process_chat_tool_round_trip_and_restart_preserve_history_without_replay() {
     let root = fixture();
@@ -144,7 +328,15 @@ async fn real_process_chat_tool_round_trip_and_restart_preserve_history_without_
     assert_eq!(initial.body["model"], "fixture-model");
     assert_eq!(initial.body["store"], false);
     assert_eq!(initial.body["stream"], false);
-    assert_eq!(initial.body["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        initial.body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["echo", "context_notes"])
+    );
     assert!(
         initial.body["input"][0]["content"]
             .as_str()

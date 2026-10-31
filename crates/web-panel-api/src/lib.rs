@@ -2,11 +2,20 @@
 use eve_control_api::GenerationKey;
 use eve_memory_api::MemoryScope;
 use eve_session_api::SessionKey;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 mod extensions;
 pub use extensions::*;
 
 pub type PanelResult<T> = Result<T, PanelError>;
+pub const MAX_PANEL_CONTEXT_BODY_BYTES: usize = eve_context_api::MAX_CONTEXT_BODY_BYTES + 8192;
+
+/// 本机管理入口显式选择已有会话；通道由宿主绑定，不能借此执行模型或工具。
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PanelContextNoteRequest {
+    pub key: SessionKey,
+    pub action: eve_context_api::ContextOperation,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PanelError {
@@ -655,6 +664,12 @@ pub struct LearningView {
 /// 每页 1..=100 项；历史最多 50 轮，每段正文最多 8192 字节并明确标注截断。
 /// 暴露给本机操作者；不存在通过 HTTP 指定其他 Provider、执行工具或新任务的入口。
 pub trait PanelService: Send + Sync {
+    fn context_notes(
+        &self,
+        _request: PanelContextNoteRequest,
+    ) -> PanelResult<eve_context_api::ContextReply> {
+        Err(PanelError::Unavailable)
+    }
     fn plugins(&self) -> PanelResult<PluginList> {
         Err(PanelError::Unavailable)
     }
