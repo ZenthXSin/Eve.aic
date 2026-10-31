@@ -510,6 +510,115 @@ struct ChangingCredentials {
 }
 
 #[tokio::test]
+async fn independent_auxiliary_endpoint_and_chat_protocol_never_receive_primary_credentials_or_fall_back()
+ {
+    use eve_llm_api::{ChatMessage, ChatRole, CredentialPurpose, ModelRequest};
+    let root = tempfile::tempdir().unwrap();
+    let mut primary_server = Server::start(vec![final_reply("responses")]).await;
+    let mut rejected = Reply::json(json!({"error":{"message":"synthetic rejection"}}));
+    rejected.status = 401;
+    let mut auxiliary_server = Server::start(vec![final_reply("chat"), rejected]).await;
+    let h = Harness::start(root.path(), &primary_server.url, "responses").await;
+    h.update(
+        &[
+            (MODELS_NAMESPACE, "auxiliary_small_enabled", json!(true)),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_provider",
+                json!("openai"),
+            ),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_model",
+                json!("independent-small"),
+            ),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_credential_ref",
+                json!(crate::model_credentials::AUXILIARY),
+            ),
+            (
+                config::MODEL_USES_NAMESPACE,
+                "summary_role",
+                json!("auxiliary_small"),
+            ),
+            (
+                config::OPENAI_NAMESPACE,
+                "auxiliary_base_url",
+                json!(auxiliary_server.url.trim_end_matches("/responses")),
+            ),
+            (
+                config::OPENAI_NAMESPACE,
+                "auxiliary_protocol",
+                json!("chat"),
+            ),
+        ],
+        ApplyMode::Immediate,
+    );
+    let bank = Arc::new(eve_model_credentials::CredentialBank::default());
+    bank.bind(
+        CredentialPurpose::Primary,
+        crate::model_credentials::PRIMARY,
+        Some("primary-synthetic".into()),
+    )
+    .unwrap();
+    bank.bind(
+        CredentialPurpose::Auxiliary,
+        crate::model_credentials::AUXILIARY,
+        Some("auxiliary-synthetic".into()),
+    )
+    .unwrap();
+    let primary = CoreModelResolver::from_credentials(h.settings.clone(), Ok(bank.clone()))
+        .with_use("dialogue")
+        .resolve()
+        .unwrap();
+    let auxiliary = CoreModelResolver::from_credentials(h.settings.clone(), Ok(bank))
+        .with_use("summary")
+        .resolve()
+        .unwrap();
+    let request = || ModelRequest {
+        messages: vec![ChatMessage::text(ChatRole::User, "独立端点验证")],
+        tools: vec![],
+    };
+    primary.provider.complete(request()).await.unwrap();
+    let main = primary_server.next().await;
+    assert!(main.headers.starts_with("POST /v1/responses HTTP/1.1"));
+    assert!(
+        main.headers
+            .to_lowercase()
+            .contains("authorization: bearer primary-synthetic\r\n")
+    );
+    assert_eq!(main.body["model"], "model-a");
+    auxiliary.provider.complete(request()).await.unwrap();
+    let independent = auxiliary_server.next().await;
+    assert!(
+        independent
+            .headers
+            .starts_with("POST /v1/chat/completions HTTP/1.1")
+    );
+    assert!(
+        independent
+            .headers
+            .to_lowercase()
+            .contains("authorization: bearer auxiliary-synthetic\r\n")
+    );
+    assert!(!independent.headers.contains("primary-synthetic"));
+    assert_eq!(independent.body["model"], "independent-small");
+    assert!(auxiliary.provider.complete(request()).await.is_err());
+    let failed = auxiliary_server.next().await;
+    assert_eq!(failed.body["model"], "independent-small");
+    assert!(
+        primary_server.requests.try_recv().is_err(),
+        "辅助失败不调用主模型"
+    );
+    assert!(
+        auxiliary_server.requests.try_recv().is_err(),
+        "401 不额外重试"
+    );
+    h.stop().await;
+}
+
+#[tokio::test]
 async fn auxiliary_use_routes_real_requests_keeps_old_selections_and_isolates_credential_rotation()
 {
     use eve_llm_api::{ChatMessage, ChatRole, CredentialPurpose, ModelRequest};

@@ -4,6 +4,7 @@ use eve_model_credentials::CredentialBank;
 use std::sync::Arc;
 
 pub(crate) const PRIMARY: &str = "env:EVE_OPENAI_API_KEY";
+pub(crate) const AUXILIARY: &str = "env:EVE_AUXILIARY_API_KEY";
 pub(crate) const JEV: &str = "env:EVE_JEV_API_KEY";
 pub(crate) const SEMANTIC: &str = "env:EVE_SEMANTIC_API_KEY";
 
@@ -18,7 +19,8 @@ pub(crate) fn reference(
         CredentialPurpose::Jev => JEV,
     });
     match (purpose, reference) {
-        (CredentialPurpose::Primary | CredentialPurpose::Auxiliary, PRIMARY)
+        (CredentialPurpose::Primary, PRIMARY)
+        | (CredentialPurpose::Auxiliary, PRIMARY | AUXILIARY)
         | (CredentialPurpose::Jev, JEV)
         | (CredentialPurpose::Semantic, PRIMARY | SEMANTIC) => Ok(reference),
         _ => Err(CredentialError::UnknownReference),
@@ -32,13 +34,51 @@ pub(crate) fn bank(
     bank.bind(purpose, reference(purpose, None)?, Some(key))?;
     Ok(bank)
 }
-/// 默认 CLI 主/辅角色由宿主显式绑定同一启动密钥，租约用途仍独立核验。
-/// 替换代理可为两个用途注入不同密钥，不按配置引用读取任意环境。
+/// 可选辅助密钥只在宿主装配时读取；未选择的坏密钥不使主模型不可用。
 pub(crate) fn core_bank(key: String) -> Result<Arc<dyn ModelCredentials>, CredentialError> {
-    let bank = Arc::new(CredentialBank::default());
+    let auxiliary = match std::env::var("EVE_AUXILIARY_API_KEY") {
+        Ok(key) => Ok(Some(key)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err(CredentialError::Invalid),
+    };
+    core_bank_with_auxiliary(key, auxiliary)
+}
+fn core_bank_with_auxiliary(
+    key: String,
+    auxiliary: Result<Option<String>, CredentialError>,
+) -> Result<Arc<dyn ModelCredentials>, CredentialError> {
+    let bank = CredentialBank::default();
     bank.bind(CredentialPurpose::Primary, PRIMARY, Some(key.clone()))?;
     bank.bind(CredentialPurpose::Auxiliary, PRIMARY, Some(key))?;
-    Ok(bank)
+    let auxiliary_error = match auxiliary {
+        Ok(key) => bank
+            .bind(CredentialPurpose::Auxiliary, AUXILIARY, key)
+            .err(),
+        Err(error) => Some(error),
+    };
+    Ok(Arc::new(CoreCredentials {
+        bank,
+        auxiliary_error,
+    }))
+}
+struct CoreCredentials {
+    bank: CredentialBank,
+    auxiliary_error: Option<CredentialError>,
+}
+impl ModelCredentials for CoreCredentials {
+    fn resolve(
+        &self,
+        purpose: CredentialPurpose,
+        reference: &str,
+    ) -> Result<CredentialLease, CredentialError> {
+        if purpose == CredentialPurpose::Auxiliary
+            && reference == AUXILIARY
+            && let Some(error) = self.auxiliary_error
+        {
+            return Err(error);
+        }
+        self.bank.resolve(purpose, reference)
+    }
 }
 
 pub(crate) fn resolve(
@@ -50,4 +90,60 @@ pub(crate) fn resolve(
     let lease = broker.resolve(purpose, reference)?;
     lease.validate_for(purpose, reference)?;
     Ok(lease)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn independent_auxiliary_key_is_explicit_and_cannot_cross_into_primary_or_semantic() {
+        let bank = core_bank_with_auxiliary(
+            "primary-synthetic".into(),
+            Ok(Some("auxiliary-synthetic".into())),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve(bank.as_ref(), CredentialPurpose::Auxiliary, Some(AUXILIARY))
+                .unwrap()
+                .expose(),
+            "auxiliary-synthetic"
+        );
+        assert_eq!(
+            resolve(bank.as_ref(), CredentialPurpose::Auxiliary, None)
+                .unwrap()
+                .expose(),
+            "primary-synthetic"
+        );
+        assert_eq!(
+            resolve(bank.as_ref(), CredentialPurpose::Primary, None)
+                .unwrap()
+                .expose(),
+            "primary-synthetic"
+        );
+        for purpose in [
+            CredentialPurpose::Primary,
+            CredentialPurpose::Jev,
+            CredentialPurpose::Semantic,
+        ] {
+            assert!(resolve(bank.as_ref(), purpose, Some(AUXILIARY)).is_err());
+        }
+    }
+    #[test]
+    fn unselected_bad_auxiliary_key_does_not_poison_primary_or_shared_auxiliary_binding() {
+        for (key, expected) in [
+            (Ok(None), CredentialError::Missing),
+            (
+                Ok(Some("invalid synthetic key".into())),
+                CredentialError::Invalid,
+            ),
+            (Err(CredentialError::Invalid), CredentialError::Invalid),
+        ] {
+            let bank = core_bank_with_auxiliary("primary-synthetic".into(), key).unwrap();
+            assert!(resolve(bank.as_ref(), CredentialPurpose::Primary, None).is_ok());
+            assert!(resolve(bank.as_ref(), CredentialPurpose::Auxiliary, None).is_ok());
+            assert!(
+                matches!(resolve(bank.as_ref(), CredentialPurpose::Auxiliary, Some(AUXILIARY)), Err(error) if error == expected)
+            );
+        }
+    }
 }
