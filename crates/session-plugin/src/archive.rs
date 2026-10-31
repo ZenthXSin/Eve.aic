@@ -1,5 +1,5 @@
 use eve_session_api::*;
-use ring::digest::{SHA256, digest};
+use ring::digest::{Context, SHA256, digest};
 use std::{
     fs::File,
     io::{Read, Write},
@@ -39,6 +39,56 @@ impl FileSessionArchive {
         }
         Ok(self.directory.join(format!("{key}.json")))
     }
+    /// 幂等写入仍完整验证已有正文；不为只需摘要的检查再分配整份冷记录。
+    fn verify_and_sync(&self, hash: &str) -> SessionResult<()> {
+        let path = self.path(hash)?;
+        let meta = path.symlink_metadata().map_err(|_| SessionError::Storage)?;
+        if !meta.is_file() || meta.len() > MAX_SESSION_ARCHIVE_RECORD_BYTES as u64 {
+            return Err(SessionError::CorruptState);
+        }
+        // Windows 的 FlushFileBuffers 要求写句柄；只同步，不改写原文。
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(cfg!(windows))
+            .open(&path)
+            .map_err(|_| SessionError::Storage)?;
+        if !file
+            .metadata()
+            .map_err(|_| SessionError::Storage)?
+            .is_file()
+        {
+            return Err(SessionError::CorruptState);
+        }
+        let mut source = (&mut file).take((MAX_SESSION_ARCHIVE_RECORD_BYTES + 1) as u64);
+        let mut digest = Context::new(&SHA256);
+        let mut size = 0usize;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = match source.read(&mut buffer) {
+                Ok(count) => count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(SessionError::Storage),
+            };
+            if count == 0 {
+                break;
+            }
+            size += count;
+            if size > MAX_SESSION_ARCHIVE_RECORD_BYTES {
+                return Err(SessionError::CorruptState);
+            }
+            digest.update(&buffer[..count]);
+        }
+        let actual: String = digest
+            .finish()
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if actual != hash {
+            return Err(SessionError::CorruptState);
+        }
+        file.sync_all().map_err(|_| SessionError::Storage)
+    }
 }
 impl SessionArchiveStore for FileSessionArchive {
     fn get(&self, hash: &str) -> SessionResult<Vec<u8>> {
@@ -64,14 +114,7 @@ impl SessionArchiveStore for FileSessionArchive {
             return Err(SessionError::InvalidInput);
         }
         if target.symlink_metadata().is_ok() {
-            self.get(hash)?;
-            // Windows 的 FlushFileBuffers 要求写句柄；仅同步，绝不改写已验证的正文。
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(cfg!(windows))
-                .open(&target)
-                .and_then(|f| f.sync_all())
-                .map_err(|_| SessionError::Storage)?;
+            self.verify_and_sync(hash)?;
             #[cfg(unix)]
             File::open(&self.directory)
                 .and_then(|f| f.sync_all())
@@ -87,7 +130,7 @@ impl SessionArchiveStore for FileSessionArchive {
         match temp.persist_noclobber(&target) {
             Ok(_) => {}
             Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                self.get(hash)?;
+                self.verify_and_sync(hash)?;
             }
             Err(_) => return Err(SessionError::Storage),
         }
