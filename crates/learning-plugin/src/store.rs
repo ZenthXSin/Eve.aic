@@ -654,6 +654,22 @@ impl StoredLearning {
         use eve_memory_api::{MemoryEvidenceCursor, ValidatedMemoryCursor};
         options.validate()?;
         validate_id(extractor_version).map_err(|_| LearningError::InvalidInput)?;
+        {
+            let mut inner = self.inner.lock().map_err(|_| LearningError::Unavailable)?;
+            if inner.context.is_none() {
+                return Err(LearningError::Unavailable);
+            }
+            if inner.archive.is_some() && inner.job_index.is_some() {
+                return cold_jobs::reserve_reader(
+                    &mut inner,
+                    scope,
+                    reader,
+                    now_ms,
+                    extractor_version,
+                    options,
+                );
+            }
+        }
         let mut cursor = ValidatedMemoryCursor::new(scope.clone(), reader.scan()?)?;
         let revision = cursor.summary().revision;
         let mut inner = self.lock()?;
@@ -772,6 +788,21 @@ impl StoredLearning {
     ) -> LearningResult<Option<LearningBatch>> {
         use eve_memory_api::{MemoryEvidenceCursor, ValidatedMemoryCursor};
         validate_id(extractor_version).map_err(|_| LearningError::InvalidInput)?;
+        {
+            let mut inner = self.inner.lock().map_err(|_| LearningError::Unavailable)?;
+            if inner.context.is_none() {
+                return Err(LearningError::Unavailable);
+            }
+            if inner.archive.is_some() && inner.job_index.is_some() {
+                return cold_jobs::reserve_repair_reader(
+                    &mut inner,
+                    scope,
+                    reader,
+                    now_ms,
+                    extractor_version,
+                );
+            }
+        }
         let mut cursor = ValidatedMemoryCursor::new(scope.clone(), reader.scan()?)?;
         let revision = cursor.summary().revision;
         let mut inner = self.lock()?;

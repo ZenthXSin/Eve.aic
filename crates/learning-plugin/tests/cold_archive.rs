@@ -1281,3 +1281,210 @@ async fn cold_finish_rejects_stale_input_and_invalid_time_and_keeps_failure_repl
     );
     kernel.stop_all().await.unwrap();
 }
+
+struct SnapshotMemory(MemorySnapshot);
+impl eve_memory_api::MemoryService for SnapshotMemory {
+    fn snapshot(&self) -> eve_memory_api::MemoryResult<MemorySnapshot> {
+        Ok(self.0.clone())
+    }
+}
+#[tokio::test]
+async fn cold_reader_admission_and_repair_only_put_the_new_or_selected_record() {
+    use std::sync::atomic::Ordering;
+    let root = tempfile::tempdir().unwrap();
+    let state = RecordingStore::open(&root.path().join("state"));
+    let archive = traced(&root.path().join("cold"));
+    let (kernel, admin, _) = finish_fixture(state.clone(), archive.clone()).await;
+    let source = SnapshotMemory(memory(scope("admit-target", "u"), 1));
+    let mut pinned = admin.scan_jobs(&source.0.scope).unwrap();
+    let before: Value =
+        serde_json::from_slice(&state.get(&owner(), LEARNING_STATE_KEY).unwrap().unwrap()).unwrap();
+    let puts = archive.puts.load(Ordering::SeqCst);
+    let writes = state.writes();
+    let batch = admin
+        .reserve_reader(&source.0.scope, &source, 300, "v1", &options())
+        .unwrap()
+        .unwrap();
+    assert_eq!(archive.puts.load(Ordering::SeqCst), puts + 1);
+    assert_eq!(state.writes(), writes + 1);
+    let after: Value =
+        serde_json::from_slice(&state.get(&owner(), LEARNING_STATE_KEY).unwrap().unwrap()).unwrap();
+    assert_eq!(
+        before["records"].as_array().unwrap(),
+        &after["records"].as_array().unwrap()[..2]
+    );
+    assert!(pinned.next_page().unwrap().is_empty());
+    assert_eq!(batch.evidence, source.0.evidence);
+    assert!(
+        admin
+            .reserve_reader(&source.0.scope, &source, 301, "v2", &options())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(state.writes(), writes + 1);
+    admin
+        .finish(
+            &batch,
+            310,
+            LearningOutcome::Failed(LearningFailure::Timeout),
+        )
+        .unwrap();
+    let puts = archive.puts.load(Ordering::SeqCst);
+    let writes = state.writes();
+    let repair = admin
+        .reserve_repair_reader(&source.0.scope, &source, 310 + REPAIR_COOLDOWN_MS, "v1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(archive.puts.load(Ordering::SeqCst), puts + 1);
+    assert_eq!(state.writes(), writes + 1);
+    assert_eq!(repair.evidence, batch.evidence);
+    assert_eq!(repair.id, batch.id);
+    assert_eq!(repair.attempt, 1);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn cold_reader_admission_cold_put_failure_keeps_sources_unused_and_the_index_unchanged() {
+    use std::sync::atomic::Ordering;
+    for mode in [1, 2] {
+        let root = tempfile::tempdir().unwrap();
+        let state = RecordingStore::open(&root.path().join("state"));
+        let archive = traced(&root.path().join("cold"));
+        let (kernel, admin, _) = finish_fixture(state.clone(), archive.clone()).await;
+        let source = SnapshotMemory(memory(scope("admit-failure", "u"), 1));
+        let before = state.get(&owner(), LEARNING_STATE_KEY).unwrap();
+        let writes = state.writes();
+        archive.failure.store(mode, Ordering::SeqCst);
+        assert_eq!(
+            admin.reserve_reader(&source.0.scope, &source, 300, "v1", &options()),
+            Err(LearningError::Storage)
+        );
+        assert_eq!(state.get(&owner(), LEARNING_STATE_KEY).unwrap(), before);
+        assert_eq!(state.writes(), writes);
+        assert!(admin.snapshot(&source.0.scope).unwrap().jobs.is_empty());
+        archive.failure.store(0, Ordering::SeqCst);
+        let batch = admin
+            .reserve_reader(&source.0.scope, &source, 300, "v1", &options())
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.evidence, source.0.evidence);
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cold_reader_admission_index_commit_uncertainty_closes_cursors_and_preserves_actual_consumption()
+ {
+    for after in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let state = RecordingStore::open(&root.path().join("state"));
+        let archive = traced(&root.path().join("cold"));
+        let (kernel, admin, existing) = finish_fixture(state.clone(), archive.clone()).await;
+        let mut pinned = admin.scan_jobs(&existing.scope).unwrap();
+        let source = SnapshotMemory(memory(scope("admit-uncertain", "u"), 1));
+        state.fail_before(!after);
+        state.fail_after(after);
+        assert_eq!(
+            admin.reserve_reader(&source.0.scope, &source, 300, "v1", &options()),
+            Err(LearningError::Storage)
+        );
+        assert!(matches!(
+            pinned.next_page(),
+            Err(LearningError::Unavailable)
+        ));
+        assert_eq!(
+            admin.snapshot(&source.0.scope),
+            Err(LearningError::Unavailable)
+        );
+        kernel.stop_all().await.unwrap();
+        state.fail_before(false);
+        state.fail_after(false);
+        let (kernel, admin) = open(state, Some(archive)).await;
+        let jobs = admin.snapshot(&source.0.scope).unwrap().jobs;
+        assert_eq!(jobs.len(), usize::from(after));
+        if after {
+            assert_eq!(jobs[0].status, JobStatus::Interrupted);
+            assert!(
+                admin
+                    .reserve_reader(&source.0.scope, &source, 301, "v1", &options())
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            assert!(
+                admin
+                    .reserve_reader(&source.0.scope, &source, 301, "v1", &options())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cold_repair_commit_uncertainty_preserves_exact_attempt_generation_after_restart() {
+    for after in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let state = RecordingStore::open(&root.path().join("state"));
+        let archive = traced(&root.path().join("cold"));
+        let (kernel, admin, batch) = finish_fixture(state.clone(), archive.clone()).await;
+        admin
+            .finish(
+                &batch,
+                210,
+                LearningOutcome::Failed(LearningFailure::Timeout),
+            )
+            .unwrap();
+        let source = SnapshotMemory(memory(batch.scope.clone(), 1));
+        let at = 210 + REPAIR_COOLDOWN_MS;
+        let mut pinned = admin.scan_jobs(&batch.scope).unwrap();
+        state.fail_before(!after);
+        state.fail_after(after);
+        assert_eq!(
+            admin.reserve_repair_reader(&batch.scope, &source, at, "v1"),
+            Err(LearningError::Storage)
+        );
+        assert!(matches!(
+            pinned.next_page(),
+            Err(LearningError::Unavailable)
+        ));
+        kernel.stop_all().await.unwrap();
+        state.fail_before(false);
+        state.fail_after(false);
+        let (kernel, admin) = open(state, Some(archive)).await;
+        let saved = admin.snapshot(&batch.scope).unwrap().jobs;
+        assert_eq!(saved[0].batch.attempt, u8::from(after));
+        assert_eq!(
+            saved[0].status,
+            if after {
+                JobStatus::Interrupted
+            } else {
+                JobStatus::Failed(LearningFailure::Timeout)
+            }
+        );
+        let receipts = admin.maintenance_receipts(&batch.scope).unwrap();
+        assert_eq!(receipts[0].previous_attempts.len(), usize::from(after));
+        if after {
+            assert_eq!(saved[0].batch.evidence, batch.evidence);
+            assert_eq!(
+                admin.finish(&batch, at + 1, LearningOutcome::Completed(vec![])),
+                Err(LearningError::Conflict)
+            );
+            assert!(
+                admin
+                    .reserve_repair_reader(&batch.scope, &source, at + 1, "v1")
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            let next = admin
+                .reserve_repair_reader(&batch.scope, &source, at + 1, "v1")
+                .unwrap()
+                .unwrap();
+            assert_eq!(next.attempt, 1);
+            assert_eq!(next.evidence, batch.evidence);
+        }
+        kernel.stop_all().await.unwrap();
+    }
+}
