@@ -1015,6 +1015,67 @@ impl Tool for DispatchTool {
 pub(crate) struct ListTool {
     pub(crate) tasks: Arc<dyn TaskAdmin>,
 }
+
+fn query_task_records(
+    directory: &TaskSchedulingSnapshot,
+    owner: &TaskOwner,
+    arguments: &Value,
+    mut read: impl FnMut(&TaskOwner, &str) -> eve_task_api::TaskResult<Option<Task>>,
+) -> Result<Value, ToolExecutionError> {
+    directory.validate().map_err(task_error)?;
+    let mut checked = |entry: &TaskSchedulingEntry| -> Result<Option<Task>, ToolExecutionError> {
+        let task = read(&entry.owner, &entry.id).map_err(task_error)?;
+        if task.as_ref().is_some_and(|task| !entry.matches(task)) {
+            return Err(failed("后台任务目录与正文不符；停止读取"));
+        }
+        Ok(task)
+    };
+    if let Some(id) = arguments.get("task_id").and_then(Value::as_str) {
+        let entry = directory
+            .tasks
+            .iter()
+            .find(|entry| entry.owner.user_id == owner.user_id && entry.id == id)
+            .ok_or_else(|| failed("这位用户没有这个后台任务"))?;
+        let task = checked(entry)?.ok_or_else(|| failed("这位用户没有这个后台任务"))?;
+        let detail =
+            if arguments.get("step_offset").is_some() || arguments.get("step_limit").is_some() {
+                let offset = arguments
+                    .get("step_offset")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let limit = arguments
+                    .get("step_limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(12) as usize;
+                let page = crate::qq_task_diagnostics::task_step_window(&task, offset, limit);
+                if offset > page.total {
+                    return Err(failed("step_offset 超过已保存的步骤数"));
+                }
+                let end = offset.saturating_add(page.steps.len());
+                let total = page.total;
+                let mut detail = view_steps(&task, LIST_RESULT_BYTES, page);
+                detail["steps_truncated"] = json!(offset > 0 || end < total);
+                detail["next_step_offset"] = json!((end < total).then_some(end));
+                detail
+            } else {
+                view(&task, LIST_RESULT_BYTES)
+            };
+        return Ok(json!({"task":detail}));
+    }
+    let mut mine: Vec<_> = directory
+        .tasks
+        .iter()
+        .filter(|entry| entry.owner.user_id == owner.user_id)
+        .collect();
+    mine.sort_by_key(|entry| std::cmp::Reverse((entry.created_at_ms, &entry.id)));
+    let mut views = vec![];
+    for entry in mine.into_iter().take(10) {
+        if let Some(task) = checked(entry)? {
+            views.push(view(&task, PREVIEW_BYTES));
+        }
+    }
+    Ok(json!({"tasks":views}))
+}
 impl Tool for ListTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -1057,49 +1118,10 @@ impl Tool for ListTool {
     fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
         Box::pin(async move {
             let owner = owner(&context)?;
-            let snapshot = self.tasks.snapshot().map_err(task_error)?;
-            if let Some(id) = call.arguments.get("task_id").and_then(Value::as_str) {
-                let task = snapshot
-                    .for_owner(&owner.user_id)
-                    .find(|task| task.id == id)
-                    .ok_or_else(|| failed("这位用户没有这个后台任务"))?;
-                let detail = if call.arguments.get("step_offset").is_some()
-                    || call.arguments.get("step_limit").is_some()
-                {
-                    let offset = call
-                        .arguments
-                        .get("step_offset")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as usize;
-                    let limit = call
-                        .arguments
-                        .get("step_limit")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(12) as usize;
-                    let page = crate::qq_task_diagnostics::task_step_window(task, offset, limit);
-                    if offset > page.total {
-                        return Err(failed("step_offset 超过已保存的步骤数"));
-                    }
-                    let end = offset.saturating_add(page.steps.len());
-                    let total = page.total;
-                    let mut detail = view_steps(task, LIST_RESULT_BYTES, page);
-                    detail["steps_truncated"] = json!(offset > 0 || end < total);
-                    detail["next_step_offset"] = json!((end < total).then_some(end));
-                    detail
-                } else {
-                    view(task, LIST_RESULT_BYTES)
-                };
-                return Ok(json!({"task": detail}));
-            }
-            let mut mine: Vec<&Task> = snapshot.for_owner(&owner.user_id).collect();
-            mine.sort_by_key(|task| std::cmp::Reverse((task.created_at_ms, task.id.clone())));
-            Ok(json!({
-                "tasks": mine
-                    .into_iter()
-                    .take(10)
-                    .map(|task| view(task, PREVIEW_BYTES))
-                    .collect::<Vec<_>>()
-            }))
+            let directory = self.tasks.scheduling_snapshot().map_err(task_error)?;
+            query_task_records(&directory, &owner, &call.arguments, |owner, id| {
+                self.tasks.get_owned(owner, id)
+            })
         })
     }
 }
@@ -2035,6 +2057,132 @@ mod tests {
         assert_eq!(view(&task, PREVIEW_BYTES)["steps_used"], 7);
         task.usage = None;
         assert!(view(&task, PREVIEW_BYTES)["steps_used"].is_null());
+    }
+
+    #[test]
+    fn explicit_task_query_reads_only_selected_records_and_keeps_same_user_other_session_management()
+     {
+        let owner = TaskOwner {
+            session_id: "s".into(),
+            user_id: "u".into(),
+        };
+        let mut records: Vec<_> = (0..12)
+            .map(|index| {
+                let mut task = task(TaskStatus::Running);
+                task.id = format!("own-{index}");
+                task.source = format!("source-{index}");
+                task.created_at_ms = index + 1;
+                task.started_at_ms = Some(index + 2);
+                task.finished_at_ms = None;
+                task.result = None;
+                task.failure = None;
+                task.notice = None;
+                task
+            })
+            .collect();
+        records[11].owner.session_id = "another-session".into();
+        let mut foreign = records[11].clone();
+        foreign.id = "foreign".into();
+        foreign.owner.user_id = "other".into();
+        foreign.created_at_ms = 100;
+        records.push(foreign);
+        let directory = TaskSchedulingSnapshot {
+            tasks: records.iter().map(TaskSchedulingEntry::from).collect(),
+        };
+        let mut reads = vec![];
+        let data = query_task_records(&directory, &owner, &json!({}), |owner, id| {
+            let record = records.iter().find(|task| task.id == id).unwrap();
+            assert_eq!(owner, &record.owner);
+            reads.push(id.to_owned());
+            Ok(Some(record.clone()))
+        })
+        .unwrap();
+        assert_eq!(
+            reads,
+            (2..12)
+                .rev()
+                .map(|index| format!("own-{index}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(data["tasks"].as_array().unwrap().len(), 10);
+        let mut reads = 0;
+        let data = query_task_records(
+            &directory,
+            &owner,
+            &json!({"task_id":"own-11"}),
+            |requested_owner, id| {
+                reads += 1;
+                assert_eq!(requested_owner.session_id, "another-session");
+                assert_eq!(requested_owner.user_id, owner.user_id);
+                assert_eq!(id, "own-11");
+                Ok(Some(records[11].clone()))
+            },
+        )
+        .unwrap();
+        assert_eq!(reads, 1);
+        assert_eq!(data["task"]["id"], "own-11");
+        assert!(
+            query_task_records(
+                &directory,
+                &owner,
+                &json!({"task_id":"foreign"}),
+                |_, _| panic!("foreign body must not be read")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_task_query_rejects_body_substitution_and_partial_reads_but_handles_retired_records()
+    {
+        let mut first = task(TaskStatus::Running);
+        first.finished_at_ms = None;
+        let mut second = first.clone();
+        second.id = "task-2".into();
+        second.created_at_ms += 1;
+        let owner = first.owner.clone();
+        let records = [first, second];
+        let directory = TaskSchedulingSnapshot {
+            tasks: records.iter().map(TaskSchedulingEntry::from).collect(),
+        };
+        for variant in 0..5 {
+            assert!(
+                query_task_records(&directory, &owner, &json!({"task_id":"task-1"}), |_, _| {
+                    let mut task = records[0].clone();
+                    match variant {
+                        0 => task.id = "substituted".into(),
+                        1 => task.owner.user_id = "other".into(),
+                        2 => task.owner.session_id = "other".into(),
+                        3 => task.source = "substituted".into(),
+                        _ => task.created_at_ms += 1,
+                    }
+                    Ok(Some(task))
+                })
+                .is_err()
+            );
+        }
+        let mut reads = 0;
+        assert!(
+            query_task_records(&directory, &owner, &json!({}), |_, id| {
+                reads += 1;
+                if reads == 2 {
+                    return Err(TaskError::Storage);
+                }
+                Ok(records.iter().find(|task| task.id == id).cloned())
+            })
+            .is_err()
+        );
+        assert_eq!(reads, 2);
+        assert_eq!(
+            query_task_records(&directory, &owner, &json!({}), |_, _| Ok(None)).unwrap(),
+            json!({"tasks":[]})
+        );
+        assert!(
+            query_task_records(&directory, &owner, &json!({"task_id":"task-1"}), |_, _| Ok(
+                None
+            ))
+            .is_err()
+        );
     }
 
     #[test]
