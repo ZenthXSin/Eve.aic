@@ -53,7 +53,9 @@ try {
   await page.getByText(/记录或配置已经变化/).waitFor();
   assert.equal(await input.inputValue(), "unsaved-draft");
   await page.getByRole("button", { name: "重新读取（放弃编辑）", exact: true }).click();
-  await page.waitForFunction(() => document.querySelector("#plugin-field-2")?.value === "concurrent-model");
+  // 字段次序随 Schema 扩展变化；按与表单关联的语义标签查找，不固定数组下标。
+  await page.waitForFunction(() => [...document.querySelectorAll("#plugin-page-detail label")]
+    .some(label => label.textContent === "model" && document.getElementById(label.htmlFor)?.value === "concurrent-model"));
   await input.fill("initial-model");
   await save();
   await page.getByRole("button", { name: "插件管理", exact: true }).click();
