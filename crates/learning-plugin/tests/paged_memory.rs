@@ -484,3 +484,191 @@ async fn reader_admission_and_repair_keep_cold_ledger_consumption_across_restart
     assert_eq!(admin.snapshot(&newer.scope).unwrap().jobs.len(), 2);
     kernel.stop_all().await.unwrap();
 }
+
+async fn open_cold(
+    state: Arc<dyn StateStore>,
+    path: &std::path::Path,
+) -> (Kernel, LearningController) {
+    let kernel = Kernel::with_services(KernelServices {
+        state,
+        ..KernelServices::default()
+    });
+    let archive = Arc::new(eve_learning_plugin::FileLearningArchive::open(path).unwrap());
+    let plugin = LearningPlugin::new().unwrap().with_archive(archive);
+    let admin = plugin.controller();
+    kernel.register(Box::new(plugin)).unwrap();
+    kernel.start_all().await.unwrap();
+    (kernel, admin)
+}
+
+#[tokio::test]
+async fn cold_admission_scans_six_thousand_sources_and_matches_legacy_batches_after_consumption() {
+    let root = tempfile::tempdir().unwrap();
+    let state = Arc::new(MemoryStateStore::default());
+    let (kernel, admin) = open_cold(state, root.path()).await;
+    let source = reader(6000);
+    let first = admin
+        .reserve_reader(&source.scope, &source, 100, "v1", &options())
+        .unwrap()
+        .unwrap();
+    admin
+        .finish(&first, 110, LearningOutcome::Completed(vec![]))
+        .unwrap();
+    let second = admin
+        .reserve_reader(&source.scope, &source, 200, "v1", &options())
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.read.load(Ordering::SeqCst), 12000);
+    let (legacy_kernel, legacy) = open(Arc::new(MemoryStateStore::default())).await;
+    let small = memory(source.scope.clone(), 8);
+    let first_legacy = legacy
+        .reserve(&small, 100, "v1", &options())
+        .unwrap()
+        .unwrap();
+    legacy
+        .finish(&first_legacy, 110, LearningOutcome::Completed(vec![]))
+        .unwrap();
+    let larger = memory(source.scope.clone(), 16);
+    let second_legacy = legacy
+        .reserve(&larger, 200, "v1", &options())
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, first_legacy);
+    assert_eq!(second, second_legacy);
+    assert_eq!(second.evidence.len(), 8);
+    assert_eq!(second.evidence[0].id, "e-9");
+    assert_eq!(second.evidence[7].id, "e-16");
+    kernel.stop_all().await.unwrap();
+    legacy_kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn cold_admission_keeps_all_late_source_checks_during_cooldown_and_repair_checks() {
+    let root = tempfile::tempdir().unwrap();
+    let state = Arc::new(MemoryStateStore::default());
+    let (kernel, admin) = open_cold(state.clone(), root.path()).await;
+    let initial = reader(8);
+    let first = admin
+        .reserve_reader(&initial.scope, &initial, 100, "v1", &options())
+        .unwrap()
+        .unwrap();
+    admin
+        .finish(
+            &first,
+            110,
+            LearningOutcome::Failed(LearningFailure::Timeout),
+        )
+        .unwrap();
+    let before = raw(state.as_ref());
+    let mut bad = reader(500);
+    bad.fail_at = Some(128);
+    let mut cooling = options();
+    cooling.cooldown_ms = 5_000;
+    assert!(matches!(
+        admin.reserve_reader(&bad.scope, &bad, 200, "v1", &cooling),
+        Err(LearningError::Memory(MemoryError::Storage))
+    ));
+    assert!(matches!(
+        admin.reserve_repair_reader(&bad.scope, &bad, 110 + REPAIR_COOLDOWN_MS, "v1"),
+        Err(LearningError::Memory(MemoryError::Storage))
+    ));
+    bad.fail_at = None;
+    bad.tamper = Some(1);
+    assert_eq!(
+        admin.reserve_reader(&bad.scope, &bad, 200, "v1", &cooling),
+        Err(LearningError::Conflict)
+    );
+    assert_eq!(
+        admin.reserve_repair_reader(&bad.scope, &bad, 110 + REPAIR_COOLDOWN_MS, "v1"),
+        Err(LearningError::Conflict)
+    );
+    assert_eq!(raw(state.as_ref()), before);
+    assert_eq!(
+        admin.snapshot(&initial.scope).unwrap().jobs[0].status,
+        JobStatus::Failed(LearningFailure::Timeout)
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn cold_repair_keeps_two_attempt_limit_original_quotes_version_and_old_attempt_rejection() {
+    let root = tempfile::tempdir().unwrap();
+    let state = Arc::new(MemoryStateStore::default());
+    let (kernel, admin) = open_cold(state.clone(), root.path()).await;
+    let source = reader(8);
+    let first = admin
+        .reserve_reader(&source.scope, &source, 100, "v1", &options())
+        .unwrap()
+        .unwrap();
+    admin
+        .finish(
+            &first,
+            110,
+            LearningOutcome::Failed(LearningFailure::Timeout),
+        )
+        .unwrap();
+    assert!(
+        admin
+            .reserve_repair_reader(&source.scope, &source, 110 + REPAIR_COOLDOWN_MS, "v2")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        admin
+            .reserve_repair_reader(&source.scope, &source, 109 + REPAIR_COOLDOWN_MS, "v1")
+            .unwrap()
+            .is_none()
+    );
+    let mut previous = first.clone();
+    let mut at = 110;
+    for attempt in 1..=2 {
+        let next = admin
+            .reserve_repair_reader(&source.scope, &source, at + REPAIR_COOLDOWN_MS, "v1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.id, first.id);
+        assert_eq!(next.evidence, first.evidence);
+        assert_eq!(next.attempt, attempt);
+        assert_eq!(
+            admin.finish(
+                &previous,
+                next.started_at_ms + 1,
+                LearningOutcome::Completed(vec![])
+            ),
+            Err(LearningError::Conflict)
+        );
+        assert!(
+            admin
+                .reserve_repair_reader(
+                    &source.scope,
+                    &source,
+                    next.started_at_ms + REPAIR_COOLDOWN_MS,
+                    "v1"
+                )
+                .unwrap()
+                .is_none()
+        );
+        at = next.started_at_ms + 1;
+        admin
+            .finish(&next, at, LearningOutcome::Failed(LearningFailure::Timeout))
+            .unwrap();
+        previous = next;
+    }
+    let before = raw(state.as_ref());
+    assert!(
+        admin
+            .reserve_repair_reader(&source.scope, &source, at + REPAIR_COOLDOWN_MS, "v1")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(raw(state.as_ref()), before);
+    kernel.stop_all().await.unwrap();
+    let (kernel, admin) = open_cold(state, root.path()).await;
+    assert!(
+        admin
+            .reserve_repair_reader(&source.scope, &source, at + 2 * REPAIR_COOLDOWN_MS, "v1")
+            .unwrap()
+            .is_none()
+    );
+    kernel.stop_all().await.unwrap();
+}
