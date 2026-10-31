@@ -703,3 +703,277 @@ async fn change_token_tracks_durable_changes_and_new_service_identity_without_lo
     );
     kernel.stop_all().await.unwrap();
 }
+
+async fn startup_fixture(
+    state: Arc<RecordingStore>,
+    archive: Arc<TracedArchive>,
+) -> eve_memory_api::MemoryScope {
+    let (kernel, admin) = open(state, Some(archive)).await;
+    let first = memory(scope("startup-complete", "u"), 1);
+    complete(&admin, &first);
+    admin
+        .record_decision(&first.scope, decision(&admin, &first), 111)
+        .unwrap();
+    complete(&admin, &memory(scope("startup-other", "u"), 1));
+    let pending = memory(scope("startup-pending", "u"), 1);
+    admin
+        .reserve(&pending, 200, "v1", &options())
+        .unwrap()
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    pending.scope
+}
+async fn reject_startup(state: Arc<RecordingStore>, archive: Arc<TracedArchive>) {
+    let kernel = Kernel::with_services(KernelServices {
+        state,
+        ..KernelServices::default()
+    });
+    let plugin = LearningPlugin::new().unwrap().with_archive(archive);
+    let controller = plugin.controller();
+    kernel.register(Box::new(plugin)).unwrap();
+    assert!(kernel.start_all().await.is_err());
+    assert_eq!(
+        controller.snapshot(&scope("startup-pending", "u")),
+        Err(LearningError::Unavailable)
+    );
+}
+
+#[tokio::test]
+async fn streamed_startup_checks_every_record_and_only_rewrites_interrupted_jobs() {
+    use std::sync::atomic::Ordering;
+    let root = tempfile::tempdir().unwrap();
+    let state = RecordingStore::open(&root.path().join("state"));
+    let archive = traced(&root.path().join("cold"));
+    let pending = startup_fixture(state.clone(), archive.clone()).await;
+    let before: Value =
+        serde_json::from_slice(&state.get(&owner(), LEARNING_STATE_KEY).unwrap().unwrap()).unwrap();
+    let decisions = state.get(&owner(), DECISIONS).unwrap();
+    let puts = archive.puts.load(Ordering::SeqCst);
+    let gets = archive.gets.load(Ordering::SeqCst);
+    let writes = state.writes();
+    let (kernel, admin) = open(state.clone(), Some(archive.clone())).await;
+    assert_eq!(
+        archive.gets.load(Ordering::SeqCst),
+        gets + 5,
+        "三批次和一决策逐条核验，只重读一个在途批次"
+    );
+    assert_eq!(archive.puts.load(Ordering::SeqCst), puts + 1);
+    assert_eq!(state.writes(), writes + 1);
+    let after: Value =
+        serde_json::from_slice(&state.get(&owner(), LEARNING_STATE_KEY).unwrap().unwrap()).unwrap();
+    assert_eq!(before["records"][0], after["records"][0]);
+    assert_eq!(before["records"][1], after["records"][1]);
+    assert_ne!(before["records"][2], after["records"][2]);
+    assert_eq!(state.get(&owner(), DECISIONS).unwrap(), decisions);
+    let job = &admin.snapshot(&pending).unwrap().jobs[0];
+    assert_eq!(job.status, JobStatus::Interrupted);
+    assert_eq!(job.finished_at_ms, None);
+    kernel.stop_all().await.unwrap();
+    let puts = archive.puts.load(Ordering::SeqCst);
+    let gets = archive.gets.load(Ordering::SeqCst);
+    let writes = state.writes();
+    let (kernel, _) = open(state.clone(), Some(archive.clone())).await;
+    assert_eq!(archive.gets.load(Ordering::SeqCst), gets + 4);
+    assert_eq!(archive.puts.load(Ordering::SeqCst), puts);
+    assert_eq!(state.writes(), writes);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn streamed_startup_late_invalid_decision_never_rewrites_pending_jobs() {
+    use std::sync::atomic::Ordering;
+    let root = tempfile::tempdir().unwrap();
+    let state = RecordingStore::open(&root.path().join("state"));
+    let archive = traced(&root.path().join("cold"));
+    startup_fixture(state.clone(), archive.clone()).await;
+    let old_jobs = state.get(&owner(), LEARNING_STATE_KEY).unwrap();
+    let mut index: Value =
+        serde_json::from_slice(&state.get(&owner(), DECISIONS).unwrap().unwrap()).unwrap();
+    let reference = &index["records"][0];
+    let mut record: Value =
+        serde_json::from_slice(&archive.get(reference["hash"].as_str().unwrap()).unwrap()).unwrap();
+    record["record"]["sequence"] = json!(2);
+    let bytes = serde_json::to_vec(&record).unwrap();
+    let key = hash(&bytes);
+    archive.put(&key, &bytes).unwrap();
+    index["records"][0] = json!({"hash": key, "bytes": bytes.len()});
+    state
+        .set(
+            &owner(),
+            DECISIONS.into(),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+    let writes = state.writes();
+    let puts = archive.puts.load(Ordering::SeqCst);
+    reject_startup(state.clone(), archive.clone()).await;
+    assert_eq!(archive.puts.load(Ordering::SeqCst), puts);
+    assert_eq!(state.writes(), writes);
+    assert_eq!(state.get(&owner(), LEARNING_STATE_KEY).unwrap(), old_jobs);
+}
+
+#[tokio::test]
+async fn streamed_startup_cold_write_uncertainty_keeps_old_index_and_retries_recovery_only() {
+    use std::sync::atomic::Ordering;
+    for mode in [1, 2] {
+        let root = tempfile::tempdir().unwrap();
+        let state = RecordingStore::open(&root.path().join("state"));
+        let archive = traced(&root.path().join("cold"));
+        let pending = startup_fixture(state.clone(), archive.clone()).await;
+        let before = state.get(&owner(), LEARNING_STATE_KEY).unwrap();
+        let writes = state.writes();
+        archive.failure.store(mode, Ordering::SeqCst);
+        reject_startup(state.clone(), archive.clone()).await;
+        assert_eq!(state.writes(), writes);
+        assert_eq!(state.get(&owner(), LEARNING_STATE_KEY).unwrap(), before);
+        archive.failure.store(0, Ordering::SeqCst);
+        let (kernel, admin) = open(state, Some(archive)).await;
+        let jobs = admin.snapshot(&pending).unwrap().jobs;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, JobStatus::Interrupted);
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn streamed_startup_failed_index_commit_requires_reopen_and_uses_actual_saved_index() {
+    use std::sync::atomic::Ordering;
+    for after in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let state = RecordingStore::open(&root.path().join("state"));
+        let archive = traced(&root.path().join("cold"));
+        let pending = startup_fixture(state.clone(), archive.clone()).await;
+        let before = state.get(&owner(), LEARNING_STATE_KEY).unwrap();
+        state.fail_before(!after);
+        state.fail_after(after);
+        reject_startup(state.clone(), archive.clone()).await;
+        assert_eq!(
+            state.get(&owner(), LEARNING_STATE_KEY).unwrap() == before,
+            !after
+        );
+        state.fail_before(false);
+        state.fail_after(false);
+        let puts = archive.puts.load(Ordering::SeqCst);
+        let writes = state.writes();
+        let (kernel, admin) = open(state.clone(), Some(archive.clone())).await;
+        assert_eq!(
+            archive.puts.load(Ordering::SeqCst),
+            puts + usize::from(!after)
+        );
+        assert_eq!(state.writes(), writes + usize::from(!after));
+        assert_eq!(
+            admin.snapshot(&pending).unwrap().jobs[0].status,
+            JobStatus::Interrupted
+        );
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn streamed_startup_rejects_cross_record_duplicates_before_recovery_writes() {
+    use std::sync::atomic::Ordering;
+    let root = tempfile::tempdir().unwrap();
+    let state = RecordingStore::open(&root.path().join("state"));
+    let archive = traced(&root.path().join("cold"));
+    startup_fixture(state.clone(), archive.clone()).await;
+    let mut index: Value =
+        serde_json::from_slice(&state.get(&owner(), LEARNING_STATE_KEY).unwrap().unwrap()).unwrap();
+    let duplicate = index["records"][0].clone();
+    index["records"].as_array_mut().unwrap().push(duplicate);
+    let bytes = serde_json::to_vec(&index).unwrap();
+    state
+        .set(&owner(), LEARNING_STATE_KEY.into(), bytes.clone())
+        .unwrap();
+    let puts = archive.puts.load(Ordering::SeqCst);
+    let writes = state.writes();
+    reject_startup(state.clone(), archive.clone()).await;
+    assert_eq!(archive.puts.load(Ordering::SeqCst), puts);
+    assert_eq!(state.writes(), writes);
+    assert_eq!(
+        state.get(&owner(), LEARNING_STATE_KEY).unwrap(),
+        Some(bytes)
+    );
+}
+
+#[tokio::test]
+async fn streamed_startup_keeps_both_mixed_legacy_formats_and_pending_recovery() {
+    for legacy_key in [LEARNING_STATE_KEY, DECISIONS] {
+        let root = tempfile::tempdir().unwrap();
+        let state = RecordingStore::open(&root.path().join("state"));
+        let archive = traced(&root.path().join("cold"));
+        let pending = startup_fixture(state.clone(), archive.clone()).await;
+        let index: Value =
+            serde_json::from_slice(&state.get(&owner(), legacy_key).unwrap().unwrap()).unwrap();
+        let records: Vec<Value> = index["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|reference| {
+                serde_json::from_slice(&archive.get(reference["hash"].as_str().unwrap()).unwrap())
+                    .unwrap()
+            })
+            .collect();
+        let hot = if legacy_key == LEARNING_STATE_KEY {
+            json!({"format_version":1,"jobs":records})
+        } else {
+            json!({"format_version":1,"records":records})
+        };
+        state
+            .set(
+                &owner(),
+                legacy_key.into(),
+                serde_json::to_vec(&hot).unwrap(),
+            )
+            .unwrap();
+        let (kernel, admin) = open(state, Some(archive)).await;
+        assert_eq!(
+            admin.snapshot(&pending).unwrap().jobs[0].status,
+            JobStatus::Interrupted
+        );
+        assert_eq!(
+            admin
+                .snapshot(&scope("startup-complete", "u"))
+                .unwrap()
+                .jobs[0]
+                .status,
+            JobStatus::Completed
+        );
+        let decisions = admin.decisions(&scope("startup-complete", "u")).unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].sequence, 1);
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn streamed_startup_does_not_let_cold_jobs_bypass_legacy_decision_count_limit() {
+    use std::sync::atomic::Ordering;
+    let root = tempfile::tempdir().unwrap();
+    let state = RecordingStore::open(&root.path().join("state"));
+    let archive = traced(&root.path().join("cold"));
+    startup_fixture(state.clone(), archive.clone()).await;
+    let index: Value =
+        serde_json::from_slice(&state.get(&owner(), DECISIONS).unwrap().unwrap()).unwrap();
+    let entry: Value = serde_json::from_slice(
+        &archive
+            .get(index["records"][0]["hash"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let records: Vec<_> = (1..=MAX_DECISIONS + 1)
+        .map(|sequence| {
+            let mut value = entry.clone();
+            value["record"]["sequence"] = json!(sequence);
+            value["record"]["decision"]["policy_version"] = json!(format!("p-{sequence}"));
+            value
+        })
+        .collect();
+    let bytes = serde_json::to_vec(&json!({"format_version":1,"records":records})).unwrap();
+    assert!(bytes.len() < MAX_STATE_BYTES);
+    state.set(&owner(), DECISIONS.into(), bytes).unwrap();
+    let writes = state.writes();
+    let puts = archive.puts.load(Ordering::SeqCst);
+    reject_startup(state.clone(), archive.clone()).await;
+    assert_eq!(state.writes(), writes);
+    assert_eq!(archive.puts.load(Ordering::SeqCst), puts);
+}

@@ -17,6 +17,8 @@ use std::{
 
 #[path = "cold_decisions.rs"]
 mod cold_decisions;
+#[path = "cold_startup.rs"]
+mod cold_startup;
 
 static INSTANCE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 const FORMAT_VERSION: u32 = 1;
@@ -184,13 +186,10 @@ impl StoredLearning {
                 {
                     let index: Index =
                         serde_json::from_value(value).map_err(|_| LearningError::CorruptState)?;
-                    let jobs = archive::thaw(
-                        archive
-                            .as_deref()
-                            .ok_or(LearningError::UnsupportedVersion)?,
-                        &index,
-                        "jobs",
-                    )?;
+                    if archive.is_none() {
+                        return Err(LearningError::UnsupportedVersion);
+                    }
+                    let jobs = vec![];
                     job_index = Some(index);
                     Document {
                         format_version: 1,
@@ -229,13 +228,10 @@ impl StoredLearning {
                 {
                     let index: Index =
                         serde_json::from_value(value).map_err(|_| LearningError::CorruptState)?;
-                    let records = archive::thaw(
-                        archive
-                            .as_deref()
-                            .ok_or(LearningError::UnsupportedVersion)?,
-                        &index,
-                        "decisions",
-                    )?;
+                    if archive.is_none() {
+                        return Err(LearningError::UnsupportedVersion);
+                    }
+                    let records = vec![];
                     decision_index = Some(index);
                     DecisionsDocument {
                         format_version: 1,
@@ -251,8 +247,13 @@ impl StoredLearning {
                 }
             }
         };
-        validate_decisions_document(&decisions, &document, decision_index.is_some())
-            .map_err(|_| LearningError::CorruptState)?;
+        if decision_index.is_none() && decisions.records.len() > MAX_DECISIONS {
+            return Err(LearningError::CorruptState);
+        }
+        if job_index.is_none() && decision_index.is_none() {
+            validate_decisions_document(&decisions, &document, false)
+                .map_err(|_| LearningError::CorruptState)?;
+        }
         let mut inner = Inner {
             change: LearningChangeToken {
                 instance: INSTANCE_SEQUENCE
@@ -272,6 +273,13 @@ impl StoredLearning {
             job_index,
             decision_index,
         };
+        if inner.job_index.is_some() || inner.decision_index.is_some() {
+            cold_startup::validate_and_recover(&mut inner)?;
+            evict(&mut inner);
+            return Ok(Self {
+                inner: Mutex::new(inner),
+            });
+        }
         let mut next = inner.document.clone();
         let mut interrupted = false;
         for record in &mut next.jobs {

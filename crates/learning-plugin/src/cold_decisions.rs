@@ -7,7 +7,7 @@ struct CandidateBinding {
     evidence_ids: Vec<String>,
 }
 #[derive(Default)]
-struct Check {
+pub(super) struct Check {
     job_ids: BTreeSet<String>,
     ids: BTreeSet<(MemoryScope, String)>,
     messages: BTreeSet<(MemoryScope, String)>,
@@ -19,7 +19,7 @@ struct Check {
     outcomes: BTreeMap<(MemoryScope, String), [u8; 32]>,
     selected: Option<LearningDecisionRecord>,
 }
-fn index_total(index: &Index, kind: &str) -> LearningResult<usize> {
+pub(super) fn index_total(index: &Index, kind: &str) -> LearningResult<usize> {
     if index.format_version != 2 || index.kind != kind {
         return Err(LearningError::CorruptState);
     }
@@ -49,7 +49,7 @@ fn outcome(decision: &LearningDecision) -> LearningResult<[u8; 32]> {
     Ok(result)
 }
 impl Check {
-    fn job(&mut self, value: serde_json::Value) -> LearningResult<()> {
+    pub(super) fn job(&mut self, value: serde_json::Value) -> LearningResult<()> {
         let record: JobRecord =
             serde_json::from_value(value).map_err(|_| LearningError::CorruptState)?;
         let one = Document {
@@ -125,11 +125,10 @@ impl Check {
         }
         Ok(())
     }
-    fn decision(
+    pub(super) fn decision(
         &mut self,
         value: serde_json::Value,
-        target: &MemoryScope,
-        candidate: &str,
+        target: Option<(&MemoryScope, &str)>,
     ) -> LearningResult<()> {
         let entry: ScopedDecisionRecord =
             serde_json::from_value(value).map_err(|_| LearningError::CorruptState)?;
@@ -148,7 +147,9 @@ impl Check {
         {
             return Err(LearningError::CorruptState);
         }
-        if entry.scope == *target && record.decision.candidate_id == candidate {
+        if target.is_some_and(|(scope, candidate)| {
+            entry.scope == *scope && record.decision.candidate_id == candidate
+        }) {
             self.selected = Some(record);
         }
         Ok(())
@@ -181,8 +182,7 @@ pub(super) fn append(
         for reference in &decisions.records {
             check.decision(
                 archive::load_value(archive.as_ref(), reference)?,
-                scope,
-                &decision.candidate_id,
+                Some((scope, &decision.candidate_id)),
             )?;
         }
         Ok((check, total))
@@ -360,13 +360,19 @@ mod tests {
             },
         };
         check
-            .decision(serde_json::to_value(&entry).unwrap(), &scope, &candidate.id)
+            .decision(
+                serde_json::to_value(&entry).unwrap(),
+                Some((&scope, &candidate.id)),
+            )
             .unwrap();
         entry.record.sequence = 2;
         entry.record.decision.memory_revision = 2;
         assert!(
             check
-                .decision(serde_json::to_value(entry).unwrap(), &scope, &candidate.id)
+                .decision(
+                    serde_json::to_value(entry).unwrap(),
+                    Some((&scope, &candidate.id))
+                )
                 .is_err()
         );
     }
