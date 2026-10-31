@@ -367,7 +367,7 @@ async fn failed_cancel_commit_blocks_replacement_and_preserves_pending() {
         Err(ControlError::Blocked)
     );
     assert_eq!(
-        rig.snapshot("s").turns[0].status,
+        durable_snapshot(store.as_ref(), "s").turns[0].status,
         SessionTurnStatus::Pending
     );
     assert_eq!(p.requests.lock().unwrap().len(), 1);

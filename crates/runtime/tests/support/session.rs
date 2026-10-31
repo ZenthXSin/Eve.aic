@@ -99,6 +99,19 @@ impl StateStore for FaultStore {
     }
 }
 
+/// 只用于验收持久字节，不向运行时提供绕过关闭句柄的读取回退。
+pub fn durable_snapshot(state: &dyn StateStore, session: &str) -> SessionSnapshot {
+    let bytes = state
+        .get(&id(SESSION_PLUGIN_ID), SESSION_STATE_KEY)
+        .unwrap()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    let snapshot: SessionSnapshot =
+        serde_json::from_value(value["sessions"][session].clone()).unwrap();
+    snapshot.validate().unwrap();
+    snapshot
+}
+
 pub struct Step {
     pub response: Result<ModelResponse, LlmError>,
     pub gate: Option<Arc<Notify>>,

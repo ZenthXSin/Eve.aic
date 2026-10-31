@@ -175,9 +175,11 @@ impl StoredSessions {
     }
     fn save(&self, inner: &mut Inner, document: Document) -> SessionResult<()> {
         let bytes = serde_json::to_vec(&document).map_err(|_| SessionError::CorruptState)?;
-        self.context
-            .state_set(SESSION_STATE_KEY, bytes)
-            .map_err(|_| SessionError::Storage)?;
+        if self.context.state_set(SESSION_STATE_KEY, bytes).is_err() {
+            // 后端可能已提交但确认丢失；旧缓存不能再覆盖实际状态或重用轮次 ID。
+            inner.active = false;
+            return Err(SessionError::Storage);
+        }
         inner.document = document;
         Ok(())
     }
