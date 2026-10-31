@@ -17,7 +17,7 @@ mod strict_json;
 mod summary;
 pub use summary::{
     ConversationSummaryPlugin, ModelConversationSummarizer, SUMMARY_STATE_KEY, SummaryController,
-    effective_points, validate_summary_points,
+    effective_points, effective_points_reader, validate_summary_points,
 };
 
 use archive::ArchiveConfig;

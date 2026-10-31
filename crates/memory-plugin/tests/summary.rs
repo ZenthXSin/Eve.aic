@@ -2,7 +2,7 @@ use eve_kernel::{Kernel, KernelServices, backends::FileStateStore};
 use eve_memory_api::*;
 use eve_memory_plugin::{
     ConversationSummaryPlugin, SUMMARY_STATE_KEY, SummaryController, effective_points,
-    validate_summary_points,
+    effective_points_reader, validate_summary_points,
 };
 use eve_plugin_api::{PluginError, PluginId, PluginResult, StateStore};
 use std::sync::{
@@ -198,12 +198,18 @@ async fn restart_preserves_completed_summary_and_interrupts_without_replaying_co
         effective_points(&jobs[0], &snapshot(2)).unwrap(),
         vec![point("e-1")]
     );
-    // 来源移入记忆归档后，观点仍有效；热层同 ID 的不同内容仍是冲突。
+    // 不完整热快照不能证明归档来源；必须读取真实固定来源流。
     let mut archived = snapshot(2);
     archived.evidence.remove(0);
     archived.archived_evidence = 1;
     assert_eq!(
-        effective_points(&jobs[0], &archived).unwrap(),
+        effective_points(&jobs[0], &archived),
+        Err(MemoryError::Conflict)
+    );
+    assert_eq!(
+        effective_points_reader(&jobs[0], &reader(2))
+            .unwrap()
+            .points,
         vec![point("e-1")]
     );
     let mut rewritten = snapshot(2);
@@ -221,12 +227,16 @@ async fn restart_preserves_completed_summary_and_interrupts_without_replaying_co
             .is_none()
     );
     assert_eq!(writes, store.writes.load(Ordering::SeqCst));
-    // 下一批次继承旧观点：被引用的第 1 条已归档，逐字副本取自旧批次。
+    // 下一批次继承旧观点：归档来源由完整流核对，不采用旧副本猜测。
     let mut third = snapshot(3);
     third.evidence.remove(0);
     third.archived_evidence = 1;
+    assert_eq!(
+        restored.reserve(&third, 101, "v1", options()),
+        Err(MemoryError::Conflict)
+    );
     let next = restored
-        .reserve(&third, 101, "v1", options())
+        .reserve_reader(&third.scope, &reader(3), 101, "v1", options())
         .unwrap()
         .unwrap();
     assert_eq!(next.previous, vec![point("e-1")]);
@@ -236,7 +246,7 @@ async fn restart_preserves_completed_summary_and_interrupts_without_replaying_co
         .unwrap();
     assert!(
         restored
-            .reserve(&third, 103, "v1", options())
+            .reserve_reader(&third.scope, &reader(3), 103, "v1", options())
             .unwrap()
             .is_none()
     );
@@ -622,5 +632,195 @@ async fn paged_summary_respects_revocation_without_reintroducing_the_old_point()
     assert!(batch.previous.is_empty());
     assert_eq!(batch.sources.len(), 1);
     assert_eq!(batch.sources[0].evidence_id, "e-2");
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn effective_context_scans_exact_archived_sources_and_refuses_missing_changed_or_late_failed_data()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let (kernel, admin) = open(Store::open(root.path())).await;
+    let batch = admin
+        .reserve(&snapshot(1), 10, "v1", options())
+        .unwrap()
+        .unwrap();
+    admin.finish(&batch, 11, Ok(vec![point("e-1")])).unwrap();
+    let job = admin.latest_completed(&batch.scope).unwrap().unwrap();
+    let source = reader(6000);
+    let effective = effective_points_reader(&job, &source).unwrap();
+    assert_eq!(effective.source_revision, 6000);
+    assert_eq!(effective.points, vec![point("e-1")]);
+    assert_eq!(
+        source.reads.load(Ordering::SeqCst),
+        6000,
+        "来源命中后仍验证末页，且不读取全快照"
+    );
+    let mut source = reader(65);
+    source.fail_after = Some(64);
+    assert_eq!(
+        effective_points_reader(&job, &source).err(),
+        Some(MemoryError::Storage)
+    );
+    let mut source = reader(2);
+    let mut values = snapshot(2).evidence;
+    values[0].at_ms += 1;
+    source.fixed = Some(values);
+    assert_eq!(
+        effective_points_reader(&job, &source).err(),
+        Some(MemoryError::Conflict)
+    );
+    let mut source = reader(1);
+    let mut missing = snapshot(1).evidence;
+    missing[0].id = "different-evidence".into();
+    source.fixed = Some(missing);
+    assert_eq!(
+        effective_points_reader(&job, &source).err(),
+        Some(MemoryError::Conflict),
+        "有别的归档条目不证明本条存在"
+    );
+    let mut source = reader(1);
+    source.summary.scope.user_id = "other".into();
+    assert_eq!(
+        effective_points_reader(&job, &source).err(),
+        Some(MemoryError::CorruptState)
+    );
+    kernel.stop_all().await.unwrap();
+    assert_eq!(
+        admin.latest_completed(&batch.scope).err(),
+        Some(MemoryError::Unavailable)
+    );
+}
+
+#[tokio::test]
+async fn real_archive_sources_remain_verifiable_after_hot_eviction_and_restart() {
+    use eve_memory_plugin::{ArchivePolicy, FileEvidenceArchive, MemoryPlugin};
+    use eve_plugin_api::ServiceId;
+    use eve_session_api::{SESSION_SERVICE_ID, SessionKey, SessionServiceHandle};
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(root.path());
+    let archive = Arc::new(FileEvidenceArchive::open(root.path().join("evidence")).unwrap());
+    let policy = ArchivePolicy {
+        trigger_evidence: 4,
+        pressure_evidence: 8,
+        keep_recent: 1,
+        pressure_keep_recent: 1,
+        min_age_ms: 0,
+        min_chunk: 2,
+        max_chunk_evidence: 2,
+        ..ArchivePolicy::default()
+    };
+    let scope = snapshot(0).scope;
+    let key = SessionKey::new(&scope.session_id, &scope.user_id).unwrap();
+    let open_all = || {
+        let backends = KernelServices {
+            state: store.clone(),
+            ..KernelServices::default()
+        };
+        let registry = backends.registry.clone();
+        let kernel = Kernel::with_services(backends);
+        let memory = MemoryPlugin::new()
+            .unwrap()
+            .with_archive(archive.clone(), policy.clone())
+            .unwrap();
+        let admin = memory.controller();
+        let summary = ConversationSummaryPlugin::new().unwrap();
+        let summaries = summary.controller();
+        kernel
+            .register(Box::new(eve_session_plugin::SessionPlugin::new().unwrap()))
+            .unwrap();
+        kernel.register(Box::new(memory)).unwrap();
+        kernel.register(Box::new(summary)).unwrap();
+        (kernel, registry, admin, summaries)
+    };
+    let (kernel, registry, memory, summaries) = open_all();
+    kernel.start_all().await.unwrap();
+    let sessions = registry
+        .get(&ServiceId::new(SESSION_SERVICE_ID).unwrap())
+        .unwrap()
+        .unwrap()
+        .value
+        .downcast::<SessionServiceHandle>()
+        .unwrap()
+        .0
+        .clone();
+    for number in 1..=8 {
+        let text = format!("第{number}次交流：我喜欢 Mindustry，但不知道怎么创作模组");
+        let started = sessions
+            .begin(eve_session_api::SessionInput {
+                key: key.clone(),
+                text: text.clone(),
+            })
+            .unwrap();
+        sessions
+            .complete(
+                &started.lease,
+                vec![
+                    eve_llm_api::ChatMessage::text(eve_llm_api::ChatRole::User, &text),
+                    eve_llm_api::ChatMessage::text(
+                        eve_llm_api::ChatRole::Assistant,
+                        "已送达的助手内容",
+                    ),
+                ],
+            )
+            .unwrap();
+        let saved = sessions.snapshot(&key).unwrap().unwrap();
+        memory
+            .import_completed(
+                &scope,
+                number - 1,
+                CompletedInteraction {
+                    evidence_id: format!("e-{number}"),
+                    message_id: format!("m-{number}"),
+                    at_ms: number,
+                    snapshot: saved,
+                    turn_id: number,
+                },
+            )
+            .unwrap();
+    }
+    let reader = memory.reader(scope.clone()).unwrap();
+    let hot = reader.snapshot().unwrap();
+    assert!(hot.archived_evidence > 0);
+    assert!(!hot.evidence.iter().any(|e| e.id == "e-1"));
+    let batch = summaries
+        .reserve_reader(&scope, reader.as_ref(), 100, "v1", options())
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.consumed_ids, vec!["e-1"]);
+    summaries
+        .finish(&batch, 101, Ok(vec![point("e-1")]))
+        .unwrap();
+    let latest = summaries.latest_completed(&scope).unwrap().unwrap();
+    assert_eq!(effective_points(&latest, &hot), Err(MemoryError::Conflict));
+    assert_eq!(
+        effective_points_reader(&latest, reader.as_ref())
+            .unwrap()
+            .points,
+        vec![point("e-1")]
+    );
+    let before = store.writes.load(Ordering::SeqCst);
+    assert!(!archive.list().unwrap().is_empty());
+    drop(reader);
+    drop(sessions);
+    kernel.stop_all().await.unwrap();
+    drop(kernel);
+    drop(memory);
+    drop(summaries);
+    drop(registry);
+    let (kernel, _, memory, summaries) = open_all();
+    kernel.start_all().await.unwrap();
+    let latest = summaries.latest_completed(&scope).unwrap().unwrap();
+    let reader = memory.reader(scope.clone()).unwrap();
+    assert_eq!(
+        effective_points_reader(&latest, reader.as_ref())
+            .unwrap()
+            .points,
+        vec![point("e-1")]
+    );
+    assert_eq!(
+        store.writes.load(Ordering::SeqCst),
+        before,
+        "只读重启与查询不改写来源和摘要账本"
+    );
     kernel.stop_all().await.unwrap();
 }
