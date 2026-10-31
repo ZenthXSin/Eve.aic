@@ -83,6 +83,7 @@ mod qq_tools;
 mod qq_triggers;
 mod qq_vision;
 mod qqbot;
+mod record_json_page;
 mod segment_advice;
 mod segment_commands;
 mod services;
