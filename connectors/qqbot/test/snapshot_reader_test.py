@@ -1,5 +1,6 @@
 """验收观察器遇到 Windows 快照替换竞争时有界等待，真实损坏仍失败。"""
 import ctypes
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -53,6 +54,26 @@ class SnapshotReaderTest(unittest.TestCase):
     def test_absent_initial_snapshot_is_empty(self):
         self.path.unlink()
         self.assertEqual(self.reader.documents(), {})
+
+    def test_cold_learning_reader_uses_snapshot_parent_without_optional_work_directory(self):
+        body = json.dumps({"job": {"status": "Completed"}}).encode()
+        digest = hashlib.sha256(body).hexdigest()
+        archive = self.path.parent / "learning-archive"
+        archive.mkdir()
+        record = archive / (digest + ".json")
+        record.write_bytes(body)
+        index = {"format_version": 2, "kind": "jobs", "records": [{"hash": digest, "bytes": len(body)}]}
+        self.path.write_text(json.dumps({"version": 1, "entries": {
+            "eve.learning": {"learning.v1": list(json.dumps(index).encode())}}}), encoding="utf8")
+        before = self.path.read_bytes()
+        self.assertFalse(hasattr(self.reader, "work"))
+        self.assertEqual(self.reader.documents()["eve.learning"]["learning.v1"],
+                         {"format_version": 1, "jobs": [{"job": {"status": "Completed"}}]})
+        record.write_bytes(b"corrupt")
+        with self.assertRaises(AssertionError):
+            self.reader.documents()
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(record.read_bytes(), b"corrupt")
 
     @unittest.skipUnless(os.name == "nt", "Windows 文件共享语义")
     def test_real_windows_exclusive_handle_is_released_before_retry(self):
