@@ -373,6 +373,7 @@
       const row = node("div", "readiness-role");
       const [label, style] = role.state === "responsive" ? ["可响应", "good"] : role.state === "failing" ? ["请求失败", "bad"] : ["尚未验证", ""];
       const parts = [`请求 ${count(role.requests)} 次`, `失败 ${count(role.failures)} 次`];
+      if (role.configured_model) parts.push(`配置模型 ${text(role.configured_model)}`);
       if (role.consecutive_failures > 0) parts.push(`连续失败 ${count(role.consecutive_failures)} 次`);
       const failure = role.last_failure;
       if (failure) {
@@ -380,9 +381,19 @@
         parts.push(`最近失败：${text(failureLabels[failure.kind], "未知类别")}${status}，${goalDate(failure.at_ms)}`);
       }
       if (Number.isFinite(role.last_success_at_ms)) parts.push(`最近成功：${goalDate(role.last_success_at_ms)}`);
-      if (role.state === "unverified") parts.push("本进程还没有这项用途的请求");
+      if (role.state === "unverified") parts.push("本进程尚无这项用途的请求结局");
       const limit = role.output_limit;
       parts.push(limit ? limitText(limit.max_output_tokens, limit.key, limit.source) : "单次输出上限无法读取");
+      const admission = role.admission;
+      if (admission) {
+        const name = admission.role === "auxiliary_small" ? "辅助模型" : "主模型";
+        if (Number.isInteger(admission.active) && Number.isInteger(admission.waiting)) {
+          parts.push(`共享${name}并发：在途 ${count(admission.active)}，等待 ${count(admission.waiting)}，上限 ${count(admission.observed_limit)}`);
+          if (admission.observed_limit !== admission.configured_limit) parts.push(`新上限 ${count(admission.configured_limit)} 将在后续请求生效`);
+        } else {
+          parts.push(`共享${name}并发上限 ${count(admission.configured_limit)}，尚无准入观测`);
+        }
+      }
       const cache = role.cache;
       if (cache && (cache.reported_requests > 0 || cache.local_requests > 0)) {
         const percent = (value) => `${(value / 100).toFixed(1)}%`;

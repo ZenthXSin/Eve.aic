@@ -97,6 +97,8 @@ impl CoreModelResolver {
 
 /// 面板显示的用途当前模型配置与编辑目标；不含凭据与端点。
 pub(crate) struct ModelSummary {
+    pub(crate) role: Option<ModelRole>,
+    pub(crate) max_concurrent_requests: Option<usize>,
     /// 与展示模型相同的一致性配置修订及实际修改目标。
     pub(crate) config_revision: u64,
     pub(crate) model_namespace: &'static str,
@@ -133,6 +135,11 @@ pub(crate) fn summary(
         None => (config::OPENAI_NAMESPACE, "model".into()),
     };
     Ok(ModelSummary {
+        role: captured.selected_role,
+        max_concurrent_requests: captured
+            .profile
+            .as_ref()
+            .map(|profile| profile.max_concurrent_requests),
         config_revision: captured.provider.revision,
         model_namespace,
         model_field,
@@ -376,14 +383,31 @@ impl LlmModelResolver for CoreModelResolver {
         if let Some(observer) = usage {
             provider = Arc::new(eve_model_health::PrefixProbe::new(provider, role, observer));
         }
+        if captured.natural_style {
+            provider = Arc::new(crate::dialogue::NaturalDialogue(provider));
+        }
+        // 候选 Provider 与凭据均有效后才调整共享准入，坏配置不能放宽旧调用的上限。
+        let gate = captured
+            .selected_role
+            .zip(captured.profile.as_ref())
+            .map(|(role, profile)| {
+                crate::model_concurrency::gate(
+                    &self.settings,
+                    role,
+                    profile.max_concurrent_requests,
+                    captured.provider.revision,
+                )
+            })
+            .transpose()?;
+        // 等待在 PrefixProbe 之外：未准入不能被记成已发出的请求前缀。
+        if let Some(gate) = gate {
+            provider = gate.wrap(provider);
+        }
         let selected = ModelSelection {
             provider_timeout,
-            provider: if captured.natural_style {
-                Arc::new(crate::dialogue::NaturalDialogue(provider))
-            } else {
-                provider
-            },
+            provider,
         };
+
         *cached = Some(CachedModel {
             captured,
             credential_version: credential.version(),

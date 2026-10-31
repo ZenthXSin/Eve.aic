@@ -95,6 +95,9 @@ pub enum ModelState {
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelRoleHealth {
     pub role: String,
+    /// 当前配置，不代表在途旧快照已经切换。
+    pub configured_model: Option<String>,
+    pub configured_protocol: Option<String>,
     pub state: ModelState,
     pub requests: u64,
     pub failures: u64,
@@ -103,8 +106,20 @@ pub struct ModelRoleHealth {
     pub last_failure: Option<ModelFailureView>,
     /// 该用途的单次输出上限；配置读取失败时为空。
     pub output_limit: Option<OutputLimitView>,
+    /// 主/辅角色共享准入；无角色或尚未观测时不伪造活动计数。
+    pub admission: Option<ModelAdmissionView>,
     /// 提示缓存统计；本进程还没有请求时各项为零。
     pub cache: CacheView,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelAdmissionView {
+    pub role: String,
+    pub configured_limit: usize,
+    pub configuration_revision: u64,
+    pub observed_limit: Option<usize>,
+    pub observed_revision: Option<u64>,
+    pub active: Option<usize>,
+    pub waiting: Option<usize>,
 }
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CacheView {

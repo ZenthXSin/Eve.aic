@@ -5,6 +5,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import developer_tools_test as developer
+import memory_test
 from dialogue_tools_test import text_response, tool_response
 
 
@@ -123,6 +124,35 @@ class ModelSwitchAcceptance(developer.DeveloperAcceptance):
         self.callback = lambda body: text_response('模型=' + body['model'])
         self.enabled(self.send(self.message('unused-bad-key', '普通对话继续', expected='模型=direct-a')),
                      env_extra={'EVE_AUXILIARY_API_KEY': 'invalid synthetic key'})
+        self.assertEqual(len(self.kind('chat')), 1)
+
+    def test_primary_role_active_request_is_visible_without_changing_configuration(self):
+        self.response_gates[('chat', 1)] = 'release-concurrency'
+        self.callback = lambda body: text_response('完成：' + self.text(body))
+        first = self.message('shared-first', '第一条', expected='完成：第一条')
+
+        def admission():
+            status, body = memory_test.MemoryAcceptance.panel(self, '/api/readiness')
+            self.assertEqual(status, 200, body)
+            return next(r['admission'] for r in body['roles'] if r['role'] == 'dialogue')
+
+        def inspect_active():
+            configuration = self.work / 'state/configuration/config.json'
+            before = configuration.read_bytes() if configuration.exists() else None
+            seen = admission()
+            self.assertEqual((seen['role'], seen['configured_limit'], seen['observed_limit']), ('primary', 1, 1))
+            self.assertEqual((seen['active'], seen['waiting']), (1, 0))
+            self.assertEqual(len(self.kind('chat')), 1)
+            self.assertEqual(configuration.read_bytes() if configuration.exists() else None, before, '诊断读取不修改配置')
+
+        def settled():
+            self.assertEqual((admission()['active'], admission()['waiting']), (0, 0))
+
+        self.enabled([{'send': first}, {'wait_file': str(self.arrived('chat', 1))},
+                      *self.checkpoint('active'), {'touch': str(self.gate('release-concurrency'))},
+                      self.wait_reply(first['id']), self.wait_receipt(first['id']),
+                      *self.checkpoint('settled')], role=True, panel=True,
+                     checkpoints={'active': inspect_active, 'settled': settled})
         self.assertEqual(len(self.kind('chat')), 1)
 
     def test_ordinary_user_and_invalid_arguments_cannot_change_configuration(self):

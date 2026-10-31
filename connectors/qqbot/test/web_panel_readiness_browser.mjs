@@ -13,7 +13,8 @@ assert.ok(url && token, "需要 EVE_PANEL_URL 与 EVE_PANEL_TOKEN");
 const artifacts = process.env.EVE_WEB_ARTIFACTS || path.join(os.tmpdir(), "eve-web-browser-artifacts");
 fs.mkdirSync(artifacts, { recursive: true });
 
-const browser = await chromium.launch({ headless: true });
+const browser = await chromium.launch({ headless: true,
+  ...(process.env.EVE_TEST_BROWSER ? { executablePath: process.env.EVE_TEST_BROWSER } : {}) });
 try {
   const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
   const page = await context.newPage();
@@ -27,9 +28,10 @@ try {
   await page.locator("#console-view").waitFor({ state: "visible" });
   await page.waitForFunction(() => (document.querySelector("#readiness-roles")?.textContent || "").includes("请求失败"));
   const readiness = await page.locator("#readiness").textContent();
-  for (const expected of ["对话工具", "主模型", "单次输出上限", "provider.openai.max_output_tokens", "视觉", "未配置",
+  for (const expected of ["对话工具", "主模型", "单次输出上限", "runtime.models.primary_max_output_tokens", "视觉", "未配置",
     "对话", "请求失败", "额度不足", "HTTP 402", "请求 1 次", "失败 1 次", "重启后清零",
-    "单次输出上限 1,500", "runtime.model_uses.dialogue_max_output_tokens（环境变量）"]) {
+    "单次输出上限 1,500", "runtime.model_uses.dialogue_max_output_tokens（环境变量）",
+    "共享主模型并发：在途 0，等待 0，上限 1", "配置模型 browser-role-fixture"]) {
     assert.ok(readiness.includes(expected), `就绪区块缺少：${expected}`);
   }
   assert.ok(!readiness.includes("local provider unavailable"), "不显示供应商错误正文");

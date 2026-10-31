@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/model-concurrency",
     "crates/model-credentials",
     "crates/context-api",
     "crates/context-plugin",

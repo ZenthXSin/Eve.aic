@@ -200,6 +200,8 @@ class MessageJudgeAcceptance(unittest.TestCase):
                    EVE_OPENAI_MODEL_ROLE="primary", EVE_MODELS_PRIMARY_ENABLED="true",
                    EVE_MODELS_PRIMARY_PROVIDER="openai", EVE_MODELS_PRIMARY_MODEL="test-primary-role",
                    EVE_MODELS_PRIMARY_MAX_OUTPUT_TOKENS="256", EVE_MODELS_PRIMARY_TIMEOUT_MS="10000",
+                   # 旧分类场景故意让主对话等待同时分类，需显式提供两个主模型位置。
+                   EVE_MODELS_PRIMARY_MAX_CONCURRENT_REQUESTS="2",
                    EVE_JEV_API_KEY="test-jev-secret", EVE_JEV_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
                    EVE_MODELS_JEV_ENABLED="true", EVE_MODELS_JEV_PROVIDER="jev",
                    EVE_MODELS_JEV_MODEL="test-jev-model", EVE_MODELS_JEV_TIMEOUT_MS="10000",
