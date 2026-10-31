@@ -1,8 +1,7 @@
 //! 主动压缩仅修改请求副本；完整历史、工具回执和当前任务控制状态始终保留。
 use eve_llm_api::{
     ChatMessage, ChatRole, ContextCompactionPolicy, ContextScope, ContextSnapshot, HistoryDigest,
-    HistoryDigests, LlmError, MAX_HISTORY_DIGEST_BYTES, ModelRequest, ToolDefinition,
-    history_turns,
+    HistoryDigests, LlmError, MAX_HISTORY_DIGEST_BYTES, ToolDefinition, history_turns,
 };
 
 const HISTORY: &str = "[宿主上下文压缩摘要：历史]";
@@ -11,13 +10,51 @@ const CURRENT: &str = "[宿主上下文压缩摘要：本轮已执行工具]";
 /// 无 Grok 官方本地分词器时的保守估算：ASCII 每四字节一 token，其他字符每字两 token。
 /// 序列化整个消息与工具定义，包含协议开销；不是厂商计费 token 数。
 pub(crate) fn estimate<T: serde::Serialize + ?Sized>(value: &T) -> Result<usize, LlmError> {
-    let json =
-        serde_json::to_string(value).map_err(|_| LlmError::Context("上下文大小无法估算".into()))?;
-    let ascii = json.bytes().filter(u8::is_ascii).count();
-    let non_ascii = json.chars().filter(|c| !c.is_ascii()).count();
-    Ok(ascii
+    let mut count = JsonCharacters::default();
+    serde_json::to_writer(&mut count, value)
+        .map_err(|_| LlmError::Context("上下文大小无法估算".into()))?;
+    Ok(count
+        .ascii
         .div_ceil(4)
-        .saturating_add(non_ascii.saturating_mul(2)))
+        .saturating_add(count.non_ascii.saturating_mul(2)))
+}
+
+/// JSON 序列化器输出合法 UTF-8；每个非 ASCII 字符恰有一个首字节，不受 write 分片边界影响。
+#[derive(Default)]
+struct JsonCharacters {
+    ascii: usize,
+    non_ascii: usize,
+}
+impl std::io::Write for JsonCharacters {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let overflow = || std::io::Error::other("上下文字符计数溢出");
+        let ascii = self
+            .ascii
+            .checked_add(bytes.iter().filter(|byte| byte.is_ascii()).count())
+            .ok_or_else(overflow)?;
+        let non_ascii = self
+            .non_ascii
+            .checked_add(bytes.iter().filter(|byte| **byte >= 0xc0).count())
+            .ok_or_else(overflow)?;
+        self.ascii = ascii;
+        self.non_ascii = non_ascii;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize)]
+struct RequestShape<'a, M: ?Sized> {
+    messages: &'a M,
+    tools: &'a [ToolDefinition],
+}
+pub(crate) fn estimate_request(
+    messages: &[ChatMessage],
+    tools: &[ToolDefinition],
+) -> Result<usize, LlmError> {
+    estimate(&RequestShape { messages, tools })
 }
 
 fn valid(digest: &HistoryDigest, turns: usize) -> bool {
@@ -135,13 +172,13 @@ impl State {
             {
                 index += 2;
             } else {
-                fixed.push(messages[index].clone());
+                fixed.push(&messages[index]);
                 index += 1;
             }
         }
-        estimate(&ModelRequest {
-            messages: fixed,
-            tools: tools.to_vec(),
+        estimate(&RequestShape {
+            messages: &fixed,
+            tools,
         })
     }
 
@@ -183,10 +220,7 @@ impl State {
         scope: Option<&ContextScope>,
         fallback_trigger: Option<usize>,
     ) -> Result<(), LlmError> {
-        let before = estimate(&ModelRequest {
-            messages: messages.clone(),
-            tools: tools.to_vec(),
-        })?;
+        let before = estimate_request(messages, tools)?;
         if before < policy.trigger_tokens {
             return Ok(());
         }
@@ -226,10 +260,7 @@ impl State {
             self.cached = Some(digest.text.clone());
             summary(messages, HISTORY, &digest.text);
         }
-        let now = estimate(&ModelRequest {
-            messages: messages.clone(),
-            tools: tools.to_vec(),
-        })?;
+        let now = estimate_request(messages, tools)?;
         if now > policy.target_tokens {
             messages
                 .iter()
@@ -285,10 +316,7 @@ impl State {
                 summary(messages, CURRENT, &digest.text);
             }
         }
-        let after = estimate(&ModelRequest {
-            messages: messages.clone(),
-            tools: tools.to_vec(),
-        })?;
+        let after = estimate_request(messages, tools)?;
         // 闲聊预算只是更早压缩；固定提示或当前输入本身超过它时，退回主阈值继续，不让本轮失败。
         if after >= policy.trigger_tokens && fallback_trigger.is_none_or(|limit| after >= limit) {
             return Err(LlmError::Context(
@@ -306,8 +334,117 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eve_llm_api::LlmFuture;
+    use eve_llm_api::{LlmFuture, ModelRequest};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    fn original_estimate<T: serde::Serialize + ?Sized>(value: &T) -> usize {
+        let json = serde_json::to_string(value).unwrap();
+        json.bytes()
+            .filter(u8::is_ascii)
+            .count()
+            .div_ceil(4)
+            .saturating_add(
+                json.chars()
+                    .filter(|ch| !ch.is_ascii())
+                    .count()
+                    .saturating_mul(2),
+            )
+    }
+    #[test]
+    fn streamed_estimate_matches_original_json_for_unicode_escaping_and_large_values() {
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!([
+                true,
+                false,
+                0,
+                -2,
+                1.25,
+                "",
+                "ascii",
+                "猫猫",
+                "😀𠀀",
+                "引号\"\\\n\t\u{0}"
+            ]),
+            serde_json::json!({"系统":[{"tool":"echo","arguments":{"text":"猫😀\"\\\n".repeat(100_000)}}],"value":1e100}),
+        ] {
+            assert_eq!(estimate(&value).unwrap(), original_estimate(&value));
+        }
+        struct Reject;
+        impl serde::Serialize for Reject {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("private-serializer-detail"))
+            }
+        }
+        assert_eq!(
+            estimate(&Reject).unwrap_err(),
+            LlmError::Context("上下文大小无法估算".into())
+        );
+    }
+    #[test]
+    fn borrowed_request_shape_matches_owned_request_wire_and_estimate() {
+        let messages = vec![
+            ChatMessage::text(ChatRole::System, "规则\n\""),
+            ChatMessage::text(ChatRole::User, "猫😀".repeat(100_000)),
+        ];
+        let tools = vec![ToolDefinition {
+            name: "echo".into(),
+            description: "说明".into(),
+            argument_schema: serde_json::json!({"type":"object","properties":{"text":{"type":"string"}}}),
+            required_permissions: vec![],
+            concurrency: None,
+        }];
+        let owned = ModelRequest {
+            messages: messages.clone(),
+            tools: tools.clone(),
+        };
+        assert_eq!(
+            serde_json::to_vec(&RequestShape {
+                messages: &messages,
+                tools: &tools
+            })
+            .unwrap(),
+            serde_json::to_vec(&owned).unwrap()
+        );
+        assert_eq!(
+            estimate_request(&messages, &tools).unwrap(),
+            original_estimate(&owned)
+        );
+        let references: Vec<_> = messages.iter().collect();
+        assert_eq!(
+            estimate(&RequestShape {
+                messages: &references,
+                tools: &tools
+            })
+            .unwrap(),
+            original_estimate(&owned)
+        );
+    }
+    #[test]
+    fn utf8_count_survives_write_boundaries_and_cannot_wrap() {
+        use std::io::Write;
+        let text = "a猫😀\n字";
+        for size in 1..=7 {
+            let mut count = JsonCharacters::default();
+            for bytes in text.as_bytes().chunks(size) {
+                count.write_all(bytes).unwrap();
+            }
+            assert_eq!(count.ascii, text.bytes().filter(u8::is_ascii).count());
+            assert_eq!(
+                count.non_ascii,
+                text.chars().filter(|ch| !ch.is_ascii()).count()
+            );
+        }
+        let mut count = JsonCharacters {
+            ascii: usize::MAX,
+            non_ascii: 0,
+        };
+        assert!(count.write_all(b"x").is_err());
+        let mut count = JsonCharacters {
+            ascii: 0,
+            non_ascii: usize::MAX,
+        };
+        assert!(count.write_all("猫".as_bytes()).is_err());
+    }
     struct Digests(AtomicUsize);
 
     #[tokio::test]
