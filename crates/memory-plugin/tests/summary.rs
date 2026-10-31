@@ -1247,3 +1247,91 @@ async fn model_failure_categories_reject_duplicate_keys_and_never_store_model_ou
     }
     kernel.stop_all().await.unwrap();
 }
+
+struct LimitedSummaryArchive {
+    inner: eve_memory_plugin::FileSummaryArchive,
+    limited: std::sync::atomic::AtomicBool,
+}
+impl SummaryArchiveStore for LimitedSummaryArchive {
+    fn get(&self, hash: &str) -> MemoryResult<Vec<u8>> {
+        self.inner.get(hash)
+    }
+    fn put(&self, hash: &str, bytes: &[u8]) -> MemoryResult<()> {
+        if self.limited.load(Ordering::SeqCst) {
+            return Err(MemoryError::LimitReached);
+        }
+        self.inner.put(hash, bytes)
+    }
+}
+#[tokio::test]
+async fn cold_capacity_failure_is_rechecked_without_reopening_or_resetting_consumption() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(&root.path().join("state"));
+    let archive = Arc::new(LimitedSummaryArchive {
+        inner: eve_memory_plugin::FileSummaryArchive::open(root.path().join("archive")).unwrap(),
+        limited: std::sync::atomic::AtomicBool::new(false),
+    });
+    let (kernel, admin) = cold_open(store.clone(), archive.clone()).await.unwrap();
+    for i in 1..=96 {
+        let batch = admin
+            .reserve(&snapshot(i), i, "v1", options())
+            .unwrap()
+            .unwrap();
+        admin.finish(&batch, i, Ok(vec![])).unwrap();
+    }
+    let before = store.get(&owner(), SUMMARY_STATE_KEY).unwrap();
+    archive.limited.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        admin.reserve(&snapshot(97), 97, "v1", options()),
+        Err(MemoryError::LimitReached)
+    ));
+    assert_eq!(store.get(&owner(), SUMMARY_STATE_KEY).unwrap(), before);
+    assert_eq!(admin.jobs(&snapshot(0).scope).unwrap().len(), 96);
+    archive.limited.store(false, Ordering::SeqCst);
+    let batch = admin
+        .reserve(&snapshot(97), 98, "v1", options())
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.sequence, 97);
+    assert_eq!(batch.consumed_ids, vec!["e-97"]);
+    admin.finish(&batch, 99, Ok(vec![])).unwrap();
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_running_prefix_cannot_be_evicted_but_finishing_it_reopens_global_capacity() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(&root.path().join("state"));
+    let archive =
+        Arc::new(eve_memory_plugin::FileSummaryArchive::open(root.path().join("archive")).unwrap());
+    let (kernel, admin) = cold_open(store.clone(), archive).await.unwrap();
+    let mut first = None;
+    for i in 1..=MAX_SUMMARY_JOBS {
+        let mut input = snapshot(1);
+        input.scope.user_id = format!("user-{i}");
+        let batch = admin
+            .reserve(&input, i as u64, "v1", options())
+            .unwrap()
+            .unwrap();
+        if first.is_none() {
+            first = Some(batch);
+        }
+    }
+    let mut extra = snapshot(1);
+    extra.scope.user_id = "overflow".into();
+    let before = store.get(&owner(), SUMMARY_STATE_KEY).unwrap();
+    assert!(matches!(
+        admin.reserve(&extra, 1000, "v1", options()),
+        Err(MemoryError::LimitReached)
+    ));
+    assert_eq!(store.get(&owner(), SUMMARY_STATE_KEY).unwrap(), before);
+    admin.finish(&first.unwrap(), 1001, Ok(vec![])).unwrap();
+    let admitted = admin
+        .reserve(&extra, 1002, "v1", options())
+        .unwrap()
+        .unwrap();
+    assert_eq!(admitted.sequence, 129);
+    assert_eq!(saved_summary(&store)["tail"]["last"], 1);
+    assert_eq!(saved_summary(&store)["jobs"].as_array().unwrap().len(), 128);
+    kernel.stop_all().await.unwrap();
+}
