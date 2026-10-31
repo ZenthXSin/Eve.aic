@@ -200,6 +200,11 @@ impl Cache {
     }
 }
 
+fn first_with_prefix<'a>(names: &'a [String], prefix: &str) -> Option<&'a String> {
+    let position = names.partition_point(|name| name.as_str() < prefix);
+    names.get(position).filter(|name| name.starts_with(prefix))
+}
+
 /// 目录中的不可变分段文件；先写临时文件并同步，再原子改名。只接受本模块生成的文件名，不提供删除。
 pub struct SegmentStore {
     directory: PathBuf,
@@ -234,12 +239,8 @@ impl SegmentStore {
     /// 这一段是否已经写出（按内容摘要匹配，不读文件）。
     pub fn contains(&self, key: &SegmentKey) -> Result<bool, SegmentError> {
         let prefix = key.prefix();
-        Ok(self
-            .names
-            .lock()
-            .map_err(|_| SegmentError::Storage)?
-            .iter()
-            .any(|name| name.starts_with(&prefix)))
+        let names = self.names.lock().map_err(|_| SegmentError::Storage)?;
+        Ok(first_with_prefix(&names, &prefix).is_some())
     }
 
     /// 本作用域、本模型已写出的分段条目；每段都逐字节核对。同一区间有多段时只取内容摘要与 `wanted` 一致的。
@@ -249,21 +250,24 @@ impl SegmentStore {
         scope: &str,
         wanted: &[SegmentKey],
     ) -> Result<Vec<Arc<Vec<IndexEntry>>>, SegmentError> {
-        let names = self
-            .names
-            .lock()
-            .map_err(|_| SegmentError::Storage)?
-            .clone();
-        let mut loaded = Vec::new();
-        for key in wanted {
-            if key.scope != scope || key.profile != profile_key(profile) {
-                return Err(SegmentError::InvalidInput);
+        let selected = {
+            let names = self.names.lock().map_err(|_| SegmentError::Storage)?;
+            let profile = profile_key(profile);
+            let mut selected = Vec::new();
+            for key in wanted {
+                if key.scope != scope || key.profile != profile {
+                    return Err(SegmentError::InvalidInput);
+                }
+                if let Some(name) = first_with_prefix(&names, &key.prefix()) {
+                    selected.push((key, name.clone()));
+                }
             }
-            let prefix = key.prefix();
-            let Some(name) = names.iter().find(|name| name.starts_with(&prefix)) else {
-                continue;
-            };
-            loaded.push(self.read(name, key, profile)?);
+            selected
+        };
+        // 只复制实际匹配的文件名；读文件前释放目录锁，不克隆整份目录。
+        let mut loaded = Vec::with_capacity(selected.len());
+        for (key, name) in selected {
+            loaded.push(self.read(&name, key, profile)?);
         }
         Ok(loaded)
     }
@@ -413,9 +417,8 @@ impl SegmentStore {
         sync_directory(&self.directory).map_err(|_| SegmentError::Storage)?;
         // 另一实例刚创建的相同正文也要进入当前目录视图，不能等重启才可召回。
         let mut names = self.names.lock().map_err(|_| SegmentError::Storage)?;
-        if !names.contains(&name) {
-            names.push(name);
-            names.sort();
+        if let Err(position) = names.binary_search(&name) {
+            names.insert(position, name);
         }
         Ok(())
     }
@@ -484,6 +487,26 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap()
+    }
+    #[test]
+    fn large_sorted_directory_keeps_first_matching_filename_and_missing_prefix_semantics() {
+        let mut names = Vec::new();
+        for index in 0..10_000 {
+            let (_, key, _) = fixture("a", index * 64 + 1);
+            for digest in ["f".repeat(64), "0".repeat(64)] {
+                names.push(format!("{}{digest}.json.zz", key.prefix()));
+            }
+        }
+        names.sort();
+        for index in [0, 1, 128, 4096, 9999, 10_000] {
+            let (_, key, _) = fixture("a", index * 64 + 1);
+            let prefix = key.prefix();
+            let expected = names.iter().find(|name| name.starts_with(&prefix));
+            assert_eq!(first_with_prefix(&names, &prefix), expected);
+        }
+        assert!(first_with_prefix(&names, "a").is_none());
+        assert!(first_with_prefix(&names, "z").is_none());
+        assert!(first_with_prefix(&[], "vectors-").is_none());
     }
     #[test]
     fn byte_eviction_keeps_inflight_values_and_reload_uses_immutable_disk_content() {
