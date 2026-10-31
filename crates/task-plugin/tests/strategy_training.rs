@@ -231,13 +231,68 @@ async fn frozen_sources_generate_once_and_survive_plugin_restart() {
             assert!(guidance.instructions.is_none());
             assert!(guidance.evaluation == contract());
         }
-        strategies.reconcile(&snapshot).unwrap();
-        strategies.reconcile(&snapshot).unwrap();
+        let reader = EvidenceOnly {
+            tasks: snapshot.clone(),
+            requested: std::sync::Mutex::new(Vec::new()),
+        };
+        strategies.reconcile_from(&reader).unwrap();
+        strategies.reconcile_from(&reader).unwrap();
+        {
+            let requested = reader.requested.lock().unwrap();
+            assert_eq!(requested.len(), 2);
+            assert!(requested.iter().all(|keys| keys
+                == &vec![TaskEvidenceKey {
+                    id: finished.id.clone(),
+                    owner: finished.owner.clone()
+                }]));
+        }
         let stored = strategies.snapshot().unwrap();
         assert_eq!(stored.versions.len(), 1);
         assert_eq!(stored.sources.len(), 1);
         assert!(stored.sources[0].extracted);
         assert!(stored.selections.is_empty());
         kernel.stop_all().await.unwrap();
+    }
+}
+
+// 新原生对账只能请求冻结来源；任何退回完整快照或执行操作立即失败。
+struct EvidenceOnly {
+    tasks: TaskSnapshot,
+    requested: std::sync::Mutex<Vec<Vec<TaskEvidenceKey>>>,
+}
+impl TaskAdmin for EvidenceOnly {
+    fn snapshot(&self) -> TaskResult<TaskSnapshot> {
+        panic!("native reconciliation must not load full task bodies")
+    }
+    fn evidence_snapshot(&self, keys: &[TaskEvidenceKey]) -> TaskResult<TaskEvidenceSnapshot> {
+        self.requested.lock().unwrap().push(keys.to_vec());
+        TaskEvidenceSnapshot::select(&self.tasks.tasks, keys)
+    }
+    fn create(&self, _: &TaskOwner, _: TaskSpec, _: &str, _: u64) -> TaskResult<Task> {
+        panic!("no execution")
+    }
+    fn start(&self, _: &str, _: u64) -> TaskResult<Task> {
+        panic!("no execution")
+    }
+    fn checkpoint(&self, _: &str, _: TurnCheckpoint, _: u64, _: u64) -> TaskResult<Task> {
+        panic!("no execution")
+    }
+    fn retry(&self, _: &str, _: u64) -> TaskResult<Task> {
+        panic!("no execution")
+    }
+    fn finish(&self, _: &str, _: TaskEnd, _: TaskUsage, _: u64) -> TaskResult<Task> {
+        panic!("no execution")
+    }
+    fn cancel(&self, _: &str, _: &str, _: u64) -> TaskResult<Task> {
+        panic!("no execution")
+    }
+    fn claim(&self, _: &str, _: DeliveryChannel, _: u64) -> TaskResult<Task> {
+        panic!("no delivery")
+    }
+    fn record_delivery(&self, _: &str, _: DeliveryResult, _: u64) -> TaskResult<Task> {
+        panic!("no delivery")
+    }
+    fn expire(&self, _: &str, _: u64) -> TaskResult<Task> {
+        panic!("no delivery")
     }
 }

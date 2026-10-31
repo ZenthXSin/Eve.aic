@@ -1182,3 +1182,57 @@ async fn scoped_task_directory_omits_heavy_context_and_full_reads_keep_both_iden
     ));
     kernel.stop_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn selected_evidence_is_read_only_frozen_and_closed_after_ambiguous_commit() {
+    let world = World::new();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let alice = tasks
+        .create(&owner("alice"), spec("alice"), "alice-source", 1)
+        .unwrap();
+    let bob = tasks
+        .create(&owner("bob"), spec("bob"), "bob-source", 2)
+        .unwrap();
+    let key = TaskEvidenceKey {
+        id: alice.id.clone(),
+        owner: alice.owner.clone(),
+    };
+    let before = world.raw();
+    let view = tasks.evidence_snapshot(std::slice::from_ref(&key)).unwrap();
+    assert_eq!(view.selected_len(), 1);
+    assert_eq!(view.find(&alice.id).unwrap(), Some(&alice));
+    assert!(matches!(view.find(&bob.id), Err(TaskError::Unavailable)));
+    assert_eq!(
+        world.raw(),
+        before,
+        "reading evidence does not save or claim a task"
+    );
+    assert!(matches!(
+        tasks.evidence_snapshot(&[TaskEvidenceKey {
+            id: alice.id.clone(),
+            owner: bob.owner
+        }]),
+        Err(TaskError::CorruptState)
+    ));
+    let running = tasks.start(&alice.id, 3).unwrap();
+    assert_eq!(
+        view.find(&alice.id).unwrap().unwrap().status,
+        TaskStatus::Queued
+    );
+    assert_eq!(
+        tasks
+            .evidence_snapshot(std::slice::from_ref(&key))
+            .unwrap()
+            .find(&alice.id)
+            .unwrap(),
+        Some(&running)
+    );
+    world.state.fail_after.store(true, Ordering::SeqCst);
+    assert_eq!(tasks.cancel("alice", &alice.id, 4), Err(TaskError::Storage));
+    world.state.fail_after.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        tasks.evidence_snapshot(&[key]),
+        Err(TaskError::Unavailable)
+    ));
+    kernel.stop_all().await.unwrap();
+}

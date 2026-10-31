@@ -36,6 +36,9 @@ impl TaskAdmin for TaskController {
     fn snapshot(&self) -> TaskResult<TaskSnapshot> {
         self.service()?.snapshot()
     }
+    fn evidence_snapshot(&self, keys: &[TaskEvidenceKey]) -> TaskResult<TaskEvidenceSnapshot> {
+        self.service()?.evidence_snapshot(keys)
+    }
     fn scheduling_snapshot(&self) -> TaskResult<TaskSchedulingSnapshot> {
         self.service()?.scheduling_snapshot()
     }
@@ -55,7 +58,7 @@ impl TaskAdmin for TaskController {
     }
     fn reconcile_strategies(&self) -> TaskResult<()> {
         if let Some(strategies) = &self.strategies {
-            strategies.reconcile(&self.snapshot()?)?;
+            strategies.reconcile_from(self)?;
         }
         Ok(())
     }

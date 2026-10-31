@@ -716,12 +716,24 @@ impl TaskStrategyLearning for Stored {
         })
     }
     fn reconcile(&self, tasks: &TaskSnapshot) -> TaskResult<()> {
+        self.reconcile_evidence(tasks)
+    }
+    fn reconcile_from(&self, tasks: &dyn TaskAdmin) -> TaskResult<()> {
+        let keys = self.snapshot()?.evidence_keys()?;
+        let evidence = tasks.evidence_snapshot(&keys)?;
+        self.reconcile_evidence(&evidence)
+    }
+}
+
+impl Stored {
+    fn reconcile_evidence(&self, tasks: &dyn TaskEvidenceReader) -> TaskResult<()> {
         let snapshot = self.snapshot()?;
         let mut completed = Vec::new();
         for selected in &snapshot.selections {
-            match tasks.get(&selected.task_id) {
+            match tasks.find(&selected.task_id)? {
                 Some(task) if selected.observation.is_none() && task.status.finished() => {
-                    if task.owner != selected.assignment.scope.owner
+                    if task.id != selected.task_id
+                        || task.owner != selected.assignment.scope.owner
                         || task_strategy_input(task) != selected.input_sha256
                     {
                         return Err(TaskError::CorruptState);
@@ -751,7 +763,8 @@ impl TaskStrategyLearning for Stored {
                         .as_ref()
                         .ok_or(TaskError::CorruptState)?;
                     // 通知回执后续会变化，不用整条 Task 摘要校验已完成任务。
-                    if task.owner != selected.assignment.scope.owner
+                    if task.id != selected.task_id
+                        || task.owner != selected.assignment.scope.owner
                         || task_strategy_input(task) != selected.input_sha256
                         || (old.reason != "source_evicted"
                             && old.evidence_sha256 != effect_digest(task))
@@ -774,9 +787,10 @@ impl TaskStrategyLearning for Stored {
         }
         let mut source_completed = Vec::new();
         for source in &snapshot.sources {
-            match tasks.get(&source.task_id) {
+            match tasks.find(&source.task_id)? {
                 Some(task) => {
-                    if task.owner != source.scope.owner
+                    if task.id != source.task_id
+                        || task.owner != source.scope.owner
                         || task_strategy_input(task) != source.input_sha256
                     {
                         return Err(TaskError::CorruptState);
@@ -845,7 +859,7 @@ impl TaskStrategyLearning for Stored {
             .iter()
             .filter(|s| !s.extracted && s.observation.is_some())
         {
-            let proposal = match tasks.get(&source.task_id) {
+            let proposal = match tasks.find(&source.task_id)? {
                 Some(task)
                     if source
                         .observation
@@ -934,6 +948,9 @@ impl TaskStrategyLearning for TaskStrategyController {
     }
     fn reconcile(&self, tasks: &TaskSnapshot) -> TaskResult<()> {
         self.service()?.reconcile(tasks)
+    }
+    fn reconcile_from(&self, tasks: &dyn TaskAdmin) -> TaskResult<()> {
+        self.service()?.reconcile_from(tasks)
     }
 }
 pub struct TaskStrategyPlugin {

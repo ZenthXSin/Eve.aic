@@ -162,6 +162,18 @@ impl TaskStrategyLearning for TaskCognition {
     }
     fn reconcile(&self, tasks: &TaskSnapshot) -> TaskResult<()> {
         self.strategies.reconcile(tasks)?;
+        self.reconcile_world(tasks)
+    }
+    fn reconcile_from(&self, tasks: &dyn TaskAdmin) -> TaskResult<()> {
+        self.strategies.reconcile_from(tasks)?;
+        let keys = self.strategies.snapshot()?.evidence_keys()?;
+        let evidence = tasks.evidence_snapshot(&keys)?;
+        self.reconcile_world(&evidence)
+    }
+}
+
+impl TaskCognition {
+    fn reconcile_world(&self, tasks: &dyn TaskEvidenceReader) -> TaskResult<()> {
         let ledger = self.strategies.snapshot()?;
         let world = self.world.snapshot().map_err(world_error)?;
         for trial in world.trials.iter().filter(|t| t.resolution.is_none()) {
@@ -213,7 +225,7 @@ impl TaskStrategyLearning for TaskCognition {
             {
                 return Err(TaskError::CorruptState);
             }
-            let Some(task) = tasks.tasks.iter().find(|t| t.id == task_id) else {
+            let Some(task) = tasks.find(task_id)? else {
                 // 来源已归档且无法核对时，只封存不确定；不重放历史任务。
                 let at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -225,7 +237,8 @@ impl TaskStrategyLearning for TaskCognition {
                     .map_err(world_error)?;
                 continue;
             };
-            if task.owner != strategy_scope.owner
+            if task.id != task_id
+                || task.owner != strategy_scope.owner
                 || task.started_at_ms != Some(prediction.created_at_ms)
             {
                 return Err(TaskError::CorruptState);
