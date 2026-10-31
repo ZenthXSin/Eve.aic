@@ -21,6 +21,7 @@ fn public_tool(name: &str) -> bool {
     matches!(
         name,
         "echo"
+            | "inspect_tool_permission"
             | "inspect_model_runtime"
             | "save_script_plugin"
             | "list_script_plugins"

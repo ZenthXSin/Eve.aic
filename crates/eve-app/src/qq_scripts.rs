@@ -1,4 +1,5 @@
 //! QQ 装配的脚本插件工具适配；叶子工具与直接工具调用共用宿主授权策略。
+mod permission;
 use eve_llm_api::{
     Tool, ToolCall, ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolExecutionError,
     ToolFuture, ToolValidationError,
@@ -138,14 +139,16 @@ impl ScriptTools {
             .map_err(|_| rejected("脚本叶子已装配"))
     }
     pub fn tools(self: &Arc<Self>) -> Vec<Arc<dyn Tool>> {
-        (0..4)
+        let mut tools: Vec<Arc<dyn Tool>> = (0..4)
             .map(|kind| {
                 Arc::new(ScriptTool {
                     service: self.clone(),
                     kind,
                 }) as Arc<dyn Tool>
             })
-            .collect()
+            .collect();
+        tools.push(permission::tool(self.dispatch.clone()));
+        tools
     }
 }
 struct ScriptTool {
@@ -669,6 +672,7 @@ mod tests {
             "create_subagent",
             "save_script_plugin",
             "run_script_plugin",
+            "inspect_tool_permission",
         ] {
             assert!(
                 service.bind_tools(vec![Arc::new(NonLeaf(name))]).is_err(),
