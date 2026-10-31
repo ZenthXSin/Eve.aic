@@ -338,9 +338,9 @@ while True:
         self.assertEqual(self.events.read_text().splitlines(),['old','new'])
         self.assertEqual((self.state/'state.json').read_bytes(),before)
 
-    def launch(self,wait_running=True):
+    def launch(self,wait_running=True,script=SCRIPT):
         self.log=(self.root/'supervisor.log').open('ab')
-        self.process=subprocess.Popen([sys.executable,str(SCRIPT),'--directory',str(self.queue),
+        self.process=subprocess.Popen([sys.executable,str(script),'--directory',str(self.queue),
             '--candidates',str(self.candidates),'--ready-timeout','3','--stop-timeout','3',
             '--drain-timeout','5','--quiet-seconds','.1','--health-seconds','.1',
             '--restart-delay','.05','--restart-window-seconds','10','--',*self.command],env=self.env,
@@ -357,7 +357,7 @@ while True:
                 if predicate(d):return d
             if self.process.poll() is not None:self.fail((self.root/'supervisor.log').read_text(errors='replace'))
             time.sleep(.02)
-        self.fail('supervisor timeout: '+(self.root/'supervisor.log').read_text(errors='replace'))
+        self.fail('supervisor timeout; phase/result: '+repr((d.get('phase'), d.get('result'), d.get('error')) if p.exists() else None)+'; '+(self.root/'supervisor.log').read_text(errors='replace'))
 
     def test_startup_readiness_failure_retries_with_the_same_bounded_recovery_budget(self):
         (self.initial/'AGENT.md').write_text('startup-retry')
@@ -431,6 +431,74 @@ while True:
             self.assertEqual((self.state/'state.json').stat().st_mtime_ns,stamp)
             self.assertEqual(self.events.read_text().splitlines(),['old','new'])
         finally:connection.close()
+
+    def test_negative_idle_cache_is_rechecked_even_if_all_file_stamps_stay_equal(self):
+        import sqlite3
+        wrapper=self.root/'fixed-stamp-supervisor.py'
+        wrapper.write_text('import sys\nsys.path.insert(0, '+repr(str(SCRIPT.parent))+')\nimport self_upgrade_runtime as runtime\nruntime.drain_stamp=lambda path: ()\nraise SystemExit(runtime.main())\n')
+        connection=sqlite3.connect(self.state/'group-observations.sqlite3')
+        try:
+            connection.execute('PRAGMA journal_mode=WAL')
+            connection.execute('CREATE TABLE outbound(status TEXT)')
+            connection.execute("INSERT INTO outbound VALUES ('sending')");connection.commit()
+            self.launch(script=wrapper)
+            request=self.candidate('new');runtime.atomic(self.queue/'request.json',request)
+            self.wait(lambda d:d['phase']=='waiting');time.sleep(.3)
+            self.assertEqual(self.events.read_text().splitlines(),['old'])
+            connection.execute("UPDATE outbound SET status='sent'");connection.commit()
+            self.wait(lambda d:d['result']=='applied')
+            self.assertEqual(self.events.read_text().splitlines(),['old','new'])
+        finally:connection.close()
+
+    def cold_state(self, pending=False):
+        path=self.state/'state.json';state=runtime.read_json(path)
+        document=json.loads(bytes(state['entries']['eve.session']['sessions.v1']))
+        session=document['sessions'][self.session]
+        turn=(next(runtime.session_turns(path,session,2)) if document['format_version']==2 else session['turns'][0])
+        if pending:
+            turn['status']={'state':'Pending'}
+        else:
+            turn['status']={'state':'Completed','messages':[{'role':'User','text':turn['input']},{'role':'Assistant','text':'已提交升级'}]}
+        raw=json.dumps(turn,ensure_ascii=False).encode();digest=hashlib.sha256(raw).hexdigest()
+        directory=self.state/'session-archive';directory.mkdir(exist_ok=True)
+        (directory/(digest+'.json')).write_bytes(raw)
+        session['turns']=[dict(hash=digest,bytes=len(raw))];session['revision']=1 if pending else 2
+        document['format_version']=2
+        state['entries']['eve.session']['sessions.v1']=list(json.dumps(document).encode())
+        runtime.atomic(path,state)
+        return directory/(digest+'.json')
+
+    def test_cold_session_real_supervisor_switches_and_backs_up_exact_original_files(self):
+        cold=self.cold_state();before=cold.read_bytes()
+        self.launch();request=self.candidate('new');runtime.atomic(self.queue/'request.json',request)
+        self.wait(lambda d:d['result']=='applied')
+        self.assertEqual(self.events.read_text().splitlines(),['old','new'])
+        self.assertEqual(cold.read_bytes(),before)
+        backups=list((self.queue/'backups').glob('*/session-archive/'+cold.name))
+        self.assertEqual(len(backups),1);self.assertEqual(backups[0].read_bytes(),before)
+
+    def test_cold_session_pending_missing_tampered_revision_and_symlink_never_open_gate(self):
+        request={'session_id':self.session,'requested_by':self.session,'turn_id':1}
+        path=self.state/'state.json'
+        self.cold_state(pending=True)
+        self.assertFalse(runtime.delivery_gate(path,request));self.assertFalse(runtime.runtime_idle_gate(path))
+        cold=self.cold_state();raw=cold.read_bytes();before=path.read_bytes()
+        cold.write_bytes(b'corrupt')
+        with self.assertRaises(ValueError):runtime.delivery_gate(path,request)
+        self.assertEqual(path.read_bytes(),before);cold.write_bytes(raw)
+        cold.unlink()
+        with self.assertRaises(ValueError):runtime.runtime_idle_gate(path)
+        cold.write_bytes(raw)
+        if os.name != 'nt':
+            target=self.state/'original-turn.json';target.write_bytes(raw)
+            cold.unlink();cold.symlink_to(target)
+            with self.assertRaises(ValueError):runtime.runtime_idle_gate(path)
+            cold.unlink();cold.write_bytes(raw)
+        state=runtime.read_json(path);document=json.loads(bytes(state['entries']['eve.session']['sessions.v1']))
+        document['sessions'][self.session]['revision']=3
+        state['entries']['eve.session']['sessions.v1']=list(json.dumps(document).encode());runtime.atomic(path,state)
+        with self.assertRaisesRegex(ValueError,'revision'):runtime.delivery_gate(path,request)
+        self.assertEqual(cold.read_bytes(),raw)
 
     def test_malformed_request_is_rejected_with_minimal_evidence_and_old_process_alive(self):
         self.launch();(self.queue/'request.json').write_text('{corrupt')

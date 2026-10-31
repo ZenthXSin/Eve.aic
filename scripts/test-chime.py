@@ -5,6 +5,7 @@
 切换为 quiet 判断器或关闭插话后不再请求模型判断。
 """
 import json
+import self_upgrade_runtime as runtime
 import os
 import pathlib
 import subprocess
@@ -101,8 +102,9 @@ def main():
         judge_input = json.loads(provider.kind("judge")[0]["body"]["messages"][-1]["content"])
         require(judge_input["persona"] == "Eve" and judge_input["recent"][-1]["text"] == "周末去爬山吗", judge_input)
         document = json.loads((state / "state.json").read_text(encoding="utf-8"))
-        sessions = json.loads(bytes(document["entries"]["eve.session"]["sessions.v1"]))["sessions"]
-        turns = [t for s in sessions.values() if s["key"]["session_id"] == "group-1" for t in s["turns"]]
+        sessions = json.loads(bytes(document["entries"]["eve.session"]["sessions.v1"]))
+        turns = [t for s in sessions["sessions"].values() if s["key"]["session_id"] == "group-1"
+                 for t in runtime.session_turns(state / "state.json", s, sessions["format_version"])]
         require(len(turns) == 2 and all(t["status"]["state"] == "Completed" for t in turns), turns)
 
         # 只在被叫到时接话：未被叫到的消息不请求模型判断。
