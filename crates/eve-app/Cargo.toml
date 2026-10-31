@@ -32,6 +32,7 @@ path = "src/bin/memory.rs"
 
 [dependencies]
 eve-model-credentials = { path = "../model-credentials" }
+eve-model-concurrency = { path = "../model-concurrency" }
 eve-context-api = { path = "../context-api" }
 eve-context-plugin = { path = "../context-plugin" }
 eve-subject-api = { path = "../subject-api" }

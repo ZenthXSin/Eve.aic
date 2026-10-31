@@ -236,45 +236,66 @@ impl PanelService for QqPanel {
             .health
             .snapshot()
             .into_iter()
-            .map(|(role, health)| ModelRoleHealth {
-                state: match health.last_succeeded {
-                    None => ModelState::Unverified,
-                    Some(true) => ModelState::Responsive,
-                    Some(false) => ModelState::Failing,
-                },
-                requests: health.requests,
-                failures: health.failures,
-                consecutive_failures: health.consecutive_failures,
-                last_success_at_ms: health.last_success_at_ms,
-                last_failure: health
-                    .last_failure
-                    .map(|(outcome, at_ms)| failure_view(outcome, at_ms)),
-                output_limit: crate::models::summary(settings, Some(&role))
-                    .ok()
-                    .map(|summary| OutputLimitView {
+            .map(|(role, health)| {
+                let summary = crate::models::summary(settings, Some(&role)).ok();
+                let admission = summary.as_ref().and_then(|summary| {
+                    let model_role = summary.role?;
+                    let configured_limit = summary.max_concurrent_requests?;
+                    let observed =
+                        crate::model_concurrency::status(&self.readiness.settings, model_role)
+                            .ok()
+                            .flatten();
+                    Some(ModelAdmissionView {
+                        role: model_role.key().into(),
+                        configured_limit,
+                        configuration_revision: summary.config_revision,
+                        observed_limit: observed.map(|s| s.limit),
+                        observed_revision: observed.map(|s| s.revision),
+                        active: observed.map(|s| s.active),
+                        waiting: observed.map(|s| s.waiting),
+                    })
+                });
+                ModelRoleHealth {
+                    configured_model: summary.as_ref().map(|s| s.model.clone()),
+                    configured_protocol: summary.as_ref().map(|s| s.protocol.into()),
+                    state: match health.last_succeeded {
+                        None => ModelState::Unverified,
+                        Some(true) => ModelState::Responsive,
+                        Some(false) => ModelState::Failing,
+                    },
+                    requests: health.requests,
+                    failures: health.failures,
+                    consecutive_failures: health.consecutive_failures,
+                    last_success_at_ms: health.last_success_at_ms,
+                    last_failure: health
+                        .last_failure
+                        .map(|(outcome, at_ms)| failure_view(outcome, at_ms)),
+                    admission,
+                    output_limit: summary.map(|summary| OutputLimitView {
                         max_output_tokens: summary.max_output_tokens,
                         key: summary.max_output_tokens_key,
                         source: summary
                             .max_output_tokens_source
                             .map(|source| source.as_str().into()),
                     }),
-                cache: eve_web_panel_api::CacheView {
-                    recent_reported_ratio: health.cache.recent_reported_ratio(),
-                    reported_requests: health.cache.reported_requests,
-                    unreported_requests: health.cache.unreported_requests,
-                    input_tokens: health.cache.input_tokens,
-                    cached_tokens: health.cache.cached_tokens,
-                    recent_local_ratio: health.cache.recent_local_ratio(),
-                    local_requests: health.cache.local_requests,
-                    last_break: health.cache.last_break.and_then(|reuse| {
-                        Some(eve_web_panel_api::PrefixBreakView {
-                            first_changed_message: reuse.first_changed_message?,
-                            messages: reuse.messages,
-                            tools_changed: reuse.tools_changed,
-                        })
-                    }),
-                },
-                role,
+                    cache: eve_web_panel_api::CacheView {
+                        recent_reported_ratio: health.cache.recent_reported_ratio(),
+                        reported_requests: health.cache.reported_requests,
+                        unreported_requests: health.cache.unreported_requests,
+                        input_tokens: health.cache.input_tokens,
+                        cached_tokens: health.cache.cached_tokens,
+                        recent_local_ratio: health.cache.recent_local_ratio(),
+                        local_requests: health.cache.local_requests,
+                        last_break: health.cache.last_break.and_then(|reuse| {
+                            Some(eve_web_panel_api::PrefixBreakView {
+                                first_changed_message: reuse.first_changed_message?,
+                                messages: reuse.messages,
+                                tools_changed: reuse.tools_changed,
+                            })
+                        }),
+                    },
+                    role,
+                }
             })
             .collect();
         Ok(Readiness {

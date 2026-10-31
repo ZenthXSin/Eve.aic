@@ -510,6 +510,90 @@ struct ChangingCredentials {
 }
 
 #[tokio::test]
+async fn role_gates_share_configuration_identity_isolate_roles_and_do_not_pin_unused_lanes() {
+    let first_root = tempfile::tempdir().unwrap();
+    let second_root = tempfile::tempdir().unwrap();
+    let mut server = Server::start(vec![]).await;
+    let first = Harness::start(first_root.path(), &server.url, "chat").await;
+    let second = Harness::start(second_root.path(), &server.url, "chat").await;
+    use crate::model_concurrency::{gate, status};
+    assert!(
+        status(&first.settings, ModelRole::AuxiliarySmall)
+            .unwrap()
+            .is_none()
+    );
+    let a = gate(&first.settings, ModelRole::AuxiliarySmall, 2, 0).unwrap();
+    let same = gate(&first.settings.clone(), ModelRole::AuxiliarySmall, 2, 0).unwrap();
+    assert!(Arc::ptr_eq(&a, &same));
+    let other_config = gate(&second.settings, ModelRole::AuxiliarySmall, 2, 0).unwrap();
+    let other_role = gate(&first.settings, ModelRole::Primary, 1, 0).unwrap();
+    assert!(!Arc::ptr_eq(&a, &other_config));
+    assert!(!Arc::ptr_eq(&a, &other_role));
+    assert_eq!(
+        status(&first.settings, ModelRole::AuxiliarySmall)
+            .unwrap()
+            .unwrap()
+            .limit,
+        2
+    );
+    let weak = Arc::downgrade(&a);
+    drop(a);
+    drop(same);
+    assert!(
+        weak.upgrade().is_none(),
+        "目录只持弱引用，不能保留无调用的队列"
+    );
+    assert!(
+        status(&first.settings, ModelRole::AuxiliarySmall)
+            .unwrap()
+            .is_none()
+    );
+    let replacement = gate(&first.settings, ModelRole::AuxiliarySmall, 1, 1).unwrap();
+    assert!(!weak.ptr_eq(&Arc::downgrade(&replacement)));
+    assert!(server.requests.try_recv().is_err());
+    first.stop().await;
+    second.stop().await;
+}
+
+#[tokio::test]
+async fn invalid_candidate_provider_cannot_change_the_existing_shared_concurrency_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let mut server = Server::start(vec![]).await;
+    let h = Harness::start(root.path(), &server.url, "chat").await;
+    let before = crate::model_concurrency::status(&h.settings, ModelRole::Primary)
+        .unwrap()
+        .unwrap();
+    h.update(
+        &[
+            (
+                MODELS_NAMESPACE,
+                "primary_max_concurrent_requests",
+                json!(10),
+            ),
+            (
+                config::OPENAI_NAMESPACE,
+                "base_url",
+                json!("invalid://synthetic"),
+            ),
+        ],
+        ApplyMode::Immediate,
+    );
+    assert!(
+        CoreModelResolver::new(h.settings.clone(), "synthetic-key".into())
+            .resolve()
+            .is_err()
+    );
+    assert_eq!(
+        crate::model_concurrency::status(&h.settings, ModelRole::Primary)
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    assert!(server.requests.try_recv().is_err());
+    h.stop().await;
+}
+
+#[tokio::test]
 async fn independent_auxiliary_endpoint_and_chat_protocol_never_receive_primary_credentials_or_fall_back()
  {
     use eve_llm_api::{ChatMessage, ChatRole, CredentialPurpose, ModelRequest};

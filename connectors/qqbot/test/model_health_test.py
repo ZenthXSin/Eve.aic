@@ -190,7 +190,12 @@ class ModelHealthAcceptance(interest_test.InterestAcceptance):
 
         self.run_eve([*self.send(self.message("payment", PAYMENT, contains="HTTP 402")), *self.checkpoint("browse")],
                      interest=False, panel=True, checkpoints={"browse": browse}, timeout=150,
-                     env_extra={"EVE_MODEL_USE_DIALOGUE_MAX_OUTPUT_TOKENS": str(DIALOGUE_LIMIT)})
+                     env_extra={"EVE_MODEL_USE_DIALOGUE_MAX_OUTPUT_TOKENS": str(DIALOGUE_LIMIT),
+                                "EVE_OPENAI_MODEL_ROLE": "primary",
+                                "EVE_MODELS_PRIMARY_ENABLED": "true",
+                                "EVE_MODELS_PRIMARY_PROVIDER": "openai",
+                                "EVE_MODELS_PRIMARY_MODEL": "browser-role-fixture",
+                                "EVE_MODELS_PRIMARY_MAX_OUTPUT_TOKENS": "2048"})
 
 
 if __name__ == "__main__":

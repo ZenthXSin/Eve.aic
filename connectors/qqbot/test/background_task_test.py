@@ -309,7 +309,40 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.assertEqual(len(self.worker_requests()), 2)
         self.assertEqual(self.tasks(), [], "子代理不进入后台任务账本")
 
-    def test_ten_subagents_execute_concurrently_in_one_tool_batch(self):
+    def test_primary_model_limit_is_shared_by_subagents_and_visible_while_waiting(self):
+        import memory_test
+        self.response_gates[('chat', 2)] = 'release-shared-model'
+        def respond(body):
+            if self.is_worker(body):
+                return text_response('checked ' + self.text(body))
+            results = self.results(body)
+            if not results:
+                return calls(*[(f'limited-{i}', 'run_subagent', {'task': f'check-{i}'}) for i in range(3)])
+            self.assertEqual(len(results), 3)
+            self.assertTrue(all(result['completed'] for result in results))
+            return text_response('三个子代理完成')
+        self.callback = respond
+        def inspect_queue():
+            def state():
+                status, body = memory_test.MemoryAcceptance.panel(self, '/api/readiness')
+                self.assertEqual(status, 200, body)
+                return next(r['admission'] for r in body['roles'] if r['role'] == 'task')
+            self.wait_for(lambda: (state() or {}).get('waiting') == 2, 'subagents did not share the model queue', 10)
+            observed = state()
+            self.assertEqual((observed['active'], observed['waiting'], observed['observed_limit']), (1, 2, 1))
+            self.assertEqual(len(self.worker_requests()), 1, '其余子代理未向模型服务发请求')
+        message = self.message('limited-parallel', '核对三项', expected='三个子代理完成')
+        self.run_eve([{'send': message}, {'wait_file': str(self.arrived('chat', 2))},
+                      *self.checkpoint('queued'), {'touch': str(self.gate('release-shared-model'))},
+                      self.wait_reply(message['id']), self.wait_receipt(message['id'])], panel=True,
+                     checkpoints={'queued': inspect_queue}, env_extra={
+                         'EVE_OPENAI_MODEL_ROLE': 'primary', 'EVE_MODELS_PRIMARY_ENABLED': 'true',
+                         'EVE_MODELS_PRIMARY_PROVIDER': 'openai', 'EVE_MODELS_PRIMARY_MODEL': 'limited-primary',
+                         'EVE_MODELS_PRIMARY_MAX_CONCURRENT_REQUESTS': '1'})
+        self.assertEqual(len(self.worker_requests()), 3)
+        self.assertEqual(len(self.kind('chat')), 5)
+
+    def _exercise_ten_subagents(self, **options):
         condition = threading.Condition()
         entered = []
         def respond(body):
@@ -327,8 +360,17 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
             self.assertTrue(all(result["completed"] for result in results))
             return text_response("十个子代理全部完成")
         self.callback = respond
-        self.run_eve(self.send(self.message("parallel", "并行核对十项", expected="十个子代理全部完成")))
+        self.run_eve(self.send(self.message("parallel", "并行核对十项", expected="十个子代理全部完成")), **options)
         self.assertEqual(len(entered), 10)
+
+    def test_ten_subagents_execute_concurrently_in_one_tool_batch(self):
+        self._exercise_ten_subagents()
+
+    def test_explicit_primary_model_limit_ten_allows_ten_shared_subagent_requests(self):
+        self._exercise_ten_subagents(env_extra={
+            'EVE_OPENAI_MODEL_ROLE': 'primary', 'EVE_MODELS_PRIMARY_ENABLED': 'true',
+            'EVE_MODELS_PRIMARY_PROVIDER': 'openai', 'EVE_MODELS_PRIMARY_MODEL': 'parallel-primary',
+            'EVE_MODELS_PRIMARY_MAX_CONCURRENT_REQUESTS': '10'})
 
     def test_subagents_can_run_serially_with_the_previous_result_as_input(self):
         def respond(body):

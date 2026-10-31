@@ -45,7 +45,7 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def exercise(self, stall, invalid=0, milestones=False):
+    def exercise(self, stall, invalid=0, milestones=False, primary_role=False):
         self.narrations = []
         self.stall = stall
         self.remaining_invalid_digests = invalid
@@ -78,7 +78,10 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
                        "EVE_PROGRESS_TOOL_MILESTONES":str(milestones).lower(),
                        "EVE_OPENAI_STREAM_COMPLETIONS":"true", "EVE_OPENAI_TIMEOUT_SECONDS":"1", "EVE_TRACE_DIALOGUE_TIMING":"true",
                        "EVE_MODELS_PRIMARY_TIMEOUT_MS":"1000", "EVE_MODEL_FIRST_RESPONSE_TIMEOUT_MS":"350",
-                       "EVE_MODEL_STREAM_IDLE_TIMEOUT_MS":"350", "EVE_MODEL_STREAM_TOTAL_TIMEOUT_MS":"3000"})
+                       "EVE_MODEL_STREAM_IDLE_TIMEOUT_MS":"350", "EVE_MODEL_STREAM_TOTAL_TIMEOUT_MS":"3000",
+                       **({"EVE_OPENAI_MODEL_ROLE":"primary", "EVE_MODELS_PRIMARY_ENABLED":"true",
+                           "EVE_MODELS_PRIMARY_PROVIDER":"openai", "EVE_MODELS_PRIMARY_MODEL":"compaction-role",
+                           "EVE_MODELS_PRIMARY_MAX_CONCURRENT_REQUESTS":"1"} if primary_role else {})})
         receipt = self.receipt("compact")
         self.assertEqual([p["text"] for p in receipt["progress"]].count(NOTICE), 1)
         self.assertEqual(sum(f['phase'] == 'compaction' for f in self.narrations), 1,
@@ -109,6 +112,9 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
             self.assertLessEqual(max(batches.values()), 2, "同一批摘要不无限重试")
             if failed:
                 self.assertEqual(len(self.digest_requests()), 2)
+
+    def test_single_primary_slot_allows_progress_digest_and_dialogue_without_deadlock(self):
+        self.exercise(False, primary_role=True)
 
     def test_healthy_digest_stream_outlives_old_total_timeout_and_notifies_once(self):
         self.exercise(False)
