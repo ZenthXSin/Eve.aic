@@ -36,6 +36,12 @@ impl TaskAdmin for TaskController {
     fn snapshot(&self) -> TaskResult<TaskSnapshot> {
         self.service()?.snapshot()
     }
+    fn summaries_for(&self, owner: &TaskOwner) -> TaskResult<Vec<TaskSummary>> {
+        self.service()?.summaries_for(owner)
+    }
+    fn get_owned(&self, owner: &TaskOwner, id: &str) -> TaskResult<Option<Task>> {
+        self.service()?.get_owned(owner, id)
+    }
     fn strategy_guidance(&self, task: &Task) -> TaskResult<Option<TaskStrategyGuidance>> {
         self.strategies
             .as_ref()
