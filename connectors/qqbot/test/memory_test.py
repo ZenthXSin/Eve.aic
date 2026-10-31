@@ -5,7 +5,7 @@
 """
 from fixture_auth import configure_fixture_progress, is_progress_request, progress_fixture_text
 import json
-from fixture_auth import bootstrap_test_admin
+from fixture_auth import bootstrap_test_admin, bootstrap_fixture_groups, expand_learning_archive
 import os
 import pathlib
 import signal
@@ -116,8 +116,9 @@ class MemoryAcceptance(unittest.TestCase):
                     raise
                 time.sleep(0.01)
         document = json.loads(text)
-        return {owner: {key: json.loads(bytes(value)) for key, value in entries.items()}
-                for owner, entries in document["entries"].items()}
+        documents = {owner: {key: json.loads(bytes(value)) for key, value in entries.items()}
+                     for owner, entries in document["entries"].items()}
+        return expand_learning_archive(documents, self.state_path.parent / "learning-archive")
 
     def memory(self):
         return self.documents().get("eve.memory", {}).get("memory.v1")
@@ -226,6 +227,7 @@ class MemoryAcceptance(unittest.TestCase):
         env.update(env_extra or {})
         bootstrap_test_admin(self.work / "state", env, app,
                              users=getattr(self, "fixture_admin_users", ("user-1", "user-2")))
+        bootstrap_fixture_groups(self.work / "state", scenario)
         command = [str(BINARY), "--state-dir", str(self.work / "state"),
             "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
             "--bridge-arg", str(scenario)]

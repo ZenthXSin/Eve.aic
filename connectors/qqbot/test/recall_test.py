@@ -122,8 +122,9 @@ class RecallAcceptance(unittest.TestCase):
         inspector = threading.Thread(target=inspect, daemon=True)
         self.panel_stderr = self.work / f'panel-stderr-{self.runs}'
         sink = self.panel_stderr.open('w')
-        from fixture_auth import bootstrap_test_admin
+        from fixture_auth import bootstrap_test_admin, bootstrap_fixture_groups
         bootstrap_test_admin(self.work / "state", env)
+        bootstrap_fixture_groups(self.work / "state", scenario)
         child = subprocess.Popen(command, env=configure_fixture_progress(env), stdout=subprocess.PIPE,
                                  stderr=sink if panel else subprocess.PIPE, text=True)
         inspector.start()

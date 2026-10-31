@@ -2,7 +2,7 @@
 
 模型与 QQ 都是本地替身；真实平台的全量事件权限及主动发送配额另行观察。
 """
-from fixture_auth import configure_fixture_progress
+from fixture_auth import configure_fixture_progress, bootstrap_fixture_group_ids
 import json
 from contextlib import closing
 import sqlite3
@@ -150,6 +150,7 @@ export class QQBot {
 }
 '''
         (sdk/'index.mjs').write_text(sdk_code.replace('RECORD_PATH',json.dumps(str(record))))
+        bootstrap_fixture_group_ids(self.work / 'state', ['wire-group'])
         self.runs+=1
         env={key:os.environ[key] for key in ('PATH','SystemRoot','SYSTEMROOT','TEMP','TMP') if key in os.environ}
         env.update(QQBOT_APP_SECRET='test-app-secret',QQBOT_APP_ID='1904159860',EVE_OPENAI_API_KEY='test-model-secret',

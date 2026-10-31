@@ -353,11 +353,20 @@ fn provider_executor_shutdown_preserves_durable_state_and_releases_directory_and
                 before.turn_id
             );
             assert!(queued_events.iter().all(|event| !control.accepts(event)));
+            let persisted = if failure_commit_failed {
+                assert_eq!(
+                    rig.service().snapshot(&fixture::key("provider")),
+                    Err(eve_session_api::SessionError::Unavailable)
+                );
+                fixture::durable_snapshot(state_released.upgrade().unwrap().as_ref(), "provider")
+            } else {
+                rig.snapshot("provider")
+            };
             assert_eq!(
-                rig.snapshot("provider").turns[0].status,
+                persisted.turns[0].status,
                 interrupted_session_status(failure_commit_failed)
             );
-            assert!(rig.snapshot("provider").history().is_empty());
+            assert!(persisted.history().is_empty());
             let retained = control.wait(&key);
             rig.stop().await;
             assert_eq!(done(retained).await, report);

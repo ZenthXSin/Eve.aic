@@ -653,7 +653,10 @@ async fn begin_save_failure_never_requests_provider() {
         rig.host.run_turn(input("s", "问题")).await.unwrap_err(),
         SessionRunError::Session(SessionError::Storage)
     );
-    assert!(rig.service().snapshot(&key("s")).unwrap().is_none());
+    assert_eq!(
+        rig.service().snapshot(&key("s")),
+        Err(SessionError::Unavailable)
+    );
     assert!(store.bytes().is_none());
     assert!(provider.requests.lock().unwrap().is_empty());
     rig.stop().await;
@@ -679,27 +682,39 @@ async fn final_save_failure_preserves_reply_and_pending_without_retrying_tools()
     assert_eq!(output.text, "已生成回执回复");
     assert_eq!(output.diagnostics.started_tools, 1);
     assert_eq!(
-        rig.snapshot("s").turns[0].status,
+        durable_snapshot(store.as_ref(), "s").turns[0].status,
         SessionTurnStatus::Pending
     );
     assert_eq!(
         rig.host.run_turn(input("s", "自动重试")).await.unwrap_err(),
-        SessionRunError::Session(SessionError::Busy)
+        SessionRunError::Session(SessionError::Unavailable)
     );
     assert_eq!(provider.requests.lock().unwrap().len(), 2);
     assert_eq!(rig.starts.load(Ordering::SeqCst), 1);
     store.fail.store(false, Ordering::SeqCst);
-    // 调用方明确只重试本地提交，不再调用模型或工具。
-    rig.service()
-        .complete(
+    assert_eq!(
+        rig.service().snapshot(&key("s")),
+        Err(SessionError::Unavailable)
+    );
+    // 只有重新打开并核对持久结果后才能恢复；不能对旧缓存补交。
+    rig.kernel.stop(&id(SESSION_PLUGIN_ID)).await.unwrap();
+    rig.kernel.start(&id(SESSION_PLUGIN_ID)).await.unwrap();
+    assert_eq!(
+        rig.service().complete(
             &TurnLease {
                 key: key("s"),
-                turn_id: 1,
+                turn_id: 1
             },
-            output.transcript,
-        )
-        .unwrap();
-    assert_eq!(rig.snapshot("s").history().len(), 4);
+            output.transcript
+        ),
+        Err(SessionError::StaleTurn)
+    );
+    assert_eq!(
+        rig.snapshot("s").turns[0].status,
+        SessionTurnStatus::Interrupted
+    );
+    assert_eq!(provider.requests.lock().unwrap().len(), 2);
+    assert_eq!(rig.starts.load(Ordering::SeqCst), 1);
     rig.stop().await;
 }
 
@@ -719,7 +734,7 @@ async fn failed_failure_record_keeps_original_failure_and_pending() {
     assert_eq!(error, SessionError::Storage);
     assert!(matches!(failure.error, LlmError::Provider(_)));
     assert_eq!(
-        rig.snapshot("s").turns[0].status,
+        durable_snapshot(store.as_ref(), "s").turns[0].status,
         SessionTurnStatus::Pending
     );
     assert!(rig.logger.snapshot().unwrap().records.is_empty()); // 不是取消，不由 Drop 覆盖。
@@ -742,7 +757,7 @@ async fn cancellation_records_unknown_side_effects_or_preserves_pending_with_dia
         assert!(running.await.unwrap_err().is_cancelled());
         if fail_cancel {
             assert_eq!(
-                rig.snapshot("private-session").turns[0].status,
+                durable_snapshot(store.as_ref(), "private-session").turns[0].status,
                 SessionTurnStatus::Pending
             );
             assert_eq!(store.bytes(), bytes);

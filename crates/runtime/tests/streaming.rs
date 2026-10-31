@@ -166,7 +166,7 @@ async fn commit_failure_retains_output_pending_and_side_effects() {
     assert_eq!(output.text, "回执");
     assert_eq!(output.diagnostics.started_tools, 1);
     assert_eq!(
-        rig.snapshot("one").turns[0].status,
+        durable_snapshot(store.as_ref(), "one").turns[0].status,
         SessionTurnStatus::Pending
     );
     assert_ne!(store.bytes(), before);

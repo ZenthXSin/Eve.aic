@@ -49,7 +49,7 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const DISTILL_GRACE_MS: u64 = 15 * 60 * 1000;
 const MAX_QUOTES: usize = 3;
 const DISABLED: &str = "主动交流未启用。";
-const HELP: &str = "用法：/outreach 查看 Eve 主动邀请的状态；/outreach off 请 Eve 不再主动提起学习进展；/outreach on 恢复。";
+const HELP: &str = "用法：/outreach 查看 Eve 主动邀请的状态；/outreach off 请 Eve 不再发送主动交流或空闲闲聊邀请；/outreach on 恢复。";
 const SHOWN: usize = 3;
 
 fn now_ms() -> Result<u64, AppError> {
@@ -68,6 +68,8 @@ fn prefix(text: &str, limit: usize) -> &str {
 
 /// 后台撰写与回应识别依赖的服务。
 pub(crate) struct Services {
+    pub(crate) conversations: eve_qqbot_plugin::QqConversations,
+    pub(crate) settings: Arc<dyn eve_config_api::ConfigService>,
     pub(crate) outreach: Arc<dyn OutreachAdmin>,
     pub(crate) cognition: Arc<dyn CognitionAdmin>,
     pub(crate) interests: Arc<dyn InterestAdmin>,
@@ -172,6 +174,7 @@ async fn run(
         }
     }
     let mut inviting = true;
+    let mut next_chat_scan = tokio::time::Instant::now();
     loop {
         if *stopped.borrow() {
             return Ok(());
@@ -202,6 +205,24 @@ async fn run(
             }
             continue;
         }
+        if inviting && affordable && tokio::time::Instant::now() >= next_chat_scan {
+            next_chat_scan = tokio::time::Instant::now() + crate::qq_idle_chat::CHAT_SCAN_INTERVAL;
+            if let Some(candidate) = crate::qq_idle_chat::candidate(&services, now_ms()?)? {
+                match services.outreach.begin_chat(
+                    &candidate.owner,
+                    candidate.source,
+                    candidate.facts,
+                    services.composer.version(),
+                    now_ms()?,
+                ) {
+                    Ok(Some(invitation)) => compose(&services, &invitation, &mut stopped).await?,
+                    Ok(None) => {}
+                    Err(OutreachError::LimitReached) => inviting = false,
+                    Err(error) => return Err(error.into()),
+                }
+                continue;
+            }
+        }
         // 余额用尽时回应留在账本中等待；超过回应窗口后不再判断。
         if affordable && listen(&services, &mut stopped).await? {
             continue;
@@ -230,6 +251,21 @@ fn cancel_closed(services: &Services) -> Result<(), AppError> {
         .snapshot()
         .map_err(|_| "主动交流无法读取学习目标")?;
     for invitation in pending {
+        if !invitation.origin.is_goal() {
+            if !crate::qq_idle_chat::still_current(
+                invitation,
+                services.memory.as_ref(),
+                services.settings.as_ref(),
+                now_ms()?,
+            )? {
+                services.outreach.cancel(
+                    &invitation.id,
+                    now_ms()?.max(after(invitation)),
+                    eve_outreach_api::CancelReason::IdleConversationChanged,
+                )?;
+            }
+            continue;
+        }
         let open = cognition
             .state
             .goals
@@ -593,6 +629,9 @@ fn after(invitation: &Invitation) -> u64 {
 
 /// 通道的两个投递点：按宿主策略取出邀请、先保存时机判断与投递尝试，再交给通道发送。
 pub(crate) struct ChannelAdapter {
+    pub(crate) conversations: eve_qqbot_plugin::QqConversations,
+    pub(crate) memory: Arc<dyn MemoryAdmin>,
+    pub(crate) settings: Arc<dyn eve_config_api::ConfigService>,
     pub(crate) outreach: Arc<dyn OutreachAdmin>,
     pub(crate) judge: Arc<dyn TimingJudge>,
     pub(crate) policy: OutreachPolicy,
@@ -610,12 +649,33 @@ fn affordable(gate: &qq_budget::Gate) -> PluginResult<bool> {
         .map_err(|_| PluginError::State("自主运行预算不可用".into()))
 }
 impl QqOutreach for ChannelAdapter {
+    fn ordinary_direct_invitation(&self, id: &str) -> PluginResult<Option<SessionKey>> {
+        let snapshot = self.outreach.snapshot().map_err(plugin_error)?;
+        let Some(invitation) = snapshot
+            .invitations
+            .iter()
+            .find(|i| i.id == id && i.status == InvitationStatus::Delivering)
+        else {
+            return Ok(None);
+        };
+        let eve_outreach_api::InvitationOrigin::IdleChat(source) = &invitation.origin else {
+            return Ok(None);
+        };
+        let key = SessionKey::new(&source.session_id, &invitation.owner)
+            .map_err(|e| PluginError::State(e.to_string()))?;
+        Ok(self
+            .conversations
+            .identity(&key)?
+            .filter(|i| i.source == eve_qqbot_plugin::QqInteractionSource::DirectMessage)
+            .map(|i| i.session))
+    }
+
     fn due(&self, session: &SessionKey) -> PluginResult<bool> {
         let now = self.now()?;
         let snapshot = self.outreach.snapshot().map_err(plugin_error)?;
         Ok(snapshot
             .judgeable_for(&session.user_id, now, &self.policy)
-            .is_some()
+            .is_some_and(|i| i.origin.is_goal())
             && affordable(&self.gate)?)
     }
 
@@ -674,7 +734,10 @@ impl QqOutreach for ChannelAdapter {
     ) -> PluginResult<Option<QqOutreachMessage>> {
         let now = self.now()?;
         let snapshot = self.outreach.snapshot().map_err(plugin_error)?;
-        let Some(invitation) = snapshot.due_for(&session.user_id, now, &self.policy) else {
+        let Some(invitation) = snapshot
+            .due_for(&session.user_id, now, &self.policy)
+            .filter(|i| i.origin.is_goal())
+        else {
             return Ok(None);
         };
         let claimed = self
@@ -699,6 +762,23 @@ impl QqOutreach for ChannelAdapter {
         let Some(invitation) = snapshot.due_proactive(now, &self.policy) else {
             return Ok(None);
         };
+        if !crate::qq_idle_chat::still_current(
+            invitation,
+            self.memory.as_ref(),
+            self.settings.as_ref(),
+            now,
+        )
+        .map_err(|e| PluginError::State(e.to_string()))?
+        {
+            self.outreach
+                .cancel(
+                    &invitation.id,
+                    now.max(after(invitation)),
+                    eve_outreach_api::CancelReason::IdleConversationChanged,
+                )
+                .map_err(plugin_error)?;
+            return Ok(None);
+        }
         let claimed = self
             .outreach
             .claim(
@@ -707,8 +787,15 @@ impl QqOutreach for ChannelAdapter {
                 DeliveryChannel::Proactive,
             )
             .map_err(plugin_error)?;
+        let session = match &claimed.origin {
+            eve_outreach_api::InvitationOrigin::IdleChat(source) => Some(
+                SessionKey::new(&source.session_id, &claimed.owner)
+                    .map_err(|e| PluginError::State(e.to_string()))?,
+            ),
+            _ => None,
+        };
         Ok(claimed.text.map(|text| QqOutreachPush {
-            session: None,
+            session,
             user_id: claimed.owner,
             message: QqOutreachMessage {
                 id: claimed.id,
@@ -863,9 +950,9 @@ impl QqCommandHandler for Commands {
                     .set_quiet(owner, quiet, at)
                     .map_err(|_| failure())?;
                 if quiet {
-                    "好的，之后我不会再主动提起学习进展，直到你发送 /outreach on。".into()
+                    "好的，之后我不再发送学习进展或空闲闲聊邀请，直到你发送 /outreach on。".into()
                 } else {
-                    "好的，学到实际能用的东西时，我会在合适的时候告诉你。".into()
+                    "好的，已恢复主动交流；学习进展和空闲闲聊邀请都会遵守冷却与反馈设置。".into()
                 }
             }
             _ => HELP.into(),
@@ -882,7 +969,7 @@ fn status(
     let mut reply = if snapshot.quiet(owner) {
         "主动邀请：已关闭（发送 /outreach on 恢复）".to_string()
     } else {
-        "主动邀请：开启（有了实际验证的进展时，在合适的时候顺带告诉你）".to_string()
+        "主动邀请：开启（学习进展与空闲闲聊按宿主配置和冷却投递）".to_string()
     };
     let mut invitations: Vec<&Invitation> = snapshot.for_owner(owner).collect();
     if invitations.is_empty() {
@@ -902,7 +989,12 @@ fn status(
             InvitationStatus::Delivering => "发送中",
             InvitationStatus::Delivered => "已送达",
             InvitationStatus::Unknown => "发送时进程退出，是否送达未知，不会重发",
-            InvitationStatus::Cancelled(_) => "学习目标已关闭，已取消",
+            InvitationStatus::Cancelled(eve_outreach_api::CancelReason::GoalClosed) => {
+                "学习目标已关闭，已取消"
+            }
+            InvitationStatus::Cancelled(
+                eve_outreach_api::CancelReason::IdleConversationChanged,
+            ) => "对话已恢复、过期或闲聊已关闭，已取消",
             InvitationStatus::Failed(OutreachFailure::Exhausted) => "多次未能送达，已停止",
             InvitationStatus::Failed(_) => "撰写失败",
             InvitationStatus::Interrupted => "撰写时进程退出，不重放",

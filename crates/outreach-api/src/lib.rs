@@ -56,6 +56,8 @@ pub type OutreachFuture<'a, T> = BoxFuture<'a, OutreachResult<T>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FactKind {
+    /// 宿主可核对的对话时间事实，不推断用户情绪。
+    IdleContext,
     /// 用户自己说过的原话。
     UserQuote,
     /// 实际运行验证过的进展。
@@ -216,6 +218,8 @@ pub struct ResponseJudgement {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CancelReason {
+    /// 用户已回来、邀请过期或宿主关闭了空闲邀请。
+    IdleConversationChanged,
     /// 学习目标已取消或结束，例如用户撤回了兴趣。
     GoalClosed,
 }
@@ -242,6 +246,35 @@ impl InvitationStatus {
     }
 }
 
+/// 闲聊邀请的真实来源；不能充当认知目标或实践验证证据。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdleChatSource {
+    pub session_id: String,
+    pub evidence_id: String,
+    pub last_active_at_ms: u64,
+}
+impl IdleChatSource {
+    pub fn key(&self, owner: &str) -> String {
+        format!(
+            "chat-{}",
+            digest(&["idle-chat-v1", owner, &self.session_id, &self.evidence_id])
+        )
+    }
+}
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum InvitationOrigin {
+    #[default]
+    Goal,
+    IdleChat(IdleChatSource),
+}
+impl InvitationOrigin {
+    pub fn is_goal(&self) -> bool {
+        matches!(self, Self::Goal)
+    }
+}
+
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Invitation {
@@ -249,7 +282,9 @@ pub struct Invitation {
     /// 邀请对象；与学习目标的可见用户相同。
     pub owner: String,
     pub goal_id: String,
-    pub milestone: Milestone,
+    pub milestone: Option<Milestone>,
+    #[serde(default, skip_serializing_if = "InvitationOrigin::is_goal")]
+    pub origin: InvitationOrigin,
     pub facts: Vec<Fact>,
     pub composer_version: String,
     pub created_at_ms: u64,
@@ -476,7 +511,7 @@ impl OutreachSnapshot {
     /// 主动消息受平台配额限制，每条邀请至多主动尝试一次；用户最近的反馈是负面的，
     /// 只等用户自己找 Eve 时再看时机。
     pub fn due_proactive(&self, now_ms: u64, policy: &OutreachPolicy) -> Option<&Invitation> {
-        let after = policy.proactive_after_ms?;
+        let after = policy.proactive_after_ms.unwrap_or(u64::MAX);
         let mut owners: Vec<&str> = self
             .invitations
             .iter()
@@ -490,9 +525,9 @@ impl OutreachSnapshot {
             .filter_map(|owner| self.due_for(owner, now_ms, policy))
             .filter(|invitation| {
                 invitation.proactive_attempts() == 0
-                    && invitation
-                        .pending_since_ms()
-                        .is_some_and(|since| now_ms.saturating_sub(since) >= after)
+                    && invitation.pending_since_ms().is_some_and(|since| {
+                        !invitation.origin.is_goal() || now_ms.saturating_sub(since) >= after
+                    })
             })
             .min_by_key(|invitation| (invitation.composed_at_ms, invitation.id.clone()))
     }
@@ -606,6 +641,17 @@ pub trait OutreachAdmin: Send + Sync {
         composer_version: &str,
         now_ms: u64,
     ) -> OutreachResult<Option<Invitation>>;
+    /// 使用同一持久账本准入普通闲聊；独立来源，不伪造学习目标与实践。
+    fn begin_chat(
+        &self,
+        _owner: &str,
+        _source: IdleChatSource,
+        _facts: Vec<Fact>,
+        _composer_version: &str,
+        _now_ms: u64,
+    ) -> OutreachResult<Option<Invitation>> {
+        Err(OutreachError::Unavailable)
+    }
     /// 保存撰写结果：成功进入 Pending，失败记为 Failed，不重试。
     fn record_composition(
         &self,
@@ -709,7 +755,9 @@ pub fn validate_text(value: &str) -> OutreachResult<()> {
 pub fn validate_facts(facts: &[Fact]) -> OutreachResult<()> {
     if facts.is_empty()
         || facts.len() > MAX_FACTS
-        || !facts.iter().any(|fact| fact.kind == FactKind::Progress)
+        || !(facts.iter().all(|fact| fact.kind == FactKind::IdleContext)
+            || facts.iter().any(|fact| fact.kind == FactKind::Progress)
+                && facts.iter().all(|fact| fact.kind != FactKind::IdleContext))
         || facts.iter().any(|fact| {
             fact.text.trim().is_empty()
                 || fact.text.len() > MAX_FACT_BYTES
@@ -833,10 +881,11 @@ mod tests {
             id: id.into(),
             owner: owner.into(),
             goal_id: format!("goal-{id}"),
-            milestone: Milestone {
+            milestone: Some(Milestone {
                 practice_run_id: "practice-1".into(),
                 skill_id: None,
-            },
+            }),
+            origin: InvitationOrigin::Goal,
             facts: vec![Fact {
                 kind: FactKind::Progress,
                 text: "已验证".into(),

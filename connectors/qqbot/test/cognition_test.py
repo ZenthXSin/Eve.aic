@@ -170,8 +170,9 @@ class CognitionAcceptance(unittest.TestCase):
             command.extend(["--cognition", "--cognition-max-executions", "1"])
         if training:
             command.append("--training")
-        from fixture_auth import bootstrap_test_admin
+        from fixture_auth import bootstrap_test_admin, bootstrap_fixture_groups
         bootstrap_test_admin(self.work / "state", env, app)
+        bootstrap_fixture_groups(self.work / "state", scenario)
         child = subprocess.Popen(command, env=configure_fixture_progress(env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             if cancel_at:

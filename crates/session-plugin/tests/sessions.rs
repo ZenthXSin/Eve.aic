@@ -13,6 +13,7 @@ use std::sync::{
 struct FaultStore {
     memory: MemoryStateStore,
     fail: AtomicBool,
+    fail_after: AtomicBool,
 }
 impl StateStore for FaultStore {
     fn get(&self, namespace: &PluginId, key: &str) -> PluginResult<Option<Vec<u8>>> {
@@ -22,7 +23,11 @@ impl StateStore for FaultStore {
         if self.fail.load(Ordering::SeqCst) {
             return Err(PluginError::State("backend-secret".into()));
         }
-        self.memory.set(namespace, key, value)
+        self.memory.set(namespace, key, value)?;
+        if self.fail_after.load(Ordering::SeqCst) {
+            return Err(PluginError::State("commit-ack-lost".into()));
+        }
+        Ok(())
     }
 }
 fn id() -> PluginId {
@@ -286,30 +291,113 @@ async fn rejects_partial_foreign_and_mismatched_completed_history() {
 }
 
 #[tokio::test]
-async fn commits_before_memory_and_preserves_pending_when_write_fails() {
+async fn write_errors_disable_stale_handles_until_explicit_reopen() {
     let state = Arc::new(FaultStore::default());
-    let (kernel, _, sessions) = open(state.clone()).await;
+    let (kernel, registry, sessions) = open(state.clone()).await;
     state.fail.store(true, Ordering::SeqCst);
     assert_eq!(
         sessions.begin(input("s", "u", "问题")),
         Err(SessionError::Storage)
     );
-    assert!(sessions.snapshot(&key("s", "u")).unwrap().is_none());
+    assert_eq!(
+        sessions.snapshot(&key("s", "u")),
+        Err(SessionError::Unavailable)
+    );
+    assert!(state.get(&id(), SESSION_STATE_KEY).unwrap().is_none());
     state.fail.store(false, Ordering::SeqCst);
-    let lease = sessions.begin(input("s", "u", "问题")).unwrap().lease;
+    assert_eq!(
+        sessions.begin(input("other", "u", "不能覆盖")),
+        Err(SessionError::Unavailable)
+    );
+    kernel.stop(&id()).await.unwrap();
+    kernel.start(&id()).await.unwrap();
+    let fresh = service(&kernel, &registry);
+    let lease = fresh.begin(input("s", "u", "问题")).unwrap().lease;
     let saved = state.get(&id(), SESSION_STATE_KEY).unwrap();
     state.fail.store(true, Ordering::SeqCst);
     assert_eq!(
-        sessions.complete(&lease, simple("问题")),
+        fresh.complete(&lease, simple("问题")),
         Err(SessionError::Storage)
     );
-    let snapshot = sessions.snapshot(&lease.key).unwrap().unwrap();
-    assert_eq!(snapshot.revision, 1);
-    assert_eq!(snapshot.turns[0].status, SessionTurnStatus::Pending);
     assert_eq!(state.get(&id(), SESSION_STATE_KEY).unwrap(), saved);
+    assert_eq!(fresh.snapshot(&lease.key), Err(SessionError::Unavailable));
     state.fail.store(false, Ordering::SeqCst);
-    sessions.complete(&lease, simple("问题")).unwrap();
+    assert_eq!(
+        fresh.complete(&lease, simple("问题")),
+        Err(SessionError::Unavailable)
+    );
+    kernel.stop(&id()).await.unwrap();
+    kernel.start(&id()).await.unwrap();
+    let recovered = service(&kernel, &registry);
+    assert_eq!(
+        recovered.snapshot(&lease.key).unwrap().unwrap().turns[0].status,
+        SessionTurnStatus::Interrupted
+    );
+    assert_eq!(
+        recovered.complete(&lease, simple("问题")),
+        Err(SessionError::StaleTurn)
+    );
     kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn committed_but_unacknowledged_begin_complete_and_fail_cannot_be_overwritten() {
+    for operation in ["begin", "complete", "fail"] {
+        let state = Arc::new(FaultStore::default());
+        let (kernel, registry, sessions) = open(state.clone()).await;
+        let original = if operation != "begin" {
+            Some(sessions.begin(input("s", "u", "不能重放")).unwrap())
+        } else {
+            None
+        };
+        state.fail_after.store(true, Ordering::SeqCst);
+        let failed = match operation {
+            "begin" => sessions.begin(input("s", "u", "不能重放")).map(|_| ()),
+            "complete" => sessions.complete(&original.as_ref().unwrap().lease, simple("不能重放")),
+            _ => sessions.fail(
+                &original.as_ref().unwrap().lease,
+                SessionFailure {
+                    code: SessionFailureCode::Provider,
+                    started_tools: Some(1),
+                    evidence: None,
+                },
+            ),
+        };
+        assert_eq!(failed, Err(SessionError::Storage));
+        let committed = state.get(&id(), SESSION_STATE_KEY).unwrap();
+        state.fail_after.store(false, Ordering::SeqCst);
+        assert_eq!(
+            sessions.begin(input("other", "u", "不得用旧缓存覆盖")),
+            Err(SessionError::Unavailable)
+        );
+        assert_eq!(sessions.list_keys(None, 10), Err(SessionError::Unavailable));
+        assert_eq!(sessions.reset_context(None), Err(SessionError::Unavailable));
+        assert_eq!(state.get(&id(), SESSION_STATE_KEY).unwrap(), committed);
+        kernel.stop(&id()).await.unwrap();
+        kernel.start(&id()).await.unwrap();
+        let recovered = service(&kernel, &registry);
+        let snapshot = recovered.snapshot(&key("s", "u")).unwrap().unwrap();
+        match operation {
+            "begin" => assert_eq!(snapshot.turns[0].status, SessionTurnStatus::Interrupted),
+            "complete" => assert_eq!(
+                snapshot.turns[0].status,
+                SessionTurnStatus::Completed {
+                    messages: simple("不能重放")
+                }
+            ),
+            _ => assert!(matches!(
+                snapshot.turns[0].status,
+                SessionTurnStatus::Failed { .. }
+            )),
+        }
+        let next = recovered.begin(input("s", "u", "明确的新输入")).unwrap();
+        assert_eq!(next.lease.turn_id, 2);
+        assert_eq!(
+            sessions.snapshot(&key("s", "u")),
+            Err(SessionError::Unavailable)
+        );
+        kernel.stop_all().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -622,5 +710,86 @@ async fn recovered_history_keys_are_read_only_and_old_handles_stay_unavailable()
     assert_eq!(history.revision, 2);
     assert_eq!(sessions.list_keys(None, 2), Err(SessionError::Unavailable));
     assert_eq!(state.get(&id(), SESSION_STATE_KEY).unwrap(), saved);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn turn_pages_pin_pending_and_prefix_across_completion_append_reset_and_restart() {
+    let state = Arc::new(MemoryStateStore::default());
+    let (kernel, registry, sessions) = open(state.clone()).await;
+    let own = key("pages", "owner");
+    assert!(sessions.scan_turns(&own).unwrap().is_none());
+    for n in 0..20 {
+        let text = format!("原文{n}");
+        let started = sessions.begin(input("pages", "owner", &text)).unwrap();
+        sessions.complete(&started.lease, simple(&text)).unwrap();
+    }
+    let pending = sessions
+        .begin(input("pages", "owner", "创建游标时在途"))
+        .unwrap();
+    let mut cursor = sessions.scan_turns(&own).unwrap().unwrap();
+    let summary = cursor.summary().clone();
+    assert_eq!(summary.turn_count, 21);
+    assert_eq!(summary.revision, 41);
+    assert!(matches!(
+        sessions.scan_turns(&key("pages", "other")),
+        Err(SessionError::OwnerMismatch)
+    ));
+    let mut observed = cursor.next_page().unwrap();
+    assert_eq!(observed.len(), MAX_SESSION_TURN_PAGE);
+    sessions
+        .complete(&pending.lease, simple("创建游标时在途"))
+        .unwrap();
+    sessions
+        .begin(input("pages", "owner", "游标后新轮次"))
+        .unwrap();
+    sessions.reset_context(Some(&own)).unwrap();
+    observed.extend(cursor.next_page().unwrap());
+    assert!(cursor.next_page().unwrap().is_empty());
+    assert_eq!(observed.len(), 21);
+    assert_eq!(observed.last().unwrap().status, SessionTurnStatus::Pending);
+    SessionSnapshot {
+        key: own.clone(),
+        revision: summary.revision,
+        turns: observed,
+    }
+    .validate()
+    .unwrap();
+    assert_eq!(
+        sessions
+            .scan_turns(&own)
+            .unwrap()
+            .unwrap()
+            .summary()
+            .turn_count,
+        22
+    );
+    let saved = state.get(&id(), SESSION_STATE_KEY).unwrap();
+    kernel.stop(&id()).await.unwrap();
+    assert_eq!(state.get(&id(), SESSION_STATE_KEY).unwrap(), saved);
+    assert!(cursor.next_page().is_err());
+    kernel.start(&id()).await.unwrap();
+    let new = service(&kernel, &registry);
+    assert_eq!(new.snapshot(&own).unwrap().unwrap().turns.len(), 22);
+    assert!(cursor.next_page().is_err());
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn storage_error_also_invalidates_existing_turn_cursors() {
+    let state = Arc::new(FaultStore::default());
+    let (kernel, _, sessions) = open(state.clone()).await;
+    let first = sessions.begin(input("pages", "u", "完成原文")).unwrap();
+    sessions.complete(&first.lease, simple("完成原文")).unwrap();
+    let mut cursor = sessions.scan_turns(&first.lease.key).unwrap().unwrap();
+    let before = state.get(&id(), SESSION_STATE_KEY).unwrap();
+    state.fail.store(true, Ordering::SeqCst);
+    assert_eq!(
+        sessions.begin(input("other", "u", "失败输入")),
+        Err(SessionError::Storage)
+    );
+    assert_eq!(cursor.next_page(), Err(SessionError::Unavailable));
+    assert_eq!(state.get(&id(), SESSION_STATE_KEY).unwrap(), before);
+    state.fail.store(false, Ordering::SeqCst);
     kernel.stop_all().await.unwrap();
 }

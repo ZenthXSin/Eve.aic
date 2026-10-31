@@ -1,4 +1,7 @@
-use crate::strict_json;
+use crate::{
+    archive::{self, Index},
+    strict_json,
+};
 use eve_learning_api::*;
 use eve_memory_api::{
     EvidenceSource, InteractionEvidence, MemoryScope, MemorySnapshot, validate_id, validate_text,
@@ -7,9 +10,9 @@ use eve_plugin_api::{PluginContext, PluginError, PluginResult};
 use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt::Write,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 const FORMAT_VERSION: u32 = 1;
@@ -50,18 +53,116 @@ struct Inner {
     document: Document,
     decisions: DecisionsDocument,
     context: Option<PluginContext>,
+    archive: Option<Arc<dyn LearningArchiveStore>>,
+    job_index: Option<Index>,
+    decision_index: Option<Index>,
+}
+// 兼容公开的全历史操作，但不在两次操作之间保留冷正文。
+// 操作期间仍会加载全账本；分页消费属于后续性能改进，不能宣称恒定峰值内存。
+fn evict(inner: &mut Inner) {
+    if inner.job_index.is_some() {
+        inner.document.jobs = Vec::new();
+    }
+    if inner.decision_index.is_some() {
+        inner.decisions.records = Vec::new();
+    }
+}
+struct WorkingGuard<'a>(MutexGuard<'a, Inner>);
+impl std::ops::Deref for WorkingGuard<'_> {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for WorkingGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        &mut self.0
+    }
+}
+impl Drop for WorkingGuard<'_> {
+    fn drop(&mut self) {
+        evict(&mut self.0);
+    }
+}
+type Decoder<T> = Box<dyn FnMut(serde_json::Value) -> LearningResult<Option<T>> + Send>;
+struct ArchiveCursor<T> {
+    service: Arc<StoredLearning>,
+    scope: MemoryScope,
+    store: Option<Arc<dyn LearningArchiveStore>>,
+    refs: VecDeque<archive::RecordRef>,
+    hot: VecDeque<T>,
+    decode: Decoder<T>,
+    failed: bool,
+}
+impl<T> ArchiveCursor<T> {
+    fn check(&self) -> LearningResult<()> {
+        let inner = self
+            .service
+            .inner
+            .lock()
+            .map_err(|_| LearningError::Unavailable)?;
+        if inner.context.is_none() {
+            return Err(LearningError::Unavailable);
+        }
+        Ok(())
+    }
+}
+impl<T: Send> LearningHistoryCursor<T> for ArchiveCursor<T> {
+    fn scope(&self) -> &MemoryScope {
+        &self.scope
+    }
+    fn next_page(&mut self) -> LearningResult<Vec<T>> {
+        if self.failed {
+            return Err(LearningError::Unavailable);
+        }
+        let result = (|| {
+            self.check()?;
+            let mut page = Vec::new();
+            while page.len() < MAX_LEARNING_PAGE {
+                if let Some(item) = self.hot.pop_front() {
+                    page.push(item);
+                    continue;
+                }
+                let Some(reference) = self.refs.pop_front() else {
+                    break;
+                };
+                let value = archive::load_value(
+                    self.store.as_deref().ok_or(LearningError::Unavailable)?,
+                    &reference,
+                )?;
+                if let Some(item) = (self.decode)(value)? {
+                    page.push(item);
+                }
+            }
+            self.check()?;
+            Ok(page)
+        })();
+        if result.is_err() {
+            self.failed = true;
+            self.refs.clear();
+            self.hot.clear();
+            // 不能把损坏页跳过去，或让其他学习操作继续使用已不可信的存储。
+            let _ = self.service.close();
+        }
+        result
+    }
 }
 pub(super) struct StoredLearning {
     inner: Mutex<Inner>,
 }
 impl StoredLearning {
-    pub(super) fn open(context: PluginContext) -> LearningResult<Self> {
-        let mut document = match context
+    pub(super) fn open(
+        context: PluginContext,
+        archive: Option<Arc<dyn LearningArchiveStore>>,
+    ) -> LearningResult<Self> {
+        let mut job_index = None;
+        let mut decision_index = None;
+        let document = match context
             .state_get(LEARNING_STATE_KEY)
             .map_err(|_| LearningError::Storage)?
         {
             None => Document {
-                format_version: FORMAT_VERSION,
+                format_version: 1,
                 jobs: vec![],
             },
             Some(bytes) => {
@@ -70,96 +171,247 @@ impl StoredLearning {
                 }
                 let value =
                     strict_json::from_slice(&bytes).map_err(|_| LearningError::CorruptState)?;
-                let document: Document =
-                    serde_json::from_value(value).map_err(|_| LearningError::CorruptState)?;
-                if document.format_version != FORMAT_VERSION {
-                    return Err(LearningError::UnsupportedVersion);
+                if value
+                    .get("format_version")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(2)
+                {
+                    let index: Index =
+                        serde_json::from_value(value).map_err(|_| LearningError::CorruptState)?;
+                    let jobs = archive::thaw(
+                        archive
+                            .as_deref()
+                            .ok_or(LearningError::UnsupportedVersion)?,
+                        &index,
+                        "jobs",
+                    )?;
+                    job_index = Some(index);
+                    Document {
+                        format_version: 1,
+                        jobs,
+                    }
+                } else {
+                    let doc: Document =
+                        serde_json::from_value(value).map_err(|_| LearningError::CorruptState)?;
+                    if doc.format_version != FORMAT_VERSION {
+                        return Err(LearningError::UnsupportedVersion);
+                    }
+                    doc
                 }
-                validate_document(&document).map_err(|_| LearningError::CorruptState)?;
-                document
             }
         };
+        validate_document(&document, job_index.is_some())
+            .map_err(|_| LearningError::CorruptState)?;
         let decisions = match context
             .state_get(DECISIONS_STATE_KEY)
             .map_err(|_| LearningError::Storage)?
         {
             None => DecisionsDocument {
-                format_version: FORMAT_VERSION,
+                format_version: 1,
                 records: vec![],
             },
             Some(bytes) => {
-                if bytes.len() > MAX_DECISIONS_STATE_BYTES {
+                if bytes.len() > MAX_STATE_BYTES {
                     return Err(LearningError::CorruptState);
                 }
                 let value =
                     strict_json::from_slice(&bytes).map_err(|_| LearningError::CorruptState)?;
-                let decisions: DecisionsDocument =
-                    serde_json::from_value(value).map_err(|_| LearningError::CorruptState)?;
-                if decisions.format_version != FORMAT_VERSION {
-                    return Err(LearningError::UnsupportedVersion);
+                if value
+                    .get("format_version")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(2)
+                {
+                    let index: Index =
+                        serde_json::from_value(value).map_err(|_| LearningError::CorruptState)?;
+                    let records = archive::thaw(
+                        archive
+                            .as_deref()
+                            .ok_or(LearningError::UnsupportedVersion)?,
+                        &index,
+                        "decisions",
+                    )?;
+                    decision_index = Some(index);
+                    DecisionsDocument {
+                        format_version: 1,
+                        records,
+                    }
+                } else {
+                    let doc: DecisionsDocument =
+                        serde_json::from_value(value).map_err(|_| LearningError::CorruptState)?;
+                    if doc.format_version != FORMAT_VERSION {
+                        return Err(LearningError::UnsupportedVersion);
+                    }
+                    doc
                 }
-                validate_decisions_document(&decisions, &document)
-                    .map_err(|_| LearningError::CorruptState)?;
-                decisions
             }
         };
-        // 必须先读验两个文档；损坏的决策账本不能触发旧批次的恢复写入。
+        validate_decisions_document(&decisions, &document, decision_index.is_some())
+            .map_err(|_| LearningError::CorruptState)?;
+        let mut inner = Inner {
+            document,
+            decisions,
+            context: Some(context),
+            archive,
+            job_index,
+            decision_index,
+        };
+        let mut next = inner.document.clone();
         let mut interrupted = false;
-        for record in &mut document.jobs {
+        for record in &mut next.jobs {
             if record.job.status == JobStatus::Running {
                 record.job.status = JobStatus::Interrupted;
                 interrupted = true;
             }
         }
-        // 先保存中断结局再公开实例，不伪造完成时钟；补做由独立有界准入负责。
+        // 两个账本全部读验通过后，才允许写入重启中断结局。
         if interrupted {
-            let bytes = encode(&document)?;
-            context
-                .state_set(LEARNING_STATE_KEY, bytes)
-                .map_err(|_| LearningError::Storage)?;
+            persist(&mut inner, next)?;
         }
+        evict(&mut inner);
         Ok(Self {
-            inner: Mutex::new(Inner {
-                document,
-                decisions,
-                context: Some(context),
-            }),
+            inner: Mutex::new(inner),
         })
     }
-    fn lock(&self) -> LearningResult<MutexGuard<'_, Inner>> {
+    fn lock(&self) -> LearningResult<WorkingGuard<'_>> {
+        let mut inner = self.inner.lock().map_err(|_| LearningError::Unavailable)?;
+        if inner.context.is_none() {
+            return Err(LearningError::Unavailable);
+        }
+        let loaded = (|| {
+            if let Some(index) = &inner.job_index {
+                inner.document.jobs = archive::thaw(
+                    inner.archive.as_deref().ok_or(LearningError::Unavailable)?,
+                    index,
+                    "jobs",
+                )?;
+            }
+            if let Some(index) = &inner.decision_index {
+                inner.decisions.records = archive::thaw(
+                    inner.archive.as_deref().ok_or(LearningError::Unavailable)?,
+                    index,
+                    "decisions",
+                )?;
+            }
+            validate_document(&inner.document, inner.job_index.is_some())?;
+            validate_decisions_document(
+                &inner.decisions,
+                &inner.document,
+                inner.decision_index.is_some(),
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = loaded {
+            inner.context = None;
+            evict(&mut inner);
+            return Err(error);
+        }
+        Ok(WorkingGuard(inner))
+    }
+    pub(super) fn archived_history(&self) -> LearningResult<bool> {
         let inner = self.inner.lock().map_err(|_| LearningError::Unavailable)?;
         if inner.context.is_none() {
             return Err(LearningError::Unavailable);
         }
-        Ok(inner)
+        Ok(inner.archive.is_some())
     }
-    pub(super) fn snapshot(&self, scope: &MemoryScope) -> LearningResult<LearningSnapshot> {
-        let inner = self.lock()?;
-        scope.validate().map_err(|_| LearningError::InvalidInput)?;
-        Ok(LearningSnapshot {
-            scope: scope.clone(),
-            jobs: inner
-                .document
-                .jobs
-                .iter()
-                .filter(|record| record.job.batch.scope == *scope)
-                .map(|record| record.job.clone())
-                .collect(),
-        })
-    }
-    pub(super) fn decisions(
-        &self,
+    pub(super) fn scan_jobs(
+        self: &Arc<Self>,
         scope: &MemoryScope,
-    ) -> LearningResult<Vec<LearningDecisionRecord>> {
-        let inner = self.lock()?;
+    ) -> LearningResult<Box<dyn LearningHistoryCursor<LearningJob>>> {
         scope.validate().map_err(|_| LearningError::InvalidInput)?;
-        Ok(inner
-            .decisions
-            .records
-            .iter()
-            .filter(|record| record.scope == *scope)
-            .map(|record| record.record.clone())
-            .collect())
+        let inner = self.inner.lock().map_err(|_| LearningError::Unavailable)?;
+        if inner.context.is_none() {
+            return Err(LearningError::Unavailable);
+        }
+        let target = scope.clone();
+        Ok(Box::new(ArchiveCursor {
+            service: self.clone(),
+            scope: scope.clone(),
+            store: inner.archive.clone(),
+            refs: inner
+                .job_index
+                .as_ref()
+                .map(|i| i.records.clone().into())
+                .unwrap_or_default(),
+            hot: if inner.job_index.is_none() {
+                inner
+                    .document
+                    .jobs
+                    .iter()
+                    .filter(|r| &r.job.batch.scope == scope)
+                    .map(|r| r.job.clone())
+                    .collect()
+            } else {
+                VecDeque::new()
+            },
+            decode: Box::new(move |value| {
+                let record: JobRecord =
+                    serde_json::from_value(value).map_err(|_| LearningError::CorruptState)?;
+                let mut document = Document {
+                    format_version: 1,
+                    jobs: vec![record],
+                };
+                validate_document(&document, true)?;
+                let job = document.jobs.pop().ok_or(LearningError::CorruptState)?.job;
+                Ok(if job.batch.scope == target {
+                    Some(job)
+                } else {
+                    None
+                })
+            }),
+            failed: false,
+        }))
+    }
+    pub(super) fn scan_decisions(
+        self: &Arc<Self>,
+        scope: &MemoryScope,
+    ) -> LearningResult<Box<dyn LearningHistoryCursor<LearningDecisionRecord>>> {
+        scope.validate().map_err(|_| LearningError::InvalidInput)?;
+        let inner = self.inner.lock().map_err(|_| LearningError::Unavailable)?;
+        if inner.context.is_none() {
+            return Err(LearningError::Unavailable);
+        }
+        let target = scope.clone();
+        let mut last = 0u64;
+        Ok(Box::new(ArchiveCursor {
+            service: self.clone(),
+            scope: scope.clone(),
+            store: inner.archive.clone(),
+            refs: inner
+                .decision_index
+                .as_ref()
+                .map(|i| i.records.clone().into())
+                .unwrap_or_default(),
+            hot: if inner.decision_index.is_none() {
+                inner
+                    .decisions
+                    .records
+                    .iter()
+                    .filter(|r| &r.scope == scope)
+                    .map(|r| r.record.clone())
+                    .collect()
+            } else {
+                VecDeque::new()
+            },
+            decode: Box::new(move |value| {
+                let entry: ScopedDecisionRecord =
+                    serde_json::from_value(value).map_err(|_| LearningError::CorruptState)?;
+                entry
+                    .scope
+                    .validate()
+                    .map_err(|_| LearningError::CorruptState)?;
+                entry.record.decision.validate()?;
+                if entry.scope != target {
+                    return Ok(None);
+                }
+                last = last.checked_add(1).ok_or(LearningError::CorruptState)?;
+                if entry.record.sequence != last {
+                    return Err(LearningError::CorruptState);
+                }
+                Ok(Some(entry.record))
+            }),
+            failed: false,
+        }))
     }
     pub(super) fn record_decision(
         &self,
@@ -177,7 +429,7 @@ impl StoredLearning {
         {
             return Ok(previous.record.clone());
         }
-        if inner.decisions.records.len() >= MAX_DECISIONS {
+        if inner.archive.is_none() && inner.decisions.records.len() >= MAX_DECISIONS {
             return Err(LearningError::LimitReached);
         }
         let sequence = inner
@@ -286,7 +538,7 @@ impl StoredLearning {
         if batch.evidence.is_empty() || (batch.evidence.len() < options.min_new_evidence && !aged) {
             return Ok(None);
         }
-        if inner.document.jobs.len() >= MAX_JOBS {
+        if inner.archive.is_none() && inner.document.jobs.len() >= MAX_JOBS {
             return Err(LearningError::LimitReached);
         }
         batch.id = batch_id(&memory.scope, extractor_version, &batch.evidence)?;
@@ -472,7 +724,12 @@ impl StoredLearning {
 }
 
 fn persist(inner: &mut Inner, next: Document) -> LearningResult<()> {
-    let bytes = encode(&next)?;
+    let (bytes, index) = if let Some(store) = &inner.archive {
+        let (bytes, index) = archive::freeze(store.as_ref(), "jobs", &next.jobs)?;
+        (bytes, Some(index))
+    } else {
+        (encode(&next)?, None)
+    };
     let context = inner.context.as_ref().ok_or(LearningError::Unavailable)?;
     // 失败也可能已经提交；关闭整个实例，禁止旧缓存继续读取或覆盖后端。
     if context.state_set(LEARNING_STATE_KEY, bytes).is_err() {
@@ -480,13 +737,22 @@ fn persist(inner: &mut Inner, next: Document) -> LearningResult<()> {
         return Err(LearningError::Storage);
     }
     inner.document = next;
+    inner.job_index = index;
     Ok(())
 }
 fn persist_decisions(inner: &mut Inner, next: DecisionsDocument) -> LearningResult<()> {
-    if next.records.len() > MAX_DECISIONS {
+    if inner.archive.is_none() && next.records.len() > MAX_DECISIONS {
         return Err(LearningError::LimitReached);
     }
-    let bytes = serde_json::to_vec(&next).map_err(|_| LearningError::InvalidInput)?;
+    let (bytes, index) = if let Some(store) = &inner.archive {
+        let (bytes, index) = archive::freeze(store.as_ref(), "decisions", &next.records)?;
+        (bytes, Some(index))
+    } else {
+        (
+            serde_json::to_vec(&next).map_err(|_| LearningError::InvalidInput)?,
+            None,
+        )
+    };
     if bytes.len() > MAX_DECISIONS_STATE_BYTES {
         return Err(LearningError::LimitReached);
     }
@@ -498,6 +764,7 @@ fn persist_decisions(inner: &mut Inner, next: DecisionsDocument) -> LearningResu
         return Err(LearningError::Storage);
     }
     inner.decisions = next;
+    inner.decision_index = index;
     Ok(())
 }
 
@@ -535,8 +802,9 @@ fn validate_decision_binding(
 fn validate_decisions_document(
     decisions: &DecisionsDocument,
     document: &Document,
+    archived: bool,
 ) -> LearningResult<()> {
-    if decisions.records.len() > MAX_DECISIONS {
+    if !archived && decisions.records.len() > MAX_DECISIONS {
         return Err(LearningError::CorruptState);
     }
     let mut sequences = BTreeMap::new();
@@ -745,8 +1013,8 @@ fn validate_batch(batch: &LearningBatch, memory_revision: u64) -> LearningResult
     }
     Ok(())
 }
-fn validate_document(document: &Document) -> LearningResult<()> {
-    if document.jobs.len() > MAX_JOBS {
+fn validate_document(document: &Document, archived: bool) -> LearningResult<()> {
+    if !archived && document.jobs.len() > MAX_JOBS {
         return Err(LearningError::CorruptState);
     }
     let mut ids = BTreeSet::new();

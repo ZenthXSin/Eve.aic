@@ -132,11 +132,57 @@ impl StoredOutreach {
         composer_version: &str,
         now_ms: u64,
     ) -> OutreachResult<Option<Invitation>> {
+        self.begin_source(
+            owner,
+            goal_id,
+            (InvitationOrigin::Goal, Some(milestone)),
+            facts,
+            composer_version,
+            now_ms,
+        )
+    }
+    pub(super) fn begin_chat(
+        &self,
+        owner: &str,
+        source: IdleChatSource,
+        facts: Vec<Fact>,
+        composer_version: &str,
+        now_ms: u64,
+    ) -> OutreachResult<Option<Invitation>> {
+        let key = source.key(owner);
+        self.begin_source(
+            owner,
+            &key,
+            (InvitationOrigin::IdleChat(source), None),
+            facts,
+            composer_version,
+            now_ms,
+        )
+    }
+    fn begin_source(
+        &self,
+        owner: &str,
+        goal_id: &str,
+        source: (InvitationOrigin, Option<Milestone>),
+        facts: Vec<Fact>,
+        composer_version: &str,
+        now_ms: u64,
+    ) -> OutreachResult<Option<Invitation>> {
+        let (origin, milestone) = source;
         validate_id(owner)?;
         validate_id(goal_id)?;
         validate_id(composer_version)?;
-        validate_milestone(&milestone)?;
+        match (&origin, &milestone) {
+            (InvitationOrigin::Goal, Some(m)) => validate_milestone(m)?,
+            (InvitationOrigin::IdleChat(source), None) => {
+                validate_chat(source, owner, goal_id, now_ms)?
+            }
+            _ => return Err(OutreachError::InvalidInput),
+        }
         validate_facts(&facts)?;
+        if origin.is_goal() == facts.iter().any(|f| f.kind == FactKind::IdleContext) {
+            return Err(OutreachError::InvalidInput);
+        }
         if now_ms == 0 {
             return Err(OutreachError::InvalidInput);
         }
@@ -153,6 +199,7 @@ impl StoredOutreach {
             owner: owner.into(),
             goal_id: goal_id.into(),
             milestone,
+            origin,
             facts,
             composer_version: composer_version.into(),
             created_at_ms: now_ms,
@@ -627,13 +674,32 @@ fn validate_ledger(ledger: &Ledger) -> OutreachResult<()> {
     Ok(())
 }
 
+fn validate_chat(source: &IdleChatSource, owner: &str, key: &str, now: u64) -> OutreachResult<()> {
+    validate_id(&source.session_id)?;
+    validate_id(&source.evidence_id)?;
+    if source.last_active_at_ms == 0 || source.last_active_at_ms >= now || source.key(owner) != key
+    {
+        return Err(OutreachError::InvalidInput);
+    }
+    Ok(())
+}
+
 fn validate_invitation(entry: &Invitation) -> OutreachResult<()> {
     let invalid = || OutreachError::InvalidInput;
     validate_id(&entry.owner)?;
     validate_id(&entry.goal_id)?;
     validate_id(&entry.composer_version)?;
-    validate_milestone(&entry.milestone)?;
+    match (&entry.origin, &entry.milestone) {
+        (InvitationOrigin::Goal, Some(m)) => validate_milestone(m)?,
+        (InvitationOrigin::IdleChat(source), None) => {
+            validate_chat(source, &entry.owner, &entry.goal_id, entry.created_at_ms)?
+        }
+        _ => return Err(invalid()),
+    }
     validate_facts(&entry.facts)?;
+    if entry.origin.is_goal() == entry.facts.iter().any(|f| f.kind == FactKind::IdleContext) {
+        return Err(invalid());
+    }
     if entry.id != invitation_id(&entry.goal_id)
         || entry.created_at_ms == 0
         || entry.attempts.len() > MAX_ATTEMPTS

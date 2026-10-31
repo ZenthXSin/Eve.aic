@@ -1,4 +1,6 @@
 //! 低频偏好候选、单次模型提炼与严格恢复。
+mod archive;
+pub use archive::FileLearningArchive;
 mod confirmation;
 mod decision;
 mod extractor;
@@ -33,6 +35,22 @@ impl LearningController {
     }
 }
 impl LearningAdmin for LearningController {
+    fn scan_jobs(
+        &self,
+        scope: &MemoryScope,
+    ) -> LearningResult<Box<dyn LearningHistoryCursor<LearningJob>>> {
+        self.service()?.scan_jobs(scope)
+    }
+    fn scan_decisions(
+        &self,
+        scope: &MemoryScope,
+    ) -> LearningResult<Box<dyn LearningHistoryCursor<LearningDecisionRecord>>> {
+        self.service()?.scan_decisions(scope)
+    }
+
+    fn archived_history(&self) -> LearningResult<bool> {
+        self.service()?.archived_history()
+    }
     fn maintenance_receipts(&self, scope: &MemoryScope) -> LearningResult<Vec<MaintenanceReceipt>> {
         self.service()?.maintenance_receipts(scope)
     }
@@ -46,10 +64,31 @@ impl LearningAdmin for LearningController {
             .reserve_repair(memory, now_ms, extractor_version)
     }
     fn snapshot(&self, scope: &MemoryScope) -> LearningResult<LearningSnapshot> {
-        self.service()?.snapshot(scope)
+        let mut cursor = self.scan_jobs(scope)?;
+        let mut jobs = Vec::new();
+        loop {
+            let page = cursor.next_page()?;
+            if page.is_empty() {
+                break;
+            }
+            jobs.extend(page);
+        }
+        Ok(LearningSnapshot {
+            scope: scope.clone(),
+            jobs,
+        })
     }
     fn decisions(&self, scope: &MemoryScope) -> LearningResult<Vec<LearningDecisionRecord>> {
-        self.service()?.decisions(scope)
+        let mut cursor = self.scan_decisions(scope)?;
+        let mut records = Vec::new();
+        loop {
+            let page = cursor.next_page()?;
+            if page.is_empty() {
+                break;
+            }
+            records.extend(page);
+        }
+        Ok(records)
     }
     fn record_decision(
         &self,
@@ -82,13 +121,20 @@ impl LearningAdmin for LearningController {
 pub struct LearningPlugin {
     manifest: PluginManifest,
     controller: LearningController,
+    archive: Option<Arc<dyn LearningArchiveStore>>,
 }
 impl LearningPlugin {
     pub fn new() -> PluginResult<Self> {
         Ok(Self {
             manifest: PluginManifest::new(LEARNING_PLUGIN_ID, env!("CARGO_PKG_VERSION"))?,
             controller: LearningController::default(),
+            archive: None,
         })
+    }
+    /// 宿主显式提供不可变冷记录存储；旧二进制不能读取迁移后的格式。
+    pub fn with_archive(mut self, archive: Arc<dyn LearningArchiveStore>) -> Self {
+        self.archive = Some(archive);
+        self
     }
     pub fn controller(&self) -> LearningController {
         self.controller.clone()
@@ -101,7 +147,7 @@ impl Plugin for LearningPlugin {
     fn start(&mut self, context: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         Box::pin(async move {
             let stored = Arc::new(
-                StoredLearning::open(context.clone())
+                StoredLearning::open(context.clone(), self.archive.clone())
                     .map_err(|error| PluginError::State(error.to_string()))?,
             );
             let to_close = stored.clone();

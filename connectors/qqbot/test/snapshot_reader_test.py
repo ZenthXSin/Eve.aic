@@ -1,5 +1,6 @@
 """验收观察器遇到 Windows 快照替换竞争时有界等待，真实损坏仍失败。"""
 import ctypes
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,51 @@ import unittest
 from unittest.mock import patch
 
 import memory_test
+
+
+class FixtureDatabaseTest(unittest.TestCase):
+    def test_whitelist_commit_closes_connections_before_fixture_cleanup(self):
+        import sqlite3
+        from contextlib import closing
+        from fixture_auth import bootstrap_fixture_group_ids
+        original = sqlite3.connect
+        connections = []
+        class Connection:
+            def __init__(self, *args, **kwargs):
+                self.inner = original(*args, **kwargs)
+                self.closed = False
+                connections.append(self)
+            def __enter__(self):
+                self.inner.__enter__()
+                return self
+            def __exit__(self, *args):
+                return self.inner.__exit__(*args)
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+            def close(self):
+                self.inner.close()
+                self.closed = True
+        with tempfile.TemporaryDirectory() as root:
+            try:
+                with patch('fixture_auth.sqlite3.connect', Connection):
+                    bootstrap_fixture_group_ids(root, ['group-1', 'group-2'])
+                    bootstrap_fixture_group_ids(root, ['group-1'])
+                self.assertEqual(len(connections), 2)
+                self.assertTrue(all(c.closed for c in connections), '事务结束不代表 SQLite 连接已关闭')
+                with closing(original(Path(root) / 'qq-group-whitelist.sqlite3')) as connection:
+                    self.assertEqual(connection.execute('SELECT group_id FROM groups ORDER BY group_id').fetchall(), [('group-1',), ('group-2',)])
+                    self.assertEqual(connection.execute('PRAGMA user_version').fetchone()[0], 1)
+            finally:
+                for connection in connections:
+                    if not connection.closed:
+                        connection.close()
+
+    def test_invalid_test_group_cannot_create_a_database_or_expand_permissions(self):
+        from fixture_auth import bootstrap_fixture_group_ids
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(ValueError):
+                bootstrap_fixture_group_ids(root, ['../outside'])
+            self.assertEqual(list(Path(root).iterdir()), [])
 
 
 class SnapshotReaderTest(unittest.TestCase):
@@ -53,6 +99,26 @@ class SnapshotReaderTest(unittest.TestCase):
     def test_absent_initial_snapshot_is_empty(self):
         self.path.unlink()
         self.assertEqual(self.reader.documents(), {})
+
+    def test_cold_learning_reader_uses_snapshot_parent_without_optional_work_directory(self):
+        body = json.dumps({"job": {"status": "Completed"}}).encode()
+        digest = hashlib.sha256(body).hexdigest()
+        archive = self.path.parent / "learning-archive"
+        archive.mkdir()
+        record = archive / (digest + ".json")
+        record.write_bytes(body)
+        index = {"format_version": 2, "kind": "jobs", "records": [{"hash": digest, "bytes": len(body)}]}
+        self.path.write_text(json.dumps({"version": 1, "entries": {
+            "eve.learning": {"learning.v1": list(json.dumps(index).encode())}}}), encoding="utf8")
+        before = self.path.read_bytes()
+        self.assertFalse(hasattr(self.reader, "work"))
+        self.assertEqual(self.reader.documents()["eve.learning"]["learning.v1"],
+                         {"format_version": 1, "jobs": [{"job": {"status": "Completed"}}]})
+        record.write_bytes(b"corrupt")
+        with self.assertRaises(AssertionError):
+            self.reader.documents()
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(record.read_bytes(), b"corrupt")
 
     @unittest.skipUnless(os.name == "nt", "Windows 文件共享语义")
     def test_real_windows_exclusive_handle_is_released_before_retry(self):

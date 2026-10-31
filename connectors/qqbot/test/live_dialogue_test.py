@@ -19,9 +19,9 @@ class LiveInputAcceptance(judge.MessageJudgeAcceptance):
         self.steps[('task', 1)] = {'wait': 'release-base', 'text': '旧草稿不投递'}
         self.steps[('task', 2)] = {'text': '收到，去修电脑'}
         base = self.message('base', '出来聊天', '收到，去修电脑')
-        steer = self.message('steer', '去给朋友修电脑', expected_type='finish')
+        steer = self.message('steer', '去给朋友修电脑', '收到，已把这条消息加入原任务。当前还在等待模型回复，还没有结束；不会另开一遍任务。')
         self.run_live([{'send': base}, self.wait_request('task'), {'send': steer},
-            self.wait_command('steer', 'finish'), self.open_gate('release-base'), self.wait_receipt('base')])
+            self.wait_receipt('steer'), self.open_gate('release-base'), self.wait_receipt('base')])
         self.assertEqual(self.counts(), (2, 0, 0))
         turns = self.sessions()[0]['turns']
         self.assertEqual(len(turns), 1)
@@ -29,11 +29,13 @@ class LiveInputAcceptance(judge.MessageJudgeAcceptance):
         self.assertEqual([m['text'] for m in turns[0]['status']['messages'] if m['role'] == 'User'],
                          ['出来聊天', '去给朋友修电脑'])
         receipts = self.documents()['eve.channel.qqbot']['receipts.v1']
-        self.assertEqual(receipts['version'], 7)
+        self.assertEqual(receipts['version'], 1)
         steered = next(e for e in receipts['entries'] if e['message']['id'] == 'steer')
-        self.assertEqual((steered['state'], steered['merged_into']), ('Merged', 'base'))
-        self.assertEqual(self.replies(), [('base', '收到，去修电脑')])
-        self.run_live([{'send': [dict(base, expected_type='finish'), steer]},
+        self.assertEqual(steered['state'], 'Sent')
+        self.assertNotIn('merged_into', steered)
+        self.assertIn('已把这条消息加入原任务', steered['reply'])
+        self.assertEqual([item[0] for item in self.replies()], ['steer', 'base'])
+        self.run_live([{'send': [dict(base, expected_type='finish'), dict(steer, expected_type='finish')]},
                        self.wait_command('base', 'finish'), self.wait_command('steer', 'finish')])
         self.assertEqual(self.counts(), (2, 0, 0))
 
@@ -46,6 +48,20 @@ class LiveInputAcceptance(judge.MessageJudgeAcceptance):
         self.assertEqual(self.counts(), (2, 0, 0))
         original = next(s for s in self.sessions() if s['turns'][0]['input'] == '原请求')
         self.assertEqual(len(original['turns'][0]['status']['messages']), 2)
+
+    def test_private_ack_inflight_is_not_replayed_after_restart(self):
+        self.steps[('task', 1)] = {'wait': 'never-release', 'text': '原任务未完成'}
+        ack = self.message('ack', '人呢', '收到，已把这条消息加入原任务。当前还在等待模型回复，还没有结束；不会另开一遍任务。') | {'hold_delivery': True}
+        stop = self.work / 'stop-after-ack'
+        self.run_eve([{'send': self.message('base', '原任务')}, self.wait_request('task'),
+                      {'send': ack}, self.wait_command('ack', 'reply'),
+                      {'touch': str(stop)}, {'wait_file': str(self.work / 'never')}],
+                     mode='jev', environment={'EVE_QQ_LIVE_INTERACTION': 'true'}, terminate_at=stop)
+        saved = next(e for e in self.documents()['eve.channel.qqbot']['receipts.v1']['entries'] if e['message']['id'] == 'ack')
+        self.assertEqual(saved['state'], 'ReplyPending')
+        self.run_live([{'send': dict(ack, expected_type='finish')}, self.wait_command('ack', 'finish')])
+        self.assertEqual(self.counts(), (1, 0, 0))
+        self.assertFalse(self.replies())
 
     def test_current_conversation_send_does_not_require_management_authorization(self):
         self.steps[('task', 1)] = {'message': dialogue.tool_response([
@@ -82,8 +98,8 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
         self.run_live([{'send': self.message('base', '帮忙修电脑', expected='那就先备份，再处理系统')},
             {'wait_command': {'id': 'base', 'type': 'progress'}},
             {'wait_file': str(self.arrived('chat', 2))},
-            {'send': self.message('answer', '有，先备份') | {'expected_type': 'finish'}},
-            {'wait_command': {'id': 'answer', 'type': 'finish'}},
+            {'send': self.message('answer', '有，先备份', contains='已把这条消息加入原任务')},
+            self.wait_receipt('answer'),
             {'touch': str(self.gate('input-ready'))}, self.wait_receipt('base')])
         self.assertEqual([e['text'] for e in self.progress('base')], ['硬盘里有重要数据吗'])
         self.assertEqual(len(next(iter(self.documents()['eve.session']['sessions.v1']['sessions'].values()))['turns']), 1)
@@ -100,8 +116,8 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
         self.callback = respond
         self.run_live([{'send': self.message('sleeping', '等一下再做', expected='等待完成，按补充继续')},
             {'wait_command': {'id': 'sleeping', 'type': 'progress'}},
-            {'send': self.message('steer', '补充：先备份') | {'expected_type': 'finish'}},
-            {'wait_command': {'id': 'steer', 'type': 'finish'}}, self.wait_receipt('sleeping')],
+            {'send': self.message('steer', '补充：先备份', contains='当前还在执行工具步骤')},
+            self.wait_receipt('steer'), self.wait_receipt('sleeping')],
             more=['--sleep'], env_extra={'EVE_PROGRESS_SLOW_AFTER_MS': '1000'})
         self.assertEqual(self.chat_rounds, 2)
 
@@ -141,6 +157,22 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
         self.run_live(self.send(self.message('fresh', '新的聊天', expected='恢复后正常')))
         self.assertEqual(self.receipt('unknown'), before)
         self.assertEqual(self.progress('unknown'), [])
+
+    def test_new_explicit_progress_after_unknown_is_allowed_but_same_text_is_not_retried(self):
+        def respond(body):
+            results = self.results(body)
+            if len(results) < 3:
+                text = '第一条发现' if len(results) < 2 else '不同的新发现'
+                response = dialogue.tool_response([('send_message', {'text': text})])
+                response['choices'][0]['message']['tool_calls'][0]['id'] += str(len(results))
+                return response
+            self.assertEqual([r['sent'] for r in results], [False, False, False])
+            return dialogue.text_response('最终答复仍可返回')
+        self.callback = respond
+        self.run_live(self.send(self.message('recover', '开始检查', expected='最终答复仍可返回') | {'fail_progress': True}),
+                      env_extra={'EVE_PROGRESS_STAGE_UPDATES': 'true', 'EVE_PROGRESS_MIN_INTERVAL_MS': '1000'})
+        self.assertEqual([e['text'] for e in self.progress('recover')], ['第一条发现', '不同的新发现'])
+        self.assertEqual(self.receipt('recover')['state'], 'Sent')
 
     def test_explicit_cancel_after_message_suppresses_old_final(self):
         self.response_gates[('chat', 2)] = 'never-release'

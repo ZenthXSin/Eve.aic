@@ -125,7 +125,7 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         self.developer_config.write_text(json.dumps(config))
         names = {"clear_context", "clear_all_contexts", "echo", "search_memory", "save_preference", "note_commitment", "settle_commitment", "send_file", "read_attachment", "describe_image", "read_raw_message", "read_context_record", "acquire_condition", "read_source", "list_files", "read_file", "write_file", "edit_file",
                  "search_files", "apply_patch", "run_command", "github_api", "prepare_self_upgrade",
-                 "experience_memory", "memory_maintenance", "manage_memory_sharing", "set_reasoning_effort", "manage_subject_focus", "configure_subject_autonomy", "query_file_delivery",
+                 "experience_memory", "memory_maintenance", "manage_memory_sharing", "set_reasoning_effort", "set_group_whitelist", "manage_subject_focus", "configure_subject_autonomy", "query_file_delivery",
                  "save_script_plugin", "list_script_plugins", "activate_script_plugin", "run_script_plugin"}
         def respond(body):
             self.assertEqual(self.definitions(body), names)
@@ -178,7 +178,7 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         self.callback = first
         self.enabled(self.send(self.message("failed-command", "执行一次本地检查", contains=["HTTP 503", "已启动 1 次", "本轮已停止", "不再自动重试"])))
         self.assertEqual((self.source / "once.txt").read_text(), "x")
-        self.assertEqual(len(self.kind('chat')),5)  # 一次工具请求 + 后续模型最多四次尝试。
+        self.assertEqual(len(self.kind('chat')), 2)  # 本组关闭传输重试；开启后的上限及命令零重放由 model_retry_test 验证。
         failed = self.turn("执行一次本地检查")["status"]
         self.assertEqual(failed["state"], "Failed")
         evidence = failed["failure"]["evidence"]

@@ -2,6 +2,8 @@
 mod http_support;
 #[path = "../examples/support/model_check.rs"]
 mod model_check;
+#[path = "support/session_archive.rs"]
+mod session_archive;
 use http_support::{Reply, Server, final_response};
 use model_check::{CheckError, CheckOptions};
 use serde_json::{Value, json};
@@ -81,7 +83,10 @@ fn sessions(root: &Path) -> Value {
         .iter()
         .map(|v| v.as_u64().unwrap() as u8)
         .collect();
-    serde_json::from_slice(&bytes).unwrap()
+    session_archive::expand(
+        serde_json::from_slice(&bytes).unwrap(),
+        &root.join("check/state/session-archive"),
+    )
 }
 fn user_texts(request: &Value) -> Vec<&str> {
     request["input"]

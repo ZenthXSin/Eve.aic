@@ -579,6 +579,13 @@ impl QqOutreach for ChannelAdapter {
 /// 投递结果按 ID 前缀交回分配它的来源。
 pub(crate) struct Combined(pub(crate) Vec<(&'static str, Arc<dyn QqOutreach>)>);
 impl QqOutreach for Combined {
+    fn ordinary_direct_invitation(&self, id: &str) -> PluginResult<Option<SessionKey>> {
+        match self.0.iter().find(|(prefix, _)| id.starts_with(prefix)) {
+            Some((_, source)) => source.ordinary_direct_invitation(id),
+            None => Ok(None),
+        }
+    }
+
     fn group_chime(
         &self,
         id: &str,

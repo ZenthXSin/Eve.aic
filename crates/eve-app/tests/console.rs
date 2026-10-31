@@ -1,5 +1,7 @@
 #[path = "../../llm-openai/tests/support/mod.rs"]
 mod http_support;
+#[path = "support/session_archive.rs"]
+mod session_archive;
 use http_support::{Reply, Server, final_response};
 use serde_json::{Value, json};
 use std::{
@@ -90,7 +92,10 @@ fn sessions(root: &Path) -> Value {
         .iter()
         .map(|v| u8::try_from(v.as_u64().unwrap()).unwrap())
         .collect();
-    serde_json::from_slice(&bytes).unwrap()
+    session_archive::expand(
+        serde_json::from_slice(&bytes).unwrap(),
+        &root.join("state/session-archive"),
+    )
 }
 fn user_texts(request: &Value) -> Vec<&str> {
     request["input"]

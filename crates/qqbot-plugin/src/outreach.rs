@@ -78,6 +78,11 @@ pub struct QqGroupChimeDelivery {
 }
 
 pub trait QqOutreach: Send + Sync {
+    /// 仅宿主空闲邀请来源实现；必须核对已持久化领取和真实私聊身份，不能凭 ID 前缀授予权限。
+    fn ordinary_direct_invitation(&self, _id: &str) -> PluginResult<Option<SessionKey>> {
+        Ok(None)
+    }
+
     /// 只接受与本组件已领取的插话账本匹配的 ID；默认来源不能扩大群聊发送范围。
     fn group_chime(&self, _id: &str) -> PluginResult<Option<QqGroupChimeDelivery>> {
         Ok(None)

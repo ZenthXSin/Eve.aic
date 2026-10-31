@@ -182,7 +182,7 @@ class LearningAcceptance(unittest.TestCase):
 
     def run_eve(self, script, learning=True, memory=True, cognition=False, training=False,
                 app="1904159860", checkpoints=None, stop_at=None, abrupt=False, segmented=False, self_learning=False, cooldown_ms=None,
-                panel=False):
+                panel=False, env_extra=None):
         self.runs += 1
         self.run_release = threading.Event()
         events_path = self.work / f"events-{self.runs}.jsonl"
@@ -197,6 +197,7 @@ class LearningAcceptance(unittest.TestCase):
                    EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete",
                    # 分段节奏偏好按自然段规划验收；按句分条见 segment_test。
                    EVE_CHAT_SENTENCE_SPLIT="false")
+        env.update(env_extra or {})
         command = [str(BINARY), "--state-dir", str(self.work / "state"),
                    "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
                    "--bridge-arg", str(scenario)]
@@ -231,8 +232,9 @@ class LearningAcceptance(unittest.TestCase):
 
         inspector = threading.Thread(target=inspect, daemon=True)
         sink = open(self.panel_stderr, "w")
-        from fixture_auth import bootstrap_test_admin
+        from fixture_auth import bootstrap_test_admin, bootstrap_fixture_groups
         bootstrap_test_admin(self.work / "state", env, app)
+        bootstrap_fixture_groups(self.work / "state", scenario)
         child = subprocess.Popen(command, env=configure_fixture_progress(env), stdout=subprocess.PIPE,
                                  stderr=sink if panel else subprocess.PIPE, text=True)
         inspector.start()
@@ -685,7 +687,7 @@ class LearningAcceptance(unittest.TestCase):
         self.assertFalse(any(CANDIDATE in event.get("text", "") for event in self.events))
         self.assertEqual(len(self.learning_requests()), 1)
 
-    def test_provider_empty_invalid_and_tool_results_are_persisted_without_retry(self):
+    def test_provider_and_invalid_outcomes_are_saved_with_bounded_transport_retry_and_no_replay(self):
         original_work = self.work
         for mode, expected in (("provider", {"Failed": "TransientProvider"}), ("empty", "Completed"),
                                ("invalid", {"Failed": "InvalidOutput"}), ("tool", {"Failed": "InvalidOutput"})):
@@ -696,15 +698,19 @@ class LearningAcceptance(unittest.TestCase):
                 self.learning_response = mode
                 requests_before = len(self.learning_requests())
                 self.seed()
-                self.inspect_run(lambda: self.wait_jobs(1, expected))
+                self.inspect_run(lambda: self.wait_jobs(1, expected), env_extra={"EVE_OPENAI_TRANSIENT_RETRIES":"true"})
                 self.assertEqual(self.jobs()[0]["candidates"], [])
                 before = self.learning_bytes()
                 memory_before = self.memory()
                 self.inspect_run(self.quiet, prefix=self.send(self.message("list-empty", "/memory-candidates", EMPTY)))
                 self.assertEqual(self.learning_bytes(), before)
                 self.assertEqual(self.memory(), memory_before)
-                self.assertEqual(len(self.learning_requests()), requests_before + 1)
-                self.assert_reserved_before_request(self.learning_requests()[-1])
+                # 503 在同一批次内进行至多四次传输；无效正文/工具调用不重试。
+                attempts = self.learning_requests()[requests_before:]
+                self.assertEqual(len(attempts), 4 if mode == "provider" else 1)
+                for attempt in attempts:
+                    self.assertEqual(attempt["body"], attempts[0]["body"])
+                    self.assert_reserved_before_request(attempt)
 
     @unittest.skipUnless(os.name == "posix", "owned child signals use the Unix process interface")
     def test_cancelled_and_abruptly_interrupted_requests_are_consumed_without_restart_replay(self):

@@ -55,6 +55,8 @@ jobs:
       - name: Node 桥接测试
         working-directory: connectors/qqbot
         run: npm test
+      - name: 独立生图适配器本地上游验收
+        run: python3 imgadapter/test_adapter.py
       - name: 安装 Rust
         run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt --component clippy
       - name: 验证通道依赖构建
@@ -128,6 +130,7 @@ jobs:
           python3 connectors/qqbot/test/group_relation_test.py
           python3 connectors/qqbot/test/group_wakeup_test.py
           python3 connectors/qqbot/test/context_reset_test.py
+          python3 connectors/qqbot/test/session_archive_test.py
           python3 connectors/qqbot/test/group_digest_test.py
           python3 connectors/qqbot/test/group_recall_test.py
           python3 connectors/qqbot/test/background_recovery_test.py

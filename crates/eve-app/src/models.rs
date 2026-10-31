@@ -33,6 +33,7 @@ struct CapturedModel {
     use_limit: Option<u32>,
     natural_style: bool,
     streamed_completions: bool,
+    transient_retries: bool,
     stream_timeouts: Option<StreamTimeoutPolicy>,
 }
 struct CachedModel {
@@ -188,6 +189,16 @@ fn capture(
                 ));
             }
         };
+        let transient_retries = match std::env::var("EVE_OPENAI_TRANSIENT_RETRIES") {
+            Err(std::env::VarError::NotPresent) => true,
+            Ok(value) if matches!(value.as_str(), "1" | "true") => true,
+            Ok(value) if matches!(value.as_str(), "0" | "false") => false,
+            _ => {
+                return Err(LlmError::Configuration(
+                    "EVE_OPENAI_TRANSIENT_RETRIES 必须为 true/false 或 1/0".into(),
+                ));
+            }
+        };
         let stream_timeouts =
             if streamed_completions && matches!(use_name, Some("dialogue" | "digest")) {
                 let config = config::provider_config(&provider, primary.as_ref())
@@ -209,6 +220,7 @@ fn capture(
             use_limit,
             natural_style,
             streamed_completions,
+            transient_retries,
             stream_timeouts,
         });
     }
@@ -281,7 +293,8 @@ impl LlmModelResolver for CoreModelResolver {
         if captured.streamed_completions {
             provider = provider.with_streamed_completions();
         }
-        if self.use_name.as_deref() == Some("dialogue") {
+        // 对话与后台任务执行共用主链路：瞬时错误（超时/429/5xx）按底层有界重试处理。
+        if captured.transient_retries {
             provider = provider.with_transient_retries();
         }
         if matches!(self.use_name.as_deref(), Some("dialogue" | "digest")) && timing_enabled() {

@@ -3,7 +3,7 @@ from fixture_auth import configure_fixture_progress
 from request_messages import conversation_messages
 import hashlib
 import json
-from fixture_auth import bootstrap_test_admin
+from fixture_auth import bootstrap_test_admin, bootstrap_fixture_groups
 import os
 import pathlib
 import shutil
@@ -152,6 +152,7 @@ class Acceptance(unittest.TestCase):
             EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
         env.update(environment or {})
         bootstrap_test_admin(self.work / "state", env, app)
+        bootstrap_fixture_groups(self.work / "state", scenario)
         command = [str(BINARY), "--state-dir", str(self.work / "state"),
             "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
             "--bridge-arg", str(scenario)]

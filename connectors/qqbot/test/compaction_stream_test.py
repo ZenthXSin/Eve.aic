@@ -81,8 +81,12 @@ class CompactionStreamAcceptance(compact.ContextCompactionAcceptance):
         self.assertEqual([p["text"] for p in receipt["progress"]].count(NOTICE), 1)
         self.assertEqual(sum(f['phase'] == 'compaction' for f in self.narrations), 1,
                          '压缩进展正文来自真实事件的一次独立模型请求')
-        self.assertEqual(len(receipt["progress"]), 3 if milestones else 1,
-                         "默认只保留压缩通知；显式开启时两个工具里程碑与压缩共用配额")
+        if milestones:
+            # 工具完成很快时，中间通知会被限频/去重；墙钟速度不能决定验收是否通过。
+            self.assertGreaterEqual(len(receipt["progress"]), 2, "有工具进度和一次压缩通知")
+            self.assertLessEqual(len(receipt["progress"]), 3, "里程碑与压缩共用配额")
+        else:
+            self.assertEqual(len(receipt["progress"]), 1, "默认只保留一次压缩通知")
         self.assertTrue(all(p["state"] == "Sent" for p in receipt["progress"]))
         self.assertTrue(self.digest_requests())
         self.assertTrue(all(r["stream"] for r in self.digest_requests()))

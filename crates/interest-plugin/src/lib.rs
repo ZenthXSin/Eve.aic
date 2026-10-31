@@ -48,6 +48,17 @@ impl InterestAdmin for InterestController {
         self.service()?
             .reserve(memory, now_ms, observer_version, options)
     }
+    fn reserve_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+        observer_version: &str,
+        options: &ObservationOptions,
+    ) -> InterestResult<Option<ObservationBatch>> {
+        self.service()?
+            .reserve_reader(scope, reader, now_ms, observer_version, options)
+    }
     fn finish(
         &self,
         batch: &ObservationBatch,

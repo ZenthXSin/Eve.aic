@@ -6,7 +6,7 @@
 """
 from fixture_auth import configure_fixture_progress, is_progress_request, progress_fixture_text
 import json
-from fixture_auth import bootstrap_test_admin
+from fixture_auth import bootstrap_test_admin, bootstrap_fixture_groups
 import contextlib
 import os
 import pathlib
@@ -242,6 +242,7 @@ class InterestAcceptance(unittest.TestCase):
                    EVE_QQ_LIVE_INTERACTION="false")
         env.update(env_extra or {})
         bootstrap_test_admin(self.work / "state", env)
+        bootstrap_fixture_groups(self.work / "state", scenario)
         command = [str(BINARY), "--state-dir", str(self.work / "state"),
                    "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
                    "--bridge-arg", str(scenario), "--cognition-max-executions", str(max_executions)]
@@ -508,6 +509,20 @@ class InterestAcceptance(unittest.TestCase):
         self.assertEqual(self.goals(), [])
         self.run_eve(self.checkpoint("quiet"), checkpoints={"quiet": self.quiet})
         self.assertEqual(len(self.kind("interest")), 2, "failed batches consume their evidence")
+
+    def test_explicit_transient_retries_keep_one_observation_batch_and_do_not_replay(self):
+        self.provider_failure = True
+        self.inspect_run(lambda: self.wait_until(lambda: len(self.jobs()) == 1 and self.jobs()[0]["status"] == {"Failed":"Provider"}, "failure was not saved"),
+                         prefix=self.send(self.message("retry-interest", MINDUSTRY)),
+                         env_extra={"EVE_OPENAI_TRANSIENT_RETRIES":"true"})
+        requests=self.kind("interest")
+        self.assertEqual(len(requests),4)
+        self.assertTrue(all(r["body"] == requests[0]["body"] for r in requests))
+        self.assertEqual(len(self.jobs()),1)
+        self.provider_failure=False
+        self.inspect_run(self.quiet, env_extra={"EVE_OPENAI_TRANSIENT_RETRIES":"true"})
+        self.assertEqual(len(self.kind("interest")),4)
+        self.assertEqual(self.interests(),[])
 
     def test_interrupted_observation_is_interrupted_after_restart_without_replay(self):
         self.response_gates = {("interest", 1): "never-released"}

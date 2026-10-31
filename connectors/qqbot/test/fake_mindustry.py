@@ -31,6 +31,7 @@ def parse(text):
 
 
 def main():
+    parent = os.getppid()
     args = sys.argv[1:]
     # 验证器与服务端共用宿主的 Java 启动命令；按 jar 文件名把调用交给验证器替身。
     if "-jar" in args and pathlib.Path(args[args.index("-jar") + 1]).name == "mod-validator.jar":
@@ -81,6 +82,10 @@ def main():
     log("I", "Server loaded. Type 'help' for help.")
     if hold:
         while not os.path.exists(hold):
+            # 强制终止 Eve 的恢复用例会丢失 stdin 的读取机会；替身不能无限
+            # 留在门闸里。只检查自己的真实父进程，不扫描或终止其他进程。
+            if parent <= 1 or os.getppid() != parent:
+                return 0
             time.sleep(0.05)
     for line in sys.stdin:
         command = line.strip()

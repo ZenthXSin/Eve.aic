@@ -33,6 +33,7 @@ mod qq_failure_recovery;
 mod qq_failure_replay;
 mod qq_files;
 mod qq_group;
+mod qq_group_access;
 mod qq_group_admission;
 mod qq_group_digest;
 mod qq_group_recall;
@@ -41,6 +42,7 @@ mod qq_help;
 mod qq_history_digest;
 mod qq_host_facts;
 mod qq_identity;
+mod qq_idle_chat;
 mod qq_impressions;
 mod qq_interest;
 mod qq_learning;
@@ -428,6 +430,7 @@ pub(crate) async fn install_core_with_pages_and_admin(
         config::dialogue_schema(),
         config::history_schema(),
         qq_history_digest::schema(),
+        qq_idle_chat::schema(),
         qq_phrases::schema(),
         qq_vision::schema(),
         qq_progress::schema(),
@@ -468,10 +471,25 @@ pub(crate) async fn install_core_with_pages_and_admin(
         permissions,
         logger,
         bootstrap,
-        config_plugin,
+        CorePlugins {
+            configuration: config_plugin,
+            sessions: match std::env::var("EVE_SESSION_COLD_ARCHIVE").as_deref() {
+                Ok("false") => SessionPlugin::new()?,
+                Ok("true") | Err(std::env::VarError::NotPresent) => SessionPlugin::new()?
+                    .with_archive(Arc::new(eve_session_plugin::FileSessionArchive::open(
+                        state_directory.join("session-archive"),
+                    )?)),
+                _ => return Err("EVE_SESSION_COLD_ARCHIVE 必须是 true 或 false".into()),
+            },
+        },
     )
     .await?;
     Ok((control, controller))
+}
+
+struct CorePlugins {
+    configuration: ConfigPlugin,
+    sessions: SessionPlugin,
 }
 
 async fn install_core_with_config(
@@ -480,7 +498,7 @@ async fn install_core_with_config(
     permissions: Arc<dyn eve_plugin_api::PermissionChecker>,
     logger: Arc<dyn eve_plugin_api::Logger>,
     bootstrap: CoreBootstrap,
-    config_plugin: ConfigPlugin,
+    plugins: CorePlugins,
 ) -> Result<Arc<dyn eve_control_api::ControlService>, AppError> {
     let CoreBootstrap {
         tool_scope_policy,
@@ -502,8 +520,8 @@ async fn install_core_with_config(
         }
         bindings.push((name.clone(), services::tool_service_id(&name)));
     }
-    kernel.register(Box::new(config_plugin))?;
-    kernel.register(Box::new(SessionPlugin::new()?))?;
+    kernel.register(Box::new(plugins.configuration))?;
+    kernel.register(Box::new(plugins.sessions))?;
     let mut core_services = services::CoreServices::new()?.with_tools(tools);
     if let Some(context) = context {
         core_services = core_services.with_context(context);
