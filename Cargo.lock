@@ -1454,6 +1454,7 @@ dependencies = [
  "eve-llm-api",
  "eve-plugin-api",
  "eve-task-api",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

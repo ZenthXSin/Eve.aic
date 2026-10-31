@@ -1361,3 +1361,481 @@ async fn selected_evidence_is_read_only_frozen_and_closed_after_ambiguous_commit
     ));
     kernel.stop_all().await.unwrap();
 }
+
+struct Archive {
+    file: eve_task_plugin::FileTaskArchive,
+    reads: std::sync::atomic::AtomicUsize,
+    writes: std::sync::atomic::AtomicUsize,
+    fail: AtomicBool,
+    fail_after: AtomicBool,
+}
+impl TaskArchiveStore for Archive {
+    fn compact(&self, retained: &[String]) -> TaskResult<()> {
+        self.file.compact(retained)
+    }
+    fn get(&self, hash: &str) -> TaskResult<Vec<u8>> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.file.get(hash)
+    }
+    fn put(&self, hash: &str, bytes: &[u8]) -> TaskResult<()> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(TaskError::Storage);
+        }
+        self.file.put(hash, bytes)?;
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        if self.fail_after.load(Ordering::SeqCst) {
+            return Err(TaskError::Storage);
+        }
+        Ok(())
+    }
+}
+impl World {
+    fn archive(&self) -> Arc<Archive> {
+        Arc::new(Archive {
+            file: eve_task_plugin::FileTaskArchive::open(self._directory.path().join("archive"))
+                .unwrap(),
+            reads: Default::default(),
+            writes: Default::default(),
+            fail: AtomicBool::new(false),
+            fail_after: AtomicBool::new(false),
+        })
+    }
+    async fn cold(&self, archive: Arc<Archive>) -> PluginResult<(Kernel, TaskController)> {
+        let kernel = Kernel::with_services(KernelServices {
+            state: self.state.clone(),
+            ..KernelServices::default()
+        });
+        let plugin = TaskPlugin::new()?.with_archive(archive);
+        let controller = plugin.controller();
+        kernel.register(Box::new(plugin))?;
+        kernel.start_all().await?;
+        Ok((kernel, controller))
+    }
+    fn cold_path(&self, id: &str) -> std::path::PathBuf {
+        let value: Value = serde_json::from_slice(&self.raw().unwrap()).unwrap();
+        let entry = value["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["directory"]["id"] == id)
+            .unwrap();
+        self._directory.path().join("archive").join(format!(
+            "{}.json",
+            entry["record"]["hash"].as_str().unwrap()
+        ))
+    }
+}
+fn heavy_spec(user: &str) -> TaskSpec {
+    let mut task = spec("保留完整上下文");
+    task.context = Some(DelegatedContext {
+        owner: owner(user),
+        messages_json: serde_json::to_string(&vec![eve_llm_api::ChatMessage::text(
+            eve_llm_api::ChatRole::User,
+            "原始证据".repeat(20000),
+        )])
+        .unwrap(),
+    });
+    task
+}
+#[tokio::test]
+async fn cold_ledger_keeps_catalog_light_and_hydrates_only_requested_owned_records() {
+    let world = World::new();
+    let archive = world.archive();
+    let (kernel, tasks) = world.cold(archive.clone()).await.unwrap();
+    let first = tasks
+        .create(&owner("alice"), heavy_spec("alice"), "cold-first", 10)
+        .unwrap();
+    let second = tasks
+        .create(&owner("bob"), heavy_spec("bob"), "cold-second", 11)
+        .unwrap();
+    let raw = world.raw().unwrap();
+    assert!(raw.len() < 5000, "索引不携带委派正文");
+    let reads = archive.reads.load(Ordering::SeqCst);
+    assert_eq!(tasks.scheduling_snapshot().unwrap().tasks.len(), 2);
+    assert_eq!(tasks.delivery_snapshot().unwrap().tasks.len(), 2);
+    assert_eq!(tasks.summaries_for(&owner("alice")).unwrap().len(), 1);
+    assert_eq!(
+        archive.reads.load(Ordering::SeqCst),
+        reads,
+        "轮询目录不读冷正文"
+    );
+    assert_eq!(tasks.get_owned(&owner("bob"), &first.id).unwrap(), None);
+    assert_eq!(archive.reads.load(Ordering::SeqCst), reads);
+    assert_eq!(
+        tasks.get_owned(&owner("alice"), &first.id).unwrap(),
+        Some(first.clone())
+    );
+    assert_eq!(archive.reads.load(Ordering::SeqCst), reads + 1);
+    let writes = archive.writes.load(Ordering::SeqCst);
+    let changed = tasks.start(&first.id, 20).unwrap();
+    assert_eq!(
+        archive.writes.load(Ordering::SeqCst),
+        writes + 1,
+        "变更不重写另一任务"
+    );
+    let view = tasks
+        .evidence_snapshot(&[TaskEvidenceKey {
+            id: first.id.clone(),
+            owner: owner("alice"),
+        }])
+        .unwrap();
+    assert_eq!(view.find(&first.id).unwrap(), Some(&changed));
+    assert_eq!(view.find(&second.id), Err(TaskError::Unavailable));
+    assert_eq!(tasks.snapshot().unwrap().tasks, vec![changed, second]);
+    kernel.stop_all().await.unwrap();
+}
+#[tokio::test]
+async fn legacy_task_migration_preserves_full_context_and_requires_archive_on_reopen() {
+    let world = World::new();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let task = tasks
+        .create(&owner("alice"), heavy_spec("alice"), "migrate", 10)
+        .unwrap();
+    let old = world.raw().unwrap();
+    kernel.stop_all().await.unwrap();
+    let archive = world.archive();
+    let (kernel, tasks) = world.cold(archive.clone()).await.unwrap();
+    assert_eq!(
+        tasks.get_owned(&owner("alice"), &task.id).unwrap(),
+        Some(task.clone())
+    );
+    assert!(world.raw().unwrap().len() < old.len() / 10);
+    kernel.stop_all().await.unwrap();
+    let before = world.raw();
+    assert!(world.open().await.is_err());
+    assert_eq!(world.raw(), before);
+    let (kernel, tasks) = world.cold(archive).await.unwrap();
+    assert_eq!(
+        tasks.get_owned(&owner("alice"), &task.id).unwrap(),
+        Some(task)
+    );
+    assert_eq!(world.raw(), before, "无恢复动作不重写索引");
+    kernel.stop_all().await.unwrap();
+}
+#[tokio::test]
+async fn cold_restart_validates_late_corruption_before_any_running_task_recovery_write() {
+    let world = World::new();
+    let archive = world.archive();
+    let (kernel, tasks) = world.cold(archive.clone()).await.unwrap();
+    let first = tasks
+        .create(&owner("alice"), spec("先恢复"), "first", 10)
+        .unwrap();
+    tasks.start(&first.id, 20).unwrap();
+    tasks
+        .checkpoint(&first.id, checkpoint("alice"), u64::MAX, 30)
+        .unwrap();
+    let second = tasks
+        .create(&owner("bob"), spec("末页损坏"), "last", 10)
+        .unwrap();
+    let path = world.cold_path(&second.id);
+    let bytes = std::fs::read(&path).unwrap();
+    kernel.stop_all().await.unwrap();
+    let before = world.raw();
+    let writes = archive.writes.load(Ordering::SeqCst);
+    std::fs::write(&path, b"damaged").unwrap();
+    assert!(world.cold(archive.clone()).await.is_err());
+    assert_eq!(world.raw(), before);
+    assert_eq!(
+        archive.writes.load(Ordering::SeqCst),
+        writes,
+        "未做部分恢复或写入"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"damaged");
+    std::fs::write(&path, bytes).unwrap();
+    let (kernel, tasks) = world.cold(archive).await.unwrap();
+    let restored = tasks
+        .get_owned(&owner("alice"), &first.id)
+        .unwrap()
+        .unwrap();
+    let execution = restored.execution.unwrap();
+    assert_eq!(execution.checkpoint, Some(checkpoint("alice")));
+    assert_eq!(execution.recoveries, 1);
+    assert_eq!(execution.deadline_at_ms, Some(u64::MAX));
+    kernel.stop_all().await.unwrap();
+}
+#[tokio::test]
+async fn cold_lost_index_acknowledgement_closes_old_handle_and_recovers_committed_body() {
+    let world = World::new();
+    let archive = world.archive();
+    let (kernel, tasks) = world.cold(archive.clone()).await.unwrap();
+    world.state.fail_after.store(true, Ordering::SeqCst);
+    assert_eq!(
+        tasks.create(&owner("alice"), heavy_spec("alice"), "once", 10),
+        Err(TaskError::Storage)
+    );
+    assert_eq!(tasks.snapshot().err(), Some(TaskError::Unavailable));
+    world.state.fail_after.store(false, Ordering::SeqCst);
+    kernel.stop_all().await.unwrap();
+    let (kernel, tasks) = world.cold(archive).await.unwrap();
+    let restored = tasks
+        .create(&owner("alice"), spec("不得覆盖"), "once", 11)
+        .unwrap();
+    assert_eq!(restored.spec, heavy_spec("alice"));
+    assert_eq!(tasks.snapshot().unwrap().tasks.len(), 1);
+    kernel.stop_all().await.unwrap();
+}
+#[tokio::test]
+async fn cold_migration_write_failure_never_replaces_legacy_root_or_claims_success() {
+    for after in [false, true] {
+        let world = World::new();
+        let (kernel, tasks) = world.open().await.unwrap();
+        tasks
+            .create(&owner("alice"), heavy_spec("alice"), "keep", 10)
+            .unwrap();
+        kernel.stop_all().await.unwrap();
+        let before = world.raw();
+        let archive = world.archive();
+        if after {
+            archive.fail_after.store(true, Ordering::SeqCst);
+        } else {
+            archive.fail.store(true, Ordering::SeqCst);
+        }
+        assert!(world.cold(archive.clone()).await.is_err());
+        assert_eq!(world.raw(), before);
+        archive.fail_after.store(false, Ordering::SeqCst);
+        archive.fail.store(false, Ordering::SeqCst);
+        let (kernel, tasks) = world.cold(archive).await.unwrap();
+        assert_eq!(tasks.snapshot().unwrap().tasks.len(), 1);
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cold_storage_does_not_raise_original_logical_capacity_or_write_rejected_payloads() {
+    for cold in [false, true] {
+        let world = World::new();
+        let archive = world.archive();
+        let (kernel, tasks) = if cold {
+            world.cold(archive.clone()).await.unwrap()
+        } else {
+            world.open().await.unwrap()
+        };
+        let mut large = spec("原容量保持");
+        large.context = Some(DelegatedContext {
+            owner: owner("alice"),
+            messages_json: serde_json::to_string(&vec![eve_llm_api::ChatMessage::text(
+                eve_llm_api::ChatRole::User,
+                "\"".repeat(600_000),
+            )])
+            .unwrap(),
+        });
+        let first = tasks
+            .create(&owner("alice"), large.clone(), "large-first", 10)
+            .unwrap();
+        let before = world.raw();
+        let writes = archive.writes.load(Ordering::SeqCst);
+        assert_eq!(
+            tasks.create(&owner("alice"), large, "large-second", 11),
+            Err(TaskError::LimitReached)
+        );
+        assert_eq!(world.raw(), before);
+        assert_eq!(archive.writes.load(Ordering::SeqCst), writes);
+        assert_eq!(
+            tasks.get_owned(&owner("alice"), &first.id).unwrap(),
+            Some(first)
+        );
+        kernel.stop_all().await.unwrap();
+    }
+}
+#[tokio::test]
+async fn ambiguous_cold_payload_write_closes_handle_without_publishing_new_index() {
+    let world = World::new();
+    let archive = world.archive();
+    let (kernel, tasks) = world.cold(archive.clone()).await.unwrap();
+    let first = tasks
+        .create(&owner("alice"), spec("保留旧结局"), "first", 10)
+        .unwrap();
+    let before = world.raw();
+    archive.fail_after.store(true, Ordering::SeqCst);
+    assert_eq!(tasks.start(&first.id, 20), Err(TaskError::Storage));
+    assert_eq!(world.raw(), before);
+    assert_eq!(tasks.snapshot().err(), Some(TaskError::Unavailable));
+    assert_eq!(
+        tasks.scheduling_snapshot().err(),
+        Some(TaskError::Unavailable)
+    );
+    archive.fail_after.store(false, Ordering::SeqCst);
+    kernel.stop_all().await.unwrap();
+    let (kernel, tasks) = world.cold(archive).await.unwrap();
+    assert_eq!(
+        tasks.get_owned(&owner("alice"), &first.id).unwrap(),
+        Some(first)
+    );
+    kernel.stop_all().await.unwrap();
+}
+#[tokio::test]
+async fn missing_cold_record_never_becomes_missing_task_and_closes_cached_catalog() {
+    let world = World::new();
+    let archive = world.archive();
+    let (kernel, tasks) = world.cold(archive.clone()).await.unwrap();
+    let first = tasks
+        .create(&owner("alice"), spec("不能清空"), "first", 10)
+        .unwrap();
+    let before = world.raw();
+    let path = world.cold_path(&first.id);
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(tasks.get_owned(&owner("alice"), &first.id).is_err());
+    assert_eq!(
+        tasks.scheduling_snapshot().err(),
+        Some(TaskError::Unavailable)
+    );
+    assert_eq!(world.raw(), before);
+    kernel.stop_all().await.unwrap();
+    assert!(world.cold(archive.clone()).await.is_err());
+    assert_eq!(world.raw(), before);
+    std::fs::write(path, bytes).unwrap();
+    let (kernel, tasks) = world.cold(archive).await.unwrap();
+    assert_eq!(tasks.snapshot().unwrap().tasks, vec![first]);
+    kernel.stop_all().await.unwrap();
+}
+#[tokio::test]
+async fn cold_notice_inflight_recovery_remains_unknown_and_does_not_replay() {
+    let world = World::new();
+    let archive = world.archive();
+    let (kernel, tasks) = world.cold(archive.clone()).await.unwrap();
+    let first = tasks
+        .create(&owner("alice"), spec("结果保持"), "first", 10)
+        .unwrap();
+    tasks.start(&first.id, 20).unwrap();
+    tasks
+        .finish(
+            &first.id,
+            TaskEnd::Completed {
+                result: "实际结果".into(),
+            },
+            usage(1),
+            30,
+        )
+        .unwrap();
+    tasks
+        .claim(&first.id, DeliveryChannel::Proactive, 40)
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    let (kernel, tasks) = world.cold(archive).await.unwrap();
+    let restored = tasks
+        .get_owned(&owner("alice"), &first.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.result.as_deref(), Some("实际结果"));
+    let notice = restored.notice.unwrap();
+    assert_eq!(notice.status, NoticeStatus::Unknown);
+    assert_eq!(notice.attempts[0].result, Some(DeliveryResult::Unknown));
+    let before = world.raw();
+    assert_eq!(
+        tasks.claim(&first.id, DeliveryChannel::Proactive, 50),
+        Err(TaskError::InvalidTransition)
+    );
+    assert_eq!(world.raw(), before);
+    kernel.stop_all().await.unwrap();
+}
+
+#[test]
+fn file_task_archive_is_exclusive_and_releases_its_lock_with_the_last_owner() {
+    let root = tempfile::tempdir().unwrap();
+    let archive = eve_task_plugin::FileTaskArchive::open(root.path()).unwrap();
+    assert!(matches!(
+        eve_task_plugin::FileTaskArchive::open(root.path()),
+        Err(TaskError::Unavailable)
+    ));
+    drop(archive);
+    assert!(eve_task_plugin::FileTaskArchive::open(root.path()).is_ok());
+}
+#[tokio::test]
+async fn confirmed_checkpoint_replacement_reclaims_only_superseded_records() {
+    let world = World::new();
+    let archive = world.archive();
+    let (kernel, tasks) = world.cold(archive.clone()).await.unwrap();
+    let task = tasks
+        .create(&owner("alice"), heavy_spec("alice"), "checkpoints", 10)
+        .unwrap();
+    tasks.start(&task.id, 20).unwrap();
+    let mut frame = checkpoint("alice");
+    frame.messages.push(eve_llm_api::ChatMessage::text(
+        eve_llm_api::ChatRole::User,
+        "待核对正文".repeat(10000),
+    ));
+    let directory = world._directory.path().join("archive");
+    let backup = directory.join("manual-backup.keep");
+    std::fs::write(&backup, b"not managed").unwrap();
+    for round in 0..24 {
+        frame.provider_requests += 1;
+        tasks
+            .checkpoint(&task.id, frame.clone(), u64::MAX, 30 + round)
+            .unwrap();
+        let files = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .count();
+        assert_eq!(files, 1, "只有当前已确认索引引用的任务正文留存");
+    }
+    assert_eq!(std::fs::read(backup).unwrap(), b"not managed");
+    let expected = tasks.get_owned(&owner("alice"), &task.id).unwrap().unwrap();
+    world.state.fail_after.store(true, Ordering::SeqCst);
+    frame.provider_requests += 1;
+    assert_eq!(
+        tasks.checkpoint(&task.id, frame.clone(), u64::MAX, 60),
+        Err(TaskError::Storage)
+    );
+    let files = std::fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .count();
+    assert_eq!(files, 2, "确认未知时保留旧、新两份，不能提前回收");
+    world.state.fail_after.store(false, Ordering::SeqCst);
+    kernel.stop_all().await.unwrap();
+    let (kernel, tasks) = world.cold(archive).await.unwrap();
+    let current = tasks.get_owned(&owner("alice"), &task.id).unwrap().unwrap();
+    assert_eq!(current.spec, expected.spec);
+    assert_eq!(current.execution.unwrap().checkpoint, Some(frame));
+    let files = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .count();
+    assert_eq!(files, 1);
+    kernel.stop_all().await.unwrap();
+}
+
+#[test]
+fn archive_quota_and_compaction_preserve_current_unknown_and_corrupt_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let archive = eve_task_plugin::FileTaskArchive::open(directory.path()).unwrap();
+    let hash = |data: &[u8]| {
+        ring::digest::digest(&ring::digest::SHA256, data)
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let current = hash(b"current");
+    let superseded = hash(b"superseded");
+    archive.put(&current, b"current").unwrap();
+    archive.put(&superseded, b"superseded").unwrap();
+    let unknown = directory.path().join("backup.keep");
+    std::fs::write(&unknown, b"keep").unwrap();
+    let damaged = directory.path().join(format!("{superseded}.json"));
+    std::fs::write(&damaged, b"damaged").unwrap();
+    assert_eq!(
+        archive.compact(std::slice::from_ref(&current)),
+        Err(TaskError::CorruptState)
+    );
+    assert_eq!(std::fs::read(&damaged).unwrap(), b"damaged");
+    assert_eq!(archive.get(&current).unwrap(), b"current");
+    assert_eq!(std::fs::read(&unknown).unwrap(), b"keep");
+    std::fs::write(&damaged, b"superseded").unwrap();
+    archive.compact(std::slice::from_ref(&current)).unwrap();
+    assert!(!damaged.exists());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&unknown)
+        .unwrap()
+        .set_len(64 * 1024 * 1024)
+        .unwrap();
+    let next = hash(b"next");
+    assert_eq!(archive.put(&next, b"next"), Err(TaskError::LimitReached));
+    assert!(!directory.path().join(format!("{next}.json")).exists());
+    assert_eq!(archive.get(&current).unwrap(), b"current");
+}

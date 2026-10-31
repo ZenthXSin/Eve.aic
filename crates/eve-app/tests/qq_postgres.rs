@@ -2151,3 +2151,99 @@ async fn sql_qq_and_console_preserve_history_training_and_receipts_without_repla
             .unwrap()
     });
 }
+
+#[tokio::test]
+#[ignore = "需要 EVE_POSTGRES_TEST_CONFIG；专用本机测试库，所有SQL验收串行运行"]
+async fn sql_task_cold_index_restarts_and_missing_body_never_clears_sql_records() {
+    use eve_kernel::{Kernel, KernelServices};
+    use eve_plugin_api::PluginId;
+    use eve_task_api::*;
+    let database =
+        PathBuf::from(std::env::var_os("EVE_POSTGRES_TEST_CONFIG").expect("需要专用测试连接"));
+    admin(&database, |client| {
+        let active:i64=client.query_one("SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE datname=current_database() AND application_name='eve-state-postgres'",&[]).unwrap().get(0);
+        assert_eq!(active, 0, "测试库已有运行中的Eve后端");
+        client
+            .batch_execute("DROP SCHEMA IF EXISTS eve_state CASCADE")
+            .unwrap();
+    });
+    let root = tempfile::tempdir().unwrap();
+    let archive = std::sync::Arc::new(
+        eve_task_plugin::FileTaskArchive::open(root.path().join("task-archive")).unwrap(),
+    );
+    let open = || {
+        let state =
+            eve_state_postgres::PostgresStateStore::connect(credentials(&database)).unwrap();
+        let kernel = Kernel::with_services(KernelServices {
+            state: std::sync::Arc::new(state),
+            ..KernelServices::default()
+        });
+        let plugin = eve_task_plugin::TaskPlugin::new()
+            .unwrap()
+            .with_archive(archive.clone());
+        let controller = plugin.controller();
+        kernel.register(Box::new(plugin)).unwrap();
+        (kernel, controller)
+    };
+    let (kernel, tasks) = open();
+    kernel.start_all().await.unwrap();
+    let owner = TaskOwner {
+        session_id: "sql-task-session".into(),
+        user_id: "sql-task-owner".into(),
+    };
+    let spec = TaskSpec {
+        title: "SQL冷任务".into(),
+        instructions: "读取已授权材料，保留原文，不重复执行".into(),
+        max_steps: 3,
+        context: Some(DelegatedContext {
+            owner: owner.clone(),
+            messages_json: serde_json::to_string(&vec![eve_llm_api::ChatMessage::text(
+                eve_llm_api::ChatRole::User,
+                "SQL任务原文".repeat(10000),
+            )])
+            .unwrap(),
+        }),
+    };
+    let task = tasks.create(&owner, spec, "sql-source", 10).unwrap();
+    let stored = rows(&database);
+    let index = document(&stored, TASK_PLUGIN_ID, TASK_STATE_KEY);
+    assert_eq!(index["format_version"], 4);
+    assert!(serde_json::to_vec(&index).unwrap().len() < 5000);
+    let hash = index["tasks"][0]["record"]["hash"].as_str().unwrap();
+    let path = root
+        .path()
+        .join("task-archive")
+        .join(format!("{hash}.json"));
+    let body = std::fs::read(&path).unwrap();
+    assert!(body.len() > 100_000);
+    kernel.stop_all().await.unwrap();
+    drop(tasks);
+    drop(kernel);
+    let (kernel, tasks) = open();
+    kernel.start_all().await.unwrap();
+    assert_eq!(
+        tasks.get_owned(&owner, &task.id).unwrap(),
+        Some(task.clone())
+    );
+    assert_eq!(rows(&database), stored);
+    kernel.stop_all().await.unwrap();
+    drop(tasks);
+    drop(kernel);
+    std::fs::remove_file(&path).unwrap();
+    let before = rows(&database);
+    let (kernel, _) = open();
+    assert!(
+        kernel
+            .start(&PluginId::new(TASK_PLUGIN_ID).unwrap())
+            .await
+            .is_err()
+    );
+    assert_eq!(rows(&database), before, "不能清空SQL索引或重建空任务库");
+    drop(kernel);
+    std::fs::write(path, body).unwrap();
+    let (kernel, tasks) = open();
+    kernel.start_all().await.unwrap();
+    assert_eq!(tasks.get_owned(&owner, &task.id).unwrap(), Some(task));
+    assert_eq!(rows(&database), before);
+    kernel.stop_all().await.unwrap();
+}

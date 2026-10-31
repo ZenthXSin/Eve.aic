@@ -107,3 +107,58 @@ def expand_learning_archive(documents, directory):
             records.append(json.loads(payload))
         learning[key] = {"format_version": 1, field: records}
     return documents
+
+
+def expand_task_archive(documents, directory):
+    """仅验收侧恢复完整任务；真实读取并核对冷文件，不把目录占位内容冒充正文。"""
+    index = documents.get('eve.task', {}).get('tasks.v1')
+    if not index or index.get('format_version') != 4:
+        return documents
+    tasks, identities = [], set()
+    for entry in index['tasks']:
+        ref = entry['record']
+        digest = ref['hash']
+        assert len(digest) == 64 and all(c in '0123456789abcdef' for c in digest)
+        path = Path(directory) / (digest + '.json')
+        assert not path.is_symlink()
+        with path.open('rb') as source:
+            payload = source.read(4 * 1024**2 + 1)
+        assert len(payload) <= 4 * 1024**2 and len(payload) == ref['bytes']
+        assert hashlib.sha256(payload).hexdigest() == digest
+        task = json.loads(payload)
+        metadata = json.loads(payload)
+        metadata['spec'].pop('context', None)
+        metadata['result'] = metadata['failure'] = None
+        if metadata.get('execution') is not None:
+            metadata['execution']['checkpoint'] = None
+        assert metadata == entry['directory']
+        assert task['id'] not in identities
+        identities.add(task['id'])
+        tasks.append(task)
+    documents['eve.task']['tasks.v1'] = {'format_version':4, 'tasks':tasks}
+    return documents
+
+
+def read_archived_state(path):
+    """外部验收读者没有宿主锁；只在索引确实已改变时重取被 GC 超越的旧快照。"""
+    import time
+    path = Path(path)
+    for attempt in range(11):
+        try:
+            payload = path.read_bytes()
+        except FileNotFoundError:
+            return {}
+        except PermissionError:
+            if attempt == 10:
+                raise
+            time.sleep(0.01)
+            continue
+        state = json.loads(payload)
+        documents = {owner:{key:json.loads(bytes(value)) for key,value in entries.items()}
+                     for owner,entries in state['entries'].items()}
+        try:
+            return expand_task_archive(expand_learning_archive(documents, path.parent / 'learning-archive'), path.parent / 'task-archive')
+        except (FileNotFoundError, PermissionError):
+            if attempt == 10 or path.read_bytes() == payload:
+                raise
+    raise AssertionError('状态持续变化，未取得一致验收快照')

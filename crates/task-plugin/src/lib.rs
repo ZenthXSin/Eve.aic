@@ -1,5 +1,8 @@
 //! 后台任务账本。
+mod archive;
+mod cold;
 mod store;
+pub use archive::FileTaskArchive;
 mod strategy;
 mod strategy_policy;
 mod strict_json;
@@ -127,8 +130,13 @@ impl TaskAdmin for TaskController {
 pub struct TaskPlugin {
     manifest: PluginManifest,
     controller: TaskController,
+    archive: Option<Arc<dyn TaskArchiveStore>>,
 }
 impl TaskPlugin {
+    pub fn with_archive(mut self, archive: Arc<dyn TaskArchiveStore>) -> Self {
+        self.archive = Some(archive);
+        self
+    }
     /// 只有可信宿主装配评价策略；未装配时保持原有执行路径。
     pub fn with_strategy_learning(mut self, strategies: Arc<dyn TaskStrategyLearning>) -> Self {
         self.controller.strategies = Some(strategies);
@@ -138,6 +146,7 @@ impl TaskPlugin {
         Ok(Self {
             manifest: PluginManifest::new(TASK_PLUGIN_ID, env!("CARGO_PKG_VERSION"))?,
             controller: TaskController::default(),
+            archive: None,
         })
     }
     pub fn controller(&self) -> TaskController {
@@ -151,7 +160,7 @@ impl Plugin for TaskPlugin {
     fn start(&mut self, context: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         Box::pin(async move {
             let stored = Arc::new(
-                StoredTasks::open(context.clone())
+                StoredTasks::open_with_archive(context.clone(), self.archive.clone())
                     .map_err(|error| PluginError::State(error.to_string()))?,
             );
             let to_close = stored.clone();

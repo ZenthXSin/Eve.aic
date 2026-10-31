@@ -6,7 +6,7 @@ use eve_task_api::*;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -16,13 +16,14 @@ const INITIALIZED_VALUE: &[u8] = br#"{"format_version":1,"ledger":"tasks.v1"}"#;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Ledger {
-    format_version: u32,
-    tasks: Vec<Task>,
+pub(super) struct Ledger {
+    pub(super) format_version: u32,
+    pub(super) tasks: Vec<Task>,
 }
 struct Inner {
     ledger: Ledger,
     context: Option<PluginContext>,
+    cold: Option<crate::cold::ColdState>,
 }
 pub(super) struct StoredTasks {
     inner: Mutex<Inner>,
@@ -38,7 +39,10 @@ fn now_ms() -> u64 {
 }
 
 impl StoredTasks {
-    pub(super) fn open(context: PluginContext) -> TaskResult<Self> {
+    pub(super) fn open_with_archive(
+        context: PluginContext,
+        archive: Option<Arc<dyn TaskArchiveStore>>,
+    ) -> TaskResult<Self> {
         let initialized = context
             .state_get(INITIALIZED_KEY)
             .map_err(|_| TaskError::Storage)?;
@@ -55,6 +59,7 @@ impl StoredTasks {
         if fresh && initialized.is_some() {
             return Err(TaskError::CorruptState);
         }
+        let mut cold = None;
         let mut ledger = match stored {
             None => Ledger {
                 format_version: FORMAT_VERSION,
@@ -65,34 +70,41 @@ impl StoredTasks {
                     return Err(TaskError::CorruptState);
                 }
                 let value = strict_json::from_slice(&bytes).map_err(|_| TaskError::CorruptState)?;
-                if !matches!(
-                    value.get("format_version").and_then(|value| value.as_u64()),
-                    Some(1..=3)
-                ) {
-                    return Err(if value.get("format_version").is_some() {
-                        TaskError::UnsupportedVersion
-                    } else {
-                        TaskError::CorruptState
-                    });
+                if value.get("format_version").and_then(|v| v.as_u64()) == Some(4) {
+                    let archive = archive.clone().ok_or(TaskError::UnsupportedVersion)?;
+                    let (ledger, state) = crate::cold::ColdState::restore(archive, value)?;
+                    cold = Some(state);
+                    ledger
+                } else {
+                    if !matches!(
+                        value.get("format_version").and_then(|value| value.as_u64()),
+                        Some(1..=3)
+                    ) {
+                        return Err(if value.get("format_version").is_some() {
+                            TaskError::UnsupportedVersion
+                        } else {
+                            TaskError::CorruptState
+                        });
+                    }
+                    let mut ledger: Ledger =
+                        serde_json::from_value(value).map_err(|_| TaskError::CorruptState)?;
+                    if ledger.format_version == 1
+                        && ledger
+                            .tasks
+                            .iter()
+                            .any(|task| task.spec.context.is_some() || task.execution.is_some())
+                    {
+                        return Err(TaskError::CorruptState);
+                    }
+                    if ledger.format_version < 3
+                        && ledger.tasks.iter().any(|t| t.status == TaskStatus::Blocked)
+                    {
+                        return Err(TaskError::CorruptState);
+                    }
+                    validate_ledger(&ledger)?;
+                    ledger.format_version = FORMAT_VERSION;
+                    ledger
                 }
-                let mut ledger: Ledger =
-                    serde_json::from_value(value).map_err(|_| TaskError::CorruptState)?;
-                if ledger.format_version == 1
-                    && ledger
-                        .tasks
-                        .iter()
-                        .any(|task| task.spec.context.is_some() || task.execution.is_some())
-                {
-                    return Err(TaskError::CorruptState);
-                }
-                if ledger.format_version < 3
-                    && ledger.tasks.iter().any(|t| t.status == TaskStatus::Blocked)
-                {
-                    return Err(TaskError::CorruptState);
-                }
-                validate_ledger(&ledger)?;
-                ledger.format_version = FORMAT_VERSION;
-                ledger
             }
         };
         // 首次先保存合法空账本，再封存初始化标记；任一步失败均拒绝启动。
@@ -109,100 +121,77 @@ impl StoredTasks {
                 .map_err(|_| TaskError::Storage)?;
         }
         let mut changed = false;
-        let now = now_ms();
-        for task in &mut ledger.tasks {
-            if task.status == TaskStatus::Running {
-                if !task.cancel_requested
-                    && let Some(execution) = &mut task.execution
-                {
-                    // 最终结果已经持久化，只有任务结局尚未提交：直接了结，不请求模型或重放工具。
-                    if let Some(checkpoint) = &execution.checkpoint
-                        && let Some(result) = &checkpoint.result
-                    {
-                        if task.source.starts_with(FAILURE_RECOVERY_SOURCE_PREFIX)
-                            && recovery_needs_step_approval(checkpoint)
-                        {
-                            task.status = TaskStatus::Failed;
-                            task.failure = Some(
-                                "本次步数预算不足；已有进度保留，等待原会话明确同意追加步数。"
-                                    .into(),
-                            );
-                        } else if blocked_progress(&checkpoint.messages).is_some() {
-                            task.status = TaskStatus::Blocked;
-                            task.result = Some(bounded(result, MAX_RESULT_BYTES));
-                        } else {
-                            task.status = TaskStatus::Completed;
-                            task.result = Some(bounded(result, MAX_RESULT_BYTES));
-                        }
-                        task.usage = Some(checkpoint_usage(checkpoint));
-                        task.finished_at_ms = Some(now.max(last_time(task)));
-                        task.notice = Some(Notice {
-                            status: NoticeStatus::Pending,
-                            attempts: vec![],
-                            closed_at_ms: None,
-                        });
-                        changed = true;
-                        continue;
-                    }
-                    // 在模型边界崩溃可接续；待执行工具批次或异常工具回执不可自动重放。
-                    if can_retry(execution, now) {
-                        schedule_retry(execution, now);
-                        changed = true;
-                        continue;
-                    }
+        if let Some(state) = &mut cold {
+            // restore 已完整核对全部正文；现在才逐条恢复，绝不把目录当完整任务。
+            for position in 0..ledger.tasks.len() {
+                let task = state.load(&ledger.tasks[position])?;
+                let mut one = Ledger {
+                    format_version: FORMAT_VERSION,
+                    tasks: vec![task],
+                };
+                if recover(&mut one, now_ms()) {
+                    validate_ledger(&one)?;
+                    let mut references: Vec<_> = ledger.tasks.iter().collect();
+                    references[position] = &one.tasks[0];
+                    let prepared = state.prepare(&references, Some(&one.tasks[0].id))?;
+                    ledger.tasks = prepared.tasks;
+                    *state = prepared.state;
+                    changed = true;
                 }
-                // 执行中进程退出：不知道做到了哪一步，不自动重跑。已请求取消的按取消结束。
-                let at = now.max(last_time(task));
-                task.finished_at_ms = Some(at);
-                if task.cancel_requested {
-                    task.status = TaskStatus::Cancelled;
-                } else {
-                    task.status = TaskStatus::Interrupted;
-                    task.notice = Some(Notice {
-                        status: NoticeStatus::Pending,
-                        attempts: vec![],
-                        closed_at_ms: None,
-                    });
-                }
-                changed = true;
             }
-            if let Some(notice) = &mut task.notice
-                && notice.status == NoticeStatus::Delivering
-            {
-                // 发送前后进程退出：是否送达不确定，不重发，也不当作已送达。
-                if let Some(attempt) = notice.attempts.last_mut() {
-                    attempt.result = Some(DeliveryResult::Unknown);
-                }
-                notice.status = NoticeStatus::Unknown;
+        } else {
+            changed = recover(&mut ledger, now_ms());
+            validate_ledger(&ledger)?;
+            if let Some(archive) = archive {
+                let prepared = crate::cold::ColdState::empty(archive)
+                    .prepare(&ledger.tasks.iter().collect::<Vec<_>>(), None)?;
+                ledger.tasks = prepared.tasks;
+                cold = Some(prepared.state);
                 changed = true;
             }
         }
         if changed {
-            validate_ledger(&ledger)?;
-            let bytes = encode(&ledger)?;
+            let bytes = if let Some(state) = &cold {
+                state
+                    .prepare(&ledger.tasks.iter().collect::<Vec<_>>(), None)?
+                    .bytes
+            } else {
+                validate_ledger(&ledger)?;
+                encode(&ledger)?
+            };
             context
                 .state_set(TASK_STATE_KEY, bytes)
                 .map_err(|_| TaskError::Storage)?;
+        }
+        if let Some(state) = &cold {
+            state.compact();
         }
         Ok(Self {
             inner: Mutex::new(Inner {
                 ledger,
                 context: Some(context),
+                cold,
             }),
         })
     }
 
     fn lock(&self) -> TaskResult<MutexGuard<'_, Inner>> {
         let inner = self.inner.lock().map_err(|_| TaskError::Unavailable)?;
-        if inner.context.is_none() {
+        if inner.context.is_none() || inner.cold.as_ref().is_some_and(|state| !state.active()) {
             return Err(TaskError::Unavailable);
         }
         Ok(inner)
     }
 
     pub(super) fn snapshot(&self) -> TaskResult<TaskSnapshot> {
+        let inner = self.lock()?;
         Ok(TaskSnapshot {
-            tasks: self.lock()?.ledger.tasks.clone(),
+            tasks: inner
+                .ledger
+                .tasks
+                .iter()
+                .map(|task| load_task(&inner, task))
+                .collect::<TaskResult<_>>()?,
         })
     }
 
@@ -210,7 +199,17 @@ impl StoredTasks {
         &self,
         keys: &[TaskEvidenceKey],
     ) -> TaskResult<TaskEvidenceSnapshot> {
-        TaskEvidenceSnapshot::select(&self.lock()?.ledger.tasks, keys)
+        // 先校验请求和目录身份，保留未请求/不存在的原区别；只恢复明确选中的正文。
+        let inner = self.lock()?;
+        let _ = TaskEvidenceSnapshot::select(&inner.ledger.tasks, keys)?;
+        let tasks = inner
+            .ledger
+            .tasks
+            .iter()
+            .filter(|task| keys.iter().any(|key| key.id == task.id))
+            .map(|task| load_task(&inner, task))
+            .collect::<TaskResult<Vec<_>>>()?;
+        TaskEvidenceSnapshot::select(&tasks, keys)
     }
 
     pub(super) fn scheduling_snapshot(&self) -> TaskResult<TaskSchedulingSnapshot> {
@@ -255,13 +254,14 @@ impl StoredTasks {
     pub(super) fn get_owned(&self, owner: &TaskOwner, id: &str) -> TaskResult<Option<Task>> {
         validate_owner(owner)?;
         validate_id(id)?;
-        Ok(self
-            .lock()?
+        let inner = self.lock()?;
+        inner
             .ledger
             .tasks
             .iter()
             .find(|task| task.id == id && task.owner == *owner)
-            .cloned())
+            .map(|task| load_task(&inner, task))
+            .transpose()
     }
 
     pub(super) fn create(
@@ -304,7 +304,7 @@ impl StoredTasks {
             if deadline_at_ms.is_some() && &existing.owner != owner {
                 return Err(TaskError::NotFound);
             }
-            return Ok(existing.clone());
+            return load_task(&inner, existing);
         }
         let mine = || {
             inner
@@ -362,12 +362,27 @@ impl StoredTasks {
             .map(|(_, existing)| existing)
             .chain(std::iter::once(&task))
             .collect();
-        let bytes = encode_tasks(&tasks)?;
+        let cold = inner
+            .cold
+            .as_ref()
+            .map(|state| state.prepare(&tasks, Some(&task.id)))
+            .transpose()?;
+        let bytes = if let Some(prepared) = &cold {
+            prepared.bytes.clone()
+        } else {
+            encode_tasks(&tasks)?
+        };
         commit_bytes(&mut inner, bytes)?;
-        if let Some(position) = evict {
-            inner.ledger.tasks.remove(position);
+        if let Some(prepared) = cold {
+            inner.ledger.tasks = prepared.tasks;
+            inner.cold = Some(prepared.state);
+            inner.cold.as_ref().unwrap().compact();
+        } else {
+            if let Some(position) = evict {
+                inner.ledger.tasks.remove(position);
+            }
+            inner.ledger.tasks.push(task.clone());
         }
-        inner.ledger.tasks.push(task.clone());
         Ok(task)
     }
 
@@ -717,7 +732,7 @@ impl StoredTasks {
             .iter()
             .position(|task| task.id == id)
             .ok_or(TaskError::NotFound)?;
-        let mut task = inner.ledger.tasks[position].clone();
+        let mut task = load_task(&inner, &inner.ledger.tasks[position])?;
         apply(&mut task)?;
         validate_task(&task).map_err(|_| TaskError::InvalidInput)?;
         let tasks: Vec<_> = inner
@@ -727,9 +742,24 @@ impl StoredTasks {
             .enumerate()
             .map(|(index, existing)| if index == position { &task } else { existing })
             .collect();
-        let bytes = encode_tasks(&tasks)?;
+        let cold = inner
+            .cold
+            .as_ref()
+            .map(|state| state.prepare(&tasks, Some(&task.id)))
+            .transpose()?;
+        let bytes = if let Some(prepared) = &cold {
+            prepared.bytes.clone()
+        } else {
+            encode_tasks(&tasks)?
+        };
         commit_bytes(&mut inner, bytes)?;
-        inner.ledger.tasks[position] = task.clone();
+        if let Some(prepared) = cold {
+            inner.ledger.tasks = prepared.tasks;
+            inner.cold = Some(prepared.state);
+            inner.cold.as_ref().unwrap().compact();
+        } else {
+            inner.ledger.tasks[position] = task.clone();
+        }
         Ok(task)
     }
 
@@ -831,19 +861,7 @@ fn encode_tasks(tasks: &[&Task]) -> TaskResult<Vec<u8>> {
     } else {
         FORMAT_VERSION
     };
-    // 重启时写入的中断与未知结局比原状态略长；为进行中的任务预留空间，保证能保存。
-    let open = tasks
-        .iter()
-        .filter(|task| !task.status.finished() || task.notice.is_some())
-        .count();
-    // 进行中的任务结束时还要写入结果；按上限预留。
-    let pending_results = tasks.iter().filter(|task| !task.status.finished()).count();
-    let reserved = open
-        .saturating_mul(160)
-        .saturating_add(pending_results.saturating_mul(MAX_RESULT_BYTES * 2));
-    let available = MAX_STATE_BYTES
-        .checked_sub(reserved)
-        .ok_or(TaskError::LimitReached)?;
+    let available = available_capacity(tasks)?;
     let mut writer = LimitedJson {
         bytes: vec![],
         available,
@@ -902,7 +920,7 @@ fn validate_ledger(ledger: &Ledger) -> TaskResult<()> {
     Ok(())
 }
 
-fn validate_task(task: &Task) -> TaskResult<()> {
+pub(super) fn validate_task(task: &Task) -> TaskResult<()> {
     validate_id(&task.id)?;
     validate_owner(&task.owner)?;
     validate_id(&task.source)?;
@@ -1014,4 +1032,113 @@ fn validate_task(task: &Task) -> TaskResult<()> {
         validate_notice(notice, finished.unwrap_or(0))?;
     }
     Ok(())
+}
+
+fn recover(ledger: &mut Ledger, now: u64) -> bool {
+    let mut changed = false;
+    for task in &mut ledger.tasks {
+        if task.status == TaskStatus::Running {
+            if !task.cancel_requested
+                && let Some(execution) = &mut task.execution
+            {
+                // 最终结果已经持久化，只有任务结局尚未提交：直接了结，不请求模型或重放工具。
+                if let Some(checkpoint) = &execution.checkpoint
+                    && let Some(result) = &checkpoint.result
+                {
+                    if task.source.starts_with(FAILURE_RECOVERY_SOURCE_PREFIX)
+                        && recovery_needs_step_approval(checkpoint)
+                    {
+                        task.status = TaskStatus::Failed;
+                        task.failure = Some(
+                            "本次步数预算不足；已有进度保留，等待原会话明确同意追加步数。".into(),
+                        );
+                    } else if blocked_progress(&checkpoint.messages).is_some() {
+                        task.status = TaskStatus::Blocked;
+                        task.result = Some(bounded(result, MAX_RESULT_BYTES));
+                    } else {
+                        task.status = TaskStatus::Completed;
+                        task.result = Some(bounded(result, MAX_RESULT_BYTES));
+                    }
+                    task.usage = Some(checkpoint_usage(checkpoint));
+                    task.finished_at_ms = Some(now.max(last_time(task)));
+                    task.notice = Some(Notice {
+                        status: NoticeStatus::Pending,
+                        attempts: vec![],
+                        closed_at_ms: None,
+                    });
+                    changed = true;
+                    continue;
+                }
+                // 在模型边界崩溃可接续；待执行工具批次或异常工具回执不可自动重放。
+                if can_retry(execution, now) {
+                    schedule_retry(execution, now);
+                    changed = true;
+                    continue;
+                }
+            }
+            // 执行中进程退出：不知道做到了哪一步，不自动重跑。已请求取消的按取消结束。
+            let at = now.max(last_time(task));
+            task.finished_at_ms = Some(at);
+            if task.cancel_requested {
+                task.status = TaskStatus::Cancelled;
+            } else {
+                task.status = TaskStatus::Interrupted;
+                task.notice = Some(Notice {
+                    status: NoticeStatus::Pending,
+                    attempts: vec![],
+                    closed_at_ms: None,
+                });
+            }
+            changed = true;
+        }
+        if let Some(notice) = &mut task.notice
+            && notice.status == NoticeStatus::Delivering
+        {
+            // 发送前后进程退出：是否送达不确定，不重发，也不当作已送达。
+            if let Some(attempt) = notice.attempts.last_mut() {
+                attempt.result = Some(DeliveryResult::Unknown);
+            }
+            notice.status = NoticeStatus::Unknown;
+            changed = true;
+        }
+    }
+    changed
+}
+
+pub(super) fn available_capacity(tasks: &[&Task]) -> TaskResult<usize> {
+    // 重启时写入的中断与未知结局比原状态略长；为进行中的任务预留空间，保证能保存。
+    let open = tasks
+        .iter()
+        .filter(|task| !task.status.finished() || task.notice.is_some())
+        .count();
+    // 进行中的任务结束时还要写入结果；按上限预留。
+    let pending_results = tasks.iter().filter(|task| !task.status.finished()).count();
+    let reserved = open
+        .saturating_mul(160)
+        .saturating_add(pending_results.saturating_mul(MAX_RESULT_BYTES * 2));
+    MAX_STATE_BYTES
+        .checked_sub(reserved)
+        .ok_or(TaskError::LimitReached)
+}
+
+fn load_task(inner: &Inner, task: &Task) -> TaskResult<Task> {
+    inner
+        .cold
+        .as_ref()
+        .map_or_else(|| Ok(task.clone()), |state| state.load(task))
+}
+pub(super) fn bounded_encode(value: &impl Serialize, available: usize) -> TaskResult<Vec<u8>> {
+    let mut writer = LimitedJson {
+        bytes: vec![],
+        available,
+        exceeded: false,
+    };
+    serde_json::to_writer(&mut writer, value).map_err(|_| {
+        if writer.exceeded {
+            TaskError::LimitReached
+        } else {
+            TaskError::InvalidInput
+        }
+    })?;
+    Ok(writer.bytes)
 }

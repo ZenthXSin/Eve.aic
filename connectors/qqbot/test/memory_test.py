@@ -4,6 +4,7 @@
 快照检查通过桥接 touch/wait_file 握手，避免用固定延时猜测提交时序。
 """
 from fixture_auth import configure_fixture_progress, is_progress_request, progress_fixture_text
+from fixture_auth import read_archived_state
 import json
 from fixture_auth import bootstrap_test_admin, bootstrap_fixture_groups, expand_learning_archive
 import os
@@ -103,22 +104,7 @@ class MemoryAcceptance(unittest.TestCase):
         self.directory.cleanup()
 
     def documents(self):
-        # Windows 在原子替换快照时可能短暂拒绝打开。只重试读取权限竞争，
-        # 不重跑模型/工具，不把持续失败或损坏数据当作空状态。
-        for attempt in range(11):
-            try:
-                text = self.state_path.read_text(encoding="utf-8")
-                break
-            except FileNotFoundError:
-                return {}
-            except PermissionError:
-                if attempt == 10:
-                    raise
-                time.sleep(0.01)
-        document = json.loads(text)
-        documents = {owner: {key: json.loads(bytes(value)) for key, value in entries.items()}
-                     for owner, entries in document["entries"].items()}
-        return expand_learning_archive(documents, self.state_path.parent / "learning-archive")
+        return read_archived_state(self.state_path)
 
     def memory(self):
         return self.documents().get("eve.memory", {}).get("memory.v1")

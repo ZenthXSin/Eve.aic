@@ -1453,6 +1453,7 @@ async fn run_qqbot_composed(
         };
         let tasks = if options.background_tasks {
             let mut plugin = eve_task_plugin::TaskPlugin::new()?;
+            plugin = plugin.with_archive(Arc::new(eve_task_plugin::FileTaskArchive::open(options.state_directory.join("task-archive"))?));
             if let Some(strategies) = task_strategies {
                 plugin = plugin.with_strategy_learning(strategies);
             }
