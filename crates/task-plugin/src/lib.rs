@@ -36,6 +36,9 @@ impl TaskAdmin for TaskController {
     fn snapshot(&self) -> TaskResult<TaskSnapshot> {
         self.service()?.snapshot()
     }
+    fn scheduling_snapshot(&self) -> TaskResult<TaskSchedulingSnapshot> {
+        self.service()?.scheduling_snapshot()
+    }
     fn summaries_for(&self, owner: &TaskOwner) -> TaskResult<Vec<TaskSummary>> {
         self.service()?.summaries_for(owner)
     }

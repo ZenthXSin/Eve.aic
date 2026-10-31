@@ -30,7 +30,7 @@ use eve_session_api::SessionKey;
 use eve_task_api::{
     DEFAULT_STEPS, DelegatedContext, DeliveryChannel, DeliveryResult, MAX_CONTEXT_BYTES,
     MAX_INSTRUCTIONS_BYTES, MAX_STEPS, MAX_TITLE_BYTES, MIN_STEPS, Task, TaskAdmin, TaskEnd,
-    TaskError, TaskOwner, TaskSpec, TaskStatus, TaskUsage, bounded,
+    TaskError, TaskOwner, TaskSchedulingEntry, TaskSpec, TaskStatus, TaskUsage, bounded,
 };
 use ring::digest::{Context as Digest, SHA256};
 use serde_json::{Value, json};
@@ -1549,7 +1549,7 @@ async fn run(
     }
     let worker = late.worker.get().cloned().ok_or("后台任务执行器未装配")?;
     let config = late.config.get().cloned().ok_or("后台任务配置未装配")?;
-    let mut running: HashMap<String, watch::Sender<bool>> = HashMap::new();
+    let mut running: HashMap<String, RunningTask> = HashMap::new();
     let mut joins: JoinSet<(String, WorkerRun)> = JoinSet::new();
     let result: Result<(), AppError> = async {
         loop {
@@ -1557,18 +1557,19 @@ async fn run(
                 return Ok(());
             }
             tasks.reconcile_strategies()?;
-            let snapshot = tasks.snapshot()?;
+            let snapshot = tasks.scheduling_snapshot()?;
+            snapshot.validate()?;
             if let Some(admission) = late.admission.get() {
                 use eve_qqbot_plugin::QqAdmission;
                 for task in snapshot.tasks.iter().filter(|t| t.status.finished()) {
                     let key = SessionKey::new(task.owner.session_id.clone(),task.owner.user_id.clone())?;
-                    admission.abandon(&key, &format!("task:{}:{}",task.id,task.execution.as_ref().map_or(0, |e| e.recoveries)))?;
+                    admission.abandon(&key, &format!("task:{}:{}",task.id,task.recoveries))?;
                 }
             }
             // 用户在执行中取消：停下执行器，由结局写入取消。
             for task in snapshot.running().filter(|task| task.cancel_requested) {
                 if let Some(stop) = running.get(&task.id) {
-                    let _ = stop.send(true);
+                    let _ = stop.stop.send(true);
                 } else {
                     tasks.finish(&task.id, TaskEnd::Cancelled, TaskUsage::default(), now_ms())?;
                 }
@@ -1579,9 +1580,7 @@ async fn run(
                 !running.contains_key(&task.id)
                     && !task.cancel_requested
                     && task
-                        .execution
-                        .as_ref()
-                        .and_then(|e| e.resume_at_ms)
+                        .resume_at_ms
                         .is_some_and(|at| at <= now_ms())
             }));
             for task in candidates {
@@ -1591,15 +1590,24 @@ async fn run(
                 let admission_ticket = if let Some(admission) = late.admission.get() {
                     let key = SessionKey::new(task.owner.session_id.clone(), task.owner.user_id.clone())?;
                     let priority = if task.source.starts_with("subject-focus:") { eve_subject_api::EventPriority::Autonomy } else if task.status == TaskStatus::Running { eve_subject_api::EventPriority::Recovery } else { eve_subject_api::EventPriority::User };
-                    let source = format!("task:{}:{}", task.id, task.execution.as_ref().map_or(0, |e| e.recoveries));
+                    let source = format!("task:{}:{}", task.id, task.recoveries);
                     match admission.begin_work(&key, &source, priority, match priority { eve_subject_api::EventPriority::User => eve_subject_api::EventSource::UserIngress, eve_subject_api::EventPriority::Autonomy => eve_subject_api::EventSource::AutonomyScheduler, _ => eve_subject_api::EventSource::RecoverySupervisor })? {
                         Some(ticket) => Some((admission.clone(), ticket)),
                         None => continue,
                     }
                 } else { None };
                 let start_result = if task.status == TaskStatus::Running {
-                    Ok(task.clone())
-                } else { tasks.start(&task.id, now_ms()) };
+                    tasks.get_owned(&task.owner, &task.id).and_then(|task| task.ok_or(TaskError::InvalidTransition))
+                } else { tasks.start(&task.id, now_ms()) }.and_then(|started| {
+                    if !task.matches(&started) { return Err(TaskError::CorruptState); }
+                    if started.status != TaskStatus::Running || started.cancel_requested {
+                        return Err(TaskError::InvalidTransition);
+                    }
+                    if task.status == TaskStatus::Running && started.execution.as_ref().and_then(|execution| execution.resume_at_ms).is_none_or(|at| at > now_ms()) {
+                        return Err(TaskError::InvalidTransition);
+                    }
+                    Ok(started)
+                });
                 if let Some((admission, ticket)) = &admission_ticket {
                     use eve_qqbot_plugin::QqAdmission;
                     admission.finish(ticket, match &start_result {
@@ -1615,7 +1623,7 @@ async fn run(
                     Err(error) => return Err(error.into()),
                 };
                 let (stop, stop_signal) = watch::channel(false);
-                running.insert(started.id.clone(), stop);
+                running.insert(started.id.clone(), RunningTask { entry: TaskSchedulingEntry::from(&started), stop });
                 let worker = worker.clone();
                 let scope = ContextScope {
                     session_id: started.owner.session_id.clone(),
@@ -1691,7 +1699,7 @@ async fn run(
             tokio::select! {
                 Some(joined) = joins.join_next() => {
                     let (id, outcome) = joined.map_err(|_| "后台任务执行异常")?;
-                    running.remove(&id);
+                    let entry = running.remove(&id).ok_or("后台任务执行身份缺失，停止核对")?.entry;
                     if outcome.retryable {
                         match tasks.retry(&id, now_ms()) {
                             Ok(_) => continue,
@@ -1699,9 +1707,12 @@ async fn run(
                             Err(error) => return Err(error.into()),
                         }
                     }
-                    let task = tasks.snapshot()?.tasks.into_iter().find(|task| task.id == id);
+                    let task = tasks.get_owned(&entry.owner, &id)?.ok_or(TaskError::NotFound)?;
+                    if !entry.matches(&task) {
+                        return Err(TaskError::CorruptState.into());
+                    }
                     let mut end = outcome.end;
-                    if let Some(task) = task.as_ref().filter(|t| t.source.starts_with(crate::qq_failure_recovery::SOURCE_PREFIX)) {
+                    if task.source.starts_with(crate::qq_failure_recovery::SOURCE_PREFIX) {
                         let exhausted = matches!(&end, TaskEnd::Failed { reason } if reason.starts_with("步数用尽后模型仍要求调用工具"))
                             || task.needs_step_approval();
                         if exhausted && !task.cancel_requested {
@@ -1737,10 +1748,15 @@ async fn run(
     .await;
     // 关闭时停下执行中的任务；下次启动只在已持久化的安全边界接续，不重放未知工具。
     for stop in running.values() {
-        let _ = stop.send(true);
+        let _ = stop.stop.send(true);
     }
     joins.shutdown().await;
     result
+}
+
+struct RunningTask {
+    entry: TaskSchedulingEntry,
+    stop: watch::Sender<bool>,
 }
 
 #[cfg(test)]

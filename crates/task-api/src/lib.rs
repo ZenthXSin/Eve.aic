@@ -4,6 +4,8 @@
 //! 创建、开始、结束与每次通知尝试都先持久化。执行中进程退出时在持久化的安全边界接续，未知工具结果不自动重放；
 //! 发送通知时进程退出记为结果未知，不重发。
 mod profiles;
+mod scheduling;
+pub use scheduling::{TaskSchedulingEntry, TaskSchedulingSnapshot};
 mod strategy;
 pub use profiles::*;
 use serde::{Deserialize, Serialize};
@@ -425,6 +427,20 @@ impl TaskSnapshot {
 /// 仅可信宿主持有；不发布给模型或不受信插件。
 pub trait TaskAdmin: Send + Sync {
     fn snapshot(&self) -> TaskResult<TaskSnapshot>;
+    /// 可信宿主调度所需的完整轻量目录；不携带任务说明、上下文、检查点、结果或通知正文。
+    /// 旧实现默认从完整快照转换；原生实现直接借用账本元数据。
+    fn scheduling_snapshot(&self) -> TaskResult<TaskSchedulingSnapshot> {
+        let directory = TaskSchedulingSnapshot {
+            tasks: self
+                .snapshot()?
+                .tasks
+                .iter()
+                .map(TaskSchedulingEntry::from)
+                .collect(),
+        };
+        directory.validate()?;
+        Ok(directory)
+    }
     /// owner 必须来自可信宿主；返回同一完整身份的轻量目录，不创建任务或重领预算。
     fn summaries_for(&self, owner: &TaskOwner) -> TaskResult<Vec<TaskSummary>> {
         validate_owner(owner)?;
