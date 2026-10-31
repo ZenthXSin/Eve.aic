@@ -178,7 +178,7 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         self.callback = first
         self.enabled(self.send(self.message("failed-command", "执行一次本地检查", contains=["HTTP 503", "已启动 1 次", "本轮已停止", "不再自动重试"])))
         self.assertEqual((self.source / "once.txt").read_text(), "x")
-        self.assertEqual(len(self.kind('chat')),5)  # 一次工具请求 + 后续模型最多四次尝试。
+        self.assertEqual(len(self.kind('chat')), 2)  # 本组关闭传输重试；开启后的上限及命令零重放由 model_retry_test 验证。
         failed = self.turn("执行一次本地检查")["status"]
         self.assertEqual(failed["state"], "Failed")
         evidence = failed["failure"]["evidence"]
