@@ -1,4 +1,5 @@
 """本地模型与 QQ 验收的公共默认、进度分类和可信测试管理员；不修改生产权限。"""
+from contextlib import closing
 import hashlib
 import json
 import sqlite3
@@ -81,10 +82,12 @@ def bootstrap_fixture_group_ids(state, groups):
         return
     state = Path(state)
     state.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(state / "qq-group-whitelist.sqlite3") as connection:
-        connection.execute("CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY, added_at INTEGER NOT NULL)")
-        connection.executemany("INSERT OR IGNORE INTO groups VALUES (?, 0)", [(g,) for g in sorted(groups)])
-        connection.execute("PRAGMA user_version=1")
+    # sqlite3 的上下文只提交/回滚，不负责关闭；Windows 删除夹具前必须释放句柄。
+    with closing(sqlite3.connect(state / "qq-group-whitelist.sqlite3")) as connection:
+        with connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY, added_at INTEGER NOT NULL)")
+            connection.executemany("INSERT OR IGNORE INTO groups VALUES (?, 0)", [(g,) for g in sorted(groups)])
+            connection.execute("PRAGMA user_version=1")
 
 
 def expand_learning_archive(documents, directory):
