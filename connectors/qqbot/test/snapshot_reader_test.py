@@ -11,6 +11,51 @@ from unittest.mock import patch
 import memory_test
 
 
+class FixtureDatabaseTest(unittest.TestCase):
+    def test_whitelist_commit_closes_connections_before_fixture_cleanup(self):
+        import sqlite3
+        from contextlib import closing
+        from fixture_auth import bootstrap_fixture_group_ids
+        original = sqlite3.connect
+        connections = []
+        class Connection:
+            def __init__(self, *args, **kwargs):
+                self.inner = original(*args, **kwargs)
+                self.closed = False
+                connections.append(self)
+            def __enter__(self):
+                self.inner.__enter__()
+                return self
+            def __exit__(self, *args):
+                return self.inner.__exit__(*args)
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+            def close(self):
+                self.inner.close()
+                self.closed = True
+        with tempfile.TemporaryDirectory() as root:
+            try:
+                with patch('fixture_auth.sqlite3.connect', Connection):
+                    bootstrap_fixture_group_ids(root, ['group-1', 'group-2'])
+                    bootstrap_fixture_group_ids(root, ['group-1'])
+                self.assertEqual(len(connections), 2)
+                self.assertTrue(all(c.closed for c in connections), '事务结束不代表 SQLite 连接已关闭')
+                with closing(original(Path(root) / 'qq-group-whitelist.sqlite3')) as connection:
+                    self.assertEqual(connection.execute('SELECT group_id FROM groups ORDER BY group_id').fetchall(), [('group-1',), ('group-2',)])
+                    self.assertEqual(connection.execute('PRAGMA user_version').fetchone()[0], 1)
+            finally:
+                for connection in connections:
+                    if not connection.closed:
+                        connection.close()
+
+    def test_invalid_test_group_cannot_create_a_database_or_expand_permissions(self):
+        from fixture_auth import bootstrap_fixture_group_ids
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(ValueError):
+                bootstrap_fixture_group_ids(root, ['../outside'])
+            self.assertEqual(list(Path(root).iterdir()), [])
+
+
 class SnapshotReaderTest(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
