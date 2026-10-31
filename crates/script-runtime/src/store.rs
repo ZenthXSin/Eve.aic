@@ -57,16 +57,25 @@ pub struct ScriptStore {
     directory: PathBuf,
     ledger: Mutex<Ledger>,
     poisoned: std::sync::atomic::AtomicBool,
-    _lock: File,
+    _lock: StoreLock,
     #[cfg(test)]
     lock_attempts: std::sync::atomic::AtomicUsize,
+}
+// 只有成功取得的锁才包装；失败的独立打开不能影响另一个 Store。
+struct StoreLock(File);
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        // Unix 的 fork/dup 可保留同一 open file description；所有者结束即显式释放。
+        // 解锁失败仍关闭本句柄，不删锁文件、不重试或绕过排他性。
+        let _ = self.0.unlock();
+    }
 }
 impl ScriptStore {
     /// 独占进程锁；损坏、未知格式、缺失已初始化账本均拒绝打开，不清空。
     pub fn open(directory: impl AsRef<Path>) -> Result<Arc<Self>> {
         let directory = directory.as_ref().to_path_buf();
         std::fs::create_dir_all(&directory).map_err(fail)?;
-        let mut lock = OpenOptions::new()
+        let lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -76,6 +85,7 @@ impl ScriptStore {
         // Rust 1.89 的标准库锁在 Unix/Windows 使用对应 OS 独占锁，整个 Store 持有。
         lock.try_lock()
             .map_err(|_| fail("脚本账本锁不可用或已被另一运行器占用"))?;
+        let mut lock = StoreLock(lock);
         let path = directory.join("ledger.json");
         let ledger = if path.exists() {
             if std::fs::metadata(&path).map_err(fail)?.len() > MAX_LEDGER_BYTES as u64 {
@@ -121,7 +131,7 @@ impl ScriptStore {
             ledger
         } else {
             let mut marker = String::new();
-            lock.read_to_string(&mut marker).map_err(fail)?;
+            lock.0.read_to_string(&mut marker).map_err(fail)?;
             if !marker.is_empty() {
                 return Err(fail("已初始化的脚本账本缺失，拒绝重建"));
             }
@@ -147,7 +157,7 @@ impl ScriptStore {
             }
             Ok(())
         })?;
-        let mut marker = &store._lock;
+        let mut marker = &store._lock.0;
         marker.write_all(b"initialized-v1\n").map_err(fail)?;
         marker.sync_all().map_err(fail)?;
         Ok(store)
@@ -671,6 +681,26 @@ pub(crate) fn strict_json(bytes: &[u8]) -> Result<Value> {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    #[cfg(unix)]
+    #[test]
+    fn last_owner_releases_lock_even_if_fork_equivalent_descriptor_is_still_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ScriptStore::open(directory.path()).unwrap();
+        // dup 与 fork 的描述符共享同一 open file description；无需不安全 fork。
+        let inherited = store._lock.0.try_clone().unwrap();
+        let owner = store.clone();
+        drop(store);
+        assert!(ScriptStore::open(directory.path()).is_err());
+        drop(owner);
+        // 并行子进程尚未 exec/关闭继承的描述符，不应延长已结束 Store 的所有权。
+        let reopened = ScriptStore::open(directory.path()).unwrap();
+        drop(inherited);
+        // 旧描述符关闭也不能释放后来重新取得的独占锁。
+        assert!(ScriptStore::open(directory.path()).is_err());
+        drop(reopened);
+        assert!(ScriptStore::open(directory.path()).is_ok());
+    }
 
     #[test]
     fn queued_access_fails_closed_after_an_earlier_commit_poisoned_the_store() {
