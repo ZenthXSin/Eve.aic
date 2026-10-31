@@ -525,10 +525,8 @@ pub(crate) fn auto_confirm(
     validate_records(&records, &pending, archived)?;
     pending.reverse(); // 先确认旧证据，新的纠正具有更高来源修订。
     for candidate in pending {
-        let snapshot = memory
-            .reader(scope.clone())
-            .and_then(|r| r.complete_snapshot())
-            .map_err(|_| failure())?;
+        let reader = memory.reader(scope.clone()).map_err(|_| failure())?;
+        let snapshot = preference_history_view(scope, reader.as_ref()).map_err(|_| failure())?;
         if snapshot.scope != *scope {
             return Err(failure());
         }
@@ -543,30 +541,27 @@ pub(crate) fn auto_confirm(
         if candidate.created_at_ms > at_ms {
             continue;
         }
-        if candidate.draft.evidence_ids.iter().any(|id| {
-            let source = batch.batch.evidence.iter().find(|e| e.id == *id);
-            !snapshot
-                .evidence
-                .iter()
-                .any(|current| Some(current) == source)
-        }) {
-            return Err(failure());
-        }
         let decision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let proposal = policy.decide(candidate, &batch.batch, &snapshot, at_ms)?;
+            let proposal = policy.decide_reader(candidate, &batch.batch, reader.as_ref(), at_ms)?;
             if proposal.policy_version != policy.version() {
                 return Err(LearningError::InvalidInput);
             }
-            eve_learning_plugin::constrain_decision(
+            eve_learning_plugin::constrain_decision_reader(
                 candidate,
                 &batch.batch,
-                &snapshot,
+                reader.as_ref(),
+                snapshot.revision,
                 at_ms,
                 proposal,
             )
         }))
-        .map_err(|_| failure())?
         .map_err(|_| failure())?;
+        let decision = match decision {
+            Ok(decision) => decision,
+            // 多次只读扫描间出现新证据时，不保存旧提议；下一轮重新读取。
+            Err(LearningError::Memory(MemoryError::StaleRevision)) => return Ok(()),
+            Err(_) => return Err(failure()),
+        };
         match learning.record_decision(scope, decision.clone(), at_ms) {
             Ok(record) if record.decision.same_outcome(&decision) => {}
             // 没有可持久审计意图时不得继续写 Memory。
@@ -602,7 +597,7 @@ pub(crate) fn auto_confirm(
             .draft
             .evidence_ids
             .iter()
-            .filter_map(|id| snapshot.evidence.iter().find(|e| e.id == *id))
+            .filter_map(|id| batch.batch.evidence.iter().find(|e| e.id == *id))
             .max_by_key(|e| e.revision)
             .ok_or_else(failure)?;
         let change = PreferenceChange {
@@ -616,7 +611,7 @@ pub(crate) fn auto_confirm(
                 let committed_records = learning.decisions(scope).map_err(|_| failure())?;
                 let complete = memory
                     .reader(scope.clone())
-                    .and_then(|r| r.complete_snapshot())
+                    .and_then(|r| preference_history_view(scope, r.as_ref()))
                     .map_err(|_| failure())?;
                 linked_candidate(&complete, candidate, &committed_records)?.ok_or_else(failure)?;
             }
@@ -1213,6 +1208,80 @@ mod tests {
             panic!("已关联候选重复确认不得写入")
         }
     }
+    struct ConfirmationMemory {
+        inner: PagedMemory,
+        writes: AtomicUsize,
+    }
+    impl MemoryAdmin for ConfirmationMemory {
+        fn reader(&self, scope: MemoryScope) -> MemoryResult<Arc<dyn MemoryService>> {
+            self.inner.reader(scope)
+        }
+        fn import_completed(
+            &self,
+            _: &MemoryScope,
+            _: u64,
+            _: CompletedInteraction,
+        ) -> MemoryResult<MemorySnapshot> {
+            panic!("确认不伪造已完成交互")
+        }
+        fn update_preference(
+            &self,
+            scope: &MemoryScope,
+            revision: u64,
+            change: PreferenceChange,
+        ) -> MemoryResult<MemorySnapshot> {
+            assert_eq!(scope, &self.inner.scope);
+            assert_eq!(revision, 6001);
+            assert!(
+                matches!(change.evidence, PreferenceEvidence::Existing(ref id) if id == "completed-1")
+            );
+            assert!(matches!(change.action, PreferenceAction::Confirm { .. }));
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Err(MemoryError::StaleRevision)
+        }
+    }
+    #[test]
+    fn native_confirmation_uses_paged_evidence_and_never_writes_after_a_late_read_error() {
+        let session = session();
+        let scope = crate::qq_memory::scope(&session);
+        for failed_at in [None, Some(5900)] {
+            let memory = ConfirmationMemory {
+                inner: PagedMemory {
+                    scope: scope.clone(),
+                    failed_at,
+                    reads: Arc::new(AtomicUsize::new(0)),
+                },
+                writes: AtomicUsize::new(0),
+            };
+            let learning = learning(&session, 1);
+            let mut snapshots = learning.snapshots.lock().unwrap();
+            let job = &mut snapshots.get_mut(&scope).unwrap().jobs[0];
+            let mut cursor = memory.inner.scan().unwrap();
+            job.batch.evidence = cursor.next_page().unwrap().into_iter().take(2).collect();
+            job.candidates[0].id = "candidate-new".into();
+            job.candidates[0].draft.text = "回复最多3段".into();
+            job.candidates[0].draft.evidence_ids =
+                job.batch.evidence.iter().map(|e| e.id.clone()).collect();
+            drop(snapshots);
+            let result = auto_confirm(
+                &memory,
+                learning.as_ref(),
+                &eve_learning_plugin::EvidenceConfirmationPolicy,
+                &scope,
+                3,
+            );
+            if failed_at.is_some() {
+                assert!(result.is_err());
+                assert_eq!(learning.record_writes.load(Ordering::SeqCst), 0);
+                assert_eq!(memory.writes.load(Ordering::SeqCst), 0);
+            } else {
+                result.unwrap();
+                assert_eq!(learning.record_writes.load(Ordering::SeqCst), 1);
+                assert_eq!(memory.writes.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
     #[test]
     fn explicit_preference_queries_scan_all_pages_and_only_retain_referenced_sources() {
         let session = session();

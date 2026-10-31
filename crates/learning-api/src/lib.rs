@@ -260,6 +260,18 @@ pub trait AutoConfirmationPolicy: Send + Sync {
     fn version(&self) -> &str {
         "legacy-auto-confirm-v1"
     }
+    /// 只读判断入口。旧策略保持完整快照语义；原生策略可逐页核验后只保留
+    /// 候选批次和偏好历史所需原文。宿主仍独立复核提议并以原修订 CAS 提交。
+    fn decide_reader(
+        &self,
+        candidate: &PreferenceCandidate,
+        batch: &LearningBatch,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+    ) -> LearningResult<LearningDecision> {
+        let memory = reader.complete_snapshot()?;
+        self.decide(candidate, batch, &memory, now_ms)
+    }
     fn allows(
         &self,
         candidate: &PreferenceCandidate,

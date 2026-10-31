@@ -8,7 +8,7 @@ mod store;
 mod strict_json;
 
 pub use confirmation::EvidenceConfirmationPolicy;
-pub use decision::{EVIDENCE_POLICY_VERSION, constrain_decision};
+pub use decision::{EVIDENCE_POLICY_VERSION, constrain_decision, constrain_decision_reader};
 use eve_learning_api::*;
 use eve_memory_api::{MemoryScope, MemorySnapshot};
 use eve_plugin_api::{

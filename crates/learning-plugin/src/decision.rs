@@ -8,6 +8,135 @@ use std::collections::BTreeSet;
 
 pub const EVIDENCE_POLICY_VERSION: &str = "evidence-conflict-v2";
 
+trait DecisionMemory {
+    fn scope(&self) -> &eve_memory_api::MemoryScope;
+    fn revision(&self) -> u64;
+    fn preferences(&self) -> &[Preference];
+    fn evidence(&self) -> &[InteractionEvidence];
+}
+impl DecisionMemory for MemorySnapshot {
+    fn scope(&self) -> &eve_memory_api::MemoryScope {
+        &self.scope
+    }
+    fn revision(&self) -> u64 {
+        self.revision
+    }
+    fn preferences(&self) -> &[Preference] {
+        &self.preferences
+    }
+    fn evidence(&self) -> &[InteractionEvidence] {
+        &self.evidence
+    }
+}
+struct PagedDecisionMemory {
+    scope: eve_memory_api::MemoryScope,
+    revision: u64,
+    preferences: Vec<Preference>,
+    evidence: Vec<InteractionEvidence>,
+}
+impl DecisionMemory for PagedDecisionMemory {
+    fn scope(&self) -> &eve_memory_api::MemoryScope {
+        &self.scope
+    }
+    fn revision(&self) -> u64 {
+        self.revision
+    }
+    fn preferences(&self) -> &[Preference] {
+        &self.preferences
+    }
+    fn evidence(&self) -> &[InteractionEvidence] {
+        &self.evidence
+    }
+}
+fn read_decision_memory(
+    batch: &LearningBatch,
+    reader: &dyn eve_memory_api::MemoryService,
+) -> LearningResult<PagedDecisionMemory> {
+    use eve_memory_api::{MemoryEvidenceCursor, ValidatedMemoryCursor};
+    use std::collections::BTreeMap;
+    if batch.evidence.is_empty() || batch.evidence.len() > MAX_BATCH_EVIDENCE {
+        return Err(LearningError::InvalidInput);
+    }
+    let mut cursor = ValidatedMemoryCursor::new(batch.scope.clone(), reader.scan()?)?;
+    let summary = cursor.summary();
+    let count = summary
+        .preferences
+        .iter()
+        .try_fold(0usize, |n, p| n.checked_add(p.history.len()))
+        .ok_or(LearningError::InvalidInput)?;
+    if count > eve_memory_api::MAX_HISTORY {
+        return Err(LearningError::InvalidInput);
+    }
+    let summary = summary.clone();
+    let mut wanted: BTreeSet<_> = summary
+        .preferences
+        .iter()
+        .flat_map(|p| p.history.iter().map(|v| v.evidence_id.clone()))
+        .collect();
+    let expected: BTreeMap<_, _> = batch.evidence.iter().map(|e| (e.id.as_str(), e)).collect();
+    if expected.len() != batch.evidence.len() {
+        return Err(LearningError::InvalidInput);
+    }
+    wanted.extend(expected.keys().map(|id| (*id).to_owned()));
+    let mut evidence = Vec::new();
+    let mut matched = BTreeSet::new();
+    loop {
+        let page = cursor.next_page()?;
+        if page.is_empty() {
+            break;
+        }
+        for current in page {
+            if let Some(original) = expected.get(current.id.as_str()) {
+                if **original != current {
+                    return Err(LearningError::Conflict);
+                }
+                matched.insert(current.id.clone());
+            }
+            if wanted.contains(&current.id) {
+                evidence.push(current);
+            }
+        }
+    }
+    if matched.len() != expected.len() {
+        return Err(LearningError::Conflict);
+    }
+    Ok(PagedDecisionMemory {
+        scope: summary.scope,
+        revision: summary.revision,
+        preferences: summary.preferences,
+        evidence,
+    })
+}
+
+/// 独立复核可替换策略的提议；完整扫描后才能提交决策，读取变化由调用者重新准入。
+pub fn constrain_decision_reader(
+    candidate: &PreferenceCandidate,
+    batch: &LearningBatch,
+    reader: &dyn eve_memory_api::MemoryService,
+    expected_revision: u64,
+    now_ms: u64,
+    proposal: LearningDecision,
+) -> LearningResult<LearningDecision> {
+    let memory = read_decision_memory(batch, reader)?;
+    if memory.revision != expected_revision {
+        return Err(LearningError::Memory(
+            eve_memory_api::MemoryError::StaleRevision,
+        ));
+    }
+    constrain(candidate, batch, &memory, now_ms, proposal)
+}
+
+pub(super) fn evidence_decision_reader(
+    candidate: &PreferenceCandidate,
+    batch: &LearningBatch,
+    reader: &dyn eve_memory_api::MemoryService,
+    now_ms: u64,
+    version: &str,
+) -> LearningResult<LearningDecision> {
+    let memory = read_decision_memory(batch, reader)?;
+    resolve_decision(candidate, batch, &memory, now_ms, version, true)
+}
+
 /// 宿主必须在提交任何可替换策略的结果前调用。此函数只收窄提议，不把新增授权
 /// 升级成更正授权；宿主另须核对 `proposal.policy_version == policy.version()`。
 /// 替换策略可以自行选择置信度及支持数量门槛；真实来源、时间和冲突屏障不可绕过。
@@ -19,10 +148,20 @@ pub fn constrain_decision(
     now_ms: u64,
     proposal: LearningDecision,
 ) -> LearningResult<LearningDecision> {
+    constrain(candidate, batch, memory, now_ms, proposal)
+}
+
+fn constrain(
+    candidate: &PreferenceCandidate,
+    batch: &LearningBatch,
+    memory: &impl DecisionMemory,
+    now_ms: u64,
+    proposal: LearningDecision,
+) -> LearningResult<LearningDecision> {
     proposal.validate()?;
     if proposal.candidate_id != candidate.id
         || proposal.batch_id != batch.id
-        || proposal.memory_revision != memory.revision
+        || proposal.memory_revision != memory.revision()
         || proposal.evidence_ids != candidate.draft.evidence_ids
     {
         return Err(LearningError::InvalidInput);
@@ -70,7 +209,7 @@ pub(super) fn evidence_decision(
 fn resolve_decision(
     candidate: &PreferenceCandidate,
     batch: &LearningBatch,
-    memory: &MemorySnapshot,
+    memory: &impl DecisionMemory,
     now_ms: u64,
     policy_version: &str,
     enforce_default_threshold: bool,
@@ -81,7 +220,7 @@ fn resolve_decision(
             candidate_id: candidate.id.clone(),
             batch_id: batch.id.clone(),
             policy_version: policy_version.into(),
-            memory_revision: memory.revision,
+            memory_revision: memory.revision(),
             evidence_ids: candidate.draft.evidence_ids.clone(),
             action,
             reason,
@@ -104,12 +243,12 @@ fn resolve_decision(
         return defer(DecisionReason::EvidenceThreshold);
     }
     let text = &candidate.draft.text;
-    if memory.preferences.iter().any(|preference| {
+    if memory.preferences().iter().any(|preference| {
         preference.status == PreferenceStatus::Confirmed && equivalent(&preference.text, text)
     }) {
         return reject(DecisionReason::Duplicate);
     }
-    if memory.preferences.iter().any(|preference| {
+    if memory.preferences().iter().any(|preference| {
         preference.status == PreferenceStatus::Revoked
             && preference
                 .history
@@ -119,7 +258,7 @@ fn resolve_decision(
         return reject(DecisionReason::RevokedConflict);
     }
     // 明确更正过的旧正文不能换一个候选 ID 从历史复活。来源类型检查覆盖全部版本。
-    for preference in &memory.preferences {
+    for preference in memory.preferences() {
         if preference
             .history
             .iter()
@@ -135,7 +274,7 @@ fn resolve_decision(
             return decide(LearningDecisionAction::Confirm, DecisionReason::Eligible);
         }
         let related: Vec<_> = memory
-            .preferences
+            .preferences()
             .iter()
             .filter(|preference| {
                 preference.history.iter().any(|version| {
@@ -165,7 +304,7 @@ fn resolve_decision(
         };
     };
     let related: Vec<_> = memory
-        .preferences
+        .preferences()
         .iter()
         .filter(|preference| {
             preference
@@ -221,21 +360,21 @@ fn resolve_decision(
 fn validate_inputs(
     candidate: &PreferenceCandidate,
     batch: &LearningBatch,
-    memory: &MemorySnapshot,
+    memory: &impl DecisionMemory,
 ) -> LearningResult<()> {
     batch.scope.validate()?;
     validate_id(&candidate.id)?;
     validate_id(&batch.id)?;
     validate_id(&batch.extractor_version)?;
-    if memory.scope != batch.scope
+    if memory.scope() != &batch.scope
         || candidate.batch_id != batch.id
         || candidate.created_at_ms < batch.started_at_ms
         || candidate.expires_at_ms <= candidate.created_at_ms
-        || memory.revision == 0
+        || memory.revision() == 0
         || batch.evidence.is_empty()
         || batch.evidence.len() > MAX_BATCH_EVIDENCE
-        || memory.evidence.len() as u64 > memory.revision
-        || memory.preferences.len() > eve_memory_api::MAX_PREFERENCES
+        || memory.evidence().len() as u64 > memory.revision()
+        || memory.preferences().len() > eve_memory_api::MAX_PREFERENCES
     {
         return Err(LearningError::InvalidInput);
     }
@@ -244,11 +383,11 @@ fn validate_inputs(
     let mut revisions = BTreeSet::new();
     let mut messages = BTreeSet::new();
     let mut turns = BTreeSet::new();
-    for item in &memory.evidence {
+    for item in memory.evidence() {
         validate_id(&item.id)?;
         if !ids.insert(&item.id)
             || item.revision == 0
-            || item.revision > memory.revision
+            || item.revision > memory.revision()
             || !revisions.insert(item.revision)
         {
             return Err(LearningError::InvalidInput);
@@ -290,7 +429,7 @@ fn validate_inputs(
     }
     let mut preference_ids = BTreeSet::new();
     let mut history_count = 0usize;
-    for preference in &memory.preferences {
+    for preference in memory.preferences() {
         validate_id(&preference.id)?;
         validate_text(&preference.text, eve_memory_api::MAX_PREFERENCE_BYTES)?;
         if !preference_ids.insert(&preference.id) || preference.history.is_empty() {
@@ -321,15 +460,21 @@ fn validate_inputs(
     Ok(())
 }
 
-fn source<'a>(memory: &'a MemorySnapshot, id: &str) -> LearningResult<&'a InteractionEvidence> {
+fn source<'a>(
+    memory: &'a impl DecisionMemory,
+    id: &str,
+) -> LearningResult<&'a InteractionEvidence> {
     memory
-        .evidence
+        .evidence()
         .iter()
         .find(|item| item.id == id)
         .ok_or(LearningError::InvalidInput)
 }
 
-fn has_manual_history(preference: &Preference, memory: &MemorySnapshot) -> LearningResult<bool> {
+fn has_manual_history(
+    preference: &Preference,
+    memory: &impl DecisionMemory,
+) -> LearningResult<bool> {
     for version in &preference.history {
         if matches!(
             source(memory, &version.evidence_id)?.source,
@@ -343,9 +488,9 @@ fn has_manual_history(preference: &Preference, memory: &MemorySnapshot) -> Learn
 
 fn already_linked(
     candidate: &PreferenceCandidate,
-    memory: &MemorySnapshot,
+    memory: &impl DecisionMemory,
 ) -> LearningResult<bool> {
-    for preference in &memory.preferences {
+    for preference in memory.preferences() {
         let mut linked = false;
         for version in &preference.history {
             if version.text != candidate.draft.text || version.status != PreferenceStatus::Confirmed

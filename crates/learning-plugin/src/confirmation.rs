@@ -9,6 +9,16 @@ impl AutoConfirmationPolicy for EvidenceConfirmationPolicy {
         crate::decision::EVIDENCE_POLICY_VERSION
     }
 
+    fn decide_reader(
+        &self,
+        candidate: &PreferenceCandidate,
+        batch: &LearningBatch,
+        reader: &dyn eve_memory_api::MemoryService,
+        now_ms: u64,
+    ) -> LearningResult<LearningDecision> {
+        crate::decision::evidence_decision_reader(candidate, batch, reader, now_ms, self.version())
+    }
+
     fn allows(
         &self,
         candidate: &PreferenceCandidate,
