@@ -23,6 +23,45 @@ mod cold_jobs;
 mod cold_startup;
 
 static INSTANCE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+// 仅用 MSRV 已有的 CAS；新版 Rust 弃用 fetch_update，try_update 又不在 MSRV 内。
+fn allocate_instance(sequence: &std::sync::atomic::AtomicU64) -> LearningResult<u64> {
+    use std::sync::atomic::Ordering;
+    let mut current = sequence.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1).ok_or(LearningError::LimitReached)?;
+        match sequence.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(value) => return Ok(value),
+            Err(actual) => current = actual,
+        }
+    }
+}
+#[cfg(test)]
+mod instance_tests {
+    use super::*;
+    #[test]
+    fn concurrent_instances_are_unique_and_exhaustion_never_wraps() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let sequence = AtomicU64::new(1);
+        let values = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..32)
+                .map(|_| scope.spawn(|| allocate_instance(&sequence).unwrap()))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<BTreeSet<_>>()
+        });
+        assert_eq!(values, (1..=32).collect());
+        let sequence = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(allocate_instance(&sequence), Ok(u64::MAX - 1));
+        assert_eq!(
+            allocate_instance(&sequence),
+            Err(LearningError::LimitReached)
+        );
+        assert_eq!(sequence.load(Ordering::Relaxed), u64::MAX);
+    }
+}
+
 const FORMAT_VERSION: u32 = 1;
 const DECISIONS_STATE_KEY: &str = "learning.decisions.v1";
 const MAX_DECISIONS_STATE_BYTES: usize = MAX_STATE_BYTES;
@@ -258,13 +297,7 @@ impl StoredLearning {
         }
         let mut inner = Inner {
             change: LearningChangeToken {
-                instance: INSTANCE_SEQUENCE
-                    .fetch_update(
-                        std::sync::atomic::Ordering::Relaxed,
-                        std::sync::atomic::Ordering::Relaxed,
-                        |n| n.checked_add(1),
-                    )
-                    .map_err(|_| LearningError::LimitReached)?,
+                instance: allocate_instance(&INSTANCE_SEQUENCE)?,
                 revision: 0,
             },
             scope_changes: BTreeMap::new(),
