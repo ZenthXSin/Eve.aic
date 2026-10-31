@@ -224,6 +224,8 @@ mod reasoning_tests {
                 path,
                 vec![
                     config::openai_schema(),
+                    config::model_uses_schema(),
+                    config::dialogue_schema(),
                     eve_config_api::runtime_llm_schema(),
                     eve_config_api::model_roles_schema(),
                     eve_message_api::message_schema(),
@@ -331,5 +333,140 @@ mod reasoning_tests {
         );
         assert!(tool.execute(call("low"), context("admin")).await.is_ok());
         kernel.stop_all().await.unwrap();
+    }
+    #[tokio::test]
+    async fn model_status_is_read_only_distinguishes_revisions_and_rejects_forged_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let (kernel, reasoning, commands) = setup(directory.path()).await;
+        let tool = crate::qq_model_status::StatusTool(reasoning.0);
+        let inspect = |arguments| ToolCall {
+            id: "inspect".into(),
+            name: "inspect_model_runtime".into(),
+            arguments,
+        };
+        let before = std::fs::read(directory.path().join("config.json")).ok();
+        let result = tool
+            .execute(inspect(json!({})), context("member"))
+            .await
+            .unwrap();
+        assert_eq!(result["purpose"], "dialogue");
+        assert!(result["configured"]["role"].is_null());
+        assert!(result["admission"]["active"].is_null());
+        assert_eq!(result["configuration_written"], false);
+        assert_eq!(
+            std::fs::read(directory.path().join("config.json")).ok(),
+            before
+        );
+        for arguments in [
+            json!({"purpose":null}),
+            json!({"purpose":"jev"}),
+            json!({"purpose":"../secret"}),
+            json!({"user":"owner"}),
+            json!({"purpose":"dialogue","url":"https://invalid.example"}),
+        ] {
+            assert!(tool.validate_arguments(&arguments).is_err());
+            assert!(
+                tool.execute(inspect(arguments), context("member"))
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            tool.execute(inspect(json!({})), ToolExecutionContext::new())
+                .await
+                .is_err()
+        );
+        let cancelled = context("member");
+        cancelled.cancellation_handle().cancel();
+        assert!(tool.execute(inspect(json!({})), cancelled).await.is_err());
+        let mut current = commands.admin.current().unwrap();
+        for (namespace, field, value) in [
+            (config::OPENAI_NAMESPACE, "model_role", json!("primary")),
+            (
+                eve_config_api::MODELS_NAMESPACE,
+                "primary_enabled",
+                json!(true),
+            ),
+            (
+                eve_config_api::MODELS_NAMESPACE,
+                "primary_provider",
+                json!("openai"),
+            ),
+            (
+                eve_config_api::MODELS_NAMESPACE,
+                "primary_model",
+                json!("status-model"),
+            ),
+            (
+                eve_config_api::MODELS_NAMESPACE,
+                "primary_max_concurrent_requests",
+                json!(1),
+            ),
+        ] {
+            current
+                .namespaces
+                .entry(namespace.into())
+                .or_insert_with(|| NamespaceValues {
+                    schema_version: 1,
+                    values: BTreeMap::new(),
+                })
+                .values
+                .insert(field.into(), value);
+        }
+        commands
+            .admin
+            .replace(current.revision, current.namespaces, ApplyMode::Immediate)
+            .unwrap();
+        let revision = commands.admin.current().unwrap().revision;
+        let gate = crate::model_concurrency::gate(
+            &commands.settings,
+            eve_config_api::ModelRole::Primary,
+            1,
+            revision,
+        )
+        .unwrap();
+        let mut current = commands.admin.current().unwrap();
+        current
+            .namespaces
+            .get_mut(eve_config_api::MODELS_NAMESPACE)
+            .unwrap()
+            .values
+            .insert("primary_max_concurrent_requests".into(), json!(2));
+        commands
+            .admin
+            .replace(current.revision, current.namespaces, ApplyMode::Immediate)
+            .unwrap();
+        let configured_revision = commands.admin.current().unwrap().revision;
+        let before = std::fs::read(directory.path().join("config.json")).unwrap();
+        let result = tool
+            .execute(inspect(json!({"purpose":"summary"})), context("member"))
+            .await
+            .unwrap();
+        assert_eq!(result["configured"]["model"], "status-model");
+        assert_eq!(result["configured"]["max_concurrent_requests"], 2);
+        assert_eq!(result["configured"]["revision"], configured_revision);
+        assert_eq!(result["admission"]["limit"], 1);
+        assert_eq!(result["admission"]["revision"], revision);
+        assert_eq!(result["admission"]["active"], 0);
+        assert_eq!(result["inflight_model_known"], false);
+        assert_eq!(result["provider_availability_verified"], false);
+        assert_eq!(
+            gate.status().unwrap().limit,
+            1,
+            "inspection cannot adopt a new configured limit"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("config.json")).unwrap(),
+            before
+        );
+        for forbidden in ["credential_ref", "api_key", "base_url", "trusted", "member"] {
+            assert!(!result.to_string().contains(forbidden));
+        }
+        kernel.stop_all().await.unwrap();
+        assert!(
+            tool.execute(inspect(json!({})), context("member"))
+                .await
+                .is_err()
+        );
     }
 }

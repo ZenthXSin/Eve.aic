@@ -39,6 +39,37 @@ class ModelSwitchAcceptance(developer.DeveloperAcceptance):
         return next(message['content'] for message in reversed(body['messages'])
                     if message['role'] == 'user')
 
+    def test_member_can_inspect_configured_model_without_probe_writes_or_admin_access(self):
+        def respond(body):
+            self.assertIn('inspect_model_runtime', self.definitions(body))
+            results = self.results(body)
+            if not results:
+                return tool_response([('inspect_model_runtime', {})])
+            self.assertEqual(len(results), 1)
+            result = results[0]
+            self.assertEqual(result['purpose'], 'dialogue')
+            self.assertEqual(result['configured']['role'], 'primary')
+            self.assertEqual(result['configured']['model'], 'role-a')
+            self.assertEqual(result['configured']['max_output_tokens'], 128)
+            self.assertEqual(result['configured']['max_concurrent_requests'], 1)
+            self.assertEqual(result['admission']['limit'], 1)
+            self.assertEqual(result['admission']['active'], 0)
+            self.assertEqual(result['admission']['waiting'], 0)
+            self.assertFalse(result['configuration_written'])
+            self.assertFalse(result['provider_availability_verified'])
+            self.assertFalse(result['inflight_model_known'])
+            encoded = json.dumps(result)
+            for forbidden in ('api_key', 'credential_ref', 'base_url', 'user-2', 'test-model-secret'):
+                self.assertNotIn(forbidden, encoded)
+            return text_response('当前配置role-a，没有排队请求')
+        self.callback = respond
+        for index in range(2):
+            self.enabled(self.send(self.message('inspect-' + str(index), '检查当前模型', user='user-2',
+                                                expected='当前配置role-a，没有排队请求')), role=True)
+            configuration = self.work / 'state/configuration/config.json'
+            self.assertFalse(configuration.exists(), '只读查询不创建或保存配置')
+        self.assertEqual(self.chat_rounds, 4, '两轮各一次对话和一次工具后续，无额外探测或重试')
+
     def test_switch_changes_real_requests_and_survives_restart(self):
         self.callback = lambda body: text_response('模型=' + body['model'])
         self.enabled([*self.send(self.message('query', '/model', contains=['当前主模型：direct-a', '全局'])),

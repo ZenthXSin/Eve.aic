@@ -2133,6 +2133,7 @@ async fn run_qqbot_composed(
         } else {None};
         let reasoning_settings = Arc::new(std::sync::OnceLock::new());
         bootstrap.tools.push(Arc::new(crate::qq_model::ReasoningTool(reasoning_settings.clone())));
+        bootstrap.tools.push(Arc::new(crate::qq_model_status::StatusTool(reasoning_settings.clone())));
         // 群白名单工具：默认每个群禁用，只有主人本人在群里能放行或取消放行。
         bootstrap.tools.push(Arc::new(crate::qq_group_access::AllowTool {
             access: group_access.clone(),
