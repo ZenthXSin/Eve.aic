@@ -16,6 +16,8 @@ mod compaction;
 mod control_runner;
 mod history;
 mod images;
+mod json_size;
+pub use json_size::serialized_json_size;
 mod llm_host;
 mod relation_judge;
 mod session_host;

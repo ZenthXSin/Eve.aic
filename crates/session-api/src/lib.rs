@@ -235,12 +235,7 @@ pub fn validate_completed_turn(input: &str, messages: &[ChatMessage]) -> Session
             return Err(SessionError::InvalidInput);
         }
     }
-    ModelRequest {
-        messages: messages.to_vec(),
-        tools: vec![],
-    }
-    .validate()
-    .map_err(|_| SessionError::InvalidInput)
+    ModelRequest::validate_parts(messages, &[]).map_err(|_| SessionError::InvalidInput)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
