@@ -87,6 +87,18 @@ pub const DELIVERY_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// 每条通知至多投递尝试次数（其中至多一次主动私聊）。
 pub const MAX_ATTEMPTS: usize = 6;
 pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
+/// 内容寻址的不可变任务正文；实现须核对大小/摘要、持久化后确认，不允许覆盖。
+/// 冷正文与索引共同备份；缺失或损坏不能伪装成任务不存在。
+pub trait TaskArchiveStore: Send + Sync {
+    fn get(&self, hash: &str) -> TaskResult<Vec<u8>>;
+    fn put(&self, hash: &str, bytes: &[u8]) -> TaskResult<()>;
+    /// 只供可信宿主在完整索引提交确认后回收无引用正文；不是用户工具。
+    /// 索引和正文必须使用独占的同一存储；替换实现可保留历史并另设磁盘配额。
+    fn compact(&self, _retained: &[String]) -> TaskResult<()> {
+        Ok(())
+    }
+}
+
 pub const MAX_AUTO_RECOVERIES: u32 = 3;
 
 /// 新任务默认开启安全接续；旧任务没有检查点，保持旧的中断语义。

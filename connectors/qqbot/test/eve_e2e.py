@@ -1,6 +1,7 @@
 """Actual Eve process + production plugin + fake Node/loopback Chat HTTP."""
 from fixture_auth import configure_fixture_progress
 from request_messages import conversation_messages
+from fixture_auth import read_archived_state
 import hashlib
 import json
 from fixture_auth import bootstrap_test_admin, bootstrap_fixture_groups
@@ -190,9 +191,7 @@ class Acceptance(unittest.TestCase):
         return summary
 
     def documents(self):
-        state = json.loads((self.work / "state/state.json").read_text())
-        return {owner: {key: json.loads(bytes(value)) for key, value in entries.items()}
-            for owner, entries in state["entries"].items()}
+        return read_archived_state(self.work / 'state/state.json')
 
     def expression_state(self):
         with sqlite3.connect(self.work / "state/training-expressions.sqlite3") as db:

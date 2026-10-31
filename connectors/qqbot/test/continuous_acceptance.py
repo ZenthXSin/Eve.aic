@@ -3,6 +3,7 @@
 计划是有顺序的对话/断言，不把独立进程的 echo 次数冒充连续交互。
 输出保存输入、模型决策、工具回执、状态检查与累计预算；凭据只在上游代理内存中使用。
 """
+from fixture_auth import read_archived_state
 import argparse
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -240,12 +241,7 @@ class ContinuousTrial:
         return result, status
 
     def documents(self):
-        path = self.state / 'state.json'
-        if not path.exists():
-            return {}
-        raw = json.loads(path.read_bytes())
-        return {owner: {key: json.loads(bytes(v)) for key, v in rows.items()}
-                for owner, rows in raw['entries'].items()}
+        return read_archived_state(self.state / 'state.json')
 
     def wait_file(self, path):
         until = time.monotonic() + self.args.round_seconds

@@ -263,7 +263,8 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.release.set()
         # 模拟升级前没有执行检查点的历史任务；不能对未知旧操作自动重放。
         state = json.loads(self.state_path.read_text())
-        ledger = json.loads(bytes(state["entries"]["eve.task"]["tasks.v1"]))
+        ledger = self.ledger()
+        ledger['format_version'] = 2
         ledger["tasks"][0].pop("execution", None)
         state["entries"]["eve.task"]["tasks.v1"] = list(json.dumps(ledger).encode())
         self.state_path.write_text(json.dumps(state))
