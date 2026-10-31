@@ -10,6 +10,20 @@ class ModelRetryAcceptance(developer.DeveloperAcceptance):
         if name.startswith('test_'): locals()[name] = None
     del name
 
+    def enabled(self, script):
+        self.run_eve(script, interest=False, memory=True, research=False, practice=False,
+                     env_extra={"EVE_DEVELOPER_CONFIG": str(self.developer_config), "EVE_OPENAI_TRANSIENT_RETRIES":"true"})
+
+    def test_explicit_retry_opt_out_saves_failure_without_starting_tools(self):
+        self.http_status = lambda kind,number:503 if kind=='chat' else None
+        message = {**self.message('retry-off','核对不重试'), 'accept_any':True}
+        self.run_eve(self.send(message), interest=False, memory=True, research=False, practice=False,
+                     env_extra={"EVE_DEVELOPER_CONFIG":str(self.developer_config), "EVE_OPENAI_TRANSIENT_RETRIES":"false"})
+        self.assertEqual(len(self.kind('chat')),1)
+        failure=self.turn('核对不重试')['status']['failure']
+        self.assertEqual(failure['started_tools'],0)
+        self.assertEqual(failure['code'],'Provider')
+
     def test_transient_failure_after_command_retries_only_model_and_preserves_receipts(self):
         retried = []
         def status(kind, number):
