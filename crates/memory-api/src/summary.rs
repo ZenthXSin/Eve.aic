@@ -4,7 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::{future::Future, pin::Pin};
 
 pub const SUMMARY_PLUGIN_ID: &str = "eve.memory-summary";
+/// 常驻任务正文上限；历史通过不可变分块归档，不是整个生命周期上限。
 pub const MAX_SUMMARY_JOBS: usize = 128;
+pub const MAX_SUMMARY_ARCHIVE_BYTES: usize = 16 * 1024 * 1024;
+pub trait SummaryArchiveStore: Send + Sync {
+    fn get(&self, hash: &str) -> MemoryResult<Vec<u8>>;
+    fn put(&self, hash: &str, bytes: &[u8]) -> MemoryResult<()>;
+}
 pub const MAX_SUMMARY_POINTS: usize = 6;
 pub const MAX_SUMMARY_INPUT_BYTES: usize = 65_536;
 pub const MAX_SUMMARY_OUTPUT_BYTES: usize = 8192;
@@ -76,6 +82,11 @@ pub enum SummaryFailure {
     Provider,
     Timeout,
     InvalidOutput,
+    InvalidOutputJson,
+    InvalidOutputShape,
+    InvalidOutputSource,
+    InvalidOutputTooLarge,
+    UnexpectedTool,
     Cancelled,
     InputTooLarge,
 }
@@ -89,11 +100,20 @@ pub enum SummaryStatus {
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SummaryJob {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<SummaryRepair>,
     pub batch: SummaryBatch,
     pub status: SummaryStatus,
     pub finished_at_ms: Option<u64>,
     /// 始终是待核对的模型归纳，不确认或更新 Memory.preferences。
     pub points: Vec<SummaryPoint>,
+}
+/// 原失败记录保留，补做追加新全局序号；最多两次，不补做中断或取消的不明结局。
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryRepair {
+    pub original_sequence: u64,
+    pub attempt: u8,
 }
 /// 仅在固定来源流全部核验完成后返回；不代表归纳语义已被事实核实。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -121,8 +141,15 @@ pub trait SummaryAdmin: Send + Sync {
         }
         Ok(jobs
             .into_iter()
-            .rev()
-            .find(|job| job.status == SummaryStatus::Completed))
+            .filter(|job| job.status == SummaryStatus::Completed)
+            .max_by_key(|job| {
+                (
+                    job.batch.source_revision,
+                    job.repair
+                        .as_ref()
+                        .map_or(job.batch.sequence, |repair| repair.original_sequence),
+                )
+            }))
     }
     fn reserve(
         &self,
@@ -146,6 +173,31 @@ pub trait SummaryAdmin: Send + Sync {
             return Err(crate::MemoryError::Conflict);
         }
         self.reserve(&snapshot, now_ms, version, options)
+    }
+    /// 组合层入口；原生后端在新证据和到期补做之间公平轮换，重启继续读取原记录。
+    fn reserve_scheduled_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn crate::MemoryService,
+        now_ms: u64,
+        version: &str,
+        options: SummaryOptions,
+    ) -> MemoryResult<Option<SummaryBatch>> {
+        if let Some(batch) = self.reserve_reader(scope, reader, now_ms, version, options)? {
+            return Ok(Some(batch));
+        }
+        self.reserve_repair_reader(scope, reader, now_ms, version, options)
+    }
+    /// 已知失败的有限补做；默认替换后端不隐式重放历史。
+    fn reserve_repair_reader(
+        &self,
+        _scope: &MemoryScope,
+        _reader: &dyn crate::MemoryService,
+        _now_ms: u64,
+        _version: &str,
+        _options: SummaryOptions,
+    ) -> MemoryResult<Option<SummaryBatch>> {
+        Ok(None)
     }
     fn finish(
         &self,

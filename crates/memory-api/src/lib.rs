@@ -25,7 +25,7 @@ use std::{fmt, sync::Arc};
 
 pub const MEMORY_PLUGIN_ID: &str = "eve.memory";
 pub const MEMORY_FORMAT_VERSION: u32 = 1;
-/// 热层全局证据容量；仍受 4 MiB 字节上限约束。装配归档存储后，较早的完成交互
+/// 热层全局证据容量；仍受 16 MiB 字节上限约束。装配归档存储后，较早的完成交互
 /// 移入不可变分块而不是被清理；未装配时满即拒绝新增。
 pub const MAX_EVIDENCE: usize = 4096;
 /// 可信作用域（通道 + 会话 + 用户）总数。群聊每位成员各占一个作用域；满后新作用域的

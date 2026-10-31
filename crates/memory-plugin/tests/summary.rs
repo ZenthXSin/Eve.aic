@@ -30,7 +30,11 @@ impl StateStore for Store {
     }
     fn set(&self, owner: &PluginId, key: String, value: Vec<u8>) -> PluginResult<()> {
         self.writes.fetch_add(1, Ordering::SeqCst);
-        let mode = self.failure.load(Ordering::SeqCst);
+        let mode = if key == SUMMARY_STATE_KEY {
+            self.failure.load(Ordering::SeqCst)
+        } else {
+            0
+        };
         if mode == 1 {
             return Err(PluginError::State("private backend detail".into()));
         }
@@ -822,5 +826,512 @@ async fn real_archive_sources_remain_verifiable_after_hot_eviction_and_restart()
         before,
         "只读重启与查询不改写来源和摘要账本"
     );
+    kernel.stop_all().await.unwrap();
+}
+
+async fn cold_open(
+    store: Arc<Store>,
+    archive: Arc<dyn SummaryArchiveStore>,
+) -> PluginResult<(Kernel, SummaryController)> {
+    let kernel = Kernel::with_services(KernelServices {
+        state: store,
+        ..KernelServices::default()
+    });
+    let plugin = ConversationSummaryPlugin::new()?.with_archive(archive);
+    let admin = plugin.controller();
+    kernel.register(Box::new(plugin))?;
+    kernel.start(&owner()).await?;
+    Ok((kernel, admin))
+}
+fn saved_summary(store: &Store) -> serde_json::Value {
+    serde_json::from_slice(&store.get(&owner(), SUMMARY_STATE_KEY).unwrap().unwrap()).unwrap()
+}
+#[tokio::test]
+async fn cold_history_crosses_global_128_jobs_keeps_scopes_sequences_and_consumption_after_restart()
+{
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(&root.path().join("state"));
+    let archive =
+        Arc::new(eve_memory_plugin::FileSummaryArchive::open(root.path().join("archive")).unwrap());
+    let (kernel, admin) = cold_open(store.clone(), archive.clone()).await.unwrap();
+    let alice = snapshot(1);
+    let batch = admin.reserve(&alice, 1, "v1", options()).unwrap().unwrap();
+    admin.finish(&batch, 1, Ok(vec![point("e-1")])).unwrap();
+    for i in 1..=260 {
+        let mut source = snapshot(i);
+        source.scope.user_id = "bob".into();
+        let batch = admin
+            .reserve(&source, i + 1, "v1", options())
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.sequence, i + 1);
+        admin.finish(&batch, i + 1, Ok(vec![])).unwrap();
+        let saved = saved_summary(&store);
+        assert!(saved["jobs"].as_array().unwrap().len() <= MAX_SUMMARY_JOBS);
+    }
+    let saved = saved_summary(&store);
+    assert_eq!(saved["format_version"], 2);
+    assert!(saved["tail"]["last"].as_u64().unwrap() >= 128);
+    assert_eq!(admin.jobs(&alice.scope).unwrap().len(), 1);
+    assert_eq!(
+        admin
+            .latest_completed(&alice.scope)
+            .unwrap()
+            .unwrap()
+            .points,
+        vec![point("e-1")]
+    );
+    kernel.stop_all().await.unwrap();
+    let (kernel, admin) = cold_open(store.clone(), archive).await.unwrap();
+    assert_eq!(
+        admin
+            .latest_completed(&alice.scope)
+            .unwrap()
+            .unwrap()
+            .batch
+            .sequence,
+        1
+    );
+    let mut bob = snapshot(260);
+    bob.scope.user_id = "bob".into();
+    assert_eq!(admin.jobs(&bob.scope).unwrap().len(), 260);
+    assert!(
+        admin
+            .reserve(&bob, 1000, "v1", options())
+            .unwrap()
+            .is_none()
+    );
+    bob = snapshot(261);
+    bob.scope.user_id = "bob".into();
+    assert_eq!(
+        admin
+            .reserve(&bob, 1001, "v1", options())
+            .unwrap()
+            .unwrap()
+            .sequence,
+        262
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_summary_repairs_are_finite_persistent_and_never_replace_newer_same_revision_context()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(&root.path().join("state"));
+    let archive =
+        Arc::new(eve_memory_plugin::FileSummaryArchive::open(root.path().join("archive")).unwrap());
+    let (kernel, admin) = cold_open(store.clone(), archive.clone()).await.unwrap();
+    let source = reader(4);
+    let scope = source.summary.scope.clone();
+    let first = admin
+        .reserve_reader(&scope, &source, 10, "v1", options())
+        .unwrap()
+        .unwrap();
+    admin
+        .finish(&first, 11, Err(SummaryFailure::InvalidOutput))
+        .unwrap();
+    let second = admin
+        .reserve_reader(&scope, &source, 12, "v1", options())
+        .unwrap()
+        .unwrap();
+    admin.finish(&second, 13, Ok(vec![point("e-2")])).unwrap();
+    let repair = admin
+        .reserve_repair_reader(&scope, &source, 70_000, "v2", options())
+        .unwrap()
+        .unwrap();
+    assert_eq!(repair.consumed_ids, first.consumed_ids);
+    assert_eq!(repair.source_revision, first.source_revision);
+    assert!(repair.previous.is_empty());
+    admin
+        .finish(&repair, 70_001, Ok(vec![point("e-1")]))
+        .unwrap();
+    assert_eq!(
+        admin
+            .latest_completed(&scope)
+            .unwrap()
+            .unwrap()
+            .batch
+            .sequence,
+        second.sequence
+    );
+    let third = admin
+        .reserve_reader(&scope, &source, 70_002, "v1", options())
+        .unwrap()
+        .unwrap();
+    admin
+        .finish(&third, 70_003, Err(SummaryFailure::Timeout))
+        .unwrap();
+    for (attempt, at) in [(1, 140_000), (2, 270_000)] {
+        let repair = admin
+            .reserve_repair_reader(&scope, &source, at, "v2", options())
+            .unwrap()
+            .unwrap();
+        let job = admin.jobs(&scope).unwrap().pop().unwrap();
+        assert_eq!(job.repair.unwrap().attempt, attempt);
+        admin
+            .finish(&repair, at + 1, Err(SummaryFailure::Timeout))
+            .unwrap();
+    }
+    kernel.stop_all().await.unwrap();
+    let (kernel, admin) = cold_open(store, archive).await.unwrap();
+    assert!(
+        admin
+            .reserve_repair_reader(&scope, &source, 1_000_000, "v3", options())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        admin
+            .jobs(&scope)
+            .unwrap()
+            .iter()
+            .filter(|j| j.batch.sequence == first.sequence
+                && j.status == SummaryStatus::Failed(SummaryFailure::InvalidOutput))
+            .count(),
+        1
+    );
+    assert_eq!(
+        admin
+            .latest_completed(&scope)
+            .unwrap()
+            .unwrap()
+            .batch
+            .sequence,
+        second.sequence
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_summary_migration_and_uncertain_root_commit_keep_both_recoverable_histories() {
+    for failure in [1, 2] {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(&root.path().join("state"));
+        let (kernel, admin) = open(store.clone()).await;
+        for i in 1..=100 {
+            let batch = admin
+                .reserve(&snapshot(i), i, "v1", options())
+                .unwrap()
+                .unwrap();
+            admin.finish(&batch, i, Ok(vec![])).unwrap();
+        }
+        kernel.stop_all().await.unwrap();
+        let before = store.get(&owner(), SUMMARY_STATE_KEY).unwrap();
+        let archive = Arc::new(
+            eve_memory_plugin::FileSummaryArchive::open(root.path().join("archive")).unwrap(),
+        );
+        store.failure.store(failure, Ordering::SeqCst);
+        assert!(cold_open(store.clone(), archive.clone()).await.is_err());
+        if failure == 1 {
+            assert_eq!(store.get(&owner(), SUMMARY_STATE_KEY).unwrap(), before);
+        }
+        store.failure.store(0, Ordering::SeqCst);
+        let (kernel, admin) = cold_open(store.clone(), archive).await.unwrap();
+        assert_eq!(admin.jobs(&snapshot(0).scope).unwrap().len(), 100);
+        assert_eq!(saved_summary(&store)["format_version"], 2);
+        assert!(
+            admin
+                .reserve(&snapshot(100), 101, "v1", options())
+                .unwrap()
+                .is_none()
+        );
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn late_cold_corruption_is_checked_before_recovering_any_running_summary() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(&root.path().join("state"));
+    let directory = root.path().join("archive");
+    let archive = Arc::new(eve_memory_plugin::FileSummaryArchive::open(&directory).unwrap());
+    let (kernel, admin) = cold_open(store.clone(), archive.clone()).await.unwrap();
+    for i in 1..=170 {
+        let batch = admin
+            .reserve(&snapshot(i), i, "v1", options())
+            .unwrap()
+            .unwrap();
+        admin.finish(&batch, i, Ok(vec![])).unwrap();
+    }
+    admin
+        .reserve(&snapshot(171), 171, "v1", options())
+        .unwrap()
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    let before = store.get(&owner(), SUMMARY_STATE_KEY).unwrap();
+    let tail = saved_summary(&store)["tail"]["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let latest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join(format!("{tail}.json"))).unwrap())
+            .unwrap();
+    let oldest = latest["previous"]["hash"].as_str().unwrap();
+    let path = directory.join(format!("{oldest}.json"));
+    std::fs::write(&path, b"damaged").unwrap();
+    assert!(cold_open(store.clone(), archive).await.is_err());
+    assert_eq!(store.get(&owner(), SUMMARY_STATE_KEY).unwrap(), before);
+    assert_eq!(std::fs::read(path).unwrap(), b"damaged");
+}
+
+#[tokio::test]
+async fn missing_initialized_summary_root_is_not_a_fresh_empty_ledger() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(&root.path().join("state"));
+    let archive =
+        Arc::new(eve_memory_plugin::FileSummaryArchive::open(root.path().join("archive")).unwrap());
+    let (kernel, _) = cold_open(store.clone(), archive.clone()).await.unwrap();
+    kernel.stop_all().await.unwrap();
+    // 模拟根键消失，其他持久状态完整保留。
+    let kernel = Kernel::with_services(KernelServices {
+        state: Arc::new(HiddenSummary(store.clone())),
+        ..KernelServices::default()
+    });
+    kernel
+        .register(Box::new(
+            ConversationSummaryPlugin::new()
+                .unwrap()
+                .with_archive(archive),
+        ))
+        .unwrap();
+    let before = store.get(&owner(), SUMMARY_STATE_KEY).unwrap();
+    assert!(kernel.start_all().await.is_err());
+    assert_eq!(store.get(&owner(), SUMMARY_STATE_KEY).unwrap(), before);
+}
+struct HiddenSummary(Arc<Store>);
+impl StateStore for HiddenSummary {
+    fn get(&self, owner: &PluginId, key: &str) -> PluginResult<Option<Vec<u8>>> {
+        if key == SUMMARY_STATE_KEY {
+            Ok(None)
+        } else {
+            self.0.get(owner, key)
+        }
+    }
+    fn set(&self, owner: &PluginId, key: String, bytes: Vec<u8>) -> PluginResult<()> {
+        self.0.set(owner, key, bytes)
+    }
+}
+
+#[tokio::test]
+async fn summary_repairs_revalidate_all_sources_and_skip_revocation_changed_or_late_failed_scans() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(root.path());
+    let (kernel, admin) = open(store.clone()).await;
+    let source = reader(1);
+    let scope = source.summary.scope.clone();
+    let batch = admin
+        .reserve_reader(&scope, &source, 10, "v1", options())
+        .unwrap()
+        .unwrap();
+    admin
+        .finish(&batch, 11, Err(SummaryFailure::InvalidOutput))
+        .unwrap();
+    let before = store.get(&owner(), SUMMARY_STATE_KEY).unwrap();
+    let mut changed = reader(1);
+    let mut record = generated(1);
+    if let EvidenceSource::CompletedInteraction { user_text, .. } = &mut record.source {
+        *user_text = "内容已被替换".into();
+    }
+    changed.fixed = Some(vec![record]);
+    assert!(
+        admin
+            .reserve_repair_reader(&scope, &changed, 70_000, "v2", options())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(store.get(&owner(), SUMMARY_STATE_KEY).unwrap(), before);
+    let mut revoked = reader(2);
+    revoked.summary.revision = 4;
+    let mut evidence = snapshot(2).evidence;
+    evidence[1].revision = 3;
+    revoked.fixed = Some(evidence);
+    revoked.summary.preferences = vec![Preference {
+        id: "p".into(),
+        text: "旧偏好".into(),
+        status: PreferenceStatus::Revoked,
+        revision: 2,
+        history: vec![
+            PreferenceVersion {
+                revision: 1,
+                evidence_id: "e-1".into(),
+                at_ms: 2,
+                text: "旧偏好".into(),
+                status: PreferenceStatus::Confirmed,
+            },
+            PreferenceVersion {
+                revision: 2,
+                evidence_id: "e-2".into(),
+                at_ms: 4,
+                text: "旧偏好".into(),
+                status: PreferenceStatus::Revoked,
+            },
+        ],
+    }];
+    assert!(
+        admin
+            .reserve_repair_reader(&scope, &revoked, 100_000, "v2", options())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(store.get(&owner(), SUMMARY_STATE_KEY).unwrap(), before);
+    // 换一个更晚的固定读取时间，验证读流出错仍不能发布部分补做。
+    let mut failing = reader(1);
+    failing.fail_after = Some(0);
+    assert!(
+        admin
+            .reserve_repair_reader(&scope, &failing, 140_000, "v2", options())
+            .is_err()
+    );
+    assert_eq!(store.get(&owner(), SUMMARY_STATE_KEY).unwrap(), before);
+    kernel.stop_all().await.unwrap();
+    let (kernel, admin) = open(store.clone()).await;
+    // 取消和重启中断的批次不是可自动补做的已知失败。
+    let repair = admin
+        .reserve_repair_reader(&scope, &source, 200_000, "v2", options())
+        .unwrap()
+        .unwrap();
+    admin
+        .finish(&repair, 200_001, Err(SummaryFailure::Cancelled))
+        .unwrap();
+    assert!(
+        admin
+            .reserve_repair_reader(&scope, &source, 1_000_000, "v2", options())
+            .unwrap()
+            .is_none()
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+struct SummaryReply(String);
+impl eve_llm_api::LlmProvider for SummaryReply {
+    fn complete(
+        &self,
+        _: eve_llm_api::ModelRequest,
+    ) -> eve_llm_api::LlmFuture<'_, eve_llm_api::ModelResponse> {
+        Box::pin(async move {
+            Ok(eve_llm_api::ModelResponse::Final {
+                text: self.0.clone(),
+            })
+        })
+    }
+}
+struct SummaryResolver(String);
+impl eve_llm_api::LlmModelResolver for SummaryResolver {
+    fn resolve(&self) -> Result<eve_llm_api::ModelSelection, eve_llm_api::LlmError> {
+        Ok(eve_llm_api::ModelSelection {
+            provider: Arc::new(SummaryReply(self.0.clone())),
+            provider_timeout: std::time::Duration::from_secs(1),
+        })
+    }
+}
+#[tokio::test]
+async fn model_failure_categories_reject_duplicate_keys_and_never_store_model_output_as_a_reason() {
+    let root = tempfile::tempdir().unwrap();
+    let (kernel, admin) = open(Store::open(root.path())).await;
+    let batch = admin
+        .reserve(&snapshot(1), 1, "conversation-summary-v1", options())
+        .unwrap()
+        .unwrap();
+    for (text,expected) in [
+        ("SECRET_BAD_RESPONSE".to_string(), SummaryFailure::InvalidOutputJson),
+        ("{\"points\":[],\"points\":[]}".into(), SummaryFailure::InvalidOutputJson),
+        ("{\"extra\":\"SECRET_BAD_RESPONSE\",\"points\":[]}".into(), SummaryFailure::InvalidOutputShape),
+        ("x".repeat(MAX_SUMMARY_OUTPUT_BYTES + 1), SummaryFailure::InvalidOutputTooLarge),
+        (serde_json::json!({"points":[{"text":"不存在的来源","quotes":[{"evidence_id":"foreign","text":"SECRET_BAD_RESPONSE"}]}]}).to_string(), SummaryFailure::InvalidOutputSource),
+    ] {
+        let model = eve_memory_plugin::ModelConversationSummarizer::new(Arc::new(SummaryResolver(text)));
+        let failure = model.summarize(batch.clone()).await.unwrap_err();
+        assert_eq!(failure,expected);
+        assert!(!format!("{failure:?}").contains("SECRET_BAD_RESPONSE"));
+    }
+    kernel.stop_all().await.unwrap();
+}
+
+struct LimitedSummaryArchive {
+    inner: eve_memory_plugin::FileSummaryArchive,
+    limited: std::sync::atomic::AtomicBool,
+}
+impl SummaryArchiveStore for LimitedSummaryArchive {
+    fn get(&self, hash: &str) -> MemoryResult<Vec<u8>> {
+        self.inner.get(hash)
+    }
+    fn put(&self, hash: &str, bytes: &[u8]) -> MemoryResult<()> {
+        if self.limited.load(Ordering::SeqCst) {
+            return Err(MemoryError::LimitReached);
+        }
+        self.inner.put(hash, bytes)
+    }
+}
+#[tokio::test]
+async fn cold_capacity_failure_is_rechecked_without_reopening_or_resetting_consumption() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(&root.path().join("state"));
+    let archive = Arc::new(LimitedSummaryArchive {
+        inner: eve_memory_plugin::FileSummaryArchive::open(root.path().join("archive")).unwrap(),
+        limited: std::sync::atomic::AtomicBool::new(false),
+    });
+    let (kernel, admin) = cold_open(store.clone(), archive.clone()).await.unwrap();
+    for i in 1..=96 {
+        let batch = admin
+            .reserve(&snapshot(i), i, "v1", options())
+            .unwrap()
+            .unwrap();
+        admin.finish(&batch, i, Ok(vec![])).unwrap();
+    }
+    let before = store.get(&owner(), SUMMARY_STATE_KEY).unwrap();
+    archive.limited.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        admin.reserve(&snapshot(97), 97, "v1", options()),
+        Err(MemoryError::LimitReached)
+    ));
+    assert_eq!(store.get(&owner(), SUMMARY_STATE_KEY).unwrap(), before);
+    assert_eq!(admin.jobs(&snapshot(0).scope).unwrap().len(), 96);
+    archive.limited.store(false, Ordering::SeqCst);
+    let batch = admin
+        .reserve(&snapshot(97), 98, "v1", options())
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.sequence, 97);
+    assert_eq!(batch.consumed_ids, vec!["e-97"]);
+    admin.finish(&batch, 99, Ok(vec![])).unwrap();
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_running_prefix_cannot_be_evicted_but_finishing_it_reopens_global_capacity() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(&root.path().join("state"));
+    let archive =
+        Arc::new(eve_memory_plugin::FileSummaryArchive::open(root.path().join("archive")).unwrap());
+    let (kernel, admin) = cold_open(store.clone(), archive).await.unwrap();
+    let mut first = None;
+    for i in 1..=MAX_SUMMARY_JOBS {
+        let mut input = snapshot(1);
+        input.scope.user_id = format!("user-{i}");
+        let batch = admin
+            .reserve(&input, i as u64, "v1", options())
+            .unwrap()
+            .unwrap();
+        if first.is_none() {
+            first = Some(batch);
+        }
+    }
+    let mut extra = snapshot(1);
+    extra.scope.user_id = "overflow".into();
+    let before = store.get(&owner(), SUMMARY_STATE_KEY).unwrap();
+    assert!(matches!(
+        admin.reserve(&extra, 1000, "v1", options()),
+        Err(MemoryError::LimitReached)
+    ));
+    assert_eq!(store.get(&owner(), SUMMARY_STATE_KEY).unwrap(), before);
+    admin.finish(&first.unwrap(), 1001, Ok(vec![])).unwrap();
+    let admitted = admin
+        .reserve(&extra, 1002, "v1", options())
+        .unwrap()
+        .unwrap();
+    assert_eq!(admitted.sequence, 129);
+    assert_eq!(saved_summary(&store)["tail"]["last"], 1);
+    assert_eq!(saved_summary(&store)["jobs"].as_array().unwrap().len(), 128);
     kernel.stop_all().await.unwrap();
 }

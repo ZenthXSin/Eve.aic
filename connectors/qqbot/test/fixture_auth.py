@@ -139,6 +139,38 @@ def expand_task_archive(documents, directory):
     return documents
 
 
+def expand_summary_archive(documents, directory):
+    """只供验收恢复不可变摘要块；缺块和校验失败不能当成空历史。"""
+    import hashlib
+    ledger = documents.get('eve.memory-summary', {}).get('summaries.v1')
+    if not ledger or ledger.get('format_version') != 2:
+        return documents
+    reference = ledger.get('tail')
+    chunks = []
+    seen = set()
+    while reference:
+        digest = reference['hash']
+        assert len(digest) == 64 and all(c in '0123456789abcdef' for c in digest)
+        assert digest not in seen and len(seen) < 65536
+        seen.add(digest)
+        payload = (Path(directory) / (digest + '.json')).read_bytes()
+        assert len(payload) == reference['bytes'] <= 16 * 1024 * 1024
+        assert hashlib.sha256(payload).hexdigest() == digest
+        chunk = json.loads(payload)
+        jobs = chunk['jobs']
+        assert chunk['format_version'] == 1 and 1 <= len(jobs) <= 64
+        assert jobs[0]['batch']['sequence'] == reference['first']
+        assert jobs[-1]['batch']['sequence'] == reference['last']
+        previous = chunk['previous']
+        assert previous['last'] + 1 == reference['first'] if previous else reference['first'] == 1
+        chunks.append(jobs)
+        reference = previous
+    jobs = [job for chunk in reversed(chunks) for job in chunk] + ledger['jobs']
+    assert [job['batch']['sequence'] for job in jobs] == list(range(1, len(jobs) + 1))
+    documents['eve.memory-summary']['summaries.v1'] = dict(ledger, jobs=jobs)
+    return documents
+
+
 def read_archived_state(path):
     """外部验收读者没有宿主锁；只在索引确实已改变时重取被 GC 超越的旧快照。"""
     import time
@@ -157,7 +189,7 @@ def read_archived_state(path):
         documents = {owner:{key:json.loads(bytes(value)) for key,value in entries.items()}
                      for owner,entries in state['entries'].items()}
         try:
-            return expand_task_archive(expand_learning_archive(documents, path.parent / 'learning-archive'), path.parent / 'task-archive')
+            return expand_summary_archive(expand_task_archive(expand_learning_archive(documents, path.parent / 'learning-archive'), path.parent / 'task-archive'), path.parent / 'summary-archive')
         except (FileNotFoundError, PermissionError):
             if attempt == 10 or path.read_text(encoding="utf-8") == payload:
                 raise

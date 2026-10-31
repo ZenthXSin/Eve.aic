@@ -179,13 +179,13 @@ async fn run(
     while !*active.borrow_and_update() {
         tokio::select! { biased; _ = stop_requested(&mut stopped) => return Ok(()), changed = active.changed() => if changed.is_err() { return Ok(()); } }
     }
-    let mut full = false;
+    let mut deferred = std::collections::BTreeMap::<MemoryScope, u64>::new();
     loop {
         if *stopped.borrow() {
             return Ok(());
         }
         let config = settings.snapshot(NAMESPACE, 1)?;
-        if config.get::<bool>("enabled")? && !full {
+        if config.get::<bool>("enabled")? {
             let options = SummaryOptions {
                 min_new_evidence: config.get("min_new_evidence")?,
                 max_new_evidence: 8,
@@ -216,9 +216,12 @@ async fn run(
                 if scope.channel != "qq" {
                     continue;
                 }
+                if deferred.get(&scope).is_some_and(|at| now_ms() < *at) {
+                    continue;
+                }
                 // 完整校验原始证据流，仅保留新批次及旧观点需要的来源。
                 let reader = memory.reader(scope.clone())?;
-                let batch = match summaries.reserve_reader(
+                let batch = match summaries.reserve_scheduled_reader(
                     &scope,
                     reader.as_ref(),
                     now_ms(),
@@ -228,8 +231,20 @@ async fn run(
                     Ok(Some(batch)) => batch,
                     Ok(None) => continue,
                     Err(MemoryError::LimitReached) => {
-                        full = true;
-                        break;
+                        deferred.insert(
+                            scope.clone(),
+                            now_ms().saturating_add(options.cooldown_ms.max(60_000)),
+                        );
+                        eprintln!("EVE_SUMMARY_DEFER reason=capacity");
+                        continue;
+                    }
+                    Err(MemoryError::Conflict | MemoryError::StaleRevision) => {
+                        deferred.insert(
+                            scope.clone(),
+                            now_ms().saturating_add(options.cooldown_ms.max(60_000)),
+                        );
+                        eprintln!("EVE_SUMMARY_DEFER reason=source_unavailable_or_changed");
+                        continue;
                     }
                     Err(error) => return Err(error.into()),
                 };
@@ -247,6 +262,12 @@ async fn run(
                     result,
                     Err(SummaryFailure::Provider | SummaryFailure::Timeout)
                 );
+                if let Err(reason) = &result {
+                    eprintln!(
+                        "EVE_SUMMARY_FAILURE category={reason:?} sequence={}",
+                        batch.sequence
+                    );
+                }
                 summaries.finish(&batch, now_ms().max(batch.started_at_ms), result)?;
                 if provider_failed {
                     break;
