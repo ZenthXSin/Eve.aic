@@ -145,7 +145,7 @@ def read_archived_state(path):
     path = Path(path)
     for attempt in range(11):
         try:
-            payload = path.read_bytes()
+            payload = path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return {}
         except PermissionError:
@@ -159,6 +159,6 @@ def read_archived_state(path):
         try:
             return expand_task_archive(expand_learning_archive(documents, path.parent / 'learning-archive'), path.parent / 'task-archive')
         except (FileNotFoundError, PermissionError):
-            if attempt == 10 or path.read_bytes() == payload:
+            if attempt == 10 or path.read_text(encoding="utf-8") == payload:
                 raise
     raise AssertionError('状态持续变化，未取得一致验收快照')
