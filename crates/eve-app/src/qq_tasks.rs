@@ -759,14 +759,22 @@ fn status_text(task: &Task) -> &'static str {
 }
 
 fn view(task: &Task, result_bytes: usize) -> Value {
-    let steps = crate::qq_task_diagnostics::task_steps(task);
-    let offset = steps
-        .len()
-        .saturating_sub(if result_bytes == LIST_RESULT_BYTES {
+    let page = crate::qq_task_diagnostics::task_step_tail(
+        task,
+        if result_bytes == LIST_RESULT_BYTES {
             12
         } else {
             3
-        });
+        },
+    );
+    view_steps(task, result_bytes, page)
+}
+
+fn view_steps(
+    task: &Task,
+    result_bytes: usize,
+    page: crate::qq_task_diagnostics::StepWindow,
+) -> Value {
     json!({
         "id": task.id,
         "title": task.spec.title,
@@ -792,10 +800,10 @@ fn view(task: &Task, result_bytes: usize) -> Value {
                     "instruction":"在隔离环境以冻结回执和脚本模型复现；不要重放未知工具或生产发送"}})
         }),
         "interruption_reason": (task.status == TaskStatus::Interrupted).then(|| crate::qq_task_diagnostics::interruption(task)),
-        "execution_steps": &steps[offset..],
-        "step_total": steps.len(),
-        "step_offset": offset,
-        "steps_truncated": offset > 0,
+        "execution_steps": page.steps,
+        "step_total": page.total,
+        "step_offset": page.offset,
+        "steps_truncated": page.offset > 0,
         "remaining": task.execution.as_ref().and_then(|e| e.checkpoint.as_ref()).and_then(|c| c.remaining.as_ref()),
     })
 }
@@ -1032,30 +1040,32 @@ impl Tool for ListTool {
                     .for_owner(&owner.user_id)
                     .find(|task| task.id == id)
                     .ok_or_else(|| failed("这位用户没有这个后台任务"))?;
-                let mut detail = view(task, LIST_RESULT_BYTES);
-                if call.arguments.get("step_offset").is_some()
+                let detail = if call.arguments.get("step_offset").is_some()
                     || call.arguments.get("step_limit").is_some()
                 {
-                    let steps = crate::qq_task_diagnostics::task_steps(task);
                     let offset = call
                         .arguments
                         .get("step_offset")
                         .and_then(Value::as_u64)
                         .unwrap_or(0) as usize;
-                    if offset > steps.len() {
-                        return Err(failed("step_offset 超过已保存的步骤数"));
-                    }
                     let limit = call
                         .arguments
                         .get("step_limit")
                         .and_then(Value::as_u64)
                         .unwrap_or(12) as usize;
-                    let end = (offset + limit).min(steps.len());
-                    detail["execution_steps"] = json!(&steps[offset..end]);
-                    detail["step_offset"] = json!(offset);
-                    detail["steps_truncated"] = json!(offset > 0 || end < steps.len());
-                    detail["next_step_offset"] = json!((end < steps.len()).then_some(end));
-                }
+                    let page = crate::qq_task_diagnostics::task_step_window(task, offset, limit);
+                    if offset > page.total {
+                        return Err(failed("step_offset 超过已保存的步骤数"));
+                    }
+                    let end = offset.saturating_add(page.steps.len());
+                    let total = page.total;
+                    let mut detail = view_steps(task, LIST_RESULT_BYTES, page);
+                    detail["steps_truncated"] = json!(offset > 0 || end < total);
+                    detail["next_step_offset"] = json!((end < total).then_some(end));
+                    detail
+                } else {
+                    view(task, LIST_RESULT_BYTES)
+                };
                 return Ok(json!({"task": detail}));
             }
             let mut mine: Vec<&Task> = snapshot.for_owner(&owner.user_id).collect();
