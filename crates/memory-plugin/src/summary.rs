@@ -1,5 +1,8 @@
 //! 可替换的语义归纳实现及持久账本；保存准入后才允许模型调用。
+mod archive;
+mod history;
 mod model;
+pub use archive::FileSummaryArchive;
 mod store;
 mod validation;
 use eve_memory_api::*;
@@ -56,6 +59,37 @@ impl SummaryAdmin for SummaryController {
         self.service()?
             .reserve_reader(scope, reader, now, version, options)
     }
+    fn reserve_scheduled_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn MemoryService,
+        now: u64,
+        version: &str,
+        options: SummaryOptions,
+    ) -> MemoryResult<Option<SummaryBatch>> {
+        let service = self.service()?;
+        if service.prefer_repair(scope)?
+            && let Some(batch) =
+                service.reserve_repair_reader(scope, reader, now, version, options)?
+        {
+            return Ok(Some(batch));
+        }
+        if let Some(batch) = service.reserve_reader(scope, reader, now, version, options)? {
+            return Ok(Some(batch));
+        }
+        service.reserve_repair_reader(scope, reader, now, version, options)
+    }
+    fn reserve_repair_reader(
+        &self,
+        scope: &MemoryScope,
+        reader: &dyn MemoryService,
+        now: u64,
+        version: &str,
+        options: SummaryOptions,
+    ) -> MemoryResult<Option<SummaryBatch>> {
+        self.service()?
+            .reserve_repair_reader(scope, reader, now, version, options)
+    }
     fn finish(
         &self,
         batch: &SummaryBatch,
@@ -68,13 +102,19 @@ impl SummaryAdmin for SummaryController {
 pub struct ConversationSummaryPlugin {
     manifest: PluginManifest,
     controller: SummaryController,
+    archive: Option<Arc<dyn SummaryArchiveStore>>,
 }
 impl ConversationSummaryPlugin {
     pub fn new() -> PluginResult<Self> {
         Ok(Self {
             manifest: PluginManifest::new(SUMMARY_PLUGIN_ID, env!("CARGO_PKG_VERSION"))?,
             controller: SummaryController::default(),
+            archive: None,
         })
+    }
+    pub fn with_archive(mut self, archive: Arc<dyn SummaryArchiveStore>) -> Self {
+        self.archive = Some(archive);
+        self
     }
     pub fn controller(&self) -> SummaryController {
         self.controller.clone()
@@ -87,7 +127,7 @@ impl Plugin for ConversationSummaryPlugin {
     fn start(&mut self, context: PluginContext) -> PluginFuture<'_, Option<Cleanup>> {
         Box::pin(async move {
             let stored = Arc::new(
-                StoredSummaries::open(context.clone())
+                StoredSummaries::open(context.clone(), self.archive.clone())
                     .map_err(|e| PluginError::State(e.to_string()))?,
             );
             let closing = stored.clone();

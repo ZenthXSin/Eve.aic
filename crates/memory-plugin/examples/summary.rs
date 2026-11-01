@@ -4,7 +4,9 @@ use eve_llm_api::{
     LlmFuture, LlmModelResolver, LlmProvider, ModelRequest, ModelResponse, ModelSelection,
 };
 use eve_memory_api::*;
-use eve_memory_plugin::{ConversationSummaryPlugin, ModelConversationSummarizer};
+use eve_memory_plugin::{
+    ConversationSummaryPlugin, FileSummaryArchive, ModelConversationSummarizer,
+};
 use eve_plugin_api::PluginId;
 use serde::Deserialize;
 use std::{error::Error, path::Path, sync::Arc, time::Duration};
@@ -66,7 +68,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         state,
         ..KernelServices::default()
     });
-    let plugin = ConversationSummaryPlugin::new()?;
+    let plugin = ConversationSummaryPlugin::new()?.with_archive(Arc::new(
+        FileSummaryArchive::open(Path::new(&args[0]).join("summary-archive"))?,
+    ));
     let admin = plugin.controller();
     kernel.register(Box::new(plugin))?;
     kernel.start(&PluginId::new(SUMMARY_PLUGIN_ID)?).await?;

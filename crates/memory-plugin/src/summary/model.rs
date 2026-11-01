@@ -58,15 +58,17 @@ impl ConversationSummarizer for ModelConversationSummarizer {
             .map_err(|_| SummaryFailure::Timeout)?
             .map_err(failure)?;
             let ModelResponse::Final { text } = response else {
-                return Err(SummaryFailure::InvalidOutput);
+                return Err(SummaryFailure::UnexpectedTool);
             };
             if text.len() > MAX_SUMMARY_OUTPUT_BYTES {
-                return Err(SummaryFailure::InvalidOutput);
+                return Err(SummaryFailure::InvalidOutputTooLarge);
             }
+            let value = crate::strict_json::from_slice(text.as_bytes())
+                .map_err(|_| SummaryFailure::InvalidOutputJson)?;
             let result: Output =
-                serde_json::from_str(&text).map_err(|_| SummaryFailure::InvalidOutput)?;
+                serde_json::from_value(value).map_err(|_| SummaryFailure::InvalidOutputShape)?;
             validate_summary_points(&batch, &result.points)
-                .map_err(|_| SummaryFailure::InvalidOutput)?;
+                .map_err(|_| SummaryFailure::InvalidOutputSource)?;
             Ok(result.points)
         })
     }
