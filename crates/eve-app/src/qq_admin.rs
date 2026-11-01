@@ -113,6 +113,9 @@ impl Admin {
         .unwrap_or(false)
     }
     pub(crate) fn is_owner(&self, scope: &ContextScope) -> bool {
+        if crate::web_chat::is_owner(scope) {
+            return true;
+        }
         if let Some(owner) = self.stub_owner {
             return owner;
         }
@@ -132,7 +135,8 @@ impl Admin {
 }
 impl DeveloperAuthorization for Admin {
     fn allows_workspace_development(&self, scope: &ContextScope) -> bool {
-        self.subject(scope).is_some() && scope.user_id != crate::qq_group::USER
+        crate::web_chat::is_owner(scope)
+            || (self.subject(scope).is_some() && scope.user_id != crate::qq_group::USER)
     }
     fn is_operator(&self, scope: &ContextScope) -> bool {
         self.is_owner(scope)

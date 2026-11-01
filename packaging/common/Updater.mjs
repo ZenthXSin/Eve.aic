@@ -124,6 +124,8 @@ export function createUpdater(root, { fetchImpl = globalThis.fetch, log = consol
     const manifest = JSON.parse(raw);
     const plan = { version: ref.version, target: current.target, label: current.platform_label };
     const entries = verifyManifest(manifest, plan);
+    const webBinary = 'eve-web' + (current.platform_label.startsWith('windows-') ? '.exe' : '');
+    if (mode === 'web' && !Object.hasOwn(manifest.files_sha256, webBinary)) throw new Error('候选运行包没有独立 Web 入口；保留当前版本。');
     for (const [name, expected] of entries) {
       let ancestor = appRoot;
       for (const component of name.split('/')) {
@@ -137,6 +139,7 @@ export function createUpdater(root, { fetchImpl = globalThis.fetch, log = consol
     if (help) {
       const extension = current.platform_label.startsWith('windows-') ? '.exe' : '';
       for (const binary of ['eve', 'eve-qqbot', 'eve-cognition', 'eve-memory', 'eve-message-evaluate']) await runProgram(path.join(appRoot, binary + extension));
+      if (Object.hasOwn(manifest.files_sha256, webBinary)) await runProgram(path.join(appRoot, webBinary));
       const node = path.join(appRoot, extension ? 'runtime/node.exe' : 'runtime/bin/node');
       await runProgram(node);
       await runProgram(node, ['--check', path.join(appRoot, 'Launch.mjs')]);

@@ -64,6 +64,23 @@ test('仅验证配置时不启动宿主或默认能力', { skip: process.platfor
   assert.match(result.stdout, /配置及发行包检查通过/);
   await assert.rejects(fs.stat(path.join(f.root, 'captured.json')), { code: 'ENOENT' });
 });
+
+test('Web 模式没有 QQ 配置也能启动专用入口并传递面板令牌', { skip: process.platform === 'win32' }, async t => {
+  const f = await fixture(t);
+  delete f.config.qq;
+  delete f.config.jev;
+  f.config.features.segmented = true;
+  await fs.writeFile(path.join(f.root,'config.json'),JSON.stringify(f.config));
+  await fs.writeFile(path.join(f.root,'eve-web'),`#!${process.execPath}\nrequire('node:fs').writeFileSync('web-captured.json',JSON.stringify({args:process.argv.slice(2),token_configured:!!process.env.EVE_WEB_TOKEN}));\n`,{mode:0o700});
+  const result=spawnSync(process.execPath,[path.join(f.root,'Launch.mjs'),'web','--no-prompt','--skip-update'],{encoding:'utf8',timeout:10000});
+  assert.equal(result.status,0,result.stderr);
+  const saved=JSON.parse(await fs.readFile(path.join(f.root,'web-captured.json'),'utf8'));
+  assert.ok(saved.args.includes('--listen'));
+  assert.ok(saved.args.includes('127.0.0.1:0'));
+  assert.equal(saved.args.includes('--segmented'),false);
+  assert.equal(saved.args.includes('--bridge-script'),false);
+  assert.equal(saved.token_configured,true);
+});
 test('不支持的平台在读取用户配置或启动宿主前明确拒绝', { skip: process.platform === 'win32' }, async t => {
   const f = await fixture(t);
   const original = JSON.stringify(f.config);

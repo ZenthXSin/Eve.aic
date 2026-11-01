@@ -903,6 +903,7 @@ async fn run_qqbot_composed(
     let mut trigger_background: Option<qq_triggers::Background> = None;
     let mut channel: Option<Arc<QqBotStatusHandle>> = None;
     let mut panel: Option<eve_web_panel::LocalPanel> = None;
+    let mut web_chat: Option<Arc<crate::web_chat::WebChat>> = None;
     let page_permit = eve_web_panel_api::PageWritePermit::default();
     // 插件只能弱引用此宿主诊断句柄，避免 QQ 插件与 Kernel 形成引用环。
     let runtime_inspector: Arc<dyn eve_plugin_api::RuntimeInspector> = Arc::new(kernel.clone());
@@ -2208,6 +2209,10 @@ async fn run_qqbot_composed(
                 .map_or_else(Vec::new, |policy| policy.seeds().to_vec()),
             runner: practice.is_some().then(|| skill_runner.clone()),
         }));
+        bootstrap.context = Some(Arc::new(crate::web_chat::WebContext {
+            inner:bootstrap.context.take().ok_or("对话上下文缺失")?,
+            web:Some(Arc::new(crate::context_notes::NotesContext { channel:"web", inner:crate::services::default_context(), admin:context_notes.clone() })),
+        }));
         let (control, model_settings_admin) = crate::install_core_with_pages_and_admin(
             &kernel,
             registry.clone(),
@@ -3106,6 +3111,8 @@ async fn run_qqbot_composed(
         channel = Some(handle.clone());
         if let Some(monitor)=&health_monitor { let _=monitor.source.channel.set(handle.clone()); }
         if let Some(config) = panel_config {
+            let browser_chat = Arc::new(crate::web_chat::WebChat::open(control.clone(), &options.state_directory).map_err(|_| "Web 对话回执目录不可用；保留原记录")?);
+            web_chat = Some(browser_chat.clone());
             let sessions = registry
                 .get(&ServiceId::new(SESSION_SERVICE_ID)?)?
                 .ok_or("面板会话服务缺失")?
@@ -3134,8 +3141,9 @@ async fn run_qqbot_composed(
                     )
                     .map_err(|_| "面板插件管理初始化失败")?,
                     sessions: sessions.0.clone(),
+                    chat: Some(browser_chat),
                     control,
-                    channel: handle.clone(),
+                    channel: Some(handle.clone()),
                     started_at_unix_ms,
                     judgments: judgments
                         .clone()
@@ -3361,6 +3369,11 @@ async fn run_qqbot_composed(
         if let Err(error) = panel.stop().await {
             secondary.push(error.into());
         }
+    }
+    if let Some(chat) = web_chat
+        && chat.shutdown().await.is_err()
+    {
+        secondary.push("Web 在途任务收尾未能确认；原记录保留".into());
     }
     if channel.is_none() {
         match registry.get(&ServiceId::new(QQBOT_STATUS_SERVICE_ID).expect("有效 QQ 状态 ID")) {

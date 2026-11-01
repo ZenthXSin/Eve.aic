@@ -3,7 +3,9 @@ use eve_control_api::GenerationKey;
 use eve_memory_api::MemoryScope;
 use eve_session_api::SessionKey;
 use serde::{Deserialize, Serialize};
+mod chat;
 mod extensions;
+pub use chat::*;
 pub use extensions::*;
 
 pub type PanelResult<T> = Result<T, PanelError>;
@@ -677,8 +679,20 @@ pub struct LearningView {
 
 /// 受信宿主提供服务，HTTP 实现仅消费此契约。cancel 只准入取消，不等待或声明提交完成。
 /// 每页 1..=100 项；历史最多 50 轮，每段正文最多 8192 字节并明确标注截断。
-/// 暴露给本机操作者；不存在通过 HTTP 指定其他 Provider、执行工具或新任务的入口。
+/// Web 对话是可选能力，仅接收正文与请求编号，身份由宿主固定；不允许指定 Provider 或直接执行工具。
 pub trait PanelService: Send + Sync {
+    fn chat_info(&self) -> PanelResult<ChatInfo> {
+        Err(PanelError::Unavailable)
+    }
+    fn chat_submit(&self, _request: ChatSubmit) -> PanelResult<ChatState> {
+        Err(PanelError::Unavailable)
+    }
+    fn chat_read(&self, _request: ChatLookup) -> PanelResult<ChatState> {
+        Err(PanelError::Unavailable)
+    }
+    fn chat_cancel(&self, _request: ChatLookup) -> PanelResult<ChatState> {
+        Err(PanelError::Unavailable)
+    }
     fn context_notes(
         &self,
         _request: PanelContextNoteRequest,
