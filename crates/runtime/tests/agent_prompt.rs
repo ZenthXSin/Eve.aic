@@ -364,3 +364,88 @@ async fn agent_file_cannot_grant_tool_permissions() {
     assert!(provider.requests.lock().unwrap().is_empty());
     kernel.stop_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn live_file_updates_next_turn_but_never_changes_inflight_tools_or_creates_a_lease_on_invalid_input()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("AGENT.md");
+    std::fs::write(&path, "LIVE_FIRST").unwrap();
+    let source = Arc::new(
+        eve_agent_prompt::WatchedAgentPrompt::new(FileAgentPrompt::new(&path).unwrap()).unwrap(),
+    );
+    let config = LlmHostConfig::default()
+        .with_live_prompt_source(source.clone())
+        .unwrap();
+    let release = Arc::new(Notify::new());
+    let provider = Provider::new(vec![
+        Step {
+            gate: Some(release.clone()),
+            ..Step::new(calls())
+        },
+        Step::new(final_response("第一轮完成")),
+        Step::new(final_response("新规则生效")),
+    ]);
+    let state = Arc::new(MemoryStateStore::default());
+    let rig = Rig::new(provider.clone(), state.clone(), config).await;
+    let host = rig.host.clone();
+    let running = tokio::spawn(async move { host.run_turn(input("live-agent", "第一轮")).await });
+    provider.wait_requests(1).await;
+    std::fs::write(&path, "LIVE_SECOND").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !source
+            .load()
+            .is_ok_and(|snapshot| snapshot.text() == "LIVE_SECOND")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    release.notify_one();
+    running.await.unwrap().unwrap();
+    rig.host
+        .run_turn(input("live-agent", "第二轮"))
+        .await
+        .unwrap();
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert!(first_text(&requests[0]).starts_with("LIVE_FIRST\n"));
+        assert_eq!(first_text(&requests[0]), first_text(&requests[1]));
+        assert!(first_text(&requests[2]).starts_with("LIVE_SECOND\n"));
+        assert_eq!(requests[0].tools, requests[2].tools);
+    }
+    std::fs::write(&path, [0xff]).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while source.load().is_ok() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let before = state
+        .get(
+            &id(eve_session_api::SESSION_PLUGIN_ID),
+            eve_session_plugin::SESSION_STATE_KEY,
+        )
+        .unwrap();
+    assert!(
+        rig.host
+            .run_turn(input("live-agent", "不应启动"))
+            .await
+            .is_err()
+    );
+    assert_eq!(provider.requests.lock().unwrap().len(), 3);
+    assert_eq!(rig.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state
+            .get(
+                &id(eve_session_api::SESSION_PLUGIN_ID),
+                eve_session_plugin::SESSION_STATE_KEY
+            )
+            .unwrap(),
+        before
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), [0xff]);
+    rig.stop().await;
+}

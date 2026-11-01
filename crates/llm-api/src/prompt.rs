@@ -68,7 +68,33 @@ impl fmt::Debug for SystemPromptSnapshot {
     }
 }
 
-/// 只在组合层装配时调用；不得在模型请求或工具循环中进行同步 I/O。
+/// 静态来源只在组合层装配时调用。动态来源应只返回后台已验证缓存，
+/// 不能在模型请求或工具循环中进行同步文件 I/O。
 pub trait SystemPromptSource: Send + Sync {
     fn load(&self) -> Result<SystemPromptSnapshot, LlmError>;
+}
+
+/// 动态来源的绑定身份；相等表示同一缓存来源，不代表其当前文本版本相同。
+#[derive(Clone)]
+pub struct SystemPromptSourceHandle(std::sync::Arc<dyn SystemPromptSource>);
+impl SystemPromptSourceHandle {
+    pub fn new(source: std::sync::Arc<dyn SystemPromptSource>) -> Self {
+        Self(source)
+    }
+}
+impl PartialEq for SystemPromptSourceHandle {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for SystemPromptSourceHandle {}
+impl SystemPromptSource for SystemPromptSourceHandle {
+    fn load(&self) -> Result<SystemPromptSnapshot, LlmError> {
+        self.0.load()
+    }
+}
+impl fmt::Debug for SystemPromptSourceHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SystemPromptSourceHandle(..)")
+    }
 }

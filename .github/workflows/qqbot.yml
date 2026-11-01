@@ -142,6 +142,7 @@ jobs:
           python3 connectors/qqbot/test/group_wakeup_test.py
           python3 connectors/qqbot/test/context_reset_test.py
           python3 connectors/qqbot/test/context_notes_test.py
+          python3 connectors/qqbot/test/agent_prompt_reload_test.py
           python3 connectors/qqbot/test/session_archive_test.py
           python3 connectors/qqbot/test/group_digest_test.py
           python3 connectors/qqbot/test/group_recall_test.py

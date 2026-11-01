@@ -6,6 +6,7 @@
 mod prompt;
 pub use prompt::{
     SystemPromptMetadata, SystemPromptOrigin, SystemPromptSnapshot, SystemPromptSource,
+    SystemPromptSourceHandle,
 };
 
 use eve_plugin_api::{Permission, PluginId, ServiceId};

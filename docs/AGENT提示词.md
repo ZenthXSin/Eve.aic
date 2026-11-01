@@ -1,8 +1,8 @@
 # AGENT.md 提示词设计
 
-状态：稳定身份第一切片已实现；STATE、DRIVES、AGENDA 已列入[当前认知实施计划](./认知循环.md)，结构化认知数据与持久化已随 PR #73 合入；生产 Context 注入仍未接线；首版独立本地认知循环已在 PR #75 提供，尚未装入生产终端/QQ。
+状态：稳定身份来源、不可变快照和 AGENT.md 文件热重载已实现；认知状态、驱动与议程的接线进度见[认知循环](./认知循环.md)与[未完成事项推进台账](./未完成事项推进台账.md)。
 
-根目录 [AGENT.md](../AGENT.md) 提供 Eve 的稳定身份。`eve-llm-api` 定义来源与不可变快照，`eve-agent-prompt` 实现文本/文件加载，Runtime 在装配时显式选择后进入固定提示词前缀。
+根目录 [AGENT.md](../AGENT.md) 提供 Eve 的稳定身份。`eve-llm-api` 定义来源与不可变快照，`eve-agent-prompt` 实现文本/文件加载，Runtime 在装配时显式选择来源，每轮捕获后进入该轮固定提示词前缀。
 
 AGENT.md 的“沿用旧 Eve 的做法”一节整理自旧版 Eve（eve-portable@e7e43b4）的执行规则与语言风格，只保留与当前身份一致的部分，不引入旧宿主的账号、路径和工具；取舍见[继承清单](./继承清单-eve-portable.md)。
 
@@ -103,25 +103,29 @@ Eve 的系统提示词应由多个来源分层组成。稳定身份和行为原�
 
 ## 第一切片加载契约
 
-组合层显式选择一个来源；直接文本与文件互相替换，不拼接身份。不递归发现 Markdown，也不读取环境变量来决定来源。旧的直接设置 `system_prompt` 仍可使用，此兼容路径没有来源元数据；需要来源版本时使用 `InlineAgentPrompt`。所有现有入口保留原装配选择，新示例明确选择根目录 AGENT.md，库默认不会扫描工作目录。
+组合层显式选择一个来源；直接文本与文件互相替换，不拼接身份。不递归发现 Markdown，也不读取环境变量来决定来源。旧的直接设置 `system_prompt` 仍可使用，此兼容路径没有来源元数据；需要来源版本时使用 `InlineAgentPrompt`。终端与 QQ 默认监听启动参数 `--agent` 指定的文件；库默认不扫描工作目录，静态 builder 保留原有语义。
 
 `FileAgentPrompt::new(path)` 将相对路径按构造时工作目录解析为绝对路径，拒绝空路径、非 UTF-8 路径和 AGENTS.md 文件名。加载普通 UTF-8 文本，去掉可选首字节 BOM；保留其他内容，不求值模板、include、环境变量或命令。文件自身的符号链接、目录及其他非普通文件均拒绝；路径及其祖先目录须受信，不保证对抗并发替换、硬链接或祖先目录链接。
 
 文件大小上限为 65536 字节（含 BOM），显式文本按 UTF-8 字节计同一上限。缺失、不可读、非法 UTF-8、空白、NUL 或超大内容返回 `LlmError::Configuration`，不截断、不创建、不回退。异常诊断不包含文件正文或原始 I/O 错误。调用方必须先取得成功配置再启动使用它的 Provider/工具。
 
-`with_prompt_source` 同步读取恰好一次，形成宿主持有的快照；模型请求和工具循环不做文件 I/O。同一 Host 的所有轮次复用身份；修改文件后，必须显式重新装配新 Host。直接改写已加载配置的 `system_prompt` 会因正文与快照不一致而失败；改用文本时通过 builder 替换来源。
+静态 `with_prompt_source` 仍同步读取恰好一次，所有轮次复用该快照。动态 `with_live_prompt_source` 接受已验证缓存来源；组合层使用 `WatchedAgentPrompt`，文件读取只发生在共享监听线程，每轮开始只读取缓存并冻结该轮版本。直接改写已加载配置的 `system_prompt` 仍因正文与快照不一致而失败；改用文本时通过 builder 显式替换来源。
 
-元数据为 `origin`（Inline/File/Custom）、`revision`、有效正文 UTF-8 `bytes`。内置修订为去除 BOM 后正文的 SHA-256，路径和时间不充当内容版本；自定义实现负责自己的修订语义。`SystemPromptSnapshot` 与 `LlmHostConfig` 的 Debug 隐藏正文，Host 通过 `system_prompt_metadata()` 只读查询来源。元数据路径仍是本地诊断信息，调用方对外展示时可进一步脱敏。
+监听器每 250 ms 采样一次，连续两次相同才发布。读取内容并计算 SHA-256，同大小改写、保留时间戳和原子替换也能识别；内容不变则保持原版本。通常两次采样后，新一轮无需重启即可采用更新。建议原子保存，稳定采样不能证明文本在语义上已经写完。前台、后台任务和子代理共享来源，不为每个会话创建监听线程，也不调用模型或主动投递通知。
+
+已经在途的一整轮继续使用旧快照，工具、预算、权限和既有回执不变。无效文件在两次稳定采样后发布错误：新轮次在创建会话租约、请求模型或执行工具之前拒绝启动，保留文件原样；合法修复后自动恢复，不悄悄使用旧规则掩盖错误。监听器异常退出同样拒绝新轮次，最后一个来源句柄释放后通知线程停止；析构不阻塞等待文件系统 I/O。
+
+元数据为 `origin`（Inline/File/Custom）、`revision`、有效正文 UTF-8 `bytes`。内置修订为去除 BOM 后正文的 SHA-256，路径和时间不充当内容版本；自定义实现负责自己的修订语义。`SystemPromptSnapshot` 与 `LlmHostConfig` 的 Debug 隐藏正文，Host 通过 `system_prompt_metadata()` 只读查询装配或该轮已捕获的来源；动态根 Host 的装配值不代表下一轮版本。元数据路径仍是本地诊断信息，调用方对外展示时可进一步脱敏。
 
 请求布局不变：身份 + output_format 位于第一条 system，之后是 Context 修订、资料、记忆、完成历史和本轮用户输入；工具定义仍是结构化 ModelRequest.tools，工具循环只追加配对调用与结果。自然语言身份不改变 Runtime 权限、参数和插件状态检查，也不保证模型抵抗 Prompt 注入。
 
-身份快照不写入 Session/StateStore。重启时从本次显式选择的来源装配身份，Session 独立恢复完成历史，不保存/抽取旧 system，不因身份变化重跑旧工具。损坏会话仍按既有契约失败，身份加载器不会修改文件或清空历史。详见 ADR-0036 与[执行书](./执行书.md)。
+身份快照不写入 Session/StateStore。重启时从本次显式选择的来源装配身份，Session 独立恢复完成历史，不保存/抽取旧 system，不因身份变化重跑旧工具。损坏会话仍按既有契约失败，身份加载器不会修改文件或清空历史。后台任务执行检查点保留原消息，恢复时继续使用检查点内原提示词，不因文件更新重放旧工具。详见 ADR-0036 与[执行书](./执行书.md)。
 
 ## 后续实现交接
 
 1. RULE.md、MEMORY.md、自定义注入增加 scope、priority、trust、revision、TTL 和审计字段。
 2. 以结构化 STATE、DRIVES、AGENDA 表示动态内容，并验证过期、旧任务和停止条件。
-3. 完善配置服务接线、热重载、历史来源审计；当前只通过重新装配生效。
+3. 完善文件热重载已接线；继续配置服务与历史来源审计。
 4. Web 管理面板通过 Control/Context API 查看、编辑、预览和回滚来源。
 
 相关设计边界见 [架构设计](./架构设计.md)、[LLM 工具调用](./LLM工具调用.md)、Issue [#27](https://github.com/ZenthXSin/Eve.aic/issues/27)、Issue [#29](https://github.com/ZenthXSin/Eve.aic/issues/29) 和 Issue [#32](https://github.com/ZenthXSin/Eve.aic/issues/32)。

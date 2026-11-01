@@ -35,6 +35,8 @@ pub struct LlmHostConfig {
     pub system_prompt: String,
     /// 与 system_prompt 一致的不可变来源快照；直接文本兼容路径为 None。
     pub system_prompt_snapshot: Option<SystemPromptSnapshot>,
+    /// 可选已验证缓存来源；每轮开始捕获一次，不在工具内循环进行文件 I/O。
+    pub live_prompt_source: Option<eve_llm_api::SystemPromptSourceHandle>,
     pub output_format: String,
     pub provider_timeout: Duration,
     pub tool_timeout: Duration,
@@ -66,6 +68,7 @@ impl Default for LlmHostConfig {
             version: "1".into(),
             system_prompt: "You are Eve's assistant".into(),
             system_prompt_snapshot: None,
+            live_prompt_source: None,
             output_format: "plain text".into(),
             provider_timeout: Duration::from_secs(30),
             tool_timeout: Duration::from_secs(10),
@@ -91,6 +94,7 @@ impl std::fmt::Debug for LlmHostConfig {
             .field("version", &self.version)
             .field("system_prompt_bytes", &self.system_prompt.len())
             .field("system_prompt_snapshot", &self.system_prompt_snapshot)
+            .field("live_prompt_source", &self.live_prompt_source.is_some())
             .field("output_format", &self.output_format)
             .field("provider_timeout", &self.provider_timeout)
             .field("tool_timeout", &self.tool_timeout)
@@ -117,12 +121,24 @@ impl LlmHostConfig {
         self.with_prompt_snapshot(source.load()?)
     }
 
+    /// 只接受无同步 I/O 的缓存来源；在途轮次冻结当前版本，新轮次自动捕获新版本。
+    pub fn with_live_prompt_source(
+        self,
+        source: Arc<dyn SystemPromptSource>,
+    ) -> Result<Self, LlmError> {
+        let snapshot = source.load()?;
+        let mut config = self.with_prompt_snapshot(snapshot)?;
+        config.live_prompt_source = Some(eve_llm_api::SystemPromptSourceHandle::new(source));
+        Ok(config)
+    }
+
     pub fn with_prompt_snapshot(
         mut self,
         snapshot: SystemPromptSnapshot,
     ) -> Result<Self, LlmError> {
         self.system_prompt = snapshot.text().into();
         self.system_prompt_snapshot = Some(snapshot);
+        self.live_prompt_source = None;
         self.validate()?;
         Ok(self)
     }
@@ -479,7 +495,7 @@ pub struct LlmHost {
 }
 
 impl LlmHost {
-    /// 来源元数据不包含正文；旧的直接 system_prompt 路径返回 None。
+    /// 装配或本轮已捕获的来源元数据，不包含正文；动态宿主的装配值不代表下一轮版本。
     pub fn system_prompt_metadata(&self) -> Option<&SystemPromptMetadata> {
         self.config
             .system_prompt_snapshot
@@ -665,6 +681,12 @@ impl LlmHost {
         scope: Option<&eve_llm_api::ContextScope>,
     ) -> Result<Self, LlmError> {
         let mut host = self.clone();
+        if let Some(source) = &self.config.live_prompt_source {
+            let snapshot = catch_unwind(AssertUnwindSafe(|| source.load())).map_err(|_| {
+                LlmError::Configuration("AGENT 缓存来源读取异常；未启动本轮".into())
+            })??;
+            host.config = host.config.with_prompt_snapshot(snapshot)?;
+        }
         if let (Some(policy), Some(scope)) = (&self.tool_scope_policy, scope) {
             let allowed = catch_unwind(AssertUnwindSafe(|| policy.tools_allowed(scope)))
                 .map_err(|_| LlmError::Configuration("工具范围策略异常；未执行工具".into()))?;

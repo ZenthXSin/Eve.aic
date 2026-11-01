@@ -1,9 +1,11 @@
-//! 固定 Agent 提示词的可替换实现；不依赖 Kernel、Runtime 或 Provider。
+//! Agent 提示词的静态与监听来源；不依赖 Kernel、Runtime 或 Provider。
+mod watch;
 use eve_llm_api::{LlmError, SystemPromptOrigin, SystemPromptSnapshot, SystemPromptSource};
 use ring::digest::{SHA256, digest};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+pub use watch::WatchedAgentPrompt;
 
 pub const MAX_AGENT_PROMPT_BYTES: usize = 64 * 1024;
 
