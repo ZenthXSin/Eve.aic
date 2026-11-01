@@ -422,6 +422,7 @@ fn recent_record(turn: &eve_session_api::SessionTurn) -> Result<Value, ToolExecu
             if let Some(evidence) = &failure.evidence {
                 result["provider_http_status"] = json!(evidence.provider_http_status);
                 result["provider_failure"] = json!(evidence.provider_failure);
+                result["protocol_failure"] = json!(evidence.protocol_failure);
                 result["recorded_tool_receipts"] = json!(evidence.tool_results.len());
                 result["tool_names_preview"] = json!(
                     evidence
@@ -1443,6 +1444,7 @@ mod tests {
                     evidence: Some(eve_session_api::SessionFailureEvidence {
                         provider_http_status: Some(504),
                         provider_failure: None,
+                        protocol_failure: None,
                         tool_names: vec!["write_file".into()],
                         tool_results: vec![
                             ToolResult::success(

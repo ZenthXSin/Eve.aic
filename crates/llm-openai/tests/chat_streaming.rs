@@ -130,6 +130,46 @@ async fn fragmented_interleaved_tools_preserve_order_and_never_publish_drafts() 
     assert!(sink.0.lock().unwrap().is_empty());
 }
 #[tokio::test]
+async fn null_optional_placeholders_preserve_complete_tool_identity_and_arguments() {
+    let mut chunks = vec![
+        chunk(
+            json!({"role":"assistant","tool_calls":[{"index":0,"id":"one","type":"function","function":{"name":"echo","arguments":"{"}}]}),
+            None,
+        ),
+        chunk(
+            json!({"role":null,"content":null,"tool_calls":[{"index":0,"id":null,"type":null,"function":{"name":null,"arguments":"\"text\":\"中文\"}"}}]}),
+            None,
+        ),
+        chunk(
+            json!({"role":null,"tool_calls":[{"index":0,"id":null,"type":null,"function":null}]}),
+            None,
+        ),
+        chunk(json!({"role":null,"tool_calls":null}), Some("tool_calls")),
+    ];
+    chunks[1]["id"] = Value::Null;
+    let mut server = Server::start(vec![reply(chunks)]).await;
+    assert_eq!(
+        provider(&server)
+            .with_streamed_completions()
+            .complete(request())
+            .await
+            .unwrap(),
+        ModelResponse::ToolCalls {
+            calls: vec![ToolCall {
+                id: "one".into(),
+                name: "echo".into(),
+                arguments: json!({"text":"中文"})
+            }]
+        }
+    );
+    server.next().await;
+    assert!(
+        server.requests.try_recv().is_err(),
+        "兼容 null 占位不重发请求"
+    );
+}
+
+#[tokio::test]
 async fn corrupt_or_incomplete_streams_never_return_partial_text_or_calls() {
     let mut cases = vec![
         vec![chunk(json!({"content":"partial"}), None)],
@@ -147,6 +187,18 @@ async fn corrupt_or_incomplete_streams_never_return_partial_text_or_calls() {
     for args in ["{", "[]", r#"{"a":1,"a":2}"#] {
         cases.push(vec![chunk(json!({"tool_calls":[{"index":0,"id":"a","type":"function","function":{"name":"echo","arguments":args}}]}),Some("tool_calls"))]);
     }
+    for (key, bad) in [("id", Value::Null), ("id", json!(3)), ("type", Value::Null)] {
+        let mut call = json!({"index":0,"id":"a","type":"function","function":{"name":"echo","arguments":"{}"}});
+        call[key] = bad;
+        cases.push(vec![chunk(
+            json!({"tool_calls":[call]}),
+            Some("tool_calls"),
+        )]);
+    }
+    cases.push(vec![
+        chunk(json!({"tool_calls":[{"index":0,"id":"original","type":"function","function":{"name":"echo","arguments":"{}"}}]}), None),
+        chunk(json!({"tool_calls":[{"index":0,"id":"changed","type":null,"function":null}]}), Some("tool_calls")),
+    ]);
     for chunks in cases {
         let mut server = Server::start(vec![reply(chunks)]).await;
         let sink = Sink::default();

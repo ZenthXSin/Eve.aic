@@ -38,7 +38,7 @@ impl ChatStream {
         if value.get("error").is_some_and(|v| !v.is_null()) {
             return Err(crate::failed(ProviderFailureKind::Other));
         }
-        if let Some(id) = value.get("id") {
+        if let Some(id) = value.get("id").filter(|v| !v.is_null()) {
             let id = id
                 .as_str()
                 .filter(|id| !id.is_empty())
@@ -68,6 +68,7 @@ impl ChatStream {
             .ok_or_else(protocol)?;
         if delta
             .get("role")
+            .filter(|v| !v.is_null())
             .is_some_and(|v| v.as_str() != Some("assistant"))
         {
             return Err(protocol());
@@ -96,7 +97,9 @@ impl ChatStream {
                     .filter(|index| *index < 256)
                     .ok_or_else(protocol)?;
                 let call = self.calls.entry(index).or_default();
-                if let Some(id) = item.get("id") {
+                // 一些兼容服务把未重复发送的可选字段显式编码为 null。
+                // null 与省略相同，不清除已收集的值；终态仍严格核对完整身份与参数。
+                if let Some(id) = item.get("id").filter(|v| !v.is_null()) {
                     let id = id
                         .as_str()
                         .filter(|id| !id.is_empty())
@@ -106,20 +109,20 @@ impl ChatStream {
                     }
                     call.id = Some(id.into());
                 }
-                if let Some(kind) = item.get("type") {
+                if let Some(kind) = item.get("type").filter(|v| !v.is_null()) {
                     if kind.as_str() != Some("function") {
                         return Err(protocol());
                     }
                     call.function_type = true;
                 }
-                if let Some(function) = item.get("function") {
+                if let Some(function) = item.get("function").filter(|v| !v.is_null()) {
                     if !function.is_object() {
                         return Err(protocol());
                     }
                     for (key, destination) in
                         [("name", &mut call.name), ("arguments", &mut call.arguments)]
                     {
-                        if let Some(part) = function.get(key) {
+                        if let Some(part) = function.get(key).filter(|v| !v.is_null()) {
                             destination.push_str(part.as_str().ok_or_else(protocol)?);
                         }
                     }

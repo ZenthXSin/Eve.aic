@@ -17,6 +17,7 @@ mod failure;
 mod history;
 mod image;
 mod journal;
+mod protocol;
 mod steering;
 mod usage;
 pub use budget::{BudgetUsage, ExecutionLimits, SharedStepUsage, SharedToolSteps, TurnBudget};
@@ -30,6 +31,7 @@ pub use image::{
     ImageInput, MAX_IMAGE_BYTES, MAX_TURN_IMAGES, TurnImageSource, TurnImages, sniff_image,
 };
 pub use journal::{MAX_CHECKPOINT_BYTES, TurnCheckpoint, TurnJournal};
+pub use protocol::ProtocolFailureKind;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;

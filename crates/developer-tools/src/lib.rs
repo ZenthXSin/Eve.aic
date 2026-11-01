@@ -287,7 +287,7 @@ impl Tool for DeveloperTool {
     fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
         Box::pin(async move {
             let operation = Self::operation(self.kind, &call.arguments)
-                .map_err(|_| ToolExecutionError::Failed("开发工具参数无效".into()))?;
+                .map_err(|_| ToolExecutionError::Rejected("开发工具参数无效".into()))?;
             match self.backend.execute(operation, context).await {
                 Err(ToolExecutionError::Failed(message))
                     if matches!(self.kind, Kind::List | Kind::Read | Kind::Search) =>

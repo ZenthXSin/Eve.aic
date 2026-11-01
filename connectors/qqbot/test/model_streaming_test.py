@@ -16,6 +16,7 @@ class ModelStreamingAcceptance(developer.DeveloperAcceptance):
     def setUp(self):
         super().setUp()
         self.truncate = False
+        self.null_placeholders = False
 
     def enabled(self, script):
         self.run_eve(script, interest=False, memory=True, research=False, practice=False,
@@ -39,6 +40,14 @@ class ModelStreamingAcceptance(developer.DeveloperAcceptance):
             chunks.extend({"content": char} for char in message["content"])
         frames = [{"id": "fixture", "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
                   for delta in chunks]
+        if getattr(self, "null_placeholders", False):
+            for frame in frames[1:]:
+                delta = frame["choices"][0]["delta"]
+                delta.setdefault("role", None)
+                for call in delta.get("tool_calls", []):
+                    call.setdefault("id", None)
+                    call.setdefault("type", None)
+                    call["function"].setdefault("name", None)
         if not self.truncate:
             frames.append({"id": "fixture", "choices": [{"index": 0, "delta": {},
                                                           "finish_reason": choice["finish_reason"]}]})
@@ -65,6 +74,21 @@ class ModelStreamingAcceptance(developer.DeveloperAcceptance):
                       *self.send(self.message("restored", "检查状态", expected="恢复后未重跑"))])
         self.assertEqual((self.source / "once.txt").read_text(), "x")
         self.assertEqual(self.chat_rounds, 3)
+
+    def test_eighteen_tools_with_null_placeholders_complete_without_replay(self):
+        self.null_placeholders = True
+        def respond(body):
+            if not self.results(body):
+                return tool_response([("run_command", {"program": sys.executable, "args": ["-c",
+                    "from pathlib import Path; p=Path('eighteen.txt'); p.write_text(p.read_text()+'x' if p.exists() else 'x')"]}),
+                    *[("echo", {"text": str(i)}) for i in range(17)]])
+            self.assertEqual(len(self.results(body)), 18)
+            return text_response("18 条回执已核对完成")
+        self.callback = respond
+        self.enabled(self.send(self.message("eighteen", "执行18次工具", expected="18 条回执已核对完成")))
+        self.assertEqual((self.source / "eighteen.txt").read_text(), "x")
+        self.assertEqual(self.turn("执行18次工具")["status"]["state"], "Completed")
+        self.assertEqual(self.chat_rounds, 2)
 
     def test_unfinished_tool_stream_never_executes_or_commits_draft(self):
         self.truncate = True

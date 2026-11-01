@@ -533,6 +533,12 @@ async fn provider_protocol_unsupported_and_round_limit_failures_are_not_replayed
         };
         assert_eq!(failure.code, code);
         assert_eq!(failure.started_tools, Some(started));
+        if code == SessionFailureCode::Protocol {
+            assert_eq!(
+                failure.evidence.as_ref().unwrap().protocol_failure,
+                Some(eve_llm_api::ProtocolFailureKind::EmptyResponse)
+            );
+        }
         assert_eq!(
             failure
                 .evidence

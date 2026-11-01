@@ -19,6 +19,26 @@ class SessionDiagnosticsAcceptance(timeout_fixture.ModelTimeoutAcceptance):
             locals()[_name] = None
     del _name
 
+    def test_protocol_category_survives_restart_and_is_visible_to_eve(self):
+        self.truncate = True
+        self.callback = lambda body: text_response('不能提交的草稿')
+        self.enabled(self.send(self.message('protocol-fail', '协议诊断原任务', contains=['模型流在正常结束前断开', '尚未启动工具调用'])))
+        failure = self.turn('协议诊断原任务')['status']['failure']
+        self.assertEqual(failure['evidence']['protocol_failure'], 'StreamIncomplete')
+        self.truncate = False
+
+        def inspect(body):
+            if not self.results(body):
+                return invoke({'action': 'recent', 'limit': 3}, 'inspect-protocol-kind')
+            [record] = [r for r in self.results(body)[-1]['records'] if r['status'] == 'Failed']
+            self.assertEqual(record['protocol_failure'], 'StreamIncomplete')
+            self.assertEqual(record['started_tools'], 0)
+            return text_response('是模型流未正常结束，未执行新工具')
+
+        self.callback = inspect
+        self.enabled(self.send(self.message('protocol-inspect', '查看协议失败类别', expected='是模型流未正常结束，未执行新工具')))
+        self.assertEqual(self.turn('协议诊断原任务')['status']['failure'], failure)
+
     def test_saved_failed_turn_can_be_inspected_after_restart_without_replaying_command(self):
         def fail_after_tool(body):
             if not self.results(body):
