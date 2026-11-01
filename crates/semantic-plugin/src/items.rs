@@ -22,6 +22,13 @@ fn item_text(text: &str) -> String {
 }
 
 pub(crate) fn items(snapshot: &MemorySnapshot) -> MemoryResult<Vec<Item>> {
+    items_with_revisions(snapshot, &BTreeMap::new())
+}
+
+fn items_with_revisions(
+    snapshot: &MemorySnapshot,
+    archived_revisions: &BTreeMap<String, u64>,
+) -> MemoryResult<Vec<Item>> {
     let evidence: BTreeMap<_, _> = snapshot
         .evidence
         .iter()
@@ -33,8 +40,10 @@ pub(crate) fn items(snapshot: &MemorySnapshot) -> MemoryResult<Vec<Item>> {
             continue;
         }
         let latest = preference.history.last().ok_or(MemoryError::CorruptState)?;
-        let source = evidence
+        let source_revision = evidence
             .get(latest.evidence_id.as_str())
+            .map(|source| source.revision)
+            .or_else(|| archived_revisions.get(&latest.evidence_id).copied())
             .ok_or(MemoryError::CorruptState)?;
         items.push(Item {
             key: format!("pref:{}", preference.id),
@@ -42,11 +51,11 @@ pub(crate) fn items(snapshot: &MemorySnapshot) -> MemoryResult<Vec<Item>> {
             source: MemoryRecallSource::ConfirmedPreference {
                 preference_id: preference.id.clone(),
                 preference_revision: preference.revision,
-                evidence_id: source.id.clone(),
-                evidence_revision: source.revision,
+                evidence_id: latest.evidence_id.clone(),
+                evidence_revision: source_revision,
                 at_ms: latest.at_ms,
             },
-            evidence_revision: source.revision,
+            evidence_revision: source_revision,
         });
     }
     for entry in &snapshot.evidence {
@@ -186,11 +195,31 @@ pub(crate) fn scan_layout<T>(
     mut consume: impl FnMut(&mut T, LayoutPart) -> MemoryResult<()>,
 ) -> MemoryResult<LayoutScan<T>> {
     for _ in 0..3 {
-        let snapshot = reader.snapshot()?;
+        let mut snapshot = reader.snapshot()?;
         let scope = snapshot.scope.clone();
         let revision = snapshot.revision;
         let mut value = create(&scope, revision)?;
-        if !with_segments || snapshot.archived_evidence == 0 {
+        let required = snapshot
+            .preferences
+            .iter()
+            .filter(|p| p.status == PreferenceStatus::Confirmed)
+            .map(|p| {
+                p.history
+                    .last()
+                    .map(|h| h.evidence_id.clone())
+                    .ok_or(MemoryError::CorruptState)
+            })
+            .collect::<MemoryResult<std::collections::BTreeSet<_>>>()?;
+        let mut reference_revisions: BTreeMap<String, u64> = snapshot
+            .evidence
+            .iter()
+            .filter(|e| required.contains(&e.id))
+            .map(|e| (e.id.clone(), e.revision))
+            .collect();
+        let missing_reference = required
+            .iter()
+            .any(|id| !reference_revisions.contains_key(id));
+        if (!with_segments && !missing_reference) || snapshot.archived_evidence == 0 {
             let ledger = items(&snapshot)?;
             drop(snapshot);
             consume(&mut value, LayoutPart::Ledger(ledger))?;
@@ -200,6 +229,14 @@ pub(crate) fn scan_layout<T>(
                 value,
             });
         }
+        // 归档逐页核验期间只保留偏好元数据，不保留热层正文。
+        let preference_snapshot = MemorySnapshot {
+            scope: scope.clone(),
+            revision,
+            evidence: vec![],
+            preferences: std::mem::take(&mut snapshot.preferences),
+            archived_evidence: 0,
+        };
         let mut ledger = items(&snapshot)?;
         let archived_count = snapshot.archived_evidence;
         // 热快照正文不参与归档扫描，先释放；每次只保留当前归档页的完整正文。
@@ -217,6 +254,13 @@ pub(crate) fn scan_layout<T>(
                     return Err(MemoryError::CorruptState);
                 }
                 last = entry.revision;
+                if required.contains(&entry.id)
+                    && reference_revisions
+                        .insert(entry.id.clone(), entry.revision)
+                        .is_some_and(|previous| previous != entry.revision)
+                {
+                    return Err(MemoryError::CorruptState);
+                }
             }
             if page
                 .next_after
@@ -231,7 +275,7 @@ pub(crate) fn scan_layout<T>(
                 break;
             }
             let next = page.next_after;
-            if !page.evidence.is_empty() {
+            if with_segments && !page.evidence.is_empty() {
                 let full = page.evidence.len() == crate::segments::SEGMENT_EVIDENCE;
                 let first_revision = page.evidence.first().map_or(0, |entry| entry.revision);
                 let last_revision = page.evidence.last().map_or(0, |entry| entry.revision);
@@ -265,6 +309,9 @@ pub(crate) fn scan_layout<T>(
         if total != archived_count {
             continue;
         }
+        let mut preferences = items_with_revisions(&preference_snapshot, &reference_revisions)?;
+        preferences.extend(ledger);
+        let mut ledger = preferences;
         // 保持旧布局：偏好原顺序在前，其余热条目与不满一段的归档按来源修订排序。
         ledger.sort_by_key(|item| match item.source {
             MemoryRecallSource::ConfirmedPreference { .. } => (0, 0),
@@ -607,5 +654,76 @@ mod tests {
             1,
             "consumer failure cannot silently skip a segment"
         );
+    }
+    struct ArchivedPreference {
+        reader: Paged,
+        evidence_id: &'static str,
+    }
+    impl MemoryService for ArchivedPreference {
+        fn snapshot(&self) -> MemoryResult<MemorySnapshot> {
+            let mut snapshot = self.reader.snapshot()?;
+            snapshot.preferences.push(eve_memory_api::Preference {
+                id: "confirmed".into(),
+                text: "preference text".into(),
+                status: PreferenceStatus::Confirmed,
+                revision: 1,
+                history: vec![eve_memory_api::PreferenceVersion {
+                    revision: 1,
+                    evidence_id: self.evidence_id.into(),
+                    at_ms: 180,
+                    text: "preference text".into(),
+                    status: PreferenceStatus::Confirmed,
+                }],
+            });
+            Ok(snapshot)
+        }
+        fn archived(
+            &self,
+            after: u64,
+            limit: usize,
+        ) -> MemoryResult<eve_memory_api::ArchivedEvidencePage> {
+            self.reader.archived(after, limit)
+        }
+    }
+    #[test]
+    fn confirmed_preference_resolves_real_archived_evidence_without_duplicate_interactions() {
+        for with_segments in [true, false] {
+            let reader = ArchivedPreference {
+                reader: reader(0),
+                evidence_id: "e-65",
+            };
+            let result = layout(&reader, with_segments).unwrap();
+            assert_eq!(result.ledger.len(), if with_segments { 5 } else { 3 });
+            assert_eq!(result.ledger[0].key, "pref:confirmed");
+            assert_eq!(result.ledger[0].evidence_revision, 65);
+            assert!(matches!(&result.ledger[0].source,
+                MemoryRecallSource::ConfirmedPreference {
+                    evidence_id, evidence_revision: 65, at_ms: 180, ..
+                } if evidence_id == "e-65"));
+            assert!(!result.ledger.iter().any(|i| i.key == "int:e-65:user"));
+            assert_eq!(result.blocks.len(), if with_segments { 2 } else { 0 });
+        }
+    }
+    #[test]
+    fn absent_preference_evidence_still_rejects_instead_of_guessing_a_revision() {
+        let reader = ArchivedPreference {
+            reader: reader(0),
+            evidence_id: "missing",
+        };
+        assert!(matches!(
+            layout(&reader, true),
+            Err(MemoryError::CorruptState)
+        ));
+    }
+    #[test]
+    fn resolving_a_preference_does_not_skip_later_archive_corruption() {
+        let reader = ArchivedPreference {
+            reader: reader(1),
+            evidence_id: "e-1",
+        };
+        assert!(matches!(
+            layout(&reader, true),
+            Err(MemoryError::CorruptState)
+        ));
     }
 }
