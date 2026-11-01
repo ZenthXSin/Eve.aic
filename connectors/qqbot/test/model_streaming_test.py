@@ -40,7 +40,7 @@ class ModelStreamingAcceptance(developer.DeveloperAcceptance):
             chunks.extend({"content": char} for char in message["content"])
         frames = [{"id": "fixture", "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
                   for delta in chunks]
-        if self.null_placeholders:
+        if getattr(self, "null_placeholders", False):
             for frame in frames[1:]:
                 delta = frame["choices"][0]["delta"]
                 delta.setdefault("role", None)
