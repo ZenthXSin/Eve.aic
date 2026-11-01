@@ -94,9 +94,34 @@ class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
         self.assertEqual(sorted(t["spec"]["max_steps"] for t in self.tasks()),[100,100])
 
     def test_uncertain_tool_effects_do_not_handoff(self):
-        self.callback=lambda body: calls(("uncertain","run_command",{"program":sys.executable,"args":["-c","import time; time.sleep(2)"],"timeout_ms":50})) if not self.results(body) else {"choices":[]}
-        self.run_recovery(self.send(self.message("unsafe","超时命令",contains=["存在未确认的工具副作用", "未自动派发"])))
+        self.callback=lambda body: calls(*[(f"checked-{i}", "echo", {"text": str(i)}) for i in range(17)],
+            ("uncertain","run_command",{"program":sys.executable,"args":["-c",
+                "from pathlib import Path; import time; p=Path('uncertain.txt'); p.write_text(p.read_text()+'x' if p.exists() else 'x'); time.sleep(5)"],"timeout_ms":1000})) if not self.results(body) else {"choices":[]}
+        self.run_recovery(self.send(self.message("unsafe","超时命令",contains=["模型服务返回空回复", "已启动 18 次工具调用，收到 18 条工具回执", "存在未确认的工具副作用", "第 18 条调用 run_command 执行异常", "未自动派发"])))
         self.assertFalse(self.tasks())
+        failure = self.turn("超时命令")["status"]["failure"]
+        self.assertEqual(failure["evidence"]["protocol_failure"], "EmptyResponse")
+        self.assertEqual(len(failure["evidence"]["tool_results"]), 18)
+        self.assertEqual((self.source / "uncertain.txt").read_text(), "x")
+        self.callback = lambda body: text_response("已保留失败回执，没有重跑")
+        self.run_recovery(self.send(self.message("uncertain-restart", "重启后核对", expected="已保留失败回执，没有重跑")))
+        self.assertEqual(self.turn("超时命令")["status"]["failure"], failure)
+        self.assertEqual((self.source / "uncertain.txt").read_text(), "x")
+
+    def test_preflight_rejection_is_not_an_unconfirmed_side_effect(self):
+        def respond(body):
+            if self.is_worker(body):
+                self.assertIn("UnknownTool", self.text(body))
+                return text_response("已经核对拒绝回执，未发生外部操作")
+            if not self.results(body):
+                return calls(("not-installed", "nonexistent_tool", {}))
+            return {"choices": []}
+        self.callback = respond
+        self.run_recovery([*self.send(self.message("rejected", "核对拒绝的调用", contains=["已保存并转交后台任务"])),
+            *self.checkpoint("rejected-done")], checkpoints={"rejected-done": self.wait_finished})
+        [task] = self.tasks()
+        self.assertEqual(task["status"], "Completed")
+        self.assertEqual(self.turn("核对拒绝的调用")["status"]["failure"]["started_tools"], 0)
 
     def test_hundred_calls_report_progress_with_large_context_and_no_replay_after_restart(self):
         self.closing_requests = 0

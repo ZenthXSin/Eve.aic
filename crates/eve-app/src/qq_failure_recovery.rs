@@ -63,23 +63,6 @@ impl QqFailureRecovery for Recovery {
         let Some(started) = report.run.started_tools else {
             return Ok(None);
         };
-        if started != report.run.tool_results.len() as u64
-            || report.run.tool_results.iter().any(|r| {
-                matches!(
-                    r.output,
-                    ToolOutput::Failure {
-                        code: ToolFailureCode::TimedOut
-                            | ToolFailureCode::Cancelled
-                            | ToolFailureCode::ExecutionFailed,
-                        ..
-                    }
-                )
-            })
-        {
-            return Ok(Some(
-                "存在未确认的工具副作用，未自动派发；请先核对已执行操作。".into(),
-            ));
-        }
         let snapshot = self
             .sessions
             .snapshot(&report.key.session)
@@ -99,9 +82,12 @@ impl QqFailureRecovery for Recovery {
                 .evidence
                 .as_ref()
                 .is_some_and(|e| e.tool_results != report.run.tool_results)
-            || (failure.evidence.is_none() && started != 0)
+            || (failure.evidence.is_none() && (started != 0 || !report.run.tool_results.is_empty()))
         {
             return Err(unavailable());
+        }
+        if let Some(reason) = recovery_blocker(started, failure.evidence.as_ref()) {
+            return Ok(Some(reason));
         }
         let owner = TaskOwner {
             session_id: scope.session_id.clone(),
@@ -137,7 +123,7 @@ impl QqFailureRecovery for Recovery {
         }).to_string()));
         let messages_json = serde_json::to_string(&messages).map_err(|_| unavailable())?;
         if messages_json.len() > MAX_CONTEXT_BYTES {
-            return Ok(Some("恢复上下文超过 2 MiB，未截断或自动派发；原文和工具回执保留，请先明确需要继续的事项。".into()));
+            return Ok(Some("恢复上下文超过 16 MiB，未截断或自动派发；原文和工具回执保留，请先明确需要继续的事项。".into()));
         }
         let max_steps = STEPS.min(config.get::<u32>("max_steps").map_err(|_| unavailable())?);
         let source = source(&owner, turn_id);
@@ -156,6 +142,57 @@ impl QqFailureRecovery for Recovery {
             task.id
         )))
     }
+}
+
+/// 准入前拒绝也有回执，但不计入 started；不能用“启动数 != 回执数”判断未知副作用。
+/// 先核对完整登记调用与回执，再按固定错误码保守判断；只显示位置与安全工具名。
+fn recovery_blocker(
+    started: u64,
+    evidence: Option<&eve_session_api::SessionFailureEvidence>,
+) -> Option<String> {
+    let evidence = evidence?;
+    let calls = evidence.tool_names.len();
+    let results = evidence.tool_results.len();
+    let succeeded = evidence
+        .tool_results
+        .iter()
+        .filter(|r| matches!(r.output, ToolOutput::Success(_)))
+        .count();
+    if calls != results || started > calls as u64 || started < succeeded as u64 {
+        return Some(format!(
+            "工具执行记录不完整（启动 {started} 次、登记 {calls} 条调用、收到 {results} 条回执），存在未确认的工具副作用，未自动派发；请先核对已执行操作。"
+        ));
+    }
+    let uncertain: Vec<_> = evidence
+        .tool_results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            let ToolOutput::Failure { code, .. } = &r.output else {
+                return None;
+            };
+            let reason = match code {
+                ToolFailureCode::TimedOut => "超时",
+                ToolFailureCode::Cancelled => "被取消",
+                ToolFailureCode::ExecutionFailed => "执行异常",
+                _ => return None,
+            };
+            let name = &evidence.tool_names[i];
+            let name = if name.len() <= 64
+                && !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            {
+                name.as_str()
+            } else {
+                "工具"
+            };
+            Some(format!("第 {} 条调用 {name} {reason}", i + 1))
+        })
+        .take(3)
+        .collect();
+    (!uncertain.is_empty()).then(|| format!("存在未确认的工具副作用：{}；失败回执不代表操作未发生，未自动派发。请先核对这些调用，已完成操作不会自动重跑。", uncertain.join("、")))
 }
 
 fn source(owner: &TaskOwner, turn: u64) -> String {
@@ -217,7 +254,7 @@ impl eve_qqbot_plugin::QqCommandHandler for Commands {
             .map_err(|_| PluginError::State("接续上下文无法编码".into()))?;
         if messages_json.len() > MAX_CONTEXT_BYTES {
             return Ok(Some(
-                "接续上下文超过 2 MiB，未截断或派发；原记录保留。".into(),
+                "接续上下文超过 16 MiB，未截断或派发；原记录保留。".into(),
             ));
         }
         let steps = STEPS.min(
@@ -252,5 +289,82 @@ impl eve_qqbot_plugin::QqCommandHandler for Commands {
             ),
             Err(_) => "追加任务未能确认保存，未扩大原任务预算；原记录保留。".into(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eve_llm_api::{ProtocolFailureKind, ToolResult};
+    use eve_session_api::SessionFailureEvidence;
+
+    fn evidence(results: Vec<ToolResult>) -> SessionFailureEvidence {
+        SessionFailureEvidence {
+            provider_http_status: None,
+            provider_failure: None,
+            protocol_failure: Some(ProtocolFailureKind::StreamInvalid),
+            tool_names: vec!["run_command".into(); results.len()],
+            tool_results: results,
+        }
+    }
+
+    #[test]
+    fn all_eighteen_receipts_can_still_contain_one_unknown_effect() {
+        for (code, label) in [
+            (ToolFailureCode::TimedOut, "超时"),
+            (ToolFailureCode::Cancelled, "被取消"),
+            (ToolFailureCode::ExecutionFailed, "执行异常"),
+        ] {
+            let mut results: Vec<_> = (0..17)
+                .map(|i| ToolResult::success(i.to_string(), json!({"ok":true})).unwrap())
+                .collect();
+            results.push(ToolResult::failure("18", code, "private command secret").unwrap());
+            let e = evidence(results);
+            let notice = recovery_blocker(18, Some(&e)).unwrap();
+            assert!(
+                notice.contains(&format!("第 18 条调用 run_command {label}")),
+                "{notice}"
+            );
+            assert!(notice.contains("未自动派发"));
+            assert!(!notice.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn known_rejection_before_execution_does_not_imply_unknown_effects() {
+        let e = evidence(vec![
+            ToolResult::failure("rejected", ToolFailureCode::UnknownTool, "未执行").unwrap(),
+        ]);
+        assert_eq!(recovery_blocker(0, Some(&e)), None);
+        let e = evidence(vec![
+            ToolResult::failure("rejected", ToolFailureCode::InvalidArguments, "未执行").unwrap(),
+        ]);
+        assert_eq!(recovery_blocker(0, Some(&e)), None);
+        assert_eq!(recovery_blocker(1, Some(&e)), None);
+        let e = evidence(vec![ToolResult::success("ok", json!(true)).unwrap()]);
+        assert_eq!(recovery_blocker(1, Some(&e)), None);
+        assert!(
+            recovery_blocker(0, Some(&e))
+                .unwrap()
+                .contains("记录不完整")
+        );
+    }
+
+    #[test]
+    fn missing_receipts_or_unsafe_tool_names_are_not_hidden() {
+        let mut e = evidence(vec![]);
+        e.tool_names.push("run_command".into());
+        assert!(
+            recovery_blocker(1, Some(&e))
+                .unwrap()
+                .contains("记录不完整")
+        );
+        let mut e = evidence(vec![
+            ToolResult::failure("bad", ToolFailureCode::ExecutionFailed, "secret").unwrap(),
+        ]);
+        e.tool_names[0] = "secret\n@everyone".into();
+        let notice = recovery_blocker(1, Some(&e)).unwrap();
+        assert!(notice.contains("第 1 条调用 工具 执行异常"));
+        assert!(!notice.contains("secret"));
     }
 }

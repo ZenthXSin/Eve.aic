@@ -84,6 +84,9 @@ pub struct SessionFailureEvidence {
     /// Provider 给出的失败类别；旧记录与没有类别的失败缺省为 None，写出时省略。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_failure: Option<eve_llm_api::ProviderFailureKind>,
+    /// 固定协议故障类别；旧记录缺省为 None，不保存模型或供应商原始错误正文。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_failure: Option<eve_llm_api::ProtocolFailureKind>,
     pub tool_names: Vec<String>,
     pub tool_results: Vec<ToolResult>,
 }
@@ -103,8 +106,9 @@ impl SessionFailure {
     pub fn validate(&self) -> SessionResult<()> {
         if let Some(e) = &self.evidence {
             let mut ids = std::collections::BTreeSet::new();
-            if e.provider_http_status
-                .is_some_and(|status| !(100..=599).contains(&status))
+            if (e.protocol_failure.is_some() && self.code != SessionFailureCode::Protocol)
+                || e.provider_http_status
+                    .is_some_and(|status| !(100..=599).contains(&status))
                 || e.tool_names.iter().any(|name| name.trim().is_empty())
                 || e.tool_results
                     .iter()
@@ -379,6 +383,25 @@ mod tests {
 #[cfg(test)]
 mod enumeration_compatibility {
     use super::*;
+
+    #[test]
+    fn protocol_category_roundtrips_and_old_records_remain_readable() {
+        let old = serde_json::json!({"code":"Protocol","started_tools":0,
+            "evidence":{"provider_http_status":null,"tool_names":[],"tool_results":[]}});
+        let mut record: SessionFailure = serde_json::from_value(old).unwrap();
+        record.validate().unwrap();
+        assert_eq!(record.evidence.as_ref().unwrap().protocol_failure, None);
+        record.evidence.as_mut().unwrap().protocol_failure =
+            Some(eve_llm_api::ProtocolFailureKind::StreamInvalid);
+        record.validate().unwrap();
+        let bytes = serde_json::to_vec(&record).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<SessionFailure>(&bytes).unwrap(),
+            record
+        );
+        record.code = SessionFailureCode::Provider;
+        assert_eq!(record.validate(), Err(SessionError::InvalidInput));
+    }
 
     struct CustomSessions;
     impl SessionService for CustomSessions {

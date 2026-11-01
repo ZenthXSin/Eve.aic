@@ -670,7 +670,9 @@ fn failed_turn_notice(report: &ControlReport, recovery: Option<&str>) -> String 
         (_, Some(LlmError::Protocol(reason))) if reason.starts_with("任务仍标记为未完成；") => {
             "任务仍未完成，自动续行三次后仍未完成或说明阻塞，已停止本轮".into()
         }
-        (_, Some(LlmError::Protocol(_))) => "模型回复格式或工具调用未通过协议检查".into(),
+        (_, Some(error @ LlmError::Protocol(_))) => {
+            protocol_reason(error.protocol_failure().expect("协议错误必有类别")).into()
+        }
         (_, Some(LlmError::ContextCompactionFailed(failure))) => {
             format!(
                 "上下文压缩失败：{}；原始记录与摘要进度保留",
@@ -715,6 +717,24 @@ fn failed_turn_notice(report: &ControlReport, recovery: Option<&str>) -> String 
         .or(no_tools)
         .unwrap_or("本轮已停止，不再自动重试；继续前需要核对现有结果。");
     format!("{reason}。{effects}{next}")
+}
+/// 固定类别之外的错误仍给通用提示，不转述可包含秘密的原始错误字符串。
+fn protocol_reason(kind: eve_llm_api::ProtocolFailureKind) -> &'static str {
+    use eve_llm_api::ProtocolFailureKind::*;
+    match kind {
+        InvalidJson => "模型服务返回的响应不是有效 JSON，本次回复未执行新工具",
+        EmptyResponse => "模型服务返回空回复，本次回复未执行新工具",
+        ToolArguments => "模型生成的工具参数不是有效 JSON，本批工具未执行",
+        ToolBatch => "模型回复的工具批次或结束标记不一致，本批工具未执行",
+        ReusedToolId => "模型工具调用标识被重复使用，重复批次未执行",
+        StreamContentType => "模型服务未返回约定的事件流，本次回复未执行新工具",
+        StreamIncomplete => "模型流在正常结束前断开，本次回复未执行新工具",
+        StreamInvalid => "模型流片段或工具标识不一致，本次回复未执行新工具",
+        StreamMismatch => "模型流增量与最终结果不一致，本次回复未执行新工具",
+        StreamTooLarge => "模型流文本超过接收上限，本次回复未执行新工具",
+        TaskIncomplete => "任务仍未完成，自动续行三次后仍未完成或说明阻塞，已停止本轮",
+        Other => "模型回复格式或工具调用未通过协议检查",
+    }
 }
 /// 只用固定类别与状态码说明，不转述供应商错误正文。
 fn failure_reason(failure: ProviderFailure) -> String {
@@ -2598,6 +2618,14 @@ mod tests {
             (
                 RunFailure::Execution(LlmError::Protocol("private response body".into())),
                 "模型回复格式或工具调用未通过协议检查",
+            ),
+            (
+                RunFailure::Execution(LlmError::Protocol("Chat 函数参数不是有效 JSON".into())),
+                "模型生成的工具参数不是有效 JSON，本批工具未执行",
+            ),
+            (
+                RunFailure::Execution(LlmError::Protocol("模型流在正常终态前结束".into())),
+                "模型流在正常结束前断开，本次回复未执行新工具",
             ),
             (
                 RunFailure::Commit(SessionError::Storage),

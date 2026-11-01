@@ -187,6 +187,7 @@ async fn cold_and_hot_history_keep_identical_complete_turns_and_failure_meaning_
                 Some(SessionFailureEvidence {
                     provider_http_status: None,
                     provider_failure: Some(eve_llm_api::ProviderFailureKind::Truncated),
+                    protocol_failure: None,
                     tool_names: vec![],
                     tool_results: vec![],
                 }),
@@ -198,6 +199,7 @@ async fn cold_and_hot_history_keep_identical_complete_turns_and_failure_meaning_
                 Some(SessionFailureEvidence {
                     provider_http_status: Some(503),
                     provider_failure: None,
+                    protocol_failure: None,
                     tool_names: vec!["write_file".into()],
                     tool_results: vec![
                         eve_llm_api::ToolResult::success(
@@ -502,6 +504,7 @@ async fn unacknowledged_begin_recovers_interrupted_and_failed_evidence_stays_exa
         evidence: Some(SessionFailureEvidence {
             provider_http_status: Some(503),
             provider_failure: None,
+            protocol_failure: None,
             tool_names: vec!["write_file".into()],
             tool_results: vec![
                 eve_llm_api::ToolResult::success("write-1", json!("已写入的原始回执")).unwrap(),

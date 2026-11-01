@@ -245,6 +245,7 @@ impl SessionLlmHost {
             Err(failure) => {
                 let summary = SessionFailure {
                     evidence: (failure.error.provider_failure().is_some()
+                        || failure.error.protocol_failure().is_some()
                         || failure.error.provider_http_status().is_some()
                         || !failure.diagnostics.calls.is_empty()
                         || !failure.diagnostics.tool_results.is_empty())
@@ -254,6 +255,7 @@ impl SessionLlmHost {
                             .error
                             .provider_failure()
                             .map(|failure| failure.kind),
+                        protocol_failure: failure.error.protocol_failure(),
                         tool_names: failure
                             .diagnostics
                             .calls
