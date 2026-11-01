@@ -37,7 +37,7 @@ pub const MAX_HISTORY: usize = 256;
 pub const MAX_TEXT_BYTES: usize = 32_768;
 pub const MAX_PREFERENCE_BYTES: usize = 4096;
 /// 热层文档的序列化字节上限；归档分块不计入。
-pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 pub type MemoryResult<T> = Result<T, MemoryError>;
 
 /// 不自动合并同名用户或跨通道身份。只有可信宿主能绑定读取句柄。

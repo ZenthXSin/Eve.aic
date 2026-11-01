@@ -15,6 +15,56 @@ impl ContextReply {
         };
         let valid = match (self, operation) {
             (Self::View { view }, ContextOperation::Inspect {}) => valid_view(view),
+            (
+                Self::Range { page },
+                ContextOperation::ReadRange {
+                    revision,
+                    offset,
+                    limit,
+                },
+            ) => {
+                let end = page.offset.checked_add(page.text.len());
+                page.owner == *owner
+                    && page.revision == *revision
+                    && page.offset == *offset
+                    && page.total_bytes <= MAX_NOTE_BYTES
+                    && page.text.len() <= *limit
+                    && end.is_some_and(|end| {
+                        end <= page.total_bytes
+                            && page.next_offset == (end < page.total_bytes).then_some(end)
+                            && (end == page.total_bytes || !page.text.is_empty())
+                    })
+                    && match &page.version {
+                        None => page.revision == 0 && page.total_bytes == 0,
+                        Some(version) => {
+                            version.validate().is_ok()
+                                && version.revision == page.revision
+                                && version.text_bytes == page.total_bytes
+                        }
+                    }
+            }
+            (
+                Self::Saved {
+                    view,
+                    saved,
+                    effective,
+                },
+                ContextOperation::Splice {
+                    expected_revision,
+                    start,
+                    text,
+                    ..
+                },
+            ) => {
+                *saved
+                    && *effective == "next_turn"
+                    && valid_view(view)
+                    && valid_revision(view, *expected_revision)
+                    && start
+                        .checked_add(text.len())
+                        .and_then(|end| view.text.get(*start..end))
+                        .is_some_and(|actual| actual == text)
+            }
             (Self::View { view }, ContextOperation::ReadVersion { revision }) => {
                 valid_view(view) && view.revision == *revision
             }

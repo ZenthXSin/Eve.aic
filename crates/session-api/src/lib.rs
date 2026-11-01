@@ -17,6 +17,9 @@ pub trait SessionArchiveStore: Send + Sync {
     fn get(&self, key: &str) -> SessionResult<Vec<u8>>;
 }
 /// 单轮冷正文保护，不是进程内存预算。
+/// 新写入的单记录逻辑容量。
+pub const MAX_SESSION_ARCHIVE_WRITE_BYTES: usize = 16 * 1024 * 1024;
+/// 旧记录读回兼容上限，不删除或误判历史合法记录。
 pub const MAX_SESSION_ARCHIVE_RECORD_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

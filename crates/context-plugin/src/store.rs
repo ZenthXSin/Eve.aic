@@ -8,7 +8,7 @@ use std::{
 };
 
 pub const CONTEXT_INDEX_KEY: &str = "index.v1";
-pub const MAX_CONTEXT_INDEX_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_CONTEXT_INDEX_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CONTEXT_OWNERS: usize = 1024;
 pub const MAX_CONTEXT_VERSIONS: usize = 8192;
 

@@ -1,7 +1,7 @@
 //! 自主运行预算契约：后台自主工作（不是对用户消息的回复）在固定时间窗口内可发起的模型请求总数。
 //!
-//! 每次请求先持久化计数再发出；重启、重复事件或自造目标都不能放大一个窗口内的用量。
-//! 进程在计数后、请求前退出时，该次计数不退还：预算宁可少用，不能多用。
+//! 模型请求先持久化预留，成功后结算；失败、取消和重启时未确认成功的预留释放。
+//! 预留也占用可用余额，不能用并发请求突破窗口上限；旧版直接计数没有结果证据，不追溯退款。
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt};
 
@@ -115,6 +115,14 @@ pub trait AutonomyBudget: Send + Sync {
     fn snapshot(&self, now_ms: u64) -> BudgetResult<BudgetSnapshot>;
     /// 先持久化计数再返回；余额不足时返回 Exhausted 且不写入。返回本窗口剩余额度。
     fn reserve(&self, category: &str, count: u32, now_ms: u64) -> BudgetResult<u32>;
+    /// 模型请求的持久预留；返回只供宿主结算的唯一编号。替换实现未支持时失败关闭。
+    fn begin_request(&self, _category: &str, _now_ms: u64) -> BudgetResult<u64> {
+        Err(BudgetError::Unavailable)
+    }
+    /// success 仅表示模型适配器确认返回；不证明后续任务、工具或业务验收成功。
+    fn settle_request(&self, _id: u64, _success: bool) -> BudgetResult<()> {
+        Err(BudgetError::Unavailable)
+    }
 }
 
 #[cfg(test)]

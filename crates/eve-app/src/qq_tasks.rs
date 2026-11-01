@@ -130,13 +130,13 @@ pub(crate) fn schema() -> ConfigSchema {
             ),
             (
                 "task_timeout_ms".into(),
-                field(1_800_000, 10_000, 7_200_000, "EVE_TASK_TIMEOUT_MS"),
+                field(0, 0, 7_200_000, "EVE_TASK_TIMEOUT_MS"),
             ),
             (
                 "subagent_timeout_ms".into(),
                 field(
-                    180_000,
-                    5_000,
+                    0,
+                    0,
                     MAX_SUBAGENT_TIMEOUT_MS as i64,
                     "EVE_SUBAGENT_TIMEOUT_MS",
                 ),
@@ -205,7 +205,7 @@ struct WorkerRequest {
     instructions: String,
     scope: Option<ContextScope>,
     steps: u32,
-    timeout: Duration,
+    timeout: Option<Duration>,
     stop: watch::Receiver<bool>,
     journal: Option<Arc<dyn eve_llm_api::TurnJournal>>,
     shared_steps: Option<eve_llm_api::SharedToolSteps>,
@@ -216,7 +216,7 @@ struct TaskJournal {
     tasks: Arc<dyn TaskAdmin>,
     owner: TaskOwner,
     id: String,
-    deadline_at_ms: u64,
+    deadline_at_ms: Option<u64>,
 }
 impl eve_llm_api::TurnJournal for TaskJournal {
     fn load(&self) -> Result<Option<eve_llm_api::TurnCheckpoint>, LlmError> {
@@ -230,7 +230,7 @@ impl eve_llm_api::TurnJournal for TaskJournal {
     }
     fn save(&self, checkpoint: &eve_llm_api::TurnCheckpoint) -> Result<(), LlmError> {
         self.tasks
-            .checkpoint(&self.id, checkpoint.clone(), self.deadline_at_ms, now_ms())
+            .checkpoint_with_deadline(&self.id, checkpoint.clone(), self.deadline_at_ms, now_ms())
             .map(|_| ())
             .map_err(|error| {
                 LlmError::Context(match error {
@@ -478,10 +478,12 @@ impl Worker {
                 };
             }
         };
-        let host = host
-            .with_shared_steps(steps_pool.clone())
-            .with_run_deadline(std::time::Instant::now() + timeout)
-            .delegated();
+        let host = host.with_shared_steps(steps_pool.clone()).delegated();
+        let host = if let Some(timeout) = timeout {
+            host.with_run_deadline(std::time::Instant::now() + timeout)
+        } else {
+            host
+        };
         let usage = |requests, calls| {
             if child {
                 usage_of(requests, calls)
@@ -499,7 +501,12 @@ impl Worker {
         };
         let sink = StopSignal(stop.clone());
         let run = host.run_scoped_turn_with_events(TurnInput { text: instructions }, scope, &sink);
-        match tokio::time::timeout(timeout, run).await {
+        let outcome = if let Some(timeout) = timeout {
+            tokio::time::timeout(timeout, run).await.map_err(|_| ())
+        } else {
+            Ok(run.await)
+        };
+        match outcome {
             Ok(Ok(TurnOutput {
                 text,
                 diagnostics,
@@ -535,7 +542,7 @@ impl Worker {
             Err(_) => WorkerRun {
                 end: TaskEnd::Failed {
                     reason: crate::qq_task_diagnostics::failure_checkpoint(
-                        &format!("超过 {} 秒仍未完成", timeout.as_secs()),
+                        &format!("超过 {} 秒仍未完成", timeout.unwrap_or_default().as_secs()),
                         journal
                             .as_ref()
                             .and_then(|j| j.load().ok().flatten())
@@ -900,7 +907,7 @@ fn capture_context(
     let messages_json = serde_json::to_string(messages).map_err(|_| failed("上下文序列化失败"))?;
     if messages_json.len() > MAX_CONTEXT_BYTES {
         return Err(failed(
-            "完整上下文超过 2 MiB；未截断、未派发，请关闭 include_context 并提供明确任务说明",
+            "完整上下文超过 16 MiB；未截断、未派发，请关闭 include_context 并提供明确任务说明",
         ));
     }
     Ok(Some(DelegatedContext {
@@ -1258,11 +1265,14 @@ impl Tool for SubagentTool {
                     .get(&scope, profile_id)
                     .map_err(failed)?,
             };
-            let own_deadline = std::time::Instant::now() + settings.subagent_timeout;
-            let deadline = context
-                .deadline()
-                .map_or(own_deadline, |parent| parent.min(own_deadline));
-            let context = context.with_deadline(Some(deadline));
+            // 子代理不自行领取总时长期限；只继承父任务或明确配置的截止。
+            let own_deadline = (!settings.subagent_timeout.is_zero())
+                .then(|| std::time::Instant::now() + settings.subagent_timeout);
+            let deadline = match (context.deadline(), own_deadline) {
+                (Some(parent), Some(own)) => Some(parent.min(own)),
+                (parent, own) => parent.or(own),
+            };
+            let context = context.with_deadline(deadline);
             let worker = self
                 .late
                 .worker
@@ -1286,8 +1296,9 @@ impl Tool for SubagentTool {
             )?;
             // 本轮取消时子代理一并停下。
             let (stop, stopped) = watch::channel(false);
-            let timeout = deadline.saturating_duration_since(std::time::Instant::now());
-            if timeout.is_zero() {
+            let timeout = deadline
+                .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
+            if timeout.is_some_and(|timeout| timeout.is_zero()) {
                 return Err(failed("等待并发槽已耗尽子代理期限；未启动模型"));
             }
             let running = worker.run_request(WorkerRequest {
@@ -1729,18 +1740,19 @@ async fn run(
                     session_id: started.owner.session_id.clone(),
                     user_id: started.owner.user_id.clone(),
                 };
-                let deadline_at_ms = started
-                    .execution
-                    .as_ref()
-                    .and_then(|e| e.deadline_at_ms)
-                    .unwrap_or_else(|| {
-                        started.started_at_ms.unwrap_or_else(now_ms)
-                            .saturating_add(settings.task_timeout.as_millis() as u64)
-                    });
-                let deadline_at_ms = started.execution.as_ref().and_then(|e| e.authorization_deadline_at_ms).map_or(deadline_at_ms, |authorized| deadline_at_ms.min(authorized));
-                // 给执行前预测绑定本次实际期限；执行器首次检查点保存同一值。
+                let execution = started.execution.as_ref();
+                let configured = (!settings.task_timeout.is_zero()).then(||
+                    started.started_at_ms.unwrap_or_else(now_ms)
+                        .saturating_add(settings.task_timeout.as_millis() as u64));
+                // 已保存的旧任务仍保留原截止；新任务默认只按共享步骤结束。
+                let deadline_at_ms = execution.and_then(|e| e.deadline_at_ms).or(configured);
+                let authorization = execution.and_then(|e| e.authorization_deadline_at_ms);
+                let deadline_at_ms = match (deadline_at_ms, authorization) {
+                    (Some(task), Some(auth)) => Some(task.min(auth)),
+                    (task, auth) => task.or(auth),
+                };
                 let mut strategy_task = started.clone();
-                strategy_task.execution.get_or_insert_with(Default::default).deadline_at_ms = Some(deadline_at_ms);
+                strategy_task.execution.get_or_insert_with(Default::default).deadline_at_ms = deadline_at_ms;
                 let guidance = tasks.strategy_guidance(&strategy_task)?;
                 let mut instructions = format!(
                     "任务：{}\n\n{}",
@@ -1758,7 +1770,7 @@ async fn run(
                     &started.owner,
                 );
                 let steps = started.spec.max_steps;
-                let timeout = Duration::from_millis(deadline_at_ms.saturating_sub(now_ms()));
+                let timeout = deadline_at_ms.map(|at| Duration::from_millis(at.saturating_sub(now_ms())));
                 let journal: Option<Arc<dyn eve_llm_api::TurnJournal>> =
                     started.execution.as_ref().map(|_| {
                         Arc::new(TaskJournal {
@@ -2245,7 +2257,8 @@ mod tests {
         let defaults = settings(&snapshot(&values)).unwrap();
         assert_eq!(defaults.default_steps, 100);
         assert_eq!(defaults.max_steps, 5000);
-        assert_eq!(defaults.subagent_timeout, Duration::from_secs(180));
+        assert_eq!(defaults.subagent_timeout, Duration::ZERO);
+        assert_eq!(defaults.task_timeout, Duration::ZERO);
         values.insert("default_steps".into(), json!(5001));
         assert!(settings(&snapshot(&values)).is_err());
     }

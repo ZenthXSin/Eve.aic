@@ -8,7 +8,8 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
+const MAX_PENDING: usize = 128;
 const MAX_STATE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -18,6 +19,47 @@ struct Ledger {
     policy: BudgetPolicy,
     current: BudgetWindow,
     history: Vec<BudgetWindow>,
+    #[serde(default)]
+    pending: BTreeMap<u64, Reservation>,
+    #[serde(default)]
+    next_request: u64,
+    #[serde(default)]
+    failed_requests: u64,
+    #[serde(default)]
+    interrupted_requests: u64,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Reservation {
+    window_start_ms: u64,
+    category: String,
+}
+fn release(ledger: &mut Ledger, reservation: &Reservation) -> BudgetResult<()> {
+    let window = if ledger.current.start_ms == reservation.window_start_ms {
+        Some(&mut ledger.current)
+    } else {
+        ledger
+            .history
+            .iter_mut()
+            .find(|w| w.start_ms == reservation.window_start_ms)
+    };
+    // 已越过有界历史保留期的失败不冲抵新窗口。
+    if let Some(window) = window {
+        let value = window
+            .by_category
+            .get_mut(&reservation.category)
+            .ok_or(BudgetError::CorruptState)?;
+        *value = value.checked_sub(1).ok_or(BudgetError::CorruptState)?;
+        if *value == 0 {
+            window.by_category.remove(&reservation.category);
+        }
+        window.used = window
+            .used
+            .checked_sub(1)
+            .ok_or(BudgetError::CorruptState)?;
+    }
+    ledger.history.retain(|window| window.used != 0);
+    Ok(())
 }
 impl Ledger {
     /// 按配置的策略与当前时间滚动窗口。窗口长度改变或进入新窗口时，旧窗口进入历史；
@@ -26,12 +68,22 @@ impl Ledger {
         let mut next = self.clone();
         let start = policy.window_start(now_ms);
         let changed_length = next.policy.window_ms != policy.window_ms;
+        let old_end = next.current.start_ms.saturating_add(next.policy.window_ms);
+        // 切换窗口长度不得在尚未结束的窗口内重新领额度，也不能生成倒序历史。
+        if changed_length && now_ms < old_end {
+            next.policy.limit = policy.limit;
+            return next;
+        }
         next.policy = policy;
         if changed_length || start > next.current.start_ms {
             let finished = std::mem::replace(
                 &mut next.current,
                 BudgetWindow {
-                    start_ms: start,
+                    start_ms: if changed_length {
+                        start.max(old_end)
+                    } else {
+                        start
+                    },
                     used: 0,
                     by_category: Default::default(),
                 },
@@ -59,8 +111,10 @@ fn decode(bytes: &[u8]) -> BudgetResult<Ledger> {
         return Err(BudgetError::CorruptState);
     }
     let value = strict_json::from_slice(bytes).map_err(|_| BudgetError::CorruptState)?;
-    if value.get("format_version").and_then(|value| value.as_u64())
-        != Some(u64::from(FORMAT_VERSION))
+    if value
+        .get("format_version")
+        .and_then(|value| value.as_u64())
+        .is_none_or(|version| version != 1 && version != u64::from(FORMAT_VERSION))
     {
         return Err(if value.get("format_version").is_some() {
             BudgetError::UnsupportedVersion
@@ -68,7 +122,18 @@ fn decode(bytes: &[u8]) -> BudgetResult<Ledger> {
             BudgetError::CorruptState
         });
     }
-    let ledger: Ledger = serde_json::from_value(value).map_err(|_| BudgetError::CorruptState)?;
+    let mut ledger: Ledger =
+        serde_json::from_value(value).map_err(|_| BudgetError::CorruptState)?;
+    if ledger.format_version == 1 {
+        if !ledger.pending.is_empty()
+            || ledger.next_request != 0
+            || ledger.failed_requests != 0
+            || ledger.interrupted_requests != 0
+        {
+            return Err(BudgetError::CorruptState);
+        }
+        ledger.format_version = FORMAT_VERSION;
+    }
     validate(&ledger)?;
     Ok(ledger)
 }
@@ -103,16 +168,32 @@ impl StoredBudget {
                 policy,
                 current: BudgetWindow::default(),
                 history: vec![],
+                pending: BTreeMap::new(),
+                next_request: 0,
+                failed_requests: 0,
+                interrupted_requests: 0,
             },
             Some(bytes) => decode(&bytes)?,
         };
+        let mut inner = Inner {
+            ledger,
+            context: Some(context),
+        };
+        if !inner.ledger.pending.is_empty() {
+            let mut recovered = inner.ledger.clone();
+            for reservation in std::mem::take(&mut recovered.pending).values() {
+                release(&mut recovered, reservation)?;
+                recovered.interrupted_requests = recovered
+                    .interrupted_requests
+                    .checked_add(1)
+                    .ok_or(BudgetError::CorruptState)?;
+            }
+            persist(&mut inner, recovered)?;
+        }
         Ok(Self {
             policy,
             category_limits,
-            inner: Mutex::new(Inner {
-                ledger,
-                context: Some(context),
-            }),
+            inner: Mutex::new(inner),
         })
     }
 
@@ -131,6 +212,17 @@ impl StoredBudget {
     }
 
     pub(crate) fn reserve(&self, category: &str, count: u32, now_ms: u64) -> BudgetResult<u32> {
+        self.admit(category, count, now_ms, false)
+            .map(|(remaining, _)| remaining)
+    }
+
+    fn admit(
+        &self,
+        category: &str,
+        count: u32,
+        now_ms: u64,
+        leased: bool,
+    ) -> BudgetResult<(u32, u64)> {
         validate_category(category)?;
         if count == 0 {
             return Err(BudgetError::InvalidInput);
@@ -168,8 +260,45 @@ impl StoredBudget {
             .entry(category.to_string())
             .or_default() += count;
         let remaining = next.policy.limit - next.current.used;
+        let id = if leased {
+            if count != 1 || next.pending.len() >= MAX_PENDING {
+                return Err(BudgetError::Unavailable);
+            }
+            let id = next
+                .next_request
+                .checked_add(1)
+                .ok_or(BudgetError::Unavailable)?;
+            next.next_request = id;
+            next.pending.insert(
+                id,
+                Reservation {
+                    window_start_ms: next.current.start_ms,
+                    category: category.into(),
+                },
+            );
+            id
+        } else {
+            0
+        };
         persist(&mut inner, next)?;
-        Ok(remaining)
+        Ok((remaining, id))
+    }
+
+    pub(crate) fn begin_request(&self, category: &str, now_ms: u64) -> BudgetResult<u64> {
+        self.admit(category, 1, now_ms, true).map(|(_, id)| id)
+    }
+    pub(crate) fn settle_request(&self, id: u64, success: bool) -> BudgetResult<()> {
+        let mut inner = self.lock()?;
+        let mut next = inner.ledger.clone();
+        let reservation = next.pending.remove(&id).ok_or(BudgetError::InvalidInput)?;
+        if !success {
+            release(&mut next, &reservation)?;
+            next.failed_requests = next
+                .failed_requests
+                .checked_add(1)
+                .ok_or(BudgetError::Unavailable)?;
+        }
+        persist(&mut inner, next)
     }
 
     pub(crate) fn close(&self) -> PluginResult<()> {
@@ -204,6 +333,30 @@ fn validate(ledger: &Ledger) -> BudgetResult<()> {
         .policy
         .validate()
         .map_err(|_| BudgetError::CorruptState)?;
+    if ledger.format_version != FORMAT_VERSION || ledger.pending.len() > MAX_PENDING {
+        return Err(BudgetError::CorruptState);
+    }
+    let mut reserved = BTreeMap::<(u64, &str), u32>::new();
+    for (id, reservation) in &ledger.pending {
+        if *id == 0
+            || *id > ledger.next_request
+            || reservation.window_start_ms > ledger.current.start_ms
+        {
+            return Err(BudgetError::CorruptState);
+        }
+        validate_category(&reservation.category).map_err(|_| BudgetError::CorruptState)?;
+        *reserved
+            .entry((reservation.window_start_ms, &reservation.category))
+            .or_default() += 1;
+    }
+    for ((start, category), count) in reserved {
+        let window = std::iter::once(&ledger.current)
+            .chain(&ledger.history)
+            .find(|w| w.start_ms == start);
+        if window.is_some_and(|w| w.by_category.get(category).copied().unwrap_or(0) < count) {
+            return Err(BudgetError::CorruptState);
+        }
+    }
     validate_window(&ledger.current)?;
     if ledger.history.len() > MAX_HISTORY
         || ledger
@@ -224,7 +377,11 @@ fn validate(ledger: &Ledger) -> BudgetResult<()> {
 }
 
 fn persist(inner: &mut Inner, next: Ledger) -> BudgetResult<()> {
+    validate(&next)?;
     let bytes = serde_json::to_vec(&next).map_err(|_| BudgetError::InvalidInput)?;
+    if bytes.len() > MAX_STATE_BYTES {
+        return Err(BudgetError::InvalidInput);
+    }
     let context = inner.context.as_ref().ok_or(BudgetError::Unavailable)?;
     // 失败也可能已经提交；关闭整个实例，之后的请求一律拒绝，须重新打开核对。
     if context.state_set(BUDGET_STATE_KEY, bytes).is_err() {

@@ -108,7 +108,7 @@ pub fn model_roles_schema() -> ConfigSchema {
                     minimum: Some(1),
                     maximum: Some(u32::MAX.into()),
                 },
-                Value::from(1),
+                Value::from(5),
             ),
         ];
         for (suffix, kind, default) in values {

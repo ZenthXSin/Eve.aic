@@ -1160,7 +1160,7 @@ async fn oversized_escaped_context_keeps_committed_tasks_and_handle_usable_after
             owner: owner.clone(),
             messages_json: serde_json::to_string(&vec![eve_llm_api::ChatMessage::text(
                 eve_llm_api::ChatRole::User,
-                "\\\"".repeat(300_000),
+                "\\\"".repeat(MAX_STATE_BYTES / 14 + 64 * 1024),
             )])
             .unwrap(),
         });
@@ -1615,7 +1615,7 @@ async fn cold_storage_does_not_raise_original_logical_capacity_or_write_rejected
             owner: owner("alice"),
             messages_json: serde_json::to_string(&vec![eve_llm_api::ChatMessage::text(
                 eve_llm_api::ChatRole::User,
-                "\"".repeat(600_000),
+                "\"".repeat(MAX_STATE_BYTES / 8 + 64 * 1024),
             )])
             .unwrap(),
         });
@@ -1838,4 +1838,39 @@ fn archive_quota_and_compaction_preserve_current_unknown_and_corrupt_files() {
     assert_eq!(archive.put(&next, b"next"), Err(TaskError::LimitReached));
     assert!(!directory.path().join(format!("{next}.json")).exists());
     assert_eq!(archive.get(&current).unwrap(), b"current");
+}
+
+#[tokio::test]
+async fn step_only_checkpoints_resume_after_the_old_time_limit_without_losing_steps_or_authorization()
+ {
+    let world = World::new();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let task = tasks
+        .create(&owner("alice"), spec("按步骤恢复"), "step-only", 10)
+        .unwrap();
+    tasks.start(&task.id, 20).unwrap();
+    tasks
+        .checkpoint_with_deadline(&task.id, checkpoint("alice"), None, 30)
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    let (kernel, tasks) = world.open().await.unwrap();
+    let recovered = tasks.get_owned(&owner("alice"), &task.id).unwrap().unwrap();
+    let execution = recovered.execution.unwrap();
+    assert_eq!(execution.deadline_at_ms, None);
+    assert_eq!(execution.checkpoint, Some(checkpoint("alice")));
+    // 三十分钟已经过去，但恢复不额外领步数，也不受旧总时长截止影响。
+    tasks
+        .checkpoint_with_deadline(&task.id, checkpoint("alice"), None, 3_600_000)
+        .unwrap();
+    tasks.retry(&task.id, 3_600_001).unwrap();
+    let authorized = tasks
+        .create_bounded(&owner("bob"), spec("有限授权"), "authorized", 100, 40)
+        .unwrap();
+    tasks.start(&authorized.id, 50).unwrap();
+    assert!(
+        tasks
+            .checkpoint_with_deadline(&authorized.id, checkpoint("bob"), None, 60)
+            .is_err()
+    );
+    kernel.stop_all().await.unwrap();
 }

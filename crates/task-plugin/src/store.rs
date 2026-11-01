@@ -470,7 +470,7 @@ impl StoredTasks {
         &self,
         id: &str,
         checkpoint: eve_llm_api::TurnCheckpoint,
-        deadline_at_ms: u64,
+        deadline_at_ms: Option<u64>,
         now_ms: u64,
     ) -> TaskResult<Task> {
         self.update(id, now_ms, |task| {
@@ -482,7 +482,7 @@ impl StoredTasks {
                 .map_err(|_| TaskError::InvalidInput)?;
             if checkpoint.scope.session_id != task.owner.session_id
                 || checkpoint.scope.user_id != task.owner.user_id
-                || deadline_at_ms <= now_ms
+                || deadline_at_ms.is_some_and(|at| at <= now_ms)
             {
                 return Err(TaskError::InvalidInput);
             }
@@ -492,10 +492,10 @@ impl StoredTasks {
                 .ok_or(TaskError::InvalidTransition)?;
             if execution
                 .authorization_deadline_at_ms
-                .is_some_and(|deadline| deadline_at_ms > deadline)
+                .is_some_and(|deadline| deadline_at_ms.is_none_or(|at| at > deadline))
                 || execution
                     .deadline_at_ms
-                    .is_some_and(|deadline| deadline != deadline_at_ms)
+                    .is_some_and(|deadline| Some(deadline) != deadline_at_ms)
                 || execution.checkpoint.as_ref().is_some_and(|old| {
                     checkpoint.used_tool_calls < old.used_tool_calls
                         || checkpoint.delegated_tool_calls < old.delegated_tool_calls
@@ -506,7 +506,7 @@ impl StoredTasks {
             {
                 return Err(TaskError::InvalidInput);
             }
-            execution.deadline_at_ms = Some(deadline_at_ms);
+            execution.deadline_at_ms = deadline_at_ms;
             execution.resume_at_ms = None;
             execution.checkpoint = Some(checkpoint);
             Ok(())
@@ -536,7 +536,8 @@ impl StoredTasks {
             }
             let execution = task.execution.as_mut().ok_or(TaskError::InvalidTransition)?;
             let frame = execution.checkpoint.as_mut().ok_or(TaskError::InvalidTransition)?;
-            if !frame.resumable() || execution.recoveries >= MAX_AUTO_RECOVERIES || execution.deadline_at_ms.is_none_or(|at| at <= now_ms)
+            if !frame.resumable() || execution.recoveries >= MAX_AUTO_RECOVERIES || execution.deadline_at_ms.is_some_and(|at| at <= now_ms)
+                || execution.authorization_deadline_at_ms.is_some_and(|at| at <= now_ms)
                 || frame.used_tool_calls + frame.delegated_tool_calls >= task.spec.max_steps as usize
                 || frame.closing {
                 return Err(TaskError::InvalidTransition);
@@ -782,6 +783,9 @@ fn checkpoint_usage(checkpoint: &eve_llm_api::TurnCheckpoint) -> TaskUsage {
 fn can_retry(execution: &TaskExecution, now_ms: u64) -> bool {
     execution.recoveries < MAX_AUTO_RECOVERIES
         && execution
+            .authorization_deadline_at_ms
+            .is_none_or(|at| now_ms.saturating_add(10_000) < at)
+        && execution
             .deadline_at_ms
             .is_none_or(|deadline| now_ms.saturating_add(10_000) < deadline)
         && execution
@@ -947,7 +951,7 @@ pub(super) fn validate_task(task: &Task) -> TaskResult<()> {
             || execution.deadline_at_ms.is_some_and(|deadline| {
                 deadline <= task.started_at_ms.unwrap_or(task.created_at_ms)
             })
-            || execution.checkpoint.is_some() != execution.deadline_at_ms.is_some()
+            || (execution.checkpoint.is_none() && execution.deadline_at_ms.is_some())
             || (task.status == TaskStatus::Queued
                 && (execution.checkpoint.is_some()
                     || execution.recoveries != 0

@@ -737,26 +737,26 @@ class LearningAcceptance(unittest.TestCase):
                 self.assertEqual(len(self.learning_requests()), number)
                 self.assertEqual(self.only_snapshot()["preferences"], [])
 
-    def test_four_request_startup_budget_is_bounded_and_next_start_only_consumes_unused_scope(self):
-        for index in range(5):
+    def test_fifteen_success_startup_budget_is_bounded_and_next_start_only_consumes_unused_scope(self):
+        for index in range(16):
             self.seed(prefix=f"budget-{index}", user=f"user-{index}")
         def budget_reached():
-            self.wait_jobs(4)
+            self.wait_jobs(15)
             self.quiet()
-            self.assertEqual(len(self.learning_requests()), 4)
+            self.assertEqual(len(self.learning_requests()), 15)
         self.inspect_run(budget_reached)
         first_jobs = self.jobs()
         scopes = [job["batch"]["scope"] for job in first_jobs]
-        self.assertEqual(len({scope["session_id"] for scope in scopes}), 4)
+        self.assertEqual(len({scope["session_id"] for scope in scopes}), 15)
         for request in self.learning_requests():
             self.assertEqual(len(self.assert_reserved_before_request(request)["evidence"]), 3)
-        self.inspect_run(lambda: self.wait_jobs(5))
-        self.assertEqual(len(self.learning_requests()), 5)
-        self.assertEqual(self.jobs()[:4], first_jobs)
+        self.inspect_run(lambda: self.wait_jobs(16))
+        self.assertEqual(len(self.learning_requests()), 16)
+        self.assertEqual(self.jobs()[:15], first_jobs)
         before = self.learning_bytes()
         self.inspect_run(self.quiet)
         self.assertEqual(self.learning_bytes(), before)
-        self.assertEqual(len(self.learning_requests()), 5)
+        self.assertEqual(len(self.learning_requests()), 16)
 
     def test_extractor_receives_only_saved_chat_evidence_without_training_preferences_or_reflection(self):
         preference = "EXPLICIT_PRIVATE_PREFERENCE：此标记不得进入偏好提炼输入。"

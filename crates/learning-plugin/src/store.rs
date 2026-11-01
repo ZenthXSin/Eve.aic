@@ -215,7 +215,7 @@ impl StoredLearning {
                 jobs: vec![],
             },
             Some(bytes) => {
-                if bytes.len() > MAX_STATE_BYTES {
+                if bytes.len() > MAX_LEGACY_STATE_BYTES {
                     return Err(LearningError::CorruptState);
                 }
                 let value =
@@ -257,7 +257,7 @@ impl StoredLearning {
                 records: vec![],
             },
             Some(bytes) => {
-                if bytes.len() > MAX_STATE_BYTES {
+                if bytes.len() > MAX_LEGACY_STATE_BYTES {
                     return Err(LearningError::CorruptState);
                 }
                 let value =

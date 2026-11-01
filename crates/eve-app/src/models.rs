@@ -399,6 +399,8 @@ impl LlmModelResolver for CoreModelResolver {
                 )
             })
             .transpose()?;
+        // 先取得角色槽，再取得宿主总槽；角色排队不能占住其他角色的总槽。
+        provider = crate::model_concurrency::global(&self.settings)?.wrap(provider);
         // 等待在 PrefixProbe 之外：未准入不能被记成已发出的请求前缀。
         if let Some(gate) = gate {
             provider = gate.wrap(provider);

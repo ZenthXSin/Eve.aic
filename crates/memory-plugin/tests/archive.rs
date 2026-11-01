@@ -1062,8 +1062,9 @@ async fn archived_single_scope_over_hot_byte_limit_still_recalls_old_evidence() 
         revision: 0,
         turns: vec![],
     };
-    for number in 1..=80 {
-        let user = format!("unique-original-{number} {}", "x".repeat(30000));
+    // JSON 转义后的冷记录总量确实超过当前热层字节上限。
+    for number in 1..=(MAX_STATE_BYTES / 210_000 + 2) as u64 {
+        let user = format!("unique-original-{number} {}", "\u{0001}".repeat(30000));
         let reply = "y".repeat(30000);
         session.turns.push(SessionTurn {
             id: number,

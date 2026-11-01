@@ -850,7 +850,10 @@ mod tests {
                         root.path().join("config"),
                         vec![crate::config::history_schema()],
                     )
-                    .with_environment(BTreeMap::new()),
+                    .with_environment(BTreeMap::from([(
+                        "EVE_HISTORY_MAX_BYTES".into(),
+                        "65536".into(),
+                    )])),
                 )
                 .unwrap(),
             ))

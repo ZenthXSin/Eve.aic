@@ -148,7 +148,7 @@ async fn usage_is_persisted_before_admission_survives_restart_and_rolls_by_windo
     assert_eq!((later.current.used, later.history.len()), (0, 2));
     kernel.stop_all().await.unwrap();
 
-    // 改变窗口长度：当前窗口进入历史，按新长度重新对齐计数。
+    // 改变窗口长度：当前未结束窗口不能重新领额度；结束后才切换窗口。
     let (kernel, budget) = world
         .open(BudgetPolicy {
             window_ms: 24 * HOUR,
@@ -157,13 +157,10 @@ async fn usage_is_persisted_before_admission_survives_restart_and_rolls_by_windo
         .await
         .unwrap();
     let snapshot = budget.snapshot(start + HOUR + 10).unwrap();
-    assert_eq!(snapshot.current.used, 0);
-    assert_eq!(
-        snapshot.current.start_ms,
-        (start + HOUR) / (24 * HOUR) * 24 * HOUR
-    );
-    assert_eq!(snapshot.history.len(), 2);
-    assert_eq!(budget.reserve("interest", 2, start + HOUR + 10).unwrap(), 0);
+    assert_eq!(snapshot.current.used, 1);
+    assert_eq!(snapshot.current.start_ms, start + HOUR);
+    assert_eq!(snapshot.history.len(), 1);
+    assert_eq!(budget.reserve("interest", 1, start + HOUR + 10).unwrap(), 0);
     kernel.stop_all().await.unwrap();
 }
 
@@ -458,5 +455,93 @@ async fn applying_a_cap_to_an_old_ledger_keeps_every_charged_request() {
     assert_eq!(world.raw(), original);
     assert_eq!(budget.snapshot(T0).unwrap().current.used, 12);
     assert_eq!(budget.reserve("chime", 1, T0).unwrap(), 7);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_leases_release_only_their_original_window_and_restart_releases_unknown_requests() {
+    let world = World::new();
+    let (kernel, budget) = world.open(hourly(2)).await.unwrap();
+    let failed = budget.begin_request("interest", T0).unwrap();
+    let success = budget.begin_request("interest", T0 + 1).unwrap();
+    assert!(matches!(
+        budget.begin_request("practice", T0 + 2),
+        Err(BudgetError::Exhausted { .. })
+    ));
+    budget.settle_request(failed, false).unwrap();
+    assert_eq!(budget.snapshot(T0 + 3).unwrap().remaining(), 1);
+    budget.settle_request(success, true).unwrap();
+    assert!(
+        budget.settle_request(success, false).is_err(),
+        "结算不能重放退款"
+    );
+    let interrupted = budget.begin_request("practice", T0 + 4).unwrap();
+    // 新窗口的实际成功不能被上一窗口的失败冲抵。
+    budget.reserve("interest", 1, T0 + HOUR).unwrap();
+    budget.settle_request(interrupted, false).unwrap();
+    let snapshot = budget.snapshot(T0 + HOUR).unwrap();
+    assert_eq!(snapshot.current.used, 1);
+    assert_eq!(snapshot.history[0].used, 1);
+    budget.begin_request("practice", T0 + HOUR).unwrap();
+    kernel.stop_all().await.unwrap();
+    let (kernel, budget) = world.open(hourly(2)).await.unwrap();
+    assert_eq!(budget.snapshot(T0 + HOUR).unwrap().current.used, 1);
+    let raw: serde_json::Value = serde_json::from_slice(&world.raw().unwrap()).unwrap();
+    assert_eq!(raw["failed_requests"], 2);
+    assert_eq!(raw["interrupted_requests"], 1);
+    assert_eq!(raw["pending"], serde_json::json!({}));
+    kernel.stop_all().await.unwrap();
+}
+
+struct Unsuccessful(bool);
+impl LlmProvider for Unsuccessful {
+    fn complete(&self, _: ModelRequest) -> LlmFuture<'_, ModelResponse> {
+        Box::pin(async move {
+            if self.0 {
+                std::future::pending::<()>().await;
+            }
+            Err(LlmError::ProviderTimeout)
+        })
+    }
+}
+struct AnyFixed(Arc<dyn LlmProvider>);
+impl LlmModelResolver for AnyFixed {
+    fn resolve(&self) -> Result<ModelSelection, LlmError> {
+        Ok(ModelSelection {
+            provider: self.0.clone(),
+            provider_timeout: Duration::from_secs(1),
+        })
+    }
+}
+#[tokio::test]
+async fn failed_and_cancelled_model_futures_do_not_consume_the_success_quota() {
+    let world = World::new();
+    let (kernel, budget) = world
+        .open(BudgetPolicy {
+            window_ms: MAX_WINDOW_MS,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    for hangs in [false, true] {
+        let resolver = BudgetedResolver::new(
+            Arc::new(AnyFixed(Arc::new(Unsuccessful(hangs)))),
+            Arc::new(budget.clone()),
+            "interest",
+        )
+        .unwrap();
+        let selection = resolver.resolve().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(5),
+            selection.provider.complete(request()),
+        )
+        .await;
+        assert!(result.is_err() || result.unwrap().is_err());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert_eq!(budget.snapshot(now).unwrap().current.used, 0);
+    }
     kernel.stop_all().await.unwrap();
 }

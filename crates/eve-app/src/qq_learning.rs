@@ -231,7 +231,6 @@ async fn run(
                     }
                     Err(error) => return Err(error.into()),
                 };
-                remaining -= 1;
                 let began = batch.started_at_ms;
                 let outcome = {
                     let request = extractor.extract_maintenance(batch.clone());
@@ -248,7 +247,11 @@ async fn run(
                     }
                 };
                 // 当前尝试先持久收尾。只读提炼的补做由独立准入负责，原失败保留且次数受限。
+                let completed = matches!(&outcome, LearningOutcome::Maintained(_));
                 learning.finish(&batch, now_ms()?.max(began), outcome)?;
+                if completed {
+                    remaining -= 1;
+                }
                 if remaining == 0 {
                     // 本轮额度用尽不代表后续范围已完成提炼检查。自主模式下一轮
                     // 会续领原有批次额度，不能让预先计算的 ready 将它们负缓存。

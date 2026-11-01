@@ -112,7 +112,7 @@ async fn context_notes_validate_auth_scope_operations_and_utf8_before_optional_b
     for invalid in [
         json!({"key":{"session_id":"会话","user_id":"bad\n"},"action":{"operation":"inspect"}}),
         json!({"key":{"session_id":"会话","user_id":"用户"},"action":{"operation":"versions","limit":65}}),
-        json!({"key":{"session_id":"会话","user_id":"用户"},"action":{"operation":"preview","text":"文".repeat(6000)}}),
+        json!({"key":{"session_id":"会话","user_id":"用户"},"action":{"operation":"preview","text":"文".repeat((16 * 1024 * 1024) / 3 + 1)}}),
     ] {
         assert_code(
             client()
@@ -130,6 +130,7 @@ async fn context_notes_validate_auth_scope_operations_and_utf8_before_optional_b
     for action in [
         json!({"operation":"inspect"}),
         json!({"operation":"update","expected_revision":0,"text":"x".repeat(16384)}),
+        json!({"operation":"preview","text":"文".repeat(6000)}),
         json!({"operation":"preview","text":"\n".repeat(16384)}),
         json!({"operation":"rollback","expected_revision":1,"target_revision":0}),
     ] {

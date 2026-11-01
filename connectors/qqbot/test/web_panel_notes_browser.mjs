@@ -74,6 +74,11 @@ try {
 
   // 用真实 HTTP 模拟另一个编辑者，旧预览不能覆盖其结果，草稿必须保留。
   await card.getByRole("textbox",{name:"工作便笺正文"}).fill("文".repeat(6000));
+  assert.equal(await card.getByRole("button",{name:"预览便笺",exact:true}).isDisabled(),false);
+  await card.getByRole("textbox",{name:"工作便笺正文"}).evaluate(editor=>{
+    editor.value = "文".repeat(Math.floor(16*1024*1024/3)+1);
+    editor.dispatchEvent(new Event("input", {bubbles:true}));
+  });
   assert.equal(await card.getByRole("button",{name:"预览便笺",exact:true}).isDisabled(),true);
   await card.getByRole("textbox",{name:"工作便笺正文"}).fill("尚未保存的草稿");
   await card.getByRole("button",{name:"预览便笺",exact:true}).click();

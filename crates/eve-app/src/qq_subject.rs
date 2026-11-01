@@ -27,8 +27,8 @@ use tokio::{sync::watch, task::JoinHandle};
 // 同步账本事务组合不能与工具配置交错，避免用旧grant覆盖刚授予的新预算。审查await期间不持锁。
 static MUTATIONS: Mutex<()> = Mutex::new(());
 const POLICY_ID: &str = "autonomy-policy-v1";
-const STEPS: u32 = 50;
-const MAX_GRANT_GOALS: u32 = 8;
+const STEPS: u32 = 550;
+const MAX_GRANT_GOALS: u32 = 20;
 const PROPOSAL_PREFIX: &str = "candidate-";
 fn scope(s: &ContextScope) -> SubjectScope {
     SubjectScope {
@@ -335,7 +335,7 @@ pub(crate) struct ConfigureTool {
 }
 impl Tool for ConfigureTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition{name:"configure_subject_autonomy".into(),description:"真实主人在当前可信会话显式启用/暂停自主探索，固定总目标数1至8、每目标步数1至50；默认3个目标各50步，主兴趣Mindustry并可多元。启用及增加预算须用宿主采集的最近主人原话审查，模型自称同意无效；后台/子代理不能授权。预算耗尽、过期或失败就停，30分钟检查不刷新预算或期限。有效期默认24小时、最长7天。授权仅在当前精确scope生效，不将群聊内容传播至别处。暂停不撤销已发生副作用，运行任务另行取消。".into(),argument_schema:json!({"type":"object","properties":{"action":{"const":"configure_autonomy"},"enabled":{"type":"boolean"},"max_goals":{"type":"integer","minimum":1,"maximum":8},"steps_per_goal":{"type":"integer","minimum":1,"maximum":50},"expires_in_seconds":{"type":"integer","minimum":1800,"maximum":604800},"interests":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8}},"required":["action","enabled"],"additionalProperties":false}),required_permissions:vec![],concurrency:Some(ToolConcurrency::Serial{scope:"subject-focus".into()})}
+        ToolDefinition{name:"configure_subject_autonomy".into(),description:"真实主人在当前可信会话显式启用/暂停自主探索，固定总目标数1至20、每目标步数1至550；默认20个目标各550步，主兴趣Mindustry并可多元。启用及增加预算须用宿主采集的最近主人原话审查，模型自称同意无效；后台/子代理不能授权。预算耗尽、过期或失败就停，30分钟检查不刷新预算或期限。有效期默认24小时、最长7天。授权仅在当前精确scope生效，不将群聊内容传播至别处。暂停不撤销已发生副作用，运行任务另行取消。".into(),argument_schema:json!({"type":"object","properties":{"action":{"const":"configure_autonomy"},"enabled":{"type":"boolean"},"max_goals":{"type":"integer","minimum":1,"maximum":MAX_GRANT_GOALS},"steps_per_goal":{"type":"integer","minimum":1,"maximum":STEPS},"expires_in_seconds":{"type":"integer","minimum":1800,"maximum":604800},"interests":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8}},"required":["action","enabled"],"additionalProperties":false}),required_permissions:vec![],concurrency:Some(ToolConcurrency::Serial{scope:"subject-focus".into()})}
     }
     fn validate_arguments(&self, v: &Value) -> Result<(), ToolValidationError> {
         configure_args(v).map(|_| ())
@@ -443,7 +443,7 @@ impl Tool for ConfigureTool {
             let grant = Grant {
                 version: 1,
                 generation,
-                max_goals: a.max_goals.unwrap_or(3),
+                max_goals: a.max_goals.unwrap_or(MAX_GRANT_GOALS),
                 issued: 0,
                 steps_per_goal: a.steps_per_goal.unwrap_or(STEPS),
                 interests: a.interests.unwrap_or_else(|| {
@@ -540,7 +540,7 @@ fn plan_next(
     {
         return Ok(None);
     }
-    let (title,goal)=proposal.map(|f|(f.title.clone(),f.goal.clone())).unwrap_or_else(||(format!("自主探索：{topic}"),format!("在既定兴趣“{topic}”中选择一个尚未验证的具体问题，先检索已有经验和本范围任务结果，独立实作、验证并记录新证据。Mindustry是主要兴趣，但不要重复机械研究；可发现其他有价值的新兴趣。先用工具核对真实问题来源，比较修复价值、已有替代方案、成本和风险，选择能验证的小目标；没有值得做的事就明确记录无新发现，不为忙碌造任务。完成后用manage_subject_focus discover及assessment保存有证据的新问题和复用计划；候选不授予额外预算。")));
+    let (title,goal)=proposal.map(|f|(f.title.clone(),f.goal.clone())).unwrap_or_else(||(format!("自主探索：{topic}"),format!("在既定兴趣“{topic}”中选择一个尚未验证的具体问题，先检索已有经验和本范围任务结果，独立实作、验证并记录新证据。Mindustry是主要兴趣，但不要重复机械研究；可发现其他有价值的新兴趣。定期优先检查已有失败诊断、阻塞任务、真实交互缺陷、内存与磁盘压力和重复流程；先用工具核对真实问题来源，比较修复价值、已有替代方案、成本和风险，选择能验证的小目标；没有值得做的事就明确记录无新发现，不为忙碌造任务。反复出现且验证通过的流程可整理为经验或插件候选，先核对权限、预演与实际验收，不把候选当成已生效工具。完成后用manage_subject_focus discover及assessment保存有证据的新问题和复用计划；候选不授予额外预算。")));
     // 先消耗有限授权。若之后提交失败，恢复时缺失slot会阻塞政策，不能悄悄补发新预算。
     grant.issued += 1;
     policy.goal = serde_json::to_string(&grant).map_err(|_| SubjectError::InvalidInput)?;

@@ -79,6 +79,8 @@ impl Tool for StatusTool {
                     "model":summary.model,"protocol":summary.protocol,
                     "max_output_tokens":summary.max_output_tokens,
                     "max_concurrent_requests":summary.max_concurrent_requests,
+                    "effective_role_limit":summary.max_concurrent_requests.map(|limit|limit.min(5)),
+                    "shared_host_limit":5,
                     "applies_to":"next_model_resolution"
                 },
                 "admission":{
