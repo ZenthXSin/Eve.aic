@@ -226,3 +226,124 @@ async fn filling_first_batch_does_not_skip_a_later_scope_error_or_write_partial_
     assert!(indexer.index.entries().unwrap().is_empty());
     kernel.stop_all().await.unwrap();
 }
+
+struct SnapshotMemory(Vec<(MemorySnapshot, Vec<InteractionEvidence>)>);
+struct SnapshotReader(MemorySnapshot, Vec<InteractionEvidence>);
+impl MemoryService for SnapshotReader {
+    fn snapshot(&self) -> MemoryResult<MemorySnapshot> {
+        Ok(self.0.clone())
+    }
+    fn archived(&self, after: u64, limit: usize) -> MemoryResult<ArchivedEvidencePage> {
+        let mut entries = self.1.iter().filter(|e| e.revision > after);
+        let evidence: Vec<_> = entries.by_ref().take(limit).cloned().collect();
+        let next_after = entries
+            .next()
+            .and_then(|_| evidence.last().map(|e| e.revision));
+        Ok(ArchivedEvidencePage {
+            evidence,
+            next_after,
+        })
+    }
+}
+impl MemoryAdmin for SnapshotMemory {
+    fn scopes(&self) -> MemoryResult<Vec<MemoryScope>> {
+        Ok(self.0.iter().map(|(s, _)| s.scope.clone()).collect())
+    }
+    fn reader(&self, scope: MemoryScope) -> MemoryResult<Arc<dyn MemoryService>> {
+        let (snapshot, archived) = self
+            .0
+            .iter()
+            .find(|(s, _)| s.scope == scope)
+            .ok_or(MemoryError::CorruptState)?;
+        Ok(Arc::new(SnapshotReader(snapshot.clone(), archived.clone())))
+    }
+    fn import_completed(
+        &self,
+        _: &MemoryScope,
+        _: u64,
+        _: CompletedInteraction,
+    ) -> MemoryResult<MemorySnapshot> {
+        Err(MemoryError::Unavailable)
+    }
+    fn update_preference(
+        &self,
+        _: &MemoryScope,
+        _: u64,
+        _: PreferenceChange,
+    ) -> MemoryResult<MemorySnapshot> {
+        Err(MemoryError::Unavailable)
+    }
+}
+#[tokio::test]
+#[ignore = "Read-only persisted-state regression; set EVE_SEMANTIC_SNAPSHOT to a private snapshot"]
+async fn persisted_snapshot_resolves_archived_preference_sources_without_embedding_calls() {
+    use std::io::Read;
+    let root = std::path::PathBuf::from(std::env::var("EVE_SEMANTIC_SNAPSHOT").unwrap());
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("state.json")).unwrap()).unwrap();
+    let bytes: Vec<u8> =
+        serde_json::from_value(state["entries"]["eve.memory"]["memory.v1"].clone()).unwrap();
+    let memory: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let mut snapshots = Vec::new();
+    for record in memory["scopes"].as_array().unwrap() {
+        let snapshot: MemorySnapshot = serde_json::from_value(record["snapshot"].clone()).unwrap();
+        let mut archived = Vec::new();
+        if let Some(chunks) = record["archive"].as_array() {
+            for chunk in chunks {
+                let name = format!(
+                    "evidence-{:010}-{}.json{}",
+                    chunk["sequence"].as_u64().unwrap(),
+                    chunk["sha256"].as_str().unwrap(),
+                    if chunk["compressed"] == true {
+                        ".zz"
+                    } else {
+                        ""
+                    }
+                );
+                let bytes = std::fs::read(root.join("memory-archive").join(name)).unwrap();
+                let mut decoded = Vec::new();
+                if chunk["compressed"] == true {
+                    flate2::read::ZlibDecoder::new(bytes.as_slice())
+                        .read_to_end(&mut decoded)
+                        .unwrap();
+                } else {
+                    decoded = bytes;
+                }
+                let payload: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+                assert!(
+                    serde_json::from_value::<MemoryScope>(payload["scope"].clone()).unwrap()
+                        == snapshot.scope
+                );
+                let entries: Vec<InteractionEvidence> =
+                    serde_json::from_value(payload["evidence"].clone()).unwrap();
+                archived.extend(entries);
+            }
+        }
+        archived.sort_by_key(|e| e.revision);
+        assert_eq!(archived.len() as u64, snapshot.archived_evidence);
+        snapshots.push((snapshot, archived));
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let kernel = Kernel::with_services(KernelServices {
+        state: Arc::new(FileStateStore::open(directory.path().join("state")).unwrap()),
+        ..Default::default()
+    });
+    let plugin = SemanticPlugin::new().unwrap().with_segments(Arc::new(
+        SegmentStore::open(directory.path().join("segments")).unwrap(),
+    ));
+    let index = plugin.index();
+    kernel.register(Box::new(plugin)).unwrap();
+    kernel.start_all().await.unwrap();
+    let embedder = Arc::new(Inputs {
+        profile: EmbeddingProfile {
+            model: "synthetic".into(),
+            dimensions: 2,
+        },
+        calls: Mutex::new(vec![]),
+    });
+    let indexer = Indexer::new(Arc::new(SnapshotMemory(snapshots)), index, embedder.clone());
+    let status = indexer.status().unwrap();
+    assert!(status.pending > 0);
+    assert!(embedder.calls.lock().unwrap().is_empty());
+    kernel.stop_all().await.unwrap();
+}
