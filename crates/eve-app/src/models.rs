@@ -316,22 +316,35 @@ impl LlmModelResolver for CoreModelResolver {
             .credentials
             .as_ref()
             .map_err(|error| LlmError::Configuration(error.to_string()))?;
-        let credential = crate::model_credentials::resolve(
-            credentials.as_ref(),
-            captured.credential_purpose(),
-            captured
+        let anonymous = captured.credential_purpose() == eve_llm_api::CredentialPurpose::Auxiliary
+            && captured
                 .profile
                 .as_ref()
-                .and_then(|profile| profile.credential_ref.as_deref()),
-        )
-        .map_err(|error| LlmError::Configuration(error.to_string()))?;
+                .and_then(|p| p.credential_ref.as_deref())
+                == Some(crate::model_credentials::ANONYMOUS);
+        let credential = if anonymous {
+            None
+        } else {
+            Some(
+                crate::model_credentials::resolve(
+                    credentials.as_ref(),
+                    captured.credential_purpose(),
+                    captured
+                        .profile
+                        .as_ref()
+                        .and_then(|profile| profile.credential_ref.as_deref()),
+                )
+                .map_err(|error| LlmError::Configuration(error.to_string()))?,
+            )
+        };
+        let credential_version = credential.as_ref().map_or(0, |c| c.version());
         let mut cached = self
             .cached
             .lock()
             .map_err(|_| LlmError::Backend("模型 Provider 缓存不可用".into()))?;
         if let Some(previous) = cached.as_ref()
             && previous.captured == captured
-            && previous.credential_version == credential.version()
+            && previous.credential_version == credential_version
         {
             return Ok(previous.selected.clone());
         }
@@ -348,7 +361,11 @@ impl LlmModelResolver for CoreModelResolver {
         // 留给适配器先返回分阶段诊断；外层只作为略晚的安全期限。
         let provider_timeout =
             stream_timeouts.map_or(config.request_timeout, |p| p.total + Duration::from_secs(1));
-        let mut provider = OpenAiProvider::new(config, credential.expose())?;
+        let mut provider = if let Some(credential) = &credential {
+            OpenAiProvider::new(config, credential.expose())?
+        } else {
+            OpenAiProvider::anonymous(config)?
+        };
         if let Some(policy) = stream_timeouts {
             if timing_enabled() {
                 eprintln!(
@@ -412,7 +429,7 @@ impl LlmModelResolver for CoreModelResolver {
 
         *cached = Some(CachedModel {
             captured,
-            credential_version: credential.version(),
+            credential_version,
             selected: selected.clone(),
         });
         Ok(selected)

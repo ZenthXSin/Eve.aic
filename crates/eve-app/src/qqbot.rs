@@ -2507,7 +2507,7 @@ async fn run_qqbot_composed(
             let _ = task_late.worker.set(worker);
         }
         if let Some(tasks) = &tasks {
-            subject_background = Some(crate::qq_subject::Background::start(subject.clone(), Arc::new(tasks.clone()), qq_admin.clone()));
+            subject_background = Some(crate::qq_subject::Background::start_with_services(subject.clone(), Arc::new(tasks.clone()), qq_admin.clone(), Some(registry.get(&ServiceId::new(eve_session_api::SESSION_SERVICE_ID)?)?.ok_or("空闲回顾会话服务缺失")?.value.downcast::<eve_session_api::SessionServiceHandle>().map_err(|_|"空闲回顾会话服务类型错误")?.0.clone()), Some(control.clone())));
         }
         let failure_recovery = if let Some(tasks) = &tasks {
             let recovery = Arc::new(crate::qq_failure_recovery::Recovery {

@@ -414,9 +414,10 @@ pub(crate) fn provider_config_for(
     if purpose == eve_llm_api::CredentialPurpose::Auxiliary {
         let independent: String = snapshot.get("auxiliary_base_url")?;
         if !independent.is_empty() {
-            if primary.and_then(|profile| profile.credential_ref.as_deref())
-                != Some(crate::model_credentials::AUXILIARY)
-            {
+            if !matches!(
+                primary.and_then(|profile| profile.credential_ref.as_deref()),
+                Some(crate::model_credentials::AUXILIARY | crate::model_credentials::ANONYMOUS)
+            ) {
                 return Err("独立辅助端点须显式选择宿主辅助凭据引用。".into());
             }
             base_url = independent;

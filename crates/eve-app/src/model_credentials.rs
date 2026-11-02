@@ -3,6 +3,7 @@ use eve_llm_api::{CredentialError, CredentialLease, CredentialPurpose, ModelCred
 use eve_model_credentials::CredentialBank;
 use std::sync::Arc;
 
+pub(crate) const ANONYMOUS: &str = "anonymous";
 pub(crate) const PRIMARY: &str = "env:EVE_OPENAI_API_KEY";
 pub(crate) const AUXILIARY: &str = "env:EVE_AUXILIARY_API_KEY";
 pub(crate) const JEV: &str = "env:EVE_JEV_API_KEY";
@@ -20,7 +21,7 @@ pub(crate) fn reference(
     });
     match (purpose, reference) {
         (CredentialPurpose::Primary, PRIMARY)
-        | (CredentialPurpose::Auxiliary, PRIMARY | AUXILIARY)
+        | (CredentialPurpose::Auxiliary, PRIMARY | AUXILIARY | ANONYMOUS)
         | (CredentialPurpose::Jev, JEV)
         | (CredentialPurpose::Semantic, PRIMARY | SEMANTIC) => Ok(reference),
         _ => Err(CredentialError::UnknownReference),

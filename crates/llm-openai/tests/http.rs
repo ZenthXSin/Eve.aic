@@ -383,3 +383,34 @@ async fn auxiliary_requests_reject_chunked_overflow_before_eof() {
         );
     }
 }
+
+#[tokio::test]
+async fn explicit_anonymous_provider_sends_no_authorization_and_keeps_url_validation() {
+    let mut server = Server::start(vec![Reply::json(final_response("匿名请求成功"))]).await;
+    let provider = OpenAiProvider::anonymous(config(&server.url)).unwrap();
+    assert_eq!(
+        provider.complete(request()).await.unwrap(),
+        ModelResponse::Final {
+            text: "匿名请求成功".into()
+        }
+    );
+    assert!(
+        !server
+            .next()
+            .await
+            .headers
+            .to_lowercase()
+            .contains("authorization:")
+    );
+    assert!(OpenAiProvider::anonymous(config("http://public.example/v1/responses")).is_ok());
+    assert!(
+        OpenAiProvider::new(config("http://public.example/v1/responses"), "synthetic").is_err()
+    );
+    for url in [
+        "file:///tmp/key",
+        "https://user:secret@example.com",
+        "https://example.com?key=secret",
+    ] {
+        assert!(OpenAiProvider::anonymous(config(url)).is_err());
+    }
+}

@@ -26,6 +26,8 @@ pub const MAX_ACTIVE_PER_OWNER: usize = 4;
 pub const MAX_CREATED_PER_OWNER_PER_DAY: usize = 20;
 pub const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_TITLE_BYTES: usize = 120;
+/// 宿主内部的无工具空闲回顾；成功记录保留，但不产生对外完成通知。
+pub const IDLE_TASK_SOURCE_PREFIX: &str = "subject-idle:";
 pub const MAX_INSTRUCTIONS_BYTES: usize = 8192;
 /// 单次显式委派的完整上下文快照上限；超限拒绝，绝不静默截断。
 pub const MAX_CONTEXT_BYTES: usize = 16 * 1024 * 1024;
