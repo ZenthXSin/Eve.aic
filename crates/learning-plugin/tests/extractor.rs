@@ -154,8 +154,8 @@ async fn sends_only_fixed_rules_and_exact_scoped_batch_once() {
     assert_eq!(request.messages[0].role, ChatRole::System);
     assert_eq!(request.messages[1].role, ChatRole::User);
     assert_eq!(
-        request.messages[1].text.as_deref().unwrap(),
-        serde_json::to_string(&input).unwrap()
+        request.messages[1].text.as_deref().unwrap().len(),
+        serde_json::to_string(&input).unwrap().len()
     );
     let actual: LearningBatch =
         serde_json::from_str(request.messages[1].text.as_deref().unwrap()).unwrap();
@@ -345,11 +345,14 @@ async fn preserves_exact_input_budget_boundaries_and_never_truncates() {
     extractor.extract(single.clone()).await.unwrap();
     assert_single_call(&mock);
     assert_eq!(
-        mock.requests.lock().unwrap()[0].messages[1]
-            .text
-            .as_ref()
-            .unwrap(),
-        &serde_json::to_string(&single).unwrap()
+        serde_json::from_str::<LearningBatch>(
+            mock.requests.lock().unwrap()[0].messages[1]
+                .text
+                .as_ref()
+                .unwrap()
+        )
+        .unwrap(),
+        single
     );
     user_text(&mut single.evidence[0]).push('x');
     let (extractor, mock) = with_text(r#"{"candidates":[]}"#);
@@ -513,4 +516,33 @@ async fn maintenance_distinguishes_transient_errors_from_auth_and_payment() {
         assert_eq!(error, LearningError::Extraction(expected));
         assert_eq!(mock.requests.lock().unwrap().len(), 1);
     }
+}
+
+#[tokio::test]
+async fn batch_metadata_changes_preserve_evidence_prefix_without_losing_any_fields() {
+    let (extractor, mock) = with_text(r#"{"candidates":[]}"#);
+    let first = batch();
+    let mut next = first.clone();
+    next.id = "next-batch".into();
+    next.attempt = 1;
+    next.started_at_ms += 1000;
+    extractor.extract(first.clone()).await.unwrap();
+    extractor.extract(next.clone()).await.unwrap();
+    let requests = mock.requests.lock().unwrap();
+    let a = requests[0].messages[1].text.as_ref().unwrap();
+    let b = requests[1].messages[1].text.as_ref().unwrap();
+    let common = a.bytes().zip(b.bytes()).take_while(|(a, b)| a == b).count();
+    let old_a = serde_json::to_string(&first).unwrap();
+    let old_b = serde_json::to_string(&next).unwrap();
+    let old_common = old_a
+        .bytes()
+        .zip(old_b.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    assert!(common > old_common + serde_json::to_string(&first.evidence).unwrap().len());
+    assert_eq!(serde_json::from_str::<LearningBatch>(a).unwrap(), first);
+    assert_eq!(serde_json::from_str::<LearningBatch>(b).unwrap(), next);
+    assert_eq!(a.len(), old_a.len());
+    assert_eq!(b.len(), old_b.len());
+    assert_eq!(requests[0].messages[0], requests[1].messages[0]);
 }

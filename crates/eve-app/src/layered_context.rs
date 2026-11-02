@@ -266,12 +266,17 @@ impl HistoryContextPlanner for Planner {
             {
                 return Err(LlmError::HistoryWindowExceeded);
             }
+            // 完整历史放得下时不按本轮问题重选：旧消息保持原顺序，新轮次只追加，
+            // 既不漏掉仍有用的原话，也不在固定提示后反复改写可缓存前缀。
+            let full_history_fits = groups.len() <= window.max_turns
+                && eve_runtime::serialized_json_size(history).map_err(|_| fail("历史编码失败"))?
+                    <= window.max_bytes;
             let recent = groups.len().saturating_sub(RECENT.min(window.max_turns));
             let query = terms(&input.text);
             let work = self.work(scope, &input.text)?;
             let mut ranked: Vec<_> = groups
                 .iter()
-                .take(recent)
+                .take(if full_history_fits { 0 } else { recent })
                 .enumerate()
                 .map(|(i, g)| {
                     (
@@ -306,51 +311,56 @@ impl HistoryContextPlanner for Planner {
                 .filter(|id| candidates.iter().any(|c| &c.id == id))
                 .collect();
             let mut selected = BTreeSet::new();
-            let mut bytes = 0usize;
-            for i in (groups.len().saturating_sub(2.min(window.max_turns))..groups.len()).rev() {
-                let size = eve_runtime::serialized_json_size(groups[i])
-                    .map_err(|_| fail("历史轮次编码失败"))?;
-                if bytes.saturating_add(size) <= window.max_bytes {
-                    selected.insert(i);
-                    bytes += size;
+            if full_history_fits {
+                selected.extend(0..groups.len());
+            } else {
+                let mut bytes = 0usize;
+                for i in (groups.len().saturating_sub(2.min(window.max_turns))..groups.len()).rev()
+                {
+                    let size = eve_runtime::serialized_json_size(groups[i])
+                        .map_err(|_| fail("历史轮次编码失败"))?;
+                    if bytes.saturating_add(size) <= window.max_bytes {
+                        selected.insert(i);
+                        bytes += size;
+                    }
                 }
-            }
-            if !candidates.is_empty() {
-                let request = ContextSelectionInput {
-                    query: excerpt(&input.text, eve_memory_api::MAX_CONTEXT_QUERY_BYTES),
-                    candidates,
-                };
-                // 原记录任何修正均使建议缓存失效，包括候选摘录之外的工具结果。
-                let key = hash(&(scope, &request, &work, history))?;
-                let chosen = self.choose(key, request, fallback).await;
-                for id in chosen {
-                    if let Some(i) = id
-                        .strip_prefix('h')
-                        .and_then(|s| s.parse::<usize>().ok())
-                        .filter(|i| *i < recent)
-                    {
-                        let size = eve_runtime::serialized_json_size(groups[i])
-                            .map_err(|_| fail("历史轮次编码失败"))?;
-                        if selected.len() < window.max_turns
-                            && bytes.saturating_add(size) <= window.max_bytes
+                if !candidates.is_empty() {
+                    let request = ContextSelectionInput {
+                        query: excerpt(&input.text, eve_memory_api::MAX_CONTEXT_QUERY_BYTES),
+                        candidates,
+                    };
+                    // 原记录任何修正均使建议缓存失效，包括候选摘录之外的工具结果。
+                    let key = hash(&(scope, &request, &work, history))?;
+                    let chosen = self.choose(key, request, fallback).await;
+                    for id in chosen {
+                        if let Some(i) = id
+                            .strip_prefix('h')
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .filter(|i| *i < recent)
                         {
-                            selected.insert(i);
-                            bytes += size;
+                            let size = eve_runtime::serialized_json_size(groups[i])
+                                .map_err(|_| fail("历史轮次编码失败"))?;
+                            if selected.len() < window.max_turns
+                                && bytes.saturating_add(size) <= window.max_bytes
+                            {
+                                selected.insert(i);
+                                bytes += size;
+                            }
                         }
                     }
                 }
-            }
-            for i in (recent..groups.len()).rev() {
-                if selected.contains(&i) {
-                    continue;
-                }
-                let size = eve_runtime::serialized_json_size(groups[i])
-                    .map_err(|_| fail("历史轮次编码失败"))?;
-                if selected.len() < window.max_turns
-                    && bytes.saturating_add(size) <= window.max_bytes
-                {
-                    selected.insert(i);
-                    bytes += size;
+                for i in (recent..groups.len()).rev() {
+                    if selected.contains(&i) {
+                        continue;
+                    }
+                    let size = eve_runtime::serialized_json_size(groups[i])
+                        .map_err(|_| fail("历史轮次编码失败"))?;
+                    if selected.len() < window.max_turns
+                        && bytes.saturating_add(size) <= window.max_bytes
+                    {
+                        selected.insert(i);
+                        bytes += size;
+                    }
                 }
             }
             let refs:Vec<_>=groups.iter().enumerate().filter(|(i,_)|!selected.contains(i) && (*i>=recent || ranked.iter().any(|(score,index)|index==i && *score>0))).rev().take(12).map(|(_,g)|Ok(json!({"reference":format!("history:{}",hash(*g)?),"input_excerpt":excerpt(g.first().and_then(|m|m.text.as_deref()).unwrap_or_default(),160)}))).collect::<Result<_,LlmError>>()?;
@@ -913,6 +923,98 @@ mod tests {
             .unwrap();
     }
     #[tokio::test]
+    async fn fitting_history_keeps_original_prefix_across_queries_and_appended_turns() {
+        let (_kernel, planner, _root, _) = world().await;
+        let selector = Arc::new(Selector {
+            calls: AtomicUsize::new(0),
+            bad: true,
+        });
+        planner.selector.set(selector.clone()).ok().unwrap();
+        let own = scope("alice");
+        let mut history = Vec::new();
+        for n in 0..10 {
+            history.extend([
+                ChatMessage::text(ChatRole::User, format!("原始问题{n}")),
+                ChatMessage::text(ChatRole::Assistant, format!("完整原始回执{n}")),
+            ]);
+        }
+        let original = history.clone();
+        for query in ["atlas工程继续", "改聊天气", "回到旧任务"] {
+            let plan = planner
+                .plan(Some(&own), &TurnInput { text: query.into() }, &history)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(plan.retained_turns, (0..10).collect::<Vec<_>>());
+        }
+        history.extend([
+            ChatMessage::text(ChatRole::User, "新问题"),
+            ChatMessage::text(ChatRole::Assistant, "新答复"),
+        ]);
+        let plan = planner
+            .plan(Some(&own), &input(), &history)
+            .await
+            .unwrap()
+            .unwrap();
+        let groups = history_turns(&history);
+        let selected: Vec<_> = plan
+            .retained_turns
+            .iter()
+            .flat_map(|i| groups[*i].iter().cloned())
+            .collect();
+        assert!(selected.starts_with(&original));
+        assert_eq!(selected, history);
+        assert_eq!(
+            selector.calls.load(Ordering::SeqCst),
+            0,
+            "fitting original history needs no relevance-model request"
+        );
+    }
+
+    #[tokio::test]
+    async fn fitting_history_respects_exact_byte_boundary_and_latest_turn_guard() {
+        let (_kernel, planner, _root, _) = world().await;
+        let own = scope("alice");
+        let mut history = vec![
+            ChatMessage::text(ChatRole::User, "旧原话"),
+            ChatMessage::text(ChatRole::Assistant, "a"),
+        ];
+        let padding = 65536 - eve_runtime::serialized_json_size(&history).unwrap();
+        history[1]
+            .text
+            .as_mut()
+            .unwrap()
+            .push_str(&"x".repeat(padding));
+        assert_eq!(eve_runtime::serialized_json_size(&history).unwrap(), 65536);
+        assert_eq!(
+            planner
+                .plan(Some(&own), &input(), &history)
+                .await
+                .unwrap()
+                .unwrap()
+                .retained_turns,
+            vec![0]
+        );
+        let oversized_latest = history.clone();
+        history.extend([
+            ChatMessage::text(ChatRole::User, "新原话"),
+            ChatMessage::text(ChatRole::Assistant, "新回执"),
+        ]);
+        let plan = planner
+            .plan(Some(&own), &input(), &history)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.retained_turns, vec![1]);
+        let mut too_large = oversized_latest;
+        too_large[1].text.as_mut().unwrap().push('x');
+        assert!(matches!(
+            planner.plan(Some(&own), &input(), &too_large).await,
+            Err(LlmError::HistoryWindowExceeded)
+        ));
+    }
+
+    #[tokio::test]
     async fn long_dialogue_load_plateaus_and_exact_original_is_scope_bound() {
         let (_kernel, planner, _root, session) = world().await;
         let selector = Arc::new(Selector {
@@ -1061,7 +1163,7 @@ mod tests {
             ChatMessage::text(ChatRole::User, "atlas工程版本约束atlas-version-7"),
             ChatMessage::text(ChatRole::Assistant, "已记录"),
         ];
-        for _ in 0..10 {
+        for _ in 0..20 {
             history.extend([
                 ChatMessage::text(ChatRole::User, "午餐"),
                 ChatMessage::text(ChatRole::Assistant, "面条"),

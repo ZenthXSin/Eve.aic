@@ -73,6 +73,18 @@ impl PreferenceExtractor for ModelPreferenceExtractor {
     }
 }
 
+// 仅控制模型提示中的字段顺序；账本仍使用原 LearningBatch 格式。
+// 作用域先界定证据边界，批次号与时钟放在证据之后，避免先打断重复材料的前缀。
+#[derive(serde::Serialize)]
+struct PromptBatch<'a> {
+    scope: &'a eve_memory_api::MemoryScope,
+    extractor_version: &'a str,
+    evidence: &'a [eve_memory_api::InteractionEvidence],
+    attempt: u8,
+    id: &'a str,
+    started_at_ms: u64,
+}
+
 fn validated_input(batch: &LearningBatch) -> LearningResult<String> {
     let invalid = || LearningError::InvalidInput;
     batch.scope.validate().map_err(|_| invalid())?;
@@ -117,7 +129,15 @@ fn validated_input(batch: &LearningBatch) -> LearningResult<String> {
         }
         previous_revision = evidence.revision;
     }
-    let input = serde_json::to_string(batch).map_err(|_| invalid())?;
+    let input = serde_json::to_string(&PromptBatch {
+        scope: &batch.scope,
+        extractor_version: &batch.extractor_version,
+        evidence: &batch.evidence,
+        attempt: batch.attempt,
+        id: &batch.id,
+        started_at_ms: batch.started_at_ms,
+    })
+    .map_err(|_| invalid())?;
     if input.len() > MAX_INPUT_BYTES {
         return Err(invalid());
     }
