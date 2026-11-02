@@ -16,6 +16,74 @@ use tokio::net::TcpStream;
 const TOKEN: &str = "synthetic-panel-token-never-persisted-123456789";
 
 #[tokio::test]
+async fn chat_auth_and_identity_validation_precede_optional_execution() {
+    let service = Arc::new(Service::default());
+    let panel = panel(service.clone()).await;
+    let request =
+        json!({"conversation_id":"a".repeat(32),"request_id":"b".repeat(32),"text":"你好"});
+    assert_code(
+        client()
+            .post(url(&panel, "/api/chat/send"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+    )
+    .await;
+    let mut impersonation = request.clone();
+    impersonation["user_id"] = json!("owner");
+    assert_code(
+        client()
+            .post(url(&panel, "/api/chat/send"))
+            .bearer_auth(TOKEN)
+            .json(&impersonation)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::BAD_REQUEST,
+        "invalid_json",
+    )
+    .await;
+    for (field, value) in [
+        ("conversation_id", json!("../qq:other")),
+        ("request_id", json!("bad")),
+        ("text", json!("文".repeat(12000))),
+        ("text", json!(" \n")),
+    ] {
+        let mut invalid = request.clone();
+        invalid[field] = value;
+        assert_code(
+            client()
+                .post(url(&panel, "/api/chat/send"))
+                .bearer_auth(TOKEN)
+                .json(&invalid)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+        )
+        .await;
+    }
+    assert_code(
+        client()
+            .post(url(&panel, "/api/chat/send"))
+            .bearer_auth(TOKEN)
+            .json(&request)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+    )
+    .await;
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+    panel.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn extension_endpoints_require_authentication_and_validate_before_optional_services() {
     let service = Arc::new(Service::default());
     let panel = panel(service.clone()).await;

@@ -87,6 +87,52 @@ fn single_call() -> Result<ModelResponse, LlmError> {
 }
 
 #[tokio::test]
+async fn retiring_a_saved_completion_releases_report_but_keeps_history_and_old_waiters() {
+    let gate = Arc::new(Notify::new());
+    let provider = Provider::new(vec![
+        Step::blocked(gate.clone()),
+        Step::new(final_response("下一轮")),
+    ]);
+    let rig = Rig::new(
+        provider.clone(),
+        Arc::new(FaultStore::default()),
+        LlmHostConfig::default(),
+    )
+    .await;
+    let control = install(&rig).await;
+    let first = control
+        .submit(request("retired", "first", "第一轮"), discard())
+        .unwrap();
+    let retained = control.wait(&first);
+    assert_eq!(control.retire_finished(&first), Err(ControlError::Busy));
+    gate.notify_one();
+    let report = done(control.as_ref(), &first).await;
+    control.retire_finished(&first).unwrap();
+    assert_eq!(control.snapshot(&first.session).unwrap(), None);
+    assert_eq!(retained.await.unwrap(), report);
+    assert_eq!(
+        control.wait(&first).await,
+        Err(ControlError::StaleGeneration)
+    );
+    assert_eq!(rig.snapshot("retired").turns.len(), 1);
+    let second = control
+        .submit(request("retired", "second", "第二轮"), discard())
+        .unwrap();
+    assert_ne!(first.generation, second.generation);
+    assert_eq!(
+        control.retire_finished(&first),
+        Err(ControlError::StaleGeneration)
+    );
+    assert_eq!(
+        done(control.as_ref(), &second).await.run.commit,
+        CommitState::Completed
+    );
+    assert_eq!(rig.snapshot("retired").turns.len(), 2);
+    assert_eq!(provider.requests.lock().unwrap().len(), 2);
+    rig.stop().await;
+}
+
+#[tokio::test]
 async fn normal_tools_complete_and_old_completion_wait_survives_replacement() {
     let p = Provider::new(vec![
         Step::new(calls()),
@@ -351,6 +397,7 @@ async fn failed_cancel_commit_blocks_replacement_and_preserves_pending() {
     control.cancel(&key).unwrap();
     let report = done(&*control, &key).await;
     assert_eq!(report.run.commit, CommitState::Pending);
+    assert_eq!(control.retire_finished(&key), Err(ControlError::Busy));
     assert_eq!(
         report.run.failure,
         Some(RunFailure::FailureRecord {

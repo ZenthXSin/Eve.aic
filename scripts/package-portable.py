@@ -25,7 +25,7 @@ TARGETS = {
     "x86_64-unknown-linux-gnu": ("linux-x64", "linux-x64", "tar.xz", "9aa8e9d2298ab68c600bd6fb86a6c13bce11a4eca1ba9b39d79fa021755d7c37"),
     "aarch64-unknown-linux-gnu": ("linux-arm64", "linux-arm64", "tar.xz", "1bf1eb9ee63ffc4e5d324c0b9b62cf4a289f44332dfef9607cea1a0d9596ba6f"),
 }
-BINARIES = ("eve", "eve-qqbot", "eve-cognition", "eve-memory", "eve-message-evaluate")
+BINARIES = ("eve", "eve-qqbot", "eve-web", "eve-cognition", "eve-memory", "eve-message-evaluate")
 MAX_NODE_ARCHIVE_BYTES = 128 * 1024 * 1024
 
 
@@ -138,7 +138,7 @@ def package(target, binary_directory, output_directory):
     for file in ("Launch.mjs", "Updater.mjs", "update-contract.mjs", "update-archive.mjs"):
         shutil.copy2(ROOT / "packaging/common" / file, bundle)
     if windows:
-        for file in ("Launch.ps1", "Open-Panel.ps1", "Start-Eve.cmd", "Start-Console.cmd", "Open-Panel.cmd", "Update-Eve.cmd", "使用说明.md"):
+        for file in ("Launch.ps1", "Open-Panel.ps1", "Start-Eve.cmd", "Start-Console.cmd", "Start-Web.cmd", "Open-Panel.cmd", "Update-Eve.cmd", "使用说明.md"):
             source_file = ROOT / "packaging/windows" / file
             if source_file.suffix == ".ps1":
                 (bundle / source_file.name).write_text(source_file.read_text(encoding="utf-8"), encoding="utf-8-sig")
@@ -147,14 +147,14 @@ def package(target, binary_directory, output_directory):
             else:
                 shutil.copy2(source_file, bundle)
         if label == "windows-arm64":
-            for script, mode in (("Start-Eve", "qq"), ("Start-Console", "console"), ("Open-Panel", "panel"), ("Update-Eve", "update")):
+            for script, mode in (("Start-Eve", "qq"), ("Start-Console", "console"), ("Start-Web", "web"), ("Open-Panel", "panel"), ("Update-Eve", "update")):
                 (bundle / f"{script}.cmd").write_bytes((
                     '@echo off\r\nchcp 65001 >nul\r\n'
                     '"%~dp0runtime\\node.exe" "%~dp0Launch.mjs" ' + mode + ' %*\r\npause\r\n').encode("ascii"))
     else:
         for file in ("使用说明.md",):
             shutil.copy2(ROOT / "packaging/posix" / file, bundle)
-        for script, mode in (("Start-Eve", "qq"), ("Start-Console", "console"), ("Open-Panel", "panel"), ("Update-Eve", "update")):
+        for script, mode in (("Start-Eve", "qq"), ("Start-Console", "console"), ("Start-Web", "web"), ("Open-Panel", "panel"), ("Update-Eve", "update")):
             shell = bundle / f"{script}.sh"
             shell.write_text('#!/bin/sh\nEVE_PACKAGE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1\nexec "$EVE_PACKAGE_DIR/runtime/bin/node" "$EVE_PACKAGE_DIR/Launch.mjs" ' + mode + ' "$@"\n', encoding="utf-8")
             shell.chmod(0o755)

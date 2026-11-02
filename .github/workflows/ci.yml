@@ -154,6 +154,8 @@ jobs:
           $env:EVE_TEST_BROWSER = (Get-Command google-chrome -ErrorAction Stop).Source
           python -X utf8 scripts/test-web-plugins.py target/debug/eve-qqbot --browser
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -X utf8 scripts/test-web-chat.py --browser
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证 150k 上下文主动压缩与重启复用
         run: |
           $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
