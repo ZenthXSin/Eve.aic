@@ -1028,3 +1028,74 @@ fn mismatched_configuration_revisions_fail_after_bounded_reads() {
     ));
     assert_eq!(settings.0.load(std::sync::atomic::Ordering::SeqCst), 8);
 }
+
+#[tokio::test]
+async fn anonymous_auxiliary_route_uses_no_key_and_cannot_be_selected_as_primary_identity() {
+    use eve_llm_api::{ChatMessage, ChatRole, CredentialPurpose, ModelRequest};
+    let root = tempfile::tempdir().unwrap();
+    let primary_server = Server::start(vec![]).await;
+    let mut auxiliary_server = Server::start(vec![final_reply("chat")]).await;
+    let h = Harness::start(root.path(), &primary_server.url, "responses").await;
+    h.update(
+        &[
+            (MODELS_NAMESPACE, "auxiliary_small_enabled", json!(true)),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_provider",
+                json!("openai"),
+            ),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_model",
+                json!("anonymous-small"),
+            ),
+            (
+                MODELS_NAMESPACE,
+                "auxiliary_small_credential_ref",
+                json!(crate::model_credentials::ANONYMOUS),
+            ),
+            (
+                config::MODEL_USES_NAMESPACE,
+                "summary_role",
+                json!("auxiliary_small"),
+            ),
+            (
+                config::OPENAI_NAMESPACE,
+                "auxiliary_base_url",
+                json!(auxiliary_server.url.trim_end_matches("/responses")),
+            ),
+            (
+                config::OPENAI_NAMESPACE,
+                "auxiliary_protocol",
+                json!("chat"),
+            ),
+        ],
+        ApplyMode::Immediate,
+    );
+    let selected = CoreModelResolver::new(h.settings.clone(), "primary-synthetic".into())
+        .with_use("summary")
+        .resolve()
+        .unwrap();
+    selected
+        .provider
+        .complete(ModelRequest {
+            messages: vec![ChatMessage::text(ChatRole::User, "合成材料")],
+            tools: vec![],
+        })
+        .await
+        .unwrap();
+    let request = auxiliary_server.next().await;
+    assert_eq!(request.body["model"], "anonymous-small");
+    assert!(!request.headers.to_lowercase().contains("authorization:"));
+    for purpose in [
+        CredentialPurpose::Primary,
+        CredentialPurpose::Jev,
+        CredentialPurpose::Semantic,
+    ] {
+        assert!(
+            crate::model_credentials::reference(purpose, Some(crate::model_credentials::ANONYMOUS))
+                .is_err()
+        );
+    }
+    h.stop().await;
+}

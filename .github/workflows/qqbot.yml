@@ -134,6 +134,7 @@ jobs:
           python3 connectors/qqbot/test/execution_test.py
           python3 connectors/qqbot/test/admin_test.py
           python3 connectors/qqbot/test/trigger_test.py
+          python3 connectors/qqbot/test/idle_loop_test.py
           python3 connectors/qqbot/test/background_task_test.py
           python3 connectors/qqbot/test/delegation_context_test.py
           python3 connectors/qqbot/test/subagent_profiles_test.py

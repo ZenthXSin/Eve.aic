@@ -443,7 +443,13 @@ impl StoredTasks {
                     }
                     task.status = TaskStatus::Completed;
                     task.result = Some(bounded(&result, MAX_RESULT_BYTES));
-                    task.notice = notice;
+                    task.notice = if task.source.starts_with(IDLE_TASK_SOURCE_PREFIX)
+                        && usage.tool_calls == 0
+                    {
+                        None
+                    } else {
+                        notice
+                    };
                 }
                 TaskEnd::Failed { reason } => {
                     if reason.trim().is_empty() {
@@ -1012,6 +1018,13 @@ pub(super) fn validate_task(task: &Task) -> TaskResult<()> {
             shape == (false, false, false, false, false, false) && !task.cancel_requested
         }
         TaskStatus::Running => shape == (true, false, false, false, false, false),
+        TaskStatus::Completed
+            if task.source.starts_with(IDLE_TASK_SOURCE_PREFIX)
+                && task.usage.is_some_and(|usage| usage.tool_calls == 0) =>
+        {
+            shape == (true, true, true, true, false, false)
+                || shape == (true, true, true, true, false, true)
+        }
         TaskStatus::Completed | TaskStatus::Blocked => {
             shape == (true, true, true, true, false, true)
         }

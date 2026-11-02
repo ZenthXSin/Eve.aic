@@ -96,7 +96,7 @@ impl OpenAiConfig {
 pub struct OpenAiProvider {
     config: OpenAiConfig,
     endpoint: Url,
-    authorization: HeaderValue,
+    authorization: Option<HeaderValue>,
     client: Client,
     timing_diagnostics: bool,
     transient_retries: bool,
@@ -106,7 +106,23 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
+    fn authentication_headers(&self) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(value) = &self.authorization {
+            headers.insert(reqwest::header::AUTHORIZATION, value.clone());
+        }
+        headers
+    }
     pub fn new(config: OpenAiConfig, api_key: impl AsRef<str>) -> Result<Self, LlmError> {
+        Self::build(config, Some(api_key.as_ref()))
+    }
+
+    /// 显式无认证提供方。允许 HTTP，不读取、继承或发送任何模型密钥；不跟随重定向。
+    pub fn anonymous(config: OpenAiConfig) -> Result<Self, LlmError> {
+        Self::build(config, None)
+    }
+
+    fn build(config: OpenAiConfig, api_key: Option<&str>) -> Result<Self, LlmError> {
         if config.model.trim().is_empty()
             || config.request_timeout.is_zero()
             || config.max_response_bytes == 0
@@ -135,7 +151,8 @@ impl OpenAiProvider {
                     .parse::<std::net::IpAddr>()
                     .is_ok_and(|ip| ip.is_loopback())
         });
-        if !(endpoint.scheme() == "https" || endpoint.scheme() == "http" && loopback)
+        if !(endpoint.scheme() == "https"
+            || endpoint.scheme() == "http" && (loopback || api_key.is_none()))
             || endpoint.host_str().is_none()
             || !endpoint.username().is_empty()
             || endpoint.password().is_some()
@@ -146,13 +163,17 @@ impl OpenAiProvider {
                 "OpenAI URL 必须是无用户信息、查询或片段的 HTTPS，或 loopback HTTP".into(),
             ));
         }
-        let key = api_key.as_ref();
-        if key.trim().is_empty() || key.chars().any(char::is_whitespace) {
-            return Err(LlmError::Configuration("API 凭据不能为空或含空白".into()));
-        }
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {key}"))
-            .map_err(|_| LlmError::Configuration("API 凭据格式无效".into()))?;
-        authorization.set_sensitive(true);
+        let authorization = api_key
+            .map(|key| {
+                if key.trim().is_empty() || key.chars().any(char::is_whitespace) {
+                    return Err(LlmError::Configuration("API 凭据不能为空或含空白".into()));
+                }
+                let mut value = HeaderValue::from_str(&format!("Bearer {key}"))
+                    .map_err(|_| LlmError::Configuration("API 凭据格式无效".into()))?;
+                value.set_sensitive(true);
+                Ok(value)
+            })
+            .transpose()?;
         let mut builder = Client::builder()
             .redirect(Policy::none())
             .retry(reqwest::retry::never());
@@ -231,7 +252,7 @@ impl OpenAiProvider {
         let response = self
             .client
             .post(self.endpoint.clone())
-            .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
+            .headers(self.authentication_headers())
             .json(&body)
             .timeout(self.config.request_timeout)
             .send()
@@ -282,7 +303,7 @@ impl OpenAiProvider {
         let response = self
             .client
             .get(self.models_url())
-            .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
+            .headers(self.authentication_headers())
             .timeout(self.config.request_timeout)
             .send()
             .await
@@ -413,7 +434,7 @@ impl OpenAiProvider {
         let sending = self
             .client
             .post(self.endpoint.clone())
-            .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
+            .headers(self.authentication_headers())
             .json(body)
             .timeout(self.total_timeout(sink.is_some()))
             .send();

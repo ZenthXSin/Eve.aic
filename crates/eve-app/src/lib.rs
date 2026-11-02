@@ -12,6 +12,8 @@ mod developer;
 mod dialogue;
 mod error;
 mod history;
+mod idle_loop;
+mod idle_small;
 mod input;
 mod layered_context;
 mod memory_cli;
