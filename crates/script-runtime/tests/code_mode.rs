@@ -1,8 +1,11 @@
+#[cfg(target_os = "linux")]
 use eve_llm_api::{
     ContextScope, SharedToolSteps, ToolCall, ToolExecutionContext, ToolExecutionError, ToolFuture,
 };
 use eve_script_runtime::*;
+#[cfg(target_os = "linux")]
 use serde_json::json;
+#[cfg(target_os = "linux")]
 use std::{
     path::PathBuf,
     sync::{
@@ -26,12 +29,14 @@ fn sandbox() -> Bubblewrap {
     sandbox.bwrap = path("bwrap");
     sandbox
 }
+#[cfg(target_os = "linux")]
 fn owner() -> ContextScope {
     ContextScope {
         session_id: "code-session".into(),
         user_id: "owner".into(),
     }
 }
+#[cfg(target_os = "linux")]
 fn context(limit: usize) -> ToolExecutionContext {
     ToolExecutionContext::new()
         .with_scope(Some(owner()))
@@ -39,11 +44,13 @@ fn context(limit: usize) -> ToolExecutionContext {
         .with_call_id("outer".into())
 }
 #[derive(Default)]
+#[cfg(target_os = "linux")]
 struct Dispatch {
     calls: Mutex<Vec<String>>,
     active: AtomicUsize,
     peak: AtomicUsize,
 }
+#[cfg(target_os = "linux")]
 impl AuthorizedToolDispatch for Dispatch {
     fn parallel_safe(&self, name: &str) -> bool {
         name == "read"

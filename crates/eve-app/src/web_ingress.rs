@@ -56,7 +56,7 @@ pub(crate) struct RawMessages {
     directory: PathBuf,
     claims: PathBuf,
     marker: PathBuf,
-    file_lock: fs::File,
+    _file_lock: fs::File,
     gate: Mutex<()>,
     failed: AtomicBool,
 }
@@ -250,7 +250,7 @@ impl RawMessages {
             directory,
             claims,
             marker,
-            file_lock,
+            _file_lock: file_lock,
             gate: Mutex::new(()),
             failed: AtomicBool::new(false),
         };
@@ -297,7 +297,7 @@ impl RawMessages {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            let locked = self.file_lock.metadata().map_err(unavailable)?;
+            let locked = self._file_lock.metadata().map_err(unavailable)?;
             if current.dev() != locked.dev() || current.ino() != locked.ino() {
                 return Err(UNAVAILABLE.into());
             }
