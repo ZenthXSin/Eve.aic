@@ -202,7 +202,7 @@ class SkillAcceptance(unittest.TestCase):
             *self.send(self.message("show", f"/skill {skill['id']}", contains=[
                 "第 1 版「指定生命值的墙」", "参数：block（标识）、health（整数 100～2000）",
                 "验证参数：block=sample-wall-b，health=2000", "已验证",
-                "探测 eve-sample-sample-wall-b.health：期望 2000，实际 2000 ✓",
+                "探测 eve-sample-sample-wall-b.health：期望 2000，实际 2000 通过",
                 "验证通过后自动启用第 1 版", "参数 block=sturdy-wall，health=1200｜实际运行验证通过"])),
             *self.send(self.message("practice", f"/practice {interest['id']}", contains=[
                 "尝试 1：已验证", "由已验证技能的模板实例化：「指定生命值的墙」第 1 版"])),
