@@ -319,7 +319,8 @@ print('fixture check passed')
         self.assertEqual({name for name in manifest['resources'] if name.startswith('scripts/')},
                          set(update.RUNTIME_SCRIPTS))
         for name in update.RUNTIME_SCRIPTS:
-            self.assertEqual((resources/name).read_bytes(), (self.remote/name).read_bytes())
+            expected_blob = subprocess.check_output(['git', 'show', self.head + ':' + name], cwd=self.remote)
+            self.assertEqual((resources/name).read_bytes(), expected_blob)
         identity = {name:manifest[name] for name in ['source', 'binary_sha256', 'resources', 'source_diff', 'runtime']}
         self.assertEqual(runtime.value_digest(identity), request['candidate_sha256'])
         (directory/'source-diff.patch').write_bytes(expected + b'changed')
@@ -422,7 +423,7 @@ print('fixture check passed')
             self.assertEqual(list(self.fixture.candidates.iterdir()), [])
             if resource:
                 (self.root/'update/source/scripts/self_upgrade_runtime.py').write_bytes(
-                    (self.remote/'scripts/self_upgrade_runtime.py').read_bytes())
+                    subprocess.check_output(['git', 'show', self.head + ':scripts/self_upgrade_runtime.py'], cwd=self.remote))
 
     def test_new_runtime_candidate_hands_off_without_claiming_applied_or_failed(self):
         self.updater.builder_factory = lambda *args:update.GitBuilder(*args, remote=str(self.remote),

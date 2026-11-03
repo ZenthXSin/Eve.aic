@@ -47,7 +47,8 @@ class WebChatAcceptance(developer.DeveloperAcceptance):
                    EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS='0', EVE_CONTEXT_COMPACT_AT_TOKENS='0')
         self.child = subprocess.Popen([str(WEB), '--listen','127.0.0.1:0', '--state-dir',str(self.work/'state'),
                                      '--agent',str(ROOT/'AGENT.md')], env=env, stdout=subprocess.PIPE, stderr=self.log)
-        deadline = time.monotonic()+12
+        # CI冷启动包含全部默认插件与持久后端；轮询真实就绪，期限内不重启掩盖失败。
+        deadline = time.monotonic()+30
         while time.monotonic()<deadline:
             lines=self.log_path.read_text().splitlines()
             ready=next((line.split(' ',1)[1] for line in lines if line.startswith('EVE_WEB_READY ')),None)
