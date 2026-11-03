@@ -718,13 +718,10 @@ mod tests {
                 _ => source.directory.join("lock"),
             };
             let saved = root.path().join("preserved");
-            let moved = fs::rename(&path, &saved);
-            if cfg!(windows) && matches!(target, "directory" | "lock") && moved.is_err() {
+            if let Err(error) = fs::rename(&path, &saved) {
                 // Windows 的活跃文件锁禁止移走文件及父目录，先核对操作被拒绝。
-                assert_eq!(
-                    moved.unwrap_err().kind(),
-                    std::io::ErrorKind::PermissionDenied
-                );
+                assert!(cfg!(windows) && matches!(target, "directory" | "lock"));
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
                 assert_eq!(
                     source.read(&scope(&session)).unwrap(),
                     Some(vec!["保留这条证据".into()])
@@ -732,7 +729,6 @@ mod tests {
                 drop(source);
                 fs::rename(&path, &saved).unwrap();
             } else {
-                moved.unwrap();
                 assert!(source.read(&scope(&session)).is_err(), "{target}");
                 assert!(
                     source
