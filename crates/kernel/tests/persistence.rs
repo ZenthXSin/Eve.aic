@@ -237,6 +237,54 @@ fn concurrent_writes_preserve_every_key_in_memory_and_on_disk() {
 }
 
 #[test]
+fn identical_updates_reuse_the_saved_snapshot_and_real_changes_still_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.json");
+    let owner = pid("unchanged");
+    let store = FileStateStore::open(directory.path()).unwrap();
+    // 不存在与已经保存的空值不同，第一次空值写入也要创建文件。
+    store.set(&owner, "empty".into(), vec![]).unwrap();
+    assert!(path.is_file());
+    let bytes = vec![173; 1024 * 1024];
+    store.set(&owner, "large".into(), bytes.clone()).unwrap();
+    let checkpoint = directory.path().join("saved-inode.json");
+    fs::hard_link(&path, &checkpoint).unwrap();
+    let saved = fs::metadata(&path).unwrap();
+    for _ in 0..20 {
+        store.set(&owner, "large".into(), bytes.clone()).unwrap();
+        store.set(&owner, "empty".into(), vec![]).unwrap();
+    }
+    assert_eq!(
+        fs::metadata(&path).unwrap().modified().unwrap(),
+        saved.modified().unwrap()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(fs::metadata(&path).unwrap().ino(), saved.ino());
+    }
+    drop(store);
+    let reopened = FileStateStore::open(directory.path()).unwrap();
+    reopened.set(&owner, "large".into(), bytes.clone()).unwrap();
+    assert_eq!(
+        fs::metadata(&path).unwrap().modified().unwrap(),
+        saved.modified().unwrap()
+    );
+    reopened.set(&owner, "empty".into(), vec![1]).unwrap();
+    assert_ne!(fs::read(&path).unwrap(), fs::read(checkpoint).unwrap());
+    assert_eq!(reopened.get(&owner, "large").unwrap(), Some(bytes));
+    assert_eq!(reopened.get(&owner, "empty").unwrap(), Some(vec![1]));
+    drop(reopened);
+    assert_eq!(
+        FileStateStore::open(directory.path())
+            .unwrap()
+            .get(&owner, "empty")
+            .unwrap(),
+        Some(vec![1])
+    );
+}
+
+#[test]
 fn failed_atomic_replacement_preserves_memory_and_previous_document() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.json");
