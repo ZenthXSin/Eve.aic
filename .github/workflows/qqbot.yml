@@ -78,6 +78,7 @@ jobs:
           cargo +1.89.0 build -p eve-app --bin eve-qqbot --bin eve-web --bin eve-memory --locked
           python3 scripts/test-web-chat.py
           python3 scripts/test-web-autonomy.py
+          python3 scripts/test-web-goals.py
           python3 connectors/qqbot/test/default_capabilities_test.py
           python3 connectors/qqbot/test/natural_goal_test.py
           python3 connectors/qqbot/test/eve_e2e.py

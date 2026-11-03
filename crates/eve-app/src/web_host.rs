@@ -64,7 +64,14 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
     let state_store = backends.state.clone();
     let permissions = backends.permissions.clone();
     let logger = backends.logger.clone();
-    let kernel = eve_kernel::Kernel::with_services(backends);
+    let kernel = eve_kernel::Kernel::with_services(eve_kernel::KernelServices {
+        events: backends.events.clone(),
+        registry: backends.registry.clone(),
+        state: backends.state.clone(),
+        permissions: backends.permissions.clone(),
+        tasks: backends.tasks.clone(),
+        logger: backends.logger.clone(),
+    });
     let health = Arc::new(eve_model_health::HealthBook::default());
     crate::models::observe_usage(health.clone());
     bootstrap.health = Some(health.clone());
@@ -135,6 +142,9 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
         let runtime = autonomy
             .start(
                 &kernel,
+                &backends,
+                &options.agent_path,
+                &options.state_directory,
                 registry.clone(),
                 permissions,
                 control.clone(),
@@ -144,6 +154,7 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
             )
             .await?;
         let recovery = runtime.recovery.clone();
+        let cognition = runtime.goals.reader()?;
         background = Some(runtime);
         let inbox = Arc::new(
             crate::web_notifications::Inbox::open(&options.state_directory)
@@ -184,13 +195,13 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
                     .as_millis()
                     .try_into()?,
                 judgments: None,
-                cognition: None,
+                cognition: Some(cognition),
                 memory: Some(crate::web_panel_memory::MemoryView::new(
                     autonomy.memory.clone(),
                 )),
                 learning: None,
                 autonomy: None,
-                plans: None,
+                plans: Some(autonomy.goals.plans.clone()),
                 plugins: crate::web_panel_plugins::PanelPlugins::new(
                     Arc::new(kernel.clone()),
                     Arc::new(kernel.clone()),
