@@ -105,7 +105,7 @@ async fn run() -> Result<(), AppError> {
     let root = developer_path.parent().ok_or("测试目录无效")?;
     let developer: DeveloperConfig = serde_json::from_slice(&fs::read(&developer_path)?)?;
     if fs::read(root.join("task-strategy-fixture.marker"))? != b"isolated-task-strategy-v1"
-        || options.state_directory != root.join("state")
+        || options.state_directory.canonicalize()? != root.join("state").canonicalize()?
         || developer.workspace.canonicalize()? != root.join("source").canonicalize()?
         || developer.commands
         || developer.github

@@ -297,7 +297,7 @@ class InterestAcceptance(unittest.TestCase):
             stderr = self.panel_stderr.read_text(encoding="utf8")
         self.assertFalse(inspector.is_alive(), "state inspector did not stop")
         self.assertFalse(error_path.exists(), (error_path.read_text() + "\n" + stderr[-6000:]) if error_path.exists() else "")
-        self.assertFalse(self.errors, "\n".join(self.errors))
+        self.assertFalse(self.errors, "\n".join(self.errors) + f"\nprocess_exit={child.returncode}\n" + stderr[-6000:])
         for secret in ("test-model-secret", "test-app-secret"):
             self.assertNotIn(secret, stdout + stderr)
         if stop_at is not None:

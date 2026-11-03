@@ -26,10 +26,11 @@ class TaskStrategyProcessAcceptance(background.BackgroundTaskAcceptance):
 
     def setUp(self):
         super().setUp()
+        (self.work / "state").mkdir(exist_ok=True)
         self.source = self.work / "source"
         self.source.mkdir()
         for name in CASES:
-            (self.source / f"{name}.txt").write_text(INITIAL, encoding="utf8")
+            (self.source / f"{name}.txt").write_bytes(INITIAL.encode())
         (self.work / "task-strategy-fixture.marker").write_bytes(b"isolated-task-strategy-v1")
         self.developer_config = self.work / "developer.json"
         self.developer_config.write_text(json.dumps({
@@ -136,7 +137,7 @@ class TaskStrategyProcessAcceptance(background.BackgroundTaskAcceptance):
         script, checkpoints = [], {}
         for index, (label, name) in enumerate(order):
             before, after = f"reset-{index}", f"settle-{index}"
-            checkpoints[before] = lambda name=name: (self.source / f"{name}.txt").write_text(INITIAL, encoding="utf8")
+            checkpoints[before] = lambda name=name: (self.source / f"{name}.txt").write_bytes(INITIAL.encode())
             checkpoints[after] = lambda count=index + 1: self.settled(count)
             script += self.checkpoint(before)
             script += self.send(self.message(f"task-{index}", f"{label}:{name}", expected="fixture queued"))
