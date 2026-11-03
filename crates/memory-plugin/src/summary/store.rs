@@ -9,7 +9,7 @@ use eve_plugin_api::{PluginContext, PluginError, PluginResult};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -25,6 +25,8 @@ const INITIALIZED: &[u8] = br#"{"format_version":2,"initialized":true}"#;
 
 struct Inner {
     document: Document,
+    // 只发布与已提交文档对应的完整验证索引；轮询共享只读结果。
+    metadata: Arc<Metadata>,
     context: Option<PluginContext>,
     cold: Option<Cold>,
     sealed: bool,
@@ -117,14 +119,21 @@ impl StoredSummaries {
         if cold.is_some() {
             document.format_version = 2;
         }
+        let mut metadata = cold
+            .as_ref()
+            .map(|cold| cold.base.clone())
+            .unwrap_or_default();
+        metadata
+            .extend(&document.jobs, None)
+            .map_err(|_| MemoryError::CorruptState)?;
         let mut inner = Inner {
             document,
+            metadata: Arc::new(metadata),
             context: Some(context),
             cold,
             sealed: marker.is_some(),
             repair_scans: BTreeMap::new(),
         };
-        metadata(&inner).map_err(|_| MemoryError::CorruptState)?;
         let mut next = inner.document.clone();
         let mut changed = legacy;
         for job in &mut next.jobs {
@@ -655,21 +664,13 @@ impl StoredSummaries {
         persist(&mut inner, next)
     }
 }
-fn metadata(inner: &Inner) -> MemoryResult<Metadata> {
+fn metadata(inner: &Inner) -> MemoryResult<Arc<Metadata>> {
     if inner.context.is_none() {
         return Err(MemoryError::Unavailable);
     }
-    if inner.document.jobs.len() > MAX_SUMMARY_JOBS {
-        return Err(MemoryError::LimitReached);
-    }
-    let mut meta = inner
-        .cold
-        .as_ref()
-        .map(|cold| cold.base.clone())
-        .unwrap_or_default();
-    meta.extend(&inner.document.jobs, None)?;
-    Ok(meta)
+    Ok(inner.metadata.clone())
 }
+
 fn load(
     inner: &mut Inner,
     sequence: u64,
@@ -775,6 +776,9 @@ fn persist(inner: &mut Inner, mut next: Document) -> MemoryResult<()> {
                 base.extend(&next.jobs[..count], Some(&reference))?;
                 next.jobs.drain(..count);
                 next.tail = Some(reference);
+                // 归档后索引必须绑定新的冷块引用，不能沿用旧的热记录位置。
+                verified = base.clone();
+                verified.extend(&next.jobs, None)?;
                 next_base = Some(base);
             }
         }
@@ -803,5 +807,6 @@ fn persist(inner: &mut Inner, mut next: Document) -> MemoryResult<()> {
         inner.cold.as_mut().ok_or(MemoryError::Unavailable)?.base = base;
     }
     inner.document = next;
+    inner.metadata = Arc::new(verified);
     Ok(())
 }

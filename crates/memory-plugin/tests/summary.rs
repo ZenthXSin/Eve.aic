@@ -1335,3 +1335,71 @@ async fn a_running_prefix_cannot_be_evicted_but_finishing_it_reopens_global_capa
     assert_eq!(saved_summary(&store)["jobs"].as_array().unwrap().len(), 128);
     kernel.stop_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn committed_index_tracks_cold_repairs_and_late_damage_without_reopening() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(&root.path().join("state"));
+    let directory = root.path().join("archive");
+    let archive = Arc::new(eve_memory_plugin::FileSummaryArchive::open(&directory).unwrap());
+    let (kernel, admin) = cold_open(store.clone(), archive).await.unwrap();
+    let alice = snapshot(1);
+    let first = admin.reserve(&alice, 1, "v1", options()).unwrap().unwrap();
+    admin
+        .finish(&first, 2, Err(SummaryFailure::InvalidOutput))
+        .unwrap();
+    for i in 1..=100 {
+        let mut source = snapshot(i);
+        source.scope.user_id = "bob".into();
+        let batch = admin
+            .reserve(&source, i + 2, "v1", options())
+            .unwrap()
+            .unwrap();
+        admin.finish(&batch, i + 2, Ok(vec![])).unwrap();
+    }
+    let saved = saved_summary(&store);
+    assert!(saved["tail"]["last"].as_u64().unwrap() >= first.sequence);
+    let repair = admin
+        .reserve_repair_reader(&alice.scope, &reader(1), 70_000, "v2", options())
+        .unwrap()
+        .unwrap();
+    assert_eq!(repair.sequence, 102);
+    assert_eq!(repair.consumed_ids, first.consumed_ids);
+    admin
+        .finish(&repair, 70_001, Ok(vec![point("e-1")]))
+        .unwrap();
+    assert_eq!(
+        admin
+            .latest_completed(&alice.scope)
+            .unwrap()
+            .unwrap()
+            .batch
+            .sequence,
+        repair.sequence
+    );
+    assert!(
+        admin
+            .reserve_repair_reader(&alice.scope, &reader(1), 140_000, "v2", options())
+            .unwrap()
+            .is_none()
+    );
+    let before = store.get(&owner(), SUMMARY_STATE_KEY).unwrap();
+    let hash = saved["tail"]["hash"].as_str().unwrap();
+    let path = directory.join(format!("{hash}.json"));
+    std::fs::write(&path, b"damaged after index validation").unwrap();
+    assert!(admin.jobs(&alice.scope).is_err());
+    assert_eq!(
+        admin.latest_completed(&alice.scope),
+        Err(MemoryError::Unavailable)
+    );
+    assert!(matches!(
+        admin.reserve(&snapshot(2), 150_000, "v2", options()),
+        Err(MemoryError::Unavailable)
+    ));
+    assert_eq!(store.get(&owner(), SUMMARY_STATE_KEY).unwrap(), before);
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        b"damaged after index validation"
+    );
+    kernel.stop_all().await.unwrap();
+}
