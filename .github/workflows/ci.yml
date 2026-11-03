@@ -152,6 +152,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -X utf8 connectors/qqbot/test/task_progress_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not $IsWindows) {
+            python -X utf8 connectors/qqbot/test/default_goal_journey_test.py
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       - name: 验证主人跨群账号、撤权与旧身份兼容
         if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
