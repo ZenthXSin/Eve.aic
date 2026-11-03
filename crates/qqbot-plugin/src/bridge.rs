@@ -604,6 +604,8 @@ struct Delivery {
     pauses: Vec<u64>,
     index: usize,
     pause_until: Option<tokio::time::Instant>,
+    /// 上一段写出时开始准备下一段；平台回执和落盘耗时也计入段间停顿。
+    written_at: tokio::time::Instant,
     /// 随这条被动回复附带的邀请及其片段序号。
     appendix: Option<(String, usize)>,
     /// 正文发完后等待发表情包的时刻；`sticker_sending` 表示已写出、等回执。
@@ -1737,8 +1739,9 @@ pub(crate) async fn run(
                 };
                 write(&mut stdin, frame).await?;
                 timing(timing_diagnostics, "reply_written", None);
-                delivering.push(Delivery { reply, pauses, index: 0, pause_until: None, appendix,
-                    sticker_at: None, sticker_sending: false, deadline: tokio::time::Instant::now() + DELIVERY_TIMEOUT });
+                let written_at = tokio::time::Instant::now();
+                delivering.push(Delivery { reply, pauses, index: 0, pause_until: None, written_at, appendix,
+                    sticker_at: None, sticker_sending: false, deadline: written_at + DELIVERY_TIMEOUT });
             }
             // 段间停顿结束后写下一段；路由或命令尚未收尾时先等待，取消或新代可在此关闭剩余片段。
             if let Some(position) = delivering.iter().position(|delivery|
@@ -1767,7 +1770,8 @@ pub(crate) async fn run(
                     continue;
                 }
                 write(&mut stdin, segment_frame(&ledger, index, part)).await?;
-                delivery.deadline = tokio::time::Instant::now() + DELIVERY_TIMEOUT;
+                delivery.written_at = tokio::time::Instant::now();
+                delivery.deadline = delivery.written_at + DELIVERY_TIMEOUT;
                 delivery.pause_until = None;
             }
             // 正文发完、停顿结束后发表情包；写出前先记为发送中，中断后不重发。
@@ -2287,7 +2291,7 @@ pub(crate) async fn run(
                                 if ok && !last {
                                     // 已确认片段不再重发；下一段只在停顿后重新核对代际才写出。
                                     delivery.index += 1;
-                                    delivery.pause_until = Some(tokio::time::Instant::now()
+                                    delivery.pause_until = Some(delivery.written_at
                                         + Duration::from_millis(delivery.pauses[delivery.index]));
                                     continue;
                                 }

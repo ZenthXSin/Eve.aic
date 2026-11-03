@@ -501,12 +501,16 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         parts.map(p=>p[0].replace(/\s/gu,"")).join("") !== frame.text.replace(/\s/gu,"")) throw new Error("invalid_parts");
       let result;
       const deadline = now() + SEND_TIMEOUT_MS;
+      let previousStarted;
       for (let index=0;index<parts.length;index++) {
         if (closed) throw new Error("closed");
-        if (parts[index][1]) await new Promise(resolve=>setTimeout(resolve,parts[index][1]));
+        const elapsed = previousStarted === undefined ? 0 : Math.max(0, now() - previousStarted);
+        const pause = Math.max(0, parts[index][1] - elapsed);
+        if (pause) await new Promise(resolve=>schedule(resolve,pause));
         if (closed) throw new Error("closed");
         const remaining = deadline - now();
         if (remaining <= 0) throw Object.assign(new Error("push_timeout"), {name:"TimeoutError"});
+        previousStarted = now();
         result = await sendText({ scope, targetId: frame.target_id }, parts[index][0], mention, remaining);
       }
       send({ type: "delivery", id: frame.id, push: true, ok: true,

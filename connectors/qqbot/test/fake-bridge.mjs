@@ -76,6 +76,9 @@ if (scenario.script) {
         if (!await until(() => commands.filter(cmd => cmd.type === expected.type && cmd.id === expected.id).length >= (expected.count ?? 1))) return;
       } else if (step.touch) {
         fs.writeFileSync(step.touch, "ready");
+      } else if (step.delay_ms !== undefined) {
+        if (!Number.isInteger(step.delay_ms) || step.delay_ms < 0 || step.delay_ms > 5000) throw new Error("invalid_test_delay");
+        await delay(step.delay_ms);
       } else if (step.push_mode) {
         pushMode = step.push_mode;
       } else if (step.delivery) {
