@@ -56,9 +56,18 @@ pub(crate) struct RawMessages {
     directory: PathBuf,
     claims: PathBuf,
     marker: PathBuf,
-    _file_lock: fs::File,
+    _file_lock: DirectoryLock,
     gate: Mutex<()>,
     failed: AtomicBool,
+}
+
+struct DirectoryLock(fs::File);
+
+impl Drop for DirectoryLock {
+    fn drop(&mut self) {
+        // fork/dup 可暂时保留同一打开文件描述，所有者结束即显式释放锁。
+        let _ = self.0.unlock();
+    }
 }
 
 fn unavailable<T>(_: T) -> String {
@@ -229,8 +238,9 @@ impl RawMessages {
                 .map_err(unavailable)?
         };
         file_lock.try_lock().map_err(unavailable)?;
+        let file_lock = DirectoryLock(file_lock);
         if !initialized {
-            file_lock.sync_all().map_err(unavailable)?;
+            file_lock.0.sync_all().map_err(unavailable)?;
             sync_directory(&directory)?;
             let mut empty = Claims {
                 version: 1,
@@ -297,7 +307,7 @@ impl RawMessages {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            let locked = self._file_lock.metadata().map_err(unavailable)?;
+            let locked = self._file_lock.0.metadata().map_err(unavailable)?;
             if current.dev() != locked.dev() || current.ino() != locked.ino() {
                 return Err(UNAVAILABLE.into());
             }
@@ -571,6 +581,30 @@ mod tests {
             reopened.read(&scope(&session)).unwrap(),
             Some(expected[2..].to_vec())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_drop_releases_lock_while_a_duplicate_descriptor_remains_open() {
+        let root = tempfile::tempdir().unwrap();
+        let source = RawMessages::open(root.path()).unwrap();
+        let session = session_key(1);
+        record(&source, &session, 1, "完整原话保持原值");
+        let path = source.path(&format!("{:032x}", 1));
+        let before = fs::read(&path).unwrap();
+        // dup 与子进程 fork 暂留的描述符共享同一文件锁，不依赖并发调度概率。
+        let duplicate = source._file_lock.0.try_clone().unwrap();
+        assert!(RawMessages::open(root.path()).is_err());
+        drop(source);
+        let reopened = RawMessages::open(root.path()).unwrap();
+        assert_eq!(
+            reopened.read(&scope(&session)).unwrap(),
+            Some(vec!["完整原话保持原值".into()])
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+        assert!(RawMessages::open(root.path()).is_err());
+        drop(duplicate);
+        assert!(RawMessages::open(root.path()).is_err());
     }
 
     #[test]
