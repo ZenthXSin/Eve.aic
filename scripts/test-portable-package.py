@@ -236,7 +236,7 @@ def main():
             bridge = work / "离线 桥接.mjs"
             bridge.write_bytes((pathlib.Path(__file__).resolve().parents[1] / "connectors/qqbot/test/fake-bridge.mjs").read_bytes())
             message = {"id": "package-chat", "scope": "c2c", "target_id": "user-1", "user_id": "user-1",
-                       "text": "你好", "expected_segments": ["你好。", "我在这里。"]}
+                       "text": "你好", "original_text": "你好", "expected_segments": ["你好。", "我在这里。"]}
             for restart in (False, True):
                 stop_gate = work / f"stop-{restart}"
                 scenario = work / f"scenario-{restart}.json"
