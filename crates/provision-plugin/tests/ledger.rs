@@ -484,7 +484,7 @@ async fn download_follows_redirects_and_reports_http_failures() {
     assert!(matches!(plain, Err(ProvisionError::InvalidInput(_))));
     assert_eq!(
         provider.ready_path("sample-server").unwrap(),
-        Some(root.path().join(acquired.path))
+        Some(root.path().join(acquired.path).canonicalize().unwrap())
     );
 }
 

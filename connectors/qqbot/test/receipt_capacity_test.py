@@ -14,6 +14,11 @@ class ReceiptCapacityAcceptance(segment.SegmentAcceptance):
             locals()[_name] = None
     del _name
 
+    def run_eve(self, script, **options):
+        # 16 MiB 原回执以字节数组存储，debug 宿主须解析并持久化数倍大小的 JSON。
+        # CI 曾在所有行为断言之前超过普通分条夹具30秒期限；此容量验收独立保留90秒。
+        return super().run_eve(script, timeout=90, **options)
+
     def seed(self, count, size):
         entries = [{"app_id": "1904159860", "message": {
             "id": f"old-{i}", "scope": "c2c", "target_id": "user-1", "user_id": "user-1",

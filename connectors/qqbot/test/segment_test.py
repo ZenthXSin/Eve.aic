@@ -115,13 +115,14 @@ class SegmentAcceptance(unittest.TestCase):
         return {"wait_receipt": {"path": str(self.state_path), "id": id, "state": state}}
 
     def run_eve(self, script, segmented=True, memory=False, training=False, terminate_at=None, success=True,
-                sentence_split=False):
+                sentence_split=False, timeout=30):
         self.runs += 1
         events_path = self.work / f"events-{self.runs}.jsonl"
         error_path = self.work / f"error-{self.runs}.txt"
         scenario = self.work / f"scenario-{self.runs}.json"
         scenario.write_text(json.dumps({"script": script, "events_file": str(events_path),
-                                        "error_file": str(error_path)}), encoding="utf8")
+                                        "error_file": str(error_path),
+                                        "wait_timeout_ms": max(15000, (timeout - 5) * 1000)}), encoding="utf8")
         env = {key: os.environ[key] for key in ("PATH", "SystemRoot", "TEMP", "TMP") if key in os.environ}
         env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret",
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
@@ -148,7 +149,7 @@ class SegmentAcceptance(unittest.TestCase):
                     time.sleep(0.01)
                 self.assertTrue(terminate_at.exists(), "process exited before SIGTERM synchronization")
                 child.send_signal(signal.SIGTERM)
-            stdout, stderr = child.communicate(timeout=30)
+            stdout, stderr = child.communicate(timeout=timeout)
         finally:
             if child.poll() is None:
                 child.kill()
