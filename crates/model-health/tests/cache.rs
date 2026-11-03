@@ -96,7 +96,21 @@ fn reported_usage_accumulates_hits_and_counts_unreported() {
         },
     );
     let cache = book.snapshot()[0].1.cache.clone();
-    assert_eq!((cache.reported_requests, cache.unreported_requests), (2, 1));
-    assert_eq!(cache.cached_tokens, 1900, "命中数不超过输入");
-    assert_eq!(cache.recent_reported_ratio(), Some(9500));
+    assert_eq!((cache.reported_requests, cache.unreported_requests), (1, 2));
+    assert_eq!((cache.input_tokens, cache.cached_tokens), (1000, 900));
+    assert_eq!(cache.recent_reported_ratio(), Some(9000));
+
+    // 服务明确报告零命中仍是有效用量，不能与缺失或异常统计混淆。
+    book.reported(
+        "dialogue",
+        ModelUsage {
+            input_tokens: Some(1000),
+            cached_input_tokens: Some(0),
+            output_tokens: None,
+        },
+    );
+    let cache = book.snapshot()[0].1.cache.clone();
+    assert_eq!((cache.reported_requests, cache.unreported_requests), (2, 2));
+    assert_eq!((cache.input_tokens, cache.cached_tokens), (2000, 900));
+    assert_eq!(cache.recent_reported_ratio(), Some(4500));
 }
