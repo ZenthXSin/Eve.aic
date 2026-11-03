@@ -414,7 +414,11 @@ impl LocalDeveloper {
                             use std::os::unix::fs::PermissionsExt;
                             fs::set_permissions(
                                 &path,
-                                fs::Permissions::from_mode(if *_executable { 0o755 } else { 0o644 }),
+                                fs::Permissions::from_mode(if *_executable {
+                                    0o755
+                                } else {
+                                    0o644
+                                }),
                             )
                             .map_err(|_| failed("候选源码权限无法保存"))?;
                         }

@@ -26,6 +26,9 @@ try {
   await page.getByRole("button", { name: "插件页面", exact: true }).click();
   await page.getByRole("button", { name: "兴趣学习", exact: true }).click();
   const interest = page.getByLabel("启用兴趣学习", { exact: true });
+  assert.equal(await interest.isChecked(), true);
+  await interest.uncheck();
+  await save();
   assert.equal(await interest.isChecked(), false);
   await interest.check();
   await page.getByLabel("观察间隔（毫秒）", { exact: true }).fill("1000");
