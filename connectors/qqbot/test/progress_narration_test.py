@@ -96,6 +96,30 @@ class ProgressNarrationAcceptance(developer.DeveloperAcceptance):
         sessions = self.documents()['eve.session']['sessions.v1']['sessions']
         self.assertEqual(sum(len(s['turns']) for s in sessions.values()), 1)
 
+    def test_final_and_other_conversation_do_not_wait_for_progress_narration(self):
+        self.response_gates[('progress',1)]='release-narration'
+        def respond(body):
+            users=[m.get('content','') for m in body['messages'] if m['role']=='user']
+            if '另一位的问候' in users:
+                return dialogue.text_response('另一位也收到了')
+            if not self.results(body):
+                return dialogue.tool_response([('run_command',{'program':sys.executable,
+                    'args':['-c','import time; time.sleep(1.2)']})])
+            return dialogue.text_response('本轮检查完成')
+        self.callback=respond
+        def before_release():
+            self.assertFalse(self.gate('release-narration').exists())
+            self.assertEqual(self.receipt('final-first')['state'],'Sent')
+            self.assertEqual(self.receipt('parallel')['state'],'Sent')
+        other=self.message('parallel','另一位的问候',expected='另一位也收到了')
+        other.update(user_id='user-2',target_id='user-2')
+        self.run_progress([{'send':self.message('final-first','执行一次检查',expected='本轮检查完成')},
+            {'wait_file':str(self.arrived('progress',1))}, {'send':other},
+            self.wait_receipt('parallel'),self.wait_receipt('final-first'),
+            *self.checkpoint('both-before-narration'),{'touch':str(self.gate('release-narration'))}],
+            checkpoints={'both-before-narration':before_release})
+        self.assertEqual(self.progress('final-first'),[])
+
     def test_invalid_narration_uses_bounded_host_status_and_final_still_arrives(self):
         original = self.provider_response
         def broken(body, kind, fallback):
