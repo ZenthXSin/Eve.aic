@@ -109,6 +109,25 @@ class DefaultCapabilitiesAcceptance(unittest.TestCase):
                     kind = "conversation_learning"
                     outer.assertFalse(body.get("tools"), "交流经验分析不能获得业务工具")
                     response = text_response('{"lessons":[]}')
+                elif (isinstance(decoded, dict) and decoded.get("selector_version") == "source-selector:v1"
+                      and body["messages"][0].get("content", "").startswith("你是受限的资料来源选择器。")):
+                    # 冻结发行包可自带语料，因兴趣唤起的来源选择不是普通聊天。
+                    kind = "source_selection"
+                    outer.assertFalse(body.get("tools"), "资料筛选不能获得业务工具")
+                    outer.assertIsInstance(decoded["candidates"], list)
+                    response = text_response('{"selected":[]}')
+                elif (isinstance(decoded, dict) and decoded.get("composer_version") == "clarify-composer:v1"
+                      and body["messages"][0].get("content", "").startswith("你是受限的提问撰写器。")):
+                    kind = "clarify"
+                    outer.assertFalse(body.get("tools"), "澄清撰写不能获得业务工具")
+                    outer.assertEqual(decoded["stall"], "research_empty")
+                    response = text_response(json.dumps({"question": "还没找到合适的调色资料，你想先了解什么颜色？"},
+                                                        ensure_ascii=False))
+                elif (isinstance(decoded, dict) and decoded.get("judge_version") == "outreach-judge:v2"
+                      and body["messages"][0].get("content", "").startswith("你是受限的时机判断器。")):
+                    kind = "outreach_judge"
+                    outer.assertFalse(body.get("tools"), "时机判断不能获得业务工具")
+                    response = text_response('{"decision":"not_now"}')
                 elif "unverified_waiting_input" in latest:
                     kind = "reflection"
                     response = text_response(json.dumps({"summary": "没有已验证的执行结果",
@@ -197,7 +216,9 @@ class DefaultCapabilitiesAcceptance(unittest.TestCase):
                 self.assertIsNone(self.child.poll(), message + ": Eve 进程已结束")
             time.sleep(0.02)
 
-    def run_default(self, script, checkpoints=None):
+    def run_default(self, script, checkpoints=None, stop_at=None):
+        if stop_at is not None:
+            self.assertIn(stop_at, checkpoints or {})
         self.runs += 1
         scenario = self.work / f"scenario-{self.runs}.json"
         events = self.work / f"events-{self.runs}.jsonl"
@@ -221,16 +242,22 @@ class DefaultCapabilitiesAcceptance(unittest.TestCase):
             for name, callback in (checkpoints or {}).items():
                 self.wait_for(lambda: (self.work / (name + ".inspect")).exists(), name + " 未到达")
                 callback()
+                if name == stop_at:
+                    self.child.kill()
+                    break
                 (self.work / (name + ".continue")).touch()
             stdout, stderr = self.child.communicate(timeout=35)
             self.assertFalse(error.exists(), error.read_text() if error.exists() else "")
             self.assertFalse(self.errors, "\n".join(self.errors))
+            for secret in ("test-app-secret", "test-model-secret"):
+                self.assertNotIn(secret, stdout + stderr)
+            if stop_at is not None:
+                self.assertNotEqual(self.child.returncode, 0)
+                return
             self.assertEqual(self.child.returncode, 0, stderr)
             summary = json.loads(stdout)
             self.assertTrue(summary["closed"])
             self.assertFalse(summary["terminal_error"])
-            for secret in ("test-app-secret", "test-model-secret"):
-                self.assertNotIn(secret, stdout + stderr)
         except Exception as failure:
             if self.child.poll() is None:
                 self.child.kill()
