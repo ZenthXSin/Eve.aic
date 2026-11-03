@@ -8,7 +8,12 @@ use std::sync::Arc;
 
 fn owner(channel: &str, scope: &ContextScope) -> ContextOwner {
     ContextOwner {
-        channel: channel.into(),
+        channel: if crate::web_chat::is_owner(scope) {
+            "web"
+        } else {
+            channel
+        }
+        .into(),
         session_id: scope.session_id.clone(),
         user_id: scope.user_id.clone(),
     }
@@ -68,6 +73,7 @@ pub(crate) struct NotesTool {
     pub binding: NoteBinding,
 }
 pub(crate) enum NoteBinding {
+    Web,
     Qq(QqConversations),
     /// 由终端宿主启动选项绑定，不从本轮模型参数或文本取得。
     Console(SessionKey),
@@ -77,6 +83,9 @@ impl NoteBinding {
         let key = SessionKey::new(&scope.session_id, &scope.user_id)
             .map_err(|_| failure(ContextError::InvalidInput))?;
         match self {
+            Self::Web if crate::web_chat::is_owner(scope) => Ok(owner("web", scope)),
+            Self::Web => Err(ToolExecutionError::Rejected("Web 便笺身份无效".into())),
+            Self::Qq(_) if crate::web_chat::is_owner(scope) => Ok(owner("web", scope)),
             Self::Qq(conversations) => {
                 if scope.user_id == crate::qq_group::USER
                     || conversations

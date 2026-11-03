@@ -175,6 +175,12 @@ pub trait ControlService: Send + Sync {
     /// 不得将它视为取消完成、没有副作用或允许重试的依据。
     fn wait(&self, key: &GenerationKey) -> ControlFuture<'static, ControlReport>;
     fn snapshot(&self, key: &SessionKey) -> ControlResult<Option<ControlSnapshot>>;
+    /// 可信通道已持久化回执后释放已结束代的内存报告，不修改 Session 历史。
+    /// 精确代际必须正常结算为 Finished；在途、Blocked 和未知结局拒绝。
+    /// 旧等待句柄保留原报告，新建的旧代读取与事件展示失效。
+    fn retire_finished(&self, _key: &GenerationKey) -> ControlResult<()> {
+        Err(ControlError::Unavailable)
+    }
     /// 包括用户、会话、任务、控制器 epoch 和生成代；取消代及被替换代均不接受。
     fn accepts(&self, event: &ControlEvent) -> bool;
 }

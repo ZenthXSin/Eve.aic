@@ -59,7 +59,7 @@ function releaseOf(archive, version = 'v1.1.0', label = 'linux-x64') {
   return { tag_name: version, draft: false, prerelease: false, assets: [{ name, size: archive.length,
     digest: 'sha256:' + digest(archive), browser_download_url: `https://github.com/ZenthXSin/Eve.aic/releases/download/${version}/${name}` }] };
 }
-async function fixture(t, { brokenProbe = false } = {}) {
+async function fixture(t, { brokenProbe = false, mode = 'qq' } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'Eve 更新 空格 '));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   await fs.writeFile(path.join(root, 'build-info.json'), JSON.stringify(base));
@@ -71,7 +71,7 @@ async function fixture(t, { brokenProbe = false } = {}) {
     calls.push({ url, options });
     return new Response(url.includes('/releases/latest') ? JSON.stringify(release) : archive);
   };
-  const updater = createUpdater(root, { fetchImpl, log: text => logs.push(text), runProgram: async (...args) => {
+  const updater = createUpdater(root, { fetchImpl, mode, log: text => logs.push(text), runProgram: async (...args) => {
     probes.push(args); if (brokenProbe) throw new Error('fixture probe failed');
   } });
   return { root, updater, calls, probes, logs, mutate(nextArchive, nextRelease) { archive = nextArchive; release = nextRelease; } };
@@ -152,6 +152,27 @@ test('下载、校验、下次启动切换与回退，用户文件字节不变',
   saved = await f.updater.status(); assert.equal(saved.active.version, 'v1.1.0'); assert.equal(saved.pending, null);
   await f.updater.rollback(); assert.equal((await f.updater.resolveInstalled()).appRoot, f.root);
   await preserved(f); assert.equal(f.calls.length, 2);
+});
+test('Web 更新拒绝缺少独立入口的旧包并保留用户数据', async t => {
+  const f=await fixture(t,{mode:'web'});
+  await assert.rejects(f.updater.check({force:true}),/没有独立 Web 入口/);
+  const saved=await f.updater.status();
+  assert.equal(saved.active,null);
+  assert.equal(saved.pending,null);
+  await preserved(f);
+});
+test('含 Web 的更新候选核验新二进制并用 Web 模式检查配置', async t => {
+  const f=await fixture(t,{mode:'web'}),candidate=tree();
+  candidate.files.set('eve-web',Buffer.from('fixture-web-runtime'));
+  candidate.manifest.files_sha256['eve-web']=digest(candidate.files.get('eve-web'));
+  candidate.files.set('build-info.json',Buffer.from(JSON.stringify(candidate.manifest)));
+  const archive=archiveTar(candidate.files,'Eve-v1.1.0-linux-x64');
+  f.mutate(archive,releaseOf(archive));
+  await f.updater.check({force:true});
+  assert(f.probes.some(([program])=>program.endsWith('eve-web')));
+  await f.updater.resolveInstalled();
+  assert(f.probes.some(([,args])=>args?.includes('web')&&args.includes('--validate-only')));
+  await preserved(f);
 });
 test('关闭本次更新不切换已下载版本', async t => {
   const f = await fixture(t); await f.updater.check({ force: true });

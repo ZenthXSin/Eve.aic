@@ -348,6 +348,33 @@ impl ControlService for Controller {
             .map(|state| Some(state.clone()))
             .map_err(|_| ControlError::Unavailable)
     }
+    fn retire_finished(&self, key: &GenerationKey) -> ControlResult<()> {
+        let mut registry = self.lock()?;
+        let generation = registry
+            .sessions
+            .get(&key.session.session_id)
+            .ok_or(ControlError::StaleGeneration)?;
+        if generation.key != *key {
+            return Err(ControlError::StaleGeneration);
+        }
+        let state = generation
+            .state
+            .lock()
+            .map_err(|_| ControlError::Unavailable)?;
+        if state.phase != ControlPhase::Finished
+            || state.report.as_ref().is_none_or(|report| {
+                matches!(
+                    report.run.commit,
+                    CommitState::Pending | CommitState::Unknown
+                )
+            })
+        {
+            return Err(ControlError::Busy);
+        }
+        drop(state);
+        registry.sessions.remove(&key.session.session_id);
+        Ok(())
+    }
     fn accepts(&self, event: &ControlEvent) -> bool {
         let Ok(registry) = self.lock() else {
             return false;

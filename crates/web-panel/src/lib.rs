@@ -1,4 +1,4 @@
-//! 仅绑定环回地址的 HTTP 管理面板；所有业务由公开 PanelService 实现。
+//! 仅绑定环回地址的 HTTP 管理与对话面板；所有业务由公开 PanelService 实现。
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Query, Request, State},
@@ -106,6 +106,13 @@ impl LocalPanel {
             .route("/style.css", get(styles))
             .route("/api/status", get(status))
             .route("/api/readiness", get(readiness))
+            .route("/api/chat", get(chat_info))
+            .route(
+                "/api/chat/send",
+                post(chat_send).layer(DefaultBodyLimit::max(256 * 1024)),
+            )
+            .route("/api/chat/read", post(chat_read))
+            .route("/api/chat/cancel", post(chat_cancel))
             .route("/api/sessions", get(sessions))
             .route("/api/tasks", get(tasks))
             .route("/api/session", post(session))
@@ -207,6 +214,57 @@ fn failure(error_value: PanelError) -> Response {
 
 async fn plugins(State(shared): State<Arc<Shared>>) -> Response {
     match shared.service.plugins() {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+async fn chat_info(State(shared): State<Arc<Shared>>) -> Response {
+    match shared.service.chat_info() {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+async fn chat_send(
+    State(shared): State<Arc<Shared>>,
+    body: Result<Json<eve_web_panel_api::ChatSubmit>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(request)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_json");
+    };
+    if request.validate().is_err() {
+        return error(StatusCode::BAD_REQUEST, "invalid_input");
+    }
+    match shared.service.chat_submit(request) {
+        Ok(value) => (StatusCode::ACCEPTED, Json(value)).into_response(),
+        Err(e) => failure(e),
+    }
+}
+async fn chat_read(
+    State(shared): State<Arc<Shared>>,
+    body: Result<Json<eve_web_panel_api::ChatLookup>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(request)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_json");
+    };
+    if request.validate().is_err() {
+        return error(StatusCode::BAD_REQUEST, "invalid_input");
+    }
+    match shared.service.chat_read(request) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+async fn chat_cancel(
+    State(shared): State<Arc<Shared>>,
+    body: Result<Json<eve_web_panel_api::ChatLookup>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(request)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_json");
+    };
+    if request.validate().is_err() {
+        return error(StatusCode::BAD_REQUEST, "invalid_input");
+    }
+    match shared.service.chat_cancel(request) {
         Ok(value) => Json(value).into_response(),
         Err(e) => failure(e),
     }
