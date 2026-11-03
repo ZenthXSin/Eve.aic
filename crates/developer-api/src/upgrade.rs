@@ -5,6 +5,14 @@ use std::path::PathBuf;
 pub const LIVE_UPGRADE_VERSION: u8 = 1;
 pub const LIVE_UPGRADE_MAX_JSON: usize = 1024 * 1024;
 pub const LIVE_UPGRADE_LEASE_MS: u64 = 24 * 3600 * 1000;
+pub const LIVE_UPGRADE_MAX_SOURCE_DIFF: usize = 128 * 1024;
+
+pub fn valid_source_revision(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
 
 /// 宿主准备阶段签发的内容绑定；模型只能选摘要，不能补写或放宽校验字段。
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -46,6 +54,16 @@ pub struct UpgradeRequest {
     pub lease: Option<UpgradeLease>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestartRequest {
+    pub format_version: u8,
+    pub action: String,
+    pub session_id: String,
+    pub requested_by: String,
+    pub turn_id: u64,
+}
+
 /// Python 监督器定期原子保存；附加状态只作为数据，不能授予权限。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,4 +76,13 @@ pub struct UpgradeSupervisor {
     pub candidate_sha256: Option<String>,
     pub result: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub restart_supported: bool,
+    /// 由宿主从已验证且干净的在线源码生成；未知基线不能准备新候选。
+    #[serde(default)]
+    pub active_source_revision: Option<String>,
+    #[serde(default)]
+    pub active_candidate_sha256: Option<String>,
+    #[serde(default)]
+    pub host_nonce: Option<String>,
 }

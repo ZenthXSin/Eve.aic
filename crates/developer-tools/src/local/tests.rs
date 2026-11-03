@@ -43,6 +43,29 @@ fn file(path: &str) -> FileArguments {
     }
 }
 
+#[test]
+fn observation_capabilities_match_the_backend_root_and_command_switch() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let mut settings = config(root.path());
+    settings.workspace = root.path().join(".");
+    settings.commands = false;
+    let backend =
+        LocalDeveloper::new(settings.clone(), ledger.path().join("read-only"), None).unwrap();
+    assert_eq!(
+        backend.observation_capabilities(),
+        Some(DeveloperObservationCapabilities {
+            workspace: root.path().canonicalize().unwrap(),
+            processes: false,
+        })
+    );
+    settings.commands = true;
+    let backend = LocalDeveloper::new(settings, ledger.path().join("commands"), None).unwrap();
+    let capabilities = backend.observation_capabilities().unwrap();
+    assert_eq!(capabilities.workspace, root.path().canonicalize().unwrap());
+    assert!(capabilities.processes);
+}
+
 #[tokio::test]
 async fn explicit_member_policy_isolates_project_and_does_not_grant_upgrade_or_shared_root() {
     struct Members;
@@ -189,7 +212,9 @@ async fn identity_paths_and_corrupt_journal_are_rejected_without_cleanup() {
             .await
             .is_err()
     );
-    assert!(!ledger.path().join("operations.jsonl").exists());
+    let rejected = fs::read_to_string(ledger.path().join("operations.jsonl")).unwrap();
+    assert!(rejected.contains("preflight_rejected"));
+    assert!(!rejected.contains("\"state\":\"started\""));
     for path in ["../private", "/etc/passwd", ".git/config", "C:/config.json"] {
         assert!(
             backend
@@ -229,7 +254,8 @@ async fn public_github_allows_guest_write_without_granting_local_tools() {
         ledger.path().into(),
         Some("SYNTHETIC_GITHUB_TOKEN".into()),
     )
-    .unwrap();
+    .unwrap()
+    .with_action_reviewer(Arc::new(super::security_tests::Allow));
     backend.api = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
     let write = GithubArguments {
         method: "PATCH".into(),
@@ -255,7 +281,12 @@ async fn public_github_allows_guest_write_without_granting_local_tools() {
             .unwrap();
     });
     let result = backend
-        .execute(DeveloperOperation::Github(write.clone()), context("guest"))
+        .execute(
+            DeveloperOperation::Github(write.clone()),
+            context("guest").with_review_user_messages(Arc::new(vec![
+                "更新 foreign/repo 的 issue 1 标题为 updated".into(),
+            ])),
+        )
         .await
         .unwrap();
     assert_eq!(result["success"], true);
@@ -272,7 +303,17 @@ async fn public_github_allows_guest_write_without_granting_local_tools() {
             timeout_ms: None,
         }),
     ] {
-        assert!(backend.execute(operation, context("guest")).await.is_err());
+        assert!(
+            backend
+                .execute(
+                    operation,
+                    context("guest").with_review_user_messages(Arc::new(vec![
+                        "更新 foreign/repo 的 issue 1 标题为 updated".into()
+                    ]))
+                )
+                .await
+                .is_err()
+        );
     }
     assert!(
         backend
@@ -292,7 +333,12 @@ async fn public_github_allows_guest_write_without_granting_local_tools() {
     .unwrap();
     assert!(
         restricted
-            .execute(DeveloperOperation::Github(write.clone()), context("guest"))
+            .execute(
+                DeveloperOperation::Github(write.clone()),
+                context("guest").with_review_user_messages(Arc::new(vec![
+                    "更新 foreign/repo 的 issue 1 标题为 updated".into()
+                ]))
+            )
             .await
             .is_err()
     );
@@ -306,7 +352,12 @@ async fn public_github_allows_guest_write_without_granting_local_tools() {
     .unwrap();
     assert!(
         owners
-            .execute(DeveloperOperation::Github(write.clone()), context("guest"))
+            .execute(
+                DeveloperOperation::Github(write.clone()),
+                context("guest").with_review_user_messages(Arc::new(vec![
+                    "更新 foreign/repo 的 issue 1 标题为 updated".into()
+                ]))
+            )
             .await
             .is_err()
     );
@@ -314,7 +365,12 @@ async fn public_github_allows_guest_write_without_granting_local_tools() {
     let no_token = LocalDeveloper::new(settings, ledger.path().into(), None).unwrap();
     assert!(
         no_token
-            .execute(DeveloperOperation::Github(write), context("guest"))
+            .execute(
+                DeveloperOperation::Github(write),
+                context("guest").with_review_user_messages(Arc::new(vec![
+                    "更新 foreign/repo 的 issue 1 标题为 updated".into()
+                ]))
+            )
             .await
             .is_err()
     );
@@ -832,7 +888,8 @@ async fn real_command_status_output_limits_cancellation_and_timeout_kill_descend
         ledger.path().into(),
         Some("SYNTHETIC_TOKEN".into()),
     )
-    .unwrap();
+    .unwrap()
+    .with_command_policy(Arc::new(ScriptPolicy));
     let command = |script: &str, limit| {
         DeveloperOperation::Command(CommandArguments {
             owner_confirmed: false,
@@ -887,6 +944,7 @@ async fn real_command_status_output_limits_cancellation_and_timeout_kill_descend
 async fn upgrade_runs_real_rust_checks_and_builds_an_immutable_candidate_without_activation() {
     let root = tempfile::tempdir().unwrap();
     let ledger = tempfile::tempdir().unwrap();
+    let queue = tempfile::tempdir().unwrap();
     fs::create_dir_all(root.path().join("crates/eve-app/src/bin")).unwrap();
     fs::write(
         root.path().join("Cargo.toml"),
@@ -910,6 +968,23 @@ async fn upgrade_runs_real_rust_checks_and_builds_an_immutable_candidate_without
     .unwrap();
     fs::write(root.path().join(".gitignore"), "/target/\n").unwrap();
     fs::write(root.path().join("AGENT.md"), "合成候选身份资料").unwrap();
+    fs::create_dir_all(root.path().join("scripts")).unwrap();
+    for name in [
+        "build_resources.py",
+        "self_upgrade_runtime.py",
+        "source_update.py",
+    ] {
+        fs::write(
+            root.path().join("scripts").join(name),
+            "# runtime fixture\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.path().join("scripts/verify-self-upgrade.py"),
+        "from pathlib import Path\nimport sys\nprint('runtime fixture executed')\nsys.exit(9 if Path('reject-runtime').exists() else 0)\n",
+    )
+    .unwrap();
     fs::create_dir_all(root.path().join("connectors/qqbot")).unwrap();
     for name in [
         "bridge.mjs",
@@ -958,8 +1033,32 @@ async fn upgrade_runs_real_rust_checks_and_builds_an_immutable_candidate_without
     }
     let mut c = config(root.path());
     c.self_upgrade = true;
+    c.live_upgrade = Some(queue.path().into());
     c.cargo_program = wrapper.to_string_lossy().into_owned();
     c.command_timeout_ms = 60_000;
+    let baseline = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root.path())
+        .output()
+        .unwrap();
+    let baseline = String::from_utf8(baseline.stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let refresh = || {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        fs::write(
+            queue.path().join("supervisor.json"),
+            json!({"format_version":1,"pid":1,"heartbeat_ms":now,
+            "phase":"running","active_sha256":"b".repeat(64),"active_source_revision":baseline})
+            .to_string(),
+        )
+        .unwrap();
+    };
+    refresh();
     // 工作区即使残留旧调试产物，也只能发布本次优化构建生成的候选。
     fs::create_dir_all(root.path().join("target/debug")).unwrap();
     fs::write(
@@ -967,15 +1066,29 @@ async fn upgrade_runs_real_rust_checks_and_builds_an_immutable_candidate_without
         b"stale debug output",
     )
     .unwrap();
-    let backend = LocalDeveloper::new(c, ledger.path().into(), None).unwrap();
+    let backend = LocalDeveloper::new(c, ledger.path().into(), None)
+        .unwrap()
+        .with_action_reviewer(Arc::new(super::security_tests::Allow));
     let result = backend
-        .execute(DeveloperOperation::PrepareUpgrade, context("owner"))
+        .execute(
+            DeveloperOperation::PrepareUpgrade,
+            context("owner").with_review_user_messages(Arc::new(vec![
+                "请构建并验证本次完整源码，准备升级候选".into(),
+            ])),
+        )
         .await
         .unwrap();
     assert_eq!(result["success"], true, "{result}");
     assert_eq!(result["prepared"], true);
     assert_eq!(result["applied"], false);
     assert_eq!(result["checks"].as_array().unwrap().len(), 4);
+    assert_eq!(result["checks"][2]["steps"].as_array().unwrap().len(), 2);
+    assert!(
+        result["checks"][2]["steps"][1]["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("runtime fixture executed")
+    );
     // 完整检查复用 release；自升级不能再生成第二套 debug 依赖与测试产物。
     assert_eq!(
         fs::read_dir(root.path().join("target/debug"))
@@ -1000,8 +1113,19 @@ async fn upgrade_runs_real_rust_checks_and_builds_an_immutable_candidate_without
     );
     let manifest_path = candidate.parent().unwrap().join("manifest.json");
     let frozen_manifest = fs::read(&manifest_path).unwrap();
+    assert_eq!(result["source_diff"]["base_revision"], baseline);
+    assert_eq!(
+        fs::read(candidate.parent().unwrap().join("source-diff.patch")).unwrap(),
+        b""
+    );
+    refresh();
     let repeated = backend
-        .execute(DeveloperOperation::PrepareUpgrade, context("owner"))
+        .execute(
+            DeveloperOperation::PrepareUpgrade,
+            context("owner").with_review_user_messages(Arc::new(vec![
+                "请构建并验证本次完整源码，准备升级候选".into(),
+            ])),
+        )
         .await
         .unwrap();
     assert_eq!(repeated["candidate_sha256"], result["candidate_sha256"]);
@@ -1023,12 +1147,58 @@ async fn upgrade_runs_real_rust_checks_and_builds_an_immutable_candidate_without
     assert_eq!(fs::read_to_string(resource).unwrap(), "合成候选身份资料");
     // 结束上面的构建输出篡改场景；下一次只改变运行资源，保持原二进制。
     fs::copy(&candidate, root.path().join("target/release/eve-qqbot")).unwrap();
+    refresh();
+    assert!(
+        backend
+            .execute(
+                DeveloperOperation::PrepareUpgrade,
+                context("owner").with_review_user_messages(Arc::new(vec![
+                    "请构建并验证本次完整源码，准备升级候选".into()
+                ]))
+            )
+            .await
+            .is_err(),
+        "未提交源码不能冒充干净候选"
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qam",
+                "change runtime resource"
+            ])
+            .current_dir(root.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    refresh();
     let later = backend
-        .execute(DeveloperOperation::PrepareUpgrade, context("owner"))
+        .execute(
+            DeveloperOperation::PrepareUpgrade,
+            context("owner").with_review_user_messages(Arc::new(vec![
+                "请构建并验证本次完整源码，准备升级候选".into(),
+            ])),
+        )
         .await
         .unwrap();
     assert_eq!(later["binary_sha256"], result["binary_sha256"]);
     assert_ne!(later["candidate_sha256"], result["candidate_sha256"]);
+    let patch = fs::read_to_string(
+        Path::new(later["candidate_path"].as_str().unwrap())
+            .parent()
+            .unwrap()
+            .join("source-diff.patch"),
+    )
+    .unwrap();
+    assert!(
+        patch.contains("后来的源文件修改"),
+        "必须覆盖相对在线版本的已提交变更"
+    );
     // 真正的 Rust 生产者与 Python 消费者必须对候选/资源身份算出同一摘要。
     let verifier =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/self_upgrade_runtime.py");
@@ -1038,6 +1208,52 @@ async fn upgrade_runs_real_rust_checks_and_builds_an_immutable_candidate_without
     assert!(std::process::Command::new("python3").args(["-c",
         "import importlib.util,json,pathlib,sys; s=importlib.util.spec_from_file_location('upgrade',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=json.loads(sys.argv[2]); b,_,v=m.validate_candidate(r,pathlib.Path(sys.argv[3])); m.validate_lease(r,b.parent,v)",
         verifier.to_str().unwrap(), &request.to_string(), ledger.path().join("candidates").to_str().unwrap()]).status().unwrap().success());
+    fs::write(root.path().join("reject-runtime"), "reject").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["add", "reject-runtime"])
+            .current_dir(root.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "reject runtime fixture"
+            ])
+            .current_dir(root.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    refresh();
+    let count = fs::read_dir(ledger.path().join("candidates"))
+        .unwrap()
+        .count();
+    let rejected = backend
+        .execute(
+            DeveloperOperation::PrepareUpgrade,
+            context("owner").with_review_user_messages(Arc::new(vec![
+                "请构建并验证本次完整源码，准备升级候选".into(),
+            ])),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected["prepared"], false);
+    assert_eq!(rejected["checks"][2]["steps"][1]["exit_code"], 9);
+    assert_eq!(
+        fs::read_dir(ledger.path().join("candidates"))
+            .unwrap()
+            .count(),
+        count
+    );
 }
 
 #[tokio::test]
@@ -1061,31 +1277,41 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
         candidate_sha256: None,
         result: None,
         error: None,
+        restart_supported: false,
+        active_source_revision: Some("0".repeat(40)),
+        active_candidate_sha256: None,
+        host_nonce: None,
     };
     fs::write(
         queue.path().join("supervisor.json"),
         serde_json::to_vec(&status).unwrap(),
     )
     .unwrap();
-    let source = json!({"head":"0".repeat(40),"diff":"0".repeat(64),"untracked":"0".repeat(64)});
+    let source = json!({"head":"0".repeat(40),"diff":hash(b""),"untracked":hash(b"")});
+    let source_diff = json!({"path":"source-diff.patch","sha256":hash(b"complete fixture diff"),"base_revision":"0".repeat(40),"target_revision":"0".repeat(40)});
+    let runtime = json!({"host_protocol":1,"scripts":["scripts/build_resources.py","scripts/self_upgrade_runtime.py","scripts/source_update.py"]});
     let resources: BTreeMap<_, _> = [
         "AGENT.md",
         "connectors/qqbot/bridge.mjs",
         "connectors/qqbot/bridge-core.mjs",
         "connectors/qqbot/package.json",
         "connectors/qqbot/package-lock.json",
+        "scripts/build_resources.py",
+        "scripts/self_upgrade_runtime.py",
+        "scripts/source_update.py",
     ]
     .into_iter()
     .map(|name| (name, hash(b"fixture")))
     .collect();
     let binary_sha = hash(b"fixture");
     let id = hash(
-        json!({"source":source,"binary_sha256":binary_sha,"resources":resources})
+        json!({"source":source,"source_diff":source_diff,"runtime":runtime,"binary_sha256":binary_sha,"resources":resources})
             .to_string()
             .as_bytes(),
     );
     let candidate = ledger.path().join("candidates").join(&id);
     fs::create_dir_all(&candidate).unwrap();
+    fs::write(candidate.join("source-diff.patch"), "complete fixture diff").unwrap();
     let binary = candidate.join(if cfg!(windows) {
         "eve-qqbot.exe"
     } else {
@@ -1097,11 +1323,13 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, b"fixture").unwrap();
     }
-    let manifest = json!({"format_version":1,"prepared":true,"success":true,"source":source,"resources":resources,
+    let manifest = json!({"format_version":1,"prepared":true,"success":true,"source":source,"source_diff":source_diff,"runtime":runtime,"resources":resources,
         "binary_sha256":binary_sha,"candidate_path":binary,"candidate_sha256":id,
         "checks":[{"success":true},{"success":true},{"success":true},{"success":true}]});
     fs::write(candidate.join("manifest.json"), manifest.to_string()).unwrap();
-    let backend = LocalDeveloper::new(c, ledger.path().into(), None).unwrap();
+    let mut backend = LocalDeveloper::new(c, ledger.path().into(), None)
+        .unwrap()
+        .with_action_reviewer(Arc::new(super::security_tests::Allow));
     backend.issue_upgrade_lease(&candidate, manifest).unwrap();
     let operation = DeveloperOperation::ApplyUpgrade(ApplyUpgradeArguments {
         candidate_sha256: id.clone(),
@@ -1126,7 +1354,14 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
         format!(
             "{:?}",
             backend
-                .execute(operation.clone(), context("owner").with_turn_id(Some(1)))
+                .execute(
+                    operation.clone(),
+                    context("owner")
+                        .with_review_user_messages(Arc::new(vec![
+                            "应用此次通过验证的升级候选".into()
+                        ]))
+                        .with_turn_id(Some(1))
+                )
                 .await
                 .unwrap_err()
         )
@@ -1139,7 +1374,14 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
         format!(
             "{:?}",
             backend
-                .execute(operation.clone(), context("owner").with_turn_id(Some(1)))
+                .execute(
+                    operation.clone(),
+                    context("owner")
+                        .with_review_user_messages(Arc::new(vec![
+                            "应用此次通过验证的升级候选".into()
+                        ]))
+                        .with_turn_id(Some(1))
+                )
                 .await
                 .unwrap_err()
         )
@@ -1153,7 +1395,14 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
         format!(
             "{:?}",
             backend
-                .execute(operation.clone(), context("owner").with_turn_id(Some(1)))
+                .execute(
+                    operation.clone(),
+                    context("owner")
+                        .with_review_user_messages(Arc::new(vec![
+                            "应用此次通过验证的升级候选".into()
+                        ]))
+                        .with_turn_id(Some(1))
+                )
                 .await
                 .unwrap_err()
         )
@@ -1170,7 +1419,14 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
         fs::write(&path, vec![b'x'; LIVE_UPGRADE_MAX_JSON + 1]).unwrap();
         assert!(
             backend
-                .execute(operation.clone(), context("owner").with_turn_id(Some(1)))
+                .execute(
+                    operation.clone(),
+                    context("owner")
+                        .with_review_user_messages(Arc::new(vec![
+                            "应用此次通过验证的升级候选".into()
+                        ]))
+                        .with_turn_id(Some(1))
+                )
                 .await
                 .is_err()
         );
@@ -1184,8 +1440,78 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
         );
         fs::write(&path, original).unwrap();
     }
+    // 完整候选验证不能代替危险动作的独立授权审核。
+    backend.action_reviewer = None;
+    let error = backend
+        .execute(
+            operation.clone(),
+            context("owner")
+                .with_review_user_messages(Arc::new(vec!["应用此次通过验证的升级候选".into()]))
+                .with_turn_id(Some(1)),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("审核器未配置"));
+    assert!(!queue.path().join("request.json").exists());
+    for target in [
+        candidate.join("source-diff.patch"),
+        candidate.join("manifest.json"),
+        lease_path.clone(),
+    ] {
+        let old = fs::read(&target).unwrap();
+        let changed = target.clone();
+        backend.action_reviewer = Some(Arc::new(super::security_tests::UpgradeReviewer {
+            change: Box::new(move || {
+                fs::write(&changed, b"changed during independent review").unwrap();
+            }),
+        }));
+        assert!(
+            backend
+                .execute(
+                    operation.clone(),
+                    context("owner")
+                        .with_review_user_messages(Arc::new(vec![
+                            "应用此次通过验证的升级候选".into()
+                        ]))
+                        .with_turn_id(Some(1))
+                )
+                .await
+                .is_err()
+        );
+        assert!(!queue.path().join("request.json").exists());
+        fs::write(&target, old).unwrap();
+    }
+    let status_path = queue.path().join("supervisor.json");
+    let old_status = fs::read(&status_path).unwrap();
+    let changed = status_path.clone();
+    backend.action_reviewer = Some(Arc::new(super::security_tests::UpgradeReviewer {
+        change: Box::new(move || {
+            let mut value: Value = serde_json::from_slice(&fs::read(&changed).unwrap()).unwrap();
+            value["active_sha256"] = json!("e".repeat(64));
+            fs::write(&changed, value.to_string()).unwrap();
+        }),
+    }));
+    assert!(
+        backend
+            .execute(
+                operation.clone(),
+                context("owner")
+                    .with_review_user_messages(Arc::new(vec!["应用此次通过验证的升级候选".into()]))
+                    .with_turn_id(Some(1))
+            )
+            .await
+            .is_err()
+    );
+    assert!(!queue.path().join("request.json").exists());
+    fs::write(status_path, old_status).unwrap();
+    backend.action_reviewer = Some(Arc::new(super::security_tests::Allow));
     let result = backend
-        .execute(operation.clone(), context("owner").with_turn_id(Some(1)))
+        .execute(
+            operation.clone(),
+            context("owner")
+                .with_review_user_messages(Arc::new(vec!["应用此次通过验证的升级候选".into()]))
+                .with_turn_id(Some(1)),
+        )
         .await
         .unwrap();
     assert_eq!(result["queued"], true);
@@ -1195,7 +1521,12 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
     assert_eq!(request.turn_id, 1);
     assert_eq!(request.requested_by, "owner");
     backend
-        .execute(operation.clone(), context("owner").with_turn_id(Some(1)))
+        .execute(
+            operation.clone(),
+            context("owner")
+                .with_review_user_messages(Arc::new(vec!["应用此次通过验证的升级候选".into()]))
+                .with_turn_id(Some(1)),
+        )
         .await
         .unwrap();
     assert_eq!(fs::read(queue.path().join("request.json")).unwrap(), before);
@@ -1206,7 +1537,12 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
     .unwrap();
     assert!(
         backend
-            .execute(operation.clone(), context("owner").with_turn_id(Some(1)))
+            .execute(
+                operation.clone(),
+                context("owner")
+                    .with_review_user_messages(Arc::new(vec!["应用此次通过验证的升级候选".into()]))
+                    .with_turn_id(Some(1))
+            )
             .await
             .is_err()
     );
@@ -1217,9 +1553,38 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
         (LIVE_UPGRADE_MAX_JSON + 1) as u64
     );
     fs::write(queue.path().join("request.json"), &before).unwrap();
+    // 新监督器启动后 result 可以为空，重复请求按受信在线候选身份确认，不重排切换。
+    fs::remove_file(queue.path().join("request.json")).unwrap();
+    let supervisor_path = queue.path().join("supervisor.json");
+    let old_status = fs::read(&supervisor_path).unwrap();
+    let mut active: Value = serde_json::from_slice(&old_status).unwrap();
+    active["active_candidate_sha256"] = json!(id);
+    active["active_sha256"] = json!(binary_sha);
+    active["active_source_revision"] = json!("d".repeat(40));
+    active["result"] = Value::Null;
+    fs::write(&supervisor_path, active.to_string()).unwrap();
+    let already = backend
+        .execute(
+            operation.clone(),
+            context("owner")
+                .with_review_user_messages(Arc::new(vec!["应用此次通过验证的升级候选".into()]))
+                .with_turn_id(Some(2)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(already["already_active"], true);
+    assert_eq!(already["queued"], false);
+    assert!(!queue.path().join("request.json").exists());
+    fs::write(&supervisor_path, old_status).unwrap();
+    fs::write(queue.path().join("request.json"), &before).unwrap();
     assert!(
         backend
-            .execute(operation, context("owner").with_turn_id(Some(2)))
+            .execute(
+                operation,
+                context("owner")
+                    .with_review_user_messages(Arc::new(vec!["应用此次通过验证的升级候选".into()]))
+                    .with_turn_id(Some(2))
+            )
             .await
             .is_err()
     );
@@ -1339,7 +1704,7 @@ impl eve_developer_api::CommandPolicy for ScriptPolicy {
         } else if script.contains("careful") {
             Some(CommandDecision::Prompt)
         } else {
-            None
+            Some(CommandDecision::Allow)
         };
         CommandEvaluation {
             decision,
@@ -1446,7 +1811,11 @@ async fn action_reviewer_decides_prompt_commands_from_user_words_and_fails_close
         ChatMessage::text(ChatRole::User, full_user_quote.clone()),
         ChatMessage::text(ChatRole::Assistant, "好"),
     ]);
-    let talking = || context("owner").with_conversation(conversation.clone());
+    let talking = || {
+        context("owner")
+            .with_conversation(conversation.clone())
+            .with_review_user_messages(Arc::new(vec![full_user_quote.clone()]))
+    };
 
     // 审查放行：不需要模型自带 owner_confirmed。
     let allow = Arc::new(Reviewer {
@@ -1462,7 +1831,7 @@ async fn action_reviewer_decides_prompt_commands_from_user_words_and_fails_close
     let seen = allow.seen.lock().unwrap().pop().unwrap();
     assert_eq!(
         seen.user_messages,
-        vec![full_user_quote],
+        vec![full_user_quote.clone()],
         "完整保留用户原话"
     );
     assert!(!seen.delegated && !seen.claimed_confirmation);
@@ -1506,9 +1875,10 @@ async fn action_reviewer_decides_prompt_commands_from_user_words_and_fails_close
         .execute(command("careful-delegated"), talking().with_delegated(true))
         .await
         .unwrap_err();
-    assert!(format!("{error:?}").contains("没有人在场"), "{error:?}");
+    assert!(format!("{error:?}").contains("未放行"), "{error:?}");
     let seen = delegated.seen.lock().unwrap().pop().unwrap();
-    assert!(seen.delegated && seen.user_messages.is_empty());
+    assert!(seen.delegated);
+    assert_eq!(seen.user_messages, vec![full_user_quote.clone()]);
 
     // 不需要确认的命令不经过审查；禁止的命令也不交给审查者放行。
     let untouched = Arc::new(Reviewer {
@@ -1546,7 +1916,9 @@ fn review_preserves_six_long_quotes_and_complete_command_with_bounded_summaries(
         })
         .collect();
     messages.push(assistant);
-    let context = context("owner").with_conversation(Arc::new(messages));
+    let context = context("owner")
+        .with_conversation(Arc::new(messages))
+        .with_review_user_messages(Arc::new(quotes.clone()));
     let command = CommandArguments {
         program: "sh".into(),
         args: vec![
@@ -1571,7 +1943,7 @@ fn review_preserves_six_long_quotes_and_complete_command_with_bounded_summaries(
     );
     assert!(request.validate_capacity().is_ok());
     let delegated = review_request(&command, "审核".into(), &context.with_delegated(true)).unwrap();
-    assert!(delegated.user_messages.is_empty());
+    assert_eq!(delegated.user_messages, quotes[1..]);
 }
 
 #[cfg(unix)]
@@ -1605,12 +1977,12 @@ async fn review_overflow_and_audit_failure_never_execute_a_command() {
             timeout_ms: None,
         })
     };
-    let too_long = Arc::new(vec![eve_llm_api::ChatMessage::text(
-        eve_llm_api::ChatRole::User,
-        "长".repeat(MAX_ACTION_REVIEW_BYTES),
-    )]);
+    let too_long = Arc::new(vec!["长".repeat(MAX_ACTION_REVIEW_BYTES)]);
     let error = backend
-        .execute(operation(), context("owner").with_conversation(too_long))
+        .execute(
+            operation(),
+            context("owner").with_review_user_messages(too_long),
+        )
         .await
         .unwrap_err();
     assert!(format!("{error:?}").contains("未裁剪"));
@@ -1652,4 +2024,202 @@ async fn expired_context_cannot_write_or_pass_developer_preflight() {
         backend.preflight(&DeveloperOperation::Write(arguments), &expired),
         Err(ToolExecutionError::Cancelled(_))
     ));
+}
+
+#[tokio::test]
+async fn restart_is_strict_authorized_turn_bound_and_exclusive() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let queue = tempfile::tempdir().unwrap();
+    let mut c = config(root.path());
+    c.self_upgrade = true;
+    c.live_upgrade = Some(queue.path().into());
+    c.operators.insert("admin".into());
+    let backend = LocalDeveloper::new(c.clone(), ledger.path().into(), None).unwrap();
+    let tools = crate::tools(&c, Arc::new(backend));
+    let tool = tools
+        .iter()
+        .find(|tool| tool.definition().name == "restart_self")
+        .unwrap();
+    assert!(tool.validate_arguments(&json!({})).is_ok());
+    for invalid in [
+        json!(null),
+        json!([]),
+        json!({"action":"restart"}),
+        json!({"turn_id":1}),
+    ] {
+        assert!(tool.validate_arguments(&invalid).is_err());
+    }
+    assert_eq!(
+        tool.definition().argument_schema["additionalProperties"],
+        false
+    );
+    assert!(
+        crate::operation_for_tool("restart_self", &json!({}))
+            .unwrap()
+            .is_ok()
+    );
+    let backend = LocalDeveloper::new(c, ledger.path().into(), None)
+        .unwrap()
+        .with_action_reviewer(Arc::new(super::security_tests::Allow));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut status = UpgradeSupervisor {
+        format_version: 1,
+        pid: 1,
+        heartbeat_ms: now,
+        phase: "running".into(),
+        active_sha256: "b".repeat(64),
+        candidate_sha256: None,
+        result: None,
+        error: None,
+        restart_supported: false,
+        active_source_revision: Some("0".repeat(40)),
+        active_candidate_sha256: None,
+        host_nonce: None,
+    };
+    let status_path = queue.path().join("supervisor.json");
+    fs::write(&status_path, serde_json::to_vec(&status).unwrap()).unwrap();
+    assert!(
+        backend
+            .execute(
+                DeveloperOperation::RestartSelf,
+                context("owner")
+                    .with_turn_id(Some(1))
+                    .with_review_user_messages(Arc::new(vec!["请重启 Eve".into()]))
+            )
+            .await
+            .is_err()
+    );
+    assert!(!queue.path().join("request.json").exists());
+    status.restart_supported = true;
+    fs::write(&status_path, serde_json::to_vec(&status).unwrap()).unwrap();
+    let observed = backend
+        .execute(DeveloperOperation::UpgradeStatus, context("owner"))
+        .await
+        .unwrap();
+    assert_eq!(observed["restart_supported"], true);
+    for ctx in [
+        context("stranger").with_turn_id(Some(1)),
+        context("owner")
+            .with_turn_id(Some(1))
+            .with_review_user_messages(Arc::new(vec!["请重启 Eve".into()]))
+            .with_delegated(true),
+        context("owner"),
+        context("owner").with_turn_id(Some(0)),
+        ToolExecutionContext::new().with_turn_id(Some(1)),
+        ToolExecutionContext::new()
+            .with_scope(Some(ContextScope {
+                session_id: " ".into(),
+                user_id: "owner".into(),
+            }))
+            .with_turn_id(Some(1)),
+    ] {
+        assert!(
+            backend
+                .preflight(&DeveloperOperation::RestartSelf, &ctx)
+                .is_err()
+        );
+        assert!(
+            backend
+                .execute(DeveloperOperation::RestartSelf, ctx)
+                .await
+                .is_err()
+        );
+    }
+    assert!(!queue.path().join("request.json").exists());
+    for phase in ["switching", "failed"] {
+        status.phase = phase.into();
+        fs::write(&status_path, serde_json::to_vec(&status).unwrap()).unwrap();
+        assert!(
+            backend
+                .execute(
+                    DeveloperOperation::RestartSelf,
+                    context("owner")
+                        .with_turn_id(Some(1))
+                        .with_review_user_messages(Arc::new(vec!["请重启 Eve".into()]))
+                )
+                .await
+                .is_err()
+        );
+    }
+    status.phase = "running".into();
+    status.heartbeat_ms = 0;
+    fs::write(&status_path, serde_json::to_vec(&status).unwrap()).unwrap();
+    assert!(
+        backend
+            .execute(
+                DeveloperOperation::RestartSelf,
+                context("owner")
+                    .with_turn_id(Some(1))
+                    .with_review_user_messages(Arc::new(vec!["请重启 Eve".into()]))
+            )
+            .await
+            .is_err()
+    );
+    fs::write(&status_path, b"not json").unwrap();
+    assert!(
+        backend
+            .execute(
+                DeveloperOperation::RestartSelf,
+                context("owner")
+                    .with_turn_id(Some(1))
+                    .with_review_user_messages(Arc::new(vec!["请重启 Eve".into()]))
+            )
+            .await
+            .is_err()
+    );
+    status.heartbeat_ms = now;
+    fs::write(&status_path, serde_json::to_vec(&status).unwrap()).unwrap();
+    let target = queue.path().join("request.json");
+    for existing in [
+        b"invalid".as_slice(),
+        br#"{"format_version":1,"candidate_sha256":"upgrade"}"#.as_slice(),
+    ] {
+        fs::write(&target, existing).unwrap();
+        assert!(
+            backend
+                .execute(
+                    DeveloperOperation::RestartSelf,
+                    context("owner")
+                        .with_turn_id(Some(1))
+                        .with_review_user_messages(Arc::new(vec!["请重启 Eve".into()]))
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(&target).unwrap(), existing);
+        fs::remove_file(&target).unwrap();
+    }
+    let result = backend
+        .execute(
+            DeveloperOperation::RestartSelf,
+            context("admin")
+                .with_turn_id(Some(42))
+                .with_review_user_messages(Arc::new(vec!["请重启 Eve".into()])),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["queued"], true);
+    assert_eq!(result["restarted"], false);
+    let before = fs::read(&target).unwrap();
+    let request: Value = serde_json::from_slice(&before).unwrap();
+    assert_eq!(
+        request,
+        json!({"format_version":1,"action":"restart","session_id":"test-session","requested_by":"admin","turn_id":42})
+    );
+    assert!(
+        backend
+            .execute(
+                DeveloperOperation::RestartSelf,
+                context("admin")
+                    .with_turn_id(Some(42))
+                    .with_review_user_messages(Arc::new(vec!["请重启 Eve".into()]))
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(&target).unwrap(), before);
 }

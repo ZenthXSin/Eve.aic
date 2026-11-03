@@ -1,5 +1,7 @@
 //! QQ 装配的脚本插件工具适配；叶子工具与直接工具调用共用宿主授权策略。
+mod code;
 mod permission;
+mod update;
 use eve_llm_api::{
     Tool, ToolCall, ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolExecutionError,
     ToolFuture, ToolValidationError,
@@ -70,6 +72,11 @@ fn rejected(error: impl ToString) -> ToolExecutionError {
 
 struct LateDispatch(OnceLock<CheckedTools>);
 impl AuthorizedToolDispatch for LateDispatch {
+    fn parallel_safe(&self, name: &str) -> bool {
+        self.0
+            .get()
+            .is_some_and(|dispatch| dispatch.parallel_safe(name))
+    }
     fn preflight_tool(&self, name: &str, context: &ToolExecutionContext) -> Result<()> {
         self.0
             .get()
@@ -188,6 +195,8 @@ impl ScriptTools {
             })
             .collect();
         tools.push(permission::tool(self.dispatch.clone()));
+        tools.push(code::tool(self.clone()));
+        tools.push(update::tool(self.clone()));
         tools
     }
 }
@@ -472,6 +481,135 @@ mod tests {
         )
         .await
     }
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn hot_update_isolated_plugin_preserves_old_binding_and_other_plugin_across_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let host = ScriptTools::open(root.path(), isolated_sandbox(), Arc::new(Deny)).unwrap();
+        host.bind_tools(vec![]).unwrap();
+        let tools = host.tools();
+        let update = tools
+            .iter()
+            .find(|tool| tool.definition().name == "update_script_plugin")
+            .unwrap();
+        let ctx = context();
+        let old = execute(update, "update-old", json!({"spec":spec()}), ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(old["host_rebuilt"], false);
+        let old: VersionRef = serde_json::from_value(old["version"].clone()).unwrap();
+        let bound = host.runtime.bind(ctx.scope().unwrap(), &old).unwrap();
+        let mut other = spec();
+        other.name = "unrelated".into();
+        let other = execute(update, "other", json!({"spec":other}), ctx.clone())
+            .await
+            .unwrap();
+        let mut next = spec();
+        next.source = "import json\ninput()\nprint(json.dumps({'op':'return','value':{'new':True}}),flush=True)\n".into();
+        let current = execute(update, "update-new", json!({"spec":next}), ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(current["previous"], json!(old));
+        let current: VersionRef = serde_json::from_value(current["version"].clone()).unwrap();
+        let receipt = host
+            .runtime
+            .run(&bound, "still-old", json!({}), ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(receipt.result, Some(json!({"local":true})));
+        let mut invalid = spec();
+        invalid.state_schema.version = 2;
+        assert!(
+            execute(
+                update,
+                "missing-migration",
+                json!({"spec":invalid}),
+                ctx.clone()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            host.store
+                .selected(ctx.scope().unwrap(), &old.script)
+                .unwrap(),
+            current
+        );
+        assert_eq!(
+            json!(
+                host.store
+                    .selected(ctx.scope().unwrap(), "unrelated")
+                    .unwrap()
+            ),
+            other["version"]
+        );
+        drop(tools);
+        drop(host);
+        let reopened = service(root.path());
+        assert_eq!(
+            reopened
+                .store
+                .selected(ctx.scope().unwrap(), &old.script)
+                .unwrap(),
+            current
+        );
+        reopened
+            .store
+            .activate(ctx.scope().unwrap(), &old, None)
+            .unwrap();
+        assert_eq!(
+            reopened
+                .store
+                .selected(ctx.scope().unwrap(), &old.script)
+                .unwrap(),
+            old
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn code_tool_reuses_version_and_refuses_replay_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let host = ScriptTools::open(root.path(), isolated_sandbox(), Arc::new(Deny)).unwrap();
+        host.bind_tools(vec![]).unwrap();
+        let tools = host.tools();
+        let code = tools
+            .iter()
+            .find(|tool| tool.definition().name == "run_tool_code")
+            .unwrap();
+        let args = json!({"code":"text(args.number);", "tools":[],"arguments":{"number":7}});
+        let first = execute(code, "code-first", args.clone(), context())
+            .await
+            .unwrap();
+        assert_eq!(first["result"], json!({"output":[7]}));
+        let second = execute(code, "code-second", args.clone(), context())
+            .await
+            .unwrap();
+        assert_eq!(first["version"], second["version"]);
+        assert_eq!(
+            host.store.list(context().scope().unwrap()).unwrap().len(),
+            1
+        );
+        drop(tools);
+        drop(host);
+        let host = ScriptTools::open(root.path(), isolated_sandbox(), Arc::new(Deny)).unwrap();
+        host.bind_tools(vec![]).unwrap();
+        let tools = host.tools();
+        let code = tools
+            .iter()
+            .find(|tool| tool.definition().name == "run_tool_code")
+            .unwrap();
+        assert!(execute(code, "code-first", args, context()).await.is_err());
+        let receipt = host
+            .store
+            .receipt(
+                context().scope().unwrap(),
+                first["call_id"].as_str().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(receipt.result, Some(json!({"output":[7]})));
+    }
+
     #[tokio::test]
     async fn adapter_reads_exact_cold_version_after_restart_without_cross_scope_access() {
         let root = tempfile::tempdir().unwrap();

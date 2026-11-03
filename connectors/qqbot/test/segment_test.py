@@ -100,7 +100,7 @@ class SegmentAcceptance(unittest.TestCase):
                 if item["source"]["kind"] == "CompletedInteraction"]
 
     def message(self, id, text=TEXT, segments=PARTS, **extra):
-        message = {"id": id, "text": text, "scope": "c2c", "user_id": "user-1", "target_id": "user-1",
+        message = {"id": id, "text": text, "original_text": text, "scope": "c2c", "user_id": "user-1", "target_id": "user-1",
                    "expected_type": "reply", **extra}
         if segments is None:
             message.setdefault("expected", text)
@@ -131,7 +131,7 @@ class SegmentAcceptance(unittest.TestCase):
         bootstrap_test_admin(self.work / "state", env,
                              users=getattr(self, "fixture_admin_users", ("user-1", "user-2")))
         bootstrap_fixture_groups(self.work / "state", scenario)
-        command = [str(BINARY), "--state-dir", str(self.work / "state"), "--agent", str(ROOT / "AGENT.md"),
+        command = [str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "state"), "--agent", str(ROOT / "AGENT.md"),
                    "--bridge-script", str(FAKE), "--bridge-arg", str(scenario)]
         if segmented:
             command.append("--segmented")

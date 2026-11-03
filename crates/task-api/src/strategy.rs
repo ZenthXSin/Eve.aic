@@ -86,7 +86,7 @@ impl TaskEvaluationContract {
             validate_id(&check.tool)?;
             if matches!(
                 check.tool.as_str(),
-                "echo" | "task_progress" | "run_subagent" | "dispatch_task"
+                "echo" | "task_progress" | "register_task_wait" | "run_subagent" | "dispatch_task"
             ) || !check.arguments.is_object()
                 || serde_json::to_vec(&check.arguments)
                     .map_err(|_| TaskError::InvalidInput)?

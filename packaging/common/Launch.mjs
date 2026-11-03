@@ -120,8 +120,12 @@ async function main() {
     if (mode === 'qq') {
       if (!validText(config.qq.app_secret)) { config.qq.app_secret = await readSecret('请输入 QQ App Secret'); changed = true; }
       if (config.jev.enabled && !validText(config.jev.api_key)) { config.jev.api_key = await readSecret('请输入 OpenRouter / Jev 密钥'); changed = true; }
-      if (!validText(config.web.token)) { config.web.token = randomBytes(32).toString('hex'); changed = true; }
     }
+  }
+  const tokenMissing = config.web?.token === undefined || (typeof config.web?.token === 'string' && !validText(config.web.token));
+  if (!options.validateOnly && (mode === 'qq' || mode === 'web') && tokenMissing) {
+    config.web ??= {};
+    config.web.token = randomBytes(32).toString('hex'); changed = true;
   }
   validate(config);
   if (mode === 'panel') {
@@ -204,6 +208,7 @@ async function main() {
     env.EVE_SCRIPT_NODE = nodePath;
     // 默认装配自然对话能力；主动探索仍需可信主人经审核授予持久预算。
     if (config.features.autonomous_tools !== false) args.push('--background-tasks', '--subagents', '--triggers', '--sleep', '--workflow-tools', '--health-watch');
+    else args.push('--minimal-profile');
     if (options.bridgeArg) args.push('--bridge-arg', options.bridgeArg);
     for (const [key, flag] of [['training', '--training'], ['cognition', '--cognition'], ['self_learning', '--self-learning'], ['memory_recall', '--memory-recall']]) {
       if (config.features[key]) args.push(flag);

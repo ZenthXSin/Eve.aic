@@ -485,43 +485,80 @@ impl SubjectAdmin for SubjectController {
             })
         })
     }
-    fn upsert_focus(&self, mut focus: SubjectFocus, now_ms: u64) -> SubjectResult<SubjectFocus> {
+    fn upsert_focus(&self, focus: SubjectFocus, now_ms: u64) -> SubjectResult<SubjectFocus> {
+        self.upsert_foci(vec![focus], now_ms)?
+            .pop()
+            .ok_or(SubjectError::InvalidInput)
+    }
+    fn upsert_foci(
+        &self,
+        mut foci: Vec<SubjectFocus>,
+        now_ms: u64,
+    ) -> SubjectResult<Vec<SubjectFocus>> {
         check_time(now_ms)?;
-        focus.updated_at_ms = now_ms;
-        validate_focus(&focus)?;
+        if foci.is_empty() {
+            return Err(SubjectError::InvalidInput);
+        }
         // 新建/修改关注都不能绕过半小时检查间隔。
-        focus.next_check_at_ms = focus.next_check_at_ms.max(
-            now_ms
-                .checked_add(AUTONOMY_INTERVAL_MS)
-                .ok_or(SubjectError::InvalidInput)?,
-        );
-        self.update(|ledger| {
-            if let Some(existing) = ledger
-                .foci
-                .iter_mut()
-                .find(|f| f.id == focus.id && f.scope == focus.scope)
-            {
-                if now_ms < existing.updated_at_ms {
-                    return Err(SubjectError::InvalidInput);
-                }
-                *existing = focus.clone();
-            } else {
-                if ledger.foci.len() >= MAX_FOCI {
-                    let oldest = ledger
-                        .foci
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, f)| {
-                            matches!(f.status, FocusStatus::Completed | FocusStatus::Cancelled)
-                        })
-                        .min_by_key(|(_, f)| f.updated_at_ms)
-                        .map(|(i, _)| i)
-                        .ok_or(SubjectError::LimitReached)?;
-                    ledger.foci.remove(oldest);
-                }
-                ledger.foci.push(focus.clone());
+        let earliest_check = now_ms
+            .checked_add(AUTONOMY_INTERVAL_MS)
+            .ok_or(SubjectError::InvalidInput)?;
+        let mut protected = BTreeSet::new();
+        for focus in &mut foci {
+            focus.updated_at_ms = now_ms;
+            validate_focus(focus)?;
+            focus.next_check_at_ms = focus.next_check_at_ms.max(earliest_check);
+            if !protected.insert((focus.scope.clone(), focus.id.clone())) {
+                return Err(SubjectError::InvalidInput);
             }
-            Ok(focus)
+        }
+        if foci.len() > MAX_FOCI {
+            return Err(SubjectError::LimitReached);
+        }
+        self.update(|ledger| {
+            let mut additions = 0;
+            for focus in &foci {
+                if let Some(existing) = ledger
+                    .foci
+                    .iter()
+                    .find(|f| f.id == focus.id && f.scope == focus.scope)
+                {
+                    if now_ms < existing.updated_at_ms {
+                        return Err(SubjectError::InvalidInput);
+                    }
+                } else {
+                    additions += 1;
+                }
+            }
+            // 连同被更新的关注一起保护，避免先保存的契约在后续输入写入时被容量回收。
+            for _ in 0..(ledger.foci.len() + additions).saturating_sub(MAX_FOCI) {
+                let oldest = ledger
+                    .foci
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, focus)| {
+                        matches!(
+                            focus.status,
+                            FocusStatus::Completed | FocusStatus::Cancelled
+                        ) && !protected.contains(&(focus.scope.clone(), focus.id.clone()))
+                    })
+                    .min_by_key(|(_, focus)| focus.updated_at_ms)
+                    .map(|(index, _)| index)
+                    .ok_or(SubjectError::LimitReached)?;
+                ledger.foci.remove(oldest);
+            }
+            for focus in &foci {
+                if let Some(existing) = ledger
+                    .foci
+                    .iter_mut()
+                    .find(|f| f.id == focus.id && f.scope == focus.scope)
+                {
+                    *existing = focus.clone();
+                } else {
+                    ledger.foci.push(focus.clone());
+                }
+            }
+            Ok(foci)
         })
     }
     fn schedule_due(&self, now_ms: u64) -> SubjectResult<usize> {

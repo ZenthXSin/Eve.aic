@@ -74,6 +74,25 @@ pub(crate) fn install_with_member_runtime_backend(
     member_runtime: Option<eve_developer_api::MemberRuntime>,
     reviewer: Option<Arc<dyn ActionReviewer>>,
 ) -> Result<Option<Arc<dyn eve_developer_api::DeveloperBackend>>, AppError> {
+    install_with_member_runtime_backend_profile(
+        bootstrap,
+        state,
+        authorization,
+        member_runtime,
+        reviewer,
+        false,
+    )
+}
+
+/// 产品默认能力由入口明确选择，不依据模型 URL 是否环回来暗中改变工具集合。
+pub(crate) fn install_with_member_runtime_backend_profile(
+    bootstrap: &mut CoreBootstrap,
+    state: &Path,
+    authorization: Option<Arc<dyn eve_developer_api::DeveloperAuthorization>>,
+    member_runtime: Option<eve_developer_api::MemberRuntime>,
+    reviewer: Option<Arc<dyn ActionReviewer>>,
+    automatic_capabilities: bool,
+) -> Result<Option<Arc<dyn eve_developer_api::DeveloperBackend>>, AppError> {
     let config: DeveloperConfig = if let Some(path) = std::env::var_os("EVE_DEVELOPER_CONFIG") {
         let bytes = std::fs::read(path).map_err(|_| "开发工具配置文件无法读取；保留原文件")?;
         if bytes.len() > 32 * 1024 {
@@ -81,7 +100,7 @@ pub(crate) fn install_with_member_runtime_backend(
         }
         serde_json::from_slice(&bytes)
             .map_err(|_| "开发工具配置无效；不能在配置内填写 token 正文")?
-    } else if direct_tools_enabled() {
+    } else if automatic_capabilities || direct_tools_enabled() {
         let workspace =
             std::env::current_dir().map_err(|_| "无法确定 Eve 工作目录；未装配开发工具")?;
         // 主人默认会话直接拥有受限开发工具；自升级准备、命令策略和行动审查生效。
@@ -120,7 +139,8 @@ pub(crate) fn install_with_member_runtime_backend(
         .storage_directory
         .clone()
         .unwrap_or_else(|| state.join("developer-tools"));
-    let mut backend = eve_developer_tools::LocalDeveloper::new(config.clone(), storage, token)?;
+    let mut backend = eve_developer_tools::LocalDeveloper::new(config.clone(), storage, token)?
+        .with_session_workspaces(config.live_upgrade.is_some());
     if let Some(authorization) = authorization {
         backend = backend.with_authorization(authorization);
     }
@@ -144,12 +164,12 @@ pub(crate) fn install_with_member_runtime_backend(
     // 期限只在显式启用开发工具时扩大，普通对话和旧配置保持原值。
     bootstrap.host_config.tool_timeout = Duration::from_millis(config.command_timeout_ms + 30_000);
     if config.self_upgrade {
-        // 自升级连续执行四次 Cargo 验收、前后源码指纹和元数据查询；
+        // 自升级连续执行四次 Cargo 与两次隔离进程验收、源码指纹和元数据查询；
         // 外层必须容纳整条管线，不能沿用单个命令期限而提前取消正常构建。
         // 每条命令的期限、用户取消和父任务总期限仍然生效。
         bootstrap.host_config.tool_timeout_overrides.insert(
             "prepare_self_upgrade".into(),
-            Duration::from_millis(config.command_timeout_ms * 4 + 240_000),
+            Duration::from_millis(config.command_timeout_ms * 6 + 300_000),
         );
     }
     bootstrap

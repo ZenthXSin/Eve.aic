@@ -41,7 +41,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-pub use steering::{TurnSteering, TurnSteeringSource};
+pub use steering::{SteeringBatch, TurnSteering, TurnSteeringSource};
 pub use usage::{ModelUsage, ModelUsageObserver, PrefixReuse};
 
 pub type LlmFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, LlmError>> + Send + 'a>>;
@@ -676,6 +676,32 @@ pub struct ContextScope {
     pub user_id: String,
 }
 
+/// 通道验证和持久化后的独立用户原文来源。引用、附件提示、模型上下文不是授权证据。
+/// None 表示此来源不处理该通道；Some(empty) 表示该范围没有可用的真实用户原话。
+pub trait ReviewUserMessageSource: Send + Sync {
+    fn read(&self, scope: &ContextScope) -> Result<Option<Vec<String>>, LlmError>;
+    /// 可信宿主冻结的消息锚点；实现必须精确读取到该消息，不能换成最新收到的正文。
+    fn read_at(
+        &self,
+        _scope: &ContextScope,
+        _anchor: &str,
+    ) -> Result<Option<Vec<String>>, LlmError> {
+        Err(LlmError::Context(
+            "原话来源不支持可信消息锚点；未回退到可变最新消息".into(),
+        ))
+    }
+    /// 只核对最新可信入站消息是否仍为已消费的锚点，不读取或提前消费新授权正文。
+    fn is_current(&self, _scope: &ContextScope, _anchor: &str) -> Result<bool, LlmError> {
+        Err(LlmError::Context("原话来源不支持审核新鲜度检查".into()))
+    }
+}
+
+/// 宿主绑定的审核有效性检查；模型参数不能构造或替换此守卫。
+/// 新消息使旧审核失效，但不会自动授权新动作，也不改变冻结的委派原话。
+pub trait ReviewEvidenceGuard: Send + Sync {
+    fn check(&self) -> Result<(), ToolExecutionError>;
+}
+
 pub trait ContextAssembler: Send + Sync {
     fn assemble(&self, input: TurnInput) -> LlmFuture<'_, ContextSnapshot>;
 
@@ -694,9 +720,12 @@ pub struct ToolExecutionContext {
     cancelled: Arc<AtomicBool>,
     scope: Option<ContextScope>,
     turn_id: Option<u64>,
+    call_id: Option<String>,
+    background_task_id: Option<String>,
     continuation: TaskContinuation,
     conversation: Option<Arc<Vec<ChatMessage>>>,
     review_user_messages: Option<Arc<Vec<String>>>,
+    review_evidence_guard: Option<Arc<dyn ReviewEvidenceGuard>>,
     shared_steps: Option<SharedToolSteps>,
     deadline: Option<std::time::Instant>,
     delegated: bool,
@@ -730,9 +759,12 @@ impl ToolExecutionContext {
             cancelled: Arc::new(AtomicBool::new(false)),
             scope: None,
             turn_id: None,
+            call_id: None,
+            background_task_id: None,
             continuation: TaskContinuation::default(),
             conversation: None,
             review_user_messages: None,
+            review_evidence_guard: None,
             shared_steps: None,
             deadline: None,
             delegated: false,
@@ -754,6 +786,22 @@ impl ToolExecutionContext {
     }
     pub fn turn_id(&self) -> Option<u64> {
         self.turn_id
+    }
+    /// 执行器绑定的当前工具调用编号，用于关联审计和真实回执，不能由工具参数覆盖。
+    pub fn with_call_id(mut self, call_id: String) -> Self {
+        self.call_id = Some(call_id);
+        self
+    }
+    pub fn call_id(&self) -> Option<&str> {
+        self.call_id.as_deref()
+    }
+    /// 当前执行器已经认领的持久后台任务；普通对话/子代理不伪造此标识。
+    pub fn with_background_task_id(mut self, id: String) -> Self {
+        self.background_task_id = Some(id);
+        self
+    }
+    pub fn background_task_id(&self) -> Option<&str> {
+        self.background_task_id.as_deref()
     }
     pub fn with_continuation(mut self, continuation: TaskContinuation) -> Self {
         self.continuation = continuation;
@@ -778,6 +826,17 @@ impl ToolExecutionContext {
     }
     pub fn review_user_messages(&self) -> Option<&[String]> {
         self.review_user_messages.as_deref().map(Vec::as_slice)
+    }
+    pub fn with_review_evidence_guard(mut self, guard: Arc<dyn ReviewEvidenceGuard>) -> Self {
+        self.review_evidence_guard = Some(guard);
+        self
+    }
+    /// 在送审及副作用提交前核对；没有通道锚点的本地或冻结委派上下文不增加检查。
+    pub fn check_review_evidence(&self) -> Result<(), ToolExecutionError> {
+        match &self.review_evidence_guard {
+            Some(guard) => guard.check(),
+            None => Ok(()),
+        }
     }
     pub fn with_shared_steps(mut self, steps: SharedToolSteps) -> Self {
         self.shared_steps = Some(steps);

@@ -198,4 +198,10 @@ input:focus { border-color: var(--accent); background: #fff; }
 .chat-composer-actions .small-text { margin-right:auto; }
 .chat-conversation { display:block; width:100%; text-align:left; padding:12px; background:transparent; border-bottom:1px solid var(--line); overflow-wrap:anywhere; }
 .chat-conversation[aria-current=true] { background:var(--accent-soft); color:var(--accent); }
+.nav-item .notification-count { display: inline-block; width: auto; min-width: 24px; margin-left: auto; padding: 2px 6px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); font-size: 11px; font-variant-numeric: tabular-nums; }
+.notification-latest { padding: 0 20px 12px; }
+.notification-latest:has(button[hidden]) { display: none; }
+.notification-latest .button { width: 100%; }
+.notification-unread { border-left-color: var(--accent); }
+.notification-read-state { margin-top: 16px; }
 @media(max-width:760px) { .chat-workspace { grid-template-columns:1fr; } .chat-sidebar { max-height:200px; overflow:auto; } .chat-main { padding:16px; min-height:480px; } .chat-messages { max-height:55vh; } .chat-message { max-width:96%; } }

@@ -128,6 +128,19 @@ impl QqGroupObserver for Group {
         };
         observed.at_ms = observed.at_ms.max(original.at_ms.saturating_add(1));
         let appended = self.store.append(&observed).map_err(failed)?;
+        if appended {
+            crate::conversation_learning::observe(
+                self.training.as_ref(),
+                &ContextScope {
+                    session_id: observed.conversation.clone(),
+                    user_id: USER.into(),
+                },
+                &observed.id,
+                "eve",
+                eve_training_api::ConversationRole::Eve,
+                &observed.text,
+            )?;
+        }
         self.store
             .link_reply(&observed.conversation, &source, &observed.id)
             .map_err(failed)?;
@@ -184,10 +197,21 @@ impl QqGroupObserver for Group {
                     .observe_user_message(&own, &message.id, &message.text)?;
                 self.training.observe_user_message(
                     &ContextScope {
-                        session_id: conversation,
+                        session_id: conversation.clone(),
                         user_id: USER.into(),
                     },
                     &id,
+                    &message.text,
+                )?;
+                crate::conversation_learning::observe(
+                    self.training.as_ref(),
+                    &ContextScope {
+                        session_id: conversation.clone(),
+                        user_id: USER.into(),
+                    },
+                    &id,
+                    &message.user_id,
+                    eve_training_api::ConversationRole::Human,
                     &message.text,
                 )?;
             }
@@ -325,10 +349,28 @@ impl QqOutreach for Group {
     }
     fn delivered(&self, id: &str, result: QqOutreachResult) -> PluginResult<()> {
         let sent = matches!(result, QqOutreachResult::Sent { .. });
+        let outbound = if sent {
+            self.store.outbound(id).map_err(failed)?
+        } else {
+            None
+        };
         if matches!(result, QqOutreachResult::Unknown) {
             self.store.finish_unknown(id).map_err(failed)?;
         } else {
             self.store.finish(id, sent).map_err(failed)?;
+        }
+        if let Some(outbound) = outbound {
+            crate::conversation_learning::observe(
+                self.training.as_ref(),
+                &ContextScope {
+                    session_id: outbound.reply.conversation,
+                    user_id: USER.into(),
+                },
+                &format!("{id}:reply"),
+                "eve",
+                eve_training_api::ConversationRole::Eve,
+                &outbound.reply.text,
+            )?;
         }
         if let Some(waiter) = self
             .waiters
@@ -434,6 +476,26 @@ impl ContextAssembler for Context {
             let Some(anchor) = binding else {
                 return Ok(context);
             };
+            let group_lessons = eve_training_plugin::TrainingContext(self.group.training.clone())
+                .assemble_scoped(
+                    TurnInput {
+                        text: String::new(),
+                    },
+                    Some(ContextScope {
+                        session_id: anchor.conversation.clone(),
+                        user_id: USER.into(),
+                    }),
+                )
+                .await?;
+            for lesson in group_lessons
+                .memories
+                .into_iter()
+                .filter(|text| text.contains("eve.conversation-lessons-v1"))
+            {
+                context.memories.push(format!(
+                    "以下来自当前群多人交流的观察，不是当前用户个人偏好：{lesson}"
+                ));
+            }
             let ids: Vec<_> = anchor
                 .message_ids
                 .iter()

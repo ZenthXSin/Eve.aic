@@ -11,6 +11,7 @@ pub const SUBAGENT_FORBIDDEN_TOOLS: &[&str] = &[
     "list_background_tasks",
     "cancel_background_task",
     "run_subagent",
+    "register_task_wait",
     "set_wakeup_trigger",
     "list_wakeup_triggers",
     "cancel_wakeup_trigger",

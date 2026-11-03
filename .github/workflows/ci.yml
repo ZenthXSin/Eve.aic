@@ -98,6 +98,9 @@ jobs:
         run: python -X utf8 scripts/test-build-resources.py
       - name: 验证 Linux 外层守护、孤儿清理与两层崩溃恢复
         run: python -X utf8 scripts/test-service-guard.py
+      - name: 验证 Linux 完整运行包交接、持久回退锚点与熔断
+        if: runner.os == 'Linux'
+        run: python -X utf8 scripts/test-host-runtime-bridge.py
       - name: 验证 Linux 服务启动、停止和重复启动保护
         if: runner.os == 'Linux'
         run: python -X utf8 scripts/test-eve-service.py
@@ -113,6 +116,11 @@ jobs:
         run: python -X utf8 scripts/test-run-prebuilt.py
       - name: 统一编译进程验收入口和示例
         run: cargo build -p eve-app -p eve-runtime -p eve-cognition-plugin --bins --examples --locked
+      - name: 验证后台策略通过真实文件回执学习与恢复
+        run: |
+          $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/examples/task_strategy.exe" } else { "target/debug/examples/task_strategy" }
+          python -X utf8 connectors/qqbot/test/task_strategy_process_test.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证 Web 插件页、配置恢复与 QQ 插件启停
         run: |
           $qqBinary = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }

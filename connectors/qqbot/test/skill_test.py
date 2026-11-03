@@ -315,7 +315,7 @@ class SkillAcceptance(unittest.TestCase):
 
         env = {key: os.environ[key] for key in ("PATH", "SystemRoot", "TEMP", "TMP") if key in os.environ}
         env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret")
-        result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
+        result = subprocess.run([str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "refused"),
                                  "--agent", str(ROOT / "AGENT.md"), "--interest-learning", "--skill-learning"],
                                 env=configure_fixture_progress(env), capture_output=True, text=True, timeout=60)
         self.assertNotEqual(result.returncode, 0)

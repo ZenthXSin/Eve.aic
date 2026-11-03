@@ -30,7 +30,7 @@ pub struct TriggerController(Arc<Mutex<Option<Inner>>>);
 fn valid(ledger: &Ledger) -> bool {
     let mut ids = BTreeSet::new();
     let mut sources = BTreeSet::new();
-    matches!(ledger.format_version, 1 | 2)
+    matches!(ledger.format_version, 1..=3)
         && ledger.triggers.len() <= MAX_TRIGGERS
         && ledger.triggers.iter().all(|t| {
             let expected = identifier(&t.owner, &t.source);
@@ -39,6 +39,10 @@ fn valid(ledger: &Ledger) -> bool {
                 && sources.insert((&t.owner.session_id, &t.owner.user_id, &t.source))
                 && t.owner.validate().is_ok()
                 && t.spec.valid()
+                && (ledger.format_version == 3 || t.review_messages.is_none())
+                && t.review_messages
+                    .as_ref()
+                    .is_none_or(|messages| validate_review_messages(messages).is_ok())
                 && (ledger.format_version != 1
                     || (t.spec.recurrence.is_none()
                         && t.spec.resume_task_id.is_none()
@@ -64,8 +68,8 @@ fn valid(ledger: &Ledger) -> bool {
 }
 
 fn recover(ledger: &mut Ledger) -> bool {
-    let mut changed = ledger.format_version != 2;
-    ledger.format_version = 2;
+    let mut changed = ledger.format_version != 3;
+    ledger.format_version = 3;
     for t in &mut ledger.triggers {
         if t.status == Status::Running {
             t.status = Status::Interrupted;
@@ -99,7 +103,7 @@ impl TriggerController {
             .filter(|i| i.available)
             .ok_or(TriggerError::Unavailable)?;
         let mut next = inner.ledger.clone();
-        next.format_version = 2;
+        next.format_version = 3;
         let result = f(&mut next)?;
         if !valid(&next) {
             return Err(TriggerError::Invalid);
@@ -129,6 +133,68 @@ impl TriggerController {
     }
 }
 impl TriggerController {
+    fn create_inner(
+        &self,
+        owner: SessionKey,
+        source: String,
+        spec: TriggerSpec,
+        review_messages: Option<Vec<String>>,
+        now: u64,
+    ) -> Result<Trigger> {
+        if owner.validate().is_err()
+            || source.is_empty()
+            || source.len() > 256
+            || !spec.valid()
+            || review_messages.as_ref().is_some_and(|messages| validate_review_messages(messages).is_err())
+            // 截止瞬间无法保证被扫描观察到，拒绝不可达的同刻时间条件。
+            || spec.conditions.iter().any(|c| matches!(c, Condition::Time { at_ms } if *at_ms >= spec.expires_at_ms))
+            || now == 0
+            || spec.expires_at_ms <= now
+            || spec.expires_at_ms.saturating_sub(now) > 90 * 86_400_000
+        {
+            return Err(TriggerError::Invalid);
+        }
+        self.change(|l| {
+            let id = identifier(&owner, &source);
+            if let Some(old) = l.triggers.iter().find(|t| t.id == id) {
+                return Ok(old.clone());
+            }
+            if l.triggers.len() >= MAX_TRIGGERS
+                || l.triggers
+                    .iter()
+                    .filter(|t| {
+                        t.owner == owner
+                            && matches!(t.status, Status::Armed | Status::Ready | Status::Running)
+                    })
+                    .count()
+                    >= MAX_ACTIVE_PER_SESSION
+                || l.triggers
+                    .iter()
+                    .filter(|t| {
+                        t.owner == owner && now.saturating_sub(t.created_at_ms) < 86_400_000
+                    })
+                    .count()
+                    >= 32
+            {
+                return Err(TriggerError::Limit);
+            }
+            let t = Trigger {
+                id,
+                owner,
+                source,
+                spec,
+                created_at_ms: now,
+                status: Status::Armed,
+                evidence: vec![],
+                result: None,
+                delivery: None,
+                runs: 0,
+                review_messages,
+            };
+            l.triggers.push(t.clone());
+            Ok(t)
+        })
+    }
     fn delivery_inner(
         &self,
         id: &str,
@@ -178,57 +244,17 @@ impl TriggerAdmin for TriggerController {
         spec: TriggerSpec,
         now: u64,
     ) -> Result<Trigger> {
-        if owner.validate().is_err()
-            || source.is_empty()
-            || source.len() > 256
-            || !spec.valid()
-            // 截止瞬间无法保证被扫描观察到，拒绝不可达的同刻时间条件。
-            || spec.conditions.iter().any(|c| matches!(c, Condition::Time { at_ms } if *at_ms >= spec.expires_at_ms))
-            || now == 0
-            || spec.expires_at_ms <= now
-            || spec.expires_at_ms.saturating_sub(now) > 90 * 86_400_000
-        {
-            return Err(TriggerError::Invalid);
-        }
-        self.change(|l| {
-            let id = identifier(&owner, &source);
-            if let Some(old) = l.triggers.iter().find(|t| t.id == id) {
-                return Ok(old.clone());
-            }
-            if l.triggers.len() >= MAX_TRIGGERS
-                || l.triggers
-                    .iter()
-                    .filter(|t| {
-                        t.owner == owner
-                            && matches!(t.status, Status::Armed | Status::Ready | Status::Running)
-                    })
-                    .count()
-                    >= MAX_ACTIVE_PER_SESSION
-                || l.triggers
-                    .iter()
-                    .filter(|t| {
-                        t.owner == owner && now.saturating_sub(t.created_at_ms) < 86_400_000
-                    })
-                    .count()
-                    >= 32
-            {
-                return Err(TriggerError::Limit);
-            }
-            let t = Trigger {
-                id,
-                owner,
-                source,
-                spec,
-                created_at_ms: now,
-                status: Status::Armed,
-                evidence: vec![],
-                result: None,
-                delivery: None,
-                runs: 0,
-            };
-            l.triggers.push(t.clone());
-            Ok(t)
-        })
+        self.create_inner(owner, source, spec, None, now)
+    }
+    fn create_with_review_messages(
+        &self,
+        owner: SessionKey,
+        source: String,
+        spec: TriggerSpec,
+        review_messages: Vec<String>,
+        now: u64,
+    ) -> Result<Trigger> {
+        self.create_inner(owner, source, spec, Some(review_messages), now)
     }
     fn ready(&self, id: &str, evidence: Vec<String>) -> Result<()> {
         self.change(|l| {
@@ -293,7 +319,10 @@ impl TriggerAdmin for TriggerController {
                 .ok_or(TriggerError::NotFound)?;
             let r = t.spec.recurrence.as_ref().ok_or(TriggerError::Transition)?;
             if t.status != Status::Completed
-                || !matches!(t.delivery, Some(Delivery::Sent | Delivery::Failed))
+                || !matches!(
+                    t.delivery,
+                    Some(Delivery::Sent | Delivery::Failed | Delivery::StoredLocally)
+                )
                 || t.runs >= r.max_runs
             {
                 return Err(TriggerError::Transition);
@@ -331,6 +360,30 @@ impl TriggerAdmin for TriggerController {
     fn delivery_for_run(&self, id: &str, run: u32, from: Delivery, to: Delivery) -> Result<()> {
         self.delivery_inner(id, Some(run), from, to)
     }
+    fn record_local_delivery(&self, owner: &SessionKey, id: &str, run: u32) -> Result<()> {
+        owner.validate().map_err(|_| TriggerError::Invalid)?;
+        self.change(|ledger| {
+            let trigger = ledger
+                .triggers
+                .iter_mut()
+                .find(|trigger| trigger.id == id && trigger.owner == *owner)
+                .ok_or(TriggerError::NotFound)?;
+            if trigger.runs != run
+                || !matches!(
+                    trigger.status,
+                    Status::Completed | Status::Failed | Status::Interrupted
+                )
+                || !matches!(
+                    trigger.delivery,
+                    Some(Delivery::Pending | Delivery::StoredLocally)
+                )
+            {
+                return Err(TriggerError::Transition);
+            }
+            trigger.delivery = Some(Delivery::StoredLocally);
+            Ok(())
+        })
+    }
 }
 pub struct TriggerPlugin {
     manifest: PluginManifest,
@@ -357,7 +410,7 @@ impl Plugin for TriggerPlugin {
             let bytes = context.state_get(STATE_KEY)?;
             let mut ledger = match bytes {
                 None => Ledger {
-                    format_version: 2,
+                    format_version: 3,
                     triggers: vec![],
                 },
                 Some(bytes) if bytes.len() <= MAX_BYTES => {

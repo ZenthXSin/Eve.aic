@@ -185,6 +185,7 @@ async fn cold_and_hot_history_keep_identical_complete_turns_and_failure_meaning_
                 SessionFailureCode::Provider,
                 Some(0),
                 Some(SessionFailureEvidence {
+                    review_user_messages: None,
                     provider_http_status: None,
                     provider_failure: Some(eve_llm_api::ProviderFailureKind::Truncated),
                     protocol_failure: None,
@@ -197,6 +198,7 @@ async fn cold_and_hot_history_keep_identical_complete_turns_and_failure_meaning_
                 SessionFailureCode::ProviderTimeout,
                 Some(1),
                 Some(SessionFailureEvidence {
+                    review_user_messages: None,
                     provider_http_status: Some(503),
                     provider_failure: None,
                     protocol_failure: None,
@@ -502,6 +504,7 @@ async fn unacknowledged_begin_recovers_interrupted_and_failed_evidence_stays_exa
         code: SessionFailureCode::Provider,
         started_tools: Some(1),
         evidence: Some(SessionFailureEvidence {
+            review_user_messages: None,
             provider_http_status: Some(503),
             provider_failure: None,
             protocol_failure: None,

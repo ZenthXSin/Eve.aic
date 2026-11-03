@@ -38,6 +38,54 @@ class ScriptRepairAcceptance(developer.DeveloperAcceptance):
         self.run_eve(script, interest=False, memory=True, research=False, practice=False,
             env_extra={'EVE_DEVELOPER_CONFIG': str(self.developer_config), 'EVE_SCRIPT_RUSTC': self.compiler})
 
+    def test_code_mode_reads_then_edits_with_exact_original_review_in_one_model_tool_round(self):
+        (self.source/'test-config.txt').write_text('真实源码测试',encoding='utf8')
+        reviews=[]
+        original='把test-config.txt里的真实源码测试改为编排验证成功，然后读回核对'
+        def review(request):
+            reviews.append(request)
+            allowed=original in request['user_messages'] and 'edit_file' in request['action']
+            return {'risk':'medium','authorization':'high' if allowed else 'unknown',
+                    'outcome':'allow' if allowed else 'deny','rationale':'完整原话授权指定文件修改'}
+        self.review_reply=review
+        def respond(body):
+            results=self.results(body)
+            if not results:
+                code="const before=await tools.read_file({path:'test-config.txt'}); await tools.edit_file({path:'test-config.txt',old_string:'真实源码测试',new_string:'编排验证成功',expected_sha256:before.sha256}); const after=await tools.read_file({path:'test-config.txt'}); text({content:after.content});"
+                return self.tools([('run_tool_code',{'code':code,'tools':['read_file','edit_file']})])
+            self.assertEqual(len(results),1)
+            self.assertTrue(results[0]['success'],repr(results[0]))
+            self.assertEqual(results[0]['result'],{'output':[{'content':'编排验证成功'}]})
+            self.assertEqual([e['status'] for e in results[0]['evidence']],['succeeded']*3)
+            return text_response('已修改并读回核对')
+        self.callback=respond
+        self.execute_script(self.send(self.message('code-edit',original,expected='已修改并读回核对')))
+        self.assertEqual(self.chat_rounds,2)
+        self.assertEqual(len(reviews),1)
+        self.assertEqual((self.source/'test-config.txt').read_text(),'编排验证成功')
+
+    def test_one_call_hot_update_then_run_without_host_restart(self):
+        version=None
+        def respond(body):
+            nonlocal version
+            results=self.results(body)
+            if not results:
+                spec={'name':'live-one','language':'javascript','source':"const r=require('readline').createInterface({input:process.stdin});r.once('line',()=>{console.log(JSON.stringify({op:'return',value:{value:42}}));r.close();});",'dependencies':{},'tools':[],
+                    'state_schema':{'version':1,'fields':{}},'initial_state':{}}
+                return self.tools([('update_script_plugin',{'spec':spec})])
+            if len(results)==1:
+                self.assertTrue(results[0]['hot_updated'],repr(results[0]))
+                self.assertFalse(results[0]['host_rebuilt']);self.assertFalse(results[0]['host_restarted'])
+                version=results[0]['version']
+                return self.tools([('run_script_plugin',{'version':version,'arguments':{}})])
+            self.assertTrue(results[-1]['success'],repr(results[-1]))
+            self.assertEqual(results[-1]['receipt']['result'],{'value':42})
+            return text_response('热更新后实际运行得到42')
+        self.callback=respond
+        self.execute_script(self.send(self.message('hot-update','更新插件并运行核对',expected='热更新后实际运行得到42')))
+        self.assertEqual(self.chat_rounds,3)
+        self.assertIsNotNone(version)
+
     def test_concrete_parameter_preflight_does_not_write_then_execution_uses_original_authority(self):
         source = '''import json
 x=json.loads(input())

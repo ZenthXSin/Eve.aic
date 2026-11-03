@@ -213,7 +213,7 @@ class MessageJudgeAcceptance(unittest.TestCase):
                 env.pop(name, None)
             else:
                 env[name] = value
-        command = [str(BINARY), "--state-dir", str(self.work / "state"), "--agent", str(ROOT / "AGENT.md"),
+        command = [str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "state"), "--agent", str(ROOT / "AGENT.md"),
                    "--bridge-script", str(BRIDGE), "--bridge-arg", str(scenario)]
         if mode is not None:
             command.extend(["--message-judge", mode])

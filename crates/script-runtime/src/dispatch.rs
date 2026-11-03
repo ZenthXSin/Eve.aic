@@ -5,6 +5,10 @@ use std::{collections::BTreeMap, sync::Arc};
 /// 必须与宿主直接工具调用使用同一策略。两个检查函数均不得产生业务副作用。
 /// 工具列表来自可信装配，不能由脚本自行注册；dispatch 仍需检查实时权限撤回。
 pub trait AuthorizedToolDispatch: Send + Sync {
+    /// 仅可信组合层可以允许并发；未标注工具保持串行。
+    fn parallel_safe(&self, _name: &str) -> bool {
+        false
+    }
     fn preflight_tool(&self, name: &str, context: &ToolExecutionContext) -> Result<()>;
     fn preflight_call(&self, call: &ToolCall, context: &ToolExecutionContext) -> Result<()>;
     /// 步数由脚本运行器统一预留，派发器不得重复扣除。
@@ -41,6 +45,14 @@ impl CheckedTools {
     }
 }
 impl AuthorizedToolDispatch for CheckedTools {
+    fn parallel_safe(&self, name: &str) -> bool {
+        self.tools.get(name).is_some_and(|tool| {
+            matches!(
+                tool.definition().concurrency,
+                Some(eve_llm_api::ToolConcurrency::ParallelSafe)
+            )
+        })
+    }
     fn preflight_tool(&self, name: &str, context: &ToolExecutionContext) -> Result<()> {
         if context.scope().is_none() || !self.tools.contains_key(name) {
             return Err(reject("缺少可信身份或叶子工具"));

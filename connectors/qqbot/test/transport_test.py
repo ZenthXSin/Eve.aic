@@ -42,7 +42,7 @@ class TransportAcceptance(memory.MemoryAcceptance):
         stdout = self.work / f"{number}-stdout"
         stderr = self.work / f"{number}-stderr"
         with stdout.open("w") as out, stderr.open("w") as err:
-            child = subprocess.Popen([str(memory.BINARY), "--memory", "--state-dir", str(self.work / "state"),
+            child = subprocess.Popen([str(memory.BINARY), "--minimal-profile", "--memory", "--state-dir", str(self.work / "state"),
                 "--agent", str(memory.ROOT / "AGENT.md"), "--bridge-script",
                 str(pathlib.Path(__file__).with_name("transport-bridge.mjs")), "--bridge-arg", str(path)],
                 env=configure_fixture_progress(env), stdout=out, stderr=err)

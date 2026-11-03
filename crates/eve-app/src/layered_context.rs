@@ -1544,6 +1544,7 @@ mod tests {
                     code: eve_session_api::SessionFailureCode::ProviderTimeout,
                     started_tools: Some(1),
                     evidence: Some(eve_session_api::SessionFailureEvidence {
+                        review_user_messages: None,
                         provider_http_status: Some(504),
                         provider_failure: None,
                         protocol_failure: None,

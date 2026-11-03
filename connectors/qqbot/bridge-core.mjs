@@ -1,5 +1,7 @@
 // Tencent SDK adaptation; stdout is reserved for the versioned JSONL protocol.
 export const MAX_FRAME = 65536;
+// Raw SDK body and display text are separate; JSON escaping can expand both by 6x.
+export const MAX_INBOUND_FRAME = 512 * 1024;
 // The control task ID adds "qq:" and must fit its 256-byte contract.
 export const MAX_MESSAGE_ID_BYTES = 253;
 // QQ passive replies to one inbound message are limited; segmented replies stay within it.
@@ -230,14 +232,14 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     } finally { activeSends--; }
   }
   // 表情包作为原消息的被动回复图片发出，同样计入并发上限。
-  async function sendImage(target, localPath, mention) {
+  async function sendImage(target, localPath) {
     if (activeSends >= limit) {
       warn("outbound_limit");
       throw new Error("outbound_limit");
     }
     activeSends++;
     try {
-      const result = await bot.sendImage(target, { localPath }, { content: mentionedText(target, "", mention) });
+      const result = await bot.sendImage(target, { localPath });
       if (!validMessageId(result?.message?.id)) throw new Error("platform_message_id_unknown");
       return result;
     }
@@ -270,33 +272,40 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       warn("invalid_route_or_text"); return;
     }
     if (pending.has(msg.messageId)) { warn("duplicate_pending"); return; }
-    if (pending.size >= limit) { warn("pending_limit"); return; }
+    const restrictionOnly = pending.size >= limit;
+    if (restrictionOnly) warn("pending_limit");
     const text = userText(msg, bot.appId);
     if (!validText(text) && !attachments.length) { warn("invalid_route_or_text"); return; }
     const senderName = typeof msg.senderName === "string" ? msg.senderName.trim() : "";
     const validName = senderName && Buffer.byteLength(senderName) <= 128 && [...senderName].length <= 48 && !/[\p{Cc}]/u.test(senderName);
-    const frame = { type: "message", id: msg.messageId, scope: msg.kind,
+    const frame = { type: restrictionOnly ? "restriction_only" : "message", id: msg.messageId, scope: msg.kind,
       target_id: target.targetId, user_id: msg.senderId,
-      text, ...(attachments.length ? { attachments } : {}),
+      text, original_text: msg.content, ...(attachments.length ? { attachments } : {}),
       ...(quoted ? { quoted } : {}), ...(validName ? { sender_name: senderName } : {}) };
     // 调试用的原始事件，和规范化帧分开；只保留有界的结构字段，不进回执。
     const raw = rawMessage(msg);
     if (raw) frame.raw = raw;
     // JSON escaping can expand a legal body beyond the Rust wire-frame limit.
-    if (Buffer.byteLength(JSON.stringify({ version: 1, ...frame })) > MAX_FRAME) {
+    if (Buffer.byteLength(JSON.stringify({ version: 1, ...frame })) > MAX_INBOUND_FRAME) {
       warn("frame_limit"); return;
     }
     if (msg.kind === "group" && group.observe) {
-      const message = { id:frame.id, scope:frame.scope,target_id:frame.target_id,user_id:frame.user_id,text:frame.text,
-        ...(frame.attachments ? {attachments:frame.attachments}:{}), ...(frame.quoted ? {quoted:frame.quoted}:{}) };
-      const observation={version:1,type:"group_observation",message,mentions_me:isGroupAt(msg,bot.appId),
-        ...(validName?{sender_name:senderName}:{})};
-      if (Buffer.byteLength(JSON.stringify(observation)) <= MAX_FRAME) emit(observation);
-      else { warn("frame_limit"); return; }
+      // 容量满时只保留本条可信缩权入口，不因此新增群观察或待回复路由。
+      if (!restrictionOnly) {
+        const message = { id:frame.id, scope:frame.scope,target_id:frame.target_id,user_id:frame.user_id,text:frame.text,
+          ...(frame.attachments ? {attachments:frame.attachments}:{}), ...(frame.quoted ? {quoted:frame.quoted}:{}) };
+        const observation={version:1,type:"group_observation",message,mentions_me:isGroupAt(msg,bot.appId),
+          ...(validName?{sender_name:senderName}:{})};
+        if (Buffer.byteLength(JSON.stringify(observation)) <= MAX_INBOUND_FRAME) emit(observation);
+        else { warn("frame_limit"); return; }
+      }
       if (!isGroupAt(msg,bot.appId) && !isGroupNameWake(msg)) return;
     }
     // 仅前缀模式仍记录群原话；艾特、引用和附件本身都不能绕过前缀唤醒。
     if (msg.kind === "group" && group.prefixOnly && !/^eve/i.test(text.trimStart())) return;
+    // 不在 SDK 猜测业务句意。Rust 核对真实身份、白名单和完整原话后只允许缩权，
+    // 此帧没有 SDK pending 路由，不启动模型任务，也不能获得被动回复额度。
+    if (restrictionOnly) { send(frame); return; }
     pending.set(msg.messageId, { target: { ...target }, senderId:msg.senderId, sending: false, receivedAt: now() });
     send(frame);
   });
@@ -385,7 +394,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         send({ type: "delivery", id: frame.id, sticker: true, ok: false, failure_kind: "passive_window_elapsed" });
         return;
       }
-      const result = await sendImage(item.target, path, replyMention(item));
+      const result = await sendImage(item.target, path);
       const id = result?.message?.id;
       send({ type: "delivery", id: frame.id, sticker: true, ok: true,
         ...(validMessageId(id) ? { message_id: id } : {}) });

@@ -191,7 +191,11 @@ pub fn extract_task_strategy(
                 .any(|c| c.tool == call.name && c.arguments == call.arguments)
                 || matches!(
                     call.name.as_str(),
-                    "echo" | "task_progress" | "run_subagent" | "dispatch_task"
+                    "echo"
+                        | "task_progress"
+                        | "register_task_wait"
+                        | "run_subagent"
+                        | "dispatch_task"
                 )
                 || call.name.len() > 64
                 || !call

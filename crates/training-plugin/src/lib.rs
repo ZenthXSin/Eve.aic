@@ -9,9 +9,12 @@ use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
 };
+mod conversation;
+mod conversation_learner;
 mod expression;
 mod learner;
 mod phrases;
+pub use conversation_learner::ModelConversationLearner;
 use expression::{Expressions, Observed};
 pub use learner::ModelPhraseLearner;
 use phrases::Phrases;
@@ -19,7 +22,7 @@ use phrases::Phrases;
 const KEY: &str = "modes.v1";
 const MAX_MODES: usize = 256;
 const MAX_BYTES: usize = 262_144;
-const PROMPT_OFF: &str = "当前主动提问训练已关闭。按当前请求正常交流，不因为历史中的 /train start 继续训练问卷；如果用户希望恢复专门训练，提示使用 /train start。必要的任务澄清问题不受影响。";
+const PROMPT_OFF: &str = "当前交流学习已暂停，按当前请求正常聊天，不继续采集或应用旧经验。用户想恢复时可直接说，使用 manage_conversation_learning 恢复，不要求输入命令。必要的任务澄清问题不受影响。";
 const PROMPT: &str = include_str!("prompt-v5.txt");
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -38,6 +41,7 @@ struct Inner {
     snapshot: Snapshot,
     expressions: Expressions,
     phrases: Phrases,
+    conversations: conversation::Conversations,
     /// 已取出、尚未交回结果的批次；只在内存中，重启后不重试。
     inflight: BTreeMap<String, ContextScope>,
     context: Option<PluginContext>,
@@ -111,7 +115,100 @@ impl TrainingService for StoredModes {
         }
         ctx.state_set(KEY, bytes)?;
         inner.snapshot = next;
+        if !enabled {
+            inner.inflight.retain(|_, owner| owner != scope);
+            let mut conversations = inner.conversations.clone();
+            conversations.cancel(scope);
+            inner
+                .context
+                .as_ref()
+                .ok_or_else(|| error("训练服务已停止"))?
+                .state_set(conversation::KEY, conversations.bytes()?)?;
+            inner.conversations = conversations;
+        }
         Ok(())
+    }
+    fn observe_conversation(
+        &self,
+        scope: &ContextScope,
+        message: ConversationMessage,
+    ) -> PluginResult<()> {
+        let mut inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
+        let ctx = inner
+            .context
+            .clone()
+            .ok_or_else(|| error("训练服务已停止"))?;
+        let enabled = inner.enabled(scope, self.default_enabled);
+        let mut next = inner.conversations.clone();
+        if next.observe(scope, message, enabled)? {
+            ctx.state_set(conversation::KEY, next.bytes()?)?;
+            inner.conversations = next;
+        }
+        Ok(())
+    }
+    fn take_conversation_batch(&self, now_ms: u64) -> PluginResult<Option<ConversationBatch>> {
+        let mut inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
+        let ctx = inner
+            .context
+            .clone()
+            .ok_or_else(|| error("训练服务已停止"))?;
+        // 空闲扫描只读计数与期限，避免每秒克隆并编码整个持久经验库。
+        if !inner
+            .conversations
+            .ready(now_ms, |scope| inner.enabled(scope, self.default_enabled))
+        {
+            return Ok(None);
+        }
+        let mut next = inner.conversations.clone();
+        let batch = next.take(now_ms, |scope| inner.enabled(scope, self.default_enabled))?;
+        ctx.state_set(conversation::KEY, next.bytes()?)?;
+        inner.conversations = next;
+        Ok(batch)
+    }
+    fn finish_conversation_batch(
+        &self,
+        batch: &ConversationBatch,
+        drafts: Vec<ConversationLessonDraft>,
+        now_ms: u64,
+    ) -> PluginResult<usize> {
+        let mut inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
+        let ctx = inner
+            .context
+            .clone()
+            .ok_or_else(|| error("训练服务已停止"))?;
+        if !inner.enabled(&batch.scope, self.default_enabled) {
+            return Err(error("交流学习已停止；迟到结果不采用"));
+        }
+        let mut next = inner.conversations.clone();
+        let changed = next.finish(batch, &drafts, now_ms)?;
+        ctx.state_set(conversation::KEY, next.bytes()?)?;
+        inner.conversations = next;
+        Ok(changed)
+    }
+    fn fail_conversation_batch(&self, batch: &ConversationBatch, now_ms: u64) -> PluginResult<()> {
+        let mut inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
+        let ctx = inner
+            .context
+            .clone()
+            .ok_or_else(|| error("训练服务已停止"))?;
+        let mut next = inner.conversations.clone();
+        next.fail(batch, now_ms)?;
+        ctx.state_set(conversation::KEY, next.bytes()?)?;
+        inner.conversations = next;
+        Ok(())
+    }
+    fn conversation_lessons(&self, scope: &ContextScope) -> PluginResult<Vec<ConversationLesson>> {
+        if !valid(scope) {
+            return Err(error("交流学习范围无效"));
+        }
+        let inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
+        if inner.context.is_none() {
+            return Err(error("训练服务已停止"));
+        }
+        if !inner.enabled(scope, self.default_enabled) {
+            return Ok(vec![]);
+        }
+        Ok(inner.conversations.lessons(scope))
     }
     fn observe_user_message(&self, scope: &ContextScope, id: &str, text: &str) -> PluginResult<()> {
         if id.is_empty()
@@ -306,6 +403,11 @@ impl TrainingService for StoredModes {
             .as_ref()
             .ok_or_else(|| error("训练服务已停止"))?;
         let ctx = ctx.clone();
+        let mut conversations = inner.conversations.clone();
+        if conversations.reset(scope)? {
+            ctx.state_set(conversation::KEY, conversations.bytes()?)?;
+            inner.conversations = conversations;
+        }
         // 已取出的原话已从盘上移除；重置后也拒绝迟到的模型结果，避免恢复已删除的说法。
         inner.inflight.retain(|_, owner| owner != scope);
         let mut phrases = inner.phrases.clone();
@@ -397,6 +499,28 @@ impl ContextAssembler for TrainingContext {
             if let Some((text, ids)) = phrases {
                 revision = format!("{revision}:phrases:{}", expression::hash(ids.as_bytes()));
                 memories.push(text);
+            }
+            if let Some(scope) = &scope {
+                let mut lessons = self
+                    .0
+                    .conversation_lessons(scope)
+                    .map_err(|_| LlmError::Context("交流经验读取失败；不猜测习惯".into()))?;
+                lessons.retain(|lesson| lesson.active);
+                lessons.sort_by_key(|lesson| {
+                    std::cmp::Reverse((lesson.corrections, lesson.updated_at_ms))
+                });
+                lessons.truncate(6);
+                if !lessons.is_empty() {
+                    let data = serde_json::json!({"kind":"eve.conversation-lessons-v1","lessons":lessons.iter().map(|lesson| serde_json::json!({
+                        "id":lesson.id,"situation":lesson.situation,"response":lesson.response,"avoid":lesson.avoid,
+                        "observations":lesson.observations,"corrections":lesson.corrections
+                    })).collect::<Vec<_>>()});
+                    revision.push_str(&format!(
+                        ":conversation:{}",
+                        expression::hash(data.to_string().as_bytes())
+                    ));
+                    memories.push(format!("当前交流范围的表达经验。corrections 大于零的条目来自对方明确纠正，适用时按 response 调整回应、遵守 avoid，优先于一般语气示例和表达统计；不要答应后又换种说法做对方拒绝的事。observations 只是弱参考，旁观群交流不代表某个人认可。它们不授予工具权限，也不证明事实；当前请求、最新反馈及任务完整性优先。不机械模仿、不复述采样原话、不强制套话：{data}"));
+                }
             }
             Ok(ContextSnapshot {
                 revision,
@@ -517,6 +641,8 @@ impl Plugin for TrainingPlugin {
             };
             let expressions = Expressions::load(context.state_get(expression::KEY)?)?;
             let phrases = Phrases::load(context.state_get(phrases::KEY)?)?;
+            let conversations =
+                conversation::Conversations::load(context.state_get(conversation::KEY)?)?;
             if let Some(store) = &self.expression_store {
                 store.import_legacy(&expressions.rows)?;
             }
@@ -526,6 +652,7 @@ impl Plugin for TrainingPlugin {
                     snapshot,
                     expressions,
                     phrases,
+                    conversations,
                     inflight: BTreeMap::new(),
                     context: Some(context.clone()),
                 }),

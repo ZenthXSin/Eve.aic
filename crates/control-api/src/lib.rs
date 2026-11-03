@@ -10,6 +10,9 @@ pub type ControlResult<T> = Result<T, ControlError>;
 pub type ControlFuture<'a, T> = Pin<Box<dyn Future<Output = ControlResult<T>> + Send + 'a>>;
 pub type RunFuture<'a> = Pin<Box<dyn Future<Output = RunReport> + Send + 'a>>;
 
+mod run_metadata;
+pub use run_metadata::{ControlReviewEvidence, ControlRunMetadata};
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenerationKey {
@@ -136,6 +139,30 @@ impl ControlEventSink for DiscardControlEvents {
 /// 只表示原始结果不可用，不保证 runner 派生的任务或工具已经完成析构。
 pub trait ControlRunner: Send + Sync {
     fn run<'a>(&'a self, input: SessionInput, sink: &'a dyn TurnEventSink) -> RunFuture<'a>;
+    /// 专用宿主通道；旧执行器必须拒绝带证据的请求，不能静默丢掉原话或消息标识。
+    fn run_with_metadata<'a>(
+        &'a self,
+        input: SessionInput,
+        metadata: Option<ControlRunMetadata>,
+        sink: &'a dyn TurnEventSink,
+    ) -> RunFuture<'a> {
+        if metadata.is_none() {
+            return self.run(input, sink);
+        }
+        Box::pin(async {
+            RunReport {
+                turn_id: None,
+                commit: CommitState::NotStarted,
+                text: None,
+                transcript: None,
+                started_tools: Some(0),
+                tool_results: vec![],
+                failure: Some(RunFailure::Execution(LlmError::Configuration(
+                    "控制执行器不支持可信审核证据；未执行本轮".into(),
+                ))),
+            }
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,6 +186,18 @@ pub trait ControlService: Send + Sync {
         input: ControlInput,
         sink: Arc<dyn ControlEventSink>,
     ) -> ControlResult<GenerationKey>;
+    /// 元数据不进入可反序列化输入；控制器在准入前核对完整作用域和任务标识。
+    fn submit_with_metadata(
+        &self,
+        input: ControlInput,
+        metadata: Option<ControlRunMetadata>,
+        sink: Arc<dyn ControlEventSink>,
+    ) -> ControlResult<GenerationKey> {
+        if metadata.is_some() {
+            return Err(ControlError::Unavailable);
+        }
+        self.submit(input, sink)
+    }
     /// 目标已收尾后，原子比较完整代际并提交替代请求；不隐式取消。
     /// 比较与提交在同一临界区，避免过时分类覆盖刚完成的新任务。
     fn submit_if_current(
@@ -167,6 +206,19 @@ pub trait ControlService: Send + Sync {
         input: ControlInput,
         sink: Arc<dyn ControlEventSink>,
     ) -> ControlResult<GenerationKey>;
+    /// 与 submit_if_current 相同的代际 CAS，并原子冻结本次执行的授权来源。
+    fn submit_if_current_with_metadata(
+        &self,
+        expected: &GenerationKey,
+        input: ControlInput,
+        metadata: Option<ControlRunMetadata>,
+        sink: Arc<dyn ControlEventSink>,
+    ) -> ControlResult<GenerationKey> {
+        if metadata.is_some() {
+            return Err(ControlError::Unavailable);
+        }
+        self.submit_if_current(expected, input, sink)
+    }
     /// 只发送取消信号，不宣称工具已经停止；须读取 wait 报告判断实际结果。
     fn cancel(&self, key: &GenerationKey) -> ControlResult<CancelDisposition>;
     /// 创建时捕获该代完成通知；之后即使新代启动，这个 Future 仍返回原代报告。
@@ -223,7 +275,7 @@ mod enumeration_compatibility {
             _: ControlInput,
             _: Arc<dyn ControlEventSink>,
         ) -> ControlResult<GenerationKey> {
-            Err(ControlError::Unavailable)
+            panic!("旧接口不能静默接收新证据")
         }
         fn submit_if_current(
             &self,
@@ -231,7 +283,7 @@ mod enumeration_compatibility {
             _: ControlInput,
             _: Arc<dyn ControlEventSink>,
         ) -> ControlResult<GenerationKey> {
-            Err(ControlError::Unavailable)
+            panic!("旧接口不能静默接收新证据")
         }
         fn cancel(&self, _: &GenerationKey) -> ControlResult<CancelDisposition> {
             Err(ControlError::Unavailable)
@@ -251,5 +303,48 @@ mod enumeration_compatibility {
     fn existing_custom_service_can_omit_enumeration() {
         let custom: &dyn ControlService = &CustomControl;
         assert_eq!(custom.list_keys(None, 10), Err(ControlError::Unavailable));
+    }
+
+    #[test]
+    fn existing_custom_service_rejects_metadata_without_falling_back_to_legacy_submit() {
+        let custom: &dyn ControlService = &CustomControl;
+        let input = ControlInput {
+            session: SessionInput {
+                key: SessionKey::new("session", "user").unwrap(),
+                text: "待执行任务".into(),
+            },
+            task_id: "task".into(),
+        };
+        let metadata = ControlRunMetadata {
+            scope: eve_llm_api::ContextScope {
+                session_id: "session".into(),
+                user_id: "user".into(),
+            },
+            task_id: "task".into(),
+            review: ControlReviewEvidence::ChannelAnchor("real-message".into()),
+        };
+        assert_eq!(
+            custom.submit_with_metadata(
+                input.clone(),
+                Some(metadata.clone()),
+                Arc::new(DiscardControlEvents)
+            ),
+            Err(ControlError::Unavailable)
+        );
+        let previous = GenerationKey {
+            session: input.session.key.clone(),
+            task_id: "previous-task".into(),
+            controller_epoch: [1; 16],
+            generation: 1,
+        };
+        assert_eq!(
+            custom.submit_if_current_with_metadata(
+                &previous,
+                input,
+                Some(metadata),
+                Arc::new(DiscardControlEvents)
+            ),
+            Err(ControlError::Unavailable)
+        );
     }
 }

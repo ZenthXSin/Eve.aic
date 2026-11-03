@@ -14,6 +14,13 @@ import developer_tools_test as developer
 from dialogue_tools_test import text_response, tool_response
 
 PREFIX='eve.idle.observation.v1\n'
+PLAN_PREFIX='eve.subject.plan.v1\n'
+EXPERIMENT='actual experiment evidence'
+EXPERIMENT_SHA256=hashlib.sha256(EXPERIMENT.encode()).hexdigest()
+ACTION_CONTRACT={'kind':'receipts','contract':{'checks':[{
+    'tool':'read_file','arguments':{'path':'experiment.txt'},
+    'output_pointer':'/sha256','expected':EXPERIMENT_SHA256}],
+    'require_final_batch':True}}
 
 class IdleLoopAcceptance(developer.DeveloperAcceptance):
     for _name in dir(developer.DeveloperAcceptance):
@@ -30,6 +37,7 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
         self.small=[]
         self.review_reply=lambda _: {'risk':'medium','authorization':'high','outcome':'allow','rationale':'夹具主人原话明确授权本次有限回顾与本地实验'}
         self.reflections=0
+        self.plans=0
         self.mode='act'
         outer=self
         class Small(BaseHTTPRequestHandler):
@@ -62,6 +70,18 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
 
     def respond(self,body):
         system=str(body['messages'][0]['content'])
+        if '本任务只规划一个有价值的下一目标' in system:
+            self.assertFalse(body.get('tools'),'缺合同的旧行动必须先无工具规划')
+            text=next(m['content'] for m in reversed(body['messages'])
+                if PLAN_PREFIX in (m.get('content') or ''))
+            frozen=json.JSONDecoder().raw_decode(text.split(PLAN_PREFIX,1)[1])[0]
+            self.assertTrue(frozen['exact_goal'])
+            self.assertTrue(frozen['require_receipts'])
+            self.assertEqual(frozen['goal'],self.proposed_action['goal'])
+            self.assertEqual(frozen['problem_key'],self.proposed_action['assessment']['problem_key'])
+            self.assertTrue(set(self.proposed_action['assessment']['evidence']).issubset(frozen['evidence']))
+            self.plans+=1
+            return text_response(json.dumps({**self.proposed_action,'completion_contract':ACTION_CONTRACT},ensure_ascii=False))
         if '这是Eve无人打扰时的一次自主回顾' in system:
             self.assertFalse(body.get('tools'),'回顾轮次无外部操作工具')
             self.assertNotIn('invented-hint',json.dumps(body),'非法小模型ID不能注入主模型')
@@ -74,7 +94,9 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
             observation=json.loads(next(m['text'][len(PREFIX):] for m in messages if (m.get('text') or '').startswith(PREFIX)))
             self.reflections+=1
             ids=[e['id'] for e in observation['evidence']]
-            choice='act' if self.mode=='act' and self.reflections==1 else 'wait'
+            self.assertFalse(any(e['kind']=='focus' and e['id'].startswith('contract-')
+                for e in observation['evidence']),'冻结合同和授权原话不能作为普通经历节选')
+            choice='act' if self.mode in ('act','legacy-act','text-act') and self.reflections==1 else 'wait'
             evidence=ids[0] if ids else None
             result={'choice':choice,'thought':'依据实际经历决定下一步','reason':'值得验证时行动，没有新证据时等待',
                 'judgments':[],'action':None,'revisit_after_minutes':30}
@@ -87,12 +109,21 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
                 self.assertIsNotNone(evidence)
                 result['action']={'title':'隔离验证空闲想法','goal':'在工作区写一次experiment.txt并核对回执',
                     'assessment':{'problem_key':'idle-experiment','expected_gain':'验证自主行动闭环','verification':'检查文件和工具回执',
-                        'reuse_plan':'保存为下一次可比较经验','benefit':90,'confidence':90,'cost':10,'risk':0,'evidence':[evidence]}}
+                        'reuse_plan':'保存为下一次可比较经验','benefit':90,'confidence':90,'cost':10,'risk':0,'evidence':[evidence]},
+                    'completion_contract':ACTION_CONTRACT}
+                if self.mode=='legacy-act':result['action'].pop('completion_contract')
+                if self.mode=='text-act':result['action']['completion_contract']={'kind':'text','required_fragments':['实验完成']}
+                self.proposed_action=result['action']
             return text_response(json.dumps(result,ensure_ascii=False))
         if '你在为 Eve 独立完成一项委托的任务' in system:
-            if not self.results(body):return tool_response([('write_file',{'path':'experiment.txt','content':'actual experiment evidence','expected_sha256':''})])
-            self.assertTrue(self.results(body)[-1].get('success'),self.results(body))
-            return text_response('已经实际写入实验文件，回执成功')
+            results=self.results(body)
+            if not results:return tool_response([('write_file',{'path':'experiment.txt','content':EXPERIMENT,'expected_sha256':''})])
+            if len(results)==1:
+                self.assertTrue(results[-1].get('success'),results)
+                return tool_response([('read_file',{'path':'experiment.txt'})])
+            self.assertEqual(results[-1].get('sha256'),EXPERIMENT_SHA256,results)
+            self.assertEqual(results[-1].get('content'),EXPERIMENT,results)
+            return text_response('已经实际写入实验文件，并以末批读取回执核对完整SHA256')
         if not self.results(body):
             return tool_response([('configure_subject_autonomy',{'action':'configure_autonomy','enabled':True,'idle_reflection':True,'max_goals':5,'steps_per_goal':10})])
         self.assertTrue(self.results(body)[-1].get('enabled'),self.results(body))
@@ -126,7 +157,7 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
             self.wait_for(lambda:any(t['spec']['title']=='隔离验证空闲想法' and t['status']=='Completed' for t in self.tasks()),'行动未完成',15)
         self.run_idle(self.checkpoint('action'),checkpoints={'action':completed})
         self.assertEqual(self.reflections,1)
-        self.assertEqual((self.source/'experiment.txt').read_text(),'actual experiment evidence')
+        self.assertEqual((self.source/'experiment.txt').read_text(),EXPERIMENT)
         first=self.mind();self.assertEqual(first['revision'],1)
         self.due()
         self.run_idle(self.checkpoint('reconsider'),checkpoints={'reconsider':lambda:self.wait_revision(2)})
@@ -134,7 +165,13 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
         self.assertEqual(self.mind()['judgments'][0]['statement'],'实验结果改变了原来判断')
         actions=[t for t in self.tasks() if t['spec']['title']=='隔离验证空闲想法']
         self.assertEqual(len(actions),1)
-        self.assertEqual(actions[0]['usage']['tool_calls'],1)
+        self.assertEqual(actions[0]['usage'],{'tool_calls':2,'model_requests':3})
+        self.assertEqual(actions[0]['execution']['completion_contract'],ACTION_CONTRACT)
+        self.assertEqual(actions[0]['execution']['recoveries'],0)
+        checkpoint=actions[0]['execution']['checkpoint']
+        calls=[c for m in checkpoint['messages'] for c in m.get('tool_calls',[])]
+        self.assertEqual([c['name'] for c in calls],['write_file','read_file'])
+        self.assertEqual(calls[-1]['arguments'],ACTION_CONTRACT['contract']['checks'][0]['arguments'])
         reviews=[t for t in self.tasks() if t['source'].startswith('subject-idle:')]
         self.assertEqual(len(reviews),2)
         self.assertTrue(all(t['usage']=={'tool_calls':0,'model_requests':2} and t['notice'] is None for t in reviews))
@@ -150,6 +187,46 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
         self.assertEqual(self.mind()['revision'],1)
         self.assertFalse((self.source/'experiment.txt').exists())
         self.assertEqual(len(self.small),1)
+
+    def test_legacy_action_freezes_receipts_in_zero_tool_planning_before_execution(self):
+        self.mode='legacy-act';self.initialize();self.due()
+        def completed_and_delivered():
+            self.wait_for(lambda:any(t['source'].startswith('subject-focus:') and t['status']=='Completed'
+                for t in self.tasks()),'旧行动没有完成规划、冻结和真实验收',15)
+            self.wait_for(lambda:all(t['notice'] is None or t['notice']['status']=='Delivered'
+                for t in self.tasks()),'重启快照前已完成任务通知尚未送达',15)
+        self.run_idle(self.checkpoint('legacy-action'),checkpoints={'legacy-action':completed_and_delivered})
+        self.assertEqual(self.reflections,1)
+        self.assertEqual(self.plans,1)
+        [planning]=[t for t in self.tasks() if t['source'].startswith('subject-plan:')]
+        [action]=[t for t in self.tasks() if t['source'].startswith('subject-focus:')]
+        self.assertEqual(planning['status'],'Completed')
+        self.assertEqual(planning['usage'],{'tool_calls':0,'model_requests':1})
+        self.assertEqual(planning['execution']['completion_contract']['kind'],'text')
+        self.assertEqual(json.loads(planning['result'])['goal'],self.proposed_action['goal'])
+        self.assertEqual(action['execution']['completion_contract'],ACTION_CONTRACT)
+        self.assertEqual(action['usage'],{'tool_calls':2,'model_requests':3})
+        self.assertEqual(action['execution']['recoveries'],0)
+        self.assertEqual((self.source/'experiment.txt').read_text(),EXPERIMENT)
+        policy=next(f for f in self.subject()['foci'] if f['id']=='autonomy-policy-v1')
+        self.assertEqual(json.loads(policy['goal'])['issued'],3,'回顾、规划、行动各占原授权一个名额')
+        before=json.dumps(self.tasks(),sort_keys=True)
+        self.run_idle(self.checkpoint('legacy-quiet'),checkpoints={'legacy-quiet':lambda:time.sleep(1.3)})
+        self.assertEqual(json.dumps(self.tasks(),sort_keys=True),before,'重启不改合同或重复规划、行动')
+
+    def test_text_contract_cannot_authorize_or_complete_idle_action(self):
+        self.mode='text-act';self.initialize();self.due()
+        self.run_idle(self.checkpoint('text-rejected'),checkpoints={'text-rejected':lambda:self.wait_for(
+            lambda:any(t['source'].startswith('subject-idle:') and t['status']=='Failed' for t in self.tasks()),
+            '空闲行动错误接受纯文本合同',15)})
+        self.assertFalse((self.source/'experiment.txt').exists())
+        self.assertFalse(any(t['source'].startswith(('subject-focus:','subject-plan:')) for t in self.tasks()))
+        self.assertIsNone(self.mind())
+        [review]=[t for t in self.tasks() if t['source'].startswith('subject-idle:')]
+        self.assertEqual(review['usage'],{'tool_calls':0,'model_requests':2})
+        self.assertIn('空闲回顾结构、来源或判断修订检查失败',review['failure'])
+        saved=json.loads(review['execution']['checkpoint']['result'])
+        self.assertEqual(saved['action']['completion_contract']['kind'],'text')
 
     @unittest.skipUnless(os.environ.get('EVE_TEST_IDLE_SMALL_URL'),'仅显式配置时连接真实无密钥小模型')
     def test_explicit_real_small_endpoint_with_synthetic_experiences(self):

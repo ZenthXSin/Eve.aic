@@ -5,6 +5,7 @@ mod commands;
 mod conversations;
 mod files;
 mod live;
+mod trusted_review;
 pub use live::LiveDialogue;
 mod admission;
 mod observer;
@@ -20,7 +21,10 @@ mod progress;
 pub use progress::{ModelProgressNarrator, QqProgressFacts, QqProgressNarrator};
 mod state;
 
-pub use archive::{QqArchivedReceipt, QqReceiptArchive, read_archived_receipt};
+pub use archive::{
+    QqArchivedReceipt, QqOriginalBinding, QqOriginalMessage, QqReceiptArchive,
+    read_archived_receipt,
+};
 pub use commands::{QqCommandHandler, QqCommandInput};
 pub use conversations::{QqConversationIdentity, QqConversations, QqTurnAnchor, QqWakeupLease};
 pub use files::{
@@ -36,6 +40,7 @@ pub use outreach::{
 };
 pub use participants::QqParticipantObserver;
 pub use state::{ImageAttachment, Message};
+pub use trusted_review::QqRestrictionObserver;
 
 /// 慢步骤进度的时间阈值：本轮某一步（等待模型或一批工具）持续超过它仍未结束时，
 /// 通道补发一条说明当前步骤与已进行时长的进度。返回 None 表示关闭；每次检查时读取，可热修改。
@@ -232,6 +237,7 @@ pub struct QqBotPlugin {
     file_poll: Option<Duration>,
     attachment_observer: Option<Arc<dyn QqAttachmentObserver>>,
     raw_observer: Option<Arc<dyn QqRawMessageObserver>>,
+    restriction_observer: Option<Arc<dyn QqRestrictionObserver>>,
     conversations: QqConversations,
     participant_observer: Option<Arc<dyn QqParticipantObserver>>,
     timing_diagnostics: bool,
@@ -278,6 +284,7 @@ impl QqBotPlugin {
             file_poll: None,
             attachment_observer: None,
             raw_observer: None,
+            restriction_observer: None,
             conversations: QqConversations::default(),
             participant_observer: None,
             timing_diagnostics: false,
@@ -429,6 +436,11 @@ impl QqBotPlugin {
     }
 
     /// 收到消息时把原始平台事件交给宿主，仅供调试；未接线时丢弃。
+    /// 收到已验证原文后立即执行本地缩权，不等待旧轮次或审核模型返回。
+    pub fn with_restriction_observer(mut self, observer: Arc<dyn QqRestrictionObserver>) -> Self {
+        self.restriction_observer = Some(observer);
+        self
+    }
     pub fn with_raw_observer(mut self, observer: Arc<dyn QqRawMessageObserver>) -> Self {
         self.raw_observer = Some(observer);
         self
@@ -501,6 +513,8 @@ impl Plugin for QqBotPlugin {
         Box::pin(async move {
             let mut ledger = state::Ledger::load(&ctx)?;
             ledger.attach_archive(self.receipt_archive.clone())?;
+            self.conversations
+                .attach_review_archive(&ctx, self.receipt_archive.clone())?;
             // 群白名单只认主人本人（按登记的账号判断，不看昵称）。进程重启后用已校验的持久
             // 回执把主人的群会话与群号交回宿主，这样名单管理不必等本人再在群里开口。
             if let (Some(access), Some(owners)) = (&self.group_access, &self.owner_directory) {
@@ -589,6 +603,7 @@ impl Plugin for QqBotPlugin {
             let file_poll = self.file_poll;
             let attachment_observer = self.attachment_observer.clone();
             let raw_observer = self.raw_observer.clone();
+            let restriction_observer = self.restriction_observer.clone();
             let conversations = self.conversations.clone();
             let participant_observer = self.participant_observer.clone();
             let group_observer = self.group_observer.clone();
@@ -622,6 +637,7 @@ impl Plugin for QqBotPlugin {
                     let files = files.clone();
                     let attachment_observer = attachment_observer.clone();
                     let raw_observer = raw_observer.clone();
+                    let restriction_observer = restriction_observer.clone();
                     let conversations = conversations.clone();
                     let participant_observer = participant_observer.clone();
                     let group_observer = group_observer.clone();
@@ -658,6 +674,7 @@ impl Plugin for QqBotPlugin {
                                 file_poll,
                                 attachment_observer,
                                 raw_observer,
+                                restriction_observer,
                                 conversations,
                                 participant_observer,
                                 group_observer,

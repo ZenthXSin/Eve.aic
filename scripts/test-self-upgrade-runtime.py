@@ -12,12 +12,40 @@ import sysconfig
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name('self_upgrade_runtime.py')
 spec = importlib.util.spec_from_file_location('upgrade_runtime', SCRIPT)
 runtime = importlib.util.module_from_spec(spec); spec.loader.exec_module(runtime)
 
 class DigestTests(unittest.TestCase):
+    def test_hash_and_json_reads_remain_bounded_when_open_file_grows(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'growing'
+            path.write_bytes(b'{"value":1}')
+            observed = []
+            real = os.fstat
+            def outdated(fd):
+                metadata = real(fd)
+                observed.append(fd)
+                return SimpleNamespace(st_mode=metadata.st_mode, st_size=3)
+            with patch.object(runtime.os, 'fstat', side_effect=outdated):
+                with self.assertRaisesRegex(ValueError, 'binary_or_resource_changed_during_read'):
+                    runtime.digest(path)
+            # metadata initially fits; opening the stream appends bytes before the bounded read.
+            path.write_bytes(b'{}')
+            original = Path.open
+            def growing(current, *args, **kwargs):
+                stream = original(current, *args, **kwargs)
+                if current == path and args == ('rb',):
+                    with original(current, 'ab') as writer: writer.write(b' ' * 30)
+                return stream
+            with patch.object(Path, 'open', growing), patch.object(runtime.os, 'fstat', side_effect=outdated):
+                with self.assertRaisesRegex(ValueError, 'json_file_grew_beyond_limit'):
+                    runtime.read_json(path, 10)
+            self.assertTrue(observed)
+
     @unittest.skipIf(os.name == 'nt', 'Windows runner 不保证有文件符号链接权限')
     def test_request_file_symlink_cannot_change_the_manual_request_gate(self):
         from types import SimpleNamespace
@@ -359,6 +387,39 @@ while True:
             time.sleep(.02)
         self.fail('supervisor timeout; phase/result: '+repr((d.get('phase'), d.get('result'), d.get('error')) if p.exists() else None)+'; '+(self.root/'supervisor.log').read_text(errors='replace'))
 
+    def test_restart_request_restarts_same_child_only_after_delivery_and_records_result(self):
+        self.launch()
+        before = (self.state / 'state.json').read_bytes()
+        request = {'format_version': runtime.VERSION, 'action': 'restart',
+                   'session_id': self.session, 'requested_by': self.session, 'turn_id': 1}
+        runtime.atomic(self.queue / 'request.json', request)
+        self.wait(lambda d: d['result'] == 'restarted')
+        self.assertEqual(self.events.read_text().splitlines(), ['old', 'old'])
+        self.assertEqual((self.state / 'state.json').read_bytes(), before)
+        self.assertFalse((self.queue / 'request.json').exists())
+        self.assertEqual(runtime.read_json(self.queue / 'supervisor.json')['restart_supported'], True)
+
+    def test_restart_request_waits_for_exact_turn_delivery(self):
+        self.write_state('Pending', 'Processing')
+        self.launch()
+        request = {'format_version': runtime.VERSION, 'action': 'restart',
+                   'session_id': self.session, 'requested_by': self.session, 'turn_id': 1}
+        runtime.atomic(self.queue / 'request.json', request)
+        self.wait(lambda d: d['phase'] == 'waiting')
+        time.sleep(.2)
+        self.assertEqual(self.events.read_text().splitlines(), ['old'])
+        self.write_state('Completed', 'Sent')
+        self.wait(lambda d: d['result'] == 'restarted')
+        self.assertEqual(self.events.read_text().splitlines(), ['old', 'old'])
+
+    def test_restart_request_rejects_bad_scope_without_stopping_child(self):
+        self.launch()
+        request = {'format_version': runtime.VERSION, 'action': 'restart',
+                   'session_id': 'wrong', 'requested_by': self.session, 'turn_id': 1}
+        runtime.atomic(self.queue / 'request.json', request)
+        self.wait(lambda d: d['result'] == 'rejected')
+        self.assertEqual(self.events.read_text().splitlines(), ['old'])
+
     def test_startup_readiness_failure_retries_with_the_same_bounded_recovery_budget(self):
         (self.initial/'AGENT.md').write_text('startup-retry')
         self.launch()
@@ -379,7 +440,7 @@ while True:
     def test_manual_switch_waits_for_task_and_side_file_delivery_without_state_stamp_change(self):
         self.launch()
         path=self.state/'state.json';state=runtime.read_json(path)
-        state['entries']['eve.task']={'tasks.v1':list(json.dumps({'tasks':[{'status':'Running'}]}).encode())}
+        state['entries']['eve.task']={'tasks.v1':list(json.dumps({'format_version':2,'tasks':[{'id':'task-1','status':'Running'}]}).encode())}
         runtime.atomic(path,state)
         request=self.candidate('new');runtime.atomic(self.queue/'request.json',request)
         self.wait(lambda d:d['phase']=='waiting');time.sleep(.3)
@@ -395,6 +456,215 @@ while True:
         self.assertEqual(path.stat().st_mtime_ns,stamp)
         self.assertEqual(self.events.read_text().splitlines(),['old','new'])
         self.assertFalse((Path(request['candidate_directory'])/'resources/connectors/qqbot/node_modules').exists())
+
+    def cold_task(self, status='Completed', notice='Delivered'):
+        task = dict(id='task-1', owner={'session_id': self.session, 'user_id': self.session},
+                    source='fixture', spec={'title': '验证升级', 'instructions': '真实隔离验收', 'max_steps': 10,
+                    'context': {'owner': {'session_id': self.session, 'user_id': self.session}, 'messages_json': '[]'}},
+                    created_at_ms=1, status=status, cancel_requested=False, started_at_ms=2,
+                    finished_at_ms=3 if status == 'Completed' else None,
+                    usage={'tool_calls': 1, 'model_requests': 1} if status == 'Completed' else None,
+                    result='完成' if status == 'Completed' else None, failure=None,
+                    notice={'status': notice, 'attempts': [], 'closed_at_ms': 3} if status == 'Completed' else None,
+                    execution={'checkpoint': {'private_fixture': True}, 'recoveries': 0,
+                               'resume_at_ms': None, 'deadline_at_ms': 100})
+        raw = json.dumps(task, ensure_ascii=False).encode()
+        directory = json.loads(raw)
+        directory['spec'].pop('context')
+        directory['result'] = directory['failure'] = None
+        directory['execution']['checkpoint'] = None
+        archive = self.state / 'task-archive'; archive.mkdir(exist_ok=True)
+        key = hashlib.sha256(raw).hexdigest()
+        cold = archive / (key + '.json'); cold.write_bytes(raw)
+        ledger = {'format_version': 4, 'tasks': [{'directory': directory, 'record': {'hash': key, 'bytes': len(raw)}}]}
+        self.save_tasks(ledger)
+        return cold, ledger
+
+    def save_tasks(self, ledger):
+        path = self.state / 'state.json'
+        state = runtime.read_json(path)
+        state['entries']['eve.task'] = {'tasks.v1': list(json.dumps(ledger).encode())}
+        runtime.atomic(path, state)
+
+    def test_cold_tasks_hold_manual_upgrade_and_preserve_complete_archive_after_switch(self):
+        self.cold_task('Running')
+        self.launch()
+        request = self.candidate('new'); runtime.atomic(self.queue / 'request.json', request)
+        self.wait(lambda d: d['phase'] == 'waiting')
+        time.sleep(.2)
+        self.assertEqual(self.events.read_text().splitlines(), ['old'])
+        self.cold_task(notice='Delivering')
+        time.sleep(.2)
+        self.assertEqual(self.events.read_text().splitlines(), ['old'])
+        archive, _ = self.cold_task()
+        before = (self.state / 'state.json').read_bytes(), archive.read_bytes()
+        self.wait(lambda d: d['result'] == 'applied')
+        self.assertEqual(self.events.read_text().splitlines(), ['old', 'new'])
+        self.assertEqual(((self.state / 'state.json').read_bytes(), archive.read_bytes()), before)
+        self.assertEqual(next((self.queue / 'backups').glob('*/task-archive/' + archive.name)).read_bytes(), before[1])
+
+    def test_cold_task_gate_rejects_missing_tampered_directory_unknown_version_and_duplicate_ids(self):
+        archive, ledger = self.cold_task()
+        path = self.state / 'state.json'
+        original = archive.read_bytes()
+        self.assertTrue(runtime.runtime_idle_gate(path))
+        archive.unlink()
+        with self.assertRaisesRegex(ValueError, 'invalid_task_archive_file'): runtime.runtime_idle_gate(path)
+        archive.write_bytes(original[:-1] + b' ')
+        with self.assertRaisesRegex(ValueError, 'task_archive_digest_mismatch'): runtime.runtime_idle_gate(path)
+        archive.write_bytes(original)
+        ledger['tasks'][0]['directory']['status'] = 'Running'; self.save_tasks(ledger)
+        with self.assertRaisesRegex(ValueError, 'task_archive_directory_mismatch'): runtime.runtime_idle_gate(path)
+        ledger['tasks'][0]['directory']['status'] = 'Completed'
+        ledger['format_version'] = 5; self.save_tasks(ledger)
+        with self.assertRaisesRegex(ValueError, 'unknown_task_ledger_version'): runtime.runtime_idle_gate(path)
+        ledger['format_version'] = 4
+        ledger['tasks'].append(ledger['tasks'][0]); self.save_tasks(ledger)
+        before = path.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'invalid_task_ledger_record'): runtime.runtime_idle_gate(path)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(archive.read_bytes(), original)
+
+    @unittest.skipIf(os.name == 'nt', 'Windows runner 不保证有文件符号链接权限')
+    def test_cold_task_archive_symlink_never_opens_idle_gate(self):
+        archive, _ = self.cold_task()
+        target = self.root / 'task-body'; archive.rename(target); archive.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, 'invalid_task_archive_file'):
+            runtime.runtime_idle_gate(self.state / 'state.json')
+
+    def managed_candidate(self, tag='managed'):
+        request = self.candidate(tag)
+        old = Path(request['candidate_directory'])
+        manifest = runtime.read_json(old / 'manifest.json')
+        manifest['source'].update(diff=hashlib.sha256(b'').hexdigest(), untracked=hashlib.sha256(b'').hexdigest())
+        for name in runtime.RUNTIME_SCRIPTS:
+            target = old / 'resources' / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((SCRIPT.parent / Path(name).name).read_bytes())
+            manifest['resources'][name] = runtime.digest(target)
+        (old / 'source-diff.patch').write_bytes(b'')
+        manifest['source_diff'] = dict(path='source-diff.patch', sha256=hashlib.sha256(b'').hexdigest(),
+            base_revision='1' * 40, target_revision=manifest['source']['head'])
+        manifest['runtime'] = runtime.RUNTIME_CONTRACT
+        identity = {key: manifest[key] for key in ('source', 'binary_sha256', 'resources', 'runtime', 'source_diff')}
+        key = runtime.value_digest(identity)
+        new = old.with_name(key); old.rename(new)
+        manifest.update(candidate_sha256=key, candidate_path=str(new / Path(manifest['candidate_path']).name))
+        runtime.atomic(new / 'manifest.json', manifest)
+        request.update(candidate_sha256=key, candidate_directory=str(new))
+        request['lease'] = runtime.prepare_lease(new, manifest)
+        return request
+
+    def test_complete_source_diff_and_runtime_resources_are_bound_and_required_for_handoff(self):
+        from types import SimpleNamespace
+        request = self.managed_candidate()
+        binary, _, manifest = runtime.validate_candidate(request, self.candidates)
+        self.assertEqual(runtime.upgrade_plan(manifest)['operation'], 'switch_runtime_preserve_state')
+        runtime.validate_lease(request, binary.parent, manifest)
+        supervisor = runtime.Supervisor(SimpleNamespace(directory=self.queue, candidates=self.candidates,
+            command=self.command))
+        try:
+            with self.assertRaisesRegex(ValueError, 'runtime_handoff_requires_host_bridge'):
+                supervisor.candidate_command(request)
+        finally:
+            supervisor.lock.close()
+        artifact = binary.parent / 'source-diff.patch'; artifact.write_text('unreviewed source')
+        with self.assertRaisesRegex(ValueError, 'source_diff_changed'):
+            runtime.validate_candidate(request, self.candidates)
+
+    def test_managed_supervisor_hands_off_only_after_delivery_and_never_switches_locally(self):
+        from types import SimpleNamespace
+        request = self.managed_candidate()
+        descriptor = dict(format_version=1, command=self.command, candidate_request=None, source_revision='1' * 40)
+        launch = self.queue / 'launch.json'; runtime.atomic(launch, descriptor)
+        nonce = 'a' * 64
+        supervisor = runtime.Supervisor(SimpleNamespace(directory=self.queue, candidates=self.candidates,
+            command=self.command, host_bridge=self.queue, host_nonce=nonce, launch_descriptor=launch,
+            ready_timeout=3, stop_timeout=3, health_seconds=.05))
+        supervisor.child = runtime.Child(self.command)
+        try:
+            supervisor.wait_ready(supervisor.child)
+            self.write_state('Pending', 'Processing')
+            runtime.atomic(self.queue / 'request.json', request)
+            command, manifest = supervisor.candidate_command(request)
+            with self.assertRaisesRegex(ValueError, 'runtime_not_idle'):
+                supervisor.switch(request, command, manifest)
+            self.assertIsNone(supervisor.child.process.poll())
+            self.write_state('Completed', 'Sent')
+            supervisor.switch(request, command, manifest)
+            self.assertEqual(supervisor.status['result'], 'handed_off')
+            self.assertTrue(supervisor.handoff)
+            self.assertTrue(supervisor.stopping)
+            self.assertEqual(self.events.read_text().splitlines(), ['old'])
+            self.assertFalse((self.queue / 'active-command.json').exists())
+            self.assertEqual(runtime.read_json(self.queue / 'handoff-request.json'),
+                dict(format_version=1, nonce=nonce, base_candidate_sha256=None, request=request, command=command))
+            self.assertTrue((self.queue / 'processing.json').exists())
+        finally:
+            supervisor.child.stop(3)
+            supervisor.lock.close()
+
+    def test_managed_runtime_waits_for_matching_host_commit_before_scheduling(self):
+        from types import SimpleNamespace
+        supervisor = SimpleNamespace(root=self.queue, host_bridge=self.queue, host_nonce='a' * 64,
+                                     status={'active_candidate_sha256': 'b' * 64})
+        check = lambda: runtime.Supervisor.host_activation_confirmed(supervisor)
+        self.assertFalse(check())
+        status = dict(format_version=1, phase='starting', child_pid=os.getpid(),
+                      host_nonce=supervisor.host_nonce, candidate_sha256='b' * 64)
+        runtime.atomic(self.queue / 'host-status.json', status)
+        self.assertFalse(check())
+        status['phase'] = 'running'
+        runtime.atomic(self.queue / 'host-status.json', status)
+        self.assertTrue(check())
+        for key, value in [('child_pid', os.getpid() + 1), ('host_nonce', 'c' * 64),
+                           ('candidate_sha256', 'd' * 64), ('format_version', True)]:
+            runtime.atomic(self.queue / 'host-status.json', dict(status, **{key: value}))
+            self.assertFalse(check())
+
+    def test_managed_runtime_rejects_dirty_binary_and_submodule_source_evidence(self):
+        request = self.managed_candidate()
+        directory = Path(request['candidate_directory'])
+        manifest = runtime.read_json(directory / 'manifest.json')
+        manifest['source']['diff'] = '0' * 64
+        runtime.atomic(directory / 'manifest.json', manifest)
+        with self.assertRaisesRegex(ValueError, 'source_diff_requires_clean_committed_source'):
+            runtime.validate_candidate(request, self.candidates)
+        manifest['source']['diff'] = hashlib.sha256(b'').hexdigest()
+        for patch in (b'GIT binary patch\n', b'Binary files a/x and b/x differ\n',
+                      b'index 111..222 160000\n', b'new file mode 160000\n'):
+            (directory / 'source-diff.patch').write_bytes(patch)
+            manifest['source_diff']['sha256'] = hashlib.sha256(patch).hexdigest()
+            runtime.atomic(directory / 'manifest.json', manifest)
+            with self.assertRaisesRegex(ValueError, 'source_diff_not_reviewable'):
+                runtime.validate_candidate(request, self.candidates)
+
+    def test_managed_status_reports_only_committed_matching_host_result_once(self):
+        from types import SimpleNamespace
+        descriptor = dict(format_version=1, command=self.command, candidate_request=None, source_revision='1' * 40)
+        receipt = dict(format_version=1, phase='rolled_back', previous={'descriptor': descriptor},
+                       next={'descriptor': dict(descriptor, candidate_request={'candidate_sha256': 'a' * 64})},
+                       error='host_managed_runtime_failed', updated_at_ms=1)
+        status = {'active_source_revision': '1' * 40}
+        supervisor = SimpleNamespace(root=self.queue, host_bridge=self.queue, host_confirmed=False,
+                                     command=self.command, active_descriptor=descriptor, status=status,
+                                     publish=lambda **changes: status.update(changes))
+        runtime.atomic(self.queue / 'host-handoff.json', dict(receipt, phase='trial'))
+        with self.assertRaisesRegex(ValueError, 'invalid_host_handoff_receipt'):
+            runtime.Supervisor.confirm_host_result(supervisor)
+        self.assertNotIn('result', status)
+        runtime.atomic(self.queue / 'host-handoff.json', receipt)
+        runtime.Supervisor.confirm_host_result(supervisor)
+        self.assertEqual(status['result'], 'rolled_back_runtime_state_preserved')
+        self.assertEqual(status['candidate_sha256'], 'a' * 64)
+        status['result'] = 'restarted'
+        runtime.Supervisor.confirm_host_result(supervisor)
+        self.assertEqual(status['result'], 'restarted')
+        supervisor.host_confirmed = False
+        receipt['previous']['descriptor']['source_revision'] = '2' * 40
+        runtime.atomic(self.queue / 'host-handoff.json', receipt)
+        with self.assertRaisesRegex(ValueError, 'host_handoff_receipt_mismatch'):
+            runtime.Supervisor.confirm_host_result(supervisor)
 
     def test_incomplete_node_dependency_cache_is_rebuilt_without_modifying_candidate(self):
         from types import SimpleNamespace
@@ -573,6 +843,51 @@ while True:
         self.assertEqual(self.events.read_text().splitlines(),['old','fail','old'])
         self.assertIn('synthetic.candidate',runtime.read_json(self.state/'state.json')['entries'])
         self.assertEqual(next((self.queue/'backups').glob('*/state.json')).read_bytes(),before)
+        self.assertTrue((self.queue / 'quarantine' / (request['candidate_sha256'] + '.json')).is_file())
+        runtime.atomic(self.queue / 'request.json', request)
+        self.wait(lambda d: d['result'] == 'rejected' and d['error'] == 'candidate_quarantined')
+        self.assertEqual(self.events.read_text().splitlines(), ['old', 'fail', 'old'])
+
+    def test_switch_commit_failure_restores_runtime_and_durable_pointer(self):
+        from types import SimpleNamespace
+        options = SimpleNamespace(directory=self.queue, candidates=self.candidates,
+            command=self.command, ready_timeout=3, stop_timeout=3, health_seconds=.05)
+        supervisor = runtime.Supervisor(options)
+        supervisor.child = runtime.Child(self.command)
+        try:
+            supervisor.wait_ready(supervisor.child)
+            initial = supervisor.active_descriptor
+            for failure in ('snapshot', 'publish'):
+                request = self.candidate('new-' + failure)
+                runtime.atomic(self.queue / 'request.json', request)
+                command, manifest = supervisor.candidate_command(request)
+                if failure == 'snapshot':
+                    original = runtime.snapshot_command
+                    def broken(command, candidate_request=None):
+                        if candidate_request == request: raise ValueError('synthetic_descriptor_failure')
+                        return original(command, candidate_request)
+                    injected = patch.object(runtime, 'snapshot_command', side_effect=broken)
+                else:
+                    original = supervisor.publish
+                    def broken(**changes):
+                        if changes.get('result') == 'applied': raise OSError('synthetic status write failure')
+                        return original(**changes)
+                    injected = patch.object(supervisor, 'publish', side_effect=broken)
+                with injected:
+                    supervisor.switch(request, command, manifest)
+                self.assertEqual(supervisor.status['result'], 'rolled_back_binary_state_preserved')
+                self.assertEqual(supervisor.command, self.command)
+                self.assertEqual(supervisor.active_descriptor, initial)
+                self.assertEqual(supervisor.status['active_sha256'], initial['binary_sha256'])
+                self.assertFalse((self.queue / 'active-command.json').exists())
+                self.assertIsNone(supervisor.child.process.poll())
+            supervisor.child.stop(3)
+        finally:
+            supervisor.child.stop(3)
+            supervisor.lock.close()
+        (self.queue / 'supervisor.json').unlink()
+        self.launch()
+        self.assertEqual(self.events.read_text().splitlines(), ['old', 'new-snapshot', 'old', 'new-publish', 'old', 'old'])
 
     def add_receipt(self, state='Processing', progress=None):
         path=self.state/'state.json';doc=runtime.read_json(path)
@@ -670,6 +985,37 @@ while True:
         self.assertEqual(self.process.wait(timeout=10),0)
         self.log.close();self.launch()
         self.assertEqual(self.events.read_text().splitlines(),['old','new','new'])
+
+    def test_reapplying_active_candidate_after_supervisor_restart_preserves_rollback_anchor(self):
+        self.launch(); request = self.candidate('new')
+        runtime.atomic(self.queue / 'request.json', request)
+        self.wait(lambda d: d['result'] == 'applied')
+        previous = (self.queue / 'previous-command.json').read_bytes()
+        self.process.send_signal(signal.CTRL_BREAK_EVENT if os.name == 'nt' else signal.SIGINT)
+        self.assertEqual(self.process.wait(timeout=10), 0)
+        self.log.close(); self.process = None
+        (self.queue / 'supervisor.json').unlink()
+        self.launch()
+        runtime.atomic(self.queue / 'request.json', request)
+        self.wait(lambda d: d['result'] == 'applied')
+        self.assertEqual(self.events.read_text().splitlines(), ['old', 'new', 'new'])
+        self.assertEqual((self.queue / 'previous-command.json').read_bytes(), previous)
+        (self.state / 'new.crash').touch()
+        self.wait(lambda d: d['result'] == 'runtime_rolled_back_binary_state_preserved' and d['phase'] == 'running')
+        self.assertEqual(self.events.read_text().splitlines(), ['old', 'new', 'new', 'old'])
+
+    def test_failed_second_upgrade_preserves_first_upgrade_previous_version(self):
+        self.launch(); first = self.candidate('first')
+        runtime.atomic(self.queue / 'request.json', first)
+        self.wait(lambda d: d['result'] == 'applied')
+        previous = (self.queue / 'previous-command.json').read_bytes()
+        second = self.candidate('fail')
+        runtime.atomic(self.queue / 'request.json', second)
+        self.wait(lambda d: d['result'] == 'rolled_back_binary_state_preserved')
+        self.assertEqual((self.queue / 'previous-command.json').read_bytes(), previous)
+        (self.state / 'first.crash').touch()
+        self.wait(lambda d: d['result'] == 'runtime_rolled_back_binary_state_preserved' and d['phase'] == 'running')
+        self.assertEqual(self.events.read_text().splitlines(), ['old', 'first', 'fail', 'first', 'old'])
         self.assertFalse((self.queue/'request.json').exists())
 
     def test_runtime_crash_restarts_once_and_preserves_new_state(self):

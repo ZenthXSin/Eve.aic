@@ -208,9 +208,9 @@ impl Bubblewrap {
                 command.args(["--", "/entry"]);
             }
             Language::Python => {
+                let python = resolve(&self.python)?;
                 // 解释器来自可信PATH/配置；同时只读挂载其安装前缀的lib，支持非/usr的CI Python。
-                let library = self
-                    .python
+                let library = python
                     .parent()
                     .and_then(Path::parent)
                     .map(|prefix| prefix.join("lib"))
@@ -221,14 +221,14 @@ impl Bubblewrap {
                     .arg(library)
                     .arg("/runtime/lib")
                     .arg("--ro-bind")
-                    .arg(&self.python)
+                    .arg(&python)
                     .arg("/runtime/bin/python")
                     .args(["--", "/runtime/bin/python", "-I", "-B", "-u", "/entry"]);
             }
             Language::Javascript => {
                 command
                     .arg("--ro-bind")
-                    .arg(&self.node)
+                    .arg(resolve(&self.node)?)
                     .arg("/runtime/node")
                     .args([
                         "--",
@@ -256,6 +256,11 @@ impl Bubblewrap {
             })
             .map_err(|_| reject("隔离进程启动失败，未降级到宿主 exec"))
     }
+}
+
+/// 跟随可信解释器的符号链接，避免沙箱内绑定失效，并从真实安装前缀查找库。
+fn resolve(path: &Path) -> Result<PathBuf> {
+    std::fs::canonicalize(path).map_err(|_| reject("语言运行时路径无法解析，未启动脚本"))
 }
 
 /// 拒绝新进程、额外 namespace 和常见跨进程/内核访问；允许 Node 运行时线程。

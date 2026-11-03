@@ -1,6 +1,12 @@
 //! 原会话条件唤醒：有限的本地观察、持久准入、原会话 Control 与真实平台回执。
+#[cfg(test)]
+#[path = "qq_trigger_authorization_tests.rs"]
+mod authorization_tests;
 use crate::AppError;
-use eve_control_api::{ControlInput, ControlPhase, ControlService, DiscardControlEvents};
+use eve_control_api::{
+    ControlInput, ControlPhase, ControlReviewEvidence, ControlRunMetadata, ControlService,
+    DiscardControlEvents,
+};
 use eve_llm_api::ContextScope;
 use eve_llm_api::{
     Tool, ToolCall, ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolExecutionError,
@@ -129,16 +135,32 @@ impl Observations {
         self.authorization = Some(authorization);
         self
     }
+    /// 从实际开发后端取得观察边界；没有后端能力就不能依据环境猜测许可。
+    pub(crate) fn with_development(
+        mut self,
+        capabilities: Option<eve_developer_api::DeveloperObservationCapabilities>,
+    ) -> Self {
+        self.workspace = capabilities.as_ref().map(|c| c.workspace.clone());
+        self.processes = capabilities.is_some_and(|c| c.processes);
+        self
+    }
     fn authorized(&self, owner: &SessionKey) -> bool {
-        self.operators.contains(&owner.user_id)
-            || self.authorization.as_ref().is_some_and(|a| {
-                a.is_operator(&ContextScope {
+        match &self.authorization {
+            Some(authorization) => {
+                let scope = ContextScope {
                     session_id: owner.session_id.clone(),
                     user_id: owner.user_id.clone(),
-                })
-            })
+                };
+                authorization.is_operator(&scope) && authorization.permits_business(&scope)
+            }
+            None => self.operators.contains(&owner.user_id),
+        }
     }
-    fn file(&self, owner: &SessionKey, path: &str) -> Result<String, ToolExecutionError> {
+    pub(crate) fn file(
+        &self,
+        owner: &SessionKey,
+        path: &str,
+    ) -> Result<String, ToolExecutionError> {
         if !self.authorized(owner) {
             return Err(failed("文件触发仅限已授权开发操作者"));
         }
@@ -185,7 +207,11 @@ impl Observations {
             .map(|b| format!("{b:02x}"))
             .collect())
     }
-    fn process(&self, owner: &SessionKey, pid: u32) -> Result<String, ToolExecutionError> {
+    pub(crate) fn process(
+        &self,
+        owner: &SessionKey,
+        pid: u32,
+    ) -> Result<String, ToolExecutionError> {
         if !self.processes || !self.authorized(owner) {
             return Err(failed("进程观察仅限已启用命令的开发操作者"));
         }
@@ -386,13 +412,16 @@ impl Tool for Tools {
     fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
         Box::pin(async move {
             let owner = owner(&context)?;
-            if self
+            if !crate::web_chat::is_owner(&ContextScope {
+                session_id: owner.session_id.clone(),
+                user_id: owner.user_id.clone(),
+            }) && self
                 .conversations
                 .identity(&owner)
                 .map_err(failed)?
                 .is_none()
             {
-                return Err(failed("没有已验证的 QQ 会话路由"));
+                return Err(failed("没有已验证的通道会话身份"));
             }
             let observations = self
                 .observations
@@ -551,11 +580,21 @@ impl Tool for Tools {
                             "时间条件必须早于触发器有效期，请延长 expires_in_seconds",
                         ));
                     }
-                    let t = self
-                        .admin
-                        .create(owner, source, spec, now)
-                        .map_err(failed)?;
-                    Ok(json!({"created":true,"trigger":t,"current_time_ms":now}))
+                    let t = if spec.resume_task_id.is_some() {
+                        // 原任务接续只使用任务账本自身冻结的证据，不混入这次登记说明。
+                        self.admin.create(owner, source, spec, now)
+                    } else {
+                        let originals = crate::qq_trigger_review::capture(&context, &owner)?;
+                        self.admin
+                            .create_with_review_messages(owner, source, spec, originals, now)
+                    }
+                    .map_err(failed)?;
+                    let mut view = serde_json::to_value(&t).map_err(failed)?;
+                    // 原话只在专用审核槽和持久账本中保存，不复制进模型工具轨迹。
+                    if let Some(view) = view.as_object_mut() {
+                        view.remove("review_messages");
+                    }
+                    Ok(json!({"created":true,"trigger":view,"current_time_ms":now}))
                 }
             }
         })
@@ -706,8 +745,9 @@ fn submit_wakeup(
     observations: &Observations,
     ticket: &str,
     input: ControlInput,
+    metadata: Option<ControlRunMetadata>,
 ) -> Result<eve_control_api::ControlResult<eve_control_api::GenerationKey>, AppError> {
-    let result = control.submit(input, Arc::new(DiscardControlEvents));
+    let result = control.submit_with_metadata(input, metadata, Arc::new(DiscardControlEvents));
     observations.finish_admission(
         ticket,
         match &result {
@@ -813,6 +853,44 @@ async fn run(
                 }
             }
             if let Some(id) = &t.spec.resume_task_id {
+                let tasks = observations.tasks.as_ref().ok_or("后台任务未启用")?;
+                let owner = eve_task_api::TaskOwner {
+                    session_id: t.owner.session_id.clone(),
+                    user_id: t.owner.user_id.clone(),
+                };
+                let mut expected_checkpoint = None;
+                if let Some(task) = tasks.get_owned(&owner, id)? {
+                    let confirmed = crate::qq_task_wait::confirmed_wait(&t, &task);
+                    if confirmed.is_some()
+                        && matches!(
+                            task.status,
+                            eve_task_api::TaskStatus::Queued | eve_task_api::TaskStatus::Running
+                        )
+                    {
+                        // 自登记时原任务仍在运行；条件可先满足，必须等原执行器安全提交 Blocked。
+                        // 保留 Ready 与证据，不抢占当前轮次、不消费接续次数或主体准入。
+                        continue;
+                    }
+                    if confirmed == Some(false) {
+                        transition(
+                            admin.as_ref(),
+                            &t.id,
+                            Status::Ready,
+                            Status::Failed,
+                            Some(failure_receipt(
+                                &t,
+                                "technical_wait",
+                                "not_started",
+                                "原任务未以匹配的技术等待回执安全阻塞；可能需要用户决定，未自动接续",
+                            )),
+                        )?;
+                        continue;
+                    }
+                    if confirmed == Some(true) {
+                        expected_checkpoint =
+                            task.execution.and_then(|execution| execution.checkpoint);
+                    }
+                }
                 let Some(ticket) = observations.begin_admission(&t)? else {
                     continue;
                 };
@@ -821,28 +899,26 @@ async fn run(
                     continue;
                 }
                 t.runs = t.runs.saturating_add(1);
-                let resumed = observations
-                    .tasks
-                    .as_ref()
-                    .ok_or("后台任务未启用")?
-                    .resume_blocked(
-                        &eve_task_api::TaskOwner {
-                            session_id: t.owner.session_id.clone(),
-                            user_id: t.owner.user_id.clone(),
-                        },
+                let evidence = format!(
+                    "触发器 {} 已满足条件 {:?}；原任务内接续说明：{}",
+                    t.id, t.evidence, t.spec.instructions
+                );
+                let resumed = match expected_checkpoint {
+                    Some(checkpoint) => tasks.resume_blocked_checkpoint(
+                        &owner,
                         id,
-                        &format!(
-                            "触发器 {} 已满足条件 {:?}；原任务内接续说明：{}",
-                            t.id, t.evidence, t.spec.instructions
-                        ),
+                        &checkpoint,
+                        &evidence,
                         now_ms(),
-                    );
+                    ),
+                    None => tasks.resume_blocked(&owner, id, &evidence, now_ms()),
+                };
                 observations.finish_admission(
                     &ticket,
-                    if resumed.is_ok() {
-                        QqAdmissionResult::Started
-                    } else {
-                        QqAdmissionResult::Rejected
+                    match &resumed {
+                        Ok(_) => QqAdmissionResult::Started,
+                        Err(eve_task_api::TaskError::Busy) => QqAdmissionResult::Retry,
+                        Err(_) => QqAdmissionResult::Rejected,
                     },
                 )?;
                 let did_resume = resumed.is_ok();
@@ -854,6 +930,12 @@ async fn run(
                             task.id
                         ),
                     ),
+                    Err(eve_task_api::TaskError::Busy) => {
+                        // 通知仍在发送，原任务未接续。保留条件证据和原期限；
+                        // 回到 Ready 同时退还本次运行计数，主体准入也允许重试。
+                        transition(admin.as_ref(), &t.id, Status::Running, Status::Ready, None)?;
+                        continue;
+                    }
                     Err(e) => (
                         Status::Failed,
                         failure_receipt(&t, "resume", "not_started", &e.to_string()),
@@ -874,14 +956,42 @@ async fn run(
                 }
                 continue;
             }
+            let originals = match crate::qq_trigger_review::restore(&t) {
+                Ok(originals) => originals,
+                Err(error) => {
+                    transition(
+                        admin.as_ref(),
+                        &t.id,
+                        Status::Ready,
+                        Status::Failed,
+                        Some(failure_receipt(
+                            &t,
+                            "authorization",
+                            "not_started",
+                            &error.to_string(),
+                        )),
+                    )?;
+                    continue;
+                }
+            };
             if control
                 .snapshot(&t.owner)?
                 .is_some_and(|s| s.phase != ControlPhase::Finished)
             {
                 continue;
             }
-            let Some(lease) = conversations.try_claim_wakeup() else {
-                continue;
+            // QQ 租约只协调真实 QQ 入站队列；Web 由同一主体准入和 Control
+            // 代际锁协调，不依赖不存在的 QQ 通道空闲信号或伪造路由。
+            let lease = if crate::web_chat::is_owner(&ContextScope {
+                session_id: t.owner.session_id.clone(),
+                user_id: t.owner.user_id.clone(),
+            }) {
+                None
+            } else {
+                let Some(lease) = conversations.try_claim_wakeup() else {
+                    continue;
+                };
+                Some(lease)
             };
             let Some(ticket) = observations.begin_admission(&t)? else {
                 continue;
@@ -906,6 +1016,14 @@ async fn run(
                     },
                     task_id: t.id.clone(),
                 },
+                Some(ControlRunMetadata {
+                    scope: ContextScope {
+                        session_id: t.owner.session_id.clone(),
+                        user_id: t.owner.user_id.clone(),
+                    },
+                    task_id: t.id.clone(),
+                    review: ControlReviewEvidence::FrozenDelegation(originals),
+                }),
             )? {
                 Ok(k) => k,
                 Err(eve_control_api::ControlError::Busy) => {
@@ -987,6 +1105,12 @@ impl QqOutreach for ChannelAdapter {
             .map_err(plugin_error)?
             .into_iter()
             .filter(|t| t.delivery == Some(Delivery::Pending))
+            .filter(|t| {
+                !crate::web_chat::is_owner(&ContextScope {
+                    session_id: t.owner.session_id.clone(),
+                    user_id: t.owner.user_id.clone(),
+                })
+            })
         {
             if !observations.authorized(&t.owner) {
                 reject_pending_delivery(self.0.as_ref(), &t.id).map_err(plugin_error)?;
@@ -1044,6 +1168,7 @@ mod tests {
     use eve_llm_api::{ChatMessage, ChatRole};
     use eve_plugin_api::ServiceId;
     use eve_session_api::{SESSION_SERVICE_ID, SessionServiceHandle};
+    use eve_subject_api::SubjectAdmin;
 
     async fn world() -> (Kernel, Arc<Observations>, tempfile::TempDir) {
         let services = KernelServices::default();
@@ -1094,6 +1219,7 @@ mod tests {
             result: None,
             delivery: None,
             runs: 0,
+            review_messages: None,
         }
     }
     fn complete(sessions: &dyn SessionService, owner: SessionKey, text: &str) {
@@ -1113,6 +1239,68 @@ mod tests {
                 ],
             )
             .unwrap();
+    }
+    #[tokio::test]
+    async fn live_authorization_overrides_static_operators_and_backend_controls_observation() {
+        use eve_developer_api::{DeveloperAuthorization, DeveloperObservationCapabilities};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct LiveAuthorization {
+            operator: AtomicBool,
+            business: AtomicBool,
+        }
+        impl DeveloperAuthorization for LiveAuthorization {
+            fn is_operator(&self, _: &ContextScope) -> bool {
+                self.operator.load(Ordering::Acquire)
+            }
+            fn permits_business(&self, _: &ContextScope) -> bool {
+                self.business.load(Ordering::Acquire)
+            }
+        }
+        let (kernel, observations, original) = world().await;
+        let actual = tempfile::tempdir().unwrap();
+        std::fs::write(original.path().join("output.txt"), "legacy configuration").unwrap();
+        std::fs::write(actual.path().join("output.txt"), "actual backend").unwrap();
+        let authorization = Arc::new(LiveAuthorization {
+            operator: AtomicBool::new(true),
+            business: AtomicBool::new(true),
+        });
+        let owner = SessionKey::new("s", "u").unwrap();
+        let observations = Arc::try_unwrap(observations)
+            .ok()
+            .unwrap()
+            .with_authorization(authorization.clone())
+            .with_development(Some(DeveloperObservationCapabilities {
+                workspace: actual.path().canonicalize().unwrap(),
+                processes: true,
+            }));
+        let expected: String = digest(&SHA256, b"actual backend")
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(observations.file(&owner, "output.txt").unwrap(), expected);
+        assert!(observations.authorized(&owner));
+        authorization.operator.store(false, Ordering::Release);
+        assert!(observations.operators.contains("u"));
+        assert!(!observations.authorized(&owner));
+        assert!(observations.file(&owner, "output.txt").is_err());
+        assert!(observations.process(&owner, std::process::id()).is_err());
+        authorization.operator.store(true, Ordering::Release);
+        authorization.business.store(false, Ordering::Release);
+        assert!(!observations.authorized(&owner));
+        assert!(observations.file(&owner, "output.txt").is_err());
+        assert!(observations.process(&owner, std::process::id()).is_err());
+        authorization.business.store(true, Ordering::Release);
+        let observations = observations.with_development(Some(DeveloperObservationCapabilities {
+            workspace: actual.path().canonicalize().unwrap(),
+            processes: false,
+        }));
+        assert_eq!(observations.file(&owner, "output.txt").unwrap(), expected);
+        assert!(observations.process(&owner, std::process::id()).is_err());
+        let observations = observations.with_development(None);
+        assert!(observations.file(&owner, "output.txt").is_err());
+        assert!(observations.process(&owner, std::process::id()).is_err());
+        kernel.stop_all().await.unwrap();
     }
     #[tokio::test]
     async fn file_changes_time_and_boolean_combinations_use_observed_state() {
@@ -1366,6 +1554,637 @@ mod tests {
         kernel.stop_all().await.unwrap();
     }
     #[tokio::test]
+    async fn technical_wait_registers_current_task_and_resumes_after_safe_block_and_restart() {
+        use eve_llm_api::{ToolResult, TurnCheckpoint};
+        use eve_task_api::{
+            TaskCompletionContract, TaskEnd, TaskOwner, TaskSpec, TaskStatus, TaskUsage,
+        };
+        let (kernel, observations, directory) = world().await;
+        let trigger_plugin = eve_trigger_plugin::TriggerPlugin::new().unwrap();
+        let triggers = Arc::new(trigger_plugin.controller());
+        let task_plugin = eve_task_plugin::TaskPlugin::new().unwrap();
+        let tasks = Arc::new(task_plugin.controller());
+        kernel.register(Box::new(trigger_plugin)).unwrap();
+        kernel.register(Box::new(task_plugin)).unwrap();
+        for id in [eve_trigger_api::PLUGIN_ID, eve_task_api::TASK_PLUGIN_ID] {
+            kernel
+                .start(&eve_plugin_api::PluginId::new(id).unwrap())
+                .await
+                .unwrap();
+        }
+        let mut observations = Arc::try_unwrap(observations).ok().unwrap();
+        observations.tasks = Some(tasks.clone());
+        let observations = Arc::new(observations);
+        let cell = Arc::new(std::sync::OnceLock::new());
+        assert!(cell.set(observations.clone()).is_ok());
+        let tool = crate::qq_task_wait::WaitTool {
+            tasks: tasks.clone(),
+            triggers: triggers.clone(),
+            observations: cell,
+        };
+        let owner = TaskOwner {
+            session_id: "s".into(),
+            user_id: "u".into(),
+        };
+        let now = now_ms();
+        let original_messages = vec!["等构建状态文件改变后继续原任务；这是原始授权。".repeat(100)];
+        let task = tasks
+            .create_authorized(
+                &owner,
+                TaskSpec {
+                    title: "等待构建文件".into(),
+                    instructions: "文件变化后核对结果并继续".into(),
+                    max_steps: 10,
+                    context: None,
+                },
+                "technical-file-wait",
+                original_messages.clone(),
+                Some(TaskCompletionContract::Unspecified),
+                Some(now + 60_000),
+                now,
+            )
+            .unwrap();
+        tasks.start(&task.id, now).unwrap();
+        let call = ToolCall {
+            id: "register-file".into(),
+            name: crate::qq_task_wait::TOOL_NAME.into(),
+            arguments: json!({
+                "condition":{"type":"file_changed","path":"build.status"},"reason":"等待构建状态改变后读取结果"
+            }),
+        };
+        let scope = ContextScope {
+            session_id: owner.session_id.clone(),
+            user_id: owner.user_id.clone(),
+        };
+        let context = ToolExecutionContext::new()
+            .with_scope(Some(scope.clone()))
+            .with_delegated(true)
+            .with_background_task_id(task.id.clone())
+            .with_call_id(call.id.clone());
+        let mut frame = TurnCheckpoint {
+            version: 1,
+            scope,
+            messages: vec![ChatMessage::text(ChatRole::User, "检查构建后继续")],
+            pending_calls: vec![call.clone()],
+            used_tool_calls: 1,
+            delegated_tool_calls: 0,
+            delegated_model_requests: 0,
+            provider_requests: 1,
+            tool_batches: 1,
+            remaining: None,
+            continuation_checks: 0,
+            closing: false,
+            result: None,
+        };
+        tasks
+            .checkpoint(&task.id, frame.clone(), now + 30_000, now)
+            .unwrap();
+        for unbound in [
+            ToolExecutionContext::new()
+                .with_scope(context.scope().cloned())
+                .with_delegated(true)
+                .with_call_id(call.id.clone()),
+            context
+                .clone()
+                .with_background_task_id("some-other-task".into()),
+            context.clone().with_scope(Some(ContextScope {
+                session_id: "other".into(),
+                user_id: "u".into(),
+            })),
+            context.clone().with_delegated(false),
+        ] {
+            assert!(tool.execute(call.clone(), unbound).await.is_err());
+        }
+        let mut forged = call.clone();
+        forged.arguments["task_id"] = json!("some-other-task");
+        assert!(tool.execute(forged, context.clone()).await.is_err());
+        assert!(triggers.snapshot().unwrap().is_empty());
+        let receipt = tool.execute(call.clone(), context.clone()).await.unwrap();
+        assert_eq!(tool.execute(call.clone(), context).await.unwrap(), receipt);
+        let record = triggers.snapshot().unwrap().remove(0);
+        assert_eq!(record.spec.expires_at_ms, now + 30_000);
+        assert_eq!(
+            record.spec.resume_task_id.as_deref(),
+            Some(task.id.as_str())
+        );
+        assert_eq!(
+            record.spec.conditions,
+            vec![Condition::FileChanged {
+                path: "build.status".into(),
+                baseline: "missing".into()
+            }]
+        );
+        assert_eq!(tasks.snapshot().unwrap().tasks.len(), 1);
+        std::fs::write(directory.path().join("build.status"), "finished").unwrap();
+        let control: Arc<dyn ControlService> = Arc::new(SimulatedControl {
+            held_task: "no-model-wakeup".into(),
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let (_active_tx, active) = watch::channel(true);
+        let (stop_tx, stop) = watch::channel(false);
+        let running = tokio::spawn(run(
+            triggers.clone(),
+            observations.clone(),
+            control.clone(),
+            QqConversations::default(),
+            active.clone(),
+            stop,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while triggers.snapshot().unwrap()[0].status != Status::Ready {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // 技术条件先满足不能抢先接续仍在执行的任务；Ready 不消耗次数。
+        assert_eq!(
+            tasks.get_owned(&owner, &task.id).unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+        assert_eq!(triggers.snapshot().unwrap()[0].runs, 0);
+        stop_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let plugin = eve_plugin_api::PluginId::new(eve_trigger_api::PLUGIN_ID).unwrap();
+        kernel.stop(&plugin).await.unwrap();
+        kernel.start(&plugin).await.unwrap();
+        assert_eq!(triggers.snapshot().unwrap()[0].status, Status::Ready);
+        let progress = ToolCall {
+            id: "blocked-progress".into(),
+            name: "task_progress".into(),
+            arguments: json!({"status":"blocked","remaining":receipt["remaining"]}),
+        };
+        frame.pending_calls.clear();
+        frame.messages.extend([
+            ChatMessage::assistant_tool_calls(vec![call]).unwrap(),
+            ChatMessage::tool_results(vec![ToolResult::success("register-file", receipt).unwrap()]).unwrap(),
+            ChatMessage::assistant_tool_calls(vec![progress.clone()]).unwrap(),
+            ChatMessage::tool_results(vec![ToolResult::success(progress.id.clone(), json!({"status":"blocked","remaining":progress.arguments["remaining"],"verified_by_host":false})).unwrap()]).unwrap(),
+        ]);
+        frame.used_tool_calls = 2;
+        frame.tool_batches = 2;
+        frame.provider_requests = 3;
+        frame.result = Some("已经登记等待，文件变化后继续核对。".into());
+        tasks
+            .checkpoint(&task.id, frame.clone(), now + 30_000, now_ms())
+            .unwrap();
+        let blocked = tasks
+            .finish(
+                &task.id,
+                TaskEnd::Blocked {
+                    result: frame.result.clone().unwrap(),
+                },
+                TaskUsage {
+                    tool_calls: 2,
+                    model_requests: 3,
+                },
+                now_ms(),
+            )
+            .unwrap();
+        assert_eq!(
+            crate::qq_task_wait::confirmed_wait(&record, &blocked),
+            Some(true)
+        );
+        // 后来的用户决策、伪造回执和未知效果均不能把原技术等待当作恢复授权。
+        let mut decision = blocked.clone();
+        let checkpoint = decision
+            .execution
+            .as_mut()
+            .unwrap()
+            .checkpoint
+            .as_mut()
+            .unwrap();
+        checkpoint.messages.last_mut().unwrap().tool_results[0].output =
+            eve_llm_api::ToolOutput::Success(
+                json!({"status":"blocked","remaining":"需要主人选择发布目标"}),
+            );
+        assert_eq!(
+            crate::qq_task_wait::confirmed_wait(&record, &decision),
+            Some(false)
+        );
+        let mut forged = blocked.clone();
+        forged
+            .execution
+            .as_mut()
+            .unwrap()
+            .checkpoint
+            .as_mut()
+            .unwrap()
+            .messages[2]
+            .tool_results[0]
+            .output =
+            eve_llm_api::ToolOutput::Success(json!({"registered":true,"trigger_id":record.id}));
+        assert_eq!(
+            crate::qq_task_wait::confirmed_wait(&record, &forged),
+            Some(false)
+        );
+        let mut unknown = blocked.clone();
+        unknown
+            .execution
+            .as_mut()
+            .unwrap()
+            .checkpoint
+            .as_mut()
+            .unwrap()
+            .pending_calls
+            .push(ToolCall {
+                id: "unknown-effect".into(),
+                name: "run_command".into(),
+                arguments: json!({}),
+            });
+        assert_eq!(
+            crate::qq_task_wait::confirmed_wait(&record, &unknown),
+            Some(false)
+        );
+        let (stop_tx, stop) = watch::channel(false);
+        let running = tokio::spawn(run(
+            triggers.clone(),
+            observations,
+            control,
+            QqConversations::default(),
+            active,
+            stop,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while triggers.snapshot().unwrap()[0].status != Status::Completed {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        stop_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let resumed = tasks.get_owned(&owner, &task.id).unwrap().unwrap();
+        assert_eq!(resumed.status, TaskStatus::Running);
+        assert!(resumed.spec == task.spec);
+        let execution = resumed.execution.unwrap();
+        assert_eq!(execution.review_messages, original_messages);
+        assert!(matches!(
+            execution.completion_contract,
+            Some(TaskCompletionContract::Unspecified)
+        ));
+        assert_eq!(execution.deadline_at_ms, Some(now + 30_000));
+        assert_eq!(execution.authorization_deadline_at_ms, Some(now + 60_000));
+        assert_eq!(execution.recoveries, 1);
+        assert_eq!(execution.checkpoint.unwrap().used_tool_calls, 2);
+        assert_eq!(tasks.snapshot().unwrap().tasks.len(), 1);
+        kernel.stop_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn technical_wait_process_uses_live_instance_and_rejects_parallel_registration() {
+        use eve_llm_api::TurnCheckpoint;
+        use eve_task_api::{TaskCompletionContract, TaskOwner, TaskSpec};
+        let (kernel, observations, _directory) = world().await;
+        let trigger_plugin = eve_trigger_plugin::TriggerPlugin::new().unwrap();
+        let triggers = Arc::new(trigger_plugin.controller());
+        let task_plugin = eve_task_plugin::TaskPlugin::new().unwrap();
+        let tasks = Arc::new(task_plugin.controller());
+        kernel.register(Box::new(trigger_plugin)).unwrap();
+        kernel.register(Box::new(task_plugin)).unwrap();
+        for id in [eve_trigger_api::PLUGIN_ID, eve_task_api::TASK_PLUGIN_ID] {
+            kernel
+                .start(&eve_plugin_api::PluginId::new(id).unwrap())
+                .await
+                .unwrap();
+        }
+        let mut observations = Arc::try_unwrap(observations).ok().unwrap();
+        observations.tasks = Some(tasks.clone());
+        let observations = Arc::new(observations);
+        let cell = Arc::new(std::sync::OnceLock::new());
+        assert!(cell.set(observations.clone()).is_ok());
+        let tool = crate::qq_task_wait::WaitTool {
+            tasks: tasks.clone(),
+            triggers: triggers.clone(),
+            observations: cell,
+        };
+        let owner = TaskOwner {
+            session_id: "s".into(),
+            user_id: "u".into(),
+        };
+        let now = now_ms();
+        let mut process = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let call = ToolCall {
+            id: "register-process".into(),
+            name: crate::qq_task_wait::TOOL_NAME.into(),
+            arguments: json!({
+                "condition":{"type":"process_exit","pid":process.id()},"reason":"构建进程退出后核对退出状态和文件"
+            }),
+        };
+        let scope = ContextScope {
+            session_id: "s".into(),
+            user_id: "u".into(),
+        };
+        let mut frame = TurnCheckpoint {
+            version: 1,
+            scope: scope.clone(),
+            messages: vec![ChatMessage::text(ChatRole::User, "构建完成后检查")],
+            pending_calls: vec![call.clone()],
+            used_tool_calls: 1,
+            delegated_tool_calls: 0,
+            delegated_model_requests: 0,
+            provider_requests: 1,
+            tool_batches: 1,
+            remaining: None,
+            continuation_checks: 0,
+            closing: false,
+            result: None,
+        };
+        let make_task = |source: &str, checkpoint: TurnCheckpoint, steps: u32| {
+            let task = tasks
+                .create_authorized(
+                    &owner,
+                    TaskSpec {
+                        title: "进程等待".into(),
+                        instructions: "退出后核对，不猜测成功".into(),
+                        max_steps: steps,
+                        context: None,
+                    },
+                    source,
+                    vec!["等待原构建进程完成后核对".into()],
+                    Some(TaskCompletionContract::Unspecified),
+                    Some(now + 60_000),
+                    now,
+                )
+                .unwrap();
+            tasks.start(&task.id, now).unwrap();
+            tasks
+                .checkpoint(&task.id, checkpoint, now + 30_000, now)
+                .unwrap();
+            ToolExecutionContext::new()
+                .with_scope(Some(scope.clone()))
+                .with_delegated(true)
+                .with_background_task_id(task.id)
+                .with_call_id(call.id.clone())
+        };
+        let valid = make_task("process-live", frame.clone(), 10);
+        frame.pending_calls.push(ToolCall {
+            id: "other-call".into(),
+            name: "echo".into(),
+            arguments: json!({"text":"parallel"}),
+        });
+        frame.used_tool_calls = 2;
+        let parallel = make_task("process-parallel", frame.clone(), 10);
+        assert!(tool.execute(call.clone(), parallel).await.is_err());
+        frame.pending_calls.pop();
+        frame.used_tool_calls = 1;
+        let no_remaining_budget = make_task("process-no-remaining-budget", frame.clone(), 2);
+        assert!(
+            tool.execute(call.clone(), no_remaining_budget)
+                .await
+                .is_err()
+        );
+        assert!(triggers.snapshot().unwrap().is_empty());
+        tool.execute(call.clone(), valid).await.unwrap();
+        let record = triggers.snapshot().unwrap().remove(0);
+        assert!(
+            matches!(record.spec.conditions.as_slice(), [Condition::ProcessState { pid, running: false, identity }] if *pid == process.id() && identity != "missing")
+        );
+        assert!(observations.evaluate(&record).unwrap().is_none());
+        process.kill().unwrap();
+        process.wait().unwrap();
+        assert!(observations.evaluate(&record).unwrap().is_some());
+        let already_exited = make_task("process-gone", frame, 10);
+        assert!(tool.execute(call, already_exited).await.is_err());
+        assert_eq!(triggers.snapshot().unwrap().len(), 1);
+        kernel.stop_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_task_delivery_busy_retries_after_trigger_restart_without_new_budget() {
+        let (kernel, observations, _directory) = world().await;
+        let subject = eve_subject_plugin::SubjectPlugin::new().unwrap();
+        let subject_admin = Arc::new(subject.controller());
+        let trigger_plugin = eve_trigger_plugin::TriggerPlugin::new().unwrap();
+        let admin = Arc::new(trigger_plugin.controller());
+        let task_plugin = eve_task_plugin::TaskPlugin::new().unwrap();
+        let tasks = Arc::new(task_plugin.controller());
+        kernel.register(Box::new(subject)).unwrap();
+        kernel.register(Box::new(trigger_plugin)).unwrap();
+        kernel.register(Box::new(task_plugin)).unwrap();
+        for id in [
+            eve_subject_api::SUBJECT_PLUGIN_ID,
+            eve_trigger_api::PLUGIN_ID,
+            eve_task_api::TASK_PLUGIN_ID,
+        ] {
+            kernel
+                .start(&eve_plugin_api::PluginId::new(id).unwrap())
+                .await
+                .unwrap();
+        }
+        let mut observations =
+            Arc::try_unwrap(observations)
+                .ok()
+                .unwrap()
+                .with_admission(Arc::new(crate::qq_subject_admission::Admission(
+                    subject_admin.clone(),
+                )));
+        observations.tasks = Some(tasks.clone());
+        let observations = Arc::new(observations);
+        let now = now_ms();
+        let owner = eve_task_api::TaskOwner {
+            session_id: "s".into(),
+            user_id: "u".into(),
+        };
+        let task = tasks
+            .create_bounded(
+                &owner,
+                eve_task_api::TaskSpec {
+                    title: "等待构建".into(),
+                    instructions: "构建退出后读取日志".into(),
+                    max_steps: 10,
+                    context: None,
+                },
+                "delivery-race",
+                now + 60_000,
+                now,
+            )
+            .unwrap();
+        tasks.start(&task.id, now).unwrap();
+        let frame = eve_llm_api::TurnCheckpoint {
+            version: 1,
+            scope: ContextScope {
+                session_id: owner.session_id.clone(),
+                user_id: owner.user_id.clone(),
+            },
+            messages: vec![ChatMessage::text(ChatRole::User, "构建退出后读取日志")],
+            pending_calls: vec![],
+            used_tool_calls: 0,
+            delegated_tool_calls: 0,
+            delegated_model_requests: 0,
+            provider_requests: 1,
+            tool_batches: 0,
+            remaining: None,
+            continuation_checks: 0,
+            closing: false,
+            result: Some("构建仍在运行".into()),
+        };
+        tasks
+            .checkpoint(&task.id, frame.clone(), now + 30_000, now)
+            .unwrap();
+        tasks
+            .finish(
+                &task.id,
+                eve_task_api::TaskEnd::Blocked {
+                    result: "构建仍在运行".into(),
+                },
+                eve_task_api::TaskUsage {
+                    model_requests: 1,
+                    tool_calls: 0,
+                },
+                now,
+            )
+            .unwrap();
+        let sending = tasks
+            .claim(&task.id, eve_task_api::DeliveryChannel::Proactive, now)
+            .unwrap();
+        let mut spec = trigger(vec![Condition::Time { at_ms: now }]).spec;
+        spec.expires_at_ms = now + 60_000;
+        spec.resume_task_id = Some(task.id.clone());
+        let record = admin
+            .create(
+                SessionKey::new("s", "u").unwrap(),
+                "delivery-race".into(),
+                spec.clone(),
+                now,
+            )
+            .unwrap();
+        let subject_scope = eve_subject_api::SubjectScope {
+            channel: "qq".into(),
+            conversation_id: "s".into(),
+            principal_id: "u".into(),
+        };
+        // 使用真实条件循环与三个账本；此控制器不允许模型唤醒，接续只调度原任务。
+        let control: Arc<dyn ControlService> = Arc::new(SimulatedControl {
+            held_task: "no-model-wakeup".into(),
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let (_active_tx, active) = watch::channel(true);
+        let (stop_tx, stop) = watch::channel(false);
+        let running = tokio::spawn(run(
+            admin.clone(),
+            observations.clone(),
+            control.clone(),
+            QqConversations::default(),
+            active.clone(),
+            stop,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if subject_admin
+                    .snapshot_for(&subject_scope)
+                    .unwrap()
+                    .events
+                    .iter()
+                    .any(|event| event.outcome.as_deref() == Some("admission_busy"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        stop_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let waiting = admin.snapshot().unwrap().remove(0);
+        assert_eq!(waiting.status, Status::Ready);
+        assert_eq!(waiting.runs, 0);
+        assert_eq!(waiting.spec, spec);
+        assert!(!waiting.evidence.is_empty());
+        assert_eq!(waiting.result, None);
+        assert_eq!(waiting.delivery, None);
+        assert_eq!(tasks.snapshot().unwrap().get(&task.id), Some(&sending));
+        let unrelated = observations
+            .admission
+            .as_ref()
+            .unwrap()
+            .begin(
+                &SessionKey::new("other", "u").unwrap(),
+                "while-delivery-busy",
+            )
+            .unwrap()
+            .unwrap();
+        observations
+            .finish_admission(&unrelated, QqAdmissionResult::Started)
+            .unwrap();
+        // Ready 与原条件证据跨插件重启保存；不把暂态恢复为 Interrupted。
+        let plugin_id = eve_plugin_api::PluginId::new(eve_trigger_api::PLUGIN_ID).unwrap();
+        kernel.stop(&plugin_id).await.unwrap();
+        kernel.start(&plugin_id).await.unwrap();
+        assert_eq!(admin.snapshot().unwrap()[0], waiting);
+        tasks
+            .record_delivery(
+                &task.id,
+                eve_task_api::DeliveryResult::Sent {
+                    platform_message_id: Some("notice-confirmed".into()),
+                },
+                now_ms(),
+            )
+            .unwrap();
+        let (stop_tx, stop) = watch::channel(false);
+        let running = tokio::spawn(run(
+            admin.clone(),
+            observations,
+            control,
+            QqConversations::default(),
+            active,
+            stop,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if admin.snapshot().unwrap()[0].status == Status::Completed {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        stop_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let completed = admin.snapshot().unwrap().remove(0);
+        assert_eq!(completed.id, record.id);
+        assert_eq!(completed.runs, 1);
+        assert_eq!(completed.spec, spec);
+        assert_eq!(completed.evidence, waiting.evidence);
+        let state = tasks.snapshot().unwrap();
+        assert_eq!(state.tasks.len(), 1);
+        let resumed = state.get(&task.id).unwrap();
+        assert_eq!(resumed.status, eve_task_api::TaskStatus::Running);
+        assert_eq!(resumed.spec.max_steps, task.spec.max_steps);
+        let execution = resumed.execution.as_ref().unwrap();
+        assert_eq!(execution.recoveries, 1);
+        assert_eq!(execution.deadline_at_ms, Some(now + 30_000));
+        assert_eq!(execution.authorization_deadline_at_ms, Some(now + 60_000));
+        let restored = execution.checkpoint.as_ref().unwrap();
+        assert_eq!(restored.used_tool_calls, frame.used_tool_calls);
+        assert_eq!(restored.provider_requests, frame.provider_requests);
+        assert_eq!(restored.result, None);
+        kernel.stop_all().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn control_busy_rearms_the_same_trigger_admission_without_stopping_other_windows() {
         let (kernel, observations, _directory) = world().await;
         let subject = eve_subject_plugin::SubjectPlugin::new().unwrap();
@@ -1420,6 +2239,7 @@ mod tests {
                 },
                 task_id: record.id.clone(),
             },
+            None,
         )
         .unwrap();
         assert_eq!(result, Err(eve_control_api::ControlError::Busy));
@@ -1467,7 +2287,8 @@ mod tests {
                         text: "wake".into()
                     },
                     task_id: "unknown-submit".into()
-                }
+                },
+                None,
             )
             .unwrap(),
             Err(eve_control_api::ControlError::Blocked)

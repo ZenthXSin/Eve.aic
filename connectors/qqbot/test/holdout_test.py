@@ -216,7 +216,7 @@ class HoldoutAcceptance(outreach_test.OutreachAcceptance):
                                 (["--practice-browser", BROWSER], "--interest-learning"),
                                 (["--interest-learning", "--practice-browser", str(self.work / "missing")],
                                  "实践运行环境无效")):
-            result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
+            result = subprocess.run([str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "refused"),
                                      "--agent", str(ROOT / "AGENT.md"), *extra],
                                     env=configure_fixture_progress(env), capture_output=True, text=True, timeout=60)
             self.assertNotEqual(result.returncode, 0)

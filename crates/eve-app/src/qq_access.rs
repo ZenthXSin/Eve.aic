@@ -21,12 +21,18 @@ fn public_tool(name: &str) -> bool {
     matches!(
         name,
         "echo"
+            | "manage_business_permissions"
+            | "outreach_status"
+            | "set_outreach_enabled"
             | "inspect_tool_permission"
             | "inspect_model_runtime"
+            | "inspect_capabilities"
             | "save_script_plugin"
             | "list_script_plugins"
             | "activate_script_plugin"
             | "run_script_plugin"
+            | "run_tool_code"
+            | "update_script_plugin"
             | "manage_failure_reproduction"
             | "send_message"
             | "clear_context"
@@ -117,7 +123,12 @@ impl Tool for GuardedTool {
         ) {
             definition.description.push_str(" 普通成员在自己当前会话的独立项目工作区执行，不需要管理员逐项授权。相对路径以此项目根目录为准；run_command 中工作区是 /work，HOME 是 /work/.home，Java 在 PATH，Mindustry 无头服务端只读位于 /opt/eve/mindustry-server.jar（宿主已配置时）。可编写模组、编译、导入并运行验证，交付文件可直接把项目内实际路径交给 send_file，宿主自动复制入库并处理重名。编译通过不能冒充已通过游戏运行验证；无图形客户端时如实区分无头验证与客户端验证。");
         }
-        if !(public_tool(&definition.name) || self.public_github && definition.name == "github_api")
+        if definition.name == crate::qq_task_wait::TOOL_NAME {
+            definition.description.push_str(
+                " 仅已授权主人或管理员的当前后台任务可调用；身份与任务由宿主绑定，普通用户和子代理不能代办。",
+            );
+        } else if !(public_tool(&definition.name)
+            || self.public_github && definition.name == "github_api")
         {
             definition.description.push_str(
                 " 此管理能力需要主人或管理员授权；普通用户不可调用，也不可通过后台或子代理代办。",
@@ -161,6 +172,12 @@ pub(crate) fn authorize_tool(
             "群聊观察只允许生成聊天回复，不执行工具或代办管理任务".into(),
         ));
     }
+    // 身份与业务许可独立；主人身份或公共工具也不能越过持久急停。
+    if !admin.business_permitted(scope) && !business_control_tool(name) {
+        return Err(ToolExecutionError::Failed(
+            "当前会话业务权限已撤销、急停或账本不可用；可直接聊天查询或重新解锁，已发生副作用不会自动撤回".into(),
+        ));
+    }
     let owner = admin.is_owner(scope);
     let administrator = admin.is_operator(scope);
     if !(owner || administrator || public_tool(name) || public_github && name == "github_api") {
@@ -197,11 +214,27 @@ pub(crate) fn authorize_tool(
     Ok(())
 }
 
+fn business_control_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "manage_business_permissions"
+            | "inspect_tool_permission"
+            | "inspect_model_runtime"
+            | "inspect_capabilities"
+            | "list_background_tasks"
+            | "list_wakeup_triggers"
+            | "cancel_background_task"
+            | "cancel_wakeup_trigger"
+            | "cancel_reminder"
+            | "task_progress"
+    )
+}
+
 pub(crate) struct ScriptAuthorizer {
     pub admin: Arc<Admin>,
     pub public_github: bool,
     pub developer: Option<Arc<dyn eve_developer_api::DeveloperBackend>>,
-    pub outbox: Arc<crate::qq_files::Outbox>,
+    pub outbox: Option<Arc<crate::qq_files::Outbox>>,
 }
 impl eve_script_runtime::ToolAuthorizer for ScriptAuthorizer {
     fn authorize(
@@ -210,11 +243,19 @@ impl eve_script_runtime::ToolAuthorizer for ScriptAuthorizer {
         arguments: Option<&Value>,
         context: &ToolExecutionContext,
     ) -> Result<(), ToolExecutionError> {
+        if name == "restart_self" {
+            return Err(ToolExecutionError::Rejected(
+                "主动重启必须由当前会话直接调用，不能通过脚本插件代办".into(),
+            ));
+        }
         authorize_tool(&self.admin, self.public_github, name, arguments, context)?;
         if name == "send_file"
             && let Some(arguments) = arguments
         {
-            self.outbox.preflight_send(arguments, context)?;
+            self.outbox
+                .as_ref()
+                .ok_or_else(|| ToolExecutionError::Rejected("当前通道未装配文件投递服务".into()))?
+                .preflight_send(arguments, context)?;
         }
         if let Some(arguments) = arguments
             && let Some(operation) = eve_developer_tools::operation_for_tool(name, arguments)
@@ -289,6 +330,21 @@ impl QqOutreach for GuardedOutreach {
         let ordinary_allowed = ordinary.as_ref().is_some_and(|session| {
             push.session.as_ref() == Some(session) && push.user_id == session.user_id
         });
+        if !push
+            .session
+            .as_ref()
+            .or(fallback.as_ref())
+            .is_some_and(|session| {
+                self.admin.business_permitted(&eve_llm_api::ContextScope {
+                    session_id: session.session_id.clone(),
+                    user_id: session.user_id.clone(),
+                })
+            })
+        {
+            self.inner
+                .delivered(&push.message.id, QqOutreachResult::NotSent)?;
+            return Ok(None);
+        }
         if !group_allowed
             && !ordinary_allowed
             && !push
@@ -362,6 +418,15 @@ impl QqCommandHandler for GuardedCommands {
             session_id: input.session.session_id.clone(),
             user_id: input.session.user_id.clone(),
         };
+        if head.starts_with('/')
+            && !self.admin.business_permitted(&scope)
+            && !matches!(head, "/admin" | "/help" | "/status" | "/cancel")
+        {
+            return Ok(Some(
+                "当前会话业务权限已撤销或急停；请直接聊天查询或重新解锁，管理命令不能绕过暂停。"
+                    .into(),
+            ));
+        }
         if head.starts_with('/') && !query && !self.admin.is_operator(&scope) {
             return Ok(Some(
                 "此管理操作需要主人或管理员授权。普通聊天和只读查询仍可使用。".into(),
@@ -407,9 +472,9 @@ mod tests {
             admin,
             public_github: false,
             developer: Some(Arc::new(Deny)),
-            outbox: Arc::new(
+            outbox: Some(Arc::new(
                 crate::qq_files::Outbox::open(directory.path().join("outbox")).unwrap(),
-            ),
+            )),
         };
         let member = ToolExecutionContext::new().with_scope(Some(eve_llm_api::ContextScope {
             session_id: "s".into(),
@@ -426,6 +491,13 @@ mod tests {
                 session_id: "s".into(),
                 user_id: "administrator".into(),
             }));
+        for arguments in [None, Some(serde_json::json!({}))] {
+            assert!(
+                authorizer
+                    .authorize("restart_self", arguments.as_ref(), &administrator)
+                    .is_err()
+            );
+        }
         let error = authorizer
             .authorize(
                 "run_command",
@@ -452,6 +524,7 @@ mod tests {
             "run_subagent",
             "set_reminder",
             "github_api",
+            "restart_self",
             "new_management_tool",
         ] {
             assert!(!public_tool(name));
@@ -479,5 +552,27 @@ mod tests {
             "*** Update File: src/a.rs\n*** Move to: private/a.rs\n@@\n-x\n+y"
         )));
         assert!(patch_touches_owner_file("无法解析"));
+    }
+
+    #[test]
+    fn natural_management_tools_use_live_identity_and_own_outreach_preferences_are_public() {
+        let directory = tempfile::tempdir().unwrap();
+        let admin = Admin::open(
+            directory.path(),
+            eve_qqbot_plugin::QqConversations::default(),
+            std::collections::BTreeSet::from(["administrator".into()]),
+            eve_kernel::KernelServices::default().registry,
+        )
+        .unwrap();
+        let member = ToolExecutionContext::new().with_scope(Some(eve_llm_api::ContextScope {
+            session_id: "a".into(),
+            user_id: "member".into(),
+        }));
+        for name in ["manage_skill", "manage_forged_tool"] {
+            assert!(authorize_tool(&admin, false, name, None, &member).is_err());
+        }
+        for name in ["outreach_status", "set_outreach_enabled"] {
+            assert!(authorize_tool(&admin, false, name, None, &member).is_ok());
+        }
     }
 }

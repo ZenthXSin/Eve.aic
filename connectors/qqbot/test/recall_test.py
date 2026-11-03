@@ -96,7 +96,7 @@ class RecallAcceptance(unittest.TestCase):
         env.update(env_extra or {})
         if panel:
             env['EVE_WEB_TOKEN'] = memory_harness.PANEL_TOKEN
-        command = [str(memory_harness.BINARY), "--state-dir", str(self.work / "state"),
+        command = [str(memory_harness.BINARY), "--minimal-profile", "--state-dir", str(self.work / "state"),
             "--agent", str(memory_harness.ROOT / "AGENT.md"), "--bridge-script",
             str(memory_harness.FAKE), "--bridge-arg", str(scenario)]
         if memory:
@@ -197,7 +197,7 @@ class RecallAcceptance(unittest.TestCase):
         self.assertFalse(self.snapshots())
 
     def test_context_opt_in_without_memory_fails_before_starting_bridge(self):
-        child = subprocess.Popen([str(memory_harness.BINARY), "--memory-recall",
+        child = subprocess.Popen([str(memory_harness.BINARY), "--minimal-profile", "--memory-recall",
                                   "--state-dir", str(self.work / "state")],
                                  env={"PATH": os.environ.get("PATH", "")},
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

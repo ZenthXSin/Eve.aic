@@ -76,7 +76,7 @@ pub enum SessionFailureCode {
     Cancelled,
 }
 
-/// 仅持久化已完成的工具回执和受限诊断，不保存供应商原始错误、URL 或提示词。
+/// 持久化已完成的工具回执、可信审核原话和受限诊断，不保存供应商原始错误或系统提示词。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionFailureEvidence {
@@ -89,6 +89,10 @@ pub struct SessionFailureEvidence {
     pub protocol_failure: Option<eve_llm_api::ProtocolFailureKind>,
     pub tool_names: Vec<String>,
     pub tool_results: Vec<ToolResult>,
+    /// 宿主在失败前捕获的最近六条真实用户正文（含轮内引导），完整保留。
+    /// None只表示旧版本未捕获；Some空数组明确表示没有用户授权证据。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_user_messages: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -105,6 +109,19 @@ pub struct SessionFailure {
 impl SessionFailure {
     pub fn validate(&self) -> SessionResult<()> {
         if let Some(e) = &self.evidence {
+            if let Some(messages) = &e.review_user_messages
+                && (messages.len() > 6
+                    || messages
+                        .iter()
+                        .try_fold(0usize, |sum, text| sum.checked_add(text.len()))
+                        .is_none_or(|bytes| bytes > eve_llm_api::MAX_REVIEW_USER_MESSAGES_BYTES)
+                    || serde_json::to_vec(messages)
+                        .map_err(|_| SessionError::InvalidInput)?
+                        .len()
+                        > eve_llm_api::MAX_REVIEW_USER_MESSAGES_BYTES)
+            {
+                return Err(SessionError::InvalidInput);
+            }
             let mut ids = std::collections::BTreeSet::new();
             if (e.protocol_failure.is_some() && self.code != SessionFailureCode::Protocol)
                 || e.provider_http_status
@@ -401,6 +418,45 @@ mod enumeration_compatibility {
         );
         record.code = SessionFailureCode::Provider;
         assert_eq!(record.validate(), Err(SessionError::InvalidInput));
+    }
+
+    #[test]
+    fn failure_review_originals_preserve_complete_bodies_and_distinguish_absent_from_empty() {
+        let old = serde_json::json!({"code":"Provider","started_tools":0,
+            "evidence":{"provider_http_status":null,"tool_names":[],"tool_results":[]}});
+        let mut record: SessionFailure = serde_json::from_value(old).unwrap();
+        assert!(
+            record
+                .evidence
+                .as_ref()
+                .unwrap()
+                .review_user_messages
+                .is_none()
+        );
+        let messages: Vec<_> = (0..6)
+            .map(|index| format!("第{index}条\n{}\n尾部完整", "范围不得扩大".repeat(200)))
+            .collect();
+        record.evidence.as_mut().unwrap().review_user_messages = Some(messages.clone());
+        record.validate().unwrap();
+        let restored: SessionFailure =
+            serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(
+            restored.evidence.unwrap().review_user_messages,
+            Some(messages)
+        );
+        record.evidence.as_mut().unwrap().review_user_messages = Some(vec![]);
+        record.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&record).unwrap()["evidence"]["review_user_messages"],
+            serde_json::json!([])
+        );
+        for invalid in [
+            vec!["a".into(); 7],
+            vec!["x".repeat(eve_llm_api::MAX_REVIEW_USER_MESSAGES_BYTES)],
+        ] {
+            record.evidence.as_mut().unwrap().review_user_messages = Some(invalid);
+            assert_eq!(record.validate(), Err(SessionError::InvalidInput));
+        }
     }
 
     struct CustomSessions;

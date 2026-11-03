@@ -78,6 +78,8 @@ impl Harness {
                 api_key: "resolver-test-key".into(),
                 context: None,
                 tools: vec![],
+                foreground_excluded_tools: Default::default(),
+                review_source: None,
                 health: None,
                 history_digests: None,
                 history_context_planner: None,

@@ -1,7 +1,8 @@
 #[tokio::main]
 async fn main() {
     let result = async {
-        let Some(options) = eve_app::QqBotOptions::parse(std::env::args_os().skip(1))? else {
+        let Some(options) = eve_app::QqBotOptions::parse_product(std::env::args_os().skip(1))?
+        else {
             println!("{}", eve_app::QQBOT_HELP);
             return Ok::<(), eve_app::AppError>(());
         };

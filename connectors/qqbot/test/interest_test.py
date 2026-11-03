@@ -149,6 +149,8 @@ class InterestAcceptance(unittest.TestCase):
         self.directory.cleanup()
 
     def classify(self, decoded, latest):
+        if isinstance(decoded, dict) and {"id", "scope", "messages", "lessons", "attempt"} <= set(decoded):
+            return "conversation_learning"
         if isinstance(decoded, dict) and "observer_version" in decoded and "known_interests" in decoded:
             return "interest"
         if "unverified_waiting_input" in latest:
@@ -156,6 +158,8 @@ class InterestAcceptance(unittest.TestCase):
         return "chat"
 
     def reply(self, kind, decoded, latest):
+        if kind == "conversation_learning":
+            return json.dumps({"lessons": []})
         if kind == "progress":
             return progress_fixture_text(decoded)
         if kind == "interest":
@@ -243,7 +247,7 @@ class InterestAcceptance(unittest.TestCase):
         env.update(env_extra or {})
         bootstrap_test_admin(self.work / "state", env)
         bootstrap_fixture_groups(self.work / "state", scenario)
-        command = [str(BINARY), "--state-dir", str(self.work / "state"),
+        command = [str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "state"),
                    "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
                    "--bridge-arg", str(scenario), "--cognition-max-executions", str(max_executions)]
         # 只传 --interest-learning 时须自动开启记忆和认知。

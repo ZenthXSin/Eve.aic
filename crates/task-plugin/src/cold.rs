@@ -66,6 +66,11 @@ fn directory(task: &Task) -> Task {
         notice: task.notice.clone(),
         execution: task.execution.as_ref().map(|execution| TaskExecution {
             checkpoint: None,
+            last_finished_at_ms: execution.last_finished_at_ms,
+            progress_notices: execution.progress_notices.clone(),
+            // 授权原话只留在按摘要核对的完整冷正文中，目录不复制用户正文。
+            review_messages: vec![],
+            completion_contract: execution.completion_contract.clone(),
             deadline_at_ms: execution.deadline_at_ms,
             authorization_deadline_at_ms: execution.authorization_deadline_at_ms,
             recoveries: execution.recoveries,

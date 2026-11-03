@@ -167,6 +167,34 @@ impl SessionLlmHost {
     ) -> Result<SessionTurnOutput, SessionRunError> {
         self.run_inner(input, Some(sink)).await
     }
+    /// 控制器专用的可信证据路径；逐次克隆宿主，避免并发或后续消息覆盖本轮来源。
+    pub async fn run_turn_with_events_and_metadata(
+        &self,
+        input: SessionInput,
+        metadata: Option<eve_control_api::ControlRunMetadata>,
+        sink: &dyn TurnEventSink,
+    ) -> Result<SessionTurnOutput, SessionRunError> {
+        let Some(metadata) = metadata else {
+            return self.run_inner(input, Some(sink)).await;
+        };
+        metadata.validate_scope(&input.key).map_err(|_| {
+            SessionRunError::NotStarted(LlmError::Context(
+                "控制执行证据与可信会话不匹配；未开始本轮".into(),
+            ))
+        })?;
+        let mut configured = self.clone();
+        configured.host = match metadata.review {
+            eve_control_api::ControlReviewEvidence::ChannelAnchor(anchor) => configured
+                .host
+                .with_review_user_message_anchor(anchor)
+                .map_err(SessionRunError::NotStarted)?,
+            eve_control_api::ControlReviewEvidence::FrozenDelegation(messages) => configured
+                .host
+                .with_delegated_review_messages(metadata.scope, messages)
+                .map_err(SessionRunError::NotStarted)?,
+        };
+        configured.run_inner(input, Some(sink)).await
+    }
     async fn run_inner(
         &self,
         input: SessionInput,
@@ -247,6 +275,7 @@ impl SessionLlmHost {
                     evidence: (failure.error.provider_failure().is_some()
                         || failure.error.protocol_failure().is_some()
                         || failure.error.provider_http_status().is_some()
+                        || failure.diagnostics.review_user_messages.is_some()
                         || !failure.diagnostics.calls.is_empty()
                         || !failure.diagnostics.tool_results.is_empty())
                     .then(|| SessionFailureEvidence {
@@ -263,6 +292,7 @@ impl SessionLlmHost {
                             .map(|call| call.name.clone())
                             .collect(),
                         tool_results: failure.diagnostics.tool_results.clone(),
+                        review_user_messages: failure.diagnostics.review_user_messages.clone(),
                     }),
                     code: failure_code(&failure.error),
                     started_tools: Some(failure.diagnostics.started_tools as u64),

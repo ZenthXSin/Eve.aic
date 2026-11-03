@@ -30,6 +30,14 @@ impl BudgetedSessionRunner {
 }
 impl ControlRunner for BudgetedSessionRunner {
     fn run<'a>(&'a self, input: SessionInput, sink: &'a dyn TurnEventSink) -> RunFuture<'a> {
+        self.run_with_metadata(input, None, sink)
+    }
+    fn run_with_metadata<'a>(
+        &'a self,
+        input: SessionInput,
+        metadata: Option<ControlRunMetadata>,
+        sink: &'a dyn TurnEventSink,
+    ) -> RunFuture<'a> {
         Box::pin(async move {
             let binding = self
                 .bindings
@@ -51,7 +59,9 @@ impl ControlRunner for BudgetedSessionRunner {
                 };
             };
             let host = Arc::new(self.host.with_execution_budget(binding.budget));
-            SessionControlRunner::new(host).run(input, sink).await
+            SessionControlRunner::new(host)
+                .run_with_metadata(input, metadata, sink)
+                .await
         })
     }
 }

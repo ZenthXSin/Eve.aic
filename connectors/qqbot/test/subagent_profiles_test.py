@@ -1,4 +1,5 @@
 """实际宿主：自定义/编码/只读子代理、后台派发与共享总步数；只使用本地替身。"""
+import hashlib
 import json
 import threading
 import unittest
@@ -47,7 +48,11 @@ class SubagentProfilesAcceptance(developer.DeveloperAcceptance):
                 return calls(('create','create_subagent',{'name':'专用编码','instructions':'只处理本次授权代码并核验','tools':['read_file','write_file']}))
             if len(results) == 1:
                 saved.append(results[0]['profile']['id'])
-                return calls(('run','run_subagent',{'agent_id':saved[0],'task':'写入 from-agent.py 并读取验证'}))
+                return calls(('run','run_subagent',{'agent_id':saved[0],'task':'写入 from-agent.py 并读取验证',
+                    'verification': {'kind':'receipts','contract': {'checks': [{
+                        'tool':'read_file','arguments':{'path':'from-agent.py'},
+                        'output_pointer':'/sha256','expected':hashlib.sha256(b'value = 42\n').hexdigest()}],
+                        'require_final_batch':True}}}))
             self.assertTrue(results[1]['completed'])
             self.assertEqual(results[1]['usage']['shared_steps_used'],4)
             return text_response('已创建并完成编码')
@@ -97,6 +102,8 @@ class SubagentProfilesAcceptance(developer.DeveloperAcceptance):
             if not results:
                 return calls(*[(f'agent-{i}','run_subagent',{'task':f'并行核验{i}'}) for i in range(10)])
             used.extend(r['usage']['steps_used'] for r in results)
+            self.assertTrue(all(not r['completed'] and r['blocked'] for r in results),
+                            'echo 和用尽共享预算不能证明子任务完成')
             self.assertTrue(all(r['usage']['shared_steps_used']<=100 for r in results))
             self.assertFalse(body.get('tools'),'共享预算耗尽后 Eve 也不能获得新工具')
             return text_response('共享步数已用尽')
@@ -120,17 +127,22 @@ class SubagentProfilesAcceptance(developer.DeveloperAcceptance):
                     return calls(('child','run_subagent',{'task':'核验三个项目'}))
                 self.assertEqual(results[0]['usage']['steps_used'],3)
                 self.assertEqual(results[0]['usage']['shared_steps_remaining'],0)
+                self.assertFalse(results[0]['completed'])
+                self.assertTrue(results[0]['blocked'])
                 self.assertFalse(body.get('tools'))
-                return text_response('后台核验结束')
+                return text_response('共享预算已用尽，原目标尚未通过验收')
             if not results:
                 return calls(('dispatch','dispatch_background_task',{'title':'共享预算核验','instructions':'委派核验三个项目','max_steps':4}))
             return text_response('已派发')
         self.callback = respond
         def finished():
-            self.wait_for(lambda:any(t['status']=='Completed' for t in self.documents().get('eve.task',{}).get('tasks.v1',{}).get('tasks',[])), 'background did not finish', 20)
+            self.wait_for(lambda:any(t['status']=='Blocked' and (t.get('notice') or {}).get('status')=='Delivered'
+                for t in self.documents().get('eve.task',{}).get('tasks.v1',{}).get('tasks',[])), 'background did not block and notify', 20)
         self.enabled([*self.send(self.message('background','后台委派核验',expected='已派发')),*self.checkpoint('finished')],checkpoints={'finished':finished})
         [task] = self.documents()['eve.task']['tasks.v1']['tasks']
         self.assertEqual(task['usage']['tool_calls'],4)
+        self.assertEqual(task['status'],'Blocked')
+        self.assertIn('任务尚未通过冻结验收', task['result'])
         frame = task['execution']['checkpoint']
         self.assertEqual((frame['used_tool_calls'],frame['delegated_tool_calls']),(1,3))
         self.assertEqual(frame['delegated_model_requests'],2)

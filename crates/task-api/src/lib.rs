@@ -1,15 +1,19 @@
 //! 后台任务契约：Eve 在对话中把一件需要多步完成的事派发到后台，由执行器在步数预算内独立完成，
-//! 结束后私聊通知派发它的用户。
+//! 结束后经私聊或可信宿主的本地收件箱通知派发它的用户。
 //!
 //! 创建、开始、结束与每次通知尝试都先持久化。执行中进程退出时在持久化的安全边界接续，未知工具结果不自动重放；
 //! 发送通知时进程退出记为结果未知，不重发。
 mod evidence;
 pub use evidence::{TaskEvidenceKey, TaskEvidenceReader, TaskEvidenceSnapshot};
+mod completion;
+pub use completion::*;
 mod delivery;
 pub use delivery::{TaskDeliveryEntry, TaskDeliverySnapshot, validate_notice};
 mod profiles;
 mod scheduling;
 pub use scheduling::{TaskSchedulingEntry, TaskSchedulingSnapshot};
+mod progress;
+pub use progress::*;
 mod strategy;
 pub use profiles::*;
 use serde::{Deserialize, Serialize};
@@ -108,6 +112,20 @@ pub const MAX_AUTO_RECOVERIES: u32 = 3;
 #[serde(deny_unknown_fields)]
 pub struct TaskExecution {
     pub checkpoint: Option<eve_llm_api::TurnCheckpoint>,
+    /// 最近一次结束的持久时间下界；阻塞接续保留，下一次结束必须严格增加。
+    /// 防止同毫秒或时钟回拨复用通知结算批次；旧状态首次接续时从 finished_at_ms 补齐。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_finished_at_ms: Option<u64>,
+    /// 定时进度通知独立于执行结局；发送前持久化，未知结果不重发。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub progress_notices: Vec<TaskProgressNotice>,
+    /// 可信宿主与任务创建原子冻结；None 仅保留旧宿主手工结算兼容路径。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_contract: Option<TaskCompletionContract>,
+    /// 派发时由可信宿主冻结的最近六条真实用户正文。与任务身份一并持久化，
+    /// 不取模型任务说明或普通历史摘要；空数组表示没有可继承的授权证据。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_messages: Vec<String>,
     pub recoveries: u32,
     pub resume_at_ms: Option<u64>,
     /// 首次执行固定总期限；重试和重启不能重置。
@@ -226,6 +244,8 @@ pub enum DeliveryChannel {
     Proactive,
     /// 随用户这条私聊消息的被动回复附带。
     Passive { message_id: String },
+    /// 可信宿主已将通知持久保存到本地收件箱；只能经专用结算入口记录。
+    LocalInbox,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -233,6 +253,10 @@ pub enum DeliveryChannel {
 pub enum DeliveryResult {
     Sent {
         platform_message_id: Option<String>,
+    },
+    /// 本地收件箱的持久回执；不表示已发送到外部平台。
+    StoredLocally {
+        notification_id: String,
     },
     Failed {
         http_status: Option<u16>,
@@ -328,6 +352,14 @@ impl Task {
         if !self.status.finished() {
             return None;
         }
+        if self
+            .execution
+            .as_ref()
+            .and_then(|e| e.progress_notices.last())
+            .is_some_and(|notice| notice.attempt.result.is_none())
+        {
+            return None;
+        }
         match &self.notice {
             None => self.finished_at_ms,
             Some(notice) if notice.status.settled() => notice.closed_at_ms.or(self.finished_at_ms),
@@ -411,6 +443,51 @@ impl TaskSnapshot {
 /// 仅可信宿主持有；不发布给模型或不受信插件。
 pub trait TaskAdmin: Send + Sync {
     fn snapshot(&self) -> TaskResult<TaskSnapshot>;
+    /// 进度轮询仅复制小型投递元数据；正文在原子认领后读取。
+    fn progress_snapshot(&self) -> TaskResult<TaskProgressSnapshot> {
+        let snapshot = TaskProgressSnapshot {
+            tasks: self
+                .snapshot()?
+                .tasks
+                .iter()
+                .map(TaskProgressEntry::from)
+                .collect(),
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+    /// 原身份、原任务的三十分钟进度提醒；提交成功后才能发送。
+    fn claim_progress(
+        &self,
+        _owner: &TaskOwner,
+        _id: &str,
+        _channel: DeliveryChannel,
+        _now_ms: u64,
+    ) -> TaskResult<Task> {
+        Err(TaskError::Unavailable)
+    }
+    /// 序号与身份必须匹配最后一次未结算发送；不能覆盖历史回执。
+    fn record_progress_delivery(
+        &self,
+        _owner: &TaskOwner,
+        _id: &str,
+        _sequence: u64,
+        _result: DeliveryResult,
+        _now_ms: u64,
+    ) -> TaskResult<Task> {
+        Err(TaskError::Unavailable)
+    }
+    /// 本地收件箱先以稳定事件 ID 持久化，再幂等结算；不是平台送达回执。
+    fn record_local_progress(
+        &self,
+        _owner: &TaskOwner,
+        _id: &str,
+        _sequence: u64,
+        _notification_id: &str,
+        _at_ms: u64,
+    ) -> TaskResult<Task> {
+        Err(TaskError::Unavailable)
+    }
     /// 同一时点、显式指定完整身份的任务证据视图；不将局部数据冒充完整快照。
     /// 原生实现只复制匹配的任务，旧实现保留完整快照兼容路径。
     fn evidence_snapshot(&self, keys: &[TaskEvidenceKey]) -> TaskResult<TaskEvidenceSnapshot> {
@@ -494,6 +571,22 @@ pub trait TaskAdmin: Send + Sync {
     ) -> TaskResult<Task> {
         Err(TaskError::InvalidTransition)
     }
+    /// 原子保存任务、可信用户原话与验收合同；不能先排队再追加授权。
+    /// 原话只能由可信宿主从当前身份的独立审核槽取得，不接受模型参数。
+    /// 自定义实现默认失败关闭，不得退回丢失授权或验收条件的普通创建。
+    #[allow(clippy::too_many_arguments)]
+    fn create_authorized(
+        &self,
+        _owner: &TaskOwner,
+        _spec: TaskSpec,
+        _source: &str,
+        _review_messages: Vec<String>,
+        _completion_contract: Option<TaskCompletionContract>,
+        _deadline_at_ms: Option<u64>,
+        _now_ms: u64,
+    ) -> TaskResult<Task> {
+        Err(TaskError::InvalidTransition)
+    }
     /// 排队 → 执行中；保存后执行器才开始。
     fn start(&self, id: &str, now_ms: u64) -> TaskResult<Task>;
     /// 工具前/后及模型请求前的持久检查点；保存失败不得继续执行。
@@ -530,14 +623,41 @@ pub trait TaskAdmin: Send + Sync {
     ) -> TaskResult<Task> {
         Err(TaskError::InvalidTransition)
     }
+    /// 技术条件只解除其实际核对的阻塞检查点；比较与接续必须在同一存储事务中。
+    /// 另一入口已恢复并再次阻塞时，旧条件不得解除新问题；替换后端默认拒绝。
+    fn resume_blocked_checkpoint(
+        &self,
+        _owner: &TaskOwner,
+        _id: &str,
+        _expected: &eve_llm_api::TurnCheckpoint,
+        _evidence: &str,
+        _now_ms: u64,
+    ) -> TaskResult<Task> {
+        Err(TaskError::InvalidTransition)
+    }
     /// 执行中 → 结束，保存结果与用量；完成与失败生成一条等待投递的通知。
     fn finish(&self, id: &str, end: TaskEnd, usage: TaskUsage, now_ms: u64) -> TaskResult<Task>;
     /// 用户取消自己的任务：排队或阻塞中的直接取消；执行中的记下取消请求，由执行器停止后结束。
     fn cancel(&self, user_id: &str, id: &str, now_ms: u64) -> TaskResult<Task>;
-    /// 保存一次通知投递尝试并进入发送中；返回后才可发送。主动私聊每条至多一次。
+    /// 保存一次平台通知尝试并进入发送中；返回后才可发送。主动私聊每条至多一次。
+    /// LocalInbox 只允许通过 record_local_delivery 结算，普通认领必须拒绝。
     fn claim(&self, id: &str, channel: DeliveryChannel, now_ms: u64) -> TaskResult<Task>;
-    /// 保存投递结果：送达即了结；没有写出或平台拒绝时回到等待，尝试用尽记为过期。
+    /// 保存平台投递结果：送达即了结；没有写出或平台拒绝时回到等待，尝试用尽记为过期。
+    /// StoredLocally 只能由 record_local_delivery 写入，普通平台回执入口必须拒绝。
     fn record_delivery(&self, id: &str, result: DeliveryResult, now_ms: u64) -> TaskResult<Task>;
+    /// 收件箱先可靠落盘，宿主再以完整身份、任务 ID 和本次结束时间原子结算。
+    /// 只结算等待中的通知；相同结束批次和本地回执可重复确认，不覆盖发送中或未知结果。
+    /// 替换实现默认失败关闭，不能把本地保存冒充平台发送成功。
+    fn record_local_delivery(
+        &self,
+        _owner: &TaskOwner,
+        _id: &str,
+        _finished_at_ms: u64,
+        _notification_id: &str,
+        _now_ms: u64,
+    ) -> TaskResult<Task> {
+        Err(TaskError::Unavailable)
+    }
     /// 投递窗口已过仍未送达：通知记为过期。
     fn expire(&self, id: &str, now_ms: u64) -> TaskResult<Task>;
 }
@@ -549,6 +669,8 @@ pub enum TaskError {
     LimitReached,
     NotFound,
     InvalidTransition,
+    /// 原任务仍有效，但已持久化的通知投递正在收尾；可在同一期限内稍后重试。
+    Busy,
     Unavailable,
     CorruptState,
     UnsupportedVersion,
@@ -562,6 +684,7 @@ impl fmt::Display for TaskError {
             Self::LimitReached => "后台任务已达上限",
             Self::NotFound => "没有这个后台任务",
             Self::InvalidTransition => "后台任务状态不允许此操作",
+            Self::Busy => "后台任务正在提交投递结果，请稍后核对",
             Self::Unavailable => "后台任务不可用",
             Self::CorruptState => "后台任务记录损坏；未清空",
             Self::UnsupportedVersion => "不支持该后台任务记录版本",
@@ -570,6 +693,23 @@ impl fmt::Display for TaskError {
     }
 }
 impl std::error::Error for TaskError {}
+
+/// 审核原话必须完整保存；超限拒绝创建任务，不截断任何一条正文。
+pub fn validate_review_messages(messages: &[String]) -> TaskResult<()> {
+    if messages.len() > 6
+        || messages
+            .iter()
+            .try_fold(0usize, |sum, message| sum.checked_add(message.len()))
+            .is_none_or(|bytes| bytes > eve_llm_api::MAX_REVIEW_USER_MESSAGES_BYTES)
+    {
+        return Err(TaskError::InvalidInput);
+    }
+    let bytes = serde_json::to_vec(messages).map_err(|_| TaskError::InvalidInput)?;
+    if bytes.len() > eve_llm_api::MAX_REVIEW_USER_MESSAGES_BYTES {
+        return Err(TaskError::InvalidInput);
+    }
+    Ok(())
+}
 
 pub fn validate_id(value: &str) -> TaskResult<()> {
     if value.is_empty()

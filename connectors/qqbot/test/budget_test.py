@@ -171,7 +171,7 @@ class BudgetAcceptance(unittest.TestCase):
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
                    EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
         child = subprocess.run(
-            [str(BINARY), "--state-dir", str(self.work / "state"), "--agent", str(ROOT / "AGENT.md"),
+            [str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "state"), "--agent", str(ROOT / "AGENT.md"),
              "--bridge-script", str(FAKE), "--bridge-arg", str(scenario), "--interest-learning",
              *self.budget(3)], env=configure_fixture_progress(env), capture_output=True, text=True, timeout=30)
         self.assertNotEqual(child.returncode, 0)

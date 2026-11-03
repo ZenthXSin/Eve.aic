@@ -117,7 +117,7 @@ class Acceptance(unittest.TestCase):
     def message(self, id, text, expected=None, scope="c2c", user="user-1", target=None,
             expected_type=None):
         message = {"id": id, "scope": scope, "target_id": target or (user if scope == "c2c" else "group-1"),
-            "user_id": user, "text": text, "expected": expected if expected is not None else text}
+            "user_id": user, "text": text, "original_text": text, "expected": expected if expected is not None else text}
         if expected_type:
             message["expected_type"] = expected_type
         return message
@@ -154,7 +154,7 @@ class Acceptance(unittest.TestCase):
         env.update(environment or {})
         bootstrap_test_admin(self.work / "state", env, app)
         bootstrap_fixture_groups(self.work / "state", scenario)
-        command = [str(BINARY), "--state-dir", str(self.work / "state"),
+        command = [str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "state"),
             "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
             "--bridge-arg", str(scenario)]
         if training:

@@ -237,6 +237,16 @@ impl ScriptStore {
             owner: owner.clone(),
             spec,
         };
+        // 频繁执行相同编排只读已有内容；避免每轮重写整本持久账本。
+        if let Some(existing) = self.read(|ledger| {
+            ledger
+                .versions
+                .get(&version.reference.digest)
+                .map(|existing| existing.load(&self.directory))
+                .transpose()
+        })? {
+            return Ok(existing);
+        }
         self.change(|ledger| {
             for dependency in version.spec.dependencies.values() {
                 get_version(ledger, owner, dependency)?;
@@ -298,6 +308,17 @@ impl ScriptStore {
         reference: &VersionRef,
         migration: Option<StateMigration>,
     ) -> Result<()> {
+        if migration.is_none()
+            && self.read(|ledger| {
+                get_version(ledger, owner, reference)?;
+                Ok(
+                    ledger.active.get(&active_key(owner, &reference.script)?) == Some(reference)
+                        && ledger.states.contains_key(&reference.digest),
+                )
+            })?
+        {
+            return Ok(());
+        }
         self.activate_with_receipt(owner, reference, migration, None)
     }
     pub(crate) fn activate_with_receipt(

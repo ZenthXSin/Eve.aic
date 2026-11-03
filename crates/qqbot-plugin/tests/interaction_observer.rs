@@ -109,6 +109,21 @@ struct Runner {
     tampered: bool,
 }
 impl ControlRunner for Runner {
+    fn run_with_metadata<'a>(
+        &'a self,
+        input: SessionInput,
+        metadata: Option<eve_control_api::ControlRunMetadata>,
+        sink: &'a dyn TurnEventSink,
+    ) -> RunFuture<'a> {
+        let metadata = metadata.expect("QQ 轮次必须携带可信入口证据");
+        metadata.validate_scope(&input.key).unwrap();
+        assert!(matches!(
+            metadata.review,
+            eve_control_api::ControlReviewEvidence::ChannelAnchor(anchor) if !anchor.is_empty()
+        ));
+        // 此替身只写测试 Session；生产执行器仍必须核对原文来源。
+        self.run(input, sink)
+    }
     fn run<'a>(&'a self, input: SessionInput, _: &'a dyn TurnEventSink) -> RunFuture<'a> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);

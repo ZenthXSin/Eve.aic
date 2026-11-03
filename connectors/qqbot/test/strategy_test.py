@@ -89,7 +89,7 @@ class StrategyAcceptance(toolforge_test.ToolForgeAcceptance):
                          prefix=self.send(self.message('casual', MINDUSTRY)), learning=False, max_executions=4)
         self.assertEqual(self.events(), [])
         self.assertTrue(all('guidance' not in json.loads(r['body']['messages'][-1]['content']) for r in self.kind('draft')))
-        child = subprocess.run([str(BINARY), '--strategy-learning', '--interest-learning', '--agent', str(ROOT / 'AGENT.md')],
+        child = subprocess.run([str(BINARY), "--minimal-profile", '--strategy-learning', '--interest-learning', '--agent', str(ROOT / 'AGENT.md')],
                                env={'PATH': os.environ['PATH']}, capture_output=True, text=True, timeout=5)
         self.assertNotEqual(child.returncode, 0)
         self.assertIn('实践运行环境', child.stderr)

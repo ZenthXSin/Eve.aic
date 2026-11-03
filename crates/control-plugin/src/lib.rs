@@ -161,9 +161,13 @@ impl Controller {
         &self,
         expected: Option<&GenerationKey>,
         input: ControlInput,
+        metadata: Option<ControlRunMetadata>,
         sink: Arc<dyn ControlEventSink>,
     ) -> ControlResult<GenerationKey> {
         input.validate()?;
+        if let Some(metadata) = &metadata {
+            metadata.validate_for(&input)?;
+        }
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| ControlError::Unavailable)?;
         let mut registry = self.lock()?;
@@ -231,7 +235,12 @@ impl Controller {
                 generation: running.clone(),
                 sink,
             };
-            let run = contain_panic(async { runner.run(input.session, &events).await }).await;
+            let run = contain_panic(async {
+                runner
+                    .run_with_metadata(input.session, metadata, &events)
+                    .await
+            })
+            .await;
             let run = run.unwrap_or(RunReport {
                 turn_id: None,
                 commit: CommitState::Unknown,
@@ -293,7 +302,15 @@ impl ControlService for Controller {
         input: ControlInput,
         sink: Arc<dyn ControlEventSink>,
     ) -> ControlResult<GenerationKey> {
-        self.submit_inner(None, input, sink)
+        self.submit_inner(None, input, None, sink)
+    }
+    fn submit_with_metadata(
+        &self,
+        input: ControlInput,
+        metadata: Option<ControlRunMetadata>,
+        sink: Arc<dyn ControlEventSink>,
+    ) -> ControlResult<GenerationKey> {
+        self.submit_inner(None, input, metadata, sink)
     }
     fn submit_if_current(
         &self,
@@ -301,7 +318,16 @@ impl ControlService for Controller {
         input: ControlInput,
         sink: Arc<dyn ControlEventSink>,
     ) -> ControlResult<GenerationKey> {
-        self.submit_inner(Some(expected), input, sink)
+        self.submit_inner(Some(expected), input, None, sink)
+    }
+    fn submit_if_current_with_metadata(
+        &self,
+        expected: &GenerationKey,
+        input: ControlInput,
+        metadata: Option<ControlRunMetadata>,
+        sink: Arc<dyn ControlEventSink>,
+    ) -> ControlResult<GenerationKey> {
+        self.submit_inner(Some(expected), input, metadata, sink)
     }
     fn cancel(&self, key: &GenerationKey) -> ControlResult<CancelDisposition> {
         let registry = self.lock()?;

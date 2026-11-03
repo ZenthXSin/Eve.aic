@@ -110,7 +110,7 @@ class GoalFeedbackAcceptance(unittest.TestCase):
 
     def message(self, message_id, text, contains=(), excludes=(), expected_type="reply",
                 scope="c2c", user="user-1", target=None, delivery_ok=True):
-        return {"id": message_id, "text": text, "scope": scope, "user_id": user,
+        return {"id": message_id, "text": text, "original_text": text, "scope": scope, "user_id": user,
                 "target_id": target or (user if scope == "c2c" else "group-1"),
                 "expected_type": expected_type, "contains": list(contains), "excludes": list(excludes),
                 "delivery_ok": delivery_ok}
@@ -182,7 +182,7 @@ class GoalFeedbackAcceptance(unittest.TestCase):
             EVE_OPENAI_API_KEY="test-model-secret", EVE_OPENAI_PROTOCOL="chat",
             EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
             EVE_LLM_RESPONSE_MODE="complete")
-        command = [str(BINARY), "--state-dir", str(self.work / "state"), "--agent", str(ROOT / "AGENT.md"),
+        command = [str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "state"), "--agent", str(ROOT / "AGENT.md"),
                    "--bridge-script", str(BRIDGE), "--bridge-arg", str(scenario)]
         if cognition:
             command.extend(["--cognition", "--cognition-max-executions", str(budget)])

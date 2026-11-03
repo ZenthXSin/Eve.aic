@@ -87,7 +87,7 @@ impl WorldCheck {
         validate_id(&self.tool)?;
         if matches!(
             self.tool.as_str(),
-            "echo" | "task_progress" | "dispatch_task" | "run_subagent"
+            "echo" | "task_progress" | "register_task_wait" | "dispatch_task" | "run_subagent"
         ) || !valid_world_digest(&self.arguments_sha256)
             || self.output_pointer.len() > 256
             || (!self.output_pointer.is_empty() && !self.output_pointer.starts_with('/'))

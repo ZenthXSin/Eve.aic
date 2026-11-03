@@ -60,6 +60,18 @@ fn input(
 fn token(event: &SubjectEvent) -> LeaseToken {
     event.lease.as_ref().unwrap().token.clone()
 }
+fn focus(id: &str, status: FocusStatus, t: u64) -> SubjectFocus {
+    SubjectFocus {
+        id: id.into(),
+        scope: scope("a", "alice"),
+        title: format!("关注 {id}"),
+        goal: format!("保存 {id} 的目标"),
+        task_id: None,
+        status,
+        next_check_at_ms: t,
+        updated_at_ms: t,
+    }
+}
 
 #[tokio::test]
 async fn one_subject_prioritizes_events_without_merging_windows_or_principals() {
@@ -291,6 +303,173 @@ async fn focus_checks_are_persistent_half_hourly_coalesced_and_do_not_notify() {
         .cancel_scope(&scope("a", "alice"), t + 2 * AUTONOMY_INTERVAL_MS)
         .unwrap();
     assert_eq!(admin.schedule_due(t + 3 * AUTONOMY_INTERVAL_MS).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn batch_foci_use_one_commit_and_fill_two_remaining_slots_atomically() {
+    let state = Arc::new(FailNth {
+        base: MemoryStateStore::default(),
+        writes: AtomicUsize::new(0),
+        fail_at: AtomicUsize::new(usize::MAX),
+    });
+    let (kernel, admin) = start(state.clone()).await;
+    let t = now();
+    admin
+        .upsert_foci(
+            (0..MAX_FOCI - 2)
+                .map(|n| focus(&format!("saved-{n}"), FocusStatus::Blocked, t))
+                .collect(),
+            t,
+        )
+        .unwrap();
+    let mut policy = focus("saved-0", FocusStatus::Active, t);
+    policy.goal = "已计入新目标的原始预算".into();
+    let mut action = focus("action", FocusStatus::Active, t);
+    action.next_check_at_ms = t + 3 * AUTONOMY_INTERVAL_MS;
+    let batch = vec![policy, focus("contract", FocusStatus::Blocked, t), action];
+    let before_writes = state.writes.load(Ordering::SeqCst);
+    let saved = admin.upsert_foci(batch.clone(), t + 1).unwrap();
+    assert_eq!(state.writes.load(Ordering::SeqCst), before_writes + 1);
+    assert_eq!(saved.len(), batch.len());
+    for (saved, input) in saved.iter().zip(&batch) {
+        assert_eq!(saved.id, input.id);
+        assert_eq!(saved.goal, input.goal);
+        assert_eq!(saved.updated_at_ms, t + 1);
+        assert_eq!(
+            saved.next_check_at_ms,
+            input.next_check_at_ms.max(t + 1 + AUTONOMY_INTERVAL_MS)
+        );
+    }
+    let snapshot = admin.snapshot_for(&scope("a", "alice")).unwrap();
+    assert_eq!(snapshot.foci.len(), MAX_FOCI);
+    assert!(saved.iter().all(|focus| snapshot.foci.contains(focus)));
+    kernel.stop(&plugin_id()).await.unwrap();
+    let (_kernel, restarted) = start(state).await;
+    assert_eq!(
+        restarted.snapshot_for(&scope("a", "alice")).unwrap(),
+        snapshot
+    );
+}
+
+#[tokio::test]
+async fn batch_foci_capacity_eviction_protects_existing_and_new_inputs() {
+    let (_kernel, admin) = start(Arc::new(MemoryStateStore::default())).await;
+    let t = now();
+    let mut initial: Vec<_> = (0..MAX_FOCI)
+        .map(|n| focus(&format!("saved-{n}"), FocusStatus::Blocked, t))
+        .collect();
+    initial[0].status = FocusStatus::Completed;
+    initial[1].status = FocusStatus::Completed;
+    initial[2].status = FocusStatus::Cancelled;
+    admin.upsert_foci(initial, t).unwrap();
+    let saved = admin
+        .upsert_foci(
+            vec![
+                focus("saved-0", FocusStatus::Completed, t),
+                focus("contract", FocusStatus::Completed, t),
+                focus("action", FocusStatus::Active, t),
+            ],
+            t + 1,
+        )
+        .unwrap();
+    let snapshot = admin.snapshot_for(&scope("a", "alice")).unwrap();
+    assert_eq!(snapshot.foci.len(), MAX_FOCI);
+    assert!(saved.iter().all(|focus| snapshot.foci.contains(focus)));
+    assert!(
+        snapshot
+            .foci
+            .iter()
+            .all(|focus| focus.id != "saved-1" && focus.id != "saved-2")
+    );
+}
+
+#[tokio::test]
+async fn batch_foci_capacity_failure_preserves_all_memory_and_storage() {
+    let state = Arc::new(MemoryStateStore::default());
+    let (_kernel, admin) = start(state.clone()).await;
+    let t = now();
+    let mut initial: Vec<_> = (0..MAX_FOCI)
+        .map(|n| focus(&format!("saved-{n}"), FocusStatus::Blocked, t))
+        .collect();
+    initial[0].status = FocusStatus::Completed;
+    initial[1].status = FocusStatus::Cancelled;
+    admin.upsert_foci(initial, t).unwrap();
+    let before = admin.snapshot_for(&scope("a", "alice")).unwrap();
+    let stored = state.get(&plugin_id(), SUBJECT_STATE_KEY).unwrap();
+    let mut updated = focus("saved-0", FocusStatus::Completed, t);
+    updated.goal = "本次更新不得半写".into();
+    assert_eq!(
+        admin.upsert_foci(
+            vec![
+                updated,
+                focus("contract", FocusStatus::Completed, t),
+                focus("action", FocusStatus::Active, t),
+            ],
+            t + 1,
+        ),
+        Err(SubjectError::LimitReached)
+    );
+    assert_eq!(admin.snapshot_for(&scope("a", "alice")).unwrap(), before);
+    assert_eq!(state.get(&plugin_id(), SUBJECT_STATE_KEY).unwrap(), stored);
+}
+
+#[tokio::test]
+async fn batch_foci_time_conflict_rolls_back_earlier_updates_and_additions() {
+    let state = Arc::new(MemoryStateStore::default());
+    let (_kernel, admin) = start(state.clone()).await;
+    let t = now();
+    admin
+        .upsert_focus(focus("policy", FocusStatus::Active, t), t)
+        .unwrap();
+    admin
+        .upsert_focus(focus("future", FocusStatus::Blocked, t), t + 2)
+        .unwrap();
+    let before = admin.snapshot_for(&scope("a", "alice")).unwrap();
+    let stored = state.get(&plugin_id(), SUBJECT_STATE_KEY).unwrap();
+    assert_eq!(
+        admin.upsert_foci(
+            vec![
+                focus("policy", FocusStatus::Completed, t),
+                focus("contract", FocusStatus::Blocked, t),
+                focus("future", FocusStatus::Active, t),
+            ],
+            t + 1,
+        ),
+        Err(SubjectError::InvalidInput)
+    );
+    assert_eq!(admin.snapshot_for(&scope("a", "alice")).unwrap(), before);
+    assert_eq!(state.get(&plugin_id(), SUBJECT_STATE_KEY).unwrap(), stored);
+}
+
+#[tokio::test]
+async fn batch_foci_reject_duplicate_keys_and_invalid_inputs_without_writing() {
+    let state = Arc::new(MemoryStateStore::default());
+    let (_kernel, admin) = start(state.clone()).await;
+    let t = now();
+    let item = focus("goal", FocusStatus::Active, t);
+    let mut other_scope = item.clone();
+    other_scope.scope = scope("b", "alice");
+    admin
+        .upsert_foci(vec![item.clone(), other_scope], t)
+        .unwrap();
+    let before = admin.snapshot_for(&scope("a", "alice")).unwrap();
+    let stored = state.get(&plugin_id(), SUBJECT_STATE_KEY).unwrap();
+    let mut invalid = focus("invalid", FocusStatus::Active, t);
+    invalid.goal.clear();
+    for (batch, at) in [
+        (vec![], t),
+        (vec![item.clone(), item.clone()], t),
+        (vec![item.clone(), invalid], t),
+        (vec![item.clone()], 0),
+        (vec![item], u64::MAX),
+    ] {
+        assert_eq!(
+            admin.upsert_foci(batch, at),
+            Err(SubjectError::InvalidInput)
+        );
+        assert_eq!(admin.snapshot_for(&scope("a", "alice")).unwrap(), before);
+        assert_eq!(state.get(&plugin_id(), SUBJECT_STATE_KEY).unwrap(), stored);
+    }
 }
 
 #[tokio::test]

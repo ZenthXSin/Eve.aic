@@ -1,6 +1,8 @@
 //! 组合层：把内置会话执行连接到独立控制契约。
 use crate::{SessionLlmHost, SessionRunError, TurnDiagnostics};
-use eve_control_api::{CommitState, ControlRunner, RunFailure, RunFuture, RunReport};
+use eve_control_api::{
+    CommitState, ControlRunMetadata, ControlRunner, RunFailure, RunFuture, RunReport,
+};
 use eve_llm_api::{LlmFuture, TurnEvent, TurnEventSink};
 use eve_session_api::SessionInput;
 use std::sync::{Arc, Mutex};
@@ -34,12 +36,23 @@ fn diagnostics(report: &mut RunReport, value: TurnDiagnostics) {
 }
 impl ControlRunner for SessionControlRunner {
     fn run<'a>(&'a self, input: SessionInput, sink: &'a dyn TurnEventSink) -> RunFuture<'a> {
+        self.run_with_metadata(input, None, sink)
+    }
+    fn run_with_metadata<'a>(
+        &'a self,
+        input: SessionInput,
+        metadata: Option<ControlRunMetadata>,
+        sink: &'a dyn TurnEventSink,
+    ) -> RunFuture<'a> {
         Box::pin(async move {
             let observed = ObservedSink {
                 sink,
                 turn_id: Mutex::new(None),
             };
-            let result = self.host.run_turn_with_events(input, &observed).await;
+            let result = self
+                .host
+                .run_turn_with_events_and_metadata(input, metadata, &observed)
+                .await;
             let mut report = RunReport {
                 turn_id: observed.turn_id.into_inner().unwrap_or(None),
                 commit: CommitState::NotStarted,

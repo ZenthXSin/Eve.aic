@@ -131,6 +131,7 @@ def expand_task_archive(documents, directory):
         metadata['result'] = metadata['failure'] = None
         if metadata.get('execution') is not None:
             metadata['execution']['checkpoint'] = None
+            metadata['execution'].pop('review_messages', None)
         assert metadata == entry['directory']
         assert task['id'] not in identities
         identities.add(task['id'])

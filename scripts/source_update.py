@@ -1,6 +1,7 @@
 """宿主源码自动同步：独立检出、完整验收、冻结候选，由升级监督器在空闲时切换。"""
 import argparse
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -19,6 +21,43 @@ import self_upgrade_runtime as runtime
 
 EMPTY = hashlib.sha256(b'').hexdigest()
 MAX_LOG_BYTES = 32 * 1024 * 1024
+MAX_SOURCE_DIFF_BYTES = 128 * 1024
+RUNTIME_SCRIPTS = ('scripts/build_resources.py', 'scripts/self_upgrade_runtime.py',
+                   'scripts/source_update.py')
+RETRY_LIMIT = 4
+RETRY_BASE_SECONDS = 60
+TRANSIENT_ERRORS = frozenset({
+    'auto_update_command_timeout', 'auto_update_fetch_failed', 'auto_update_disk_pressure',
+    'auto_update_resources_busy', 'auto_update_insufficient_space',
+    'auto_update_insufficient_space_for_candidate', 'auto_update_insufficient_space_for_backup',
+    'insufficient_space_for_backup', 'candidate_storage_limit', 'prepare_lease_expired',
+    'auto_update_os_transient',
+})
+
+
+def failure_code(error):
+    if isinstance(error, subprocess.TimeoutExpired):
+        return 'auto_update_command_timeout'
+    if isinstance(error, OSError) and error.errno in {
+            errno.ENOSPC, errno.EDQUOT, errno.EAGAIN, errno.ENOMEM, errno.ETIMEDOUT,
+            errno.ENETUNREACH, errno.ECONNRESET, errno.ECONNREFUSED}:
+        return 'auto_update_os_transient'
+    return (str(error) if type(error) is ValueError and str(error).replace('_', '').isalnum()
+            else type(error).__name__)[:100]
+
+
+def validate_retry(value):
+    if value is None:
+        return
+    fields = {'configuration', 'head', 'attempts', 'next_attempt_at_ms', 'error'}
+    if (not isinstance(value, dict) or set(value) != fields
+            or not runtime.sha(value['configuration'])
+            or value['head'] is not None and (not isinstance(value['head'], str)
+                                            or not re.fullmatch('[a-f0-9]{40}', value['head']))
+            or type(value['attempts']) is not int or not 1 <= value['attempts'] <= RETRY_LIMIT
+            or type(value['next_attempt_at_ms']) is not int or value['next_attempt_at_ms'] < 0
+            or value['error'] is not None and value['error'] not in TRANSIENT_ERRORS):
+        raise ValueError('invalid_auto_update_retry_state')
 
 def log_tail(path, limit=16384):
     # 必须先 seek；read_bytes()[-limit:] 会先把完整 Cargo 日志读进内存。
@@ -138,10 +177,22 @@ class GitBuilder:
                 'stderr': '', 'stdout_truncated': truncated, 'stderr_truncated': False}
 
     def git(self, args, cwd, log):
-        self.command(['git', '-c', 'credential.helper=', '-c', 'core.hooksPath=/dev/null', *args], cwd, log, 120)
+        try:
+            self.command(['git', '-c', 'credential.helper=', '-c', 'core.hooksPath=/dev/null', *args], cwd, log, 120)
+        except ValueError as error:
+            if args[:1] == ['fetch'] and str(error) == 'auto_update_check_failed':
+                raise ValueError('auto_update_fetch_failed') from None
+            raise
         return log.read_text().strip()
 
+    def validate_index(self, source, git_log):
+        records = self.git(['ls-files', '-v', '-z'], source, git_log).split('\0')
+        if any(not record.startswith('H ') for record in records if record):
+            raise ValueError('auto_update_hidden_index_state')
+
     def prepare(self, active_head, forced=False, failed_head=None):
+        if not isinstance(active_head, str) or not re.fullmatch('[a-f0-9]{40}', active_head):
+            raise ValueError('auto_update_trusted_base_missing')
         source = self.root / 'source'
         logs = self.root / 'logs'; logs.mkdir(exist_ok=True)
         # 日志仅保留最近两次源码验收；具体失败摘要由状态文件持久保存。
@@ -156,6 +207,7 @@ class GitBuilder:
         source.mkdir(exist_ok=True)
         if source.is_symlink(): raise ValueError('auto_update_source_symlink')
         if not (source / '.git').exists(): self.git(['init'], source, git_log)
+        self.validate_index(source, git_log)
         if self.git(['status', '--porcelain', '--untracked-files=all'], source, git_log):
             raise ValueError('auto_update_checkout_has_local_changes')
         self.git(['fetch', '--no-tags', '--depth=200', self.remote,
@@ -165,14 +217,33 @@ class GitBuilder:
         self.publish(phase='checking', target_head=head)
         if head == active_head: return {'head': head, 'up_to_date': True}
         if head == failed_head and not forced: return {'head': head, 'previous_failure': True}
-        if active_head:
-            # 不自动降级、切换到不相关历史或丢弃 Eve 已激活的分支功能。
-            self.git(['fetch', '--no-tags', '--depth=200', self.remote, active_head], source, git_log)
-            try: self.git(['merge-base', '--is-ancestor', active_head, head], source, git_log)
-            except ValueError: raise ValueError('active_source_not_upstream') from None
+        # 不自动降级、切换到不相关历史或丢弃 Eve 已激活的分支功能。
+        self.git(['fetch', '--no-tags', '--depth=200', self.remote, active_head], source, git_log)
+        if self.git(['rev-parse', '--verify', active_head + '^{commit}'], source, git_log) != active_head:
+            raise ValueError('auto_update_base_not_commit')
+        try: self.git(['merge-base', '--is-ancestor', active_head, head], source, git_log)
+        except ValueError as error:
+            if str(error) == 'auto_update_check_failed':
+                raise ValueError('active_source_not_upstream') from None
+            raise
         if shutil.disk_usage(self.root).free < self.settings['minimum_free_bytes']:
             raise ValueError('auto_update_insufficient_space')
         self.git(['checkout', '--detach', head], source, git_log)
+        source_diff_path = logs / (head + '-source-diff.patch')
+        self.command(['git', '--no-pager', '-c', 'credential.helper=', '-c', 'core.hooksPath=/dev/null',
+                      'diff', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--binary', active_head, '--'],
+                     source, logs / (head + '-source-diff.log'), 120, stdout_file=source_diff_path)
+        if source_diff_path.stat().st_size > MAX_SOURCE_DIFF_BYTES:
+            raise ValueError('auto_update_source_diff_too_large')
+        source_diff_text = source_diff_path.read_text(encoding='utf8')
+        if any(line.startswith(('GIT binary patch', 'Binary files ', 'Submodule ',
+                                'new file mode 160000', 'deleted file mode 160000',
+                                'old mode 160000', 'new mode 160000'))
+               or line.startswith('index ') and line.endswith(' 160000')
+               for line in source_diff_text.splitlines()):
+            raise ValueError('auto_update_source_diff_not_reviewable')
+        source_diff = dict(path='source-diff.patch', sha256=runtime.digest(source_diff_path),
+                           base_revision=active_head, target_revision=head)
         self.publish(phase='verifying', target_head=head)
         target = self.root / 'target'
         cargo = [self.settings['cargo_program'], *self.settings['cargo_arguments']]
@@ -195,6 +266,7 @@ class GitBuilder:
             (2, 'clippy', ['clippy', '--workspace', '--all-targets', *common, '--', '-D', 'warnings']),
             (3, 'test_compile', ['test', '--workspace', '--no-run', *common]),
             (3, 'tests', ['test', '--workspace', *common]),
+            (3, 'runtime_contracts', [sys.executable, '-B', 'scripts/verify-self-upgrade.py']),
             *[(4, 'binary', ['build', '-p', 'eve-app', '--bin', binary, *common]) for binary in binaries],
         ]
         groups = [[], [], [], []]
@@ -204,7 +276,7 @@ class GitBuilder:
                          stage_index=index + 1, stage_count=len(stages), effective_jobs=plan['jobs'],
                          resources=plan, binary=arguments[arguments.index('--bin') + 1] if '--bin' in arguments else None)
             if not plan['jobs']: raise ValueError('auto_update_resources_busy')
-            groups[check - 1].append(self.command(cargo + arguments, source,
+            groups[check - 1].append(self.command(arguments if stage == 'runtime_contracts' else cargo + arguments, source,
                 logs / (head + '-' + str(check) + '-' + str(index + 1) + '-' + stage + '.log'), plan=plan))
         checks = []
         for group in groups:
@@ -212,24 +284,45 @@ class GitBuilder:
             checks.append(dict(success=True, exit_code=0, stdout=output[-16384:], stderr='',
                 stdout_truncated=len(output) > 16384 or any(r['stdout_truncated'] for r in group), stderr_truncated=False,
                 steps=[dict(success=r['success'], exit_code=r['exit_code']) for r in group]))
+        self.validate_index(source, git_log)
         if self.git(['rev-parse', 'HEAD'], source, git_log) != head or self.git(['status', '--porcelain', '--untracked-files=all'], source, git_log):
             raise ValueError('auto_update_source_changed_during_validation')
-        return self.freeze(source, head, target / 'release' / ('eve-qqbot.exe' if os.name == 'nt' else 'eve-qqbot'), checks, git_log)
+        binary = target / 'release' / ('eve-qqbot.exe' if os.name == 'nt' else 'eve-qqbot')
+        binary_sha = runtime.digest(binary)
+        return self.freeze(source, head, binary, checks, git_log, source_diff, source_diff_path, binary_sha)
 
-    def freeze(self, source, head, binary, checks, git_log):
+    def freeze(self, source, head, binary, checks, git_log, source_diff, source_diff_path, binary_sha):
+        if (source_diff_path.stat().st_size > MAX_SOURCE_DIFF_BYTES
+                or runtime.digest(source_diff_path) != source_diff['sha256']
+                or source_diff['target_revision'] != head):
+            raise ValueError('auto_update_source_diff_changed')
         self.candidates.mkdir(parents=True, exist_ok=True)
         resources = {}
-        names = self.git(['ls-files', '-z', '--', 'AGENT.md', 'connectors/qqbot', 'vendor'], source, git_log).split('\0')
+        records = self.git(['ls-tree', '-rz', head, '--', 'AGENT.md', 'connectors/qqbot', 'vendor',
+                            *RUNTIME_SCRIPTS], source, git_log).split('\0')
         total = 0
-        for name in filter(None, names):
+        for record in filter(None, records):
+            metadata, name = record.split('\t', 1)
+            mode, kind, blob = metadata.split()
             path = source / name
-            if path.is_symlink() or not path.is_file(): raise ValueError('invalid_auto_update_resource')
+            if mode not in ('100644', '100755') or kind != 'blob' or path.is_symlink() or not path.is_file():
+                raise ValueError('invalid_auto_update_resource')
             total += path.stat().st_size
             if total > 64 * 1024**2 or len(resources) >= 10000: raise ValueError('auto_update_resources_too_large')
-            resources[name] = runtime.digest(path)
+            # 资源必须仍是已验收提交的实际 blob；仅重算当前工作树摘要会把迟到修改伪装成 clean。
+            raw = path.read_bytes()
+            git_blob = hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()
+            if git_blob != blob or len(raw) > 64 * 1024**2:
+                raise ValueError('auto_update_source_changed_during_freeze')
+            resources[name] = hashlib.sha256(raw).hexdigest()
+        if not set(RUNTIME_SCRIPTS) <= resources.keys():
+            raise ValueError('auto_update_runtime_scripts_missing')
         source_id = {'head': head, 'diff': EMPTY, 'untracked': EMPTY}
-        binary_sha = runtime.digest(binary)
-        identity = {'source': source_id, 'binary_sha256': binary_sha, 'resources': resources}
+        if runtime.digest(binary) != binary_sha:
+            raise ValueError('auto_update_binary_changed_during_freeze')
+        runtime_bundle = dict(host_protocol=1, scripts=list(RUNTIME_SCRIPTS))
+        identity = {'source': source_id, 'binary_sha256': binary_sha, 'resources': resources,
+                    'source_diff': source_diff, 'runtime': runtime_bundle}
         key = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         directory = self.candidates / key
         request = dict(format_version=1, candidate_sha256=key, candidate_directory=str(directory),
@@ -237,17 +330,24 @@ class GitBuilder:
         if not directory.exists():
             if sum(p.is_dir() for p in self.candidates.iterdir()) >= 8:
                 raise ValueError('candidate_storage_limit')
-            if shutil.disk_usage(self.candidates).free < binary.stat().st_size + total + 128 * 1024**2:
+            if shutil.disk_usage(self.candidates).free < binary.stat().st_size + total + source_diff_path.stat().st_size + 128 * 1024**2:
                 raise ValueError('auto_update_insufficient_space_for_candidate')
             with tempfile.TemporaryDirectory(dir=self.candidates) as temporary:
                 stage = Path(temporary)
                 shutil.copy2(binary, stage / binary.name); (stage / binary.name).chmod(0o700)
+                shutil.copy2(source_diff_path, stage / source_diff['path'])
                 for name in resources:
                     dest = stage / 'resources' / name; dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source / name, dest)
+                if (runtime.digest(stage / binary.name) != binary_sha
+                        or runtime.digest(stage / source_diff['path']) != source_diff['sha256']
+                        or any(runtime.digest(stage / 'resources' / name) != expected
+                               for name, expected in resources.items())):
+                    raise ValueError('auto_update_candidate_changed_during_freeze')
                 runtime.atomic(stage / 'manifest.json', dict(format_version=1, prepared=True, success=True, applied=False,
                     source=source_id, binary_sha256=binary_sha, candidate_sha256=key,
-                    candidate_path=str(directory / binary.name), resources=resources, checks=checks))
+                    candidate_path=str(directory / binary.name), resources=resources, checks=checks,
+                    source_diff=source_diff, runtime=runtime_bundle))
                 stage.rename(directory)
         _, _, manifest = runtime.validate_candidate(request, self.candidates)
         request['lease'] = runtime.prepare_lease(directory, manifest)
@@ -268,26 +368,88 @@ class SourceUpdater:
         path = self.control / 'auto-update.json'
         self.status = runtime.read_json(path) if path.exists() else {'format_version': 1}
         if self.status.get('format_version') != 1: raise ValueError('unknown_auto_update_status')
-        self.publish(phase='idle', enabled=self.settings['enabled'], interrupted=self.status.get('phase') in ('checking', 'verifying', 'waiting'))
+        if self.status.get('configuration') is not None and not runtime.sha(self.status['configuration']):
+            raise ValueError('invalid_auto_update_configuration_binding')
+        validate_retry(self.status.get('retry'))
+        self.publish(phase='handed_off' if self.status.get('result') == 'handed_off' else 'idle',
+                     enabled=self.settings['enabled'], interrupted=self.status.get('phase') in ('checking', 'verifying', 'waiting'))
 
     def publish(self, **changes):
         with self.mutex:
             self.status.update(changes, updated_at_ms=int(time.time() * 1000))
             runtime.atomic(self.control / 'auto-update.json', self.status)
 
+    def retry_record(self, signature, head, attempts, error=None):
+        return dict(configuration=signature, head=head, attempts=attempts, error=error,
+                    next_attempt_at_ms=int((time.time() + RETRY_BASE_SECONDS * 2 ** (attempts - 1)) * 1000))
+
+    def record_failure(self, error):
+        code = failure_code(error)
+        retry = self.status.get('retry')
+        if code in TRANSIENT_ERRORS and retry is not None:
+            retry = self.retry_record(retry['configuration'], retry['head'], retry['attempts'], code)
+            exhausted = retry['attempts'] >= RETRY_LIMIT
+            self.next_check = (time.monotonic() + self.settings['interval_seconds'] if exhausted
+                               else time.monotonic() + max(0, retry['next_attempt_at_ms'] / 1000 - time.time()))
+            self.publish(phase='idle', result='retry_exhausted' if exhausted else 'deferred',
+                         error=code, retry=retry)
+        else:
+            self.next_check = time.monotonic() + self.settings['interval_seconds']
+            self.publish(phase='idle', result='failed', error=code,
+                         failed_head=self.status.get('target_head'), retry=None)
+
     def active(self, supervisor):
         descriptor = supervisor.active_descriptor
-        if not descriptor['candidate_request']: return None
+        if not descriptor['candidate_request']:
+            return supervisor.status.get('active_source_revision')
         _, _, manifest = runtime.validate_candidate(descriptor['candidate_request'], self.candidates)
         source = manifest['source']
         if source['diff'] != EMPTY or source['untracked'] != EMPTY:
             raise ValueError('active_source_has_local_changes')
         return source['head']
 
+    def reconcile_handoff(self, supervisor):
+        if self.status.get('result') != 'handed_off':
+            return True
+        if getattr(supervisor, 'stopping', False):
+            return False
+        path = self.control/'host-handoff.json'
+        if not path.exists():
+            return False
+        receipt = runtime.read_json(path)
+        if (not isinstance(receipt, dict)
+                or set(receipt) != {'format_version', 'phase', 'previous', 'next', 'error', 'updated_at_ms'}
+                or receipt['format_version'] != 1
+                or receipt['phase'] not in ('prepared', 'old_closed', 'trial', 'committed',
+                                            'rolling_back', 'rolled_back', 'blocked')
+                or type(receipt['updated_at_ms']) is not int):
+            raise ValueError('invalid_host_handoff_receipt')
+        next_request = receipt['next']['descriptor']['candidate_request']
+        if next_request['candidate_sha256'] != self.status.get('handed_off_candidate_sha256'):
+            raise ValueError('host_handoff_receipt_mismatch')
+        if receipt['phase'] in ('prepared', 'old_closed', 'trial', 'rolling_back'):
+            return False
+        if receipt['phase'] == 'blocked':
+            self.publish(phase='blocked', error='host_handoff_blocked')
+            return False
+        expected = receipt['next' if receipt['phase'] == 'committed' else 'previous']['descriptor']
+        if (supervisor.active_descriptor['candidate_request'] != expected['candidate_request']
+                or supervisor.active_descriptor['command'] != expected['command']
+                or self.active(supervisor) != expected['source_revision']):
+            raise ValueError('host_handoff_active_mismatch')
+        applied = receipt['phase'] == 'committed'
+        self.publish(phase='idle', result='applied' if applied else 'rolled_back_runtime_state_preserved',
+                     current_head=expected['source_revision'],
+                     applied_head=expected['source_revision'] if applied else None,
+                     failed_head=None if applied else self.status['handed_off_head'], retry=None, error=None)
+        return True
+
     def tick(self, supervisor):
         if time.monotonic() - self.last_tick < .5: return
         self.last_tick = time.monotonic()
         try:
+            if not self.reconcile_handoff(supervisor):
+                return
             self.settings = configuration(self.config_path)
             root = Path(self.settings['data_directory'])
             if any(root == p.resolve() or root in p.resolve().parents or p.resolve() in root.parents
@@ -298,7 +460,11 @@ class SourceUpdater:
                 self.stopped.set(); self.pending = None; self.quiet = None
                 if self.thread and not self.thread.is_alive():
                     self.thread.join(); self.thread = None; self.results.get_nowait()
-                if self.status.get('phase') != 'disabled': self.publish(phase='disabled', enabled=False)
+                if self.status.get('phase') != 'disabled':
+                    # 显式禁用取消当前准备；已经记录的失败预算继续保留。
+                    retry = self.status.get('retry')
+                    self.publish(phase='disabled', enabled=False,
+                                 retry=retry if retry and retry['error'] is not None else None)
                 return
             if self.status.get('enabled') is False:
                 if self.thread:
@@ -321,6 +487,9 @@ class SourceUpdater:
                 if shutil.disk_usage(self.control).free < state_bytes * 2 + 256 * 1024**2:
                     raise ValueError('auto_update_insufficient_space_for_backup')
                 request = self.pending['request']
+                _, _, checked = runtime.validate_candidate(request, self.candidates)
+                if checked['source_diff']['base_revision'] != supervisor.status.get('active_source_revision'):
+                    raise ValueError('auto_update_source_base_changed')
                 path = self.control / 'auto-request.json'
                 runtime.atomic(path, request)
                 command, manifest = supervisor.candidate_command(request)
@@ -328,8 +497,14 @@ class SourceUpdater:
                     path.unlink(); self.quiet = None; return
                 supervisor.switch(request, command, manifest, request_path=path)
                 result = supervisor.status['result']
+                if result == 'handed_off':
+                    self.publish(phase='handed_off', result=result, current_head=self.pending['base_head'],
+                                 handed_off_head=self.pending['head'], handed_off_candidate_sha256=request['candidate_sha256'],
+                                 applied_head=None, retry=None)
+                    self.pending = None; self.quiet = None
+                    return
                 self.publish(phase='idle', result=result, current_head=self.pending['head'] if result == 'applied' else self.pending['base_head'], applied_head=self.pending['head'] if result == 'applied' else None,
-                             failed_head=None if result == 'applied' else self.pending['head'])
+                             failed_head=None if result == 'applied' else self.pending['head'], retry=None)
                 self.pending = None; self.quiet = None; return
             if self.thread:
                 if self.thread.is_alive(): return
@@ -337,13 +512,32 @@ class SourceUpdater:
                 result, base_head, job_signature = self.results.get_nowait()
                 if job_signature != signature:
                     self.next_check = 0; self.publish(phase='idle', result='configuration_changed'); return
+                if result.get('failure_recorded'):
+                    return
                 if 'request' in result:
                     self.pending = dict(result, base_head=base_head, configuration=signature); self.quiet = None
                     self.publish(phase='waiting', prepared_head=result['head']); return
-                if result.get('result') == 'deferred': self.next_check = min(self.next_check, time.monotonic() + 60)
+                if result.get('up_to_date'):
+                    self.publish(retry=None, failed_head=None)
+                elif result.get('previous_failure') and (self.status.get('retry') or {}).get('attempts', 0) < RETRY_LIMIT:
+                    self.publish(retry=None)
                 self.publish(phase='idle', **result, **({} if 'result' in result else {'result': 'up_to_date' if result.get('up_to_date') else 'previous_failure'})); return
             force = self.control / 'check-updates.json'
             forced = force.exists()
+            retry = self.status.get('retry')
+            if retry is not None and retry['configuration'] != signature:
+                retry = None
+                self.next_check = 0
+                self.publish(retry=None, failed_head=None)
+            if self.status.get('configuration') is not None and self.status['configuration'] != signature:
+                retry = None
+                self.next_check = 0
+                self.publish(configuration=signature, retry=None, failed_head=None)
+            if retry and not forced:
+                if retry['attempts'] >= RETRY_LIMIT and retry['head'] is None:
+                    return
+                if int(time.time() * 1000) < retry['next_attempt_at_ms']:
+                    return
             if time.monotonic() < self.next_check and not forced: return
             if forced:
                 value = runtime.read_json(force)
@@ -352,24 +546,52 @@ class SourceUpdater:
                 force.unlink()
             base = self.active(supervisor)
             self.next_check = time.monotonic() + self.settings['interval_seconds']
-            self.publish(phase='checking', enabled=True, current_head=base, error=None, check=0, stage=None, stage_index=0, stage_count=None, effective_jobs=None, resources=None, binary=None)
+            failed_head = self.status.get('failed_head')
+            if retry and retry['attempts'] >= RETRY_LIMIT and not forced:
+                failed_head = retry['head']
+            else:
+                retry = self.retry_record(signature, None if forced or retry is None else retry['head'],
+                                          1 if forced or retry is None else retry['attempts'] + 1,
+                                          None if forced or retry is None else retry['error'])
+            # 先持久化本次占用的次数；重启不能清空预算或跳过退避后重复执行未知结果的构建。
+            self.publish(phase='checking', enabled=True, current_head=base, target_head=None,
+                         result=None, error=None, configuration=signature, retry=retry, check=0, stage=None, stage_index=0, stage_count=None,
+                         effective_jobs=None, resources=None, binary=None)
             settings = dict(self.settings)
             if self.stopped.is_set(): self.stopped = threading.Event()
+            def publish_build(**changes):
+                if self.stopped.is_set():
+                    return
+                head = changes.get('target_head')
+                current = self.status['retry']
+                if head is not None and current['head'] != head:
+                    changes['retry'] = self.retry_record(signature, head, 1)
+                self.publish(**changes)
             def work():
                 try:
-                    builder = self.builder_factory(settings, self.candidates, self.stopped, self.publish)
-                    result = builder.prepare(base, forced, self.status.get('failed_head'))
+                    builder = self.builder_factory(settings, self.candidates, self.stopped, publish_build)
+                    result = builder.prepare(base, forced, failed_head)
                 except Exception as error:
-                    code = str(error) if type(error) is ValueError and str(error).replace('_', '').isalnum() else type(error).__name__
-                    result = {'result': 'deferred' if code == 'auto_update_resources_busy' else 'failed', 'error': code[:100], 'failed_head': None if code == 'auto_update_resources_busy' else self.status.get('target_head')}
+                    # 失败与预算一并落盘，不能等内存结果队列被下一次 tick 消费才记录。
+                    if not self.stopped.is_set():
+                        self.record_failure(error)
+                    result = {'failure_recorded': True}
                 self.results.put((result, base, signature))
             self.thread = threading.Thread(target=work, daemon=True); self.thread.start()
         except Exception as error:
             if (self.control / 'processing.json').exists(): raise
-            code = str(error) if type(error) is ValueError and str(error).replace('_', '').isalnum() else type(error).__name__
             self.pending = None; self.quiet = None
-            self.next_check = time.monotonic() + self.settings['interval_seconds']
-            self.publish(phase='idle', result='failed', error=code[:100])
+            code = failure_code(error)
+            if self.status.get('result') == 'handed_off':
+                # 未核实的宿主回执不能解除交接门禁，也不能被通用错误处理改成可再次构建。
+                self.publish(phase='blocked', error=code)
+                return
+            if code in TRANSIENT_ERRORS and self.status.get('retry') is not None:
+                self.record_failure(error)
+            else:
+                # 配置、运行时状态或控制文件错误不是源码验收失败；保留在途构建的预算。
+                self.next_check = time.monotonic() + self.settings['interval_seconds']
+                self.publish(phase='idle', result='failed', error=code)
 
     def stop(self):
         self.stopped.set()

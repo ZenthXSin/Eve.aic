@@ -640,7 +640,14 @@ async fn provider_timeout_records_failure_and_releases_admission() {
         rig.snapshot("s").turns[0].status,
         SessionTurnStatus::Failed {
             failure: SessionFailure {
-                evidence: None,
+                evidence: Some(eve_session_api::SessionFailureEvidence {
+                    review_user_messages: Some(vec!["问题".into()]),
+                    provider_http_status: None,
+                    provider_failure: None,
+                    protocol_failure: None,
+                    tool_names: vec![],
+                    tool_results: vec![],
+                }),
                 code: SessionFailureCode::ProviderTimeout,
                 started_tools: Some(0)
             }

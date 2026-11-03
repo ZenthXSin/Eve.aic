@@ -1,6 +1,7 @@
 //! 条件账本与取得流程：先把来源取到暂存目录，核对大小与摘要，交给宿主登记的验证器实际使用一次，
 //! 全部通过后才移入条件目录并写账本；账本写盘成功才替换内存。失败的暂存文件删除，只记原因。
 //! 账本损坏或格式未知时拒绝启动并保留原字节；条件目录里账本没有引用的文件不会被自动删除。
+//! 恢复使用前重新核对普通文件、长度与摘要；缺失返回 None，内容或路径改变则拒绝使用，保留账本与原文件。
 mod fetch;
 
 use eve_plugin_api::{
@@ -12,6 +13,7 @@ use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::{ErrorKind, Read},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -173,6 +175,101 @@ impl Drop for BusyGuard {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 已取得文件的路径不是验证证据；每次交给运行器前均核对账本中冻结的内容。
+fn verified_ready_path(
+    root: &Path,
+    acquired: &Acquisition,
+    max_bytes: u64,
+) -> ProvisionResult<Option<PathBuf>> {
+    let failed = |reason: &str| ProvisionError::VerifyFailed(reason.into());
+    let root_metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(failed("已验证运行条件的根目录无法读取")),
+    };
+    if !root_metadata.file_type().is_dir() {
+        return Err(failed("运行条件根目录必须是普通目录，不能是符号链接"));
+    }
+    let root = match root.canonicalize() {
+        Ok(root) => root,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(failed("已验证运行条件的根目录无法解析")),
+    };
+    let mut path = root.clone();
+    for part in Path::new(&acquired.path).components() {
+        if !matches!(part, std::path::Component::Normal(_)) {
+            return Err(ProvisionError::CorruptState);
+        }
+        path.push(part.as_os_str());
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(failed("已验证运行条件的路径无法读取")),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(failed("运行条件路径不能包含符号链接"));
+        }
+    }
+    let path = match path.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(failed("已验证运行条件的路径无法解析")),
+    };
+    if !path.starts_with(&root) {
+        return Err(failed("运行条件文件超出条件根目录"));
+    }
+    let metadata = match path.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(failed("已验证运行条件文件的属性无法读取")),
+    };
+    if !metadata.is_file() {
+        return Err(failed("已验证运行条件必须是普通文件"));
+    }
+    if acquired.bytes == 0 || metadata.len() != acquired.bytes {
+        return Err(failed("已验证运行条件文件的长度与原验证记录不符"));
+    }
+    if acquired.bytes > max_bytes {
+        return Err(ProvisionError::TooLarge);
+    }
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(failed("已验证运行条件文件无法打开")),
+    };
+    let opened = file
+        .metadata()
+        .map_err(|_| failed("已验证运行条件文件的属性无法读取"))?;
+    if !opened.is_file() || opened.len() != acquired.bytes {
+        return Err(failed("读取期间运行条件文件的类型或长度改变"));
+    }
+    let mut input = file.take(acquired.bytes.saturating_add(1));
+    let mut digest = Context::new(&SHA256);
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut bytes = 0_u64;
+    loop {
+        let count = input
+            .read(&mut buffer)
+            .map_err(|_| failed("已验证运行条件文件读取中断"))?;
+        if count == 0 {
+            break;
+        }
+        bytes += count as u64;
+        if bytes > acquired.bytes {
+            return Err(failed("读取期间运行条件文件的长度改变"));
+        }
+        digest.update(&buffer[..count]);
+    }
+    if bytes != acquired.bytes {
+        return Err(failed("读取期间运行条件文件的长度改变"));
+    }
+    let actual = hex(digest.finish().as_ref());
+    if actual != acquired.sha256 {
+        return Err(ProvisionError::DigestMismatch { actual });
+    }
+    Ok(Some(path))
 }
 
 impl ProvisionController {
@@ -369,14 +466,20 @@ impl ConditionProvider for ProvisionController {
 
     fn ready_path(&self, condition: &str) -> ProvisionResult<Option<PathBuf>> {
         let stored = self.service()?;
-        stored.read(|ledger| {
+        let acquired = stored.read(|ledger| {
             ledger
                 .conditions
                 .get(condition)
-                .and_then(|entry| entry.ready.as_ref())
-                .map(|a| self.root.join(&a.path))
-                .filter(|path| path.is_file())
-        })
+                .and_then(|entry| entry.ready.clone())
+        })?;
+        let Some(acquired) = acquired else {
+            return Ok(None);
+        };
+        let registered = self
+            .registry
+            .get(condition)
+            .ok_or(ProvisionError::UnknownCondition)?;
+        verified_ready_path(&self.root, &acquired, registered.spec.max_bytes)
     }
 
     fn acquire(&self, request: AcquireRequest) -> BoxFuture<'_, ProvisionResult<Acquisition>> {

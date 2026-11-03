@@ -320,6 +320,53 @@ print(json.dumps({'op':'return','value':result}),flush=True)
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn sandbox_symlinked_runtimes_use_real_installation_without_other_languages() {
+    let aliases = tempfile::tempdir().unwrap();
+    let bin = aliases.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let missing = aliases.path().join("unconfigured-runtime");
+    for (name, language, source) in [
+        ("python3", Language::Python, RETURN_ONE),
+        (
+            "node",
+            Language::Javascript,
+            "const lines=require('node:readline').createInterface({input:process.stdin});\nlines.once('line',()=>{console.log(JSON.stringify({op:'return',value:1}));lines.close();});",
+        ),
+    ] {
+        // 别名前缀没有 lib；Python 必须从真实安装前缀加载标准库。
+        let alias = bin.join(name);
+        std::os::unix::fs::symlink(trusted_runtime(name), &alias).unwrap();
+        let mut sandbox = match language {
+            Language::Python => Bubblewrap::new(&alias, &missing),
+            _ => Bubblewrap::new(&missing, &alias),
+        };
+        sandbox.bwrap = trusted_runtime("bwrap");
+        let (_root, store, _, runtime) = setup_with_sandbox(sandbox);
+        let mut candidate = spec("symlink-runtime", source);
+        candidate.language = language;
+        let reference = install(&store, candidate);
+        let bound = runtime.bind(&owner(), &reference).unwrap();
+        let receipt = runtime
+            .run(&bound, "symlink-runtime", json!({}), context(1))
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Succeeded, "{receipt:?}");
+        assert_eq!(receipt.result, Some(json!(1)));
+
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&missing, &alias).unwrap();
+        assert!(
+            runtime
+                .run(&bound, "broken-runtime", json!({}), context(1))
+                .await
+                .is_err(),
+            "断开的解释器链接必须在启动前失败关闭"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn python_calls_javascript_and_host_delivery_with_shared_identity_budget_and_temp_lifecycle()
 {
     let (root, store, gate, runtime) = setup_isolated();

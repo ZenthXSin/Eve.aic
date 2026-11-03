@@ -61,7 +61,7 @@ export class QQBot {
             EVE_MODELS_JEV_ENABLED='true',EVE_MODELS_JEV_PROVIDER='jev',EVE_MODELS_JEV_MODEL='group-jev-test-model')
         bootstrap_fixture_group_ids(self.work / 'state', ['prefix-group', 'wake-group'])
         self.runs += 1
-        child = subprocess.Popen([str(reminder_test.BINARY),'--group-chat','--message-judge','jev',
+        child = subprocess.Popen([str(reminder_test.BINARY), "--minimal-profile",'--group-chat','--message-judge','jev',
             '--state-dir',str(self.work/'state'),'--agent',str(source.parents[1]/'AGENT.md'),
             '--bridge-script',str(root/'bridge.mjs')],env=configure_fixture_progress(env),text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         try:
@@ -136,7 +136,7 @@ export class QQBot {
                    EVE_CHIME_MAX_REPLIES_PER_HOUR='1')
         bootstrap_fixture_group_ids(self.work / 'state', ['prefix-group', 'wake-group'])
         self.runs += 1
-        child = subprocess.Popen([str(reminder_test.BINARY), '--group-chat', '--training', '--interest-learning',
+        child = subprocess.Popen([str(reminder_test.BINARY), "--minimal-profile", '--group-chat', '--training', '--interest-learning',
             '--message-judge', 'jev', '--autonomy-budget', '1', '--state-dir', str(self.work / 'state'),
             '--agent', str(source.parents[1] / 'AGENT.md'), '--bridge-script', str(root / 'bridge.mjs')],
             env=configure_fixture_progress(env), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

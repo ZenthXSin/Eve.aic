@@ -32,6 +32,7 @@ fn message_key(m: &IncomingMessage) -> MessageKey {
 }
 struct Entry {
     message: IncomingMessage,
+    metadata: Option<ControlRunMetadata>,
     ordinal: u64,
     done: watch::Sender<Option<MessageResult<RouteReport>>>,
     task: Mutex<Option<JoinHandle<()>>>,
@@ -83,16 +84,32 @@ impl MessageService for Router {
         message: IncomingMessage,
         sink: Arc<dyn ControlEventSink>,
     ) -> MessageResult<MessageTicket> {
+        self.submit_with_metadata(message, None, sink)
+    }
+    fn submit_with_metadata(
+        &self,
+        message: IncomingMessage,
+        metadata: Option<ControlRunMetadata>,
+        sink: Arc<dyn ControlEventSink>,
+    ) -> MessageResult<MessageTicket> {
         message.validate()?;
         let mut book = self.0.book.lock().map_err(|_| MessageError::Unavailable)?;
         if !book.active {
             return Err(MessageError::Unavailable);
         }
         if let Some(entry) = book.entries.get(&message_key(&message)) {
-            if entry.message != message {
+            if entry.message != message || entry.metadata != metadata {
                 return Err(MessageError::Conflict);
             }
             return Ok(MessageTicket { message });
+        }
+        if let Some(metadata) = &metadata {
+            metadata
+                .validate_scope(&message.target.session)
+                .map_err(|_| MessageError::InvalidInput)?;
+            if metadata.task_id != message.target.task_id {
+                return Err(MessageError::InvalidInput);
+            }
         }
         let request = self
             .0
@@ -112,6 +129,7 @@ impl MessageService for Router {
         let (done, _) = watch::channel(None);
         let entry = Arc::new(Entry {
             message: message.clone(),
+            metadata,
             ordinal: book.next,
             done,
             task: Mutex::new(None),
@@ -536,9 +554,17 @@ impl Inner {
                 },
             );
         }
-        let outcome = match self.control.submit_if_current(
+        let new_input = new_input.expect("replacement action");
+        // 原文证据随可信入口消息冻结；只有路由器生成的新任务标识随替代输入重绑。
+        // 不能把新输入的加工正文、旧轮会话槽位或分类器输出当作授权来源。
+        let metadata = entry.metadata.clone().map(|mut metadata| {
+            metadata.task_id = new_input.task_id.clone();
+            metadata
+        });
+        let outcome = match self.control.submit_if_current_with_metadata(
             &m.target,
-            new_input.expect("replacement action"),
+            new_input,
+            metadata,
             sink.clone(),
         ) {
             Ok(generation) => {
