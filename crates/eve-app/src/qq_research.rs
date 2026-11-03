@@ -56,6 +56,7 @@ impl Background {
         plans: Option<Arc<dyn PlanJournal>>,
         gate: qq_budget::Gate,
         learning_progress: bool,
+        authorization: Arc<crate::qq_admin::Admin>,
     ) -> Self {
         let (active, activated) = watch::channel(false);
         let (stop, stopped) = watch::channel(false);
@@ -70,6 +71,7 @@ impl Background {
                 plans,
                 gate,
                 learning_progress,
+                authorization,
                 activated,
                 stopped,
             )
@@ -141,6 +143,7 @@ async fn run(
     plans: Option<Arc<dyn PlanJournal>>,
     gate: qq_budget::Gate,
     learning_progress: bool,
+    authorization: Arc<crate::qq_admin::Admin>,
     mut active: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
 ) -> Result<(), AppError> {
@@ -167,7 +170,12 @@ async fn run(
                 .map_err(|_| "受控研究无法读取学习目标")?;
             // 兴趣派生的学习目标，以及计划步骤正在请求研究的用户待办。
             let requested = match &plans {
-                Some(plans) => qq_plan::requested(&plans.snapshot()?, qq_plan::RESEARCH),
+                Some(plans) => qq_plan::authorized_requests(
+                    &plans.snapshot()?,
+                    &snapshot,
+                    qq_plan::RESEARCH,
+                    &authorization,
+                ),
                 None => Vec::new(),
             };
             let mut goals: Vec<(&Goal, &str)> = snapshot
@@ -217,7 +225,8 @@ async fn run(
                     let _admission = eve_pursuit_plugin::progress_admission_guard()
                         .map_err(|error| error.to_string())?;
                     let current = cognition.snapshot().map_err(|error| error.to_string())?;
-                    if current.state.goals.get(&goal.id) != Some(goal)
+                    if !qq_plan::admitted(goal, plans.as_deref(), qq_plan::RESEARCH, &authorization)
+                        || current.state.goals.get(&goal.id) != Some(goal)
                         || (learning_progress
                             && crate::qq_pursuit::learning_goal(goal).is_some()
                             && !eve_pursuit_plugin::progress_admitted(&current.state, &goal.id)

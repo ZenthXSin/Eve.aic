@@ -18,8 +18,8 @@ jobs:
     name: Stable / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     # 统一编译示例，避免 cargo run 改变包特征后重复编译。
-    # 16 MiB 容量与持久化故障验收需要更长时间；两平台统一保留有限截止。
-    timeout-minutes: 40
+    # Windows 全项测试与进程验收实测超过 41 分钟；为较慢的文件持久化保留有界余量。
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 55 || 40 }}
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
@@ -165,6 +165,12 @@ jobs:
           python -X utf8 connectors/qqbot/test/public_source_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -X utf8 connectors/qqbot/test/member_network_test.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 验证自然待办、计划确认与原状态恢复
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
+        run: |
+          $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
+          python -X utf8 connectors/qqbot/test/natural_goal_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证浏览器中的插件配置、冲突、启停与窄屏
         if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' && runner.os == 'Linux' }}

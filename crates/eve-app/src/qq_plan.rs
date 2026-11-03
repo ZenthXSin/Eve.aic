@@ -11,6 +11,7 @@ use crate::{
 };
 use eve_cognition_api::{CognitionAdmin, Goal, GoalStatus, SourceKind, Visibility};
 use eve_cognition_loop_plugin::current_reflection;
+use eve_developer_api::DeveloperAuthorization;
 use eve_knowledge_api::{KnowledgeAdmin, KnowledgeStatus, RunStatus as ResearchStatus};
 use eve_plan_api::*;
 use eve_plugin_api::{PluginError, PluginResult};
@@ -27,6 +28,10 @@ use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
 };
+
+#[path = "qq_plan_tool.rs"]
+mod tool;
+pub(crate) use tool::ManageTool;
 
 /// 按待办描述在入口页面范围内受控研究一次。
 pub(crate) const RESEARCH: &str = "eve.research.v1";
@@ -92,6 +97,73 @@ pub(crate) fn requested(snapshot: &PlanSnapshot, capability: &str) -> Vec<(Strin
         })
         .map(|plan| (plan.binding.goal_id.clone(), plan.binding.goal_revision))
         .collect()
+}
+
+/// 待办归属不能代替实时许可。自然入口使用持久确认记录；旧 QQ 命令沿用平台派生范围。
+fn permitted(admin: &crate::qq_admin::Admin, goal: &Goal, plan_id: &str) -> bool {
+    let Some(owner) = user_goal(goal) else {
+        return false;
+    };
+    let scope = match admin.business.reviewed_plan_scope(plan_id) {
+        Ok(Some(scope)) if scope.user_id == owner => scope,
+        Ok(None)
+            if !goal.source.reference.starts_with("natural:")
+                && owner.strip_prefix("qq:").is_some_and(|id| {
+                    id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
+                }) =>
+        {
+            eve_llm_api::ContextScope {
+                session_id: owner.into(),
+                user_id: owner.into(),
+            }
+        }
+        _ => return false,
+    };
+    admin.is_operator(&scope)
+}
+
+pub(crate) fn authorized_requests(
+    snapshot: &PlanSnapshot,
+    cognition: &eve_cognition_api::CognitiveSnapshot,
+    capability: &str,
+    admin: &crate::qq_admin::Admin,
+) -> Vec<(String, u64)> {
+    let requested = requested(snapshot, capability);
+    requested
+        .into_iter()
+        .filter(|(id, _)| {
+            cognition.state.goals.get(id).is_some_and(|goal| {
+                snapshot.plans.iter().any(|plan| {
+                    plan.binding.goal_id == *id
+                        && plan.status == PlanStatus::Active
+                        && permitted(admin, goal, &plan.id)
+                })
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn admitted(
+    goal: &Goal,
+    plans: Option<&dyn PlanJournal>,
+    capability: &str,
+    admin: &crate::qq_admin::Admin,
+) -> bool {
+    if user_goal(goal).is_none() {
+        return true;
+    }
+    plans
+        .and_then(|plans| plans.snapshot().ok())
+        .is_some_and(|snapshot| {
+            snapshot.plans.iter().any(|plan| {
+                plan.status == PlanStatus::Active
+                    && plan.binding == binding(goal)
+                    && permitted(admin, goal, &plan.id)
+                    && plan.steps.iter().any(|step| {
+                        step.status == StepStatus::Executing && step.spec.capability == capability
+                    })
+            })
+        })
 }
 
 /// 计划步骤正在请求这个仍在等待的待办版本时，返回其所有者；研究与实践后台据此把它纳入处理。
@@ -170,7 +242,7 @@ struct Enabled {
     requests: mpsc::UnboundedSender<Pending>,
 }
 impl Commands {
-    pub(crate) fn disabled() -> Arc<dyn QqCommandHandler> {
+    pub(crate) fn disabled() -> Arc<Self> {
         Arc::new(Self { enabled: None })
     }
     pub(crate) fn enabled(
@@ -180,7 +252,7 @@ impl Commands {
         capabilities: Vec<CapabilitySpec>,
         proposer_version: String,
         requests: mpsc::UnboundedSender<Pending>,
-    ) -> Arc<dyn QqCommandHandler> {
+    ) -> Arc<Self> {
         Arc::new(Self {
             enabled: Some(Enabled {
                 plans,
@@ -596,6 +668,7 @@ pub(crate) struct Services {
     pub(crate) practice: Option<Arc<dyn PracticeAdmin>>,
     pub(crate) proposer: Arc<dyn PlanProposer>,
     pub(crate) capabilities: Vec<CapabilitySpec>,
+    pub(crate) authorization: Arc<crate::qq_admin::Admin>,
 }
 
 pub(crate) struct Background {
@@ -781,6 +854,11 @@ fn settle(services: &Services, at_ms: u64) -> Result<(), AppError> {
             },
             // 待办不再等待：不开始新步骤，执行中的步骤结束时照常判定。
             Some(goal) if goal.status != GoalStatus::Waiting && executing.is_none() => continue,
+            Some(goal)
+                if executing.is_none() && !permitted(&services.authorization, goal, &plan.id) =>
+            {
+                continue;
+            }
             None => continue,
             Some(_) => match executing {
                 Some(step) => match outcome(services, plan, step, at_ms)? {

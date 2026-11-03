@@ -31,7 +31,7 @@ MINUTE = 60_000
 # 注册证据取实际协议，不使用助手的能力自述或一份静态帮助文本。
 DEFAULT_TOOLS = {
     "inspect_capabilities", "manage_business_permissions", "search_memory", "save_preference", "note_commitment",
-    "list_interests", "list_goals", "list_skills", "list_forged_tools",
+    "list_interests", "list_goals", "manage_goal", "list_skills", "list_forged_tools",
     "manage_skill", "manage_forged_tool", "set_reminder", "cancel_reminder",
     "dispatch_background_task", "list_background_tasks", "cancel_background_task",
     "run_subagent", "create_subagent", "list_subagents", "delete_subagent",

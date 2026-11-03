@@ -178,6 +178,12 @@ pub(crate) struct Store {
     path: Option<PathBuf>,
     state: Mutex<Ledger>,
     failed: AtomicBool,
+    plan_scopes: Mutex<Option<PlanScopes>>,
+}
+
+struct PlanScopes {
+    revision: u64,
+    scopes: BTreeMap<String, ContextScope>,
 }
 
 pub(crate) struct Mutation {
@@ -234,6 +240,7 @@ impl Store {
             path: Some(path),
             state: Mutex::new(state),
             failed: AtomicBool::new(false),
+            plan_scopes: Mutex::new(None),
         })
     }
 
@@ -243,6 +250,7 @@ impl Store {
             path: None,
             state: Mutex::new(Ledger::default()),
             failed: AtomicBool::new(false),
+            plan_scopes: Mutex::new(None),
         }
     }
 
@@ -262,6 +270,61 @@ impl Store {
 
     pub(crate) fn revision(&self) -> Result<u64, String> {
         Ok(self.lock()?.revision)
+    }
+
+    /// 自然计划恢复其实际确认时的可信范围；模型参数、其他动作或拒绝记录不能绑定后台授权。
+    pub(crate) fn reviewed_plan_scope(
+        &self,
+        plan_id: &str,
+    ) -> Result<Option<ContextScope>, String> {
+        let state = self.lock()?;
+        let mut cache = self.plan_scopes.lock().map_err(|_| "计划授权索引不可用")?;
+        if let Some(index) = &*cache
+            && index.revision == state.revision
+        {
+            return Ok(index.scopes.get(plan_id).cloned());
+        }
+        let mut scopes = BTreeMap::new();
+        for record in state.audit.iter().rev().filter(|record| {
+            record.action == "manage_plan"
+                && record.outcome == "review_allowed"
+                && record.verdict.as_ref().is_some_and(|v| {
+                    v.permits() && v.authorization == eve_developer_api::ReviewAuthorization::High
+                })
+        }) {
+            let target = record.target.as_deref().ok_or("计划审核记录缺少完整动作")?;
+            let request: serde_json::Value =
+                serde_json::from_str(target).map_err(|_| "计划审核动作损坏")?;
+            let operation = request["arguments"][0].as_str().ok_or("计划审核参数缺失")?;
+            let operation: serde_json::Value =
+                serde_json::from_str(operation).map_err(|_| "计划审核参数损坏")?;
+            if request["program"] == "eve.manage_plan"
+                && operation["operation"]["arguments"]["action"] == "confirm"
+            {
+                let id = operation["operation"]["plan"]["id"]
+                    .as_str()
+                    .ok_or("计划审核缺少计划编号")?;
+                if operation["trusted_scope"]
+                    != serde_json::to_value(&record.scope).map_err(|_| "计划范围无法编码")?
+                    || request["user_messages"]
+                        != serde_json::to_value(&record.user_messages)
+                            .map_err(|_| "计划原话无法编码")?
+                    || operation["turn_id"]
+                        != serde_json::to_value(record.turn_id).map_err(|_| "计划轮次无法编码")?
+                {
+                    return Err("计划审核范围不一致".into());
+                }
+                scopes
+                    .entry(id.to_owned())
+                    .or_insert_with(|| record.scope.clone());
+            }
+        }
+        let result = scopes.get(plan_id).cloned();
+        *cache = Some(PlanScopes {
+            revision: state.revision,
+            scopes,
+        });
+        Ok(result)
     }
 
     pub(crate) fn fail_closed(&self) {

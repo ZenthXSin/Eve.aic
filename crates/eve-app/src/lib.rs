@@ -64,6 +64,7 @@ mod qq_memory_sharing;
 mod qq_message_judge;
 mod qq_model;
 mod qq_model_status;
+mod qq_natural_goals;
 #[cfg(test)]
 mod qq_natural_management_tests;
 mod qq_outreach;
