@@ -363,6 +363,16 @@ impl StateStore for FileStateStore {
             .snapshot
             .lock()
             .map_err(|_| PluginError::State("状态快照锁中毒".into()))?;
+        // 单宿主独占目录内，相同字节已由当前快照持久保存。后台扫描重复保存
+        // 未变账本时无需重新编码、同步或替换整份文件；首次创建空值仍须提交。
+        if snapshot
+            .entries
+            .get(namespace.as_str())
+            .and_then(|values| values.get(&key))
+            .is_some_and(|saved| saved.bytes.as_ref() == value.as_slice())
+        {
+            return Ok(());
+        }
         let mut candidate = snapshot.clone();
         let previous_cache = candidate
             .entries
