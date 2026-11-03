@@ -1350,26 +1350,26 @@ mod tests {
     async fn private_file_observations_follow_own_workspace_and_reject_foreign_binding() {
         let (kernel, observations, shared) = world().await;
         let private = tempfile::tempdir().unwrap();
+        let private_root = private.path().canonicalize().unwrap();
+        let shared_root = shared.path().canonicalize().unwrap();
         let owner = SessionKey::new("s", "u").unwrap();
         let scope = ContextScope {
             session_id: owner.session_id.clone(),
             user_id: owner.user_id.clone(),
         };
-        let directory = private
-            .path()
-            .join(eve_developer_api::session_workspace_key(&scope));
+        let directory = private_root.join(eve_developer_api::session_workspace_key(&scope));
         let root = directory.join("source");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(shared.path().join("build.status"), "other session").unwrap();
         std::fs::write(root.join("build.status"), "building").unwrap();
-        let binding = json!({"version":1,"scope":scope,"source":shared.path()});
+        let binding = json!({"version":1,"scope":scope,"source":shared_root});
         std::fs::write(directory.join("binding.json"), binding.to_string()).unwrap();
         let observations = Arc::try_unwrap(observations)
             .ok()
             .unwrap()
             .with_development(Some(eve_developer_api::DeveloperObservationCapabilities {
-                workspace: shared.path().to_path_buf(),
-                session_workspaces: Some(private.path().to_path_buf()),
+                workspace: shared_root,
+                session_workspaces: Some(private_root),
                 processes: true,
             }));
         let baseline = observations.file(&owner, "build.status").unwrap();

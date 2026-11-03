@@ -36,8 +36,8 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    # 全量验收包含构建、进程恢复、流式超时和真实浏览器；完整执行已达 22 至 25 分钟。
-    timeout-minutes: 40
+    # 全量验收含真实离线Cargo编译；实测主场景及浏览器约40分钟，保留最后热更新验收时间。
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:

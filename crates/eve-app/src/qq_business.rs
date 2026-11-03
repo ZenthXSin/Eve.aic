@@ -22,6 +22,14 @@ pub(crate) use tool::BusinessTool;
 const MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RECORDS: usize = 4096;
 
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BusinessState {
@@ -282,7 +290,7 @@ impl Store {
             marker
                 .persist(parent.join("business-permissions.failed"))
                 .map_err(|error| error.error)?;
-            std::fs::File::open(parent)?.sync_all()
+            sync_directory(parent)
         };
         write().map_err(|_| "业务失败关闭标记无法持久化；进程仍保持关闭，原目录不可用".into())
     }
@@ -473,7 +481,7 @@ impl Store {
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                     Err(e) => return Err(e),
                 }
-                std::fs::File::open(parent)?.sync_all()
+                sync_directory(parent)
             };
             if persist().is_err() {
                 self.failed.store(true, Ordering::Release);

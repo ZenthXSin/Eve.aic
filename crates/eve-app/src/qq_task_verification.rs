@@ -111,9 +111,10 @@ fn paired_observation(
 
 fn relative_workspace_path(path: &str) -> bool {
     !path.is_empty()
-        && !Path::new(path).is_absolute()
+        && !Path::new(path).has_root()
         && !path.chars().any(char::is_control)
         && !path.contains('\\')
+        && !path.contains(':')
         && !path
             .split('/')
             .any(|part| matches!(part, ".." | ".git" | ".eve-developer"))
@@ -403,6 +404,8 @@ mod tests {
             None,
             Some(json!("../other")),
             Some(json!("/tmp")),
+            Some(json!("C:other")),
+            Some(json!("C:/other")),
             Some(json!("")),
             Some(json!(".git")),
         ] {
@@ -451,6 +454,8 @@ mod tests {
             ".git/config",
             ".eve-developer/audit",
             "..\\artifact.txt",
+            "C:artifact.txt",
+            "C:/artifact.txt",
         ] {
             assert!(
                 validate_contract(&receipts(file_content(json!({"path":path}), "ok"))).is_err()

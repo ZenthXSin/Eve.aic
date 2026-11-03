@@ -718,14 +718,29 @@ mod tests {
                 _ => source.directory.join("lock"),
             };
             let saved = root.path().join("preserved");
-            fs::rename(&path, &saved).unwrap();
-            assert!(source.read(&scope(&session)).is_err(), "{target}");
-            assert!(
-                source
-                    .record(&session, &format!("{:032x}", 2), "不能新增")
-                    .is_err()
-            );
-            drop(source);
+            let moved = fs::rename(&path, &saved);
+            if cfg!(windows) && matches!(target, "directory" | "lock") && moved.is_err() {
+                // Windows 的活跃文件锁禁止移走文件及父目录，先核对操作被拒绝。
+                assert_eq!(
+                    moved.unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+                assert_eq!(
+                    source.read(&scope(&session)).unwrap(),
+                    Some(vec!["保留这条证据".into()])
+                );
+                drop(source);
+                fs::rename(&path, &saved).unwrap();
+            } else {
+                moved.unwrap();
+                assert!(source.read(&scope(&session)).is_err(), "{target}");
+                assert!(
+                    source
+                        .record(&session, &format!("{:032x}", 2), "不能新增")
+                        .is_err()
+                );
+                drop(source);
+            }
             assert!(RawMessages::open(root.path()).is_err(), "{target}");
             assert!(!path.exists());
             assert!(saved.exists());
