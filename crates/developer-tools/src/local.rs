@@ -8,16 +8,19 @@ use std::{
     io::Write,
     path::{Component, Path, PathBuf},
     process::Stdio,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::Ordering,
     time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
-    sync::Mutex,
 };
+mod journal;
 mod live_upgrade;
 mod member;
+mod review;
+mod source;
+mod workspaces;
 
 const MAX_FILE: usize = 8 * 1024 * 1024;
 const MAX_OUTPUT: usize = 32 * 1024;
@@ -92,8 +95,7 @@ pub struct LocalDeveloper {
     token: Option<String>,
     root: PathBuf,
     journal: PathBuf,
-    next: AtomicU64,
-    serial: Mutex<()>,
+    ledger: std::sync::Arc<journal::Journal>,
     /// 只由测试构造替换；生产始终为 https://api.github.com/。
     api: Url,
     authorization: Option<std::sync::Arc<dyn DeveloperAuthorization>>,
@@ -101,6 +103,7 @@ pub struct LocalDeveloper {
     isolated: bool,
     command_policy: Option<std::sync::Arc<dyn eve_developer_api::CommandPolicy>>,
     action_reviewer: Option<std::sync::Arc<dyn ActionReviewer>>,
+    session_workspaces: bool,
 }
 /// 交给审查者的用户原话条数与行动轨迹条数；用户原话正文不裁剪，
 /// 工具轨迹与命令摘要仍保持有界。
@@ -114,8 +117,7 @@ fn clip(text: &str, limit: usize) -> String {
         None => text.to_string(),
     }
 }
-/// 从本轮上下文取审查依据。宿主标记的委托执行没有人在场，用户角色的消息是派发时
-/// 由模型写的任务说明，不作为用户原话交给审查者。
+/// 只读取宿主独立保存的原话；后台委托可继承这些证据，模型任务说明不作为授权。
 fn review_request(
     a: &CommandArguments,
     reason: String,
@@ -123,9 +125,7 @@ fn review_request(
 ) -> Result<ActionReviewRequest, ToolExecutionError> {
     let delegated = context.is_delegated();
     let messages = context.conversation().unwrap_or_default();
-    let user_messages = if delegated {
-        vec![]
-    } else if let Some(originals) = context.review_user_messages() {
+    let user_messages = if let Some(originals) = context.review_user_messages() {
         originals
             .iter()
             .rev()
@@ -136,17 +136,7 @@ fn review_request(
             .rev()
             .collect()
     } else {
-        let mut texts: Vec<String> = messages
-            .iter()
-            .rev()
-            .filter(|m| m.role == eve_llm_api::ChatRole::User)
-            .filter_map(|m| m.text.as_deref())
-            .filter(|t| !t.trim().is_empty())
-            .take(REVIEW_USER_MESSAGES)
-            .map(ToOwned::to_owned)
-            .collect();
-        texts.reverse();
-        texts
+        vec![]
     };
     let mut recent_actions: Vec<String> = messages
         .iter()
@@ -190,28 +180,6 @@ impl LocalDeveloper {
             return Err(failed("开发源码工作区必须是目录"));
         }
         fs::create_dir_all(&journal).map_err(|_| failed("开发工具账本无法创建"))?;
-        let next = match fs::read(journal.join("operations.jsonl")) {
-            Ok(bytes) => {
-                let text = std::str::from_utf8(&bytes)
-                    .map_err(|_| failed("开发工具账本损坏；保留原文件"))?;
-                if !text.is_empty() && !text.ends_with('\n') {
-                    return Err(failed("开发工具账本存在不完整提交；保留原文件"));
-                }
-                let mut max = 0;
-                for line in text.lines() {
-                    let v: Value = serde_json::from_str(line)
-                        .map_err(|_| failed("开发工具账本损坏；保留原文件"))?;
-                    let id = v["id"]
-                        .as_u64()
-                        .ok_or_else(|| failed("开发工具账本版本无效"))?;
-                    max = max.max(id);
-                }
-                max.checked_add(1)
-                    .ok_or_else(|| failed("开发工具账本已满"))?
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 1,
-            Err(_) => return Err(failed("开发工具账本无法读取")),
-        };
         match fs::read(journal.join("action-reviews.jsonl")) {
             Ok(bytes) => {
                 let text = std::str::from_utf8(&bytes)
@@ -236,6 +204,8 @@ impl LocalDeveloper {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(failed("行动审核审计无法读取；保留原文件")),
         }
+        let ledger = journal::open(&journal)?;
+        let journal = ledger.directory().to_path_buf();
         let token = token.filter(|v| !v.trim().is_empty());
         if token
             .as_ref()
@@ -255,14 +225,14 @@ impl LocalDeveloper {
             token,
             root,
             journal,
-            next: AtomicU64::new(next),
-            serial: Mutex::new(()),
+            ledger,
             api: Url::parse("https://api.github.com/").expect("static URL"),
             authorization: None,
             member_runtime: None,
             isolated: false,
             command_policy: None,
             action_reviewer: None,
+            session_workspaces: false,
         })
     }
     pub fn with_authorization(
@@ -289,17 +259,22 @@ impl LocalDeveloper {
         self.member_runtime = Some(runtime);
         self
     }
+    /// 自升级宿主的操作者按可信会话使用独立检出；共享源码只提供已提交基线。
+    pub fn with_session_workspaces(mut self, enabled: bool) -> Self {
+        self.session_workspaces = enabled;
+        self
+    }
     fn authorize(&self, context: &ToolExecutionContext) -> Result<(), ToolExecutionError> {
         if stopped(context) {
             return Err(ToolExecutionError::Cancelled("开发操作已取消".into()));
         }
-        if context.scope().is_none_or(|s| {
-            !self.config.operators.contains(&s.user_id)
-                && !self
-                    .authorization
-                    .as_ref()
-                    .is_some_and(|a| a.is_operator(s))
-        }) {
+        if context
+            .scope()
+            .is_none_or(|scope| match &self.authorization {
+                Some(authorization) => !authorization.is_operator(scope),
+                None => !self.config.operators.contains(&scope.user_id),
+            })
+        {
             return Err(failed("此开发工具仅供宿主配置的操作者使用"));
         }
         Ok(())
@@ -311,6 +286,40 @@ impl LocalDeveloper {
     ) -> Result<(), ToolExecutionError> {
         if stopped(context) {
             return Err(ToolExecutionError::Cancelled("开发操作已取消或到期".into()));
+        }
+        if context.scope().is_some_and(|scope| {
+            self.authorization
+                .as_ref()
+                .is_some_and(|authorization| !authorization.permits_business(scope))
+        }) {
+            return Err(ToolExecutionError::Rejected(
+                "当前业务权限已暂停，操作未执行".into(),
+            ));
+        }
+        let protected = match operation {
+            DeveloperOperation::Read(a)
+            | DeveloperOperation::Write(a)
+            | DeveloperOperation::List(a) => review::credential_path(&a.path),
+            DeveloperOperation::Edit(a) => review::credential_path(&a.path),
+            DeveloperOperation::Search(a) => review::credential_path(&a.path),
+            DeveloperOperation::Patch(a) => eve_apply_patch::paths(&a.patch)
+                .is_some_and(|paths| paths.iter().any(|path| review::credential_path(path))),
+            _ => false,
+        };
+        if protected {
+            return Err(failed("凭据文件不交给模型工具；请通过宿主受信凭据配置处理"));
+        }
+        if matches!(operation, DeveloperOperation::RestartSelf) {
+            self.authorize(context)?;
+            if context.is_delegated()
+                || context.scope().is_none_or(|scope| {
+                    scope.session_id.trim().is_empty() || scope.user_id.trim().is_empty()
+                })
+                || context.turn_id().is_none_or(|id| id == 0)
+            {
+                return Err(failed("重启需要非委托的可信当前会话和持久轮次"));
+            }
+            return Ok(());
         }
         if self.member_operation(operation, context) {
             return Ok(());
@@ -407,27 +416,11 @@ impl LocalDeveloper {
             None => text.into(),
         }
     }
-    fn record(
-        &self,
-        id: u64,
-        kind: &str,
-        state: &str,
-        result: Option<&Value>,
-    ) -> Result<(), ToolExecutionError> {
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(self.journal.join("operations.jsonl"))
-            .map_err(|_| failed("操作账本不可写；没有开始新操作"))?;
-        let value = json!({"format_version":1,"id":id,"kind":kind,"state":state,"success":result.and_then(|v|v.get("success")).and_then(Value::as_bool)});
-        writeln!(file, "{value}")
-            .and_then(|_| file.sync_all())
-            .map_err(|_| failed("操作账本提交失败；操作结果不确定，不能自动重试"))
-    }
     /// 独立审核审计只保存请求指纹、等级和结论，不持久化原话、命令参数或模型理由。
     /// 审计写入失败时拒绝执行，不能带着无记录的批准继续。
     fn record_review(
         &self,
+        operation_id: u64,
         fingerprint: &str,
         result: &Result<ActionReviewVerdict, String>,
     ) -> Result<(), ToolExecutionError> {
@@ -438,10 +431,10 @@ impl LocalDeveloper {
             .map_err(|_| failed("行动审核审计不可写，命令未执行"))?;
         let value = match result {
             Ok(v) => {
-                json!({"format_version":1,"request_sha256":fingerprint,"status":"reviewed","risk":v.risk,"authorization":v.authorization,"allowed":v.permits()})
+                json!({"format_version":1,"operation_id":operation_id,"request_sha256":fingerprint,"status":"reviewed","risk":v.risk,"authorization":v.authorization,"allowed":v.permits()})
             }
             Err(_) => {
-                json!({"format_version":1,"request_sha256":fingerprint,"status":"failed","allowed":false})
+                json!({"format_version":1,"operation_id":operation_id,"request_sha256":fingerprint,"status":"failed","allowed":false})
             }
         };
         writeln!(file, "{value}")
@@ -469,6 +462,7 @@ impl LocalDeveloper {
         if current.as_deref().unwrap_or("") != expected {
             return Err(failed("文件在提交前变化，未覆盖"));
         }
+        context.check_review_evidence()?;
         if expected.is_empty() {
             tmp.persist_noclobber(path)
                 .map_err(|_| failed("新文件提交失败，未覆盖已有文件"))?;
@@ -599,6 +593,10 @@ impl LocalDeveloper {
         let mut results = Vec::new();
         let mut failure = None;
         for step in &steps {
+            if let Err(error) = context.check_review_evidence() {
+                failure = Some(error);
+                break;
+            }
             if stopped(context) {
                 failure = Some(ToolExecutionError::Cancelled(
                     "补丁已取消或到期，恢复已提交部分".into(),
@@ -623,9 +621,11 @@ impl LocalDeveloper {
                     if current.as_deref() != Some(hash(before).as_str()) {
                         Err(failed(format!("{rel} 在提交前变化，未删除")))
                     } else {
-                        fs::remove_file(path)
-                            .map(|()| json!({"path": rel, "action": "delete"}))
-                            .map_err(|_| failed(format!("{rel} 无法删除")))
+                        context.check_review_evidence().and_then(|()| {
+                            fs::remove_file(path)
+                                .map(|()| json!({"path": rel, "action": "delete"}))
+                                .map_err(|_| failed(format!("{rel} 无法删除")))
+                        })
                     }
                 }
             };
@@ -727,7 +727,9 @@ impl LocalDeveloper {
                     break 'walk;
                 }
                 files += 1;
-                if entry.metadata().is_ok_and(|m| m.len() > MAX_FILE as u64) {
+                if review::credential_path(&relative)
+                    || entry.metadata().is_ok_and(|m| m.len() > MAX_FILE as u64)
+                {
                     continue;
                 }
                 let Ok(bytes) = fs::read(entry.path()) else {
@@ -762,6 +764,7 @@ impl LocalDeveloper {
         &self,
         operation: DeveloperOperation,
         context: &ToolExecutionContext,
+        reviewed_source: Option<source::SourceEvidence>,
     ) -> Result<Value, ToolExecutionError> {
         match operation {
             DeveloperOperation::List(a) => {
@@ -847,70 +850,13 @@ impl LocalDeveloper {
             DeveloperOperation::Search(a) => {
                 self.search(a, self.isolated || self.authorize(context).is_ok())
             }
-            DeveloperOperation::Command(a) => {
-                if !self.config.commands {
-                    return Err(failed("命令执行未启用"));
-                }
-                if let Some(policy) = &self.command_policy {
-                    let evaluation = policy.evaluate(&a.program, &a.args);
-                    match evaluation.decision {
-                        Some(eve_developer_api::CommandDecision::Forbidden) => {
-                            return Err(failed(format!(
-                                "命令被策略禁止：{}。不要换一种写法绕过；需要时请主人自己执行",
-                                evaluation.reason()
-                            )));
-                        }
-                        Some(eve_developer_api::CommandDecision::Prompt) => {
-                            match &self.action_reviewer {
-                                Some(reviewer) => {
-                                    let mut request =
-                                        review_request(&a, evaluation.reason(), context)?;
-                                    request.workspace = self.root.to_string_lossy().into_owned();
-                                    request.isolated = self.isolated;
-                                    let delegated = request.delegated;
-                                    let fingerprint = hash(
-                                        serde_json::to_string(&request)
-                                            .map_err(|_| failed("审查请求无法序列化"))?
-                                            .as_bytes(),
-                                    );
-                                    let result = match request.validate_capacity() {
-                                        Ok(()) => reviewer.review(request).await,
-                                        Err(error) => Err(error),
-                                    };
-                                    self.record_review(&fingerprint, &result)?;
-                                    let verdict = result.map_err(|e| {
-                                        failed(format!("行动审查没有完成（{e}），命令未执行"))
-                                    })?;
-                                    if !verdict.permits() {
-                                        return Err(failed(format!(
-                                            "行动审查未放行，命令未执行：风险 {:?}，用户授权 {:?}。{}{}",
-                                            verdict.risk,
-                                            verdict.authorization,
-                                            verdict.rationale,
-                                            if delegated {
-                                                "。后台执行没有人在场，需要时在结果里说明，请用户在对话里明确要求后再做"
-                                            } else {
-                                                "。先在对话里说明要执行什么、影响哪些文件或分支，得到用户明确同意后再试"
-                                            }
-                                        )));
-                                    }
-                                }
-                                None => {
-                                    return Err(failed(format!(
-                                        "这条命令需要行动审查，但审查器未配置：{}。命令未执行；owner_confirmed 不能代替独立审核",
-                                        evaluation.reason()
-                                    )));
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                self.command(a, context).await
+            DeveloperOperation::Command(a) => self.command(a, context).await,
+            DeveloperOperation::Github(a) => self.github(a, context).await,
+            DeveloperOperation::PrepareUpgrade => {
+                self.upgrade(context, reviewed_source.as_ref()).await
             }
-            DeveloperOperation::Github(a) => self.github(a).await,
-            DeveloperOperation::PrepareUpgrade => self.upgrade(context).await,
             DeveloperOperation::ApplyUpgrade(a) => self.apply_upgrade(a, context),
+            DeveloperOperation::RestartSelf => self.restart_self(context),
             DeveloperOperation::UpgradeStatus => self.upgrade_status(),
         }
     }
@@ -926,6 +872,24 @@ impl LocalDeveloper {
         a: CommandArguments,
         context: &ToolExecutionContext,
         output_limit: usize,
+    ) -> Result<Value, ToolExecutionError> {
+        self.command_output(a, context, output_limit, false).await
+    }
+    /// 冻结证据只接受原始完整 UTF-8；不得先脱敏或有损解码再声称完整。
+    async fn command_evidence(
+        &self,
+        a: CommandArguments,
+        context: &ToolExecutionContext,
+        output_limit: usize,
+    ) -> Result<Value, ToolExecutionError> {
+        self.command_output(a, context, output_limit, true).await
+    }
+    async fn command_output(
+        &self,
+        a: CommandArguments,
+        context: &ToolExecutionContext,
+        output_limit: usize,
+        evidence: bool,
     ) -> Result<Value, ToolExecutionError> {
         let cwd = self.path(&a.cwd, false)?;
         if !cwd.is_dir() {
@@ -991,6 +955,7 @@ impl LocalDeveloper {
                 "命令准入已取消或到期；未启动".into(),
             ));
         }
+        self.authorize_selected_backend(&DeveloperOperation::Command(a.clone()), context)?;
         let mut child = command
             .spawn()
             .map_err(|_| failed("程序无法启动；检查 program 与构建环境"))?;
@@ -1019,11 +984,18 @@ impl LocalDeveloper {
         };
         let (status, out, err) = result?;
         group.terminate();
+        let decode = |bytes: Vec<u8>| -> Result<String, ToolExecutionError> {
+            if evidence {
+                String::from_utf8(bytes).map_err(|_| failed("源码证据不是完整 UTF-8；未发布候选"))
+            } else {
+                Ok(self.redact(&String::from_utf8_lossy(&bytes)))
+            }
+        };
         Ok(
-            json!({"success":status.success(),"exit_code":status.code(),"stdout":self.redact(&out.0),"stderr":self.redact(&err.0),"stdout_truncated":out.1,"stderr_truncated":err.1}),
+            json!({"success":status.success(),"exit_code":status.code(),"stdout":decode(out.0)?,"stderr":decode(err.0)?,"stdout_truncated":out.1,"stderr_truncated":err.1}),
         )
     }
-    async fn github(&self, a: GithubArguments) -> Result<Value, ToolExecutionError> {
+    fn github_arguments(&self, a: GithubArguments) -> Result<GithubArguments, ToolExecutionError> {
         if !self.config.github {
             return Err(failed("GitHub 未启用"));
         }
@@ -1084,6 +1056,15 @@ impl LocalDeveloper {
         {
             return Err(failed("GitHub 密钥资源不对模型开放"));
         }
+        Ok(a)
+    }
+    async fn github(
+        &self,
+        a: GithubArguments,
+        context: &ToolExecutionContext,
+    ) -> Result<Value, ToolExecutionError> {
+        let a = self.github_arguments(a)?;
+        let search = a.resource.starts_with("search/");
         let path = if search {
             a.resource.clone()
         } else if a.resource.is_empty() {
@@ -1111,9 +1092,10 @@ impl LocalDeveloper {
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
-        if let Some(body) = a.body {
-            request = request.json(&body);
+        if let Some(body) = &a.body {
+            request = request.json(body);
         }
+        self.authorize_selected_backend(&DeveloperOperation::Github(a.clone()), context)?;
         let mut response = request
             .send()
             .await
@@ -1162,7 +1144,11 @@ impl LocalDeveloper {
             json!({"success":(200..300).contains(&status),"status":status,"repository":a.repository,"resource":a.resource,"data":body,"truncated":truncated,"untrusted_data":true}),
         )
     }
-    async fn upgrade(&self, context: &ToolExecutionContext) -> Result<Value, ToolExecutionError> {
+    async fn upgrade(
+        &self,
+        context: &ToolExecutionContext,
+        reviewed_source: Option<&source::SourceEvidence>,
+    ) -> Result<Value, ToolExecutionError> {
         if !self.config.self_upgrade || !self.config.commands {
             return Err(failed("自身升级准备未启用"));
         }
@@ -1170,22 +1156,11 @@ impl LocalDeveloper {
             return Err(failed("源码工作区不是 Eve 源码仓库"));
         }
         let before = self.source_fingerprint(context).await?;
+        if reviewed_source != Some(&before) {
+            return Err(failed("审核后源码已变化或缺少准备审核，未启动构建"));
+        }
         let mut checks = vec![];
-        for args in [
-            vec!["fmt", "--all", "--", "--check"],
-            vec![
-                "clippy",
-                "--release",
-                "--workspace",
-                "--all-targets",
-                "--locked",
-                "--",
-                "-D",
-                "warnings",
-            ],
-            vec!["test", "--release", "--workspace", "--locked"],
-            vec!["build", "-p", "eve-app", "--bins", "--release", "--locked"],
-        ] {
+        for args in source::cargo_checks() {
             let args = self
                 .config
                 .cargo_arguments
@@ -1205,6 +1180,25 @@ impl LocalDeveloper {
                     context,
                 )
                 .await?;
+            let mut result = result;
+            if result["success"] == true && checks.len() == 2 {
+                let runtime = self
+                    .command(
+                        CommandArguments {
+                            owner_confirmed: false,
+                            program: if cfg!(windows) { "python" } else { "python3" }.into(),
+                            args: vec!["-B".into(), "scripts/verify-self-upgrade.py".into()],
+                            cwd: ".".into(),
+                            timeout_ms: None,
+                        },
+                        context,
+                    )
+                    .await?;
+                // 仍以四组证据绑定租约；第三组同时证明 Rust 与实际升级运行时。
+                let success = runtime["success"] == true;
+                result = json!({"success":success,"exit_code":runtime["exit_code"],
+                    "steps":[result,runtime]});
+            }
             let success = result["success"] == true;
             checks.push(result);
             if !success {
@@ -1267,62 +1261,69 @@ impl LocalDeveloper {
             "eve-qqbot"
         });
         let bytes =
-            live_upgrade::read_bounded_scoped(&binary, 2 * 1024 * 1024 * 1024, Some(context))
-                .map_err(|error| match error {
-                    error @ ToolExecutionError::Cancelled(_) => error,
-                    _ => failed("构建程序不可读、类型无效或超过2GiB；没有准备候选"),
-                })?;
-        self.publish_upgrade(before, bytes, checks, context).await
-    }
-    async fn source_fingerprint(
-        &self,
-        context: &ToolExecutionContext,
-    ) -> Result<Value, ToolExecutionError> {
-        let mut facts = BTreeMap::new();
-        for (key, args) in [
-            ("head", vec!["rev-parse", "HEAD"]),
-            ("diff", vec!["diff", "HEAD", "--"]),
-            (
-                "untracked",
-                vec!["ls-files", "--others", "--exclude-standard"],
-            ),
-        ] {
-            let result = self
-                .command(
-                    CommandArguments {
-                        owner_confirmed: false,
-                        program: "git".into(),
-                        args: args.into_iter().map(str::to_string).collect(),
-                        cwd: ".".into(),
-                        timeout_ms: Some(30_000),
-                    },
-                    context,
-                )
-                .await?;
-            if result["success"] != true || result["stdout_truncated"] == true {
-                return Err(failed("源码修订无法完整核对"));
-            }
-            let text = result["stdout"]
-                .as_str()
-                .ok_or_else(|| failed("源码修订无法读取"))?;
-            if key == "untracked" && !text.trim().is_empty() {
-                return Err(failed(
-                    "先 git add 新文件，再准备自身升级，以便核对全部源码",
-                ));
-            }
-            facts.insert(
-                key.to_string(),
-                if key == "head" {
-                    text.trim().to_string()
-                } else {
-                    hash(text.as_bytes())
-                },
-            );
+            live_upgrade::read_bounded_scoped(&binary, 2 * 1024 * 1024 * 1024, Some(context))?;
+        // 共享 Cargo 缓存可能被别的构建更新；预演和发布必须使用同一份已冻结字节。
+        let frozen = tempfile::tempdir_in(&self.journal).map_err(|_| failed("候选预演暂存失败"))?;
+        let frozen_binary = frozen
+            .path()
+            .join(binary.file_name().ok_or_else(|| failed("候选文件名无效"))?);
+        fs::write(&frozen_binary, &bytes).map_err(|_| failed("候选预演程序保存失败"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&frozen_binary, fs::Permissions::from_mode(0o700))
+                .map_err(|_| failed("候选预演权限设置失败"))?;
         }
-        Ok(json!(facts))
+        // 使用刚构建的真实 Eve 进程验证重启、冻结运行包交接及持久回执去重。
+        // 只操作测试自己的目录/本地替身；正式进程无需先切换才能验证协议。
+        let rehearsal = self
+            .command(
+                CommandArguments {
+                    owner_confirmed: false,
+                    program: if cfg!(windows) { "python" } else { "python3" }.into(),
+                    args: vec![
+                        "-B".into(),
+                        "scripts/verify-self-upgrade.py".into(),
+                        "--binary".into(),
+                        frozen_binary
+                            .to_str()
+                            .ok_or_else(|| failed("构建产物路径无效"))?
+                            .into(),
+                    ],
+                    cwd: ".".into(),
+                    timeout_ms: None,
+                },
+                context,
+            )
+            .await?;
+        let success = rehearsal["success"] == true;
+        let build = checks.pop().ok_or_else(|| failed("缺少构建证据"))?;
+        checks.push(json!({"success":success,"steps":[build,rehearsal]}));
+        if !success {
+            return Ok(json!({"success":false,"prepared":false,"applied":false,"checks":checks}));
+        }
+        if before != self.source_fingerprint(context).await? {
+            return Err(failed("隔离预演期间源码发生变化；没有准备候选"));
+        }
+        if live_upgrade::file_digest(&frozen_binary, 2 * 1024 * 1024 * 1024, context)?
+            != hash(&bytes)
+        {
+            return Err(failed("预演候选字节已改变；没有准备候选"));
+        }
+        self.publish_upgrade(before, bytes, checks, context).await
     }
 }
 impl DeveloperBackend for LocalDeveloper {
+    fn observation_capabilities(&self) -> Option<DeveloperObservationCapabilities> {
+        Some(DeveloperObservationCapabilities {
+            workspace: self.root.clone(),
+            session_workspaces: self
+                .session_workspaces
+                .then(|| self.journal.join("workspaces")),
+            processes: self.config.commands,
+        })
+    }
+
     fn preflight(
         &self,
         operation: &DeveloperOperation,
@@ -1336,37 +1337,57 @@ impl DeveloperBackend for LocalDeveloper {
         context: ToolExecutionContext,
     ) -> ToolFuture<'_> {
         Box::pin(async move {
-            self.authorize_operation(&operation, &context)?;
-            let _serial = tokio::select! {lock=self.serial.lock()=>lock,_=cancelled(&context)=>return Err(ToolExecutionError::Cancelled("等待中的开发操作已取消".into()))};
-            self.authorize_operation(&operation, &context)?;
-            let kind = match &operation {
-                DeveloperOperation::List(_) => "list",
-                DeveloperOperation::Read(_) => "read",
-                DeveloperOperation::Write(_) => "write",
-                DeveloperOperation::Edit(_) => "edit",
-                DeveloperOperation::Patch(_) => "patch",
-                DeveloperOperation::Search(_) => "search",
-                DeveloperOperation::Command(_) => "command",
-                DeveloperOperation::Github(_) => "github",
-                DeveloperOperation::PrepareUpgrade => "upgrade",
-                DeveloperOperation::ApplyUpgrade(_) => "apply_upgrade",
-                DeveloperOperation::UpgradeStatus => "upgrade_status",
+            let _serial = tokio::select! {lock=self.ledger.serial.lock()=>lock,_=cancelled(&context)=>return Err(ToolExecutionError::Cancelled("等待中的开发操作已取消".into()))};
+            // serial 覆盖所有审计分配；先检查溢出，再发布下一编号。
+            let id = self.ledger.next.load(Ordering::SeqCst);
+            let next = id
+                .checked_add(1)
+                .ok_or_else(|| failed("操作审计 ID 已满，未执行"))?;
+            self.ledger.next.store(next, Ordering::SeqCst);
+            if let Err(error) = self.authorize_operation(&operation, &context) {
+                journal::reject(&self.journal, id, &operation, &context, &error)?;
+                return Err(error);
+            }
+            let audit = journal::begin(&self.journal, id, &operation, &context)?;
+            let work = async {
+                let member = if self.member_operation(&operation, &context) {
+                    Some(self.member_backend(&context)?)
+                } else if self.session_workspaces && workspaces::uses_workspace(&operation) {
+                    Some(self.session_backend(&context).await?)
+                } else {
+                    None
+                };
+                let backend = member.as_ref().unwrap_or(self);
+                let snapshot = if self.session_workspaces
+                    && matches!(operation, DeveloperOperation::PrepareUpgrade)
+                {
+                    Some(backend.upgrade_snapshot(&context).await?)
+                } else {
+                    None
+                };
+                let backend = snapshot.as_ref().unwrap_or(backend);
+                let reviewed = backend
+                    .review_operation(audit.id(), &operation, &context)
+                    .await?;
+                backend.authorize_selected_backend(&operation, &context)?;
+                reviewed.recheck(backend)?;
+                let mut result = backend
+                    .execute_inner(operation, &context, reviewed.into_source())
+                    .await?;
+                if self.session_workspaces
+                    && member.is_some()
+                    && let Some(object) = result.as_object_mut()
+                {
+                    object.insert(
+                        "workspace".into(),
+                        json!({"path":backend.root,
+                        "session_private":true,"candidate_snapshot":snapshot.is_some()}),
+                    );
+                }
+                Ok(result)
             };
-            let id = self.next.fetch_add(1, Ordering::SeqCst);
-            self.record(id, kind, "started", None)?;
-            let member = if self.member_operation(&operation, &context) {
-                Some(self.member_backend(&context)?)
-            } else {
-                None
-            };
-            let backend = member.as_ref().unwrap_or(self);
-            let result = tokio::select! {result=backend.execute_inner(operation,&context)=>result,_=cancelled(&context)=>Err(ToolExecutionError::Cancelled("开发操作已取消；不能假定没有副作用".into()))};
-            self.record(
-                id,
-                kind,
-                if result.is_ok() { "finished" } else { "failed" },
-                result.as_ref().ok(),
-            )?;
+            let result = tokio::select! {result=work=>result,_=cancelled(&context)=>Err(ToolExecutionError::Cancelled("开发操作已取消；不能假定没有副作用".into()))};
+            journal::finish(&self.journal, &audit, &result)?;
             result
         })
     }
@@ -1382,7 +1403,7 @@ async fn cancelled(context: &ToolExecutionContext) {
 async fn capture(
     mut stream: impl AsyncRead + Unpin,
     limit: usize,
-) -> Result<(String, bool), ToolExecutionError> {
+) -> Result<(Vec<u8>, bool), ToolExecutionError> {
     let mut output = Vec::new();
     let mut total = 0;
     let mut buf = [0; 8192];
@@ -1398,10 +1419,8 @@ async fn capture(
         let keep = n.min(limit - output.len());
         output.extend_from_slice(&buf[..keep]);
     }
-    Ok((
-        String::from_utf8_lossy(&output).into_owned(),
-        total > output.len(),
-    ))
+    let truncated = total > output.len();
+    Ok((output, truncated))
 }
 struct ProcessGroup {
     pid: Option<u32>,
@@ -1461,5 +1480,9 @@ fn decode64(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+#[cfg(test)]
+mod security_tests;
+#[cfg(test)]
+mod source_tests;
 #[cfg(test)]
 mod tests;

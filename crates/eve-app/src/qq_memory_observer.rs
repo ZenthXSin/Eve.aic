@@ -13,6 +13,7 @@ use std::{
 pub(crate) struct Observer {
     pub memory: Arc<dyn MemoryAdmin>,
     pub sessions: Arc<dyn SessionService>,
+    pub training: Option<Arc<dyn eve_training_api::TrainingService>>,
 }
 
 fn failure() -> PluginError {
@@ -82,6 +83,19 @@ impl QqInteractionObserver for Observer {
             })?;
         if saved.scope != scope {
             return Err(failure());
+        }
+        if let Some(training) = &self.training {
+            crate::conversation_learning::observe(
+                training.as_ref(),
+                &eve_llm_api::ContextScope {
+                    session_id: scope.session_id,
+                    user_id: scope.user_id,
+                },
+                &format!("eve:{}", interaction.message_id()),
+                "eve",
+                eve_training_api::ConversationRole::Eve,
+                interaction.assistant_text(),
+            )?;
         }
         Ok(())
     }

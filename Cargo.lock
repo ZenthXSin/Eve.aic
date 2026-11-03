@@ -1183,6 +1183,7 @@ version = "0.1.0"
 dependencies = [
  "eve-plugin-api",
  "eve-qqbot-plugin",
+ "eve-session-api",
  "ring",
  "rusqlite",
  "tempfile",
@@ -1531,8 +1532,10 @@ dependencies = [
 name = "eve-trigger-api"
 version = "0.1.0"
 dependencies = [
+ "eve-llm-api",
  "eve-session-api",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -36,8 +36,8 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    # 全量验收包含构建、进程恢复、流式超时和真实浏览器；完整执行已达 22 至 25 分钟。
-    timeout-minutes: 40
+    # 全量验收含真实离线Cargo编译；实测主场景及浏览器约40分钟，保留最后热更新验收时间。
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -77,6 +77,8 @@ jobs:
         run: |
           cargo +1.89.0 build -p eve-app --bin eve-qqbot --bin eve-web --bin eve-memory --locked
           python3 scripts/test-web-chat.py
+          python3 scripts/test-web-autonomy.py
+          python3 connectors/qqbot/test/default_capabilities_test.py
           python3 connectors/qqbot/test/eve_e2e.py
           python3 connectors/qqbot/test/message_judge_test.py
           python3 connectors/qqbot/test/live_dialogue_test.py
@@ -99,6 +101,8 @@ jobs:
           python3 connectors/qqbot/test/toolforge_test.py
           python3 connectors/qqbot/test/dialogue_tools_test.py
           python3 connectors/qqbot/test/developer_tools_test.py
+          python3 connectors/qqbot/test/business_restriction_ingress_test.py
+          python3 connectors/qqbot/test/trusted_review_originals_test.py
           EVE_TEST_PLUGIN_TOOLCHAIN=1.89.0 python3 connectors/qqbot/test/script_runtime_test.py
           python3 connectors/qqbot/test/file_import_test.py
           python3 connectors/qqbot/test/workflow_tools_test.py
@@ -137,9 +141,12 @@ jobs:
           python3 connectors/qqbot/test/trigger_test.py
           python3 connectors/qqbot/test/idle_loop_test.py
           python3 connectors/qqbot/test/background_task_test.py
+          python3 connectors/qqbot/test/background_completion_test.py
+          python3 connectors/qqbot/test/background_wait_test.py
           python3 connectors/qqbot/test/delegation_context_test.py
           python3 connectors/qqbot/test/subagent_profiles_test.py
           python3 connectors/qqbot/test/group_chat_test.py
+          python3 connectors/qqbot/test/conversation_learning_test.py
           python3 connectors/qqbot/test/group_relation_test.py
           python3 connectors/qqbot/test/group_wakeup_test.py
           python3 connectors/qqbot/test/context_reset_test.py

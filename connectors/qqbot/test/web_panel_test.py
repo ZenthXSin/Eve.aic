@@ -61,7 +61,7 @@ class WebPanelAcceptance(unittest.TestCase):
         env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret",
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}", EVE_OPENAI_PROTOCOL="chat",
                    EVE_LLM_RESPONSE_MODE="complete", EVE_WEB_TOKEN=token)
-        command = [str(support.BINARY), "--state-dir", str(self.work / "state"), "--agent", str(support.ROOT / "AGENT.md"),
+        command = [str(support.BINARY), "--minimal-profile", "--state-dir", str(self.work / "state"), "--agent", str(support.ROOT / "AGENT.md"),
                    "--bridge-script", str(BRIDGE), "--bridge-arg", str(scenario), "--web-listen", "127.0.0.1:0"]
         from fixture_auth import bootstrap_test_admin, bootstrap_fixture_groups
         bootstrap_test_admin(self.work / "state", env)

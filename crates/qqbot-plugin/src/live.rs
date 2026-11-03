@@ -19,7 +19,7 @@ fn unavailable() -> LlmError {
 #[derive(Default)]
 struct Input {
     accepting: bool,
-    messages: Vec<String>,
+    messages: Vec<(String, Option<String>)>,
     bytes: usize,
     accepted: usize,
 }
@@ -50,11 +50,22 @@ pub struct LiveDialogue {
 }
 impl LiveDialogue {
     /// 持有入口锁时先保存平台回执，成功后才让运行时看见正文。
+    #[cfg(test)]
     pub(crate) fn steer(
         &self,
         scope: &ContextScope,
         turn_id: u64,
         text: String,
+        persist: impl FnOnce() -> PluginResult<()>,
+    ) -> PluginResult<bool> {
+        self.steer_anchored(scope, turn_id, text, None, persist)
+    }
+    pub(crate) fn steer_anchored(
+        &self,
+        scope: &ContextScope,
+        turn_id: u64,
+        text: String,
+        anchor: Option<String>,
         persist: impl FnOnce() -> PluginResult<()>,
     ) -> PluginResult<bool> {
         let turn = self
@@ -76,7 +87,7 @@ impl LiveDialogue {
         persist()?;
         input.bytes += text.len();
         input.accepted += 1;
-        input.messages.push(text);
+        input.messages.push((text, anchor));
         Ok(true)
     }
     pub(crate) fn next(&self) -> Option<LiveSend> {
@@ -106,11 +117,22 @@ impl TurnSteeringSource for LiveDialogue {
 }
 impl TurnSteering for Turn {
     fn take(&self, finish: bool) -> Result<Vec<String>, LlmError> {
+        self.take_batch(finish).map(|batch| batch.messages)
+    }
+    fn take_batch(&self, finish: bool) -> Result<SteeringBatch, LlmError> {
         let mut input = self.input.lock().map_err(|_| unavailable())?;
         if finish && input.messages.is_empty() {
             input.accepting = false;
         }
-        Ok(std::mem::take(&mut input.messages))
+        let pending = std::mem::take(&mut input.messages);
+        let review_anchor = pending.last().and_then(|(_, anchor)| anchor.clone());
+        if review_anchor.is_some() && pending.iter().any(|(_, anchor)| anchor.is_none()) {
+            return Err(unavailable());
+        }
+        Ok(SteeringBatch {
+            messages: pending.into_iter().map(|(text, _)| text).collect(),
+            review_anchor,
+        })
     }
 }
 
@@ -294,5 +316,42 @@ mod tests {
         drop(turn);
         let next = live.open(&owner, 2).unwrap();
         assert!(next.take(false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn consumed_batch_keeps_its_exact_anchor_when_later_input_arrives() {
+        let live = LiveDialogue::default();
+        let scope = ContextScope {
+            session_id: "s".into(),
+            user_id: "owner".into(),
+        };
+        let turn = live.open(&scope, 1).unwrap();
+        assert!(
+            live.steer_anchored(
+                &scope,
+                1,
+                "展示第一条".into(),
+                Some("first".into()),
+                || Ok(())
+            )
+            .unwrap()
+        );
+        let first = turn.take_batch(false).unwrap();
+        assert!(
+            live.steer_anchored(
+                &scope,
+                1,
+                "展示后到第二条".into(),
+                Some("later".into()),
+                || Ok(())
+            )
+            .unwrap()
+        );
+        assert_eq!(first.messages, ["展示第一条"]);
+        assert_eq!(first.review_anchor.as_deref(), Some("first"));
+        let later = turn.take_batch(true).unwrap();
+        assert_eq!(later.messages, ["展示后到第二条"]);
+        assert_eq!(later.review_anchor.as_deref(), Some("later"));
+        assert_eq!(turn.take_batch(true).unwrap(), SteeringBatch::default());
     }
 }

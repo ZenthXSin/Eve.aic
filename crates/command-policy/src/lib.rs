@@ -1,16 +1,19 @@
 //! 前缀规则命令策略，规则语义参考 openai/codex 的 execpolicy（Apache-2.0）：
-//! 每条规则按顺序匹配命令的前几个参数，某一位可以列出几个可选值；结论为放行、需确认或禁止，
+//! 每条规则按顺序匹配命令的前几个参数，某一位可以列出几个可选值；结论为放行、需审核或禁止，
 //! 多条规则命中时取最严格的一项。规则自带“应匹配 / 不应匹配”的例子，加载时逐一核对，
 //! 例子与规则不符就拒绝加载，避免写错的规则悄悄失效。
 //!
-//! 与 Codex 不同，规则文件用 JSON 而不是 Starlark；`sh -c` / `bash -lc` 等脚本按 `;`、`&&`、`||`、
-//! `|` 拆成几段分别判断。脚本解析是尽力而为，不是安全边界：变量展开、命令替换等无法静态确定的部分不做判断。
+//! 与 Codex 不同，规则文件用 JSON 而不是 Starlark。只有固定系统路径下、完整参数通过检查的少量
+//! 只读命令可以免审核；未知程序、解释器、脚本及包装器始终至少需审核，追加 Allow 规则不能放宽。
+//! shell 文本拆分只用于发现更严格的禁令，不能证明脚本安全，也不能替代独立行动审核。
 use eve_developer_api::{CommandDecision, CommandEvaluation, CommandPolicy, CommandRuleMatch};
 use serde::Deserialize;
 use std::path::Path;
 
 const DEFAULT_RULES: &str = include_str!("default-rules.json");
-const SHELLS: [&str; 5] = ["sh", "bash", "zsh", "dash", "ash"];
+const SHELLS: [&str; 9] = [
+    "sh", "bash", "zsh", "dash", "ash", "ksh", "mksh", "fish", "csh",
+];
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
@@ -132,7 +135,7 @@ impl PrefixRulePolicy {
         Ok(Self { rules })
     }
 
-    /// 内置规则：拦下停机、格式化、递归删除系统目录，要求确认改写远端历史、丢弃修改等操作。
+    /// 内置规则：拦下停机、格式化、递归删除系统目录，其余非明确只读的命令自动送审。
     pub fn builtin() -> Self {
         Self::from_json(DEFAULT_RULES).expect("内置命令策略规则必须有效")
     }
@@ -159,13 +162,16 @@ impl PrefixRulePolicy {
             .and_then(|s| s.to_str())
             .unwrap_or(&command[0]);
         let args = &command[1..];
-        let mut mark = |reason: &str| {
-            matches.push(CommandRuleMatch {
-                matched_prefix: vec![base.into()],
-                decision: CommandDecision::Prompt,
-                justification: Some(reason.into()),
-            })
-        };
+        let readonly = readonly_system_command(&command[0], args);
+        matches.push(CommandRuleMatch {
+            matched_prefix: vec![command[0].clone()],
+            decision: if readonly { CommandDecision::Allow } else { CommandDecision::Prompt },
+            justification: Some(if readonly {
+                "固定系统路径与完整参数符合只读规则"
+            } else {
+                "不能证明完整命令在安全只读范围内；未知程序、脚本、解释器和包装器必须独立审核，前缀放行不能代替审核"
+            }.into()),
+        });
         if base == "git" {
             let mut position = 0;
             while let Some(option) = args.get(position).filter(|a| a.starts_with('-')) {
@@ -201,7 +207,11 @@ impl PrefixRulePolicy {
                     _ => false,
                 };
                 if dangerous {
-                    mark("Git 参数会删除或丢弃工作、改写远端历史，执行前审核完整命令");
+                    require_review(
+                        matches,
+                        base,
+                        "Git 参数会删除或丢弃工作、改写远端历史，执行前审核完整命令",
+                    );
                 }
             }
         }
@@ -213,22 +223,34 @@ impl PrefixRulePolicy {
                         && (a.contains('r') || a.contains('R')))
             })
         {
-            mark("递归删除，必须先审核完整目标与影响范围");
+            require_review(matches, base, "递归删除，必须先审核完整目标与影响范围");
+            // 不能让重排选项、-- 或尾斜杠把已禁止的系统目录删除降级为可审核动作。
+            if args
+                .iter()
+                .any(|argument| protected_delete_target(argument))
+            {
+                matches.push(CommandRuleMatch {
+                    matched_prefix: vec![base.into()],
+                    decision: CommandDecision::Forbidden,
+                    justification: Some("递归删除系统或家目录，参数重排不能绕过禁令".into()),
+                });
+            }
         }
         if matches!(
             base,
-            "env" | "sudo" | "command" | "exec" | "nohup" | "timeout"
+            "env" | "sudo" | "command" | "exec" | "nohup" | "timeout" | "time"
         ) {
             if depth >= 8 {
-                mark("命令包装层级过深，执行前审核");
+                require_review(matches, base, "命令包装层级过深，执行前审核");
                 return;
             }
-            mark("包装命令可能改变执行身份、环境或目标，执行前审核");
-            if let Some(position) = args
-                .iter()
-                .position(|a| !a.starts_with('-') && !a.contains('='))
-            {
-                self.evaluate_semantics(&args[position..], matches, depth + 1);
+            require_review(
+                matches,
+                base,
+                "包装命令可能改变执行身份、环境或目标，执行前审核",
+            );
+            if let Some(child) = wrapped_command(base, args) {
+                self.evaluate_semantics(child, matches, depth + 1);
             }
         }
         if SHELLS.contains(&base) && args.iter().any(|a| a.starts_with('-') && a.contains('c')) {
@@ -247,7 +269,7 @@ impl PrefixRulePolicy {
                     .any(|a| a.contains(['$', '`', '\n', '(', ')', '{', '}', '<', '>']))
             {
                 matches.push(CommandRuleMatch {
-                    matched_prefix: command.to_vec(),
+                    matched_prefix: vec![base.into()],
                     decision: CommandDecision::Prompt,
                     justification: Some(
                         "脚本包含动态展开、重定向或无法静态解析的语法，执行前必须审核完整命令"
@@ -267,7 +289,8 @@ impl PrefixRulePolicy {
         let Some(first) = command.first() else {
             return;
         };
-        // 绝对路径的程序同时按文件名匹配，`/usr/bin/git` 与 `git` 用同一组规则。
+        // 文件名归一化只提供前缀规则候选；免审核仍要求完整系统路径与只读参数。
+        // 因此 /tmp/ls、./git 等工作区程序不能借系统工具的 Allow 规则绕过审核。
         let base = Path::new(first)
             .file_name()
             .and_then(|name| name.to_str())
@@ -290,6 +313,270 @@ impl PrefixRulePolicy {
     }
 }
 
+fn require_review(matches: &mut Vec<CommandRuleMatch>, base: &str, reason: &str) {
+    matches.push(CommandRuleMatch {
+        matched_prefix: vec![base.into()],
+        decision: CommandDecision::Prompt,
+        justification: Some(reason.into()),
+    });
+}
+
+fn protected_delete_target(value: &str) -> bool {
+    if !value.starts_with('/') {
+        return matches!(value.trim_end_matches('/'), "~" | "$HOME");
+    }
+    let mut parts = Vec::new();
+    for part in Path::new(value).components() {
+        match part {
+            std::path::Component::Normal(name) => parts.push(name),
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            _ => {}
+        }
+    }
+    parts.is_empty()
+        || (parts.len() == 1
+            && matches!(
+                parts[0].to_str(),
+                Some("*" | "home" | "root" | "etc" | "usr" | "var")
+            ))
+}
+
+/// 纯 argv 策略不知道工作目录和文件授权，也不解析 PATH。因此不把工作区里的同名程序、
+/// 文件内容读取或受仓库配置影响的 Git 操作视为免审核命令。固定系统目录由宿主信任边界保护。
+fn readonly_system_command(program: &str, args: &[String]) -> bool {
+    let Some(base) = program
+        .strip_prefix("/usr/bin/")
+        .or_else(|| program.strip_prefix("/bin/"))
+    else {
+        return false;
+    };
+    if base.contains('/') || args.iter().any(|arg| arg.contains('\0')) {
+        return false;
+    }
+    match base {
+        "true" | "false" => args.is_empty(),
+        // 直接启动系统 echo，参数中的 $()、;、> 等是普通字符，不是 shell 语法。
+        "echo" => true,
+        "pwd" => args.iter().all(|arg| {
+            matches!(
+                arg.as_str(),
+                "-L" | "-P" | "--logical" | "--physical" | "--help" | "--version"
+            )
+        }),
+        "whoami" => {
+            args.is_empty()
+                || (args.len() == 1 && matches!(args[0].as_str(), "--help" | "--version"))
+        }
+        "uname" => args.iter().all(|arg| {
+            matches!(
+                arg.as_str(),
+                "--all"
+                    | "--kernel-name"
+                    | "--nodename"
+                    | "--kernel-release"
+                    | "--kernel-version"
+                    | "--machine"
+                    | "--processor"
+                    | "--hardware-platform"
+                    | "--operating-system"
+                    | "--help"
+                    | "--version"
+            ) || short_flags(arg, "asnrvmpio")
+        }),
+        "id" => args.iter().all(|arg| {
+            matches!(
+                arg.as_str(),
+                "--user"
+                    | "--group"
+                    | "--groups"
+                    | "--name"
+                    | "--real"
+                    | "--zero"
+                    | "--help"
+                    | "--version"
+            ) || short_flags(arg, "ugGnrza")
+        }),
+        "ls" => {
+            let mut positional = false;
+            args.iter().all(|arg| {
+                if arg == "--" && !positional {
+                    positional = true;
+                    true
+                } else if arg == "." {
+                    true
+                } else if positional {
+                    false
+                } else {
+                    matches!(
+                        arg.as_str(),
+                        "--all"
+                            | "--almost-all"
+                            | "--directory"
+                            | "--human-readable"
+                            | "--numeric-uid-gid"
+                            | "--reverse"
+                            | "--size"
+                            | "--classify"
+                            | "--help"
+                            | "--version"
+                            | "--color=never"
+                            | "--color=auto"
+                            | "--color=always"
+                    ) || short_flags(arg, "aAldhniSrstUFp1")
+                }
+            })
+        }
+        _ => false,
+    }
+}
+
+fn short_flags(value: &str, allowed: &str) -> bool {
+    value.starts_with('-')
+        && value.len() > 1
+        && value[1..].chars().all(|flag| allowed.contains(flag))
+}
+
+/// 只提取有确定参数语义的包装命令，避免把 sudo 用户名、timeout 时长或 env 变量名
+/// 当成可执行文件而漏掉下层禁令。未知参数仍需审核，不猜测它是否消费下一个参数。
+fn wrapped_command<'a>(program: &str, args: &'a [String]) -> Option<&'a [String]> {
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            index += 1;
+            break;
+        }
+        if matches!(program, "env" | "sudo") && environment_assignment(argument) {
+            index += 1;
+            continue;
+        }
+        if !argument.starts_with('-') {
+            break;
+        }
+        let value_options: &[&str] = match program {
+            "env" => &["-u", "--unset", "-C", "--chdir", "--argv0"],
+            "sudo" => &[
+                "-u",
+                "--user",
+                "-g",
+                "--group",
+                "-h",
+                "--host",
+                "-p",
+                "--prompt",
+                "-C",
+                "--close-from",
+                "-R",
+                "--chroot",
+                "-D",
+                "--chdir",
+                "-T",
+                "--command-timeout",
+                "-r",
+                "--role",
+                "-t",
+                "--type",
+            ],
+            "timeout" => &["-s", "--signal", "-k", "--kill-after"],
+            "exec" => &["-a"],
+            "time" => &["-f", "--format", "-o", "--output"],
+            _ => &[],
+        };
+        let flag_options: &[&str] = match program {
+            "env" => &[
+                "-",
+                "-i",
+                "--ignore-environment",
+                "-0",
+                "--null",
+                "-v",
+                "--debug",
+            ],
+            "sudo" => &[
+                "-A",
+                "--askpass",
+                "-b",
+                "--background",
+                "-E",
+                "--preserve-env",
+                "-H",
+                "--set-home",
+                "-i",
+                "--login",
+                "-K",
+                "--remove-timestamp",
+                "-k",
+                "--reset-timestamp",
+                "-n",
+                "--non-interactive",
+                "-P",
+                "--preserve-groups",
+                "-S",
+                "--stdin",
+                "-s",
+                "--shell",
+            ],
+            "timeout" => &["--preserve-status", "--foreground", "-v", "--verbose"],
+            "command" => &["-p"],
+            "exec" => &["-c", "-l"],
+            "time" => &[
+                "-a",
+                "--append",
+                "-p",
+                "--portability",
+                "-q",
+                "--quiet",
+                "-v",
+                "--verbose",
+            ],
+            _ => &[],
+        };
+        if value_options.contains(&argument.as_str()) {
+            args.get(index + 1)?;
+            index += 2;
+        } else if flag_options.contains(&argument.as_str())
+            || value_options.iter().any(|option| {
+                if option.starts_with("--") {
+                    argument.starts_with(&format!("{option}="))
+                } else {
+                    argument.starts_with(option) && argument.len() > option.len()
+                }
+            })
+        {
+            index += 1;
+        } else {
+            return None;
+        }
+    }
+    if matches!(program, "env" | "sudo") {
+        // env 即使在 -- 后仍接受 NAME=VALUE；sudo 同样允许在命令前设置环境变量。
+        while args
+            .get(index)
+            .is_some_and(|argument| environment_assignment(argument))
+        {
+            index += 1;
+        }
+    }
+    if program == "timeout" {
+        // 时长是 timeout 自己的第一个位置参数。
+        args.get(index)?;
+        index += 1;
+    }
+    args.get(index..).filter(|child| !child.is_empty())
+}
+
+fn environment_assignment(argument: &str) -> bool {
+    argument.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && name.chars().enumerate().all(|(index, character)| {
+                character == '_'
+                    || character.is_ascii_alphabetic()
+                    || (index > 0 && character.is_ascii_digit())
+            })
+    })
+}
+
 /// `sh -c '…'` 一类调用里的脚本，按分隔符拆成几段命令；不是这种形式时返回 None。
 fn shell_script(program: &str, args: &[String]) -> Option<Vec<Vec<String>>> {
     let name = Path::new(program).file_name()?.to_str()?;
@@ -301,7 +588,8 @@ fn shell_script(program: &str, args: &[String]) -> Option<Vec<Vec<String>>> {
         .position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'))?;
     let script = args.get(position + 1)?;
     let words = shlex::split(script)?;
-    // 引号里的 `;`、`|`、`&` 也会被当作分隔（例如 `echo 'a; reboot'`），只会多判断，不会漏判。
+    // 引号里的分隔符也可能误报，动态 shell 语法也可能漏掉具体禁令；本函数仅加强结论，
+    // 脚本本身的 Prompt 下限独立存在，不能将这里解析出的只读片段用于放行。
     let mut commands = vec![Vec::new()];
     for word in words {
         let mut piece = String::new();
@@ -363,8 +651,8 @@ mod tests {
             Some(Prompt),
             "绝对路径按文件名匹配"
         );
-        assert_eq!(decide(&policy, "git push origin main"), None);
-        assert_eq!(decide(&policy, "cargo test"), None);
+        assert_eq!(decide(&policy, "git push origin main"), Some(Prompt));
+        assert_eq!(decide(&policy, "cargo test"), Some(Prompt));
         let evaluation = policy.evaluate("shutdown", &["-h".into(), "now".into()]);
         assert!(
             evaluation.reason().contains("停机"),
@@ -385,7 +673,7 @@ mod tests {
             decide(&policy, "bash -lc 'echo hi; reboot'"),
             Some(Forbidden)
         );
-        assert_eq!(decide(&policy, "bash -c 'ls | grep x'"), None);
+        assert_eq!(decide(&policy, "bash -c 'ls | grep x'"), Some(Prompt));
         assert_eq!(decide(&policy, "sh -c 'echo a;rm -rf ~'"), Some(Forbidden));
     }
 
@@ -410,7 +698,10 @@ mod tests {
             decide(&policy, "sudo reboot"),
             Some(CommandDecision::Forbidden)
         );
-        assert_eq!(decide(&policy, "git -C repo status"), None);
+        assert_eq!(
+            decide(&policy, "git -C repo status"),
+            Some(CommandDecision::Prompt)
+        );
     }
 
     #[test]
@@ -445,8 +736,208 @@ mod tests {
             policy
                 .evaluate("sh", &["-c".into(), "sh -c 'echo hello'".into()])
                 .decision,
-            None
+            Some(CommandDecision::Prompt)
         );
+    }
+
+    #[test]
+    fn unknown_programs_interpreters_and_scripts_never_default_to_allow() {
+        for policy in [PrefixRulePolicy::default(), PrefixRulePolicy::builtin()] {
+            for command in [
+                "unknown-deploy --production",
+                "./safe-looking-program",
+                "/tmp/ls",
+                "sh",
+                "sh script.sh",
+                "bash --noprofile script.sh",
+                "bash -s",
+                "fish -c '/bin/echo hello'",
+                "python3 -c 'import os; os.remove(\"data\")'",
+                "python3 script.py",
+                "python -m package",
+                "node -e 'require(\"fs\").unlinkSync(\"data\")'",
+                "perl -e 'unlink \"data\"'",
+                "ruby script.rb",
+                "php script.php",
+                "lua script.lua",
+                "cmd.exe /c del data",
+                "powershell -Command Remove-Item data",
+                "pwsh -File script.ps1",
+                "busybox sh script.sh",
+                "sqlite3 db 'DELETE FROM users'",
+            ] {
+                assert_eq!(
+                    decide(&policy, command),
+                    Some(CommandDecision::Prompt),
+                    "{command}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compound_shell_text_never_proves_a_script_safe() {
+        let policy = PrefixRulePolicy::builtin();
+        for script in [
+            "/bin/echo hello",
+            "/bin/ls . && /bin/pwd",
+            "/bin/ls . | /bin/echo hello",
+            "/bin/pwd || /bin/echo fallback",
+            "/bin/echo `cat action`",
+            "/bin/echo $(cat action)",
+            "/bin/echo > output",
+            "/bin/echo <(cat input)",
+            "while true; do /bin/echo hello; done",
+            "/bin/echo hello\n./unknown",
+        ] {
+            assert_eq!(
+                policy
+                    .evaluate("/bin/sh", &["-c".into(), script.into()])
+                    .decision,
+                Some(CommandDecision::Prompt),
+                "{script}"
+            );
+        }
+        assert_eq!(
+            policy
+                .evaluate("/bin/echo", &["$(reboot); > output".into()])
+                .decision,
+            Some(CommandDecision::Allow),
+            "直接 argv 里的 shell 字符没有执行语义"
+        );
+    }
+
+    #[test]
+    fn only_complete_readonly_argv_at_trusted_system_paths_can_skip_review() {
+        let policy = PrefixRulePolicy::builtin();
+        for command in [
+            "/bin/pwd",
+            "/usr/bin/pwd -P",
+            "/usr/bin/whoami",
+            "/bin/uname -a",
+            "/usr/bin/id -un",
+            "/bin/ls -alh .",
+            "/usr/bin/ls --color=never -- .",
+            "/bin/true",
+            "/bin/false",
+            "/usr/bin/echo hello",
+        ] {
+            assert_eq!(
+                decide(&policy, command),
+                Some(CommandDecision::Allow),
+                "{command}"
+            );
+        }
+        for command in [
+            "ls .",
+            "./ls .",
+            "/tmp/ls .",
+            "/usr/bin/../local/bin/ls .",
+            "/bin/ls --unknown",
+            "/bin/ls /root/.ssh",
+            "/bin/ls -- -R",
+            "/bin/ls -R .",
+            "/bin/id --unknown",
+            "/bin/uname --unknown",
+            "/bin/pwd arbitrary",
+            "/bin/true script",
+            "/usr/bin/cat /root/.ssh/id_rsa",
+            "git status",
+            "git -c core.fsmonitor=./script status",
+        ] {
+            assert_eq!(
+                decide(&policy, command),
+                Some(CommandDecision::Prompt),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn broad_allow_prefixes_cannot_remove_review_or_forbidden_floors() {
+        let commands = [
+            "bash script.sh",
+            "python3 -c 'print(1)'",
+            "git status",
+            "/tmp/ls",
+            "unknown-binary --dangerous",
+            "find . -delete",
+            "find . -exec sh script.sh ';'",
+            "sed -n '1w /tmp/x' input",
+            "sed -n '1e sh script.sh' input",
+            "awk 'BEGIN{system(\"sh script.sh\")}'",
+            "sort -o /tmp/x input",
+            "uniq input /tmp/x",
+            "file -C -m data",
+            "date -s tomorrow",
+            "rg --pre=./script pattern .",
+            "cmd.exe /c del data",
+            "pwsh -File script.ps1",
+        ];
+        for command in commands {
+            let words = shlex::split(command).unwrap();
+            let name = Path::new(&words[0]).file_name().unwrap().to_str().unwrap();
+            let rules =
+                serde_json::json!({"rules":[{"pattern":[name],"decision":"allow"}]}).to_string();
+            let policy =
+                PrefixRulePolicy::builtin().merged(PrefixRulePolicy::from_json(&rules).unwrap());
+            assert_eq!(
+                decide(&policy, command),
+                Some(CommandDecision::Prompt),
+                "{command}"
+            );
+        }
+        let policy = PrefixRulePolicy::builtin().merged(PrefixRulePolicy::from_json(
+            r#"{"rules":[{"pattern":["reboot"],"decision":"allow"},{"pattern":["/bin/pwd"],"decision":"prompt"}]}"#
+        ).unwrap());
+        assert_eq!(decide(&policy, "reboot"), Some(CommandDecision::Forbidden));
+        assert_eq!(decide(&policy, "/bin/pwd"), Some(CommandDecision::Prompt));
+    }
+
+    #[test]
+    fn wrapper_options_and_reordered_system_deletion_preserve_forbidden() {
+        let policy = PrefixRulePolicy::builtin();
+        for command in [
+            "sudo -u root reboot",
+            "sudo --user=root reboot",
+            "sudo -uroot reboot",
+            "timeout 5 reboot",
+            "timeout -s TERM -k 1 5 reboot",
+            "env -u X reboot",
+            "env --unset=X reboot",
+            "env A=b reboot",
+            "env -i -- reboot",
+            "env -- A=b reboot",
+            "sudo FOO=bar reboot",
+            "nohup /sbin/reboot",
+            "command -p reboot",
+            "exec -a alias reboot",
+            "time -o timing reboot",
+            "sudo -u root timeout 5 env -u X reboot",
+            "rm --force -R -- /",
+            "rm --recursive -- /root/",
+            "rm /etc/. -fr",
+            "rm //etc -fr",
+            "rm -R /tmp/../root",
+        ] {
+            assert_eq!(
+                decide(&policy, command),
+                Some(CommandDecision::Forbidden),
+                "{command}"
+            );
+        }
+        for command in [
+            "sudo --unknown root reboot",
+            "env -S 'reboot'",
+            "timeout -s TERM",
+            "rm -rf build",
+        ] {
+            assert_eq!(
+                decide(&policy, command),
+                Some(CommandDecision::Prompt),
+                "{command}"
+            );
+        }
     }
 
     #[test]
@@ -476,6 +967,9 @@ mod tests {
             decide(&policy, "npm publish"),
             Some(CommandDecision::Forbidden)
         );
-        assert_eq!(decide(&policy, "npm install"), None);
+        assert_eq!(
+            decide(&policy, "npm install"),
+            Some(CommandDecision::Prompt)
+        );
     }
 }

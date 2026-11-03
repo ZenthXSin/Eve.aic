@@ -6,6 +6,8 @@ use eve_session_api::SessionKey;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
+mod metadata;
+
 struct Settings;
 impl ConfigService for Settings {
     fn snapshot(&self, _: &str, _: u32) -> ConfigResult<ConfigSnapshot> {
@@ -214,7 +216,7 @@ impl RelationJudge for SlowJudge {
     }
 }
 
-fn router(control: Arc<Control>, judge: Arc<dyn RelationJudge>) -> Router {
+fn router(control: Arc<dyn ControlService>, judge: Arc<dyn RelationJudge>) -> Router {
     Router(Arc::new(Inner {
         control,
         judge,

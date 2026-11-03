@@ -100,7 +100,7 @@ class SegmentAcceptance(unittest.TestCase):
                 if item["source"]["kind"] == "CompletedInteraction"]
 
     def message(self, id, text=TEXT, segments=PARTS, **extra):
-        message = {"id": id, "text": text, "scope": "c2c", "user_id": "user-1", "target_id": "user-1",
+        message = {"id": id, "text": text, "original_text": text, "scope": "c2c", "user_id": "user-1", "target_id": "user-1",
                    "expected_type": "reply", **extra}
         if segments is None:
             message.setdefault("expected", text)
@@ -115,13 +115,14 @@ class SegmentAcceptance(unittest.TestCase):
         return {"wait_receipt": {"path": str(self.state_path), "id": id, "state": state}}
 
     def run_eve(self, script, segmented=True, memory=False, training=False, terminate_at=None, success=True,
-                sentence_split=False):
+                sentence_split=False, timeout=30):
         self.runs += 1
         events_path = self.work / f"events-{self.runs}.jsonl"
         error_path = self.work / f"error-{self.runs}.txt"
         scenario = self.work / f"scenario-{self.runs}.json"
         scenario.write_text(json.dumps({"script": script, "events_file": str(events_path),
-                                        "error_file": str(error_path)}), encoding="utf8")
+                                        "error_file": str(error_path),
+                                        "wait_timeout_ms": max(15000, (timeout - 5) * 1000)}), encoding="utf8")
         env = {key: os.environ[key] for key in ("PATH", "SystemRoot", "TEMP", "TMP") if key in os.environ}
         env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret",
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
@@ -131,7 +132,7 @@ class SegmentAcceptance(unittest.TestCase):
         bootstrap_test_admin(self.work / "state", env,
                              users=getattr(self, "fixture_admin_users", ("user-1", "user-2")))
         bootstrap_fixture_groups(self.work / "state", scenario)
-        command = [str(BINARY), "--state-dir", str(self.work / "state"), "--agent", str(ROOT / "AGENT.md"),
+        command = [str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "state"), "--agent", str(ROOT / "AGENT.md"),
                    "--bridge-script", str(FAKE), "--bridge-arg", str(scenario)]
         if segmented:
             command.append("--segmented")
@@ -148,7 +149,7 @@ class SegmentAcceptance(unittest.TestCase):
                     time.sleep(0.01)
                 self.assertTrue(terminate_at.exists(), "process exited before SIGTERM synchronization")
                 child.send_signal(signal.SIGTERM)
-            stdout, stderr = child.communicate(timeout=30)
+            stdout, stderr = child.communicate(timeout=timeout)
         finally:
             if child.poll() is None:
                 child.kill()

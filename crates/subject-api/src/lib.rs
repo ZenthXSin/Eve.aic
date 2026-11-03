@@ -257,6 +257,11 @@ pub trait SubjectAdmin: Send + Sync {
 
     fn snapshot_for(&self, scope: &SubjectScope) -> SubjectResult<SubjectSnapshot>;
     fn upsert_focus(&self, focus: SubjectFocus, now_ms: u64) -> SubjectResult<SubjectFocus>;
+    /// 在一次持久事务中保存全部关注，按输入顺序返回规范化后的值。
+    /// 输入不能为空或包含重复的范围与 ID；全部输入都受容量保护，不能被本次写入回收。
+    /// 验证、时间冲突或容量不足时不保存任何输入，也不回收已有关注。
+    fn upsert_foci(&self, foci: Vec<SubjectFocus>, now_ms: u64)
+    -> SubjectResult<Vec<SubjectFocus>>;
     /// 只排入到期关注的检查事件，不产生通知；每个关注至少间隔三十分钟。
     fn schedule_due(&self, now_ms: u64) -> SubjectResult<usize>;
     /// 只能由可信宿主根据人工核对结果了结未知事件，不能令它重新排队。

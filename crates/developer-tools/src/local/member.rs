@@ -78,14 +78,14 @@ impl LocalDeveloper {
             token: None,
             root,
             journal: self.journal.clone(),
-            next: AtomicU64::new(0),
-            serial: Mutex::new(()),
+            ledger: self.ledger.clone(),
             api: self.api.clone(),
             authorization: self.authorization.clone(),
             member_runtime: self.member_runtime.clone(),
             isolated: true,
             command_policy: self.command_policy.clone(),
             action_reviewer: self.action_reviewer.clone(),
+            session_workspaces: false,
         })
     }
     pub(super) fn member_command(

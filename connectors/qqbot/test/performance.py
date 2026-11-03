@@ -174,7 +174,7 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes, p
         EVE_PROGRESS_SLOW_AFTER_MS="45000" if progress_enabled else "0",
         EVE_PROGRESS_TOOL_MILESTONES="false",
     )
-    command = [str(binary), "--state-dir", str(directory / "state"),
+    command = [str(binary), "--minimal-profile", "--state-dir", str(directory / "state"),
                "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(HERE / "performance-bridge.mjs"),
                "--bridge-arg", str(scenario)]
     before = resource.getrusage(resource.RUSAGE_CHILDREN)

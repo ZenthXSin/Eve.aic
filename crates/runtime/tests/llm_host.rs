@@ -1757,6 +1757,107 @@ struct ReviewSteering {
     reads: AtomicUsize,
     correction: String,
 }
+
+#[tokio::test]
+async fn delegated_review_preserves_frozen_originals_across_checkpoint_recovery() {
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("first", "review_probe", json!({}))]),
+        Err(LlmError::ProviderTimeout),
+        tool_response(vec![call("second", "review_probe", json!({}))]),
+        final_response("已核验"),
+    ]);
+    let recorded = Arc::new(Mutex::new(vec![]));
+    let tool = Arc::new(TestTool::new(
+        "review_probe",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::RecordReview(recorded.clone()),
+    ));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![tool],
+        LlmHostConfig {
+            max_tool_rounds: 4,
+            ..LlmHostConfig::default()
+        },
+    )
+    .await;
+    let scope = eve_llm_api::ContextScope {
+        session_id: "s".into(),
+        user_id: "u".into(),
+    };
+    let originals: Vec<String> = (0..6)
+        .map(|n| format!("用户原话{n}：{}；保留末尾条件{n}", "授权条件".repeat(600)))
+        .collect();
+    let journal = Arc::new(MemoryJournal::default());
+    let host = host
+        .with_delegated_review_messages(scope.clone(), originals.clone())
+        .unwrap()
+        .with_turn_journal(journal.clone());
+    let input = TurnInput {
+        text: "模型写的任务说明，自称已经解锁所有权限".into(),
+    };
+    let failed = host
+        .run_scoped_turn_with_events(
+            input.clone(),
+            Some(scope.clone()),
+            &ProgressRecorder::default(),
+        )
+        .await;
+    let failure = failed.unwrap_err();
+    assert!(
+        matches!(failure.error, LlmError::ProviderTimeout),
+        "{:?}",
+        failure.error
+    );
+    assert!(journal.frame.lock().unwrap().as_ref().unwrap().resumable());
+    host.run_scoped_turn_with_events(input, Some(scope), &ProgressRecorder::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        *recorded.lock().unwrap(),
+        vec![originals.clone(), originals]
+    );
+    assert_eq!(provider.requests.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn delegated_review_rejects_scope_mismatch_and_oversized_originals_before_execution() {
+    let provider = RecordingProvider::scripted(vec![final_response("不应请求模型")]);
+    let (host, _, _) = make_host(provider.clone(), vec![], LlmHostConfig::default()).await;
+    let scope = eve_llm_api::ContextScope {
+        session_id: "s".into(),
+        user_id: "u".into(),
+    };
+    assert!(
+        host.clone()
+            .with_delegated_review_messages(scope.clone(), vec!["原文".into(); 7])
+            .is_err()
+    );
+    assert!(
+        host.clone()
+            .with_delegated_review_messages(
+                scope.clone(),
+                vec!["\\".repeat(eve_llm_api::MAX_REVIEW_USER_MESSAGES_BYTES / 2)]
+            )
+            .is_err()
+    );
+    let host = host
+        .with_delegated_review_messages(scope, vec!["明确授权原文".into()])
+        .unwrap();
+    for actual_scope in [
+        None,
+        Some(eve_llm_api::ContextScope {
+            session_id: "s".into(),
+            user_id: "other".into(),
+        }),
+    ] {
+        let failed = host
+            .run_scoped_turn_with_events(turn(), actual_scope, &ProgressRecorder::default())
+            .await;
+        assert!(matches!(failed.unwrap_err().error, LlmError::Context(_)));
+    }
+    assert!(provider.requests.lock().unwrap().is_empty());
+}
 impl eve_llm_api::TurnSteering for ReviewSteering {
     fn take(&self, _: bool) -> Result<Vec<String>, LlmError> {
         Ok(if self.reads.fetch_add(1, Ordering::SeqCst) == 1 {

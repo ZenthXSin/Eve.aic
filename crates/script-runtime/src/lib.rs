@@ -2,6 +2,7 @@
 //! 仅在 OS 沙箱可用时启动进程；宿主权限始终由统一派发边界重新检查。
 mod cargo_compiler;
 mod cargo_model;
+mod code;
 mod cold;
 mod compiler;
 mod container;
@@ -14,6 +15,7 @@ mod store;
 
 pub use cargo_compiler::{CargoArtifact, CargoCompilation, CargoCompiler};
 pub use cargo_model::{CargoCompilationFailure, CargoCompilerConfig, CargoProject, CargoSettings};
+pub use code::tool_code_spec;
 pub use cold::VersionSummary;
 pub use container::ContainerSandbox;
 pub use dispatch::{AuthorizedToolDispatch, CheckedTools, ToolAuthorizer};

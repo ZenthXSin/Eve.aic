@@ -1,6 +1,15 @@
 use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const RUNTIME_SCRIPTS: [&str; 3] = [
+    "scripts/build_resources.py",
+    "scripts/self_upgrade_runtime.py",
+    "scripts/source_update.py",
+];
+fn candidate_runtime() -> Value {
+    json!({"host_protocol":1,"scripts":RUNTIME_SCRIPTS})
+}
+
 fn now_ms() -> Result<u64, ToolExecutionError> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -127,7 +136,7 @@ fn digest_stream(
     ))
 }
 
-fn file_digest(
+pub(super) fn file_digest(
     path: &Path,
     limit: u64,
     context: &ToolExecutionContext,
@@ -191,6 +200,10 @@ fn verify_contents(
     {
         return Err(failed("candidate_changed：缺少完整硬性验证证据"));
     }
+    source::read_source_diff(directory, manifest)?;
+    if manifest["runtime"] != candidate_runtime() {
+        return Err(failed("candidate_changed：候选运行监督脚本协议无效"));
+    }
     let binary = directory.join(if cfg!(windows) {
         "eve-qqbot.exe"
     } else {
@@ -215,6 +228,9 @@ fn verify_contents(
         ]
         .iter()
         .any(|name| !resources.contains_key(*name))
+        || RUNTIME_SCRIPTS
+            .iter()
+            .any(|name| !resources.contains_key(*name))
     {
         return Err(failed("candidate_changed：运行资源缺失"));
     }
@@ -222,7 +238,8 @@ fn verify_contents(
     for (name, expected) in resources {
         if !(name == "AGENT.md"
             || name.starts_with("connectors/qqbot/")
-            || name.starts_with("vendor/"))
+            || name.starts_with("vendor/")
+            || RUNTIME_SCRIPTS.contains(&name.as_str()))
             || name.contains('\\')
             || name.contains("//")
             || Path::new(name)
@@ -253,7 +270,7 @@ fn verify_contents(
     }
     if hash(
         json!({"source":manifest["source"], "binary_sha256":manifest["binary_sha256"],
-        "resources":manifest["resources"]})
+        "resources":manifest["resources"],"source_diff":manifest["source_diff"],"runtime":manifest["runtime"]})
         .to_string()
         .as_bytes(),
     ) != id
@@ -264,8 +281,8 @@ fn verify_contents(
 }
 
 fn upgrade_plan(manifest: &Value) -> Value {
-    json!({"operation":"switch_binary_preserve_state", "candidate_sha256":manifest["candidate_sha256"],
-        "state_schema_version":1, "validation_policy":"format-clippy-tests-release-build-v1"})
+    json!({"operation":"switch_runtime_preserve_state", "candidate_sha256":manifest["candidate_sha256"],
+        "runtime":manifest["runtime"],"state_schema_version":1, "validation_policy":"format-clippy-tests-release-build-v1"})
 }
 
 impl LocalDeveloper {
@@ -301,7 +318,7 @@ impl LocalDeveloper {
 
     pub(super) async fn publish_upgrade(
         &self,
-        source: Value,
+        source: source::SourceEvidence,
         bytes: Vec<u8>,
         checks: Vec<Value>,
         context: &ToolExecutionContext,
@@ -310,17 +327,22 @@ impl LocalDeveloper {
         fs::create_dir_all(&parent).map_err(|_| failed("候选目录不可创建"))?;
         let stage = tempfile::tempdir_in(&parent).map_err(|_| failed("候选暂存失败"))?;
         let listing = self
-            .command_limited(
+            .command_evidence(
                 CommandArguments {
                     owner_confirmed: false,
                     program: "git".into(),
                     args: [
-                        "ls-files",
-                        "-z",
+                        "ls-tree",
+                        "-rz",
+                        "--full-tree",
+                        "HEAD",
                         "--",
                         "AGENT.md",
                         "connectors/qqbot",
                         "vendor",
+                        "scripts/build_resources.py",
+                        "scripts/self_upgrade_runtime.py",
+                        "scripts/source_update.py",
                     ]
                     .into_iter()
                     .map(str::to_owned)
@@ -337,12 +359,26 @@ impl LocalDeveloper {
         }
         let mut resources = BTreeMap::new();
         let mut total = 0usize;
-        for name in listing["stdout"]
+        for entry in listing["stdout"]
             .as_str()
             .ok_or_else(|| failed("资源清单缺失"))?
             .split('\0')
             .filter(|s| !s.is_empty())
         {
+            let (object, name) = entry
+                .split_once('\t')
+                .ok_or_else(|| failed("提交资源目录格式无效"))?;
+            if review::credential_path(name) {
+                return Err(failed("运行资源包含凭据路径，未读取或发布候选"));
+            }
+            let mut parts = object.split(' ');
+            if !matches!(parts.next(), Some("100644" | "100755")) || parts.next() != Some("blob") {
+                return Err(failed("候选资源必须是提交中的普通文件，不能是链接或子模块"));
+            }
+            let expected_blob = parts
+                .next()
+                .filter(|sha| valid_source_revision(sha))
+                .ok_or_else(|| failed("提交资源摘要无效"))?;
             let path = self.path(name, false)?;
             let metadata = fs::metadata(&path).map_err(|_| failed("运行资源不可读取"))?;
             if !metadata.is_file() || metadata.len() > MAX_FILE as u64 || resources.len() >= 10_000
@@ -359,6 +395,19 @@ impl LocalDeveloper {
                         _ => failed("运行资源不可读、类型无效或超过8MiB"),
                     },
                 )?;
+            // 对复制出的实际字节核对 Git blob，防止短暂修改后恢复绕过末尾 clean 检查。
+            let mut blob = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
+            blob.update(format!("blob {}\0", data.len()).as_bytes());
+            blob.update(&data);
+            let actual_blob: String = blob
+                .finish()
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            if actual_blob != expected_blob {
+                return Err(failed("冻结资源与目标提交不一致；未发布候选"));
+            }
             total += data.len();
             if total > 64 * 1024 * 1024 {
                 return Err(failed("运行资源超过 64 MiB"));
@@ -369,12 +418,26 @@ impl LocalDeveloper {
             fs::write(target, &data).map_err(|_| failed("运行资源保存失败"))?;
             resources.insert(name.to_owned(), hash(&data));
         }
+        if [
+            "AGENT.md",
+            "connectors/qqbot/bridge.mjs",
+            "connectors/qqbot/bridge-core.mjs",
+            "connectors/qqbot/package.json",
+            "connectors/qqbot/package-lock.json",
+        ]
+        .into_iter()
+        .chain(RUNTIME_SCRIPTS)
+        .any(|name| !resources.contains_key(name))
+        {
+            return Err(failed("候选缺少完整运行资源或监督脚本，未发布候选"));
+        }
         self.authorize(context)?;
         if self.source_fingerprint(context).await? != source {
             return Err(failed("冻结资源时源码发生变化；没有发布候选"));
         }
         let digest = hash(&bytes);
-        let identity = json!({"source":source,"binary_sha256":digest,"resources":resources});
+        let runtime = candidate_runtime();
+        let identity = json!({"source":source.fingerprint,"source_diff":source.descriptor,"runtime":runtime,"binary_sha256":digest,"resources":resources});
         let candidate_id = hash(identity.to_string().as_bytes());
         let directory = parent.join(&candidate_id);
         if !directory.exists()
@@ -407,15 +470,21 @@ impl LocalDeveloper {
                 .map_err(|_| failed("候选可执行权限设置失败"))?;
         }
         let manifest = json!({"format_version":1,"success":true,"prepared":true,"applied":false,
-            "source":source,"candidate_sha256":candidate_id,"binary_sha256":digest,"candidate_path":candidate,
+            "source":source.fingerprint,"source_diff":source.descriptor,"runtime":runtime,"candidate_sha256":candidate_id,"binary_sha256":digest,"candidate_path":candidate,
             "resources":resources,"checks":checks,
             "next":"按仓库约定提交分支/PR；已装配监督器时用 apply_self_upgrade 提交切换，并用 self_upgrade_status 核对真实结果。"});
         if manifest.to_string().len() > LIVE_UPGRADE_MAX_JSON {
             return Err(failed("候选清单超过上限，未发布候选"));
         }
+        self.validate_candidate_review_capacity(&manifest, &source.diff, context)?;
+        fs::write(
+            stage.path().join("source-diff.patch"),
+            source.diff.as_bytes(),
+        )
+        .map_err(|_| failed("源码差异冻结失败；未发布候选"))?;
         fs::write(stage.path().join("manifest.json"), manifest.to_string())
             .map_err(|_| failed("候选清单保存失败"))?;
-        for name in [filename, "manifest.json"] {
+        for name in [filename, "manifest.json", "source-diff.patch"] {
             fs::File::open(stage.path().join(name))
                 .and_then(|f| f.sync_all())
                 .map_err(|_| failed("候选持久化失败"))?;
@@ -424,13 +493,16 @@ impl LocalDeveloper {
             // 相同摘要的已发布目录不得覆盖；损坏时保留现场并拒绝。
             let (_, old) = read_manifest(&directory)?;
             verify_contents(&directory, &old, &candidate_id, context)?;
+            context.check_review_evidence()?;
             return self.issue_upgrade_lease(&directory, old);
         }
+        context.check_review_evidence()?;
         fs::rename(stage.path(), &directory).map_err(|_| failed("候选原子发布失败；保留原文件"))?;
+        context.check_review_evidence()?;
         self.issue_upgrade_lease(&directory, manifest)
     }
 
-    fn supervisor(&self) -> Result<(PathBuf, UpgradeSupervisor), ToolExecutionError> {
+    pub(super) fn supervisor(&self) -> Result<(PathBuf, UpgradeSupervisor), ToolExecutionError> {
         let directory = self
             .config
             .live_upgrade
@@ -461,6 +533,46 @@ impl LocalDeveloper {
     pub(super) fn upgrade_status(&self) -> Result<Value, ToolExecutionError> {
         let (_, status) = self.supervisor()?;
         serde_json::to_value(status).map_err(|_| failed("监督器状态无法读取"))
+    }
+
+    pub(super) fn restart_self(
+        &self,
+        context: &ToolExecutionContext,
+    ) -> Result<Value, ToolExecutionError> {
+        self.authorize_operation(&DeveloperOperation::RestartSelf, context)?;
+        if !self.config.self_upgrade || !self.config.commands {
+            return Err(failed("实时监督器未启用"));
+        }
+        let (queue, status) = self.supervisor()?;
+        if !status.restart_supported {
+            return Err(failed("当前监督器不支持主动重启，未提交请求"));
+        }
+        if !matches!(status.phase.as_str(), "starting" | "running" | "waiting") {
+            return Err(failed("监督器正在切换或需要检查，未提交新请求"));
+        }
+        let scope = context
+            .scope()
+            .ok_or_else(|| failed("重启请求缺少可信会话"))?;
+        let request = RestartRequest {
+            format_version: LIVE_UPGRADE_VERSION,
+            action: "restart".into(),
+            session_id: scope.session_id.clone(),
+            requested_by: scope.user_id.clone(),
+            turn_id: context
+                .turn_id()
+                .ok_or_else(|| failed("重启请求缺少可信持久轮次"))?,
+        };
+        let mut file =
+            tempfile::NamedTempFile::new_in(&queue).map_err(|_| failed("重启请求暂存失败"))?;
+        file.write_all(&serde_json::to_vec(&request).map_err(|_| failed("重启请求编码失败"))?)
+            .and_then(|_| file.as_file().sync_all())
+            .map_err(|_| failed("重启请求保存失败"))?;
+        self.authorize_operation(&DeveloperOperation::RestartSelf, context)?;
+        context.check_review_evidence()?;
+        file.persist_noclobber(queue.join("request.json"))
+            .map_err(|_| failed("已有请求或提交结果需核对，未覆盖；禁止盲目重试"))?;
+        Ok(json!({"queued":true,"restarted":false,
+            "next":"先结束本轮回复；后续新轮用 self_upgrade_status 核对真实结果。"}))
     }
 
     pub(super) fn apply_upgrade(
@@ -498,6 +610,20 @@ impl LocalDeveloper {
             return Err(failed("候选没有完整验证证据，未提交切换"));
         }
         verify_contents(&candidate, &manifest, &a.candidate_sha256, context)?;
+        if status.active_candidate_sha256.as_deref() == Some(a.candidate_sha256.as_str())
+            && manifest["binary_sha256"] == status.active_sha256
+        {
+            return Ok(
+                json!({"queued":false,"applied":true,"already_active":true,"candidate_sha256":a.candidate_sha256}),
+            );
+        }
+        if status.active_source_revision.as_deref()
+            != manifest["source_diff"]["base_revision"].as_str()
+        {
+            return Err(failed(
+                "candidate_changed：在线源码基线已变化；重新准备并审核",
+            ));
+        }
         let lease_path = self
             .journal
             .join("leases")
@@ -572,6 +698,7 @@ impl LocalDeveloper {
             file.write_all(&serde_json::to_vec(&request).map_err(|_| failed("升级请求编码失败"))?)
                 .and_then(|_| file.as_file().sync_all())
                 .map_err(|_| failed("升级请求保存失败"))?;
+            context.check_review_evidence()?;
             file.persist_noclobber(target)
                 .map_err(|_| failed("升级请求提交结果需核对，禁止盲目重试"))?;
         }

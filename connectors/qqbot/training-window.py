@@ -225,11 +225,21 @@ def unseal(source, output):
     with tarfile.open(fileobj=io.BytesIO(plaintext), mode="r:gz") as archive:
         members = archive.getmembers()
         if sum(m.size for m in members) > MAX_ARCHIVE or any(
-                m.issym() or m.islnk() or m.name.startswith("/") or ".." in Path(m.name).parts or
+                not (m.isfile() or m.isdir()) or m.name.startswith("/") or ".." in Path(m.name).parts or
+                "\\" in m.name or ":" in m.name or
                 not (m.name == "state" or m.name.startswith("state/") or m.name in ("training-report.json", "window.json"))
                 for m in members):
             raise ValueError("archive_members")
-        archive.extractall(output, filter="data")
+        # 兼容 Python 3.11；只恢复已校验的普通文件和目录，不应用归档权限或链接。
+        output.mkdir(parents=True, exist_ok=False)
+        for member in members:
+            destination = output / member.name
+            if member.isdir():
+                destination.mkdir(parents=True, exist_ok=True)
+            else:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with archive.extractfile(member) as source, destination.open("xb") as target:
+                    shutil.copyfileobj(source, target)
 
 
 def run_window(root, seconds, binary, seed_state=None, command=None):

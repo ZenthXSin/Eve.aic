@@ -26,10 +26,11 @@ class TaskStrategyProcessAcceptance(background.BackgroundTaskAcceptance):
 
     def setUp(self):
         super().setUp()
+        (self.work / "state").mkdir(exist_ok=True)
         self.source = self.work / "source"
         self.source.mkdir()
         for name in CASES:
-            (self.source / f"{name}.txt").write_text(INITIAL, encoding="utf8")
+            (self.source / f"{name}.txt").write_bytes(INITIAL.encode())
         (self.work / "task-strategy-fixture.marker").write_bytes(b"isolated-task-strategy-v1")
         self.developer_config = self.work / "developer.json"
         self.developer_config.write_text(json.dumps({
@@ -64,6 +65,10 @@ class TaskStrategyProcessAcceptance(background.BackgroundTaskAcceptance):
             return background.calls(("dispatch-fixture", "dispatch_background_task", {
                 "title": label, "instructions": f"task-strategy-fixture:{name}",
                 "max_steps": STEPS, "include_context": False,
+                "verification": {"kind": "receipts", "contract": {"checks": [{
+                    "tool": "read_file", "arguments": {"path": f"{name}.txt", "offset": 0},
+                    "output_pointer": "/sha256", "expected": hashlib.sha256(CORRECT.encode()).hexdigest(),
+                }], "require_final_batch": True}},
             }))
         self.assertTrue(results[-1]["dispatched"], results)
         return text_response("fixture queued")
@@ -110,6 +115,13 @@ class TaskStrategyProcessAcceptance(background.BackgroundTaskAcceptance):
         for task in self.tasks():
             self.assertEqual(task["usage"], {"tool_calls": 3, "model_requests": 4})
             self.assertIsNone(task["spec"].get("context"))
+            name = task["spec"]["instructions"].split(":", 1)[1]
+            self.assertEqual(task["execution"]["completion_contract"], {
+                "kind": "receipts", "contract": {"checks": [{
+                    "tool": "read_file", "arguments": {"path": f"{name}.txt", "offset": 0},
+                    "output_pointer": "/sha256", "expected": hashlib.sha256(CORRECT.encode()).hexdigest(),
+                }], "require_final_batch": True},
+            })
         for trial in self.world()["trials"]:
             self.assertEqual(trial["resolution"]["effect"], "Verified")
             receipt = trial["resolution"]["receipt"]
@@ -125,7 +137,7 @@ class TaskStrategyProcessAcceptance(background.BackgroundTaskAcceptance):
         script, checkpoints = [], {}
         for index, (label, name) in enumerate(order):
             before, after = f"reset-{index}", f"settle-{index}"
-            checkpoints[before] = lambda name=name: (self.source / f"{name}.txt").write_text(INITIAL, encoding="utf8")
+            checkpoints[before] = lambda name=name: (self.source / f"{name}.txt").write_bytes(INITIAL.encode())
             checkpoints[after] = lambda count=index + 1: self.settled(count)
             script += self.checkpoint(before)
             script += self.send(self.message(f"task-{index}", f"{label}:{name}", expected="fixture queued"))

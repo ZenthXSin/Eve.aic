@@ -31,6 +31,34 @@ class CacheMetricsAcceptance(model_health_test.ModelHealthAcceptance):
                                  "prompt_tokens_details": {"cached_tokens": size * 3 // 4}}
         return response
 
+    def test_invalid_and_missing_usage_are_not_counted_as_hits_and_zero_is_reported(self):
+        replies = iter([
+            {"prompt_tokens": 1000, "prompt_tokens_details": {"cached_tokens": 1500}},
+            {"prompt_tokens": 1000},
+            {"prompt_tokens": 1000, "prompt_tokens_details": {"cached_tokens": 0}},
+        ])
+
+        def response(body, kind, fallback):
+            if kind == "chat":
+                fallback["usage"] = next(replies)
+            return fallback
+
+        self.provider_response = response
+        seen = {}
+
+        def inspect():
+            seen.update(self.dialogue(self.readiness())["cache"])
+
+        self.run_eve([
+            *self.send(self.message("invalid", "第一句")),
+            *self.send(self.message("missing", "第二句")),
+            *self.send(self.message("zero", "第三句")),
+            *self.checkpoint("usage"),
+        ], interest=False, panel=True, checkpoints={"usage": inspect})
+        self.assertEqual((seen["reported_requests"], seen["unreported_requests"]), (1, 2))
+        self.assertEqual((seen["input_tokens"], seen["cached_tokens"]), (1000, 0))
+        self.assertEqual(seen["recent_reported_ratio"], 0)
+
     def test_cache_hits_and_local_prefix_reuse_are_shown_per_use(self):
         seen = {}
 
@@ -60,7 +88,7 @@ class CacheMetricsAcceptance(model_health_test.ModelHealthAcceptance):
         # 宿主事实、工具说明、授权与训练开关提示属于固定资料：并在工具清单那条系统消息里，位于历史之前。
         for body in bodies:
             fixed = body["messages"][1]["content"]
-            for kind in ("eve.host.capabilities", "eve.host.authorization", "eve.host-facts", "当前主动提问训练已关闭"):
+            for kind in ("eve.host.capabilities", "eve.host.authorization", "eve.host-facts"):
                 self.assertIn(kind, fixed)
                 self.assertFalse(any(kind in str(m.get("content")) for m in body["messages"][2:]), kind)
         broken = cache["last_break"]

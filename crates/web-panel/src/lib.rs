@@ -106,6 +106,8 @@ impl LocalPanel {
             .route("/style.css", get(styles))
             .route("/api/status", get(status))
             .route("/api/readiness", get(readiness))
+            .route("/api/notifications", get(notifications))
+            .route("/api/notifications/read", post(mark_notification_read))
             .route("/api/chat", get(chat_info))
             .route(
                 "/api/chat/send",
@@ -209,6 +211,7 @@ fn failure(error_value: PanelError) -> Response {
         PanelError::NotFound => error(StatusCode::NOT_FOUND, "not_found"),
         PanelError::Stale => error(StatusCode::CONFLICT, "stale_generation"),
         PanelError::Unavailable => error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        PanelError::Capacity => error(StatusCode::SERVICE_UNAVAILABLE, "inbox_capacity"),
     }
 }
 
@@ -500,6 +503,51 @@ async fn status(State(shared): State<Arc<Shared>>) -> Response {
 async fn readiness(State(shared): State<Arc<Shared>>) -> Response {
     match shared.service.readiness() {
         Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NotificationListing {
+    before: Option<u64>,
+    #[serde(default = "page_size")]
+    limit: usize,
+}
+async fn notifications(
+    State(shared): State<Arc<Shared>>,
+    query: Result<Query<NotificationListing>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Ok(Query(page)) = query else {
+        return error(StatusCode::BAD_REQUEST, "invalid_query");
+    };
+    if !(1..=100).contains(&page.limit) || page.before == Some(0) {
+        return error(StatusCode::BAD_REQUEST, "invalid_query");
+    }
+    match shared.service.notifications(page.before, page.limit) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => failure(e),
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NotificationRead {
+    id: u64,
+}
+async fn mark_notification_read(
+    State(shared): State<Arc<Shared>>,
+    body: Result<Json<NotificationRead>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return error(StatusCode::BAD_REQUEST, "invalid_json");
+    };
+    if body.id == 0 {
+        return error(StatusCode::BAD_REQUEST, "invalid_input");
+    }
+    if !shared.open.load(Ordering::Acquire) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "stopping");
+    }
+    match shared.service.mark_notification_read(body.id) {
+        Ok(updated) => Json(json!({"updated": updated})).into_response(),
         Err(e) => failure(e),
     }
 }

@@ -1,9 +1,9 @@
 """实际 eve-qqbot 的后台任务与子代理验收；只连接本地模型替身与 fake bridge。
 
 用户在对话里请 Eve 去做一件需要多步的事：聊天模型调用 dispatch_background_task 派发，账本保存后才回复；
-后台执行器看不到对话，只按派发说明调用工具，步数（工具调用次数）用尽后不再提供工具、由模型收尾；结束后
-私聊通知派发它的用户。用户可以让 Eve 查看或取消；重启时没有检查点的旧任务记为中断，不自动重跑；新任务的自动接续由 background_recovery_test 覆盖。子代理在同一轮里
-做完一件子任务并把结果交回。
+后台执行器看不到对话，只按派发说明调用工具，步数（工具调用次数）用尽后不再提供工具、由模型收尾；
+没有可验证合同的结果必须标为阻塞，再通知派发它的用户。用户可以让 Eve 查看或取消；重启时没有检查点的旧任务记为中断，不自动重跑；新任务的自动接续由 background_recovery_test 覆盖。
+子代理只有满足冻结的机械合同才可以声明完成。
 
 模型替身按请求里的工具定义与上下文确定性地作答，只证明宿主契约，不代表真实模型的理解能力。
 """
@@ -22,11 +22,11 @@ WORKER = "你在为 Eve 独立完成一项委托的任务"
 TASKS = '{"kind":"eve.background_tasks"'
 ORCHESTRATION = {"dispatch_background_task", "list_background_tasks", "cancel_background_task", "run_subagent"}
 REPRODUCTION_TOOLS = {"manage_failure_reproduction"}
-CHAT_TOOLS = PLATFORM_TOOLS | {"echo"} | ORCHESTRATION | REPRODUCTION_TOOLS | {"create_subagent","list_subagents","delete_subagent"}
+CHAT_TOOLS = PLATFORM_TOOLS | {"echo", "task_progress", "manage_conversation_learning"} | ORCHESTRATION | REPRODUCTION_TOOLS | {"create_subagent","list_subagents","delete_subagent"}
 ASK = "帮我在后台把日志整理一下"
 DISPATCHED = "好，已经在后台处理，做完私聊你。"
 INSTRUCTIONS = "读取三份日志，统计错误条数，给出结论。"
-RESULT = "日志整理完毕：三份日志共 3 条错误。"
+RESULT = "工具调用已结束，尚未读取日志或核验错误条数。"
 STATUS = "刚才那个任务怎么样了"
 HOLD_SECONDS = 20
 
@@ -65,6 +65,10 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
     def worker_requests(self):
         return [r["body"] for r in self.kind("chat") if self.is_worker(r["body"])]
 
+    def worker_input(self, body):
+        """冻结验收条件附在原委派说明后；原任务正文不能被替换。"""
+        return self.text(body).split("\n\n宿主已冻结以下验收条件", 1)[0]
+
     def context(self, body):
         found = [m["content"] for m in body["messages"] if m["role"] == "system" and TASKS in m["content"]]
         self.assertLessEqual(len(found), 1)
@@ -99,12 +103,12 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
 
     def worker(self, body):
         """执行器替身：每步调用一次 echo，直到宿主不再提供工具时收尾。"""
-        self.assertEqual(self.text(body), "任务：整理日志\n\n" + INSTRUCTIONS)
+        self.assertEqual(self.worker_input(body), "任务：整理日志\n\n" + INSTRUCTIONS)
         roles = [m["role"] for m in body["messages"]]
         self.assertEqual(roles.count("user"), 1, "执行器看不到对话")
         if not body.get("tools"):
             return text_response(RESULT)
-        self.assertEqual(self.definitions(body), (PLATFORM_TOOLS - CONTEXT_RESET_TOOLS) | REPRODUCTION_TOOLS | {"echo"} | ({"run_subagent"} if self.worker_subagents else set()), "后台执行者可以委派叶子子代理与隔离复现，但不能再派发后台任务")
+        self.assertEqual(self.definitions(body), (PLATFORM_TOOLS - CONTEXT_RESET_TOOLS) | REPRODUCTION_TOOLS | {"echo", "task_progress", "manage_conversation_learning"} | ({"run_subagent"} if self.worker_subagents else set()), "后台执行者可以委派叶子子代理与隔离复现，但不能再派发后台任务")
         done = len(self.results(body))
         return calls((f"step-{done}", "echo", {"text": f"第 {done + 1} 步"}))
 
@@ -144,7 +148,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
                          lambda t: (t.get("notice") or {}).get("status") == "Delivered", "auxiliary notice missing")})
         [task] = self.tasks()
         self.assertEqual(task["usage"], {"tool_calls": 3, "model_requests": 4})
-        self.assertEqual(task["status"], "Completed")
+        self.assertEqual(task["status"], "Blocked", "echo 和模型收尾不能证明日志任务完成")
         self.assertEqual([r["model"] for r in self.worker_requests()], ["worker-small"] * 4)
         self.assertTrue(all(r["body"]["model"] != "worker-small" for r in self.kind("chat")
                             if not self.is_worker(r["body"])))
@@ -159,9 +163,10 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
                          "quiet": self.quiet})
         [task] = self.tasks()
         self.assertEqual((task["status"], task["spec"]["title"], task["spec"]["max_steps"]),
-                         ("Completed", "整理日志", 3))
+                         ("Blocked", "整理日志", 3))
         self.assertEqual(task["owner"]["user_id"], reminder_test.identity("user-1"))
-        self.assertEqual(task["result"], RESULT)
+        self.assertTrue(task["result"].startswith("任务尚未通过冻结验收："), task["result"])
+        self.assertIn(RESULT, task["result"])
         # 三步之后宿主不再提供工具：共 3 次工具调用、4 次模型请求，最后一次没有工具。
         self.assertEqual(task["usage"], {"tool_calls": 3, "model_requests": 4})
         workers = self.worker_requests()
@@ -173,26 +178,29 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.assertEqual(answered["state"]["eve.task"]["tasks.v1"]["tasks"][0]["id"], task["id"])
         [push] = self.pushes()
         self.assertEqual((push["id"], push["target_id"]), (task["id"], "user-1"))
-        self.assertEqual(push["text"], f"后台任务「整理日志」完成了：\n{RESULT}")
+        self.assertEqual(push["text"], f"后台任务「整理日志」等待补充信息或解除阻塞，已有步骤已保留：\n{task['result']}")
+        self.assertNotIn("完成了：", push["text"])
 
         # 之后再问：对话里能看到这个任务，模型按 ID 查看完整结果。
         def respond(body):
             if self.text(body) != STATUS:
                 return self.chat(body)
             [shown] = self.context(body)["tasks"]
-            self.assertEqual((shown["id"], shown["status"], shown["steps_used"]), (task["id"], "已完成", 3))
+            self.assertEqual((shown["id"], shown["status"], shown["steps_used"]),
+                             (task["id"], "等待补充信息或解除阻塞", 3))
             results = self.results(body)
             if not results:
                 return calls(("look", "list_background_tasks", {"task_id": task["id"]}))
             [result] = results
-            self.assertEqual(result["task"]["result"], RESULT)
-            return text_response("已经做完了：" + RESULT)
+            self.assertEqual(result["task"]["result"], task["result"])
+            self.assertTrue(result["task"]["blocked"])
+            return text_response("还未核验：" + RESULT)
         self.callback = respond
-        self.run_eve(self.send(self.message("status", STATUS, expected="已经做完了：" + RESULT)))
+        self.run_eve(self.send(self.message("status", STATUS, expected="还未核验：" + RESULT)))
         # 其他用户看不到这个任务。
         self.callback = lambda body: (self.assertIsNone(self.context(body)), self.chat(body))[1]
         self.run_eve(self.send(self.message("other", "你好", user="user-2", expected="嗯。")))
-        self.assertEqual(len(self.worker_requests()), 4, "完成的任务不重跑")
+        self.assertEqual(len(self.worker_requests()), 4, "没有验收条件的终态任务不在重启后自动重跑")
 
     def test_steps_above_the_configured_cap_are_refused_without_saving(self):
         def respond(body):
@@ -282,16 +290,16 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.assertIn(task["id"], push["text"])
         self.assertIn("查看已做步骤与剩余工作", push["text"])
 
-    def test_a_subagent_does_a_subtask_within_the_turn_and_hands_back_its_result(self):
+    def test_a_subagent_returns_real_tool_output_but_cannot_claim_unverified_completion(self):
         task = "查一下 echo 是否可用，给出结论。"
 
         def respond(body):
             if self.is_worker(body):
-                self.assertEqual(self.text(body), task)
+                self.assertEqual(self.worker_input(body), task)
                 self.assertEqual([m["role"] for m in body["messages"]].count("user"), 1, "子代理看不到对话")
                 if not body.get("tools"):
                     return text_response("echo 可用。")
-                self.assertEqual(self.definitions(body), (PLATFORM_TOOLS - CONTEXT_RESET_TOOLS) | REPRODUCTION_TOOLS | {"echo"})
+                self.assertEqual(self.definitions(body), (PLATFORM_TOOLS - CONTEXT_RESET_TOOLS) | REPRODUCTION_TOOLS | {"echo", "task_progress", "manage_conversation_learning"})
                 if not self.results(body):
                     return calls(("probe", "echo", {"text": "ping"}))
                 [echoed] = self.results(body)
@@ -302,11 +310,18 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
             if not results:
                 return calls(("delegate", "run_subagent", {"task": task, "max_steps": 2}))
             [result] = results
-            self.assertEqual(result, {"completed": True, "result": "echo 可用。", "include_context": False,
-                                      "usage": {"steps_used": 1, "max_steps": 2, "model_requests": 2, "shared_steps_used": 2,"shared_steps_remaining":98,"agent_id":"general"}})
-            return text_response("子代理查过了：echo 可用。")
+            self.assertFalse(result["completed"])
+            self.assertTrue(result["blocked"])
+            self.assertFalse(result["include_context"])
+            self.assertIn("echo 可用。", result["result"])
+            self.assertIn("宿主验收未通过", result["result"])
+            self.assertEqual(result["usage"], {"steps_used": 1, "max_steps": 2, "model_requests": 2,
+                                               "shared_steps_used": 2, "shared_steps_remaining": 98,
+                                               "agent_id": "general"})
+            return text_response("子代理取得了 echo 回执，结果尚未通过宿主验收。")
         self.callback = respond
-        self.run_eve(self.send(self.message("ask", "帮我确认一下 echo 能不能用", expected="子代理查过了：echo 可用。")))
+        self.run_eve(self.send(self.message("ask", "帮我确认一下 echo 能不能用",
+                                           expected="子代理取得了 echo 回执，结果尚未通过宿主验收。")))
         self.assertEqual(len(self.worker_requests()), 2)
         self.assertEqual(self.tasks(), [], "子代理不进入后台任务账本")
 
@@ -315,10 +330,13 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.response_gates[('chat', 2)] = 'release-shared-model'
         def respond(body):
             if self.is_worker(body):
-                return text_response('checked ' + self.text(body))
+                self.assertFalse(body.get("tools"), "纯文本合同不得向执行者开放工具")
+                return text_response('checked ' + self.worker_input(body))
             results = self.results(body)
             if not results:
-                return calls(*[(f'limited-{i}', 'run_subagent', {'task': f'check-{i}'}) for i in range(3)])
+                return calls(*[(f'limited-{i}', 'run_subagent', {
+                    'task': f'check-{i}', 'verification': {'kind': 'text',
+                        'required_fragments': [f'checked check-{i}']}}) for i in range(3)])
             self.assertEqual(len(results), 3)
             self.assertTrue(all(result['completed'] for result in results))
             return text_response('三个子代理完成')
@@ -344,6 +362,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         self.assertEqual(len(self.kind('chat')), 5)
 
     def _exercise_ten_subagents(self, **options):
+        import memory_test
         condition = threading.Condition()
         entered = []
         active = peak = 0
@@ -353,28 +372,59 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
                 with condition:
                     active += 1
                     peak = max(peak, active)
-                    entered.append(self.text(body))
+                    self.assertFalse(body.get("tools"), "纯文本合同不得向执行者开放工具")
+                    entered.append(self.worker_input(body))
                     condition.notify_all()
-                    target = ((len(entered) - 1) // 5 + 1) * 5
-                    try:
-                        self.assertTrue(condition.wait_for(lambda: len(entered) >= target, timeout=12),
-                                        "五并发模型槽下的十个子代理未能全部推进")
-                    finally:
+                try:
+                    self.assertTrue(self.release.wait(20), "等待验收模型准入队列后再放行")
+                finally:
+                    with condition:
                         active -= 1
-                return text_response("checked " + self.text(body))
+                return text_response("checked " + self.worker_input(body))
             results = self.results(body)
             if not results:
-                return calls(*[(f"parallel-{i}", "run_subagent", {"task": f"check-{i}"}) for i in range(10)])
+                return calls(*[(f"parallel-{i}", "run_subagent", {
+                    "task": f"check-{i}", "verification": {"kind": "text",
+                        "required_fragments": [f"checked check-{i}"]}}) for i in range(10)])
             self.assertEqual(len(results), 10)
             self.assertTrue(all(result["completed"] for result in results))
             return text_response("十个子代理全部完成")
         self.callback = respond
-        self.run_eve(self.send(self.message("parallel", "并行核对十项", expected="十个子代理全部完成")), **options)
+        def inspect_queue():
+            def admission():
+                status, data = memory_test.MemoryAcceptance.panel(self, '/api/readiness')
+                self.assertEqual(status, 200, data)
+                return next(role['admission'] for role in data['roles'] if role['role'] == 'task')
+            try:
+                self.wait_for(lambda: len(self.worker_requests()) >= 5,
+                              '前五个子代理没有进入模型槽', 10)
+                observed = admission()
+                if observed is None:
+                    # 旧无角色配置没有逐角色准入遥测；冻结首批真实 HTTP 请求期间，第六个不能进入。
+                    self.quiet()
+                else:
+                    self.wait_for(lambda: (admission() or {}).get('waiting') == 5,
+                                  '十个子代理没有在共用的五个模型槽前正确排队', 10)
+                    observed = admission()
+                    self.assertEqual((observed['active'], observed['waiting'], observed['observed_limit']),
+                                     (5, 5, 5))
+                self.assertEqual(len(self.worker_requests()), 5, '另外五个子代理尚未向模型发请求')
+            finally:
+                self.release.set()
+        message = self.message("parallel", "并行核对十项", expected="十个子代理全部完成")
+        self.run_eve([{'send': message}, *self.checkpoint('model-queue'), self.wait_reply(message['id']),
+                      self.wait_receipt(message['id'])], panel=True,
+                     checkpoints={'model-queue': inspect_queue}, **options)
         self.assertEqual(len(entered), 10)
         self.assertEqual(peak, 5, "全部子代理共用五个模型请求槽")
 
     def test_ten_subagents_execute_concurrently_in_one_tool_batch(self):
         self._exercise_ten_subagents()
+
+    def test_default_primary_model_limit_has_five_active_and_five_waiting(self):
+        self._exercise_ten_subagents(env_extra={
+            'EVE_OPENAI_MODEL_ROLE': 'primary', 'EVE_MODELS_PRIMARY_ENABLED': 'true',
+            'EVE_MODELS_PRIMARY_PROVIDER': 'openai', 'EVE_MODELS_PRIMARY_MODEL': 'parallel-primary'})
 
     def test_legacy_primary_limit_ten_is_capped_at_five_and_all_children_complete(self):
         self._exercise_ten_subagents(env_extra={
@@ -385,22 +435,27 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
     def test_subagents_can_run_serially_with_the_previous_result_as_input(self):
         def respond(body):
             if self.is_worker(body):
-                return text_response("first-result" if self.text(body) == "first" else "second-result")
+                self.assertFalse(body.get("tools"), "纯文本合同不得向执行者开放工具")
+                return text_response("first-result" if self.worker_input(body) == "first" else "second-result")
             results = self.results(body)
             if not results:
-                return calls(("serial-1", "run_subagent", {"task": "first"}))
+                return calls(("serial-1", "run_subagent", {"task": "first", "verification": {
+                    "kind": "text", "required_fragments": ["first-result"]}}))
             if len(results) == 1:
                 self.assertEqual(results[0]["result"], "first-result")
-                return calls(("serial-2", "run_subagent", {"task": "use first-result"}))
+                self.assertTrue(results[0]["completed"])
+                return calls(("serial-2", "run_subagent", {"task": "use first-result", "verification": {
+                    "kind": "text", "required_fragments": ["second-result"]}}))
             self.assertEqual(results[1]["result"], "second-result")
+            self.assertTrue(results[1]["completed"])
             return text_response("串行完成")
         self.callback = respond
         self.run_eve(self.send(self.message("serial", "依次核对", expected="串行完成")))
-        self.assertEqual([self.text(r) for r in self.worker_requests()], ["first", "use first-result"])
+        self.assertEqual([self.worker_input(r) for r in self.worker_requests()], ["first", "use first-result"])
 
     def test_both_are_off_by_default(self):
         def respond(body):
-            self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo"})
+            self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo", "manage_conversation_learning"})
             self.assertIsNone(self.context(body))
             return text_response("我现在不能派发后台任务。")
         self.callback = respond
@@ -410,7 +465,7 @@ class BackgroundTaskAcceptance(reminder_test.ReminderAcceptance):
         env = {key: os.environ[key] for key in ("PATH", "SystemRoot", "TEMP", "TMP") if key in os.environ}
         env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret",
                    EVE_TASK_DEFAULT_STEPS="300", EVE_TASK_MAX_STEPS="200")
-        result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
+        result = subprocess.run([str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "refused"),
                                  "--agent", str(ROOT / "AGENT.md"), "--background-tasks"],
                                 env=configure_fixture_progress(env), capture_output=True, text=True, timeout=60)
         self.assertNotEqual(result.returncode, 0, "默认步数大于上限时拒绝启动")

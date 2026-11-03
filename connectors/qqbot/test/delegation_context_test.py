@@ -55,6 +55,7 @@ class DelegationContextAcceptance(developer.DeveloperAcceptance):
                 return text_response("背景已收到")
             if not self.results(body):
                 arguments = {"title":"核查", "instructions":"核查背景并交付结论"} if tool == "dispatch_background_task" else {"task":"核查背景并交付结论"}
+                arguments["verification"] = {"kind":"text", "required_fragments":["委派核查完成"]}
                 if include:
                     arguments["include_context"] = True
                 return calls(("delegate", tool, arguments))

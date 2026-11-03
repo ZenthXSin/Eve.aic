@@ -17,6 +17,7 @@ struct Inner {
     sources: HashMap<String, QqInteractionSource>,
     identities: HashMap<String, QqConversationIdentity>,
     turn_anchors: HashMap<String, QqTurnAnchor>,
+    review_anchors: HashMap<String, String>,
     order: VecDeque<String>,
     idle: bool,
     wakeup_claimed: bool,
@@ -62,6 +63,7 @@ pub struct QqTurnAnchor {
 #[derive(Clone, Default)]
 pub struct QqConversations {
     inner: Arc<Mutex<Inner>>,
+    review: crate::trusted_review::TrustedReview,
 }
 pub struct QqWakeupLease(QqConversations);
 impl Drop for QqWakeupLease {
@@ -159,6 +161,9 @@ impl QqConversations {
         {
             return Ok(());
         }
+        inner
+            .review_anchors
+            .insert(session.session_id.clone(), last.id.clone());
         inner.turn_anchors.insert(session.session_id, anchor);
         Ok(())
     }
@@ -183,7 +188,133 @@ impl QqConversations {
             })
         {
             inner.turn_anchors.remove(&session.session_id);
+            inner.review_anchors.remove(&session.session_id);
         }
+        Ok(())
+    }
+
+    pub(crate) fn attach_review_archive(
+        &self,
+        ctx: &eve_plugin_api::PluginContext,
+        backend: Option<Arc<dyn crate::QqReceiptArchive>>,
+    ) -> PluginResult<()> {
+        self.review.attach(ctx, backend)
+    }
+    pub(crate) fn record_original(
+        &self,
+        ctx: &eve_plugin_api::PluginContext,
+        app: &str,
+        message: &crate::Message,
+        original: Option<String>,
+    ) -> PluginResult<()> {
+        self.review.record(ctx, app, message, original)
+    }
+    pub(crate) fn incoming_originals(
+        &self,
+        app: &str,
+        message: &crate::Message,
+    ) -> PluginResult<Vec<String>> {
+        self.review
+            .read(app, &message.session_key(app)?, &message.id)
+    }
+    /// 原始正文来自平台认证入口。严格核对完整身份和本轮消息锚点；历史加工与摘要不参与授权。
+    pub fn review_user_messages(
+        &self,
+        scope: &eve_llm_api::ContextScope,
+    ) -> PluginResult<Vec<String>> {
+        let (identity, id) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| PluginError::State("QQ 审核原文目录不可用".into()))?;
+            let invalid = || PluginError::State("QQ 审核原文缺少可信当前轮次锚点".into());
+            let identity = inner
+                .identities
+                .get(&scope.session_id)
+                .filter(|v| {
+                    v.session.session_id == scope.session_id && v.session.user_id == scope.user_id
+                })
+                .ok_or_else(invalid)?;
+            let anchor = inner
+                .turn_anchors
+                .get(&scope.session_id)
+                .filter(|a| {
+                    a.session == identity.session
+                        && a.conversation == identity.conversation
+                        && a.speaker_id == identity.user_id
+                })
+                .ok_or_else(invalid)?;
+            let id = inner
+                .review_anchors
+                .get(&scope.session_id)
+                .or_else(|| anchor.message_ids.last())
+                .ok_or_else(invalid)?;
+            (identity.clone(), id.clone())
+        };
+        self.review.read(&identity.app_id, &identity.session, &id)
+    }
+    /// 控制宿主或批次指定的平台消息 ID；数据库验证此 ID 的完整可信身份，禁止改读最新消息。
+    pub fn review_user_messages_at(
+        &self,
+        scope: &eve_llm_api::ContextScope,
+        message_id: &str,
+    ) -> PluginResult<Vec<String>> {
+        if !crate::state::valid_message_id(message_id) {
+            return Err(PluginError::State("QQ 审核消息锚点无效".into()));
+        }
+        let identity = self
+            .identity(
+                &SessionKey::new(&scope.session_id, &scope.user_id)
+                    .map_err(|_| PluginError::State("QQ 审核身份无效".into()))?,
+            )?
+            .ok_or_else(|| PluginError::State("QQ 审核缺少平台身份".into()))?;
+        self.review
+            .read(&identity.app_id, &identity.session, message_id)
+    }
+    /// 核对审核锚点仍是完整可信会话最新接收的消息；排队中的新消息也会令旧审核失效。
+    /// 直接读取原文库顺序，不依赖当前轮次或实时引导是否已消费该消息。
+    pub fn review_user_message_is_current(
+        &self,
+        scope: &eve_llm_api::ContextScope,
+        anchor: &str,
+    ) -> PluginResult<bool> {
+        if !crate::state::valid_message_id(anchor) {
+            return Err(PluginError::State("QQ 审核消息锚点无效".into()));
+        }
+        let session = SessionKey::new(&scope.session_id, &scope.user_id)
+            .map_err(|_| PluginError::State("QQ 审核身份无效".into()))?;
+        let identity = self
+            .identity(&session)?
+            .ok_or_else(|| PluginError::State("QQ 审核缺少平台身份".into()))?;
+        self.review.is_current(&identity.app_id, &session, anchor)
+    }
+    /// 仅在实时引导已保存且即将对模型可见时推进审核锚点；后到的排队消息不改变旧轮原话。
+    pub(crate) fn advance_review_anchor(
+        &self,
+        app: &str,
+        message: &crate::Message,
+    ) -> PluginResult<()> {
+        let session = message.session_key(app)?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| PluginError::State("QQ 审核原文目录不可用".into()))?;
+        if !inner
+            .turn_anchors
+            .get(&session.session_id)
+            .is_some_and(|anchor| {
+                anchor.session == session
+                    && anchor.speaker_id == message.user_id
+                    && message
+                        .conversation_key(app)
+                        .is_ok_and(|key| key == anchor.conversation)
+            })
+        {
+            return Err(PluginError::State("QQ 实时原文缺少本轮锚点".into()));
+        }
+        inner
+            .review_anchors
+            .insert(session.session_id, message.id.clone());
         Ok(())
     }
 
@@ -336,6 +467,7 @@ impl QqConversations {
                     inner.sources.remove(&oldest);
                     inner.identities.remove(&oldest);
                     inner.turn_anchors.remove(&oldest);
+                    inner.review_anchors.remove(&oldest);
                 }
             }
         }

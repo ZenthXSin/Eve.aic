@@ -304,7 +304,8 @@ class ContinuousTrial:
         for item in rounds:
             message = {'id': item['id'], 'scope': item.get('scope', 'c2c'),
                        'user_id': item.get('user', 'user-1'), 'target_id': item.get('target', item.get('user', 'user-1')),
-                       'text': item['text'], 'accept_any': True, **item.get('message_options', {})}
+                       'text': item['text'], 'original_text': item['text'],
+                       'accept_any': True, **item.get('message_options', {})}
             steps.extend(self.expand(item.get('before_steps', [])))
             steps.append({'send': message})
             steps.extend(self.expand(item.get('after_send_steps', [])))

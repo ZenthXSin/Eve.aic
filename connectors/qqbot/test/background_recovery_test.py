@@ -1,4 +1,5 @@
 """真实 QQ 进程故障恢复：实际命令只执行一次，检查点接续沿用预算和授权。"""
+import hashlib
 import json
 import sys
 import threading
@@ -19,6 +20,25 @@ class BackgroundRecoveryAcceptance(context.DelegationContextAcceptance):
         super().setUp()
         self.hold = threading.Event()
         self.hold_after_command = True
+        self.once_command = {"program": sys.executable, "args": ["-c",
+            "from pathlib import Path; p=Path('once.txt'); p.write_text(p.read_text()+'x' if p.exists() else 'x'); "
+            "assert p.read_text() == 'x', 'command replayed or artifact invalid'; print('ACTUAL_SAVED_RECEIPT')"]}
+        self.inflight_command = {"program": sys.executable, "args": ["-c",
+            "from pathlib import Path; import time; p=Path('once.txt'); p.write_text(p.read_text()+'x' if p.exists() else 'x'); time.sleep(2)"]}
+        self.readback = {"path": "once.txt", "offset": 0}
+        self.expected_hash = hashlib.sha256(b"x").hexdigest()
+        self.verification = {"kind": "receipts", "contract": {"checks": [{
+            "tool": "read_file", "arguments": self.readback,
+            "output_pointer": "/sha256", "expected": self.expected_hash}], "require_final_batch": True}}
+
+    def review_reply(self, request):
+        self.assertTrue(request["delegated"])
+        self.assertEqual(request["program"], sys.executable)
+        self.assertIn(request["arguments"], [self.once_command["args"], self.inflight_command["args"]])
+        self.assertEqual(request["workspace"], str(self.source.resolve()))
+        self.assertTrue(any("派发恢复任务" in text for text in request["user_messages"]))
+        return {"risk": "medium", "authorization": "high", "outcome": "allow",
+                "rationale": "隔离验收仅执行固定命令并保留原任务授权和执行回执"}
 
     def tearDown(self):
         self.hold.set()
@@ -30,17 +50,21 @@ class BackgroundRecoveryAcceptance(context.DelegationContextAcceptance):
                 return text_response("背景已收到")
             if not self.results(body):
                 return calls(("dispatch", "dispatch_background_task", {
-                    "title":"恢复验收", "instructions":"执行一次命令，检查结果后完成。", "max_steps":1,
-                    "include_context":True}))
+                    "title":"恢复验收", "instructions":"执行一次命令，再读取 once.txt 核对内容哈希后完成。", "max_steps":2,
+                    "include_context":True, "verification":self.verification}))
             self.assertTrue(self.results(body)[-1]["dispatched"])
             return text_response("后台已派发")
         self.assertIn("FROZEN_PARENT_561", self.text(body))
         self.assertNotIn("AFTER_SNAPSHOT_874", self.text(body))
         if not self.results(body):
-            return calls(("actual-once", "run_command", {"program":sys.executable, "args":["-c",
-                "from pathlib import Path; p=Path('once.txt'); p.write_text(p.read_text()+'x' if p.exists() else 'x'); print('ACTUAL_SAVED_RECEIPT')"]}))
-        self.assertFalse(body.get("tools"), "恢复不能补充已耗尽的一步预算")
+            return calls(("actual-once", "run_command", self.once_command))
         self.assertIn("ACTUAL_SAVED_RECEIPT", json.dumps(self.results(body)))
+        if len(self.results(body)) == 1:
+            return calls(("verify-once", "read_file", self.readback))
+        self.assertEqual(len(self.results(body)), 2)
+        self.assertEqual(self.results(body)[-1]["sha256"], self.expected_hash)
+        self.assertEqual(self.results(body)[-1]["content"], "x")
+        self.assertFalse(body.get("tools"), "恢复不能补充已耗尽的两步预算")
         if self.hold_after_command:
             self.hold.wait(20)
         return text_response("恢复验收完成，命令仅执行一次")
@@ -50,9 +74,9 @@ class BackgroundRecoveryAcceptance(context.DelegationContextAcceptance):
         stop = self.gate("stop-checkpoint")
         def inspect():
             self.wait_for(lambda: (self.source / "once.txt").exists() and any(
-                t.get("execution", {}).get("checkpoint", {}).get("used_tool_calls") == 1
+                t.get("execution", {}).get("checkpoint", {}).get("used_tool_calls") == 2
                 and not t["execution"]["checkpoint"]["pending_calls"]
-                and t["execution"]["checkpoint"]["provider_requests"] >= 2 for t in self.tasks()),
+                and t["execution"]["checkpoint"]["provider_requests"] >= 3 for t in self.tasks()),
                 "safe checkpoint not saved", 20)
         self.enabled([*self.send(self.message("fact", "FROZEN_PARENT_561", expected="背景已收到")),
                       *self.send(self.message("dispatch", "派发恢复任务", expected="后台已派发")),
@@ -63,6 +87,9 @@ class BackgroundRecoveryAcceptance(context.DelegationContextAcceptance):
         self.hold_after_command = False
         [task] = self.tasks()
         self.assertEqual(task["status"], "Running")
+        self.assertEqual(task["spec"]["max_steps"], 2)
+        self.assertEqual(task["execution"]["checkpoint"]["used_tool_calls"], 2)
+        self.assertEqual(task["execution"]["checkpoint"]["provider_requests"], 3)
         self.assertEqual((self.source / "once.txt").read_text(), "x")
         return task
 
@@ -86,9 +113,14 @@ class BackgroundRecoveryAcceptance(context.DelegationContextAcceptance):
                       *self.checkpoint("resumed")], checkpoints={"resumed":self.wait_finished})
         [task] = self.tasks()
         self.assertEqual(task["id"], before["id"])
-        self.assertEqual(task["usage"]["tool_calls"], 1)
+        self.assertEqual(task["spec"]["max_steps"], before["spec"]["max_steps"])
+        self.assertEqual(task["usage"]["tool_calls"], 2)
+        self.assertEqual(task["usage"]["model_requests"], before["execution"]["checkpoint"]["provider_requests"] + 1)
+        self.assertEqual(task["execution"]["checkpoint"]["used_tool_calls"], 2)
         self.assertEqual(task["execution"]["recoveries"], 1)
         self.assertEqual(task["execution"]["deadline_at_ms"], before["execution"]["deadline_at_ms"])
+        self.assertEqual(task["execution"]["completion_contract"], self.verification)
+        self.assertEqual(task["execution"]["completion_contract"], before["execution"]["completion_contract"])
         self.assertEqual(task["spec"]["context"], before["spec"]["context"])
         self.assertEqual((self.source / "once.txt").read_text(), "x")
         self.assertEqual(self.receipt("dispatch")["state"], "Sent")
@@ -98,7 +130,7 @@ class BackgroundRecoveryAcceptance(context.DelegationContextAcceptance):
         self.callback = self.callback_for_task
         def status(kind, number):
             body = self.requests[-1]["body"]
-            if kind == "chat" and self.is_worker(body) and self.results(body) and not self.tasks()[0]["execution"]["recoveries"]:
+            if kind == "chat" and self.is_worker(body) and len(self.results(body)) == 2 and not self.tasks()[0]["execution"]["recoveries"]:
                 return 503
             return 200
         self.http_status = status
@@ -107,7 +139,10 @@ class BackgroundRecoveryAcceptance(context.DelegationContextAcceptance):
                       *self.checkpoint("resumed")], checkpoints={"resumed":self.wait_finished}, timeout=60)
         [task] = self.tasks()
         self.assertEqual(task["execution"]["recoveries"], 1)
-        self.assertEqual(task["usage"]["tool_calls"], 1)
+        self.assertEqual(task["usage"]["tool_calls"], 2)
+        self.assertEqual(task["execution"]["checkpoint"]["used_tool_calls"], 2)
+        self.assertEqual(task["spec"]["max_steps"], 2)
+        self.assertEqual(task["execution"]["completion_contract"], self.verification)
         self.assertEqual((self.source / "once.txt").read_text(), "x")
 
     def test_revoked_admin_is_not_allowed_to_resume_tools_or_model(self):
@@ -119,7 +154,7 @@ class BackgroundRecoveryAcceptance(context.DelegationContextAcceptance):
         self.enabled(self.checkpoint("revoked"), checkpoints={"revoked":lambda:self.wait_finished("Failed")})
         [task] = self.tasks()
         self.assertIn("授权已失效", task["failure"])
-        self.assertEqual(task["usage"]["tool_calls"], 1)
+        self.assertEqual(task["usage"]["tool_calls"], 2)
         self.assertEqual(len(self.requests), count)
         self.assertEqual((self.source / "once.txt").read_text(), "x")
         self.assertEqual(task["spec"]["max_steps"], before["spec"]["max_steps"])
@@ -129,8 +164,7 @@ class BackgroundRecoveryAcceptance(context.DelegationContextAcceptance):
         def respond(body):
             if self.is_worker(body):
                 self.assertFalse(self.results(body))
-                return calls(("in-flight", "run_command", {"program":sys.executable, "args":["-c",
-                    "from pathlib import Path; import time; p=Path('once.txt'); p.write_text(p.read_text()+'x' if p.exists() else 'x'); time.sleep(2)"]}))
+                return calls(("in-flight", "run_command", self.inflight_command))
             return base(body)
         self.callback = respond
         stop = self.gate("stop-tool")
@@ -140,10 +174,12 @@ class BackgroundRecoveryAcceptance(context.DelegationContextAcceptance):
                      checkpoints={"in-flight":lambda:self.wait_for(lambda:(self.source / "once.txt").exists(), "command did not start", 20)},
                      stop_at=stop)
         count = len(self.requests)
-        self.enabled(self.checkpoint("stopped"), checkpoints={"stopped":lambda:self.wait_finished("Interrupted")})
+        self.enabled(self.checkpoint("stopped"), checkpoints={"stopped":lambda:self.wait_finished("Blocked")})
         self.assertEqual(len(self.requests), count)
         self.assertEqual((self.source / "once.txt").read_text(), "x")
         [task] = self.tasks()
+        self.assertEqual(task["status"], "Blocked")
+        self.assertIn("unknown_tool_effect_not_replayed", task["result"])
         self.assertTrue(task["execution"]["checkpoint"]["pending_calls"])
 
     def test_repeated_provider_failure_stops_after_three_recoveries(self):

@@ -271,7 +271,7 @@ impl Tool for SavePreferenceTool {
         Box::pin(async move {
             self.validate_arguments(&call.arguments)
                 .map_err(|_| failed("工具参数无效"))?;
-            let current = scope(&context)?;
+            let current = scope(&context, self.services.channel.as_deref())?;
             let level = call.arguments["scope"].as_str().unwrap_or_default();
             let text = call.arguments["text"].as_str().unwrap_or_default();
             if validate_text(text, MAX_PREFERENCE_BYTES).is_err()

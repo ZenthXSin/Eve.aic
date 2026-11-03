@@ -84,6 +84,413 @@ async fn chat_auth_and_identity_validation_precede_optional_execution() {
 }
 
 #[tokio::test]
+async fn notifications_require_auth_and_reject_invalid_input_before_optional_service() {
+    let service = Arc::new(Service::default());
+    let panel = panel(service.clone()).await;
+    let client = client();
+    for path in [
+        "/api/notifications",
+        "/api/notifications?before=0&user_id=other",
+    ] {
+        assert_code(
+            client.get(url(&panel, path)).send().await.unwrap(),
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        )
+        .await;
+    }
+    for body in [json!({"id": 1}), json!({"id": 0, "user_id": "other"})] {
+        assert_code(
+            client
+                .post(url(&panel, "/api/notifications/read"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        )
+        .await;
+    }
+    for query in [
+        "before=0",
+        "before=-1",
+        "before=bad",
+        "before=2&before=1",
+        "limit=0",
+        "limit=101",
+        "limit=1&limit=2",
+        "user_id=other",
+        "session_id=web%3Aother",
+    ] {
+        assert_code(
+            client
+                .get(url(&panel, &format!("/api/notifications?{query}")))
+                .bearer_auth(TOKEN)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+        )
+        .await;
+    }
+    for (body, code) in [
+        (json!({"id": 0}), "invalid_input"),
+        (json!({}), "invalid_json"),
+        (json!({"id": -1}), "invalid_json"),
+        (json!({"id": "1"}), "invalid_json"),
+        (json!({"id": 1, "user_id": "other"}), "invalid_json"),
+        (json!({"id": 1, "session_id": "web:other"}), "invalid_json"),
+        (json!({"id": 1, "read_at_ms": 100}), "invalid_json"),
+    ] {
+        assert_code(
+            client
+                .post(url(&panel, "/api/notifications/read"))
+                .bearer_auth(TOKEN)
+                .json(&body)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            code,
+        )
+        .await;
+    }
+    for body in [r#"{"id":1,"id":2}"#, r#"{"id":18446744073709551616}"#] {
+        assert_code(
+            client
+                .post(url(&panel, "/api/notifications/read"))
+                .bearer_auth(TOKEN)
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            "invalid_json",
+        )
+        .await;
+    }
+    assert_code(
+        client
+            .post(url(&panel, "/api/notifications/read"))
+            .bearer_auth(TOKEN)
+            .header("Content-Type", "text/plain")
+            .body(r#"{"id":1}"#)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "json_required",
+    )
+    .await;
+    for (method, path) in [
+        (Method::POST, "/api/notifications"),
+        (Method::DELETE, "/api/notifications"),
+        (Method::GET, "/api/notifications/read"),
+    ] {
+        let response = client
+            .request(method, url(&panel, path))
+            .bearer_auth(TOKEN)
+            .json(&json!({"id": 1}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+    // 旧宿主没有收件箱实现时明确不可用，不把未装配能力当成空收件箱。
+    assert_code(
+        client
+            .get(url(&panel, "/api/notifications?limit=100&before=2"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+    )
+    .await;
+    assert_code(
+        client
+            .post(url(&panel, "/api/notifications/read"))
+            .bearer_auth(TOKEN)
+            .json(&json!({"id": 1}))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+    )
+    .await;
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+    panel.stop().await.unwrap();
+}
+
+struct Notifications {
+    calls: Mutex<Vec<String>>,
+    items: Mutex<Vec<Notification>>,
+}
+impl PanelService for Notifications {
+    fn status(&self) -> PanelResult<PanelStatus> {
+        Err(PanelError::Unavailable)
+    }
+    fn sessions(&self, _: Option<&str>, _: usize) -> PanelResult<Page<SessionSummary>> {
+        Err(PanelError::Unavailable)
+    }
+    fn tasks(&self, _: Option<&str>, _: usize) -> PanelResult<Page<TaskSummary>> {
+        Err(PanelError::Unavailable)
+    }
+    fn session(&self, _: &SessionKey, _: Option<u64>, _: usize) -> PanelResult<SessionDetail> {
+        Err(PanelError::Unavailable)
+    }
+    fn cancel(&self, _: &GenerationKey) -> PanelResult<CancelStatus> {
+        Err(PanelError::Unavailable)
+    }
+    fn notifications(&self, before: Option<u64>, limit: usize) -> PanelResult<NotificationPage> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("list:{before:?}:{limit}"));
+        let items = self.items.lock().unwrap();
+        let mut selected: Vec<_> = items
+            .iter()
+            .filter(|item| before.is_none_or(|before| item.id < before))
+            .cloned()
+            .collect();
+        let has_more = selected.len() > limit;
+        selected.truncate(limit);
+        let next_before = if has_more {
+            selected.last().map(|item| item.id)
+        } else {
+            None
+        };
+        Ok(NotificationPage {
+            items: selected,
+            next_before,
+            unread: items
+                .iter()
+                .filter(|item| item.read_at_ms.is_none())
+                .count(),
+        })
+    }
+    fn mark_notification_read(&self, id: u64) -> PanelResult<bool> {
+        self.calls.lock().unwrap().push(format!("read:{id}"));
+        let mut items = self.items.lock().unwrap();
+        let item = items
+            .iter_mut()
+            .find(|item| item.id == id)
+            .ok_or(PanelError::NotFound)?;
+        let updated = item.read_at_ms.is_none();
+        item.read_at_ms.get_or_insert(300);
+        Ok(updated)
+    }
+}
+
+#[tokio::test]
+async fn notification_pages_preserve_content_and_only_explicit_read_changes_unread() {
+    let service = Arc::new(Notifications {
+        calls: Mutex::new(vec![]),
+        items: Mutex::new(
+            [2, 1]
+                .into_iter()
+                .map(|id| Notification {
+                    id,
+                    session_id: "web:owner:test".into(),
+                    source_id: format!("task-{id}"),
+                    kind: "task".into(),
+                    status: "completed".into(),
+                    title: "任务结果".into(),
+                    body: "正文\n<script>不是聊天回执</script>".into(),
+                    truncated: id == 1,
+                    created_at_ms: id * 100,
+                    read_at_ms: None,
+                })
+                .collect(),
+        ),
+    });
+    let panel = LocalPanel::bind(
+        PanelConfig {
+            address: "127.0.0.1:0".parse().unwrap(),
+            token: TOKEN.into(),
+        },
+        service.clone(),
+    )
+    .await
+    .unwrap();
+    let client = client();
+    assert_code(
+        client
+            .get(url(&panel, "/api/notifications"))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+    )
+    .await;
+    assert_code(
+        client
+            .get(url(&panel, "/api/notifications?before=0"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::BAD_REQUEST,
+        "invalid_query",
+    )
+    .await;
+    assert_code(
+        client
+            .post(url(&panel, "/api/notifications/read"))
+            .bearer_auth(TOKEN)
+            .header("Origin", "https://other.example")
+            .json(&json!({"id": 2}))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::FORBIDDEN,
+        "invalid_origin",
+    )
+    .await;
+    assert!(service.calls.lock().unwrap().is_empty());
+    let response = client
+        .get(url(&panel, "/api/notifications?limit=1"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let body = response.json::<Value>().await.unwrap();
+    assert_eq!(
+        body,
+        json!({
+            "items": [{
+                "id": 2, "session_id": "web:owner:test", "source_id": "task-2",
+                "kind": "task", "status": "completed", "title": "任务结果",
+                "body": "正文\n<script>不是聊天回执</script>", "truncated": false,
+                "created_at_ms": 200, "read_at_ms": null,
+            }],
+            "next_before": 2, "unread": 2,
+        })
+    );
+    assert!(
+        service
+            .items
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|item| item.read_at_ms.is_none())
+    );
+    // 已装配服务也不能被未授权已读请求或伪造身份字段调用。
+    assert_code(
+        client
+            .post(url(&panel, "/api/notifications/read"))
+            .json(&json!({"id": 2}))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+    )
+    .await;
+    assert_code(
+        client
+            .post(url(&panel, "/api/notifications/read"))
+            .bearer_auth(TOKEN)
+            .json(&json!({"id": 2, "user_id": "other"}))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::BAD_REQUEST,
+        "invalid_json",
+    )
+    .await;
+    assert_eq!(*service.calls.lock().unwrap(), vec!["list:None:1"]);
+    for updated in [true, false] {
+        let response = client
+            .post(url(&panel, "/api/notifications/read"))
+            .bearer_auth(TOKEN)
+            .json(&json!({"id": 2}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"updated": updated})
+        );
+    }
+    assert_code(
+        client
+            .post(url(&panel, "/api/notifications/read"))
+            .bearer_auth(TOKEN)
+            .json(&json!({"id": 99}))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::NOT_FOUND,
+        "not_found",
+    )
+    .await;
+    let body = client
+        .get(url(&panel, "/api/notifications?before=2&limit=1"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(body["items"][0]["id"], 1);
+    assert_eq!(body["items"][0]["truncated"], true);
+    assert_eq!(body["items"][0]["read_at_ms"], Value::Null);
+    assert_eq!(body["next_before"], Value::Null);
+    assert_eq!(body["unread"], 1);
+    let empty = client
+        .get(url(&panel, "/api/notifications?before=1"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(
+        empty,
+        json!({"items": [], "next_before": null, "unread": 1})
+    );
+    let latest = client
+        .get(url(&panel, "/api/notifications"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(latest["items"][0]["read_at_ms"], 300);
+    assert_eq!(latest["unread"], 1);
+    assert_eq!(service.items.lock().unwrap()[0].read_at_ms, Some(300));
+    assert_eq!(
+        *service.calls.lock().unwrap(),
+        vec![
+            "list:None:1",
+            "read:2",
+            "read:2",
+            "read:99",
+            "list:Some(2):1",
+            "list:Some(1):25",
+            "list:None:25",
+        ]
+    );
+    panel.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn extension_endpoints_require_authentication_and_validate_before_optional_services() {
     let service = Arc::new(Service::default());
     let panel = panel(service.clone()).await;

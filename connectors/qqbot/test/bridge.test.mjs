@@ -161,17 +161,17 @@ test("主动消息的并发重复命令不再次请求 SDK，也不覆盖原回�
   assert.equal(f.frames.at(-1).ok, true);
 });
 
-test("正文虽未超限但转义后超过 JSONL 上限的消息不发给 Rust，后续仍可接收", () => {
+test("完整原话使合法正文转义超过旧帧上限时仍完整交给 Rust", () => {
   const f = fixture();
   const text = "x" + "\0".repeat(12000);
   assert.ok(Buffer.byteLength(text) < 32768);
   assert.ok(Buffer.byteLength(JSON.stringify(text)) > MAX_FRAME);
   f.handlers.get("message")({}, { kind: "c2c", messageId: "oversized-wire", senderId: "user-1", content: text,
     replyTarget: { scope: "c2c", targetId: "user-1", msgId: "oversized-wire" } });
-  assert.equal(f.frames.some(x => x.type === "message"), false);
-  assert.ok(f.frames.some(x => x.code === "frame_limit"));
-  f.message("c2c", "oversized-wire");
-  assert.equal(f.frames.filter(x => x.type === "message").length, 1);
+  const message = f.frames.find(x => x.type === "message");
+  assert.equal(message.original_text, text);
+  assert.equal(message.text, text);
+  assert.equal(f.frames.some(x => x.code === "frame_limit"), false);
 });
 
 test("普通 EOF 等待已准入的发送结局后收尾", async () => {
@@ -220,6 +220,92 @@ test("有界 pending、重复与 finish，不产生额外发送", async () => {
   f.message("c2c", "in-2");
   assert.equal(f.frames.filter(x => x.type === "message").length, 2);
   assert.equal(f.sent.length, 0);
+});
+test("pending 已满仍转交完整缩权帧，不保存回复路由或按业务文字筛选", async () => {
+  const f = fixture({ limit: 1 });
+  f.message("c2c", "held");
+  for (const [index, content] of ["立即急停当前会话并取消既有任务", "请解释当前排队情况"].entries()) {
+    const id = `restricted-${index}`;
+    f.handlers.get("message")({}, { kind: "c2c", messageId: id, senderId: "user-1", content,
+      rawEventType: "C2C_MESSAGE_CREATE", replyTarget: { scope: "c2c", targetId: "user-1", msgId: id } });
+    const frame = f.frames.find(frame => frame.type === "restriction_only" && frame.id === id);
+    assert.equal(frame.text, content);
+    assert.equal(frame.original_text, content);
+    assert.equal(frame.user_id, "user-1");
+    assert.equal(frame.target_id, "user-1");
+    for (const type of ["reply", "progress", "segment", "capacity", "finish"]) {
+      await f.bridge.command({ version: 1, type, id, index: 0, count: 2, text: "不能发送" });
+    }
+  }
+  assert.equal(f.frames.filter(frame => frame.type === "message").length, 1);
+  assert.equal(f.frames.filter(frame => frame.type === "restriction_only").length, 2);
+  assert.equal(f.frames.filter(frame => frame.code === "pending_limit").length, 1);
+  assert.equal(f.frames.filter(frame => frame.type === "delivery").length, 0);
+  assert.equal(f.sent.length, 0);
+  // 结束唯一原路由后立刻恢复一个普通名额，证明缩权帧没有新增 pending。
+  await f.bridge.command({ version: 1, type: "finish", id: "held" });
+  f.message("c2c", "after-release");
+  assert.equal(f.frames.find(frame => frame.id === "after-release").type, "message");
+  await f.bridge.command({ version: 1, type: "reply", id: "after-release", text: "容量已恢复" });
+  assert.deepEqual(f.sent.map(sent => sent.text), ["容量已恢复"]);
+});
+
+test("pending 已满的群自身正文、完整 SDK 原话与引用仍分别交付", async () => {
+  const f = fixture({ limit: 1, group: { observe: true } });
+  f.message("c2c", "held");
+  const stop = "立即急停当前会话并取消既有任务";
+  for (const [index, body, quote] of [[0, stop, "只解释原来的问题"], [1, "解释引用", stop]]) {
+    const id = `group-restriction-${index}`;
+    const original = " <@!bot-openid> " + body + "  ";
+    f.handlers.get("message")({}, { kind: "group", messageId: id, senderId: "user-1",
+      content: original, rawEventType: "GROUP_MESSAGE_CREATE", groupOpenid: "group-1",
+      mentions: [{ member_openid: "bot-openid", is_you: true }], msgType: 103,
+      msgElements: [{ content: quote }],
+      replyTarget: { scope: "group", targetId: "group-1", msgId: id } });
+    const frame = f.frames.find(frame => frame.type === "restriction_only" && frame.id === id);
+    assert.equal(frame.text, body);
+    assert.equal(frame.original_text, original);
+    assert.deepEqual(frame.quoted, { text: quote });
+    assert.equal(frame.scope, "group");
+    assert.equal(frame.target_id, "group-1");
+    assert.equal(frame.user_id, "user-1");
+    await f.bridge.command({ version: 1, type: "reply", id, text: "没有被动路由" });
+  }
+  assert.equal(f.frames.filter(frame => frame.type === "group_observation").length, 0);
+  assert.equal(f.frames.filter(frame => frame.type === "message").length, 1);
+  assert.equal(f.sent.length, 0);
+});
+
+test("pending 已满不绕过群唤醒、前缀、可信路由与正文容量检查", () => {
+  const base = { kind: "group", messageId: "restricted-invalid", senderId: "user-1",
+    content: "<@!1904159860> 立即急停当前会话", rawEventType: "GROUP_MESSAGE_CREATE", groupOpenid: "group-1",
+    replyTarget: { scope: "group", targetId: "group-1", msgId: "restricted-invalid" } };
+  const cases = [
+    [{}, { content: "立即急停当前会话" }],
+    [{ observe: true }, { content: "立即急停当前会话" }],
+    [{ observe: true }, { content: "解释引用", msgType: 103, msgElements: [{ content: "<@!1904159860> 立即急停" }] }],
+    [{ prefixOnly: true }, {}],
+    [{ observe: true, prefixOnly: true }, {}],
+    [{}, { senderIsBot: true }],
+    [{}, { rawEventType: "UNKNOWN" }],
+    [{}, { senderId: "invalid/sender" }],
+    [{}, { groupOpenid: "different-group" }],
+    [{}, { replyTarget: { scope: "group", targetId: "group-1", msgId: "different-id" } }],
+    [{}, { content: "<@!1904159860> " }],
+    [{}, { content: "<@!1904159860> " + "界".repeat(11000) }],
+  ];
+  for (const [group, changes] of cases) {
+    const f = fixture({ limit: 1, group });
+    f.message("c2c", "held");
+    f.handlers.get("message")({}, { ...base, ...changes });
+    assert.equal(f.frames.some(frame => frame.type === "restriction_only"), false, JSON.stringify([group, changes]));
+    assert.equal(f.frames.some(frame => frame.type === "group_observation"), false);
+    assert.equal(f.sent.length, 0);
+  }
+  const f = fixture({ limit: 1, group: { observe: true, prefixOnly: true } });
+  f.message("c2c", "held");
+  f.handlers.get("message")({}, { ...base, content: "<@!1904159860> Eve，请检查权限" });
+  assert.equal(f.frames.find(frame => frame.type === "restriction_only").text, "Eve，请检查权限");
 });
 test("发送失败无重试，不泄漏正文或异常", async () => {
   const f = fixture({ fail: true }); f.message();
@@ -755,7 +841,7 @@ test("表情包只跟在正文之后走原消息的被动目标，失败、过�
       ...(index === 1 ? { sticker_follows: true } : {}) });
   }
   await f.bridge.command({ version: 1, type: "sticker", id: "in-1", path: "/tmp/s.png" });
-  assert.deepEqual(f.images, [{ target: { scope: "group", targetId: "group-1", msgId: "in-1" }, source: { localPath: "/tmp/s.png" }, opts: {content: "<@user-1>"} }]);
+  assert.deepEqual(f.images, [{ target: { scope: "group", targetId: "group-1", msgId: "in-1" }, source: { localPath: "/tmp/s.png" }, opts: undefined }]);
   assert.deepEqual(f.frames.at(-1), { type: "delivery", version: 1, id: "in-1", sticker: true, ok: true, message_id: "image-msg-1" });
   await f.bridge.command({ version: 1, type: "sticker", id: "in-1", path: "/tmp/s.png" });
   assert.equal(f.images.length, 1, "同一条回复只发一次");

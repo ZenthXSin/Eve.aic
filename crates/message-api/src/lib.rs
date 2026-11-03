@@ -239,6 +239,20 @@ pub trait MessageService: Send + Sync {
         message: IncomingMessage,
         sink: Arc<dyn eve_control_api::ControlEventSink>,
     ) -> MessageResult<MessageTicket>;
+    /// 可信运行证据独立于消息正文传递，不参与消息序列化，也不得从正文重建。
+    /// 同一消息 ID 携带不同 metadata 时必须拒绝，不能覆盖已受理请求的证据。
+    /// 旧实现拒绝带 metadata 的请求，避免静默丢失证据；无 metadata 时转发 submit。
+    fn submit_with_metadata(
+        &self,
+        message: IncomingMessage,
+        metadata: Option<eve_control_api::ControlRunMetadata>,
+        sink: Arc<dyn eve_control_api::ControlEventSink>,
+    ) -> MessageResult<MessageTicket> {
+        if metadata.is_some() {
+            return Err(MessageError::Unavailable);
+        }
+        self.submit(message, sink)
+    }
     fn wait(&self, ticket: &MessageTicket) -> MessageFuture<'static, RouteReport>;
 }
 #[derive(Clone)]
@@ -323,5 +337,73 @@ impl TryFrom<&ConfigSnapshot> for MessageConfig {
             max_input_bytes: s.get("max_input_bytes")?,
             max_tracked_messages: s.get("max_tracked_messages")?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eve_control_api::{ControlReviewEvidence, ControlRunMetadata, DiscardControlEvents};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct LegacyService(AtomicUsize);
+    impl MessageService for LegacyService {
+        fn submit(
+            &self,
+            message: IncomingMessage,
+            _: Arc<dyn eve_control_api::ControlEventSink>,
+        ) -> MessageResult<MessageTicket> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(MessageTicket { message })
+        }
+
+        fn wait(&self, _: &MessageTicket) -> MessageFuture<'static, RouteReport> {
+            Box::pin(async { Err(MessageError::Unavailable) })
+        }
+    }
+
+    #[test]
+    fn legacy_service_rejects_metadata_without_submitting_and_forwards_none() {
+        let legacy = LegacyService::default();
+        let service: &dyn MessageService = &legacy;
+        let message = IncomingMessage {
+            message_id: "message".into(),
+            target: GenerationKey {
+                session: serde_json::from_value(serde_json::json!({
+                    "session_id": "session", "user_id": "user"
+                }))
+                .unwrap(),
+                task_id: "task".into(),
+                controller_epoch: [1; 16],
+                generation: 1,
+            },
+            text: "真实消息".into(),
+            reply_to: None,
+        };
+        let metadata = ControlRunMetadata {
+            scope: serde_json::from_value(serde_json::json!({
+                "session_id": "session", "user_id": "user"
+            }))
+            .unwrap(),
+            task_id: "task".into(),
+            review: ControlReviewEvidence::ChannelAnchor("message".into()),
+        };
+        assert_eq!(
+            service.submit_with_metadata(
+                message.clone(),
+                Some(metadata),
+                Arc::new(DiscardControlEvents)
+            ),
+            Err(MessageError::Unavailable)
+        );
+        assert_eq!(legacy.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            service
+                .submit_with_metadata(message.clone(), None, Arc::new(DiscardControlEvents))
+                .unwrap(),
+            MessageTicket { message }
+        );
+        assert_eq!(legacy.0.load(Ordering::SeqCst), 1);
     }
 }

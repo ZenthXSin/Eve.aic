@@ -23,6 +23,7 @@ pub(crate) struct QqPanel {
     pub control: Arc<dyn ControlService>,
     pub channel: Option<Arc<QqBotStatusHandle>>,
     pub chat: Option<Arc<crate::web_chat::WebChat>>,
+    pub inbox: Option<Arc<dyn WebInbox>>,
     pub started_at_unix_ms: u64,
     /// 本进程最近判断与启动时选择的判断方式；未开启面板时不记录。
     pub judgments: Option<(Arc<RecentRelationJudgments>, &'static str)>,
@@ -118,6 +119,23 @@ fn cursor(keys: &[SessionKey], limit: usize) -> Option<String> {
     (keys.len() == limit).then(|| keys.last().expect("nonempty page").session_id.clone())
 }
 impl PanelService for QqPanel {
+    fn notifications(&self, before: Option<u64>, limit: usize) -> PanelResult<NotificationPage> {
+        self.inbox
+            .as_ref()
+            .ok_or(PanelError::Unavailable)?
+            .list(before, limit)
+    }
+    fn mark_notification_read(&self, id: u64) -> PanelResult<bool> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+            .ok_or(PanelError::Unavailable)?;
+        self.inbox
+            .as_ref()
+            .ok_or(PanelError::Unavailable)?
+            .mark_read(id, now_ms)
+    }
     fn chat_info(&self) -> PanelResult<ChatInfo> {
         Ok(self.chat.as_ref().ok_or(PanelError::Unavailable)?.info())
     }

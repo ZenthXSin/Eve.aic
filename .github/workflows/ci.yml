@@ -98,6 +98,9 @@ jobs:
         run: python -X utf8 scripts/test-build-resources.py
       - name: 验证 Linux 外层守护、孤儿清理与两层崩溃恢复
         run: python -X utf8 scripts/test-service-guard.py
+      - name: 验证 Linux 完整运行包交接、持久回退锚点与熔断
+        if: runner.os == 'Linux'
+        run: python -X utf8 scripts/test-host-runtime-bridge.py
       - name: 验证 Linux 服务启动、停止和重复启动保护
         if: runner.os == 'Linux'
         run: python -X utf8 scripts/test-eve-service.py
@@ -108,22 +111,33 @@ jobs:
       - name: 检查 Clippy 警告
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: 运行测试与文档测试
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
       - name: 验证预编译目标的参数与失败传播
         run: python -X utf8 scripts/test-run-prebuilt.py
       - name: 统一编译进程验收入口和示例
+        id: process-binaries
         run: cargo build -p eve-app -p eve-runtime -p eve-cognition-plugin --bins --examples --locked
+      # 独立进程验收继续收集失败，避免每修一处重跑全量才能发现下一处；失败仍使作业失败。
+      - name: 验证后台策略通过真实文件回执学习与恢复
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
+        run: |
+          $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/examples/task_strategy.exe" } else { "target/debug/examples/task_strategy" }
+          python -X utf8 connectors/qqbot/test/task_strategy_process_test.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证 Web 插件页、配置恢复与 QQ 插件启停
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           $qqBinary = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
           python -X utf8 scripts/test-web-plugins.py $qqBinary
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证群聊插话的判断与完整回复链路
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           $chimeBinary = if ($IsWindows) { "target/debug/eve-chime.exe" } else { "target/debug/eve-chime" }
           python -X utf8 scripts/test-chime.py $chimeBinary
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证引用和附件消息的记忆采集及重启不重放
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           python -X utf8 connectors/qqbot/test/snapshot_reader_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -131,11 +145,13 @@ jobs:
           python -X utf8 connectors/qqbot/test/memory_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证模型进度、轮内提问与真实文件投递凭据
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
           python -X utf8 connectors/qqbot/test/progress_narration_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证主人跨群账号、撤权与旧身份兼容
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
           python -X utf8 connectors/qqbot/test/owner_account_test.py
@@ -145,7 +161,7 @@ jobs:
           python -X utf8 connectors/qqbot/test/member_network_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证浏览器中的插件配置、冲突、启停与窄屏
-        if: runner.os == 'Linux'
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' && runner.os == 'Linux' }}
         run: |
           $browserDirectory = Join-Path $env:RUNNER_TEMP "eve-web-browser"
           npm install --prefix $browserDirectory --no-audit --no-fund playwright-core@1.57.0
@@ -157,6 +173,7 @@ jobs:
           python -X utf8 scripts/test-web-chat.py --browser
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证 150k 上下文主动压缩与重启复用
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
           python -X utf8 connectors/qqbot/test/context_compaction_test.py
@@ -164,6 +181,7 @@ jobs:
           python -X utf8 connectors/qqbot/test/compaction_stream_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证交互记忆三次独立进程恢复
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           $memoryDirectory = Join-Path $env:RUNNER_TEMP "eve-memory-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           $before = ""
@@ -175,6 +193,7 @@ jobs:
             $before = $bytes
           }
       - name: 验证偏好提炼三次独立进程恢复
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           $learningDirectory = Join-Path $env:RUNNER_TEMP "eve-learning-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           $before = ""
@@ -186,18 +205,25 @@ jobs:
             $before = $bytes
           }
       - name: 验证核心入口帮助
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: python -X utf8 scripts/run-prebuilt.py --bin eve -- --help
       - name: 验证内生反思入口帮助
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: python -X utf8 scripts/run-prebuilt.py --bin eve-cognition -- --help
       - name: 验证主模型多轮验收帮助
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: python -X utf8 scripts/run-prebuilt.py --example model_acceptance -- --help
       - name: 运行插件协作验收
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: python -X utf8 scripts/run-prebuilt.py --bin eve-runtime
       - name: 验证取消生命周期等待后的收尾
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: python -X utf8 scripts/run-prebuilt.py --example lifecycle_operations
       - name: 验证集成后的 Mock LLM 工具闭环
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: python -X utf8 scripts/run-prebuilt.py --example llm_tool_loop
       - name: 验证 AGENT 文件身份与工具往返
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           function Invoke-Agent([string] $Path) {
             if ($Path) {
@@ -224,6 +250,7 @@ jobs:
             throw "显式文件没有替换默认文件身份"
           }
       - name: 验证认知状态、权限与三次独立进程恢复
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           $cognitionDirectory = Join-Path $env:RUNNER_TEMP "eve-cognition-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           $previousBytes = ""
@@ -256,6 +283,7 @@ jobs:
             $previousBytes = $bytes
           }
       - name: 验证配置插件及两次独立进程恢复
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           $env:EVE_LLM_MAX_PARALLEL_TOOL_CALLS = "10"
           $configDirectory = Join-Path $env:RUNNER_TEMP "eve-config-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
@@ -280,6 +308,7 @@ jobs:
             throw "第二次配置文件修订、值或备份不符"
           }
       - name: 验证四类模型配置、固定快照及独立进程恢复
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           $modelDirectory = Join-Path $env:RUNNER_TEMP "eve-models-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           for ($attempt = 1; $attempt -le 2; $attempt++) {
@@ -308,10 +337,13 @@ jobs:
             }
           }
       - name: 验证 OpenAI 本地 HTTP 与插件工具闭环
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: python -X utf8 scripts/run-prebuilt.py --example openai_offline
       - name: 验证 Responses SSE、插件工具与会话保存
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: python -X utf8 scripts/run-prebuilt.py --example streaming_offline
       - name: 验证显式取消、代际隔离及独立进程恢复
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           $controlDirectory = Join-Path $env:RUNNER_TEMP "eve-control-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           for ($attempt = 1; $attempt -le 2; $attempt++) {
@@ -338,6 +370,7 @@ jobs:
                 $snapshot.turns[$index].status.messages.Count -ne 4) { throw "完整工具历史未保存" }
           }
       - name: 验证规则与 LLM 判断、混合修订及独立进程恢复
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           foreach ($example in @("message_relations", "natural_message_relations")) {
             $messageDirectory = Join-Path $env:RUNNER_TEMP "eve-$example-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
@@ -372,6 +405,7 @@ jobs:
             }
           }
       - name: 验证流式跨进程恢复及取消输入过滤
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           $streamDirectory = Join-Path $env:RUNNER_TEMP "eve-stream-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           function Invoke-Stream([string] $Mode) {
@@ -393,6 +427,7 @@ jobs:
           $snapshot = $document.sessions["demo-session"]
           if ($snapshot.revision -ne 8 -or $snapshot.turns[2].status.state -ne "Failed" -or $snapshot.turns[2].status.failure.code -ne "Cancelled") { throw "实际取消记录未正确保存" }
       - name: 验证会话与工具历史跨进程恢复及中断
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           $sessionDirectory = Join-Path $env:RUNNER_TEMP "eve-session-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           function Invoke-Session([string] $Mode) {
@@ -418,6 +453,7 @@ jobs:
           $snapshot = $document.sessions["demo-session"]
           if ($document.format_version -ne 1 -or $snapshot.revision -ne 8 -or $snapshot.turns.Count -ne 4 -or $snapshot.turns[2].status.state -ne "Interrupted" -or $snapshot.turns[0].status.messages.Count -ne 4) { throw "实际磁盘会话记录不符" }
       - name: 验证认知循环无输入推进与三个独立进程零重放
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           $directory = Join-Path $env:RUNNER_TEMP "eve-cognition-loop-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           $reports = @()
@@ -449,6 +485,7 @@ jobs:
             throw "磁盘认知反馈没有保存"
           }
       - name: 验证两次独立进程恢复状态
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           function Assert-SavedCounter([string] $Directory, [string] $ExpectedStarts) {
             $snapshotPath = Join-Path $Directory "state.json"

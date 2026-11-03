@@ -253,6 +253,9 @@ pub struct Preflight {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Request {
+    Tools {
+        calls: Vec<CodeToolCall>,
+    },
     CheckTool {
         name: String,
         arguments: Value,
@@ -278,4 +281,11 @@ pub(crate) enum Request {
     Return {
         value: Value,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CodeToolCall {
+    pub name: String,
+    pub arguments: Value,
 }

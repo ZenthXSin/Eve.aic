@@ -46,21 +46,25 @@ class BackgroundDiagnosticsAcceptance(context.DelegationContextAcceptance):
                     'title':'失败诊断','instructions':'先保存文件，再执行指定程序，保留失败记录。','max_steps':3}))
             return text_response('后台已派发')
         self.callback = respond
-        def failed():
-            self.wait_for(lambda:any(t['status']=='Failed' and (t.get('notice') or {}).get('status')=='Delivered'
-                for t in self.tasks()), '后台失败及通知没有完成', 20)
+        def blocked():
+            self.wait_for(lambda:any(t['status']=='Blocked' and (t.get('notice') or {}).get('status')=='Delivered'
+                for t in self.tasks()), '后台阻断及通知没有完成', 20)
         self.enabled([*self.send(self.message('dispatch','保存后执行',expected='后台已派发')),
-                      *self.checkpoint('failed')], checkpoints={'failed':failed})
+                      *self.checkpoint('blocked')], checkpoints={'blocked':blocked})
         [task] = self.tasks()
-        self.assertIn('程序无法启动', task['failure'])
-        self.assertIn('write_file', task['failure'])
-        self.assertIn('run_command', task['failure'])
+        self.assertEqual(task['status'], 'Blocked')
+        self.assertIn('程序无法启动', task['result'])
+        self.assertIn('write_file', task['result'])
+        self.assertIn('run_command', task['result'])
+        self.assertIn('未知工具效果不重放', task['result'])
         self.assertEqual(task['usage']['tool_calls'], 2)
         self.assertEqual((self.source/'kept.txt').read_text(), 'COMPLETED_BEFORE_FAILURE')
         workers = sum(self.is_worker(r['body']) for r in self.requests)
         self.enabled(self.send(self.message('query','查看失败步骤',expected='已写入文件，后续程序无法启动，原结果保留')))
         self.assertEqual(sum(self.is_worker(r['body']) for r in self.requests), workers)
         self.assertEqual(self.tasks()[0]['id'], task['id'])
+        self.assertEqual(self.tasks()[0]['status'], 'Blocked')
+        self.assertEqual(self.tasks()[0]['result'], task['result'])
         self.assertEqual((self.source/'kept.txt').read_text(), 'COMPLETED_BEFORE_FAILURE')
 
 

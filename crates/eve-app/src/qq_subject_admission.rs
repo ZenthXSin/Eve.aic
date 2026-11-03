@@ -8,7 +8,15 @@ use std::sync::Arc;
 pub(crate) struct Admission(pub Arc<dyn SubjectAdmin>);
 fn scope(key: &SessionKey) -> SubjectScope {
     SubjectScope {
-        channel: "qq".into(),
+        channel: if crate::web_chat::is_owner(&eve_llm_api::ContextScope {
+            session_id: key.session_id.clone(),
+            user_id: key.user_id.clone(),
+        }) {
+            "web"
+        } else {
+            "qq"
+        }
+        .into(),
         conversation_id: key.session_id.clone(),
         principal_id: key.user_id.clone(),
     }
@@ -187,7 +195,7 @@ impl QqAdmission for Admission {
                     priority: EventPriority::Recovery,
                     kind: "dialogue_lifecycle".into(),
                     payload: if known {
-                        "控制报告已取得；投递仍按QQ回执判断"
+                        "控制报告已取得；投递仍按原通道回执判断"
                     } else {
                         "控制结果未知；不得自动重放"
                     }

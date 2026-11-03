@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+mod batch;
 
 /// publish/activate 不会改变现有句柄。私有字段防止调用方改写版本源码。
 #[derive(Clone)]
@@ -214,6 +215,18 @@ impl ScriptRuntime {
         bound: &BoundVersion,
         context: &ToolExecutionContext,
     ) -> Result<Preflight> {
+        let result = self.preflight_candidate(bound, context)?;
+        for version in bound.versions.values() {
+            self.store.state(&bound.owner, &version.reference)?;
+        }
+        Ok(result)
+    }
+    /// 新版本尚未激活时核对声明图和隔离器；不会要求该版本已存在状态。
+    pub fn preflight_candidate(
+        &self,
+        bound: &BoundVersion,
+        context: &ToolExecutionContext,
+    ) -> Result<Preflight> {
         identity(bound, context)?;
         check_stop(context, Instant::now() + Duration::from_secs(30))?;
         if context.shared_steps().is_none() {
@@ -225,7 +238,9 @@ impl ScriptRuntime {
                 .map(|(settings, _)| crate::Language::RustCargo(settings))
                 .unwrap_or_else(|| version.spec.language.clone());
             self.sandbox.preflight(&language)?;
-            self.store.state(&bound.owner, &version.reference)?;
+            if version.reference != bound.root {
+                self.store.state(&bound.owner, &version.reference)?;
+            }
             for name in &version.spec.tools {
                 self.dispatch.preflight_tool(name, context)?;
                 tools.insert(name.clone());
@@ -559,7 +574,8 @@ impl ScriptRuntime {
                         name: name.clone(),
                         arguments,
                     };
-                    self.dispatch.preflight_call(&call, context)?;
+                    let leaf_context = context.clone().with_call_id(call.id.clone());
+                    self.dispatch.preflight_call(&call, &leaf_context)?;
                     check_stop(context, chain.deadline)?;
                     reserve(context)?;
                     receipt.evidence.push(Evidence {
@@ -570,7 +586,7 @@ impl ScriptRuntime {
                     });
                     self.store.record(receipt)?;
                     let outcome = guarded(
-                        self.dispatch.dispatch(call, context.clone()),
+                        self.dispatch.dispatch(call, leaf_context),
                         context,
                         chain.deadline,
                     )
@@ -601,6 +617,10 @@ impl ScriptRuntime {
                             return Err(error);
                         }
                     }
+                }
+                Request::Tools { calls } => {
+                    self.tool_batch(calls, version, receipt, context, &chain, count)
+                        .await?
                 }
                 Request::Script {
                     dependency,

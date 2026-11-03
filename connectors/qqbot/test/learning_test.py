@@ -87,7 +87,9 @@ class LearningAcceptance(unittest.TestCase):
                     decoded = json.loads(latest)
                 except (ValueError, TypeError):
                     decoded = None
-                if isinstance(decoded, dict) and "extractor_version" in decoded and "evidence" in decoded:
+                if isinstance(decoded, dict) and "feedback_pairs" in decoded and "messages" in decoded:
+                    kind = "conversation"
+                elif isinstance(decoded, dict) and "extractor_version" in decoded and "evidence" in decoded:
                     kind = "learning"
                 elif "unverified_waiting_input" in latest:
                     kind = "reflection"
@@ -112,6 +114,9 @@ class LearningAcceptance(unittest.TestCase):
                 if kind == "chat" and outer.chat_response is not None:
                     text = outer.chat_response(body, latest)
                 message = {"role": "assistant", "content": text}
+                if kind == "conversation":
+                    assert not body.get("tools"), "交流学习不得获得对话工具"
+                    message["content"] = json.dumps({"lessons": []})
                 if isinstance(text, dict):
                     message = {"role": "assistant", **text}
                     if "tool_calls" in text:
@@ -198,7 +203,7 @@ class LearningAcceptance(unittest.TestCase):
                    # 分段节奏偏好按自然段规划验收；按句分条见 segment_test。
                    EVE_CHAT_SENTENCE_SPLIT="false")
         env.update(env_extra or {})
-        command = [str(BINARY), "--state-dir", str(self.work / "state"),
+        command = [str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "state"),
                    "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
                    "--bridge-arg", str(scenario)]
         if learning:
@@ -589,7 +594,7 @@ class LearningAcceptance(unittest.TestCase):
         self.assertEqual(self.requests, [])
         self.assertFalse(self.jobs())
         self.assertFalse(self.snapshots())
-        result = subprocess.run([str(BINARY), "--memory-learning"], env={}, capture_output=True, text=True, timeout=10)
+        result = subprocess.run([str(BINARY), "--minimal-profile", "--memory-learning"], env={}, capture_output=True, text=True, timeout=10)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("需要同时开启 --memory", result.stderr)
         self.assertEqual(self.requests, [])

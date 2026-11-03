@@ -8,6 +8,7 @@ mod cognition_plan;
 mod config;
 mod console;
 mod context_notes;
+mod conversation_learning;
 mod developer;
 mod dialogue;
 mod error;
@@ -26,6 +27,8 @@ mod qq_access;
 mod qq_admin;
 mod qq_agenda;
 mod qq_budget;
+mod qq_business;
+mod qq_capability_profile;
 mod qq_chat_style;
 mod qq_chat_timing;
 mod qq_clarify;
@@ -61,6 +64,8 @@ mod qq_memory_sharing;
 mod qq_message_judge;
 mod qq_model;
 mod qq_model_status;
+#[cfg(test)]
+mod qq_natural_management_tests;
 mod qq_outreach;
 mod qq_people;
 mod qq_phrases;
@@ -71,6 +76,7 @@ mod qq_provision;
 mod qq_pursuit;
 mod qq_reminder;
 mod qq_research;
+mod qq_review_source;
 pub mod qq_scripts;
 mod qq_semantic;
 mod qq_skill;
@@ -80,10 +86,17 @@ mod qq_subject;
 mod qq_subject_admission;
 mod qq_summary;
 mod qq_task_diagnostics;
+mod qq_task_notices;
+mod qq_task_review;
+mod qq_task_verification;
+mod qq_task_wait;
 mod qq_tasks;
 mod qq_tools;
+mod qq_trigger_review;
 mod qq_triggers;
 mod qq_vision;
+mod qq_web_context;
+mod qq_web_notifications;
 mod qqbot;
 mod record_json_page;
 mod segment_advice;
@@ -94,8 +107,12 @@ mod task_cognition;
 mod task_strategy_catalog;
 pub use task_cognition::CognitiveServices;
 mod storage;
+mod web_autonomy;
 mod web_chat;
 mod web_host;
+mod web_ingress;
+mod web_memory;
+mod web_notifications;
 mod web_panel;
 pub use web_host::{WEB_HELP, WebOptions, run_web};
 mod web_panel_autonomy;
@@ -368,6 +385,8 @@ pub(crate) struct CoreBootstrap {
     context: Option<Arc<dyn eve_llm_api::ContextAssembler>>,
     /// 宿主额外提供给对话模型的工具；名称不能与内置工具重复。
     tools: Vec<Arc<dyn eve_llm_api::Tool>>,
+    /// 后台专用能力仍注册为服务，但不向前台对话模型开放。
+    foreground_excluded_tools: std::collections::BTreeSet<String>,
     /// 记录对话模型每次请求的结局；只观察，不改变请求。
     health: Option<Arc<dyn eve_llm_api::ModelHealthObserver>>,
     /// 历史窗口省略较早轮次时提供的摘要；不装配时照常省略并提示。
@@ -376,6 +395,7 @@ pub(crate) struct CoreBootstrap {
     /// 本轮用户消息的图像来源；不装配时只发文字。
     image_source: Option<Arc<dyn eve_llm_api::TurnImageSource>>,
     steering: Option<Arc<dyn eve_llm_api::TurnSteeringSource>>,
+    review_source: Option<Arc<dyn eve_llm_api::ReviewUserMessageSource>>,
 }
 
 pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstrap, AppError> {
@@ -390,11 +410,13 @@ pub(crate) fn core_bootstrap(agent_path: &std::path::Path) -> Result<CoreBootstr
         api_key,
         context: None,
         tools: vec![],
+        foreground_excluded_tools: Default::default(),
         health: None,
         history_digests: None,
         history_context_planner: None,
         image_source: None,
         steering: None,
+        review_source: None,
     })
 }
 
@@ -539,11 +561,13 @@ async fn install_core_with_config(
         api_key,
         context,
         tools,
+        foreground_excluded_tools,
         health,
         history_digests,
         history_context_planner,
         image_source,
         steering,
+        review_source,
     } = bootstrap;
     let mut bindings = Vec::with_capacity(tools.len() + 1);
     for tool in &tools {
@@ -604,13 +628,18 @@ async fn install_core_with_config(
             service_id: ServiceId::new(services::TOOL)?,
             expected_owner: owner.clone(),
         }))
-        .chain(bindings.into_iter().map(|(name, service)| {
-            Ok::<_, AppError>(ToolBinding {
-                name,
-                service_id: ServiceId::new(service)?,
-                expected_owner: owner.clone(),
-            })
-        }))
+        .chain(
+            bindings
+                .into_iter()
+                .filter(|(name, _)| !foreground_excluded_tools.contains(name))
+                .map(|(name, service)| {
+                    Ok::<_, AppError>(ToolBinding {
+                        name,
+                        service_id: ServiceId::new(service)?,
+                        expected_owner: owner.clone(),
+                    })
+                }),
+        )
         .collect::<Result<Vec<_>, AppError>>()?,
         LlmHostConfig {
             provider_timeout: timeout,
@@ -640,6 +669,10 @@ async fn install_core_with_config(
     };
     let host = match steering {
         Some(source) => host.with_steering(source),
+        None => host,
+    };
+    let host = match review_source {
+        Some(source) => host.with_review_user_message_source(source),
         None => host,
     };
     let host = Arc::new(SessionLlmHost::new(host, SessionBinding::builtin()).with_logger(logger));

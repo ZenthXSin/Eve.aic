@@ -121,7 +121,7 @@ class CognitionAcceptance(unittest.TestCase):
         return self.work / f"{kind}-{number}.arrived"
 
     def message(self, id, text, expected=None, contains=None, scope="c2c", user="user-1", target=None):
-        message = {"id": id, "text": text, "scope": scope, "user_id": user,
+        message = {"id": id, "text": text, "original_text": text, "scope": scope, "user_id": user,
                    "target_id": target or (user if scope == "c2c" else "group-1"),
                    "expected_type": "reply"}
         if contains is None:
@@ -163,7 +163,7 @@ class CognitionAcceptance(unittest.TestCase):
             EVE_OPENAI_API_KEY="test-model-secret",
             EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
             EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")
-        command = [str(BINARY), "--state-dir", str(self.work / "state"),
+        command = [str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "state"),
             "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
             "--bridge-arg", str(scenario)]
         if cognition:

@@ -160,7 +160,7 @@ class SemanticAcceptance(recall_test.RecallAcceptance):
         self.assertFalse(self.embeddings)
 
     def refused(self, arguments, env=None):
-        child = subprocess.Popen([str(memory_harness.BINARY), *arguments, "--state-dir", str(self.work / "state"),
+        child = subprocess.Popen([str(memory_harness.BINARY), "--minimal-profile", *arguments, "--state-dir", str(self.work / "state"),
                                   "--agent", str(memory_harness.ROOT / "AGENT.md")],
                                  env={"PATH": os.environ.get("PATH", ""), **(env or {})},
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

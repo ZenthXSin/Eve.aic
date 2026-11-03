@@ -112,6 +112,19 @@ class Service:
         binary, _, manifest = self.runtime.validate_candidate(active['candidate_request'], candidates)
         if self.runtime.digest(binary) != active['binary_sha256']:
             raise ValueError('active_binary_changed')
+        bridge = None
+        if 'host_bridge_script' in self.data:
+            value = self.data['host_bridge_script']
+            if not isinstance(value, str) or not value:
+                raise ValueError('invalid_host_bridge_script')
+            bridge = Path(value)
+            if (not bridge.is_absolute() or bridge.is_symlink() or not bridge.is_file()
+                    or bridge.parent.is_symlink()):
+                raise ValueError('host_bridge_script_missing_or_unsafe')
+            contract = bridge.parent/'host_runtime_contract.py'
+            if contract.is_symlink() or not contract.is_file():
+                raise ValueError('host_bridge_contract_missing_or_unsafe')
+            source_revision = self.runtime.source_revision(manifest)
         state = Path(self.data['state_directory'])
         if self.runtime.argument(active['command'], '--state-dir') != str(state) or not (state / 'state.json').is_file():
             raise ValueError('existing_state_required')
@@ -138,13 +151,17 @@ class Service:
         if '--node' in active['command']:
             prefixes.append(str(Path(self.runtime.argument(active['command'], '--node')).parent))
         env['PATH'] = os.pathsep.join(prefixes + [env.get('PATH', '/usr/bin:/bin')])
-        command = [sys.executable, self.data['guard_script'], '--directory', str(guard_directory),
-                   '--stop-timeout', '110', '--', sys.executable, self.data['supervisor_script'],
-                   '--directory', self.data['control_directory'], '--candidates', str(candidates),
-                   '--stop-timeout', '90', '--ready-timeout', '60', '--drain-timeout', '600', '--', *active['command']]
+        managed = [sys.executable, '-I', '-B', str(bridge), '--supervisor', self.data['supervisor_script']] if bridge else [
+            sys.executable, self.data['supervisor_script']]
+        managed.extend(['--directory', self.data['control_directory'], '--candidates', str(candidates),
+                        '--stop-timeout', '90', '--ready-timeout', '60', '--drain-timeout', '600'])
+        if bridge and source_revision is not None:
+            managed.extend(['--source-revision', source_revision])
         if self.data.get('auto_update_config'):
-            separator = command.index('--', command.index(self.data['supervisor_script']))
-            command[separator:separator] = ['--auto-update-config', self.data['auto_update_config']]
+            managed.extend(['--auto-update-config', self.data['auto_update_config']])
+        managed.extend(['--', *active['command']])
+        command = [sys.executable, self.data['guard_script'], '--directory', str(guard_directory),
+                   '--stop-timeout', '110', '--', *managed]
         log_path = self.directory / ('eve-' + stamp + '.log')
         with log_path.open('ab') as log:
             process = subprocess.Popen(command, cwd=config['workspace'], env=env, stdin=subprocess.DEVNULL,
@@ -161,7 +178,12 @@ class Service:
             try:
                 ready = self.probe()
                 status = self.runtime.read_json(Path(self.data['control_directory']) / 'supervisor.json')
-                if ready['channel']['connected'] and status['phase'] == 'running' and status['active_sha256'] == active['binary_sha256']:
+                host_ready = True
+                if bridge:
+                    host = self.runtime.read_json(Path(self.data['control_directory'])/'host-status.json')
+                    host_ready = (host['phase'] == 'running' and host['child_pid'] == status['pid']
+                                  and host['candidate_sha256'] == active['candidate_request']['candidate_sha256'])
+                if host_ready and ready['channel']['connected'] and status['phase'] == 'running' and status['active_sha256'] == active['binary_sha256']:
                     self.data.update(channel='connected', supervisor_pid=status['pid'], tools_registered=ready['tools_registered'])
                     self.runtime.atomic(self.record, self.data)
                     return self.status()

@@ -1,6 +1,9 @@
 //! 后台任务账本。
 mod archive;
 mod cold;
+mod completion;
+pub use completion::{evaluate_completion_contract, evaluate_task_completion};
+mod progress;
 mod store;
 pub use archive::FileTaskArchive;
 mod strategy;
@@ -38,6 +41,40 @@ impl TaskController {
 impl TaskAdmin for TaskController {
     fn snapshot(&self) -> TaskResult<TaskSnapshot> {
         self.service()?.snapshot()
+    }
+    fn progress_snapshot(&self) -> TaskResult<TaskProgressSnapshot> {
+        self.service()?.progress_snapshot()
+    }
+    fn claim_progress(
+        &self,
+        owner: &TaskOwner,
+        id: &str,
+        channel: DeliveryChannel,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        self.service()?.claim_progress(owner, id, channel, now_ms)
+    }
+    fn record_progress_delivery(
+        &self,
+        owner: &TaskOwner,
+        id: &str,
+        sequence: u64,
+        result: DeliveryResult,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        self.service()?
+            .record_progress_delivery(owner, id, sequence, result, now_ms)
+    }
+    fn record_local_progress(
+        &self,
+        owner: &TaskOwner,
+        id: &str,
+        sequence: u64,
+        notification_id: &str,
+        at_ms: u64,
+    ) -> TaskResult<Task> {
+        self.service()?
+            .record_local_progress(owner, id, sequence, notification_id, at_ms)
     }
     fn evidence_snapshot(&self, keys: &[TaskEvidenceKey]) -> TaskResult<TaskEvidenceSnapshot> {
         self.service()?.evidence_snapshot(keys)
@@ -88,6 +125,27 @@ impl TaskAdmin for TaskController {
     fn start(&self, id: &str, now_ms: u64) -> TaskResult<Task> {
         self.service()?.start(id, now_ms)
     }
+    #[allow(clippy::too_many_arguments)]
+    fn create_authorized(
+        &self,
+        owner: &TaskOwner,
+        spec: TaskSpec,
+        source: &str,
+        review_messages: Vec<String>,
+        completion_contract: Option<TaskCompletionContract>,
+        deadline_at_ms: Option<u64>,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        self.service()?.create_authorized(
+            owner,
+            spec,
+            source,
+            review_messages,
+            completion_contract,
+            deadline_at_ms,
+            now_ms,
+        )
+    }
     fn checkpoint(
         &self,
         id: &str,
@@ -120,6 +178,17 @@ impl TaskAdmin for TaskController {
     ) -> TaskResult<Task> {
         self.service()?.resume_blocked(owner, id, evidence, now_ms)
     }
+    fn resume_blocked_checkpoint(
+        &self,
+        owner: &TaskOwner,
+        id: &str,
+        expected: &eve_llm_api::TurnCheckpoint,
+        evidence: &str,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        self.service()?
+            .resume_blocked_checkpoint(owner, id, expected, evidence, now_ms)
+    }
     fn finish(&self, id: &str, end: TaskEnd, usage: TaskUsage, now_ms: u64) -> TaskResult<Task> {
         self.service()?.finish(id, end, usage, now_ms)
     }
@@ -131,6 +200,17 @@ impl TaskAdmin for TaskController {
     }
     fn record_delivery(&self, id: &str, result: DeliveryResult, now_ms: u64) -> TaskResult<Task> {
         self.service()?.record_delivery(id, result, now_ms)
+    }
+    fn record_local_delivery(
+        &self,
+        owner: &TaskOwner,
+        id: &str,
+        finished_at_ms: u64,
+        notification_id: &str,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        self.service()?
+            .record_local_delivery(owner, id, finished_at_ms, notification_id, now_ms)
     }
     fn expire(&self, id: &str, now_ms: u64) -> TaskResult<Task> {
         self.service()?.expire(id, now_ms)

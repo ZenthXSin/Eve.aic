@@ -3,6 +3,8 @@ use eve_llm_api::{ContextScope, LlmFuture};
 use eve_plugin_api::PluginResult;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+mod conversation;
+pub use conversation::*;
 
 pub const TRAINING_PLUGIN_ID: &str = "eve.training";
 pub const TRAINING_SERVICE_ID: &str = "eve.training.mode";
@@ -127,6 +129,36 @@ pub trait PhraseLearner: Send + Sync {
 }
 
 pub trait TrainingService: Send + Sync {
+    /// 只采集当前可信范围内实际发生的交流，不接受模型编造的示范对话。
+    fn observe_conversation(
+        &self,
+        _scope: &ContextScope,
+        _message: ConversationMessage,
+    ) -> PluginResult<()> {
+        Ok(())
+    }
+    fn take_conversation_batch(&self, _now_ms: u64) -> PluginResult<Option<ConversationBatch>> {
+        Ok(None)
+    }
+    fn finish_conversation_batch(
+        &self,
+        _batch: &ConversationBatch,
+        _drafts: Vec<ConversationLessonDraft>,
+        _now_ms: u64,
+    ) -> PluginResult<usize> {
+        Ok(0)
+    }
+    /// 失败只重新请求无工具的提炼，最多三次；不重放聊天或业务动作。
+    fn fail_conversation_batch(
+        &self,
+        _batch: &ConversationBatch,
+        _now_ms: u64,
+    ) -> PluginResult<()> {
+        Ok(())
+    }
+    fn conversation_lessons(&self, _scope: &ContextScope) -> PluginResult<Vec<ConversationLesson>> {
+        Ok(vec![])
+    }
     fn enabled(&self, scope: &ContextScope) -> PluginResult<bool>;
     /// 必须先持久化再确认；失败保留原状态。
     fn set_enabled(&self, scope: &ContextScope, enabled: bool) -> PluginResult<()>;

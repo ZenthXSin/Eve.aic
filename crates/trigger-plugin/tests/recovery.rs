@@ -53,6 +53,99 @@ async fn idempotency_and_cancellation_are_bound_to_exact_session() {
     );
     k.stop_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn local_inbox_receipt_is_owner_and_run_bound_and_never_rewrites_unknown() {
+    let state = Arc::new(MemoryStateStore::default());
+    let (kernel, triggers) = open(state.clone()).await;
+    let mut recurring = spec();
+    recurring.recurrence = Some(Recurrence {
+        interval_ms: 60_000,
+        max_runs: 2,
+    });
+    let task = triggers
+        .create(owner("web"), "inbox".into(), recurring, 1000)
+        .unwrap();
+    triggers.ready(&task.id, vec!["time".into()]).unwrap();
+    triggers
+        .transition(&task.id, Status::Ready, Status::Running, None)
+        .unwrap();
+    triggers
+        .transition(
+            &task.id,
+            Status::Running,
+            Status::Completed,
+            Some("第一周期实际结果".into()),
+        )
+        .unwrap();
+    assert_eq!(
+        triggers.record_local_delivery(&owner("other"), &task.id, 1),
+        Err(TriggerError::NotFound)
+    );
+    assert_eq!(
+        triggers.record_local_delivery(&task.owner, &task.id, 2),
+        Err(TriggerError::Transition)
+    );
+    assert_eq!(
+        triggers.delivery_for_run(&task.id, 1, Delivery::Pending, Delivery::StoredLocally),
+        Err(TriggerError::Transition)
+    );
+    triggers
+        .record_local_delivery(&task.owner, &task.id, 1)
+        .unwrap();
+    triggers
+        .record_local_delivery(&task.owner, &task.id, 1)
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    let (kernel, triggers) = open(state).await;
+    assert_eq!(
+        triggers.snapshot().unwrap()[0].delivery,
+        Some(Delivery::StoredLocally)
+    );
+    triggers
+        .record_local_delivery(&task.owner, &task.id, 1)
+        .unwrap();
+    triggers.rearm(&task.id, 2000).unwrap();
+    assert_eq!(
+        triggers.record_local_delivery(&task.owner, &task.id, 1),
+        Err(TriggerError::Transition)
+    );
+    triggers.ready(&task.id, vec!["time".into()]).unwrap();
+    triggers
+        .transition(&task.id, Status::Ready, Status::Running, None)
+        .unwrap();
+    triggers
+        .transition(
+            &task.id,
+            Status::Running,
+            Status::Completed,
+            Some("第二周期实际结果".into()),
+        )
+        .unwrap();
+    assert_eq!(
+        triggers.record_local_delivery(&task.owner, &task.id, 1),
+        Err(TriggerError::Transition)
+    );
+    triggers
+        .delivery_for_run(&task.id, 2, Delivery::Pending, Delivery::Sending)
+        .unwrap();
+    assert_eq!(
+        triggers.record_local_delivery(&task.owner, &task.id, 2),
+        Err(TriggerError::Transition)
+    );
+    triggers
+        .delivery_for_run(&task.id, 2, Delivery::Sending, Delivery::Unknown)
+        .unwrap();
+    assert_eq!(
+        triggers.record_local_delivery(&task.owner, &task.id, 2),
+        Err(TriggerError::Transition)
+    );
+    assert_eq!(
+        triggers.snapshot().unwrap()[0].delivery,
+        Some(Delivery::Unknown)
+    );
+    kernel.stop_all().await.unwrap();
+}
 #[tokio::test]
 async fn restart_preserves_waiting_and_never_replays_running_or_sending() {
     let state = Arc::new(MemoryStateStore::default());
@@ -108,7 +201,7 @@ async fn restart_preserves_waiting_and_never_replays_running_or_sending() {
 async fn invalid_and_duplicate_key_state_is_preserved_and_rejected() {
     for bytes in [
         br#"{"format_version":1,"format_version":1,"triggers":[]}"#.to_vec(),
-        br#"{"format_version":3,"triggers":[]}"#.to_vec(),
+        br#"{"format_version":4,"triggers":[]}"#.to_vec(),
         b"broken".to_vec(),
     ] {
         let state = Arc::new(MemoryStateStore::default());
@@ -182,7 +275,13 @@ async fn lost_commit_confirmation_closes_handle_and_restart_never_replays() {
     k.register(Box::new(p)).unwrap();
     k.start_all().await.unwrap();
     let t = c
-        .create(owner("a"), "uncertain".into(), spec(), 1000)
+        .create_with_review_messages(
+            owner("a"),
+            "uncertain".into(),
+            spec(),
+            vec![" 真实授权\n提交确认丢失也要保留全文 ".into()],
+            1000,
+        )
         .unwrap();
     c.ready(&t.id, vec!["time".into()]).unwrap();
     state.lose.store(true, Ordering::SeqCst);
@@ -201,7 +300,9 @@ async fn lost_commit_confirmation_closes_handle_and_restart_never_replays() {
     let c = p.controller();
     next.register(Box::new(p)).unwrap();
     next.start_all().await.unwrap();
-    assert_eq!(c.snapshot().unwrap()[0].status, Status::Interrupted);
+    let restored = c.snapshot().unwrap().remove(0);
+    assert_eq!(restored.status, Status::Interrupted);
+    assert_eq!(restored.review_messages, t.review_messages);
     next.stop_all().await.unwrap();
 }
 
@@ -319,6 +420,10 @@ async fn recurrence_subprocess_helper() {
     let c = plugin.controller();
     kernel.register(Box::new(plugin)).unwrap();
     kernel.start_all().await.unwrap();
+    let review_messages = vec![
+        " 每30分钟核对一次目标进展\n完整保留本次授权范围 ".into(),
+        String::new(),
+    ];
     if std::env::var("EVE_TRIGGER_SIMULATION_PHASE").unwrap() == "seed" {
         let mut recurring = spec();
         recurring.expires_at_ms = 7_200_000;
@@ -327,7 +432,13 @@ async fn recurrence_subprocess_helper() {
             max_runs: 3,
         });
         let t = c
-            .create(owner("simulation"), "periodic-goal".into(), recurring, 1000)
+            .create_with_review_messages(
+                owner("simulation"),
+                "periodic-goal".into(),
+                recurring,
+                review_messages,
+                1000,
+            )
             .unwrap();
         c.ready(&t.id, vec!["模拟时钟达到2000".into()]).unwrap();
         c.transition(&t.id, Status::Ready, Status::Running, None)
@@ -353,6 +464,7 @@ async fn recurrence_subprocess_helper() {
             vec![Condition::Time { at_ms: 1_803_000 }]
         );
         assert_eq!(t.result.as_deref(), Some("模拟检查完成"));
+        assert_eq!(t.review_messages, Some(review_messages));
     }
     kernel.stop_all().await.unwrap();
 }
@@ -380,7 +492,7 @@ async fn old_trigger_ledger_migrates_without_losing_armed_conditions() {
     assert_eq!(controller.snapshot().unwrap(), vec![trigger]);
     let stored: serde_json::Value =
         serde_json::from_slice(&state.get(&namespace, STATE_KEY).unwrap().unwrap()).unwrap();
-    assert_eq!(stored["format_version"], 2);
+    assert_eq!(stored["format_version"], 3);
     kernel.stop_all().await.unwrap();
 }
 
@@ -457,8 +569,13 @@ async fn full_legacy_running_ledger_never_writes_an_oversized_recovery() {
 
 #[tokio::test]
 async fn running_admission_reserves_space_for_unknown_restart_receipt() {
-    let (state, id, original) = near_capacity_legacy_state(Status::Ready).await;
+    let (state, id, _) = near_capacity_legacy_state(Status::Ready).await;
     let (kernel, controller) = open(state.clone()).await;
+    // 启动已将旧版本迁移为 3；后续失败准入不能改动这一可靠恢复结果。
+    let original = state
+        .get(&PluginId::new(PLUGIN_ID).unwrap(), STATE_KEY)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         controller.transition(&id, Status::Ready, Status::Running, None),
         Err(TriggerError::Limit)

@@ -195,6 +195,7 @@ fn task() -> Task {
             resume_at_ms: None,
             deadline_at_ms: Some(100),
             authorization_deadline_at_ms: None,
+            ..Default::default()
         }),
     }
 }

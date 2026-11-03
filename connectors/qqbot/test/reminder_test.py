@@ -30,7 +30,7 @@ WELCOME = "欢迎回来。"
 CHAT = "在吗"
 HERE = "在的。"
 REMINDERS = '{"kind":"eve.reminders"'
-TOOLS = PLATFORM_TOOLS | {"echo", "set_reminder", "cancel_reminder"}
+TOOLS = PLATFORM_TOOLS | {"echo", "manage_conversation_learning", "set_reminder", "cancel_reminder"}
 MINUTE = 60_000
 
 
@@ -321,7 +321,7 @@ class ReminderAcceptance(unittest.TestCase):
 
     def test_reminders_are_off_by_default_and_the_offset_requires_them(self):
         def respond(body):
-            self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo"})
+            self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo", "manage_conversation_learning"})
             self.assertIsNone(self.context(body))
             return text_response("我现在还不能设提醒。")
         self.callback = respond
@@ -331,7 +331,7 @@ class ReminderAcceptance(unittest.TestCase):
         env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret")
         for extra, expected in ((["--reminder-utc-offset", "+08:00"], "需要同时开启 --reminders"),
                                 (["--reminders", "--reminder-utc-offset", "+15:00"], "-12:00 至 +14:00")):
-            result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
+            result = subprocess.run([str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "refused"),
                                      "--agent", str(ROOT / "AGENT.md"), *extra],
                                     env=configure_fixture_progress(env), capture_output=True, text=True, timeout=60)
             self.assertNotEqual(result.returncode, 0)

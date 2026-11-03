@@ -1,10 +1,12 @@
 //! 单宿主 SQLite 冷回执库。事务先提交，宿主再缩小活跃账本；重复批次只核对原字节。
 use eve_plugin_api::{PluginError, PluginResult};
-use eve_qqbot_plugin::{QqArchivedReceipt, QqReceiptArchive};
+use eve_qqbot_plugin::{QqArchivedReceipt, QqOriginalBinding, QqOriginalMessage, QqReceiptArchive};
+use eve_session_api::SessionKey;
 use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{path::Path, sync::Mutex, time::Duration};
 
+mod originals;
 mod whitelist;
 pub use whitelist::SqliteGroupWhitelist;
 
@@ -71,6 +73,11 @@ impl SqliteReceiptArchive {
         }
         let archive = Self(Mutex::new(connection));
         archive.identity()?;
+        {
+            let mut connection = archive.0.lock().map_err(|_| unavailable())?;
+            originals::initialize(&mut connection)?;
+        }
+        archive.original_identity()?;
         Ok(archive)
     }
 }
@@ -132,6 +139,60 @@ impl QqReceiptArchive for SqliteReceiptArchive {
         self.0.lock().map_err(|_| unavailable())?.query_row(
             "SELECT payload FROM receipts WHERE app=?1 AND session_id=?2 AND failed_reply=1 ORDER BY seq DESC LIMIT 1", params![app,session_id], |r| r.get(0))
             .optional().map_err(|_| unavailable())
+    }
+    fn original_identity(&self) -> PluginResult<Option<(String, u64)>> {
+        let mut connection = self.0.lock().map_err(|_| originals::unavailable())?;
+        let tx = connection
+            .transaction()
+            .map_err(|_| originals::unavailable())?;
+        originals::identity(&tx).map(Some)
+    }
+    fn store_original(&self, record: &QqOriginalMessage) -> PluginResult<u64> {
+        let mut connection = self.0.lock().map_err(|_| originals::unavailable())?;
+        originals::store(&mut connection, record, None)
+    }
+    fn read_originals(
+        &self,
+        app: &str,
+        session: &SessionKey,
+        through_message_id: &str,
+    ) -> PluginResult<Vec<QqOriginalMessage>> {
+        let mut connection = self.0.lock().map_err(|_| originals::unavailable())?;
+        originals::read(&mut connection, app, session, through_message_id, None)
+    }
+    fn store_original_bound(
+        &self,
+        record: &QqOriginalMessage,
+        expected: &QqOriginalBinding,
+    ) -> PluginResult<u64> {
+        let mut connection = self.0.lock().map_err(|_| originals::unavailable())?;
+        originals::store(&mut connection, record, Some(expected))
+    }
+    fn read_originals_bound(
+        &self,
+        app: &str,
+        session: &SessionKey,
+        through_message_id: &str,
+        expected: &QqOriginalBinding,
+    ) -> PluginResult<Vec<QqOriginalMessage>> {
+        let mut connection = self.0.lock().map_err(|_| originals::unavailable())?;
+        originals::read(
+            &mut connection,
+            app,
+            session,
+            through_message_id,
+            Some(expected),
+        )
+    }
+    fn original_is_current_bound(
+        &self,
+        app: &str,
+        session: &SessionKey,
+        message_id: &str,
+        expected: &QqOriginalBinding,
+    ) -> PluginResult<bool> {
+        let mut connection = self.0.lock().map_err(|_| originals::unavailable())?;
+        originals::is_current(&mut connection, app, session, message_id, expected)
     }
 }
 

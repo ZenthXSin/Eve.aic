@@ -38,7 +38,7 @@ impl QqCommandHandler for Help {
         }
         if !matches!(words.as_slice(), ["/help"] | ["/help", "tools"]) {
             return Ok(Some(
-                "用法：/help 查看常用命令和实际对话工具；/help tools 查看工具说明；/help identity 查看本会话操作者标识。".into(),
+                "直接说你想做什么即可；/help 查看当前能力，/help tools 查看实际工具说明，/help identity 查看本会话操作者标识。".into(),
             ));
         }
         let names = self
@@ -48,7 +48,7 @@ impl QqCommandHandler for Help {
             .collect::<Vec<_>>()
             .join("、");
         let mut text = format!(
-            "当前实际对话工具（{} 个）：{names}\n",
+            "直接聊天即可使用当前已装配的能力，例如请我安排提醒、回忆偏好、处理后台工作或查看真实进度。\n当前实际对话工具（{} 个）：{names}\n",
             self.definitions.len()
         );
         if words.len() == 2 {
@@ -58,7 +58,7 @@ impl QqCommandHandler for Help {
                 text.push_str(&format!("\n{}：{description}", definition.name));
             }
         } else {
-            text.push_str("\n/admin：查看宿主确认的管理员状态\n/model、/model 模型名：查看或全局切换主模型（切换仅主人/管理员）\n/bind 密钥：绑定管理员（私聊与群聊分别绑定）\n/name 名字、/name：设置或查看自己的称呼\n/train start|stop|status：主动提问训练\n/self-learning status：自主学习状态\n/segment on|off|reset：分段输出\n/remember 内容、/memories、/recall 关键词：记忆\n/interests：兴趣；/knowledge 兴趣ID：资料\n/practice 兴趣ID：实践证据\n/skills、/tools：已固化技能和检查规则，列表可为空\n/goals、/mind、/plans：目标与计划\n/budget：后台自主运行预算\n/clarify、/clarify off|on：卡住时的提问\n/outreach、/outreach off|on：主动跟进\n/last-reply：取回当前会话发送失败的回复，不重新执行任务\n/cancel：取消当前任务\n/help tools：实际聊天工具说明\n\n命令对应能力未装配时会明确提示。工具调用以真实结果为准；检查规则不等于任意代码插件。");
+            text.push_str("\n可以直接问“你现在能做什么”“我的任务进行到哪了”“有哪些已经验证的技能”。需要运行环境的能力会说明实际缺少的条件；主人或管理员可以让我补齐并验证。技能列表为空表示尚未学会，工具执行以真实回执为准。\n\n管理权限依据宿主核验的身份；直接提出切换模型、解锁业务权限或停止任务等请求仍经过对应检查。兼容入口：/admin 查看角色，/bind 密钥绑定管理员，/help identity 查看可信账号标识，/last-reply 取回发送失败的回复，/cancel 取消当前任务，/help tools 查看工具说明。");
         }
         Ok(Some(text))
     }

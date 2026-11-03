@@ -11,7 +11,9 @@ use eve_interest_api::{
     INTEREST_GOAL_CHANNEL, INTEREST_GOAL_VERIFICATION, InterestAdmin, InterestStatus, StatementKind,
 };
 use eve_llm_api::{
-    ContextAssembler, ContextScope, ContextSnapshot, LlmError, LlmFuture, TurnInput,
+    ContextAssembler, ContextScope, ContextSnapshot, LlmError, LlmFuture, Tool, ToolCall,
+    ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolExecutionError, ToolFuture,
+    ToolValidationError, TurnInput,
 };
 use eve_memory_api::{EvidenceSource, MemoryAdmin, MemoryScope};
 use eve_outreach_api::{
@@ -30,6 +32,7 @@ use eve_qqbot_plugin::{
 };
 use eve_session_api::SessionKey;
 use eve_skill_api::{DistillStatus, SelectionStatus, SkillAdmin, SkillRef};
+use serde_json::{Value, json};
 use std::{
     cmp::Reverse,
     fmt::Write,
@@ -49,7 +52,7 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const DISTILL_GRACE_MS: u64 = 15 * 60 * 1000;
 const MAX_QUOTES: usize = 3;
 const DISABLED: &str = "主动交流未启用。";
-const HELP: &str = "用法：/outreach 查看 Eve 主动邀请的状态；/outreach off 请 Eve 不再发送主动交流或空闲闲聊邀请；/outreach on 恢复。";
+const HELP: &str = "直接告诉我“别主动找我了”“恢复主动交流”或“看看主动邀请状态”即可。也可用 /outreach 查看、/outreach off 关闭、/outreach on 恢复。";
 const SHOWN: usize = 3;
 
 fn now_ms() -> Result<u64, AppError> {
@@ -943,21 +946,136 @@ impl QqCommandHandler for Commands {
                     owner,
                 )
             }
-            [switch @ ("on" | "off")] => {
-                let quiet = *switch == "off";
-                let at = now_ms().map_err(|_| failure())?;
-                outreach
-                    .set_quiet(owner, quiet, at)
-                    .map_err(|_| failure())?;
-                if quiet {
-                    "好的，之后我不再发送学习进展或空闲闲聊邀请，直到你发送 /outreach on。".into()
-                } else {
-                    "好的，已恢复主动交流；学习进展和空闲闲聊邀请都会遵守冷却与反馈设置。".into()
-                }
-            }
+            [switch @ ("on" | "off")] => set_enabled(outreach.as_ref(), owner, *switch == "on")
+                .map_err(|_| failure())?["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
             _ => HELP.into(),
         };
         Ok(Some(reply))
+    }
+}
+
+/// 安静偏好只影响当前用户；两个入口共用同一次持久化提交。
+fn set_enabled(
+    outreach: &dyn OutreachAdmin,
+    owner: &str,
+    enabled: bool,
+) -> Result<Value, OutreachError> {
+    let at = now_ms().map_err(|_| OutreachError::Unavailable)?;
+    let preference = outreach.set_quiet(owner, !enabled, at)?;
+    let message = if preference.quiet {
+        "好的，之后我不再发送学习进展或空闲闲聊邀请，直到你告诉我恢复主动交流。"
+    } else {
+        "好的，已恢复主动交流偏好；实际邀请仍遵守宿主权限、冷却和反馈设置。"
+    };
+    Ok(json!({"saved":true,"enabled":!preference.quiet,"quiet":preference.quiet,"message":message}))
+}
+
+fn tool_owner(context: &ToolExecutionContext) -> Result<&str, ToolExecutionError> {
+    if context.is_cancel_requested() {
+        return Err(ToolExecutionError::Cancelled("本轮已取消".into()));
+    }
+    let scope = context
+        .scope()
+        .ok_or_else(|| ToolExecutionError::Failed("主动交流设置需要宿主绑定的用户身份".into()))?;
+    SessionKey::new(&scope.session_id, &scope.user_id)
+        .map_err(|_| ToolExecutionError::Failed("用户会话身份无效".into()))?;
+    if scope.user_id == crate::qq_group::USER {
+        return Err(ToolExecutionError::Failed(
+            "群体观察不能代替用户设置主动交流偏好".into(),
+        ));
+    }
+    Ok(&scope.user_id)
+}
+
+/// 当前用户通过自然聊天设置自己的安静偏好；不请求或投递消息。
+pub(crate) struct SetEnabledTool {
+    pub(crate) outreach: Arc<dyn OutreachAdmin>,
+}
+impl Tool for SetEnabledTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "set_outreach_enabled".into(),
+            description: "用户明确说不要主动找自己、暂停主动交流或恢复主动交流时调用。enabled=false 关闭自己的学习进展和空闲闲聊邀请，true 恢复偏好；不会立即发送消息，也不绕过宿主权限、冷却与反馈设置。设置按宿主绑定的本人身份保存，重启后保留；不能替别人设置，后台或子代理不能改变偏好。用户无需输入命令。".into(),
+            argument_schema: json!({"type":"object","properties":{"enabled":{"type":"boolean"}},"required":["enabled"],"additionalProperties":false}),
+            required_permissions: vec![],
+            concurrency: Some(ToolConcurrency::Serial { scope: "eve.outreach.preference".into() }),
+        }
+    }
+    fn validate_arguments(&self, value: &Value) -> Result<(), ToolValidationError> {
+        if value.as_object().is_some_and(|object| {
+            object.len() == 1 && object.get("enabled").is_some_and(Value::is_boolean)
+        }) {
+            Ok(())
+        } else {
+            Err(ToolValidationError {
+                message: "仅接受 enabled 布尔值；目标由宿主本人身份决定".into(),
+            })
+        }
+    }
+    fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
+        Box::pin(async move {
+            self.validate_arguments(&call.arguments)
+                .map_err(|error| ToolExecutionError::Failed(error.message))?;
+            let owner = tool_owner(&context)?;
+            if context.is_delegated() {
+                return Err(ToolExecutionError::Failed(
+                    "后台或子代理不能代替用户改变主动交流偏好".into(),
+                ));
+            }
+            set_enabled(
+                self.outreach.as_ref(),
+                owner,
+                call.arguments["enabled"].as_bool().unwrap_or(false),
+            )
+            .map_err(|_| ToolExecutionError::Failed("主动交流设置未确认保存；不能声称成功".into()))
+        })
+    }
+}
+
+/// 在自然聊天中展示与兼容命令同样的真实邀请回执和后续实践状态。
+pub(crate) struct StatusTool {
+    pub(crate) outreach: Arc<dyn OutreachAdmin>,
+    pub(crate) practice: Option<Arc<dyn PracticeAdmin>>,
+}
+impl Tool for StatusTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "outreach_status".into(),
+            description: "查看当前用户自己的主动交流偏好、最近邀请真实送达回执、回应及后续实践进展。只读，不发送消息，不改变偏好；Unknown 不得称已送达，也不得据此重发。需要关闭或恢复自己的主动交流时用 set_outreach_enabled。".into(),
+            argument_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+            required_permissions: vec![],
+            concurrency: Some(ToolConcurrency::ParallelSafe),
+        }
+    }
+    fn validate_arguments(&self, value: &Value) -> Result<(), ToolValidationError> {
+        if value.as_object().is_some_and(|object| object.is_empty()) {
+            Ok(())
+        } else {
+            Err(ToolValidationError {
+                message: "主动交流状态不接受参数；只查询当前可信用户".into(),
+            })
+        }
+    }
+    fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
+        Box::pin(async move {
+            self.validate_arguments(&call.arguments)
+                .map_err(|error| ToolExecutionError::Failed(error.message))?;
+            let owner = tool_owner(&context)?;
+            let failure = || ToolExecutionError::Failed("主动交流记录暂时不可用".into());
+            let snapshot = self.outreach.snapshot().map_err(|_| failure())?;
+            let practice = self
+                .practice
+                .as_ref()
+                .map(|practice| practice.snapshot())
+                .transpose()
+                .map_err(|_| failure())?;
+            Ok(
+                json!({"quiet":snapshot.quiet(owner),"enabled":!snapshot.quiet(owner),"message":status(&snapshot, practice.as_ref(), owner)}),
+            )
+        })
     }
 }
 
@@ -967,7 +1085,7 @@ fn status(
     owner: &str,
 ) -> String {
     let mut reply = if snapshot.quiet(owner) {
-        "主动邀请：已关闭（发送 /outreach on 恢复）".to_string()
+        "主动邀请：已关闭（告诉我恢复主动交流即可）".to_string()
     } else {
         "主动邀请：开启（学习进展与空闲闲聊按宿主配置和冷却投递）".to_string()
     };

@@ -209,6 +209,8 @@ pub struct TurnDiagnostics {
     pub peak_parallelism: usize,
     pub calls: Vec<ToolCallDiagnostic>,
     pub tool_results: Vec<ToolResult>,
+    /// 压缩前独立采集的完整审核原话，供失败持久化和恢复使用；不是模型生成的消息。
+    pub review_user_messages: Option<Vec<String>>,
 }
 
 impl Default for TurnDiagnostics {
@@ -221,6 +223,7 @@ impl Default for TurnDiagnostics {
             peak_parallelism: 0,
             calls: Vec::new(),
             tool_results: Vec::new(),
+            review_user_messages: None,
         }
     }
 }
@@ -236,7 +239,7 @@ pub struct TurnOutput {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TurnFailure {
     pub error: LlmError,
-    pub diagnostics: TurnDiagnostics,
+    pub diagnostics: Box<TurnDiagnostics>,
 }
 
 struct PreparedTool {
@@ -250,6 +253,21 @@ struct ToolCaller {
     continuation: eve_llm_api::TaskContinuation,
     conversation: Arc<Vec<ChatMessage>>,
     review_user_messages: Arc<Vec<String>>,
+    review_guard: Option<Arc<dyn eve_llm_api::ReviewEvidenceGuard>>,
+}
+
+struct ChannelReviewGuard {
+    source: Arc<dyn eve_llm_api::ReviewUserMessageSource>,
+    scope: eve_llm_api::ContextScope,
+    anchor: String,
+}
+impl eve_llm_api::ReviewEvidenceGuard for ChannelReviewGuard {
+    fn check(&self) -> Result<(), eve_llm_api::ToolExecutionError> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.source.is_current(&self.scope, &self.anchor))) {
+            Ok(Ok(true)) => Ok(()),
+            _ => Err(eve_llm_api::ToolExecutionError::Rejected("review_evidence_changed：有新用户消息或原文不可核验，旧审批不再执行；先理解最新消息再决定".into())),
+        }
+    }
 }
 
 struct PreparedTurn {
@@ -480,6 +498,10 @@ pub struct LlmHost {
     tool_scope_policy: Option<Arc<dyn eve_llm_api::ToolScopePolicy>>,
     shared_steps: Option<eve_llm_api::SharedToolSteps>,
     delegated: bool,
+    delegated_review: Option<(eve_llm_api::ContextScope, Arc<Vec<String>>)>,
+    review_source: Option<Arc<dyn eve_llm_api::ReviewUserMessageSource>>,
+    review_anchor: Option<String>,
+    background_task_id: Option<String>,
     run_deadline: Option<std::time::Instant>,
     journal: Option<Arc<dyn eve_llm_api::TurnJournal>>,
     image_source: Option<Arc<dyn eve_llm_api::TurnImageSource>>,
@@ -543,6 +565,10 @@ impl LlmHost {
             tool_scope_policy: None,
             shared_steps: None,
             delegated: false,
+            delegated_review: None,
+            review_source: None,
+            review_anchor: None,
+            background_task_id: None,
             run_deadline: None,
             journal: None,
             image_source: None,
@@ -618,6 +644,133 @@ impl LlmHost {
     pub fn delegated(mut self) -> Self {
         self.delegated = true;
         self
+    }
+    /// 由可信宿主冻结的委派授权原话。任务说明、模型参数和普通历史不能代替此通道。
+    /// 原话绑定完整作用域；恢复时由持久任务记录重新装配，不从检查点消息推断授权。
+    pub fn with_delegated_review_messages(
+        mut self,
+        scope: eve_llm_api::ContextScope,
+        messages: Vec<String>,
+    ) -> Result<Self, LlmError> {
+        if scope.session_id.trim().is_empty()
+            || scope.user_id.trim().is_empty()
+            || scope.session_id.chars().any(char::is_control)
+            || scope.user_id.chars().any(char::is_control)
+        {
+            return Err(LlmError::Configuration(
+                "委派审核原话缺少可信完整身份".into(),
+            ));
+        }
+        validate_delegated_review_messages(&messages)?;
+        self.delegated = true;
+        self.review_anchor = None;
+        self.delegated_review = Some((scope, Arc::new(messages)));
+        Ok(self)
+    }
+    pub fn with_review_user_message_source(
+        mut self,
+        source: Arc<dyn eve_llm_api::ReviewUserMessageSource>,
+    ) -> Self {
+        self.review_source = Some(source);
+        self
+    }
+    /// 单次执行由可信控制宿主绑定原始入站消息；正文内容不能选择或覆盖锚点。
+    pub fn with_review_user_message_anchor(mut self, anchor: String) -> Result<Self, LlmError> {
+        if self.delegated
+            || anchor.is_empty()
+            || anchor.len() > 256
+            || anchor.trim() != anchor
+            || anchor.chars().any(char::is_control)
+        {
+            return Err(LlmError::Context("审核原文锚点无效".into()));
+        }
+        self.review_anchor = Some(anchor);
+        Ok(self)
+    }
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)]
+    fn apply_steering_batch(
+        &self,
+        batch: eve_llm_api::SteeringBatch,
+        scope: Option<&eve_llm_api::ContextScope>,
+        review_user_messages: &mut Arc<Vec<String>>,
+        diagnostics: &mut TurnDiagnostics,
+        planned_history: bool,
+        messages: &mut Vec<ChatMessage>,
+        transcript: &mut Vec<ChatMessage>,
+    ) -> Result<(), TurnFailure> {
+        if batch.messages.is_empty() {
+            if batch.review_anchor.is_some() {
+                return Err(fail(
+                    LlmError::Context("空引导批次不能推进审核锚点".into()),
+                    diagnostics.clone(),
+                ));
+            }
+            return Ok(());
+        }
+        if !self.delegated {
+            if self.review_anchor.is_some() && batch.review_anchor.is_none() {
+                return Err(fail(
+                    LlmError::Context("可信通道引导缺少消息锚点".into()),
+                    diagnostics.clone(),
+                ));
+            }
+            let originals = Arc::make_mut(review_user_messages);
+            // 使用消费批次携带的锚点；后到而未消费的消息不参与当前工具授权。
+            if let Some(current) = self
+                .channel_review_messages(scope, batch.review_anchor.as_deref())
+                .map_err(|error| fail(error, diagnostics.clone()))?
+            {
+                *originals = current;
+            } else {
+                originals.extend(batch.messages.iter().cloned());
+                originals.drain(..originals.len().saturating_sub(6));
+            }
+            diagnostics.review_user_messages = Some(originals.clone());
+            if planned_history {
+                validate_review_originals(originals)
+                    .map_err(|error| fail(error, diagnostics.clone()))?;
+            }
+        }
+        for text in batch.messages {
+            let message = ChatMessage::text(ChatRole::User, text);
+            messages.push(message.clone());
+            transcript.push(message);
+        }
+        Ok(())
+    }
+    pub fn with_background_task_id(mut self, id: String) -> Self {
+        self.background_task_id = Some(id);
+        self
+    }
+
+    fn channel_review_messages(
+        &self,
+        scope: Option<&eve_llm_api::ContextScope>,
+        anchor: Option<&str>,
+    ) -> Result<Option<Vec<String>>, LlmError> {
+        if self.delegated {
+            return Ok(None);
+        }
+        let Some((source, scope)) = self.review_source.as_ref().zip(scope) else {
+            if anchor.is_some() {
+                return Err(LlmError::Context(
+                    "审核消息锚点没有对应可信来源或身份".into(),
+                ));
+            }
+            return Ok(None);
+        };
+        let messages = catch_unwind(AssertUnwindSafe(|| match anchor {
+            Some(anchor) => source.read_at(scope, anchor),
+            None => source.read(scope),
+        }))
+        .map_err(|_| LlmError::Context("原始授权来源读取异常，未执行工具".into()))??;
+        if anchor.is_some() && messages.is_none() {
+            return Err(LlmError::Context("可信来源没有处理本轮审核锚点".into()));
+        }
+        if let Some(messages) = &messages {
+            validate_delegated_review_messages(messages)?;
+        }
+        Ok(messages)
     }
     pub fn with_run_deadline(mut self, deadline: std::time::Instant) -> Self {
         self.run_deadline = Some(self.run_deadline.map_or(deadline, |old| old.min(deadline)));
@@ -810,6 +963,14 @@ impl LlmHost {
         events: Option<&EventDelivery<'_>>,
     ) -> Result<TurnOutput, TurnFailure> {
         let mut diagnostics = TurnDiagnostics::default();
+        if let Some((evidence_scope, _)) = &self.delegated_review
+            && scope.as_ref() != Some(evidence_scope)
+        {
+            return Err(fail(
+                LlmError::Context("委派审核原话身份不符；未请求模型或执行工具".into()),
+                diagnostics,
+            ));
+        }
         let steering = match (&self.steering, scope.as_ref(), turn_id) {
             (Some(source), Some(scope), Some(turn_id)) => Some(
                 source
@@ -854,11 +1015,18 @@ impl LlmHost {
             }
         }
         // 审核原话独立保留，先于历史窗口裁剪和上下文压缩；委派说明不是用户授权。
-        let mut review_user_messages = Arc::new(review_originals(
-            &prepared.context.history,
-            &input.text,
-            self.delegated,
-        ));
+        let mut review_user_messages = match &self.delegated_review {
+            Some((_, originals)) => originals.clone(),
+            None => Arc::new(
+                self.channel_review_messages(scope.as_ref(), self.review_anchor.as_deref())
+                    .map_err(|error| fail(error, diagnostics.clone()))?
+                    .unwrap_or_else(|| {
+                        review_originals(&prepared.context.history, &input.text, self.delegated)
+                    }),
+            ),
+        };
+        diagnostics.review_user_messages = Some(review_user_messages.as_ref().clone());
+        let mut consumed_review_anchor = self.review_anchor.clone();
         let mut planned_history = false;
         if let Some(planner) = &self.history_context_planner {
             let deadline = self
@@ -1072,22 +1240,21 @@ impl LlmHost {
         };
         loop {
             if let Some(steering) = &steering {
-                for text in steering
-                    .take(false)
-                    .map_err(|error| fail(error, diagnostics.clone()))?
-                {
-                    if !self.delegated {
-                        let originals = Arc::make_mut(&mut review_user_messages);
-                        originals.push(text.clone());
-                        originals.drain(..originals.len().saturating_sub(6));
-                        if planned_history {
-                            validate_review_originals(originals)
-                                .map_err(|error| fail(error, diagnostics.clone()))?;
-                        }
-                    }
-                    let message = ChatMessage::text(ChatRole::User, text);
-                    messages.push(message.clone());
-                    transcript.push(message);
+                let batch = steering
+                    .take_batch(false)
+                    .map_err(|error| fail(error, diagnostics.clone()))?;
+                let next_anchor = batch.review_anchor.clone();
+                self.apply_steering_batch(
+                    batch,
+                    scope.as_ref(),
+                    &mut review_user_messages,
+                    &mut diagnostics,
+                    planned_history,
+                    &mut messages,
+                    &mut transcript,
+                )?;
+                if next_anchor.is_some() {
+                    consumed_review_anchor = next_anchor;
                 }
             }
             // 本轮还没有任何工具调用（含恢复的旧调用）时按闲聊阈值压缩；一旦开始做事改用主阈值。
@@ -1177,27 +1344,27 @@ impl LlmHost {
                 Err(error) => return Err(fail(error, diagnostics)),
             };
             if let Some(steering) = &steering {
-                let extra = steering
-                    .take(
+                let batch = steering
+                    .take_batch(
                         matches!(response, ModelResponse::Final { .. })
                             && (closing || continuation.remaining().is_none()),
                     )
                     .map_err(|error| fail(error, diagnostics.clone()))?;
-                if !extra.is_empty() {
-                    for text in extra {
-                        if !self.delegated {
-                            let originals = Arc::make_mut(&mut review_user_messages);
-                            originals.push(text.clone());
-                            originals.drain(..originals.len().saturating_sub(6));
-                            if planned_history {
-                                validate_review_originals(originals)
-                                    .map_err(|error| fail(error, diagnostics.clone()))?;
-                            }
-                        }
-                        let message = ChatMessage::text(ChatRole::User, text);
-                        messages.push(message.clone());
-                        transcript.push(message);
-                    }
+                let has_extra = !batch.messages.is_empty();
+                let next_anchor = batch.review_anchor.clone();
+                self.apply_steering_batch(
+                    batch,
+                    scope.as_ref(),
+                    &mut review_user_messages,
+                    &mut diagnostics,
+                    planned_history,
+                    &mut messages,
+                    &mut transcript,
+                )?;
+                if next_anchor.is_some() {
+                    consumed_review_anchor = next_anchor;
+                }
+                if has_extra {
                     // 尚未开始的旧工具批次不执行；已完成的工具回执仍保留，不重放。
                     continue;
                 }
@@ -1329,6 +1496,22 @@ impl LlmHost {
                         continuation: continuation.clone(),
                         conversation: Arc::new(messages.clone()),
                         review_user_messages: review_user_messages.clone(),
+                        review_guard: if self.delegated {
+                            None
+                        } else {
+                            self.review_source
+                                .as_ref()
+                                .zip(scope.as_ref())
+                                .zip(consumed_review_anchor.as_ref())
+                                .map(|((source, scope), anchor)| {
+                                    Arc::new(ChannelReviewGuard {
+                                        source: source.clone(),
+                                        scope: scope.clone(),
+                                        anchor: anchor.clone(),
+                                    })
+                                        as Arc<dyn eve_llm_api::ReviewEvidenceGuard>
+                                })
+                        },
                     },
                 )
                 .await
@@ -1751,10 +1934,19 @@ impl LlmHost {
                 .with_conversation(caller.conversation.clone())
                 .with_review_user_messages(caller.review_user_messages.clone())
                 .with_turn_id(caller.turn_id)
+                .with_call_id(prepared_call.call.id.clone())
                 .with_deadline(self.run_deadline)
                 .with_delegated(self.delegated);
+            let context = match &caller.review_guard {
+                Some(guard) => context.with_review_evidence_guard(guard.clone()),
+                None => context,
+            };
             let context = match &self.shared_steps {
                 Some(steps) => context.with_shared_steps(steps.clone()),
+                None => context,
+            };
+            let context = match &self.background_task_id {
+                Some(id) => context.with_background_task_id(id.clone()),
                 None => context,
             };
             let timeout = self
@@ -2069,6 +2261,21 @@ fn validate_review_originals(messages: &[String]) -> Result<(), LlmError> {
     Ok(())
 }
 
+fn validate_delegated_review_messages(messages: &[String]) -> Result<(), LlmError> {
+    validate_review_originals(messages)?;
+    if messages.len() > 6
+        || serde_json::to_vec(messages)
+            .map_err(|_| LlmError::Context("委派审核原话无法编码".into()))?
+            .len()
+            > eve_llm_api::MAX_REVIEW_USER_MESSAGES_BYTES
+    {
+        return Err(LlmError::Context(
+            "委派审核原话超过六条或容量上限；原文未裁剪，未授权执行".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn build_messages(
     config: &LlmHostConfig,
     context: &ContextSnapshot,
@@ -2227,20 +2434,21 @@ fn backend(error: PluginError) -> LlmError {
 
 fn fail(error: LlmError, mut diagnostics: TurnDiagnostics) -> TurnFailure {
     diagnostics.stage = TurnStage::Failed;
-    TurnFailure { error, diagnostics }
+    TurnFailure {
+        error,
+        diagnostics: Box::new(diagnostics),
+    }
 }
 
 fn review_originals(history: &[ChatMessage], input: &str, delegated: bool) -> Vec<String> {
     if delegated {
         return vec![];
     }
-    let is_user = |text: &&str| !text.starts_with("【宿主条件触发事件；不是用户新消息】");
     let mut originals: Vec<_> = history
         .iter()
         .filter(|message| message.role == ChatRole::User)
         .filter_map(|message| message.text.as_deref())
         .chain(std::iter::once(input))
-        .filter(is_user)
         .rev()
         .take(6)
         .map(str::to_owned)
@@ -2264,10 +2472,6 @@ mod tests {
                 "助手不是授权",
             ));
         }
-        history.push(eve_llm_api::ChatMessage::text(
-            eve_llm_api::ChatRole::User,
-            "【宿主条件触发事件；不是用户新消息】后台事件",
-        ));
         let current = "当前原话".repeat(20_000);
         let actual = super::review_originals(&history, &current, false);
         let mut expected: Vec<_> = (15..20)
@@ -2276,9 +2480,10 @@ mod tests {
         expected.push(current.clone());
         assert_eq!(actual, expected);
         let event = "【宿主条件触发事件；不是用户新消息】定时";
-        let expected: Vec<_> = (14..20)
+        let mut expected: Vec<_> = (15..20)
             .map(|n| format!("原话{n}:{}", "汉字".repeat(10_000)))
             .collect();
+        expected.push(event.into());
         assert_eq!(super::review_originals(&history, event, false), expected);
         assert!(super::review_originals(&history, &current, true).is_empty());
     }
@@ -2652,6 +2857,84 @@ mod tests {
         assert_eq!(output.text, "完成");
         assert_eq!(output.diagnostics.provider_requests, 2);
         assert_eq!(output.diagnostics.tool_results[0].call_id, "c1");
+    }
+
+    #[tokio::test]
+    async fn steering_review_uses_consumed_anchor_even_when_source_has_newer_messages() {
+        struct Source;
+        impl eve_llm_api::ReviewUserMessageSource for Source {
+            fn read(&self, _: &eve_llm_api::ContextScope) -> Result<Option<Vec<String>>, LlmError> {
+                panic!("不能读取后到消息的可变最新授权");
+            }
+            fn read_at(
+                &self,
+                _: &eve_llm_api::ContextScope,
+                anchor: &str,
+            ) -> Result<Option<Vec<String>>, LlmError> {
+                match anchor {
+                    "consumed" => Ok(Some(vec!["已消费的真实正文：只读".into()])),
+                    "later" => Ok(Some(vec!["尚未消费的新消息：允许写入".into()])),
+                    _ => Err(LlmError::Context("未知锚点".into())),
+                }
+            }
+        }
+        let host = setup(
+            Arc::new(ScriptedProvider {
+                calls: Mutex::new(vec![]),
+            }),
+            Arc::new(EchoTool {
+                active: Arc::new(AtomicUsize::new(0)),
+                peak: Arc::new(AtomicUsize::new(0)),
+            }),
+        )
+        .await
+        .with_review_user_message_source(Arc::new(Source))
+        .with_review_user_message_anchor("initial".into())
+        .unwrap();
+        let scope = eve_llm_api::ContextScope {
+            session_id: "scope".into(),
+            user_id: "owner".into(),
+        };
+        let mut originals = Arc::new(vec!["原任务".into()]);
+        let mut diagnostics = TurnDiagnostics::default();
+        let mut messages = vec![];
+        let mut transcript = vec![];
+        host.apply_steering_batch(
+            eve_llm_api::SteeringBatch {
+                messages: vec!["显示加工文字".into()],
+                review_anchor: Some("consumed".into()),
+            },
+            Some(&scope),
+            &mut originals,
+            &mut diagnostics,
+            false,
+            &mut messages,
+            &mut transcript,
+        )
+        .unwrap();
+        assert_eq!(originals.as_ref(), &["已消费的真实正文：只读"]);
+        assert_eq!(
+            diagnostics.review_user_messages.as_ref().unwrap(),
+            originals.as_ref()
+        );
+        assert_eq!(messages[0].text.as_deref(), Some("显示加工文字"));
+        let before = messages.clone();
+        assert!(
+            host.apply_steering_batch(
+                eve_llm_api::SteeringBatch {
+                    messages: vec!["缺锚点不能授权".into()],
+                    review_anchor: None,
+                },
+                Some(&scope),
+                &mut originals,
+                &mut diagnostics,
+                false,
+                &mut messages,
+                &mut transcript
+            )
+            .is_err()
+        );
+        assert_eq!(messages, before);
     }
 
     #[tokio::test]

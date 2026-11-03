@@ -32,15 +32,6 @@ pub(crate) fn key(id: &str) -> PanelResult<SessionKey> {
     }
     SessionKey::new(format!("{PREFIX}{id}"), USER).map_err(|_| PanelError::InvalidInput)
 }
-pub(crate) struct OwnerAuthorization;
-impl eve_developer_api::DeveloperAuthorization for OwnerAuthorization {
-    fn is_operator(&self, scope: &ContextScope) -> bool {
-        is_owner(scope)
-    }
-    fn allows_workspace_development(&self, scope: &ContextScope) -> bool {
-        is_owner(scope)
-    }
-}
 pub(crate) struct WebContext {
     pub inner: Arc<dyn eve_llm_api::ContextAssembler>,
     pub web: Option<Arc<dyn eve_llm_api::ContextAssembler>>,
@@ -78,6 +69,10 @@ impl eve_llm_api::ContextAssembler for WebContext {
 struct Receipt {
     version: u32,
     fingerprint: String,
+    #[serde(default)]
+    local_control: bool,
+    #[serde(default)]
+    memory_recorded: bool,
     state: ChatState,
 }
 pub(crate) struct WebChat {
@@ -86,6 +81,12 @@ pub(crate) struct WebChat {
     claims: PathBuf,
     open: std::sync::atomic::AtomicBool,
     admission: Mutex<std::collections::BTreeMap<String, eve_control_api::GenerationKey>>,
+    business: Option<Arc<crate::qq_business::BusinessTool>>,
+    recovery: Option<Arc<dyn eve_qqbot_plugin::QqFailureRecovery>>,
+    ingress: Option<Arc<crate::web_ingress::RawMessages>>,
+    subject_admission: Option<Arc<dyn eve_qqbot_plugin::QqAdmission>>,
+    memory: Option<crate::web_memory::Observer>,
+    training: Option<Arc<dyn eve_training_api::TrainingService>>,
 }
 fn unavailable<T>(_: T) -> PanelError {
     PanelError::Unavailable
@@ -173,7 +174,125 @@ impl WebChat {
             claims,
             open: std::sync::atomic::AtomicBool::new(true),
             admission: Mutex::new(Default::default()),
+            business: None,
+            recovery: None,
+            ingress: None,
+            subject_admission: None,
+            memory: None,
+            training: None,
         })
+    }
+    pub(crate) fn with_business(mut self, business: Arc<crate::qq_business::BusinessTool>) -> Self {
+        self.business = Some(business);
+        self
+    }
+    pub(crate) fn with_recovery(
+        mut self,
+        recovery: Arc<dyn eve_qqbot_plugin::QqFailureRecovery>,
+    ) -> Self {
+        self.recovery = Some(recovery);
+        self
+    }
+    pub(crate) fn with_ingress(mut self, ingress: Arc<crate::web_ingress::RawMessages>) -> Self {
+        self.ingress = Some(ingress);
+        self
+    }
+    pub(crate) fn with_admission(
+        mut self,
+        admission: Arc<dyn eve_qqbot_plugin::QqAdmission>,
+    ) -> Self {
+        self.subject_admission = Some(admission);
+        self
+    }
+    pub(crate) fn with_memory(
+        mut self,
+        memory: Arc<dyn eve_memory_api::MemoryAdmin>,
+        sessions: Arc<dyn eve_session_api::SessionService>,
+    ) -> Self {
+        self.memory = Some(crate::web_memory::Observer { memory, sessions });
+        self
+    }
+    pub(crate) fn with_training(
+        mut self,
+        training: Arc<dyn eve_training_api::TrainingService>,
+    ) -> Self {
+        self.training = Some(training);
+        self
+    }
+    fn observe_memory(&self, receipt: &mut Receipt) -> PanelResult<()> {
+        if receipt.local_control || receipt.memory_recorded || receipt.state.status != "completed" {
+            return Ok(());
+        }
+        let Some(memory) = &self.memory else {
+            return Ok(());
+        };
+        let error = match memory.record(&receipt.state, &receipt.fingerprint) {
+            Ok(()) => {
+                if let (Some(training), Some(text)) = (&self.training, &receipt.state.text) {
+                    let session = key(&receipt.state.conversation_id)?;
+                    crate::conversation_learning::observe(
+                        training.as_ref(),
+                        &ContextScope {
+                            session_id: session.session_id,
+                            user_id: session.user_id,
+                        },
+                        &format!("eve:{}", receipt.state.request_id),
+                        "eve",
+                        eve_training_api::ConversationRole::Eve,
+                        text,
+                    )
+                    .map_err(unavailable)?;
+                }
+                receipt.memory_recorded = true;
+                None
+            }
+            Err(error) => {
+                eprintln!(
+                    "EVE_WEB_MEMORY_UNCONFIRMED request_id={} error={error}",
+                    receipt.state.request_id
+                );
+                Some(format!("交流记忆尚未确认保存：{error}"))
+            }
+        };
+        if receipt.memory_recorded || receipt.state.memory_error != error {
+            receipt.state.memory_error = error;
+            self.save(receipt, false)?;
+        }
+        Ok(())
+    }
+    /// 只恢复已落盘的完成回执，不重发输入、模型或工具。
+    /// 单次流式扫描避免把无限期保留的幂等回执全部装入内存。
+    pub(crate) fn recover_memory(&self) -> PanelResult<()> {
+        if self.memory.is_none() {
+            return Ok(());
+        }
+        let _active = self.admission.lock().map_err(unavailable)?;
+        for entry in fs::read_dir(&self.claims).map_err(unavailable)? {
+            let name = entry.map_err(unavailable)?.file_name();
+            let Some((conversation_id, request_id)) = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+                .and_then(|name| name.split_once('-'))
+            else {
+                return Err(PanelError::Unavailable);
+            };
+            let mut receipt = self
+                .load(&ChatLookup {
+                    conversation_id: conversation_id.into(),
+                    request_id: request_id.into(),
+                })?
+                .ok_or(PanelError::Unavailable)?;
+            self.observe_memory(&mut receipt)?;
+        }
+        Ok(())
+    }
+    fn cancel_active(&self, session: &SessionKey) -> PanelResult<()> {
+        if let Some(snapshot) = self.control.snapshot(session).map_err(control_error)?
+            && snapshot.report.is_none()
+        {
+            self.control.cancel(&snapshot.key).map_err(control_error)?;
+        }
+        Ok(())
     }
     pub fn info(&self) -> ChatInfo {
         ChatInfo {
@@ -227,7 +346,13 @@ impl WebChat {
                     | "rejected"
             )
             || (receipt.state.status == "completed"
-                && (receipt.state.text.is_none() || receipt.state.generation.is_none()))
+                && (receipt.state.text.is_none()
+                    || (!receipt.local_control && receipt.state.generation.is_none())))
+            || (receipt.local_control && receipt.state.generation.is_some())
+            || (receipt.memory_recorded
+                && (receipt.local_control
+                    || receipt.state.status != "completed"
+                    || receipt.state.memory_error.is_some()))
             || receipt.state.conversation_id != id.conversation_id
             || receipt.state.request_id != id.request_id
             || receipt.fingerprint.len() != 64
@@ -299,6 +424,7 @@ impl WebChat {
             receipt.state.status.as_str(),
             "completed" | "failed" | "rejected"
         ) {
+            self.observe_memory(&mut receipt)?;
             return Ok(receipt.state);
         }
         let Some(snapshot) = snapshot.filter(|s| {
@@ -364,6 +490,7 @@ impl WebChat {
                 );
             }
             self.save(&receipt, false)?;
+            self.observe_memory(&mut receipt)?;
         }
         Ok(receipt.state)
     }
@@ -388,6 +515,96 @@ impl WebChat {
                 receipt,
                 self.control.snapshot(&session).map_err(control_error)?,
             );
+        }
+        // 可信 HTTP 原文的明确缩权先落意图再执行，不能被同会话在途模型审核挡住。
+        // 这条路径不授权新业务；重复请求只返回原回执，崩溃窗口保留 unknown。
+        if let Some(business) = &self.business
+            && crate::qq_business::BusinessTool::is_restriction_input(&request.text)
+        {
+            let mut receipt = Receipt {
+                version: 1,
+                fingerprint,
+                local_control: true,
+                memory_recorded: false,
+                state: ChatState {
+                    conversation_id: request.conversation_id,
+                    request_id: request.request_id,
+                    status: "accepted".into(),
+                    generation: None,
+                    turn_id: None,
+                    text: None,
+                    failure: None,
+                    memory_error: None,
+                    started_tools: Some(0),
+                    tool_receipts: 0,
+                },
+            };
+            let scope = ContextScope {
+                session_id: session.session_id.clone(),
+                user_id: session.user_id.clone(),
+            };
+            let originals = (|| {
+                self.save(&receipt, true)?;
+                let ingress = self.ingress.as_ref().ok_or(PanelError::Unavailable)?;
+                ingress
+                    .record(&session, &receipt.state.request_id, &request.text)
+                    .map_err(unavailable)?;
+                eve_llm_api::ReviewUserMessageSource::read_at(
+                    ingress.as_ref(),
+                    &scope,
+                    &receipt.state.request_id,
+                )
+                .map_err(unavailable)?
+                .ok_or(PanelError::Unavailable)
+            })();
+            let originals = match originals {
+                Ok(originals) => originals,
+                Err(error) => {
+                    let _ = business.restrict_missing(
+                        &scope,
+                        &format!("web-request:{}", receipt.state.request_id),
+                        &request.text,
+                    );
+                    if self.cancel_active(&session).is_err() {
+                        eprintln!("EVE_WEB_CHAT_RESTRICTION_CANCEL_UNCONFIRMED");
+                    }
+                    return Err(error);
+                }
+            };
+            let restricted = business.restrict_input(
+                &scope,
+                &format!("web-request:{}", receipt.state.request_id),
+                &originals,
+            );
+            // 已认证主人明确缩权；即使业务审计或后台结算失败，仍停止前台。
+            let cancelled = self.cancel_active(&session);
+            match restricted {
+                Ok(true) => {
+                    if cancelled.is_ok() {
+                        receipt.state.status = "completed".into();
+                        receipt.state.text = Some(
+                            "当前会话业务权限已关闭；已请求停止在途执行，已有操作及回执保留。"
+                                .into(),
+                        );
+                    } else {
+                        receipt.state.status = "failed".into();
+                        receipt.state.failure = Some(
+                            "当前会话业务权限已关闭；前台停止尚未确认，已有操作及回执保留。".into(),
+                        );
+                    }
+                }
+                Ok(false) => {
+                    receipt.state.status = "rejected".into();
+                    receipt.state.failure = Some("当前入口身份未通过缩权核验，未执行。".into());
+                }
+                Err(_) => {
+                    receipt.state.status = "failed".into();
+                    receipt.state.failure =
+                        Some("缩权或取消结算未能确认；业务保持关闭，原记录保留。".into());
+                }
+            }
+            self.save(&receipt, false)?;
+            return Ok(receipt.state);
         }
         let mut unreadable = false;
         active.retain(
@@ -423,6 +640,8 @@ impl WebChat {
         let mut receipt = Receipt {
             version: 1,
             fingerprint,
+            local_control: false,
+            memory_recorded: false,
             state: ChatState {
                 conversation_id: request.conversation_id,
                 request_id: request.request_id,
@@ -431,27 +650,124 @@ impl WebChat {
                 turn_id: None,
                 text: None,
                 failure: None,
+                memory_error: None,
                 started_tools: None,
                 tool_receipts: 0,
             },
         };
-        self.save(&receipt, true)?;
-        let generation = self
-            .control
-            .submit(
-                ControlInput {
-                    session: SessionInput {
-                        key: session,
-                        text: request.text,
-                    },
-                    task_id: format!("web-request:{}", receipt.state.request_id),
+        let ticket = match &self.subject_admission {
+            Some(admission) => {
+                let source = format!("web-request:{}", receipt.state.request_id);
+                match admission.begin(&session, &source).map_err(unavailable)? {
+                    Some(ticket) => Some(ticket),
+                    None => {
+                        // 保存终态，使同请求重试稳定；撤回无人消费的主体队头。
+                        receipt.state.status = "rejected".into();
+                        receipt.state.failure =
+                            Some("主体正在执行其他工作，本次输入未执行；稍后可发送新请求。".into());
+                        let saved = self.save(&receipt, true);
+                        admission.abandon(&session, &source).map_err(unavailable)?;
+                        saved?;
+                        return Ok(receipt.state);
+                    }
+                }
+            }
+            None => None,
+        };
+        if let Err(error) = self.save(&receipt, true) {
+            if let (Some(admission), Some(ticket)) = (&self.subject_admission, &ticket) {
+                admission
+                    .finish(ticket, eve_qqbot_plugin::QqAdmissionResult::Rejected)
+                    .map_err(unavailable)?;
+            }
+            return Err(error);
+        }
+        if let Some(ingress) = &self.ingress
+            && let Err(error) = ingress.record(&session, &receipt.state.request_id, &request.text)
+        {
+            if let (Some(admission), Some(ticket)) = (&self.subject_admission, &ticket) {
+                admission
+                    .finish(ticket, eve_qqbot_plugin::QqAdmissionResult::Rejected)
+                    .map_err(unavailable)?;
+            }
+            return Err(unavailable(error));
+        }
+        let metadata = self
+            .ingress
+            .as_ref()
+            .map(|_| eve_control_api::ControlRunMetadata {
+                scope: ContextScope {
+                    session_id: session.session_id.clone(),
+                    user_id: session.user_id.clone(),
                 },
-                Arc::new(DiscardControlEvents),
+                task_id: format!("web-request:{}", receipt.state.request_id),
+                review: eve_control_api::ControlReviewEvidence::ChannelAnchor(
+                    receipt.state.request_id.clone(),
+                ),
+            });
+        if let Some(training) = &self.training {
+            let scope = ContextScope {
+                session_id: session.session_id.clone(),
+                user_id: session.user_id.clone(),
+            };
+            training
+                .observe_user_message(&scope, &receipt.state.request_id, &request.text)
+                .map_err(unavailable)?;
+            crate::conversation_learning::observe(
+                training.as_ref(),
+                &scope,
+                &receipt.state.request_id,
+                &session.user_id,
+                eve_training_api::ConversationRole::Human,
+                &request.text,
             )
-            .map_err(control_error)?;
+            .map_err(unavailable)?;
+        }
+        let submitted = self.control.submit_with_metadata(
+            ControlInput {
+                session: SessionInput {
+                    key: session,
+                    text: request.text,
+                },
+                task_id: format!("web-request:{}", receipt.state.request_id),
+            },
+            metadata,
+            Arc::new(DiscardControlEvents),
+        );
+        let admitted = if let (Some(admission), Some(ticket)) = (&self.subject_admission, &ticket) {
+            let outcome = match &submitted {
+                Ok(_) => eve_qqbot_plugin::QqAdmissionResult::Started,
+                Err(
+                    eve_control_api::ControlError::Unavailable
+                    | eve_control_api::ControlError::Blocked,
+                ) => eve_qqbot_plugin::QqAdmissionResult::Unknown,
+                Err(_) => eve_qqbot_plugin::QqAdmissionResult::Rejected,
+            };
+            admission.finish(ticket, outcome).map_err(unavailable)
+        } else {
+            Ok(())
+        };
+        let generation = match submitted {
+            Ok(generation) => generation,
+            Err(error) => {
+                let unknown = matches!(
+                    error,
+                    eve_control_api::ControlError::Unavailable
+                        | eve_control_api::ControlError::Blocked
+                );
+                receipt.state.status = if unknown { "unknown" } else { "rejected" }.into();
+                receipt.state.failure = Some(if unknown {
+                    "控制服务受理状态尚未确认，原请求保留且未自动重发。".into()
+                } else {
+                    format!("本次输入未执行：{error}；稍后可发送新请求。")
+                });
+                self.save(&receipt, false)?;
+                admitted?;
+                return Ok(receipt.state);
+            }
+        };
         active.insert(receipt.state.conversation_id.clone(), generation.clone());
         receipt.state.generation = Some(generation.clone());
-        self.save(&receipt, false)?;
         // 结果落盘不依赖浏览器轮询；等待句柄在新代启动前捕获，永远只结算原请求。
         let wait = self.control.wait(&generation);
         let service = self.clone();
@@ -467,6 +783,26 @@ impl WebChat {
                     return;
                 }
             };
+            if let Some(admission) = &service.subject_admission
+                && admission
+                    .completed(
+                        &report.key.session,
+                        &report.key.task_id,
+                        !matches!(
+                            report.run.commit,
+                            CommitState::Pending | CommitState::Unknown
+                        ),
+                    )
+                    .is_err()
+            {
+                eprintln!("EVE_WEB_CHAT_SUBJECT_COMPLETION_UNCONFIRMED");
+            }
+            if let Some(recovery) = &service.recovery
+                && report.run.failure.is_some()
+                && recovery.recover(&report).is_err()
+            {
+                eprintln!("EVE_WEB_CHAT_RECOVERY_UNCONFIRMED");
+            }
             let snapshot = ControlSnapshot {
                 key: report.key.clone(),
                 input_text: String::new(),
@@ -507,6 +843,12 @@ impl WebChat {
                 eprintln!("EVE_WEB_CHAT_COMPLETION_SAVE_FAILED");
             }
         });
+        // control 已受理后，观察任务与 shutdown 跟踪先建立；后续存储或准入结算
+        // 失败只取消这一代，仍由已经持有的等待句柄保存真实结局。
+        if let Err(error) = admitted.and_then(|_| self.save(&receipt, false)) {
+            self.control.cancel(&generation).map_err(control_error)?;
+            return Err(error);
+        }
         Ok(receipt.state)
     }
     pub fn read(&self, request: ChatLookup) -> PanelResult<ChatState> {
@@ -571,9 +913,12 @@ impl WebChat {
 }
 
 #[cfg(test)]
+#[path = "web_chat_tests.rs"]
+mod lifecycle_tests;
+
+#[cfg(test)]
 mod identity_tests {
     use super::*;
-    use eve_developer_api::DeveloperAuthorization;
     #[test]
     fn owner_identity_requires_both_host_bound_fields_and_valid_conversation_id() {
         let key = key(&"a".repeat(32)).unwrap();
@@ -581,8 +926,7 @@ mod identity_tests {
             session_id: key.session_id,
             user_id: key.user_id,
         };
-        assert!(OwnerAuthorization.is_operator(&scope));
-        assert!(OwnerAuthorization.allows_workspace_development(&scope));
+        assert!(is_owner(&scope));
         for bad in [
             ContextScope {
                 user_id: "owner".into(),
@@ -597,7 +941,7 @@ mod identity_tests {
                 ..scope.clone()
             },
         ] {
-            assert!(!OwnerAuthorization.is_operator(&bad));
+            assert!(!is_owner(&bad));
         }
     }
 }

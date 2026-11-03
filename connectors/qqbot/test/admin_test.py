@@ -3,11 +3,30 @@ import json
 import unittest
 import reminder_test
 from background_task_test import calls
-from dialogue_tools_test import text_response
+from dialogue_tools_test import text_response, tool_response
 from execution_test import ExecutionAcceptance
 
 class AdminAcceptance(ExecutionAcceptance):
     test_pending_task_continues_after_early_final_and_sleep_without_new_user_input = None
+
+    def classify(self, decoded, latest):
+        if isinstance(decoded, dict) and {"action", "policy_reason", "user_messages"} <= decoded.keys():
+            return "review"
+        return super().classify(decoded, latest)
+
+    def provider_response(self, body, kind, fallback):
+        if kind == "review":
+            self.assertEqual(self.definitions(body), {"submit_review"})
+            request = json.loads(body["messages"][-1]["content"])
+            self.assertNotIn("isolated-test-bind-key", json.dumps(request))
+            if "admin-ok" not in request["action"]:
+                return tool_response([("submit_review", {"risk": "low", "authorization": "unknown",
+                    "outcome": "deny", "rationale": "普通读取没有授权执行命令"})])
+            self.assertEqual(len(request["user_messages"]), 6)
+            return tool_response([("submit_review", {"risk": "low", "authorization": "high",
+                "outcome": "allow", "rationale": "隔离测试已绑定身份授权运行 echo"})])
+        return super().provider_response(body, kind, fallback)
+
     def run_eve(self, script, developer=False, **options):
         env = {"EVE_ADMIN_BIND_KEY": "isolated-test-bind-key"}
         if developer:
@@ -52,7 +71,7 @@ class AdminAcceptance(ExecutionAcceptance):
                 self.assertNotIn("public source", result)
                 return text_response("读取需要管理员")
             if admin:
-                self.assertTrue(results[-1]["success"])
+                self.assertTrue(results[-1].get("success"), results[-1])
                 self.assertIn("admin-ok", result)
                 return text_response("管理员操作成功")
             self.assertNotIn("public source", result)
@@ -62,6 +81,10 @@ class AdminAcceptance(ExecutionAcceptance):
             *self.send(self.message("read", "普通读取", expected="读取需要管理员")),
             *self.send(self.message("denied", "执行命令", expected="需要管理员")),
             *self.send(self.message("bind", "/bind isolated-test-bind-key", contains="绑定成功")),
+            # 密钥正文不保存为原话，最近六条仍含该缺口时业务失败关闭。
+            *self.send(self.message("gap", "执行命令", contains="尚未启动工具调用")),
+            *[step for i in range(6) for step in self.send(self.message(
+                f"complete-original-{i}", "/admin", expected="当前平台身份：管理员。"))],
             *self.send(self.message("allowed", "执行命令", expected="管理员操作成功")),
         ], developer=True)
 

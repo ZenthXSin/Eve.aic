@@ -1,9 +1,11 @@
 """真实进程和四次真实 Cargo：整条升级准备不能被单命令总超时截断。"""
 import json
 import os
+from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 import unittest
 import developer_tools_test as developer
@@ -27,6 +29,11 @@ class UpgradeTimeoutAcceptance(developer.DeveloperAcceptance):
         (self.source/'crates/eve-app/Cargo.toml').write_text('[package]\nname="eve-app"\nversion="0.0.1"\nedition="2021"\n[[bin]]\nname="eve-qqbot"\npath="src/main.rs"\n')
         (self.source/'crates/eve-app/src/main.rs').write_text('fn main() {\n    println!("compiled candidate");\n}\n')
         (self.source/'AGENT.md').write_text('合成升级候选')
+        (self.source/'scripts').mkdir()
+        (self.source/'scripts/verify-self-upgrade.py').write_text("print('runtime contract fixture passed')\n")
+        runtime_source=Path(__file__).resolve().parents[3]/'scripts'
+        for name in ['build_resources.py','self_upgrade_runtime.py','source_update.py']:
+            shutil.copy2(runtime_source/name,self.source/'scripts'/name)
         resources=self.source/'connectors/qqbot';resources.mkdir(parents=True)
         for file in ['bridge.mjs','bridge-core.mjs','package.json','package-lock.json']:(resources/file).write_text('{}')
         (self.source/'.gitignore').write_text('/target/\n')
@@ -65,14 +72,66 @@ class UpgradeTimeoutAcceptance(developer.DeveloperAcceptance):
         wrapper.chmod(0o700)
         for args in [['init','-q'],['add','.'],['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','fixture']]:
             subprocess.run(['git',*args],cwd=self.source,check=True,stdout=subprocess.DEVNULL)
+        revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=self.source,text=True).strip()
+        # 共享工作区残留另一会话的未完成改动；准备不得提交、复制或覆盖它们。
+        shared_dirty='fn main() { unfinished_shared_change }\n'
+        (self.source/'crates/eve-app/src/main.rs').write_text(shared_dirty)
+        (self.source/'someone-unfinished.txt').write_text('保留其他会话',encoding='utf8')
+        shared_index=(self.source/'.git/index').read_bytes()
+        queue=self.work/'prepare-timeout-supervisor';queue.mkdir()
+        heartbeat_stop=threading.Event()
+        heartbeat_errors=[]
+        def heartbeat():
+            # 本夹具只提供准备阶段所需的在线基线，不申请切换、不伪造已上线结果。
+            while not heartbeat_stop.is_set():
+                try:
+                    temporary=queue/'supervisor.tmp'
+                    temporary.write_text(json.dumps({'format_version':1,'pid':os.getpid(),
+                        'heartbeat_ms':int(time.time()*1000),'phase':'running','active_sha256':'a'*64,
+                        'candidate_sha256':None,'result':None,'error':None,'restart_supported':True,
+                        'active_source_revision':revision,'active_candidate_sha256':None,'host_nonce':'b'*64}))
+                    temporary.replace(queue/'supervisor.json')
+                except Exception as error:
+                    heartbeat_errors.append(type(error).__name__)
+                    return
+                heartbeat_stop.wait(.2)
+        heartbeat_thread=threading.Thread(target=heartbeat,daemon=True)
+        heartbeat_thread.start()
+        def stop_heartbeat():
+            heartbeat_stop.set();heartbeat_thread.join(timeout=2)
+        self.addCleanup(stop_heartbeat)
         config=json.loads(self.developer_config.read_text())
-        config.update(command_timeout_ms=13_000,cargo_program=str(wrapper))
+        config.update(command_timeout_ms=13_000,cargo_program=str(wrapper),live_upgrade=str(queue))
         self.developer_config.write_text(json.dumps(config))
         outcomes=[]
         verification_failures=[]
+        reviews=[]
+        def review(request):
+            reviews.append(request)
+            plan=json.loads(request['arguments'][0])
+            expected_checks=[{'program':str(wrapper),'arguments':arguments,'cwd':'.'} for arguments in [
+                ['fmt','--all','--','--check'],
+                ['clippy','--release','--workspace','--all-targets','--locked','--','-D','warnings'],
+                ['test','--release','--workspace','--locked'],
+                ['build','-p','eve-app','--bins','--release','--locked']]]
+            allowed=(request['user_messages'][-1]=='准备新版本' and not request['delegated']
+                and request['program']=='eve.prepare_self_upgrade'
+                and plan['source']['head']==revision
+                and plan['source_diff']['base_revision']==revision
+                and plan['source_diff']['target_revision']==revision
+                and plan['source_diff_content']=='' and plan['active_sha256']=='a'*64
+                and plan['publish_only'] is True and plan['activate'] is False
+                and plan['checks']==expected_checks
+                and plan['after_rust_tests']=={'program':'python3','arguments':['-B','scripts/verify-self-upgrade.py'],'cwd':'.'})
+            return {'risk':'medium','authorization':'high' if allowed else 'unknown',
+                'outcome':'allow' if allowed else 'deny','rationale':'核对准备原话、完整空差异及四项真实Cargo和Python验收执行计划'}
+        self.review_reply=review
         def respond(body):
             results=self.results(body)
             if not results:return tool_response([('prepare_self_upgrade',{})])
+            self.assertEqual((self.source/'crates/eve-app/src/main.rs').read_text(),shared_dirty)
+            self.assertEqual((self.source/'someone-unfinished.txt').read_text(encoding='utf8'),'保留其他会话')
+            self.assertEqual((self.source/'.git/index').read_bytes(),shared_index)
             result=results[-1]
             outcomes.append(result)
             try:
@@ -97,13 +156,17 @@ class UpgradeTimeoutAcceptance(developer.DeveloperAcceptance):
             replies=[json.loads(line) for line in events.read_text().splitlines()
                      if json.loads(line).get('type')=='reply'] if events.exists() else []
             evidence={'elapsed_seconds':round(time.monotonic()-start,3),'command_timeout_ms':13_000,
-                'host_prepare_timeout_ms':4*13_000+240_000,'process_timeout_seconds':90,
+                'host_prepare_timeout_ms':6*13_000+300_000,'process_timeout_seconds':90,
                 'toolchain':toolchain or 'host-default','warmup':warmup,
                 'cargo_stages':stages.read_text()[-8000:] if stages.exists() else '',
                 'prepare_results':outcomes,'prepare_assertions':verification_failures,
                 'provider_errors':self.errors,'bridge_replies':replies}
             raise AssertionError(str(error)+'\n升级准备真实现场：'+json.dumps(evidence,ensure_ascii=False)[-24000:]) from error
         self.assertGreater(time.monotonic()-start,43,'必须跨过旧的单命令 43 秒总期限')
+        stop_heartbeat()
+        self.assertEqual(heartbeat_errors,[])
+        self.assertEqual(len(reviews),1,'准备候选必须独立审核一次')
+        self.assertFalse((queue/'request.json').exists(),'准备不能申请上线')
         print(json.dumps({'upgrade_prepared':True,'elapsed_seconds':round(time.monotonic()-start,3),
             'command_timeout_ms':13_000,'toolchain':toolchain or 'host-default',
             'cargo_stages':stages.read_text()},ensure_ascii=False),flush=True)

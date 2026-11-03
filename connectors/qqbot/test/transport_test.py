@@ -42,7 +42,7 @@ class TransportAcceptance(memory.MemoryAcceptance):
         stdout = self.work / f"{number}-stdout"
         stderr = self.work / f"{number}-stderr"
         with stdout.open("w") as out, stderr.open("w") as err:
-            child = subprocess.Popen([str(memory.BINARY), "--memory", "--state-dir", str(self.work / "state"),
+            child = subprocess.Popen([str(memory.BINARY), "--minimal-profile", "--memory", "--state-dir", str(self.work / "state"),
                 "--agent", str(memory.ROOT / "AGENT.md"), "--bridge-script",
                 str(pathlib.Path(__file__).with_name("transport-bridge.mjs")), "--bridge-arg", str(path)],
                 env=configure_fixture_progress(env), stdout=out, stderr=err)
@@ -89,7 +89,10 @@ class TransportAcceptance(memory.MemoryAcceptance):
         self.assertTrue(pathlib.Path(run[1]["stopped"]).exists())
 
     def test_oversized_encoded_message_does_not_disconnect_real_rust_channel(self):
-        run = self.launch(contents=["x" + "\0" * 12000, "后续正常消息"])
+        # 入站上限已独立提升至512KiB；同时覆盖超限协议帧和SDK正文32KiB上限。
+        run = self.launch(raw_frames=[{"version":1, "type":"message", "id":"oversized",
+            "scope":"c2c", "target_id":"transport-user", "user_id":"transport-user",
+            "text":"x" * (512 * 1024)}], contents=["x" * 32769, "后续正常消息"])
         self.wait_until(lambda: self.state_path.exists() and any(r["state"] == "Sent" for r in
             self.documents().get("eve.channel.qqbot", {}).get("receipts.v1", {}).get("entries", [])),
             "normal message after rejected frame was not delivered")

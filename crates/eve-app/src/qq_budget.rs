@@ -20,6 +20,7 @@ pub(crate) const SKILL: &str = "skill";
 pub(crate) const FORGE: &str = "forge";
 pub(crate) const OUTREACH: &str = "outreach";
 pub(crate) const CLARIFY: &str = "clarify";
+pub(crate) const CONVERSATION_LEARNING: &str = "conversation-learning";
 
 /// 一项工作开始前要求的最少余额：观察 1 次；研究选来源与提取各 1 次；
 /// 实践至多 3 次草稿另加 1 次技能选择；技能提炼、工具锻造、撰写邀请或问题、判断时机与回应各 1 次。
@@ -107,6 +108,7 @@ impl Gate {
 
 fn label(category: &str) -> &str {
     match category {
+        CONVERSATION_LEARNING => "交流学习",
         INTEREST => "兴趣观察",
         RESEARCH => "受控研究",
         PRACTICE => "实践草稿",

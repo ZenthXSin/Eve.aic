@@ -66,7 +66,8 @@ def main():
             gates = [work / f"gate-{i}" for i in range(4)]
             script = []
             for index in range(3):
-                message = {"id": f"web-chat-{index}", "scope": "c2c", "target_id": "u1", "user_id": "u1", "text": f"你好 {index}"}
+                message = {"id": f"web-chat-{index}", "scope": "c2c", "target_id": "u1", "user_id": "u1",
+                           "text": f"你好 {index}", "original_text": f"你好 {index}"}
                 if index == 1:
                     message["expected"] = "你好。\n\n我在这里。"
                 else:

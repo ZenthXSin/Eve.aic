@@ -28,6 +28,11 @@ class ModelTimeoutAcceptance(streaming.ModelStreamingAcceptance):
 
     def write_provider_response(self, handler, body, encoded):
         try:
+            if self.definitions(body) == {'submit_review'}:
+                # 超时只注入被测聊天流；独立行动审核先完整返回。
+                handler.wfile.write(encoded)
+                handler.wfile.flush()
+                return
             if self.mode == 'healthy':
                 # 总耗时超过旧总期限 1 秒，块间隔小于 300ms。
                 width = max(1, (len(encoded) + 6) // 7)

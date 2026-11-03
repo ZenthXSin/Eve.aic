@@ -264,7 +264,7 @@ impl Frames {
             let end = available.iter().position(|b| *b == b'\n');
             let count = end.map_or(available.len(), |p| p + 1);
             if !self.discard {
-                if self.partial.len() + count > 65536 {
+                if self.partial.len() + count > 512 * 1024 {
                     self.partial.clear();
                     self.discard = true;
                 } else {
@@ -303,6 +303,7 @@ pub(crate) struct Services {
     pub file_poll: Option<Duration>,
     pub attachment_observer: Option<Arc<dyn QqAttachmentObserver>>,
     pub raw_observer: Option<Arc<dyn crate::QqRawMessageObserver>>,
+    pub restriction_observer: Option<Arc<dyn crate::QqRestrictionObserver>>,
     pub conversations: crate::QqConversations,
     pub group_observer: Option<Arc<dyn crate::QqGroupObserver>>,
     pub participant_observer: Option<Arc<dyn crate::QqParticipantObserver>>,
@@ -1001,6 +1002,7 @@ pub(crate) async fn run(
         file_poll,
         attachment_observer,
         raw_observer,
+        restriction_observer,
         conversations,
         participant_observer,
         group_observer,
@@ -1364,7 +1366,12 @@ pub(crate) async fn run(
                             }
                         }
                     } else { None };
-                    let submitted = messages.submit(incoming, route_sink);
+                    let metadata = eve_control_api::ControlRunMetadata {
+                        scope: eve_llm_api::ContextScope {session_id:target.session.session_id.clone(), user_id:target.session.user_id.clone()},
+                        task_id: target.task_id.clone(),
+                        review: eve_control_api::ControlReviewEvidence::ChannelAnchor(message.id.clone()),
+                    };
+                    let submitted = messages.submit_with_metadata(incoming, Some(metadata), route_sink);
                     if let (Some(hook),Some(ticket))=(&admission,admission_ticket) {
                         hook.finish(&ticket,if submitted.is_ok(){crate::QqAdmissionResult::Started}else{crate::QqAdmissionResult::Rejected})?;
                     }
@@ -1824,10 +1831,15 @@ pub(crate) async fn run(
                         }
                     }
                 } else { None };
-                let submitted = control.submit(ControlInput {
-                    session: SessionInput { key, text: message.turn_text() },
-                    task_id: format!("qq:{}", message.id),
-                }, sink.clone());
+                let task_id = format!("qq:{}", message.id);
+                let metadata = eve_control_api::ControlRunMetadata {
+                    scope: eve_llm_api::ContextScope {session_id:key.session_id.clone(), user_id:key.user_id.clone()},
+                    task_id: task_id.clone(),
+                    review: eve_control_api::ControlReviewEvidence::ChannelAnchor(message.id.clone()),
+                };
+                let submitted = control.submit_with_metadata(ControlInput {
+                    session: SessionInput { key, text: message.turn_text() }, task_id,
+                }, Some(metadata), sink.clone());
                 if let (Some(hook), Some(ticket)) = (&admission, admission_ticket) {
                     hook.finish(&ticket, match &submitted {
                         Ok(_) => crate::QqAdmissionResult::Started,
@@ -1985,6 +1997,7 @@ pub(crate) async fn run(
                                 finish(&mut stdin, &route.message.id).await?;
                                 continue;
                             }
+                            conversations.bind_turn_messages(&config.app_id, std::slice::from_ref(&route.message))?;
                             let wait = control.wait(&generation);
                             active.push(Active { message: route.message, key: generation, ordinary: false, started: tokio::time::Instant::now(), wait });
                             continue;
@@ -2223,12 +2236,19 @@ pub(crate) async fn run(
                                 warn(&ctx,"group_observation_failed");
                             }
                         }
-                        Some("message") => {
+                        Some("message" | "restriction_only") => {
+                            let restriction_only = frame["type"] == "restriction_only";
                             let mut payload = frame.clone();
+                            // 专用字段由 SDK 通道直接复制 content；不从 raw/debug 或格式化 text 推断。
+                            let original_text = match frame.get("original_text") {
+                                Some(Value::String(text)) if text.len() <= 32768 => Some(text.clone()),
+                                None | Some(Value::Null) => None,
+                                _ => { warn(&ctx, "invalid_original_text"); continue; }
+                            };
                             let sender_name = payload.get("sender_name").and_then(Value::as_str).map(str::to_owned);
                             if let Some(object) = payload.as_object_mut() {
                                 object.remove("type"); object.remove("version");
-                                object.remove("sender_name"); object.remove("raw");
+                                object.remove("sender_name"); object.remove("raw"); object.remove("original_text");
                                 if object.keys().any(|key| !["id", "scope", "target_id", "user_id", "text", "attachments", "quoted"].contains(&key.as_str())) {
                                     warn(&ctx, "ignored_message_fields");
                                 }
@@ -2251,12 +2271,37 @@ pub(crate) async fn run(
                             let duplicate = ledger.contains(&config.app_id, &message.id)?;
                             let pending = queue.len() + commands.len() + active.len() + replies.len()
                                 + routing.len() + usize::from(delivering.is_some()) + usize::from(judging.is_some());
-                            if duplicate || pending >= MAX_PENDING {
-                                warn(&ctx, if duplicate { "duplicate_no_replay" } else { "queue_limit" });
+                            if duplicate {
+                                warn(&ctx, "duplicate_no_replay");
                                 finish(&mut stdin, &message.id).await?;
                             } else {
                                 status.send_modify(|s| s.received += 1);
                                 timing(timing_diagnostics, "message_received", None);
+                                // 群白名单：主人本人始终放行；其他人的消息只在已放行的群进入。
+                                if message.scope == "group"
+                                    && let (Some(whitelist), Some(owners)) =
+                                        (&group_whitelist, &owner_directory)
+                                {
+                                    let owner = owners.is_owner(&message.session_key(&config.app_id)?.user_id).unwrap_or(false);
+                                    let admitted = whitelist.contains(&message.target_id);
+                                    match admitted {
+                                        Ok(true) => {}
+                                        Ok(false) if owner => {}
+                                        Ok(false) => {
+                                            warn(&ctx, "group_not_whitelisted");
+                                            finish(&mut stdin, &message.id).await?;
+                                            continue;
+                                        }
+                                        // 名单读不出来时不猜测放行，也不进模型；结束回执后继续服务主人。
+                                        Err(_) => {
+                                            warn(&ctx, "group_whitelist_unavailable");
+                                            finish(&mut stdin, &message.id).await?;
+                                            continue;
+                                        }
+                                    }
+                                }
+                                conversations.record_original(&ctx, &config.app_id, &message,
+                                    if private_text.is_some() { None } else { original_text.clone() })?;
                                 conversations.record_message(&config.app_id, &message)?;
                                 // 主人本人在群里说过话的会话，供群白名单工具定位群；只来自校验过的消息。
                                 if message.scope == "group"
@@ -2280,28 +2325,29 @@ pub(crate) async fn run(
                                         claim_tick(),
                                     );
                                 }
-                                // 群白名单：主人本人始终放行；其他人的消息只在已放行的群进入。
-                                if message.scope == "group"
-                                    && let (Some(whitelist), Some(owners)) =
-                                        (&group_whitelist, &owner_directory)
-                                {
-                                    let owner = owners.is_owner(&message.session_key(&config.app_id)?.user_id).unwrap_or(false);
-                                    let admitted = whitelist.contains(&message.target_id);
-                                    match admitted {
-                                        Ok(true) => {}
-                                        Ok(false) if owner => {}
-                                        Ok(false) => {
-                                            warn(&ctx, "group_not_whitelisted");
-                                            finish(&mut stdin, &message.id).await?;
-                                            continue;
-                                        }
-                                        // 名单读不出来时不猜测放行，也不进模型；结束回执后继续服务主人。
+
+                                // 急停/撤权在主轮工具或审核等待中也先持久执行；只交给可信本地缩权器。
+                                if private_text.is_none() && let Some(observer) = &restriction_observer {
+                                    match conversations.incoming_originals(&config.app_id, &message) {
+                                        Ok(originals) => observer.restrict_body(&message.session_key(&config.app_id)?, &message.id, &message.text, &originals)?,
                                         Err(_) => {
-                                            warn(&ctx, "group_whitelist_unavailable");
-                                            finish(&mut stdin, &message.id).await?;
-                                            continue;
-                                        }
+                                            warn(&ctx, "restriction_originals_unavailable");
+                                            if let Some(latest) = &original_text {
+                                                observer.restrict_missing_body(&message.session_key(&config.app_id)?, &message.id, &message.text, latest)?;
+                                            }
+                                        },
                                     }
+                                }
+                                // 队列满也先核对本人缩权。该输入不进入模型或附件处理，
+                                // 终态回执防止重启后把这条未准入请求重新执行。
+                                if restriction_only || pending >= MAX_PENDING {
+                                    warn(&ctx, "queue_limit_restriction_checked");
+                                    if !ledger.insert(&ctx, &config.app_id, message.clone())? {
+                                        return Err(failure("缩权入口回执容量已满；停止准入并保留原状态"));
+                                    }
+                                    mark_failed(&mut ledger, &ctx, &config.app_id, &message.id)?;
+                                    finish(&mut stdin, &message.id).await?;
+                                    continue;
                                 }
                                 if let Some(observer) = &attachment_observer { observer.observe(&message.session_key(&config.app_id)?, &message); }
                                 if let (Some(observer), Some(raw)) = (&raw_observer, raw_debug.as_ref()) {
@@ -2340,6 +2386,10 @@ pub(crate) async fn run(
                                         if training.observe_user_message(&scope, &message.id, &message.text).is_err() {
                                             warn(&ctx, "expression_learning_failed");
                                         }
+                                        if let Some(body) = original_text.as_ref().filter(|text| !text.trim().is_empty() && text.len() <= eve_training_api::MAX_CONVERSATION_BODY_BYTES && !text.contains("```") && !text.lines().any(|line| line.trim_start().starts_with('>')))
+                                            && training.observe_conversation(&scope, eve_training_api::ConversationMessage {
+                                                id: message.id.clone(), speaker: scope.user_id.clone(), role: eve_training_api::ConversationRole::Human, text: body.clone(),
+                                            }).is_err() { warn(&ctx, "conversation_learning_failed"); }
                                     }
                                     if let Some(live) = &live_dialogue {
                                         let session = message.session_key(&config.app_id)?;
@@ -2357,11 +2407,12 @@ pub(crate) async fn run(
                                             }
                                             saved = true;
                                             let notice = (message.scope == "c2c").then(|| steering_notice(snapshot.phase));
-                                            if live.steer(&scope, turn_id, message.turn_text(), || {
+                                            if live.steer_anchored(&scope, turn_id, message.turn_text(), Some(message.id.clone()), || {
                                                 match &notice {
                                                     Some(text) => ledger.acknowledge_steering(&ctx, &config.app_id, &message.id, text),
                                                     None => ledger.steer(&ctx, &config.app_id, &message.id, &parent_id),
-                                                }
+                                                }?;
+                                                conversations.advance_review_anchor(&config.app_id, &message)
                                             })? {
                                                 if let Some(text) = notice {
                                                     replies.push_front(Reply { message, text, guard: ReplyGuard::Steering(current_key), interaction: None, invite: None });

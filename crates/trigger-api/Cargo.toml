@@ -6,5 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+eve-llm-api = { path = "../llm-api" }
 eve-session-api = { path = "../session-api" }
 serde.workspace = true
+serde_json.workspace = true

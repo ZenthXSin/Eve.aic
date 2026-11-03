@@ -61,21 +61,20 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
         ..Default::default()
     };
     let registry = backends.registry.clone();
+    let state_store = backends.state.clone();
     let permissions = backends.permissions.clone();
     let logger = backends.logger.clone();
     let kernel = eve_kernel::Kernel::with_services(backends);
     let health = Arc::new(eve_model_health::HealthBook::default());
+    crate::models::observe_usage(health.clone());
     bootstrap.health = Some(health.clone());
+    let ingress = Arc::new(crate::web_ingress::RawMessages::open(
+        &options.state_directory,
+    )?);
+    bootstrap.review_source = Some(ingress.clone());
+    let mut background: Option<crate::web_autonomy::WebRuntime> = None;
     let result = async {
         let permit = eve_web_panel_api::PageWritePermit::default();
-        let reviewer = crate::developer::action_reviewer(registry.clone(), health.clone());
-        crate::developer::install_with_member_runtime(
-            &mut bootstrap,
-            &options.state_directory,
-            Some(Arc::new(crate::web_chat::OwnerAuthorization)),
-            None,
-            reviewer,
-        )?;
         let plugin = eve_context_plugin::ContextPlugin::new(Arc::new(
             eve_context_plugin::FileContextArchive::open(
                 options.state_directory.join("context-notes-archive"),
@@ -92,22 +91,32 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
                 admin: notes.clone(),
                 binding: crate::context_notes::NoteBinding::Web,
             }));
+        bootstrap.context = Some(Arc::new(crate::context_notes::NotesContext {
+            channel: "web",
+            inner: bootstrap
+                .context
+                .take()
+                .unwrap_or_else(crate::services::default_context),
+            admin: notes.clone(),
+        }));
+        let autonomy = crate::web_autonomy::WebAutonomy::install(
+            &kernel,
+            registry.clone(),
+            state_store,
+            &mut bootstrap,
+            &options.state_directory,
+            health.clone(),
+        )
+        .await?;
         bootstrap.context = Some(Arc::new(crate::web_chat::WebContext {
-            inner: Arc::new(crate::context_notes::NotesContext {
-                channel: "web",
-                inner: bootstrap
-                    .context
-                    .take()
-                    .unwrap_or_else(crate::services::default_context),
-                admin: notes.clone(),
-            }),
+            inner: bootstrap.context.take().ok_or("Web 上下文缺失")?,
             web: None,
         }));
         let tools_registered = bootstrap.tools.len() + 1;
-        let (control, _) = crate::install_core_with_pages_and_admin(
+        let (control, settings_admin) = crate::install_core_with_pages_and_admin(
             &kernel,
             registry.clone(),
-            permissions,
+            permissions.clone(),
             logger,
             &options.state_directory,
             bootstrap,
@@ -123,10 +132,44 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
             .0
             .clone();
         let settings = crate::qq_tasks::config_service(registry.as_ref())?;
+        let runtime = autonomy
+            .start(
+                &kernel,
+                registry.clone(),
+                permissions,
+                control.clone(),
+                sessions.clone(),
+                settings_admin,
+                health.clone(),
+            )
+            .await?;
+        let recovery = runtime.recovery.clone();
+        background = Some(runtime);
+        let inbox = Arc::new(
+            crate::web_notifications::Inbox::open(&options.state_directory)
+                .map_err(|_| "Web 通知账本不可用；保留原记录")?,
+        );
+        match inbox.collect(
+            autonomy.tasks.as_ref(),
+            autonomy.triggers.as_ref(),
+            crate::qq_tasks::now_ms(),
+        ) {
+            Ok(()) => {}
+            Err(eve_web_panel_api::PanelError::Capacity) => eprintln!("EVE_WEB_INBOX_CAPACITY"),
+            Err(_) => return Err("Web 通知恢复不可用；保留原记录".into()),
+        }
         let chat = Arc::new(
             crate::web_chat::WebChat::open(control.clone(), &options.state_directory)
-                .map_err(|_| "Web 请求回执目录不可用；保留原记录")?,
+                .map_err(|_| "Web 请求回执目录不可用；保留原记录")?
+                .with_business(autonomy.business.clone())
+                .with_recovery(recovery)
+                .with_ingress(ingress.clone())
+                .with_admission(autonomy.admission.clone())
+                .with_training(autonomy.training.clone())
+                .with_memory(autonomy.memory.clone(), sessions.clone()),
         );
+        chat.recover_memory()
+            .map_err(|_| "Web 交流记忆恢复状态保存失败；保留原记录")?;
         let panel = eve_web_panel::LocalPanel::bind(
             config,
             Arc::new(crate::web_panel::QqPanel {
@@ -135,13 +178,16 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
                 control,
                 channel: None,
                 chat: Some(chat.clone()),
+                inbox: Some(inbox.clone()),
                 started_at_unix_ms: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)?
                     .as_millis()
                     .try_into()?,
                 judgments: None,
                 cognition: None,
-                memory: None,
+                memory: Some(crate::web_panel_memory::MemoryView::new(
+                    autonomy.memory.clone(),
+                )),
                 learning: None,
                 autonomy: None,
                 plans: None,
@@ -161,13 +207,41 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
             }),
         )
         .await?;
+        let runtime = background.as_ref().ok_or("Web 后台未装配")?;
+        runtime.activate()?;
         eprintln!("EVE_WEB_READY http://{}", panel.address());
         let mut finished = panel.finished();
+        let workers = wait_background(runtime.finished());
+        let notifications = async {
+            let mut capacity_reported = false;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                match inbox.collect(
+                    autonomy.tasks.as_ref(),
+                    autonomy.triggers.as_ref(),
+                    crate::qq_tasks::now_ms(),
+                ) {
+                    Ok(()) => capacity_reported = false,
+                    Err(eve_web_panel_api::PanelError::Capacity) => {
+                        if !capacity_reported {
+                            eprintln!("EVE_WEB_INBOX_CAPACITY");
+                            capacity_reported = true;
+                        }
+                    }
+                    Err(_) => return Err("Web 通知保存或结算失败；保留原记录".into()),
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), AppError>(())
+        };
         let outcome: Result<(), AppError> = tokio::select! {
             result = shutdown_signal() => result.map_err(Into::into),
             _ = finished.changed() => Err("Web 监听异常结束；已停止准入，保留原记录".into()),
+            _ = workers => Err("Web 后台服务异常结束；已停止准入，保留原记录".into()),
+            result = notifications => result,
         };
         panel.request_stop();
+        runtime.request_stop();
         let stopped = panel.stop().await;
         let chats = chat
             .shutdown()
@@ -179,7 +253,24 @@ pub async fn run_web(options: WebOptions) -> Result<(), AppError> {
         Ok(())
     }
     .await;
-    crate::finish_core(&kernel, result).await
+    let stopped = match background {
+        Some(runtime) => runtime.stop().await,
+        None => Ok(()),
+    };
+    crate::finish_core(&kernel, result.and(stopped)).await
+}
+
+async fn wait_background(receivers: Vec<tokio::sync::watch::Receiver<bool>>) {
+    let mut waits = tokio::task::JoinSet::new();
+    for mut receiver in receivers {
+        waits.spawn(async move {
+            if !*receiver.borrow() {
+                let _ = receiver.changed().await;
+            }
+        });
+    }
+    let _ = waits.join_next().await;
+    waits.shutdown().await;
 }
 
 async fn shutdown_signal() -> std::io::Result<()> {

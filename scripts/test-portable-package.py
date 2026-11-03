@@ -185,15 +185,34 @@ def main():
     expected = checksums[0].read_text().split()[0]
     require(hashlib.sha256(archive.read_bytes()).hexdigest() == expected, "发行 ZIP 校验值不符")
     requests = []
+    background_requests = []
 
     class Model(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
 
         def do_POST(self):
-            requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            latest = request['messages'][-1].get('content', '')
+            try:
+                decoded = json.loads(latest)
+            except (ValueError, TypeError):
+                decoded = None
+            text = "你好。\n\n我在这里。"
+            kind = 'chat'
+            if isinstance(decoded, dict) and 'observer_version' in decoded and 'known_interests' in decoded:
+                kind, text = 'interest', '{"updates":[]}'
+            elif isinstance(decoded, dict) and 'extractor_version' in decoded and 'evidence' in decoded:
+                kind, text = 'learning', '{"candidates":[]}'
+            elif isinstance(decoded, dict) and 'feedback_pairs' in decoded and 'messages' in decoded:
+                kind, text = 'conversation', '{"lessons":[]}'
+            if kind == 'chat':
+                requests.append(request)
+            else:
+                require(not request.get('tools'), '后台学习请求不能获得业务工具')
+                background_requests.append(kind)
             body = json.dumps({"choices": [{"index": 0, "finish_reason": "stop", "message": {
-                "role": "assistant", "content": "你好。\n\n我在这里。"}}]}).encode()
+                "role": "assistant", "content": text}}]}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -236,7 +255,7 @@ def main():
             bridge = work / "离线 桥接.mjs"
             bridge.write_bytes((pathlib.Path(__file__).resolve().parents[1] / "connectors/qqbot/test/fake-bridge.mjs").read_bytes())
             message = {"id": "package-chat", "scope": "c2c", "target_id": "user-1", "user_id": "user-1",
-                       "text": "你好", "expected_segments": ["你好。", "我在这里。"]}
+                       "text": "你好", "original_text": "你好", "expected_segments": ["你好。", "我在这里。"]}
             for restart in (False, True):
                 stop_gate = work / f"stop-{restart}"
                 scenario = work / f"scenario-{restart}.json"
@@ -283,6 +302,7 @@ def main():
               "client_update_download_verified": True, "client_update_next_start": True,
               "client_update_rollback": True, "client_update_preserved_user_files": True,
               "production_qq_connections": 0}
+    report['background_requests'] = {kind:background_requests.count(kind) for kind in set(background_requests)}
     (dist / f"acceptance-{manifest['platform_label']}.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False))
 

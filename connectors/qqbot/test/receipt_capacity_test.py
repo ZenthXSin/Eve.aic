@@ -14,6 +14,11 @@ class ReceiptCapacityAcceptance(segment.SegmentAcceptance):
             locals()[_name] = None
     del _name
 
+    def run_eve(self, script, **options):
+        # 16 MiB 原回执以字节数组存储，debug 宿主须解析并持久化数倍大小的 JSON。
+        # CI 曾在所有行为断言之前超过普通分条夹具30秒期限；此容量验收独立保留90秒。
+        return super().run_eve(script, timeout=90, **options)
+
     def seed(self, count, size):
         entries = [{"app_id": "1904159860", "message": {
             "id": f"old-{i}", "scope": "c2c", "target_id": "user-1", "user_id": "user-1",
@@ -34,11 +39,13 @@ class ReceiptCapacityAcceptance(segment.SegmentAcceptance):
         duplicate = self.message("old-1", segments=None, expected_type="finish")
         summary = self.run_eve([
             {"send": duplicate}, {"wait_command": {"id": "old-1", "type": "finish"}},
+            *self.complete_original_window(),
             {"send": self.message("new", "扩容后正常回复", segments=None)},
             self.wait_receipt("new", "Sent")], segmented=False)
         self.assertEqual(summary["capacity_rejected"], 0)
         self.assertEqual(len(self.requests), 1)
         self.assertTrue(self.ledger()["entries"][:len(entries)] == entries)
+
         self.run_eve([
             {"send": self.message("new", segments=None, expected_type="finish")},
             {"wait_command": {"id": "new", "type": "finish"}},
@@ -46,6 +53,13 @@ class ReceiptCapacityAcceptance(segment.SegmentAcceptance):
             self.wait_receipt("restart", "Sent")], segmented=False)
         self.assertEqual(len(self.requests), 2)
         self.assertTrue(self.ledger()["entries"][:len(entries)] == entries)
+
+    def complete_original_window(self):
+        # 旧账本没有 original_text；保留缺口，用新收到的六条完整原话恢复准入。
+        return [step for i in range(6) for step in (
+            {"send": self.message(f"original-{i}", "/admin", segments=None,
+                                  expected="当前平台身份：管理员。")},
+            self.wait_receipt(f"original-{i}", "Sent"))]
 
     def test_over_10m_archives_to_database_keeps_1m_and_restores_scoped_reads(self):
         entries, size = self.seed(340, 32768)
@@ -61,6 +75,7 @@ class ReceiptCapacityAcceptance(segment.SegmentAcceptance):
         self.run_eve([
             {"send": self.message("old-1", segments=None, expected_type="finish")},
             {"wait_command": {"id":"old-1","type":"finish"}},
+            *self.complete_original_window(),
             {"send": self.message("after", "归档后正常执行", segments=None)}, self.wait_receipt("after","Sent")], segmented=False)
         active = self.ledger()
         self.assertEqual(active["version"],6)
@@ -134,6 +149,9 @@ class ArchivedToolAcceptance(dialogue.DialogueToolsAcceptance):
             return dialogue.text_response("已按会话核验旧资料，未执行原请求")
         self.callback=respond
         self.run_eve([
+            *self.send(self.message("missing-originals", "原话不足时查询", contains="尚未启动工具调用")),
+            *[step for i in range(6) for step in self.send(self.message(
+                f"original-{i}", "/admin", expected="当前平台身份：管理员。"))],
             *self.send(self.message("lookup","本会话查归档",expected="已按会话核验旧资料，未执行原请求")),
             *self.send(self.message("foreign-lookup","另一会话查归档",user="user-2",expected="已按会话核验旧资料，未执行原请求"))],
             interest=False,memory=False,research=False,practice=False)

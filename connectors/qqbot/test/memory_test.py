@@ -148,7 +148,8 @@ class MemoryAcceptance(unittest.TestCase):
             self.assertFalse(self.run_release.wait(0.01), message)
 
     def message(self, id, text, expected=None, contains=None, scope="c2c", user="user-1", target=None):
-        message = {"id": id, "text": text, "scope": scope, "user_id": user,
+        # 此处的 text 是本条夹具用户正文；在附加引用、附件等上下文前保留原话。
+        message = {"id": id, "text": text, "original_text": text, "scope": scope, "user_id": user,
                    "target_id": target or (user if scope == "c2c" else "group-1"),
                    "expected_type": "reply"}
         if contains is None:
@@ -214,7 +215,7 @@ class MemoryAcceptance(unittest.TestCase):
         bootstrap_test_admin(self.work / "state", env, app,
                              users=getattr(self, "fixture_admin_users", ("user-1", "user-2")))
         bootstrap_fixture_groups(self.work / "state", scenario)
-        command = [str(BINARY), "--state-dir", str(self.work / "state"),
+        command = [str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "state"),
             "--agent", str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE),
             "--bridge-arg", str(scenario)]
         if memory:

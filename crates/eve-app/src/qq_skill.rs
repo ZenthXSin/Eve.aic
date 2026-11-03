@@ -1,15 +1,18 @@
-//! QQ 宿主的技能查看与管理：/skills 列出当前用户的技能，/skill 查看版本、验证证据、
-//! 启用记录与调用结果，并可停用、启用某个已验证版本或回退到上一版本。
+//! QQ 宿主的技能查看与管理：聊天工具与兼容命令共用版本、归属和账本检查。
+//! 可查看验证证据、启用记录与调用结果，停用、启用某个已验证版本或回退到上一版本。
 //! 技能只属于来源用户；变更只改变启用版本并留下记录，不删除任何版本。
 use crate::AppError;
 use eve_llm_api::{
-    ContextAssembler, ContextScope, ContextSnapshot, LlmError, LlmFuture, TurnInput,
+    ContextAssembler, ContextScope, ContextSnapshot, LlmError, LlmFuture, Tool, ToolCall,
+    ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolExecutionError, ToolFuture,
+    ToolValidationError, TurnInput,
 };
 use eve_plugin_api::{PluginError, PluginResult};
 use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput};
 use eve_skill_api::{
     Actor, DistillStatus, InvocationOutcome, ParameterKind, SkillAdmin, SkillError, SkillSnapshot,
 };
+use serde_json::{Value, json};
 use std::{
     fmt::Write,
     sync::Arc,
@@ -19,8 +22,8 @@ use std::{
 const DISABLED: &str = "技能固化未启用。";
 const EMPTY: &str =
     "还没有固化的技能。Eve 只把实际验证通过、且用新参数再次实际运行通过的方法固化为技能。";
-const HELP: &str = "用法：/skills 列出技能；/skill 技能ID 查看详情；/skill disable 技能ID 停用；/skill enable 技能ID 版本 启用某个已验证版本；/skill rollback 技能ID 回退到上一版本。";
-const NOT_FOUND: &str = "没有这个技能。发送 /skills 查看技能 ID。";
+const HELP: &str = "直接告诉我你想查看、停用、启用或回退哪个技能即可，我会先查真实版本再处理。也可使用 /skills、/skill 技能ID、/skill disable|rollback 技能ID、/skill enable 技能ID 版本。";
+const NOT_FOUND: &str = "没有找到属于你的这个技能；可以先让我查看你的技能列表。";
 const SHOWN_INVOCATIONS: usize = 3;
 /// 交给对话模型的可用技能条数上限。
 const AVAILABLE_SKILLS: usize = 8;
@@ -175,6 +178,93 @@ fn now_ms() -> Result<u64, AppError> {
     )?)
 }
 
+#[derive(Clone, Copy)]
+enum ManagementError {
+    NotFound,
+    InvalidVersion,
+    NoPreviousVersion,
+    LimitReached,
+    Unavailable,
+}
+impl ManagementError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::NotFound => NOT_FOUND,
+            Self::InvalidVersion => "没有这个已验证版本。",
+            Self::NoPreviousVersion => "没有可以回退的更早版本。",
+            Self::LimitReached => "启用记录已满；保留原记录，未做更改。",
+            Self::Unavailable => "技能记录暂时不可用；未确认更改成功。",
+        }
+    }
+}
+
+/// 两个入口调用同一实现；归属只来自宿主身份，版本只来自真实的已验证账本。
+fn execute_command(
+    skills: &dyn SkillAdmin,
+    owner: &str,
+    command: Command<'_>,
+) -> Result<Value, ManagementError> {
+    let snapshot = skills
+        .snapshot()
+        .map_err(|_| ManagementError::Unavailable)?;
+    let owned = |id: &str| {
+        snapshot
+            .skill(id)
+            .filter(|skill| skill.owner == owner)
+            .ok_or(ManagementError::NotFound)
+    };
+    let change = |id: &str, enabled: Option<u32>| -> Result<Value, ManagementError> {
+        let previous = owned(id)?;
+        if enabled.is_some_and(|version| previous.version(version).is_none()) {
+            return Err(ManagementError::InvalidVersion);
+        }
+        let at = now_ms().map_err(|_| ManagementError::Unavailable)?;
+        let skill =
+            skills
+                .set_enabled(id, at, Actor::Owner, enabled)
+                .map_err(|error| match error {
+                    SkillError::InvalidInput => ManagementError::InvalidVersion,
+                    SkillError::LimitReached => ManagementError::LimitReached,
+                    _ => ManagementError::Unavailable,
+                })?;
+        let message = match skill.enabled {
+            Some(version) => format!("已启用「{}」第 {version} 版。", skill.name),
+            None => format!(
+                "已停用「{}」；之后的任务不会再使用它，新验证的版本也不会自动启用。",
+                skill.name
+            ),
+        };
+        Ok(
+            json!({"changed": previous.enabled != skill.enabled, "skill": skill, "message": message}),
+        )
+    };
+    match command {
+        Command::Help => Ok(json!({"message": HELP})),
+        Command::List => Ok(json!({
+            "skills": snapshot.skills_for(owner).collect::<Vec<_>>(),
+            "message": list(&snapshot, owner),
+        })),
+        Command::Show(id) => Ok(json!({"skill": owned(id)?, "message": show(&snapshot, id)})),
+        Command::Disable(id) => change(id, None),
+        Command::Enable(id, version) => change(id, Some(version)),
+        Command::Rollback(id) => {
+            let skill = owned(id)?;
+            let previous = skill.enabled.and_then(|current| {
+                skill
+                    .versions
+                    .iter()
+                    .map(|version| version.version)
+                    .filter(|version| *version < current)
+                    .max()
+            });
+            change(
+                id,
+                Some(previous.ok_or(ManagementError::NoPreviousVersion)?),
+            )
+        }
+    }
+}
+
 impl QqCommandHandler for Commands {
     fn handle(&self, input: QqCommandInput<'_>) -> PluginResult<Option<String>> {
         let Some(command) = parse(input.text) else {
@@ -183,63 +273,101 @@ impl QqCommandHandler for Commands {
         let Some(skills) = &self.skills else {
             return Ok(Some(DISABLED.into()));
         };
-        let owner = input.session.user_id.as_str();
-        let snapshot = skills.snapshot().map_err(|_| failure_text())?;
-        let owned = |id: &str| {
-            snapshot
-                .skill(id)
-                .filter(|skill| skill.owner == owner)
-                .cloned()
-        };
-        let change = |id: &str, enabled: Option<u32>| -> PluginResult<String> {
-            let at = now_ms().map_err(|_| failure_text())?;
-            match skills.set_enabled(id, at, Actor::Owner, enabled) {
-                Ok(skill) => Ok(match skill.enabled {
-                    Some(version) => format!("已启用「{}」第 {version} 版。", skill.name),
-                    None => format!(
-                        "已停用「{}」；之后的任务不会再使用它，新验证的版本也不会自动启用。",
-                        skill.name
-                    ),
-                }),
-                Err(SkillError::InvalidInput) => Ok("没有这个已验证版本。".into()),
-                Err(SkillError::LimitReached) => Ok("启用记录已满；保留原记录，未做更改。".into()),
-                Err(_) => Err(failure_text()),
-            }
-        };
-        let reply = match command {
-            Command::Help => HELP.into(),
-            Command::List => list(&snapshot, owner),
-            Command::Show(id) => match owned(id) {
-                Some(_) => show(&snapshot, id),
-                None => NOT_FOUND.into(),
-            },
-            Command::Disable(id) => match owned(id) {
-                Some(_) => change(id, None)?,
-                None => NOT_FOUND.into(),
-            },
-            Command::Enable(id, version) => match owned(id) {
-                Some(_) => change(id, Some(version))?,
-                None => NOT_FOUND.into(),
-            },
-            Command::Rollback(id) => match owned(id) {
-                None => NOT_FOUND.into(),
-                Some(skill) => {
-                    let previous = skill.enabled.and_then(|current| {
-                        skill
-                            .versions
-                            .iter()
-                            .rev()
-                            .map(|version| version.version)
-                            .find(|version| *version < current)
-                    });
-                    match previous {
-                        Some(version) => change(id, Some(version))?,
-                        None => "没有可以回退的更早版本。".into(),
-                    }
-                }
-            },
+        let reply = match execute_command(skills.as_ref(), &input.session.user_id, command) {
+            Ok(value) => value["message"].as_str().unwrap_or_default().to_owned(),
+            Err(ManagementError::Unavailable) => return Err(failure_text()),
+            Err(error) => error.message().into(),
         };
         Ok(Some(reply))
+    }
+}
+
+/// 只在技能账本已装配时注册；宿主 GuardedTool 继续执行与 /skill 相同的管理权限检查。
+pub(crate) struct ManageTool {
+    pub(crate) skills: Arc<dyn SkillAdmin>,
+}
+impl ManageTool {
+    fn command<'a>(&self, value: &'a Value) -> Result<Command<'a>, ToolValidationError> {
+        let invalid = || ToolValidationError {
+            message: concat!(
+                "action 须为 list、show、disable、enable 或 rollback；",
+                "除 list 外须 skill_id，只有 enable 须正整数 version；不接受身份或额外字段",
+            )
+            .into(),
+        };
+        let object = value.as_object().ok_or_else(invalid)?;
+        let action = object
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid)?;
+        if action == "list" && object.len() == 1 {
+            return Ok(Command::List);
+        }
+        let id = object
+            .get("skill_id")
+            .and_then(Value::as_str)
+            .filter(|id| eve_skill_api::validate_id(id).is_ok())
+            .ok_or_else(invalid)?;
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "action" | "skill_id" | "version"))
+        {
+            return Err(invalid());
+        }
+        match (action, object.get("version"), object.len()) {
+            ("show", None, 2) => Ok(Command::Show(id)),
+            ("disable", None, 2) => Ok(Command::Disable(id)),
+            ("rollback", None, 2) => Ok(Command::Rollback(id)),
+            ("enable", Some(version), 3) => {
+                let version = version
+                    .as_u64()
+                    .and_then(|version| u32::try_from(version).ok())
+                    .filter(|version| *version > 0)
+                    .ok_or_else(invalid)?;
+                Ok(Command::Enable(id, version))
+            }
+            _ => Err(invalid()),
+        }
+    }
+}
+impl Tool for ManageTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "manage_skill".into(),
+            description: "用户直接聊天要求管理自己的已固化技能时使用。先 list 或 show 查看实际 ID、版本、验证证据和启用记录，再按用户意图 disable、enable 指定的已验证 version 或 rollback 到当前启用版本之前的最近一版。只管理当前可信用户自己的技能，不删除版本、不编造验证结果；没有技能或更早版本时如实说明。与兼容命令共用真实账本和管理权限，用户无需输入命令。".into(),
+            argument_schema: json!({"type":"object","properties":{
+                "action":{"type":"string","enum":["list","show","disable","enable","rollback"]},
+                "skill_id":{"type":"string"},
+                "version":{"type":"integer","minimum":1,"maximum":u32::MAX}
+            },"required":["action"],"additionalProperties":false}),
+            required_permissions: vec![],
+            concurrency: Some(ToolConcurrency::Serial { scope: "eve.skills.management".into() }),
+        }
+    }
+    fn validate_arguments(&self, value: &Value) -> Result<(), ToolValidationError> {
+        self.command(value).map(|_| ())
+    }
+    fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
+        Box::pin(async move {
+            let command = self
+                .command(&call.arguments)
+                .map_err(|error| ToolExecutionError::Failed(error.message))?;
+            if context.is_cancel_requested() {
+                return Err(ToolExecutionError::Cancelled("本轮已取消".into()));
+            }
+            let scope = context.scope().ok_or_else(|| {
+                ToolExecutionError::Failed("技能管理需要宿主绑定的用户身份".into())
+            })?;
+            eve_session_api::SessionKey::new(&scope.session_id, &scope.user_id)
+                .map_err(|_| ToolExecutionError::Failed("用户会话身份无效".into()))?;
+            if scope.user_id == crate::qq_group::USER {
+                return Err(ToolExecutionError::Failed(
+                    "群体观察不能代替真实用户管理技能".into(),
+                ));
+            }
+            execute_command(self.skills.as_ref(), &scope.user_id, command)
+                .map_err(|error| ToolExecutionError::Failed(error.message().into()))
+        })
     }
 }
 
@@ -353,7 +481,11 @@ fn show(snapshot: &SkillSnapshot, id: &str) -> String {
                     result.probe.property,
                     result.probe.expected,
                     result.actual.as_deref().unwrap_or("无"),
-                    if result.passed { " ✓" } else { " ✗" }
+                    if result.passed {
+                        " 通过"
+                    } else {
+                        " 未通过"
+                    }
                 );
             }
         }

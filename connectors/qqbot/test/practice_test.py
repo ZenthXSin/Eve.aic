@@ -289,7 +289,7 @@ class PracticeAcceptance(unittest.TestCase):
                                 # 开启自主学习时可以只指定启动程序（服务端由 Eve 自备），不开启时仍拒绝。
                                 (["--practice-java", "java"], "--practice-mindustry-server"),
                                 (["--interest-learning", "--practice-mindustry-server", str(not_jar)], "实践运行环境无效")):
-            result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
+            result = subprocess.run([str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "refused"),
                                      "--agent", str(ROOT / "AGENT.md"), *extra],
                                     env=configure_fixture_progress(env), capture_output=True, text=True, timeout=60)
             self.assertNotEqual(result.returncode, 0)

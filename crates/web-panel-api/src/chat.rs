@@ -69,6 +69,40 @@ pub struct ChatState {
     pub turn_id: Option<u64>,
     pub text: Option<String>,
     pub failure: Option<String>,
+    /// 回复完成状态与记忆采集结果独立；有值表示交流记忆尚未确认保存。
+    /// 已保存的 Web 回复不等于用户已读，补采成功后宿主清除此字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_error: Option<String>,
     pub started_tools: Option<u64>,
     pub tool_receipts: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatState;
+
+    #[test]
+    fn legacy_receipts_default_memory_error_without_changing_completed_status() {
+        let value = serde_json::json!({
+            "conversation_id": "11111111111111111111111111111111",
+            "request_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": "completed",
+            "generation": null,
+            "turn_id": null,
+            "text": "已保存回复",
+            "failure": null,
+            "started_tools": 0,
+            "tool_receipts": 0
+        });
+        let mut state: ChatState = serde_json::from_value(value.clone()).unwrap();
+        assert!(state.memory_error.is_none());
+        assert_eq!(serde_json::to_value(&state).unwrap(), value);
+        state.memory_error = Some("交互记忆容量已满；保留原记录".into());
+        let restored: ChatState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(restored.status, "completed");
+        assert_eq!(restored.text.as_deref(), Some("已保存回复"));
+        assert!(restored.failure.is_none());
+        assert_eq!(restored.memory_error, state.memory_error);
+    }
 }

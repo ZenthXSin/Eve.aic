@@ -1,4 +1,7 @@
-"""前台失败转后台、100 步申请、原会话批准及原操作不重放的真实进程验收。"""
+"""前台失败转后台、真实授权原话继承、100步申请和原操作不重放。
+
+恢复可以继续安全执行；前台没有冻结完整验收合同时，模型声称完成仍须标为待核验。
+"""
 import hashlib
 import json
 import sys
@@ -15,6 +18,27 @@ class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
             locals()[_name] = None
     del _name
 
+    def setUp(self):
+        super().setUp()
+        self.review_requests = []
+
+    def review_reply(self, request):
+        self.review_requests.append(request)
+        self.assertFalse(request["delegated"])
+        self.assertEqual(request["program"], sys.executable)
+        self.assertEqual(request["workspace"], str(self.source.resolve()))
+        self.assertIn(request["arguments"], [
+            ["-c", "from pathlib import Path; p=Path('once.txt'); p.write_text(p.read_text()+'x' if p.exists() else 'x'); print('SAVED_COMMAND_RECEIPT')"],
+            ["-c", "from pathlib import Path; import time; p=Path('uncertain.txt'); p.write_text(p.read_text()+'x' if p.exists() else 'x'); time.sleep(5)"],
+        ])
+        self.assertTrue(request["user_messages"])
+        self.assertIn(request["user_messages"][-1], [
+            "原任务检查", "完成原任务并部署", "超时命令",
+            "最后一条真实请求：检查文件并保留结果",
+        ])
+        return {"risk": "medium", "authorization": "high", "outcome": "allow",
+                "rationale": "本地验收仅批准本例固定命令，按真实原话保留回执并检查不重放"}
+
     def run_recovery(self, script, **options):
         more = ["--background-tasks", "--sleep"] + options.pop("more", [])
         environment = {"EVE_DEVELOPER_CONFIG":str(self.developer_config),
@@ -23,8 +47,15 @@ class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
         return self.run_eve(script, interest=False, memory=True, research=False, practice=False,
             more=more, env_extra=environment, **options)
 
-    def wait_finished(self, status="Completed"):
-        self.wait_for(lambda: any(t["status"] == status and (t.get("notice") or {}).get("status") == "Delivered" for t in self.tasks()), "恢复任务或通知未完成", 30)
+    def wait_finished(self, status="Blocked", excluding=()):
+        self.wait_for(lambda: any(t["id"] not in excluding and t["status"] == status
+                                 and (t.get("notice") or {}).get("status") == "Delivered"
+                                 for t in self.tasks()), "恢复任务或通知未完成", 30)
+
+    def assert_unverified(self, task):
+        self.assertEqual(task["status"], "Blocked")
+        self.assertEqual(task["execution"]["completion_contract"], {"kind": "unspecified"})
+        self.assertIn("missing_frozen_completion_contract", task["result"])
 
     def foreground(self, body):
         if not self.results(body):
@@ -44,10 +75,18 @@ class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
         self.run_recovery([*self.send(self.message("failed", "原任务检查", contains=["已保存并转交后台任务", "100 步"])),
             *self.checkpoint("finished")], checkpoints={"finished":self.wait_finished})
         [task] = self.tasks()
+        self.assert_unverified(task)
         self.assertTrue(task["source"].startswith("failure:"))
+        self.assertEqual(task["execution"]["review_messages"], ["原任务检查"])
         self.assertEqual((task["spec"]["max_steps"], task["usage"]["tool_calls"]), (100, 0))
         self.assertEqual((self.source / "once.txt").read_text(), "x")
         self.assertEqual(self.turn("原任务检查")["status"]["state"], "Failed")
+        self.assertEqual(self.turn("原任务检查")["status"]["failure"]["evidence"]["review_user_messages"],
+                         ["原任务检查"])
+        pushes = [json.loads(line) for line in (self.work / f"events-{self.runs}.jsonl").read_text().splitlines()
+                  if json.loads(line).get("type") == "push"]
+        self.assertTrue(pushes)
+        self.assertNotIn("完成了", pushes[-1]["text"].splitlines()[0])
         self.run_recovery(self.send(self.message("again", "/tasks approve " + task["id"], contains=["没有等待追加步数"])))
         self.assertEqual(len(self.tasks()), 1)
         self.assertEqual((self.source / "once.txt").read_text(), "x")
@@ -73,8 +112,11 @@ class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
         self.callback=respond
         route={"scope":"group","target":"group-1"}
         self.run_recovery([*self.send(self.message("group-fail","群内原任务",contains=["已保存并转交后台任务"],**route)),
-            *self.checkpoint("limit")],checkpoints={"limit":lambda:self.wait_finished("Failed")})
+            *self.checkpoint("limit")],checkpoints={"limit":self.wait_finished})
         [task]=self.tasks()
+        self.assertEqual(task["status"], "Blocked")
+        self.assertIn("100 步预算不足", task["result"])
+        self.assertEqual(task["execution"]["review_messages"], ["群内原任务"])
         self.assertEqual(task["usage"]["tool_calls"],100)
         self.assertEqual(task["execution"]["checkpoint"]["remaining"],"还有核验工作未完成")
         events=[json.loads(l) for l in (self.work/f"events-{self.runs}.jsonl").read_text().splitlines()]
@@ -88,10 +130,16 @@ class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
             *self.send(self.message("approve","/tasks approve "+task["id"],contains=["已确认追加最多 100 步"],**route)),
             *self.checkpoint("done"),
             *self.send(self.message("duplicate","/tasks approve "+task["id"],contains=["已确认追加最多 100 步"],**route))],
-            checkpoints={"done":self.wait_finished})
+            checkpoints={"done":lambda:self.wait_finished(excluding=(task["id"],))})
         self.assertEqual(len(self.tasks()),2)
         self.assertEqual(self.worker_starts,2,"重复同意命令不创建或重跑接续任务")
         self.assertEqual(sorted(t["spec"]["max_steps"] for t in self.tasks()),[100,100])
+        [continued] = [saved for saved in self.tasks() if saved["id"] != task["id"]]
+        self.assert_unverified(continued)
+        self.assertEqual(continued["execution"]["review_messages"],
+                         ["群内原任务", "/tasks approve " + task["id"]])
+        self.assertEqual(continued["execution"]["completion_contract"],
+                         task["execution"]["completion_contract"])
 
     def test_uncertain_tool_effects_do_not_handoff(self):
         self.callback=lambda body: calls(*[(f"checked-{i}", "echo", {"text": str(i)}) for i in range(17)],
@@ -120,8 +168,50 @@ class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
         self.run_recovery([*self.send(self.message("rejected", "核对拒绝的调用", contains=["已保存并转交后台任务"])),
             *self.checkpoint("rejected-done")], checkpoints={"rejected-done": self.wait_finished})
         [task] = self.tasks()
-        self.assertEqual(task["status"], "Completed")
+        self.assert_unverified(task)
         self.assertEqual(self.turn("核对拒绝的调用")["status"]["failure"]["started_tools"], 0)
+
+    def test_recovery_preserves_six_complete_originals_and_never_uses_synthetic_authorization(self):
+        originals = [f"原始授权 {index}\n" + ("只在原范围工作。" * 150) + f"\n完整尾部 {index}"
+                     for index in range(7)]
+        failed_input = "最后一条真实请求：检查文件并保留结果"
+        expected = originals[-5:] + [failed_input]
+        worker_requests = []
+
+        def respond(body):
+            if self.is_worker(body):
+                worker_requests.append(body)
+                self.assertIn("eve.failed_turn", self.text(body))
+                return text_response("已检查现有回执，未规定完整验收条件")
+            if self.text(body) != failed_input:
+                return text_response("收到原始范围")
+            return self.foreground(body)
+
+        self.callback = respond
+        script = []
+        for index, text in enumerate(originals):
+            script.extend(self.send(self.message(f"original-{index}", text, expected="收到原始范围")))
+        script.extend(self.send(self.message("foreign", "其他人的内容不能成为授权",
+                                             user="user-2", expected="收到原始范围")))
+        script.extend(self.send(self.message("failed-last", failed_input,
+                                             contains=["已保存并转交后台任务"])))
+        script.extend(self.checkpoint("review-preserved"))
+        self.run_recovery(script, checkpoints={"review-preserved": self.wait_finished})
+        [task] = self.tasks()
+        self.assert_unverified(task)
+        self.assertEqual(task["execution"]["review_messages"], expected)
+        failure = self.turn(failed_input)["status"]["failure"]
+        self.assertEqual(failure["evidence"]["review_user_messages"], expected)
+        self.assertEqual(len(worker_requests), 1)
+        self.assertEqual((self.source / "once.txt").read_text(), "x")
+        frozen = task["execution"]["review_messages"]
+        self.callback = lambda body: text_response("恢复记录仍然保留")
+        self.run_recovery(self.send(self.message("restart-evidence", "重启后核对",
+                                                 expected="恢复记录仍然保留")))
+        [restored] = self.tasks()
+        self.assertEqual(restored["execution"]["review_messages"], frozen)
+        self.assertEqual(restored["status"], "Blocked")
+        self.assertEqual((self.source / "once.txt").read_text(), "x")
 
     def test_hundred_calls_report_progress_with_large_context_and_no_replay_after_restart(self):
         self.closing_requests = 0

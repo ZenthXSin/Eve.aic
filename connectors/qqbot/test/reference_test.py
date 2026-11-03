@@ -164,7 +164,7 @@ class ReferenceAcceptance(unittest.TestCase):
         for reference, expected in ((f"game={self.work / 'missing'}", "目录无法读取"),
                                     (f"empty={self.work / 'state'}", "参考资料无效")):
             (self.work / "state").mkdir(exist_ok=True)
-            result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "state"), "--agent",
+            result = subprocess.run([str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "state"), "--agent",
                                      str(ROOT / "AGENT.md"), "--bridge-script", str(FAKE), "--bridge-arg",
                                      str(scenario), "--reference", reference],
                                     env=configure_fixture_progress(env), capture_output=True, text=True, timeout=30)

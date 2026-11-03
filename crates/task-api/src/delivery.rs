@@ -145,6 +145,16 @@ pub fn validate_notice(notice: &Notice, finished: u64) -> TaskResult<()> {
     }
     let mut carried = BTreeSet::new();
     for (index, attempt) in notice.attempts.iter().enumerate() {
+        match (&attempt.channel, &attempt.result) {
+            (
+                DeliveryChannel::LocalInbox,
+                Some(DeliveryResult::StoredLocally { notification_id }),
+            ) => validate_id(notification_id)?,
+            (DeliveryChannel::LocalInbox, _) | (_, Some(DeliveryResult::StoredLocally { .. })) => {
+                return invalid;
+            }
+            _ => {}
+        }
         if let DeliveryChannel::Passive { message_id } = &attempt.channel {
             validate_id(message_id)?;
         }
@@ -162,7 +172,11 @@ pub fn validate_notice(notice: &Notice, finished: u64) -> TaskResult<()> {
         }
         if attempt.started_at_ms < finished
             || (attempt.result.is_none() && !last)
-            || (!last && matches!(attempt.result, Some(DeliveryResult::Sent { .. })))
+            || (!last
+                && matches!(
+                    attempt.result,
+                    Some(DeliveryResult::Sent { .. } | DeliveryResult::StoredLocally { .. })
+                ))
             || (!last && attempt.result == Some(DeliveryResult::Unknown))
             || attempt
                 .finished_at_ms
@@ -174,7 +188,12 @@ pub fn validate_notice(notice: &Notice, finished: u64) -> TaskResult<()> {
         }
     }
     let last_result = notice.attempts.last().map(|attempt| &attempt.result);
-    let sent = matches!(last_result, Some(Some(DeliveryResult::Sent { .. })));
+    let sent = matches!(
+        last_result,
+        Some(Some(
+            DeliveryResult::Sent { .. } | DeliveryResult::StoredLocally { .. }
+        ))
+    );
     let open_or_unknown = matches!(
         last_result,
         Some(None) | Some(Some(DeliveryResult::Unknown))
@@ -341,6 +360,60 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn local_receipt_is_a_completed_inbox_delivery_and_rejects_mismatched_pairs() {
+        let valid = Notice {
+            status: NoticeStatus::Delivered,
+            attempts: vec![DeliveryAttempt {
+                channel: DeliveryChannel::LocalInbox,
+                started_at_ms: 11,
+                finished_at_ms: Some(11),
+                result: Some(DeliveryResult::StoredLocally {
+                    notification_id: "notification-123".into(),
+                }),
+            }],
+            closed_at_ms: Some(11),
+        };
+        assert!(validate_notice(&valid, 10).is_ok());
+        let roundtrip: Notice =
+            serde_json::from_str(&serde_json::to_string(&valid).unwrap()).unwrap();
+        assert_eq!(roundtrip, valid);
+        for variant in 0..9 {
+            let mut invalid = valid.clone();
+            match variant {
+                0 => invalid.attempts[0].channel = DeliveryChannel::Proactive,
+                1 => {
+                    invalid.attempts[0].channel = DeliveryChannel::Passive {
+                        message_id: "message".into(),
+                    }
+                }
+                2 => {
+                    invalid.attempts[0].result = Some(DeliveryResult::Sent {
+                        platform_message_id: None,
+                    })
+                }
+                3 => {
+                    invalid.attempts[0].result = Some(DeliveryResult::StoredLocally {
+                        notification_id: " invalid receipt ".into(),
+                    })
+                }
+                4 => invalid.attempts[0].result = None,
+                5 => invalid.attempts[0].finished_at_ms = None,
+                6 => invalid.status = NoticeStatus::Pending,
+                7 => invalid.closed_at_ms = None,
+                _ => invalid.attempts.push(DeliveryAttempt {
+                    channel: DeliveryChannel::Proactive,
+                    started_at_ms: 12,
+                    finished_at_ms: Some(12),
+                    result: Some(DeliveryResult::Sent {
+                        platform_message_id: None,
+                    }),
+                }),
+            }
+            assert!(validate_notice(&invalid, 10).is_err(), "variant {variant}");
+        }
+    }
+
     #[test]
     fn malformed_directory_and_inconsistent_notice_fail_closed() {
         let valid = entry("a", "alice", 1);

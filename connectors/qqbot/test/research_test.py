@@ -316,7 +316,7 @@ class ResearchAcceptance(unittest.TestCase):
                                 (["--research-corpus", str(tampered), "--research-source", CORPUS_SEED], "资料与清单不符"),
                                 (["--research-corpus", str(CORPUS), "--research-source", "eve-corpus://other/x/"],
                                  "不属于本地资料")):
-            result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
+            result = subprocess.run([str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "refused"),
                                      "--agent", str(ROOT / "AGENT.md"), "--interest-learning", *extra],
                                     env=configure_fixture_progress(env), capture_output=True, text=True, timeout=60)
             self.assertNotEqual(result.returncode, 0)
@@ -426,7 +426,7 @@ class ResearchAcceptance(unittest.TestCase):
         env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret")
         for extra in (["--research-source", self.seed],
                       ["--interest-learning", "--research-source", "ftp://127.0.0.1/docs/"]):
-            result = subprocess.run([str(BINARY), "--state-dir", str(self.work / "refused"),
+            result = subprocess.run([str(BINARY), "--minimal-profile", "--state-dir", str(self.work / "refused"),
                                      "--agent", str(ROOT / "AGENT.md"), *extra],
                                     env=configure_fixture_progress(env), capture_output=True, text=True, timeout=30)
             self.assertNotEqual(result.returncode, 0)

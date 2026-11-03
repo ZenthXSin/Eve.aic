@@ -41,11 +41,20 @@ async fn start(
     root: &Path,
     check: Arc<JarCheck>,
 ) -> PluginResult<(Kernel, ProvisionController)> {
+    start_with_spec(state, root, check, spec()).await
+}
+
+async fn start_with_spec(
+    state: Arc<dyn StateStore>,
+    root: &Path,
+    check: Arc<JarCheck>,
+    condition: ConditionSpec,
+) -> PluginResult<(Kernel, ProvisionController)> {
     let kernel = Kernel::with_services(KernelServices {
         state,
         ..KernelServices::default()
     });
-    let plugin = ProvisionPlugin::new(root.to_path_buf(), vec![(spec(), check)])?;
+    let plugin = ProvisionPlugin::new(root.to_path_buf(), vec![(condition, check)])?;
     let controller = plugin.controller();
     kernel.register(Box::new(plugin))?;
     kernel
@@ -80,6 +89,23 @@ fn local(dir: &Path, name: &str, bytes: &[u8]) -> AcquireSource {
 
 fn staging_empty(root: &Path) -> bool {
     std::fs::read_dir(root.join(".staging")).map_or(true, |mut d| d.next().is_none())
+}
+
+fn assert_ready_record_preserved(
+    state: &dyn StateStore,
+    provider: &ProvisionController,
+    original_bytes: &[u8],
+    acquired: &Acquisition,
+) {
+    let id = PluginId::new(PROVISION_PLUGIN_ID).unwrap();
+    assert_eq!(
+        state.get(&id, PROVISION_STATE_KEY).unwrap().as_deref(),
+        Some(original_bytes)
+    );
+    assert_eq!(
+        provider.conditions().unwrap()[0].ready.as_ref(),
+        Some(acquired)
+    );
 }
 
 #[tokio::test]
@@ -120,6 +146,200 @@ async fn local_file_is_verified_then_enabled_and_survives_restart() {
     let view = &provider.conditions().unwrap()[0];
     assert_eq!(view.ready.as_ref().unwrap().reason, "实践验证需要服务端");
     assert!(view.attempts[0].ready);
+}
+
+#[tokio::test]
+async fn restored_ready_file_rechecks_digest_and_recovers_without_rewriting_the_ledger() {
+    let root = tempfile::tempdir().unwrap();
+    let sources = tempfile::tempdir().unwrap();
+    let state: Arc<dyn StateStore> = Arc::new(MemoryStateStore::default());
+    let check = Arc::new(JarCheck(AtomicUsize::new(0)));
+    let (kernel, provider) = start(state.clone(), root.path(), check.clone())
+        .await
+        .unwrap();
+    let good = b"PK-original";
+    let changed = b"PK-tampered";
+    assert_eq!(good.len(), changed.len(), "长度相同仍须重新核对摘要");
+    let acquired = provider
+        .acquire(request(local(sources.path(), "a.jar", good), None, 1))
+        .await
+        .unwrap();
+    let path = provider.ready_path("sample-server").unwrap().unwrap();
+    let id = PluginId::new(PROVISION_PLUGIN_ID).unwrap();
+    let original_bytes = state.get(&id, PROVISION_STATE_KEY).unwrap().unwrap();
+    kernel.stop_all().await.unwrap();
+
+    std::fs::write(&path, changed).unwrap();
+    let (kernel, provider) = start(state.clone(), root.path(), check.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.ready_path("sample-server"),
+        Err(ProvisionError::DigestMismatch {
+            actual: sha(changed)
+        })
+    );
+    assert_ready_record_preserved(state.as_ref(), &provider, &original_bytes, &acquired);
+    assert_eq!(std::fs::read(&path).unwrap(), changed);
+    kernel.stop_all().await.unwrap();
+
+    std::fs::remove_file(&path).unwrap();
+    let (kernel, provider) = start(state.clone(), root.path(), check.clone())
+        .await
+        .unwrap();
+    assert_eq!(provider.ready_path("sample-server").unwrap(), None);
+    assert_ready_record_preserved(state.as_ref(), &provider, &original_bytes, &acquired);
+    assert!(!path.exists());
+
+    std::fs::write(&path, good).unwrap();
+    assert_eq!(
+        provider.ready_path("sample-server").unwrap(),
+        Some(path.canonicalize().unwrap())
+    );
+    assert_ready_record_preserved(state.as_ref(), &provider, &original_bytes, &acquired);
+    assert_eq!(check.0.load(Ordering::SeqCst), 1);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn restored_ready_file_rejects_changed_lengths_and_directories_and_preserves_data() {
+    let root = tempfile::tempdir().unwrap();
+    let sources = tempfile::tempdir().unwrap();
+    let state: Arc<dyn StateStore> = Arc::new(MemoryStateStore::default());
+    let check = Arc::new(JarCheck(AtomicUsize::new(0)));
+    let (kernel, provider) = start(state.clone(), root.path(), check.clone())
+        .await
+        .unwrap();
+    let good = b"PK-original";
+    let acquired = provider
+        .acquire(request(local(sources.path(), "a.jar", good), None, 1))
+        .await
+        .unwrap();
+    let path = provider.ready_path("sample-server").unwrap().unwrap();
+    let id = PluginId::new(PROVISION_PLUGIN_ID).unwrap();
+    let original_bytes = state.get(&id, PROVISION_STATE_KEY).unwrap().unwrap();
+    kernel.stop_all().await.unwrap();
+
+    for length in [2, 512 * 1024 * 1024] {
+        // 稀疏大文件应在读取正文前被拒绝，不在测试中分配对应大小的内存。
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(length)
+            .unwrap();
+        let (kernel, provider) = start(state.clone(), root.path(), check.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            provider.ready_path("sample-server"),
+            Err(ProvisionError::VerifyFailed(_))
+        ));
+        assert_eq!(path.metadata().unwrap().len(), length);
+        assert_ready_record_preserved(state.as_ref(), &provider, &original_bytes, &acquired);
+        kernel.stop_all().await.unwrap();
+    }
+
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let (kernel, provider) = start(state.clone(), root.path(), check).await.unwrap();
+    assert!(matches!(
+        provider.ready_path("sample-server"),
+        Err(ProvisionError::VerifyFailed(_))
+    ));
+    assert!(path.is_dir());
+    assert_ready_record_preserved(state.as_ref(), &provider, &original_bytes, &acquired);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn restored_ready_file_obeys_the_current_size_limit_without_clearing_its_record() {
+    let root = tempfile::tempdir().unwrap();
+    let sources = tempfile::tempdir().unwrap();
+    let state: Arc<dyn StateStore> = Arc::new(MemoryStateStore::default());
+    let check = Arc::new(JarCheck(AtomicUsize::new(0)));
+    let (kernel, provider) = start(state.clone(), root.path(), check.clone())
+        .await
+        .unwrap();
+    let good = b"PK-original";
+    let acquired = provider
+        .acquire(request(local(sources.path(), "a.jar", good), None, 1))
+        .await
+        .unwrap();
+    let path = provider.ready_path("sample-server").unwrap().unwrap();
+    let id = PluginId::new(PROVISION_PLUGIN_ID).unwrap();
+    let original_bytes = state.get(&id, PROVISION_STATE_KEY).unwrap().unwrap();
+    kernel.stop_all().await.unwrap();
+
+    let (kernel, provider) = start_with_spec(
+        state.clone(),
+        root.path(),
+        check,
+        ConditionSpec {
+            max_bytes: good.len() as u64 - 1,
+            ..spec()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        provider.ready_path("sample-server"),
+        Err(ProvisionError::TooLarge)
+    );
+    assert_ready_record_preserved(state.as_ref(), &provider, &original_bytes, &acquired);
+    assert_eq!(std::fs::read(&path).unwrap(), good);
+    kernel.stop_all().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn restored_ready_file_rejects_symlinked_files_parent_directories_and_roots() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("conditions");
+    std::fs::create_dir(&root).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let state: Arc<dyn StateStore> = Arc::new(MemoryStateStore::default());
+    let check = Arc::new(JarCheck(AtomicUsize::new(0)));
+    let (kernel, provider) = start(state.clone(), &root, check.clone()).await.unwrap();
+    let good = b"PK-original";
+    let acquired = provider
+        .acquire(request(local(outside.path(), "a.jar", good), None, 1))
+        .await
+        .unwrap();
+    let path = provider.ready_path("sample-server").unwrap().unwrap();
+    let id = PluginId::new(PROVISION_PLUGIN_ID).unwrap();
+    let original_bytes = state.get(&id, PROVISION_STATE_KEY).unwrap().unwrap();
+    kernel.stop_all().await.unwrap();
+
+    for target in [path.as_path(), path.parent().unwrap(), root.as_path()] {
+        let backup = outside.path().join("original");
+        std::fs::rename(target, &backup).unwrap();
+        symlink(&backup, target).unwrap();
+        let (kernel, provider) = start(state.clone(), &root, check.clone()).await.unwrap();
+        assert!(matches!(
+            provider.ready_path("sample-server"),
+            Err(ProvisionError::VerifyFailed(_))
+        ));
+        assert_ready_record_preserved(state.as_ref(), &provider, &original_bytes, &acquired);
+        assert!(
+            std::fs::symlink_metadata(target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), good);
+
+        std::fs::remove_file(target).unwrap();
+        std::fs::rename(&backup, target).unwrap();
+        assert_eq!(
+            provider.ready_path("sample-server").unwrap(),
+            Some(path.canonicalize().unwrap())
+        );
+        assert_ready_record_preserved(state.as_ref(), &provider, &original_bytes, &acquired);
+        kernel.stop_all().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -264,7 +484,7 @@ async fn download_follows_redirects_and_reports_http_failures() {
     assert!(matches!(plain, Err(ProvisionError::InvalidInput(_))));
     assert_eq!(
         provider.ready_path("sample-server").unwrap(),
-        Some(root.path().join(acquired.path))
+        Some(root.path().join(acquired.path).canonicalize().unwrap())
     );
 }
 

@@ -18,6 +18,7 @@ enum Kind {
     Github,
     Upgrade,
     ApplyUpgrade,
+    RestartSelf,
     UpgradeStatus,
 }
 pub fn tools(config: &DeveloperConfig, backend: Arc<dyn DeveloperBackend>) -> Vec<Arc<dyn Tool>> {
@@ -30,9 +31,19 @@ pub fn tools(config: &DeveloperConfig, backend: Arc<dyn DeveloperBackend>) -> Ve
         (Kind::Search, true),
         (Kind::Command, config.commands),
         (Kind::Github, config.github),
-        (Kind::Upgrade, config.self_upgrade),
-        (Kind::ApplyUpgrade, config.live_upgrade.is_some()),
-        (Kind::UpgradeStatus, config.live_upgrade.is_some()),
+        (Kind::Upgrade, config.self_upgrade && config.commands),
+        (
+            Kind::ApplyUpgrade,
+            config.live_upgrade.is_some() && config.self_upgrade && config.commands,
+        ),
+        (
+            Kind::RestartSelf,
+            config.live_upgrade.is_some() && config.self_upgrade && config.commands,
+        ),
+        (
+            Kind::UpgradeStatus,
+            config.live_upgrade.is_some() && config.self_upgrade && config.commands,
+        ),
     ]
     .into_iter()
     .filter(|(_, on)| *on)
@@ -60,6 +71,7 @@ pub fn operation_for_tool(
         "github_api" => Kind::Github,
         "prepare_self_upgrade" => Kind::Upgrade,
         "apply_self_upgrade" => Kind::ApplyUpgrade,
+        "restart_self" => Kind::RestartSelf,
         "self_upgrade_status" => Kind::UpgradeStatus,
         _ => return None,
     };
@@ -167,12 +179,14 @@ impl DeveloperTool {
                 })?;
                 Ok(DeveloperOperation::Github(a))
             }
-            Kind::Upgrade | Kind::UpgradeStatus => {
+            Kind::Upgrade | Kind::RestartSelf | Kind::UpgradeStatus => {
                 if arguments.as_object().is_none_or(|v| !v.is_empty()) {
                     return Err(bad());
                 }
                 Ok(if matches!(kind, Kind::Upgrade) {
                     DeveloperOperation::PrepareUpgrade
+                } else if matches!(kind, Kind::RestartSelf) {
+                    DeveloperOperation::RestartSelf
                 } else {
                     DeveloperOperation::UpgradeStatus
                 })
@@ -193,7 +207,7 @@ impl Tool for DeveloperTool {
         let (name, description, schema) = match self.kind {
             Kind::List => (
                 "list_files",
-                "列出当前授权工作区的目录；返回真实路径类型，不跟随目录链接。普通成员的独立项目与管理员宿主工作区由宿主身份策略决定。",
+                "列出当前授权工作区的目录；返回真实路径类型，不跟随目录链接。开启实时升级的管理员会话自动使用私有源码检出，共享工作区未提交改动不导入；普通成员使用独立项目。",
                 object(
                     json!({"path":{"type":"string","description":"工作区相对目录，根目录为 ."}}),
                     &["path"],
@@ -254,7 +268,7 @@ impl Tool for DeveloperTool {
             ),
             Kind::Upgrade => (
                 "prepare_self_upgrade",
-                "实际执行格式、Clippy、完整工作区测试与构建；Clippy、测试及构建共用 release 产物，避免生成两套缓存。冻结候选可执行文件、运行资源及摘要。准备成功尚未切换；宿主装配 apply_self_upgrade 时可提交实时切换，否则走 PR/发行更新。",
+                "准备当前会话的升级候选。实时升级宿主自动从私有会话检出冻结候选并合并当前在线修复，无需替其他会话提交、stash、清理或覆盖共享工作区。当前会话未提交改动保留，候选合并冲突返回文件名。实际执行格式、Clippy、完整工作区测试、隔离监督器预演、release构建及真实Eve进程重启/交接预演，冻结完整差异、程序与运行资源。差异或完整审核上下文超限拒绝，不裁剪。prepared=true尚未上线，apply_self_upgrade另行审核和切换。",
                 object(json!({}), &[]),
             ),
             Kind::ApplyUpgrade => (
@@ -268,6 +282,11 @@ impl Tool for DeveloperTool {
             Kind::UpgradeStatus => (
                 "self_upgrade_status",
                 "读取独立运行监督器的心跳、当前二进制摘要、切换阶段及真实结果。applied、rolled_back 与未知/失败分开；不要把提交请求冒充已经升级。",
+                object(json!({}), &[]),
+            ),
+            Kind::RestartSelf => (
+                "restart_self",
+                "向独立监督器提交安全重启请求；仅主人或管理员可在可信当前会话调用，后台及子代理不可调用。queued=true 仅表示已排队，本轮应结束回复；后续新轮用 self_upgrade_status 核对结果。不能指定路径或命令，也不能自行终止进程。",
                 object(json!({}), &[]),
             ),
         };

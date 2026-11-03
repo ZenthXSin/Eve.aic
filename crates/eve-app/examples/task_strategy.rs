@@ -77,8 +77,10 @@ fn case(scope: &TaskStrategyScope, name: &str) -> TaskStrategyCase {
     }
 }
 async fn run() -> Result<(), AppError> {
-    let mut options =
-        QqBotOptions::parse(std::env::args_os().skip(1))?.ok_or("测试宿主需要实际启动参数")?;
+    let mut args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    // 此示例是受信测试宿主，固定使用最小组合；共享进程夹具会显式传同一开关。
+    args.insert(0, "--minimal-profile".into());
+    let mut options = QqBotOptions::parse_product(args)?.ok_or("测试宿主需要实际启动参数")?;
     let provider = std::env::var("EVE_OPENAI_BASE_URL")?;
     let local_port = provider
         .strip_prefix("http://127.0.0.1:")
@@ -103,7 +105,7 @@ async fn run() -> Result<(), AppError> {
     let root = developer_path.parent().ok_or("测试目录无效")?;
     let developer: DeveloperConfig = serde_json::from_slice(&fs::read(&developer_path)?)?;
     if fs::read(root.join("task-strategy-fixture.marker"))? != b"isolated-task-strategy-v1"
-        || options.state_directory != root.join("state")
+        || options.state_directory.canonicalize()? != root.join("state").canonicalize()?
         || developer.workspace.canonicalize()? != root.join("source").canonicalize()?
         || developer.commands
         || developer.github

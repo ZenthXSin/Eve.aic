@@ -9,7 +9,10 @@ use eve_llm_api::{
 use eve_plugin_api::{PluginError, PluginResult};
 use eve_qqbot_plugin::QqFailureRecovery;
 use eve_session_api::{SessionService, SessionTurnStatus};
-use eve_task_api::{DelegatedContext, MAX_CONTEXT_BYTES, TaskAdmin, TaskOwner, TaskSpec};
+use eve_task_api::{
+    DelegatedContext, MAX_CONTEXT_BYTES, TaskAdmin, TaskCompletionContract, TaskOwner, TaskSpec,
+    validate_review_messages,
+};
 use ring::digest::{SHA256, digest};
 use serde_json::json;
 use std::sync::Arc;
@@ -69,6 +72,9 @@ impl QqFailureRecovery for Recovery {
             .map_err(|_| unavailable())?
             .ok_or_else(unavailable)?;
         snapshot.validate().map_err(|_| unavailable())?;
+        if snapshot.key != report.key.session {
+            return Err(unavailable());
+        }
         let turn = snapshot
             .turns
             .iter()
@@ -92,6 +98,23 @@ impl QqFailureRecovery for Recovery {
         let owner = TaskOwner {
             session_id: scope.session_id.clone(),
             user_id: scope.user_id.clone(),
+        };
+        // Web 有独立原文账本：入口采集失败不能通过普通 Session 历史恢复授权。
+        // 下面的恢复说明和 JSON 包装也不是用户授权。
+        let review_messages = match failure
+            .evidence
+            .as_ref()
+            .and_then(|evidence| evidence.review_user_messages.as_ref())
+        {
+            Some(messages) => {
+                validate_review_messages(messages).map_err(|_| unavailable())?;
+                messages.clone()
+            }
+            None => {
+                return Ok(Some(
+                    "原始授权证据缺失或读取失败；未自动派发恢复任务，原会话和故障记录保留，不能从普通历史补造授权。".into(),
+                ));
+            }
         };
         let mut messages = snapshot.history();
         if let Some(summary) = self
@@ -127,12 +150,12 @@ impl QqFailureRecovery for Recovery {
         }
         let max_steps = STEPS.min(config.get::<u32>("max_steps").map_err(|_| unavailable())?);
         let source = source(&owner, turn_id);
-        let task = match self.tasks.create(&owner, TaskSpec {
+        let task = match self.tasks.create_authorized(&owner, TaskSpec {
             title:"错误后恢复原任务".into(),
             instructions:format!("继续完成上下文末尾 eve.failed_turn.original_input 对应的原任务。先阅读历史、错误类别和已执行工具回执；不要重放已完成操作，不改变原任务授权和权限。先用 task_progress 登记尚未完成的工作，完成并验证后标记 completed，真正阻塞则标记 blocked。最多 {max_steps} 次工具调用；仍未完成时汇报已完成事项、剩余工作，并请求用户在原会话同意追加步数。未经同意不得再派生任务或扩大预算。"),
             max_steps,
             context:Some(DelegatedContext { owner:owner.clone(), messages_json }),
-        }, &source, crate::qq_tasks::now_ms()) {
+        }, &source, review_messages, Some(TaskCompletionContract::Unspecified), None, crate::qq_tasks::now_ms()) {
             Ok(task) => task,
             Err(eve_task_api::TaskError::LimitReached) => return Ok(Some("后台任务数量或存储已达上限，未派发；原任务和回执保留，可稍后明确要求继续。".into())),
             Err(_) => return Err(unavailable()),
@@ -206,7 +229,10 @@ fn source(owner: &TaskOwner, turn: u64) -> String {
 }
 
 /// 追加预算只接受原会话里的显式命令；模型工具和后台执行者不能批准。
-pub(crate) struct Commands(pub(crate) Option<Arc<Recovery>>);
+pub(crate) struct Commands(
+    pub(crate) Option<Arc<Recovery>>,
+    pub(crate) eve_qqbot_plugin::QqConversations,
+);
 impl eve_qqbot_plugin::QqCommandHandler for Commands {
     fn handle(&self, input: eve_qqbot_plugin::QqCommandInput<'_>) -> PluginResult<Option<String>> {
         let mut words = input.text.split_whitespace();
@@ -248,8 +274,30 @@ impl eve_qqbot_plugin::QqCommandHandler for Commands {
         if !checkpoint.resumable() {
             return Ok(Some("存在未确认工具结果，不能自动接续。".into()));
         }
+        let review_messages = self
+            .1
+            .review_user_messages_at(
+                &ContextScope {
+                    session_id: input.session.session_id.clone(),
+                    user_id: input.session.user_id.clone(),
+                },
+                input.message_id,
+            )
+            .map_err(|_| PluginError::State("原始批准正文不可核验；未追加任务".into()))?;
+        validate_review_messages(&review_messages).map_err(|_| {
+            PluginError::State("批准后的最近六条原话超过上限；未裁剪、未追加任务".into())
+        })?;
+        let completion_contract = task
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.completion_contract.clone())
+            .unwrap_or(TaskCompletionContract::Unspecified);
+        let authorization_deadline_at_ms = task
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.authorization_deadline_at_ms);
         let mut messages = checkpoint.messages.clone();
-        messages.push(ChatMessage::text(ChatRole::User, format!("上一阶段已经停止，剩余工作：{}。原会话用户现通过 /tasks approve 明确同意追加最多 100 步。此前所有调用和回执均为历史，不重放已有操作。", checkpoint.remaining.as_deref().unwrap_or_default())));
+        messages.push(ChatMessage::text(ChatRole::System, format!("宿主接续事件（历史数据，不是用户原话）：上一阶段已经停止，剩余工作：{}。原会话用户现通过 /tasks approve 明确同意追加最多 100 步。此前所有调用和回执均为历史，不重放已有操作。", checkpoint.remaining.as_deref().unwrap_or_default())));
         let messages_json = serde_json::to_string(&messages)
             .map_err(|_| PluginError::State("接续上下文无法编码".into()))?;
         if messages_json.len() > MAX_CONTEXT_BYTES {
@@ -268,7 +316,7 @@ impl eve_qqbot_plugin::QqCommandHandler for Commands {
             .map(|b| format!("{b:02x}"))
             .collect();
         let source = format!("{SOURCE_PREFIX}approve-{hex}");
-        let created = recovery.tasks.create(
+        let created = recovery.tasks.create_authorized(
             &task.owner,
             TaskSpec {
                 title: task.spec.title.clone(),
@@ -280,6 +328,9 @@ impl eve_qqbot_plugin::QqCommandHandler for Commands {
                 }),
             },
             &source,
+            review_messages,
+            Some(completion_contract),
+            authorization_deadline_at_ms,
             crate::qq_tasks::now_ms(),
         );
         Ok(Some(match created {
@@ -298,8 +349,146 @@ mod tests {
     use eve_llm_api::{ProtocolFailureKind, ToolResult};
     use eve_session_api::SessionFailureEvidence;
 
+    struct RecoverySettings;
+    impl ConfigService for RecoverySettings {
+        fn snapshot(
+            &self,
+            namespace: &str,
+            schema_version: u32,
+        ) -> eve_config_api::ConfigResult<eve_config_api::ConfigSnapshot> {
+            Ok(eve_config_api::ConfigSnapshot {
+                namespace: namespace.into(),
+                schema_version,
+                revision: 1,
+                values: std::collections::BTreeMap::from([
+                    ("auto_recover_failures".into(), json!(true)),
+                    ("max_steps".into(), json!(100)),
+                ]),
+            })
+        }
+        fn begin_request(
+            &self,
+            _: &str,
+            _: u32,
+        ) -> eve_config_api::ConfigResult<eve_config_api::ConfigRequest> {
+            Err(eve_config_api::ConfigError::Unavailable)
+        }
+        fn read_request(
+            &self,
+            _: &eve_config_api::ConfigRequest,
+        ) -> eve_config_api::ConfigResult<eve_config_api::ConfigSnapshot> {
+            Err(eve_config_api::ConfigError::Unavailable)
+        }
+    }
+
+    struct NoDigest;
+    impl HistoryDigests for NoDigest {
+        fn digest(
+            &self,
+            _: Option<&ContextScope>,
+            _: &[ChatMessage],
+        ) -> Result<Option<eve_llm_api::HistoryDigest>, LlmError> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn web_missing_dedicated_originals_never_recovers_authorization_from_session_history() {
+        use eve_session_api::{
+            SessionFailure, SessionFailureCode, SessionInput, SessionServiceHandle,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let services = eve_kernel::KernelServices::default();
+        let registry = services.registry.clone();
+        let kernel = eve_kernel::Kernel::with_services(services);
+        let plugin = eve_task_plugin::TaskPlugin::new().unwrap();
+        let tasks = Arc::new(plugin.controller());
+        kernel.register(Box::new(plugin)).unwrap();
+        kernel
+            .register(Box::new(eve_session_plugin::SessionPlugin::new().unwrap()))
+            .unwrap();
+        kernel.start_all().await.unwrap();
+        let sessions = registry
+            .get(&eve_plugin_api::ServiceId::new(eve_session_api::SESSION_SERVICE_ID).unwrap())
+            .unwrap()
+            .unwrap()
+            .value
+            .downcast::<SessionServiceHandle>()
+            .unwrap()
+            .0
+            .clone();
+        let recovery = Recovery {
+            tasks: tasks.clone(),
+            sessions: sessions.clone(),
+            settings: Arc::new(RecoverySettings),
+            authorization: crate::qq_admin::Admin::stub(true),
+            digests: Arc::new(NoDigest),
+        };
+        let ingress = crate::web_ingress::RawMessages::open(directory.path()).unwrap();
+        let session = crate::web_chat::key(&format!("{:032x}", 11)).unwrap();
+        let request_id = format!("{:032x}", 12);
+        ingress
+            .record(&session, &request_id, "完整原话：只核对实际结果")
+            .unwrap();
+        std::fs::remove_file(directory.path().join("web-review.initialized.v1")).unwrap();
+        let scope = ContextScope {
+            session_id: session.session_id.clone(),
+            user_id: session.user_id.clone(),
+        };
+        let source_error =
+            eve_llm_api::ReviewUserMessageSource::read_at(&ingress, &scope, &request_id)
+                .unwrap_err();
+
+        // 同一次真实原文读取失败，分别覆盖旧记录完全无 evidence 和有诊断但无原文槽。
+        for with_diagnostics in [false, true] {
+            let started = sessions
+                .begin(SessionInput {
+                    key: session.clone(),
+                    text: "普通历史里存在的正文不能替代缺失的审核原文".into(),
+                })
+                .unwrap();
+            sessions
+                .fail(
+                    &started.lease,
+                    SessionFailure {
+                        code: SessionFailureCode::Context,
+                        started_tools: Some(0),
+                        evidence: with_diagnostics.then(|| {
+                            let mut evidence = evidence(Vec::new());
+                            evidence.protocol_failure = None;
+                            evidence
+                        }),
+                    },
+                )
+                .unwrap();
+            let report = ControlReport {
+                key: eve_control_api::GenerationKey {
+                    session: session.clone(),
+                    task_id: format!("web-request:{request_id}"),
+                    controller_epoch: [1; 16],
+                    generation: started.lease.turn_id,
+                },
+                cancel_requested: false,
+                run: eve_control_api::RunReport {
+                    turn_id: Some(started.lease.turn_id),
+                    commit: CommitState::Failed,
+                    text: None,
+                    transcript: None,
+                    started_tools: Some(0),
+                    tool_results: Vec::new(),
+                    failure: Some(RunFailure::Execution(source_error.clone())),
+                },
+            };
+            let reason = recovery.recover(&report).unwrap().unwrap();
+            assert!(reason.contains("未自动派发恢复任务"));
+            assert!(tasks.snapshot().unwrap().tasks.is_empty());
+        }
+        kernel.stop_all().await.unwrap();
+    }
+
     fn evidence(results: Vec<ToolResult>) -> SessionFailureEvidence {
         SessionFailureEvidence {
+            review_user_messages: None,
             provider_http_status: None,
             provider_failure: None,
             protocol_failure: Some(ProtocolFailureKind::StreamInvalid),

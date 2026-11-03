@@ -7,6 +7,8 @@ mod chat;
 mod extensions;
 pub use chat::*;
 pub use extensions::*;
+mod notifications;
+pub use notifications::*;
 
 pub type PanelResult<T> = Result<T, PanelError>;
 pub const MAX_PANEL_CONTEXT_BODY_BYTES: usize = eve_context_api::MAX_CONTEXT_BODY_BYTES + 8192;
@@ -25,6 +27,8 @@ pub enum PanelError {
     NotFound,
     Stale,
     Unavailable,
+    /// 收件箱容量已满；仍可读取和确认已读，不应停止其他业务。
+    Capacity,
     Forbidden,
 }
 
@@ -681,6 +685,12 @@ pub struct LearningView {
 /// 每页 1..=100 项；历史最多 50 轮，每段正文最多 8192 字节并明确标注截断。
 /// Web 对话是可选能力，仅接收正文与请求编号，身份由宿主固定；不允许指定 Provider 或直接执行工具。
 pub trait PanelService: Send + Sync {
+    fn notifications(&self, _before: Option<u64>, _limit: usize) -> PanelResult<NotificationPage> {
+        Err(PanelError::Unavailable)
+    }
+    fn mark_notification_read(&self, _id: u64) -> PanelResult<bool> {
+        Err(PanelError::Unavailable)
+    }
     fn chat_info(&self) -> PanelResult<ChatInfo> {
         Err(PanelError::Unavailable)
     }

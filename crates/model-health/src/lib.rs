@@ -45,7 +45,7 @@ pub const RECENT_REQUESTS: usize = 32;
 pub struct CacheStats {
     /// 响应里报告了缓存命中数的请求。
     pub reported_requests: u64,
-    /// 成功但没有报告缓存命中数的请求。
+    /// 成功但没有报告有效缓存命中数的请求。
     pub unreported_requests: u64,
     pub input_tokens: u64,
     pub cached_tokens: u64,
@@ -161,11 +161,11 @@ impl ModelUsageObserver for HealthBook {
     fn reported(&self, role: &str, usage: ModelUsage) {
         self.with_role(role, |cache| {
             match (usage.input_tokens, usage.cached_input_tokens) {
-                (Some(input), Some(cached)) => {
+                (Some(input), Some(cached)) if cached <= input => {
                     cache.reported_requests = cache.reported_requests.saturating_add(1);
                     cache.input_tokens = cache.input_tokens.saturating_add(input);
-                    cache.cached_tokens = cache.cached_tokens.saturating_add(cached.min(input));
-                    push_recent(&mut cache.recent_reported, (input, cached.min(input)));
+                    cache.cached_tokens = cache.cached_tokens.saturating_add(cached);
+                    push_recent(&mut cache.recent_reported, (input, cached));
                 }
                 _ => cache.unreported_requests = cache.unreported_requests.saturating_add(1),
             }

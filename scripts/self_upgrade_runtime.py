@@ -1,4 +1,4 @@
-"""Eve 实时升级监督器：验证候选、等待回复送达、切换，失败只回退二进制。"""
+"""Eve 实时升级监督器：等待回复送达，交接完整运行资源，保留业务状态。"""
 import argparse
 import contextlib
 import hashlib
@@ -7,6 +7,7 @@ import os
 from pathlib import Path, PurePosixPath
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,10 @@ MAX_JSON = 1024 * 1024
 MAX_STATE_JSON = 256 * 1024 * 1024
 RECOVERY_STOP = 78
 LEASE_SECONDS = 24 * 3600
+RUNTIME_SCRIPTS = ['scripts/build_resources.py', 'scripts/self_upgrade_runtime.py', 'scripts/source_update.py']
+RUNTIME_CONTRACT = dict(host_protocol=1, scripts=RUNTIME_SCRIPTS)
+HANDOFF_EXIT = 75
+MANAGED_FAILURE_EXIT = 76
 
 def value_digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
@@ -29,11 +34,23 @@ def prepare_lease(directory, manifest):
     now = int(time.time() * 1000)
     return dict(format_version=1, candidate_sha256=manifest['candidate_sha256'],
                 manifest_sha256=digest(directory / 'manifest.json'),
-                plan_sha256=value_digest(dict(operation='switch_binary_preserve_state',
-                    candidate_sha256=manifest['candidate_sha256'], state_schema_version=1,
-                    validation_policy='format-clippy-tests-release-build-v1')),
+                plan_sha256=value_digest(upgrade_plan(manifest)),
                 validation_sha256=value_digest(manifest['checks']), state_schema_version=1,
                 created_at_ms=now, expires_at_ms=now + LEASE_SECONDS * 1000)
+
+def upgrade_plan(manifest):
+    plan = dict(operation='switch_binary_preserve_state', candidate_sha256=manifest['candidate_sha256'],
+                state_schema_version=1, validation_policy='format-clippy-tests-release-build-v1')
+    if manifest.get('runtime') is not None:
+        plan.update(operation='switch_runtime_preserve_state', runtime=manifest['runtime'])
+    return plan
+
+def source_revision(manifest):
+    source = manifest['source']
+    if source['diff'] != hashlib.sha256(b'').hexdigest() or source['untracked'] != hashlib.sha256(b'').hexdigest():
+        return None
+    revision = source['head']
+    return revision if isinstance(revision, str) and len(revision) == 40 and all(c in '0123456789abcdef' for c in revision) else None
 
 def validate_lease(request, directory, manifest):
     lease = request.get('lease')
@@ -57,10 +74,26 @@ def validate_lease(request, directory, manifest):
     return lease
 
 def digest(path):
-    if not path.is_file() or path.is_symlink() or path.stat().st_size > 2 * 1024 * 1024 * 1024:
+    limit = 2 * 1024 * 1024 * 1024
+    if not path.is_file() or path.is_symlink() or path.stat().st_size > limit:
         raise ValueError('invalid_binary_or_resource')
     with path.open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > limit:
+            raise ValueError('invalid_binary_or_resource')
+        expected = metadata.st_size
+        hashed, count = hashlib.sha256(), 0
+        while True:
+            block = stream.read(min(65536, expected + 1 - count))
+            if not block:
+                break
+            count += len(block)
+            if count > expected:
+                raise ValueError('binary_or_resource_changed_during_read')
+            hashed.update(block)
+        if count != expected:
+            raise ValueError('binary_or_resource_changed_during_read')
+        return hashed.hexdigest()
 
 def unique_object(pairs):
     value = {}
@@ -77,8 +110,14 @@ def read_json(path, limit=MAX_JSON):
     # 只对这一种错误稍等重试，其他错误照常抛出。
     for attempt in range(20):
         try:
-            with path.open(encoding='utf8') as stream:
-                return json.load(stream, object_pairs_hook=unique_object)
+            with path.open('rb') as stream:
+                metadata = os.fstat(stream.fileno())
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > limit:
+                    raise ValueError('invalid_json_file')
+                raw = stream.read(limit + 1)
+                if len(raw) > limit:
+                    raise ValueError('json_file_grew_beyond_limit')
+                return json.loads(raw, object_pairs_hook=unique_object)
         except PermissionError:
             if os.name != 'nt' or attempt == 19:
                 raise
@@ -160,11 +199,17 @@ def validate_candidate(request, candidates):
                           'connectors/qqbot/package.json', 'connectors/qqbot/package-lock.json'}
     if not required_resources <= set(resources):
         raise ValueError('missing_runtime_resources')
+    runtime = manifest.get('runtime')
+    if runtime is not None and (runtime != RUNTIME_CONTRACT or not set(RUNTIME_SCRIPTS) <= set(resources)):
+        raise ValueError('invalid_runtime_contract')
+    if (directory / 'resources').is_symlink():
+        raise ValueError('resource_symlink')
     total = 0
     for name, expected in resources.items():
         relative = PurePosixPath(name)
         if (relative.is_absolute() or '..' in relative.parts or str(relative) != name
-                or not (name == 'AGENT.md' or name.startswith(('connectors/qqbot/', 'vendor/')))):
+                or not (name == 'AGENT.md' or name.startswith(('connectors/qqbot/', 'vendor/'))
+                        or runtime is not None and name in RUNTIME_SCRIPTS)):
             raise ValueError('invalid_resource_path')
         path = directory / 'resources'
         for part in relative.parts:
@@ -177,6 +222,34 @@ def validate_candidate(request, candidates):
         if total > 64 * 1024 * 1024:
             raise ValueError('resources_too_large')
     identity = {'source': manifest['source'], 'binary_sha256': manifest['binary_sha256'], 'resources': resources}
+    source_diff = manifest.get('source_diff')
+    if source_diff is not None:
+        if (not isinstance(source_diff, dict) or set(source_diff) != {'path', 'sha256', 'base_revision', 'target_revision'}
+                or source_diff['path'] != 'source-diff.patch' or not sha(source_diff['sha256'])
+                or any(not isinstance(source_diff[k], str) or len(source_diff[k]) != 40
+                       or any(c not in '0123456789abcdef' for c in source_diff[k]) for k in ('base_revision', 'target_revision'))
+                or source_diff['target_revision'] != manifest['source']['head']):
+            raise ValueError('invalid_source_diff')
+        path = directory / 'source-diff.patch'
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 128 * 1024:
+            raise ValueError('invalid_source_diff_file')
+        with path.open('rb') as stream:
+            raw = stream.read(128 * 1024 + 1)
+        if len(raw) > 128 * 1024 or hashlib.sha256(raw).hexdigest() != source_diff['sha256']:
+            raise ValueError('source_diff_changed')
+        text = raw.decode('utf8')
+        if any(line == 'GIT binary patch' or line.startswith(('Binary files ', 'Submodule '))
+               or line.startswith('index ') and line.endswith(' 160000')
+               or line in ('new file mode 160000', 'deleted file mode 160000',
+                           'old mode 160000', 'new mode 160000') for line in text.splitlines()):
+            raise ValueError('source_diff_not_reviewable')
+        if source_revision(manifest) is None:
+            raise ValueError('source_diff_requires_clean_committed_source')
+        identity['source_diff'] = source_diff
+    if runtime is not None:
+        if source_diff is None:
+            raise ValueError('source_diff_required')
+        identity['runtime'] = runtime
     actual = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     if actual != request['candidate_sha256']:
         raise ValueError('candidate_identity_changed')
@@ -341,6 +414,58 @@ def delivery_documents(state_path, inherited=frozenset()):
                 settled = False
     return sessions, receipts, settled
 
+def task_documents(state_path, ledger):
+    """核对任务目录与不可变冷正文；空闲门不能把目录当完整任务。"""
+    if (not isinstance(ledger, dict) or set(ledger) != {'format_version', 'tasks'}
+            or type(ledger['format_version']) is not int or ledger['format_version'] not in (1, 2, 3, 4)
+            or not isinstance(ledger['tasks'], list) or len(ledger['tasks']) > 128):
+        raise ValueError('unknown_task_ledger_version')
+    version = ledger['format_version']
+    seen, total = set(), 0
+    for entry in ledger['tasks']:
+        if version == 4:
+            if not isinstance(entry, dict) or set(entry) != {'directory', 'record'}:
+                raise ValueError('invalid_task_archive_index')
+            record, directory = entry['record'], entry['directory']
+            if (not isinstance(record, dict) or set(record) != {'hash', 'bytes'}
+                    or not sha(record['hash']) or type(record['bytes']) is not int
+                    or not 0 < record['bytes'] <= 16 * 1024 * 1024):
+                raise ValueError('invalid_task_archive_reference')
+            total += record['bytes']
+            if total > 16 * 1024 * 1024:
+                raise ValueError('task_archive_size_limit')
+            path = state_path.parent / 'task-archive' / (record['hash'] + '.json')
+            if path.is_symlink() or not path.is_file() or path.stat().st_size != record['bytes']:
+                raise ValueError('invalid_task_archive_file')
+            with path.open('rb') as stream:
+                raw = stream.read(record['bytes'] + 1)
+            if len(raw) != record['bytes'] or hashlib.sha256(raw).hexdigest() != record['hash']:
+                raise ValueError('task_archive_digest_mismatch')
+            task = json.loads(raw, object_pairs_hook=unique_object)
+            if not isinstance(task, dict) or not isinstance(task.get('spec'), dict):
+                raise ValueError('invalid_task_archive_body')
+            projected = dict(task, result=None, failure=None, spec=dict(task['spec']))
+            projected['spec'].pop('context', None)
+            if task.get('execution') is not None:
+                if not isinstance(task['execution'], dict):
+                    raise ValueError('invalid_task_archive_execution')
+                projected['execution'] = dict(task['execution'], checkpoint=None)
+            if projected != directory:
+                raise ValueError('task_archive_directory_mismatch')
+        else:
+            task = entry
+        if (not isinstance(task, dict) or not isinstance(task.get('id'), str) or not task['id']
+                or task['id'] in seen or not isinstance(task.get('status'), str)
+                or task['status'] not in ('Queued', 'Running', 'Completed', 'Blocked', 'Failed', 'Cancelled', 'Interrupted')
+                or version < 3 and task['status'] == 'Blocked'):
+            raise ValueError('invalid_task_ledger_record')
+        seen.add(task['id'])
+        notice = task.get('notice')
+        if notice is not None and (not isinstance(notice, dict)
+                or notice.get('status') not in ('Pending', 'Delivering', 'Delivered', 'Expired', 'Unknown')):
+            raise ValueError('invalid_task_notice')
+        yield task
+
 def runtime_idle_gate(state_path, inherited=frozenset()):
     """宿主自动更新只在当前运行的对话、任务、唤醒和文件投递全部空闲时切换。"""
     sessions, receipts, settled = delivery_documents(state_path, inherited)
@@ -360,10 +485,12 @@ def runtime_idle_gate(state_path, inherited=frozenset()):
         raw = state['entries'].get(owner, {}).get(key)
         if raw:
             ledger = json.loads(bytes(raw), object_pairs_hook=unique_object)
+            rows = task_documents(state_path, ledger) if owner == 'eve.task' else ledger[field]
+            # 只有遍历并核验全部冷记录后才能打开门。
             if any(isinstance(row['status'], str) and row['status'] in busy
                    or row.get('delivery') == 'Sending'
                    or (row.get('notice') or {}).get('status') == 'Delivering'
-                   for row in ledger[field]):
+                   for row in rows):
                 return False
     group = state_path.parent / 'group-observations.sqlite3'
     if group.exists():
@@ -562,6 +689,22 @@ class Supervisor:
             fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.command = options.command
         if self.command[:1] == ['--']: self.command = self.command[1:]
+        self.host_bridge = getattr(options, 'host_bridge', None)
+        self.host_nonce = getattr(options, 'host_nonce', None)
+        launch_path = getattr(options, 'launch_descriptor', None)
+        launch = None
+        if any(value is not None for value in (self.host_bridge, self.host_nonce, launch_path)):
+            if (self.host_bridge is None or self.host_bridge.resolve() != self.root
+                    or not sha(self.host_nonce) or launch_path is None
+                    or launch_path.parent.resolve() != self.root):
+                raise ValueError('invalid_host_launch')
+            launch = read_json(launch_path)
+            if (not isinstance(launch, dict)
+                    or set(launch) != {'format_version', 'command', 'candidate_request', 'source_revision'}
+                    or launch['format_version'] != 1 or not isinstance(launch['command'], list)
+                    or not launch['command'] or any(not isinstance(part, str) or '\0' in part for part in launch['command'])):
+                raise ValueError('invalid_host_launch_descriptor')
+            self.command = launch['command']
         if '--database-config' in self.command:
             raise ValueError('file_state_supervisor_requires_file_backend')
         self.state = Path(argument(self.command, '--state-dir')) / 'state.json'
@@ -574,17 +717,24 @@ class Supervisor:
         if self.inherited_receipts:
             print(f'EVE_UPGRADE_RECOVERY inherited_unknown_receipts={len(self.inherited_receipts)} preserved_no_replay', file=sys.stderr, flush=True)
         self.stopping = False
+        self.handoff = False
+        self.host_confirmed = False
         self.child = None
         self.status_lock = threading.RLock()
         self.status = dict(format_version=VERSION, pid=os.getpid(), heartbeat_ms=0, phase='starting',
-                           active_sha256=digest(Path(self.command[0])), candidate_sha256=None, result=None, error=None)
-        for name in ['request.json', 'processing.json', 'auto-request.json']:
+                           active_sha256=digest(Path(self.command[0])), candidate_sha256=None, result=None, error=None,
+                           restart_supported=True, host_nonce=self.host_nonce)
+        for name in ([] if launch is not None else ['request.json', 'processing.json', 'auto-request.json']):
             if (self.root / name).exists():
                 self.archive_request(self.root / name, 'interrupted_no_replay')
                 self.status['result'] = 'interrupted_no_replay'
         pointer = self.root / 'active-command.json'
-        active_request = None
-        if pointer.exists():
+        active_request = launch['candidate_request'] if launch is not None else None
+        if launch is not None and active_request is not None:
+            binary, resources, _ = validate_candidate(active_request, self.options.candidates)
+            if self.command[0] != str(binary) or argument(self.command, '--agent') != str(resources / 'AGENT.md'):
+                raise ValueError('host_launch_candidate_mismatch')
+        if launch is None and pointer.exists():
             stored = read_json(pointer)
             if set(stored) != {'command', 'binary_sha256', 'candidate_request'} or digest(Path(stored['command'][0])) != stored['binary_sha256']:
                 raise ValueError('active_command_changed')
@@ -599,6 +749,10 @@ class Supervisor:
             active_request = stored['candidate_request']
             self.status['active_sha256'] = stored['binary_sha256']
         self.active_descriptor = snapshot_command(self.command, active_request)
+        self.status['active_source_revision'] = (
+            source_revision(validate_candidate(active_request, self.options.candidates)[2])
+            if active_request is not None else (launch['source_revision'] if launch is not None else getattr(options, 'source_revision', None)))
+        self.status['active_candidate_sha256'] = active_request['candidate_sha256'] if active_request else None
         recovery = self.root / 'recovery.json'
         self.recovery = read_json(recovery) if recovery.exists() else dict(format_version=1, crashes=[], result=None)
         if (set(self.recovery) != {'format_version', 'crashes', 'result'}
@@ -626,6 +780,46 @@ class Supervisor:
             self.status.update(changes, heartbeat_ms=int(time.time() * 1000))
             atomic(self.root / 'supervisor.json', self.status)
 
+    def host_activation_confirmed(self):
+        """外层稳定窗口与指针提交完成后，才允许再调度升级或重启。"""
+        if self.host_bridge is None:
+            return True
+        if not (self.root / 'host-status.json').exists():
+            return False
+        try:
+            status = read_json(self.root / 'host-status.json')
+        except FileNotFoundError:
+            return False
+        return (isinstance(status, dict) and type(status.get('format_version')) is int
+                and status['format_version'] == VERSION and status.get('phase') == 'running'
+                and status.get('child_pid') == os.getpid() and status.get('host_nonce') == self.host_nonce
+                and status.get('candidate_sha256') == self.status['active_candidate_sha256'])
+
+    def confirm_host_result(self):
+        """只把宿主已提交并与本进程绑定的结果提供给状态查询。"""
+        if self.host_bridge is None or self.host_confirmed:
+            return
+        path = self.root / 'host-handoff.json'
+        if path.exists():
+            receipt = read_json(path)
+            if (not isinstance(receipt, dict)
+                    or set(receipt) != {'format_version', 'phase', 'previous', 'next', 'error', 'updated_at_ms'}
+                    or type(receipt['format_version']) is not int or receipt['format_version'] != VERSION
+                    or receipt['phase'] not in ('committed', 'rolled_back')
+                    or type(receipt['updated_at_ms']) is not int):
+                raise ValueError('invalid_host_handoff_receipt')
+            applied = receipt['phase'] == 'committed'
+            descriptor = receipt['next' if applied else 'previous']['descriptor']
+            request = receipt['next']['descriptor']['candidate_request']
+            if (descriptor['command'] != self.command
+                    or descriptor['candidate_request'] != self.active_descriptor['candidate_request']
+                    or descriptor['source_revision'] != self.status['active_source_revision']
+                    or not isinstance(request, dict) or not sha(request.get('candidate_sha256'))):
+                raise ValueError('host_handoff_receipt_mismatch')
+            self.publish(result='applied' if applied else 'rolled_back_runtime_state_preserved',
+                         candidate_sha256=request['candidate_sha256'], error=receipt['error'])
+        self.host_confirmed = True
+
     def archive_request(self, path, result):
         history = self.root / 'history'
         history.mkdir(exist_ok=True)
@@ -637,6 +831,15 @@ class Supervisor:
         atomic(self.root / 'last-failure.json', dict(format_version=1, at_ms=int(time.time() * 1000),
                phase=self.status['phase'], error=code[:100], active_sha256=self.status['active_sha256'],
                candidate_sha256=(request or {}).get('candidate_sha256')))
+
+    def quarantine_candidate(self, request, error):
+        directory = self.root / 'quarantine'
+        directory.mkdir(exist_ok=True)
+        code = str(error) if type(error) is ValueError and str(error).replace('_', '').isalnum() else type(error).__name__
+        path = directory / (request['candidate_sha256'] + '.json')
+        if not path.exists():
+            atomic(path, dict(format_version=1, candidate_sha256=request['candidate_sha256'],
+                             failed_at_ms=int(time.time() * 1000), error=code[:100]))
 
     def prune_backups(self):
         # 快照不用于自动还原；只保留最近两份现场，避免每次切换复制永久增长。
@@ -666,6 +869,8 @@ class Supervisor:
             raise ValueError('candidate_quarantined')
         binary, resources, manifest = validate_candidate(request, self.options.candidates)
         validate_lease(request, binary.parent, manifest)
+        if manifest.get('runtime') is not None and self.host_bridge is None:
+            raise ValueError('runtime_handoff_requires_host_bridge')
         subprocess.run(execution_command([str(binary), '--help']), check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         frozen_bridge = resources / 'connectors/qqbot'
         # Node 依赖属于运行缓存，不能 npm ci 改写内容寻址的候选目录。
@@ -726,6 +931,41 @@ class Supervisor:
         request_path = request_path.parent.resolve() / request_path.name
         if request_path not in (self.root / 'request.json', self.root / 'auto-request.json'):
             raise ValueError('request_path_outside_supervisor')
+        if request_path == self.root / 'request.json' and request.get('action') == 'restart':
+            if (set(request) != {'format_version', 'action', 'session_id', 'requested_by', 'turn_id'}
+                    or request['format_version'] != VERSION or type(request['turn_id']) is not int
+                    or request['turn_id'] <= 0 or not all(isinstance(request[k], str) and request[k]
+                        for k in ('session_id', 'requested_by'))):
+                raise ValueError('invalid_restart_request')
+            if read_json(request_path) != request:
+                raise ValueError('request_changed')
+            if not delivery_gate(self.state, request, self.inherited_receipts):
+                raise ValueError('reply_not_delivered')
+            if not runtime_idle_gate(self.state, self.inherited_receipts):
+                raise ValueError('runtime_not_idle')
+            self.validate_descriptor(self.active_descriptor)
+            self.publish(phase='restarting', result=None, error=None)
+            processing = self.root / 'processing.json'
+            request_path.rename(processing)
+            if self.child.stop(self.options.stop_timeout) != 0:
+                raise ValueError('old_process_did_not_close_cleanly')
+            if not runtime_idle_gate(self.state, self.inherited_receipts):
+                raise ValueError('runtime_drain_incomplete')
+            self.child = Child(self.command)
+            try:
+                self.wait_ready(self.child)
+            except (ValueError, OSError, subprocess.SubprocessError) as error:
+                self.failure_evidence(error)
+                self.child.stop(self.options.stop_timeout)
+                if self.stopping:
+                    raise ValueError('shutdown_during_restart')
+                self.child = Child(self.command)
+                self.wait_ready(self.child)
+                self.publish(phase='running', result='restart_failed_recovered', error='restart_not_ready')
+            else:
+                self.publish(phase='running', result='restarted', error=None)
+            self.archive_request(processing, self.status['result'])
+            return
         if read_json(request_path) != request or manifest['candidate_sha256'] != request['candidate_sha256']:
             raise ValueError('request_changed')
         binary, _, checked = validate_candidate(request, self.options.candidates)
@@ -735,17 +975,53 @@ class Supervisor:
             raise ValueError('runtime_not_idle')
         if request_path != self.root / 'auto-request.json' and not delivery_gate(self.state, request, self.inherited_receipts):
             raise ValueError('reply_not_delivered')
+        active = self.active_descriptor['candidate_request']
+        if active is not None and active['candidate_sha256'] == request['candidate_sha256']:
+            self.validate_descriptor(self.active_descriptor)
+            self.publish(phase='running', candidate_sha256=request['candidate_sha256'],
+                         result='applied', error=None)
+            self.archive_request(request_path, 'already_active')
+            return
+        if self.host_bridge is not None:
+            if checked.get('runtime') != RUNTIME_CONTRACT:
+                raise ValueError('runtime_contract_required')
+            if checked['source_diff']['base_revision'] != self.status['active_source_revision']:
+                raise ValueError('source_diff_baseline_changed')
+            self.validate_descriptor(self.active_descriptor)
+            if self.updater:
+                self.updater.stop()
+                if self.updater.thread and self.updater.thread.is_alive():
+                    raise ValueError('update_worker_did_not_close')
+            processing = self.root / 'processing.json'
+            request_path.rename(processing)
+            self.publish(phase='handing_off', result=None, error=None)
+            if self.child.stop(self.options.stop_timeout) != 0:
+                raise ValueError('old_process_did_not_close_cleanly')
+            if not runtime_idle_gate(self.state, self.inherited_receipts):
+                raise ValueError('runtime_drain_incomplete')
+            atomic(self.root / 'handoff-request.json', dict(format_version=1, nonce=self.host_nonce,
+                   base_candidate_sha256=active['candidate_sha256'] if active else None,
+                   request=request, command=command))
+            self.handoff = True
+            self.stopping = True
+            self.publish(phase='handed_off', result='handed_off')
+            return
         state_bytes = sum(p.stat().st_size for p in self.state.parent.rglob('*')
                           if p.is_file() and not p.is_symlink())
         if shutil.disk_usage(self.root).free < state_bytes * 2 + 256 * 1024**2:
             raise ValueError('insufficient_space_for_backup')
         self.validate_descriptor(self.active_descriptor)
-        atomic(self.root / 'previous-command.json', self.active_descriptor)
+        previous_path = self.root / 'previous-command.json'
+        previous = read_json(previous_path) if previous_path.exists() else None
+        if previous is not None:
+            self.validate_descriptor(previous)
+        atomic(previous_path, self.active_descriptor)
         pending = request_path
         processing = self.root / 'processing.json'
         pending.rename(processing)
         self.publish(phase='switching', candidate_sha256=request['candidate_sha256'], result=None, error=None)
         old_command = self.command
+        old_descriptor = self.active_descriptor
         if self.child.stop(self.options.stop_timeout) != 0:
             raise ValueError('old_process_did_not_close_cleanly')
         if not runtime_idle_gate(self.state, self.inherited_receipts):
@@ -755,20 +1031,40 @@ class Supervisor:
             shutil.copytree(self.state.parent, backup)
             self.child = Child(command)
             self.wait_ready(self.child)
+            descriptor = snapshot_command(command, request)
             # 状态指针只在候选真正连通后提交；不恢复旧状态快照。
             atomic(self.root / 'active-command.json', dict(command=command, binary_sha256=manifest['binary_sha256'], candidate_request=request))
             self.command = command
-            self.active_descriptor = snapshot_command(command, request)
+            self.active_descriptor = descriptor
             self.rollback_used = False
-            self.publish(phase='running', active_sha256=manifest['binary_sha256'], result='applied')
+            self.publish(phase='running', active_sha256=manifest['binary_sha256'], result='applied',
+                         active_source_revision=source_revision(manifest), active_candidate_sha256=request['candidate_sha256'])
         except (ValueError, OSError, subprocess.SubprocessError) as error:
             self.failure_evidence(error, request)
             self.child.stop(self.options.stop_timeout)
             if self.stopping: raise ValueError('shutdown_during_upgrade')
+            self.quarantine_candidate(request, error)
+            # 任何提交后异常都必须先恢复磁盘与内存的同一版本，再启动旧程序。
+            # 恢复指针失败时停止并保留现场，不能留下“运行旧版、重启新版”的分裂状态。
+            pointer = self.root / 'active-command.json'
+            if old_descriptor['candidate_request'] is None:
+                pointer.unlink(missing_ok=True)
+            else:
+                atomic(pointer, {k: old_descriptor[k] for k in ('command', 'binary_sha256', 'candidate_request')})
+            self.command = old_command
+            self.active_descriptor = old_descriptor
+            if previous is None:
+                previous_path.unlink(missing_ok=True)
+            else:
+                atomic(previous_path, previous)
             self.validate_descriptor(self.active_descriptor)
             self.child = Child(old_command)
             self.wait_ready(self.child)
-            self.publish(phase='running', result='rolled_back_binary_state_preserved')
+            self.publish(phase='running', active_sha256=old_descriptor['binary_sha256'],
+                         active_source_revision=(source_revision(validate_candidate(old_descriptor['candidate_request'], self.options.candidates)[2])
+                             if old_descriptor['candidate_request'] else getattr(self.options, 'source_revision', None)),
+                         active_candidate_sha256=old_descriptor['candidate_request']['candidate_sha256'] if old_descriptor['candidate_request'] else None,
+                         result='rolled_back_binary_state_preserved')
         self.archive_request(processing, self.status['result'])
         self.prune_backups()
 
@@ -796,6 +1092,9 @@ class Supervisor:
             return
         if self.child.process.poll() is None:
             raise ValueError('old_process_still_running')
+        if self.host_bridge is not None:
+            # 脚本与业务版本由外层作为一个整体恢复，不在旧脚本内单独回退业务程序。
+            raise ValueError('managed_runtime_process_exited')
         self.child.stop(self.options.stop_timeout)
         now = int(time.time() * 1000)
         crashes = [c for c in self.recovery['crashes']
@@ -838,7 +1137,10 @@ class Supervisor:
                 result = 'runtime_rolled_back_binary_state_preserved'
         self.validate_descriptor(self.active_descriptor)
         self.publish(phase='recovering', result=result, error='active_process_exited',
-                     active_sha256=self.active_descriptor['binary_sha256'])
+                     active_sha256=self.active_descriptor['binary_sha256'],
+                     active_source_revision=(source_revision(validate_candidate(self.active_descriptor['candidate_request'], self.options.candidates)[2])
+                         if self.active_descriptor['candidate_request'] else getattr(self.options, 'source_revision', None)),
+                     active_candidate_sha256=self.active_descriptor['candidate_request']['candidate_sha256'] if self.active_descriptor['candidate_request'] else None)
         until = time.monotonic() + min(60, self.options.restart_delay * 2 ** (len(crashes) - 1))
         while not self.stopping and time.monotonic() < until:
             time.sleep(0.05)
@@ -886,6 +1188,10 @@ class Supervisor:
                     prepared = waiting_since = quiet_since = state_stamp = None
                     gate = False
                     continue
+                if not self.host_activation_confirmed():
+                    time.sleep(0.1)
+                    continue
+                self.confirm_host_result()
                 if self.updater and not (self.root / 'request.json').exists() and prepared is None:
                     self.updater.tick(self)
                 pending = self.root / 'request.json'
@@ -894,10 +1200,18 @@ class Supervisor:
                     try:
                         request = read_json(pending)
                         if not isinstance(request, dict) or not sha(request.get('candidate_sha256')):
-                            raise ValueError('invalid_request')
+                            if not isinstance(request, dict) or request.get('action') != 'restart':
+                                raise ValueError('invalid_request')
                         if prepared is not None and prepared[0] != request:
                             raise ValueError('request_changed')
                         if prepared is None:
+                            if request.get('action') == 'restart':
+                                if set(request) != {'format_version', 'action', 'session_id', 'requested_by', 'turn_id'}:
+                                    raise ValueError('invalid_restart_request')
+                                prepared = (request, self.command, None)
+                                waiting_since = time.monotonic()
+                                self.publish(phase='waiting', candidate_sha256=None, error=None)
+                                continue
                             self.publish(phase='preparing', candidate_sha256=request.get('candidate_sha256'), result=None, error=None)
                             prepared = (request, *self.candidate_command(request))
                             waiting_since = time.monotonic()
@@ -938,7 +1252,7 @@ class Supervisor:
                         prepared = waiting_since = quiet_since = None
                         state_stamp = None
                 time.sleep(0.1)
-            return self.child.stop(self.options.stop_timeout)
+            return HANDOFF_EXIT if self.handoff else self.child.stop(self.options.stop_timeout)
         except Exception as error:
             code = str(error) if type(error) is ValueError and str(error).replace('_', '').isalnum() else type(error).__name__
             with contextlib.suppress(Exception):
@@ -966,6 +1280,10 @@ def main():
     parser.add_argument('--directory', type=Path, required=True)
     parser.add_argument('--candidates', type=Path, required=True)
     parser.add_argument('--auto-update-config', type=Path)
+    parser.add_argument('--source-revision')
+    parser.add_argument('--host-bridge', type=Path)
+    parser.add_argument('--host-nonce')
+    parser.add_argument('--launch-descriptor', type=Path)
     parser.add_argument('--ready-timeout', type=float, default=60)
     parser.add_argument('--stop-timeout', type=float, default=90)
     parser.add_argument('--drain-timeout', type=float, default=300)
@@ -976,6 +1294,9 @@ def main():
     parser.add_argument('--restart-delay', type=float, default=1)
     parser.add_argument('command', nargs=argparse.REMAINDER)
     options = parser.parse_args()
+    if options.source_revision is not None and (len(options.source_revision) != 40
+            or any(c not in '0123456789abcdef' for c in options.source_revision)):
+        parser.error('源码基线必须是宿主核对的40位提交摘要')
     if any(not 0 < v <= 600 for v in [options.ready_timeout, options.stop_timeout, options.drain_timeout, options.quiet_seconds, options.health_seconds]):
         parser.error('期限必须大于 0 且不超过 600 秒')
     if not 0 <= options.restart_limit <= 10 or not 0 < options.restart_window_seconds <= 86400 or not 0 < options.restart_delay <= 60:
@@ -985,6 +1306,8 @@ def main():
     except Exception as error:
         # 不输出子进程参数、原文、状态正文或凭据。
         print('EVE_SELF_UPGRADE_STOPPED ' + type(error).__name__, file=sys.stderr, flush=True)
+        if type(error) is ValueError and str(error) == 'managed_runtime_process_exited':
+            return MANAGED_FAILURE_EXIT
         return RECOVERY_STOP
 
 if __name__ == '__main__':

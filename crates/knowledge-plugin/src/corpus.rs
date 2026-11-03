@@ -8,7 +8,7 @@ use eve_knowledge_api::{
 };
 use ring::digest::{Context, SHA256};
 use serde::Deserialize;
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{collections::BTreeMap, io::Read, path::Path, sync::Arc};
 
 const MANIFEST: &str = "MANIFEST.json";
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
@@ -51,17 +51,17 @@ pub struct CorpusSourceFetcher {
 
 impl CorpusSourceFetcher {
     pub fn open(directory: &Path) -> Result<Self, String> {
-        let manifest_path = directory.join(MANIFEST);
-        let size = std::fs::metadata(&manifest_path)
-            .map_err(|_| "无法读取资料清单 MANIFEST.json".to_string())?
-            .len();
-        if size > MAX_MANIFEST_BYTES {
-            return Err("资料清单超出上限".into());
+        if !std::fs::symlink_metadata(directory).is_ok_and(|metadata| metadata.file_type().is_dir())
+        {
+            return Err("资料根目录必须是普通目录，不能是符号链接".into());
         }
-        let manifest: Manifest = serde_json::from_slice(
-            &std::fs::read(&manifest_path).map_err(|_| "无法读取资料清单 MANIFEST.json")?,
-        )
-        .map_err(|_| "资料清单格式无效")?;
+        let directory = directory
+            .canonicalize()
+            .map_err(|_| "无法解析资料根目录".to_string())?;
+        let manifest_bytes = read_corpus_file(&directory, MANIFEST, MAX_MANIFEST_BYTES, None)
+            .map_err(|error| format!("无法读取资料清单 MANIFEST.json：{error}"))?;
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).map_err(|_| "资料清单格式无效")?;
         if manifest.format_version != 1
             || !valid_name(&manifest.corpus)
             || manifest.upstream.is_empty()
@@ -83,8 +83,8 @@ impl CorpusSourceFetcher {
             if total > MAX_TOTAL_BYTES {
                 return Err("资料总量超出上限".into());
             }
-            let bytes = std::fs::read(directory.join(&entry.path))
-                .map_err(|_| format!("无法读取资料：{}", entry.path))?;
+            let bytes = read_corpus_file(&directory, &entry.path, entry.bytes, Some(entry.bytes))
+                .map_err(|error| format!("无法读取资料 {}：{error}", entry.path))?;
             let sha256 = sha256(&bytes);
             if bytes.len() as u64 != entry.bytes || sha256 != entry.sha256 {
                 return Err(format!("资料与清单不符：{}；不启用这份资料", entry.path));
@@ -301,6 +301,51 @@ impl SourceFetcher for RoutingSourceFetcher {
             self.web.fetch(policy, url)
         }
     }
+}
+
+/// 清单和正文均限定在资料根目录内。先核对真实文件类型与长度，再有界读取，避免
+/// 损坏资料中的符号链接、特殊文件或虚报长度把自动发现变成目录外读取、阻塞或大分配。
+fn read_corpus_file(
+    directory: &Path,
+    relative: &str,
+    limit: u64,
+    expected_bytes: Option<u64>,
+) -> Result<Vec<u8>, String> {
+    let mut path = directory.to_path_buf();
+    for part in Path::new(relative).components() {
+        if !matches!(part, std::path::Component::Normal(_)) {
+            return Err("资料路径必须在根目录内".into());
+        }
+        path.push(part.as_os_str());
+        let metadata = std::fs::symlink_metadata(&path).map_err(|_| "无法读取资料路径")?;
+        if metadata.file_type().is_symlink() {
+            return Err("资料路径不能包含符号链接".into());
+        }
+    }
+    let path = path.canonicalize().map_err(|_| "无法解析资料路径")?;
+    if !path.starts_with(directory) {
+        return Err("资料路径超出根目录".into());
+    }
+    let metadata = path.metadata().map_err(|_| "无法读取资料属性")?;
+    if !metadata.is_file() {
+        return Err("资料必须是普通文件".into());
+    }
+    if metadata.len() > limit || expected_bytes.is_some_and(|bytes| bytes != metadata.len()) {
+        return Err("资料与清单不符或超出长度上限".into());
+    }
+    let file = std::fs::File::open(path).map_err(|_| "无法打开资料文件")?;
+    let opened = file.metadata().map_err(|_| "无法读取已打开资料属性")?;
+    if !opened.is_file() || opened.len() != metadata.len() {
+        return Err("读取期间资料类型或长度改变".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "无法读取资料文件")?;
+    if bytes.len() as u64 != opened.len() || bytes.len() as u64 > limit {
+        return Err("读取期间资料长度改变或超出上限".into());
+    }
+    Ok(bytes)
 }
 
 fn finish(policy: &SourcePolicy, page: FetchedPage) -> Result<FetchedPage, FetchFailure> {
@@ -551,6 +596,115 @@ mod tests {
             );
         }
         assert!(CorpusSourceFetcher::open(&directory.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn oversized_actual_files_and_non_files_are_rejected_without_clearing_data() {
+        let directory = tempfile::tempdir().unwrap();
+        write_corpus(directory.path(), &[("mindustry/a.md", "# A\n")]);
+        let manifest_path = directory.path().join(MANIFEST);
+        let original_manifest = std::fs::read(&manifest_path).unwrap();
+        let page = directory.path().join("mindustry/a.md");
+        // 稀疏文件不在测试中分配大内存；读取器应在读正文之前发现声明长度不符。
+        let large_size = MAX_TOTAL_BYTES * 8;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&page)
+            .unwrap()
+            .set_len(large_size)
+            .unwrap();
+        assert!(
+            matches!(CorpusSourceFetcher::open(directory.path()), Err(error) if error.contains("长度"))
+        );
+        assert_eq!(page.metadata().unwrap().len(), large_size);
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), original_manifest);
+
+        std::fs::remove_file(&page).unwrap();
+        std::fs::create_dir(&page).unwrap();
+        assert!(
+            matches!(CorpusSourceFetcher::open(directory.path()), Err(error) if error.contains("普通文件"))
+        );
+        std::fs::remove_dir(&page).unwrap();
+        std::fs::write(&page, "# A\n").unwrap();
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&manifest_path)
+            .unwrap()
+            .set_len(MAX_MANIFEST_BYTES + 1)
+            .unwrap();
+        assert!(
+            matches!(CorpusSourceFetcher::open(directory.path()), Err(error) if error.contains("长度"))
+        );
+        assert_eq!(
+            manifest_path.metadata().unwrap().len(),
+            MAX_MANIFEST_BYTES + 1
+        );
+        std::fs::remove_file(&manifest_path).unwrap();
+        std::fs::create_dir(&manifest_path).unwrap();
+        assert!(
+            matches!(CorpusSourceFetcher::open(directory.path()), Err(error) if error.contains("普通文件"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_roots_manifests_files_and_parent_directories_are_rejected() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_corpus(directory.path(), &[("mindustry/a.md", "# A\n")]);
+        write_corpus(outside.path(), &[("mindustry/a.md", "# A\n")]);
+
+        let root_link = outside.path().join("linked-corpus");
+        symlink(directory.path(), &root_link).unwrap();
+        assert!(CorpusSourceFetcher::open(&root_link).is_err());
+
+        let manifest = directory.path().join(MANIFEST);
+        let original_manifest = std::fs::read(&manifest).unwrap();
+        std::fs::remove_file(&manifest).unwrap();
+        symlink(outside.path().join(MANIFEST), &manifest).unwrap();
+        assert!(CorpusSourceFetcher::open(directory.path()).is_err());
+        std::fs::remove_file(&manifest).unwrap();
+        std::fs::write(&manifest, &original_manifest).unwrap();
+
+        let page = directory.path().join("mindustry/a.md");
+        std::fs::remove_file(&page).unwrap();
+        symlink(outside.path().join("mindustry/a.md"), &page).unwrap();
+        assert!(CorpusSourceFetcher::open(directory.path()).is_err());
+        std::fs::remove_file(&page).unwrap();
+        std::fs::remove_dir(page.parent().unwrap()).unwrap();
+        symlink(outside.path().join("mindustry"), page.parent().unwrap()).unwrap();
+        assert!(CorpusSourceFetcher::open(directory.path()).is_err());
+        assert_eq!(std::fs::read(&manifest).unwrap(), original_manifest);
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("mindustry/a.md")).unwrap(),
+            "# A\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn named_pipes_are_rejected_before_opening_them() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        unsafe extern "C" {
+            fn mkfifo(path: *const std::ffi::c_char, mode: u32) -> std::ffi::c_int;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        write_corpus(directory.path(), &[("mindustry/a.md", "# A\n")]);
+        for relative in ["mindustry/a.md", MANIFEST] {
+            let path = directory.path().join(relative);
+            std::fs::remove_file(&path).unwrap();
+            let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: Linux mkfifo 的参数是存活的 NUL 结尾路径及有效 mode_t，路径在本测试目录内。
+            assert_eq!(unsafe { mkfifo(name.as_ptr(), 0o600) }, 0);
+            assert!(
+                matches!(CorpusSourceFetcher::open(directory.path()), Err(error) if error.contains("普通文件"))
+            );
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(&path, "# A\n").unwrap();
+        }
     }
 
     #[tokio::test]

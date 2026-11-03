@@ -29,9 +29,9 @@ use eve_runtime::{ContextBinding, LlmHost, LlmHostConfig, TurnFailure, TurnOutpu
 use eve_session_api::SessionKey;
 use eve_task_api::{
     DEFAULT_STEPS, DelegatedContext, DeliveryChannel, DeliveryResult, MAX_CONTEXT_BYTES,
-    MAX_INSTRUCTIONS_BYTES, MAX_STEPS, MAX_TITLE_BYTES, MIN_STEPS, Task, TaskAdmin, TaskEnd,
-    TaskError, TaskOwner, TaskSchedulingEntry, TaskSchedulingSnapshot, TaskSpec, TaskStatus,
-    TaskUsage, bounded,
+    MAX_INSTRUCTIONS_BYTES, MAX_STEPS, MAX_TITLE_BYTES, MIN_STEPS, Task, TaskAdmin,
+    TaskCompletionContract, TaskEnd, TaskError, TaskOwner, TaskSchedulingEntry,
+    TaskSchedulingSnapshot, TaskSpec, TaskStatus, TaskUsage, bounded,
 };
 use ring::digest::{Context as Digest, SHA256};
 use serde_json::{Value, json};
@@ -212,6 +212,10 @@ struct WorkerRequest {
     journal: Option<Arc<dyn eve_llm_api::TurnJournal>>,
     shared_steps: Option<eve_llm_api::SharedToolSteps>,
     profile: Option<eve_task_api::SubagentProfile>,
+    review_messages: Vec<String>,
+    completion_contract: Option<TaskCompletionContract>,
+    subject_plan: Option<Task>,
+    background_task_id: Option<String>,
 }
 
 struct TaskJournal {
@@ -351,7 +355,9 @@ impl Worker {
             tool_names
                 .iter()
                 .filter(|name| {
-                    name.as_str() == SUBAGENT_TOOL || !ORCHESTRATION_TOOLS.contains(&name.as_str())
+                    name.as_str() == SUBAGENT_TOOL
+                        || name.as_str() == crate::qq_task_wait::TOOL_NAME
+                        || !ORCHESTRATION_TOOLS.contains(&name.as_str())
                 })
                 .map(|name| {
                     Ok(ToolBinding {
@@ -428,6 +434,10 @@ impl Worker {
             journal,
             shared_steps,
             profile,
+            review_messages,
+            completion_contract,
+            subject_plan,
+            background_task_id,
         } = request;
         if !scope
             .as_ref()
@@ -475,6 +485,13 @@ impl Worker {
         };
         let source = if idle_review {
             source.with_tool_subset(&[], crate::idle_loop::RULES)
+        } else if subject_plan.is_some() {
+            source.with_tool_subset(&[], crate::qq_subject::PLAN_RULES)
+        } else if matches!(
+            completion_contract,
+            Some(TaskCompletionContract::Text { .. })
+        ) {
+            source.with_tool_subset(&[], &format!("{}\n本任务只交付文本产物。按执行前固定的文本验收条件完成正文；不能声称执行外部操作，也不能调用工具。", if child { LEAF_RULES } else { WORKER_RULES }))
         } else {
             source
         };
@@ -491,6 +508,22 @@ impl Worker {
             }
         };
         let host = host.with_shared_steps(steps_pool.clone()).delegated();
+        let host = match background_task_id {
+            Some(id) => host.with_background_task_id(id),
+            None => host,
+        };
+        let host = match crate::qq_task_review::attach(host, scope.as_ref(), review_messages) {
+            Ok(host) => host,
+            _ => {
+                return WorkerRun {
+                    end: TaskEnd::Failed {
+                        reason: "后台授权证据与原身份无法绑定；未请求模型、未执行工具".into(),
+                    },
+                    usage: TaskUsage::default(),
+                    retryable: false,
+                };
+            }
+        };
         let host = if let Some(timeout) = timeout {
             host.with_run_deadline(std::time::Instant::now() + timeout)
         } else {
@@ -554,8 +587,32 @@ impl Worker {
                     TaskEnd::Failed {
                         reason: "执行器没有给出结果".into(),
                     }
+                } else if subject_plan.as_ref().is_some_and(|task| {
+                    crate::qq_subject::validate_plan_result(task, &text).is_err()
+                }) {
+                    TaskEnd::Failed {
+                        reason:
+                            "持续目标规划的结构、范围或验收条件不符；已保存模型结果，未创建行动任务"
+                                .into(),
+                    }
                 } else if eve_task_api::blocked_progress(&transcript).is_some() {
                     TaskEnd::Blocked { result: text }
+                } else if child {
+                    match eve_task_plugin::evaluate_completion_contract(
+                        completion_contract
+                            .as_ref()
+                            .unwrap_or(&TaskCompletionContract::Unspecified),
+                        &transcript,
+                        &text,
+                        None,
+                    ) {
+                        eve_task_api::TaskCompletionAssessment::Verified => {
+                            TaskEnd::Completed { result: text }
+                        }
+                        assessment => TaskEnd::Blocked {
+                            result: format!("{}\n\n宿主验收未通过：{}", text, assessment.reason()),
+                        },
+                    }
                 } else {
                     TaskEnd::Completed { result: text }
                 },
@@ -853,6 +910,8 @@ fn view_steps(
         "auto_recoveries": task.execution.as_ref().map_or(0, |e| e.recoveries),
         "waiting_to_resume": task.execution.as_ref().is_some_and(|e| e.resume_at_ms.is_some()) && task.status == TaskStatus::Running,
         "blocked": task.status == TaskStatus::Blocked,
+        "verification": task.execution.as_ref().and_then(|e| e.completion_contract.as_ref()),
+        "verified_by_host": task.status == TaskStatus::Completed && task.execution.as_ref().is_some_and(|e| e.completion_contract.is_some()),
         "minutes_since_dispatch": now_ms().saturating_sub(task.created_at_ms) / 60_000,
         "result": task.result.as_deref().map(|text| bounded(text, result_bytes)),
         "failure": task.failure,
@@ -901,6 +960,12 @@ fn invalid(message: &str) -> ToolValidationError {
 }
 
 fn validate_steps(object: &serde_json::Map<String, Value>) -> Result<(), ToolValidationError> {
+    if let Some(value) = object.get("verification") {
+        let contract: TaskCompletionContract = serde_json::from_value(value.clone())
+            .map_err(|_| invalid("verification 须为固定的工具回执或纯文本验收条件"))?;
+        crate::qq_task_verification::validate_contract(&contract)
+            .map_err(|_| invalid("verification 验收条件无效"))?;
+    }
     if object
         .get("include_context")
         .is_some_and(|value| !value.is_boolean())
@@ -917,6 +982,39 @@ fn validate_steps(object: &serde_json::Map<String, Value>) -> Result<(), ToolVal
             Ok(())
         }
         Some(_) => Err(invalid("max_steps 须为 1 至 5000 的整数")),
+    }
+}
+
+fn completion_contract(arguments: &Value) -> Result<TaskCompletionContract, ToolExecutionError> {
+    let contract = match arguments.get("verification") {
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|_| failed("verification 验收条件格式无效"))?,
+        None => TaskCompletionContract::Unspecified,
+    };
+    crate::qq_task_verification::validate_contract(&contract).map_err(task_error)?;
+    Ok(contract)
+}
+
+fn verification_schema() -> Value {
+    json!({"description":crate::qq_task_verification::OBSERVATION_RULES,"oneOf":[
+        {"type":"object","properties":{"kind":{"const":"receipts"},"contract":{
+            "type":"object","properties":{"checks":{"type":"array","minItems":1,"maxItems":16,"items":crate::qq_task_verification::receipt_check_schema()},"require_final_batch":{"const":true}},"required":["checks","require_final_batch"],"additionalProperties":false
+        }},"required":["kind","contract"],"additionalProperties":false},
+        {"type":"object","properties":{"kind":{"const":"text"},"required_fragments":{"type":"array","items":{"type":"string"}},"json_equals":{},"valid_json":{"type":"boolean"},"json_required_pointers":{"type":"array","items":{"type":"string"}}},
+            "required":["kind","required_fragments"],"additionalProperties":false}
+    ]})
+}
+
+fn instructions_with_verification(
+    instructions: String,
+    contract: Option<&TaskCompletionContract>,
+) -> String {
+    match contract {
+        Some(contract) => format!(
+            "{instructions}\n\n宿主已冻结以下验收条件，执行者不能修改。必须满足全部条件才算完成；回执验收必须来自实际工具结果并覆盖最终产物，纯文本验收只允许交付文本，不调用工具或声称外部行动。缺少验收条件时保存结果为待核验，不得自报已验证：\n{}",
+            serde_json::to_string(contract).expect("completion contract is serializable")
+        ),
+        None => instructions,
     }
 }
 
@@ -989,14 +1087,15 @@ impl Tool for DispatchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: DISPATCH_TOOL.into(),
-            description: "把需要多步、较长时间才能完成的事派发到后台执行，不必让用户等在对话里；完成后 Eve 会私聊通知用户结果。后台执行者能用你在对话里的工具，可调用 run_subagent 分工（不含再次派发、查看、取消后台任务），默认不携带对话；include_context=true 时携带派发前当前完整模型上下文的冻结快照（含已压缩摘要，不读取已移出窗口的原文），只作为历史数据，不扩展工具与权限。instructions 要写清任务、授权边界与交付物。title 是给用户看的简短标题。max_steps 是它至多调用工具的次数，不填用宿主默认值（初始 100），超过宿主上限会被拒绝。派发成功后告诉用户已在后台处理、做完会私聊通知；没有成功就不要这样说。".into(),
+            description: "把需要多步、较长时间才能完成的事派发到后台，结束后回原会话报告实际结果。instructions 写清完整任务、授权边界与交付物。verification 在派发时冻结全部验收条件：外部行动用 receipts 精确匹配最终工具批次的参数和真实回执；纯文本产物用 text 的 required_fragments、json_equals 或 JSON 结构条件，执行器不提供工具。不能用 echo、task_progress 或口头成功代替验收；缺少合同则结果待核验，不报告目标完成。失配在原剩余预算和期限内至多自动修复三次。include_context=true 携带当前完整模型上下文冻结快照，只作历史；真实授权原话始终独立继承。max_steps 不填用宿主默认值，后台可 run_subagent 共用剩余步数，不再派发后台任务。只有 dispatched 成功才告诉用户已在后台处理。".into(),
             argument_schema: json!({
                 "type": "object",
                 "properties": {
                     "title": {"type": "string"},
                     "instructions": {"type": "string"},
                     "include_context": {"type": "boolean", "default": false},
-                    "max_steps": {"type": "integer", "minimum": MIN_STEPS, "maximum": MAX_STEPS}
+                    "max_steps": {"type": "integer", "minimum": MIN_STEPS, "maximum": MAX_STEPS},
+                    "verification": verification_schema()
                 },
                 "required": ["title", "instructions"],
                 "additionalProperties": false
@@ -1013,11 +1112,11 @@ impl Tool for DispatchTool {
         if object.keys().any(|key| {
             !matches!(
                 key.as_str(),
-                "title" | "instructions" | "max_steps" | "include_context"
+                "title" | "instructions" | "max_steps" | "include_context" | "verification"
             )
         }) {
             return Err(invalid(
-                "参数只能包含 title、instructions、max_steps 与 include_context",
+                "参数只能包含 title、instructions、max_steps、include_context 与 verification",
             ));
         }
         object
@@ -1039,6 +1138,8 @@ impl Tool for DispatchTool {
             let owner = owner(&context)?;
             let settings = self.late.settings()?;
             let steps = resolve_steps(&call.arguments, &settings)?;
+            let contract = completion_contract(&call.arguments)?;
+            let review_messages = crate::qq_task_review::capture(&context, &owner)?;
             let spec = TaskSpec {
                 title: call.arguments["title"].as_str().unwrap_or_default().into(),
                 instructions: call.arguments["instructions"]
@@ -1050,7 +1151,15 @@ impl Tool for DispatchTool {
             };
             let task = self
                 .tasks
-                .create(&owner, spec, &call_source(&context, &call.id), now_ms())
+                .create_authorized(
+                    &owner,
+                    spec,
+                    &call_source(&context, &call.id),
+                    review_messages,
+                    Some(contract),
+                    None,
+                    now_ms(),
+                )
                 .map_err(task_error)?;
             Ok(json!({"dispatched": true, "task": view(&task, PREVIEW_BYTES)}))
         })
@@ -1225,14 +1334,15 @@ impl Tool for SubagentTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: SUBAGENT_TOOL.into(),
-            description: "把一件可以独立完成的子任务委托给子代理，等它做完把结果交回给你，再继续本轮回复。子代理能用你的工具（不含后台任务与子代理），默认不携带对话；include_context=true 时携带当前完整模型上下文的冻结快照（含压缩摘要，不读取窗口外原文），只作为历史数据，不扩大权限。task 要写清任务、授权边界与交付物。独立子任务可并行，有依赖时等待前一个实际结果再委派。max_steps 仅给此子代理更小的上限，不填就继承父任务剩余步数；所有子代理与主执行者共用一个原子计数池，失败与并行调用也扣减，不会各自新领预算。agent_id 可选 general、coding、research、review 或 create_subagent 保存的角色。它要在父任务剩余期限与宿主期限（默认 3 分钟）内做完；更长的事用 dispatch_background_task。".into(),
+            description: "委托独立子任务并等待真实结果后继续本轮。task 写清范围与交付物；verification 与后台相同，在执行前冻结工具回执或零工具纯文本验收，全部匹配才 completed=true，缺少或不符返回待核验，主执行者负责修复整合。include_context=true 携带当前冻结历史，真实授权原话独立继承，均不扩大权限。max_steps 只收窄子代理上限；与父任务共享原子工具预算和原期限，失败与并行同样扣减。agent_id 选 general、coding、research、review 或已保存角色。独立子任务可并行，有依赖先等待前一结果；更长任务可用后台。".into(),
             argument_schema: json!({
                 "type": "object",
                 "properties": {
                     "task": {"type": "string"},
                     "agent_id": {"type":"string"},
                     "include_context": {"type": "boolean", "default": false},
-                    "max_steps": {"type": "integer", "minimum": MIN_STEPS, "maximum": MAX_STEPS}
+                    "max_steps": {"type": "integer", "minimum": MIN_STEPS, "maximum": MAX_STEPS},
+                    "verification": verification_schema()
                 },
                 "required": ["task"],
                 "additionalProperties": false
@@ -1247,11 +1357,11 @@ impl Tool for SubagentTool {
         if object.keys().any(|key| {
             !matches!(
                 key.as_str(),
-                "task" | "max_steps" | "include_context" | "agent_id"
+                "task" | "max_steps" | "include_context" | "agent_id" | "verification"
             )
         }) {
             return Err(invalid(
-                "参数只能包含 task、max_steps、include_context 与 agent_id",
+                "参数只能包含 task、max_steps、include_context、agent_id 与 verification",
             ));
         }
         if object.get("agent_id").is_some_and(|v| {
@@ -1327,8 +1437,13 @@ impl Tool for SubagentTool {
                 return Err(failed("排队期间主任务共享步数已用尽；未启动模型"));
             }
             let snapshot = capture_context(&call.arguments, &context)?;
+            let contract = completion_contract(&call.arguments)?;
+            let review_messages = crate::qq_task_review::capture(&context, &owner)?;
             let instructions = instructions_with_context(
-                call.arguments["task"].as_str().unwrap_or_default().into(),
+                instructions_with_verification(
+                    call.arguments["task"].as_str().unwrap_or_default().into(),
+                    Some(&contract),
+                ),
                 snapshot.as_ref(),
                 &owner,
             )?;
@@ -1350,6 +1465,10 @@ impl Tool for SubagentTool {
                 journal: None,
                 shared_steps: Some(pool.clone()),
                 profile: Some(profile.clone()),
+                review_messages,
+                completion_contract: Some(contract),
+                subject_plan: None,
+                background_task_id: None,
             });
             tokio::pin!(running);
             let run = loop {
@@ -1547,8 +1666,14 @@ fn verify_delivery_claim(
 
 impl QqOutreach for ChannelAdapter {
     fn due(&self, session: &SessionKey) -> PluginResult<bool> {
-        let snapshot = self.tasks.delivery_snapshot().map_err(plugin_error)?;
+        if session.session_id.starts_with("web:") {
+            return Ok(false);
+        }
+        let mut snapshot = self.tasks.delivery_snapshot().map_err(plugin_error)?;
         snapshot.validate().map_err(plugin_error)?;
+        snapshot
+            .tasks
+            .retain(|task| !task.owner.session_id.starts_with("web:"));
         Ok(snapshot
             .due_passive(&session.user_id, "")
             .is_some_and(|t| t.owner.session_id == session.session_id))
@@ -1563,8 +1688,14 @@ impl QqOutreach for ChannelAdapter {
         session: &SessionKey,
         message_id: &str,
     ) -> PluginResult<Option<QqOutreachMessage>> {
-        let snapshot = self.tasks.delivery_snapshot().map_err(plugin_error)?;
+        if session.session_id.starts_with("web:") {
+            return Ok(None);
+        }
+        let mut snapshot = self.tasks.delivery_snapshot().map_err(plugin_error)?;
         snapshot.validate().map_err(plugin_error)?;
+        snapshot
+            .tasks
+            .retain(|task| !task.owner.session_id.starts_with("web:"));
         let Some(task) = snapshot.due_passive(&session.user_id, message_id) else {
             return Ok(None);
         };
@@ -1590,8 +1721,11 @@ impl QqOutreach for ChannelAdapter {
 
     fn next_push(&self) -> PluginResult<Option<QqOutreachPush>> {
         let now = now_ms();
-        let snapshot = self.tasks.delivery_snapshot().map_err(plugin_error)?;
+        let mut snapshot = self.tasks.delivery_snapshot().map_err(plugin_error)?;
         snapshot.validate().map_err(plugin_error)?;
+        snapshot
+            .tasks
+            .retain(|task| !task.owner.session_id.starts_with("web:"));
         // 结束后过久仍未送达的通知不再投递。
         let overdue: Vec<String> = snapshot.overdue(now).map(|task| task.id.clone()).collect();
         for id in &overdue {
@@ -1740,9 +1874,9 @@ async fn run(
                 }
                 let admission_ticket = if let Some(admission) = late.admission.get() {
                     let key = SessionKey::new(task.owner.session_id.clone(), task.owner.user_id.clone())?;
-                    let priority = if task.source.starts_with("subject-focus:") || task.source.starts_with(eve_task_api::IDLE_TASK_SOURCE_PREFIX) { eve_subject_api::EventPriority::Autonomy } else if task.status == TaskStatus::Running { eve_subject_api::EventPriority::Recovery } else { eve_subject_api::EventPriority::User };
+                    let (priority, event_source) = task_admission(&task.source, task.status);
                     let source = format!("task:{}:{}", task.id, task.recoveries);
-                    match admission.begin_work(&key, &source, priority, match priority { eve_subject_api::EventPriority::User => eve_subject_api::EventSource::UserIngress, eve_subject_api::EventPriority::Autonomy => eve_subject_api::EventSource::AutonomyScheduler, _ => eve_subject_api::EventSource::RecoverySupervisor })? {
+                    match admission.begin_work(&key, &source, priority, event_source)? {
                         Some(ticket) => Some((admission.clone(), ticket)),
                         None => continue,
                     }
@@ -1804,8 +1938,10 @@ async fn run(
                         serde_json::to_string(&guidance)?
                     ));
                 }
+                let completion_contract = execution.and_then(|e| e.completion_contract.clone());
+                let review_messages = crate::qq_task_review::restore(&started, &started.owner)?;
                 let text = instructions_with_context(
-                    instructions,
+                    instructions_with_verification(instructions, completion_contract.as_ref()),
                     started.spec.context.as_ref(),
                     &started.owner,
                 );
@@ -1822,7 +1958,9 @@ async fn run(
                     });
                 let idle_review = started.source.starts_with(eve_task_api::IDLE_TASK_SOURCE_PREFIX);
                 let idle_input = if idle_review { crate::idle_loop::task_input(&started).ok() } else { None };
+                let subject_plan = started.source.starts_with(crate::qq_subject::PLAN_TASK_SOURCE_PREFIX).then(|| started.clone());
                 let id = started.id.clone();
+                let background_task_id = Some(id.clone());
                 joins.spawn(async move {
                     let run = match text {
                         Ok(text) => {
@@ -1838,6 +1976,10 @@ async fn run(
                                     journal,
                                     shared_steps:None,
                                     profile:None,
+                                    review_messages,
+                                    completion_contract,
+                                    subject_plan,
+                                    background_task_id,
                                 })
                                 .await
                         }
@@ -1915,6 +2057,24 @@ struct RunningTask {
     stop: watch::Sender<bool>,
 }
 
+/// 自主规划是原授权内的内部工作，不能伪装成新用户输入刷新空闲等待时间。
+fn task_admission(
+    source: &str,
+    status: TaskStatus,
+) -> (eve_subject_api::EventPriority, eve_subject_api::EventSource) {
+    use eve_subject_api::{EventPriority, EventSource};
+    if source.starts_with("subject-focus:")
+        || source.starts_with(eve_task_api::IDLE_TASK_SOURCE_PREFIX)
+        || source.starts_with(crate::qq_subject::PLAN_TASK_SOURCE_PREFIX)
+    {
+        (EventPriority::Autonomy, EventSource::AutonomyScheduler)
+    } else if status == TaskStatus::Running {
+        (EventPriority::Recovery, EventSource::RecoverySupervisor)
+    } else {
+        (EventPriority::User, EventSource::UserIngress)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1949,6 +2109,31 @@ mod tests {
             }),
             execution: None,
         }
+    }
+
+    #[test]
+    fn internal_planning_admission_does_not_reset_idle_user_ingress_time() {
+        use eve_subject_api::{EventPriority, EventSource};
+        for source in [
+            "subject-focus:scope:auto-1-0",
+            "subject-idle:scope:auto-1-0",
+            "subject-plan:scope:auto-1-1",
+        ] {
+            for status in [TaskStatus::Queued, TaskStatus::Running] {
+                assert_eq!(
+                    task_admission(source, status),
+                    (EventPriority::Autonomy, EventSource::AutonomyScheduler)
+                );
+            }
+        }
+        assert_eq!(
+            task_admission("tool:user-task", TaskStatus::Queued),
+            (EventPriority::User, EventSource::UserIngress)
+        );
+        assert_eq!(
+            task_admission("tool:user-task", TaskStatus::Running),
+            (EventPriority::Recovery, EventSource::RecoverySupervisor)
+        );
     }
 
     #[test]

@@ -1,13 +1,18 @@
-//! QQ 宿主的工具查看与管理：/tools 列出当前用户的锻造工具与最近的锻造，/tool 查看版本、规则、
-//! 回放验证、启用记录与调用，并可停用、启用某个已验证版本或回退到上一版本。
+//! QQ 宿主的工具查看与管理：聊天工具和兼容命令共用归属、版本与账本检查。
+//! 可查看回放验证、启用记录与调用，停用、启用某个已验证版本或回退到上一版本。
 //! 工具只属于来源用户；变更只改变启用版本并留下记录，不删除任何版本。
 use crate::AppError;
+use eve_llm_api::{
+    Tool, ToolCall, ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolExecutionError,
+    ToolFuture, ToolValidationError,
+};
 use eve_plugin_api::{PluginError, PluginResult};
 use eve_qqbot_plugin::{QqCommandHandler, QqCommandInput};
 use eve_toolforge_api::{
     Actor, CheckRule, ForgeOutput, ForgeStatus, ForgedTool, MAX_CALLS, ToolAdmin, ToolError,
     ToolSnapshot, Verification,
 };
+use serde_json::{Value, json};
 use std::{
     fmt::Write,
     sync::Arc,
@@ -16,8 +21,8 @@ use std::{
 
 const DISABLED: &str = "工具锻造未启用。";
 const EMPTY: &str = "还没有锻造的工具。同一运行环境中反复出现的问题，Eve 会尝试锻造成运行前检查，用实践中的真实草稿回放验证通过才启用。";
-const HELP: &str = "用法：/tools 列出工具；/tool 工具ID 查看详情；/tool disable 工具ID 停用；/tool enable 工具ID 版本 启用某个已验证版本；/tool rollback 工具ID 回退到上一版本。";
-const NOT_FOUND: &str = "没有这个工具。发送 /tools 查看工具 ID。";
+const HELP: &str = "直接告诉我你想查看、停用、启用或回退哪个锻造工具即可，我会先查真实版本再处理。也可使用 /tools、/tool 工具ID、/tool disable|rollback 工具ID、/tool enable 工具ID 版本。";
+const NOT_FOUND: &str = "没有找到属于你的这个锻造工具；可以先让我查看你的工具列表。";
 const CALLS_FULL: &str =
     "检查调用记录已满：锻造的检查暂停使用，实践照常实际运行验证；已有记录保留。";
 const SHOWN_FORGES: usize = 3;
@@ -79,6 +84,91 @@ fn now_ms() -> Result<u64, AppError> {
     )?)
 }
 
+#[derive(Clone, Copy)]
+enum ManagementError {
+    NotFound,
+    InvalidVersion,
+    NoPreviousVersion,
+    LimitReached,
+    Unavailable,
+}
+impl ManagementError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::NotFound => NOT_FOUND,
+            Self::InvalidVersion => "没有这个已验证版本。",
+            Self::NoPreviousVersion => "没有可以回退的更早版本。",
+            Self::LimitReached => "启用记录已满；保留原记录，未做更改。",
+            Self::Unavailable => "工具记录暂时不可用；未确认更改成功。",
+        }
+    }
+}
+
+/// 两个入口调用同一实现；归属只来自宿主身份，版本只来自真实的已验证账本。
+fn execute_command(
+    tools: &dyn ToolAdmin,
+    owner: &str,
+    command: Command<'_>,
+) -> Result<Value, ManagementError> {
+    let snapshot = tools.snapshot().map_err(|_| ManagementError::Unavailable)?;
+    let owned = |id: &str| {
+        snapshot
+            .tool(id)
+            .filter(|tool| tool.owner == owner)
+            .ok_or(ManagementError::NotFound)
+    };
+    let change = |id: &str, enabled: Option<u32>| -> Result<Value, ManagementError> {
+        let previous = owned(id)?;
+        if enabled.is_some_and(|version| previous.version(version).is_none()) {
+            return Err(ManagementError::InvalidVersion);
+        }
+        let at = now_ms().map_err(|_| ManagementError::Unavailable)?;
+        let tool =
+            tools
+                .set_enabled(id, at, Actor::Owner, enabled)
+                .map_err(|error| match error {
+                    ToolError::InvalidInput => ManagementError::InvalidVersion,
+                    ToolError::LimitReached => ManagementError::LimitReached,
+                    _ => ManagementError::Unavailable,
+                })?;
+        let name = title(&tool);
+        let message = match tool.enabled {
+            Some(version) => format!("已启用「{name}」第 {version} 版。"),
+            None => {
+                format!("已停用「{name}」；之后的实践不会再用它检查，新验证的版本也不会自动启用。")
+            }
+        };
+        Ok(json!({"changed": previous.enabled != tool.enabled, "tool": tool, "message": message}))
+    };
+    match command {
+        Command::Help => Ok(json!({"message": HELP})),
+        Command::List => Ok(json!({
+            "tools": snapshot.tools_for(owner).collect::<Vec<_>>(),
+            "message": list(&snapshot, owner),
+        })),
+        Command::Show(id) => {
+            let tool = owned(id)?;
+            Ok(json!({"tool": tool, "message": show(&snapshot, tool)}))
+        }
+        Command::Disable(id) => change(id, None),
+        Command::Enable(id, version) => change(id, Some(version)),
+        Command::Rollback(id) => {
+            let tool = owned(id)?;
+            let previous = tool.enabled.and_then(|current| {
+                tool.versions
+                    .iter()
+                    .map(|version| version.version)
+                    .filter(|version| *version < current)
+                    .max()
+            });
+            change(
+                id,
+                Some(previous.ok_or(ManagementError::NoPreviousVersion)?),
+            )
+        }
+    }
+}
+
 impl QqCommandHandler for Commands {
     fn handle(&self, input: QqCommandInput<'_>) -> PluginResult<Option<String>> {
         let Some(command) = parse(input.text) else {
@@ -87,64 +177,101 @@ impl QqCommandHandler for Commands {
         let Some(tools) = &self.tools else {
             return Ok(Some(DISABLED.into()));
         };
-        let owner = input.session.user_id.as_str();
-        let snapshot = tools.snapshot().map_err(|_| failure_text())?;
-        let owned = |id: &str| {
-            snapshot
-                .tool(id)
-                .filter(|tool| tool.owner == owner)
-                .cloned()
-        };
-        let change = |id: &str, enabled: Option<u32>| -> PluginResult<String> {
-            let at = now_ms().map_err(|_| failure_text())?;
-            match tools.set_enabled(id, at, Actor::Owner, enabled) {
-                Ok(tool) => {
-                    let name = title(&tool);
-                    Ok(match tool.enabled {
-                        Some(version) => format!("已启用「{name}」第 {version} 版。"),
-                        None => format!(
-                            "已停用「{name}」；之后的实践不会再用它检查，新验证的版本也不会自动启用。"
-                        ),
-                    })
-                }
-                Err(ToolError::InvalidInput) => Ok("没有这个已验证版本。".into()),
-                Err(ToolError::LimitReached) => Ok("启用记录已满；保留原记录，未做更改。".into()),
-                Err(_) => Err(failure_text()),
-            }
-        };
-        let reply = match command {
-            Command::Help => HELP.into(),
-            Command::List => list(&snapshot, owner),
-            Command::Show(id) => match owned(id) {
-                Some(tool) => show(&snapshot, &tool),
-                None => NOT_FOUND.into(),
-            },
-            Command::Disable(id) => match owned(id) {
-                Some(_) => change(id, None)?,
-                None => NOT_FOUND.into(),
-            },
-            Command::Enable(id, version) => match owned(id) {
-                Some(_) => change(id, Some(version))?,
-                None => NOT_FOUND.into(),
-            },
-            Command::Rollback(id) => match owned(id) {
-                None => NOT_FOUND.into(),
-                Some(tool) => {
-                    let previous = tool.enabled.and_then(|current| {
-                        tool.versions
-                            .iter()
-                            .rev()
-                            .map(|version| version.version)
-                            .find(|version| *version < current)
-                    });
-                    match previous {
-                        Some(version) => change(id, Some(version))?,
-                        None => "没有可以回退的更早版本。".into(),
-                    }
-                }
-            },
+        let reply = match execute_command(tools.as_ref(), &input.session.user_id, command) {
+            Ok(value) => value["message"].as_str().unwrap_or_default().to_owned(),
+            Err(ManagementError::Unavailable) => return Err(failure_text()),
+            Err(error) => error.message().into(),
         };
         Ok(Some(reply))
+    }
+}
+
+/// 只在锻造工具账本已装配时注册；宿主沿用 /tool 的管理权限。
+pub(crate) struct ManageTool {
+    pub(crate) tools: Arc<dyn ToolAdmin>,
+}
+impl ManageTool {
+    fn command<'a>(&self, value: &'a Value) -> Result<Command<'a>, ToolValidationError> {
+        let invalid = || ToolValidationError {
+            message: concat!(
+                "action 须为 list、show、disable、enable 或 rollback；",
+                "除 list 外须 tool_id，只有 enable 须正整数 version；不接受身份或额外字段",
+            )
+            .into(),
+        };
+        let object = value.as_object().ok_or_else(invalid)?;
+        let action = object
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid)?;
+        if action == "list" && object.len() == 1 {
+            return Ok(Command::List);
+        }
+        let id = object
+            .get("tool_id")
+            .and_then(Value::as_str)
+            .filter(|id| eve_toolforge_api::validate_id(id).is_ok())
+            .ok_or_else(invalid)?;
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "action" | "tool_id" | "version"))
+        {
+            return Err(invalid());
+        }
+        match (action, object.get("version"), object.len()) {
+            ("show", None, 2) => Ok(Command::Show(id)),
+            ("disable", None, 2) => Ok(Command::Disable(id)),
+            ("rollback", None, 2) => Ok(Command::Rollback(id)),
+            ("enable", Some(version), 3) => {
+                let version = version
+                    .as_u64()
+                    .and_then(|version| u32::try_from(version).ok())
+                    .filter(|version| *version > 0)
+                    .ok_or_else(invalid)?;
+                Ok(Command::Enable(id, version))
+            }
+            _ => Err(invalid()),
+        }
+    }
+}
+impl Tool for ManageTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "manage_forged_tool".into(),
+            description: "用户直接聊天要求管理自己的锻造检查工具时使用。先 list 或 show 查看实际 ID、版本、回放验证和启用记录，再按用户意图 disable、enable 指定的已验证 version 或 rollback 到当前启用版本之前的最近一版。只管理当前可信用户自己的工具，不删除版本；检查规则不等于任意代码插件。不存在或没有更早版本时如实说明。与兼容命令共用真实账本和管理权限，用户无需输入命令。".into(),
+            argument_schema: json!({"type":"object","properties":{
+                "action":{"type":"string","enum":["list","show","disable","enable","rollback"]},
+                "tool_id":{"type":"string"},
+                "version":{"type":"integer","minimum":1,"maximum":u32::MAX}
+            },"required":["action"],"additionalProperties":false}),
+            required_permissions: vec![],
+            concurrency: Some(ToolConcurrency::Serial { scope: "eve.tools.management".into() }),
+        }
+    }
+    fn validate_arguments(&self, value: &Value) -> Result<(), ToolValidationError> {
+        self.command(value).map(|_| ())
+    }
+    fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
+        Box::pin(async move {
+            let command = self
+                .command(&call.arguments)
+                .map_err(|error| ToolExecutionError::Failed(error.message))?;
+            if context.is_cancel_requested() {
+                return Err(ToolExecutionError::Cancelled("本轮已取消".into()));
+            }
+            let scope = context.scope().ok_or_else(|| {
+                ToolExecutionError::Failed("工具管理需要宿主绑定的用户身份".into())
+            })?;
+            eve_session_api::SessionKey::new(&scope.session_id, &scope.user_id)
+                .map_err(|_| ToolExecutionError::Failed("用户会话身份无效".into()))?;
+            if scope.user_id == crate::qq_group::USER {
+                return Err(ToolExecutionError::Failed(
+                    "群体观察不能代替真实用户管理工具".into(),
+                ));
+            }
+            execute_command(self.tools.as_ref(), &scope.user_id, command)
+                .map_err(|error| ToolExecutionError::Failed(error.message().into()))
+        })
     }
 }
 

@@ -126,12 +126,16 @@ class TriggerAcceptance(reminder_test.ReminderAcceptance):
         def respond(body):
             text = self.text(body)
             if "你在为 Eve 独立完成一项委托的任务" in body["messages"][0]["content"]:
+                self.assertFalse(body.get("tools"), "纯文本合同不开放副作用工具")
                 return text_response("任务已完成")
             if text.startswith(PREFIX):
                 return text_response("根据后台结果继续完成")
             results = self.results(body)
             if not results:
-                return calls(("dispatch", "dispatch_background_task", {"title": "核对", "instructions": "核对输入", "max_steps": 1}))
+                return calls(("dispatch", "dispatch_background_task", {
+                    "title": "核对", "instructions": "核对输入", "max_steps": 1,
+                    "verification": {"kind": "text", "required_fragments": ["任务已完成"]},
+                }))
             if len(results) == 1:
                 return calls(("register", "set_wakeup_trigger", {"title": "任务完成后继续", "instructions": "根据后台结果继续",
                     "conditions": [{"type": "task_finished", "task_id": results[0]["task"]["id"]}]}))
@@ -140,6 +144,10 @@ class TriggerAcceptance(reminder_test.ReminderAcceptance):
         self.run_eve([*self.send(self.message("create", "设置唤醒", expected="已设置")),
                       *self.checkpoint("sent")], tasks=True, checkpoints={"sent": self.wait_sent})
         self.assertEqual(self.triggers()[0]["delivery"], "Sent")
+        [task] = self.documents()["eve.task"]["tasks.v1"]["tasks"]
+        self.assertEqual(task["status"], "Completed")
+        self.assertEqual(task["result"], "任务已完成")
+        self.assertEqual(task["usage"]["tool_calls"], 0)
 
     def test_incoming_message_queues_while_wakeup_is_running(self):
         self.configure({"type": "time", "after_seconds": 1})

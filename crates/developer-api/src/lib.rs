@@ -21,6 +21,7 @@ pub struct DeveloperConfig {
     /// 旧后端普通访问开关；QQ 成员项目另由宿主身份策略隔离，不开放宿主管理能力。
     #[serde(default = "ordinary_access")]
     pub ordinary_access: bool,
+    /// 命令执行默认关闭；实际注册升级工具还要求此项与 self_upgrade 同时开启。
     #[serde(default)]
     pub commands: bool,
     #[serde(default)]
@@ -40,15 +41,17 @@ pub struct DeveloperConfig {
     #[serde(default = "rounds")]
     /// 0 表示不限制工具批次数；正数为显式上限。
     pub max_tool_rounds: usize,
-    #[serde(default)]
+    /// 自升级许可默认开启；实际注册升级工具仍要求 commands 同时开启并通过宿主授权。
+    #[serde(default = "enabled")]
     pub self_upgrade: bool,
-    /// 独立监督器的可信请求目录；未配置时只准备候选，不注册实时切换工具。
+    /// 独立监督器的可信请求目录；配置时要求 commands 和 self_upgrade 同时开启。
+    /// 未配置时可准备候选，但不注册实时切换工具。
     #[serde(default)]
     pub live_upgrade: Option<PathBuf>,
     /// 追加的命令策略规则文件（JSON）；内置规则始终生效。
     #[serde(default)]
     pub command_policy: Option<PathBuf>,
-    /// 需确认的命令交给宿主装配的行动审查者判断；关闭或未装配时拒绝需审核的命令，owner_confirmed不能代替审核。
+    /// 敏感命令和业务动作交给宿主装配的行动审查者判断；关闭或未装配时拒绝需审核的动作，owner_confirmed不能代替审核。
     #[serde(default = "enabled")]
     pub action_review: bool,
     #[serde(default = "cargo")]
@@ -143,26 +146,29 @@ pub enum ReviewAuthorization {
 /// 交给审查者的一次行动。只有 `user_messages` 是可信的用户原话；其余都是待核对的数据。
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ActionReviewRequest {
-    /// 有界命令摘要；不得据此替代下面完整的程序与参数。
+    /// 有界行动摘要；不得据此替代下面完整的程序、参数或业务操作。
     pub action: String,
+    /// 命令的真实程序；业务动作使用 eve.xxx 名称，并在 arguments[0] 提供完整 JSON 操作。
     pub program: String,
+    /// 命令的完整参数；业务动作的第一个参数为完整 JSON 操作，均不得裁剪。
     pub arguments: Vec<String>,
     /// 宿主绑定的工作区与隔离模式，用于判断实际影响范围。
     pub workspace: String,
     pub isolated: bool,
     pub cwd: String,
-    /// 命令策略要求确认的理由。
+    /// 命令或业务策略要求审核的理由。
     pub policy_reason: String,
     /// 模型自称已征得同意；无法核实，不能单独作为授权。
     pub claimed_confirmation: bool,
-    /// 后台委托执行，没有人在场；此时任务说明由模型撰写，不是用户原话。
+    /// 后台委托执行；模型撰写的任务说明不是用户原话，仍可携带宿主绑定的真实授权原话。
     pub delegated: bool,
-    /// 本会话最近的用户原话，从旧到新；委托执行时为空。
+    /// 宿主绑定的最近六条用户原话，从旧到新完整保留；后台任务可继承原会话的真实原话。
+    /// 没有绑定的真实原话时为空，不能用模型撰写的任务说明填充。
     pub user_messages: Vec<String>,
     /// 本会话最近的工具调用摘要，从旧到新；只作行动轨迹参考。
     pub recent_actions: Vec<String>,
 }
-/// 完整必要上下文的硬上限。超限拒绝，不能裁剪用户原话或真实命令以求放行。
+/// 完整必要上下文的硬上限。超限拒绝，不能裁剪用户原话或真实操作以求放行。
 pub const MAX_ACTION_REVIEW_BYTES: usize = 256 * 1024;
 impl ActionReviewRequest {
     pub fn validate_capacity(&self) -> Result<(), String> {
@@ -171,7 +177,7 @@ impl ActionReviewRequest {
             .len();
         if size > MAX_ACTION_REVIEW_BYTES {
             return Err(format!(
-                "完整行动审查上下文超过 {} 字节上限，未裁剪原话或命令，动作未执行",
+                "完整行动审查上下文超过 {} 字节上限，未裁剪原话或操作，动作未执行",
                 MAX_ACTION_REVIEW_BYTES
             ));
         }
@@ -206,6 +212,10 @@ pub trait ActionReviewer: Send + Sync {
 
 /// 宿主提供的平台身份授权；模型参数、昵称及自称不能实现此绑定。
 pub trait DeveloperAuthorization: Send + Sync {
+    /// 宿主业务急停；所有公开、成员及管理操作执行前都必须复核。默认兼容既有授权后端。
+    fn permits_business(&self, _scope: &eve_llm_api::ContextScope) -> bool {
+        true
+    }
     fn is_operator(&self, scope: &eve_llm_api::ContextScope) -> bool;
     /// 宿主核对的真实成员可在独立项目目录开发；不授予宿主或升级权限。
     fn allows_workspace_development(&self, _scope: &eve_llm_api::ContextScope) -> bool {
@@ -252,7 +262,6 @@ impl DeveloperConfig {
                 self.github_token_env.as_str(),
                 "EVE_GITHUB_TOKEN" | "GH_TOKEN" | "GITHUB_TOKEN"
             )
-            || (self.self_upgrade && !self.commands)
             || self
                 .live_upgrade
                 .as_ref()
@@ -436,10 +445,36 @@ pub enum DeveloperOperation {
     Github(GithubArguments),
     PrepareUpgrade,
     ApplyUpgrade(ApplyUpgradeArguments),
+    RestartSelf,
     UpgradeStatus,
 }
+/// 后端实际具备的本地观察边界，只供宿主组合；每次观察仍须检查实时身份和业务权限。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeveloperObservationCapabilities {
+    /// 与后端文件工具相同的规范化工作根目录。
+    pub workspace: PathBuf,
+    /// 私有会话检出的父目录；None 表示使用固定 workspace。
+    pub session_workspaces: Option<PathBuf>,
+    /// 后端是否允许命令与进程观察。
+    pub processes: bool,
+}
+
+/// 文件工具与观察器共用的可信会话目录标识；不接收模型提供的路径。
+pub fn session_workspace_key(scope: &eve_llm_api::ContextScope) -> String {
+    let bytes = serde_json::to_vec(scope).expect("ContextScope only contains strings");
+    ring::digest::digest(&ring::digest::SHA256, &bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// 可替换后端；接收宿主的可信会话身份与取消状态，而非模型自报 owner。
 pub trait DeveloperBackend: Send + Sync {
+    /// 未声明能力的后端不能由宿主猜测目录或默认开放进程观察。
+    fn observation_capabilities(&self) -> Option<DeveloperObservationCapabilities> {
+        None
+    }
     /// 只核验宿主身份与业务范围，不执行动作；不代表危险命令已经过审核。
     fn preflight(
         &self,
@@ -458,6 +493,47 @@ pub trait DeveloperBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn self_upgrade_defaults_on_without_enabling_commands() {
+        let config: DeveloperConfig = serde_json::from_value(serde_json::json!({
+            "workspace": std::env::current_dir().unwrap(),
+            "operators": ["owner"]
+        }))
+        .unwrap();
+        assert!(config.self_upgrade);
+        assert!(!config.commands);
+        assert!(config.live_upgrade.is_none());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn explicit_self_upgrade_disable_is_preserved_and_live_upgrade_requires_both_permissions() {
+        for commands in [false, true] {
+            let config: DeveloperConfig = serde_json::from_value(serde_json::json!({
+                "workspace": std::env::current_dir().unwrap(),
+                "operators": ["owner"],
+                "commands": commands,
+                "self_upgrade": false
+            }))
+            .unwrap();
+            assert!(!config.self_upgrade);
+            config.validate().unwrap();
+        }
+        for commands in [false, true] {
+            for self_upgrade in [false, true] {
+                let config: DeveloperConfig = serde_json::from_value(serde_json::json!({
+                    "workspace": std::env::current_dir().unwrap(),
+                    "operators": ["owner"],
+                    "commands": commands,
+                    "self_upgrade": self_upgrade,
+                    "live_upgrade": std::env::temp_dir()
+                }))
+                .unwrap();
+                assert_eq!(config.validate().is_ok(), commands && self_upgrade);
+            }
+        }
+    }
+
     #[test]
     fn github_routes_normalize_without_changing_repository_or_hiding_conflicts() {
         let base = GithubArguments {

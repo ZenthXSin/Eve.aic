@@ -29,6 +29,10 @@ pub struct IdleAction {
     pub title: String,
     pub goal: String,
     pub assessment: OpportunityAssessment,
+    /// 候选的冻结验收数据；宿主必须按任务契约严格校验，不构成权限或执行授权。
+    /// 旧回顾缺少此字段仍可恢复，但须先规划并保存合同，不能直接执行无合同目标。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_contract: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
