@@ -21,7 +21,8 @@ pub(crate) struct QqPanel {
     pub notes: Arc<dyn eve_context_api::ContextAdmin>,
     pub sessions: Arc<dyn SessionService>,
     pub control: Arc<dyn ControlService>,
-    pub channel: Arc<QqBotStatusHandle>,
+    pub channel: Option<Arc<QqBotStatusHandle>>,
+    pub chat: Option<Arc<crate::web_chat::WebChat>>,
     pub started_at_unix_ms: u64,
     /// 本进程最近判断与启动时选择的判断方式；未开启面板时不记录。
     pub judgments: Option<(Arc<RecentRelationJudgments>, &'static str)>,
@@ -117,6 +118,27 @@ fn cursor(keys: &[SessionKey], limit: usize) -> Option<String> {
     (keys.len() == limit).then(|| keys.last().expect("nonempty page").session_id.clone())
 }
 impl PanelService for QqPanel {
+    fn chat_info(&self) -> PanelResult<ChatInfo> {
+        Ok(self.chat.as_ref().ok_or(PanelError::Unavailable)?.info())
+    }
+    fn chat_submit(&self, request: ChatSubmit) -> PanelResult<ChatState> {
+        self.chat
+            .as_ref()
+            .ok_or(PanelError::Unavailable)?
+            .submit(request)
+    }
+    fn chat_read(&self, request: ChatLookup) -> PanelResult<ChatState> {
+        self.chat
+            .as_ref()
+            .ok_or(PanelError::Unavailable)?
+            .read(request)
+    }
+    fn chat_cancel(&self, request: ChatLookup) -> PanelResult<ChatState> {
+        self.chat
+            .as_ref()
+            .ok_or(PanelError::Unavailable)?
+            .cancel(request)
+    }
     fn context_notes(
         &self,
         request: PanelContextNoteRequest,
@@ -142,7 +164,11 @@ impl PanelService for QqPanel {
                         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             })
         };
-        if !qq_namespace(&request.key.session_id) || !qq_namespace(&request.key.user_id) {
+        let web = crate::web_chat::is_owner(&eve_llm_api::ContextScope {
+            session_id: request.key.session_id.clone(),
+            user_id: request.key.user_id.clone(),
+        });
+        if !web && (!qq_namespace(&request.key.session_id) || !qq_namespace(&request.key.user_id)) {
             return Err(PanelError::NotFound);
         }
         let cursor = self
@@ -154,7 +180,7 @@ impl PanelService for QqPanel {
             return Err(PanelError::NotFound);
         }
         let owner = eve_context_api::ContextOwner {
-            channel: "qq".into(),
+            channel: if web { "web" } else { "qq" }.into(),
             session_id: request.key.session_id,
             user_id: request.key.user_id,
         };
@@ -202,7 +228,11 @@ impl PanelService for QqPanel {
             failed,
             interactions_not_saved,
             ..
-        } = *self.channel.status.borrow();
+        } = self
+            .channel
+            .as_ref()
+            .map(|channel| *channel.status.borrow())
+            .unwrap_or_default();
         Ok(PanelStatus {
             started_at_unix_ms: self.started_at_unix_ms,
             qq: ChannelStatus {
@@ -218,7 +248,11 @@ impl PanelService for QqPanel {
         })
     }
     fn readiness(&self) -> PanelResult<Readiness> {
-        let channel = *self.channel.status.borrow();
+        let channel = self
+            .channel
+            .as_ref()
+            .map(|channel| *channel.status.borrow())
+            .unwrap_or_default();
         let settings = &*self.readiness.settings;
         let model = crate::models::summary(settings, None)
             .ok()

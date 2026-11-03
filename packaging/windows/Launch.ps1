@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('qq', 'console', 'update')][string]$Mode = 'qq',
+    [ValidateSet('qq', 'console', 'web', 'update')][string]$Mode = 'qq',
     [string]$ConfigPath = '',
     [switch]$NoPrompt,
     [switch]$ValidateOnly,

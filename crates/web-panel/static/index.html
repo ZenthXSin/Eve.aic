@@ -15,7 +15,7 @@
       <a class="brand" href="/" aria-label="Eve 本地控制台"><span class="brand-mark" aria-hidden="true">E</span><span>Eve<span class="brand-caption">本地控制台</span></span></a>
       <p class="eyebrow">保持对当前运行的了解</p>
       <h1>看见进度，<br>掌握下一步。</h1>
-      <p class="login-description">查看 QQ 通道状态、正在执行的任务，以及本机保存的会话记录。</p>
+      <p class="login-description">直接与 Eve 对话，查看执行进度，管理本机保存的会话与配置。</p>
       <div class="intro-note"><span class="small-dot" aria-hidden="true"></span>仅连接此 Eve 实例</div>
     </div>
     <main class="login-card">
@@ -36,6 +36,7 @@
     <aside class="sidebar">
       <a class="brand" href="/" aria-label="Eve 本地控制台"><span class="brand-mark" aria-hidden="true">E</span><span>Eve<span class="brand-caption">本地控制台</span></span></a>
       <nav aria-label="控制台导航">
+        <button class="nav-item" type="button" data-view="chat">直接对话</button>
         <button class="nav-item active" type="button" data-view="tasks" aria-current="page"><span aria-hidden="true">◎</span>任务状态</button>
         <button class="nav-item" type="button" data-view="sessions"><span aria-hidden="true">▤</span>会话记录</button>
         <button class="nav-item" type="button" data-view="judgments"><span aria-hidden="true">◇</span>判断诊断</button>
@@ -73,6 +74,24 @@
         <div id="readiness-roles" class="readiness-roles" aria-label="各用途的模型状态"></div>
       </section>
 
+      <section id="chat-view" class="workspace chat-workspace" aria-label="直接对话" hidden>
+        <aside class="list-panel chat-sidebar">
+          <div class="panel-heading"><div><h2>与 Eve 对话</h2><p>Web 默认使用主人身份</p></div><button id="chat-new" class="button secondary" type="button">新对话</button></div>
+          <p id="chat-unavailable" class="inline-error" role="alert" hidden></p>
+          <div id="chat-conversations" class="record-list" aria-label="Web 会话"></div>
+          <button id="chat-more" class="button secondary" type="button" hidden>更多会话</button>
+        </aside>
+        <section class="detail-panel chat-main" aria-label="对话内容">
+          <div class="chat-heading"><div><h2>Eve</h2><p id="chat-status" class="muted" role="status">可以直接开始聊天</p></div><span class="count-pill">主人</span></div>
+          <div id="chat-messages" class="chat-messages" role="log" aria-live="polite"></div>
+          <p id="chat-error" class="inline-error" role="alert" hidden></p>
+          <form id="chat-form" class="chat-composer">
+            <label for="chat-input">消息</label>
+            <textarea id="chat-input" rows="3" maxlength="32768" placeholder="和 Eve 说点什么，或直接交代任务" required></textarea>
+            <div class="chat-composer-actions"><span class="small-text">Enter 发送，Shift + Enter 换行</span><button id="chat-retry" class="button secondary" type="button" hidden>核对并重发原请求</button><button id="chat-cancel" class="button secondary" type="button" disabled>停止本轮</button><button id="chat-send" class="button primary" type="submit">发送</button></div>
+          </form>
+        </section>
+      </section>
       <section id="tasks-view" class="workspace" aria-label="任务状态">
         <div class="list-panel">
           <div class="panel-heading"><div><h2>受管任务</h2><p>选择任务，查看当前代际与进度。</p></div><span id="task-count" class="count-pill">0</span></div>

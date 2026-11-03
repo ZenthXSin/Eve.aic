@@ -1,4 +1,4 @@
-use crate::{ScopedLexicalRecall, recall::validate_snapshot};
+use crate::ScopedLexicalRecall;
 use eve_llm_api::{
     ContextAssembler, ContextScope, ContextSnapshot, LlmError, LlmFuture, TurnInput,
 };
@@ -34,7 +34,10 @@ struct Reader {
 }
 impl MemoryContinuityReader for Reader {
     fn read(&self, query: &str) -> MemoryResult<MemoryContinuityView> {
-        validate_snapshot(&self.anchor.snapshot()?, &self.target)?;
+        {
+            let mut anchor = ValidatedMemoryCursor::new(self.target.clone(), self.anchor.scan()?)?;
+            while !anchor.next_page()?.is_empty() {}
+        }
         if query.len() > MAX_RECALL_QUERY_BYTES || query.chars().any(char::is_control) {
             return Err(MemoryError::InvalidInput);
         }

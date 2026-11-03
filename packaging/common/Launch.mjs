@@ -63,7 +63,7 @@ async function loadConfig() {
   try { contents = await fs.readFile(configPath, 'utf8'); }
   catch (error) {
     if (error.code !== 'ENOENT') throw new Error('config.json 无法读取，原文件未修改。');
-    if (options.noPrompt || options.validateOnly || mode === 'panel') throw new Error('请先运行 Start-Eve 完成配置。');
+    if (options.noPrompt || options.validateOnly || mode === 'panel') throw new Error('请先运行 Start-Eve 或 Start-Web 完成配置。');
     contents = await fs.readFile(path.join(packageRoot, 'config.example.json'), 'utf8');
   }
   try { return { config: JSON.parse(contents), configPath }; }
@@ -91,17 +91,18 @@ function validate(config) {
   }
   if (config.features.autonomous_tools !== undefined && typeof config.features.autonomous_tools !== 'boolean') throw new Error('features.autonomous_tools 必须为布尔值。');
   if (mode === 'console') return;
-  if (!/^[0-9]{1,32}$/.test(config.qq?.app_id) || !validText(config.qq?.app_secret)) throw new Error('QQ AppID 或 Secret 无效。');
-  if (typeof config.qq.sandbox !== 'boolean' || typeof config.jev?.enabled !== 'boolean') throw new Error('QQ / Jev 开关必须为布尔值。');
   if (!/^[\x21-\x7e]{32,256}$/.test(config.web?.token)) throw new Error('面板令牌无效。');
   const match = /^127\.0\.0\.1:([0-9]{1,5})$/.exec(config.web.listen);
   if (!match || Number(match[1]) > 65535) throw new Error('面板地址必须为本机 127.0.0.1:端口。');
+  if (mode === 'web' || mode === 'panel') return;
+  if (!/^[0-9]{1,32}$/.test(config.qq?.app_id) || !validText(config.qq?.app_secret)) throw new Error('QQ AppID 或 Secret 无效。');
+  if (typeof config.qq.sandbox !== 'boolean' || typeof config.jev?.enabled !== 'boolean') throw new Error('QQ / Jev 开关必须为布尔值。');
   if (config.jev.enabled && !validText(config.jev.api_key)) throw new Error('Jev 独立密钥为空。');
 }
 
 async function main() {
   if (!['linux', 'win32'].includes(process.platform)) throw new Error('便携启动器仅支持 Linux 和 Windows。');
-  if (!['qq', 'console', 'panel', 'update'].includes(mode)) throw new Error('仅支持 qq / console / panel / update 模式。');
+  if (!['qq', 'console', 'web', 'panel', 'update'].includes(mode)) throw new Error('仅支持 qq / console / web / panel / update 模式。');
   if (mode === 'update') {
     const updater = createUpdater(root);
     if (options.status) {
@@ -133,7 +134,7 @@ async function main() {
     open.unref();
     return;
   }
-  const binary = path.join(packageRoot, (mode === 'qq' ? 'eve-qqbot' : 'eve') + (windows ? '.exe' : ''));
+  const binary = path.join(packageRoot, (mode === 'qq' ? 'eve-qqbot' : mode === 'web' ? 'eve-web' : 'eve') + (windows ? '.exe' : ''));
   const bridge = options.bridge || path.join(packageRoot, 'connectors/qqbot/bridge.mjs');
   const required = [binary, path.join(root, 'AGENT.md')];
   if (mode === 'qq') required.push(nodePath, bridge, path.join(packageRoot, 'connectors/qqbot/node_modules/@tencent-connect/qqbot-nodejs/package.json'));
@@ -190,7 +191,12 @@ async function main() {
     if (config.developer.github_token) env.EVE_GITHUB_TOKEN = config.developer.github_token;
   }
   const args = ['--state-dir', path.join(root, 'data', mode), '--agent', path.join(root, 'AGENT.md')];
-  if (config.features.segmented) args.push('--segmented');
+  if (config.features.segmented && mode !== 'web') args.push('--segmented');
+  if (mode === 'web') {
+    env.EVE_WEB_TOKEN = config.web.token;
+    args.push('--listen', config.web.listen);
+    console.log('Web 启动中；看到 EVE_WEB_READY 后打开 Open-Panel，默认主人身份。');
+  }
   if (mode === 'qq') {
     Object.assign(env, { QQBOT_APP_ID: config.qq.app_id, QQBOT_APP_SECRET: config.qq.app_secret,
       QQBOT_SANDBOX: String(config.qq.sandbox), EVE_WEB_TOKEN: config.web.token, EVE_JEV_API_KEY: '' });

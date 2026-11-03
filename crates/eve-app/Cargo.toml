@@ -15,6 +15,10 @@ name = "eve-qqbot"
 path = "src/bin/qqbot.rs"
 
 [[bin]]
+name = "eve-web"
+path = "src/bin/web.rs"
+
+[[bin]]
 name = "eve-cognition"
 path = "src/bin/cognition.rs"
 

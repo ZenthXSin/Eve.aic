@@ -11,6 +11,14 @@
   let token = "";
   let epoch = 0;
   let view = "tasks";
+  let chatAvailable = false;
+  let chatId = "";
+  let chatPending = null;
+  let chatFlight = false;
+  let chatLoading = false;
+  let chatListCursor = null;
+  let chatList = [];
+  let chatSerial = 0;
   let refreshFlight = null;
   let pollTimer = null;
   let taskLoading = false;
@@ -187,7 +195,9 @@
           429: "请求较多，请稍后重试。",
           503: "当前服务暂不可用，请稍后刷新。",
         };
-        throw new ApiError(messages[response.status] || "服务暂时无法完成请求，请稍后重试。");
+        const failure = new ApiError(messages[response.status] || "服务暂时无法完成请求，请稍后重试。");
+        failure.status = response.status;
+        throw failure;
       }
       const result = await response.json().catch(() => { throw new ApiError("服务返回的格式无效，请刷新重试。"); });
       if (epoch !== requestEpoch) throw new ApiError("访问已结束。", true);
@@ -213,6 +223,14 @@
   function logout(message = "") {
     token = "";
     epoch += 1;
+    chatSerial += 1;
+    chatAvailable = false;
+    chatFlight = false;
+    chatLoading = false;
+    chatPending = null;
+    chatList = [];
+    $("chat-messages").replaceChildren();
+    $("chat-input").value = "";
     sessionRequest += 1;
     for (const controller of controllers) controller.abort();
     controllers.clear();
@@ -1755,8 +1773,168 @@
     } catch (error) { if (request === pluginPageRequest && requestEpoch === epoch) reportError("plugin-pages-error", error); }
   }
 
+  function chatStore(key, value) {
+    try {
+      if (value === undefined) return JSON.parse(sessionStorage.getItem(key) || "null");
+      if (value === null) sessionStorage.removeItem(key);
+      else sessionStorage.setItem(key, JSON.stringify(value));
+    } catch (_) { return null; }
+  }
+  function newChatId() { return Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, "0")).join(""); }
+  function validChatId(id) { return typeof id === "string" && /^[a-f0-9]{32}$/.test(id); }
+  function chatBubble(role, content) {
+    const bubble = node("div", `chat-message ${role}`);
+    bubble.append(node("span", "chat-message-label", role === "user" ? "主人" : role === "assistant" ? "Eve" : "运行状态"), document.createTextNode(content));
+    $("chat-messages").append(bubble);
+    $("chat-messages").scrollTop = $("chat-messages").scrollHeight;
+    return bubble;
+  }
+  function chatButtons() {
+    $("chat-send").disabled = !chatAvailable || chatFlight || !!chatPending;
+    $("chat-cancel").disabled = !chatPending || chatFlight;
+  }
+  async function chatHistory(id, serial) {
+    try {
+      const result = await api("/api/session", { key: { session_id: `web:chat:${id}`, user_id: "web:owner" }, limit: 30 });
+      if (serial !== chatSerial || id !== chatId) return;
+      $("chat-messages").replaceChildren();
+      for (const turn of result.session.turns) {
+        chatBubble("user", turn.input + (turn.input_truncated ? "\n（记录预览已截断）" : ""));
+        if (turn.status.state === "Completed") {
+          for (const message of turn.status.messages) chatBubble("assistant", message.text + (message.truncated ? "\n（历史记录预览已截断）" : ""));
+        } else if (turn.status.state !== "Pending") {
+          const reason = turn.status.state === "Interrupted" ? "这轮在实例中断后保留，未自动重跑" : turn.status.code === "Cancelled" ? "这轮已停止，原记录与已有回执保留" : "这轮未能完成，原记录与已有回执保留";
+          chatBubble("notice", reason).dataset.turnId = String(turn.id);
+        }
+      }
+      if (!result.session.turns.length) chatBubble("notice", "可以直接聊天或交代任务，无需 QQ 绑定或输入命令");
+    } catch (error) {
+      if (serial !== chatSerial || id !== chatId) return;
+      if (error.status === 404) { $("chat-messages").replaceChildren(); chatBubble("notice", "可以直接聊天或交代任务，无需 QQ 绑定或输入命令"); }
+      else reportError("chat-error", error);
+    }
+  }
+  function renderChatList() {
+    $("chat-conversations").replaceChildren();
+    if (!chatList.some(row => row.key.session_id === `web:chat:${chatId}`)) {
+      const item = button("当前新对话", "chat-conversation", () => {});
+      item.setAttribute("aria-current", "true"); $("chat-conversations").append(item);
+    }
+    chatList.forEach((row, index) => {
+      const id = row.key.session_id.slice("web:chat:".length);
+      const item = button(`对话 ${index + 1} · ${row.turn_count} 轮`, "chat-conversation", () => { chatId = id; chatStore("eve.web.chat.current", id); void loadChat(); });
+      item.setAttribute("aria-current", String(id === chatId));
+      $("chat-conversations").append(item);
+    });
+    $("chat-more").hidden = !chatListCursor;
+  }
+  async function chatConversations(more = false) {
+    const serial = chatSerial;
+    const query = new URLSearchParams({ limit: "100" });
+    if (more && chatListCursor) query.set("after", chatListCursor);
+    const page = validatePage(await api(`/api/sessions?${query}`), "sessions", row => row && validSession(row.key));
+    if (serial !== chatSerial) return;
+    const rows = page.sessions.filter(row => row.key.user_id === "web:owner" && row.key.session_id.startsWith("web:chat:") && validChatId(row.key.session_id.slice(9)));
+    chatList = more ? [...chatList, ...rows] : rows;
+    chatListCursor = page.next_cursor;
+    renderChatList();
+  }
+  async function loadChat() {
+    if (!chatAvailable || !token) return;
+    if (!validChatId(chatId)) { const saved = chatStore("eve.web.chat.current"); chatId = validChatId(saved) ? saved : newChatId(); }
+    chatStore("eve.web.chat.current", chatId);
+    const saved = chatStore(`eve.web.chat.pending.${chatId}`);
+    chatPending = saved && saved.conversation_id === chatId && validChatId(saved.request_id) && typeof saved.text === "string" ? saved : null;
+    const serial = ++chatSerial;
+    chatLoading = false;
+    chatFlight = false;
+    showError("chat-error", "");
+    $("chat-retry").hidden = true;
+    $("chat-status").textContent = chatPending ? "正在核对上次请求" : "可以直接开始聊天";
+    chatButtons();
+    await Promise.allSettled([chatHistory(chatId, serial), chatConversations()]);
+    if (serial === chatSerial && chatPending) await pollChat();
+  }
+  async function pollChat() {
+    if (!chatAvailable || !chatPending || chatLoading || chatFlight) return;
+    const pending = chatPending, serial = chatSerial, requestEpoch = epoch;
+    chatLoading = true;
+    try {
+      const state = await api("/api/chat/read", { conversation_id: pending.conversation_id, request_id: pending.request_id });
+      if (serial !== chatSerial || requestEpoch !== epoch || pending !== chatPending) return;
+      const labels = { accepted: "准备开始", generating: "正在思考", tools: "正在执行工具", committing: "正在保存结果", cancelling: "正在停止，等待工具收尾", completed: "已完成", failed: "本轮未完成", unknown: "需要核对已有结果" };
+      if (state.conversation_id !== chatId || state.request_id !== pending.request_id || !labels[state.status]) throw new ApiError("对话状态不匹配，请重新核对。");
+      $("chat-status").textContent = state.status === "failed" && state.failure?.startsWith("已停止本轮") ? "已停止" : labels[state.status];
+      $("chat-retry").hidden = true;
+      showError("chat-error", "");
+      if (["completed", "failed", "unknown"].includes(state.status)) {
+        chatPending = null;
+        chatStore(`eve.web.chat.pending.${chatId}`, null);
+        await chatHistory(chatId, serial);
+        if (serial !== chatSerial || requestEpoch !== epoch) return;
+        if (state.status === "completed" && typeof state.text === "string") {
+          const last = $("chat-messages").querySelector(".chat-message.assistant:last-child");
+          if (last) { last.replaceChildren(node("span", "chat-message-label", "Eve"), document.createTextNode(state.text)); }
+          else chatBubble("assistant", state.text);
+        } else if (state.failure) {
+          const content = `${state.failure}${state.started_tools > 0 ? `；启动 ${state.started_tools} 次工具，收到 ${state.tool_receipts} 条回执` : ""}`;
+          const previous = [...$("chat-messages").querySelectorAll(".chat-message.notice")].find(item => item.dataset.turnId === String(state.turn_id));
+          if (previous) previous.replaceChildren(node("span", "chat-message-label", "运行状态"), document.createTextNode(content));
+          else chatBubble("notice", content);
+        }
+        await chatConversations();
+      }
+    } catch (error) {
+      if (serial === chatSerial && requestEpoch === epoch) {
+        reportError("chat-error", error);
+        $("chat-status").textContent = "正在核对请求状态，已有工作不会因网页断线自动重跑";
+        $("chat-retry").hidden = false;
+      }
+    } finally { if (serial === chatSerial && requestEpoch === epoch) { chatLoading = false; chatButtons(); } }
+  }
+  async function sendChat(payload) {
+    if (chatFlight || !chatAvailable) return;
+    const serial = chatSerial, requestEpoch = epoch;
+    chatFlight = true; chatPending = payload;
+    chatStore(`eve.web.chat.pending.${chatId}`, payload);
+    chatButtons(); showError("chat-error", "");
+    $("chat-status").textContent = "正在发送";
+    $("chat-retry").hidden = true;
+    try {
+      await api("/api/chat/send", payload);
+      if (serial !== chatSerial || requestEpoch !== epoch) return;
+      if ($("chat-input").value === payload.text) $("chat-input").value = "";
+      await chatHistory(chatId, serial);
+    } catch (error) {
+      if (serial === chatSerial && requestEpoch === epoch) { reportError("chat-error", error); $("chat-retry").hidden = false; }
+    } finally {
+      if (serial === chatSerial && requestEpoch === epoch) { chatFlight = false; chatButtons(); void pollChat(); }
+    }
+  }
+  $("chat-form").addEventListener("submit", event => {
+    event.preventDefault();
+    if (chatPending || chatFlight) return;
+    const content = $("chat-input").value;
+    if (!content.trim() || new TextEncoder().encode(content).length > 32768) { showError("chat-error", "消息不能为空，且 UTF-8 正文不能超过 32 KiB"); return; }
+    void sendChat({ conversation_id: chatId, request_id: newChatId(), text: content });
+  });
+  $("chat-input").addEventListener("keydown", event => { if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); $("chat-form").requestSubmit(); } });
+  $("chat-new").addEventListener("click", () => { chatId = newChatId(); chatStore("eve.web.chat.current", chatId); $("chat-input").value = ""; void loadChat(); });
+  $("chat-more").addEventListener("click", () => { void chatConversations(true).catch(error => reportError("chat-error", error)); });
+  $("chat-retry").addEventListener("click", () => { if (chatPending) void sendChat(chatPending); });
+  $("chat-cancel").addEventListener("click", async () => {
+    const pending = chatPending, serial = chatSerial;
+    if (!pending) return;
+    $("chat-cancel").disabled = true;
+    try { await api("/api/chat/cancel", { conversation_id: pending.conversation_id, request_id: pending.request_id }); if (serial === chatSerial) void pollChat(); }
+    catch (error) { if (serial === chatSerial) reportError("chat-error", error); }
+  });
+
   function switchView(next) {
     view = next;
+    document.querySelector(".overview").hidden = next === "chat";
+    $("readiness").hidden = next === "chat";
+    $("chat-view").hidden = next !== "chat";
     $("tasks-view").hidden = next !== "tasks";
     $("sessions-view").hidden = next !== "sessions";
     $("judgments-view").hidden = next !== "judgments";
@@ -1764,7 +1942,7 @@
     $("memory-view").hidden = next !== "memory";
     $("plugins-view").hidden = next !== "plugins";
     $("plugin-pages-view").hidden = next !== "plugin-pages";
-    $("page-title").textContent = { tasks: "任务状态", sessions: "会话记录", judgments: "判断诊断", goals: "认知目标", memory: "记忆偏好", plugins: "插件管理", "plugin-pages": "插件页面" }[next];
+    $("page-title").textContent = { chat: "直接对话", tasks: "任务状态", sessions: "会话记录", judgments: "判断诊断", goals: "认知目标", memory: "记忆偏好", plugins: "插件管理", "plugin-pages": "插件页面" }[next];
     for (const item of document.querySelectorAll("[data-view]")) {
       const active = item.dataset.view === next;
       item.classList.toggle("active", active);
@@ -1772,6 +1950,7 @@
       else item.removeAttribute("aria-current");
     }
     if (next === "sessions" && sessions.length === 0) void loadSessions();
+    if (next === "chat" && chatAvailable) void loadChat();
     if (next === "judgments") void loadJudgments();
     if (next === "goals") void loadGoals();
     if (next === "memory" && memoryScopes.length === 0) void loadMemoryScopes();
@@ -1795,6 +1974,7 @@
         view === "goals" ? loadGoals() : Promise.resolve(),
         view === "plugins" ? loadPlugins() : Promise.resolve(),
         view === "plugin-pages" ? loadPluginPages() : Promise.resolve(),
+        view === "chat" ? pollChat() : Promise.resolve(),
       ]);
       if (epoch !== requestEpoch) return;
       const failure = results.find((result) => result.status === "rejected");
@@ -1821,7 +2001,7 @@
     clearTimeout(pollTimer);
     pollTimer = null;
     if (!token || document.hidden) return;
-    pollTimer = setTimeout(() => { void refresh(); }, 3000);
+    pollTimer = setTimeout(() => { void refresh(); }, view === "chat" && chatPending ? 1000 : 3000);
   }
 
   $("login-form").addEventListener("submit", async (event) => {
@@ -1850,7 +2030,13 @@
       emptyDetail("memory-detail", "✦", "选择一个作用域", "查看已确认和已撤销的偏好、版本历史，以及每个版本的来源。来源正文需单独打开。");
       emptyDetail("goal-detail", "◈", "选择一个目标", "查看状态、来源记录，以及当前和历史反思草稿。草稿是未验证的建议，不代表目标完成。");
       emptyDetail("plugin-page-detail", "▦", "选择一个插件页面", "在这里修改配置、恢复默认值并查看生效方式。");
-      switchView("tasks");
+      try {
+        const info = await api("/api/chat");
+        chatAvailable = info.role === "owner" && info.user_id === "web:owner";
+      } catch (_) { chatAvailable = false; }
+      if (epoch !== requestEpoch) return;
+      document.querySelector('[data-view="chat"]').disabled = !chatAvailable;
+      switchView(chatAvailable ? "chat" : "tasks");
       void refresh();
     } catch (error) {
       if (epoch === requestEpoch && !error.silent) logout(errorText(error));
