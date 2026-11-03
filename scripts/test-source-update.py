@@ -585,7 +585,9 @@ if __name__ == '__main__':
                 attempts.append(head)
                 raise ValueError('auto_update_command_timeout')
         self.updater.builder_factory = TimeoutBuild
-        self.ticks(lambda:self.updater.status.get('result') == 'deferred')
+        # 发布状态先更新内存再原子落盘；等工作线程收尾，读取已提交的退避记录。
+        self.ticks(lambda:self.updater.status.get('result') == 'deferred'
+                   and self.updater.thread is None)
         first = runtime.read_json(self.fixture.queue/'auto-update.json')['retry']
         self.assertEqual(first['attempts'], 1)
         self.assertEqual(first['head'], head)
@@ -599,7 +601,8 @@ if __name__ == '__main__':
         self.assertEqual(attempts, [head])
         with patch.object(update.time, 'time', return_value=first['next_attempt_at_ms']/1000 + 1):
             self.ticks(lambda:self.updater.status.get('retry', {}).get('attempts') == 2
-                       and self.updater.status.get('result') == 'deferred')
+                       and self.updater.status.get('result') == 'deferred'
+                       and self.updater.thread is None)
         second = runtime.read_json(self.fixture.queue/'auto-update.json')['retry']
         self.assertEqual(attempts, [head, head])
         self.assertGreaterEqual(second['next_attempt_at_ms'] - first['next_attempt_at_ms'], 120000)

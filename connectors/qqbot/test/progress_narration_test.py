@@ -80,20 +80,29 @@ class ProgressNarrationAcceptance(developer.DeveloperAcceptance):
 
     def test_private_ack_does_not_wait_for_a_blocked_progress_model(self):
         self.response_gates[('progress', 1)] = 'release-progress'
-        release_tool = self.gate('release-tool')
-        program = ('import pathlib,time\n'
-                   f'gate=pathlib.Path({str(release_tool)!r})\n'
-                   'deadline=time.monotonic()+25\n'
-                   'while not gate.exists():\n'
-                   ' assert time.monotonic()<deadline,"test tool gate timed out"\n'
-                   ' time.sleep(.01)\n')
+        release_tool = self.source / 'release-tool'
+        tool_started = self.source / 'tool-started'
+        script = self.source / 'wait-for-followup.py'
+        script.write_text('import pathlib,time\n'
+                          "pathlib.Path('tool-started').touch()\n"
+                          "gate=pathlib.Path('release-tool')\n"
+                          'deadline=time.monotonic()+25\n'
+                          'while not gate.exists():\n'
+                          ' assert time.monotonic()<deadline,"test tool gate timed out"\n'
+                          ' time.sleep(.01)\n'
+                          'print("followup acknowledged before tool completion")\n', encoding='utf8')
         def respond(body):
-            if not any(m["role"] == "tool" for m in body["messages"]):
+            # 轮内追问会追加 user 消息；原工具回执仍属于同一轮，不能按最后 user 截断。
+            results = [json.loads(m['content']) for m in body['messages'] if m['role'] == 'tool']
+            if not results:
                 return dialogue.tool_response([('run_command', {'program': sys.executable,
-                    'args': ['-c', program]})])
+                    'args': [script.name]})])
+            self.assertTrue(results[-1].get('success'), results[-1])
+            self.assertIn('followup acknowledged before tool completion', results[-1]['stdout'])
             return dialogue.text_response('原任务已完成')
         self.callback = respond
         self.run_progress([{'send': self.message('running', '执行检查', expected='原任务已完成')},
+                           {'wait_file': str(tool_started)},
                            {'wait_file': str(self.arrived('progress', 1))},
                            {'send': self.message('followup', '人呢', contains='已把这条消息加入原任务')},
                            self.wait_receipt('followup'),
