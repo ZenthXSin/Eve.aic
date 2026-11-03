@@ -79,6 +79,7 @@ jobs:
           python3 scripts/test-web-chat.py
           python3 scripts/test-web-autonomy.py
           python3 connectors/qqbot/test/default_capabilities_test.py
+          python3 connectors/qqbot/test/natural_goal_test.py
           python3 connectors/qqbot/test/eve_e2e.py
           python3 connectors/qqbot/test/message_judge_test.py
           python3 connectors/qqbot/test/live_dialogue_test.py

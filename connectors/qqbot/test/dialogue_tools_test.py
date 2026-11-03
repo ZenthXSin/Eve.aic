@@ -20,6 +20,7 @@ PLATFORM_TOOLS = CONTEXT_TOOLS | SCRIPT_TOOLS | SUBJECT_TOOLS | {"inspect_capabi
 MEMORY_TOOLS = {"search_memory", "save_preference", "note_commitment", "settle_commitment", "experience_memory", "memory_maintenance", "manage_memory_sharing", "manage_conversation_learning"}
 
 ALL_TOOLS = PLATFORM_TOOLS | MEMORY_TOOLS | {"echo", "use_skill", "list_interests", "list_goals",
+             "manage_goal", "manage_plan",
              "list_knowledge", "list_practice", "list_skills", "list_forged_tools",
              "list_plans", "list_outreach", "read_source", "check_practice_draft", "run_practice",
              "manage_skill", "manage_forged_tool", "set_outreach_enabled", "outreach_status"}

@@ -78,6 +78,7 @@ pub(crate) struct Services {
     /// 自主运行预算：余额不够一项工作时不开始。
     pub(crate) gate: qq_budget::Gate,
     pub(crate) learning_progress: bool,
+    pub(crate) authorization: Arc<crate::qq_admin::Admin>,
 }
 
 pub(crate) struct Background {
@@ -282,6 +283,7 @@ async fn run(
         plans,
         gate,
         learning_progress,
+        authorization,
     } = services;
     loop {
         if *active.borrow() {
@@ -334,7 +336,12 @@ async fn run(
                 .snapshot()
                 .map_err(|_| "实践验证无法读取学习目标")?;
             let requested = match &plans {
-                Some(plans) => qq_plan::requested(&plans.snapshot()?, qq_plan::PRACTICE),
+                Some(plans) => qq_plan::authorized_requests(
+                    &plans.snapshot()?,
+                    &snapshot,
+                    qq_plan::PRACTICE,
+                    &authorization,
+                ),
                 None => Vec::new(),
             };
             let mut goals: Vec<(&Goal, Eligible<'_>)> = snapshot
@@ -400,7 +407,8 @@ async fn run(
                     let _admission = eve_pursuit_plugin::progress_admission_guard()
                         .map_err(|error| error.to_string())?;
                     let current = cognition.snapshot().map_err(|error| error.to_string())?;
-                    if current.state.goals.get(&goal.id) != Some(goal)
+                    if !qq_plan::admitted(goal, plans.as_deref(), qq_plan::PRACTICE, &authorization)
+                        || current.state.goals.get(&goal.id) != Some(goal)
                         || (learning_progress
                             && crate::qq_pursuit::learning_goal(goal).is_some()
                             && !eve_pursuit_plugin::progress_admitted(&current.state, &goal.id)

@@ -38,6 +38,10 @@ use std::{
 };
 use tokio::{sync::watch, task::JoinHandle};
 
+#[path = "qq_cognition_tool.rs"]
+mod tool;
+pub(crate) use tool::ManageTool;
+
 pub(crate) const CONTROL_ID: &str = "eve.cognition.control";
 const CONTEXT_ID: &str = "eve.cognition.context";
 const CONTEXT_SERVICE: &str = "eve.cognition.context.service";

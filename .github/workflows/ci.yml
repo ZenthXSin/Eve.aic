@@ -166,6 +166,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -X utf8 connectors/qqbot/test/member_network_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 验证自然待办、计划确认与原状态恢复
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
+        run: |
+          $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
+          python -X utf8 connectors/qqbot/test/natural_goal_test.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证浏览器中的插件配置、冲突、启停与窄屏
         if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' && runner.os == 'Linux' }}
         run: |

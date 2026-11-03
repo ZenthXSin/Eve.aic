@@ -2072,6 +2072,26 @@ async fn run_qqbot_composed(
             legacy,
             registry.clone(),
         )?;
+        let natural_goals = Arc::new(std::sync::OnceLock::new());
+        if options.cognition {
+            bootstrap.tools.push(Arc::new(qq_cognition::ManageTool {
+                commands: natural_goals.clone(),
+                review: crate::qq_natural_goals::Review {
+                    admin: qq_admin.clone(),
+                    reviewer: crate::developer::action_reviewer(registry.clone(), model_health.clone()),
+                },
+            }));
+        }
+        let natural_plans = Arc::new(std::sync::OnceLock::new());
+        if options.plans {
+            bootstrap.tools.push(Arc::new(qq_plan::ManageTool {
+                commands: natural_plans.clone(),
+                review: crate::qq_natural_goals::Review {
+                    admin: qq_admin.clone(),
+                    reviewer: crate::developer::action_reviewer(registry.clone(), model_health.clone()),
+                },
+            }));
+        }
         let business_tool = Arc::new(crate::qq_business::BusinessTool {
             admin: qq_admin.clone(),
             reviewer: crate::developer::action_reviewer(registry.clone(), model_health.clone()),
@@ -2465,6 +2485,7 @@ async fn run_qqbot_composed(
             )
             .await?;
             let commands = started.commands.clone();
+            natural_goals.set(commands.clone()).map_err(|_| "自然待办入口重复绑定")?;
             let _ = dialogue_cognition.set(Arc::new(started.admin()?));
             background = Some(started);
             commands
@@ -2720,6 +2741,7 @@ async fn run_qqbot_composed(
                     .map(|practice| Arc::new(practice) as Arc<dyn PracticeAdmin>),
                 proposer: proposer.clone(),
                 capabilities: capabilities.clone(),
+                authorization: qq_admin.clone(),
             });
             let commands = qq_plan::Commands::enabled(
                 journal.clone(),
@@ -2729,6 +2751,7 @@ async fn run_qqbot_composed(
                 proposer.version().into(),
                 started.requests(),
             );
+            natural_plans.set(commands.clone()).map_err(|_| "自然计划入口重复绑定")?;
             plan_background = Some(started);
             commands
         } else {
@@ -2792,6 +2815,7 @@ async fn run_qqbot_composed(
                 plan_journal.clone(),
                 budget_gate.clone(),
                 options.learning_stop,
+                qq_admin.clone(),
             ));
             qq_research::Commands::enabled(
                 Arc::new(interests.clone()),
@@ -2927,6 +2951,7 @@ async fn run_qqbot_composed(
                 plans: plan_journal.clone(),
                 gate: budget_gate.clone(),
                 learning_progress: options.learning_stop,
+                authorization: qq_admin.clone(),
             }));
             qq_practice::Commands::enabled(Arc::new(interests.clone()), Arc::new(practice.clone()))
         } else {
