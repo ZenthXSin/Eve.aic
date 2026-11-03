@@ -80,16 +80,24 @@ class ProgressNarrationAcceptance(developer.DeveloperAcceptance):
 
     def test_private_ack_does_not_wait_for_a_blocked_progress_model(self):
         self.response_gates[('progress', 1)] = 'release-progress'
+        release_tool = self.gate('release-tool')
+        program = ('import pathlib,time\n'
+                   f'gate=pathlib.Path({str(release_tool)!r})\n'
+                   'deadline=time.monotonic()+25\n'
+                   'while not gate.exists():\n'
+                   ' assert time.monotonic()<deadline,"test tool gate timed out"\n'
+                   ' time.sleep(.01)\n')
         def respond(body):
             if not any(m["role"] == "tool" for m in body["messages"]):
                 return dialogue.tool_response([('run_command', {'program': sys.executable,
-                    'args': ['-c', 'import time; time.sleep(3)']})])
+                    'args': ['-c', program]})])
             return dialogue.text_response('原任务已完成')
         self.callback = respond
         self.run_progress([{'send': self.message('running', '执行检查', expected='原任务已完成')},
                            {'wait_file': str(self.arrived('progress', 1))},
                            {'send': self.message('followup', '人呢', contains='已把这条消息加入原任务')},
                            self.wait_receipt('followup'),
+                           {'touch': str(release_tool)},
                            {'touch': str(self.gate('release-progress'))}, self.wait_receipt('running')],
                           env_extra={'EVE_QQ_LIVE_INTERACTION': 'true'})
         self.assertEqual(self.receipt('followup')['state'], 'Sent')
