@@ -2,7 +2,7 @@
 
 use eve_plugin_api::{PluginError, PluginId, PluginResult, StateStore};
 use serde::{
-    Deserialize, Deserializer, Serialize,
+    Deserialize, Deserializer, Serialize, Serializer,
     de::{self, MapAccess, Visitor},
 };
 use std::collections::BTreeMap;
@@ -11,7 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const VERSION: u32 = 1;
@@ -27,7 +27,59 @@ const REPLACE_RETRY_DELAYS: [Duration; 8] = [
     Duration::from_millis(320),
     Duration::from_millis(640),
 ];
-type Entries = BTreeMap<String, BTreeMap<String, Vec<u8>>>;
+/// 只缓存较大的字节数组编码；单份已提交快照最多增加 32 MiB 常驻编码。
+/// 提交期间旧值与候选值可以同时存在，候选编码也受同一上限约束。
+const MAX_ENCODING_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const MIN_ENCODING_CACHE_VALUE: usize = 4096;
+type Entries = BTreeMap<String, BTreeMap<String, StoredValue>>;
+
+/// 未变的正文和其 JSON 数组编码可跨候选快照共享；线上文件仍是原来的 v1 字节数组。
+#[derive(Clone)]
+struct StoredValue {
+    bytes: Arc<[u8]>,
+    encoded: Option<Arc<serde_json::value::RawValue>>,
+}
+impl StoredValue {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: bytes.into(),
+            encoded: None,
+        }
+    }
+    fn cache_bytes(&self) -> usize {
+        self.encoded.as_ref().map_or(0, |value| value.get().len())
+    }
+    fn cache(&mut self, available: usize) -> PluginResult<usize> {
+        if self.bytes.len() < MIN_ENCODING_CACHE_VALUE {
+            return Ok(0);
+        }
+        // 先计算准确长度，避免为了拒绝过大编码而分配不受预算约束的临时字符串。
+        let length = self.bytes.iter().fold(1usize, |length, byte| {
+            length.saturating_add(2 + usize::from(*byte >= 10) + usize::from(*byte >= 100))
+        });
+        if length > available {
+            return Ok(0);
+        }
+        let encoded = serde_json::value::to_raw_value(self.bytes.as_ref())
+            .map_err(|error| failure("缓存状态编码", error))?;
+        debug_assert_eq!(encoded.get().len(), length);
+        self.encoded = Some(encoded.into());
+        Ok(length)
+    }
+}
+impl Serialize for StoredValue {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.encoded {
+            Some(encoded) => encoded.as_ref().serialize(serializer),
+            None => self.bytes.as_ref().serialize(serializer),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for StoredValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<u8>::deserialize(deserializer).map(Self::new)
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,6 +87,8 @@ struct Snapshot {
     version: u32,
     #[serde(deserialize_with = "unique_entries")]
     entries: Entries,
+    #[serde(skip)]
+    cached_bytes: usize,
 }
 
 impl Default for Snapshot {
@@ -42,7 +96,60 @@ impl Default for Snapshot {
         Self {
             version: VERSION,
             entries: BTreeMap::new(),
+            cached_bytes: 0,
         }
+    }
+}
+
+impl Snapshot {
+    fn warm_cache(&mut self, budget: usize) -> PluginResult<()> {
+        for value in self
+            .entries
+            .values_mut()
+            .flat_map(|values| values.values_mut())
+        {
+            self.cached_bytes += value.cache(budget.saturating_sub(self.cached_bytes))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+
+    #[test]
+    fn cached_arrays_keep_the_exact_v1_encoding_and_bounded_budget() {
+        let bytes: Vec<u8> = (0..=255).cycle().take(8192).collect();
+        let mut value = StoredValue::new(bytes.clone());
+        let expected = serde_json::to_vec(&bytes).unwrap();
+        assert_eq!(value.cache(expected.len() - 1).unwrap(), 0);
+        assert!(value.encoded.is_none());
+        assert_eq!(value.cache(expected.len()).unwrap(), expected.len());
+        assert_eq!(serde_json::to_vec(&value).unwrap(), expected);
+        let shared = value.clone();
+        assert!(Arc::ptr_eq(&shared.bytes, &value.bytes));
+        assert!(Arc::ptr_eq(
+            shared.encoded.as_ref().unwrap(),
+            value.encoded.as_ref().unwrap()
+        ));
+
+        let original = serde_json::json!({"version":1,"entries":{"owner":{"a":bytes,"b":bytes}}});
+        let mut snapshot: Snapshot = serde_json::from_value(original.clone()).unwrap();
+        snapshot.warm_cache(expected.len()).unwrap();
+        assert_eq!(snapshot.cached_bytes, expected.len());
+        assert_eq!(
+            snapshot.entries["owner"]
+                .values()
+                .filter(|v| v.encoded.is_some())
+                .count(),
+            1
+        );
+        assert_eq!(serde_json::to_value(&snapshot).unwrap(), original);
+        assert!(
+            serde_json::from_str::<Snapshot>(r#"{"version":1,"entries":{},"cached_bytes":0}"#)
+                .is_err()
+        );
     }
 }
 
@@ -72,7 +179,7 @@ impl<'de, V: Deserialize<'de>> Deserialize<'de> for UniqueMap<V> {
 }
 
 fn unique_entries<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Entries, D::Error> {
-    let map = UniqueMap::<UniqueMap<Vec<u8>>>::deserialize(deserializer)?;
+    let map = UniqueMap::<UniqueMap<StoredValue>>::deserialize(deserializer)?;
     Ok(map
         .0
         .into_iter()
@@ -152,13 +259,14 @@ impl FileStateStore {
                 Err(error) => Err(failure("打开状态快照", error)),
             }
         })();
-        let snapshot = match snapshot {
+        let mut snapshot = match snapshot {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 drop(lock);
                 return Err(error);
             }
         };
+        snapshot.warm_cache(MAX_ENCODING_CACHE_BYTES)?;
         Ok(Self {
             directory,
             snapshot: Mutex::new(snapshot),
@@ -247,7 +355,7 @@ impl StateStore for FileStateStore {
             .entries
             .get(namespace.as_str())
             .and_then(|values| values.get(key))
-            .cloned())
+            .map(|value| value.bytes.to_vec()))
     }
 
     fn set(&self, namespace: &PluginId, key: String, value: Vec<u8>) -> PluginResult<()> {
@@ -256,6 +364,14 @@ impl StateStore for FileStateStore {
             .lock()
             .map_err(|_| PluginError::State("状态快照锁中毒".into()))?;
         let mut candidate = snapshot.clone();
+        let previous_cache = candidate
+            .entries
+            .get(namespace.as_str())
+            .and_then(|values| values.get(&key))
+            .map_or(0, StoredValue::cache_bytes);
+        candidate.cached_bytes -= previous_cache;
+        let mut value = StoredValue::new(value);
+        candidate.cached_bytes += value.cache(MAX_ENCODING_CACHE_BYTES - candidate.cached_bytes)?;
         candidate
             .entries
             .entry(namespace.as_str().into())

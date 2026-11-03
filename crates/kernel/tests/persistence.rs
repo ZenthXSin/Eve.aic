@@ -275,6 +275,51 @@ fn failed_atomic_replacement_preserves_memory_and_previous_document() {
     );
 }
 
+#[test]
+fn cached_large_values_survive_failed_replacement_and_reopening_in_the_old_format() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.json");
+    let previous = directory.path().join("previous.json");
+    let owner = pid("cached-owner");
+    let bytes: Vec<u8> = (0..=255).cycle().take(64 * 1024).collect();
+    let store = FileStateStore::open(directory.path()).unwrap();
+    store.set(&owner, "正文\\\"".into(), bytes.clone()).unwrap();
+    let original = fs::read(&path).unwrap();
+    fs::rename(&path, &previous).unwrap();
+    fs::create_dir(&path).unwrap();
+    assert!(
+        store
+            .set(&owner, "正文\\\"".into(), vec![200; 128 * 1024])
+            .is_err()
+    );
+    assert!(
+        store
+            .set(&owner, "rejected".into(), vec![99; 16 * 1024])
+            .is_err()
+    );
+    assert_eq!(store.get(&owner, "正文\\\"").unwrap(), Some(bytes.clone()));
+    assert_eq!(store.get(&owner, "rejected").unwrap(), None);
+    assert_eq!(fs::read(&previous).unwrap(), original);
+    fs::remove_dir(&path).unwrap();
+    fs::rename(&previous, &path).unwrap();
+    store.set(&owner, "small".into(), vec![7]).unwrap();
+    drop(store);
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Legacy {
+        version: u32,
+        entries: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<u8>>>,
+    }
+    let legacy: Legacy = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(legacy.version, 1);
+    assert_eq!(legacy.entries["cached-owner"]["正文\\\""], bytes);
+    let reopened = FileStateStore::open(directory.path()).unwrap();
+    reopened.set(&owner, "small".into(), vec![8]).unwrap();
+    assert_eq!(reopened.get(&owner, "正文\\\"").unwrap(), Some(bytes));
+    assert_eq!(reopened.get(&owner, "small").unwrap(), Some(vec![8]));
+}
+
 #[cfg(windows)]
 #[test]
 fn denied_windows_replacement_preserves_the_existing_file_and_memory() {
