@@ -2,6 +2,21 @@
 use super::*;
 use std::collections::BTreeSet;
 
+// Git for Windows 接收普通盘符/UNC 路径；内部身份比较仍保留 canonicalize 的完整路径。
+fn git_path(path: &Path) -> Result<String, ToolExecutionError> {
+    let text = path.to_str().ok_or_else(|| failed("源码路径无效"))?;
+    #[cfg(windows)]
+    {
+        if let Some(path) = text.strip_prefix(r"\\?\UNC\") {
+            return Ok(format!(r"\\{path}"));
+        }
+        if let Some(path) = text.strip_prefix(r"\\?\") {
+            return Ok(path.to_owned());
+        }
+    }
+    Ok(text.to_owned())
+}
+
 pub(super) fn uses_workspace(operation: &DeveloperOperation) -> bool {
     matches!(
         operation,
@@ -30,6 +45,8 @@ async fn git(
             "core.hooksPath=/dev/null",
             "-c",
             "commit.gpgsign=false",
+            "-c",
+            "core.longpaths=true",
         ])
         .args(args)
         .current_dir(root)
@@ -53,6 +70,12 @@ async fn git(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // Git 子进程仍需要系统目录与临时目录；不继承模型/平台凭据或全局 Git 配置。
+    for name in ["SystemRoot", "WINDIR", "TEMP", "TMP", "TMPDIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
     let mut child = command
         .spawn()
         .map_err(|_| failed("会话源码 Git 无法启动"))?;
@@ -144,7 +167,7 @@ impl LocalDeveloper {
             }
             let stage =
                 tempfile::tempdir_in(&parent).map_err(|_| failed("会话源码暂存目录无法创建"))?;
-            let source = self.root.to_str().ok_or_else(|| failed("源码路径无效"))?;
+            let source = git_path(&self.root)?;
             git(
                 stage.path(),
                 &[
@@ -154,7 +177,7 @@ impl LocalDeveloper {
                     "--no-checkout",
                     "--template=",
                     "--",
-                    source,
+                    &source,
                     "source",
                 ],
                 None,
@@ -191,7 +214,7 @@ impl LocalDeveloper {
         plain_directory(&root)?;
         self.import_online_revision(&root).await?;
         let actual = git(&root, &["rev-parse", "--show-toplevel"], None).await?;
-        if Path::new(actual.trim()) != root {
+        if Path::new(actual.trim()).canonicalize().ok().as_deref() != Some(root.as_path()) {
             return Err(failed("会话 Git 根目录已改变"));
         }
         Ok(self.at_root(root))
@@ -230,7 +253,7 @@ impl LocalDeveloper {
                     "fetch",
                     "--no-tags",
                     "--",
-                    self.root.to_str().ok_or_else(|| failed("源码路径无效"))?,
+                    &git_path(&self.root)?,
                     &revision,
                 ],
                 None,
@@ -267,13 +290,7 @@ impl LocalDeveloper {
                 plain_directory(&source)?;
                 git(
                     root,
-                    &[
-                        "fetch",
-                        "--no-tags",
-                        "--",
-                        source.to_str().ok_or_else(|| failed("快照路径无效"))?,
-                        &revision,
-                    ],
+                    &["fetch", "--no-tags", "--", &git_path(&source)?, &revision],
                     None,
                 )
                 .await?;
@@ -391,7 +408,7 @@ impl LocalDeveloper {
                     "--no-checkout",
                     "--template=",
                     "--",
-                    self.root.to_str().ok_or_else(|| failed("源码路径无效"))?,
+                    &git_path(&self.root)?,
                     "source",
                 ],
                 None,

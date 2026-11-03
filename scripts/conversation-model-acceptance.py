@@ -25,8 +25,12 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model-config", type=Path)
-    parser.add_argument("--reasoning-effort", default="low", choices=["none", "low", "medium", "high"])
+    parser.add_argument("--model", help="覆盖测试模型名称，保留配置中的端点和凭据")
+    parser.add_argument("--reasoning-effort", default="medium", choices=["none", "low", "medium", "high"])
+    parser.add_argument("--min-cache-hit-rate", type=float, default=.85)
     args = parser.parse_args()
+    if not 0 <= args.min_cache_hit_rate <= 1:
+        parser.error("--min-cache-hit-rate 必须在 0 到 1 之间")
     binary = args.binary.resolve()
     environment = {k: os.environ[k] for k in ("PATH", "SystemRoot", "TEMP", "TMP") if k in os.environ}
     environment.update({k: v for k, v in os.environ.items() if k.startswith("EVE_OPENAI_")})
@@ -34,6 +38,8 @@ def main():
         model = json.loads(args.model_config.read_text())["model"]
         environment.update(EVE_OPENAI_API_KEY=model["api_key"], EVE_OPENAI_BASE_URL=model["base_url"],
                            EVE_OPENAI_MODEL=model["name"], EVE_OPENAI_PROTOCOL=model["protocol"])
+    if args.model:
+        environment["EVE_OPENAI_MODEL"] = args.model
     if not environment.get("EVE_OPENAI_API_KEY"):
         raise SystemExit("缺少实际模型凭据")
     work = Path(tempfile.mkdtemp(prefix="eve-conversation-model-"))
@@ -55,6 +61,22 @@ def main():
     run = 0
 
     def save():
+        # 每个进程/用途只计最后的累计值；重启、冷启动和旁观分析均保留在分母中。
+        latest = {(sample["host_run"], role["role"]): role.get("cache") or {}
+                  for sample in report["model_metrics"] for role in sample["roles"]}
+        total = sum(cache.get("input_tokens", 0) for cache in latest.values())
+        cached = sum(cache.get("cached_tokens", 0) for cache in latest.values())
+        reported = sum(cache.get("reported_requests", 0) for cache in latest.values())
+        unreported = sum(cache.get("unreported_requests", 0) for cache in latest.values())
+        ratio = cached / total if total else None
+        report["cache_acceptance"] = {
+            "target": args.min_cache_hit_rate, "metric": "provider cached_tokens / input_tokens",
+            "input_tokens_with_cache_usage": total, "cached_tokens": cached,
+            "reported_requests": reported, "unreported_requests": unreported, "ratio": ratio,
+            "status": "unverifiable" if unreported or not total else
+                      "passed" if ratio >= args.min_cache_hit_rate else "below_target",
+            "local_prefix_is_not_provider_cache": True,
+        }
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf8")
 
@@ -160,7 +182,7 @@ def main():
         stop()
         report["lessons"] = lessons()
         save()
-    if report["errors"]:
+    if report["errors"] or report["cache_acceptance"]["status"] != "passed":
         raise SystemExit(1)
 
 

@@ -111,7 +111,7 @@ jobs:
       - name: 检查 Clippy 警告
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: 运行测试与文档测试
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
       - name: 验证预编译目标的参数与失败传播
         run: python -X utf8 scripts/test-run-prebuilt.py
       - name: 统一编译进程验收入口和示例

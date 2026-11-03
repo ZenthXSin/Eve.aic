@@ -71,7 +71,14 @@ fn observation_capabilities_match_the_backend_root_and_command_switch() {
             .observation_capabilities()
             .unwrap()
             .session_workspaces,
-        Some(ledger.path().join("commands/workspaces"))
+        Some(
+            ledger
+                .path()
+                .join("commands")
+                .canonicalize()
+                .unwrap()
+                .join("workspaces")
+        )
     );
 }
 
@@ -1327,6 +1334,7 @@ async fn live_upgrade_is_authorized_bound_to_turn_and_idempotently_queued_withou
         "eve-qqbot"
     });
     fs::write(&binary, b"fixture").unwrap();
+    let binary = binary.canonicalize().unwrap();
     for name in resources.keys() {
         let path = candidate.join("resources").join(name);
         fs::create_dir_all(path.parent().unwrap()).unwrap();

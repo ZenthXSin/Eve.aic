@@ -174,9 +174,38 @@ REAL_MODEL = os.environ.get("EVE_MEMORY_EVAL_MODEL")
 
 
 def cached_tokens(usage):
-    """服务商报告的命中缓存的输入 token；OpenAI 与兼容实现的两种常见字段。"""
-    details = usage.get("prompt_tokens_details") or {}
-    return details.get("cached_tokens") or usage.get("prompt_cache_hit_tokens") or 0
+    """缺失与真实零命中分别保留，不能用零或本地估算补齐服务商用量。"""
+    for value in ((usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+                  (usage.get("input_tokens_details") or {}).get("cached_tokens"),
+                  usage.get("prompt_cache_hit_tokens")):
+        if type(value) is int and value >= 0:
+            return value
+    return None
+
+
+def cache_ratio(calls):
+    total = hit = 0
+    for call in calls:
+        usage = call["usage"]
+        prompt = usage.get("prompt_tokens", usage.get("input_tokens"))
+        cached = cached_tokens(usage)
+        if type(prompt) is not int or prompt < 0 or cached is None or cached > prompt:
+            return None
+        total += prompt
+        hit += cached
+    return hit / total if total else None
+
+
+class CacheUsageEvaluation(unittest.TestCase):
+    def test_weighted_usage_keeps_missing_distinct_from_zero(self):
+        zero = {"usage": {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 0}}}
+        hit = {"usage": {"input_tokens": 900, "input_tokens_details": {"cached_tokens": 900}}}
+        self.assertEqual(cache_ratio([zero]), 0)
+        self.assertEqual(cache_ratio([zero, hit]), .9)
+        self.assertLess(cache_ratio([{"usage": {"prompt_tokens": 100000, "prompt_cache_hit_tokens": 84999}}]), .85)
+        self.assertIsNone(cache_ratio([hit, {"usage": {"prompt_tokens": 100}}]))
+        self.assertIsNone(cache_ratio([]))
+        self.assertIsNone(cache_ratio([{"usage": {"prompt_tokens": 100, "prompt_cache_hit_tokens": 101}}]))
 
 
 @unittest.skipUnless(REAL_BASE and REAL_KEY and REAL_MODEL,
@@ -246,16 +275,14 @@ class RealModelEvaluation(people_test.PeopleAcceptance):
                       *say("other", "群里有人在学什么吗？", user="user-2", target="group-3"),
                       *[s for i, t in enumerate(steady) for s in say(f"s{i}", t)]],
                      checkpoints={"learned": learned}, timeout=900,
-                     env_extra={"EVE_OPENAI_MODEL": REAL_MODEL})
+                     env_extra={"EVE_OPENAI_MODEL": REAL_MODEL,
+                                "EVE_OPENAI_REASONING_EFFORT": os.environ.get("EVE_MEMORY_EVAL_REASONING_EFFORT", "medium")})
         replies = self.replies()
         people = json.dumps(self.people_state(), ensure_ascii=False)
         commitments = commitment_test.CommitmentAcceptance.ledger(self)["commitments"]
         chat = [c for c in self.calls if c["kind"] == "chat"]
         steady_calls = [c for c in chat if c["text"] in steady and not c["after_tool"]]
 
-        def ratio(calls):
-            prompt = sum(c["usage"].get("prompt_tokens", 0) for c in calls)
-            return round(sum(cached_tokens(c["usage"]) for c in calls) / prompt, 4) if prompt else None
         report = {
             "model": REAL_MODEL,
             "commitment_tool_used": any("地图" in c["text"] for c in commitments),
@@ -265,8 +292,11 @@ class RealModelEvaluation(people_test.PeopleAcceptance):
             "recalls_learning_in_other_group": "rust" in replies.get("recall", "").lower(),
             "recalls_promise_in_other_group": "地图" in replies.get("promised", ""),
             "no_leak_to_other_person": "rust" not in replies.get("other", "").lower(),
-            "cache_hit_ratio": {"steady_chat": ratio(steady_calls), "all_chat": ratio(chat),
-                                "all_requests": ratio(self.calls)},
+            "cache_hit_ratio": {"steady_chat": cache_ratio(steady_calls), "all_chat": cache_ratio(chat),
+                                "all_requests": cache_ratio(self.calls)},
+            "cache_target": .85,
+            "cache_acceptance": "unverifiable" if cache_ratio(self.calls) is None else
+                                "passed" if cache_ratio(self.calls) >= .85 else "below_target",
             "requests": {"chat": len(chat), "total": len(self.calls),
                          "mean_seconds": round(statistics.mean(c["seconds"] for c in self.calls), 2)},
             "replies": {k: replies.get(k, "") for k in ("recall", "promised", "other")},
@@ -276,8 +306,9 @@ class RealModelEvaluation(people_test.PeopleAcceptance):
         if os.environ.get("EVE_MEMORY_EVAL_REPORT"):
             with open(os.environ["EVE_MEMORY_EVAL_REPORT"], "w", encoding="utf8") as f:
                 json.dump(report, f, ensure_ascii=False, indent=2)
-        # 只有隐私边界是硬性要求；其余是模型表现，按报告比较。
+        # 模型表达质量保留原回复供评估；缓存须有真实用量且达到目标。
         self.assertTrue(report["no_leak_to_other_person"], report["replies"]["other"])
+        self.assertEqual(report["cache_acceptance"], "passed", report["cache_hit_ratio"])
 
 
 if __name__ == "__main__":
