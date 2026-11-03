@@ -30,7 +30,7 @@ WELCOME = "欢迎回来。"
 CHAT = "在吗"
 HERE = "在的。"
 REMINDERS = '{"kind":"eve.reminders"'
-TOOLS = PLATFORM_TOOLS | {"echo", "set_reminder", "cancel_reminder"}
+TOOLS = PLATFORM_TOOLS | {"echo", "manage_conversation_learning", "set_reminder", "cancel_reminder"}
 MINUTE = 60_000
 
 
@@ -321,7 +321,7 @@ class ReminderAcceptance(unittest.TestCase):
 
     def test_reminders_are_off_by_default_and_the_offset_requires_them(self):
         def respond(body):
-            self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo"})
+            self.assertEqual(self.definitions(body), PLATFORM_TOOLS | {"echo", "manage_conversation_learning"})
             self.assertIsNone(self.context(body))
             return text_response("我现在还不能设提醒。")
         self.callback = respond

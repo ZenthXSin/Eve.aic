@@ -137,12 +137,10 @@ class ToolProgressAcceptance(progress.ProgressNarrationAcceptance):
         self.response_gates[('chat', 2)] = 'never-release'
         self.callback = lambda body: dialogue.text_response('新任务完成') if self.results(body) else self.calls(1)
         old = self.message('retired', '旧任务等待') | {'expected_type':'finish'}
-        self.run_eve([*self.send(self.message('bind-progress', '/bind progress-acceptance-key', contains='管理员')),
-                      {'send':old}, {'wait_command':{'id':'retired','type':'progress'}},
+        self.run_eve([{'send':old}, {'wait_command':{'id':'retired','type':'progress'}},
                       {'wait_file':str(self.arrived('chat', 2))},
                       *self.send(self.message('replace', '/new 新任务', expected='新任务完成')),
-                      {'wait_command':{'id':'retired','type':'finish'}}],
-                     env_extra={'EVE_ADMIN_BIND_KEY': 'progress-acceptance-key'})
+                      {'wait_command':{'id':'retired','type':'finish'}}])
         self.assertEqual(len(self.progress('retired')), 1)
         self.assertLessEqual(len(self.progress('replace')), 1)
         self.assertEqual(self.receipt('retired')['state'], 'Failed')

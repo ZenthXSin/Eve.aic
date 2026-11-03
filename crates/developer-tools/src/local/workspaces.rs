@@ -400,7 +400,7 @@ impl LocalDeveloper {
             let root = stage.path().join("source");
             git(&root, &["checkout", "--detach", head.trim(), "--"], None).await?;
             let backend = self.at_root(root.clone());
-            for (relative, bytes, executable) in &files {
+            for (relative, bytes, _executable) in &files {
                 let path = backend.path(relative, true)?;
                 match bytes {
                     Some(bytes) => {
@@ -414,7 +414,7 @@ impl LocalDeveloper {
                             use std::os::unix::fs::PermissionsExt;
                             fs::set_permissions(
                                 &path,
-                                fs::Permissions::from_mode(if *executable { 0o755 } else { 0o644 }),
+                                fs::Permissions::from_mode(if *_executable { 0o755 } else { 0o644 }),
                             )
                             .map_err(|_| failed("候选源码权限无法保存"))?;
                         }
