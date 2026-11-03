@@ -53,7 +53,8 @@ class WebGoalAcceptance(autonomy.WebAutonomyAcceptance):
     def prepare_corpus(self):
         corpus = self.source / "vendor/eve-portable-knowledge"
         corpus.mkdir(parents=True)
-        (corpus / "observations.md").write_text(CORPUS_TEXT, encoding="utf8")
+        # 清单绑定实际 UTF-8 字节；Windows 文本模式不能把 LF 改成 CRLF。
+        (corpus / "observations.md").write_bytes(CORPUS_TEXT.encode("utf8"))
         manifest = {"format_version": 1, "corpus": "web-fixture", "upstream": "https://example.test/web-fixture",
             "commit": "a" * 40, "license": "CC0", "files": [{"path": "observations.md",
             "sha256": hashlib.sha256(CORPUS_TEXT.encode()).hexdigest(), "bytes": len(CORPUS_TEXT.encode())}]}
@@ -134,6 +135,8 @@ class WebGoalAcceptance(autonomy.WebAutonomyAcceptance):
         self.send_and_finish(stale, 8)
         gid = observed["updated"]["goal"]["id"]
         self.wait_saved(lambda: any(goal["source"]["reference"] == gid and goal["status"] == "Completed"
+            and json.loads(goal["description"].splitlines()[-1])["unverified_waiting_input"]["parent_revision"]
+                == observed["updated"]["goal"]["revision"]
             for goal in self.goals() if goal["source"]["kind"] == "Inference"), "当前待办没有完成无工具反思")
         self.assertEqual(self.user_goals(), [observed["updated"]["goal"]])
         self.assertEqual(len(reviews), 2)
