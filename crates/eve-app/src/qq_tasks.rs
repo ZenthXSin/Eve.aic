@@ -202,6 +202,8 @@ pub(crate) struct WorkerRun {
 }
 
 struct WorkerRequest {
+    idle_review: bool,
+    idle_input: Option<String>,
     instructions: String,
     scope: Option<ContextScope>,
     steps: u32,
@@ -258,6 +260,8 @@ fn retryable_model_failure(error: &LlmError) -> bool {
 
 /// 执行器：独立的模型宿主，可用对话工具中除编排工具以外的全部。
 pub(crate) struct Worker {
+    settings: Arc<dyn ConfigService>,
+    resolver: Arc<dyn LlmModelResolver>,
     host: LlmHost,
     leaf_host: LlmHost,
     pub(crate) leaf_tool_names: Vec<String>,
@@ -329,9 +333,8 @@ impl Worker {
         resolver: Arc<dyn LlmModelResolver>,
         digests: Arc<dyn eve_llm_api::HistoryDigests>,
     ) -> Result<Arc<Self>, AppError> {
-        let history = Arc::new(crate::history::ConfiguredHistory(config_service(
-            registry.as_ref(),
-        )?));
+        let settings = config_service(registry.as_ref())?;
+        let history = Arc::new(crate::history::ConfiguredHistory(settings.clone()));
         kernel.register(Box::new(ContextPlugin(PluginManifest::new(
             CONTEXT_ID,
             env!("CARGO_PKG_VERSION"),
@@ -382,7 +385,7 @@ impl Worker {
             bindings,
             host_config,
         )?
-        .with_model_resolver(resolver)
+        .with_model_resolver(resolver.clone())
         .with_history_resolver(history)
         .with_history_digests(digests);
         let leaf_tool_names = std::iter::once("echo".to_owned())
@@ -397,6 +400,8 @@ impl Worker {
             .with_tool_subset(&leaf_tool_names, LEAF_RULES)
             .with_independent_tool_slots();
         Ok(Arc::new(Self {
+            settings,
+            resolver,
             leaf_host,
             leaf_tool_names,
             host,
@@ -413,6 +418,8 @@ impl Worker {
 
     async fn run_request(&self, request: WorkerRequest) -> WorkerRun {
         let WorkerRequest {
+            idle_review,
+            idle_input,
             instructions,
             scope,
             steps,
@@ -466,6 +473,11 @@ impl Worker {
         } else {
             source.clone()
         };
+        let source = if idle_review {
+            source.with_tool_subset(&[], crate::idle_loop::RULES)
+        } else {
+            source
+        };
         let host = match source.with_tool_call_limit(steps as usize) {
             Ok(host) => host,
             Err(_) => {
@@ -500,6 +512,26 @@ impl Worker {
             host
         };
         let sink = StopSignal(stop.clone());
+        let original_idle_input = idle_input;
+        let host = if idle_review {
+            let Some(input) = original_idle_input.clone() else {
+                return WorkerRun {
+                    end: TaskEnd::Failed {
+                        reason: "空闲回顾缺少可信冻结经历；未请求模型".into(),
+                    },
+                    usage: TaskUsage::default(),
+                    retryable: false,
+                };
+            };
+            host.with_model_resolver(Arc::new(crate::idle_small::Resolver {
+                inner: self.resolver.clone(),
+                settings: self.settings.clone(),
+                input,
+                steps: steps_pool.clone(),
+            }))
+        } else {
+            host
+        };
         let run = host.run_scoped_turn_with_events(TurnInput { text: instructions }, scope, &sink);
         let outcome = if let Some(timeout) = timeout {
             tokio::time::timeout(timeout, run).await.map_err(|_| ())
@@ -512,7 +544,13 @@ impl Worker {
                 diagnostics,
                 transcript,
             })) => WorkerRun {
-                end: if text.trim().is_empty() {
+                end: if idle_review
+                    && original_idle_input
+                        .as_deref()
+                        .is_none_or(|input| crate::idle_loop::decode(input, &text).is_err())
+                {
+                    TaskEnd::Failed { reason: "空闲回顾结构、来源或判断修订检查失败；原模型结果保留在执行检查点，未派发行动".into() }
+                } else if text.trim().is_empty() {
                     TaskEnd::Failed {
                         reason: "执行器没有给出结果".into(),
                     }
@@ -1302,6 +1340,8 @@ impl Tool for SubagentTool {
                 return Err(failed("等待并发槽已耗尽子代理期限；未启动模型"));
             }
             let running = worker.run_request(WorkerRequest {
+                idle_review: false,
+                idle_input: None,
                 instructions,
                 scope: Some(scope),
                 steps,
@@ -1700,7 +1740,7 @@ async fn run(
                 }
                 let admission_ticket = if let Some(admission) = late.admission.get() {
                     let key = SessionKey::new(task.owner.session_id.clone(), task.owner.user_id.clone())?;
-                    let priority = if task.source.starts_with("subject-focus:") { eve_subject_api::EventPriority::Autonomy } else if task.status == TaskStatus::Running { eve_subject_api::EventPriority::Recovery } else { eve_subject_api::EventPriority::User };
+                    let priority = if task.source.starts_with("subject-focus:") || task.source.starts_with(eve_task_api::IDLE_TASK_SOURCE_PREFIX) { eve_subject_api::EventPriority::Autonomy } else if task.status == TaskStatus::Running { eve_subject_api::EventPriority::Recovery } else { eve_subject_api::EventPriority::User };
                     let source = format!("task:{}:{}", task.id, task.recoveries);
                     match admission.begin_work(&key, &source, priority, match priority { eve_subject_api::EventPriority::User => eve_subject_api::EventSource::UserIngress, eve_subject_api::EventPriority::Autonomy => eve_subject_api::EventSource::AutonomyScheduler, _ => eve_subject_api::EventSource::RecoverySupervisor })? {
                         Some(ticket) => Some((admission.clone(), ticket)),
@@ -1780,12 +1820,16 @@ async fn run(
                             deadline_at_ms,
                         }) as Arc<dyn eve_llm_api::TurnJournal>
                     });
+                let idle_review = started.source.starts_with(eve_task_api::IDLE_TASK_SOURCE_PREFIX);
+                let idle_input = if idle_review { crate::idle_loop::task_input(&started).ok() } else { None };
                 let id = started.id.clone();
                 joins.spawn(async move {
                     let run = match text {
                         Ok(text) => {
                             worker
                                 .run_request(WorkerRequest {
+                                    idle_review,
+                                    idle_input,
                                     instructions: text,
                                     scope: Some(scope),
                                     steps,

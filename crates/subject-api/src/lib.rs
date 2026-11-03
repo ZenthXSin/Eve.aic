@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 mod opportunity;
 pub use opportunity::OpportunityAssessment;
+mod idle;
+pub use idle::*;
 
 pub const SUBJECT_PLUGIN_ID: &str = "eve.subject";
 pub const SUBJECT_STATE_KEY: &str = "subject.v1";
