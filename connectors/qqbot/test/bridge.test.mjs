@@ -49,6 +49,33 @@ async function within(promise) {
 }
 const line = frame => JSON.stringify({ version: 1, ...frame }) + "\n";
 
+test("主动分段只等待尚未满足的间隔，慢发送不会叠加完整停顿", async () => {
+  let clock = 0;
+  const starts = [], pauses = [], deadlines = new Set();
+  const durations = [450, 1300, 0];
+  const timers = {
+    setTimeout(callback, milliseconds) {
+      if (milliseconds <= 2500) {
+        pauses.push(milliseconds);
+        queueMicrotask(() => { clock += milliseconds; callback(); });
+      } else deadlines.add(callback);
+      return callback;
+    },
+    clearTimeout(callback) { deadlines.delete(callback); },
+  };
+  const f = fixture({now: () => clock, timers, hold() {
+    starts.push(clock);
+    clock += durations[starts.length - 1];
+  }});
+  await within(f.bridge.command({version:1,type:"push",id:"elapsed-push",target_id:"user-1",
+    text:"先说一件事。再补充一句。最后一句。",
+    parts:[["先说一件事。",0],["再补充一句。",1200],["最后一句。",800]]}));
+  assert.deepEqual(starts, [0, 1200, 2500]);
+  assert.deepEqual(pauses, [750]);
+  assert.equal(f.frames.at(-1).ok, true);
+  assert.equal(deadlines.size, 0);
+});
+
 test("进度 SDK 超时保留未知，最终回复仍可发送，迟到成功不会改写结果", async () => {
   const held=deferred();
   const timeouts=new Set();

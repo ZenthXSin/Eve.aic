@@ -227,7 +227,7 @@ class SegmentAcceptance(unittest.TestCase):
         self.assertEqual([(event["index"], event["count"], event["text"]) for event in segments],
                          [(index, 3, part) for index, part in enumerate(PARTS)])
         self.assertFalse(self.sent("reply"))
-        # 停顿从上一段回执开始计时：400 ms 基础值加每字 25 ms，上限 2.5 秒。
+        # 段间最小间隔：400 ms 基础值加每字 25 ms，上限 2.5 秒；回执耗时计入。
         for index in (1, 2):
             pause = min(2500, 400 + 25 * len(PARTS[index]))
             self.assertGreaterEqual(segments[index]["at"] - segments[index - 1]["at"], pause - 50)
@@ -259,6 +259,21 @@ class SegmentAcceptance(unittest.TestCase):
         receipt = self.receipt("chat")
         self.assertEqual((receipt["reply"], receipt["segments"]["planner"]), (text, "chat-v1"))
         self.assertEqual(self.interactions()[0]["source"]["assistant_text"], text)
+
+    def test_slow_segment_receipt_already_satisfies_typing_pause(self):
+        parts = ['第一段已经写出。', '这段稍长的文字需要打字停顿，但等待上一段平台回执的时间已经足够长。']
+        text = ''.join(parts)
+        first = self.message('elapsed-pause', text=text, segments=parts, hold_segments=[0])
+        # 真实桥接收到首段之后延后回执，第二段仍须等确认；确认后不能再加完整 2.5 秒。
+        self.run_eve([{'send': first}, self.wait_segment(first['id'], 1), {'delay_ms': 3500},
+                      {'deliver_segment': {'id': first['id'], 'index': 0}},
+                      self.wait_receipt(first['id'], 'Sent')], sentence_split=True)
+        segments = self.sent('segment')
+        gap = segments[1]['at'] - segments[0]['at']
+        self.assertGreaterEqual(gap, 3450, '回执之前写出了后续片段')
+        self.assertLess(gap, 5500, '平台等待后又增加了完整打字停顿')
+        self.assertEqual(self.part_states(first['id']), ['Sent', 'Sent'])
+        self.assertEqual(self.receipt(first['id'])['reply'], text)
 
     def test_two_short_complete_sentences_are_delivered_separately_and_not_replayed(self):
         parts = ["嗯，那就好。", "歇会儿吧。"]
