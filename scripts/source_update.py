@@ -178,7 +178,8 @@ class GitBuilder:
 
     def git(self, args, cwd, log):
         try:
-            self.command(['git', '-c', 'credential.helper=', '-c', 'core.hooksPath=/dev/null', *args], cwd, log, 120)
+            self.command(['git', '-c', 'credential.helper=', '-c', 'core.hooksPath=/dev/null',
+                          '-c', 'core.autocrlf=false', '-c', 'core.eol=lf', *args], cwd, log, 120)
         except ValueError as error:
             if args[:1] == ['fetch'] and str(error) == 'auto_update_check_failed':
                 raise ValueError('auto_update_fetch_failed') from None

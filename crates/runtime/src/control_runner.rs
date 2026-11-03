@@ -79,7 +79,7 @@ impl ControlRunner for SessionControlRunner {
                 Err(SessionRunError::Turn(failure)) => {
                     report.commit = CommitState::Failed;
                     report.failure = Some(RunFailure::Execution(failure.error));
-                    diagnostics(&mut report, failure.diagnostics);
+                    diagnostics(&mut report, *failure.diagnostics);
                 }
                 Err(SessionRunError::Commit { error, output }) => {
                     report.commit = CommitState::Pending;
@@ -102,7 +102,7 @@ impl ControlRunner for SessionControlRunner {
                         storage: error,
                         execution: failure.error,
                     });
-                    diagnostics(&mut report, failure.diagnostics);
+                    diagnostics(&mut report, *failure.diagnostics);
                 }
             }
             report

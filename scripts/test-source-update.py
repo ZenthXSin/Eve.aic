@@ -188,6 +188,17 @@ print('fixture check passed')
         self.assertEqual(self.fixture.events.read_text().splitlines(), ['old', 'new'])
         self.assertEqual(runtime.read_json(self.fixture.queue / 'supervisor.json')['active_sha256'], supervisor.status['active_sha256'])
 
+    def test_global_autocrlf_cannot_change_verified_candidate_resource_bytes(self):
+        config = self.root / 'global-git-config'
+        config.write_text('[core]\n\tautocrlf = true\n\teol = crlf\n')
+        with patch.dict(os.environ, {'GIT_CONFIG_GLOBAL': str(config)}):
+            prepared = self.prepare()
+        _, resources, manifest = runtime.validate_candidate(prepared['request'], self.fixture.candidates)
+        for path in manifest['resources']:
+            expected = subprocess.run(['git', 'show', self.head + ':' + path], cwd=self.remote,
+                                      check=True, capture_output=True).stdout
+            self.assertEqual((resources / path).read_bytes(), expected)
+
     def test_auto_request_directory_alias_still_uses_the_host_idle_gate(self):
         # Windows TEMP 可能是 8.3 短名，监督器 resolve 后为长名；用 .. 在所有平台重现目录别名。
         self.updater.control = self.fixture.queue / '..' / self.fixture.queue.name

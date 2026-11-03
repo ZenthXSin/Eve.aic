@@ -622,7 +622,9 @@ class Acceptance(unittest.TestCase):
         self.assertEqual(failure, {"code": "Cancelled", "started_tools": tools})
         if evidence is not None:
             self.assertIsNone(evidence["provider_http_status"])
-            self.assertEqual(set(evidence), {"provider_http_status", "tool_names", "tool_results"})
+            self.assertEqual(set(evidence), {"provider_http_status", "tool_names", "tool_results", "review_user_messages"})
+            self.assertIsInstance(evidence["review_user_messages"], list)
+            self.assertLessEqual(len(evidence["review_user_messages"]), 6)
 
     def test_explicit_cancel_inflight_filters_old_reply_and_restart_does_not_replay(self):
         self.provider_steps[1] = {"wait": "never-release-old", "text": "old-result"}

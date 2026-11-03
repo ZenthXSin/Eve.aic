@@ -17,11 +17,12 @@ SUBJECT_TOOLS = {"manage_subject_focus", "configure_subject_autonomy"}
 PLATFORM_TOOLS = CONTEXT_TOOLS | SCRIPT_TOOLS | SUBJECT_TOOLS | {"inspect_capabilities", "manage_business_permissions", "inspect_model_runtime", "set_reasoning_effort", "set_group_whitelist", "send_file", "query_file_delivery", "read_attachment", "describe_image", "read_raw_message", "read_context_record", "acquire_condition", "read_source"}
 
 # 开启交互记忆时注册的工具：记忆检索、保存偏好与约定。
-MEMORY_TOOLS = {"search_memory", "save_preference", "note_commitment", "settle_commitment", "experience_memory", "memory_maintenance", "manage_memory_sharing"}
+MEMORY_TOOLS = {"search_memory", "save_preference", "note_commitment", "settle_commitment", "experience_memory", "memory_maintenance", "manage_memory_sharing", "manage_conversation_learning"}
 
 ALL_TOOLS = PLATFORM_TOOLS | MEMORY_TOOLS | {"echo", "use_skill", "list_interests", "list_goals",
              "list_knowledge", "list_practice", "list_skills", "list_forged_tools",
-             "list_plans", "list_outreach", "read_source", "check_practice_draft", "run_practice"}
+             "list_plans", "list_outreach", "read_source", "check_practice_draft", "run_practice",
+             "manage_skill", "manage_forged_tool", "set_outreach_enabled", "outreach_status"}
 
 
 def tool_response(calls):

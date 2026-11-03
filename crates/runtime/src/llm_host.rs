@@ -239,7 +239,7 @@ pub struct TurnOutput {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TurnFailure {
     pub error: LlmError,
-    pub diagnostics: TurnDiagnostics,
+    pub diagnostics: Box<TurnDiagnostics>,
 }
 
 struct PreparedTool {
@@ -2434,7 +2434,10 @@ fn backend(error: PluginError) -> LlmError {
 
 fn fail(error: LlmError, mut diagnostics: TurnDiagnostics) -> TurnFailure {
     diagnostics.stage = TurnStage::Failed;
-    TurnFailure { error, diagnostics }
+    TurnFailure {
+        error,
+        diagnostics: Box::new(diagnostics),
+    }
 }
 
 fn review_originals(history: &[ChatMessage], input: &str, delegated: bool) -> Vec<String> {

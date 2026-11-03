@@ -18,6 +18,8 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
 
     def setUp(self):
         super().setUp()
+        self.review_reply = lambda request: {"risk":"medium", "authorization":"high",
+            "outcome":"allow", "rationale":"合成场景授权在临时目录执行完整测试命令"}
         self.source = self.work / "source"
         self.source.mkdir()
         (self.source / "README.md").write_text("真实源码测试", encoding="utf8")
@@ -67,7 +69,7 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
                             "name": "run_command", "arguments": json.dumps({"program": "rm", "args": ["-r", target]})}}]}}]}
             outcome = json.dumps(results[-1], ensure_ascii=False)
             return text_response("已删除" if results[-1].get("success") else
-                                 "没有删除，行动审查未放行" if "行动审查未放行" in outcome else "失败：" + outcome)
+                                 "没有删除，行动审查未放行" if "行动审核未放行" in outcome else "失败：" + outcome)
         self.callback = respond
         self.enabled([*self.send(self.message("rm-a", "old-a 目录不要了，帮我删掉", expected="已删除")),
                       *self.send(self.message("rm-b", "old-b 里有什么", expected="没有删除，行动审查未放行"))])
@@ -246,7 +248,7 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
             self.assertNotIn('真实源码测试', json.dumps(read, ensure_ascii=False))
             # shell 重定向须先审核；文件存在不能证明隔离可用，也不能绕过审核执行。
             self.assertIn('error', command)
-            self.assertIn('行动审查未放行', json.dumps(command, ensure_ascii=False))
+            self.assertIn('行动审核未放行', json.dumps(command, ensure_ascii=False))
             self.assertNotIn('success', command)
             self.assertIn('授权',json.dumps(github,ensure_ascii=False))
             return text_response("未执行越权操作")
@@ -288,7 +290,7 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
             results = self.results(body)
             self.assertIn("仅限主人", json.dumps(results[0], ensure_ascii=False))
             self.assertIn("参数", json.dumps(results[1], ensure_ascii=False))
-            self.assertIn("不是 Eve 源码仓库", json.dumps(results[2], ensure_ascii=False))
+            self.assertIn("宿主没有启用实时升级监督器", json.dumps(results[2], ensure_ascii=False))
             return text_response("升级尚未准备，运行版本未变化")
         self.callback = respond
         self.enabled(self.send(self.message("invalid", "核对升级", expected="升级尚未准备，运行版本未变化")))
@@ -298,22 +300,29 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         queue = self.work / "upgrade-queue"
         queue.mkdir()
         storage = self.work / "live-developer"
-        source={'head':'0'*40,'diff':'0'*64,'untracked':'0'*64}
+        empty_sha=hashlib.sha256(b'').hexdigest()
+        source={'head':'2'*40,'diff':empty_sha,'untracked':empty_sha}
+        source_diff={'path':'source-diff.patch','sha256':empty_sha,
+                     'base_revision':'1'*40,'target_revision':source['head']}
+        runtime_contract={'host_protocol':1,'scripts':['scripts/build_resources.py',
+            'scripts/self_upgrade_runtime.py','scripts/source_update.py']}
         names=['AGENT.md','connectors/qqbot/bridge.mjs','connectors/qqbot/bridge-core.mjs',
-            'connectors/qqbot/package.json','connectors/qqbot/package-lock.json']
+            'connectors/qqbot/package.json','connectors/qqbot/package-lock.json',*runtime_contract['scripts']]
         binary=b'synthetic-verified-artifact'
         binary_sha=hashlib.sha256(binary).hexdigest()
         resources={name:hashlib.sha256(binary).hexdigest() for name in names}
-        identity={'source':source,'binary_sha256':binary_sha,'resources':resources}
+        identity={'source':source,'binary_sha256':binary_sha,'resources':resources,
+                  'source_diff':source_diff,'runtime':runtime_contract}
         candidate_id=hashlib.sha256(json.dumps(identity,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()
         candidate = storage / "candidates" / candidate_id
         candidate.mkdir(parents=True)
+        (candidate/'source-diff.patch').write_bytes(b'')
         target=candidate/('eve-qqbot.exe' if sys.platform=='win32' else 'eve-qqbot');target.write_bytes(binary)
         for name in names:
             path=candidate/'resources'/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(binary)
         manifest={"format_version":1,"prepared":True,"success":True,"candidate_sha256":candidate_id,
             "source":source,"binary_sha256":binary_sha,"resources":resources,"candidate_path":str(target),
-            "checks":[{"success":True}]*4}
+            "source_diff":source_diff,"runtime":runtime_contract,"checks":[{"success":True}]*4}
         (candidate/'manifest.json').write_text(json.dumps(manifest))
         spec=importlib.util.spec_from_file_location('developer_upgrade_runtime',pathlib.Path(__file__).resolve().parents[3]/'scripts/self_upgrade_runtime.py')
         runtime=importlib.util.module_from_spec(spec);spec.loader.exec_module(runtime)
@@ -324,13 +333,13 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         self.developer_config.write_text(json.dumps(config))
         (queue / "supervisor.json").write_text(json.dumps({"format_version":1,"pid":1,
             "heartbeat_ms":int(time.time()*1000),"phase":"running","active_sha256":"b"*64,
-            "candidate_sha256":None,"result":None}))
+            "active_source_revision":"1"*40,"candidate_sha256":None,"result":None}))
         def respond(body):
             self.assertTrue({"apply_self_upgrade","self_upgrade_status"} <= self.definitions(body))
             results = self.results(body)
             if not results:
                 return tool_response([("apply_self_upgrade", {"candidate_sha256":candidate_id})])
-            self.assertTrue(results[0]["queued"])
+            self.assertTrue(results[0].get("queued"), results[0])
             self.assertFalse(results[0]["applied"])
             return text_response("切换已排队，尚未声称应用成功")
         self.callback=respond

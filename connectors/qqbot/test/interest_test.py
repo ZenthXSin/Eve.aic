@@ -283,6 +283,10 @@ class InterestAcceptance(unittest.TestCase):
                     self.assertTrue(stop_at.exists(), "process exited before stop synchronization")
                     child.kill()
                 stdout, stderr = child.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                events = events_path.read_text()[-12000:] if events_path.exists() else ''
+                self.fail('\n'.join(self.errors) + '\n' +
+                          (error_path.read_text() if error_path.exists() else 'process_timeout') + '\n' + events)
             finally:
                 if child.poll() is None:
                     child.kill()

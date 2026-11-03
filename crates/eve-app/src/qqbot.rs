@@ -2601,7 +2601,7 @@ async fn run_qqbot_composed(
             },
         ));
         conversation_background = Some(crate::conversation_learning::Background::start(
-            training.0.clone(), Arc::new(eve_training_plugin::ModelConversationLearner::new(budgeted("conversation_learning")?)), budget_gate.clone(),
+            training.0.clone(), Arc::new(eve_training_plugin::ModelConversationLearner::new(budget_gate.wrap(core_resolver("conversation_learning")?, crate::qq_budget::CONVERSATION_LEARNING)?)), budget_gate.clone(),
         ));
         // 说法学习：训练中的会话攒够一批原话后学习一次；用途 phrase 单独记健康与输出上限。
         let _ = phrase_policy

@@ -89,7 +89,10 @@ class TransportAcceptance(memory.MemoryAcceptance):
         self.assertTrue(pathlib.Path(run[1]["stopped"]).exists())
 
     def test_oversized_encoded_message_does_not_disconnect_real_rust_channel(self):
-        run = self.launch(contents=["x" + "\0" * 12000, "后续正常消息"])
+        # 入站上限已独立提升至512KiB；同时覆盖超限协议帧和SDK正文32KiB上限。
+        run = self.launch(raw_frames=[{"version":1, "type":"message", "id":"oversized",
+            "scope":"c2c", "target_id":"transport-user", "user_id":"transport-user",
+            "text":"x" * (512 * 1024)}], contents=["x" * 32769, "后续正常消息"])
         self.wait_until(lambda: self.state_path.exists() and any(r["state"] == "Sent" for r in
             self.documents().get("eve.channel.qqbot", {}).get("receipts.v1", {}).get("entries", [])),
             "normal message after rejected frame was not delivered")

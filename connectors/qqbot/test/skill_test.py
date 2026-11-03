@@ -24,7 +24,7 @@ REAL_JAR = practice_test.REAL_JAR
 SECOND = "我还想给 Mindustry 做一面更结实的墙，可还是不会写方块。"
 DISABLED = "技能固化未启用。"
 EMPTY = "还没有固化的技能"
-NOT_FOUND = "没有这个技能"
+NOT_FOUND = "没有找到属于你的这个技能；可以先让我查看你的技能列表。"
 
 
 def base():
@@ -206,7 +206,7 @@ class SkillAcceptance(unittest.TestCase):
                 "验证通过后自动启用第 1 版", "参数 block=sturdy-wall，health=1200｜实际运行验证通过"])),
             *self.send(self.message("practice", f"/practice {interest['id']}", contains=[
                 "尝试 1：已验证", "由已验证技能的模板实例化：「指定生命值的墙」第 1 版"])),
-            *self.send(self.message("other", f"/skill {skill['id']}", user="user-2", expected=NOT_FOUND + "。发送 /skills 查看技能 ID。")),
+            *self.send(self.message("other", f"/skill {skill['id']}", user="user-2", expected=NOT_FOUND)),
             *self.send(self.message("empty", "/skills", user="user-2", contains=EMPTY)),
             *self.checkpoint("quiet")], checkpoints={"quiet": self.quiet})
         # 技能实例验证通过的实践不再提炼；重启不重放任何请求或运行。
@@ -234,8 +234,8 @@ class SkillAcceptance(unittest.TestCase):
             *self.send(self.message("again", f"/skill rollback {skill['id']}", expected="没有可以回退的更早版本。")),
             *self.send(self.message("missing", f"/skill enable {skill['id']} 7", expected="没有这个已验证版本。")),
             *self.send(self.message("other", f"/skill disable {skill['id']}", user="user-2",
-                                    expected=NOT_FOUND + "。发送 /skills 查看技能 ID。")),
-            *self.send(self.message("help", "/skill", contains="用法：/skills")),
+                                    expected=NOT_FOUND)),
+            *self.send(self.message("help", "/skill", contains="直接告诉我你想查看、停用、启用或回退哪个技能")),
             *self.checkpoint("quiet")], checkpoints={"quiet": self.quiet})
         [skill] = self.skills()
         self.assertEqual(skill["enabled"], 1)

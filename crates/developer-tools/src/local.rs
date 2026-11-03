@@ -1338,11 +1338,12 @@ impl DeveloperBackend for LocalDeveloper {
     ) -> ToolFuture<'_> {
         Box::pin(async move {
             let _serial = tokio::select! {lock=self.ledger.serial.lock()=>lock,_=cancelled(&context)=>return Err(ToolExecutionError::Cancelled("等待中的开发操作已取消".into()))};
-            let id = self
-                .ledger
-                .next
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
-                .map_err(|_| failed("操作审计 ID 已满，未执行"))?;
+            // serial 覆盖所有审计分配；先检查溢出，再发布下一编号。
+            let id = self.ledger.next.load(Ordering::SeqCst);
+            let next = id
+                .checked_add(1)
+                .ok_or_else(|| failed("操作审计 ID 已满，未执行"))?;
+            self.ledger.next.store(next, Ordering::SeqCst);
             if let Err(error) = self.authorize_operation(&operation, &context) {
                 journal::reject(&self.journal, id, &operation, &context, &error)?;
                 return Err(error);

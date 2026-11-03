@@ -87,7 +87,9 @@ class LearningAcceptance(unittest.TestCase):
                     decoded = json.loads(latest)
                 except (ValueError, TypeError):
                     decoded = None
-                if isinstance(decoded, dict) and "extractor_version" in decoded and "evidence" in decoded:
+                if isinstance(decoded, dict) and "feedback_pairs" in decoded and "messages" in decoded:
+                    kind = "conversation"
+                elif isinstance(decoded, dict) and "extractor_version" in decoded and "evidence" in decoded:
                     kind = "learning"
                 elif "unverified_waiting_input" in latest:
                     kind = "reflection"
@@ -112,6 +114,9 @@ class LearningAcceptance(unittest.TestCase):
                 if kind == "chat" and outer.chat_response is not None:
                     text = outer.chat_response(body, latest)
                 message = {"role": "assistant", "content": text}
+                if kind == "conversation":
+                    assert not body.get("tools"), "交流学习不得获得对话工具"
+                    message["content"] = json.dumps({"lessons": []})
                 if isinstance(text, dict):
                     message = {"role": "assistant", **text}
                     if "tool_calls" in text:

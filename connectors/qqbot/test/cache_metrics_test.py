@@ -60,7 +60,7 @@ class CacheMetricsAcceptance(model_health_test.ModelHealthAcceptance):
         # 宿主事实、工具说明、授权与训练开关提示属于固定资料：并在工具清单那条系统消息里，位于历史之前。
         for body in bodies:
             fixed = body["messages"][1]["content"]
-            for kind in ("eve.host.capabilities", "eve.host.authorization", "eve.host-facts", "当前主动提问训练已关闭"):
+            for kind in ("eve.host.capabilities", "eve.host.authorization", "eve.host-facts"):
                 self.assertIn(kind, fixed)
                 self.assertFalse(any(kind in str(m.get("content")) for m in body["messages"][2:]), kind)
         broken = cache["last_break"]

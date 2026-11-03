@@ -12,6 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) const KEY: &str = "phrases.v1";
 const MAX_BYTES: usize = 2 * 1_048_576;
 const MAX_SCOPES: usize = 256;
+// 旧实现取出批次后暂时释放范围名额，迟到结果可能形成两倍范围；保留可验证旧记录，
+// 新增仍受 MAX_SCOPES 和总字节上限限制，不清空既有学习。
+const MAX_RESTORED_SCOPES: usize = MAX_SCOPES * 2;
 /// 每个作用域至多缓冲两批；更早的未学原话被新原话替换。
 const MAX_PENDING: usize = PHRASE_BATCH * 2;
 const MAX_PENDING_CHARS: usize = 512;
@@ -100,7 +103,7 @@ impl Phrases {
             || value.next == 0
             || bad_pending
             || bad_learned
-            || scopes.len() > MAX_SCOPES
+            || scopes.len() > MAX_RESTORED_SCOPES
         {
             return Err(corrupt());
         }
@@ -184,6 +187,11 @@ impl Phrases {
             })
         {
             return Err(error("说法学习结果不合格；本批不保存"));
+        }
+        let scopes = self.scopes();
+        if !drafts.is_empty() && !scopes.contains(&key(&batch.scope)) && scopes.len() >= MAX_SCOPES
+        {
+            return Err(error("说法学习范围容量已满；保留旧状态，不接纳迟到新范围"));
         }
         let mut changed = 0;
         for draft in drafts {
@@ -333,6 +341,41 @@ mod tests {
         assert!(!loaded.forget(&scope("b"), &list[1].id));
         assert!(loaded.reset(&scope("a")));
         assert!(loaded.list(&scope("a")).is_empty());
+    }
+
+    #[test]
+    fn late_batch_cannot_overfill_scopes_and_legacy_overflow_is_preserved() {
+        let mut phrases = Phrases::load(None).unwrap();
+        for _ in 0..PHRASE_BATCH {
+            phrases.buffer(&scope("old"), "原话").unwrap();
+        }
+        let batch = phrases.take(&[]).unwrap();
+        for i in 0..MAX_SCOPES {
+            phrases.buffer(&scope(&i.to_string()), "原话").unwrap();
+        }
+        let before = phrases.bytes().unwrap();
+        assert!(
+            phrases
+                .merge(&batch, &[draft(PhraseKind::Term, "原话", "原话")], 1)
+                .is_err()
+        );
+        assert_eq!(phrases.bytes().unwrap(), before);
+        // 还原旧实现曾写出的第257个范围；恢复不删任何原话，新增仍拒绝。
+        phrases.pending.push(Pending {
+            scope: scope("legacy-overflow"),
+            text: "保留".into(),
+        });
+        let legacy = phrases.bytes().unwrap();
+        let mut restored = Phrases::load(Some(legacy.clone())).unwrap();
+        assert_eq!(restored.bytes().unwrap(), legacy);
+        assert!(restored.buffer(&scope("new"), "新增").is_err());
+        restored
+            .buffer(&scope("legacy-overflow"), "原范围继续")
+            .unwrap();
+        assert_eq!(restored.scopes().len(), MAX_SCOPES + 1);
+        let mut corrupt: serde_json::Value = serde_json::from_slice(&legacy).unwrap();
+        corrupt["pending"][0]["text"] = "".into();
+        assert!(Phrases::load(Some(serde_json::to_vec(&corrupt).unwrap())).is_err());
     }
 
     #[test]

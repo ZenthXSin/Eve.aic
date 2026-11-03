@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import subprocess
 import sys
 import unittest
 
@@ -22,6 +23,12 @@ class MemberDevelopmentAcceptance(developer.DeveloperAcceptance):
             locals()[_name] = None
     del _name
 
+    def setUp(self):
+        super().setUp()
+        self.review_reply = lambda request: {
+            'risk':'medium','authorization':'high','outcome':'allow',
+            'rationale':'合成场景明确授权在成员隔离目录内执行完整测试命令'}
+
     def tools(self, operations):
         response = tool_response(operations)
         for call in response['choices'][0]['message']['tool_calls']:
@@ -30,8 +37,12 @@ class MemberDevelopmentAcceptance(developer.DeveloperAcceptance):
 
     def run_member(self, script, real=False, **options):
         more = ['--practice-mindustry-server', JAR] if real else []
-        return self.run_eve(script, interest=real, memory=True, research=False, practice=False,
-            more=more, env_extra={'EVE_DEVELOPER_CONFIG':str(self.developer_config)}, **options)
+        try:
+            return self.run_eve(script, interest=real, memory=True, research=False, practice=False,
+                more=more, env_extra={'EVE_DEVELOPER_CONFIG':str(self.developer_config)}, **options)
+        except subprocess.TimeoutExpired:
+            self.assertFalse(self.errors, '\n'.join(self.errors))
+            raise
 
     def member(self, id, text, expected='已核实', user='user-2'):
         return self.message(id, text, user=user, scope='group', target='group-1', expected=expected)
@@ -104,7 +115,7 @@ class MemberDevelopmentAcceptance(developer.DeveloperAcceptance):
                 self.assertTrue(results[0]['success'])
                 return self.tools([('run_command', {'program':'rm', 'args':['-r','keep.txt'], 'owner_confirmed':True})])
             if len(results) == 2:
-                self.assertIn('行动审查未放行', json.dumps(results[-1], ensure_ascii=False))
+                self.assertIn('行动审核未放行', json.dumps(results[-1], ensure_ascii=False))
                 return self.tools([('read_file', {'path':'keep.txt'})])
             self.assertEqual(results[-1]['content'], 'MEMBER_FILE_PRESERVED')
             return text_response('成员文件可读写，未授权删除未执行')

@@ -198,6 +198,7 @@ fn command(entry: Entry, root: &Path, url: &str, database: Option<&Path>) -> Com
         let bridge = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../connectors/qqbot/test/fake-bridge.mjs");
         command
+            .arg("--minimal-profile")
             .env("QQBOT_APP_SECRET", QQ_KEY)
             .env("QQBOT_APP_ID", "1904159860")
             .arg("--training")
@@ -278,7 +279,7 @@ fn scenario(root: &Path, messages: Vec<Value>) {
 
 fn message(id: &str, text: &str, expected: &str) -> Value {
     json!({"id":id, "scope":"c2c", "target_id":"sql-user", "user_id":"sql-user",
-        "text":text, "expected":expected})
+        "text":text, "original_text":text, "expected":expected})
 }
 
 fn successful(output: Output, entry: Entry) -> Value {

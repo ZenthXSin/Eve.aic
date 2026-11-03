@@ -153,7 +153,7 @@ impl Background {
                 }
                 loop {
                     if *stopped.borrow() { return Ok(()); }
-                    if gate.admits_category("conversation_learning", 1)?
+                    if gate.admits_category(crate::qq_budget::CONVERSATION_LEARNING, 1)?
                         && let Some(batch) = training.take_conversation_batch(crate::qq_tasks::now_ms())? {
                         let result = tokio::select! { biased;
                             _ = stopped.changed() => { return Ok(()); },

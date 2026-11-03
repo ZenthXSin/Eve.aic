@@ -153,13 +153,13 @@ class ToolForgeAcceptance(unittest.TestCase):
                 "匹配 *.hjson 的文件不能包含“type: Walll”", "出现问题的 2 份拦下 2 份",
                 "验证通过的 2 份没有误报 2 份", "验证通过后自动启用第 1 版", "拦下，没有运行",
                 "通过，交给运行环境实际运行"])),
-            *self.send(self.message("other", f"/tool {tool['id']}", user="user-2", contains="没有这个工具")),
+            *self.send(self.message("other", f"/tool {tool['id']}", user="user-2", contains="没有找到属于你的这个锻造工具")),
             *self.send(self.message("disable", f"/tool disable {tool['id']}", contains="已停用「block-type」")),
             *self.send(self.message("rollback", f"/tool rollback {tool['id']}", contains="没有可以回退的更早版本")),
             *self.send(self.message("enable", f"/tool enable {tool['id']} 1",
                                     contains="已启用「block-type」第 1 版")),
             *self.send(self.message("missing", f"/tool enable {tool['id']} 9", contains="没有这个已验证版本")),
-            *self.send(self.message("help", "/tool", contains="用法：/tools")),
+            *self.send(self.message("help", "/tool", contains="直接告诉我你想查看、停用、启用或回退哪个锻造工具")),
             *self.checkpoint("quiet")], checkpoints={"quiet": self.quiet})
         after = self.toolforge()
         self.assertEqual([(change["actor"], change["enabled"]) for change in after["tools"][0]["changes"]],
