@@ -120,6 +120,7 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
                 self.assertEqual(batch, {"messages": talk, "known": []})
                 return {"impressions": [{"text": "在学 Rust", "quote": "我最近在学Rust", "replaces": None},
                                         {"text": "养了一只橘猫", "quote": "我养了一只橘猫", "replaces": None}]}
+            self.assertEqual(batch["messages"], later)
             self.assertEqual([k["text"] for k in batch["known"]], ["在学 Rust", "养了一只橘猫"])
             old, cat = batch["known"][0]["id"], batch["known"][1]["id"]
             return {"impressions": [{"text": "改学 Go 了", "quote": "我不学Rust了改学Go", "replaces": old},
@@ -135,15 +136,16 @@ class PeopleAcceptance(dialogue.DialogueToolsAcceptance):
                                                                       target="group-1", expected="好"))
         self.enabled([*[step for i, text in enumerate(talk) for step in say(f"t{i}", text)],
                       *self.checkpoint("learned"),
-                      *say("ask", "你还记得我在学什么吗"),
+                      # 查询不加入下一批自述，避免第三条新话就提前凑满四条并缺少末条引用。
+                      *say("ask", "之前聊的学习情况还记得吗"),
                       *say("other", "大家好呀", user="user-2"),
                       *self.send(self.message("list", "/impressions", user="user-1", scope="group", target="group-1",
                                               contains=["在学 Rust", "养了一只橘猫", "我最近在学Rust"]))],
                      checkpoints={"learned": lambda: self.wait_learned(2)})
         self.assertEqual(len(self.kind("impression")), 1)
-        self.assertEqual([i["text"] for i in seen["你还记得我在学什么吗"]["current"]["impressions"]],
+        self.assertEqual([i["text"] for i in seen["之前聊的学习情况还记得吗"]["current"]["impressions"]],
                          ["在学 Rust", "养了一只橘猫"])
-        self.assertNotIn("pending", seen["你还记得我在学什么吗"]["current"])
+        self.assertNotIn("pending", seen["之前聊的学习情况还记得吗"]["current"])
         other = seen["大家好呀"]
         self.assertNotIn("impressions", other["current"])
         self.assertTrue(all("impressions" not in p for p in other["others"]), "别人的印象不进入他人的对话")
