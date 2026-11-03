@@ -172,6 +172,44 @@ class SegmentAcceptance(unittest.TestCase):
     def sent(self, kind):
         return [event for event in self.events if event["direction"] == "out" and event["type"] == kind]
 
+    def test_slow_receipt_does_not_block_another_private_conversation(self):
+        slow=self.message('slow-private',text='第一位的回复',segments=None,hold_delivery=True)
+        fast=self.message('fast-private',text='第二位的回复',segments=None,user_id='user-2',target_id='user-2')
+        summary=self.run_eve([{'send':slow},{'wait_command':{'id':slow['id'],'type':'reply'}},
+            {'send':fast},self.wait_receipt(fast['id'],'Sent'),
+            {'delivery':slow['id']},self.wait_receipt(slow['id'],'Sent')],segmented=False)
+        self.assertEqual((summary['completed'],summary['sent']),(2,2))
+        self.assertEqual([e['id'] for e in self.sent('reply')],[slow['id'],fast['id']])
+
+    def test_same_group_stays_ordered_while_other_group_delivers(self):
+        first=self.message('group-first',scope='group',target_id='group-1',hold_segments=[0])
+        second=self.message('group-second',text='同群第二位',segments=None,scope='group',target_id='group-1',user_id='user-2')
+        other=self.message('other-group',text='另一群',segments=None,scope='group',target_id='group-2',user_id='user-2')
+        summary=self.run_eve([{'send':first},self.wait_segment(first['id'],1),
+            {'send':[second,other]},self.wait_receipt(other['id'],'Sent'),
+            {'deliver_segment':{'id':first['id'],'index':0}},self.wait_receipt(first['id'],'Sent'),
+            self.wait_receipt(second['id'],'Sent')])
+        self.assertEqual((summary['completed'],summary['sent']),(3,3))
+        writes=[e for e in self.events if e['direction']=='out' and e['type'] in ('reply','segment')]
+        second_at=next(i for i,e in enumerate(writes) if e['id']==second['id'])
+        self.assertGreater(second_at,max(i for i,e in enumerate(writes) if e['id']==first['id']))
+        self.assertEqual([e['text'] for e in writes if e['id']==first['id']],PARTS)
+
+    def test_timed_out_segment_keeps_partial_evidence_and_channel_recovers_without_replay(self):
+        slow=self.message('timeout-part',hold_segments=[1],allow_finish=True)
+        fast=self.message('after-timeout',text='其他会话仍可回复',segments=None,user_id='user-2',target_id='user-2')
+        summary=self.run_eve([{'send':slow},self.wait_segment(slow['id'],2),
+            self.wait_receipt(slow['id'],'Unknown'),{'send':fast},self.wait_receipt(fast['id'],'Sent'),
+            {'deliver_segment':{'id':slow['id'],'index':1}},
+            self.wait_receipt(slow['id'],'Unknown')],timeout=48)
+        self.assertEqual(self.part_states(slow['id']),['Sent','Unknown','Skipped'])
+        self.assertEqual(self.receipt(slow['id'])['reply'],TEXT)
+        self.assertEqual((summary['completed'],summary['sent'],summary['failed']),(2,1,1))
+        self.run_eve([{'send':{**slow,'expected_type':'finish'}},
+            {'wait_command':{'id':slow['id'],'type':'finish'}}])
+        self.assertFalse(self.sent('segment'))
+        self.assertEqual(self.part_states(slow['id']),['Sent','Unknown','Skipped'])
+
     def test_disabled_by_default_sends_one_reply_and_keeps_format_one(self):
         message = self.message("whole", segments=None)
         summary = self.run_eve([{"send": message}, self.wait_receipt("whole", "Sent")], segmented=False)

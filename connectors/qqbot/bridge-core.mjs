@@ -10,6 +10,10 @@ export const MAX_SEGMENTS = 5;
 export const MAX_PUSH_BYTES = 2048;
 // Leave a margin before QQ's five-minute passive reply window expires.
 export const PASSIVE_REPLY_WINDOW_MS = 240000;
+// Bound the whole SDK operation, including response-body reads after headers.
+// Rust's independently owned receipt deadlines leave a margin for this result.
+export const SEND_TIMEOUT_MS = 30000;
+export const FILE_TIMEOUT_MS = 110000;
 const passiveLimit = scope => scope === "c2c" ? 4 : MAX_SEGMENTS;
 function diagnostic(err) {
   const out = {};
@@ -183,12 +187,30 @@ export function optionsFromEnv(env) {
     logger: { info() {}, warn() {}, error() {}, debug() {} },
   };
 }
-export function createBridge(bot, emit, limit = 128, now = () => performance.now(), group = {}) {
+export function createBridge(bot, emit, limit = 128, now = () => performance.now(), group = {}, timers = {}) {
   const pending = new Map();
   const pushing = new Set();
   const warned = new Set();
   let activeSends = 0;
   let closed = false;
+  const schedule = timers.setTimeout ?? setTimeout;
+  const unschedule = timers.clearTimeout ?? clearTimeout;
+  // A timed-out transport may still be inside the SDK. Keep it in activeSends
+  // until it settles, so repeated timeouts cannot create unbounded requests.
+  async function boundedSend(operation, timeout) {
+    if (activeSends >= limit) {
+      warn("outbound_limit");
+      throw new Error("outbound_limit");
+    }
+    activeSends++;
+    const pending = Promise.resolve().then(operation).finally(() => { activeSends--; });
+    let timer;
+    try {
+      return await Promise.race([pending, new Promise((_, reject) => {
+        timer = schedule(() => reject(Object.assign(new Error("send_timeout"), {name:"TimeoutError"})), timeout);
+      })]);
+    } finally { unschedule(timer); }
+  }
   const send = frame => { if (!closed) emit({ version: 1, ...frame }); };
   const warn = code => {
     if (!warned.has(code)) { warned.add(code); send({ type: "warning", code }); }
@@ -202,48 +224,25 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
   }
   // Share one bound across passive replies, segments and proactive messages.
   // Admission failure happens before the SDK call and is never queued/retried.
-  async function sendText(target, text, mention) {
+  async function sendText(target, text, mention, timeout = SEND_TIMEOUT_MS) {
     text = mentionedText(target, text, mention);
     if (Buffer.byteLength(text) > 32768) throw new Error("reply_limit");
-    if (activeSends >= limit) {
-      warn("outbound_limit");
-      throw new Error("outbound_limit");
-    }
-    activeSends++;
-    try {
-      const result = await bot.sendText(target, text);
-      if (!validMessageId(result?.id)) throw new Error("platform_message_id_unknown");
-      return result;
-    }
-    finally { activeSends--; }
+    const result = await boundedSend(() => bot.sendText(target, text), timeout);
+    if (!validMessageId(result?.id)) throw new Error("platform_message_id_unknown");
+    return result;
   }
   // 文件走同一条并发上限；路径已由 Rust 侧解析并校验，这里只做形状检查。
   async function sendFile(target, localPath, name, caption) {
-    if (activeSends >= limit) {
-      warn("outbound_limit");
-      throw new Error("outbound_limit");
-    }
-    activeSends++;
-    try {
-      const result = await bot.sendFile(target, { localPath },
-        { ...(name ? { fileName: name } : {}), ...(caption ? { content: caption } : {}) });
-      if (!validMessageId(result?.message?.id)) throw new Error("platform_message_id_unknown");
-      return result;
-    } finally { activeSends--; }
+    const result = await boundedSend(() => bot.sendFile(target, { localPath },
+      { ...(name ? { fileName: name } : {}), ...(caption ? { content: caption } : {}) }), FILE_TIMEOUT_MS);
+    if (!validMessageId(result?.message?.id)) throw new Error("platform_message_id_unknown");
+    return result;
   }
   // 表情包作为原消息的被动回复图片发出，同样计入并发上限。
   async function sendImage(target, localPath) {
-    if (activeSends >= limit) {
-      warn("outbound_limit");
-      throw new Error("outbound_limit");
-    }
-    activeSends++;
-    try {
-      const result = await bot.sendImage(target, { localPath });
-      if (!validMessageId(result?.message?.id)) throw new Error("platform_message_id_unknown");
-      return result;
-    }
-    finally { activeSends--; }
+    const result = await boundedSend(() => bot.sendImage(target, { localPath }), SEND_TIMEOUT_MS);
+    if (!validMessageId(result?.message?.id)) throw new Error("platform_message_id_unknown");
+    return result;
   }
   const stop = () => {
     if (closed) return;
@@ -501,11 +500,14 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         !Array.isArray(p)||p.length!==2||!validText(p[0])||!Number.isInteger(p[1])||p[1]<0||p[1]>2500) ||
         parts.map(p=>p[0].replace(/\s/gu,"")).join("") !== frame.text.replace(/\s/gu,"")) throw new Error("invalid_parts");
       let result;
+      const deadline = now() + SEND_TIMEOUT_MS;
       for (let index=0;index<parts.length;index++) {
         if (closed) throw new Error("closed");
         if (parts[index][1]) await new Promise(resolve=>setTimeout(resolve,parts[index][1]));
         if (closed) throw new Error("closed");
-        result = await sendText({ scope, targetId: frame.target_id }, parts[index][0], mention);
+        const remaining = deadline - now();
+        if (remaining <= 0) throw Object.assign(new Error("push_timeout"), {name:"TimeoutError"});
+        result = await sendText({ scope, targetId: frame.target_id }, parts[index][0], mention, remaining);
       }
       send({ type: "delivery", id: frame.id, push: true, ok: true,
         ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });

@@ -580,10 +580,14 @@ type Judging = (
     Reply,
     std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
 );
-async fn judged(judging: &mut Option<Judging>) -> bool {
-    poll_fn(|cx| match judging.as_mut() {
-        Some((_, wait)) => wait.as_mut().poll(cx),
-        None => Poll::Pending,
+async fn judged(judging: &mut [Judging]) -> (usize, bool) {
+    poll_fn(|cx| {
+        for (index, (_, wait)) in judging.iter_mut().enumerate() {
+            if let Poll::Ready(result) = wait.as_mut().poll(cx) {
+                return Poll::Ready((index, result));
+            }
+        }
+        Poll::Pending
     })
     .await
 }
@@ -593,8 +597,8 @@ fn invitable(reply: &Reply) -> bool {
         && reply.message.scope == "c2c"
         && !explicit(&reply.message.text)
 }
-/// 一次只投递一条回复。分段时逐段写出并等待回执；段间停顿结束、
-/// 路由与命令都收尾后，重新核对代际再写下一段。
+/// 每个目标独立保序；其他目标可以在等待回执或段间停顿时继续投递。
+/// 下一段写出前仍重新核对代际及该会话的路由与命令。
 struct Delivery {
     reply: Reply,
     pauses: Vec<u64>,
@@ -605,6 +609,25 @@ struct Delivery {
     /// 正文发完后等待发表情包的时刻；`sticker_sending` 表示已写出、等回执。
     sticker_at: Option<tokio::time::Instant>,
     sticker_sending: bool,
+    deadline: tokio::time::Instant,
+}
+const MAX_DELIVERIES: usize = 8;
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(35);
+struct ProgressDelivery {
+    message: Message,
+    part: usize,
+    deadline: tokio::time::Instant,
+}
+struct AuxiliaryDelivery {
+    id: String,
+    scope: String,
+    target: String,
+    deadline: tokio::time::Instant,
+}
+impl AuxiliaryDelivery {
+    fn targets(&self, message: &Message) -> bool {
+        self.scope == message.scope && self.target == message.target_id
+    }
 }
 /// 正文发完到发表情包之间的停顿。
 const STICKER_PAUSE: Duration = Duration::from_millis(800);
@@ -795,6 +818,25 @@ fn preempts_natural(text: &str, training: bool) -> bool {
 }
 fn same_session(a: &Message, b: &Message) -> bool {
     a.scope == b.scope && a.target_id == b.target_id && a.user_id == b.user_id
+}
+fn same_destination(a: &Message, b: &Message) -> bool {
+    a.scope == b.scope && a.target_id == b.target_id
+}
+fn destination_busy(
+    message: &Message,
+    deliveries: &[Delivery],
+    progress: &[ProgressDelivery],
+    pushing: Option<&AuxiliaryDelivery>,
+    file: Option<&AuxiliaryDelivery>,
+) -> bool {
+    deliveries
+        .iter()
+        .any(|d| same_destination(message, &d.reply.message))
+        || progress
+            .iter()
+            .any(|p| same_destination(message, &p.message))
+        || pushing.is_some_and(|p| p.targets(message))
+        || file.is_some_and(|f| f.targets(message))
 }
 fn pending_control(
     message: &Message,
@@ -1124,8 +1166,8 @@ pub(crate) async fn run(
     let mut controlled_sessions: BTreeMap<String, SessionKey> = BTreeMap::new();
     let mut routing: Vec<Routing> = Vec::new();
     let mut replies: VecDeque<Reply> = VecDeque::new();
-    let mut delivering: Option<Delivery> = None;
-    let mut progress_delivery: Option<(String, usize)> = None;
+    let mut delivering: Vec<Delivery> = Vec::new();
+    let mut progress_delivery: Vec<ProgressDelivery> = Vec::new();
     let mut progress_queue: VecDeque<(ControlEvent, Option<String>, Option<u64>)> = VecDeque::new();
     let (narrated_tx, mut narrated_rx) = mpsc::channel(1);
     let mut narrating = false;
@@ -1134,13 +1176,13 @@ pub(crate) async fn run(
     let mut slow_steps: BTreeMap<String, SlowStep> = BTreeMap::new();
     let mut slow_reported = BTreeSet::new();
     let mut last_progress: BTreeMap<String, tokio::time::Instant> = BTreeMap::new();
-    let mut deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    // 正在主动私聊的邀请；一次只发送一条，期间不开始新的回复投递。
-    let mut pushing: Option<String> = None;
-    // 正在上传的文件；一次只发一个，期间不开始新的回复投递。
-    let mut sending_file: Option<String> = None;
-    // 正在等宿主判断时机的回复；判断结束后回到队首照常投递。
-    let mut judging: Option<Judging> = None;
+    let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    // 附加投递各自保留目标和截止时间，不延长正文的回执期限。
+    let mut pushing: Option<AuxiliaryDelivery> = None;
+    let mut sending_file: Option<AuxiliaryDelivery> = None;
+    let mut pending_file = None;
+    // 每个目标独立等待附带邀请的时机判断。
+    let mut judging: Vec<Judging> = Vec::new();
     let push_interval = outreach.as_ref().and_then(|hook| hook.push_interval);
     let mut next_push = tokio::time::Instant::now();
     let result: PluginResult<()> = async {
@@ -1169,7 +1211,7 @@ pub(crate) async fn run(
             let stages = slow_progress.as_ref().is_some_and(|p| p.stage_updates());
             let min_interval = slow_progress.as_ref().map_or(Duration::from_secs(15), |p| p.min_interval());
             let slow_after = slow_progress.as_ref().and_then(|policy| policy.after());
-            if progress_delivery.is_none() && progress_queue.is_empty()
+            if progress_delivery.len() < MAX_DELIVERIES && progress_queue.len() < 64
                 && let Some(outgoing) = live_dialogue.as_ref().and_then(|live| live.next()) {
                 let current = active.iter().find(|a| a.key.session.session_id == outgoing.scope.session_id
                     && a.key.session.user_id == outgoing.scope.user_id
@@ -1182,7 +1224,7 @@ pub(crate) async fn run(
                 } else { outgoing.complete(None); }
             }
             // 慢步骤：同一步只提示一次；与里程碑进度共用每轮至多 3 条和被动回复配额。
-            if let Some(after) = slow_after && progress_queue.is_empty() && progress_delivery.is_none()
+            if let Some(after) = slow_after && progress_queue.is_empty() && progress_delivery.len() < MAX_DELIVERIES
                 && let Some((id, step)) = slow_steps.iter_mut().find(|(id, step)| (stages || !step.reported) && step.next.elapsed() >= after
                     && last_progress.get(*id).is_none_or(|last| last.elapsed() >= after)) {
                 step.reported = true;
@@ -1387,8 +1429,8 @@ pub(crate) async fn run(
                 }
                 continue;
             }
-            // 待发文件不等通道空闲：QQ 主动消息随时可发，和当前轮的回复互不占用配额。
-            if sending_file.is_none() && file_poll.is_some() && let Some(files) = &files {
+            // 文件上传只等待相同目标的输出；领取后保留在本通道，停止时回报未写出。
+            if sending_file.is_none() && pending_file.is_none() && file_poll.is_some() && let Some(files) = &files {
                 match files.next_file() {
                     Ok(Some(file)) => {
                         let route = route_for(&ledger, &config.app_id, &file.session)?;
@@ -1396,12 +1438,7 @@ pub(crate) async fn run(
                         let caption_ok = file.caption.as_deref().is_none_or(crate::files::valid_caption);
                         match route.filter(|_| valid_message_id(&file.id) && valid_path(&file.path) && name_ok && caption_ok) {
                             Some(message) => {
-                                write(&mut stdin, json!({"type":"file","version":1,"id":file.id,
-                                    "scope":message.scope,"target_id":message.target_id,"path":file.path,
-                                    "mention_user_id": if message.scope == "group" {Some(message.user_id)} else {None},
-                                    "name":file.name,"caption":file.caption})).await?;
-                                deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-                                sending_file = Some(file.id);
+                                pending_file = Some((file, message));
                             }
                             None => report_file(files, &ctx, &file.id, QqFileResult::NotSent),
                         }
@@ -1411,13 +1448,27 @@ pub(crate) async fn run(
                     Err(_) => warn(&ctx, "file_delivery_unavailable"),
                 }
             }
-            if delivering.is_none() && pushing.is_none() && sending_file.is_none() && progress_delivery.is_none()
-                && !narrating
-                && !replies.iter().any(|r| matches!(r.guard, ReplyGuard::Steering(_)))
-                && progress_queue.front().is_some_and(|(event, _, _): &(ControlEvent, Option<String>, Option<u64>)|
-                    active.iter().any(|a| a.key == event.key)
-                    || !routing.iter().any(|r| r.target.session == event.key.session))
-                && let Some((event, text, waiting_seconds)) = progress_queue.pop_front() {
+            if pending_file.as_ref().is_some_and(|(_, message)| !destination_busy(message,
+                &delivering, &progress_delivery, pushing.as_ref(), sending_file.as_ref())
+                && !replies.iter().any(|r| same_destination(message, &r.message))) {
+                let (file, message) = pending_file.take().expect("pending file");
+                write(&mut stdin, json!({"type":"file","version":1,"id":file.id,
+                    "scope":message.scope,"target_id":message.target_id,"path":file.path,
+                    "mention_user_id": if message.scope == "group" {Some(message.user_id.clone())} else {None},
+                    "name":file.name,"caption":file.caption})).await?;
+                sending_file = Some(AuxiliaryDelivery { id: file.id, scope: message.scope,
+                    target: message.target_id, deadline: tokio::time::Instant::now() + Duration::from_secs(120) });
+            }
+            if progress_delivery.len() < MAX_DELIVERIES
+                && let Some(position) = progress_queue.iter().position(|(event, text, _)| {
+                    let Some(current) = active.iter().find(|a| a.key == event.key) else {
+                        return !routing.iter().any(|r| r.target.session == event.key.session);
+                    };
+                    (text.is_some() || matches!(event.event.kind, TurnEventKind::AssistantMessage { .. }) || !narrating)
+                        && !destination_busy(&current.message, &delivering, &progress_delivery, pushing.as_ref(), sending_file.as_ref())
+                        && !replies.iter().any(|r| same_destination(&r.message, &current.message))
+                }) {
+                let (event, text, waiting_seconds) = progress_queue.remove(position).expect("queued progress");
                 if text.is_none() && !matches!(event.event.kind, TurnEventKind::AssistantMessage { .. }) {
                     if let Some(narrator) = progress_narrator.clone()
                         && let Some(current) = active.iter().find(|a| a.key == event.key) {
@@ -1503,21 +1554,27 @@ pub(crate) async fn run(
                         // 同步落盘后再次核验；写出后未知结果不会自动补发。
                         if control.accepts(&event) && control.snapshot(&event.key.session).is_ok_and(|s| s.is_some_and(|s| !s.cancel_requested)) {
                             write(&mut stdin, json!({"type":"progress","version":1,"id":message.id,"index":part,"text":text,"proactive":proactive})).await?;
-                            progress_delivery = Some((message.id.clone(), part));
-                            deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+                            progress_delivery.push(ProgressDelivery { message: message.clone(), part,
+                                deadline: tokio::time::Instant::now() + DELIVERY_TIMEOUT });
                         } else {
                             ledger.entries[index].progress[part].state = PartState::Failed;
                             ledger.save(&ctx)?;
                         }
                     }
                 }
-                if progress_delivery.is_none() && let Some(current) = active.iter().find(|a| a.key == event.key)
+                if let Some(current) = active.iter().find(|a| a.key == event.key)
+                    && !progress_delivery.iter().any(|p| p.message.id == current.message.id)
                     && let Some(outgoing) = live_waiting.remove(&current.message.id) { outgoing.complete(None); }
                 continue;
             }
-            if delivering.is_none() && pushing.is_none() && sending_file.is_none() && judging.is_none() && progress_delivery.is_none()
-                && let Some(index) = replies.iter().position(|reply| !pending_control(&reply.message, &routing, &commands)
-                    && (matches!(reply.guard, ReplyGuard::Steering(_)) || (!narrating && progress_queue.is_empty() && progress_rx.is_empty()))) {
+            if delivering.len() + judging.len() < MAX_DELIVERIES
+                && let Some(index) = replies.iter().enumerate().find_map(|(index, reply)| {
+                    (!pending_control(&reply.message, &routing, &commands)
+                        && !destination_busy(&reply.message, &delivering, &progress_delivery, pushing.as_ref(), sending_file.as_ref())
+                        && !judging.iter().any(|(r, _)| same_destination(&r.message, &reply.message))
+                        && !replies.iter().take(index).any(|r| same_destination(&r.message, &reply.message)))
+                    .then_some(index)
+                }) {
                 let reply = replies.remove(index).expect("queued reply");
                 if !reply.guard.accepts(control.as_ref()) {
                     mark_failed(&mut ledger, &ctx, &config.app_id, &reply.message.id)?;
@@ -1539,7 +1596,7 @@ pub(crate) async fn run(
                             let wait = Box::pin(async move {
                                 matches!(tokio::time::timeout(QQ_OUTREACH_JUDGE_TIMEOUT, wait).await, Ok(Ok(true)))
                             });
-                            judging = Some((reply, wait));
+                            judging.push((reply, wait));
                             continue;
                         }
                         Ok(false) => {}
@@ -1680,13 +1737,14 @@ pub(crate) async fn run(
                 };
                 write(&mut stdin, frame).await?;
                 timing(timing_diagnostics, "reply_written", None);
-                deadline = tokio::time::Instant::now() + Duration::from_secs(35);
-                delivering = Some(Delivery { reply, pauses, index: 0, pause_until: None, appendix, sticker_at: None, sticker_sending: false });
+                delivering.push(Delivery { reply, pauses, index: 0, pause_until: None, appendix,
+                    sticker_at: None, sticker_sending: false, deadline: tokio::time::Instant::now() + DELIVERY_TIMEOUT });
             }
             // 段间停顿结束后写下一段；路由或命令尚未收尾时先等待，取消或新代可在此关闭剩余片段。
-            if let Some(delivery) = delivering.as_mut()
-                && !pending_control(&delivery.reply.message, &routing, &commands)
-                && delivery.pause_until.is_some_and(|until| until <= tokio::time::Instant::now()) {
+            if let Some(position) = delivering.iter().position(|delivery|
+                !pending_control(&delivery.reply.message, &routing, &commands)
+                && delivery.pause_until.is_some_and(|until| until <= tokio::time::Instant::now())) {
+                let delivery = &mut delivering[position];
                 let id = delivery.reply.message.id.clone();
                 let index = ledger.find(&config.app_id, &id).expect("inserted receipt");
                 let part = delivery.index;
@@ -1702,19 +1760,19 @@ pub(crate) async fn run(
                     if let (Some(hook), Some((id, _))) = (&outreach, delivery.appendix.take()) {
                         report(hook, &ctx, &id, QqOutreachResult::NotSent);
                     }
-                    delivering = None;
+                    delivering.remove(position);
                     mark_failed(&mut ledger, &ctx, &config.app_id, &id)?;
                     warn(&ctx, "stale_segments_suppressed");
                     finish(&mut stdin, &id).await?;
                     continue;
                 }
                 write(&mut stdin, segment_frame(&ledger, index, part)).await?;
-                deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+                delivery.deadline = tokio::time::Instant::now() + DELIVERY_TIMEOUT;
                 delivery.pause_until = None;
             }
             // 正文发完、停顿结束后发表情包；写出前先记为发送中，中断后不重发。
-            if let Some(delivery) = delivering.as_mut()
-                && delivery.sticker_at.is_some_and(|at| at <= tokio::time::Instant::now()) {
+            if let Some(delivery) = delivering.iter_mut().find(|delivery|
+                delivery.sticker_at.is_some_and(|at| at <= tokio::time::Instant::now())) {
                 let id = delivery.reply.message.id.clone();
                 let index = ledger.find(&config.app_id, &id).expect("inserted receipt");
                 delivery.sticker_at = None;
@@ -1724,7 +1782,7 @@ pub(crate) async fn run(
                 let path = sticker.path.clone();
                 ledger.save(&ctx)?;
                 write(&mut stdin, json!({"type":"sticker","version":1,"id":id,"path":path})).await?;
-                deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+                delivery.deadline = tokio::time::Instant::now() + DELIVERY_TIMEOUT;
             }
             let debounce_window = debounce.as_ref().and_then(|policy| policy.window());
             let next_ordinary = queue.iter().position(|queued| {
@@ -1747,17 +1805,13 @@ pub(crate) async fn run(
                 }
                 if control.snapshot(&session).ok().flatten().is_some_and(|s| s.phase != eve_control_api::ControlPhase::Finished) { return false; }
 
-                if !natural_message_judgement {
-                    return routing.is_empty() && commands.is_empty() && active.is_empty()
-                        && delivering.is_none() && replies.is_empty() && judging.is_none();
-                }
-                if judging.as_ref().is_some_and(|(reply, _)| same_session(&queued.message, &reply.message)) {
+                if judging.iter().any(|(reply, _)| same_session(&queued.message, &reply.message)) {
                     return false;
                 }
                 !pending_control(&queued.message, &routing, &commands)
                     && !active.iter().any(|a| same_session(&queued.message, &a.message))
                     && !replies.iter().any(|r| same_session(&queued.message, &r.message))
-                    && !delivering.as_ref().is_some_and(|d| same_session(&queued.message, &d.reply.message))
+                    && !delivering.iter().any(|d| same_session(&queued.message, &d.reply.message))
             });
             if let Some(index) = next_ordinary {
                 timing(timing_diagnostics, "admission_begin", None);
@@ -1867,8 +1921,9 @@ pub(crate) async fn run(
                 continue;
             }
             // 主动私聊：通道空闲时定期询问宿主；路由只取自已确认的私聊回执。
-            let channel_idle = pushing.is_none() && sending_file.is_none() && delivering.is_none() && progress_delivery.is_none()
-                && judging.is_none() && replies.is_empty() && status.borrow().ready;
+            let channel_idle = pushing.is_none() && sending_file.is_none() && pending_file.is_none()
+                && delivering.is_empty() && progress_delivery.is_empty()
+                && judging.is_empty() && replies.is_empty() && status.borrow().ready;
             let push_ready = push_interval.is_some() && channel_idle;
             if push_ready && let (Some(hook), Some(interval)) = (&outreach, push_interval)
                 && tokio::time::Instant::now() >= next_push {
@@ -1897,8 +1952,8 @@ pub(crate) async fn run(
                                     frame["parts"]=json!(meta.parts);
                                 }
                                 write(&mut stdin, frame).await?;
-                                deadline = tokio::time::Instant::now() + Duration::from_secs(35);
-                                pushing = Some(push.message.id);
+                                pushing = Some(AuxiliaryDelivery { id: push.message.id, scope, target,
+                                    deadline: tokio::time::Instant::now() + DELIVERY_TIMEOUT });
                             }
                             None => report(hook, &ctx, &push.message.id, QqOutreachResult::NotSent),
                         }
@@ -1909,14 +1964,65 @@ pub(crate) async fn run(
                 continue;
             }
             conversations.set_idle(active.is_empty() && queue.is_empty() && routing.is_empty() && commands.is_empty()
-                && replies.is_empty() && delivering.is_none() && pushing.is_none() && sending_file.is_none() && judging.is_none() && status.borrow().ready);
+                && replies.is_empty() && channel_idle && !narrating && progress_queue.is_empty());
+            let deadline = delivering.iter().filter(|d| d.awaiting()).map(|d| d.deadline)
+                .chain(progress_delivery.iter().map(|p| p.deadline))
+                .chain(pushing.iter().chain(sending_file.iter()).map(|d| d.deadline))
+                .chain((!status.borrow().ready).then_some(ready_deadline))
+                .min();
             let eligible: Vec<bool> = active.iter().map(|a| !pending_control(&a.message, &routing, &commands)).collect();
             tokio::select! {
                 biased;
                 _ = signal.cancelled() => break Ok(()),
                 _ = stop.changed() => break Ok(()),
-                _ = tokio::time::sleep_until(deadline), if !status.borrow().ready || delivering.as_ref().is_some_and(Delivery::awaiting) || pushing.is_some() || sending_file.is_some() || progress_delivery.is_some() => {
-                    break Err(failure("QQBot ready 或 delivery 等待超时"));
+                _ = tokio::time::sleep_until(deadline.unwrap_or(ready_deadline)), if deadline.is_some() => {
+                    let now = tokio::time::Instant::now();
+                    if !status.borrow().ready && now >= ready_deadline {
+                        break Err(failure("QQBot ready 等待超时"));
+                    }
+                    // 请求已经写出，超时只证明回执未知；按片段记录，不重新执行或重发。
+                    for position in (0..delivering.len()).rev() {
+                        if !delivering[position].awaiting() || delivering[position].deadline > now { continue; }
+                        let delivery = delivering.remove(position);
+                        let id = &delivery.reply.message.id;
+                        let index = ledger.find(&config.app_id, id).expect("delivery receipt");
+                        let entry = &mut ledger.entries[index];
+                        if delivery.sticker_sending {
+                            entry.sticker.as_mut().expect("sending sticker").state = PartState::Unknown;
+                        } else {
+                            entry.state = ReceiptState::Unknown;
+                            if let Some(segments) = &mut entry.segments {
+                                segments.parts[delivery.index].state = PartState::Unknown;
+                                segments.skip_rest();
+                            }
+                            if let Some(sticker) = &mut entry.sticker { sticker.state = PartState::Skipped; }
+                            if let (Some(hook), Some((invitation, part))) = (&outreach, &delivery.appendix) {
+                                report(hook, &ctx, invitation, if delivery.index == *part { QqOutreachResult::Unknown } else { QqOutreachResult::NotSent });
+                            }
+                            status.send_modify(|s| s.failed += 1);
+                        }
+                        ledger.save(&ctx)?;
+                        warn(&ctx, "delivery_timeout_unknown_no_retry");
+                        finish(&mut stdin, id).await?;
+                    }
+                    for position in (0..progress_delivery.len()).rev() {
+                        if progress_delivery[position].deadline > now { continue; }
+                        let progress = progress_delivery.remove(position);
+                        let id = &progress.message.id;
+                        let index = ledger.find(&config.app_id, id).expect("progress receipt");
+                        ledger.entries[index].progress[progress.part].state = PartState::Unknown;
+                        ledger.save(&ctx)?;
+                        if let Some(outgoing) = live_waiting.remove(id) { outgoing.complete(None); }
+                        warn(&ctx, "progress_timeout_unknown_no_retry");
+                    }
+                    if sending_file.as_ref().is_some_and(|d| d.deadline <= now) {
+                        let delivery = sending_file.take().expect("timed out file");
+                        if let Some(files) = &files { report_file(files, &ctx, &delivery.id, QqFileResult::Unknown); }
+                    }
+                    if pushing.as_ref().is_some_and(|d| d.deadline <= now) {
+                        let delivery = pushing.take().expect("timed out push");
+                        if let Some(hook) = &outreach { report(hook, &ctx, &delivery.id, QqOutreachResult::Unknown); }
+                    }
                 }
                 _ = tokio::time::sleep_until(next_push), if push_ready => {}
                 _ = tokio::time::sleep(Duration::from_millis(100)), if !queue.is_empty() => {}
@@ -1935,16 +2041,16 @@ pub(crate) async fn run(
                         }
                     }
                 }
-                _ = tokio::time::sleep_until(slow_steps.iter().filter(|(_, step)| stages || !step.reported).map(|(id, step)| step.next.max(last_progress.get(id).copied().unwrap_or(step.next)) + slow_after.unwrap_or_default()).min().unwrap_or(deadline)),
-                    if slow_after.is_some() && progress_delivery.is_none() && slow_steps.values().any(|step| stages || !step.reported) => {}
-                invite = judged(&mut judging), if judging.is_some() => {
-                    let (mut reply, _) = judging.take().expect("judging reply");
+                _ = tokio::time::sleep_until(slow_steps.iter().filter(|(_, step)| stages || !step.reported).map(|(id, step)| step.next.max(last_progress.get(id).copied().unwrap_or(step.next)) + slow_after.unwrap_or_default()).min().unwrap_or(ready_deadline)),
+                    if slow_after.is_some() && progress_delivery.len() < MAX_DELIVERIES && slow_steps.values().any(|step| stages || !step.reported) => {}
+                (index, invite) = judged(&mut judging), if !judging.is_empty() => {
+                    let (mut reply, _) = judging.remove(index);
                     reply.invite = Some(invite);
                     replies.push_front(reply);
                 }
                 // 停顿结束时唤醒：每次循环先处理一条待路由命令，命令清空后才写下一段。
-                _ = tokio::time::sleep_until(delivering.as_ref().and_then(|d| d.pause_until.or(d.sticker_at)).unwrap_or(deadline)),
-                    if delivering.as_ref().is_some_and(|d| !d.awaiting() && !pending_control(&d.reply.message, &routing, &commands)) => {}
+                _ = tokio::time::sleep_until(delivering.iter().filter(|d| !pending_control(&d.reply.message, &routing, &commands)).filter_map(|d| d.pause_until.or(d.sticker_at)).min().unwrap_or(ready_deadline)),
+                    if delivering.iter().any(|d| !d.awaiting() && !pending_control(&d.reply.message, &routing, &commands)) => {}
                 (index, report) = routed(&mut routing), if !routing.is_empty() => {
                     timing(timing_diagnostics, "routing_completed", None);
                     let route = routing.remove(index);
@@ -2063,7 +2169,7 @@ pub(crate) async fn run(
                 frame = frames.next() => {
                     conversations.set_idle(false);
                     let Some(frame) = frame? else {
-                        if !active.is_empty() || !routing.is_empty() || delivering.is_some() || pushing.is_some() || progress_delivery.is_some() || judging.is_some() || !queue.is_empty()
+                        if !active.is_empty() || !routing.is_empty() || !delivering.is_empty() || pushing.is_some() || sending_file.is_some() || pending_file.is_some() || !progress_delivery.is_empty() || !judging.is_empty() || !queue.is_empty()
                             || !commands.is_empty() || !replies.is_empty() || !status.borrow().ready {
                             break Err(failure("QQBot 在未完成交互时断开；保留状态"));
                         }
@@ -2096,21 +2202,23 @@ pub(crate) async fn run(
                             }
                         }
                         Some("delivery") if frame.get("progress").and_then(Value::as_bool) == Some(true) => {
-                            let Some((id, part)) = progress_delivery.as_ref() else { warn(&ctx, "unexpected_progress_delivery"); continue; };
-                            if frame.get("id").and_then(Value::as_str) != Some(id.as_str()) || frame.get("index").and_then(Value::as_u64) != Some(*part as u64) {
-                                warn(&ctx, "progress_delivery_mismatch"); continue;
-                            }
+                            let Some(position) = progress_delivery.iter().position(|p|
+                                frame.get("id").and_then(Value::as_str) == Some(p.message.id.as_str())
+                                && frame.get("index").and_then(Value::as_u64) == Some(p.part as u64))
+                                else { warn(&ctx, "unexpected_progress_delivery"); continue; };
+                            let progress = &progress_delivery[position];
+                            let (id, part) = (&progress.message.id, progress.part);
                             let Some(reported_ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
                             let ok = reported_ok && frame.get("message_id").and_then(Value::as_str).is_some_and(valid_message_id);
                             let index = ledger.find(&config.app_id, id).expect("progress receipt");
-                            ledger.entries[index].progress[*part].state = if ok { PartState::Sent } else if delivery_unknown(&frame) { PartState::Unknown } else { PartState::Failed };
+                            ledger.entries[index].progress[part].state = if ok { PartState::Sent } else if delivery_unknown(&frame) { PartState::Unknown } else { PartState::Failed };
                             ledger.save(&ctx)?;
                             if !ok { delivery_log(&ctx, "progress_failed_no_retry", &frame); }
                             if let Some(outgoing) = live_waiting.remove(id) { outgoing.complete(if ok { frame.get("message_id").and_then(Value::as_str).map(str::to_owned) } else { None }); }
-                            progress_delivery = None;
+                            progress_delivery.remove(position);
                         }
                         Some("delivery") if frame.get("file").and_then(Value::as_bool) == Some(true) => {
-                            let (Some(files), Some(current)) = (&files, sending_file.as_deref()) else { warn(&ctx, "unexpected_delivery"); continue; };
+                            let (Some(files), Some(current)) = (&files, sending_file.as_ref().map(|d| d.id.as_str())) else { warn(&ctx, "unexpected_delivery"); continue; };
                             if frame.get("id").and_then(Value::as_str) != Some(current) { warn(&ctx, "delivery_id_mismatch"); continue; }
                             let Some(reported_ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
                             let ok = reported_ok && frame.get("message_id").and_then(Value::as_str).is_some_and(valid_message_id);
@@ -2119,7 +2227,7 @@ pub(crate) async fn run(
                             sending_file = None;
                         }
                         Some("delivery") if frame.get("push").and_then(Value::as_bool) == Some(true) => {
-                            let (Some(hook), Some(current)) = (&outreach, pushing.as_deref()) else { warn(&ctx, "unexpected_delivery"); continue; };
+                            let (Some(hook), Some(current)) = (&outreach, pushing.as_ref().map(|d| d.id.as_str())) else { warn(&ctx, "unexpected_delivery"); continue; };
                             if frame.get("id").and_then(Value::as_str) != Some(current) { warn(&ctx, "delivery_id_mismatch"); continue; }
                             let Some(reported_ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
                             let ok = reported_ok && frame.get("message_id").and_then(Value::as_str).is_some_and(valid_message_id);
@@ -2128,10 +2236,10 @@ pub(crate) async fn run(
                             pushing = None;
                         }
                         Some("delivery") if frame.get("sticker").and_then(Value::as_bool) == Some(true) => {
-                            let Some(delivery) = delivering.as_ref().filter(|d| d.sticker_sending) else { warn(&ctx, "unexpected_delivery"); continue; };
-                            if frame.get("id").and_then(Value::as_str) != Some(delivery.reply.message.id.as_str()) {
-                                warn(&ctx, "delivery_id_mismatch"); continue;
-                            }
+                            let Some(position) = delivering.iter().position(|d| d.sticker_sending
+                                && frame.get("id").and_then(Value::as_str) == Some(d.reply.message.id.as_str()))
+                                else { warn(&ctx, "unexpected_delivery"); continue; };
+                            let delivery = &delivering[position];
                             let Some(reported_ok) = frame.get("ok").and_then(Value::as_bool) else { warn(&ctx, "invalid_delivery"); continue; };
                             let ok = reported_ok && frame.get("message_id").and_then(Value::as_str).is_some_and(valid_message_id);
                             let index = ledger.find(&config.app_id, &delivery.reply.message.id).expect("inserted receipt");
@@ -2139,10 +2247,13 @@ pub(crate) async fn run(
                                 if ok { PartState::Sent } else if delivery_unknown(&frame) { PartState::Unknown } else { PartState::Failed };
                             ledger.save(&ctx)?;
                             if !ok { delivery_log(&ctx, "sticker_failed_no_retry", &frame); }
-                            delivering = None;
+                            delivering.remove(position);
                         }
                         Some("delivery") => {
-                            let Some(delivery) = delivering.as_mut().filter(|d| d.awaiting() && !d.sticker_sending) else { warn(&ctx, "unexpected_delivery"); continue; };
+                            let Some(position) = delivering.iter().position(|d| d.awaiting() && !d.sticker_sending
+                                && frame.get("id").and_then(Value::as_str) == Some(d.reply.message.id.as_str()))
+                                else { warn(&ctx, "unexpected_delivery"); continue; };
+                            let delivery = &mut delivering[position];
                             let message = &delivery.reply.message;
                             if frame.get("id").and_then(Value::as_str) != Some(message.id.as_str()) {
                                 warn(&ctx, "delivery_id_mismatch"); continue;
@@ -2214,7 +2325,7 @@ pub(crate) async fn run(
                                 sticker.state = PartState::Skipped;
                                 ledger.save(&ctx)?;
                             }
-                            delivering = None;
+                            delivering.remove(position);
                         }
                         Some("group_observation") => {
                             let Some(observer) = &group_observer else { continue; };
@@ -2265,12 +2376,12 @@ pub(crate) async fn run(
                                 || active.iter().any(|a| a.message.id == message.id)
                                 || routing.iter().any(|r| r.message.id == message.id)
                                 || replies.iter().any(|r| r.message.id == message.id)
-                                || judging.as_ref().is_some_and(|(r, _)| r.message.id == message.id)
-                                || delivering.as_ref().is_some_and(|d| d.reply.message.id == message.id);
+                                || judging.iter().any(|(r, _)| r.message.id == message.id)
+                                || delivering.iter().any(|d| d.reply.message.id == message.id);
                             if live { warn(&ctx, "duplicate_pending"); continue; }
                             let duplicate = ledger.contains(&config.app_id, &message.id)?;
                             let pending = queue.len() + commands.len() + active.len() + replies.len()
-                                + routing.len() + usize::from(delivering.is_some()) + usize::from(judging.is_some());
+                                + routing.len() + delivering.len() + judging.len();
                             if duplicate {
                                 warn(&ctx, "duplicate_no_replay");
                                 finish(&mut stdin, &message.id).await?;
@@ -2454,23 +2565,28 @@ pub(crate) async fn run(
         }
     }.await;
     // 停止时尚未写出的邀请段确定没有发送；已写出但未收到回执的留给宿主重启时核对。
-    if let (Some(hook), Some(delivery)) = (&outreach, &delivering)
-        && let Some((id, part)) = &delivery.appendix
-        && ledger
-            .find(&config.app_id, &delivery.reply.message.id)
-            .is_some_and(|index| {
-                ledger.entries[index]
-                    .segments
-                    .as_ref()
-                    .is_some_and(|segments| {
-                        matches!(
-                            segments.parts[*part].state,
-                            PartState::Pending | PartState::Skipped
-                        )
-                    })
-            })
-    {
-        report(hook, &ctx, id, QqOutreachResult::NotSent);
+    for delivery in &delivering {
+        if let Some(hook) = &outreach
+            && let Some((id, part)) = &delivery.appendix
+            && ledger
+                .find(&config.app_id, &delivery.reply.message.id)
+                .is_some_and(|index| {
+                    ledger.entries[index]
+                        .segments
+                        .as_ref()
+                        .is_some_and(|segments| {
+                            matches!(
+                                segments.parts[*part].state,
+                                PartState::Pending | PartState::Skipped
+                            )
+                        })
+                })
+        {
+            report(hook, &ctx, id, QqOutreachResult::NotSent);
+        }
+    }
+    if let (Some(files), Some((file, _))) = (&files, pending_file) {
+        report_file(files, &ctx, &file.id, QqFileResult::NotSent);
     }
     // MessageService 拥有准入动作；停止不能丢弃 wait 后遗留它启动的替代代。
     // 先等路由收尾，再查询目标会话最新代，随后取消并等待全部本地执行器。

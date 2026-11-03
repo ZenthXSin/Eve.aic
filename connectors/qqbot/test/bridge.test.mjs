@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Readable, PassThrough } from "node:stream";
 import { createBridge, consume, optionsFromEnv, readableFaces, MAX_FRAME, MAX_MESSAGE_ID_BYTES, MAX_PUSH_BYTES, MAX_SEGMENTS, PASSIVE_REPLY_WINDOW_MS } from "../bridge-core.mjs";
-function fixture({ group = {}, fail = false, error = null, now, limit = 128, appId = "1904159860", hold = null, fileFail = false, imageFail = false, textResult = { id: "out-1" }, fileResult, imageResult } = {}) {
+function fixture({ group = {}, timers = {}, fail = false, error = null, now, limit = 128, appId = "1904159860", hold = null, fileFail = false, imageFail = false, textResult = { id: "out-1" }, fileResult, imageResult } = {}) {
   const frames = [], sent = [], files = [], images = [], handlers = new Map();
   const bot = {
     appId,
@@ -25,7 +25,7 @@ function fixture({ group = {}, fail = false, error = null, now, limit = 128, app
       return fileResult ?? { upload: { file_uuid: "uuid-1", file_info: "info-1", ttl: 60 }, message: { id: "file-msg-1" } };
     },
   };
-  const bridge = createBridge(bot, f => frames.push(f), limit, now, group);
+  const bridge = createBridge(bot, f => frames.push(f), limit, now, group, timers);
   const message = (kind = "c2c", id = "in-1") => handlers.get("message")({}, {
     kind, messageId: id, senderId: "user-1", content: "你好",
     rawEventType: kind === "group" ? "GROUP_AT_MESSAGE_CREATE" : "C2C_MESSAGE_CREATE",
@@ -48,6 +48,48 @@ async function within(promise) {
   } finally { clearTimeout(timer); }
 }
 const line = frame => JSON.stringify({ version: 1, ...frame }) + "\n";
+
+test("进度 SDK 超时保留未知，最终回复仍可发送，迟到成功不会改写结果", async () => {
+  const held=deferred();
+  const timeouts=new Set();
+  const timers={setTimeout(callback){timeouts.add(callback);return callback;},clearTimeout(callback){timeouts.delete(callback);}};
+  const f=fixture({timers,hold(_target,text){if(text==='慢进度')return held.promise;}});
+  f.message();
+  const sending=f.bridge.command({version:1,type:'progress',id:'in-1',index:0,text:'慢进度'});
+  await new Promise(setImmediate);
+  assert.equal(f.sent.length,1);
+  for(const callback of [...timeouts])callback();
+  await sending;
+  assert.equal(f.frames.at(-1).ok,false);
+  assert.equal(f.frames.at(-1).failure_kind,'timeout');
+  await f.bridge.command({version:1,type:'reply',id:'in-1',text:'最终结果'});
+  assert.equal(f.frames.at(-1).ok,true);
+  held.resolve();
+  await new Promise(setImmediate);
+  assert.deepEqual(f.sent.map(s=>s.text),['慢进度','最终结果']);
+  assert.equal(f.frames.filter(f=>f.type==='delivery'&&f.progress).length,1);
+  assert.equal(timeouts.size,0);
+});
+
+test("超时后仍在 SDK 的请求继续占容量，避免累积未知请求", async () => {
+  const held=deferred();
+  let timeout;
+  const f=fixture({limit:1,hold:held.promise,timers:{setTimeout(callback){timeout=callback;return callback;},clearTimeout(){}}});
+  f.message();
+  const first=f.bridge.command({version:1,type:'reply',id:'in-1',text:'等待到期'});
+  await new Promise(setImmediate);
+  timeout();
+  await first;
+  await f.bridge.command({version:1,type:'push',id:'while-unknown',target_id:'user-2',text:'尚无容量'});
+  assert.equal(f.sent.length,1);
+  assert.ok(f.frames.some(f=>f.code==='outbound_limit'));
+  held.resolve();
+  await new Promise(setImmediate);
+  await f.bridge.command({version:1,type:'push',id:'after-settled',target_id:'user-2',text:'容量恢复'});
+  assert.equal(f.sent.length,2);
+  assert.equal(f.frames.at(-1).ok,true);
+  assert.equal(f.frames.filter(f=>f.type==='delivery'&&f.id==='in-1').length,1);
+});
 
 test("进展与最终分段共用五条配额，重复进展不重发，原始路由保持不变", async () => {
   const f = fixture(); f.message("group");
