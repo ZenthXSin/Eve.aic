@@ -330,6 +330,12 @@ async fn missing_original_is_a_gap_but_present_empty_body_remains_exact() {
             .is_err()
     );
     assert!(
+        host.conversations
+            .legacy_review_gap_at(&scope(&gap), &gap.id)
+            .is_err(),
+        "缺失当前原文不是可降级的旧格式缺口"
+    );
+    assert!(
         host.record("app", &gap, Some(&gap.text)).is_err(),
         "加工正文不能回填已有缺口"
     );
@@ -663,6 +669,11 @@ async fn legacy_receipts_create_a_persistent_gap_until_six_new_platform_original
                 .review_user_messages(&scope(message))
                 .is_err()
         );
+        assert!(
+            host.conversations
+                .legacy_review_gap_at(&scope(message), &message.id)
+                .unwrap()
+        );
     }
     let saved_marker = store.marker().unwrap();
     host.kernel.stop_all().await.unwrap();
@@ -690,6 +701,12 @@ async fn legacy_receipts_create_a_persistent_gap_until_six_new_platform_original
             assert!(evidence.is_err(), "已有五条真实原话仍不能宣称历史六条完整");
         } else {
             assert_eq!(evidence.unwrap(), texts);
+            assert!(
+                !restarted
+                    .conversations
+                    .legacy_review_gap_at(&scope(&messages[id]), &messages[id].id)
+                    .unwrap()
+            );
         }
     }
     assert_eq!(

@@ -694,6 +694,15 @@ pub trait ReviewUserMessageSource: Send + Sync {
     fn is_current(&self, _scope: &ContextScope, _anchor: &str) -> Result<bool, LlmError> {
         Err(LlmError::Context("原话来源不支持审核新鲜度检查".into()))
     }
+    /// 仅可信来源确认的旧格式原话缺口可继续无工具聊天；损坏、身份错误等不得放行。
+    /// 宿主在整个当前轮次移除全部工具，后续完整新轮次才恢复工具目录。
+    fn allows_chat_without_tools_at(
+        &self,
+        _scope: &ContextScope,
+        _anchor: &str,
+    ) -> Result<bool, LlmError> {
+        Ok(false)
+    }
 }
 
 /// 宿主绑定的审核有效性检查；模型参数不能构造或替换此守卫。

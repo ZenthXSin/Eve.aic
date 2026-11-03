@@ -124,16 +124,78 @@ import dialogue_tools_test as dialogue
 
 
 class ArchivedToolAcceptance(dialogue.DialogueToolsAcceptance):
+    ledger = segment.SegmentAcceptance.ledger
+
     for _name in dir(dialogue.DialogueToolsAcceptance):
         if _name.startswith("test_"):
             locals()[_name] = None
     del _name
+
+    def test_legacy_conversation_recovers_tools_through_ordinary_chat_across_restart(self):
+        entries, _ = ReceiptCapacityAcceptance.seed(self, 340, 32768)
+        originals = [f"迁移后的普通聊天 {i}，继续聊今天的计划。" for i in range(5)]
+        lookup = "现在帮我核对 old-1 的原始回执。"
+        tool_results = []
+
+        def assert_history_preserved():
+            with sqlite3.connect(self.work / "state/qq-receipts.sqlite3") as db:
+                archived = [json.loads(row[0]) for row in db.execute("SELECT payload FROM receipts")]
+            saved = {entry["message"]["id"]: entry
+                     for entry in archived + self.ledger()["entries"]}
+            self.assertTrue(all(saved.get(entry["message"]["id"]) == entry for entry in entries))
+
+        def respond(body):
+            current = next(m["content"] for m in reversed(body["messages"])
+                           if m["role"] == "user")
+            results = self.results(body)
+            if current in originals:
+                self.assertFalse(body.get("tools"), "迁移原话尚未完整时只允许文字交流")
+                return dialogue.text_response("好，接着聊今天的计划。")
+            self.assertEqual(current, lookup)
+            self.assertIn("read_raw_message", self.definitions(body))
+            if not results:
+                return dialogue.tool_response([("read_raw_message", {"message_id": "old-1"})])
+            self.assertTrue(results[-1]["found"], results[-1])
+            self.assertIn("旧输入", results[-1]["data"])
+            tool_results.append(results[-1])
+            return dialogue.text_response("原始回执仍在，已经核对。")
+
+        self.callback = respond
+        options = dict(interest=False, memory=True, research=False, practice=False,
+                       env_extra={"EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS": "200000"})
+        script = [step for i in range(2) for step in self.send(self.message(
+            f"natural-{i}", originals[i], expected="好，接着聊今天的计划。"))]
+        summary = self.run_eve(script, **options)
+        self.assertEqual(summary["completed"], 2)
+        self.assertEqual(self.chat_rounds, 2)
+        assert_history_preserved()
+
+        # 重启保留迁移缺口；继续普通聊天即可补足，不要求发送命令或重说旧消息。
+        script = [step for i in range(2, 5) for step in self.send(self.message(
+            f"natural-{i}", originals[i], expected="好，接着聊今天的计划。"))]
+        script += self.send(self.message("natural-sixth", lookup, expected="原始回执仍在，已经核对。"))
+        summary = self.run_eve(script, **options)
+        self.assertEqual(summary["completed"], 4)
+        self.assertEqual(len(tool_results), 1)
+        self.assertEqual(self.chat_rounds, 7)
+        assert_history_preserved()
+        with sqlite3.connect(self.work / "state/qq-receipts.sqlite3") as db:
+            saved = [row[0] for row in db.execute("SELECT text FROM qq_originals ORDER BY seq")]
+        self.assertEqual(saved, originals + [lookup], "原文库不得混入加工后的旧回执")
+
+        self.run_eve(self.send(self.message(
+            "natural-after-restart", lookup, expected="原始回执仍在，已经核对。")), **options)
+        self.assertEqual(len(tool_results), 2)
+        assert_history_preserved()
 
     def test_model_pulls_archived_receipt_pages_without_crossing_session_or_replaying(self):
         ReceiptCapacityAcceptance.seed(self,340,32768)
         def respond(body):
             results = self.results(body)
             text = body["messages"][max(i for i,m in enumerate(body["messages"]) if m["role"]=="user")]["content"]
+            if text == "原话不足时查询":
+                self.assertEqual(body.get("tools", []), [], "旧格式缺口不能开放任何工具")
+                return dialogue.text_response("可以继续聊，这轮暂时不能查询旧资料")
             if not results:
                 return dialogue.tool_response([("read_raw_message",{"message_id":"old-1"}),
                     ("read_raw_message",{"message_id":"old-1","offset":8192})])
@@ -149,13 +211,13 @@ class ArchivedToolAcceptance(dialogue.DialogueToolsAcceptance):
             return dialogue.text_response("已按会话核验旧资料，未执行原请求")
         self.callback=respond
         self.run_eve([
-            *self.send(self.message("missing-originals", "原话不足时查询", contains="尚未启动工具调用")),
+            *self.send(self.message("missing-originals", "原话不足时查询", expected="可以继续聊，这轮暂时不能查询旧资料")),
             *[step for i in range(6) for step in self.send(self.message(
                 f"original-{i}", "/admin", expected="当前平台身份：管理员。"))],
             *self.send(self.message("lookup","本会话查归档",expected="已按会话核验旧资料，未执行原请求")),
             *self.send(self.message("foreign-lookup","另一会话查归档",user="user-2",expected="已按会话核验旧资料，未执行原请求"))],
             interest=False,memory=False,research=False,practice=False)
-        self.assertEqual(self.chat_rounds,4)
+        self.assertEqual(self.chat_rounds,5)
 
 
 if __name__ == "__main__":

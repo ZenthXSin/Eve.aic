@@ -7,6 +7,18 @@ pub(crate) struct QqReviewSource {
 }
 
 impl ReviewUserMessageSource for QqReviewSource {
+    fn allows_chat_without_tools_at(
+        &self,
+        scope: &ContextScope,
+        anchor: &str,
+    ) -> Result<bool, LlmError> {
+        if crate::web_chat::is_owner(scope) || scope.user_id == crate::qq_group::USER {
+            return Ok(false);
+        }
+        self.conversations
+            .legacy_review_gap_at(scope, anchor)
+            .map_err(|_| LlmError::Context("QQ 原文缺口无法核验；未开放工具".into()))
+    }
     fn is_current(&self, scope: &ContextScope, anchor: &str) -> Result<bool, LlmError> {
         if crate::web_chat::is_owner(scope) {
             return self

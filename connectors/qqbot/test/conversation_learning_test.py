@@ -11,6 +11,7 @@ import unittest
 
 from group_chat_test import GroupChatAcceptance
 from dialogue_tools_test import text_response
+from memory_test import MemoryAcceptance
 
 ROOT = Path(__file__).resolve().parents[3]
 SPEC = importlib.util.spec_from_file_location("web_learning_fixture", ROOT / "scripts/test-web-autonomy.py")
@@ -96,6 +97,11 @@ class GroupConversationLearning(GroupChatAcceptance):
         def pending():
             self.wait_for(lambda: self.learned(), "旁观交流没有候选", 20)
             self.assertFalse(self.learned()[0]["lessons"][0]["active"])
+            status, readiness = MemoryAcceptance.panel(self, "/api/readiness")
+            self.assertEqual(status, 200)
+            role = next(r for r in readiness["roles"] if r["role"] == "conversation_learning")
+            self.assertGreaterEqual(role["requests"], 1)
+            self.assertEqual(role["failures"], 0)
 
         def active():
             self.wait_for(lambda: self.learned() and self.learned()[0]["lessons"][0]["active"], "独立新证据没有确认经验", 20)
@@ -108,7 +114,7 @@ class GroupConversationLearning(GroupChatAcceptance):
                   self.observation("b2", "先歇会儿，真够累的", user="member-3"),
                   self.observation("b3", "刚刚坐下", user="member-2"),
                   self.observation("b4", "喘口气吧", user="member-3")]
-        self.run_eve([*first, *self.checkpoint("pending"), *second, *self.checkpoint("active")], checkpoints={"pending":pending, "active":active})
+        self.run_eve([*first, *self.checkpoint("pending"), *second, *self.checkpoint("active")], checkpoints={"pending":pending, "active":active}, panel=True)
         self.assertEqual(self.pushes(), [], "学习他人交流不应制造回复")
         self.assertEqual(self.kind("chat"), [], "旁观不伪造一次与 Eve 的对话")
         self.assertEqual(self.learned()[0]["lessons"][0]["observations"], 2)
