@@ -695,6 +695,7 @@ impl LlmHost {
         review_user_messages: &mut Arc<Vec<String>>,
         diagnostics: &mut TurnDiagnostics,
         planned_history: bool,
+        chat_without_tools: bool,
         messages: &mut Vec<ChatMessage>,
         transcript: &mut Vec<ChatMessage>,
     ) -> Result<(), TurnFailure> {
@@ -714,21 +715,23 @@ impl LlmHost {
                     diagnostics.clone(),
                 ));
             }
-            let originals = Arc::make_mut(review_user_messages);
-            // 使用消费批次携带的锚点；后到而未消费的消息不参与当前工具授权。
-            if let Some(current) = self
-                .channel_review_messages(scope, batch.review_anchor.as_deref())
-                .map_err(|error| fail(error, diagnostics.clone()))?
-            {
-                *originals = current;
-            } else {
-                originals.extend(batch.messages.iter().cloned());
-                originals.drain(..originals.len().saturating_sub(6));
-            }
-            diagnostics.review_user_messages = Some(originals.clone());
-            if planned_history {
-                validate_review_originals(originals)
-                    .map_err(|error| fail(error, diagnostics.clone()))?;
+            if !chat_without_tools {
+                let originals = Arc::make_mut(review_user_messages);
+                // 使用消费批次携带的锚点；后到而未消费的消息不参与当前工具授权。
+                if let Some(current) = self
+                    .channel_review_messages(scope, batch.review_anchor.as_deref())
+                    .map_err(|error| fail(error, diagnostics.clone()))?
+                {
+                    *originals = current;
+                } else {
+                    originals.extend(batch.messages.iter().cloned());
+                    originals.drain(..originals.len().saturating_sub(6));
+                }
+                diagnostics.review_user_messages = Some(originals.clone());
+                if planned_history {
+                    validate_review_originals(originals)
+                        .map_err(|error| fail(error, diagnostics.clone()))?;
+                }
             }
         }
         for text in batch.messages {
@@ -771,6 +774,26 @@ impl LlmHost {
             validate_delegated_review_messages(messages)?;
         }
         Ok(messages)
+    }
+
+    fn allows_chat_without_tools(&self, scope: Option<&eve_llm_api::ContextScope>) -> bool {
+        if self.delegated || self.journal.is_some() {
+            return false;
+        }
+        let Some(((source, scope), anchor)) = self
+            .review_source
+            .as_ref()
+            .zip(scope)
+            .zip(self.review_anchor.as_deref())
+        else {
+            return false;
+        };
+        matches!(
+            catch_unwind(AssertUnwindSafe(
+                || source.allows_chat_without_tools_at(scope, anchor)
+            )),
+            Ok(Ok(true))
+        )
     }
     pub fn with_run_deadline(mut self, deadline: std::time::Instant) -> Self {
         self.run_deadline = Some(self.run_deadline.map_or(deadline, |old| old.min(deadline)));
@@ -1015,17 +1038,27 @@ impl LlmHost {
             }
         }
         // 审核原话独立保留，先于历史窗口裁剪和上下文压缩；委派说明不是用户授权。
+        let mut chat_without_tools = false;
         let mut review_user_messages = match &self.delegated_review {
             Some((_, originals)) => originals.clone(),
             None => Arc::new(
-                self.channel_review_messages(scope.as_ref(), self.review_anchor.as_deref())
-                    .map_err(|error| fail(error, diagnostics.clone()))?
-                    .unwrap_or_else(|| {
+                match self.channel_review_messages(scope.as_ref(), self.review_anchor.as_deref()) {
+                    Ok(messages) => messages.unwrap_or_else(|| {
                         review_originals(&prepared.context.history, &input.text, self.delegated)
                     }),
+                    Err(_) if self.allows_chat_without_tools(scope.as_ref()) => {
+                        chat_without_tools = true;
+                        prepared.tools.clear();
+                        prepared.context.profile.push_str("\n本轮只能文字交流，不能使用工具或声称已经执行外部操作。正常接话；确实需要操作时说明本轮暂时不能执行，不要求用户补说历史消息。\n");
+                        Vec::new()
+                    }
+                    Err(error) => return Err(fail(error, diagnostics)),
+                },
             ),
         };
-        diagnostics.review_user_messages = Some(review_user_messages.as_ref().clone());
+        if !chat_without_tools {
+            diagnostics.review_user_messages = Some(review_user_messages.as_ref().clone());
+        }
         let mut consumed_review_anchor = self.review_anchor.clone();
         let mut planned_history = false;
         if let Some(planner) = &self.history_context_planner {
@@ -1250,6 +1283,7 @@ impl LlmHost {
                     &mut review_user_messages,
                     &mut diagnostics,
                     planned_history,
+                    chat_without_tools,
                     &mut messages,
                     &mut transcript,
                 )?;
@@ -1358,6 +1392,7 @@ impl LlmHost {
                     &mut review_user_messages,
                     &mut diagnostics,
                     planned_history,
+                    chat_without_tools,
                     &mut messages,
                     &mut transcript,
                 )?;
@@ -1401,6 +1436,12 @@ impl LlmHost {
             let ModelResponse::ToolCalls { calls } = response else {
                 unreachable!()
             };
+            if chat_without_tools {
+                return Err(fail(
+                    LlmError::Context("本轮审核原话不足，仅允许文字交流；未执行工具".into()),
+                    diagnostics,
+                ));
+            }
             let calls_exhausted = calls.len()
                 > self
                     .config
@@ -2908,6 +2949,7 @@ mod tests {
             &mut originals,
             &mut diagnostics,
             false,
+            false,
             &mut messages,
             &mut transcript,
         )
@@ -2929,12 +2971,37 @@ mod tests {
                 &mut originals,
                 &mut diagnostics,
                 false,
+                false,
                 &mut messages,
                 &mut transcript
             )
             .is_err()
         );
         assert_eq!(messages, before);
+
+        // 迁移缺口已将本轮固定为纯文字；消费后到消息不补造审核背景。
+        let mut originals = Arc::new(vec![]);
+        let mut diagnostics = TurnDiagnostics::default();
+        host.apply_steering_batch(
+            eve_llm_api::SteeringBatch {
+                messages: vec!["补充聊聊今天".into()],
+                review_anchor: Some("later".into()),
+            },
+            Some(&scope),
+            &mut originals,
+            &mut diagnostics,
+            true,
+            true,
+            &mut messages,
+            &mut transcript,
+        )
+        .unwrap();
+        assert!(originals.is_empty());
+        assert!(diagnostics.review_user_messages.is_none());
+        assert_eq!(
+            messages.last().unwrap().text.as_deref(),
+            Some("补充聊聊今天")
+        );
     }
 
     #[tokio::test]

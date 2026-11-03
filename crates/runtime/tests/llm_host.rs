@@ -22,6 +22,97 @@ use tokio::sync::Notify;
 const OWNER: &str = "llm-test-owner";
 const CONTEXT: &str = "llm-test.context";
 
+struct LegacyReviewSource {
+    gap: bool,
+}
+impl eve_llm_api::ReviewUserMessageSource for LegacyReviewSource {
+    fn read(&self, _: &eve_llm_api::ContextScope) -> Result<Option<Vec<String>>, LlmError> {
+        panic!("必须使用当前消息锚点")
+    }
+    fn read_at(
+        &self,
+        _: &eve_llm_api::ContextScope,
+        _: &str,
+    ) -> Result<Option<Vec<String>>, LlmError> {
+        Err(LlmError::Context("原话不足或来源异常".into()))
+    }
+    fn allows_chat_without_tools_at(
+        &self,
+        _: &eve_llm_api::ContextScope,
+        anchor: &str,
+    ) -> Result<bool, LlmError> {
+        assert_eq!(anchor, "current");
+        Ok(self.gap)
+    }
+}
+
+#[tokio::test]
+async fn legacy_review_gap_allows_text_without_tools_but_rejects_model_tool_calls() {
+    let provider = RecordingProvider::scripted(vec![
+        final_response("聊聊今天吧"),
+        tool_response(vec![call("forbidden", "echo", json!({}))]),
+    ]);
+    let tool = Arc::new(TestTool::new(
+        "echo",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    ));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![tool.clone()],
+        LlmHostConfig::default(),
+    )
+    .await;
+    let host = host
+        .with_review_user_message_source(Arc::new(LegacyReviewSource { gap: true }))
+        .with_review_user_message_anchor("current".into())
+        .unwrap();
+    let scope = Some(eve_llm_api::ContextScope {
+        session_id: "s".into(),
+        user_id: "u".into(),
+    });
+    let output = host
+        .run_scoped_turn_with_events(turn(), scope.clone(), &ProgressRecorder::default())
+        .await
+        .unwrap();
+    assert_eq!(output.text, "聊聊今天吧");
+    assert!(
+        output.diagnostics.review_user_messages.is_none(),
+        "不能把空数组伪装成完整审核证据"
+    );
+    let failure = host
+        .run_scoped_turn_with_events(turn(), scope, &ProgressRecorder::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(failure.error, LlmError::Context(_)));
+    assert!(tool.starts.lock().unwrap().is_empty());
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|r| r.tools.is_empty()));
+}
+
+#[tokio::test]
+async fn unknown_review_failure_still_stops_before_requesting_model() {
+    let provider = RecordingProvider::scripted(vec![final_response("不该请求")]);
+    let (host, _, _) = make_host(provider.clone(), vec![], LlmHostConfig::default()).await;
+    let host = host
+        .with_review_user_message_source(Arc::new(LegacyReviewSource { gap: false }))
+        .with_review_user_message_anchor("current".into())
+        .unwrap();
+    let result = host
+        .run_scoped_turn_with_events(
+            turn(),
+            Some(eve_llm_api::ContextScope {
+                session_id: "s".into(),
+                user_id: "u".into(),
+            }),
+            &ProgressRecorder::default(),
+        )
+        .await;
+    assert!(matches!(result.unwrap_err().error, LlmError::Context(_)));
+    assert!(provider.requests.lock().unwrap().is_empty());
+}
+
 #[derive(Default)]
 struct MemoryJournal {
     frame: Mutex<Option<eve_llm_api::TurnCheckpoint>>,

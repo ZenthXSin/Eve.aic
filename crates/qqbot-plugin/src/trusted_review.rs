@@ -217,6 +217,28 @@ impl TrustedReview {
         session: &SessionKey,
         id: &str,
     ) -> PluginResult<Vec<String>> {
+        let (originals, legacy_gap) = self.read_checked(app, session, id)?;
+        if legacy_gap {
+            return Err(unavailable());
+        }
+        Ok(originals)
+    }
+
+    pub(crate) fn legacy_gap(
+        &self,
+        app: &str,
+        session: &SessionKey,
+        id: &str,
+    ) -> PluginResult<bool> {
+        self.read_checked(app, session, id).map(|(_, gap)| gap)
+    }
+
+    fn read_checked(
+        &self,
+        app: &str,
+        session: &SessionKey,
+        id: &str,
+    ) -> PluginResult<(Vec<String>, bool)> {
         let state = self.0.lock().map_err(|_| unavailable())?;
         let binding = state.binding.as_ref().ok_or_else(unavailable)?;
         let records = state
@@ -224,14 +246,11 @@ impl TrustedReview {
             .as_ref()
             .ok_or_else(unavailable)?
             .read_originals_bound(app, session, id, &binding.expected())?;
-        if records.len() < 6
+        let legacy_gap = records.len() < 6
             && binding
                 .legacy_scopes
                 .iter()
-                .any(|legacy| legacy.app_id == app && legacy.session == *session)
-        {
-            return Err(unavailable());
-        }
+                .any(|legacy| legacy.app_id == app && legacy.session == *session);
         let mut ids = std::collections::BTreeSet::new();
         if records.is_empty()
             || records.len() > 6
@@ -245,10 +264,11 @@ impl TrustedReview {
         {
             return Err(unavailable());
         }
-        records
+        let originals = records
             .into_iter()
             .map(|record| record.text.ok_or_else(unavailable))
-            .collect()
+            .collect::<PluginResult<Vec<_>>>()?;
+        Ok((originals, legacy_gap))
     }
 
     pub(crate) fn is_current(

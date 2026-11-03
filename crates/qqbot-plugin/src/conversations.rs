@@ -288,6 +288,23 @@ impl QqConversations {
             .ok_or_else(|| PluginError::State("QQ 审核缺少平台身份".into()))?;
         self.review.is_current(&identity.app_id, &session, anchor)
     }
+
+    /// 完整核对库绑定、当前消息与已存原文后，只报告旧格式历史的缺口。
+    pub fn legacy_review_gap_at(
+        &self,
+        scope: &eve_llm_api::ContextScope,
+        anchor: &str,
+    ) -> PluginResult<bool> {
+        if !crate::state::valid_message_id(anchor) {
+            return Err(PluginError::State("QQ 审核消息锚点无效".into()));
+        }
+        let session = SessionKey::new(&scope.session_id, &scope.user_id)
+            .map_err(|_| PluginError::State("QQ 审核身份无效".into()))?;
+        let identity = self
+            .identity(&session)?
+            .ok_or_else(|| PluginError::State("QQ 审核缺少平台身份".into()))?;
+        self.review.legacy_gap(&identity.app_id, &session, anchor)
+    }
     /// 仅在实时引导已保存且即将对模型可见时推进审核锚点；后到的排队消息不改变旧轮原话。
     pub(crate) fn advance_review_anchor(
         &self,
