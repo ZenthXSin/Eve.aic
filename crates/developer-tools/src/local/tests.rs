@@ -56,6 +56,7 @@ fn observation_capabilities_match_the_backend_root_and_command_switch() {
         backend.observation_capabilities(),
         Some(DeveloperObservationCapabilities {
             workspace: root.path().canonicalize().unwrap(),
+            session_workspaces: None,
             processes: false,
         })
     );
@@ -64,6 +65,14 @@ fn observation_capabilities_match_the_backend_root_and_command_switch() {
     let capabilities = backend.observation_capabilities().unwrap();
     assert_eq!(capabilities.workspace, root.path().canonicalize().unwrap());
     assert!(capabilities.processes);
+    let backend = backend.with_session_workspaces(true);
+    assert_eq!(
+        backend
+            .observation_capabilities()
+            .unwrap()
+            .session_workspaces,
+        Some(ledger.path().join("commands/workspaces"))
+    );
 }
 
 #[tokio::test]

@@ -453,8 +453,20 @@ pub enum DeveloperOperation {
 pub struct DeveloperObservationCapabilities {
     /// 与后端文件工具相同的规范化工作根目录。
     pub workspace: PathBuf,
+    /// 私有会话检出的父目录；None 表示使用固定 workspace。
+    pub session_workspaces: Option<PathBuf>,
     /// 后端是否允许命令与进程观察。
     pub processes: bool,
+}
+
+/// 文件工具与观察器共用的可信会话目录标识；不接收模型提供的路径。
+pub fn session_workspace_key(scope: &eve_llm_api::ContextScope) -> String {
+    let bytes = serde_json::to_vec(scope).expect("ContextScope only contains strings");
+    ring::digest::digest(&ring::digest::SHA256, &bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// 可替换后端；接收宿主的可信会话身份与取消状态，而非模型自报 owner。

@@ -1317,6 +1317,9 @@ impl DeveloperBackend for LocalDeveloper {
     fn observation_capabilities(&self) -> Option<DeveloperObservationCapabilities> {
         Some(DeveloperObservationCapabilities {
             workspace: self.root.clone(),
+            session_workspaces: self
+                .session_workspaces
+                .then(|| self.journal.join("workspaces")),
             processes: self.config.commands,
         })
     }

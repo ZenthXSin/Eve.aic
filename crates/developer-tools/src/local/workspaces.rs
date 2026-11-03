@@ -121,7 +121,7 @@ impl LocalDeveloper {
         let scope = context
             .scope()
             .ok_or_else(|| failed("会话工作区缺少可信身份"))?;
-        let owner = hash(&serde_json::to_vec(scope).map_err(|_| failed("会话身份编码失败"))?);
+        let owner = session_workspace_key(scope);
         let parent = self.journal.join("workspaces");
         plain_directory(&parent)?;
         let directory = parent.join(owner);

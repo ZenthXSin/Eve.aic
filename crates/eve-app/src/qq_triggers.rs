@@ -70,6 +70,7 @@ pub(crate) struct Observations {
     pub(crate) sessions: Arc<dyn SessionService>,
     pub(crate) tasks: Option<Arc<dyn TaskAdmin>>,
     workspace: Option<PathBuf>,
+    session_workspaces: Option<PathBuf>,
     operators: BTreeSet<String>,
     authorization: Option<Arc<dyn eve_developer_api::DeveloperAuthorization>>,
     processes: bool,
@@ -96,6 +97,7 @@ impl Observations {
             sessions,
             tasks,
             workspace: config.as_ref().map(|c| c.workspace.clone()),
+            session_workspaces: None,
             operators: config
                 .as_ref()
                 .map_or_else(BTreeSet::new, |c| c.operators.clone()),
@@ -141,6 +143,9 @@ impl Observations {
         capabilities: Option<eve_developer_api::DeveloperObservationCapabilities>,
     ) -> Self {
         self.workspace = capabilities.as_ref().map(|c| c.workspace.clone());
+        self.session_workspaces = capabilities
+            .as_ref()
+            .and_then(|c| c.session_workspaces.clone());
         self.processes = capabilities.is_some_and(|c| c.processes);
         self
     }
@@ -164,12 +169,48 @@ impl Observations {
         if !self.authorized(owner) {
             return Err(failed("文件触发仅限已授权开发操作者"));
         }
-        let root = self
+        let shared = self
             .workspace
             .as_ref()
-            .ok_or_else(|| failed("未配置文件观察目录"))?
+            .ok_or_else(|| failed("未配置文件观察目录"))?;
+        let selected = if let Some(parent) = &self.session_workspaces {
+            let scope = ContextScope {
+                session_id: owner.session_id.clone(),
+                user_id: owner.user_id.clone(),
+            };
+            let directory = parent.join(eve_developer_api::session_workspace_key(&scope));
+            let path = directory.join("binding.json");
+            let metadata =
+                std::fs::symlink_metadata(&path).map_err(|_| failed("当前会话工作区尚未建立"))?;
+            if !metadata.is_file()
+                || metadata.len() > 8192
+                || directory.canonicalize().ok().as_ref() != Some(&directory)
+            {
+                return Err(failed("会话文件观察绑定无效"));
+            }
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)
+                .map_err(failed)?
+                .take(8193)
+                .read_to_end(&mut bytes)
+                .map_err(failed)?;
+            if bytes.len() > 8192 {
+                return Err(failed("会话文件观察绑定超限"));
+            }
+            let binding: Value = serde_json::from_slice(&bytes).map_err(failed)?;
+            if binding != json!({"version":1,"scope":scope,"source":shared}) {
+                return Err(failed("会话文件观察绑定不匹配"));
+            }
+            directory.join("source")
+        } else {
+            shared.clone()
+        };
+        let root = selected
             .canonicalize()
             .map_err(|_| failed("文件观察目录不可用"))?;
+        if self.session_workspaces.is_some() && root != selected {
+            return Err(failed("会话文件观察根目录已跳转"));
+        }
         let relative = Path::new(path);
         if relative.is_absolute()
             || relative
@@ -1192,6 +1233,7 @@ mod tests {
             sessions,
             tasks: None,
             workspace: Some(directory.path().into()),
+            session_workspaces: None,
             operators: BTreeSet::from(["u".into()]),
             authorization: None,
             admission: None,
@@ -1271,6 +1313,7 @@ mod tests {
             .with_authorization(authorization.clone())
             .with_development(Some(DeveloperObservationCapabilities {
                 workspace: actual.path().canonicalize().unwrap(),
+                session_workspaces: None,
                 processes: true,
             }));
         let expected: String = digest(&SHA256, b"actual backend")
@@ -1293,6 +1336,7 @@ mod tests {
         authorization.business.store(true, Ordering::Release);
         let observations = observations.with_development(Some(DeveloperObservationCapabilities {
             workspace: actual.path().canonicalize().unwrap(),
+            session_workspaces: None,
             processes: false,
         }));
         assert_eq!(observations.file(&owner, "output.txt").unwrap(), expected);
@@ -1302,6 +1346,50 @@ mod tests {
         assert!(observations.process(&owner, std::process::id()).is_err());
         kernel.stop_all().await.unwrap();
     }
+    #[tokio::test]
+    async fn private_file_observations_follow_own_workspace_and_reject_foreign_binding() {
+        let (kernel, observations, shared) = world().await;
+        let private = tempfile::tempdir().unwrap();
+        let owner = SessionKey::new("s", "u").unwrap();
+        let scope = ContextScope {
+            session_id: owner.session_id.clone(),
+            user_id: owner.user_id.clone(),
+        };
+        let directory = private
+            .path()
+            .join(eve_developer_api::session_workspace_key(&scope));
+        let root = directory.join("source");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(shared.path().join("build.status"), "other session").unwrap();
+        std::fs::write(root.join("build.status"), "building").unwrap();
+        let binding = json!({"version":1,"scope":scope,"source":shared.path()});
+        std::fs::write(directory.join("binding.json"), binding.to_string()).unwrap();
+        let observations = Arc::try_unwrap(observations)
+            .ok()
+            .unwrap()
+            .with_development(Some(eve_developer_api::DeveloperObservationCapabilities {
+                workspace: shared.path().to_path_buf(),
+                session_workspaces: Some(private.path().to_path_buf()),
+                processes: true,
+            }));
+        let baseline = observations.file(&owner, "build.status").unwrap();
+        std::fs::write(shared.path().join("build.status"), "other finished").unwrap();
+        assert_eq!(observations.file(&owner, "build.status").unwrap(), baseline);
+        std::fs::write(root.join("build.status"), "finished").unwrap();
+        assert_ne!(observations.file(&owner, "build.status").unwrap(), baseline);
+        assert_eq!(observations.file(&owner, "missing").unwrap(), "missing");
+        assert!(
+            observations
+                .file(&SessionKey::new("another", "u").unwrap(), "build.status")
+                .is_err()
+        );
+        let mut forged = binding;
+        forged["scope"]["session_id"] = json!("another");
+        std::fs::write(directory.join("binding.json"), forged.to_string()).unwrap();
+        assert!(observations.file(&owner, "build.status").is_err());
+        kernel.stop_all().await.unwrap();
+    }
+
     #[tokio::test]
     async fn file_changes_time_and_boolean_combinations_use_observed_state() {
         let (k, o, d) = world().await;

@@ -36,6 +36,7 @@ async fn world(
         .0
         .clone();
     let observations = Arc::new(Observations {
+        session_workspaces: None,
         sessions,
         tasks: None,
         workspace: None,
