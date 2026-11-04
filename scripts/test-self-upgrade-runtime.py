@@ -467,12 +467,14 @@ while True:
                     result='完成' if status == 'Completed' else None, failure=None,
                     notice={'status': notice, 'attempts': [], 'closed_at_ms': 3} if status == 'Completed' else None,
                     execution={'checkpoint': {'private_fixture': True}, 'recoveries': 0,
-                               'resume_at_ms': None, 'deadline_at_ms': 100})
+                               'resume_at_ms': None, 'deadline_at_ms': 100,
+                               'review_messages': ['真实用户授权仅保存在完整冷正文']})
         raw = json.dumps(task, ensure_ascii=False).encode()
         directory = json.loads(raw)
         directory['spec'].pop('context')
         directory['result'] = directory['failure'] = None
         directory['execution']['checkpoint'] = None
+        directory['execution'].pop('review_messages')
         archive = self.state / 'task-archive'; archive.mkdir(exist_ok=True)
         key = hashlib.sha256(raw).hexdigest()
         cold = archive / (key + '.json'); cold.write_bytes(raw)
