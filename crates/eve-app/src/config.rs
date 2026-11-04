@@ -446,10 +446,10 @@ pub(crate) fn provider_config_for(
         config.max_output_tokens = (limit != 0).then_some(limit);
     }
     let effort: String = snapshot.get("reasoning_effort")?;
-    config.reasoning_effort = if effort.is_empty() {
-        Some("low".into())
-    } else {
-        Some(effort)
+    config.reasoning_effort = match effort.as_str() {
+        "omit" => None,
+        "" => Some("low".into()),
+        _ => Some(effort),
     };
     Ok(config)
 }
@@ -626,6 +626,38 @@ mod tests {
                 .into_iter()
                 .map(|(name, field)| (name, field.default.unwrap()))
                 .collect(),
+        }
+    }
+
+    #[test]
+    fn omitted_reasoning_is_distinct_from_none_and_preserves_existing_defaults() {
+        for protocol in ["chat", "responses"] {
+            let mut settings = snapshot();
+            settings.values.insert("protocol".into(), json!(protocol));
+            assert_eq!(
+                provider_config(&settings, None)
+                    .unwrap()
+                    .reasoning_effort
+                    .as_deref(),
+                Some("low")
+            );
+            for (value, expected) in [
+                ("", Some("low")),
+                ("none", Some("none")),
+                ("medium", Some("medium")),
+                ("omit", None),
+            ] {
+                settings
+                    .values
+                    .insert("reasoning_effort".into(), json!(value));
+                assert_eq!(
+                    provider_config(&settings, None)
+                        .unwrap()
+                        .reasoning_effort
+                        .as_deref(),
+                    expected
+                );
+            }
         }
     }
 

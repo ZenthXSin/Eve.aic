@@ -237,6 +237,13 @@ async fn primary_selection_is_fixed_during_tools_and_changes_at_next_round() {
         };
         assert!(request.headers.starts_with(expected_path));
         assert_eq!(request.body["model"], "model-a");
+        let reasoning_field = if protocol == "chat" {
+            "reasoning_effort"
+        } else {
+            "reasoning"
+        };
+        let original_reasoning = request.body[reasoning_field].clone();
+        assert!(!original_reasoning.is_null());
         assert_eq!(
             request.body[if protocol == "chat" {
                 "max_tokens"
@@ -253,6 +260,7 @@ async fn primary_selection_is_fixed_during_tools_and_changes_at_next_round() {
                 ("runtime.models", "primary_model", json!("model-b")),
                 ("runtime.models", "primary_timeout_ms", json!(4000)),
                 ("runtime.models", "primary_max_output_tokens", json!(64)),
+                (config::OPENAI_NAMESPACE, "reasoning_effort", json!("omit")),
             ],
             mode,
         );
@@ -262,6 +270,7 @@ async fn primary_selection_is_fixed_during_tools_and_changes_at_next_round() {
         assert_eq!(completed.run.started_tools, Some(1));
         let follow = server.next().await;
         assert_eq!(follow.body["model"], "model-a");
+        assert_eq!(follow.body[reasoning_field], original_reasoning);
         assert_eq!(
             follow.body[if protocol == "chat" {
                 "max_tokens"
@@ -274,6 +283,8 @@ async fn primary_selection_is_fixed_during_tools_and_changes_at_next_round() {
         assert_eq!(h.done(&second).await.run.commit, CommitState::Completed);
         let next = server.next().await;
         assert_eq!(next.body["model"], "model-b");
+        assert!(next.body.get(reasoning_field).is_none());
+        assert!(next.body.get("temperature").is_none());
         assert_eq!(
             next.body[if protocol == "chat" {
                 "max_tokens"
@@ -319,6 +330,7 @@ async fn primary_selection_is_fixed_during_tools_and_changes_at_next_round() {
         assert_eq!(result.run.started_tools, Some(0));
         let restored = server.next().await.body;
         assert_eq!(restored["model"], "model-c");
+        assert!(restored.get(reasoning_field).is_none());
         assert_eq!(
             user_texts(&restored, protocol),
             ["first", "second", "third", "fourth"]

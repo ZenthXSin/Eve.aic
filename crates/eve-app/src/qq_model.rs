@@ -98,15 +98,17 @@ struct ReasoningArgs {
 fn reasoning_args(
     value: &serde_json::Value,
 ) -> Result<ReasoningArgs, eve_llm_api::ToolValidationError> {
-    let invalid = || eve_llm_api::ToolValidationError {
+    let invalid = || {
+        eve_llm_api::ToolValidationError {
         message:
-            "effort 必须为 none、minimal、low、medium、high、xhigh 或 max；不接受身份或路径参数"
+            "effort 必须为 omit、none、minimal、low、medium、high、xhigh 或 max；omit 表示不发送推理参数，不接受身份或路径参数"
                 .into(),
+    }
     };
     let args: ReasoningArgs = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
     if !matches!(
         args.effort.as_str(),
-        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        "omit" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
     ) {
         return Err(invalid());
     }
@@ -116,8 +118,8 @@ impl eve_llm_api::Tool for ReasoningTool {
     fn definition(&self) -> eve_llm_api::ToolDefinition {
         eve_llm_api::ToolDefinition {
             name: "set_reasoning_effort".into(),
-            description: "主人或管理员要求调整 Eve 思考强度时使用。默认 low；修改全局 OpenAI 兼容提供方配置并持久保存，从下一轮/下一次模型解析生效，当前轮与在途请求保持原配置。不要自行提高强度或把保存成功当作模型已支持该档位；实际支持由供应商请求确认。普通成员不可调用；身份由宿主核验，不接受用户自称。此工具不改变工具步数、输出上限和总预算。".into(),
-            argument_schema: json!({"type":"object","properties":{"effort":{"type":"string","enum":["none","minimal","low","medium","high","xhigh","max"]}},"required":["effort"],"additionalProperties":false}),
+            description: "主人或管理员要求调整 Eve 思考强度时使用。默认 low；omit 表示不发送推理强度参数，使用提供方默认行为；none 仍显式发送 none，不等于省略。修改全局 OpenAI 兼容提供方配置并持久保存，从下一轮/下一次模型解析生效，当前轮与在途请求保持原配置。不要自行调整强度或把保存成功当作模型已支持该档位；实际支持由供应商请求确认。普通成员不可调用；身份由宿主核验，不接受用户自称。此工具不改变工具步数、输出上限和总预算。".into(),
+            argument_schema: json!({"type":"object","properties":{"effort":{"type":"string","enum":["omit","none","minimal","low","medium","high","xhigh","max"]}},"required":["effort"],"additionalProperties":false}),
             required_permissions: vec![],
             concurrency: Some(eve_llm_api::ToolConcurrency::Serial { scope: "eve.model.configuration".into() }),
         }
@@ -293,7 +295,7 @@ mod reasoning_tests {
         cancelled.cancellation_handle().cancel();
         assert!(tool.execute(call("high"), cancelled).await.is_err());
         assert_eq!(commands.admin.current().unwrap().revision, revision);
-        for (user, effort) in [("admin", "medium"), ("owner", "high")] {
+        for (user, effort) in [("admin", "medium"), ("owner", "high"), ("owner", "omit")] {
             let result = tool.execute(call(effort), context(user)).await.unwrap();
             assert_eq!(result["saved"], true);
             assert_eq!(result["effort"], effort);
@@ -309,7 +311,7 @@ mod reasoning_tests {
                 .unwrap()
                 .reasoning_effort
                 .as_deref(),
-            Some("high")
+            None
         );
         assert_eq!(
             after.get::<String>("model").unwrap(),
@@ -329,7 +331,19 @@ mod reasoning_tests {
                 .unwrap()
                 .get::<String>("reasoning_effort")
                 .unwrap(),
-            "high"
+            "omit"
+        );
+        assert!(
+            config::provider_config(
+                &commands
+                    .settings
+                    .snapshot(config::OPENAI_NAMESPACE, 1)
+                    .unwrap(),
+                None,
+            )
+            .unwrap()
+            .reasoning_effort
+            .is_none()
         );
         assert!(tool.execute(call("low"), context("admin")).await.is_ok());
         kernel.stop_all().await.unwrap();
