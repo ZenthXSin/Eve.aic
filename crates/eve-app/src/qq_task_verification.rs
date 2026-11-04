@@ -6,9 +6,12 @@ use eve_task_api::{
 };
 use ring::digest::{SHA256, digest};
 use serde_json::{Value, json};
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Component, Path},
+    sync::Arc,
+};
 
-pub(crate) const OBSERVATION_RULES: &str = "回执只接受宿主真实观察：read_file /sha256 为完整文件摘要；/content 精确全文须同参数配 /truncated=false 和该全文的 /sha256，offset 必须为0。run_command 仅限固定cwd和参数的 cargo test/check/clippy、python3 -I -m unittest，检查 /exit_code=0，不接受stdout或任意脚本。send_message 须同参数配 /sent=true 与 /delivery_status=sent（仅当前活跃对话轮可用）；query_file_delivery 须按既有文件投递id配 /sent=true 与 /state=Sent。排队不代表送达，未知观察保留待验收。合同只证明明确覆盖的行为，不能将单项检查扩大为整个目标成功。";
+pub(crate) const OBSERVATION_RULES: &str = "回执只接受宿主真实观察：read_file /sha256 为完整文件摘要；/content 精确全文须同参数配 /truncated=false 和该全文的 /sha256，offset 必须为0。path/cwd 可冻结工程相对路径或宿主绝对路径，实际执行仍须通过当前后端能力与身份授权。run_command 仅限固定cwd和参数的 cargo test/check/clippy、python3 -I -m unittest，检查 /exit_code=0，不接受stdout或任意脚本。send_message 须同参数配 /sent=true 与 /delivery_status=sent（仅当前活跃对话轮可用）；query_file_delivery 须按既有文件投递id配 /sent=true 与 /state=Sent。排队不代表送达，未知观察保留待验收。合同只证明明确覆盖的行为，不能将单项检查扩大为整个目标成功。";
 
 /// 只验证合同具有可信观察来源；实际结果、最后批次与无工具的文本交付由任务验收器核对。
 /// Unspecified 保留原目标为待验收，要求主动执行的入口可另外拒绝未指定合同。
@@ -109,7 +112,16 @@ fn paired_observation(
         && has_observation(contract, check, second_pointer, second_expected)
 }
 
-fn relative_workspace_path(path: &str) -> bool {
+fn observation_path(path: &str) -> bool {
+    // 合同只冻结目标，不授予读取或执行权限；拒绝路径跳转等无效写法。
+    // 绝对目标是否可访问由实际工具逐次核验，失败回执不能通过完成验收。
+    if Path::new(path).is_absolute() {
+        return !path.chars().any(char::is_control)
+            && !Path::new(path).components().any(|part| {
+                matches!(part, Component::ParentDir)
+                    || matches!(part, Component::Normal(name) if name == ".git" || name == ".eve-developer")
+            });
+    }
     !path.is_empty()
         && !Path::new(path).has_root()
         && !path.chars().any(char::is_control)
@@ -126,7 +138,7 @@ fn file_observation(check: &TaskReceiptCheck, contract: &TaskEvaluationContract)
     else {
         return false;
     };
-    if arguments.offset != 0 || !relative_workspace_path(&arguments.path) {
+    if arguments.offset != 0 || !observation_path(&arguments.path) {
         return false;
     }
     match check.output_pointer.as_str() {
@@ -169,8 +181,7 @@ fn verification_command(arguments: &Value) -> bool {
     else {
         return false;
     };
-    if !arguments.get("cwd").is_some_and(Value::is_string) || !relative_workspace_path(&command.cwd)
-    {
+    if !arguments.get("cwd").is_some_and(Value::is_string) || !observation_path(&command.cwd) {
         return false;
     }
     match command.program.as_str() {
@@ -403,9 +414,9 @@ mod tests {
         for cwd in [
             None,
             Some(json!("../other")),
-            Some(json!("/tmp")),
+            Some(json!("/tmp/../other")),
             Some(json!("C:other")),
-            Some(json!("C:/other")),
+            Some(json!("C:/other/../elsewhere")),
             Some(json!("")),
             Some(json!(".git")),
         ] {
@@ -423,6 +434,28 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn absolute_targets_can_be_frozen_without_changing_the_original_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact.txt");
+        let contract = receipts(file_content(json!({"path": path}), "fixed artifact"));
+        let saved = serde_json::to_value(&contract).unwrap();
+        assert!(validate_contract(&contract).is_ok());
+        assert_eq!(serde_json::to_value(contract).unwrap(), saved);
+        let contract = receipts(vec![check(
+            "run_command",
+            json!({
+                "program":"cargo", "args":["test","--locked"], "cwd":directory.path(),
+            }),
+            "/exit_code",
+            json!(0),
+        )]);
+        assert!(validate_contract(&contract).is_ok());
+        assert!(!observation_path(
+            directory.path().join(".git/config").to_str().unwrap()
+        ));
     }
 
     #[test]
@@ -450,12 +483,12 @@ mod tests {
         assert!(validate_contract(&receipts(other_file)).is_err());
         for path in [
             "../artifact.txt",
-            "/tmp/artifact.txt",
+            "/tmp/../artifact.txt",
             ".git/config",
             ".eve-developer/audit",
             "..\\artifact.txt",
             "C:artifact.txt",
-            "C:/artifact.txt",
+            "C:/other/../artifact.txt",
         ] {
             assert!(
                 validate_contract(&receipts(file_content(json!({"path":path}), "ok"))).is_err()

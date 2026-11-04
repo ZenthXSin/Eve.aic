@@ -89,7 +89,7 @@ impl ReviewedFiles {
 
 impl LocalDeveloper {
     fn review_file(&self, relative: &str) -> Result<(Value, Option<String>), ToolExecutionError> {
-        let path = self.path(relative, true)?;
+        let path = self.model_file_path(relative, true)?;
         match fs::symlink_metadata(&path) {
             Ok(metadata)
                 if metadata.is_file() && metadata.len() <= MAX_ACTION_REVIEW_BYTES as u64 => {}
@@ -114,6 +114,8 @@ impl LocalDeveloper {
         context: &ToolExecutionContext,
     ) -> Result<(), ToolExecutionError> {
         context.check_review_evidence()?;
+        self.authorize_host_paths(operation, context)?;
+        self.authorize_file_targets(operation, context)?;
         if context.scope().is_some_and(|scope| {
             self.authorization
                 .as_ref()
@@ -236,20 +238,20 @@ impl LocalDeveloper {
                     "将已验证候选切换为运行中的 Eve，会短暂中断服务。候选验证不等于用户授权；须按原话审核完整候选、验证记录、运行版本和准备租约；业务权限不能跳过审核、回退及熔断".into()))
             }
             DeveloperOperation::RestartSelf => Some((business_action("restart_self",json!({"scope":context.scope(),"turn_id":context.turn_id(),"target":"current-running-binary","retain_state":true})),"重启当前 Eve 服务会短暂中断服务；必须当前真实用户明确要求并经宿主监督器等待回执和空闲后执行，不能伪称已重启".into())),
-            DeveloperOperation::Write(a) if !self.isolated && sensitive_write(&a.path) => {
+            DeveloperOperation::Write(a) if !self.isolated && (sensitive_write(&a.path) || self.external_path(&a.path)) => {
                 paths.push(a.path.clone());
                 Some((
                     business_action(
                         "write_file",
                         serde_json::to_value(a).map_err(|_| failed("写入动作无法编码"))?,
                     ),
-                    "修改宿主身份、安全策略或工程配置；业务授权不能关闭认证、审核、审计和失败关闭"
+                    "修改工程外宿主文件或身份、安全策略、工程配置；按实际路径和原话核对范围"
                         .into(),
                 ))
             }
-            DeveloperOperation::Edit(a) if !self.isolated && sensitive_write(&a.path) => {
+            DeveloperOperation::Edit(a) if !self.isolated && (sensitive_write(&a.path) || self.external_path(&a.path)) => {
                 paths.push(a.path.clone());
-                Some((business_action("edit_file", serde_json::to_value(a).map_err(|_| failed("编辑动作无法编码"))?), "修改宿主身份、安全策略或工程配置；核对完整原文件与替换内容，业务授权不能关闭安全底座".into()))
+                Some((business_action("edit_file", serde_json::to_value(a).map_err(|_| failed("编辑动作无法编码"))?), "修改工程外宿主文件或身份、安全策略、工程配置；核对实际路径、完整原文件与替换内容".into()))
             }
             DeveloperOperation::Patch(a) => {
                 let touched = eve_apply_patch::paths(&a.patch)
@@ -257,11 +259,11 @@ impl LocalDeveloper {
                 if touched.iter().any(|p| credential_path(p)) {
                     return Err(failed("凭据文件不交给模型工具；请通过宿主受信凭据配置处理"));
                 }
-                if self.isolated || !touched.iter().any(|p| sensitive_write(p)) {
+                if self.isolated || !touched.iter().any(|p| sensitive_write(p) || self.external_path(p)) {
                     return Ok(ReviewedFiles(vec![], vec![], None, None));
                 }
                 paths = touched;
-                Some((business_action("apply_patch", serde_json::to_value(a).map_err(|_| failed("补丁动作无法编码"))?), "修改宿主身份、安全策略或工程配置；核对全部补丁及原文件，业务授权不能关闭安全底座".into()))
+                Some((business_action("apply_patch", serde_json::to_value(a).map_err(|_| failed("补丁动作无法编码"))?), "修改工程外宿主文件或身份、安全策略、工程配置；核对所有实际目标、完整补丁及原文件".into()))
             }
             _ => None,
         };

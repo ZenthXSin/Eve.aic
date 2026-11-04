@@ -216,6 +216,12 @@ impl DeveloperAuthorization for Admin {
     fn is_operator(&self, scope: &ContextScope) -> bool {
         self.is_operator_identity(scope) && self.business_permitted(scope)
     }
+    fn permits_file(&self, scope: &ContextScope, path: &std::path::Path, write: bool) -> bool {
+        self.business_permitted(scope)
+            && (self.is_owner(scope)
+                || !self.is_operator_identity(scope)
+                || !crate::qq_access::owner_file(&path.to_string_lossy(), write))
+    }
 }
 impl QqCommandHandler for Admin {
     fn handle(&self, input: QqCommandInput<'_>) -> PluginResult<Option<String>> {

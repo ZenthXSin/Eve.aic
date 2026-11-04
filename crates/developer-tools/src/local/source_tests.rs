@@ -12,7 +12,20 @@ struct Fixture {
 
 #[tokio::test]
 async fn private_sessions_and_candidate_snapshots_preserve_shared_dirty_work_and_indices() {
-    let fixture = Fixture::new(None);
+    let mut fixture = Fixture::new(None);
+    fixture.backend.config.host_filesystem = true;
+    let external = tempfile::tempdir().unwrap();
+    fs::write(external.path().join("external.txt"), "工程外资料\n").unwrap();
+    let read: FileArguments =
+        serde_json::from_value(json!({"path":external.path().join("external.txt")})).unwrap();
+    assert_eq!(
+        fixture
+            .backend
+            .execute(DeveloperOperation::Read(read), context())
+            .await
+            .unwrap()["content"],
+        "工程外资料\n"
+    );
     fs::write(fixture.root.path().join("main.txt"), "另一会话还没做完\n").unwrap();
     fs::write(
         fixture.root.path().join("someone-new.txt"),
@@ -81,6 +94,7 @@ async fn private_sessions_and_candidate_snapshots_preserve_shared_dirty_work_and
     let evidence = snapshot.source_fingerprint(&first_context).await.unwrap();
     assert!(evidence.diff.contains("本会话修复"));
     assert!(!evidence.diff.contains("另一会话"));
+    assert!(!evidence.diff.contains("工程外资料"));
     let reopened = fixture
         .backend
         .session_backend(&first_context)

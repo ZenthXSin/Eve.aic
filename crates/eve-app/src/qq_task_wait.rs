@@ -191,7 +191,7 @@ impl Tool for WaitTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: TOOL_NAME.into(),
-            description: "当前后台任务因文件尚未变化或真实进程尚未退出而暂时不能推进时，单独调用本工具登记技术等待。condition=file_changed 使用开发目录内相对 path；condition=process_exit 使用仍在运行的 pid，宿主捕获进程实例。reason 写清等待原因和剩余工作。成功后必须立即单独 task_progress(status=blocked,remaining=本回执原文) 并结束本轮；宿主在条件满足后接续同一任务，保留原授权、验收标准、工具预算和期限。缺少用户决定、授权或信息不能用技术条件冒充解除；未知工具副作用不自动重放。此工具不创建新任务，不发送消息，不执行命令。".into(),
+            description: "当前后台任务因文件尚未变化或真实进程尚未退出而暂时不能推进时，单独调用本工具登记技术等待。condition=file_changed 使用工程相对 path；启用宿主文件访问的操作者也可用绝对 path；condition=process_exit 使用仍在运行的 pid，宿主捕获进程实例。reason 写清等待原因和剩余工作。成功后必须立即单独 task_progress(status=blocked,remaining=本回执原文) 并结束本轮；宿主在条件满足后接续同一任务，保留原授权、验收标准、工具预算和期限。缺少用户决定、授权或信息不能用技术条件冒充解除；未知工具副作用不自动重放。此工具不创建新任务，不发送消息，不执行命令。".into(),
             argument_schema: json!({"type":"object","properties":{
                 "reason":{"type":"string","minLength":1,"maxLength":MAX_REASON_BYTES},
                 "condition":{"oneOf":[

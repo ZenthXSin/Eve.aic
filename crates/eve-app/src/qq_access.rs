@@ -85,7 +85,7 @@ fn public_tool(name: &str) -> bool {
             | "settle_commitment"
     )
 }
-fn owner_file(path: &str, write: bool) -> bool {
+pub(crate) fn owner_file(path: &str, write: bool) -> bool {
     Path::new(path).components().any(|c| match c {
         Component::Normal(s) => {
             let s = s.to_string_lossy().to_ascii_lowercase();
@@ -549,6 +549,33 @@ impl QqCommandHandler for GuardedCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resolved_file_permissions_keep_members_own_project_rules_editable() {
+        let directory = tempfile::tempdir().unwrap();
+        let admin = Admin::open(
+            directory.path(),
+            eve_qqbot_plugin::QqConversations::default(),
+            std::collections::BTreeSet::from(["administrator".into()]),
+            eve_kernel::KernelServices::default().registry,
+        )
+        .unwrap();
+        let administrator = eve_llm_api::ContextScope {
+            session_id: "s".into(),
+            user_id: "administrator".into(),
+        };
+        let member = eve_llm_api::ContextScope {
+            session_id: "s".into(),
+            user_id: "member".into(),
+        };
+        for name in ["AGENT.md", "USER.md"] {
+            let path = directory.path().join(name);
+            assert!(!admin.permits_file(&administrator, &path, true));
+            assert!(admin.permits_file(&administrator, &path, false));
+            assert!(admin.permits_file(&member, &path, true));
+        }
+        assert!(admin.permits_file(&administrator, &directory.path().join("source.rs"), true));
+    }
+
     #[test]
     fn script_preflight_reuses_backend_and_owner_file_rules_without_execution() {
         use eve_script_runtime::ToolAuthorizer;

@@ -40,6 +40,8 @@ async fn world(
         sessions,
         tasks: None,
         workspace: None,
+        host_filesystem: false,
+        protected_paths: BTreeSet::new(),
         operators: BTreeSet::from([session().user_id]),
         authorization: None,
         admission: None,
