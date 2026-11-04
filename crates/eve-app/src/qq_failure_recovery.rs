@@ -95,6 +95,25 @@ impl QqFailureRecovery for Recovery {
         if let Some(reason) = recovery_blocker(started, failure.evidence.as_ref()) {
             return Ok(Some(reason));
         }
+        // 模型服务尚未返回任何可执行工作时，转后台仍会请求同一个故障服务。
+        // 前台已有有界模型重试；不能因此再复制整段历史并新增 100 步恢复任务。
+        if started == 0
+            && report.run.tool_results.is_empty()
+            && matches!(
+                &report.run.failure,
+                Some(RunFailure::Execution(
+                    LlmError::ProviderTimeout
+                        | LlmError::Provider(_)
+                        | LlmError::ProviderFailed(_)
+                        | LlmError::Configuration(_)
+                ))
+            )
+        {
+            return Ok(Some(
+                "未创建后台恢复任务；原始请求和失败记录已保留，模型服务恢复后可在本会话继续。"
+                    .into(),
+            ));
+        }
         let owner = TaskOwner {
             session_id: scope.session_id.clone(),
             user_id: scope.user_id.clone(),
