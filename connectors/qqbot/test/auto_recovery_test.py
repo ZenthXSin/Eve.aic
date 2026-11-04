@@ -273,6 +273,70 @@ class AutoRecoveryAcceptance(delegation.DelegationContextAcceptance):
         self.run_recovery(self.send(self.message("fallback","故障兜底检查",contains=["本轮已停止", "不再自动重试"])), more=["--no-error-recovery"])
         self.assertFalse(self.tasks())
 
+    def test_provider_failures_before_tools_do_not_fill_background_storage(self):
+        timeout_text = "模型超时，保留这条原始请求"
+        rejected_text = "模型拒绝了这条原始请求"
+        unavailable_text = "模型暂不可用，保留原始请求"
+        self.response_gates = {("chat", 1): "hold-timed-out-provider"}
+        self.status_for_body = lambda body: {
+            rejected_text: 400, unavailable_text: 503,
+        }.get(self.text(body))
+
+        def respond(body):
+            self.assertFalse(self.is_worker(body), "未启动工具的模型故障不能派生后台请求")
+            return text_response("模型已恢复，原始请求仍在")
+
+        self.callback = respond
+        environment = {"EVE_OPENAI_TIMEOUT_SECONDS": "1", "EVE_OPENAI_TRANSIENT_RETRIES": "false"}
+        script = []
+        for index, text in enumerate((timeout_text, rejected_text, unavailable_text)):
+            script.extend(self.send(self.message(f"provider-failure-{index}", text,
+                contains=["尚未启动工具调用", "未创建后台恢复任务", "原始请求和失败记录已保留"])))
+        self.run_recovery(script, env_extra=environment)
+        self.assertFalse(self.tasks())
+        self.assertEqual(len(self.kind("chat")), 3, "每个失败只请求前台，不创建恢复链")
+        saved = [self.turn(text) for text in (timeout_text, rejected_text, unavailable_text)]
+        self.assertEqual([turn["status"]["failure"]["code"] for turn in saved],
+                         ["ProviderTimeout", "Provider", "Provider"])
+        for turn in saved:
+            self.assertEqual(turn["status"]["state"], "Failed")
+            self.assertEqual(turn["status"]["failure"]["started_tools"], 0)
+        self.status_for_body = lambda body: None
+        self.run_recovery(self.send(self.message("provider-recovered", "现在继续",
+            expected="模型已恢复，原始请求仍在")), env_extra=environment)
+        self.assertFalse(self.tasks(), "重启不补派已停止的故障轮")
+        self.assertEqual(len(self.kind("chat")), 4)
+        self.assertEqual([self.turn(turn["input"]) for turn in saved], saved)
+        history = json.dumps(self.kind("chat")[-1]["body"], ensure_ascii=False)
+        for text in (timeout_text, rejected_text, unavailable_text):
+            self.assertIn(text, history)
+
+    def test_provider_timeout_after_real_tool_keeps_recovery_and_does_not_replay(self):
+        self.response_gates = {("chat", 2): "hold-provider-after-tool"}
+
+        def respond(body):
+            if self.is_worker(body):
+                self.assertIn("SAVED_COMMAND_RECEIPT", self.text(body))
+                return text_response("已核对保存的命令回执，没有重跑")
+            return self.foreground(body)
+
+        self.callback = respond
+        environment = {"EVE_OPENAI_TIMEOUT_SECONDS": "1", "EVE_OPENAI_TRANSIENT_RETRIES": "false"}
+        self.run_recovery([
+            *self.send(self.message("timeout-after-tool", "原任务检查",
+                contains=["模型服务响应超时", "已保存并转交后台任务", "100 步"])),
+            *self.checkpoint("timeout-recovered"),
+        ], env_extra=environment, checkpoints={"timeout-recovered": self.wait_finished})
+        [task] = self.tasks()
+        self.assert_unverified(task)
+        self.assertEqual(self.turn("原任务检查")["status"]["failure"]["started_tools"], 1)
+        self.assertEqual((self.source / "once.txt").read_text(), "x")
+        self.callback = lambda body: text_response("已保留旧回执")
+        self.run_recovery(self.send(self.message("timeout-restart", "核对恢复结果",
+            expected="已保留旧回执")), env_extra=environment)
+        self.assertEqual(len(self.tasks()), 1)
+        self.assertEqual((self.source / "once.txt").read_text(), "x")
+
 
 if __name__ == "__main__":
     unittest.main()
