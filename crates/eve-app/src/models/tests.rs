@@ -43,6 +43,7 @@ impl Harness {
                 root.join("state/configuration"),
                 vec![
                     runtime_llm_schema(),
+                    crate::deferred_reply::schema(),
                     config::openai_schema(),
                     config::model_uses_schema(),
                     config::dialogue_schema(),

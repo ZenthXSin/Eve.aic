@@ -9,6 +9,7 @@ mod config;
 mod console;
 mod context_notes;
 mod conversation_learning;
+mod deferred_reply;
 mod developer;
 mod dialogue;
 mod error;
@@ -481,6 +482,7 @@ pub(crate) async fn install_core_with_pages_and_admin(
 > {
     let mut schemas = vec![
         runtime_llm_schema(),
+        deferred_reply::schema(),
         config::openai_schema(),
         config::model_uses_schema(),
         config::memory_digest_schema(),
@@ -646,6 +648,7 @@ async fn install_core_with_config(
         .collect::<Result<Vec<_>, AppError>>()?,
         LlmHostConfig {
             provider_timeout: timeout,
+            deferred_reply: deferred_reply::read(settings.0.as_ref())?,
             max_parallel_tool_calls: runtime.max_parallel_tool_calls,
             response_mode: ResponseMode::Complete,
             ..host_config

@@ -12,7 +12,9 @@ pub use prompt::{
 use eve_plugin_api::{Permission, PluginId, ServiceId};
 mod budget;
 mod credentials;
+mod deferred_reply;
 pub use credentials::{CredentialError, CredentialLease, CredentialPurpose, ModelCredentials};
+pub use deferred_reply::DeferredReplyPolicy;
 mod failure;
 mod history;
 mod image;

@@ -137,6 +137,7 @@ jobs:
           python3 connectors/qqbot/test/budget_test.py
           python3 connectors/qqbot/test/reference_test.py
           python3 connectors/qqbot/test/source_lookup_test.py
+          python3 connectors/qqbot/test/deferred_reply_test.py
           python3 connectors/qqbot/test/clarify_test.py
           python3 connectors/qqbot/test/agenda_test.py
           python3 connectors/qqbot/test/reminder_test.py

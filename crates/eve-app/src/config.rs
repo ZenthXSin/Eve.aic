@@ -18,6 +18,10 @@ impl eve_config_api::ConfigValidator for CoreConfigValidator {
             ConfigError, LLM_NAMESPACE, LlmRuntimeConfig, MODELS_NAMESPACE, ModelRolesConfig,
         };
         let invalid = || ConfigError::InvalidValue("宿主配置".into());
+        if let Some(deferred) = snapshots.get(crate::deferred_reply::NAMESPACE) {
+            crate::deferred_reply::settings(deferred)
+                .map_err(|_| ConfigError::InvalidValue(crate::deferred_reply::NAMESPACE.into()))?;
+        }
         if let Some(history) = snapshots.get(crate::history::NAMESPACE) {
             let adaptive: usize = history.get("adaptive_limit_tokens")?;
             if adaptive != 0 && adaptive < 10000 {
@@ -612,6 +616,57 @@ mod tests {
             .unwrap()
             .values
             .insert("response_mode".into(), json!("stream"));
+        assert!(CoreConfigValidator.validate(&snapshots).is_err());
+    }
+
+    #[test]
+    fn deferred_reply_validation_rejects_unusable_waits_before_saving_configuration() {
+        use eve_config_api::{ConfigValidator, model_roles_schema, runtime_llm_schema};
+        let mut snapshots: BTreeMap<_, _> = [
+            runtime_llm_schema(),
+            model_roles_schema(),
+            openai_schema(),
+            eve_message_api::message_schema(),
+            crate::deferred_reply::schema(),
+        ]
+        .into_iter()
+        .map(|schema| {
+            let namespace = schema.namespace;
+            let snapshot = ConfigSnapshot {
+                namespace: namespace.clone(),
+                schema_version: schema.version,
+                revision: 0,
+                values: schema
+                    .fields
+                    .into_iter()
+                    .filter_map(|(key, field)| field.default.map(|v| (key, v)))
+                    .collect(),
+            };
+            (namespace, snapshot)
+        })
+        .collect();
+        CoreConfigValidator.validate(&snapshots).unwrap();
+        snapshots
+            .get_mut(crate::deferred_reply::NAMESPACE)
+            .unwrap()
+            .values
+            .insert("enabled".into(), json!(true));
+        snapshots
+            .get_mut(crate::deferred_reply::NAMESPACE)
+            .unwrap()
+            .values
+            .insert("recovery_window_ms".into(), json!(1000));
+        assert!(CoreConfigValidator.validate(&snapshots).is_err());
+        snapshots
+            .get_mut(crate::deferred_reply::NAMESPACE)
+            .unwrap()
+            .values
+            .insert("recovery_window_ms".into(), json!(600_000));
+        snapshots
+            .get_mut(crate::deferred_reply::NAMESPACE)
+            .unwrap()
+            .values
+            .insert("max_delay_ms".into(), json!(1000));
         assert!(CoreConfigValidator.validate(&snapshots).is_err());
     }
 

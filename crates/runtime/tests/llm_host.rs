@@ -22,6 +22,211 @@ use tokio::sync::Notify;
 const OWNER: &str = "llm-test-owner";
 const CONTEXT: &str = "llm-test.context";
 
+fn deferred_policy(retries: u32) -> eve_llm_api::DeferredReplyPolicy {
+    eve_llm_api::DeferredReplyPolicy {
+        max_retries: retries,
+        initial_delay: Duration::from_millis(5),
+        max_delay: Duration::from_millis(20),
+        recovery_window: Duration::from_secs(1),
+    }
+}
+
+#[tokio::test]
+async fn deferred_reply_keeps_tool_receipts_and_retries_only_the_failed_model_request() {
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("once", "echo", json!({"evidence":"保留原结果"}))]),
+        Err(LlmError::ProviderTimeout),
+        Err(LlmError::ProviderFailed(
+            eve_llm_api::ProviderFailure::http(503).unwrap(),
+        )),
+        final_response("核对完整回执后回复"),
+    ]);
+    let tool = Arc::new(TestTool::new(
+        "echo",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    ));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![tool.clone()],
+        LlmHostConfig {
+            deferred_reply: Some(deferred_policy(3)),
+            max_tool_calls: 1,
+            final_answer_on_round_limit: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let output = host.run_turn(turn()).await.unwrap();
+    assert_eq!(output.text, "核对完整回执后回复");
+    assert_eq!(output.diagnostics.provider_requests, 4);
+    assert_eq!(output.diagnostics.started_tools, 1);
+    assert_eq!(tool.starts.lock().unwrap().len(), 1);
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests[1], requests[2]);
+    assert_eq!(requests[2], requests[3]);
+    assert!(requests[1].tools.is_empty(), "重试不能重置工具额度");
+    assert_eq!(output.diagnostics.tool_results.len(), 1);
+}
+
+#[tokio::test]
+async fn deferred_reply_retry_budget_is_shared_across_successful_tool_batches() {
+    let provider = RecordingProvider::scripted(vec![
+        Err(LlmError::ProviderTimeout),
+        tool_response(vec![call("one", "echo", json!({}))]),
+        Err(LlmError::ProviderTimeout),
+        tool_response(vec![call("two", "echo", json!({}))]),
+        Err(LlmError::ProviderTimeout),
+        final_response("不得越过两次额度"),
+    ]);
+    let tool = Arc::new(TestTool::new(
+        "echo",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    ));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![tool.clone()],
+        LlmHostConfig {
+            deferred_reply: Some(deferred_policy(2)),
+            max_tool_rounds: 0,
+            ..Default::default()
+        },
+    )
+    .await;
+    let failure = host.run_turn(turn()).await.unwrap_err();
+    assert_eq!(failure.error, LlmError::ProviderTimeout);
+    assert_eq!(failure.diagnostics.provider_requests, 5);
+    assert_eq!(failure.diagnostics.tool_results.len(), 2);
+    assert_eq!(tool.starts.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn deferred_reply_deadline_bounds_a_slow_retry_and_permanent_errors_are_not_retried() {
+    let mut policy = deferred_policy(8);
+    policy.recovery_window = Duration::from_millis(30);
+    let provider = RecordingProvider::delayed(Duration::from_secs(30));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![],
+        LlmHostConfig {
+            provider_timeout: Duration::from_millis(100),
+            deferred_reply: Some(policy),
+            ..Default::default()
+        },
+    )
+    .await;
+    let failure = tokio::time::timeout(Duration::from_secs(1), host.run_turn(turn()))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(failure.error, LlmError::ProviderTimeout);
+    assert_eq!(failure.diagnostics.provider_requests, 2);
+    for error in [
+        LlmError::ProviderFailed(eve_llm_api::ProviderFailure::http(400).unwrap()),
+        LlmError::ProviderFailed(eve_llm_api::ProviderFailure::http(401).unwrap()),
+        LlmError::Protocol("不完整工具调用".into()),
+        LlmError::Configuration("配置错误".into()),
+    ] {
+        let provider =
+            RecordingProvider::scripted(vec![Err(error.clone()), final_response("不应请求")]);
+        let (host, _, _) = make_host(
+            provider.clone(),
+            vec![],
+            LlmHostConfig {
+                deferred_reply: Some(deferred_policy(3)),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(host.run_turn(turn()).await.unwrap_err().error, error);
+        assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn deferred_reply_cancellation_stops_backoff_without_another_model_request() {
+    struct Closed(tokio::sync::watch::Receiver<bool>);
+    impl eve_llm_api::TurnEventSink for Closed {
+        fn emit(&self, _: eve_llm_api::TurnEvent) -> LlmFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn closed(&self) -> LlmFuture<'_, ()> {
+            let mut rx = self.0.clone();
+            Box::pin(async move {
+                let _ = rx.wait_for(|closed| *closed).await;
+                Ok(())
+            })
+        }
+    }
+    let provider = RecordingProvider::scripted(vec![
+        Err(LlmError::ProviderTimeout),
+        final_response("不应请求"),
+    ]);
+    let mut policy = deferred_policy(3);
+    policy.initial_delay = Duration::from_millis(500);
+    policy.max_delay = policy.initial_delay;
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![],
+        LlmHostConfig {
+            deferred_reply: Some(policy),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let running = tokio::spawn(async move { host.run_turn_with_events(turn(), &Closed(rx)).await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while provider.requests.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tx.send(true).unwrap();
+    let result = tokio::time::timeout(Duration::from_millis(250), running)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.unwrap_err().error, LlmError::Cancelled);
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn deferred_reply_does_not_add_retries_to_persistent_task_recovery() {
+    let provider = RecordingProvider::scripted(vec![
+        Err(LlmError::ProviderTimeout),
+        final_response("由持久恢复器决定下一次执行"),
+    ]);
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![],
+        LlmHostConfig {
+            deferred_reply: Some(deferred_policy(3)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let journal = Arc::new(MemoryJournal::default());
+    let host = host.with_turn_journal(journal.clone());
+    let result = host
+        .run_scoped_turn_with_events(
+            turn(),
+            Some(eve_llm_api::ContextScope {
+                session_id: "s".into(),
+                user_id: "u".into(),
+            }),
+            &ProgressRecorder::default(),
+        )
+        .await;
+    assert_eq!(result.unwrap_err().error, LlmError::ProviderTimeout);
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    let frame = journal.frame.lock().unwrap();
+    assert_eq!(frame.as_ref().unwrap().provider_requests, 1);
+    assert!(frame.as_ref().unwrap().resumable());
+}
+
 struct LegacyReviewSource {
     gap: bool,
 }

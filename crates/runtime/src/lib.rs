@@ -14,6 +14,7 @@ mod cognition_executor;
 pub use cognition_executor::{BudgetedSessionRunner, ControlGoalExecutor};
 mod compaction;
 mod control_runner;
+mod deferred_reply;
 mod history;
 mod images;
 mod json_size;
