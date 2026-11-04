@@ -285,6 +285,26 @@ impl QqConversations {
         self.review
             .read(&identity.app_id, &identity.session, message_id)
     }
+    /// 交流审视使用指定锚点的完整入站原话，包含失败或尚未完成轮次。
+    /// 只供理解当前交流；不能替代完整审核窗口，不提供新权限。
+    pub fn original_message_at(
+        &self,
+        session: &SessionKey,
+        message_id: &str,
+    ) -> PluginResult<String> {
+        session
+            .validate()
+            .map_err(|_| PluginError::State("QQ 原话身份无效".into()))?;
+        if !crate::state::valid_message_id(message_id) {
+            return Err(PluginError::State("QQ 原话锚点无效".into()));
+        }
+        let identity = self
+            .identity(session)?
+            .ok_or_else(|| PluginError::State("QQ 原话缺少平台身份".into()))?;
+        self.review
+            .original_text(&identity.app_id, session, message_id)
+    }
+
     /// 核对审核锚点仍是完整可信会话最新接收的消息；排队中的新消息也会令旧审核失效。
     /// 直接读取原文库顺序，不依赖当前轮次或实时引导是否已消费该消息。
     pub fn review_user_message_is_current(

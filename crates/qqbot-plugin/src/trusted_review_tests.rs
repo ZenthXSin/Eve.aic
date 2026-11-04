@@ -331,6 +331,11 @@ async fn missing_original_is_a_gap_but_present_empty_body_remains_exact() {
     );
     assert!(
         host.conversations
+            .original_message_at(&gap.session_key("app").unwrap(), &gap.id)
+            .is_err()
+    );
+    assert!(
+        host.conversations
             .legacy_review_gap_at(&scope(&gap), &gap.id)
             .is_err(),
         "缺失当前原文不是可降级的旧格式缺口"
@@ -344,6 +349,12 @@ async fn missing_original_is_a_gap_but_present_empty_body_remains_exact() {
         host.record("app", &next, Some("新的原话")).unwrap();
         host.bind("app", std::slice::from_ref(&next));
         let evidence = host.conversations.review_user_messages(&scope(&next));
+        assert_eq!(
+            host.conversations
+                .original_message_at(&next.session_key("app").unwrap(), &next.id)
+                .unwrap(),
+            "新的原话"
+        );
         if id < 5 {
             assert!(evidence.is_err(), "窗口内缺口不能跳过并补更旧消息");
         } else {
@@ -587,11 +598,22 @@ async fn replaceable_archive_cannot_supply_foreign_unanchored_or_oversized_evide
         archive.0.lock().unwrap().read_override = Some(bad);
         assert!(
             host.conversations
+                .original_message_at(&anchor.session_key("app").unwrap(), &anchor.id)
+                .is_err()
+        );
+        assert!(
+            host.conversations
                 .review_user_messages(&scope(&anchor))
                 .is_err()
         );
     }
     archive.0.lock().unwrap().read_override = Some(vec![good]);
+    assert_eq!(
+        host.conversations
+            .original_message_at(&anchor.session_key("app").unwrap(), &anchor.id)
+            .unwrap(),
+        "真实原话"
+    );
     assert_eq!(
         host.conversations
             .review_user_messages(&scope(&anchor))
@@ -664,6 +686,12 @@ async fn legacy_receipts_create_a_persistent_gap_until_six_new_platform_original
     for (message, text) in messages[..3].iter().zip(&texts[..3]) {
         host.record("app", message, Some(text)).unwrap();
         host.bind("app", std::slice::from_ref(message));
+        assert_eq!(
+            host.conversations
+                .original_message_at(&message.session_key("app").unwrap(), &message.id)
+                .unwrap(),
+            *text
+        );
         assert!(
             host.conversations
                 .review_user_messages(&scope(message))

@@ -499,6 +499,10 @@ impl Speech {
             session_id: event.session.session_id.clone(),
             user_id: event.session.user_id.clone(),
         };
+        let current_text = self
+            .conversations
+            .original_message_at(&event.session, &event.anchor)
+            .map_err(context_error)?;
         let context = self
             .context
             .assemble_scoped(
@@ -550,7 +554,7 @@ impl Speech {
         }
         // 当前模式在资料与历史之后说明，避免把旧对话的 final 或工具计划继续当作本次输出。
         messages.push(ChatMessage::text(ChatRole::System, RULES));
-        messages.push(ChatMessage::text(ChatRole::User, json!({"host_event":event.facts,"now_ms":now(),"current_message_id":event.anchor,"instruction":"只审视这次事实，自主选择 speak / wait / silence。"}).to_string()));
+        messages.push(ChatMessage::text(ChatRole::User, json!({"host_event":event.facts,"now_ms":now(),"current_message_id":event.anchor,"current_user_message":{"id":event.anchor,"text":current_text},"instruction":"结合当前用户原话审视这次事实，自主选择 speak / wait / silence。"}).to_string()));
         let model = if event.id.starts_with("outreach:") {
             &self.background_resolver
         } else {
@@ -600,6 +604,21 @@ impl QqSpeech for Speech {
             if due > now() {
                 return Ok(None);
             }
+            let scope = ContextScope {
+                session_id: event.session.session_id.clone(),
+                user_id: event.session.user_id.clone(),
+            };
+            // 原话可能已持久化，而对应回执尚未提交；重启后的内存目录不能独自证明最新性。
+            if !self
+                .conversations
+                .review_user_message_is_current(&scope, &event.anchor)
+                .map_err(context_error)?
+            {
+                self.store
+                    .postpone(&event, RETRY_MS)
+                    .map_err(context_error)?;
+                return Ok(None);
+            }
             if state == "ready" {
                 return Ok(cached.map(|d| match d {
                     QqSpeechDecision::Speak { text, .. } => {
@@ -621,6 +640,10 @@ impl QqSpeech for Speech {
                 .map_err(context_error)?
                 .as_deref()
                 != Some(&event.anchor)
+                || !self
+                    .conversations
+                    .review_user_message_is_current(&scope, &event.anchor)
+                    .map_err(context_error)?
             {
                 self.store
                     .save(&event, "waiting", None, now().saturating_add(1000))

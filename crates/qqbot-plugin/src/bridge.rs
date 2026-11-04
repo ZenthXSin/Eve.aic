@@ -2121,6 +2121,11 @@ pub(crate) async fn run(
                         if let Some(anchor)=conversations.latest_message_id(&event.session)? {event.anchor=anchor;speaker.enqueue(event)?;} else {speaker.postpone(&event,60_000)?;}
                         continue;
                     }
+                    let scope=eve_llm_api::ContextScope {session_id:ready.event.session.session_id.clone(),user_id:ready.event.session.user_id.clone()};
+                    if !conversations.review_user_message_is_current(&scope,&ready.event.anchor).unwrap_or(false) {
+                        speaker.postpone(&ready.event,60_000)?;
+                        continue;
+                    }
                     let route=route_for(&ledger,&config.app_id,&ready.event.session)?;
                     if let Some(route)=route.filter(|_|valid_outreach_text(&ready.text)) {
                         let id=if let Some(candidate)=&ready.candidate {

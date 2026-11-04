@@ -33,6 +33,8 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
             self.assertEqual(body.get('response_format'), {'type': 'json_object'})
             self.assertEqual(body['messages'][-2]['role'], 'system')
             self.assertTrue(body['messages'][-2]['content'].startswith('本轮自主发言协议：'))
+            self.assertEqual(facts['current_user_message']['id'], facts['current_message_id'])
+            self.assertIsInstance(facts['current_user_message']['text'], str)
             self.speech_requests.append(body)
             return dialogue.text_response(json.dumps(self.speech_callback(facts), ensure_ascii=False))
         return super().provider_response(body, kind, fallback)
@@ -301,6 +303,57 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
         facts = json.loads(self.speech_requests[0]['messages'][-1]['content'])
         self.assertEqual(facts['host_event']['kind'], 'host_operation_result')
         self.assertFalse([e for e in self.events if e.get('type') == 'push'])
+
+    def test_background_reconsideration_reads_new_original_even_when_that_turn_failed(self):
+        self.callback = lambda _: dialogue.text_response('{"action":"silence"}')
+        self.speech_callback = lambda _: {'action': 'wait', 'after_ms': 1000}
+        def waiting():
+            self.wait_until(lambda: any(event['id'] == 'host-reply:older' and state == 'waiting'
+                for event, state, _ in self.speech_rows()), '旧事件没有保存等待决定')
+        self.run_live([*self.send(self.message('older', '/help')), *self.checkpoint('waiting')],
+                      checkpoints={'waiting': waiting})
+        current = '我先忙，这条不用回复，也不要继续旧话题。'
+        self.status_for_body = lambda body: 503 if body['messages'][-1].get('content') == current else 200
+        def decide(facts):
+            self.assertEqual(facts['current_user_message'], {'id': 'new-failed', 'text': current})
+            if facts['host_event']['user_text'] == '/help':
+                self.gate('new-original-seen').touch()
+            return {'action': 'silence'}
+        self.speech_callback = decide
+        self.run_live([*self.send(self.message('new-failed', current)),
+                       {'wait_file': str(self.gate('new-original-seen'))}, {'delay_ms': 300}],
+                      env_extra={'EVE_OPENAI_TRANSIENT_RETRIES': 'false'})
+        self.assertEqual(self.turn(current)['status']['state'], 'Failed')
+        self.assertFalse([e for e in self.events if e.get('type') in ('push', 'progress')])
+        self.assertTrue(any(event['id'] == 'host-reply:older' and event['anchor'] == 'new-failed'
+                            and state == 'silence' for event, state, _ in self.speech_rows()))
+
+    def test_restart_cannot_send_cached_text_when_original_commit_is_ahead_of_receipt(self):
+        self.speech_callback = lambda _: {'action': 'speak', 'text': '旧决定不可越过新原话', 'after_ms': 60_000}
+        def ready():
+            self.wait_until(lambda: any(event['id'] == 'host-reply:cached' and state == 'ready'
+                for event, state, _ in self.speech_rows()), '延迟发言没有落盘')
+        self.run_live([*self.send(self.message('cached', '/help')), *self.checkpoint('ready')],
+                      checkpoints={'ready': ready})
+        before = self.receipt('cached')
+        # 模拟原文事务已提交、主回执尚未提交即停止的窗口，保留真实库结构与旧回执。
+        with closing(sqlite3.connect(self.work / 'state/qq-receipts.sqlite3')) as db, db:
+            db.execute('INSERT INTO qq_originals SELECT seq+1,app,?,session_id,session_user_id,scope,'
+                       'target_id,user_id,? FROM qq_originals ORDER BY seq DESC LIMIT 1',
+                       ('original-only', '先别继续，等我回来。'))
+            db.execute('UPDATE qq_original_metadata SET committed_count=committed_count+1')
+        with closing(sqlite3.connect(self.work / 'state/speech.sqlite3')) as db, db:
+            db.execute("UPDATE speech SET due=0 WHERE state='ready'")
+        calls = len(self.speech_requests)
+        def postponed():
+            def future_due():
+                with closing(sqlite3.connect(self.work / 'state/speech.sqlite3')) as db:
+                    return db.execute("SELECT due FROM speech WHERE state='ready'").fetchone()[0] > time.time() * 1000
+            self.wait_until(future_due, '原话领先于回执时没有延后旧决定')
+        self.run_live(self.checkpoint('postponed'), checkpoints={'postponed': postponed})
+        self.assertEqual(self.receipt('cached'), before)
+        self.assertEqual(len(self.speech_requests), calls)
+        self.assertFalse([e for e in self.events if e.get('type') in ('push', 'progress')])
 
     def test_cancel_confirmation_is_authored_by_eve_and_old_output_stays_cancelled(self):
         self.response_gates[('chat', 2)] = 'never-release'
