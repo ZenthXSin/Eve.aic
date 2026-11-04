@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -13,6 +14,69 @@ spec.loader.exec_module(training)
 
 
 class Reports(unittest.TestCase):
+    def test_authored_cold_receipts_require_exact_turn_and_platform_delivery(self):
+        app = "1904159860"
+        identity = "qq:" + hashlib.sha256(json.dumps([app, "c2c", "user-1", "user-1"], separators=(",", ":")).encode()).hexdigest()
+        message = {"id": "spoken", "scope": "c2c", "target_id": "user-1", "user_id": "user-1", "text": "重复原话"}
+        def receipt(id, turn, parts):
+            return {"app_id": app, "message": {**message, "id": id}, "state": "Handled", "reply": None,
+                    "control_turn_id": turn, "progress": parts}
+        def part(text, id, **extra):
+            return {"text": text, "decision_id": id, "state": "Sent", "platform_message_id": "platform-" + id, **extra}
+        spoken = receipt("spoken", 1, [part("这句真的发出去了？", "spoken"), part("图片说明不是聊天正文", "image", image_path="/fixture/image.png")])
+        silent = receipt("silent", 2, [])
+        wrong_turn = receipt("wrong-turn", 99, [part("轮次错了，不能采集", "wrong")])
+        unknown = receipt("unknown", 3, [part("平台没有确认的草稿", "unknown", platform_message_id=None)])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.json"
+            archive = root / "session-archive"
+            archive.mkdir()
+            references = []
+            for index in range(1, 4):
+                turn = {"id": index, "input": message["text"], "status": {"state": "Completed", "messages": [
+                    {"role": "User", "text": message["text"]}, {"role": "Assistant", "text": "这只是内部草稿，不能算说过。"}]}}
+                payload = json.dumps(turn).encode()
+                digest = hashlib.sha256(payload).hexdigest()
+                (archive / (digest + ".json")).write_bytes(payload)
+                references.append({"hash": digest, "bytes": len(payload)})
+            database = sqlite3.connect(root / "qq-receipts.sqlite3")
+            try:
+                database.execute("CREATE TABLE metadata(version INTEGER, identity TEXT)")
+                database.execute("INSERT INTO metadata VALUES(1,?)", ("a" * 32,))
+                database.execute("CREATE TABLE receipts(seq INTEGER PRIMARY KEY, app TEXT, message_id TEXT, payload BLOB)")
+                database.execute("INSERT INTO receipts VALUES(1,?,?,?)", (app, "spoken", json.dumps(spoken).encode()))
+                database.commit()
+            finally:
+                database.close()
+            receipts = {"version": 9, "archive": {"identity": "a" * 32, "records": 1},
+                        "entries": [silent, wrong_turn, unknown]}
+            sessions = {"format_version": 2, "sessions": {identity: {"key": {"session_id": identity, "user_id": identity},
+                "revision": 6, "turns": references}}}
+            training.write_json(state_path, {"version": 1, "entries": {
+                "eve.channel.qqbot": {"receipts.v1": list(json.dumps(receipts).encode())},
+                "eve.session": {"sessions.v1": list(json.dumps(sessions).encode())}}})
+            report = training.collect(state_path)
+            self.assertEqual(report["counts"]["model_sent"], 1)
+            self.assertEqual(report["counts"]["silent_turns"], 1)
+            self.assertEqual(report["counts"]["image_sent"], 1)
+            self.assertEqual(report["counts"]["unconfirmed"], 2)
+            self.assertEqual(report["evidence"][0]["reply"], "这句真的发出去了？")
+            self.assertEqual(report["evidence"][0]["deliveries"][0]["platform_message_id"], "platform-spoken")
+            before = state_path.read_bytes()
+            next_round = root.parent / (root.name + "-next")
+            try:
+                next_round.mkdir()
+                training.seed_round(next_round, root)
+                self.assertEqual(training.collect(next_round / "state/state.json")["counts"]["received_records"], 0)
+            finally:
+                import shutil
+                shutil.rmtree(next_round)
+            self.assertEqual(state_path.read_bytes(), before)
+            (archive / (references[0]["hash"] + ".json")).unlink()
+            with self.assertRaisesRegex(ValueError, "invalid_session_archive_file"):
+                training.collect(state_path)
+
     def test_new_round_preserves_source_history_and_counts_only_new_receipts_and_turns(self):
         identity = "qq:" + hashlib.sha256(json.dumps(["1904159860", "c2c", "user-1", "user-1"], separators=(",", ":")).encode()).hexdigest()
         message = {"id": "old-1", "scope": "c2c", "target_id": "user-1", "user_id": "user-1", "text": "你好"}

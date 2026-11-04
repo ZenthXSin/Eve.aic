@@ -1,6 +1,8 @@
 """真实 Eve 进程：只有明确表达会发送；模型和 QQ 均使用本地协议替身。"""
+from contextlib import closing
 import hashlib
 import json
+import os
 import sqlite3
 import time
 import unittest
@@ -71,7 +73,7 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
         path = self.work / 'state/speech.sqlite3'
         if not path.exists():
             return []
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db:
             return [(json.loads(event), state, json.loads(decision) if decision else None)
                     for event, state, decision in db.execute('SELECT event,state,decision FROM speech')]
 
@@ -81,13 +83,14 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
                 return self.choose('echo', {'text': '内部核对完成'})
             return dialogue.text_response('只是内部结束，不是要说给对方的话')
         self.callback = respond
-        self.run_live(self.send(self.message('quiet', '这个先不用回答')), env_extra={
+        summary = self.run_live(self.send(self.message('quiet', '这个先不用回答')), env_extra={
             'EVE_PROGRESS_TOOL_MILESTONES': 'true', 'EVE_PROGRESS_STAGE_UPDATES': 'true',
             'EVE_PROGRESS_SLOW_AFTER_MS': '1000'})
         self.assertEqual(self.progress('quiet'), [])
         self.assertEqual(self.receipt('quiet')['state'], 'Handled')
         self.assertIsNone(self.receipt('quiet')['reply'])
         self.assertEqual(self.speech_rows(), [])
+        self.assertEqual(summary['sent'], 0)
 
     def test_question_and_wait_take_new_input_in_the_same_turn_without_ack(self):
         def respond(body):
@@ -103,11 +106,12 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
                 return self.choose('send_message', {'text': '那先保住数据，再看系统的问题'})
             return dialogue.text_response('本轮结束')
         self.callback = respond
-        self.run_live([{'send': self.message('base', '帮忙修电脑')}, self.wait_command('base', 'progress'),
+        summary = self.run_live([{'send': self.message('base', '帮忙修电脑')}, self.wait_command('base', 'progress'),
             {'wait_file': str(self.gate('waiting-started'))}, {'delay_ms': 150},
             {'send': self.message('answer', '有，先备份')}, self.wait_receipt('answer', 'Merged'), self.wait_receipt('base')])
         self.assertEqual([e['text'] for e in self.progress('base')], ['硬盘里有重要数据吗', '那先保住数据，再看系统的问题'])
         self.assertEqual(self.progress('answer'), [])
+        self.assertEqual(summary['sent'], 2)
         turns = next(iter(self.documents()['eve.session']['sessions.v1']['sessions'].values()))['turns']
         self.assertEqual(len(turns), 1)
         self.assertEqual([m['text'] for m in turns[0]['status']['messages'] if m['role'] == 'User'], ['帮忙修电脑', '有，先备份'])
@@ -298,7 +302,7 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
         self.callback = respond
         self.run_live(self.send(self.message('image-only', '哈哈这也太好了')), more=['--stickers'])
         [frame] = self.progress('image-only')
-        self.assertEqual(frame['image_path'], str(path))
+        self.assertTrue(os.path.samefile(frame['image_path'], path))
         part = self.receipt('image-only')['progress'][0]
         self.assertEqual(part['image_path'], str(path))
         self.assertEqual(part['state'], 'Sent')

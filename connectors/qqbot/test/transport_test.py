@@ -35,7 +35,7 @@ class TransportAcceptance(memory.MemoryAcceptance):
         path = self.work / f"{number}-scenario.json"
         path.write_text(json.dumps(scenario))
         env = {key: os.environ[key] for key in ("PATH", "SystemRoot", "TEMP", "TMP") if key in os.environ}
-        env.update(QQBOT_APP_ID="1904159860", QQBOT_APP_SECRET="synthetic-app-secret",
+        env.update(EVE_QQ_LIVE_INTERACTION="false", QQBOT_APP_ID="1904159860", QQBOT_APP_SECRET="synthetic-app-secret",
                    EVE_OPENAI_API_KEY="synthetic-model-secret", EVE_OPENAI_PROTOCOL="chat",
                    EVE_LLM_RESPONSE_MODE="complete",
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}")

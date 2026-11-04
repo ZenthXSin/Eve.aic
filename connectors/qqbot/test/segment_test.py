@@ -124,7 +124,7 @@ class SegmentAcceptance(unittest.TestCase):
                                         "error_file": str(error_path),
                                         "wait_timeout_ms": max(15000, (timeout - 5) * 1000)}), encoding="utf8")
         env = {key: os.environ[key] for key in ("PATH", "SystemRoot", "TEMP", "TMP") if key in os.environ}
-        env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret",
+        env.update(EVE_QQ_LIVE_INTERACTION="false", QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret",
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
                    EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete",
                    # 本文件的既有用例验收自然段规划；按句分条单独验收。

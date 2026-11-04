@@ -7,15 +7,14 @@ import { createBridge, consume } from "../bridge-core.mjs";
 const scenario = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 if (process.env.EVE_OPENAI_API_KEY) throw new Error("model_credentials_leaked");
 const handlers = new Map(), latencies = [];
-const progressTexts = new Set();
-let index = 0, start = 0, peakRss = 0;
+let index = 0, start = 0, peakRss = 0, delivered = false;
 const bot = {
   on: (name, handler) => handlers.set(name, handler),
   stop() {},
   async sendText(target, text) {
     const message = scenario.messages[index];
     assert.deepEqual(target, { scope: "c2c", targetId: "perf-user", msgId: message.id });
-    if (!progressTexts.delete(text)) assert.equal(text, message.expected);
+    assert.equal(text, message.expected);
     return { id: "perf-out." + index + "!" };
   },
 };
@@ -38,17 +37,25 @@ const bridge = createBridge(bot, frame => {
   if (frame.type === "delivery") {
     assert.equal(frame.ok, true);
     assert.equal(frame.id, scenario.messages[index].id);
-    if (frame.progress) return; // 进展不结束当前消息，不混入最终答复的延迟样本。
+    assert.equal(frame.progress, true); // 只有显式 send_message 能产生平台发言。
+    assert.equal(delivered, false);
+    delivered = true;
     latencies.push(performance.now() - start);
     peakRss = Math.max(peakRss, process.memoryUsage().rss / 1048576);
-    index++;
-    setImmediate(next);
   } else if (frame.type === "warning" || frame.type === "fatal") throw new Error("unexpected_bridge_frame");
 });
 const originalCommand = bridge.command;
-bridge.command = frame => {
-  if (frame.type === "progress") progressTexts.add(frame.text);
-  return originalCommand(frame);
+bridge.command = async frame => {
+  assert.notEqual(frame.type, "reply");
+  assert.notEqual(frame.type, "segment");
+  await originalCommand(frame);
+  if (frame.type === "finish") {
+    assert.equal(frame.id, scenario.messages[index].id);
+    assert.equal(delivered, true);
+    delivered = false;
+    index++;
+    setImmediate(next);
+  }
 };
 handlers.get("ready")();
 next();

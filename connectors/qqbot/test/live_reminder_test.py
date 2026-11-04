@@ -1,4 +1,5 @@
 """实际 QQ 宿主：到期提醒仅是事实，由同一 Eve 决定说、等或沉默。模型/平台用本地替身。"""
+from contextlib import closing
 import json
 import sqlite3
 import unittest
@@ -67,8 +68,9 @@ class LiveReminderAcceptance(live.LiveToolAcceptance):
         count = len(self.speech_requests)
         self.run_live([{'delay_ms': 2300}], more=['--reminders'])
         self.assertEqual(len(self.speech_requests), count, '未到 Eve 选的时间不能提前复审')
-        with sqlite3.connect(self.work / 'state/speech.sqlite3') as db:
+        with closing(sqlite3.connect(self.work / 'state/speech.sqlite3')) as db:
             db.execute("UPDATE speech SET due=0 WHERE state='waiting'")
+            db.commit()
         def decide(facts):
             self.assertEqual(facts['host_event']['kind'], 'reminder_due')
             self.assertEqual(facts['host_event']['reminder']['text'], '喝水')
@@ -100,8 +102,9 @@ class LiveReminderAcceptance(live.LiveToolAcceptance):
         self.callback = cancel
         self.run_live(self.send(self.message('cancel-due', '不用提醒喝水了')), more=['--reminders'])
         self.assertEqual(self.reminders()[0]['status'], 'Cancelled')
-        with sqlite3.connect(self.work / 'state/speech.sqlite3') as db:
+        with closing(sqlite3.connect(self.work / 'state/speech.sqlite3')) as db:
             db.execute("UPDATE speech SET due=0 WHERE state='ready'")
+            db.commit()
         self.run_live([{'delay_ms': 2300}], more=['--reminders'])
         self.assertEqual(self.reminders()[0]['attempts'], [])
         self.assertFalse([e for e in self.events if e.get('type') in ('push', 'progress')])

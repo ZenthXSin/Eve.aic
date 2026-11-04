@@ -2524,6 +2524,9 @@ pub(crate) async fn run(
                             ledger.entries[index].progress[part].state = if ok { PartState::Sent } else if delivery_unknown(&frame) { PartState::Unknown } else { PartState::Failed };
                             ledger.entries[index].progress[part].platform_message_id = if ok && ledger.entries[index].progress[part].decision_id.is_some() { frame.get("message_id").and_then(Value::as_str).map(str::to_owned) } else { None };
                             ledger.save(&ctx)?;
+                            if ledger.entries[index].progress[part].decision_id.is_some() {
+                                status.send_modify(|s| { if ok { s.sent += 1; } else { s.failed += 1; } });
+                            }
                             if let Some(speaker)=&speech {expression_receipt(speaker,&config.app_id,&ledger.entries[index],part,
                                 if ok {QqOutreachResult::Sent{platform_message_id:ledger.entries[index].progress[part].platform_message_id.clone()}} else if delivery_unknown(&frame) {QqOutreachResult::Unknown} else {QqOutreachResult::Failed{http_status:None,biz_code:None}})?;}
                             if !ok { delivery_log(&ctx, "progress_failed_no_retry", &frame); }

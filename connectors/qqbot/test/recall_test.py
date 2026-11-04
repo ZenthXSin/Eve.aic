@@ -89,7 +89,7 @@ class RecallAcceptance(unittest.TestCase):
         scenario.write_text(json.dumps({"script": script, "events_file": str(events_path),
             "error_file": str(error_path), "send_fail": send_fail}), encoding="utf8")
         env = {key: os.environ[key] for key in ("PATH", "SystemRoot", "TEMP", "TMP") if key in os.environ}
-        env.update(QQBOT_APP_SECRET="test-app-secret", QQBOT_APP_ID=app,
+        env.update(EVE_QQ_LIVE_INTERACTION="false", QQBOT_APP_SECRET="test-app-secret", QQBOT_APP_ID=app,
             EVE_OPENAI_API_KEY="test-model-secret",
             EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
             EVE_OPENAI_PROTOCOL="chat", EVE_LLM_RESPONSE_MODE="complete")

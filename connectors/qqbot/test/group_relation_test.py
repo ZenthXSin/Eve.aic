@@ -2,6 +2,7 @@
 
 所有 HTTP 模型及 QQ 发送均为本地替身，不向真实群发测试消息。
 """
+from contextlib import closing
 import json
 import sqlite3
 import threading
@@ -142,7 +143,7 @@ class GroupRelationAcceptance(group_chat_test.GroupChatAcceptance):
     def relation_rows(self,table):
         path=self.work/'state/jev-group-experience.sqlite3'
         if not path.exists(): return []
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db:
             db.row_factory=sqlite3.Row
             return [dict(row) for row in db.execute('SELECT * FROM '+table+' ORDER BY seq')]
 

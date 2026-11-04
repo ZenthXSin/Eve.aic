@@ -82,6 +82,8 @@ def main():
                         "QQBOT_SANDBOX": "false", "EVE_OPENAI_API_KEY": "test-model-secret",
                         "EVE_OPENAI_BASE_URL": f"http://127.0.0.1:{server.server_port}",
                         "EVE_OPENAI_MODEL": "initial-model", "EVE_OPENAI_PROTOCOL": "chat", "EVE_WEB_TOKEN": TOKEN,
+                        # 插件启停在显式旧分段组合中验收；自主发言不受分段插件驱动。
+                        "EVE_QQ_LIVE_INTERACTION": "false",
                         # 本脚本验证自然段分条；按句分条由 segment_test 覆盖。
                         "EVE_CHAT_SENTENCE_SPLIT": "false"})
 

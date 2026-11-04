@@ -9,6 +9,7 @@ import unittest
 
 import group_relation_test
 import reminder_test
+from dialogue_tools_test import tool_response, text_response
 
 
 @unittest.skipIf(os.name == 'nt', '真实 SIGTERM 收尾由 Ubuntu 验收')
@@ -17,6 +18,18 @@ class GroupWakeupAcceptance(group_relation_test.GroupRelationAcceptance):
         if _name.startswith('test_'):
             locals()[_name] = None
     del _name
+
+    def setUp(self):
+        super().setUp()
+        def respond(body):
+            latest=body['messages'][-1]
+            if latest['role']=='tool':
+                self.assertTrue(json.loads(latest['content'])['sent'])
+                return text_response('内部结束')
+            response=tool_response([('send_message',{'text':'这个思路可以试试'})])
+            response['choices'][0]['message']['tool_calls'][0]['id']='wake-speech-'+str(len(self.kind('chat')))
+            return response
+        self.callback=respond
 
     def test_prefix_only_bridge_does_not_wake_on_at_or_plain_group_and_keeps_private_chat(self):
         root = self.work / 'prefix-bridge'
@@ -53,7 +66,7 @@ export class QQBot {
 }'''
         (sdk / 'index.mjs').write_text(code.replace('RECORD',json.dumps(str(record))))
         env = {key:os.environ[key] for key in ('PATH','SystemRoot','TEMP','TMP') if key in os.environ}
-        env.update(QQBOT_APP_SECRET='test-app-secret',QQBOT_APP_ID='1904159860',
+        env.update(EVE_QQ_LIVE_INTERACTION='true',QQBOT_APP_SECRET='test-app-secret',QQBOT_APP_ID='1904159860',
             EVE_OPENAI_API_KEY='test-model-secret',EVE_OPENAI_BASE_URL=f'http://127.0.0.1:{self.server.server_port}',
             EVE_OPENAI_PROTOCOL='chat',EVE_LLM_RESPONSE_MODE='complete',EVE_DEBOUNCE_MS='0',
             QQBOT_GROUP_PREFIX_ONLY='true',EVE_CHIME_ENABLED='false',EVE_HISTORY_DIGEST_ENABLED='false',
@@ -72,21 +85,21 @@ export class QQBot {
             self.assertEqual(child.returncode,0,stderr)
             sends=[json.loads(line) for line in record.read_text().splitlines()]
             self.assertEqual([r['target']['msgId'] for r in sends],['prefix-1','prefix-2','private'])
-            self.assertEqual(len(self.kind('chat')),3)
+            self.assertEqual(len(self.kind('chat')),6)
             self.assertEqual(self.jev_requests,[])
             self.assertEqual(self.kind('chime'),[])
             self.assertEqual(self.errors,[])
         finally:
             if child.poll() is None: child.kill();child.communicate(timeout=5)
 
-    def test_prefix_wakes_with_exhausted_budget_broken_jev_and_hourly_limit(self):
+    def test_prefix_wakes_with_exhausted_budget_and_broken_jev(self):
         self.jev_status = 503
         pulse = self.work / 'budget-spent'
         original_reply = self.reply
 
         def reply(kind, decoded, latest):
             result = original_reply(kind, decoded, latest)
-            if kind == 'chime':
+            if kind == 'group_speech':
                 pulse.touch()
             return result
 
@@ -126,7 +139,7 @@ export class QQBot {
 }'''
         (sdk / 'index.mjs').write_text(code.replace('RECORD', json.dumps(str(record))).replace('PULSE', json.dumps(str(pulse))))
         env = {key: os.environ[key] for key in ('PATH', 'SystemRoot', 'TEMP', 'TMP') if key in os.environ}
-        env.update(QQBOT_APP_SECRET='test-app-secret', QQBOT_APP_ID='1904159860',
+        env.update(EVE_QQ_LIVE_INTERACTION='true', QQBOT_APP_SECRET='test-app-secret', QQBOT_APP_ID='1904159860',
                    EVE_OPENAI_API_KEY='test-model-secret', EVE_OPENAI_BASE_URL=f'http://127.0.0.1:{self.server.server_port}',
                    EVE_OPENAI_PROTOCOL='chat', EVE_LLM_RESPONSE_MODE='complete', EVE_DEBOUNCE_MS='0',
                    EVE_JEV_API_KEY='group-jev-test-secret', EVE_JEV_BASE_URL=f'http://127.0.0.1:{self.jev_server.server_port}',
@@ -141,8 +154,9 @@ export class QQBot {
             '--agent', str(source.parents[1] / 'AGENT.md'), '--bridge-script', str(root / 'bridge.mjs')],
             env=configure_fixture_progress(env), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            self.wait_for(lambda:child.poll() is not None or len(self.kind('chat')) >= 4, '名字呼叫未逐条进入普通会话', 25)
-            self.wait_for(lambda:sum(e['state'] == 'Sent' for e in self.documents().get('eve.channel.qqbot', {}).get('receipts.v1', {}).get('entries', [])) == 4,
+            self.wait_for(lambda:child.poll() is not None or len(self.kind('chat')) >= 8, '名字呼叫未逐条进入普通会话', 25)
+            self.wait_for(lambda:sum(e['state'] == 'Handled' and any(p['state']=='Sent' and p.get('platform_message_id') for p in e.get('progress',[]))
+                          for e in self.documents().get('eve.channel.qqbot', {}).get('receipts.v1', {}).get('entries', [])) == 4,
                           '名字呼叫未保存四条发送回执', 10)
             self.quiet()
             child.send_signal(signal.SIGTERM)
@@ -151,10 +165,12 @@ export class QQBot {
             sends = [json.loads(line) for line in record.read_text().splitlines()]
             self.assertEqual([r['target']['msgId'] for r in sends], ['wake-0', 'wake-1', 'wake-2', 'wake-3'])
             self.assertTrue(all(r['text'].startswith('<@member-1> ') for r in sends))
-            self.assertEqual(len(self.kind('chat')), 4)
-            self.assertEqual(len(self.kind('chime')), 1)
-            self.assertEqual(len(self.jev_requests), 1, '名字呼叫不能进入 Jev 关系判断')
-            self.assertEqual(len(self.relation_rows('judgments')), 1, '名字呼叫不能积攒到待补答池')
+            self.assertEqual(len(self.kind('chat')), 8)
+            self.assertEqual(len(self.kind('group_speech')), 1)
+            self.assertEqual(self.kind('chime'), [])
+            self.assertEqual(self.jev_requests, [], '名字呼叫不能进入 Jev 关系判断')
+            self.assertTrue(all(r['active']=='none' for r in self.relation_rows('judgments')),
+                            '原话可以供后续关系整理，不能派生自动补答')
             self.assertEqual(self.rows('outbound'), [], '名字呼叫只走普通回复，不产生主动补答')
             budget = self.documents()['eve.budget']['usage.v1']['current']
             self.assertEqual(budget['used'], 1)
