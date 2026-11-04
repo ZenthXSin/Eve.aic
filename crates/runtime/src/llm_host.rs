@@ -1072,9 +1072,19 @@ impl LlmHost {
                             matches!(
                                 t.definition.name.as_str(),
                                 "send_message" | "wait_for_input"
-                            )
+                            ) || self
+                                .tool_scope_policy
+                                .as_ref()
+                                .zip(scope.as_ref())
+                                .is_some_and(|(policy, scope)| {
+                                    catch_unwind(AssertUnwindSafe(|| {
+                                        policy
+                                            .tool_allowed_without_review(scope, &t.definition.name)
+                                    }))
+                                    .unwrap_or(false)
+                                })
                         });
-                        prepared.context.profile.push_str("\n本轮只能文字交流或等待新输入，不能执行业务工具或声称已经执行外部操作。若装配 send_message，仍由你通过它决定发言。确实需要操作时说明本轮暂时不能执行，不要求用户补说历史消息。\n");
+                        prepared.context.profile.push_str("\n旧会话的历史授权原话尚不完整。本次 tools 中保留了交流及宿主允许的只读查询：有源码或资料查询工具时正常调用查证，不要因为缺少其他工具就说无法查源码。写入、命令执行与管理操作暂不可用，不要求用户补说历史消息，也不能把查证说成完成了这些操作。\n");
                         Vec::new()
                     }
                     Err(error) => return Err(fail(error, diagnostics)),
@@ -1476,10 +1486,12 @@ impl LlmHost {
             if chat_without_tools
                 && calls
                     .iter()
-                    .any(|c| !matches!(c.name.as_str(), "send_message" | "wait_for_input"))
+                    .any(|c| !definitions.iter().any(|tool| tool.name == c.name))
             {
                 return Err(fail(
-                    LlmError::Context("本轮审核原话不足，仅允许文字交流；未执行工具".into()),
+                    LlmError::Context(
+                        "本轮审核原话不足，仅允许已提供的交流与只读查询；未执行该批工具".into(),
+                    ),
                     diagnostics,
                 ));
             }

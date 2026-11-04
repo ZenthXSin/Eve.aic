@@ -85,6 +85,11 @@ fn public_tool(name: &str) -> bool {
             | "settle_commitment"
     )
 }
+
+/// 固定公开资料和公共网页查询不借用任何群成员的操作授权。
+fn source_lookup_tool(name: &str) -> bool {
+    matches!(name, "search_reference" | "read_reference" | "read_source")
+}
 pub(crate) fn owner_file(path: &str, write: bool) -> bool {
     Path::new(path).components().any(|c| match c {
         Component::Normal(s) => {
@@ -168,9 +173,9 @@ pub(crate) fn authorize_tool(
     let scope = context
         .scope()
         .ok_or_else(|| ToolExecutionError::Failed("管理工具需要可信平台身份".into()))?;
-    if scope.user_id == crate::qq_group::USER {
+    if scope.user_id == crate::qq_group::USER && !source_lookup_tool(name) {
         return Err(ToolExecutionError::Failed(
-            "群聊观察只允许生成聊天回复，不执行工具或代办管理任务".into(),
+            "群聊观察仅可交流与查询公开参考资料，不代办命令、写入或管理任务".into(),
         ));
     }
     // 身份与业务许可独立；主人身份或公共工具也不能越过持久急停。
@@ -282,12 +287,27 @@ pub(crate) struct GuardedOutreach {
 }
 pub(crate) struct ChannelToolPolicy;
 impl eve_llm_api::ToolScopePolicy for ChannelToolPolicy {
-    fn tools_allowed(&self, scope: &eve_llm_api::ContextScope) -> bool {
-        scope.user_id != crate::qq_group::USER
+    fn tools_allowed(&self, _scope: &eve_llm_api::ContextScope) -> bool {
+        true
     }
     fn tool_allowed(&self, scope: &eve_llm_api::ContextScope, name: &str) -> bool {
+        if scope.user_id == crate::qq_group::USER {
+            return source_lookup_tool(name);
+        }
         !matches!(name, "send_message" | "wait_for_input" | "send_sticker")
             || (scope.session_id.starts_with("qq:") && scope.session_id == scope.user_id)
+    }
+    fn tool_allowed_without_review(&self, scope: &eve_llm_api::ContextScope, name: &str) -> bool {
+        scope.session_id.starts_with("qq:")
+            && scope.session_id == scope.user_id
+            && (source_lookup_tool(name)
+                || matches!(
+                    name,
+                    "read_raw_message"
+                        | "inspect_capabilities"
+                        | "inspect_tool_permission"
+                        | "inspect_model_runtime"
+                ))
     }
 }
 impl GuardedOutreach {
@@ -549,6 +569,67 @@ impl QqCommandHandler for GuardedCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_queries_remain_available_in_legacy_and_group_conversations() {
+        use eve_llm_api::ToolScopePolicy;
+        let directory = tempfile::tempdir().unwrap();
+        let admin = Admin::open(
+            directory.path(),
+            eve_qqbot_plugin::QqConversations::default(),
+            Default::default(),
+            eve_kernel::KernelServices::default().registry,
+        )
+        .unwrap();
+        let group = eve_llm_api::ContextScope {
+            session_id: "qq:group".into(),
+            user_id: crate::qq_group::USER.into(),
+        };
+        let legacy = eve_llm_api::ContextScope {
+            session_id: "qq:user".into(),
+            user_id: "qq:user".into(),
+        };
+        let policy = ChannelToolPolicy;
+        assert!(policy.tools_allowed(&group));
+        for name in ["search_reference", "read_reference", "read_source"] {
+            assert!(policy.tool_allowed(&group, name));
+            assert!(policy.tool_allowed_without_review(&legacy, name));
+            assert!(
+                authorize_tool(
+                    &admin,
+                    false,
+                    name,
+                    None,
+                    &ToolExecutionContext::new().with_scope(Some(group.clone()))
+                )
+                .is_ok()
+            );
+        }
+        for name in [
+            "run_command",
+            "write_file",
+            "read_file",
+            "run_tool_code",
+            "dispatch_background_task",
+            "send_message",
+            "read_raw_message",
+        ] {
+            assert!(!policy.tool_allowed(&group, name));
+            assert!(
+                authorize_tool(
+                    &admin,
+                    false,
+                    name,
+                    None,
+                    &ToolExecutionContext::new().with_scope(Some(group.clone()))
+                )
+                .is_err()
+            );
+        }
+        assert!(policy.tool_allowed_without_review(&legacy, "read_raw_message"));
+        assert!(!policy.tool_allowed_without_review(&legacy, "run_command"));
+        assert!(!policy.tool_allowed_without_review(&group, "read_raw_message"));
+    }
     #[test]
     fn resolved_file_permissions_keep_members_own_project_rules_editable() {
         let directory = tempfile::tempdir().unwrap();

@@ -739,7 +739,8 @@ pub trait ReviewUserMessageSource: Send + Sync {
         Err(LlmError::Context("原话来源不支持审核新鲜度检查".into()))
     }
     /// 仅可信来源确认的旧格式原话缺口可继续无工具聊天；损坏、身份错误等不得放行。
-    /// 宿主在整个当前轮次移除全部工具，后续完整新轮次才恢复工具目录。
+    /// 宿主在整个当前轮次移除需要完整审核原话的工具；仅保留交流工具和
+    /// ToolScopePolicy 明确允许的不依赖历史授权的只读查询，下一轮重新核对。
     fn allows_chat_without_tools_at(
         &self,
         _scope: &ContextScope,
@@ -1264,5 +1265,11 @@ pub trait ToolScopePolicy: Send + Sync {
     /// 个别工具可能只存在于某个真实通道；默认保留旧的整组策略。
     fn tool_allowed(&self, _scope: &ContextScope, _name: &str) -> bool {
         true
+    }
+    /// 仅在可信通道确认旧格式历史原话缺口时使用。不能放开需要完整授权证据、
+    /// 任意执行或写入的工具；当前消息缺失、身份错误和存储异常不进入此路径。
+    /// 该策略只收窄已装配目录，不能由模型参数授予；旧实现默认不开放额外工具。
+    fn tool_allowed_without_review(&self, _scope: &ContextScope, _name: &str) -> bool {
+        false
     }
 }

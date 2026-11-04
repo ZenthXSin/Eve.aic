@@ -85,7 +85,7 @@ pub(crate) fn schema() -> ConfigSchema {
             ),
             (
                 "judge_timeout_ms".into(),
-                integer(15_000, 1000, 60_000, "EVE_CHIME_JUDGE_TIMEOUT_MS"),
+                integer(120_000, 1000, 120_000, "EVE_CHIME_JUDGE_TIMEOUT_MS"),
             ),
         ]),
     }

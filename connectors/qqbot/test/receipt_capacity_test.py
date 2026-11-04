@@ -149,7 +149,9 @@ class ArchivedToolAcceptance(dialogue.DialogueToolsAcceptance):
                            if m["role"] == "user")
             results = self.results(body)
             if current in originals:
-                self.assertFalse(body.get("tools"), "迁移原话尚未完整时只允许文字交流")
+                names = self.definitions(body)
+                self.assertLessEqual({"read_raw_message", "read_source", "inspect_capabilities"}, names)
+                self.assertFalse({"run_command", "write_file", "run_tool_code", "manage_business_permissions"} & names)
                 return dialogue.text_response("好，接着聊今天的计划。")
             self.assertEqual(current, lookup)
             self.assertIn("read_raw_message", self.definitions(body))
@@ -194,12 +196,12 @@ class ArchivedToolAcceptance(dialogue.DialogueToolsAcceptance):
             results = self.results(body)
             text = body["messages"][max(i for i,m in enumerate(body["messages"]) if m["role"]=="user")]["content"]
             if text == "原话不足时查询":
-                self.assertEqual(body.get("tools", []), [], "旧格式缺口不能开放任何工具")
-                return dialogue.text_response("可以继续聊，这轮暂时不能查询旧资料")
+                self.assertIn("read_raw_message", self.definitions(body))
+                self.assertNotIn("run_command", self.definitions(body))
             if not results:
                 return dialogue.tool_response([("read_raw_message",{"message_id":"old-1"}),
                     ("read_raw_message",{"message_id":"old-1","offset":8192})])
-            if text == "本会话查归档":
+            if text in ("本会话查归档", "原话不足时查询"):
                 self.assertTrue(all(r["found"] and r["archived"] for r in results))
                 self.assertIn("旧输入",results[0]["data"])
                 self.assertEqual(results[0]["next_offset"],8192)
@@ -211,13 +213,11 @@ class ArchivedToolAcceptance(dialogue.DialogueToolsAcceptance):
             return dialogue.text_response("已按会话核验旧资料，未执行原请求")
         self.callback=respond
         self.run_eve([
-            *self.send(self.message("missing-originals", "原话不足时查询", expected="可以继续聊，这轮暂时不能查询旧资料")),
-            *[step for i in range(6) for step in self.send(self.message(
-                f"original-{i}", "/admin", expected="当前平台身份：管理员。"))],
+            *self.send(self.message("missing-originals", "原话不足时查询", expected="已按会话核验旧资料，未执行原请求")),
             *self.send(self.message("lookup","本会话查归档",expected="已按会话核验旧资料，未执行原请求")),
             *self.send(self.message("foreign-lookup","另一会话查归档",user="user-2",expected="已按会话核验旧资料，未执行原请求"))],
             interest=False,memory=False,research=False,practice=False)
-        self.assertEqual(self.chat_rounds,5)
+        self.assertEqual(self.chat_rounds,6)
 
 
 if __name__ == "__main__":
