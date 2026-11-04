@@ -203,7 +203,12 @@ class WebPanelAcceptance(unittest.TestCase):
             self.assertEqual(self.api(url, "/api/cancel", {"target": target}), (202, {"status": "requested"}))
             def cancelled():
                 _, value = self.api(url, "/api/session", {"key": key})
-                return value if value["session"]["turns"][0]["status"]["state"] == "Failed" else None
+                # 会话先持久提交，控制器等 runner 返回后才发布结束回执；两者不是原子视图。
+                # 等同一代的两份状态都完成，再检查取消及跨进程零重放。
+                settled = (value["session"]["turns"][0]["status"]["state"] == "Failed"
+                           and value.get("control") is not None
+                           and value["control"]["commit"] == "Failed")
+                return value if settled else None
             detail = self.until(cancelled, child)
             self.assertEqual(detail["session"]["turns"][0]["status"]["code"], "Cancelled")
             self.assertEqual(detail["control"]["commit"], "Failed")
