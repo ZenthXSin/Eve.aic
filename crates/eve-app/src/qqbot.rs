@@ -1223,9 +1223,12 @@ async fn run_qqbot_composed(
         } else {
             None
         };
-        let subject_plugin = eve_subject_plugin::SubjectPlugin::new()?.with_idle_memory(Arc::new(
-            eve_subject_sqlite::SqliteIdleMemory::open(&options.state_directory.join("self-interests.sqlite3"))?,
-        ));
+        let subject_memory = Arc::new(eve_subject_sqlite::SqliteIdleMemory::open(
+            &options.state_directory.join("self-interests.sqlite3"),
+        )?);
+        let subject_plugin = eve_subject_plugin::SubjectPlugin::new()?
+            .with_idle_memory(subject_memory.clone())
+            .with_autonomy_memory(subject_memory);
         let subject: Arc<dyn eve_subject_api::SubjectAdmin> = Arc::new(subject_plugin.controller());
         kernel.register(Box::new(subject_plugin))?;
         let subject_admission = Arc::new(crate::qq_subject_admission::Admission(subject.clone()));
@@ -2674,6 +2677,9 @@ async fn run_qqbot_composed(
             worker.authorize_with(qq_admin.clone());
             let _ = task_late.worker.set(worker);
         }
+        if std::env::var_os("EVE_HOST_AUTONOMY_CONFIG").is_some() && tasks.is_none() {
+            eprintln!("EVE_HOST_AUTONOMY installed=false background_tasks_enabled=false existing_grant_preserved=true");
+        }
         if let Some(tasks) = &tasks {
             subject_background = Some(crate::qq_subject::Background::start_with_services(subject.clone(), Arc::new(tasks.clone()), qq_admin.clone(), Some(registry.get(&ServiceId::new(eve_session_api::SESSION_SERVICE_ID)?)?.ok_or("空闲回顾会话服务缺失")?.value.downcast::<eve_session_api::SessionServiceHandle>().map_err(|_|"空闲回顾会话服务类型错误")?.0.clone()), Some(control.clone())));
         }
@@ -3282,6 +3288,16 @@ async fn run_qqbot_composed(
         // 完成组合配置和各账本读取后才恢复主体，避免错误启动改写其他损坏状态。
         kernel.start(&PluginId::new(eve_subject_api::SUBJECT_PLUGIN_ID)?).await?;
         subject.abandon_pending_kind("work_admission", qq_tasks::now_ms())?;
+        if let Some(tasks) = &tasks {
+            let sessions = registry.get(&ServiceId::new(SESSION_SERVICE_ID)?)?
+                .ok_or("宿主自主授权会话服务缺失")?.value
+                .downcast::<SessionServiceHandle>().map_err(|_| "会话服务类型错误")?.0.clone();
+            crate::qq_subject::install_host_autonomy(
+                &subject, &(Arc::new(tasks.clone()) as Arc<dyn eve_task_api::TaskAdmin>),
+                &(qq_admin.clone() as Arc<dyn crate::qq_subject::AutonomyOwner>),
+                &sessions, crate::qq_tasks::now_ms(),
+            )?;
+        }
         kernel.start(&PluginId::new(QQBOT_PLUGIN_ID)?).await?;
         let handle = registry
             .get(&ServiceId::new(QQBOT_STATUS_SERVICE_ID)?)?
