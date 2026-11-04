@@ -82,7 +82,7 @@ class ReleaseTests(unittest.TestCase):
                       "node_launcher": True, "console_ctrl_c": True,
                       "external_model_requests": 0, "production_qq_connections": 0}
             report.update({key: True for key in ("unicode_and_space_path", "web_http", "memory_and_learning_views",
-                                                "qq_segmented_delivery", "recovery_without_replay", "client_update_download_verified",
+                                                "qq_segmented_delivery", "qq_explicit_speech", "recovery_without_replay", "client_update_download_verified",
                                                 "client_update_next_start", "client_update_rollback", "client_update_preserved_user_files")})
             (self.folder / f"acceptance-{label}.json").write_text(json.dumps(report), encoding="utf-8")
 
@@ -131,6 +131,7 @@ class ReleaseTests(unittest.TestCase):
         original = report_file.read_bytes()
         for key, value in (("source_commit", OTHER), ("version", "v9.0.0"), ("archive", "../outside.tar.gz"),
                            ("archive_sha256", "wrong"), ("web_http", "true"), ("console_ctrl_c", False),
+                           ("qq_explicit_speech", False), ("qq_explicit_speech", None),
                            ("production_qq_connections", 1), ("external_model_requests", 1), ("client_update_next_start", False),
                            ("client_update_rollback", None), ("client_update_preserved_user_files", "true")):
             with self.subTest(key=key):

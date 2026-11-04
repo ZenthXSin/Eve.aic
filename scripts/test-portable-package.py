@@ -45,7 +45,8 @@ def validate_launcher(command, phase, timeout=20):
             f'启动器配置预检失败（{phase}）；stdout={excerpt(result.stdout)!r}；stderr={excerpt(result.stderr)!r}')
 
 
-def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, label, updated=None):
+def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, label, updated=None,
+        *, live=True, message_id="package-chat", expected_turns=1):
     config_path = root / "config.json"
     before = config_path.read_bytes()
     if label == "windows-x64":
@@ -56,7 +57,13 @@ def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, 
         node = root / ("runtime/node.exe" if os.name == "nt" else "runtime/bin/node")
         command = [str(node), str(root / "Launch.mjs"), "qq",
                    "--no-prompt", "--no-check-updates", "--bridge-script", str(bridge), "--bridge-arg", str(scenario)]
-    child = subprocess.Popen(command, cwd=root.parent, stdout=subprocess.PIPE,
+    environment = dict(os.environ)
+    if live:
+        # 默认启动必须实际采用自主发言，不能靠验收环境覆盖掩盖默认值回退。
+        environment.pop("EVE_QQ_LIVE_INTERACTION", None)
+    else:
+        environment["EVE_QQ_LIVE_INTERACTION"] = "false"
+    child = subprocess.Popen(command, cwd=root.parent, env=environment, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
     lines = []
     ready = queue.Queue()
@@ -116,7 +123,7 @@ def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, 
                 time.sleep(0.02)
                 continue
             receipts = json.loads(bytes(document["entries"].get("eve.channel.qqbot", {}).get("receipts.v1", [])) or b'{}')
-            if any(item["message"]["id"] == "package-chat" and item["state"] == "Sent"
+            if any(item["message"]["id"] == message_id and item["state"] == ("Handled" if live else "Sent")
                    for item in receipts.get("entries", [])):
                 break
             time.sleep(0.02)
@@ -151,10 +158,19 @@ def run(root, config, bridge, scenario, stop_gate, requests, expected_requests, 
         sessions = json.loads(bytes(json.loads(state_file.read_text(encoding="utf-8"))["entries"]["eve.session"]["sessions.v1"]))
         turns = [turn for session in sessions["sessions"].values()
                  for turn in runtime.session_turns(state_file, session, sessions["format_version"])]
-        require(len(turns) == 1 and turns[0]["status"]["state"] == "Completed", "完成历史未保存或旧消息被重放")
-        receipt = next(item for item in receipts["entries"] if item["message"]["id"] == "package-chat")
-        require(len(receipt["segments"]["parts"]) == 2, "回复未分成两条 QQ 消息")
-        require(all(part["state"] == "Sent" for part in receipt["segments"]["parts"]), "分段发送回执不完整")
+        require(len(turns) == expected_turns and all(turn["status"]["state"] == "Completed" for turn in turns),
+                "完成历史未保存或旧消息被重放")
+        receipt = next(item for item in receipts["entries"] if item["message"]["id"] == message_id)
+        if live:
+            require(receipt.get("reply") is None and receipt.get("segments") is None,
+                    "自主发言模式自动发送了内部 final 或分段")
+            parts = receipt.get("progress", [])
+            require([part["text"] for part in parts] == ["你好。", "我在这里。"], "模型明确选择的两次发言未完整送达")
+            require(all(part["state"] == "Sent" and part.get("decision_id") and part.get("platform_message_id")
+                        for part in parts), "自主发言缺少工具决定或平台确认回执")
+        else:
+            require(len(receipt["segments"]["parts"]) == 2, "回复未分成两条 QQ 消息")
+            require(all(part["state"] == "Sent" for part in receipt["segments"]["parts"]), "分段发送回执不完整")
     finally:
         stop_gate.touch()
         if child.poll() is None:
@@ -206,13 +222,27 @@ def main():
                 kind, text = 'learning', '{"candidates":[]}'
             elif isinstance(decoded, dict) and 'feedback_pairs' in decoded and 'messages' in decoded:
                 kind, text = 'conversation', '{"lessons":[]}'
+            elif isinstance(decoded, dict) and 'host_event' in decoded:
+                kind, text = 'speech', '{"action":"silence"}'
+            message = {"role": "assistant", "content": text}
+            finish_reason = "stop"
             if kind == 'chat':
                 requests.append(request)
+                names = {tool['function']['name'] for tool in request.get('tools', [])}
+                if 'send_message' in names:
+                    sent = sum(item.get('role') == 'tool' and item.get('tool_call_id', '').startswith('package-send-')
+                               for item in request['messages'])
+                    if sent < 2:
+                        finish_reason = "tool_calls"
+                        message = {"role": "assistant", "content": None, "tool_calls": [{
+                            "id": f"package-send-{sent}", "type": "function", "function": {
+                                "name": "send_message", "arguments": json.dumps({"text": ["你好。", "我在这里。"][sent]})}}]}
+                    else:
+                        message['content'] = '{"action":"silence"}'
             else:
                 require(not request.get('tools'), '后台学习请求不能获得业务工具')
                 background_requests.append(kind)
-            body = json.dumps({"choices": [{"index": 0, "finish_reason": "stop", "message": {
-                "role": "assistant", "content": text}}]}).encode()
+            body = json.dumps({"choices": [{"index": 0, "finish_reason": finish_reason, "message": message}]}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -255,7 +285,7 @@ def main():
             bridge = work / "离线 桥接.mjs"
             bridge.write_bytes((pathlib.Path(__file__).resolve().parents[1] / "connectors/qqbot/test/fake-bridge.mjs").read_bytes())
             message = {"id": "package-chat", "scope": "c2c", "target_id": "user-1", "user_id": "user-1",
-                       "text": "你好", "original_text": "你好", "expected_segments": ["你好。", "我在这里。"]}
+                       "text": "你好", "original_text": "你好", "expected_type": "finish"}
             for restart in (False, True):
                 stop_gate = work / f"stop-{restart}"
                 scenario = work / f"scenario-{restart}.json"
@@ -263,11 +293,11 @@ def main():
                 if restart:
                     steps += [{"wait_command": {"id": message["id"], "type": "finish"}}]
                 else:
-                    steps += [{"wait_receipt": {"path": str(root / "data/qq/state.json"), "id": message["id"], "state": "Sent"}}]
+                    steps += [{"wait_receipt": {"path": str(root / "data/qq/state.json"), "id": message["id"], "state": "Handled"}}]
                 steps += [{"wait_file": str(stop_gate)}]
                 scenario.write_text(json.dumps({"script": steps}), encoding="utf-8")
-                run(root, config, bridge, scenario, stop_gate, requests, 1, manifest["platform_label"])
-            require(len(requests) == 1, "恢复产生了新的模型请求")
+                run(root, config, bridge, scenario, stop_gate, requests, 3, manifest["platform_label"])
+            require(len(requests) == 3, "恢复产生了新的模型请求")
             from client_update_native import exercise
             def restart_update(update_root, updated, gate_name):
                 update_stop = work / ("update-stop-" + gate_name)
@@ -275,16 +305,28 @@ def main():
                 update_scenario.write_text(json.dumps({"script": [{"send": message},
                     {"wait_command": {"id": message["id"], "type": "finish"}},
                     {"wait_file": str(update_stop)}]}), encoding="utf8")
-                run(update_root, config, bridge, update_scenario, update_stop, requests, 1,
+                run(update_root, config, bridge, update_scenario, update_stop, requests, 3,
                     manifest["platform_label"], updated=updated)
             exercise(root, work, manifest, restart_update)
+            legacy_message = dict(message, id="package-legacy", expected_type="reply",
+                                  expected_segments=["你好。", "我在这里。"])
+            for restart in (False, True):
+                legacy_stop = work / f"legacy-stop-{restart}"
+                legacy_scenario = work / f"legacy-scenario-{restart}.json"
+                replay_message = dict(legacy_message, expected_type="finish") if restart else legacy_message
+                legacy_scenario.write_text(json.dumps({"script": [{"send": replay_message},
+                    {"wait_command": {"id": legacy_message["id"], "type": "finish"}} if restart else
+                    {"wait_receipt": {"path": str(root / "data/qq/state.json"), "id": legacy_message["id"], "state": "Sent"}},
+                    {"wait_file": str(legacy_stop)}]}), encoding="utf8")
+                run(root, config, bridge, legacy_scenario, legacy_stop, requests, 4, manifest["platform_label"],
+                    live=False, message_id=legacy_message["id"], expected_turns=2)
             subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name("test-launcher-signal.py")), str(root)],
                            check=True, timeout=90)
-            require(len(requests) == 1, "信号验收重放了模型请求")
+            require(len(requests) == 4, "信号验收重放了模型请求")
             if manifest["platform_label"] == "windows-x64":
                 subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name("test-launcher-signal.py")), str(root), "--powershell"],
                                check=True, timeout=90)
-                require(len(requests) == 1, "PowerShell 信号验收重放了模型请求")
+                require(len(requests) == 4, "PowerShell 信号验收重放了模型请求")
     finally:
         server.shutdown()
         server.server_close()
@@ -297,7 +339,7 @@ def main():
               "node_launcher": True,
               "console_ctrl_c": True,
               "unicode_and_space_path": True, "web_http": True,
-              "memory_and_learning_views": True, "qq_segmented_delivery": True,
+              "memory_and_learning_views": True, "qq_segmented_delivery": True, "qq_explicit_speech": True,
               "recovery_without_replay": True, "external_model_requests": 0,
               "client_update_download_verified": True, "client_update_next_start": True,
               "client_update_rollback": True, "client_update_preserved_user_files": True,

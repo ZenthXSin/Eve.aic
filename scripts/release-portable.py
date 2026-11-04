@@ -101,7 +101,7 @@ def verify(folder, tag, source):
             raise ValueError("发行包文件名与平台/版本不一致")
         archive = folder / expected
         if digest(archive) != report["archive_sha256"] or any(report.get(key) is not True for key in
-                ("unicode_and_space_path", "web_http", "memory_and_learning_views", "qq_segmented_delivery", "recovery_without_replay",
+                ("unicode_and_space_path", "web_http", "memory_and_learning_views", "qq_segmented_delivery", "qq_explicit_speech", "recovery_without_replay",
                  "client_update_download_verified", "client_update_next_start", "client_update_rollback", "client_update_preserved_user_files")):
             raise ValueError("发行包散列或实际进程验收不符")
         if report.get("external_model_requests") != 0 or report.get("production_qq_connections") != 0:
