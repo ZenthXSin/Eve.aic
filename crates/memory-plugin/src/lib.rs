@@ -71,7 +71,21 @@ impl MemoryAdmin for MemoryController {
         interaction: CompletedInteraction,
     ) -> MemoryResult<MemorySnapshot> {
         self.service()?
-            .import_completed(scope, expected_revision, interaction)
+            .import_completed(scope, expected_revision, interaction, None)
+    }
+    fn import_delivered(
+        &self,
+        scope: &MemoryScope,
+        expected_revision: u64,
+        interaction: CompletedInteraction,
+        assistant_text: String,
+    ) -> MemoryResult<MemorySnapshot> {
+        self.service()?.import_completed(
+            scope,
+            expected_revision,
+            interaction,
+            Some(assistant_text),
+        )
     }
     fn update_preference(
         &self,

@@ -456,6 +456,67 @@ fn affordable(gate: &qq_budget::Gate) -> PluginResult<bool> {
 }
 
 impl QqOutreach for ChannelAdapter {
+    fn candidates(&self) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
+        let mut snapshot = self.clarify.snapshot().map_err(plugin_error)?;
+        let mut owners: Vec<_> = snapshot.requests.iter().map(|r| r.owner.clone()).collect();
+        owners.sort();
+        owners.dedup();
+        let mut output = Vec::new();
+        for owner in owners {
+            while let Some(request) = snapshot.due_for(&owner, time()?, &self.policy).cloned() {
+                snapshot.requests.retain(|r| r.id != request.id);
+                if request.attempts.iter().any(|a| a.proactive) {
+                    continue;
+                }
+                output.push(crate::qq_speech::candidate(
+                    request.id.clone(),
+                    None,
+                    owner.clone(),
+                    serde_json::json!({"kind":"clarification_needed","request":request}),
+                )?);
+            }
+        }
+        Ok(output)
+    }
+    fn claim_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+        text: &str,
+        anchor: &str,
+    ) -> PluginResult<Option<QqOutreachPush>> {
+        if !self.candidates()?.contains(candidate) {
+            return Ok(None);
+        }
+        let expected: eve_clarify_api::Clarification =
+            serde_json::from_value(candidate.facts["request"].clone())
+                .map_err(|_| PluginError::State("澄清候选无效".into()))?;
+        let claimed = match self.clarify.claim_decided(&expected, text, anchor, time()?) {
+            Ok(c) => c,
+            Err(eve_clarify_api::ClarifyError::InvalidTransition) => return Ok(None),
+            Err(e) => return Err(plugin_error(e)),
+        };
+        Ok(Some(QqOutreachPush {
+            session: None,
+            user_id: claimed.owner,
+            message: QqOutreachMessage {
+                id: claimed.id,
+                text: text.into(),
+            },
+        }))
+    }
+    fn silence_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+    ) -> PluginResult<()> {
+        if !self.candidates()?.contains(candidate) {
+            return Ok(());
+        }
+        self.clarify
+            .cancel(&candidate.id, time()?, CancelReason::ChoseSilence)
+            .map_err(plugin_error)?;
+        Ok(())
+    }
+
     fn due(&self, session: &SessionKey) -> PluginResult<bool> {
         let snapshot = self.clarify.snapshot().map_err(plugin_error)?;
         Ok(snapshot
@@ -579,6 +640,115 @@ impl QqOutreach for ChannelAdapter {
 /// 投递结果按 ID 前缀交回分配它的来源。
 pub(crate) struct Combined(pub(crate) Vec<(&'static str, Arc<dyn QqOutreach>)>);
 impl QqOutreach for Combined {
+    fn authored_pushes(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> PluginResult<eve_qqbot_plugin::QqAuthoredPushPage> {
+        if !(1..=64).contains(&limit) {
+            return Err(PluginError::State("群发言分页上限无效".into()));
+        }
+        let mut pushes = Vec::new();
+        let mut frontier: Option<String> = None;
+        for (prefix, source) in &self.0 {
+            match source.authored_pushes(after, limit) {
+                Ok(page)
+                    if page.valid(after, limit)
+                        && page
+                            .pushes
+                            .iter()
+                            .all(|push| push.message.id.starts_with(prefix)) =>
+                {
+                    if let Some(next) = page.next {
+                        frontier =
+                            Some(frontier.map_or(next.clone(), |previous| previous.min(next)));
+                    }
+                    pushes.extend(page.pushes);
+                }
+                _ => eprintln!("Eve 群发言来源暂不可用：{prefix}"),
+            }
+        }
+        pushes.sort_by(|a, b| a.message.id.cmp(&b.message.id));
+        pushes.dedup_by(|a, b| a.message.id == b.message.id);
+        if let Some(next) = frontier.as_ref() {
+            pushes.retain(|push| push.message.id <= *next);
+        }
+        if pushes.len() > limit {
+            pushes.truncate(limit);
+            frontier = pushes.last().map(|push| push.message.id.clone());
+        }
+        Ok(eve_qqbot_plugin::QqAuthoredPushPage {
+            pushes,
+            next: frontier,
+        })
+    }
+    fn next_authored_push(&self) -> PluginResult<Option<QqOutreachPush>> {
+        Ok(self.authored_pushes(None, 64)?.pushes.into_iter().next())
+    }
+    fn claim_authored_push(&self, expected: &QqOutreachPush) -> PluginResult<bool> {
+        match self
+            .0
+            .iter()
+            .find(|(prefix, _)| expected.message.id.starts_with(prefix))
+        {
+            Some((_, source)) => source.claim_authored_push(expected),
+            None => Ok(false),
+        }
+    }
+    fn ordinary_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+    ) -> PluginResult<bool> {
+        match self
+            .0
+            .iter()
+            .find(|(prefix, _)| candidate.id.starts_with(prefix))
+        {
+            Some((_, source)) => source.ordinary_candidate(candidate),
+            None => Ok(false),
+        }
+    }
+    fn candidates(&self) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
+        let mut candidates = Vec::new();
+        for (prefix, source) in &self.0 {
+            match source.candidates() {
+                Ok(rows) if rows.iter().all(|c| c.id.starts_with(prefix)) => {
+                    candidates.extend(rows)
+                }
+                _ => eprintln!("Eve 主动事实来源暂不可用：{prefix}"),
+            }
+        }
+        Ok(candidates)
+    }
+    fn claim_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+        text: &str,
+        _anchor: &str,
+    ) -> PluginResult<Option<QqOutreachPush>> {
+        match self
+            .0
+            .iter()
+            .find(|(prefix, _)| candidate.id.starts_with(prefix))
+        {
+            Some((_, source)) => source.claim_candidate(candidate, text, _anchor),
+            None => Ok(None),
+        }
+    }
+    fn silence_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+    ) -> PluginResult<()> {
+        match self
+            .0
+            .iter()
+            .find(|(prefix, _)| candidate.id.starts_with(prefix))
+        {
+            Some((_, source)) => source.silence_candidate(candidate),
+            None => Ok(()),
+        }
+    }
+
     fn ordinary_direct_invitation(&self, id: &str) -> PluginResult<Option<SessionKey>> {
         match self.0.iter().find(|(prefix, _)| id.starts_with(prefix)) {
             Some((_, source)) => source.ordinary_direct_invitation(id),
@@ -672,6 +842,7 @@ fn status_text(request: &Clarification) -> &'static str {
         ClarifyStatus::Expired => "送达后没有回复，不再等待",
         ClarifyStatus::Unknown => "送达与否不确定，不重发",
         ClarifyStatus::Cancelled(CancelReason::GoalChanged) => "目标已更新，不再问",
+        ClarifyStatus::Cancelled(CancelReason::ChoseSilence) => "Eve 选择安静，未提问",
         ClarifyStatus::Cancelled(CancelReason::GoalClosed) => "学习目标已结束，不再问",
         ClarifyStatus::Failed(ClarifyFailure::Exhausted) => "一直没有合适的时机，不再问",
         ClarifyStatus::Failed(_) => "撰写失败，不重试",
@@ -738,7 +909,7 @@ impl QqCommandHandler for Commands {
                 stall_text(request.stall.kind),
                 status_text(request)
             );
-            if let Some(question) = &request.question {
+            if let Some(question) = request.delivered_question() {
                 line.push_str(&format!("\n问题：{question}"));
             }
             if let Some(answer) = &request.answer {

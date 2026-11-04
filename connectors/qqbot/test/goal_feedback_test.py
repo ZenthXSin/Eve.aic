@@ -178,7 +178,7 @@ class GoalFeedbackAcceptance(unittest.TestCase):
             "events_file": str(events_file), "error_file": str(error_file),
             "bindings_file": str(bindings_file)}), encoding="utf8")
         environment = {key: os.environ[key] for key in ("PATH", "SystemRoot", "TEMP", "TMP") if key in os.environ}
-        environment.update(QQBOT_APP_SECRET="test-app-secret", QQBOT_APP_ID=app,
+        environment.update(EVE_QQ_LIVE_INTERACTION="false", QQBOT_APP_SECRET="test-app-secret", QQBOT_APP_ID=app,
             EVE_OPENAI_API_KEY="test-model-secret", EVE_OPENAI_PROTOCOL="chat",
             EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}",
             EVE_LLM_RESPONSE_MODE="complete")

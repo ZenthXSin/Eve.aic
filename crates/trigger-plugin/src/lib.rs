@@ -30,7 +30,7 @@ pub struct TriggerController(Arc<Mutex<Option<Inner>>>);
 fn valid(ledger: &Ledger) -> bool {
     let mut ids = BTreeSet::new();
     let mut sources = BTreeSet::new();
-    matches!(ledger.format_version, 1..=3)
+    matches!(ledger.format_version, 1..=4)
         && ledger.triggers.len() <= MAX_TRIGGERS
         && ledger.triggers.iter().all(|t| {
             let expected = identifier(&t.owner, &t.source);
@@ -39,7 +39,8 @@ fn valid(ledger: &Ledger) -> bool {
                 && sources.insert((&t.owner.session_id, &t.owner.user_id, &t.source))
                 && t.owner.validate().is_ok()
                 && t.spec.valid()
-                && (ledger.format_version == 3 || t.review_messages.is_none())
+                && (ledger.format_version >= 3 || t.review_messages.is_none())
+                && (ledger.format_version >= 4 || t.delivery != Some(Delivery::Silenced))
                 && t.review_messages
                     .as_ref()
                     .is_none_or(|messages| validate_review_messages(messages).is_ok())
@@ -68,8 +69,8 @@ fn valid(ledger: &Ledger) -> bool {
 }
 
 fn recover(ledger: &mut Ledger) -> bool {
-    let mut changed = ledger.format_version != 3;
-    ledger.format_version = 3;
+    let mut changed = ledger.format_version < 3;
+    ledger.format_version = ledger.format_version.max(3);
     for t in &mut ledger.triggers {
         if t.status == Status::Running {
             t.status = Status::Interrupted;
@@ -103,7 +104,7 @@ impl TriggerController {
             .filter(|i| i.available)
             .ok_or(TriggerError::Unavailable)?;
         let mut next = inner.ledger.clone();
-        next.format_version = 3;
+        next.format_version = next.format_version.max(3);
         let result = f(&mut next)?;
         if !valid(&next) {
             return Err(TriggerError::Invalid);
@@ -321,7 +322,12 @@ impl TriggerAdmin for TriggerController {
             if t.status != Status::Completed
                 || !matches!(
                     t.delivery,
-                    Some(Delivery::Sent | Delivery::Failed | Delivery::StoredLocally)
+                    Some(
+                        Delivery::Sent
+                            | Delivery::Failed
+                            | Delivery::StoredLocally
+                            | Delivery::Silenced
+                    )
                 )
                 || t.runs >= r.max_runs
             {
@@ -359,6 +365,31 @@ impl TriggerAdmin for TriggerController {
     }
     fn delivery_for_run(&self, id: &str, run: u32, from: Delivery, to: Delivery) -> Result<()> {
         self.delivery_inner(id, Some(run), from, to)
+    }
+    fn silence_for_run(&self, owner: &SessionKey, id: &str, run: u32) -> Result<()> {
+        owner.validate().map_err(|_| TriggerError::Invalid)?;
+        self.change(|ledger| {
+            let trigger = ledger
+                .triggers
+                .iter_mut()
+                .find(|trigger| trigger.id == id && &trigger.owner == owner)
+                .ok_or(TriggerError::NotFound)?;
+            if trigger.runs != run
+                || !matches!(
+                    trigger.status,
+                    Status::Completed | Status::Failed | Status::Interrupted
+                )
+                || !matches!(
+                    trigger.delivery,
+                    Some(Delivery::Pending | Delivery::Silenced)
+                )
+            {
+                return Err(TriggerError::Transition);
+            }
+            trigger.delivery = Some(Delivery::Silenced);
+            ledger.format_version = 4;
+            Ok(())
+        })
     }
     fn record_local_delivery(&self, owner: &SessionKey, id: &str, run: u32) -> Result<()> {
         owner.validate().map_err(|_| TriggerError::Invalid)?;

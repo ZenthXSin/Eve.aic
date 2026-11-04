@@ -1,5 +1,5 @@
 //! QQ 宿主的提醒：用户在私聊里自然地说"半小时后提醒我喝水"，聊天模型调用提醒工具记下并如实回复；
-//! 到时先主动私聊一次，发不出去时随用户下一条私聊的回复附带。没有任何命令。
+//! 到时提供来源事实，实时路径由 Eve 决定说话、等待或沉默。没有任何命令。
 //!
 //! 只在私聊中成立：会话类型取自 QQ 通道的登记，不从用户文字或模型输出推断。私聊时，当前本地时间与
 //! 这位用户等待中的提醒作为数据交给对话，模型据此换算时间、回答"我有哪些提醒"或取消某一条。
@@ -383,6 +383,55 @@ pub(crate) struct ChannelAdapter {
 }
 
 impl QqOutreach for ChannelAdapter {
+    fn candidates(&self) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
+        let now = now_ms();
+        let snapshot = self.reminders.snapshot().map_err(plugin_error)?;
+        let overdue: Vec<_> = snapshot.overdue(now).map(|r| r.id.clone()).collect();
+        for id in &overdue {
+            self.reminders.expire(id, now).map_err(plugin_error)?;
+        }
+        snapshot
+            .reminders
+            .iter()
+            .filter(|r| r.due(now) && r.proactive_attempts() == 0 && !overdue.contains(&r.id))
+            .filter(|r| {
+                !snapshot
+                    .for_owner(&r.owner)
+                    .any(|other| other.status == ReminderStatus::Delivering)
+            })
+            .map(|r| {
+                crate::qq_speech::candidate(
+                    r.id.clone(),
+                    None,
+                    r.owner.clone(),
+                    json!({"kind":"reminder_due","reminder":r}),
+                )
+            })
+            .collect()
+    }
+    fn claim_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+        text: &str,
+        _anchor: &str,
+    ) -> PluginResult<Option<QqOutreachPush>> {
+        if !self.candidates()?.contains(candidate) {
+            return Ok(None);
+        }
+        let claimed = self
+            .reminders
+            .claim(&candidate.id, DeliveryChannel::Proactive, now_ms())
+            .map_err(plugin_error)?;
+        Ok(Some(QqOutreachPush {
+            session: None,
+            user_id: claimed.owner,
+            message: QqOutreachMessage {
+                id: claimed.id,
+                text: text.into(),
+            },
+        }))
+    }
+
     fn due(&self, session: &SessionKey) -> PluginResult<bool> {
         let snapshot = self.reminders.snapshot().map_err(plugin_error)?;
         let now = now_ms();

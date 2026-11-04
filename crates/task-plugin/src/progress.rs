@@ -53,6 +53,29 @@ impl StoredTasks {
         channel: DeliveryChannel,
         now_ms: u64,
     ) -> TaskResult<Task> {
+        self.claim_progress_inner(owner, id, None, channel, now_ms)
+    }
+
+    pub(super) fn claim_progress_expected(
+        &self,
+        owner: &TaskOwner,
+        id: &str,
+        expected: &TaskProgressToken,
+        channel: DeliveryChannel,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        expected.validate()?;
+        self.claim_progress_inner(owner, id, Some(expected), channel, now_ms)
+    }
+
+    fn claim_progress_inner(
+        &self,
+        owner: &TaskOwner,
+        id: &str,
+        expected: Option<&TaskProgressToken>,
+        channel: DeliveryChannel,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
         validate_owner(owner)?;
         validate_id(id)?;
         // 本地收件箱使用原子已存回执；被动消息不能绕过进度提醒间隔。
@@ -75,6 +98,11 @@ impl StoredTasks {
             |task| {
                 if &task.owner != owner {
                     return Err(TaskError::NotFound);
+                }
+                if let Some(expected) = expected
+                    && TaskProgressToken::from_task(task)? != *expected
+                {
+                    return Err(TaskError::InvalidTransition);
                 }
                 let entry = TaskProgressEntry::from(&*task);
                 if !entry.due(now_ms) {

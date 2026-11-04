@@ -261,7 +261,7 @@ def receipt_fingerprint(receipt):
                                      separators=(',', ':')).encode()).hexdigest()
 
 def validate_receipt_archive(state_path, receipts):
-    if receipts['version'] != 6 and not (receipts['version'] in (7, 8) and 'archive' in receipts):
+    if receipts['version'] != 6 and not (receipts['version'] in (7, 8, 9) and 'archive' in receipts):
         if 'archive' in receipts:
             raise ValueError('unexpected_receipt_archive_binding')
         return
@@ -292,7 +292,7 @@ def inherited_receipts(state_path):
     if raw is None:
         return frozenset()
     receipts = json.loads(bytes(raw), object_pairs_hook=unique_object)
-    if receipts['version'] not in (1, 2, 3, 4, 5, 6, 7, 8):
+    if receipts['version'] not in (1, 2, 3, 4, 5, 6, 7, 8, 9):
         raise ValueError('unknown_ledger_version')
     validate_receipt_archive(state_path, receipts)
     validate_merged_receipts(receipts)
@@ -369,7 +369,7 @@ def delivery_documents(state_path, inherited=frozenset()):
         return json.loads(bytes(entries[owner][key]), object_pairs_hook=unique_object)
     sessions = document('eve.session', 'sessions.v1')
     receipts = document('eve.channel.qqbot', 'receipts.v1')
-    if sessions['format_version'] not in (1, 2) or receipts['version'] not in (1, 2, 3, 4, 5, 6, 7, 8):
+    if sessions['format_version'] not in (1, 2) or receipts['version'] not in (1, 2, 3, 4, 5, 6, 7, 8, 9):
         raise ValueError('unknown_ledger_version')
     if sessions['format_version'] == 2:
         if set(sessions) != {'format_version', 'sessions'} or not isinstance(sessions['sessions'], dict):
@@ -386,15 +386,19 @@ def delivery_documents(state_path, inherited=frozenset()):
     validate_merged_receipts(receipts)
     settled = True
     for receipt in receipts['entries']:
+        control_turn = receipt.get('control_turn_id')
+        if control_turn is not None and (receipts['version'] != 9 or type(control_turn) is not int
+                                        or control_turn <= 0 or receipt['state'] != 'Handled'):
+            raise ValueError('invalid_handled_turn_binding')
         progress = receipt.get('progress', [])
-        if not isinstance(progress, list) or len(progress) > (64 if receipts['version'] == 8 else 3):
+        if not isinstance(progress, list) or len(progress) > (64 if receipts['version'] >= 8 else 3):
             raise ValueError('invalid_progress_ledger')
-        if progress and receipts['version'] not in (3, 4, 5, 6, 7, 8):
+        if progress and receipts['version'] not in (3, 4, 5, 6, 7, 8, 9):
             raise ValueError('invalid_progress_ledger')
         if sum(p.get('proactive') is not True for p in progress if isinstance(p, dict)) > 3:
             raise ValueError('invalid_passive_progress_budget')
         sticker = receipt.get('sticker')
-        if sticker is not None and (receipts['version'] not in (5, 6, 7, 8) or not isinstance(sticker, dict)
+        if sticker is not None and (receipts['version'] not in (5, 6, 7, 8, 9) or not isinstance(sticker, dict)
                                     or set(sticker) != {'path', 'state'}
                                     or not isinstance(sticker['path'], str) or not sticker['path']
                                     or sticker['state'] not in ('Pending', 'Sending', 'Sent', 'Failed', 'Skipped', 'Unknown')):
@@ -402,17 +406,36 @@ def delivery_documents(state_path, inherited=frozenset()):
         if sticker_in_flight(receipt) and receipt_fingerprint(receipt) not in inherited:
             settled = False
         for part in progress:
+            authored = receipts['version'] == 9 and isinstance(part, dict) and part.get('decision_id') is not None
+            allowed_fields = {'text', 'state', 'proactive', 'necessary'}
+            if receipts['version'] == 9:
+                allowed_fields |= {'decision_id', 'platform_message_id', 'image_path'}
             if (not isinstance(part, dict) or not {'text', 'state'} <= set(part)
-                    or not set(part) <= {'text', 'state', 'proactive', 'necessary'}
+                    or not set(part) <= allowed_fields
                     or ('necessary' in part and part['necessary'] is not True)
-                    or ('proactive' in part and (receipts['version'] != 8 or part['proactive'] is not True))
+                    or ('proactive' in part and (receipts['version'] < 8 or part['proactive'] is not True))
                     or not isinstance(part['text'], str) or not part['text'].strip()
-                    or len(part['text'].encode()) > 1024
+                    or len(part['text'].encode()) > (32768 if authored else 1024)
                     or part['state'] not in ('Sending', 'Sent', 'Failed', 'Unknown')):
                 raise ValueError('invalid_progress_ledger')
+            if authored and (not platform_id(part['decision_id'])
+                    or part['state'] == 'Sent' and not platform_id(part.get('platform_message_id'))
+                    or part.get('platform_message_id') is not None and
+                       (not platform_id(part['platform_message_id']) or part['state'] != 'Sent')):
+                raise ValueError('invalid_expression_receipt')
+            image = part.get('image_path')
+            if image is not None and (not authored or not isinstance(image, str) or not image
+                    or len(image.encode()) > 4096 or any(ord(c) < 32 or ord(c) == 127 for c in image)):
+                raise ValueError('invalid_expression_image')
+            if not authored and part.get('platform_message_id') is not None:
+                raise ValueError('unexpected_expression_receipt')
             if part['state'] == 'Sending' and receipt_fingerprint(receipt) not in inherited:
                 settled = False
     return sessions, receipts, settled
+
+def platform_id(value):
+    return (isinstance(value, str) and 0 < len(value.encode()) <= 253 and value.strip() == value
+            and not any(ord(c) < 32 or ord(c) == 127 for c in value))
 
 def task_documents(state_path, ledger):
     """核对任务目录与不可变冷正文；空闲门不能把目录当完整任务。"""
@@ -493,10 +516,27 @@ def runtime_idle_gate(state_path, inherited=frozenset()):
                    for row in rows):
                 return False
     group = state_path.parent / 'group-observations.sqlite3'
+    if group.with_suffix('.required').exists() and not group.exists():
+        raise ValueError('group_database_missing')
     if group.exists():
         import sqlite3
         with contextlib.closing(sqlite3.connect(group.as_uri() + '?mode=ro', uri=True, timeout=1)) as db:
             if db.execute("SELECT 1 FROM outbound WHERE status IN ('queued','sending') LIMIT 1").fetchone():
+                return False
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='speech_reviews'").fetchone():
+                if db.execute("SELECT 1 FROM speech_reviews WHERE state='evaluating' LIMIT 1").fetchone():
+                    return False
+    speech = state_path.parent / 'speech.sqlite3'
+    if speech.with_suffix('.required').exists() and not speech.exists():
+        raise ValueError('speech_database_missing')
+    if speech.exists():
+        import sqlite3
+        if speech.is_symlink() or not speech.is_file():
+            raise ValueError('invalid_speech_database')
+        with contextlib.closing(sqlite3.connect(speech.as_uri() + '?mode=ro', uri=True, timeout=1)) as db:
+            if db.execute('PRAGMA user_version').fetchone() != (1,):
+                raise ValueError('unknown_speech_database_version')
+            if db.execute("SELECT 1 FROM speech WHERE state IN ('evaluating','sending') LIMIT 1").fetchone():
                 return False
     files = state_path.parent / 'qq-outbox' / 'ledger.json'
     if files.exists():
@@ -538,19 +578,30 @@ def delivery_gate(state_path, request, inherited=frozenset()):
         scope = 'qq:' + hashlib.sha256(identity).hexdigest()
         merged_text = '\n'.join([r['message']['text'] for r in receipts['entries']
             if r.get('merged_into') == msg.get('id') and r['app_id'] == receipt['app_id']]
-            + [msg['text']]) if receipts['version'] in (4, 5, 6, 7, 8) else msg['text']
-        if receipt['state'] != 'Merged' and scope == request['session_id'] and merged_text == turn['input']:
+            + [msg['text']]) if receipts['version'] in (4, 5, 6, 7, 8, 9) else msg['text']
+        if receipts['version'] == 9 and msg['text'] == turn['input']:
+            # 轮内补充保存在同一轮 messages 中，首条输入没有被自动合成替换。
+            merged_text = msg['text']
+        bound_handled = (receipts['version'] == 9 and receipt['state'] == 'Handled'
+                         and receipt.get('control_turn_id') == request['turn_id'])
+        if receipt['state'] != 'Merged' and scope == request['session_id'] and (bound_handled or merged_text == turn['input']):
             matching = receipt
         if receipt['state'] in ('Processing', 'ReplyPending'):
             return False
-    return bool(matching and matching['state'] == 'Sent' and matching.get('reply') == reply) and all(t['status']['state'] != 'Pending'
+    handled = (matching and receipts['version'] == 9 and matching['state'] == 'Handled'
+               and matching.get('control_turn_id') == request['turn_id']
+               and matching.get('reply') is None
+               and not any(p['state'] == 'Sending' for p in matching.get('progress', [])))
+    return bool(handled or matching and matching['state'] == 'Sent' and matching.get('reply') == reply) and all(t['status']['state'] != 'Pending'
                         for s in sessions['sessions'].values() for t in session_turns(state_path, s, sessions['format_version']))
 
 def drain_stamp(state_path):
     """侧账本及 SQLite WAL 也参与门禁缓存；大状态未变化时不重复解析。"""
     paths = [state_path, state_path.parent / 'qq-outbox' / 'ledger.json']
-    paths += [state_path.parent / ('group-observations.sqlite3' + suffix)
+    paths += [state_path.parent / (name + suffix)
+              for name in ('group-observations.sqlite3', 'speech.sqlite3')
               for suffix in ('', '-wal', '-journal')]
+    paths += [state_path.parent / name for name in ('group-observations.required', 'speech.required')]
     stamps = []
     for path in paths:
         try:
@@ -562,7 +613,7 @@ def drain_stamp(state_path):
 
 def validate_merged_receipts(receipts):
     """格式 4 起的合并关系只关联同身份、顺序在后的非合并目标；不得隐藏未决投递。"""
-    if receipts['version'] not in (4, 5, 6, 7, 8):
+    if receipts['version'] not in (4, 5, 6, 7, 8, 9):
         return
     lookup = {}
     for index, entry in enumerate(receipts['entries']):
@@ -580,7 +631,7 @@ def validate_merged_receipts(receipts):
         if not isinstance(into, str):
             raise ValueError('invalid_merged_receipt')
         target = lookup.get((entry['app_id'], into))
-        if (not target or (receipts['version'] not in (7, 8) and target[0] <= index) or target[0] == index or target[1]['state'] == 'Merged'
+        if (not target or (receipts['version'] not in (7, 8, 9) and target[0] <= index) or target[0] == index or target[1]['state'] == 'Merged'
                 or any(entry['message'][key] != target[1]['message'][key]
                        for key in ('scope', 'target_id', 'user_id'))
                 or entry.get('reply') is not None or entry.get('segments') is not None

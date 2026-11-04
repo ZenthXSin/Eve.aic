@@ -5,8 +5,9 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex, Weak},
+    time::Duration,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 type Key = (String, String);
 fn key(scope: &ContextScope) -> Key {
@@ -26,20 +27,43 @@ struct Input {
 struct Turn {
     id: u64,
     input: Mutex<Input>,
+    changed: Notify,
 }
 pub(crate) struct LiveSend {
     pub scope: ContextScope,
     pub turn_id: u64,
     pub text: String,
+    pub image: Option<String>,
     pub needs_answer: bool,
-    result: oneshot::Sender<Option<String>>,
+    pub call_id: String,
+    context: ToolExecutionContext,
+    turn: Weak<Turn>,
+    result: oneshot::Sender<LiveDelivery>,
+}
+#[derive(Clone, Debug)]
+pub(crate) enum LiveDelivery {
+    Sent(String),
+    Unknown,
+    NotSent,
+    Stale,
 }
 impl LiveSend {
     pub fn cancelled(&self) -> bool {
         self.result.is_closed()
     }
-    pub fn complete(self, message_id: Option<String>) {
-        let _ = self.result.send(message_id);
+    /// 从决定到真正写出之间，新输入和取消都可能让这句话失效。
+    pub fn current(&self) -> bool {
+        !self.cancelled()
+            && !self.context.is_cancel_requested()
+            && self.context.check_review_evidence().is_ok()
+            && self.turn.upgrade().is_some_and(|turn| {
+                turn.input
+                    .lock()
+                    .is_ok_and(|input| input.accepting && input.messages.is_empty())
+            })
+    }
+    pub fn complete(self, outcome: LiveDelivery) {
+        let _ = self.result.send(outcome);
     }
 }
 
@@ -88,6 +112,7 @@ impl LiveDialogue {
         input.bytes += text.len();
         input.accepted += 1;
         input.messages.push((text, anchor));
+        turn.changed.notify_waiters();
         Ok(true)
     }
     pub(crate) fn next(&self) -> Option<LiveSend> {
@@ -95,6 +120,86 @@ impl LiveDialogue {
     }
     pub fn send_tool(self: &Arc<Self>) -> Arc<dyn Tool> {
         Arc::new(SendMessage(self.clone()))
+    }
+    pub fn wait_tool(self: &Arc<Self>) -> Arc<dyn Tool> {
+        Arc::new(WaitForInput(self.clone()))
+    }
+    /// 图片也是模型的明确表达决定；不附加到内部 final，不等待自动收尾。
+    pub fn send_image(
+        &self,
+        path: std::path::PathBuf,
+        description: String,
+        context: ToolExecutionContext,
+    ) -> ToolFuture<'_> {
+        Box::pin(async move {
+            let rejected = || ToolExecutionError::Rejected("当前没有可投递的图片对话轮次".into());
+            if description.trim().is_empty()
+                || description.len() > 32768
+                || description
+                    .chars()
+                    .any(|c| c.is_control() && c != '\n' && c != '\t')
+            {
+                return Err(rejected());
+            }
+            let description = description.trim().to_owned();
+            let path = path
+                .to_str()
+                .filter(|p| !p.is_empty() && p.len() <= 4096 && !p.chars().any(char::is_control))
+                .ok_or_else(rejected)?
+                .to_owned();
+            let scope = context.scope().cloned().ok_or_else(rejected)?;
+            let turn_id = context.turn_id().ok_or_else(rejected)?;
+            let call_id = context.call_id().ok_or_else(rejected)?.to_owned();
+            let turn = self
+                .turns
+                .lock()
+                .map_err(|_| rejected())?
+                .get(&key(&scope))
+                .and_then(Weak::upgrade)
+                .filter(|t| t.id == turn_id)
+                .ok_or_else(rejected)?;
+            let session_id = scope.session_id.clone();
+            if context.is_cancel_requested()
+                || context.check_review_evidence().is_err()
+                || !turn
+                    .input
+                    .lock()
+                    .is_ok_and(|i| i.accepting && i.messages.is_empty())
+            {
+                return Ok(
+                    json!({"sent":false,"message_id":null,"session_id":session_id,"delivery_status":"stale"}),
+                );
+            }
+            let (sender, receiver) = oneshot::channel();
+            {
+                let mut queue = self.outgoing.lock().map_err(|_| rejected())?;
+                if queue.len() >= 64 {
+                    return Err(rejected());
+                }
+                queue.push_back(LiveSend {
+                    scope,
+                    turn_id,
+                    text: description,
+                    image: Some(path),
+                    needs_answer: false,
+                    call_id: format!(
+                        "speech-{}",
+                        ring::digest::digest(&ring::digest::SHA256, call_id.as_bytes())
+                            .as_ref()
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
+                    ),
+                    context,
+                    turn: Arc::downgrade(&turn),
+                    result: sender,
+                });
+            }
+            let outcome = receiver
+                .await
+                .map_err(|_| ToolExecutionError::Failed("图片投递结果未知，不要重发".into()))?;
+            Ok(delivery_json(outcome, &session_id))
+        })
     }
 }
 impl TurnSteeringSource for LiveDialogue {
@@ -110,6 +215,7 @@ impl TurnSteeringSource for LiveDialogue {
                 accepting: true,
                 ..Input::default()
             }),
+            changed: Notify::new(),
         });
         turns.insert(key(scope), Arc::downgrade(&turn));
         Ok(turn)
@@ -141,38 +247,45 @@ impl Tool for SendMessage {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "send_message".into(),
-            description: "在当前会话立即说一句话，不结束当前轮，也不停止正在推进的任务。多步任务在私聊开始、关键节点、长等待时用自己的话告知真实进展，结尾用最终答复；群聊只发开始、一个中间节点与结尾。必要授权或问题独立使用 purpose=question 或 authorization，不计作普通进度；用户中途回话会直接加入本轮引导，下一次模型请求可见。不要播报调用次数、工具名或每个琐碎步骤，不反复说正在处理，不把未完成的事说成完成，不重复最终答复。一次至多 250 字，受 QQ 剩余消息配额限制；返回 sent=true 且有 message_id、session_id 才确认送达。失败或结果未知不得自动重发。只发给当前会话，不接受目标地址。需要答案时继续推进其他独立工作，不能假定用户已回答；调用本工具不会终止主执行循环。".into(),
-            argument_schema: json!({"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":250},"purpose":{"type":"string","enum":["progress","question","authorization"]}},"required":["text"],"additionalProperties":false}),
+            description: "由你决定在当前会话说什么；用于闲聊、提问、进展和最终回应。只在你想说且内容值得说时调用，没有固定汇报次数。普通 final 只结束内部处理，不自动发送。每次一条完整消息，最多 32768 UTF-8 字节；长内容自行决定分条。after_ms 可选择 0 至 10000 毫秒后再说，默认现在；期间有新消息则旧决定不发，返回 stale，交给你重新考虑。不会结束当前任务。只向可信的原会话发送，不接受地址。sent=true 且有 message_id 才确认送达；unknown 不重发；not_sent/stale 没有发出。不要把未完成说成完成，不重复已说过的话。".into(),
+            argument_schema: json!({"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":32768},"after_ms":{"type":"integer","minimum":0,"maximum":10000},"purpose":{"type":"string","enum":["conversation","progress","question","authorization","answer"]}},"required":["text"],"additionalProperties":false}),
             required_permissions: vec![],
             concurrency: Some(ToolConcurrency::Serial { scope: "eve.qq.live-send".into() }),
         }
     }
     fn validate_arguments(&self, value: &Value) -> Result<(), ToolValidationError> {
-        if value
-            .as_object()
-            .is_none_or(|v| v.keys().any(|k| k != "text" && k != "purpose"))
-            || value.get("purpose").is_some_and(|p| {
-                !matches!(p.as_str(), Some("progress" | "question" | "authorization"))
-            })
+        if value.as_object().is_none_or(|v| {
+            v.keys()
+                .any(|k| !matches!(k.as_str(), "text" | "purpose" | "after_ms"))
+        }) || value.get("purpose").is_some_and(|p| {
+            !matches!(
+                p.as_str(),
+                Some("conversation" | "progress" | "question" | "authorization" | "answer")
+            )
+        }) || value
+            .get("after_ms")
+            .is_some_and(|p| p.as_u64().is_none_or(|ms| ms > 10_000))
             || value
                 .get("text")
                 .and_then(Value::as_str)
                 .is_none_or(|text| {
                     text.trim().is_empty()
-                        || text.chars().count() > 250
+                        || text.len() > 32768
                         || text
                             .chars()
                             .any(|c| c.is_control() && c != '\n' && c != '\t')
                 })
         {
             return Err(ToolValidationError {
-                message: "只接受非空 text，最多 250 字".into(),
+                message: "text 需要 1 至 32768 UTF-8 字节，after_ms 为 0 至 10000 的整数".into(),
             });
         }
         Ok(())
     }
     fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
         Box::pin(async move {
+            self.validate_arguments(&call.arguments)
+                .map_err(|error| ToolExecutionError::Rejected(error.message))?;
             let rejected = || ToolExecutionError::Rejected("当前没有可投递的对话轮次".into());
             let scope = context.scope().cloned().ok_or_else(rejected)?;
             let turn_id = context.turn_id().ok_or_else(rejected)?;
@@ -185,10 +298,48 @@ impl Tool for SendMessage {
                 .and_then(Weak::upgrade)
                 .filter(|t| t.id == turn_id)
                 .ok_or_else(rejected)?;
-            if !turn.input.lock().map_err(|_| rejected())?.accepting {
+            if !turn.input.lock().map_err(|_| rejected())?.accepting
+                || context.is_cancel_requested()
+            {
                 return Err(rejected());
             }
             let session_id = scope.session_id.clone();
+            let stale = || json!({"sent":false,"message_id":null,"session_id":session_id,"delivery_status":"stale"});
+            let changed = turn.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if context.check_review_evidence().is_err()
+                || !turn
+                    .input
+                    .lock()
+                    .map_err(|_| rejected())?
+                    .messages
+                    .is_empty()
+            {
+                return Ok(stale());
+            }
+            if let Some(ms) = call
+                .arguments
+                .get("after_ms")
+                .and_then(Value::as_u64)
+                .filter(|ms| *ms > 0)
+            {
+                tokio::select! {
+                    _ = &mut changed => return Ok(stale()),
+                    _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
+                }
+            }
+            if context.is_cancel_requested()
+                || context.check_review_evidence().is_err()
+                || !turn
+                    .input
+                    .lock()
+                    .map_err(|_| rejected())?
+                    .messages
+                    .is_empty()
+            {
+                return Ok(stale());
+            }
             let (sender, receiver) = oneshot::channel();
             {
                 let mut queue = self.0.outgoing.lock().map_err(|_| rejected())?;
@@ -203,20 +354,98 @@ impl Tool for SendMessage {
                         .ok_or_else(rejected)?
                         .trim()
                         .into(),
+                    image: None,
                     needs_answer: matches!(
                         call.arguments.get("purpose").and_then(Value::as_str),
                         Some("question" | "authorization")
                     ),
+                    call_id: format!(
+                        "speech-{}",
+                        ring::digest::digest(&ring::digest::SHA256, call.id.as_bytes())
+                            .as_ref()
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
+                    ),
+                    context,
+                    turn: Arc::downgrade(&turn),
                     result: sender,
                 });
             }
-            let message_id = receiver
+            let result = receiver
                 .await
                 .map_err(|_| ToolExecutionError::Failed("消息投递结果未知，不要重发".into()))?;
-            let sent = message_id.is_some();
-            Ok(
-                json!({"sent":sent,"message_id":message_id,"session_id":session_id,"delivery_status":if sent {"sent"} else {"unknown"},"note":if sent {"已送达，继续当前任务；不要在最终答复中重复这句话"} else {"未确认送达或剩余配额不足，不要重发；可在最终答复中说明必要内容"}}),
-            )
+            Ok(delivery_json(result, &session_id))
+        })
+    }
+}
+
+fn delivery_json(result: LiveDelivery, session_id: &str) -> Value {
+    let (status, message_id) = match result {
+        LiveDelivery::Sent(id) => ("sent", Some(id)),
+        LiveDelivery::Unknown => ("unknown", None),
+        LiveDelivery::NotSent => ("not_sent", None),
+        LiveDelivery::Stale => ("stale", None),
+    };
+    json!({"sent":message_id.is_some(),"message_id":message_id,"session_id":session_id,"delivery_status":status})
+}
+
+struct WaitForInput(Arc<LiveDialogue>);
+impl Tool for WaitForInput {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "wait_for_input".into(),
+            description: "你决定暂时听对方继续说时使用。等待当前会话的新输入或最多 60 秒，不发送任何话；新内容随后进入同一轮。没有新输入也不要求你发言，可以安静结束。更长等待使用持久触发器。".into(),
+            argument_schema: json!({"type":"object","properties":{"timeout_ms":{"type":"integer","minimum":1,"maximum":60000}},"required":["timeout_ms"],"additionalProperties":false}),
+            required_permissions: vec![],
+            concurrency: Some(ToolConcurrency::ParallelSafe),
+        }
+    }
+    fn validate_arguments(&self, value: &Value) -> Result<(), ToolValidationError> {
+        if value.as_object().is_none_or(|v| v.len() != 1)
+            || value
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .is_none_or(|ms| !(1..=60000).contains(&ms))
+        {
+            return Err(ToolValidationError {
+                message: "timeout_ms 需要 1 至 60000 的整数".into(),
+            });
+        }
+        Ok(())
+    }
+    fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
+        Box::pin(async move {
+            self.validate_arguments(&call.arguments)
+                .map_err(|error| ToolExecutionError::Rejected(error.message))?;
+            let unavailable = || ToolExecutionError::Rejected("当前会话没有可等待的轮次".into());
+            let scope = context.scope().ok_or_else(unavailable)?;
+            let turn = self
+                .0
+                .turns
+                .lock()
+                .map_err(|_| unavailable())?
+                .get(&key(scope))
+                .and_then(Weak::upgrade)
+                .filter(|t| Some(t.id) == context.turn_id())
+                .ok_or_else(unavailable)?;
+            let changed = turn.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let input = turn.input.lock().map_err(|_| unavailable())?;
+                if !input.accepting || context.is_cancel_requested() {
+                    return Err(unavailable());
+                }
+                if !input.messages.is_empty() {
+                    return Ok(json!({"new_input":true}));
+                }
+            }
+            let received = tokio::select! {
+                _ = &mut changed => true,
+                _ = tokio::time::sleep(Duration::from_millis(call.arguments["timeout_ms"].as_u64().unwrap())) => false,
+            };
+            Ok(json!({"new_input":received}))
         })
     }
 }
@@ -252,7 +481,7 @@ mod tests {
         };
         assert!(outgoing.needs_answer);
         assert_eq!(outgoing.scope, scope);
-        outgoing.complete(Some("platform-message-7".into()));
+        outgoing.complete(LiveDelivery::Sent("platform-message-7".into()));
         let result = sending.await.unwrap().unwrap();
         assert_eq!(result["sent"], true);
         assert_eq!(result["message_id"], "platform-message-7");

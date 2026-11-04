@@ -36,6 +36,15 @@ impl CompletionLedger for CompletionController {
     ) -> CompletionResult<CompletionQuestion> {
         self.service()?.claim(target, message_id, now_ms)
     }
+    fn claim_decided(
+        &self,
+        target: &QuestionTarget,
+        anchor: &str,
+        text: &str,
+        now_ms: u64,
+    ) -> CompletionResult<CompletionQuestion> {
+        self.service()?.claim_decided(target, anchor, text, now_ms)
+    }
     fn record(
         &self,
         id: &str,

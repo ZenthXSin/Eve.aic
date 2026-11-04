@@ -174,6 +174,8 @@ fn command(entry: Entry, root: &Path, url: &str, database: Option<&Path>) -> Com
         // 回执分段断言针对自然段规划；按句分条由 segment_test 覆盖。
         .env("EVE_CHAT_SENTENCE_SPLIT", "false");
     if matches!(entry, Entry::Qq) {
+        // 本套件的历史分段、管理命令与最终正文断言覆盖旧组合；自主发言另行实际验收。
+        command.env("EVE_QQ_LIVE_INTERACTION", "false");
         // 测试中的管理命令使用宿主可信绑定；生产默认权限与普通用户负例不变。
         let bindings = root.join("state/admin-bindings.json");
         if !bindings.exists() {
@@ -2247,4 +2249,112 @@ async fn sql_task_cold_index_restarts_and_missing_body_never_clears_sql_records(
     assert_eq!(tasks.get_owned(&owner, &task.id).unwrap(), Some(task));
     assert_eq!(rows(&database), before);
     kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "需要 EVE_POSTGRES_TEST_CONFIG；与其他 SQL 测试串行运行"]
+async fn sql_explicit_speech_and_silence_keep_platform_receipts_without_replay() {
+    let database =
+        PathBuf::from(std::env::var_os("EVE_POSTGRES_TEST_CONFIG").expect("需要专用测试库"));
+    let credentials = credentials(&database);
+    admin(&database, |client| {
+        client
+            .batch_execute("DROP SCHEMA IF EXISTS eve_state CASCADE")
+            .unwrap();
+    });
+    let root = fixture();
+    let mut server = Server::start(vec![
+        Reply::json(json!({"id":"speech-response","object":"response","status":"completed",
+            "output":[{"type":"function_call","id":"speech-item","call_id":"explicit-sql-speech",
+                "name":"send_message","arguments":json!({"text":"这句话由 Eve 自己决定发出。"}).to_string(),"status":"completed"}]})),
+        Reply::json(final_response("这是内部完成记录，不能发送。")),
+        Reply::json(final_response("这一轮保持安静。")),
+    ]).await;
+    let messages = [
+        message("sql-speak", "说一句话", ""),
+        message("sql-silence", "不要回复这条", ""),
+    ];
+    let mut steps = Vec::new();
+    for mut message in messages.clone() {
+        message["expected_type"] = json!("finish");
+        let id = message["id"].clone();
+        steps.push(json!({"send":message}));
+        steps.push(json!({"wait_command":{"id":id,"type":"finish"}}));
+    }
+    std::fs::write(
+        root.path().join("scenario.json"),
+        serde_json::to_vec(&json!({
+            "script":steps,"events_file":root.path().join("events.jsonl")
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut run = command(Entry::Qq, root.path(), &server.url, Some(&database));
+    run.env("EVE_QQ_LIVE_INTERACTION", "true");
+    successful(
+        Process::run(run, "", &credentials.password).await,
+        Entry::Qq,
+    );
+    let before = document(&rows(&database), QQBOT_PLUGIN_ID, "receipts.v1");
+    assert_eq!(before["version"], 9);
+    let entries = before["entries"].as_array().unwrap();
+    assert!(entries.iter().all(|r| r["state"] == "Handled"
+        && r["reply"].is_null()
+        && r["control_turn_id"].as_u64().is_some()));
+    let spoken = entries
+        .iter()
+        .find(|r| r["message"]["id"] == "sql-speak")
+        .unwrap();
+    assert_eq!(spoken["progress"][0]["text"], "这句话由 Eve 自己决定发出。");
+    assert_eq!(spoken["progress"][0]["state"], "Sent");
+    assert!(
+        spoken["progress"][0]["platform_message_id"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    );
+    let quiet = entries
+        .iter()
+        .find(|r| r["message"]["id"] == "sql-silence")
+        .unwrap();
+    assert!(quiet["progress"].as_array().is_none_or(Vec::is_empty));
+    for _ in 0..3 {
+        server.next().await;
+    }
+    let mut replay = Vec::new();
+    for mut message in messages {
+        message["expected_type"] = json!("finish");
+        let id = message["id"].clone();
+        replay.push(json!({"send":message}));
+        replay.push(json!({"wait_command":{"id":id,"type":"finish"}}));
+    }
+    std::fs::write(
+        root.path().join("scenario.json"),
+        serde_json::to_vec(&json!({
+            "script":replay,"events_file":root.path().join("restart-events.jsonl")
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut restarted = command(
+        Entry::Qq,
+        root.path(),
+        "http://127.0.0.1:1",
+        Some(&database),
+    );
+    restarted.env("EVE_QQ_LIVE_INTERACTION", "true");
+    successful(
+        Process::run(restarted, "", &credentials.password).await,
+        Entry::Qq,
+    );
+    assert_eq!(
+        document(&rows(&database), QQBOT_PLUGIN_ID, "receipts.v1"),
+        before
+    );
+    let events = std::fs::read_to_string(root.path().join("restart-events.jsonl")).unwrap();
+    assert!(
+        !events
+            .lines()
+            .map(|s| serde_json::from_str::<Value>(s).unwrap())
+            .any(|v| matches!(v["type"].as_str(), Some("reply" | "progress" | "push")))
+    );
 }

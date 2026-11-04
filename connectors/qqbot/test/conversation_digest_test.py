@@ -47,7 +47,7 @@ class ConversationDigestAcceptance(memory.MemoryAcceptance):
             self.assertIn("eve.runtime.tool-capabilities", messages[-2]["content"])
             if policies:
                 self.assertEqual(policies, [len(messages) - 4])
-                self.assertEqual(messages[-3]["role"],"user")
+                self.assertEqual(messages[-3]["role"],"system")
                 self.assertTrue(messages[-3]["content"].startswith("宿主表达方式"))
         for session in self.documents()["eve.session"]["sessions.v1"]["sessions"].values():
             for turn in session["turns"]:

@@ -30,6 +30,260 @@ fn spec() -> TriggerSpec {
         resume_task_id: None,
     }
 }
+
+#[tokio::test]
+async fn silence_is_owner_and_run_bound_persists_and_rearms_only_within_original_limits() {
+    let state = Arc::new(MemoryStateStore::default());
+    let namespace = PluginId::new(PLUGIN_ID).unwrap();
+    let (kernel, triggers) = open(state.clone()).await;
+    let mut recurring = spec();
+    recurring.recurrence = Some(Recurrence {
+        interval_ms: 60_000,
+        max_runs: 2,
+    });
+    let trigger = triggers
+        .create_with_review_messages(
+            owner("qq"),
+            "silent-recurring".into(),
+            recurring,
+            vec!["按照这个条件检查两次，没必要就不用告诉我".into()],
+            1000,
+        )
+        .unwrap();
+    triggers.ready(&trigger.id, vec!["time".into()]).unwrap();
+    triggers
+        .transition(&trigger.id, Status::Ready, Status::Running, None)
+        .unwrap();
+    triggers
+        .transition(
+            &trigger.id,
+            Status::Running,
+            Status::Completed,
+            Some("核验无变化".into()),
+        )
+        .unwrap();
+    let before = state.get(&namespace, STATE_KEY).unwrap();
+    assert_eq!(
+        triggers.silence_for_run(&owner("other"), &trigger.id, 1),
+        Err(TriggerError::NotFound)
+    );
+    assert_eq!(
+        triggers.silence_for_run(&trigger.owner, &trigger.id, 0),
+        Err(TriggerError::Transition)
+    );
+    assert_eq!(
+        triggers.silence_for_run(&trigger.owner, &trigger.id, 2),
+        Err(TriggerError::Transition)
+    );
+    assert_eq!(
+        triggers.delivery_for_run(&trigger.id, 1, Delivery::Pending, Delivery::Silenced),
+        Err(TriggerError::Transition)
+    );
+    assert_eq!(state.get(&namespace, STATE_KEY).unwrap(), before);
+    triggers
+        .silence_for_run(&trigger.owner, &trigger.id, 1)
+        .unwrap();
+    triggers
+        .silence_for_run(&trigger.owner, &trigger.id, 1)
+        .unwrap();
+    let closed = triggers.snapshot().unwrap().remove(0);
+    assert_eq!(closed.delivery, Some(Delivery::Silenced));
+    assert_eq!(closed.status, Status::Completed);
+    assert_eq!(closed.result.as_deref(), Some("核验无变化"));
+    let committed = state.get(&namespace, STATE_KEY).unwrap();
+    let raw: serde_json::Value = serde_json::from_slice(committed.as_ref().unwrap()).unwrap();
+    assert_eq!(raw["format_version"], 4);
+    kernel.stop_all().await.unwrap();
+
+    let (kernel, triggers) = open(state.clone()).await;
+    assert_eq!(triggers.snapshot().unwrap(), vec![closed]);
+    assert_eq!(state.get(&namespace, STATE_KEY).unwrap(), committed);
+    assert_eq!(
+        triggers.rearm(&trigger.id, trigger.spec.expires_at_ms - 60_000),
+        Err(TriggerError::Transition)
+    );
+    assert_eq!(state.get(&namespace, STATE_KEY).unwrap(), committed);
+    triggers.rearm(&trigger.id, 2000).unwrap();
+    let armed = triggers.snapshot().unwrap().remove(0);
+    assert_eq!(armed.status, Status::Armed);
+    assert_eq!(armed.runs, 1);
+    assert_eq!(armed.delivery, None);
+    assert_eq!(armed.spec.expires_at_ms, trigger.spec.expires_at_ms);
+    assert_eq!(armed.spec.recurrence, trigger.spec.recurrence);
+    assert_eq!(armed.review_messages, trigger.review_messages);
+    assert_eq!(
+        armed.spec.conditions,
+        vec![Condition::Time { at_ms: 62_000 }]
+    );
+    assert_eq!(
+        triggers.silence_for_run(&trigger.owner, &trigger.id, 1),
+        Err(TriggerError::Transition)
+    );
+    triggers.ready(&trigger.id, vec!["time".into()]).unwrap();
+    triggers
+        .transition(&trigger.id, Status::Ready, Status::Running, None)
+        .unwrap();
+    triggers
+        .transition(
+            &trigger.id,
+            Status::Running,
+            Status::Completed,
+            Some("第二次核验".into()),
+        )
+        .unwrap();
+    let before = state.get(&namespace, STATE_KEY).unwrap();
+    assert_eq!(
+        triggers.silence_for_run(&trigger.owner, &trigger.id, 1),
+        Err(TriggerError::Transition)
+    );
+    assert_eq!(state.get(&namespace, STATE_KEY).unwrap(), before);
+    triggers
+        .silence_for_run(&trigger.owner, &trigger.id, 2)
+        .unwrap();
+    assert_eq!(
+        triggers.rearm(&trigger.id, 63_000),
+        Err(TriggerError::Transition)
+    );
+    assert_eq!(
+        triggers.snapshot().unwrap()[0].delivery,
+        Some(Delivery::Silenced)
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn silence_cannot_hide_inflight_or_unknown_delivery_and_cannot_rearm_failed_execution() {
+    let state = Arc::new(MemoryStateStore::default());
+    let (kernel, triggers) = open(state.clone()).await;
+    let mut recurring = spec();
+    recurring.recurrence = Some(Recurrence {
+        interval_ms: 60_000,
+        max_runs: 2,
+    });
+    let sent = triggers
+        .create(owner("qq"), "inflight".into(), recurring.clone(), 1000)
+        .unwrap();
+    let failed = triggers
+        .create(owner("qq"), "failed".into(), recurring, 1000)
+        .unwrap();
+    for trigger in [&sent, &failed] {
+        triggers.ready(&trigger.id, vec!["time".into()]).unwrap();
+        triggers
+            .transition(&trigger.id, Status::Ready, Status::Running, None)
+            .unwrap();
+    }
+    triggers
+        .transition(
+            &sent.id,
+            Status::Running,
+            Status::Completed,
+            Some("实际结果".into()),
+        )
+        .unwrap();
+    triggers
+        .transition(
+            &failed.id,
+            Status::Running,
+            Status::Failed,
+            Some("执行失败".into()),
+        )
+        .unwrap();
+    triggers
+        .delivery_for_run(&sent.id, 1, Delivery::Pending, Delivery::Sending)
+        .unwrap();
+    assert_eq!(
+        triggers.silence_for_run(&sent.owner, &sent.id, 1),
+        Err(TriggerError::Transition)
+    );
+    triggers
+        .silence_for_run(&failed.owner, &failed.id, 1)
+        .unwrap();
+    assert_eq!(
+        triggers.rearm(&failed.id, 2000),
+        Err(TriggerError::Transition)
+    );
+    kernel.stop_all().await.unwrap();
+    let (kernel, triggers) = open(state).await;
+    assert_eq!(
+        triggers
+            .snapshot()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == sent.id)
+            .unwrap()
+            .delivery,
+        Some(Delivery::Unknown)
+    );
+    assert_eq!(
+        triggers.silence_for_run(&sent.owner, &sent.id, 1),
+        Err(TriggerError::Transition)
+    );
+    assert_eq!(
+        triggers.rearm(&sent.id, 2000),
+        Err(TriggerError::Transition)
+    );
+    assert_eq!(
+        triggers
+            .snapshot()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == failed.id)
+            .unwrap()
+            .delivery,
+        Some(Delivery::Silenced)
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn silenced_state_requires_its_explicit_format_without_erasing_older_bytes() {
+    let state = Arc::new(MemoryStateStore::default());
+    let namespace = PluginId::new(PLUGIN_ID).unwrap();
+    let (kernel, triggers) = open(state.clone()).await;
+    let trigger = triggers
+        .create(owner("qq"), "format".into(), spec(), 1000)
+        .unwrap();
+    triggers.ready(&trigger.id, vec!["time".into()]).unwrap();
+    triggers
+        .transition(&trigger.id, Status::Ready, Status::Running, None)
+        .unwrap();
+    triggers
+        .transition(
+            &trigger.id,
+            Status::Running,
+            Status::Completed,
+            Some("已核对".into()),
+        )
+        .unwrap();
+    triggers
+        .silence_for_run(&trigger.owner, &trigger.id, 1)
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    let raw: serde_json::Value =
+        serde_json::from_slice(&state.get(&namespace, STATE_KEY).unwrap().unwrap()).unwrap();
+    for version in [1, 2, 3] {
+        let mut invalid = raw.clone();
+        invalid["format_version"] = version.into();
+        if version == 1 {
+            invalid["triggers"][0]["runs"] = 0.into();
+        }
+        let bytes = serde_json::to_vec(&invalid).unwrap();
+        let state = Arc::new(MemoryStateStore::default());
+        state
+            .set(&namespace, STATE_KEY.into(), bytes.clone())
+            .unwrap();
+        let kernel = Kernel::with_services(KernelServices {
+            state: state.clone(),
+            ..Default::default()
+        });
+        kernel
+            .register(Box::new(TriggerPlugin::new().unwrap()))
+            .unwrap();
+        assert!(kernel.start_all().await.is_err());
+        assert_eq!(state.get(&namespace, STATE_KEY).unwrap().unwrap(), bytes);
+    }
+}
+
 #[tokio::test]
 async fn idempotency_and_cancellation_are_bound_to_exact_session() {
     let (k, c) = open(Arc::default()).await;
@@ -201,7 +455,7 @@ async fn restart_preserves_waiting_and_never_replays_running_or_sending() {
 async fn invalid_and_duplicate_key_state_is_preserved_and_rejected() {
     for bytes in [
         br#"{"format_version":1,"format_version":1,"triggers":[]}"#.to_vec(),
-        br#"{"format_version":4,"triggers":[]}"#.to_vec(),
+        br#"{"format_version":5,"triggers":[]}"#.to_vec(),
         b"broken".to_vec(),
     ] {
         let state = Arc::new(MemoryStateStore::default());

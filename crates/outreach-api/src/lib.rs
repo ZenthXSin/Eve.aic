@@ -110,6 +110,9 @@ pub enum AttemptResult {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeliveryAttempt {
+    /// Eve 为本次投递明确选择的文字；旧记录无此字段时沿用原始草稿。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_text: Option<String>,
     pub channel: DeliveryChannel,
     pub started_at_ms: u64,
     pub finished_at_ms: Option<u64>,
@@ -222,6 +225,8 @@ pub enum CancelReason {
     IdleConversationChanged,
     /// 学习目标已取消或结束，例如用户撤回了兴趣。
     GoalClosed,
+    /// Eve 审视过这次事实，选择不说；不计为发送或投递失败。
+    ChoseSilence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -300,6 +305,13 @@ pub struct Invitation {
     pub responses: Vec<ResponseJudgement>,
 }
 impl Invitation {
+    pub fn delivered_text(&self) -> Option<&str> {
+        self.attempts
+            .last()
+            .and_then(|a| a.actual_text.as_deref())
+            .or(self.text.as_deref())
+    }
+
     /// 正在进行的时机判断。
     pub fn judging(&self) -> bool {
         self.judgements
@@ -673,6 +685,17 @@ pub trait OutreachAdmin: Send + Sync {
     /// 保存一次投递尝试并进入 Delivering；返回后才可发送。被动附带须先有对这条消息的
     /// 邀请判断。
     fn claim(&self, id: &str, at_ms: u64, channel: DeliveryChannel) -> OutreachResult<Invitation>;
+    /// 对已审视的源记录做精确 CAS；保存实际正文后才进入 Delivering。
+    fn claim_decided(
+        &self,
+        _expected: &Invitation,
+        _text: &str,
+        _at_ms: u64,
+        _channel: DeliveryChannel,
+    ) -> OutreachResult<Invitation> {
+        Err(OutreachError::Unavailable)
+    }
+
     /// 保存投递结果：送达进入 Delivered；没有写出或平台拒绝时回到 Pending，尝试用尽记为失败。
     fn record_delivery(
         &self,
@@ -958,6 +981,7 @@ mod tests {
 
         snapshot.preferences.clear();
         snapshot.invitations[0].attempts.push(DeliveryAttempt {
+            actual_text: None,
             channel: DeliveryChannel::Proactive,
             started_at_ms: 1300,
             finished_at_ms: Some(1310),

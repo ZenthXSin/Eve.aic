@@ -30,7 +30,7 @@ class ToolProgressAcceptance(progress.ProgressNarrationAcceptance):
         options['env_extra'] = env
         result = super().run_eve(script, **options)
         path = self.work / f'events-{self.runs}.jsonl'
-        self.events = [json.loads(line) for line in path.read_text().splitlines()]
+        self.events = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
         return result
 
     def calls(self, count):

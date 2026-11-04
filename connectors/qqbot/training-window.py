@@ -9,9 +9,14 @@ from pathlib import Path
 import re
 import signal
 import shutil
+import sqlite3
 import subprocess
+import sys
 import tarfile
 import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+from self_upgrade_runtime import session_turns, validate_receipt_archive
 
 MAGIC = b"EVE-QQ-TRAINING-1\n"
 MAX_ARCHIVE = 32 * 1024 * 1024
@@ -72,18 +77,47 @@ def write_json(path, value):
     temporary.replace(path)
 
 
-def collect(state_path):
-    if not state_path.exists():
-        return {"evidence_status": "no_state", "counts": {}, "evidence": []}
+def evidence_documents(state_path):
+    """已停止窗口的只读证据；冷文件和回执数据库仍须核对持久绑定。"""
+    state_path = state_path.resolve()
     state = json.loads(state_path.read_bytes())
     if state.get("version") != 1:
         raise ValueError("state_version")
     entries = state["entries"]
     receipts = json.loads(bytes(entries.get("eve.channel.qqbot", {}).get("receipts.v1", b'{"version":1,"entries":[]}')))
     sessions = json.loads(bytes(entries.get("eve.session", {}).get("sessions.v1", b'{"format_version":1,"sessions":{}}')))
-    # 格式 2 增加分段、3 增加工具进展；均只按最终 state / reply 统计训练证据。
-    if receipts.get("version") not in (1, 2, 3) or sessions.get("format_version") != 1:
+    if receipts.get("version") not in range(1, 10) or sessions.get("format_version") not in (1, 2):
         raise ValueError("evidence_version")
+    validate_receipt_archive(state_path, receipts)
+    if "archive" in receipts:
+        connection = sqlite3.connect((state_path.parent / "qq-receipts.sqlite3").resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            cold = []
+            for app, message_id, payload in connection.execute("SELECT app,message_id,payload FROM receipts ORDER BY seq"):
+                if len(payload) > 16 * 1024 * 1024:
+                    raise ValueError("receipt_archive_payload_invalid")
+                receipt = json.loads(payload)
+                if receipt["app_id"] != app or receipt["message"]["id"] != message_id:
+                    raise ValueError("receipt_archive_identity")
+                cold.append(receipt)
+        finally:
+            connection.close()
+        by_id = {(r["app_id"], r["message"]["id"]): r for r in cold}
+        for receipt in receipts["entries"]:
+            identity = (receipt["app_id"], receipt["message"]["id"])
+            if identity in by_id and by_id[identity] != receipt:
+                raise ValueError("receipt_archive_conflict")
+            by_id[identity] = receipt
+        receipts["entries"] = list(by_id.values())
+    for session in sessions["sessions"].values():
+        session["turns"] = list(session_turns(state_path, session, sessions["format_version"]))
+    return receipts, sessions
+
+
+def collect(state_path):
+    if not state_path.exists():
+        return {"evidence_status": "no_state", "counts": {}, "evidence": []}
+    receipts, sessions = evidence_documents(state_path)
     excluded, prior_turns = set(), {}
     baseline_path = state_path.parent / "round-baseline.v1.json"
     if baseline_path.exists():
@@ -102,9 +136,10 @@ def collect(state_path):
               "unconfirmed": 0, "c2c_sent": 0, "group_at_sent": 0,
               "completed_turns": 0, "model_sent": 0, "failed_turns": 0, "question_replies": 0,
               "multi_question_replies": 0, "paragraphs": 0, "reply_characters": 0,
-              "feedback_candidates": 0, "failed_after_tools": 0, "image_received": 0}
+              "feedback_candidates": 0, "failed_after_tools": 0, "image_received": 0,
+              "silent_turns": 0, "image_sent": 0}
     evidence, failures = [], []
-    completed_inputs = {}
+    completed_inputs, completed_turns = {}, {}
     for session in sessions["sessions"].values():
         identity = session["key"]["session_id"]
         for turn in session["turns"][prior_turns.get(identity, 0):]:
@@ -118,20 +153,49 @@ def collect(state_path):
                 continue
             counts["completed_turns"] += 1
             completed_inputs.setdefault(identity, set()).add((turn["input"], turn["status"]["messages"][-1]["text"]))
+            if type(turn.get("id")) is int:
+                completed_turns[(identity, turn["id"])] = turn["input"]
     for receipt in current_receipts:
         counts["image_received"] += len(receipt["message"].get("attachments", []))
         status = receipt["state"]
-        if status != "Sent":
-            counts["failed" if status == "Failed" else "unconfirmed"] += 1
-            continue
-        counts["sent"] += 1
-        msg, reply = receipt["message"], receipt["reply"]
-        counts[msg["scope"] + "_sent" if msg["scope"] == "c2c" else "group_at_sent"] += 1
-        # 与 Rust Message::session_key 的 JSON 数组和 SHA256 映射一致。
+        if status == "Merged":
+            continue  # 连发原文由绑定的主回执计数。
+        msg = receipt["message"]
         routing = json.dumps([receipt["app_id"], msg["scope"], msg["target_id"], msg["user_id"]], ensure_ascii=False, separators=(",", ":")).encode()
         identity = "qq:" + hashlib.sha256(routing).hexdigest()
-        if (msg["text"], reply) not in completed_inputs.get(identity, set()):
-            continue  # 控制确认不冒充模型训练问答。
+        deliveries = None
+        if receipts["version"] == 9 and status == "Handled":
+            # 内部 final 不是发言。Control 轮次和平台回执同时吻合才采集正文。
+            parts = [p for p in receipt.get("progress", []) if p.get("decision_id")]
+            failed = any(p["state"] == "Failed" for p in parts)
+            unknown = any(p["state"] in ("Pending", "Sending", "Unknown") or
+                          p["state"] == "Sent" and not p.get("platform_message_id") for p in parts)
+            counts["failed"] += int(failed)
+            counts["unconfirmed"] += int(unknown)
+            sent = [p for p in parts if p["state"] == "Sent" and p.get("platform_message_id")]
+            if not sent:
+                counts["silent_turns"] += int(not parts and completed_turns.get((identity, receipt.get("control_turn_id"))) == msg["text"])
+                continue
+            counts["sent"] += 1
+            counts["image_sent"] += sum(p.get("image_path") is not None for p in sent)
+            counts["c2c_sent" if msg["scope"] == "c2c" else "group_at_sent"] += 1
+            if completed_turns.get((identity, receipt.get("control_turn_id"))) != msg["text"]:
+                counts["unconfirmed"] += int(not unknown)
+                continue
+            deliveries = [{"decision_id": p["decision_id"], "platform_message_id": p["platform_message_id"], "text": p["text"]}
+                          for p in sent if p.get("image_path") is None]
+            reply = "\n\n".join(p["text"] for p in deliveries)
+            if not reply:
+                continue
+        elif status != "Sent":
+            counts["failed" if status == "Failed" else "unconfirmed"] += 1
+            continue
+        else:
+            counts["sent"] += 1
+            reply = receipt["reply"]
+            counts["c2c_sent" if msg["scope"] == "c2c" else "group_at_sent"] += 1
+            if (msg["text"], reply) not in completed_inputs.get(identity, set()):
+                continue  # 旧控制确认不冒充模型训练问答。
         counts["model_sent"] += 1
         questions = len(re.findall(r"[?？]+", reply))
         counts["question_replies"] += int(questions > 0)
@@ -142,9 +206,11 @@ def collect(state_path):
         counts["feedback_candidates"] += int(feedback)
         evidence.append({"session": identity, "scope": msg["scope"], "message_id": msg["id"],
                          "input": msg["text"], "reply": reply, "feedback_candidate": feedback})
+        if deliveries is not None:
+            evidence[-1].update(control_turn_id=receipt["control_turn_id"], deliveries=deliveries)
     return {"evidence_status": "saved", "counts": counts, "evidence": evidence, "failures": failures,
             "limitations": ["问号数量和反馈关键词仅是可复核指标，不代表语义判断或已学会偏好。",
-                            "只把 Session Completed 且 QQ Sent 的交互列为训练证据。",
+                            "只采集已完成会话中实际送达的正文；自主发言同时核对 Control 轮次和平台消息编号，沉默与内部草稿不算发言。",
                             "本地表达统计是弱示范，未更新模型权重或已确认长期偏好。",
                             "失败、中断、未确认发送保留在状态包中，不作为成功训练样本。"]}
 
@@ -164,9 +230,7 @@ def seed_round(root, source):
     state_path = source / "state.json"
     if collect(state_path)["evidence_status"] != "saved":
         raise ValueError("seed_state_invalid")
-    state = json.loads(state_path.read_bytes())["entries"]
-    receipts = json.loads(bytes(state.get("eve.channel.qqbot", {}).get("receipts.v1", b'{"version":1,"entries":[]}')))
-    sessions = json.loads(bytes(state.get("eve.session", {}).get("sessions.v1", b'{"format_version":1,"sessions":{}}')))
+    receipts, sessions = evidence_documents(state_path)
     destination = root / "state"
     shutil.copytree(source, destination)
     write_json(destination / "round-baseline.v1.json", {"version": 1,
@@ -292,7 +356,7 @@ def run_window(root, seconds, binary, seed_state=None, command=None):
 def finish(root, output, profile="training"):
     try:
         report = collect(root / "state/state.json")
-    except (ValueError, KeyError, TypeError, OSError):
+    except (ValueError, KeyError, TypeError, OSError, sqlite3.Error):
         # 无法分析的状态仍加密保留；不能伪装为零交互成功。
         report = {"evidence_status": "analysis_failed_state_preserved", "counts": {}, "evidence": []}
     report["window"] = json.loads((root / "window.json").read_bytes())

@@ -68,7 +68,7 @@ pub struct UserStatement {
 }
 
 /// 必须是实际已持久保存的 Session 快照；QQ 等宿主还须先确认面向用户投递成功。
-/// 此能力不发布给模型/通道。实现校验 Completed 与可信作用域，仅保留用户和最终回复。
+/// 此能力不发布给模型/通道。实现校验 Completed 与可信作用域，仅保留用户和已送达正文。
 #[derive(Clone)]
 pub struct CompletedInteraction {
     pub evidence_id: String,
@@ -304,6 +304,18 @@ pub trait MemoryAdmin: Send + Sync {
         expected_revision: u64,
         interaction: CompletedInteraction,
     ) -> MemoryResult<MemorySnapshot>;
+    /// 显式发言的已送达正文来自可信宿主的通道回执；Session 原始快照不改写。
+    /// 普通内部 final 不能替代此正文。沿用完成轮次、作用域、去重与 CAS 校验；
+    /// 无此能力的替换实现明确拒绝，不能退回导入未发送的 final。
+    fn import_delivered(
+        &self,
+        _scope: &MemoryScope,
+        _expected_revision: u64,
+        _interaction: CompletedInteraction,
+        _assistant_text: String,
+    ) -> MemoryResult<MemorySnapshot> {
+        Err(MemoryError::Unavailable)
+    }
     /// 确认必须由可信宿主授权（用户命令或显式开启的自主学习策略）；
     /// 自动确认引用真实 Existing 交互，不能伪造 UserStatement。证据与历史一次提交。
     /// 任何持久化错误都保留旧内存并关闭实例，因为后端可能已提交但未确认。

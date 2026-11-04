@@ -381,6 +381,20 @@ async fn invalid_or_failed_output_is_not_saved_and_input_respects_budget() {
 }
 
 #[test]
+fn unsent_internal_record_stays_distinct_when_history_is_compressed() {
+    let raw = ChatMessage::internal_text("我已经通知你了".repeat(1000));
+    let messages = [ChatMessage::text(ChatRole::User, "先不要说"), raw.clone()];
+    let turn = digest_turn(1, &messages);
+    assert!(turn.assistant[0].starts_with("【宿主内部记录，未发送】"));
+    assert!(turn.truncated);
+    assert_eq!(messages[1], raw, "摘要请求不能改写持久原文");
+    assert_eq!(
+        digest_turn(2, &[ChatMessage::text(ChatRole::Assistant, "旧版回复")]).assistant,
+        ["旧版回复"]
+    );
+}
+
+#[test]
 fn tool_calls_are_summarized_by_name_and_clipped_result() {
     let call = ToolCall {
         id: "c1".into(),

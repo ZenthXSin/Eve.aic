@@ -11,7 +11,7 @@ pub(crate) fn encode_request(model: &str, request: ModelRequest) -> Result<Value
     }
     let mut messages = Vec::new();
     for message in request.messages {
-        if let Some(text) = message.text {
+        if let Some(text) = message.text_for_model() {
             let role = match message.role {
                 ChatRole::System => "system",
                 ChatRole::User => "user",
@@ -202,6 +202,29 @@ mod tests {
     fn decode(value: Value) -> Result<ModelResponse, LlmError> {
         decode_response(&serde_json::to_vec(&value).unwrap())
     }
+    #[test]
+    fn internal_record_is_labelled_in_both_wire_protocols_without_rewriting_history() {
+        let raw = ChatMessage::internal_text("没有发出的草稿");
+        let request = ModelRequest {
+            messages: vec![
+                ChatMessage::text(ChatRole::User, "先别说"),
+                raw.clone(),
+                ChatMessage::text(ChatRole::User, "再聊聊"),
+            ],
+            tools: vec![],
+        };
+        let chat = encode_request("test", request.clone()).unwrap();
+        let responses = crate::wire::encode_request("test", request).unwrap();
+        for text in [
+            chat["messages"][1]["content"].as_str().unwrap(),
+            responses["input"][1]["content"].as_str().unwrap(),
+        ] {
+            assert!(text.starts_with("【宿主内部记录，未发送】"));
+            assert!(text.contains("没有发出的草稿"));
+        }
+        assert_eq!(raw.text.as_deref(), Some("没有发出的草稿"));
+    }
+
     #[test]
     fn preserves_ordered_history_tool_ids_and_structured_results() {
         let definition = |name: &str| ToolDefinition {

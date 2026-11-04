@@ -18,6 +18,7 @@ struct Inner {
     identities: HashMap<String, QqConversationIdentity>,
     turn_anchors: HashMap<String, QqTurnAnchor>,
     review_anchors: HashMap<String, String>,
+    latest_messages: HashMap<String, String>,
     order: VecDeque<String>,
     idle: bool,
     wakeup_claimed: bool,
@@ -74,6 +75,19 @@ impl Drop for QqWakeupLease {
     }
 }
 impl QqConversations {
+    /// 最后持久接收的真实入站 ID；后台思考与发送之间只核对新鲜度，不授予新权限。
+    pub fn latest_message_id(&self, session: &SessionKey) -> PluginResult<Option<String>> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| PluginError::State("QQ 消息目录不可用".into()))?;
+        Ok(inner
+            .identities
+            .get(&session.session_id)
+            .filter(|i| i.session == *session)
+            .and_then(|_| inner.latest_messages.get(&session.session_id))
+            .cloned())
+    }
     pub(crate) fn set_idle(&self, idle: bool) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.idle = idle;
@@ -271,6 +285,26 @@ impl QqConversations {
         self.review
             .read(&identity.app_id, &identity.session, message_id)
     }
+    /// 交流审视使用指定锚点的完整入站原话，包含失败或尚未完成轮次。
+    /// 只供理解当前交流；不能替代完整审核窗口，不提供新权限。
+    pub fn original_message_at(
+        &self,
+        session: &SessionKey,
+        message_id: &str,
+    ) -> PluginResult<String> {
+        session
+            .validate()
+            .map_err(|_| PluginError::State("QQ 原话身份无效".into()))?;
+        if !crate::state::valid_message_id(message_id) {
+            return Err(PluginError::State("QQ 原话锚点无效".into()));
+        }
+        let identity = self
+            .identity(session)?
+            .ok_or_else(|| PluginError::State("QQ 原话缺少平台身份".into()))?;
+        self.review
+            .original_text(&identity.app_id, session, message_id)
+    }
+
     /// 核对审核锚点仍是完整可信会话最新接收的消息；排队中的新消息也会令旧审核失效。
     /// 直接读取原文库顺序，不依赖当前轮次或实时引导是否已消费该消息。
     pub fn review_user_message_is_current(
@@ -451,11 +485,14 @@ impl QqConversations {
                 _ => return Err(PluginError::Task("QQ 身份范围无效".into())),
             },
         };
-        self.inner
+        let mut inner = self
+            .inner
             .lock()
-            .map_err(|_| PluginError::State("QQ 身份目录不可用".into()))?
-            .identities
-            .insert(session.session_id, identity);
+            .map_err(|_| PluginError::State("QQ 身份目录不可用".into()))?;
+        inner
+            .latest_messages
+            .insert(session.session_id.clone(), message.id.clone());
+        inner.identities.insert(session.session_id, identity);
         Ok(())
     }
     /// 这个会话是私聊还是群聊；本进程还没有为它提交过轮次时为 None。
@@ -485,6 +522,7 @@ impl QqConversations {
                     inner.identities.remove(&oldest);
                     inner.turn_anchors.remove(&oldest);
                     inner.review_anchors.remove(&oldest);
+                    inner.latest_messages.remove(&oldest);
                 }
             }
         }

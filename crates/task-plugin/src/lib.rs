@@ -54,6 +54,17 @@ impl TaskAdmin for TaskController {
     ) -> TaskResult<Task> {
         self.service()?.claim_progress(owner, id, channel, now_ms)
     }
+    fn claim_progress_expected(
+        &self,
+        owner: &TaskOwner,
+        id: &str,
+        expected: &TaskProgressToken,
+        channel: DeliveryChannel,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        self.service()?
+            .claim_progress_expected(owner, id, expected, channel, now_ms)
+    }
     fn record_progress_delivery(
         &self,
         owner: &TaskOwner,
@@ -198,8 +209,44 @@ impl TaskAdmin for TaskController {
     fn claim(&self, id: &str, channel: DeliveryChannel, now_ms: u64) -> TaskResult<Task> {
         self.service()?.claim(id, channel, now_ms)
     }
+    fn claim_notice_expected(
+        &self,
+        owner: &TaskOwner,
+        id: &str,
+        finished_at_ms: u64,
+        attempt_count: usize,
+        channel: DeliveryChannel,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        self.service()?.claim_notice_expected(
+            owner,
+            id,
+            finished_at_ms,
+            attempt_count,
+            channel,
+            now_ms,
+        )
+    }
     fn record_delivery(&self, id: &str, result: DeliveryResult, now_ms: u64) -> TaskResult<Task> {
         self.service()?.record_delivery(id, result, now_ms)
+    }
+    fn record_delivery_expected(
+        &self,
+        owner: &TaskOwner,
+        id: &str,
+        finished_at_ms: u64,
+        attempt_count: usize,
+        result: DeliveryResult,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        self.service()?.record_delivery_expected(
+            owner,
+            id,
+            finished_at_ms,
+            attempt_count,
+            result,
+            now_ms,
+        )
     }
     fn record_local_delivery(
         &self,

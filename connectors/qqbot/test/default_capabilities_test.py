@@ -71,6 +71,7 @@ class DefaultCapabilitiesAcceptance(unittest.TestCase):
         self.runs = 0
         self.child = None
         self.callback = lambda body: text_response("收到")
+        self.speech = lambda facts: {"action": "silence"}
         self.observe = lambda batch: {"updates": []}
         outer = self
 
@@ -96,7 +97,16 @@ class DefaultCapabilitiesAcceptance(unittest.TestCase):
                 except (ValueError, TypeError):
                     decoded = None
                 kind = "chat"
-                if is_progress_request(body):
+                if isinstance(decoded, dict) and "host_event" in decoded:
+                    kind = "speech"
+                    outer.assertFalse(body.get("tools"), "后台事实审视没有执行工具")
+                    response = text_response(json.dumps(outer.speech(decoded["host_event"]), ensure_ascii=False))
+                elif (body["messages"][-1]["role"] == "tool" and
+                      body["messages"][-1].get("tool_call_id") == "fixture-expression"):
+                    receipt = json.loads(body["messages"][-1]["content"])
+                    outer.assertTrue(receipt["sent"] and receipt["message_id"], receipt)
+                    response = text_response("内部结束，不再补发")
+                elif is_progress_request(body):
                     kind = "progress"
                     response = text_response(progress_fixture_text(decoded))
                 elif isinstance(decoded, dict) and "observer_version" in decoded and "known_interests" in decoded:
@@ -200,8 +210,13 @@ class DefaultCapabilitiesAcceptance(unittest.TestCase):
     def send(self, identity, text, expected):
         return [{"send": {"id": identity, "scope": "c2c", "target_id": "user-1",
                           "user_id": "user-1", "text": text, "original_text": text,
-                          "expected": expected, "expected_type": "reply"}},
-                {"wait_receipt": {"path": str(self.state_path), "id": identity, "state": "Sent"}}]
+                          "expected": expected, "expected_type": "finish"}},
+                {"wait_receipt": {"path": str(self.state_path), "id": identity, "state": "Handled"}},
+                {"wait_command": {"id": identity, "type": "finish"}}]
+
+    def say(self, text):
+        """本地模型明确选择发送；收到实际工具回执后才内部结束。"""
+        return tool_response("fixture-expression", "send_message", {"text": text})
 
     def checkpoint(self, name):
         return [{"touch": str(self.work / (name + ".inspect"))},
@@ -251,6 +266,19 @@ class DefaultCapabilitiesAcceptance(unittest.TestCase):
             self.assertFalse(self.errors, "\n".join(self.errors))
             for secret in ("test-app-secret", "test-model-secret"):
                 self.assertNotIn(secret, stdout + stderr)
+            receipts = self.documents().get("eve.channel.qqbot", {}).get("receipts.v1", {}).get("entries", [])
+            for step in script:
+                message = step.get("send", {})
+                if "expected" not in message:
+                    continue
+                entry = next((r for r in receipts if r["message"]["id"] == message["id"]), None)
+                if stop_at is not None and entry is None:
+                    continue
+                self.assertIsNotNone(entry, message["id"])
+                self.assertEqual(entry["state"], "Handled")
+                self.assertIsNone(entry.get("reply"), "内部 final 不能自动发送")
+                spoken = [p["text"] for p in entry.get("progress", []) if p["state"] == "Sent" and p.get("platform_message_id")]
+                self.assertIn(message["expected"], spoken)
             if stop_at is not None:
                 self.assertNotEqual(self.child.returncode, 0)
                 return
@@ -294,7 +322,7 @@ class DefaultCapabilitiesAcceptance(unittest.TestCase):
             return {"updates": updates}
 
         self.observe = observe
-        self.callback = lambda body: (self.assert_default_tools(body), text_response("收到"))[1]
+        self.callback = lambda body: (self.assert_default_tools(body), self.say("收到"))[1]
 
         def observed_and_learned():
             documents = self.documents()
@@ -352,8 +380,9 @@ class DefaultCapabilitiesAcceptance(unittest.TestCase):
             self.assertEqual(result["reminder"]["text"], "喝水")
             [saved] = self.reminders()
             self.assertEqual(saved["id"], result["reminder"]["id"], "确认回复前须已持久化")
-            return text_response("三十分钟后提醒你喝水")
+            return self.say("三十分钟后提醒你喝水")
         self.callback = respond
+        self.speech = lambda facts: {"action": "speak", "text": "到喝水的时间了。", "after_ms": 0} if facts.get("kind") == "reminder_due" else {"action": "silence"}
         self.run_default(self.send("reminder", "半小时后提醒我喝水", "三十分钟后提醒你喝水"))
         [reminder] = self.reminders()
         self.assertEqual(reminder["status"], "Scheduled")
@@ -383,12 +412,13 @@ class DefaultCapabilitiesAcceptance(unittest.TestCase):
             self.wait_for(lambda: self.reminders()[0]["status"] == "Delivered", "提醒未主动送达")})
         [push] = self.pushes()
         self.assertEqual((push["id"], push["target_id"], push["text"]),
-                         (reminder["id"], "user-1", "提醒你：喝水"))
+                         (reminder["id"], "user-1", "到喝水的时间了。"))
         self.assertNotIn("msg_id", push)
         [attempt] = self.reminders()[0]["attempts"]
         self.assertEqual(attempt["result"], {"sent": {"platform_message_id": "push-" + reminder["id"]}})
         self.assertEqual(sum(request["kind"] == "chat" for request in self.requests), chat_count,
-                         "到期投递不需要新用户输入或模型编造回执")
+                         "后台审视不伪造新用户对话")
+        self.assertTrue(any(request["kind"] == "speech" for request in self.requests), "到期需由 Eve 明确决定发言")
         delivered = self.reminders()
 
         def stays_delivered():
@@ -413,14 +443,15 @@ class DefaultCapabilitiesAcceptance(unittest.TestCase):
                 return text_response("模型声称所有工作已完成")
             self.assert_default_tools(body)
             if self.text(body) == "重启后查任务":
-                return text_response("已保留任务状态")
+                return self.say("已保留任务状态")
             if not results:
                 return tool_response("default-background", "dispatch_background_task", {
                     "title": "核对日志", "instructions": "读取日志并核对错误数量", "max_steps": 1})
             self.assertTrue(results[0]["dispatched"])
             self.assertTrue(self.tasks(), "派发确认前须已保存任务")
-            return text_response("已派发后台任务")
+            return self.say("已派发后台任务")
         self.callback = respond
+        self.speech = lambda facts: {"action": "speak", "text": "日志还没有核验完成，等待补充信息或解除阻塞。", "after_ms": 0} if facts.get("kind") == "background_task_result" else {"action": "silence"}
         self.run_default([*self.send("background", "请在后台核对日志", "已派发后台任务"),
                           *self.checkpoint("blocked")], checkpoints={"blocked": lambda:
             self.wait_for(lambda: any(t["status"] == "Blocked" and
@@ -430,7 +461,7 @@ class DefaultCapabilitiesAcceptance(unittest.TestCase):
         self.assertEqual(task["usage"], {"tool_calls": 1, "model_requests": 2})
         self.assertTrue(task["result"].startswith("任务尚未通过冻结验收："))
         [notice] = self.pushes()
-        self.assertEqual(notice["id"], task["id"])
+        self.assertEqual(notice["id"], f'{task["id"]}:finish-{task["finished_at_ms"]}:attempt-1')
         self.assertIn("等待补充信息或解除阻塞", notice["text"])
         self.assertNotIn("完成了：", notice["text"])
         workers = sum(WORKER in r["body"]["messages"][0].get("content", "") for r in self.requests)
@@ -455,7 +486,7 @@ class DefaultCapabilitiesAcceptance(unittest.TestCase):
                 # 未注册的名字也不能因模型强行发出调用而变成已运行。
                 return tool_response("invented-runner", "run_practice", {})
             self.assertEqual(results[-1]["error"]["code"], "UnknownTool")
-            return text_response("没有运行器，尚未执行验证")
+            return self.say("没有运行器，尚未执行验证")
         self.callback = respond
         self.run_default(self.send("no-runner", "实际运行并验证这个产物", "没有运行器，尚未执行验证"))
         practice = self.documents().get("eve.practice", {}).get("practice.v1", {}).get("runs", [])

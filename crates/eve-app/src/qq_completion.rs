@@ -152,6 +152,71 @@ impl ChannelAdapter {
     }
 }
 impl QqOutreach for ChannelAdapter {
+    fn candidates(&self) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
+        let Some(cognition) = self.cognition.get() else {
+            return Ok(vec![]);
+        };
+        let snapshot = cognition.snapshot().map_err(plugin_error)?;
+        let plans = self.plans.snapshot().map_err(plugin_error)?;
+        let asked = self.ledger.snapshot().map_err(plugin_error)?;
+        let mut owners: Vec<_> = snapshot
+            .state
+            .goals
+            .values()
+            .filter_map(|g| {
+                if let Visibility::User(owner) = &g.visibility {
+                    Some(owner.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        owners.sort();
+        owners.dedup();
+        let mut output = Vec::new();
+        for owner in owners {
+            for item in confirmable(snapshot.state.goals.values(), &plans, &owner) {
+                if !asked.askable(&owner, &item.plan.id) {
+                    continue;
+                }
+                let target = QuestionTarget {
+                    owner: owner.clone(),
+                    goal_id: item.goal.id.clone(),
+                    goal_revision: item.goal.revision,
+                    plan_id: item.plan.id.clone(),
+                    plan_revision: item.plan.revision,
+                };
+                output.push(crate::qq_speech::candidate(eve_completion_api::question_id(&owner,&item.plan.id),None,owner.clone(),json!({"kind":"goal_completion_to_confirm","target":target,"goal":item.goal,"plan":item.plan}))?);
+            }
+        }
+        Ok(output)
+    }
+    fn claim_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+        text: &str,
+        anchor: &str,
+    ) -> PluginResult<Option<QqOutreachPush>> {
+        if !self.candidates()?.contains(candidate) {
+            return Ok(None);
+        }
+        let target: QuestionTarget =
+            serde_json::from_value(candidate.facts["target"].clone()).map_err(plugin_error)?;
+        let claimed = match self.ledger.claim_decided(&target, anchor, text, now_ms()) {
+            Ok(c) => c,
+            Err(CompletionError::AlreadyAsked) => return Ok(None),
+            Err(e) => return Err(plugin_error(e)),
+        };
+        Ok(Some(QqOutreachPush {
+            session: None,
+            user_id: target.owner,
+            message: QqOutreachMessage {
+                id: claimed.id,
+                text: text.into(),
+            },
+        }))
+    }
+
     fn due(&self, session: &SessionKey) -> PluginResult<bool> {
         Ok(self.pick(&session.user_id)?.is_some())
     }

@@ -52,15 +52,20 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
             if not results:return tool_response([('restart_self',{})])
             self.assertTrue(results[0]['queued'],repr(results[0]))
             self.assertFalse(results[0]['restarted'])
-            return text_response('已排队，回复送达后重启')
+            if len(results)==1:
+                response=tool_response([('send_message',{'text':'这轮说完就重启。'})])
+                response['choices'][0]['message']['tool_calls'][0]['id']='restart-expression'
+                return response
+            self.assertTrue(results[1]['sent'])
+            return text_response('内部处理结束。')
         self.callback=respond
         scenario=self.work/'scenario.json'
         scenario.write_text(json.dumps({'wait_timeout_ms':30000,'events_file':str(self.work/'events.jsonl'),
-            'script':[{'send':{**self.message('restart-once','重启一次'),'accept_any':True}},
-                {'wait_receipt':{'path':str(self.work/'state/state.json'),'id':'restart-once','state':'Sent'}},
+            'script':[{'send':{**self.message('restart-once','重启一次'),'expected_type':'finish'}},
+                {'wait_receipt':{'path':str(self.work/'state/state.json'),'id':'restart-once','state':'Handled'}},
                 {'wait_file':str(self.work/'never-touched')}]}))
         env={k:os.environ[k] for k in ['PATH','SystemRoot','TEMP','TMP'] if k in os.environ}
-        env.update(QQBOT_APP_ID='1904159860',QQBOT_APP_SECRET='test-app-secret',EVE_OPENAI_API_KEY='test-model-secret',
+        env.update(EVE_QQ_LIVE_INTERACTION='true',QQBOT_APP_ID='1904159860',QQBOT_APP_SECRET='test-app-secret',EVE_OPENAI_API_KEY='test-model-secret',
             EVE_OPENAI_BASE_URL=f'http://127.0.0.1:{self.server.server_port}',EVE_OPENAI_PROTOCOL='chat',
             EVE_LLM_RESPONSE_MODE='complete',EVE_DEVELOPER_CONFIG=str(self.developer_config))
         command=[sys.executable,str(ROOT/'scripts/self_upgrade_runtime.py'),'--directory',str(queue),
@@ -75,13 +80,16 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
                     runtime.read_json(queue/'supervisor.json').get('result')=='restarted','restart never completed',timeout=25)
                 self.wait_until(lambda:len([json.loads(line) for line in (self.work/'events.jsonl').read_text().splitlines()
                     if json.loads(line).get('type')=='finish'])>=1,'new process did not deduplicate',timeout=10)
-                self.assertEqual(self.chat_rounds,2)
+                self.assertEqual(self.chat_rounds,3)
                 self.assertEqual(len(reviews),1)
                 self.assertFalse(reviews[0]['delegated'])
                 turns=[t for s in self.documents()['eve.session']['sessions.v1']['sessions'].values() for t in s['turns']]
                 self.assertEqual(len(turns),1)
                 self.assertEqual(turns[0]['status']['state'],'Completed')
-                self.assertEqual(self.receipt('restart-once')['state'],'Sent')
+                receipt=self.receipt('restart-once')
+                self.assertEqual(receipt['state'],'Handled')
+                self.assertEqual(receipt['progress'][0]['state'],'Sent')
+                self.assertTrue(receipt['progress'][0]['platform_message_id'])
                 self.assertEqual(len(list((queue/'history').glob('*-restarted.json'))),1)
                 child.send_signal(signal.SIGINT)
                 self.assertEqual(child.wait(timeout=15),0)
@@ -135,15 +143,20 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
             if not results:return tool_response([('apply_self_upgrade',{'candidate_sha256':candidate_id})])
             self.assertIn('queued',results[0],repr(results[0]))
             self.assertTrue(results[0]['queued']);self.assertFalse(results[0]['applied'])
-            return text_response('已排队，回复送达后切换')
+            if len(results)==1:
+                response=tool_response([('send_message',{'text':'这轮说完就切换。'})])
+                response['choices'][0]['message']['tool_calls'][0]['id']='upgrade-expression'
+                return response
+            self.assertTrue(results[1]['sent'])
+            return text_response('内部处理结束。')
         self.callback=respond
         scenario=self.work/'scenario.json'
         scenario.write_text(json.dumps({'wait_timeout_ms':30000,'events_file':str(self.work/'events.jsonl'),
-            'script':[{'send':{**self.message('apply-once','应用合成候选'),'accept_any':True}},
-                {'wait_receipt':{'path':str(self.work/'state/state.json'),'id':'apply-once','state':'Sent'}},
+            'script':[{'send':{**self.message('apply-once','应用合成候选'),'expected_type':'finish'}},
+                {'wait_receipt':{'path':str(self.work/'state/state.json'),'id':'apply-once','state':'Handled'}},
                 {'wait_file':str(self.work/'never-touched')}]}))
         env={k:os.environ[k] for k in ['PATH','SystemRoot','TEMP','TMP'] if k in os.environ}
-        env.update(QQBOT_APP_ID='1904159860',QQBOT_APP_SECRET='test-app-secret',EVE_OPENAI_API_KEY='test-model-secret',
+        env.update(EVE_QQ_LIVE_INTERACTION='true',QQBOT_APP_ID='1904159860',QQBOT_APP_SECRET='test-app-secret',EVE_OPENAI_API_KEY='test-model-secret',
             EVE_OPENAI_BASE_URL=f'http://127.0.0.1:{self.server.server_port}',EVE_OPENAI_PROTOCOL='chat',
             EVE_LLM_RESPONSE_MODE='complete',EVE_DEVELOPER_CONFIG=str(self.developer_config))
         command=[sys.executable,'-I','-B',str(ROOT/'scripts/host_runtime_bridge.py'),
@@ -156,11 +169,13 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
             child=subprocess.Popen(command,env=configure_fixture_progress(env),stdout=out,stderr=err)
             try:
                 self.wait_until(lambda:(queue/'supervisor.json').exists() and
-                    runtime.read_json(queue/'supervisor.json').get('result')=='applied','upgrade never applied',timeout=25)
-                # 新进程收到同一个 message id，保留的 Sent 回执使其只 finish，不再调用模型或工具。
+                    runtime.read_json(queue/'supervisor.json').get('active_candidate_sha256')==candidate_id and
+                    (queue/'host-handoff.json').exists() and runtime.read_json(queue/'host-handoff.json').get('phase')=='committed',
+                    'upgrade never committed',timeout=35)
+                # 新进程收到同一个 message id，只 finish，不再调用模型、工具或补发。
                 self.wait_until(lambda:len([json.loads(line) for line in (self.work/'events.jsonl').read_text().splitlines()
                     if json.loads(line).get('type')=='finish'])>=1,'new process did not deduplicate',timeout=10)
-                self.assertEqual(self.chat_rounds,2)
+                self.assertEqual(self.chat_rounds,3)
                 self.assertEqual(len(reviews),1)
                 self.assertFalse(reviews[0]['delegated'])
                 self.assertEqual(runtime.read_json(queue/'host-active.json')['descriptor']['candidate_request']['candidate_sha256'],candidate_id)
@@ -172,7 +187,10 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
                 turns=[t for s in sessions.values() for t in s['turns']]
                 self.assertEqual(len(turns),1)
                 self.assertEqual(turns[0]['status']['state'],'Completed')
-                self.assertEqual(self.receipt('apply-once')['state'],'Sent')
+                receipt=self.receipt('apply-once')
+                self.assertEqual(receipt['state'],'Handled')
+                self.assertEqual(receipt['progress'][0]['state'],'Sent')
+                self.assertTrue(receipt['progress'][0]['platform_message_id'])
                 # 监督器先发布 applied，随后才把升级请求归档到 history；等归档完成再核对数量。
                 self.wait_until(lambda:(queue/'history').is_dir() and any((queue/'history').glob('*.json')),
                     'upgrade request was not archived',timeout=10)

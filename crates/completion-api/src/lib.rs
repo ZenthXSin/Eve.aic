@@ -49,6 +49,10 @@ pub enum AttemptResult {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuestionAttempt {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub proactive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_text: Option<String>,
     /// 附带在这条用户私聊消息的回复后。
     pub message_id: String,
     pub started_at_ms: u64,
@@ -175,6 +179,15 @@ impl CompletionQuestion {
             .ok_or(CompletionError::InvalidInput)?;
         for attempt in self.attempts.iter() {
             validate_id(&attempt.message_id)?;
+            if attempt.proactive && attempt.actual_text.is_none()
+                || attempt.actual_text.as_ref().is_some_and(|t| {
+                    t.trim().is_empty()
+                        || t.len() > 2048
+                        || t.chars().any(|c| c.is_control() && c != '\n' && c != '\t')
+                })
+            {
+                return Err(CompletionError::InvalidInput);
+            }
             if attempt.started_at_ms == 0
                 || attempt.result.is_some() != attempt.finished_at_ms.is_some()
             {
@@ -238,6 +251,15 @@ pub trait CompletionLedger: Send + Sync {
     fn snapshot(&self) -> CompletionResult<CompletionSnapshot>;
     /// 先保存“发送中”再附带。从没问过时新建记录；上次没发出去且还有次数时再试一次；
     /// 其余情况返回 `AlreadyAsked`，不写入。
+    fn claim_decided(
+        &self,
+        _target: &QuestionTarget,
+        _anchor: &str,
+        _text: &str,
+        _now_ms: u64,
+    ) -> CompletionResult<CompletionQuestion> {
+        Err(CompletionError::Unavailable)
+    }
     fn claim(
         &self,
         target: &QuestionTarget,

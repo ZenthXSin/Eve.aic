@@ -106,7 +106,7 @@ impl QqReceiptArchive for SqliteReceiptArchive {
         let mut connection = self.0.lock().map_err(|_| unavailable())?;
         let tx = connection.transaction().map_err(|_| unavailable())?;
         for record in records {
-            if record.payload.len() > 512 * 1024 {
+            if record.payload.len() > 16 * 1024 * 1024 {
                 return Err(unavailable());
             }
             tx.execute("INSERT OR IGNORE INTO receipts(app,message_id,session_id,failed_reply,payload) VALUES (?1,?2,?3,?4,?5)",
@@ -231,6 +231,21 @@ mod tests {
         let db = SqliteReceiptArchive::open(&path).unwrap();
         assert_eq!(db.identity().unwrap(), (id, 1));
         assert_eq!(db.get("app", "one").unwrap(), Some(b"original".to_vec()));
+    }
+    #[test]
+    fn large_authored_receipt_is_preserved_byte_for_byte_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("receipts.sqlite3");
+        let payload = serde_json::to_vec(&serde_json::json!({"state":"Handled", "control_turn_id":17,
+            "progress": (0..64).map(|n|serde_json::json!({"text":"x".repeat(32768), "decision_id":format!("call-{n}"),
+                "state":"Unknown", "proactive":true})).collect::<Vec<_>>() })).unwrap();
+        assert!(payload.len() > 512 * 1024);
+        let db = SqliteReceiptArchive::open(&path).unwrap();
+        db.store(&[record("long-turn", &payload)]).unwrap();
+        drop(db);
+        let db = SqliteReceiptArchive::open(&path).unwrap();
+        assert_eq!(db.get("app", "long-turn").unwrap(), Some(payload.clone()));
+        assert_eq!(db.store(&[record("long-turn", &payload)]).unwrap(), 1);
     }
     #[test]
     fn empty_file_left_before_first_commit_is_initialized() {

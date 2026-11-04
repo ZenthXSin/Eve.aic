@@ -41,9 +41,10 @@ impl StoredOutreach {
                 }
                 let value =
                     strict_json::from_slice(&bytes).map_err(|_| OutreachError::CorruptState)?;
-                if value.get("format_version").and_then(|value| value.as_u64())
-                    != Some(u64::from(FORMAT_VERSION))
-                {
+                if !matches!(
+                    value.get("format_version").and_then(|value| value.as_u64()),
+                    Some(1 | 2)
+                ) {
                     return Err(if value.get("format_version").is_some() {
                         OutreachError::UnsupportedVersion
                     } else {
@@ -309,8 +310,38 @@ impl StoredOutreach {
         at_ms: u64,
         channel: DeliveryChannel,
     ) -> OutreachResult<Invitation> {
+        self.claim_inner(id, at_ms, channel, None)
+    }
+    pub(super) fn claim_decided(
+        &self,
+        expected: &Invitation,
+        text: &str,
+        at_ms: u64,
+        channel: DeliveryChannel,
+    ) -> OutreachResult<Invitation> {
+        if text.trim().is_empty()
+            || text.trim() != text
+            || text.len() > 2048
+            || text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+        {
+            return Err(OutreachError::InvalidInput);
+        }
+        self.claim_inner(&expected.id, at_ms, channel, Some((expected, text)))
+    }
+    fn claim_inner(
+        &self,
+        id: &str,
+        at_ms: u64,
+        channel: DeliveryChannel,
+        decided: Option<(&Invitation, &str)>,
+    ) -> OutreachResult<Invitation> {
         validate_channel(&channel)?;
         self.update(id, at_ms, |ledger, entry| {
+            if decided.is_some_and(|(expected, _)| expected != entry) {
+                return Err(OutreachError::Conflict);
+            }
             let busy = ledger.invitations.iter().any(|other| {
                 other.owner == entry.owner && other.status == InvitationStatus::Delivering
             });
@@ -337,6 +368,7 @@ impl StoredOutreach {
                 return Err(OutreachError::Conflict);
             }
             entry.attempts.push(DeliveryAttempt {
+                actual_text: decided.map(|(_, text)| text.to_owned()),
                 channel,
                 started_at_ms: at_ms,
                 finished_at_ms: None,
@@ -627,7 +659,14 @@ fn encode(ledger: &Ledger) -> OutreachResult<Vec<u8>> {
     if ledger.invitations.len() > MAX_INVITATIONS || ledger.preferences.len() > MAX_PREFERENCES {
         return Err(OutreachError::LimitReached);
     }
-    let bytes = serde_json::to_vec(ledger).map_err(|_| OutreachError::InvalidInput)?;
+    let mut wire = ledger.clone();
+    if wire.invitations.iter().any(|i| {
+        i.status == InvitationStatus::Cancelled(CancelReason::ChoseSilence)
+            || i.attempts.iter().any(|a| a.actual_text.is_some())
+    }) {
+        wire.format_version = 2;
+    }
+    let bytes = serde_json::to_vec(&wire).map_err(|_| OutreachError::InvalidInput)?;
     // 重启时写入的中断与未知结局比原状态略长；预留空间保证能保存。
     let open = ledger
         .invitations
@@ -649,7 +688,12 @@ fn encode(ledger: &Ledger) -> OutreachResult<Vec<u8>> {
 /// 启动时完整核对；任何不一致都拒绝打开并保留原字节。
 fn validate_ledger(ledger: &Ledger) -> OutreachResult<()> {
     let invalid = || OutreachError::InvalidInput;
-    if ledger.format_version != FORMAT_VERSION
+    if !matches!(ledger.format_version, 1 | 2)
+        || ledger.format_version == 1
+            && ledger.invitations.iter().any(|i| {
+                i.status == InvitationStatus::Cancelled(CancelReason::ChoseSilence)
+                    || i.attempts.iter().any(|a| a.actual_text.is_some())
+            })
         || ledger.invitations.len() > MAX_INVITATIONS
         || ledger.preferences.len() > MAX_PREFERENCES
     {
@@ -764,6 +808,16 @@ fn validate_invitation(entry: &Invitation) -> OutreachResult<()> {
     let last = entry.attempts.len().saturating_sub(1);
     for (index, attempt) in entry.attempts.iter().enumerate() {
         validate_channel(&attempt.channel)?;
+        if let Some(text) = &attempt.actual_text
+            && (text.trim().is_empty()
+                || text.trim() != text
+                || text.len() > 2048
+                || text
+                    .chars()
+                    .any(|c| c.is_control() && c != '\n' && c != '\t'))
+        {
+            return Err(invalid());
+        }
         if let Some(result) = &attempt.result {
             validate_result(result)?;
         }

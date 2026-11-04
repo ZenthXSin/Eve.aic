@@ -56,6 +56,7 @@ def aggregate(runs):
         report["progress_requests"] = sum(run["progress_requests"] for run in runs)
         report["total_provider_requests"] = sum(run["total_provider_requests"] for run in runs)
         report["tool_roundtrips"] = sum(run["tool_roundtrips"] for run in runs)
+        report["expression_roundtrips"] = sum(run["expression_roundtrips"] for run in runs)
     return {key: round(value, 4) if isinstance(value, float) else value for key, value in report.items()}
 
 
@@ -83,11 +84,8 @@ class LocalProvider:
                                 and messages[0]["content"].startswith("根据下一条JSON中的真实事件，自由写一句自然的中文任务进展")
                                 and messages[1]["role"] == "user")
                     facts = json.loads(messages[1]["content"]) if progress else None
-                    if progress:
-                        require(set(facts) == {"user_request", "phase", "activity", "tool_names", "failed_calls",
-                                               "waiting_seconds", "previous_messages", "group"}, "invalid_progress_facts")
-                        require(not body.get("tools") and isinstance(facts["phase"], str), "invalid_progress_request")
-                    else:
+                    require(not progress, "automatic_progress_generated")
+                    if not progress:
                         pending = set()
                         for item in conversation_messages(messages):
                             if item["role"] == "tool":
@@ -97,6 +95,9 @@ class LocalProvider:
                                 require(not pending, "missing_tool_result")
                                 pending.update(call["id"] for call in item.get("tool_calls", []))
                         require(not pending, "missing_tool_result")
+                    latest = messages[-1]
+                    result = json.loads(latest["content"]) if latest["role"] == "tool" else None
+                    completed_speech = result is not None and "sent" in result
                     outer.requests.append({
                         "at": time.perf_counter(),
                         "kind": "progress" if progress else "chat",
@@ -105,13 +106,12 @@ class LocalProvider:
                         "user_texts": [message["content"] for message in conversation_messages(messages)
                                        if message["role"] == "user"],
                         "tool": messages[-1]["role"] == "tool",
+                        "completed_speech": completed_speech,
                     })
-                    latest = messages[-1]
                     reason = "stop"
-                    if progress:
-                        message = {"role": "assistant", "content": "我在核对这一步的结果。"}
-                    elif latest["role"] == "tool":
-                        message = {"role": "assistant", "content": json.loads(latest["content"])["echo"]}
+                    if completed_speech:
+                        require(result["sent"] is True, "expression_not_sent")
+                        message = {"role": "assistant", "content": "内部完成，不发送此文本。"}
                     elif latest["content"].startswith("echo:"):
                         marker = latest["content"][5:]
                         reason = "tool_calls"
@@ -120,7 +120,12 @@ class LocalProvider:
                             "function": {"name": "echo", "arguments": json.dumps({"text": marker})},
                         }]}
                     else:
-                        message = {"role": "assistant", "content": latest["content"]}
+                        marker = result["echo"] if result is not None else latest["content"]
+                        reason = "tool_calls"
+                        message = {"role": "assistant", "content": None, "tool_calls": [{
+                            "id": "perf-speech-" + str(len(outer.requests)), "type": "function",
+                            "function": {"name": "send_message", "arguments": json.dumps({"text": marker})},
+                        }]}
                     encoded = json.dumps({"choices": [{
                         "index": 0, "finish_reason": reason, "message": message,
                     }]}).encode()
@@ -163,6 +168,7 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes, p
         EVE_OPENAI_PROTOCOL="chat",
         EVE_OPENAI_REASONING_EFFORT="none",
         EVE_LLM_RESPONSE_MODE="complete",
+        EVE_QQ_LIVE_INTERACTION="true",
         # 测量处理开销；连发合并是刻意等待，不计入通道性能。
         EVE_DEBOUNCE_MS="0",
         # 测的是对话链路并逐一核对请求数；历史摘要是后台请求，次数取决于时机，单独由 history_digest_test 验收。
@@ -217,9 +223,10 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes, p
     requests = [request for request in all_requests if request["kind"] == "chat"]
     progress_requests = [request for request in all_requests if request["kind"] == "progress"]
     tool_count = sum(message["text"].startswith("echo:") for message in messages)
-    require(not provider.errors and len(requests) == count + tool_count, "wrong_model_request_count")
-    require(sum(request["tool"] for request in requests) == tool_count, "wrong_tool_result_count")
-    require(len(progress_requests) == (tool_count if progress_enabled else 0), "wrong_progress_request_count")
+    require(not provider.errors and len(requests) == 2 * count + tool_count, "wrong_model_request_count")
+    require(sum(request["tool"] for request in requests) == count + tool_count, "wrong_tool_result_count")
+    require(sum(request["completed_speech"] for request in requests) == count, "wrong_expression_receipt_count")
+    require(not progress_requests, "automatic_progress_generated")
     completed = initial_turns
     for request in requests:
         require(min(completed, 2) + 1 <= request["user_count"] <= min(completed, HISTORY_TURNS) + 1,
@@ -235,9 +242,7 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes, p
                 "wrong_history_originals")
         require(request["user_texts"][-min(completed + 1, 3):] == expected[-min(completed + 1, 3):],
                 "missing_recent_originals")
-        if request["tool"]:
-            completed += 1
-        elif not messages[completed - initial_turns]["text"].startswith("echo:"):
+        if request["completed_speech"]:
             completed += 1
     require(completed == initial_turns + count, "missing_request_round")
     metrics = json.loads(metrics_path.read_text())
@@ -248,8 +253,12 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes, p
     state = json.loads(state_path.read_text())
     ledger = json.loads(bytes(state["entries"]["eve.channel.qqbot"]["receipts.v1"]))
     require(len(ledger["entries"]) == initial_turns + count, "wrong_receipt_count")
-    require(all(entry["state"] == "Sent" for entry in ledger["entries"]), "uncommitted_delivery")
-    by_id = {entry["message"]["id"]: entry["reply"] for entry in ledger["entries"]}
+    require(ledger["version"] == 9, "wrong_receipt_version")
+    require(all(entry["state"] == "Handled" and entry.get("reply") is None and
+                isinstance(entry.get("control_turn_id"), int) and len(entry.get("progress", [])) == 1 and
+                entry["progress"][0]["state"] == "Sent" and entry["progress"][0].get("decision_id") and
+                entry["progress"][0].get("platform_message_id") for entry in ledger["entries"]), "uncommitted_delivery")
+    by_id = {entry["message"]["id"]: entry["progress"][0]["text"] for entry in ledger["entries"]}
     require(all(by_id[message["id"]] == message["expected"] for message in messages), "wrong_saved_reply")
     session_document = json.loads(bytes(state["entries"]["eve.session"]["sessions.v1"]))
     sessions = session_document["sessions"]
@@ -269,6 +278,7 @@ def run_wave(binary, provider, directory, count, initial_turns, payload_bytes, p
         "rss_mib": peak[0], "node_peak_rss_mib": metrics["node_peak_rss_mib"],
         "startup_to_first_request_ms": (requests[0]["at"] - started) * 1000,
         "state_bytes": state_path.stat().st_size, "provider_requests": len(requests), "tool_roundtrips": tool_count,
+        "expression_roundtrips": count,
         "progress_requests": len(progress_requests), "total_provider_requests": len(all_requests),
     }
 
@@ -326,6 +336,7 @@ def main():
     report = {"format_version": 1, "functional_ok": False, "performance_status": "failed",
               "provider": "loopback_chat_stub", "provider_tcp_nodelay": True, "qq_transport": "production_bridge_with_sdk_stub",
               "build_profile": args.build_profile, "progress_mode": args.progress, "platform": platform.platform(),
+              "reply_mechanism": "eve_explicit_speech", "automatic_progress_expected": False,
               "python_version": platform.python_version(), "logical_cpus": os.cpu_count(),
               "source_sha": os.environ.get("GITHUB_SHA", "local")}
     provider = None

@@ -1,4 +1,4 @@
-"""默认 QQ 宿主的半小时进度提醒：真实进程、持久检查点和桥接回执。
+"""默认 QQ 宿主的进度事实审视：Eve 明确发言、持久检查点和桥接回执。
 
 模型和 QQ 网络使用本地协议替身。只在进程停止后平移隔离任务的时间，
 保持 30 分钟产品常量；默认能力、原任务、预算及回执均不通过测试参数改写。
@@ -26,6 +26,7 @@ class TaskProgressAcceptance(default.DefaultCapabilitiesAcceptance):
         self.worker_returned = threading.Event()
         self.addCleanup(self.release_worker.set)
         self.callback = self.respond
+        self.speech = lambda facts: {"action": "speak", "text": "验收步骤已经保存，剩余工作还在核对。", "after_ms": 0} if facts.get("kind") in ("background_task_observation", "background_task_result") else {"action": "silence"}
 
     def respond(self, body):
         results = self.results(body)
@@ -40,12 +41,12 @@ class TaskProgressAcceptance(default.DefaultCapabilitiesAcceptance):
         self.assert_default_tools(body)
         if self.text(body) == "再聊两句，原来的任务继续":
             self.assertEqual(len(self.tasks()), 1)
-            return default.text_response("原任务保留，可以继续聊")
+            return self.say("原任务保留，可以继续聊")
         if self.text(body) == "取消这个后台任务":
             if not results:
                 return default.tool_response("cancel-original", "cancel_background_task", {
                     "task_id": self.tasks()[0]["id"]})
-            return default.text_response("已请求停止")
+            return self.say("已请求停止")
         self.assertEqual(self.text(body), "后台核对步骤并保留进度")
         if not results:
             return default.tool_response("dispatch-original", "dispatch_background_task", {
@@ -53,7 +54,7 @@ class TaskProgressAcceptance(default.DefaultCapabilitiesAcceptance):
                 "max_steps": 2})
         self.assertTrue(results[-1]["dispatched"], results)
         self.assertEqual(len(self.tasks()), 1, "答复派发成功前必须已持久化")
-        return default.text_response("后台任务已保存")
+        return self.say("后台任务已保存")
 
     def wait_checkpoint(self):
         self.wait_for(lambda: self.worker_waiting.is_set() and len(self.tasks()) == 1 and
@@ -167,10 +168,8 @@ class TaskProgressAcceptance(default.DefaultCapabilitiesAcceptance):
         [push] = self.progress_pushes()
         self.assertEqual((push["id"], push["scope"], push["target_id"]), (push_id, "c2c", "user-1"))
         self.assertNotIn("msg_id", push)
-        self.assertIn("已记账工具步骤 1/2", push["text"])
-        self.assertRegex(push["text"],
-            r"等待自动恢复|等待调度接续；尚无新的执行确认|当前进程是否仍在执行尚无独立确认",
-            "恢复退避和已接收执行均须如实表达，持久 Running 不能冒充持续执行证据")
+        self.assertEqual(push["text"], "验收步骤已经保存，剩余工作还在核对。")
+        self.assertTrue(any(r["kind"] == "speech" for r in self.requests), "进度事实须由 Eve 选择怎样说")
         [notice] = self.notices()
         self.assertGreaterEqual(notice["attempt"]["started_at_ms"] - before["created_at_ms"], 30 * default.MINUTE)
         self.assertEqual(notice["status"], "Running")

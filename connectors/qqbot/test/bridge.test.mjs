@@ -49,6 +49,53 @@ async function within(promise) {
 }
 const line = frame => JSON.stringify({ version: 1, ...frame }) + "\n";
 
+test("明确发送在实际 SDK 调用前被新输入作废",async()=>{
+  const f=fixture();f.message();
+  const pending=f.bridge.command({version:1,type:"progress",id:"in-1",index:0,text:"旧决定",explicit:true,based_on_message_id:"in-1"});
+  f.message("c2c","new-input");
+  await pending;
+  assert.deepEqual(f.sent,[]);
+  assert.equal(f.frames.at(-1).failure_kind,"stale_decision");
+  await f.bridge.command({version:1,type:"progress",id:"in-1",index:1,text:"已经看过补充",explicit:true,based_on_message_id:"new-input"});
+  assert.deepEqual(f.sent.map(x=>x.text),["已经看过补充"]);
+  assert.equal(f.frames.at(-1).message_id,"out-1");
+});
+
+test("重启锚点只恢复缺失路由，不能覆盖新到内容",async()=>{
+  const f=fixture();
+  const seed={version:1,type:"restore_anchor",scope:"c2c",target_id:"user-1",sender_id:"user-1",message_id:"saved"};
+  await f.bridge.command(seed);
+  const push={version:1,type:"push",id:"decided",scope:"c2c",target_id:"user-1",sender_id:"user-1",text:"自己决定的提醒",based_on_message_id:"saved"};
+  await f.bridge.command(push);
+  assert.equal(f.sent.length,1);
+  f.message("c2c","fresh");
+  await f.bridge.command(seed);
+  await f.bridge.command({...push,id:"old-decision"});
+  assert.equal(f.sent.length,1);
+  assert.equal(f.frames.at(-1).failure_kind,"stale_decision");
+});
+
+test("未唤醒的群友消息也会作废尚未发送的插话",async()=>{
+  const f=fixture({group:{observe:true}});f.message("group");
+  const pending=f.bridge.command({version:1,type:"push",id:"chime-decided",scope:"group",target_id:"group-1",sender_id:"user-1",text:"先前的话",based_on_message_id:"in-1",group_chime:true});
+  f.handlers.get("message")({}, {kind:"group",rawEventType:"GROUP_MESSAGE_CREATE",messageId:"other-input",senderId:"member-2",content:"补充一下",groupOpenid:"group-1",replyTarget:{scope:"group",targetId:"group-1",msgId:"other-input"}});
+  await pending;
+  assert.deepEqual(f.sent,[]);
+  assert.equal(f.frames.at(-1).failure_kind,"stale_decision");
+});
+
+test("表情包作为明确表达独立发送，并使用同一个新鲜度检查",async()=>{
+  const f=fixture();f.message();
+  await f.bridge.command({version:1,type:"progress",id:"in-1",index:0,text:"表情描述",image_path:"/tmp/chosen.png",explicit:true,based_on_message_id:"in-1"});
+  assert.equal(f.images.length,1);
+  assert.equal(f.sent.length,0);
+  assert.equal(f.frames.at(-1).message_id,"image-msg-1");
+  const pending=f.bridge.command({version:1,type:"progress",id:"in-1",index:1,text:"另一张",image_path:"/tmp/other.png",explicit:true,based_on_message_id:"in-1"});
+  f.message("c2c","stop-image");await pending;
+  assert.equal(f.images.length,1);
+  assert.equal(f.frames.at(-1).failure_kind,"stale_decision");
+});
+
 test("主动分段只等待尚未满足的间隔，慢发送不会叠加完整停顿", async () => {
   let clock = 0;
   const starts = [], pauses = [], deadlines = new Set();
@@ -796,31 +843,19 @@ test("窗口用尽后的分段全部沿原会话主动投递，不重发已成�
   assert.ok(f.sent.every(s => !s.target.msgId && s.target.targetId === "group-1"));
 });
 
-test("SDK 明确拒绝后单独通知一次，正文仍报告失败且错误内容不泄漏", async () => {
+test("SDK 拒绝只返回事实，不追加宿主台词、不泄漏异常正文", async () => {
   const error = Object.assign(new Error("secret-token sensitive-body"), { httpStatus: 400, bizCode: 40034005 });
-  const f = fixture({ fail: n => n === 1, error }); f.message("group");
+  const f = fixture({ fail: true, error }); f.message("group");
   await f.bridge.command({ version: 1, type: "reply", id: "in-1", text: "原始正文" });
-  assert.equal(f.sent.length, 2);
+  assert.equal(f.sent.length, 1);
   assert.equal(f.sent[0].target.msgId, "in-1");
-  assert.deepEqual(f.sent[1].target, { scope: "group", targetId: "group-1" });
-  assert.match(f.sent[1].text, /\/last-reply/);
   assert.equal(f.frames.at(-1).ok, false);
-  assert.equal(f.frames.at(-1).notice_status, "sent");
+  assert.equal(f.frames.at(-1).notice_status, undefined);
   assert.equal(f.frames.at(-1).http_status, 400);
   assert.equal(f.frames.at(-1).biz_code, 40034005);
   assert.ok(!JSON.stringify(f.frames).includes("secret-token"));
   await f.bridge.command({ version: 1, type: "reply", id: "in-1", text: "不能重发" });
-  assert.equal(f.sent.length, 2);
-});
-
-test("通知本身失败如实保留两个错误码，不把通知算作正文送达", async () => {
-  const error = Object.assign(new Error("private content"), { httpStatus: 400, bizCode: 12345 });
-  const f = fixture({ fail: true, error }); f.message();
-  await f.bridge.command({ version: 1, type: "reply", id: "in-1", text: "结果" });
-  assert.equal(f.sent.length, 2);
-  assert.equal(f.frames.at(-1).ok, false);
-  assert.equal(f.frames.at(-1).notice_status, "failed");
-  assert.equal(f.frames.at(-1).notice_biz_code, 12345);
+  assert.equal(f.sent.length, 1);
 });
 
 test("未知网络结果、鉴权失败和限流不重发正文或追加主动通知", async () => {
@@ -830,7 +865,7 @@ test("未知网络结果、鉴权失败和限流不重发正文或追加主动�
     await f.bridge.command({ version: 1, type: "reply", id: "in-1", text: "结果" });
     assert.equal(f.sent.length, 1);
     assert.equal(f.frames.at(-1).ok, false);
-    assert.equal(f.frames.at(-1).notice_status, "not_attempted");
+    assert.equal(f.frames.at(-1).notice_status, undefined);
   }
 });
 
@@ -860,19 +895,19 @@ test("私聊进度占用三次后只剩一次正文配额，不能继续分两�
   assert.equal(f.frames.at(-1).ok, true);
 });
 
-test("第二段被拒绝只提醒一次，已发送第一段不重发且不再发送剩余段", async () => {
+test("第二段被拒绝不追加提醒，已发送第一段不重发且不再发送剩余段", async () => {
   const error = Object.assign(new Error("sensitive"), { httpStatus: 400, bizCode: 123 });
   const f = fixture({ fail: n => n === 2, error }); f.message("group");
   for (const index of [0, 1, 2]) {
     await f.bridge.command({ version: 1, type: "segment", id: "in-1", count: 3, index, text: `原始片段${index}` });
   }
   assert.deepEqual(f.sent.map(s => s.text).slice(0, 2), ["<@user-1> 原始片段0", "<@user-1> 原始片段1"]);
-  assert.equal(f.sent.length, 3);
+  assert.equal(f.sent.length, 2);
   const receipts = f.frames.filter(x => x.type === "delivery");
   assert.equal(receipts.length, 2);
   assert.equal(receipts[0].ok, true);
   assert.equal(receipts[1].ok, false);
-  assert.equal(receipts[1].notice_status, "sent");
+  assert.equal(receipts[1].notice_status, undefined);
 });
 
 test("停止后的迟到平台拒绝不会再发通知，也不伪造送达", async () => {
@@ -884,19 +919,6 @@ test("停止后的迟到平台拒绝不会再发通知，也不伪造送达", as
   held.resolve(); await sending;
   assert.equal(f.sent.length, 1);
   assert.equal(f.frames.some(x => x.type === "delivery"), false);
-});
-
-test("失败提醒没有回执时有界返回未知，不重发也不把正文改成成功", async () => {
-  const held = deferred();
-  const error = Object.assign(new Error("rejected"), { httpStatus: 400, bizCode: 123 });
-  const f = fixture({ fail: n => n === 1, error, hold: target => target.msgId ? null : held.promise });
-  f.message();
-  try {
-    await f.bridge.command({ version: 1, type: "reply", id: "in-1", text: "原始结果" });
-    assert.equal(f.sent.length, 2);
-    assert.equal(f.frames.at(-1).notice_status, "unknown");
-    assert.equal(f.frames.at(-1).ok, false);
-  } finally { held.resolve(); }
 });
 
 test("表情包只跟在正文之后走原消息的被动目标，失败、过期或未预告都不发送也不重试", async () => {
@@ -932,21 +954,15 @@ test("表情包只跟在正文之后走原消息的被动目标，失败、过�
 });
 
 
-test("容量拒绝只通知原会话，不重试、不声称回复已保存", async () => {
-  for (const fail of [false, true]) {
-    const f = fixture({ fail, error: { response: { status: 400, data: { code: 40034090 } } } });
-    f.message("group");
-    await f.bridge.command({ version: 1, type: "capacity", id: "in-1" });
-    await f.bridge.command({ version: 1, type: "capacity", id: "in-1" });
-    assert.equal(f.sent.length, 1);
-    assert.equal(f.sent[0].target.targetId, "group-1");
-    assert.equal(f.sent[0].target.msgId, "in-1");
-    assert.match(f.sent[0].text, /本条请求尚未执行/);
-    assert.ok(!f.sent[0].text.includes("/last-reply"));
-    const [delivery] = f.frames.filter(f => f.type === "delivery");
-    assert.equal(delivery.capacity_notice, true);
-    assert.equal(delivery.ok, !fail);
-  }
+test("容量拒绝只报告未受理，不自动发送占位通知", async () => {
+  const f = fixture(); f.message("group");
+  await f.bridge.command({version:1,type:"capacity",id:"in-1"});
+  await f.bridge.command({version:1,type:"capacity",id:"in-1"});
+  assert.equal(f.sent.length,0);
+  const deliveries=f.frames.filter(x=>x.type==="delivery");
+  assert.equal(deliveries.length,1);
+  assert.equal(deliveries[0].ok,false);
+  assert.equal(deliveries[0].failure_kind,"receipt_capacity");
 });
 
 test("QQ 表情标签转成可读的【表情：名字】，解不出名字时只标出表情", () => {
@@ -1028,13 +1044,13 @@ test("网络故障按固定类别记录且不重发未知投递", async () => {
     await f.bridge.command({ version: 1, type: "reply", id: "in-1", text: "结果" });
     assert.equal(f.sent.length, 1);
     assert.equal(f.frames.at(-1).failure_kind, expected);
-    assert.equal(f.frames.at(-1).notice_status, "not_attempted");
+    assert.equal(f.frames.at(-1).notice_status, undefined);
     assert.ok(!JSON.stringify(f.frames).includes("private"));
     assert.ok(!JSON.stringify(f.frames).includes("PRIVATE_VALUE"));
   }
 });
 
-test("不同群友的进度、分段、容量及错误通知均艾特原触发者，不能伪造目标", async () => {
+test("不同群友的明确回复保持原触发者，失败和容量不足不生成台词", async () => {
   const f=fixture();
   for (const [id,user] of [["a","member-a"],["b","member-b"]]) {
     f.handlers.get("message")({}, {kind:"group",messageId:id,senderId:user,content:"帮忙",rawEventType:"GROUP_AT_MESSAGE_CREATE",groupOpenid:"group-1",replyTarget:{scope:"group",targetId:"group-1",msgId:id}});
@@ -1045,11 +1061,11 @@ test("不同群友的进度、分段、容量及错误通知均艾特原触发�
   assert.deepEqual(f.sent.map(s=>s.text),["<@member-a> 正在核对","<@member-b> 已经处理","<@member-a> 已核实"]);
   f.message("group","capacity-at");
   await f.bridge.command({version:1,type:"capacity",id:"capacity-at"});
-  assert.match(f.sent.at(-1).text,/^<@user-1> /);
+  assert.equal(f.sent.length,3);
   const fail=fixture({fail:n=>n===1,error:{httpStatus:400,bizCode:40034090}});
   fail.message("group");
   await fail.bridge.command({version:1,type:"reply",id:"in-1",text:"已保存的结论"});
-  assert.equal(fail.sent.length,2);
+  assert.equal(fail.sent.length,1);
   assert.ok(fail.sent.every(s=>s.text.startsWith("<@user-1> ")));
 });
 
@@ -1095,7 +1111,7 @@ test("平台返回接受但缺少消息编号时保持未知，不宣称送达�
     assert.equal(delivery.ok, false);
     assert.equal(delivery.failure_kind, "transport_unknown");
     assert.equal(f.sent.length, 1);
-    assert.equal(delivery.notice_status, "not_attempted");
+    assert.equal(delivery.notice_status, undefined);
   }
   const file = fixture({fileResult:{upload:{id:"upload-only"}}});
   await file.bridge.command({version:1,type:"file",id:"file-unknown",scope:"c2c",target_id:"user-1",path:"/tmp/file.txt"});

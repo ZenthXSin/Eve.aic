@@ -70,6 +70,17 @@ class TrustedReviewOriginalsAcceptance(developer.DeveloperAcceptance):
         self.assertTrue(self.command_results[0].get("success"), self.command_results[0])
         self.assertFalse(self.target.exists())
 
+    def assert_no_expression(self, *message_ids):
+        events = [json.loads(line) for path in self.work.glob('events-*.jsonl')
+                  for line in path.read_text(encoding='utf8').splitlines()]
+        self.assertFalse([event for event in events if event.get('direction') == 'out'
+                          and event.get('id') in message_ids
+                          and event.get('type') in ('reply', 'segment', 'progress', 'sticker', 'push')],
+                         '内部 final 和合并消息不能自动生成对外回复或确认')
+        for message_id in message_ids:
+            self.assertIsNone(self.receipt(message_id).get('reply'))
+            self.assertFalse(self.receipt(message_id).get('progress'))
+
     def permit_group_operator(self):
         identity = json.dumps(["1904159860", "group", "group-1", "user-1"],
                               separators=(",", ":")).encode()
@@ -152,15 +163,17 @@ class TrustedReviewOriginalsAcceptance(developer.DeveloperAcceptance):
             return self.delete_then_report(body)
 
         self.callback = respond
-        base = self.original("steering-base", "加工后的原任务", originals[0], expected="已核对执行回执")
-        steer = self.original("steering-update", "加工后的新补充", originals[1],
-                              contains="已把这条消息加入原任务")
+        base = self.original("steering-base", "加工后的原任务", originals[0]) | {'expected_type':'finish'}
+        steer = self.original("steering-update", "加工后的新补充", originals[1]) | {'expected_type':'finish'}
         self.run_trusted([{"send": base}, {"wait_file": str(self.arrived("chat", 1))},
-                          {"send": steer}, self.wait_receipt("steering-update"),
+                          {"send": steer}, self.wait_receipt("steering-update", state="Merged"),
                           {"touch": str(self.gate("steering-persisted"))},
-                          self.wait_reply("steering-base"), self.wait_receipt("steering-base")],
+                          {"wait_command":{"id":"steering-base","type":"finish"}},
+                          self.wait_receipt("steering-base", state="Handled")],
                          env_extra={"EVE_QQ_LIVE_INTERACTION": "true"})
         self.assert_authorized_deletion(originals)
+        self.assertEqual(self.receipt('steering-update')['merged_into'],'steering-base')
+        self.assert_no_expression('steering-base','steering-update')
         turns = [turn for session in self.documents()["eve.session"]["sessions.v1"]["sessions"].values()
                  for turn in session["turns"]]
         self.assertEqual(len(turns), 1)
@@ -227,7 +240,8 @@ class TrustedReviewOriginalsAcceptance(developer.DeveloperAcceptance):
             request = json.loads(pending["body"]["messages"][-1]["content"])
             self.assertEqual(request["user_messages"], [old_raw],
                              "新原话尚未被主模型消费，不能混入旧审核请求")
-            self.assertEqual(self.receipt("stale-review-steer")["state"], "Sent")
+            self.assertEqual(self.receipt("stale-review-steer")["state"], "Merged")
+            self.assertEqual(self.receipt("stale-review-steer")["merged_into"], "stale-review-base")
             archive = (self.work / "state/qq-receipts.sqlite3").as_uri() + "?mode=ro"
             with closing(sqlite3.connect(archive, uri=True)) as connection:
                 persisted = connection.execute(
@@ -237,18 +251,18 @@ class TrustedReviewOriginalsAcceptance(developer.DeveloperAcceptance):
             self.assertEqual((self.target / "evidence.txt").read_text(encoding="utf8"), "只允许按原话删除")
 
         self.callback = respond
-        base = self.original("stale-review-base", "加工原任务：删除 keep", old_raw,
-                             expected="旧删除未执行，已经只读核对原文件")
+        base = self.original("stale-review-base", "加工原任务：删除 keep", old_raw) | {'expected_type':'finish'}
         # 这是普通即时纠正，不是固定急停/撤权命令，也不撤销全部业务权限。
-        steer = self.original("stale-review-steer", new_raw, new_raw,
-                              contains="已把这条消息加入原任务")
+        steer = self.original("stale-review-steer", new_raw, new_raw) | {'expected_type':'finish'}
         self.run_trusted([{"send": base}, {"wait_file": str(self.arrived("review", 1))},
-                          {"send": steer}, self.wait_receipt("stale-review-steer"),
+                          {"send": steer}, self.wait_receipt("stale-review-steer", state="Merged"),
                           *self.checkpoint("stale-review-persisted"),
                           {"touch": str(self.gate("release-stale-review"))},
-                          self.wait_reply("stale-review-base"), self.wait_receipt("stale-review-base")],
+                          {"wait_command":{"id":"stale-review-base","type":"finish"}},
+                          self.wait_receipt("stale-review-base", state="Handled")],
                          checkpoints={"stale-review-persisted": inspect_while_review_waits},
                          env_extra={"EVE_QQ_LIVE_INTERACTION": "true"})
+        self.assert_no_expression('stale-review-base','stale-review-steer')
         self.assertEqual(len(self.reviews), 1)
         self.assertEqual(self.reviews[0]["user_messages"], [old_raw])
         self.assertEqual(len(self.command_results), 1)

@@ -1,4 +1,5 @@
 """Actual Eve process + production plugin + fake Node/loopback Chat HTTP."""
+from contextlib import closing
 from fixture_auth import configure_fixture_progress
 from request_messages import conversation_messages
 from fixture_auth import read_archived_state
@@ -35,6 +36,7 @@ class Acceptance(unittest.TestCase):
         self.request_documents = []
         self.provider_steps = {}
         self.empty_interest_updates = False
+        self.explicit_speech = False
         self.server_errors = []
         self.request_lock = threading.Lock()
         self.runs = 0
@@ -65,6 +67,8 @@ class Acceptance(unittest.TestCase):
                 outer.request_arrived(index).touch()
                 messages = body["messages"]
                 latest = messages[-1]
+                spoken_receipt = (outer.explicit_speech and latest["role"] == "tool"
+                                  and "sent" in json.loads(latest["content"]))
                 reason = "stop"
                 step = outer.provider_steps.get(index, {})
                 if "wait" in step:
@@ -76,7 +80,10 @@ class Acceptance(unittest.TestCase):
                 if latest.get("content") == "wait":
                     outer.started.set()
                     outer.release.wait(timeout=20)
-                if "text" in step:
+                if spoken_receipt:
+                    assert json.loads(latest["content"])["sent"]
+                    message = {"role": "assistant", "content": "内部完成，不对外发送。"}
+                elif "text" in step:
                     message = {"role": "assistant", "content": step["text"]}
                 elif outer.empty_interest_updates and any(
                         m.get("role") == "system" and "你是受限的兴趣观察器" in m.get("content", "")
@@ -94,10 +101,20 @@ class Acceptance(unittest.TestCase):
                         "function": {"name": "echo", "arguments": json.dumps({"text": marker})}}]}
                 elif latest["content"].startswith("recall:"):
                     marker = latest["content"].split(":", 1)[1]
-                    assert any(m.get("role") == "assistant" and m.get("content") == marker for m in messages[:-1])
+                    assert any(m.get("role") == "assistant" and (m.get("content") == marker or
+                        outer.explicit_speech and any(c["function"]["name"] == "send_message" and
+                            json.loads(c["function"]["arguments"])["text"] == marker for c in m.get("tool_calls", [])))
+                        for m in messages[:-1])
                     message = {"role": "assistant", "content": marker}
                 else:
                     message = {"role": "assistant", "content": latest["content"]}
+                observer = any(m.get("role") == "system" and "你是受限的兴趣观察器" in m.get("content", "") for m in messages)
+                if outer.explicit_speech and not observer and not spoken_receipt and reason == "stop":
+                    # 测试模型明确选择发言，真实宿主只能转发工具中的正文。
+                    reason = "tool_calls"
+                    message = {"role": "assistant", "content": None, "tool_calls": [{
+                        "id": "window-speech-" + str(index), "type": "function",
+                        "function": {"name": "send_message", "arguments": json.dumps({"text": message["content"]})}}]}
                 encoded = json.dumps({"choices": [{"index": 0, "finish_reason": reason, "message": message}]}).encode()
                 self.send_response(200); self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(encoded))); self.end_headers()
@@ -194,7 +211,7 @@ class Acceptance(unittest.TestCase):
         return read_archived_state(self.work / 'state/state.json')
 
     def expression_state(self):
-        with sqlite3.connect(self.work / "state/training-expressions.sqlite3") as db:
+        with closing(sqlite3.connect(self.work / "state/training-expressions.sqlite3")) as db:
             db.row_factory = sqlite3.Row
             records = [dict(row) for row in db.execute("SELECT session_id,user_id,id,body,chars,paragraphs,question,formal,casual,active FROM expressions ORDER BY seq")]
         for row in records:
@@ -336,12 +353,13 @@ class Acceptance(unittest.TestCase):
             ("tc-stop", "已结束当前会话的主动提问训练，已完成记录保留；普通聊天仍可继续。")])
 
     def test_training_window_ready_checkpoint_and_encrypted_completed_results(self):
+        self.explicit_speech = True
         self.provider_steps = {1: {"text": "你希望每段几句话？"}}
         launcher = self.work / "launch-eve"
         scenario = self.work / "window-scenario.json"
         scenario.write_text(json.dumps({"script": [
             {"send": self.message("tw-1", "/train start", "你希望每段几句话？")},
-            self.wait_command("tw-1"), {"wait_file": str(self.gate("window-close"))}]}))
+            self.wait_command("tw-1", "finish"), {"wait_file": str(self.gate("window-close"))}]}))
         launcher.write_text("#!/usr/bin/env python3\nimport os, sys\nos.execv(" + repr(str(BINARY)) + ", [" + repr(str(BINARY)) + ", *sys.argv[1:], '--bridge-script', " + repr(str(FAKE)) + ", '--bridge-arg', " + repr(str(scenario)) + "])\n")
         launcher.chmod(0o700)
         env = {k: os.environ[k] for k in ("PATH", "SystemRoot", "TEMP", "TMP") if k in os.environ}
@@ -383,6 +401,7 @@ class Acceptance(unittest.TestCase):
 
     @unittest.skipUnless(BROWSER, "需要 EVE_TEST_BROWSER 或 PATH 中的 google-chrome（全功能体验开启网页实践）")
     def test_full_experience_window_starts_every_capability_and_continues_from_encrypted_state(self):
+        self.explicit_speech = True
         self.empty_interest_updates = True
         launcher = self.work / "launch-eve"
         scenario = self.work / "full-scenario.json"
@@ -404,7 +423,7 @@ class Acceptance(unittest.TestCase):
                      "--reference", "eve-portable=vendor/eve-portable-knowledge"]
 
         def window(name, message, gate, practice, seed=None):
-            scenario.write_text(json.dumps({"script": [{"send": message}, self.wait_command(message["id"]),
+            scenario.write_text(json.dumps({"script": [{"send": message}, self.wait_command(message["id"], "finish"),
                                                        {"wait_file": str(self.gate(gate))}]}))
             root, output = self.work / name, self.work / (name + "-results")
             command = ["python3", str(script), "--profile", "full", *practice, "--root", str(root), "--output", str(output),

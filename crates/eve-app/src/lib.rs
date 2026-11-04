@@ -81,6 +81,7 @@ mod qq_review_source;
 pub mod qq_scripts;
 mod qq_semantic;
 mod qq_skill;
+mod qq_speech;
 mod qq_stickers;
 mod qq_subagents;
 mod qq_subject;

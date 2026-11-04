@@ -443,7 +443,7 @@ impl TaskSnapshot {
 /// 仅可信宿主持有；不发布给模型或不受信插件。
 pub trait TaskAdmin: Send + Sync {
     fn snapshot(&self) -> TaskResult<TaskSnapshot>;
-    /// 进度轮询仅复制小型投递元数据；正文在原子认领后读取。
+    /// 进度轮询仅复制小型投递元数据；候选正文和事实版本按指定身份、任务另行读取。
     fn progress_snapshot(&self) -> TaskResult<TaskProgressSnapshot> {
         let snapshot = TaskProgressSnapshot {
             tasks: self
@@ -461,6 +461,18 @@ pub trait TaskAdmin: Send + Sync {
         &self,
         _owner: &TaskOwner,
         _id: &str,
+        _channel: DeliveryChannel,
+        _now_ms: u64,
+    ) -> TaskResult<Task> {
+        Err(TaskError::Unavailable)
+    }
+    /// 只认领模型实际审视过的完整身份、下一通知序号与进度事实版本。
+    /// 事实变化须在写入尝试前返回冲突，不消耗间隔或通知次数；旧实现默认拒绝。
+    fn claim_progress_expected(
+        &self,
+        _owner: &TaskOwner,
+        _id: &str,
+        _expected: &TaskProgressToken,
         _channel: DeliveryChannel,
         _now_ms: u64,
     ) -> TaskResult<Task> {
@@ -642,9 +654,38 @@ pub trait TaskAdmin: Send + Sync {
     /// 保存一次平台通知尝试并进入发送中；返回后才可发送。主动私聊每条至多一次。
     /// LocalInbox 只允许通过 record_local_delivery 结算，普通认领必须拒绝。
     fn claim(&self, id: &str, channel: DeliveryChannel, now_ms: u64) -> TaskResult<Task>;
+    /// 认领指定身份和结束批次的通知；attempt_count 是认领前的尝试总数。
+    /// 必须在同一源账本事务中比较后再追加，不得回退为只按任务 ID 认领。
+    #[allow(clippy::too_many_arguments)]
+    fn claim_notice_expected(
+        &self,
+        _owner: &TaskOwner,
+        _id: &str,
+        _finished_at_ms: u64,
+        _attempt_count: usize,
+        _channel: DeliveryChannel,
+        _now_ms: u64,
+    ) -> TaskResult<Task> {
+        Err(TaskError::Unavailable)
+    }
     /// 保存平台投递结果：送达即了结；没有写出或平台拒绝时回到等待，尝试用尽记为过期。
     /// StoredLocally 只能由 record_local_delivery 写入，普通平台回执入口必须拒绝。
+    /// 缺少平台编号的 Sent 按 Unknown 结算；运输未知立即保存，不必等待重启。
     fn record_delivery(&self, id: &str, result: DeliveryResult, now_ms: u64) -> TaskResult<Task>;
+    /// 只结算指定结束批次的最后一次未结算尝试；attempt_count 是认领后的总数。
+    /// 迟到回执不能覆盖同一任务接续后产生的新终态或新的发送尝试。
+    #[allow(clippy::too_many_arguments)]
+    fn record_delivery_expected(
+        &self,
+        _owner: &TaskOwner,
+        _id: &str,
+        _finished_at_ms: u64,
+        _attempt_count: usize,
+        _result: DeliveryResult,
+        _now_ms: u64,
+    ) -> TaskResult<Task> {
+        Err(TaskError::Unavailable)
+    }
     /// 收件箱先可靠落盘，宿主再以完整身份、任务 ID 和本次结束时间原子结算。
     /// 只结算等待中的通知；相同结束批次和本地回执可重复确认，不覆盖发送中或未知结果。
     /// 替换实现默认失败关闭，不能把本地保存冒充平台发送成功。

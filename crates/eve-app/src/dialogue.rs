@@ -95,32 +95,45 @@ fn apply(mut request: ModelRequest) -> ModelRequest {
             &request,
             request.messages[user].text.as_deref().unwrap_or_default(),
         );
-        // 保留 Runtime 当前工具清单与当前用户输入的相邻关系。
-        let index = if user > 0
+        // 保留当前工具清单或发言 JSON 协议与本次输入的相邻关系。
+        let current_choice = request
+            .messages
+            .iter()
+            .rposition(|m| m.role == ChatRole::System)
+            .filter(|&i| {
+                request.messages[i]
+                    .text
+                    .as_deref()
+                    .is_some_and(|s| s.contains("本次即时通讯输出选择："))
+            });
+        let index = if let Some(index) = current_choice {
+            index
+        } else if user > 0
             && request.messages[user - 1].role == ChatRole::System
-            && request.messages[user - 1]
-                .text
-                .as_deref()
-                .is_some_and(|s| s.contains("eve.runtime.tool-capabilities"))
+            && request.messages[user - 1].text.as_deref().is_some_and(|s| {
+                s.contains("eve.runtime.tool-capabilities") || s.starts_with("本轮自主发言协议：")
+            })
         {
             user - 1
         } else {
             user
         };
-        // 有些模型会忽略纯 System 的表达/结构要求。用固定的宿主提示再次明确，
-        // 原始 User 消息与图片不改写，当前工具清单仍紧邻真实输入；提示不写入会话或记忆。
+        // 表达约束保持 System 身份，不制造用户消息；原文、图片和当前工具清单不改写。
         request
             .messages
             .insert(index, ChatMessage::text(ChatRole::System, POLICY.trim()));
         request
             .messages
-            .insert(index + 1, ChatMessage::text(ChatRole::User, guard));
+            .insert(index + 1, ChatMessage::text(ChatRole::System, guard));
     }
     request
 }
 impl LlmProvider for NaturalDialogue {
     fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
         self.0.complete(apply(request))
+    }
+    fn complete_json(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
+        self.0.complete_json(apply(request))
     }
     fn stream<'a>(
         &'a self,
@@ -134,6 +147,44 @@ impl LlmProvider for NaturalDialogue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_input_after_a_tool_receipt_keeps_expression_choice_in_the_last_system() {
+        let request = ModelRequest {
+            messages: vec![
+                ChatMessage::text(
+                    ChatRole::System,
+                    "本轮当前工具复核\n本次即时通讯输出选择：测试协议",
+                ),
+                ChatMessage::text(ChatRole::User, "先看看"),
+                ChatMessage::assistant_tool_calls(vec![eve_llm_api::ToolCall {
+                    id: "listen".into(),
+                    name: "wait_for_input".into(),
+                    arguments: json!({}),
+                }])
+                .unwrap(),
+                ChatMessage::tool_results(vec![
+                    eve_llm_api::ToolResult::success("listen", json!({})).unwrap(),
+                ])
+                .unwrap(),
+                ChatMessage::text(ChatRole::User, "补充一句"),
+            ],
+            tools: vec![],
+        };
+        let updated = apply(request.clone());
+        updated.validate().unwrap();
+        assert_eq!(&updated.messages[2..], request.messages.as_slice());
+        assert!(
+            updated
+                .messages
+                .iter()
+                .rfind(|m| m.role == ChatRole::System)
+                .unwrap()
+                .text
+                .as_ref()
+                .unwrap()
+                .contains("本次即时通讯输出选择：")
+        );
+    }
     #[test]
     fn current_policy_follows_old_answers_and_preserves_current_capability_frame() {
         let request = ModelRequest {
@@ -155,7 +206,7 @@ mod tests {
                 .unwrap()
                 .starts_with("本轮自然接话约束")
         );
-        assert_eq!(updated.messages[3].role, ChatRole::User);
+        assert_eq!(updated.messages[3].role, ChatRole::System);
         assert!(
             updated.messages[3]
                 .text

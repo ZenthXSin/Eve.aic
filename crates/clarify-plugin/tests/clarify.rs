@@ -127,6 +127,61 @@ fn answer(message: &str, at: u64) -> Answer {
 }
 
 #[tokio::test]
+async fn authored_question_has_real_anchor_no_fake_judgement_and_durable_unknown_result() {
+    let world = World::new();
+    let (kernel, admin) = world.open().await.unwrap();
+    let composing = begin(&admin, "authored", 1, 100).await;
+    let request = admin
+        .record_composition(&composing.id, 101, Ok("你更希望做什么？".into()))
+        .unwrap();
+    let before = world.raw().unwrap();
+    let mut stale = request.clone();
+    stale.question = Some("不相符的事实？".into());
+    assert!(
+        admin
+            .claim_decided(&stale, "卡在哪一步了？", "real-input", 200)
+            .is_err()
+    );
+    assert_eq!(world.raw().unwrap(), before);
+    let claimed = admin
+        .claim_decided(
+            &request,
+            "现在卡在加载，还是运行的时候？",
+            "real-input",
+            200,
+        )
+        .unwrap();
+    assert!(claimed.judgements.is_empty());
+    assert!(claimed.attempts[0].proactive);
+    assert_eq!(claimed.attempts[0].message_id, "real-input");
+    assert_eq!(
+        claimed.delivered_question(),
+        Some("现在卡在加载，还是运行的时候？")
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&world.raw().unwrap()).unwrap()["format_version"],
+        2
+    );
+    kernel.stop_all().await.unwrap();
+    let (kernel, admin) = world.open().await.unwrap();
+    let restored = admin
+        .snapshot()
+        .unwrap()
+        .requests
+        .into_iter()
+        .find(|r| r.id == request.id)
+        .unwrap();
+    assert_eq!(restored.status, ClarifyStatus::Unknown);
+    assert_eq!(restored.delivered_question(), claimed.delivered_question());
+    assert!(
+        admin
+            .claim_decided(&restored, "不重复问", "later-input", 300)
+            .is_err()
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
 async fn one_question_per_goal_revision_is_judged_per_message_delivered_and_answered() {
     let world = World::new();
     let (kernel, admin) = world.open().await.unwrap();
@@ -475,7 +530,7 @@ async fn corrupt_or_unknown_ledgers_are_refused_and_preserved() {
     let cases = vec![
         b"{\"format_version\":1,\"format_version\":1,\"requests\":[],\"preferences\":[]}".to_vec(),
         serde_json::to_vec(
-            &serde_json::json!({"format_version": 2, "requests": [], "preferences": []}),
+            &serde_json::json!({"format_version": 3, "requests": [], "preferences": []}),
         )
         .unwrap(),
         mutate(&|value| value["requests"][0]["id"] = "clarify-other".into()),

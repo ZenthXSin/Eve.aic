@@ -78,38 +78,33 @@ class ProgressNarrationAcceptance(developer.DeveloperAcceptance):
         self.assertEqual(self.receipt('private')['state'], 'Sent')
         self.assertEqual(self.receipt('group')['state'], 'Sent')
 
-    def test_private_ack_does_not_wait_for_a_blocked_progress_model(self):
-        self.response_gates[('progress', 1)] = 'release-progress'
+    def test_live_followup_is_persisted_without_an_automatic_ack_or_progress_model(self):
         release_tool = self.source / 'release-tool'
         tool_started = self.source / 'tool-started'
         script = self.source / 'wait-for-followup.py'
-        script.write_text('import pathlib,time\n'
-                          "pathlib.Path('tool-started').touch()\n"
-                          "gate=pathlib.Path('release-tool')\n"
-                          'deadline=time.monotonic()+25\n'
-                          'while not gate.exists():\n'
-                          ' assert time.monotonic()<deadline,"test tool gate timed out"\n'
-                          ' time.sleep(.01)\n'
-                          'print("followup acknowledged before tool completion")\n', encoding='utf8')
+        script.write_text("import pathlib,time\npathlib.Path('tool-started').touch()\n"
+                          "while not pathlib.Path('release-tool').exists(): time.sleep(.01)\n"
+                          "print('tool completed after new input was persisted')\n", encoding='utf8')
         def respond(body):
-            # 轮内追问会追加 user 消息；原工具回执仍属于同一轮，不能按最后 user 截断。
             results = [json.loads(m['content']) for m in body['messages'] if m['role'] == 'tool']
             if not results:
-                return dialogue.tool_response([('run_command', {'program': sys.executable,
-                    'args': [script.name]})])
-            self.assertTrue(results[-1].get('success'), results[-1])
-            self.assertIn('followup acknowledged before tool completion', results[-1]['stdout'])
-            return dialogue.text_response('原任务已完成')
+                return dialogue.tool_response([('run_command', {'program': sys.executable, 'args': [script.name]})])
+            self.assertTrue(results[0].get('success'), results[0])
+            self.assertIn('人呢', [m.get('content') for m in body['messages'] if m['role'] == 'user'])
+            if len(results) == 1:
+                return dialogue.tool_response([('send_message', {'text': '查完了，这一步通过了'})])
+            self.assertTrue(results[-1]['sent'])
+            return dialogue.text_response('内部结束')
         self.callback = respond
-        self.run_progress([{'send': self.message('running', '执行检查', expected='原任务已完成')},
-                           {'wait_file': str(tool_started)},
-                           {'wait_file': str(self.arrived('progress', 1))},
-                           {'send': self.message('followup', '人呢', contains='已把这条消息加入原任务')},
-                           self.wait_receipt('followup'),
-                           {'touch': str(release_tool)},
-                           {'touch': str(self.gate('release-progress'))}, self.wait_receipt('running')],
-                          env_extra={'EVE_QQ_LIVE_INTERACTION': 'true'})
-        self.assertEqual(self.receipt('followup')['state'], 'Sent')
+        self.run_progress([{'send': self.message('running', '执行检查') | {'expected_type': 'finish'}},
+            {'wait_file': str(tool_started)},
+            {'send': self.message('followup', '人呢') | {'expected_type': 'finish'}},
+            self.wait_receipt('followup', 'Merged'), {'touch': str(release_tool)},
+            self.wait_receipt('running', 'Handled')], env_extra={'EVE_QQ_LIVE_INTERACTION': 'true'})
+        self.assertFalse(self.narrations)
+        self.assertFalse(self.progress('followup'))
+        self.assertEqual([p['text'] for p in self.progress('running')], ['查完了，这一步通过了'])
+        self.assertFalse([e for e in self.events if e.get('type') in ('reply','segment')])
         sessions = self.documents()['eve.session']['sessions.v1']['sessions']
         self.assertEqual(sum(len(s['turns']) for s in sessions.values()), 1)
 
@@ -168,11 +163,12 @@ class ProgressNarrationAcceptance(developer.DeveloperAcceptance):
             self.assertTrue(result['session_id'])
             return dialogue.text_response('问题已经送达，独立检查也完成了。')
         self.callback = respond
-        self.run_progress(self.send(self.message('question', '先提问并继续独立检查', expected='问题已经送达，独立检查也完成了。')),
+        self.run_progress([{'send': self.message('question', '先提问并继续独立检查') | {'expected_type':'finish'}}, self.wait_receipt('question', 'Handled')],
                           env_extra={'EVE_QQ_LIVE_INTERACTION': 'true', 'EVE_PROGRESS_STAGE_UPDATES': 'false',
                                      'EVE_PROGRESS_SLOW_AFTER_MS': '0'})
         self.assertEqual([e['text'] for e in self.progress('question')], ['这个目录需要保留吗？'])
-        self.assertEqual(self.receipt('question')['state'], 'Sent')
+        self.assertEqual(self.receipt('question')['state'], 'Handled')
+        self.assertIsNone(self.receipt('question')['reply'])
 
     def test_file_queue_receipt_can_be_queried_with_actual_platform_and_session_ids(self):
         (self.source / 'artifact.txt').write_text('已验证的测试产物', encoding='utf-8')

@@ -1,8 +1,8 @@
 //! 表情包的 QQ 组合：从本轮收到的图片里收集候选，后台请视觉模型审看，
-//! 对话中用 `send_sticker` 按心情挑一张，通道在回复正文发完后作为图片发出。
+//! 对话中用 `send_sticker` 按心情挑一张，实时通道独立发送并等待实际回执。
 //!
 //! 只收消息里直接附带、下载成功且不超过 512 KiB 的图片；引用消息里的图片不收。审看前不会发出，
-//! 不是表情包的图片字节随即删除。挑选结果只在内存里等本条回复带走，进程退出即失效。
+//! 不是表情包的图片字节随即删除。旧通道兼容的附带选择仅保存在内存，不跨进程重放。
 use crate::AppError;
 use eve_config_api::{ConfigField, ConfigKind, ConfigSchema, ConfigService};
 use eve_llm_api::{
@@ -57,6 +57,7 @@ fn now_ms() -> u64 {
 pub(crate) struct Stickers {
     pub(crate) library: Arc<dyn StickerLibrary>,
     pub(crate) settings: OnceLock<Arc<dyn ConfigService>>,
+    pub(crate) live: Option<Arc<eve_qqbot_plugin::LiveDialogue>>,
     choices: Mutex<HashMap<(String, String), PathBuf>>,
 }
 
@@ -65,6 +66,7 @@ impl Stickers {
         Self {
             library,
             settings: OnceLock::new(),
+            live: None,
             choices: Mutex::new(HashMap::new()),
         }
     }
@@ -109,11 +111,11 @@ impl Tool for SendStickerTool {
         ToolDefinition {
             name: SEND_TOOL.into(),
             description: format!(
-                "在这条回复的文字后面跟一张表情包，像聊天时顺手发个表情。mood 只能是：{}。\
-                 只在气氛合适的闲聊里偶尔用，正式回答、认真讨论或用户不喜欢时不要用；一轮至多一张。\
+                "由你决定现在是否发一张表情包。mood 只能是：{}。\
+                 是否适合、何时发出由你结合气氛和用户偏好决定，不自动附加，也不重复发送同一张。\
                  宿主会自动查看用户直接附带、至多 512 KiB 的图片，由当前主模型审看，合适的表情包自动保存，不需要额外收藏工具；引用图片不收。\
                  action=status 可查询实际收集/发送开关与库存，不发送图片，此时无需 mood。默认 action=send，需要 mood；没有对应心情时返回 chosen=false。\
-                 正文里不要描述或预告这张表情包。",
+                 当前实时会话直接发送并等平台回执，只有 sent=true 且有 message_id 才确认送达；unknown 不重发；stale 表示新输入使旧决定失效。普通 final 不附加图片。正文里不要描述或预告这张表情包。",
                 MOODS.join("、")
             ),
             argument_schema: json!({
@@ -123,7 +125,7 @@ impl Tool for SendStickerTool {
             }),
             required_permissions: vec![],
             concurrency: Some(ToolConcurrency::Serial {
-                scope: "eve.qqbot.stickers".into(),
+                scope: "eve.qq.live-send".into(),
             }),
         }
     }
@@ -187,6 +189,15 @@ impl Tool for SendStickerTool {
                     json!({"chosen": false, "available_moods": self.0.library.moods().map_err(failed)?}),
                 );
             };
+            if let Some(live) = &self.0.live {
+                let description = choice.description.clone();
+                let mut result = live
+                    .send_image(choice.path, description.clone(), context)
+                    .await?;
+                result["chosen"] = json!(true);
+                result["description"] = json!(description);
+                return Ok(result);
+            }
             self.0
                 .choices
                 .lock()

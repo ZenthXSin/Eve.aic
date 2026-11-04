@@ -116,6 +116,313 @@ fn sent() -> DeliveryResult {
 }
 
 #[tokio::test]
+async fn expected_notice_claim_and_receipt_cannot_cross_attempts_or_resumed_endings() {
+    for cold in [false, true] {
+        let world = World::new();
+        let archive = world.archive();
+        let (kernel, tasks) = if cold {
+            world.cold(archive.clone()).await.unwrap()
+        } else {
+            world.open().await.unwrap()
+        };
+        let alice = owner("alice");
+        let task = tasks
+            .create_bounded(&alice, spec("等待条件后接续"), "expected-notice", 1000, 10)
+            .unwrap();
+        tasks.start(&task.id, 20).unwrap();
+        let mut frame = checkpoint("alice");
+        frame.result = Some("等待条件".into());
+        frame.remaining = None;
+        tasks.checkpoint(&task.id, frame, 900, 30).unwrap();
+        tasks
+            .finish(
+                &task.id,
+                TaskEnd::Blocked {
+                    result: "等待条件".into(),
+                },
+                usage(0),
+                40,
+            )
+            .unwrap();
+        let wrong_scope = TaskOwner {
+            session_id: "qq:another-session".into(),
+            ..alice.clone()
+        };
+        let before = world.raw();
+        assert_eq!(
+            tasks.claim_notice_expected(
+                &wrong_scope,
+                &task.id,
+                40,
+                0,
+                DeliveryChannel::Proactive,
+                50
+            ),
+            Err(TaskError::NotFound)
+        );
+        for (finish, attempts) in [(39, 0), (40, 1)] {
+            assert_eq!(
+                tasks.claim_notice_expected(
+                    &alice,
+                    &task.id,
+                    finish,
+                    attempts,
+                    DeliveryChannel::Proactive,
+                    50
+                ),
+                Err(TaskError::InvalidTransition)
+            );
+        }
+        assert_eq!(world.raw(), before, "旧判断不得先消耗一次尝试");
+        let claimed = tasks
+            .claim_notice_expected(&alice, &task.id, 40, 0, DeliveryChannel::Proactive, 50)
+            .unwrap();
+        assert_eq!(claimed.notice.as_ref().unwrap().attempts.len(), 1);
+        tasks
+            .record_delivery_expected(&alice, &task.id, 40, 1, DeliveryResult::NotSent, 60)
+            .unwrap();
+        tasks
+            .claim_notice_expected(
+                &alice,
+                &task.id,
+                40,
+                1,
+                DeliveryChannel::Passive {
+                    message_id: "new-input".into(),
+                },
+                65,
+            )
+            .unwrap();
+        let before = world.raw();
+        assert_eq!(
+            tasks.record_delivery_expected(&alice, &task.id, 40, 1, sent(), 66),
+            Err(TaskError::InvalidTransition)
+        );
+        assert_eq!(
+            world.raw(),
+            before,
+            "同一终态的第一条迟到回执不能结算第二次尝试"
+        );
+        tasks
+            .record_delivery_expected(&alice, &task.id, 40, 2, sent(), 66)
+            .unwrap();
+        tasks
+            .resume_blocked(&alice, &task.id, "条件已经满足", 70)
+            .unwrap();
+        tasks
+            .finish(
+                &task.id,
+                TaskEnd::Completed {
+                    result: "实际验证完成".into(),
+                },
+                usage(1),
+                80,
+            )
+            .unwrap();
+        let before = world.raw();
+        assert_eq!(
+            tasks.claim_notice_expected(&alice, &task.id, 40, 0, DeliveryChannel::Proactive, 90),
+            Err(TaskError::InvalidTransition)
+        );
+        assert_eq!(world.raw(), before);
+        tasks
+            .claim_notice_expected(&alice, &task.id, 80, 0, DeliveryChannel::Proactive, 90)
+            .unwrap();
+        let before = world.raw();
+        for (finish, attempts) in [(40, 1), (40, 2), (80, 2)] {
+            assert_eq!(
+                tasks.record_delivery_expected(&alice, &task.id, finish, attempts, sent(), 100),
+                Err(TaskError::InvalidTransition)
+            );
+        }
+        assert_eq!(
+            tasks.record_delivery_expected(&wrong_scope, &task.id, 80, 1, sent(), 100),
+            Err(TaskError::NotFound)
+        );
+        assert_eq!(world.raw(), before, "旧终态回执不能结算新终态的发送中通知");
+        let delivered = tasks
+            .record_delivery_expected(&alice, &task.id, 80, 1, sent(), 100)
+            .unwrap();
+        assert_eq!(
+            delivered.notice.as_ref().unwrap().status,
+            NoticeStatus::Delivered
+        );
+        kernel.stop_all().await.unwrap();
+        let (kernel, tasks) = if cold {
+            world.cold(archive).await.unwrap()
+        } else {
+            world.open().await.unwrap()
+        };
+        assert_eq!(tasks.get_owned(&alice, &task.id).unwrap(), Some(delivered));
+        let before = world.raw();
+        assert_eq!(
+            tasks.record_delivery_expected(&alice, &task.id, 40, 1, sent(), 110),
+            Err(TaskError::InvalidTransition)
+        );
+        assert_eq!(world.raw(), before);
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unknown_notice_results_settle_immediately_and_remain_unknown_after_restart() {
+    for cold in [false, true] {
+        for expected in [false, true] {
+            for outcome in [
+                DeliveryResult::Unknown,
+                DeliveryResult::Sent {
+                    platform_message_id: None,
+                },
+            ] {
+                let world = World::new();
+                let archive = world.archive();
+                let (kernel, tasks) = if cold {
+                    world.cold(archive.clone()).await.unwrap()
+                } else {
+                    world.open().await.unwrap()
+                };
+                let alice = owner("alice");
+                let task = tasks
+                    .create(&alice, spec("核验结束"), "unknown-result", 10)
+                    .unwrap();
+                tasks.start(&task.id, 20).unwrap();
+                tasks
+                    .finish(
+                        &task.id,
+                        TaskEnd::Completed {
+                            result: "实际结果".into(),
+                        },
+                        usage(1),
+                        30,
+                    )
+                    .unwrap();
+                tasks
+                    .claim_notice_expected(&alice, &task.id, 30, 0, DeliveryChannel::Proactive, 40)
+                    .unwrap();
+                let settled = if expected {
+                    tasks
+                        .record_delivery_expected(&alice, &task.id, 30, 1, outcome, 50)
+                        .unwrap()
+                } else {
+                    tasks.record_delivery(&task.id, outcome, 50).unwrap()
+                };
+                let notice = settled.notice.as_ref().unwrap();
+                assert_eq!(notice.status, NoticeStatus::Unknown);
+                assert_eq!(notice.attempts[0].result, Some(DeliveryResult::Unknown));
+                assert_eq!(notice.attempts[0].finished_at_ms, Some(50));
+                assert_eq!(notice.closed_at_ms, None);
+                assert!(tasks.delivery_snapshot().unwrap().due_proactive().is_none());
+                assert!(
+                    tasks
+                        .delivery_snapshot()
+                        .unwrap()
+                        .due_passive("alice", "next-input")
+                        .is_none()
+                );
+                let committed = world.raw();
+                kernel.stop_all().await.unwrap();
+                let (kernel, tasks) = if cold {
+                    world.cold(archive).await.unwrap()
+                } else {
+                    world.open().await.unwrap()
+                };
+                assert_eq!(tasks.get_owned(&alice, &task.id).unwrap(), Some(settled));
+                assert_eq!(world.raw(), committed);
+                assert_eq!(
+                    tasks.record_delivery_expected(&alice, &task.id, 30, 1, sent(), 60),
+                    Err(TaskError::InvalidTransition)
+                );
+                assert_eq!(
+                    tasks.claim_notice_expected(
+                        &alice,
+                        &task.id,
+                        30,
+                        1,
+                        DeliveryChannel::Passive {
+                            message_id: "next-input".into()
+                        },
+                        60
+                    ),
+                    Err(TaskError::InvalidTransition)
+                );
+                assert_eq!(world.raw(), committed);
+                kernel.stop_all().await.unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn uncertain_expected_notice_claim_closes_handle_and_recovers_only_persisted_attempt() {
+    for cold in [false, true] {
+        for after in [false, true] {
+            let world = World::new();
+            let archive = world.archive();
+            let (kernel, tasks) = if cold {
+                world.cold(archive.clone()).await.unwrap()
+            } else {
+                world.open().await.unwrap()
+            };
+            let alice = owner("alice");
+            let task = tasks
+                .create(&alice, spec("提交边界"), "expected-commit", 10)
+                .unwrap();
+            tasks.start(&task.id, 20).unwrap();
+            tasks
+                .finish(
+                    &task.id,
+                    TaskEnd::Completed {
+                        result: "完成".into(),
+                    },
+                    usage(1),
+                    30,
+                )
+                .unwrap();
+            let fail = if after {
+                &world.state.fail_after
+            } else {
+                &world.state.fail
+            };
+            fail.store(true, Ordering::SeqCst);
+            assert_eq!(
+                tasks.claim_notice_expected(
+                    &alice,
+                    &task.id,
+                    30,
+                    0,
+                    DeliveryChannel::Proactive,
+                    40
+                ),
+                Err(TaskError::Storage)
+            );
+            assert_eq!(tasks.snapshot().err(), Some(TaskError::Unavailable));
+            fail.store(false, Ordering::SeqCst);
+            kernel.stop_all().await.unwrap();
+            let (kernel, tasks) = if cold {
+                world.cold(archive).await.unwrap()
+            } else {
+                world.open().await.unwrap()
+            };
+            let restored = tasks.get_owned(&alice, &task.id).unwrap().unwrap();
+            let notice = restored.notice.unwrap();
+            assert_eq!(
+                notice.status,
+                if after {
+                    NoticeStatus::Unknown
+                } else {
+                    NoticeStatus::Pending
+                }
+            );
+            assert_eq!(notice.attempts.len(), usize::from(after));
+            if after {
+                assert_eq!(notice.attempts[0].result, Some(DeliveryResult::Unknown));
+            }
+            kernel.stop_all().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn local_delivery_records_one_receipt_and_replays_without_writing_after_restart() {
     let world = World::new();
     let (kernel, tasks) = world.open().await.unwrap();

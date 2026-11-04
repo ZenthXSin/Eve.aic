@@ -20,6 +20,8 @@ pub enum Delivery {
     Sent,
     Failed,
     Unknown,
+    /// 宿主已记录 Eve 选择不说；没有发送尝试，可以安全回收这条旧通知。
+    Suppressed,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,7 +78,7 @@ impl HealthWatch {
             _ => return Err("健康账本不可读或过大；保留原文件".into()),
         };
         let mut ids = BTreeSet::new();
-        if state.version != 1
+        if !matches!(state.version, 1 | 2)
             || state.next_id == 0
             || state.notices.len() > MAX_NOTICES
             || !validate_findings(&state.active)
@@ -89,6 +91,7 @@ impl HealthWatch {
                     || n.at_ms == 0
                     || n.findings.is_empty()
                     || !validate_findings(&n.findings)
+                    || (state.version == 1 && n.delivery == Delivery::Suppressed)
                     || (n.owner.is_some() != (n.delivery != Delivery::Pending))
                     || n.owner
                         .as_ref()
@@ -147,11 +150,12 @@ impl HealthWatch {
         next.active = findings;
         if !fresh.is_empty() {
             if next.notices.len() == MAX_NOTICES {
-                if let Some(i) = next
-                    .notices
-                    .iter()
-                    .position(|n| matches!(n.delivery, Delivery::Sent | Delivery::Failed))
-                {
+                if let Some(i) = next.notices.iter().position(|n| {
+                    matches!(
+                        n.delivery,
+                        Delivery::Sent | Delivery::Failed | Delivery::Suppressed
+                    )
+                }) {
                     next.notices.remove(i);
                 } else {
                     return Err("健康通知记录已满；旧记录保留，未覆盖".into());
@@ -172,16 +176,36 @@ impl HealthWatch {
         Ok(())
     }
     pub fn claim(&self, owner: ContextScope) -> Result<Option<Notice>, String> {
+        self.claim_inner(None, owner)
+    }
+
+    /// 只认领宿主已审视的那条事件；ID 或观察时间不符时不挑选其他通知。
+    pub fn claim_id(
+        &self,
+        id: &str,
+        expected_at_ms: u64,
+        owner: ContextScope,
+    ) -> Result<Option<Notice>, String> {
+        if id.is_empty() || expected_at_ms == 0 {
+            return Err("健康通知候选无效".into());
+        }
+        self.claim_inner(Some((id, expected_at_ms)), owner)
+    }
+
+    fn claim_inner(
+        &self,
+        expected: Option<(&str, u64)>,
+        owner: ContextScope,
+    ) -> Result<Option<Notice>, String> {
         if owner.session_id.is_empty() || owner.user_id.is_empty() {
             return Err("健康通知缺少可信身份".into());
         }
         let mut guard = self.state.lock().map_err(|_| "健康账本不可用")?;
         let mut next = guard.clone();
-        let Some(n) = next
-            .notices
-            .iter_mut()
-            .find(|n| n.delivery == Delivery::Pending)
-        else {
+        let Some(n) = next.notices.iter_mut().find(|n| {
+            n.delivery == Delivery::Pending
+                && expected.is_none_or(|(id, at_ms)| n.id == id && n.at_ms == at_ms)
+        }) else {
             return Ok(None);
         };
         n.owner = Some(owner);
@@ -190,6 +214,41 @@ impl HealthWatch {
         self.write(&next)?;
         *guard = next;
         Ok(Some(claimed))
+    }
+
+    /// 只结束指定的未发送通知，不制造平台回执；同一身份重复确认可幂等。
+    pub fn suppress(
+        &self,
+        id: &str,
+        expected_at_ms: u64,
+        owner: ContextScope,
+    ) -> Result<(), String> {
+        if id.is_empty()
+            || expected_at_ms == 0
+            || owner.session_id.is_empty()
+            || owner.user_id.is_empty()
+        {
+            return Err("健康通知决定缺少可信事件或身份".into());
+        }
+        let mut guard = self.state.lock().map_err(|_| "健康账本不可用")?;
+        let mut next = guard.clone();
+        let notice = next
+            .notices
+            .iter_mut()
+            .find(|notice| notice.id == id && notice.at_ms == expected_at_ms)
+            .ok_or("健康通知候选已变化")?;
+        if notice.delivery == Delivery::Suppressed && notice.owner.as_ref() == Some(&owner) {
+            return Ok(());
+        }
+        if notice.delivery != Delivery::Pending {
+            return Err("健康通知已认领或结算，不能改为安静".into());
+        }
+        notice.owner = Some(owner);
+        notice.delivery = Delivery::Suppressed;
+        next.version = 2;
+        self.write(&next)?;
+        *guard = next;
+        Ok(())
     }
     pub fn delivered(&self, id: &str, outcome: Delivery) -> Result<(), String> {
         if !matches!(
@@ -248,6 +307,179 @@ mod tests {
             user_id: "owner".into(),
         }
     }
+    #[test]
+    fn exact_claim_never_substitutes_the_first_pending_incident() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health.json");
+        let watch = HealthWatch::open(path.clone()).unwrap();
+        watch.check(&Source(true), 100, 1).unwrap();
+        watch.check(&Source(false), 101, 1).unwrap();
+        watch.check(&Source(true), 102, 1).unwrap();
+        let notices = watch.snapshot().unwrap().notices;
+        let first = &notices[0];
+        let selected = &notices[1];
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            watch
+                .claim_id("missing", selected.at_ms, owner())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            watch
+                .claim_id(&selected.id, selected.at_ms + 1, owner())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let claimed = watch
+            .claim_id(&selected.id, selected.at_ms, owner())
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, selected.id);
+        assert_eq!(claimed.delivery, Delivery::Sending);
+        assert_eq!(
+            watch.snapshot().unwrap().notices[0].delivery,
+            Delivery::Pending
+        );
+        assert!(
+            watch
+                .suppress(&selected.id, selected.at_ms, owner())
+                .is_err()
+        );
+        assert!(
+            watch
+                .claim_id(&selected.id, selected.at_ms, owner())
+                .unwrap()
+                .is_none()
+        );
+        watch.delivered(&selected.id, Delivery::Unknown).unwrap();
+        assert!(
+            watch
+                .suppress(&selected.id, selected.at_ms, owner())
+                .is_err()
+        );
+        assert_eq!(watch.claim(owner()).unwrap().unwrap().id, first.id);
+    }
+
+    #[test]
+    fn suppression_has_no_send_receipt_and_survives_restart_and_recovery_of_new_incidents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health.json");
+        let watch = HealthWatch::open(path.clone()).unwrap();
+        watch.check(&Source(true), 100, 1).unwrap();
+        let candidate = watch.snapshot().unwrap().notices[0].clone();
+        let before = std::fs::read(&path).unwrap();
+        assert!(watch.suppress(&candidate.id, 99, owner()).is_err());
+        assert!(
+            watch
+                .delivered(&candidate.id, Delivery::Suppressed)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        watch
+            .suppress(&candidate.id, candidate.at_ms, owner())
+            .unwrap();
+        let committed = std::fs::read(&path).unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&committed).unwrap();
+        assert_eq!(wire["version"], 2);
+        watch
+            .suppress(&candidate.id, candidate.at_ms, owner())
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+        let watch = HealthWatch::open(path.clone()).unwrap();
+        let suppressed = &watch.snapshot().unwrap().notices[0];
+        assert_eq!(suppressed.delivery, Delivery::Suppressed);
+        assert_eq!(suppressed.owner, Some(owner()));
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+        let other_owner = ContextScope {
+            session_id: "other-session".into(),
+            ..owner()
+        };
+        assert!(
+            watch
+                .suppress(&candidate.id, candidate.at_ms, other_owner)
+                .is_err()
+        );
+        assert!(watch.delivered(&candidate.id, Delivery::Sent).is_err());
+        assert!(
+            watch
+                .claim_id(&candidate.id, candidate.at_ms, owner())
+                .unwrap()
+                .is_none()
+        );
+        watch.check(&Source(true), 101, 1).unwrap();
+        assert!(watch.claim(owner()).unwrap().is_none());
+        watch.check(&Source(false), 102, 1).unwrap();
+        watch.check(&Source(true), 103, 1).unwrap();
+        let new = watch.claim(owner()).unwrap().unwrap();
+        assert_ne!(new.id, candidate.id);
+    }
+
+    #[test]
+    fn suppression_releases_capacity_without_reclaiming_unknown_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health.json");
+        let watch = HealthWatch::open(path.clone()).unwrap();
+        watch.check(&Source(true), 100, 1).unwrap();
+        let uncertain = watch.claim(owner()).unwrap().unwrap();
+        watch.delivered(&uncertain.id, Delivery::Unknown).unwrap();
+        for i in 1..=MAX_NOTICES + 1 {
+            let at = 100 + 2 * i as u64;
+            watch.check(&Source(false), at, 1).unwrap();
+            watch.check(&Source(true), at + 1, 1).unwrap();
+            let candidate = watch.snapshot().unwrap().notices.last().unwrap().clone();
+            watch
+                .suppress(&candidate.id, candidate.at_ms, owner())
+                .unwrap();
+        }
+        let watch = HealthWatch::open(path).unwrap();
+        let notices = watch.snapshot().unwrap().notices;
+        assert_eq!(notices.len(), MAX_NOTICES);
+        assert_eq!(notices[0].id, uncertain.id);
+        assert_eq!(notices[0].delivery, Delivery::Unknown);
+        assert!(
+            notices
+                .iter()
+                .skip(1)
+                .all(|notice| notice.delivery == Delivery::Suppressed)
+        );
+        assert!(watch.claim(owner()).unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_suppression_commit_leaves_candidate_pending_and_unknown_format_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("health.json");
+        let watch = HealthWatch::open(path.clone()).unwrap();
+        watch.check(&Source(true), 100, 1).unwrap();
+        let candidate = watch.snapshot().unwrap().notices[0].clone();
+        let pending = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            watch
+                .suppress(&candidate.id, candidate.at_ms, owner())
+                .is_err()
+        );
+        assert_eq!(
+            watch.snapshot().unwrap().notices[0].delivery,
+            Delivery::Pending
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, pending).unwrap();
+        watch
+            .suppress(&candidate.id, candidate.at_ms, owner())
+            .unwrap();
+        let mut invalid: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        invalid["version"] = 1.into();
+        let bytes = serde_json::to_vec(&invalid).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(HealthWatch::open(path.clone()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
     #[test]
     fn persistent_dedup_unknown_delivery_and_recovered_incident() {
         let dir = tempfile::tempdir().unwrap();

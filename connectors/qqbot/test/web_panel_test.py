@@ -58,7 +58,7 @@ class WebPanelAcceptance(unittest.TestCase):
         errors = self.work / f"web-errors-{self.runs}.txt"
         scenario.write_text(json.dumps({"script": script, "events_file": str(events), "error_file": str(errors)}))
         env = {key: os.environ[key] for key in ("PATH", "SystemRoot", "TEMP", "TMP") if key in os.environ}
-        env.update(QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret",
+        env.update(EVE_QQ_LIVE_INTERACTION="false", QQBOT_APP_SECRET="test-app-secret", EVE_OPENAI_API_KEY="test-model-secret",
                    EVE_OPENAI_BASE_URL=f"http://127.0.0.1:{self.server.server_port}", EVE_OPENAI_PROTOCOL="chat",
                    EVE_LLM_RESPONSE_MODE="complete", EVE_WEB_TOKEN=token)
         command = [str(support.BINARY), "--minimal-profile", "--state-dir", str(self.work / "state"), "--agent", str(support.ROOT / "AGENT.md"),

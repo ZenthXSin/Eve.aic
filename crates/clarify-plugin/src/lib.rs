@@ -79,6 +79,15 @@ impl ClarifyAdmin for ClarifyController {
     fn claim(&self, id: &str, message_id: &str, at_ms: u64) -> ClarifyResult<Clarification> {
         self.service()?.claim(id, message_id, at_ms)
     }
+    fn claim_decided(
+        &self,
+        expected: &Clarification,
+        text: &str,
+        anchor: &str,
+        at_ms: u64,
+    ) -> ClarifyResult<Clarification> {
+        self.service()?.claim_decided(expected, text, anchor, at_ms)
+    }
     fn record_delivery(
         &self,
         id: &str,

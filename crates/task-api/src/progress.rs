@@ -6,6 +6,88 @@ pub const TASK_PROGRESS_INTERVAL_MS: u64 = 30 * 60 * 1000;
 /// 同一范围滚动二十四小时最多四十八次进度通知；每个任务保留最近四十八条回执。
 pub const MAX_TASK_PROGRESS_NOTICES: usize = 48;
 
+/// 模型审视过的一份进度事实；只携带序号和摘要，不复制检查点或授予投递权限。
+/// 源账本认领时须在同一锁内重新计算，不能先认领再发现事实已经变化。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskProgressToken {
+    pub next_sequence: u64,
+    pub facts_revision: String,
+}
+
+impl TaskProgressToken {
+    pub fn from_task(task: &Task) -> TaskResult<Self> {
+        validate_id(&task.id)?;
+        validate_owner(&task.owner)?;
+        let execution = task
+            .execution
+            .as_ref()
+            .ok_or(TaskError::InvalidTransition)?;
+        let last = execution.progress_notices.last();
+        let next_sequence = last
+            .map_or(Some(1), |notice| notice.sequence.checked_add(1))
+            .ok_or(TaskError::LimitReached)?;
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+        digest.update(b"eve.task-progress-facts:v1\0");
+        // 流式计算完整事实摘要，大小不随检查点增长；通知回执独立，只纳入最后序号/回执。
+        let facts = (
+            (&task.id, &task.owner, &task.source, task.created_at_ms),
+            (
+                &task.spec.title,
+                task.spec.max_steps,
+                task.status,
+                task.cancel_requested,
+            ),
+            (task.started_at_ms, task.finished_at_ms, &task.usage),
+            (&task.result, &task.failure, &task.notice),
+            (
+                &execution.checkpoint,
+                execution.last_finished_at_ms,
+                execution.recoveries,
+                execution.resume_at_ms,
+                execution.deadline_at_ms,
+                execution.authorization_deadline_at_ms,
+            ),
+            last,
+        );
+        serde_json::to_writer(ProgressDigest(&mut digest), &facts)
+            .map_err(|_| TaskError::InvalidInput)?;
+        Ok(Self {
+            next_sequence,
+            facts_revision: digest
+                .finish()
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        })
+    }
+
+    pub fn validate(&self) -> TaskResult<()> {
+        if self.next_sequence == 0
+            || self.facts_revision.len() != 64
+            || !self
+                .facts_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(TaskError::InvalidInput);
+        }
+        Ok(())
+    }
+}
+
+struct ProgressDigest<'a>(&'a mut ring::digest::Context);
+impl std::io::Write for ProgressDigest<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskProgressNotice {

@@ -233,12 +233,37 @@ impl TrustedReview {
         self.read_checked(app, session, id).map(|(_, gap)| gap)
     }
 
+    /// 交流审视只读取指定消息的可信原话；不把旧历史缺口伪装成完整授权窗口。
+    pub(crate) fn original_text(
+        &self,
+        app: &str,
+        session: &SessionKey,
+        id: &str,
+    ) -> PluginResult<String> {
+        let (mut records, _) = self.read_records(app, session, id)?;
+        records.pop().and_then(|r| r.text).ok_or_else(unavailable)
+    }
+
     fn read_checked(
         &self,
         app: &str,
         session: &SessionKey,
         id: &str,
     ) -> PluginResult<(Vec<String>, bool)> {
+        let (records, legacy_gap) = self.read_records(app, session, id)?;
+        let originals = records
+            .into_iter()
+            .map(|record| record.text.ok_or_else(unavailable))
+            .collect::<PluginResult<Vec<_>>>()?;
+        Ok((originals, legacy_gap))
+    }
+
+    fn read_records(
+        &self,
+        app: &str,
+        session: &SessionKey,
+        id: &str,
+    ) -> PluginResult<(Vec<QqOriginalMessage>, bool)> {
         let state = self.0.lock().map_err(|_| unavailable())?;
         let binding = state.binding.as_ref().ok_or_else(unavailable)?;
         let records = state
@@ -264,11 +289,7 @@ impl TrustedReview {
         {
             return Err(unavailable());
         }
-        let originals = records
-            .into_iter()
-            .map(|record| record.text.ok_or_else(unavailable))
-            .collect::<PluginResult<Vec<_>>>()?;
-        Ok((originals, legacy_gap))
+        Ok((records, legacy_gap))
     }
 
     pub(crate) fn is_current(

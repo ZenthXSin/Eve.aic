@@ -35,6 +35,7 @@ fn public_tool(name: &str) -> bool {
             | "update_script_plugin"
             | "manage_failure_reproduction"
             | "send_message"
+            | "wait_for_input"
             | "clear_context"
             | "context_notes"
             | "save_preference"
@@ -279,6 +280,16 @@ pub(crate) struct GuardedOutreach {
     pub inner: Arc<dyn QqOutreach>,
     pub admin: Arc<Admin>,
 }
+pub(crate) struct ChannelToolPolicy;
+impl eve_llm_api::ToolScopePolicy for ChannelToolPolicy {
+    fn tools_allowed(&self, scope: &eve_llm_api::ContextScope) -> bool {
+        scope.user_id != crate::qq_group::USER
+    }
+    fn tool_allowed(&self, scope: &eve_llm_api::ContextScope, name: &str) -> bool {
+        !matches!(name, "send_message" | "wait_for_input" | "send_sticker")
+            || (scope.session_id.starts_with("qq:") && scope.session_id == scope.user_id)
+    }
+}
 impl GuardedOutreach {
     fn allowed(&self, session: &eve_session_api::SessionKey) -> bool {
         self.admin.is_operator(&eve_llm_api::ContextScope {
@@ -287,7 +298,106 @@ impl GuardedOutreach {
         })
     }
 }
+impl GuardedOutreach {
+    fn authored_allowed(&self, push: &QqOutreachPush) -> PluginResult<bool> {
+        let Some(session) = push.session.as_ref() else {
+            return Ok(false);
+        };
+        if push.user_id != "eve-chime"
+            || session.user_id != "eve-chime"
+            || !self.admin.business_permitted(&eve_llm_api::ContextScope {
+                session_id: session.session_id.clone(),
+                user_id: session.user_id.clone(),
+            })
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .inner
+            .group_chime(&push.message.id)?
+            .is_some_and(|meta| {
+                meta.session == *session
+                    && meta
+                        .anchor
+                        .as_deref()
+                        .is_some_and(eve_qqbot_plugin::valid_message_id)
+                    && meta.parts.as_slice() == [(push.message.text.clone(), 0)]
+            }))
+    }
+    fn candidate_allowed(&self, candidate: &eve_qqbot_plugin::QqOutreachCandidate) -> bool {
+        let fallback =
+            eve_session_api::SessionKey::new(&candidate.user_id, &candidate.user_id).ok();
+        candidate
+            .session
+            .as_ref()
+            .or(fallback.as_ref())
+            .is_some_and(|session| {
+                self.admin.business_permitted(&eve_llm_api::ContextScope {
+                    session_id: session.session_id.clone(),
+                    user_id: session.user_id.clone(),
+                }) && (self.allowed(session)
+                    || self.inner.ordinary_candidate(candidate).unwrap_or(false))
+            })
+    }
+}
 impl QqOutreach for GuardedOutreach {
+    fn authored_pushes(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> PluginResult<eve_qqbot_plugin::QqAuthoredPushPage> {
+        let mut page = self.inner.authored_pushes(after, limit)?;
+        if !page.valid(after, limit) {
+            return Err(eve_plugin_api::PluginError::State("群发言分页无效".into()));
+        }
+        page.pushes
+            .retain(|push| match self.authored_allowed(push) {
+                Ok(allowed) => allowed,
+                Err(_) => {
+                    eprintln!("Eve 群发言资料暂不可用");
+                    false
+                }
+            });
+        Ok(page)
+    }
+    fn next_authored_push(&self) -> PluginResult<Option<QqOutreachPush>> {
+        Ok(self.authored_pushes(None, 64)?.pushes.into_iter().next())
+    }
+    fn claim_authored_push(&self, expected: &QqOutreachPush) -> PluginResult<bool> {
+        if !self.authored_allowed(expected)? {
+            return Ok(false);
+        }
+        self.inner.claim_authored_push(expected)
+    }
+    fn candidates(&self) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
+        Ok(self
+            .inner
+            .candidates()?
+            .into_iter()
+            .filter(|c| self.candidate_allowed(c))
+            .collect())
+    }
+    fn claim_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+        text: &str,
+        _anchor: &str,
+    ) -> PluginResult<Option<QqOutreachPush>> {
+        if !self.candidate_allowed(candidate) {
+            return Ok(None);
+        }
+        self.inner.claim_candidate(candidate, text, _anchor)
+    }
+    fn silence_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+    ) -> PluginResult<()> {
+        if !self.candidate_allowed(candidate) {
+            return Ok(());
+        }
+        self.inner.silence_candidate(candidate)
+    }
+
     fn group_chime(
         &self,
         id: &str,

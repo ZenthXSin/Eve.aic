@@ -187,6 +187,92 @@ impl Monitor {
     }
 }
 impl QqOutreach for Monitor {
+    fn candidates(&self) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
+        self.check().map_err(error)?;
+        let owners: Vec<_> = self
+            .conversations
+            .recent_identities()?
+            .into_iter()
+            .filter(|i| {
+                self.admin.is_owner(&ContextScope {
+                    session_id: i.session.session_id.clone(),
+                    user_id: i.session.user_id.clone(),
+                })
+            })
+            .collect();
+        let Some(identity) = owners
+            .iter()
+            .find(|i| i.source == QqInteractionSource::DirectMessage)
+            .or_else(|| owners.first())
+        else {
+            return Ok(vec![]);
+        };
+        self.store.snapshot().map_err(error)?.notices.into_iter().filter(|n|n.delivery==Delivery::Pending).map(|notice|{
+            crate::qq_speech::candidate(notice.id.clone(),Some(identity.session.clone()),identity.session.user_id.clone(),serde_json::json!({"kind":"health_findings","at_ms":notice.at_ms,"findings":notice.findings}))
+        }).collect()
+    }
+    fn claim_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+        text: &str,
+        _anchor: &str,
+    ) -> PluginResult<Option<QqOutreachPush>> {
+        if !self.candidates()?.contains(candidate) {
+            return Ok(None);
+        }
+        let Some(session) = &candidate.session else {
+            return Ok(None);
+        };
+        let at = candidate.facts["at_ms"]
+            .as_u64()
+            .ok_or_else(|| error("健康候选缺少时点"))?;
+        let Some(notice) = self
+            .store
+            .claim_id(
+                &candidate.id,
+                at,
+                ContextScope {
+                    session_id: session.session_id.clone(),
+                    user_id: session.user_id.clone(),
+                },
+            )
+            .map_err(error)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(QqOutreachPush {
+            session: Some(session.clone()),
+            user_id: session.user_id.clone(),
+            message: QqOutreachMessage {
+                id: notice.id,
+                text: text.into(),
+            },
+        }))
+    }
+    fn silence_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+    ) -> PluginResult<()> {
+        if !self.candidates()?.contains(candidate) {
+            return Ok(());
+        }
+        let Some(session) = &candidate.session else {
+            return Ok(());
+        };
+        self.store
+            .suppress(
+                &candidate.id,
+                candidate.facts["at_ms"]
+                    .as_u64()
+                    .ok_or_else(|| error("健康候选缺少时点"))?,
+                ContextScope {
+                    session_id: session.session_id.clone(),
+                    user_id: session.user_id.clone(),
+                },
+            )
+            .map_err(error)
+    }
+
     fn due(&self, _: &SessionKey) -> PluginResult<bool> {
         Ok(false)
     }

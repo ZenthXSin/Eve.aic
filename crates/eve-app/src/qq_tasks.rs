@@ -355,9 +355,12 @@ impl Worker {
             tool_names
                 .iter()
                 .filter(|name| {
-                    name.as_str() == SUBAGENT_TOOL
+                    !matches!(
+                        name.as_str(),
+                        "send_message" | "wait_for_input" | "send_sticker"
+                    ) && (name.as_str() == SUBAGENT_TOOL
                         || name.as_str() == crate::qq_task_wait::TOOL_NAME
-                        || !ORCHESTRATION_TOOLS.contains(&name.as_str())
+                        || !ORCHESTRATION_TOOLS.contains(&name.as_str()))
                 })
                 .map(|name| {
                     Ok(ToolBinding {
@@ -398,7 +401,13 @@ impl Worker {
             .chain(
                 tool_names
                     .iter()
-                    .filter(|name| !ORCHESTRATION_TOOLS.contains(&name.as_str()))
+                    .filter(|name| {
+                        !ORCHESTRATION_TOOLS.contains(&name.as_str())
+                            && !matches!(
+                                name.as_str(),
+                                "send_message" | "wait_for_input" | "send_sticker"
+                            )
+                    })
                     .cloned(),
             )
             .collect::<Vec<_>>();
@@ -1665,6 +1674,86 @@ fn verify_delivery_claim(
 }
 
 impl QqOutreach for ChannelAdapter {
+    fn candidates(&self) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
+        let now = now_ms();
+        let mut snapshot = self.tasks.delivery_snapshot().map_err(plugin_error)?;
+        snapshot.validate().map_err(plugin_error)?;
+        snapshot
+            .tasks
+            .retain(|t| t.owner.session_id.starts_with("qq:"));
+        let overdue: Vec<_> = snapshot.overdue(now).map(|t| t.id.clone()).collect();
+        for id in &overdue {
+            self.tasks.expire(id, now).map_err(plugin_error)?;
+        }
+        let mut output = Vec::new();
+        // 逐个移除已取出的只读目录候选，沉默的首条不阻塞其他候选。
+        while let Some(entry) = snapshot.due_proactive().cloned() {
+            snapshot.tasks.retain(|t| t.id != entry.id);
+            if overdue.contains(&entry.id) {
+                continue;
+            }
+            let Some(task) = self
+                .tasks
+                .get_owned(&entry.owner, &entry.id)
+                .map_err(plugin_error)?
+            else {
+                continue;
+            };
+            if !entry.matches(&task) {
+                return Err(plugin_error(TaskError::CorruptState));
+            }
+            output.push(crate::qq_speech::candidate(task.id.clone(),Some(SessionKey{session_id:task.owner.session_id.clone(),user_id:task.owner.user_id.clone()}),task.owner.user_id.clone(),json!({
+                "kind":"background_task_result","id":task.id,"owner":task.owner,"source":task.source,"created_at_ms":task.created_at_ms,"finished_at_ms":task.finished_at_ms,
+                "attempt_count":task.notice.as_ref().map_or(0,|n|n.attempts.len()),"title":task.spec.title,"status":task.status,"result":task.result,"failure":task.failure,
+                "remaining":task.execution.as_ref().and_then(|e|e.checkpoint.as_ref()).and_then(|c|c.remaining.as_ref()),"needs_step_approval":task.needs_step_approval()
+            }))?);
+        }
+        Ok(output)
+    }
+    fn claim_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+        text: &str,
+        _anchor: &str,
+    ) -> PluginResult<Option<QqOutreachPush>> {
+        if !self.candidates()?.contains(candidate) {
+            return Ok(None);
+        }
+        let Some(session) = &candidate.session else {
+            return Ok(None);
+        };
+        let owner = TaskOwner {
+            session_id: session.session_id.clone(),
+            user_id: session.user_id.clone(),
+        };
+        let finish = candidate.facts["finished_at_ms"]
+            .as_u64()
+            .ok_or_else(|| plugin_error(TaskError::InvalidInput))?;
+        let count = candidate.facts["attempt_count"]
+            .as_u64()
+            .ok_or_else(|| plugin_error(TaskError::InvalidInput))? as usize;
+        let claimed = match self.tasks.claim_notice_expected(
+            &owner,
+            &candidate.id,
+            finish,
+            count,
+            DeliveryChannel::Proactive,
+            now_ms(),
+        ) {
+            Ok(t) => t,
+            Err(TaskError::InvalidTransition | TaskError::NotFound) => return Ok(None),
+            Err(e) => return Err(plugin_error(e)),
+        };
+        Ok(Some(QqOutreachPush {
+            session: Some(session.clone()),
+            user_id: claimed.owner.user_id,
+            message: QqOutreachMessage {
+                id: format!("{}:finish-{}:attempt-{}", candidate.id, finish, count + 1),
+                text: text.into(),
+            },
+        }))
+    }
+
     fn due(&self, session: &SessionKey) -> PluginResult<bool> {
         if session.session_id.starts_with("web:") {
             return Ok(false);
@@ -1756,6 +1845,15 @@ impl QqOutreach for ChannelAdapter {
     }
 
     fn delivered(&self, id: &str, result: QqOutreachResult) -> PluginResult<()> {
+        let exact = id.rsplit_once(":attempt-").and_then(|(prefix, count)| {
+            prefix.rsplit_once(":finish-").and_then(|(id, finish)| {
+                Some((
+                    id,
+                    finish.parse::<u64>().ok()?,
+                    count.parse::<usize>().ok()?,
+                ))
+            })
+        });
         let result = match result {
             QqOutreachResult::Sent {
                 platform_message_id,
@@ -1773,9 +1871,27 @@ impl QqOutreach for ChannelAdapter {
             QqOutreachResult::NotSent => DeliveryResult::NotSent,
             QqOutreachResult::Unknown => DeliveryResult::Unknown,
         };
-        self.tasks
-            .record_delivery(id, result, now_ms())
-            .map_err(plugin_error)?;
+        if let Some((id, finish, count)) = exact {
+            let snapshot = self.tasks.delivery_snapshot().map_err(plugin_error)?;
+            let Some(entry) = snapshot.tasks.iter().find(|t| t.id == id) else {
+                return Ok(());
+            };
+            match self.tasks.record_delivery_expected(
+                &entry.owner,
+                id,
+                finish,
+                count,
+                result,
+                now_ms(),
+            ) {
+                Ok(_) | Err(TaskError::InvalidTransition | TaskError::NotFound) => {}
+                Err(e) => return Err(plugin_error(e)),
+            }
+        } else {
+            self.tasks
+                .record_delivery(id, result, now_ms())
+                .map_err(plugin_error)?;
+        }
         Ok(())
     }
 }
