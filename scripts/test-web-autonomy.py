@@ -91,17 +91,7 @@ class WebAutonomyAcceptance(web_chat.WebChatAcceptance):
             str(web_chat.WEB), "--listen", "127.0.0.1:0", "--state-dir", str(self.work / "state"),
             "--agent", str(web_chat.ROOT / "AGENT.md")], cwd=self.source, env=env,
             stdout=subprocess.PIPE, stderr=self.log)
-        deadline = time.monotonic() + 25
-        while time.monotonic() < deadline:
-            lines = self.log_path.read_text().splitlines()
-            ready = next((line.split(" ", 1)[1] for line in lines
-                          if line.startswith("EVE_WEB_READY ")), None)
-            if ready:
-                self.url = ready
-                return
-            self.assertIsNone(self.child.poll(), self.log_path.read_text())
-            time.sleep(.02)
-        self.fail("默认 Web 宿主没有就绪：" + self.log_path.read_text())
+        self.wait_web_ready(timeout=25)
 
     def send_and_finish(self, text, number, conversation=CONVERSATION):
         request = self.request(text, conversation, format(number, "032x"))

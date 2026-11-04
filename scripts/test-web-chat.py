@@ -47,15 +47,27 @@ class WebChatAcceptance(developer.DeveloperAcceptance):
                    EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS='0', EVE_CONTEXT_COMPACT_AT_TOKENS='0')
         self.child = subprocess.Popen([str(WEB), '--listen','127.0.0.1:0', '--state-dir',str(self.work/'state'),
                                      '--agent',str(ROOT/'AGENT.md')], env=env, stdout=subprocess.PIPE, stderr=self.log)
-        # CI冷启动包含全部默认插件与持久后端；轮询真实就绪，期限内不重启掩盖失败。
-        deadline = time.monotonic()+30
+        self.wait_web_ready()
+
+    def wait_web_ready(self, timeout=30):
+        # stderr 的格式化写入可能拆成多个片段；未换行的端口不能作为就绪地址。
+        deadline = time.monotonic()+timeout
         while time.monotonic()<deadline:
-            lines=self.log_path.read_text().splitlines()
-            ready=next((line.split(' ',1)[1] for line in lines if line.startswith('EVE_WEB_READY ')),None)
-            if ready: self.url=ready; return
-            if self.child.poll() is not None: self.fail(self.log_path.read_text())
+            lines=self.log_path.read_text().splitlines(keepends=True)
+            ready=next((line.split(' ',1)[1].strip() for line in lines
+                        if line.endswith('\n') and line.startswith('EVE_WEB_READY ')),None)
+            if self.child.poll() is not None:
+                self.fail(f'Web 宿主提前退出 {self.child.returncode}：'+self.log_path.read_text())
+            if ready:
+                self.url=ready
+                try:
+                    status, _ = self.web('/api/chat')
+                    self.assertEqual(status, 200, self.log_path.read_text())
+                    return
+                except (urllib.error.URLError, TimeoutError):
+                    pass
             time.sleep(.02)
-        self.fail('Web 宿主没有就绪：'+self.log_path.read_text())
+        self.fail(f'Web 宿主没有就绪，退出码 {self.child.poll()}：'+self.log_path.read_text())
 
     def stop_web(self, graceful=False, signum=signal.SIGINT):
         if self.child and self.child.poll() is None:
