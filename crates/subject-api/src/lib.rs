@@ -6,6 +6,8 @@ mod opportunity;
 pub use opportunity::OpportunityAssessment;
 mod idle;
 pub use idle::*;
+mod self_interest;
+pub use self_interest::*;
 
 pub const SUBJECT_PLUGIN_ID: &str = "eve.subject";
 pub const SUBJECT_STATE_KEY: &str = "subject.v1";
@@ -182,6 +184,9 @@ pub enum SubjectClaim {
 
 /// 只交给可信宿主。模型工具须绑定 scope 的包装器，不能直接发布此管理能力。
 pub trait SubjectAdmin: Send + Sync {
+    fn idle_memory(&self) -> Option<std::sync::Arc<dyn IdleMemoryStore>> {
+        None
+    }
     fn enqueue(&self, input: SubjectEventInput, now_ms: u64) -> SubjectResult<SubjectEvent>;
     /// 兼容已有同步入口：原子记录已经处理的输入，不将它再次放入执行队列。
     fn observe_completed(

@@ -1223,7 +1223,9 @@ async fn run_qqbot_composed(
         } else {
             None
         };
-        let subject_plugin = eve_subject_plugin::SubjectPlugin::new()?;
+        let subject_plugin = eve_subject_plugin::SubjectPlugin::new()?.with_idle_memory(Arc::new(
+            eve_subject_sqlite::SqliteIdleMemory::open(&options.state_directory.join("self-interests.sqlite3"))?,
+        ));
         let subject: Arc<dyn eve_subject_api::SubjectAdmin> = Arc::new(subject_plugin.controller());
         kernel.register(Box::new(subject_plugin))?;
         let subject_admission = Arc::new(crate::qq_subject_admission::Admission(subject.clone()));

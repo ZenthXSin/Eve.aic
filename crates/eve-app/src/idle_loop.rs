@@ -65,6 +65,8 @@ pub(crate) const RULES: &str = concat!(
     r#"仅返回严格JSON，不要Markdown：{"choice":"wait|reflect|act","thought":"本次想法，最多1024 UTF8字节","reason":"选择理由，最多768字节","judgments":[{"key":"稳定问题键","statement":"判断，最多512字节","confidence":0,"evidence":["真实ID"],"revision_reason":"保留或修改判断的理由，最多512字节"}],"action":null,"revisit_after_minutes":30}。judgments最多4条。仅act时action为{"title":"最多120字节","goal":"最多2000字节","assessment":{"problem_key":"稳定问题键","expected_gain":"预期收益","verification":"实际验证方法","reuse_plan":"复用计划","benefit":80,"confidence":80,"cost":10,"risk":0,"evidence":["真实ID"]},"completion_contract":null}。"#,
     r#"若已能确定最终产物的真实验收条件，completion_contract填写{"kind":"receipts","contract":{"checks":[{"tool":"read_file","arguments":{"path":"工作区内相对文件路径"},"output_pointer":"/sha256","expected":"期望最终完整文件的64位小写SHA256"}],"require_final_batch":true}}。不能猜测哈希；无法确定时填null，宿主先用原预算规划并冻结合同。行动完成必须通过最后一个工具批次中的全部固定检查，该批次不能混有修改动作。不能用任意命令输出、参数回显、自述、Text或JSON正文宣称行动完成。合同只是候选验收数据，不授权工具或扩大身份、权限、预算；禁止在action或合同中添加授权字段。"#,
     r#"工程验证也可用固定的run_command检查，例如{"tool":"run_command","arguments":{"program":"cargo","args":["test","--lib","--locked"],"cwd":"."},"output_pointer":"/exit_code","expected":0}。宿主只接受受限cargo test/check/clippy或python3 -I -m unittest参数，必须明确冻结工作区内cwd；shell、任意脚本和输出伪造不能作验收。选择真正覆盖目标的测试，测试退出码仅证明该固定检查通过。"#,
+    r#"interests只是配置的探索方向；self_interests才是你从经历形成并保存的兴趣。不要把用户的爱好直接当成自己的，不必围绕固定领域，也不用每次提出工程任务。可返回interest_updates数组（最多2项），每项为{"key":"稳定主题键，最多64字节","topic":"主题，最多120字节","phase":"curious|active|resting|dropped","strength":60,"reason":"为什么吸引你或为什么暂缓、放下，最多384字节","want_to_try":"自己想尝试的具体小事，最多384字节","evidence":["当前经历ID"]}。curious表示想了解，active表示想继续，resting表示暂缓，dropped表示已放下；curious和active必须写want_to_try。没有更新时返回空数组，原兴趣继续保留；不要为显得有个性编造阅读、体验、身体感受或成果。"#,
+    r#"新兴趣和每次变化都须有当前材料中不同于原兴趣的新经历，并说明自己的理由；self_reflection类型只是以前的回顾，不能靠反复读自己的想法制造新经历或提高兴趣强度。沿用同主题的原key，不能换key复活已放下的兴趣。当前上下文最多展示8项，完整兴趣与修订历史另存，不能把没展示的当作不存在。interest_consumed标明当前证据中已用于该兴趣的来源，不能重复消费。行动由某项兴趣驱动时，在action加入interest_key，必须指向curious或active项，可以是本轮形成的兴趣。want_to_try与兴趣强度只帮助选择，不算任务授权，也不替代assessment和真实验收；已放下或暂缓的兴趣不借此自动派发行动。"#,
     "revisit_after_minutes为30至1440，全部JSON最多6000字节。",
 );
 
@@ -78,7 +80,9 @@ pub(crate) fn mind(snapshot: &SubjectSnapshot) -> SubjectResult<Mind> {
     let Some(focus) = snapshot.foci.iter().find(|f| f.id == MIND_ID) else {
         return Ok(Mind::default());
     };
-    let value: Mind = serde_json::from_str(&focus.goal).map_err(invalid)?;
+    let value: Mind =
+        serde_json::from_value(strict_json::from_slice(focus.goal.as_bytes()).map_err(invalid)?)
+            .map_err(invalid)?;
     if value.revision == 0
         || value.last_task.is_empty()
         || value.next_at_ms == 0
@@ -87,9 +91,40 @@ pub(crate) fn mind(snapshot: &SubjectSnapshot) -> SubjectResult<Mind> {
         return Err(SubjectError::CorruptState);
     }
     validate_judgments(&value.judgments).map_err(invalid)?;
+    validate_self_interests(&value.self_interests).map_err(invalid)?;
     Ok(value)
 }
 
+pub(crate) fn current_mind(
+    subject: &Arc<dyn SubjectAdmin>,
+    snapshot: &SubjectSnapshot,
+    scope: &SubjectScope,
+) -> SubjectResult<Mind> {
+    let previous = mind(snapshot)?;
+    let Some(store) = subject.idle_memory() else {
+        return if previous.archived {
+            Err(SubjectError::CorruptState)
+        } else {
+            Ok(previous)
+        };
+    };
+    let mut current = store.snapshot(scope)?;
+    if current.revision == 0 && previous.revision > 0 {
+        if previous.archived {
+            return Err(SubjectError::CorruptState);
+        }
+        store.import_legacy(scope, &previous)?;
+        current = store.snapshot(scope)?;
+    }
+    if current.revision < previous.revision
+        || (current.revision == previous.revision && current.last_task != previous.last_task)
+    {
+        return Err(SubjectError::CorruptState);
+    }
+    Ok(current)
+}
+
+#[cfg(test)]
 pub(crate) fn observation(
     snapshot: &SubjectSnapshot,
     tasks: &[Task],
@@ -97,24 +132,16 @@ pub(crate) fn observation(
     interests: &[String],
 ) -> SubjectResult<Observation> {
     let previous = mind(snapshot)?;
-    let mut evidence: Vec<_> = snapshot
-        .foci
-        .iter()
-        .rev()
-        .filter(|f| {
-            f.id != MIND_ID
-                && f.id != "autonomy-policy-v1"
-                && !f.id.starts_with("contract-")
-                && !f.goal.starts_with(IDLE_INPUT_PREFIX)
-        })
-        .take(6)
-        .map(|f| Evidence {
-            id: f.id.clone(),
-            kind: "focus".into(),
-            text: eve_task_api::bounded(&format!("{}\n{}", f.title, f.goal), 1200),
-            excerpt: true,
-        })
-        .collect();
+    observation_with_mind(snapshot, tasks, scope, interests, previous)
+}
+
+pub(crate) fn observation_with_mind(
+    snapshot: &SubjectSnapshot,
+    tasks: &[Task],
+    scope: &SubjectScope,
+    interests: &[String],
+    previous: Mind,
+) -> SubjectResult<Observation> {
     let mut recent: Vec<_> = tasks
         .iter()
         .filter(|t| {
@@ -124,10 +151,41 @@ pub(crate) fn observation(
         })
         .collect();
     recent.sort_by_key(|t| std::cmp::Reverse((t.finished_at_ms, &t.id)));
-    for task in recent.into_iter().take(4) {
+    let internal = |t: &&Task| {
+        t.source.starts_with(IDLE_TASK_SOURCE_PREFIX)
+            || t.source
+                .starts_with(crate::qq_subject::PLAN_TASK_SOURCE_PREFIX)
+    };
+    let last_reflection = recent.iter().copied().find(internal);
+    let mut evidence: Vec<_> = snapshot
+        .foci
+        .iter()
+        .rev()
+        .filter(|f| {
+            f.id != MIND_ID
+                && f.id != "autonomy-policy-v1"
+                && !f.id.starts_with("contract-")
+                && !f.goal.starts_with(IDLE_INPUT_PREFIX)
+                && !f.goal.starts_with(crate::qq_subject::PLAN_INPUT_PREFIX)
+        })
+        .take(6 - usize::from(last_reflection.is_some()))
+        .map(|f| Evidence {
+            id: f.id.clone(),
+            kind: "focus".into(),
+            text: eve_task_api::bounded(&format!("{}\n{}", f.title, f.goal), 1200),
+            excerpt: true,
+        })
+        .collect();
+    // 给最新一次回顾（含确认失败）单独留一个位置，不占四个实际行动结果名额。
+    for task in recent
+        .into_iter()
+        .filter(|t| !internal(t))
+        .take(4)
+        .chain(last_reflection)
+    {
         evidence.push(Evidence {
             id: task.id.clone(),
-            kind: "task_result".into(),
+            kind: if internal(&task) { "self_reflection" } else { "task_result" }.into(),
             text: {
                 let steps=crate::qq_task_diagnostics::task_step_tail(task,3);
                 serde_json::to_string(&serde_json::json!({"title":task.spec.title,"status":task.status,
@@ -144,6 +202,8 @@ pub(crate) fn observation(
         scope: scope.clone(),
         revision: previous.revision,
         interests: interests.to_vec(),
+        self_interests: previous.self_interests,
+        interest_consumed: Default::default(),
         evidence,
         judgments: previous.judgments,
     })
@@ -215,19 +275,35 @@ pub(crate) fn settle(
         task.result.as_deref().ok_or(SubjectError::CorruptState)?,
     )?;
     let snapshot = subject.snapshot_for(scope)?;
-    let previous = mind(&snapshot)?;
+    let previous = current_mind(subject, &snapshot, scope)?;
     if previous.last_task == task.id || input.revision < previous.revision {
+        if mind(&snapshot)?.revision < previous.revision {
+            save_mind_view(subject, scope, &previous, now)?;
+        }
         return Ok(result);
     }
     if input.revision != previous.revision {
         return Err(SubjectError::InvalidTransition);
     }
-    let previous = eve_subject_plugin::revise_idle_mind(previous, &result, &task.id, now)?;
+    let previous = match subject.idle_memory() {
+        Some(store) => store.commit(&input, &result, &task.id, now)?,
+        None => eve_subject_plugin::revise_idle_mind(previous, &result, &task.id, now)?,
+    };
+    save_mind_view(subject, scope, &previous, now)?;
+    Ok(result)
+}
+
+fn save_mind_view(
+    subject: &Arc<dyn SubjectAdmin>,
+    scope: &SubjectScope,
+    previous: &Mind,
+    now: u64,
+) -> SubjectResult<()> {
     let goal = serde_json::to_string(&previous).map_err(invalid)?;
     validate_focus(&SubjectFocus {
         id: MIND_ID.into(),
         scope: scope.clone(),
-        title: "空闲回顾与可修正判断".into(),
+        title: "自己的兴趣、想法与可修正判断".into(),
         goal: goal.clone(),
         task_id: None,
         status: FocusStatus::Blocked,
@@ -238,7 +314,7 @@ pub(crate) fn settle(
         SubjectFocus {
             id: MIND_ID.into(),
             scope: scope.clone(),
-            title: "空闲回顾与可修正判断".into(),
+            title: "自己的兴趣、想法与可修正判断".into(),
             goal,
             task_id: None,
             status: FocusStatus::Blocked,
@@ -247,7 +323,7 @@ pub(crate) fn settle(
         },
         now,
     )?;
-    Ok(result)
+    Ok(())
 }
 
 #[cfg(test)]

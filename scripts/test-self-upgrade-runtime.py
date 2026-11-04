@@ -737,6 +737,27 @@ while True:
         save()
         self.assertFalse(runtime.delivery_gate(path, request), '同文宿主命令不能冒充当前对话轮已结束')
 
+    def test_self_interests_changes_and_missing_database_invalidate_upgrade_gate(self):
+        import sqlite3
+        path = self.state / 'self-interests.sqlite3'
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute('PRAGMA journal_mode=WAL')
+            connection.execute('CREATE TABLE minds(revision INTEGER)')
+            connection.execute('INSERT INTO minds VALUES (1)')
+            connection.commit()
+            before = runtime.drain_stamp(self.state / 'state.json')
+            self.assertTrue(runtime.runtime_idle_gate(self.state / 'state.json'))
+            connection.execute('UPDATE minds SET revision=2')
+            connection.commit()
+            self.assertNotEqual(before, runtime.drain_stamp(self.state / 'state.json'))
+        finally:
+            connection.close()
+        path.with_suffix('.required').write_text('self-interests-v1\n')
+        path.unlink()
+        with self.assertRaisesRegex(ValueError, 'self_interests_database_missing'):
+            runtime.runtime_idle_gate(self.state / 'state.json')
+
     def test_speech_sqlite_wal_and_missing_marker_are_part_of_upgrade_gate(self):
         import sqlite3
         path = self.state / 'speech.sqlite3'

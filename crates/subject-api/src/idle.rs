@@ -1,5 +1,8 @@
 //! 空闲回顾的模型输出契约；想法、判断和行动提议均不构成授权或已验证事实。
-use crate::{OpportunityAssessment, SubjectError, SubjectResult, SubjectScope, validate_id};
+use crate::{
+    MAX_SELF_INTERESTS, OpportunityAssessment, SelfInterest, SelfInterestRecord, SubjectError,
+    SubjectResult, SubjectScope, validate_id, validate_self_interests,
+};
 use serde::{Deserialize, Serialize};
 
 pub const IDLE_INPUT_PREFIX: &str = "eve.idle.observation.v1\n";
@@ -29,6 +32,9 @@ pub struct IdleAction {
     pub title: String,
     pub goal: String,
     pub assessment: OpportunityAssessment,
+    /// 若由自己的兴趣驱动，关联当前兴趣键；不产生执行授权。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interest_key: Option<String>,
     /// 候选的冻结验收数据；宿主必须按任务契约严格校验，不构成权限或执行授权。
     /// 旧回顾缺少此字段仍可恢复，但须先规划并保存合同，不能直接执行无合同目标。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -42,6 +48,9 @@ pub struct IdleReflection {
     pub thought: String,
     pub reason: String,
     pub judgments: Vec<IdleJudgment>,
+    /// 旧回顾没有兴趣更新时保持原兴趣；空列表不表示遗忘。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interest_updates: Vec<SelfInterest>,
     pub action: Option<IdleAction>,
     /// 下一次回顾的间隔，三十分钟至一天；不改变原授权截止。
     pub revisit_after_minutes: u32,
@@ -54,6 +63,7 @@ impl IdleReflection {
             || !text(&self.reason, 768)
             || !(30..=1440).contains(&self.revisit_after_minutes)
             || self.judgments.len() > 4
+            || self.interest_updates.len() > 2
             || (self.choice == IdleChoice::Act) != self.action.is_some()
             || serde_json::to_vec(self)
                 .map_err(|_| SubjectError::InvalidInput)?
@@ -78,8 +88,21 @@ impl IdleReflection {
                 validate_id(evidence)?;
             }
         }
+        let mut interest_keys = std::collections::BTreeSet::new();
+        let mut interest_topics = std::collections::BTreeSet::new();
+        for interest in &self.interest_updates {
+            interest.validate()?;
+            if !interest_keys.insert(&interest.key)
+                || !interest_topics.insert(crate::self_interest_topic_key(&interest.topic))
+            {
+                return Err(SubjectError::InvalidInput);
+            }
+        }
         if let Some(action) = &self.action {
             action.assessment.validate()?;
+            if let Some(key) = &action.interest_key {
+                validate_id(key)?;
+            }
             if !text(&action.title, 120)
                 || !text(&action.goal, 2000)
                 || action.assessment.evidence.is_empty()
@@ -105,7 +128,13 @@ pub struct IdleEvidence {
 pub struct IdleObservation {
     pub scope: SubjectScope,
     pub revision: u64,
+    /// 授权配置中的探索方向，不等于 Eve 已经形成的喜好。
     pub interests: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub self_interests: Vec<SelfInterestRecord>,
+    /// 当前冻结材料中，哪些来源已被某项兴趣消费；完整去重历史由存储维护。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub interest_consumed: std::collections::BTreeMap<String, Vec<String>>,
     pub evidence: Vec<IdleEvidence>,
     pub judgments: Vec<IdleJudgment>,
 }
@@ -118,6 +147,11 @@ pub struct IdleMind {
     pub thought: String,
     pub reason: String,
     pub judgments: Vec<IdleJudgment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub self_interests: Vec<SelfInterestRecord>,
+    /// 历史已经保存在独立账本；缺失该账本时不能以当前视图重建历史。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 impl IdleObservation {
@@ -141,13 +175,30 @@ impl IdleObservation {
                 || evidence.text.len() > 16384
                 || !matches!(
                     evidence.kind.as_str(),
-                    "focus" | "task_result" | "completed_conversation"
+                    "focus" | "task_result" | "completed_conversation" | "self_reflection"
                 )
             {
                 return Err(SubjectError::InvalidInput);
             }
         }
-        validate_judgments(&self.judgments)
+        validate_judgments(&self.judgments)?;
+        if self.interest_consumed.len() > MAX_SELF_INTERESTS {
+            return Err(SubjectError::InvalidInput);
+        }
+        for (key, evidence) in &self.interest_consumed {
+            if !self.self_interests.iter().any(|r| &r.current.key == key)
+                || evidence.len() > 16
+                || evidence
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != evidence.len()
+                || evidence.iter().any(|id| !ids.contains(id))
+            {
+                return Err(SubjectError::InvalidInput);
+            }
+        }
+        validate_self_interests(&self.self_interests)
     }
 }
 pub fn validate_judgments(judgments: &[IdleJudgment]) -> SubjectResult<()> {

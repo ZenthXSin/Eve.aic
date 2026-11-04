@@ -387,6 +387,7 @@ dependencies = [
  "eve-subagent-profile-sqlite",
  "eve-subject-api",
  "eve-subject-plugin",
+ "eve-subject-sqlite",
  "eve-task-api",
  "eve-task-plugin",
  "eve-toolforge-api",
@@ -1437,6 +1438,19 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "eve-subject-sqlite"
+version = "0.1.0"
+dependencies = [
+ "eve-subject-api",
+ "eve-subject-plugin",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

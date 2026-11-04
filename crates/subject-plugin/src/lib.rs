@@ -1,6 +1,7 @@
 //! 单一主体的有界持久账本；执行能力仍由宿主注入，不直接执行模型或外部副作用。
 mod driver;
 mod idle;
+mod self_interest;
 pub use idle::{revise_idle_mind, validate_idle_reflection};
 mod opportunity;
 pub use opportunity::{Opportunity, decode_opportunity, encode_opportunity, select_opportunity};
@@ -58,6 +59,7 @@ struct Store {
 #[derive(Clone, Default)]
 pub struct SubjectController {
     active: Arc<Mutex<Option<Arc<Mutex<Store>>>>>,
+    idle_memory: Option<Arc<dyn IdleMemoryStore>>,
 }
 impl SubjectController {
     fn read<T>(&self, f: impl FnOnce(&Ledger) -> SubjectResult<T>) -> SubjectResult<T> {
@@ -118,6 +120,10 @@ impl SubjectPlugin {
     }
     pub fn controller(&self) -> SubjectController {
         self.controller.clone()
+    }
+    pub fn with_idle_memory(mut self, memory: Arc<dyn IdleMemoryStore>) -> Self {
+        self.controller.idle_memory = Some(memory);
+        self
     }
 }
 impl Plugin for SubjectPlugin {
@@ -188,6 +194,9 @@ impl Plugin for SubjectPlugin {
 }
 
 impl SubjectAdmin for SubjectController {
+    fn idle_memory(&self) -> Option<Arc<dyn IdleMemoryStore>> {
+        self.idle_memory.clone()
+    }
     fn enqueue(&self, input: SubjectEventInput, now_ms: u64) -> SubjectResult<SubjectEvent> {
         validate_input(&input)?;
         check_time(now_ms)?;

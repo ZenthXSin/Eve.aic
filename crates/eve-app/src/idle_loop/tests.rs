@@ -70,6 +70,104 @@ fn frozen_contract_authority_is_not_idle_evidence_or_part_of_the_focus_limit() {
     );
 }
 
+fn completed_task(id: &str, source: &str, at: u64) -> Task {
+    serde_json::from_value(json!({
+        "id":id,"source":source,
+        "owner":{"session_id":"private-owner","user_id":"owner"},
+        "spec":{"title":"保留的真实记录","instructions":"记录一次结果","max_steps":1},
+        "created_at_ms":1,"status":"Completed","cancel_requested":false,
+        "started_at_ms":1,"finished_at_ms":at,"usage":{"tool_calls":0,"model_requests":1},
+        "result":"已保存的结果","failure":null,"notice":null
+    }))
+    .unwrap()
+}
+
+#[test]
+fn repeated_reflection_cannot_displace_real_action_evidence() {
+    let scope = SubjectScope {
+        channel: "qq".into(),
+        conversation_id: "private-owner".into(),
+        principal_id: "owner".into(),
+    };
+    let mut tasks = vec![completed_task("actual-result", "subject-action:one", 2)];
+    for n in 0..12 {
+        tasks.push(completed_task(
+            &format!("review-{n}"),
+            &format!("{IDLE_TASK_SOURCE_PREFIX}{n}"),
+            10 + n,
+        ));
+        tasks.push(completed_task(
+            &format!("plan-{n}"),
+            &format!("{}{n}", crate::qq_subject::PLAN_TASK_SOURCE_PREFIX),
+            30 + n,
+        ));
+    }
+    let mut foreign = completed_task("other-window", "subject-action:other", 50);
+    foreign.owner.session_id = "other".into();
+    tasks.push(foreign);
+    let snapshot = SubjectSnapshot {
+        events: vec![],
+        foci: vec![],
+    };
+    let observed = observation(&snapshot, &tasks, &scope, &["自己探索".into()]).unwrap();
+    assert_eq!(observed.evidence.len(), 2);
+    assert_eq!(observed.evidence[0].id, "actual-result");
+    assert_eq!(observed.evidence[0].kind, "task_result");
+    assert_eq!(observed.evidence[1].kind, "self_reflection");
+}
+
+#[tokio::test]
+async fn committed_mind_repairs_its_projection_once_and_keeps_original_deadline() {
+    use eve_kernel::{Kernel, KernelServices};
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        eve_subject_sqlite::SqliteIdleMemory::open(&temp.path().join("interests.sqlite3")).unwrap(),
+    );
+    let input_text = input();
+    let observed: Observation =
+        serde_json::from_str(input_text.strip_prefix(IDLE_INPUT_PREFIX).unwrap()).unwrap();
+    let output = json!({"choice":"reflect","thought":"继续考虑图案规则","reason":"实际经历带来新想法","judgments":[],"action":null,"revisit_after_minutes":30,
+        "interest_updates":[{"key":"patterns","topic":"图案规则","phase":"curious","strength":60,"reason":"想了解变化","want_to_try":"比较不同规则","evidence":["evidence-1"]}]});
+    let reflection: IdleReflection = serde_json::from_value(output.clone()).unwrap();
+    let committed = store
+        .commit(&observed, &reflection, "review-1", 100)
+        .unwrap();
+    let plugin = eve_subject_plugin::SubjectPlugin::new()
+        .unwrap()
+        .with_idle_memory(store.clone());
+    let admin: Arc<dyn SubjectAdmin> = Arc::new(plugin.controller());
+    let kernel = Kernel::with_services(KernelServices::default());
+    kernel.register(Box::new(plugin)).unwrap();
+    kernel.start_all().await.unwrap();
+    // 模拟数据库已提交、主体关注还没落盘时进程中断。
+    assert!(admin.snapshot_for(&observed.scope).unwrap().foci.is_empty());
+    let mut task = completed_task("review-1", &format!("{IDLE_TASK_SOURCE_PREFIX}one"), 100);
+    task.result = Some(output.to_string());
+    task.spec.context = Some(eve_task_api::DelegatedContext {
+        owner: task.owner.clone(),
+        messages_json: serde_json::to_string(&vec![ChatMessage::text(
+            eve_llm_api::ChatRole::Assistant,
+            input_text,
+        )])
+        .unwrap(),
+    });
+    settle(&admin, &observed.scope, &task, 200).unwrap();
+    settle(&admin, &observed.scope, &task, 1000).unwrap();
+    let restored = mind(&admin.snapshot_for(&observed.scope).unwrap()).unwrap();
+    assert_eq!(restored.revision, 1);
+    assert!(restored.archived);
+    assert_eq!(restored.next_at_ms, committed.next_at_ms);
+    assert_eq!(
+        store
+            .history(&observed.scope, "patterns", 0, 8)
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    kernel.stop_all().await.unwrap();
+}
+
 fn reflection() -> Value {
     json!({
         "choice":"act","thought":"已有真实记录支持继续验证","reason":"验证最终产物",
@@ -112,6 +210,59 @@ fn legacy_idle_action_remains_a_proposal_awaiting_a_frozen_contract() {
                 .is_none(),
             "旧提议不能被自动改写为 Unspecified 执行合同"
         );
+    }
+}
+
+#[test]
+fn corrupt_self_interest_state_is_not_treated_as_an_empty_mind() {
+    let scope = SubjectScope {
+        channel: "qq".into(),
+        conversation_id: "private-owner".into(),
+        principal_id: "owner".into(),
+    };
+    let interest = json!({
+        "current":{"key":"patterns","topic":"规则图案","phase":"curious","strength":60,
+            "reason":"想了解规律","want_to_try":"比较两个小实验","evidence":["evidence-1"]},
+        "revision":1,"first_recorded_at_ms":100,"updated_at_ms":100,
+        "consumed_evidence":["evidence-1"]
+    });
+    let valid = json!({"revision":1,"last_task":"review-1","next_at_ms":200,
+        "thought":"想了解规律","reason":"实际交流带来的好奇","judgments":[],
+        "self_interests":[interest]})
+    .to_string();
+    let snapshot = |goal: String| SubjectSnapshot {
+        events: vec![],
+        foci: vec![SubjectFocus {
+            id: MIND_ID.into(),
+            scope: scope.clone(),
+            title: "自己的兴趣".into(),
+            goal,
+            task_id: None,
+            status: FocusStatus::Blocked,
+            next_check_at_ms: 200,
+            updated_at_ms: 100,
+        }],
+    };
+    let observed =
+        observation(&snapshot(valid.clone()), &[], &scope, &["探索方向".into()]).unwrap();
+    assert_eq!(observed.self_interests[0].current.topic, "规则图案");
+    assert!(observed.evidence.is_empty(), "自己的兴趣账本不是一次新经历");
+    let cases = [
+        valid.replace("\"phase\":\"curious\"", "\"phase\":\"unknown\""),
+        valid.replace("\"strength\":60", "\"strength\":101"),
+        valid.replace("\"revision\":1", "\"revision\":0"),
+        valid.replace(
+            "\"consumed_evidence\":[\"evidence-1\"]",
+            "\"consumed_evidence\":[]",
+        ),
+        valid.replace("\"strength\":60", "\"strength\":100,\"strength\":60"),
+    ];
+    for damaged in cases {
+        assert_ne!(damaged, valid);
+        assert!(matches!(
+            mind(&snapshot(damaged)),
+            Err(SubjectError::CorruptState)
+        ));
     }
 }
 
