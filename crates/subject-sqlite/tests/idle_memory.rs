@@ -38,14 +38,14 @@ fn reflection(key: &str, evidence: &str, n: u64) -> IdleReflection {
         interest_updates: vec![SelfInterest {
             key: key.into(),
             topic: format!("规则-{key}"),
-            phase: if n % 2 == 0 {
+            phase: if n.is_multiple_of(2) {
                 SelfInterestPhase::Active
             } else {
                 SelfInterestPhase::Resting
             },
             strength: 60,
             reason: format!("第{n}次实际比较改变了看法"),
-            want_to_try: if n % 2 == 0 {
+            want_to_try: if n.is_multiple_of(2) {
                 "比较另一种规则".into()
             } else {
                 String::new()
