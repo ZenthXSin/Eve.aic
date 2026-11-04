@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location("release_portable", pathlib.Path(__file__).with_name("release-portable.py"))
 release = importlib.util.module_from_spec(SPEC)
@@ -151,6 +152,59 @@ class ReleaseTests(unittest.TestCase):
             with self.subTest(runs=runs), self.assertRaises((ValueError, TimeoutError)):
                 release.wait_for_ci(github, SOURCE, timeout=0)
             self.assertFalse(any(method == "POST" for method, _, _ in github.calls))
+
+    def test_slow_successful_ci_is_still_waited_for_after_twenty_minutes(self):
+        github = FakeGitHub()
+        github.ci[0].update(status="in_progress", conclusion=None)
+        clock = [0]
+
+        def advance(seconds):
+            clock[0] += seconds
+            if clock[0] >= 45 * 60:
+                github.ci[0].update(status="completed", conclusion="success")
+
+        with patch.object(release.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(release.time, "sleep", side_effect=advance):
+            self.assertTrue(release.wait_for_ci(github, SOURCE))
+        self.assertGreater(clock[0], 20 * 60)
+        self.assertFalse(any(method != "GET" for method, _, _ in github.calls))
+
+    def test_waiting_still_has_a_deadline_and_does_not_publish(self):
+        github = FakeGitHub()
+        github.ci[0].update(status="in_progress", conclusion=None)
+        clock = [0]
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        with patch.object(release.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(release.time, "sleep", side_effect=advance), \
+                self.assertRaises(TimeoutError):
+            release.wait_for_ci(github, SOURCE)
+        self.assertEqual(clock[0], release.CI_WAIT_SECONDS)
+        self.assertFalse(github.refs)
+        self.assertIsNone(github.published)
+
+    def test_failed_or_superseded_ci_stops_during_wait(self):
+        for change in ("failed", "updated"):
+            with self.subTest(change=change):
+                github = FakeGitHub()
+                github.ci[0].update(status="in_progress", conclusion=None)
+
+                def change_state(_):
+                    if change == "failed":
+                        github.ci[0].update(status="completed", conclusion="failure")
+                    else:
+                        github.head = OTHER
+
+                with patch.object(release.time, "sleep", side_effect=change_state):
+                    if change == "failed":
+                        with self.assertRaises(ValueError):
+                            release.wait_for_ci(github, SOURCE)
+                    else:
+                        self.assertFalse(release.wait_for_ci(github, SOURCE))
+                self.assertFalse(github.refs)
+                self.assertIsNone(github.published)
 
     def test_latest_filtered_workflow_failure_blocks_publication(self):
         github = FakeGitHub()

@@ -13,6 +13,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 TAG = re.compile(r"v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[A-Za-z0-9][A-Za-z0-9.-]*)?")
 LABELS = {"windows-x64", "windows-arm64", "linux-x64", "linux-arm64"}
 CI_NAMES = {"Rust 持续集成", "QQBot 通道离线验收", "PostgreSQL 状态与宿主验收", "自动性能测试"}
+# 最慢的主线 Windows CI 允许 55 分钟；等满原 CI 窗口后再判定超时。
+CI_WAIT_SECONDS = 60 * 60
 
 
 def validate_tag(tag):
@@ -120,7 +122,7 @@ def verify(folder, tag, source):
     return [*archives, sums, evidence]
 
 
-def wait_for_ci(client, source, timeout=1200):
+def wait_for_ci(client, source, timeout=CI_WAIT_SECONDS):
     deadline = time.monotonic() + timeout
     while True:
         if client.api("git/ref/heads/main")["object"]["sha"] != source:
