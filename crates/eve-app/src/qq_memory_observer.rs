@@ -64,23 +64,37 @@ impl QqInteractionObserver for Observer {
             .ok()
             .and_then(|value| u64::try_from(value.as_millis()).ok())
             .ok_or_else(failure)?;
-        let saved = self
-            .memory
-            .import_completed(
+        let explicit = snapshot
+            .turns
+            .iter()
+            .find(|turn| turn.id == interaction.turn_id())
+            .is_some_and(|turn| {
+                matches!(&turn.status,
+                eve_session_api::SessionTurnStatus::Completed { messages }
+                    if messages.last().is_some_and(|m| m.internal_only))
+            });
+        let evidence = CompletedInteraction {
+            evidence_id: format!("qq-interaction-{id}"),
+            message_id: interaction.message_id().into(),
+            at_ms,
+            snapshot,
+            turn_id: interaction.turn_id(),
+        };
+        let saved = if explicit {
+            self.memory.import_delivered(
                 &scope,
                 before.revision,
-                CompletedInteraction {
-                    evidence_id: format!("qq-interaction-{id}"),
-                    message_id: interaction.message_id().into(),
-                    at_ms,
-                    snapshot,
-                    turn_id: interaction.turn_id(),
-                },
+                evidence,
+                interaction.assistant_text().into(),
             )
-            .map_err(|error| match error {
-                MemoryError::LimitReached => refused(),
-                _ => failure(),
-            })?;
+        } else {
+            self.memory
+                .import_completed(&scope, before.revision, evidence)
+        }
+        .map_err(|error| match error {
+            MemoryError::LimitReached => refused(),
+            _ => failure(),
+        })?;
         if saved.scope != scope {
             return Err(failure());
         }

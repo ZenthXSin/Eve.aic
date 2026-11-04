@@ -744,6 +744,7 @@ impl StoredMemory {
         scope: &MemoryScope,
         expected: u64,
         interaction: CompletedInteraction,
+        assistant_text: Option<String>,
     ) -> MemoryResult<MemorySnapshot> {
         self.mutate(scope, |record, archived| {
             interaction
@@ -764,10 +765,14 @@ impl StoredMemory {
             let SessionTurnStatus::Completed { messages } = &turn.status else {
                 return Err(MemoryError::InvalidInput);
             };
-            let reply = messages
-                .last()
-                .and_then(|message| message.text.as_ref())
-                .ok_or(MemoryError::InvalidInput)?;
+            let reply = match &assistant_text {
+                Some(delivered) => delivered,
+                None => messages
+                    .last()
+                    .filter(|message| !message.internal_only)
+                    .and_then(|message| message.text.as_ref())
+                    .ok_or(MemoryError::InvalidInput)?,
+            };
             record.import(
                 expected,
                 InteractionEvidence {

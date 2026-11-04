@@ -95,6 +95,62 @@ fn statement(operation: &str, evidence: &str, id: &str, text: &str) -> Preferenc
 }
 
 #[tokio::test]
+async fn delivered_text_is_imported_without_treating_internal_final_as_speech() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = RecordingStore::open(directory.path());
+    let (kernel, admin, sessions) = open(store.clone()).await;
+    let scope = scope("explicit", "alice");
+    let begun = sessions
+        .begin(SessionInput {
+            key: key(&scope),
+            text: "看看".into(),
+        })
+        .unwrap();
+    sessions
+        .complete(
+            &begun.lease,
+            vec![
+                ChatMessage::text(ChatRole::User, "看看"),
+                ChatMessage::internal_text("绝不能记成已说的草稿"),
+            ],
+        )
+        .unwrap();
+    let snapshot = sessions.snapshot(&key(&scope)).unwrap().unwrap();
+    let evidence = interaction("delivered", snapshot.clone(), begun.lease.turn_id);
+    assert_eq!(
+        admin.import_completed(&scope, 0, evidence.clone()),
+        Err(MemoryError::InvalidInput)
+    );
+    let saved = admin
+        .import_delivered(&scope, 0, evidence.clone(), "实际说的话".into())
+        .unwrap();
+    let EvidenceSource::CompletedInteraction { assistant_text, .. } = &saved.evidence[0].source
+    else {
+        panic!("missing completed evidence");
+    };
+    assert_eq!(assistant_text, "实际说的话");
+    assert_eq!(sessions.snapshot(&key(&scope)).unwrap().unwrap(), snapshot);
+    let writes = store.writes();
+    assert_eq!(
+        admin
+            .import_delivered(&scope, 0, evidence.clone(), "实际说的话".into())
+            .unwrap(),
+        saved
+    );
+    assert_eq!(store.writes(), writes);
+    assert_eq!(
+        admin.import_delivered(&scope, 1, evidence.clone(), "换掉已说的话".into()),
+        Err(MemoryError::Conflict)
+    );
+    assert_eq!(
+        admin.import_delivered(&scope, 1, evidence, String::new()),
+        Err(MemoryError::InvalidInput)
+    );
+    assert_eq!(admin.reader(scope).unwrap().snapshot().unwrap(), saved);
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
 async fn host_scope_enumeration_only_returns_durable_scopes_without_creating_or_writing() {
     let directory = tempfile::tempdir().unwrap();
     let store = RecordingStore::open(directory.path());

@@ -821,6 +821,18 @@ async fn explicit_expression_keeps_one_choice_inside_the_total_budget() {
     assert_eq!(work.starts.lock().unwrap().len(), 1);
     assert_eq!(send.starts.lock().unwrap().len(), 1);
     let requests = provider.requests.lock().unwrap();
+    let first_system = requests[0]
+        .messages
+        .iter()
+        .rfind(|m| m.role == ChatRole::System)
+        .unwrap()
+        .text
+        .as_ref()
+        .unwrap();
+    assert!(first_system.contains("本次即时通讯输出选择："));
+    assert!(first_system.contains("{\"action\":\"silence\"}"));
+    assert!(first_system.contains("业务工具继续执行"));
+    assert!(!first_system.contains("调用 wait_for_input"));
     assert_eq!(
         requests[1]
             .tools
@@ -830,6 +842,146 @@ async fn explicit_expression_keeps_one_choice_inside_the_total_budget() {
         vec!["send_message"]
     );
     assert!(requests[2].tools.is_empty());
+    assert!(
+        !requests[1]
+            .messages
+            .last()
+            .unwrap()
+            .text
+            .as_ref()
+            .unwrap()
+            .contains("业务工具继续执行")
+    );
+    assert!(
+        !requests[2]
+            .messages
+            .last()
+            .unwrap()
+            .text
+            .as_ref()
+            .unwrap()
+            .contains("本次即时通讯输出选择：")
+    );
+    assert!(
+        requests[1]
+            .messages
+            .last()
+            .unwrap()
+            .text
+            .as_ref()
+            .unwrap()
+            .contains("当前只提供预算内的 send_message")
+    );
+    assert!(
+        requests[2]
+            .messages
+            .last()
+            .unwrap()
+            .text
+            .as_ref()
+            .unwrap()
+            .contains("只依据已有回执保存内部结束记录")
+    );
+    assert!(output.transcript.last().unwrap().internal_only);
+}
+
+#[tokio::test]
+async fn batch_limit_retains_expression_protocol_without_executing_more_work() {
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("work", "echo", json!({}))]),
+        tool_response(vec![call("stopped-work", "echo", json!({}))]),
+        tool_response(vec![call(
+            "say",
+            "send_message",
+            json!({"text":"还有未完成的事"}),
+        )]),
+        final_response("本轮内部结束"),
+    ]);
+    let work = Arc::new(TestTool::new("echo", None, ToolMode::Echo));
+    let send = Arc::new(TestTool::new("send_message", None, ToolMode::Echo));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![work.clone(), send.clone()],
+        LlmHostConfig {
+            max_tool_calls: 10,
+            max_tool_rounds: 1,
+            final_answer_on_round_limit: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let out = host.run_turn(turn()).await.unwrap();
+    assert_eq!(work.starts.lock().unwrap().len(), 1);
+    assert_eq!(send.starts.lock().unwrap().len(), 1);
+    assert_eq!(out.diagnostics.started_tools, 2);
+    assert!(out.transcript.last().unwrap().internal_only);
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(
+        requests[2]
+            .tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["send_message"]
+    );
+    assert!(
+        requests[2]
+            .messages
+            .last()
+            .unwrap()
+            .text
+            .as_ref()
+            .unwrap()
+            .contains("当前只提供预算内的 send_message")
+    );
+}
+
+#[tokio::test]
+async fn expression_fallback_records_internal_state_without_claiming_user_notification() {
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call(
+            "say",
+            "send_message",
+            json!({"text":"这一条才发送"}),
+        )]),
+        tool_response(vec![call(
+            "over-limit",
+            "send_message",
+            json!({"text":"不会执行"}),
+        )]),
+        final_response("内部记录未完成事项"),
+    ]);
+    let send = Arc::new(TestTool::new("send_message", None, ToolMode::Echo));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![send.clone()],
+        LlmHostConfig {
+            max_tool_calls: 1,
+            max_tool_rounds: 0,
+            final_answer_on_round_limit: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let out = host.run_turn(turn()).await.unwrap();
+    assert_eq!(send.starts.lock().unwrap().len(), 1);
+    assert!(out.transcript.last().unwrap().internal_only);
+    let requests = provider.requests.lock().unwrap();
+    assert!(requests[2].tools.is_empty());
+    assert!(
+        requests[2].messages[0]
+            .text
+            .as_ref()
+            .unwrap()
+            .contains("不会发送给对方")
+    );
+    assert!(
+        !requests[2].messages[0]
+            .text
+            .as_ref()
+            .unwrap()
+            .contains("向原会话用户汇报")
+    );
 }
 
 #[tokio::test]
@@ -846,6 +998,49 @@ async fn final_is_allowed_to_stay_silent_and_does_not_invoke_expression() {
         0
     );
     assert!(send.starts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn expression_choice_tracks_available_wait_and_keeps_receipts_and_context_intact() {
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("listen", "wait_for_input", json!({}))]),
+        final_response("{\"action\":\"silence\"}"),
+    ]);
+    let send = Arc::new(TestTool::new("send_message", None, ToolMode::Echo));
+    let listen = Arc::new(TestTool::new("wait_for_input", None, ToolMode::Echo));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![send.clone(), listen.clone()],
+        LlmHostConfig::default(),
+    )
+    .await;
+    let output = host.run_turn(turn()).await.unwrap();
+    assert!(send.starts.lock().unwrap().is_empty());
+    assert_eq!(listen.starts.lock().unwrap().len(), 1);
+    assert!(output.transcript.last().unwrap().internal_only);
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests[0].messages.last().unwrap().role, ChatRole::User);
+    assert_eq!(requests[1].messages.last().unwrap().role, ChatRole::Tool);
+    for request in requests.iter() {
+        let text = request
+            .messages
+            .iter()
+            .rfind(|m| m.role == ChatRole::System)
+            .unwrap()
+            .text
+            .as_ref()
+            .unwrap();
+        assert_eq!(text.matches("本次即时通讯输出选择：").count(), 1);
+        assert!(text.contains("调用 wait_for_input"));
+        assert!(!text.contains("业务工具继续执行"));
+        assert!(!text.contains("调用 send_sticker"));
+    }
+    assert!(output.transcript.iter().all(|m| {
+        !m.text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("本次即时通讯输出选择：")
+    }));
 }
 
 #[tokio::test]

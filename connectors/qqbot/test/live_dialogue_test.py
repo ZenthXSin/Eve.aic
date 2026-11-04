@@ -30,6 +30,9 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
             facts = None
         if isinstance(facts, dict) and 'host_event' in facts:
             self.assertFalse(body.get('tools'))
+            self.assertEqual(body.get('response_format'), {'type': 'json_object'})
+            self.assertEqual(body['messages'][-2]['role'], 'system')
+            self.assertTrue(body['messages'][-2]['content'].startswith('本轮自主发言协议：'))
             self.speech_requests.append(body)
             return dialogue.text_response(json.dumps(self.speech_callback(facts), ensure_ascii=False))
         return super().provider_response(body, kind, fallback)
@@ -79,6 +82,11 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
 
     def test_internal_final_can_end_in_silence_even_with_automatic_progress_settings(self):
         def respond(body):
+            self.assertIn('对外正文只经 send_message 明确发送', body['messages'][0]['content'])
+            self.assertNotIn('output format: plain text', body['messages'][0]['content'])
+            current = next(m['content'] for m in reversed(body['messages']) if m['role'] == 'system')
+            self.assertEqual(current.count('本次即时通讯输出选择：'), 1)
+            self.assertIn('{"action":"silence"}', current)
             if not self.all_results(body):
                 return self.choose('echo', {'text': '内部核对完成'})
             return dialogue.text_response('只是内部结束，不是要说给对方的话')
@@ -91,6 +99,38 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
         self.assertIsNone(self.receipt('quiet')['reply'])
         self.assertEqual(self.speech_rows(), [])
         self.assertEqual(summary['sent'], 0)
+        turns = next(iter(self.documents()['eve.session']['sessions.v1']['sessions'].values()))['turns']
+        original = turns[-1]['status']['messages'][-1]
+        self.assertEqual(original['text'], '只是内部结束，不是要说给对方的话')
+        self.assertTrue(original['internal_only'])
+        def inspect_history(body):
+            records = [m.get('content') for m in body['messages'] if m['role'] == 'assistant']
+            self.assertTrue(any(t and t.startswith('【宿主内部记录，未发送】') and original['text'] in t for t in records))
+            self.assertNotIn(original['text'], records)
+            return dialogue.text_response('继续保持安静')
+        self.callback = inspect_history
+        self.run_live(self.send(self.message('after-restart', '先不回答，接着刚才看一下')))
+        self.assertFalse(self.progress('after-restart'))
+        turns = next(iter(self.documents()['eve.session']['sessions.v1']['sessions'].values()))['turns']
+        self.assertEqual(turns[0]['status']['messages'][-1], original)
+
+    def test_memory_imports_delivered_text_and_preserves_internal_final_after_restart(self):
+        def respond(body):
+            if not self.all_results(body):
+                return self.choose('send_message', {'text': '实际说的话'})
+            return dialogue.text_response('绝不能记成已说的草稿')
+        self.callback = respond
+        self.run_live(self.send(self.message('spoken-memory', '看看')), memory=True)
+        [source] = [item['source'] for item in self.interactions()]
+        self.assertEqual(source['assistant_text'], '实际说的话')
+        original = self.turn('看看')['status']['messages'][-1]
+        self.assertEqual(original['text'], '绝不能记成已说的草稿')
+        self.assertTrue(original['internal_only'])
+        self.callback = lambda _: dialogue.text_response('{"action":"silence"}')
+        self.run_live(self.send(self.message('memory-restart', '先不用答')), memory=True)
+        self.assertEqual([item['source'] for item in self.interactions()], [source])
+        self.assertEqual(self.turn('看看')['status']['messages'][-1], original)
+        self.assertFalse(self.progress('memory-restart'))
 
     def test_question_and_wait_take_new_input_in_the_same_turn_without_ack(self):
         def respond(body):
@@ -304,7 +344,7 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
         [frame] = self.progress('image-only')
         self.assertTrue(os.path.samefile(frame['image_path'], path))
         part = self.receipt('image-only')['progress'][0]
-        self.assertEqual(part['image_path'], str(path))
+        self.assertTrue(os.path.samefile(part['image_path'], path))
         self.assertEqual(part['state'], 'Sent')
         self.assertTrue(part['platform_message_id'])
         self.assertTrue(any(event['facts'].get('medium') == 'image' and state == 'sent'

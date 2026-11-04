@@ -8,7 +8,7 @@ pub(crate) fn encode_request(model: &str, request: ModelRequest) -> Result<Value
     }
     let mut input = Vec::new();
     for message in request.messages {
-        if let Some(text) = message.text {
+        if let Some(text) = message.text_for_model() {
             let role = match message.role {
                 ChatRole::System => "system",
                 ChatRole::User => "user",
@@ -25,7 +25,7 @@ pub(crate) fn encode_request(model: &str, request: ModelRequest) -> Result<Value
                 json!(parts)
             };
             let mut item = json!({"role": role, "content": content});
-            // Eve 的 assistant 文本历史只有已完成回复，等价于 final_answer。
+            // 内部结束记录不曾对外发送，用正文标识；普通旧历史仍保留原义。
             if role == "assistant" {
                 item["phase"] = json!("final_answer");
             }

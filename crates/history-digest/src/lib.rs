@@ -425,8 +425,8 @@ fn digest_turn_limits(
         match message.role {
             ChatRole::User => turn.user = text(message.text.as_deref().unwrap_or(""), text_limit),
             ChatRole::Assistant => {
-                if let Some(value) = message.text.as_deref().filter(|v| !v.trim().is_empty()) {
-                    turn.assistant.push(text(value, text_limit));
+                if let Some(value) = message.text_for_model().filter(|v| !v.trim().is_empty()) {
+                    turn.assistant.push(text(&value, text_limit));
                 }
                 for call in &message.tool_calls {
                     names.insert(call.id.clone(), turn.tools.len());

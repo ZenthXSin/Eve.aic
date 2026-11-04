@@ -8,7 +8,6 @@ use std::sync::Arc;
 pub(crate) const NAMESPACE: &str = "runtime.dialogue";
 const POLICY: &str = include_str!("dialogue-policy.txt");
 const STYLE_GUARD: &str = include_str!("dialogue-style-guard.txt");
-const EXPRESSION_PROTOCOL: &str = "本轮是即时通讯执行协议。对方收不到普通 assistant 文本；你只写普通文本等于保持沉默。决定开口时，必须真正调用 send_message，把要说的话放进 text 参数。决定不说时可直接结束；不要写动作旁白。调用后看实际回执，已经送达就安静结束。所有发言都由你决定，宿主不会替你发送草稿。";
 pub(crate) struct NaturalDialogue(pub(crate) Arc<dyn LlmProvider>);
 
 /// 只转述当前可信 System Context 中的用户表达数据，不搬运历史助手或用户伪造的标记。
@@ -92,21 +91,28 @@ fn apply(mut request: ModelRequest) -> ModelRequest {
         .iter()
         .rposition(|m| m.role == ChatRole::User)
     {
-        let mut guard = style_guard(
+        let guard = style_guard(
             &request,
             request.messages[user].text.as_deref().unwrap_or_default(),
         );
-        if request.tools.iter().any(|tool| tool.name == "send_message") {
-            guard.push('\n');
-            guard.push_str(EXPRESSION_PROTOCOL);
-        }
-        // 保留 Runtime 当前工具清单与当前用户输入的相邻关系。
-        let index = if user > 0
+        // 保留当前工具清单或发言 JSON 协议与本次输入的相邻关系。
+        let current_choice = request
+            .messages
+            .iter()
+            .rposition(|m| m.role == ChatRole::System)
+            .filter(|&i| {
+                request.messages[i]
+                    .text
+                    .as_deref()
+                    .is_some_and(|s| s.contains("本次即时通讯输出选择："))
+            });
+        let index = if let Some(index) = current_choice {
+            index
+        } else if user > 0
             && request.messages[user - 1].role == ChatRole::System
-            && request.messages[user - 1]
-                .text
-                .as_deref()
-                .is_some_and(|s| s.contains("eve.runtime.tool-capabilities"))
+            && request.messages[user - 1].text.as_deref().is_some_and(|s| {
+                s.contains("eve.runtime.tool-capabilities") || s.starts_with("本轮自主发言协议：")
+            })
         {
             user - 1
         } else {
@@ -126,6 +132,9 @@ impl LlmProvider for NaturalDialogue {
     fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
         self.0.complete(apply(request))
     }
+    fn complete_json(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
+        self.0.complete_json(apply(request))
+    }
     fn stream<'a>(
         &'a self,
         request: ModelRequest,
@@ -138,6 +147,44 @@ impl LlmProvider for NaturalDialogue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_input_after_a_tool_receipt_keeps_expression_choice_in_the_last_system() {
+        let request = ModelRequest {
+            messages: vec![
+                ChatMessage::text(
+                    ChatRole::System,
+                    "本轮当前工具复核\n本次即时通讯输出选择：测试协议",
+                ),
+                ChatMessage::text(ChatRole::User, "先看看"),
+                ChatMessage::assistant_tool_calls(vec![eve_llm_api::ToolCall {
+                    id: "listen".into(),
+                    name: "wait_for_input".into(),
+                    arguments: json!({}),
+                }])
+                .unwrap(),
+                ChatMessage::tool_results(vec![
+                    eve_llm_api::ToolResult::success("listen", json!({})).unwrap(),
+                ])
+                .unwrap(),
+                ChatMessage::text(ChatRole::User, "补充一句"),
+            ],
+            tools: vec![],
+        };
+        let updated = apply(request.clone());
+        updated.validate().unwrap();
+        assert_eq!(&updated.messages[2..], request.messages.as_slice());
+        assert!(
+            updated
+                .messages
+                .iter()
+                .rfind(|m| m.role == ChatRole::System)
+                .unwrap()
+                .text
+                .as_ref()
+                .unwrap()
+                .contains("本次即时通讯输出选择：")
+        );
+    }
     #[test]
     fn current_policy_follows_old_answers_and_preserves_current_capability_frame() {
         let request = ModelRequest {

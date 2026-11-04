@@ -61,6 +61,10 @@ pub enum ChatRole {
 pub struct ChatMessage {
     pub role: ChatRole,
     pub text: Option<String>,
+    /// 宿主确认未对外发送的普通助手文本；原文保存，模型回放时带明确标识。
+    /// 缺省保留旧会话语义，不能推断旧版 final 未发送。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub internal_only: bool,
     pub tool_calls: Vec<ToolCall>,
     pub tool_results: Vec<ToolResult>,
     /// 本轮用户消息附带的图像；从不序列化，持久历史中始终为空。
@@ -68,15 +72,41 @@ pub struct ChatMessage {
     pub images: Vec<ImageInput>,
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 impl ChatMessage {
     pub fn text(role: ChatRole, text: impl Into<String>) -> Self {
         Self {
             role,
             text: Some(text.into()),
+            internal_only: false,
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
             images: Vec::new(),
         }
+    }
+
+    pub fn internal_text(text: impl Into<String>) -> Self {
+        Self {
+            internal_only: true,
+            ..Self::text(ChatRole::Assistant, text)
+        }
+    }
+
+    /// 仅用于模型请求。存储、原始回执与对外发送继续使用未改写的 text。
+    pub fn text_for_model(&self) -> Option<std::borrow::Cow<'_, str>> {
+        self.text.as_deref().map(|text| {
+            if self.internal_only {
+                std::borrow::Cow::Owned(format!(
+                    "【宿主内部记录，未发送】以下原文只是内部结束记录，不是对方收到的话，不能据此判断已经回复或交付：\n{}",
+                    serde_json::json!({"kind":"eve.internal_record","text":text})
+                ))
+            } else {
+                std::borrow::Cow::Borrowed(text)
+            }
+        })
     }
 
     pub fn assistant_tool_calls(calls: Vec<ToolCall>) -> Result<Self, LlmError> {
@@ -84,6 +114,7 @@ impl ChatMessage {
         Ok(Self {
             role: ChatRole::Assistant,
             text: None,
+            internal_only: false,
             tool_calls: calls,
             tool_results: Vec::new(),
             images: Vec::new(),
@@ -100,6 +131,7 @@ impl ChatMessage {
         Ok(Self {
             role: ChatRole::Tool,
             text: None,
+            internal_only: false,
             tool_calls: Vec::new(),
             tool_results: results,
             images: Vec::new(),
@@ -113,6 +145,15 @@ impl ChatMessage {
     }
 
     fn validate(&self) -> Result<(), LlmError> {
+        if self.internal_only
+            && (self.role != ChatRole::Assistant
+                || !self.tool_calls.is_empty()
+                || !self.tool_results.is_empty())
+        {
+            return Err(LlmError::Protocol(
+                "internal record must be plain assistant text".into(),
+            ));
+        }
         if self.images.len() > MAX_TURN_IMAGES
             || (!self.images.is_empty() && self.role != ChatRole::User)
         {
@@ -1029,6 +1070,34 @@ mod tests {
     }
 
     #[test]
+    fn internal_record_preserves_raw_text_and_legacy_serialization() {
+        let legacy = ChatMessage::text(ChatRole::Assistant, "旧版真实回复");
+        let encoded = serde_json::to_value(&legacy).unwrap();
+        assert!(encoded.get("internal_only").is_none());
+        assert_eq!(
+            serde_json::from_value::<ChatMessage>(encoded).unwrap(),
+            legacy
+        );
+        assert_eq!(legacy.text_for_model().as_deref(), Some("旧版真实回复"));
+        let internal = ChatMessage::internal_text("我已经告诉你了\n但其实没有发送");
+        assert!(request(vec![internal.clone()]).validate().is_ok());
+        let stored = serde_json::to_value(&internal).unwrap();
+        assert_eq!(stored["text"], "我已经告诉你了\n但其实没有发送");
+        assert_eq!(stored["internal_only"], true);
+        let restored: ChatMessage = serde_json::from_value(stored).unwrap();
+        assert_eq!(restored, internal);
+        assert!(
+            restored
+                .text_for_model()
+                .unwrap()
+                .starts_with("【宿主内部记录，未发送】")
+        );
+        let mut invalid = internal;
+        invalid.role = ChatRole::User;
+        assert!(request(vec![invalid]).validate().is_err());
+    }
+
+    #[test]
     fn accepts_matching_assistant_calls_and_tool_results() {
         let calls = vec![call("first"), call("second")];
         let results = vec![
@@ -1083,6 +1152,7 @@ mod tests {
         let assistant = ChatMessage {
             role: ChatRole::Assistant,
             text: Some("also explain this".into()),
+            internal_only: false,
             tool_calls: vec![call("demo")],
             tool_results: vec![],
             images: vec![],
@@ -1102,6 +1172,7 @@ mod tests {
             request(vec![ChatMessage {
                 role: ChatRole::Assistant,
                 text: None,
+                internal_only: false,
                 tool_calls: vec![],
                 tool_results: vec![],
                 images: vec![],

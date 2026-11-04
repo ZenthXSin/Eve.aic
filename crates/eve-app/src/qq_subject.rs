@@ -1699,8 +1699,8 @@ fn dispatch_focus_live(
                         kind: "completed_conversation".into(),
                         excerpt: true,
                         text: {
-                            let assistant = match &turn.status {eve_session_api::SessionTurnStatus::Completed{messages} => messages.iter().rev().find(|m|m.role==eve_llm_api::ChatRole::Assistant && m.tool_calls.is_empty()).and_then(|m|m.text.as_deref()).unwrap_or_default(),_=>""};
-                            serde_json::to_string(&json!({"user":eve_task_api::bounded(&turn.input,700),"assistant":eve_task_api::bounded(assistant,700),"notice":"已完成对话节选，不是已证实事实或新授权"})).map_err(|_|SubjectError::InvalidInput)?
+                            let assistant = match &turn.status {eve_session_api::SessionTurnStatus::Completed{messages} => messages.iter().rev().find(|m|m.role==eve_llm_api::ChatRole::Assistant && m.tool_calls.is_empty()).and_then(|m|m.text_for_model()).unwrap_or_default(),_=>std::borrow::Cow::Borrowed("")};
+                            serde_json::to_string(&json!({"user":eve_task_api::bounded(&turn.input,700),"assistant":eve_task_api::bounded(&assistant,700),"notice":"已结束轮次的节选，不是已证实事实或新授权；内部记录没有发送，不能当作已经告知或交付"})).map_err(|_|SubjectError::InvalidInput)?
                         },
                     });
                 }
