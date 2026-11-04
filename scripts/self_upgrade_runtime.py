@@ -518,6 +518,11 @@ def runtime_idle_gate(state_path, inherited=frozenset()):
                    for row in rows):
                 return False
     group = state_path.parent / 'group-observations.sqlite3'
+    interests = state_path.parent / 'self-interests.sqlite3'
+    if interests.with_suffix('.required').exists() and not interests.exists():
+        raise ValueError('self_interests_database_missing')
+    if interests.exists() and (interests.is_symlink() or not interests.is_file()):
+        raise ValueError('invalid_self_interests_database')
     if group.with_suffix('.required').exists() and not group.exists():
         raise ValueError('group_database_missing')
     if group.exists():
@@ -601,9 +606,9 @@ def drain_stamp(state_path):
     """侧账本及 SQLite WAL 也参与门禁缓存；大状态未变化时不重复解析。"""
     paths = [state_path, state_path.parent / 'qq-outbox' / 'ledger.json']
     paths += [state_path.parent / (name + suffix)
-              for name in ('group-observations.sqlite3', 'speech.sqlite3')
+              for name in ('group-observations.sqlite3', 'speech.sqlite3', 'self-interests.sqlite3')
               for suffix in ('', '-wal', '-journal')]
-    paths += [state_path.parent / name for name in ('group-observations.required', 'speech.required')]
+    paths += [state_path.parent / name for name in ('group-observations.required', 'speech.required', 'self-interests.required')]
     stamps = []
     for path in paths:
         try:

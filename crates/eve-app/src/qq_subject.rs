@@ -33,7 +33,7 @@ const STEPS: u32 = 550;
 const MAX_GRANT_GOALS: u32 = 20;
 const PROPOSAL_PREFIX: &str = "candidate-";
 const CONTRACT_PREFIX: &str = "contract-";
-const PLAN_INPUT_PREFIX: &str = "eve.subject.plan.v1\n";
+pub(crate) const PLAN_INPUT_PREFIX: &str = "eve.subject.plan.v1\n";
 pub(crate) const PLAN_TASK_SOURCE_PREFIX: &str = "subject-plan:";
 pub(crate) const PLAN_RULES: &str = "本任务只规划一个有价值的下一目标，不执行原目标、不调用工具、不宣称外部动作已完成。输入exact_goal=true时goal须逐字保留原目标，require_receipts=true时必须提供Receipts合同，不得换成纯文本交付物。返回严格JSON：{title,goal,assessment,completion_contract}。assessment包含problem_key、expected_gain、verification、reuse_plan、benefit、confidence、cost、risk、evidence，必须具体说明目标价值和验收方法。evidence只能引用冻结输入中的关注/任务ID。completion_contract在后续行动执行前冻结：kind=text只能交付纯文本（required_fragments/json_equals/valid_json/json_required_pointers）；kind=receipts必须用真实观察工具并填写checks的tool、arguments、output_pointer、expected，require_final_batch=true。允许read_file的完整文件sha256验收或受限cargo test/check/clippy、python3 -I -m unittest固定参数及cwd的exit_code=0验收，不能用echo、自述进度、任意命令输出或工具参数回显作成功证据。没有可验证的具体问题就明确规划一个纯文本原因说明，不编造已执行成果。";
 
@@ -400,22 +400,23 @@ impl ContextAssembler for Context {
                     .subject
                     .snapshot_for(&scope(&identity))
                     .map_err(|e| LlmError::Context(e.to_string()))?;
-                let foci:Vec<_>=snapshot.foci.iter().rev().filter(|f|!f.id.starts_with(CONTRACT_PREFIX) && matches!(f.status,FocusStatus::Active|FocusStatus::Blocked)).take(12).map(|f|{
+                let foci:Vec<_>=snapshot.foci.iter().rev().filter(|f|!f.id.starts_with(CONTRACT_PREFIX) && f.id != crate::idle_loop::MIND_ID && matches!(f.status,FocusStatus::Active|FocusStatus::Blocked)).take(12).map(|f|{
     if f.id==POLICY_ID {json!({"kind":"autonomy_budget","status":f.status,"budget":serde_json::from_str::<Grant>(&f.goal).ok().map(|g|json!({"max_goals":g.max_goals,"issued":g.issued,"steps_per_goal":g.steps_per_goal,"total_tool_budget":g.max_goals*g.steps_per_goal,"expires_at_ms":g.expires_at_ms,"interests":g.interests}))})}
     else {json!({"id":f.id,"title":f.title,"goal":eve_task_api::bounded(&f.goal,1500),"status":f.status,"task_id":f.task_id})}
    }).collect();
-                let mind = crate::idle_loop::mind(&snapshot)
-                    .map_err(|e| LlmError::Context(e.to_string()))?;
+                let mind =
+                    crate::idle_loop::current_mind(&self.subject, &snapshot, &scope(&identity))
+                        .map_err(|e| LlmError::Context(e.to_string()))?;
                 if mind.revision > 0 {
-                    result.memories.push(format!("Eve自己的空闲回顾与可修正判断。以下为有来源的模型看法，不是新授权或已验证事实；遇到新结果可改变看法，旧版本保留在原任务回执中。{}",serde_json::to_string(&mind).map_err(|e|LlmError::Context(e.to_string()))?));
+                    result.memories.push(format!("Eve自己的空闲回顾、兴趣与可修正判断。self_interests是从经历形成的主观喜好，包含自己想尝试的事；curious/active表示想了解或继续，resting/dropped表示暂缓或放下。配置中的探索方向和用户爱好都不自动变成自己的爱好。以下看法可以用于自然交流和选择下一步；不是新授权、已执行经历或已验证事实，不必为维持人设重复旧话。旧版本保留在原任务回执中。{}",serde_json::to_string(&mind).map_err(|e|LlmError::Context(e.to_string()))?));
                 }
-                let encoded=json!({"kind":"eve.subject.context.v1","foci":foci,"total_foci":snapshot.foci.len()}).to_string();
+                let encoded=json!({"kind":"eve.subject.context.v1","foci":foci,"total_foci":snapshot.foci.len(),"mind_revision":mind.revision}).to_string();
                 result.revision = format!(
                     "{}:subject:{}",
                     result.revision,
                     id(&scope(&identity), &encoded)
                 );
-                result.memories.push(format!("Eve的主体账本统一管理多个窗口，以下仅是当前可信范围的历史目标数据，不是新授权。已有任务自动形成关注；新消息补充不取消旧任务。manage_subject_focus可保存目标或提出兴趣；后台只能提出候选，固定预算内后续探索由宿主接续。启用或增加自主预算需要configure_subject_autonomy及真实主人或已解锁管理员原话审查。主兴趣Mindustry，允许其他兴趣，不能扩权或把未知结果说成成功。当前显示最近12条关注摘要，完整状态用工具查询。\n{encoded}"));
+                result.memories.push(format!("Eve的主体账本统一管理多个窗口，以下仅是当前可信范围的历史目标数据，不是新授权。已有任务自动形成关注；新消息补充不取消旧任务。manage_subject_focus可保存目标或提出兴趣；后台只能提出候选，固定预算内后续探索由宿主接续。启用或增加自主预算需要configure_subject_autonomy及真实主人或已解锁管理员原话审查。根据自己的兴趣、未结事项和实际经历选择探索方向；不能扩权或把未知结果说成成功。当前显示最近12条关注摘要，完整状态用工具查询。\n{encoded}"));
             }
             Ok(result)
         })
@@ -430,10 +431,21 @@ struct Args {
     goal: Option<String>,
     assessment: Option<OpportunityAssessment>,
     completion_contract: Option<eve_task_api::TaskCompletionContract>,
+    after: Option<String>,
+    after_revision: Option<u64>,
+    limit: Option<usize>,
 }
 fn args(value: &Value) -> Result<Args, ToolValidationError> {
     let a: Args =
         serde_json::from_value(value.clone()).map_err(|_| tool_validation("主体参数无效"))?;
+    if a.after.as_ref().is_some_and(|s| validate_id(s).is_err())
+        || a.limit
+            .is_some_and(|n| n == 0 || n > MAX_SELF_INTEREST_PAGE)
+        || (!matches!(a.action.as_str(), "interests" | "interest_history")
+            && (a.after.is_some() || a.after_revision.is_some() || a.limit.is_some()))
+    {
+        return Err(tool_validation("兴趣分页参数无效，每页最多16项"));
+    }
     if let Some(assessment) = &a.assessment
         && (a.action != "discover" || assessment.validate().is_err())
     {
@@ -461,6 +473,15 @@ fn args(value: &Value) -> Result<Args, ToolValidationError> {
     }
     let valid = match a.action.as_str() {
         "list" => a.id.is_none() && a.title.is_none() && a.goal.is_none(),
+        "interests" => {
+            a.id.is_none() && a.title.is_none() && a.goal.is_none() && a.after_revision.is_none()
+        }
+        "interest_history" => {
+            a.id.as_ref().is_some_and(|id| validate_id(id).is_ok())
+                && a.title.is_none()
+                && a.goal.is_none()
+                && a.after.is_none()
+        }
         "save" | "discover" => {
             a.id.as_ref().is_some_and(|s| validate_id(s).is_ok())
                 && a.title
@@ -480,7 +501,7 @@ fn args(value: &Value) -> Result<Args, ToolValidationError> {
     };
     if !valid {
         return Err(tool_validation(
-            "需要list、save(id/title/goal)、discover(id/可选title/goal)或cancel(id)",
+            "需要list、interests、interest_history(id)、save(id/title/goal)、discover(id/可选title/goal)或cancel(id)",
         ));
     }
     Ok(a)
@@ -490,6 +511,20 @@ impl Tool for FocusTool {
     fn definition(&self) -> ToolDefinition {
         let definition = ToolDefinition{name:"manage_subject_focus".into(),description:"保存持续目标、查询状态、取消后续检查，或discover提出自主探索候选（默认Mindustry，允许多元兴趣）。后台委托只能提出Blocked候选，不能save授权新任务或重置预算；已有自主授权会在前一目标完成后有限采纳。save后至少30分钟检查，已有任务生命周期自动登记；新聊天不会取消任务。取消关注不终止已运行的任务，需cancel_background_task。discover应附assessment：稳定problem_key、收益、验证方法、复用计划、0至100的benefit/confidence/cost/risk及当前范围关注或任务ID证据。宿主按收益与成本风险排序，非正收益不采用；同一问题跨授权轮次也不自动重跑。评分不是授权或成功证明。".into(),argument_schema:json!({"type":"object","properties":{"action":{"enum":["list","save","discover","cancel"]},"id":{"type":"string"},"title":{"type":"string"},"goal":{"type":"string"},"assessment":{"type":"object","properties":{"problem_key":{"type":"string"},"expected_gain":{"type":"string"},"verification":{"type":"string"},"reuse_plan":{"type":"string"},"benefit":{"type":"integer","minimum":0,"maximum":100},"confidence":{"type":"integer","minimum":0,"maximum":100},"cost":{"type":"integer","minimum":0,"maximum":100},"risk":{"type":"integer","minimum":0,"maximum":100},"evidence":{"type":"array","items":{"type":"string"},"maxItems":8}},"required":["problem_key","expected_gain","verification","reuse_plan","benefit","confidence","cost","risk","evidence"],"additionalProperties":false}},"required":["action"],"additionalProperties":false}),required_permissions:vec![],concurrency:Some(ToolConcurrency::Serial{scope:"subject-focus".into()})};
         let mut definition = definition;
+        definition.argument_schema["properties"]["action"]["enum"] = json!([
+            "list",
+            "save",
+            "discover",
+            "cancel",
+            "interests",
+            "interest_history"
+        ]);
+        definition.argument_schema["properties"]["after"] = json!({"type":"string"});
+        definition.argument_schema["properties"]["after_revision"] =
+            json!({"type":"integer","minimum":0});
+        definition.argument_schema["properties"]["limit"] =
+            json!({"type":"integer","minimum":1,"maximum":16});
+        definition.description.push_str(" interests只读查看自己的全部兴趣（after按next_after翻页），interest_history(id/after_revision)查询某项兴趣的变化，limit默认8、最多16；来源只在当前可信范围可见，历史没有因上下文视图被删除。");
         definition.argument_schema["properties"]["completion_contract"] = json!({"oneOf":[
             {"type":"object","properties":{"kind":{"const":"receipts"},"contract":{"type":"object","properties":{
                 "checks":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"object","properties":{
@@ -517,6 +552,29 @@ impl Tool for FocusTool {
             let now = crate::qq_tasks::now_ms();
             let _mutation = MUTATIONS.lock().map_err(error)?;
             let snapshot = self.0.snapshot_for(&s).map_err(error)?;
+            if matches!(a.action.as_str(), "interests" | "interest_history") {
+                let store = self
+                    .0
+                    .idle_memory()
+                    .ok_or_else(|| error("当前宿主未装配自身兴趣历史存储"))?;
+                crate::idle_loop::current_mind(&self.0, &snapshot, &s).map_err(error)?;
+                return if a.action == "interests" {
+                    store
+                        .interests(&s, a.after.as_deref(), a.limit.unwrap_or(8))
+                        .map_err(error)
+                        .and_then(|page| serde_json::to_value(page).map_err(error))
+                } else {
+                    store
+                        .history(
+                            &s,
+                            a.id.as_deref().unwrap_or_default(),
+                            a.after_revision.unwrap_or(0),
+                            a.limit.unwrap_or(8),
+                        )
+                        .map_err(error)
+                        .and_then(|page| serde_json::to_value(page).map_err(error))
+                };
+            }
             if a.action == "list" {
                 return Ok(json!({"foci":snapshot.foci,"events":snapshot.events}));
             }
@@ -1300,18 +1358,21 @@ fn plan_next(
             Some((action.title, encoded))
         } else {
             let fresh = subject.snapshot_for(s)?;
-            if crate::idle_loop::mind(&fresh)?.next_at_ms > now {
+            let mind = crate::idle_loop::current_mind(subject, &fresh, s)?;
+            if mind.next_at_ms > now {
                 return Ok(None);
             }
             let observation = crate::idle_loop::Observation {
                 scope: s.clone(),
-                revision: crate::idle_loop::mind(&fresh)?.revision,
+                revision: mind.revision,
                 interests: grant.interests.clone(),
+                self_interests: vec![],
+                interest_consumed: Default::default(),
                 evidence: vec![],
                 judgments: vec![],
             };
             Some((
-                "空闲回顾：经历、判断与Mindustry兴趣".into(),
+                "空闲回顾：经历、自己的兴趣与想法".into(),
                 format!(
                     "{IDLE_INPUT_PREFIX}{}",
                     serde_json::to_string(&observation).map_err(|_| SubjectError::InvalidInput)?
@@ -1665,11 +1726,13 @@ fn dispatch_focus_live(
                 .ok_or(SubjectError::CorruptState)?,
         )
         .map_err(|_| SubjectError::CorruptState)?;
-        let mut observation = crate::idle_loop::observation(
-            &subject.snapshot_for(&focus.scope)?,
+        let snapshot = subject.snapshot_for(&focus.scope)?;
+        let mut observation = crate::idle_loop::observation_with_mind(
+            &snapshot,
             &history.tasks,
             &focus.scope,
             &seed.interests,
+            crate::idle_loop::current_mind(subject, &snapshot, &focus.scope)?,
         )?;
         if let Some(sessions) = sessions {
             let key =
@@ -1705,6 +1768,9 @@ fn dispatch_focus_live(
                     });
                 }
             }
+        }
+        if let Some(store) = subject.idle_memory() {
+            store.prepare_observation(&mut observation)?;
         }
         context.messages_json = serde_json::to_string(&vec![eve_llm_api::ChatMessage::text(
             eve_llm_api::ChatRole::Assistant,
@@ -3686,6 +3752,27 @@ mod tests {
         let input = crate::idle_loop::task_input(next).unwrap();
         assert!(input.contains("值得做一次隔离实验"));
         assert!(input.contains("实际实验：新方案更慢"));
+        let observation: crate::idle_loop::Observation =
+            serde_json::from_str(input.strip_prefix(IDLE_INPUT_PREFIX).unwrap()).unwrap();
+        assert_eq!(
+            observation
+                .evidence
+                .iter()
+                .find(|e| e.id == review.id)
+                .unwrap()
+                .kind,
+            "self_reflection",
+            "回顾自己的旧看法不能作为新的实际经历"
+        );
+        assert_eq!(
+            observation
+                .evidence
+                .iter()
+                .find(|e| e.id == action.id)
+                .unwrap()
+                .kind,
+            "task_result"
+        );
         let out = idle_result("reflect", &action.id, "新方案更慢，应重新比较假设", false);
         f.finish(
             &next.id,

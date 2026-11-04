@@ -7,6 +7,7 @@ pub fn validate_idle_reflection(
 ) -> SubjectResult<()> {
     observation.validate()?;
     result.validate()?;
+    crate::self_interest::validate_interest_updates(observation, result)?;
     let references = |ids: &[String]| {
         ids.iter()
             .all(|id| observation.evidence.iter().any(|e| &e.id == id))
@@ -48,6 +49,11 @@ pub fn revise_idle_mind(
     if now == 0 {
         return Err(SubjectError::InvalidInput);
     }
+    previous.self_interests = crate::self_interest::revise_self_interests(
+        previous.self_interests,
+        &result.interest_updates,
+        now,
+    )?;
     for judgment in &result.judgments {
         previous.judgments.retain(|j| j.key != judgment.key);
         previous.judgments.push(judgment.clone());
@@ -96,6 +102,7 @@ mod tests {
             thought: "重新比较假设".into(),
             reason: "有新的实验结果".into(),
             judgments: vec![judgment("new", "原方案较慢")],
+            interest_updates: vec![],
             action: None,
             revisit_after_minutes: 30,
         }
@@ -110,6 +117,8 @@ mod tests {
             },
             revision: 1,
             interests: vec!["Mindustry".into()],
+            self_interests: vec![],
+            interest_consumed: Default::default(),
             evidence: vec![IdleEvidence {
                 id: "old".into(),
                 kind: "task_result".into(),
@@ -142,6 +151,8 @@ mod tests {
             thought: "旧想法".into(),
             reason: "旧理由".into(),
             judgments: observation.judgments.clone(),
+            self_interests: vec![],
+            archived: false,
         };
         let next = revise_idle_mind(previous, &reflection(), "review-2", 100).unwrap();
         assert_eq!(next.revision, 2);

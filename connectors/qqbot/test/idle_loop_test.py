@@ -6,6 +6,7 @@
 import hashlib
 import json
 import os
+import sqlite3
 import threading
 import time
 import unittest
@@ -37,6 +38,7 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
         self.small=[]
         self.review_reply=lambda _: {'risk':'medium','authorization':'high','outcome':'allow','rationale':'夹具主人原话明确授权本次有限回顾与本地实验'}
         self.reflections=0
+        self.observations=[]
         self.plans=0
         self.mode='act'
         outer=self
@@ -92,11 +94,12 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
                     packet=json.JSONDecoder().raw_decode(text[text.index('{"kind":"eve.delegated_context"'):])[0]
                     messages.extend(packet['messages'])
             observation=json.loads(next(m['text'][len(PREFIX):] for m in messages if (m.get('text') or '').startswith(PREFIX)))
+            self.observations.append(observation)
             self.reflections+=1
             ids=[e['id'] for e in observation['evidence']]
             self.assertFalse(any(e['kind']=='focus' and e['id'].startswith('contract-')
                 for e in observation['evidence']),'冻结合同和授权原话不能作为普通经历节选')
-            choice='act' if self.mode in ('act','legacy-act','text-act') and self.reflections==1 else 'wait'
+            choice='act' if self.mode in ('act','legacy-act','text-act','own-interest') and self.reflections==1 else 'wait'
             evidence=ids[0] if ids else None
             result={'choice':choice,'thought':'依据实际经历决定下一步','reason':'值得验证时行动，没有新证据时等待',
                 'judgments':[],'action':None,'revisit_after_minutes':30}
@@ -105,12 +108,24 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
             if evidence:
                 statement='先做一个实际实验' if choice=='act' else '实验结果改变了原来判断'
                 result['judgments']=[{'key':'experiment','statement':statement,'confidence':70,'evidence':[evidence],'revision_reason':'从新的实际结果修正认识'}]
+            if self.mode=='own-interest':
+                experiences=[e for e in observation['evidence']
+                    if e['kind'] in ('completed_conversation','task_result')]
+                self.assertTrue(experiences,'自己的兴趣需要实际经历')
+                actual=next((e for e in experiences if e['kind']=='task_result'),experiences[0])
+                result['interest_updates']=[{'key':'rule-patterns','topic':'规则形成的图案',
+                    'phase':'curious' if self.reflections==1 else 'resting',
+                    'strength':60 if self.reflections==1 else 30,
+                    'reason':'想弄清简单规则的变化' if self.reflections==1 else '实际实验后先放下这条方向',
+                    'want_to_try':'保存一个可复查的小实验' if self.reflections==1 else '',
+                    'evidence':[actual['id']]}]
             if choice=='act':
                 self.assertIsNotNone(evidence)
                 result['action']={'title':'隔离验证空闲想法','goal':'在工作区写一次experiment.txt并核对回执',
                     'assessment':{'problem_key':'idle-experiment','expected_gain':'验证自主行动闭环','verification':'检查文件和工具回执',
                         'reuse_plan':'保存为下一次可比较经验','benefit':90,'confidence':90,'cost':10,'risk':0,'evidence':[evidence]},
                     'completion_contract':ACTION_CONTRACT}
+                if self.mode=='own-interest':result['action']['interest_key']='rule-patterns'
                 if self.mode=='legacy-act':result['action'].pop('completion_contract')
                 if self.mode=='text-act':result['action']['completion_contract']={'kind':'text','required_fragments':['实验完成']}
                 self.proposed_action=result['action']
@@ -148,6 +163,14 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
                     if d['event_id']==event['id']:d['at_ms']=event['created_at_ms']
         raw['entries']['eve.subject']['subject.v1']=list(json.dumps(ledger,ensure_ascii=False).encode())
         self.state_path.write_text(json.dumps(raw),encoding='utf8')
+        # 独立历史库是新宿主的当前认知来源；仅推进这个隔离夹具的再回顾时间。
+        database=self.state_path.parent/'self-interests.sqlite3'
+        if database.exists():
+            with sqlite3.connect(database) as db:
+                for scope,payload in db.execute('SELECT scope,payload FROM minds').fetchall():
+                    mind=json.loads(payload);mind['next_at_ms']=now-1
+                    db.execute('UPDATE minds SET payload=? WHERE scope=?',
+                        (json.dumps(mind,ensure_ascii=False),scope))
 
     def wait_revision(self,n):self.wait_for(lambda:self.mind() and self.mind()['revision']>=n,'回顾结果未保存',15)
     def test_idle_action_and_changed_judgment_across_processes_without_new_user_message(self):
@@ -187,6 +210,61 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
         self.assertEqual(self.mind()['revision'],1)
         self.assertFalse((self.source/'experiment.txt').exists())
         self.assertEqual(len(self.small),1)
+
+    def test_own_interest_guides_real_action_changes_from_result_and_returns_to_chat(self):
+        self.mode='own-interest';self.initialize();self.due()
+        def completed():
+            self.wait_for(lambda:any(t['spec']['title']=='隔离验证空闲想法' and t['status']=='Completed'
+                for t in self.tasks()),'兴趣驱动的实际行动未完成',15)
+        self.run_idle(self.checkpoint('own-action'),checkpoints={'own-action':completed})
+        first=self.mind()['self_interests'][0]
+        self.assertEqual(first['revision'],1)
+        self.assertEqual(first['current']['phase'],'curious')
+        self.assertEqual((self.source/'experiment.txt').read_text(),EXPERIMENT)
+        self.due()
+        self.run_idle(self.checkpoint('own-reconsider'),checkpoints={'own-reconsider':lambda:self.wait_revision(2)})
+        self.assertEqual(self.observations[-1]['self_interests'],[first], '下一次回顾应收到原兴趣')
+        current=self.mind()['self_interests'][0]
+        self.assertEqual(current['revision'],2)
+        self.assertEqual(current['first_recorded_at_ms'],first['first_recorded_at_ms'])
+        self.assertEqual(current['current']['phase'],'resting')
+        self.assertNotEqual(current['current']['evidence'],first['current']['evidence'])
+        tasks_before=json.dumps(self.tasks(),sort_keys=True)
+        mind_before=json.dumps(self.mind(),sort_keys=True)
+        def chat(body):
+            text=json.dumps(body,ensure_ascii=False)
+            latest=next(m['content'] for m in reversed(body['messages']) if m.get('role')=='user')
+            def query(arguments):
+                response=tool_response([('manage_subject_focus',arguments)])
+                response['choices'][0]['message']['tool_calls'][0]['id']=f'interest-read-{len(self.results(body))}'
+                return response
+            if latest=='别的窗口看不到私聊兴趣':
+                self.assertNotIn('rule-patterns',text)
+                return text_response('这里只知道本窗口的事')
+            self.assertIn('rule-patterns',text)
+            self.assertIn('实际实验后先放下这条方向',text)
+            queried=self.results(body)
+            if not queried:
+                return query({'action':'interests','limit':1})
+            if len(queried)==1:
+                self.assertEqual(queried[-1]['total'],1)
+                self.assertEqual(queried[-1]['items'][0]['current']['phase'],'resting')
+                return query({'action':'interest_history','id':'rule-patterns','limit':1})
+            if len(queried)==2:
+                self.assertEqual(queried[-1]['items'][0]['current']['phase'],'curious')
+                self.assertEqual(queried[-1]['next_after'],1)
+                return query({'action':'interest_history','id':'rule-patterns','after_revision':1,'limit':1})
+            self.assertEqual(queried[-1]['items'][0]['current']['phase'],'resting')
+            self.assertIsNone(queried[-1]['next_after'])
+            return text_response('做过这个小实验，现在先放一放')
+        self.callback=chat
+        self.run_idle([
+            *self.send(self.message('own-chat','你刚才对什么感兴趣',expected='做过这个小实验，现在先放一放')),
+            *self.send(self.message('other-chat','别的窗口看不到私聊兴趣',user='user-2',expected='这里只知道本窗口的事')),
+        ])
+        self.assertEqual(json.dumps(self.tasks(),sort_keys=True),tasks_before,'聊天和重启不重放兴趣行动')
+        self.assertEqual(json.dumps(self.mind(),sort_keys=True),mind_before,'聊天不伪造新的兴趣修订')
+        self.assertEqual(self.reflections,2)
 
     def test_legacy_action_freezes_receipts_in_zero_tool_planning_before_execution(self):
         self.mode='legacy-act';self.initialize();self.due()
