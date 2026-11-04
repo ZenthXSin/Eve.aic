@@ -473,6 +473,8 @@ def task_documents(state_path, ledger):
                 if not isinstance(task['execution'], dict):
                     raise ValueError('invalid_task_archive_execution')
                 projected['execution'] = dict(task['execution'], checkpoint=None)
+                # Rust 冷目录不复制授权原话；完整证据仍由摘要绑定的冷正文保存。
+                projected['execution'].pop('review_messages', None)
             if projected != directory:
                 raise ValueError('task_archive_directory_mismatch')
         else:
