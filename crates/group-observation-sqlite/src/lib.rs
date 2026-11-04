@@ -1,9 +1,11 @@
 //! 群消息原话与主动发送账本；重启不重放、不补发，异常保留原记录。
 use eve_chime_api::{
-    ChimeReply, GroupExchange, GroupMessage, GroupObservationStore, GroupObservationWindow,
-    GroupOutbound, ObservedMessage,
+    ChimeReply, ChimeSpeechDecision, GroupAuthoredOutbound, GroupExchange, GroupMessage,
+    GroupObservationStore, GroupObservationWindow, GroupOutbound, GroupReplyCadence,
+    GroupSpeechReview, ObservedMessage,
 };
 mod digests;
+mod speech;
 pub use digests::SqliteGroupDigests;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
@@ -18,6 +20,7 @@ const BROKEN: &str = "群消息数据库不可用；原记录保留，停止本�
 pub struct SqliteGroupObservations {
     db: Mutex<Connection>,
     healthy: AtomicBool,
+    _exclusive: std::fs::File,
 }
 impl SqliteGroupObservations {
     pub fn open(path: &Path) -> Result<Self, String> {
@@ -32,6 +35,23 @@ impl SqliteGroupObservations {
         if marker.exists() && !exists {
             return Err("群消息数据库缺失；保留现场，请恢复原数据库".into());
         }
+        let lock_path = path.with_extension("lock");
+        if lock_path
+            .symlink_metadata()
+            .is_ok_and(|m| !m.file_type().is_file())
+        {
+            return Err(BROKEN.into());
+        }
+        let exclusive = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|_| BROKEN)?;
+        exclusive
+            .try_lock()
+            .map_err(|_| "群消息数据库已由另一宿主持有")?;
         let mut db = Connection::open(path).map_err(|_| BROKEN)?;
         db.busy_timeout(Duration::from_millis(100))
             .map_err(|_| BROKEN)?;
@@ -54,18 +74,25 @@ impl SqliteGroupObservations {
         let check: String = db
             .query_row("PRAGMA quick_check", [], |r| r.get(0))
             .map_err(|_| BROKEN)?;
-        if (versions != [1] && versions != [2]) || check != "ok" {
+        if (versions != [1] && versions != [2] && versions != [4]) || check != "ok" {
             return Err(BROKEN.into());
         }
         db.prepare("SELECT seq,conversation,id,payload FROM observations LIMIT 0")
             .map_err(|_| BROKEN)?;
         db.prepare("SELECT seq,id,conversation,reply_to,payload,status FROM outbound LIMIT 0")
             .map_err(|_| BROKEN)?;
+        if versions == [4] {
+            speech::validate(&db)?;
+        }
         if versions == [1] {
             db.execute_batch("BEGIN IMMEDIATE; CREATE TABLE exchanges(seq INTEGER PRIMARY KEY AUTOINCREMENT,conversation TEXT NOT NULL,source TEXT NOT NULL,reply TEXT NOT NULL,UNIQUE(conversation,reply)); UPDATE metadata SET version=2; COMMIT;").map_err(|_|BROKEN)?;
         }
         db.prepare("SELECT seq,conversation,source,reply FROM exchanges LIMIT 0")
             .map_err(|_| BROKEN)?;
+        if versions != [4] {
+            speech::migrate(&mut db)?;
+            speech::validate(&db)?;
+        }
         // 普通回复保存正文后、关联提交前中断的，可由宿主稳定 ID 恢复；不推断缺失原话。
         db.execute("INSERT OR IGNORE INTO exchanges(conversation,source,reply) SELECT a.conversation,a.id,b.id FROM observations a JOIN observations b ON b.conversation=a.conversation AND b.id='sent-'||substr(a.id,4) WHERE a.id LIKE 'qg-%' AND json_extract(a.payload,'$.from_me')=0 AND json_extract(b.payload,'$.from_me')=1",[]).map_err(|_|BROKEN)?;
         db.pragma_update(None, "journal_mode", "DELETE")
@@ -73,12 +100,8 @@ impl SqliteGroupObservations {
         db.pragma_update(None, "synchronous", "FULL")
             .map_err(|_| BROKEN)?;
         recover_confirmed(&mut db)?;
-        // 上次进程未确认的发送不重试，窗口只供读取，不主动重放旧消息。
-        db.execute(
-            "UPDATE outbound SET status='unknown' WHERE status IN ('queued','sending')",
-            [],
-        )
-        .map_err(|_| BROKEN)?;
+        // 新 queued 明确未认领；恢复等待和候选，sending 的未知结局永不补发。
+        speech::recover(&mut db)?;
         if !marker.exists() {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
@@ -99,6 +122,7 @@ impl SqliteGroupObservations {
         Ok(Self {
             db: Mutex::new(db),
             healthy: AtomicBool::new(true),
+            _exclusive: exclusive,
         })
     }
     fn run<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T, String>) -> Result<T, String> {
@@ -254,9 +278,72 @@ impl GroupObservationStore for SqliteGroupObservations {
                 params![m.conversation, m.id, payload],
             )
             .map_err(|_| BROKEN)?;
+            speech::invalidate_older(&tx, m)?;
             tx.commit().map_err(|_| BROKEN)?;
             Ok(true)
         })
+    }
+    fn append_anchored(&self, message: &GroupMessage, platform_id: &str) -> Result<bool, String> {
+        self.append_anchored_inner(message, platform_id)
+    }
+    fn advance_anchor(&self, conversation: &str, platform_id: &str) -> Result<bool, String> {
+        self.advance_anchor_inner(conversation, platform_id)
+    }
+    fn append_speech(
+        &self,
+        message: &GroupMessage,
+        platform_id: &str,
+        outbound_id: &str,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        self.append_speech_inner(message, platform_id, outbound_id, now_ms)
+    }
+    fn stage_speech(
+        &self,
+        message: &GroupMessage,
+        outbound_id: &str,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        self.stage_speech_inner(message, outbound_id, now_ms)
+    }
+    fn pending_speech(&self, now_ms: u64, limit: usize) -> Result<Vec<GroupMessage>, String> {
+        self.pending_speech_inner(now_ms, limit)
+    }
+    fn begin_speech(
+        &self,
+        message: &GroupMessage,
+        now_ms: u64,
+    ) -> Result<Option<GroupSpeechReview>, String> {
+        self.begin_speech_inner(message, now_ms)
+    }
+    fn decide_speech(
+        &self,
+        review: &GroupSpeechReview,
+        decision: Option<&ChimeSpeechDecision>,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        self.decide_speech_inner(review, decision, now_ms)
+    }
+    fn next_authored(&self, now_ms: u64) -> Result<Option<GroupAuthoredOutbound>, String> {
+        self.next_authored_inner(now_ms)
+    }
+    fn authored_after(
+        &self,
+        now_ms: u64,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<GroupAuthoredOutbound>, String> {
+        self.authored_after_inner(now_ms, after, limit)
+    }
+    fn authored(&self, id: &str) -> Result<Option<GroupAuthoredOutbound>, String> {
+        self.authored_inner(id)
+    }
+    fn claim_authored(
+        &self,
+        expected: &GroupAuthoredOutbound,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        self.claim_authored_inner(expected, now_ms)
     }
     fn recent(&self, conversation: &str, limit: usize) -> Result<Vec<GroupMessage>, String> {
         self.run(|db| {
@@ -484,7 +571,7 @@ impl GroupObservationStore for SqliteGroupObservations {
             let tx = db.transaction().map_err(|_| BROKEN)?;
             let value: Option<(String, String, String, String)> = tx
                 .query_row(
-                    "SELECT id,conversation,reply_to,payload FROM outbound WHERE status='queued' ORDER BY seq LIMIT 1",
+                    "SELECT id,conversation,reply_to,payload FROM outbound WHERE status='queued' AND NOT EXISTS(SELECT 1 FROM speech_reviews s WHERE s.outbound_id=outbound.id) ORDER BY seq LIMIT 1",
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
@@ -559,13 +646,15 @@ impl GroupObservationStore for SqliteGroupObservations {
             {
                 return Err("群回复结局无效；原记录保留".into());
             }
+            tx.execute("UPDATE speech_reviews SET state=?2 WHERE outbound_id=?1 AND state='sending'", params![id,if sent {"sent"} else {"failed"}]).map_err(|_|BROKEN)?;
             tx.commit().map_err(|_| BROKEN)?;
             Ok(())
         })
     }
     fn finish_unknown(&self, id: &str) -> Result<(), String> {
         self.run(|db| {
-            let changed = db
+            let tx = db.transaction().map_err(|_| BROKEN)?;
+            let changed = tx
                 .execute(
                     "UPDATE outbound SET status='unknown' WHERE id=?1 AND status='sending'",
                     [id],
@@ -574,11 +663,30 @@ impl GroupObservationStore for SqliteGroupObservations {
             if changed != 1 {
                 return Err("群回复结局无效；原记录保留".into());
             }
+            tx.execute("UPDATE speech_reviews SET state='unknown' WHERE outbound_id=?1 AND state='sending'",[id]).map_err(|_|BROKEN)?;
+            tx.commit().map_err(|_|BROKEN)?;
             Ok(())
         })
     }
+    fn reply_cadence(&self, conversation: &str, now_ms: u64) -> Result<GroupReplyCadence, String> {
+        self.run(|db| {
+            db.query_row(
+                "SELECT MAX(json_extract(o.payload,'$.at_ms')),COALESCE(SUM(CASE WHEN json_extract(o.payload,'$.at_ms')>?2 THEN 1 ELSE 0 END),0) FROM exchanges x JOIN observations o ON o.conversation=x.conversation AND o.id=x.reply WHERE x.conversation=?1",
+                params![conversation, now_ms.saturating_sub(3_600_000)],
+                |r| Ok(GroupReplyCadence { last_reply_ms: r.get(0)?, replies_last_hour: r.get(1)? }),
+            ).map_err(|_|BROKEN.to_string())
+        })
+    }
     fn abandon(&self, id: &str) -> Result<(), String> {
-        self.run(|db|{db.execute("UPDATE outbound SET status='unknown' WHERE id=?1 AND status IN ('queued','sending')",[id]).map_err(|_|BROKEN)?;Ok(())})
+        self.run(|db|{
+            let tx=db.transaction().map_err(|_|BROKEN)?;
+            tx.execute("UPDATE outbound SET status='cancelled' WHERE id=?1 AND status='queued' AND EXISTS(SELECT 1 FROM speech_reviews s WHERE s.outbound_id=outbound.id AND s.state='ready')",[id]).map_err(|_|BROKEN)?;
+            tx.execute("UPDATE speech_reviews SET state='stale' WHERE outbound_id=?1 AND state='ready'",[id]).map_err(|_|BROKEN)?;
+            tx.execute("UPDATE speech_reviews SET state='unknown' WHERE outbound_id=?1 AND state='sending'",[id]).map_err(|_|BROKEN)?;
+            tx.execute("UPDATE outbound SET status='unknown' WHERE id=?1 AND status IN ('queued','sending')",[id]).map_err(|_|BROKEN)?;
+            tx.commit().map_err(|_|BROKEN)?;
+            Ok(())
+        })
     }
     fn outbound(&self, id: &str) -> Result<Option<GroupOutbound>, String> {
         self.run(|db| {

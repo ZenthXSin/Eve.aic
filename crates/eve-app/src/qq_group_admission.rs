@@ -137,7 +137,7 @@ mod tests {
                     run: RunReport {
                         turn_id: Some(1),
                         commit: CommitState::Completed,
-                        text: Some("已核对".into()),
+                        text: Some(r#"{"action":"speak","text":"已核对","after_ms":0}"#.into()),
                         transcript: None,
                         started_tools: Some(0),
                         tool_results: vec![],
@@ -183,15 +183,8 @@ mod tests {
         let other = SessionKey::new("private", "alice").unwrap();
         let ticket = admission.begin(&other, "user-priority").unwrap().unwrap();
         let inner = Arc::new(CountControl(AtomicUsize::new(0)));
-        let engine = ChimeEngine::new(
+        let engine = ChimeEngine::autonomous(
             GroupControl::wrap(inner.clone(), admission.clone()),
-            Arc::new(QuietJudge),
-            Arc::new(eve_segment_plugin::ParagraphPlanner::default()),
-            eve_segment_api::SegmentLimits {
-                max_segments: 3,
-                max_segment_bytes: 4096,
-                max_pause_ms: 2000,
-            },
             Arc::new(Settings),
             "Eve",
             crate::qq_group::USER,

@@ -702,6 +702,80 @@ while True:
             self.assertEqual(self.events.read_text().splitlines(),['old','new'])
         finally:connection.close()
 
+    def test_authored_speech_handled_turn_needs_no_automatic_final_but_waits_for_inflight_send(self):
+        path = self.state / 'state.json'
+        state = runtime.read_json(path)
+        ledger = json.loads(bytes(state['entries']['eve.channel.qqbot']['receipts.v1']))
+        ledger['version'] = 9
+        receipt = ledger['entries'][0]
+        receipt['message']['id'] = 'authored-input'
+        receipt.update(state='Handled', reply=None, control_turn_id=1, progress=[dict(text='Eve 自己决定说的话', state='Sent',
+            decision_id='speech-call', platform_message_id='platform-1')])
+        def save():
+            state['entries']['eve.channel.qqbot']['receipts.v1'] = list(json.dumps(ledger).encode())
+            runtime.atomic(path, state)
+        save()
+        request = self.candidate('new')
+        self.assertTrue(runtime.delivery_gate(path, request))
+        self.assertTrue(runtime.runtime_idle_gate(path))
+        receipt['progress'][0]['state'] = 'Sending'
+        receipt['progress'][0].pop('platform_message_id')
+        save()
+        self.assertFalse(runtime.delivery_gate(path, request))
+        inherited = runtime.inherited_receipts(path)
+        self.assertEqual(len(inherited), 1)
+        self.assertFalse(runtime.delivery_gate(path, request, inherited), '旧未决记录不能证明本次升级轮次已结束')
+        receipt['progress'][0]['state'] = 'Unknown'
+        save()
+        self.assertTrue(runtime.delivery_gate(path, request), '不确定结果已保留，不能为等待成功而重发')
+        receipt['progress'] = []
+        save()
+        self.assertTrue(runtime.delivery_gate(path, request), 'Eve 可选择安静结束，不能强制她发最终一句')
+        receipt.pop('control_turn_id')
+        save()
+        self.assertFalse(runtime.delivery_gate(path, request), '同文宿主命令不能冒充当前对话轮已结束')
+
+    def test_speech_sqlite_wal_and_missing_marker_are_part_of_upgrade_gate(self):
+        import sqlite3
+        path = self.state / 'speech.sqlite3'
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute('PRAGMA journal_mode=WAL')
+            connection.execute('PRAGMA user_version=1')
+            connection.execute('CREATE TABLE speech(state TEXT)')
+            connection.execute("INSERT INTO speech VALUES ('evaluating')")
+            connection.commit()
+            before = runtime.drain_stamp(self.state / 'state.json')
+            self.assertFalse(runtime.runtime_idle_gate(self.state / 'state.json'))
+            connection.execute("UPDATE speech SET state='waiting'")
+            connection.commit()
+            self.assertNotEqual(before, runtime.drain_stamp(self.state / 'state.json'))
+            self.assertTrue(runtime.runtime_idle_gate(self.state / 'state.json'), '持久等待可以跨升级继续')
+            connection.execute("UPDATE speech SET state='sending'")
+            connection.commit()
+            self.assertFalse(runtime.runtime_idle_gate(self.state / 'state.json'))
+        finally:
+            connection.close()
+        path.with_suffix('.required').touch()
+        path.unlink()
+        with self.assertRaisesRegex(ValueError, 'speech_database_missing'):
+            runtime.runtime_idle_gate(self.state / 'state.json')
+
+    def test_legacy_ledger_cannot_smuggle_authored_fields_and_invalid_platform_ids_are_refused(self):
+        path = self.state / 'state.json'
+        state = runtime.read_json(path)
+        ledger = json.loads(bytes(state['entries']['eve.channel.qqbot']['receipts.v1']))
+        part = dict(text='明确发言', state='Sent', decision_id='speech-call', platform_message_id='valid-platform')
+        ledger['entries'][0]['message']['id'] = 'invalid-authored-input'
+        ledger['entries'][0]['progress'] = [part]
+        for version, platform in [(8, 'valid-platform'), (9, '\n'), (9, None)]:
+            ledger['version'] = version
+            part['platform_message_id'] = platform
+            state['entries']['eve.channel.qqbot']['receipts.v1'] = list(json.dumps(ledger).encode())
+            runtime.atomic(path, state)
+            with self.assertRaises(ValueError):
+                runtime.delivery_documents(path)
+
     def test_negative_idle_cache_is_rechecked_even_if_all_file_stamps_stay_equal(self):
         import sqlite3
         wrapper=self.root/'fixed-stamp-supervisor.py'

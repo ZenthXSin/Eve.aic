@@ -81,6 +81,61 @@ fn target(owner: &str, plan: &str) -> QuestionTarget {
 }
 
 #[tokio::test]
+async fn authored_confirmation_persists_actual_text_and_requires_the_same_goal_and_plan_revision() {
+    let world = World::new();
+    let (kernel, ledger) = world.open().await.unwrap();
+    let target = target("alice", "authored-plan");
+    let claimed = ledger
+        .claim_decided(&target, "actual-input", "跑过了，你那边用起来怎么样？", 100)
+        .unwrap();
+    assert!(claimed.attempts[0].proactive);
+    assert_eq!(
+        claimed.attempts[0].actual_text.as_deref(),
+        Some("跑过了，你那边用起来怎么样？")
+    );
+    assert_eq!(claimed.attempts[0].message_id, "actual-input");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&world.raw().unwrap()).unwrap()["format_version"],
+        2
+    );
+    ledger
+        .record(&claimed.id, AttemptResult::NotSent, 101)
+        .unwrap();
+    let mut changed = target.clone();
+    changed.plan_revision += 1;
+    let before = world.raw().unwrap();
+    assert!(
+        ledger
+            .claim_decided(&changed, "new-input", "旧决定不能用于新计划", 102)
+            .is_err()
+    );
+    assert_eq!(world.raw().unwrap(), before);
+    ledger
+        .claim_decided(&target, "new-input", "重新看过情况后再问一句", 103)
+        .unwrap();
+    kernel.stop_all().await.unwrap();
+    let (kernel, ledger) = world.open().await.unwrap();
+    let restored = ledger
+        .snapshot()
+        .unwrap()
+        .questions
+        .into_iter()
+        .find(|q| q.id == claimed.id)
+        .unwrap();
+    assert_eq!(restored.status, QuestionStatus::Unknown);
+    assert_eq!(
+        restored.attempts.last().unwrap().actual_text.as_deref(),
+        Some("重新看过情况后再问一句")
+    );
+    assert!(
+        ledger
+            .claim_decided(&target, "another-input", "不能重发", 200)
+            .is_err()
+    );
+    kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
 async fn each_plan_is_asked_once_retried_at_most_three_times_and_never_after_delivery() {
     let world = World::new();
     let (_kernel, ledger) = world.open().await.unwrap();

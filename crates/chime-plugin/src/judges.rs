@@ -1,4 +1,4 @@
-//! 两种判断器：只在被叫到时接话的规则判断，与一次无工具请求的模型判断。
+//! 旧插件兼容的审视资格判断器；最终是否说话仍由同一对话模型三态决定。
 use eve_chime_api::{ChimeContext, ChimeJudge, ChimeVerdict};
 use eve_llm_api::{
     ChatMessage, ChatRole, LlmError, LlmFuture, LlmModelResolver, ModelRequest, ModelResponse,
@@ -6,7 +6,7 @@ use eve_llm_api::{
 use serde_json::json;
 use std::sync::Arc;
 
-/// 从不主动插话；被叫到的消息由引擎直接放行，不经过判断器。
+/// 暂停主动审视；提及与名字不会绕过该决定。
 pub struct QuietJudge;
 impl ChimeJudge for QuietJudge {
     fn judge(&self, _: ChimeContext) -> LlmFuture<'_, ChimeVerdict> {
@@ -14,7 +14,7 @@ impl ChimeJudge for QuietJudge {
             Ok(ChimeVerdict {
                 reply: false,
                 confidence: 100,
-                reason: "只在被叫到时接话".into(),
+                reason: "主动审视暂未启用".into(),
             })
         })
     }

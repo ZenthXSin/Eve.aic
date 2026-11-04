@@ -43,9 +43,10 @@ impl StoredClarify {
                 }
                 let value =
                     strict_json::from_slice(&bytes).map_err(|_| ClarifyError::CorruptState)?;
-                if value.get("format_version").and_then(|value| value.as_u64())
-                    != Some(u64::from(FORMAT_VERSION))
-                {
+                if !matches!(
+                    value.get("format_version").and_then(|value| value.as_u64()),
+                    Some(1 | 2)
+                ) {
                     return Err(if value.get("format_version").is_some() {
                         ClarifyError::UnsupportedVersion
                     } else {
@@ -281,6 +282,8 @@ impl StoredClarify {
                 return Err(ClarifyError::InvalidTransition);
             }
             entry.attempts.push(DeliveryAttempt {
+                actual_text: None,
+                proactive: false,
                 message_id: message_id.into(),
                 started_at_ms: at_ms.max(last_time(entry)),
                 finished_at_ms: None,
@@ -291,6 +294,44 @@ impl StoredClarify {
         })
     }
 
+    pub(super) fn claim_decided(
+        &self,
+        expected: &Clarification,
+        text: &str,
+        anchor: &str,
+        at_ms: u64,
+    ) -> ClarifyResult<Clarification> {
+        validate_id(anchor)?;
+        if text.trim().is_empty()
+            || text.trim() != text
+            || text.len() > 2048
+            || text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+        {
+            return Err(ClarifyError::InvalidInput);
+        }
+        self.update(&expected.id, at_ms, |_, entry| {
+            if entry != expected
+                || entry.status != ClarifyStatus::Pending
+                || entry.judging()
+                || entry.attempts.len() >= MAX_ATTEMPTS
+                || entry.attempts.iter().any(|a| a.proactive)
+            {
+                return Err(ClarifyError::InvalidTransition);
+            }
+            entry.attempts.push(DeliveryAttempt {
+                actual_text: Some(text.into()),
+                proactive: true,
+                message_id: anchor.into(),
+                started_at_ms: at_ms.max(last_time(entry)),
+                finished_at_ms: None,
+                result: None,
+            });
+            entry.status = ClarifyStatus::Delivering;
+            Ok(())
+        })
+    }
     pub(super) fn record_delivery(
         &self,
         id: &str,
@@ -504,7 +545,16 @@ fn encode(ledger: &Ledger) -> ClarifyResult<Vec<u8>> {
     if ledger.requests.len() > MAX_REQUESTS || ledger.preferences.len() > MAX_PREFERENCES {
         return Err(ClarifyError::LimitReached);
     }
-    let bytes = serde_json::to_vec(ledger).map_err(|_| ClarifyError::InvalidInput)?;
+    let mut wire = ledger.clone();
+    if wire.requests.iter().any(|r| {
+        r.status == ClarifyStatus::Cancelled(CancelReason::ChoseSilence)
+            || r.attempts
+                .iter()
+                .any(|a| a.proactive || a.actual_text.is_some())
+    }) {
+        wire.format_version = 2;
+    }
+    let bytes = serde_json::to_vec(&wire).map_err(|_| ClarifyError::InvalidInput)?;
     // 重启时写入的中断与未知结局比原状态略长；预留空间保证能保存。
     let open = ledger
         .requests
@@ -524,6 +574,16 @@ fn encode(ledger: &Ledger) -> ClarifyResult<Vec<u8>> {
 
 /// 启动时完整核对；任何不一致都拒绝打开并保留原字节。
 fn validate_ledger(ledger: &Ledger) -> ClarifyResult<()> {
+    if ledger.format_version == 1
+        && ledger.requests.iter().any(|r| {
+            r.status == ClarifyStatus::Cancelled(CancelReason::ChoseSilence)
+                || r.attempts
+                    .iter()
+                    .any(|a| a.proactive || a.actual_text.is_some())
+        })
+    {
+        return Err(ClarifyError::CorruptState);
+    }
     if ledger.requests.len() > MAX_REQUESTS || ledger.preferences.len() > MAX_PREFERENCES {
         return Err(ClarifyError::CorruptState);
     }
@@ -548,6 +608,9 @@ fn validate_ledger(ledger: &Ledger) -> ClarifyResult<()> {
 }
 
 fn validate_request(entry: &Clarification) -> ClarifyResult<()> {
+    if entry.attempts.iter().filter(|a| a.proactive).count() > 1 {
+        return Err(ClarifyError::CorruptState);
+    }
     for id in [
         &entry.id,
         &entry.owner,
@@ -598,7 +661,15 @@ fn validate_request(entry: &Clarification) -> ClarifyResult<()> {
             judgement.message_id == attempt.message_id
                 && judgement.outcome == Some(JudgeOutcome::Ask)
         });
-        if !judged_ask
+        if (!attempt.proactive && !judged_ask)
+            || (attempt.proactive && attempt.actual_text.is_none())
+            || attempt.actual_text.as_ref().is_some_and(|text| {
+                text.trim().is_empty()
+                    || text.len() > 2048
+                    || text
+                        .chars()
+                        .any(|c| c.is_control() && c != '\n' && c != '\t')
+            })
             || (attempt.result.is_none() && !last)
             || (!last && matches!(attempt.result, Some(DeliveryResult::Sent { .. })))
             || attempt

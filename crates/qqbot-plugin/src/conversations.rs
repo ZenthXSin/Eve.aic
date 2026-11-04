@@ -18,6 +18,7 @@ struct Inner {
     identities: HashMap<String, QqConversationIdentity>,
     turn_anchors: HashMap<String, QqTurnAnchor>,
     review_anchors: HashMap<String, String>,
+    latest_messages: HashMap<String, String>,
     order: VecDeque<String>,
     idle: bool,
     wakeup_claimed: bool,
@@ -74,6 +75,19 @@ impl Drop for QqWakeupLease {
     }
 }
 impl QqConversations {
+    /// 最后持久接收的真实入站 ID；后台思考与发送之间只核对新鲜度，不授予新权限。
+    pub fn latest_message_id(&self, session: &SessionKey) -> PluginResult<Option<String>> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| PluginError::State("QQ 消息目录不可用".into()))?;
+        Ok(inner
+            .identities
+            .get(&session.session_id)
+            .filter(|i| i.session == *session)
+            .and_then(|_| inner.latest_messages.get(&session.session_id))
+            .cloned())
+    }
     pub(crate) fn set_idle(&self, idle: bool) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.idle = idle;
@@ -451,11 +465,14 @@ impl QqConversations {
                 _ => return Err(PluginError::Task("QQ 身份范围无效".into())),
             },
         };
-        self.inner
+        let mut inner = self
+            .inner
             .lock()
-            .map_err(|_| PluginError::State("QQ 身份目录不可用".into()))?
-            .identities
-            .insert(session.session_id, identity);
+            .map_err(|_| PluginError::State("QQ 身份目录不可用".into()))?;
+        inner
+            .latest_messages
+            .insert(session.session_id.clone(), message.id.clone());
+        inner.identities.insert(session.session_id, identity);
         Ok(())
     }
     /// 这个会话是私聊还是群聊；本进程还没有为它提交过轮次时为 None。
@@ -485,6 +502,7 @@ impl QqConversations {
                     inner.identities.remove(&oldest);
                     inner.turn_anchors.remove(&oldest);
                     inner.review_anchors.remove(&oldest);
+                    inner.latest_messages.remove(&oldest);
                 }
             }
         }

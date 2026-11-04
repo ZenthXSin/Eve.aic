@@ -788,6 +788,99 @@ fn call(id: &str, name: &str, arguments: Value) -> ToolCall {
     }
 }
 
+#[tokio::test]
+async fn explicit_expression_keeps_one_choice_inside_the_total_budget() {
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("work", "echo", json!({}))]),
+        tool_response(vec![call(
+            "expression",
+            "send_message",
+            json!({"text":"实际结果"}),
+        )]),
+        final_response("内部结束"),
+    ]);
+    let work = Arc::new(TestTool::new(
+        "echo",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    ));
+    let send = Arc::new(TestTool::new("send_message", None, ToolMode::Echo));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![work.clone(), send.clone()],
+        LlmHostConfig {
+            max_tool_calls: 2,
+            max_tool_rounds: 1,
+            final_answer_on_round_limit: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let output = host.run_turn(turn()).await.unwrap();
+    assert_eq!(output.diagnostics.started_tools, 2);
+    assert_eq!(work.starts.lock().unwrap().len(), 1);
+    assert_eq!(send.starts.lock().unwrap().len(), 1);
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(
+        requests[1]
+            .tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["send_message"]
+    );
+    assert!(requests[2].tools.is_empty());
+}
+
+#[tokio::test]
+async fn final_is_allowed_to_stay_silent_and_does_not_invoke_expression() {
+    let provider = RecordingProvider::scripted(vec![final_response("安静结束")]);
+    let send = Arc::new(TestTool::new("send_message", None, ToolMode::Echo));
+    let (host, _, _) = make_host(provider, vec![send.clone()], LlmHostConfig::default()).await;
+    assert_eq!(
+        host.run_turn(turn())
+            .await
+            .unwrap()
+            .diagnostics
+            .started_tools,
+        0
+    );
+    assert!(send.starts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_oversized_work_batch_does_not_spend_the_last_expression_choice() {
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![
+            call("work1", "echo", json!({})),
+            call("work2", "echo", json!({})),
+        ]),
+        tool_response(vec![call(
+            "say",
+            "send_message",
+            json!({"text":"本批没有执行"}),
+        )]),
+        final_response("内部结束"),
+    ]);
+    let work = Arc::new(TestTool::new("echo", None, ToolMode::Echo));
+    let send = Arc::new(TestTool::new("send_message", None, ToolMode::Echo));
+    let (host, _, _) = make_host(
+        provider,
+        vec![work.clone(), send.clone()],
+        LlmHostConfig {
+            max_tool_calls: 2,
+            max_tool_rounds: 0,
+            final_answer_on_round_limit: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let out = host.run_turn(turn()).await.unwrap();
+    assert_eq!(out.diagnostics.started_tools, 1);
+    assert!(work.starts.lock().unwrap().is_empty());
+    assert_eq!(send.starts.lock().unwrap().len(), 1);
+}
+
 fn final_response(text: &str) -> Result<ModelResponse, LlmError> {
     Ok(ModelResponse::Final { text: text.into() })
 }

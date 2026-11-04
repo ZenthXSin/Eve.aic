@@ -88,6 +88,16 @@ impl OutreachAdmin for OutreachController {
     fn claim(&self, id: &str, at_ms: u64, channel: DeliveryChannel) -> OutreachResult<Invitation> {
         self.service()?.claim(id, at_ms, channel)
     }
+    fn claim_decided(
+        &self,
+        expected: &Invitation,
+        text: &str,
+        at_ms: u64,
+        channel: DeliveryChannel,
+    ) -> OutreachResult<Invitation> {
+        self.service()?
+            .claim_decided(expected, text, at_ms, channel)
+    }
     fn record_delivery(
         &self,
         id: &str,

@@ -1125,6 +1125,66 @@ pub(crate) struct ChannelAdapter(
     pub(crate) Arc<std::sync::OnceLock<Arc<Observations>>>,
 );
 impl QqOutreach for ChannelAdapter {
+    fn candidates(&self) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
+        let observations = self
+            .1
+            .get()
+            .ok_or_else(|| plugin_error("条件观察服务未就绪"))?;
+        self.0.snapshot().map_err(plugin_error)?.into_iter().filter(|t|t.delivery==Some(Delivery::Pending)&&t.owner.session_id.starts_with("qq:")&&observations.authorized(&t.owner)).map(|t|{
+            crate::qq_speech::candidate(format!("{}:run-{}",t.id,t.runs),Some(t.owner.clone()),t.owner.user_id.clone(),serde_json::json!({"kind":"wakeup_result","trigger_id":t.id,"run":t.runs,"status":t.status,"result":t.result,"created_at_ms":t.created_at_ms}))
+        }).collect()
+    }
+    fn claim_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+        text: &str,
+        _anchor: &str,
+    ) -> PluginResult<Option<QqOutreachPush>> {
+        if !self.candidates()?.contains(candidate) {
+            return Ok(None);
+        }
+        let id = candidate.facts["trigger_id"]
+            .as_str()
+            .ok_or_else(|| plugin_error("唤醒候选缺少 ID"))?;
+        let run = candidate.facts["run"]
+            .as_u64()
+            .ok_or_else(|| plugin_error("唤醒候选缺少 run"))? as u32;
+        match self
+            .0
+            .delivery_for_run(id, run, Delivery::Pending, Delivery::Sending)
+        {
+            Ok(()) => {}
+            Err(eve_trigger_api::TriggerError::Transition) => return Ok(None),
+            Err(e) => return Err(plugin_error(e)),
+        }
+        Ok(Some(QqOutreachPush {
+            session: candidate.session.clone(),
+            user_id: candidate.user_id.clone(),
+            message: QqOutreachMessage {
+                id: candidate.id.clone(),
+                text: text.into(),
+            },
+        }))
+    }
+    fn silence_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+    ) -> PluginResult<()> {
+        if !self.candidates()?.contains(candidate) {
+            return Ok(());
+        }
+        let Some(owner) = &candidate.session else {
+            return Ok(());
+        };
+        let id = candidate.facts["trigger_id"]
+            .as_str()
+            .ok_or_else(|| plugin_error("唤醒候选缺少 ID"))?;
+        let run = candidate.facts["run"]
+            .as_u64()
+            .ok_or_else(|| plugin_error("唤醒候选缺少 run"))? as u32;
+        self.0.silence_for_run(owner, id, run).map_err(plugin_error)
+    }
+
     fn due(&self, _: &SessionKey) -> PluginResult<bool> {
         Ok(false)
     }

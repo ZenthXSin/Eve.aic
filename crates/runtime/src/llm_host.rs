@@ -871,7 +871,27 @@ impl LlmHost {
                     &[],
                     "当前受信范围仅允许生成文字回复，不提供工具；不得声称执行任何外部操作",
                 );
+            } else {
+                let mut allowed_bindings = Vec::with_capacity(host.bindings.len());
+                for binding in host.bindings.drain(..) {
+                    if catch_unwind(AssertUnwindSafe(|| {
+                        policy.tool_allowed(scope, &binding.name)
+                    }))
+                    .map_err(|_| LlmError::Configuration("工具范围策略异常；未执行工具".into()))?
+                    {
+                        allowed_bindings.push(binding);
+                    }
+                }
+                host.bindings = allowed_bindings;
             }
+        }
+        if self.delegated {
+            host.bindings.retain(|binding| {
+                !matches!(
+                    binding.name.as_str(),
+                    "send_message" | "wait_for_input" | "send_sticker"
+                )
+            });
         }
         if host.shared_steps.is_none() {
             host.shared_steps = Some(eve_llm_api::SharedToolSteps::new(
@@ -1048,8 +1068,13 @@ impl LlmHost {
                     }),
                     Err(_) if self.allows_chat_without_tools(scope.as_ref()) => {
                         chat_without_tools = true;
-                        prepared.tools.clear();
-                        prepared.context.profile.push_str("\n本轮只能文字交流，不能使用工具或声称已经执行外部操作。正常接话；确实需要操作时说明本轮暂时不能执行，不要求用户补说历史消息。\n");
+                        prepared.tools.retain(|t| {
+                            matches!(
+                                t.definition.name.as_str(),
+                                "send_message" | "wait_for_input"
+                            )
+                        });
+                        prepared.context.profile.push_str("\n本轮只能文字交流或等待新输入，不能执行业务工具或声称已经执行外部操作。若装配 send_message，仍由你通过它决定发言。确实需要操作时说明本轮暂时不能执行，不要求用户补说历史消息。\n");
                         Vec::new()
                     }
                     Err(error) => return Err(fail(error, diagnostics)),
@@ -1131,6 +1156,10 @@ impl LlmHost {
             .iter()
             .map(|tool| tool.definition.clone())
             .collect::<Vec<_>>();
+        let expression = definitions
+            .iter()
+            .find(|d| d.name == "send_message")
+            .cloned();
         let mut messages = build_messages(&self.config, &prepared.context, &input, &definitions);
         // 检查点会持久化请求消息，带检查点的独立任务不附图像。
         if let Some(source) = self.image_source.as_deref()
@@ -1363,7 +1392,17 @@ impl LlmHost {
                         ModelRequest {
                             messages: messages.clone(),
                             tools: if closing {
-                                Vec::new()
+                                expression
+                                    .iter()
+                                    .filter(|_| {
+                                        diagnostics.calls.len() < self.config.max_tool_calls
+                                            && self
+                                                .shared_steps
+                                                .as_ref()
+                                                .is_none_or(|s| s.remaining().is_ok_and(|n| n > 0))
+                                    })
+                                    .cloned()
+                                    .collect()
                             } else {
                                 definitions.clone()
                             },
@@ -1436,7 +1475,11 @@ impl LlmHost {
             let ModelResponse::ToolCalls { calls } = response else {
                 unreachable!()
             };
-            if chat_without_tools {
+            if chat_without_tools
+                && calls
+                    .iter()
+                    .any(|c| !matches!(c.name.as_str(), "send_message" | "wait_for_input"))
+            {
                 return Err(fail(
                     LlmError::Context("本轮审核原话不足，仅允许文字交流；未执行工具".into()),
                     diagnostics,
@@ -1447,9 +1490,25 @@ impl LlmHost {
                     .config
                     .max_tool_calls
                     .saturating_sub(diagnostics.calls.len());
-            if closing
+            let closing_expression = closing
+                && !reporting
+                && expression.is_some()
+                && calls.len() == 1
+                && calls[0].name == "send_message";
+            // 同一工具总额度内保留最后一次表达机会，不在预算耗尽后代写总结。
+            let reserve_expression = !closing
+                && expression.is_some()
+                && calls.len()
+                    >= self
+                        .config
+                        .max_tool_calls
+                        .saturating_sub(diagnostics.calls.len())
+                && !calls.iter().any(|c| c.name == "send_message");
+            if (closing && !closing_expression)
                 || calls_exhausted
-                || (self.config.max_tool_rounds != 0
+                || reserve_expression
+                || (!closing_expression
+                    && self.config.max_tool_rounds != 0
                     && diagnostics.tool_batches >= self.config.max_tool_rounds)
             {
                 if closing && !reporting {
@@ -1464,7 +1523,9 @@ impl LlmHost {
                 closing = true;
                 messages.push(ChatMessage::text(
                     ChatRole::System,
-                    if calls_exhausted {
+                    if reserve_expression {
+                        "本批尚未执行；剩余最后一次工具机会留给你自主决定是否说话。需要表达时只调用 send_message，依据已有回执如实说清；不想说则直接内部结束。不得声称未做的工作已完成。".into()
+                    } else if calls_exhausted {
                         self.step_limit_notice(diagnostics.calls.len())
                     } else {
                         round_limit_notice(self.config.max_tool_rounds)
@@ -1633,6 +1694,12 @@ impl LlmHost {
             }
             // 恰好耗尽后直接收尾，不额外请求一个注定不能执行的工具批次。
             if (diagnostics.calls.len() == self.config.max_tool_calls
+                || expression.is_some()
+                    && self
+                        .config
+                        .max_tool_calls
+                        .saturating_sub(diagnostics.calls.len())
+                        == 1
                 || self
                     .shared_steps
                     .as_ref()
@@ -1642,7 +1709,9 @@ impl LlmHost {
                 closing = true;
                 messages.push(ChatMessage::text(
                     ChatRole::System,
-                    self.step_limit_notice(diagnostics.calls.len()),
+                    if expression.is_some() && diagnostics.calls.len()<self.config.max_tool_calls {
+                        "本轮仅剩一次工具机会，可用 send_message 表达已有结果，也可安静结束。由你决定说什么；没有新业务操作额度，不要承诺本轮还会继续执行。".into()
+                    } else {self.step_limit_notice(diagnostics.calls.len())},
                 ));
             }
         }
@@ -2350,10 +2419,11 @@ fn build_messages(
              清单不授予额外权限，不代表工具已执行；结果仍以真实调用返回为准。\
              只在用户询问或任务需要时解释能力，不机械复述内部标记。\
              max_tool_calls 是每轮单个工具调用总上限，失败和并行调用也计数；超出余额的批次整体不执行，依据已有结果收尾。\
-             tool_progress_reports 为 true 时宿主依据真实回执提供阶段反馈；进展不代表任务成功，不能声称停止后还会后台继续。"
+             tool_progress_reports 为 true 时宿主记录真实阶段事件；事件不代表对外发言或任务成功，不能声称停止后还会后台继续。"
     );
     if definitions.iter().any(|d| d.name == "send_message") {
-        fixed.push_str("\n执行多步任务时像与你并肩工作的同事一样沟通：开始前用 send_message 简短说明将做什么；完成一小阶段、有关键发现或遇到阻塞时，再用 send_message 说明实际做了什么、真实结果和下一步。连续工作约 45 秒时在工具返回后主动汇报，不要一直埋头执行。只依据已返回的工具证据，不把计划说成完成，不公开内部推理或密钥。把相关小步骤合并成一条，通常至少间隔 15 秒，不要逐工具刷屏；简单聊天直接最终回复。发送工具返回未送达时不要重试，继续工作并在最终答复保留必要内容。工具正在执行时宿主可补发真实等待状态；你仍须给出有内容的阶段小结。群消息由宿主艾特原触发者，不自行选择收件人。最终回复只交付结论、验证情况与未完成项，不重复途中消息。");
+        fixed.push('\n');
+        fixed.push_str(eve_llm_api::DIALOGUE_EXPRESSION_PROMPT);
     }
     // 进程内几乎不变的宿主资料并入这条固定提示，和工具清单一起留在历史之前的可缓存前缀里。
     if !context.pinned.is_empty() {

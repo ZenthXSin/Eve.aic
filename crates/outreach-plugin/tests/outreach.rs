@@ -111,6 +111,66 @@ fn passive(id: &str) -> DeliveryChannel {
     }
 }
 
+#[tokio::test]
+async fn authored_invitation_is_claimed_by_exact_facts_and_restores_actual_text_without_replay() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path());
+    let (kernel, admin) = open(store.clone()).await.unwrap();
+    let invitation = pending(&admin, "user-1", "authored", 100);
+    assert!(invitation.attempts.is_empty());
+    let before = store.raw().unwrap();
+    let mut changed = invitation.clone();
+    changed.text = Some("伪造的新草稿".into());
+    assert!(
+        admin
+            .claim_decided(&changed, "现在想说的话", 200, DeliveryChannel::Proactive)
+            .is_err()
+    );
+    assert_eq!(store.raw().unwrap(), before);
+    let claimed = admin
+        .claim_decided(
+            &invitation,
+            "刚试了那个方块，效果还不错",
+            200,
+            DeliveryChannel::Proactive,
+        )
+        .unwrap();
+    assert_eq!(
+        claimed.text, invitation.text,
+        "原事实草稿没有被改成已发送内容"
+    );
+    assert_eq!(claimed.delivered_text(), Some("刚试了那个方块，效果还不错"));
+    assert!(claimed.judgements.is_empty(), "没有补造旧式时机判断");
+    assert_eq!(store.saved()["format_version"], 2);
+    assert!(
+        admin
+            .claim_decided(
+                &invitation,
+                "同一决定不能重复认领",
+                201,
+                DeliveryChannel::Proactive
+            )
+            .is_err()
+    );
+    kernel.stop_all().await.unwrap();
+    let (kernel, admin) = open(store.clone()).await.unwrap();
+    let restored = admin
+        .snapshot()
+        .unwrap()
+        .invitations
+        .into_iter()
+        .find(|i| i.id == invitation.id)
+        .unwrap();
+    assert_eq!(restored.status, InvitationStatus::Unknown);
+    assert_eq!(restored.delivered_text(), claimed.delivered_text());
+    assert!(
+        admin
+            .claim_decided(&restored, "不能重发", 300, DeliveryChannel::Proactive)
+            .is_err()
+    );
+    kernel.stop_all().await.unwrap();
+}
+
 /// 对用户某条消息判断为“邀请”，随后才能被动附带。
 fn invite(admin: &OutreachController, id: &str, message: &str, at: u64) {
     admin.begin_judgement(id, message, at).unwrap();

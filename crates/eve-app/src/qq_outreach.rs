@@ -570,7 +570,7 @@ async fn listen(
             invitation_id: invitation.id.clone(),
             judge_version: services.responder.version().into(),
             invitation: prefix(
-                invitation.text.as_deref().unwrap_or_default(),
+                invitation.delivered_text().unwrap_or_default(),
                 MAX_MOMENT_BYTES,
             )
             .into(),
@@ -652,6 +652,106 @@ fn affordable(gate: &qq_budget::Gate) -> PluginResult<bool> {
         .map_err(|_| PluginError::State("自主运行预算不可用".into()))
 }
 impl QqOutreach for ChannelAdapter {
+    fn ordinary_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+    ) -> PluginResult<bool> {
+        if !self.candidates()?.contains(candidate) {
+            return Ok(false);
+        }
+        let Some(session) = &candidate.session else {
+            return Ok(false);
+        };
+        Ok(self
+            .conversations
+            .identity(session)?
+            .is_some_and(|i| i.source == eve_qqbot_plugin::QqInteractionSource::DirectMessage))
+    }
+    fn candidates(&self) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
+        let now = self.now()?;
+        let mut snapshot = self.outreach.snapshot().map_err(plugin_error)?;
+        let mut output = Vec::new();
+        while let Some(invitation) = snapshot.due_proactive(now, &self.policy).cloned() {
+            snapshot.invitations.retain(|i| i.id != invitation.id);
+            if !crate::qq_idle_chat::still_current(
+                &invitation,
+                self.memory.as_ref(),
+                self.settings.as_ref(),
+                now,
+            )
+            .map_err(|e| PluginError::State(e.to_string()))?
+            {
+                continue;
+            }
+            let session = match &invitation.origin {
+                eve_outreach_api::InvitationOrigin::IdleChat(source) => Some(
+                    SessionKey::new(&source.session_id, &invitation.owner)
+                        .map_err(|e| PluginError::State(e.to_string()))?,
+                ),
+                _ => None,
+            };
+            // 字段来自受信适配器；GuardedOutreach 仍在 claim 前重新查询同一候选。
+            let ordinary = session.as_ref().is_some_and(|s| {
+                self.conversations
+                    .identity(s)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|i| {
+                        i.source == eve_qqbot_plugin::QqInteractionSource::DirectMessage
+                    })
+            });
+            output.push(crate::qq_speech::candidate(invitation.id.clone(),session,invitation.owner.clone(),serde_json::json!({"kind":"invitation_facts","ordinary_invitation":ordinary,"invitation":invitation}))?);
+        }
+        Ok(output)
+    }
+    fn claim_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+        text: &str,
+        _anchor: &str,
+    ) -> PluginResult<Option<QqOutreachPush>> {
+        if !self.candidates()?.contains(candidate) {
+            return Ok(None);
+        }
+        let expected: eve_outreach_api::Invitation =
+            serde_json::from_value(candidate.facts["invitation"].clone())
+                .map_err(|_| PluginError::State("邀请候选无效".into()))?;
+        let claimed = match self.outreach.claim_decided(
+            &expected,
+            text,
+            self.now()?.max(after(&expected)),
+            DeliveryChannel::Proactive,
+        ) {
+            Ok(i) => i,
+            Err(OutreachError::Conflict) => return Ok(None),
+            Err(e) => return Err(plugin_error(e)),
+        };
+        Ok(Some(QqOutreachPush {
+            session: candidate.session.clone(),
+            user_id: claimed.owner,
+            message: QqOutreachMessage {
+                id: claimed.id,
+                text: text.into(),
+            },
+        }))
+    }
+    fn silence_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+    ) -> PluginResult<()> {
+        if !self.candidates()?.contains(candidate) {
+            return Ok(());
+        }
+        self.outreach
+            .cancel(
+                &candidate.id,
+                self.now()?,
+                eve_outreach_api::CancelReason::ChoseSilence,
+            )
+            .map_err(plugin_error)?;
+        Ok(())
+    }
+
     fn ordinary_direct_invitation(&self, id: &str) -> PluginResult<Option<SessionKey>> {
         let snapshot = self.outreach.snapshot().map_err(plugin_error)?;
         let Some(invitation) = snapshot
@@ -879,7 +979,7 @@ impl ContextAssembler for OutreachContext {
                 .for_owner(&scope.user_id)
                 .filter(|invitation| invitation.status == InvitationStatus::Delivered)
                 .filter_map(|invitation| {
-                    Some((invitation.delivered_at_ms?, invitation.text.as_deref()?))
+                    Some((invitation.delivered_at_ms?, invitation.delivered_text()?))
                 })
                 .filter(|(at, _)| now.saturating_sub(*at) <= CONTEXT_WINDOW_MS)
                 .max_by_key(|(at, _)| *at);
@@ -1113,6 +1213,9 @@ fn status(
             InvitationStatus::Cancelled(
                 eve_outreach_api::CancelReason::IdleConversationChanged,
             ) => "对话已恢复、过期或闲聊已关闭，已取消",
+            InvitationStatus::Cancelled(eve_outreach_api::CancelReason::ChoseSilence) => {
+                "Eve 选择安静，未发送"
+            }
             InvitationStatus::Failed(OutreachFailure::Exhausted) => "多次未能送达，已停止",
             InvitationStatus::Failed(_) => "撰写失败",
             InvitationStatus::Interrupted => "撰写时进程退出，不重放",

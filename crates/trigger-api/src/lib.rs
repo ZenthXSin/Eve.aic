@@ -108,6 +108,8 @@ pub enum Delivery {
     Unknown,
     /// 已可靠保存到本机 Web 收件箱；不表示平台发送或用户已阅读。
     StoredLocally,
+    /// Eve 已审视本次结果并选择不说；没有发送尝试，不表示失败或送达。
+    Silenced,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -188,7 +190,7 @@ pub trait TriggerAdmin: Send + Sync {
     }
     fn ready(&self, id: &str, evidence: Vec<String>) -> Result<()>;
     fn transition(&self, id: &str, from: Status, to: Status, result: Option<String>) -> Result<()>;
-    /// 仅上轮明确完成且投递已了结时推进，不补跑、不开启未知结果。
+    /// 仅上轮明确完成且投递已了结或明确选择安静时推进，不补跑、不开启未知结果。
     fn rearm(&self, _id: &str, _now: u64) -> Result<()> {
         Err(TriggerError::Transition)
     }
@@ -198,6 +200,11 @@ pub trait TriggerAdmin: Send + Sync {
     /// 周期回执须同时 CAS 周期代号，防止迟到的上一周期回执覆盖新周期。
     fn delivery_for_run(&self, _id: &str, _run: u32, _from: Delivery, _to: Delivery) -> Result<()> {
         Err(TriggerError::Transition)
+    }
+    /// 可信宿主已保存 Eve 的安静决定；精确身份与周期 CAS，仅 Pending 可结算。
+    /// 不经普通投递回执入口，不覆盖 Sending/Unknown；旧实现默认拒绝。
+    fn silence_for_run(&self, _owner: &SessionKey, _id: &str, _run: u32) -> Result<()> {
+        Err(TriggerError::Unavailable)
     }
     /// 仅宿主在收件箱 insert_once 持久提交后调用；精确身份与周期 CAS，重复结算幂等。
     /// 本地事件编号由 (owner, id, run) 冻结，不走平台 Sending/Unknown 路径。
@@ -289,6 +296,14 @@ mod tests {
                 spec,
                 vec!["请稍后继续核对".into()],
                 1000,
+            ),
+            Err(TriggerError::Unavailable)
+        );
+        assert_eq!(
+            custom.silence_for_run(
+                &SessionKey::new("trusted-session", "trusted-user").unwrap(),
+                "wake-reviewed",
+                1,
             ),
             Err(TriggerError::Unavailable)
         );

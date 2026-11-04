@@ -50,9 +50,10 @@ impl StoredQuestions {
                 }
                 let value =
                     strict_json::from_slice(&bytes).map_err(|_| CompletionError::CorruptState)?;
-                if value.get("format_version").and_then(|value| value.as_u64())
-                    != Some(u64::from(FORMAT_VERSION))
-                {
+                if !matches!(
+                    value.get("format_version").and_then(|value| value.as_u64()),
+                    Some(1 | 2)
+                ) {
                     return Err(if value.get("format_version").is_some() {
                         CompletionError::UnsupportedVersion
                     } else {
@@ -115,6 +116,33 @@ impl StoredQuestions {
         message_id: &str,
         now_ms: u64,
     ) -> CompletionResult<CompletionQuestion> {
+        self.claim_inner(target, message_id, now_ms, None)
+    }
+    pub(super) fn claim_decided(
+        &self,
+        target: &QuestionTarget,
+        anchor: &str,
+        text: &str,
+        now_ms: u64,
+    ) -> CompletionResult<CompletionQuestion> {
+        if text.trim().is_empty()
+            || text.trim() != text
+            || text.len() > 2048
+            || text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+        {
+            return Err(CompletionError::InvalidInput);
+        }
+        self.claim_inner(target, anchor, now_ms, Some(text))
+    }
+    fn claim_inner(
+        &self,
+        target: &QuestionTarget,
+        message_id: &str,
+        now_ms: u64,
+        text: Option<&str>,
+    ) -> CompletionResult<CompletionQuestion> {
         target.validate()?;
         validate_id(message_id)?;
         if now_ms == 0 {
@@ -122,6 +150,8 @@ impl StoredQuestions {
         }
         let id = question_id(&target.owner, &target.plan_id);
         let attempt = QuestionAttempt {
+            proactive: text.is_some(),
+            actual_text: text.map(str::to_owned),
             message_id: message_id.into(),
             started_at_ms: now_ms,
             finished_at_ms: None,
@@ -249,7 +279,15 @@ fn encode(ledger: &Ledger) -> CompletionResult<Vec<u8>> {
     if ledger.questions.len() > MAX_QUESTIONS {
         return Err(CompletionError::LimitReached);
     }
-    let bytes = serde_json::to_vec(ledger).map_err(|_| CompletionError::InvalidInput)?;
+    let mut wire = ledger.clone();
+    if wire.questions.iter().any(|q| {
+        q.attempts
+            .iter()
+            .any(|a| a.proactive || a.actual_text.is_some())
+    }) {
+        wire.format_version = 2;
+    }
+    let bytes = serde_json::to_vec(&wire).map_err(|_| CompletionError::InvalidInput)?;
     if bytes.len() > MAX_STATE_BYTES {
         return Err(CompletionError::LimitReached);
     }
@@ -257,6 +295,15 @@ fn encode(ledger: &Ledger) -> CompletionResult<Vec<u8>> {
 }
 
 fn validate_ledger(ledger: &Ledger) -> CompletionResult<()> {
+    if ledger.format_version == 1
+        && ledger.questions.iter().any(|q| {
+            q.attempts
+                .iter()
+                .any(|a| a.proactive || a.actual_text.is_some())
+        })
+    {
+        return Err(CompletionError::CorruptState);
+    }
     if ledger.questions.len() > MAX_QUESTIONS {
         return Err(CompletionError::CorruptState);
     }

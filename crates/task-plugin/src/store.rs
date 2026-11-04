@@ -723,8 +723,35 @@ impl StoredTasks {
         channel: DeliveryChannel,
         now_ms: u64,
     ) -> TaskResult<Task> {
+        self.claim_notice_inner(id, None, channel, now_ms)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn claim_notice_expected(
+        &self,
+        owner: &TaskOwner,
+        id: &str,
+        finished_at_ms: u64,
+        attempt_count: usize,
+        channel: DeliveryChannel,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        let expected = NoticeExpectation::new(owner, id, finished_at_ms, attempt_count)?;
+        self.claim_notice_inner(id, Some(expected), channel, now_ms)
+    }
+
+    fn claim_notice_inner(
+        &self,
+        id: &str,
+        expected: Option<NoticeExpectation<'_>>,
+        channel: DeliveryChannel,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
         validate_channel(&channel)?;
         self.update(id, now_ms, |task| {
+            if let Some(expected) = expected {
+                expected.check(task)?;
+            }
             let at = now_ms.max(last_time(task));
             let notice = task
                 .notice
@@ -754,12 +781,45 @@ impl StoredTasks {
         result: DeliveryResult,
         now_ms: u64,
     ) -> TaskResult<Task> {
-        validate_result(&result)?;
-        if result == DeliveryResult::Unknown {
-            // 结果未知只由重启核对写入。
+        self.record_delivery_inner(id, None, result, now_ms)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_delivery_expected(
+        &self,
+        owner: &TaskOwner,
+        id: &str,
+        finished_at_ms: u64,
+        attempt_count: usize,
+        result: DeliveryResult,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        let expected = NoticeExpectation::new(owner, id, finished_at_ms, attempt_count)?;
+        if attempt_count == 0 {
             return Err(TaskError::InvalidInput);
         }
+        self.record_delivery_inner(id, Some(expected), result, now_ms)
+    }
+
+    fn record_delivery_inner(
+        &self,
+        id: &str,
+        expected: Option<NoticeExpectation<'_>>,
+        result: DeliveryResult,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        let result = match result {
+            // 请求结果没有可核对的平台编号，不能作为已送达依据。
+            DeliveryResult::Sent {
+                platform_message_id: None,
+            } => DeliveryResult::Unknown,
+            other => other,
+        };
+        validate_result(&result)?;
         self.update(id, now_ms, |task| {
+            if let Some(expected) = expected {
+                expected.check(task)?;
+            }
             let at = now_ms.max(last_time(task));
             let notice = task
                 .notice
@@ -775,6 +835,9 @@ impl StoredTasks {
             attempt.finished_at_ms = Some(at);
             attempt.result = Some(result.clone());
             match result {
+                DeliveryResult::Unknown => {
+                    notice.status = NoticeStatus::Unknown;
+                }
                 DeliveryResult::Sent { .. } => {
                     notice.status = NoticeStatus::Delivered;
                     notice.closed_at_ms = Some(at);
@@ -898,6 +961,46 @@ impl StoredTasks {
             .lock()
             .map_err(|_| PluginError::State("后台任务状态锁不可用".into()))?
             .context = None;
+        Ok(())
+    }
+}
+
+struct NoticeExpectation<'a> {
+    owner: &'a TaskOwner,
+    finished_at_ms: u64,
+    attempt_count: usize,
+}
+impl<'a> NoticeExpectation<'a> {
+    fn new(
+        owner: &'a TaskOwner,
+        id: &str,
+        finished_at_ms: u64,
+        attempt_count: usize,
+    ) -> TaskResult<Self> {
+        validate_owner(owner)?;
+        validate_id(id)?;
+        if finished_at_ms == 0 || attempt_count > MAX_ATTEMPTS {
+            return Err(TaskError::InvalidInput);
+        }
+        Ok(Self {
+            owner,
+            finished_at_ms,
+            attempt_count,
+        })
+    }
+
+    fn check(&self, task: &Task) -> TaskResult<()> {
+        if &task.owner != self.owner {
+            return Err(TaskError::NotFound);
+        }
+        if task.finished_at_ms != Some(self.finished_at_ms)
+            || task
+                .notice
+                .as_ref()
+                .is_none_or(|notice| notice.attempts.len() != self.attempt_count)
+        {
+            return Err(TaskError::InvalidTransition);
+        }
         Ok(())
     }
 }

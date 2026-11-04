@@ -21,7 +21,7 @@ pub(crate) fn valid_id(v: &str) -> bool {
         && v.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
-pub(crate) fn valid_message_id(v: &str) -> bool {
+pub fn valid_message_id(v: &str) -> bool {
     !v.is_empty()
         && v.len() <= MAX_MESSAGE_ID_BYTES
         && v.trim() == v
@@ -207,6 +207,8 @@ pub(crate) enum ReceiptState {
     Unknown,
     /// 连发的消息并入同一会话稍后的一条，由那一条统一回复；本条不单独回复。
     Merged,
+    /// 本轮内部处理已结束；只有 progress 中带真实回执的显式发言算已说。
+    Handled,
 }
 /// 单个片段的投递状态。Sending 在写出前保存；重启后表示是否送达不确定，不会补发。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -266,7 +268,7 @@ impl Segments {
             ReceiptState::Unknown => {
                 !rest.is_empty() && tail(PartState::Unknown, PartState::Skipped)
             }
-            ReceiptState::Merged => false,
+            ReceiptState::Merged | ReceiptState::Handled => false,
         }
     }
 }
@@ -277,6 +279,9 @@ pub(crate) struct Receipt {
     pub message: Message,
     pub state: ReceiptState,
     pub reply: Option<String>,
+    /// 只有实际完成的自主对话轮才写入；命令处理结束不冒充某个 Control 轮次。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_turn_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segments: Option<Segments>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -287,6 +292,46 @@ pub(crate) struct Receipt {
     /// 正文发完后附带发出的表情包；失败或中断不重发。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sticker: Option<StickerPart>,
+}
+impl Receipt {
+    pub(crate) fn confirmed_outbound(&self) -> bool {
+        self.state == ReceiptState::Sent
+            || self.progress.iter().any(|p| {
+                p.state == PartState::Sent
+                    && p.platform_message_id
+                        .as_deref()
+                        .is_some_and(valid_message_id)
+            })
+    }
+    pub(crate) fn spoken_text(&self) -> String {
+        self.progress
+            .iter()
+            .filter(|p| {
+                p.image_path.is_none()
+                    && p.decision_id.is_some()
+                    && p.state == PartState::Sent
+                    && p.platform_message_id
+                        .as_deref()
+                        .is_some_and(valid_message_id)
+            })
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+    fn failed_text(&self) -> Option<String> {
+        self.progress
+            .iter()
+            .rev()
+            .find(|p| {
+                p.image_path.is_none() && p.decision_id.is_some() && p.state == PartState::Failed
+            })
+            .map(|p| p.text.clone())
+            .or_else(|| {
+                (self.state == ReceiptState::Failed)
+                    .then(|| self.reply.clone())
+                    .flatten()
+            })
+    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -305,12 +350,21 @@ pub(crate) struct Progress {
     /// 必要授权或问题独立于普通进度节奏，但仍占实际平台消息额度。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub necessary: bool,
+    /// 显式发言的工具调用与平台回执；旧进度记录缺省为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_message_id: Option<String>,
+    /// 显式图片表达；text 是库中描述，不是发送的文字。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_path: Option<String>,
 }
 pub(crate) fn passive_progress(entry: &Receipt) -> usize {
     entry.progress.iter().filter(|p| !p.proactive).count()
 }
 /// 格式 1 不含片段，2 包含分段，3 包含途中进展，4 包含合并的连发消息，5 包含附带的表情包，
 /// 6 绑定归档库，7 允许后到的轮内引导并入较早的原轮回执，8 区分主动阶段消息与被动配额。
+/// 9 区分内部处理结束与显式发言，并保存发言决定 ID 和真实平台编号。
 /// 旧版本拒绝读取而不是忽略投递记录。
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -375,7 +429,11 @@ impl Ledger {
                 || passive_progress(entry) > 3
                 || entry.progress.iter().any(|p| {
                     p.text.trim().is_empty()
-                        || p.text.len() > 1024
+                        || p.text.len() > if p.decision_id.is_some() {32768} else {1024}
+                        || p.decision_id.as_ref().is_some_and(|id| !valid_message_id(id))
+                        || (p.decision_id.is_some() && p.state == PartState::Sent && p.platform_message_id.is_none())
+                        || p.image_path.as_ref().is_some_and(|path|p.decision_id.is_none() || path.is_empty() || path.len()>4096 || path.chars().any(char::is_control))
+                        || p.platform_message_id.as_ref().is_some_and(|id| p.decision_id.is_none() || !valid_message_id(id) || p.state != PartState::Sent)
                         || !matches!(
                             p.state,
                             PartState::Sending | PartState::Sent | PartState::Failed | PartState::Unknown
@@ -396,6 +454,7 @@ impl Ledger {
                             && !matches!(sticker.state, PartState::Pending | PartState::Skipped))
                 })
                 || (entry.state == ReceiptState::Merged) != entry.merged_into.is_some()
+                || (entry.state == ReceiptState::Handled && (entry.reply.is_some() || entry.segments.is_some() || entry.sticker.is_some()))
                 || (entry.state == ReceiptState::Merged
                     && (entry.reply.is_some()
                         || entry.segments.is_some()
@@ -412,6 +471,7 @@ impl Ledger {
                                 && e.message.user_id == entry.message.user_id
                         })
                 })
+                || entry.control_turn_id.is_some_and(|id|id==0 || entry.state!=ReceiptState::Handled)
             {
                 return Err(corrupt());
             }
@@ -420,7 +480,15 @@ impl Ledger {
         Ok(ledger)
     }
     fn format(&self) -> u8 {
-        if self
+        if self.entries.iter().any(|e| {
+            e.state == ReceiptState::Handled
+                || e.control_turn_id.is_some()
+                || e.progress
+                    .iter()
+                    .any(|p| p.decision_id.is_some() || p.platform_message_id.is_some())
+        }) {
+            9
+        } else if self
             .entries
             .iter()
             .any(|e| e.progress.iter().any(|p| p.proactive))
@@ -458,23 +526,6 @@ impl Ledger {
         self.entries
             .iter()
             .position(|r| r.app_id == app && r.message.id == id)
-    }
-
-    /// 私聊追加消息单独投递宿主确认；确认只表示已接收引导，不是原任务完成。
-    /// 沿用 Processing/ReplyPending 回执，重启不重放追加消息或确认通知。
-    pub fn acknowledge_steering(
-        &mut self,
-        ctx: &PluginContext,
-        app: &str,
-        id: &str,
-        text: &str,
-    ) -> PluginResult<()> {
-        let index = self.find(app, id).ok_or_else(corrupt)?;
-        if self.entries[index].state != ReceiptState::Processing {
-            return Err(corrupt());
-        }
-        self.entries[index].reply = Some(text.into());
-        self.save(ctx)
     }
 
     pub fn steer(
@@ -540,10 +591,9 @@ impl Ledger {
             entry.app_id == app
                 && entry.message.session_key(app).ok().as_ref() == Some(&session)
                 && entry.message.text.trim() != "/last-reply"
-                && entry.state == ReceiptState::Failed
-                && entry.reply.is_some()
+                && entry.failed_text().is_some()
         }) {
-            return Ok(entry.reply.clone());
+            return Ok(entry.failed_text());
         }
         let bytes = self
             .backend
@@ -555,13 +605,12 @@ impl Ledger {
         if entry.as_ref().is_some_and(|e| {
             e.app_id != app
                 || e.message.session_key(app).ok().as_ref() != Some(&session)
-                || e.state != ReceiptState::Failed
-                || e.reply.is_none()
+                || e.failed_text().is_none()
                 || e.message.text.trim() == "/last-reply"
         }) {
             return Err(corrupt());
         }
-        Ok(entry.and_then(|e| e.reply))
+        Ok(entry.and_then(|e| e.failed_text()))
     }
 
     /// 仅在循环边界归档；提交数据库后才缩小活跃账本，失败恢复内存且保留两边原数据。
@@ -593,7 +642,7 @@ impl Ledger {
                 &e.message.user_id,
             );
             let latest_session = latest.insert(identity);
-            let latest_confirmed = e.state == ReceiptState::Sent && confirmed.insert(identity);
+            let latest_confirmed = e.confirmed_outbound() && confirmed.insert(identity);
             let pinned = matches!(
                 e.state,
                 ReceiptState::Processing | ReceiptState::ReplyPending
@@ -638,8 +687,7 @@ impl Ledger {
                     app_id: e.app_id.clone(),
                     message_id: e.message.id.clone(),
                     session_id: e.message.session_key(&e.app_id)?.session_id,
-                    failed_reply: e.state == ReceiptState::Failed
-                        && e.reply.is_some()
+                    failed_reply: e.failed_text().is_some()
                         && e.message.text.trim() != "/last-reply",
                     payload: serde_json::to_vec(e).map_err(|_| corrupt())?,
                 })
@@ -732,6 +780,7 @@ impl Ledger {
                     ReceiptState::Processing
                 },
                 reply: None,
+                control_turn_id: None,
                 segments: None,
                 progress: vec![],
                 merged_into: merged.then(|| target.id.clone()),
@@ -766,6 +815,7 @@ impl Ledger {
             message,
             state: ReceiptState::Processing,
             reply: None,
+            control_turn_id: None,
             segments: None,
             progress: vec![],
             merged_into: None,
@@ -791,7 +841,7 @@ impl Ledger {
     }
 }
 pub(crate) fn decode_archived(bytes: &[u8]) -> PluginResult<Receipt> {
-    if bytes.len() > 512 * 1024 {
+    if bytes.len() > MAX_BYTES {
         return Err(corrupt());
     }
     let entry: Receipt = serde_json::from_slice(bytes).map_err(|_| corrupt())?;
@@ -799,6 +849,7 @@ pub(crate) fn decode_archived(bytes: &[u8]) -> PluginResult<Receipt> {
         if !valid_id(&entry.app_id)
             || !entry.message.valid()
             || entry.reply.is_some()
+            || entry.control_turn_id.is_some()
             || entry.segments.is_some()
             || !entry.progress.is_empty()
             || entry.sticker.is_some()
@@ -863,6 +914,7 @@ mod tests {
             state,
             progress: vec![],
             reply: (state != ReceiptState::Processing).then(|| REPLY.into()),
+            control_turn_id: None,
             segments: parts.map(|parts| Segments {
                 planner: "paragraph-v1".into(),
                 parts: parts
@@ -886,6 +938,129 @@ mod tests {
             ..Ledger::default()
         };
         Ledger::decode(&ledger.encode()?)
+    }
+
+    #[test]
+    fn handled_turn_records_only_receipted_expression_as_spoken() {
+        let mut entry = receipt(ReceiptState::Handled, None);
+        entry.reply = None;
+        entry.control_turn_id = Some(17);
+        entry.progress = vec![
+            Progress {
+                text: "实际说过的话".into(),
+                state: Sent,
+                proactive: false,
+                necessary: false,
+                decision_id: Some("text-call".into()),
+                platform_message_id: Some("platform-text".into()),
+                image_path: None,
+            },
+            Progress {
+                text: "开心的猫，图片描述不是文字发言".into(),
+                state: Sent,
+                proactive: false,
+                necessary: false,
+                decision_id: Some("image-call".into()),
+                platform_message_id: Some("platform-image".into()),
+                image_path: Some("/stickers/cat.png".into()),
+            },
+            Progress {
+                text: "投递未知的话".into(),
+                state: Unknown,
+                proactive: true,
+                necessary: false,
+                decision_id: Some("unknown-call".into()),
+                platform_message_id: None,
+                image_path: None,
+            },
+            Progress {
+                text: "明确失败的话".into(),
+                state: Failed,
+                proactive: true,
+                necessary: false,
+                decision_id: Some("failed-call".into()),
+                platform_message_id: None,
+                image_path: None,
+            },
+        ];
+        let ledger = round_trip(entry).unwrap();
+        assert_eq!(ledger.version, 9);
+        let entry = &ledger.entries[0];
+        assert_eq!(entry.control_turn_id, Some(17));
+        assert!(entry.confirmed_outbound());
+        assert_eq!(entry.spoken_text(), "实际说过的话");
+        assert_eq!(entry.failed_text().as_deref(), Some("明确失败的话"));
+        let restored = decode_archived(&serde_json::to_vec(entry).unwrap()).unwrap();
+        assert_eq!(restored.spoken_text(), entry.spoken_text());
+        assert_eq!(restored.control_turn_id, Some(17));
+    }
+
+    #[test]
+    fn authored_success_requires_platform_receipt_and_handled_binding_is_checked() {
+        let mut entry = receipt(ReceiptState::Handled, None);
+        entry.reply = None;
+        entry.control_turn_id = Some(1);
+        entry.progress.push(Progress {
+            text: "自主发言".into(),
+            state: Sent,
+            proactive: false,
+            necessary: false,
+            decision_id: Some("call".into()),
+            platform_message_id: Some("message".into()),
+            image_path: None,
+        });
+        let mut ledger = round_trip(entry).unwrap();
+        let valid: serde_json::Value = serde_json::from_slice(&ledger.encode().unwrap()).unwrap();
+        for (field, value) in [
+            ("decision_id", serde_json::Value::Null),
+            ("platform_message_id", serde_json::Value::Null),
+            ("platform_message_id", "\n".into()),
+            ("state", "Unknown".into()),
+        ] {
+            let mut corrupt = valid.clone();
+            corrupt["entries"][0]["progress"][0][field] = value;
+            assert!(
+                Ledger::decode(&serde_json::to_vec(&corrupt).unwrap()).is_err(),
+                "invalid {field}"
+            );
+        }
+        for (field, value) in [
+            ("control_turn_id", 0.into()),
+            ("state", "Processing".into()),
+            ("reply", "内部 final 不能混成外发回执".into()),
+        ] {
+            let mut corrupt = valid.clone();
+            corrupt["entries"][0][field] = value;
+            assert!(
+                Ledger::decode(&serde_json::to_vec(&corrupt).unwrap()).is_err(),
+                "invalid {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_authored_expression_history_survives_cold_archive_serialization() {
+        let mut entry = receipt(ReceiptState::Handled, None);
+        entry.reply = None;
+        entry.control_turn_id = Some(2);
+        for index in 0..64 {
+            entry.progress.push(Progress {
+                text: "x".repeat(32768),
+                state: if index == 63 { Unknown } else { Sent },
+                proactive: index >= 2,
+                necessary: false,
+                decision_id: Some(format!("call-{index}")),
+                platform_message_id: (index < 63).then(|| format!("platform-{index}")),
+                image_path: None,
+            });
+        }
+        let bytes = serde_json::to_vec(&entry).unwrap();
+        assert!(bytes.len() > 512 * 1024);
+        let restored = decode_archived(&bytes).unwrap();
+        assert_eq!(restored.progress.len(), 64);
+        assert_eq!(restored.progress[63].state, Unknown);
+        assert_eq!(restored.progress[63].text.len(), 32768);
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), bytes);
     }
 
     #[test]
@@ -962,6 +1137,9 @@ mod tests {
         for state in [Sending, Sent, Failed, Unknown] {
             let mut entry = receipt(ReceiptState::Processing, None);
             entry.progress.push(Progress {
+                decision_id: None,
+                platform_message_id: None,
+                image_path: None,
                 necessary: false,
                 text: "资料检索已返回结果。".into(),
                 state,
@@ -976,6 +1154,9 @@ mod tests {
         let mut entry = receipt(ReceiptState::Sent, Some(&[Sent, Sent, Sent]));
         for _ in 0..3 {
             entry.progress.push(Progress {
+                decision_id: None,
+                platform_message_id: None,
+                image_path: None,
                 necessary: false,
                 text: "回执".into(),
                 state: Sent,
@@ -989,6 +1170,9 @@ mod tests {
     fn necessary_questions_keep_their_own_persisted_kind() {
         let mut entry = receipt(ReceiptState::Processing, None);
         entry.progress.push(Progress {
+            decision_id: None,
+            platform_message_id: None,
+            image_path: None,
             text: "需要保留哪个目录？".into(),
             state: Sent,
             proactive: false,
@@ -1008,6 +1192,9 @@ mod tests {
         let mut entry = receipt(ReceiptState::Sent, Some(&[Sent, Sent, Sent]));
         for i in 0..6 {
             entry.progress.push(Progress {
+                decision_id: None,
+                platform_message_id: None,
+                image_path: None,
                 necessary: false,
                 text: "真实阶段".into(),
                 state: if i == 5 { Sending } else { Sent },

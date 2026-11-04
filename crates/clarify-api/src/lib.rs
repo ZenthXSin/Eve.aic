@@ -120,6 +120,11 @@ pub enum DeliveryResult {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeliveryAttempt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_text: Option<String>,
+    /// 主动发送仍保留本次决定依据的真实入站锚点，但不冒充被动回复。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub proactive: bool,
     pub message_id: String,
     pub started_at_ms: u64,
     pub finished_at_ms: Option<u64>,
@@ -132,6 +137,7 @@ pub enum CancelReason {
     GoalChanged,
     /// 学习目标已取消或结束，例如用户撤回了兴趣。
     GoalClosed,
+    ChoseSilence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -193,6 +199,13 @@ pub struct Clarification {
     pub closed_at_ms: Option<u64>,
 }
 impl Clarification {
+    pub fn delivered_question(&self) -> Option<&str> {
+        self.attempts
+            .last()
+            .and_then(|a| a.actual_text.as_deref())
+            .or(self.question.as_deref())
+    }
+
     /// 正在进行的时机判断。
     pub fn judging(&self) -> bool {
         self.judgements
@@ -371,6 +384,17 @@ pub trait ClarifyAdmin: Send + Sync {
     ) -> ClarifyResult<Clarification>;
     /// 保存一次投递尝试并进入 Delivering；返回后才可发送。须先有对这条消息“适合附带”的判断。
     fn claim(&self, id: &str, message_id: &str, at_ms: u64) -> ClarifyResult<Clarification>;
+    /// Eve 已持久保存主动提问决定；精确核验审视时的记录，不重新撰写。
+    fn claim_decided(
+        &self,
+        _expected: &Clarification,
+        _text: &str,
+        _anchor: &str,
+        _at_ms: u64,
+    ) -> ClarifyResult<Clarification> {
+        Err(ClarifyError::Unavailable)
+    }
+
     /// 保存投递结果：送达进入 Delivered；没有写出或平台拒绝时回到 Pending，尝试用尽记为失败。
     fn record_delivery(
         &self,

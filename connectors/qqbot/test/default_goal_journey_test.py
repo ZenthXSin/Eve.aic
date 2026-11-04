@@ -85,13 +85,13 @@ class DefaultGoalJourneyAcceptance(progress.TaskProgressAcceptance):
         if default.WORKER not in body["messages"][0].get("content", ""):
             self.assert_default_tools(body)
             if self.text(body) != self.originals[-1]:
-                return default.text_response("原任务和条件保留")
+                return self.say("原任务和条件保留")
             if not self.results(body):
                 return default.tool_response("journey-dispatch", "dispatch_background_task", {
                     "title": "修复出发时间", "instructions": self.originals[-1],
                     "max_steps": 5, "include_context": True, "verification": self.contract})
             self.assertTrue(self.results(body)[-1].get("dispatched"), self.results(body))
-            return default.text_response("后台目标已保存")
+            return self.say("后台目标已保存")
         results = self.all_results(body)
         if not results:
             return default.tool_response("baseline", "run_command", self.command)
@@ -183,7 +183,8 @@ class DefaultGoalJourneyAcceptance(progress.TaskProgressAcceptance):
         attempts = [json.loads(line) for line in (self.project / "attempts.jsonl").read_text().splitlines()]
         self.assertEqual(attempts, [{"passed": False, "cases": 3}, {"passed": True, "cases": 3}])
         self.assertEqual(len(self.reviews), 2)
-        self.assertEqual([push["id"] for push in self.pushes()], ["taskprogress-" + task["id"] + "-1", task["id"]])
+        self.assertEqual([push["id"] for push in self.pushes()], ["taskprogress-" + task["id"] + "-1",
+            f'{task["id"]}:finish-{task["finished_at_ms"]}:attempt-1'])
         journal = self.state / "developer-tools" / "operations.jsonl"
         saved_journal = journal.read_bytes()
         saved_attempts = (self.project / "attempts.jsonl").read_bytes()

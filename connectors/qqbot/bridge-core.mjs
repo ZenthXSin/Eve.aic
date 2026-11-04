@@ -23,7 +23,7 @@ function diagnostic(err) {
   if (Number.isSafeInteger(code)) out.biz_code = code;
   // 仅分类标准网络错误码，不记录原始 error、请求体或凭据；未知投递仍不重试。
   const transport = typeof err?.cause?.code === "string" ? err.cause.code : err?.code;
-  out.failure_kind = out.http_status ? "http" :
+  out.failure_kind = ["stale_decision", "outbound_limit", "reply_limit"].includes(err?.message) ? err.message : out.http_status ? "http" :
     ["AbortError", "TimeoutError"].includes(err?.name) ||
       ["ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"].includes(transport) ? "timeout" :
     ["ENOTFOUND", "EAI_AGAIN"].includes(transport) ? "dns" :
@@ -189,6 +189,8 @@ export function optionsFromEnv(env) {
 }
 export function createBridge(bot, emit, limit = 128, now = () => performance.now(), group = {}, timers = {}) {
   const pending = new Map();
+  const latestInput = new Map();
+  const routeKey = (scope, target, sender) => JSON.stringify([scope,target,sender]);
   const pushing = new Set();
   const warned = new Set();
   let activeSends = 0;
@@ -224,10 +226,13 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
   }
   // Share one bound across passive replies, segments and proactive messages.
   // Admission failure happens before the SDK call and is never queued/retried.
-  async function sendText(target, text, mention, timeout = SEND_TIMEOUT_MS) {
+  async function sendText(target, text, mention, timeout = SEND_TIMEOUT_MS, guard) {
     text = mentionedText(target, text, mention);
     if (Buffer.byteLength(text) > 32768) throw new Error("reply_limit");
-    const result = await boundedSend(() => bot.sendText(target, text), timeout);
+    const result = await boundedSend(() => {
+      if (guard && !guard()) throw new Error("stale_decision");
+      return bot.sendText(target, text);
+    }, timeout);
     if (!validMessageId(result?.id)) throw new Error("platform_message_id_unknown");
     return result;
   }
@@ -239,8 +244,11 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     return result;
   }
   // 表情包作为原消息的被动回复图片发出，同样计入并发上限。
-  async function sendImage(target, localPath) {
-    const result = await boundedSend(() => bot.sendImage(target, { localPath }), SEND_TIMEOUT_MS);
+  async function sendImage(target, localPath, guard) {
+    const result = await boundedSend(() => {
+      if(guard && !guard()) throw new Error("stale_decision");
+      return bot.sendImage(target, { localPath });
+    }, SEND_TIMEOUT_MS);
     if (!validMessageId(result?.message?.id)) throw new Error("platform_message_id_unknown");
     return result;
   }
@@ -248,6 +256,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     if (closed) return;
     closed = true;
     pending.clear();
+    latestInput.clear();
     bot.stop();
   };
   bot.on("ready", () => send({ type: "ready" }));
@@ -288,6 +297,16 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     if (Buffer.byteLength(JSON.stringify({ version: 1, ...frame })) > MAX_INBOUND_FRAME) {
       warn("frame_limit"); return;
     }
+    // 所有验证过的真实输入都使旧决定过期，包括无需唤醒的群消息。
+    const inputKey=routeKey(msg.kind,target.targetId,msg.senderId);
+    latestInput.delete(inputKey);
+    latestInput.set(inputKey,msg.messageId);
+    if (msg.kind === "group") {
+      const groupKey=routeKey("group",target.targetId,"*");
+      latestInput.delete(groupKey);
+      latestInput.set(groupKey,msg.messageId);
+    }
+    while(latestInput.size>8192) latestInput.delete(latestInput.keys().next().value);
     if (msg.kind === "group" && group.observe) {
       // 容量满时只保留本条可信缩权入口，不因此新增群观察或待回复路由。
       if (!restrictionOnly) {
@@ -328,28 +347,8 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       return { ok: true, ...meta,
         ...(validMessageId(result?.id) ? { message_id: result.id } : {}) };
     } catch (err) {
-      const error = diagnostic(err);
-      let notice_status = "not_attempted";
-      let notice_diagnostic = {};
-      // Only a definitive platform rejection permits a separate short notice.
-      // Unknown network outcomes, auth errors and rate limits are never retried.
-      if (!closed && [400, 404, 413, 422].includes(error.http_status) &&
-          Number.isSafeInteger(error.biz_code) && !item.noticeAttempted) {
-        item.noticeAttempted = true;
-        let timer;
-        try {
-          const attempt = sendText({ scope: item.target.scope, targetId: item.target.targetId },
-            "本轮回复已保存，但 QQ 正文投递失败。发送 /last-reply 取回，不会重新执行任务。", replyMention(item))
-            .then(() => ({ state: "sent" }), error => ({ state: diagnostic(error).http_status ? "failed" : "unknown", error }));
-          const result = await Promise.race([attempt, new Promise(resolve => {
-            timer = setTimeout(() => resolve({ state: "unknown" }), 3000);
-          })]);
-          notice_status = result.state;
-          if (result.error) notice_diagnostic = Object.fromEntries(Object.entries(diagnostic(result.error))
-            .map(([key, value]) => ["notice_" + key, value]));
-        } finally { clearTimeout(timer); }
-      }
-      return { ok: false, ...meta, ...error, notice_status, ...notice_diagnostic };
+      // 传输只回报事实；是否解释失败以及怎么说，留给 Eve。
+      return { ok: false, ...meta, ...diagnostic(err) };
     }
   }
   async function segment(frame, item) {
@@ -410,7 +409,7 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
     if (item.sending || item.next !== undefined || frame.index !== index || index >= 64 || (frame.proactive !== true && (item.passiveProgress ?? index) >= 3)) {
       warn("invalid_progress"); return;
     }
-    if (!validText(frame.text) || Buffer.byteLength(frame.text) > 1024) {
+    if (!validText(frame.text) || Buffer.byteLength(frame.text) > (frame.explicit === true ? 32768 : 1024)) {
       warn("invalid_progress");
       send({ type: "delivery", id: frame.id, progress: true, index, ok: false });
       return;
@@ -433,9 +432,13 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         return;
       }
       const target = proactive ? {scope: item.target.scope, targetId: item.target.targetId} : item.target;
-      const result = await sendText(target, frame.text, replyMention(item));
+      const guard=frame.explicit===true ? () => !item.finished && latestInput.get(routeKey(item.target.scope,item.target.targetId,item.senderId)) === (frame.based_on_message_id ?? frame.id) : undefined;
+      const image=frame.image_path;
+      if(image!==undefined && (frame.explicit!==true || typeof image!=="string" || !image || image.length>4096 || /[\p{Cc}]/u.test(image))) throw new Error("invalid_image_path");
+      const result = image===undefined ? await sendText(target, frame.text, replyMention(item), SEND_TIMEOUT_MS, guard) : await sendImage(target,image,guard);
+      const messageId=image===undefined ? result?.id : result?.message?.id;
       send({ type: "delivery", id: frame.id, progress: true, index, ok: true, delivery_mode: proactive ? "proactive" : "passive", elapsed_ms: elapsed,
-        ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
+        ...(validMessageId(messageId) ? { message_id: messageId } : {}) });
     } catch (err) {
       send({ type: "delivery", id: frame.id, progress: true, index, ok: false, ...diagnostic(err) });
     } finally {
@@ -511,7 +514,8 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
         const remaining = deadline - now();
         if (remaining <= 0) throw Object.assign(new Error("push_timeout"), {name:"TimeoutError"});
         previousStarted = now();
-        result = await sendText({ scope, targetId: frame.target_id }, parts[index][0], mention, remaining);
+        const guard=frame.based_on_message_id === undefined ? undefined : () => validMessageId(frame.based_on_message_id) && validId(frame.sender_id) && latestInput.get(routeKey(scope,frame.target_id,frame.group_chime === true ? "*" : frame.sender_id)) === frame.based_on_message_id;
+        result = await sendText({ scope, targetId: frame.target_id }, parts[index][0], mention, remaining, guard);
       }
       send({ type: "delivery", id: frame.id, push: true, ok: true,
         ...(validMessageId(result?.id) ? { message_id: result.id } : {}) });
@@ -529,6 +533,13 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       if (frame.version !== 1) { warn("protocol_version"); return; }
       if (frame.type === "stop") { stop(); return; }
       if (closed) return;
+      // 只恢复宿主持久接收的锚点；绝不覆盖本进程已经看见的新消息。
+      if (frame.type === "restore_anchor") {
+        if (!["c2c","group"].includes(frame.scope) || !validId(frame.target_id) || !validId(frame.sender_id) || !validMessageId(frame.message_id)) {warn("invalid_command");return;}
+        const key=routeKey(frame.scope,frame.target_id,frame.group_chime === true ? "*" : frame.sender_id);
+        if (!latestInput.has(key) && latestInput.size < 8192) latestInput.set(key,frame.message_id);
+        return;
+      }
       if (frame.type === "push") { await push(frame); return; }
       if (frame.type === "file") { await pushFile(frame); return; }
       const item = pending.get(frame.id);
@@ -540,16 +551,8 @@ export function createBridge(bot, emit, limit = 128, now = () => performance.now
       }
       if (frame.type === "capacity") {
         if (item.sending || item.next !== undefined) { warn("duplicate_reply"); return; }
-        item.sending = true;
-        try {
-          await sendText(item.target, "消息回执存储已满，本条请求尚未执行。请联系管理员处理容量；历史记录已保留。", replyMention(item));
-          send({ type: "delivery", id: frame.id, capacity_notice: true, ok: true });
-        } catch (err) {
-          send({ type: "delivery", id: frame.id, capacity_notice: true, ok: false, ...diagnostic(err) });
-        } finally {
-          item.sending = false;
-          pending.delete(frame.id);
-        }
+        pending.delete(frame.id);
+        send({ type: "delivery", id: frame.id, capacity_notice: true, ok: false, failure_kind: "receipt_capacity" });
         return;
       }
       if (frame.type === "segment") { await segment(frame, item); return; }

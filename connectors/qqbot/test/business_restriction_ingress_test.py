@@ -66,6 +66,17 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
         self.assertEqual((self.target / "evidence.txt").read_text(encoding="utf8"),
                          "急停后必须保留")
 
+    def assert_no_expression(self, *message_ids):
+        events = [json.loads(line) for path in self.work.glob('events-*.jsonl')
+                  for line in path.read_text(encoding='utf8').splitlines()]
+        self.assertFalse([event for event in events if event.get('direction') == 'out'
+                          and event.get('id') in message_ids
+                          and event.get('type') in ('reply', 'segment', 'progress', 'sticker', 'push')],
+                         '急停与内部 final 不生成自动确认')
+        for message_id in message_ids:
+            self.assertIsNone(self.receipt(message_id).get('reply'))
+            self.assertFalse(self.receipt(message_id).get('progress'))
+
     def review_allow(self, request):
         self.reviews.append(request)
         return {"risk": "medium", "authorization": "high", "outcome": "allow",
@@ -292,21 +303,22 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
         stop_message["expected_type"] = "finish"
         self.run_restriction([
             *self.owner_checkpoint(),
-            {"send": self.incoming("live-command", command, originals[0],
-                                   expected="已急停，旧命令未执行，目录保留")},
+            {"send": self.incoming("live-command", command, originals[0]) | {'expected_type':'finish'}},
             {"wait_file": str(self.arrived("review", 1))},
             {"send": stop_message},
             {"wait_command": {"id": "live-stop", "type": "finish"}},
             self.wait_receipt("live-stop", state="Merged"),
             *self.checkpoint("live-stopped-before-review"),
             {"touch": str(self.gate("live-review-release"))},
-            self.wait_reply("live-command"), self.wait_receipt("live-command"),
+            {"wait_command":{"id":"live-command","type":"finish"}},
+            self.wait_receipt("live-command", state="Handled"),
         ], panel=True, env_extra=environment,
             checkpoints={"bind-owner": self.bind_owner,
                          "live-stopped-before-review": check_while_held})
         self.assertEqual(len(self.command_results), 1)
         self.assertEqual(len(self.reviews), 1)
         self.assertEqual(self.chat_rounds, 2)
+        self.assert_no_expression('live-command','live-stop')
         turns = self.documents()["eve.session"]["sessions.v1"]["sessions"][self.scope_id]["turns"]
         self.assertEqual(len(turns), 1)
         self.assertEqual([message["text"] for message in turns[0]["status"]["messages"]
@@ -320,9 +332,11 @@ class BusinessRestrictionIngressAcceptance(owner.OwnerAccountAcceptance):
         self.assertEqual(operations[-1]["decision"], "execution_rejected")
         self.assertFalse(operations[-1]["success"])
 
-        self.run_restriction(self.send(self.incoming(
-            "live-restart", "重启后核对实时急停", expected="实时急停在重启后仍有效")),
-            env_extra=environment)
+        self.run_restriction([
+            {"send":self.incoming("live-restart", "重启后核对实时急停") | {'expected_type':'finish'}},
+            {"wait_command":{"id":"live-restart","type":"finish"}},
+            self.wait_receipt("live-restart", state="Handled")], env_extra=environment)
+        self.assert_no_expression('live-restart')
         self.assertEqual(self.ledger_path.read_bytes(), committed)
         self.assertEqual(operation_path.read_bytes(), operation_bytes)
         self.assertEqual(len(self.reviews), 1)

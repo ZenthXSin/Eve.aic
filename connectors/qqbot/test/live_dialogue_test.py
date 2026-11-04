@@ -1,189 +1,331 @@
-"""实际 QQ 进程：轮内引导不分类、不取消，工具主动发言等真实回执；仅本地替身。"""
+"""真实 Eve 进程：只有明确表达会发送；模型和 QQ 均使用本地协议替身。"""
+import hashlib
 import json
-import sys
+import sqlite3
+import time
 import unittest
-import message_judge_test as judge
-import tool_progress_test as progress
+
 import dialogue_tools_test as dialogue
-
-
-class LiveInputAcceptance(judge.MessageJudgeAcceptance):
-    for name in dir(judge.MessageJudgeAcceptance):
-        if name.startswith('test_'): locals()[name] = None
-    del name
-
-    def run_live(self, script):
-        return self.run_eve(script, mode='jev', environment={'EVE_QQ_LIVE_INTERACTION': 'true'})
-
-    def test_inflight_input_joins_same_turn_without_judging_and_survives_restart(self):
-        self.steps[('task', 1)] = {'wait': 'release-base', 'text': '旧草稿不投递'}
-        self.steps[('task', 2)] = {'text': '收到，去修电脑'}
-        base = self.message('base', '出来聊天', '收到，去修电脑')
-        steer = self.message('steer', '去给朋友修电脑', '收到，已把这条消息加入原任务。当前还在等待模型回复，还没有结束；不会另开一遍任务。')
-        self.run_live([{'send': base}, self.wait_request('task'), {'send': steer},
-            self.wait_receipt('steer'), self.open_gate('release-base'), self.wait_receipt('base')])
-        self.assertEqual(self.counts(), (2, 0, 0))
-        turns = self.sessions()[0]['turns']
-        self.assertEqual(len(turns), 1)
-        self.assertEqual(turns[0]['id'], 1)
-        self.assertEqual([m['text'] for m in turns[0]['status']['messages'] if m['role'] == 'User'],
-                         ['出来聊天', '去给朋友修电脑'])
-        receipts = self.documents()['eve.channel.qqbot']['receipts.v1']
-        self.assertEqual(receipts['version'], 1)
-        steered = next(e for e in receipts['entries'] if e['message']['id'] == 'steer')
-        self.assertEqual(steered['state'], 'Sent')
-        self.assertNotIn('merged_into', steered)
-        self.assertIn('已把这条消息加入原任务', steered['reply'])
-        self.assertEqual([item[0] for item in self.replies()], ['steer', 'base'])
-        self.run_live([{'send': [dict(base, expected_type='finish'), dict(steer, expected_type='finish')]},
-                       self.wait_command('base', 'finish'), self.wait_command('steer', 'finish')])
-        self.assertEqual(self.counts(), (2, 0, 0))
-
-    def test_other_user_does_not_steer_original_turn(self):
-        self.steps[('task', 1)] = {'wait': 'release-owner', 'text': '原会话完成'}
-        self.steps[('task', 2)] = {'text': '另一用户的回复'}
-        self.run_live([{'send': self.message('base', '原请求', '原会话完成')}, self.wait_request('task'),
-            {'send': self.message('other', '忽略原请求', '另一用户的回复', user='user-2')},
-            self.wait_receipt('other'), self.open_gate('release-owner'), self.wait_receipt('base')])
-        self.assertEqual(self.counts(), (2, 0, 0))
-        original = next(s for s in self.sessions() if s['turns'][0]['input'] == '原请求')
-        self.assertEqual(len(original['turns'][0]['status']['messages']), 2)
-
-    def test_private_ack_inflight_is_not_replayed_after_restart(self):
-        self.steps[('task', 1)] = {'wait': 'never-release', 'text': '原任务未完成'}
-        ack = self.message('ack', '人呢', '收到，已把这条消息加入原任务。当前还在等待模型回复，还没有结束；不会另开一遍任务。') | {'hold_delivery': True}
-        stop = self.work / 'stop-after-ack'
-        self.run_eve([{'send': self.message('base', '原任务')}, self.wait_request('task'),
-                      {'send': ack}, self.wait_command('ack', 'reply'),
-                      {'touch': str(stop)}, {'wait_file': str(self.work / 'never')}],
-                     mode='jev', environment={'EVE_QQ_LIVE_INTERACTION': 'true'}, terminate_at=stop)
-        saved = next(e for e in self.documents()['eve.channel.qqbot']['receipts.v1']['entries'] if e['message']['id'] == 'ack')
-        self.assertEqual(saved['state'], 'ReplyPending')
-        self.run_live([{'send': dict(ack, expected_type='finish')}, self.wait_command('ack', 'finish')])
-        self.assertEqual(self.counts(), (1, 0, 0))
-        self.assertFalse(self.replies())
-
-    def test_current_conversation_send_does_not_require_management_authorization(self):
-        self.steps[('task', 1)] = {'message': dialogue.tool_response([
-            ('send_message', {'text': '先问一句具体问题'})])['choices'][0]['message']}
-        self.steps[('task', 2)] = {'text': '最后的答复'}
-        self.run_eve([{'send': self.message('ordinary', '普通用户聊天', '最后的答复')},
-            self.wait_command('ordinary', 'progress'), self.wait_receipt('ordinary')],
-            mode='jev', environment={'EVE_QQ_LIVE_INTERACTION': 'true', 'EVE_ADMIN_BIND_KEY': 'synthetic-not-bound-key'})
-        result = json.loads(self.calls['task'][1]['body']['messages'][-1]['content'])
-        self.assertTrue(result['sent'])
+import tool_progress_test as progress
+import vision_test as vision
 
 
 class LiveToolAcceptance(progress.ToolProgressAcceptance):
     for name in dir(progress.ToolProgressAcceptance):
-        if name.startswith('test_'): locals()[name] = None
+        if name.startswith('test_'):
+            locals()[name] = None
     del name
+
+    def setUp(self):
+        super().setUp()
+        self.speech_requests = []
+        self.speech_callback = lambda _: {"action": "silence"}
+
+    def provider_response(self, body, kind, fallback):
+        try:
+            facts = json.loads(body['messages'][-1].get('content') or 'null')
+        except (TypeError, ValueError):
+            facts = None
+        if isinstance(facts, dict) and 'host_event' in facts:
+            self.assertFalse(body.get('tools'))
+            self.speech_requests.append(body)
+            return dialogue.text_response(json.dumps(self.speech_callback(facts), ensure_ascii=False))
+        return super().provider_response(body, kind, fallback)
 
     def run_live(self, script, **options):
         options['env_extra'] = dict(options.pop('env_extra', {}), EVE_QQ_LIVE_INTERACTION='true')
-        return self.run_eve(script, milestones=None, **options)
+        result = self.run_eve(script, milestones=None, **options)
+        self.assertFalse(self.narrations, '交流模式不能另起进度文案生成器')
+        self.assertFalse([e for e in self.events if e.get('direction') == 'out' and
+                          e.get('type') in ('reply', 'segment', 'sticker')],
+                         '宿主不能发送内部 final、自动分段或自动附带表情')
+        return result
 
-    def test_send_message_delivers_question_and_answer_steers_same_turn(self):
-        self.response_gates[('chat', 2)] = 'input-ready'
+    def message(self, *args, **kwargs):
+        return super().message(*args, **kwargs) | {'expected_type': 'finish'}
+
+    def wait_receipt(self, id, state='Handled'):
+        return super().wait_receipt(id, state)
+
+    def send(self, message):
+        return [{'send': message}, self.wait_receipt(message['id']), self.wait_command(message['id'], 'finish')]
+
+    @staticmethod
+    def wait_command(id, kind, count=1):
+        return {'wait_command': {'id': id, 'type': kind, 'count': count}}
+
+    def choose(self, name, arguments):
+        response = dialogue.tool_response([(name, arguments)])
+        response['choices'][0]['message']['tool_calls'][0]['id'] += f'-{self.chat_rounds}'
+        return response
+
+    @staticmethod
+    def all_results(body):
+        return [json.loads(message['content']) for message in body['messages'] if message['role'] == 'tool']
+
+    @staticmethod
+    def users(body):
+        return [message.get('content') for message in body['messages'] if message['role'] == 'user']
+
+    def speech_rows(self):
+        path = self.work / 'state/speech.sqlite3'
+        if not path.exists():
+            return []
+        with sqlite3.connect(path) as db:
+            return [(json.loads(event), state, json.loads(decision) if decision else None)
+                    for event, state, decision in db.execute('SELECT event,state,decision FROM speech')]
+
+    def test_internal_final_can_end_in_silence_even_with_automatic_progress_settings(self):
+        def respond(body):
+            if not self.all_results(body):
+                return self.choose('echo', {'text': '内部核对完成'})
+            return dialogue.text_response('只是内部结束，不是要说给对方的话')
+        self.callback = respond
+        self.run_live(self.send(self.message('quiet', '这个先不用回答')), env_extra={
+            'EVE_PROGRESS_TOOL_MILESTONES': 'true', 'EVE_PROGRESS_STAGE_UPDATES': 'true',
+            'EVE_PROGRESS_SLOW_AFTER_MS': '1000'})
+        self.assertEqual(self.progress('quiet'), [])
+        self.assertEqual(self.receipt('quiet')['state'], 'Handled')
+        self.assertIsNone(self.receipt('quiet')['reply'])
+        self.assertEqual(self.speech_rows(), [])
+
+    def test_question_and_wait_take_new_input_in_the_same_turn_without_ack(self):
         def respond(body):
             if self.chat_rounds == 1:
-                self.assertIn('send_message', self.definitions(body))
-                return dialogue.tool_response([('send_message', {'text': '硬盘里有重要数据吗'})])
-            results = [json.loads(m['content']) for m in body['messages'] if m['role'] == 'tool']
-            self.assertTrue(results[-1]['sent'])
-            if self.chat_rounds == 2: return dialogue.text_response('旧草稿不投递')
-            self.assertTrue(any(m.get('content') == '有，先备份' for m in body['messages']))
-            return dialogue.text_response('那就先备份，再处理系统')
+                return self.choose('send_message', {'text': '硬盘里有重要数据吗', 'purpose': 'question'})
+            if self.chat_rounds == 2:
+                self.assertTrue(self.all_results(body)[-1]['sent'])
+                self.gate('waiting-started').touch()
+                return self.choose('wait_for_input', {'timeout_ms': 10_000})
+            if self.chat_rounds == 3:
+                self.assertIn('有，先备份', self.users(body))
+                self.assertTrue(self.all_results(body)[-1]['new_input'])
+                return self.choose('send_message', {'text': '那先保住数据，再看系统的问题'})
+            return dialogue.text_response('本轮结束')
         self.callback = respond
-        self.run_live([{'send': self.message('base', '帮忙修电脑', expected='那就先备份，再处理系统')},
-            {'wait_command': {'id': 'base', 'type': 'progress'}},
-            {'wait_file': str(self.arrived('chat', 2))},
-            {'send': self.message('answer', '有，先备份', contains='已把这条消息加入原任务')},
-            self.wait_receipt('answer'),
-            {'touch': str(self.gate('input-ready'))}, self.wait_receipt('base')])
-        self.assertEqual([e['text'] for e in self.progress('base')], ['硬盘里有重要数据吗'])
-        self.assertEqual(len(next(iter(self.documents()['eve.session']['sessions.v1']['sessions'].values()))['turns']), 1)
+        self.run_live([{'send': self.message('base', '帮忙修电脑')}, self.wait_command('base', 'progress'),
+            {'wait_file': str(self.gate('waiting-started'))}, {'delay_ms': 150},
+            {'send': self.message('answer', '有，先备份')}, self.wait_receipt('answer', 'Merged'), self.wait_receipt('base')])
+        self.assertEqual([e['text'] for e in self.progress('base')], ['硬盘里有重要数据吗', '那先保住数据，再看系统的问题'])
+        self.assertEqual(self.progress('answer'), [])
+        turns = next(iter(self.documents()['eve.session']['sessions.v1']['sessions'].values()))['turns']
+        self.assertEqual(len(turns), 1)
+        self.assertEqual([m['text'] for m in turns[0]['status']['messages'] if m['role'] == 'User'], ['帮忙修电脑', '有，先备份'])
 
-    def test_input_during_running_tool_does_not_cancel_or_repeat_it(self):
+    def test_inflight_model_draft_is_discarded_after_a_correction(self):
+        self.response_gates[('chat', 1)] = 'release-old-draft'
         def respond(body):
             if self.chat_rounds == 1:
-                return dialogue.tool_response([('sleep', {'seconds': 3})])
-            self.assertTrue(any(m.get('content') == '补充：先备份' for m in body['messages']))
-            results = [json.loads(m['content']) for m in body['messages'] if m['role'] == 'tool']
-            self.assertEqual(len(results), 1)
-            self.assertTrue(results[0]['waited'])
-            return dialogue.text_response('等待完成，按补充继续')
+                return dialogue.text_response('旧草稿不能投递')
+            if self.chat_rounds == 2:
+                self.assertEqual(self.users(body)[0], '出来聊聊')
+                self.assertEqual(self.users(body)[-1], '等下，我先去修电脑')
+                return self.choose('send_message', {'text': '行，忙完再聊'})
+            return dialogue.text_response('内部结束')
         self.callback = respond
-        self.run_live([{'send': self.message('sleeping', '等一下再做', expected='等待完成，按补充继续')},
-            {'wait_command': {'id': 'sleeping', 'type': 'progress'}},
-            {'send': self.message('steer', '补充：先备份', contains='当前还在执行工具步骤')},
-            self.wait_receipt('steer'), self.wait_receipt('sleeping')],
-            more=['--sleep'], env_extra={'EVE_PROGRESS_SLOW_AFTER_MS': '1000'})
-        self.assertEqual(self.chat_rounds, 2)
+        self.run_live([{'send': self.message('base', '出来聊聊')}, {'wait_file': str(self.arrived('chat', 1))},
+            {'send': self.message('steer', '等下，我先去修电脑')}, self.wait_receipt('steer', 'Merged'),
+            {'touch': str(self.gate('release-old-draft'))}, self.wait_receipt('base')])
+        self.assertEqual([e['text'] for e in self.progress('base')], ['行，忙完再聊'])
+        self.assertEqual(self.progress('steer'), [])
+        before = self.chat_rounds
+        self.run_live([{'send': self.message('base', '出来聊聊')}, self.wait_command('base', 'finish'),
+                       {'send': self.message('steer', '等下，我先去修电脑')}, self.wait_command('steer', 'finish')])
+        self.assertEqual(self.chat_rounds, before)
+        self.assertFalse(self.progress('base'))
 
-    def test_three_messages_preserve_final_quota_and_fourth_reports_not_sent(self):
+    def test_input_during_a_running_tool_does_not_cancel_repeat_or_announce_it(self):
+        def respond(body):
+            if self.chat_rounds == 1:
+                return self.choose('sleep', {'seconds': 1})
+            if self.chat_rounds == 2:
+                self.assertIn('补充：先备份', self.users(body))
+                self.assertTrue(self.all_results(body)[0]['waited'])
+                return self.choose('send_message', {'text': '先备份，这条记住了'})
+            return dialogue.text_response('内部结束')
+        self.callback = respond
+        self.run_live([{'send': self.message('sleeping', '等一下再做')}, {'wait_file': str(self.arrived('chat', 1))},
+            {'delay_ms': 200}, {'send': self.message('steer', '补充：先备份')},
+            self.wait_receipt('steer', 'Merged'), self.wait_receipt('sleeping')], more=['--sleep'],
+            env_extra={'EVE_PROGRESS_STAGE_UPDATES': 'true', 'EVE_PROGRESS_SLOW_AFTER_MS': '1000'})
+        self.assertEqual([e['text'] for e in self.progress('sleeping')], ['先备份，这条记住了'])
+        messages = self.turn('等一下再做')['status']['messages']
+        self.assertEqual(sum(c['name'] == 'sleep' for m in messages for c in m.get('tool_calls', [])), 1)
+
+    def test_chosen_delay_is_cancelled_by_new_input_before_any_send(self):
+        def respond(body):
+            if self.chat_rounds == 1:
+                return self.choose('send_message', {'text': '延后的旧话', 'after_ms': 3000})
+            if self.chat_rounds == 2:
+                self.assertEqual(self.all_results(body)[-1]['delivery_status'], 'stale')
+                self.assertIn('不用了，事情变了', self.users(body))
+                return self.choose('send_message', {'text': '好，那先停在这里'})
+            return dialogue.text_response('内部结束')
+        self.callback = respond
+        self.run_live([{'send': self.message('delayed', '过会儿再说')}, {'wait_file': str(self.arrived('chat', 1))},
+            {'delay_ms': 200}, {'send': self.message('changed', '不用了，事情变了')},
+            self.wait_receipt('changed', 'Merged'), self.wait_receipt('delayed')])
+        self.assertEqual([e['text'] for e in self.progress('delayed')], ['好，那先停在这里'])
+
+    def test_multiple_messages_are_chosen_individually_without_mandatory_final(self):
         def respond(body):
             if self.chat_rounds <= 4:
-                response = dialogue.tool_response([('send_message', {'text': f'实际发现{self.chat_rounds}'})])
-                response['choices'][0]['message']['tool_calls'][0]['id'] += str(self.chat_rounds)
-                return response
-            self.assertEqual([r['sent'] for r in self.results(body)], [True, True, True, False])
-            return dialogue.text_response('最终结论')
+                return self.choose('send_message', {'text': f'独立表达{self.chat_rounds}', 'after_ms': 1100 if self.chat_rounds > 2 else 0})
+            self.assertEqual([r['sent'] for r in self.all_results(body)], [True] * 4)
+            return dialogue.text_response('不可见的收尾')
         self.callback = respond
-        self.run_live(self.send(self.message('quota', '检查一下', expected='最终结论')))
-        self.assertEqual(len(self.progress('quota')), 3)
-        self.assertEqual(self.receipt('quota')['state'], 'Sent')
+        self.run_live(self.send(self.message('several', '说说你查到的')))
+        self.assertEqual([e['text'] for e in self.progress('several')], [f'独立表达{n}' for n in range(1, 5)])
+        parts = self.receipt('several')['progress']
+        self.assertEqual([p.get('proactive', False) for p in parts], [False, False, True, True])
+        self.assertTrue(all(p['state'] == 'Sent' and p['platform_message_id'] for p in parts))
 
-    def test_failed_send_is_not_retried_and_final_answer_remains_available(self):
+    def test_failed_send_does_not_generate_an_automatic_replacement(self):
         def respond(body):
             if self.chat_rounds == 1:
-                return dialogue.tool_response([('send_message', {'text': '需要马上告诉你的发现'})])
-            self.assertFalse(self.results(body)[-1]['sent'])
-            return dialogue.text_response('最终结论仍可送达')
+                return self.choose('send_message', {'text': '一条已核实的发现'})
+            self.assertFalse(self.all_results(body)[-1]['sent'])
+            return dialogue.text_response('结束，不补备用消息')
         self.callback = respond
-        self.run_live(self.send(self.message('failed', '检查一下', expected='最终结论仍可送达') | {'fail_progress': True}))
+        self.run_live(self.send(self.message('failed', '检查一下') | {'fail_progress': True,
+            'progress_diagnostic': {'failure_kind': 'http', 'http_status': 403, 'biz_code': 304023}}))
         self.assertEqual(len(self.progress('failed')), 1)
-        self.assertEqual(self.receipt('failed')['state'], 'Sent')
+        self.assertEqual(self.receipt('failed')['progress'][0]['state'], 'Failed')
 
-    def test_unknown_send_is_preserved_without_replay_after_restart(self):
-        self.callback = lambda body: dialogue.tool_response([('send_message', {'text': '已核实的一条发现'})])
+    def test_unknown_send_survives_restart_without_replay_and_enters_actual_receipt_context(self):
+        self.callback = lambda _: self.choose('send_message', {'text': '可能已经送达的发现'})
         stop = self.gate('stop-owned-child')
-        self.run_live([{'send': self.message('unknown', '检查一下') | {'hold_progress': True}},
-            {'wait_command': {'id': 'unknown', 'type': 'progress'}}, {'touch': str(stop)},
+        self.run_live([{'send': self.message('unknown', '开始检查') | {'hold_progress': True}},
+            self.wait_command('unknown', 'progress'), {'touch': str(stop)},
             {'wait_file': str(self.gate('never'))}], stop_at=stop)
         before = self.receipt('unknown')
         self.assertEqual(before['progress'][0]['state'], 'Sending')
-        self.callback = lambda body: dialogue.text_response('恢复后正常')
-        self.run_live(self.send(self.message('fresh', '新的聊天', expected='恢复后正常')))
+        def resumed(body):
+            context = '\n'.join(m.get('content') or '' for m in body['messages'] if m['role'] == 'system')
+            self.assertIn('可能已经送达的发现', context)
+            self.assertIn('unknown', context)
+            return dialogue.text_response('看到未知回执，安静结束')
+        self.callback = resumed
+        self.run_live(self.send(self.message('fresh', '接着聊点别的')))
         self.assertEqual(self.receipt('unknown'), before)
-        self.assertEqual(self.progress('unknown'), [])
+        self.assertFalse(self.progress('unknown'))
+        self.assertTrue(any(state == 'unknown' for _, state, _ in self.speech_rows()))
 
-    def test_new_explicit_progress_after_unknown_is_allowed_but_same_text_is_not_retried(self):
+    def test_duplicate_unknown_text_is_not_retried_but_new_expression_is_allowed(self):
         def respond(body):
-            results = self.results(body)
-            if len(results) < 3:
-                text = '第一条发现' if len(results) < 2 else '不同的新发现'
-                response = dialogue.tool_response([('send_message', {'text': text})])
-                response['choices'][0]['message']['tool_calls'][0]['id'] += str(len(results))
-                return response
-            self.assertEqual([r['sent'] for r in results], [False, False, False])
-            return dialogue.text_response('最终答复仍可返回')
+            if self.chat_rounds < 4:
+                return self.choose('send_message', {'text': '第一条发现' if self.chat_rounds < 3 else '不同的新发现'})
+            self.assertEqual([r['delivery_status'] for r in self.all_results(body)], ['unknown', 'not_sent', 'unknown'])
+            return dialogue.text_response('内部结束')
         self.callback = respond
-        self.run_live(self.send(self.message('recover', '开始检查', expected='最终答复仍可返回') | {'fail_progress': True}),
-                      env_extra={'EVE_PROGRESS_STAGE_UPDATES': 'true', 'EVE_PROGRESS_MIN_INTERVAL_MS': '1000'})
-        self.assertEqual([e['text'] for e in self.progress('recover')], ['第一条发现', '不同的新发现'])
-        self.assertEqual(self.receipt('recover')['state'], 'Sent')
+        self.run_live(self.send(self.message('dedup', '看看这个') | {'fail_progress': True,
+            'progress_diagnostic': {'failure_kind': 'timeout'}}))
+        self.assertEqual([e['text'] for e in self.progress('dedup')], ['第一条发现', '不同的新发现'])
 
-    def test_explicit_cancel_after_message_suppresses_old_final(self):
+    def test_current_conversation_expression_does_not_require_management_authorization(self):
+        def respond(body):
+            if self.chat_rounds == 1:
+                self.assertIn('send_message', self.definitions(body))
+                self.assertIn('wait_for_input', self.definitions(body))
+                return self.choose('send_message', {'text': '你说，我在听'})
+            if self.chat_rounds == 2:
+                self.assertTrue(self.all_results(body)[-1]['sent'])
+                return self.choose('wait_for_input', {'timeout_ms': 50})
+            self.assertFalse(self.all_results(body)[-1]['new_input'])
+            return dialogue.text_response('内部结束')
+        self.callback = respond
+        self.run_live(self.send(self.message('ordinary', '有人吗', user='ordinary-user')),
+                      env_extra={'EVE_ADMIN_BIND_KEY': 'synthetic-not-bound-key'})
+        self.assertEqual([e['text'] for e in self.progress('ordinary')], ['你说，我在听'])
+
+    def test_wait_timeout_may_end_without_saying_anything(self):
+        def respond(body):
+            if self.chat_rounds == 1:
+                return self.choose('wait_for_input', {'timeout_ms': 100})
+            self.assertFalse(self.all_results(body)[-1]['new_input'])
+            return dialogue.text_response('不需要再补一句')
+        self.callback = respond
+        self.run_live(self.send(self.message('listen', '我想想再说')))
+        self.assertFalse(self.progress('listen'))
+
+    def test_host_command_becomes_a_fact_and_eve_can_choose_silence(self):
+        def inspect():
+            self.wait_until(lambda: any(state == 'silence' for _, state, _ in self.speech_rows()), 'Eve 的沉默决定没有落盘')
+        self.run_live([*self.send(self.message('help', '/help')), *self.checkpoint('quiet-command')],
+                      checkpoints={'quiet-command': inspect})
+        self.assertEqual(len(self.speech_requests), 1)
+        facts = json.loads(self.speech_requests[0]['messages'][-1]['content'])
+        self.assertEqual(facts['host_event']['kind'], 'host_operation_result')
+        self.assertFalse([e for e in self.events if e.get('type') == 'push'])
+
+    def test_cancel_confirmation_is_authored_by_eve_and_old_output_stays_cancelled(self):
         self.response_gates[('chat', 2)] = 'never-release'
-        self.callback = lambda body: (dialogue.tool_response([('send_message', {'text': '已经查到一项'})])
-                                     if self.chat_rounds == 1 else dialogue.text_response('旧回复不能投递'))
-        self.run_live([{'send': self.message('old', '查资料') | {'expected_type': 'finish'}},
-            {'wait_command': {'id': 'old', 'type': 'progress'}}, {'wait_file': str(self.arrived('chat', 2))},
-            *self.send(self.message('cancel', '/cancel', contains='已取消')),
-            {'wait_command': {'id': 'old', 'type': 'finish'}}])
+        self.callback = lambda _: (self.choose('send_message', {'text': '先查这条线索'})
+                                  if self.chat_rounds == 1 else dialogue.text_response('旧回复不能投递'))
+        def decide(facts):
+            self.assertEqual(facts['host_event']['user_text'], '/cancel')
+            return {'action': 'speak', 'text': '停下了，刚才那条线索先留着', 'after_ms': 0}
+        self.speech_callback = decide
+        push_id = 'speech-' + hashlib.sha256(b'host-reply:cancel').hexdigest()
+        self.run_live([{'send': self.message('old', '查一下')}, self.wait_command('old', 'progress'),
+            {'wait_file': str(self.arrived('chat', 2))}, *self.send(self.message('cancel', '/cancel')),
+            self.wait_command('old', 'finish'), self.wait_command(push_id, 'push'), {'delay_ms': 150}])
         self.assertEqual(self.receipt('old')['state'], 'Failed')
-        self.assertFalse([e for e in self.events if e.get('id') == 'old' and e.get('type') in ('reply', 'segment')])
+        self.assertEqual([e['text'] for e in self.events if e.get('type') == 'push'], ['停下了，刚才那条线索先留着'])
+        self.assertTrue(any(state == 'sent' for event, state, _ in self.speech_rows() if event['id'] == 'host-reply:cancel'))
+
+    def install_sticker(self):
+        data = vision.png('自主表情测试')
+        sha = hashlib.sha256(data).hexdigest()
+        directory = self.work / 'state/stickers'
+        (directory / 'blobs').mkdir(parents=True)
+        path = directory / 'blobs' / (sha + '.png')
+        path.write_bytes(data)
+        (directory / 'index.json').write_text(json.dumps({'format_version': 1, 'next': 1, 'stickers': [
+            {'id': 's1', 'sha256': sha, 'media_type': 'image/png', 'bytes': len(data), 'state': 'approved',
+             'description': '开心的猫', 'moods': ['开心'], 'uses': 0, 'added_at_ms': int(time.time() * 1000)}]}))
+        return path
+
+    def test_sticker_can_be_the_only_expression_and_returns_an_actual_receipt(self):
+        path = self.install_sticker()
+        def respond(body):
+            if not self.all_results(body):
+                return self.choose('send_sticker', {'mood': '开心'})
+            result = self.all_results(body)[-1]
+            self.assertTrue(result['sent'])
+            self.assertTrue(result['message_id'])
+            return dialogue.text_response('内部结束，不附文字')
+        self.callback = respond
+        self.run_live(self.send(self.message('image-only', '哈哈这也太好了')), more=['--stickers'])
+        [frame] = self.progress('image-only')
+        self.assertEqual(frame['image_path'], str(path))
+        part = self.receipt('image-only')['progress'][0]
+        self.assertEqual(part['image_path'], str(path))
+        self.assertEqual(part['state'], 'Sent')
+        self.assertTrue(part['platform_message_id'])
+        self.assertTrue(any(event['facts'].get('medium') == 'image' and state == 'sent'
+                            for event, state, _ in self.speech_rows()))
+        self.callback = lambda _: dialogue.text_response('继续安静')
+        self.run_live(self.send(self.message('image-restart', '先不用说')), more=['--stickers'])
+        self.assertFalse(self.progress('image-only'))
+        self.assertFalse(self.progress('image-restart'))
+
+    def test_text_and_sticker_share_a_serial_send_queue_and_each_wait_for_its_receipt(self):
+        self.install_sticker()
+        def respond(body):
+            if not self.all_results(body):
+                return dialogue.tool_response([('send_message', {'text': '确实不错'}), ('send_sticker', {'mood': '开心'})])
+            self.assertEqual([r['sent'] for r in self.all_results(body)], [True, True])
+            self.assertEqual(len({r['message_id'] for r in self.all_results(body)}), 2)
+            return dialogue.text_response('内部结束')
+        self.callback = respond
+        self.run_live(self.send(self.message('mixed', '你看这个好不好')), more=['--stickers'])
+        frames = self.progress('mixed')
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(frames[0]['text'], '确实不错')
+        self.assertTrue(frames[1]['image_path'])
+        self.assertTrue(all(p['state'] == 'Sent' for p in self.receipt('mixed')['progress']))
 
 
-if __name__ == '__main__': unittest.main()
+if __name__ == '__main__':
+    unittest.main()

@@ -1,7 +1,7 @@
 //! QQ 全量群观察的组合：复用插话引擎、说法学习和已有主动投递。
 use crate::{AppError, chime};
 use eve_chime_api::*;
-use eve_chime_plugin::{ChimeEngine, ChimeSettingsSource, GroupRelationPipeline, ModelChimeJudge};
+use eve_chime_plugin::{ChimeEngine, ChimeSettingsSource, GroupRelationPipeline};
 use eve_llm_api::{
     ContextAssembler, ContextScope, ContextSnapshot, LlmError, LlmFuture, TurnInput,
 };
@@ -14,22 +14,15 @@ use eve_session_api::SessionKey;
 use eve_training_api::TrainingService;
 use ring::digest::{SHA256, digest};
 use std::{
-    collections::BTreeMap,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{mpsc, watch},
     task::{JoinHandle, JoinSet},
 };
 pub(crate) const PREFIX: &str = "chime-";
 pub(crate) const USER: &str = "eve-chime";
-pub(crate) struct ToolPolicy;
-impl eve_llm_api::ToolScopePolicy for ToolPolicy {
-    fn tools_allowed(&self, scope: &ContextScope) -> bool {
-        scope.user_id != USER
-    }
-}
 fn failed(e: impl ToString) -> PluginError {
     PluginError::Task(e.to_string())
 }
@@ -40,6 +33,14 @@ fn hash(parts: &[&str]) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |v| u64::try_from(v.as_millis()).unwrap_or(u64::MAX))
+}
+fn authored_id(message: &GroupMessage) -> String {
+    format!("{PREFIX}{}", hash(&[&message.conversation, &message.id]))
 }
 fn name_wakeup(text: &str) -> bool {
     text.trim_start()
@@ -58,7 +59,6 @@ pub(crate) struct Group {
     training: Arc<dyn TrainingService>,
     sender: mpsc::Sender<Event>,
     receiver: Mutex<Option<mpsc::Receiver<Event>>>,
-    waiters: Mutex<BTreeMap<String, oneshot::Sender<bool>>>,
     pub(crate) policy: Arc<chime::Policy>,
 }
 impl Group {
@@ -76,7 +76,6 @@ impl Group {
             training,
             sender,
             receiver: Mutex::new(Some(receiver)),
-            waiters: Mutex::new(BTreeMap::new()),
             policy: Arc::new(chime::Policy::default()),
         })
     }
@@ -122,7 +121,9 @@ impl QqGroupObserver for Group {
                     from_me: false,
                     at_ms: observed.at_ms.saturating_sub(1),
                 };
-                self.store.append(&original).map_err(failed)?;
+                self.store
+                    .append_anchored(&original, &message.id)
+                    .map_err(failed)?;
                 original
             }
         };
@@ -157,10 +158,13 @@ impl QqGroupObserver for Group {
         mentions_me: bool,
         at_ms: u64,
     ) -> PluginResult<()> {
-        if message.scope != "group"
-            || !message.valid()
-            || message.text.trim_start().starts_with('/')
-        {
+        if message.scope != "group" || !message.valid() {
+            return Ok(());
+        }
+        if message.text.trim_start().starts_with('/') {
+            self.store
+                .advance_anchor(&message.conversation_key(&self.app)?, &message.id)
+                .map_err(failed)?;
             return Ok(());
         }
         let session = message.session_key(&self.app)?;
@@ -183,7 +187,19 @@ impl QqGroupObserver for Group {
             from_me: false,
             at_ms,
         };
-        if !self.store.append(&event).map_err(failed)? {
+        let ordinary = mentions_me || name_wakeup(&message.text) || message.text.trim().is_empty();
+        // 入队前落盘；排队拥挤、取消或重启不会丢失一次尚未审视的事实。
+        let appended = if !ordinary
+            && self.policy.settings().is_some_and(|s| s.enabled)
+            && event.text.chars().count() <= MAX_MESSAGE_CHARS
+        {
+            self.store
+                .append_speech(&event, &message.id, &authored_id(&event), at_ms)
+        } else {
+            self.store.append_anchored(&event, &message.id)
+        }
+        .map_err(failed)?;
+        if !appended {
             return Ok(());
         }
         // 仅学习真实用户原话，不伪造一次“已完成交互”。群风格与个人风格分范围保存。
@@ -230,9 +246,7 @@ impl QqGroupObserver for Group {
         self.sender
             .try_send(Event {
                 message: event,
-                ordinary: mentions_me
-                    || name_wakeup(&message.text)
-                    || message.text.trim().is_empty(),
+                ordinary,
             })
             .map_err(|error| {
                 let event = error.into_inner();
@@ -247,74 +261,59 @@ impl QqGroupObserver for Group {
                         let _ = relations.store.suppress_active(&event.message);
                     }
                 }
-                failed("群观察队列已满；原话已保存，本次不触发插话")
+                failed("群观察队列已满；原话与待审视事实已保存")
             })?;
         Ok(())
     }
 }
-struct Outlet {
-    group: Arc<Group>,
-    speaker: String,
-}
-struct Pending {
-    group: Arc<Group>,
-    id: String,
-}
-impl Drop for Pending {
-    fn drop(&mut self) {
-        let _ = self.group.store.abandon(&self.id);
-        if let Ok(mut w) = self.group.waiters.lock() {
-            w.remove(&self.id);
-        }
-    }
-}
-impl ChimeOutlet for Outlet {
-    fn send<'a>(&'a self, reply: &'a ChimeReply) -> LlmFuture<'a, ()> {
-        Box::pin(async move {
-            if reply.text.len() > eve_qqbot_plugin::QQ_OUTREACH_MAX_BYTES {
-                return Err(LlmError::Context(
-                    "群插话回复超过主动发送上限；已保留历史，未发送".into(),
-                ));
-            }
-            let id = format!("{PREFIX}{}", hash(&[&reply.conversation, &reply.reply_to]));
-            let (send, receive) = oneshot::channel();
-            self.group
-                .waiters
-                .lock()
-                .map_err(|_| LlmError::Context("群发送等待器不可用".into()))?
-                .insert(id.clone(), send);
-            let _pending = Pending {
-                group: self.group.clone(),
-                id: id.clone(),
-            };
-            self.group
-                .store
-                .queue(&id, reply, &self.speaker)
-                .map_err(LlmError::Context)?;
-            match tokio::time::timeout(Duration::from_secs(45), receive).await {
-                Ok(Ok(true)) => Ok(()),
-                _ => Err(LlmError::Context(
-                    "群消息发送失败或回执未确认；不自动重发".into(),
-                )),
-            }
-        })
-    }
+fn authored_push(candidate: &GroupAuthoredOutbound) -> PluginResult<QqOutreachPush> {
+    Ok(QqOutreachPush {
+        session: Some(
+            SessionKey::new(&candidate.outbound.reply.conversation, USER).map_err(failed)?,
+        ),
+        user_id: USER.into(),
+        message: QqOutreachMessage {
+            id: candidate.outbound.id.clone(),
+            text: candidate.outbound.reply.text.clone(),
+        },
+    })
 }
 impl QqOutreach for Group {
+    fn authored_pushes(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> PluginResult<eve_qqbot_plugin::QqAuthoredPushPage> {
+        if !(1..=64).contains(&limit) {
+            return Err(failed("群发言分页上限无效"));
+        }
+        if !self.policy.settings().is_some_and(|s| s.enabled) || !self.policy.review_enabled() {
+            return Ok(eve_qqbot_plugin::QqAuthoredPushPage::default());
+        }
+        let mut rows = self
+            .store
+            .authored_after(now_ms(), after, limit + 1)
+            .map_err(failed)?;
+        let more = rows.len() > limit;
+        rows.truncate(limit);
+        let next = more.then(|| rows.last().expect("非空分页").outbound.id.clone());
+        let pushes = rows
+            .iter()
+            .map(authored_push)
+            .collect::<PluginResult<_>>()?;
+        Ok(eve_qqbot_plugin::QqAuthoredPushPage { pushes, next })
+    }
     fn group_chime(&self, id: &str) -> PluginResult<Option<QqGroupChimeDelivery>> {
         self.store
-            .outbound(id)
+            .authored(id)
             .map_err(failed)?
             .map(|m| {
                 Ok(QqGroupChimeDelivery {
-                    session: SessionKey::new(m.reply.conversation, USER).map_err(failed)?,
-                    speaker_id: m.speaker,
-                    parts: m
-                        .reply
-                        .parts
-                        .into_iter()
-                        .map(|p| (p.text, p.pause_before_ms))
-                        .collect(),
+                    session: SessionKey::new(m.outbound.reply.conversation, USER)
+                        .map_err(failed)?,
+                    speaker_id: m.outbound.speaker,
+                    anchor: Some(m.anchor),
+                    parts: vec![(m.outbound.reply.text, 0)],
                 })
             })
             .transpose()
@@ -329,37 +328,58 @@ impl QqOutreach for Group {
         Ok(None)
     }
     fn next_push(&self) -> PluginResult<Option<QqOutreachPush>> {
-        if !self.policy.settings().is_some_and(|s| s.enabled) {
+        Ok(None)
+    }
+    fn next_authored_push(&self) -> PluginResult<Option<QqOutreachPush>> {
+        if !self.policy.settings().is_some_and(|s| s.enabled) || !self.policy.review_enabled() {
             return Ok(None);
         }
         self.store
-            .claim()
+            .next_authored(now_ms())
             .map_err(failed)?
-            .map(|m| {
-                Ok(QqOutreachPush {
-                    session: Some(SessionKey::new(m.reply.conversation, USER).map_err(failed)?),
-                    user_id: USER.into(),
-                    message: QqOutreachMessage {
-                        id: m.id,
-                        text: m.reply.text,
-                    },
-                })
-            })
+            .as_ref()
+            .map(authored_push)
             .transpose()
     }
+    fn claim_authored_push(&self, expected: &QqOutreachPush) -> PluginResult<bool> {
+        if !self.policy.settings().is_some_and(|s| s.enabled) || !self.policy.review_enabled() {
+            return Ok(false);
+        }
+        let Some(candidate) = self.store.authored(&expected.message.id).map_err(failed)? else {
+            return Ok(false);
+        };
+        if authored_push(&candidate)? != *expected {
+            return Ok(false);
+        }
+        self.store
+            .claim_authored(&candidate, now_ms())
+            .map_err(failed)
+    }
     fn delivered(&self, id: &str, result: QqOutreachResult) -> PluginResult<()> {
-        let sent = matches!(result, QqOutreachResult::Sent { .. });
+        let sent = matches!(&result, QqOutreachResult::Sent { platform_message_id:Some(id) } if !id.trim().is_empty());
         let outbound = if sent {
             self.store.outbound(id).map_err(failed)?
         } else {
             None
         };
-        if matches!(result, QqOutreachResult::Unknown) {
+        if matches!(
+            result,
+            QqOutreachResult::Unknown | QqOutreachResult::Sent { .. }
+        ) && !sent
+        {
             self.store.finish_unknown(id).map_err(failed)?;
         } else {
             self.store.finish(id, sent).map_err(failed)?;
         }
         if let Some(outbound) = outbound {
+            if let Some(engine) = self.engine.get()
+                && let Some(message) = self
+                    .store
+                    .message(&outbound.reply.conversation, &format!("{id}:reply"))
+                    .map_err(failed)?
+            {
+                engine.record_outgoing(message);
+            }
             crate::conversation_learning::observe(
                 self.training.as_ref(),
                 &ContextScope {
@@ -371,14 +391,6 @@ impl QqOutreach for Group {
                 eve_training_api::ConversationRole::Eve,
                 &outbound.reply.text,
             )?;
-        }
-        if let Some(waiter) = self
-            .waiters
-            .lock()
-            .map_err(|_| failed("群发送等待器不可用"))?
-            .remove(id)
-        {
-            let _ = waiter.send(sent);
         }
         Ok(())
     }
@@ -543,11 +555,28 @@ pub(crate) struct Background {
     finished: watch::Receiver<bool>,
     task: JoinHandle<()>,
 }
+struct GroupBudgetEvents(crate::qq_budget::Gate);
+impl eve_control_api::ControlEventSink for GroupBudgetEvents {
+    fn emit(&self, event: eve_control_api::ControlEvent) -> LlmFuture<'_, ()> {
+        Box::pin(async move {
+            if matches!(
+                event.event.kind,
+                eve_llm_api::TurnEventKind::ProviderStarted { .. }
+            ) && let Some(budget) = self.0.budget()
+            {
+                budget
+                    .reserve("chime", 1, now_ms())
+                    .map_err(|error| LlmError::Context(error.to_string()))?;
+            }
+            Ok(())
+        })
+    }
+}
 impl Background {
     pub(crate) fn start(
         group: Arc<Group>,
         control: Arc<dyn eve_control_api::ControlService>,
-        resolver: Arc<dyn eve_llm_api::LlmModelResolver>,
+        _resolver: Arc<dyn eve_llm_api::LlmModelResolver>,
         relations: Option<Arc<GroupRelationPipeline>>,
         budget: crate::qq_budget::Gate,
     ) -> Result<Self, AppError> {
@@ -564,30 +593,15 @@ impl Background {
             let _ = group.relations.set(relations.clone());
         }
         let task = tokio::spawn(async move {
-            let engine = Arc::new(ChimeEngine::new(
-                control,
-                Arc::new(chime::SwitchJudge {
-                    policy: group.policy.clone(),
-                    model: Arc::new(ModelChimeJudge::new(resolver)),
-                }),
-                Arc::new(eve_segment_plugin::ChatPlanner::new(Arc::new(
-                    crate::chime::AlwaysSentences,
-                ))),
-                eve_segment_api::SegmentLimits {
-                    max_segments: 3,
-                    max_segment_bytes: 2048,
-                    max_pause_ms: 2500,
-                },
-                group.policy.clone(),
-                "Eve",
-                USER,
-            ));
+            let engine = Arc::new(
+                ChimeEngine::autonomous(control, group.policy.clone(), "Eve", USER)
+                    .with_events(Arc::new(GroupBudgetEvents(budget.clone()))),
+            );
             let _ = group.engine.set(engine.clone());
             let mut jobs = JoinSet::new();
             let mut reviews = JoinSet::new();
-            let mut proactive =
-                tokio::time::interval(group.policy.interval("relation_active_interval_ms", 15_000));
-            proactive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut speech_tick = tokio::time::interval(Duration::from_millis(1000));
+            speech_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut learning =
                 tokio::time::interval(group.policy.interval("relation_review_interval_ms", 60_000));
             learning.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -601,15 +615,28 @@ impl Background {
                         continue;
                     },
                     _=reviews.join_next(), if !reviews.is_empty()=>{continue;},
-                    _=proactive.tick(), if relations.is_some()=>{
-                        if jobs.len()<8 && group.policy.settings().is_some_and(|s| s.enabled) {
-                            match relations.as_ref().expect("关系系统已开启").store.claim_active() {
-                                Ok(Some(message))=>{
-                                    let outlet=Outlet{group:group.clone(),speaker:message.speaker.clone()};
-                                    let engine=engine.clone();
-                                    jobs.spawn(async move {let outcome=engine.consider(message,&outlet).await;log_outcome(&outcome);});
-                                },
-                                Ok(None)=>{},Err(_)=>eprintln!("EVE_GROUP relation_active_unavailable"),
+                    _=speech_tick.tick()=>{
+                        if jobs.len()<8 && group.policy.settings().is_some_and(|s|s.enabled)
+                            && group.policy.judge().as_deref()==Some("model") {
+                            let admitted=budget.admits_category("chime",1).unwrap_or_else(|_|{
+                                eprintln!("EVE_GROUP speech_budget_unavailable");false
+                            });
+                            if admitted {
+                                match group.store.pending_speech(now_ms(),8-jobs.len()) {
+                                    Ok(messages)=>for message in messages {
+                                        match group.store.begin_speech(&message,now_ms()) {
+                                            Ok(Some(review))=>{
+                                                let group=group.clone();
+                                                let engine=engine.clone();
+                                                let relations=relations.clone();
+                                                jobs.spawn(async move {review_speech(group,engine,relations,review).await;});
+                                            },
+                                            Ok(None)=>{},
+                                            Err(_)=>eprintln!("EVE_GROUP speech_review_claim_unavailable"),
+                                        }
+                                    },
+                                    Err(_)=>eprintln!("EVE_GROUP speech_pending_unavailable"),
+                                }
                             }
                         }
                         continue;
@@ -628,78 +655,25 @@ impl Background {
                     event=receiver.recv()=>event,
                 };
                 let Some(event) = event else { break };
-                let outlet = Outlet {
-                    group: group.clone(),
-                    speaker: event.message.speaker.clone(),
-                };
-                // 名字前缀已由桥接送入普通对话；这里仅保留群观察，不能再判断或补答。
-                if event.ordinary && name_wakeup(&event.message.text) {
-                    let _ = engine.observe_only(event.message, &outlet).await;
-                    continue;
-                }
-                if !group.policy.settings().is_some_and(|s| s.enabled) {
-                    let _ = engine.observe_only(event.message, &outlet).await;
-                    continue;
-                }
-                if jobs.len() >= 8 {
-                    if let Some(relations) = &relations {
-                        let _ = relations.store.record(
+                // 关系整理保留为只读语境经验；不再先替 Eve 判 yes/no 或触发第二次发送。
+                if group.policy.settings().is_some_and(|s| s.enabled)
+                    && let Some(relations) = &relations
+                {
+                    let result = relations
+                        .store
+                        .record(
                             &event.message,
                             &GroupRelationDecision::uncertain(
-                                "群判断繁忙；保留待整理，等待主动系统",
+                                "交流由 Eve 自主审视；关系只待后续证据整理",
                             ),
-                        );
-                        if event.ordinary {
-                            let _ = relations.store.suppress_active(&event.message);
-                        }
+                        )
+                        .and_then(|()| relations.store.suppress_active(&event.message));
+                    if result.is_err() {
+                        eprintln!("EVE_GROUP relation_observation_unavailable");
                     }
-                    let _ = engine.observe_only(event.message, &outlet).await;
-                } else {
-                    let engine = engine.clone();
-                    let relations = relations.clone();
-                    jobs.spawn(async move {
-                        if let Some(relations) = relations {
-                            let decision = relations.classify(&event.message).await;
-                            if event.ordinary {
-                                let _ = relations.store.suppress_active(&event.message);
-                            }
-                            let outcome = match decision {
-                                Ok(d) if d.certain() && !event.ordinary => {
-                                    let exchange = d.topic.as_ref().and_then(|id| {
-                                        outlet
-                                            .group
-                                            .store
-                                            .exchanges(&event.message.conversation)
-                                            .ok()?
-                                            .into_iter()
-                                            .find(|e| &e.source.id == id)
-                                    });
-                                    engine
-                                        .observe_judged(
-                                            event.message,
-                                            &outlet,
-                                            ChimeVerdict {
-                                                reply: d.needs_reply,
-                                                confidence: d.confidence,
-                                                reason: d.reason,
-                                            },
-                                            exchange,
-                                        )
-                                        .await
-                                }
-                                _ => engine.observe_only(event.message, &outlet).await,
-                            };
-                            log_outcome(&outcome);
-                        } else if event.ordinary {
-                            let _ = engine.observe_only(event.message, &outlet).await;
-                        } else {
-                            match engine.observe(event.message, &outlet).await {
-                                Ok(outcome) => log_outcome(&outcome),
-                                Err(_) => eprintln!("EVE_GROUP chime_failed"),
-                            }
-                        }
-                    });
                 }
+                // ordinary 消息已进入普通对话；从未为它登记第二条群主动回复。
+                let _ = event.ordinary;
             }
             jobs.abort_all();
             reviews.abort_all();
@@ -728,28 +702,98 @@ impl Background {
         self.task.await.map_err(|_| "群观察后台退出异常".into())
     }
 }
-fn log_outcome(outcome: &ChimeOutcome) {
-    // 只输出固定错误类别；模型错误可能含原话、URL 或凭据，不能原样写日志。
-    let error_code = if outcome.decision.reason == eve_chime_api::ChimeReason::JudgeFailed {
-        let detail = &outcome.decision.detail;
-        Some(if detail.contains("自主运行预算分项已用尽") {
-            "budget_category_exhausted"
-        } else if detail.contains("自主运行预算已用尽") {
-            "budget_exhausted"
-        } else if detail.contains("自主运行预算不可用") {
-            "budget_unavailable"
-        } else {
-            "judge_error"
-        })
-    } else {
-        None
-    };
-
-    eprintln!(
-        "EVE_GROUP {}",
-        serde_json::json!({"message_id":outcome.decision.message_id,"conversation":outcome.decision.conversation,"reason":outcome.decision.reason,"error_code":error_code,"delivery":match &outcome.delivery {ChimeDelivery::Silent=>"silent",ChimeDelivery::Sent{..}=>"sent",ChimeDelivery::SendFailed{..}=>"send_failed",ChimeDelivery::NotGenerated{..}=>"not_generated"}})
-    );
+/// 取消或 panic 只解除模型审视；不会凭没有回执的正文伪造发送结局。
+struct SpeechReviewGuard {
+    store: Arc<dyn GroupObservationStore>,
+    review: GroupSpeechReview,
+    saved: bool,
 }
+impl Drop for SpeechReviewGuard {
+    fn drop(&mut self) {
+        if !self.saved
+            && self
+                .store
+                .decide_speech(&self.review, None, now_ms())
+                .is_err()
+        {
+            eprintln!("EVE_GROUP speech_retry_persist_failed");
+        }
+    }
+}
+async fn review_speech(
+    group: Arc<Group>,
+    engine: Arc<ChimeEngine>,
+    relations: Option<Arc<GroupRelationPipeline>>,
+    review: GroupSpeechReview,
+) {
+    let mut guard = SpeechReviewGuard {
+        store: group.store.clone(),
+        review,
+        saved: false,
+    };
+    let message = &guard.review.message;
+    let result = async {
+        let limit = group
+            .policy
+            .settings()
+            .map_or(20, |s| s.window_messages.clamp(1, 100));
+        let window = group.store.window_ending_at(
+            &message.conversation,
+            std::slice::from_ref(&message.id),
+            limit,
+        )?;
+        let mut exchanges = Vec::new();
+        if let Some(relations) = relations {
+            // 只复用已有经验，不把第三方分类或 needs_reply 变成发送许可。
+            match relations.store.recall(message) {
+                Ok(examples) => {
+                    for example in examples {
+                        if let Some(exchange) = example.exchange
+                            && exchange.valid(&message.conversation)
+                            && exchange.reply.at_ms <= message.at_ms
+                            && !exchanges.contains(&exchange)
+                        {
+                            exchanges.push(exchange);
+                        }
+                    }
+                }
+                Err(_) => eprintln!("EVE_GROUP relation_context_unavailable"),
+            }
+        }
+        engine
+            .decide_speech(
+                &guard.review,
+                &window,
+                &exchanges,
+                &group.store.reply_cadence(&message.conversation, now_ms())?,
+            )
+            .await
+    }
+    .await;
+    let state = match &result {
+        Ok(ChimeSpeechDecision::Speak { .. }) => "ready",
+        Ok(ChimeSpeechDecision::Wait { .. }) => "waiting",
+        Ok(ChimeSpeechDecision::Silence {}) => "silence",
+        Err(_) => "review_unavailable",
+    };
+    match group
+        .store
+        .decide_speech(&guard.review, result.as_ref().ok(), now_ms())
+    {
+        Ok(saved) => {
+            guard.saved = true;
+            eprintln!(
+                "EVE_GROUP {}",
+                serde_json::json!({"message_id":guard.review.message.id,"conversation":guard.review.message.conversation,"decision":if saved {state}else{"stale"}})
+            );
+        }
+        Err(_) => eprintln!("EVE_GROUP speech_decision_persist_failed"),
+    }
+}
+
+#[cfg(test)]
+#[path = "qq_group_tests.rs"]
+mod speech_tests;
 
 #[cfg(test)]
 mod anchored_window_tests {

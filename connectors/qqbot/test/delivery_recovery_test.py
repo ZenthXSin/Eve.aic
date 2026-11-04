@@ -41,25 +41,25 @@ class DeliveryRecoveryAcceptance(ToolProgressAcceptance):
                       *self.send(self.message('private-retrieve', '/last-reply', expected='私聊结果'))])
         self.assertEqual(self.chat_rounds, 2)
 
-    def test_sdk_diagnostics_are_logged_for_progress_and_final_without_raw_error_content(self):
-        self.callback = lambda body: dialogue.text_response('已保存正文') if self.results(body) else dialogue.tool_response(
-            [('send_message', {'text': '正在核对当前结果', 'purpose': 'progress'})])
-        message = self.message('diagnostic', '执行诊断任务', expected='已保存正文') | {
-            'fail_delivery': True, 'fail_progress': True,
-            'progress_diagnostic': {'http_status': 429, 'biz_code': 1234, 'failure_kind': 'http'},
-            'delivery_diagnostic': {'http_status': 400, 'biz_code': 5678, 'delivery_mode': 'passive',
-                                    'notice_status': 'sent', 'secret': 'never-print-private-body'},
+    def test_sdk_diagnostics_describe_explicit_send_without_automatic_error_or_final(self):
+        self.callback = lambda body: dialogue.text_response('内部结束') if self.results(body) else dialogue.tool_response(
+            [('send_message', {'text': '当前核实的发现', 'purpose': 'conversation'})])
+        message = self.message('diagnostic', '执行诊断任务') | {
+            'expected_type': 'finish', 'fail_progress': True,
+            'progress_diagnostic': {'http_status': 429, 'biz_code': 1234, 'failure_kind': 'http',
+                                    'secret': 'never-print-private-body'},
         }
-        self.run_eve([{'send': message}, self.wait_receipt('diagnostic', 'Failed')], panel=True,
+        self.run_eve([{'send': message}, self.wait_receipt('diagnostic', 'Handled')], panel=True,
                      env_extra={'EVE_QQ_LIVE_INTERACTION': 'true'})
         logs = self.panel_stderr.read_text()
         self.assertIn('progress_failed_no_retry', logs)
-        self.assertIn('delivery_failed_no_retry', logs)
-        for value in ['429', '1234', '400', '5678', 'notice_status']:
+        for value in ['429', '1234']:
             self.assertIn(value, logs)
         self.assertNotIn('never-print-private-body', logs)
-        self.assertEqual(self.receipt('diagnostic')['state'], 'Failed')
-        self.assertEqual(self.receipt('diagnostic')['reply'], '已保存正文')
+        self.assertEqual(self.receipt('diagnostic')['state'], 'Handled')
+        self.assertEqual(self.receipt('diagnostic')['progress'][0]['state'], 'Failed')
+        self.assertIsNone(self.receipt('diagnostic')['reply'])
+        self.assertFalse([e for e in self.events if e.get('type') in ('reply', 'segment', 'push')])
 
 
 if __name__ == '__main__':

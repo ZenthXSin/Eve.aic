@@ -19,6 +19,8 @@ mod outreach;
 mod participants;
 mod progress;
 pub use progress::{ModelProgressNarrator, QqProgressFacts, QqProgressNarrator};
+mod speech;
+pub use speech::{QqSpeech, QqSpeechDecision, QqSpeechEvent};
 mod state;
 
 pub use archive::{
@@ -35,11 +37,12 @@ pub use files::{
 pub use observer::{QqInteraction, QqInteractionObserver, QqInteractionSource};
 pub use outreach::{
     QQ_OUTREACH_JUDGE_TIMEOUT, QQ_OUTREACH_MAX_BYTES, QQ_OUTREACH_MAX_REPLY_PARTS,
-    QQ_OUTREACH_PAUSE_MS, QqGroupChimeDelivery, QqOutreach, QqOutreachFuture, QqOutreachMessage,
-    QqOutreachMoment, QqOutreachPush, QqOutreachResult,
+    QQ_OUTREACH_PAUSE_MS, QqAuthoredPushPage, QqGroupChimeDelivery, QqOutreach,
+    QqOutreachCandidate, QqOutreachFuture, QqOutreachMessage, QqOutreachMoment, QqOutreachPush,
+    QqOutreachResult,
 };
 pub use participants::QqParticipantObserver;
-pub use state::{ImageAttachment, Message};
+pub use state::{ImageAttachment, Message, valid_message_id};
 pub use trusted_review::QqRestrictionObserver;
 
 /// 慢步骤进度的时间阈值：本轮某一步（等待模型或一批工具）持续超过它仍未结束时，
@@ -243,6 +246,7 @@ pub struct QqBotPlugin {
     timing_diagnostics: bool,
     slow_progress: Option<Arc<dyn QqSlowProgress>>,
     progress_narrator: Option<Arc<dyn QqProgressNarrator>>,
+    speech: Option<Arc<dyn QqSpeech>>,
     debounce: Option<Arc<dyn QqDebounce>>,
     stickers: Option<Arc<dyn QqStickers>>,
     failure_recovery: Option<Arc<dyn QqFailureRecovery>>,
@@ -290,6 +294,7 @@ impl QqBotPlugin {
             timing_diagnostics: false,
             slow_progress: None,
             progress_narrator: None,
+            speech: None,
             debounce: None,
             stickers: None,
             failure_recovery: None,
@@ -414,6 +419,12 @@ impl QqBotPlugin {
     }
 
     /// 进度由模型按真实事实自由生成；未接线或生成失败时不发送自动进度。
+    /// 宿主事实统一交给 Eve 决定是否发言。
+    pub fn with_speech(mut self, speech: Arc<dyn QqSpeech>) -> Self {
+        self.speech = Some(speech);
+        self
+    }
+
     pub fn with_progress_narrator(mut self, narrator: Arc<dyn QqProgressNarrator>) -> Self {
         self.progress_narrator = Some(narrator);
         self
@@ -610,6 +621,7 @@ impl Plugin for QqBotPlugin {
             let timing_diagnostics = self.timing_diagnostics;
             let slow_progress = self.slow_progress.clone();
             let progress_narrator = self.progress_narrator.clone();
+            let speech = self.speech.clone();
             let debounce = self.debounce.clone();
             let stickers = self.stickers.clone();
             let failure_recovery = self.failure_recovery.clone();
@@ -643,6 +655,7 @@ impl Plugin for QqBotPlugin {
                     let group_observer = group_observer.clone();
                     let slow_progress = slow_progress.clone();
                     let progress_narrator = progress_narrator.clone();
+                    let speech = speech.clone();
                     let debounce = debounce.clone();
                     let stickers = stickers.clone();
                     let failure_recovery = failure_recovery.clone();
@@ -681,6 +694,7 @@ impl Plugin for QqBotPlugin {
                                 timing_diagnostics,
                                 slow_progress,
                                 progress_narrator,
+                                speech,
                                 debounce,
                                 stickers,
                                 failure_recovery,

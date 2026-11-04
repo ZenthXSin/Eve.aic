@@ -130,6 +130,159 @@ fn is_due(tasks: &TaskController, id: &str, at: u64) -> bool {
 }
 
 #[tokio::test]
+async fn reviewed_progress_facts_are_compared_inside_the_claim_even_with_the_same_status_and_sequence()
+ {
+    for cold in [false, true] {
+        let world = World::new(cold);
+        let (kernel, tasks) = world.open().await.unwrap();
+        let alice = owner("alice");
+        let task = tasks
+            .create(&alice, spec(), "reviewed-progress", 10)
+            .unwrap();
+        let queued = TaskProgressToken::from_task(&task).unwrap();
+        tasks.start(&task.id, 20).unwrap();
+        let mut checkpoint = eve_llm_api::TurnCheckpoint {
+            version: 1,
+            scope: eve_llm_api::ContextScope {
+                session_id: alice.session_id.clone(),
+                user_id: alice.user_id.clone(),
+            },
+            messages: vec![eve_llm_api::ChatMessage::text(
+                eve_llm_api::ChatRole::User,
+                "执行核验",
+            )],
+            pending_calls: vec![],
+            used_tool_calls: 0,
+            delegated_tool_calls: 0,
+            delegated_model_requests: 0,
+            provider_requests: 1,
+            tool_batches: 0,
+            remaining: Some("正在读取原始结果".into()),
+            continuation_checks: 0,
+            closing: false,
+            result: None,
+        };
+        let first = tasks
+            .checkpoint(&task.id, checkpoint.clone(), u64::MAX, 30)
+            .unwrap();
+        let old = TaskProgressToken::from_task(&first).unwrap();
+        checkpoint.remaining = Some("已有结果，需要核对最新差异".into());
+        let latest = tasks
+            .checkpoint(&task.id, checkpoint, u64::MAX, 31)
+            .unwrap();
+        let expected = TaskProgressToken::from_task(&latest).unwrap();
+        assert_eq!(old.next_sequence, expected.next_sequence);
+        assert_ne!(old.facts_revision, expected.facts_revision);
+        assert_eq!(first.status, latest.status);
+        let at = task.created_at_ms + TASK_PROGRESS_INTERVAL_MS;
+        let before = world.raw();
+        for stale in [&queued, &old] {
+            assert_eq!(
+                tasks.claim_progress_expected(
+                    &alice,
+                    &task.id,
+                    stale,
+                    DeliveryChannel::Proactive,
+                    at
+                ),
+                Err(TaskError::InvalidTransition)
+            );
+        }
+        assert_eq!(world.raw(), before);
+        assert!(notices(&tasks.get_owned(&alice, &task.id).unwrap().unwrap()).is_empty());
+        let claimed = tasks
+            .claim_progress_expected(&alice, &task.id, &expected, DeliveryChannel::Proactive, at)
+            .unwrap();
+        assert_eq!(notices(&claimed)[0].sequence, 1);
+        assert_eq!(
+            claimed.execution.as_ref().unwrap().checkpoint,
+            latest.execution.as_ref().unwrap().checkpoint
+        );
+        let delivered = tasks
+            .record_progress_delivery(&alice, &task.id, 1, sent("actual-receipt"), at)
+            .unwrap();
+        let current = TaskProgressToken::from_task(&delivered).unwrap();
+        assert_eq!(current.next_sequence, 2);
+        let mut stale_facts = expected;
+        stale_facts.next_sequence = 2;
+        let before = world.raw();
+        assert_eq!(
+            tasks.claim_progress_expected(
+                &alice,
+                &task.id,
+                &stale_facts,
+                DeliveryChannel::Proactive,
+                at + TASK_PROGRESS_INTERVAL_MS
+            ),
+            Err(TaskError::InvalidTransition)
+        );
+        assert_eq!(world.raw(), before, "改序号不能让旧事实的判断重新生效");
+        tasks.cancel(&alice.user_id, &task.id, at + 1).unwrap();
+        let before = world.raw();
+        assert_eq!(
+            tasks.claim_progress_expected(
+                &alice,
+                &task.id,
+                &current,
+                DeliveryChannel::Proactive,
+                at + TASK_PROGRESS_INTERVAL_MS
+            ),
+            Err(TaskError::InvalidTransition)
+        );
+        assert_eq!(world.raw(), before, "取消意图改变后必须重新决定内容");
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unclaimed_progress_decision_survives_restart_without_consuming_a_notice() {
+    for cold in [false, true] {
+        let world = World::new(cold);
+        let (kernel, tasks) = world.open().await.unwrap();
+        let alice = owner("alice");
+        let task = tasks
+            .create(&alice, spec(), "unclaimed-candidate", 10)
+            .unwrap();
+        let before = world.raw();
+        let expected = TaskProgressToken::from_task(&task).unwrap();
+        let wire = serde_json::to_vec(&expected).unwrap();
+        assert!(wire.len() < 128, "候选版本不复制任务上下文");
+        assert_eq!(world.raw(), before);
+        kernel.stop_all().await.unwrap();
+        let (kernel, tasks) = world.open().await.unwrap();
+        let restored = tasks.get_owned(&alice, &task.id).unwrap().unwrap();
+        assert_eq!(TaskProgressToken::from_task(&restored).unwrap(), expected);
+        assert!(notices(&restored).is_empty());
+        let at = task.created_at_ms + TASK_PROGRESS_INTERVAL_MS;
+        tasks
+            .claim_progress_expected(&alice, &task.id, &expected, DeliveryChannel::Proactive, at)
+            .unwrap();
+        let committed = world.raw();
+        assert_eq!(
+            tasks.claim_progress_expected(
+                &alice,
+                &task.id,
+                &expected,
+                DeliveryChannel::Proactive,
+                at
+            ),
+            Err(TaskError::InvalidTransition)
+        );
+        assert_eq!(world.raw(), committed);
+        kernel.stop_all().await.unwrap();
+        let (kernel, tasks) = world.open().await.unwrap();
+        let restored = tasks.get_owned(&alice, &task.id).unwrap().unwrap();
+        assert_eq!(notices(&restored).len(), 1);
+        assert_eq!(
+            notices(&restored)[0].attempt.result,
+            Some(DeliveryResult::Unknown)
+        );
+        assert!(!is_due(&tasks, &task.id, at + DAY_MS));
+        kernel.stop_all().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn thirty_minute_boundary_is_shared_by_scope_and_start_does_not_defer_it() {
     assert_eq!(TASK_PROGRESS_INTERVAL_MS, 30 * 60 * 1000);
     for cold in [false, true] {
@@ -556,11 +709,18 @@ async fn failed_or_unconfirmed_claim_commits_never_authorize_a_send() {
             let (kernel, tasks) = world.open().await.unwrap();
             let alice = owner("alice");
             let task = tasks.create(&alice, spec(), "claim-failure", 10).unwrap();
+            let expected = TaskProgressToken::from_task(&task).unwrap();
             let at = task.created_at_ms + TASK_PROGRESS_INTERVAL_MS;
             let before = world.raw();
             world.fail_commit(after, true);
             assert_eq!(
-                tasks.claim_progress(&alice, &task.id, DeliveryChannel::Proactive, at),
+                tasks.claim_progress_expected(
+                    &alice,
+                    &task.id,
+                    &expected,
+                    DeliveryChannel::Proactive,
+                    at
+                ),
                 Err(TaskError::Storage)
             );
             world.fail_commit(after, false);

@@ -1179,15 +1179,18 @@ async fn run_qqbot_composed(
             Ok("true") | Err(std::env::VarError::NotPresent) => true,
             _ => return Err("EVE_QQ_LIVE_INTERACTION 必须是 true 或 false".into()),
         };
-        if live_enabled {
-            let live = Arc::new(eve_qqbot_plugin::LiveDialogue::default());
+        let live_dialogue=live_enabled.then(||Arc::new(eve_qqbot_plugin::LiveDialogue::default()));
+        if let Some(live)=&live_dialogue {
             bootstrap.steering = Some(live.clone());
             bootstrap.tools.push(live.send_tool());
+            bootstrap.tools.push(live.wait_tool());
             bootstrap.host_config.tool_timeout_overrides.insert("send_message".into(), std::time::Duration::from_secs(45));
-            plugin = plugin.with_live_dialogue(live);
+            bootstrap.host_config.tool_timeout_overrides.insert("wait_for_input".into(), std::time::Duration::from_secs(65));
+            bootstrap.host_config.tool_timeout_overrides.insert("send_sticker".into(), std::time::Duration::from_secs(45));
+            plugin = plugin.with_live_dialogue(live.clone());
         }
+        bootstrap.tool_scope_policy = Some(Arc::new(crate::qq_access::ChannelToolPolicy));
         let group = if options.group_chat {
-            bootstrap.tool_scope_policy = Some(Arc::new(crate::qq_group::ToolPolicy));
             let store = Arc::new(eve_group_observation_sqlite::SqliteGroupObservations::open(
                 &options.state_directory.join("group-observations.sqlite3"),
             )?);
@@ -1976,12 +1979,14 @@ async fn run_qqbot_composed(
         // 表情包：从本轮直接附带的图片里收集候选，审看后由 send_sticker 挑选，随回复正文之后发出。
         // 库损坏时拒绝启动并保留原文件；不开启时不打开库、不注册工具。
         let stickers = if options.stickers {
-            let stickers = Arc::new(crate::qq_stickers::Stickers::new(Arc::new(
+            let mut stickers = crate::qq_stickers::Stickers::new(Arc::new(
                 eve_sticker_plugin::FileStickerLibrary::open(
                     options.state_directory.join("stickers"),
                 )
                 .map_err(|error| format!("表情包库无法打开：{error}"))?,
-            )));
+            ));
+            stickers.live=live_dialogue.clone();
+            let stickers=Arc::new(stickers);
             plugin = plugin.with_stickers(stickers.clone());
             bootstrap
                 .tools
@@ -2356,6 +2361,12 @@ async fn run_qqbot_composed(
             inner:bootstrap.context.take().ok_or("对话上下文缺失")?,
             web: Some(web_context),
         }));
+        let speech_store = if live_enabled {Some(crate::qq_speech::Store::open(&options.state_directory.join("speech.sqlite3"))?)} else {None};
+        if let Some(store)=&speech_store {
+            bootstrap.context=Some(Arc::new(crate::qq_speech::Context{inner:bootstrap.context.take().ok_or("对话上下文缺失")?,store:store.clone()}));
+        }
+        let speech_context=bootstrap.context.clone();
+        let speech_config=bootstrap.host_config.clone();
         let (control, model_settings_admin) = crate::install_core_with_pages_and_admin(
             &kernel,
             registry.clone(),
@@ -2521,7 +2532,14 @@ async fn run_qqbot_composed(
             )))
         };
         let budgeted = |category: &str| budget_gate.wrap(observed(category)?, category);
-        plugin = plugin.with_progress_narrator(Arc::new(eve_qqbot_plugin::ModelProgressNarrator(observed("progress")?)));
+        if let Some(store)=speech_store {
+            let sessions=registry.get(&ServiceId::new(SESSION_SERVICE_ID)?)?.ok_or("发言决定缺少会话服务")?.value.downcast::<SessionServiceHandle>().map_err(|_|"会话服务类型错误")?;
+            plugin=plugin.with_speech(Arc::new(crate::qq_speech::Speech{
+                store,resolver:observed("dialogue")?,background_resolver:budget_gate.wrap(observed("dialogue")?,"outreach")?,context:speech_context.ok_or("发言决定缺少上下文")?,sessions:sessions.0.clone(),host:speech_config,conversations:conversations.clone(),
+            }));
+        } else {
+            plugin = plugin.with_progress_narrator(Arc::new(eve_qqbot_plugin::ModelProgressNarrator(observed("progress")?)));
+        }
         // 群消息整理由对话中的工具按需触发，与主对话一样不计入自主运行预算；用途单独记健康。
         if let Some(tool) = &group_digest {
             let _ = tool.digester.set(Arc::new(eve_chime_plugin::ModelGroupDigester::new(

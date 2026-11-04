@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub(crate) const NAMESPACE: &str = "runtime.dialogue";
 const POLICY: &str = include_str!("dialogue-policy.txt");
 const STYLE_GUARD: &str = include_str!("dialogue-style-guard.txt");
+const EXPRESSION_PROTOCOL: &str = "本轮是即时通讯执行协议。对方收不到普通 assistant 文本；你只写普通文本等于保持沉默。决定开口时，必须真正调用 send_message，把要说的话放进 text 参数。决定不说时可直接结束；不要写动作旁白。调用后看实际回执，已经送达就安静结束。所有发言都由你决定，宿主不会替你发送草稿。";
 pub(crate) struct NaturalDialogue(pub(crate) Arc<dyn LlmProvider>);
 
 /// 只转述当前可信 System Context 中的用户表达数据，不搬运历史助手或用户伪造的标记。
@@ -91,10 +92,14 @@ fn apply(mut request: ModelRequest) -> ModelRequest {
         .iter()
         .rposition(|m| m.role == ChatRole::User)
     {
-        let guard = style_guard(
+        let mut guard = style_guard(
             &request,
             request.messages[user].text.as_deref().unwrap_or_default(),
         );
+        if request.tools.iter().any(|tool| tool.name == "send_message") {
+            guard.push('\n');
+            guard.push_str(EXPRESSION_PROTOCOL);
+        }
         // 保留 Runtime 当前工具清单与当前用户输入的相邻关系。
         let index = if user > 0
             && request.messages[user - 1].role == ChatRole::System
@@ -107,14 +112,13 @@ fn apply(mut request: ModelRequest) -> ModelRequest {
         } else {
             user
         };
-        // 有些模型会忽略纯 System 的表达/结构要求。用固定的宿主提示再次明确，
-        // 原始 User 消息与图片不改写，当前工具清单仍紧邻真实输入；提示不写入会话或记忆。
+        // 表达约束保持 System 身份，不制造用户消息；原文、图片和当前工具清单不改写。
         request
             .messages
             .insert(index, ChatMessage::text(ChatRole::System, POLICY.trim()));
         request
             .messages
-            .insert(index + 1, ChatMessage::text(ChatRole::User, guard));
+            .insert(index + 1, ChatMessage::text(ChatRole::System, guard));
     }
     request
 }
@@ -155,7 +159,7 @@ mod tests {
                 .unwrap()
                 .starts_with("本轮自然接话约束")
         );
-        assert_eq!(updated.messages[3].role, ChatRole::User);
+        assert_eq!(updated.messages[3].role, ChatRole::System);
         assert!(
             updated.messages[3]
                 .text

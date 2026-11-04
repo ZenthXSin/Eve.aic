@@ -141,6 +141,7 @@ if (scenario.script) {
       const cmd = JSON.parse(line);
       record({ direction: "out", ...cmd, ...(cmd.type === "segment" ? { at: Date.now() } : {}) });
       if (cmd.type === "stop") { stopped = true; return; }
+      if (cmd.type === "restore_anchor") { commands.push(cmd);continue; }
       if (cmd.type === "file") {
         if (typeof cmd.path !== "string" || !fs.statSync(cmd.path).isFile()) throw new Error("invalid_file_path");
         commands.push(cmd);
@@ -212,6 +213,7 @@ for await (const line of lines) {
   const cmd = JSON.parse(line);
   record({ direction: "out", ...cmd });
   if (cmd.type === "stop") break;
+  if (cmd.type === "restore_anchor") continue;
   if (cmd.id !== scenario.messages[index]?.id) throw new Error("wrong_reply_id");
   if (cmd.type === "progress") {
     send({ type: "delivery", id: cmd.id, progress: true, index: cmd.index, ok: true, message_id: "progress-" + cmd.id + "-" + cmd.index });

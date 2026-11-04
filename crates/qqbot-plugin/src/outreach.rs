@@ -47,6 +47,45 @@ pub struct QqOutreachPush {
     pub message: QqOutreachMessage,
 }
 
+/// 已由 Eve 决定正文的只读分页。按消息 ID 升序，游标是已查看范围的排他下界。
+/// 过滤权限或路由时必须保留 next；空页仍可带游标，不能把被挡住的群当成队尾。
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QqAuthoredPushPage {
+    pub pushes: Vec<QqOutreachPush>,
+    pub next: Option<String>,
+}
+
+impl QqAuthoredPushPage {
+    pub fn valid(&self, after: Option<&str>, limit: usize) -> bool {
+        if !(1..=64).contains(&limit) || self.pushes.len() > limit {
+            return false;
+        }
+        let mut previous = after;
+        for push in &self.pushes {
+            let id = push.message.id.as_str();
+            if !crate::valid_message_id(id) || previous.is_some_and(|p| id <= p) {
+                return false;
+            }
+            previous = Some(id);
+        }
+        self.next.as_deref().is_none_or(|next| {
+            crate::valid_message_id(next)
+                && after.is_none_or(|p| next > p)
+                && previous.is_none_or(|p| next >= p)
+        })
+    }
+}
+
+/// 只读候选，版本由来源事实生成；没有占用一次投递机会。
+#[derive(Clone, Debug, PartialEq)]
+pub struct QqOutreachCandidate {
+    pub id: String,
+    pub version: String,
+    pub session: Option<SessionKey>,
+    pub user_id: String,
+    pub facts: serde_json::Value,
+}
+
 /// 平台对一次邀请投递的真实结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QqOutreachResult {
@@ -74,10 +113,51 @@ pub enum QqOutreachResult {
 pub struct QqGroupChimeDelivery {
     pub session: SessionKey,
     pub speaker_id: String,
+    /// 模型决定所依据的真实平台入站 ID；新 authored 路径必须提供，旧兼容记录可缺失。
+    pub anchor: Option<String>,
     pub parts: Vec<(String, u64)>,
 }
 
 pub trait QqOutreach: Send + Sync {
+    /// 只读扫描至多 64 条已决定正文；after 为上一页的 next，None 从头开始。
+    /// 不能认领、推迟资格或改写正文；无支持时不回退旧自动推送。
+    fn authored_pushes(
+        &self,
+        _after: Option<&str>,
+        _limit: usize,
+    ) -> PluginResult<QqAuthoredPushPage> {
+        Ok(QqAuthoredPushPage::default())
+    }
+    /// 只读取 Eve 已明确决定的正文，不能在这里认领或改写；默认不使用旧自动推送。
+    fn next_authored_push(&self) -> PluginResult<Option<QqOutreachPush>> {
+        Ok(None)
+    }
+    /// 通道验证路由、消息新鲜度与正文后，紧贴 write 精确认领同一条已决定的正文。
+    /// 未实现的来源默认拒绝，不能回退为挑选另一条的 next_push。
+    fn claim_authored_push(&self, _expected: &QqOutreachPush) -> PluginResult<bool> {
+        Ok(false)
+    }
+    /// 可替换来源必须显式实现新契约，默认不回退到会认领的旧 next_push。
+    fn candidates(&self) -> PluginResult<Vec<QqOutreachCandidate>> {
+        Ok(vec![])
+    }
+    /// 候选的普通私聊资格只能由来源核对持久事实与可信身份，不能由 JSON 标记授予。
+    fn ordinary_candidate(&self, _candidate: &QqOutreachCandidate) -> PluginResult<bool> {
+        Ok(false)
+    }
+    /// 只认领已审视的具体来源版本；紧贴真实发送，不请求模型、不等待。
+    fn claim_candidate(
+        &self,
+        _candidate: &QqOutreachCandidate,
+        _text: &str,
+        _anchor: &str,
+    ) -> PluginResult<Option<QqOutreachPush>> {
+        Ok(None)
+    }
+    /// 明确的安静决定，不伪造 NotSent / Failed / Sent。周期来源可据此结束本次审视。
+    fn silence_candidate(&self, _candidate: &QqOutreachCandidate) -> PluginResult<()> {
+        Ok(())
+    }
     /// 仅宿主空闲邀请来源实现；必须核对已持久化领取和真实私聊身份，不能凭 ID 前缀授予权限。
     fn ordinary_direct_invitation(&self, _id: &str) -> PluginResult<Option<SessionKey>> {
         Ok(None)

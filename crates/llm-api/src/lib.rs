@@ -382,6 +382,9 @@ pub enum ModelResponse {
     ToolCalls { calls: Vec<ToolCall> },
 }
 
+/// 对话与后台表达共用的行为约定；正文发送只能来自显式模型决定。
+pub const DIALOGUE_EXPRESSION_PROMPT: &str = include_str!("dialogue_prompt.md");
+
 impl ModelResponse {
     pub fn validate(&self) -> Result<(), LlmError> {
         match self {
@@ -1187,4 +1190,8 @@ mod http_failure_status_tests {
 /// 宿主为可信调用范围决定是否装配工具；拒绝时隐藏并禁止执行所有工具。
 pub trait ToolScopePolicy: Send + Sync {
     fn tools_allowed(&self, scope: &ContextScope) -> bool;
+    /// 个别工具可能只存在于某个真实通道；默认保留旧的整组策略。
+    fn tool_allowed(&self, _scope: &ContextScope, _name: &str) -> bool {
+        true
+    }
 }

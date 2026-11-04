@@ -251,6 +251,84 @@ impl ChannelAdapter {
     }
 }
 impl QqOutreach for ChannelAdapter {
+    fn candidates(&self) -> PluginResult<Vec<eve_qqbot_plugin::QqOutreachCandidate>> {
+        let snapshot = self.tasks.progress_snapshot().map_err(error)?;
+        snapshot.validate().map_err(error)?;
+        let now = now_ms()?;
+        let mut output = Vec::new();
+        for entry in snapshot.due(now) {
+            if !self.allowed(&entry.owner)? {
+                continue;
+            }
+            let Some(task) = self
+                .tasks
+                .get_owned(&entry.owner, &entry.id)
+                .map_err(error)?
+            else {
+                continue;
+            };
+            if !entry.matches(&task) {
+                continue;
+            }
+            let token = eve_task_api::TaskProgressToken::from_task(&task).map_err(error)?;
+            // 周期只产生待审视事实，不强制说话；真实进展变化产生独立事件版本。
+            let checkpoint = task.execution.as_ref().and_then(|e| e.checkpoint.as_ref());
+            output.push(crate::qq_speech::candidate(format!("{ID_PREFIX}{}",task.id),Some(SessionKey{session_id:task.owner.session_id.clone(),user_id:task.owner.user_id.clone()}),task.owner.user_id.clone(),serde_json::json!({
+                "kind":"background_task_observation","task_id":task.id,"token":token,"title":task.spec.title,"status":task.status,"created_at_ms":task.created_at_ms,"finished_at_ms":task.finished_at_ms,
+                "cancel_requested":task.cancel_requested,"resume_at_ms":task.execution.as_ref().and_then(|e|e.resume_at_ms),"remaining":checkpoint.and_then(|c|c.remaining.as_ref()),
+                "result":task.result,"failure":task.failure,"process_liveness":"unverified","observation_period":now/eve_task_api::TASK_PROGRESS_INTERVAL_MS
+            }))?);
+        }
+        Ok(output)
+    }
+    fn claim_candidate(
+        &self,
+        candidate: &eve_qqbot_plugin::QqOutreachCandidate,
+        text: &str,
+        _anchor: &str,
+    ) -> PluginResult<Option<QqOutreachPush>> {
+        if !self.candidates()?.contains(candidate) {
+            return Ok(None);
+        }
+        let Some(session) = &candidate.session else {
+            return Ok(None);
+        };
+        let owner = TaskOwner {
+            session_id: session.session_id.clone(),
+            user_id: session.user_id.clone(),
+        };
+        let id = candidate.facts["task_id"]
+            .as_str()
+            .ok_or_else(|| error(TaskError::InvalidInput))?;
+        let token = serde_json::from_value(candidate.facts["token"].clone())
+            .map_err(|_| error(TaskError::InvalidInput))?;
+        let task = match self.tasks.claim_progress_expected(
+            &owner,
+            id,
+            &token,
+            DeliveryChannel::Proactive,
+            now_ms()?,
+        ) {
+            Ok(t) => t,
+            Err(TaskError::InvalidTransition | TaskError::NotFound) => return Ok(None),
+            Err(e) => return Err(error(e)),
+        };
+        let sequence = task
+            .execution
+            .as_ref()
+            .and_then(|e| e.progress_notices.last())
+            .ok_or_else(|| error(TaskError::CorruptState))?
+            .sequence;
+        Ok(Some(QqOutreachPush {
+            session: Some(session.clone()),
+            user_id: task.owner.user_id.clone(),
+            message: QqOutreachMessage {
+                id: message_id(&task, sequence),
+                text: text.into(),
+            },
+        }))
+    }
+
     fn due(&self, _session: &SessionKey) -> PluginResult<bool> {
         Ok(false)
     }

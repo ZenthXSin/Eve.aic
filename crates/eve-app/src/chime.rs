@@ -1,15 +1,11 @@
 //! 群聊插话的组合层：热配置、判断器选择，以及不绑定平台的 `eve-chime` 宿主。
 //!
 //! 宿主从标准输入逐行读取渠道已核对过的群消息（JSON），交给插话引擎；需要说话时经
-//! 正常对话链路生成并保存回复，按句分条，再把每条消息的决定与回复写成一行 JSON。
+//! 正常对话链路决定说话、等待或安静，再把决定与明确的一条正文写成一行 JSON。
 //! 真实渠道接入时只需提供自己的 `ChimeOutlet` 并把群消息喂给同一个引擎。
 use crate::{AppError, CoreBootstrap, core_bootstrap, finish_core, install_core, storage};
-use eve_chime_api::{
-    ChimeContext, ChimeJudge, ChimeOutlet, ChimeReply, ChimeService, ChimeVerdict, GroupMessage,
-};
-use eve_chime_plugin::{
-    ChimeEngine, ChimeSettings, ChimeSettingsSource, ModelChimeJudge, QuietJudge,
-};
+use eve_chime_api::{ChimeOutlet, ChimeReply, ChimeService, GroupMessage};
+use eve_chime_plugin::{ChimeEngine, ChimeSettings, ChimeSettingsSource};
 use eve_config_api::{ConfigField, ConfigKind, ConfigSchema, ConfigService};
 use eve_kernel::{Kernel, KernelServices};
 use eve_llm_api::LlmFuture;
@@ -27,11 +23,6 @@ pub(crate) const NAMESPACE: &str = "runtime.chime";
 pub(crate) const MODEL_USE: &str = "chime";
 /// 群回复会话的用户标识；会话标识取群标识。
 const SESSION_USER: &str = "eve-chime";
-const SEGMENT_LIMITS: eve_segment_api::SegmentLimits = eve_segment_api::SegmentLimits {
-    max_segments: 3,
-    max_segment_bytes: 4096,
-    max_pause_ms: 2500,
-};
 
 pub(crate) fn schema() -> ConfigSchema {
     let integer = |default: i64, min: i64, max: i64, environment: &str| {
@@ -124,7 +115,7 @@ impl Policy {
                 .unwrap_or(default),
         )
     }
-    fn judge(&self) -> Option<String> {
+    pub(crate) fn judge(&self) -> Option<String> {
         self.settings
             .get()?
             .snapshot(NAMESPACE, 1)
@@ -134,6 +125,9 @@ impl Policy {
     }
 }
 impl ChimeSettingsSource for Policy {
+    fn review_enabled(&self) -> bool {
+        self.judge().as_deref() == Some("model")
+    }
     fn settings(&self) -> Option<ChimeSettings> {
         let snapshot = self.settings.get()?.snapshot(NAMESPACE, 1).ok()?;
         let number = |name: &str| {
@@ -154,21 +148,6 @@ impl ChimeSettingsSource for Policy {
     }
 }
 
-/// 每次判断时按热配置选择：`model` 请模型判断，`quiet` 只在被叫到时接话；其他值按 `quiet`。
-pub(crate) struct SwitchJudge {
-    pub(crate) policy: Arc<Policy>,
-    pub(crate) model: Arc<dyn ChimeJudge>,
-}
-impl ChimeJudge for SwitchJudge {
-    fn judge(&self, context: ChimeContext) -> LlmFuture<'_, ChimeVerdict> {
-        if self.policy.judge().as_deref() == Some("model") {
-            self.model.judge(context)
-        } else {
-            QuietJudge.judge(context)
-        }
-    }
-}
-
 /// 示例宿主的出口：回复随决定一起写到标准输出，不在这里停顿或重发。
 struct EchoOutlet;
 impl ChimeOutlet for EchoOutlet {
@@ -177,17 +156,10 @@ impl ChimeOutlet for EchoOutlet {
     }
 }
 
-pub(crate) struct AlwaysSentences;
-impl eve_segment_plugin::ChatSplitting for AlwaysSentences {
-    fn sentences(&self) -> bool {
-        true
-    }
-}
-
 pub const CHIME_HELP: &str = "用法：eve-chime [--state-dir 目录] [--database-config 文件] [--agent 文件] [--persona 名字]
 从标准输入逐行读取群消息 JSON：{\"id\",\"conversation\",\"speaker\",\"speaker_name\",\"text\",\"mentions_me\",\"replies_to_me\",\"from_me\",\"at_ms\"}，
-每行输出一条 JSON：本条的决定（是否说话、原因）与回复（按句分条）。被 @、被回复或被叫到名字时一定接话；
-其余由 runtime.chime.judge 选择的判断器决定（model 或 quiet），并受冷却与每小时上限约束。回复照常保存在以群为会话的历史里。";
+每行输出一条 JSON：Eve 对本条选择说话、等待或安静。被 @、被回复或叫到名字只是上下文，不强制回应；
+runtime.chime.judge=model 时由同一对话模型作三态决定，quiet 暂停主动审视。正文不自动分条或添加停顿。决定保存在以群为会话的历史里。示例宿主只展示等待决定，持久渠道负责到时复审。";
 
 #[derive(Clone, Debug)]
 pub struct ChimeOptions {
@@ -257,8 +229,8 @@ pub async fn run_chime(
     input: impl BufRead,
     mut output: impl Write,
 ) -> Result<ChimeSummary, AppError> {
-    let bootstrap: CoreBootstrap = core_bootstrap(&options.agent_path)?;
-    let api_key = bootstrap.api_key.clone();
+    let mut bootstrap: CoreBootstrap = core_bootstrap(&options.agent_path)?;
+    bootstrap.tool_scope_policy = Some(Arc::new(crate::qq_access::ChannelToolPolicy));
     let backends = KernelServices {
         state: storage::open_state_store(
             &options.state_directory,
@@ -283,23 +255,8 @@ pub async fn run_chime(
         let settings = crate::qq_tasks::config_service(registry.as_ref())?;
         let policy = Arc::new(Policy::default());
         let _ = policy.settings.set(settings.clone());
-        let model: Arc<dyn ChimeJudge> = Arc::new(ModelChimeJudge::new(Arc::new(
-            crate::models::CoreModelResolver::new(settings, api_key).with_use(MODEL_USE),
-        )));
-        let engine = ChimeEngine::new(
-            control,
-            Arc::new(SwitchJudge {
-                policy: policy.clone(),
-                model,
-            }),
-            Arc::new(eve_segment_plugin::ChatPlanner::new(Arc::new(
-                AlwaysSentences,
-            ))),
-            SEGMENT_LIMITS,
-            policy,
-            options.persona.clone(),
-            SESSION_USER,
-        );
+        let engine =
+            ChimeEngine::autonomous(control, policy, options.persona.clone(), SESSION_USER);
         let mut summary = ChimeSummary::default();
         for line in input.lines() {
             let line = line?;

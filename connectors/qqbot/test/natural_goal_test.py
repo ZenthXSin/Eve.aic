@@ -57,7 +57,7 @@ class NaturalGoalAcceptance(defaults.DefaultCapabilitiesAcceptance):
             current = self.text(body)
             results = self.results(body)
             if current in words[:-1]:
-                return text_response("收到。")
+                return self.say("收到。")
             self.assert_default_tools(body)
             if not results:
                 if current == words[-1]:
@@ -74,21 +74,21 @@ class NaturalGoalAcceptance(defaults.DefaultCapabilitiesAcceptance):
                 self.assertFalse(result["external_goal_completed"])
                 self.assertEqual(result["goal"]["status"], "Waiting")
                 replies["created"] = result
-                return text_response("待办已记录，现实准备尚未完成。")
+                return self.say("待办已记录，现实准备尚未完成。")
             if current == feedback:
                 self.assertTrue(result["stored"])
                 self.assertEqual(result["goal"]["revision"], replies["created"]["goal"]["revision"] + 1)
                 self.assertEqual(result["goal"]["status"], "Waiting")
                 replies["updated"] = result
-                return text_response("九点出发的反馈已保存。")
+                return self.say("九点出发的反馈已保存。")
             if current == stale:
                 self.assertIn("error", result)
                 self.assertIn("版本", result["error"]["message"])
-                return text_response("旧版本反馈没有覆盖新时间。")
+                return self.say("旧版本反馈没有覆盖新时间。")
             self.assertEqual(current, inspect)
             self.assertEqual(result["goal"], replies["updated"]["goal"])
             self.assertFalse(result["goal_completed"])
-            return text_response("原待办和九点出发的反馈都还在。")
+            return self.say("原待办和九点出发的反馈都还在。")
 
         self.callback = respond
         script = []
