@@ -15,6 +15,8 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
 };
+pub(crate) mod host_paths;
+use host_paths::preserve_file_metadata;
 mod journal;
 mod live_upgrade;
 mod member;
@@ -296,6 +298,7 @@ impl LocalDeveloper {
                 "当前业务权限已暂停，操作未执行".into(),
             ));
         }
+        self.authorize_host_paths(operation, context)?;
         let protected = match operation {
             DeveloperOperation::Read(a)
             | DeveloperOperation::Write(a)
@@ -447,13 +450,29 @@ impl LocalDeveloper {
         path: &Path,
         expected: &str,
         content: &[u8],
+        inherited_metadata: Option<&fs::Metadata>,
         context: &ToolExecutionContext,
     ) -> Result<(), ToolExecutionError> {
+        let existing_metadata = if expected.is_empty() {
+            None
+        } else {
+            let metadata =
+                fs::symlink_metadata(path).map_err(|_| failed("原文件属性不可读取，未修改"))?;
+            if !metadata.is_file() {
+                return Err(failed("原文件已不是普通文件，未修改"));
+            }
+            Some(metadata)
+        };
         let mut tmp = tempfile::NamedTempFile::new_in(path.parent().expect("checked parent"))
             .map_err(|_| failed("临时文件不可创建"))?;
         tmp.write_all(content)
-            .and_then(|_| tmp.as_file().sync_all())
             .map_err(|_| failed("文件写入失败，原文件保留"))?;
+        if let Some(metadata) = inherited_metadata.or(existing_metadata.as_ref()) {
+            preserve_file_metadata(tmp.as_file(), tmp.path(), metadata)?;
+        }
+        tmp.as_file()
+            .sync_all()
+            .map_err(|_| failed("文件同步失败，原文件保留"))?;
         if stopped(context) {
             return Err(ToolExecutionError::Cancelled("文件提交已取消".into()));
         }
@@ -485,12 +504,14 @@ impl LocalDeveloper {
                 rel: String,
                 content: Vec<u8>,
                 before: Option<Vec<u8>>,
+                metadata: Option<fs::Metadata>,
                 action: &'static str,
             },
             Delete {
                 path: PathBuf,
                 rel: String,
                 before: Vec<u8>,
+                metadata: fs::Metadata,
             },
         }
         let hunks = eve_apply_patch::parse(text).map_err(failed)?;
@@ -521,8 +542,8 @@ impl LocalDeveloper {
         let mut steps = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for hunk in hunks {
-            let mut claim = |rel: &str| {
-                if seen.insert(rel.to_string()) {
+            let mut claim = |path: &Path, rel: &str| {
+                if seen.insert(path.to_owned()) {
                     Ok(())
                 } else {
                     Err(failed(format!("同一个补丁里 {rel} 出现了不止一次")))
@@ -533,52 +554,67 @@ impl LocalDeveloper {
                     path: rel,
                     contents,
                 } => {
-                    claim(&rel)?;
-                    let path = self.path(&rel, true)?;
+                    let path = self.model_file_path(&rel, true)?;
+                    claim(&path, &rel)?;
                     absent(&path, &rel)?;
                     steps.push(Step::Write {
                         path,
                         rel,
                         content: contents.into_bytes(),
                         before: None,
+                        metadata: None,
                         action: "add",
                     });
                 }
                 eve_apply_patch::Hunk::Delete { path: rel } => {
-                    claim(&rel)?;
-                    let path = self.path(&rel, false)?;
+                    let path = self.model_file_path(&rel, false)?;
+                    claim(&path, &rel)?;
                     let (before, _) = read_text(&path)?;
-                    steps.push(Step::Delete { path, rel, before });
+                    let metadata = fs::metadata(&path).map_err(|_| failed("原文件属性不可读取"))?;
+                    steps.push(Step::Delete {
+                        path,
+                        rel,
+                        before,
+                        metadata,
+                    });
                 }
                 eve_apply_patch::Hunk::Update {
                     path: rel,
                     move_to,
                     chunks,
                 } => {
-                    claim(&rel)?;
-                    let path = self.path(&rel, false)?;
+                    let path = self.model_file_path(&rel, false)?;
+                    claim(&path, &rel)?;
                     let (before, original) = read_text(&path)?;
+                    let metadata = fs::metadata(&path).map_err(|_| failed("原文件属性不可读取"))?;
                     let updated = eve_apply_patch::apply_update(&original, &chunks)
                         .map_err(|e| failed(format!("{rel}：{e}；补丁未应用")))?;
                     match move_to {
                         Some(target) => {
-                            claim(&target)?;
-                            let destination = self.path(&target, true)?;
+                            let destination = self.model_file_path(&target, true)?;
+                            claim(&destination, &target)?;
                             absent(&destination, &target)?;
                             steps.push(Step::Write {
                                 path: destination,
                                 rel: target,
                                 content: updated.into_bytes(),
                                 before: None,
+                                metadata: Some(metadata.clone()),
                                 action: "move",
                             });
-                            steps.push(Step::Delete { path, rel, before });
+                            steps.push(Step::Delete {
+                                path,
+                                rel,
+                                before,
+                                metadata,
+                            });
                         }
                         None => steps.push(Step::Write {
                             path,
                             rel,
                             content: updated.into_bytes(),
                             before: Some(before),
+                            metadata: Some(metadata),
                             action: "update",
                         }),
                     }
@@ -609,14 +645,17 @@ impl LocalDeveloper {
                     rel,
                     content,
                     before,
+                    metadata,
                     action,
                 } => {
                     let expected = before.as_deref().map(hash).unwrap_or_default();
-                    self.replace_file(path, &expected, content, context).map(|()| {
+                    self.replace_file(path, &expected, content, metadata.as_ref(), context).map(|()| {
                         json!({"path": rel, "action": action, "sha256": hash(content), "bytes": content.len()})
                     })
                 }
-                Step::Delete { path, rel, before } => {
+                Step::Delete {
+                    path, rel, before, ..
+                } => {
                     let current = fs::read(path).ok().map(|b| hash(&b));
                     if current.as_deref() != Some(hash(before).as_str()) {
                         Err(failed(format!("{rel} 在提交前变化，未删除")))
@@ -655,7 +694,21 @@ impl LocalDeveloper {
                     before: Some(before),
                     ..
                 } => fs::write(path, before).is_ok(),
-                Step::Delete { path, before, .. } => fs::write(path, before).is_ok(),
+                Step::Delete {
+                    path,
+                    before,
+                    metadata,
+                    ..
+                } => OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .ok()
+                    .is_some_and(|mut file| {
+                        file.write_all(before).is_ok()
+                            && preserve_file_metadata(&file, path, metadata).is_ok()
+                            && file.sync_all().is_ok()
+                    }),
             };
             if !restored {
                 unrestored.push(match step {
@@ -673,23 +726,33 @@ impl LocalDeveloper {
         }
     }
     /// 在工作区目录中按字面文本搜索 UTF-8 文件，按目录广度优先、名称排序输出；不跟随符号链接。
-    fn search(&self, a: SearchArguments, sensitive: bool) -> Result<Value, ToolExecutionError> {
-        let start = self.path(&a.path, false)?;
+    fn search(
+        &self,
+        a: SearchArguments,
+        sensitive: bool,
+        context: &ToolExecutionContext,
+    ) -> Result<Value, ToolExecutionError> {
+        let start = self.model_file_path(&a.path, false)?;
         if !fs::metadata(&start)
             .map_err(|_| failed("目录不可读取"))?
             .is_dir()
         {
-            return Err(failed("搜索只接受工作区内的目录"));
+            return Err(failed("搜索只接受当前授权范围内的目录"));
         }
-        // 结果路径与 read_file 一致，都相对于工作区根目录。
-        let prefix = Path::new(&a.path)
-            .components()
-            .filter_map(|c| match c {
-                Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("/");
+        // 相对搜索仍返回工程路径；绝对搜索使用目录项真实路径，保留 Windows verbatim 前缀。
+        let absolute = Path::new(&a.path).is_absolute();
+        let prefix = if absolute {
+            String::new()
+        } else {
+            Path::new(&a.path)
+                .components()
+                .filter_map(|c| match c {
+                    Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/")
+        };
         let mut queue = VecDeque::from([(start, prefix)]);
         let mut matches = Vec::new();
         let mut used = 0usize;
@@ -707,11 +770,25 @@ impl LocalDeveloper {
                 if kind.is_symlink() || SKIPPED_NAMES.contains(&name.as_str()) {
                     continue;
                 }
-                let relative = if prefix.is_empty() {
+                let relative = if absolute {
+                    entry.path().to_string_lossy().into_owned()
+                } else if prefix.is_empty() {
                     name
                 } else {
                     format!("{prefix}/{name}")
                 };
+                if review::credential_path(&relative)
+                    || self.check_model_file(&entry.path()).is_err()
+                    || context.scope().is_some_and(|scope| {
+                        self.authorization
+                            .as_ref()
+                            .is_some_and(|a| !a.permits_file(scope, &entry.path(), false))
+                    })
+                    || (Path::new(&relative).is_absolute()
+                        && self.model_file_path(&relative, false).is_err())
+                {
+                    continue;
+                }
                 if !sensitive && sensitive_path(&relative) {
                     continue;
                 }
@@ -768,7 +845,7 @@ impl LocalDeveloper {
     ) -> Result<Value, ToolExecutionError> {
         match operation {
             DeveloperOperation::List(a) => {
-                let mut entries = fs::read_dir(self.path(&a.path, false)?)
+                let mut entries = fs::read_dir(self.model_file_path(&a.path, false)?)
                     .map_err(|_| failed("目录不可读取"))?
                     .map(|r| r.map_err(|_| failed("目录条目不可读取")))
                     .collect::<Result<Vec<_>, _>>()?;
@@ -778,7 +855,7 @@ impl LocalDeveloper {
                 Ok(json!({"path":a.path,"entries":entries,"total":total,"truncated":total>128}))
             }
             DeveloperOperation::Read(a) => {
-                let path = self.path(&a.path, false)?;
+                let path = self.model_file_path(&a.path, false)?;
                 let metadata = fs::metadata(&path).map_err(|_| failed("文件不可读取"))?;
                 if !metadata.is_file() {
                     return Err(failed("文件工具只读取普通文件，不打开目录、设备或管道"));
@@ -798,7 +875,7 @@ impl LocalDeveloper {
                 )
             }
             DeveloperOperation::Write(a) => {
-                let path = self.path(&a.path, true)?;
+                let path = self.model_file_path(&a.path, true)?;
                 if fs::metadata(&path).is_ok_and(|m| !m.is_file()) {
                     return Err(failed("文件工具只写普通文件，不打开目录、设备或管道"));
                 }
@@ -815,13 +892,13 @@ impl LocalDeveloper {
                     return Err(failed("文件已变化；重新读取后再修改，未覆盖"));
                 }
                 let content = a.content.ok_or_else(|| failed("缺少文件内容"))?;
-                self.replace_file(&path, expected, content.as_bytes(), context)?;
+                self.replace_file(&path, expected, content.as_bytes(), None, context)?;
                 Ok(
                     json!({"success":true,"path":a.path,"sha256":hash(content.as_bytes()),"bytes":content.len()}),
                 )
             }
             DeveloperOperation::Edit(a) => {
-                let path = self.path(&a.path, false)?;
+                let path = self.model_file_path(&a.path, false)?;
                 let metadata = fs::metadata(&path).map_err(|_| failed("文件不可读取"))?;
                 if !metadata.is_file() {
                     return Err(failed("文件工具只修改普通文件，不打开目录、设备或管道"));
@@ -841,14 +918,14 @@ impl LocalDeveloper {
                     _ => return Err(failed("要替换的文本出现多次；请提供更长的上下文，未修改")),
                 }
                 let updated = text.replacen(&a.old_string, &a.new_string, 1);
-                self.replace_file(&path, &a.expected_sha256, updated.as_bytes(), context)?;
+                self.replace_file(&path, &a.expected_sha256, updated.as_bytes(), None, context)?;
                 Ok(
                     json!({"success":true,"path":a.path,"sha256":hash(updated.as_bytes()),"bytes":updated.len()}),
                 )
             }
             DeveloperOperation::Patch(a) => self.patch(&a.patch, context),
             DeveloperOperation::Search(a) => {
-                self.search(a, self.isolated || self.authorize(context).is_ok())
+                self.search(a, self.isolated || self.authorize(context).is_ok(), context)
             }
             DeveloperOperation::Command(a) => self.command(a, context).await,
             DeveloperOperation::Github(a) => self.github(a, context).await,
@@ -891,7 +968,7 @@ impl LocalDeveloper {
         output_limit: usize,
         evidence: bool,
     ) -> Result<Value, ToolExecutionError> {
-        let cwd = self.path(&a.cwd, false)?;
+        let cwd = self.model_path(&a.cwd, false)?;
         if !cwd.is_dir() {
             return Err(failed("命令 cwd 必须是目录"));
         }
@@ -901,7 +978,7 @@ impl LocalDeveloper {
             Command::new(&a.program)
         };
         command
-            .current_dir(cwd)
+            .current_dir(&cwd)
             .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -992,7 +1069,7 @@ impl LocalDeveloper {
             }
         };
         Ok(
-            json!({"success":status.success(),"exit_code":status.code(),"stdout":decode(out.0)?,"stderr":decode(err.0)?,"stdout_truncated":out.1,"stderr_truncated":err.1}),
+            json!({"success":status.success(),"exit_code":status.code(),"stdout":decode(out.0)?,"stderr":decode(err.0)?,"stdout_truncated":out.1,"stderr_truncated":err.1,"cwd":cwd}),
         )
     }
     fn github_arguments(&self, a: GithubArguments) -> Result<GithubArguments, ToolExecutionError> {
@@ -1317,6 +1394,8 @@ impl DeveloperBackend for LocalDeveloper {
     fn observation_capabilities(&self) -> Option<DeveloperObservationCapabilities> {
         Some(DeveloperObservationCapabilities {
             workspace: self.root.clone(),
+            host_filesystem: self.config.host_filesystem && !self.isolated,
+            protected_paths: self.protected_paths(),
             session_workspaces: self
                 .session_workspaces
                 .then(|| self.journal.join("workspaces")),
@@ -1352,7 +1431,10 @@ impl DeveloperBackend for LocalDeveloper {
             let work = async {
                 let member = if self.member_operation(&operation, &context) {
                     Some(self.member_backend(&context)?)
-                } else if self.session_workspaces && workspaces::uses_workspace(&operation) {
+                } else if self.session_workspaces
+                    && workspaces::uses_workspace(&operation)
+                    && !(self.config.host_filesystem && host_paths::only_absolute_paths(&operation))
+                {
                     Some(self.session_backend(&context).await?)
                 } else {
                     None
@@ -1366,6 +1448,7 @@ impl DeveloperBackend for LocalDeveloper {
                     None
                 };
                 let backend = snapshot.as_ref().unwrap_or(backend);
+                let operation = backend.bind_model_paths(operation, &context)?;
                 let reviewed = backend
                     .review_operation(audit.id(), &operation, &context)
                     .await?;

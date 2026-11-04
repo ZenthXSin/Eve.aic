@@ -70,6 +70,8 @@ pub(crate) struct Observations {
     pub(crate) sessions: Arc<dyn SessionService>,
     pub(crate) tasks: Option<Arc<dyn TaskAdmin>>,
     workspace: Option<PathBuf>,
+    host_filesystem: bool,
+    protected_paths: BTreeSet<PathBuf>,
     session_workspaces: Option<PathBuf>,
     operators: BTreeSet<String>,
     authorization: Option<Arc<dyn eve_developer_api::DeveloperAuthorization>>,
@@ -97,6 +99,11 @@ impl Observations {
             sessions,
             tasks,
             workspace: config.as_ref().map(|c| c.workspace.clone()),
+            host_filesystem: config.as_ref().is_some_and(|c| c.host_filesystem),
+            protected_paths: config
+                .as_ref()
+                .map(|c| c.protected_paths.clone())
+                .unwrap_or_default(),
             session_workspaces: None,
             operators: config
                 .as_ref()
@@ -143,6 +150,11 @@ impl Observations {
         capabilities: Option<eve_developer_api::DeveloperObservationCapabilities>,
     ) -> Self {
         self.workspace = capabilities.as_ref().map(|c| c.workspace.clone());
+        self.host_filesystem = capabilities.as_ref().is_some_and(|c| c.host_filesystem);
+        self.protected_paths = capabilities
+            .as_ref()
+            .map(|c| c.protected_paths.clone())
+            .unwrap_or_default();
         self.session_workspaces = capabilities
             .as_ref()
             .and_then(|c| c.session_workspaces.clone());
@@ -168,6 +180,18 @@ impl Observations {
     ) -> Result<String, ToolExecutionError> {
         if !self.authorized(owner) {
             return Err(failed("文件触发仅限已授权开发操作者"));
+        }
+        if Path::new(path).is_absolute() {
+            if !self.host_filesystem {
+                return Err(failed("未启用宿主文件观察；使用开发目录相对路径"));
+            }
+            let current = eve_developer_tools::resolve_host_path(
+                Path::new(path),
+                true,
+                &self.protected_paths,
+            )?;
+            self.authorize_file_target(owner, &current)?;
+            return Self::file_signature(&current);
         }
         let shared = self
             .workspace
@@ -220,6 +244,15 @@ impl Observations {
             return Err(failed("文件路径必须是开发目录内的相对路径，不允许 .."));
         }
         let mut current = root.clone();
+        self.authorize_file_target(owner, &root.join(relative))?;
+        if self.host_filesystem {
+            let target = eve_developer_tools::resolve_host_path(
+                &root.join(relative),
+                true,
+                &self.protected_paths,
+            )?;
+            self.authorize_file_target(owner, &target)?;
+        }
         for part in relative.components() {
             current.push(part);
             match current.canonicalize() {
@@ -228,6 +261,36 @@ impl Observations {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok("missing".into()),
                 Err(_) => return Err(failed("文件无法观察")),
             }
+        }
+        self.authorize_file_target(owner, &current)?;
+        Self::file_signature(&current)
+    }
+    fn authorize_file_target(
+        &self,
+        owner: &SessionKey,
+        path: &Path,
+    ) -> Result<(), ToolExecutionError> {
+        let scope = ContextScope {
+            session_id: owner.session_id.clone(),
+            user_id: owner.user_id.clone(),
+        };
+        if self
+            .authorization
+            .as_ref()
+            .is_some_and(|a| !a.permits_file(&scope, path, false))
+        {
+            return Err(failed("当前身份不允许观察实际目标文件"));
+        }
+        Ok(())
+    }
+    fn file_signature(current: &Path) -> Result<String, ToolExecutionError> {
+        let metadata = match std::fs::metadata(current) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok("missing".into()),
+            Err(_) => return Err(failed("文件无法观察")),
+        };
+        if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+            return Err(failed("只观察 1 MiB 以内的普通文件"));
         }
         let mut f = std::fs::File::open(current).map_err(|_| failed("文件无法读取"))?;
         let metadata = f.metadata().map_err(|_| failed("文件元数据不可用"))?;
@@ -357,7 +420,7 @@ impl Tool for Tools {
     fn definition(&self) -> ToolDefinition {
         let (description, schema) = match self.operation {
             "set_wakeup_trigger" => (
-                "创建条件触发器，成功后持续保存，跨对话和进程重启有效，不需要每轮重新开启；可在已有授权目标内自行设置。条件满足时在当前会话自动唤醒你，读取原会话历史并执行 instructions，结果主动发回原会话。conditions 有 1–8 项，mode=all/any。type=time 使用 after_seconds 或 at_ms；file_changed 使用开发目录内相对 path；task_finished 使用本会话 task_id；message_contains 使用 text（只匹配创建后完成的用户轮次）；process_state 使用 pid 和 running（只观察该进程实例）。文件和进程仅限授权操作者。expires_in_seconds 默认7天、最多90天。可用 interval_seconds 设置有限周期（仅单一时间条件，max_runs 默认48、最多128）；每30分钟目标检查使用 interval_seconds=1800。resume_task_id 接续本会话已有 blocked 后台任务，保留原任务、步数与期限，不从头执行；与周期互斥。检查不调用模型；执行与投递未知时不重放。",
+                "创建条件触发器，成功后持续保存，跨对话和进程重启有效，不需要每轮重新开启；可在已有授权目标内自行设置。条件满足时在当前会话自动唤醒你，读取原会话历史并执行 instructions，结果主动发回原会话。conditions 有 1–8 项，mode=all/any。type=time 使用 after_seconds 或 at_ms；file_changed 使用工程相对 path；启用宿主文件访问的操作者也可用绝对 path；task_finished 使用本会话 task_id；message_contains 使用 text（只匹配创建后完成的用户轮次）；process_state 使用 pid 和 running（只观察该进程实例）。文件和进程仅限授权操作者。expires_in_seconds 默认7天、最多90天。可用 interval_seconds 设置有限周期（仅单一时间条件，max_runs 默认48、最多128）；每30分钟目标检查使用 interval_seconds=1800。resume_task_id 接续本会话已有 blocked 后台任务，保留原任务、步数与期限，不从头执行；与周期互斥。检查不调用模型；执行与投递未知时不重放。",
                 json!({"type":"object","properties":{
                 "title":{"type":"string"},"instructions":{"type":"string"},"mode":{"type":"string","enum":["all","any"]},
                 "expires_in_seconds":{"type":"integer","minimum":1,"maximum":7776000},
@@ -1293,6 +1356,8 @@ mod tests {
             sessions,
             tasks: None,
             workspace: Some(directory.path().into()),
+            host_filesystem: false,
+            protected_paths: BTreeSet::new(),
             session_workspaces: None,
             operators: BTreeSet::from(["u".into()]),
             authorization: None,
@@ -1373,6 +1438,8 @@ mod tests {
             .with_authorization(authorization.clone())
             .with_development(Some(DeveloperObservationCapabilities {
                 workspace: actual.path().canonicalize().unwrap(),
+                host_filesystem: false,
+                protected_paths: BTreeSet::new(),
                 session_workspaces: None,
                 processes: true,
             }));
@@ -1396,6 +1463,8 @@ mod tests {
         authorization.business.store(true, Ordering::Release);
         let observations = observations.with_development(Some(DeveloperObservationCapabilities {
             workspace: actual.path().canonicalize().unwrap(),
+            host_filesystem: false,
+            protected_paths: BTreeSet::new(),
             session_workspaces: None,
             processes: false,
         }));
@@ -1406,6 +1475,113 @@ mod tests {
         assert!(observations.process(&owner, std::process::id()).is_err());
         kernel.stop_all().await.unwrap();
     }
+    #[tokio::test]
+    async fn host_file_wait_uses_actual_capability_and_survives_observer_recreation() {
+        let (kernel, observations, project) = world().await;
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("build.status");
+        let owner = SessionKey::new("s", "u").unwrap();
+        let text = path.to_str().unwrap();
+        assert!(observations.file(&owner, text).is_err());
+        let capabilities = eve_developer_api::DeveloperObservationCapabilities {
+            workspace: project.path().canonicalize().unwrap(),
+            host_filesystem: true,
+            protected_paths: BTreeSet::new(),
+            // 外部观察不依赖是否已经创建私有 Git 检出。
+            session_workspaces: Some(project.path().join("not-created")),
+            processes: false,
+        };
+        let mut observations = Arc::try_unwrap(observations)
+            .ok()
+            .unwrap()
+            .with_development(Some(capabilities.clone()));
+        assert_eq!(observations.file(&owner, text).unwrap(), "missing");
+        std::fs::write(&path, "building").unwrap();
+        let baseline = observations.file(&owner, text).unwrap();
+        let saved = serde_json::to_string(&Condition::FileChanged {
+            path: text.into(),
+            baseline: baseline.clone(),
+        })
+        .unwrap();
+        let condition: Condition = serde_json::from_str(&saved).unwrap();
+        observations = observations.with_development(Some(capabilities.clone()));
+        assert_eq!(observations.file(&owner, text).unwrap(), baseline);
+        std::fs::write(&path, "finished").unwrap();
+        let Condition::FileChanged {
+            path: saved_path,
+            baseline: saved_baseline,
+        } = condition
+        else {
+            panic!()
+        };
+        assert_ne!(
+            observations.file(&owner, &saved_path).unwrap(),
+            saved_baseline
+        );
+        observations.operators.clear();
+        assert!(observations.file(&owner, text).is_err());
+        observations.operators.insert("u".into());
+        let mut protected = capabilities.clone();
+        protected.protected_paths.insert(path.clone());
+        observations = observations.with_development(Some(protected));
+        assert!(observations.file(&owner, text).is_err());
+        let mut disabled = capabilities;
+        disabled.host_filesystem = false;
+        observations = observations.with_development(Some(disabled));
+        assert!(observations.file(&owner, text).is_err());
+        kernel.stop_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relative_file_wait_cannot_read_protected_or_disallowed_missing_targets() {
+        struct Access;
+        impl eve_developer_api::DeveloperAuthorization for Access {
+            fn is_operator(&self, _: &ContextScope) -> bool {
+                true
+            }
+            fn permits_file(&self, _: &ContextScope, path: &Path, _: bool) -> bool {
+                !path
+                    .components()
+                    .any(|part| matches!(part, Component::Normal(name) if name == "restricted"))
+            }
+        }
+        let (kernel, observations, project) = world().await;
+        let root = project.path().canonicalize().unwrap();
+        let owner = SessionKey::new("s", "u").unwrap();
+        let protected = root.join("settings.json");
+        std::fs::write(&protected, "synthetic private value").unwrap();
+        let observations = Arc::try_unwrap(observations)
+            .ok()
+            .unwrap()
+            .with_development(Some(eve_developer_api::DeveloperObservationCapabilities {
+                workspace: root.clone(),
+                host_filesystem: true,
+                protected_paths: BTreeSet::from([protected.clone()]),
+                session_workspaces: None,
+                processes: false,
+            }))
+            .with_authorization(Arc::new(Access));
+        assert!(observations.file(&owner, "settings.json").is_err());
+        assert!(
+            observations
+                .file(&owner, protected.to_str().unwrap())
+                .is_err()
+        );
+        assert!(observations.file(&owner, "restricted/missing.txt").is_err());
+        assert_eq!(
+            observations.file(&owner, "ordinary/missing.txt").unwrap(),
+            "missing"
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("restricted"), root.join("alias")).unwrap();
+            assert!(observations.file(&owner, "alias/missing.txt").is_err());
+        }
+        std::fs::remove_file(protected).unwrap();
+        assert!(observations.file(&owner, "settings.json").is_err());
+        kernel.stop_all().await.unwrap();
+    }
+
     #[tokio::test]
     async fn private_file_observations_follow_own_workspace_and_reject_foreign_binding() {
         let (kernel, observations, shared) = world().await;
@@ -1429,6 +1605,8 @@ mod tests {
             .unwrap()
             .with_development(Some(eve_developer_api::DeveloperObservationCapabilities {
                 workspace: shared_root,
+                host_filesystem: false,
+                protected_paths: BTreeSet::new(),
                 session_workspaces: Some(private_root),
                 processes: true,
             }));

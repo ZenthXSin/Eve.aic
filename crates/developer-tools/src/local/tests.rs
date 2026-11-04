@@ -9,6 +9,8 @@ use tokio::{
 fn config(root: &Path) -> DeveloperConfig {
     DeveloperConfig {
         workspace: root.into(),
+        host_filesystem: false,
+        protected_paths: BTreeSet::new(),
         storage_directory: None,
         operators: BTreeSet::from(["owner".into()]),
         ordinary_access: false,
@@ -56,6 +58,8 @@ fn observation_capabilities_match_the_backend_root_and_command_switch() {
         backend.observation_capabilities(),
         Some(DeveloperObservationCapabilities {
             workspace: root.path().canonicalize().unwrap(),
+            host_filesystem: false,
+            protected_paths: backend.protected_paths(),
             session_workspaces: None,
             processes: false,
         })

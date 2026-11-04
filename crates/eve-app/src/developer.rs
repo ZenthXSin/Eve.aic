@@ -93,7 +93,7 @@ pub(crate) fn install_with_member_runtime_backend_profile(
     reviewer: Option<Arc<dyn ActionReviewer>>,
     automatic_capabilities: bool,
 ) -> Result<Option<Arc<dyn eve_developer_api::DeveloperBackend>>, AppError> {
-    let config: DeveloperConfig = if let Some(path) = std::env::var_os("EVE_DEVELOPER_CONFIG") {
+    let mut config: DeveloperConfig = if let Some(path) = std::env::var_os("EVE_DEVELOPER_CONFIG") {
         let bytes = std::fs::read(path).map_err(|_| "开发工具配置文件无法读取；保留原文件")?;
         if bytes.len() > 32 * 1024 {
             return Err("开发工具配置超过上限".into());
@@ -107,6 +107,8 @@ pub(crate) fn install_with_member_runtime_backend_profile(
         // 实时切换仍交给独立监督器；GitHub 写入保持显式仓库与凭据授权。
         DeveloperConfig {
             workspace,
+            host_filesystem: false,
+            protected_paths: BTreeSet::new(),
             storage_directory: None,
             operators: BTreeSet::from(["owner".into()]),
             ordinary_access: false,
@@ -129,6 +131,10 @@ pub(crate) fn install_with_member_runtime_backend_profile(
         return Ok(None);
     };
     config.validate()?;
+    // 开发配置本身定义宿主权限，不能通过文件工具改写自己的能力边界。
+    if let Some(path) = std::env::var_os("EVE_DEVELOPER_CONFIG") {
+        config.protected_paths.insert(std::fs::canonicalize(path)?);
+    }
     let token = std::env::var(&config.github_token_env).ok();
     if !config.github_write_repositories.is_empty()
         && token.as_ref().is_none_or(|v| v.trim().is_empty())

@@ -121,6 +121,51 @@ class DeveloperAcceptance(dialogue.DialogueToolsAcceptance):
         self.run_eve(script, interest=False, memory=True, research=False, practice=False,
                      env_extra={"EVE_DEVELOPER_CONFIG": str(self.developer_config)})
 
+    def test_actual_host_filesystem_roundtrip_reports_resolved_paths_and_keeps_project_root(self):
+        outside = self.work / "outside-project"
+        outside.mkdir()
+        target = outside / "notes.txt"
+        config = json.loads(self.developer_config.read_text())
+        config["host_filesystem"] = True
+        self.developer_config.write_text(json.dumps(config))
+        reviews = []
+        def review(request):
+            reviews.append(request)
+            return {"risk": "low", "authorization": "high", "outcome": "allow",
+                    "rationale": "用户授权明确的外部临时文件读写和验证"}
+        self.review_reply = review
+        def respond(body):
+            results = self.results(body)
+            if not results:
+                definition = next(t["function"] for t in body["tools"] if t["function"]["name"] == "write_file")
+                self.assertIn("宿主文件访问已启用", definition["description"])
+                return tool_response([("write_file", {"path": str(target), "content": "外部产物已完成", "expected_sha256": ""})])
+            if len(results) == 1:
+                self.assertTrue(results[-1]["success"])
+                return tool_response([("search_files", {"path": str(outside), "query": "外部产物"})])
+            if len(results) == 2:
+                found = results[-1]["matches"][0]["path"]
+                self.assertTrue(pathlib.Path(found).is_absolute())
+                return tool_response([("read_file", {"path": found})])
+            if len(results) == 3:
+                self.assertEqual(results[-1]["content"], "外部产物已完成")
+                return tool_response([("run_command", {"program": sys.executable, "args": ["-c",
+                    "from pathlib import Path; assert Path('notes.txt').read_text() == '外部产物已完成'; print('外部目录验证通过')"], "cwd": str(outside)})])
+            self.assertEqual(results[-1]["exit_code"], 0)
+            self.assertEqual(pathlib.Path(results[-1]["cwd"]).resolve(), outside.resolve())
+            return text_response("外部文件实际写入并验证")
+        self.callback = respond
+        self.enabled(self.send(self.message("host-file", "请在指定的外部目录写入产物并运行验证", expected="外部文件实际写入并验证")))
+        self.assertEqual(target.read_text(), "外部产物已完成")
+        self.assertFalse((self.source / "notes.txt").exists())
+        self.assertEqual(len(reviews), 2)
+        self.assertEqual(pathlib.Path(reviews[-1]["cwd"]).resolve(), outside.resolve())
+        before = target.read_bytes()
+        self.callback = lambda _: text_response("结果已保留")
+        self.enabled(self.send(self.message("host-file-restart", "先不做新的修改", expected="结果已保留")))
+        self.assertEqual(target.read_bytes(), before)
+        self.assertEqual(len(reviews), 2)
+
     def test_actual_three_step_edit_command_and_restart_keep_complete_history_without_replay(self):
         config = json.loads(self.developer_config.read_text())
         config["storage_directory"] = str(self.work / "developer-data")

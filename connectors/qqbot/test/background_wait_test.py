@@ -21,7 +21,8 @@ class BackgroundWaitAcceptance(completion.BackgroundCompletionAcceptance):
 
     def configure_wait(self, user_decision=False):
         expected = "真实文件条件已满足"
-        verification = self.file_contract("wait-result.txt", expected)
+        wait_path = getattr(self, "wait_path", "wait-result.txt")
+        verification = self.file_contract(wait_path, expected)
 
         def respond(body):
             if not self.is_worker(body):
@@ -33,7 +34,7 @@ class BackgroundWaitAcceptance(completion.BackgroundCompletionAcceptance):
             results = self.worker_results(body)
             if not results:
                 return calls(("wait-register", "register_task_wait", {
-                    "condition": {"type": "file_changed", "path": "wait-result.txt"},
+                    "condition": {"type": "file_changed", "path": wait_path},
                     "reason": "等待构建文件生成后读取并核对结果",
                 }))
             self.assertTrue(results[0].get("registered"), results)
@@ -49,14 +50,14 @@ class BackgroundWaitAcceptance(completion.BackgroundCompletionAcceptance):
                 return text_response("已经登记文件等待，任务状态已保存。")
             self.assertFalse(user_decision, "用户待决定事项不能随文件变化自动解除")
             if len(results) == 2:
-                return calls(("wait-read", "read_file", {"path": "wait-result.txt"}))
+                return calls(("wait-read", "read_file", {"path": wait_path}))
             if len(results) == 3:
                 self.assertEqual(results[-1]["sha256"], verification["contract"]["checks"][0]["expected"])
                 return calls(("wait-complete", "task_progress", {
                     "status": "completed", "remaining": "已经读取文件并核对真实摘要，再按固定合同作最后复验",
                 }))
             if len(results) == 4:
-                return calls(("wait-verify", "read_file", {"path": "wait-result.txt"}))
+                return calls(("wait-verify", "read_file", {"path": wait_path}))
             self.assertEqual(results[-1]["sha256"], verification["contract"]["checks"][0]["expected"])
             return text_response("已读取真实文件并通过原验收。")
 
@@ -105,6 +106,25 @@ class BackgroundWaitAcceptance(completion.BackgroundCompletionAcceptance):
         self.assertEqual(self.triggers()[0]["runs"], 1)
         self.assertEqual(len(self.worker_requests()) - before_requests, 4)
         self.assertEqual((self.source / "wait-result.txt").read_text(), expected)
+
+    def test_external_file_wait_restarts_and_finishes_with_host_filesystem_enabled(self):
+        outside = self.work / "outside-project"
+        outside.mkdir()
+        self.wait_path = str(outside / "result.txt")
+        config = json.loads(self.developer_config.read_text())
+        config["host_filesystem"] = True
+        self.developer_config.write_text(json.dumps(config))
+        expected, verification, before, trigger = self.seed_wait()
+        (outside / "result.txt").write_text(expected)
+        self.enabled(self.checkpoint("external-completed"), checkpoints={
+            "external-completed": lambda: self.wait_finished("Completed")}, timeout=60)
+        [after] = self.tasks()
+        self.assertEqual(after["id"], before["id"])
+        self.assertEqual(after["execution"]["completion_contract"], verification)
+        self.assertEqual(after["execution"]["recoveries"], 1)
+        self.assertEqual(self.triggers()[0]["id"], trigger["id"])
+        self.assertEqual(self.triggers()[0]["spec"]["conditions"][0]["path"], self.wait_path)
+        self.assertFalse((self.source / "result.txt").exists())
 
     def test_later_user_decision_is_not_released_by_a_registered_technical_condition(self):
         expected, _, before, _ = self.seed_wait(user_decision=True)

@@ -14,6 +14,12 @@ pub use upgrade::*;
 #[serde(deny_unknown_fields)]
 pub struct DeveloperConfig {
     pub workspace: PathBuf,
+    /// 可信操作者可访问宿主绝对路径；workspace 仍为默认工程与升级源码根。
+    #[serde(default)]
+    pub host_filesystem: bool,
+    /// 宿主指定的凭据或内部状态路径；模型文件工具和文件观察均不读取或修改。
+    #[serde(default)]
+    pub protected_paths: BTreeSet<PathBuf>,
     /// 独立持久账本/候选目录；None 时由宿主使用状态目录下的 developer-tools。
     #[serde(default)]
     pub storage_directory: Option<PathBuf>,
@@ -217,6 +223,15 @@ pub trait DeveloperAuthorization: Send + Sync {
         true
     }
     fn is_operator(&self, scope: &eve_llm_api::ContextScope) -> bool;
+    /// 宿主在路径解析后复核身份级文件规则；审核模型不能扩张这项许可。
+    fn permits_file(
+        &self,
+        _scope: &eve_llm_api::ContextScope,
+        _path: &std::path::Path,
+        _write: bool,
+    ) -> bool {
+        true
+    }
     /// 宿主核对的真实成员可在独立项目目录开发；不授予宿主或升级权限。
     fn allows_workspace_development(&self, _scope: &eve_llm_api::ContextScope) -> bool {
         false
@@ -249,6 +264,7 @@ fn cargo() -> String {
 impl DeveloperConfig {
     pub fn validate(&self) -> Result<(), &'static str> {
         if !self.workspace.is_absolute()
+            || self.protected_paths.iter().any(|p| !p.is_absolute())
             || self
                 .storage_directory
                 .as_ref()
@@ -453,6 +469,9 @@ pub enum DeveloperOperation {
 pub struct DeveloperObservationCapabilities {
     /// 与后端文件工具相同的规范化工作根目录。
     pub workspace: PathBuf,
+    /// 仅向实时核验的开发操作者开放宿主文件观察。
+    pub host_filesystem: bool,
+    pub protected_paths: BTreeSet<PathBuf>,
     /// 私有会话检出的父目录；None 表示使用固定 workspace。
     pub session_workspaces: Option<PathBuf>,
     /// 后端是否允许命令与进程观察。
@@ -501,6 +520,8 @@ mod tests {
         }))
         .unwrap();
         assert!(config.self_upgrade);
+        assert!(!config.host_filesystem);
+        assert!(config.protected_paths.is_empty());
         assert!(!config.commands);
         assert!(config.live_upgrade.is_none());
         config.validate().unwrap();
