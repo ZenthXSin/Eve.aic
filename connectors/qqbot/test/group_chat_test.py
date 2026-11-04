@@ -28,8 +28,9 @@ class GroupChatAcceptance(reminder_test.ReminderAcceptance):
 
     def run_eve(self, script, **options):
         options.setdefault('panel', True)
+        more = ['--group-chat', '--training', *options.pop('more', [])]
         return reminder_test.base().run_eve(self, script, interest=False, research=False, practice=False,
-            more=['--group-chat', '--training'], timeout=60, **options)
+            more=more, timeout=60, **options)
 
     def classify(self, decoded, latest):
         if isinstance(latest, str) and latest.startswith('这是 Eve 自己的一次群聊交流决定。'):
@@ -91,7 +92,7 @@ class GroupChatAcceptance(reminder_test.ReminderAcceptance):
         self.assertEqual(len(self.kind('group_speech')),1)
         self.assertEqual(self.kind('chat'),[])
         self.assertEqual(self.kind('chime'),[])
-        self.assertFalse(self.kind('group_speech')[0]['body'].get('tools', []))
+        self.assertEqual(self.definitions(self.kind('group_speech')[0]['body']), {'read_source'})
         self.assertFalse(any('eve.identity.v1' in m.get('content','') for m in self.kind('group_speech')[0]['body']['messages']))
         self.assertEqual(len(self.rows('observations')),2)
         before=len(self.requests)
@@ -130,7 +131,7 @@ class GroupChatAcceptance(reminder_test.ReminderAcceptance):
         self.assertEqual(self.documents().get('eve.trigger',{}).get('triggers.v1',{}).get('triggers',[]),[])
         self.assertTrue(self.kind('group_speech'))
         for request in self.kind('group_speech'):
-            self.assertEqual(request['body'].get('tools',[]),[], '群观察身份不能装配工具')
+            self.assertEqual(self.definitions(request['body']), {'read_source'}, '群观察只可查公开资料，不能继承管理员操作权限')
 
     def test_mentioned_group_message_is_observed_but_original_task_is_answered_once(self):
         self.run_eve([self.observation('at-once','看看这个问题',mentioned=True),*self.send(self.message('at-once','看看这个问题',expected='这个思路可以试试',scope='group')),*self.checkpoint('quiet')],checkpoints={'quiet':self.quiet})

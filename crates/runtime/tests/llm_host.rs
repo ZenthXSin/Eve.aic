@@ -113,6 +113,80 @@ async fn unknown_review_failure_still_stops_before_requesting_model() {
     assert!(provider.requests.lock().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn verified_legacy_gap_can_query_only_host_selected_tools_without_fabricating_review() {
+    struct LookupPolicy;
+    impl eve_llm_api::ToolScopePolicy for LookupPolicy {
+        fn tools_allowed(&self, _: &eve_llm_api::ContextScope) -> bool {
+            true
+        }
+        fn tool_allowed_without_review(&self, _: &eve_llm_api::ContextScope, name: &str) -> bool {
+            name == "lookup"
+        }
+    }
+    let provider = RecordingProvider::scripted(vec![
+        tool_response(vec![call("source", "lookup", json!({}))]),
+        final_response("依据查询回执作答"),
+        tool_response(vec![
+            call("read", "lookup", json!({})),
+            call("write", "write", json!({})),
+        ]),
+    ]);
+    let lookup = Arc::new(TestTool::new(
+        "lookup",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    ));
+    let write = Arc::new(TestTool::new(
+        "write",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    ));
+    let (host, _, _) = make_host(
+        provider.clone(),
+        vec![lookup.clone(), write.clone()],
+        LlmHostConfig::default(),
+    )
+    .await;
+    let host = host
+        .with_tool_scope_policy(Arc::new(LookupPolicy))
+        .with_review_user_message_source(Arc::new(LegacyReviewSource { gap: true }))
+        .with_review_user_message_anchor("current".into())
+        .unwrap();
+    let scope = Some(eve_llm_api::ContextScope {
+        session_id: "s".into(),
+        user_id: "u".into(),
+    });
+    let result = host
+        .run_scoped_turn_with_events(turn(), scope.clone(), &ProgressRecorder::default())
+        .await
+        .unwrap();
+    assert_eq!(result.text, "依据查询回执作答");
+    assert_eq!(result.diagnostics.started_tools, 1);
+    assert!(result.diagnostics.review_user_messages.is_none());
+    let failure = host
+        .run_scoped_turn_with_events(turn(), scope, &ProgressRecorder::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(failure.error, LlmError::Context(_)));
+    assert_eq!(
+        lookup.starts.lock().unwrap().len(),
+        1,
+        "违规混合批次不能执行部分工具"
+    );
+    assert!(write.starts.lock().unwrap().is_empty());
+    for request in provider.requests.lock().unwrap().iter() {
+        assert_eq!(
+            request
+                .tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lookup"]
+        );
+    }
+}
+
 #[derive(Default)]
 struct MemoryJournal {
     frame: Mutex<Option<eve_llm_api::TurnCheckpoint>>,
