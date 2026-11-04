@@ -39,6 +39,9 @@ pub struct LlmHostConfig {
     pub live_prompt_source: Option<eve_llm_api::SystemPromptSourceHandle>,
     pub output_format: String,
     pub provider_timeout: Duration,
+    /// 仅完整响应模式使用；临时模型故障保留本轮，退避后继续，不生成占位回复。
+    /// 有持久任务日志的执行器沿用自身恢复策略，避免叠加重试和重置恢复额度。
+    pub deferred_reply: Option<eve_llm_api::DeferredReplyPolicy>,
     pub tool_timeout: Duration,
     /// 按工具名覆盖单次执行期限（例如需要等待子代理的工具）；其余工具使用 `tool_timeout`。
     pub tool_timeout_overrides: BTreeMap<String, Duration>,
@@ -71,6 +74,7 @@ impl Default for LlmHostConfig {
             live_prompt_source: None,
             output_format: "plain text".into(),
             provider_timeout: Duration::from_secs(30),
+            deferred_reply: None,
             tool_timeout: Duration::from_secs(10),
             tool_timeout_overrides: BTreeMap::new(),
             step_bounded_tools: Default::default(),
@@ -97,6 +101,7 @@ impl std::fmt::Debug for LlmHostConfig {
             .field("live_prompt_source", &self.live_prompt_source.is_some())
             .field("output_format", &self.output_format)
             .field("provider_timeout", &self.provider_timeout)
+            .field("deferred_reply", &self.deferred_reply)
             .field("tool_timeout", &self.tool_timeout)
             .field("tool_timeout_overrides", &self.tool_timeout_overrides)
             .field("tool_cancellation_grace", &self.tool_cancellation_grace)
@@ -144,6 +149,9 @@ impl LlmHostConfig {
     }
 
     pub fn validate(&self) -> Result<(), LlmError> {
+        if let Some(policy) = self.deferred_reply {
+            policy.validate()?;
+        }
         if self.version.trim().is_empty() {
             return Err(LlmError::Configuration("配置版本不能为空".into()));
         }
@@ -1310,6 +1318,8 @@ impl LlmHost {
         } else {
             None
         };
+        let mut deferred_reply = crate::deferred_reply::DeferredReply::default();
+        let mut retry_deadline = None;
         loop {
             if let Some(steering) = &steering {
                 let batch = steering
@@ -1393,36 +1403,74 @@ impl LlmHost {
                 self.save_execution_checkpoint(frame, &diagnostics, &continuation)
                     .map_err(|error| fail(error, diagnostics.clone()))?;
             }
-            let response = match self
-                .complete(
-                    if reporting {
-                        progress_report_request(
-                            &messages,
-                            continuation.remaining().as_deref(),
-                            expression.is_some(),
-                        )
-                        .map_err(|error| fail(error, diagnostics.clone()))?
-                    } else {
-                        ModelRequest {
-                            messages: messages.clone(),
-                            tools: if closing {
-                                expression
-                                    .iter()
-                                    .filter(|_| self.expression_available(diagnostics.calls.len()))
-                                    .cloned()
-                                    .collect()
-                            } else {
-                                definitions.clone()
-                            },
-                        }
-                    },
-                    &mut diagnostics,
-                    events,
-                )
-                .await
-            {
-                Ok(value) => value,
-                Err(error) => return Err(fail(error, diagnostics)),
+            let completion = self.complete(
+                if reporting {
+                    progress_report_request(
+                        &messages,
+                        continuation.remaining().as_deref(),
+                        expression.is_some(),
+                    )
+                    .map_err(|error| fail(error, diagnostics.clone()))?
+                } else {
+                    ModelRequest {
+                        messages: messages.clone(),
+                        tools: if closing {
+                            expression
+                                .iter()
+                                .filter(|_| self.expression_available(diagnostics.calls.len()))
+                                .cloned()
+                                .collect()
+                        } else {
+                            definitions.clone()
+                        },
+                    }
+                },
+                &mut diagnostics,
+                events,
+            );
+            let result = if let Some(deadline) = retry_deadline {
+                tokio::time::timeout_at(deadline, completion)
+                    .await
+                    .unwrap_or(Err(LlmError::ProviderTimeout))
+            } else {
+                completion.await
+            };
+            let response = match result {
+                Ok(value) => {
+                    retry_deadline = None;
+                    value
+                }
+                Err(error) => {
+                    // 已公开的增量无法收回；有检查点的后台任务由其持久恢复器接续。
+                    let retry = self
+                        .config
+                        .deferred_reply
+                        .filter(|_| {
+                            self.config.response_mode == ResponseMode::Complete
+                                && checkpoint.is_none()
+                        })
+                        .and_then(|policy| deferred_reply.next(policy, &error));
+                    let Some((attempt, delay, deadline)) = retry else {
+                        return Err(fail(error, diagnostics));
+                    };
+                    eprintln!(
+                        "EVE_DEFERRED_REPLY {}",
+                        serde_json::json!({
+                            "retry":attempt,"delay_ms":delay.as_millis(),"turn":turn_id,
+                            "completed_tool_calls":diagnostics.tool_results.len(),
+                            "provider_requests":diagnostics.provider_requests,
+                            "http_status":error.provider_http_status(),
+                            "reason":if error == LlmError::ProviderTimeout {"timeout"} else {"transient"}
+                        })
+                    );
+                    retry_deadline = Some(deadline);
+                    tokio::select! { biased;
+                        _ = wait_closed(events) => return Err(fail(LlmError::Cancelled, diagnostics)),
+                        _ = tokio::time::sleep(delay) => {},
+                    }
+                    // 回到轮次入口先消费新消息、核对授权；旧工具回执和计数保持原样。
+                    continue;
+                }
             };
             if let Some(steering) = &steering {
                 let batch = steering
