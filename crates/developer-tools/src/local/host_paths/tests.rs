@@ -103,6 +103,10 @@ async fn operator_reads_writes_searches_patches_and_runs_outside_default_project
         .unwrap();
     assert!(!first.exists());
     assert_eq!(fs::read_to_string(&second).unwrap(), "finished\n");
+    let nested = outside.path().join("nested");
+    fs::create_dir(&nested).unwrap();
+    let deeper = nested.join("deeper.txt");
+    fs::write(&deeper, "finished\n").unwrap();
     let search = backend
         .execute(
             DeveloperOperation::Search(SearchArguments {
@@ -114,15 +118,24 @@ async fn operator_reads_writes_searches_patches_and_runs_outside_default_project
         )
         .await
         .unwrap();
-    let found = Path::new(search["matches"][0]["path"].as_str().unwrap());
-    assert!(found.is_absolute());
-    assert_eq!(
-        backend
-            .execute(DeveloperOperation::Read(file(found)), context("owner"))
-            .await
-            .unwrap()["content"],
-        "finished\n"
-    );
+    let matches = search["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 2);
+    let expected = [
+        second.canonicalize().unwrap(),
+        deeper.canonicalize().unwrap(),
+    ];
+    for item in matches {
+        let found = Path::new(item["path"].as_str().unwrap());
+        assert!(found.is_absolute());
+        assert!(expected.iter().any(|path| path == found));
+        assert_eq!(
+            backend
+                .execute(DeveloperOperation::Read(file(found)), context("owner"))
+                .await
+                .unwrap()["content"],
+            "finished\n"
+        );
+    }
     let command = if cfg!(windows) {
         CommandArguments {
             program: "cmd".into(),

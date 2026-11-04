@@ -739,9 +739,10 @@ impl LocalDeveloper {
         {
             return Err(failed("搜索只接受当前授权范围内的目录"));
         }
-        // 结果路径与 read_file 一致，都相对于工作区根目录。
-        let prefix = if Path::new(&a.path).is_absolute() {
-            a.path.trim_end_matches(['/', '\\']).to_owned()
+        // 相对搜索仍返回工程路径；绝对搜索使用目录项真实路径，保留 Windows verbatim 前缀。
+        let absolute = Path::new(&a.path).is_absolute();
+        let prefix = if absolute {
+            String::new()
         } else {
             Path::new(&a.path)
                 .components()
@@ -769,12 +770,10 @@ impl LocalDeveloper {
                 if kind.is_symlink() || SKIPPED_NAMES.contains(&name.as_str()) {
                     continue;
                 }
-                let relative = if prefix.is_empty() {
-                    if Path::new(&a.path).is_absolute() {
-                        format!("/{name}")
-                    } else {
-                        name
-                    }
+                let relative = if absolute {
+                    entry.path().to_string_lossy().into_owned()
+                } else if prefix.is_empty() {
+                    name
                 } else {
                     format!("{prefix}/{name}")
                 };
