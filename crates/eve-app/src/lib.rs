@@ -110,6 +110,7 @@ pub use task_cognition::CognitiveServices;
 mod storage;
 mod web_autonomy;
 mod web_chat;
+mod web_goals;
 mod web_host;
 mod web_ingress;
 mod web_memory;

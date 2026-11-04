@@ -502,10 +502,13 @@ impl Background {
         let admin = self.commands.admin.as_ref().ok_or("认知管理句柄缺失")?;
         Ok(admin.reader(ReadAccess::Internal)?)
     }
-    pub(crate) async fn stop(self) -> Result<(), AppError> {
+    pub(crate) fn request_stop(&self) {
         self.commands.accepting.store(false, Ordering::SeqCst);
         self.enabled.store(false, Ordering::SeqCst);
         self.stop.send_replace(true);
+    }
+    pub(crate) async fn stop(self) -> Result<(), AppError> {
+        self.request_stop();
         // 即使规划任务 panic，仍先取消、等待循环，再允许 Kernel 关闭。
         let settled = self.controller.shutdown().await;
         let joined = self

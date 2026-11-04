@@ -15,6 +15,7 @@ pub(crate) struct WebAutonomy {
     pub triggers: Arc<dyn eve_trigger_api::TriggerAdmin>,
     pub memory: Arc<dyn eve_memory_api::MemoryAdmin>,
     pub training: Arc<dyn eve_training_api::TrainingService>,
+    pub goals: crate::web_goals::Assembly,
     subject: Arc<dyn eve_subject_api::SubjectAdmin>,
     pub admission: Arc<crate::qq_subject_admission::Admission>,
     late: Arc<crate::qq_tasks::Late>,
@@ -88,7 +89,7 @@ impl WebAutonomy {
                     .map(|runner| Arc::new(runner) as Arc<dyn eve_practice_api::PracticeRunner>)
             })
             .transpose()?;
-        let runner = practice_runner.map(|runner| {
+        let runner = practice_runner.clone().map(|runner| {
             let slot = Arc::new(OnceLock::new());
             let _ = slot.set(runner);
             slot
@@ -197,9 +198,23 @@ impl WebAutonomy {
             eve_knowledge_api::SourcePolicy::new(&source_seeds)?.with_unrestricted_web()
         }
         .with_public_web_only();
+        let goals = crate::web_goals::Assembly::install(
+            kernel,
+            bootstrap,
+            admin.clone(),
+            crate::developer::action_reviewer(registry.clone(), health.clone()),
+            resources.corpus.as_ref(),
+            source.clone(),
+            practice_runner,
+        )
+        .await?;
         let (tools, preferences) = eve_dialogue_tools::Services {
             channel: Some("web".into()),
             memory: Some(memory.clone()),
+            cognition: Some(goals.cognition.clone()),
+            knowledge: Some(goals.knowledge.clone()),
+            practice: Some(goals.practice.clone()),
+            plans: Some(goals.plans.clone()),
             skills: Some(skills.clone()),
             checks: Some(checks.clone()),
             runner: runner.clone(),
@@ -496,6 +511,7 @@ impl WebAutonomy {
             triggers,
             memory,
             training,
+            goals,
             subject,
             admission,
             late,
@@ -519,6 +535,9 @@ impl WebAutonomy {
     pub(crate) async fn start(
         &self,
         kernel: &eve_kernel::Kernel,
+        backends: &eve_kernel::KernelServices,
+        agent: &Path,
+        state: &Path,
         registry: Arc<dyn ServiceRegistry>,
         permissions: Arc<dyn PermissionChecker>,
         control: Arc<dyn eve_control_api::ControlService>,
@@ -555,7 +574,7 @@ impl WebAutonomy {
         };
         let worker = crate::qq_tasks::Worker::install(
             kernel,
-            registry,
+            registry.clone(),
             permissions,
             &self.worker_tools,
             self.worker_config.clone(),
@@ -588,7 +607,20 @@ impl WebAutonomy {
             authorization: self.admin.clone(),
             digests: self.digests.clone(),
         });
+        let goals = self
+            .goals
+            .start(
+                kernel,
+                backends,
+                agent,
+                state,
+                self.admin.clone(),
+                health.clone(),
+                &resolver,
+            )
+            .await?;
         Ok(WebRuntime {
+            goals,
             conversation: crate::conversation_learning::Background::start(
                 self.training.clone(),
                 Arc::new(eve_training_plugin::ModelConversationLearner::new(
@@ -622,6 +654,7 @@ impl WebAutonomy {
 
 pub(crate) struct WebRuntime {
     pub recovery: Arc<crate::qq_failure_recovery::Recovery>,
+    pub goals: crate::web_goals::Runtime,
     task: crate::qq_tasks::Background,
     trigger: crate::qq_triggers::Background,
     subject: crate::qq_subject::Background,
@@ -635,16 +668,19 @@ impl WebRuntime {
         self.trigger.activate();
         self.digest.activate();
         self.conversation.activate();
+        self.goals.activate();
         Ok(())
     }
     pub(crate) fn finished(&self) -> Vec<watch::Receiver<bool>> {
-        vec![
+        let mut finished = vec![
             self.task.finished(),
             self.trigger.finished(),
             self.subject.finished(),
             self.digest.finished(),
             self.conversation.finished(),
-        ]
+        ];
+        finished.extend(self.goals.finished());
+        finished
     }
     pub(crate) fn request_stop(&self) {
         self.task.request_stop();
@@ -652,17 +688,19 @@ impl WebRuntime {
         self.subject.request_stop();
         self.digest.request_stop();
         self.conversation.request_stop();
+        self.goals.request_stop();
     }
     pub(crate) async fn stop(self) -> Result<(), AppError> {
         self.request_stop();
-        let (task, trigger, subject, digest, conversation) = tokio::join!(
+        let (task, trigger, subject, digest, conversation, goals) = tokio::join!(
             self.task.stop(),
             self.trigger.stop(),
             self.subject.stop(),
             self.digest.stop(),
-            self.conversation.stop()
+            self.conversation.stop(),
+            self.goals.stop()
         );
-        for result in [task, trigger, subject, digest, conversation] {
+        for result in [task, trigger, subject, digest, conversation, goals] {
             result?;
         }
         Ok(())

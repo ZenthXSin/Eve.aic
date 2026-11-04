@@ -172,6 +172,12 @@ jobs:
           $env:EVE_QQBOT_BINARY = if ($IsWindows) { "target/debug/eve-qqbot.exe" } else { "target/debug/eve-qqbot" }
           python -X utf8 connectors/qqbot/test/natural_goal_test.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: 验证独立 Web 自然待办、研究计划与重启证据
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
+        run: |
+          $env:EVE_WEB_BINARY = if ($IsWindows) { "target/debug/eve-web.exe" } else { "target/debug/eve-web" }
+          python -X utf8 scripts/test-web-goals.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: 验证浏览器中的插件配置、冲突、启停与窄屏
         if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' && runner.os == 'Linux' }}
         run: |
@@ -180,6 +186,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:EVE_PLAYWRIGHT_MODULE = Join-Path $browserDirectory "node_modules/playwright-core/index.mjs"
           $env:EVE_TEST_BROWSER = (Get-Command google-chrome -ErrorAction Stop).Source
+          python -X utf8 scripts/test-web-goals.py WebGoalAcceptance.test_research_then_real_browser_repairs_failed_style_and_keeps_verified_artifact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -X utf8 scripts/test-web-plugins.py target/debug/eve-qqbot --browser
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -X utf8 scripts/test-web-chat.py --browser
