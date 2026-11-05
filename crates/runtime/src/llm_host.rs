@@ -820,6 +820,60 @@ impl LlmHost {
         host.config.output_format = output_rules.into();
         host
     }
+    /// 只读取得本宿主在给定范围内当前已注册并通过定义、权限预检的工具名。
+    /// 不组装上下文、不解析模型，也不调用工具；沿用本实例的工具子集和委派限制。
+    /// 这是当前能力快照，不是动作授权或未来可用性保证。实际运行仍重新检查服务、
+    /// 定义、权限、授权证据及预算；调用方不得用此清单冻结或扩大后续权限。
+    pub fn available_tool_names(
+        &self,
+        scope: Option<&eve_llm_api::ContextScope>,
+    ) -> Result<Vec<String>, LlmError> {
+        let mut host = self.clone();
+        host.filter_tool_bindings(scope)?;
+        Ok(host
+            .prepare_tools()?
+            .into_iter()
+            .map(|tool| tool.definition.name)
+            .collect())
+    }
+
+    fn filter_tool_bindings(
+        &mut self,
+        scope: Option<&eve_llm_api::ContextScope>,
+    ) -> Result<(), LlmError> {
+        if let (Some(policy), Some(scope)) = (&self.tool_scope_policy, scope) {
+            let allowed = catch_unwind(AssertUnwindSafe(|| policy.tools_allowed(scope)))
+                .map_err(|_| LlmError::Configuration("工具范围策略异常；未执行工具".into()))?;
+            if !allowed {
+                *self = self.with_tool_subset(
+                    &[],
+                    "当前受信范围仅允许生成文字回复，不提供工具；不得声称执行任何外部操作",
+                );
+            } else {
+                let mut allowed_bindings = Vec::with_capacity(self.bindings.len());
+                for binding in self.bindings.drain(..) {
+                    if catch_unwind(AssertUnwindSafe(|| {
+                        policy.tool_allowed(scope, &binding.name)
+                    }))
+                    .map_err(|_| LlmError::Configuration("工具范围策略异常；未执行工具".into()))?
+                    {
+                        allowed_bindings.push(binding);
+                    }
+                }
+                self.bindings = allowed_bindings;
+            }
+        }
+        if self.delegated {
+            self.bindings.retain(|binding| {
+                !matches!(
+                    binding.name.as_str(),
+                    "send_message" | "wait_for_input" | "send_sticker"
+                )
+            });
+        }
+        Ok(())
+    }
+
     /// 子代理使用独立槽位池，避免后台父工具等子代理、子代理又等父工具槽位。
     /// 调用方应共享这个叶子宿主，串行队列仍与原宿主共享。
     pub fn with_independent_tool_slots(mut self) -> Self {
@@ -871,36 +925,7 @@ impl LlmHost {
             })??;
             host.config = host.config.with_prompt_snapshot(snapshot)?;
         }
-        if let (Some(policy), Some(scope)) = (&self.tool_scope_policy, scope) {
-            let allowed = catch_unwind(AssertUnwindSafe(|| policy.tools_allowed(scope)))
-                .map_err(|_| LlmError::Configuration("工具范围策略异常；未执行工具".into()))?;
-            if !allowed {
-                host = host.with_tool_subset(
-                    &[],
-                    "当前受信范围仅允许生成文字回复，不提供工具；不得声称执行任何外部操作",
-                );
-            } else {
-                let mut allowed_bindings = Vec::with_capacity(host.bindings.len());
-                for binding in host.bindings.drain(..) {
-                    if catch_unwind(AssertUnwindSafe(|| {
-                        policy.tool_allowed(scope, &binding.name)
-                    }))
-                    .map_err(|_| LlmError::Configuration("工具范围策略异常；未执行工具".into()))?
-                    {
-                        allowed_bindings.push(binding);
-                    }
-                }
-                host.bindings = allowed_bindings;
-            }
-        }
-        if self.delegated {
-            host.bindings.retain(|binding| {
-                !matches!(
-                    binding.name.as_str(),
-                    "send_message" | "wait_for_input" | "send_sticker"
-                )
-            });
-        }
+        host.filter_tool_bindings(scope)?;
         if host.shared_steps.is_none() {
             host.shared_steps = Some(eve_llm_api::SharedToolSteps::new(
                 host.config.max_tool_calls,
@@ -1845,6 +1870,12 @@ impl LlmHost {
         let context =
             contain_panic(async { assembler.assemble_scoped(input.clone(), scope).await }).await?;
         validate_context(&context)?;
+        let tools = self.prepare_tools()?;
+        diagnostics.stage = TurnStage::Provider;
+        Ok(PreparedTurn { context, tools })
+    }
+
+    fn prepare_tools(&self) -> Result<Vec<PreparedTool>, LlmError> {
         let mut tools = Vec::with_capacity(self.bindings.len());
         for binding in &self.bindings {
             let service = self.tool_service(binding)?;
@@ -1877,8 +1908,7 @@ impl LlmHost {
             });
         }
         tools.sort_by(|left, right| left.definition.name.cmp(&right.definition.name));
-        diagnostics.stage = TurnStage::Provider;
-        Ok(PreparedTurn { context, tools })
+        Ok(tools)
     }
 
     async fn complete(
