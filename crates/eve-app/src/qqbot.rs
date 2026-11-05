@@ -2457,7 +2457,8 @@ async fn run_qqbot_composed(
                     let resolver = Arc::new(eve_model_health::ObservedResolver::new(
                         Arc::new(
                             crate::models::CoreModelResolver::new(settings.0.clone(), key)
-                                .with_use("preference"),
+                                .with_use("preference")
+                                .with_timeout_cap(std::time::Duration::from_secs(29)),
                         ),
                         "preference",
                         model_health.clone(),
@@ -2510,7 +2511,7 @@ async fn run_qqbot_composed(
         };
         // 兴趣观察与受控研究共用主模型配置；只在需要默认模型实现时读取凭据。
         let core_resolver =
-            |role: &str| -> Result<Arc<dyn eve_llm_api::LlmModelResolver>, AppError> {
+            |role: &str, cap_seconds: Option<u64>| -> Result<Arc<dyn eve_llm_api::LlmModelResolver>, AppError> {
                 let settings = registry
                     .get(&ServiceId::new(CONFIG_SERVICE_ID)?)?
                     .ok_or("兴趣学习配置服务缺失")?
@@ -2520,30 +2521,34 @@ async fn run_qqbot_composed(
                 let key = std::env::var("EVE_OPENAI_API_KEY").map_err(|_| "缺少模型凭据")?;
                 let resolver =
                     crate::models::CoreModelResolver::new(settings.0.clone(), key).with_use(role);
-                Ok(Arc::new(if role == "summary" {
-                    resolver.with_timeout_cap(std::time::Duration::from_secs(29))
-                } else {
-                    resolver
+                Ok(Arc::new(match cap_seconds {
+                    Some(seconds) => resolver.with_timeout_cap(std::time::Duration::from_secs(seconds)),
+                    None => resolver,
                 }))
             };
         // 后台学习组件的模型请求按用途计入自主运行预算；未启用预算时原样使用主模型。
         // 健康记录包在预算之内：预算拒绝没有发出请求，不算模型的结局。
-        let observed = |role: &str| -> Result<Arc<dyn eve_llm_api::LlmModelResolver>, AppError> {
+        // 固定组件期限减一秒作为该模型实例的内部上限；相同 role 可有不同调用期限。
+        let observed_capped = |role: &str, cap_seconds: Option<u64>| -> Result<Arc<dyn eve_llm_api::LlmModelResolver>, AppError> {
             model_health.register(role);
             Ok(Arc::new(eve_model_health::ObservedResolver::new(
-                core_resolver(role)?,
+                core_resolver(role, cap_seconds)?,
                 role,
                 model_health.clone(),
             )))
         };
+        let observed = |role: &str| observed_capped(role, None);
         let budgeted = |category: &str| budget_gate.wrap(observed(category)?, category);
+        let budgeted_capped = |category: &str, cap_seconds: u64| {
+            budget_gate.wrap(observed_capped(category, Some(cap_seconds))?, category)
+        };
         if let Some(store)=speech_store {
             let sessions=registry.get(&ServiceId::new(SESSION_SERVICE_ID)?)?.ok_or("发言决定缺少会话服务")?.value.downcast::<SessionServiceHandle>().map_err(|_|"会话服务类型错误")?;
             plugin=plugin.with_speech(Arc::new(crate::qq_speech::Speech{
-                store,resolver:observed("dialogue")?,background_resolver:budget_gate.wrap(observed("dialogue")?,"outreach")?,context:speech_context.ok_or("发言决定缺少上下文")?,sessions:sessions.0.clone(),host:speech_config,conversations:conversations.clone(),
+                store,resolver:observed_capped("dialogue",Some(59))?,background_resolver:budget_gate.wrap(observed_capped("dialogue",Some(59))?,"outreach")?,context:speech_context.ok_or("发言决定缺少上下文")?,sessions:sessions.0.clone(),host:speech_config,conversations:conversations.clone(),
             }));
         } else {
-            plugin = plugin.with_progress_narrator(Arc::new(eve_qqbot_plugin::ModelProgressNarrator(observed("progress")?)));
+            plugin = plugin.with_progress_narrator(Arc::new(eve_qqbot_plugin::ModelProgressNarrator(observed_capped("progress", Some(7))?)));
         }
         // 群消息整理由对话中的工具按需触发，与主对话一样不计入自主运行预算；用途单独记健康。
         if let Some(tool) = &group_digest {
@@ -2569,7 +2574,7 @@ async fn run_qqbot_composed(
                     group.store.clone(),
                     judge,
                     Arc::new(eve_chime_plugin::ModelGroupRelationReviewer::new(
-                        budget_gate.wrap(observed("group_relation_learning")?, "group-relation")?,
+                        budget_gate.wrap(observed_capped("group_relation_learning", Some(14))?, "group-relation")?,
                     )),
                 )))
             } else {
@@ -2620,8 +2625,8 @@ async fn run_qqbot_composed(
         if let Some(stickers) = &stickers {
             sticker_background = Some(crate::qq_stickers::Background::start(
                 stickers.clone(),
-                Arc::new(eve_sticker_plugin::ModelStickerReviewer::new(budgeted(
-                    crate::qq_stickers::MODEL_USE,
+                Arc::new(eve_sticker_plugin::ModelStickerReviewer::new(budgeted_capped(
+                    crate::qq_stickers::MODEL_USE, 59,
                 )?)),
                 budget_gate.clone(),
             ));
@@ -2632,20 +2637,20 @@ async fn run_qqbot_composed(
             .set(qq_tasks::config_service(registry.as_ref())?);
         impression_background = Some(crate::qq_impressions::Background::start(
             people.clone(),
-            Arc::new(eve_people_plugin::ModelImpressionLearner::new(budgeted(
-                crate::qq_impressions::MODEL_USE,
+            Arc::new(eve_people_plugin::ModelImpressionLearner::new(budgeted_capped(
+                crate::qq_impressions::MODEL_USE, 59,
             )?)),
             impression_policy.clone(),
             budget_gate.clone(),
             crate::qq_impressions::Profiles {
-                consolidator: Arc::new(eve_people_plugin::ModelProfileConsolidator::new(budgeted(
-                    crate::qq_impressions::MODEL_USE,
+                consolidator: Arc::new(eve_people_plugin::ModelProfileConsolidator::new(budgeted_capped(
+                    crate::qq_impressions::MODEL_USE, 59,
                 )?)),
                 queue: profile_queue.clone(),
             },
         ));
         conversation_background = Some(crate::conversation_learning::Background::start(
-            training.0.clone(), Arc::new(eve_training_plugin::ModelConversationLearner::new(budget_gate.wrap(observed("conversation_learning")?, crate::qq_budget::CONVERSATION_LEARNING)?)), budget_gate.clone(),
+            training.0.clone(), Arc::new(eve_training_plugin::ModelConversationLearner::new(budget_gate.wrap(observed_capped("conversation_learning", Some(59))?, crate::qq_budget::CONVERSATION_LEARNING)?)), budget_gate.clone(),
         ));
         // 说法学习：训练中的会话攒够一批原话后学习一次；用途 phrase 单独记健康与输出上限。
         let _ = phrase_policy
@@ -2653,8 +2658,8 @@ async fn run_qqbot_composed(
             .set(qq_tasks::config_service(registry.as_ref())?);
         phrase_background = Some(crate::qq_phrases::Background::start(
             training.0.clone(),
-            Arc::new(eve_training_plugin::ModelPhraseLearner::new(budgeted(
-                crate::qq_phrases::MODEL_USE,
+            Arc::new(eve_training_plugin::ModelPhraseLearner::new(budgeted_capped(
+                crate::qq_phrases::MODEL_USE, 59,
             )?)),
             phrase_policy.clone(),
             budget_gate.clone(),
@@ -2728,7 +2733,7 @@ async fn run_qqbot_composed(
         if let (Some(memory), Some(summaries)) = (&memory, &summaries) {
             let summarizer = match summarizer {
                 Some(summarizer) => summarizer,
-                None => Arc::new(ModelConversationSummarizer::new(budgeted("summary")?)),
+                None => Arc::new(ModelConversationSummarizer::new(budgeted_capped("summary", 29)?)),
             };
             summary_background = Some(qq_summary::Background::start(
                 memory.clone(),
@@ -2746,7 +2751,7 @@ async fn run_qqbot_composed(
             let capabilities = qq_plan::capabilities(knowledge.is_some(), practice.is_some());
             let proposer: Arc<dyn PlanProposer> = match plan_proposer {
                 Some(proposer) => proposer,
-                None => Arc::new(ModelPlanProposer::new(observed("plan")?)),
+                None => Arc::new(ModelPlanProposer::new(observed_capped("plan", Some(29))?)),
             };
             let cognition: Arc<dyn eve_cognition_api::CognitionAdmin> =
                 Arc::new(background.as_ref().ok_or("计划入口缺少认知服务")?.admin()?);
@@ -2788,7 +2793,7 @@ async fn run_qqbot_composed(
             let cognition = Arc::new(background.as_ref().ok_or("兴趣观察缺少认知服务")?.admin()?);
             let observer = match interest_observer {
                 Some(observer) => observer,
-                None => Arc::new(ModelInterestObserver::new(budgeted(qq_budget::INTEREST)?)),
+                None => Arc::new(ModelInterestObserver::new(budgeted_capped(qq_budget::INTEREST, 29)?)),
             };
             let deriver = Arc::new(LearningGoalDeriver::new(cognition.clone(), "eve")?);
             let dirty = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -2821,11 +2826,11 @@ async fn run_qqbot_composed(
             };
             let selector: Arc<dyn SourceSelector> = match selector {
                 Some(selector) => selector,
-                None => Arc::new(ModelSourceSelector::new(budgeted(qq_budget::RESEARCH)?)),
+                None => Arc::new(ModelSourceSelector::new(budgeted_capped(qq_budget::RESEARCH, 59)?)),
             };
             let extractor: Arc<dyn KnowledgeExtractor> = match knowledge_extractor {
                 Some(extractor) => extractor,
-                None => Arc::new(ModelKnowledgeExtractor::new(budgeted(qq_budget::RESEARCH)?)),
+                None => Arc::new(ModelKnowledgeExtractor::new(budgeted_capped(qq_budget::RESEARCH, 59)?)),
             };
             let researcher = Arc::new(Researcher::new(
                 Arc::new(knowledge.clone()),
@@ -2891,18 +2896,18 @@ async fn run_qqbot_composed(
             let _ = skill_runner.set(runner.clone());
             let mut drafter: Arc<dyn PracticeDrafter> = match practice_drafter {
                 Some(drafter) => drafter,
-                None => Arc::new(ModelPracticeDrafter::new(budgeted(qq_budget::PRACTICE)?)),
+                None => Arc::new(ModelPracticeDrafter::new(budgeted_capped(qq_budget::PRACTICE, 89)?)),
             };
             let skill_parts = match &skills {
                 Some(skills) => {
                     let admin: Arc<dyn SkillAdmin> = Arc::new(skills.clone());
                     let selector: Arc<dyn SkillSelector> = match skill_selector {
                         Some(selector) => selector,
-                        None => Arc::new(ModelSkillSelector::new(budgeted(qq_budget::SKILL)?)),
+                        None => Arc::new(ModelSkillSelector::new(budgeted_capped(qq_budget::SKILL, 89)?)),
                     };
                     let distiller: Arc<dyn SkillDistiller> = match skill_distiller {
                         Some(distiller) => distiller,
-                        None => Arc::new(ModelSkillDistiller::new(budgeted(qq_budget::SKILL)?)),
+                        None => Arc::new(ModelSkillDistiller::new(budgeted_capped(qq_budget::SKILL, 89)?)),
                     };
                     // 后续任务的第一次尝试先经一次有记录的技能选择；其余照常草稿。
                     drafter = Arc::new(SkillAwareDrafter::new(
@@ -2944,7 +2949,7 @@ async fn run_qqbot_composed(
                     let admin: Arc<dyn ToolAdmin> = Arc::new(tools.clone());
                     let forger: Arc<dyn ToolForger> = match tool_forger {
                         Some(forger) => forger,
-                        None => Arc::new(ModelToolForger::new(budgeted(qq_budget::FORGE)?)),
+                        None => Arc::new(ModelToolForger::new(budgeted_capped(qq_budget::FORGE, 89)?)),
                     };
                     // 已启用的锻造工具在实际运行前检查草稿；拦下的草稿不运行。
                     forged_check = Some(Arc::new(ForgedChecks::new(admin.clone())));
@@ -3004,11 +3009,11 @@ async fn run_qqbot_composed(
         {
             let composer: Arc<dyn InvitationComposer> = match invitation_composer {
                 Some(composer) => composer,
-                None => Arc::new(ModelInvitationComposer::new(budgeted(qq_budget::OUTREACH)?)),
+                None => Arc::new(ModelInvitationComposer::new(budgeted_capped(qq_budget::OUTREACH, 89)?)),
             };
             let responder: Arc<dyn ResponseJudge> = match response_judge {
                 Some(judge) => judge,
-                None => Arc::new(ModelResponseJudge::new(budgeted(qq_budget::OUTREACH)?)),
+                None => Arc::new(ModelResponseJudge::new(budgeted_capped(qq_budget::OUTREACH, 59)?)),
             };
             let cognition: Arc<dyn eve_cognition_api::CognitionAdmin> =
                 Arc::new(background.as_ref().ok_or("主动交流缺少认知服务")?.admin()?);
@@ -3050,8 +3055,8 @@ async fn run_qqbot_composed(
                 practice: practice
                     .clone()
                     .map(|practice| Arc::new(practice) as Arc<dyn PracticeAdmin>),
-                composer: Arc::new(ModelClarificationComposer::new(budgeted(
-                    qq_budget::CLARIFY,
+                composer: Arc::new(ModelClarificationComposer::new(budgeted_capped(
+                    qq_budget::CLARIFY, 59,
                 )?)),
                 gate: budget_gate.clone(),
             }));
@@ -3164,7 +3169,7 @@ async fn run_qqbot_composed(
         if let Some(outreach) = &outreach {
             let judge: Arc<dyn TimingJudge> = match timing_judge {
                 Some(judge) => judge,
-                None => Arc::new(ModelTimingJudge::new(budgeted(qq_budget::OUTREACH)?)),
+                None => Arc::new(ModelTimingJudge::new(budgeted_capped(qq_budget::OUTREACH, 24)?)),
             };
             sources.push((
                 "invite-",
@@ -3184,7 +3189,7 @@ async fn run_qqbot_composed(
                 qq_clarify::ID_PREFIX,
                 Arc::new(qq_clarify::ChannelAdapter {
                     clarify: Arc::new(clarify.clone()),
-                    judge: Arc::new(ModelTimingJudge::new(budgeted(qq_budget::CLARIFY)?)),
+                    judge: Arc::new(ModelTimingJudge::new(budgeted_capped(qq_budget::CLARIFY, 29)?)),
                     policy: eve_clarify_api::ClarifyPolicy::default(),
                     gate: budget_gate.clone(),
                 }),

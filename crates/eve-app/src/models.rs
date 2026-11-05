@@ -358,9 +358,14 @@ impl LlmModelResolver for CoreModelResolver {
             policy.first_response = policy.first_response.min(policy.total);
             policy.idle = policy.idle.min(policy.total);
         }
-        // 留给适配器先返回分阶段诊断；外层只作为略晚的安全期限。
-        let provider_timeout =
-            stream_timeouts.map_or(config.request_timeout, |p| p.total + Duration::from_secs(1));
+        // 所有 SSE 用途都让适配器先结束统计尾流或报告超时；外层仅作略晚的安全期限。
+        // 提供方内部的总期限与用途 cap 不变，避免同期限的外层取消吞掉完整结果。
+        let transport_timeout = stream_timeouts.map_or(config.request_timeout, |p| p.total);
+        let provider_timeout = if captured.streamed_completions {
+            transport_timeout + Duration::from_secs(1)
+        } else {
+            transport_timeout
+        };
         let mut provider = if let Some(credential) = &credential {
             OpenAiProvider::new(config, credential.expose())?
         } else {

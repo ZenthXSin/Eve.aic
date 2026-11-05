@@ -59,6 +59,7 @@ async fn unicode_chunked_text_and_multiple_calls_match_complete_protocol() {
     assert_eq!(*sink.0.lock().unwrap(), "中文🌍\n第二段");
     let first = server.next().await.body;
     assert_eq!(first["stream"], true);
+    assert!(first.get("stream_options").is_none());
     assert_eq!(first["store"], false);
     assert_eq!(first["tool_choice"], "none");
     let calls = p.stream(request(), &Sink::default()).await.unwrap();

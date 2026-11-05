@@ -20,9 +20,12 @@ pub(crate) struct ChatStream {
 }
 
 impl ChatStream {
-    /// 终态之前任一分块携带的用量；服务不发送时为 None。
-    pub(crate) fn usage(&self) -> Option<eve_llm_api::ModelUsage> {
-        self.usage
+    /// 语义终态后只保留统计所需的身份和用量，丢弃文本及工具片段。
+    pub(crate) fn into_usage_tail(self) -> UsageTail {
+        UsageTail {
+            id: self.id,
+            usage: self.usage,
+        }
     }
 
     pub(crate) fn event(
@@ -150,4 +153,50 @@ impl ChatStream {
 
 fn protocol() -> LlmError {
     LlmError::Protocol("Chat 流片段无效、终态缺失或标识不一致".into())
+}
+
+/// 终态之后不能再次进入文本/工具状态机，只接受同一请求的统计和 DONE。
+pub(crate) struct UsageTail {
+    id: Option<String>,
+    pub(crate) usage: Option<eve_llm_api::ModelUsage>,
+}
+impl UsageTail {
+    /// true 表示 DONE；调用方把错误视为统计未完整收取，不改变模型结果。
+    pub(crate) fn event(&mut self, name: &str, data: &str) -> Result<bool, LlmError> {
+        if !matches!(name, "" | "message") {
+            return Err(protocol());
+        }
+        if data.trim() == "[DONE]" {
+            return Ok(true);
+        }
+        let value: Value =
+            crate::strict_json::from_slice(data.as_bytes()).map_err(|_| protocol())?;
+        if value.get("error").is_some_and(|v| !v.is_null()) {
+            return Err(protocol());
+        }
+        if let Some(id) = value.get("id").filter(|v| !v.is_null()) {
+            let id = id
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(protocol)?;
+            if self.id.as_deref().is_some_and(|previous| previous != id) {
+                return Err(protocol());
+            }
+            self.id = Some(id.into());
+        }
+        if !value
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+            || !value
+                .get("usage")
+                .is_some_and(|v| v.is_null() || v.is_object())
+        {
+            return Err(protocol());
+        }
+        if let Some(usage) = value.get("usage").and_then(crate::usage::from_usage) {
+            self.usage = Some(usage);
+        }
+        Ok(false)
+    }
 }
