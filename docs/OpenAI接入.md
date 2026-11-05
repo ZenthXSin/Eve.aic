@@ -13,7 +13,7 @@ let provider = OpenAiProvider::new(config, credential)?;
 
 根地址补 /v1/chat/completions，版本/代理路径补 /chat/completions，完整 Chat 端点不重复；明确传入 Responses 完整端点时报告协议不匹配。protocol 显式选定，不做失败后的协议或模型回退。现有 responses_url 字段保留历史名称，在 Chat 模式中保存完整 Chat 端点。
 
-支持非流式有序 system/user/assistant 文本、assistant tool_calls 批次和逐项 role=tool / tool_call_id 回执；工具定义使用嵌套 function。对象参数和成功/失败回执编码为 JSON 字符串，保留原调用 ID、顺序和完整历史；工具定义按名称排序。空工具列表不发送 tools，Chat 不发送 Responses 的 input、phase、store 或 max_output_tokens。可选输出上限使用 max_tokens，可选 reasoning_effort 使用同名标量，默认均不由库发送。
+支持有序 system/user/assistant 文本、assistant tool_calls 批次和逐项 role=tool / tool_call_id 回执；工具定义使用嵌套 function。对象参数和成功/失败回执编码为 JSON 字符串，保留原调用 ID、顺序和完整历史；工具定义按名称排序。空工具列表不发送 tools，Chat 不发送 Responses 的 input、phase、store 或 max_output_tokens。可选输出上限使用 max_tokens，可选 reasoning_effort 使用同名标量，默认均不由库发送。
 
 ## 提示词前缀与上游缓存
 
@@ -21,13 +21,15 @@ Runtime 将固定 AGENT 与本轮实际工具的完整说明放在请求开头�
 
 这是请求布局优化，不保存或复用旧模型回复，不跳过模型与工具，也不修改已保存的对话。切换布局后的首次请求需要重新预热；历史窗口裁剪、总结、工具变动及上游路由、缓存保留策略仍可能导致未命中。
 
-命中以模型服务返回的用量和站点账单为准，例如 Chat 的 `usage.prompt_tokens_details.cached_tokens` 或 DeepSeek 的 `usage.prompt_cache_hit_tokens`。缺失这些字段只能说明本次未报告命中数，不应伪造为已命中或承诺固定命中率。当前适配器不将用量写入通用 `ModelResponse`；排查站点的零命中时，应对照同一服务的实际响应用量，而非从 Eve 的请求计数推算。
+命中以模型服务返回的用量和站点账单为准，例如 Chat 的 `usage.prompt_tokens_details.cached_tokens` 或 DeepSeek 的 `usage.prompt_cache_hit_tokens`。缺失这些字段表示未报告缓存命中数，明确 `cached_tokens=0` 才是报告零命中；二者分别计数。适配器通过 `ModelUsageObserver` 观察用量，不将用量写入通用 `ModelResponse`。站点的 `cache_ratio` 若定义为计费倍率，不能当作缓存 token 数或命中率。排查零命中时应对照同一请求的实际用量字段与账单，不能从 Eve 请求数或本地可复用前缀推算，也不承诺上游缓存可用或固定命中率。
+
+Chat 使用 SSE 时会请求 `stream_options: {"include_usage": true}`。完整终态后，在原总期限内短暂、有界地读取统计尾帧，收到 `[DONE]` 即结束，无需等待 TCP EOF；尾流失败保留已验证的响应，不为补统计重试或重放工具。非流式 Chat 和 Responses 不附加该参数。详细边界见[流式输出](./streaming.md#chat-流式用量收尾)。
 
 2026-10-18 在当前用户授权的同一模型服务上，使用实际 QQ 宿主、30 个工具、本地桥接及四轮合成消息进行对照：旧布局四轮均未报告命中；新布局后两轮各报告 7680 个缓存 token，分别占该轮输入的约 57.8% 和 56.6%。四轮合计为 15360 / 51765，约 29.7%；小样本结果不代表长期账单命中率。真实 QQ 消息未用于该验收。
 
 ## Chat 响应与验收
 
-回复只接受单个 index=0 的 assistant choice。stop 必须是完整非空文本且没有工具；tool_calls 必须含完整合法批次，允许 content 为 null/空；非空工具说明通过无正文 warning 忽略，保留完整工具批次。length/content_filter 明确失败，批次完整校验后才允许执行工具。重复 JSON 键、坏参数、空/重复调用 ID、非法消息和终态不匹配拒绝；附加 reasoning_content/reasoning 通过无正文 warning 忽略；refusal、音频和旧 function_call 返回 Unsupported。附加内容不进入 Session，也不提供 reasoning 续传。请求 Chat stream 也在发 HTTP 前返回 Unsupported。
+回复只接受单个 index=0 的 assistant choice。stop 必须是完整非空文本且没有工具；tool_calls 必须含完整合法批次，允许 content 为 null/空；非空工具说明通过无正文 warning 忽略，保留完整工具批次。length/content_filter 明确失败，批次完整校验后才允许执行工具。重复 JSON 键、坏参数、空/重复调用 ID、非法消息和终态不匹配拒绝；附加 reasoning_content/reasoning 通过无正文 warning 忽略；refusal、音频和旧 function_call 返回 Unsupported。附加内容不进入 Session，也不提供 reasoning 续传。Chat SSE 支持完整文本与工具批次，严格校验和终态后用量收尾见[流式输出](./streaming.md)。
 
 核心验收真实启动两个 Eve 子进程，对回环 Chat 服务器完成三轮、四次请求、一次插件 echo、revision 4→6 和重启新轮零工具；同一流程另验收截断回复零工具。Provider HTTP 测试覆盖请求字段、凭据、期限/取消、上限、无重试与错误脱敏。deepseek-v4.1-flash / Chat / none 已于 2026-10-01 完成同一核心的外部三轮、一次工具及独立进程恢复实测，详见[主模型验收](./主模型验收.md)。核心 Chat 普通配置空 reasoning_effort 映射为 none；库自身仍默认不发送可选参数。
 
@@ -164,6 +166,8 @@ SessionLlmHost 已在文件后端重建后，用本地 Responses HTTP 服务器�
 
 三个环境变量均限 1–600000 毫秒，首包与空闲期限不得超过总期限；非法配置明确拒绝。环境设置需重启，原主模型期限仍可在面板调整，下一轮捕获生效。只对已启用流式接收的主对话装配此策略；后台学习、工具、子代理和上下文压缩的既有独立预算、期限保持不变。主会话每轮工具调用预算为 100 次。
 
-HTTP 客户端按实际请求选择总期限；Runtime 的安全期限晚于流式总期限 1 秒，给适配器保留报告具体阶段的机会。`EVE_MODEL_TIMEOUT` 只记录 `first_response`、`stream_idle` 或 `total` 及数字计时，不记录端点、密钥、提示词、响应或工具正文。首次收到传输数据不代表已经收到完整、合法的模型结果。
+HTTP 客户端按实际请求选择总期限；Chat 完整终态后的统计收尾也受该总期限约束，统计收尾失败保留完整结果且不进入重试。所有启用 SSE 的用途，包括后台学习和审查，其宿主安全期限均晚于适配器总期限 1 秒，让适配器先完成统计收尾或返回超时；提供方内部总期限及用途上限不增加。QQ 的摘要、兴趣观察、计划提议和偏好提炼保留整轮 30 秒硬限，模型内部最多 29 秒，为外层留下收尾余量。`EVE_MODEL_TIMEOUT` 只记录 `first_response`、`stream_idle` 或 `total` 及数字计时，不记录端点、密钥、提示词、响应或工具正文。首次收到传输数据不代表已经收到完整、合法的模型结果。
+
+固定模型组件的外层期限不延长，QQ、Web 与 CLI 在相应模型实例的内部期限预留 1 秒：例如计划提议为 29/30 秒、资料提炼为 59/60 秒、实践草稿为 89/90 秒；QQ 发言决定、进度播报和群关系整理分别为 59/60、7/8、14/15 秒。同一用途下的邀请撰写、回应判断、时机判断按各自调用期限设置，不缩短主对话整体期限，也不改变健康统计用途和预算类别。这层余量不覆盖并发排队、整任务或多阶段预算：它们的主动超时、后台停止和用户取消仍可终止尚未交付的请求，不能据此承诺任何已收到模型终态的结果都必然交付。
 
 超时继续使用原有 `ProviderTimeout` 状态与 QQ 提示；完整终态到来前的工具参数和文本不交付，不因超时重新执行已经完成的工具。完整接收模式仍按原有条件至多重试三次，但共享同一个总期限；显式增量流不重试。失败回执、工具证据与历史的持久化格式不变，重启不补发或重放。默认构造的适配器与非流式请求保留原 `request_timeout` 语义；公开组合接口 `with_stream_timeout_policy` 用于显式替换传输期限。

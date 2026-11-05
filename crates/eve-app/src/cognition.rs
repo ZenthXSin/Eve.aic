@@ -946,7 +946,9 @@ pub(crate) async fn plan_model_resolver(
         return Err("计划建议当前要求 complete 模式。".into());
     }
     let resolver = Arc::new(
-        models::CoreModelResolver::new(settings.clone(), bootstrap.api_key).with_use("plan"),
+        models::CoreModelResolver::new(settings.clone(), bootstrap.api_key)
+            .with_use("plan")
+            .with_timeout_cap(Duration::from_secs(29)),
     );
     // 在保存请求记录之前确认模型配置可用；配置错误不消耗该修订的建议机会。
     resolver.resolve()?;

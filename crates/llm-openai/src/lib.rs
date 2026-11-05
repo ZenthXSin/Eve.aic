@@ -14,6 +14,7 @@ pub use vision::DEFAULT_VISION_PROMPT;
 
 mod chat;
 mod chat_stream;
+mod completion;
 mod embeddings;
 mod retry;
 mod stream;
@@ -383,6 +384,9 @@ impl OpenAiProvider {
             OpenAiProtocol::ChatCompletions => chat::encode_request(&self.config.model, request)?,
         };
         body["stream"] = serde_json::json!(sink.is_some());
+        if sink.is_some() && self.config.protocol == OpenAiProtocol::ChatCompletions {
+            body["stream_options"] = serde_json::json!({"include_usage": true});
+        }
         if json_output {
             match self.config.protocol {
                 OpenAiProtocol::Responses => {
@@ -410,14 +414,23 @@ impl OpenAiProvider {
             };
             body[field] = serde_json::json!(limit);
         }
-        if self.transient_retries && complete {
-            return self.request_retried(&body, sink).await;
-        }
         let total = self.total_timeout(sink.is_some());
         let started = std::time::Instant::now();
-        tokio::time::timeout(total, self.request_once(&body, sink, &mut None))
-            .await
-            .map_err(|_| timeouts::expired("total", total, started, None))?
+        let deadline = tokio::time::Instant::now() + total;
+        let completed = tokio::time::timeout_at(deadline, async {
+            if self.transient_retries && complete {
+                self.request_retried(&body, sink, deadline).await
+            } else {
+                self.request_once(&body, sink, &mut None).await
+            }
+        })
+        .await
+        .map_err(|_| timeouts::expired("total", total, started, None))??;
+        // 模型结果已经完整校验并离开重试范围。统计尾流不得把成功变成失败；
+        // 由持有结果的这一层处理原总期限，避免外层 timeout 丢弃已完成结果。
+        let (response, usage) = completed.finish(deadline).await;
+        self.report_usage(usage);
+        Ok(response)
     }
 
     async fn request_once(
@@ -425,7 +438,7 @@ impl OpenAiProvider {
         body: &serde_json::Value,
         sink: Option<&dyn ModelTextSink>,
         retry_after: &mut Option<Duration>,
-    ) -> Result<ModelResponse, LlmError> {
+    ) -> Result<completion::CompletedRequest, LlmError> {
         let mut timing = timing::RequestTiming::start(self.timing_diagnostics);
         let started = std::time::Instant::now();
         let policy = sink.and(self.stream_timeouts);
@@ -535,11 +548,16 @@ impl OpenAiProvider {
                 {
                     timing.record("first_stream_chunk", None);
                 }
-                if chunk.len() > self.config.max_response_bytes - received {
+                if self.config.protocol == OpenAiProtocol::Responses
+                    && chunk.len() > self.config.max_response_bytes - received
+                {
                     return Err(failed(ProviderFailureKind::ResponseTooLarge));
                 }
-                received += chunk.len();
-                for byte in chunk {
+                for (offset, &byte) in chunk.iter().enumerate() {
+                    if received == self.config.max_response_bytes {
+                        return Err(failed(ProviderFailureKind::ResponseTooLarge));
+                    }
+                    received += 1;
                     if let Some((name, data)) = parser.byte(byte)? {
                         let update = match self.config.protocol {
                             OpenAiProtocol::Responses => state.event(&name, &data)?,
@@ -559,16 +577,28 @@ impl OpenAiProvider {
                         match update {
                             stream::Update::None => {}
                             stream::Update::Text(text) => sink.text_delta(text).await?,
-                            // 正常终态立即关闭本地流，不等 EOF，不重连、不重复执行。
-                            stream::Update::Completed(response) => {
+                            stream::Update::Completed(result) => {
                                 if let Some(timing) = &mut timing {
                                     timing.finish();
                                 }
-                                self.report_usage(match self.config.protocol {
-                                    OpenAiProtocol::Responses => state.usage(),
-                                    OpenAiProtocol::ChatCompletions => chat_state.usage(),
+                                return Ok(match self.config.protocol {
+                                    // Responses 终态已经携带 usage，不等待 EOF。
+                                    OpenAiProtocol::Responses => {
+                                        completion::CompletedRequest::new(result, state.usage())
+                                    }
+                                    OpenAiProtocol::ChatCompletions => {
+                                        completion::CompletedRequest::chat(
+                                            result,
+                                            completion::ChatTail::new(
+                                                response,
+                                                parser,
+                                                chat_state.into_usage_tail(),
+                                                &chunk[offset + 1..],
+                                                self.config.max_response_bytes - received,
+                                            ),
+                                        )
+                                    }
                                 });
-                                return Ok(response);
                             }
                         }
                     }
@@ -587,13 +617,13 @@ impl OpenAiProvider {
             OpenAiProtocol::Responses => wire::decode_response(&bytes),
             OpenAiProtocol::ChatCompletions => chat::decode_response(&bytes),
         };
-        if decoded.is_ok() {
-            if let Some(timing) = &mut timing {
-                timing.finish();
-            }
-            self.report_usage(usage::from_body(&bytes));
+        if decoded.is_ok()
+            && let Some(timing) = &mut timing
+        {
+            timing.finish();
         }
         decoded
+            .map(|response| completion::CompletedRequest::new(response, usage::from_body(&bytes)))
     }
 }
 

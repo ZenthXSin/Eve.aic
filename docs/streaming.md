@@ -62,6 +62,17 @@ EVE_LLM_RESPONSE_MODE=stream cargo run -p eve-runtime --example openai_responses
 
 宿主启动时设置 `EVE_OPENAI_STREAM_COMPLETIONS=true`（也接受 `1`）可让主模型及其用途通过 SSE 接收，`complete` / `complete_json` 仍返回完整响应。默认关闭；`false` / `0` 关闭，其他值报配置错误。该开关独立于 `runtime.llm.response_mode`，QQ 保持 `complete`：完整回复保存成功后才投递，沿用原有回执、防重复和上下文压缩机制。旧版本忽略此环境变量，可继续使用完整 JSON 响应，无需回退持久化配置。
 
-Chat SSE 支持 UTF-8 分片、文本、按 index 交错的函数名称与参数分片，以及 usage 附加帧。内部 reasoning 字段丢弃，工具说明草稿不投递。完整 `stop` / `tool_calls` 终态才交给原有响应校验；参数 JSON 重复键、调用 ID 冲突、截断、过滤、错误帧、提前 `[DONE]` / EOF 均失败。正常终态立即返回，无需等待连接关闭。为避免把工具前说明误作文本，Chat 的公开 `stream` 文本接收器也只在正常文本终态收到合并后的文本；Responses 保留逐片文本事件。
+Chat SSE 支持 UTF-8 分片、文本、按 index 交错的函数名称与参数分片，以及 usage 附加帧。内部 reasoning 字段丢弃，工具说明草稿不投递。完整 `stop` / `tool_calls` 终态才交给原有响应校验；参数 JSON 重复键、调用 ID 冲突、截断、过滤、错误帧、提前 `[DONE]` / EOF 均失败。有效终态先冻结完整结果，之后只进行短暂、有界的用量收尾，不再追加文本、工具或触发第二次完成。为避免把工具前说明误作文本，Chat 的公开 `stream` 文本接收器也只在正常文本终态收到合并后的文本；Responses 保留逐片文本事件。
 
 总响应字节预算和请求总期限仍生效，流式接收不会无限延长期限。对话完整响应可沿用原有最多三次有界瞬时错误重试，全部发生在返回模型结果之前，不执行未完成的工具调用；显式 `stream` 接收器不自动重试。流式接收只能避免等待整个 JSON 响应，并不能保证上游模型一定及时响应。
+
+
+### Chat 流式用量收尾
+
+所有实际 `stream=true` 的 Chat 请求附加 `stream_options: {"include_usage": true}`，包括公开 `stream`、启用 SSE 的 `complete` 和 `complete_json`；不增加模型请求，不改变模型、temperature 或 reasoning 配置。非流式 Chat 与 Responses 不发送此参数。
+
+用量可以在终态前、终态同帧，或之后的 `choices: []` 统计帧中到达。有效 `stop` / `tool_calls` 校验完成且文本交付成功后，适配器继续读取当前 HTTP chunk 剩余字节及后续统计帧，统计收尾最多 1 秒、64 KiB：截止时刻取收尾开始后 1 秒与原请求总期限的较早者，字节额度取 64 KiB 与原响应剩余字节预算的较小者；心跳不延长期限或额度。收到 `[DONE]` 即结束，不等待 TCP EOF；EOF 也结束统计读取。终态之前的 `[DONE]` / EOF 仍是协议失败。
+
+尾部缺少用量、连接停顿或断开、无效帧、额外输出、标识冲突、字节超限或统计期限耗尽，只结束统计收尾并保留已验证的完整响应；不会重新请求模型或重复执行工具。只报告一次最后可用的用量快照，不把累计快照相加；缓存字段缺失保持未报告，明确的零命中保持零。响应完整生成前的失败、取消和文本消费者错误仍按原规则处理。Responses 继续在 `response.completed` 中读取用量并完成。
+
+`cache_metrics_test.py` 的实际 Eve 进程回归使用本地 HTTP SSE 和合成 QQ 桥接：终态后发送 usage-only 与 `[DONE]`，保持 HTTP 正文未结束；检查就绪状态里的报告数、输入与缓存 token，区分缺报与零命中，并验证真实 echo 工具仅执行一次、坏尾帧和停顿尾流不触发重试。该验收不使用真实 QQ 或付费模型，不证明上游缓存命中。

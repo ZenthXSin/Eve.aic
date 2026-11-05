@@ -212,6 +212,76 @@ fn user_texts<'a>(body: &'a Value, protocol: &str) -> Vec<&'a str> {
         .collect()
 }
 
+#[test]
+fn streamed_auxiliary_usage_tail_preserves_success_under_host_deadline() {
+    // 启动环境只作用于这个独立测试进程，不能与其他模型解析测试争用全局环境。
+    const CHILD: &str = "EVE_TEST_AUXILIARY_USAGE_TAIL";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "models::tests::streamed_auxiliary_usage_tail_preserves_success_under_host_deadline",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("EVE_OPENAI_STREAM_COMPLETIONS", "true")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use eve_llm_api::{ChatMessage, ChatRole, ModelRequest, ModelResponse};
+            for terminal_before_cap in [true, false] {
+                let root = tempfile::tempdir().unwrap();
+                let mut reply = Reply::json(json!({}));
+                reply.headers = vec![("Content-Type".into(), "text/event-stream".into())];
+                reply.chunked = true;
+                let terminal = b"data: {\"id\":\"auxiliary-tail\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"complete\"},\"finish_reason\":\"stop\"}]}\n\n".to_vec();
+                reply.delayed_chunks = vec![
+                    (
+                        Duration::from_millis(if terminal_before_cap { 20 } else { 900 }),
+                        terminal,
+                    ),
+                    (Duration::from_secs(5), b"data: [DONE]\n\n".to_vec()),
+                ];
+                let mut server = Server::start(vec![reply]).await;
+                let harness = Harness::start(root.path(), &server.url, "chat").await;
+                let resolver = CoreModelResolver::new(harness.settings.clone(), "fake-key".into())
+                    .with_use("summary")
+                    .with_timeout_cap(Duration::from_millis(300));
+                let selected = resolver.resolve().unwrap();
+                assert_eq!(selected.provider_timeout, Duration::from_millis(1300));
+                let request = ModelRequest {
+                    messages: vec![ChatMessage::text(ChatRole::User, "synthetic input")],
+                    tools: vec![],
+                };
+                let result = tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep(selected.provider_timeout) => panic!("宿主取消了已完成结果或未收到提供方超时"),
+                    result = selected.provider.complete(request) => result,
+                };
+                if terminal_before_cap {
+                    assert_eq!(result.unwrap(), ModelResponse::Final { text: "complete".into() });
+                } else {
+                    assert!(matches!(result, Err(LlmError::ProviderTimeout)), "用途内部期限不能被外层安全余量延长");
+                }
+                assert_eq!(server.next().await.body["stream_options"], json!({"include_usage": true}));
+                assert!(server.requests.try_recv().is_err(), "统计尾流不产生额外请求");
+                harness.stop().await;
+            }
+        });
+}
+
 #[tokio::test]
 async fn primary_selection_is_fixed_during_tools_and_changes_at_next_round() {
     for (protocol, mode) in [

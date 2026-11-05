@@ -568,11 +568,22 @@ impl WebAutonomy {
             .map_err(|_| "Web 模型管理重复装配")?;
         let resolver = |role: &str| -> Arc<dyn LlmModelResolver> {
             health.register(role);
+            let model =
+                crate::models::CoreModelResolver::new(settings.clone(), self.api_key.clone())
+                    .with_use(role);
+            // 此 Web 组合中的固定组件期限减一秒；任务和压缩的整轮预算仍由宿主管理。
+            let cap_seconds = match role {
+                "plan" => Some(29),
+                "research" | "conversation_learning" => Some(59),
+                "practice" => Some(89),
+                _ => None,
+            };
+            let model = match cap_seconds {
+                Some(seconds) => model.with_timeout_cap(std::time::Duration::from_secs(seconds)),
+                None => model,
+            };
             Arc::new(eve_model_health::ObservedResolver::new(
-                Arc::new(
-                    crate::models::CoreModelResolver::new(settings.clone(), self.api_key.clone())
-                        .with_use(role),
-                ),
+                Arc::new(model),
                 role,
                 health.clone(),
             ))
