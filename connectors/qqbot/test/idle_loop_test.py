@@ -40,6 +40,10 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
         self.reflections=0
         self.observations=[]
         self.plans=0
+        self.review_capabilities=[]
+        self.plan_capabilities=[]
+        self.action_toolsets=[]
+        self.forbidden_action_tools=set()
         self.mode='act'
         outer=self
         class Small(BaseHTTPRequestHandler):
@@ -70,10 +74,37 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
         return self.run_eve(script,interest=False,memory=True,research=False,practice=False,
             more=['--background-tasks','--max-tool-rounds','4'],env_extra=env,**options)
 
+    def action_capabilities(self,body):
+        # 只解析宿主首条 System 的结构化声明，合同示例提到工具不算已装配能力。
+        self.assertEqual(body['messages'][0]['role'],'system')
+        system=body['messages'][0]['content']
+        packets=[]
+        decoder=json.JSONDecoder()
+        for offset,char in enumerate(system):
+            if char!='{':continue
+            try:packet,_=decoder.raw_decode(system[offset:])
+            except json.JSONDecodeError:continue
+            if isinstance(packet,dict) and packet.get('kind')=='eve.task.action-capabilities':
+                packets.append(packet)
+        self.assertEqual(len(packets),1,'回顾/规划须收到一份宿主后续行动能力声明')
+        packet=packets[0]
+        self.assertEqual(packet['status'],'available','本夹具已装配并授权文件实验能力')
+        names=packet['tools']
+        self.assertEqual(names,sorted(set(names)),'能力名称须排序且唯一')
+        self.assertEqual(packet['total'],len(names))
+        self.assertEqual(packet['omitted'],0,'本夹具工具清单不应截断')
+        self.assertTrue({'read_file','write_file'}<=set(names),'有真实读写能力才能提出实验')
+        self.assertFalse(self.forbidden_action_tools & set(names),'不能声明未注册的后续能力')
+        return packet
+
     def respond(self,body):
         system=str(body['messages'][0]['content'])
         if '本任务只规划一个有价值的下一目标' in system:
             self.assertFalse(body.get('tools'),'缺合同的旧行动必须先无工具规划')
+            capabilities=self.action_capabilities(body)
+            self.assertTrue(self.review_capabilities)
+            self.assertEqual(capabilities,self.review_capabilities[-1],'同配置下规划与回顾的行动能力一致')
+            self.plan_capabilities.append(capabilities)
             text=next(m['content'] for m in reversed(body['messages'])
                 if PLAN_PREFIX in (m.get('content') or ''))
             frozen=json.JSONDecoder().raw_decode(text.split(PLAN_PREFIX,1)[1])[0]
@@ -86,6 +117,7 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
             return text_response(json.dumps({**self.proposed_action,'completion_contract':ACTION_CONTRACT},ensure_ascii=False))
         if '这是Eve无人打扰时的一次自主回顾' in system:
             self.assertFalse(body.get('tools'),'回顾轮次无外部操作工具')
+            self.review_capabilities.append(self.action_capabilities(body))
             self.assertNotIn('invented-hint',json.dumps(body),'非法小模型ID不能注入主模型')
             messages=[]
             for m in body['messages']:
@@ -132,7 +164,15 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
             return text_response(json.dumps(result,ensure_ascii=False))
         if '你在为 Eve 独立完成一项委托的任务' in system:
             results=self.results(body)
-            if not results:return tool_response([('write_file',{'path':'experiment.txt','content':EXPERIMENT,'expected_sha256':''})])
+            if not results:
+                names=sorted(tool['function']['name'] for tool in body.get('tools',[]))
+                self.assertTrue(self.review_capabilities,'没有收到能力包不能由夹具直接假定可行动')
+                self.assertEqual(names,self.review_capabilities[-1]['tools'],
+                    '回顾声明必须与后续行动第一次真实请求的工具集合精确一致')
+                if self.plan_capabilities:self.assertEqual(names,self.plan_capabilities[-1]['tools'])
+                self.assertFalse(self.forbidden_action_tools & set(names))
+                self.action_toolsets.append(names)
+                return tool_response([('write_file',{'path':'experiment.txt','content':EXPERIMENT,'expected_sha256':''})])
             if len(results)==1:
                 self.assertTrue(results[-1].get('success'),results)
                 return tool_response([('read_file',{'path':'experiment.txt'})])
@@ -203,6 +243,17 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
         self.run_idle(self.checkpoint('quiet'),checkpoints={'quiet':lambda:time.sleep(1.3)})
         self.assertEqual(json.dumps(self.tasks(),sort_keys=True),before,'重启不重放旧行动或重复回顾')
         self.assertEqual(self.reflections,2)
+        self.assertEqual(len(self.review_capabilities),2)
+        self.assertEqual(len(self.action_toolsets),1,'重启不能重新开始已完成行动')
+
+    def test_disabled_commands_github_and_upgrade_are_absent_from_review_and_action(self):
+        config=json.loads(self.developer_config.read_text())
+        config.update(commands=False,github=False,self_upgrade=False)
+        self.developer_config.write_text(json.dumps(config),encoding='utf8')
+        self.forbidden_action_tools={'run_command','github_api','prepare_self_upgrade',
+            'apply_self_upgrade','restart_self','self_upgrade_status'}
+        # 同一完整场景继续验证真实文件实验、改观和重启零重放，不复制状态推进逻辑。
+        self.test_idle_action_and_changed_judgment_across_processes_without_new_user_message()
 
     def test_invalid_small_selection_falls_back_to_original_observations(self):
         self.mode='bad-small';self.initialize();self.due()
@@ -291,6 +342,9 @@ class IdleLoopAcceptance(developer.DeveloperAcceptance):
         before=json.dumps(self.tasks(),sort_keys=True)
         self.run_idle(self.checkpoint('legacy-quiet'),checkpoints={'legacy-quiet':lambda:time.sleep(1.3)})
         self.assertEqual(json.dumps(self.tasks(),sort_keys=True),before,'重启不改合同或重复规划、行动')
+        self.assertEqual(len(self.review_capabilities),1)
+        self.assertEqual(len(self.plan_capabilities),1)
+        self.assertEqual(len(self.action_toolsets),1)
 
     def test_text_contract_cannot_authorize_or_complete_idle_action(self):
         self.mode='text-act';self.initialize();self.due()

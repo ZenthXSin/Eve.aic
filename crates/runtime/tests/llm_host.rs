@@ -2582,3 +2582,246 @@ async fn review_original_messages_refresh_when_a_user_steers_an_active_turn() {
     );
     kernel.stop_all().await.unwrap();
 }
+
+#[tokio::test]
+async fn available_tool_names_are_read_only_sorted_and_match_the_same_scoped_request() {
+    struct CatalogPolicy;
+    impl eve_llm_api::ToolScopePolicy for CatalogPolicy {
+        fn tools_allowed(&self, scope: &eve_llm_api::ContextScope) -> bool {
+            scope.user_id != "observer"
+        }
+        fn tool_allowed(&self, _: &eve_llm_api::ContextScope, name: &str) -> bool {
+            name != "blocked"
+        }
+    }
+    let provider = RecordingProvider::scripted(vec![final_response("已回顾")]);
+    let tools = [
+        "zeta",
+        "blocked",
+        "alpha",
+        "send_message",
+        "wait_for_input",
+        "send_sticker",
+    ]
+    .into_iter()
+    .map(|name| {
+        Arc::new(TestTool::new(
+            name,
+            Some(ToolConcurrency::ParallelSafe),
+            ToolMode::Echo,
+        ))
+    })
+    .collect();
+    let (host, context, tools) = make_host(provider.clone(), tools, LlmHostConfig::default()).await;
+    let host = host
+        .with_tool_scope_policy(Arc::new(CatalogPolicy))
+        .delegated();
+    let scope = eve_llm_api::ContextScope {
+        session_id: "catalog".into(),
+        user_id: "operator".into(),
+    };
+    assert_eq!(
+        host.available_tool_names(None).unwrap(),
+        vec!["alpha", "blocked", "zeta"]
+    );
+    let names = host.available_tool_names(Some(&scope)).unwrap();
+    assert_eq!(names, vec!["alpha", "zeta"]);
+    struct UnavailableModel;
+    impl eve_llm_api::LlmModelResolver for UnavailableModel {
+        fn resolve(&self) -> Result<eve_llm_api::ModelSelection, LlmError> {
+            panic!("工具目录不得解析模型")
+        }
+    }
+    assert_eq!(
+        host.clone()
+            .with_model_resolver(Arc::new(UnavailableModel))
+            .available_tool_names(Some(&scope))
+            .unwrap(),
+        names
+    );
+    assert!(
+        host.available_tool_names(Some(&eve_llm_api::ContextScope {
+            user_id: "observer".into(),
+            ..scope.clone()
+        }))
+        .unwrap()
+        .is_empty()
+    );
+    let subset = host.with_tool_subset(&["zeta".into(), "absent".into()], "只回顾");
+    assert_eq!(
+        subset.available_tool_names(Some(&scope)).unwrap(),
+        vec!["zeta"]
+    );
+    assert_eq!(context.snapshots.load(Ordering::SeqCst), 0);
+    assert!(provider.requests.lock().unwrap().is_empty());
+    assert!(
+        tools
+            .iter()
+            .all(|tool| tool.starts.lock().unwrap().is_empty())
+    );
+    host.run_scoped_turn_with_events(turn(), Some(scope), &eve_llm_api::DiscardTurnEvents)
+        .await
+        .unwrap();
+    assert_eq!(context.snapshots.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        provider.requests.lock().unwrap()[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>(),
+        names
+    );
+}
+
+#[tokio::test]
+async fn available_tool_names_report_service_and_scope_failures_instead_of_empty_success() {
+    struct BrokenPolicy;
+    impl eve_llm_api::ToolScopePolicy for BrokenPolicy {
+        fn tools_allowed(&self, _: &eve_llm_api::ContextScope) -> bool {
+            panic!("fixture policy failure")
+        }
+    }
+    let provider = RecordingProvider::scripted(vec![]);
+    let tool = Arc::new(TestTool::new("echo", None, ToolMode::Echo));
+    let (host, context, _, kernel) =
+        make_host_with_registry(provider.clone(), vec![tool], LlmHostConfig::default(), None).await;
+    assert_eq!(host.available_tool_names(None).unwrap(), vec!["echo"]);
+    let broken = host.clone().with_tool_scope_policy(Arc::new(BrokenPolicy));
+    assert!(
+        broken
+            .available_tool_names(Some(&eve_llm_api::ContextScope {
+                session_id: "s".into(),
+                user_id: "u".into()
+            }))
+            .is_err()
+    );
+    kernel.stop(&owner_id()).await.unwrap();
+    assert!(host.available_tool_names(None).is_err());
+    assert!(provider.requests.lock().unwrap().is_empty());
+    assert_eq!(context.snapshots.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn available_tool_names_do_not_freeze_permission_before_execution() {
+    use eve_plugin_api::{Permission, PermissionChecker};
+    struct MutablePermissions(AtomicUsize);
+    impl PermissionChecker for MutablePermissions {
+        fn check(
+            &self,
+            manifest: &PluginManifest,
+            permission: &Permission,
+        ) -> eve_plugin_api::PluginResult<()> {
+            match self.0.load(Ordering::SeqCst) {
+                0 => Ok(()),
+                1 => Err(PluginError::PermissionDenied {
+                    plugin: manifest.id.clone(),
+                    permission: permission.clone(),
+                }),
+                _ => Err(PluginError::State(
+                    "fixture permission backend unavailable".into(),
+                )),
+            }
+        }
+    }
+    struct ProtectedTool(Arc<TestTool>);
+    impl Tool for ProtectedTool {
+        fn definition(&self) -> ToolDefinition {
+            let mut definition = self.0.definition();
+            definition.required_permissions = vec![Permission::new("catalog.execute").unwrap()];
+            definition
+        }
+        fn validate_arguments(&self, arguments: &Value) -> Result<(), ToolValidationError> {
+            self.0.validate_arguments(arguments)
+        }
+        fn execute(&self, call: ToolCall, context: ToolExecutionContext) -> ToolFuture<'_> {
+            self.0.execute(call, context)
+        }
+    }
+    let permissions = Arc::new(MutablePermissions(AtomicUsize::new(0)));
+    let services = KernelServices {
+        permissions: permissions.clone(),
+        ..KernelServices::default()
+    };
+    let registry = services.registry.clone();
+    let kernel = Kernel::with_services(services);
+    let tool = Arc::new(TestTool::new(
+        "echo",
+        Some(ToolConcurrency::ParallelSafe),
+        ToolMode::Echo,
+    ));
+    let context = Arc::new(CountingContext::default());
+    let mut manifest = PluginManifest::new(OWNER, "0.1.0").unwrap();
+    manifest
+        .permissions
+        .push(Permission::new("catalog.execute").unwrap());
+    kernel
+        .register(Box::new(ServicePlugin {
+            manifest,
+            context: context.clone(),
+            tools: vec![(service_id("echo"), Arc::new(ProtectedTool(tool.clone())))],
+        }))
+        .unwrap();
+    kernel.start(&owner_id()).await.unwrap();
+    let (provider, started, release) = RecordingProvider::blocked();
+    *provider.responses.lock().unwrap() = VecDeque::from([
+        tool_response(vec![call("must-not-run", "echo", json!({}))]),
+        final_response("权限已撤销，未执行"),
+    ]);
+    let host = LlmHost::new(
+        provider.clone(),
+        registry,
+        kernel.clone(),
+        permissions.clone(),
+        ContextBinding {
+            service_id: ServiceId::new(CONTEXT).unwrap(),
+            expected_owner: owner_id(),
+        },
+        vec![ToolBinding {
+            name: "echo".into(),
+            service_id: service_id("echo"),
+            expected_owner: owner_id(),
+        }],
+        LlmHostConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(host.available_tool_names(None).unwrap(), vec!["echo"]);
+    permissions.0.store(1, Ordering::SeqCst);
+    assert!(matches!(
+        host.available_tool_names(None),
+        Err(LlmError::Configuration(_))
+    ));
+    permissions.0.store(2, Ordering::SeqCst);
+    assert!(matches!(
+        host.available_tool_names(None),
+        Err(LlmError::Backend(_))
+    ));
+    assert_eq!(context.snapshots.load(Ordering::SeqCst), 0);
+    assert!(provider.requests.lock().unwrap().is_empty());
+    permissions.0.store(0, Ordering::SeqCst);
+    let run = tokio::spawn(async move { host.run_turn(turn()).await });
+    tokio::time::timeout(Duration::from_secs(1), started.notified())
+        .await
+        .unwrap();
+    // 目录和本轮准备都已经通过，模型返回之前撤销；执行预检必须再次拒绝。
+    permissions.0.store(1, Ordering::SeqCst);
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), started.notified())
+        .await
+        .unwrap();
+    release.notify_one();
+    let output = tokio::time::timeout(Duration::from_secs(1), run)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.diagnostics.started_tools, 0);
+    assert!(tool.starts.lock().unwrap().is_empty());
+    assert!(matches!(
+        output.diagnostics.tool_results[0].output,
+        eve_llm_api::ToolOutput::Failure {
+            code: ToolFailureCode::PermissionDenied,
+            ..
+        }
+    ));
+    kernel.stop(&owner_id()).await.unwrap();
+}

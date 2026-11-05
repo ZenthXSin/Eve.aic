@@ -45,6 +45,8 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
+mod action_capabilities;
+
 pub(crate) const DISPATCH_TOOL: &str = "dispatch_background_task";
 pub(crate) const LIST_TOOL: &str = "list_background_tasks";
 pub(crate) const CANCEL_TOOL: &str = "cancel_background_task";
@@ -493,9 +495,15 @@ impl Worker {
             source.clone()
         };
         let source = if idle_review {
-            source.with_tool_subset(&[], crate::idle_loop::RULES)
+            source.with_tool_subset(
+                &[],
+                &action_capabilities::rules(&source, scope.as_ref(), crate::idle_loop::RULES),
+            )
         } else if subject_plan.is_some() {
-            source.with_tool_subset(&[], crate::qq_subject::PLAN_RULES)
+            source.with_tool_subset(
+                &[],
+                &action_capabilities::rules(&source, scope.as_ref(), crate::qq_subject::PLAN_RULES),
+            )
         } else if matches!(
             completion_contract,
             Some(TaskCompletionContract::Text { .. })
