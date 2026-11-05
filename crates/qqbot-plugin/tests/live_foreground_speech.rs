@@ -115,11 +115,18 @@ impl ControlRunner for Runner {
             sink.emit(TurnEvent {
                 turn_id: Some(turn_id),
                 kind: TurnEventKind::ToolBatchStarted {
-                    calls: vec![ToolCall {
-                        id: "long-command".into(),
-                        name: "run_command".into(),
-                        arguments: json!({"program":"local-fixture"}),
-                    }],
+                    calls: vec![
+                        ToolCall {
+                            id: "fast-read".into(),
+                            name: "read_file".into(),
+                            arguments: json!({}),
+                        },
+                        ToolCall {
+                            id: "long-command".into(),
+                            name: "run_command".into(),
+                            arguments: json!({"program":"local-fixture"}),
+                        },
+                    ],
                 },
             })
             .await
@@ -129,6 +136,17 @@ impl ControlRunner for Runner {
             .arg("const fs=require('node:fs');setInterval(()=>{if(fs.existsSync(process.argv[1]))process.exit(0)},10)")
             .arg(self.directory.join("release-tool")).kill_on_drop(true).spawn().unwrap();
             self.observed.tool_running.store(true, Ordering::SeqCst);
+            // 替换执行器可先回快工具；长子进程仍在等，不能因此撤销交流机会。
+            sink.emit(TurnEvent {
+                turn_id: Some(turn_id),
+                kind: TurnEventKind::ToolResult {
+                    ordinal: 0,
+                    result: eve_llm_api::ToolResult::success("fast-read", json!({"read":true}))
+                        .unwrap(),
+                },
+            })
+            .await
+            .unwrap();
             std::fs::write(self.directory.join("tools-ready"), b"ready").unwrap();
             let status = tokio::time::timeout(Duration::from_secs(15), child.wait())
                 .await
@@ -139,7 +157,7 @@ impl ControlRunner for Runner {
             sink.emit(TurnEvent {
                 turn_id: Some(turn_id),
                 kind: TurnEventKind::ToolProgress {
-                    completed_calls: 1,
+                    completed_calls: 2,
                     failed_calls: 0,
                     tool_names: vec!["run_command".into()],
                 },
@@ -176,7 +194,7 @@ impl ControlRunner for Runner {
                 commit: CommitState::Completed,
                 text: Some("内部结束不得自动发出".into()),
                 transcript: Some(transcript),
-                started_tools: Some(1),
+                started_tools: Some(2),
                 tool_results: vec![],
                 failure: None,
             }

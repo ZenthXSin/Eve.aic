@@ -19,6 +19,7 @@ pub(super) struct Batch {
     version: u64,
     since: Instant,
     activity: String,
+    remaining: BTreeMap<String, String>,
 }
 
 #[derive(Default)]
@@ -53,12 +54,26 @@ impl ForegroundActivity {
                 version: state.version,
                 since: Instant::now(),
                 activity: activities(calls.iter().map(|c| c.name.as_str())),
+                remaining: calls
+                    .iter()
+                    .map(|call| (call.id.clone(), call.name.clone()))
+                    .collect(),
             };
             state.batches.insert(key, batch);
+        } else if let TurnEventKind::ToolResult { result, .. } = &event.event.kind {
+            // 替换 ControlRunner 可逐个回报；只有最后一个工具结果回来才结束整批活动。
+            if let Some(batch) = state.batches.get_mut(&key).filter(|batch| {
+                batch.key == event.key && event.event.turn_id == Some(batch.turn_id)
+            }) {
+                batch.remaining.remove(&result.call_id);
+                batch.activity = activities(batch.remaining.values().map(String::as_str));
+                if batch.remaining.is_empty() {
+                    state.batches.remove(&key);
+                }
+            }
         } else if matches!(
             event.event.kind,
             TurnEventKind::ToolBatchStarted { .. }
-                | TurnEventKind::ToolResult { .. }
                 | TurnEventKind::ToolProgress { .. }
                 | TurnEventKind::ProviderStarted { .. }
                 | TurnEventKind::ResponseCompleted { .. }
@@ -224,6 +239,52 @@ mod tests {
                 }],
             },
         ));
+        assert!(activity.current(&key, 3).is_none());
+    }
+
+    #[test]
+    fn individual_fast_result_preserves_pending_long_tool_and_ignores_foreign_call_ids() {
+        let activity = ForegroundActivity::default();
+        let key = GenerationKey {
+            session: SessionKey::new("session", "owner").unwrap(),
+            task_id: "task".into(),
+            controller_epoch: [1; 16],
+            generation: 1,
+        };
+        activity.observe(&event(
+            &key,
+            TurnEventKind::ToolBatchStarted {
+                calls: vec![
+                    ToolCall {
+                        id: "fast".into(),
+                        name: "read_file".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "slow".into(),
+                        name: "run_command".into(),
+                        arguments: json!({}),
+                    },
+                ],
+            },
+        ));
+        let version = activity.current(&key, 3).unwrap().version;
+        let result = |call: &str| TurnEventKind::ToolResult {
+            ordinal: 0,
+            result: eve_llm_api::ToolResult::success(call, json!({"done":true})).unwrap(),
+        };
+        activity.observe(&event(&key, result("foreign")));
+        assert_eq!(activity.current(&key, 3).unwrap().remaining.len(), 2);
+        activity.observe(&event(&key, result("fast")));
+        let current = activity.current(&key, 3).expect("长工具仍然在运行");
+        assert_eq!(current.version, version);
+        assert_eq!(current.remaining.len(), 1);
+        assert_eq!(current.activity, "命令执行");
+        let input = ForegroundInput::new(current, "while-slow".into());
+        assert_eq!(input.event.facts["activity"], "命令执行");
+        activity.observe(&event(&key, result("fast")));
+        assert!(activity.current(&key, 3).is_some());
+        activity.observe(&event(&key, result("slow")));
         assert!(activity.current(&key, 3).is_none());
     }
 }

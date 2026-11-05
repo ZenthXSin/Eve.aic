@@ -22,6 +22,10 @@ fn fingerprint(event: &QqSpeechEvent) -> String {
         digest.update(&(value.len() as u64).to_be_bytes());
         digest.update(value.as_bytes());
     }
+    // 通常来源版本已在 event.id 中；额外覆盖替换实现的事实更新，日志仍只出指纹。
+    let facts = event.facts.to_string();
+    digest.update(&(facts.len() as u64).to_be_bytes());
+    digest.update(facts.as_bytes());
     digest
         .finish()
         .as_ref()
@@ -177,6 +181,9 @@ mod tests {
         let mut newer = bad.clone();
         newer.anchor = "new-input".into();
         assert!(retries.eligible(&newer, now));
+        let mut updated = bad.clone();
+        updated.facts = json!({"text":"a new fact version"});
+        assert!(retries.eligible(&updated, now));
         let mut foreign = bad.clone();
         foreign.session.user_id = "another-user".into();
         assert!(retries.eligible(&foreign, now));
