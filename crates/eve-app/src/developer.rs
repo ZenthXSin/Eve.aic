@@ -135,6 +135,9 @@ pub(crate) fn install_with_member_runtime_backend_profile(
     if let Some(path) = std::env::var_os("EVE_DEVELOPER_CONFIG") {
         config.protected_paths.insert(std::fs::canonicalize(path)?);
     }
+    if let Some(path) = std::env::var_os("EVE_HOST_AUTONOMY_CONFIG") {
+        config.protected_paths.insert(std::fs::canonicalize(path)?);
+    }
     let token = std::env::var(&config.github_token_env).ok();
     if !config.github_write_repositories.is_empty()
         && token.as_ref().is_none_or(|v| v.trim().is_empty())

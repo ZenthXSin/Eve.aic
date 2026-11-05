@@ -297,7 +297,7 @@ impl SqliteIdleMemory {
             .map_err(corrupt)?
             .collect::<Result<_, _>>()
             .map_err(corrupt)?;
-        if versions != [1] {
+        if versions != [1] && versions != [2] {
             return Err(SubjectError::UnsupportedVersion);
         }
         let check: String = db
@@ -319,6 +319,22 @@ impl SqliteIdleMemory {
             .map_err(storage)?;
         db.pragma_update(None, "synchronous", "FULL")
             .map_err(storage)?;
+        // 先验证旧库，再原子迁移；无法读取的旧状态不能被版本迁移改写。
+        if versions == [1] {
+            db.execute_batch("BEGIN IMMEDIATE;
+                CREATE TABLE host_authorizations(scope TEXT PRIMARY KEY,authorization_id TEXT NOT NULL,digest TEXT NOT NULL,at_ms INTEGER NOT NULL);
+                CREATE TABLE autonomy_problems(scope TEXT NOT NULL,problem TEXT NOT NULL,focus TEXT NOT NULL,at_ms INTEGER NOT NULL,PRIMARY KEY(scope,problem));
+                CREATE TABLE reconciled_tasks(scope TEXT NOT NULL,task TEXT NOT NULL,outcome TEXT NOT NULL,at_ms INTEGER NOT NULL,PRIMARY KEY(scope,task,outcome));
+                UPDATE metadata SET version=2;
+                COMMIT;").map_err(storage)?;
+        }
+        for query in [
+            "SELECT scope,authorization_id,digest,at_ms FROM host_authorizations LIMIT 0",
+            "SELECT scope,problem,focus,at_ms FROM autonomy_problems LIMIT 0",
+            "SELECT scope,task,outcome,at_ms FROM reconciled_tasks LIMIT 0",
+        ] {
+            db.prepare(query).map_err(corrupt)?;
+        }
         if !marker_exists {
             let mut file = OpenOptions::new()
                 .create_new(true)
@@ -360,6 +376,145 @@ impl SqliteIdleMemory {
             self.healthy.store(false, Ordering::SeqCst);
         }
         result
+    }
+}
+
+impl AutonomyMemoryStore for SqliteIdleMemory {
+    fn host_authorization_seen(&self, scope: &SubjectScope) -> SubjectResult<bool> {
+        let key = scope_key(scope)?;
+        self.run(|db| {
+            let row: Option<(String, String, u64)> = db
+                .query_row(
+                    "SELECT authorization_id,digest,at_ms FROM host_authorizations WHERE scope=?1",
+                    [key],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .map_err(storage)?;
+            if let Some((id, digest, at)) = row {
+                if validate_id(&id).is_err()
+                    || digest.len() != 64
+                    || !digest.bytes().all(|b| b.is_ascii_hexdigit())
+                    || at == 0
+                {
+                    return Err(SubjectError::CorruptState);
+                }
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })
+    }
+    fn record_host_authorization(
+        &self,
+        scope: &SubjectScope,
+        id: &str,
+        digest: &str,
+        now: u64,
+    ) -> SubjectResult<()> {
+        validate_id(id)?;
+        if now == 0 || digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(SubjectError::InvalidInput);
+        }
+        let key = scope_key(scope)?;
+        let at = bounded_integer(now)?;
+        self.run(|db|{
+            let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(storage)?;
+            let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM host_authorizations WHERE scope=?1)",[&key],|r|r.get(0)).map_err(storage)?;
+            if exists {return Err(SubjectError::InvalidTransition);}
+            tx.execute("INSERT INTO host_authorizations(scope,authorization_id,digest,at_ms) VALUES(?1,?2,?3,?4)",params![key,id,digest,at]).map_err(storage)?;
+            tx.commit().map_err(storage)
+        })
+    }
+    fn problem_focus(&self, scope: &SubjectScope, problem: &str) -> SubjectResult<Option<String>> {
+        validate_id(problem)?;
+        let key = scope_key(scope)?;
+        self.run(|db| {
+            let row: Option<(String, u64)> = db
+                .query_row(
+                    "SELECT focus,at_ms FROM autonomy_problems WHERE scope=?1 AND problem=?2",
+                    params![key, problem],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(storage)?;
+            row.map(|(focus, at)| {
+                if validate_id(&focus).is_err() || at == 0 {
+                    Err(SubjectError::CorruptState)
+                } else {
+                    Ok(focus)
+                }
+            })
+            .transpose()
+        })
+    }
+    fn reserve_problem(
+        &self,
+        scope: &SubjectScope,
+        problem: &str,
+        focus: &str,
+        now: u64,
+    ) -> SubjectResult<()> {
+        validate_id(problem)?;
+        validate_id(focus)?;
+        if now == 0 {
+            return Err(SubjectError::InvalidInput);
+        }
+        let key = scope_key(scope)?;
+        let at = bounded_integer(now)?;
+        self.run(|db|{
+            let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(storage)?;
+            let old:Option<String>=tx.query_row("SELECT focus FROM autonomy_problems WHERE scope=?1 AND problem=?2",params![key,problem],|r|r.get(0)).optional().map_err(storage)?;
+            match old {
+                Some(old) if old!=focus=>return Err(SubjectError::InvalidTransition),
+                Some(_)=>{},
+                None=>{tx.execute("INSERT INTO autonomy_problems(scope,problem,focus,at_ms) VALUES(?1,?2,?3,?4)",params![key,problem,focus,at]).map_err(storage)?;}
+            }
+            tx.commit().map_err(storage)
+        })
+    }
+    fn task_reconciled(
+        &self,
+        scope: &SubjectScope,
+        task: &str,
+        outcome: &str,
+    ) -> SubjectResult<bool> {
+        validate_id(task)?;
+        validate_id(outcome)?;
+        let key = scope_key(scope)?;
+        self.run(|db| {
+            let at: Option<u64> = db
+                .query_row(
+                    "SELECT at_ms FROM reconciled_tasks WHERE scope=?1 AND task=?2 AND outcome=?3",
+                    params![key, task, outcome],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(storage)?;
+            if at == Some(0) {
+                return Err(SubjectError::CorruptState);
+            }
+            Ok(at.is_some())
+        })
+    }
+    fn record_task_reconciled(
+        &self,
+        scope: &SubjectScope,
+        task: &str,
+        outcome: &str,
+        now: u64,
+    ) -> SubjectResult<()> {
+        validate_id(task)?;
+        validate_id(outcome)?;
+        if now == 0 {
+            return Err(SubjectError::InvalidInput);
+        }
+        let key = scope_key(scope)?;
+        let at = bounded_integer(now)?;
+        self.run(|db|{
+            db.execute("INSERT OR IGNORE INTO reconciled_tasks(scope,task,outcome,at_ms) VALUES(?1,?2,?3,?4)",params![key,task,outcome,at]).map_err(storage)?;
+            Ok(())
+        })
     }
 }
 
