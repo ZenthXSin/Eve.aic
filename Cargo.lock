@@ -677,6 +677,7 @@ name = "eve-developer-tools"
 version = "0.1.0"
 dependencies = [
  "eve-apply-patch",
+ "eve-command-policy",
  "eve-developer-api",
  "eve-llm-api",
  "reqwest",

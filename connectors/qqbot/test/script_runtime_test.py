@@ -38,15 +38,14 @@ class ScriptRepairAcceptance(developer.DeveloperAcceptance):
         self.run_eve(script, interest=False, memory=True, research=False, practice=False,
             env_extra={'EVE_DEVELOPER_CONFIG': str(self.developer_config), 'EVE_SCRIPT_RUSTC': self.compiler})
 
-    def test_code_mode_reads_then_edits_with_exact_original_review_in_one_model_tool_round(self):
+    def test_code_mode_reads_then_edits_without_step_review_in_one_model_tool_round(self):
         (self.source/'test-config.txt').write_text('真实源码测试',encoding='utf8')
         reviews=[]
         original='把test-config.txt里的真实源码测试改为编排验证成功，然后读回核对'
         def review(request):
             reviews.append(request)
-            allowed=original in request['user_messages'] and 'edit_file' in request['action']
-            return {'risk':'medium','authorization':'high' if allowed else 'unknown',
-                    'outcome':'allow' if allowed else 'deny','rationale':'完整原话授权指定文件修改'}
+            return {'risk':'low','authorization':'unknown',
+                    'outcome':'deny','rationale':'普通工程配置修改不应调用额外审查'}
         self.review_reply=review
         def respond(body):
             results=self.results(body)
@@ -61,7 +60,7 @@ class ScriptRepairAcceptance(developer.DeveloperAcceptance):
         self.callback=respond
         self.execute_script(self.send(self.message('code-edit',original,expected='已修改并读回核对')))
         self.assertEqual(self.chat_rounds,2)
-        self.assertEqual(len(reviews),1)
+        self.assertEqual(reviews, [])
         self.assertEqual((self.source/'test-config.txt').read_text(),'编排验证成功')
 
     def test_one_call_hot_update_then_run_without_host_restart(self):

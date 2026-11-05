@@ -36,6 +36,31 @@ fn context(user: &str) -> ToolExecutionContext {
         user_id: user.into(),
     }))
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn commands_default_to_one_cargo_job_or_inherit_the_trusted_host_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let backend = LocalDeveloper::new(config(root.path()), ledger.path().into(), None).unwrap();
+    let expected = std::env::var("CARGO_BUILD_JOBS").unwrap_or_else(|_| "1".into());
+    let result = backend
+        .execute(
+            DeveloperOperation::Command(CommandArguments {
+                program: "sh".into(),
+                args: vec!["-c".into(), "printf '%s' \"$CARGO_BUILD_JOBS\"".into()],
+                cwd: ".".into(),
+                timeout_ms: None,
+                owner_confirmed: false,
+            }),
+            context("owner"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["success"], true);
+    assert_eq!(result["stdout"], expected);
+}
+
 fn file(path: &str) -> FileArguments {
     FileArguments {
         path: path.into(),
@@ -1714,7 +1739,7 @@ async fn patch_adds_updates_moves_and_deletes_atomically_inside_the_workspace() 
 
 /// 测试用策略：脚本含 forbidden 为禁止，含 careful 为需确认。
 #[cfg(unix)]
-struct ScriptPolicy;
+pub(super) struct ScriptPolicy;
 #[cfg(unix)]
 impl eve_developer_api::CommandPolicy for ScriptPolicy {
     fn evaluate(&self, program: &str, args: &[String]) -> eve_developer_api::CommandEvaluation {
@@ -1740,10 +1765,10 @@ impl eve_developer_api::CommandPolicy for ScriptPolicy {
         }
     }
 }
-/// 命令策略：禁止的不执行，需确认的没有明确同意时不执行，同意后照常执行。
+/// 命令策略：明确禁止的不执行，具体危险要经过系统影响审查，模型自称确认无效。
 #[cfg(unix)]
 #[tokio::test]
-async fn command_policy_blocks_or_requires_confirmation_before_anything_runs() {
+async fn command_policy_blocks_or_reviews_concrete_danger_before_anything_runs() {
     let root = tempfile::tempdir().unwrap();
     let ledger = tempfile::tempdir().unwrap();
     let backend = LocalDeveloper::new(config(root.path()), ledger.path().into(), None)
@@ -1768,7 +1793,7 @@ async fn command_policy_blocks_or_requires_confirmation_before_anything_runs() {
         .await
         .unwrap_err();
     assert!(
-        format!("{error:?}").contains("owner_confirmed"),
+        format!("{error:?}").contains("系统安全审查器未配置"),
         "{error:?}"
     );
     assert!(!root.path().join("forbidden").exists() && !root.path().join("careful").exists());
@@ -1776,7 +1801,7 @@ async fn command_policy_blocks_or_requires_confirmation_before_anything_runs() {
         .execute(command("careful", true), context("owner"))
         .await
         .unwrap_err();
-    assert!(format!("{error:?}").contains("不能代替独立审核"));
+    assert!(format!("{error:?}").contains("具体危险尚未核对"));
     assert!(!root.path().join("careful").exists());
     backend
         .execute(command("plain", false), context("owner"))
@@ -1787,7 +1812,7 @@ async fn command_policy_blocks_or_requires_confirmation_before_anything_runs() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn action_reviewer_decides_prompt_commands_from_user_words_and_fails_closed() {
+async fn system_safety_review_checks_danger_without_a_step_authorization_requirement() {
     use eve_llm_api::{ChatMessage, ChatRole};
     use std::sync::Mutex;
     struct Reviewer {
@@ -1852,8 +1877,8 @@ async fn action_reviewer_decides_prompt_commands_from_user_words_and_fails_close
     let seen = allow.seen.lock().unwrap().pop().unwrap();
     assert_eq!(
         seen.user_messages,
-        vec![full_user_quote.clone()],
-        "完整保留用户原话"
+        Vec::<String>::new(),
+        "系统安全入口不重复逐步审核用户原话"
     );
     assert!(!seen.delegated && !seen.claimed_confirmation);
     assert!(
@@ -1863,7 +1888,21 @@ async fn action_reviewer_decides_prompt_commands_from_user_words_and_fails_close
     );
     assert_eq!(seen.policy_reason, "sh（测试规则）");
 
-    // 审查者同意但等级不够、审查者拒绝、审查失败：都不执行。
+    let curious = Arc::new(Reviewer {
+        verdict: verdict(ReviewRisk::Low, ReviewAuthorization::Unknown, true),
+        seen: Mutex::new(vec![]),
+    });
+    with(curious.clone())
+        .execute(
+            command("careful-curiosity"),
+            context("owner").with_delegated(true),
+        )
+        .await
+        .unwrap();
+    assert!(root.path().join("careful-curiosity").exists());
+    assert!(curious.seen.lock().unwrap()[0].user_messages.is_empty());
+
+    // 具体高风险、审查拒绝或服务失败不执行；授权不能消除直接危害。
     for (name, reviewer_verdict) in [
         (
             "careful-high-risk",
@@ -1899,7 +1938,7 @@ async fn action_reviewer_decides_prompt_commands_from_user_words_and_fails_close
     assert!(format!("{error:?}").contains("未放行"), "{error:?}");
     let seen = delegated.seen.lock().unwrap().pop().unwrap();
     assert!(seen.delegated);
-    assert_eq!(seen.user_messages, vec![full_user_quote.clone()]);
+    assert!(seen.user_messages.is_empty());
 
     // 不需要确认的命令不经过审查；禁止的命令也不交给审查者放行。
     let untouched = Arc::new(Reviewer {
@@ -1919,7 +1958,7 @@ async fn action_reviewer_decides_prompt_commands_from_user_words_and_fails_close
 }
 
 #[test]
-fn review_preserves_six_long_quotes_and_complete_command_with_bounded_summaries() {
+fn safety_review_preserves_complete_action_but_does_not_repeat_user_history() {
     use eve_llm_api::{ChatMessage, ChatRole, ToolCall};
     let quotes: Vec<_> = (0..7)
         .map(|i| format!("原话{i}：{}结尾授权{i}", "完整正文".repeat(1200)))
@@ -1951,7 +1990,7 @@ fn review_preserves_six_long_quotes_and_complete_command_with_bounded_summaries(
         timeout_ms: None,
     };
     let request = review_request(&command, "审核".into(), &context).unwrap();
-    assert_eq!(request.user_messages, quotes[1..]);
+    assert!(request.user_messages.is_empty());
     assert_eq!(request.arguments, command.args);
     assert!(request.arguments[1].ends_with("git reset --hard"));
     assert!(request.action.chars().count() <= REVIEW_COMMAND_CHARS + 1);
@@ -1964,7 +2003,7 @@ fn review_preserves_six_long_quotes_and_complete_command_with_bounded_summaries(
     );
     assert!(request.validate_capacity().is_ok());
     let delegated = review_request(&command, "审核".into(), &context.with_delegated(true)).unwrap();
-    assert_eq!(delegated.user_messages, quotes[1..]);
+    assert!(delegated.user_messages.is_empty());
 }
 
 #[cfg(unix)]
@@ -2001,7 +2040,19 @@ async fn review_overflow_and_audit_failure_never_execute_a_command() {
     let too_long = Arc::new(vec!["长".repeat(MAX_ACTION_REVIEW_BYTES)]);
     let error = backend
         .execute(
-            operation(),
+            DeveloperOperation::Command(CommandArguments {
+                program: "sh".into(),
+                args: vec![
+                    "-c".into(),
+                    format!(
+                        "touch careful-never; #{}",
+                        "x".repeat(MAX_ACTION_REVIEW_BYTES)
+                    ),
+                ],
+                cwd: ".".into(),
+                timeout_ms: None,
+                owner_confirmed: false,
+            }),
             context("owner").with_review_user_messages(too_long),
         )
         .await
