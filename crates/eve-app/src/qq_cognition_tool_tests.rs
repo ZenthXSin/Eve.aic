@@ -38,12 +38,10 @@ fn context(call: &ToolCall) -> ToolExecutionContext {
 async fn own_goal_and_feedback_use_durable_version_and_do_not_complete_work() {
     let (kernel, commands, cognition) = commands().await;
     let dir = tempfile::tempdir().unwrap();
-    let reviewer = fixture::reviewer();
     let tool = tool(
         commands,
         Review {
             admin: fixture::admin(dir.path()),
-            reviewer: Some(reviewer.clone()),
         },
     );
     let create = fixture::call(
@@ -79,7 +77,14 @@ async fn own_goal_and_feedback_use_durable_version_and_do_not_complete_work() {
         .unwrap();
     assert_eq!(view["goal"], result["goal"]);
     assert!(view["draft"].is_null());
-    assert_eq!(reviewer.requests.lock().unwrap().len(), 2, "只读不送审");
+    assert_eq!(
+        fixture::ledger(dir.path())["audit"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "只读不增加变更记录"
+    );
     let other = fixture::context(&inspect, "other-administrator", vec!["查看对方目标".into()]);
     assert!(tool.execute(inspect.clone(), other).await.is_err());
     let feedback = fixture::call(
@@ -106,15 +111,18 @@ async fn own_goal_and_feedback_use_durable_version_and_do_not_complete_work() {
     );
     assert_eq!(cognition.snapshot().unwrap(), snapshot);
     assert_eq!(
-        reviewer.requests.lock().unwrap().len(),
+        fixture::ledger(dir.path())["audit"]
+            .as_array()
+            .unwrap()
+            .len(),
         3,
-        "旧版本不能再次送审或写入"
+        "旧版本不能再次记录或写入"
     );
     kernel.stop_all().await.unwrap();
 }
 
 #[tokio::test]
-async fn feedback_changed_while_reviewing_preserves_newer_fact() {
+async fn feedback_with_stale_revision_preserves_newer_fact() {
     let (kernel, commands, cognition) = commands().await;
     let dir = tempfile::tempdir().unwrap();
     let admin = fixture::admin(dir.path());
@@ -122,7 +130,6 @@ async fn feedback_changed_while_reviewing_preserves_newer_fact() {
         commands.clone(),
         Review {
             admin: admin.clone(),
-            reviewer: Some(fixture::reviewer()),
         },
     );
     let create = fixture::call(
@@ -136,10 +143,9 @@ async fn feedback_changed_while_reviewing_preserves_newer_fact() {
         .unwrap();
     let id = saved["goal"]["id"].as_str().unwrap().to_owned();
     let version = saved["goal"]["revision"].as_u64().unwrap();
-    let mut reviewer = fixture::reviewer();
-    let current = cognition.clone();
-    let changed_id = id.clone();
-    Arc::get_mut(&mut reviewer).unwrap().during = Some(Box::new(move || {
+    {
+        let current = cognition.clone();
+        let changed_id = id.clone();
         let service = UserGoalFeedback::new(
             Arc::new(current.clone()),
             "eve".into(),
@@ -157,14 +163,8 @@ async fn feedback_changed_while_reviewing_preserves_newer_fact() {
                 at_ms: 99,
             })
             .unwrap();
-    }));
-    let tool = tool(
-        commands,
-        Review {
-            admin,
-            reviewer: Some(reviewer),
-        },
-    );
+    }
+    let tool = tool(commands, Review { admin });
     let feedback = fixture::call(
         "manage_goal",
         "older-feedback",
@@ -195,18 +195,14 @@ async fn feedback_changed_while_reviewing_preserves_newer_fact() {
 }
 
 #[tokio::test]
-async fn stopping_service_during_review_does_not_create_goal() {
+async fn stopped_service_does_not_create_goal() {
     let (kernel, commands, cognition) = commands().await;
     let dir = tempfile::tempdir().unwrap();
-    let mut reviewer = fixture::reviewer();
-    let accepting = commands.accepting.clone();
-    Arc::get_mut(&mut reviewer).unwrap().during =
-        Some(Box::new(move || accepting.store(false, Ordering::SeqCst)));
+    commands.accepting.store(false, Ordering::SeqCst);
     let tool = tool(
         commands,
         Review {
             admin: fixture::admin(dir.path()),
-            reviewer: Some(reviewer),
         },
     );
     let create = fixture::call(

@@ -9,6 +9,8 @@ use std::{
 
 mod upgrade;
 pub use upgrade::*;
+mod credentials;
+pub use credentials::credential_path;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

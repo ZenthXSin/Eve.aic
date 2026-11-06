@@ -18,11 +18,6 @@ def review_input(body):
     return None
 
 
-def allow_review():
-    return tool_response([("submit_review", {"risk": "medium", "authorization": "high", "outcome": "allow",
-        "rationale": "固定审核器核对完整原话、动作和目标范围。"})])
-
-
 class NaturalGoalAcceptance(defaults.DefaultCapabilitiesAcceptance):
     for name in dir(defaults.DefaultCapabilitiesAcceptance):
         if name.startswith("test_"):
@@ -32,28 +27,16 @@ class NaturalGoalAcceptance(defaults.DefaultCapabilitiesAcceptance):
     def goals(self):
         return self.documents().get("eve.cognition", {}).get("cognition.v1", {}).get("state", {}).get("goals", {})
 
-    def test_default_chat_create_feedback_and_restart_keep_actual_goal_and_raw_review(self):
+    def test_default_chat_create_feedback_and_restart_keep_actual_goal_without_review(self):
         words = ["安排一次出行。", "先保留沿途路线。", "资料：" + "出发前检查天气。" * 500 + "尾部完整保留。",
                  "还需要明确到达时间。", "暂时保存待办，现实准备尚未完成。", "请记下一件待办：整理出行计划。"]
         feedback = "补充刚才的待办：出发时间改成上午九点。"
         stale = "再检查之前那条旧版本反馈有没有覆盖新时间。"
         inspect = "重启后查看刚才的出行待办和反思。"
-        reviews, replies = [], {}
+        replies = {}
 
         def respond(body):
-            request = review_input(body)
-            if request:
-                self.assertEqual([entry["function"]["name"] for entry in body["tools"]], ["submit_review"])
-                self.assertEqual(request["program"], "eve.manage_goal")
-                expected = words if not reviews else words[1:] + [feedback]
-                self.assertEqual(request["user_messages"], expected)
-                operation = json.loads(request["arguments"][0])
-                self.assertEqual(operation["operation"]["arguments"]["action"], "create" if not reviews else "feedback")
-                self.assertTrue(operation["call_id"])
-                self.assertGreater(operation["turn_id"], 0)
-                self.assertFalse(request["delegated"])
-                reviews.append(request)
-                return allow_review()
+            self.assertIsNone(review_input(body), "普通待办无需模型审查")
             current = self.text(body)
             results = self.results(body)
             if current in words[:-1]:
@@ -100,14 +83,23 @@ class NaturalGoalAcceptance(defaults.DefaultCapabilitiesAcceptance):
         self.run_default(script)
         goal = replies["updated"]["goal"]
         self.assertEqual(self.goals()[goal["id"]], goal)
-        self.assertEqual(len(reviews), 2)
+        self.assertFalse(any(review_input(request["body"]) for request in self.requests))
         audit_path = self.state / "business-permissions.json"
         before = audit_path.read_bytes()
         audit = json.loads(before)["audit"]
         self.assertEqual(len(audit), 2)
-        for record, request in zip(audit, reviews):
-            self.assertEqual(record["outcome"], "review_allowed")
-            self.assertEqual(json.loads(record["target"]), request)
+        for record, action in zip(audit, ["create", "feedback"]):
+            self.assertEqual(record["outcome"], "host_authorized")
+            self.assertEqual(record["user_messages"], [])
+            self.assertIsNone(record["verdict"])
+            operation = json.loads(record["target"])
+            self.assertEqual(operation["tool"], "manage_goal")
+            self.assertEqual(operation["operation"]["arguments"]["action"], action)
+            self.assertEqual(operation["trusted_scope"], record["scope"])
+            self.assertEqual(operation["turn_id"], record["turn_id"])
+            self.assertTrue(operation["call_id"])
+            self.assertFalse(operation["delegated"])
+        self.assertEqual(json.loads(before)["grants"], {})
         # 已有平台回执阻止整段消息重放；新的查询由真实宿主读取同一待办。
         replay = []
         for step in script:
@@ -116,7 +108,7 @@ class NaturalGoalAcceptance(defaults.DefaultCapabilitiesAcceptance):
                 replay.append({"send": message})
                 replay.append({"wait_command": {"id": message["id"], "type": "finish"}})
         self.run_default(replay + self.send("natural-inspect", inspect, "原待办和九点出发的反馈都还在。"))
-        self.assertEqual(len(reviews), 2)
+        self.assertFalse(any(review_input(request["body"]) for request in self.requests))
         self.assertEqual(audit_path.read_bytes(), before)
         self.assertEqual(self.goals()[goal["id"]], goal)
 
@@ -137,23 +129,10 @@ class NaturalPlanAcceptance(plan_test.PlanAcceptance):
         propose = "给刚才的模组待办拟一个先查资料再运行验证的计划，先展示步骤。"
         inspect = "查看这份计划的全部步骤和目前状态。"
         confirm = "确认刚才展示的步骤：先查官方资料，再实际运行最小模组验证。"
-        reviews, observed = [], {}
+        observed = {}
 
         def respond(body):
-            request = review_input(body)
-            if request:
-                self.assertFalse(request["delegated"])
-                action = json.loads(request["arguments"][0])["operation"]
-                self.assertIn(request["program"], ["eve.manage_goal", "eve.manage_plan"])
-                if action["arguments"]["action"] == "confirm":
-                    self.assertEqual(request["user_messages"], [create, propose, inspect, confirm])
-                    plan = action["plan"]
-                    self.assertEqual(plan["status"], "proposed")
-                    self.assertEqual([step["spec"]["capability"] for step in plan["steps"]], [plan_test.RESEARCH, plan_test.PRACTICE])
-                    self.assertEqual(plan["steps"][1]["spec"]["depends_on"], ["learn"])
-                    self.assertEqual(action["goal"]["description"], plan_test.GOAL)
-                reviews.append(request)
-                return allow_review()
+            self.assertIsNone(review_input(body), "普通计划无需模型审查")
             messages = body["messages"]
             current_index = max(i for i, message in enumerate(messages) if message["role"] == "user")
             current = messages[current_index]["content"]
@@ -208,12 +187,33 @@ class NaturalPlanAcceptance(plan_test.PlanAcceptance):
         self.assertEqual(plan["steps"][1]["attempts"][0]["evidence"]["source_id"], practice["id"])
         self.assertGreaterEqual(practice["started_at_ms"], research["finished_at_ms"])
         self.assertEqual(self.user_goal()["status"], "Waiting")
-        self.assertEqual(len(reviews), 3)
+        self.assertEqual(self.kind("review"), [])
+        audit_path = self.work / "state/business-permissions.json"
+        business_before = audit_path.read_bytes()
+        audit = json.loads(business_before)["audit"]
+        self.assertEqual(len(audit), 3)
+        self.assertTrue(all(record["outcome"] == "host_authorized" for record in audit))
+        self.assertTrue(all(record["user_messages"] == [] and record["verdict"] is None for record in audit))
+        record = audit[-1]
+        saved = json.loads(record["target"])
+        action = saved["operation"]
+        self.assertEqual(saved["trusted_scope"], record["scope"])
+        self.assertEqual(saved["turn_id"], record["turn_id"])
+        self.assertTrue(saved["call_id"])
+        self.assertEqual(action["arguments"]["action"], "confirm")
+        self.assertEqual(action["plan"]["id"], plan["id"])
+        self.assertEqual(action["plan"]["status"], "proposed")
+        self.assertEqual([step["spec"]["capability"] for step in action["plan"]["steps"]],
+                         [plan_test.RESEARCH, plan_test.PRACTICE])
+        self.assertEqual(action["plan"]["steps"][1]["spec"]["depends_on"], ["learn"])
+        self.assertEqual(action["goal"]["description"], plan_test.GOAL)
+        self.assertEqual(json.loads(business_before)["grants"], {})
         before = self.ledger(), len(self.launches()), len(self.kind("plan")), len(self.kind("draft"))
         self.inspect_run(self.quiet, prefix=self.send(self.message("natural-plan-restart", inspect,
             expected="原计划的研究和运行验证均有结果。")))
         self.assertEqual((self.ledger(), len(self.launches()), len(self.kind("plan")), len(self.kind("draft"))), before)
-        self.assertEqual(len(reviews), 3)
+        self.assertEqual(audit_path.read_bytes(), business_before)
+        self.assertEqual(self.kind("review"), [])
 
 
 if __name__ == "__main__":

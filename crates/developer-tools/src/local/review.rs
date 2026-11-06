@@ -1,59 +1,7 @@
 //! 开发动作只在命中具体系统危险时审查；普通操作不以目标或逐步用户授权为门槛。
 use super::*;
 
-pub(super) fn credential_path(path: &str) -> bool {
-    let path = Path::new(path);
-    if [
-        ".docker/config.json",
-        ".kube/config",
-        ".config/gh/hosts.yml",
-        ".composer/auth.json",
-        ".config/composer/auth.json",
-    ]
-    .iter()
-    .any(|suffix| path.ends_with(suffix))
-    {
-        return true;
-    }
-    path.components().any(|part| match part {
-        Component::Normal(name) => {
-            let name = name.to_string_lossy().to_ascii_lowercase();
-            name == ".env"
-                || name.starts_with(".env.")
-                || matches!(
-                    name.as_str(),
-                    "private"
-                        | ".ssh"
-                        | ".aws"
-                        | ".gnupg"
-                        | ".netrc"
-                        | ".npmrc"
-                        | ".pgpass"
-                        | "id_rsa"
-                        | "id_ed25519"
-                        | "business-permissions.json"
-                        | "business-permissions.initialized"
-                        | "business-permissions.failed"
-                        | "admin-bindings.json"
-                )
-                || matches!(
-                    name.as_str(),
-                    "secret" | "secrets" | "credential" | "credentials"
-                )
-                || ((name.contains("secret") || name.contains("credential"))
-                    && Path::new(&name)
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| {
-                            matches!(extension, "json" | "toml" | "yaml" | "yml" | "ini" | "txt")
-                        }))
-                || name.ends_with(".pem")
-                || name.ends_with(".key")
-                || name.ends_with(".p12")
-        }
-        _ => false,
-    })
-}
+pub(super) use eve_developer_api::credential_path;
 
 /// 路径已由宿主绑定；只审查操作系统、服务状态与启动配置，普通工程配置不额外送审。
 fn sensitive_write(path: &str) -> bool {
@@ -408,6 +356,12 @@ mod tests {
         for path in [
             "src/credentials.rs",
             "src/secret_parser.rs",
+            "src/credentials/mod.rs",
+            "tests/secrets/parser.rs",
+            "src/credentials",
+            "tests/secrets",
+            "src/credential_schema.json",
+            "docs/secret-handling.txt",
             "docs/secret-handling.md",
             "policy.json",
             "Cargo.toml",
@@ -434,6 +388,7 @@ mod tests {
             ".config/gh/hosts.yml",
             ".composer/auth.json",
             ".config/composer/auth.json",
+            "/run/secrets/service-token",
         ] {
             assert!(credential_path(path), "{path}");
         }

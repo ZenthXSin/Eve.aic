@@ -236,6 +236,10 @@ async fn ordinary_source_access_reads_edits_and_searches_without_filename_false_
         "src/config.rs",
         "src/credentials.rs",
         "src/secret_parser.rs",
+        "src/credentials/mod.rs",
+        "tests/secrets/parser.rs",
+        "src/credential_schema.json",
+        "docs/secret-handling.txt",
         "fixtures/hosts.yml",
         "src/auth.json",
     ];
