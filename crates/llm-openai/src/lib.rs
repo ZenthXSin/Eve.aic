@@ -418,18 +418,24 @@ impl OpenAiProvider {
                 .then_some(&discard as &dyn ModelTextSink)
         });
         let body = self.request_body(request, sink.is_some(), json_output)?;
+        let mut diagnostics =
+            timing::CallDiagnostics::start(self.usage.as_ref().map(|(_, role)| role.as_str()));
         let total = self.total_timeout(sink.is_some());
         let started = std::time::Instant::now();
         let deadline = tokio::time::Instant::now() + total;
         let completed = tokio::time::timeout_at(deadline, async {
             if self.transient_retries && complete {
-                self.request_retried(&body, &headers, sink, deadline).await
+                self.request_retried(&body, &headers, sink, deadline, &mut diagnostics)
+                    .await
             } else {
-                self.request_once(&body, &headers, sink, &mut None).await
+                self.request_once(&body, &headers, sink, &mut None, diagnostics.next_attempt())
+                    .await
             }
         })
-        .await
-        .map_err(|_| timeouts::expired("total", total, started, None))??;
+        .await;
+        let completed = completed.map_err(|_| {
+            timeouts::expired("total", total, started, None, diagnostics.identity())
+        })??;
         // 模型结果已经完整校验并离开重试范围。统计尾流不得把成功变成失败；
         // 由持有结果的这一层处理原总期限，避免外层 timeout 丢弃已完成结果。
         let (response, usage) = completed.finish(deadline).await;
@@ -495,8 +501,9 @@ impl OpenAiProvider {
         headers: &reqwest::header::HeaderMap,
         sink: Option<&dyn ModelTextSink>,
         retry_after: &mut Option<Duration>,
+        identity: timing::RequestIdentity,
     ) -> Result<completion::CompletedRequest, LlmError> {
-        let mut timing = timing::RequestTiming::start(self.timing_diagnostics);
+        let mut timing = timing::RequestTiming::start(self.timing_diagnostics, identity);
         let started = std::time::Instant::now();
         let policy = sink.and(self.stream_timeouts);
         let first_deadline = tokio::time::Instant::now()
@@ -512,12 +519,23 @@ impl OpenAiProvider {
             tokio::time::timeout_at(first_deadline, sending)
                 .await
                 .map_err(|_| {
-                    timeouts::expired("first_response", policy.first_response, started, Some(0))
+                    timeouts::expired(
+                        "first_response",
+                        policy.first_response,
+                        started,
+                        Some(0),
+                        identity,
+                    )
                 })?
         } else {
             sending.await
         }
-        .map_err(transport_error)?;
+        .map_err(|error| {
+            if let Some(timing) = &timing {
+                timing.transport_failed(timing::TransportPhase::BeforeHeaders, &error);
+            }
+            transport_error(error)
+        })?;
         let status = response.status();
         if let Some(timing) = &timing {
             timing.record("headers", Some(status.as_u16()));
@@ -574,18 +592,22 @@ impl OpenAiProvider {
                             } else {
                                 ("stream_idle", policy.idle)
                             };
-                            timeouts::expired(phase, limit, started, Some(received))
+                            timeouts::expired(phase, limit, started, Some(received), identity)
                         })?
                 } else {
                     response.chunk().await
                 };
                 let Some(chunk) = next.map_err(|error| {
+                    if let Some(timing) = &timing {
+                        timing.transport_failed(timing::TransportPhase::StreamBody, &error);
+                    }
                     if error.is_timeout() {
                         timeouts::expired(
                             "total",
                             self.total_timeout(true),
                             started,
                             Some(received),
+                            identity,
                         )
                     } else {
                         transport_error(error)
@@ -664,7 +686,12 @@ impl OpenAiProvider {
             return Err(LlmError::Protocol("模型流在正常终态前结束".into()));
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            if let Some(timing) = &timing {
+                timing.transport_failed(timing::TransportPhase::ResponseBody, &error);
+            }
+            transport_error(error)
+        })? {
             if chunk.len() > self.config.max_response_bytes - bytes.len() {
                 return Err(failed(ProviderFailureKind::ResponseTooLarge));
             }
