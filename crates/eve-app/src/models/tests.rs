@@ -668,6 +668,17 @@ async fn role_gates_share_configuration_identity_isolate_roles_and_do_not_pin_un
     assert!(Arc::ptr_eq(&a, &same));
     let other_config = gate(&second.settings, ModelRole::AuxiliarySmall, 2, 0).unwrap();
     let other_role = gate(&first.settings, ModelRole::Primary, 5, 0).unwrap();
+    let jev = gate(&first.settings, ModelRole::Jev, 32, 0).unwrap();
+    let same_jev = gate(&first.settings.clone(), ModelRole::Jev, 32, 0).unwrap();
+    assert!(Arc::ptr_eq(&jev, &same_jev));
+    assert_eq!(jev.status().unwrap().limit, 32);
+    assert!(!Arc::ptr_eq(&jev, &other_role));
+    assert!(!Arc::ptr_eq(
+        &jev,
+        &gate(&second.settings, ModelRole::Jev, 32, 0).unwrap()
+    ));
+    assert!(gate(&first.settings, ModelRole::Jev, 33, 1).is_err());
+    assert_eq!(jev.status().unwrap().limit, 32);
     let total = crate::model_concurrency::global(&first.settings).unwrap();
     let same_total = crate::model_concurrency::global(&first.settings.clone()).unwrap();
     assert!(Arc::ptr_eq(&total, &same_total));

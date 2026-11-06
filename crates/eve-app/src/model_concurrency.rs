@@ -1,4 +1,4 @@
-//! 核心模型角色的并发通道按配置服务身份共享，不能让不同用途各领一份并发。
+//! 模型角色的并发通道按配置服务身份共享，不能让用途或热配置各领一份并发。
 use eve_config_api::{ConfigService, ModelRole};
 use eve_llm_api::LlmError;
 use eve_model_concurrency::ConcurrencyGate;
@@ -8,6 +8,7 @@ struct Scope {
     settings: Weak<dyn ConfigService>,
     primary: Weak<ConcurrencyGate>,
     auxiliary: Weak<ConcurrencyGate>,
+    jev: Weak<ConcurrencyGate>,
     global: Weak<ConcurrencyGate>,
 }
 static SCOPES: Mutex<Vec<Scope>> = Mutex::new(Vec::new());
@@ -27,6 +28,7 @@ pub(crate) fn status(
         .and_then(|scope| match role {
             ModelRole::Primary => scope.primary.upgrade(),
             ModelRole::AuxiliarySmall => scope.auxiliary.upgrade(),
+            ModelRole::Jev => scope.jev.upgrade(),
             _ => None,
         });
     drop(scopes);
@@ -39,7 +41,13 @@ pub(crate) fn gate(
     limit: usize,
     revision: u64,
 ) -> Result<Arc<ConcurrencyGate>, LlmError> {
-    let limit = limit.min(5);
+    let limit = match role {
+        ModelRole::Primary | ModelRole::AuxiliarySmall => limit.min(5),
+        ModelRole::Jev if (1..=32).contains(&limit) => limit,
+        _ => {
+            return Err(LlmError::Configuration("模型并发角色或上限无效".into()));
+        }
+    };
     let mut scopes = SCOPES
         .lock()
         .map_err(|_| LlmError::Backend("模型并发目录不可用".into()))?;
@@ -55,6 +63,7 @@ pub(crate) fn gate(
             settings: identity,
             primary: Weak::new(),
             auxiliary: Weak::new(),
+            jev: Weak::new(),
             global: Weak::new(),
         });
         scopes.len() - 1
@@ -62,9 +71,10 @@ pub(crate) fn gate(
     let slot = match role {
         ModelRole::Primary => &mut scopes[index].primary,
         ModelRole::AuxiliarySmall => &mut scopes[index].auxiliary,
+        ModelRole::Jev => &mut scopes[index].jev,
         _ => {
             return Err(LlmError::Configuration(
-                "此并发通道只接受主/辅对话模型角色".into(),
+                "此并发通道只接受主/辅对话或 Jev 模型角色".into(),
             ));
         }
     };
@@ -94,6 +104,7 @@ pub(crate) fn global(settings: &Arc<dyn ConfigService>) -> Result<Arc<Concurrenc
             settings: identity,
             primary: Weak::new(),
             auxiliary: Weak::new(),
+            jev: Weak::new(),
             global: Weak::new(),
         });
         scopes.len() - 1
