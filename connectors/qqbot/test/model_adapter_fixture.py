@@ -121,6 +121,7 @@ class WireAcceptance(memory_test.MemoryAcceptance):
                 self.send_error(404)
 
             def do_POST(self):
+                captured = None
                 try:
                     length = int(self.headers["Content-Length"])
                     assert 0 < length <= 8 * 1024 * 1024
@@ -146,6 +147,17 @@ class WireAcceptance(memory_test.MemoryAcceptance):
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 except Exception:
+                    if captured is not None:
+                        body = captured["body"]
+                        system = next((content_text(item) for item in items(body)
+                                       if item.get("role") == "system"),
+                                      body.get("instructions", ""))
+                        # 只输出合成夹具的请求形状与系统提示开头，不输出 HTTP 凭据。
+                        outer.errors.append(json.dumps({
+                            "path": captured["path"], "model": body.get("model"),
+                            "tool_count": len(body.get("tools", [])),
+                            "system_prefix": system[:160].replace(MODEL_KEY, "[fixture-key]"),
+                        }, ensure_ascii=False))
                     outer.errors.append(traceback.format_exc())
                     self.send_error(500)
 
@@ -168,6 +180,8 @@ class WireAcceptance(memory_test.MemoryAcceptance):
             "EVE_MODELS_PRIMARY_CREDENTIAL_REF": "env:EVE_OPENAI_API_KEY",
             "EVE_OPENAI_REASONING_EFFORT": "high",
             "EVE_LLM_RESPONSE_MODE": "complete",
+            # 本组逐条核对主对话往返；后台摘要的独立请求由 history_digest_test 验收。
+            "EVE_HISTORY_DIGEST_ENABLED": "false",
             "EVE_CONTEXT_ADAPTIVE_LIMIT_TOKENS": "0",
             "EVE_CONTEXT_COMPACT_AT_TOKENS": "0",
         }
