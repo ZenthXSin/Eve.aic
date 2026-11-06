@@ -3,7 +3,7 @@ use eve_interest_api::{
     MAX_OUTPUT_BYTES, ObservationBatch, ObservationFailure, validate_updates,
 };
 use eve_llm_api::{ChatMessage, ChatRole, LlmError, LlmModelResolver, ModelRequest, ModelResponse};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 
 pub const OBSERVER_VERSION: &str = "interest-observer:v1";
@@ -27,6 +27,30 @@ impl ModelInterestObserver {
     }
 }
 
+// 只调整发给模型的字段顺序；持久化批次的形状和值保持原样。
+// 原始证据先于已学兴趣和每批变化的编号、时间，避免元数据打断证据前缀。
+#[derive(Serialize)]
+struct PromptBatch<'a> {
+    scope: &'a eve_memory_api::MemoryScope,
+    observer_version: &'a str,
+    evidence: &'a [eve_memory_api::InteractionEvidence],
+    known_interests: &'a [eve_interest_api::KnownInterest],
+    id: &'a str,
+    started_at_ms: u64,
+}
+
+fn prompt_batch(batch: &ObservationBatch) -> InterestResult<String> {
+    serde_json::to_string(&PromptBatch {
+        scope: &batch.scope,
+        observer_version: &batch.observer_version,
+        evidence: &batch.evidence,
+        known_interests: &batch.known_interests,
+        id: &batch.id,
+        started_at_ms: batch.started_at_ms,
+    })
+    .map_err(|_| InterestError::InvalidInput)
+}
+
 impl InterestObserver for ModelInterestObserver {
     fn version(&self) -> &str {
         OBSERVER_VERSION
@@ -38,7 +62,7 @@ impl InterestObserver for ModelInterestObserver {
                 return Err(InterestError::InvalidInput);
             }
             batch.validate()?;
-            let input = serde_json::to_string(&batch).map_err(|_| InterestError::InvalidInput)?;
+            let input = prompt_batch(&batch)?;
             let request = ModelRequest {
                 session: Some(
                     eve_llm_api::ModelSession::scoped(

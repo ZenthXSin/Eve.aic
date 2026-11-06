@@ -2,8 +2,10 @@
 use eve_llm_api::{ChatMessage, ChatRole, LlmError, LlmModelResolver, ModelRequest, ModelResponse};
 use eve_practice_api::{
     DraftRequest, MAX_DRAFT_OUTPUT_BYTES, PracticeDraft, PracticeDrafter, PracticeError,
-    PracticeFailure, PracticeFuture, PracticeResult, validate_draft,
+    PracticeFailure, PracticeFuture, PracticeGuidance, PracticeResult, PracticeTask,
+    PreviousAttempt, RunnerProfile, validate_draft,
 };
+use serde::Serialize;
 use std::{sync::Arc, time::Duration};
 
 pub const DRAFTER_VERSION: &str = "practice-drafter:v3";
@@ -31,6 +33,33 @@ impl ModelPracticeDrafter {
     }
 }
 
+// 只改变模型提示的字段顺序，保留公开请求和持久化格式。
+// 同一实践的任务、运行器与历史建议先于每次变化的尝试次数和上次结果。
+#[derive(Serialize)]
+struct PromptRequest<'a> {
+    run_id: &'a str,
+    drafter_version: &'a str,
+    task: &'a PracticeTask,
+    runner: &'a RunnerProfile,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guidance: Option<&'a PracticeGuidance>,
+    attempt: usize,
+    previous: Option<&'a PreviousAttempt>,
+}
+
+fn prompt_request(request: &DraftRequest) -> PracticeResult<String> {
+    serde_json::to_string(&PromptRequest {
+        run_id: &request.run_id,
+        drafter_version: &request.drafter_version,
+        task: &request.task,
+        runner: &request.runner,
+        guidance: request.guidance.as_ref(),
+        attempt: request.attempt,
+        previous: request.previous.as_ref(),
+    })
+    .map_err(|_| PracticeError::InvalidInput)
+}
+
 impl PracticeDrafter for ModelPracticeDrafter {
     fn version(&self) -> &str {
         DRAFTER_VERSION
@@ -50,7 +79,7 @@ impl PracticeDrafter for ModelPracticeDrafter {
             if let Some(guidance) = &request.guidance {
                 guidance.validate(&request.runner)?;
             }
-            let input = serde_json::to_string(&request).map_err(|_| PracticeError::InvalidInput)?;
+            let input = prompt_request(&request)?;
             let model_request = ModelRequest {
                 session: Some(
                     eve_llm_api::ModelSession::owned(

@@ -5,13 +5,16 @@ export const INGRESS_REJECTION_REASONS = Object.freeze([
   "target_id", "content_type", "content_bytes", "c2c_target", "group_target",
   "normalized_text_empty", "normalized_text_bytes",
 ]);
+export const ATTACHMENT_REJECTION_REASONS = Object.freeze([
+  "invalid_shape", "unsupported_type", "invalid_url", "quoted", "element_not_selected", "duplicate", "limit",
+]);
 const increment = value => Math.min(Number.MAX_SAFE_INTEGER, value + 1);
 const valueType = value => value === null ? "null" : Array.isArray(value) ? "array" :
   ["undefined", "string", "number", "boolean", "object"].includes(typeof value) ? typeof value : "other";
 const bytes = value => typeof value === "string" ? Buffer.byteLength(value) : null;
 const count = value => Array.isArray(value) ? value.length : null;
 
-function shape(msg, attachments, text) {
+function shape(msg, attachments, text, attachmentRejections) {
   const target = msg.replyTarget;
   const elements = msg.msg_elements ?? msg.msgElements;
   const sample = {
@@ -36,6 +39,12 @@ function shape(msg, attachments, text) {
     sample[`${name}_type`] = valueType(value);
     sample[`${name}_bytes`] = bytes(value);
   }
+  const rejections = {};
+  for (const reason of ATTACHMENT_REJECTION_REASONS) {
+    const value = attachmentRejections?.[reason];
+    if (Number.isSafeInteger(value) && value > 0) rejections[reason] = value;
+  }
+  if (Object.keys(rejections).length) sample.attachment_rejections = rejections;
   return sample;
 }
 
@@ -57,7 +66,7 @@ export function createIngressDiagnostics(emit, now, timers = {}) {
     state.reportedAt = at;
   }
   return {
-    reject(reason, msg, attachments, text) {
+    reject(reason, msg, attachments, text, attachmentRejections) {
       if (closed || !INGRESS_REJECTION_REASONS.includes(reason)) return;
       let state = reasons.get(reason);
       if (!state) {
@@ -67,7 +76,7 @@ export function createIngressDiagnostics(emit, now, timers = {}) {
       state.saturated ||= state.total === Number.MAX_SAFE_INTEGER;
       state.count = increment(state.count);
       state.total = increment(state.total);
-      state.last = shape(msg, attachments, text);
+      state.last = shape(msg, attachments, text, attachmentRejections);
       const elapsed = Math.max(0, now() - state.reportedAt);
       if (state.total === 1 || elapsed >= INGRESS_REPORT_INTERVAL_MS) {
         if (state.timer !== null) unschedule(state.timer);

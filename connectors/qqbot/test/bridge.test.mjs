@@ -49,6 +49,82 @@ async function within(promise) {
 }
 const line = frame => JSON.stringify({ version: 1, ...frame }) + "\n";
 
+const activityFrame = (index, text = "系统进度：正在等待回复生成，本轮处理尚未结束。") => ({
+  version:1, type:"progress", id:"in-1", index, text,
+  host_activity:true, explicit:false, proactive:false, based_on_message_id:"in-1",
+});
+
+test("系统进度使用原被动窗口并给正式答复留额度，不建立Eve表达窗口", async () => {
+  const f=fixture();f.message();
+  await f.bridge.command(activityFrame(0));
+  await f.bridge.command(activityFrame(1,"系统进度：已进入命令执行阶段，尚未收到全部工具结果。"));
+  await f.bridge.command({version:1,type:"progress",id:"in-1",index:2,
+    text:"这是已经核对的结果",explicit:true,based_on_message_id:"in-1"});
+  assert.deepEqual(f.sent.map(s=>s.target.msgId),["in-1","in-1","in-1"]);
+  assert.equal(f.frames.filter(x=>x.type==="delivery"&&x.progress&&x.ok).length,3);
+  await f.bridge.command({version:1,type:"finish",id:"in-1",keep_passive:true});
+  assert.equal(f.frames.at(-1).type,"passive_window");
+  assert.equal(f.frames.at(-1).remaining,1);
+  const quiet=fixture();quiet.message();
+  await quiet.bridge.command(activityFrame(0));
+  await quiet.bridge.command({version:1,type:"finish",id:"in-1",keep_passive:true});
+  assert.equal(quiet.frames.some(x=>x.type==="passive_window"),false);
+});
+
+test("系统进度在平台写出前被取消或更新输入作废", async () => {
+  for (const finish of [false,true]) {
+    const f=fixture();f.message();
+    const pending=f.bridge.command(activityFrame(0));
+    if (finish) await f.bridge.command({version:1,type:"finish",id:"in-1"});
+    else f.message("c2c","new-input");
+    await pending;
+    assert.deepEqual(f.sent,[]);
+    assert.equal(f.frames.at(-1).failure_kind,"stale_decision");
+  }
+});
+
+test("系统进度同一事实只尝试一次且不会转主动消息", async () => {
+  const f=fixture({fail:true});f.message();
+  await f.bridge.command(activityFrame(0));
+  assert.equal(f.frames.at(-1).ok,false);
+  await f.bridge.command(activityFrame(1));
+  assert.equal(f.sent.length,1);
+  assert.equal(f.frames.at(-1).failure_kind,"progress_rate_limit");
+  const invalid=fixture();invalid.message();
+  await invalid.bridge.command({...activityFrame(0),proactive:true});
+  assert.equal(invalid.sent.length,0);
+  // 接收时刻不能因等待或重试重置。
+  let now=0;const timed=fixture({now:()=>now});timed.message();now=PASSIVE_REPLY_WINDOW_MS;
+  await timed.bridge.command(activityFrame(0));
+  assert.equal(timed.sent.length,0);
+  assert.equal(timed.frames.at(-1).failure_kind,"passive_window_elapsed");
+});
+
+test("系统进度超时回执保持未知，晚到成功不能阻止随后正式发言", async () => {
+  const held=deferred(), timersPending=new Set();
+  const timers={setTimeout(callback){timersPending.add(callback);return callback;},clearTimeout(callback){timersPending.delete(callback);}};
+  const f=fixture({timers,hold(_target,text){if(text.startsWith("系统进度："))return held.promise;}});f.message();
+  const first=f.bridge.command(activityFrame(0));
+  await new Promise(setImmediate);
+  for(const callback of [...timersPending])callback();
+  await first;
+  assert.equal(f.frames.at(-1).failure_kind,"timeout");
+  await f.bridge.command({version:1,type:"progress",id:"in-1",index:1,
+    text:"Eve的正式结果",explicit:true,based_on_message_id:"in-1"});
+  assert.equal(f.frames.at(-1).ok,true);
+  held.resolve();await new Promise(setImmediate);
+  assert.equal(f.sent.length,2);
+  assert.equal(f.frames.filter(x=>x.type==="delivery"&&x.progress&&x.index===0).length,1);
+});
+
+test("群系统进度只占一个被动名额", async () => {
+  const f=fixture();f.message("group");
+  await f.bridge.command(activityFrame(0));
+  await f.bridge.command(activityFrame(1,"系统进度：已进入命令执行阶段，尚未收到全部工具结果。"));
+  assert.equal(f.sent.length,1);
+  assert.equal(f.frames.at(-1).failure_kind,"progress_rate_limit");
+});
+
 test("明确发送在实际 SDK 调用前被新输入作废",async()=>{
   const f=fixture();f.message();
   const pending=f.bridge.command({version:1,type:"progress",id:"in-1",index:0,text:"旧决定",explicit:true,based_on_message_id:"in-1"});

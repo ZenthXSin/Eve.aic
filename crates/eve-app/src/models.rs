@@ -490,6 +490,7 @@ impl LlmModelResolver for CoreModelResolver {
             &ProviderOptions {
                 streamed_completions: captured.streamed_completions,
                 transient_retries: captured.transient_retries,
+                recover_tool_arguments: role == "dialogue",
                 stream_timeouts,
                 timing_diagnostics: matches!(self.use_name.as_deref(), Some("dialogue" | "digest"))
                     && timing_enabled(),

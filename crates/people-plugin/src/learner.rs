@@ -2,7 +2,7 @@
 use eve_llm_api::{ChatMessage, ChatRole, LlmModelResolver, ModelRequest, ModelResponse};
 use eve_people_api::{ImpressionBatch, ImpressionDraft, ImpressionLearner, MAX_IMPRESSION_DRAFTS};
 use eve_plugin_api::{PluginError, PluginFuture};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 const MAX_OUTPUT_BYTES: usize = 4096;
@@ -32,15 +32,37 @@ fn failure(reason: &str) -> PluginError {
     PluginError::Task(format!("印象学习失败：{reason}"))
 }
 
+#[derive(Serialize)]
+struct PromptBatch<'a> {
+    messages: &'a [String],
+    known: Vec<KnownImpression<'a>>,
+}
+#[derive(Serialize)]
+struct KnownImpression<'a> {
+    id: &'a str,
+    text: &'a str,
+}
+
+fn prompt_batch(batch: &ImpressionBatch) -> Result<String, PluginError> {
+    // 原话先于会被新学习结果更新的已有印象，不由 JSON 对象的字母顺序决定。
+    serde_json::to_string(&PromptBatch {
+        messages: &batch.messages,
+        known: batch
+            .known
+            .iter()
+            .map(|item| KnownImpression {
+                id: &item.id,
+                text: &item.text,
+            })
+            .collect(),
+    })
+    .map_err(|_| failure("批次编码失败"))
+}
+
 impl ImpressionLearner for ModelImpressionLearner {
     fn learn(&self, batch: ImpressionBatch) -> PluginFuture<'_, Vec<ImpressionDraft>> {
         Box::pin(async move {
-            let known: Vec<_> = batch
-                .known
-                .iter()
-                .map(|i| serde_json::json!({"id": i.id, "text": i.text}))
-                .collect();
-            let input = serde_json::json!({"messages": batch.messages, "known": known}).to_string();
+            let input = prompt_batch(&batch)?;
             let request = ModelRequest {
                 session: Some(
                     eve_llm_api::ModelSession::anchored(
@@ -91,6 +113,34 @@ fn parse(text: &str) -> Result<Vec<ImpressionDraft>, PluginError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn learned_impressions_do_not_precede_unchanged_original_messages() {
+        let mut batch = ImpressionBatch {
+            id: "batch".into(),
+            participant: "participant".into(),
+            messages: vec!["最近在读一本书\n原话".into()],
+            known: vec![],
+        };
+        let first = prompt_batch(&batch).unwrap();
+        batch.known.push(eve_people_api::Impression {
+            id: "i-1".into(),
+            text: "最近在读书".into(),
+            quote: "最近在读一本书".into(),
+            updated_at_ms: 1,
+            reaffirmed: 0,
+            reaffirmed_at_ms: None,
+        });
+        let next = prompt_batch(&batch).unwrap();
+        let prefix = first.find(",\"known\":").unwrap();
+        assert_eq!(&first[..prefix], &next[..prefix]);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&next).unwrap(),
+            serde_json::json!({
+                "messages":batch.messages, "known":[{"id":"i-1","text":"最近在读书"}]
+            })
+        );
+    }
 
     /// 整理原则（借鉴 openai/codex 的记忆写入规则）：一次说的话不升级为长期喜好。
     #[test]

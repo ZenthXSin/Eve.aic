@@ -16,6 +16,7 @@ class DeferredReplyAcceptance(live.LiveToolAcceptance):
     del name
 
     def run_deferred(self, script, **options):
+        notifications = options.pop('failure_notifications', None)
         environment = {
             'EVE_DEFERRED_REPLY_ENABLED': 'true',
             'EVE_DEFERRED_REPLY_MAX_RETRIES': '3',
@@ -28,6 +29,8 @@ class DeferredReplyAcceptance(live.LiveToolAcceptance):
             'EVE_DEVELOPER_CONFIG': str(self.developer_config),
         }
         environment.update(options.pop('env_extra', {}))
+        if notifications is not None:
+            return self.run_live_failure(script, notifications, panel=True, env_extra=environment, **options)
         return self.run_live(script, panel=True, env_extra=environment, **options)
 
     def test_unavailable_service_then_full_reply_without_acknowledgement(self):
@@ -119,22 +122,28 @@ class DeferredReplyAcceptance(live.LiveToolAcceptance):
         self.assertEqual(len(self.kind('chat')), 3)
         self.assertEqual(self.turn('等到查清再回答')['status']['state'], 'Completed')
 
-    def test_retry_exhaustion_and_permanent_failure_preserve_failure_without_ack_or_new_task(self):
+    def test_retry_exhaustion_and_permanent_failure_send_system_notice_without_ack_or_new_task(self):
         self.http_status = lambda kind, number: 503 if kind == 'chat' else 200
-        self.run_deferred(self.send(self.message('exhausted', '暂时没好也不要乱回复')),
+        self.run_deferred(self.failed_send(self.failure_message('exhausted', '暂时没好也不要乱回复')),
+                          failure_notifications={'exhausted': 'Sent'},
                           more=['--background-tasks'], env_extra={'EVE_DEFERRED_REPLY_MAX_RETRIES': '2'})
         self.assertEqual(len(self.kind('chat')), 3)
         self.assertEqual(self.turn('暂时没好也不要乱回复')['status']['state'], 'Failed')
         self.assertFalse(self.progress('exhausted'))
+        self.assertFalse(self.speech_requests)
+        self.assertIn('HTTP 503', self.receipt('exhausted')['reply'])
         self.assertFalse(self.documents().get('eve.task', {}).get('tasks.v1', {}).get('tasks', []))
         before = len(self.requests)
         self.http_status = lambda kind, number: 400 if kind == 'chat' else 200
-        self.run_deferred(self.send(self.message('rejected', '核对参数拒绝')))
+        self.run_deferred(self.failed_send(self.failure_message('rejected', '核对参数拒绝')),
+                          failure_notifications={'rejected': 'Sent'})
         attempted = [r for r in self.requests[before:]
                      if next((m['content'] for m in reversed(r['body']['messages']) if m['role'] == 'user'), None) == '核对参数拒绝']
         self.assertEqual(len(attempted), 1)
         self.assertEqual(self.turn('核对参数拒绝')['status']['state'], 'Failed')
         self.assertFalse(self.progress('rejected'))
+        self.assertFalse(self.speech_requests)
+        self.assertIn('HTTP 400', self.receipt('rejected')['reply'])
 
     def test_completed_send_before_failure_is_not_sent_again(self):
         failed = []

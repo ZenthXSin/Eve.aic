@@ -81,7 +81,25 @@ impl ConcurrencyGate {
             provider,
         })
     }
-    async fn acquire(self: &Arc<Self>) -> Result<Ticket, LlmError> {
+    /// 立即尝试准入；满额或已有排队者时返回 None，不排队，也不越过先到的请求。
+    pub fn try_acquire(self: &Arc<Self>) -> Result<Option<GatePermit>, LlmError> {
+        let mut state = self.state.lock().map_err(|_| unavailable())?;
+        if !state.queued.is_empty() || state.active.len() >= state.limit {
+            return Ok(None);
+        }
+        let id = state
+            .next
+            .checked_add(1)
+            .ok_or_else(|| LlmError::Backend("模型并发调用编号已用尽".into()))?;
+        state.next = id;
+        state.active.insert(id);
+        Ok(Some(GatePermit {
+            gate: self.clone(),
+            id,
+        }))
+    }
+    /// 按先到顺序等待准入；调用者负责期限，取消等待会移除其位置。
+    pub async fn acquire(self: &Arc<Self>) -> Result<GatePermit, LlmError> {
         let id = {
             let mut state = self.state.lock().map_err(|_| unavailable())?;
             let id = state
@@ -92,7 +110,7 @@ impl ConcurrencyGate {
             state.queued.push_back(id);
             id
         };
-        let ticket = Ticket {
+        let ticket = GatePermit {
             gate: self.clone(),
             id,
         };
@@ -119,11 +137,13 @@ impl ConcurrencyGate {
         }
     }
 }
-struct Ticket {
+/// 准入凭据；持有期间计入在途请求，释放或取消时归还容量。
+#[must_use]
+pub struct GatePermit {
     gate: Arc<ConcurrencyGate>,
     id: u64,
 }
-impl Drop for Ticket {
+impl Drop for GatePermit {
     fn drop(&mut self) {
         if let Ok(mut state) = self.gate.state.lock()
             && !state.active.remove(&self.id)
