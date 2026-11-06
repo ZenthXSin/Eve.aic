@@ -1,4 +1,6 @@
 //! 认知与自身兴趣的持久历史。上下文有界，历史及来源去重不会因视图容量被删除。
+mod exploration;
+mod migration;
 use eve_subject_api::*;
 use ring::digest::{SHA256, digest};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -172,6 +174,16 @@ fn consumed(db: &Connection, scope: &str, key: &str, evidence: &str) -> SubjectR
 fn prepare(db: &Connection, observation: &mut IdleObservation) -> SubjectResult<()> {
     observation.validate()?;
     let scope = scope_key(&observation.scope)?;
+    for evidence in &observation.evidence {
+        if matches!(
+            evidence.kind.as_str(),
+            "exploration_experience" | "exploration_reflection"
+        ) {
+            let saved =
+                exploration::get_in(db, &scope, &evidence.id)?.ok_or(SubjectError::InvalidInput)?;
+            eve_subject_plugin::validate_exploration_evidence(&saved, evidence)?;
+        }
+    }
     let actual_mind = snapshot(db, &scope)?;
     if actual_mind.revision != observation.revision
         || actual_mind.judgments != observation.judgments
@@ -270,7 +282,7 @@ impl SqliteIdleMemory {
         exclusive
             .try_lock()
             .map_err(|_| SubjectError::Unavailable)?;
-        let db = Connection::open(path).map_err(corrupt)?;
+        let mut db = Connection::open(path).map_err(corrupt)?;
         db.busy_timeout(Duration::from_millis(500))
             .map_err(storage)?;
         if !exists {
@@ -297,7 +309,7 @@ impl SqliteIdleMemory {
             .map_err(corrupt)?
             .collect::<Result<_, _>>()
             .map_err(corrupt)?;
-        if versions != [1] && versions != [2] {
+        if versions != [1] && versions != [2] && versions != [3] {
             return Err(SubjectError::UnsupportedVersion);
         }
         let check: String = db
@@ -315,26 +327,8 @@ impl SqliteIdleMemory {
         ] {
             db.prepare(query).map_err(corrupt)?;
         }
-        db.pragma_update(None, "journal_mode", "DELETE")
-            .map_err(storage)?;
-        db.pragma_update(None, "synchronous", "FULL")
-            .map_err(storage)?;
-        // 先验证旧库，再原子迁移；无法读取的旧状态不能被版本迁移改写。
-        if versions == [1] {
-            db.execute_batch("BEGIN IMMEDIATE;
-                CREATE TABLE host_authorizations(scope TEXT PRIMARY KEY,authorization_id TEXT NOT NULL,digest TEXT NOT NULL,at_ms INTEGER NOT NULL);
-                CREATE TABLE autonomy_problems(scope TEXT NOT NULL,problem TEXT NOT NULL,focus TEXT NOT NULL,at_ms INTEGER NOT NULL,PRIMARY KEY(scope,problem));
-                CREATE TABLE reconciled_tasks(scope TEXT NOT NULL,task TEXT NOT NULL,outcome TEXT NOT NULL,at_ms INTEGER NOT NULL,PRIMARY KEY(scope,task,outcome));
-                UPDATE metadata SET version=2;
-                COMMIT;").map_err(storage)?;
-        }
-        for query in [
-            "SELECT scope,authorization_id,digest,at_ms FROM host_authorizations LIMIT 0",
-            "SELECT scope,problem,focus,at_ms FROM autonomy_problems LIMIT 0",
-            "SELECT scope,task,outcome,at_ms FROM reconciled_tasks LIMIT 0",
-        ] {
-            db.prepare(query).map_err(corrupt)?;
-        }
+        // 旧记录内容和索引先核对，迁移不借机修复、清空或重编码历史。
+        migration::prepare(&mut db, versions[0])?;
         if !marker_exists {
             let mut file = OpenOptions::new()
                 .create_new(true)
@@ -519,6 +513,40 @@ impl AutonomyMemoryStore for SqliteIdleMemory {
 }
 
 impl IdleMemoryStore for SqliteIdleMemory {
+    fn record_exploration(&self, experience: &ExplorationExperience) -> SubjectResult<()> {
+        exploration::record(self, experience)
+    }
+    fn exploration(
+        &self,
+        scope: &SubjectScope,
+        session_id: &str,
+    ) -> SubjectResult<Option<ExplorationExperience>> {
+        exploration::get(self, scope, session_id)
+    }
+    fn explorations(
+        &self,
+        scope: &SubjectScope,
+        before: Option<u64>,
+        limit: usize,
+    ) -> SubjectResult<ExplorationExperiencePage> {
+        exploration::page(self, scope, before, limit)
+    }
+    fn reserve_exploration_source(
+        &self,
+        scope: &SubjectScope,
+        reflection_id: &str,
+        focus_id: &str,
+        now_ms: u64,
+    ) -> SubjectResult<()> {
+        exploration::reserve_source(self, scope, reflection_id, focus_id, now_ms)
+    }
+    fn exploration_source(
+        &self,
+        scope: &SubjectScope,
+        reflection_id: &str,
+    ) -> SubjectResult<Option<String>> {
+        exploration::source(self, scope, reflection_id)
+    }
     fn snapshot(&self, scope: &SubjectScope) -> SubjectResult<IdleMind> {
         let key = scope_key(scope)?;
         self.run(|db| snapshot(db, &key))
@@ -560,12 +588,13 @@ impl IdleMemoryStore for SqliteIdleMemory {
                 if topic_owner.is_some_and(|owner|owner!=update.key) {return Err(SubjectError::InvalidInput);}
             }
             // 输出最多两个更新；保留相关项核对，其他项不参与当前修订。
-            let needed: BTreeSet<_>=result.interest_updates.iter().map(|u|u.key.as_str()).chain(result.action.iter().filter_map(|a|a.interest_key.as_deref())).collect();
+            let needed: BTreeSet<_>=result.interest_updates.iter().map(|u|u.key.as_str()).chain(result.action.iter().filter_map(|a|a.interest_key.as_deref())).chain(result.exploration.iter().filter_map(|e|e.interest_key.as_deref())).collect();
             checked.self_interests.retain(|r|needed.contains(r.current.key.as_str()));
             checked.interest_consumed.clear();
-            if let Some(action_key)=result.action.as_ref().and_then(|a|a.interest_key.as_ref())
-                && !checked.self_interests.iter().any(|r|&r.current.key==action_key)
-                && let Some(record)=existing(&tx,&key,action_key)? {checked.self_interests.push(record);}
+            for interest_key in result.action.iter().filter_map(|a|a.interest_key.as_ref()).chain(result.exploration.iter().filter_map(|e|e.interest_key.as_ref())) {
+                if !checked.self_interests.iter().any(|r|&r.current.key==interest_key)
+                    && let Some(record)=existing(&tx,&key,interest_key)? {checked.self_interests.push(record);}
+            }
             prepare(&tx,&mut checked)?;
             eve_subject_plugin::validate_idle_reflection(&checked,result)?;
             for update in &result.interest_updates {
@@ -573,7 +602,8 @@ impl IdleMemoryStore for SqliteIdleMemory {
                 if old.as_ref().is_some_and(|old|old.current==*update) {continue;}
                 let revision=old.as_ref().map_or(Ok(1),|r|r.revision.checked_add(1).ok_or(SubjectError::LimitReached))?;
                 if old.as_ref().is_some_and(|r|now<r.updated_at_ms) {return Err(SubjectError::InvalidInput);}
-                let record=SelfInterestRecord{current:update.clone(),revision,first_recorded_at_ms:old.as_ref().map_or(now,|r|r.first_recorded_at_ms),updated_at_ms:now,consumed_evidence:update.evidence.clone()};
+                let consumed_evidence=if update.evidence.is_empty(){old.as_ref().map_or_else(Vec::new,|r|r.consumed_evidence.clone())}else{update.evidence.clone()};
+                let record=SelfInterestRecord{current:update.clone(),revision,first_recorded_at_ms:old.as_ref().map_or(now,|r|r.first_recorded_at_ms),updated_at_ms:now,consumed_evidence};
                 save_interest(&tx,&key,&record,task)?;
             }
             previous.self_interests.clear();

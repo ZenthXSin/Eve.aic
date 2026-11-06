@@ -65,6 +65,9 @@ fn directory(task: &Task) -> Task {
         failure: None,
         notice: task.notice.clone(),
         execution: task.execution.as_ref().map(|execution| TaskExecution {
+            kind: execution.kind,
+            session_end_reason: execution.session_end_reason,
+            exploration_acknowledged_at_ms: execution.exploration_acknowledged_at_ms,
             checkpoint: None,
             last_finished_at_ms: execution.last_finished_at_ms,
             progress_notices: execution.progress_notices.clone(),

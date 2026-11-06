@@ -17,6 +17,9 @@ pub struct TaskProgressToken {
 
 impl TaskProgressToken {
     pub fn from_task(task: &Task) -> TaskResult<Self> {
+        if task.is_exploration() {
+            return Err(TaskError::InvalidTransition);
+        }
         validate_id(&task.id)?;
         validate_owner(&task.owner)?;
         let execution = task
@@ -105,6 +108,7 @@ pub struct TaskProgressEntry {
     pub source: String,
     pub created_at_ms: u64,
     pub status: TaskStatus,
+    pub kind: TaskExecutionKind,
     pub finished_at_ms: Option<u64>,
     pub cancel_requested: bool,
     pub resume_at_ms: Option<u64>,
@@ -119,10 +123,13 @@ impl From<&Task> for TaskProgressEntry {
             source: task.source.clone(),
             created_at_ms: task.created_at_ms,
             status: task.status,
+            kind: task.execution_kind(),
             finished_at_ms: task.finished_at_ms,
             cancel_requested: task.cancel_requested,
             resume_at_ms: task.execution.as_ref().and_then(|e| e.resume_at_ms),
-            enabled: task.execution.is_some() && !task.source.starts_with(IDLE_TASK_SOURCE_PREFIX),
+            enabled: task.execution.is_some()
+                && !task.is_exploration()
+                && !task.source.starts_with(IDLE_TASK_SOURCE_PREFIX),
             notices: task
                 .execution
                 .as_ref()
@@ -136,6 +143,7 @@ impl TaskProgressEntry {
             && self.owner == task.owner
             && self.source == task.source
             && self.created_at_ms == task.created_at_ms
+            && self.kind == task.execution_kind()
     }
     pub fn next_sequence(&self) -> Option<u64> {
         self.notices
@@ -144,6 +152,7 @@ impl TaskProgressEntry {
     }
     pub fn due(&self, now_ms: u64) -> bool {
         self.enabled
+            && self.kind.is_task()
             && matches!(
                 self.status,
                 TaskStatus::Queued | TaskStatus::Running | TaskStatus::Blocked
@@ -159,6 +168,7 @@ impl TaskProgressEntry {
     pub fn interval_due(&self, now_ms: u64) -> bool {
         let last = self.notices.last();
         self.enabled
+            && self.kind.is_task()
             && self.next_sequence().is_some()
             && last.is_none_or(|notice| {
                 notice.attempt.result.is_some()
@@ -186,6 +196,9 @@ impl TaskProgressSnapshot {
             validate_owner(&task.owner)?;
             validate_id(&task.source)?;
             if !ids.insert(&task.id) || task.created_at_ms == 0 {
+                return Err(TaskError::CorruptState);
+            }
+            if !task.kind.is_task() && (task.enabled || !task.notices.is_empty()) {
                 return Err(TaskError::CorruptState);
             }
             validate_progress_notices(&task.notices, task.created_at_ms)?;

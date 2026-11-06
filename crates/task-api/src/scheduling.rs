@@ -10,6 +10,7 @@ pub struct TaskSchedulingEntry {
     pub created_at_ms: u64,
     pub finished_at_ms: Option<u64>,
     pub status: TaskStatus,
+    pub kind: TaskExecutionKind,
     pub cancel_requested: bool,
     pub recoveries: u32,
     pub resume_at_ms: Option<u64>,
@@ -23,6 +24,7 @@ impl From<&Task> for TaskSchedulingEntry {
             created_at_ms: task.created_at_ms,
             finished_at_ms: task.finished_at_ms,
             status: task.status,
+            kind: task.execution_kind(),
             cancel_requested: task.cancel_requested,
             recoveries: task
                 .execution
@@ -42,6 +44,7 @@ impl TaskSchedulingEntry {
             && self.owner == task.owner
             && self.source == task.source
             && self.created_at_ms == task.created_at_ms
+            && self.kind == task.execution_kind()
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,6 +65,8 @@ impl TaskSchedulingSnapshot {
                 || task.created_at_ms == 0
                 || task.recoveries > MAX_AUTO_RECOVERIES
                 || task.resume_at_ms == Some(0)
+                || (task.status == TaskStatus::SessionEnded && task.kind.is_task())
+                || (task.status == TaskStatus::Completed && !task.kind.is_task())
             {
                 return Err(TaskError::CorruptState);
             }

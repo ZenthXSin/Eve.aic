@@ -145,6 +145,7 @@ jobs:
           python3 connectors/qqbot/test/admin_test.py
           python3 connectors/qqbot/test/trigger_test.py
           python3 connectors/qqbot/test/idle_loop_test.py
+          EVE_QQBOT_BINARY=target/debug/eve-qqbot python3 connectors/qqbot/test/free_exploration_test.py
           python3 connectors/qqbot/test/continuous_autonomy_test.py
           python3 connectors/qqbot/test/background_task_test.py
           python3 connectors/qqbot/test/task_progress_test.py
