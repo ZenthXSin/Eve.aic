@@ -482,14 +482,27 @@ print('fixture check passed')
         # 新候选不含注入。交接前关闭测试自动检查，避免新实例访问外网。
         for name in update.RUNTIME_SCRIPTS:
             (self.remote/name).write_bytes((Path(__file__).parent.parent/name).read_bytes())
-        if fail:
-            (self.remote/'AGENT.md').write_text('fail')
+        (self.remote/'AGENT.md').write_text('old')
         self.git('add', '.')
-        self.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'actual runtime bundle')
-        self.head = self.git('rev-parse', 'HEAD')
+        self.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'trusted deployed runtime bundle')
+        self.base_head = self.git('rev-parse', 'HEAD')
         trusted = self.root/'trusted-runtime'; trusted.mkdir()
         for name in update.RUNTIME_SCRIPTS:
             shutil.copy2(self.remote/name, trusted/Path(name).name)
+        # 已部署基线也包含真实脚本；本次候选只改变源码增量，避免把整套运行时当新文件。
+        # 三个模块都保留真实差异，确保交接验证的是升级后的冻结资源。
+        (self.remote/'AGENT.md').write_text('fail' if fail else 'new')
+        for name in update.RUNTIME_SCRIPTS:
+            with (self.remote/name).open('a') as stream:
+                stream.write('\n# source update handoff fixture candidate\n')
+        self.git('add', '.')
+        self.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'runtime candidate delta')
+        self.head = self.git('rev-parse', 'HEAD')
+        source_diff = subprocess.check_output(['git', '--no-pager', 'diff', '--no-ext-diff',
+                                              '--no-textconv', '--binary', self.base_head, '--'], cwd=self.remote)
+        self.assertLessEqual(len(source_diff), update.MAX_SOURCE_DIFF_BYTES)
+        for name in update.RUNTIME_SCRIPTS:
+            self.assertIn(('diff --git a/' + name + ' b/' + name).encode(), source_diff)
         wrapper = trusted/'self_upgrade_runtime.py'
         injection = '''
 if __name__ == '__main__':
