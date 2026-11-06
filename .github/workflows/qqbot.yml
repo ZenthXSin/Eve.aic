@@ -7,6 +7,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "scripts/*cargo*.py"
+      - "scripts/test-web-model-adapter.py"
       - ".github/workflows/qqbot.yml"
       - ".github/workflows/qqbot-training.yml"
       - ".github/qqbot-training-request.json"
@@ -23,6 +24,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "scripts/*cargo*.py"
+      - "scripts/test-web-model-adapter.py"
       - ".github/workflows/qqbot.yml"
       - ".github/workflows/qqbot-training.yml"
       - ".github/qqbot-training-request.json"
@@ -77,6 +79,7 @@ jobs:
         run: |
           cargo +1.95.0 build -p eve-app --bin eve-qqbot --bin eve-web --bin eve-memory --locked
           python3 scripts/test-web-chat.py
+          python3 scripts/test-web-model-adapter.py
           python3 scripts/test-web-autonomy.py
           python3 scripts/test-web-goals.py
           python3 connectors/qqbot/test/default_capabilities_test.py
@@ -172,6 +175,7 @@ jobs:
           python3 connectors/qqbot/test/management_access_test.py
           python3 connectors/qqbot/test/member_development_test.py
           python3 connectors/qqbot/test/model_switch_test.py
+          python3 connectors/qqbot/test/model_adapter_test.py
           python3 connectors/qqbot/test/model_streaming_test.py
           python3 connectors/qqbot/test/model_timeout_test.py
           python3 connectors/qqbot/test/session_diagnostics_test.py

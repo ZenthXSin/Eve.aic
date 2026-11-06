@@ -372,6 +372,12 @@ async fn all_primary_auxiliary_adapter_protocol_pairs_keep_credentials_limits_an
                 }],
                 32
             );
+            assert!(captured.body.get("temperature").is_none());
+            if primary_protocol == "responses" {
+                assert_eq!(captured.body["reasoning"]["effort"], "high");
+            } else {
+                assert_eq!(captured.body["reasoning_effort"], "high");
+            }
             small.provider.complete(request("summary")).await.unwrap();
             let captured = auxiliary.next().await;
             assert_eq!(

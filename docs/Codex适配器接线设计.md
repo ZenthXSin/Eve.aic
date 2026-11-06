@@ -1,6 +1,6 @@
 # Codex 适配器接线设计
 
-本文记录原 Codex 适配器、主/辅模型共同构造、识图入口和显式切换工具的实现。代码已完成静态核对，尚未运行 Cargo、Rust 1.95 依赖解析与构建或新的 Rust 测试，也未切换生产或向真实 Codex 端点请求。基础会话 API 来自 `a2eb9e52c135ae03e36233541242f6fe287a8a91`，原适配器草稿提交为 `78f2b526404a9d0dc3c939a428e51abfa642542d`；静态实现不算运行验收完成。
+本文记录原 Codex 适配器、主/辅模型共同构造、识图入口和显式切换工具的实现。尚未运行 Cargo、Rust 1.95 依赖解析与构建、新的 Rust 测试或新 QQ/Web 进程用例，也未切换生产或向真实 Codex 端点请求。基础会话 API 来自 `a2eb9e52c135ae03e36233541242f6fe287a8a91`，其最终验收提交 `c0ede7efed0a3b2ee2676b37c578fc8eb6c6da85` 已正式合并；原适配器草稿提交为 `78f2b526404a9d0dc3c939a428e51abfa642542d`。静态实现不算运行验收完成。
 
 目标是在保留现有 Chat 默认路径的前提下，为主模型和辅助模型提供显式的原 Codex Responses 实现。模型名称、端点、协议和实现选择分开处理；失败不自动切换模型、协议、凭据或实现。
 
@@ -73,6 +73,8 @@ Codex+Chat、协议与完整端点冲突、无效地址或引用在保存前拒�
 
 宿主提供的 `ModelSession` 是唯一身份来源，主对话、后台任务、审查、发言和识图分别沿现有隔离键。适配器不从 prompt、模型回复或配置中的姓名推断身份，不创建全局 cache key。
 
+原 `ResponsesClient` 的两个公开入口最终都调用同一个 `stream_encoded`，再经过原 HTTP、重试和 SSE 代码。Eve 使用原 `stream(Value, headers, ...)`：先由原 `ResponsesApiRequest` 序列化，再追加原请求类型没有的 `max_output_tokens`。没有直接采用便利入口 `stream_request`，因为它还会用 `thread_id` 覆盖 `x-client-request-id`；Eve 需要同一用户会话的稳定 thread ID，同时按持久轮次和请求序号区分每次调用。session/thread 头仍调用原 `build_session_headers`。这些是桥接层的会话和参数策略，不是原源码改写，也不能描述为整个 Codex 客户端的默认头、OAuth、请求参数完全相同。
+
 `request_fingerprint` 同步只读编码实际 Responses body 和规范端点，使用独立 domain `codex-responses-wire-v1`。它不访问网络，不取得轮次状态锁，不读/写服务端 token，也不包含凭据或 `x-client-request-id`。`complete` 和 `stream` 的实际 body 相同，故指纹相同；JSON 专用请求不属于 Runtime 的 `ResponseMode`。
 
 HTTP 重试复用当前 request ID；进程恢复时仅相同指纹可复用检查点中的待请求序号。输入、工具、配置、端点或适配器改变，指纹随之改变，宿主分配新序号并保留已完成工具，不重跑整轮。服务端 `x-codex-turn-state` 只在同一 Provider 内按会话和轮次保存，切换或重启后重新取得，不借用别的会话。
@@ -91,7 +93,9 @@ HTTP 重试复用当前 request ID；进程恢复时仅相同指纹可复用检�
 
 需要真实运行后才可标记完成：原 Chat 和原 Responses 回归；主/辅每个可用组合；Codex+Chat 配置保存/请求前拒绝；原凭据拒绝与匿名边界；分用途输出上限；旧配置加载；无探测的状态查询展示 adapter；原 HTTP/SSE 完整批次；缓存未知/零；取消和重试期限；并发准入；相同持久请求恢复、输入变化和切回后新请求序号；主工具零重放；识图旁路的实际实现一致。
 
-独立适配器已有 23 个验收用例和 1 个忽略的恢复子进程入口；宿主新增 8 个 loopback 组合用例及 4 个切换入口用例，均尚未执行。指纹用例设计为捕获实际请求核对摘要，并验证请求序号、服务端 token 和凭据不改变 body 指纹。组合用例含真实配置插件、普通会话工具往返、主辅各三种实现/协议的九种有效组合、独立主/辅服务、识图与目录实际入口；切换入口用例含权限、持久化重开和实际 CAS 冲突。这些夹具使用合成模型响应，不代表外部供应商兼容性已验收。
+独立适配器已有 23 个验收用例和 1 个忽略的恢复子进程入口；宿主新增 8 个 loopback 组合用例及 4 个切换入口用例，均尚未执行。指纹用例设计为捕获实际请求核对摘要，并验证请求序号、服务端 token 和凭据不改变 body 指纹。组合用例含真实配置插件、普通会话工具往返、主辅各三种实现/协议的九种有效组合、独立主/辅服务、识图与目录实际入口；九组合中主、辅请求均直接断言 high 和无 temperature。切换入口用例含权限、持久化重开和实际 CAS 冲突。
+
+另外新增 4 个真实宿主进程用例，尚未执行：QQ 指令切 Codex 后由普通对话实际发送 Responses SSE，模型调用切换工具后当前轮仍走 Codex、下一轮走 Chat，重启后重复入站不重放配置写入；独立 eve-web 经 `/api/chat/send` 在两个方向调用真实工具切换，验证当前轮、下一轮、两个独立 Web 会话和两次重启。两种入口各自检查可信身份与伪造参数拒绝，逐条捕获 HTTP 请求核对工具定义、high、无 temperature、模型名、输出上限、稳定会话/缓存键和独立请求 ID。请求总数必须恰好等于正常模型/工具往返，不容许额外目录探测、模型审查或失败回退。这些夹具使用本地合成模型响应，不代表外部供应商兼容性或真实模型自主能力已验收。
 
 最小动态验收命令（先由 Rust 1.95 完成锁文件解析）：
 
@@ -104,6 +108,9 @@ cargo +1.95.0 test -p eve-app qq_model --locked
 cargo +1.95.0 test -p eve-llm-openai --locked
 cargo +1.95.0 clippy --workspace --all-targets --locked -- -D warnings
 python3 scripts/verify-codex-upstream.py
+cargo +1.95.0 build -p eve-app --bin eve-qqbot --bin eve-web --locked
+EVE_QQBOT_BINARY=target/debug/eve-qqbot python3 connectors/qqbot/test/model_adapter_test.py
+EVE_WEB_BINARY=target/debug/eve-web python3 scripts/test-web-model-adapter.py
 ```
 
 随后运行现有工作区测试、示例、QQ 模型切换/模型健康/工具目录/识图实际进程及 Web 宿主回归。当前 Cargo.lock 的原 Codex 依赖闭包尚未解析，不能把上述命令标成已通过。
