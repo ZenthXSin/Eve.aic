@@ -127,6 +127,10 @@ class RequestTimingAcceptance(semantic.SemanticAcceptance):
         before = len(self.requests)
         started = []
 
+        def query_requests():
+            with self.lock:
+                return [request for request in self.embedding_requests if request['body']['input'] == [query]]
+
         def block_query(body):
             if body['input'] == [query]:
                 started.append(time.monotonic())
@@ -159,18 +163,39 @@ class RequestTimingAcceptance(semantic.SemanticAcceptance):
                 release.set()
             self.wait_until(lambda: '"phase":"embedding_ready"' in self.panel_stderr.read_text(), 'background query did not finish')
 
+        def cached_query_reuses_vector():
+            self.assertEqual(len(query_requests()), 1, 'same-user warm query must reuse the completed vector')
+            [data] = self.recall_data(self.requests[-1])
+            self.assertEqual(data['retrieval'], 'hybrid')
+            self.assertTrue(any(semantic.HISTORY in hit['excerpt'] for hit in data['hits']))
+
+        def foreign_query_uses_own_session():
+            self.wait_until(lambda: len(query_requests()) >= 2, 'another user must start a separate embedding request')
+            requests = query_requests()
+            self.assertEqual(len(requests), 2)
+            first, foreign = requests
+            for name in ('session-id', 'thread-id', 'x-client-request-id'):
+                self.assertTrue(first['headers'][name], f'first query is missing {name}')
+                self.assertTrue(foreign['headers'][name], f'foreign query is missing {name}')
+                self.assertNotEqual(first['headers'][name], foreign['headers'][name], name)
+            for request in requests:
+                self.assertEqual(set(request['body']), {'model', 'input', 'dimensions', 'encoding_format'},
+                                 'embedding session metadata belongs in headers')
+
         self.before_embedding = block_query
         self.semantic_run([*self.checkpoint('enable'), *self.send(self.message('cold', query)),
                            *self.checkpoint('warm'), *self.send(self.message('cached', query)),
-                           *self.send(self.message('foreign', query, user='user-2'))],
+                           *self.checkpoint('cache_hit'), *self.send(self.message('foreign', query, user='user-2')),
+                           *self.checkpoint('foreign_query')],
                           panel=True, env={'EVE_TRACE_DIALOGUE_TIMING': '1', 'EVE_SEMANTIC_QUERY_TIMEOUT_MS': '50'},
-                          checkpoints={'enable': enable_background, 'warm': primary_while_embedding_blocked})
+                          checkpoints={'enable': enable_background, 'warm': primary_while_embedding_blocked,
+                                       'cache_hit': cached_query_reuses_vector, 'foreign_query': foreign_query_uses_own_session})
         self.assertEqual(len(self.requests), before + 3)
         [data] = self.recall_data(self.requests[-2])
         self.assertEqual(data['retrieval'], 'hybrid')
         self.assertTrue(any(semantic.HISTORY in hit['excerpt'] for hit in data['hits']))
         self.assertEqual(self.recall_data(self.requests[-1]), [], 'cached vectors cannot leak another user memory')
-        self.assertEqual(sum(body['input'] == [query] for body in self.embeddings), 1)
+        self.assertEqual(len(query_requests()), 2)
         self.assertNotIn(query, self.last_stderr)
 
 
