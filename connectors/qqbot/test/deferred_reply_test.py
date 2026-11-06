@@ -89,13 +89,18 @@ class DeferredReplyAcceptance(live.LiveToolAcceptance):
             return self.choose('send_message', {'text': '按你补充的要求，只查询。'}) if not self.all_results(body) else dialogue.text_response('{"action":"silence"}')
 
         self.callback = respond
+        # Handled 先持久化，通道随后才写 finish；桥接必须消费收尾帧后再退出。
         self.run_deferred([{'send': self.message('first', '看看这个问题')},
             {'wait_file': str(self.arrived('chat', 1))},
             {'send': self.message('steer', '改为只查询，不执行命令')},
-            self.wait_receipt('steer', 'Merged'), self.wait_receipt('first')],
+            self.wait_receipt('steer', 'Merged'), self.wait_receipt('first'),
+            self.wait_command('first', 'finish')],
             env_extra={'EVE_DEFERRED_REPLY_INITIAL_DELAY_MS': '500', 'EVE_DEFERRED_REPLY_MAX_DELAY_MS': '500'})
+        self.assertEqual(len(self.kind('chat')), 3)
         self.assertEqual([e['text'] for e in self.progress('first')], ['按你补充的要求，只查询。'])
         self.assertFalse(self.progress('steer'))
+        self.assertEqual([e['id'] for e in self.events
+                          if e.get('direction') == 'out' and e.get('type') == 'finish'], ['steer', 'first'])
         turns = next(iter(self.documents()['eve.session']['sessions.v1']['sessions'].values()))['turns']
         self.assertEqual(len(turns), 1)
         self.assertEqual([m['text'] for m in turns[0]['status']['messages'] if m['role'] == 'User'],

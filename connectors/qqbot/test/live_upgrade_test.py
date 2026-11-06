@@ -106,9 +106,11 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
         env.update(EVE_QQ_LIVE_INTERACTION='true',QQBOT_APP_ID='1904159860',QQBOT_APP_SECRET='test-app-secret',EVE_OPENAI_API_KEY='test-model-secret',
             EVE_OPENAI_BASE_URL=f'http://127.0.0.1:{self.server.server_port}',EVE_OPENAI_PROTOCOL='chat',
             EVE_LLM_RESPONSE_MODE='complete',EVE_DEVELOPER_CONFIG=str(self.developer_config))
+        # 只验证真实回执后的交接；显式隔离组合避免默认浏览器探测占用就绪期限。
+        # 开发工具权限来自本组配置，记忆与完整候选校验仍由真实宿主执行。
         command=[sys.executable,str(ROOT/'scripts/self_upgrade_runtime.py'),'--directory',str(queue),
             '--candidates',str(storage/'candidates'),'--ready-timeout','10','--stop-timeout','10',
-            '--quiet-seconds','.1','--health-seconds','.2','--',str(BINARY),
+            '--quiet-seconds','.1','--health-seconds','.2','--',str(BINARY),'--minimal-profile',
             '--state-dir',str(self.work/'state'),'--agent',str(ROOT/'AGENT.md'),
             '--bridge-script',str(FAKE),'--bridge-arg',str(scenario),'--memory']
         with (self.work/'stdout').open('w') as out,(self.work/'stderr').open('w') as err:
@@ -199,10 +201,11 @@ class LiveUpgradeAcceptance(developer.DeveloperAcceptance):
         env.update(EVE_QQ_LIVE_INTERACTION='true',QQBOT_APP_ID='1904159860',QQBOT_APP_SECRET='test-app-secret',EVE_OPENAI_API_KEY='test-model-secret',
             EVE_OPENAI_BASE_URL=f'http://127.0.0.1:{self.server.server_port}',EVE_OPENAI_PROTOCOL='chat',
             EVE_LLM_RESPONSE_MODE='complete',EVE_DEVELOPER_CONFIG=str(self.developer_config))
+        # 与同版本重启保持相同显式组合，候选仍接续全部工具与平台回执。
         command=[sys.executable,'-I','-B',str(ROOT/'scripts/host_runtime_bridge.py'),
             '--supervisor',str(ROOT/'scripts/self_upgrade_runtime.py'),'--source-revision','1'*40,'--directory',str(queue),
             '--candidates',str(storage/'candidates'),'--ready-timeout','10','--stop-timeout','10',
-            '--quiet-seconds','.1','--health-seconds','.2','--',str(BINARY),
+            '--quiet-seconds','.1','--health-seconds','.2','--',str(BINARY),'--minimal-profile',
             '--state-dir',str(self.work/'state'),'--agent',str(ROOT/'AGENT.md'),
             '--bridge-script',str(FAKE),'--bridge-arg',str(scenario),'--memory']
         with (self.work/'stdout').open('w') as out,(self.work/'stderr').open('w') as err:
