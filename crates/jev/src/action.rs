@@ -196,7 +196,8 @@ impl ActionReviewClassifier for JevRelationJudge {
                 let _slot = self
                     .slots
                     .try_acquire()
-                    .map_err(|_| ActionReviewUncertainty::Busy)?;
+                    .map_err(|_| ActionReviewUncertainty::Unavailable)?
+                    .ok_or(ActionReviewUncertainty::Busy)?;
                 let bytes = tokio::time::timeout(
                     self.config.timeout,
                     self.group_request(body, session.as_ref()),

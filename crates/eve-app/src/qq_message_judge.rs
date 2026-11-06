@@ -305,7 +305,16 @@ impl JevRoleJudge {
             timeout: Duration::from_millis(captured.profile.timeout_ms),
             max_concurrent_requests: captured.profile.max_concurrent_requests,
         };
-        let judge = Arc::new(JevRelationJudge::new(config, credential.expose())?);
+        // 先验证完整客户端，再更新宿主稳定准入；无效热配置不能改变现有额度。
+        let judge = JevRelationJudge::new(config, credential.expose())?;
+        let gate = crate::model_concurrency::gate(
+            &self.settings,
+            ModelRole::Jev,
+            captured.profile.max_concurrent_requests,
+            captured.role_revision,
+        )
+        .map_err(|_| JevConfigurationError)?;
+        let judge = Arc::new(judge.with_concurrency_gate(gate, captured.role_revision)?);
         *cached = Some(CachedJev {
             captured,
             credential_version: credential.version(),

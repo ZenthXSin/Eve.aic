@@ -33,6 +33,8 @@ Jev 模式需要宿主环境中的 `EVE_JEV_API_KEY`，不会读取主模型密�
 
 启动只预检并构造客户端，不发送健康探测请求。缺凭据、角色关闭或配置错误会拒绝启动；运行中的 Jev 配置变坏则返回不可用并进入主模型回退。每次判断捕获同一修订的角色与 Provider 配置，最多重读四次；在途请求固定选择，新请求使用新配置，宿主只缓存最近一个客户端选择。凭据在宿主启动时读取，变更凭据需重启。
 
+Jev 准入按宿主配置服务身份共享，客户端热更新不会重置在途数量。新候选完整验证后才更新限额；降低上限保留旧请求，后续请求等空位或按原用途回退，旧修订不能重新放宽新限额。主/辅模型与 Jev 分别计数，群原话挑选的等待仍以三秒为限。具体装配和恢复语义见 [Jev 行动审查](Jev行动审查.md)。
+
 ## 通过 OpenRouter 使用原生 Jev
 
 OpenRouter 的 [TypeSafe SDK 兼容说明](https://openrouter.ai/blog/insights/what-is-jev/#typesafe-javascript-sdk-pointed-at-openrouter) 明确支持 `POST https://openrouter.ai/api/v1/systemone`，请求仍是 `state/model/questions`，返回 `answers` 中的 `choice` / `noul`。无需切换 Chat Completions，也无需新增模型 Provider。这里固定 `typesafe/jev-1.13`，避免最新别名变化影响验收。

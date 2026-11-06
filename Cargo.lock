@@ -2176,6 +2176,7 @@ dependencies = [
  "eve-memory-api",
  "eve-message-api",
  "eve-message-diagnostics",
+ "eve-model-concurrency",
  "eve-session-api",
  "reqwest",
  "serde",

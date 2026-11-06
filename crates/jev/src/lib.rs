@@ -5,6 +5,7 @@ use eve_message_api::{
     RelationObservation, RelationObserver, RelationOutcome, TextSpan, observe_relation,
 };
 use eve_message_diagnostics::RelationObservationGuard;
+use eve_model_concurrency::ConcurrencyGate;
 use reqwest::{Client, Url, header::HeaderValue};
 use serde::{
     Deserialize, Deserializer,
@@ -12,7 +13,6 @@ use serde::{
 };
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
-use tokio::sync::Semaphore;
 mod action;
 mod context_recall;
 mod group;
@@ -71,7 +71,7 @@ pub struct JevRelationJudge {
     endpoint: Url,
     authorization: HeaderValue,
     config: JevConfig,
-    slots: Semaphore,
+    slots: Arc<ConcurrencyGate>,
 }
 impl JevRelationJudge {
     fn model_headers(
@@ -142,7 +142,8 @@ impl JevRelationJudge {
             .retry(reqwest::retry::never())
             .build()
             .map_err(|_| JevConfigurationError)?;
-        let slots = Semaphore::new(config.max_concurrent_requests);
+        let slots = ConcurrencyGate::new(config.max_concurrent_requests, 0)
+            .map_err(|_| JevConfigurationError)?;
         Ok(Self {
             client,
             endpoint,
@@ -150,6 +151,19 @@ impl JevRelationJudge {
             config,
             slots,
         })
+    }
+
+    /// 使用宿主按配置身份共享的准入；配置已验证后才更新限额，旧修订不能放宽新限额。
+    /// 新客户端与旧在途请求共用计数，替换模型、端点或凭据不会产生额外名额。
+    pub fn with_concurrency_gate(
+        mut self,
+        gate: Arc<ConcurrencyGate>,
+        revision: u64,
+    ) -> Result<Self, JevConfigurationError> {
+        gate.observe(self.config.max_concurrent_requests, revision)
+            .map_err(|_| JevConfigurationError)?;
+        self.slots = gate;
+        Ok(self)
     }
 }
 
@@ -384,7 +398,8 @@ impl RelationJudge for JevRelationJudge {
             let _slot = self
                 .slots
                 .try_acquire()
-                .map_err(|_| RelationError::Unavailable)?;
+                .map_err(|_| RelationError::Unavailable)?
+                .ok_or(RelationError::Unavailable)?;
             // 从本地 send 到有界响应完成；不证明远端收到请求、执行或计费。
             let guard =
                 RelationObservationGuard::attempt(observer, RelationAttempt::ClassifierCall);

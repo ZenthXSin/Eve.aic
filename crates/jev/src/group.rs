@@ -184,7 +184,11 @@ impl GroupRelationJudge for JevRelationJudge {
                 &input.message.conversation,
             )?
             .with_turn(&input.message.id)?;
-            let _slot = self.slots.try_acquire().map_err(|_| error())?;
+            let _slot = self
+                .slots
+                .try_acquire()
+                .map_err(|_| error())?
+                .ok_or_else(error)?;
             let mut input = input;
             while !input.examples.is_empty()
                 && serde_json::to_vec(&request(&input, &[], &self.config.model))

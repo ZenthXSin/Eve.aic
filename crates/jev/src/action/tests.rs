@@ -230,7 +230,7 @@ async fn full_input_over_jev_limit_never_sends_an_http_request_or_truncates() {
             .await
             .is_err()
     );
-    assert_eq!(judge.slots.available_permits(), 1);
+    assert_eq!(judge.slots.status().unwrap().active, 0);
 }
 
 #[tokio::test]
@@ -291,7 +291,7 @@ async fn one_http_slot_is_shared_across_both_modes_and_cancel_releases_it() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(judge.slots.available_permits(), 0);
+    assert_eq!(judge.slots.status().unwrap().active, 1);
     assert_eq!(
         ActionReviewClassifier::classify(
             judge.as_ref(),
@@ -303,7 +303,7 @@ async fn one_http_slot_is_shared_across_both_modes_and_cancel_releases_it() {
     );
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
-    assert_eq!(judge.slots.available_permits(), 1);
+    assert_eq!(judge.slots.status().unwrap().active, 0);
     holding.abort();
     let _ = holding.await;
 }
