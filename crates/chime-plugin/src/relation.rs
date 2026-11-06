@@ -214,6 +214,10 @@ impl GroupRelationReviewer for ModelGroupRelationReviewer {
             let result = selection
                 .provider
                 .complete_json(ModelRequest {
+                    session: Some(crate::model_session(
+                        "group-relation-review",
+                        &input.input.message,
+                    )?),
                     messages: vec![
                         ChatMessage::text(ChatRole::System, REVIEW_RULES),
                         ChatMessage::text(ChatRole::User, REVIEW_FORMAT_GUARD),

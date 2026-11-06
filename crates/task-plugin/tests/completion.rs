@@ -88,6 +88,9 @@ fn technical_wait_registration_cannot_be_a_completion_receipt() {
 fn frame(result: &str) -> TurnCheckpoint {
     let owner = owner();
     TurnCheckpoint {
+        pending_model_request: None,
+        pending_request_fingerprint: None,
+        model_session: None,
         version: 1,
         scope: ContextScope {
             session_id: owner.session_id,

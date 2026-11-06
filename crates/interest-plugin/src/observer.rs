@@ -40,6 +40,21 @@ impl InterestObserver for ModelInterestObserver {
             batch.validate()?;
             let input = serde_json::to_string(&batch).map_err(|_| InterestError::InvalidInput)?;
             let request = ModelRequest {
+                session: Some(
+                    eve_llm_api::ModelSession::scoped(
+                        "interest-observer",
+                        &eve_llm_api::ContextScope {
+                            session_id: format!(
+                                "{}:{}",
+                                batch.scope.channel.len(),
+                                batch.scope.channel
+                            ) + &batch.scope.session_id,
+                            user_id: batch.scope.user_id.clone(),
+                        },
+                    )
+                    .and_then(|s| s.with_turn(&batch.id))
+                    .map_err(provider_error)?,
+                ),
                 messages: vec![
                     ChatMessage::text(ChatRole::System, SYSTEM_PROMPT),
                     ChatMessage::text(ChatRole::User, input),

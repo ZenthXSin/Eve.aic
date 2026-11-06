@@ -55,7 +55,13 @@ impl SourceSelector for ModelSourceSelector {
             }
             let input =
                 serde_json::to_string(&request).map_err(|_| KnowledgeError::InvalidInput)?;
-            let text = complete(&*self.resolver, SELECTOR_PROMPT, input).await?;
+            let text = complete(
+                &*self.resolver,
+                SELECTOR_PROMPT,
+                input,
+                request.model_session.clone(),
+            )
+            .await?;
             if text.len() > MAX_SELECTION_OUTPUT_BYTES {
                 return Err(invalid_output());
             }
@@ -88,7 +94,13 @@ impl KnowledgeExtractor for ModelKnowledgeExtractor {
             }
             let input =
                 serde_json::to_string(&request).map_err(|_| KnowledgeError::InvalidInput)?;
-            let text = complete(&*self.resolver, EXTRACTOR_PROMPT, input).await?;
+            let text = complete(
+                &*self.resolver,
+                EXTRACTOR_PROMPT,
+                input,
+                request.model_session.clone(),
+            )
+            .await?;
             if text.len() > MAX_EXTRACTION_OUTPUT_BYTES {
                 return Err(invalid_output());
             }
@@ -109,8 +121,10 @@ async fn complete(
     resolver: &dyn LlmModelResolver,
     system: &str,
     input: String,
+    session: Option<eve_llm_api::ModelSession>,
 ) -> KnowledgeResult<String> {
     let request = ModelRequest {
+        session,
         messages: vec![
             ChatMessage::text(ChatRole::System, system),
             ChatMessage::text(ChatRole::User, input),

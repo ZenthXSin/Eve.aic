@@ -243,6 +243,7 @@ mod tests {
             concurrency: Some(ToolConcurrency::ParallelSafe),
         };
         let request = ModelRequest {
+            session: None,
             messages: vec![
                 ChatMessage::text(ChatRole::System, "规则"),
                 ChatMessage::text(ChatRole::User, "问题"),
@@ -432,14 +433,17 @@ mod tests {
     fn rejects_invalid_requests_before_mapping() {
         for request in [
             ModelRequest {
+                session: None,
                 messages: vec![],
                 tools: vec![],
             },
             ModelRequest {
+                session: None,
                 messages: vec![ChatMessage::text(ChatRole::User, " ")],
                 tools: vec![],
             },
             ModelRequest {
+                session: None,
                 messages: vec![ChatMessage::assistant_tool_calls(vec![call("a")]).unwrap()],
                 tools: vec![],
             },
@@ -451,6 +455,7 @@ mod tests {
         }
         for name in ["tool.with.dots", "工具", &"a".repeat(65)] {
             let request = ModelRequest {
+                session: None,
                 messages: vec![ChatMessage::text(ChatRole::User, "run")],
                 tools: vec![ToolDefinition {
                     name: name.into(),
@@ -473,6 +478,7 @@ mod tests {
         let body = encode_request(
             "m",
             ModelRequest {
+                session: None,
                 messages: vec![
                     ChatMessage::text(ChatRole::System, "s"),
                     ChatMessage::text(ChatRole::User, "图里是什么").with_images(vec![image]),

@@ -3,7 +3,7 @@ mod http_support;
 #[path = "support/session.rs"]
 mod support;
 use eve_kernel::backends::FileStateStore;
-use eve_llm_api::{ChatMessage, ChatRole, ToolCall, ToolResult};
+use eve_llm_api::{ChatMessage, ChatRole, ContextScope, ModelSession, ToolCall, ToolResult};
 use eve_llm_openai::{OpenAiConfig, OpenAiProvider};
 use eve_runtime::{LlmHostConfig, SessionRunError};
 use eve_session_api::*;
@@ -61,9 +61,46 @@ async fn file_recovery_sends_paired_history_and_final_answer_phase_with_stable_p
     assert_eq!(second_rig.starts.load(Ordering::SeqCst), 0);
     let captured = server.next().await;
     assert!(captured.headers.starts_with("POST /v1/responses HTTP/1.1"));
+    let tool_captured = server.next().await;
+    let recovered_captured = server.next().await;
+    let long_session = ModelSession::scoped(
+        "main",
+        &ContextScope {
+            session_id: "s".into(),
+            user_id: "用户一".into(),
+        },
+    )
+    .unwrap();
+    for (captured, turn, ordinal) in [
+        (&captured, "1", 1),
+        (&tool_captured, "1", 2),
+        (&recovered_captured, "2", 1),
+    ] {
+        let session = long_session
+            .clone()
+            .with_turn(turn)
+            .unwrap()
+            .for_request(ordinal);
+        for (name, value) in [
+            ("session-id", session.session_id()),
+            ("thread-id", session.thread_id()),
+            ("x-client-request-id", session.client_request_id()),
+        ] {
+            assert!(
+                captured
+                    .headers
+                    .lines()
+                    .any(|line| line == format!("{name}: {value}"))
+            );
+        }
+        assert_eq!(
+            captured.body["prompt_cache_key"],
+            session.prompt_cache_key()
+        );
+    }
     let first_request = captured.body;
-    let tool_request = server.next().await.body;
-    let recovered_request = server.next().await.body;
+    let tool_request = tool_captured.body;
+    let recovered_request = recovered_captured.body;
     assert_eq!(first_request["tools"], recovered_request["tools"]);
     let original = first_request["input"].as_array().unwrap();
     let recovered = recovered_request["input"].as_array().unwrap();

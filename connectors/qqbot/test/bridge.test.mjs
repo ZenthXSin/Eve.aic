@@ -1119,3 +1119,138 @@ test("平台返回接受但缺少消息编号时保持未知，不宣称送达�
   assert.equal(file.frames.at(-1).failure_kind, "transport_unknown");
   assert.equal(file.files.length, 1);
 });
+
+const passiveFrame = (id = "notice-1", anchor = "in-1") => ({version:1,type:"passive_push",id,scope:"c2c",target_id:"user-1",sender_id:"user-1",based_on_message_id:anchor,text:"Eve 审视后写出的任务结局"});
+async function openPassive(f, count = 1) {
+  f.message();
+  for (let index=0;index<count;index++) await f.bridge.command({version:1,type:"progress",id:"in-1",index,text:"真实回复",explicit:true});
+  await f.bridge.command({version:1,type:"finish",id:"in-1",keep_passive:true});
+}
+test("实时回复后的通知使用真实被动目标并共享剩余额度，重复帧不发送",async()=>{
+  const f=fixture();await openPassive(f,3);
+  assert.equal(f.frames.at(-1).type,"passive_window");
+  assert.equal(f.frames.at(-1).remaining,1);
+  await f.bridge.command(passiveFrame());
+  assert.deepEqual(f.sent.at(-1).target,{scope:"c2c",targetId:"user-1",msgId:"in-1"});
+  assert.equal(f.frames.at(-1).delivery_mode,"passive");
+  await f.bridge.command(passiveFrame());
+  assert.equal(f.sent.length,4);
+  await f.bridge.command(passiveFrame("notice-2"));
+  assert.equal(f.sent.length,4);
+  assert.equal(f.frames.at(-1).failure_kind,"passive_quota_exhausted");
+});
+test("被动通知窗口不跨重启恢复，过期或新入站不会退回主动发送",async()=>{
+  let now=0;const f=fixture({now:()=>now});await openPassive(f);
+  now=PASSIVE_REPLY_WINDOW_MS;
+  await f.bridge.command(passiveFrame());
+  assert.equal(f.frames.at(-1).failure_kind,"passive_window_elapsed");
+  assert.equal(f.sent.length,1);
+  const fresh=fixture();await openPassive(fresh);
+  fresh.message("c2c","new-input");
+  await fresh.bridge.command(passiveFrame());
+  assert.equal(fresh.sent.length,1);
+  assert.equal(fresh.frames.at(-1).failure_kind,"passive_window_missing");
+  const restarted=fixture();
+  await restarted.bridge.command({version:1,type:"restore_anchor",scope:"c2c",target_id:"user-1",sender_id:"user-1",message_id:"in-1"});
+  await restarted.bridge.command(passiveFrame());
+  assert.equal(restarted.sent.length,0);
+  assert.equal(restarted.frames.at(-1).failure_kind,"passive_window_missing");
+});
+test("被动通知未知结果也消耗额度，后续同 ID 不会重发",async()=>{
+  const f=fixture({fail:n=>n===2,error:Object.assign(new Error("timed out"),{name:"TimeoutError"})});await openPassive(f);
+  await f.bridge.command(passiveFrame());
+  assert.equal(f.frames.at(-1).failure_kind,"timeout");
+  await f.bridge.command(passiveFrame());
+  assert.equal(f.sent.length,2);
+});
+test("被动通知真正调用 SDK 前重新检查新入站和身份",async()=>{
+  const f=fixture();await openPassive(f);
+  await f.bridge.command({...passiveFrame(),target_id:"other"});
+  assert.equal(f.frames.at(-1).failure_kind,"stale_decision");
+  assert.equal(f.sent.length,1);
+  const pending=f.bridge.command(passiveFrame());
+  f.message("c2c","new-input");
+  await pending;
+  assert.equal(f.sent.length,1);
+  assert.equal(f.frames.at(-1).failure_kind,"stale_decision");
+});
+test("被动补充只在明确文字真正送达后开放，失败和恢复锚点不产生额度",async()=>{
+  for (const mode of ["no-reply","failed","image-only"]) {
+    const f=fixture({fail:mode==="failed"});f.message();
+    if(mode!=="no-reply") await f.bridge.command({version:1,type:"progress",id:"in-1",index:0,text:"尝试表达",explicit:true,
+      ...(mode==="image-only"?{image_path:"/tmp/fixture.png"}:{})});
+    await f.bridge.command({version:1,type:"finish",id:"in-1",keep_passive:true});
+    assert.equal(f.frames.filter(frame=>frame.type==="passive_window").length,0);
+    const before=f.sent.length;
+    await f.bridge.command(passiveFrame());
+    assert.equal(f.sent.length,before);
+    assert.equal(f.frames.at(-1).failure_kind,"passive_window_missing");
+  }
+});
+test("部分失败和图片也计入真实剩余额度，重复 finish 不恢复已消费的通知额度",async()=>{
+  const f=fixture({fail:n=>n===2});f.message();
+  await f.bridge.command({version:1,type:"progress",id:"in-1",index:0,text:"真实回复",explicit:true});
+  await f.bridge.command({version:1,type:"progress",id:"in-1",index:1,text:"失败文字",explicit:true});
+  await f.bridge.command({version:1,type:"progress",id:"in-1",index:2,text:"真实图片",explicit:true,image_path:"/tmp/fixture.png"});
+  await f.bridge.command({version:1,type:"finish",id:"in-1",keep_passive:true});
+  assert.equal(f.frames.at(-1).remaining,1);
+  await f.bridge.command(passiveFrame());
+  await f.bridge.command({version:1,type:"finish",id:"in-1",keep_passive:true});
+  await f.bridge.command(passiveFrame("notice-2"));
+  assert.equal(f.sent.length,3);
+  assert.equal(f.images.length,1);
+  assert.equal(f.frames.at(-1).failure_kind,"passive_quota_exhausted");
+});
+
+test("长工具中新输入保留自身原被动机会，与后台通知窗口分离",async()=>{
+  let now=10;
+  const f=fixture({now:()=>now});f.message();
+  now=6010;
+  await f.bridge.command({version:1,type:"finish",id:"in-1",keep_foreground:true});
+  assert.equal(f.frames.at(-1).type,"foreground_window");
+  assert.equal(f.frames.at(-1).remaining,4);
+  assert.equal(f.frames.at(-1).remaining_ms,PASSIVE_REPLY_WINDOW_MS-6000);
+  await f.bridge.command(passiveFrame());
+  assert.equal(f.frames.at(-1).failure_kind,"passive_window_missing");
+  assert.equal(f.sent.length,0);
+  await f.bridge.command({...passiveFrame(),foreground:true});
+  assert.equal(f.frames.at(-1).ok,true);
+  assert.deepEqual(f.sent[0].target,{scope:"c2c",targetId:"user-1",msgId:"in-1"});
+  await f.bridge.command({...passiveFrame(),foreground:true});
+  assert.equal(f.sent.length,1);
+  const background=fixture();await openPassive(background);
+  await background.bridge.command({...passiveFrame(),foreground:true});
+  assert.equal(background.frames.at(-1).failure_kind,"passive_window_missing");
+  assert.equal(background.sent.length,1);
+});
+
+test("工具结束或输入已消费时撤销前台窗口，SDK 调用前再次检查",async()=>{
+  const f=fixture();f.message();
+  await f.bridge.command({version:1,type:"finish",id:"in-1",keep_foreground:true});
+  const sending=f.bridge.command({...passiveFrame(),foreground:true});
+  await f.bridge.command({version:1,type:"close_foreground",id:"in-1"});
+  await sending;
+  assert.equal(f.sent.length,0);
+  assert.equal(f.frames.at(-1).failure_kind,"stale_decision");
+  await f.bridge.command({...passiveFrame("new-decision"),foreground:true});
+  assert.equal(f.frames.at(-1).failure_kind,"passive_window_missing");
+  assert.equal(f.sent.length,0);
+});
+
+test("前台窗口新输入和重启失效，未知投递不重试或变成主动发送",async()=>{
+  const f=fixture({textResult:{}});f.message();
+  await f.bridge.command({version:1,type:"finish",id:"in-1",keep_foreground:true});
+  await f.bridge.command({...passiveFrame(),foreground:true});
+  assert.equal(f.frames.at(-1).failure_kind,"transport_unknown");
+  await f.bridge.command({...passiveFrame(),foreground:true});
+  assert.equal(f.sent.length,1);
+  f.message("c2c","later");
+  await f.bridge.command({...passiveFrame("later-decision"),foreground:true});
+  assert.equal(f.frames.at(-1).failure_kind,"passive_window_missing");
+  assert.equal(f.sent.length,1);
+  const restarted=fixture();
+  await restarted.bridge.command({version:1,type:"restore_anchor",scope:"c2c",target_id:"user-1",sender_id:"user-1",message_id:"in-1"});
+  await restarted.bridge.command({...passiveFrame(),foreground:true});
+  assert.equal(restarted.frames.at(-1).failure_kind,"passive_window_missing");
+  assert.equal(restarted.sent.length,0);
+});

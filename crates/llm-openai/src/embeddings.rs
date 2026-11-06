@@ -86,7 +86,11 @@ impl OpenAiEmbeddings {
         })
     }
 
-    async fn request(&self, inputs: &[String]) -> EmbedResult<Vec<Vec<f32>>> {
+    async fn request(
+        &self,
+        inputs: &[String],
+        session: Option<&eve_llm_api::ModelSession>,
+    ) -> EmbedResult<Vec<Vec<f32>>> {
         validate_inputs(inputs)?;
         let body = serde_json::json!({
             "model": self.profile.model,
@@ -94,14 +98,21 @@ impl OpenAiEmbeddings {
             "dimensions": self.profile.dimensions,
             "encoding_format": "float",
         });
-        let mut response = self
+        let mut request = self
             .client
             .post(self.endpoint.clone())
-            .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
-            .json(&body)
-            .send()
-            .await
-            .map_err(transport_error)?;
+            .header(reqwest::header::AUTHORIZATION, self.authorization.clone());
+        if let Some(session) = session {
+            session
+                .validate()
+                .map_err(|_| EmbeddingError::InvalidInput)?;
+            request = request
+                .header("session-id", session.session_id())
+                .header("thread-id", session.thread_id())
+                .header("x-client-request-id", session.client_request_id());
+        }
+        // embeddings 协议没有 prompt cache 字段；不扩展其正文，只发送可信追踪头。
+        let mut response = request.json(&body).send().await.map_err(transport_error)?;
         // 响应体、URL 与后端错误可能含凭据或用户正文，不进入诊断。
         if !response.status().is_success() {
             return Err(EmbeddingError::Provider);
@@ -142,8 +153,15 @@ impl EmbeddingProvider for OpenAiEmbeddings {
         &self.profile
     }
     fn embed<'a>(&'a self, inputs: &'a [String]) -> EmbedFuture<'a> {
+        self.embed_with_model_session(inputs, None)
+    }
+    fn embed_with_model_session<'a>(
+        &'a self,
+        inputs: &'a [String],
+        session: Option<&'a eve_llm_api::ModelSession>,
+    ) -> EmbedFuture<'a> {
         Box::pin(async move {
-            tokio::time::timeout(self.timeout, self.request(inputs))
+            tokio::time::timeout(self.timeout, self.request(inputs, session))
                 .await
                 .map_err(|_| EmbeddingError::Timeout)?
         })

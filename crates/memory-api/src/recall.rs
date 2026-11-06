@@ -207,6 +207,15 @@ pub type RecallFuture<'a> =
 /// 现行偏好与已导入交互，返回值同样须通过 `validate_for`，不写入记忆或查询历史。
 pub trait AsyncMemoryRecallService: Send + Sync {
     fn recall<'a>(&'a self, request: &'a MemoryRecallRequest) -> RecallFuture<'a>;
+
+    /// 语义查询的可信宿主绑定；原文与查询内容不作为会话身份。
+    fn recall_with_model_session<'a>(
+        &'a self,
+        request: &'a MemoryRecallRequest,
+        _session: Option<&'a eve_llm_api::ModelSession>,
+    ) -> RecallFuture<'a> {
+        self.recall(request)
+    }
 }
 
 /// 仅由可信宿主持有，不能发布给模型或非可信通道。

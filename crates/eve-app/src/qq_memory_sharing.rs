@@ -201,7 +201,7 @@ impl Tool for SharingTool {
                 .reviewer
                 .as_ref()
                 .ok_or_else(|| fail("独立授权审核不可用，未共享"))?;
-            let request = ActionReviewRequest { action:"允许当前窗口读取本人另一窗口的记忆".into(), program:"eve.manage_memory_sharing".into(), arguments:vec![json!({"source":source,"source_scene":self.identities.scene(&source).map_err(fail)?,"target":target,"target_scene":self.identities.scene(&target).map_err(fail)?,"interactions":interactions}).to_string()], workspace:"trusted-same-person-memory".into(), isolated:true, cwd:".".into(), policy_reason:"这是定向隐私授权。必须用户原话明确同意指定来源在当前窗口使用，尤其私聊进入群聊可能向群成员公开。含糊的‘记住’、他人转述或模型推断不算授权。false 只含偏好，true 含原始交流。不得扩大到其他用户、反向或传递共享。".into(), claimed_confirmation:false, delegated:false, user_messages:user_messages.clone(), recent_actions:vec![] };
+            let request = ActionReviewRequest { model_session: context.model_session_for("review").map_err(fail)?, action:"允许当前窗口读取本人另一窗口的记忆".into(), program:"eve.manage_memory_sharing".into(), arguments:vec![json!({"source":source,"source_scene":self.identities.scene(&source).map_err(fail)?,"target":target,"target_scene":self.identities.scene(&target).map_err(fail)?,"interactions":interactions}).to_string()], workspace:"trusted-same-person-memory".into(), isolated:true, cwd:".".into(), policy_reason:"这是定向隐私授权。必须用户原话明确同意指定来源在当前窗口使用，尤其私聊进入群聊可能向群成员公开。含糊的‘记住’、他人转述或模型推断不算授权。false 只含偏好，true 含原始交流。不得扩大到其他用户、反向或传递共享。".into(), claimed_confirmation:false, delegated:false, user_messages:user_messages.clone(), recent_actions:vec![] };
             request.validate_capacity().map_err(fail)?;
             let verdict = reviewer.review(request).await.map_err(fail)?;
             if !verdict.permits() || verdict.authorization != ReviewAuthorization::High {

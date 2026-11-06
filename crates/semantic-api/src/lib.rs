@@ -63,6 +63,15 @@ impl EmbeddingProfile {
 pub trait EmbeddingProvider: Send + Sync {
     fn profile(&self) -> &EmbeddingProfile;
     fn embed<'a>(&'a self, inputs: &'a [String]) -> EmbedFuture<'a>;
+
+    /// 输入和会话分离。包装器必须透传，宿主按查询或索引作业派生用途。
+    fn embed_with_model_session<'a>(
+        &'a self,
+        inputs: &'a [String],
+        _session: Option<&'a eve_llm_api::ModelSession>,
+    ) -> EmbedFuture<'a> {
+        self.embed(inputs)
+    }
 }
 
 /// 输入：1 到 `MAX_EMBED_BATCH` 条，每条非空、不超过字节上限、不含 NUL。

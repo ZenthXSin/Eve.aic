@@ -148,6 +148,7 @@ impl Forge {
             return Err(ToolError::Conflict);
         }
         let request = ForgeRequest {
+            owner: entry.owner.clone(),
             forge_id: entry.id.clone(),
             forger_version: entry.forger_version.clone(),
             gap: candidate.gap.clone(),

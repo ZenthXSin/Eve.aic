@@ -306,7 +306,17 @@ async fn run(
         {
             match stickers.library.next_pending() {
                 Ok(Some((id, image))) => {
-                    let request = reviewer.review(image);
+                    let session =
+                        match eve_llm_api::ModelSession::anchored("sticker-review", None, &id)
+                            .and_then(|s| s.with_turn(&id))
+                        {
+                            Ok(session) => session,
+                            Err(_) => {
+                                report("invalid_session", &id, json!({}));
+                                continue;
+                            }
+                        };
+                    let request = reviewer.review_with_session(image, session);
                     tokio::pin!(request);
                     let result = tokio::select! {
                         biased;

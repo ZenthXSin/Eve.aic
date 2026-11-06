@@ -139,6 +139,9 @@ pub struct DigestTool {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DigestRequest {
+    /// 独立摘要会话，由可信宿主/待处理范围构造，不进入摘要原文数据。
+    #[serde(skip)]
+    pub model_session: Option<eve_llm_api::ModelSession>,
     pub previous_turns: usize,
     pub previous: Vec<DigestPoint>,
     pub turns: Vec<DigestTurn>,
@@ -275,6 +278,15 @@ impl HistoryDigests for HistoryDigestService {
         scope: Option<&'a ContextScope>,
         messages: &'a [ChatMessage],
     ) -> LlmFuture<'a, Option<HistoryDigest>> {
+        self.compact_with_session(scope, messages, None)
+    }
+
+    fn compact_with_session<'a>(
+        &'a self,
+        scope: Option<&'a ContextScope>,
+        messages: &'a [ChatMessage],
+        parent_session: Option<&'a eve_llm_api::ModelSession>,
+    ) -> LlmFuture<'a, Option<HistoryDigest>> {
         Box::pin(async move {
             let Some(mut options) = self.policy.options()? else {
                 return Ok(None);
@@ -300,8 +312,20 @@ impl HistoryDigests for HistoryDigestService {
             };
             let total = history_turns(messages).len();
             while pending.base.as_ref().map_or(0, |v| v.covered_turns) < total {
-                let request = plan_active(&pending, options)
+                let mut request = plan_active(&pending, options)
                     .ok_or_else(|| LlmError::Context("上下文压缩没有向前推进".into()))?;
+                request.model_session = if let Some(parent) = parent_session {
+                    Some(
+                        parent
+                            .fork("history-digest", None)?
+                            .for_request(request.covered_turns() as u64),
+                    )
+                } else if scope.is_some() {
+                    request.model_session
+                } else {
+                    // 旧非会话调用不能借临时存储占位作用域生成全局缓存身份。
+                    None
+                };
                 let covered = request.covered_turns();
                 let points = digester
                     .digest(request)
@@ -472,6 +496,9 @@ fn plan_inner(
         None => (0, vec![]),
     };
     let mut request = DigestRequest {
+        model_session: Some(
+            eve_llm_api::ModelSession::scoped("history-digest", &pending.scope).ok()?,
+        ),
         previous_turns,
         previous,
         turns: vec![],
@@ -502,7 +529,15 @@ fn plan_inner(
         bytes = bytes.saturating_add(size);
         request.turns.push(turn);
     }
-    (!request.turns.is_empty()).then_some(request)
+    if request.turns.is_empty() {
+        return None;
+    }
+    // 覆盖轮数来自宿主历史序号；不使用原文指纹充当会话/轮次 ID。
+    request.model_session = request
+        .model_session
+        .take()
+        .and_then(|s| s.with_turn(&request.covered_turns().to_string()).ok());
+    Some(request)
 }
 
 /// 生成并保存一个新版本；返回保存的版本。任何失败都不改动已有文件。

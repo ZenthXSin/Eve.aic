@@ -33,6 +33,8 @@ pub trait QqSpeech: Send + Sync {
     /// 事实版本已经失效；原决定保留在账本中，不再进入待发队列。
     fn retire(&self, event: &QqSpeechEvent) -> PluginResult<()>;
     fn silenced(&self, event: &QqSpeechEvent) -> PluginResult<bool>;
+    /// future 可能在通道停止或事实失效时被丢弃；实现须恢复仍在审视的记录，
+    /// 不能覆盖已失效、已决定或已交给发送层的状态，也不能触发投递。
     fn consider(&self, event: QqSpeechEvent) -> LlmFuture<'_, Option<QqSpeechDecision>>;
     fn dispatched(&self, event: &QqSpeechEvent) -> PluginResult<()>;
     fn delivered(&self, event: &QqSpeechEvent, result: super::QqOutreachResult)

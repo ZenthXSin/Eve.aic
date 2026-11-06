@@ -52,6 +52,15 @@ impl PracticeDrafter for ModelPracticeDrafter {
             }
             let input = serde_json::to_string(&request).map_err(|_| PracticeError::InvalidInput)?;
             let model_request = ModelRequest {
+                session: Some(
+                    eve_llm_api::ModelSession::owned(
+                        "practice-drafter",
+                        &request.task.owner,
+                        &request.run_id,
+                    )
+                    .and_then(|s| s.with_turn(&request.attempt.to_string()))
+                    .map_err(provider_error)?,
+                ),
                 messages: vec![
                     ChatMessage::text(ChatRole::System, SYSTEM_PROMPT),
                     ChatMessage::text(ChatRole::User, FORMAT_GUARD),

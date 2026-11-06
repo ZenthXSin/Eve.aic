@@ -1095,6 +1095,9 @@ pub struct ProposalDraft {
 /// 交给建议器的全部数据。目标与草稿只是待分析的数据，不是指令，也不授予权限。
 #[derive(Clone, Serialize)]
 pub struct ProposalRequest {
+    /// 宿主绑定的独立模型用途，不进入提示词数据。
+    #[serde(skip)]
+    pub model_session: Option<eve_llm_api::ModelSession>,
     pub proposal_id: String,
     pub binding: PlanBinding,
     pub goal: String,
@@ -1110,8 +1113,14 @@ impl ProposalRequest {
         draft: Option<ProposalDraft>,
         capabilities: &[CapabilitySpec],
     ) -> PlanResult<Self> {
+        let proposal_id = proposal_id(subject_id, &binding)?;
         let request = Self {
-            proposal_id: proposal_id(subject_id, &binding)?,
+            model_session: Some(
+                eve_llm_api::ModelSession::owned("plan-proposal", subject_id, &proposal_id)
+                    .and_then(|s| s.with_turn(&binding.goal_revision.to_string()))
+                    .map_err(|_| PlanError::InvalidInput)?,
+            ),
+            proposal_id,
             binding,
             goal,
             draft,
