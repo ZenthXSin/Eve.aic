@@ -790,6 +790,7 @@ const DELIVERY_TIMEOUT: Duration = Duration::from_secs(35);
 struct ProgressDelivery {
     message: Message,
     part: usize,
+    host_activity: bool,
     deadline: tokio::time::Instant,
 }
 struct AuxiliaryDelivery {
@@ -1804,7 +1805,7 @@ pub(crate) async fn run(
                             let mut frame=json!({"type":"progress","version":1,"id":message.id,"index":part,"text":text,"proactive":proactive,"explicit":explicit_send,"based_on_message_id":conversations.latest_message_id(&event.key.session)?});
                             if let Some(path)=image_path {frame["image_path"]=json!(path);}
                             write(&mut stdin,frame).await?;
-                            progress_delivery.push(ProgressDelivery { message: message.clone(), part,
+                            progress_delivery.push(ProgressDelivery { message: message.clone(), part, host_activity: false,
                                 deadline: tokio::time::Instant::now() + DELIVERY_TIMEOUT });
                         } else {
                             ledger.entries[index].progress[part].state = PartState::Failed;
@@ -1861,7 +1862,7 @@ pub(crate) async fn run(
                     write(&mut stdin, json!({"type":"progress", "version":1, "id":message.id,
                         "index":part, "text":notice.text, "proactive":false, "explicit":false,
                         "host_activity":true, "based_on_message_id":message.id})).await?;
-                    progress_delivery.push(ProgressDelivery {message, part,
+                    progress_delivery.push(ProgressDelivery {message, part, host_activity: true,
                         deadline:tokio::time::Instant::now()+DELIVERY_TIMEOUT});
                 } else {
                     // 尚未写入桥接，Node 没有领取这个序号；撤销准备记录，不占用后续正式发言的序号和额度。
@@ -2551,6 +2552,9 @@ pub(crate) async fn run(
                         let index = ledger.find(&config.app_id, id).expect("progress receipt");
                         ledger.entries[index].progress[progress.part].state = PartState::Unknown;
                         ledger.save(&ctx)?;
+                        if progress.host_activity {
+                            host_progress::log_delivery(&ctx,&config.app_id,id,progress.part,PartState::Unknown,None);
+                        }
                         if let Some(speaker)=&speech {expression_receipt(speaker,&config.app_id,&ledger.entries[index],progress.part,QqOutreachResult::Unknown)?;}
                         if ledger.entries[index].progress[progress.part].decision_id.as_deref()
                             .is_some_and(|decision| live_waiting.get(id).is_some_and(|send| send.call_id == decision))
@@ -2809,6 +2813,10 @@ pub(crate) async fn run(
                             ledger.entries[index].progress[part].state = if ok { PartState::Sent } else if delivery_unknown(&frame) { PartState::Unknown } else { PartState::Failed };
                             ledger.entries[index].progress[part].platform_message_id = if ok && ledger.entries[index].progress[part].decision_id.is_some() { frame.get("message_id").and_then(Value::as_str).map(str::to_owned) } else { None };
                             ledger.save(&ctx)?;
+                            if progress.host_activity {
+                                host_progress::log_delivery(&ctx,&config.app_id,id,part,
+                                    ledger.entries[index].progress[part].state,frame.get("message_id").and_then(Value::as_str));
+                            }
                             if ledger.entries[index].progress[part].decision_id.is_some() {
                                 status.send_modify(|s| { if ok { s.sent += 1; } else { s.failed += 1; } });
                             }

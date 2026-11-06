@@ -2,7 +2,7 @@
 use eve_config_plugin::{ConfigBootstrap, ConfigPlugin};
 use eve_control_api::{CommitState, ControlRunner, RunFuture, RunReport};
 use eve_control_plugin::ControlPlugin;
-use eve_kernel::{Kernel, KernelServices};
+use eve_kernel::{Kernel, KernelServices, backends::MemoryLogger};
 use eve_llm_api::{
     ChatMessage, ChatRole, ContextScope, LlmFuture, ToolCall, ToolExecutionContext, TurnEvent,
     TurnEventKind, TurnEventSink, TurnSteeringSource,
@@ -245,8 +245,13 @@ impl ControlRunner for Runner {
 
 async fn scenario(mode: Mode) {
     let directory = tempfile::tempdir().unwrap();
-    let services = KernelServices::default();
+    let logger = Arc::new(MemoryLogger::default());
+    let services = KernelServices {
+        logger: logger.clone(),
+        ..KernelServices::default()
+    };
     let registry = services.registry.clone();
+    let state = services.state.clone();
     let kernel = Kernel::with_services(services);
     kernel
         .register(Box::new(SessionPlugin::new().unwrap()))
@@ -362,6 +367,48 @@ async fn scenario(mode: Mode) {
     if matches!(mode, Mode::Slow) {
         assert!(sent[0]["text"].as_str().unwrap().contains("等待回复生成"));
         assert!(sent[1]["text"].as_str().unwrap().contains("命令执行"));
+    }
+    let activity_count = match mode {
+        Mode::Slow => 2,
+        Mode::DelayedReceipt => 1,
+        _ => 0,
+    };
+    let snapshot = logger.snapshot().unwrap();
+    let receipts: Vec<_> = snapshot
+        .records
+        .iter()
+        .filter(|record| record.entry.message == "host_progress_delivery")
+        .collect();
+    assert_eq!(receipts.len(), activity_count);
+    for (index, record) in receipts.iter().enumerate() {
+        assert_eq!(record.entry.fields["app_id"], "app");
+        assert_eq!(record.entry.fields["input_message_id"], "initial-input");
+        assert_eq!(record.entry.fields["progress_index"], index.to_string());
+        assert_eq!(record.entry.fields["delivery_status"], "sent");
+        assert_eq!(
+            record.entry.fields["platform_message_id"],
+            format!("platform-{}", index + 1)
+        );
+        assert_eq!(record.entry.fields.len(), 5);
+    }
+    let bytes = state
+        .get(&PluginId::new(QQBOT_PLUGIN_ID).unwrap(), "receipts.v1")
+        .unwrap()
+        .unwrap();
+    validate_receipt_state(&bytes).unwrap();
+    let ledger: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(ledger["version"], 9);
+    let progress = ledger["entries"][0]
+        .get("progress")
+        .and_then(Value::as_array);
+    assert_eq!(progress.map_or(0, Vec::len), count);
+    if let Some(progress) = progress {
+        for entry in progress.iter().take(activity_count) {
+            assert_eq!(entry["state"], "Sent");
+            assert!(entry.get("decision_id").is_none());
+            assert!(entry.get("platform_message_id").is_none());
+        }
+        assert!(progress[activity_count]["decision_id"].as_str().is_some());
     }
 }
 

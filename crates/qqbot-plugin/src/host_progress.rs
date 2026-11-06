@@ -2,6 +2,7 @@
 use super::activities;
 use eve_control_api::{ControlEvent, ControlPhase, ControlSnapshot, GenerationKey};
 use eve_llm_api::TurnEventKind;
+use eve_plugin_api::{LogEntry, LogLevel, PluginContext};
 use std::{collections::BTreeMap, sync::Mutex, time::Duration};
 use tokio::time::Instant;
 
@@ -63,6 +64,55 @@ pub(super) fn quiet_request(text: &str) -> bool {
         ]
         .iter()
         .any(|phrase| text.to_ascii_lowercase().contains(phrase))
+}
+
+/// 活动平台编号进入现有宿主日志；主回执继续使用 v9 的状态与去重语义。
+pub(super) fn log_delivery(
+    ctx: &PluginContext,
+    app: &str,
+    input: &str,
+    index: usize,
+    state: crate::state::PartState,
+    platform_message_id: Option<&str>,
+) {
+    if let Some(entry) = delivery_entry(app, input, index, state, platform_message_id)
+        && ctx.log(entry).is_err()
+    {
+        // 不改变已保存的投递状态，不重发消息，也不递归请求失败的日志后端。
+        eprintln!("EVE_QQ_HOST_PROGRESS_LOG_UNAVAILABLE");
+    }
+}
+
+fn delivery_entry(
+    app: &str,
+    input: &str,
+    index: usize,
+    state: crate::state::PartState,
+    platform_message_id: Option<&str>,
+) -> Option<LogEntry> {
+    use crate::state::{PartState, valid_id, valid_message_id};
+    if !valid_id(app) || !valid_message_id(input) || index >= 64 {
+        return None;
+    }
+    let (level, status) = match state {
+        PartState::Sent => (LogLevel::Info, "sent"),
+        PartState::Failed => (LogLevel::Warn, "failed"),
+        PartState::Unknown => (LogLevel::Warn, "unknown"),
+        _ => return None,
+    };
+    let mut entry = LogEntry::new(level, "eve.qqbot", "host_progress_delivery")
+        .ok()?
+        .with_field("app_id", app)
+        .with_field("input_message_id", input)
+        .with_field("progress_index", index.to_string())
+        .with_field("delivery_status", status);
+    if state == PartState::Sent {
+        entry = entry.with_field(
+            "platform_message_id",
+            platform_message_id.filter(|id| valid_message_id(id))?,
+        );
+    }
+    Some(entry)
 }
 
 pub(super) struct Notice {
@@ -386,5 +436,21 @@ mod tests {
                 .is_some()
         );
         assert_eq!(host.0.lock().unwrap().active.len(), 128);
+    }
+
+    #[test]
+    fn activity_delivery_log_keeps_validated_receipt_ids_and_never_invents_unknown_ids() {
+        use crate::state::PartState;
+        let sent = delivery_entry("app", "input", 0, PartState::Sent, Some("platform-1")).unwrap();
+        assert_eq!(sent.message, "host_progress_delivery");
+        assert_eq!(sent.fields["input_message_id"], "input");
+        assert_eq!(sent.fields["platform_message_id"], "platform-1");
+        assert_eq!(sent.fields["delivery_status"], "sent");
+        assert_eq!(sent.fields.len(), 5);
+        assert!(delivery_entry("app", "input", 0, PartState::Sent, Some("\n")).is_none());
+        let unknown =
+            delivery_entry("app", "input", 1, PartState::Unknown, Some("late-id")).unwrap();
+        assert_eq!(unknown.fields["delivery_status"], "unknown");
+        assert!(!unknown.fields.contains_key("platform_message_id"));
     }
 }
