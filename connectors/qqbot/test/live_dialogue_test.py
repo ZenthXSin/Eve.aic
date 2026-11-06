@@ -169,9 +169,11 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
                 return self.choose('send_message', {'text': '行，忙完再聊'})
             return dialogue.text_response('内部结束')
         self.callback = respond
+        # Handled 先落盘，桥接须收到随后写出的 finish 才能结束进程。
         self.run_live([{'send': self.message('base', '出来聊聊')}, {'wait_file': str(self.arrived('chat', 1))},
             {'send': self.message('steer', '等下，我先去修电脑')}, self.wait_receipt('steer', 'Merged'),
-            {'touch': str(self.gate('release-old-draft'))}, self.wait_receipt('base')])
+            {'touch': str(self.gate('release-old-draft'))}, self.wait_receipt('base'),
+            self.wait_command('base', 'finish')])
         self.assertEqual([e['text'] for e in self.progress('base')], ['行，忙完再聊'])
         self.assertEqual(self.progress('steer'), [])
         before = self.chat_rounds
