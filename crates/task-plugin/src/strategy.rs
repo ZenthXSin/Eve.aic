@@ -28,7 +28,7 @@ pub fn evaluate_task_effect(
     if !task.status.finished() {
         return Err(TaskError::InvalidTransition);
     }
-    if task.status != TaskStatus::Completed || task.cancel_requested {
+    if task.is_exploration() || task.status != TaskStatus::Completed || task.cancel_requested {
         return Ok(unknown("task_not_completed"));
     }
     let Some(checkpoint) = task.execution.as_ref().and_then(|e| e.checkpoint.as_ref()) else {
@@ -554,6 +554,9 @@ impl TaskStrategyLearning for Stored {
         })
     }
     fn prepare(&self, task: &Task) -> TaskResult<Option<TaskStrategyGuidance>> {
+        if task.is_exploration() {
+            return Ok(None);
+        }
         if task.status != TaskStatus::Running || task.cancel_requested {
             return Err(TaskError::InvalidTransition);
         }

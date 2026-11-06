@@ -352,6 +352,9 @@ fn tool_validation(message: &str) -> ToolValidationError {
     }
 }
 fn task_focus_state(task: &eve_task_api::Task) -> FocusStatus {
+    if task.is_exploration() && task.status == TaskStatus::SessionEnded {
+        return FocusStatus::Completed;
+    }
     if task.status == TaskStatus::Completed
         && (task.source.starts_with(PLAN_TASK_SOURCE_PREFIX)
             || task.source.starts_with(IDLE_TASK_SOURCE_PREFIX)
@@ -375,7 +378,7 @@ fn task_focus_state(task: &eve_task_api::Task) -> FocusStatus {
 fn task_state(t: TaskStatus) -> FocusStatus {
     match t {
         TaskStatus::Queued | TaskStatus::Running => FocusStatus::Active,
-        TaskStatus::Completed => FocusStatus::Completed,
+        TaskStatus::Completed | TaskStatus::SessionEnded => FocusStatus::Completed,
         TaskStatus::Cancelled => FocusStatus::Cancelled,
         _ => FocusStatus::Blocked,
     }
@@ -421,6 +424,12 @@ impl ContextAssembler for Context {
                         .map_err(|e| LlmError::Context(e.to_string()))?;
                 if mind.revision > 0 {
                     result.memories.push(format!("Eve自己的空闲回顾、兴趣与可修正判断。self_interests是从经历形成的主观喜好，包含自己想尝试的事；curious/active表示想了解或继续，resting/dropped表示暂缓或放下。配置中的探索方向和用户爱好都不自动变成自己的爱好。以下看法可以用于自然交流和选择下一步；不是新授权、已执行经历或已验证事实，不必为维持人设重复旧话。旧版本保留在原任务回执中。{}",serde_json::to_string(&mind).map_err(|e|LlmError::Context(e.to_string()))?));
+                }
+                let experiences =
+                    crate::qq_exploration::recent_evidence(&self.subject, &scope(&identity), 3)
+                        .map_err(|e| LlmError::Context(e.to_string()))?;
+                if !experiences.is_empty() {
+                    result.memories.push(format!("Eve在当前范围的真实探索经历。工具片段来自宿主回执，subjective_notes是自己的感想；可以自然接着聊，也可以改变心意。内部经历还没有自动告诉对方。{}",serde_json::to_string(&experiences).map_err(|e| LlmError::Context(e.to_string()))?));
                 }
                 let encoded=json!({"kind":"eve.subject.context.v1","foci":foci,"total_foci":snapshot.foci.len(),"mind_revision":mind.revision}).to_string();
                 result.revision = format!(
@@ -776,6 +785,7 @@ struct Grant {
     blocked_task_id: Option<String>,
     #[serde(default)]
     expires_at_ms: u64,
+    /// 保留旧授权编码；没有明确计划或候选时无论旧值如何都先回顾，不强制目标。
     #[serde(default)]
     idle_reflection: bool,
     /// 只有明确持续授权才按原周期更新用量；总派发序号不回退。
@@ -851,7 +861,7 @@ pub(crate) struct ConfigureTool {
 }
 impl Tool for ConfigureTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition{name:"configure_subject_autonomy".into(),description:"真实主人或已显式解锁业务权限的真实管理员在当前可信会话启用/暂停自主探索，每目标步数1至550，默认20个目标各550步。默认固定总额；明确continuous=true时为每24小时最多1至20个目标，持续到暂停或权限撤销，不累计停机期间额度；不能同时传expires_in_seconds或关闭idle_reflection。探索方向不等于自己的爱好。宿主按真实身份与现有权限允许前台配置，不再审核目标收益、聊天原话或逐步意图；每个前台轮次最多新增一次预算。后台/子代理沿用既有预算，不能自行重置额度。固定授权耗尽或过期停止；持续授权本周期用尽后等待下一窗口。空闲模式的已确认失败至少30分钟后可新回顾，未知副作用继续阻塞，不重放原动作。30分钟检查不刷新预算或期限。有效期默认24小时、最长7天。授权仅在当前精确scope生效，不将群聊内容传播至别处。新授权默认启用空闲回顾idle_reflection：无人打扰时无工具回顾经历，由模型选择等待、继续思考或提议行动，回顾和行动各计一个原目标名额。旧授权不自动开启。暂停不撤销已发生副作用，运行任务另行取消。".into(),argument_schema:json!({"type":"object","properties":{"action":{"const":"configure_autonomy"},"enabled":{"type":"boolean"},"idle_reflection":{"type":"boolean"},"continuous":{"type":"boolean"},"max_goals":{"type":"integer","minimum":1,"maximum":MAX_GRANT_GOALS},"steps_per_goal":{"type":"integer","minimum":1,"maximum":STEPS},"expires_in_seconds":{"type":"integer","minimum":1800,"maximum":604800},"interests":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8}},"required":["action","enabled"],"additionalProperties":false}),required_permissions:vec![],concurrency:Some(ToolConcurrency::Serial{scope:"subject-focus".into()})}
+        ToolDefinition{name:"configure_subject_autonomy".into(),description:"真实主人或已显式解锁业务权限的真实管理员在当前可信会话启用/暂停自主探索，每段步数1至550，默认20段各550步。兼容字段max_goals表示会话或明确目标的名额，steps_per_goal表示每段工具预算。默认固定总额；明确continuous=true时为每24小时最多1至20段，持续到暂停或权限撤销，不累计停机期间额度；不能同时传expires_in_seconds或关闭idle_reflection。探索方向不等于自己的爱好。宿主按真实身份与现有权限允许前台配置，不再审核目标收益、聊天原话或逐步意图；每个前台轮次最多新增一次预算。后台/子代理沿用既有预算，不能自行重置额度。固定授权耗尽或过期停止；持续授权本周期用尽后等待下一窗口。回顾和探索的已确认失败至少30分钟后可新回顾，未知副作用保留待核对，不重放原动作。30分钟检查不刷新预算或期限。有效期默认24小时、最长7天。授权仅在当前精确scope生效，不将群聊内容传播至别处。没有明确计划或候选时先回顾经历，由Eve选择等待、继续思考、自由探索或提出明确任务；回顾与后续会话各计一个原名额。旧idle_reflection=false仍可读取，但不再强制价值目标。普通探索不追加收益评审或逐步重复授权，只核对身份和是否直接危害系统安全。暂停不撤销已发生副作用，运行任务另行取消。".into(),argument_schema:json!({"type":"object","properties":{"action":{"const":"configure_autonomy"},"enabled":{"type":"boolean"},"idle_reflection":{"type":"boolean"},"continuous":{"type":"boolean"},"max_goals":{"type":"integer","minimum":1,"maximum":MAX_GRANT_GOALS},"steps_per_goal":{"type":"integer","minimum":1,"maximum":STEPS},"expires_in_seconds":{"type":"integer","minimum":1800,"maximum":604800},"interests":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8}},"required":["action","enabled"],"additionalProperties":false}),required_permissions:vec![],concurrency:Some(ToolConcurrency::Serial{scope:"subject-focus".into()})}
     }
     fn validate_arguments(&self, v: &Value) -> Result<(), ToolValidationError> {
         configure_args(v).map(|_| ())
@@ -1106,7 +1116,12 @@ fn reconcile_autonomy(
     };
     let expected_source = format!(
         "{}{}:{}",
-        if previous.goal.starts_with(IDLE_INPUT_PREFIX) {
+        if previous
+            .goal
+            .starts_with(crate::qq_exploration::INPUT_PREFIX)
+        {
+            crate::qq_exploration::SOURCE_PREFIX
+        } else if previous.goal.starts_with(IDLE_INPUT_PREFIX) {
             IDLE_TASK_SOURCE_PREFIX
         } else if previous.goal.starts_with(PLAN_INPUT_PREFIX) {
             PLAN_TASK_SOURCE_PREFIX
@@ -1116,20 +1131,22 @@ fn reconcile_autonomy(
         id(s, "task-source"),
         previous.id
     );
+    let exploration_ended = task.is_exploration() && task.status == TaskStatus::SessionEnded;
     if task.source != expected_source
-        || task.status != TaskStatus::Completed
-        || task.cancel_requested
-        || task
-            .execution
-            .as_ref()
-            .and_then(|e| e.completion_contract.as_ref())
-            .is_none()
-        || !task.result.as_deref().is_some_and(|result| {
-            matches!(
-                eve_task_plugin::evaluate_task_completion(&task, result),
-                eve_task_api::TaskCompletionAssessment::Verified
-            )
-        })
+        || (!exploration_ended
+            && (task.status != TaskStatus::Completed
+                || task.cancel_requested
+                || task
+                    .execution
+                    .as_ref()
+                    .and_then(|e| e.completion_contract.as_ref())
+                    .is_none()
+                || !task.result.as_deref().is_some_and(|result| {
+                    matches!(
+                        eve_task_plugin::evaluate_task_completion(&task, result),
+                        eve_task_api::TaskCompletionAssessment::Verified
+                    )
+                })))
     {
         return Ok(());
     }
@@ -1199,7 +1216,13 @@ fn plan_next(
         match previous.map(|f| f.status) {
             Some(FocusStatus::Active) => return Ok(None),
             Some(FocusStatus::Completed) => {}
-            Some(FocusStatus::Blocked) if grant.idle_reflection => {
+            Some(FocusStatus::Blocked)
+                if grant.idle_reflection
+                    || previous.is_some_and(|focus| {
+                        focus.goal.starts_with(IDLE_INPUT_PREFIX)
+                            || focus.goal.starts_with(crate::qq_exploration::INPUT_PREFIX)
+                    }) =>
+            {
                 let task = previous
                     .and_then(|f| f.task_id.as_ref())
                     .map(|id| {
@@ -1364,7 +1387,7 @@ fn plan_next(
     } else {
         None
     };
-    if grant.idle_reflection {
+    if grant.idle_reflection || (planned.is_none() && proposal.is_none()) {
         if snapshot.events.iter().any(|event| {
             event.input.source == EventSource::UserIngress
                 && now.saturating_sub(event.created_at_ms) < AUTONOMY_INTERVAL_MS
@@ -1388,25 +1411,20 @@ fn plan_next(
     let mut frozen_contract = planned
         .as_ref()
         .map(|plan| plan.completion_contract.clone());
-    let idle = if let Some(plan) = planned {
-        Some((
+    let mut exploration = None;
+    let (title, goal) = if let Some(plan) = planned {
+        (
             plan.title,
             encode_opportunity(&Opportunity {
                 goal: plan.goal,
                 assessment: plan.assessment,
             })?,
-        ))
+        )
     } else if let Some(proposal) = proposal {
         frozen_contract = focus_contract(&snapshot, &proposal.id)?;
-        Some((proposal.title.clone(), proposal.goal.clone()))
-    } else if grant.idle_reflection {
-        // 空闲时只观察，不与用户在途输入或同范围执行争抢；等待不消耗新目标名额。
-        if snapshot.events.iter().any(|e| {
-            e.input.source == EventSource::UserIngress
-                && now.saturating_sub(e.created_at_ms) < AUTONOMY_INTERVAL_MS
-        }) {
-            return Ok(None);
-        }
+        (proposal.title.clone(), proposal.goal.clone())
+    } else {
+        // 没有明确计划或候选时统一回顾；旧 idle_reflection=false 不再强制生成价值目标。
         let previous = snapshot.foci.iter().find(|f| {
             grant.issued > 0 && f.id == format!("auto-{}-{}", grant.generation, grant.issued - 1)
         });
@@ -1435,6 +1453,19 @@ fn plan_next(
                     }) {
                         None
                     } else {
+                        if result.choice == IdleChoice::Explore {
+                            let store = subject.idle_memory().ok_or(SubjectError::Unavailable)?;
+                            let source = store.exploration_source(s, &task.id)?;
+                            let next_id = format!("auto-{}-{}", grant.generation, grant.issued);
+                            if source.as_ref().is_none_or(|id| id == &next_id) {
+                                exploration = Some(crate::qq_exploration::ExplorationInput {
+                                    scope: s.clone(),
+                                    reflection_id: task.id.clone(),
+                                    exploration: result.exploration.clone(),
+                                    thought: result.thought.clone(),
+                                });
+                            }
+                        }
                         result.action
                     }
                 }
@@ -1475,13 +1506,15 @@ fn plan_next(
                         .is_some_and(|o| o.assessment.problem_key == action.assessment.problem_key)
                 })
         });
-        if let Some(action) = action {
+        if let Some(input) = &exploration {
+            ("探索会话".into(), input.encode()?)
+        } else if let Some(action) = action {
             frozen_contract = crate::idle_loop::action_completion_contract(&action)?;
             let encoded = encode_opportunity(&Opportunity {
                 goal: action.goal,
                 assessment: action.assessment,
             })?;
-            Some((action.title, encoded))
+            (action.title, encoded)
         } else {
             let fresh = subject.snapshot_for(s)?;
             let mind = crate::idle_loop::current_mind(subject, &fresh, s)?;
@@ -1497,35 +1530,16 @@ fn plan_next(
                 evidence: vec![],
                 judgments: vec![],
             };
-            Some((
+            (
                 "空闲回顾：经历、自己的兴趣与想法".into(),
                 format!(
                     "{IDLE_INPUT_PREFIX}{}",
                     serde_json::to_string(&observation).map_err(|_| SubjectError::InvalidInput)?
                 ),
-            ))
+            )
         }
-    } else {
-        None
     };
     let index = grant.issued;
-    let topic = &grant.interests[(index % grant.interests.len() as u64) as usize];
-    if idle.is_none()
-        && let Some(proposal) = proposal
-    {
-        frozen_contract = focus_contract(&snapshot, &proposal.id)?;
-    }
-    // 有候选但没有值得做的新问题时保持等待，不靠泛化探索绕过价值判断或去重。
-    if idle.is_none()
-        && proposal.is_none()
-        && snapshot
-            .foci
-            .iter()
-            .any(|f| f.id.starts_with(PROPOSAL_PREFIX) && f.status == FocusStatus::Blocked)
-    {
-        return Ok(None);
-    }
-    let (title,goal)=idle.unwrap_or_else(||proposal.map(|f|(f.title.clone(),f.goal.clone())).unwrap_or_else(||(format!("自主探索：{topic}"),format!("在既定兴趣“{topic}”中选择一个尚未验证的具体问题，先检索已有经验和本范围任务结果，独立实作、验证并记录新证据。方向可依真实经历改变，不要为了维持旧人设重复研究。定期优先检查已有失败诊断、阻塞任务、真实交互缺陷、内存与磁盘压力和重复流程；先用工具核对真实问题来源，比较修复价值、已有替代方案、成本和风险，选择能验证的小目标；没有值得做的事就明确记录无新发现，不为忙碌造任务。反复出现且验证通过的流程可整理为经验或插件候选，先核对权限、预演与实际验收，不把候选当成已生效工具。完成后用manage_subject_focus discover及assessment保存有证据的新问题和复用计划；候选不授予额外预算。"))));
     let mut focus = SubjectFocus {
         id: format!("auto-{}-{index}", grant.generation),
         scope: s.clone(),
@@ -1552,6 +1566,12 @@ fn plan_next(
         }
     }
     validate_focus(&focus)?;
+    if let Some(input) = &exploration {
+        subject
+            .idle_memory()
+            .ok_or(SubjectError::Unavailable)?
+            .reserve_exploration_source(s, &input.reflection_id, &focus.id, now)?;
+    }
     if let Some(memory) = subject.autonomy_memory()
         && let Some(opportunity) = decode_opportunity(&focus.goal)?
     {
@@ -1576,7 +1596,7 @@ fn plan_next(
             changes.push(authority);
         }
     }
-    // 目标、验收和原授权名额一起写入；容量失败不能只扣预算或丢失冻结合同。
+    // 会话或明确目标与原授权名额一起写入；容量失败不能只扣预算或丢失冻结合同。
     grant.issued = grant
         .issued
         .checked_add(1)
@@ -1657,6 +1677,10 @@ fn reconcile_tasks(
                     .strip_prefix("subject-focus:")
                     .or_else(|| task.source.strip_prefix(IDLE_TASK_SOURCE_PREFIX))
                     .or_else(|| task.source.strip_prefix(PLAN_TASK_SOURCE_PREFIX))
+                    .or_else(|| {
+                        task.source
+                            .strip_prefix(crate::qq_exploration::SOURCE_PREFIX)
+                    })
                     .and_then(|key| {
                         snapshot
                             .foci
@@ -1666,6 +1690,14 @@ fn reconcile_tasks(
                     })
             });
         let expected = task_focus_state(task);
+        if task.is_exploration() && task.status.finished() {
+            let experience = crate::qq_exploration::experience(task, &s)?;
+            // 经历必须先独立保存，后面的关注/消费索引写失败只重试保存，不重做工具。
+            subject
+                .idle_memory()
+                .ok_or(SubjectError::Unavailable)?
+                .record_exploration(&experience)?;
+        }
         let mut focus = focus.unwrap_or_else(|| SubjectFocus {
             id: format!("task-{}", task.id),
             scope: s.clone(),
@@ -1727,6 +1759,14 @@ fn reconcile_tasks(
                 Ok(_) | Err(SubjectError::InvalidTransition) => {}
                 Err(e) => return Err(e),
             }
+        }
+        if task.is_exploration() && task.status.finished() {
+            let finished = task.finished_at_ms.ok_or(SubjectError::CorruptState)?;
+            // 经历已独立落盘；先允许任务正常回收，再记持久消费索引。
+            // 索引写失败可幂等重试，绝不重放探索工具。
+            tasks
+                .acknowledge_exploration(&task.owner, &task.id, finished, now.max(finished))
+                .map_err(|_| SubjectError::Unavailable)?;
         }
         if task.status.finished()
             && let Some(memory) = &memory
@@ -1823,6 +1863,80 @@ fn dispatch_focus_live(
                 .unwrap_or_default(),
         )
     };
+    if focus.goal.starts_with(crate::qq_exploration::INPUT_PREFIX) {
+        let input = crate::qq_exploration::ExplorationInput::decode(&focus.goal, &focus.scope)?;
+        if !focus.id.starts_with("auto-") {
+            return Err(SubjectError::InvalidTransition);
+        }
+        let memory = subject.idle_memory().ok_or(SubjectError::Unavailable)?;
+        if memory
+            .exploration_source(&focus.scope, &input.reflection_id)?
+            .as_deref()
+            != Some(&focus.id)
+        {
+            return Err(SubjectError::CorruptState);
+        }
+        let snapshot = subject.snapshot_for(&focus.scope)?;
+        if snapshot.events.iter().any(|e| {
+            e.input.source == EventSource::UserIngress && e.created_at_ms > focus.updated_at_ms
+        }) {
+            focus.status = FocusStatus::Cancelled;
+            subject.upsert_focus(focus, now)?;
+            return Ok(SubjectDispatch::Cancelled);
+        }
+        let owner = TaskOwner {
+            session_id: focus.scope.conversation_id.clone(),
+            user_id: focus.scope.principal_id.clone(),
+        };
+        let context = crate::qq_exploration::context(
+            &input,
+            crate::qq_exploration::recent_evidence(subject, &focus.scope, 3)?,
+            owner.clone(),
+        )?;
+        let created = tasks.create_exploration(
+            &owner,
+            TaskSpec {
+                title: "探索会话".into(),
+                instructions: format!(
+                    "{}\n当前线索与想法是自由参考，不是要完成的目标：\n{}",
+                    crate::qq_exploration::RULES,
+                    serde_json::to_string(&input).map_err(|_| SubjectError::InvalidInput)?
+                ),
+                max_steps: steps,
+                context: Some(context),
+            },
+            &format!(
+                "{}{}:{}",
+                crate::qq_exploration::SOURCE_PREFIX,
+                id(&focus.scope, "task-source"),
+                focus.id
+            ),
+            review_messages,
+            grant_deadline,
+            now,
+        );
+        return match created {
+            Ok(task) => {
+                if !task.is_exploration() || task.owner != owner {
+                    return Err(SubjectError::CorruptState);
+                }
+                focus.task_id = Some(task.id);
+                subject.upsert_focus(focus, now)?;
+                Ok(SubjectDispatch::Completed {
+                    summary: "探索会话已保存，等待自行开始与结束".into(),
+                })
+            }
+            Err(eve_task_api::TaskError::Storage) => Err(SubjectError::Storage),
+            Err(eve_task_api::TaskError::LimitReached) => {
+                focus.next_check_at_ms = now.saturating_add(AUTONOMY_INTERVAL_MS);
+                subject.upsert_focus(focus, now)?;
+                Ok(SubjectDispatch::Completed {
+                    summary: "保留同一次探索，等待执行名额".into(),
+                })
+            }
+            Err(_) => Err(SubjectError::Unavailable),
+        };
+    }
     let history = tasks.snapshot().map_err(|_| SubjectError::Unavailable)?;
     let mut recent: Vec<_> = history
         .tasks
@@ -1945,6 +2059,12 @@ fn dispatch_focus_live(
             }
         }
         if let Some(store) = subject.idle_memory() {
+            let experiences = crate::qq_exploration::recent_evidence(subject, &focus.scope, 3)?;
+            // 真实探索单独留出空间，旧任务摘要和旧焦点不能把经历挤掉。
+            observation
+                .evidence
+                .truncate(16usize.saturating_sub(experiences.len()));
+            observation.evidence.extend(experiences);
             store.prepare_observation(&mut observation)?;
         }
         context.messages_json = serde_json::to_string(&vec![eve_llm_api::ChatMessage::text(
@@ -1997,7 +2117,6 @@ fn dispatch_focus_live(
                 "/thought",
                 "/reason",
                 "/judgments",
-                "/action",
                 "/revisit_after_minutes",
             ]
             .into_iter()
@@ -2119,7 +2238,9 @@ fn tick_live(
         if authorization.allows_autonomy(&identity(&s))
             && !foreground_busy(control, &s)?
             && let Some(next) = plan_next(subject, tasks, &s, now)?
-            && grant_for(subject, &s)?.is_some_and(|(_, g)| g.idle_reflection)
+            && (next.goal.starts_with(IDLE_INPUT_PREFIX)
+                || next.goal.starts_with(crate::qq_exploration::INPUT_PREFIX)
+                || grant_for(subject, &s)?.is_some_and(|(_, g)| g.idle_reflection))
         {
             subject.enqueue(
                 SubjectEventInput {
@@ -2849,7 +2970,7 @@ mod tests {
         );
         assert!(task.spec.instructions.contains("experience_memory"));
         assert!(!task.spec.instructions.contains("eve-opportunity-v1"));
-        // 另一会话只剩负收益候选时，不派发泛化探索，也不消耗授权名额。
+        // 另一会话没有可采纳候选时先回顾，不因候选的价值判断限制自由探索。
         f.config()
             .execute(config_call(), authorized("b"))
             .await
@@ -2860,17 +2981,76 @@ mod tests {
         )
         .await
         .unwrap();
+        let b_now = crate::qq_tasks::now_ms() + AUTONOMY_INTERVAL_MS;
         for offset in 5..10 {
-            f.tick(now + offset);
+            f.tick(b_now + offset);
         }
-        assert_eq!(f.tasks.snapshot().unwrap().tasks.len(), 1);
+        let tasks = f.tasks.snapshot().unwrap();
+        assert_eq!(tasks.tasks.len(), 2);
+        let review = tasks
+            .tasks
+            .iter()
+            .find(|task| task.owner.session_id == "b")
+            .unwrap();
+        assert!(review.source.starts_with(IDLE_TASK_SOURCE_PREFIX));
+        assert!(!review.source.starts_with(PLAN_TASK_SOURCE_PREFIX));
         let b = f
             .subject
             .snapshot_for(&scope(&trusted("b", "owner")))
             .unwrap();
         let policy = b.foci.iter().find(|focus| focus.id == POLICY_ID).unwrap();
         let grant: Grant = serde_json::from_str(&policy.goal).unwrap();
-        assert_eq!(grant.issued, 0);
+        assert_eq!(grant.issued, 1);
+        assert!(b.foci.iter().any(|focus| {
+            focus.id.starts_with(PROPOSAL_PREFIX) && focus.status == FocusStatus::Blocked
+        }));
+    }
+
+    #[tokio::test]
+    async fn legacy_false_or_absent_idle_flag_starts_review_without_inventing_a_goal() {
+        for absent in [false, true] {
+            let f = Fixture::new().await;
+            f.config()
+                .execute(config_call(), authorized("legacy-review"))
+                .await
+                .unwrap();
+            let s = scope(&trusted("legacy-review", "owner"));
+            let subject = f.subject.clone() as Arc<dyn SubjectAdmin>;
+            let (mut policy, original) = grant_for(&subject, &s).unwrap().unwrap();
+            let t = policy.updated_at_ms;
+            if absent {
+                let mut raw: Value = serde_json::from_str(&policy.goal).unwrap();
+                raw.as_object_mut().unwrap().remove("idle_reflection");
+                policy.goal = raw.to_string();
+                f.subject.upsert_focus(policy, t).unwrap();
+            }
+            pump(&f, t + AUTONOMY_INTERVAL_MS);
+            let tasks = f.tasks.snapshot().unwrap();
+            assert_eq!(tasks.tasks.len(), 1);
+            let review = &tasks.tasks[0];
+            assert!(review.source.starts_with(IDLE_TASK_SOURCE_PREFIX));
+            assert!(!review.is_exploration());
+            assert!(crate::idle_loop::task_input(review).is_ok());
+            assert_eq!(review.spec.max_steps, original.steps_per_goal);
+            assert_eq!(
+                review
+                    .execution
+                    .as_ref()
+                    .unwrap()
+                    .authorization_deadline_at_ms,
+                Some(original.expires_at_ms)
+            );
+            let (_, after) = grant_for(&subject, &s).unwrap().unwrap();
+            assert!(!after.idle_reflection);
+            assert_eq!(after.issued, 1);
+            assert_eq!(after.generation, original.generation);
+            assert_eq!(after.evidence_digest, original.evidence_digest);
+            assert_eq!(after.review_messages, original.review_messages);
+            assert_eq!(after.max_goals, original.max_goals);
+            assert_eq!(after.expires_at_ms, original.expires_at_ms);
+            assert_eq!(after.configured_turn_id, original.configured_turn_id);
+            f.kernel.stop_all().await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2914,6 +3094,7 @@ mod tests {
     #[tokio::test]
     async fn failed_autonomy_blocks_chain_and_pause_keeps_running_task_result_honest() {
         let f = Fixture::new().await;
+        candidate(&f, "a", "first", "明确委托的固定产物").await;
         let config = f.config();
         config
             .execute(config_call(), authorized("a"))
@@ -3216,6 +3397,20 @@ mod tests {
     #[tokio::test]
     async fn missing_contract_plans_without_tools_then_freezes_original_action_contract() {
         let f = Fixture::new().await;
+        let original_goal = "创建固定产物并验证摘要";
+        FocusTool(f.subject.clone())
+            .execute(
+                call(
+                    "manage_subject_focus",
+                    json!({
+                        "action":"discover", "id":"missing-contract",
+                        "title":"创建固定产物", "goal":original_goal,
+                    }),
+                ),
+                authorized("a").with_delegated(true),
+            )
+            .await
+            .unwrap();
         f.config()
             .execute(config_call(), authorized("a"))
             .await
@@ -3224,6 +3419,16 @@ mod tests {
         pump(&f, now);
         let planning = f.tasks.snapshot().unwrap().tasks[0].clone();
         assert!(planning.source.starts_with(PLAN_TASK_SOURCE_PREFIX));
+        let input: PlanningInput = serde_json::from_str(
+            planning
+                .spec
+                .instructions
+                .strip_prefix(PLAN_INPUT_PREFIX)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(input.goal, original_goal);
+        assert!(input.exact_goal && input.require_receipts);
         assert!(matches!(
             planning.execution.as_ref().unwrap().completion_contract,
             Some(eve_task_api::TaskCompletionContract::Text { .. })
@@ -3259,7 +3464,7 @@ mod tests {
                 .instructions,
             planning.spec.instructions
         );
-        let result = json!({"title":"规划后创建固定产物","goal":"创建固定产物并验证摘要",
+        let result = json!({"title":"规划后创建固定产物","goal":original_goal,
             "assessment":{"problem_key":"planned-artifact","expected_gain":"验证有复用价值的结果","verification":"读取完整文件SHA256","reuse_plan":"保留固定工序","benefit":90,"confidence":100,"cost":10,"risk":0,"evidence":[]},
             "completion_contract":file_contract()}).to_string();
         assert!(validate_plan_result(&planning, &result).is_ok());
@@ -3901,6 +4106,119 @@ mod tests {
         );
         f.kernel.stop_all().await.unwrap();
     }
+    #[tokio::test]
+    async fn exploration_reconciliation_persists_before_acknowledging_and_keeps_failed_history() {
+        for conflict in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let memory = Arc::new(
+                eve_subject_sqlite::SqliteIdleMemory::open(&temporary.path().join("mind.sqlite3"))
+                    .unwrap(),
+            );
+            let f = Fixture::with_memory(Some(memory.clone())).await;
+            let owner = TaskOwner {
+                session_id: "a".into(),
+                user_id: "owner".into(),
+            };
+            let task = f
+                .tasks
+                .create_exploration(
+                    &owner,
+                    TaskSpec {
+                        title: "探索会话".into(),
+                        instructions: crate::qq_exploration::RULES.into(),
+                        max_steps: 10,
+                        context: None,
+                    },
+                    "subject-explore:reconciliation",
+                    vec![],
+                    None,
+                    1000,
+                )
+                .unwrap();
+            f.tasks.start(&task.id, 1001).unwrap();
+            let mut checkpoint = frame(&task);
+            checkpoint.result = Some("现在想先歇会儿".into());
+            f.tasks
+                .checkpoint_with_deadline(&task.id, checkpoint, None, 1002)
+                .unwrap();
+            let ended = f
+                .tasks
+                .finish(
+                    &task.id,
+                    TaskEnd::SessionEnded {
+                        result: "现在想先歇会儿".into(),
+                    },
+                    TaskUsage {
+                        tool_calls: 0,
+                        model_requests: 1,
+                    },
+                    1003,
+                )
+                .unwrap();
+            let s = scope(&trusted("a", "owner"));
+            let expected = crate::qq_exploration::experience(&ended, &s).unwrap();
+            if conflict {
+                let mut earlier = expected.clone();
+                earlier.subjective_notes = Some(crate::qq_exploration::excerpt("保留先前记录"));
+                memory.record_exploration(&earlier).unwrap();
+            }
+            let subject = f.subject.clone() as Arc<dyn SubjectAdmin>;
+            let tasks = f.tasks.clone() as Arc<dyn TaskAdmin>;
+            let result = reconcile_tasks(&subject, &tasks, 1002);
+            let actual = f.tasks.get_owned(&owner, &task.id).unwrap().unwrap();
+            let outcome = id(
+                &s,
+                &serde_json::to_string(&(
+                    ended.status,
+                    ended.finished_at_ms,
+                    ended.cancel_requested,
+                    ended.execution.as_ref().unwrap().recoveries,
+                ))
+                .unwrap(),
+            );
+            if conflict {
+                assert!(result.is_err());
+                assert!(
+                    actual
+                        .execution
+                        .as_ref()
+                        .unwrap()
+                        .exploration_acknowledged_at_ms
+                        .is_none()
+                );
+                assert!(!memory.task_reconciled(&s, &task.id, &outcome).unwrap());
+                assert_eq!(
+                    memory
+                        .exploration(&s, &task.id)
+                        .unwrap()
+                        .unwrap()
+                        .subjective_notes
+                        .unwrap()
+                        .text,
+                    "保留先前记录"
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(memory.exploration(&s, &task.id).unwrap(), Some(expected));
+                assert_eq!(
+                    actual
+                        .execution
+                        .as_ref()
+                        .unwrap()
+                        .exploration_acknowledged_at_ms,
+                    Some(1003)
+                );
+                assert!(memory.task_reconciled(&s, &task.id, &outcome).unwrap());
+                reconcile_tasks(&subject, &tasks, 1010).unwrap();
+                assert!(f.tasks.get_owned(&owner, &task.id).unwrap().unwrap() == actual);
+                assert_eq!(memory.explorations(&s, None, 16).unwrap().total, 1);
+            }
+            assert_eq!(actual.status, TaskStatus::SessionEnded);
+            assert!(actual.notice.is_none());
+            f.kernel.stop_all().await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn archived_finished_tasks_do_not_recreate_evicted_foci_or_events() {
         let temporary = tempfile::tempdir().unwrap();

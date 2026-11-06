@@ -129,7 +129,7 @@ impl StoredTasks {
                     format_version: FORMAT_VERSION,
                     tasks: vec![task],
                 };
-                if recover(&mut one, now_ms()) {
+                if recover(&mut one, now_ms())? {
                     validate_ledger(&one)?;
                     let mut references: Vec<_> = ledger.tasks.iter().collect();
                     references[position] = &one.tasks[0];
@@ -140,7 +140,7 @@ impl StoredTasks {
                 }
             }
         } else {
-            changed = recover(&mut ledger, now_ms());
+            changed = recover(&mut ledger, now_ms())?;
             validate_ledger(&ledger)?;
             if let Some(archive) = archive {
                 let prepared = crate::cold::ColdState::empty(archive)
@@ -309,6 +309,51 @@ impl StoredTasks {
         deadline_at_ms: Option<u64>,
         now_ms: u64,
     ) -> TaskResult<Task> {
+        self.create_execution(
+            owner,
+            spec,
+            source,
+            review_messages,
+            completion_contract,
+            deadline_at_ms,
+            now_ms,
+            TaskExecutionKind::Task,
+        )
+    }
+
+    pub(super) fn create_exploration(
+        &self,
+        owner: &TaskOwner,
+        spec: TaskSpec,
+        source: &str,
+        review_messages: Vec<String>,
+        deadline_at_ms: Option<u64>,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        self.create_execution(
+            owner,
+            spec,
+            source,
+            review_messages,
+            None,
+            deadline_at_ms,
+            now_ms,
+            TaskExecutionKind::Exploration,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_execution(
+        &self,
+        owner: &TaskOwner,
+        spec: TaskSpec,
+        source: &str,
+        review_messages: Vec<String>,
+        completion_contract: Option<TaskCompletionContract>,
+        deadline_at_ms: Option<u64>,
+        now_ms: u64,
+        kind: TaskExecutionKind,
+    ) -> TaskResult<Task> {
         validate_review_messages(&review_messages)?;
         if let Some(contract) = &completion_contract {
             contract.validate()?;
@@ -335,6 +380,9 @@ impl StoredTasks {
         if let Some(existing) = inner.ledger.tasks.iter().find(|task| task.id == id) {
             if &existing.owner != owner {
                 return Err(TaskError::NotFound);
+            }
+            if existing.execution_kind() != kind {
+                return Err(TaskError::InvalidTransition);
             }
             return load_task(&inner, existing);
         }
@@ -390,6 +438,7 @@ impl StoredTasks {
             failure: None,
             notice: None,
             execution: Some(TaskExecution {
+                kind,
                 review_messages,
                 completion_contract,
                 authorization_deadline_at_ms: deadline_at_ms,
@@ -455,6 +504,10 @@ impl StoredTasks {
             if usage.tool_calls > task.spec.max_steps {
                 return Err(TaskError::InvalidInput);
             }
+            // 探索单独结算，不走旧无合同任务的自动成功路径或完成修复。
+            if task.is_exploration() {
+                return finish_exploration(task, end, usage, now_ms);
+            }
             if let Some(checkpoint) = task.execution.as_ref().and_then(|e| e.checkpoint.as_ref()) {
                 let saved = checkpoint_usage(checkpoint);
                 usage.tool_calls = usage.tool_calls.max(saved.tool_calls);
@@ -472,6 +525,7 @@ impl StoredTasks {
                 end
             };
             match end {
+                TaskEnd::SessionEnded { .. } => return Err(TaskError::InvalidTransition),
                 TaskEnd::Blocked { result } => {
                     if result.trim().is_empty() {
                         return Err(TaskError::InvalidInput);
@@ -522,6 +576,43 @@ impl StoredTasks {
             }
             Ok(())
         })
+    }
+
+    pub(super) fn acknowledge_exploration(
+        &self,
+        owner: &TaskOwner,
+        id: &str,
+        finished_at_ms: u64,
+        now_ms: u64,
+    ) -> TaskResult<Task> {
+        validate_owner(owner)?;
+        validate_id(id)?;
+        if finished_at_ms == 0 || now_ms < finished_at_ms {
+            return Err(TaskError::InvalidInput);
+        }
+        let mut inner = self.lock()?;
+        let position = inner
+            .ledger
+            .tasks
+            .iter()
+            .position(|task| task.id == id && task.owner == *owner)
+            .ok_or(TaskError::NotFound)?;
+        let mut task = load_task(&inner, &inner.ledger.tasks[position])?;
+        if !task.is_exploration()
+            || !task.status.finished()
+            || task.finished_at_ms != Some(finished_at_ms)
+        {
+            return Err(TaskError::InvalidTransition);
+        }
+        let execution = task
+            .execution
+            .as_mut()
+            .ok_or(TaskError::InvalidTransition)?;
+        if execution.exploration_acknowledged_at_ms.is_some() {
+            return Ok(task);
+        }
+        execution.exploration_acknowledged_at_ms = Some(now_ms);
+        commit_task(&mut inner, position, task)
     }
 
     pub(super) fn checkpoint(
@@ -611,6 +702,7 @@ impl StoredTasks {
         }, |task| {
             if &task.owner != owner { return Err(TaskError::NotFound); }
             if task.status != TaskStatus::Blocked || task.cancel_requested
+                || task.is_exploration()
                 || task.notice.as_ref().is_some_and(|n| n.status == NoticeStatus::Unknown) {
                 return Err(TaskError::InvalidTransition);
             }
@@ -670,6 +762,18 @@ impl StoredTasks {
             if task.status != TaskStatus::Running || task.cancel_requested {
                 return Err(TaskError::InvalidTransition);
             }
+            if task.is_exploration()
+                && task
+                    .execution
+                    .as_ref()
+                    .and_then(|execution| execution.checkpoint.as_ref())
+                    .is_some_and(|checkpoint| {
+                        checkpoint.used_tool_calls + checkpoint.delegated_tool_calls
+                            >= task.spec.max_steps as usize
+                    })
+            {
+                return Err(TaskError::InvalidTransition);
+            }
             let execution = task
                 .execution
                 .as_mut()
@@ -699,10 +803,11 @@ impl StoredTasks {
                     Ok(())
                 }
                 TaskStatus::Blocked
-                    if task
-                        .notice
-                        .as_ref()
-                        .is_none_or(|notice| notice.status != NoticeStatus::Delivering) =>
+                    if !task.is_exploration()
+                        && task
+                            .notice
+                            .as_ref()
+                            .is_none_or(|notice| notice.status != NoticeStatus::Delivering) =>
                 {
                     // 阻塞任务仍可显式撤回，之后条件触发器不得再次接续它。
                     task.status = TaskStatus::Cancelled;
@@ -1010,6 +1115,139 @@ fn checkpoint_usage(checkpoint: &eve_llm_api::TurnCheckpoint) -> TaskUsage {
         tool_calls: (checkpoint.used_tool_calls + checkpoint.delegated_tool_calls) as u32,
         model_requests: (checkpoint.provider_requests + checkpoint.delegated_model_requests) as u32,
     }
+}
+
+fn exploration_end_reason(task: &Task, now: u64) -> TaskSessionEndReason {
+    let execution = task.execution.as_ref().expect("exploration execution");
+    if execution.checkpoint.as_ref().is_some_and(|checkpoint| {
+        checkpoint.used_tool_calls + checkpoint.delegated_tool_calls >= task.spec.max_steps as usize
+    }) {
+        TaskSessionEndReason::ToolBudgetExhausted
+    } else if execution
+        .checkpoint
+        .as_ref()
+        .is_some_and(|checkpoint| checkpoint.result.is_some())
+    {
+        // 最终输出只能在原期限内保存；重启晚于期限不改写此前已发生的自然停止。
+        TaskSessionEndReason::NaturalStop
+    } else if execution.deadline_at_ms.is_some_and(|at| at <= now)
+        || execution
+            .authorization_deadline_at_ms
+            .is_some_and(|at| at <= now)
+    {
+        TaskSessionEndReason::DeadlineExpired
+    } else if execution.recoveries >= MAX_AUTO_RECOVERIES
+        && execution
+            .checkpoint
+            .as_ref()
+            .is_none_or(|checkpoint| checkpoint.result.is_none())
+    {
+        TaskSessionEndReason::RecoveryLimitReached
+    } else {
+        TaskSessionEndReason::NaturalStop
+    }
+}
+
+fn retained_session_result(result: &str) -> String {
+    if result.len() > MAX_RESULT_BYTES {
+        bounded(result, MAX_RESULT_BYTES)
+    } else {
+        result.to_owned()
+    }
+}
+
+/// 会话只保存实际经过和停止原因。remaining、task_progress 与目标验收不决定是否可停止。
+fn finish_exploration(
+    task: &mut Task,
+    end: TaskEnd,
+    mut usage: TaskUsage,
+    now: u64,
+) -> TaskResult<()> {
+    let execution = task
+        .execution
+        .as_ref()
+        .ok_or(TaskError::InvalidTransition)?;
+    if execution.kind != TaskExecutionKind::Exploration || execution.completion_contract.is_some() {
+        return Err(TaskError::InvalidTransition);
+    }
+    let checkpoint = execution.checkpoint.as_ref();
+    if let Some(checkpoint) = checkpoint {
+        checkpoint
+            .validate(task.spec.max_steps as usize)
+            .map_err(|_| TaskError::InvalidInput)?;
+        if checkpoint.scope.session_id != task.owner.session_id
+            || checkpoint.scope.user_id != task.owner.user_id
+        {
+            return Err(TaskError::InvalidInput);
+        }
+        let saved = checkpoint_usage(checkpoint);
+        if matches!(end, TaskEnd::SessionEnded { .. }) && usage != saved && !task.cancel_requested {
+            return Err(TaskError::InvalidInput);
+        }
+        usage.tool_calls = usage.tool_calls.max(saved.tool_calls);
+        usage.model_requests = usage.model_requests.max(saved.model_requests);
+    } else if usage.tool_calls != 0 {
+        return Err(TaskError::InvalidInput);
+    }
+    let end = if task.cancel_requested {
+        TaskEnd::Cancelled
+    } else {
+        end
+    };
+    if matches!(end, TaskEnd::Completed { .. }) {
+        return Err(TaskError::InvalidTransition);
+    }
+    let unknown = checkpoint.is_some_and(|checkpoint| !checkpoint.resumable());
+    if unknown && !matches!(end, TaskEnd::Cancelled) {
+        task.status = TaskStatus::Interrupted;
+        task.failure = Some("unknown_tool_effect_not_replayed".into());
+    } else {
+        match end {
+            TaskEnd::SessionEnded { result } => {
+                let checkpoint = checkpoint.ok_or(TaskError::InvalidTransition)?;
+                // 无小结是有效停止；非空小结必须来自已保存的同一轮模型输出。
+                if checkpoint
+                    .result
+                    .as_deref()
+                    .map_or(!result.is_empty(), |saved| saved != result)
+                {
+                    return Err(TaskError::InvalidInput);
+                }
+                task.status = TaskStatus::SessionEnded;
+                task.result = Some(retained_session_result(&result));
+            }
+            TaskEnd::Blocked { result } => {
+                if result.trim().is_empty() {
+                    return Err(TaskError::InvalidInput);
+                }
+                task.status = TaskStatus::Blocked;
+                task.result = Some(bounded(&result, MAX_RESULT_BYTES));
+            }
+            TaskEnd::Failed { reason } => {
+                if reason.trim().is_empty() {
+                    return Err(TaskError::InvalidInput);
+                }
+                task.status = TaskStatus::Failed;
+                task.failure = Some(bounded(&reason, MAX_FAILURE_BYTES));
+            }
+            TaskEnd::Cancelled => {
+                if !task.cancel_requested {
+                    return Err(TaskError::InvalidTransition);
+                }
+                task.status = TaskStatus::Cancelled;
+            }
+            TaskEnd::Completed { .. } => return Err(TaskError::InvalidTransition),
+        }
+    }
+    task.usage = Some(usage);
+    task.notice = None;
+    record_finished_time(task, now);
+    if task.status == TaskStatus::SessionEnded {
+        let reason = exploration_end_reason(task, task.finished_at_ms.unwrap_or(now));
+        task.execution.as_mut().unwrap().session_end_reason = Some(reason);
+    }
+    task.execution.as_mut().unwrap().resume_at_ms = None;
+    Ok(())
 }
 
 /// 正常提交和 result 已落盘后的重启使用完全相同的验收与恢复语义。
@@ -1389,6 +1627,26 @@ pub(super) fn validate_task(task: &Task) -> TaskResult<()> {
         return Err(TaskError::CorruptState);
     }
     if let Some(execution) = &task.execution {
+        if task.is_exploration() {
+            if execution.completion_contract.is_some()
+                || !execution.progress_notices.is_empty()
+                || task.notice.is_some()
+                || task.status == TaskStatus::Completed
+                || (task.status == TaskStatus::SessionEnded)
+                    != execution.session_end_reason.is_some()
+            {
+                return Err(TaskError::CorruptState);
+            }
+            if execution.exploration_acknowledged_at_ms.is_some_and(|at| {
+                !task.status.finished() || task.finished_at_ms.is_none_or(|finished| at < finished)
+            }) {
+                return Err(TaskError::CorruptState);
+            }
+        } else if execution.session_end_reason.is_some()
+            || execution.exploration_acknowledged_at_ms.is_some()
+        {
+            return Err(TaskError::CorruptState);
+        }
         validate_progress_notices(&execution.progress_notices, task.created_at_ms)
             .map_err(|_| TaskError::CorruptState)?;
         if let Some(last_finished) = execution.last_finished_at_ms
@@ -1456,10 +1714,10 @@ pub(super) fn validate_task(task: &Task) -> TaskResult<()> {
         || task
             .usage
             .is_some_and(|usage| usage.tool_calls > task.spec.max_steps)
-        || task
-            .result
-            .as_ref()
-            .is_some_and(|text| text.trim().is_empty() || text.len() > MAX_RESULT_BYTES)
+        || task.result.as_ref().is_some_and(|text| {
+            (text.trim().is_empty() && task.status != TaskStatus::SessionEnded)
+                || text.len() > MAX_RESULT_BYTES
+        })
         || task
             .failure
             .as_ref()
@@ -1480,6 +1738,11 @@ pub(super) fn validate_task(task: &Task) -> TaskResult<()> {
             shape == (false, false, false, false, false, false) && !task.cancel_requested
         }
         TaskStatus::Running => shape == (true, false, false, false, false, false),
+        TaskStatus::SessionEnded => {
+            task.is_exploration()
+                && shape == (true, true, true, true, false, false)
+                && !task.cancel_requested
+        }
         TaskStatus::Completed
             if task.source.starts_with(IDLE_TASK_SOURCE_PREFIX)
                 && task.usage.is_some_and(|usage| usage.tool_calls == 0) =>
@@ -1487,10 +1750,19 @@ pub(super) fn validate_task(task: &Task) -> TaskResult<()> {
             shape == (true, true, true, true, false, false)
                 || shape == (true, true, true, true, false, true)
         }
+        TaskStatus::Blocked if task.is_exploration() => {
+            shape == (true, true, true, true, false, false) && !task.cancel_requested
+        }
         TaskStatus::Completed | TaskStatus::Blocked => {
             shape == (true, true, true, true, false, true)
         }
+        TaskStatus::Failed if task.is_exploration() => {
+            shape == (true, true, true, false, true, false) && !task.cancel_requested
+        }
         TaskStatus::Failed => shape == (true, true, true, false, true, true),
+        TaskStatus::Interrupted if task.is_exploration() => {
+            shape == (true, true, true, false, true, false) && !task.cancel_requested
+        }
         TaskStatus::Interrupted => {
             shape == (true, true, false, false, false, true) && !task.cancel_requested
         }
@@ -1506,6 +1778,36 @@ pub(super) fn validate_task(task: &Task) -> TaskResult<()> {
     };
     if !consistent {
         return invalid;
+    }
+    if task.status == TaskStatus::SessionEnded {
+        let execution = task.execution.as_ref().ok_or(TaskError::CorruptState)?;
+        let checkpoint = execution
+            .checkpoint
+            .as_ref()
+            .ok_or(TaskError::CorruptState)?;
+        if !checkpoint.resumable()
+            || task.usage != Some(checkpoint_usage(checkpoint))
+            || task.result.as_deref()
+                != Some(
+                    retained_session_result(checkpoint.result.as_deref().unwrap_or("")).as_str(),
+                )
+            || execution.resume_at_ms.is_some()
+            || execution.session_end_reason
+                != Some(exploration_end_reason(task, finished.unwrap_or(0)))
+        {
+            return invalid;
+        }
+    }
+    if task.is_exploration() && task.status == TaskStatus::Interrupted {
+        let checkpoint = task
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.checkpoint.as_ref());
+        if checkpoint.is_none_or(eve_llm_api::TurnCheckpoint::resumable)
+            || task.failure.as_deref() != Some("unknown_tool_effect_not_replayed")
+        {
+            return invalid;
+        }
     }
     // 严格任务的 Completed 必须能从持久化证据重新证明，不能只信状态位。
     if task.status == TaskStatus::Completed
@@ -1527,12 +1829,87 @@ pub(super) fn validate_task(task: &Task) -> TaskResult<()> {
     Ok(())
 }
 
-fn recover(ledger: &mut Ledger, now: u64) -> bool {
+/// 返回 false 仅表示已经安排且仍在期限内的安全接续；未知效果从不进入接续队列。
+fn recover_exploration(task: &mut Task, now: u64) -> TaskResult<bool> {
+    let execution = task.execution.as_ref().ok_or(TaskError::CorruptState)?;
+    let checkpoint = execution.checkpoint.as_ref();
+    let usage = checkpoint.map(checkpoint_usage).unwrap_or_default();
+    if task.cancel_requested {
+        finish_exploration(task, TaskEnd::Cancelled, usage, now)?;
+        return Ok(true);
+    }
+    if checkpoint.is_some_and(|checkpoint| !checkpoint.resumable()) {
+        finish_exploration(
+            task,
+            TaskEnd::Failed {
+                reason: "unknown_tool_effect_not_replayed".into(),
+            },
+            usage,
+            now,
+        )?;
+        return Ok(true);
+    }
+    if let Some(result) = checkpoint.and_then(|checkpoint| checkpoint.result.clone()) {
+        finish_exploration(task, TaskEnd::SessionEnded { result }, usage, now)?;
+        return Ok(true);
+    }
+    let reason = exploration_end_reason(task, now);
+    let waiting = execution.resume_at_ms.is_some() && can_wait_for_retry(execution, now);
+    if reason != TaskSessionEndReason::NaturalStop
+        && !(reason == TaskSessionEndReason::RecoveryLimitReached && waiting)
+    {
+        if checkpoint.is_some() {
+            finish_exploration(
+                task,
+                TaskEnd::SessionEnded {
+                    result: String::new(),
+                },
+                usage,
+                now,
+            )?;
+        } else {
+            // 没有检查点不能编造已经进行过一次探索；只记录执行未开始便已停止。
+            finish_exploration(
+                task,
+                TaskEnd::Failed {
+                    reason: "exploration_stopped_before_first_checkpoint".into(),
+                },
+                usage,
+                now,
+            )?;
+        }
+        return Ok(true);
+    }
+    if waiting {
+        return Ok(false);
+    }
+    let execution = task.execution.as_mut().ok_or(TaskError::CorruptState)?;
+    if can_retry(execution, now) {
+        schedule_retry(execution, now);
+        Ok(true)
+    } else {
+        finish_exploration(
+            task,
+            TaskEnd::Failed {
+                reason: "exploration_recovery_unavailable".into(),
+            },
+            usage,
+            now,
+        )?;
+        Ok(true)
+    }
+}
+
+fn recover(ledger: &mut Ledger, now: u64) -> TaskResult<bool> {
     let mut changed = false;
     for task in &mut ledger.tasks {
         // 在执行恢复的任何提前 continue 之前核对通知；未知发送不得在下个周期重发。
         changed |= crate::progress::recover(task);
         if task.status == TaskStatus::Running {
+            if task.is_exploration() {
+                changed |= recover_exploration(task, now)?;
+                continue;
+            }
             if !task.cancel_requested {
                 let final_result = task
                     .execution
@@ -1646,7 +2023,7 @@ fn recover(ledger: &mut Ledger, now: u64) -> bool {
             changed = true;
         }
     }
-    changed
+    Ok(changed)
 }
 
 pub(super) fn available_capacity(tasks: &[&Task]) -> TaskResult<usize> {
@@ -1656,6 +2033,7 @@ pub(super) fn available_capacity(tasks: &[&Task]) -> TaskResult<usize> {
         .filter(|task| {
             !task.status.finished()
                 || task.notice.is_some()
+                || (task.is_exploration() && task.settled_at().is_none())
                 || task
                     .execution
                     .as_ref()

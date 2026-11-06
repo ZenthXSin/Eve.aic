@@ -73,11 +73,18 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           bwrap --unshare-all --ro-bind / / --dev /dev --proc /proc /usr/bin/true
-      - name: 编译实际 Eve QQ、Web 与记忆进程
+      - name: 编译实际 Eve QQBot、Web 与记忆进程
+        id: process-binaries
         run: |
           set -x
           cargo +1.89.0 build -p eve-app --bin eve-qqbot --bin eve-web --bin eve-memory --locked
+      - name: 实际自由探索、静默结束与经历恢复验收
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
+        env:
+          EVE_QQBOT_BINARY: target/debug/eve-qqbot
+        run: python3 connectors/qqbot/test/free_exploration_test.py
       - name: 进程验收：Web 与基础对话
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           set -x
           python3 scripts/test-web-chat.py
@@ -94,6 +101,7 @@ jobs:
           python3 connectors/qqbot/test/cognition_test.py
           python3 connectors/qqbot/test/goal_feedback_test.py
       - name: 进程验收：记忆、学习与能力形成
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           set -x
           python3 connectors/qqbot/test/memory_test.py
@@ -110,6 +118,7 @@ jobs:
           python3 connectors/qqbot/test/skill_test.py
           python3 connectors/qqbot/first-goal-acceptance.py --help
       - name: 进程验收：工具执行、隔离与桥接
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           set -x
           python3 connectors/qqbot/test/toolforge_test.py
@@ -126,6 +135,7 @@ jobs:
           EVE_TEST_UPGRADE_TOOLCHAIN=1.89.0 python3 connectors/qqbot/test/self_upgrade_timeout_test.py
           python3 connectors/qqbot/test/transport_test.py
       - name: 进程验收：模型请求、缓存与执行进展
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           set -x
           python3 connectors/qqbot/test/people_test.py
@@ -143,6 +153,7 @@ jobs:
           python3 connectors/qqbot/test/slow_progress_test.py
           python3 connectors/qqbot/test/stage_feedback_test.py
       - name: 进程验收：上下文、源码查阅与自主探索
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           set -x
           python3 connectors/qqbot/test/history_window_test.py
@@ -164,6 +175,7 @@ jobs:
           python3 connectors/qqbot/test/idle_loop_test.py
           python3 connectors/qqbot/test/continuous_autonomy_test.py
       - name: 进程验收：后台任务与群聊记忆
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           set -x
           python3 connectors/qqbot/test/background_task_test.py
@@ -184,6 +196,7 @@ jobs:
           python3 connectors/qqbot/test/group_digest_test.py
           python3 connectors/qqbot/test/group_recall_test.py
       - name: 进程验收：恢复、管理与模型传输
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           set -x
           python3 connectors/qqbot/test/background_recovery_test.py
@@ -200,6 +213,7 @@ jobs:
           python3 connectors/qqbot/test/permission_inspection_test.py
           python3 connectors/qqbot/test/delivery_recovery_test.py
       - name: 进程验收：持续任务与训练评审
+        if: ${{ !cancelled() && steps.process-binaries.outcome == 'success' }}
         run: |
           set -x
           python3 connectors/qqbot/test/compaction_stream_test.py

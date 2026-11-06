@@ -93,6 +93,9 @@ impl TaskStrategyPolicy for PairedTaskStrategyPolicy {
             .map(|c| c.contract.clone()))
     }
     fn scope(&self, task: &Task) -> TaskResult<Option<TaskStrategyScope>> {
+        if task.is_exploration() {
+            return Ok(None);
+        }
         let scope = self.environment.scope(task)?;
         if let Some(scope) = &scope {
             scope.validate()?;

@@ -38,6 +38,7 @@ mod qq_commitments;
 mod qq_completion;
 mod qq_context_reset;
 mod qq_conversation;
+mod qq_exploration;
 mod qq_failure_recovery;
 mod qq_failure_replay;
 mod qq_files;

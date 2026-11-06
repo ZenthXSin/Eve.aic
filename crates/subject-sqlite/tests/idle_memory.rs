@@ -34,6 +34,7 @@ fn reflection(key: &str, evidence: &str, n: u64) -> IdleReflection {
         reason: "这次有不同的经历".into(),
         judgments: vec![],
         action: None,
+        exploration: None,
         revisit_after_minutes: 30,
         interest_updates: vec![SelfInterest {
             key: key.into(),
@@ -122,7 +123,7 @@ fn persistent_interests_outgrow_context_and_history_outgrows_old_lifetime_limit(
         reopened
             .commit(
                 &input,
-                &reflection("topic-000", "conversation-0", 999),
+                &reflection("topic-000", "conversation-0", 998),
                 "reuse-old",
                 2000
             )

@@ -104,6 +104,7 @@ mod tests {
             judgments: vec![judgment("new", "原方案较慢")],
             interest_updates: vec![],
             action: None,
+            exploration: None,
             revisit_after_minutes: 30,
         }
     }
