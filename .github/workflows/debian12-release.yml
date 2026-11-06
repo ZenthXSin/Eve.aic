@@ -52,7 +52,8 @@ jobs:
         run: |
           export EVE_RELEASE_OUTPUT="$RUNNER_TEMP/eve-debian12-release"
           printf 'EVE_RELEASE_OUTPUT=%s\n' "$EVE_RELEASE_OUTPUT" >> "$GITHUB_ENV"
-          bash scripts/setup-debian12-release.sh
+          mkdir -p "$EVE_RELEASE_OUTPUT/evidence"
+          bash scripts/setup-debian12-release.sh 2>&1 | tee "$EVE_RELEASE_OUTPUT/evidence/environment.txt"
       - name: 验证来源绑定、失败产物拒绝和超时停止
         run: python3 -B scripts/test-debian12-release.py
       - name: 核对来源并构建三个生产入口

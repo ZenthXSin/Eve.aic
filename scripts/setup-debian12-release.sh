@@ -9,9 +9,13 @@ test -f /.dockerenv
 test "$ID" = debian
 test "$VERSION_ID" = 12
 [[ "${EVE_RELEASE_REVISION:-}" =~ ^[0-9a-f]{40}$ ]]
+# checkout 的 safe.directory 仅写入它自己的临时 HOME；后续容器步骤需要持久配置。
+# 仅信任当前显式检出的工作区，不能放宽为通配路径或改变宿主机配置。
+release_workspace="$(realpath -e -- "${GITHUB_WORKSPACE:?}")"
+test "$(pwd -P)" = "$release_workspace"
+git config --global --add safe.directory "$release_workspace"
 test "$(git rev-parse HEAD)" = "$EVE_RELEASE_REVISION"
 
-mkdir -p "$EVE_RELEASE_OUTPUT/evidence"
 apt-get -q update
 apt-get install -y --no-install-recommends python3 bubblewrap binutils file curl xz-utils ca-certificates
 node_archive="$EVE_RELEASE_OUTPUT/node-v22.22.0-linux-x64.tar.xz"
@@ -33,4 +37,4 @@ bwrap --unshare-all --ro-bind / / --dev /dev --proc /proc /usr/bin/true
   python3 --version
   getconf GNU_LIBC_VERSION
   dpkg-query -W bubblewrap binutils file python3 libc6
-} > "$EVE_RELEASE_OUTPUT/evidence/environment.txt"
+}
