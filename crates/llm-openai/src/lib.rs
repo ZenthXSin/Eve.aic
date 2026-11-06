@@ -414,18 +414,24 @@ impl OpenAiProvider {
             };
             body[field] = serde_json::json!(limit);
         }
+        let mut diagnostics =
+            timing::CallDiagnostics::start(self.usage.as_ref().map(|(_, role)| role.as_str()));
         let total = self.total_timeout(sink.is_some());
         let started = std::time::Instant::now();
         let deadline = tokio::time::Instant::now() + total;
         let completed = tokio::time::timeout_at(deadline, async {
             if self.transient_retries && complete {
-                self.request_retried(&body, sink, deadline).await
+                self.request_retried(&body, sink, deadline, &mut diagnostics)
+                    .await
             } else {
-                self.request_once(&body, sink, &mut None).await
+                self.request_once(&body, sink, &mut None, diagnostics.next_attempt())
+                    .await
             }
         })
-        .await
-        .map_err(|_| timeouts::expired("total", total, started, None))??;
+        .await;
+        let completed = completed.map_err(|_| {
+            timeouts::expired("total", total, started, None, diagnostics.identity())
+        })??;
         // 模型结果已经完整校验并离开重试范围。统计尾流不得把成功变成失败；
         // 由持有结果的这一层处理原总期限，避免外层 timeout 丢弃已完成结果。
         let (response, usage) = completed.finish(deadline).await;
@@ -438,8 +444,9 @@ impl OpenAiProvider {
         body: &serde_json::Value,
         sink: Option<&dyn ModelTextSink>,
         retry_after: &mut Option<Duration>,
+        identity: timing::RequestIdentity,
     ) -> Result<completion::CompletedRequest, LlmError> {
-        let mut timing = timing::RequestTiming::start(self.timing_diagnostics);
+        let mut timing = timing::RequestTiming::start(self.timing_diagnostics, identity);
         let started = std::time::Instant::now();
         let policy = sink.and(self.stream_timeouts);
         let first_deadline = tokio::time::Instant::now()
@@ -455,7 +462,13 @@ impl OpenAiProvider {
             tokio::time::timeout_at(first_deadline, sending)
                 .await
                 .map_err(|_| {
-                    timeouts::expired("first_response", policy.first_response, started, Some(0))
+                    timeouts::expired(
+                        "first_response",
+                        policy.first_response,
+                        started,
+                        Some(0),
+                        identity,
+                    )
                 })?
         } else {
             sending.await
@@ -522,7 +535,7 @@ impl OpenAiProvider {
                             } else {
                                 ("stream_idle", policy.idle)
                             };
-                            timeouts::expired(phase, limit, started, Some(received))
+                            timeouts::expired(phase, limit, started, Some(received), identity)
                         })?
                 } else {
                     response.chunk().await
@@ -537,6 +550,7 @@ impl OpenAiProvider {
                             self.total_timeout(true),
                             started,
                             Some(received),
+                            identity,
                         )
                     } else {
                         transport_error(error)

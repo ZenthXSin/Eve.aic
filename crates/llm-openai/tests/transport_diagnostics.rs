@@ -55,6 +55,9 @@ fn transport_diagnostics_preserve_failures_and_correlate_safe_phases() {
                 .zip(["before_headers", "response_body", "stream_body"])
         {
             assert_eq!(record["phase"], phase);
+            assert!(record["call"].is_u64());
+            assert_eq!(record["attempt"], 1);
+            assert!(record["role"].is_null());
             assert_eq!(record["is_timeout"], false);
             assert!(record["is_connect"].is_boolean());
             assert!(record["io_kind"].is_null() || record["io_kind"].is_string());
@@ -62,7 +65,12 @@ fn transport_diagnostics_preserve_failures_and_correlate_safe_phases() {
             let phases: Vec<_> = timing
                 .iter()
                 .filter(|event| event["request"] == record["request"])
-                .map(|event| event["phase"].as_str().unwrap())
+                .map(|event| {
+                    assert_eq!(event["call"], record["call"]);
+                    assert_eq!(event["attempt"], record["attempt"]);
+                    assert_eq!(event["role"], record["role"]);
+                    event["phase"].as_str().unwrap()
+                })
                 .collect();
             assert_eq!(phases.first(), Some(&"dispatch"));
             assert_eq!(phases.last(), Some(&"closed_without_decoded_response"));
@@ -72,6 +80,12 @@ fn transport_diagnostics_preserve_failures_and_correlate_safe_phases() {
         let timeouts = records("EVE_MODEL_TIMEOUT ");
         assert_eq!(timeouts.len(), 1);
         assert_eq!(timeouts[0]["phase"], "first_response");
+        assert!(timing.iter().any(|event| {
+            event["call"] == timeouts[0]["call"]
+                && event["request"] == timeouts[0]["request"]
+                && event["attempt"] == timeouts[0]["attempt"]
+                && event["phase"] == "closed_without_decoded_response"
+        }));
         assert!(!stderr.contains("EVE_MODEL_RETRY"));
         return;
     }
@@ -155,4 +169,206 @@ fn provider(url: &str) -> OpenAiProvider {
         "fixture-private-key",
     )
     .unwrap()
+}
+
+struct IgnoreUsage;
+impl eve_llm_api::ModelUsageObserver for IgnoreUsage {
+    fn reported(&self, _: &str, _: eve_llm_api::ModelUsage) {}
+}
+
+struct PendingSink;
+impl eve_llm_api::ModelTextSink for PendingSink {
+    fn text_delta(&self, _: String) -> eve_llm_api::LlmFuture<'_, ()> {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[test]
+fn retry_and_outer_timeout_are_correlated_without_logging_private_roles() {
+    const CHILD: &str = "EVE_TEST_DIAGNOSTIC_CORRELATION";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "retry_and_outer_timeout_are_correlated_without_logging_private_roles",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        for private in ["fixture-private", "127.0.0.1", "http://", "/v1/"] {
+            assert!(!stderr.contains(private));
+        }
+        let records = |tag: &str| -> Vec<Value> {
+            stderr
+                .lines()
+                .filter_map(|line| line.strip_prefix(tag))
+                .map(|line| serde_json::from_str(line.trim()).unwrap())
+                .collect()
+        };
+        let retries = records("EVE_MODEL_RETRY ");
+        let timings = records("EVE_HTTP_TIMING ");
+        let transports = records("EVE_HTTP_TRANSPORT ");
+        let timeouts = records("EVE_MODEL_TIMEOUT ");
+        assert_eq!(retries.len(), 3);
+        assert_eq!(retries.iter().filter(|r| r["role"].is_null()).count(), 1);
+        for retry in &retries {
+            assert!(retry["call"].is_u64());
+            assert!(retry["request"].is_u64());
+            assert_eq!(retry["attempt"], 1);
+            assert_eq!(retry["retry"], 1);
+            assert_eq!(retry["max_retries"], 3);
+            assert_eq!(retry["delay_ms"], 1000);
+            let events: Vec<_> = timings
+                .iter()
+                .filter(|event| event["call"] == retry["call"])
+                .collect();
+            if retry["role"].is_null() {
+                // 关闭计时仍沿用原有 retry 日志；未知用途不输出原始 role。
+                assert!(events.is_empty());
+                continue;
+            }
+            assert!(matches!(
+                retry["role"].as_str(),
+                Some("dialogue" | "speech")
+            ));
+            assert!(events.iter().all(|event| event["role"] == retry["role"]));
+            let starts: Vec<_> = events
+                .iter()
+                .filter(|event| event["phase"] == "dispatch")
+                .collect();
+            assert_eq!(starts.len(), 2);
+            assert_eq!(starts[0]["request"], retry["request"]);
+            assert_eq!(starts[0]["attempt"], 1);
+            assert_eq!(starts[1]["attempt"], 2);
+            assert_ne!(starts[0]["request"], starts[1]["request"]);
+            assert!(events.iter().any(|event| {
+                event["request"] == retry["request"]
+                    && event["phase"] == "closed_without_decoded_response"
+            }));
+            assert!(events.iter().any(|event| {
+                event["request"] == starts[1]["request"] && event["phase"] == "decoded"
+            }));
+        }
+        let mut calls: Vec<_> = retries
+            .iter()
+            .map(|r| r["call"].as_u64().unwrap())
+            .collect();
+        calls.sort_unstable();
+        calls.dedup();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(transports.len(), 1);
+        assert_eq!(transports[0]["phase"], "response_body");
+        assert_eq!(transports[0]["role"], "dialogue");
+        let retry = retries.iter().find(|r| r["role"] == "dialogue").unwrap();
+        for key in ["call", "request", "attempt", "role"] {
+            assert_eq!(transports[0][key], retry[key]);
+        }
+        assert_eq!(timeouts.len(), 1);
+        let timeout = &timeouts[0];
+        assert_eq!(timeout["phase"], "total");
+        assert_eq!(timeout["role"], "progress");
+        assert_eq!(timeout["attempt"], 1);
+        assert!(!calls.contains(&timeout["call"].as_u64().unwrap()));
+        let events: Vec<_> = timings
+            .iter()
+            .filter(|event| event["call"] == timeout["call"])
+            .collect();
+        assert!(events.iter().all(|event| {
+            event["request"] == timeout["request"]
+                && event["attempt"] == timeout["attempt"]
+                && event["role"] == timeout["role"]
+        }));
+        let phases: Vec<_> = events
+            .iter()
+            .map(|event| event["phase"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            phases,
+            [
+                "dispatch",
+                "headers",
+                "first_stream_chunk",
+                "closed_without_decoded_response"
+            ]
+        );
+        return;
+    }
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut broken = Reply::json(final_response("fixture-private-output"));
+            broken.declared_length = Some(broken.body.len() + 10);
+            let mut unavailable = Reply::json(json!({"error":"fixture-private-error"}));
+            unavailable.status = 503;
+            let mut dialogue = Server::start(vec![broken, Reply::json(final_response("ok"))]).await;
+            let mut speech = Server::start(vec![unavailable, Reply::json(final_response("ok"))]).await;
+            let observed = |server: &Server, role: &str| {
+                provider(&server.url)
+                    .with_usage_observer(std::sync::Arc::new(IgnoreUsage), role)
+                    .with_timing_diagnostics()
+                    .with_transient_retries()
+            };
+            let dialogue_provider = observed(&dialogue, "dialogue");
+            let speech_provider = observed(&speech, "speech");
+            let (first, second) = tokio::join!(
+                dialogue_provider.complete(request()),
+                speech_provider.complete(request())
+            );
+            assert!(first.is_ok());
+            assert!(second.is_ok());
+            for server in [&mut dialogue, &mut speech] {
+                let first = server.next().await;
+                let second = server.next().await;
+                assert_eq!(first.body, second.body);
+                assert_eq!(first.headers, second.headers);
+                assert!(server.requests.try_recv().is_err());
+            }
+
+            let mut unavailable = Reply::json(json!({}));
+            unavailable.status = 503;
+            let mut disabled = Server::start(vec![unavailable, Reply::json(final_response("ok"))]).await;
+            assert!(provider(&disabled.url)
+                .with_usage_observer(std::sync::Arc::new(IgnoreUsage), "fixture-private-role")
+                .with_transient_retries()
+                .complete(request())
+                .await
+                .is_ok());
+            let first = disabled.next().await;
+            let second = disabled.next().await;
+            assert_eq!(first.body, second.body);
+            assert_eq!(first.headers, second.headers);
+            assert!(disabled.requests.try_recv().is_err());
+
+            // 响应已经完整到达，sink 等待让外层总期限先取消；不会经过传输错误映射。
+            let mut reply = Reply::json(json!({}));
+            reply.headers.push(("Content-Type".into(), "text/event-stream".into()));
+            reply.body = format!(
+                "data: {}\n\n",
+                json!({"id":"fixture","choices":[{"index":0,"delta":{"content":"fixture-private-output"},"finish_reason":"stop"}]})
+            ).into_bytes();
+            let mut server = Server::start(vec![reply]).await;
+            let p = OpenAiProvider::new(OpenAiConfig {
+                responses_url: server.url.replace("/responses", "/chat/completions"),
+                request_timeout: Duration::from_millis(150),
+                ..OpenAiConfig::chat("fixture-model")
+            }, "fixture-private-key")
+            .unwrap()
+            .with_usage_observer(std::sync::Arc::new(IgnoreUsage), "progress")
+            .with_timing_diagnostics()
+            .with_transient_retries();
+            assert_eq!(p.stream(request(), &PendingSink).await.unwrap_err(), LlmError::ProviderTimeout);
+            server.next().await;
+            assert!(server.requests.try_recv().is_err());
+        });
 }

@@ -18,10 +18,14 @@ impl OpenAiProvider {
         body: &serde_json::Value,
         sink: Option<&dyn ModelTextSink>,
         deadline: Instant,
+        diagnostics: &mut crate::timing::CallDiagnostics,
     ) -> Result<crate::completion::CompletedRequest, LlmError> {
         for attempt in 0..=3 {
             let mut retry_after = None;
-            let result = self.request_once(body, sink, &mut retry_after).await;
+            let identity = diagnostics.next_attempt();
+            let result = self
+                .request_once(body, sink, &mut retry_after, identity)
+                .await;
             let Err(error) = &result else { return result };
             if attempt == 3 || !transient(error) {
                 return result;
@@ -31,12 +35,17 @@ impl OpenAiProvider {
                 return result;
             }
             // 固定元数据，不记录请求体、端点、密钥、响应正文或工具输出。
-            eprintln!(
-                "EVE_MODEL_RETRY {}",
-                serde_json::json!({"retry":attempt + 1,"max_retries":3,
-                        "delay_ms":delay.as_millis(),"http_status":error.provider_http_status(),
-                        "reason":if matches!(error,LlmError::ProviderTimeout) {"timeout"} else {"transient"}})
-            );
+            let mut fields = identity.fields();
+            fields["retry"] = serde_json::json!(attempt + 1);
+            fields["max_retries"] = serde_json::json!(3);
+            fields["delay_ms"] = serde_json::json!(delay.as_millis());
+            fields["http_status"] = serde_json::json!(error.provider_http_status());
+            fields["reason"] = serde_json::json!(if matches!(error, LlmError::ProviderTimeout) {
+                "timeout"
+            } else {
+                "transient"
+            });
+            eprintln!("EVE_MODEL_RETRY {fields}");
             sleep(delay).await;
         }
         unreachable!("bounded attempts return their last result")

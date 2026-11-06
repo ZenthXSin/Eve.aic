@@ -54,8 +54,15 @@ class RequestTimingAcceptance(semantic.SemanticAcceptance):
         self.assertEqual(positions, sorted(positions))
         context_ready = next(value for prefix, value in events if prefix == 'EVE_CONTEXT_TIMING' and value['phase'] == 'ready')
         self.assertGreaterEqual(context_ready['elapsed_ms'], 100)
-        for _, data in events:
-            self.assertLessEqual(set(data), {'request', 'phase', 'at_ms', 'elapsed_ms', 'http_status', 'turn'})
+        for prefix, data in events:
+            fields = {'request', 'phase', 'at_ms', 'elapsed_ms', 'http_status', 'turn'}
+            if prefix == 'EVE_HTTP_TIMING':
+                fields |= {'call', 'attempt', 'role'}
+                self.assertGreater(data['call'], 0)
+                self.assertGreater(data['request'], 0)
+                self.assertEqual(data['attempt'], 1)
+                self.assertIn(data['role'], (None, 'dialogue'))
+            self.assertLessEqual(set(data), fields)
         self.assertNotIn(query, self.last_stderr)
 
     def test_slow_semantic_query_falls_back_before_the_embedding_server_finishes(self):
