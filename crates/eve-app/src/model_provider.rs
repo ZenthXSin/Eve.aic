@@ -107,6 +107,9 @@ impl ProviderConfig {
                 if options.transient_retries {
                     provider = provider.with_transient_retries();
                 }
+                if options.recover_tool_arguments {
+                    provider = provider.with_tool_argument_recovery();
+                }
                 if options.timing_diagnostics {
                     provider = provider.with_timing_diagnostics();
                 }
@@ -156,6 +159,7 @@ impl ProviderConfig {
 pub(crate) struct ProviderOptions {
     pub(crate) streamed_completions: bool,
     pub(crate) transient_retries: bool,
+    pub(crate) recover_tool_arguments: bool,
     pub(crate) stream_timeouts: Option<StreamTimeoutPolicy>,
     pub(crate) timing_diagnostics: bool,
     pub(crate) usage: Option<(Arc<dyn ModelUsageObserver>, String)>,

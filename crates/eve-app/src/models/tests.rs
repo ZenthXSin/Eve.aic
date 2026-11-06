@@ -205,6 +205,45 @@ fn tool_reply(protocol: &str) -> Reply {
         ]})
     })
 }
+
+#[tokio::test]
+async fn invalid_tool_argument_recovery_is_only_enabled_for_dialogue() {
+    use eve_llm_api::{ChatMessage, ChatRole, ModelRequest, ProtocolFailureKind};
+    for role in ["dialogue", "task", "review", "speech"] {
+        let root = tempfile::tempdir().unwrap();
+        let mut malformed = tool_reply("chat");
+        let mut body: Value = serde_json::from_slice(&malformed.body).unwrap();
+        body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = json!("{invalid");
+        malformed.body = serde_json::to_vec(&body).unwrap();
+        let mut server = Server::start(vec![malformed, final_reply("chat")]).await;
+        let harness = Harness::start(root.path(), &server.url, "chat").await;
+        let selected = CoreModelResolver::new(harness.settings.clone(), "fake-key".into())
+            .with_use(role)
+            .resolve()
+            .unwrap();
+        let result = selected
+            .provider
+            .complete(ModelRequest {
+                session: None,
+                messages: vec![ChatMessage::text(ChatRole::User, "synthetic request")],
+                tools: vec![],
+            })
+            .await;
+        let first = server.next().await;
+        if role == "dialogue" {
+            assert!(result.is_ok());
+            assert_eq!(server.next().await.body, first.body);
+        } else {
+            assert_eq!(
+                result.unwrap_err().protocol_failure(),
+                Some(ProtocolFailureKind::ToolArguments),
+                "后台用途不能因本次修复增加主模型请求"
+            );
+        }
+        assert!(server.requests.try_recv().is_err());
+        harness.stop().await;
+    }
+}
 fn user_texts<'a>(body: &'a Value, protocol: &str) -> Vec<&'a str> {
     let messages = body[if protocol == "chat" {
         "messages"
