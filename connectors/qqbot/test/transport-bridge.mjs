@@ -24,6 +24,12 @@ bridge.command = frame => {
 };
 handlers.get("ready")();
 for (const frame of scenario.raw_frames ?? []) process.stdout.write(JSON.stringify(frame) + "\n");
+for (const patch of scenario.incoming ?? []) {
+  handlers.get("message")({}, {
+    kind: "c2c", rawEventType: "C2C_MESSAGE_CREATE", messageId: "rejected-input", senderId: "transport-user",
+    content: "", replyTarget: { scope: "c2c", targetId: "transport-user", msgId: "rejected-input" }, ...patch,
+  });
+}
 for (const content of scenario.contents ?? ["桥接验收消息"]) {
   handlers.get("message")({}, {
     kind: "c2c", messageId: "transport-message", senderId: "transport-user",

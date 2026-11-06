@@ -19,6 +19,23 @@ spec = importlib.util.spec_from_file_location('upgrade_runtime', SCRIPT)
 runtime = importlib.util.module_from_spec(spec); spec.loader.exec_module(runtime)
 
 class DigestTests(unittest.TestCase):
+    def test_bridge_ingress_diagnostics_changes_invalidate_runtime_snapshot(self):
+        with tempfile.TemporaryDirectory(prefix='eve-bridge-snapshot-') as directory:
+            root = Path(directory)
+            binary = root / 'binary'
+            binary.write_bytes(b'synthetic-binary')
+            bridge = root / 'bridge.mjs'
+            bridge.write_text('export {};')
+            diagnostic = root / 'ingress-diagnostics.mjs'
+            diagnostic.write_text('export const version = 1;')
+            command = [str(binary), '--bridge-script', str(bridge)]
+            first = runtime.snapshot_command(command)
+            self.assertIn(str(diagnostic), first['resources'])
+            diagnostic.write_text('export const version = 2;')
+            changed = runtime.snapshot_command(command)
+            self.assertNotEqual(first['resources'], changed['resources'])
+            self.assertEqual(first['binary_sha256'], changed['binary_sha256'])
+
     def test_hash_and_json_reads_remain_bounded_when_open_file_grows(self):
         from types import SimpleNamespace
         with tempfile.TemporaryDirectory() as directory:

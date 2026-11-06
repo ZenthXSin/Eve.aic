@@ -16,6 +16,15 @@ spec.loader.exec_module(builder)
 
 
 class PackagingResourceTests(unittest.TestCase):
+    def test_copied_bridge_can_load_its_ingress_diagnostics_without_source_tree(self):
+        bridge = builder.copy_qq_bridge(self.root)
+        result = subprocess.run(['node', '--input-type=module', '-e',
+                                 'const module = await import(process.argv[1]); '
+                                 'if (typeof module.createBridge !== "function") process.exit(1);',
+                                 (bridge / 'bridge-core.mjs').as_uri()],
+                                cwd=self.root, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
     def test_packaging_targets_are_only_linux_and_windows(self):
         self.assertEqual(set(builder.TARGETS), {
             'x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc',

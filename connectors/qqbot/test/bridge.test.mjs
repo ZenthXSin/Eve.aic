@@ -407,7 +407,7 @@ test("pending 已满不绕过群唤醒、前缀、可信路由与正文容量检
     [{}, { senderId: "invalid/sender" }],
     [{}, { groupOpenid: "different-group" }],
     [{}, { replyTarget: { scope: "group", targetId: "group-1", msgId: "different-id" } }],
-    [{}, { content: "<@!1904159860> " }],
+    [{}, { content: " \t " }],
     [{}, { content: "<@!1904159860> " + "界".repeat(11000) }],
   ];
   for (const [group, changes] of cases) {
@@ -594,7 +594,8 @@ test("原生训练命令只剥离开头已确认的自身 @，保留其他提及
     rawEventType: "GROUP_MESSAGE_CREATE", groupOpenid: "group-1",
     mentions: [{ member_openid: "bot-openid", is_you: true }],
     replyTarget: { scope: "group", targetId: "group-1", msgId: "empty-1" }, content: "<@bot-openid>" });
-  assert.equal(f.frames.filter(x => x.type === "message").length, 0);
+  assert.equal(f.frames.find(x => x.type === "message").text, "<@bot-openid>");
+  assert.equal(f.frames.find(x => x.type === "message").original_text, "<@bot-openid>");
 });
 
 const segment = (index, count, text = `第${index + 1}段`, id = "in-1") =>
