@@ -29,6 +29,15 @@ BINARIES = ("eve", "eve-qqbot", "eve-web", "eve-cognition", "eve-memory", "eve-m
 MAX_NODE_ARCHIVE_BYTES = 128 * 1024 * 1024
 
 
+def copy_qq_bridge(bundle):
+    bridge = bundle / "connectors/qqbot"
+    bridge.mkdir(parents=True)
+    for file in ("bridge.mjs", "bridge-core.mjs", "ingress-diagnostics.mjs",
+                 "package.json", "package-lock.json", "THIRD_PARTY.md"):
+        shutil.copy2(ROOT / "connectors/qqbot" / file, bridge)
+    return bridge
+
+
 @contextlib.contextmanager
 def stage(name, **details):
     started = time.monotonic()
@@ -158,10 +167,7 @@ def package(target, binary_directory, output_directory):
             shell = bundle / f"{script}.sh"
             shell.write_text('#!/bin/sh\nEVE_PACKAGE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1\nexec "$EVE_PACKAGE_DIR/runtime/bin/node" "$EVE_PACKAGE_DIR/Launch.mjs" ' + mode + ' "$@"\n', encoding="utf-8")
             shell.chmod(0o755)
-    bridge = bundle / "connectors/qqbot"
-    bridge.mkdir(parents=True)
-    for file in ("bridge.mjs", "bridge-core.mjs", "package.json", "package-lock.json", "THIRD_PARTY.md"):
-        shutil.copy2(ROOT / "connectors/qqbot" / file, bridge)
+    bridge = copy_qq_bridge(bundle)
     runtime = bundle / "runtime"
     runtime.mkdir()
     print(json.dumps(dict(packaging_stage='copy_runtime_assets', event='completed', platform=label)), flush=True)

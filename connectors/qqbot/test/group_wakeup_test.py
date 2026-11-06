@@ -35,7 +35,7 @@ class GroupWakeupAcceptance(group_relation_test.GroupRelationAcceptance):
         root = self.work / 'prefix-bridge'
         root.mkdir()
         source = Path(__file__).resolve().parents[1]
-        for name in ['bridge.mjs', 'bridge-core.mjs']:
+        for name in ['bridge.mjs', 'bridge-core.mjs', 'ingress-diagnostics.mjs']:
             (root / name).write_bytes((source / name).read_bytes())
         sdk = root / 'node_modules/@tencent-connect/qqbot-nodejs'
         sdk.mkdir(parents=True)
@@ -107,14 +107,14 @@ export class QQBot {
         root = self.work / 'production-bridge'
         root.mkdir()
         source = Path(__file__).resolve().parents[1]
-        for name in ['bridge.mjs', 'bridge-core.mjs']:
+        for name in ['bridge.mjs', 'bridge-core.mjs', 'ingress-diagnostics.mjs']:
             (root / name).write_bytes((source / name).read_bytes())
         sdk = root / 'node_modules/@tencent-connect/qqbot-nodejs'
         sdk.mkdir(parents=True)
         (sdk / 'package.json').write_text(json.dumps({'type': 'module', 'exports': './index.mjs'}))
         record = self.work / 'sdk-sends.jsonl'
         code = r'''import fs from "node:fs";
-const record=RECORD, pulse=PULSE;
+const record=RECORD, pulse=PULSE, statePath=STATE_PATH;
 const texts=["eve在不在","EVE","eVe帮我看看","  EvE 在吗"];
 export class QQBot {
   constructor(options){this.appId=options.appId;this.handlers=new Map();this.count=0;}
@@ -129,15 +129,22 @@ export class QQBot {
   async sendText(target,text){
     fs.appendFileSync(record,JSON.stringify({target,text})+"\n");
     const index=this.count++;
-    setTimeout(()=>{
+    this.timer=setInterval(()=>{
+      const document=JSON.parse(fs.readFileSync(statePath,"utf8"));
+      const bytes=document.entries["eve.channel.qqbot"]?.["receipts.v1"];
+      // 平台发送成功后宿主仍须处理工具结果；逐条唤醒等待本轮持久结束。
+      if(!bytes || !JSON.parse(Buffer.from(bytes).toString()).entries.some(entry=>
+        entry.message.id==="wake-"+index && entry.state==="Handled"))return;
+      clearInterval(this.timer);
       this.message("wake-"+index,texts[index]);
       if(index+1<texts.length)this.message("wake-"+(index+1),texts[index+1]);
-    },50);
+    },20);
     return {id:"sent-"+index};
   }
   stop(){clearInterval(this.timer);this.resolve?.();}
 }'''
-        (sdk / 'index.mjs').write_text(code.replace('RECORD', json.dumps(str(record))).replace('PULSE', json.dumps(str(pulse))))
+        (sdk / 'index.mjs').write_text(code.replace('RECORD', json.dumps(str(record))).replace('PULSE', json.dumps(str(pulse)))
+                                    .replace('STATE_PATH', json.dumps(str(self.state_path))))
         env = {key: os.environ[key] for key in ('PATH', 'SystemRoot', 'TEMP', 'TMP') if key in os.environ}
         env.update(EVE_QQ_LIVE_INTERACTION='true', QQBOT_APP_SECRET='test-app-secret', QQBOT_APP_ID='1904159860',
                    EVE_OPENAI_API_KEY='test-model-secret', EVE_OPENAI_BASE_URL=f'http://127.0.0.1:{self.server.server_port}',
