@@ -46,9 +46,12 @@ use tokio::{
 mod bridge_warning;
 #[path = "foreground_speech.rs"]
 mod foreground_speech;
+#[path = "host_progress.rs"]
+mod host_progress;
 #[path = "speech_retry.rs"]
 mod speech_retry;
 use foreground_speech::{ForegroundActivity, ForegroundInput};
+use host_progress::HostProgress;
 
 /// /train words 的回复：按学到次数列出编号、词语或场合、含义与原话摘录。
 fn phrase_list(phrases: &[eve_training_api::LearnedPhrase]) -> String {
@@ -524,6 +527,7 @@ struct ChannelEvents {
     /// 慢步骤记录只是提示依据，队列满时丢弃，不影响本轮。
     steps: mpsc::Sender<ControlEvent>,
     foreground_activity: Arc<ForegroundActivity>,
+    host_progress: Arc<HostProgress>,
 }
 impl ChannelEvents {
     fn is_closed(&self) -> bool {
@@ -557,6 +561,7 @@ impl ControlEventSink for ChannelEvents {
                 Err(LlmError::Cancelled)
             } else {
                 self.foreground_activity.observe(&event);
+                self.host_progress.observe(&event);
                 if matches!(
                     event.event.kind,
                     TurnEventKind::ToolProgress { .. }
@@ -1277,6 +1282,7 @@ pub(crate) async fn run(
     let (progress_tx, mut progress_rx) = mpsc::channel(64);
     let (steps_tx, mut steps_rx) = mpsc::channel::<ControlEvent>(256);
     let foreground_activity = Arc::new(ForegroundActivity::default());
+    let host_progress = Arc::new(HostProgress::default());
     let sink = Arc::new(ChannelEvents {
         signal: signal.clone(),
         stop: stop.clone(),
@@ -1285,6 +1291,7 @@ pub(crate) async fn run(
         progress: progress_tx,
         steps: steps_tx,
         foreground_activity: foreground_activity.clone(),
+        host_progress: host_progress.clone(),
     });
     let mut command = Command::new(&config.node_program);
     command
@@ -1388,7 +1395,12 @@ pub(crate) async fn run(
             ledger.archive_if_needed(&ctx)?;
             let abandoned: Vec<_> = live_waiting.iter().filter(|(id, send)| send.cancelled()
                 || !active.iter().any(|a| &a.message.id == *id)).map(|(id, _)| id.clone()).collect();
-            for id in abandoned { if let Some(send) = live_waiting.remove(&id) { send.complete(if progress_delivery.iter().any(|p|p.message.id==id) {LiveDelivery::Unknown} else {LiveDelivery::NotSent}); } }
+            for id in abandoned { if let Some(send) = live_waiting.remove(&id) {
+                let written = progress_delivery.iter().any(|p| p.message.id == id
+                    && ledger.find(&config.app_id, &id).is_some_and(|index|
+                        ledger.entries[index].progress[p.part].decision_id.as_deref() == Some(send.call_id.as_str())));
+                send.complete(if written {LiveDelivery::Unknown} else {LiveDelivery::NotSent});
+            } }
             while progress_queue.len() < 64 {
                 match progress_rx.try_recv() {
                     Ok(event) => progress_queue.push_back((event, None, None)),
@@ -1681,7 +1693,7 @@ pub(crate) async fn run(
                         && !replies.iter().any(|r| same_destination(&r.message, &current.message))
                 }) {
                 let (event, text, waiting_seconds) = progress_queue.remove(position).expect("queued progress");
-                // 运行事件供 Eve 推进工作；显式发言模式下不另起措辞模型或模板。
+                // 运行事件供 Eve 推进工作；实时模式的宿主慢进度由独立观察器处理，不另起措辞模型。
                 if live_dialogue.is_some() && !matches!(event.event.kind, TurnEventKind::AssistantMessage { .. }) {
                     continue;
                 }
@@ -1774,7 +1786,9 @@ pub(crate) async fn run(
                     if scope_budget && entry.state == ReceiptState::Processing && !skip_start && interval_ok && legacy_milestone
                         && !duplicate && !cooling_down && entry.progress.len() < if explicit_send || stages {64} else {3} {
                         let part = entry.progress.len();
-                        let proactive = message.scope == "c2c" && (explicit_send || stages) && (passive_progress(entry) >= 2 || elapsed >= Duration::from_secs(230));
+                        // 系统进度不能把紧接着的正式答复挤到主动发送；仍留一个原被动名额。
+                        let passive_threshold = if explicit_send && entry.progress.iter().any(|p| p.decision_id.is_none()) {3} else {2};
+                        let proactive = message.scope == "c2c" && (explicit_send || stages) && (passive_progress(entry) >= passive_threshold || elapsed >= Duration::from_secs(230));
                         let decision_id = live_waiting.get(&message.id).map(|send| send.call_id.clone());
                         if !proactive && passive_progress(entry) >= 3 {
                             if let Some(outgoing) = live_waiting.remove(&message.id) { outgoing.complete(LiveDelivery::NotSent); }
@@ -1801,6 +1815,59 @@ pub(crate) async fn run(
                 if let Some(current) = active.iter().find(|a| a.key == event.key)
                     && !progress_delivery.iter().any(|p| p.message.id == current.message.id)
                     && let Some(outgoing) = live_waiting.remove(&current.message.id) { outgoing.complete(LiveDelivery::NotSent); }
+                continue;
+            }
+            // 实时模式的慢步骤只播报宿主可确认的活动，不调用发言模型；正式发言先走上方队列。
+            if let (Some(live), Some(after)) = (&live_dialogue, slow_progress.as_ref().and_then(|p| p.after()))
+                && progress_delivery.len() < MAX_DELIVERIES
+                && let Some((message, notice)) = active.iter().find_map(|current| {
+                    if pending_control(&current.message, &routing, &commands)
+                        || current.started.elapsed() >= Duration::from_secs(230)
+                        || host_progress::quiet_request(&current.message.text)
+                        || live_waiting.contains_key(&current.message.id)
+                        || live.has_outgoing(&current.key.session)
+                        || destination_busy(&current.message, &delivering, &progress_delivery, pushing.as_ref(), sending_file.as_ref())
+                        || replies.iter().any(|r| same_destination(&r.message, &current.message))
+                        || last_progress.get(&current.message.id).is_some_and(|last| last.elapsed() < min_interval.max(after))
+                    { return None; }
+                    let notice = host_progress.due(&current.key, after)?;
+                    if !control.snapshot(&current.key.session).ok().flatten().is_some_and(|s| notice.accepts(&s))
+                        || conversations.latest_message_id(&current.key.session).ok().flatten().as_deref() != Some(&current.message.id)
+                    { return None; }
+                    let entry = &ledger.entries[ledger.find(&config.app_id, &current.message.id)?];
+                    let quota = if current.message.scope == "c2c" { 2 } else { 1 };
+                    if entry.state != ReceiptState::Processing || entry.progress.len() >= 64
+                        || passive_progress(entry) >= 2
+                        || entry.progress.iter().filter(|p| p.decision_id.is_none()).count() >= quota
+                        || entry.progress.iter().any(|p| p.text == notice.text)
+                        || entry.progress.last().is_some_and(|p| matches!(p.state, PartState::Failed | PartState::Unknown))
+                    { return None; }
+                    Some((current.message.clone(), notice))
+                })
+            {
+                let index = ledger.find(&config.app_id, &message.id).expect("活动进度回执");
+                let part = ledger.entries[index].progress.len();
+                ledger.entries[index].progress.push(Progress {
+                    text: notice.text.clone(), state: PartState::Sending, proactive: false,
+                    necessary: false, decision_id: None, platform_message_id: None, image_path: None,
+                });
+                ledger.save(&ctx)?;
+                if host_progress.current(&notice)
+                    && control.snapshot(&notice.key.session).is_ok_and(|s| s.is_some_and(|s| notice.accepts(&s)))
+                    && !live.has_outgoing(&notice.key.session)
+                    && conversations.latest_message_id(&notice.key.session)?.as_deref() == Some(&message.id)
+                {
+                    last_progress.insert(message.id.clone(), tokio::time::Instant::now());
+                    write(&mut stdin, json!({"type":"progress", "version":1, "id":message.id,
+                        "index":part, "text":notice.text, "proactive":false, "explicit":false,
+                        "host_activity":true, "based_on_message_id":message.id})).await?;
+                    progress_delivery.push(ProgressDelivery {message, part,
+                        deadline:tokio::time::Instant::now()+DELIVERY_TIMEOUT});
+                } else {
+                    // 尚未写入桥接，Node 没有领取这个序号；撤销准备记录，不占用后续正式发言的序号和额度。
+                    ledger.entries[index].progress.pop().expect("已准备的未写出活动进度");
+                    ledger.save(&ctx)?;
+                }
                 continue;
             }
             if delivering.len() + judging.len() < MAX_DELIVERIES
@@ -2485,7 +2552,9 @@ pub(crate) async fn run(
                         ledger.entries[index].progress[progress.part].state = PartState::Unknown;
                         ledger.save(&ctx)?;
                         if let Some(speaker)=&speech {expression_receipt(speaker,&config.app_id,&ledger.entries[index],progress.part,QqOutreachResult::Unknown)?;}
-                        if let Some(outgoing) = live_waiting.remove(id) { outgoing.complete(LiveDelivery::Unknown); }
+                        if ledger.entries[index].progress[progress.part].decision_id.as_deref()
+                            .is_some_and(|decision| live_waiting.get(id).is_some_and(|send| send.call_id == decision))
+                            && let Some(outgoing) = live_waiting.remove(id) { outgoing.complete(LiveDelivery::Unknown); }
                         warn(&ctx, "progress_timeout_unknown_no_retry");
                     }
                     if sending_file.as_ref().is_some_and(|d| d.deadline <= now) {
@@ -2746,7 +2815,9 @@ pub(crate) async fn run(
                             if let Some(speaker)=&speech {expression_receipt(speaker,&config.app_id,&ledger.entries[index],part,
                                 if ok {QqOutreachResult::Sent{platform_message_id:ledger.entries[index].progress[part].platform_message_id.clone()}} else if delivery_unknown(&frame) {QqOutreachResult::Unknown} else {QqOutreachResult::Failed{http_status:None,biz_code:None}})?;}
                             if !ok { delivery_log(&ctx, "progress_failed_no_retry", &frame); }
-                            if let Some(outgoing) = live_waiting.remove(id) {
+                            if ledger.entries[index].progress[part].decision_id.as_deref()
+                                .is_some_and(|decision| live_waiting.get(id).is_some_and(|send| send.call_id == decision))
+                                && let Some(outgoing) = live_waiting.remove(id) {
                                 outgoing.complete(if ok { LiveDelivery::Sent(frame["message_id"].as_str().unwrap().to_owned()) }
                                     else if delivery_unknown(&frame) { LiveDelivery::Unknown } else if frame.get("failure_kind").and_then(Value::as_str)==Some("stale_decision") {LiveDelivery::Stale} else { LiveDelivery::NotSent });
                             }
