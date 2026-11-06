@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import sys
 import time
 import unittest
 
@@ -47,6 +48,42 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
                           e.get('type') in ('reply', 'segment', 'sticker')],
                          '宿主不能发送内部 final、自动分段或自动附带表情')
         return result
+
+    def run_live_failure(self, script, notifications, **options):
+        """只允许逐条指定的失败回执发系统通知；普通 live 断言保持不变。"""
+        self.assertTrue(notifications)
+        options['env_extra'] = dict(options.pop('env_extra', {}), EVE_QQ_LIVE_INTERACTION='true')
+        result = self.run_eve(script, milestones=None, **options)
+        self.assertFalse(self.narrations, '故障通知不得调用措辞模型')
+        outputs = [e for e in self.events if e.get('direction') == 'out' and
+                   e.get('type') in ('reply', 'segment', 'sticker')]
+        self.assertCountEqual([e['id'] for e in outputs], notifications)
+        for output in outputs:
+            self.assertEqual(output['type'], 'reply', '系统通知只能单条投递')
+            self.assertTrue(output['text'].startswith('系统通知：'))
+            receipt = self.receipt(output['id'])
+            self.assertEqual(receipt['state'], notifications[output['id']])
+            self.assertEqual(receipt['reply'], output['text'])
+            self.assertIsNone(receipt.get('control_turn_id'), '系统通知不能冒充成功对话')
+            self.assertFalse(receipt.get('segments') or receipt.get('sticker'))
+            first = next(e for e in self.events if e.get('direction') == 'out' and
+                         e.get('id') == output['id'] and e.get('type') in ('finish', 'reply'))
+            self.assertEqual(first['type'], 'reply', '不得先关闭原消息再转交发言模型')
+        self.assertFalse(any(event['id'] in {f'host-reply:{id}' for id in notifications}
+                             for event, _, _ in self.speech_rows()))
+        return result
+
+    def failure_message(self, id, text, **options):
+        return super().message(id, text, contains=['系统通知：'], **options) | {'allow_finish': True}
+
+    def failed_send(self, message, state='Sent'):
+        return [{'send': message}, self.wait_command(message['id'], 'reply'),
+                self.wait_receipt(message['id'], state)]
+
+    def malformed_tool_response(self):
+        response = self.choose('echo', {'text': '这一批不得执行'})
+        response['choices'][0]['message']['tool_calls'][0]['function']['arguments'] = '{"text":'
+        return response
 
     def message(self, *args, **kwargs):
         return super().message(*args, **kwargs) | {'expected_type': 'finish'}
@@ -240,6 +277,67 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
         self.assertEqual(len(self.progress('failed')), 1)
         self.assertEqual(self.receipt('failed')['progress'][0]['state'], 'Failed')
 
+    def test_repeated_bad_arguments_send_one_system_notice_without_a_speech_decision(self):
+        self.callback = lambda _: self.malformed_tool_response()
+        message = self.failure_message('bad-arguments', '检查工具参数错误')
+        summary = self.run_live_failure(self.failed_send(message), {'bad-arguments': 'Sent'},
+            more=['--segmented'], memory=True, env_extra={'EVE_OPENAI_TRANSIENT_RETRIES': 'true'})
+        self.assertEqual(self.chat_rounds, 2, '同一坏批次至多重取一次')
+        self.assertFalse(self.speech_requests)
+        failure = self.turn(message['text'])['status']['failure']
+        self.assertEqual(failure['code'], 'Protocol')
+        self.assertEqual(failure['started_tools'], 0)
+        self.assertIn('本批工具未执行', self.receipt(message['id'])['reply'])
+        self.assertIn('尚未启动工具调用', self.receipt(message['id'])['reply'])
+        self.assertEqual(summary['sent'], 1)
+        self.assertFalse(self.interactions(), '失败通知不进入成功交互学习')
+
+    def test_failure_after_a_delivered_message_preserves_executed_command_and_sends_system_notice(self):
+        marker = self.source / 'executions.txt'
+        program = "from pathlib import Path; p=Path('executions.txt'); p.write_text(p.read_text()+'x' if p.exists() else 'x'); print('command-complete')"
+        def respond(body):
+            results = self.all_results(body)
+            if not results:
+                return self.choose('send_message', {'text': '已收到，正在核对'})
+            if len(results) == 1:
+                self.assertTrue(results[0]['sent'])
+                return self.choose('run_command', {'program': sys.executable, 'args': ['-c', program]})
+            return self.malformed_tool_response()
+        self.callback = respond
+        message = self.failure_message('partial-failure', '核对一次命令的执行结果')
+        self.run_live_failure(self.failed_send(message), {'partial-failure': 'Sent'}, env_extra={
+            'EVE_OPENAI_TRANSIENT_RETRIES': 'true', 'EVE_DEVELOPER_CONFIG': str(self.developer_config)})
+        self.assertEqual(self.chat_rounds, 4)
+        self.assertEqual(marker.read_text(), 'x', '重取坏参数不得重放前面的成功命令')
+        self.assertEqual([e['text'] for e in self.progress(message['id'])], ['已收到，正在核对'])
+        receipt = self.receipt(message['id'])
+        self.assertEqual(receipt['progress'][0]['state'], 'Sent')
+        self.assertTrue(receipt['progress'][0]['platform_message_id'])
+        self.assertIn('已启动 2 次工具调用，收到 2 条工具回执', receipt['reply'])
+        self.assertEqual(self.turn(message['text'])['status']['failure']['started_tools'], 2)
+        self.assertFalse(self.speech_requests)
+
+    def failure_notice_not_replayed(self, state, diagnostic):
+        self.callback = lambda _: self.malformed_tool_response()
+        message = self.failure_message('notice-outcome', '核对故障通知的发送结果') | {
+            'fail_delivery': True, 'delivery_diagnostic': diagnostic}
+        self.run_live_failure([*self.failed_send(message, state), {'delay_ms': 100},
+            {'send': message}, self.wait_command(message['id'], 'finish')], {message['id']: state},
+            env_extra={'EVE_OPENAI_TRANSIENT_RETRIES': 'true'})
+        self.assertEqual(self.chat_rounds, 2)
+        self.assertFalse(self.speech_requests)
+        before = self.receipt(message['id'])
+        self.callback = lambda _: dialogue.text_response('内部结束，不重发旧消息')
+        self.run_live(self.send(self.message('new-turn', '这次先不用回复')))
+        self.assertEqual(self.receipt(message['id']), before)
+        self.assertFalse(self.speech_requests)
+
+    def test_rejected_system_notice_is_not_retried_after_duplicate_input_or_restart(self):
+        self.failure_notice_not_replayed('Failed', {'failure_kind': 'http', 'http_status': 403})
+
+    def test_unknown_system_notice_is_not_retried_after_duplicate_input_or_restart(self):
+        self.failure_notice_not_replayed('Unknown', {'failure_kind': 'timeout'})
+
     def test_unknown_send_survives_restart_without_replay_and_enters_actual_receipt_context(self):
         self.callback = lambda _: self.choose('send_message', {'text': '可能已经送达的发现'})
         stop = self.gate('stop-owned-child')
@@ -322,8 +420,9 @@ class LiveToolAcceptance(progress.ToolProgressAcceptance):
                 self.gate('new-original-seen').touch()
             return {'action': 'silence'}
         self.speech_callback = decide
-        self.run_live([*self.send(self.message('new-failed', current)),
+        self.run_live_failure([*self.failed_send(self.failure_message('new-failed', current)),
                        {'wait_file': str(self.gate('new-original-seen'))}, {'delay_ms': 300}],
+                      {'new-failed': 'Sent'},
                       env_extra={'EVE_OPENAI_TRANSIENT_RETRIES': 'false'})
         self.assertEqual(self.turn(current)['status']['state'], 'Failed')
         self.assertFalse([e for e in self.events if e.get('type') in ('push', 'progress')])

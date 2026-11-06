@@ -822,6 +822,8 @@ fn segment_frame(ledger: &Ledger, index: usize, part: usize) -> Value {
 enum ReplyGuard {
     // 控制消息的确认仍可用于已取消/阻塞代，但不能用于已被替换的代。
     Current(GenerationKey),
+    // 系统故障事实保留同代约束；直接投递，不交给自主发言模型决定是否开口。
+    Failure(GenerationKey),
     Completed(ControlEvent),
     NoTask,
     // 宿主命令的已保存结果不属于聊天生成代，但仍绑定原消息和持久回执。
@@ -830,7 +832,7 @@ enum ReplyGuard {
 impl ReplyGuard {
     fn accepts(&self, control: &dyn ControlService) -> bool {
         match self {
-            Self::Current(key) => control
+            Self::Current(key) | Self::Failure(key) => control
                 .snapshot(&key.session)
                 .is_ok_and(|s| s.is_some_and(|s| s.key == *key)),
             Self::Completed(event) => control.accepts(event),
@@ -1818,7 +1820,7 @@ pub(crate) async fn run(
                     finish(&mut stdin, &reply.message.id).await?;
                     continue;
                 }
-                if live_dialogue.is_some() {
+                if live_dialogue.is_some() && !matches!(reply.guard, ReplyGuard::Failure(_)) {
                     if let Some(speech) = &speech {
                         let session = reply.message.session_key(&config.app_id)?;
                         speech.enqueue(crate::QqSpeechEvent {
@@ -2659,7 +2661,7 @@ pub(crate) async fn run(
                             }
                         });
                         replies.push_back(Reply { message: current.message,
-                            text: failed_turn_notice(&report, recovery.as_deref()), guard: ReplyGuard::Current(report.key),
+                            text: format!("系统通知：{}", failed_turn_notice(&report, recovery.as_deref())), guard: ReplyGuard::Failure(report.key),
                             interaction: None, invite: None });
                     } else {
                         mark_failed(&mut ledger, &ctx, &config.app_id, &current.message.id)?;
@@ -2842,7 +2844,7 @@ pub(crate) async fn run(
                                 delivery_log(&ctx, "late_reply_proactive_sent", &frame);
                             }
                             if ok { timing(timing_diagnostics, "delivery_confirmed", None); }
-                            if ok && let Some(observer)=&group_observer && observer.replied(message,&reply.text).is_err() { warn(&ctx,"group_reply_observation_failed"); }
+                            if ok && !matches!(reply.guard, ReplyGuard::Failure(_)) && let Some(observer)=&group_observer && observer.replied(message,&reply.text).is_err() { warn(&ctx,"group_reply_observation_failed"); }
                             if ok && let Some(interaction) = &reply.interaction
                                 && let Some(observation) = &observation
                                 && let Err(error) = interaction.observe(observation.observer.as_ref(), &config.app_id, message, &reply.text) {
