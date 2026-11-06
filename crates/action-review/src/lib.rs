@@ -217,6 +217,13 @@ mod tests {
         });
         let reviewer = ModelActionReviewer::new(Arc::new(Fixed(provider.clone())));
         let mut action = request();
+        let scope = eve_llm_api::ContextScope {
+            session_id: "main-chat".into(),
+            user_id: "owner".into(),
+        };
+        let session =
+            eve_llm_api::ModelSession::anchored("review", Some(&scope), "tool-call-7").unwrap();
+        action.model_session = Some(session.clone());
         action.user_messages.clear();
         action.delegated = true;
         action.claimed_confirmation = false;
@@ -225,6 +232,7 @@ mod tests {
         assert!(!verdict.permits(), "旧身份授权接口不可混同系统安全接口");
         let seen = provider.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].session, Some(session));
         assert_eq!(
             seen[0].messages[0].text.as_deref(),
             Some(SYSTEM_SAFETY_PROMPT)

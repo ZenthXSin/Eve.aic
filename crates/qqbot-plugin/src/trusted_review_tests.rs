@@ -340,6 +340,13 @@ async fn missing_original_is_a_gap_but_present_empty_body_remains_exact() {
             .is_err(),
         "缺失当前原文不是可降级的旧格式缺口"
     );
+    assert_eq!(
+        host.conversations
+            .review_window_at(&scope(&gap), &gap.id)
+            .unwrap(),
+        eve_llm_api::ReviewUserMessageWindow::MissingOriginals,
+        "普通工具窗口明确报告经过身份和库绑定核验的原文缺口，不伪造授权"
+    );
     assert!(
         host.record("app", &gap, Some(&gap.text)).is_err(),
         "加工正文不能回填已有缺口"
@@ -357,12 +364,80 @@ async fn missing_original_is_a_gap_but_present_empty_body_remains_exact() {
         );
         if id < 5 {
             assert!(evidence.is_err(), "窗口内缺口不能跳过并补更旧消息");
+            assert_eq!(
+                host.conversations
+                    .review_window_at(&scope(&next), &next.id)
+                    .unwrap(),
+                eve_llm_api::ReviewUserMessageWindow::MissingOriginals
+            );
         } else {
             assert_eq!(evidence.unwrap(), vec!["新的原话"; 6]);
+            assert_eq!(
+                host.conversations
+                    .review_window_at(&scope(&next), &next.id)
+                    .unwrap(),
+                eve_llm_api::ReviewUserMessageWindow::Complete(vec!["新的原话".into(); 6])
+            );
         }
     }
     assert_eq!(archive.0.lock().unwrap().rows[1].text, None);
     host.kernel.stop_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn anchored_original_gap_survives_restart_without_changing_bytes_or_accepting_foreign_identity()
+ {
+    let store = Arc::new(Store::default());
+    let archive = Arc::new(Archive::default());
+    let host = Host::new(store.clone(), Some(archive.clone()));
+    host.kernel.start_all().await.unwrap();
+    let missing = message("missing");
+    host.record("app", &missing, None).unwrap();
+    host.bind("app", std::slice::from_ref(&missing));
+    let marker = store.marker().unwrap();
+    let rows = archive.0.lock().unwrap().rows.clone();
+    host.kernel.stop_all().await.unwrap();
+    drop(host);
+    let restarted = Host::new(store.clone(), Some(archive.clone()));
+    restarted.kernel.start_all().await.unwrap();
+    assert!(
+        restarted
+            .conversations
+            .review_window_at(&scope(&missing), &missing.id)
+            .is_err(),
+        "重启没有重新绑定当前平台身份时，不能仅凭旧数据开放工具"
+    );
+    restarted.bind("app", std::slice::from_ref(&missing));
+    assert_eq!(
+        restarted
+            .conversations
+            .review_window_at(&scope(&missing), &missing.id)
+            .unwrap(),
+        eve_llm_api::ReviewUserMessageWindow::MissingOriginals
+    );
+    assert!(
+        restarted
+            .conversations
+            .review_user_messages_at(&scope(&missing), &missing.id)
+            .is_err()
+    );
+    let mut foreign = scope(&missing);
+    foreign.user_id = "foreign".into();
+    assert!(
+        restarted
+            .conversations
+            .review_window_at(&foreign, &missing.id)
+            .is_err()
+    );
+    assert!(
+        restarted
+            .conversations
+            .review_window_at(&scope(&missing), "unbound")
+            .is_err()
+    );
+    assert_eq!(archive.0.lock().unwrap().rows, rows);
+    assert_eq!(store.marker().unwrap(), marker);
+    restarted.kernel.stop_all().await.unwrap();
 }
 
 #[tokio::test]
@@ -459,6 +534,12 @@ async fn live_archive_rollback_or_identity_change_blocks_reads_and_writes_until_
                 .review_user_messages(&scope(&first))
                 .is_err(),
             "{defect}: 运行中读取必须检查原文库绑定"
+        );
+        assert!(
+            host.conversations
+                .review_window_at(&scope(&first), &first.id)
+                .is_err(),
+            "{defect}: 库失效不能变成允许普通工具的原文缺口"
         );
         let second = message("second");
         assert!(
@@ -606,6 +687,12 @@ async fn replaceable_archive_cannot_supply_foreign_unanchored_or_oversized_evide
                 .review_user_messages(&scope(&anchor))
                 .is_err()
         );
+        assert!(
+            host.conversations
+                .review_window_at(&scope(&anchor), &anchor.id)
+                .is_err(),
+            "损坏或身份错误不能降级成原文缺口"
+        );
     }
     archive.0.lock().unwrap().read_override = Some(vec![good]);
     assert_eq!(
@@ -702,6 +789,12 @@ async fn legacy_receipts_create_a_persistent_gap_until_six_new_platform_original
                 .legacy_review_gap_at(&scope(message), &message.id)
                 .unwrap()
         );
+        assert_eq!(
+            host.conversations
+                .review_window_at(&scope(message), &message.id)
+                .unwrap(),
+            eve_llm_api::ReviewUserMessageWindow::MissingOriginals
+        );
     }
     let saved_marker = store.marker().unwrap();
     host.kernel.stop_all().await.unwrap();
@@ -716,6 +809,13 @@ async fn legacy_receipts_create_a_persistent_gap_until_six_new_platform_original
             .review_user_messages(&scope(&messages[2]))
             .is_err(),
         "重启不能遗忘旧历史缺口"
+    );
+    assert_eq!(
+        restarted
+            .conversations
+            .review_window_at(&scope(&messages[2]), &messages[2].id)
+            .unwrap(),
+        eve_llm_api::ReviewUserMessageWindow::MissingOriginals
     );
     for id in 3..6 {
         restarted
