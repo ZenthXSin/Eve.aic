@@ -1,11 +1,11 @@
-name: 跨平台构建与发布
+name: Linux 双架构构建与发布
 
 on:
   push:
     branches: [main]
     tags: ['v*']
   pull_request:
-    paths: ['packaging/**', 'scripts/package-*.ps1', 'scripts/package-*.py', 'scripts/test-*package.py', 'scripts/test-package-*.py', 'scripts/test-launcher-signal.py', 'scripts/test-launcher-*.mjs', 'scripts/*client-update*.mjs', 'scripts/client_update_native.py', 'scripts/release-portable.py', 'scripts/test-release-portable.py', '.github/workflows/release.yml']
+    paths: ['packaging/**', 'scripts/package-*.py', 'scripts/test-*package.py', 'scripts/test-package-*.py', 'scripts/test-launcher-signal.py', 'scripts/test-launcher-*.mjs', 'scripts/*client-update*.mjs', 'scripts/client_update_native.py', 'scripts/release-portable.py', 'scripts/test-release-portable.py', '.github/workflows/release.yml']
   workflow_dispatch:
 
 permissions:
@@ -56,8 +56,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {label: windows-x64, runner: windows-latest, target: x86_64-pc-windows-msvc, os: windows}
-          - {label: windows-arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc, os: windows}
           - {label: linux-x64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, os: linux}
           - {label: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, os: linux}
     steps:
@@ -72,7 +70,6 @@ jobs:
           targets: ${{ matrix.target }}
       - name: 构建原生运行器
         env:
-          RUSTFLAGS: ${{ matrix.os == 'windows' && '-C target-feature=+crt-static' || '' }}
           CARGO_INCREMENTAL: '0'
           EVE_BUILD_TARGET: ${{ matrix.target }}
         shell: bash
@@ -91,7 +88,6 @@ jobs:
         with:
           name: Eve-${{ matrix.label }}
           path: |
-            dist/Eve-*.zip
             dist/Eve-*.tar.gz
             dist/SHA256SUMS-*.txt
             dist/acceptance-*.json
@@ -116,7 +112,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: 下载四个平台的验收产物
+      - name: 下载 Linux 两种架构的验收产物
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: Eve-*

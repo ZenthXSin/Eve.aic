@@ -23,14 +23,14 @@ Rust 认知系统底座：稳定插件 Runtime 与主模型闭环，持续推进
 
 ## 运行
 
-免编译运行可从[最新发行](https://github.com/ZenthXSin/Eve.aic/releases/latest)选择 Windows 或 Linux 的 x64 / ARM64 便携包，完整解压后使用包内 Start-Eve；安装与更新见[跨平台发行](./docs/跨平台发行.md)。
+免编译运行可从[最新发行](https://github.com/ZenthXSin/Eve.aic/releases/latest)选择 Linux 的 x64 / ARM64 便携包，完整解压后使用包内 Start-Eve.sh；安装与更新见[跨平台发行](./docs/跨平台发行.md)。
 
 Rust 1.89+。在仓库根目录配置主模型及宿主凭据：
 
-```powershell
-$env:EVE_OPENAI_MODEL = "deepseek-v4.1-flash"
-$env:EVE_OPENAI_PROTOCOL = "chat"
-$env:EVE_OPENAI_API_KEY = "<宿主凭据>"
+```bash
+export EVE_OPENAI_MODEL="deepseek-v4.1-flash"
+export EVE_OPENAI_PROTOCOL="chat"
+export EVE_OPENAI_API_KEY="<宿主凭据>"
 cargo run -p eve-app --locked -- --state-dir ./.eve --agent ./AGENT.md
 ```
 

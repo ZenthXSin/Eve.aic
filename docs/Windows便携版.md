@@ -1,18 +1,7 @@
-# Windows exe 与便携发行包
+# Windows 支持已停止
 
-发行物为 `Eve-<版本或提交>-windows-x64.zip`（Windows 10/11）及 `windows-arm64.zip`（Windows 11 ARM64），包含原生 MSVC exe、内嵌 Web 页面、固定 Node 22.22.0 与锁定 QQ SDK、启动脚本和无密钥配置示例。使用方法见[随包说明](../packaging/windows/使用说明.md)。不包含用户会话、训练样本或真实密钥。
+从 2026-11-06 的平台范围调整起，Eve 不再维护 Windows CI、生成 Windows x64 / ARM64 发行包或提供新的 Windows 更新。当前支持 Linux x64 / ARM64，安装与发行见 [Linux 双架构发行](./跨平台发行.md)。macOS 也不在支持范围内。
 
-`跨平台构建与发布` 工作流在 Windows runner 上用 Rust 1.89、对应 MSVC 目标和静态 CRT 构建五个入口，直接运行帮助；下载官方 Node ZIP，复核固定 SHA-256 和版本，再从锁文件安装纯 JS 桥接依赖。共用 `scripts/package-portable.py` 只复制明确列出的发行文件，不递归打包仓库或工作目录；PowerShell 打包入口仅委托它。输出源码提交、树、逐文件 SHA-256 与发行 ZIP 校验值。
+已经发布的 Windows Release 资产及原用户目录保持原样。旧启动器仍按原平台匹配资产；新版本缺少 Windows 资产时不会选择 Linux 包，不会转换或清空配置、会话和训练数据。这不代表旧 Windows 版本仍有兼容性或修复保证。
 
-`scripts/test-portable-package.py` 解压实际 ZIP 到含中文、空格的临时目录，检查文件散列与空密钥模板，然后使用内置 exe/Node 启动（x64 用 PowerShell 5.1，ARM64 用原生 Node）。仅连接回环模型与 QQ 替身，验证面板鉴权、认知与记忆/学习读取、两段投递、关闭和第二次启动零重放；它不连接正式 QQ 或外部模型。通过后工作流上传 ZIP、校验清单与验收 JSON，保存 30 天；版本标签自动发布 Release，见[跨平台发行](./跨平台发行.md)。
-
-源码构建可在有 Rust 1.89/MSVC、Node 和 PowerShell 7 的 Windows 开发机器执行：
-
-```powershell
-$env:RUSTFLAGS = '-C target-feature=+crt-static'
-cargo +1.89.0 build -p eve-app --bins --release --locked --target x86_64-pc-windows-msvc
-./scripts/package-windows.ps1
-python scripts/test-windows-package.py dist
-```
-
-用户运行 x64 发行包使用系统自带 Windows PowerShell 5.1；ARM64 使用随包 Node，均不需要上述构建工具。`config.json` 与 `data` 留在本机；读取无效配置和损坏状态会失败，不自动重置。迁移与升级先退出并备份原文件，再复制到新版目录；不同宿主模式使用独立状态目录。启动脚本只给当前子进程提供凭据和功能参数，沿用 Rust 宿主对 Node 凭据隔离、回执与恢复的原有契约。
+历史资料保存在停止支持前的主线提交 `c57f35b0f156a3c2144ac2d31a498a9e13f4f47c`：[原构建与验收说明](https://github.com/ZenthXSin/Eve.aic/blob/c57f35b0f156a3c2144ac2d31a498a9e13f4f47c/docs/Windows便携版.md)、[原安装说明](https://github.com/ZenthXSin/Eve.aic/blob/c57f35b0f156a3c2144ac2d31a498a9e13f4f47c/packaging/windows/使用说明.md)。这些资料只描述当时的版本。
