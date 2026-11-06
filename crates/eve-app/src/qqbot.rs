@@ -1081,6 +1081,7 @@ async fn run_qqbot_composed(
         let model_health = Arc::new(eve_model_health::HealthBook::new());
         model_health.register("dialogue");
         crate::models::observe_usage(model_health.clone());
+        crate::idle_small::observe(model_health.clone());
         bootstrap.health = Some(model_health.clone());
         // 历史窗口省略较早轮次时用摘要代替；摘要是派生数据，原始会话历史完整保留。
         let digest_policy = Arc::new(crate::qq_history_digest::Policy::default());

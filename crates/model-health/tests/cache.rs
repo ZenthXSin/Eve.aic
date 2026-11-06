@@ -88,11 +88,20 @@ async fn prefix_reuse_is_measured_within_the_explicit_session_only() {
     ] {
         request.session = Some(session);
         probe.complete(request.clone()).await.unwrap();
+        let cache = book.snapshot()[0].1.cache.clone();
+        assert!(
+            !cache.last_break.is_some_and(|last| last.tools_changed),
+            "同一工具的新会话是冷启动，不能误报为工具变化"
+        );
     }
     let cache = book.snapshot()[0].1.cache.clone();
     assert_eq!(cache.recent_local[0].1, 0);
     assert_eq!(cache.recent_local[1].1, 0);
     assert_eq!(cache.recent_local[2].0, cache.recent_local[2].1);
+
+    request.tools[0].name = "new-tool".into();
+    probe.complete(request).await.unwrap();
+    assert!(book.snapshot()[0].1.cache.last_break.unwrap().tools_changed);
 }
 
 #[test]
