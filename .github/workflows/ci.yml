@@ -42,7 +42,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup default stable
       - name: 检查代码格式
-        run: cargo fmt --all -- --check
+        run: cargo fmt -- --check
       - name: 安装与便携包一致的 Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
@@ -539,7 +539,7 @@ jobs:
           Assert-SavedCounter $stateDirectory "[50]"
 
   msrv:
-    name: 最低 Rust 版本 / 1.89.0
+    name: 最低 Rust 版本 / 1.95.0
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -548,6 +548,8 @@ jobs:
         with:
           persist-credentials: false
       - name: 安装最低支持版本
-        run: rustup toolchain install 1.89.0 --profile minimal
+        run: rustup toolchain install 1.95.0 --profile minimal
       - name: 检查最低版本的所有构建目标
-        run: cargo +1.89.0 check --workspace --all-targets --locked
+        run: cargo +1.95.0 check --workspace --all-targets --locked
+      - name: 核对保留的 Codex 原文件
+        run: python3 scripts/verify-codex-upstream.py

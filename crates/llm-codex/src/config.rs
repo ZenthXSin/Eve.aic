@@ -46,6 +46,11 @@ impl CodexConfig {
         Ok(self)
     }
 
+    /// 只校验普通配置，不读取凭据、不创建客户端、不探测端点。
+    pub fn validate(&self, authenticated: bool) -> Result<(), LlmError> {
+        self.endpoint(authenticated).map(|_| ())
+    }
+
     pub(crate) fn endpoint(&self, authenticated: bool) -> Result<Endpoint, LlmError> {
         if self.model.trim().is_empty()
             || self.model.len() > 512

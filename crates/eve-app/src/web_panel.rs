@@ -277,6 +277,7 @@ impl PanelService for QqPanel {
             .map(|summary| ModelConfigView {
                 model: summary.model,
                 protocol: summary.protocol.into(),
+                adapter: summary.adapter.into(),
                 max_output_tokens: summary.max_output_tokens,
                 max_output_tokens_key: summary.max_output_tokens_key,
                 max_output_tokens_source: summary
@@ -310,6 +311,7 @@ impl PanelService for QqPanel {
                 ModelRoleHealth {
                     configured_model: summary.as_ref().map(|s| s.model.clone()),
                     configured_protocol: summary.as_ref().map(|s| s.protocol.into()),
+                    configured_adapter: summary.as_ref().map(|s| s.adapter.into()),
                     state: match health.last_succeeded {
                         None => ModelState::Unverified,
                         Some(true) => ModelState::Responsive,

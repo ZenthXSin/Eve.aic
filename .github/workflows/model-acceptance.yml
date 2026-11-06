@@ -49,9 +49,9 @@ jobs:
         with:
           persist-credentials: false
       - name: 安装 Rust
-        run: rustup toolchain install 1.89.0 --profile minimal
+        run: rustup toolchain install 1.95.0 --profile minimal
       - name: 构建核心入口
-        run: cargo +1.89.0 build -p eve-app --bin eve --example model_acceptance --locked
+        run: cargo +1.95.0 build -p eve-app --bin eve --example model_acceptance --locked
       - name: 验收多轮与新进程恢复
         env:
           EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}

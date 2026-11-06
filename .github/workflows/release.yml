@@ -65,10 +65,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: 安装 Rust 1.89 与目标
+      - name: 安装 Rust 1.95 与目标
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          toolchain: 1.89.0
+          toolchain: 1.95.0
           targets: ${{ matrix.target }}
       - name: 构建原生运行器
         env:

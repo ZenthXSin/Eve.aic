@@ -203,7 +203,7 @@ def package(target, binary_directory, output_directory):
     with stage('hash_bundle'):
         files = {file.relative_to(bundle).as_posix(): digest(file) for file in sorted(bundle.rglob("*")) if file.is_file()}
     manifest = {"format_version": 1, "source_commit": source, "source_tree": tree, "version": version,
-                "target": target, "platform_label": label, "rust_version": "1.89.0", "static_crt": windows,
+                "target": target, "platform_label": label, "rust_version": "1.95.0", "static_crt": windows,
                 "node_version": NODE_VERSION, "node_archive_sha256": pinned_digest,
                 "credentials_included": False, "user_data_included": False, "files_sha256": files,
                 "updater_protocol": 1, "state_schema_generation": 2}

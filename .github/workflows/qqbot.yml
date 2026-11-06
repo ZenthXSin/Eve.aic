@@ -60,11 +60,11 @@ jobs:
       - name: 独立生图适配器本地上游验收
         run: python3 imgadapter/test_adapter.py
       - name: 安装 Rust
-        run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
       - name: 验证通道依赖构建
         run: |
-          cargo +1.89.0 fmt --all -- --check
-          cargo +1.89.0 check --workspace --all-targets --locked
+          cargo +1.95.0 fmt -- --check
+          cargo +1.95.0 check --workspace --all-targets --locked
       - name: 准备并验证实际脚本隔离环境
         run: |
           sudo apt-get update
@@ -75,7 +75,7 @@ jobs:
           bwrap --unshare-all --ro-bind / / --dev /dev --proc /proc /usr/bin/true
       - name: 实际 Eve QQBot 进程验收
         run: |
-          cargo +1.89.0 build -p eve-app --bin eve-qqbot --bin eve-web --bin eve-memory --locked
+          cargo +1.95.0 build -p eve-app --bin eve-qqbot --bin eve-web --bin eve-memory --locked
           python3 scripts/test-web-chat.py
           python3 scripts/test-web-autonomy.py
           python3 scripts/test-web-goals.py
@@ -107,13 +107,13 @@ jobs:
           python3 connectors/qqbot/test/developer_tools_test.py
           python3 connectors/qqbot/test/business_restriction_ingress_test.py
           python3 connectors/qqbot/test/trusted_review_originals_test.py
-          EVE_TEST_PLUGIN_TOOLCHAIN=1.89.0 python3 connectors/qqbot/test/script_runtime_test.py
+          EVE_TEST_PLUGIN_TOOLCHAIN=1.95.0 python3 connectors/qqbot/test/script_runtime_test.py
           python3 connectors/qqbot/test/file_import_test.py
           python3 connectors/qqbot/test/workflow_tools_test.py
           python3 connectors/qqbot/test/vision_test.py
           python3 connectors/qqbot/test/sticker_test.py
           python3 connectors/qqbot/test/live_upgrade_test.py
-          EVE_TEST_UPGRADE_TOOLCHAIN=1.89.0 python3 connectors/qqbot/test/self_upgrade_timeout_test.py
+          EVE_TEST_UPGRADE_TOOLCHAIN=1.95.0 python3 connectors/qqbot/test/self_upgrade_timeout_test.py
           python3 connectors/qqbot/test/transport_test.py
           python3 connectors/qqbot/test/people_test.py
           python3 connectors/qqbot/test/phrases_test.py
@@ -193,9 +193,9 @@ jobs:
         run: |
           export EVE_TEST_BROWSER="$(command -v google-chrome)"
           "$EVE_TEST_BROWSER" --version
-          cargo +1.89.0 test -p eve-practice-browser --test real --locked -- --ignored --nocapture
+          cargo +1.95.0 test -p eve-practice-browser --test real --locked -- --ignored --nocapture
           python3 connectors/qqbot/test/holdout_test.py
       - name: 真实离线 Cargo 编译、热切换与 QQ 进程恢复
         env:
-          RUSTUP_TOOLCHAIN: "1.89.0"
+          RUSTUP_TOOLCHAIN: "1.95.0"
         run: python3 scripts/test-cargo-isolation.py

@@ -76,7 +76,7 @@ impl Tool for StatusTool {
                 "purpose":purpose,
                 "configured":{
                     "revision":summary.config_revision,"role":summary.role.map(|role| role.key()),
-                    "model":summary.model,"protocol":summary.protocol,
+                    "model":summary.model,"protocol":summary.protocol,"adapter":summary.adapter,
                     "max_output_tokens":summary.max_output_tokens,
                     "max_concurrent_requests":summary.max_concurrent_requests,
                     "effective_role_limit":summary.max_concurrent_requests.map(|limit|limit.min(5)),

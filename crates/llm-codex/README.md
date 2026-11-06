@@ -4,7 +4,7 @@
 
 每次请求必须携带宿主创建的 `ModelSession`。`session-id`、`thread-id`、`prompt_cache_key` 随用途和会话保持稳定，审查和各后台任务分别隔离。`x-client-request-id` 来自持久轮次和请求序号，HTTP 重试复用原值。模型参数不能指定或替换这些身份。
 
-`request_fingerprint` 只读编码实际 Responses 正文和端点，供宿主判断待恢复请求是否未变；不连接网络、不读写轮次 token、不包含凭据或请求序号。切换实现、输入、工具或实际模型配置时不能沿用旧请求 ID。宿主组合与可切回方案见[接线设计](../../docs/Codex适配器接线设计.md)，其中组合层尚待实现和实际验收。
+`request_fingerprint` 只读编码实际 Responses 正文和端点，供宿主判断待恢复请求是否未变；不连接网络、不读写轮次 token、不包含凭据或请求序号。切换实现、输入、工具或实际模型配置时不能沿用旧请求 ID。主/辅共同构造、识图入口及显式切换工具已编写，见[接线设计](../../docs/Codex适配器接线设计.md)，尚待 Rust 1.95 的锁文件解析、构建和实际验收。
 
 同一 provider 内以会话和轮次隔离 `x-codex-turn-state`，工具往返复用原服务器值；新轮次不复用。状态只保存在内存，最多缓存 1024 个轮次，优先淘汰无人持有的最旧项；全部在途时明确失败。新建 provider、进程重启或淘汰后保留宿主持久会话身份，服务器 token 从新响应取得，绝不借用其他会话。Eve 持久历史、任务恢复和工具去重由原宿主负责，适配器不执行或重放工具。
 
@@ -16,4 +16,4 @@
 
 缓存计数读取原 parser 保留的真实 usage metadata：字段缺失为未知，真实零仍为零。HTTP 原请求日志关闭，Eve 诊断只记录固定阶段、时长、字节数和错误分类；原 SSE 模块的 TRACE 会输出服务端内容，宿主不得为该原模块启用 TRACE。
 
-验收命令：`cargo +stable test -p eve-llm-codex --test responses`。全部端点均为本地 TCP/SSE 替身；恢复用例另起隔离测试子进程，读取临时持久请求，验证原会话不变且服务器 token 重新取得。工具回执在此是合成输入，真实执行与去重由宿主验收覆盖。另覆盖原重试、完整工具批次、缓存字段、取消、限额和期限。原文件校验命令为 `python3 scripts/verify-codex-upstream.py`；文件校验不代替运行测试。
+最低 Rust 版本为 1.95，保持原 Codex manifest 的版本要求。锁文件完成后验收命令为 `cargo +1.95.0 test -p eve-llm-codex --test responses --locked`。23 个有效用例全部使用本地 TCP/SSE 替身；恢复用例另起隔离测试子进程，读取临时持久请求，验证原会话不变且服务器 token 重新取得。工具回执在此是合成输入，真实执行与去重由宿主验收覆盖。另覆盖原重试、完整工具批次、缓存字段、取消、限额和期限。原文件校验命令为 `python3 scripts/verify-codex-upstream.py`；文件校验不代替运行测试。

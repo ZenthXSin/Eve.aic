@@ -8,7 +8,7 @@ Rust 认知系统底座：稳定插件 Runtime 与主模型闭环，持续推进
 - 事件、服务、状态、任务、日志与权限公开契约；后端可替换。
 - 文件/本地 PostgreSQL 状态、目录独占、严格恢复、诊断与停止错误汇总。
 - 普通配置的来源优先级、请求快照、版本、备份与回滚。
-- Mock/Responses/Chat 主模型、插件上下文、工具批次执行和结果回传。
+- Mock/Responses/Chat 主模型、插件上下文、工具批次执行和结果回传；[原 Codex 适配器切换](./docs/Codex适配器接线设计.md)已编写，待运行验收。
 - AGENT.md 显式来源、内容版本和固定身份快照。
 - 多轮会话、完整工具历史、重启恢复；失败输入不进入完成历史，旧工具不重放。
 - 独立流式输出、任务取消、代际过滤；QQ 支持明确补充、纠正和取消。
@@ -25,7 +25,7 @@ Rust 认知系统底座：稳定插件 Runtime 与主模型闭环，持续推进
 
 免编译运行可从[最新发行](https://github.com/ZenthXSin/Eve.aic/releases/latest)选择 Windows 或 Linux 的 x64 / ARM64 便携包，完整解压后使用包内 Start-Eve；安装与更新见[跨平台发行](./docs/跨平台发行.md)。
 
-Rust 1.89+。在仓库根目录配置主模型及宿主凭据：
+Rust 1.95+。在仓库根目录配置主模型及宿主凭据：
 
 ```powershell
 $env:EVE_OPENAI_MODEL = "deepseek-v4.1-flash"

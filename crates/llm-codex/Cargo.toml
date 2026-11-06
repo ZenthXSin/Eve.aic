@@ -2,7 +2,7 @@
 name = "eve-llm-codex"
 version.workspace = true
 edition.workspace = true
-rust-version = "1.95"
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

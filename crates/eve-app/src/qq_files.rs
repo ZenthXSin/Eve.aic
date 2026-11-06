@@ -9,7 +9,6 @@ use eve_llm_api::{
     Tool, ToolCall, ToolConcurrency, ToolDefinition, ToolExecutionContext, ToolExecutionError,
     ToolFuture, ToolValidationError,
 };
-use eve_llm_openai::OpenAiProvider;
 use eve_plugin_api::PluginError;
 use eve_qqbot_plugin::{
     ImageAttachment, Message, QQ_FILE_CAPTION_MAX_BYTES, QQ_FILE_NAME_MAX_BYTES, QqFileDelivery,
@@ -944,8 +943,9 @@ pub(crate) struct DescribeImageTool {
     inbox: std::sync::Arc<AttachmentInbox>,
     /// 配置服务在核心安装后才可用，由组合层随后注入；之前调用如实报告未就绪。
     pub(crate) settings: std::sync::OnceLock<std::sync::Arc<dyn ConfigService>>,
-    api_key: String,
-    /// 本进程里最近一次看图成功的模型，按端点区分；只在内存里，重启后重新从主模型试起。
+    credentials:
+        Result<std::sync::Arc<dyn eve_llm_api::ModelCredentials>, eve_llm_api::CredentialError>,
+    /// 本进程里最近一次看图成功的模型，按实现与端点区分；重启后重新从主模型试起。
     learned: std::sync::Mutex<Option<(String, String)>>,
 }
 
@@ -954,7 +954,7 @@ impl DescribeImageTool {
         Self {
             inbox,
             settings: std::sync::OnceLock::new(),
-            api_key,
+            credentials: crate::model_credentials::core_bank(api_key),
             learned: std::sync::Mutex::new(None),
         }
     }
@@ -992,11 +992,126 @@ fn vision_prompt(question: Option<&str>) -> String {
     }
 }
 
+impl DescribeImageTool {
+    /// 下载与格式核对后的共同推理入口；本地夹具可直接传入已核对图片。
+    pub(crate) async fn describe_downloaded(
+        &self,
+        arguments: &Value,
+        image: eve_llm_api::ImageInput,
+        context: &ToolExecutionContext,
+    ) -> Result<Value, ToolExecutionError> {
+        if context.scope().is_none() {
+            return Err(failed("只有带用户身份的对话里才能识图"));
+        }
+        let question = arguments.get("question").and_then(Value::as_str);
+        let image_bytes = image.data().len();
+        let settings = self
+            .settings
+            .get()
+            .ok_or_else(|| failed("识图配置尚未就绪"))?;
+        let credentials = self
+            .credentials
+            .as_ref()
+            .map_err(|error| failed(format!("识图凭据不可用：{error}")))?;
+        let captured = crate::models::ImageModel::capture(settings.clone(), credentials.as_ref())
+            .map_err(|error| failed(format!("主模型配置不可用：{error}")))?;
+        let primary_model = captured.model().to_owned();
+        let endpoint = captured.cache_scope();
+        let learned = self
+            .learned
+            .lock()
+            .ok()
+            .and_then(|learned| learned.clone())
+            .filter(|(known, _)| *known == endpoint)
+            .map(|(_, model)| model);
+        let requested = arguments.get("model").and_then(Value::as_str);
+        let model = requested
+            .map(str::to_owned)
+            .or(learned)
+            .unwrap_or_else(|| primary_model.clone());
+        let protocol = captured.protocol();
+        let adapter = captured.adapter();
+        let catalog = captured.catalog();
+        let selected = captured
+            .select(model.clone())
+            .map_err(|error| failed(format!("识图模型不可用：{error}")))?;
+        let content_type = image.media_type();
+        let request = eve_llm_api::ModelRequest {
+            session: context
+                .model_session_for("vision")
+                .map_err(|error| failed(error.to_string()))?,
+            messages: vec![
+                eve_llm_api::ChatMessage::text(
+                    eve_llm_api::ChatRole::User,
+                    vision_prompt(question),
+                )
+                .with_images(vec![image]),
+            ],
+            tools: vec![],
+        };
+        let description = tokio::time::timeout(
+            selected.provider_timeout,
+            selected.provider.complete(request),
+        )
+        .await
+        .unwrap_or(Err(eve_llm_api::LlmError::ProviderTimeout))
+        .and_then(|response| match response {
+            eve_llm_api::ModelResponse::Final { text } => Ok(text),
+            eve_llm_api::ModelResponse::ToolCalls { .. } => Err(eve_llm_api::LlmError::Protocol(
+                "识图回复不能是工具调用".into(),
+            )),
+        });
+        match description {
+            Ok(description) => {
+                if let Ok(mut learned) = self.learned.lock() {
+                    *learned = Some((endpoint, model.clone()));
+                }
+                Ok(json!({
+                    "seen": true,
+                    "description": description,
+                    "model": model,
+                    "primary_model": primary_model,
+                    "protocol": protocol,
+                    "adapter": adapter,
+                    "content_type": content_type,
+                    "bytes": image_bytes,
+                    "note": if model == primary_model {
+                        "这是主模型对图片的文字描述，不是像素级事实，宿主并没有看见图片。"
+                    } else {
+                        "这是同一服务里另一个模型对图片的文字描述，不是像素级事实。本进程之后看图默认先用这个模型；要长期使用，可以告诉主人在 runtime.vision 或模型配置里设定。"
+                    }
+                }))
+            }
+            // 图片本身已校验，失败归因于所选模型或服务；列出同一服务的候选，交给模型自己换着试。
+            Err(error) => {
+                let models = match catalog {
+                    Ok(catalog) => catalog.list(500).await,
+                    Err(error) => Err(error),
+                };
+                let candidates = match models {
+                    Ok(models) => json!(rank_candidates(models, &model)),
+                    Err(list_error) => json!(format!("模型列表不可用：{list_error}")),
+                };
+                Ok(json!({
+                    "seen": false,
+                    "adapter": adapter,
+                    "protocol": protocol,
+                    "model": model,
+                    "primary_model": primary_model,
+                    "error": error.to_string(),
+                    "candidates": candidates,
+                    "next": "这个模型没能看图。可以从 candidates 里挑一个（名称带 vision、vl 等标记的更可能支持图像）用 model 参数再试；都不行就如实告诉用户没看到，不要猜图片内容。"
+                }))
+            }
+        }
+    }
+}
+
 impl Tool for DescribeImageTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "describe_image".into(),
-            description: "看当前会话最近一条带附件消息里的第 index 个图片附件（从 1 起，默认 1），表情包、截图都可以。用户发图而你看不到时，先调用它自己看，不要干等对方解释。下载后以 data URL 发给与主模型相同的端点和协议；model 可选，缺省用本进程最近看图成功的模型，没有则用主模型。所选模型看不了图时返回 seen=false 和同一服务里的候选模型（名称带视觉标记的在前），可以换 model 再试；都不行就如实告诉用户没看到。question 可选，最多 500 字；缺省只做客观描述。返回的是模型描述，不是像素级事实。非图片、越界或下载失败会返回错误，不会假装成功。".into(),
+            description: "看当前会话最近一条带附件消息里的第 index 个图片附件（从 1 起，默认 1），表情包、截图都可以。用户发图而你看不到时，先调用它自己看，不要干等对方解释。下载后经主模型所选适配器，以 data URL 发给同一端点和协议；model 可选，缺省用本进程最近看图成功的模型，没有则用主模型。所选模型看不了图时返回 seen=false 和同一服务里的候选模型（名称带视觉标记的在前），可以换 model 再试；都不行就如实告诉用户没看到。question 可选，最多 500 字；缺省只做客观描述。返回的是模型描述，不是像素级事实。非图片、越界或下载失败会返回错误，不会假装成功。".into(),
             argument_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1056,7 +1171,6 @@ impl Tool for DescribeImageTool {
                 .get("index")
                 .and_then(Value::as_u64)
                 .unwrap_or(1) as usize;
-            let question = call.arguments.get("question").and_then(Value::as_str);
             let attachment = self.inbox.attachment(&scope.session_id, index)?;
             if !attachment.content_type.starts_with("image/") {
                 return Err(failed(format!(
@@ -1106,102 +1220,10 @@ impl Tool for DescribeImageTool {
             if bytes.is_empty() {
                 return Err(failed("图片内容为空，没有发给模型"));
             }
-            let settings = self
-                .settings
-                .get()
-                .ok_or_else(|| failed("识图配置尚未就绪"))?;
-            let snapshot = settings
-                .snapshot(crate::config::OPENAI_NAMESPACE, 1)
-                .map_err(|error| failed(format!("主模型配置不可用：{error}")))?;
-            let role = crate::config::configured_role(&snapshot)
-                .map_err(|error| failed(format!("主模型配置不可用：{error}")))?;
-            let primary = match role {
-                Some(role) => {
-                    let models = settings
-                        .snapshot(
-                            eve_config_api::MODELS_NAMESPACE,
-                            eve_config_api::MODELS_SCHEMA_VERSION,
-                        )
-                        .map_err(|error| failed(format!("主模型配置不可用：{error}")))?;
-                    let roles = eve_config_api::ModelRolesConfig::try_from(&models)
-                        .map_err(|error| failed(format!("主模型配置不可用：{error}")))?;
-                    Some(
-                        roles
-                            .require(role)
-                            .map_err(|error| failed(format!("主模型配置不可用：{error}")))?
-                            .clone(),
-                    )
-                }
-                None => None,
-            };
-            let mut config = crate::config::provider_config(&snapshot, primary.as_ref())
-                .map_err(|error| failed(format!("主模型配置不可用：{error}")))?;
-            let primary_model = config.model.clone();
-            let endpoint = config.responses_url.clone();
-            let learned = self
-                .learned
-                .lock()
-                .ok()
-                .and_then(|learned| learned.clone())
-                .filter(|(known, _)| *known == endpoint)
-                .map(|(_, model)| model);
-            let requested = call.arguments.get("model").and_then(Value::as_str);
-            let model = requested
-                .map(str::to_owned)
-                .or(learned)
-                .unwrap_or_else(|| primary_model.clone());
-            config.model = model.clone();
-            let protocol = match config.protocol {
-                eve_llm_openai::OpenAiProtocol::ChatCompletions => "chat",
-                eve_llm_openai::OpenAiProtocol::Responses => "responses",
-            };
-            let provider = OpenAiProvider::new(config, &self.api_key)
-                .map_err(|error| failed(format!("识图模型不可用：{error}")))?;
-            let session = context.model_session_for("vision").map_err(failed)?;
-            match provider
-                .describe_image_with_session(
-                    &vision_prompt(question),
-                    &content_type,
-                    &bytes,
-                    session.as_ref(),
-                )
+            let image = eve_llm_api::ImageInput::new(bytes)
+                .map_err(|error| failed(format!("图片不可用：{error}")))?;
+            self.describe_downloaded(&call.arguments, image, &context)
                 .await
-            {
-                Ok(description) => {
-                    if let Ok(mut learned) = self.learned.lock() {
-                        *learned = Some((endpoint, model.clone()));
-                    }
-                    Ok(json!({
-                        "seen": true,
-                        "description": description,
-                        "model": model,
-                        "primary_model": primary_model,
-                        "protocol": protocol,
-                        "content_type": content_type,
-                        "bytes": bytes.len(),
-                        "note": if model == primary_model {
-                            "这是主模型对图片的文字描述，不是像素级事实，宿主并没有看见图片。"
-                        } else {
-                            "这是同一服务里另一个模型对图片的文字描述，不是像素级事实。本进程之后看图默认先用这个模型；要长期使用，可以告诉主人在 runtime.vision 或模型配置里设定。"
-                        }
-                    }))
-                }
-                // 图片本身已校验，失败归因于所选模型或服务；列出同一服务的候选，交给模型自己换着试。
-                Err(error) => {
-                    let candidates = match provider.list_models(500).await {
-                        Ok(models) => json!(rank_candidates(models, &model)),
-                        Err(list_error) => json!(format!("模型列表不可用：{list_error}")),
-                    };
-                    Ok(json!({
-                        "seen": false,
-                        "model": model,
-                        "primary_model": primary_model,
-                        "error": error.to_string(),
-                        "candidates": candidates,
-                        "next": "这个模型没能看图。可以从 candidates 里挑一个（名称带 vision、vl 等标记的更可能支持图像）用 model 参数再试；都不行就如实告诉用户没看到，不要猜图片内容。"
-                    }))
-                }
-            }
         })
     }
 }
