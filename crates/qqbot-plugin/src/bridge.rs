@@ -1821,9 +1821,11 @@ pub(crate) async fn run(
                 continue;
             }
             // 实时模式的慢步骤只播报宿主可确认的活动，不调用发言模型；正式发言先走上方队列。
-            if let (Some(live), Some(after)) = (&live_dialogue, slow_progress.as_ref().and_then(|p| p.after()))
+            // 候选先转为自有数据；Active 含在途 future，不能让迭代借用跨过下面的异步写出。
+            let host_notice = if let (Some(live), Some(after)) = (&live_dialogue, slow_progress.as_ref().and_then(|p| p.after()))
                 && progress_delivery.len() < MAX_DELIVERIES
-                && let Some((message, notice)) = active.iter().find_map(|current| {
+            {
+                active.iter().find_map(|current| {
                     if pending_control(&current.message, &routing, &commands)
                         || current.started.elapsed() >= Duration::from_secs(230)
                         || host_progress::quiet_request(&current.message.text)
@@ -1847,6 +1849,8 @@ pub(crate) async fn run(
                     { return None; }
                     Some((current.message.clone(), notice))
                 })
+            } else { None };
+            if let (Some(live), Some((message, notice))) = (&live_dialogue, host_notice)
             {
                 let index = ledger.find(&config.app_id, &message.id).expect("活动进度回执");
                 let part = ledger.entries[index].progress.len();
