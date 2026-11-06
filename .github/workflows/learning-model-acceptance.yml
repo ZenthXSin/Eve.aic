@@ -64,9 +64,9 @@ jobs:
             "https://github.com/Anuken/Mindustry/releases/download/${MINDUSTRY_VERSION}/server-release.jar"
           echo "${MINDUSTRY_SHA256}  $RUNNER_TEMP/server-release.jar" | sha256sum -c -
       - name: 安装 Rust
-        run: rustup toolchain install 1.89.0 --profile minimal
+        run: rustup toolchain install 1.95.0 --profile minimal
       - name: 构建 QQBot 入口
-        run: cargo +1.89.0 build -p eve-app --bin eve-qqbot --locked
+        run: cargo +1.95.0 build -p eve-app --bin eve-qqbot --locked
       - name: 真实模型走完整条行为链
         env:
           EVE_OPENAI_API_KEY: ${{ secrets.EVE_OPENAI_API_KEY }}

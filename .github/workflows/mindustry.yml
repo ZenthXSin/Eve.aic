@@ -84,16 +84,16 @@ jobs:
           echo "${MINDUSTRY_SHA256}  $RUNNER_TEMP/server-release.jar" | sha256sum -c -
           java -version
       - name: 安装 Rust
-        run: rustup toolchain install 1.89.0 --profile minimal
+        run: rustup toolchain install 1.95.0 --profile minimal
       - name: 运行器在真实服务端中的加载、警告与崩溃证据
         env:
           EVE_MINDUSTRY_SERVER_JAR: ${{ runner.temp }}/server-release.jar
-        run: cargo +1.89.0 test -p eve-practice-mindustry --test real --locked -- --ignored --nocapture
+        run: cargo +1.95.0 test -p eve-practice-mindustry --test real --locked -- --ignored --nocapture
       - name: 实际 Eve QQBot 进程用真实服务端完成实践
         env:
           EVE_MINDUSTRY_SERVER_JAR: ${{ runner.temp }}/server-release.jar
         run: |
-          cargo +1.89.0 build -p eve-app --bin eve-qqbot --locked
+          cargo +1.95.0 build -p eve-app --bin eve-qqbot --locked
           python3 connectors/qqbot/test/practice_test.py PracticeAcceptance.test_real_runtime_verifies_the_drafted_mod
       - name: 实际 Eve QQBot 进程自己取得并用真实服务端验证运行条件
         env:
@@ -150,9 +150,9 @@ jobs:
       - name: 用示例模组验收
         run: python3 scripts/mod_validator_acceptance.py vendor/mindustry-mod-validator/build/libs/mindustry-mod-validator-1.0.0-all.jar
       - name: 安装 Rust
-        run: rustup toolchain install 1.89.0 --profile minimal
+        run: rustup toolchain install 1.95.0 --profile minimal
       - name: 实践运行器用真实服务端与构建出的验证器做动态测试
         env:
           EVE_MINDUSTRY_SERVER_JAR: ${{ runner.temp }}/server-release.jar
           EVE_MOD_VALIDATOR_JAR: ${{ github.workspace }}/vendor/mindustry-mod-validator/build/libs/mindustry-mod-validator-1.0.0-all.jar
-        run: cargo +1.89.0 test -p eve-practice-mindustry --test real --locked -- --ignored real_validator --nocapture
+        run: cargo +1.95.0 test -p eve-practice-mindustry --test real --locked -- --ignored real_validator --nocapture

@@ -44,7 +44,7 @@ class UpgradeTimeoutAcceptance(developer.DeveloperAcceptance):
         warmup=[]
         for arguments in [
             ['--version'],['fmt','--version'],['clippy','--version'],
-            ['fmt','--all','--','--check'],
+            ['fmt','--','--check'],
             ['clippy','--release','--workspace','--all-targets','--locked','--','-D','warnings'],
             ['test','--release','--workspace','--locked'],
             ['build','-p','eve-app','--bins','--release','--locked'],
@@ -110,7 +110,7 @@ class UpgradeTimeoutAcceptance(developer.DeveloperAcceptance):
             reviews.append(request)
             plan=json.loads(request['arguments'][0])
             expected_checks=[{'program':str(wrapper),'arguments':arguments,'cwd':'.'} for arguments in [
-                ['fmt','--all','--','--check'],
+                ['fmt','--','--check'],
                 ['clippy','--release','--workspace','--all-targets','--locked','--','-D','warnings'],
                 ['test','--release','--workspace','--locked'],
                 ['build','-p','eve-app','--bins','--release','--locked']]]

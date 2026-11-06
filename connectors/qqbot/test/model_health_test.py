@@ -69,12 +69,14 @@ class ModelHealthAcceptance(interest_test.InterestAcceptance):
             self.assertEqual(body["vision"], "not_configured")
             model = body["model"]
             self.assertEqual(model["protocol"], "chat")
+            self.assertEqual(model["adapter"], "openai")
             self.assertTrue(model["model"])
             self.assertEqual(model["max_output_tokens_key"], "provider.openai.max_output_tokens")
             self.assertIsNone(model["max_output_tokens"], "默认不额外指定输出 token 上限")
             self.assertNotEqual(model["max_output_tokens"], DIALOGUE_LIMIT)
             self.assertIn(model["max_output_tokens_source"], ("environment", "default"))
             dialogue = self.dialogue(body)
+            self.assertEqual(dialogue["configured_adapter"], "openai")
             # 对话用途的上限与来源单独显示；主模型摘要不受影响。
             self.assertEqual(dialogue["output_limit"], {
                 "max_output_tokens": DIALOGUE_LIMIT,

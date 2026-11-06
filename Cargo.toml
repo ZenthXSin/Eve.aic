@@ -83,6 +83,7 @@ members = [
     "crates/llm-api",
     "crates/agent-prompt",
     "crates/llm-openai",
+    "crates/llm-codex",
     "crates/jev",
     "crates/session-api",
     "crates/session-plugin",
@@ -106,11 +107,37 @@ members = [
     "crates/segment-plugin",
     "crates/example-plugins",
 ]
+exclude = [
+    "vendor/codex-0.162.0/codex-rs/async-utils",
+    "vendor/codex-0.162.0/codex-rs/codex-api",
+    "vendor/codex-0.162.0/codex-rs/codex-client",
+    "vendor/codex-0.162.0/codex-rs/execpolicy",
+    "vendor/codex-0.162.0/codex-rs/ext/items",
+    "vendor/codex-0.162.0/codex-rs/http-client",
+    "vendor/codex-0.162.0/codex-rs/network-proxy",
+    "vendor/codex-0.162.0/codex-rs/otel",
+    "vendor/codex-0.162.0/codex-rs/protocol",
+    "vendor/codex-0.162.0/codex-rs/utils/absolute-path",
+    "vendor/codex-0.162.0/codex-rs/utils/cache",
+    "vendor/codex-0.162.0/codex-rs/utils/cargo-bin",
+    "vendor/codex-0.162.0/codex-rs/utils/home-dir",
+    "vendor/codex-0.162.0/codex-rs/utils/image",
+    "vendor/codex-0.162.0/codex-rs/utils/path-uri",
+    "vendor/codex-0.162.0/codex-rs/utils/process",
+    "vendor/codex-0.162.0/codex-rs/utils/pty",
+    "vendor/codex-0.162.0/codex-rs/utils/redacted-string",
+    "vendor/codex-0.162.0/codex-rs/utils/rustls-provider",
+    "vendor/codex-0.162.0/codex-rs/utils/stream-parser",
+    "vendor/codex-0.162.0/codex-rs/utils/string",
+    "vendor/codex-0.162.0/codex-rs/websocket-client",
+    "vendor/codex-0.162.0/codex-rs/windows-sandbox-rs",
+    "vendor/codex-0.162.0/codex-rs/windows-sandbox-rs/tests/support",
+]
 resolver = "2"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.95"
 version = "0.1.0"
 license = "MIT"
 
@@ -118,7 +145,15 @@ license = "MIT"
 ring = "0.17"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 semver = "1"
 tempfile = "3"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+# Codex 原 WebSocket 实现依赖其固定 fork；不能换成同版本 registry 源。
+[patch.crates-io]
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
+
+[patch."ssh://git@github.com/openai-oss-forks/tungstenite-rs.git"]
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }

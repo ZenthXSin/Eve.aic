@@ -422,7 +422,7 @@
     }
     $("readiness-tools").textContent = `${count(body.tools_registered)} 个`;
     const model = body.model;
-    $("readiness-model").textContent = model ? `${text(model.model, "未知")}（${text(model.protocol, "未知协议")}）` : "配置无法读取";
+    $("readiness-model").textContent = model ? `${text(model.model, "未知")}（${text(model.adapter, "未知适配器")} / ${text(model.protocol, "未知协议")}）` : "配置无法读取";
     $("readiness-limit").textContent = model
       ? limitText(model.max_output_tokens, model.max_output_tokens_key, model.max_output_tokens_source)
       : "—";
@@ -434,6 +434,7 @@
       const [label, style] = role.state === "responsive" ? ["可响应", "good"] : role.state === "failing" ? ["请求失败", "bad"] : ["尚未验证", ""];
       const parts = [`请求 ${count(role.requests)} 次`, `失败 ${count(role.failures)} 次`];
       if (role.configured_model) parts.push(`配置模型 ${text(role.configured_model)}`);
+      if (role.configured_adapter) parts.push(`适配器 ${text(role.configured_adapter)}`);
       if (role.consecutive_failures > 0) parts.push(`连续失败 ${count(role.consecutive_failures)} 次`);
       const failure = role.last_failure;
       if (failure) {
