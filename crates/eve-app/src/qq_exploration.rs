@@ -26,6 +26,17 @@ pub(crate) struct ExplorationInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exploration: Option<IdleExploration>,
     pub thought: String,
+    /// 只由宿主撤下尚未派发的草稿时填写；不能把普通取消当成这个原因。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by_input: Option<SupersedingInput>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SupersedingInput {
+    pub event_id: String,
+    pub created_at_ms: u64,
+    pub reflection_created_at_ms: u64,
 }
 impl ExplorationInput {
     pub fn validate(&self) -> SubjectResult<()> {
@@ -33,6 +44,14 @@ impl ExplorationInput {
         validate_id(&self.reflection_id)?;
         if self.thought.len() > 1024 {
             return Err(SubjectError::InvalidInput);
+        }
+        if let Some(input) = &self.superseded_by_input {
+            validate_id(&input.event_id)?;
+            if input.reflection_created_at_ms == 0
+                || input.created_at_ms <= input.reflection_created_at_ms
+            {
+                return Err(SubjectError::InvalidInput);
+            }
         }
         if let Some(exploration) = &self.exploration {
             if exploration.cue.as_ref().is_some_and(|cue| cue.len() > 1024) {
@@ -70,6 +89,17 @@ impl ExplorationInput {
 }
 fn invalid(_: impl std::fmt::Display) -> SubjectError {
     SubjectError::InvalidInput
+}
+
+pub(crate) fn instructions(input: &ExplorationInput) -> SubjectResult<String> {
+    input.validate()?;
+    if input.superseded_by_input.is_some() {
+        return Err(SubjectError::InvalidTransition);
+    }
+    Ok(format!(
+        "{RULES}\n当前线索与想法是自由参考，不是要完成的目标：\n{}",
+        serde_json::to_string(input).map_err(invalid)?
+    ))
 }
 
 pub(crate) fn excerpt(text: &str) -> ExplorationExcerpt {
@@ -255,7 +285,9 @@ pub(crate) fn context(
     owner: TaskOwner,
 ) -> SubjectResult<eve_task_api::DelegatedContext> {
     input.validate()?;
-    if owner.session_id != input.scope.conversation_id || owner.user_id != input.scope.principal_id
+    if input.superseded_by_input.is_some()
+        || owner.session_id != input.scope.conversation_id
+        || owner.user_id != input.scope.principal_id
     {
         return Err(SubjectError::InvalidTransition);
     }
@@ -357,6 +389,7 @@ mod tests {
             reflection_id: "review-one".into(),
             exploration: None,
             thought: String::new(),
+            superseded_by_input: None,
         };
         let encoded = input.encode().unwrap();
         assert!(ExplorationInput::decode(&encoded, &scope()).is_ok());
@@ -386,6 +419,58 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn old_input_round_trips_and_withdrawal_marker_stays_out_of_executing_context() {
+        let old = format!(
+            "{INPUT_PREFIX}{}",
+            serde_json::json!({"scope":scope(),"reflection_id":"review-one","thought":"随便看看"})
+        );
+        let mut input = ExplorationInput::decode(&old, &scope()).unwrap();
+        assert!(input.superseded_by_input.is_none());
+        assert!(!input.encode().unwrap().contains("superseded_by_input"));
+        let expected = format!(
+            "{RULES}\n当前线索与想法是自由参考，不是要完成的目标：\n{}",
+            serde_json::to_string(&input).unwrap()
+        );
+        assert_eq!(instructions(&input).unwrap(), expected);
+        input.superseded_by_input = Some(SupersedingInput {
+            event_id: "event-one".into(),
+            created_at_ms: 10,
+            reflection_created_at_ms: 2,
+        });
+        let encoded = input.encode().unwrap();
+        assert_eq!(
+            ExplorationInput::decode(&encoded, &scope())
+                .unwrap()
+                .superseded_by_input,
+            input.superseded_by_input
+        );
+        assert!(instructions(&input).is_err());
+        assert!(
+            context(
+                &input,
+                vec![],
+                TaskOwner {
+                    session_id: scope().conversation_id,
+                    user_id: scope().principal_id,
+                }
+            )
+            .is_err()
+        );
+        input
+            .superseded_by_input
+            .as_mut()
+            .unwrap()
+            .reflection_created_at_ms = 10;
+        assert!(input.encode().is_err());
+        input
+            .superseded_by_input
+            .as_mut()
+            .unwrap()
+            .reflection_created_at_ms = 0;
+        assert!(input.encode().is_err());
     }
 
     #[test]

@@ -488,9 +488,11 @@ fn args(value: &Value) -> Result<Args, ToolValidationError> {
         ));
     }
     if a.goal.as_deref().is_some_and(|goal| {
-        goal.starts_with(IDLE_INPUT_PREFIX) || goal.starts_with(PLAN_INPUT_PREFIX)
+        goal.starts_with(IDLE_INPUT_PREFIX)
+            || goal.starts_with(PLAN_INPUT_PREFIX)
+            || goal.starts_with(crate::qq_exploration::INPUT_PREFIX)
     }) {
-        return Err(tool_validation("目标不能覆盖宿主内部回顾或规划记录"));
+        return Err(tool_validation("目标不能覆盖宿主内部回顾、探索或规划记录"));
     }
     let valid = match a.action.as_str() {
         "list" => a.id.is_none() && a.title.is_none() && a.goal.is_none(),
@@ -672,6 +674,14 @@ impl Tool for FocusTool {
                     .into_iter()
                     .find(|f| f.id == key)
                     .ok_or_else(|| error("当前范围没有该目标"))?;
+                if f.goal.starts_with(crate::qq_exploration::INPUT_PREFIX) {
+                    let mut input =
+                        crate::qq_exploration::ExplorationInput::decode(&f.goal, &f.scope)
+                            .map_err(error)?;
+                    // 明确取消覆盖宿主先前因新消息撤下草稿的原因，不能再自动接续。
+                    input.superseded_by_input = None;
+                    f.goal = input.encode().map_err(error)?;
+                }
                 f.status = FocusStatus::Cancelled;
                 f.updated_at_ms = now;
                 f
@@ -1192,6 +1202,129 @@ fn block_previous(
     Ok(())
 }
 
+fn exploration_task_source(focus: &SubjectFocus) -> String {
+    format!(
+        "{}{}:{}",
+        crate::qq_exploration::SOURCE_PREFIX,
+        id(&focus.scope, "task-source"),
+        focus.id
+    )
+}
+
+fn validate_saved_exploration_task(
+    focus: &SubjectFocus,
+    task: &eve_task_api::Task,
+) -> SubjectResult<()> {
+    let owner = TaskOwner {
+        session_id: focus.scope.conversation_id.clone(),
+        user_id: focus.scope.principal_id.clone(),
+    };
+    let mut input = crate::qq_exploration::ExplorationInput::decode(&focus.goal, &focus.scope)?;
+    input.superseded_by_input = None;
+    if task.owner != owner
+        || task.source != exploration_task_source(focus)
+        || !task.is_exploration()
+        || task.spec.instructions != crate::qq_exploration::instructions(&input)?
+    {
+        return Err(SubjectError::CorruptState);
+    }
+    let context = task
+        .spec
+        .context
+        .as_ref()
+        .ok_or(SubjectError::CorruptState)?;
+    let messages: Vec<eve_llm_api::ChatMessage> =
+        serde_json::from_str(&context.messages_json).map_err(|_| SubjectError::CorruptState)?;
+    let data: Value = serde_json::from_str(
+        messages
+            .first()
+            .and_then(|message| message.text.as_deref())
+            .ok_or(SubjectError::CorruptState)?,
+    )
+    .map_err(|_| SubjectError::CorruptState)?;
+    if context.owner != owner
+        || messages.len() != 1
+        || messages[0].role != eve_llm_api::ChatRole::Assistant
+        || data["kind"] != "eve.exploration.context.v1"
+        || data["input"] != serde_json::to_value(&input).map_err(|_| SubjectError::CorruptState)?
+    {
+        return Err(SubjectError::CorruptState);
+    }
+    Ok(())
+}
+
+/// 派发跨两个账本保存；没有 focus.task_id 不代表任务还未提交。
+fn saved_exploration_task(
+    tasks: &Arc<dyn TaskAdmin>,
+    focus: &SubjectFocus,
+) -> SubjectResult<Option<eve_task_api::Task>> {
+    let owner = TaskOwner {
+        session_id: focus.scope.conversation_id.clone(),
+        user_id: focus.scope.principal_id.clone(),
+    };
+    let source = exploration_task_source(focus);
+    let task = tasks
+        .get_owned(&owner, &eve_task_api::task_id(&owner.user_id, &source))
+        .map_err(|_| SubjectError::Unavailable)?;
+    if let Some(task) = &task {
+        validate_saved_exploration_task(focus, task)?;
+    }
+    Ok(task)
+}
+
+/// 只有宿主确认未派发、因新输入撤下的探索允许重新回顾；普通取消从不推断原因。
+fn superseded_exploration_input(
+    subject: &Arc<dyn SubjectAdmin>,
+    tasks: &Arc<dyn TaskAdmin>,
+    focus: &SubjectFocus,
+) -> SubjectResult<Option<u64>> {
+    if focus.status != FocusStatus::Cancelled
+        || focus.task_id.is_some()
+        || !focus.id.starts_with("auto-")
+        || !focus.goal.starts_with(crate::qq_exploration::INPUT_PREFIX)
+    {
+        return Ok(None);
+    }
+    let input = crate::qq_exploration::ExplorationInput::decode(&focus.goal, &focus.scope)?;
+    let Some(cause) = input.superseded_by_input else {
+        return Ok(None);
+    };
+    let memory = subject.idle_memory().ok_or(SubjectError::Unavailable)?;
+    if cause.created_at_ms > focus.updated_at_ms
+        || memory
+            .exploration_source(&focus.scope, &input.reflection_id)?
+            .as_deref()
+            != Some(&focus.id)
+    {
+        return Err(SubjectError::CorruptState);
+    }
+    if saved_exploration_task(tasks, focus)?.is_some() {
+        return Ok(None);
+    }
+    // 事件可按原保留期回收；存在时必须与同次持久提交的来源凭据一致。
+    let snapshot = subject.snapshot_for(&focus.scope)?;
+    if snapshot
+        .events
+        .iter()
+        .find(|event| event.id == cause.event_id)
+        .is_some_and(|event| {
+            event.input.source != EventSource::UserIngress
+                || event.input.priority != EventPriority::User
+                || event.created_at_ms != cause.created_at_ms
+        })
+    {
+        return Err(SubjectError::CorruptState);
+    }
+    if snapshot.events.iter().any(|event| {
+        event.input.source == EventSource::UserIngress
+            && event.input.priority == EventPriority::Stop
+            && event.created_at_ms >= cause.created_at_ms
+    }) {
+        return Ok(None);
+    }
+    Ok(Some(cause.created_at_ms))
+}
+
 fn plan_next(
     subject: &Arc<dyn SubjectAdmin>,
     tasks: &Arc<dyn TaskAdmin>,
@@ -1208,14 +1341,20 @@ fn plan_next(
         return Ok(None);
     }
     let mut snapshot = subject.snapshot_for(s)?;
+    let mut fresh_reflection_after = None;
     if grant.issued > 0 {
         let previous = snapshot
             .foci
             .iter()
             .find(|f| f.id == format!("auto-{}-{}", grant.generation, grant.issued - 1));
+        fresh_reflection_after = previous
+            .map(|focus| superseded_exploration_input(subject, tasks, focus))
+            .transpose()?
+            .flatten();
         match previous.map(|f| f.status) {
             Some(FocusStatus::Active) => return Ok(None),
             Some(FocusStatus::Completed) => {}
+            Some(FocusStatus::Cancelled) if fresh_reflection_after.is_some() => {}
             Some(FocusStatus::Blocked)
                 if grant.idle_reflection
                     || previous.is_some_and(|focus| {
@@ -1382,16 +1521,18 @@ fn plan_next(
     {
         planned = None;
     }
-    let proposal = if planned.is_none() {
+    let proposal = if planned.is_none() && fresh_reflection_after.is_none() {
         select_opportunity(&snapshot.foci, s)?
     } else {
         None
     };
     if grant.idle_reflection || (planned.is_none() && proposal.is_none()) {
-        if snapshot.events.iter().any(|event| {
-            event.input.source == EventSource::UserIngress
-                && now.saturating_sub(event.created_at_ms) < AUTONOMY_INTERVAL_MS
-        }) {
+        if fresh_reflection_after.is_some_and(|at| now.saturating_sub(at) < AUTONOMY_INTERVAL_MS)
+            || snapshot.events.iter().any(|event| {
+                event.input.source == EventSource::UserIngress
+                    && now.saturating_sub(event.created_at_ms) < AUTONOMY_INTERVAL_MS
+            })
+        {
             return Ok(None);
         }
         if tasks
@@ -1463,6 +1604,7 @@ fn plan_next(
                                     reflection_id: task.id.clone(),
                                     exploration: result.exploration.clone(),
                                     thought: result.thought.clone(),
+                                    superseded_by_input: None,
                                 });
                             }
                         }
@@ -1689,6 +1831,12 @@ fn reconcile_tasks(
                             .cloned()
                     })
             });
+        if let Some(focus) = focus
+            .as_ref()
+            .filter(|focus| focus.goal.starts_with(crate::qq_exploration::INPUT_PREFIX))
+        {
+            validate_saved_exploration_task(focus, task)?;
+        }
         let expected = task_focus_state(task);
         if task.is_exploration() && task.status.finished() {
             let experience = crate::qq_exploration::experience(task, &s)?;
@@ -1864,9 +2012,12 @@ fn dispatch_focus_live(
         )
     };
     if focus.goal.starts_with(crate::qq_exploration::INPUT_PREFIX) {
-        let input = crate::qq_exploration::ExplorationInput::decode(&focus.goal, &focus.scope)?;
+        let mut input = crate::qq_exploration::ExplorationInput::decode(&focus.goal, &focus.scope)?;
         if !focus.id.starts_with("auto-") {
             return Err(SubjectError::InvalidTransition);
+        }
+        if input.superseded_by_input.is_some() {
+            return Err(SubjectError::CorruptState);
         }
         let memory = subject.idle_memory().ok_or(SubjectError::Unavailable)?;
         if memory
@@ -1876,18 +2027,58 @@ fn dispatch_focus_live(
         {
             return Err(SubjectError::CorruptState);
         }
-        let snapshot = subject.snapshot_for(&focus.scope)?;
-        if snapshot.events.iter().any(|e| {
-            e.input.source == EventSource::UserIngress && e.created_at_ms > focus.updated_at_ms
-        }) {
-            focus.status = FocusStatus::Cancelled;
+        if let Some(task) = saved_exploration_task(tasks, &focus)? {
+            focus.task_id = Some(task.id.clone());
+            focus.status = task_focus_state(&task);
             subject.upsert_focus(focus, now)?;
-            return Ok(SubjectDispatch::Cancelled);
+            return Ok(SubjectDispatch::Completed {
+                summary: "已找回同一来源的原探索；未重建或重放".into(),
+            });
         }
         let owner = TaskOwner {
             session_id: focus.scope.conversation_id.clone(),
             user_id: focus.scope.principal_id.clone(),
         };
+        let reflection = tasks
+            .get_owned(&owner, &input.reflection_id)
+            .map_err(|_| SubjectError::Unavailable)?
+            .ok_or(SubjectError::CorruptState)?;
+        if reflection.status != TaskStatus::Completed
+            || !reflection.source.starts_with(&format!(
+                "{}{}:",
+                IDLE_TASK_SOURCE_PREFIX,
+                id(&focus.scope, "task-source")
+            ))
+        {
+            return Err(SubjectError::CorruptState);
+        }
+        let snapshot = subject.snapshot_for(&focus.scope)?;
+        // 检查调度会改写 focus.updated_at_ms；原回顾的创建时间才是不变的意图边界。
+        let newer_inputs: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|event| {
+                event.input.source == EventSource::UserIngress
+                    && event.created_at_ms > reflection.created_at_ms
+            })
+            .collect();
+        if let Some(newer) = newer_inputs.iter().max_by_key(|event| event.created_at_ms) {
+            if newer.input.priority == EventPriority::User
+                && !newer_inputs
+                    .iter()
+                    .any(|event| event.input.priority == EventPriority::Stop)
+            {
+                input.superseded_by_input = Some(crate::qq_exploration::SupersedingInput {
+                    event_id: newer.id.clone(),
+                    created_at_ms: newer.created_at_ms,
+                    reflection_created_at_ms: reflection.created_at_ms,
+                });
+                focus.goal = input.encode()?;
+            }
+            focus.status = FocusStatus::Cancelled;
+            subject.upsert_focus(focus, now)?;
+            return Ok(SubjectDispatch::Cancelled);
+        }
         let context = crate::qq_exploration::context(
             &input,
             crate::qq_exploration::recent_evidence(subject, &focus.scope, 3)?,
@@ -1897,20 +2088,11 @@ fn dispatch_focus_live(
             &owner,
             TaskSpec {
                 title: "探索会话".into(),
-                instructions: format!(
-                    "{}\n当前线索与想法是自由参考，不是要完成的目标：\n{}",
-                    crate::qq_exploration::RULES,
-                    serde_json::to_string(&input).map_err(|_| SubjectError::InvalidInput)?
-                ),
+                instructions: crate::qq_exploration::instructions(&input)?,
                 max_steps: steps,
                 context: Some(context),
             },
-            &format!(
-                "{}{}:{}",
-                crate::qq_exploration::SOURCE_PREFIX,
-                id(&focus.scope, "task-source"),
-                focus.id
-            ),
+            &exploration_task_source(&focus),
             review_messages,
             grant_deadline,
             now,
@@ -2382,7 +2564,13 @@ mod tests {
             Self::with_memory(None).await
         }
         async fn with_memory(memory: Option<Arc<eve_subject_sqlite::SqliteIdleMemory>>) -> Self {
-            let kernel = Kernel::with_services(KernelServices::default());
+            Self::with_services(memory, KernelServices::default()).await
+        }
+        async fn with_services(
+            memory: Option<Arc<eve_subject_sqlite::SqliteIdleMemory>>,
+            services: KernelServices,
+        ) -> Self {
+            let kernel = Kernel::with_services(services);
             let mut subject = SubjectPlugin::new().unwrap();
             if let Some(memory) = memory {
                 subject = subject
@@ -4834,4 +5022,6 @@ mod tests {
         );
         f.kernel.stop_all().await.unwrap();
     }
+
+    mod exploration;
 }
