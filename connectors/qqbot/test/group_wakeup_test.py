@@ -35,7 +35,7 @@ class GroupWakeupAcceptance(group_relation_test.GroupRelationAcceptance):
         root = self.work / 'prefix-bridge'
         root.mkdir()
         source = Path(__file__).resolve().parents[1]
-        for name in ['bridge.mjs', 'bridge-core.mjs']:
+        for name in ['bridge.mjs', 'bridge-core.mjs', 'ingress-diagnostics.mjs']:
             (root / name).write_bytes((source / name).read_bytes())
         sdk = root / 'node_modules/@tencent-connect/qqbot-nodejs'
         sdk.mkdir(parents=True)
@@ -107,7 +107,7 @@ export class QQBot {
         root = self.work / 'production-bridge'
         root.mkdir()
         source = Path(__file__).resolve().parents[1]
-        for name in ['bridge.mjs', 'bridge-core.mjs']:
+        for name in ['bridge.mjs', 'bridge-core.mjs', 'ingress-diagnostics.mjs']:
             (root / name).write_bytes((source / name).read_bytes())
         sdk = root / 'node_modules/@tencent-connect/qqbot-nodejs'
         sdk.mkdir(parents=True)

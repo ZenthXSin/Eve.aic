@@ -42,6 +42,8 @@ use tokio::{
     sync::{mpsc, watch},
 };
 
+#[path = "bridge_warning.rs"]
+mod bridge_warning;
 #[path = "foreground_speech.rs"]
 mod foreground_speech;
 #[path = "speech_retry.rs"]
@@ -2710,17 +2712,9 @@ pub(crate) async fn run(
                             }
                         }
                         Some("warning") => {
-                            let code = match frame.get("code").and_then(Value::as_str) {
-                                Some("invalid_route_or_text") => "bridge_invalid_route_or_text",
-                                Some("unsupported_message") => "bridge_unsupported_message",
-                                Some("pending_limit") => "bridge_pending_limit",
-                                Some("outbound_limit") => "bridge_outbound_limit",
-                                Some("frame_limit") => "bridge_frame_limit",
-                                Some("protocol_version") => "bridge_protocol_version",
-                                Some("sdk_error") => "bridge_sdk_error",
-                                _ => "bridge_warning",
-                            };
-                            warn(&ctx, code);
+                            if let Some(entry) = bridge_warning::entry(&frame) {
+                                let _ = ctx.log(entry);
+                            }
                         }
                         Some("fatal") => break Err(failure("QQBot SDK 启动或连接失败")),
                         Some("delivery") if frame.get("capacity_notice").and_then(Value::as_bool) == Some(true) => {
