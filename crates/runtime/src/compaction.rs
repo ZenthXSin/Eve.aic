@@ -84,6 +84,12 @@ pub(crate) struct State {
     current: Option<String>,
 }
 
+/// 持久摘要作用域与调用方模型会话成对传入；临时摘要仍保留模型会话。
+pub(crate) struct DigestContext<'a> {
+    pub(crate) scope: Option<&'a ContextScope>,
+    pub(crate) model_session: Option<&'a eve_llm_api::ModelSession>,
+}
+
 impl State {
     pub(crate) fn new(
         context: &mut ContextSnapshot,
@@ -217,10 +223,13 @@ impl State {
         tools: &[ToolDefinition],
         policy: ContextCompactionPolicy,
         service: &dyn HistoryDigests,
-        scope: Option<&ContextScope>,
-        model_session: Option<&eve_llm_api::ModelSession>,
+        context: DigestContext<'_>,
         fallback_trigger: Option<usize>,
     ) -> Result<(), LlmError> {
+        let DigestContext {
+            scope,
+            model_session,
+        } = context;
         let before = estimate_request(messages, tools)?;
         if before < policy.trigger_tokens {
             return Ok(());
@@ -487,8 +496,10 @@ mod tests {
                 &[],
                 policy,
                 &service,
-                None,
-                None,
+                DigestContext {
+                    scope: None,
+                    model_session: None,
+                },
                 Some(200000),
             )
             .await
@@ -585,7 +596,17 @@ mod tests {
             );
             let before = messages.clone();
             state
-                .compact(&mut messages, &[], policy, &service, None, None, None)
+                .compact(
+                    &mut messages,
+                    &[],
+                    policy,
+                    &service,
+                    DigestContext {
+                        scope: None,
+                        model_session: None,
+                    },
+                    None,
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -639,8 +660,10 @@ mod tests {
                         target_tokens: 100000
                     },
                     &service,
-                    None,
-                    None,
+                    DigestContext {
+                        scope: None,
+                        model_session: None,
+                    },
                     None
                 )
                 .await

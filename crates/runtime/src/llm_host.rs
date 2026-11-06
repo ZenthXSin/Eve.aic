@@ -1509,10 +1509,14 @@ impl LlmHost {
                         .map_err(|error| fail(error, diagnostics.clone()))?;
                     compaction_announced = true;
                 }
+                let digest_context = crate::compaction::DigestContext {
+                    scope: compaction_scope,
+                    model_session: model_session.as_ref(),
+                };
                 let result = tokio::select! { biased;
                     _ = wait_closed(events) => Err(LlmError::Cancelled),
                     _ = tokio::time::sleep(eve_llm_api::CONTEXT_COMPACTION_TIMEOUT) => Err(LlmError::Context("上下文压缩超过 5 分钟总期限；已经保存的摘要进度与工具回执保留，压缩后的下一次对话请求未发出".into())),
-                    result = contain_panic(state.compact(&mut messages, &definitions, policy, service, compaction_scope, model_session.as_ref(), fallback)) => result,
+                    result = contain_panic(state.compact(&mut messages, &definitions, policy, service, digest_context, fallback)) => result,
                 };
                 if let Err(error) = result {
                     return Err(fail(error, diagnostics));
