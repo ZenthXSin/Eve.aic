@@ -80,6 +80,10 @@ pub const MAX_PHRASE_DRAFTS: usize = 6;
 /// 词语或场合的字符上限；词义、说法特点与原话摘录的字符上限。
 pub const MAX_PHRASE_TEXT_CHARS: usize = 24;
 pub const MAX_PHRASE_DETAIL_CHARS: usize = 60;
+/// 固定提炼协议；恢复时不得用新协议无提示重做旧批次。
+pub const PHRASE_LEARNER_VERSION: u8 = 1;
+/// 一批原话最多三次逻辑请求，Provider 内部传输重试另计。
+pub const MAX_PHRASE_ATTEMPTS: u8 = 3;
 
 /// 从用户自己的话里学到的说法：词语（含圈内黑话、缩写、梗），或某种场合下的表达方式。
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -115,12 +119,51 @@ pub struct LearnedPhrase {
     pub updated_at_ms: u64,
 }
 
-/// 一批待学习的用户原话。取出即从待学缓冲中移除；学习失败或进程中断不重试。
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// 调模型前已持久领取的固定原话。只补做已明确记录的暂态失败，未知结局不重放。
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PhraseBatch {
     pub id: String,
     pub scope: ContextScope,
     pub messages: Vec<String>,
+    pub attempt: u8,
+    pub learner_version: u8,
+}
+
+/// 宿主按结构化模型结局分类，不读取错误正文猜测是否暂态。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhraseFailure {
+    Timeout,
+    Network,
+    RateLimited,
+    ServerError,
+    Cancelled,
+    Rejected,
+}
+impl PhraseFailure {
+    pub fn retryable(self) -> bool {
+        matches!(
+            self,
+            Self::Timeout | Self::Network | Self::RateLimited | Self::ServerError
+        )
+    }
+}
+
+/// Saved、Rejected 已确认持久保存；Stale 不写。存储结果未知须返回 Err，不能伪装 Rejected。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhraseFinish {
+    Saved(usize),
+    Rejected,
+    Stale,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhraseFailureOutcome {
+    Retry { ready_at_ms: u64 },
+    Exhausted,
+    Finished,
+    Stale,
 }
 
 /// 可替换的说法学习器；只看本批原话，不读其他状态，不调用工具。
@@ -194,14 +237,27 @@ pub trait TrainingService: Send + Sync {
     fn take_phrase_batch(&self, _now_ms: u64) -> PluginResult<Option<PhraseBatch>> {
         Ok(None)
     }
-    /// 核对并保存学习结果，返回新增或更新的条数；任一候选不合格时整批拒绝，不保存。
+    /// 结果和消费批次同次提交；空结果、不合格及本地容量拒绝也终结。失效批次不写，存储未知不重放。
     fn finish_phrase_batch(
         &self,
         _batch: &PhraseBatch,
         _drafts: Vec<PhraseDraft>,
         _now_ms: u64,
-    ) -> PluginResult<usize> {
-        Ok(0)
+    ) -> PluginResult<PhraseFinish> {
+        Err(eve_plugin_api::PluginError::State(
+            "该训练实现不支持说法批次持久完成".into(),
+        ))
+    }
+    /// 明确暂态失败有限补做；取消和非暂态失败终结。成功返回才确认重试已安排。
+    fn fail_phrase_batch(
+        &self,
+        _batch: &PhraseBatch,
+        _failure: PhraseFailure,
+        _now_ms: u64,
+    ) -> PluginResult<PhraseFailureOutcome> {
+        Err(eve_plugin_api::PluginError::State(
+            "该训练实现不支持说法批次持久失败处理".into(),
+        ))
     }
     /// 当前作用域已学到的说法，按学到次数降序。
     fn phrases(&self, _scope: &ContextScope) -> PluginResult<Vec<LearnedPhrase>> {

@@ -2,7 +2,10 @@
 use eve_llm_api::{
     ChatMessage, ChatRole, LlmError, LlmFuture, LlmModelResolver, ModelRequest, ModelResponse,
 };
-use eve_training_api::{MAX_PHRASE_DRAFTS, PhraseBatch, PhraseDraft, PhraseLearner};
+use eve_training_api::{
+    MAX_PHRASE_ATTEMPTS, MAX_PHRASE_DRAFTS, PHRASE_LEARNER_VERSION, PhraseBatch, PhraseDraft,
+    PhraseLearner,
+};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -35,11 +38,19 @@ struct Output {
 impl PhraseLearner for ModelPhraseLearner {
     fn learn(&self, batch: PhraseBatch) -> LlmFuture<'_, Vec<PhraseDraft>> {
         Box::pin(async move {
+            if batch.learner_version != PHRASE_LEARNER_VERSION
+                || !(1..=MAX_PHRASE_ATTEMPTS).contains(&batch.attempt)
+            {
+                return Err(LlmError::Context(
+                    "说法批次版本或尝试序号无效；不请求模型".into(),
+                ));
+            }
             let input = serde_json::json!({ "messages": batch.messages }).to_string();
             let request = ModelRequest {
                 session: Some(
                     eve_llm_api::ModelSession::scoped("phrase-learning", &batch.scope)?
-                        .with_turn(&batch.id)?,
+                        .with_turn(&batch.id)?
+                        .for_request(u64::from(batch.attempt)),
                 ),
                 messages: vec![
                     ChatMessage::text(ChatRole::System, SYSTEM_PROMPT),
@@ -81,7 +92,67 @@ fn parse(text: &str) -> Result<Vec<PhraseDraft>, LlmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eve_training_api::PhraseKind;
+    use eve_llm_api::{ContextScope, LlmProvider, ModelSelection};
+    use eve_training_api::{PHRASE_BATCH, PhraseKind};
+    use std::{sync::Mutex, time::Duration};
+
+    #[derive(Default)]
+    struct Capture(Mutex<Vec<ModelRequest>>);
+    impl LlmProvider for Capture {
+        fn complete(&self, request: ModelRequest) -> LlmFuture<'_, ModelResponse> {
+            self.0.lock().unwrap().push(request);
+            Box::pin(async {
+                Ok(ModelResponse::Final {
+                    text: "{\"phrases\":[]}".into(),
+                })
+            })
+        }
+    }
+    struct Resolver(Arc<Capture>);
+    impl LlmModelResolver for Resolver {
+        fn resolve(&self) -> Result<ModelSelection, LlmError> {
+            Ok(ModelSelection {
+                provider: self.0.clone(),
+                provider_timeout: Duration::from_secs(1),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_keeps_scope_turn_and_cache_but_advances_logical_request() {
+        let capture = Arc::new(Capture::default());
+        let learner = ModelPhraseLearner::new(Arc::new(Resolver(capture.clone())));
+        let mut batch = PhraseBatch {
+            id: "b1".into(),
+            scope: ContextScope {
+                session_id: "s".into(),
+                user_id: "u".into(),
+            },
+            messages: vec!["原话".into(); PHRASE_BATCH],
+            attempt: 1,
+            learner_version: PHRASE_LEARNER_VERSION,
+        };
+        learner.learn(batch.clone()).await.unwrap();
+        batch.attempt = 2;
+        learner.learn(batch.clone()).await.unwrap();
+        batch.scope.user_id = "other".into();
+        learner.learn(batch.clone()).await.unwrap();
+        batch.learner_version += 1;
+        assert!(learner.learn(batch).await.is_err());
+        let requests = capture.0.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|r| r.tools.is_empty()));
+        assert_eq!(requests[0].messages, requests[1].messages);
+        let first = requests[0].session.as_ref().unwrap();
+        let second = requests[1].session.as_ref().unwrap();
+        let other = requests[2].session.as_ref().unwrap();
+        assert_eq!(first.session_id(), second.session_id());
+        assert_eq!(first.thread_id(), second.thread_id());
+        assert_eq!(first.prompt_cache_key(), second.prompt_cache_key());
+        assert_eq!(first.turn_id(), second.turn_id());
+        assert_ne!(first.client_request_id(), second.client_request_id());
+        assert_ne!(first.session_id(), other.session_id());
+    }
 
     #[test]
     fn output_must_be_the_strict_schema() {

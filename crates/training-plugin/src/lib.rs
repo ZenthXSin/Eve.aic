@@ -5,10 +5,7 @@ use eve_llm_api::{
 use eve_plugin_api::*;
 use eve_training_api::*;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 mod conversation;
 mod conversation_learner;
 mod expression;
@@ -42,8 +39,8 @@ struct Inner {
     expressions: Expressions,
     phrases: Phrases,
     conversations: conversation::Conversations,
-    /// 已取出、尚未交回结果的批次；只在内存中，重启后不重试。
-    inflight: BTreeMap<String, ContextScope>,
+    /// 写入返回未知后封住旧快照，避免其他入口覆盖可能已提交的结果。
+    phrases_writable: bool,
     context: Option<PluginContext>,
 }
 impl Inner {
@@ -53,6 +50,26 @@ impl Inner {
             .iter()
             .find(|m| m.scope == *scope)
             .map_or(default, |m| m.enabled)
+    }
+    fn require_phrases_writable(&self) -> PluginResult<()> {
+        if !self.phrases_writable {
+            return Err(error("说法学习保存结果未知；旧实例停止写入，保留持久状态"));
+        }
+        Ok(())
+    }
+    fn save_phrases(&mut self, next: Phrases) -> PluginResult<()> {
+        self.require_phrases_writable()?;
+        let bytes = next.bytes()?;
+        let ctx = self
+            .context
+            .as_ref()
+            .ok_or_else(|| error("训练服务已停止"))?;
+        if let Err(error) = ctx.state_set(phrases::KEY, bytes) {
+            self.phrases_writable = false;
+            return Err(error);
+        }
+        self.phrases = next;
+        Ok(())
     }
 }
 struct StoredModes {
@@ -93,9 +110,10 @@ impl TrainingService for StoredModes {
             return Err(error("训练会话作用域无效"));
         }
         let mut inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
+        inner.require_phrases_writable()?;
         let ctx = inner
             .context
-            .as_ref()
+            .clone()
             .ok_or_else(|| error("训练服务已停止"))?;
         let mut next = inner.snapshot.clone();
         if let Some(mode) = next.modes.iter_mut().find(|m| m.scope == *scope) {
@@ -113,10 +131,21 @@ impl TrainingService for StoredModes {
         if bytes.len() > MAX_BYTES {
             return Err(error("训练状态容量已满；保留状态"));
         }
-        ctx.state_set(KEY, bytes)?;
+        // 先持久撤销旧批次。即使后续 mode 写入失败，快速恢复也不会复活旧请求。
+        if !enabled {
+            let mut phrases = inner.phrases.clone();
+            if phrases.cancel_scope(scope) {
+                inner.save_phrases(phrases)?;
+            }
+        }
+        if let Err(error) = ctx.state_set(KEY, bytes) {
+            if self.phrase_learning {
+                inner.phrases_writable = false;
+            }
+            return Err(error);
+        }
         inner.snapshot = next;
         if !enabled {
-            inner.inflight.retain(|_, owner| owner != scope);
             let mut conversations = inner.conversations.clone();
             conversations.cancel(scope);
             inner
@@ -223,6 +252,9 @@ impl TrainingService for StoredModes {
             return Err(error("训练会话作用域无效"));
         }
         let mut inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
+        if self.phrase_learning {
+            inner.require_phrases_writable()?;
+        }
         let ctx = inner
             .context
             .as_ref()
@@ -255,73 +287,81 @@ impl TrainingService for StoredModes {
         // 统计已保存；原话缓冲另存。容量已满时只是不再缓冲新原话，已有状态保留。
         if let (true, Some(sample)) = (self.phrase_learning, sample) {
             let mut phrases = inner.phrases.clone();
-            if phrases.buffer(scope, &sample).is_ok()
-                && let Ok(bytes) = phrases.bytes()
-            {
-                inner
-                    .context
-                    .as_ref()
-                    .ok_or_else(|| error("训练服务已停止"))?
-                    .state_set(phrases::KEY, bytes)?;
-                inner.phrases = phrases;
+            if phrases.buffer(scope, &sample).is_ok() && phrases.bytes().is_ok() {
+                // 容量不足仅不缓冲新样本；后端错误必须封住旧快照。
+                inner.save_phrases(phrases)?;
             }
         }
         Ok(())
     }
-    fn take_phrase_batch(&self, _now_ms: u64) -> PluginResult<Option<PhraseBatch>> {
+    fn take_phrase_batch(&self, now_ms: u64) -> PluginResult<Option<PhraseBatch>> {
         if !self.phrase_learning {
             return Ok(None);
         }
         let mut inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
-        let ctx = inner
-            .context
-            .clone()
-            .ok_or_else(|| error("训练服务已停止"))?;
-        // 正在学习的作用域与已停止训练的作用域都不取。
-        let mut skip: Vec<ContextScope> = inner.inflight.values().cloned().collect();
-        let mut next = inner.phrases.clone();
-        loop {
-            let Some(batch) = next.take(&skip) else {
-                return Ok(None);
-            };
-            if !inner.enabled(&batch.scope, self.default_enabled) {
-                skip.push(batch.scope);
-                next = inner.phrases.clone();
-                continue;
-            }
-            ctx.state_set(phrases::KEY, next.bytes()?)?;
-            inner.phrases = next;
-            inner.inflight.insert(batch.id.clone(), batch.scope.clone());
-            return Ok(Some(batch));
+        inner.require_phrases_writable()?;
+        if inner.context.is_none() {
+            return Err(error("训练服务已停止"));
         }
+        if !inner
+            .phrases
+            .ready(now_ms, |scope| inner.enabled(scope, self.default_enabled))
+        {
+            return Ok(None);
+        }
+        let mut next = inner.phrases.clone();
+        let batch = next.take(now_ms, |scope| inner.enabled(scope, self.default_enabled))?;
+        inner.save_phrases(next)?;
+        Ok(batch)
     }
     fn finish_phrase_batch(
         &self,
         batch: &PhraseBatch,
         drafts: Vec<PhraseDraft>,
         now_ms: u64,
-    ) -> PluginResult<usize> {
+    ) -> PluginResult<PhraseFinish> {
         let mut inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
-        let ctx = inner
-            .context
-            .clone()
-            .ok_or_else(|| error("训练服务已停止"))?;
-        if inner.inflight.remove(&batch.id).as_ref() != Some(&batch.scope) {
-            return Err(error("说法学习批次不存在或已结束"));
+        inner.require_phrases_writable()?;
+        if inner.context.is_none() {
+            return Err(error("训练服务已停止"));
+        }
+        if !inner.enabled(&batch.scope, self.default_enabled) {
+            return Ok(PhraseFinish::Stale);
         }
         let mut next = inner.phrases.clone();
-        let changed = next.merge(batch, &drafts, now_ms)?;
-        if changed > 0 {
-            ctx.state_set(phrases::KEY, next.bytes()?)?;
-            inner.phrases = next;
+        let outcome = next.finish(batch, &drafts, now_ms)?;
+        if outcome != PhraseFinish::Stale {
+            inner.save_phrases(next)?;
         }
-        Ok(changed)
+        Ok(outcome)
+    }
+    fn fail_phrase_batch(
+        &self,
+        batch: &PhraseBatch,
+        failure: PhraseFailure,
+        now_ms: u64,
+    ) -> PluginResult<PhraseFailureOutcome> {
+        let mut inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
+        inner.require_phrases_writable()?;
+        if inner.context.is_none() {
+            return Err(error("训练服务已停止"));
+        }
+        if !inner.enabled(&batch.scope, self.default_enabled) {
+            return Ok(PhraseFailureOutcome::Stale);
+        }
+        let mut next = inner.phrases.clone();
+        let outcome = next.fail(batch, failure, now_ms);
+        if outcome != PhraseFailureOutcome::Stale {
+            inner.save_phrases(next)?;
+        }
+        Ok(outcome)
     }
     fn phrases(&self, scope: &ContextScope) -> PluginResult<Vec<LearnedPhrase>> {
         if !valid(scope) {
             return Err(error("训练会话作用域无效"));
         }
         let inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
+        inner.require_phrases_writable()?;
         if inner.context.is_none() {
             return Err(error("训练服务已停止"));
         }
@@ -332,16 +372,15 @@ impl TrainingService for StoredModes {
             return Err(error("训练会话作用域无效"));
         }
         let mut inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
-        let ctx = inner
-            .context
-            .clone()
-            .ok_or_else(|| error("训练服务已停止"))?;
+        inner.require_phrases_writable()?;
+        if inner.context.is_none() {
+            return Err(error("训练服务已停止"));
+        }
         let mut next = inner.phrases.clone();
         if !next.forget(scope, id) {
             return Ok(false);
         }
-        ctx.state_set(phrases::KEY, next.bytes()?)?;
-        inner.phrases = next;
+        inner.save_phrases(next)?;
         Ok(true)
     }
     fn expression_snapshot(
@@ -398,22 +437,21 @@ impl TrainingService for StoredModes {
             return Err(error("训练会话作用域无效"));
         }
         let mut inner = self.inner.lock().map_err(|_| error("训练状态锁不可用"))?;
+        inner.require_phrases_writable()?;
         let ctx = inner
             .context
             .as_ref()
             .ok_or_else(|| error("训练服务已停止"))?;
         let ctx = ctx.clone();
+        // 说法的删除和迟到屏障先在同一键完成，不依赖内存撤销。
+        let mut phrases = inner.phrases.clone();
+        if phrases.reset(scope) {
+            inner.save_phrases(phrases)?;
+        }
         let mut conversations = inner.conversations.clone();
         if conversations.reset(scope)? {
             ctx.state_set(conversation::KEY, conversations.bytes()?)?;
             inner.conversations = conversations;
-        }
-        // 已取出的原话已从盘上移除；重置后也拒绝迟到的模型结果，避免恢复已删除的说法。
-        inner.inflight.retain(|_, owner| owner != scope);
-        let mut phrases = inner.phrases.clone();
-        if phrases.reset(scope) {
-            ctx.state_set(phrases::KEY, phrases.bytes()?)?;
-            inner.phrases = phrases;
         }
         if let Some(store) = &self.expression_store {
             store.reset(scope)?;
@@ -653,7 +691,7 @@ impl Plugin for TrainingPlugin {
                     expressions,
                     phrases,
                     conversations,
-                    inflight: BTreeMap::new(),
+                    phrases_writable: true,
                     context: Some(context.clone()),
                 }),
                 default_enabled: self.default_enabled,

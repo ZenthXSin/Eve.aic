@@ -1,7 +1,7 @@
 """实际 QQ 宿主的说法学习：训练中的会话攒够一批原话后学习一次，核对摘录出自原话再保存。
 
 模型与 QQ 都是本地替身。验证学到的词语进入下一轮对话上下文、可查看可删除、
-不合格结果整批不保存、取出的批次重启后不重试，关闭学习或停止训练时不发学习请求。
+不合格/已完成结果不重放、明确暂态失败跨重启有限补做，关闭学习或停止训练时不发学习请求。
 """
 import json
 import time
@@ -56,6 +56,16 @@ class PhraseAcceptance(developer.DeveloperAcceptance):
     def phrase_state(self):
         return self.documents().get("eve.training", {}).get("phrases.v1")
 
+    def due_retry(self):
+        # 宿主已退出，仅推进测试状态的到期时间；不改变真实重试间隔与尝试计数。
+        state = json.loads(self.state_path.read_text())
+        value = json.loads(bytes(state["entries"]["eve.training"]["phrases.v1"]))
+        self.assertEqual(len(value["inflight"]), 1)
+        self.assertEqual(value["inflight"][0]["phase"]["state"], "retry_wait")
+        value["inflight"][0]["phase"]["ready_at_ms"] = 0
+        state["entries"]["eve.training"]["phrases.v1"] = list(json.dumps(value).encode())
+        self.state_path.write_text(json.dumps(state))
+
     def wait_for(self, predicate, message, timeout=15):
         deadline = time.monotonic() + timeout
         while not predicate():
@@ -95,7 +105,7 @@ class PhraseAcceptance(developer.DeveloperAcceptance):
         term = next(s["phrase"] for s in state["learned"] if s["phrase"]["kind"] == "term")
         self.chat(self.send(self.message("forget", f"/train forget {term['id']}", contains="已删除")))
         self.assertEqual([s["phrase"]["text"] for s in self.phrase_state()["learned"]], ["表示赞同时"])
-        self.assertEqual(len(self.kind("phrase")), 1, "重启不重新学习已取出的批次")
+        self.assertEqual(len(self.kind("phrase")), 1, "重启不重新学习已完成的批次")
 
     def test_unverifiable_output_saves_nothing_and_is_not_retried_after_restart(self):
         self.learned = {"phrases": [{"kind": "term", "text": "绝绝子", "meaning": "非常好", "example": "绝绝子"}]}
@@ -105,6 +115,73 @@ class PhraseAcceptance(developer.DeveloperAcceptance):
         self.chat(self.send(self.message("list", "/train words", contains="还没有学到说法")))
         self.assertEqual(self.phrase_state()["learned"], [])
         self.assertEqual(self.phrase_state()["pending"], [])
+        self.assertEqual(len(self.kind("phrase")), 1)
+
+    def test_transient_failure_preserves_batch_and_retries_after_restart(self):
+        self.failing.add("phrase")
+        def retry_saved():
+            self.wait_for(lambda: (self.phrase_state() or {}).get("inflight", [])
+                          and self.phrase_state()["inflight"][0]["phase"]["state"] == "retry_wait",
+                          "HTTP 503 后没有保存待补做批次")
+        self.chat([*self.words(), *self.checkpoint("failed")], checkpoints={"failed": retry_saved})
+        self.assertEqual(len(self.kind("phrase")), 1)
+        saved = self.phrase_state()["inflight"][0]["batch"]
+        self.assertEqual(saved["messages"], WORDS)
+        self.assertEqual(saved["attempt"], 1)
+        self.assertEqual(self.phrase_state()["pending"], [])
+        self.due_retry()
+        self.failing.clear()
+        # 到期但开关关闭，原批次和尝试计数必须保留。
+        self.chat(self.checkpoint("paused"), env={"EVE_PHRASE_LEARNING": "false"},
+                  checkpoints={"paused": lambda: time.sleep(1)})
+        self.assertEqual(self.phrase_state()["inflight"][0]["batch"], saved)
+        self.assertEqual(len(self.kind("phrase")), 1)
+        self.chat(self.checkpoint("learned"), checkpoints={"learned": lambda: self.wait_for(
+            lambda: len((self.phrase_state() or {}).get("learned", [])) == 2, "原失败批次没有完成")})
+        self.assertEqual(len(self.kind("phrase")), 2)
+        request = self.kind("phrase")[-1]
+        at_request = request["state"]["eve.training"]["phrases.v1"]["inflight"][0]["batch"]
+        self.assertEqual(at_request["id"], saved["id"])
+        self.assertEqual(at_request["scope"], saved["scope"])
+        self.assertEqual(at_request["messages"], WORDS)
+        self.assertEqual(at_request["attempt"], 2)
+        self.assertEqual(self.phrase_state()["inflight"], [])
+        self.chat(self.send(self.message("done", "/train words", contains="yyds")))
+        self.assertEqual(len(self.kind("phrase")), 2)
+        self.assertTrue(all(row["phrase"]["uses"] == 1 for row in self.phrase_state()["learned"]))
+
+    def test_http_400_is_terminal_and_not_retried_after_restart(self):
+        self.http_status = lambda kind, number: 400 if kind == "phrase" else None
+        self.chat([*self.words(), *self.checkpoint("rejected")], checkpoints={"rejected": lambda: self.wait_for(
+            lambda: self.kind("phrase") and not (self.phrase_state() or {}).get("inflight", []),
+            "HTTP 400 批次未终结")})
+        self.assertEqual(self.phrase_state()["learned"], [])
+        self.assertEqual(self.phrase_state()["pending"], [])
+        self.chat(self.send(self.message("after-rejected", "/train words", contains="还没有学到说法")))
+        self.assertEqual(len(self.kind("phrase")), 1)
+
+    def test_reset_rejects_a_late_success_and_restart_never_restores_it(self):
+        self.response_gates[("phrase", 1)] = "late-phrase"
+        claimed = {}
+        def arrived():
+            self.wait_for(lambda: self.arrived("phrase", 1).exists(), "未收到学习请求")
+            claimed["batch"] = self.phrase_state()["inflight"][0]["batch"]["id"]
+        def stale_finished():
+            for line in self.panel_stderr.read_text().splitlines():
+                if line.startswith("EVE_PHRASES "):
+                    event = json.loads(line[len("EVE_PHRASES "):])
+                    if event.get("batch") == claimed["batch"] and event.get("outcome") == "stale":
+                        return True
+            return False
+        def release():
+            self.assertEqual(self.phrase_state()["inflight"], [])
+            self.gate("late-phrase").touch()
+            self.wait_for(stale_finished, "迟到结果没有结束")
+        self.chat([*self.words(), *self.checkpoint("arrived"),
+                   *self.send(self.message("reset-late", "/train reset", contains="已重置")),
+                   *self.checkpoint("release")], checkpoints={"arrived": arrived, "release": release}, panel=True)
+        self.assertEqual(self.phrase_state()["learned"], [])
+        self.chat(self.send(self.message("after-reset", "/train words", contains="还没有学到说法")))
         self.assertEqual(len(self.kind("phrase")), 1)
 
     def test_exhausted_global_budget_preserves_pending_phrases_across_restart(self):
