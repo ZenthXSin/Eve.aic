@@ -37,6 +37,17 @@ class WebModelAdapterAcceptance(WireAcceptance):
         self.logs = []
         self.source = self.work / "workspace"
         self.source.mkdir()
+        # Web 默认启用交流学习；仅为这两个合成会话预置已有的持久暂停模式。
+        # 后台交流学习单独验收，这里每个模型请求必须属于适配器切换的主对话。
+        modes = {"version": 1, "modes": [
+            {"scope": {"session_id": "web:chat:" + conversation, "user_id": "web:owner"},
+             "enabled": False}
+            for conversation in (CONVERSATION, OTHER_CONVERSATION)
+        ]}
+        self.state_path.parent.mkdir()
+        self.state_path.write_text(json.dumps({"version": 1, "entries": {
+            "eve.training": {"modes.v1": list(json.dumps(modes).encode())},
+        }}), encoding="utf8")
 
     def start_web(self):
         self.run_number += 1
@@ -60,6 +71,9 @@ class WebModelAdapterAcceptance(WireAcceptance):
                 log = path.read_text(encoding="utf8")
                 self.assertNotIn(MODEL_KEY, log)
                 self.assertNotIn(web_chat.PANEL_TOKEN, log)
+            modes = self.documents()["eve.training"]["modes.v1"]["modes"]
+            self.assertEqual(len(modes), 2)
+            self.assertTrue(all(mode["enabled"] is False for mode in modes))
         finally:
             super().tearDown()
 

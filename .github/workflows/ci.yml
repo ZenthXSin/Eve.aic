@@ -111,7 +111,10 @@ jobs:
       - name: 检查 Clippy 警告
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: 运行测试与文档测试
-        run: cargo test --workspace --locked --no-fail-fast
+        run: |
+          cargo tree --workspace -e features -i serde_json --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --workspace --locked --no-fail-fast
       - name: 验证预编译目标的参数与失败传播
         run: python -X utf8 scripts/test-run-prebuilt.py
       - name: 统一编译进程验收入口和示例
@@ -576,10 +579,12 @@ jobs:
         run: cargo +1.95.0 test -p eve-llm-api --lib --locked
       - name: 验证最低版本的原 Codex Responses 传输与恢复
         if: ${{ !cancelled() && steps.msrv-targets.outcome == 'success' }}
-        run: cargo +1.95.0 test -p eve-llm-codex --test responses --locked
+        run: cargo +1.95.0 test -p eve-llm-codex --lib --test responses --locked
       - name: 验证最低版本的原 OpenAI Chat、Responses 与会话回归
         if: ${{ !cancelled() && steps.msrv-targets.outcome == 'success' }}
-        run: cargo +1.95.0 test -p eve-llm-openai --locked
+        run: |
+          cargo +1.95.0 tree -p eve-llm-openai -e features -i serde_json --locked
+          cargo +1.95.0 test -p eve-llm-openai --locked
       - name: 验证最低版本的主辅选择、九组合与识图入口
         if: ${{ !cancelled() && steps.msrv-targets.outcome == 'success' }}
         run: cargo +1.95.0 test -p eve-app --lib models::tests --locked
