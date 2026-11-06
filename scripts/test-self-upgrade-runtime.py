@@ -129,10 +129,10 @@ class ExplorationIdleGateTests(unittest.TestCase):
             execution=dict(kind='exploration', session_end_reason='natural_stop', checkpoint=checkpoint,
                 recoveries=0, resume_at_ms=None, deadline_at_ms=None, last_finished_at_ms=40))
 
-    def save(self, tasks, version):
+    def save(self, tasks, version, archived=None):
         entries = []
         for task in tasks:
-            if version == 4:
+            if version in (4, 5):
                 raw = json.dumps(task, ensure_ascii=False).encode()
                 digest = hashlib.sha256(raw).hexdigest()
                 (self.archive / (digest + '.json')).write_bytes(raw)
@@ -142,7 +142,10 @@ class ExplorationIdleGateTests(unittest.TestCase):
                 if isinstance(directory.get('execution'), dict):
                     directory['execution']['checkpoint'] = None
                     directory['execution'].pop('review_messages', None)
-                entries.append(dict(directory=directory, record=dict(hash=digest, bytes=len(raw))))
+                entry = dict(directory=directory, record=dict(hash=digest, bytes=len(raw)))
+                if version == 5:
+                    entry['archived'] = archived is not None and task['id'] in archived
+                entries.append(entry)
             else:
                 entries.append(task)
         ledger = dict(format_version=version, tasks=entries)
@@ -178,7 +181,7 @@ class ExplorationIdleGateTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
 
     def test_session_ended_hot_and_cold_records_are_idle_with_or_without_experience_ack(self):
-        for version in (2, 3, 4):
+        for version in (2, 3, 4, 5):
             for acknowledged in (None, 40, 50):
                 with self.subTest(version=version, acknowledged=acknowledged):
                     task = self.ended()
@@ -187,7 +190,7 @@ class ExplorationIdleGateTests(unittest.TestCase):
                     self.assert_gate([task], version, True)
 
     def test_resource_stops_without_summary_and_delegated_usage_remain_idle(self):
-        for version in (2, 3, 4):
+        for version in (2, 3, 4, 5):
             for reason in ('natural_stop', 'tool_budget_exhausted', 'deadline_expired', 'recovery_limit_reached'):
                 with self.subTest(version=version, reason=reason):
                     task = self.ended(result=None)
@@ -211,7 +214,7 @@ class ExplorationIdleGateTests(unittest.TestCase):
         self.assert_gate([task], 4, True)
 
     def test_finished_exploration_does_not_hide_busy_act_or_delivery(self):
-        for version in (2, 3, 4):
+        for version in (2, 3, 4, 5):
             for status, idle in (('Queued', False), ('Running', False), ('Completed', True),
                                  ('Failed', True), ('Cancelled', True), ('Interrupted', True)):
                 with self.subTest(version=version, status=status):
@@ -261,14 +264,14 @@ class ExplorationIdleGateTests(unittest.TestCase):
             ('unknown closing flag', lambda t: t['execution']['checkpoint'].update(closing='false')),
             ('wrong result', lambda t: t.update(result='编造的小结')),
         ]
-        for version in (2, 3, 4):
+        for version in (2, 3, 4, 5):
             for label, mutate in mutations:
                 with self.subTest(version=version, problem=label):
                     task = self.ended()
                     mutate(task)
                     self.assert_rejected(task, version)
         self.assert_rejected(self.ended(), 1)
-        self.assert_rejected(self.ended(), 5)
+        self.assert_rejected(self.ended(), 6)
 
     def tool_end(self, output):
         task = self.ended()
@@ -282,7 +285,7 @@ class ExplorationIdleGateTests(unittest.TestCase):
         return task
 
     def test_tool_receipts_must_be_paired_and_have_no_unknown_effect(self):
-        for version in (2, 4):
+        for version in (2, 4, 5):
             self.assert_gate([self.tool_end({'Success': {'text': '真实材料'}})], version, True)
             self.assert_gate([self.tool_end({'Failure': {'code': 'PermissionDenied', 'message': '范围拒绝'}})], version, True)
             for code in ('TimedOut', 'Cancelled', 'ExecutionFailed', 'NewFailure'):
@@ -315,6 +318,164 @@ class ExplorationIdleGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'task_archive_directory_mismatch'):
             runtime.runtime_idle_gate(self.state)
         self.assertEqual(self.snapshot(), before)
+
+
+class TaskWorkingSetGateTests(unittest.TestCase):
+    """格式 5 只分开运行与历史容量；完整冷文件仍经真实读取器核对。"""
+    setUp = ExplorationIdleGateTests.setUp
+    save = ExplorationIdleGateTests.save
+    snapshot = ExplorationIdleGateTests.snapshot
+    ended = ExplorationIdleGateTests.ended
+
+    def cancelled(self, number, payload=0):
+        owner = dict(session_id='archive-session', user_id='archive-owner')
+        source = 'archive-fixture-' + str(number)
+        identity = hashlib.sha256()
+        for part in ('eve.task:v1', owner['user_id'], source):
+            raw = part.encode()
+            identity.update(len(raw).to_bytes(8, 'big'))
+            identity.update(raw)
+        task = dict(id='task-' + identity.hexdigest()[:32], owner=owner, source=source,
+                    status='Cancelled', cancel_requested=False, started_at_ms=None,
+                    created_at_ms=10, finished_at_ms=20, usage=None, result=None, failure=None,
+                    notice=None, spec=dict(title='保留历史', instructions='合成任务正文', max_steps=4),
+                    execution=dict(checkpoint=None, recoveries=0, resume_at_ms=None,
+                                   deadline_at_ms=None, last_finished_at_ms=20))
+        if payload:
+            messages = [dict(role='User', text='x' * payload, tool_calls=[], tool_results=[])]
+            task['spec']['context'] = dict(owner=owner, messages_json=json.dumps(messages))
+        return task
+
+    def save_ledger(self, ledger):
+        state = runtime.read_json(self.state)
+        state['entries']['eve.task']['tasks.v1'] = list(json.dumps(ledger).encode())
+        runtime.atomic(self.state, state)
+
+    def assert_ledger_rejected(self, ledger, message):
+        self.save_ledger(ledger)
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, message):
+            list(runtime.task_documents(self.state, ledger))
+        with self.assertRaisesRegex(ValueError, message):
+            runtime.runtime_idle_gate(self.state)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_40_archived_records_over_old_byte_limit_remain_fully_readable(self):
+        tasks = [self.cancelled(number, 420 * 1024) for number in range(40)]
+        ledger = self.save(tasks, 5, {task['id'] for task in tasks[:2]})
+        self.assertGreater(sum(entry['record']['bytes'] for entry in ledger['tasks']), 16 * 1024**2)
+        before = self.snapshot()
+        self.assertEqual(list(runtime.task_documents(self.state, ledger)), tasks)
+        self.assertTrue(runtime.runtime_idle_gate(self.state))
+        self.assertEqual(self.snapshot(), before)
+        legacy = copy.deepcopy(ledger)
+        legacy['format_version'] = 4
+        for entry in legacy['tasks']:
+            entry.pop('archived')
+        self.assert_ledger_rejected(legacy, 'task_archive_size_limit')
+        for entry in ledger['tasks']:
+            entry['archived'] = False
+        self.assert_ledger_rejected(ledger, 'task_working_set_size_limit')
+
+    def test_v5_requires_explicit_boolean_and_v4_rejects_archival_fields(self):
+        task = self.cancelled(1)
+        for value in (None, 0, 1, 'true', [], {}):
+            with self.subTest(value=value):
+                ledger = self.save([task], 5)
+                ledger['tasks'][0]['archived'] = value
+                self.assert_ledger_rejected(ledger, 'invalid_task_archive_index')
+        ledger = self.save([task], 5)
+        ledger['tasks'][0].pop('archived')
+        self.assert_ledger_rejected(ledger, 'invalid_task_archive_index')
+        for value in (True, False, None):
+            ledger = self.save([task], 4)
+            ledger['tasks'][0]['archived'] = value
+            self.assert_ledger_rejected(ledger, 'invalid_task_archive_index')
+
+    def test_archival_needs_settled_status_notice_progress_and_exploration_ack(self):
+        mutations = [
+            lambda task: task.update(status='Queued'),
+            lambda task: task.update(status='Running'),
+            lambda task: task.update(finished_at_ms=None),
+            lambda task: task.update(notice=dict(status='Pending')),
+            lambda task: task.update(notice=dict(status='Delivering')),
+            lambda task: task.update(execution=dict(progress_notices=[dict(attempt=dict(result=None))])),
+            lambda task: task.update(execution=dict(kind='exploration')),
+            lambda task: task.update(execution=dict(kind='exploration', exploration_acknowledged_at_ms=19)),
+        ]
+        for number, mutate in enumerate(mutations):
+            with self.subTest(problem=number):
+                task = self.cancelled(number)
+                mutate(task)
+                ledger = self.save([task], 5, {task['id']})
+                self.assert_ledger_rejected(ledger, 'invalid_task_archive_settlement')
+        for status in ('Completed', 'Failed', 'Cancelled', 'Interrupted', 'Blocked'):
+            for notice in (None, 'Delivered', 'Expired', 'Unknown'):
+                task = self.cancelled(status + str(notice))
+                task['status'] = status
+                task['notice'] = None if notice is None else dict(status=notice)
+                ledger = self.save([task], 5, {task['id']})
+                before = self.snapshot()
+                self.assertEqual(list(runtime.task_documents(self.state, ledger)), [task])
+                self.assertTrue(runtime.runtime_idle_gate(self.state))
+                self.assertEqual(self.snapshot(), before)
+        task = self.ended()
+        task['execution']['exploration_acknowledged_at_ms'] = 50
+        ledger = self.save([task], 5, {task['id']})
+        self.assertEqual(list(runtime.task_documents(self.state, ledger)), [task])
+        self.assertTrue(runtime.runtime_idle_gate(self.state))
+
+    def test_archived_reference_still_requires_hash_body_and_exact_identity_projection(self):
+        task = self.cancelled(1, 1024)
+        ledger = self.save([task], 5, {task['id']})
+        record = ledger['tasks'][0]['record']
+        path = self.archive / (record['hash'] + '.json')
+        original = path.read_bytes()
+        path.unlink()
+        self.assert_ledger_rejected(ledger, 'invalid_task_archive_file')
+        path.write_bytes(original[:-1] + b' ')
+        self.assert_ledger_rejected(ledger, 'task_archive_digest_mismatch')
+        path.write_bytes(original)
+        for field, value in [('id', 'other'), ('owner', {'user_id': 'other'}), ('source', 'other'),
+                             ('created_at_ms', 11)]:
+            changed = copy.deepcopy(ledger)
+            changed['tasks'][0]['directory'][field] = value
+            self.assert_ledger_rejected(changed, 'task_archive_directory_mismatch')
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_history_total_working_overhead_and_original_closeout_reserve_are_independent(self):
+        limit = 16 * 1024**2
+        tasks = [self.cancelled(number) for number in range(5)]
+        ledger = self.save(tasks, 5, {task['id'] for task in tasks})
+        for entry in ledger['tasks']:
+            entry['record']['bytes'] = limit
+        # 容量先于正文 IO；不需要写五份越界文件或伪造摘要。
+        with self.assertRaisesRegex(ValueError, 'task_archive_size_limit'):
+            list(runtime.task_documents(self.state, ledger))
+        for count in (1, 4):
+            ledger = self.save(tasks[:count], 5, {task['id'] for task in tasks})
+            for entry in ledger['tasks']:
+                entry['record']['bytes'] = limit
+            runtime.task_archive_capacity(ledger)
+        ledger = self.save(tasks[:2], 5, {tasks[0]['id']})
+        ledger['tasks'][0]['directory']['notice'] = dict(status='Expired')
+        ledger['tasks'][1]['directory']['status'] = 'Queued'
+        ledger['tasks'][1]['record']['bytes'] = limit - 32768 - 320 - len(b'{"format_version":2,"tasks":[]}')
+        runtime.task_archive_capacity(ledger)
+        ledger['tasks'][1]['record']['bytes'] += 1
+        with self.assertRaisesRegex(ValueError, 'task_working_set_size_limit'):
+            runtime.task_archive_capacity(ledger)
+        for value in (0, -1, True, limit + 1):
+            ledger['tasks'][1]['record']['bytes'] = value
+            with self.assertRaisesRegex(ValueError, 'invalid_task_archive_reference'):
+                runtime.task_archive_capacity(ledger)
+
+    def test_unknown_or_malformed_execution_is_not_hidden_by_v5_flags(self):
+        for value in (False, 0, [], ''):
+            # 使用真实索引结构；避开夹具只支持正常 execution 的投影分支。
+            ledger = self.save([self.cancelled(1)], 5)
+            ledger['tasks'][0]['directory']['execution'] = value
+            self.assert_ledger_rejected(ledger, 'invalid_task_archive_execution')
 
 
 class UpgradeRuntimeTests(unittest.TestCase):
@@ -691,7 +852,7 @@ while True:
         self.assertEqual(self.events.read_text().splitlines(),['old','new'])
         self.assertFalse((Path(request['candidate_directory'])/'resources/connectors/qqbot/node_modules').exists())
 
-    def cold_task(self, status='Completed', notice='Delivered'):
+    def cold_task(self, status='Completed', notice='Delivered', version=4, archived=False):
         task = dict(id='task-1', owner={'session_id': self.session, 'user_id': self.session},
                     source='fixture', spec={'title': '验证升级', 'instructions': '真实隔离验收', 'max_steps': 10,
                     'context': {'owner': {'session_id': self.session, 'user_id': self.session}, 'messages_json': '[]'}},
@@ -712,7 +873,10 @@ while True:
         archive = self.state / 'task-archive'; archive.mkdir(exist_ok=True)
         key = hashlib.sha256(raw).hexdigest()
         cold = archive / (key + '.json'); cold.write_bytes(raw)
-        ledger = {'format_version': 4, 'tasks': [{'directory': directory, 'record': {'hash': key, 'bytes': len(raw)}}]}
+        entry = {'directory': directory, 'record': {'hash': key, 'bytes': len(raw)}}
+        if version == 5:
+            entry['archived'] = archived
+        ledger = {'format_version': version, 'tasks': [entry]}
         self.save_tasks(ledger)
         return cold, ledger
 
@@ -739,6 +903,20 @@ while True:
         self.assertEqual(((self.state / 'state.json').read_bytes(), archive.read_bytes()), before)
         self.assertEqual(next((self.queue / 'backups').glob('*/task-archive/' + archive.name)).read_bytes(), before[1])
 
+    def test_v5_upgrade_waits_for_running_work_and_backs_up_archived_body_without_rewriting_it(self):
+        self.cold_task('Running', version=5)
+        self.launch()
+        request = self.candidate('new')
+        runtime.atomic(self.queue / 'request.json', request)
+        self.wait(lambda document: document['phase'] == 'waiting')
+        self.assertEqual(self.events.read_text().splitlines(), ['old'])
+        archive, _ = self.cold_task(version=5, archived=True)
+        before = (self.state / 'state.json').read_bytes(), archive.read_bytes()
+        self.wait(lambda document: document['result'] == 'applied')
+        self.assertEqual(self.events.read_text().splitlines(), ['old', 'new'])
+        self.assertEqual(((self.state / 'state.json').read_bytes(), archive.read_bytes()), before)
+        self.assertEqual(next((self.queue / 'backups').glob('*/task-archive/' + archive.name)).read_bytes(), before[1])
+
     def test_cold_task_gate_rejects_missing_tampered_directory_unknown_version_and_duplicate_ids(self):
         archive, ledger = self.cold_task()
         path = self.state / 'state.json'
@@ -752,7 +930,7 @@ while True:
         ledger['tasks'][0]['directory']['status'] = 'Running'; self.save_tasks(ledger)
         with self.assertRaisesRegex(ValueError, 'task_archive_directory_mismatch'): runtime.runtime_idle_gate(path)
         ledger['tasks'][0]['directory']['status'] = 'Completed'
-        ledger['format_version'] = 5; self.save_tasks(ledger)
+        ledger['format_version'] = 6; self.save_tasks(ledger)
         with self.assertRaisesRegex(ValueError, 'unknown_task_ledger_version'): runtime.runtime_idle_gate(path)
         ledger['format_version'] = 4
         ledger['tasks'].append(ledger['tasks'][0]); self.save_tasks(ledger)
